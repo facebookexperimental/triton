@@ -2221,9 +2221,18 @@ void PartitionSchedulingMeta::runOnOperation() {
     schedOpts.mergeReduction = mergeReduction;
     schedOpts.separateEpilogueStore = separateEpilogueStore;
 
-    // Per-loop tt.merge_epilogue attribute overrides mergeEpilogueToComputation.
-    if (auto attr = loop->getAttrOfType<BoolAttr>("tt.merge_epilogue"))
+
+    // Per-loop tt.merge_epilogue_to_computation overrides pass option.
+    if (auto attr = loop->getAttrOfType<BoolAttr>("tt.merge_epilogue_to_computation"))
       schedOpts.mergeEpilogueToComputation = attr.getValue();
+
+    // Per-loop tt.separate_epilogue_store overrides pass option.
+    if (auto attr = loop->getAttrOfType<BoolAttr>("tt.separate_epilogue_store"))
+      schedOpts.separateEpilogueStore = attr.getValue();
+
+    // Per-loop tt.merge_epilogue overrides pass option.
+    if (auto attr2 = loop->getAttrOfType<BoolAttr>("tt.merge_epilogue"))
+      schedOpts.mergeEpilogue = attr2.getValue();
 
     if (std::optional<ScheduleResult> result =
             getInitialSchedule(loop, schedOpts)) {

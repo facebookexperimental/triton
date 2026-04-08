@@ -3274,7 +3274,7 @@ class range(base_value):
 
     def __init__(self, arg1, arg2=None, step=None, num_stages=None, loop_unroll_factor=None,
                  disallow_acc_multi_buffer=False, flatten=False, warp_specialize=False, disable_licm=False,
-                 data_partition_factor=None, merge_epilogue=False, tmem_alloc_algo=None, smem_alloc_algo=None,
+                 data_partition_factor=None, merge_epilogue=False, merge_epilogue_to_computation=False, separate_epilogue_store=False, tmem_alloc_algo=None, smem_alloc_algo=None,
                  smem_budget=None, smem_circular_reuse=None):
         if step is None:
             self.step = constexpr(1)
@@ -3291,6 +3291,8 @@ class range(base_value):
         self.disallow_acc_multi_buffer = disallow_acc_multi_buffer
         self.data_partition_factor = data_partition_factor
         self.merge_epilogue = merge_epilogue
+        self.merge_epilogue_to_computation = merge_epilogue_to_computation
+        self.separate_epilogue_store = separate_epilogue_store
         self.tmem_alloc_algo = tmem_alloc_algo
         self.smem_alloc_algo = smem_alloc_algo
         self.smem_budget = smem_budget

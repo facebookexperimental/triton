@@ -145,7 +145,7 @@ def _attn_fwd_inner_oss_dp(
             lo,
             hi,
             BLOCK_N,
-            warp_specialize=warp_specialize,
+            warp_specialize=warp_specialize, merge_epilogue=True, separate_epilogue_store=True,
             # disallow_acc_multi_buffer=True,
             data_partition_factor=DP_FACTOR,
     ):
@@ -564,7 +564,7 @@ def _attn_fwd_persist(
     for _ in tl.range(
             0,
             tiles_per_sm,
-            warp_specialize=warp_specialize and OUTER_LOOP,
+            warp_specialize=warp_specialize and OUTER_LOOP, merge_epilogue=True, separate_epilogue_store=True,
             data_partition_factor=DP_FACTOR,
     ):
         pid = tile_idx % n_tile_num
@@ -790,7 +790,7 @@ def _attn_bwd_dkdv(
     curr_m = start_m
     step_m = BLOCK_M1
     if warp_specialize:
-        for blk_idx in tl.range(0, num_steps, warp_specialize=True, merge_epilogue=True, tmem_alloc_algo=2,
+        for blk_idx in tl.range(0, num_steps, warp_specialize=True, merge_epilogue_to_computation=True, tmem_alloc_algo=2,
                                 smem_alloc_algo=1, smem_budget=200000):
             dk, dv, curr_m = _attn_bwd_dkdv_inner(
                 dk,
@@ -1166,7 +1166,7 @@ def _attn_bwd_persist(
         block_shape=[BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE],
     )
 
-    for _ in tl.range(0, tiles_per_sm, warp_specialize=True, merge_epilogue=True, tmem_alloc_algo=2, smem_alloc_algo=1,
+    for _ in tl.range(0, tiles_per_sm, warp_specialize=True, merge_epilogue_to_computation=True, tmem_alloc_algo=2, smem_alloc_algo=1,
                       smem_budget=200000):
         pid = tile_idx % n_tile_num
         bhid = tile_idx // n_tile_num
