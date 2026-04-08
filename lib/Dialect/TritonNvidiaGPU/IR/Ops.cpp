@@ -924,7 +924,12 @@ void TMEMSubSliceOp::build(OpBuilder &builder, OperationState &state,
   shape.back() = size;
   auto encoding =
       cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(allocTy.getEncoding());
-  unsigned newBlockN = std::min<unsigned>(encoding.getBlockN(), size);
+  // For multi-M-block tensors, preserve blockN to maintain correct column
+  // stride between M-blocks in TMEM layout.
+  unsigned mDim = shape[shape.size() - 2]; // M dimension of the tensor
+  unsigned mBlocks = mDim / encoding.getBlockM();
+  unsigned newBlockN = mBlocks > 1 ? encoding.getBlockN()
+                                   : std::min<unsigned>(encoding.getBlockN(), size);
   auto newEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
       builder.getContext(), encoding.getBlockM(), newBlockN,
       encoding.getColStride(), encoding.getCTASplitM(),

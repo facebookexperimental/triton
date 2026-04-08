@@ -570,6 +570,25 @@ module attributes {"ttg.num-warps" = 8 : i32} {
 
 // -----
 
+// Test subsliced 256x64 tensor from 256x128 TMEM. The tmem_subslice op
+// preserves blockN=128 in the encoding to maintain correct column stride
+// between M-blocks.
+#blocked_subslice = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [32, 1], warpsPerCTA = [8, 1], order = [0, 1]}>
+#tmem_subslice = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+module attributes {"ttg.num-warps" = 8 : i32} {
+  // CHECK-LABEL: @tensor_memory_ld_256x64_subslice
+  tt.func public @tensor_memory_ld_256x64_subslice(%tmem: !ttg.memdesc<256x128xf32, #tmem_subslice, #ttng.tensor_memory, mutable>) {
+    %subslice = ttng.tmem_subslice %tmem {N = 0 : i32} : !ttg.memdesc<256x128xf32, #tmem_subslice, #ttng.tensor_memory, mutable> -> !ttg.memdesc<256x64xf32, #tmem_subslice, #ttng.tensor_memory, mutable, 256x128>
+    // CHECK-COUNT-1: tcgen05.ld.sync.aligned.32x32b.x64.b32
+    // CHECK-NOT: tcgen05.ld
+    %result = ttng.tmem_load %subslice : !ttg.memdesc<256x64xf32, #tmem_subslice, #ttng.tensor_memory, mutable, 256x128> -> tensor<256x64xf32, #blocked_subslice>
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>
 

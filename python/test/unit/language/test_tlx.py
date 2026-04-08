@@ -687,6 +687,7 @@ def test_tmem_subslice(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
     torch.testing.assert_close(x, ref_out)
 
 
+
 def test_thread_id(device):
 
     @triton.jit

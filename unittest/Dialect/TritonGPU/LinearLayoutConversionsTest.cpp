@@ -3697,6 +3697,48 @@ TEST_F(LinearLayoutConversionsTest, TensorMemory_blockM_128) {
                 LinearLayout::identity1D(2, kCol, d1));
 }
 
+TEST_F(LinearLayoutConversionsTest, TensorMemory_blockM_128_subslice) {
+  // Test subsliced tensors where encoding blockN > shape[1].
+  // This happens when a 256x128 TMEM tensor is subsliced to 256x64:
+  // the encoding preserves blockN=128 to maintain correct column stride
+  // between M-blocks, but shape[1]=64.
+  auto d0 = S("dim0");
+  auto d1 = S("dim1");
+  auto kRow = S("row");
+  auto kCol = S("col");
+
+  // encoding blockN=128, but shape is {256, 64}.
+  // The tile should be 128x64 with a padding gap, so that the second
+  // M-block starts at kCol=128 (not kCol=64).
+  auto enc = tmem(128, 128, 1, 1);
+  LinearLayout smallTile = LinearLayout::identity1D(128, kRow, d0) *
+                           LinearLayout::identity1D(64, kCol, d1);
+  // Insert a padding basis to skip the gap (kCol 64-127 maps to {0,0}).
+  auto bases = smallTile.getBases();
+  bases[kCol].push_back({0, 0});
+  smallTile = LinearLayout(bases, {d0, d1});
+  // Then the repsM expansion puts M-block 1 at kCol=128.
+  EXPECT_EQ(toLinearLayout({256, 64}, enc),
+            smallTile * LinearLayout::identity1D(2, kCol, d0));
+
+  // Also test 256x32 subslice with encoding blockN=128.
+  // Need 2 padding bases (128/32 = 4, log2(4) = 2 padding bits).
+  LinearLayout smallTile2 = LinearLayout::identity1D(128, kRow, d0) *
+                            LinearLayout::identity1D(32, kCol, d1);
+  auto bases2 = smallTile2.getBases();
+  bases2[kCol].push_back({0, 0});
+  bases2[kCol].push_back({0, 0});
+  smallTile2 = LinearLayout(bases2, {d0, d1});
+  EXPECT_EQ(toLinearLayout({256, 32}, enc),
+            smallTile2 * LinearLayout::identity1D(2, kCol, d0));
+
+  // Verify that non-subsliced 256x128 still works correctly.
+  LinearLayout fullTile = LinearLayout::identity1D(128, kRow, d0) *
+                          LinearLayout::identity1D(128, kCol, d1);
+  EXPECT_EQ(toLinearLayout({256, 128}, enc),
+            fullTile * LinearLayout::identity1D(2, kCol, d0));
+}
+
 TEST_F(LinearLayoutConversionsTest, TensorMemory_CTASplit) {
   auto d0 = S("dim0");
   auto d1 = S("dim1");

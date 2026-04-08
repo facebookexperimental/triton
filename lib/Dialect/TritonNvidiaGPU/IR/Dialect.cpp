@@ -95,6 +95,9 @@ DistributedEncodingTrait getTmemLoadStoreLayout32x32b(unsigned M, unsigned N,
   SmallVector<unsigned> threadsPerWarp;
   SmallVector<unsigned> warpsPerCTA;
   SmallVector<unsigned> order;
+  // Cap N at the actual tensor width to handle subsliced tensors where
+  // the encoding's blockN exceeds the tensor dimension.
+  N = std::min(N, (unsigned)shape[1]);
   SmallVector<unsigned> blocksPerTile = {(unsigned)shape[0] / M,
                                          (unsigned)shape[1] / N};
   int numBlocks = blocksPerTile[0] * blocksPerTile[1];
