@@ -158,8 +158,8 @@ class Gemm:
         for shape in shapes:
             M, N, K = shape
             torch.manual_seed(0)
-            a = torch.randn((M, K), device=DEVICE, dtype=dtype)
-            b = torch.randn((K, N), device=DEVICE, dtype=dtype)
+            a = (torch.randn((M, K), device=DEVICE, dtype=dtype) + 1) / K
+            b = (torch.randn((K, N), device=DEVICE, dtype=dtype) + 1) / K
             torch_output = torch.matmul(a, b)
             triton_output = matmul_fn(a, b, config=config)
             torch.testing.assert_close(triton_output, torch_output)
