@@ -505,8 +505,7 @@ void convertDot(const LLVMTypeConverter &typeConverter,
   MemDescType bTensorTy = op.getB().getType();
   MemDescType dTensorTy = op.getD().getType();
   auto dLayout = cast<ttng::TensorMemoryEncodingAttr>(dTensorTy.getEncoding());
-  bool twoCTAs = ttng::getModuleTwoCTAs(op);
-  assert(twoCTAs == op.getTwoCtas());
+  bool twoCTAs = ttng::getModuleTwoCTAs(op) || tlx::tlxEnablePairedMMA(op);
 
   DotConversion dot;
 
@@ -615,8 +614,7 @@ void convertScaledDot(const LLVMTypeConverter &typeConverter,
   Value baseD = tb.ptrtoint(i32_ty, adaptor.getD());
   Value baseScaleA = tb.ptrtoint(i32_ty, adaptor.getAScale());
   Value baseScaleB = tb.ptrtoint(i32_ty, adaptor.getBScale());
-  bool twoCTAs = ttng::getModuleTwoCTAs(op);
-  assert(twoCTAs == op.getTwoCtas());
+  bool twoCTAs = ttng::getModuleTwoCTAs(op) || tlx::tlxEnablePairedMMA(op);
 
   int numRows = 128;
   int colSizeInBits = 32;
