@@ -865,3 +865,46 @@ llvm.func @paired_cta_cluster_sync(%a: !llvm.ptr<3>, %b: i1) attributes {allocat
   llvm.return
 }
 }
+
+// -----
+
+// Test that cluster sync is inserted before return for non-WS clustered kernels.
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.total-num-warps" = 4 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+
+llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
+
+// CHECK-LABEL: @clustered_no_ws_exit_sync
+// CHECK: nvvm.cluster.arrive {aligned}
+// CHECK-NEXT: nvvm.cluster.wait {aligned}
+// CHECK-NEXT: llvm.return
+llvm.func @clustered_no_ws_exit_sync() attributes {allocation.offset = 0 : i32} {
+  llvm.return
+}
+}
+
+// -----
+
+// Test that cluster sync is inserted before return for WS clustered kernels,
+// not just paired CTA MMA.
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.total-num-warps" = 5 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+
+llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
+
+// CHECK-LABEL: @clustered_kernel_exit_sync
+// CHECK: nvvm.cluster.arrive {aligned}
+// CHECK-NEXT: nvvm.cluster.wait {aligned}
+// CHECK-NEXT: llvm.return
+// CHECK: nvvm.cluster.arrive {aligned}
+// CHECK-NEXT: nvvm.cluster.wait {aligned}
+// CHECK-NEXT: llvm.return
+llvm.func @clustered_kernel_exit_sync() attributes {allocation.offset = 0 : i32} {
+  ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4>}
+  default {
+    ttg.warp_yield
+  }
+  partition0() num_warps(1) {
+    ttg.warp_return
+  } : () -> ()
+  llvm.return
+}
+}

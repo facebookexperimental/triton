@@ -311,6 +311,11 @@ def compile(src, target=None, options=None, _env_vars=None):
         config_parts.append(f"stages{options.num_stages}")
         config_parts.append(f"ctas{options.num_ctas}")
         config_name = "_".join(config_parts)
+        # Truncate long config names to avoid filesystem path length limits.
+        # Keep the first 150 chars and append a hash of the full name for uniqueness.
+        if len(config_name) > 150:
+            config_hash = hashlib.sha256(config_name.encode("utf-8")).hexdigest()[:16]
+            config_name = config_name[:150] + "_" + config_hash
         config_dump_dir = os.path.join(fn_dump_manager.cache_dir, config_name)
         os.makedirs(config_dump_dir, exist_ok=True)
         fn_dump_manager.cache_dir = config_dump_dir
