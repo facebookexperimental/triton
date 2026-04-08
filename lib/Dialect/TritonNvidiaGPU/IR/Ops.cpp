@@ -460,44 +460,44 @@ LogicalResult TCGen5MMAOp::verify() {
            << retEnc.getColStride();
 
   // if (getTwoCtas()) {
-    // Once we have a `block` dimension in TMEM, we can look at this via the
-    // associated LL
-    // NOTE(TLX): CTASplitNum verification is disabled because TLX two-CTA
-    // mode intentionally keeps shared memory CTASplitNum as [1,1] to avoid
-    // triggering upstream CTA distribution passes (PlanCTA, AccelerateMatmul).
-    // The upstream checks require {2,1} for LHS, {1,2} for RHS, and {2,1}
-    // for the return value, which is incompatible with TLX's approach.
-    // TODO: Re-enable once TLX adopts upstream's CTAEncodingAttr convention.
-    //
-    // auto checkSplitNum = [&](ArrayRef<unsigned> splitNum,
-    //                          std::string_view name,
-    //                          ArrayRef<unsigned> expected) -> LogicalResult {
-    //   if (splitNum != expected) {
-    //     return emitOpError("The op is two CTAs but the split num of the ")
-    //            << name << " is not " << expected << ". Got " << splitNum;
-    //   }
-    //   return success();
-    // };
-    // if (failed(checkSplitNum(getCTASplitNum(aEnc), "LHS", {2, 1})))
-    //   return failure();
-    // if (failed(checkSplitNum(getCTASplitNum(bEnc), "RHS", {1, 2})))
-    //   return failure();
-    // if (failed(checkSplitNum(getCTASplitNum(retEnc), "returned value",
-    //                          {2, 1})))
-    //   return failure();
+  // Once we have a `block` dimension in TMEM, we can look at this via the
+  // associated LL
+  // NOTE(TLX): CTASplitNum verification is disabled because TLX two-CTA
+  // mode intentionally keeps shared memory CTASplitNum as [1,1] to avoid
+  // triggering upstream CTA distribution passes (PlanCTA, AccelerateMatmul).
+  // The upstream checks require {2,1} for LHS, {1,2} for RHS, and {2,1}
+  // for the return value, which is incompatible with TLX's approach.
+  // TODO: Re-enable once TLX adopts upstream's CTAEncodingAttr convention.
+  //
+  // auto checkSplitNum = [&](ArrayRef<unsigned> splitNum,
+  //                          std::string_view name,
+  //                          ArrayRef<unsigned> expected) -> LogicalResult {
+  //   if (splitNum != expected) {
+  //     return emitOpError("The op is two CTAs but the split num of the ")
+  //            << name << " is not " << expected << ". Got " << splitNum;
+  //   }
+  //   return success();
+  // };
+  // if (failed(checkSplitNum(getCTASplitNum(aEnc), "LHS", {2, 1})))
+  //   return failure();
+  // if (failed(checkSplitNum(getCTASplitNum(bEnc), "RHS", {1, 2})))
+  //   return failure();
+  // if (failed(checkSplitNum(getCTASplitNum(retEnc), "returned value",
+  //                          {2, 1})))
+  //   return failure();
 
-    // NOTE(TLX): twoCTAs encoding checks disabled — TLX does not propagate
-    // twoCTAs into TensorMemoryEncodingAttr. See comment above.
-    // if (!retEnc.getTwoCTAs())
-    //   return emitOpError(
-    //       "The returned value's encoding must have twoCTA=true to be used "
-    //       "in a twoCTA matmul");
-    // if (auto tmemEnc = dyn_cast<TensorMemoryEncodingAttr>(aEnc)) {
-    //   if (!tmemEnc.getTwoCTAs())
-    //     return emitOpError(
-    //         "The LHS operand's encoding must have twoCTA=true to be used "
-    //         "in a twoCTA matmul");
-    // }
+  // NOTE(TLX): twoCTAs encoding checks disabled — TLX does not propagate
+  // twoCTAs into TensorMemoryEncodingAttr. See comment above.
+  // if (!retEnc.getTwoCTAs())
+  //   return emitOpError(
+  //       "The returned value's encoding must have twoCTA=true to be used "
+  //       "in a twoCTA matmul");
+  // if (auto tmemEnc = dyn_cast<TensorMemoryEncodingAttr>(aEnc)) {
+  //   if (!tmemEnc.getTwoCTAs())
+  //     return emitOpError(
+  //         "The LHS operand's encoding must have twoCTA=true to be used "
+  //         "in a twoCTA matmul");
+  // }
   // }
 
   return success();

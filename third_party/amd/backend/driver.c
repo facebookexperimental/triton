@@ -453,15 +453,15 @@ static PyObject *createTDMDescriptor(PyObject *self, PyObject *args) {
   stridesFast = NULL;
 
   {
-  bool success = encodeTDMDescriptor(
-      &descObj->desc, elementBitWidth, blockSizeInt, numWarps, padInterval,
-      padAmount, shapeInt, stridesInt, globalAddress, rank);
-  if (!success) {
-    PyErr_SetString(PyExc_RuntimeError, "Failed to encode TDM descriptor");
-    goto cleanup;
-  }
+    bool success = encodeTDMDescriptor(
+        &descObj->desc, elementBitWidth, blockSizeInt, numWarps, padInterval,
+        padAmount, shapeInt, stridesInt, globalAddress, rank);
+    if (!success) {
+      PyErr_SetString(PyExc_RuntimeError, "Failed to encode TDM descriptor");
+      goto cleanup;
+    }
 
-  return (PyObject *)descObj;
+    return (PyObject *)descObj;
   }
 
 cleanup:

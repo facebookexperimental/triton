@@ -25,7 +25,6 @@ from ..runtime.jit import (
     ConstexprFunction,
     JITFunction,
 )
-from ..language.core import _unwrap_if_constexpr, base_value, base_type
 from .._utils import find_paths_if, get_iterable_path, set_iterable_path, is_namedtuple
 
 from .errors import CompilationError, CompileTimeAssertionFailure, UnsupportedLanguageConstruct
