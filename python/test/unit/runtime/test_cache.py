@@ -795,26 +795,29 @@ def test_higher_order_kernel(device, fresh_triton_cache, capsys):
         val = FUNC()
         tl.store(out_ptr, val)
 
-    output = torch.empty((), device=device, dtype=torch.int32)
-    kernel[(1, )](output, fn_a)
-    assert output.item() == 0
+    with (compilation := triton.knobs.compilation).scope():
+        compilation.always_compile = False
 
-    # Test we can update src in-place
-    orig_src = fn_a.src
-    new_src = orig_src.replace("with fn_a", "with fn_a after modification")
-    new_src = new_src.replace("0", "1")
-    fn_a._unsafe_update_src(new_src)
-    kernel[(1, )](output, fn_a)
-    assert output.item() == 1
+        output = torch.empty((), device=device, dtype=torch.int32)
+        kernel[(1, )](output, fn_a)
+        assert output.item() == 0
 
-    # Test that the on disc cache works
-    kernel.device_caches.clear()
-    kernel[(1, )](output, fn_a)
-    assert output.item() == 1
+        # Test we can update src in-place
+        orig_src = fn_a.src
+        new_src = orig_src.replace("with fn_a", "with fn_a after modification")
+        new_src = new_src.replace("0", "1")
+        fn_a._unsafe_update_src(new_src)
+        kernel[(1, )](output, fn_a)
+        assert output.item() == 1
 
-    fn_a._unsafe_update_src(orig_src)
-    kernel[(1, )](output, fn_a)
-    assert output.item() == 0
+        # Test that the on disc cache works
+        kernel.device_caches.clear()
+        kernel[(1, )](output, fn_a)
+        assert output.item() == 1
+
+        fn_a._unsafe_update_src(orig_src)
+        kernel[(1, )](output, fn_a)
+        assert output.item() == 0
 
     expecttest.assert_expected_inline(capsys.readouterr().out, """\
 Compiling with fn_a
