@@ -319,7 +319,7 @@ To ensure users always have an escape hatch when the higher-level API is insuffi
 | `dialect/lib/Transforms/StorageAliasAllocation.cpp` | Pass Step 3: Materialize allocations, replace ops, rewrite indices |
 | `dialect/lib/Transforms/StorageAliasLowering.cpp` | Combined pass orchestration |
 | `test/TLX/buffer-offset-calculation.mlir` | MLIR-level tests for the offset calculation pass |
-| `python/test/unit/language/test_tlx.py` | Python unit tests for the frontend API and end-to-end compilation |
+| `python/test/unit/language/test_tlx_storage_alias.py` | Python unit tests for the storage alias frontend API and end-to-end compilation |
 | `tutorials/blackwell_fa_ws_pipelined_persistent.py` | Real-world usage example in Flash Attention |
 
 ---
