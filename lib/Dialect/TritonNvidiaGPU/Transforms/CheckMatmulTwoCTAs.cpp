@@ -28,8 +28,7 @@ public:
     Operation *firstMatmul = nullptr;
     bool firstTwoCTA = false;
 
-    auto checkTwoCTA = [&](Operation *op,
-                           bool currentTwoCTA) -> WalkResult {
+    auto checkTwoCTA = [&](Operation *op, bool currentTwoCTA) -> WalkResult {
       if (!firstMatmul) {
         firstMatmul = op;
         firstTwoCTA = currentTwoCTA;
