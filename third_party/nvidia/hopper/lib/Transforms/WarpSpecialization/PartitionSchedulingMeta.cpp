@@ -860,11 +860,36 @@ static void iterateDefs(scf::ForOp loop, Operation *op,
 static void iterateUsers(scf::ForOp loop, Operation *op,
                          function_ref<void(Operation *)> callback) {
   SmallVector<OpOperand *> uses;
+  DenseSet<OpOperand *> visited;
   for (OpOperand &use : op->getUses())
     uses.push_back(&use);
   while (!uses.empty()) {
     OpOperand *use = uses.pop_back_val();
+    if (!visited.insert(use).second)
+      continue;
     Operation *owner = loop.getBody()->findAncestorOpInBlock(*use->getOwner());
+    if (auto nestedFor = dyn_cast<scf::ForOp>(owner)) {
+      // For captured values used inside nested loops, walk the use
+      // chain inside the loop to find partitioned consumers.
+      SmallVector<Operation *> innerWorklist;
+      DenseSet<Operation *> innerVisited;
+      for (OpOperand &innerUse : use->get().getUses())
+        if (nestedFor->isAncestor(innerUse.getOwner()))
+          innerWorklist.push_back(innerUse.getOwner());
+      while (!innerWorklist.empty()) {
+        Operation *innerOp = innerWorklist.pop_back_val();
+        if (!innerVisited.insert(innerOp).second) continue;
+        if (hasPartition(innerOp)) {
+          callback(innerOp);
+        } else {
+          for (Value result : innerOp->getResults())
+            for (OpOperand &u : result.getUses())
+              if (nestedFor->isAncestor(u.getOwner()))
+                innerWorklist.push_back(u.getOwner());
+        }
+      }
+      continue;
+    }
     if (!isa<scf::YieldOp>(owner)) {
       callback(owner);
       continue;
@@ -1740,6 +1765,14 @@ namespace {
 // operation in a partition. This function propagates partitions by first
 // forming contiguous clusters from the unassigned operations and then
 // deciding what to do with the operations in that cluster.
+// Check if an op produces only scalar results (can be rematerialized).
+static bool isScalarOp(Operation *op) {
+  if (op->getNumResults() == 0) return false;
+  return llvm::all_of(op->getResults(), [](Value v) {
+    return !isa<RankedTensorType, triton::gpu::MemDescType>(v.getType());
+  });
+}
+
 void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
                          bool createComputePartitions) {
   OpClusters opClusters;
@@ -1840,7 +1873,8 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
     // Skip dead clusters.
     if (cluster.ops.empty())
       continue;
-    assert(!cluster.defPartitions.empty());
+    // Skip clusters with no def partitions (all scalar ops).
+    if (cluster.defPartitions.empty()) continue;
     assert(llvm::all_of(cluster.ops,
                         [&](Operation *op) { return !hasPartition(op); }));
 
@@ -1863,8 +1897,10 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
           existingComputation = &p;
       }
       if (hasReduction && !hasEpilogue && existingComputation) {
-        for (Operation *op : cluster.ops)
+        for (Operation *op : cluster.ops) {
+          if (isScalarOp(op)) continue;
           setPartition(op, existingComputation);
+        }
         continue;
       }
       // For GEMM with data partitioning, merge into the default partition
@@ -1889,8 +1925,10 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
           }
         }
         if (fallbackPartition) {
-          for (Operation *op : cluster.ops)
+          for (Operation *op : cluster.ops) {
+            if (isScalarOp(op)) continue;
             setPartition(op, fallbackPartition);
+          }
           continue;
         }
       }
@@ -1901,14 +1939,18 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
       // the gemm and computation partitions form a cluster.
       if (cluster.sinkPartitions.size() == 1 &&
           cluster.sinkPartitions.front()->getType() == "computation") {
-        for (Operation *op : cluster.ops)
+        for (Operation *op : cluster.ops) {
+          if (isScalarOp(op)) continue;
           setPartition(op, cluster.sinkPartitions.front());
+        }
         continue;
       }
       Partition *newPartition = schedule.addPartition(0);
       newPartition->setType("computation");
-      for (Operation *op : cluster.ops)
+      for (Operation *op : cluster.ops) {
+        if (isScalarOp(op)) continue;
         setPartition(op, newPartition);
+      }
       continue;
     }
 
@@ -1916,8 +1958,10 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
     // somewhere, for now assign the cluster to the def partition.
     Partition *defPartition = cluster.defPartitions.front();
     if (cluster.sinkPartitions.empty()) {
-      for (Operation *op : cluster.ops)
+      for (Operation *op : cluster.ops) {
+        if (isScalarOp(op)) continue;
         setPartition(op, defPartition);
+      }
       continue;
     }
 
@@ -1942,8 +1986,10 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
 
     // If all ops are on the critical path, assign them to the def partition.
     if (critPath.size() == cluster.ops.size()) {
-      for (Operation *op : cluster.ops)
+      for (Operation *op : cluster.ops) {
+        if (isScalarOp(op)) continue;
         setPartition(op, defPartition);
+      }
       continue;
     }
 
@@ -1962,8 +2008,10 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
       sinkOps.insert(clone);
       setPartition(clone, sinkPartition);
     }
-    for (Operation *op : cluster.ops)
+    for (Operation *op : cluster.ops) {
+      if (isScalarOp(op)) continue;
       setPartition(op, defPartition);
+    }
   }
 }
 

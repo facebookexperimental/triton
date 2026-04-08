@@ -237,11 +237,41 @@ assignment since they are loop-control ops, not data-partition computation ops.
 
 ### `propagatePartitions`
 
-Handles unscheduled ops by forming clusters and assigning them based on their
-def-use relationships to already-scheduled partitions. When
-`createComputePartitions=false` (Hopper with all merges, or no default
-partition), unscheduled clusters merge into existing default or computation
-partitions instead of creating new ones.
+Handles unscheduled ops by forming **clusters** — groups of adjacent
+unscheduled ops connected via the SSA def-use graph. Each cluster tracks:
+
+- **defPartitions**: Partitions of already-scheduled ops that feed into the
+  cluster (upstream).
+- **sinkPartitions**: Partitions of already-scheduled ops that consume the
+  cluster's outputs (downstream).
+
+**Nested loop visibility**: `iterateUsers` follows use chains into nested
+inner loops to find partitioned consumers. When a captured value (e.g.,
+`tt.splat` producing `tensor<!tt.ptr>`) is used inside a nested `scf.for`,
+`iterateUsers` walks the use chain inside the nested loop until it finds an
+op with a partition annotation. This ensures the cluster gets the correct
+sink partition (e.g., computation) rather than falling back to the def
+partition (e.g., reduction). Without this, `propagatePartitions` would
+assign pointer tensor ops to reduction, creating cross-partition channels
+for pointer types that crash `WSCodePartition`.
+
+**Scalar op exclusion**: During cluster assignment, ops that produce only
+scalar results (non-tensor, non-memdesc) are skipped. These ops can be
+rematerialized in any partition and should not force partition assignment.
+Clusters with empty `defPartitions` (containing only scalar ops) are also
+skipped.
+
+Cluster assignment rules:
+
+1. **Multiple def or sink partitions**: The cluster sits between multiple
+   partitions. For BWD-like kernels (has reduction, no epilogue, has
+   computation), assign to the existing computation partition. Otherwise
+   create a new computation partition (unless `createComputePartitions=false`,
+   in which case merge into existing computation).
+2. **No sink partition** (no downstream consumers with partitions): Assign
+   the entire cluster to its def partition.
+3. **Single def and single sink**: Assign to the sink partition (downstream
+   consumer), or to the def partition if they're the same.
 
 ### `schedulePostLoopOps`
 

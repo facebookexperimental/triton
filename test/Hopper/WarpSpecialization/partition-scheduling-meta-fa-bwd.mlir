@@ -13,10 +13,9 @@
 
 // CHECK-LABEL: @_attn_bwd_persist
 //
-// --- Pre-loop: address computation → reduction partition ---
+// --- Pre-loop: address computation -> reduction partition ---
+// (scalar ops may be unscheduled since they can be rematerialized)
 // CHECK: arith.divsi {{.*}}ttg.partition = array<i32: [[RED:[0-9]+]]>
-// CHECK: arith.muli {{.*}}ttg.partition = array<i32: [[RED]]>
-// CHECK: arith.extsi {{.*}}ttg.partition = array<i32: [[RED]]>
 // CHECK: arith.remsi {{.*}}ttg.partition = array<i32: [[RED]]>
 // CHECK: arith.muli {{.*}}ttg.partition = array<i32: [[RED]]>
 // CHECK: arith.divsi {{.*}}ttg.partition = array<i32: [[RED]]>
@@ -24,22 +23,17 @@
 // CHECK: arith.addi {{.*}}ttg.partition = array<i32: [[RED]]>
 // CHECK: arith.extsi {{.*}}ttg.partition = array<i32: [[RED]]>
 // CHECK: arith.divsi {{.*}}ttg.partition = array<i32: [[RED]]>
-// CHECK: tt.addptr {{.*}}ttg.partition = array<i32: [[RED]]>
-// CHECK: tt.addptr {{.*}}ttg.partition = array<i32: [[RED]]>
-// CHECK: arith.addi {{.*}}ttg.partition = array<i32: [[COMP:[0-9]+]]>
-// CHECK: arith.trunci {{.*}}ttg.partition = array<i32: [[COMP]]>
-// --- Pre-loop: K, V descriptor_load → load partition ---
+// --- Pre-loop: K, V descriptor_load -> load partition ---
 // CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD:[0-9]+]]>
 // CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
 // CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD]]>
 // CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
-// CHECK: tt.splat {{.*}}ttg.partition = array<i32: [[RED]]>
-// CHECK: tt.splat {{.*}}ttg.partition = array<i32: [[RED]]>
+// CHECK: tt.splat {{.*}}ttg.partition = array<i32: [[COMP:[0-9]+]]>
+// CHECK: tt.splat {{.*}}ttg.partition = array<i32: [[COMP]]>
 // --- Pre-loop: dq tmem_alloc, dk/dv init → reduction partition ---
 // CHECK: ttng.tmem_alloc {{.*}}ttg.partition = array<i32: [[RED]]>
 // CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: [[RED]]>
 // CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: [[RED]]>
-//
 // --- In-loop: address computation → reduction partition ---
 // CHECK: arith.extsi {{.*}}ttg.partition = array<i32: [[RED]]>
 // CHECK: arith.addi {{.*}}ttg.partition = array<i32: [[RED]]>
