@@ -28,15 +28,14 @@ public:
     Operation *firstMatmul = nullptr;
     bool firstTwoCTA = false;
 
-    WalkResult result = mod.walk([&](ttng::TCGen5MMAOp op) {
-      bool currentTwoCTA = op.getTwoCtas();
+    auto checkTwoCTA = [&](Operation *op, bool currentTwoCTA) -> WalkResult {
       if (!firstMatmul) {
         firstMatmul = op;
         firstTwoCTA = currentTwoCTA;
         return WalkResult::advance();
       }
       if (currentTwoCTA != firstTwoCTA) {
-        auto diag = op.emitError()
+        auto diag = op->emitError()
                     << "inconsistent two_ctas setting across matmuls; "
                        "expected all matmuls to "
                     << (firstTwoCTA ? "enable" : "disable") << " two_ctas.";
@@ -45,6 +44,14 @@ public:
             << (firstTwoCTA ? "true" : "false") << ".";
         return WalkResult::interrupt();
       }
+      return WalkResult::advance();
+    };
+
+    WalkResult result = mod.walk([&](Operation *op) {
+      if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(op))
+        return checkTwoCTA(op, mmaOp.getTwoCtas());
+      if (auto scaledOp = dyn_cast<ttng::TCGen5MMAScaledOp>(op))
+        return checkTwoCTA(op, scaledOp.getTwoCtas());
       return WalkResult::advance();
     });
 
