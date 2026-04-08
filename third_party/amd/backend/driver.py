@@ -500,7 +500,7 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas
 
     hipLaunchAttribute attributes[2];
     // Attribute0: Cluster dimensions
-    attributes[0].id = 4;
+    attributes[0].id = (hipLaunchAttributeID)4;
     int *cluster_dims = (int*)attributes[0].val.pad;
     cluster_dims[0] = num_ctas;
     cluster_dims[1] = 1;
@@ -510,9 +510,9 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas
     attributes[1].val.cooperative = launch_cooperative_grid;
 
     HIP_LAUNCH_CONFIG config = {{
-        gridX * num_ctas, gridY, gridZ, // Grid size
-        {warp_size} * num_warps, 1, 1, // Block size
-        shared_memory, stream,
+        (unsigned int)(gridX * num_ctas), (unsigned int)gridY, (unsigned int)gridZ, // Grid size
+        (unsigned int)({warp_size} * num_warps), 1, 1, // Block size
+        (unsigned int)shared_memory, stream,
         attributes, 2 // Number of attributes
     }};
     HIP_CHECK(hipSymbolTable.hipDrvLaunchKernelEx(&config, function, params, 0));
