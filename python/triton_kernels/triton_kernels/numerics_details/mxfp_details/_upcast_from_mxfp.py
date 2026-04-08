@@ -4,7 +4,6 @@ import triton.language as tl
 from ._downcast_to_mxfp import MXFP_BLOCK_SIZE
 from triton_kernels.target_info import cuda_capability_geq
 
-
 # fmt: off
 
 # ---------------------------------------------------------------------------
