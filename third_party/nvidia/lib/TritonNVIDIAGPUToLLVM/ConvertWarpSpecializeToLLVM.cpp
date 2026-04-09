@@ -92,8 +92,10 @@ static void createBarrier(TritonLLVMIRRewriter &b, unsigned barIdx,
   if (numThreads == 32)
     LLVM::NVIDIA::createSyncWarp(b.getLoc(), b);
   else
-    NVVM::BarrierOp::create(b, b.getLoc(), b.i32_val(barIdx),
-                            b.i32_val(numThreads));
+    NVVM::BarrierOp::create(b, b.getLoc(), mlir::TypeRange{},
+                            b.i32_val(barIdx), b.i32_val(numThreads),
+                            /*reductionOp=*/nullptr,
+                            /*reductionPredicate=*/nullptr);
 }
 
 static void createAllBarrier(TritonLLVMIRRewriter &b, unsigned barIdx) {

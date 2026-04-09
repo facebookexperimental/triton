@@ -630,7 +630,7 @@ void TritonIntegerRangeAnalysis::initializeFuncOp(tt::FuncOp op) {
 
 void TritonIntegerRangeAnalysis::visitRegionSuccessors(
     ProgramPoint *point, RegionBranchOpInterface branch,
-    RegionBranchPoint successor,
+    RegionSuccessor successor,
     ArrayRef<dataflow::AbstractSparseLattice *> abstractLattices) {
   LLVM_DEBUG({
     DBGS() << "Visit Region Succesors of ";
@@ -716,7 +716,7 @@ void TritonIntegerRangeAnalysis::visitRegionSuccessors(
           firstIndex = cast<OpResult>(inputs.front()).getResultNumber();
         }
         visitNonControlFlowArguments(branch,
-                                     RegionSuccessor(branch->getResults().slice(
+                                     RegionSuccessor(branch, branch->getResults().slice(
                                          firstIndex, inputs.size())),
                                      lattices, firstIndex);
       } else {
