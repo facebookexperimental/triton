@@ -475,7 +475,7 @@ bool initSymbolTable() {{
 
 static inline void gpuAssert(hipError_t code, const char *file, int line)
 {{
-   if (code != HIP_SUCCESS)
+   if (code != hipSuccess)
    {{
       const char* prefix = "Triton Error [HIP]: ";
       const char* str = hipSymbolTable.hipGetErrorString(code);
