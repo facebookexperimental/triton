@@ -204,49 +204,28 @@ LogicalResult InvalBarrierOp::verify() {
 
 // -- FenceMBarrierInitReleaseClusterOp --
 LogicalResult FenceMBarrierInitReleaseClusterOp::verify() {
-  int numCTAs = triton::gpu::lookupNumCTAs(getOperation());
-  if (numCTAs <= 1){
-    // upstream numCTA is 1, check TLX cluster size
-    const SmallVector<int> tlxClusterDims =
-      triton::gpu::TritonGPUDialect::getClusterDims(getOperation()->getParentOfType<ModuleOp>());
-    int tlxClusterSize = 1;
-    for (int d : tlxClusterDims)
-      tlxClusterSize *= d;
-      if(tlxClusterSize <= 1)
-        return emitOpError("requires ttg.num-ctas > 1 or TLX cluster size > 1");
-  }
+  // FB: comment out these because we allow the op in frontend/ttir, where the
+  // ir does not have tlx cluster dim yet int numCTAs =
+  // triton::gpu::lookupNumCTAs(getOperation()); if (numCTAs <= 1)
+  //   return emitOpError("requires ttg.num-ctas > 1");
   return success();
 }
 
 // -- ClusterArriveOp --
 LogicalResult ClusterArriveOp::verify() {
-  int numCTAs = triton::gpu::lookupNumCTAs(getOperation());
-  if (numCTAs <= 1){
-    // upstream numCTA is 1, check TLX cluster size
-    const SmallVector<int> tlxClusterDims =
-      triton::gpu::TritonGPUDialect::getClusterDims(getOperation()->getParentOfType<ModuleOp>());
-    int tlxClusterSize = 1;
-    for (int d : tlxClusterDims)
-      tlxClusterSize *= d;
-      if(tlxClusterSize <= 1)
-        return emitOpError("requires ttg.num-ctas > 1 or TLX cluster size > 1");
-  }
+  // FB: comment out these because we allow the op in frontend/ttir, where the
+  // ir does not have tlx cluster dim yet int numCTAs =
+  // triton::gpu::lookupNumCTAs(getOperation()); if (numCTAs <= 1)
+  //   return emitOpError("requires ttg.num-ctas > 1");
   return success();
 }
 
 // -- ClusterWaitOp --
 LogicalResult ClusterWaitOp::verify() {
-  int numCTAs = triton::gpu::lookupNumCTAs(getOperation());
-  if (numCTAs <= 1){
-    // upstream numCTA is 1, check TLX cluster size
-    const SmallVector<int> tlxClusterDims =
-      triton::gpu::TritonGPUDialect::getClusterDims(getOperation()->getParentOfType<ModuleOp>());
-    int tlxClusterSize = 1;
-    for (int d : tlxClusterDims)
-      tlxClusterSize *= d;
-      if(tlxClusterSize <= 1)
-        return emitOpError("requires ttg.num-ctas > 1 or TLX cluster size > 1");
-  }
+  // FB: comment out these because we allow the op in frontend/ttir, where the
+  // ir does not have tlx cluster dim yet int numCTAs =
+  // triton::gpu::lookupNumCTAs(getOperation()); if (numCTAs <= 1)
+  //   return emitOpError("requires ttg.num-ctas > 1");
   return success();
 }
 
