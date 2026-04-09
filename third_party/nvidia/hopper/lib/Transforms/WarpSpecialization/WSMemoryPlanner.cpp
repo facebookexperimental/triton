@@ -252,7 +252,8 @@ static LogicalResult getAllAcutalUsersForChannel(Channel *TheCh,
     // Allocations inside loops should have associated channels
     // For outside loop ops, channels are not created when there is
     // no valid producer or outside loop op has no task IDs (e.g., store)
-    if (alloc && alloc->getParentOfType<scf::ForOp>()) {
+    if (alloc && alloc->getParentOfType<scf::ForOp>() &&
+        !alloc->hasAttr("tma_store_buffer")) {
       return alloc->emitError(
           "getAllAcutalUsersForChannel: expected channel for allocation "
           "inside loop");

@@ -1116,11 +1116,35 @@ getInitialSchedule(scf::ForOp mainLoop,
   // truncf, etc.)
   if (epiloguePartition) {
     // Stores inside loops (both pre-lowering DescriptorStoreOp and
-    // post-lowering AsyncTMACopyLocalToGlobalOp)
+    // post-lowering AsyncTMACopyLocalToGlobalOp) and their backward slice
+    // (epilogue computation: tmem_load, truncf, bias add, broadcast, etc.)
     for (auto loop : loops) {
       loop.walk([&](Operation *op) {
-        if (isEpilogueStoreOp(op))
+        if (isEpilogueStoreOp(op)) {
           tryScheduleOp(epiloguePartition, op);
+          // Schedule the backward slice so epilogue computation ops
+          // (between TMEMLoad and the store) land in the same partition.
+          SetVector<Operation *> slice;
+          BackwardSliceOptions options;
+          options.omitBlockArguments = true;
+          options.filter = [&](Operation *sliceOp) {
+            // Stay within the loop
+            if (!loop->isProperAncestor(sliceOp))
+              return false;
+            // Skip already-scheduled ops and control flow
+            if (hasPartition(sliceOp))
+              return false;
+            if (isa<scf::ForOp, scf::IfOp, scf::WhileOp>(sliceOp))
+              return false;
+            return true;
+          };
+          (void)getBackwardSlice(op, &slice, options);
+          for (Operation *sliceOp : slice) {
+            if (isa<arith::ConstantOp>(sliceOp))
+              continue;
+            tryScheduleOp(epiloguePartition, sliceOp);
+          }
+        }
       });
     }
 

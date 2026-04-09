@@ -39,6 +39,17 @@ TritonGPUTypeConverter::TritonGPUTypeConverter(MLIRContext *context,
     return tensorType.cloneWithEncoding(encoding);
   });
 
+  // Add encoding for tensor descriptor
+  addConversion(
+      [this](triton::TensorDescType descType) -> triton::TensorDescType {
+        auto blockType = descType.getBlockType();
+        if (blockType.getEncoding())
+          return descType;
+        auto convertedBlockType =
+            cast<RankedTensorType>(convertType(blockType));
+        return triton::TensorDescType::get(this->context, convertedBlockType);
+      });
+
   // Add encoding for tensor pointer
   addConversion([this](triton::PointerType ptrType) -> triton::PointerType {
     // Check whether tensor pointer `tt.ptr<tensor<>>`

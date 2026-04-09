@@ -12,7 +12,33 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/Support/LogicalResult.h"
 
+#include "mlir/Dialect/SCF/IR/SCF.h"
+
 #define DEBUG_TYPE "nvgpu-warp-specialization"
+
+// Fixup: ensure scf.yield terminators are the last ops in their blocks.
+// Various WS pipeline steps can leave materializations or reordered ops
+// after the yield, violating MLIR's block structure invariant.
+static void fixupTerminators(mlir::triton::FuncOp &funcOp) {
+  funcOp->walk([&](mlir::Block *block) {
+    if (block->empty())
+      return;
+    mlir::Operation *terminator = nullptr;
+    for (mlir::Operation &op : *block) {
+      if (op.hasTrait<mlir::OpTrait::IsTerminator>()) {
+        terminator = &op;
+        break;
+      }
+    }
+    if (!terminator)
+      return;
+    for (auto it = std::next(mlir::Block::iterator(terminator)),
+              e = block->end();
+         it != e;) {
+      (&*it++)->moveBefore(terminator);
+    }
+  });
+}
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
@@ -85,6 +111,9 @@ public:
     }
     if (!enabled)
       return;
+
+
+    fixupTerminators(funcOp);
 
     // int numWarps = mlir::triton::gpu::lookupNumWarps(funcOp);
     // if (numWarps != 4) {
@@ -186,6 +215,8 @@ public:
     // persistent kernels.
     removeRedundantTmemZeroStores(funcOp);
 
+    fixupTerminators(funcOp);
+
     // Canonicalize the SMEM/TEM buffers.
     // Create buffers for register channels.
     doBufferAllocation(funcOp);
@@ -216,6 +247,8 @@ public:
       moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
       llvm::dbgs() << "\n\n\n";
     }
+
+    fixupTerminators(funcOp);
 
     doAnnotateTMAStoreWaits(funcOp);
     if (dumpIntermediateSteps) {
@@ -251,6 +284,7 @@ public:
       }
     }
 
+    fixupTerminators(funcOp);
     doTokenLowering(funcOp, numWarpGroups - 1);
     if (dumpIntermediateSteps) {
       llvm::dbgs()

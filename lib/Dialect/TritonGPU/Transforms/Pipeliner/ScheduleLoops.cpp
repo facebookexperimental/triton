@@ -808,10 +808,10 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
     auto ops = forOp.getBody()->without_terminator();
     for (Operation &op : llvm::make_filter_range(ops, isLatencyOp)) {
       // FIXME: This should assert all latency ops have an assigned stage.
+      // Ops created by doCodePartitionPost (e.g., cross-partition channel
+      // LocalStoreOp/LocalLoadOp) may not have stages assigned yet.
       if (schedule.count(&op))
         latencyStages.insert(schedule[&op].first);
-      else if (useMetaWS)
-        assert(false);
     }
     if (latencyStages.size() <= 1) {
       CoarseSchedule normalized(/*numStages=*/1);
