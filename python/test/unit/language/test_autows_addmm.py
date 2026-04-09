@@ -65,6 +65,7 @@ def addmm_kernel_tma_persistent_ws(
             disallow_acc_multi_buffer=True,
             data_partition_factor=DATA_PARTITION_FACTOR,
             smem_alloc_algo=SMEM_ALLOC_ALGO,
+            separate_epilogue_store=True,
     ):
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M

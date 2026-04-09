@@ -2538,7 +2538,10 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
         createChannelsForProducers(currentProds, producerTaskId, consumerIds,
                                    tmemAllocOp.getOperation(), user, channels);
       } else {
-        assert(false && "Unexpected Producer Found");
+        // Producer and consumer are in the same partition — no
+        // cross-partition synchronization required. This can happen
+        // when if/else blocks cause partition assignments where both
+        // sides end up in the same task.
       }
     }
   }

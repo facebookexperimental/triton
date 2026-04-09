@@ -271,10 +271,23 @@ def NVGPUPartitionSchedulingMeta : Pass<"nvgpu-partition-scheduling-meta", "mlir
   }];
 
   let options = [
-    Option<"mergeEpilogueIntoComputation", "merge-epilogue-into-computation",
+    Option<"mergeEpilogue", "merge-epilogue",
            "bool", /*default*/"false",
-           "If true, merge epilogue stores into the computation partition "
-           "instead of creating a separate epilogue partition">
+           "If true, merge epilogue ops into the correction/reduction partition "
+           "(or computation partition if neither exists)">,
+    Option<"mergeEpilogueToComputation", "merge-epilogue-to-computation",
+           "bool", /*default*/"false",
+           "If true, merge epilogue ops directly into computation[dpId] "
+           "partitions, even if correction/reduction exists">,
+    Option<"mergeCorrection", "merge-correction",
+           "bool", /*default*/"false",
+           "If true, merge correction ops into computation[dpId] partitions">,
+    Option<"mergeReduction", "merge-reduction",
+           "bool", /*default*/"false",
+           "If true, merge reduction ops into computation[dpId] partitions">,
+    Option<"separateEpilogueStore", "separate-epilogue-store",
+           "bool", /*default*/"false",
+           "If true, place epilogue store ops in a dedicated 1-warp partition">
   ];
 }
 
