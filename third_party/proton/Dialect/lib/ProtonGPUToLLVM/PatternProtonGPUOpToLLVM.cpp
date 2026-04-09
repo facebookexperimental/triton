@@ -676,9 +676,9 @@ private:
     // Add the 'else' block and the condition.
     Block *thenBlock = rewriter.splitBlock(ifBlock, op->getIterator());
     rewriter.setInsertionPointToEnd(prevBlock);
-    rewriter.create<cf::CondBranchOp>(loc, isFirstThread, ifBlock, thenBlock);
+    cf::CondBranchOp::create(rewriter, loc, isFirstThread, ifBlock, thenBlock);
     rewriter.setInsertionPointToEnd(ifBlock);
-    rewriter.create<cf::BranchOp>(loc, thenBlock);
+    cf::BranchOp::create(rewriter, loc, thenBlock);
   }
 
 protected:

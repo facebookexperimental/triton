@@ -121,7 +121,7 @@ public:
         Location loc = op.getLoc();
         for (auto barrier : barriers) {
           if (domInfo.properlyDominates(barrier, op)) {
-            builder.create<ttng::InvalBarrierOp>(loc, barrier);
+            ttng::InvalBarrierOp::create(builder, loc, barrier);
           }
         }
       });

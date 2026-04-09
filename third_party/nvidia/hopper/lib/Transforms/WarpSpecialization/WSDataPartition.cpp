@@ -1062,7 +1062,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
                      "backward-sliced in getSliceToPartition?");
     if (newSrc.getType() != newSrcType) {
       auto cvtOp =
-          builder.create<ConvertLayoutOp>(op->getLoc(), newSrcType, newSrc);
+          ConvertLayoutOp::create(builder, op->getLoc(), newSrcType, newSrc);
       mappings.map(tmemStOp.getSrc(), cvtOp->getResult(0));
     }
     newOp = cloneAndSetResultType(op);

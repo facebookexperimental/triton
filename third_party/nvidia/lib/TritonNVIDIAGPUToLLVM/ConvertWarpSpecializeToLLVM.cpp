@@ -92,8 +92,8 @@ static void createBarrier(TritonLLVMIRRewriter &b, unsigned barIdx,
   if (numThreads == 32)
     LLVM::NVIDIA::createSyncWarp(b.getLoc(), b);
   else
-    NVVM::BarrierOp::create(b, b.getLoc(), mlir::TypeRange{},
-                            b.i32_val(barIdx), b.i32_val(numThreads),
+    NVVM::BarrierOp::create(b, b.getLoc(), mlir::TypeRange{}, b.i32_val(barIdx),
+                            b.i32_val(numThreads),
                             /*reductionOp=*/nullptr,
                             /*reductionPredicate=*/nullptr);
 }
@@ -601,8 +601,8 @@ struct ConvertWarpSpecializeToLLVM
           // active and should not have exited."
           auto unitAttr = UnitAttr::get(ctx);
           rewriter.setInsertionPoint(ret);
-          rewriter.create<NVVM::ClusterArriveOp>(loc, unitAttr);
-          rewriter.create<NVVM::ClusterWaitOp>(loc, unitAttr);
+          NVVM::ClusterArriveOp::create(rewriter, loc, unitAttr);
+          NVVM::ClusterWaitOp::create(rewriter, loc, unitAttr);
         });
       }
     }

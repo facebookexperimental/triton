@@ -182,19 +182,19 @@ private:
           initIndexValue
               ? (initIndexValue.getType().isInteger(32)
                      ? initIndexValue
-                     : builder.create<arith::IndexCastOp>(
-                           loc, builder.getI32Type(), initIndexValue))
-              : builder.create<arith::ConstantOp>(loc, builder.getI32Type(),
-                                                  builder.getI32IntegerAttr(0));
+                     : arith::IndexCastOp::create(
+                           builder, loc, builder.getI32Type(), initIndexValue))
+              : arith::ConstantOp::create(builder, loc, builder.getI32Type(),
+                                          builder.getI32IntegerAttr(0));
       if (pos <= newInitArgs.size())
         newInitArgs.insert(newInitArgs.begin() + pos, initValue);
     }
 
     // Create new for loop
     builder.setInsertionPoint(forOp);
-    auto newForOp = builder.create<scf::ForOp>(loc, forOp.getLowerBound(),
-                                               forOp.getUpperBound(),
-                                               forOp.getStep(), newInitArgs);
+    auto newForOp =
+        scf::ForOp::create(builder, loc, forOp.getLowerBound(),
+                           forOp.getUpperBound(), forOp.getStep(), newInitArgs);
 
     Block *newBlock = newForOp.getBody();
     Block *oldBlock = forOp.getBody();
@@ -227,7 +227,7 @@ private:
     for (Value v : newYieldOperands)
       mappedYieldOperands.push_back(mapping.lookupOrDefault(v));
 
-    builder.create<scf::YieldOp>(loc, mappedYieldOperands);
+    scf::YieldOp::create(builder, loc, mappedYieldOperands);
 
     numInserted = 0;
     newIdx = 0;
@@ -335,13 +335,13 @@ private:
               builder.setInsertionPoint(terminator);
               if (idx.getType().isInteger(32))
                 return idx;
-              return builder.create<arith::IndexCastOp>(
-                  terminator->getLoc(), builder.getI32Type(), idx);
+              return arith::IndexCastOp::create(builder, terminator->getLoc(),
+                                                builder.getI32Type(), idx);
             }
             builder.setInsertionPoint(terminator);
-            return builder.create<arith::ConstantOp>(
-                terminator->getLoc(), builder.getI32Type(),
-                builder.getI32IntegerAttr(0));
+            return arith::ConstantOp::create(builder, terminator->getLoc(),
+                                             builder.getI32Type(),
+                                             builder.getI32IntegerAttr(0));
           };
 
           if (auto branchOp = dyn_cast<cf::BranchOp>(terminator)) {
@@ -355,8 +355,8 @@ private:
                                  newIndexValue);
 
               builder.setInsertionPoint(branchOp);
-              builder.create<cf::BranchOp>(branchOp.getLoc(), block,
-                                           newOperands);
+              cf::BranchOp::create(builder, branchOp.getLoc(), block,
+                                   newOperands);
               branchOp.erase();
             }
           } else if (auto condBranchOp =
@@ -385,8 +385,8 @@ private:
             }
 
             builder.setInsertionPoint(condBranchOp);
-            builder.create<cf::CondBranchOp>(
-                condBranchOp.getLoc(), condBranchOp.getCondition(),
+            cf::CondBranchOp::create(
+                builder, condBranchOp.getLoc(), condBranchOp.getCondition(),
                 condBranchOp.getTrueDest(), newTrueOperands,
                 condBranchOp.getFalseDest(), newFalseOperands);
             condBranchOp.erase();
@@ -636,8 +636,8 @@ private:
       if (v.getType().isInteger(32))
         return v;
       builder.setInsertionPoint(op);
-      return builder
-          .create<arith::IndexCastOp>(op->getLoc(), builder.getI32Type(), v)
+      return arith::IndexCastOp::create(builder, op->getLoc(),
+                                        builder.getI32Type(), v)
           .getResult();
     };
 
@@ -745,7 +745,7 @@ private:
     auto toCounterType = [&](Value v) -> Value {
       return v.getType() == counterType
                  ? v
-                 : builder.create<arith::IndexCastOp>(loc, counterType, v)
+                 : arith::IndexCastOp::create(builder, loc, counterType, v)
                        .getResult();
     };
 

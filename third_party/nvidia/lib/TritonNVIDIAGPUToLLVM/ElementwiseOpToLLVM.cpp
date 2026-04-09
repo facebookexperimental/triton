@@ -571,10 +571,10 @@ struct FpToFpOpConversion
       for (unsigned j = 1; j < rbitsPack.size(); ++j) {
         // Shift r[j] by j positions to decorrelate bit patterns
         Value shiftAmount = b.i32_val(j);
-        Value shifted =
-            rewriter.create<LLVM::ShlOp>(loc, i32Ty, rbitsPack[j], shiftAmount);
+        Value shifted = LLVM::ShlOp::create(rewriter, loc, i32Ty, rbitsPack[j],
+                                            shiftAmount);
         // XOR with accumulated rbits to mix entropy sources
-        rbits = rewriter.create<LLVM::XOrOp>(loc, i32Ty, rbits, shifted);
+        rbits = LLVM::XOrOp::create(rewriter, loc, i32Ty, rbits, shifted);
       }
 
       // Emit PTX inline assembly for stochastic rounding

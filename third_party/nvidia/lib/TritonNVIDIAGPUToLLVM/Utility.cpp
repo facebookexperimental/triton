@@ -141,11 +141,11 @@ Value createElectPredicateWarp0(Location loc, RewriterBase &rewriter) {
 
 Value createLeaderCTAPredicate(Location loc, RewriterBase &rewriter) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
-  Value clusterCTARank = rewriter.create<triton::nvgpu::ClusterCTAIdOp>(
-      loc, rewriter.getI32Type());
+  Value clusterCTARank = triton::nvgpu::ClusterCTAIdOp::create(
+      rewriter, loc, rewriter.getI32Type());
   // Always pick the even numbered CTA in the CTA pair to be the leader
   Value rem =
-      rewriter.create<mlir::arith::RemUIOp>(loc, clusterCTARank, b.i32_val(2));
+      mlir::arith::RemUIOp::create(rewriter, loc, clusterCTARank, b.i32_val(2));
   return b.icmp_eq(rem, b.i32_val(0));
 }
 

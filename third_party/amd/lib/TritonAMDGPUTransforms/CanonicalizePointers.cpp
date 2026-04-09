@@ -1239,9 +1239,9 @@ public:
     }
 #endif
 
-    auto newWsOp = rewriter.create<ttg::WarpSpecializeOp>(
-        wsOp.getLoc(), wsOp.getResultTypes(), wsOp.getPartitionNumWarps(),
-        wsOp.getPartitionRegions().size());
+    auto newWsOp = ttg::WarpSpecializeOp::create(
+        rewriter, wsOp.getLoc(), wsOp.getResultTypes(),
+        wsOp.getPartitionNumWarps(), wsOp.getPartitionRegions().size());
     newWsOp->setAttrs(wsOp->getAttrs());
     newWsOp->setOperands(flattenValues(remappedOperands));
 

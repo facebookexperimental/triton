@@ -67,8 +67,8 @@ LogicalResult insertRequireLayout(ModuleOp m) {
             auto newType = ttg::MemDescType::get(
                 type.getShape(), type.getElementType(), encodingAttr,
                 type.getMemorySpace(), type.getMutableMemory());
-            auto converLayoutOp = builder.create<tlx::RequireLayoutOp>(
-                op->getLoc(), newType, loadMemDescTy);
+            auto converLayoutOp = tlx::RequireLayoutOp::create(
+                builder, op->getLoc(), newType, loadMemDescTy);
             localLoadOp->setOperand(0, converLayoutOp.getResult());
           }
         } else {

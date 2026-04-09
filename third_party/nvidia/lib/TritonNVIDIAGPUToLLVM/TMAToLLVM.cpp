@@ -327,8 +327,8 @@ struct PrefetchTensormapOpConversion
     // Device side TMA desc gets initialized in SMEM and copied to GMEM
     // We use Generic Address state space here to support both
     auto genericPtrTy = LLVM::LLVMPointerType::get(ctx, 0);
-    Value addr = rewriter.create<LLVM::AddrSpaceCastOp>(loc, genericPtrTy,
-                                                        adaptor.getDesc());
+    Value addr = LLVM::AddrSpaceCastOp::create(rewriter, loc, genericPtrTy,
+                                               adaptor.getDesc());
     // Note: not lowering to NVVM::PrefetchOp as it seems to have a bug where
     // if I don't set `$in_param_space` (leading to prefetch.param.tensormap)
     // it's emitting both `prefetch.tensormap` and `prefetch.param.tensormap` at
