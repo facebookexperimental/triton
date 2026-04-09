@@ -305,8 +305,8 @@ void init_triton_tlx_ir(py::module &&m) {
              //  Init barrier in each slot
              for (auto i = 0; i < numBarriers; i++) {
                // Obtain the single buffer view
-               Value idx = self.getBuilder().create<arith::ConstantIntOp>(
-                   bufferViews.getLoc(), i, 32);
+               Value idx = arith::ConstantIntOp::create(
+                   self.getBuilder(), bufferViews.getLoc(), i, 32);
                mlir::Value buf = self.create<ttg::MemDescIndexOp>(
                    singleBarrierMemDescType, bufferViews, idx);
 

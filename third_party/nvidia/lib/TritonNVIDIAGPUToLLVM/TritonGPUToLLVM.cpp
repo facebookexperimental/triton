@@ -378,9 +378,9 @@ private:
     // need to insert cluster arrive and wait to prevent CTA_X from arriving
     // CTA_Y's bar before CTA_Y inits it, as shown in ptx doc examples:
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-test-wait-try-wait
-    builder.create<ttng::ClusterArriveOp>(lastBarInitOp.getLoc(),
-                                          /*relaxed*/ false);
-    builder.create<ttng::ClusterWaitOp>(lastBarInitOp.getLoc());
+    ttng::ClusterArriveOp::create(builder, lastBarInitOp.getLoc(),
+                                  /*relaxed*/ false);
+    ttng::ClusterWaitOp::create(builder, lastBarInitOp.getLoc());
 
     return success();
   }

@@ -20,9 +20,10 @@ ttng::TMEMAllocOp TMEM1DAllocator::alloc1DTMEMBuffer() {
   auto oldRetType = getResultTensorType(expandedInput->getResult(0), 2);
   auto shape = oldRetType.getShape();
   auto tmemDesc = createTMEMDesc(builder, oldRetType, shape[0], shape[1]);
-  auto allocCall = builder.create<ttng::TMEMAllocOp>(
-      expandedInput->getLoc(), tmemDesc, builder.getType<ttg::AsyncTokenType>(),
-      /*src=*/Value());
+  auto allocCall =
+      ttng::TMEMAllocOp::create(builder, expandedInput->getLoc(), tmemDesc,
+                                builder.getType<ttg::AsyncTokenType>(),
+                                /*src=*/Value());
   return allocCall;
 }
 
@@ -232,15 +233,15 @@ sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
   auto elemTyWidth = newType.getElementType().getIntOrFloatBitWidth();
   auto oldElemTyWidth = allocType.getElementType().getIntOrFloatBitWidth();
   if (oldElemTyWidth == elemTyWidth * 2) {
-    auto subSlice = builder.create<ttng::TMEMSubSliceOp>(
-        allocOp->getLoc(), allocResult, offset, blockN / 2);
-    return builder.create<ttg::MemDescReinterpretOp>(allocOp->getLoc(),
-                                                     tmemDesc, subSlice);
+    auto subSlice = ttng::TMEMSubSliceOp::create(
+        builder, allocOp->getLoc(), allocResult, offset, blockN / 2);
+    return ttg::MemDescReinterpretOp::create(builder, allocOp->getLoc(),
+                                             tmemDesc, subSlice);
   } else if (elemTyWidth == oldElemTyWidth) {
-    auto subSlice = builder.create<ttng::TMEMSubSliceOp>(
-        allocOp->getLoc(), allocResult, offset, blockN);
-    return builder.create<ttg::MemDescReinterpretOp>(allocOp->getLoc(),
-                                                     tmemDesc, subSlice);
+    auto subSlice = ttng::TMEMSubSliceOp::create(builder, allocOp->getLoc(),
+                                                 allocResult, offset, blockN);
+    return ttg::MemDescReinterpretOp::create(builder, allocOp->getLoc(),
+                                             tmemDesc, subSlice);
   } else {
     // Unsupported element type conversion
     return nullptr;
@@ -268,10 +269,10 @@ ttg::MemDescReinterpretOp sliceAndReinterpretTMEMBuffer(OpBuilder &builder,
 
   auto tmemDesc =
       createTMEMDesc(builder, allocType, shape[shape.size() - 2], 1);
-  auto subSlice = builder.create<ttng::TMEMSubSliceOp>(
-      allocOp->getLoc(), allocResult, offset, blockN);
-  return builder.create<ttg::MemDescReinterpretOp>(allocOp->getLoc(), tmemDesc,
-                                                   subSlice);
+  auto subSlice = ttng::TMEMSubSliceOp::create(builder, allocOp->getLoc(),
+                                               allocResult, offset, blockN);
+  return ttg::MemDescReinterpretOp::create(builder, allocOp->getLoc(), tmemDesc,
+                                           subSlice);
 }
 
 ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
@@ -306,10 +307,9 @@ ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
   size_t CTASplitN;
   bool twoCTAs = false;
   if (auto ttgLayout = mlir::dyn_cast<ttg::LayoutEncodingTrait>(encoding)) {
-    ArrayRef<unsigned> CTASplitNum =
-        ttg::getCTALayout(encoding).getCTASplitNum();
-    CTASplitM = CTASplitNum[0];
-    CTASplitN = CTASplitNum[1];
+    auto ctaLayoutAttr = ttg::getCTALayout(encoding);
+    CTASplitM = ctaLayoutAttr.getCTASplitNum()[0];
+    CTASplitN = ctaLayoutAttr.getCTASplitNum()[1];
   } else if (auto tmemLayout =
                  mlir::dyn_cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
                      encoding)) {

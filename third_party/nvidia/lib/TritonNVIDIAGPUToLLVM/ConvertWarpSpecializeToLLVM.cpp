@@ -601,8 +601,8 @@ struct ConvertWarpSpecializeToLLVM
           // active and should not have exited."
           auto unitAttr = UnitAttr::get(ctx);
           rewriter.setInsertionPoint(ret);
-          rewriter.create<NVVM::ClusterArriveOp>(loc, unitAttr);
-          rewriter.create<NVVM::ClusterWaitOp>(loc, unitAttr);
+          NVVM::ClusterArriveOp::create(rewriter, loc, unitAttr);
+          NVVM::ClusterWaitOp::create(rewriter, loc, unitAttr);
         });
       }
     }

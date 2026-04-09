@@ -1335,8 +1335,8 @@ void createTokenPost(
           llvm_unreachable("Unexpected load type");
         }
         Value v;
-        v = builder.create<ttnvws::CreateTokenOp>(
-            funcOp.getLoc(), channel->getNumBuffers(), tokenLoadType);
+        v = ttnvws::CreateTokenOp::create(
+            builder, funcOp.getLoc(), channel->getNumBuffers(), tokenLoadType);
         commChannel.tokens[consumerAsyncTaskId] = v;
       }
 
@@ -1404,15 +1404,15 @@ static Value hoistLocalAlloc(OpBuilderWithAsyncTaskIds &builder,
   Operation *newAlloc;
   if (auto localAlloc = dyn_cast<ttg::LocalAllocOp>(oldAlloc)) {
     newAlloc =
-        builder.create<ttg::LocalAllocOp>(oldAlloc->getLoc(), memdescType);
+        ttg::LocalAllocOp::create(builder, oldAlloc->getLoc(), memdescType);
   } else if (auto tmemAlloc = dyn_cast<ttng::TMEMAllocOp>(oldAlloc)) {
     if (tmemAlloc.getToken()) {
-      newAlloc = builder.create<ttng::TMEMAllocOp>(
-          oldAlloc->getLoc(), memdescType, tmemAlloc.getToken().getType(),
-          Value());
+      newAlloc =
+          ttng::TMEMAllocOp::create(builder, oldAlloc->getLoc(), memdescType,
+                                    tmemAlloc.getToken().getType(), Value());
     } else {
-      newAlloc = builder.create<ttng::TMEMAllocOp>(
-          oldAlloc->getLoc(), memdescType, mlir::Type(), Value());
+      newAlloc = ttng::TMEMAllocOp::create(builder, oldAlloc->getLoc(),
+                                           memdescType, mlir::Type(), Value());
     }
   } else {
     llvm_unreachable("Unexpected alloc type");
@@ -1496,8 +1496,8 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
         channel->srcName.empty()
             ? srcOp->getLoc()
             : replaceOutermostNameLoc(srcOp->getLoc(), channel->srcName);
-    auto allocOp = builder.create<ttng::TMEMAllocOp>(
-        allocLoc, memdescType, builder.getType<ttg::AsyncTokenType>(),
+    auto allocOp = ttng::TMEMAllocOp::create(
+        builder, allocLoc, memdescType, builder.getType<ttg::AsyncTokenType>(),
         /*src=*/Value());
     newProducer = TMEM1DAllocator(builder).replaceWith1DTMEM(
         dyn_cast<mlir::OpResult>(srcResult), channel->relation.first, dstOp,
@@ -1565,7 +1565,7 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
         channel->srcName.empty()
             ? srcOp->getLoc()
             : replaceOutermostNameLoc(srcOp->getLoc(), channel->srcName);
-    auto allocOp = builder.create<ttg::LocalAllocOp>(allocLoc, memdescType);
+    auto allocOp = ttg::LocalAllocOp::create(builder, allocLoc, memdescType);
     buffer = allocOp->getResult(0);
 
     if (isPost) {
@@ -1605,7 +1605,7 @@ static ttg::LocalAllocOp hoistLocalAllocPost(OpBuilder &builder,
   Type memdescType = ttg::MemDescType::get(
       shape, allocDescType.getElementType(), allocDescType.getEncoding(),
       allocDescType.getMemorySpace(), allocDescType.getMutableMemory());
-  return builder.create<ttg::LocalAllocOp>(oldAlloc.getLoc(), memdescType);
+  return ttg::LocalAllocOp::create(builder, oldAlloc.getLoc(), memdescType);
 }
 
 static ttng::TMEMAllocOp createTMemAllocPost(OpBuilder &builder,
@@ -3108,8 +3108,8 @@ void foldLocalLoads(triton::FuncOp funcOp) {
 // Compare against TritonNvidiaGPURemoveTMEMTokensPass.
 static void cleanupTmemTokens(triton::FuncOp funcOp) {
   auto b = OpBuilder::atBlockBegin(&funcOp.getBody().front());
-  Value replTok =
-      b.create<ub::PoisonOp>(funcOp.getLoc(), b.getType<ttg::AsyncTokenType>());
+  Value replTok = ub::PoisonOp::create(b, funcOp.getLoc(),
+                                       b.getType<ttg::AsyncTokenType>());
   funcOp.walk([&](Operation *op) {
     if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(op)) {
       storeOp.getDepMutable().clear();
@@ -3150,7 +3150,7 @@ static void separateLocalAllocWithSrc(triton::FuncOp &funcOp) {
 
     builder.setInsertionPoint(allocOp);
     auto newAlloc =
-        builder.create<ttg::LocalAllocOp>(allocOp.getLoc(), memdescType);
+        ttg::LocalAllocOp::create(builder, allocOp.getLoc(), memdescType);
 
     auto originTaskIds = builder.getAsyncTaskIds();
     auto originLoopScheduleInfo = builder.getLoopScheduleInfo();

@@ -1168,8 +1168,9 @@ struct AsyncCopyGlobalToLocalOpConversion
       ptxBuilder.launch(rewriter, loc, voidTy);
 
       // Replace op with dummy token (same as non-bulk path)
-      Value zero = rewriter.create<LLVM::ConstantOp>(
-          loc, IntegerType::get(ctx, 32), rewriter.getI32IntegerAttr(0));
+      Value zero =
+          LLVM::ConstantOp::create(rewriter, loc, IntegerType::get(ctx, 32),
+                                   rewriter.getI32IntegerAttr(0));
       rewriter.replaceOp(op, zero);
       return success();
     }
@@ -2132,7 +2133,7 @@ struct AsyncStoreOpConversion
     ptxBuilder.launch(rewriter, loc, voidTy);
 
     // Emit commit group so completion can be tracked via wait_group
-    rewriter.create<NVVM::CpAsyncBulkCommitGroupOp>(loc);
+    NVVM::CpAsyncBulkCommitGroupOp::create(rewriter, loc);
 
     rewriter.eraseOp(op);
     return success();

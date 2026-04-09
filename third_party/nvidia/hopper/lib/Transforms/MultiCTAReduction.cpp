@@ -143,22 +143,22 @@ static LogicalResult transformMultiCTALoop(scf::ForOp forOp,
   auto ivType = lb.getType();
 
   // Step 1: Get CTA rank within the cluster.
-  Value ctaRankI32 = builder.create<triton::nvgpu::ClusterCTAIdOp>(loc, i32Ty);
-  Value numCTAsI32 = builder.create<arith::ConstantIntOp>(
-      loc, static_cast<int64_t>(numClusterCTAs), /*width=*/32);
+  Value ctaRankI32 = triton::nvgpu::ClusterCTAIdOp::create(builder, loc, i32Ty);
+  Value numCTAsI32 = arith::ConstantIntOp::create(
+      builder, loc, static_cast<int64_t>(numClusterCTAs), /*width=*/32);
 
   // Cast to the loop IV type if needed.
   Value ctaRank = (ivType == i32Ty)
                       ? ctaRankI32
-                      : static_cast<Value>(builder.create<arith::IndexCastOp>(
-                            loc, ivType, ctaRankI32));
+                      : static_cast<Value>(arith::IndexCastOp::create(
+                            builder, loc, ivType, ctaRankI32));
   Value numCTAs = (ivType == i32Ty)
                       ? numCTAsI32
-                      : static_cast<Value>(builder.create<arith::IndexCastOp>(
-                            loc, ivType, numCTAsI32));
+                      : static_cast<Value>(arith::IndexCastOp::create(
+                            builder, loc, ivType, numCTAsI32));
 
   // Step 2: Partition loop range across CTAs.
-  Value range = builder.create<arith::SubIOp>(loc, ub, lb);
+  Value range = arith::SubIOp::create(builder, loc, ub, lb);
 
   // Verify divisibility: floor division drops remainder iterations.
   APInt rangeConst;
@@ -170,10 +170,10 @@ static LogicalResult transformMultiCTALoop(scf::ForOp forOp,
            << "); remainder iterations would be silently dropped";
   }
 
-  Value chunkSize = builder.create<arith::DivUIOp>(loc, range, numCTAs);
-  Value offset = builder.create<arith::MulIOp>(loc, ctaRank, chunkSize);
-  Value myLB = builder.create<arith::AddIOp>(loc, lb, offset);
-  Value myUB = builder.create<arith::AddIOp>(loc, myLB, chunkSize);
+  Value chunkSize = arith::DivUIOp::create(builder, loc, range, numCTAs);
+  Value offset = arith::MulIOp::create(builder, loc, ctaRank, chunkSize);
+  Value myLB = arith::AddIOp::create(builder, loc, lb, offset);
+  Value myUB = arith::AddIOp::create(builder, loc, myLB, chunkSize);
 
   forOp.setLowerBound(myLB);
   forOp.setUpperBound(myUB);
@@ -252,62 +252,63 @@ static LogicalResult transformMultiCTALoop(scf::ForOp forOp,
         /*order=*/{1, 0}, ctaLayout2d);
     auto bufType = ttg::MemDescType::get({numClusterCTAs, resultSize}, elemType,
                                          smemEncoding2d, smemSpace, true);
-    Value dsmBuf = builder.create<ttg::LocalAllocOp>(loc, bufType, Value());
+    Value dsmBuf = ttg::LocalAllocOp::create(builder, loc, bufType, Value());
 
     // b) Allocate barrier.
     auto barBufType = ttg::MemDescType::get({1}, builder.getI64Type(),
                                             smemEncoding1d, smemSpace, true);
-    Value barrier = builder.create<ttg::LocalAllocOp>(loc, barBufType, Value());
+    Value barrier =
+        ttg::LocalAllocOp::create(builder, loc, barBufType, Value());
     // init_barrier count = 1: only BarrierExpectOp counts as an arrival.
     // The st.async.mbarrier::complete_tx::bytes ops deliver bytes but do NOT
     // count as arrivals. Using numClusterCTAs-1 here causes deadlock for >2
     // CTAs.
-    builder.create<ttng::InitBarrierOp>(loc, barrier, 1);
+    ttng::InitBarrierOp::create(builder, loc, barrier, 1);
 
     // c) Wrap/convert the partial result into the exchange tensor type.
     Value partialTensor;
     if (isScalar) {
       partialTensor =
-          builder.create<triton::SplatOp>(loc, exchangeTy, partialResult);
+          triton::SplatOp::create(builder, loc, exchangeTy, partialResult);
     } else {
       partialTensor =
-          builder.create<ttg::ConvertLayoutOp>(loc, exchangeTy, partialResult);
+          ttg::ConvertLayoutOp::create(builder, loc, exchangeTy, partialResult);
     }
 
     // d) Get my slot in dsmBuf: memdesc<resultSize x elemType> (rank-1).
     auto dsmSlotType = ttg::MemDescType::get({resultSize}, elemType,
                                              smemEncoding1d, smemSpace, true);
-    Value mySlot = builder.create<ttg::MemDescIndexOp>(loc, dsmSlotType, dsmBuf,
-                                                       ctaRankI32);
+    Value mySlot = ttg::MemDescIndexOp::create(builder, loc, dsmSlotType,
+                                               dsmBuf, ctaRankI32);
 
     // Match TLX ordering exactly:
     //   barrier_expect -> cluster_arrive/wait -> local_store -> async_remote ->
     //   wait_barrier
-    Value predTrue = builder.create<arith::ConstantIntOp>(loc, 1, 1);
-    builder.create<ttng::BarrierExpectOp>(loc, barrier, expectedBytes,
-                                          predTrue);
-    builder.create<ttng::ClusterArriveOp>(loc, false);
-    builder.create<ttng::ClusterWaitOp>(loc);
+    Value predTrue = arith::ConstantIntOp::create(builder, loc, 1, 1);
+    ttng::BarrierExpectOp::create(builder, loc, barrier, expectedBytes,
+                                  predTrue);
+    ttng::ClusterArriveOp::create(builder, loc, false);
+    ttng::ClusterWaitOp::create(builder, loc);
 
     // e) Store my partial to my slot AFTER cluster sync (matching TLX).
-    builder.create<ttg::LocalStoreOp>(loc, partialTensor, mySlot);
+    ttg::LocalStoreOp::create(builder, loc, partialTensor, mySlot);
 
     // f) Send partial to other CTAs (skip self).
     for (int i = 0; i < numClusterCTAs; ++i) {
-      Value iVal = builder.create<arith::ConstantIntOp>(loc, i, 32);
-      Value isNotMe = builder.create<arith::CmpIOp>(
-          loc, arith::CmpIPredicate::ne, ctaRankI32, iVal);
-      auto ifOp = builder.create<scf::IfOp>(loc, TypeRange{}, isNotMe,
-                                            /*withElseRegion=*/false);
+      Value iVal = arith::ConstantIntOp::create(builder, loc, i, 32);
+      Value isNotMe = arith::CmpIOp::create(
+          builder, loc, arith::CmpIPredicate::ne, ctaRankI32, iVal);
+      auto ifOp = scf::IfOp::create(builder, loc, TypeRange{}, isNotMe,
+                                    /*withElseRegion=*/false);
       builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
-      builder.create<ttg::AsyncRemoteShmemStoreOp>(loc, partialTensor, mySlot,
-                                                   iVal, barrier);
+      ttg::AsyncRemoteShmemStoreOp::create(builder, loc, partialTensor, mySlot,
+                                           iVal, barrier);
       builder.setInsertionPointAfter(ifOp);
     }
 
     // g) Wait for all remote stores.
-    Value phaseZero = builder.create<arith::ConstantIntOp>(loc, 0, 32);
-    builder.create<ttng::WaitBarrierOp>(loc, barrier, phaseZero, predTrue);
+    Value phaseZero = arith::ConstantIntOp::create(builder, loc, 0, 32);
+    ttng::WaitBarrierOp::create(builder, loc, barrier, phaseZero, predTrue);
 
     // h) Accumulate: load each slot, add with arith.addf.
     if (!isa<FloatType>(elemType)) {
@@ -316,25 +317,25 @@ static LogicalResult transformMultiCTALoop(scf::ForOp forOp,
                                 "reductions, got ")
              << elemType;
     }
-    Value firstSlotIdx = builder.create<arith::ConstantIntOp>(loc, 0, 32);
-    Value firstSlot = builder.create<ttg::MemDescIndexOp>(loc, dsmSlotType,
-                                                          dsmBuf, firstSlotIdx);
+    Value firstSlotIdx = arith::ConstantIntOp::create(builder, loc, 0, 32);
+    Value firstSlot = ttg::MemDescIndexOp::create(builder, loc, dsmSlotType,
+                                                  dsmBuf, firstSlotIdx);
     Value combined =
-        builder.create<ttg::LocalLoadOp>(loc, exchangeTy, firstSlot);
+        ttg::LocalLoadOp::create(builder, loc, exchangeTy, firstSlot);
     for (int i = 1; i < numClusterCTAs; ++i) {
-      Value iVal = builder.create<arith::ConstantIntOp>(loc, i, 32);
+      Value iVal = arith::ConstantIntOp::create(builder, loc, i, 32);
       Value slot =
-          builder.create<ttg::MemDescIndexOp>(loc, dsmSlotType, dsmBuf, iVal);
-      Value loaded = builder.create<ttg::LocalLoadOp>(loc, exchangeTy, slot);
-      combined = builder.create<arith::AddFOp>(loc, combined, loaded);
+          ttg::MemDescIndexOp::create(builder, loc, dsmSlotType, dsmBuf, iVal);
+      Value loaded = ttg::LocalLoadOp::create(builder, loc, exchangeTy, slot);
+      combined = arith::AddFOp::create(builder, loc, combined, loaded);
     }
 
     // i) Extract the final result from the accumulated exchange tensor.
     Value finalResult;
     if (isScalar) {
       // Scalar case: extract from tensor<1xelemType> via tt.reduce(axis=0).
-      auto finalReduce = builder.create<triton::ReduceOp>(
-          loc, SmallVector<Value>{combined}, 0);
+      auto finalReduce = triton::ReduceOp::create(
+          builder, loc, SmallVector<Value>{combined}, 0);
       IRMapping finalMapping;
       reduceOp.getCombineOp().cloneInto(&finalReduce.getCombineOp(),
                                         finalMapping);
@@ -342,7 +343,7 @@ static LogicalResult transformMultiCTALoop(scf::ForOp forOp,
     } else {
       // Tensor case: convert back from exchange encoding to original encoding.
       finalResult =
-          builder.create<ttg::ConvertLayoutOp>(loc, resultType, combined);
+          ttg::ConvertLayoutOp::create(builder, loc, resultType, combined);
     }
 
     // j) Replace uses of the original reduce result with the final result.

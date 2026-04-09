@@ -309,8 +309,8 @@ static void createMMACommit(ConversionPatternRewriter &rewriter, Location loc,
     // be broadcasted into CTAid 0 and 1
     // If there're more than 2 CTAs in a cluster, it should be CTAid x and x+1
     // where x is even
-    Value clusterCTARank = rewriter.create<triton::nvgpu::ClusterCTAIdOp>(
-        loc, rewriter.getI32Type());
+    Value clusterCTARank = triton::nvgpu::ClusterCTAIdOp::create(
+        rewriter, loc, rewriter.getI32Type());
     // mask the least bit
     Value leaderCTARank = b.and_(clusterCTARank, b.i32_val(~1));
     // "3 << leaderCTARank" means " (1<<leaderCTARank) | (1 << (leaderCTARank +

@@ -60,7 +60,7 @@ struct Clock64OpConversion
   matchAndRewrite(triton::gpu::Clock64Op op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto readClock =
-        rewriter.create<NVVM::Clock64Op>(op.getLoc(), rewriter.getI64Type());
+        NVVM::Clock64Op::create(rewriter, op.getLoc(), rewriter.getI64Type());
     rewriter.replaceOp(op, readClock.getResult());
     return success();
   }

@@ -45,15 +45,15 @@ void lowerArriveBarrierOps(ModuleOp m,
       auto ctx = op.getContext();
       // Create if condition for the arrive
       auto i32ty = builder.getIntegerType(32);
-      auto threadId = builder.create<ROCDL::ThreadIdXOp>(loc, i32ty);
+      auto threadId = ROCDL::ThreadIdXOp::create(builder, loc, i32ty);
       auto threadsPerWave =
-          builder.create<arith::ConstantIntOp>(loc, THREADS_PER_WAVE, 32);
-      auto mod = builder.create<arith::RemSIOp>(loc, threadId, threadsPerWave);
-      auto zero = builder.create<arith::ConstantIntOp>(loc, 0, 32);
-      cond = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, mod,
-                                           zero);
+          arith::ConstantIntOp::create(builder, loc, THREADS_PER_WAVE, 32);
+      auto mod = arith::RemSIOp::create(builder, loc, threadId, threadsPerWave);
+      auto zero = arith::ConstantIntOp::create(builder, loc, 0, 32);
+      cond = arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::eq, mod,
+                                   zero);
     }
-    auto ifOp = builder.create<scf::IfOp>(loc, cond);
+    auto ifOp = scf::IfOp::create(builder, loc, cond);
     auto thenBuilder = ifOp.getThenBodyBuilder();
     if (auto defOp = dyn_cast<triton::gpu::MemDescIndexOp>(
             op.getAlloc().getDefiningOp())) {
@@ -65,8 +65,8 @@ void lowerArriveBarrierOps(ModuleOp m,
           auto incrementCount = op.getCount();
           LDBG("srcOp: " << srcOp << " inc: " << incrementCount
                          << "expected: " << expectedCount << "\n");
-          thenBuilder.create<triton::amdgpu::ArriveBarrierOp>(
-              loc, op.getAlloc(), incrementCount, expectedCount);
+          triton::amdgpu::ArriveBarrierOp::create(
+              thenBuilder, loc, op.getAlloc(), incrementCount, expectedCount);
         } else {
           assert(false && "Cannot find LocalAlllocOp for ArriveBarrierOp");
         }
@@ -88,34 +88,35 @@ void lowerWaitBarrierOps(ModuleOp m) {
     auto loc = op.getLoc();
     OpBuilder builder(op);
     auto waitPhase = op.getPhase();
-    auto whileOp = builder.create<scf::WhileOp>(loc, TypeRange{}, ValueRange{});
+    auto whileOp =
+        scf::WhileOp::create(builder, loc, TypeRange{}, ValueRange{});
     // Spin Wait
     // while - Before block
     Block *beforeBlock = builder.createBlock(&whileOp.getBefore());
     builder.setInsertionPointToEnd(beforeBlock);
     auto i32ty = builder.getIntegerType(32);
     // TODO: Lower this to a LocalLoad
-    Value barrierPhase = builder.create<triton::amdgpu::ReadBarrierPhaseOp>(
-        loc, i32ty, op.getAlloc());
-    Value phaseCond = builder.create<arith::CmpIOp>(
-        loc, arith::CmpIPredicate::eq, barrierPhase, waitPhase);
-    builder.create<scf::ConditionOp>(loc, phaseCond, ValueRange{});
+    Value barrierPhase = triton::amdgpu::ReadBarrierPhaseOp::create(
+        builder, loc, i32ty, op.getAlloc());
+    Value phaseCond = arith::CmpIOp::create(
+        builder, loc, arith::CmpIPredicate::eq, barrierPhase, waitPhase);
+    scf::ConditionOp::create(builder, loc, phaseCond, ValueRange{});
     // while - after block
     Block *afterBlock = builder.createBlock(&whileOp.getAfter());
     builder.setInsertionPointToEnd(afterBlock);
-    auto five = builder.create<arith::ConstantIntOp>(loc, 5, 32);
+    auto five = arith::ConstantIntOp::create(builder, loc, 5, 32);
     auto sleepInstrinsic = "llvm.amdgcn.s.sleep";
     auto sleepOp = LLVM::createLLVMIntrinsicCallOp(
         builder, loc, sleepInstrinsic, TypeRange{}, ValueRange{five});
-    builder.create<scf::YieldOp>(loc, ValueRange{});
+    scf::YieldOp::create(builder, loc, ValueRange{});
     builder.setInsertionPointAfter(whileOp);
 
     const char *asmStr = "s_wakeup";
     const char *constraints = "";
     auto asmDialectAttr = LLVM::AsmDialectAttr::get(builder.getContext(),
                                                     LLVM::AsmDialect::AD_ATT);
-    builder.create<LLVM::InlineAsmOp>(
-        loc,
+    LLVM::InlineAsmOp::create(
+        builder, loc,
         /*resultTypes=*/TypeRange(), /*operands=*/ValueRange(),
         /*asm_string=*/asmStr, constraints, /*has_side_effects=*/true,
         /*is_align_stack=*/false, LLVM::TailCallKind::None,
@@ -142,15 +143,15 @@ void lowerInitBarrierOps(ModuleOp m,
       auto ctx = op.getContext();
       // Create if tid == 0 condition for the arrive
       auto i32ty = builder.getIntegerType(32);
-      auto threadId = builder.create<ROCDL::ThreadIdXOp>(loc, i32ty);
-      auto zero = builder.create<arith::ConstantIntOp>(loc, 0, 32);
-      cond = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
-                                           threadId, zero);
+      auto threadId = ROCDL::ThreadIdXOp::create(builder, loc, i32ty);
+      auto zero = arith::ConstantIntOp::create(builder, loc, 0, 32);
+      cond = arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::eq,
+                                   threadId, zero);
     }
-    auto ifOp = builder.create<scf::IfOp>(loc, cond);
+    auto ifOp = scf::IfOp::create(builder, loc, cond);
     auto thenBuilder = ifOp.getThenBodyBuilder();
-    thenBuilder.create<triton::amdgpu::InitBarrierOp>(loc, op.getAlloc(),
-                                                      op.getCount());
+    triton::amdgpu::InitBarrierOp::create(thenBuilder, loc, op.getAlloc(),
+                                          op.getCount());
     if (auto defOp = dyn_cast<triton::gpu::MemDescIndexOp>(
             op.getAlloc().getDefiningOp())) {
       if (auto srcOp = dyn_cast<triton::gpu::LocalAllocOp>(

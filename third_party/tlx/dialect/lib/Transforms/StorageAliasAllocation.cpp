@@ -131,7 +131,7 @@ LogicalResult materializeStorageAliasAllocations(
           ttg::MemDescType::get(shape, elemType, sharedEncoding, memorySpace,
                                 /*mutableMemory=*/true);
       auto allocOp =
-          builder.create<ttg::LocalAllocOp>(specOp.getLoc(), memDescType);
+          ttg::LocalAllocOp::create(builder, specOp.getLoc(), memDescType);
       allocResult = allocOp.getResult();
     } else {
       // TMEM: 2D allocation
@@ -158,8 +158,8 @@ LogicalResult materializeStorageAliasAllocations(
       auto memDescType =
           ttg::MemDescType::get(tmemShape, tmemElemType, tmemEncoding,
                                 memorySpace, /*mutableMemory=*/true);
-      auto allocOp = builder.create<ttng::TMEMAllocOp>(specOp.getLoc(),
-                                                       memDescType, nullptr);
+      auto allocOp = ttng::TMEMAllocOp::create(builder, specOp.getLoc(),
+                                               memDescType, nullptr);
       allocResult = allocOp.getResult();
     }
 
@@ -278,7 +278,7 @@ LogicalResult materializeStorageAliasAllocations(
     // Create a LocalAliasOp to reinterpret the allocation with the
     // (possibly expanded) type
     auto localAliasOp =
-        builder.create<LocalAliasOp>(allocOp.getLoc(), resultType, it->second);
+        LocalAliasOp::create(builder, allocOp.getLoc(), resultType, it->second);
 
     // Replace all uses and erase the old operation
     allocOp.getResult().replaceAllUsesWith(localAliasOp.getResult());
@@ -335,25 +335,25 @@ LogicalResult materializeStorageAliasAllocations(
           Value newIndex = originalIndex;
 
           if (scaleFactor > 1) {
-            Value scaleVal = builder.create<arith::ConstantOp>(
-                loc, builder.getI32IntegerAttr(scaleFactor));
+            Value scaleVal = arith::ConstantOp::create(
+                builder, loc, builder.getI32IntegerAttr(scaleFactor));
             newIndex =
-                builder.create<arith::MulIOp>(loc, originalIndex, scaleVal);
+                arith::MulIOp::create(builder, loc, originalIndex, scaleVal);
           }
 
           if (offsetSlots > 0) {
-            Value offsetVal = builder.create<arith::ConstantOp>(
-                loc, builder.getI32IntegerAttr(offsetSlots));
-            newIndex = builder.create<arith::AddIOp>(loc, newIndex, offsetVal);
+            Value offsetVal = arith::ConstantOp::create(
+                builder, loc, builder.getI32IntegerAttr(offsetSlots));
+            newIndex = arith::AddIOp::create(builder, loc, newIndex, offsetVal);
           }
 
           // Add (originalIndex % groupSize) for subtiling
           if (groupSize > 1) {
-            Value groupSizeVal = builder.create<arith::ConstantOp>(
-                loc, builder.getI32IntegerAttr(groupSize));
-            Value modVal = builder.create<arith::RemSIOp>(loc, originalIndex,
-                                                          groupSizeVal);
-            newIndex = builder.create<arith::AddIOp>(loc, newIndex, modVal);
+            Value groupSizeVal = arith::ConstantOp::create(
+                builder, loc, builder.getI32IntegerAttr(groupSize));
+            Value modVal = arith::RemSIOp::create(builder, loc, originalIndex,
+                                                  groupSizeVal);
+            newIndex = arith::AddIOp::create(builder, loc, newIndex, modVal);
           }
 
           // Update the index operand

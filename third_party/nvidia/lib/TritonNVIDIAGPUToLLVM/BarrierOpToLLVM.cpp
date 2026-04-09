@@ -460,9 +460,9 @@ struct VoteBallotSyncOpConversion
 
     // Scalar case: simple pass-through to NVVM
     if (!isa<RankedTensorType>(predType)) {
-      Value result = rewriter.create<NVVM::VoteSyncOp>(
-          loc, rewriter.getI32Type(), adaptor.getMask(), adaptor.getPred(),
-          NVVM::VoteSyncKind::ballot);
+      Value result = NVVM::VoteSyncOp::create(
+          rewriter, loc, rewriter.getI32Type(), adaptor.getMask(),
+          adaptor.getPred(), NVVM::VoteSyncKind::ballot);
       rewriter.replaceOp(op, result);
       return success();
     }
@@ -494,8 +494,8 @@ struct VoteBallotSyncOpConversion
     }
 
     // Perform the warp-level ballot with the combined predicate
-    Value ballot = rewriter.create<NVVM::VoteSyncOp>(
-        loc, rewriter.getI32Type(), adaptor.getMask(), combinedPred,
+    Value ballot = NVVM::VoteSyncOp::create(
+        rewriter, loc, rewriter.getI32Type(), adaptor.getMask(), combinedPred,
         NVVM::VoteSyncKind::ballot);
 
     // Replicate the ballot result to all elements of the output tensor

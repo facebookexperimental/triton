@@ -108,8 +108,8 @@ struct MapToRemoteBufferOpConversion
     Type convertedPtrTy = convertedRetTy.getBody()[0];
 
     // map an SMEM ptr in mem space 3 to a ptr in mem space 7
-    auto remotePtr = rewriter.create<NVVM::MapaOp>(
-        loc, convertedPtrTy, srcSmemPtr, adaptor.getCtaRank());
+    auto remotePtr = NVVM::MapaOp::create(rewriter, loc, convertedPtrTy,
+                                          srcSmemPtr, adaptor.getCtaRank());
 
     // everything stays the same except base ptr comparing to srcSmemObj
     auto dstSmemObj = SharedMemoryObject(
