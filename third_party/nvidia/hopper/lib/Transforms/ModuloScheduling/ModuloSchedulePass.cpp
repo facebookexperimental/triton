@@ -45,15 +45,38 @@ static void emitScheduleAttributes(scf::ForOp loop,
   const int maxStage = schedule.getMaxStage();
   auto ctx = loop.getContext();
 
+  // Step 2.5: Compute per-stage cluster IDs from modulo cycles.
+  // Ops in the same stage are ordered by cycle: lower cycle → lower cluster ID.
+  // This preserves the modulo schedule's within-stage ordering for downstream
+  // pipelining, instead of relying on IR program order.
+  llvm::DenseMap<int, SmallVector<int>> stageToCycles;
   for (const auto &node : ddg.getNodes()) {
     auto it = schedule.nodeToCycle.find(node.idx);
     if (it == schedule.nodeToCycle.end())
       continue;
     int stage = it->second / II;
+    stageToCycles[stage].push_back(it->second);
+  }
+  // Deduplicate and sort cycles per stage to assign dense cluster IDs.
+  llvm::DenseMap<int, llvm::DenseMap<int, int>> stageAndCycleToCluster;
+  for (auto &[stage, cycles] : stageToCycles) {
+    llvm::sort(cycles);
+    cycles.erase(llvm::unique(cycles), cycles.end());
+    for (int i = 0, e = cycles.size(); i < e; ++i)
+      stageAndCycleToCluster[stage][cycles[i]] = i;
+  }
+
+  for (const auto &node : ddg.getNodes()) {
+    auto it = schedule.nodeToCycle.find(node.idx);
+    if (it == schedule.nodeToCycle.end())
+      continue;
+    int stage = it->second / II;
+    int cycle = it->second;
+    int clusterId = stageAndCycleToCluster[stage][cycle];
     node.op->setAttr(tt::kLoopStageAttrName,
                      IntegerAttr::get(IntegerType::get(ctx, 32), stage));
     node.op->setAttr(tt::kLoopClusterAttrName,
-                     IntegerAttr::get(IntegerType::get(ctx, 32), 0));
+                     IntegerAttr::get(IntegerType::get(ctx, 32), clusterId));
   }
 
   // Ensure ALL ops in the loop body have loop.stage/loop.cluster attrs.
