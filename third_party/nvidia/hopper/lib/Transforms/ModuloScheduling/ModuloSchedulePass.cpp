@@ -70,6 +70,12 @@ static void emitScheduleAttributes(scf::ForOp loop,
     auto it = schedule.nodeToCycle.find(node.idx);
     if (it == schedule.nodeToCycle.end())
       continue;
+    // For multi-stage super-nodes (prologue/kloop/epilogue sharing the same
+    // Operation*), only write attrs from the node registered in opToIdx
+    // (the epilogue) to avoid overwrites.
+    auto opIt = ddg.getOpToIdx().find(node.op);
+    if (opIt != ddg.getOpToIdx().end() && opIt->second != node.idx)
+      continue;
     int stage = it->second / II;
     int cycle = it->second;
     int clusterId = stageAndCycleToCluster[stage][cycle];
@@ -165,6 +171,42 @@ struct ModuloSchedulePass
 
       // Emit loop.stage / loop.cluster on all ops.
       emitScheduleAttributes(innerLoop, ddg, *schedResult);
+    }
+
+    // Step 2: Schedule outer loops (persistent kernels).
+    SmallVector<scf::ForOp> outerLoops;
+    moduleOp.walk([&](scf::ForOp loop) {
+      bool hasInnerLoop = false;
+      loop.getBody()->walk([&](scf::ForOp) { hasInnerLoop = true; });
+      if (!hasInnerLoop)
+        return;
+      if (loop->getParentOfType<scf::ForOp>())
+        return;
+      outerLoops.push_back(loop);
+    });
+
+    LDBG("Found " << outerLoops.size() << " outer loop(s)");
+
+    for (auto outerLoop : outerLoops) {
+      auto outerDDG = ttg::DataDependenceGraph::build(outerLoop, model);
+      if (outerDDG.getNumNodes() == 0)
+        continue;
+
+      LDBG("Outer DDG: " << outerDDG.getNumNodes() << " nodes, "
+                          << outerDDG.getEdges().size() << " edges");
+
+      auto outerSched = ttg::runModuloScheduling(outerDDG);
+      if (failed(outerSched)) {
+        LDBG("Outer scheduling FAILED");
+        continue;
+      }
+
+      LDBG("Outer schedule: II=" << outerSched->II
+                                 << " ResMII=" << outerDDG.computeResMII()
+                                 << " RecMII=" << outerDDG.computeRecMII()
+                                 << " maxStage=" << outerSched->getMaxStage());
+
+      emitScheduleAttributes(outerLoop, outerDDG, *outerSched);
     }
   }
 };
