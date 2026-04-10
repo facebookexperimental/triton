@@ -11,10 +11,15 @@ def _generate_test_params():
     dtype = torch.float16
     params = []
 
-    for M, N, K in itertools.product(dims_mn, dims_mn, dims_k):
+    try:
         device_props = str(torch.cuda.get_device_properties())
-        matmul_size = (M * K + K * N) * dtype.itemsize
         max_shared_mem = driver.active.utils.get_device_properties(driver.active.get_current_device())["max_shared_mem"]
+    except RuntimeError:
+        # CUDA not available (e.g., ASAN build or no GPU); return all combos unskipped
+        return list(itertools.product(dims_mn, dims_mn, dims_k))
+
+    for M, N, K in itertools.product(dims_mn, dims_mn, dims_k):
+        matmul_size = (M * K + K * N) * dtype.itemsize
         if matmul_size > max_shared_mem:
             continue
         # TODO: Investigate why this test fails on gfx942 with M=512, N=512, K=16

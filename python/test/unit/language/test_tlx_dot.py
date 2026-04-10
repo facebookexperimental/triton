@@ -8,7 +8,12 @@ import triton.language.extra.tlx as tlx
 from typing import Optional
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from conftest import _generate_test_params, _swizzle_scale_to_5d
+from triton.runtime.fbcode_gating import is_fbcode_dependant
+
+if is_fbcode_dependant():
+    from python.test.unit.language.conftest import _generate_test_params, _swizzle_scale_to_5d
+else:
+    from conftest import _generate_test_params, _swizzle_scale_to_5d
 
 
 # Test tl.dot wit tlx smem ops
