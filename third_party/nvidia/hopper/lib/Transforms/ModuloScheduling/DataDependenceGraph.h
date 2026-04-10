@@ -40,6 +40,9 @@ public:
   llvm::ArrayRef<DDGEdge> getEdges() const { return edges; }
   const DDGNode &getNode(unsigned idx) const { return nodes[idx]; }
   unsigned getNumNodes() const { return nodes.size(); }
+  const llvm::DenseMap<Operation *, unsigned> &getOpToIdx() const {
+    return opToIdx;
+  }
 
   /// Get all incoming edges for a node.
   llvm::SmallVector<const DDGEdge *> getInEdges(unsigned nodeIdx) const;
@@ -66,6 +69,10 @@ private:
   llvm::SmallVector<DDGNode> nodes;
   llvm::SmallVector<DDGEdge> edges;
   llvm::DenseMap<Operation *, unsigned> opToIdx;
+  // For multi-stage super-nodes (prologue/kloop/epilogue sharing the same
+  // Operation*), opToIdx maps to the epilogue (producer). consumerOpToIdx
+  // maps to the prologue so loop-carried edges target the correct node.
+  llvm::DenseMap<Operation *, unsigned> consumerOpToIdx;
 
   unsigned addNode(Operation *op, const LatencyModel &model);
   void addEdge(unsigned src, unsigned dst, int latency, unsigned distance);
