@@ -1,0 +1,20 @@
+name: TritonBench PR Test
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  h100-tlx-test:
+    if: github.repository_owner == 'facebookexperimental'
+    runs-on: [linux.gcp.h100]
+    timeout-minutes: 240
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Tune Nvidia GPU
+        run: |
+          sudo nvidia-smi -pm 1
+          sudo ldconfig
+          nvidia-smi
