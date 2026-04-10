@@ -17,6 +17,7 @@ add_triton_library(NVHopperTransforms
   WarpSpecialization/WSTaskPartition.cpp
   WarpSpecialization/PartitionSchedulingMeta.cpp
   ModuloScheduling/LatencyModel.cpp
+  ModuloScheduling/DataDependenceGraph.cpp
 
   DEPENDS
   NVHopperTransformsIncGen
