@@ -473,6 +473,7 @@ private:
 
     OpBuilder builder(lastBarInitOp);
     builder.setInsertionPointAfter(lastBarInitOp);
+    // need to insert fence to make mbar init visible to cluster
     ttng::FenceMBarrierInitReleaseClusterOp::create(builder,
                                                     lastBarInitOp.getLoc());
     // need to insert cluster arrive and wait to prevent CTA_X from arriving
