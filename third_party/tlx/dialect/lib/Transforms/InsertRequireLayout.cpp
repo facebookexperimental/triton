@@ -186,6 +186,65 @@ static void applyRequireLayout(ttg::SwizzledSharedEncodingAttr encoding,
   }
 }
 
+static void
+collectRegionBranchSuccessors(RegionBranchOpInterface branchOp,
+                              SmallVectorImpl<RegionSuccessor> &successors) {
+  auto appendUniqueSuccessors = [&](ArrayRef<RegionSuccessor> newSuccessors) {
+    for (RegionSuccessor successor : newSuccessors) {
+      if (!llvm::is_contained(successors, successor))
+        successors.push_back(successor);
+    }
+  };
+
+  SmallVector<RegionSuccessor> newSuccessors;
+  branchOp.getSuccessorRegions(RegionBranchPoint::parent(), newSuccessors);
+  appendUniqueSuccessors(newSuccessors);
+  for (Region &region : branchOp->getRegions()) {
+    newSuccessors.clear();
+    branchOp.getSuccessorRegions(region, newSuccessors);
+    appendUniqueSuccessors(newSuccessors);
+  }
+}
+
+static std::optional<Type> getConsensusType(ValueRange values) {
+  if (values.empty())
+    return std::nullopt;
+
+  Type consensusType = values.front().getType();
+  for (Value value : values.drop_front()) {
+    if (value.getType() != consensusType)
+      return std::nullopt;
+  }
+  return consensusType;
+}
+
+static void updateRegionBranchTypes(RegionBranchOpInterface branchOp) {
+  SmallVector<RegionSuccessor> successors;
+  collectRegionBranchSuccessors(branchOp, successors);
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (RegionSuccessor successor : successors) {
+      ValueRange successorInputs = branchOp.getSuccessorInputs(successor);
+      for (auto [index, successorInput] : llvm::enumerate(successorInputs)) {
+        SmallVector<Value> predecessorValues;
+        branchOp.getPredecessorValues(successor, index, predecessorValues);
+        std::optional<Type> consensusType =
+            getConsensusType(ValueRange(predecessorValues));
+        if (!consensusType || successorInput.getType() == *consensusType)
+          continue;
+
+        LDBG("Updating region-branch type for "
+             << successorInput << " from " << successorInput.getType() << " to "
+             << *consensusType);
+        successorInput.setType(*consensusType);
+        changed = true;
+      }
+    }
+  }
+}
+
 } // namespace
 
 // ============================================================================
@@ -230,49 +289,13 @@ LogicalResult insertRequireLayout(ModuleOp m) {
     localLoadOp->getResult(0).setType(newType);
   });
 
-  // --- Fix region-branch result types to match changed operand types ---
-  // After rewriting local_load results, yield operand types inside
-  // RegionBranchOpInterface ops (scf.for, scf.if, scf.while, ...) may
-  // no longer match the parent op's result types or block arg types.
-  // Walk all such ops and propagate types from yield operands to results
-  // and from the dataflow analysis to block arguments.
-  m.walk([&](RegionBranchOpInterface branchOp) {
-    Operation *op = branchOp.getOperation();
-    // Propagate yield operand types to parent result types.
-    for (Region &region : op->getRegions()) {
-      for (Block &block : region) {
-        auto *terminator = block.getTerminator();
-        if (!terminator)
-          continue;
-        // Check if this terminator yields values to the parent.
-        for (unsigned i = 0;
-             i < terminator->getNumOperands() && i < op->getNumResults(); ++i) {
-          Type yieldTy = terminator->getOperand(i).getType();
-          if (op->getResult(i).getType() != yieldTy)
-            op->getResult(i).setType(yieldTy);
-        }
-      }
-    }
-    // Propagate dot encodings from the analysis to block arguments.
-    for (Region &region : op->getRegions()) {
-      for (BlockArgument blockArg : region.getArguments()) {
-        auto *lattice = solver.lookupState<DotEncodingLattice>(blockArg);
-        if (!lattice || lattice->getValue().isUninitialized() ||
-            lattice->getValue().isUnknown())
-          continue;
-        auto dotEnc = dyn_cast<ttg::DotOperandEncodingAttr>(
-            lattice->getValue().getEncoding());
-        if (!dotEnc)
-          continue;
-        auto origType = dyn_cast<RankedTensorType>(blockArg.getType());
-        if (!origType)
-          continue;
-        auto newType = RankedTensorType::get(origType.getShape(),
-                                             origType.getElementType(), dotEnc);
-        if (newType != origType)
-          blockArg.setType(newType);
-      }
-    }
+  // --- Fix region-branch result and block-argument types ---
+  // After rewriting local_load results, region-branch edges may no longer have
+  // matching source and destination types. Recompute those destination types
+  // from the RegionBranch interfaces and only retag slots whose predecessors
+  // all agree on the same type.
+  m.walk<WalkOrder::PostOrder>([&](RegionBranchOpInterface branchOp) {
+    updateRegionBranchTypes(branchOp);
   });
 
   // --- Clean up redundant convert_layout ops ---
