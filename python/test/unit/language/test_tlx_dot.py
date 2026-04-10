@@ -409,6 +409,7 @@ def run_async_dot_blackwell_2cta_tma(device, A_TMEM, SAMPLE_M):
         cluster_cta_rank = tlx.cluster_cta_rank()
         pred_cta0 = cluster_cta_rank == 0
         cta_bars = tlx.alloc_barriers(num_barriers=1, arrive_count=2)  # CTA0 waits for signals from both CTAs
+        mma_bars = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
 
         desc_a = tl.make_tensor_descriptor(
             a_ptr,
@@ -452,10 +453,12 @@ def run_async_dot_blackwell_2cta_tma(device, A_TMEM, SAMPLE_M):
             buf_alloc_a_tmem = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, tl.constexpr(1), tlx.storage_kind.tmem)
             a_reg = tlx.local_load(a_smem)
             tlx.local_store(buf_alloc_a_tmem[0], a_reg)
-            tlx.async_dot(buf_alloc_a_tmem[0], b_smem, acc_tmem, use_acc=False, mBarriers=[], two_ctas=True,
+            tlx.async_dot(buf_alloc_a_tmem[0], b_smem, acc_tmem, use_acc=False, mBarriers=[mma_bars[0]], two_ctas=True,
                           out_dtype=OUT_DTYPE)
         else:
-            tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=False, mBarriers=[], two_ctas=True, out_dtype=OUT_DTYPE)
+            tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=False, mBarriers=[mma_bars[0]], two_ctas=True,
+                          out_dtype=OUT_DTYPE)
+        tlx.barrier_wait(mma_bars[0], 0)
         result = tlx.local_load(acc_tmem)
 
         c = result.to(tl.float16)
@@ -595,9 +598,9 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
                 tlx.barrier_wait(cta_bars[0], phase=0, pred=pred_cta0)
 
                 # difference from 1cta: set two_ctas. Compiler auto generates pred to issue mma only from CTA0
-                tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=False, mBarriers=[], two_ctas=True, out_dtype=OUT_DTYPE)
+                tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=False, mBarriers=[tmem_full_bars[0]], two_ctas=True,
+                              out_dtype=OUT_DTYPE)
 
-                tlx.barrier_arrive(tmem_full_bars[0], 1)
             with tlx.async_task(num_warps=1, num_regs=232):  # producer
                 # difference from 1cta: size
                 tlx.barrier_expect_bytes(smem_full_bars[0],
