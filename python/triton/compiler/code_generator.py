@@ -25,7 +25,7 @@ from ..runtime.jit import (
     ConstexprFunction,
     JITFunction,
 )
-from .._utils import find_paths_if, get_iterable_path, set_iterable_path, is_namedtuple
+from .._utils import apply_with_path, set_iterable_path, is_namedtuple
 
 from .errors import CompilationError, CompileTimeAssertionFailure, UnsupportedLanguageConstruct
 
@@ -43,15 +43,13 @@ def check_identifier_legality(name, type):
     return name
 
 
-def mangle_fn(name, arg_tys, constants, caller_context):
+def mangle_fn(name, arg_tys, caller_context):
     # doesn't mangle ret type, which must be a function of arg tys
-    mangled_arg_names = "_".join([ty.mangle() for ty in arg_tys])
-    mangled_constants = "_".join([f"{i}c{repr(constants[i])}" for i in sorted(constants)])
-    mangled_constants = mangled_constants.replace(".", "_d_")
-    mangled_constants = mangled_constants.replace("'", "_sq_")
+    mangled_args = '_'.join([ty.mangle() for ty in arg_tys])
+    mangled_args = mangled_args.replace("'", '_sq_')
     # [ and ] are not allowed in LLVM identifiers
-    mangled_constants = mangled_constants.replace("[", "_").replace("]", "_")
-    ret = f"{name}__{mangled_arg_names}__{mangled_constants}"
+    mangled_args = mangled_args.replace('[', '_').replace(']', '_')
+    ret = f'{name}__{mangled_args}'
     if caller_context is not None:
         ret += caller_context.mangle()
     return ret
@@ -239,10 +237,9 @@ class ContainsReturnChecker(ast.NodeVisitor):
 
 class ASTFunction:
 
-    def __init__(self, ret_types, arg_types, constants, attrs):
+    def __init__(self, ret_types, arg_types, attrs):
         self.ret_types = ret_types
         self.arg_types = arg_types
-        self.constants = constants
         self.attrs = attrs
 
     def flatten_ir_types(self, builder: ir.builder, types: List[base_type]) -> List[ir.type]:
@@ -257,12 +254,8 @@ class ASTFunction:
         return self.flatten_ir_types(builder, self.ret_types)
 
     def serialize(self, builder: ir.builder):
-        # fill up IR values in template
-        # > build function
-        is_val = lambda path, _: path not in self.constants and _ is not None
-        val_paths = list(find_paths_if(self.arg_types, is_val))
-        arg_types = [get_iterable_path(self.arg_types, path) for path in val_paths]
-        arg_types_ir = self.flatten_ir_types(builder, arg_types)
+        # > build mlir function type
+        arg_types_ir = self.flatten_ir_types(builder, self.arg_types)
         ret_types_ir = self.return_types_ir(builder)
         return builder.get_function_ty(arg_types_ir, ret_types_ir)
 
@@ -274,17 +267,11 @@ class ASTFunction:
             return language.constexpr(None)
 
         vals = make_template(self.arg_types)
-        is_val = lambda path, _: path not in self.constants and _ is not None
-        val_paths = list(find_paths_if(self.arg_types, is_val))
-        for i, path in enumerate(val_paths):
-            ty = get_iterable_path(self.arg_types, path)
-            if isinstance(ty, nv_tma_desc_type):
-                fn.set_arg_attr(i, "tt.nv_tma_desc", 1)
-        # > add IR values to the template
-        cursor = 0
         handles = [fn.args(i) for i in range(fn.get_num_args())]
-        for path in val_paths:
-            ty = get_iterable_path(self.arg_types, path)
+        cursor = 0
+
+        def build_value(path, ty):
+            nonlocal cursor, handles
             # > set attributes
             attr_specs = self.attrs.get(path, [])
             for attr_name, attr_val in attr_specs:
@@ -292,10 +279,8 @@ class ASTFunction:
             # > build frontend value
             val, cursor = ty._unflatten_ir(handles, cursor)
             set_iterable_path(vals, path, val)
-        # > add constexpr values to the template
-        constants = self.constants
-        for path, val in constants.items():
-            set_iterable_path(vals, path, language.constexpr(val))
+
+        apply_with_path(self.arg_types, build_value)
         return vals
 
 
@@ -1411,25 +1396,17 @@ class CodeGenerator(ast.NodeVisitor):
         args = bound_args.arguments
         args = [args[name] for name in fn.arg_names]
         for i, arg in enumerate(args):
-            if isinstance(arg, (language.dtype, float, int, bool, JITFunction)):
+            if not isinstance(arg, base_value) or isinstance(arg, JITCallable):
                 args[i] = language.core.constexpr(arg)
-        args_cst = find_paths_if(args, lambda _, x: _is_constexpr(x))
-        args_cst = {path: get_iterable_path(args, path) for path in args_cst}
-        args_path = find_paths_if(args, lambda _, x: not _is_constexpr(x))
-        args_val = [get_iterable_path(args, path) for path in args_path]
         # mangle
         caller_context = caller_context or self.caller_context
-        fn_name = mangle_fn(get_full_name(fn), [arg.type for arg in args_val], args_cst, caller_context)
+        arg_types = [arg.type for arg in args]
+        fn_name = mangle_fn(get_full_name(fn), arg_types, caller_context)
         # generate function def if necessary
         if not self.module.has_function(fn_name):
             # If the callee is not set, we use the same debug setting as the caller
             file_name, begin_line = get_jit_fn_file_line(fn)
-            arg_types = [
-                language.core.constexpr if arg is None or isinstance(arg,
-                                                                     (bool, int, language.core.dtype)) else arg.type
-                for arg in args
-            ]
-            prototype = ASTFunction([], arg_types, args_cst, dict())
+            prototype = ASTFunction([], arg_types, dict())
             generator = CodeGenerator(
                 self.context,
                 prototype,
@@ -1460,7 +1437,7 @@ class CodeGenerator(ast.NodeVisitor):
         else:
             callee_ret_type = self.function_ret_types[fn_name]
         symbol = self.module.get_function(fn_name)
-        args_val = flatten_values_to_ir(args_val)
+        args_val = flatten_values_to_ir(args)
         call_op = self.builder.call(symbol, args_val)
         handles = [call_op.get_result(i) for i in range(call_op.get_num_results())]
         return next(unflatten_ir_values(handles, [callee_ret_type]))
@@ -1751,7 +1728,7 @@ def ast_to_ttir(fn, src, context, options, codegen_fns, module_map, module=None)
     for path, value in src.constants.items():
         apply_constexpr_types(arg_types, list(path)[::-1], value)
 
-    prototype = ASTFunction([], arg_types, src.constants, src.attrs)
+    prototype = ASTFunction([], arg_types, src.attrs)
     file_name, begin_line = get_jit_fn_file_line(fn)
     # query function representation
     from collections import namedtuple
