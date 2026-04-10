@@ -16,6 +16,7 @@ namespace mlir {
 
 // Modulo scheduling pass (manual registration, not tablegen-generated).
 std::unique_ptr<Pass> createNVGPUModuloSchedule();
+void registerNVGPUModuloSchedule();
 
 } // namespace mlir
 #endif // DIALECT_NV_TRANSFORMS_PASSES_H_
