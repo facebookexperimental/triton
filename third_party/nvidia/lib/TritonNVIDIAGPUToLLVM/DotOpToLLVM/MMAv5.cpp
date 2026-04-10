@@ -301,30 +301,22 @@ static void createMMACommit(ConversionPatternRewriter &rewriter, Location loc,
   SmallVector<PTXBuilder::Operand *> ptxOperands;
   auto *predOperand = ptxBuilder.newOperand(pred, "b");
   ptxOperands.push_back(predOperand);
-  auto *barrierOperand = ptxBuilder.newOperand(barrier, "l");
+  barrier = b.ptrtoint(i32_ty, barrier);
+  auto *barrierOperand = ptxBuilder.newOperand(barrier, "r");
   ptxOperands.push_back(barrierOperand);
   std::string opcode;
   if (twoCTAs) {
-    // .multicast::cluster and mask 0x3 means the completion of UTCMMA.2CTA will
-    // be broadcasted into CTAid 0 and 1
-    // If there're more than 2 CTAs in a cluster, it should be CTAid x and x+1
-    // where x is even
-    Value clusterCTARank = triton::nvgpu::ClusterCTAIdOp::create(
-        rewriter, loc, rewriter.getI32Type());
-    // mask the least bit
-    Value leaderCTARank = b.and_(clusterCTARank, b.i32_val(~1));
-    // "3 << leaderCTARank" means " (1<<leaderCTARank) | (1 << (leaderCTARank +
-    // 1))"
-    Value mask = b.shl(b.i32_val(3), leaderCTARank);
+    auto ctaId = b.trunc(i16_ty, nvgpu::ClusterCTAIdOp::create(rewriter, loc));
+    auto totalCTAs = lookupNumCTAs(rewriter);
+    auto ctaIdLead = b.and_(ctaId, b.i16_val(totalCTAs - 2));
+    Value mask = b.shl(b.i16_val(3), ctaIdLead);
     auto *ctaMask = ptxBuilder.newOperand(mask, "h");
     ptxOperands.push_back(ctaMask);
     opcode = "@$0 "
              "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::"
              "cluster.multicast::cluster.b64 [$1], $2;";
   } else {
-    opcode =
-        "@$0 tcgen05.commit.cta_group::" + std::to_string(twoCTAs ? 2 : 1) +
-        ".mbarrier::arrive::one.b64 [$1];";
+    opcode = "@$0 tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [$1];";
   }
   auto &barrierOp = *ptxBuilder.create(opcode);
   barrierOp(ptxOperands, /*onlyAttachMLIRArgs=*/true);
