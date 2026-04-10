@@ -121,7 +121,7 @@ LogicalResult materializeStorageAliasAllocations(
 
       // Create a shared encoding with default parameters
       auto ctaLayout =
-          ttg::CTAEncodingAttr::fromSplitParams(m.getContext(), {1}, {1}, {0});
+          ttg::CGAEncodingAttr::fromSplitParams(m.getContext(), {1}, {1}, {0});
       auto sharedEncoding = ttg::SwizzledSharedEncodingAttr::get(
           m.getContext(), /*vec=*/1, /*perPhase=*/1, /*maxPhase=*/1,
           /*order=*/{0}, ctaLayout);

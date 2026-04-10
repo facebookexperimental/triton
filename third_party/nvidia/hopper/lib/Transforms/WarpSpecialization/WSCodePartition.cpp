@@ -755,9 +755,9 @@ static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance) {
       triton::gpu::SharedMemorySpaceAttr::get(funcOp.getContext());
   Location loc = funcOp.getLoc();
   auto context = funcOp.getContext();
-  auto barrierCTALayout = ttg::CTAEncodingAttr::getDefault(context, 1);
+  auto barrierCGALayout = ttg::CGAEncodingAttr::getDefault(context, 1);
   auto barrierEncoding = ttg::SwizzledSharedEncodingAttr::get(
-      context, 1, 1, 1, {0}, barrierCTALayout);
+      context, 1, 1, 1, {0}, barrierCGALayout);
   ttg::MemDescType barrierMemDescType = ttg::MemDescType::get(
       {distance, 1}, builder.getI64Type(), barrierEncoding, sharedMemorySpace,
       /*mutableMemory=*/true);
@@ -1461,7 +1461,7 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
 
   // Get basic information from tensorType
   auto order = ttg::getOrderForMemory(tensorType);
-  auto CTALayout = ttg::getCTALayout(tensorType.getEncoding());
+  auto CGALayout = ttg::getCGALayout(tensorType.getEncoding());
   auto elemType = tensorType.getElementType();
 
   // Check the consumer type
@@ -1534,7 +1534,7 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
     Attribute sharedLayout;
     if (requireMMASharedEncoding) {
       sharedLayout = ttg::NVMMASharedEncodingAttr::get(
-          context, sliceShape, order, CTALayout, elemType,
+          context, sliceShape, order, CGALayout, elemType,
           /*fp4Padded*/ false);
     } else if (tmaStore) {
       sharedLayout = ttng::getEncodingFromDescriptor(tmaStore, tensorType,
@@ -1546,7 +1546,7 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
       // Create an unswizzled layout for now.
       // TODO: optimize it based on the consumer.
       sharedLayout = ttg::SwizzledSharedEncodingAttr::get(context, 1, 1, 1,
-                                                          order, CTALayout);
+                                                          order, CGALayout);
     }
 
     // Get shape, layout and type of the complete buffer
@@ -3223,7 +3223,7 @@ static void swapTransposedLocalAllocs(triton::FuncOp &funcOp) {
     auto nonTransposedEncoding = ttg::NVMMASharedEncodingAttr::get(
         encoding.getContext(), encoding.getSwizzlingByteWidth(),
         /*transposed=*/false, encoding.getElementBitWidth(),
-        encoding.getFp4Padded(), encoding.getCTALayout());
+        encoding.getFp4Padded(), encoding.getCGALayout());
 
     // New alloc type: non-transposed encoding.
     auto newAllocType = ttg::MemDescType::get(

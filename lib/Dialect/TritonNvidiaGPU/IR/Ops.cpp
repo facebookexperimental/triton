@@ -494,7 +494,7 @@ LogicalResult TCGen5MMAOp::verify() {
   // triggering upstream CTA distribution passes (PlanCTA, AccelerateMatmul).
   // The upstream checks require {2,1} for LHS, {1,2} for RHS, and {2,1}
   // for the return value, which is incompatible with TLX's approach.
-  // TODO: Re-enable once TLX adopts upstream's CTAEncodingAttr convention.
+  // TODO: Re-enable once TLX adopts upstream's CGAEncodingAttr convention.
   //
   // auto checkSplitNum = [&](ArrayRef<unsigned> splitNum,
   //                          std::string_view name,

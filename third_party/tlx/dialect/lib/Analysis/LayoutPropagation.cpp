@@ -126,7 +126,7 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
         auto newMmaEncoding = ttg::NVMMASharedEncodingAttr::get(
             mmaEncoding.getContext(),
             memDescTransOp.getSrc().getType().getShape(), newOrder,
-            mmaEncoding.getCTALayout(),
+            mmaEncoding.getCGALayout(),
             memDescTransOp.getSrc().getType().getElementType(),
             mmaEncoding.getFp4Padded());
         const auto updatedResultLayoutEncoding = LayoutEncoding(newMmaEncoding);
@@ -205,7 +205,7 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
       auto ctx = srcType.getContext();
 
       // Build unswizzled NVMMASharedEncodingAttr with default CTA layout
-      auto ctaLayout = ttg::CTAEncodingAttr::getDefault(ctx, srcType.getRank());
+      auto ctaLayout = ttg::CGAEncodingAttr::getDefault(ctx, srcType.getRank());
       auto unswizzledEncoding = ttg::NVMMASharedEncodingAttr::get(
           ctx,
           /*swizzlingByteWidth=*/0,

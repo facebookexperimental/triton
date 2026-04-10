@@ -76,7 +76,7 @@ static Attribute resolveRegisterLayout(DummyRegisterLayoutAttr dummyLayout,
     auto memDescType = ttg::MemDescType::get(shape, elementType, tmemEncoding,
                                              memSpace, /*mutableMemory=*/true);
     auto ctaLayout =
-        ttg::CTAEncodingAttr::fromSplitParams(ctx, {1, 1}, {1, 1}, {1, 0});
+        ttg::CGAEncodingAttr::fromSplitParams(ctx, {1, 1}, {1, 1}, {1, 0});
 
     // Create a temporary RankedTensorType with a blocked encoding for
     // getTmemCompatibleLayout to use as a reference type.

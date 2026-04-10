@@ -53,11 +53,11 @@ void TMEM1DAllocator::TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
       auto retWarpsPerCTA = to_vector(blockedEnc.getWarpsPerCTA());
       retWarpsPerCTA.insert(retWarpsPerCTA.begin() + axis, 1);
       auto retOrder = {axis, blockedEnc.getOrder()[0]};
-      auto argCTALayout = blockedEnc.getCTALayout();
+      auto argCTALayout = blockedEnc.getCGALayout();
       auto retCTAsPerCGA = {argCTALayout.getCTAsPerCGA()[0], axis};
       auto retCTASplitNum = {argCTALayout.getCTASplitNum()[0], axis};
       auto retCTAOrder = {axis, argCTALayout.getCTAOrder()[0]};
-      auto retCTALayout = triton::gpu::CTAEncodingAttr::fromSplitParams(
+      auto retCTALayout = triton::gpu::CGAEncodingAttr::fromSplitParams(
           context, retCTAsPerCGA, retCTASplitNum, retCTAOrder);
       blockedEnc = triton::gpu::BlockedEncodingAttr::get(
           context, retSizePerThread, retThreadsPerWarp, retWarpsPerCTA,
@@ -307,7 +307,7 @@ ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
   size_t CTASplitN;
   bool twoCTAs = false;
   if (auto ttgLayout = mlir::dyn_cast<ttg::LayoutEncodingTrait>(encoding)) {
-    auto ctaLayoutAttr = ttg::getCTALayout(encoding);
+    auto ctaLayoutAttr = ttg::getCGALayout(encoding);
     CTASplitM = ctaLayoutAttr.getCTASplitNum()[0];
     CTASplitN = ctaLayoutAttr.getCTASplitNum()[1];
   } else if (auto tmemLayout =

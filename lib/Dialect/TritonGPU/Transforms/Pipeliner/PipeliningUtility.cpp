@@ -455,10 +455,10 @@ Value mlir::triton::createScalarAlloc(ImplicitLocOpBuilder &rewriter, Type type,
   bases[kBlock] =
       std::vector<std::vector<int32_t>>(llvm::Log2_32(numCTAs), {0});
   auto dims = standardOutDimNames(ctx, 1);
-  auto barrierCTALayout =
-      ttg::CTAEncodingAttr::get(ctx, LinearLayout(bases, dims));
+  auto barrierCGALayout =
+      ttg::CGAEncodingAttr::get(ctx, LinearLayout(bases, dims));
   auto barrierEncoding =
-      ttg::SwizzledSharedEncodingAttr::get(ctx, 1, 1, 1, {0}, barrierCTALayout);
+      ttg::SwizzledSharedEncodingAttr::get(ctx, 1, 1, 1, {0}, barrierCGALayout);
   ttg::MemDescType memDescType = ttg::MemDescType::get(
       {numBuffers, 1}, type, barrierEncoding, sharedMemorySpace,
       /*mutableMemory=*/true);
@@ -582,11 +582,11 @@ mlir::triton::getMultiBufferedType(ttg::MemDescType memDescType,
 }
 
 ttg::SharedEncodingTrait mlir::triton::getSharedEncoding(RankedTensorType ty) {
-  auto ctaLayout = ttg::getCTALayout(ty.getEncoding());
+  auto cgaLayout = ttg::getCGALayout(ty.getEncoding());
   auto order = ttg::getOrder(ty);
   // Use generic layout. This won't be optimal for 2D tensors.
   return ttg::SwizzledSharedEncodingAttr::get(ty.getContext(), 1, 1, 1, order,
-                                              ctaLayout);
+                                              cgaLayout);
 }
 
 ttg::SharedEncodingTrait mlir::triton::getSharedEncoding(Operation *op) {
@@ -616,7 +616,7 @@ ttg::SharedEncodingTrait mlir::triton::getSharedEncoding(Operation *op) {
   }
 
   auto ty = cast<RankedTensorType>(op->getResultTypes()[0]);
-  auto ctaLayout = ttg::getCTALayout(ty.getEncoding());
+  auto cgaLayout = ttg::getCGALayout(ty.getEncoding());
   auto order = ttg::getOrder(ty);
   if (isTMALoad(op)) {
     // TMA encoding is set on the descriptor type
@@ -646,7 +646,7 @@ ttg::SharedEncodingTrait mlir::triton::getSharedEncoding(Operation *op) {
 
   // Use generic layout. This won't be optimal for 2D tensors.
   return ttg::SwizzledSharedEncodingAttr::get(ty.getContext(), 1, 1, 1, order,
-                                              ctaLayout);
+                                              cgaLayout);
 }
 
 int mlir::triton::getNumStagesOrDefault(scf::ForOp forOp,
