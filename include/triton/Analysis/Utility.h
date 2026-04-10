@@ -287,6 +287,8 @@ bool hasOpOfAnyTypeInForwardSlice(Operation *liveOp) {
 /// Create a basic DataFlowSolver with constant and dead code analysis included.
 std::unique_ptr<DataFlowSolver> createDataFlowSolver();
 
+namespace triton {
+
 /// This class represents a call graph for a given ModuleOp and holds
 /// data of type T associated with each FunctionOpInterface.
 template <typename T> class CallGraph {
@@ -425,6 +427,9 @@ protected:
   FuncDataMapT funcMap;
   SmallVector<FunctionOpInterface> roots;
 };
+
+} // namespace triton
+
 // Create a basic DataFlowSolver with constant and dead code analysis included.
 std::unique_ptr<DataFlowSolver> createDataFlowSolver();
 
