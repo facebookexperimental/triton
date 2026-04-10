@@ -131,6 +131,9 @@ def async_dot(
         acc_handle = require_tmem_layout_col_stride(acc, 1, _semantic.builder)
         handles = [t.handle for t in mBarriers]
         is_async = force_async or len(handles) > 0
+        # Sync semantic gen5 dot is rarely a good idea in TLX. It usually comes with perf penalty around bar init/inval.
+        # We're deprecating it, but as a first step let's force a crash in case we do have a use case.
+        assert is_async, "Blackwell dot with sync semantics is disabled. Please pass in proper mBarriers and wait for the barrier explicitly."
         use_acc_handle = None
         if use_acc is not None:
             assert isinstance(use_acc, tl.tensor) or isinstance(
