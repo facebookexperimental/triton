@@ -723,15 +723,63 @@ class JITFunction(JITCallable, KernelInterface[T]):
         return options, signature, constexprs, attrs
 
     def run(self, *args, grid, warmup, **kwargs):
+        device = driver.active.get_current_device()
+        stream = driver.active.get_current_stream(device)
+
+        # --- FAST PATH (Layer 1: Identity check) ---
+        # If the exact same Python objects are passed as the previous call
+        # (common in training loops where the same tensors/kwargs are reused),
+        # skip the binder, cache key computation, and most dispatch overhead.
+        # This is just N pointer comparisons with zero attribute access.
+        if not warmup and not self.pre_run_hooks:
+            last = self._last_call
+            if last is not None and last[0] is device:
+                last_args = last[1]
+                if len(args) == len(last_args):
+                    identical = True
+                    for i in range(len(args)):
+                        if args[i] is not last_args[i]:
+                            identical = False
+                            break
+                    if identical:
+                        last_kw = self._last_kwargs
+                        if len(kwargs) != len(last_kw):
+                            identical = False
+                        else:
+                            for k, v in kwargs.items():
+                                if k not in last_kw or v is not last_kw[k]:
+                                    identical = False
+                                    break
+                    if identical:
+                        kernel = last[2]
+                        if self.used_global_vals:
+                            not_present = object()
+                            for (name, _), (val, globals_dict) in self.used_global_vals.items():
+                                if globals_dict.get(name, not_present) != val:
+                                    kernel = None
+                                    break
+                        if kernel is not None:
+                            bound_vals = last[3]
+                            assert grid is not None
+                            if callable(grid):
+                                grid = grid(dict(zip(self.arg_names, bound_vals)))
+                            grid_size = len(grid)
+                            grid_0 = grid[0]
+                            grid_1 = grid[1] if grid_size > 1 else 1
+                            grid_2 = grid[2] if grid_size > 2 else 1
+                            launch_metadata = kernel.launch_metadata(grid, stream, *bound_vals)
+                            kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata,
+                                       launch_metadata, knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook,
+                                       *bound_vals)
+                            return kernel
+
+        # --- SLOW PATH ---
+        _user_kwargs = dict(kwargs) if kwargs else {}
         kwargs["debug"] = kwargs.get("debug", self.debug) or knobs.runtime.debug
         # Enable sanitize_overflow if explicitly set via kwarg, env var (TRITON_SANITIZE_OVERFLOW), or if debug is enabled
         kwargs["sanitize_overflow"] = kwargs.get("sanitize_overflow",
                                                  False) or knobs.runtime.sanitize_overflow or kwargs["debug"]
         kwargs["instrumentation_mode"] = knobs.compilation.instrumentation_mode
-
-        # parse options
-        device = driver.active.get_current_device()
-        stream = driver.active.get_current_stream(device)
 
         # Execute pre run hooks with args and kwargs
         for hook in self.pre_run_hooks:
@@ -780,6 +828,13 @@ class JITFunction(JITCallable, KernelInterface[T]):
             launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
             kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,
                        knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *bound_args.values())
+
+            # Populate Layer 1 cache for future calls.
+            # Store both raw args (for identity check) and bound_args values
+            # (for launching — includes default parameter values).
+            self._last_call = (device, args, kernel, tuple(bound_args.values()))
+            self._last_kwargs = _user_kwargs
+
         return kernel
 
     def repr(self, _):
@@ -806,6 +861,11 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
         # cache of just-in-time compiled kernels
         self.device_caches = defaultdict(self.create_binder)
+
+        # Last-call cache for identity-based fast path (Layer 1).
+        # Stores (device, args, kernel, bound_vals) from the previous successful launch.
+        self._last_call = None
+        self._last_kwargs = {}
 
         # JITFunction can be instantiated as kernel
         # when called with a grid using __getitem__
