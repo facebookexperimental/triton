@@ -722,7 +722,142 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
         return options, signature, constexprs, attrs
 
+    def _compute_fingerprint(self, args):
+        """Compute a specialization fingerprint for the given args.
+
+        Returns a hashable tuple that uniquely identifies the specialization
+        (dtype, alignment, constexpr values) so that args producing the same
+        fingerprint will use the same compiled kernel.
+        """
+        return self._fp_extract(args)
+
+    def _check_last_fingerprint(self, args):
+        """Check args against the last-used fingerprint without allocation.
+
+        Returns the cached (kernel, device) if args match, None otherwise.
+        """
+        last = self._fast_path_last
+        if last is None or len(args) != self._fp_nparams:
+            return None
+        return self._fp_check(args, last[0], last[1])
+
+    @staticmethod
+    def _build_fp_functions(params):
+        """Pre-generate specialized fingerprint extract/check functions.
+
+        By building functions with per-slot logic baked in at init time, we
+        avoid per-arg hasattr/isinstance dispatch on every call.
+        """
+        nparams = len(params)
+
+        # Build extract function body
+        extract_lines = [
+            f"def _fp_extract(args):",
+            f"    if len(args) != {nparams}: return _fp_extract_slow(args)",
+        ]
+        for i, p in enumerate(params):
+            if p.is_constexpr:
+                extract_lines.append(f"    e{i} = ('ce', args[{i}])")
+            else:
+                extract_lines.append(f"    a{i} = args[{i}]")
+                extract_lines.append(f"    if hasattr(a{i}, 'data_ptr'):")
+                extract_lines.append(f"        e{i} = (id(a{i}.dtype), a{i}.data_ptr() % 16 == 0)")
+                extract_lines.append(f"    elif type(a{i}) is int:")
+                extract_lines.append(f"        e{i} = (a{i} == 1, a{i} % 16 == 0)")
+                extract_lines.append(f"    else:")
+                extract_lines.append(f"        e{i} = ('other', id(type(a{i})))")
+        elems = ", ".join(f"e{i}" for i in range(nparams))
+        if nparams == 0:
+            extract_lines.append(f"    return (0, ())")
+        elif nparams == 1:
+            extract_lines.append(f"    return (1, ({elems},))")
+        else:
+            extract_lines.append(f"    return ({nparams}, ({elems},))")
+
+        # Slow fallback for mismatched arg count
+        extract_lines.append(f"def _fp_extract_slow(args):")
+        extract_lines.append(f"    fp_list = []")
+        extract_lines.append(f"    params = _params")
+        extract_lines.append(f"    for i in range(min(len(args), len(params))):")
+        extract_lines.append(f"        a = args[i]")
+        extract_lines.append(f"        if params[i].is_constexpr:")
+        extract_lines.append(f"            fp_list.append(('ce', a))")
+        extract_lines.append(f"        elif hasattr(a, 'data_ptr'):")
+        extract_lines.append(f"            fp_list.append((id(a.dtype), a.data_ptr() % 16 == 0))")
+        extract_lines.append(f"        elif type(a) is int:")
+        extract_lines.append(f"            fp_list.append((a == 1, a % 16 == 0))")
+        extract_lines.append(f"        else:")
+        extract_lines.append(f"            fp_list.append(('other', id(type(a))))")
+        extract_lines.append(f"    return (len(args), tuple(fp_list))")
+
+        # Build check function body — returns cached entry or None
+        check_lines = [
+            f"def _fp_check(args, fp, entry):",
+        ]
+        for i, p in enumerate(params):
+            if p.is_constexpr:
+                check_lines.append(f"    if args[{i}] != fp[{i}][1]: return None")
+            else:
+                check_lines.append(f"    a{i} = args[{i}]")
+                check_lines.append(f"    if hasattr(a{i}, 'data_ptr'):")
+                check_lines.append(f"        if (id(a{i}.dtype), a{i}.data_ptr() % 16 == 0) != fp[{i}]: return None")
+                check_lines.append(f"    elif type(a{i}) is int:")
+                check_lines.append(f"        if (a{i} == 1, a{i} % 16 == 0) != fp[{i}]: return None")
+                check_lines.append(f"    else: return None")
+        check_lines.append(f"    return entry")
+
+        ns = {"_params": params}
+        exec("\n".join(extract_lines), ns)
+        exec("\n".join(check_lines), ns)
+        return nparams, ns["_fp_extract"], ns["_fp_check"]
+
     def run(self, *args, grid, warmup, **kwargs):
+        # Fast path: skip binder, cache key, and global check when args
+        # match a cached specialization fingerprint.
+        if (
+            not warmup
+            and not kwargs
+            and not callable(grid)
+            and self._fast_path_last is not None
+        ):
+            # Try last-used entry first (no allocation)
+            entry = self._check_last_fingerprint(args)
+            # Fall back to dict lookup if last entry didn't match
+            if entry is None and len(self._fast_path_cache) > 1:
+                fp = self._compute_fingerprint(args)
+                entry = self._fast_path_cache.get(fp)
+                if entry is not None:
+                    # Promote to last-used
+                    self._fast_path_last = (fp[1], entry)
+            if entry is not None:
+                kernel, device = entry
+                if device != driver.active.get_current_device():
+                    entry = None
+            if entry is not None:
+                kernel, device = entry
+                stream = driver.active.get_current_stream(device)
+
+                for hook in self.pre_run_hooks:
+                    hook(*args)
+
+                grid_size = len(grid)
+                grid_0 = grid[0]
+                grid_1 = grid[1] if grid_size > 1 else 1
+                grid_2 = grid[2] if grid_size > 2 else 1
+
+                if hasattr(kernel, "result"):
+                    kernel = kernel.result()
+
+                launch_metadata = kernel.launch_metadata(grid, stream, *args)
+                kernel.run(
+                    grid_0, grid_1, grid_2, stream,
+                    kernel.function, kernel.packed_metadata, launch_metadata,
+                    knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook,
+                    *args,
+                )
+                return kernel
+
+        # Slow path
         kwargs["debug"] = kwargs.get("debug", self.debug) or knobs.runtime.debug
         # Enable sanitize_overflow if explicitly set via kwarg, env var (TRITON_SANITIZE_OVERFLOW), or if debug is enabled
         kwargs["sanitize_overflow"] = kwargs.get("sanitize_overflow",
@@ -780,6 +915,19 @@ class JITFunction(JITCallable, KernelInterface[T]):
             launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
             kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,
                        knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *bound_args.values())
+
+            # Update fast path cache
+            fp = self._compute_fingerprint(args)
+            entry = (kernel, device)
+            if fp in self._fast_path_cache:
+                # Move to end (most recently used)
+                del self._fast_path_cache[fp]
+            elif len(self._fast_path_cache) >= self._fast_path_cache_max:
+                # Evict oldest entry
+                self._fast_path_cache.pop(next(iter(self._fast_path_cache)))
+            self._fast_path_cache[fp] = entry
+            self._fast_path_last = (fp[1], entry)
+
         return kernel
 
     def repr(self, _):
@@ -806,6 +954,15 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
         # cache of just-in-time compiled kernels
         self.device_caches = defaultdict(self.create_binder)
+
+        # Fast path cache: fingerprint -> (kernel, device), capped to avoid
+        # unbounded growth for kernels with many specialization patterns.
+        self._fast_path_cache = {}
+        self._fast_path_cache_max = 32
+        # Last-used entry for zero-allocation fast check: (fingerprint_inner, (kernel, device))
+        self._fast_path_last = None
+        # Pre-generated specialized fingerprint functions
+        self._fp_nparams, self._fp_extract, self._fp_check = self._build_fp_functions(self.params)
 
         # JITFunction can be instantiated as kernel
         # when called with a grid using __getitem__
