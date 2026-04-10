@@ -545,6 +545,7 @@ class nvidia_knobs(base_knobs):
     force_trunk_swp_schedule: env_bool = env_bool("TRITON_FORCE_TRUNK_SWP_SCHEDULE")
     dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
     dump_tlx_benchmark: env_bool = env_bool("TRITON_DUMP_TLX_BENCHMARK")
+    analyze_ttgir_barrier: env_bool = env_bool("TRITON_DUMP_BARRIER_ANALYSIS")
 
 
 class amd_knobs(base_knobs):
