@@ -509,8 +509,8 @@ def run_async_dot_blackwell_2cta_tma(device, A_TMEM, SAMPLE_M):
     assert ttgir.count("ttng.map_to_remote_buffer") == 1
 
     ptx = kernel.asm["ptx"]
-    assert ptx.count("barrier.cluster.arrive.aligned") == 2  # one for remote bar init, one for tmem dealloc
-    assert ptx.count("barrier.cluster.wait.aligned") == 2  # one for remote bar init, one for tmem dealloc
+    assert ptx.count("barrier.cluster.arrive.aligned") == 1  # one for remote bar init
+    assert ptx.count("barrier.cluster.wait.aligned") == 1  # one for remote bar init
     assert ptx.count("mapa.shared::cluster") == 1  # address mapping for remote_view
     assert ptx.count("tcgen05.mma.cta_group::2") == 8  # BK=128 divided into steps of 16
 
@@ -650,12 +650,10 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
 
     ptx = kernel.asm["ptx"]
     # two for trunk remote bar init: one for default wg, one for non default
-    # two for tmem dealloc (two returns)
-    assert ptx.count("barrier.cluster.arrive.aligned") == 4
+    assert ptx.count("barrier.cluster.arrive.aligned") == 2
     # one for trunk remote bar init: non default WGs just arrive anyway, then it's equivalent to a sync between
     #   default WGs in all CTAs
-    # two for tmem dealloc (two returns)
-    assert ptx.count("barrier.cluster.wait.aligned") == 3
+    assert ptx.count("barrier.cluster.wait.aligned") == 1
     assert ptx.count("mapa.shared::cluster") == 1  # address mapping for remote_view
     assert ptx.count("tcgen05.mma.cta_group::2") == 8  # BK=128 divided into steps of 16
 
