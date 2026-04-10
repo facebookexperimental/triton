@@ -42,6 +42,7 @@ def builtin(fn: T) -> T:
         return fn(*args, **kwargs)
 
     setattr(wrapper, TRITON_BUILTIN, True)
+    wrapper.signature = inspect.signature(fn)
 
     return wrapper
 
@@ -81,6 +82,7 @@ def _tensor_member_fn(fn: T) -> T:
     new_params[0] = new_params[0].replace(name='self')
     new_sig = orig_sig.replace(parameters=new_params)
     wrapper.__signature__ = new_sig
+    wrapper.signature = new_sig
     wrapper.__doc__ = f"Forwards to :py:func:`{fn.__name__}` free function"
     # If fn is a builtin, mark the wrapper as a builtin too.
     if is_builtin(fn):
