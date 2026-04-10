@@ -187,3 +187,47 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     tt.return %dot : tensor<64x64xf32, #mma_3>
   }
 }
+
+// -----
+// Test 5: one local_load feeds both a dot path and a sibling convert_layout
+// path into a non-dot user. The mixed use should make the rewrite illegal, so
+// the load must stay in the original blocked layout.
+
+#blocked_4 = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked_4_alt = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [0, 1]}>
+#mma_4 = #ttg.amd_mfma<{version = 3, warpsPerCTA = [2, 2], instrShape = [32, 32, 8], isTransposed = true}>
+#shared_4 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem_4 = #ttg.shared_memory
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: @mixed_use_local_load_stays_blocked
+  tt.func public @mixed_use_local_load_stays_blocked(%arg0: !tt.ptr<f16>) -> tensor<64x64xf32, #mma_4> {
+    %c0_i32 = arith.constant 0 : i32
+    %cst = arith.constant dense<0.000000e+00> : tensor<64x64xf32, #blocked_4>
+    %alloc_a = ttg.local_alloc : () -> !ttg.memdesc<1x64x32xf16, #shared_4, #smem_4, mutable>
+    %alloc_b = ttg.local_alloc : () -> !ttg.memdesc<1x32x64xf16, #shared_4, #smem_4, mutable>
+    %alloc_sink = ttg.local_alloc : () -> !ttg.memdesc<1x64x32xf16, #shared_4, #smem_4, mutable>
+    // CHECK: %[[DESC_A:.*]] = ttg.memdesc_index
+    %buf_a = ttg.memdesc_index %alloc_a[%c0_i32] : !ttg.memdesc<1x64x32xf16, #shared_4, #smem_4, mutable> -> !ttg.memdesc<64x32xf16, #shared_4, #smem_4, mutable>
+    // CHECK: %[[DESC_B:.*]] = ttg.memdesc_index
+    %buf_b = ttg.memdesc_index %alloc_b[%c0_i32] : !ttg.memdesc<1x32x64xf16, #shared_4, #smem_4, mutable> -> !ttg.memdesc<32x64xf16, #shared_4, #smem_4, mutable>
+    %buf_sink = ttg.memdesc_index %alloc_sink[%c0_i32] : !ttg.memdesc<1x64x32xf16, #shared_4, #smem_4, mutable> -> !ttg.memdesc<64x32xf16, #shared_4, #smem_4, mutable>
+    // A has a mixed use, so it must remain blocked and keep the explicit convert for dot.
+    // CHECK: %[[A_LOAD:.*]] = ttg.local_load %[[DESC_A]] : !ttg.memdesc<64x32xf16, #{{.*}}, #smem, mutable> -> tensor<64x32xf16, #{{.*}}>
+    %a = ttg.local_load %buf_a : !ttg.memdesc<64x32xf16, #shared_4, #smem_4, mutable> -> tensor<64x32xf16, #blocked_4>
+    // CHECK: %[[A_ALT:.*]] = ttg.convert_layout %[[A_LOAD]] : tensor<64x32xf16, #{{.*}}> -> tensor<64x32xf16, #{{.*}}>
+    %a_alt = ttg.convert_layout %a : tensor<64x32xf16, #blocked_4> -> tensor<64x32xf16, #blocked_4_alt>
+    // CHECK: ttg.local_store %[[A_ALT]],
+    ttg.local_store %a_alt, %buf_sink : tensor<64x32xf16, #blocked_4_alt> -> !ttg.memdesc<64x32xf16, #shared_4, #smem_4, mutable>
+    // B is dot-only, so the pass can still rewrite it.
+    // CHECK: %[[REQ_B:.*]] = tlx.require_layout %[[DESC_B]] {{.*}} -> !ttg.memdesc<32x64xf16, #{{.*}}, #smem, mutable>
+    // CHECK-NEXT: %[[B_LOAD:.*]] = ttg.local_load %[[REQ_B]] : !ttg.memdesc<32x64xf16, #{{.*}}, #smem, mutable> -> tensor<32x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>>
+    %b = ttg.local_load %buf_b : !ttg.memdesc<32x64xf16, #shared_4, #smem_4, mutable> -> tensor<32x64xf16, #blocked_4>
+    %acc = ttg.convert_layout %cst : tensor<64x64xf32, #blocked_4> -> tensor<64x64xf32, #mma_4>
+    // CHECK: %[[A_DOT:.*]] = ttg.convert_layout %[[A_LOAD]] : tensor<64x32xf16, #{{.*}}> -> tensor<64x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>>
+    %a_dot = ttg.convert_layout %a : tensor<64x32xf16, #blocked_4> -> tensor<64x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_4, kWidth = 4}>>
+    // CHECK: tt.dot %[[A_DOT]], %[[B_LOAD]], %{{.*}} : tensor<64x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>> * tensor<32x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>> -> tensor<64x64xf32, #mma>
+    %b_dot = ttg.convert_layout %b : tensor<32x64xf16, #blocked_4> -> tensor<32x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma_4, kWidth = 4}>>
+    %dot = tt.dot %a_dot, %b_dot, %acc, inputPrecision = tf32 : tensor<64x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_4, kWidth = 4}>> * tensor<32x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma_4, kWidth = 4}>> -> tensor<64x64xf32, #mma_4>
+    tt.return %dot : tensor<64x64xf32, #mma_4>
+  }
+}
