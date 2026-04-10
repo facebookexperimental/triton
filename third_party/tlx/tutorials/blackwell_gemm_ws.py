@@ -1,4 +1,5 @@
 # TLX GEMM kernel optimized for Blackwell Warp Specialization
+import functools
 import math
 import os
 
@@ -10,6 +11,14 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 # Track which (M, N, K) shapes have already printed their heuristic config
 _printed_heuristic_configs = set()
+
+
+# Cached SM count — never changes during program lifetime.
+# Calling torch.cuda.get_device_properties() on every matmul() call
+# adds measurable overhead that degrades benchmark throughput on fast kernels.
+@functools.lru_cache(maxsize=1)
+def _get_num_sms():
+    return torch.cuda.get_device_properties("cuda").multi_processor_count
 
 
 def get_heuristic_config(M, N, K, num_sms=148):
@@ -367,13 +376,14 @@ def get_cuda_autotune_config():
                 "NUM_CTAS": num_ctas,
                 "SPLIT_K": split_k,
                 "INTERLEAVE_EPILOGUE": interleave,
+                "USE_WARP_BARRIER": uwb,
             },
             num_warps=4,
             num_stages=1,
             pre_hook=matmul_tma_set_block_size_hook,
             ctas_per_cga=(num_ctas, 1, 1) if num_ctas > 1 else None,
         )
-        for BM in [128, 256]
+        for BM in [64, 128, 256]
         for BN in [64, 128, 256]
         for BK in [64, 128]
         for s in [2, 3, 4, 5, 6, 7]
@@ -381,9 +391,10 @@ def get_cuda_autotune_config():
         for m in [1, 2]
         for subtile in [1, 2, 4, 8]
         for num_ctas in [1, 2]
-        for split_k in [1, 2, 3, 4, 5, 6]  # pruning selects one optimal SPLIT_K per tile group
+        for split_k in [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 19, 24]  # pruning selects one optimal SPLIT_K per tile group
         for interleave in [0, 1]
         for g in [1, 8, 64]
+        for uwb in [False, True]
     ]
 
 
@@ -392,16 +403,37 @@ def matmul_tma_set_block_size_hook(nargs):
     BLOCK_N = nargs["BLOCK_SIZE_N"]
     BLOCK_K = nargs["BLOCK_SIZE_K"]
     NUM_MMA_GROUPS = nargs.get("NUM_MMA_GROUPS", 1)
-    nargs["a_desc"].block_shape = [BLOCK_M // NUM_MMA_GROUPS, BLOCK_K]
+    BLOCK_M_SPLIT = BLOCK_M // NUM_MMA_GROUPS
     NUM_CTAS = nargs.get("NUM_CTAS", 1)
-    nargs["b_desc"].block_shape = [BLOCK_K, BLOCK_N // NUM_CTAS]
+    BLOCK_N_PER_CTA = BLOCK_N // NUM_CTAS
+    # For column-major inputs, TMA descriptor block shape matches the transposed view
+    if nargs.get("A_ROW_MAJOR", True):
+        nargs["a_desc"].block_shape = [BLOCK_M_SPLIT, BLOCK_K]
+    else:
+        nargs["a_desc"].block_shape = [BLOCK_K, BLOCK_M_SPLIT]
+    if nargs.get("B_ROW_MAJOR", True):
+        nargs["b_desc"].block_shape = [BLOCK_K, BLOCK_N_PER_CTA]
+    else:
+        nargs["b_desc"].block_shape = [BLOCK_N_PER_CTA, BLOCK_K]
     EPILOGUE_SUBTILE = nargs.get("EPILOGUE_SUBTILE", 1)
     nargs["c_desc"].block_shape = [
         BLOCK_M // NUM_MMA_GROUPS,
         BLOCK_N // EPILOGUE_SUBTILE,
     ]
-    if nargs.get("SPLIT_K", 1) > 1:
-        nargs["c_desc"].base.zero_()
+    SPLIT_K = nargs.get("SPLIT_K", 1)
+    if SPLIT_K > 1:
+        M = nargs["M"]
+        N = nargs["N"]
+        workspace = torch.empty((SPLIT_K * M, N), device=nargs["c_desc"].base.device, dtype=nargs["c_desc"].base.dtype)
+        nargs["workspace_desc"].base = workspace
+        nargs["workspace_desc"].shape = list(workspace.shape)
+    else:
+        nargs["workspace_desc"].base = nargs["c_desc"].base
+        nargs["workspace_desc"].shape = list(nargs["c_desc"].base.shape)
+    nargs["workspace_desc"].block_shape = [
+        BLOCK_M // NUM_MMA_GROUPS,
+        BLOCK_N // EPILOGUE_SUBTILE,
+    ]
 
 
 @triton.jit
@@ -416,7 +448,7 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M):
 
 def preprocess_configs(configs, named_args, **kwargs):
     # Blackwell B200A resource limits
-    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    NUM_SMS = _get_num_sms()
     MAX_SHARED_MEMORY = 232 * 1024  # bytes (232KB)
     MAX_TENSOR_MEMORY = 256 * 1024  # bytes (256KB TMEM per SM)
 
@@ -438,12 +470,19 @@ def preprocess_configs(configs, named_args, **kwargs):
         SPLIT_K = conf.kwargs.get("SPLIT_K", 1)
         EPILOGUE_SUBTILE = conf.kwargs["EPILOGUE_SUBTILE"]
         INTERLEAVE_EPILOGUE = conf.kwargs.get("INTERLEAVE_EPILOGUE", 0)
+        GROUP_SIZE_M = conf.kwargs["GROUP_SIZE_M"]
 
         # Filter out invalid config that causes wrong hardware MMA
         if BLOCK_M // NUM_MMA_GROUPS > 128:
             continue
         # Pair-CTA MMA doesn't work with M=64 per MMA group
         if NUM_CTAS == 2 and BLOCK_M // NUM_MMA_GROUPS == 64:
+            continue
+        # GROUP_SIZE_M must be a multiple of NUM_CTAS so that consecutive
+        # tile_ids (assigned to paired CTAs in a cluster) always map to the
+        # same pid_n. Otherwise, at group boundaries a CTA pair can straddle
+        # two different pid_n values, breaking 2-CTA B-tile sharing.
+        if GROUP_SIZE_M % NUM_CTAS != 0:
             continue
 
         # EPILOGUE_SUBTILE must evenly divide BLOCK_N
@@ -454,9 +493,19 @@ def preprocess_configs(configs, named_args, **kwargs):
         if INTERLEAVE_EPILOGUE and NUM_MMA_GROUPS != 2:
             continue
 
+        # Blackwell MMA requires BLOCK_M_SPLIT >= 64
+        if BLOCK_M // NUM_MMA_GROUPS < 64:
+            continue
+
         num_tiles_m = math.ceil(M / BLOCK_M)
         num_tiles_n = math.ceil(N / BLOCK_N)
         num_mn_tiles = num_tiles_m * num_tiles_n
+
+        # BM=64 tiles only help when MN is too small with larger tiles.
+        # Skip them for shapes that already have enough spatial tiles
+        # to avoid bloating the autotuner search space.
+        if BLOCK_M == 64 and math.ceil(M / 128) * math.ceil(N / 128) > 16:
+            continue
 
         # --- Split-K gating: only allow SPLIT_K > 1 for small shapes ---
         # Split-K helps when MN tiles are too few to saturate the GPU.
@@ -467,6 +516,11 @@ def preprocess_configs(configs, named_args, **kwargs):
                 continue
             k_tiles = math.ceil(K / BLOCK_K)
             if k_tiles < SPLIT_K:
+                continue
+            # Reject SK values where cdiv overallocation leaves the last split empty
+            # (causes deadlock: producer loop is empty but MMA consumer waits on barrier)
+            k_tiles_per_split = math.ceil(k_tiles / SPLIT_K)
+            if k_tiles_per_split * (SPLIT_K - 1) >= k_tiles:
                 continue
             # Each split must have enough K tiles to be worthwhile
             if k_tiles // SPLIT_K < 4:
@@ -642,6 +696,7 @@ def _process_tile_epilogue_inner(
     SPLIT_K,
     INTERLEAVE_EPILOGUE,
     c_desc,
+    workspace_desc,
     c_smem_buffers,
     tmem_buffers,
     tmem_full_bars,
@@ -656,7 +711,13 @@ def _process_tile_epilogue_inner(
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_SIZE_M // NUM_MMA_GROUPS
 
     slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
-    STORE_REDUCE: tl.constexpr = "add" if SPLIT_K > 1 else ""
+    if SPLIT_K > 1:
+        split_id = tile_id // num_mn_tiles
+        out_desc = workspace_desc
+        row_base = split_id * M
+    else:
+        out_desc = c_desc
+        row_base = 0
 
     if INTERLEAVE_EPILOGUE:
         # Interleaved TMA stores across two groups to improve memory throughput.
@@ -674,15 +735,14 @@ def _process_tile_epilogue_inner(
         acc_sub = tlx.local_slice(acc_tmem_0, [0, 0 * slice_size], [BLOCK_M_SPLIT, slice_size])
         result = tlx.local_load(acc_sub)
         tlx.barrier_arrive(tmem_empty_bars[buf_idx_0], 1)
-        c = result.to(tlx.dtype_of(c_desc))
+        c = result.to(tlx.dtype_of(out_desc))
         c_smem = c_smem_buffers[0]
         tlx.local_store(c_smem, c)
         tlx.fence_async_shared()
         tlx.async_descriptor_store(
-            c_desc,
+            out_desc,
             c_smem,
-            [offs_am_0, offs_bn + 0 * slice_size],
-            store_reduce=STORE_REDUCE,
+            [row_base + offs_am_0, offs_bn + 0 * slice_size],
             eviction_policy="evict_first",
         )
 
@@ -691,15 +751,14 @@ def _process_tile_epilogue_inner(
         acc_sub = tlx.local_slice(acc_tmem_1, [0, 0 * slice_size], [BLOCK_M_SPLIT, slice_size])
         result = tlx.local_load(acc_sub)
         tlx.barrier_arrive(tmem_empty_bars[buf_idx_1], 1)
-        c = result.to(tlx.dtype_of(c_desc))
+        c = result.to(tlx.dtype_of(out_desc))
         c_smem = c_smem_buffers[1]
         tlx.local_store(c_smem, c)
         tlx.fence_async_shared()
         tlx.async_descriptor_store(
-            c_desc,
+            out_desc,
             c_smem,
-            [offs_am_1, offs_bn + 0 * slice_size],
-            store_reduce=STORE_REDUCE,
+            [row_base + offs_am_1, offs_bn + 0 * slice_size],
             eviction_policy="evict_first",
         )
 
@@ -709,16 +768,15 @@ def _process_tile_epilogue_inner(
             acc_sub = tlx.local_slice(acc_tmem_0, [0, slice_id * slice_size], [BLOCK_M_SPLIT, slice_size])
             result = tlx.local_load(acc_sub)
             tlx.barrier_arrive(tmem_empty_bars[buf_idx_0], 1)
-            c = result.to(tlx.dtype_of(c_desc))
+            c = result.to(tlx.dtype_of(out_desc))
             c_smem = c_smem_buffers[0]
             tlx.async_descriptor_store_wait(1)
             tlx.local_store(c_smem, c)
             tlx.fence("async_shared")
             tlx.async_descriptor_store(
-                c_desc,
+                out_desc,
                 c_smem,
-                [offs_am_0, offs_bn + slice_id * slice_size],
-                store_reduce=STORE_REDUCE,
+                [row_base + offs_am_0, offs_bn + slice_id * slice_size],
                 eviction_policy="evict_first",
             )
 
@@ -726,16 +784,15 @@ def _process_tile_epilogue_inner(
             acc_sub = tlx.local_slice(acc_tmem_1, [0, slice_id * slice_size], [BLOCK_M_SPLIT, slice_size])
             result = tlx.local_load(acc_sub)
             tlx.barrier_arrive(tmem_empty_bars[buf_idx_1], 1)
-            c = result.to(tlx.dtype_of(c_desc))
+            c = result.to(tlx.dtype_of(out_desc))
             c_smem = c_smem_buffers[1]
             tlx.async_descriptor_store_wait(1)
             tlx.local_store(c_smem, c)
             tlx.fence("async_shared")
             tlx.async_descriptor_store(
-                c_desc,
+                out_desc,
                 c_smem,
-                [offs_am_1, offs_bn + slice_id * slice_size],
-                store_reduce=STORE_REDUCE,
+                [row_base + offs_am_1, offs_bn + slice_id * slice_size],
                 eviction_policy="evict_first",
             )
     else:
@@ -756,16 +813,15 @@ def _process_tile_epilogue_inner(
                 )
                 result = tlx.local_load(acc_tmem_subslice)
                 tlx.barrier_arrive(tmem_empty_bars[buf_idx], 1)
-                c = result.to(tlx.dtype_of(c_desc))
+                c = result.to(tlx.dtype_of(out_desc))
                 c_smem = c_smem_buffers[(group_id * EPILOGUE_SUBTILE + slice_id) % 2]
                 tlx.async_descriptor_store_wait(1)
                 tlx.local_store(c_smem, c)
                 tlx.fence_async_shared()
                 tlx.async_descriptor_store(
-                    c_desc,
+                    out_desc,
                     c_smem,
-                    [offs_am, offs_bn + slice_id * slice_size],
-                    store_reduce=STORE_REDUCE,
+                    [row_base + offs_am, offs_bn + slice_id * slice_size],
                     eviction_policy="evict_first",
                 )
 
@@ -795,6 +851,8 @@ def _process_tile_mma_inner(
     NUM_CTAS,
     cta_bars,
     pred_cta0,
+    A_ROW_MAJOR: tl.constexpr = True,
+    B_ROW_MAJOR: tl.constexpr = True,
 ):
     """Process MMA for a single tile over [k_tile_start, k_tile_end). Returns updated smem_accum_cnt."""
     local_k_tiles = k_tile_end - k_tile_start
@@ -823,10 +881,14 @@ def _process_tile_mma_inner(
             tlx.barrier_arrive(cta_bars[a_buf], arrive_count=1, remote_cta_rank=0)
             tlx.barrier_wait(cta_bars[a_buf], phase=phase, pred=pred_cta0)
 
+        # Transpose SMEM buffers if inputs were column-major
+        a_operand = tlx.local_trans(buffers_A[a_buf]) if not A_ROW_MAJOR else buffers_A[a_buf]
+        b_operand = tlx.local_trans(buffers_B[buf]) if not B_ROW_MAJOR else buffers_B[buf]
+
         # Perform MMA: use_acc=False for first K iteration (clears accumulator)
         tlx.async_dot(
-            buffers_A[a_buf],
-            buffers_B[buf],
+            a_operand,
+            b_operand,
             tmem_buffers[acc_buf],
             use_acc=False,
             mBarriers=[A_smem_empty_bars[a_buf]],
@@ -857,10 +919,14 @@ def _process_tile_mma_inner(
                 tlx.barrier_arrive(cta_bars[a_buf], arrive_count=1, remote_cta_rank=0)
                 tlx.barrier_wait(cta_bars[a_buf], phase=phase, pred=pred_cta0)
 
+            # Transpose SMEM buffers if inputs were column-major
+            a_operand = tlx.local_trans(buffers_A[a_buf]) if not A_ROW_MAJOR else buffers_A[a_buf]
+            b_operand = tlx.local_trans(buffers_B[buf]) if not B_ROW_MAJOR else buffers_B[buf]
+
             # Perform MMA: use_acc=True for remaining K iterations
             tlx.async_dot(
-                buffers_A[a_buf],
-                buffers_B[buf],
+                a_operand,
+                b_operand,
                 tmem_buffers[acc_buf],
                 use_acc=True,
                 mBarriers=[A_smem_empty_bars[a_buf]],
@@ -906,6 +972,8 @@ def _process_tile_producer_inner(
     smem_accum_cnt,
     NUM_CTAS,
     cluster_cta_rank,
+    A_ROW_MAJOR: tl.constexpr = True,
+    B_ROW_MAJOR: tl.constexpr = True,
 ):
     """Process TMA loads for a single tile with all subtiles over [k_tile_start, k_tile_end)."""
     mn_tile_id = tile_id % num_mn_tiles
@@ -928,15 +996,23 @@ def _process_tile_producer_inner(
         tlx.barrier_wait(A_smem_empty_bars[a_buf], phase ^ 1)
         offs_am = pid_m * BLOCK_SIZE_M
         tlx.barrier_expect_bytes(A_smem_full_bars[a_buf], dsize * BLOCK_M_SPLIT * BLOCK_SIZE_K)
-        tlx.async_descriptor_load(a_desc, buffers_A[a_buf], [offs_am, offs_k], A_smem_full_bars[a_buf],
-                                  eviction_policy="evict_last")
+        if not A_ROW_MAJOR:
+            tlx.async_descriptor_load(a_desc, buffers_A[a_buf], [offs_k, offs_am], A_smem_full_bars[a_buf],
+                                      eviction_policy="evict_last")
+        else:
+            tlx.async_descriptor_load(a_desc, buffers_A[a_buf], [offs_am, offs_k], A_smem_full_bars[a_buf],
+                                      eviction_policy="evict_last")
 
         # Load B once per K iteration (shared across all subtiles)
         last_a_buf = (NUM_MMA_GROUPS - 1) * NUM_SMEM_BUFFERS + buf
         tlx.barrier_wait(A_smem_empty_bars[last_a_buf], phase ^ 1)
         tlx.barrier_expect_bytes(B_smem_full_bars[buf], expected_bytes)
-        tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], B_smem_full_bars[buf],
-                                  eviction_policy="evict_last")
+        if not B_ROW_MAJOR:
+            tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_bn, offs_k], B_smem_full_bars[buf],
+                                      eviction_policy="evict_last")
+        else:
+            tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], B_smem_full_bars[buf],
+                                      eviction_policy="evict_last")
 
         # Load all remaining A subtiles for this K iteration
         for group_id in tl.static_range(1, NUM_MMA_GROUPS):
@@ -947,24 +1023,87 @@ def _process_tile_producer_inner(
             offs_am2 = offs_am + group_id * BLOCK_M_SPLIT
 
             tlx.barrier_expect_bytes(A_smem_full_bars[a_buf], dsize * BLOCK_M_SPLIT * BLOCK_SIZE_K)
-            tlx.async_descriptor_load(a_desc, buffers_A[a_buf], [offs_am2, offs_k], A_smem_full_bars[a_buf],
-                                      eviction_policy="evict_last")
+            if not A_ROW_MAJOR:
+                tlx.async_descriptor_load(a_desc, buffers_A[a_buf], [offs_k, offs_am2], A_smem_full_bars[a_buf],
+                                          eviction_policy="evict_last")
+            else:
+                tlx.async_descriptor_load(a_desc, buffers_A[a_buf], [offs_am2, offs_k], A_smem_full_bars[a_buf],
+                                          eviction_policy="evict_last")
 
         smem_accum_cnt += 1
 
     return smem_accum_cnt
 
 
+TORCH_DTYPE_TO_TRITON = {
+    torch.float16: tl.float16,
+    torch.bfloat16: tl.bfloat16,
+    torch.float32: tl.float32,
+}
+
+
+@triton.jit
+def _reduce_k_kernel(
+    workspace_ptr,
+    c_ptr,
+    M,
+    N,
+    SPLIT_K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    OUTPUT_DTYPE: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    base_offs = offs_m[:, None] * N + offs_n[None, :]
+
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for s in range(SPLIT_K):
+        ws_offs = base_offs + s * M * N
+        partial = tl.load(workspace_ptr + ws_offs, mask=mask, other=0.0)
+        acc += partial.to(tl.float32)
+
+    tl.store(c_ptr + base_offs, acc.to(OUTPUT_DTYPE), mask=mask)
+
+
+def reduce_post_hook(nargs, exception=None):
+    if exception is not None:
+        return
+    split_k = nargs.get("SPLIT_K", 1)
+    if split_k > 1:
+        M = nargs["M"]
+        N = nargs["N"]
+        workspace = nargs["workspace_desc"].base
+        c = nargs["c_desc"].base
+        reduce_grid = (triton.cdiv(M, 32), triton.cdiv(N, 32))
+        _reduce_k_kernel[reduce_grid](
+            workspace,
+            c,
+            M,
+            N,
+            SPLIT_K=split_k,
+            BLOCK_SIZE_M=32,
+            BLOCK_SIZE_N=32,
+            OUTPUT_DTYPE=TORCH_DTYPE_TO_TRITON[workspace.dtype],
+            num_warps=4,
+        )
+
+
 @triton.autotune(
     configs=get_cuda_autotune_config(),
     key=["M", "N", "K"],
     prune_configs_by={"early_config_prune": preprocess_configs},
+    post_hook=reduce_post_hook,
 )
 @triton.jit
 def matmul_kernel_tma_ws_blackwell(
     a_desc,
     b_desc,
     c_desc,
+    workspace_desc,
     M,
     N,
     K,
@@ -980,17 +1119,29 @@ def matmul_kernel_tma_ws_blackwell(
     SPLIT_K: tl.constexpr,
     INTERLEAVE_EPILOGUE: tl.constexpr,
     NUM_SMS: tl.constexpr,
+    A_ROW_MAJOR: tl.constexpr = True,
+    B_ROW_MAJOR: tl.constexpr = True,
     USE_WARP_BARRIER: tl.constexpr = False,
 ):
     # allocate NUM_SMEM_BUFFERS buffers
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_SIZE_M // NUM_MMA_GROUPS
-    buffers_A = tlx.local_alloc(
-        (BLOCK_M_SPLIT, BLOCK_SIZE_K),
-        tlx.dtype_of(a_desc),
-        NUM_SMEM_BUFFERS * NUM_MMA_GROUPS,
-    )
+    if not A_ROW_MAJOR:
+        buffers_A = tlx.local_alloc(
+            (BLOCK_SIZE_K, BLOCK_M_SPLIT),
+            tlx.dtype_of(a_desc),
+            NUM_SMEM_BUFFERS * NUM_MMA_GROUPS,
+        )
+    else:
+        buffers_A = tlx.local_alloc(
+            (BLOCK_M_SPLIT, BLOCK_SIZE_K),
+            tlx.dtype_of(a_desc),
+            NUM_SMEM_BUFFERS * NUM_MMA_GROUPS,
+        )
     # In 2-CTA mode, each CTA only needs to load BLOCK_N // NUM_CTAS of B.
-    buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N // NUM_CTAS), tlx.dtype_of(b_desc), NUM_SMEM_BUFFERS)
+    if not B_ROW_MAJOR:
+        buffers_B = tlx.local_alloc((BLOCK_SIZE_N // NUM_CTAS, BLOCK_SIZE_K), tlx.dtype_of(b_desc), NUM_SMEM_BUFFERS)
+    else:
+        buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N // NUM_CTAS), tlx.dtype_of(b_desc), NUM_SMEM_BUFFERS)
     # NUM_TMEM_BUFFERS (overlaps MMA and epilogue)
     # Each buffer holds one subtile: BLOCK_M_SPLIT x BLOCK_SIZE_N
     # Total buffers: NUM_TMEM_BUFFERS * NUM_MMA_GROUPS
@@ -1062,30 +1213,39 @@ def matmul_kernel_tma_ws_blackwell(
             tile_id = start_pid
 
             while tile_id < num_tiles:
-                cur_tmem_buf, tmem_read_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
-                _process_tile_epilogue_inner(
-                    tile_id=tile_id,
-                    num_pid_in_group=num_pid_in_group,
-                    num_pid_m=num_pid_m,
-                    num_mn_tiles=num_mn_tiles,
-                    GROUP_SIZE_M=GROUP_SIZE_M,
-                    M=M,
-                    BLOCK_SIZE_M=BLOCK_SIZE_M,
-                    BLOCK_SIZE_N=BLOCK_SIZE_N,
-                    EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
-                    NUM_MMA_GROUPS=NUM_MMA_GROUPS,
-                    NUM_TMEM_BUFFERS=NUM_TMEM_BUFFERS,
-                    SPLIT_K=SPLIT_K,
-                    INTERLEAVE_EPILOGUE=INTERLEAVE_EPILOGUE,
-                    c_desc=c_desc,
-                    c_smem_buffers=c_smem_buffers,
-                    tmem_buffers=tmem_buffers,
-                    tmem_full_bars=tmem_full_bars,
-                    tmem_empty_bars=tmem_empty_bars,
-                    cur_tmem_buf=cur_tmem_buf,
-                    tmem_read_phase=tmem_read_phase,
-                )
-                tmem_accum_cnt += 1
+                # Skip tiles whose split has zero K-tiles (last split
+                # can be empty when cdiv(k_tiles_total, SPLIT_K) * (SPLIT_K-1)
+                # >= k_tiles_total).
+                split_id = tile_id // num_mn_tiles
+                k_tiles_per_split = tl.cdiv(k_tiles_total, SPLIT_K)
+                k_tile_start = split_id * k_tiles_per_split
+                k_tile_end = min(k_tile_start + k_tiles_per_split, k_tiles_total)
+                if k_tile_end > k_tile_start:
+                    cur_tmem_buf, tmem_read_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
+                    _process_tile_epilogue_inner(
+                        tile_id=tile_id,
+                        num_pid_in_group=num_pid_in_group,
+                        num_pid_m=num_pid_m,
+                        num_mn_tiles=num_mn_tiles,
+                        GROUP_SIZE_M=GROUP_SIZE_M,
+                        M=M,
+                        BLOCK_SIZE_M=BLOCK_SIZE_M,
+                        BLOCK_SIZE_N=BLOCK_SIZE_N,
+                        EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
+                        NUM_MMA_GROUPS=NUM_MMA_GROUPS,
+                        NUM_TMEM_BUFFERS=NUM_TMEM_BUFFERS,
+                        SPLIT_K=SPLIT_K,
+                        INTERLEAVE_EPILOGUE=INTERLEAVE_EPILOGUE,
+                        c_desc=c_desc,
+                        workspace_desc=workspace_desc,
+                        c_smem_buffers=c_smem_buffers,
+                        tmem_buffers=tmem_buffers,
+                        tmem_full_bars=tmem_full_bars,
+                        tmem_empty_bars=tmem_empty_bars,
+                        cur_tmem_buf=cur_tmem_buf,
+                        tmem_read_phase=tmem_read_phase,
+                    )
+                    tmem_accum_cnt += 1
                 tile_id += NUM_SMS
 
         with tlx.async_task(num_warps=1, num_regs=24):  # MMA consumer
@@ -1120,30 +1280,34 @@ def matmul_kernel_tma_ws_blackwell(
                 k_tile_start = split_id * k_tiles_per_split
                 k_tile_end = min(k_tile_start + k_tiles_per_split, k_tiles_total)
 
-                cur_tmem_buf, tmem_write_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
-                smem_accum_cnt = _process_tile_mma_inner(
-                    k_tiles=k_tiles_total,
-                    k_tile_start=k_tile_start,
-                    k_tile_end=k_tile_end,
-                    NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS,
-                    NUM_MMA_GROUPS=NUM_MMA_GROUPS,
-                    NUM_TMEM_BUFFERS=NUM_TMEM_BUFFERS,
-                    buffers_A=buffers_A,
-                    buffers_B=buffers_B,
-                    tmem_buffers=tmem_buffers,
-                    A_smem_full_bars=A_smem_full_bars,
-                    B_smem_full_bars=B_smem_full_bars,
-                    A_smem_empty_bars=A_smem_empty_bars,
-                    tmem_full_bars=tmem_full_bars,
-                    cur_tmem_buf=cur_tmem_buf,
-                    tmem_empty_bars=tmem_empty_bars,
-                    tmem_write_phase=tmem_write_phase,
-                    smem_accum_cnt=smem_accum_cnt,
-                    NUM_CTAS=NUM_CTAS,
-                    cta_bars=cta_bars,
-                    pred_cta0=pred_cta0,
-                )
-                tmem_accum_cnt += 1
+                # Skip tiles whose split has zero K-tiles
+                if k_tile_end > k_tile_start:
+                    cur_tmem_buf, tmem_write_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
+                    smem_accum_cnt = _process_tile_mma_inner(
+                        k_tiles=k_tiles_total,
+                        k_tile_start=k_tile_start,
+                        k_tile_end=k_tile_end,
+                        NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS,
+                        NUM_MMA_GROUPS=NUM_MMA_GROUPS,
+                        NUM_TMEM_BUFFERS=NUM_TMEM_BUFFERS,
+                        buffers_A=buffers_A,
+                        buffers_B=buffers_B,
+                        tmem_buffers=tmem_buffers,
+                        A_smem_full_bars=A_smem_full_bars,
+                        B_smem_full_bars=B_smem_full_bars,
+                        A_smem_empty_bars=A_smem_empty_bars,
+                        tmem_full_bars=tmem_full_bars,
+                        cur_tmem_buf=cur_tmem_buf,
+                        tmem_empty_bars=tmem_empty_bars,
+                        tmem_write_phase=tmem_write_phase,
+                        smem_accum_cnt=smem_accum_cnt,
+                        NUM_CTAS=NUM_CTAS,
+                        cta_bars=cta_bars,
+                        pred_cta0=pred_cta0,
+                        A_ROW_MAJOR=A_ROW_MAJOR,
+                        B_ROW_MAJOR=B_ROW_MAJOR,
+                    )
+                    tmem_accum_cnt += 1
                 tile_id += NUM_SMS
 
         with tlx.async_task(num_warps=1, num_regs=24):  # producer, TMA load
@@ -1177,65 +1341,80 @@ def matmul_kernel_tma_ws_blackwell(
                 k_tile_start = split_id * k_tiles_per_split
                 k_tile_end = min(k_tile_start + k_tiles_per_split, k_tiles_total)
 
-                smem_accum_cnt = _process_tile_producer_inner(
-                    tile_id=tile_id,
-                    num_pid_in_group=num_pid_in_group,
-                    num_pid_m=num_pid_m,
-                    num_mn_tiles=num_mn_tiles,
-                    GROUP_SIZE_M=GROUP_SIZE_M,
-                    BLOCK_SIZE_M=BLOCK_SIZE_M,
-                    BLOCK_SIZE_N=BLOCK_SIZE_N,
-                    BLOCK_SIZE_K=BLOCK_SIZE_K,
-                    NUM_MMA_GROUPS=NUM_MMA_GROUPS,
-                    k_tile_start=k_tile_start,
-                    k_tile_end=k_tile_end,
-                    NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS,
-                    a_desc=a_desc,
-                    b_desc=b_desc,
-                    buffers_A=buffers_A,
-                    buffers_B=buffers_B,
-                    A_smem_full_bars=A_smem_full_bars,
-                    B_smem_full_bars=B_smem_full_bars,
-                    A_smem_empty_bars=A_smem_empty_bars,
-                    smem_accum_cnt=smem_accum_cnt,
-                    NUM_CTAS=NUM_CTAS,
-                    cluster_cta_rank=cluster_cta_rank,
-                )
+                # Skip tiles whose split has zero K-tiles
+                if k_tile_end > k_tile_start:
+                    smem_accum_cnt = _process_tile_producer_inner(
+                        tile_id=tile_id,
+                        num_pid_in_group=num_pid_in_group,
+                        num_pid_m=num_pid_m,
+                        num_mn_tiles=num_mn_tiles,
+                        GROUP_SIZE_M=GROUP_SIZE_M,
+                        BLOCK_SIZE_M=BLOCK_SIZE_M,
+                        BLOCK_SIZE_N=BLOCK_SIZE_N,
+                        BLOCK_SIZE_K=BLOCK_SIZE_K,
+                        NUM_MMA_GROUPS=NUM_MMA_GROUPS,
+                        k_tile_start=k_tile_start,
+                        k_tile_end=k_tile_end,
+                        NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS,
+                        a_desc=a_desc,
+                        b_desc=b_desc,
+                        buffers_A=buffers_A,
+                        buffers_B=buffers_B,
+                        A_smem_full_bars=A_smem_full_bars,
+                        B_smem_full_bars=B_smem_full_bars,
+                        A_smem_empty_bars=A_smem_empty_bars,
+                        smem_accum_cnt=smem_accum_cnt,
+                        NUM_CTAS=NUM_CTAS,
+                        cluster_cta_rank=cluster_cta_rank,
+                        A_ROW_MAJOR=A_ROW_MAJOR,
+                        B_ROW_MAJOR=B_ROW_MAJOR,
+                    )
                 tile_id += NUM_SMS
 
 
-def matmul(a, b, config=None, use_heuristic=False, use_warp_barrier=False):
+def matmul(a, b, config=None):
     """Matrix multiplication using TLX GEMM kernel.
 
     Args:
         a: Input matrix A of shape (M, K)
         b: Input matrix B of shape (K, N)
-        config: Optional dict with kernel config. If None and use_heuristic=True,
-                uses shape-dependent heuristic selection. If heuristic fails,
-                falls back to full autotuning.
-        use_heuristic: When config is None, try heuristic config selection first.
-                      Default True for faster kernel launch.
+        config: Optional dict with kernel config. If None and
+                TLX_GEMM_USE_HEURISTIC=1, uses shape-dependent heuristic
+                selection. If heuristic fails, falls back to full autotuning.
 
     Returns:
         Output matrix C of shape (M, N)
     """
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
-    assert a.is_contiguous(), "Matrix A must be contiguous"
     M, K = a.shape
     K, N = b.shape
     # Allocates output.
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
+    # Detect column-major inputs.
+    # A column-major (M, K) tensor has strides (1, M); its .T is row-major (K, M).
+    a_row_major = a.is_contiguous()
+    b_row_major = b.is_contiguous()
+
     # A dummy block value that will be overwritten when we have the real block size
     dummy_block = [1, 1]
-    a_desc = TensorDescriptor(a, a.shape, a.stride(), dummy_block)
-    b_desc = TensorDescriptor(b, b.shape, b.stride(), dummy_block)
+    if not a_row_major:
+        a_t = a.T  # (K, M) with strides (M, 1) — row-major
+        a_desc = TensorDescriptor(a_t, a_t.shape, a_t.stride(), dummy_block)
+    else:
+        a_desc = TensorDescriptor(a, a.shape, a.stride(), dummy_block)
+    if not b_row_major:
+        b_t = b.T  # (N, K) with strides (K, 1) — row-major
+        b_desc = TensorDescriptor(b_t, b_t.shape, b_t.stride(), dummy_block)
+    else:
+        b_desc = TensorDescriptor(b, b.shape, b.stride(), dummy_block)
     c_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
 
-    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    NUM_SMS = _get_num_sms()
 
-    # Use heuristic config if no config provided and heuristic is enabled
+    # Use heuristic config if no config provided and env var is set
+    use_heuristic = os.environ.get("TLX_GEMM_USE_HEURISTIC", "0") == "1"
     if config is None and use_heuristic:
         config = get_heuristic_config(M, N, K, NUM_SMS)
         if config is not None and os.environ.get("TRITON_PRINT_AUTOTUNING") == "1":
@@ -1250,29 +1429,66 @@ def matmul(a, b, config=None, use_heuristic=False, use_warp_barrier=False):
         ctas_per_cga = config.pop("ctas_per_cga", None)
         # Extract and run pre_hook if present
         pre_hook = config.pop("pre_hook", None)
-        if pre_hook:
-            pre_hook({"a_desc": a_desc, "b_desc": b_desc, "c_desc": c_desc, **config})
+        split_k = config.get("SPLIT_K", 1)
+        if split_k > 1:
+            workspace = torch.empty((split_k * M, N), device=a.device, dtype=a.dtype)
+            workspace_desc = TensorDescriptor(workspace, workspace.shape, workspace.stride(), dummy_block)
         else:
-            matmul_tma_set_block_size_hook({"a_desc": a_desc, "b_desc": b_desc, "c_desc": c_desc, **config})
+            workspace_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
+        hook_args = {
+            "a_desc": a_desc,
+            "b_desc": b_desc,
+            "c_desc": c_desc,
+            "workspace_desc": workspace_desc,
+            "M": M,
+            "N": N,
+            "K": K,
+            "A_ROW_MAJOR": a_row_major,
+            "B_ROW_MAJOR": b_row_major,
+            **config,
+        }
+        if pre_hook:
+            pre_hook(hook_args)
+        else:
+            matmul_tma_set_block_size_hook(hook_args)
         NUM_CTAS = config.get("NUM_CTAS", 1)
         num_pid_m = triton.cdiv(M, config["BLOCK_SIZE_M"])
         num_pid_n = triton.cdiv(N, config["BLOCK_SIZE_N"])
         num_pid_m = (num_pid_m + NUM_CTAS - 1) // NUM_CTAS * NUM_CTAS
-        total_tiles = num_pid_m * num_pid_n * config.get("SPLIT_K", 1)
+        total_tiles = num_pid_m * num_pid_n * split_k
         grid = (min(NUM_SMS, total_tiles), )
         matmul_kernel_tma_ws_blackwell.fn[grid](
             a_desc,
             b_desc,
             c_desc,
+            workspace_desc,
             M,
             N,
             K,
+            A_ROW_MAJOR=a_row_major,
+            B_ROW_MAJOR=b_row_major,
             NUM_SMS=NUM_SMS,
-            USE_WARP_BARRIER=use_warp_barrier,
             ctas_per_cga=ctas_per_cga,
             **config,
         )
+        # Run separate reduction kernel for split-K
+        if split_k > 1:
+            reduce_grid = (triton.cdiv(M, 32), triton.cdiv(N, 32))
+            _reduce_k_kernel[reduce_grid](
+                workspace_desc.base,
+                c,
+                M,
+                N,
+                SPLIT_K=split_k,
+                BLOCK_SIZE_M=32,
+                BLOCK_SIZE_N=32,
+                OUTPUT_DTYPE=TORCH_DTYPE_TO_TRITON[a.dtype],
+                num_warps=4,
+            )
     else:
+        # Pass c as dummy workspace_desc. Pre_hook dynamically allocates
+        # the right-sized workspace per config based on SPLIT_K.
+        workspace_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
 
         def grid(META):
             NUM_CTAS = META["NUM_CTAS"]
@@ -1288,14 +1504,30 @@ def matmul(a, b, config=None, use_heuristic=False, use_warp_barrier=False):
             a_desc,
             b_desc,
             c_desc,
+            workspace_desc,
             M,
             N,
             K,
+            A_ROW_MAJOR=a_row_major,
+            B_ROW_MAJOR=b_row_major,
             NUM_SMS=NUM_SMS,
-            USE_WARP_BARRIER=use_warp_barrier,
         )
+        # Run split-K reduction after the autotuner picks and launches the kernel.
+        # The autotuner's post_hook only runs during benchmarking, not production calls.
+        best = matmul_kernel_tma_ws_blackwell.best_config
+        split_k = best.kwargs.get("SPLIT_K", 1)
+        if split_k > 1:
+            workspace = workspace_desc.base
+            reduce_grid = (triton.cdiv(M, 32), triton.cdiv(N, 32))
+            _reduce_k_kernel[reduce_grid](
+                workspace,
+                c,
+                M,
+                N,
+                SPLIT_K=split_k,
+                BLOCK_SIZE_M=32,
+                BLOCK_SIZE_N=32,
+                OUTPUT_DTYPE=TORCH_DTYPE_TO_TRITON[a.dtype],
+                num_warps=4,
+            )
     return c
-
-
-def matmul_warp_barrier(a, b, config=None, use_heuristic=True):
-    return matmul(a, b, config=config, use_heuristic=use_heuristic, use_warp_barrier=True)

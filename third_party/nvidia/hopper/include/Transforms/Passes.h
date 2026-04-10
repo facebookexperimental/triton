@@ -14,5 +14,8 @@ namespace mlir {
 #define GEN_PASS_REGISTRATION
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
 
+// Modulo scheduling pass (manual registration, not tablegen-generated).
+std::unique_ptr<Pass> createNVGPUModuloSchedule();
+
 } // namespace mlir
 #endif // DIALECT_NV_TRANSFORMS_PASSES_H_

@@ -125,8 +125,8 @@ struct ArriveBarrierOpConversion
     Block *phaseFlipBlock = rewriter.createBlock(afterPhaseFlipBlock);
     rewriter.setInsertionPointToEnd(currentBlock);
 
-    rewriter.create<LLVM::CondBrOp>(loc, allArrived, phaseFlipBlock,
-                                    afterPhaseFlipBlock);
+    LLVM::CondBrOp::create(rewriter, loc, allArrived, phaseFlipBlock,
+                           afterPhaseFlipBlock);
 
     rewriter.setInsertionPointToStart(phaseFlipBlock);
     GCNBuilder phaseFlipBuilder;
@@ -143,7 +143,7 @@ struct ArriveBarrierOpConversion
     auto xor_op = phaseFlipBuilder.launch(rewriter, loc, void_ty(ctx),
                                           true /*hasSideEffects*/);
 
-    auto br = rewriter.create<LLVM::BrOp>(loc, afterPhaseFlipBlock);
+    auto br = LLVM::BrOp::create(rewriter, loc, afterPhaseFlipBlock);
 
     rewriter.eraseOp(op);
     return success();

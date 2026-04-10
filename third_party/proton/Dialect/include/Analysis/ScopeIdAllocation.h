@@ -45,7 +45,13 @@ public:
   size_t getNumScopes() const { return idToNameMap.size(); }
 
 private:
+  using VirtualBlock = std::pair<Block *, Block::iterator>;
+
   void run();
+  void reachability();
+  void liveness();
+  void dominance();
+  void visitTerminator(Operation *op, SmallVector<VirtualBlock> &successors);
 
   Operation *funcOp;
   llvm::DenseMap<ScopeId, StringRef> idToNameMap;
@@ -53,7 +59,7 @@ private:
   ScopeIdParent scopeParentIds;
 };
 
-class ModuleScopeIdAllocation : public CallGraph<ScopeIdAllocation> {
+class ModuleScopeIdAllocation : public triton::CallGraph<ScopeIdAllocation> {
 public:
   using FuncOffsetMapT =
       llvm::DenseMap<FunctionOpInterface, ScopeIdAllocation::ScopeId>;

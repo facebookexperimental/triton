@@ -59,14 +59,11 @@ struct PipelinedMMA {
 } // namespace
 
 bool samePartition(Operation *op1, Operation *op2) {
-  auto part1 = getPartitionIds(op1);
-  auto part2 = getPartitionIds(op2);
-
-  if (!part1 || !part2) {
+  if (!hasPartition(op1) || !hasPartition(op2)) {
     return false;
   }
 
-  return *part1 == *part2;
+  return getPartitionIds(op1) == getPartitionIds(op2);
 }
 
 static std::pair<SmallVector<PipelinedLoad>, SmallVector<PipelinedMMA>>
@@ -100,15 +97,15 @@ static std::pair<Value, Value> postIncrementModulo(ImplicitLocOpBuilder &b,
                                                    Value index, Value phase,
                                                    unsigned numStages) {
   auto intCst = [&](int value) {
-    return b.create<arith::ConstantIntOp>(value, 32);
+    return arith::ConstantIntOp::create(b, value, 32);
   };
-  Value nextIndex = b.create<arith::AddIOp>(index, intCst(1));
-  Value nextPhase = b.create<arith::XOrIOp>(phase, intCst(1));
+  Value nextIndex = arith::AddIOp::create(b, index, intCst(1));
+  Value nextPhase = arith::XOrIOp::create(b, phase, intCst(1));
 
-  Value rollover = b.create<arith::CmpIOp>(arith::CmpIPredicate::eq, nextIndex,
-                                           intCst(numStages));
-  nextIndex = b.create<arith::SelectOp>(rollover, intCst(0), nextIndex);
-  nextPhase = b.create<arith::SelectOp>(rollover, nextPhase, phase);
+  Value rollover = arith::CmpIOp::create(b, arith::CmpIPredicate::eq, nextIndex,
+                                         intCst(numStages));
+  nextIndex = arith::SelectOp::create(b, rollover, intCst(0), nextIndex);
+  nextPhase = arith::SelectOp::create(b, rollover, nextPhase, phase);
 
   return {nextIndex, nextPhase};
 }
@@ -131,8 +128,8 @@ addIndexAndPhase(PartitionBuilder &b, scf::ForOp &loop, unsigned numStages,
 
   auto [nextIndex, nextPhase] = postIncrementModulo(b, index, phase, numStages);
   if (epilogue) {
-    nextIndex = b.create<arith::SelectOp>(epilogue, nextIndex, index);
-    nextPhase = b.create<arith::SelectOp>(epilogue, nextPhase, phase);
+    nextIndex = arith::SelectOp::create(b, epilogue, nextIndex, index);
+    nextPhase = arith::SelectOp::create(b, epilogue, nextPhase, phase);
   }
   yield->insertOperands(yield.getNumOperands(), {nextIndex, nextPhase});
 
@@ -151,7 +148,7 @@ static Value getUserPrecondition(ImplicitLocOpBuilder &b, scf::ForOp loop,
 
   OpBuilder::InsertionGuard guard(b);
   b.setInsertionPoint(loop);
-  Value trueVal = b.create<arith::ConstantOp>(b.getBoolAttr(true));
+  Value trueVal = arith::ConstantOp::create(b, b.getBoolAttr(true));
 
   Value userPred = trueVal;
   Operation *parentOp = domOp;
@@ -165,8 +162,8 @@ static Value getUserPrecondition(ImplicitLocOpBuilder &b, scf::ForOp loop,
     }
     Value cond = ifOp.getCondition();
     if (domOp->getParentRegion() == &ifOp.getElseRegion())
-      cond = b.create<arith::XOrIOp>(cond, trueVal);
-    userPred = b.create<arith::AndIOp>(userPred, cond);
+      cond = arith::XOrIOp::create(b, cond, trueVal);
+    userPred = arith::AndIOp::create(b, userPred, cond);
   }
 
   return userPred;
@@ -340,7 +337,7 @@ void PipelinedLoadGroup::allocateAref(scf::ForOp &loop, int numStages) {
   PartitionBuilder b(getLoc(), loop);
   for (auto i : llvm::seq(numStages)) {
     Value emptyBar = createSingleBufferView(b, emptyBars, i);
-    b.create<ttng::ArriveBarrierOp>(emptyBar, arriveCount);
+    ttng::ArriveBarrierOp::create(b, emptyBar, arriveCount);
   }
 
   std::tie(index, phase) = addIndexAndPhase(b, loop, numStages);
@@ -585,7 +582,7 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
     for (auto i : llvm::seq(numMmaStages)) {
       b.setInsertionPoint(loop);
       Value bar = createSingleBufferView(b, nodes.front().barPrev, i);
-      b.create<ttng::ArriveBarrierOp>(bar, /*arriveCount=*/1);
+      ttng::ArriveBarrierOp::create(b, bar, /*arriveCount=*/1);
     }
   }
 
@@ -597,14 +594,15 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
       b.setInsertionPoint(loop);
       return getLastInductionValue(b, loop);
     }();
-    userPred = b.create<arith::CmpIOp>(
-        arith::CmpIPredicate::eq, loop.getInductionVar(), lastInductionValue);
+    userPred =
+        arith::CmpIOp::create(b, arith::CmpIPredicate::eq,
+                              loop.getInductionVar(), lastInductionValue);
     nodes.back().barNext = createBarrierAlloc(loop, /*numBarriers=*/1);
   }
 
   Value curIndex = index, curPhase = phase;
   b.setInsertionPoint(loop);
-  Value replTok = b.create<ub::PoisonOp>(b.getType<AsyncTokenType>());
+  Value replTok = ub::PoisonOp::create(b, b.getType<AsyncTokenType>());
   DenseSet<Operation *> seen;
   std::optional<OpBuilder::InsertPoint> incrementPt;
   Node *firstAfterInc = nullptr;
@@ -638,8 +636,8 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
       b.setInsertionPointAfter(inBody(readOp));
       auto [nextIndex, nextPhase] =
           postIncrementModulo(b, index, phase, numMmaStages);
-      curIndex = b.create<arith::SelectOp>(userPred, nextIndex, index);
-      curPhase = b.create<arith::SelectOp>(userPred, nextPhase, phase);
+      curIndex = arith::SelectOp::create(b, userPred, nextIndex, index);
+      curPhase = arith::SelectOp::create(b, userPred, nextPhase, phase);
       incrementPt = b.saveInsertionPoint();
     }
   }
@@ -647,12 +645,12 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
     b.setInsertionPoint(loop);
     if (firstAfterInc->op == mmaOp) {
       Value firstBar = createSingleBufferView(b, firstAfterInc->barPrev, 0);
-      b.create<ttng::ArriveBarrierOp>(firstBar, /*arriveCount=*/1);
+      ttng::ArriveBarrierOp::create(b, firstBar, /*arriveCount=*/1);
     } else {
       assert(firstAfterInc->op == dyn_cast<ttng::TMEMStoreOp>(overwriteOp));
       for (auto i : llvm::seq(numMmaStages)) {
         Value firstBar = createSingleBufferView(b, firstAfterInc->barPrev, i);
-        b.create<ttng::ArriveBarrierOp>(firstBar, /*arriveCount=*/1);
+        ttng::ArriveBarrierOp::create(b, firstBar, /*arriveCount=*/1);
       }
     }
   }
@@ -674,7 +672,8 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
     if (!defOp || loop.isDefinedOutsideOfLoop(operand))
       continue;
 
-    if (partitions.isInRootPartition(defOp)) {
+    if (!hasPartition(defOp) ||
+        getPartitionIds(defOp).size() == partitions.getNumPartitions()) {
       // If the MMA operand is coming from outside the loop, move the alloc out.
       auto allocOp = dyn_cast<LocalAllocOp>(defOp);
       if (allocOp && loop.isDefinedOutsideOfLoop(allocOp.getSrc()))
@@ -796,7 +795,7 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
     PartitionBuilder b(defs.front()->getLoc(), loop);
     // For Nx1 barrier allocations, pass a 1D view into barrier ops.
     Value emptyView0 = createSingleBufferView(b, emptyBar, b.intCst(0));
-    b.create<ttng::ArriveBarrierOp>(emptyView0, /*arriveCount=*/1);
+    ttng::ArriveBarrierOp::create(b, emptyView0, /*arriveCount=*/1);
 
     Operation *domOp = findNearestCommonDominator(defs, domInfo);
     Operation *lastOp = findNearestCommonPostDominator(defs, postDomInfo);
@@ -835,7 +834,7 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
     Value lastIndex = loop.getResult(index.getArgNumber() - 1);
     Value lastPhase = loop.getResult(phase.getArgNumber() - 1);
     Value lastBar = createSingleBufferView(b, nodes.back().barNext, lastIndex);
-    b.create<ttng::WaitBarrierOp>(lastBar, lastPhase);
+    ttng::WaitBarrierOp::create(b, lastBar, lastPhase);
   }
 
   llvm::SetVector<Operation *> predOps;

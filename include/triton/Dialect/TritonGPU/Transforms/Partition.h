@@ -17,11 +17,7 @@ class ForOp;
 } // namespace scf
 } // namespace mlir
 
-static constexpr char kPartitionAttrName[] = "ttg.partition";
-static constexpr char kPartitionOutputsAttrName[] = "ttg.partition.outputs";
-static constexpr char kPartitionStagesAttrName[] = "ttg.partition.stages";
 static constexpr char kPartitionTypesAttrName[] = "ttg.partition.types";
-static constexpr char kWarpSpecializeTagAttrName[] = "ttg.warp_specialize.tag";
 
 //===----------------------------------------------------------------------===//
 // PartitionSet
@@ -44,6 +40,7 @@ public:
   bool hasOp(Operation *op) const;
   StringRef getType() const { return type; }
   void setType(StringRef t) { type = t.str(); }
+  bool empty() const { return ops.empty(); }
 
   // Iterate the inputs of the partition. Input values are those that originate
   // from a different partition or a previous iteration of the current
@@ -116,17 +113,12 @@ public:
   // Utility to be used when the op is known to belong to one partition
   Partition *getPartition(Operation *op);
 
-  // Check if the operation belongs to all partitions
-  bool isInRootPartition(Operation *op);
-
 private:
   // WarpSpecialization tag
   int tag;
   // Partitions are numbered [0, N).
   SmallVector<std::unique_ptr<Partition>> partitions;
 };
-
-bool hasPartition(Operation *op);
 
 // Annotate the op with the partition index or indices, and add the op
 // to the partitions it belongs to.
@@ -137,8 +129,9 @@ void setPartition(Operation *op, const SetVector<Partition *> &partitions);
 // it does not keep the op attributes and the op list of a partition in sync.
 void setPartition(Operation *op, ArrayRef<int> partitionIds);
 void setPartition(Operation *op, const SetVector<int> &partitionIds);
-
-std::optional<SetVector<int>> getPartitionIds(Operation *op);
+void setPartitionOutputs(Operation *op,
+                         ArrayRef<SetVector<int>> partitionOutputsIds);
+void setWarpSpecializeTag(Operation *op, int tag);
 
 } // namespace mlir::triton::gpu
 

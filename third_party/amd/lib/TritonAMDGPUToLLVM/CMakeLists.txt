@@ -4,6 +4,7 @@ add_triton_library(TritonAMDGPUToLLVM
     AllocateSharedMemory.cpp
     BarrierOpConversion.cpp
     BufferOpsEmitter.cpp
+    TensorPtrOpsToLLVM.cpp
     ConvertLayoutOpToLLVM.cpp
     MemoryOpToLLVM.cpp
     MaskedOpsToLLVM.cpp
@@ -19,14 +20,15 @@ add_triton_library(TritonAMDGPUToLLVM
     Utility.cpp
     TargetInfo.cpp
     TargetUtils.cpp
-    OptimizeLDSUsage.cpp
-    OptimizeLDSUtility.cpp
     SPMDOpToLLVM.cpp
     SchedInstructions.cpp
     UpcastMXFPToLLVM.cpp
     Fp4ToFpOpToLLVM.cpp
     MembarUtility.cpp
     ScalarizePackedFOps.cpp
+    TDMUtility.cpp
+    BarrierOpToLLVM.cpp
+    WarpIdOpToLLVM.cpp
 
     DEPENDS
     TritonAMDGPUConversionPassIncGen

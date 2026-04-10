@@ -14,7 +14,6 @@ from numpy.random import RandomState
 
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
 
 from triton._internal_testing import (
     integral_dtypes,
@@ -103,8 +102,10 @@ def patch_kernel(template, to_replace):
         return local_namespace[template.fn.__name__]
     else:
         kernel = triton.JITFunction(template.fn)
+        src = kernel.src
         for key, value in to_replace.items():
-            kernel._unsafe_update_src(kernel.src.replace(key, value))
+            src = src.replace(key, value)
+        kernel._unsafe_update_src(src)
         return kernel
 
 
@@ -1214,7 +1215,7 @@ def test_index1d(expr, dtype_str, num_ctas, device):
     rank_y = expr.count(",") + 1
     shape_x = [32 for _ in range(rank_x)]
     shape_z = [32 for _ in range(rank_y)]
-    shape_z_rank_mismatch = [32 for _ in range(rank_y + 1)]
+    shape_z_rank_mismatch = [32 for _ in range(rank_y - 1)]
     shape_z_dim_mismatch = [64 for _ in range(rank_y)]
 
     # Triton kernel
@@ -1467,7 +1468,7 @@ def test_atomic_rmw_predicate(num_ctas, device):
 @pytest.mark.parametrize(
     "shape, axis, num_ctas, dtype_x_str, check_return_val",
     [(shape, axis, num_ctas, dtype_x_str, check_return_val)
-     for shape in [(2, 2), (2, 8), (8, 2), (8, 8), (32, 32), (64, 64)]
+     for shape in [(2, 2), (2, 8), (8, 2), (8, 8), (32, 32), (64, 64), (128, 128)]
      for axis in [0, 1]
      for num_ctas in num_ctas_list
      for dtype_x_str in ["bfloat16", "float16", "float32", "uint64", "int64", "float64"]
@@ -1707,6 +1708,8 @@ def test_tensor_atomic_rmw_block(num_ctas, device):
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
 @pytest.mark.parametrize("dtype_str", ["int32", "int64"])
 def test_atomic_cas(sem, num_ctas, dtype_str, device):
+    if is_hip_cdna2():
+        pytest.skip("Disabled due to being flaky on CDNA2")
     # 1. make sure that atomic_cas changes the original value (Lock)
     @triton.jit
     def change_value(Lock, triton_dtype: tl.constexpr):
@@ -1754,7 +1757,7 @@ def test_atomic_cas(sem, num_ctas, dtype_str, device):
 @pytest.mark.interpreter
 @pytest.mark.parametrize("sem", [None, "acquire", "release", "acq_rel", "relaxed"])
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
-@pytest.mark.parametrize("size", [4, 128, 512])
+@pytest.mark.parametrize("size", [4, 128, 512, 1024])
 @pytest.mark.parametrize("dtype_str", ["bfloat16", "float16", "float32", "uint64", "int64", "float64"])
 def test_tensor_atomic_cas(sem, size, dtype_str, num_ctas, device):
     check_type_supported(dtype_str, device)
@@ -2688,8 +2691,8 @@ def test_sum_dtype(device):
     torch.testing.assert_close(out[0], torch.tensor(32 * 32, dtype=torch.bfloat16, device=device))
 
 
-@triton.jit
 # trivial associative but not commutative function
+@triton.jit
 def get_first_element(a, b):
     return a
 
@@ -2887,6 +2890,23 @@ def test_histogram(M, N, device):
     z_torch = torch.histc(x.float(), bins=N, min=0, max=N - 1)
     histogram_kernel[(1, )](x, z, M=M, N=N)
     assert (z_torch == z).all()
+
+
+@pytest.mark.interpreter
+def test_histogram_silent_data_corruption(device):
+
+    @triton.jit
+    def histogram_kernel(x_ptr, z_ptr):
+        offset = tl.arange(0, 1)
+        x = tl.load(x_ptr + offset)
+        z = tl.histogram(x, 1)
+        tl.store(z_ptr + offset, z)
+
+    x = torch.ones(1, device=device, dtype=torch.int32)
+    z = torch.ones(2, device=device, dtype=torch.int32)
+
+    histogram_kernel[(1, )](x, z)
+    assert z[1] == 1, f"Second element shouldn't be affected, expected_buffer=[1, 1], actual_buffer={z}"
 
 
 # ------------------------
@@ -3539,7 +3559,7 @@ def test_dot(
     if "int" not in in_dtype and "float8" not in in_dtype:
         x *= 0.1
         y *= 0.1
-    if in_dtype == "float32" and input_precision == "tf32":
+    if in_dtype == "float32" and input_precision in ["tf32", "bf16x3", "bf16x6"]:
         x = (x.view("uint32") & np.uint32(0xFFFFE000)).view("float32")
         y = (y.view("uint32") & np.uint32(0xFFFFE000)).view("float32")
         w = (w.view("uint32") & np.uint32(0xFFFFE000)).view("float32")
@@ -4340,7 +4360,7 @@ def test_const(device, choose_const, constexpr, mode):
             error = "Cannot store to a constant pointer"
         else:
             if mode == "call":
-                error = "Inconsistent return types"
+                error = "Return type mismatch: "
             elif mode == "if":
                 error = "Mismatched type for final_out"
             elif mode == "ternary":
@@ -5832,7 +5852,8 @@ def test_poison_return(device):
 
     @triton.jit
     def kernel(Out):
-        tl.store(Out, return_poison(0))
+        zero = 0
+        tl.store(Out, return_poison(zero))
 
     a = torch.empty((), device=device, dtype=torch.int32)
     h = kernel.warmup(a, grid=(1, ))
@@ -6114,6 +6135,27 @@ def test_enable_fp_fusion(enable_fp_fusion, default_override, device, fresh_knob
 
 
 # -----------------------
+# test enable_reflect_ftz
+# -----------------------
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
+@pytest.mark.parametrize("enable_reflect_ftz", [False, True])
+def test_enable_reflect_ftz(enable_reflect_ftz, device, fresh_knobs):
+
+    @triton.jit
+    def exp2(data):
+        ptrs = data + tl.arange(0, 128)
+        tl.store(ptrs, tl.math.exp2(tl.load(ptrs)))
+
+    data = torch.full((128, ), -127.0, device=device, dtype=torch.float32)
+    h = exp2.warmup(data, grid=(1, ), enable_reflect_ftz=enable_reflect_ftz)
+
+    found_ex2_ftz = re.search(r'ex2.approx.ftz.f32', h.asm["ptx"]) is not None
+    assert found_ex2_ftz == enable_reflect_ftz
+
+
+# -----------------------
 # test override_arch
 # -----------------------
 
@@ -6159,7 +6201,7 @@ def test_override_arch(arch, env_var_override, device, fresh_knobs):
         assert amdgcn_gfx.group(1) == arch
 
 
-def test_num_ctas_pre_sm90(device):
+def test_num_ctas_pre_sm90(device, fresh_knobs):
     if not is_cuda() and not is_hip():
         pytest.skip("Only supported on CUDA and HIP")
 
@@ -6173,10 +6215,11 @@ def test_num_ctas_pre_sm90(device):
         msg = r"num_ctas > 1 requires NVIDIA SM90\+ \(Hopper\)"
     else:
         arch = "gfx942"
-        msg = r"num_ctas > 1 not supported for AMD GPUs"
+        msg = r"num_ctas > 1 not supported"
 
+    fresh_knobs.runtime.override_arch = str(arch)
     with pytest.raises(ValueError, match=msg):
-        _kernel.warmup(src, grid=(1, ), num_ctas=2, arch=arch)
+        _kernel.warmup(src, grid=(1, ), num_ctas=2)
 
 
 # -----------------------
@@ -6557,43 +6600,6 @@ def test_num_programs(device):
 
 
 # -----------------------
-# test extern functions
-# -----------------------
-
-
-@pytest.mark.parametrize("dtype_str", ["float32", "float64"])
-def test_math_extern(dtype_str, device):
-    if is_interpreter():
-        pytest.skip("math_extern does not work in the interpreter mode")
-
-    @triton.jit
-    def kernel(
-        x_ptr,
-        y_ptr,
-        n_elements,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        pid = tl.program_id(axis=0)
-        block_start = pid * BLOCK_SIZE
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < n_elements
-        x = tl.load(x_ptr + offsets, mask=mask)
-        y = libdevice.tanh(x)
-        tl.store(y_ptr + offsets, y, mask=mask)
-
-    shape = (128, )
-    rs = RandomState(17)
-
-    x = numpy_random(shape, dtype_str=dtype_str, rs=rs)
-    y_ref = np.tanh(x)
-    x_tri = to_triton(x, device=device)
-    y_tri = to_triton(numpy_random(shape, dtype_str=dtype_str, rs=rs), device=device)
-    kernel[(1, )](x_tri, y_tri, shape[0], BLOCK_SIZE=shape[0])
-    # compare
-    np.testing.assert_allclose(y_ref, to_numpy(y_tri), rtol=0.01)
-
-
-# -----------------------
 # test loop unrolling
 # -----------------------
 
@@ -6832,6 +6838,10 @@ def gather_test_kernel_1d(
     ],
 )
 def test_gather(src_shape, indices_shape, axis, device):
+    if (is_hip_cdna2() or is_hip_cdna3()) and src_shape == [128, 64] and indices_shape == [256, 64]:
+        # This could be solved by reducing vectorization in general swizzling algorithm.
+        # We will do this if any relevant workload suffers from large LDS consumption of the algorithm.
+        pytest.skip('Not enough LDS.')
 
     def triton_gather(src: torch.Tensor, axis: int, indices: torch.Tensor):
         output = torch.empty(indices.shape, dtype=src.dtype, device=src.device)
@@ -7121,3 +7131,40 @@ def test_tensor_member(device):
         tl.device_assert(tl.sum(x) == x.sum())
 
     kernel[(1, )]()
+
+
+@pytest.mark.interpreter
+@pytest.mark.parametrize("rank", [2, 3, 4, 5, 6])
+@pytest.mark.parametrize("trans_a", [False, True])
+@pytest.mark.parametrize("trans_b", [False, True])
+def test_dot_multidim(rank, trans_a, trans_b, device):
+
+    if is_interpreter():
+        pytest.skip("bfloat16 is not supported in the interpreter")
+
+    @triton.jit
+    def kernel(X, Y, Z, RANK: tl.constexpr, TRANS_A: tl.constexpr, TRANS_B: tl.constexpr):
+        x = tl.load(X + tl.arange(0, 256 << RANK)).reshape([2] * (RANK - 2) + [32, 32])
+        y = tl.load(Y + tl.arange(0, 256 << RANK)).reshape([2] * (RANK - 2) + [32, 32])
+        if TRANS_A:
+            x = tl.trans(x)
+        if TRANS_B:
+            y = tl.trans(y)
+        z = tl.dot(x, y)
+        tl.store(Z + tl.arange(0, 256 << RANK), z.reshape([256 << RANK]))
+
+    shape = (2, ) * (rank - 2) + (32, 32)
+
+    a = torch.randint(-4, 5, shape, dtype=torch.bfloat16, device=device)
+    b = torch.randint(-4, 5, shape, dtype=torch.bfloat16, device=device)
+    c = torch.empty(shape, dtype=torch.float32, device=device)
+    kernel[(1, )](a, b, c, rank, trans_a, trans_b)
+
+    if trans_a:
+        a = torch.transpose(a, -1, -2)
+    if trans_b:
+        b = torch.transpose(b, -1, -2)
+
+    d = a.to(torch.float32) @ b.to(torch.float32)
+
+    assert torch.allclose(c, d, rtol=1e-3, atol=1e-2)

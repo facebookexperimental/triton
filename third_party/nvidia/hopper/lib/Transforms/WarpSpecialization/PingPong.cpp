@@ -590,21 +590,21 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
     auto pingRegionLoc = pingRegionBlock.front().getLoc();
     // Prepare values
     Value pingBarrier =
-        builder.create<arith::ConstantIntOp>(pingRegionLoc, pingBarrierId, 32);
+        arith::ConstantIntOp::create(builder, pingRegionLoc, pingBarrierId, 32);
     Value pongBarrier =
-        builder.create<arith::ConstantIntOp>(pingRegionLoc, pongBarrierId, 32);
+        arith::ConstantIntOp::create(builder, pingRegionLoc, pongBarrierId, 32);
     Value pingNumThreads =
-        builder.create<arith::ConstantIntOp>(pingRegionLoc, numThreads, 32);
+        arith::ConstantIntOp::create(builder, pingRegionLoc, numThreads, 32);
     // Insert arrive barrier for the ping partition to allow the initial entry
-    builder.create<ttng::NamedBarrierArriveOp>(pingRegionLoc, pongBarrier,
-                                               pingNumThreads);
+    ttng::NamedBarrierArriveOp::create(builder, pingRegionLoc, pongBarrier,
+                                       pingNumThreads);
     builder.setInsertionPoint(pingStart);
-    builder.create<ttng::NamedBarrierWaitOp>(pingStart->getLoc(), pingBarrier,
-                                             pingNumThreads);
+    ttng::NamedBarrierWaitOp::create(builder, pingStart->getLoc(), pingBarrier,
+                                     pingNumThreads);
     // Insert AFTER the pingEnd op
     builder.setInsertionPointAfter(pingEnd);
-    builder.create<ttng::NamedBarrierArriveOp>(pingEnd->getLoc(), pongBarrier,
-                                               pingNumThreads);
+    ttng::NamedBarrierArriveOp::create(builder, pingEnd->getLoc(), pongBarrier,
+                                       pingNumThreads);
 
     // Insert barriers for the pong partition
     Operation *pongStart = pongBoundOps[0];
@@ -613,19 +613,19 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
     Block &pongRegionBlock = pongRegion->front();
     OpBuilder builder2(&pongRegionBlock, pongRegionBlock.begin());
     auto pongRegionLoc = pongRegionBlock.front().getLoc();
-    Value pingBarrier2 =
-        builder2.create<arith::ConstantIntOp>(pongRegionLoc, pingBarrierId, 32);
-    Value pongBarrier2 =
-        builder2.create<arith::ConstantIntOp>(pongRegionLoc, pongBarrierId, 32);
+    Value pingBarrier2 = arith::ConstantIntOp::create(builder2, pongRegionLoc,
+                                                      pingBarrierId, 32);
+    Value pongBarrier2 = arith::ConstantIntOp::create(builder2, pongRegionLoc,
+                                                      pongBarrierId, 32);
     Value pingNumThreads2 =
-        builder2.create<arith::ConstantIntOp>(pongRegionLoc, numThreads, 32);
+        arith::ConstantIntOp::create(builder2, pongRegionLoc, numThreads, 32);
     builder2.setInsertionPoint(pongStart);
-    builder2.create<ttng::NamedBarrierWaitOp>(pongStart->getLoc(), pongBarrier2,
-                                              pingNumThreads2);
+    ttng::NamedBarrierWaitOp::create(builder2, pongStart->getLoc(),
+                                     pongBarrier2, pingNumThreads2);
     // Insert AFTER the pongEnd op
     builder2.setInsertionPointAfter(pongEnd);
-    builder2.create<ttng::NamedBarrierArriveOp>(pongEnd->getLoc(), pingBarrier2,
-                                                pingNumThreads2);
+    ttng::NamedBarrierArriveOp::create(builder2, pongEnd->getLoc(),
+                                       pingBarrier2, pingNumThreads2);
   }
 }
 } // anonymous namespace

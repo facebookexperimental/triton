@@ -31,16 +31,16 @@ def min_dot_size(target: GPUTarget):
     return check_dot_compatibility
 
 
-def get_ptxas() -> knobs.NvidiaTool:
-    return knobs.nvidia.ptxas
+def get_ptxas(arch: int) -> knobs.NvidiaTool:
+    return knobs.nvidia.ptxas_blackwell if arch >= 100 else knobs.nvidia.ptxas
 
 
 @functools.lru_cache()
-def get_ptxas_version():
+def get_ptxas_version(arch: int = 80):
     mock_ver = knobs.nvidia.mock_ptx_version
     if mock_ver is not None:
         return mock_ver  # This is not really a version of ptxas, but it is good enough for testing
-    version = subprocess.check_output([get_ptxas().path, "--version"]).decode("utf-8")
+    version = subprocess.check_output([get_ptxas(arch).path, "--version"]).decode("utf-8")
     return version
 
 
@@ -71,7 +71,7 @@ def ptx_get_version(cuda_version) -> int:
 def get_ptx_version_from_options(options, arch: int):
     ptx_version = options.ptx_version
     if ptx_version is None:
-        cuda_version = get_ptxas().version
+        cuda_version = get_ptxas(arch).version
         ptx_version = ptx_get_version(cuda_version)
     return ptx_version
 
@@ -102,6 +102,39 @@ def sm_arch_from_capability(capability: int):
     return f"sm_{capability}{suffix}"
 
 
+def _max_shared_mem_for_capability(capability: int) -> int:
+    """Return CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN for a given SM capability.
+
+    Tries querying the GPU driver first. Falls back to a static table for
+    offline compilation environments (e.g. Triton CC on RE) where no GPU is present.
+    """
+    try:
+        from triton.runtime.driver import driver as rt_driver
+        return rt_driver.active.utils.get_device_properties(rt_driver.active.get_current_device())["max_shared_mem"]
+    except (RuntimeError, Exception):
+        pass
+    # Fallback for offline compilation (no GPU present).
+    # Values are CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN per
+    # the CUDA Programming Guide "Technical Specifications per Compute Capability".
+    _SMEM_SIZES = {
+        70: 98304,  # V100:    96 KB per SM, optin = 96 KB
+        75: 65536,  # Turing:  64 KB per SM, optin = 64 KB
+        80: 166912,  # A100:   164 KB per SM, optin = 163 KB
+        86: 101376,  # GA10x:  100 KB per SM, optin = 99 KB
+        87: 166912,  # Orin:   164 KB per SM, optin = 163 KB
+        89: 101376,  # AD10x:  100 KB per SM, optin = 99 KB
+        90: 232448,  # H100:   228 KB per SM, optin = 227 KB
+        100: 232448,  # B200:   228 KB per SM, optin = 227 KB
+        103: 232448,  # GB300:  228 KB per SM, optin = 227 KB
+        110: 232448,  # SM110: 228 KB per SM, optin = 227 KB
+        120: 101376,  # SM120: 100 KB per SM, optin = 99 KB
+    }
+    # Try exact capability first (e.g. 86), then round to family base
+    # (e.g. 86 -> 80) for unknown sub-variants, then fall back to 48 KB
+    # (the default max shared mem per block without optin).
+    return _SMEM_SIZES.get(capability, _SMEM_SIZES.get(capability // 10 * 10, 49152))
+
+
 @dataclass(frozen=True)
 class CUDAOptions:
     num_warps: int = 4
@@ -116,10 +149,12 @@ class CUDAOptions:
     maxnreg: Optional[int] = None
     cluster_dims: tuple = (1, 1, 1)
     ctas_per_cga: Optional[tuple] = None  # Alias for cluster_dims with CUDA semantics
+    preferred_ctas_per_cga: Optional[tuple] = None  # Hint for preferred cluster size (CUDA 12.8+)
     ptx_version: int = None
     ptx_options: Optional[str] = knobs.nvidia.ptxas_options
     ir_override: Optional[str] = None  # filename of a user-defined IR (*.{ttir|ttgir|llir|ptx})
     enable_fp_fusion: bool = True
+    enable_reflect_ftz: bool = True  # ftz in libdevice
     launch_cooperative_grid: bool = False
     launch_cluster: bool = False  # Blackwell cluster launcher
     launch_pdl: bool = False
@@ -189,6 +224,10 @@ class CUDABackend(BaseBackend):
         self.binary_ext = "cubin"
 
     def parse_options(self, opts) -> Any:
+        # Enable debug mode for ConSan, so device-side assertions are not optimized out
+        if "instrumentation_mode" in opts and opts["instrumentation_mode"] == "consan":
+            opts["debug"] = True
+
         args = {'arch': knobs.runtime.override_arch or f"sm{self.target.arch}"}
         args.update({k: opts[k] for k in CUDAOptions.__dataclass_fields__.keys() if k in opts if opts[k] is not None})
         capability = int(self._parse_arch(args["arch"]))
@@ -197,6 +236,10 @@ class CUDABackend(BaseBackend):
             raise ValueError((f"num_ctas > 1 requires NVIDIA SM90+ (Hopper). "
                               f"Current target is sm_{capability}. This configuration will fail. "
                               f"Please set num_ctas=1 or target an SM90+ GPU."))
+
+        if args.get("preferred_ctas_per_cga") is not None and capability < 100:
+            raise ValueError((f"preferred_ctas_per_cga requires NVIDIA SM100+ (Blackwell). "
+                              f"Current target is sm_{capability}."))
 
         if "supported_fp8_dtypes" not in args:
             supported_fp8_dtypes = set(CUDAOptions.supported_fp8_dtypes)
@@ -216,13 +259,14 @@ class CUDABackend(BaseBackend):
         return CUDAOptions(**args)
 
     def pack_metadata(self, metadata):
+        preferred = getattr(metadata, "preferred_ctas_per_cga", None) or (0, 0, 0)
         return (
             metadata.num_warps,
             metadata.num_ctas,
             metadata.shared,
-            metadata.cluster_dims[0],
-            metadata.cluster_dims[1],
-            metadata.cluster_dims[2],
+            preferred[0],
+            preferred[1],
+            preferred[2],
         )
 
     def get_codegen_implementation(self, options):
@@ -293,23 +337,19 @@ class CUDABackend(BaseBackend):
         if opt.early_tma_store_lowering:
             mod.set_attr("ttg.early_tma_store_lowering", ir.builder(mod.context).get_bool_attr(True))
 
-        cluster_info = nvidia.ClusterInfo()
         if opt.cluster_dims is not None:
-            cluster_info.clusterDimX = opt.cluster_dims[0]
-            cluster_info.clusterDimY = opt.cluster_dims[1]
-            cluster_info.clusterDimZ = opt.cluster_dims[2]
             # Set cluster_info attributes on the module
             mod.set_attr(
                 "ttg.cluster-dim-x",
-                ir.builder(mod.context).get_int32_attr(cluster_info.clusterDimX),
+                ir.builder(mod.context).get_int32_attr(opt.cluster_dims[0]),
             )
             mod.set_attr(
                 "ttg.cluster-dim-y",
-                ir.builder(mod.context).get_int32_attr(cluster_info.clusterDimY),
+                ir.builder(mod.context).get_int32_attr(opt.cluster_dims[1]),
             )
             mod.set_attr(
                 "ttg.cluster-dim-z",
-                ir.builder(mod.context).get_int32_attr(cluster_info.clusterDimZ),
+                ir.builder(mod.context).get_int32_attr(opt.cluster_dims[2]),
             )
         pm = ir.pass_manager(mod.context)
         dump_enabled = pm.enable_debug()
@@ -321,7 +361,7 @@ class CUDABackend(BaseBackend):
         tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
         # TODO(Qingyi): Move PlanCTAPass to the front of CoalescePass
-        nvidia.passes.ttnvgpuir.add_plan_cta(pm, cluster_info)
+        nvidia.passes.ttnvgpuir.add_plan_cta(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_thread_locality(pm)
         passes.ttgpuir.add_accelerate_matmul(pm)
@@ -337,9 +377,7 @@ class CUDABackend(BaseBackend):
             passes.common.add_canonicalizer(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             nvidia.passes.hopper.add_tma_store_lowering(pm)
-            from triton.runtime.driver import driver as rt_driver
-            smem_budget = rt_driver.active.utils.get_device_properties(
-                rt_driver.active.get_current_device())["max_shared_mem"]
+            smem_budget = _max_shared_mem_for_capability(capability)
             nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled,
                                                      smem_budget)
             passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
@@ -364,12 +402,11 @@ class CUDABackend(BaseBackend):
                     nvidia.passes.hopper.add_partition_scheduling_meta(pm)
                 else:
                     passes.ttgpuir.add_partition_scheduling(pm)
-                from triton.runtime.driver import driver as rt_driver
-                smem_budget = rt_driver.active.utils.get_device_properties(
-                    rt_driver.active.get_current_device())["max_shared_mem"]
+                smem_budget = _max_shared_mem_for_capability(capability)
                 nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS,
                                                          dump_enabled, smem_budget)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
+            passes.ttgpuir.add_optimize_partition_warps(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             # hoist again and allow hoisting out of if statements
             passes.ttgpuir.add_hoist_tmem_alloc(pm, True)
@@ -386,6 +423,9 @@ class CUDABackend(BaseBackend):
             nvidia.passes.ttnvgpuir.add_tma_lowering(pm)
             nvidia.passes.ttnvgpuir.add_tma_store_buffer_reuse(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
+        nvidia.passes.hopper.add_multi_cta_reduction(pm)
+        # TODO: Find the optimal place in the pipeline for this pass.
+        nvidia.passes.ttnvgpuir.add_prune_unused_barriers(pm)
         nvidia.passes.ttnvgpuir.add_interleave_tmem(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
         passes.ttgpuir.add_reorder_instructions(pm)
@@ -402,12 +442,13 @@ class CUDABackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
 
         pm.run(mod, 'make_ttgir')
-        metadata["cluster_dims"] = (cluster_info.clusterDimX, cluster_info.clusterDimY, cluster_info.clusterDimZ)
+        metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         # Track whether ctas_per_cga was explicitly set to distinguish between
         # Triton's way (num_ctas > 1) and TLX/CUDA way (ctas_per_cga set).
         metadata["ctas_per_cga"] = opt.ctas_per_cga
-        tensordesc_meta = mod.get_tensordesc_metadata()
-        metadata["tensordesc_meta"] = tensordesc_meta
+        metadata["preferred_ctas_per_cga"] = tuple(
+            opt.preferred_ctas_per_cga) if opt.preferred_ctas_per_cga is not None else None
+        metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
 
     def gluon_to_ttgir(self, src, metadata, options, capability):
@@ -416,7 +457,10 @@ class CUDABackend(BaseBackend):
         pm.enable_debug()
 
         passes.gluon.add_inliner(pm)
+        passes.gluon.add_infer_coalesced_encodings(pm)
         passes.gluon.add_resolve_auto_encodings(pm)
+        nvidia.passes.ttnvgpuir.add_tma_lowering(pm)
+        passes.gluon.add_canonicalizer(pm)
         passes.common.add_sccp(pm)
         passes.ttir.add_loop_aware_cse(pm)
         passes.gluon.add_canonicalizer(pm)
@@ -440,7 +484,8 @@ class CUDABackend(BaseBackend):
         passes.gluon.add_inliner(pm)
         nvidia.passes.ttgpuir.add_allocate_shared_memory_nv(pm, capability, ptx_version)
         nvidia.passes.ttnvgpuir.add_allocate_tensor_memory(pm)
-        if knobs.compilation.enable_experimental_consan:
+        nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm)
+        if knobs.compilation.instrumentation_mode == "consan":
             # Call ConcurrencySanitizerPass here, before allocating global scratch memory but after allocating tensor and shared
             passes.ttgpuir.add_concurrency_sanitizer(pm)
         passes.ttgpuir.add_allocate_global_scratch_memory(pm)
@@ -511,7 +556,8 @@ class CUDABackend(BaseBackend):
         triple = 'nvptx64-nvidia-cuda'
         nvidia.set_short_ptr()
         llvm.attach_datalayout(llvm_mod, triple, proc, features)
-        nvidia.set_nvvm_reflect_ftz(llvm_mod)
+        if options.enable_reflect_ftz:
+            nvidia.set_nvvm_reflect_ftz(llvm_mod)
 
         if options.extern_libs and nvidia.has_extern_deps(llvm_mod):
             paths = [path for (name, path) in options.extern_libs]
@@ -562,7 +608,7 @@ class CUDABackend(BaseBackend):
         return ret
 
     def make_cubin(self, src, metadata, opt, capability):
-        ptxas = get_ptxas().path
+        ptxas = get_ptxas(self.target.arch).path
         with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.ptx') as fsrc, \
                 tempfile.NamedTemporaryFile(delete=False, mode='r', suffix='.log') as flog:
             fsrc.write(src)
@@ -652,5 +698,5 @@ please share the reproducer above with Triton project.
 
     @functools.lru_cache()
     def hash(self):
-        version = get_ptxas_version()
+        version = get_ptxas_version(self.target.arch)
         return f'{version}-{self.target.arch}'

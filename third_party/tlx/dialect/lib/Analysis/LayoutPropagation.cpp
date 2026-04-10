@@ -126,7 +126,7 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
         auto newMmaEncoding = ttg::NVMMASharedEncodingAttr::get(
             mmaEncoding.getContext(),
             memDescTransOp.getSrc().getType().getShape(), newOrder,
-            mmaEncoding.getCTALayout(),
+            mmaEncoding.getCGALayout(),
             memDescTransOp.getSrc().getType().getElementType(),
             mmaEncoding.getFp4Padded());
         const auto updatedResultLayoutEncoding = LayoutEncoding(newMmaEncoding);
@@ -155,7 +155,8 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
         auto newTmemEncoding = ttng::TensorMemoryEncodingAttr::get(
             tmemEncoding.getContext(), srcEncoding.getBlockM(),
             srcEncoding.getBlockN(), tmemEncoding.getColStride(),
-            tmemEncoding.getCTASplitM(), tmemEncoding.getCTASplitN());
+            tmemEncoding.getCTASplitM(), tmemEncoding.getCTASplitN(),
+            tmemEncoding.getTwoCTAs());
         const auto updatedResultLayoutEncoding =
             LayoutEncoding(newTmemEncoding);
         auto operandLattice = operands[0];
@@ -204,7 +205,7 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
       auto ctx = srcType.getContext();
 
       // Build unswizzled NVMMASharedEncodingAttr with default CTA layout
-      auto ctaLayout = ttg::CTALayoutAttr::getDefault(ctx, srcType.getRank());
+      auto ctaLayout = ttg::CGAEncodingAttr::getDefault(ctx, srcType.getRank());
       auto unswizzledEncoding = ttg::NVMMASharedEncodingAttr::get(
           ctx,
           /*swizzlingByteWidth=*/0,
@@ -283,7 +284,7 @@ LogicalResult LayoutForwardPropagation::visitOperation(
         auto newEncoding = ttng::TensorMemoryEncodingAttr::get(
             op->getContext(), dstEncoding.getBlockM(), dstEncoding.getBlockN(),
             encoding.getColStride(), encoding.getCTASplitM(),
-            encoding.getCTASplitN());
+            encoding.getCTASplitN(), encoding.getTwoCTAs());
         operandLayoutEncoding = LayoutEncoding(newEncoding);
       }
     }

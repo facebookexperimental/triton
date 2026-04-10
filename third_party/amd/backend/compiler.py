@@ -30,11 +30,10 @@ def is_in_thread_transpose_enabled(arch):
 @dataclass(frozen=True)
 class HIPOptions:
     num_warps: int = 4
-    waves_per_eu: int = 1
+    waves_per_eu: int = 0
     num_stages: int = 2
     num_ctas: int = 1
     extern_libs: dict = None
-    cluster_dims: tuple = (1, 1, 1)
     debug: bool = False
     sanitize_overflow: bool = False
     arch: str = None
@@ -67,6 +66,14 @@ class HIPOptions:
     # attention: enables a bunch of optimizations for attention kernels, including:
     #            - iglp 2 and sched.barrier around it
     #            - sink-insts-to-avoid-spills flag to avoid register spills
+    # memory-bound-attention: enables custom scheduling strategy in llvm backend,
+    #            This option targets special FA variant, which is memory bound and
+    #            has a lot of elementwise operations from fused operand dequantizations.
+    #            Note that this option is highly experimental,
+    #            and will be removed as soon as default sceduler algorithm is fixed.
+    #
+    # Option allows to set multiple variants divided by commas:
+    # schedule_hint="attention,memory-bound-attention"
     schedule_hint: str = 'none'
 
     def __post_init__(self):
@@ -74,7 +81,7 @@ class HIPOptions:
         warp_size = 32 if gfx_major >= 10 else 64
         object.__setattr__(self, 'warp_size', warp_size)
         assert self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0, \
-               "num_warps must be a power of 2"
+            "num_warps must be a power of 2"
 
         if (self.arch == 'gfx950') and (self.kpack != 1):
             warnings.warn(
@@ -112,8 +119,8 @@ class HIPBackend(BaseBackend):
     def parse_options(self, opts) -> Any:
         args = {'arch': knobs.runtime.override_arch or self.target.arch}
 
-        if opts.get("num_ctas", 1) > 1:
-            raise ValueError("num_ctas > 1 not supported for AMD GPUs")
+        if opts.get("num_ctas", 1) > 1 and not amd.supports_multi_cta_launch(self.target.arch):
+            raise ValueError(f"num_ctas > 1 not supported on {self.target.arch}")
 
         # Enable XF32 (TF32) for CDNA3 GPUs
         if self.target.arch == 'gfx942':
@@ -131,8 +138,7 @@ class HIPBackend(BaseBackend):
 
         if "enable_fp_fusion" not in opts:
             args["enable_fp_fusion"] = knobs.language.default_fp_fusion
-        args.update({k: opts[k] for k in HIPOptions.__dataclass_fields__.keys() \
-                     if k in opts and opts[k] is not None})
+        args.update({k: opts[k] for k in HIPOptions.__dataclass_fields__.keys() if k in opts and opts[k] is not None})
         return HIPOptions(**args)
 
     def pack_metadata(self, metadata):
@@ -140,9 +146,6 @@ class HIPBackend(BaseBackend):
             metadata.num_warps,
             metadata.num_ctas,
             metadata.shared,
-            metadata.cluster_dims[0],
-            metadata.cluster_dims[1],
-            metadata.cluster_dims[2],
         )
 
     def get_codegen_implementation(self, options):
@@ -238,18 +241,17 @@ class HIPBackend(BaseBackend):
         passes.ttir.add_triton_licm(pm)
         passes.common.add_canonicalizer(pm)
 
-        global_prefetch = knobs.amd.global_prefetch
-        local_prefetch = knobs.amd.local_prefetch
         use_async_copy = knobs.amd.use_async_copy
         use_block_pingpong = is_pingpong_schedule_enabled(options.arch, use_async_copy)
 
-        amd.passes.ttgpuir.add_stream_pipeline(pm, options.num_stages, global_prefetch, local_prefetch, use_async_copy,
-                                               use_block_pingpong)
+        amd.passes.ttgpuir.add_schedule_loops(pm, options.num_stages)
+        amd.passes.ttgpuir.add_pipeline(pm, use_async_copy, use_block_pingpong)
         if use_async_copy:
             amd.passes.ttgpuir.add_coalesce_async_copy(pm, options.arch)
         passes.common.add_canonicalizer(pm)
         if options.schedule_hint.lower() != "none":
-            amd.passes.ttgpuir.insert_instruction_sched_hints(pm, options.schedule_hint)
+            for hint in options.schedule_hint.split(","):
+                amd.passes.ttgpuir.insert_instruction_sched_hints(pm, hint)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
         if is_in_thread_transpose_enabled(options.arch):
@@ -279,9 +281,8 @@ class HIPBackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
-        if use_async_copy:
-            amd.passes.ttgpuir.add_update_async_wait_count(pm, options.arch)
         pm.run(mod, 'make_ttgir')
+        metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
 
     @staticmethod
@@ -298,6 +299,7 @@ class HIPBackend(BaseBackend):
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
 
         pm.run(mod, 'gluon_to_ttgir')
+        metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
 
     @staticmethod
@@ -306,13 +308,7 @@ class HIPBackend(BaseBackend):
         # TritonGPU -> LLVM-IR (MLIR)
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
-        # custom_lds_size is an experimental parameter that defines amount of LDS available
-        # for one thread block. Measured in bytes.
-        #
-        # If custom_lds_size = 0, pass will consider all LDS is available for one threads block,
-        # LDS size is determined by provided arch name.
-        custom_lds_size = 0
-        amd.passes.ttgpuir.add_optimize_lds_usage(pm, options.arch, custom_lds_size)
+        amd.passes.ttgpuir.add_update_async_wait_count(pm, options.arch)
         passes.convert.add_scf_to_cf(pm)
         passes.gluon.add_inliner(pm)
         passes.convert.add_index_to_llvmir(pm)
@@ -394,6 +390,9 @@ class HIPBackend(BaseBackend):
         # The public kernel should be kernel 0.
         fns[0].set_calling_conv(amd.CALLING_CONV_AMDGPU_KERNEL)
         fns[0].add_fn_attr("amdgpu-flat-work-group-size", f"1,{options.num_warps*options.warp_size}")
+        if "memory-bound-attention" in options.schedule_hint.split(','):
+            fns[0].add_fn_attr("amdgpu-sched-strategy", "iterative-ilp")
+        fns[0].add_fn_attr("uniform-work-group-size", "true")
         # LLVM AMDGPU backend supports the attribute "amdgpu-waves-per-eu"="<min>[, <max>]".
         # This attribute may be attached to a kernel function definition and is an optimization hint.
         # <min> parameter specifies the requested minimum number of waves per EU, and optional <max> parameter
@@ -463,13 +462,13 @@ class HIPBackend(BaseBackend):
         metadata["name"] = names[0]
         # llvm -> hsaco
         flags = []
-        # The sink-insts-to-avoid-spills flag asks LLVM backend to sink instructions
-        # into loops to avoid register spills in the MachineSinking pass, while it
-        # can also lead to regression in some cases. But from current observation,
-        # the regression is not significant. It would be better to have some heuristics.
-        if options.schedule_hint == 'attention':
-            flags.append('sink-insts-to-avoid-spills')
         features = '-real-true16' if 'gfx11' in options.arch else ''
+        ir_hash = hashlib.sha256(src.encode("utf-8")).hexdigest()
+        dump_file_id = names[0] + '_' + ir_hash
+        _ = llvm.translate_to_mir(src, amd.TARGET_TRIPLE, options.arch, features, flags, options.enable_fp_fusion,
+                                  dump_file_id)
+        llvm.dump_sched_dag(src, amd.TARGET_TRIPLE, options.arch, features, flags, options.enable_fp_fusion,
+                            dump_file_id)
         amdgcn = llvm.translate_to_asm(src, amd.TARGET_TRIPLE, options.arch, features, flags, options.enable_fp_fusion,
                                        False)
         if knobs.amd.dump_amdgcn:

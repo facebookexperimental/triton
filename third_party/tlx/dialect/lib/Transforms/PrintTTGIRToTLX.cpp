@@ -502,6 +502,22 @@ normal_name:
     if (it != cache->end())
       return it->second;
   }
+
+  std::string name;
+  llvm::raw_string_ostream os(name);
+  // Use printNameLocAsPrefix to recover Python variable names from NameLoc
+  // metadata. The Triton frontend wraps value locations with NameLoc during
+  // code generation (e.g., `x = tl.load(ptr)` → NameLoc("x")), and this flag
+  // tells the MLIR printer to use those names as SSA name prefixes.
+  v.printAsOperand(os, OpPrintingFlags().printNameLocAsPrefix(true));
+  os.flush();
+  // Remove type info if present (after ':')
+  size_t colonPos = name.find(':');
+  if (colonPos != std::string::npos) {
+    name = name.substr(0, colonPos);
+  }
+  if (!name.empty())
+    return name;
   return "unknown";
 }
 

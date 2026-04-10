@@ -6,12 +6,13 @@
 #include "third_party/nvidia/include/Dialect/NVWS/Transforms/Passes.h"
 #include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 
 using namespace mlir;
 using namespace triton;
 using namespace triton::gpu;
-namespace ttng = triton::nvidia_gpu;
 namespace tlx = mlir::triton::tlx;
 
 //===----------------------------------------------------------------------===//
@@ -38,6 +39,32 @@ struct AutomaticWarpSpecialization
 
   void runOnOperation() override;
 };
+
+void multiBufferTMADescriptors(ModuleOp mod, int numStages) {
+  SetVector<scf::ForOp> descUpdateLoops;
+  mod.walk([&](scf::ForOp loop) {
+    if (loop->hasAttr(kWarpSpecializeAttrName)) {
+      loop.walk([&](triton::MakeTensorDescOp op) {
+        if (auto forOp = op->getParentOfType<scf::ForOp>()) {
+          descUpdateLoops.insert(forOp);
+        }
+      });
+    }
+  });
+
+  // +1 to make sure that overlapping of the next desc update and the oldest
+  // inflight TMA load is safe
+  const int numDescs = numStages + 1;
+  // CoarseSchedule's notion of numStages is the maximuim loop-pipelining
+  // stage + 1, see CoarseSchedule::deSerialize(). So if we want n buffers,
+  // we need to pass n + 1 as numStages.
+  triton::CoarseSchedule schedule(numDescs + 1);
+
+  for (auto loop : descUpdateLoops) {
+    triton::lowerTMADescriptors(loop, schedule);
+  }
+}
+
 } // namespace
 
 void AutomaticWarpSpecialization::runOnOperation() {
@@ -46,13 +73,17 @@ void AutomaticWarpSpecialization::runOnOperation() {
     return;
   OpPassManager pm;
   pm.addPass(createTritonGPUPartitionScheduling());
+  pm.addPass(createNVWSHoistTmemStore());
   pm.addPass(createNVWSInsertAref());
+  // TODO(triton-reactor): InsertTmemAref fails with Meta's partition layout
+  // (getInitialSchedule + schedulePostLoopOps). Keep disabled until partition
+  // scheduling is aligned with upstream. LoadMMASpecialization is retained
+  // locally as the fallback.
 #if 0
   pm.addPass(createNVWSInsertTmemAref());
 #else
   pm.addPass(createTritonGPULoadMMASpecialization({numStages}));
 #endif
-  pm.addPass(createTritonGPURewritePartitionDependencies());
   // `int-range-optimizations` and SCCP are good at cleaning up loop arithmetic.
   // FIXME: Re-enable integer range analysis once it is fixed.
   // pm.addPass(arith::createIntRangeOptimizationsPass());
@@ -61,6 +92,7 @@ void AutomaticWarpSpecialization::runOnOperation() {
   pm.addPass(createNVWSLowerAref({numStages}));
   pm.addPass(createTritonGPUPartitionLoops());
   pm.addPass(createNVWSLowerWarpGroup());
+  pm.addPass(createTritonGPUScheduleLoops());
   if (failed(runPipeline(pm, getOperation())))
     return signalPassFailure();
 
@@ -78,4 +110,8 @@ void AutomaticWarpSpecialization::runOnOperation() {
   pm.addPass(createTritonGPUScheduleLoops());
   if (failed(runPipeline(pm, getOperation())))
     return signalPassFailure();
+
+  // Multi-buffer TMA descriptors. We cannot rely on SWP to do it, to support
+  // desc updates in nested loops.
+  multiBufferTMADescriptors(getOperation(), numStages);
 }

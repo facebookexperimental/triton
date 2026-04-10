@@ -130,8 +130,8 @@ static void processBlock(Block &block) {
       OpBuilder builder(first.alloc);
       Value src = first.alloc.getSrc();
       auto buf =
-          builder.create<ttg::LocalAllocOp>(first.alloc.getLoc(), mutableTy);
-      builder.create<ttg::LocalStoreOp>(first.alloc.getLoc(), src, buf);
+          ttg::LocalAllocOp::create(builder, first.alloc.getLoc(), mutableTy);
+      ttg::LocalStoreOp::create(builder, first.alloc.getLoc(), src, buf);
       first.alloc.replaceAllUsesWith(buf.getResult());
       first.alloc.erase();
 
@@ -142,7 +142,7 @@ static void processBlock(Block &block) {
         auto &cand = candidates[chain[i]];
         OpBuilder b(cand.alloc);
         Value srcN = cand.alloc.getSrc();
-        b.create<ttg::LocalStoreOp>(cand.alloc.getLoc(), srcN, buf);
+        ttg::LocalStoreOp::create(b, cand.alloc.getLoc(), srcN, buf);
         cand.alloc.replaceAllUsesWith(buf.getResult());
         cand.alloc.erase();
       }

@@ -142,6 +142,7 @@ def inspect_stages(_self, stages, options, language, capability):
     # inspect or modify add_stages here
 triton.knobs.runtime.add_stages_inspection_hook = inspect_stages
 ```
+Examples of how to use this for out of tree plugin passes is [here](lib/Plugins/README.md)
 
 Binary wheels are available for CPython 3.10-3.14.
 
@@ -234,6 +235,26 @@ Binary wheels are available for CPython 3.10-3.14.
    # Store to remote CTA's shared memory
    tlx.async_remote_shmem_store(buffer[0], src_tensor, remote_cta_rank=1, barrier=barrier[0])
    ```
+- `tlx.remote_shmem_copy(dst, src, remote_cta_rank)`
+
+  Store a local shared memory buffer into a buffer in the remote shared memory of a cluster asynchronously.
+
+  **Parameters:**
+  - `dst`: The destination buffer in local shared memory (will be internally mapped to the remote CTA)
+  - `src`: The source distributed tensor to store
+  - `remote_cta_rank`: The rank (unique ID) of the remote CTA within the cluster
+  - `barrier`: mbarrier to signal when the store completes (will be internally mapped to the remote CTA)
+
+  **Example:**
+  ```python
+  # Allocate shared memory buffer
+  buffer0 = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+  buffer1 = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+  barrier = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+
+  # Copy to remote CTA's shared memory
+  tlx.remote_shmem_store(buffer0[0], buffer1[0], remote_cta_rank=1, barrier=barrier[0])
+  ```
 
 - `desc_ptrs = tlx.allocate_tensor_descriptor(num)`
 
@@ -511,6 +532,25 @@ Binary wheels are available for CPython 3.10-3.14.
 - `tlx.barrier_arrive(bar, arrive_count=1, remote_cta_rank=None)`
 
     Perform the arrive operation on an mbarrier. If `remote_cta_rank` is provided, signals the barrier in the specified remote CTA's shared memory (useful for multi-CTA synchronization).
+
+### Memory Fences
+
+- `tlx.fence(scope)` issues a memory fence. The `scope` argument is required:
+
+  | Scope | PTX | Description |
+  |-------|-----|-------------|
+  | `"gpu"` | `fence.acq_rel.gpu` | Device-scope fence. Orders prior global/shared memory writes to be visible to all GPU threads. |
+  | `"sys"` | `fence.acq_rel.sys` | System-scope fence. Like `"gpu"` but also visible to the host CPU. |
+  | `"async_shared"` | `fence.proxy.async.shared::cta` | Proxy fence for async shared memory. Required between `local_store` and a subsequent TMA store (`async_descriptor_store`) to the same shared memory. |
+
+  Example:
+  ```python
+  tlx.local_store(smem_buf, data)
+  tlx.fence("async_shared")
+  tlx.async_descriptor_store(desc, smem_buf, offsets)
+  ```
+
+
 
 ### Cluster Launch Control (CLC)
 
@@ -851,6 +891,32 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
     ```
         ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
     ```
+
+- `tlx.prefetch(pointer, level="L2", mask=None, tensormap=False)` issues a non-blocking prefetch hint for pointer-based scattered/gather loads. This complements `tlx.async_descriptor_prefetch_tensor` (which works on TMA tensor descriptors) by supporting raw pointer tensors.
+  Additionally, if `tensormap` is specified to `True`, the API instead does a prefetch of tensor map object (TMA descriptor) and ignores other parameters other than `pointer`.
+
+  | Level | PTX | Description |
+  |-------|-----|-------------|
+  | `"L1"` | `prefetch.global.L1` | Prefetch into L1 and L2 cache |
+  | `"L2"` | `prefetch.global.L2` | Prefetch into L2 cache only (default) |
+
+  Example:
+  ```python
+  offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+  mask = offsets < n_elements
+  tlx.prefetch(input_ptr + offsets, level="L2", mask=mask)
+  x = tl.load(input_ptr + offsets, mask=mask)
+
+  ...
+  # desc_in can be host side descriptor or device side like this:
+  desc_in = tl.make_tensor_descriptor(
+            input_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+  tlx.prefetch(desc_in, tensormap=True)
+  ```
 
 ## Kernels Implemented with TLX
 

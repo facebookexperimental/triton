@@ -130,25 +130,6 @@ def TritonGPUAutomaticWarpSpecialization : Pass<"tritongpu-automatic-warp-specia
   ];
 }
 
-def TritonGPURewritePartitionDependencies : Pass<"tritongpu-rewrite-partition-dependencies", "mlir::ModuleOp"> {
-  let summary = "test pass for rewriting partition dependencies";
-
-  let description = [{
-    The `tritongpu-rewrite-partition-dependencies` pass analyzes the partitions
-    assigned to a loop and their SSA dependencies. It rewrites the dependencies
-    to be passed through shared memory, applying multi-buffering according to
-    the assigned stages of the partitions.
-  }];
-
-  let dependentDialects = [
-    "mlir::triton::gpu::TritonGPUDialect",
-    "mlir::scf::SCFDialect",
-    "mlir::arith::ArithDialect",
-    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
-    "mlir::triton::nvws::NVWSDialect"
-  ];
-}
-
 def TritonGPUPartitionLoops : Pass<"tritongpu-partition-loops", "mlir::ModuleOp"> {
   let summary = "split scheduled loops into `ttg.warp_specialize`";
 
@@ -191,7 +172,6 @@ def TritonGPUPartitionScheduling : Pass<"tritongpu-partition-scheduling", "mlir:
            "instead of creating a separate epilogue partition">
   ];
 }
-
 
 def TritonGPULoadMMASpecialization : Pass<"tritongpu-load-mma-specialization", "mlir::ModuleOp"> {
   let summary = "load MMA specialization";

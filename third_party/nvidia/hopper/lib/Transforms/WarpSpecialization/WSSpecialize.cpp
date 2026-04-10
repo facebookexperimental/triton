@@ -40,6 +40,29 @@ Operation *SpecializeOp(Operation *op, IRMapping &mapping,
                         OpBuilderWithAsyncTaskIds &builder,
                         AsyncTaskId asyncTaskId);
 
+/// Check if any result of `op` is transitively needed by an operation
+/// with the given asyncTaskId. This handles the case where an op doesn't
+/// have the target asyncTaskId but produces values consumed (directly or
+/// through a chain of ops) by ops that do.
+static bool isNeededByTask(Operation *op, AsyncTaskId asyncTaskId) {
+  SmallVector<Operation *> worklist;
+  DenseSet<Operation *> visited;
+  worklist.push_back(op);
+  visited.insert(op);
+  while (!worklist.empty()) {
+    Operation *curr = worklist.pop_back_val();
+    for (auto result : curr->getResults()) {
+      for (Operation *user : result.getUsers()) {
+        if (hasAsyncTaskId(user, asyncTaskId))
+          return true;
+        if (visited.insert(user).second)
+          worklist.push_back(user);
+      }
+    }
+  }
+  return false;
+}
+
 unsigned scanRegUsage(Block *block, AsyncTaskId asyncTaskId,
                       unsigned requestedRegisters) {
   assert(asyncTaskId != 0 && "producer group should not request registers");
@@ -326,7 +349,7 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
   }
   if (createNewYield) {
     auto newYieldOp =
-        forBuilder.create<scf::YieldOp>(yieldOp.getLoc(), newYieldOperands);
+        scf::YieldOp::create(forBuilder, yieldOp.getLoc(), newYieldOperands);
     setAsyncTaskIds(newYieldOp, {asyncTaskId});
   }
 
@@ -346,8 +369,14 @@ Operation *SpecializeOp(Operation *op, IRMapping &mapping,
   auto taskIds = getAsyncTaskIds(op);
   // yieldOp are sometimes implict, meaning they do not necessarily have a task
   // id, but they should be shared by all async tasks.
-  if (!hasAsyncTaskId(op, asyncTaskId) && !isa<scf::YieldOp>(op))
-    return nullptr;
+  if (!hasAsyncTaskId(op, asyncTaskId) && !isa<scf::YieldOp>(op)) {
+    // Before skipping, check if any result is transitively needed by an op
+    // with the target asyncTaskId. This handles ops (e.g. MemDescIndexOp)
+    // that weren't assigned the right task IDs but produce values consumed
+    // by ops in this partition.
+    if (!isNeededByTask(op, asyncTaskId))
+      return nullptr;
+  }
 
   if (op->getNumRegions() == 0) {
     Operation *newOp = builder.clone(*op, mapping);
@@ -388,7 +417,7 @@ static void logOpStillHasUsers(Operation *op) {
   LLVM_DEBUG({
     llvm::errs() << "Op still has users: " << op->getName();
     if (auto partitionAttr =
-            op->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName)) {
+            op->getAttrOfType<DenseI32ArrayAttr>(ttg::kPartitionAttrName)) {
       llvm::errs() << " (partition: " << partitionAttr << ")";
     }
     auto taskIds = getAsyncTaskIds(op);
@@ -421,8 +450,8 @@ static void logOpStillHasUsers(Operation *op) {
         llvm::errs() << "  User: " << user->getName();
         // llvm::errs() << "  Full IR: ";
         // user->print(llvm::errs());
-        if (auto userPartitionAttr =
-                user->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName)) {
+        if (auto userPartitionAttr = user->getAttrOfType<DenseI32ArrayAttr>(
+                ttg::kPartitionAttrName)) {
           llvm::errs() << " (partition: " << userPartitionAttr << ")";
         }
         auto userTaskIds = getAsyncTaskIds(user);
@@ -536,8 +565,17 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
   ArrayRef<Type> dummyTypes;
   ImplicitLocOpBuilder impB(opList[0]->getLoc(), opList[0]);
   impB.setInsertionPoint(returnOp);
-  auto wsOp = impB.create<ttg::WarpSpecializeOp>(dummyTypes, partitionNumWarps,
-                                                 nTaskIds.size() - 1);
+  auto wsOp = ttg::WarpSpecializeOp::create(impB, dummyTypes, partitionNumWarps,
+                                            nTaskIds.size() - 1);
+
+  // Copy partition types attribute from the loop to the WarpSpecializeOp.
+  // This is needed by OptimizePartitionWarps for type-aware warp assignment.
+  funcOp.walk([&](scf::ForOp forOp) {
+    if (auto typesAttr =
+            forOp->getAttrOfType<ArrayAttr>(kPartitionTypesAttrName)) {
+      wsOp->setAttr(kPartitionTypesAttrName, typesAttr);
+    }
+  });
 
   // Copy partition types attribute from the loop to the WarpSpecializeOp.
   // This is needed by OptimizePartitionWarps for type-aware warp assignment.
@@ -565,7 +603,7 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
       SpecializeOp(op, mapping, taskBuilder, asyncTaskId);
     }
     SmallVector<Value> opnds;
-    taskBuilder.create<ttg::WarpYieldOp>(loc, opnds);
+    ttg::WarpYieldOp::create(taskBuilder, loc, opnds);
   }
 
   unsigned idx = 1;
@@ -611,7 +649,7 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
     for (Operation *op : opList) {
       SpecializeOp(op, mapping, taskBuilder, asyncTaskId);
     }
-    taskBuilder.create<ttg::WarpReturnOp>(loc);
+    ttg::WarpReturnOp::create(taskBuilder, loc);
   }
 
   // The capture set is the same for every partition region, so now find the
@@ -711,8 +749,17 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
         });
       }
     }
-    if (hasUse)
+    if (hasUse) {
       logOpStillHasUsers(op);
+      // The op has been cloned into partition regions but still has users
+      // outside the WS regions (e.g. a MemDescIndexOp at the function level
+      // that wasn't given asyncTaskIds). Keep the op alive by removing its
+      // async_task_id so it stays at the function level as a shared value.
+      op->removeAttr("async_task_id");
+      if (op->hasAttr(ttg::kPartitionAttrName))
+        op->removeAttr(ttg::kPartitionAttrName);
+      continue;
+    }
 
     op->erase();
   }

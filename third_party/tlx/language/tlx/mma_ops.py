@@ -13,7 +13,7 @@ def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builde
         elemType=x.dtype,
         numCTAsPerCGA=[1] * rank,
         numCTASplit=[1] * rank,
-        numCTAOrder=[1] * rank,
+        numCTAOrder=list(reversed(range(rank))),
         fp4Padded=fp4Padded,
         swizzled=swizzled,
     )

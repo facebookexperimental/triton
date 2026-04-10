@@ -1,4 +1,5 @@
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/IR/TypeUtilities.h"
 
 #include "PatternTritonGPUOpToLLVM.h"
@@ -31,9 +32,8 @@ void tensormap_cp_fenceproxy(Location loc, MLIRContext *ctx,
   auto *sizeOpr = ptxBuilder.newConstantOperand(TMA_SIZE_BYTES);
 
   // Define the instruction opcode
-  auto &cp =
-      *ptxBuilder.create<>("tensormap.cp_fenceproxy.global.shared::cta."
-                           "tensormap::generic.release.gpu.sync.aligned");
+  auto &cp = *ptxBuilder.create("tensormap.cp_fenceproxy.global.shared::cta."
+                                "tensormap::generic.release.gpu.sync.aligned");
 
   // Execute collectively on first warp in block
   constexpr int kWarpSize = 32;
@@ -56,7 +56,7 @@ void tensormap_replace_generic(Location loc, MLIRContext *ctx,
   auto newValOpr = ptxBuilder.newConstantOperand(newVal);
 
   // Define the instruction opcode
-  auto &replace = ptxBuilder.create<>("tensormap.replace.tile")
+  auto &replace = ptxBuilder.create("tensormap.replace.tile")
                       ->o(fieldName)
                       .o("shared::cta")
                       .o("b1024")
@@ -95,7 +95,7 @@ void tensormap_replace_generic(Location loc, MLIRContext *ctx,
   newValOpr = ptxBuilder.newOperand(newVal, constraint);
 
   // Define the instruction opcode
-  auto &replace = ptxBuilder.create<>("tensormap.replace.tile")
+  auto &replace = ptxBuilder.create("tensormap.replace.tile")
                       ->o(fieldName)
                       .o("shared::cta")
                       .o("b1024")
@@ -203,14 +203,14 @@ struct TensormapFenceproxyAcquireOpConversion
     Value threadId = getThreadId(rewriter, loc);
     Value pred = b.icmp_slt(threadId, b.i32_val(kWarpSize));
     auto &fence =
-        *ptxBuilder.create<>("fence.proxy.tensormap::generic.acquire.gpu");
+        *ptxBuilder.create("fence.proxy.tensormap::generic.acquire.gpu");
     fence(descAddrOpr, sizeOpr).predicate(pred);
 
     // Workaround for a ptxas bug missing a fence after generic.acquire.gpu.
     // TODO: remove the workaround once ptxas is fixed.
-    auto &commit = *ptxBuilder.create<>("cp.async.bulk.commit_group");
+    auto &commit = *ptxBuilder.create("cp.async.bulk.commit_group");
     commit().predicate(pred);
-    auto &wait = *ptxBuilder.create<>("cp.async.bulk.wait_group.read 0");
+    auto &wait = *ptxBuilder.create("cp.async.bulk.wait_group.read 0");
     wait().predicate(pred);
 
     ptxBuilder.launch(rewriter, loc, getVoidType());
@@ -314,12 +314,45 @@ struct ReinterpretTensorDescOpConversion
   }
 };
 
+struct PrefetchTensormapOpConversion
+    : public ConvertOpToLLVMPattern<ttng::PrefetchTensormapOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(ttng::PrefetchTensormapOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto *ctx = op.getContext();
+    // Host side TMA desc comes as a kernel param, in .param space
+    // Device side TMA desc gets initialized in SMEM and copied to GMEM
+    // We use Generic Address state space here to support both
+    auto genericPtrTy = LLVM::LLVMPointerType::get(ctx, 0);
+    Value addr = LLVM::AddrSpaceCastOp::create(rewriter, loc, genericPtrTy,
+                                               adaptor.getDesc());
+    // Note: not lowering to NVVM::PrefetchOp as it seems to have a bug where
+    // if I don't set `$in_param_space` (leading to prefetch.param.tensormap)
+    // it's emitting both `prefetch.tensormap` and `prefetch.param.tensormap` at
+    // the same time
+    PTXBuilder ptxBuilder;
+    auto *descAddrOpr = ptxBuilder.newAddrOperand(addr, "l");
+    auto &prefetch = *ptxBuilder.create<>("prefetch.tensormap");
+    prefetch(descAddrOpr);
+
+    auto voidTy = void_ty(op->getContext());
+    ptxBuilder.launch(rewriter, loc, voidTy);
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 } // namespace
 
 void mlir::triton::NVIDIA::populateTMAToLLVMPatterns(
     LLVMTypeConverter &typeConverter, const TargetInfo &targetInfo,
     RewritePatternSet &patterns, PatternBenefit benefit) {
   patterns.add<TensormapCreateOpConversion>(typeConverter, targetInfo, benefit);
-  patterns.add<TensormapFenceproxyAcquireOpConversion,
-               ReinterpretTensorDescOpConversion>(typeConverter, benefit);
+  patterns
+      .add<TensormapFenceproxyAcquireOpConversion,
+           PrefetchTensormapOpConversion, ReinterpretTensorDescOpConversion>(
+          typeConverter, benefit);
 }

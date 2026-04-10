@@ -35,7 +35,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK:   scf.yield %[[PHASE_NEXT]], %[[BAR_IDX_NEXT]], {{.*}}, %[[BAR_SLICE]], %[[PHASE]], %[[A_OP]], %[[B_OP]]
   // CHECK: ttg.local_dealloc %[[BAR_BUF]]
   // CHECK: ttng.tmem_load %[[TMEM_BUF]]
-  tt.func public @chained_dot_scaled_acc(%A_ptr: tensor<128x128x!tt.ptr<f16>, #blocked1> {tt.contiguity = 16 : i32, tt.divisibility = 16 : i32}, %B_ptr: tensor<128x128x!tt.ptr<f16>, #blocked1> {tt.contiguity = 16 : i32, tt.divisibility = 16 : i32}, %arg3: i32) -> tensor<128x128xf16, #blocked> {
+  tt.func public @chained_dot_scaled_acc(%A_ptr: tensor<128x128x!tt.ptr<f16>, #blocked1> {tt.contiguity = dense<[1, 16]> : tensor<2xi32>, tt.divisibility = dense<[16, 16]> : tensor<2xi32>}, %B_ptr: tensor<128x128x!tt.ptr<f16>, #blocked1> {tt.contiguity = dense<[1, 16]> : tensor<2xi32>, tt.divisibility = dense<[16, 16]> : tensor<2xi32>}, %arg3: i32) -> tensor<128x128xf16, #blocked> {
     %true = arith.constant true
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
     %cst2 = arith.constant dense<2.000000e+00> : tensor<128x128xf32, #blocked>
@@ -412,6 +412,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #shared_T = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#barrier_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 
 #smem = #ttg.shared_memory
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>
@@ -422,7 +423,7 @@ tt.func public @load_into_async_mma(
   %lhs_ptrs: tensor<128x64x!tt.ptr<f8E4M3FN>, #load_blocked>,
   %scale_ptrs: tensor<128x8x!tt.ptr<i8>, #load_blocked>,
   %tmem: !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable>,
-  %barrier: !ttg.memdesc<1xi64, #shared, #smem, mutable>,
+  %barrier: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
   %rhs_shared: !ttg.memdesc<64x64xf8E4M3FN, #shared, #smem>,
   %n_tiles: i32
 ) {
@@ -452,7 +453,7 @@ tt.func public @load_into_async_mma(
       !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable>,
       !ttg.memdesc<128x8xi8, #ttng.tensor_memory_scales_encoding<>, #ttng.tensor_memory>,
       !ttg.memdesc<64x8xi8, #ttng.tensor_memory_scales_encoding<>, #ttng.tensor_memory>,
-      !ttg.memdesc<1xi64, #shared, #smem, mutable>
+      !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
   }
 
   tt.return

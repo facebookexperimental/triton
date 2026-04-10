@@ -36,7 +36,7 @@ class Autotuner(KernelInterface):
         self.keys = key
         self.cache: Dict[Tuple, Config] = {}
         self.arg_names = arg_names
-        self.cache_results = cache_results or (knobs.autotuning.cache and not knobs.runtime.interpret)
+        self.cache_results = (cache_results or knobs.autotuning.cache) and not knobs.runtime.interpret
 
         # Reset to zero or restore values
         self.reset_to_zero = []
@@ -370,6 +370,10 @@ class Config:
         Unlike cluster_dims which spawns new CTAs, ctas_per_cga regroups existing grid CTAs into clusters.
         This matches CUDA's cuLaunchKernelEx CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION semantics.
     :type ctas_per_cga: tuple[int, int, int]
+    :ivar preferred_ctas_per_cga: preferred number of CTAs per cluster. Unlike ctas_per_cga which is
+        required, this is a hint: the driver may use a smaller cluster if resources are constrained.
+        Maps to CU_LAUNCH_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION. The per dim grid size must be divisible by this per dim cluster size.
+    :type preferred_ctas_per_cga: tuple[int, int, int]
     """
 
     def __init__(
@@ -390,6 +394,7 @@ class Config:
         reg_inc_consumer=0,
         ctas_per_cga=None,
         early_tma_store_lowering=None,
+        preferred_ctas_per_cga=None,
     ):
         self.kwargs = kwargs
         self.num_warps = num_warps
@@ -403,6 +408,7 @@ class Config:
         self.pingpongAutoWS = pingpongAutoWS
         self.ctas_per_cga = ctas_per_cga
         self.early_tma_store_lowering = early_tma_store_lowering
+        self.preferred_ctas_per_cga = preferred_ctas_per_cga
 
     def __setstate__(self, state):
         self.kwargs = state.get("kwargs", {})
@@ -417,6 +423,7 @@ class Config:
         self.pingpongAutoWS = state.get("pingpongAutoWS", None)
         self.ctas_per_cga = state.get("ctas_per_cga", None)
         self.early_tma_store_lowering = state.get("early_tma_store_lowering", None)
+        self.preferred_ctas_per_cga = state.get("preferred_ctas_per_cga", None)
 
     def all_kwargs(self):
         return {
@@ -434,6 +441,7 @@ class Config:
                     ("pingpongAutoWS", self.pingpongAutoWS),
                     ("ctas_per_cga", self.ctas_per_cga),
                     ("early_tma_store_lowering", self.early_tma_store_lowering),
+                    ("preferred_ctas_per_cga", self.preferred_ctas_per_cga),
                 ) if v is not None
             },
         }
@@ -451,6 +459,7 @@ class Config:
         res.append(f"pingpongAutoWS: {self.pingpongAutoWS}")
         res.append(f"ctas_per_cga: {self.ctas_per_cga}")
         res.append(f"early_tma_store_lowering: {self.early_tma_store_lowering}")
+        res.append(f"preferred_ctas_per_cga: {self.preferred_ctas_per_cga}")
         return ", ".join(res)
 
     def __hash__(self):

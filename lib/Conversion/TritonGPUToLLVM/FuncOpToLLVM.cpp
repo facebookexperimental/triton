@@ -39,6 +39,7 @@ struct FuncOpConversion : public ConvertOpToLLVMPattern<triton::FuncOp> {
       if (attr.getName() == SymbolTable::getSymbolAttrName() ||
           attr.getName() == op.getFunctionTypeAttrName() ||
           attr.getName() == "std.varargs" ||
+          attr.getName() == triton::gpu::AttrNumWarpsName ||
           (filterArgAttrs && attr.getName() == op.getArgAttrsAttrName()))
         continue;
       result.push_back(attr);
@@ -61,7 +62,7 @@ struct FuncOpConversion : public ConvertOpToLLVMPattern<triton::FuncOp> {
     auto funcTy = funcOp.getFunctionType();
     auto amendedInputTy = llvm::to_vector<4>(funcTy.getInputs());
     bool isKernel = triton::isKernel(funcOp);
-    if (isKernel) {
+    if (isKernel && targetInfo.isCuda()) {
       for (auto i : llvm::seq(amendedInputTy.size())) {
         if (isa<TensorDescType>(amendedInputTy[i])) {
           funcOp.setArgAttr(i, "tt.nv_tma_desc",
@@ -91,8 +92,9 @@ struct FuncOpConversion : public ConvertOpToLLVMPattern<triton::FuncOp> {
     }
 
     // 3. Add the new arguments to the region
-    auto amendedFuncOp = rewriter.create<triton::FuncOp>(
-        funcOp.getLoc(), funcOp.getName(), amendedFuncTy, amendedAttrs);
+    auto amendedFuncOp =
+        triton::FuncOp::create(rewriter, funcOp.getLoc(), funcOp.getName(),
+                               amendedFuncTy, amendedAttrs);
     auto &region = funcOp.getBody();
     if (!isKernel) {
       region.addArgument(sharedPtrTy, loc);
@@ -177,10 +179,37 @@ struct FuncOpConversion : public ConvertOpToLLVMPattern<triton::FuncOp> {
             "ttg.total-num-warps"))
       numWarps = totalNumWarps.getInt();
 
+    int numCTAs = 1;
+    SmallVector<int32_t, 3> clusterDims = {1, 1, 1};
+    if (auto module = funcOp->getParentOfType<ModuleOp>()) {
+      if (auto moduleAttr =
+              module->getAttrOfType<IntegerAttr>(triton::gpu::AttrNumCTAsName))
+        numCTAs = moduleAttr.getInt();
+      auto dims = triton::gpu::TritonGPUDialect::getClusterDims(module);
+      clusterDims = {static_cast<int32_t>(dims[0]),
+                     static_cast<int32_t>(dims[1]),
+                     static_cast<int32_t>(dims[2])};
+    }
+
     // Set `nvvm.maxnreg` if it was specified on the module.
     if (Attribute maxnregAttr =
             funcOp.getParentOp()->getAttr(triton::gpu::AttrMaxRegistersName))
       newFuncOp->setAttr(NVVM::NVVMDialect::getMaxnregAttrName(), maxnregAttr);
+
+    // Emit reqnctapercluster directive via nvvm.cluster_dim attribute.
+    // Two paths: ctas_per_cga sets ttg.cluster-dim-{x,y,z} (3D, num_ctas==1),
+    // while Triton's num_ctas sets a 1D cluster.
+    int clusterSize = 1;
+    for (int d : clusterDims)
+      clusterSize *= d;
+    if (clusterSize > 1) {
+      newFuncOp->setAttr(NVVM::NVVMDialect::getClusterDimAttrName(),
+                         rewriter.getDenseI32ArrayAttr(clusterDims));
+    } else if (numCTAs > 1) {
+      // Upstream Triton path: emit 1D cluster dim matching upstream behavior.
+      newFuncOp->setAttr(NVVM::NVVMDialect::getClusterDimAttrName(),
+                         rewriter.getDenseI32ArrayAttr(numCTAs));
+    }
 
     // Set an attribute for reqntidx, it could be used in latter LLVM codegen
     // for `nvvm.annotation` metadata.

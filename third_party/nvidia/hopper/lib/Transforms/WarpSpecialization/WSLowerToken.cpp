@@ -40,8 +40,8 @@ Value getMBarrierPhaseBit(OpBuilder &builder, Operation *op,
     curPhase = wait.getPhase();
   if (emptyBarrier) {
     // curPhase = curPhase xor True for emptyBarrier.
-    Value _1_1b = builder.create<arith::ConstantIntOp>(loc, 1, 1);
-    curPhase = builder.create<mlir::arith::XOrIOp>(loc, curPhase, _1_1b);
+    Value _1_1b = arith::ConstantIntOp::create(builder, loc, 1, 1);
+    curPhase = mlir::arith::XOrIOp::create(builder, loc, curPhase, _1_1b);
   }
   LLVM_DEBUG(curPhase.dump());
   return curPhase;
@@ -52,8 +52,8 @@ void processProducerAcquireOp(OpBuilder &builder, ttnvws::ProducerAcquireOp op,
   auto loc = op.getLoc();
   Value phase = getMBarrierPhaseBit(builder, op, true);
   auto i32Ty = builder.getIntegerType(32);
-  phase = builder.create<arith::ExtUIOp>(loc, i32Ty, phase);
-  auto waitOp = builder.create<ttng::WaitBarrierOp>(loc, bufferEmpty, phase);
+  phase = arith::ExtUIOp::create(builder, loc, i32Ty, phase);
+  auto waitOp = ttng::WaitBarrierOp::create(builder, loc, bufferEmpty, phase);
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(waitOp, getAsyncTaskIds(op.getOperation()));
   copyLoopScheduleInfo(waitOp, op);
@@ -67,7 +67,7 @@ void processProducerCommitOp(OpBuilder &builder, ttnvws::ProducerCommitOp op,
 
   assert(loadType != ttnvws::TokenLoadType::AsyncLoadOp);
   arriveOp =
-      builder.create<ttng::ArriveBarrierOp>(loc, bufferFull, 1); // fullCnt);
+      ttng::ArriveBarrierOp::create(builder, loc, bufferFull, 1); // fullCnt);
 
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(arriveOp, getAsyncTaskIds(op.getOperation()));
@@ -79,8 +79,8 @@ void processConsumerWaitOp(OpBuilder &builder, ttnvws::ConsumerWaitOp op,
   auto loc = op.getLoc();
   Value phase = getMBarrierPhaseBit(builder, op, false);
   auto i32Ty = builder.getIntegerType(32);
-  phase = builder.create<arith::ExtUIOp>(loc, i32Ty, phase);
-  auto waitOp = builder.create<ttng::WaitBarrierOp>(loc, bufferFull, phase);
+  phase = arith::ExtUIOp::create(builder, loc, i32Ty, phase);
+  auto waitOp = ttng::WaitBarrierOp::create(builder, loc, bufferFull, phase);
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(waitOp, getAsyncTaskIds(op.getOperation()));
   copyLoopScheduleInfo(waitOp, op);
@@ -91,7 +91,7 @@ void processConsumerReleaseOp(OpBuilder &builder, ttnvws::ConsumerReleaseOp op,
                               unsigned emptyCnt) {
   auto loc = op.getLoc();
   auto arriveOp =
-      builder.create<ttng::ArriveBarrierOp>(loc, bufferEmpty, 1); // emptyCnt);
+      ttng::ArriveBarrierOp::create(builder, loc, bufferEmpty, 1); // emptyCnt);
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(arriveOp, getAsyncTaskIds(op.getOperation()));
   copyLoopScheduleInfo(arriveOp, op);
@@ -111,11 +111,9 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
 
     Attribute sharedMemorySpace =
         triton::gpu::SharedMemorySpaceAttr::get(context);
-    auto barrierCTALayout =
-        ttg::CTALayoutAttr::get(context, /*CTAsPerCGA=*/{1},
-                                /*CTASplitNum=*/{1}, /*CTAOrder=*/{0});
+    auto barrierCGALayout = ttg::CGAEncodingAttr::getDefault(context, 1);
     auto barrierEncoding = ttg::SwizzledSharedEncodingAttr::get(
-        context, 1, 1, 1, {0}, barrierCTALayout);
+        context, 1, 1, 1, {0}, barrierCGALayout);
     ttg::MemDescType barrierMemDescType = ttg::MemDescType::get(
         {createTokenOp.getNumBuffers(), 1}, builder.getI64Type(),
         barrierEncoding, sharedMemorySpace,
@@ -124,10 +122,10 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         {1}, builder.getI64Type(), barrierEncoding,
         barrierMemDescType.getMemorySpace(), /*mutableMemory=*/true);
     // These are created prior to warp_specialize.
-    Value bufferFullArray = builder.create<mlir::triton::gpu::LocalAllocOp>(
-        loc, barrierMemDescType, Value());
-    Value bufferEmptyArray = builder.create<mlir::triton::gpu::LocalAllocOp>(
-        loc, barrierMemDescType, Value());
+    Value bufferFullArray = mlir::triton::gpu::LocalAllocOp::create(
+        builder, loc, barrierMemDescType, Value());
+    Value bufferEmptyArray = mlir::triton::gpu::LocalAllocOp::create(
+        builder, loc, barrierMemDescType, Value());
     tokenToFull[createTokenOp.getOperation()] = bufferFullArray;
     tokenToEmpty[createTokenOp.getOperation()] = bufferEmptyArray;
 
@@ -206,33 +204,33 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
                                    : THREADS_PER_WARP * producerWarps;
     unsigned bufferEmptyCount = THREADS_PER_WARP * consumerWarps;
     for (unsigned i = 0; i < createTokenOp.getNumBuffers(); i++) {
-      Value idx = builder.create<arith::ConstantIntOp>(loc, i, 32);
-      Value barrierFullView = builder.create<ttg::MemDescIndexOp>(
-          loc, singleBarrierMemDescType, bufferFullArray, idx);
+      Value idx = arith::ConstantIntOp::create(builder, loc, i, 32);
+      Value barrierFullView = ttg::MemDescIndexOp::create(
+          builder, loc, singleBarrierMemDescType, bufferFullArray, idx);
       // EmptyView is used for ConsumerRelease and ProducerAcquire.
       // FullView is for ConsumerWait and ProducerCommit.
-      builder.create<ttng::InitBarrierOp>(loc, barrierFullView,
-                                          1); // bufferFullCount);
+      ttng::InitBarrierOp::create(builder, loc, barrierFullView,
+                                  1); // bufferFullCount);
 
-      Value barrierEmptyView = builder.create<ttg::MemDescIndexOp>(
-          loc, singleBarrierMemDescType, bufferEmptyArray, idx);
-      builder.create<ttng::InitBarrierOp>(loc, barrierEmptyView,
-                                          1); // bufferEmptyCount);
+      Value barrierEmptyView = ttg::MemDescIndexOp::create(
+          builder, loc, singleBarrierMemDescType, bufferEmptyArray, idx);
+      ttng::InitBarrierOp::create(builder, loc, barrierEmptyView,
+                                  1); // bufferEmptyCount);
     }
 
     assert(numCTAs == 1 && "remote CTA is not supported yet");
-    builder.create<mlir::gpu::BarrierOp>(loc);
+    mlir::gpu::BarrierOp::create(builder, loc);
 
     // Helper function for extracting one index from bufferFullArray.
     auto extractBufferFull = [&](Location loc, Value idx) -> Value {
-      return builder.create<ttg::MemDescIndexOp>(loc, singleBarrierMemDescType,
-                                                 bufferFullArray, idx);
+      return ttg::MemDescIndexOp::create(builder, loc, singleBarrierMemDescType,
+                                         bufferFullArray, idx);
     };
 
     // Helper function for extracting one index from bufferEmptyArray.
     auto extractBufferEmpty = [&](Location loc, Value idx) -> Value {
-      return builder.create<ttg::MemDescIndexOp>(loc, singleBarrierMemDescType,
-                                                 bufferEmptyArray, idx);
+      return ttg::MemDescIndexOp::create(builder, loc, singleBarrierMemDescType,
+                                         bufferEmptyArray, idx);
     };
     auto handleOneUser = [&](Operation *user) -> bool {
       // Skip same-partition ProducerCommit/ConsumerWait pairs — the

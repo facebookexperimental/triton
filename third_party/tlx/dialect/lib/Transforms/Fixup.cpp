@@ -121,7 +121,7 @@ public:
         Location loc = op.getLoc();
         for (auto barrier : barriers) {
           if (domInfo.properlyDominates(barrier, op)) {
-            builder.create<ttng::InvalBarrierOp>(loc, barrier);
+            ttng::InvalBarrierOp::create(builder, loc, barrier);
           }
         }
       });
@@ -197,8 +197,17 @@ public:
                                return WalkResult::advance();
                              })
                               .wasInterrupted();
+    auto hasExplicitClusterSync =
+        mod.walk([&](Operation *op) {
+             if (isa<ttng::ClusterArriveOp, ttng::ClusterWaitOp>(op)) {
+               return WalkResult::interrupt();
+             }
+             return WalkResult::advance();
+           })
+            .wasInterrupted();
+
     if (!hasTLXOps && !hasExplicitLocalMemAccess && !hasWarpSpecOps &&
-        !hasTLXTwoCTAs) {
+        !hasTLXTwoCTAs && !hasExplicitClusterSync) {
       return;
     }
 
@@ -217,6 +226,9 @@ public:
       mod->setAttr(AttrHasWarpSpecOpsName, b.getBoolAttr(true));
     if (hasTLXTwoCTAs) {
       mod->setAttr(AttrTLXEnablePairedCTAMMAName, b.getBoolAttr(true));
+    }
+    if (hasExplicitClusterSync) {
+      mod->setAttr(AttrTLXExplicitClusterSyncName, b.getBoolAttr(true));
     }
   }
 };

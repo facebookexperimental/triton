@@ -378,6 +378,9 @@ def async_remote_shmem_store(
     Store a distributed tensor into a buffer into the remote shared memory of a cluster asynchronously.
     Signals the provided mbarrier when the store completes.
 
+    NOTE: this will increase the lifetime of
+    the SMEM buffers involved to entire program, and potentially increase SMEM pressure.
+
     Args:
         dst: The destination buffer in local shared memory (will be internally mapped to remote CTA)
         src: The source tensor to store
@@ -395,6 +398,41 @@ def async_remote_shmem_store(
     remote_cta_rank_handle = _get_remote_cta_rank_handle(remote_cta_rank, _semantic)
     return tl.tensor(
         _semantic.builder.create_async_remote_store(dst.handle, src.handle, remote_cta_rank_handle, barrier.handle),
+        tl.void,
+    )
+
+
+@tl.builtin
+def async_remote_shmem_copy(
+    dst: tlx.buffered_tensor,
+    src: tlx.buffered_tensor,
+    remote_cta_rank: int | tl.constexpr,
+    barrier: tlx.mbarrier,
+    _semantic=None,
+) -> tl.tensor:
+    """
+    Copy a local shared memory buffer to the remote shared memory of a cluster CTA.
+    Notifies the remote CTA's mbarrier (via mapa) when the copy completes.
+
+    NOTE: this will increase the lifetime of
+    the SMEM buffers involved to entire program, and potentially increase SMEM pressure.
+
+    Uses PTX: cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes
+
+    Args:
+        dst: The destination buffer in local shared memory (will be internally mapa'd to remote CTA)
+        src: The source buffer in local shared memory
+        remote_cta_rank: The rank of the remote CTA within the cluster
+        barrier: mbarrier in local shared memory whose address will be mapa'd to the remote CTA
+    """
+    assert src.type.storage == tlx.storage_kind.smem, ("async_remote_shmem_copy requires local smem src")
+    assert dst.type.storage == tlx.storage_kind.smem, (
+        "async_remote_shmem_copy requires local smem dst (will be mapa'd to remote CTA)")
+    assert remote_cta_rank is not None, "remote_cta_rank is required for async_remote_shmem_copy"
+    assert barrier is not None, "barrier is required for async_remote_shmem_copy"
+    remote_cta_rank_handle = _get_remote_cta_rank_handle(remote_cta_rank, _semantic)
+    return tl.tensor(
+        _semantic.builder.create_async_remote_copy(src.handle, dst.handle, remote_cta_rank_handle, barrier.handle),
         tl.void,
     )
 
@@ -762,14 +800,37 @@ def async_descriptor_load(
     cache_modifier: str = "",
     eviction_policy: str = "",
     multicast_targets: list[tl.tensor] = [],
+    two_ctas: bool = False,
     _semantic=None,
 ) -> None:
+    """
+    Async TMA load from global memory to shared memory, tracked by a barrier.
+
+    Args:
+        desc: TMA tensor descriptor.
+        result: Destination buffered tensor in SMEM.
+        offsets: Coordinates in the global tensor.
+        barrier: The mbarrier to signal upon TMA completion.
+        pred: Optional predicate for conditional load.
+        cache_modifier: Cache modifier hint.
+        eviction_policy: L2 eviction policy.
+        multicast_targets: List of CTA indices for multicast TMA.
+        two_ctas: If True, uses .cta_group::2 on the TMA instruction and
+                 automatically applies remote_view to map the barrier to the
+                 leader CTA (rank 0) via mapa.shared::cluster. The .cta_group::2
+                 modifier routes the mbarrier completion signal based on the
+                 %cluster_ctarank parity of the barrier address. Together with
+                 the remote_view to rank 0 (even parity), this ensures both CTAs'
+                 TMA loads signal the leader's barrier.
+    """
     assert isinstance(desc, tl.tensor_descriptor_base)
     assert eviction_policy in ("", "evict_first", "evict_last"), \
         f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'"
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
-    result_handle = require_nv_mma_shared_layout(result, True, _semantic.builder)
+    # 1D TMA doesn't use swizzling, so request unswizzled NVMMASharedEncoding.
+    swizzled = ndim > 1
+    result_handle = require_nv_mma_shared_layout(result, swizzled, _semantic.builder)
     multicast_targets = _semantic._convert_to_ir_values(multicast_targets, require_i64=False)
     offsets = _semantic._convert_to_ir_values(offsets, require_i64=False)
     cache = _semantic._str_to_load_cache_modifier(cache_modifier)
@@ -778,6 +839,12 @@ def async_descriptor_load(
         pred_handle = _semantic.builder.get_int1(True)
     else:
         pred_handle = pred.handle
+    if two_ctas:
+        # Both CTAs signal the leader's barrier via .cta_group::2.
+        # Round cta_rank down to even to get the leader of the CTA pair.
+        cta_rank = tl.tensor(_semantic.builder.create_cluster_cta_rank(), tl.int32)
+        leader_rank = cta_rank.__and__(~1, _semantic=_semantic)
+        barrier = remote_view(barrier, leader_rank, _semantic=_semantic)
     _semantic.builder.create_async_TMA_load(
         multicast_targets,
         desc.handle,
@@ -788,6 +855,7 @@ def async_descriptor_load(
         cache,
         eviction,
         False,
+        two_ctas,
     )
 
 
@@ -819,6 +887,37 @@ def async_descriptor_prefetch_tensor(
         pred_handle,
         eviction,
     )
+
+
+@tl.builtin
+def prefetch(pointer, level="L2", mask=None, tensormap=False, _semantic=None):
+    """
+    Issue a non-blocking prefetch hint for pointer-based scattered/gather loads.
+
+    Unlike `async_descriptor_prefetch_tensor` which works on tensor descriptors,
+    this supports raw pointer tensors. It emits per-element
+    ``prefetch.global.{L1|L2}`` PTX instructions.
+
+    Args:
+        pointer: Tensor of pointers to prefetch.
+        level: Cache level to prefetch into. ``"L1"`` prefetches into L1+L2,
+               ``"L2"`` (default) prefetches into L2 only.
+        mask: Optional boolean tensor. Only elements where mask is True are
+              prefetched.
+        tensormap: If True, ignore `level` and `mask`, and issue a prefetch for
+              the TMA descriptor (tensormap) in `pointer`. This is a perf hint to warm
+              up the descriptor for following TMA accesses
+    """
+    if tensormap:
+        _semantic.builder.create_prefetch_tensormap(pointer.handle)
+        return
+    assert level in ("L1", "L2"), f"level must be 'L1' or 'L2', got '{level}'"
+    if level == "L1":
+        cache = _semantic._str_to_load_cache_modifier(".ca")
+    else:
+        cache = _semantic._str_to_load_cache_modifier(".cg")
+    mask_handle = mask.handle if mask is not None else None
+    _semantic.builder.create_prefetch(pointer.handle, mask_handle, cache)
 
 
 @tl.builtin

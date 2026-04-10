@@ -29,8 +29,8 @@ LLVM::LLVMFuncOp getVprintfDeclaration(RewriterBase &rewriter) {
   RewriterBase::InsertionGuard guard(rewriter);
   rewriter.setInsertionPointToStart(moduleOp.getBody());
 
-  return rewriter.create<LLVM::LLVMFuncOp>(UnknownLoc::get(context), funcName,
-                                           funcType);
+  return LLVM::LLVMFuncOp::create(rewriter, UnknownLoc::get(context), funcName,
+                                  funcType);
 }
 
 // extend integer to int32, extend float to float64
@@ -75,8 +75,8 @@ LLVM::LLVMFuncOp getAssertfailDeclaration(RewriterBase &rewriter) {
   auto funcType = LLVM::LLVMFunctionType::get(void_ty(ctx), argsType);
   RewriterBase::InsertionGuard guard(rewriter);
   rewriter.setInsertionPointToStart(moduleOp.getBody());
-  auto funcOp = rewriter.create<LLVM::LLVMFuncOp>(UnknownLoc::get(ctx),
-                                                  funcName, funcType);
+  auto funcOp = LLVM::LLVMFuncOp::create(rewriter, UnknownLoc::get(ctx),
+                                         funcName, funcType);
 
   funcOp.setPassthroughAttr(
       ArrayAttr::get(ctx, StringAttr::get(ctx, "noreturn")));
@@ -131,23 +131,23 @@ bool TargetInfo::supportMaximumMinimum() const {
 }
 
 Value TargetInfo::getClusterCTAId(RewriterBase &rewriter, Location loc) const {
-  return rewriter.create<triton::nvgpu::ClusterCTAIdOp>(loc,
-                                                        rewriter.getI32Type());
+  return triton::nvgpu::ClusterCTAIdOp::create(rewriter, loc,
+                                               rewriter.getI32Type());
 }
 
 Value TargetInfo::ballot(RewriterBase &rewriter, Location loc, Type type,
                          Value cmp) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   Value threadMask = b.int_val(type.getIntOrFloatBitWidth(), -1);
-  return rewriter.create<NVVM::VoteSyncOp>(loc, type, threadMask, cmp,
-                                           NVVM::VoteSyncKind::ballot);
+  return NVVM::VoteSyncOp::create(rewriter, loc, type, threadMask, cmp,
+                                  NVVM::VoteSyncKind::ballot);
 }
 
 void TargetInfo::barrier(Location loc, RewriterBase &rewriter,
                          bool isWarpSync) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   if (isWarpSync) {
-    rewriter.create<NVVM::SyncWarpOp>(loc, b.i32_val(0xffffffff));
+    NVVM::SyncWarpOp::create(rewriter, loc, b.i32_val(0xffffffff));
   } else {
     b.barrier();
   }
@@ -160,7 +160,7 @@ static Value mapa(RewriterBase &rewriter, Location loc, Value ptr, Value ctaid,
          "Invalid src llvm addr space for mapa");
   MLIRContext *ctx = rewriter.getContext();
   auto dsmPtrTy = ptr_ty(ctx, llvm::NVPTXAS::ADDRESS_SPACE_SHARED_CLUSTER);
-  return rewriter.create<NVVM::MapaOp>(loc, dsmPtrTy, ptr, ctaid);
+  return NVVM::MapaOp::create(rewriter, loc, dsmPtrTy, ptr, ctaid);
 }
 
 static std::string getConstraintForBitwidth(unsigned bitwidth) {
@@ -201,7 +201,7 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
   auto vecTy = cast<VectorType>(val.getType());
   Type elemTy = vecTy.getElementType();
   unsigned vec = vecTy.getNumElements();
-  unsigned elemBitwidth = elemTy.getIntOrFloatBitWidth();
+  unsigned elemBitwidth = getIntOrFloatOrPtrBitWidth(elemTy);
   assert(llvm::isPowerOf2_32(vec));
 
   if (elemBitwidth < 8) {
@@ -219,7 +219,11 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
   if (!elemTy.isInteger()) {
     SmallVector<Value> vals = unpackLLVector(loc, val, rewriter);
     for (Value &v : vals) {
-      v = b.bitcast(v, int_ty(elemBitwidth));
+      if (isa<LLVM::LLVMPointerType>(v.getType())) {
+        v = b.ptrtoint(int_ty(elemBitwidth), v);
+      } else {
+        v = b.bitcast(v, int_ty(elemBitwidth));
+      }
     }
     storeDShared(rewriter, loc, ptr, ctaId, packLLVector(loc, vals, rewriter),
                  pred, barrierPtr);
@@ -319,6 +323,31 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
   }
 }
 
+void TargetInfo::copyBulkSharedToRemoteShared(RewriterBase &rewriter,
+                                              Location loc, Value srcPtr,
+                                              Value dstPtr, Value barrierPtr,
+                                              Value ctaId, Value size) const {
+  auto *ctx = rewriter.getContext();
+  // Elect one thread per warp to issue the bulk copy. This works correctly
+  // under warp specialization where the issuing warp may not be warp 0.
+  Value pred = LLVM::NVIDIA::createElectPredicate(loc, rewriter);
+  // Map dst and barrier to the remote CTA's address space via mapa.
+  Value remoteDstPtr = mapa(rewriter, loc, dstPtr, ctaId, pred);
+  Value remoteMbarPtr = mapa(rewriter, loc, barrierPtr, ctaId, pred);
+
+  PTXBuilder ptxBuilder;
+  auto &bulkCopy = *ptxBuilder.create<>(
+      "@$0 cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::"
+      "bytes [$1], [$2], $3, [$4];");
+  bulkCopy({ptxBuilder.newOperand(pred, "b"),
+            ptxBuilder.newOperand(remoteDstPtr, "r"),
+            ptxBuilder.newOperand(srcPtr, "r"),
+            ptxBuilder.newOperand(size, "r"),
+            ptxBuilder.newOperand(remoteMbarPtr, "r")},
+           /*onlyAttachMLIRArgs=*/true);
+  ptxBuilder.launch(rewriter, loc, void_ty(ctx));
+}
+
 Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
                               std::optional<Value> ctaId, Type loadTy,
                               Value pred, Operation *localLoadOp) const {
@@ -338,7 +367,7 @@ Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
   auto vecTy = cast<VectorType>(loadTy);
   Type elemTy = vecTy.getElementType();
   unsigned vec = vecTy.getNumElements();
-  unsigned elemBitwidth = elemTy.getIntOrFloatBitWidth();
+  unsigned elemBitwidth = getIntOrFloatOrPtrBitWidth(elemTy);
   assert(llvm::isPowerOf2_32(vec));
 
   if (elemBitwidth < 8) {
@@ -411,7 +440,7 @@ Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
   }
 
   PTXBuilder builder;
-  auto ld = builder.create<>("ld")
+  auto ld = builder.create("ld")
                 ->o("shared::cta", ctaId.has_value())
                 .o("shared", !ctaId.has_value())
                 .v(vec, /*predicate=*/vec > 1)
@@ -509,9 +538,9 @@ bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
               acc[i] = b.zext(i32_ty, acc[i]);
           }
         }
-        acc[i] = rewriter.create<NVVM::ReduxOp>(loc, acc[i].getType(), acc[0],
-                                                *kind, mask, /*abs=*/false,
-                                                /*nan=*/useNanQualifier);
+        acc[i] = NVVM::ReduxOp::create(rewriter, loc, acc[i].getType(), acc[0],
+                                       *kind, mask, /*abs=*/false,
+                                       /*nan=*/useNanQualifier);
         if (acc[i].getType().isInteger()) {
           if (bitwidth < 32)
             acc[i] = b.trunc(int_ty(bitwidth), acc[i]);
@@ -558,8 +587,8 @@ void TargetInfo::printf(RewriterBase &rewriter, Value formatStrStart,
 
     Type structTy = LLVM::LLVMStructType::getLiteral(ctx, argTypes);
     auto allocated =
-        rewriter.create<LLVM::AllocaOp>(loc, ptr_ty(ctx), structTy, one,
-                                        /*alignment=*/0);
+        LLVM::AllocaOp::create(rewriter, loc, ptr_ty(ctx), structTy, one,
+                               /*alignment=*/0);
 
     for (const auto &entry : llvm::enumerate(newArgs)) {
       auto index = b.i32_val(entry.index());

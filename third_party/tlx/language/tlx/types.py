@@ -74,7 +74,7 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
             numCTAs=[1] * rank,
             numCTAsPerCGA=[1] * rank,
             numCTASplit=[1] * rank,
-            numCTAOrder=[1] * rank,
+            numCTAOrder=list(reversed(range(rank))),
         )
 
     """
@@ -201,7 +201,7 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
             elemType=elemType,
             numCTAsPerCGA=[1] * rank,
             numCTASplit=[1] * rank,
-            numCTAOrder=[1] * rank,
+            numCTAOrder=list(reversed(range(rank))),
             fp4Padded=fp4Padded,
             swizzled=True,
         )

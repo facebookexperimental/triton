@@ -27,8 +27,16 @@ constexpr static char AttrHasTLXOpsName[] = "tlx.has_tlx_ops";
 constexpr static char AttrHasWarpSpecOpsName[] = "tlx.has_warp_spec_ops";
 constexpr static char AttrTLXEnablePairedCTAMMAName[] =
     "tlx.enable_paired_cta_mma";
+constexpr static char AttrTLXExplicitClusterSyncName[] =
+    "tlx.explicit_cluster_sync";
 
 bool tlxEnablePairedMMA(Operation *op);
+
+bool tlxExplicitClusterSync(Operation *op);
+
+// Returns true if the kernel uses clusters (clusterDims product > 1).
+// Subsumes tlxEnablePairedMMA: paired CTA MMA always implies clustering.
+bool tlxIsClustered(Operation *op);
 
 // Get element size in bytes for a type, handling pointer types (8 bytes)
 // and using ceiling division for sub-byte types.

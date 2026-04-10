@@ -874,8 +874,7 @@ static bool hasDefPartition(scf::ForOp loop, Operation *op,
     Operation *op = worklist.pop_back_val();
     if (!seen.insert(op).second)
       continue;
-    auto partitionIds = getPartitionIds(op);
-    if (partitionIds)
+    if (hasPartition(op))
       return true;
     iterateDefs(loop, op,
                 [&](OpResult def) { worklist.push_back(def.getDefiningOp()); });
@@ -1162,6 +1161,17 @@ getInitialSchedule(scf::ForOp mainLoop,
         }
       }
     }
+
+    // Schedule regular StoreOps to epilogue only when the epilogue partition
+    // is otherwise empty (no DescriptorStoreOps or categorized epilogue stores
+    // were scheduled above). When epilogue already has stores (e.g., FA kernels
+    // with TMA output stores), additional StoreOps should stay in the
+    // computation partition to avoid cross-partition TMEM overhead.
+    if (epiloguePartition->getOps().empty()) {
+      for (auto loop : loops)
+        for (StoreOp op : loop.getOps<StoreOp>())
+          tryScheduleOp(epiloguePartition, op);
+    }
   }
 
   // Schedule MMAs and their associated stores
@@ -1197,13 +1207,14 @@ getInitialSchedule(scf::ForOp mainLoop,
 
         // Duplicate the op if necessary to ensure MMA partition is only user
         if (!llvm::all_of(op->getUsers(), [&](Operation *user) {
-              auto ids = getPartitionIds(user);
-              return ids && ids->contains(mmaPartition->getIndex());
+              return hasPartition(user) &&
+                     getPartitionIds(user).contains(mmaPartition->getIndex());
             })) {
           Operation *newOp = OpBuilder(op).clone(*op);
           op->replaceUsesWithIf(newOp->getResults(), [&](OpOperand &use) {
-            auto ids = getPartitionIds(use.getOwner());
-            return ids && ids->contains(mmaPartition->getIndex());
+            return hasPartition(use.getOwner()) &&
+                   getPartitionIds(use.getOwner())
+                       .contains(mmaPartition->getIndex());
           });
           op = newOp;
         }
@@ -1485,10 +1496,10 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
     // Look at the definitions directly feeding into this operation.
     iterateDefs(loop, op, [&](OpResult def) {
       Operation *defOp = def.getDefiningOp();
-      if (auto partitionIds = getPartitionIds(defOp)) {
+      if (hasPartition(defOp)) {
         // The input originates from an operation already assigned to a
         // partition. Add this as a def partition.
-        for (auto id : *partitionIds) {
+        for (auto id : getPartitionIds(defOp)) {
           cluster->defPartitions.insert(schedule.getPartition(id));
         }
       } else {
@@ -1512,10 +1523,10 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
     });
     // Check the users of the operation.
     iterateUsers(loop, op, [&](Operation *user) {
-      if (auto partitionIds = getPartitionIds(user)) {
+      if (hasPartition(user)) {
         // If the user is already assigned to a partition, add that partition as
         // one of the sink partitions.
-        for (auto id : *partitionIds) {
+        for (auto id : getPartitionIds(user)) {
           cluster->sinkPartitions.insert(schedule.getPartition(id));
         }
         return;
@@ -1653,10 +1664,12 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
 void optimizeSchedule(scf::ForOp loop, PartitionSet &schedule) {
   // Helper to get partition for an op, returning null if unscheduled.
   auto getPartition = [&](Operation *op) -> Partition * {
-    auto ids = getPartitionIds(op);
-    if (!ids || ids->size() != 1)
+    if (!hasPartition(op))
       return nullptr;
-    return schedule.getPartition(static_cast<unsigned>((*ids)[0]));
+    auto ids = getPartitionIds(op);
+    if (ids.size() != 1)
+      return nullptr;
+    return schedule.getPartition(static_cast<unsigned>(ids[0]));
   };
 
   // Walk everything in reverse so that operations are visited before their
@@ -1740,7 +1753,56 @@ void PartitionSchedulingMeta::runOnOperation() {
       loop->setAttr(
           kWarpSpecializeTagAttrName,
           IntegerAttr::get(IntegerType::get(loop.getContext(), 32), idx));
-      // Clean Broadcast/ExpandDims that were left with no users
+      // Assign partition IDs to all remaining ops inside the loop that don't
+      // have one yet. This mirrors upstream's assignRegionBodyPartition and
+      // assignRegionOpPartitions to satisfy the partition verifier which
+      // requires ALL ops inside a WS loop to have partition attributes.
+
+      // Step 1: For ops nested inside regions (e.g. tt.reduce body, scf.if
+      // body), inherit the partition from the nearest ancestor op that has one.
+      Operation *loopOp = loop.getOperation();
+      loop->walk([&](Operation *op) {
+        if (isa<scf::YieldOp, scf::ForOp>(op) || hasPartition(op))
+          return WalkResult::advance();
+
+        // Find the nearest ancestor in the loop body that has a partition.
+        Operation *ancestor = op->getParentOp();
+        while (ancestor && ancestor != loopOp) {
+          if (hasPartition(ancestor)) {
+            setPartition(op, getPartitionIds(ancestor));
+            break;
+          }
+          ancestor = ancestor->getParentOp();
+        }
+        return WalkResult::advance();
+      });
+
+      // Step 2: Remove partition attribute from non-ForOp ops that have
+      // regions (e.g. tt.reduce, scf.if). The partition verifier infers
+      // their partition sets from their children's partitions.
+      loop->walk([&](Operation *op) {
+        if (!isa<scf::ForOp>(op) && hasPartition(op) &&
+            op->getNumRegions() > 0) {
+          op->removeAttr(kPartitionAttrName);
+        }
+      });
+
+      // Step 3: Handle ops without results that still need partition
+      // assignments (e.g. llvm.intr.assume, debug intrinsics). These inherit
+      // from their parent operation.
+      loop.walk([&](Operation *op) {
+        if (op->getNumResults() > 0 || hasPartition(op))
+          return WalkResult::advance();
+        if (op->getNumRegions() > 0 ||
+            isa<scf::YieldOp, triton::ReduceReturnOp>(op))
+          return WalkResult::advance();
+        auto parentOp = op->getParentOp();
+        if (hasPartition(parentOp))
+          setPartition(op, getPartitionIds(parentOp));
+        return WalkResult::advance();
+      });
+
+      // Clean Broadcast/ExpandDims/ConvertLayout that were left with no users
       // after optimizeSchedule. We wait until after the schedule is serialized
       // to avoid invalidating pointers stored in the schedule.
       loop.walk<WalkOrder::PostOrder, ReverseIterator>([](Operation *op) {

@@ -278,4 +278,16 @@ def NVGPUPartitionSchedulingMeta : Pass<"nvgpu-partition-scheduling-meta", "mlir
   ];
 }
 
+def NVGPUMultiCTAReduction : Pass<"nvgpu-multi-cta-reduction", "mlir::ModuleOp"> {
+  let summary = "Multi-CTA reduction for NVIDIA GPU";
+  let description = [{
+    Detects scf.for loops with tt.multi_cta attribute and partitions loop
+    iterations across CTAs in a cluster. Post-loop tt.reduce ops are
+    transformed into cross-CTA reduction using DSM.
+  }];
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+}
+
 #endif // NV_TRANSFORMS_PASSES

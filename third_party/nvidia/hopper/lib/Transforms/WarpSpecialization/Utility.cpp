@@ -1,5 +1,6 @@
 #include "Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "llvm/ADT/SetVector.h"
@@ -21,8 +22,8 @@ SmallVector<AsyncTaskId> getAsyncTaskIds(Operation *op) {
           asyncTaskIds[asyncTaskIds.size() - 1] != asyncTaskId)
         asyncTaskIds.push_back(asyncTaskId);
     }
-  } else if (auto attr =
-                 op->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName)) {
+  } else if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(
+                 tt::gpu::kPartitionAttrName)) {
     for (AsyncTaskId asyncTaskId : attr.asArrayRef()) {
       asyncTaskIds.push_back(asyncTaskId);
     }

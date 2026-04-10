@@ -112,6 +112,26 @@ def _fma_f32x2(a, b, c):
 
 
 @triton.jit
+def _sub_f32x2(a, b):
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 ra, rb, rc;
+            mov.b64 ra, { $2, $3 };
+            mov.b64 rb, { $4, $5 };
+            sub.f32x2 rc, ra, rb;
+            mov.b64 { $0, $1 }, rc;
+        }
+        """,
+        "=r,=r,r,r,r,r",
+        [a, b],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=2,
+    )
+
+
+@triton.jit
 def _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE: tl.constexpr):
     if STAGE == 1:
         # First part of STAGE == 3 in _get_fused_loop_bounds
@@ -367,18 +387,10 @@ def _attn_fwd_ws(
     # original grid
     #   triton.cdiv(q.shape[2], META["BLOCK_M"]),
     #   q.shape[0] * q.shape[1],
-    prog_id = tl.program_id(0)
-    num_progs = tl.num_programs(0)
+    start_pid = tl.program_id(0)
     num_pid_m = tl.cdiv(N_CTX, BLOCK_M)
     num_pid_n = Z * H
     num_pid_in_group = num_pid_m * GROUP_SIZE_N
-    total_tiles = num_pid_m * Z * H
-
-    tiles_per_sm = total_tiles // num_progs
-    if prog_id < total_tiles % num_progs:
-        tiles_per_sm += 1
-
-    tile_idx = prog_id
 
     # allocate SMEM buffers and barriers
     q_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_q), NUM_MMA_GROUPS * NUM_BUFFERS_Q)
@@ -468,15 +480,26 @@ def _attn_fwd_ws(
         l_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
         o_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
 
+    # 6 consumers: correction(1) + softmax(2 replicas) + mma(1) + load(1) + epilog(1)
+    clc_context = tlx.clc_create_context(num_consumers=6)
+
     with tlx.async_tasks():
         # correction group
         with tlx.async_task("default"):
             accum_cnt = 0
             phase = 0
-            for i in range(0, tiles_per_sm):
+            tile_count = 0
+            tile_id = start_pid
+            clc_phase_producer = 1
+            clc_phase_consumer = 0
+            while tile_id != -1:
+                # CLC producer: announce work to all consumer tasks
+                tlx.clc_producer(clc_context, clc_phase_producer)
+                clc_phase_producer ^= 1
+
                 # initialize offsets
                 start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
-                    tile_idx,
+                    tile_id,
                     H,
                     num_pid_n,
                     num_pid_in_group,
@@ -542,7 +565,7 @@ def _attn_fwd_ws(
                         tlx.barrier_arrive(acc_fulls[cid])
                     accum_cnt += 1
 
-                _, phase = _get_bufidx_phase(i, 1)
+                _, phase = _get_bufidx_phase(tile_count, 1)
                 for cid in tl.static_range(0, NUM_MMA_GROUPS):
                     # epilogue
                     tlx.barrier_wait(l_fulls[cid], phase)
@@ -581,15 +604,19 @@ def _attn_fwd_ws(
                         tlx.local_store(subslice_o, acc)
                     tlx.barrier_arrive(o_fulls[cid])
 
-                tile_idx += num_progs
+                tile_count += 1
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
+                clc_phase_consumer ^= 1
 
         # softmax groups
         with tlx.async_task(num_warps=4, registers=168, replicate=NUM_MMA_GROUPS):
             accum_cnt_qk = 0
-            for i in range(0, tiles_per_sm):
+            tile_id = start_pid
+            clc_phase_consumer = 0
+            while tile_id != -1:
                 # initialize offsets
                 start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
-                    tile_idx,
+                    tile_id,
                     H,
                     num_pid_n,
                     num_pid_in_group,
@@ -664,17 +691,21 @@ def _attn_fwd_ws(
                 tlx.local_store(l_tiles[cid], l_i[:, None])
                 tlx.local_store(m_tiles[cid], m_i[:, None])
                 tlx.barrier_arrive(l_fulls[cid])
-                tile_idx += num_progs
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
+                clc_phase_consumer ^= 1
 
-            # mma group
+        # mma group
         with tlx.async_task(num_warps=1, registers=24):
             accum_cnt_kv = 0
             accum_cnt_qk = 0
 
-            for j in range(0, tiles_per_sm):
+            tile_count = 0
+            tile_id = start_pid
+            clc_phase_consumer = 0
+            while tile_id != -1:
                 # initialize offsets
                 _, _, lo, hi, _, _ = _compute_offsets(
-                    tile_idx,
+                    tile_id,
                     H,
                     num_pid_n,
                     num_pid_in_group,
@@ -684,7 +715,7 @@ def _attn_fwd_ws(
                     GROUP_SIZE_N,
                 )
 
-                q_bufIdx, q_phase = _get_bufidx_phase(j, NUM_BUFFERS_Q)
+                q_bufIdx, q_phase = _get_bufidx_phase(tile_count, NUM_BUFFERS_Q)
                 k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
                 v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
 
@@ -841,15 +872,20 @@ def _attn_fwd_ws(
 
                 accum_cnt_qk += 1
                 accum_cnt_kv += 2
-                tile_idx += num_progs
+                tile_count += 1
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
+                clc_phase_consumer ^= 1
 
         # load
         with tlx.async_task(num_warps=1, registers=24):
             accum_cnt_kv = 0
-            for i in range(0, tiles_per_sm):
+            tile_count = 0
+            tile_id = start_pid
+            clc_phase_consumer = 0
+            while tile_id != -1:
                 # initialize offsets
                 _, _, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
-                    tile_idx,
+                    tile_id,
                     H,
                     num_pid_n,
                     num_pid_in_group,
@@ -860,7 +896,7 @@ def _attn_fwd_ws(
                 )
 
                 # load q0
-                q_bufIdx, q_phase = _get_bufidx_phase(i, NUM_BUFFERS_Q)
+                q_bufIdx, q_phase = _get_bufidx_phase(tile_count, NUM_BUFFERS_Q)
                 tlx.barrier_wait(q_empties[q_bufIdx], q_phase ^ 1)
                 tlx.barrier_expect_bytes(q_fulls[q_bufIdx], Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM)
                 qo_offset_y_split = qo_offset_y
@@ -922,15 +958,20 @@ def _attn_fwd_ws(
                     kv_offset_y += BLOCK_N
                     accum_cnt_kv += 2
 
-                tile_idx += num_progs
+                tile_count += 1
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
+                clc_phase_consumer ^= 1
 
         # epilog group
         with tlx.async_task(num_warps=1, registers=24):
             # initialize offsets
-            for i in range(0, tiles_per_sm):
+            tile_count = 0
+            tile_id = start_pid
+            clc_phase_consumer = 0
+            while tile_id != -1:
                 # initialize offsets
                 _, _, _, _, qo_offset_y, _ = _compute_offsets(
-                    tile_idx,
+                    tile_id,
                     H,
                     num_pid_n,
                     num_pid_in_group,
@@ -939,7 +980,7 @@ def _attn_fwd_ws(
                     STAGE,
                     GROUP_SIZE_N,
                 )
-                _, phase = _get_bufidx_phase(i, 1)
+                _, phase = _get_bufidx_phase(tile_count, 1)
                 for cid in tl.static_range(0, NUM_MMA_GROUPS):
                     tlx.barrier_wait(o_fulls[cid], phase)
                     tlx.fence("async_shared")
@@ -948,7 +989,9 @@ def _attn_fwd_ws(
                     tlx.async_descriptor_store_wait(0)
                     tlx.barrier_arrive(o_empties[cid])
 
-                tile_idx += num_progs
+                tile_count += 1
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
+                clc_phase_consumer ^= 1
 
 
 @triton.jit
@@ -998,7 +1041,12 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
     BLOCK_M1 = nargs["BLOCK_M1"]
     BLOCK_N1 = nargs["BLOCK_N1"]
     HEAD_DIM = nargs["HEAD_DIM"]
-    EPILOGUE_SUBTILE = nargs["EPILOGUE_SUBTILE"]
+    DQ_REDUCE_NCOL = nargs["DQ_REDUCE_NCOL"]
+
+    # Reset dq accumulator to zeros before each autotuner warmup run.
+    # Without this, dq accumulates across autotuner benchmark runs when
+    # multiple configs are present (e.g., USE_WARP_BARRIER in [False, True]).
+    nargs["desc_dq"].base.zero_()
 
     # Reset dq accumulator to zeros before each autotuner warmup run.
     # Without this, dq accumulates across autotuner benchmark runs when
@@ -1009,9 +1057,12 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
     nargs["desc_do"].block_shape = [BLOCK_M1, HEAD_DIM]
     nargs["desc_v"].block_shape = [BLOCK_N1, HEAD_DIM]
     nargs["desc_k"].block_shape = [BLOCK_N1, HEAD_DIM]
-    nargs["desc_dq"].block_shape = [BLOCK_M1, HEAD_DIM // EPILOGUE_SUBTILE]
-    nargs["desc_dv"].block_shape = [BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
-    nargs["desc_dk"].block_shape = [BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
+    nargs["desc_dq"].block_shape = [BLOCK_M1, DQ_REDUCE_NCOL]
+    DKV_STORE_NCOL = nargs["DKV_STORE_NCOL"]
+    nargs["desc_dv"].block_shape = [BLOCK_N1, DKV_STORE_NCOL]
+    nargs["desc_dk"].block_shape = [BLOCK_N1, DKV_STORE_NCOL]
+    nargs["desc_m"].block_shape = [BLOCK_M1]
+    nargs["desc_delta"].block_shape = [BLOCK_M1]
 
 
 configs_bwd_tlx = [
@@ -1019,18 +1070,19 @@ configs_bwd_tlx = [
         {
             "BLOCK_M1": bm1,
             "BLOCK_N1": 128,
-            "BLOCK_M2": 128,
-            "BLOCK_N2": 128,
             "NUM_BUFFERS_KV": 1,
             "NUM_BUFFERS_Q": 2,
             "NUM_BUFFERS_DO": 1,
             "NUM_BUFFERS_DS": 1,
             "NUM_BUFFERS_TMEM": 1,
-            "EPILOGUE_SUBTILE": 4 if bm1 == 128 else 2,
+            "DKV_STORE_NCOL": 64,
+            "NUM_COMPUTE_SLICES": 2,
+            "DQ_REDUCE_STAGES": 2,
+            "DQ_REDUCE_NCOL": 32,
             "GROUP_SIZE_M": 1,
             "USE_WARP_BARRIER": uwb,
         },
-        num_warps=4,
+        num_warps=8,
         num_stages=1,
         pre_hook=_bwd_host_descriptor_pre_hook_tlx,
     ) for bm1 in [64, 128] for uwb in [False, True]
@@ -1050,8 +1102,12 @@ def _bwd_compute_inner_loop(
     dp_tiles,
     ds_tiles,
     ds_fulls,
-    M,
-    D,
+    dsT_tmem_tiles,
+    dsT_tmem_fulls,
+    sM_tiles,
+    sD_tiles,
+    m_fulls,
+    d_fulls,
     curr_m,
     blk_idx,
     step_m,
@@ -1062,8 +1118,11 @@ def _bwd_compute_inner_loop(
     NUM_BUFFERS_DS: tl.constexpr,
     BLOCK_M1: tl.constexpr,
     BLOCK_N1: tl.constexpr,
+    NUM_COMPUTE_SLICES: tl.constexpr,
     STAGE: tl.constexpr,
     REUSE_DP_FOR_DQ: tl.constexpr,
+    M_STAGE: tl.constexpr,
+    D_STAGE: tl.constexpr,
 ):
     start_block_n = start_n * BLOCK_N1
     offs_n = start_block_n + tl.arange(0, BLOCK_N1)
@@ -1073,40 +1132,47 @@ def _bwd_compute_inner_loop(
         tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
         ds_buf_id, _ = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
 
+        # Wait for M and D to be loaded by the load task via TMA.
+        m_buf_id, m_phase = _get_bufidx_phase(blk_idx, M_STAGE)
+        d_buf_id, d_phase = _get_bufidx_phase(blk_idx, D_STAGE)
+        tlx.barrier_wait(m_fulls[m_buf_id], m_phase)
+        tlx.barrier_wait(d_fulls[d_buf_id], d_phase)
+
+        tlx.barrier_wait(qk_fulls[tmem_buf_id], tmem_phase)
+
+        # Read S from TMEM and compute pT.
+        # S and P alias the same TMEM (p_tiles reuse=qk_tiles).  The
+        # Triton compiler inserts the necessary sync between the S read
+        # and P write automatically.
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
-        m = tl.load(M + offs_m)
+        m = tlx.local_load(sM_tiles[m_buf_id])
+        qkT = tlx.local_load(qk_tiles[tmem_buf_id])
+        tlx.barrier_arrive(qk_empties[tmem_buf_id])
 
-        # wait for qkT = tl.dot(k, qT)
-        tlx.barrier_wait(tlx.local_view(qk_fulls, tmem_buf_id), tmem_phase)
-        qkT = tlx.local_load(tlx.local_view(qk_tiles, tmem_buf_id))
-        tlx.barrier_arrive(tlx.local_view(qk_empties, tmem_buf_id))
-
-        pT = tl.math.exp2(qkT - m[None, :])
+        pT = tl.math.exp2(_sub_f32x2(qkT, m[None, :]))
         if STAGE == 1:
             mask = offs_m[None, :] >= offs_n[:, None]
             pT = tl.where(mask, pT, 0.0)
 
-        # ppT *= qk_scale
-        ppT = pT
-        ppT = ppT.to(do_out_dtype)
-        tlx.local_store(tlx.local_view(p_tiles, tmem_buf_id), ppT)
-        tlx.barrier_arrive(tlx.local_view(p_fulls, tmem_buf_id))
+        # Store P to TMEM. ---
+        ppT = pT.to(do_out_dtype)
+        tlx.local_store(p_tiles[tmem_buf_id], ppT)
+        tlx.barrier_arrive(p_fulls[tmem_buf_id])
 
-        # D (= delta) is pre-divided by ds_scale.
-        Di = tl.load(D + offs_m)
-
-        # Wait for dpT = tl.dot(v, tl.trans(do))
-        tlx.barrier_wait(tlx.local_view(dp_fulls, tmem_buf_id), tmem_phase)
-        dpT = tlx.local_load(tlx.local_view(dp_tiles, tmem_buf_id))
-        # We can only signal the arrive if DP is not shared with DQ.
-        # Otherwise we need to wait for DQ to be done.
-        if not REUSE_DP_FOR_DQ:
-            tlx.barrier_arrive(tlx.local_view(dp_empties, tmem_buf_id))
-        dsT = pT * (dpT - Di[None, :])
+        # --- Phase 3: Compute dS = pT * (dpT - Di). ---
+        tlx.barrier_wait(dp_fulls[tmem_buf_id], tmem_phase)
+        dpT = tlx.local_load(dp_tiles[tmem_buf_id])
+        Di = tlx.local_load(sD_tiles[d_buf_id])
+        dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
         dsT = dsT.to(q_out_dtype)
-        tlx.local_store(tlx.local_view(ds_tiles, ds_buf_id), dsT)
+        tlx.local_store(ds_tiles[ds_buf_id], dsT)
+        tlx.local_store(dsT_tmem_tiles[ds_buf_id], dsT)
+        if not REUSE_DP_FOR_DQ:
+            tlx.barrier_arrive(dp_empties[tmem_buf_id])
         tlx.fence("async_shared")
-        tlx.barrier_arrive(tlx.local_view(ds_fulls, ds_buf_id))
+        tlx.barrier_arrive(ds_fulls[ds_buf_id])
+        tlx.barrier_arrive(dsT_tmem_fulls[ds_buf_id])
+
         curr_m += step_m
         blk_idx += 1
     return curr_m, blk_idx
@@ -1123,8 +1189,8 @@ def _attn_bwd_ws(
     desc_dq,
     desc_dk,
     desc_dv,  #
-    M,
-    D,
+    desc_m,
+    desc_delta,
     # shared by Q/K/V/DO.
     stride_z,
     stride_h,
@@ -1135,8 +1201,6 @@ def _attn_bwd_ws(
     N_CTX,  #
     BLOCK_M1: tl.constexpr,  #
     BLOCK_N1: tl.constexpr,  #
-    BLOCK_M2: tl.constexpr,  #
-    BLOCK_N2: tl.constexpr,  #
     BLK_SLICE_FACTOR: tl.constexpr,  #
     HEAD_DIM: tl.constexpr,
     NUM_BUFFERS_KV: tl.constexpr,
@@ -1144,7 +1208,10 @@ def _attn_bwd_ws(
     NUM_BUFFERS_DO: tl.constexpr,
     NUM_BUFFERS_DS: tl.constexpr,
     NUM_BUFFERS_TMEM: tl.constexpr,
-    EPILOGUE_SUBTILE: tl.constexpr,
+    NUM_COMPUTE_SLICES: tl.constexpr,
+    DQ_REDUCE_STAGES: tl.constexpr,
+    DQ_REDUCE_NCOL: tl.constexpr,
+    DKV_STORE_NCOL: tl.constexpr,
     STAGE: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     USE_WARP_BARRIER: tl.constexpr = False,
@@ -1173,15 +1240,8 @@ def _attn_bwd_ws(
     #   q.shape[0] * q.shape[1],
     n_tile_num = tl.cdiv(N_CTX, BLOCK_N1)
     num_pid_m = Z * H
-    prog_id = tl.program_id(0)
-    num_progs = tl.num_programs(0)
-    total_tiles = n_tile_num * Z * H
 
-    tiles_per_sm = total_tiles // num_progs
-    if prog_id < total_tiles % num_progs:
-        tiles_per_sm += 1
-
-    tile_idx = prog_id
+    start_pid = tl.program_id(0)
 
     # allocate smem buffers
     k_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
@@ -1192,15 +1252,42 @@ def _attn_bwd_ws(
     # Use SMEM for dsT
     ds_tiles = tlx.local_alloc((BLOCK_N1, BLOCK_M1), tlx.dtype_of(desc_q), NUM_BUFFERS_DS)
 
+    # SMEM staging buffer for async TMA reduce-add of dQ.
+    # Uses smaller column width (DQ_REDUCE_NCOL) than dK/dV to fit in SMEM.
+    DQ_REDUCE_ITERS: tl.constexpr = HEAD_DIM // DQ_REDUCE_NCOL
+    dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_REDUCE_NCOL), tlx.dtype_of(desc_dq), DQ_REDUCE_STAGES)
+
+    # - sdv reuses v_tiles (free after dv_fulls; MMA's last v_tiles read —
+    #   the dpT dot — precedes dv_fulls).
+    # - sdk reuses k_tiles (MMA's dq dot still reads k_tiles after dk_fulls,
+    #   so the compute task must wait on k_mma_done before writing sdk).
+    sdv_store_buf = tlx.local_alloc((BLOCK_N1, DKV_STORE_NCOL), tlx.dtype_of(desc_dv), NUM_BUFFERS_KV, reuse=v_tiles)
+    sdk_store_buf = tlx.local_alloc((BLOCK_N1, DKV_STORE_NCOL), tlx.dtype_of(desc_dk), NUM_BUFFERS_KV, reuse=k_tiles)
+
+    # SMEM buffers for M and D (loaded by load task, consumed by compute task).
+    # Stages match Q and dO pipelines respectively for synchronized double-buffering.
+    M_STAGE: tl.constexpr = NUM_BUFFERS_Q  # = 2
+    D_STAGE: tl.constexpr = NUM_BUFFERS_DO  # = 1
+    sM_tiles = tlx.local_alloc((BLOCK_M1, ), tl.float32, M_STAGE)
+    sD_tiles = tlx.local_alloc((BLOCK_M1, ), tl.float32, D_STAGE)
+
     # allocate barriers for smem buffers
-    k_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
+    # K/V are bundled into Q/dO barriers (loaded once per n_block in prologue).
+    # k_mma_done: signaled by MMA task after dq dot (last k_tiles read).
+    # k_empties: signaled by compute task after dKV staging stores complete
+    #            AND k_mma_done is received.  Gates both k_tiles and v_tiles
+    #            (v_tiles aliased by sdv_store_buf) since V load follows K
+    #            load in the load task.
+    k_mma_done = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     k_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
-    v_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     q_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)
     q_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)
     do_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DO)
     do_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DO)
+    m_fulls = tlx.alloc_barriers(num_barriers=M_STAGE)
+    d_fulls = tlx.alloc_barriers(num_barriers=D_STAGE)
     ds_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
+    dsT_tmem_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS)
 
     # allocate tmem buffers
     qk_tiles = tlx.local_alloc((BLOCK_N1, BLOCK_M1), tl.float32, NUM_BUFFERS_TMEM, tlx.storage_kind.tmem)
@@ -1211,11 +1298,24 @@ def _attn_bwd_ws(
         tlx.storage_kind.tmem,
         reuse=qk_tiles,
     )
+    # dP, dS (TMEM for dk dot), and dQ share TMEM via storage alias.
+    # dP and dS occupy the same offset (sequential lifetime: dpT consumed
+    # before dsT written). dQ occupies a distinct offset (it may overlap
+    # with dsT in the mma pipeline).
+    dp_dq_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
     dp_tiles = tlx.local_alloc(
         (BLOCK_N1, BLOCK_M1),
         tl.float32,
         NUM_BUFFERS_TMEM,
         tlx.storage_kind.tmem,
+        reuse=dp_dq_storage_alias,
+    )
+    dsT_tmem_tiles = tlx.local_alloc(
+        (BLOCK_N1, BLOCK_M1),
+        tlx.dtype_of(desc_q),
+        NUM_BUFFERS_DS,
+        tlx.storage_kind.tmem,
+        reuse=dp_dq_storage_alias,
     )
 
     dv_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tl.float32, NUM_BUFFERS_KV, tlx.storage_kind.tmem)
@@ -1247,18 +1347,25 @@ def _attn_bwd_ws(
     else:
         dk_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
 
-    # Establish the barriers and allocations we will use if we need to
-    # share TMEM for dq and dp. For barriers we cannot modify the definition
-    # of dp_empties because we can only signal the arrive if the barrier
+    # dQ uses the same storage alias group as dP/dS — all three share
+    # the same TMEM slot.
+    # Lifecycle within one block: dpT → dsT → dq (sequential, no overlap).
     if REUSE_DP_FOR_DQ:
         dq_tiles = tlx.local_alloc(
             (BLOCK_M1, HEAD_DIM),
             tl.float32,
             NUM_BUFFERS_TMEM,
             tlx.storage_kind.tmem,
-            reuse=dp_tiles,
+            reuse=dp_dq_storage_alias,
         )
         dp_empties = dq_empties
+        dp_dq_storage_alias.set_buffer_overlap(
+            tlx.reuse_group(
+                dp_tiles,
+                dsT_tmem_tiles,
+                dq_tiles,
+                group_type=tlx.reuse_group_type.shared,
+            ))
     else:
         dq_tiles = tlx.local_alloc(
             (BLOCK_M1, HEAD_DIM),
@@ -1273,13 +1380,169 @@ def _attn_bwd_ws(
 
     LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
 
+    # 4 consumers: reduction(1) + compute(1) + mma(1) + load(1)
+    clc_context = tlx.clc_create_context(num_consumers=4)
+
     with tlx.async_tasks():
-        # reduction
-        with tlx.async_task("default"):
+        # compute
+        with tlx.async_task("default", registers=192, replicate=1):
             blk_idx = 0
-            for i in range(0, tiles_per_sm):
+            tile_count = 0
+            tile_id = start_pid
+            clc_phase_consumer = 0
+            while tile_id != -1:
+                off_chz, off_bh, start_m, start_n, _ = bwd_calculate_offsets(
+                    tile_id,
+                    n_tile_num,
+                    num_pid_m,
+                    stride_z,
+                    stride_h,
+                    stride_tok,
+                    H,
+                    N_CTX,
+                    BLOCK_M1,
+                    BLOCK_N1,
+                    GROUP_SIZE_M,
+                    STAGE,
+                )
+                start_block_n = start_n * BLOCK_N1
+                curr_m = start_m
+                step_m = BLOCK_M1
+                do_out_dtype = tlx.dtype_of(desc_do)
+                q_out_dtype = tlx.dtype_of(desc_q)
+                if STAGE & 1:
+                    curr_m, blk_idx = _bwd_compute_inner_loop(
+                        start_n,
+                        qk_fulls,
+                        qk_tiles,
+                        qk_empties,
+                        p_tiles,
+                        p_fulls,
+                        dp_empties,
+                        dp_fulls,
+                        dp_tiles,
+                        ds_tiles,
+                        ds_fulls,
+                        dsT_tmem_tiles,
+                        dsT_tmem_fulls,
+                        sM_tiles,
+                        sD_tiles,
+                        m_fulls,
+                        d_fulls,
+                        curr_m,
+                        blk_idx,
+                        step_m,
+                        do_out_dtype,
+                        q_out_dtype,
+                        N_CTX,
+                        NUM_BUFFERS_TMEM,
+                        NUM_BUFFERS_DS,
+                        BLOCK_M1,
+                        BLOCK_N1,
+                        NUM_COMPUTE_SLICES,
+                        STAGE=4 - STAGE,
+                        REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
+                        M_STAGE=M_STAGE,
+                        D_STAGE=D_STAGE,
+                    )
+                if STAGE & 2:
+                    curr_m, blk_idx = _bwd_compute_inner_loop(
+                        start_n,
+                        qk_fulls,
+                        qk_tiles,
+                        qk_empties,
+                        p_tiles,
+                        p_fulls,
+                        dp_empties,
+                        dp_fulls,
+                        dp_tiles,
+                        ds_tiles,
+                        ds_fulls,
+                        dsT_tmem_tiles,
+                        dsT_tmem_fulls,
+                        sM_tiles,
+                        sD_tiles,
+                        m_fulls,
+                        d_fulls,
+                        curr_m,
+                        blk_idx,
+                        step_m,
+                        do_out_dtype,
+                        q_out_dtype,
+                        N_CTX,
+                        NUM_BUFFERS_TMEM,
+                        NUM_BUFFERS_DS,
+                        BLOCK_M1,
+                        BLOCK_N1,
+                        NUM_COMPUTE_SLICES,
+                        STAGE=2,
+                        REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
+                        M_STAGE=M_STAGE,
+                        D_STAGE=D_STAGE,
+                    )
+
+                kv_buf_id, kv_phase = _get_bufidx_phase(tile_count, NUM_BUFFERS_KV)
+
+                tlx.barrier_wait(dv_fulls[kv_buf_id], kv_phase)
+                DKV_STORE_ITERS: tl.constexpr = HEAD_DIM // DKV_STORE_NCOL
+                for slice_id in tl.static_range(DKV_STORE_ITERS):
+                    dv_slice = tlx.local_slice(
+                        dv_tiles[kv_buf_id],
+                        [0, slice_id * DKV_STORE_NCOL],
+                        [BLOCK_N1, DKV_STORE_NCOL],
+                    )
+                    dv = tlx.local_load(dv_slice)
+                    tlx.async_descriptor_store_wait(0)
+                    tlx.local_store(sdv_store_buf[kv_buf_id], dv.to(tlx.dtype_of(desc_dv)))
+                    tlx.fence("async_shared")
+                    tlx.async_descriptor_store(
+                        desc_dv,
+                        sdv_store_buf[kv_buf_id],
+                        [(off_bh + start_block_n).to(tl.int32), slice_id * DKV_STORE_NCOL],
+                    )
+                tlx.barrier_arrive(dv_empties[kv_buf_id])
+                tlx.barrier_wait(dk_fulls[kv_buf_id], kv_phase)
+                # Wait for MMA's dq dot (last k_tiles read) before writing
+                # sdk_store_buf which aliases k_tiles.
+                tlx.barrier_wait(k_mma_done[kv_buf_id], kv_phase)
+                for slice_id in tl.static_range(DKV_STORE_ITERS):
+                    dk_slice = tlx.local_slice(
+                        dk_tiles[kv_buf_id],
+                        [0, slice_id * DKV_STORE_NCOL],
+                        [BLOCK_N1, DKV_STORE_NCOL],
+                    )
+                    dk = tlx.local_load(dk_slice)
+                    dk *= sm_scale
+                    tlx.async_descriptor_store_wait(0)
+                    tlx.local_store(sdk_store_buf[kv_buf_id], dk.to(tlx.dtype_of(desc_dk)))
+                    tlx.fence("async_shared")
+                    tlx.async_descriptor_store(
+                        desc_dk,
+                        sdk_store_buf[kv_buf_id],
+                        [(off_bh + start_block_n).to(tl.int32), slice_id * DKV_STORE_NCOL],
+                    )
+                tlx.async_descriptor_store_wait(0)
+                # All staging stores done + MMA done reading k_tiles →
+                # safe for load task to refill both k_tiles and v_tiles.
+                tlx.barrier_arrive(k_empties[kv_buf_id])
+                tlx.barrier_arrive(dk_empties[kv_buf_id])
+                tile_count += 1
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
+                clc_phase_consumer ^= 1
+
+        # reduction
+        with tlx.async_task(num_warps=4, registers=88):
+            blk_idx = 0
+            tile_count = 0
+            tile_id = start_pid
+            clc_phase_producer = 1
+            clc_phase_consumer = 0
+            while tile_id != -1:
+                tlx.clc_producer(clc_context, clc_phase_producer)
+                clc_phase_producer ^= 1
+
                 off_chz, off_bh, start_m, _, num_steps = bwd_calculate_offsets(
-                    tile_idx,
+                    tile_id,
                     n_tile_num,
                     num_pid_m,
                     stride_z,
@@ -1299,145 +1562,49 @@ def _attn_bwd_ws(
 
                     # wait for dq = tl.dot(tl.trans(dsT), k)
                     tlx.barrier_wait(dq_fulls[tmem_buf_id], tmem_phase)
-                    slice_size: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
-                    for slice_id in tl.static_range(EPILOGUE_SUBTILE):
+                    for slice_id in tl.static_range(DQ_REDUCE_ITERS):
+                        dq_smem_idx = slice_id % DQ_REDUCE_STAGES
                         dq_slice = tlx.local_slice(
                             dq_tiles[tmem_buf_id],
-                            [0, slice_id * slice_size],
-                            [BLOCK_M1, slice_size],
+                            [0, slice_id * DQ_REDUCE_NCOL],
+                            [BLOCK_M1, DQ_REDUCE_NCOL],
                         )
                         dq = tlx.local_load(dq_slice)
                         dq = dq * LN2
-                        desc_dq.atomic_add([(off_bh + curr_m).to(tl.int32), slice_id * slice_size], dq)
+                        tlx.async_descriptor_store_wait(DQ_REDUCE_STAGES - 1)
+                        tlx.local_store(
+                            dq_store_buf[dq_smem_idx],
+                            dq.to(tlx.dtype_of(desc_dq)),
+                        )
+                        tlx.fence("async_shared")
+                        tlx.async_descriptor_store(
+                            desc_dq,
+                            dq_store_buf[dq_smem_idx],
+                            [
+                                (off_bh + curr_m).to(tl.int32),
+                                slice_id * DQ_REDUCE_NCOL,
+                            ],
+                            store_reduce="add",
+                        )
 
                     # release dq
                     tlx.barrier_arrive(dq_empties[tmem_buf_id])
                     # Increment pointers.
                     curr_m += step_m
                     blk_idx += 1
-                tile_idx += num_progs
-
-        # compute
-        with tlx.async_task(num_warps=8, registers=192, replicate=1):
-            blk_idx = 0
-            for i in range(0, tiles_per_sm):
-                off_chz, off_bh, start_m, start_n, _ = bwd_calculate_offsets(
-                    tile_idx,
-                    n_tile_num,
-                    num_pid_m,
-                    stride_z,
-                    stride_h,
-                    stride_tok,
-                    H,
-                    N_CTX,
-                    BLOCK_M1,
-                    BLOCK_N1,
-                    GROUP_SIZE_M,
-                    STAGE,
-                )
-                start_block_n = start_n * BLOCK_N1
-                # offset pointers for batch/head
-                M_updated = M + off_chz
-                D_updated = D + off_chz
-                curr_m = start_m
-                step_m = BLOCK_M1
-                do_out_dtype = tlx.dtype_of(desc_do)
-                q_out_dtype = tlx.dtype_of(desc_q)
-                if STAGE & 1:
-                    curr_m, blk_idx = _bwd_compute_inner_loop(
-                        start_n,
-                        qk_fulls,
-                        qk_tiles,
-                        qk_empties,
-                        p_tiles,
-                        p_fulls,
-                        dp_empties,
-                        dp_fulls,
-                        dp_tiles,
-                        ds_tiles,
-                        ds_fulls,
-                        M_updated,
-                        D_updated,
-                        curr_m,
-                        blk_idx,
-                        step_m,
-                        do_out_dtype,
-                        q_out_dtype,
-                        N_CTX,
-                        NUM_BUFFERS_TMEM,
-                        NUM_BUFFERS_DS,
-                        BLOCK_M1,
-                        BLOCK_N1,
-                        STAGE=4 - STAGE,
-                        REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
-                    )
-                if STAGE & 2:
-                    curr_m, blk_idx = _bwd_compute_inner_loop(
-                        start_n,
-                        qk_fulls,
-                        qk_tiles,
-                        qk_empties,
-                        p_tiles,
-                        p_fulls,
-                        dp_empties,
-                        dp_fulls,
-                        dp_tiles,
-                        ds_tiles,
-                        ds_fulls,
-                        M_updated,
-                        D_updated,
-                        curr_m,
-                        blk_idx,
-                        step_m,
-                        do_out_dtype,
-                        q_out_dtype,
-                        N_CTX,
-                        NUM_BUFFERS_TMEM,
-                        NUM_BUFFERS_DS,
-                        BLOCK_M1,
-                        BLOCK_N1,
-                        STAGE=2,
-                        REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
-                    )
-
-                kv_buf_id, kv_phase = _get_bufidx_phase(i, NUM_BUFFERS_KV)
-
-                tlx.barrier_wait(dv_fulls[kv_buf_id], kv_phase)
-                slice_size: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
-                for slice_id in tl.static_range(EPILOGUE_SUBTILE):
-                    dv_slice = tlx.local_slice(
-                        dv_tiles[kv_buf_id],
-                        [0, slice_id * slice_size],
-                        [BLOCK_N1, slice_size],
-                    )
-                    dv = tlx.local_load(dv_slice)
-                    desc_dv.store(
-                        [(off_bh + start_block_n).to(tl.int32), slice_id * slice_size],
-                        dv.to(tlx.dtype_of(desc_dv)),
-                    )
-                tlx.barrier_arrive(dv_empties[kv_buf_id])
-                tlx.barrier_wait(dk_fulls[kv_buf_id], kv_phase)
-                for slice_id in tl.static_range(EPILOGUE_SUBTILE):
-                    dk_slice = tlx.local_slice(
-                        dk_tiles[kv_buf_id],
-                        [0, slice_id * slice_size],
-                        [BLOCK_N1, slice_size],
-                    )
-                    dk = tlx.local_load(dk_slice)
-                    dk *= sm_scale
-                    desc_dk.store(
-                        [(off_bh + start_block_n).to(tl.int32), slice_id * slice_size],
-                        dk.to(tlx.dtype_of(desc_dk)),
-                    )
-                tlx.barrier_arrive(dk_empties[kv_buf_id])
-                tile_idx += num_progs
+                tile_count += 1
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
+                clc_phase_consumer ^= 1
 
         # mma
-        with tlx.async_task(num_warps=1, registers=48):
+        with tlx.async_task(num_warps=1, registers=24):
             blk_idx = 0
-            for i in range(0, tiles_per_sm):
+            tile_count = 0
+            tile_id = start_pid
+            clc_phase_consumer = 0
+            while tile_id != -1:
                 _, _, _, _, num_steps = bwd_calculate_offsets(
-                    tile_idx,
+                    tile_id,
                     n_tile_num,
                     num_pid_m,
                     stride_z,
@@ -1451,9 +1618,9 @@ def _attn_bwd_ws(
                     STAGE,
                 )
 
-                kv_buf_id, kv_phase = _get_bufidx_phase(i, NUM_BUFFERS_KV)
-                tlx.barrier_wait(k_fulls[kv_buf_id], kv_phase)
-                tlx.barrier_wait(v_fulls[kv_buf_id], kv_phase)
+                kv_buf_id, kv_phase = _get_bufidx_phase(tile_count, NUM_BUFFERS_KV)
+                # K readiness guaranteed by q_fulls (bundled in prologue).
+                # V readiness guaranteed by do_fulls (bundled in prologue).
 
                 # BLOCK_N1 must be a multiple of BLOCK_M1, otherwise the code wouldn't work.
                 tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
@@ -1534,6 +1701,20 @@ def _attn_bwd_ws(
                     tmem_buf_id_prev, tmem_phase_prev = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_TMEM)
                     ds_buf_id_prev, ds_phase_prev = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_DS)
 
+                    # Compute dk += tl.dot(dsT, tl.trans(qT)) from previous iteration
+                    # Read dsT from TMEM (faster MMA read path than SMEM).
+                    # dk must read dsT_tmem BEFORE dq writes dq_tiles (same TMEM slot).
+                    tlx.barrier_wait(dsT_tmem_fulls[ds_buf_id_prev], ds_phase_prev)
+                    tlx.async_dot(
+                        dsT_tmem_tiles[ds_buf_id_prev],
+                        q_tiles[q_buf_id_prev],
+                        dk_tiles[kv_buf_id],
+                        use_acc=(j - 1) > 0,
+                        mBarriers=[
+                            q_empties[q_buf_id_prev],
+                        ],
+                    )
+
                     # Compute dq = tl.dot(tl.trans(dsT), k) from previous iteration
                     tlx.barrier_wait(ds_fulls[ds_buf_id_prev], ds_phase_prev)
                     tlx.barrier_wait(dq_empties[tmem_buf_id_prev], tmem_phase_prev ^ 1)
@@ -1545,17 +1726,6 @@ def _attn_bwd_ws(
                         use_acc=False,
                         mBarriers=[
                             dq_fulls[tmem_buf_id_prev],
-                        ],
-                    )
-
-                    # Compute dk += tl.dot(dsT, tl.trans(qT)) from previous iteration
-                    tlx.async_dot(
-                        ds_tiles[ds_buf_id_prev],
-                        q_tiles[q_buf_id_prev],
-                        dk_tiles[kv_buf_id],
-                        use_acc=(j - 1) > 0,
-                        mBarriers=[
-                            q_empties[q_buf_id_prev],
                         ],
                     )
 
@@ -1595,9 +1765,10 @@ def _attn_bwd_ws(
                 tmem_buf_id, tmem_phase = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_TMEM)
                 ds_buf_id, ds_phase = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_DS)
                 # Compute dk += tl.dot(dsT, tl.trans(qT))
-                tlx.barrier_wait(ds_fulls[ds_buf_id], ds_phase)
+                # Read dsT from TMEM (faster MMA read path than SMEM).
+                tlx.barrier_wait(dsT_tmem_fulls[ds_buf_id], ds_phase)
                 tlx.async_dot(
-                    ds_tiles[ds_buf_id],
+                    dsT_tmem_tiles[ds_buf_id],
                     q_tiles[q_buf_id],
                     dk_tiles[kv_buf_id],
                     use_acc=num_steps > 1,
@@ -1605,6 +1776,7 @@ def _attn_bwd_ws(
                 )
 
                 # Compute dq = tl.dot(tl.trans(dsT), k)
+                tlx.barrier_wait(ds_fulls[ds_buf_id], ds_phase)
                 tlx.barrier_wait(dq_empties[tmem_buf_id], tmem_phase ^ 1)
                 dsT_view = tlx.local_trans(ds_tiles[ds_buf_id])
                 tlx.async_dot(
@@ -1616,15 +1788,20 @@ def _attn_bwd_ws(
                         dq_fulls[tmem_buf_id],
                     ],
                 )
-                tlx.tcgen05_commit(k_empties[kv_buf_id])
-                tile_idx += num_progs
+                tlx.tcgen05_commit(k_mma_done[kv_buf_id])
+                tile_count += 1
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
+                clc_phase_consumer ^= 1
 
         # load
         with tlx.async_task(num_warps=1, registers=88):
             blk_idx = 0
-            for i in range(0, tiles_per_sm):
-                _, off_bh, start_m, start_n, num_steps = bwd_calculate_offsets(
-                    tile_idx,
+            tile_count = 0
+            tile_id = start_pid
+            clc_phase_consumer = 0
+            while tile_id != -1:
+                off_chz, off_bh, start_m, start_n, num_steps = bwd_calculate_offsets(
+                    tile_id,
                     n_tile_num,
                     num_pid_m,
                     stride_z,
@@ -1638,23 +1815,22 @@ def _attn_bwd_ws(
                     STAGE,
                 )
                 start_block_n = start_n * BLOCK_N1
-                # Load K
-                kv_buf_id, kv_phase = _get_bufidx_phase(i, NUM_BUFFERS_KV)
+                kv_buf_id, kv_phase = _get_bufidx_phase(tile_count, NUM_BUFFERS_KV)
+
+                # Load K+Q bundled on q_fulls (prologue: first m_block includes K)
+                curr_m = start_m
+                step_m = BLOCK_M1
+                q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
                 tlx.barrier_wait(k_empties[kv_buf_id], kv_phase ^ 1)
-                tlx.barrier_expect_bytes(k_fulls[kv_buf_id], K_BYTES_PER_ELEM * BLOCK_N1 * HEAD_DIM)
+                tlx.barrier_wait(q_empties[q_buf_id], q_phase ^ 1)
+                tlx.barrier_expect_bytes(
+                    q_fulls[q_buf_id], K_BYTES_PER_ELEM * BLOCK_N1 * HEAD_DIM + Q_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
                 tlx.async_descriptor_load(
                     desc_k,
                     k_tiles[kv_buf_id],
                     [(off_bh + start_block_n).to(tl.int32), 0],
-                    k_fulls[kv_buf_id],
+                    q_fulls[q_buf_id],
                 )
-
-                # Load Q
-                curr_m = start_m
-                step_m = BLOCK_M1
-                q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
-                tlx.barrier_wait(q_empties[q_buf_id], q_phase ^ 1)
-                tlx.barrier_expect_bytes(q_fulls[q_buf_id], Q_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
                 tlx.async_descriptor_load(
                     desc_q,
                     q_tiles[q_buf_id],
@@ -1662,26 +1838,45 @@ def _attn_bwd_ws(
                     q_fulls[q_buf_id],
                 )
 
-                # Note: No need for v_empties because k is finished after v.
-                # Load V
-                tlx.barrier_expect_bytes(v_fulls[kv_buf_id], V_BYTES_PER_ELEM * BLOCK_N1 * HEAD_DIM)
+                # Load M
+                m_buf_id, _ = _get_bufidx_phase(blk_idx, M_STAGE)
+                tlx.barrier_expect_bytes(m_fulls[m_buf_id], 4 * BLOCK_M1)
+                tlx.async_descriptor_load(
+                    desc_m,
+                    sM_tiles[m_buf_id],
+                    [(off_chz + curr_m).to(tl.int32)],
+                    m_fulls[m_buf_id],
+                )
+
+                # Load V+dO bundled on do_fulls (prologue: first m_block includes V)
+                do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
+                tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
+                tlx.barrier_expect_bytes(
+                    do_fulls[do_buf_id],
+                    V_BYTES_PER_ELEM * BLOCK_N1 * HEAD_DIM + DO_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
                 tlx.async_descriptor_load(
                     desc_v,
                     v_tiles[kv_buf_id],
                     [(off_bh + start_block_n).to(tl.int32), 0],
-                    v_fulls[kv_buf_id],
+                    do_fulls[do_buf_id],
                 )
-
-                # Load dO
-                do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
-                tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
-                tlx.barrier_expect_bytes(do_fulls[do_buf_id], DO_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
                 tlx.async_descriptor_load(
                     desc_do,
                     do_tiles[do_buf_id],
                     [(off_bh + curr_m).to(tl.int32), 0],
                     do_fulls[do_buf_id],
                 )
+
+                # Load D
+                d_buf_id, _ = _get_bufidx_phase(blk_idx, D_STAGE)
+                tlx.barrier_expect_bytes(d_fulls[d_buf_id], 4 * BLOCK_M1)
+                tlx.async_descriptor_load(
+                    desc_delta,
+                    sD_tiles[d_buf_id],
+                    [(off_chz + curr_m).to(tl.int32)],
+                    d_fulls[d_buf_id],
+                )
+
                 curr_m += step_m
                 blk_idx += 1
 
@@ -1698,6 +1893,16 @@ def _attn_bwd_ws(
                         q_fulls[q_buf_id],
                     )
 
+                    # Load M
+                    m_buf_id, _ = _get_bufidx_phase(blk_idx, M_STAGE)
+                    tlx.barrier_expect_bytes(m_fulls[m_buf_id], 4 * BLOCK_M1)
+                    tlx.async_descriptor_load(
+                        desc_m,
+                        sM_tiles[m_buf_id],
+                        [(off_chz + curr_m).to(tl.int32)],
+                        m_fulls[m_buf_id],
+                    )
+
                     # Load dO
                     tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
                     tlx.barrier_expect_bytes(do_fulls[do_buf_id], DO_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
@@ -1707,10 +1912,23 @@ def _attn_bwd_ws(
                         [(off_bh + curr_m).to(tl.int32), 0],
                         do_fulls[do_buf_id],
                     )
+
+                    # Load D
+                    d_buf_id, _ = _get_bufidx_phase(blk_idx, D_STAGE)
+                    tlx.barrier_expect_bytes(d_fulls[d_buf_id], 4 * BLOCK_M1)
+                    tlx.async_descriptor_load(
+                        desc_delta,
+                        sD_tiles[d_buf_id],
+                        [(off_chz + curr_m).to(tl.int32)],
+                        d_fulls[d_buf_id],
+                    )
+
                     curr_m += step_m
                     blk_idx += 1
 
-                tile_idx += num_progs
+                tile_count += 1
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
+                clc_phase_consumer ^= 1
 
 
 class _attention(torch.autograd.Function):
@@ -1762,17 +1980,7 @@ class _attention(torch.autograd.Function):
 
         triton.set_allocator(alloc_fn)
 
-        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-
-        def grid(META):
-            return (
-                min(
-                    NUM_SMS,
-                    triton.cdiv(q.shape[2], META["BLOCK_M"]) * q.shape[0] * q.shape[1],
-                ),
-                1,
-                1,
-            )
+        grid = lambda META: (triton.cdiv(q.shape[2], META["BLOCK_M"]) * q.shape[0] * q.shape[1], )
 
         ctx.grid = grid
         _attn_fwd_ws[grid](
@@ -1865,29 +2073,30 @@ class _attention(torch.autograd.Function):
             strides=[HEAD_DIM, 1],
             block_shape=dummy_block,
         )
+        desc_m = TensorDescriptor(
+            M,
+            shape=[BATCH * N_HEAD * N_CTX],
+            strides=[1],
+            block_shape=[1],
+        )
+        desc_delta = TensorDescriptor(
+            delta,
+            shape=[BATCH * N_HEAD * N_CTX],
+            strides=[1],
+            block_shape=[1],
+        )
 
         def alloc_fn(size: int, align: int, _):
             return torch.empty(size, dtype=torch.int8, device="cuda")
 
         triton.set_allocator(alloc_fn)
 
-        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-
-        def grid_persistent(meta):
-            return (
-                min(
-                    NUM_SMS,
-                    # tiles along N (K/V)
-                    triton.cdiv(N_CTX, meta["BLOCK_N1"]) * BATCH * N_HEAD,
-                ),
-                1,
-                1,
-            )
+        grid_persistent = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_N1"]) * BATCH * N_HEAD, )
 
         stage = 3 if ctx.causal else 1
         _attn_bwd_ws[grid_persistent](
             desc_q, desc_k, desc_v, ctx.sm_scale, desc_do, desc_dq, desc_dk, desc_dv,  #
-            M, delta,  #
+            desc_m, desc_delta,  #
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
             N_HEAD, BATCH,  #
             N_CTX,  #
@@ -1925,8 +2134,7 @@ def attention(q, k, v, sm_scale, causal, config=None):
 
     triton.set_allocator(alloc_fn)
 
-    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-    grid = (min(NUM_SMS, triton.cdiv(q.shape[2], config["BLOCK_M"]) * q.shape[0] * q.shape[1]), 1, 1)
+    grid = (triton.cdiv(q.shape[2], config["BLOCK_M"]) * q.shape[0] * q.shape[1], 1, 1)
     _attn_fwd_ws.fn[grid](
         sm_scale,
         M,

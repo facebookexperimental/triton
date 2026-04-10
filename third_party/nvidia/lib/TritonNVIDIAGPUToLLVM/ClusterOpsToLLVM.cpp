@@ -65,6 +65,20 @@ struct ClusterWaitOpConversion
   }
 };
 
+struct ClusterSize1DOpConversion
+    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::ClusterSize1DOp> {
+  using ConvertOpToLLVMPattern<
+      triton::nvidia_gpu::ClusterSize1DOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::ClusterSize1DOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+
+    rewriter.replaceOpWithNewOp<NVVM::ClusterDim>(op, i32_ty);
+    return success();
+  }
+};
+
 // lower MapToRemoteBufferOp
 struct MapToRemoteBufferOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::MapToRemoteBufferOp> {
@@ -94,8 +108,8 @@ struct MapToRemoteBufferOpConversion
     Type convertedPtrTy = convertedRetTy.getBody()[0];
 
     // map an SMEM ptr in mem space 3 to a ptr in mem space 7
-    auto remotePtr = rewriter.create<NVVM::MapaOp>(
-        loc, convertedPtrTy, srcSmemPtr, adaptor.getCtaRank());
+    auto remotePtr = NVVM::MapaOp::create(rewriter, loc, convertedPtrTy,
+                                          srcSmemPtr, adaptor.getCtaRank());
 
     // everything stays the same except base ptr comparing to srcSmemObj
     auto dstSmemObj = SharedMemoryObject(
@@ -113,6 +127,7 @@ void mlir::triton::NVIDIA::populateClusterOpsToLLVMPatterns(
     PatternBenefit benefit) {
   patterns.add<ClusterArriveOpConversion>(typeConverter, benefit);
   patterns.add<ClusterWaitOpConversion>(typeConverter, benefit);
+  patterns.add<ClusterSize1DOpConversion>(typeConverter, benefit);
   patterns.add<MapToRemoteBufferOpConversion>(typeConverter, benefit);
   return;
 }

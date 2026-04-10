@@ -7,8 +7,8 @@ import argparse
 import triton_kernels
 import triton_kernels.roofline as roofline
 import triton_kernels.swiglu
-from triton_kernels.matmul_ogs import matmul_ogs, PrecisionConfig, FlexCtx, FnSpecs, FusedActivation
-from triton_kernels.target_info import get_cdna_version
+from triton_kernels.matmul import matmul, PrecisionConfig, FlexCtx, FnSpecs, FusedActivation
+from triton_kernels.target_info import get_cdna_version, cuda_capability_geq
 import distributed as triton_dist
 from triton_kernels.tensor_details import layout
 from bench_utils import quantize_weight
@@ -43,7 +43,8 @@ def bench_mlp(batch_per_expt, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_d
     opt1 = dict()
     opt2 = dict()
     if w_dtype == "mx4":
-        num_warps = 4 if batch <= 512 else 8
+        # on hopper we only use 8 warps when weight is scaled
+        num_warps = 4 if batch <= 512 and cuda_capability_geq(10, 0) else 8
         value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(mx_axis=1)
         scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
             mx_axis=1, num_warps=num_warps)
@@ -57,10 +58,11 @@ def bench_mlp(batch_per_expt, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_d
     wg, wg_flex, wg_scale = quantize_weight(wg, "bf16")
     w1, w1_flex, w1_scale = quantize_weight(w1, w_dtype, **opt1)
     w2, w2_flex, w2_scale = quantize_weight(w2, w_dtype, **opt2)
-    pcg = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=wg_flex), weight_scale=wg_scale)
-    act = FusedActivation(FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit")), (1.0, 1.0), 2)
-    pc1 = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w1_flex), weight_scale=w1_scale)
-    pc2 = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w2_flex), weight_scale=w2_scale)
+    pcg = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=wg_flex), b_mx_scale=wg_scale)
+    act = FusedActivation(FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit"), reduction_n=2),
+                          (1.0, 1.0))
+    pc1 = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w1_flex), b_mx_scale=w1_scale)
+    pc2 = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w2_flex), b_mx_scale=w2_scale)
 
     # -- benchmark --
     x_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp8": torch.float8_e4m3fn}[x_dtype]
@@ -69,6 +71,9 @@ def bench_mlp(batch_per_expt, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_d
         x_dtype = torch.float8_e4m3fnuz
 
     input_x = torch.randn((batch // DP, dim1), device=dev)
+    expt_assignment = triton_dist.create_expt_assignment(EP, n_expts_tot, torch.device(dev))
+    triton_dist.initialize_matmul(batch, dim1, dim2, n_expts_act, n_expts_tot, input_x.dtype)
+
     # run layer
     fpath = Path(tempfile.mktemp())
     proton.start(str(fpath), hook="triton")
@@ -76,17 +81,17 @@ def bench_mlp(batch_per_expt, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_d
     xg = input_x.to(wg.dtype if n_expts_tot > 1 else input_x.dtype)
     for i in range(100):
         if n_expts_tot > 1:  # sparse
-            logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
+            logits = matmul(xg, wg, bg, precision_config=pcg)
             x, rdata, gather_indx, scatter_indx, metadata = triton_dist.routing(input_x, logits, n_expts_act, EP=EP,
-                                                                                TP=TP)
+                                                                                TP=TP, expt_assignment=expt_assignment,
+                                                                                mode="ep_sharding")
         else:  # dense
             x = triton_dist.all_gather(input_x, dim=0)
             rdata, gather_indx, scatter_indx, metadata = None, None, None, None
         if x.nelement() > 0:
-            x = matmul_ogs(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1, fused_activation=act)
-            x = matmul_ogs(x, w2, b2 if rank % TP == 0 else None, rdata, scatter_indx=scatter_indx,
-                           precision_config=pc2)
-        x = triton_dist.reduce_scatter(x, metadata=metadata, dim=0)
+            x = matmul(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1, fused_activation=act)
+            x = matmul(x, w2, b2 if rank % TP == 0 else None, rdata, scatter_indx=scatter_indx, precision_config=pc2)
+        x = triton_dist.reduce_scatter(x, n_expts_act, metadata=metadata, expt_assignment=expt_assignment)
     proton.finalize()
     return roofline.parse_profile(fpath.with_suffix(".hatchet"), useful_op_regex=".*matmul.*")
 
@@ -136,6 +141,8 @@ if __name__ == "__main__":
         parser.add_argument("--name", type=str, choices=["dense", "gpt-oss-x2"])
         parser.add_argument("--quantized", action="store_true", default=False)
         args = parser.parse_args()
+        if args.tp > 1:
+            raise NotImplementedError("TP>1 is not supported yet in distributed mode.")
         dtypes = quantized_dtypes if args.quantized else dense_dtypes
         if args.name == "dense":
             assert args.ep == 1, "EP must be 1 for dense"

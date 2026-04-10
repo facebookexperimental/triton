@@ -5,13 +5,9 @@ import torch
 import triton
 
 from triton.language.extra.tlx.tutorials.blackwell_gemm_ws import (
-    matmul as _blackwell_gemm_ws,
-    matmul_warp_barrier as _blackwell_gemm_ws_warp_barrier,
-)
+    matmul as _blackwell_gemm_ws, )
 from triton.language.extra.tlx.tutorials.blackwell_gemm_clc import (
-    matmul as _blackwell_gemm_clc,
-    matmul_warp_barrier as _blackwell_gemm_clc_warp_barrier,
-)
+    matmul as _blackwell_gemm_clc, )
 from triton.language.extra.tlx.tutorials.blackwell_gemm_pipelined import (
     matmul as _blackwell_gemm_pipelined, )
 from triton.language.extra.tlx.tutorials.blackwell_gemm_2cta import (
@@ -23,6 +19,8 @@ from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent im
     _attn_fwd_ws as _blackwell_fa_fwd_ws,
     _host_descriptor_pre_hook as _blackwell_fa_fwd_pre_hook,
 )
+from triton.language.extra.tlx.tutorials.blackwell_fa_clc import (
+    attention as _blackwell_fa_clc, )
 from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent_mxfp8 import (
     attention as _blackwell_fa_ws_pipelined_persistent_mxfp8,
     generate_attention_inputs as _generate_mxfp8_attention_inputs,
@@ -36,9 +34,7 @@ from triton.language.extra.tlx.tutorials.blackwell_fa_ws import (
 from triton.language.extra.tlx.tutorials.hopper_gemm_pipelined import (
     matmul as _hopper_gemm_pipelined, )
 from triton.language.extra.tlx.tutorials.hopper_gemm_ws import (
-    matmul as _hopper_gemm_ws,
-    matmul_warp_barrier as _hopper_gemm_ws_warp_barrier,
-)
+    matmul as _hopper_gemm_ws, )
 from triton.language.extra.tlx.tutorials.hopper_fa_ws_pipelined_pingpong_persistent import (
     attention as _hopper_fa_ws_pipelined_pingpong_persistent, )
 from triton.language.extra.tlx.tutorials.hopper_fa_ws_pipelined_pingpong import (
@@ -48,7 +44,13 @@ from triton.language.extra.tlx.tutorials.hopper_fa_ws_pipelined import (
 from triton.language.extra.tlx.tutorials.hopper_fa_ws import (
     attention as _hopper_fa_ws, )
 
-from triton._internal_testing import is_blackwell, is_hopper
+from triton.language.extra.tlx.tutorials.testing.multi_cta_layer_norm import (
+    multi_cta_layernorm as _multi_cta_layernorm,
+    multi_cta_layernorm_2d as _multi_cta_layernorm_2d,
+)
+
+from triton._internal_testing import is_blackwell, is_hopper, is_hopper_or_newer
+from triton.language.extra.tlx.tutorials.testing.gemm_shapes import BLACKWELL_GEMM_WS as _BLACKWELL_GEMM_WS_MORE_SHAPES
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -109,6 +111,43 @@ class Gemm:
             "NUM_MMA_WARPS": 8,
             "NUM_MMA_GROUPS": 2,
             "EPILOGUE_SUBTILE": False,
+            "NUM_CTAS": 1,
+        },
+        "blackwell_gemm_ws_warp_barrier": {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 256,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 8,
+            "NUM_SMEM_BUFFERS": 2,
+            "NUM_TMEM_BUFFERS": 2,
+            "NUM_MMA_GROUPS": 1,
+            "EPILOGUE_SUBTILE": 1,
+            "NUM_CTAS": 1,
+            "SPLIT_K": 1,
+            "INTERLEAVE_EPILOGUE": 0,
+            "USE_WARP_BARRIER": True,
+        },
+        "blackwell_gemm_clc_warp_barrier": {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 256,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 8,
+            "NUM_SMEM_BUFFERS": 2,
+            "NUM_TMEM_BUFFERS": 2,
+            "EPILOGUE_SUBTILE": True,
+            "USE_WARP_BARRIER": True,
+        },
+        "hopper_gemm_ws_warp_barrier": {
+            "BM": 128,
+            "BN": 256,
+            "BK": 64,
+            "GROUP_SIZE_M": 8,
+            "NUM_STAGES": 3,
+            "NUM_MMA_WARPS": 8,
+            "NUM_MMA_GROUPS": 2,
+            "EPILOGUE_SUBTILE": False,
+            "USE_WARP_BARRIER": True,
+            "NUM_CTAS": 1,
         },
     }
 
@@ -119,8 +158,8 @@ class Gemm:
         for shape in shapes:
             M, N, K = shape
             torch.manual_seed(0)
-            a = torch.randn((M, K), device=DEVICE, dtype=dtype)
-            b = torch.randn((K, N), device=DEVICE, dtype=dtype)
+            a = (torch.randn((M, K), device=DEVICE, dtype=dtype) + 1) / K
+            b = (torch.randn((K, N), device=DEVICE, dtype=dtype) + 1) / K
             torch_output = torch.matmul(a, b)
             triton_output = matmul_fn(a, b, config=config)
             torch.testing.assert_close(triton_output, torch_output)
@@ -161,6 +200,16 @@ class FlashAttention:
             "NUM_MMA_GROUPS": 2,
         },
         "blackwell_fa_ws_pipelined_persistent": {
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "NUM_BUFFERS_Q": 1,
+            "NUM_BUFFERS_KV": 3,
+            "NUM_BUFFERS_QK": 1,
+            "NUM_MMA_GROUPS": 2,
+            "NUM_MMA_SLICES": 2,
+            "GROUP_SIZE_N": 1,
+        },
+        "blackwell_fa_clc": {
             "BLOCK_M": 256,
             "BLOCK_N": 128,
             "NUM_BUFFERS_Q": 1,
@@ -247,6 +296,16 @@ def test_blackwell_gemm_ws(dtype):
     Gemm.run_test(_blackwell_gemm_ws, Gemm.CONFIGS["blackwell_gemm_ws"], dtype=dtype)
 
 
+@pytest.mark.parametrize(
+    "shape",
+    _BLACKWELL_GEMM_WS_MORE_SHAPES,
+    ids=[f"{m}x{n}x{k}" for m, n, k in _BLACKWELL_GEMM_WS_MORE_SHAPES],
+)
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_more_shapes(shape):
+    Gemm.run_test(_blackwell_gemm_ws, Gemm.CONFIGS["blackwell_gemm_ws"], shapes=[shape], dtype=torch.bfloat16)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_gemm_clc(dtype):
@@ -255,14 +314,14 @@ def test_blackwell_gemm_clc(dtype):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
-def test_blackwell_gemm_ws_warp_barrier(dtype):
-    Gemm.run_test(_blackwell_gemm_ws_warp_barrier, Gemm.CONFIGS["blackwell_gemm_ws"], dtype=dtype)
+def test_blackwell_gemm_warp_barrier(dtype):
+    Gemm.run_test(_blackwell_gemm_ws, Gemm.CONFIGS["blackwell_gemm_ws_warp_barrier"], dtype=dtype)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_gemm_clc_warp_barrier(dtype):
-    Gemm.run_test(_blackwell_gemm_clc_warp_barrier, Gemm.CONFIGS["blackwell_gemm_clc"], dtype=dtype)
+    Gemm.run_test(_blackwell_gemm_clc, Gemm.CONFIGS["blackwell_gemm_clc_warp_barrier"], dtype=dtype)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
@@ -346,6 +405,22 @@ def test_blackwell_fa_ws_pipelined_persistent_warp_barrier(causal, RESCALE_OPT, 
         ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
         tri_out = _blackwell_fa_ws_pipelined_persistent(q, k, v, sm_scale, causal, config=config)
         torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
+
+
+@pytest.mark.parametrize("RESCALE_OPT,USE_WHERE", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("N_CTX", [1024, 2048, 4096, 8192])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_fa_clc(N_CTX, causal, RESCALE_OPT, USE_WHERE):
+    config = FlashAttention.CONFIGS["blackwell_fa_clc"].copy()
+    config["RESCALE_OPT"] = RESCALE_OPT
+    config["USE_WHERE"] = USE_WHERE
+    sm_scale = 0.5
+    Z, H, HEAD_DIM = 4, 8, 128
+    q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
+    ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
+    tri_out = _blackwell_fa_clc(q, k, v, sm_scale, causal, config=config)
+    torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
 
 
 @pytest.mark.parametrize("causal", [True, False])
@@ -434,6 +509,8 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
         desc_dq = TensorDescriptor(dq, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
         desc_dk = TensorDescriptor(dk, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
         desc_dv = TensorDescriptor(dv, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+        desc_m = TensorDescriptor(M, shape=[Z * H * N_CTX], strides=[1], block_shape=[1])
+        desc_delta = TensorDescriptor(delta, shape=[Z * H * N_CTX], strides=[1], block_shape=[1])
 
         BLK_SLICE_FACTOR = 2
 
@@ -449,8 +526,8 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
             desc_dq,
             desc_dk,
             desc_dv,
-            M,
-            delta,
+            desc_m,
+            desc_delta,
             q.stride(0),
             q.stride(1),
             q.stride(2),
@@ -474,8 +551,6 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_fa_ws_pipelined_persistent_mxfp8(HEAD_DIM, causal):
     config = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent_mxfp8"]
-    if HEAD_DIM == 128:
-        pytest.skip("HEAD_DIM=128 not supported yet")
     sm_scale = 0.5
     dtype = torch.float8_e4m3fn
     shapes = [(8, 16, 1024)]
@@ -490,9 +565,21 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8(HEAD_DIM, causal):
                                                               config=config)
         tri_out = tri_out.to(ref_out.dtype)
         if causal:
-            atol = 0.1
+            if HEAD_DIM == 64:
+                # Max atol measured was 0.09375
+                atol = 0.1
+            else:
+                # Max atol measured was 0.10986328125
+                assert HEAD_DIM == 128
+                atol = 0.11
         else:
-            atol = 0.03
+            if HEAD_DIM == 64:
+                # Max atol measured was 0.029296875
+                atol = 0.03
+            else:
+                # Max atol measured was 0.0625
+                assert HEAD_DIM == 128
+                atol = 0.07
         torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
 
 
@@ -513,7 +600,7 @@ def test_hopper_gemm_ws():
 
 @pytest.mark.skipif(not is_hopper(), reason="Requires Hopper GPU")
 def test_hopper_gemm_ws_warp_barrier():
-    Gemm.run_test(_hopper_gemm_ws_warp_barrier, Gemm.CONFIGS["hopper_gemm_ws"])
+    Gemm.run_test(_hopper_gemm_ws, Gemm.CONFIGS["hopper_gemm_ws_warp_barrier"])
 
 
 # =============================================================================
@@ -567,3 +654,41 @@ def test_hopper_fa_ws_pipelined_pingpong_persistent():
         ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
         tri_out = _hopper_fa_ws_pipelined_pingpong_persistent(q, k, v, sm_scale, config=config)
         torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
+
+
+# =============================================================================
+# Multi-CTA Layer Normalization Tests
+# =============================================================================
+
+
+class LayerNorm:
+    """Common utilities for multi-CTA layer normalization tests."""
+
+    # (M, N) shapes
+    SHAPES = [(4, 16384), (1152, 16384), (4, 32768)]
+
+    @staticmethod
+    def run_test(layernorm_fn, shapes=None, dtype=torch.float16, num_ctas=2, **kwargs):
+        if shapes is None:
+            shapes = LayerNorm.SHAPES
+        eps = 1e-5
+        for M, N in shapes:
+            torch.manual_seed(0)
+            x = torch.randn(M, N, device=DEVICE, dtype=dtype)
+            weight = torch.randn(N, device=DEVICE, dtype=dtype)
+            bias = torch.randn(N, device=DEVICE, dtype=dtype)
+            ref_out = torch.nn.functional.layer_norm(x, (N, ), weight, bias, eps)
+            tri_out, _, _ = layernorm_fn(x, weight, bias, eps, NUM_CTAS=num_ctas, **kwargs)
+            torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("num_ctas", [1, 2, 4], ids=["1cta", "2cta", "4cta"])
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or Blackwell GPU")
+def test_multi_cta_layer_norm(num_ctas):
+    LayerNorm.run_test(_multi_cta_layernorm, num_ctas=num_ctas)
+
+
+@pytest.mark.parametrize("num_ctas", [2, 4], ids=["2cta", "4cta"])
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or Blackwell GPU")
+def test_multi_cta_layer_norm_2d(num_ctas):
+    LayerNorm.run_test(_multi_cta_layernorm_2d, num_ctas=num_ctas, BLOCK_SIZE_M=4)

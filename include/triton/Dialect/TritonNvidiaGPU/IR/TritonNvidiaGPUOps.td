@@ -75,12 +75,39 @@ def TTNG_FenceOp : TTNG_Op<"fence"> {
   }];
 }
 
+def TTNG_FenceMBarrierInitReleaseClusterOp : TTNG_Op<
+    "fence_mbarrier_init_release_cluster"> {
+  let summary = "fence mbarrier init release.cluster";
+
+  let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+    static bool isSupported(int computeCapability) {
+      return computeCapability >= 90;
+    }
+  }];
+}
+
 def TTNG_ClusterArriveOp : TTNG_Op<"cluster_arrive", []> {
   let arguments = (ins I1Attr:$relaxed);
   let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
 }
 
 def TTNG_ClusterWaitOp : TTNG_Op<"cluster_wait", []> {
+  let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
+}
+
+def TTNG_ClusterSize1DOp : TTNG_Op<"cluster_size_1d", [Pure]> {
+  let summary = "Returns the number of CTAs in a cluster across all dimensions";
+  let description = [{
+    Returns the total number of CTAs in the current cluster, equal to the
+    product of the cluster dimensions across all axes. Maps to the PTX
+    special register `%cluster_nctarank`.
+  }];
+  let results = (outs I32:$result);
   let assemblyFormat = "attr-dict";
 }
 
@@ -427,7 +454,8 @@ def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local",
     I1:$pred,
     DefaultValuedAttr<TT_CacheModifierAttr, "triton::CacheModifier::NONE">:$cache,
     DefaultValuedAttr<TT_EvictionPolicyAttr, "triton::EvictionPolicy::NORMAL">:$evict,
-    DefaultValuedAttr<BoolAttr, "false">:$isVolatile
+    DefaultValuedAttr<BoolAttr, "false">:$isVolatile,
+    DefaultValuedAttr<BoolAttr, "false">:$two_cta
   );
 
   let assemblyFormat = [{
@@ -459,6 +487,33 @@ def TTNG_AsyncTMAPrefetchOp : TTNG_Op<"async_tma_prefetch", [MemoryEffects<[MemW
     $desc `[` $coord `]` `,` $pred
     oilist(`evictionPolicy` `=` $evict)
     attr-dict `:` qualified(type($desc))
+  }];
+}
+
+def TTNG_PrefetchOp : TTNG_Op<"prefetch", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
+  let summary = "prefetch data from global memory into cache using pointer";
+
+  let description = [{
+    This operation issues a non-blocking prefetch hint for pointer-based
+    scattered/gather loads.  Unlike `async_tma_prefetch` which works on tensor
+    descriptors, this supports raw pointer tensors.  It emits a per-element
+    `prefetch.global.{L1|L2}` PTX instruction.
+
+    The `cache` attribute controls the cache level:
+    - CA (cache-all) → `prefetch.global.L1` (prefetch into L1 and L2)
+    - CG (cache-global) → `prefetch.global.L2` (prefetch into L2 only)
+  }];
+
+  let arguments = (ins
+    TT_PtrLike:$ptr,
+    Optional<TT_BoolLike>:$mask,
+    DefaultValuedAttr<TT_CacheModifierAttr, "::mlir::triton::CacheModifier::CG">:$cache
+  );
+
+  let assemblyFormat = [{
+    $ptr (`,` $mask^)?
+    oilist(`cacheModifier` `=` $cache)
+    attr-dict `:` type($ptr) (`,` type($mask)^)?
   }];
 }
 
@@ -502,6 +557,7 @@ def TTNG_AsyncTMACopyLocalToGlobalOp : TTNG_Op<"async_tma_copy_local_to_global">
     oilist(`evictionPolicy` `=` $evict)
     attr-dict `:` qualified(type($desc)) `,` qualified(type($src)) (`->` type($token)^)?
   }];
+  let hasVerifier = 1;
 }
 
 def TTNG_AsyncTMAReduceOp : TTNG_Op<"async_tma_reduce", [MemoryEffects<[MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>]> {
@@ -581,7 +637,7 @@ def TTNG_AsyncTMAScatterOp : TTNG_Op<"async_tma_scatter"> {
   let hasVerifier = 1;
 }
 
-def TTNG_TMAStoreWaitOp : TTNG_Op<"async_tma_store_wait"> {
+def TTNG_TMAStoreWaitOp : TTNG_Op<"async_tma_store_wait", [MemWaitOpTrait]> {
   let summary = "wait until all the inputs are read.";
   let arguments = (ins I32Attr:$pendings);
   let description = [{
@@ -1041,6 +1097,24 @@ def TTNG_TensormapFenceproxyAcquireOp: TTNG_Op<
   let arguments = (ins TT_PtrType:$desc_ptr);
   let assemblyFormat = [{
     $desc_ptr attr-dict `:` qualified(type($desc_ptr))
+  }];
+}
+
+def TTNG_PrefetchTensormapOp: TTNG_Op<
+  "prefetch_tensormap",
+  [MemoryEffects<[MemWrite<GlobalMemory>]>]
+> {
+  let summary = "Prefetch a tensormap descriptor object into cache";
+
+  let description = [{
+    Prefetches a TMA tensor map descriptor into cache. This is a
+    performance hint that warms the cache for a subsequent TMA operation
+    that references the same descriptor.
+  }];
+
+  let arguments = (ins Arg<TT_TensorDescType, "", [MemRead<GlobalMemory>]>:$desc);
+  let assemblyFormat = [{
+    $desc attr-dict `:` qualified(type($desc))
   }];
 }
 

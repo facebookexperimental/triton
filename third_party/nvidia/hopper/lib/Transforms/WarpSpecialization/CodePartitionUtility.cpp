@@ -609,7 +609,7 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   // These operations don't participate in buffer cycling, so return constant 0.
   if (!parentForOp) {
     LDBG("getAccumCount: operation outside loop, returning constant 0");
-    return builder.create<arith::ConstantIndexOp>(op->getLoc(), 0);
+    return arith::ConstantIndexOp::create(builder, op->getLoc(), 0);
   }
 
   auto *pOp = op->getParentOp();

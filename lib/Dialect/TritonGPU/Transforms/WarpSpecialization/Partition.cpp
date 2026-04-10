@@ -1,5 +1,6 @@
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/ADT/SCCIterator.h"
@@ -15,11 +16,11 @@ using namespace triton::gpu;
 //===----------------------------------------------------------------------===//
 
 bool Partition::hasOp(Operation *op) const {
-  auto partitionIds = getPartitionIds(op);
-  if (!partitionIds) {
+  if (!hasPartition(op)) {
     return false;
   }
-  return partitionIds->contains(getIndex());
+  auto partitionIds = getPartitionIds(op);
+  return partitionIds.contains(getIndex());
 }
 
 void Partition::iterateInputs(scf::ForOp loop,
@@ -28,6 +29,9 @@ void Partition::iterateInputs(scf::ForOp loop,
     visitNestedOperands(op, [&](OpOperand &operand) {
       // Ignore implicit captures.
       Value value = operand.get();
+      std::optional<SetVector<int>> partitionIds;
+      if (hasPartition(value.getDefiningOp()))
+        partitionIds = getPartitionIds(value.getDefiningOp());
       if (value.getParentBlock() != loop.getBody())
         return;
       if (auto arg = dyn_cast<BlockArgument>(value)) {
@@ -39,7 +43,6 @@ void Partition::iterateInputs(scf::ForOp loop,
         assert(llvm::is_contained(loop.getRegionIterArgs(), arg));
         callback(operand);
       } else {
-        auto partitionIds = getPartitionIds(value.getDefiningOp());
         if (!partitionIds || !partitionIds->contains(getIndex())) {
           // This value originates from a different partition in the same
           // iteration.
@@ -63,19 +66,20 @@ void Partition::iterateOutputs(
         // The user is outside the loop, so it's a post-loop operation.
         // Use the operation directly.
         owner = use.getOwner();
-        auto ids = getPartitionIds(owner);
-        if (!ids || !ids->contains(getIndex())) {
+        if (!hasPartition(owner) ||
+            !getPartitionIds(owner).contains(getIndex())) {
           callback(owner, use);
         }
         continue;
       }
-
+      std::optional<SetVector<int>> partitionIds;
+      if (hasPartition(owner))
+        partitionIds = getPartitionIds(owner);
       if (isa<scf::YieldOp>(owner)) {
         // This value is used in a subsequent iteration.
         callback(owner, use);
       } else {
-        auto ids = getPartitionIds(owner);
-        if (!ids || !ids->contains(getIndex())) {
+        if (!partitionIds || !partitionIds->contains(getIndex())) {
           // This value is used in a different partition in the same iteration.
           callback(owner, use);
         }
@@ -140,13 +144,8 @@ const Partition *PartitionSet::getPartition(unsigned idx) const {
 
 Partition *PartitionSet::getPartition(Operation *op) {
   auto id = getPartitionIds(op);
-  assert(id && id->size() == 1);
-  return getPartition((*id)[0]);
-}
-
-bool PartitionSet::isInRootPartition(Operation *op) {
-  auto partitionIds = getPartitionIds(op);
-  return !partitionIds || partitionIds->size() == getNumPartitions();
+  assert(id.size() == 1);
+  return getPartition(id[0]);
 }
 
 FailureOr<PartitionSet> PartitionSet::fromLoop(scf::ForOp loop) {
@@ -171,14 +170,19 @@ FailureOr<PartitionSet> PartitionSet::fromLoop(scf::ForOp loop) {
         std::make_unique<Partition>(idx, stage.getInt()));
   }
 
-  for (Operation &op : loop.getBody()->without_terminator()) {
-    if (auto attrs = getPartitionIds(&op)) {
-      for (auto idx : *attrs) {
-        if (idx < 0 || idx >= result.partitions.size())
-          return mlir::emitError(op.getLoc(), "invalid partition index ")
-                 << idx;
-        result.partitions[idx]->addOp(&op);
-      }
+  SmallVector<Operation *> annotatedOps;
+  loop->walk([&](Operation *op) {
+    if (hasPartition(op)) {
+      annotatedOps.push_back(op);
+    }
+  });
+
+  for (auto op : annotatedOps) {
+    auto attrs = getPartitionIds(op);
+    for (auto idx : attrs) {
+      if (idx < 0 || idx >= result.partitions.size())
+        return mlir::emitError(op->getLoc(), "invalid partition index ") << idx;
+      result.partitions[idx]->addOp(op);
     }
   }
 
@@ -216,7 +220,31 @@ namespace mlir::triton::gpu {
 
 void setPartition(Operation *op, ArrayRef<int> partitionIds) {
   Builder b(op->getContext());
-  op->setAttr(kPartitionAttrName, b.getDenseI32ArrayAttr(partitionIds));
+  auto sorted = llvm::to_vector(partitionIds);
+  llvm::sort(sorted);
+  op->setAttr(kPartitionAttrName, b.getDenseI32ArrayAttr(sorted));
+  for (auto &region : op->getRegions()) {
+    for (auto &block : region.getBlocks()) {
+      auto terminator = block.getTerminator();
+      terminator->setAttr(kPartitionAttrName, b.getDenseI32ArrayAttr(sorted));
+    }
+  }
+}
+
+void setPartitionOutputs(Operation *op,
+                         ArrayRef<SetVector<int>> partitionOutputsIds) {
+  if (partitionOutputsIds.empty()) {
+    op->removeAttr(kPartitionOutputsAttrName);
+    return;
+  }
+  SmallVector<Attribute> attrs;
+  Builder b(op->getContext());
+  for (auto partitionIds : partitionOutputsIds) {
+    auto sorted = llvm::to_vector(partitionIds);
+    llvm::sort(sorted);
+    attrs.push_back(b.getDenseI32ArrayAttr(sorted));
+  }
+  op->setAttr(kPartitionOutputsAttrName, b.getArrayAttr(attrs));
 }
 
 void setPartition(Operation *op, const SetVector<int> &partitionIds) {
@@ -239,24 +267,9 @@ void setPartition(Operation *op, const SetVector<Partition *> &partitions) {
   setPartition(op, partitionIds);
 }
 
-std::optional<SetVector<int>> getPartitionIds(Operation *op) {
-  if (!op) {
-    return std::nullopt;
-  }
-  auto attrs = op->getAttr(kPartitionAttrName);
-  if (!attrs) {
-    return std::nullopt;
-  }
-
-  assert(isa<DenseI32ArrayAttr>(attrs));
-
-  SetVector<int> partitionIds;
-  for (auto id : cast<DenseI32ArrayAttr>(attrs).asArrayRef()) {
-    partitionIds.insert(id);
-  }
-  return partitionIds;
+void setWarpSpecializeTag(Operation *op, int tag) {
+  Builder b(op->getContext());
+  op->setAttr(kWarpSpecializeTagAttrName, b.getI32IntegerAttr(tag));
 }
-
-bool hasPartition(Operation *op) { return getPartitionIds(op) != std::nullopt; }
 
 } // namespace mlir::triton::gpu

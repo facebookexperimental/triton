@@ -43,7 +43,7 @@ static Value createAlloc(scf::ForOp &forOp, const TMAStore &store) {
       ttg::MemDescType::get(ty.getShape(), ty.getElementType(), encoding,
                             sharedMemorySpace, /*mutableMemory*/ true);
   Value alloc =
-      builder.create<ttg::LocalAllocOp>(store.op->getLoc(), memdescType);
+      ttg::LocalAllocOp::create(builder, store.op->getLoc(), memdescType);
   return alloc;
 }
 
@@ -55,29 +55,29 @@ static void createTMAAsyncCopy(scf::ForOp forOp, const TMAStore &store,
 
   // Put wait before the local_store make the store truly async. We know
   // that we are the only user of the CopyLocalToGlobal.
-  builder.create<ttng::TMAStoreWaitOp>(loc, 0);
-  builder.create<ttg::LocalStoreOp>(loc, store.src, alloc);
-  builder.create<ttng::FenceAsyncSharedOp>(loc, false);
+  ttng::TMAStoreWaitOp::create(builder, loc, 0);
+  ttg::LocalStoreOp::create(builder, loc, store.src, alloc);
+  ttng::FenceAsyncSharedOp::create(builder, loc, false);
   auto desc = store.desc;
   if (auto storeOp = dyn_cast<tt::DescriptorStoreOp>(store.op)) {
     auto indices = ttng::translateTMAIndices(
         builder, storeOp.getLoc(),
         storeOp.getDesc().getType().getBlockType().getEncoding(),
         storeOp.getIndices());
-    builder.create<ttng::AsyncTMACopyLocalToGlobalOp>(
-        loc, desc, storeOp.getIndices(), alloc);
+    ttng::AsyncTMACopyLocalToGlobalOp::create(builder, loc, desc,
+                                              storeOp.getIndices(), alloc);
   } else if (auto reduceOp = dyn_cast<tt::DescriptorReduceOp>(store.op)) {
     auto indices = ttng::translateTMAIndices(
         builder, reduceOp.getLoc(),
         reduceOp.getDesc().getType().getBlockType().getEncoding(),
         reduceOp.getIndices());
-    builder.create<ttng::AsyncTMAReduceOp>(loc, reduceOp.getKind(), desc,
-                                           reduceOp.getIndices(), alloc,
-                                           triton::EvictionPolicy::NORMAL);
+    ttng::AsyncTMAReduceOp::create(builder, loc, reduceOp.getKind(), desc,
+                                   reduceOp.getIndices(), alloc,
+                                   triton::EvictionPolicy::NORMAL);
   } else {
     auto scatterOp = cast<tt::DescriptorScatterOp>(store.op);
-    builder.create<ttng::AsyncTMAScatterOp>(loc, desc, scatterOp.getXOffsets(),
-                                            scatterOp.getYOffset(), alloc);
+    ttng::AsyncTMAScatterOp::create(builder, loc, desc, scatterOp.getXOffsets(),
+                                    scatterOp.getYOffset(), alloc);
   }
 
   store.op->erase();
@@ -120,9 +120,9 @@ bool mlir::triton::pipelineTMAStores(scf::ForOp forOp) {
   // Deallocate shared memory buffers.
   OpBuilder builder(forOp);
   builder.setInsertionPointAfter(forOp);
-  builder.create<ttng::TMAStoreWaitOp>(forOp->getLoc(), 0);
+  ttng::TMAStoreWaitOp::create(builder, forOp->getLoc(), 0);
   for (auto it : storeToAlloc) {
-    builder.create<ttg::LocalDeallocOp>(forOp->getLoc(), it.second);
+    ttg::LocalDeallocOp::create(builder, forOp->getLoc(), it.second);
   }
 
   if (hasDeviceSideTMA) {

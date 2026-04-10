@@ -1,8 +1,7 @@
 #include "mlir/Analysis/TopologicalSortUtils.h"
-#include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/Iterators.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/Pass/Pass.h"
-#include "nvidia/hopper/lib/Transforms/WarpSpecialization/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/MMAv5PipelineUtility.h"
@@ -94,7 +93,9 @@ static bool hasDefPartition(scf::ForOp loop, Operation *op,
     Operation *op = worklist.pop_back_val();
     if (!seen.insert(op).second)
       continue;
-    auto partitionIds = getPartitionIds(op);
+    std::optional<SetVector<int>> partitionIds;
+    if (hasPartition(op))
+      partitionIds = getPartitionIds(op);
     if (partitionIds && partitionIds->size() != partitions.getNumPartitions())
       return true;
     iterateDefs(loop, op,
@@ -133,9 +134,8 @@ static void scheduleDependencies(scf::ForOp loop, PartitionSet &partitions,
 
 // Recursively schedule the users of an operation, stopping when
 // encountering an operation that is already assigned.
-// If \p partition is null, a new partition will be created if needed.
-static Partition *scheduleUsers(scf::ForOp loop, PartitionSet &schedule,
-                                Partition *partition, Operation *op) {
+static void scheduleUsers(scf::ForOp loop, PartitionSet &partitions,
+                          Partition *partition, Operation *op) {
   SmallVector<OpOperand *> uses;
   for (OpOperand &use : op->getUses())
     uses.push_back(&use);
@@ -150,118 +150,49 @@ static Partition *scheduleUsers(scf::ForOp loop, PartitionSet &schedule,
       continue;
     }
 
-    if (hasPartition(user))
+    if (!trySetPartition(user, partition))
       continue;
-    if (!partition)
-      partition = schedule.addPartition(/* stage is unused */ 0);
-    if (!hasPartition(user))
-      setPartition(user, partition);
     for (OpOperand &use : user->getUses())
       uses.push_back(&use);
   }
-  return partition;
 }
 
-// Schedule post-loop operations (operations outside and after the loop) into
-// the epilogue partition. This recursively schedules operations that consume
-// loop results and their transitive users.
-static void schedulePostLoopOps(scf::ForOp loop, PartitionSet &schedule,
-                                Partition *epiloguePartition) {
-  SmallVector<OpOperand *> uses;
-
-  // Collect all uses of the loop's results.
-  for (OpResult result : loop.getResults()) {
-    for (OpOperand &use : result.getUses())
-      uses.push_back(&use);
-  }
-
-  // Recursively schedule all post-loop users.
-  DenseSet<Operation *> visited;
-  while (!uses.empty()) {
-    OpOperand *use = uses.pop_back_val();
-    Operation *user = use->getOwner();
-
-    // Skip if already visited or scheduled.
-    if (!visited.insert(user).second || hasPartition(user))
-      continue;
-
-    // Only schedule operations that are outside the loop.
-    if (loop->isAncestor(user))
-      continue;
-
-    // Schedule this post-loop operation to the epilogue partition.
-    if (!hasPartition(user))
-      setPartition(user, epiloguePartition);
-
-    // Add all users of this operation to process transitively.
-    for (OpResult result : user->getResults())
-      for (OpOperand &nextUse : result.getUses())
-        uses.push_back(&nextUse);
-  }
-}
-
-// Given a partitioning scheme, determine an initial schedule by performing a
-// first-order partition assignment to the operations in the scheme and its
-// users and/or dependencies. This sets up the initial partitioning of the ops.
-static std::optional<PartitionSet> getInitialSchedule(scf::ForOp mainLoop) {
-  // Check for an existing schedule.
-  if (FailureOr<PartitionSet> scheduleOr = PartitionSet::fromLoop(mainLoop);
-      succeeded(scheduleOr))
-    return {std::move(*scheduleOr)};
-
-  // Start by creating the default partition, a partition for for all loads, and
-  // a partition for all MMAs.
-  PartitionSet schedule;
-  Partition *defaultPartition = schedule.addPartition(0);
-  Partition *mmaPartition = schedule.addPartition(1);
-  Partition *loadPartition = schedule.addPartition(0);
-
-  SmallVector<scf::ForOp> loops{mainLoop.getOps<scf::ForOp>()};
-  loops.push_back(mainLoop);
-
-  // Find loads to pipeline.
+SetVector<Partition *> getInitialPartitions(scf::ForOp loop,
+                                            PartitionSet &partitions,
+                                            Partition *defaultPartition,
+                                            Partition *mmaPartition,
+                                            Partition *loadPartition) {
   SmallVector<Operation *> loadsAndAllocs;
-  for (auto loop : loops) {
-    for (Operation &op : loop.getOps()) {
-      // Only TMA loads are supported at the moment.
-      if (!isa<DescriptorLoadOp, DescriptorGatherOp>(op))
-        continue;
-      if (!hasPartition(&op))
-        setPartition(&op, loadPartition);
-      loadsAndAllocs.push_back(&op);
+  SmallVector<ttng::MMAv5OpInterface> mmas;
+  SetVector<Partition *> userPartitions;
+  userPartitions.insert(defaultPartition);
 
+  for (Operation &op : loop.getOps()) {
+    if (auto innerFor = dyn_cast<scf::ForOp>(op)) {
+      for (auto userPartition :
+           getInitialPartitions(innerFor, partitions, defaultPartition,
+                                mmaPartition, loadPartition)) {
+        userPartitions.insert(userPartition);
+      }
+    } else if (isa<DescriptorLoadOp, DescriptorGatherOp>(op)) {
+      setPartition(&op, loadPartition);
+      loadsAndAllocs.push_back(&op);
       // Local alloc users of the load with matching encoding will cause the
       // underlying buffer to be pass through. Keep track of them.
       SharedEncodingTrait sharedEnc = getSharedEncoding(&op);
       for (Operation *user : op.getUsers()) {
         if (auto alloc = dyn_cast<LocalAllocOp>(user)) {
           if (sharedEnc == alloc.getType().getEncoding()) {
-            if (!hasPartition(alloc))
-              setPartition(alloc, loadPartition);
+            setPartition(alloc, loadPartition);
             loadsAndAllocs.push_back(alloc);
           }
         } else if (isa<ttng::TMEMAllocOp>(user)) {
-          if (!hasPartition(user))
-            setPartition(user, loadPartition);
+          setPartition(user, loadPartition);
           loadsAndAllocs.push_back(user);
         }
       }
-    }
-  }
-
-  // Ensure the epilogue stores are in a separate partition.
-  auto epiloguePartition = schedule.addPartition(/* stage is unused */ 0);
-  for (auto loop : loops)
-    for (DescriptorStoreOp op : loop.getOps<DescriptorStoreOp>())
-      if (!hasPartition(op))
-        setPartition(op, epiloguePartition);
-
-  // Find MMAs to pipeline.
-  SmallVector<ttng::MMAv5OpInterface> mmas;
-  for (auto loop : loops) {
-    for (auto mmaOp : loop.getOps<ttng::MMAv5OpInterface>()) {
-      if (!hasPartition(mmaOp))
-        setPartition(mmaOp, mmaPartition);
+    } else if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(op)) {
+      setPartition(mmaOp, mmaPartition);
       mmas.push_back(mmaOp);
 
       // If the store is unrelated to the use of the MMA, then it gets placed in
@@ -270,10 +201,8 @@ static std::optional<PartitionSet> getInitialSchedule(scf::ForOp mainLoop) {
           findDefOpInLoop(loop, mmaOp.getAccDep()));
       if (!ttng::hasAccReadModifyWrite(mmaOp, loop) && storeOp &&
           loop.isDefinedOutsideOfLoop(storeOp.getSrc()))
-        if (!hasPartition(storeOp))
-          setPartition(storeOp, mmaPartition);
-    }
-    for (auto mmaOp : mmas) {
+        setPartition(storeOp, mmaPartition);
+
       // Look for views into the operands.
       SmallVector<Operation *> operandViews;
       for (Value operand : mmaOp->getOperands()) {
@@ -288,97 +217,121 @@ static std::optional<PartitionSet> getInitialSchedule(scf::ForOp mainLoop) {
         // Duplicate the op if necessary to ensure that the MMA partition is the
         // only user.
         if (!llvm::all_of(op->getUsers(), [&](Operation *user) {
-              auto ids = getPartitionIds(user);
-              return ids && ids->contains(mmaPartition->getIndex());
+              return mmaPartition->hasOp(user);
             })) {
           Operation *newOp = OpBuilder(op).clone(*op);
           op->replaceUsesWithIf(newOp->getResults(), [&](OpOperand &use) {
-            auto ids = getPartitionIds(use.getOwner());
-            return ids && ids->contains(mmaPartition->getIndex());
+            return mmaPartition->hasOp(use.getOwner());
           });
           op = newOp;
         }
 
-        if (!hasPartition(op))
-          setPartition(op, mmaPartition);
+        setPartition(op, mmaPartition);
         if (Operation *defOp = op->getOperand(0).getDefiningOp())
           operandViews.push_back(defOp);
       }
     }
   }
 
-  // If there are no loads or MMAs, don't warp specialize.
-  if (loadsAndAllocs.empty() && mmas.empty())
-    return std::nullopt;
+  if (loadPartition->empty() && mmaPartition->empty()) {
+    return {};
+  }
 
-  // Disable scheduling exp on the default partition for now, because we want
-  // softmax on separate partitions.
   // Propagate defs of exp.
-  // for (scf::ForOp loop : loops) {
-  //   for (Operation &op : loop.getOps()) {
-  //     if (!isa<math::Exp2Op, ElementwiseInlineAsmOp>(op))
-  //       continue;
-  //     int elementCount = 0;
-  //     for (Type type : op.getResultTypes()) {
-  //       if (auto tensorTy = dyn_cast<RankedTensorType>(type))
-  //         elementCount += tensorTy.getNumElements();
-  //     }
-  //     if (elementCount > 256) {
-  //       if (!hasPartition(&op))
-  //         setPartition(&op, defaultPartition);
-  //       scheduleDependencies(loop, schedule, defaultPartition, &op);
-  //     }
-  //   }
-  // }
+  for (Operation &op : loop.getOps()) {
+    if (!isa<math::Exp2Op, ElementwiseInlineAsmOp>(op))
+      continue;
+    int elementCount = 0;
+    for (Type type : op.getResultTypes()) {
+      if (auto tensorTy = dyn_cast<RankedTensorType>(type))
+        elementCount += tensorTy.getNumElements();
+    }
+    if (elementCount > 256) {
+      setPartition(&op, defaultPartition);
+      scheduleDependencies(loop, partitions, defaultPartition, &op);
+    }
+  }
 
   // Propagate users of loads and MMAs.
-  // Load users go to the default partition.
   for (Operation *loadOrAlloc : loadsAndAllocs)
-    scheduleUsers(loadOrAlloc->getParentOfType<scf::ForOp>(), schedule,
-                  defaultPartition, loadOrAlloc);
+    scheduleUsers(loop, partitions, defaultPartition, loadOrAlloc);
 
-  // HACK: If the user is in the next iteration, put it in the default
-  // partition. This ensures that the correction goes to the default partition,
-  // because it uses acc.
-  for (auto mmaOp : mmas) {
-    for (OpOperand &use : mmaOp->getUses()) {
-      auto loop = mmaOp->getParentOfType<scf::ForOp>();
-      if (use.getOwner() != loop.getBody()->getTerminator())
-        continue;
-      for (OpOperand &use :
-           loop.getRegionIterArg(use.getOperandNumber()).getUses()) {
-        if (!hasPartition(use.getOwner()))
-          setPartition(use.getOwner(), defaultPartition);
-        scheduleUsers(loop, schedule, defaultPartition, use.getOwner());
+  while (userPartitions.size() < mmas.size()) {
+    userPartitions.insert(partitions.addPartition(userPartitions.size()));
+  }
+  for (auto [mmaOp, userPartition] :
+       llvm::reverse(llvm::zip(mmas, userPartitions))) {
+    scheduleUsers(loop, partitions, userPartition, mmaOp);
+  }
+
+  // Annotate remaining unannotated tmem loads, for example those outside of the
+  // inner loop
+  for (ttng::TMEMLoadOp tmemLoad : loop.getOps<ttng::TMEMLoadOp>()) {
+    if (hasPartition(tmemLoad)) {
+      continue;
+    }
+
+    if (userPartitions.size() == 1) {
+      setPartition(tmemLoad, defaultPartition);
+    } else {
+      auto tmem = tmemLoad.getSrc();
+      SetVector<Partition *> tmemUserPartitions;
+      for (auto user : tmem.getUsers()) {
+        if (!hasPartition(user)) {
+          continue;
+        }
+        if (auto partition = partitions.getPartition(user);
+            partition != mmaPartition) {
+          tmemUserPartitions.insert(partition);
+        }
       }
-      break;
+      // TMEM should only used by MMA and one user partition
+      assert(tmemUserPartitions.size() == 1);
+      setPartition(tmemLoad, tmemUserPartitions.front());
     }
   }
 
-  // for causal, separate according to loops
-  // The users of MMAs go to a new partition for each MMA.
-  DenseMap<Operation *, Partition *> mmaToPartition;
-  SmallVector<Operation *> inFirstLoop;
-  for (auto mmaOp : llvm::reverse(mmas)) {
-    if (mmaOp->getParentOfType<scf::ForOp>() == loops[0]) {
-      auto part = scheduleUsers(mmaOp->getParentOfType<scf::ForOp>(), schedule,
-                                nullptr, mmaOp);
-      mmaToPartition[mmaOp.getOperation()] = part;
-      inFirstLoop.push_back(mmaOp.getOperation());
+  // Annotate the inner loop with its body partitions
+  if (!loop->hasAttr(kWarpSpecializeAttrName)) {
+    SetVector<Partition *> bodyPartitons;
+    for (Operation &op : loop.getOps()) {
+      if (hasPartition(&op)) {
+        for (auto id : getPartitionIds(&op)) {
+          bodyPartitons.insert(partitions.getPartition(id));
+        }
+      }
     }
-  }
-  unsigned Idx = 0;
-  for (auto mmaOp : llvm::reverse(mmas)) {
-    if (loops.size() == 3 && mmaOp->getParentOfType<scf::ForOp>() == loops[1]) {
-      // find the partition for the correspoding mmaOp in first loop
-      auto *part = mmaToPartition[inFirstLoop[Idx]];
-      scheduleUsers(mmaOp->getParentOfType<scf::ForOp>(), schedule, part,
-                    mmaOp);
-      ++Idx;
-    }
+
+    setPartition(loop, bodyPartitons);
   }
 
-  return schedule;
+  return userPartitions;
+}
+
+// Given a partitioning scheme, determine an initial schedule by performing a
+// first-order partition assignment to the operations in the scheme and its
+// users and/or dependencies. This sets up the initial partitioning of the ops.
+static std::optional<PartitionSet> getInitialPartitions(scf::ForOp loop) {
+  // Check for an existing partition set.
+  if (FailureOr<PartitionSet> partitionsOr = PartitionSet::fromLoop(loop);
+      succeeded(partitionsOr))
+    return {std::move(*partitionsOr)};
+  // Start by creating the default partition, a partition for for all loads, and
+  // a partition for all MMAs.
+  PartitionSet partitions;
+  Partition *defaultPartition = partitions.addPartition(0);
+  Partition *mmaPartition = partitions.addPartition(1);
+  Partition *loadPartition = partitions.addPartition(0);
+
+  getInitialPartitions(loop, partitions, defaultPartition, mmaPartition,
+                       loadPartition);
+
+  // If there are no loads or MMAs, don't warp specialize.
+  if (loadPartition->empty() && mmaPartition->empty()) {
+    return std::nullopt;
+  }
+
+  return partitions;
 }
 
 namespace {
@@ -440,6 +393,12 @@ struct OpClusters : public llvm::MapVector<Operation *, OpCluster *> {
 // forming contiguous clusters from the unassigned operations and then deciding
 // what to do with the operations in that cluster.
 void propagatePartitions(scf::ForOp loop, PartitionSet &partitions) {
+  for (Operation &op : loop.getOps()) {
+    if (auto innerFor = dyn_cast<scf::ForOp>(op)) {
+      propagatePartitions(innerFor, partitions);
+    }
+  }
+
   OpClusters opClusters;
 
   for (Partition &partition : partitions.getPartitions()) {
@@ -478,10 +437,11 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &partitions) {
     // Look at the definitions directly feeding into this operation.
     iterateDefs(loop, op, [&](OpResult def) {
       Operation *defOp = def.getDefiningOp();
-      if (auto partitionIds = getPartitionIds(defOp)) {
+      if (hasPartition(defOp)) {
+        auto partitionIds = getPartitionIds(defOp);
         // The input originates from an operation already assigned to a
         // partition. Add this as a def partition.
-        for (auto id : *partitionIds) {
+        for (auto id : partitionIds) {
           cluster->defPartitions.insert(partitions.getPartition(id));
         }
       } else {
@@ -505,10 +465,11 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &partitions) {
     });
     // Check the users of the operation.
     iterateUsers(loop, op, [&](Operation *user) {
-      if (auto partitionIds = getPartitionIds(user)) {
+      if (hasPartition(user)) {
+        auto partitionIds = getPartitionIds(user);
         // If the user is already assigned to a partition, add that partition as
         // one of the sink partitions.
-        for (auto id : *partitionIds) {
+        for (auto id : partitionIds) {
           cluster->sinkPartitions.insert(partitions.getPartition(id));
         }
         return;
@@ -537,15 +498,6 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &partitions) {
     assert(!cluster.defPartitions.empty());
     assert(llvm::all_of(cluster.ops,
                         [&](Operation *op) { return !hasPartition(op); }));
-
-    // If there are multiple def or sink partitions, don't know what to do.
-    // Assign the whole cluster to its own partition.
-    if (cluster.defPartitions.size() > 1 || cluster.sinkPartitions.size() > 1) {
-      Partition *newPartition = partitions.addPartition(0);
-      for (Operation *op : cluster.ops)
-        setPartition(op, newPartition);
-      continue;
-    }
 
     // If there is no sink partition, this means there is a backedge somewhere,
     // for now assign the cluster to the def partition.
@@ -607,15 +559,14 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &partitions) {
 void rematerializeBroadcasts(PartitionSet &partitions, OpOperand *use) {
   static_assert(
       std::is_base_of_v<OpTrait::OneResult<BroadcastOp>, BroadcastOp> &&
-      std::is_base_of_v<OpTrait::OneResult<ExpandDimsOp>, ExpandDimsOp> &&
-      std::is_base_of_v<OpTrait::OneResult<ConvertLayoutOp>, ConvertLayoutOp>);
+      std::is_base_of_v<OpTrait::OneResult<ExpandDimsOp>, ExpandDimsOp>);
 
   Operation *defOp = use->get().getDefiningOp();
-  while (isa_and_nonnull<BroadcastOp, ExpandDimsOp, ConvertLayoutOp>(defOp)) {
+  while (isa_and_nonnull<BroadcastOp, ExpandDimsOp>(defOp)) {
     Operation *clone = OpBuilder(defOp).clone(*defOp);
+    assert(hasPartition(use->getOwner()) && "user not scheduled");
     auto userPartitionIds = getPartitionIds(use->getOwner());
-    assert(userPartitionIds && "user not scheduled");
-    for (auto id : *userPartitionIds) {
+    for (auto id : userPartitionIds) {
       Partition *userPartition = partitions.getPartition(id);
       setPartition(clone, userPartition);
     }
@@ -626,66 +577,375 @@ void rematerializeBroadcasts(PartitionSet &partitions, OpOperand *use) {
   }
 }
 
-/// Walk over \p loop and clone Broadcast/ExpandDims/ConvertLayout ops into each
-/// partition that they have users in. This reduces the amount of data that
-/// needs to be transferred through memory.
-void optimizeSchedule(scf::ForOp loop, PartitionSet &schedule) {
-  // Helper to get partition for an op, returning null if unscheduled.
-  auto getPartition = [&](Operation *op) -> Partition * {
-    auto ids = getPartitionIds(op);
-    if (!ids || ids->size() != 1)
-      return nullptr;
-    return schedule.getPartition(static_cast<unsigned>((*ids)[0]));
-  };
-
-  // Walk everything in reverse so that operations are visited before their
-  // operands.
-  loop.walk<WalkOrder::PostOrder, ReverseIterator>([&](Operation *op) {
-    if (!isa<BroadcastOp, ExpandDimsOp, ConvertLayoutOp>(op))
-      return;
-
-    Partition *partition = getPartition(op);
-    if (!partition)
-      return;
-
-    // Record all the other partitions in which we have users.
-    llvm::SmallDenseSet<Partition *, 2> userPartitions;
-    for (OpOperand &use : op->getUses()) {
-      Partition *userPartition = getPartition(use.getOwner());
-      if (!userPartition || userPartition == partition)
-        continue;
-      userPartitions.insert(userPartition);
+void optimizePartitions(scf::ForOp loop, PartitionSet &partitions) {
+  for (Operation &op : loop.getOps()) {
+    if (auto innerFor = dyn_cast<scf::ForOp>(op)) {
+      optimizePartitions(innerFor, partitions);
     }
+  }
 
-    for (auto *userPartition : userPartitions) {
-      // Clone the instruction into each user partition.
-      Operation *clone = OpBuilder(op).clone(*op);
-      setPartition(clone, userPartition);
-      // Replace all users in that partition with the clone.
-      op->replaceUsesWithIf(clone->getResults(), [&](OpOperand &otherUse) {
-        return getPartition(otherUse.getOwner()) == userPartition;
-      });
-    }
-  });
+  for (Partition &partition : partitions.getPartitions()) {
+    SmallVector<OpOperand *> uses;
+    partition.iterateOutputs(loop, [&](Operation *defOp, OpOperand &use) {
+      if (!isa<scf::YieldOp>(use.getOwner()))
+        uses.push_back(&use);
+    });
+    for (OpOperand *use : uses)
+      rematerializeBroadcasts(partitions, use);
+  }
 }
 
+void getUseOps(Value value, SetVector<Operation *> &useOps,
+               DenseSet<Value> &visited) {
+  if (!visited.insert(value).second)
+    return;
+  for (auto &use : value.getUses()) {
+    auto useOp = use.getOwner();
+    if (auto forOp = dyn_cast<scf::ForOp>(useOp)) {
+      if (use.getOperandNumber() < forOp.getNumControlOperands()) {
+        useOps.insert(forOp);
+      } else {
+        auto pos = use.getOperandNumber() - forOp.getNumControlOperands();
+        auto arg = forOp.getRegionIterArg(pos);
+        getUseOps(arg, useOps, visited);
+      }
+    } else if (isa<scf::YieldOp>(useOp)) {
+      auto parentOp = useOp->getParentOp();
+      Value arg;
+      if (auto forOp = dyn_cast<scf::ForOp>(parentOp)) {
+        arg = forOp.getRegionIterArg(use.getOperandNumber());
+      } else {
+        auto ifOp = cast<scf::IfOp>(parentOp);
+        arg = ifOp.getResults()[use.getOperandNumber()];
+      }
+      getUseOps(arg, useOps, visited);
+    } else {
+      useOps.insert(useOp);
+    }
+  }
+}
 // TODO: Implement a mutually-recursive traversal that can handle
 //       nested control flow structures (if/reduce/for operations).
 //       While we don't currently have use cases requiring this,
 //       implementing it would prepare for when it is needed.
-void assignRootPartition(scf::ForOp loop, PartitionSet &partitions) {
-  auto ctx = loop.getContext();
-  Builder b(ctx);
-  SetVector<Partition *> root;
-  for (int i = 0; i < partitions.getNumPartitions(); ++i) {
-    root.insert(partitions.getPartition(i));
+LogicalResult assignMissingPartitions(scf::ForOp loop,
+                                      PartitionSet &partitions) {
+  // For operations that have no partitions assigned, assign a partition set
+  // that is the union of all partition sets of its direct users.
+  auto isScalarOp = [](Operation *op) {
+    return llvm::all_of(op->getResultTypes(), [](Type type) {
+      return isa<FloatType, IntegerType>(type);
+    });
+  };
+
+  loop.walk([&](ttng::TMEMAllocOp allocOp) {
+    std::optional<int> mmaPartitionId, loadPartitionId, storePartitionId;
+    bool hasSIMT = false;
+    for (auto users : allocOp.getResult().getUsers()) {
+      if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(users)) {
+        if (hasPartition(mma)) {
+          mmaPartitionId = getPartitionIds(mma).front();
+        }
+      } else if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(users)) {
+        hasSIMT = true;
+        if (hasPartition(storeOp)) {
+          storePartitionId = getPartitionIds(storeOp).front();
+        }
+      } else {
+        auto loadOp = cast<ttng::TMEMLoadOp>(users);
+        hasSIMT = true;
+        if (hasPartition(loadOp)) {
+          loadPartitionId = getPartitionIds(loadOp).front();
+        }
+      }
+    }
+
+    assert(mmaPartitionId && "mma must have a partition");
+    if (!hasSIMT)
+      return WalkResult::advance();
+
+    assert((loadPartitionId || storePartitionId) &&
+           "at least one of load or store must have a partition");
+    if (loadPartitionId && storePartitionId) {
+      assert(loadPartitionId == storePartitionId &&
+             "load and store partitions must be in the same partition");
+    }
+    int simtPartitionId;
+    if (loadPartitionId) {
+      simtPartitionId = *loadPartitionId;
+    } else {
+      simtPartitionId = *storePartitionId;
+    }
+
+    for (auto user : allocOp->getUsers()) {
+      if (isa<ttng::TMEMLoadOp, ttng::TMEMStoreOp>(user)) {
+        if (!hasPartition(user)) {
+          SetVector<int> simtPartitionIds;
+          simtPartitionIds.insert(simtPartitionId);
+          setPartition(user, simtPartitionIds);
+        }
+      }
+    }
+    return WalkResult::advance();
+  });
+
+  llvm::MapVector<Operation *, SetVector<Operation *>> opsMap;
+  DenseMap<Operation *, DenseSet<int>> partitionMap;
+
+  loop.walk([&](Operation *op) {
+    if (op->getNumRegions() > 0)
+      return WalkResult::advance();
+
+    DenseSet<int> ids;
+    if (hasPartition(op)) {
+      auto partitionIds = getPartitionIds(op);
+      ids.insert(partitionIds.begin(), partitionIds.end());
+    }
+    partitionMap[op] = ids;
+
+    if (hasPartition(op) || isa<scf::YieldOp>(op))
+      return WalkResult::advance();
+
+    SetVector<Operation *> useOps;
+    DenseSet<Value> visited;
+    for (auto &use : op->getUses()) {
+      getUseOps(use.get(), useOps, visited);
+    }
+
+    opsMap[op] = useOps;
+    return WalkResult::advance();
+  });
+
+  std::function<void(Operation *, DenseSet<int> &)> getOpPartitionIds =
+      [&](Operation *op, DenseSet<int> &opPartitionIds) {
+        for (auto &region : op->getRegions()) {
+          for (auto &block : region.getBlocks()) {
+            for (auto &op_ : block.without_terminator()) {
+              auto op = &op_;
+              getOpPartitionIds(op, opPartitionIds);
+            }
+          }
+        }
+        auto partitionIds = partitionMap[op];
+        opPartitionIds.insert(partitionIds.begin(), partitionIds.end());
+      };
+
+  auto iteratePartitions = [&]() {
+    int maxIter = 100;
+    while (maxIter-- > 0) {
+      bool converged = true;
+      for (auto [op, useOps] : opsMap) {
+        auto oldPartitionIds = partitionMap[op];
+        auto newPartitionIds = oldPartitionIds;
+        for (auto useOp : useOps) {
+          getOpPartitionIds(useOp, newPartitionIds);
+        }
+        converged = converged && oldPartitionIds == newPartitionIds;
+        partitionMap[op] = newPartitionIds;
+      }
+      if (converged)
+        break;
+    }
+    if (maxIter <= 0) {
+      emitError(loop.getLoc(), "assignMissingPartitions failed to converge");
+      return failure();
+    }
+
+    for (auto [op, partitionIds] : partitionMap) {
+      if (partitionIds.empty())
+        continue;
+      setPartition(op,
+                   SetVector<int>(partitionIds.begin(), partitionIds.end()));
+    }
+    return success();
+  };
+  if (failed(iteratePartitions())) {
+    return failure();
   }
 
-  for (Operation &op : loop.getBody()->without_terminator()) {
-    if (!hasPartition(&op)) {
-      setPartition(&op, root);
+  // Work-around for use cases where the partitioner doesn't assign partitions
+  // to scalar operations. This handles remaining scalars that have no partition
+  // assignments by propagating partitions forward through the def-use chain.
+  // Example scenario:
+  //    %46 = scalar_op ..  @2     // has partition assignment
+  //    %47 = scalar_op %46        // no partition assignment
+  //    llvm.intr.assume %47: i1   // terminal use, no further uses
+  std::function<void(Operation *, SetVector<Operation *> &,
+                     DenseSet<Operation *> &)>
+      getDefOps = [&](Operation *op, SetVector<Operation *> &defOps,
+                      DenseSet<Operation *> &visited) {
+        if (!visited.insert(op).second)
+          return;
+        for (auto value : op->getOperands()) {
+          if (auto defOp = value.getDefiningOp()) {
+            defOps.insert(defOp);
+          }
+        }
+      };
+  opsMap.clear();
+  loop.walk([&](Operation *op) {
+    if (hasPartition(op))
+      return WalkResult::advance();
+    // skip region ops and their terminators
+    if (op->getNumRegions() > 0 ||
+        isa<scf::YieldOp, triton::ReduceReturnOp>(op))
+      return WalkResult::advance();
+
+    // skip non-scalar ops that return value
+    if (op->getNumResults() > 0 && !isScalarOp(op))
+      return WalkResult::advance();
+
+    SetVector<Operation *> defOps;
+    DenseSet<Operation *> visited;
+    getDefOps(op, defOps, visited);
+
+    opsMap[op] = defOps;
+
+    return WalkResult::advance();
+  });
+
+  if (failed(iteratePartitions())) {
+    return failure();
+  }
+
+  return success();
+}
+
+void verifyPartitions(scf::ForOp loop, PartitionSet &partitions) {
+  loop.walk([&](Operation *op) {
+    if (hasPartition(op))
+      return WalkResult::advance();
+    if (op->hasAttr(kWarpSpecializeAttrName))
+      return WalkResult::advance();
+    if (isa<scf::YieldOp, triton::ReduceReturnOp>(op))
+      return WalkResult::advance();
+    llvm_unreachable("no partition");
+  });
+}
+
+SetVector<int> getBlockPartitions(Block *block);
+SmallVector<SetVector<int>> getYieldPartitions(Block *block) {
+  auto terminator = block->getTerminator();
+  SmallVector<SetVector<int>> yieldPartitions(terminator->getNumOperands());
+  for (auto &opnd : terminator->getOpOperands()) {
+    auto op = opnd.get().getDefiningOp();
+    if (auto forOp = dyn_cast<scf::ForOp>(block->getParentOp());
+        forOp && isa<AsyncTokenType>(opnd.get().getType())) {
+      // Heuristic: when for-op yields an async-token, the output partition of
+      //            the token is that of its user.
+      // At the moment token must have only one use
+      auto arg = forOp.getRegionIterArg(opnd.getOperandNumber());
+      assert(arg.hasOneUse());
+      op = arg.getUses().begin()->getOwner();
+      assert(op);
+    }
+    if (!op)
+      continue;
+    std::optional<SetVector<int>> partitionIds;
+    if (hasPartition(op)) {
+      partitionIds = getPartitionIds(op);
+    }
+    if (op->getNumRegions() > 0) {
+      auto it = llvm::find(op->getResults(), opnd.get());
+      assert(it != op->getResults().end());
+      auto pos = it - op->getResults().begin();
+      partitionIds = getPartitionOutputs(op)[pos];
+    }
+    if (!partitionIds) {
+      // inherit from uses
+      partitionIds = SetVector<int>();
+      for (auto user : op->getUsers()) {
+        if (auto op1 = block->findAncestorOpInBlock(*user);
+            op1 && hasPartition(op1)) {
+          auto ids = getPartitionIds(op1);
+          partitionIds->insert(ids.begin(), ids.end());
+        }
+      }
+    }
+    yieldPartitions[opnd.getOperandNumber()] = *partitionIds;
+  }
+  return yieldPartitions;
+}
+
+SetVector<int>
+setOutputPartitions(Operation *op, SetVector<int> opPartitions,
+                    SmallVector<SetVector<int>> outputPartitions) {
+  for (auto ids : outputPartitions) {
+    opPartitions.insert(ids.begin(), ids.end());
+  }
+  setPartition(op, opPartitions);
+  setPartitionOutputs(op, outputPartitions);
+  return opPartitions;
+}
+
+SetVector<int> assignIfOpPartitions(scf::IfOp ifOp) {
+  auto ifOpPartitions = getBlockPartitions(ifOp.thenBlock());
+  auto thenYieldPartitions = getYieldPartitions(ifOp.thenBlock());
+  if (!ifOp.elseBlock()) {
+    return setOutputPartitions(ifOp, ifOpPartitions, thenYieldPartitions);
+  }
+
+  auto elsePartitions = getBlockPartitions(ifOp.elseBlock());
+  ifOpPartitions.insert(elsePartitions.begin(), elsePartitions.end());
+
+  auto elseYieldPartitions = getYieldPartitions(ifOp.elseBlock());
+  assert(thenYieldPartitions.size() == elseYieldPartitions.size());
+  SmallVector<SetVector<int>> outputPartitions;
+  for (int i = 0; i < thenYieldPartitions.size(); ++i) {
+    auto &thenIds = thenYieldPartitions[i];
+    auto &elseIds = elseYieldPartitions[i];
+    auto thenYieldOpnd = ifOp.thenYield()->getOperand(i);
+    auto elseYieldOpnd = ifOp.elseYield()->getOperand(i);
+    auto thenYieldOpndDefOp = thenYieldOpnd.getDefiningOp();
+    auto elseYieldOpndDefOp = elseYieldOpnd.getDefiningOp();
+
+    if (isa<AsyncTokenType>(thenYieldOpnd.getType())) {
+      // Heuristic: when if-op yields an async-token, the output partition of
+      //            the token is that of its producer
+      if (ifOp.thenBlock()->findAncestorOpInBlock(
+              *thenYieldOpnd.getDefiningOp())) {
+        outputPartitions.push_back(elseIds);
+      } else {
+        outputPartitions.push_back(thenIds);
+      }
+    } else if (thenYieldOpndDefOp &&
+               thenYieldOpndDefOp->getBlock() == ifOp.thenBlock()) {
+      // Heuristic: if yield operand is defined in then block, use its Ids
+      outputPartitions.push_back(thenIds);
+    } else if (elseYieldOpndDefOp &&
+               elseYieldOpndDefOp->getBlock() == ifOp.elseBlock()) {
+      // same for else block
+      outputPartitions.push_back(elseIds);
+    } else {
+      // otherwise pick thenIds if avaialble, otherwise elseIds
+      outputPartitions.push_back(!thenIds.empty() ? thenIds : elseIds);
     }
   }
+  return setOutputPartitions(ifOp, ifOpPartitions, outputPartitions);
+}
+
+SetVector<int> assignSingleRegionOpPartition(Operation *op) {
+  auto block = &op->getRegion(0).getBlocks().front();
+  auto blockPartitions = getBlockPartitions(block);
+  return setOutputPartitions(op, blockPartitions, getYieldPartitions(block));
+}
+
+SetVector<int> getBlockPartitions(Block *block) {
+  SetVector<int> blockPartitions;
+  for (auto &op_ : block->without_terminator()) {
+    auto op = &op_;
+    SetVector<int> partitionIds;
+    if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+      partitionIds = assignIfOpPartitions(ifOp);
+    } else if (isa<scf::ForOp, triton::ReduceOp>(op)) {
+      partitionIds = assignSingleRegionOpPartition(op);
+    } else if (hasPartition(op)) {
+      auto ids = getPartitionIds(op);
+      partitionIds.insert(ids.begin(), ids.end());
+    }
+    blockPartitions.insert(partitionIds.begin(), partitionIds.end());
+  }
+  return blockPartitions;
 }
 
 void assignRegionBodyPartition(scf::ForOp loop, PartitionSet &partitions) {
@@ -693,14 +953,17 @@ void assignRegionBodyPartition(scf::ForOp loop, PartitionSet &partitions) {
     if (isa<scf::YieldOp, scf::ForOp>(op) || hasPartition(op))
       return WalkResult::advance();
 
-    auto parentOp = loop.getBody()->findAncestorOpInBlock(*op);
-    if (auto partitionIds = triton::gpu::getPartitionIds(parentOp)) {
-      SetVector<Partition *> parentPartitions;
-      for (auto id : *partitionIds) {
-        parentPartitions.insert(partitions.getPartition(id));
-      }
-      setPartition(op, parentPartitions);
+    auto parentOp =
+        op->getParentOfType<scf::ForOp>().getBody()->findAncestorOpInBlock(*op);
+    if (!hasPartition(parentOp))
+      return WalkResult::advance();
+
+    auto partitionIds = getPartitionIds(parentOp);
+    SetVector<Partition *> parentPartitions;
+    for (auto id : partitionIds) {
+      parentPartitions.insert(partitions.getPartition(id));
     }
+    setPartition(op, parentPartitions);
     return WalkResult::advance();
   });
 
@@ -711,6 +974,33 @@ void assignRegionBodyPartition(scf::ForOp loop, PartitionSet &partitions) {
     if (!isa<scf::ForOp>(op) && hasPartition(op) && op->getNumRegions() > 0) {
       op->removeAttr(kPartitionAttrName);
     }
+  });
+}
+
+void assignRegionOpPartitions(scf::ForOp loop) {
+  assignSingleRegionOpPartition(loop);
+
+  // Work-around for operations that don't produce results, nor use operands
+  // from inside ws-loop, but need partition assignments. These operations
+  // inherit partitions from their parent operation.
+  //   %a = ...
+  //   scf.for ... {
+  //     scf.if ... {
+  //       ...
+  //       llvm.intr.assume %a : i1  // inherits partition from scf.if
+  //       ...
+  //     } {ttg.partition = [2]}
+  //   } {ttg.ws}
+  loop.walk([&](Operation *op) {
+    if (op->getNumResults() > 0 || hasPartition(op))
+      return WalkResult::advance();
+    if (op->getNumRegions() > 0 ||
+        isa<scf::YieldOp, triton::ReduceReturnOp>(op))
+      return WalkResult::advance();
+    auto parentOp = op->getParentOp();
+    auto parentPartitionIds = getPartitionIds(parentOp);
+    setPartition(op, parentPartitionIds);
+    return WalkResult::advance();
   });
 }
 
@@ -735,41 +1025,33 @@ struct PartitionScheduling
 } // namespace
 
 void PartitionScheduling::runOnOperation() {
+  ModuleOp m = getOperation();
   SmallVector<scf::ForOp> loops;
-  getOperation().walk([&](scf::ForOp loop) {
-    if (loop->hasAttr(kWarpSpecializeAttrName))
+  m.walk([&](scf::ForOp loop) {
+    if (loop->hasAttr(kWarpSpecializeAttrName)) {
       loops.push_back(loop);
+    }
   });
+
   for (auto [idx, loop] : llvm::enumerate(loops)) {
-    if (std::optional<PartitionSet> schedule = getInitialSchedule(loop)) {
-      propagatePartitions(loop, *schedule);
+    if (std::optional<PartitionSet> partitions = getInitialPartitions(loop)) {
+      propagatePartitions(loop, *partitions);
+      optimizePartitions(loop, *partitions);
+      assignRegionBodyPartition(loop, *partitions);
+      if (failed(assignMissingPartitions(loop, *partitions)))
+        return signalPassFailure();
 
-      // Schedule post-loop operations into the epilogue partition after
-      // propagatePartitions completes. The epilogue partition is the last
-      // partition created (see getInitialSchedule).
-      if (schedule->getNumPartitions() > 0) {
-        Partition *epiloguePartition =
-            schedule->getPartition(schedule->getNumPartitions() - 1);
-        schedulePostLoopOps(loop, *schedule, epiloguePartition);
-      }
-
-      optimizeSchedule(loop, *schedule);
-      assignRootPartition(loop, *schedule);
-      assignRegionBodyPartition(loop, *schedule);
-      schedule->serialize(loop);
+      assignRegionOpPartitions(loop);
+      verifyPartitions(loop, *partitions);
       loop->setAttr(
           kWarpSpecializeTagAttrName,
           IntegerAttr::get(IntegerType::get(loop.getContext(), 32), idx));
-      // Clean Broadcast/ExpandDims/ConvertLayout that were left with no users
-      // after optimizeSchedule. We wait until after the schedule is serialized
-      // to avoid invalidating pointers stored in the schedule.
-      loop.walk<WalkOrder::PostOrder, ReverseIterator>([](Operation *op) {
-        // By default, the walk is in postorder so it is safe to delete ops
-        // while we walk.
-        if (isa<BroadcastOp, ExpandDimsOp, ConvertLayoutOp>(op))
-          if (op->use_empty())
-            op->erase();
-      });
+
+      SmallVector<Attribute> stages;
+      Builder b(loop.getContext());
+      for (Partition &partition : partitions->getPartitions())
+        stages.push_back(b.getI32IntegerAttr(partition.getStage()));
+      loop->setAttr(kPartitionStagesAttrName, b.getArrayAttr(stages));
     }
   }
 }

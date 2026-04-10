@@ -19,10 +19,8 @@ namespace ttg = ::mlir::triton::gpu;
 namespace tlx = ::mlir::triton::tlx;
 
 namespace mlir {
-namespace amdpipeliner {
 std::optional<ttg::SwizzledSharedEncodingAttr>
-getSharedEncIfAllUsersAreDotEnc(Value loadedValue);
-}
+getSharedEncIfAllUsersAreDotEnc(Value val, bool &incompatible);
 
 namespace triton {
 namespace tlx {
@@ -53,8 +51,9 @@ LogicalResult insertRequireLayout(ModuleOp m) {
           localLoadOp.dump();
         });
         // Get the shared encoding for this local load op based on the dot op
-        auto encoding = mlir::amdpipeliner::getSharedEncIfAllUsersAreDotEnc(
-                            localLoadOp->getResult(0))
+        bool incompatible = false;
+        auto encoding = mlir::getSharedEncIfAllUsersAreDotEnc(
+                            localLoadOp->getResult(0), incompatible)
                             .value_or(nullptr);
         if (encoding) {
           LLVM_DEBUG({
@@ -68,8 +67,8 @@ LogicalResult insertRequireLayout(ModuleOp m) {
             auto newType = ttg::MemDescType::get(
                 type.getShape(), type.getElementType(), encodingAttr,
                 type.getMemorySpace(), type.getMutableMemory());
-            auto converLayoutOp = builder.create<tlx::RequireLayoutOp>(
-                op->getLoc(), newType, loadMemDescTy);
+            auto converLayoutOp = tlx::RequireLayoutOp::create(
+                builder, op->getLoc(), newType, loadMemDescTy);
             localLoadOp->setOperand(0, converLayoutOp.getResult());
           }
         } else {

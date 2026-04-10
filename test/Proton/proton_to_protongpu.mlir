@@ -136,7 +136,6 @@ module attributes {"ttg.num-warps" = 8 : i32} {
 // CHECK:       proton_gpu.circular_store start %[[SEGMENT2]], %[[COUNTER4]] {scopeId = 2 : i32} : !proton_gpu.segment<1024, #smem, warp>, i32
 // CHECK:       %[[COUNTER5:.*]] = proton_gpu.read_counter : i32
 // CHECK:       proton_gpu.circular_store end %[[SEGMENT2]], %[[COUNTER5]] {scopeId = 2 : i32} : !proton_gpu.segment<1024, #smem, warp>, i32
-// CHECK:       proton_gpu.save_ctx %[[SEGMENT2]], %[[ARG1]] : !proton_gpu.segment<1024, #smem, warp>, !tt.ptr<i32>
 // CHECK:       ttg.warp_return
 // CHECK:     } : (!ttg.memdesc<256xi32, #shared, #smem, mutable>, !tt.ptr<i32>) -> ()
 // CHECK:     %[[COUNTER6:.*]] = proton_gpu.read_counter : i32
@@ -161,6 +160,28 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 8 : i32} {
       ttg.warp_return
     } : () -> ()
     proton.record end "kernel"
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 8 : i32} {
+  // CHECK-LABEL: global_mem_buffer
+  // CHECK-GMEM: %[[SCRATCH:.*]] = proton_gpu.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
+  // CHECK-GMEM: proton_gpu.initialize %[[SCRATCH]] : !tt.ptr<i32>
+  // CHECK-GMEM: %[[PTR:.*]] = tt.addptr %[[SCRATCH]]
+  // CHECK-GMEM: %[[SEGMENT:.*]] = proton_gpu.segment_alloc %[[PTR]] : !tt.ptr<i32> -> <1024, #proton_gpu.global_memory, warp>
+  // CHECK-GMEM: %[[START:.*]] = proton_gpu.read_counter : i32
+  // CHECK-GMEM: proton_gpu.circular_store start %[[SEGMENT]], %[[START]] {scopeId = 0 : i32} : !proton_gpu.segment<1024, #proton_gpu.global_memory, warp>, i32
+  // CHECK-GMEM: %[[END:.*]] = proton_gpu.read_counter : i32
+  // CHECK-GMEM: proton_gpu.circular_store end %[[SEGMENT]], %[[END]] {scopeId = 0 : i32} : !proton_gpu.segment<1024, #proton_gpu.global_memory, warp>, i32
+  // CHECK-GMEM: gpu.barrier
+  // CHECK-GMEM: proton_gpu.finalize %[[SEGMENT]], %[[SCRATCH]] : !proton_gpu.segment<1024, #proton_gpu.global_memory, warp>, !tt.ptr<i32>
+  // CHECK-GMEM: tt.return
+  tt.func @global_mem_buffer() {
+    proton.record start "name0"
+    proton.record end "name0"
     tt.return
   }
 }

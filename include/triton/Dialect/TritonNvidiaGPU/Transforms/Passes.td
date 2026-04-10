@@ -191,4 +191,31 @@ def TritonNvidiaGPURemoveTMEMTokensPass : Pass<"triton-nvidia-gpu-remove-tmem-to
   }];
 }
 
+def TritonNvidiaGPUPruneUnusedBarriersPass
+    : Pass<"triton-nvidia-gpu-prune-unused-barriers", "mlir::ModuleOp"> {
+  let summary = "Prune barriers with no wait uses after warp specialization";
+
+  let description = [{
+    After warp specialization materializes barriers for producer-consumer
+    communication channels, some barriers may have no corresponding wait ops.
+    This pass finds and removes such unused barriers and their associated
+    init/arrive/expect/commit ops.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
+def TritonNvidiaGPUCheckMatmulTwoCTAPass : Pass<"triton-nvidia-check-matmul-two-cta", "mlir::ModuleOp"> {
+  let summary = "Verify consistent two_ctas usage across matmuls";
+
+  let description = [{
+    Inspect all matmul operations and ensure they agree on the `two_ctas`
+    setting. Propagate the chosen value to the module so later lowering steps
+    can access it. Compilation fails if mixed configurations are detected.
+  }];
+}
+
 #endif

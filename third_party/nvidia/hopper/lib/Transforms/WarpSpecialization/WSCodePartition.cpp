@@ -19,6 +19,7 @@
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
@@ -757,24 +758,22 @@ static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance,
   auto context = funcOp.getContext();
   if (!srcName.empty())
     loc = NameLoc::get(StringAttr::get(context, srcName), loc);
-  auto barrierCTALayout =
-      ttg::CTALayoutAttr::get(context, /*CTAsPerCGA=*/{1},
-                              /*CTASplitNum=*/{1}, /*CTAOrder=*/{0});
+  auto barrierCGALayout = ttg::CGAEncodingAttr::getDefault(context, 1);
   auto barrierEncoding = ttg::SwizzledSharedEncodingAttr::get(
-      context, 1, 1, 1, {0}, barrierCTALayout);
+      context, 1, 1, 1, {0}, barrierCGALayout);
   ttg::MemDescType barrierMemDescType = ttg::MemDescType::get(
       {distance, 1}, builder.getI64Type(), barrierEncoding, sharedMemorySpace,
       /*mutableMemory=*/true);
   Type singleBarrierMemDescType = ttg::MemDescType::get(
       {1}, builder.getI64Type(), barrierEncoding,
       barrierMemDescType.getMemorySpace(), /*mutableMemory=*/true);
-  Value barrierAlloc = builder.create<mlir::triton::gpu::LocalAllocOp>(
-      loc, barrierMemDescType, Value());
+  Value barrierAlloc = mlir::triton::gpu::LocalAllocOp::create(
+      builder, loc, barrierMemDescType, Value());
   for (unsigned i = 0; i < distance; i++) {
-    Value idx = builder.create<arith::ConstantIntOp>(loc, i, 32);
-    Value barrierView = builder.create<ttg::MemDescIndexOp>(
-        loc, singleBarrierMemDescType, barrierAlloc, idx);
-    builder.create<ttng::InitBarrierOp>(funcOp->getLoc(), barrierView, 1);
+    Value idx = arith::ConstantIntOp::create(builder, loc, i, 32);
+    Value barrierView = ttg::MemDescIndexOp::create(
+        builder, loc, singleBarrierMemDescType, barrierAlloc, idx);
+    ttng::InitBarrierOp::create(builder, funcOp->getLoc(), barrierView, 1);
   }
   return barrierAlloc;
 }
@@ -922,10 +921,11 @@ void createToken(
           tokenLoc = NameLoc::get(
               StringAttr::get(funcOp.getContext(), channel->srcName), tokenLoc);
         if (it->second.front()->getSrcOp()->getParentOfType<scf::ForOp>())
-          v = builder.create<ttnvws::CreateTokenOp>(
-              tokenLoc, channel->getNumBuffers(), tokenLoadType);
+          v = ttnvws::CreateTokenOp::create(
+              builder, tokenLoc, channel->getNumBuffers(), tokenLoadType);
         else
-          v = builder.create<ttnvws::CreateTokenOp>(tokenLoc, 1, tokenLoadType);
+          v = ttnvws::CreateTokenOp::create(builder, tokenLoc, 1,
+                                            tokenLoadType);
         commChannel.tokens[consumerAsyncTaskId] = v;
       }
 
@@ -1355,8 +1355,8 @@ void createTokenPost(
         if (!channel->srcName.empty())
           tokenLoc = NameLoc::get(
               StringAttr::get(funcOp.getContext(), channel->srcName), tokenLoc);
-        v = builder.create<ttnvws::CreateTokenOp>(
-            tokenLoc, channel->getNumBuffers(), tokenLoadType);
+        v = ttnvws::CreateTokenOp::create(
+            builder, tokenLoc, channel->getNumBuffers(), tokenLoadType);
         commChannel.tokens[consumerAsyncTaskId] = v;
       }
 
@@ -1425,15 +1425,15 @@ static Value hoistLocalAlloc(OpBuilderWithAsyncTaskIds &builder,
   Operation *newAlloc;
   if (auto localAlloc = dyn_cast<ttg::LocalAllocOp>(oldAlloc)) {
     newAlloc =
-        builder.create<ttg::LocalAllocOp>(oldAlloc->getLoc(), memdescType);
+        ttg::LocalAllocOp::create(builder, oldAlloc->getLoc(), memdescType);
   } else if (auto tmemAlloc = dyn_cast<ttng::TMEMAllocOp>(oldAlloc)) {
     if (tmemAlloc.getToken()) {
-      newAlloc = builder.create<ttng::TMEMAllocOp>(
-          oldAlloc->getLoc(), memdescType, tmemAlloc.getToken().getType(),
-          Value());
+      newAlloc =
+          ttng::TMEMAllocOp::create(builder, oldAlloc->getLoc(), memdescType,
+                                    tmemAlloc.getToken().getType(), Value());
     } else {
-      newAlloc = builder.create<ttng::TMEMAllocOp>(
-          oldAlloc->getLoc(), memdescType, mlir::Type(), Value());
+      newAlloc = ttng::TMEMAllocOp::create(builder, oldAlloc->getLoc(),
+                                           memdescType, mlir::Type(), Value());
     }
   } else {
     llvm_unreachable("Unexpected alloc type");
@@ -1482,7 +1482,7 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
 
   // Get basic information from tensorType
   auto order = ttg::getOrderForMemory(tensorType);
-  auto CTALayout = ttg::getCTALayout(tensorType.getEncoding());
+  auto CGALayout = ttg::getCGALayout(tensorType.getEncoding());
   auto elemType = tensorType.getElementType();
 
   // Check the consumer type
@@ -1509,7 +1509,7 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
     unsigned colStride = 32 / elemBitWidth;
     auto encoding = ttng::TensorMemoryEncodingAttr::get(
         context, blockM, bufferShape[1], colStride, /*CTASplitM=*/1,
-        /*CTASplitN=*/1);
+        /*CTASplitN=*/1, /*twoCTAs=*/false);
     Type memdescType =
         ttg::MemDescType::get(bufferShape, elemType, encoding,
                               tensorMemorySpace, /*mutableMemory*/ true);
@@ -1517,8 +1517,8 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
         channel->srcName.empty()
             ? srcOp->getLoc()
             : replaceOutermostNameLoc(srcOp->getLoc(), channel->srcName);
-    auto allocOp = builder.create<ttng::TMEMAllocOp>(
-        allocLoc, memdescType, builder.getType<ttg::AsyncTokenType>(),
+    auto allocOp = ttng::TMEMAllocOp::create(
+        builder, allocLoc, memdescType, builder.getType<ttg::AsyncTokenType>(),
         /*src=*/Value());
     newProducer = TMEM1DAllocator(builder).replaceWith1DTMEM(
         dyn_cast<mlir::OpResult>(srcResult), channel->relation.first, dstOp,
@@ -1555,7 +1555,7 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
     Attribute sharedLayout;
     if (requireMMASharedEncoding) {
       sharedLayout = ttg::NVMMASharedEncodingAttr::get(
-          context, sliceShape, order, CTALayout, elemType,
+          context, sliceShape, order, CGALayout, elemType,
           /*fp4Padded*/ false);
     } else if (tmaStore) {
       sharedLayout = ttng::getEncodingFromDescriptor(tmaStore, tensorType,
@@ -1567,7 +1567,7 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
       // Create an unswizzled layout for now.
       // TODO: optimize it based on the consumer.
       sharedLayout = ttg::SwizzledSharedEncodingAttr::get(context, 1, 1, 1,
-                                                          order, CTALayout);
+                                                          order, CGALayout);
     }
 
     // Get shape, layout and type of the complete buffer
@@ -1586,7 +1586,7 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
         channel->srcName.empty()
             ? srcOp->getLoc()
             : replaceOutermostNameLoc(srcOp->getLoc(), channel->srcName);
-    auto allocOp = builder.create<ttg::LocalAllocOp>(allocLoc, memdescType);
+    auto allocOp = ttg::LocalAllocOp::create(builder, allocLoc, memdescType);
     buffer = allocOp->getResult(0);
 
     if (isPost) {
@@ -1626,7 +1626,7 @@ static ttg::LocalAllocOp hoistLocalAllocPost(OpBuilder &builder,
   Type memdescType = ttg::MemDescType::get(
       shape, allocDescType.getElementType(), allocDescType.getEncoding(),
       allocDescType.getMemorySpace(), allocDescType.getMutableMemory());
-  return builder.create<ttg::LocalAllocOp>(oldAlloc.getLoc(), memdescType);
+  return ttg::LocalAllocOp::create(builder, oldAlloc.getLoc(), memdescType);
 }
 
 static ttng::TMEMAllocOp createTMemAllocPost(OpBuilder &builder,
@@ -1643,8 +1643,8 @@ static ttng::TMEMAllocOp createTMemAllocPost(OpBuilder &builder,
   Type accMemDescType = triton::gpu::MemDescType::get(
       shape, oldRetType.getElementType(), oldRetType.getEncoding(),
       oldRetType.getMemorySpace(), /*mutableMemory=*/true);
-  return builder.create<ttng::TMEMAllocOp>(
-      oldTMemAllocOp.getLoc(), accMemDescType,
+  return ttng::TMEMAllocOp::create(
+      builder, oldTMemAllocOp.getLoc(), accMemDescType,
       builder.getType<ttg::AsyncTokenType>(), /*src=*/Value());
 }
 
@@ -3650,8 +3650,8 @@ void foldLocalLoads(triton::FuncOp funcOp) {
 // Compare against TritonNvidiaGPURemoveTMEMTokensPass.
 static void cleanupTmemTokens(triton::FuncOp funcOp) {
   auto b = OpBuilder::atBlockBegin(&funcOp.getBody().front());
-  Value replTok =
-      b.create<ub::PoisonOp>(funcOp.getLoc(), b.getType<ttg::AsyncTokenType>());
+  Value replTok = ub::PoisonOp::create(b, funcOp.getLoc(),
+                                       b.getType<ttg::AsyncTokenType>());
   funcOp.walk([&](Operation *op) {
     if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(op)) {
       storeOp.getDepMutable().clear();
@@ -3692,7 +3692,7 @@ static void separateLocalAllocWithSrc(triton::FuncOp &funcOp) {
 
     builder.setInsertionPoint(allocOp);
     auto newAlloc =
-        builder.create<ttg::LocalAllocOp>(allocOp.getLoc(), memdescType);
+        ttg::LocalAllocOp::create(builder, allocOp.getLoc(), memdescType);
 
     auto originTaskIds = builder.getAsyncTaskIds();
     auto originLoopScheduleInfo = builder.getLoopScheduleInfo();
@@ -3765,7 +3765,7 @@ static void swapTransposedLocalAllocs(triton::FuncOp &funcOp) {
     auto nonTransposedEncoding = ttg::NVMMASharedEncodingAttr::get(
         encoding.getContext(), encoding.getSwizzlingByteWidth(),
         /*transposed=*/false, encoding.getElementBitWidth(),
-        encoding.getFp4Padded(), encoding.getCTALayout());
+        encoding.getFp4Padded(), encoding.getCGALayout());
 
     // New alloc type: non-transposed encoding.
     auto newAllocType = ttg::MemDescType::get(
@@ -4030,6 +4030,37 @@ void doBufferAllocation(triton::FuncOp &funcOp) {
   separateLocalAllocWithSrc(funcOp);
 }
 
+// Ensure all ops inside regions of partition-bearing ops have partition IDs.
+// This satisfies the partition verifier which requires ALL child ops of an op
+// with kPartitionAttrName to also have it.
+static void assignMissingPartitionIds(triton::FuncOp &funcOp) {
+  funcOp->walk([&](Operation *op) {
+    if (!op->hasAttr(ttg::kPartitionAttrName) || op->getNumRegions() == 0)
+      return;
+    if (!ttg::hasPartition(op))
+      return;
+    auto parentIds = ttg::getPartitionIds(op);
+    for (auto &region : op->getRegions()) {
+      for (auto &block : region.getBlocks()) {
+        for (auto &childOp : block.getOperations()) {
+          if (isa<scf::YieldOp, tt::ReduceReturnOp>(childOp))
+            continue;
+          if (!childOp.hasAttr(ttg::kPartitionAttrName))
+            ttg::setPartition(&childOp, parentIds);
+        }
+      }
+    }
+  });
+  // Remove partition attribute from non-ForOp region-bearing ops so the
+  // verifier can infer their partition sets from their children.
+  funcOp->walk([&](Operation *op) {
+    if (!isa<scf::ForOp>(op) && op->hasAttr(ttg::kPartitionAttrName) &&
+        op->getNumRegions() > 0) {
+      op->removeAttr(ttg::kPartitionAttrName);
+    }
+  });
+}
+
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
@@ -4127,6 +4158,7 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
     LDBG("\n\nwith specializeRegion");
     funcOp.dump();
   });
+  assignMissingPartitionIds(funcOp);
 }
 
 void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
@@ -4377,6 +4409,7 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
     LDBG("\n\nwith specializeRegion");
     funcOp.dump();
   });
+  assignMissingPartitionIds(funcOp);
 }
 
 #define GEN_PASS_DEF_NVGPUTESTWSCODEPARTITION

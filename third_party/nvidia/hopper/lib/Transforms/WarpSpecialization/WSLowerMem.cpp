@@ -53,7 +53,7 @@ createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *c,
     return {nullptr, nullptr};
   // Get basic information from tensorType
   auto order = ttg::getOrderForMemory(tensorType);
-  auto CTALayout = ttg::getCTALayout(tensorType.getEncoding());
+  auto CGALayout = ttg::getCGALayout(tensorType.getEncoding());
   auto elemType = tensorType.getElementType();
 
   // Get shape, layout and type of a slice
@@ -111,7 +111,7 @@ createLocalCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
     return {nullptr, nullptr};
   // Get basic information from tensorType
   auto order = ttg::getOrderForMemory(tensorType);
-  auto CTALayout = ttg::getCTALayout(tensorType.getEncoding());
+  auto CGALayout = ttg::getCGALayout(tensorType.getEncoding());
   auto elemType = tensorType.getElementType();
 
   // Get shape, layout and type of a slice
@@ -164,9 +164,8 @@ Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
   auto viewDescType = triton::gpu::MemDescType::get(
       shape, allocDescType.getElementType(), allocDescType.getEncoding(),
       allocDescType.getMemorySpace(), allocDescType.getMutableMemory());
-  //    /*allocShape=*/allocDescType.getAllocShape());
-  return builder.create<triton::gpu::MemDescIndexOp>(alloc.getLoc(),
-                                                     viewDescType, alloc, idx);
+  return triton::gpu::MemDescIndexOp::create(builder, alloc.getLoc(),
+                                             viewDescType, alloc, idx);
 }
 
 // For the case where the value shared in (producer, consumer) is in smem.
@@ -302,7 +301,7 @@ Value getBufferForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
   assert(tensorType);
 
   auto order = ttg::getOrderForMemory(tensorType);
-  auto CTALayout = ttg::getCTALayout(tensorType.getEncoding());
+  auto CGALayout = ttg::getCGALayout(tensorType.getEncoding());
   auto elemType = tensorType.getElementType();
 
   // Get shape, layout and type of a slice

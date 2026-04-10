@@ -65,7 +65,7 @@ tt.func @tma_gather_simple(%arg0: !tt.tensordesc<tensor<1x128xbf16, #shared1>>, 
 
   // CHECK: [[OFFSET0:%.*]] = zext nneg i32 [[WARP_STRIDE]] to i64
   // CHECK: [[BASEPTR0:%.*]] = getelementptr bfloat, ptr addrspace(3) [[BASE_PTR]], i64 [[OFFSET0]]
-  // CHECK: "@$0 cp.async.bulk.tensor.2d.tile::gather4.shared::cluster.global.mbarrier::complete_tx::bytes [$1], [$2, {$3, $4, $5, $6, $7}], [$8];", "b,r,l,r,r,r,r,r,r"
+  // CHECK: "@$0 cp.async.bulk.tensor.2d.tile::gather4.shared::cta.global.mbarrier::complete_tx::bytes [$1], [$2, {$3, $4, $5, $6, $7}], [$8];", "b,r,l,r,r,r,r,r,r"
   // CHECK-SAME: (i1 [[PRED]], ptr addrspace(3) [[BASEPTR0]], ptr nonnull %0, i32 [[Y0]], i32 [[IDX0]], i32 [[IDX1]], i32 [[IDX2]], i32 [[IDX3]], ptr addrspace(3) [[BAR]])
 
   // CHECK: [[BASEPTR1:%.*]] = getelementptr i8, ptr addrspace(3) [[BASEPTR0]], i64 4096
@@ -169,17 +169,17 @@ tt.func @tma_scatter(%arg0: !tt.tensordesc<tensor<1x128xbf16, #shared1>>, %arg1:
 // CHECK-LABEL: @tma_multicast
 tt.func @tma_multicast(%desc: !tt.tensordesc<tensor<64x64xf16, #shared1>>,
                         %buffer: !ttg.memdesc<64x64xi16, #shared1, #smem, mutable>,
-                        %bar: !ttg.memdesc<1xi64, #shared1, #smem, mutable>,
+                        %bar: !ttg.memdesc<1xi64, #shared, #smem, mutable>,
                         %target_cta_mask: i32,
                         %off_m: i32,
                         %off_n: i32) {
   %true = arith.constant true
   // CHECK: "@$0 cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster [$1], [$2, {$3, $4}], [$5], $6;"
-  ttng.async_tma_copy_global_to_local %desc[%off_m, %off_n] %buffer, %bar, %true, %target_cta_mask : !tt.tensordesc<tensor<64x64xf16, #shared1>>, !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<64x64xi16, #shared1, #smem, mutable>
+  ttng.async_tma_copy_global_to_local %desc[%off_m, %off_n] %buffer, %bar, %true, %target_cta_mask : !tt.tensordesc<tensor<64x64xf16, #shared1>>, !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<64x64xi16, #shared1, #smem, mutable>
 
   // non multicast version
   // CHECK: "@$0 cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [$1], [$2, {$3, $4}], [$5];"
-  ttng.async_tma_copy_global_to_local %desc[%off_m, %off_n] %buffer, %bar, %true : !tt.tensordesc<tensor<64x64xf16, #shared1>>, !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<64x64xi16, #shared1, #smem, mutable>
+  ttng.async_tma_copy_global_to_local %desc[%off_m, %off_n] %buffer, %bar, %true : !tt.tensordesc<tensor<64x64xf16, #shared1>>, !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<64x64xi16, #shared1, #smem, mutable>
 
   tt.return
 }

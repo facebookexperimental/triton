@@ -1,14 +1,11 @@
 from . import compaction
 from . import compaction_details
-from . import matmul_ogs
-from . import matmul_ogs_details
+from . import matmul
+from . import matmul_details
 from . import numerics
 from . import numerics_details
 from . import proton_opts
-from . import reduction_details
 from . import roofline
-from . import routing
-from . import routing_details
 from . import specialize
 from . import swiglu
 from . import swiglu_details
@@ -22,15 +19,12 @@ from . import topk_details
 __all__ = [
     "compaction",
     "compaction_details",
-    "matmul_ogs",
-    "matmul_ogs_details",
+    "matmul",
+    "matmul_details",
     "numerics",
     "numerics_details",
     "proton_opts",
-    "reduction_details",
     "roofline",
-    "routing",
-    "routing_details",
     "specialize",
     "swiglu",
     "swiglu_details",

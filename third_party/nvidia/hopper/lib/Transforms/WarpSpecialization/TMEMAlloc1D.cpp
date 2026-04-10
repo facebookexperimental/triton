@@ -20,9 +20,10 @@ ttng::TMEMAllocOp TMEM1DAllocator::alloc1DTMEMBuffer() {
   auto oldRetType = getResultTensorType(expandedInput->getResult(0), 2);
   auto shape = oldRetType.getShape();
   auto tmemDesc = createTMEMDesc(builder, oldRetType, shape[0], shape[1]);
-  auto allocCall = builder.create<ttng::TMEMAllocOp>(
-      expandedInput->getLoc(), tmemDesc, builder.getType<ttg::AsyncTokenType>(),
-      /*src=*/Value());
+  auto allocCall =
+      ttng::TMEMAllocOp::create(builder, expandedInput->getLoc(), tmemDesc,
+                                builder.getType<ttg::AsyncTokenType>(),
+                                /*src=*/Value());
   return allocCall;
 }
 
@@ -52,11 +53,11 @@ void TMEM1DAllocator::TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
       auto retWarpsPerCTA = to_vector(blockedEnc.getWarpsPerCTA());
       retWarpsPerCTA.insert(retWarpsPerCTA.begin() + axis, 1);
       auto retOrder = {axis, blockedEnc.getOrder()[0]};
-      auto argCTALayout = blockedEnc.getCTALayout();
+      auto argCTALayout = blockedEnc.getCGALayout();
       auto retCTAsPerCGA = {argCTALayout.getCTAsPerCGA()[0], axis};
       auto retCTASplitNum = {argCTALayout.getCTASplitNum()[0], axis};
       auto retCTAOrder = {axis, argCTALayout.getCTAOrder()[0]};
-      auto retCTALayout = triton::gpu::CTALayoutAttr::get(
+      auto retCTALayout = triton::gpu::CGAEncodingAttr::fromSplitParams(
           context, retCTAsPerCGA, retCTASplitNum, retCTAOrder);
       blockedEnc = triton::gpu::BlockedEncodingAttr::get(
           context, retSizePerThread, retThreadsPerWarp, retWarpsPerCTA,
@@ -88,8 +89,11 @@ void TMEM1DAllocator::TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
   auto oldLayout = expandDims.getType().getEncoding();
   auto newLayout = oldLayout;
   if (!layoutTmemCompatible) {
-    newLayout = ttng::getTmemCompatibleLayout(
-        tmemDesc.getShape()[0], tmemDesc.getShape()[1], expandType, numWarps);
+    auto tmemEnc = cast<ttng::TensorMemoryEncodingAttr>(tmemDesc.getEncoding());
+    auto compatibleLayouts =
+        ttng::getTmemCompatibleLayouts(expandDims, expandType, tmemDesc);
+    assert(!compatibleLayouts.empty() && "No TMEM-compatible layout found");
+    newLayout = compatibleLayouts.front();
   }
   mlir::Operation *src = expandDims;
   if (newLayout != oldLayout) {
@@ -113,9 +117,12 @@ Value TMEM1DAllocator::TMEMLoad1D(OpResult producer, Operation *consumer) {
   auto oldInputType = dyn_cast<RankedTensorType>(producer.getType());
   auto targetEncoding = oldInputType.getEncoding();
   auto oldExpandType = getExpandedInput().getType();
-  Attribute newDistributedEncoding = ttng::getTmemCompatibleLayout(
-      oldExpandType.getShape()[0], oldExpandType.getShape()[1], oldExpandType,
-      numWarps);
+  auto allocDesc = dyn_cast<ttg::MemDescType>(allocOp->getResult(0).getType());
+  auto tmemEnc = cast<ttng::TensorMemoryEncodingAttr>(allocDesc.getEncoding());
+  auto compatibleLayouts =
+      ttng::getTmemCompatibleLayouts(allocOp, oldExpandType, allocDesc);
+  assert(!compatibleLayouts.empty() && "No TMEM-compatible layout found");
+  auto newDistributedEncoding = compatibleLayouts.front();
   auto newExpandType = oldExpandType.cloneWithEncoding(newDistributedEncoding);
   // Generate the load
   auto originTaskIds = builder.getAsyncTaskIds();
@@ -226,15 +233,15 @@ sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
   auto elemTyWidth = newType.getElementType().getIntOrFloatBitWidth();
   auto oldElemTyWidth = allocType.getElementType().getIntOrFloatBitWidth();
   if (oldElemTyWidth == elemTyWidth * 2) {
-    auto subSlice = builder.create<ttng::TMEMSubSliceOp>(
-        allocOp->getLoc(), allocResult, offset, blockN / 2);
-    return builder.create<ttg::MemDescReinterpretOp>(allocOp->getLoc(),
-                                                     tmemDesc, subSlice);
+    auto subSlice = ttng::TMEMSubSliceOp::create(
+        builder, allocOp->getLoc(), allocResult, offset, blockN / 2);
+    return ttg::MemDescReinterpretOp::create(builder, allocOp->getLoc(),
+                                             tmemDesc, subSlice);
   } else if (elemTyWidth == oldElemTyWidth) {
-    auto subSlice = builder.create<ttng::TMEMSubSliceOp>(
-        allocOp->getLoc(), allocResult, offset, blockN);
-    return builder.create<ttg::MemDescReinterpretOp>(allocOp->getLoc(),
-                                                     tmemDesc, subSlice);
+    auto subSlice = ttng::TMEMSubSliceOp::create(builder, allocOp->getLoc(),
+                                                 allocResult, offset, blockN);
+    return ttg::MemDescReinterpretOp::create(builder, allocOp->getLoc(),
+                                             tmemDesc, subSlice);
   } else {
     // Unsupported element type conversion
     return nullptr;
@@ -262,10 +269,10 @@ ttg::MemDescReinterpretOp sliceAndReinterpretTMEMBuffer(OpBuilder &builder,
 
   auto tmemDesc =
       createTMEMDesc(builder, allocType, shape[shape.size() - 2], 1);
-  auto subSlice = builder.create<ttng::TMEMSubSliceOp>(
-      allocOp->getLoc(), allocResult, offset, blockN);
-  return builder.create<ttg::MemDescReinterpretOp>(allocOp->getLoc(), tmemDesc,
-                                                   subSlice);
+  auto subSlice = ttng::TMEMSubSliceOp::create(builder, allocOp->getLoc(),
+                                               allocResult, offset, blockN);
+  return ttg::MemDescReinterpretOp::create(builder, allocOp->getLoc(), tmemDesc,
+                                           subSlice);
 }
 
 ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
@@ -298,21 +305,22 @@ ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
   // case at all from TCGen5MMAScaledOp::getBlockM?
   size_t CTASplitM;
   size_t CTASplitN;
+  bool twoCTAs = false;
   if (auto ttgLayout = mlir::dyn_cast<ttg::LayoutEncodingTrait>(encoding)) {
-    ArrayRef<unsigned> CTASplitNum =
-        ttg::getCTALayout(encoding).getCTASplitNum();
-    CTASplitM = CTASplitNum[0];
-    CTASplitN = CTASplitNum[1];
+    auto ctaLayoutAttr = ttg::getCGALayout(encoding);
+    CTASplitM = ctaLayoutAttr.getCTASplitNum()[0];
+    CTASplitN = ctaLayoutAttr.getCTASplitNum()[1];
   } else if (auto tmemLayout =
                  mlir::dyn_cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
                      encoding)) {
     CTASplitM = tmemLayout.getCTASplitM();
     CTASplitN = tmemLayout.getCTASplitN();
+    twoCTAs = tmemLayout.getTwoCTAs();
   } else {
     assert(false && "Unsupported encoding");
   }
   auto outputEncoding = ttng::TensorMemoryEncodingAttr::get(
-      context, blockM, blockN, colStride, CTASplitM, CTASplitN);
+      context, blockM, blockN, colStride, CTASplitM, CTASplitN, twoCTAs);
   if (highShape > 0) {
     llvm::SmallVector<int64_t> shapeVec{highShape, blockM, blockN};
     llvm::ArrayRef<int64_t> shape(shapeVec);
