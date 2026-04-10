@@ -9,7 +9,8 @@ namespace mlir::triton::gpu {
 /// Hardware pipeline classification for Blackwell SM100.
 /// Each op executes on exactly one pipeline; distinct pipelines overlap.
 enum class HWPipeline {
-  MEM,  // TMA loads/stores (descriptor_load, descriptor_store, descriptor_gather)
+  MEM,  // TMA loads/stores (descriptor_load, descriptor_store,
+        // descriptor_gather)
   TC,   // Tensor Core (tc_gen05_mma, warp_group_dot)
   CUDA, // General CUDA cores (arith.*, tt.reduce, type conversions)
   SFU,  // Special Function Unit (math.exp2, math.log2, math.rsqrt)
@@ -22,9 +23,9 @@ llvm::StringRef getPipelineName(HWPipeline pipeline);
 /// Latency info for a single operation.
 struct OpLatencyInfo {
   HWPipeline pipeline{HWPipeline::NONE};
-  int latency{0};     // Total latency: cycles from op start to result available.
-                      // Used for dependency analysis (RecMII — how long a
-                      // consumer must wait for the result).
+  int latency{0}; // Total latency: cycles from op start to result available.
+                  // Used for dependency analysis (RecMII — how long a
+                  // consumer must wait for the result).
   int selfLatency{0}; // Pipeline occupancy: cycles this op blocks its pipeline.
                       // Used for resource conflict analysis (ResMII — how much
                       // pipeline bandwidth is consumed).

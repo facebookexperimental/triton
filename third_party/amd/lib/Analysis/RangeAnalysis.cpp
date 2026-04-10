@@ -715,10 +715,11 @@ void TritonIntegerRangeAnalysis::visitRegionSuccessors(
         if (!inputs.empty()) {
           firstIndex = cast<OpResult>(inputs.front()).getResultNumber();
         }
-        visitNonControlFlowArguments(branch,
-                                     RegionSuccessor(branch, branch->getResults().slice(
-                                         firstIndex, inputs.size())),
-                                     lattices, firstIndex);
+        visitNonControlFlowArguments(
+            branch,
+            RegionSuccessor(
+                branch, branch->getResults().slice(firstIndex, inputs.size())),
+            lattices, firstIndex);
       } else {
         if (!inputs.empty()) {
           firstIndex = cast<BlockArgument>(inputs.front()).getArgNumber();

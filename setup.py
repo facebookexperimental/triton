@@ -675,7 +675,7 @@ def get_packages():
     if check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
         yield "triton.profiler"
 
-    yield f"triton.language.extra.tlx"
+    yield "triton.language.extra.tlx"
 
 
 def add_link_to_backends(external_only):

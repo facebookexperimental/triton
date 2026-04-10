@@ -12,10 +12,13 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // and sets tt.modulo_ii on the loop.
 //
 // CHECK-LABEL: @gemm_inner_loop
+// Cluster IDs are dense ranks of modulo cycles within each stage (Step 2.5).
+// Stages processed in reverse order: higher stage -> lower cluster ID.
+// Same cycle -> same cluster; different cycle -> different cluster.
 // CHECK: tt.descriptor_load {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32}
-// CHECK: tt.descriptor_load {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32}
-// CHECK: ttg.local_alloc {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32}
-// CHECK: ttg.local_alloc {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32}
+// CHECK: tt.descriptor_load {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+// CHECK: ttg.local_alloc {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
+// CHECK: ttg.local_alloc {{.*}} {loop.cluster = 3 : i32, loop.stage = 0 : i32}
 // CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 0 : i32, loop.stage = 1 : i32}
 // CHECK: ttng.tmem_load {{.*}} {loop.cluster = 0 : i32, loop.stage = 2 : i32}
 // CHECK: tt.modulo_ii

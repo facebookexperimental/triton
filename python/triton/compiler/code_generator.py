@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, Optional, Tuple, Type, Union, Iterable, 
 from .. import knobs, language
 from .._C.libtriton import ir, gluon_ir
 from ..language import constexpr, str_to_ty, tensor, tuple as tl_tuple
-from ..language.core import _unwrap_if_constexpr, base_value, base_type, nv_tma_desc_type
+from ..language.core import _unwrap_if_constexpr, base_value, base_type
 
 # ideally we wouldn't need any runtime component
 from ..runtime.jit import (
