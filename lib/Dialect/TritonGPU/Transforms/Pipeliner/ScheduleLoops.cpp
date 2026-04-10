@@ -830,7 +830,26 @@ void scheduleLoops(ModuleOp moduleOp, int defaultNumStages, bool useMetaWS) {
   moduleOp->walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
   if (loops.empty())
     return;
+  // If any loop has tt.modulo_ii, skip ALL loops — the modulo schedule
+  // handles scheduling globally. This module-wide skip is needed because
+  // the WS pass's PartitionLoops creates partition loop clones inside
+  // warp_specialize regions that don't inherit tt.modulo_ii from the
+  // original loop. Without the module-wide skip, these clones get
+  // re-scheduled by the heuristic, overwriting the modulo stage assignments.
+  // TODO: Propagate tt.modulo_ii to partition clones in WS pass so we can
+  // skip only annotated loops instead of all loops in the module.
+  bool moduleHasModuloSchedule = false;
   for (auto forOp : loops) {
+    if (forOp->hasAttr("tt.modulo_ii")) {
+      moduleHasModuloSchedule = true;
+      break;
+    }
+  }
+  for (auto forOp : loops) {
+    if (forOp->hasAttr("tt.modulo_ii") || moduleHasModuloSchedule) {
+      LDBG("Skipping loop (modulo-scheduled)");
+      continue;
+    }
     scheduleLoop(forOp, opLatency, defaultNumStages, useMetaWS);
   }
 }

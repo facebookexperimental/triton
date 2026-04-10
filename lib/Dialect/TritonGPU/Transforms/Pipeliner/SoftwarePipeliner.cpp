@@ -101,6 +101,9 @@ static void expandLoops(ModuleOp moduleOp) {
   auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
 
   for (scf::ForOp forOp : loops) {
+    // Skip loops already expanded by modulo scheduling.
+    if (forOp->hasAttr("tt.modulo_ii"))
+      continue;
     CoarseSchedule schedule;
     if (failed(schedule.deSerialize(forOp))) {
       continue;
