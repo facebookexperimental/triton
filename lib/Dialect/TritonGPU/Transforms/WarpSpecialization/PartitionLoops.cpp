@@ -360,11 +360,18 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
   for (const Partition &partition : partitions.getPartitions()) {
     bool failed = false;
     auto callback = [&](OpResult output, OpOperand &use, unsigned distance) {
+      // If the use owner doesn't have a partition attribute, skip it. This can
+      // happen when the owner is an inner loop op or otherwise outside the
+      // partition scheme.
+      if (!hasPartition(use.getOwner()))
+        return;
       auto partitionIds = getPartitionIds(use.getOwner());
       if (llvm::is_contained(partitionIds, partition.getIndex()))
         return;
 
       // check if consumer partition set is a subset of the producer partitions
+      if (!hasPartition(output.getDefiningOp()))
+        return;
       auto defOpPartitionIds = getPartitionIds(output.getDefiningOp());
       bool isValidSubset = std::all_of(
           partitionIds.begin(), partitionIds.end(), [&](int consumerId) {
