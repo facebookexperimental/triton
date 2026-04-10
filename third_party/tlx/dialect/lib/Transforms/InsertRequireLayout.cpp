@@ -359,6 +359,16 @@ LogicalResult insertRequireLayout(ModuleOp m) {
   if (failed(solver.initializeAndRun(m)))
     return failure();
 
+  // Proposed long-term flow.
+  // 1. InsertRequireLayout should discover dot-fed local_load ops and insert
+  //    the missing memdesc-side tlx.require_layout constraints for shared
+  //    memory.
+  // 2. Tensor-side tlx.require_layout and tlx.release_layout constraints
+  //    should then be propagated by tlx-propagate-layout, which already owns
+  //    TLX layout propagation and lowering to ttg.convert_layout.
+  // 3. The direct local_load result retagging below is a temporary bridge
+  //    until tlx-propagate-layout owns register-side propagation for this
+  //    AMD local_load-to-dot path.
   // --- Rewrite local_loads whose results require a dot-operand encoding ---
   m.walk([&](ttg::LocalLoadOp localLoadOp) {
     auto *lattice =
