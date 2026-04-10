@@ -159,20 +159,16 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
         auto transOrder = memDescTransOp.getOrder();
         if (!isValidPermutation(transOrder, rank) ||
             swizzledEncoding.getOrder().size() != rank) {
-          LDBG("Skipping backward propagation through memdesc_trans for "
-               << "invalid swizzled_shared transpose metadata.");
-          assert(false &&
-                 "swizzled_shared backward propagation through memdesc_trans "
-                 "requires a valid transpose permutation");
-          return success();
+          memDescTransOp.emitOpError(
+              "swizzled_shared backward propagation through memdesc_trans "
+              "requires a valid transpose permutation");
+          return failure();
         }
         if (!isEffectivelyUnswizzledShared(swizzledEncoding)) {
-          LDBG("Skipping backward propagation through memdesc_trans for "
-               << "nontrivial swizzled_shared encoding " << swizzledEncoding);
-          assert(false &&
-                 "swizzled_shared backward propagation through memdesc_trans "
-                 "only supports effectively unswizzled encodings");
-          return success();
+          memDescTransOp.emitOpError(
+              "swizzled_shared backward propagation through memdesc_trans "
+              "only supports effectively unswizzled encodings");
+          return failure();
         }
 
         // For effectively unswizzled shared layouts, inverting the transpose
