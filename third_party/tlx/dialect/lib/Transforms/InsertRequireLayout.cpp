@@ -32,74 +32,140 @@ namespace tlx {
 namespace {
 
 // ============================================================================
-// Backward dataflow analysis: propagate DotOperandEncodingAttr from tt.DotOp
-// operands backward through convert_layout chains and scf.for iter_args to
-// local_load ops.
+// Backward dataflow analysis: propagate the required dot-operand encoding and
+// rewrite legality from tt.DotOp operands backward through convert_layout
+// chains and region-branch carriers to local_load ops.
 //
-// MLIR's SparseBackwardDataFlowAnalysis automatically handles scf.for
-// (via RegionBranchOpInterface), so the analysis naturally sees through
-// yield -> body_arg -> init_value chains without any manual iter_arg tracing.
+// The analysis tracks both the desired dot encoding and whether rewriting the
+// value is still legal. We union convert_layout source/result anchors so mixed
+// uses that branch through sibling convert chains share the same legality
+// state.
 // ============================================================================
 
-class DotEncoding {
+class DotRewriteState {
 public:
-  DotEncoding() = default;
-  explicit DotEncoding(Attribute enc) : encoding(enc) {}
+  enum class Kind {
+    Uninitialized,
+    Required,
+    Conflict,
+    Illegal,
+  };
 
-  bool operator==(const DotEncoding &rhs) const {
-    return encoding == rhs.encoding;
+  DotRewriteState() = default;
+  explicit DotRewriteState(Attribute enc)
+      : kind(Kind::Required), encoding(enc) {}
+
+  static DotRewriteState getConflict() {
+    DotRewriteState state;
+    state.kind = Kind::Conflict;
+    return state;
   }
 
-  bool isUninitialized() const { return !encoding.has_value(); }
-  bool isUnknown() const {
-    return encoding.has_value() && *encoding == nullptr;
+  static DotRewriteState getIllegal() {
+    DotRewriteState state;
+    state.kind = Kind::Illegal;
+    return state;
   }
+
+  bool operator==(const DotRewriteState &rhs) const {
+    return kind == rhs.kind && encoding == rhs.encoding;
+  }
+
+  bool isUninitialized() const { return kind == Kind::Uninitialized; }
+  bool isRequired() const { return kind == Kind::Required; }
+  bool isConflict() const { return kind == Kind::Conflict; }
+  bool isIllegal() const { return kind == Kind::Illegal; }
 
   Attribute getEncoding() const {
-    assert(!isUninitialized() && !isUnknown());
+    assert(isRequired() && "expected required dot encoding state");
     return *encoding;
   }
 
   void print(raw_ostream &os) const {
-    if (isUninitialized())
+    if (isUninitialized()) {
       os << "<uninitialized>";
-    else if (isUnknown())
-      os << "<unknown>";
-    else
+      return;
+    }
+    if (isConflict()) {
+      os << "<conflict>";
+      return;
+    }
+    if (isIllegal()) {
+      os << "<illegal>";
+      return;
+    }
+    if (isRequired()) {
       encoding->print(os);
+      return;
+    }
+    llvm_unreachable("unknown dot rewrite state");
   }
 
-  static DotEncoding meet(const DotEncoding &lhs, const DotEncoding &rhs) {
+  friend raw_ostream &operator<<(raw_ostream &os,
+                                 const DotRewriteState &state) {
+    state.print(os);
+    return os;
+  }
+
+  static DotRewriteState meet(const DotRewriteState &lhs,
+                              const DotRewriteState &rhs) {
+    if (lhs.isIllegal() || rhs.isIllegal())
+      return getIllegal();
     if (lhs.isUninitialized())
       return rhs;
     if (rhs.isUninitialized())
       return lhs;
     if (lhs == rhs)
       return lhs;
-    return DotEncoding(nullptr); // conflict
+    if (lhs.isConflict() || rhs.isConflict())
+      return getConflict();
+    return getConflict();
   }
 
-  static DotEncoding join(const DotEncoding &lhs, const DotEncoding &rhs) {
+  static DotRewriteState join(const DotRewriteState &lhs,
+                              const DotRewriteState &rhs) {
     return meet(lhs, rhs);
   }
 
 private:
+  Kind kind = Kind::Uninitialized;
   std::optional<Attribute> encoding;
 };
 
-class DotEncodingLattice : public Lattice<DotEncoding> {
+class DotRewriteLattice : public Lattice<DotRewriteState> {
 public:
   using Lattice::Lattice;
 };
 
-class DotEncodingBackward
-    : public SparseBackwardDataFlowAnalysis<DotEncodingLattice> {
+static bool isTrackedDotValue(Value value) {
+  return isa<RankedTensorType>(value.getType());
+}
+
+static bool isAllowedDotOperandUser(Operation *op, unsigned operandIndex) {
+  if (auto dotOp = dyn_cast<tt::DotOp>(op))
+    return operandIndex < 2 && operandIndex < dotOp->getNumOperands();
+
+  return isa<ttg::ConvertLayoutOp, RegionBranchOpInterface,
+             RegionBranchTerminatorOpInterface>(op);
+}
+
+class DotRewriteBackward
+    : public SparseBackwardDataFlowAnalysis<DotRewriteLattice> {
 public:
   using SparseBackwardDataFlowAnalysis::SparseBackwardDataFlowAnalysis;
 
+  void initializeEquivalentLatticeAnchor(Operation *top) override {
+    top->walk([&](ttg::ConvertLayoutOp cvt) {
+      if (!isTrackedDotValue(cvt.getSrc()) ||
+          !isTrackedDotValue(cvt.getResult()))
+        return;
+      unionLatticeAnchors<DotRewriteLattice>(cvt.getSrc(), cvt.getResult());
+    });
+  }
+
   LogicalResult
-  visitOperation(Operation *op, ArrayRef<DotEncodingLattice *> operands,
-                 ArrayRef<const DotEncodingLattice *> results) override {
+  visitOperation(Operation *op, ArrayRef<DotRewriteLattice *> operands,
+                 ArrayRef<const DotRewriteLattice *> results) override {
     // Seed from tt.DotOp: propagate the required dot-operand encoding to
     // the values that define operands A and B.
     if (auto dotOp = dyn_cast<tt::DotOp>(op)) {
@@ -107,33 +173,63 @@ public:
         auto type = cast<RankedTensorType>(dotOp.getOperand(i).getType());
         if (auto dotEnc =
                 dyn_cast<ttg::DotOperandEncodingAttr>(type.getEncoding())) {
-          ChangeResult changed = operands[i]->meet(DotEncoding(dotEnc));
+          ChangeResult changed = operands[i]->meet(DotRewriteState(dotEnc));
           propagateIfChanged(operands[i], changed);
         }
       }
       return success();
     }
 
-    // Passthrough for ConvertLayoutOp: the source should eventually carry
-    // the same dot-operand encoding (the convert becomes redundant).
-    if (isa<ttg::ConvertLayoutOp>(op)) {
-      auto resultEnc = results[0]->getValue();
-      if (!resultEnc.isUninitialized() && !resultEnc.isUnknown()) {
-        ChangeResult changed = operands[0]->meet(resultEnc);
-        propagateIfChanged(operands[0], changed);
-      }
-      return success();
+    // If a tracked tensor value is used by an unsupported operation, the
+    // require_layout rewrite is no longer legal for that entire carrier chain.
+    for (auto [index, operand] : llvm::enumerate(op->getOperands())) {
+      if (!isTrackedDotValue(operand))
+        continue;
+      if (isAllowedDotOperandUser(op, index))
+        continue;
+
+      DotRewriteState operandState = operands[index]->getValue();
+      if (operandState.isUninitialized())
+        continue;
+
+      ChangeResult changed =
+          operands[index]->meet(DotRewriteState::getIllegal());
+      propagateIfChanged(operands[index], changed);
     }
 
     return success();
   }
 
-  void visitBranchOperand(OpOperand &operand) override {}
-  void visitCallOperand(OpOperand &operand) override {}
+  void visitBranchOperand(OpOperand &operand) override {
+    if (!isTrackedDotValue(operand.get()))
+      return;
+
+    auto *lattice = getLatticeElement(operand.get());
+    DotRewriteState state = lattice->getValue();
+    if (state.isUninitialized())
+      return;
+
+    ChangeResult changed = lattice->meet(DotRewriteState::getIllegal());
+    propagateIfChanged(lattice, changed);
+  }
+
+  void visitCallOperand(OpOperand &operand) override {
+    if (!isTrackedDotValue(operand.get()))
+      return;
+
+    auto *lattice = getLatticeElement(operand.get());
+    DotRewriteState state = lattice->getValue();
+    if (state.isUninitialized())
+      return;
+
+    ChangeResult changed = lattice->meet(DotRewriteState::getIllegal());
+    propagateIfChanged(lattice, changed);
+  }
+
   void
   visitNonControlFlowArguments(RegionSuccessor &successor,
                                ArrayRef<BlockArgument> arguments) override {}
-  void setToExitState(DotEncodingLattice *lattice) override {}
+  void setToExitState(DotRewriteLattice *lattice) override {}
 };
 
 // ============================================================================
@@ -259,17 +355,21 @@ LogicalResult insertRequireLayout(ModuleOp m) {
   SymbolTableCollection symbolTable;
   DataFlowSolver solver;
   loadBaselineAnalyses(solver);
-  solver.load<DotEncodingBackward>(symbolTable);
+  solver.load<DotRewriteBackward>(symbolTable);
   if (failed(solver.initializeAndRun(m)))
     return failure();
 
   // --- Rewrite local_loads whose results require a dot-operand encoding ---
   m.walk([&](ttg::LocalLoadOp localLoadOp) {
     auto *lattice =
-        solver.lookupState<DotEncodingLattice>(localLoadOp.getResult());
-    if (!lattice || lattice->getValue().isUninitialized() ||
-        lattice->getValue().isUnknown())
+        solver.lookupState<DotRewriteLattice>(localLoadOp.getResult());
+    if (!lattice || lattice->getValue().isUninitialized())
       return;
+
+    if (lattice->getValue().isIllegal() || lattice->getValue().isConflict()) {
+      LDBG("Skipping local_load rewrite due to state: " << lattice->getValue());
+      return;
+    }
 
     auto dotEnc = dyn_cast<ttg::DotOperandEncodingAttr>(
         lattice->getValue().getEncoding());
