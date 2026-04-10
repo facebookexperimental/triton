@@ -58,6 +58,25 @@ LayoutEncoding LayoutEncoding::meet(const LayoutEncoding &lhs,
   llvm_unreachable("Conflicting layouts");
 }
 
+static bool isValidPermutation(ArrayRef<int32_t> order, unsigned rank) {
+  if (order.size() != rank)
+    return false;
+
+  SmallVector<char> seen(rank, 0);
+  for (int32_t dim : order) {
+    if (dim < 0 || static_cast<unsigned>(dim) >= rank || seen[dim])
+      return false;
+    seen[dim] = 1;
+  }
+  return true;
+}
+
+static bool
+isEffectivelyUnswizzledShared(ttg::SwizzledSharedEncodingAttr encoding) {
+  return encoding.getVec() == 1 && encoding.getPerPhase() == 1 &&
+         encoding.getMaxPhase() == 1;
+}
+
 //===----------------------------------------------------------------------===//
 // LayoutBackwardPropagation
 //===----------------------------------------------------------------------===//
@@ -134,9 +153,30 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
             mmaEncoding.getFp4Padded());
       } else if (auto swizzledEncoding =
                      dyn_cast<ttg::SwizzledSharedEncodingAttr>(resultEnc)) {
-        // Compute inverse permutation and apply it to the encoding order.
+        auto srcType =
+            cast<ttg::MemDescType>(memDescTransOp.getSrc().getType());
+        unsigned rank = srcType.getRank();
         auto transOrder = memDescTransOp.getOrder();
-        unsigned rank = transOrder.size();
+        if (!isValidPermutation(transOrder, rank) ||
+            swizzledEncoding.getOrder().size() != rank) {
+          LDBG("Skipping backward propagation through memdesc_trans for "
+               << "invalid swizzled_shared transpose metadata.");
+          assert(false &&
+                 "swizzled_shared backward propagation through memdesc_trans "
+                 "requires a valid transpose permutation");
+          return success();
+        }
+        if (!isEffectivelyUnswizzledShared(swizzledEncoding)) {
+          LDBG("Skipping backward propagation through memdesc_trans for "
+               << "nontrivial swizzled_shared encoding " << swizzledEncoding);
+          assert(false &&
+                 "swizzled_shared backward propagation through memdesc_trans "
+                 "only supports effectively unswizzled encodings");
+          return success();
+        }
+
+        // For effectively unswizzled shared layouts, inverting the transpose
+        // only needs to update the iteration order.
         SmallVector<unsigned> invOrder(rank);
         for (unsigned i = 0; i < rank; ++i)
           invOrder[transOrder[i]] = i;
