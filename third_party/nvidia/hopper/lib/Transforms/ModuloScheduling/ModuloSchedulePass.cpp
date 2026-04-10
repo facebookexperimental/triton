@@ -83,6 +83,9 @@ static void emitScheduleAttributes(scf::ForOp loop,
                      IntegerAttr::get(IntegerType::get(ctx, 32), stage));
     node.op->setAttr(tt::kLoopClusterAttrName,
                      IntegerAttr::get(IntegerType::get(ctx, 32), clusterId));
+    // Emit raw cycle for downstream buffer depth computation (Step 3).
+    node.op->setAttr("tt.modulo_cycle",
+                     IntegerAttr::get(IntegerType::get(ctx, 32), cycle));
   }
 
   // Ensure ALL ops in the loop body have loop.stage/loop.cluster attrs.
@@ -102,6 +105,129 @@ static void emitScheduleAttributes(scf::ForOp loop,
                 IntegerAttr::get(IntegerType::get(ctx, 32), II));
   loop->setAttr(tt::kScheduledMaxStageAttrName,
                 IntegerAttr::get(IntegerType::get(ctx, 32), maxStage));
+}
+
+// ============================================================================
+// Step 3: Derive per-resource buffer depths from modulo schedule
+// ============================================================================
+
+// Blackwell sm_100 SMEM budget (reserve some for barriers/scratch).
+constexpr int kSmemBudgetBytes = 228 * 1024;
+
+static int getMemDescSizeBytes(ttg::MemDescType memDescType) {
+  int numElements = 1;
+  for (auto dim : memDescType.getShape())
+    numElements *= dim;
+  return numElements * memDescType.getElementType().getIntOrFloatBitWidth() / 8;
+}
+
+/// Compute per-resource buffer depths from the modulo schedule.
+///
+/// For each local_alloc (SMEM buffer) in the loop body:
+///   1. Find its producer's cycle (tt.modulo_cycle on the load)
+///   2. Find the last consumer's end cycle (cycle + latency)
+///   3. lifetime = last_consumer_end - producer_cycle
+///   4. num_buffers = floor(lifetime / II) + 1
+///
+/// Then check SMEM budget: if total exceeds limit, reduce depths.
+/// Returns the max buffer depth, or 0 if no buffers found.
+static int computeBufferDepths(scf::ForOp loop,
+                               const ttg::LatencyModel &model) {
+  auto ctx = loop.getContext();
+  auto iiAttr = loop->getAttrOfType<IntegerAttr>("tt.modulo_ii");
+  if (!iiAttr)
+    return 0;
+  int II = iiAttr.getInt();
+  if (II <= 0)
+    return 0;
+
+  struct BufferInfo {
+    Operation *allocOp;
+    int sizeBytes;
+    int numBuffers;
+  };
+  SmallVector<BufferInfo> buffers;
+
+  for (auto &op : loop.getBody()->without_terminator()) {
+    auto alloc = dyn_cast<ttg::LocalAllocOp>(op);
+    if (!alloc || !alloc.getSrc())
+      continue;
+
+    auto memDescType = dyn_cast<ttg::MemDescType>(alloc.getType());
+    if (!memDescType)
+      continue;
+
+    // Find producer cycle from the source op.
+    auto *producer = alloc.getSrc().getDefiningOp();
+    if (!producer)
+      continue;
+    auto prodCycleAttr =
+        producer->getAttrOfType<IntegerAttr>("tt.modulo_cycle");
+    if (!prodCycleAttr)
+      continue;
+    int prodCycle = prodCycleAttr.getInt();
+
+    // Find last consumer end cycle.
+    int lastConsumerEnd = prodCycle;
+    for (auto *user : alloc->getUsers()) {
+      auto userCycleAttr =
+          user->getAttrOfType<IntegerAttr>("tt.modulo_cycle");
+      if (!userCycleAttr)
+        continue;
+      int userCycle = userCycleAttr.getInt();
+      auto info = model.getLatency(user);
+      lastConsumerEnd = std::max(lastConsumerEnd, userCycle + info.latency);
+    }
+
+    int lifetime = lastConsumerEnd - prodCycle;
+    int numBuffers = std::max(lifetime / II + 1, 1);
+    int sizeBytes = getMemDescSizeBytes(memDescType);
+    buffers.push_back({alloc, sizeBytes, numBuffers});
+
+    LDBG("Buffer: producer_cycle=" << prodCycle
+                                   << " last_consumer_end=" << lastConsumerEnd
+                                   << " lifetime=" << lifetime << " II=" << II
+                                   << " -> num_buffers=" << numBuffers
+                                   << " (" << sizeBytes << " bytes)");
+  }
+
+  if (buffers.empty())
+    return 0;
+
+  // SMEM budget check: reduce depths if total exceeds limit.
+  auto computeTotalSmem = [&]() {
+    int total = 0;
+    for (auto &b : buffers)
+      total += b.sizeBytes * b.numBuffers;
+    return total;
+  };
+
+  while (computeTotalSmem() > kSmemBudgetBytes) {
+    int worstIdx = 0, worstCost = 0;
+    for (int i = 0; i < (int)buffers.size(); ++i) {
+      int cost = buffers[i].sizeBytes * buffers[i].numBuffers;
+      if (cost > worstCost) {
+        worstCost = cost;
+        worstIdx = i;
+      }
+    }
+    if (buffers[worstIdx].numBuffers <= 1)
+      break;
+    buffers[worstIdx].numBuffers--;
+    LDBG("Reduced buffer depth for SMEM budget");
+  }
+
+  // Emit tt.num_buffers on each local_alloc.
+  int maxNumBuffers = 1;
+  for (auto &b : buffers) {
+    b.allocOp->setAttr("tt.num_buffers",
+                       IntegerAttr::get(IntegerType::get(ctx, 32), b.numBuffers));
+    maxNumBuffers = std::max(maxNumBuffers, b.numBuffers);
+  }
+
+  LDBG("Buffer depths: max=" << maxNumBuffers
+                              << " totalSmem=" << computeTotalSmem() << "B");
+  return maxNumBuffers;
 }
 
 // ============================================================================
@@ -171,6 +297,25 @@ struct ModuloSchedulePass
 
       // Emit loop.stage / loop.cluster on all ops.
       emitScheduleAttributes(innerLoop, ddg, *schedResult);
+
+      // Step 3: Derive SMEM buffer depths from cycle-level lifetimes.
+      // Only set tt.num_stages if the user didn't specify one (no
+      // tt.num_stages attr on the loop already).
+      if (!innerLoop->hasAttr(tt::kNumStagesAttrName)) {
+        int numStages = computeBufferDepths(innerLoop, model);
+        if (numStages > 0) {
+          auto ctx = innerLoop.getContext();
+          innerLoop->setAttr(
+              tt::kNumStagesAttrName,
+              IntegerAttr::get(IntegerType::get(ctx, 32), numStages));
+          LDBG("Set tt.num_stages=" << numStages << " from modulo schedule");
+        }
+      }
+
+      // Clean up tt.modulo_cycle — internal attr used only to pass cycle
+      // info from emitScheduleAttributes to computeBufferDepths.
+      for (auto &op : innerLoop.getBody()->without_terminator())
+        op.removeAttr("tt.modulo_cycle");
     }
 
     // Step 2: Schedule outer loops (persistent kernels).
