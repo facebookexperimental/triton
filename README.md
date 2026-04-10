@@ -550,7 +550,17 @@ Binary wheels are available for CPython 3.10-3.14.
   tlx.async_descriptor_store(desc, smem_buf, offsets)
   ```
 
+- `tlx.fence_mbarrier_init_cluster(scope)` issues a memory fence to make mbarrier init visible to cluster.
 
+  Example:
+  ```python
+  bars = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+  tlx.fence_mbarrier_init_cluster()
+  tlx.cluster_barrier()
+
+  # now bars is ready for cross CTA use
+  tlx.barrier_arrive(bar=bars[0], remote_cta_rank=1)
+  ```
 
 ### Cluster Launch Control (CLC)
 
