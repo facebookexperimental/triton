@@ -103,8 +103,7 @@ void init_triton_hopper_passes(py::module &&m) {
                      mlir::createNVGPUPartitionSchedulingMeta);
   ADD_PASS_WRAPPER_0("add_multi_cta_reduction",
                      mlir::createNVGPUMultiCTAReduction);
-  ADD_PASS_WRAPPER_0("add_modulo_schedule",
-                     mlir::createNVGPUModuloSchedule);
+  ADD_PASS_WRAPPER_0("add_modulo_schedule", mlir::createNVGPUModuloSchedule);
 }
 
 static void checkMatmulConstraints(const std::string &A_dtype,

@@ -21,7 +21,6 @@ namespace mlir::triton::gpu {
 
 namespace ttng = mlir::triton::nvidia_gpu;
 
-
 unsigned DataDependenceGraph::addNode(Operation *op,
                                       const LatencyModel &model) {
   auto info = model.getLatency(op);

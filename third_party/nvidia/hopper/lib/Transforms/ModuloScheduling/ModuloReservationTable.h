@@ -3,9 +3,9 @@
 
 #include "DataDependenceGraph.h"
 
+#include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
-#include "mlir/Support/LogicalResult.h"
 
 namespace mlir::triton::gpu {
 
