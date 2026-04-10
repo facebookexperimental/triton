@@ -144,9 +144,9 @@ struct AllocateWarpGroups
       } else {
         // No user-provided IDs (or they cover all partitions already).
         // Sort by size descending (stable to preserve order for equal sizes).
-        llvm::stable_sort(
-            idxAndSize,
-            [&](auto lhs, auto rhs) { return lhs.second > rhs.second; });
+        llvm::stable_sort(idxAndSize, [&](auto lhs, auto rhs) {
+          return lhs.second > rhs.second;
+        });
 
         int startId = baseNumWarps;
         for (auto [i, size] : idxAndSize) {
