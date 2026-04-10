@@ -21,3 +21,7 @@ jobs:
           sudo nvidia-smi -pm 1
           sudo ldconfig
           nvidia-smi
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
+  cancel-in-progress: true
