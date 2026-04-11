@@ -130,8 +130,8 @@ BarrierDeadlockAnalysis::resolveBarrier(Value barrierVal,
     if (auto partitionsOp =
             dyn_cast<gpu::WarpSpecializePartitionsOp>(parentOp)) {
       unsigned argIndex = blockArg.getArgNumber();
-      if (auto wsOp = dyn_cast<gpu::WarpSpecializeOp>(
-              partitionsOp->getParentOp())) {
+      if (auto wsOp =
+              dyn_cast<gpu::WarpSpecializeOp>(partitionsOp->getParentOp())) {
         if (argIndex < wsOp.getExplicitCaptures().size()) {
           tracedSrc = wsOp.getExplicitCaptures()[argIndex];
           continue;
@@ -232,8 +232,7 @@ BarrierDeadlockAnalysis::tryEvalInt(Value val, int64_t loopVar,
 // Loop unrolling and trace construction
 //===----------------------------------------------------------------------===//
 
-void BarrierDeadlockAnalysis::unrollLoop(mlir::scf::ForOp forOp,
-                                         int64_t taskId,
+void BarrierDeadlockAnalysis::unrollLoop(mlir::scf::ForOp forOp, int64_t taskId,
                                          const std::string &taskName,
                                          TaskTrace &trace,
                                          OperandRange captures) {
@@ -287,8 +286,7 @@ void BarrierDeadlockAnalysis::unrollLoop(mlir::scf::ForOp forOp,
         concreteOp.kind = BarrierOpKind::Wait;
         auto [name, slot] = resolveBarrier(waitOp.getAlloc(), captures);
         concreteOp.allocName = name;
-        concreteOp.slotIndex =
-            resolveDynSlot(waitOp.getAlloc(), slot, k);
+        concreteOp.slotIndex = resolveDynSlot(waitOp.getAlloc(), slot, k);
 
         // Resolve phase: try direct eval, then iter_args
         auto phaseVal = tryEvalInt(waitOp.getPhase(), k, inductionVar);
@@ -303,8 +301,7 @@ void BarrierDeadlockAnalysis::unrollLoop(mlir::scf::ForOp forOp,
         concreteOp.phase = phaseVal.value_or(-1);
         isBarrierOp = true;
 
-      } else if (auto arriveOp =
-                     dyn_cast<nvidia_gpu::ArriveBarrierOp>(&op)) {
+      } else if (auto arriveOp = dyn_cast<nvidia_gpu::ArriveBarrierOp>(&op)) {
         concreteOp.kind = BarrierOpKind::ArriveSync;
         auto [name, slot] = resolveBarrier(arriveOp.getAlloc(), captures);
         concreteOp.allocName = name;
@@ -312,8 +309,7 @@ void BarrierDeadlockAnalysis::unrollLoop(mlir::scf::ForOp forOp,
         concreteOp.arriveCount = arriveOp.getCount();
         isBarrierOp = true;
 
-      } else if (auto expectOp =
-                     dyn_cast<nvidia_gpu::BarrierExpectOp>(&op)) {
+      } else if (auto expectOp = dyn_cast<nvidia_gpu::BarrierExpectOp>(&op)) {
         concreteOp.kind = BarrierOpKind::ExpectBytes;
         auto [name, slot] = resolveBarrier(expectOp.getAlloc(), captures);
         concreteOp.allocName = name;
@@ -455,8 +451,8 @@ void BarrierDeadlockAnalysis::printSummary(llvm::raw_ostream &os) const {
 
   os << "\nTask traces:\n";
   for (const auto &task : taskTraces) {
-    os << "  " << task.taskName << " (task " << task.taskId << "): "
-       << task.ops.size() << " barrier ops\n";
+    os << "  " << task.taskName << " (task " << task.taskId
+       << "): " << task.ops.size() << " barrier ops\n";
     for (const auto &op : task.ops) {
       os << "    [" << op.position << "] " << barrierOpKindToString(op.kind)
          << " " << op.allocName << "[" << op.slotIndex << "]";
