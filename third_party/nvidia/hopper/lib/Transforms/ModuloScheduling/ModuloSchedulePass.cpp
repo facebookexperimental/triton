@@ -170,8 +170,7 @@ static int computeBufferDepths(scf::ForOp loop,
     // Find last consumer end cycle.
     int lastConsumerEnd = prodCycle;
     for (auto *user : alloc->getUsers()) {
-      auto userCycleAttr =
-          user->getAttrOfType<IntegerAttr>("tt.modulo_cycle");
+      auto userCycleAttr = user->getAttrOfType<IntegerAttr>("tt.modulo_cycle");
       if (!userCycleAttr)
         continue;
       int userCycle = userCycleAttr.getInt();
@@ -184,11 +183,10 @@ static int computeBufferDepths(scf::ForOp loop,
     int sizeBytes = getMemDescSizeBytes(memDescType);
     buffers.push_back({alloc, sizeBytes, numBuffers});
 
-    LDBG("Buffer: producer_cycle=" << prodCycle
-                                   << " last_consumer_end=" << lastConsumerEnd
-                                   << " lifetime=" << lifetime << " II=" << II
-                                   << " -> num_buffers=" << numBuffers
-                                   << " (" << sizeBytes << " bytes)");
+    LDBG("Buffer: producer_cycle="
+         << prodCycle << " last_consumer_end=" << lastConsumerEnd
+         << " lifetime=" << lifetime << " II=" << II
+         << " -> num_buffers=" << numBuffers << " (" << sizeBytes << " bytes)");
   }
 
   if (buffers.empty())
@@ -223,13 +221,14 @@ static int computeBufferDepths(scf::ForOp loop,
   // Emit tt.num_buffers on each local_alloc.
   int maxNumBuffers = 1;
   for (auto &b : buffers) {
-    b.allocOp->setAttr("tt.num_buffers",
-                       IntegerAttr::get(IntegerType::get(ctx, 32), b.numBuffers));
+    b.allocOp->setAttr(
+        "tt.num_buffers",
+        IntegerAttr::get(IntegerType::get(ctx, 32), b.numBuffers));
     maxNumBuffers = std::max(maxNumBuffers, b.numBuffers);
   }
 
   LDBG("Buffer depths: max=" << maxNumBuffers
-                              << " totalSmem=" << computeTotalSmem() << "B");
+                             << " totalSmem=" << computeTotalSmem() << "B");
   return maxNumBuffers;
 }
 
@@ -341,7 +340,7 @@ struct ModuloSchedulePass
         continue;
 
       LDBG("Outer DDG: " << outerDDG.getNumNodes() << " nodes, "
-                          << outerDDG.getEdges().size() << " edges");
+                         << outerDDG.getEdges().size() << " edges");
 
       auto outerSched = ttg::runModuloScheduling(outerDDG);
       if (failed(outerSched)) {

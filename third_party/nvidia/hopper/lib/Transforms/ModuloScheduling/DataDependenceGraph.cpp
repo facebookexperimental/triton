@@ -75,8 +75,7 @@ static InnerLoopInfo computeInnerLoopInfo(scf::ForOp innerLoop,
   auto ub = innerLoop.getUpperBound().getDefiningOp<arith::ConstantIntOp>();
   auto step = innerLoop.getStep().getDefiningOp<arith::ConstantIntOp>();
   if (lb && ub && step && step.value() > 0) {
-    int64_t tc =
-        (ub.value() - lb.value() + step.value() - 1) / step.value();
+    int64_t tc = (ub.value() - lb.value() + step.value() - 1) / step.value();
     if (tc > 0) {
       info.tripCount = static_cast<int>(tc);
       info.tripCountIsEstimated = false;
@@ -181,11 +180,12 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
         node.op = &op;
         node.idx = prologueIdx;
         node.pipeline = HWPipeline::MEM;
-        int memLat =
-            info.stageLoads.empty() ? kFallbackTMATotalLatency : info.stageLoads[0].totalLatency;
+        int memLat = info.stageLoads.empty() ? kFallbackTMATotalLatency
+                                             : info.stageLoads[0].totalLatency;
         node.latency = std::max(memLat, 1);
-        node.selfLatency =
-            info.stageLoads.empty() ? kFallbackTMASelfLatency : info.stageLoads[0].memSelfLatency;
+        node.selfLatency = info.stageLoads.empty()
+                               ? kFallbackTMASelfLatency
+                               : info.stageLoads[0].memSelfLatency;
         node.selfLatency = std::max(node.selfLatency, 1);
         ddg.nodes.push_back(node);
       }
@@ -222,8 +222,9 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
         ddg.nodes.push_back(node);
       }
 
-      ddg.opToIdx[&op] = epilogueIdx;        // producer: results come from epilogue
-      ddg.consumerOpToIdx[&op] = prologueIdx; // consumer: data enters at prologue
+      ddg.opToIdx[&op] = epilogueIdx; // producer: results come from epilogue
+      ddg.consumerOpToIdx[&op] =
+          prologueIdx; // consumer: data enters at prologue
       ddg.addEdge(prologueIdx, kloopIdx, ddg.nodes[prologueIdx].latency,
                   /*distance=*/0);
       ddg.addEdge(kloopIdx, epilogueIdx, ddg.nodes[kloopIdx].latency,

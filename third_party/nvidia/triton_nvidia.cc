@@ -104,6 +104,8 @@ void init_triton_hopper_passes(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_multi_cta_reduction",
                      mlir::createNVGPUMultiCTAReduction);
   ADD_PASS_WRAPPER_0("add_modulo_schedule", mlir::createNVGPUModuloSchedule);
+  ADD_PASS_WRAPPER_0("add_modulo_ws_partition",
+                     mlir::createNVGPUModuloWSPartition);
 }
 
 static void checkMatmulConstraints(const std::string &A_dtype,
