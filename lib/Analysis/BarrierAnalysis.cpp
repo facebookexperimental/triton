@@ -13,6 +13,8 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 
+#include <functional>
+
 namespace mlir::triton {
 
 namespace gpu = triton::gpu;
@@ -65,6 +67,24 @@ void BarrierDeadlockAnalysis::collectBarrierAllocs() {
     if (!memDescType.getElementType().isInteger(64))
       return;
 
+    // Skip cluster barriers (used with map_to_remote_buffer).
+    // These are inter-CTA barriers that require multi-CTA modeling.
+    bool isClusterBarrier = false;
+    for (auto *user : result.getUsers()) {
+      if (auto indexOp = dyn_cast<gpu::MemDescIndexOp>(user)) {
+        for (auto *indexUser : indexOp.getResult().getUsers()) {
+          if (isa<nvidia_gpu::MapToRemoteBufferOp>(indexUser)) {
+            isClusterBarrier = true;
+            break;
+          }
+        }
+      }
+      if (isClusterBarrier)
+        break;
+    }
+    if (isClusterBarrier)
+      return;
+
     // Try to get a name from the location
     std::string name;
     if (auto nameLoc = dyn_cast<NameLoc>(allocOp.getLoc())) {
@@ -108,6 +128,18 @@ void BarrierDeadlockAnalysis::collectBarrierAllocs() {
 //===----------------------------------------------------------------------===//
 
 void BarrierDeadlockAnalysis::collectInitialArrives() {
+  // Get total threads in the CTA for perThread arrives
+  int64_t totalThreads = 128; // default: 4 warps * 32
+  if (auto mod = funcOp->getParentOfType<ModuleOp>()) {
+    int64_t numWarps = 4;
+    int64_t threadsPerWarp = 32;
+    if (auto attr = mod->getAttrOfType<IntegerAttr>("ttg.num-warps"))
+      numWarps = attr.getInt();
+    if (auto attr = mod->getAttrOfType<IntegerAttr>("ttg.threads-per-warp"))
+      threadsPerWarp = attr.getInt();
+    totalThreads = numWarps * threadsPerWarp;
+  }
+
   // Walk barrier ops that are OUTSIDE warp_specialize regions but inside the
   // function. These represent pre-task arrives that set the initial barrier
   // state (e.g., pre-arriving "empty" barriers so the producer can start).
@@ -138,7 +170,10 @@ void BarrierDeadlockAnalysis::collectInitialArrives() {
       if (slotIdx < 0)
         return;
       std::string key = allocName + "_" + std::to_string(slotIdx);
-      initialArrives[key] += arriveOp.getCount();
+      int64_t count = arriveOp.getCount();
+      if (arriveOp.getPerThread())
+        count *= totalThreads;
+      initialArrives[key] += count;
 
     } else if (auto expectOp = dyn_cast<nvidia_gpu::BarrierExpectOp>(op)) {
       auto indexOp = dyn_cast_or_null<gpu::MemDescIndexOp>(
@@ -174,9 +209,15 @@ void BarrierDeadlockAnalysis::collectInitialArrives() {
 std::pair<std::string, int64_t>
 BarrierDeadlockAnalysis::resolveBarrier(Value barrierVal,
                                         OperandRange captures) {
+  // Trace through map_to_remote_buffer to the underlying local memdesc.
+  Value tracedBarrier = barrierVal;
+  if (auto mapOp = dyn_cast_or_null<nvidia_gpu::MapToRemoteBufferOp>(
+          tracedBarrier.getDefiningOp()))
+    tracedBarrier = mapOp.getSrc();
+
   // Trace through memdesc_index to find (allocName, slotIndex)
   auto indexOp =
-      dyn_cast_or_null<gpu::MemDescIndexOp>(barrierVal.getDefiningOp());
+      dyn_cast_or_null<gpu::MemDescIndexOp>(tracedBarrier.getDefiningOp());
   if (!indexOp)
     return {"", -1};
 
@@ -221,11 +262,12 @@ BarrierDeadlockAnalysis::resolveBarrier(Value barrierVal,
 // Concrete integer expression evaluation
 //===----------------------------------------------------------------------===//
 
-std::optional<int64_t>
-BarrierDeadlockAnalysis::tryEvalInt(Value val, int64_t loopVar,
-                                    Value loopInductionVar) {
-  if (val == loopInductionVar)
-    return loopVar;
+std::optional<int64_t> BarrierDeadlockAnalysis::tryEvalInt(
+    Value val, const DenseMap<Value, int64_t> &knownValues) {
+  // Check if this value is in the known values map (induction var, iter_args)
+  auto it = knownValues.find(val);
+  if (it != knownValues.end())
+    return it->second;
 
   if (auto constOp = val.getDefiningOp<arith::ConstantIntOp>())
     return constOp.value();
@@ -239,14 +281,14 @@ BarrierDeadlockAnalysis::tryEvalInt(Value val, int64_t loopVar,
 
   // Handle unary ops first (1 operand) — must come before the binary check
   if (isa<arith::ExtUIOp, arith::ExtSIOp, arith::TruncIOp>(defOp))
-    return tryEvalInt(defOp->getOperand(0), loopVar, loopInductionVar);
+    return tryEvalInt(defOp->getOperand(0), knownValues);
 
   // Binary ops require 2 operands
   if (defOp->getNumOperands() < 2)
     return std::nullopt;
 
-  auto lhs = tryEvalInt(defOp->getOperand(0), loopVar, loopInductionVar);
-  auto rhs = tryEvalInt(defOp->getOperand(1), loopVar, loopInductionVar);
+  auto lhs = tryEvalInt(defOp->getOperand(0), knownValues);
+  auto rhs = tryEvalInt(defOp->getOperand(1), knownValues);
   if (!lhs || !rhs)
     return std::nullopt;
 
@@ -294,43 +336,131 @@ BarrierDeadlockAnalysis::tryEvalInt(Value val, int64_t loopVar,
 }
 
 //===----------------------------------------------------------------------===//
+// Barrier op detection helper
+//===----------------------------------------------------------------------===//
+
+bool BarrierDeadlockAnalysis::tryAppendBarrierOp(
+    Operation &op, int64_t taskId, const std::string &taskName,
+    TaskTrace &trace, OperandRange captures,
+    const DenseMap<Value, int64_t> &knownValues, int64_t iteration,
+    int64_t numThreads) {
+  // Helper to resolve dynamic slot indices.
+  auto resolveDynSlot = [&](Value alloc, int64_t staticSlot) -> int64_t {
+    if (staticSlot >= 0)
+      return staticSlot;
+    Value traced = alloc;
+    if (auto mapOp = dyn_cast_or_null<nvidia_gpu::MapToRemoteBufferOp>(
+            traced.getDefiningOp()))
+      traced = mapOp.getSrc();
+    if (auto indexOp =
+            dyn_cast_or_null<gpu::MemDescIndexOp>(traced.getDefiningOp())) {
+      if (auto evalIdx = tryEvalInt(indexOp.getIndex(), knownValues))
+        return *evalIdx;
+    }
+    return staticSlot;
+  };
+
+  ConcreteBarrierOp concreteOp;
+  concreteOp.taskId = taskId;
+  concreteOp.taskName = taskName;
+  concreteOp.iteration = iteration;
+
+  bool isBarrierOp = false;
+
+  if (auto waitOp = dyn_cast<nvidia_gpu::WaitBarrierOp>(&op)) {
+    concreteOp.kind = BarrierOpKind::Wait;
+    auto [name, slot] = resolveBarrier(waitOp.getAlloc(), captures);
+    concreteOp.allocName = name;
+    concreteOp.slotIndex = resolveDynSlot(waitOp.getAlloc(), slot);
+    concreteOp.phase = tryEvalInt(waitOp.getPhase(), knownValues).value_or(-1);
+    isBarrierOp = true;
+
+  } else if (auto arriveOp = dyn_cast<nvidia_gpu::ArriveBarrierOp>(&op)) {
+    concreteOp.kind = BarrierOpKind::ArriveSync;
+    auto [name, slot] = resolveBarrier(arriveOp.getAlloc(), captures);
+    concreteOp.allocName = name;
+    concreteOp.slotIndex = resolveDynSlot(arriveOp.getAlloc(), slot);
+    int64_t count = arriveOp.getCount();
+    if (arriveOp.getPerThread())
+      count *= numThreads;
+    concreteOp.arriveCount = count;
+    isBarrierOp = true;
+
+  } else if (auto expectOp = dyn_cast<nvidia_gpu::BarrierExpectOp>(&op)) {
+    concreteOp.kind = BarrierOpKind::ExpectBytes;
+    auto [name, slot] = resolveBarrier(expectOp.getAlloc(), captures);
+    concreteOp.allocName = name;
+    concreteOp.slotIndex = resolveDynSlot(expectOp.getAlloc(), slot);
+    concreteOp.expectedBytes = expectOp.getSize();
+    concreteOp.arriveCount = 1;
+    isBarrierOp = true;
+
+  } else if (auto tmaOp =
+                 dyn_cast<nvidia_gpu::AsyncTMACopyGlobalToLocalOp>(&op)) {
+    concreteOp.kind = BarrierOpKind::TmaLoad;
+    auto [name, slot] = resolveBarrier(tmaOp.getBarrier(), captures);
+    concreteOp.allocName = name;
+    concreteOp.slotIndex = resolveDynSlot(tmaOp.getBarrier(), slot);
+    concreteOp.arriveCount = 0;
+    isBarrierOp = true;
+  }
+
+  if (isBarrierOp && !concreteOp.allocName.empty() &&
+      concreteOp.slotIndex >= 0) {
+    std::string locStr;
+    llvm::raw_string_ostream locOs(locStr);
+    op.getLoc()->print(locOs);
+    concreteOp.locInfo = locStr;
+    concreteOp.position = trace.ops.size();
+    trace.ops.push_back(concreteOp);
+    return true;
+  }
+  return false;
+}
+
+//===----------------------------------------------------------------------===//
 // Loop unrolling and trace construction
 //===----------------------------------------------------------------------===//
 
 void BarrierDeadlockAnalysis::unrollLoop(mlir::scf::ForOp forOp, int64_t taskId,
                                          const std::string &taskName,
                                          TaskTrace &trace,
-                                         OperandRange captures) {
+                                         OperandRange captures,
+                                         int64_t numThreads) {
   auto lbConst = forOp.getLowerBound().getDefiningOp<arith::ConstantIntOp>();
   auto stepConst = forOp.getStep().getDefiningOp<arith::ConstantIntOp>();
 
   int64_t lb = lbConst ? lbConst.value() : 0;
   int64_t step = stepConst ? stepConst.value() : 1;
-  int64_t ub = unrollBound > 0 ? unrollBound : 5;
+  int64_t numIters = unrollBound > 0 ? unrollBound : 5;
+
+  // Try to resolve the loop's actual upper bound.
+  std::optional<int64_t> resolvedUb;
+  if (auto intOp = forOp.getUpperBound().getDefiningOp<arith::ConstantIntOp>())
+    resolvedUb = intOp.value();
+  else if (auto idxOp =
+               forOp.getUpperBound().getDefiningOp<arith::ConstantIndexOp>())
+    resolvedUb = idxOp.value();
+
+  // Compute the effective upper bound for unrolling.
+  // If the loop's actual upper bound is known, use it (capped by numIters).
+  // If unknown, use numIters * step as an ABSOLUTE ceiling (not relative to
+  // lb). This ensures that loops with different lower bounds but the same
+  // unknown upper bound get different iteration counts, matching the real
+  // behavior where a producer loop starting at 0 runs more iterations than
+  // a consumer loop starting at a positive offset.
+  int64_t effectiveUb;
+  if (resolvedUb) {
+    int64_t maxUb = lb + numIters * step;
+    effectiveUb = std::min(*resolvedUb, maxUb);
+  } else {
+    effectiveUb = numIters * step;
+    // Ensure at least 1 iteration when lb > 0.
+    if (effectiveUb <= lb)
+      effectiveUb = lb + step;
+  }
 
   Value inductionVar = forOp.getInductionVar();
-
-  // Resolve slot index dynamically when it depends on the loop variable
-  auto resolveDynSlot = [&](Value alloc, int64_t staticSlot,
-                            int64_t k) -> int64_t {
-    if (staticSlot >= 0)
-      return staticSlot;
-    if (auto indexOp =
-            dyn_cast_or_null<gpu::MemDescIndexOp>(alloc.getDefiningOp())) {
-      if (auto evalIdx = tryEvalInt(indexOp.getIndex(), k, inductionVar))
-        return *evalIdx;
-    }
-    return staticSlot;
-  };
-
-  // Track iter_args (e.g., phase variable) across iterations
-  SmallVector<int64_t> iterArgValues;
-  for (auto initVal : forOp.getInitArgs()) {
-    if (auto constOp = initVal.getDefiningOp<arith::ConstantIntOp>())
-      iterArgValues.push_back(constOp.value());
-    else
-      iterArgValues.push_back(0);
-  }
 
   auto &bodyBlock = forOp.getRegion().front();
   // Block args: [inductionVar, iterArg0, iterArg1, ...]
@@ -338,109 +468,112 @@ void BarrierDeadlockAnalysis::unrollLoop(mlir::scf::ForOp forOp, int64_t taskId,
   for (unsigned i = 1; i < bodyBlock.getNumArguments(); ++i)
     iterArgBlockArgs.push_back(bodyBlock.getArgument(i));
 
-  for (int64_t k = lb; k < lb + ub * step; k += step) {
-    for (auto &op : bodyBlock) {
-      ConcreteBarrierOp concreteOp;
-      concreteOp.taskId = taskId;
-      concreteOp.taskName = taskName;
-      concreteOp.iteration = k;
+  // Track iter_args (e.g., phase variable, accum_cnt) across iterations.
+  // Try to resolve initial values; default to 0 for while-loop carried args.
+  SmallVector<int64_t> iterArgValues;
+  for (auto initVal : forOp.getInitArgs()) {
+    if (auto constOp = initVal.getDefiningOp<arith::ConstantIntOp>())
+      iterArgValues.push_back(constOp.value());
+    else if (auto constOp = initVal.getDefiningOp<arith::ConstantIndexOp>())
+      iterArgValues.push_back(constOp.value());
+    else
+      iterArgValues.push_back(0);
+  }
 
-      bool isBarrierOp = false;
+  // Build known values map: induction var + all iter_arg block args.
+  // This is rebuilt at each iteration with updated values.
+  auto buildKnownValues = [&](int64_t k) -> DenseMap<Value, int64_t> {
+    DenseMap<Value, int64_t> known;
+    known[inductionVar] = k;
+    for (unsigned i = 0; i < iterArgBlockArgs.size(); ++i)
+      known[iterArgBlockArgs[i]] = iterArgValues[i];
+    return known;
+  };
 
-      if (auto waitOp = dyn_cast<nvidia_gpu::WaitBarrierOp>(&op)) {
-        concreteOp.kind = BarrierOpKind::Wait;
-        auto [name, slot] = resolveBarrier(waitOp.getAlloc(), captures);
-        concreteOp.allocName = name;
-        concreteOp.slotIndex = resolveDynSlot(waitOp.getAlloc(), slot, k);
+  // Recursive helper: process all ops in a block, handling nested for loops.
+  // `known` is passed by reference so that nested loop results are visible
+  // to subsequent ops in the same block (e.g., ops after an inner for loop
+  // that reference the inner loop's result values).
+  std::function<void(Block &, DenseMap<Value, int64_t> &, int64_t)>
+      processBlockOps = [&](Block &block, DenseMap<Value, int64_t> &known,
+                            int64_t outerIter) {
+        for (auto &op : block) {
+          // Handle nested scf.for: unroll inline and map results.
+          if (auto nestedFor = dyn_cast<scf::ForOp>(&op)) {
+            int64_t innerLb =
+                tryEvalInt(nestedFor.getLowerBound(), known).value_or(0);
+            int64_t innerStep =
+                tryEvalInt(nestedFor.getStep(), known).value_or(1);
+            auto innerUbOpt = tryEvalInt(nestedFor.getUpperBound(), known);
+            int64_t innerUb;
+            if (innerUbOpt)
+              innerUb = *innerUbOpt;
+            else
+              innerUb =
+                  innerLb + (unrollBound > 0 ? unrollBound : 5) * innerStep;
 
-        // Resolve phase: try direct eval, then iter_args
-        auto phaseVal = tryEvalInt(waitOp.getPhase(), k, inductionVar);
-        if (!phaseVal) {
-          for (unsigned i = 0; i < iterArgBlockArgs.size(); ++i) {
-            if (waitOp.getPhase() == iterArgBlockArgs[i]) {
-              phaseVal = iterArgValues[i];
-              break;
+            // Resolve init arg values using outer known values.
+            auto &innerBlock = nestedFor.getRegion().front();
+            SmallVector<int64_t> innerIterArgVals;
+            for (auto initVal : nestedFor.getInitArgs())
+              innerIterArgVals.push_back(
+                  tryEvalInt(initVal, known).value_or(0));
+
+            SmallVector<Value> innerIterArgBAs;
+            for (unsigned i = 1; i < innerBlock.getNumArguments(); ++i)
+              innerIterArgBAs.push_back(innerBlock.getArgument(i));
+
+            Value innerIndVar = nestedFor.getInductionVar();
+
+            for (int64_t ik = innerLb; ik < innerUb; ik += innerStep) {
+              // Build inner known: inherit outer, add inner loop vars.
+              DenseMap<Value, int64_t> innerKnown = known;
+              innerKnown[innerIndVar] = ik;
+              for (unsigned i = 0; i < innerIterArgBAs.size(); ++i)
+                innerKnown[innerIterArgBAs[i]] = innerIterArgVals[i];
+
+              // Recursively process inner block (handles deeper nesting).
+              processBlockOps(innerBlock, innerKnown, outerIter);
+
+              // Update inner iter_arg values for next iteration.
+              auto *innerTerm = innerBlock.getTerminator();
+              if (auto yieldOp = dyn_cast<scf::YieldOp>(innerTerm)) {
+                for (unsigned i = 0; i < yieldOp.getNumOperands() &&
+                                     i < innerIterArgVals.size();
+                     ++i) {
+                  auto nv = tryEvalInt(yieldOp.getOperand(i), innerKnown);
+                  if (nv)
+                    innerIterArgVals[i] = *nv;
+                }
+              }
             }
+
+            // Map inner loop results to final values in outer known.
+            for (unsigned i = 0;
+                 i < nestedFor.getNumResults() && i < innerIterArgVals.size();
+                 ++i)
+              known[nestedFor.getResult(i)] = innerIterArgVals[i];
+
+            continue;
           }
+
+          // Barrier op detection — delegate to shared helper.
+          tryAppendBarrierOp(op, taskId, taskName, trace, captures, known,
+                             outerIter, numThreads);
         }
-        concreteOp.phase = phaseVal.value_or(-1);
-        isBarrierOp = true;
+      };
 
-      } else if (auto arriveOp = dyn_cast<nvidia_gpu::ArriveBarrierOp>(&op)) {
-        concreteOp.kind = BarrierOpKind::ArriveSync;
-        auto [name, slot] = resolveBarrier(arriveOp.getAlloc(), captures);
-        concreteOp.allocName = name;
-        concreteOp.slotIndex = resolveDynSlot(arriveOp.getAlloc(), slot, k);
-        concreteOp.arriveCount = arriveOp.getCount();
-        isBarrierOp = true;
+  for (int64_t k = lb; k < effectiveUb; k += step) {
+    auto knownValues = buildKnownValues(k);
 
-      } else if (auto expectOp = dyn_cast<nvidia_gpu::BarrierExpectOp>(&op)) {
-        concreteOp.kind = BarrierOpKind::ExpectBytes;
-        auto [name, slot] = resolveBarrier(expectOp.getAlloc(), captures);
-        concreteOp.allocName = name;
-        concreteOp.slotIndex = resolveDynSlot(expectOp.getAlloc(), slot, k);
-        concreteOp.expectedBytes = expectOp.getSize();
-        // barrier_expect does arrive (PTX mbarrier.arrive.expect_tx)
-        concreteOp.arriveCount = 1;
-        isBarrierOp = true;
-
-      } else if (auto tmaOp =
-                     dyn_cast<nvidia_gpu::AsyncTMACopyGlobalToLocalOp>(&op)) {
-        concreteOp.kind = BarrierOpKind::TmaLoad;
-        auto [name, slot] = resolveBarrier(tmaOp.getBarrier(), captures);
-        concreteOp.allocName = name;
-        concreteOp.slotIndex = resolveDynSlot(tmaOp.getBarrier(), slot, k);
-        // TMA load does NOT arrive; only contributes bytes
-        concreteOp.arriveCount = 0;
-        isBarrierOp = true;
-      }
-
-      if (isBarrierOp) {
-        std::string locStr;
-        llvm::raw_string_ostream locOs(locStr);
-        op.getLoc()->print(locOs);
-        concreteOp.locInfo = locStr;
-        concreteOp.position = trace.ops.size();
-        trace.ops.push_back(concreteOp);
-      }
-    }
+    processBlockOps(bodyBlock, knownValues, k);
 
     // Update iter_arg values for next iteration
     auto *terminator = bodyBlock.getTerminator();
     if (auto yieldOp = dyn_cast<scf::YieldOp>(terminator)) {
       for (unsigned i = 0;
            i < yieldOp.getNumOperands() && i < iterArgValues.size(); ++i) {
-        auto newVal = tryEvalInt(yieldOp.getOperand(i), k, inductionVar);
-
-        // If direct eval fails, try resolving through iter_args
-        if (!newVal) {
-          for (unsigned j = 0; j < iterArgBlockArgs.size(); ++j) {
-            if (yieldOp.getOperand(i) == iterArgBlockArgs[j]) {
-              newVal = iterArgValues[j];
-              break;
-            }
-          }
-        }
-
-        // Handle XOR pattern: phase = old_phase ^ (buf == NUM_STAGES-1)
-        if (!newVal) {
-          if (auto xorOp =
-                  yieldOp.getOperand(i).getDefiningOp<arith::XOrIOp>()) {
-            auto lhsVal = tryEvalInt(xorOp.getLhs(), k, inductionVar);
-            auto rhsVal = tryEvalInt(xorOp.getRhs(), k, inductionVar);
-            if (!lhsVal) {
-              for (unsigned j = 0; j < iterArgBlockArgs.size(); ++j) {
-                if (xorOp.getLhs() == iterArgBlockArgs[j]) {
-                  lhsVal = iterArgValues[j];
-                  break;
-                }
-              }
-            }
-            if (lhsVal && rhsVal)
-              newVal = *lhsVal ^ *rhsVal;
-          }
-        }
-
+        auto newVal = tryEvalInt(yieldOp.getOperand(i), knownValues);
         if (newVal)
           iterArgValues[i] = *newVal;
       }
@@ -451,6 +584,31 @@ void BarrierDeadlockAnalysis::unrollLoop(mlir::scf::ForOp forOp, int64_t taskId,
 //===----------------------------------------------------------------------===//
 // Build task traces from warp_specialize regions
 //===----------------------------------------------------------------------===//
+
+/// Recursively find and process all barrier ops in a block: standalone barrier
+/// ops (outside loops) are appended directly; scf.for loops are unrolled;
+/// scf.while bodies (persistent loop wrappers) are recursed into.
+static void processBlockBarrierOps(Block &block,
+                                   BarrierDeadlockAnalysis &analysis,
+                                   int64_t taskId, const std::string &taskName,
+                                   TaskTrace &trace, OperandRange captures,
+                                   int64_t numThreads) {
+  DenseMap<Value, int64_t> emptyKnown;
+  for (auto &op : block) {
+    if (auto forOp = dyn_cast<scf::ForOp>(&op)) {
+      analysis.unrollLoop(forOp, taskId, taskName, trace, captures, numThreads);
+    } else if (auto whileOp = dyn_cast<scf::WhileOp>(&op)) {
+      // Persistent loop: recurse into the "after" (body) region.
+      if (!whileOp.getAfter().empty())
+        processBlockBarrierOps(whileOp.getAfter().front(), analysis, taskId,
+                               taskName, trace, captures, numThreads);
+    } else {
+      // Standalone barrier op (not inside a loop).
+      analysis.tryAppendBarrierOp(op, taskId, taskName, trace, captures,
+                                  emptyKnown, /*iteration=*/-1, numThreads);
+    }
+  }
+}
 
 void BarrierDeadlockAnalysis::buildTaskTraces() {
   funcOp.walk([&](gpu::WarpSpecializeOp wsOp) {
@@ -466,16 +624,33 @@ void BarrierDeadlockAnalysis::buildTaskTraces() {
       }
     }
 
+    // Get threads-per-warp from module attribute (default 32)
+    int64_t threadsPerWarp = 32;
+    if (auto mod = funcOp->getParentOfType<ModuleOp>()) {
+      if (auto attr = mod->getAttrOfType<IntegerAttr>("ttg.threads-per-warp"))
+        threadsPerWarp = attr.getInt();
+    }
+
+    // Get default region num_warps from module attribute
+    int64_t defaultNumWarps = 4;
+    if (auto mod = funcOp->getParentOfType<ModuleOp>()) {
+      if (auto attr = mod->getAttrOfType<IntegerAttr>("ttg.num-warps"))
+        defaultNumWarps = attr.getInt();
+    }
+    int64_t defaultNumThreads = defaultNumWarps * threadsPerWarp;
+
+    // Get per-partition num_warps
+    auto partitionNumWarps = wsOp.getPartitionNumWarps();
+
     // Process default region (typically the producer, task 0)
     {
       TaskTrace trace;
       trace.taskId = 0;
       trace.taskName = "default";
 
-      for (auto &op : wsOp.getDefaultRegion().front()) {
-        if (auto forOp = dyn_cast<scf::ForOp>(&op))
-          unrollLoop(forOp, 0, "default", trace, explicitCaptures);
-      }
+      processBlockBarrierOps(wsOp.getDefaultRegion().front(), *this, 0,
+                             "default", trace, explicitCaptures,
+                             defaultNumThreads);
 
       if (!trace.ops.empty())
         taskTraces.push_back(std::move(trace));
@@ -487,14 +662,16 @@ void BarrierDeadlockAnalysis::buildTaskTraces() {
       std::string taskName = "partition" + std::to_string(partIdx);
       int64_t taskId = partIdx + 1;
 
+      int64_t partNumThreads = defaultNumThreads; // fallback
+      if (partIdx < static_cast<int>(partitionNumWarps.size()))
+        partNumThreads = partitionNumWarps[partIdx] * threadsPerWarp;
+
       TaskTrace trace;
       trace.taskId = taskId;
       trace.taskName = taskName;
 
-      for (auto &op : region->front()) {
-        if (auto forOp = dyn_cast<scf::ForOp>(&op))
-          unrollLoop(forOp, taskId, taskName, trace, explicitCaptures);
-      }
+      processBlockBarrierOps(region->front(), *this, taskId, taskName, trace,
+                             explicitCaptures, partNumThreads);
 
       if (!trace.ops.empty())
         taskTraces.push_back(std::move(trace));
@@ -544,8 +721,14 @@ void BarrierDeadlockAnalysis::printSummary(llvm::raw_ostream &os) const {
 
 void BarrierDeadlockAnalysis::dumpPythonZ3Script(llvm::raw_ostream &os) const {
   // Helper: unique barrier slot key string for Z3 variable naming.
+  // Sanitize to produce valid Python identifiers (replace '-' with 'neg').
   auto slotKey = [](const ConcreteBarrierOp &op) -> std::string {
-    return op.allocName + "_" + std::to_string(op.slotIndex);
+    std::string key = op.allocName + "_";
+    if (op.slotIndex < 0)
+      key += "neg" + std::to_string(-op.slotIndex);
+    else
+      key += std::to_string(op.slotIndex);
+    return key;
   };
 
   // Build flat operation list with global indices, and per-task op lists.
@@ -829,8 +1012,9 @@ void BarrierDeadlockAnalysis::dumpPythonZ3Script(llvm::raw_ostream &os) const {
         os << "blocked_parity('" << sk << "', " << op.phase << ", " << ac
            << ")";
       } else {
-        // Fallback: cycle-based (not expected with concrete eval)
-        os << "blocked_parity('" << sk << "', 0, " << ac << ")";
+        // Unresolved phase: conservatively assume NOT blocked (avoids
+        // false positives from post-loop ops with unresolvable phases).
+        os << "False";
       }
       os << "))\n";
     }

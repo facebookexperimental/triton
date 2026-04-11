@@ -122,6 +122,20 @@ public:
     return initialArrives;
   }
 
+  /// Unroll an scf.for loop body and append concrete ops to trace.
+  /// numThreads is the number of threads in this task (for perThread arrives).
+  void unrollLoop(mlir::scf::ForOp forOp, int64_t taskId,
+                  const std::string &taskName, TaskTrace &trace,
+                  OperandRange captures, int64_t numThreads);
+
+  /// Try to convert a single MLIR op into a ConcreteBarrierOp and append it
+  /// to the trace. Returns true if the op was a recognized barrier op.
+  bool tryAppendBarrierOp(Operation &op, int64_t taskId,
+                          const std::string &taskName, TaskTrace &trace,
+                          OperandRange captures,
+                          const DenseMap<Value, int64_t> &knownValues,
+                          int64_t iteration, int64_t numThreads);
+
 private:
   /// Extract barrier allocations (local_alloc ops with i64 element type).
   void collectBarrierAllocs();
@@ -133,20 +147,16 @@ private:
   /// Build concrete operation traces by walking warp_specialize regions.
   void buildTaskTraces();
 
-  /// Unroll an scf.for loop body and append concrete ops to trace.
-  void unrollLoop(mlir::scf::ForOp forOp, int64_t taskId,
-                  const std::string &taskName, TaskTrace &trace,
-                  OperandRange captures);
-
   /// Resolve a barrier Value to (allocName, slotIndex) by tracing def-use
   /// chains through memdesc_index and warp_specialize captures.
   std::pair<std::string, int64_t> resolveBarrier(Value barrierVal,
                                                  OperandRange captures);
 
-  /// Evaluate an integer SSA value to a concrete int at a given loop
-  /// iteration. Returns nullopt if the value cannot be resolved.
-  std::optional<int64_t> tryEvalInt(Value val, int64_t loopVar,
-                                    Value loopInductionVar);
+  /// Evaluate an integer SSA value to a concrete int using a map of known
+  /// values (induction variable, iter_args, etc.). Returns nullopt if the
+  /// value cannot be resolved.
+  std::optional<int64_t>
+  tryEvalInt(Value val, const DenseMap<Value, int64_t> &knownValues);
 
   FunctionOpInterface funcOp;
   int unrollBound;
