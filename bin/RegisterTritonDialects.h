@@ -136,6 +136,9 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
 
   // NVGPU transform passes
   mlir::registerNVHopperTransformsPasses();
+  mlir::registerNVGPUModuloSchedule();
+  mlir::registerNVGPUModuloWSPartition();
+  mlir::registerNVGPUModuloBufferAlloc();
 
   // Proton passes
   mlir::test::proton::registerTestScopeIdAllocationPass();

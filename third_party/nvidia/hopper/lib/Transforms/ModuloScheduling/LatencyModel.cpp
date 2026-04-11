@@ -55,10 +55,10 @@ struct TMALatencyEntry {
   int cycles;
 };
 static constexpr TMALatencyEntry kTMALoadTable[] = {
-    {128 * 64 * 2, 518},   // 128x64 or 64x128 bf16/fp16 = 16KB
-    {128 * 128 * 2, 654},  // 128x128 bf16/fp16 = 32KB
-    {256 * 64 * 2, 653},   // 256x64 bf16 = 32KB
-    {256 * 128 * 2, 918},  // 256x128 bf16 = 64KB
+    {128 * 64 * 2, 518},  // 128x64 or 64x128 bf16/fp16 = 16KB
+    {128 * 128 * 2, 654}, // 128x128 bf16/fp16 = 32KB
+    {256 * 64 * 2, 653},  // 256x64 bf16 = 32KB
+    {256 * 128 * 2, 918}, // 256x128 bf16 = 64KB
 };
 
 // Async overhead: additional cycles for data to travel through the memory
@@ -75,8 +75,8 @@ static int lookupTMALoadOccupancy(int64_t totalBytes) {
   // Fallback: linear interpolation from 128x64 baseline.
   constexpr int64_t kBaseBytes = 128 * 64 * 2;
   constexpr int kBaseCycles = 518;
-  return static_cast<int>(kBaseCycles *
-                          static_cast<double>(totalBytes) / kBaseBytes);
+  return static_cast<int>(kBaseCycles * static_cast<double>(totalBytes) /
+                          kBaseBytes);
 }
 
 int LatencyModel::getTMALoadLatency(Operation *op) const {
@@ -163,7 +163,8 @@ HWPipeline LatencyModel::classifyPipeline(Operation *op) const {
   // MEM: TMA loads, regular loads, and stores
   if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op))
     return HWPipeline::MEM;
-  // MEM: Lowered TMA loads (TLX kernels use async_tma_copy instead of descriptor_load)
+  // MEM: Lowered TMA loads (TLX kernels use async_tma_copy instead of
+  // descriptor_load)
   if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(op))
     return HWPipeline::MEM;
   if (isa<tt::LoadOp>(op)) {

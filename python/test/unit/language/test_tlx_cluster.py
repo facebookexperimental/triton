@@ -651,6 +651,8 @@ def test_explicit_cluster_sync_ws(device):
         BLOCK_SIZE: tl.constexpr,
     ):
         bars = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+        # need this fence to make mbar init visible to cluster
+        tlx.fence_mbarrier_init_cluster()
         cta_rank = tlx.cluster_cta_rank()
 
         # Explicit cluster sync placed by user – compiler must not auto-insert
@@ -693,10 +695,14 @@ def test_explicit_cluster_sync_ws(device):
     assert "tlx.explicit_cluster_sync = true" in ttgir, (
         f"Expected tlx.explicit_cluster_sync module attr in TTGIR:\n{ttgir}")
     # User placed exactly one cluster arrive+wait pair for each task (from cluster_barrier)
+    assert ttgir.count("ttng.fence_mbarrier_init_release_cluster") == 1, (
+        f"Expected exactly 1 fence_mbarrier_init_release_cluster in TTGIR:\n{ttgir}")
     assert ttgir.count("ttng.cluster_arrive") == 3, (f"Expected exactly 3 cluster_arrive in TTGIR:\n{ttgir}")
     assert ttgir.count("ttng.cluster_wait") == 3, (f"Expected exactly 3 cluster_wait in TTGIR:\n{ttgir}")
 
     ptx = kernel.asm["ptx"]
+    assert ptx.count("fence.mbarrier_init.release.cluster") == 1, (
+        f"Expected exactly 1 fence.mbarrier_init.release.cluster in PTX:\n{ptx}")
     # The user's cluster_barrier should produce exactly one
     # barrier.cluster.arrive.aligned and one barrier.cluster.wait.aligned
     # No extra heuristic ones should be inserted

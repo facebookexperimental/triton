@@ -122,16 +122,15 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
   llvm::SmallVector<unsigned> priorityOrder;
   for (unsigned i = 0; i < ddg.getNumNodes(); ++i)
     priorityOrder.push_back(i);
-  llvm::sort(priorityOrder,
-             [&](unsigned a, unsigned b) {
-               if (heights[a] != heights[b])
-                 return heights[a] > heights[b];
-               // Tiebreaker: lower index first (producers before consumers
-               // in program order). This ensures that when a predecessor and
-               // successor have equal heights, the predecessor is scheduled
-               // first so its cycle is known when the successor is placed.
-               return a < b;
-             });
+  llvm::sort(priorityOrder, [&](unsigned a, unsigned b) {
+    if (heights[a] != heights[b])
+      return heights[a] > heights[b];
+    // Tiebreaker: lower index first (producers before consumers
+    // in program order). This ensures that when a predecessor and
+    // successor have equal heights, the predecessor is scheduled
+    // first so its cycle is known when the successor is placed.
+    return a < b;
+  });
 
   LLVM_DEBUG({
     DBGS() << "MinII=" << minII << " MaxII=" << maxII
