@@ -46,6 +46,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %true = arith.constant true
     %c4_i32 = arith.constant 4 : i32
     %c3_i32 = arith.constant 3 : i32
+    %c2_i32 = arith.constant 2 : i32
     %c1_i32 = arith.constant 1 : i32
     %c0_i32 = arith.constant 0 : i32
 
@@ -55,7 +56,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     ttng.init_barrier %be0, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     %be1 = ttg.memdesc_index %bars_empty[%c1_i32] : !ttg.memdesc<4xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     ttng.init_barrier %be1, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
-    %be2 = ttg.memdesc_index %bars_empty[%c3_i32] : !ttg.memdesc<4xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %be2 = ttg.memdesc_index %bars_empty[%c2_i32] : !ttg.memdesc<4xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     ttng.init_barrier %be2, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     %be3 = ttg.memdesc_index %bars_empty[%c3_i32] : !ttg.memdesc<4xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     ttng.init_barrier %be3, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
@@ -65,10 +66,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     ttng.init_barrier %bf0, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     %bf1 = ttg.memdesc_index %bars_full[%c1_i32] : !ttg.memdesc<4xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     ttng.init_barrier %bf1, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
-    %bf2 = ttg.memdesc_index %bars_full[%c3_i32] : !ttg.memdesc<4xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %bf2 = ttg.memdesc_index %bars_full[%c2_i32] : !ttg.memdesc<4xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     ttng.init_barrier %bf2, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     %bf3 = ttg.memdesc_index %bars_full[%c3_i32] : !ttg.memdesc<4xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     ttng.init_barrier %bf3, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+
+    // Pre-arrive empty barriers so producer can start (buffers are initially empty/available)
+    ttng.arrive_barrier %be0, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.arrive_barrier %be1, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.arrive_barrier %be2, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.arrive_barrier %be3, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
 
     ttg.warp_specialize(%K, %data, %bars_empty, %bars_full, %desc)
     default {
