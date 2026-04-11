@@ -1,6 +1,5 @@
 name: Meta Triton TLX Tests
 on:
-  pull_request:
   push:
     branches:
       - main
