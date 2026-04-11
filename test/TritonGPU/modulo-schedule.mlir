@@ -17,12 +17,13 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // Same cycle -> same cluster; different cycle -> different cluster.
 // CHECK: tt.descriptor_load {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32}
 // CHECK: tt.descriptor_load {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
-// CHECK: ttg.local_alloc {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
-// CHECK: ttg.local_alloc {{.*}} {loop.cluster = 3 : i32, loop.stage = 0 : i32}
+// CHECK: ttg.local_alloc {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32, tt.num_buffers = 3 : i32}
+// CHECK: ttg.local_alloc {{.*}} {loop.cluster = 3 : i32, loop.stage = 0 : i32, tt.num_buffers = 3 : i32}
 // CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 0 : i32, loop.stage = 1 : i32}
 // CHECK: ttng.tmem_load {{.*}} {loop.cluster = 0 : i32, loop.stage = 2 : i32}
-// CHECK: tt.modulo_ii
-// CHECK: tt.scheduled_max_stage
+// CHECK: tt.modulo_ii = 1038 : i32
+// CHECK-SAME: tt.num_stages = 3 : i32
+// CHECK-SAME: tt.scheduled_max_stage = 2 : i32
 tt.func @gemm_inner_loop(
   %a_desc: !tt.tensordesc<tensor<128x64xf16>>,
   %b_desc: !tt.tensordesc<tensor<64x128xf16>>
