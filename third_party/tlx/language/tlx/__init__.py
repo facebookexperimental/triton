@@ -7,6 +7,7 @@ from .barrier import (
     barrier_expect_bytes,
     barrier_wait,
     cluster_barrier,
+    fence_mbarrier_init_cluster,
     named_barrier_arrive,
     named_barrier_wait,
 )
@@ -148,6 +149,7 @@ __all__ = [
     "barrier_expect_bytes",
     "barrier_wait",
     "barrier_arrive",
+    "fence_mbarrier_init_cluster",
     "named_barrier_wait",
     "named_barrier_arrive",
     # mma_ops
