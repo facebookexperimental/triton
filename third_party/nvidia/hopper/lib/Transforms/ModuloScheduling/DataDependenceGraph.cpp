@@ -23,6 +23,7 @@ namespace mlir::triton::gpu {
 namespace ttng = mlir::triton::nvidia_gpu;
 
 // Default estimated trip count for inner loops with dynamic bounds.
+// Used to compute super-node latency = prologue + K_est * II.
 constexpr int kDefaultInnerTripCount = 4;
 
 // Fallback latency constants from Blackwell SM100 microbenchmarks.
@@ -33,18 +34,19 @@ constexpr int kFallbackMMALatency = 900;       // MMA 128x128x128 TC latency
 
 /// Per-stage pipeline load summary from inner loop schedule.
 struct StageLoad {
-  int memSelfLatency{0};
-  int tcSelfLatency{0};
-  int cudaSelfLatency{0};
-  int totalLatency{0};
+  int memSelfLatency{0};  // total MEM pipeline occupancy
+  int tcSelfLatency{0};   // total TC pipeline occupancy
+  int cudaSelfLatency{0}; // total CUDA pipeline occupancy
+  int totalLatency{0};    // max end-to-end latency across all ops
 };
 
 /// Info extracted from inner loop modulo scheduling.
 struct InnerLoopInfo {
   int II;
-  int prologueLatency;
-  int tripCount;
+  int prologueLatency; // cycles before TC starts
+  int tripCount;       // known or estimated trip count
   bool tripCountIsEstimated{true};
+  // Per-stage load (stage 0 = prologue ops, stage maxStage = epilogue ops)
   SmallVector<StageLoad, 4> stageLoads;
   int maxStage{0};
 };
@@ -71,6 +73,7 @@ static InnerLoopInfo computeInnerLoopInfo(scf::ForOp innerLoop,
   info.II = result->II;
   info.maxStage = result->getMaxStage();
 
+  // Try to extract constant trip count from scf.for bounds.
   auto lb = innerLoop.getLowerBound().getDefiningOp<arith::ConstantIntOp>();
   auto ub = innerLoop.getUpperBound().getDefiningOp<arith::ConstantIntOp>();
   auto step = innerLoop.getStep().getDefiningOp<arith::ConstantIntOp>();
@@ -82,6 +85,7 @@ static InnerLoopInfo computeInnerLoopInfo(scf::ForOp innerLoop,
     }
   }
 
+  // Find the earliest TC cycle — that's where MMA starts (= prologueLatency)
   int tcStart = result->II;
   for (const auto &node : innerDDG.getNodes()) {
     if (node.pipeline == HWPipeline::TC) {
@@ -92,6 +96,7 @@ static InnerLoopInfo computeInnerLoopInfo(scf::ForOp innerLoop,
   }
   info.prologueLatency = tcStart;
 
+  // Collect per-stage pipeline loads from the inner schedule.
   info.stageLoads.resize(info.maxStage + 1);
   for (const auto &node : innerDDG.getNodes()) {
     auto it = result->nodeToCycle.find(node.idx);
@@ -118,6 +123,19 @@ static InnerLoopInfo computeInnerLoopInfo(scf::ForOp innerLoop,
     sl.totalLatency = std::max(sl.totalLatency, node.latency);
   }
 
+  LLVM_DEBUG(DBGS() << "Inner loop: II=" << info.II
+                    << " maxStage=" << info.maxStage
+                    << " prologueLat=" << info.prologueLatency
+                    << " tripCount=" << info.tripCount
+                    << (info.tripCountIsEstimated ? "(est)" : "(const)")
+                    << " stages=" << info.stageLoads.size() << "\n");
+  for (int s = 0; s <= info.maxStage; ++s) {
+    LLVM_DEBUG(DBGS() << "  stage " << s
+                      << ": MEM=" << info.stageLoads[s].memSelfLatency
+                      << " TC=" << info.stageLoads[s].tcSelfLatency
+                      << " CUDA=" << info.stageLoads[s].cudaSelfLatency
+                      << "\n");
+  }
   return info;
 }
 
@@ -148,14 +166,20 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
   DataDependenceGraph ddg;
 
   // Phase 1: Create nodes for every op in the loop body (except terminator).
+  // Inner scf.for loops become super-nodes with latency = inner loop's II.
+  // scf.if ops are inspected: if they contain pipeline-relevant ops (TMA
+  // loads/stores), the scf.if node inherits the dominant pipeline/latency
+  // from its contents (e.g., conditional prefetch blocks).
   auto &body = loop.getBody()->getOperations();
   for (auto &op : body) {
     if (op.hasTrait<OpTrait::IsTerminator>())
       continue;
-    // Model inner scf.for as a super-node for outer loop scheduling.
+    // Handle inner scf.for as a super-node
     if (auto innerLoop = dyn_cast<scf::ForOp>(op)) {
       auto info = computeInnerLoopInfo(innerLoop, model);
 
+      // If inner loop is single-stage (already expanded or trivial),
+      // create a single super-node — no prologue/epilogue split needed.
       if (info.maxStage == 0) {
         unsigned idx = ddg.nodes.size();
         DDGNode node;
@@ -170,10 +194,35 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
         node.prologueLatency = info.prologueLatency;
         ddg.nodes.push_back(node);
         ddg.opToIdx[&op] = idx;
+        LLVM_DEBUG(DBGS() << "Single-stage inner loop: N" << idx
+                         << " = super-node (TC, lat=" << node.latency
+                         << " II=" << info.II << ")\n");
         continue;
       }
 
-      // Multi-stage: split into prologue/kloop/epilogue.
+      // Multi-stage: split inner loop into 3 synthetic nodes in the outer DDG:
+      //   prologue: MEM loads (stage 0 ops) — runs once before steady state
+      //   kloop:    steady-state scf.for — TC+MEM interleaved, K iterations
+      //   epilogue: last MMA (highest stage ops) — drains after loop exits
+      //
+      // Only kloop is a super-node (still an scf.for). Prologue/epilogue
+      // are synthetic DDG nodes — they don't correspond to a real loop.
+
+      LLVM_DEBUG({
+        DBGS() << "Inner loop scheduled: II=" << info.II
+               << " maxStage=" << info.maxStage
+               << " tripCount=" << info.tripCount
+               << (info.tripCountIsEstimated ? "(est)" : "(const)") << "\n";
+        for (int s = 0; s <= info.maxStage; ++s) {
+          DBGS() << "  stage " << s
+                 << ": MEM=" << info.stageLoads[s].memSelfLatency
+                 << " TC=" << info.stageLoads[s].tcSelfLatency
+                 << " CUDA=" << info.stageLoads[s].cudaSelfLatency
+                 << " totalLat=" << info.stageLoads[s].totalLatency << "\n";
+        }
+      });
+
+      // --- Node 1: inner_prologue (MEM pipeline, synthetic) ---
       unsigned prologueIdx = ddg.nodes.size();
       {
         DDGNode node;
@@ -187,9 +236,14 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
                                ? kFallbackTMASelfLatency
                                : info.stageLoads[0].memSelfLatency;
         node.selfLatency = std::max(node.selfLatency, 1);
+        // NOT a super-node — synthetic prologue, no backing loop
         ddg.nodes.push_back(node);
+        LLVM_DEBUG(DBGS() << "Split inner loop: N" << prologueIdx
+                         << " = inner_prologue (MEM, lat=" << node.latency
+                         << " selfLat=" << node.selfLatency << ")\n");
       }
 
+      // --- Node 2: inner_kloop (TC pipeline, super-node) ---
       unsigned kloopIdx = ddg.nodes.size();
       {
         DDGNode node;
@@ -202,12 +256,17 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
                             ? info.stageLoads[info.maxStage].tcSelfLatency
                             : kFallbackMMALatency;
         node.selfLatency = std::max(steadyIters * tcPerIter, 1);
-        node.isSuperNode = true;
+        node.isSuperNode = true; // this IS the scf.for
         node.innerII = info.II;
         node.prologueLatency = info.prologueLatency;
         ddg.nodes.push_back(node);
+        LLVM_DEBUG(DBGS() << "Split inner loop: N" << kloopIdx
+                         << " = inner_kloop (TC, lat=" << node.latency
+                         << " selfLat=" << node.selfLatency
+                         << " steadyIters=" << steadyIters << ")\n");
       }
 
+      // --- Node 3: inner_epilogue (TC pipeline, synthetic) ---
       unsigned epilogueIdx = ddg.nodes.size();
       {
         DDGNode node;
@@ -219,7 +278,11 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
                         : kFallbackMMALatency;
         node.latency = std::max(tcLat, 1);
         node.selfLatency = std::max(tcLat, 1);
+        // NOT a super-node — synthetic epilogue
         ddg.nodes.push_back(node);
+        LLVM_DEBUG(DBGS() << "Split inner loop: N" << epilogueIdx
+                         << " = inner_epilogue (TC, lat=" << node.latency
+                         << " selfLat=" << node.selfLatency << ")\n");
       }
 
       ddg.opToIdx[&op] = epilogueIdx; // producer: results come from epilogue
@@ -232,9 +295,9 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
       continue;
     }
     // Handle scf.if: walk regions to find pipeline-relevant ops.
-    // Persistent kernels put TMA loads inside conditional prefetch blocks
-    // (scf.if i < num_iter). Without this, those ops are invisible to
-    // the scheduler.
+    // TLX kernels put TMA loads inside conditional prefetch blocks
+    // (scf.if i < num_iter). Without this, those ops are invisible
+    // to the scheduler and the loop gets a trivial single-stage schedule.
     if (isa<scf::IfOp>(op)) {
       HWPipeline bestPipeline = HWPipeline::NONE;
       int bestLatency = 0;
@@ -260,6 +323,9 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
         node.selfLatency = bestSelfLatency;
         ddg.nodes.push_back(node);
         ddg.opToIdx[&op] = idx;
+        LLVM_DEBUG(DBGS() << "scf.if node " << idx
+                          << ": pipeline=" << getPipelineName(bestPipeline)
+                          << " latency=" << bestLatency << "\n");
         continue;
       }
     }
@@ -291,13 +357,20 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
   }
 
   // Phase 2.5: Implicit MEM-load → TC/super-node edges.
-  // In persistent kernels using lowered TMA (async_tma_copy), the MEM→TC
-  // dependency goes through SMEM buffers and barriers, not SSA. Without
-  // these edges the scheduler places MEM and TC at the same cycle.
+  // TMA loads write to SMEM buffers consumed by MMA ops. This producer-consumer
+  // relationship isn't visible in SSA (they communicate through barriers and
+  // shared memory). Without these edges, the scheduler places MEM and TC at the
+  // same cycle, missing the opportunity for multi-stage pipelining where MEM
+  // ops run ahead to prefetch data for future iterations.
+  // NOTE: Only MEM *load* ops get implicit edges to TC. MEM *store* ops
+  // (descriptor_store) consume the K-loop result — adding store→TC edges
+  // creates false cycles (store → super-node → ... → store).
   {
     SmallVector<unsigned> memLoadNodes, tcNodes;
     for (const auto &node : ddg.nodes) {
       if (node.pipeline == HWPipeline::MEM) {
+        // Only loads, not stores. For scf.if nodes, check if the
+        // contained op is a store.
         bool isStore = isa<triton::DescriptorStoreOp>(node.op) ||
                        isa<ttng::AsyncTMACopyLocalToGlobalOp>(node.op);
         if (!isStore && isa<scf::IfOp>(node.op)) {
@@ -315,6 +388,7 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
     }
     for (unsigned memIdx : memLoadNodes) {
       for (unsigned tcIdx : tcNodes) {
+        // Skip if an SSA edge already exists (avoid duplicates).
         bool hasEdge = false;
         for (const auto &e : ddg.edges) {
           if (e.srcIdx == memIdx && e.dstIdx == tcIdx) {
@@ -325,6 +399,9 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
         if (!hasEdge) {
           ddg.addEdge(memIdx, tcIdx, ddg.nodes[memIdx].latency,
                       /*distance=*/0);
+          LLVM_DEBUG(DBGS() << "Implicit edge: MEM node " << memIdx
+                            << " -> TC node " << tcIdx << " (latency="
+                            << ddg.nodes[memIdx].latency << ")\n");
         }
       }
     }
