@@ -316,6 +316,10 @@ class CUDABackend(BaseBackend):
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)
         pm.run(mod, 'make_ttir')
+
+        if knobs.compilation.static_analysis:
+            CUDABackend.run_static_analysis(mod)
+
         return mod
 
     @staticmethod
@@ -666,6 +670,12 @@ please share the reproducer above with Triton project.
             if os.path.exists(fbin):
                 os.remove(fbin)
         return cubin
+
+    @staticmethod
+    def run_static_analysis(mod):
+        # Optional static analyses gated by TRITON_ENABLE_STATIC_ANALYSIS.
+        # TODO: Add barrier deadlock detection pass (PR 2).
+        pass
 
     def add_stages(self, stages, options, language):
         capability = self._parse_arch(options.arch)
