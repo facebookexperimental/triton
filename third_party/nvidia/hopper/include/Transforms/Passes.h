@@ -19,6 +19,8 @@ std::unique_ptr<Pass> createNVGPUModuloSchedule();
 void registerNVGPUModuloSchedule();
 std::unique_ptr<Pass> createNVGPUModuloWSPartition();
 void registerNVGPUModuloWSPartition();
+std::unique_ptr<Pass> createNVGPUModuloBufferAlloc();
+void registerNVGPUModuloBufferAlloc();
 
 } // namespace mlir
 #endif // DIALECT_NV_TRANSFORMS_PASSES_H_
