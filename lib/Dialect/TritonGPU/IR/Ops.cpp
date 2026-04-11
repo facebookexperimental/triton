@@ -1030,8 +1030,9 @@ void WarpSpecializeOp::getSuccessorRegions(
     return;
   }
   // And the default region branches transparently back to the parent.
-  assert(src.getRegionOrNull() == &getDefaultRegion());
-  successors.push_back(RegionSuccessor(getResults()));
+  assert(src.getTerminatorPredecessorOrNull()->getParentRegion() ==
+         &getDefaultRegion());
+  successors.push_back(RegionSuccessor(getOperation(), getResults()));
 }
 
 LogicalResult WarpSpecializeOp::verify() {

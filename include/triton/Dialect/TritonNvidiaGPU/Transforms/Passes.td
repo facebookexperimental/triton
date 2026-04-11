@@ -94,7 +94,6 @@ def TritonNvidiaGPUTMALoweringPass : Pass<"triton-nvidia-tma-lowering", "mlir::M
   ];
 }
 
-
 def TritonNvidiaGPUTMAStoreBufferReusePass
     : Pass<"triton-nvidia-tma-store-buffer-reuse", "mlir::ModuleOp"> {
   let summary = "Reuse SMEM buffers across sequential TMA stores";
@@ -109,7 +108,6 @@ def TritonNvidiaGPUTMAStoreBufferReusePass
     "mlir::triton::gpu::TritonGPUDialect"
   ];
 }
-
 
 def TritonTensorMemoryAllocationPass : Pass<"triton-tensor-memory-allocation", "mlir::ModuleOp"> {
   let summary = "Assign tensor memory allocation";
