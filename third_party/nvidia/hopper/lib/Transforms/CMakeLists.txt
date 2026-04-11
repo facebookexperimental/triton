@@ -23,6 +23,8 @@ add_triton_library(NVHopperTransforms
   ModuloScheduling/ModuloWSPartitionPass.cpp
   ModuloScheduling/ModuloPipelineIR.cpp
   ModuloScheduling/ModuloBufferAllocPass.cpp
+  ModuloScheduling/ModuloExpandPass.cpp
+  ModuloScheduling/ModuloLowerPass.cpp
 
   DEPENDS
   NVHopperTransformsIncGen

@@ -55,8 +55,8 @@ static void dumpNodeOneLine(const PipelineNode &node, llvm::raw_ostream &os,
     if (!innerName.empty())
       os << "(" << innerName << ")";
   }
-  os << "  {pipe: " << getPipelineName(node.pipeline) << ", cycle: "
-     << node.cycle;
+  os << "  {pipe: " << getPipelineName(node.pipeline)
+     << ", cycle: " << node.cycle;
   if (node.latency)
     os << ", latency: " << node.latency;
   if (node.selfLatency)
@@ -70,8 +70,7 @@ static void dumpNodeOneLine(const PipelineNode &node, llvm::raw_ostream &os,
   os << "}\n";
 }
 
-static void dumpPort(const PipelineLoop::MemPort &port,
-                     llvm::raw_ostream &os) {
+static void dumpPort(const PipelineLoop::MemPort &port, llvm::raw_ostream &os) {
   if (!port.op) {
     if (port.bufferId != UINT_MAX)
       os << "buf" << port.bufferId;
