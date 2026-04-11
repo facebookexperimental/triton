@@ -295,24 +295,28 @@ reduce-add accumulates across N-block groups.
 
 ## TLX design: SMEM budget
 
+Following FA4's 2-CTA approach: `Q_stage=1` (single-buffered Q) with
+separate `q_tiles` and `qt_tiles` buffers.
+
 | Buffer | Shape | Bufs | Size | Notes |
 |--------|-------|------|------|-------|
 | `k_tiles` | [N, D] | 1 | 32 KB | A for dot 1, per-CTA |
 | `v_tiles` | [N, D] | 1 | 32 KB | A for dot 2, per-CTA |
-| `q_tiles` | [M, D/2] | 2 | 32 KB | B for dots 3,5 (multicast, D-halved) |
-| `qt_tiles` | [M/2, D] | 2 | 32 KB | B for dots 1,2 (multicast, M-halved) |
+| `q_tiles` | [M, D/2] | 1 | 16 KB | B for dots 3,5 (multicast, D-halved) |
+| `qt_tiles` | [M/2, D] | 1 | 16 KB | B for dots 1,2 (multicast, M-halved) |
 | `do_tiles` | [M, D/2] | 1 | 16 KB | B for dot 3 (multicast, D-halved) |
 | `dot_tiles` | [M/2, D] | 1 | 16 KB | B for dots 1,2 (multicast, M-halved) |
 | `kt_tiles` | [N*2, D/2] | 1 | 32 KB | B for dot 4, all K rows |
-| `ds_tiles` | [N, M] | 1 | 32 KB | A for dot 4, after exchange |
+| `ds_tiles` | [N*2, M/2] | 1 | 32 KB | A for dot 4, after exchange |
 | `ds_xchg_tiles` | [N, M/2] | 1 | 16 KB | DSMEM staging |
 | epilogue staging | | | ~8 KB | Hidden SMEM for TMA stores |
-| **Total** | | | **~248 KB** | Over 228 KB limit |
+| **Total** | | | **~216 KB** | Within 228 KB limit |
 
-**SMEM pressure:** 248 KB exceeds Blackwell's 228 KB. Options:
-- Reuse `q_tiles`/`qt_tiles` (same total bytes: M*D/2*2 = M/2*D*2 = 32 KB)
-- Reuse `do_tiles`/`dot_tiles` (same logic, 16 KB)
-- With both reuses: 248 - 32 - 16 = **200 KB** — fits
+With single-buffered Q, the MMA loop order must free `q_empties`
+(via dk dot) before dot1 loads new Q. This requires dk/dq before dot1
+in the loop body. On the first tile, skip dk/dq (no previous data).
+
+FA4 2-CTA loop order (hdim<=128): S → dK → dP → dQ → dV.
 
 ## TLX design: TMEM layout
 
@@ -354,7 +358,7 @@ Total: 512 TMEM columns fully packed with overlaps.
 Load (per-CTA): K → k_tiles, V → v_tiles, Kt → kt_tiles
 Load (multicast): LSE, dPsum
 
-Per M-block (inner loop):
+Prolog (first M-block):
   Load (multicast): Q → q_tiles/qt_tiles, dO → do_tiles/dot_tiles
 
   MMA dot 1: S.T = K @ Q.T         → TMEM S (per-CTA, different)
@@ -363,10 +367,23 @@ Per M-block (inner loop):
   MMA dot 3: dV += P.T @ dO         → TMEM dV (per-CTA, different)
   Compute:   dS = P * (dP - D)      → TMEM dS, then copy to sdS
   DSMEM exchange: swap M-halves of sdS with peer
-  MMA dot 5: dK += dS.T @ Q         → TMEM dK (per-CTA, uses dS from TMEM)
-  MMA dot 4: dQ = dS @ K            → TMEM dQ (128 cols allocated, tile_m/2 rows meaningful)
-  Reduce:    dQ TMEM → sdQaccum → TMA reduce-add to global
-             (each CTA writes different query row range)
+
+Per M-block (main loop, from 2nd block onward):
+  Load (multicast): Q → q_tiles/qt_tiles, dO → do_tiles/dot_tiles
+
+  MMA dot 5: dK += dS.T[prev] @ Q[prev]  → TMEM dK (from prev iteration's dS)
+  MMA dot 4: dQ = dS[prev] @ K            → TMEM dQ (frees q_empties[prev])
+  MMA dot 1: S.T = K @ Q.T         → TMEM S
+  Compute:   P = exp(S - LSE)       → TMEM P
+  MMA dot 2: dP.T = V @ dO.T       → TMEM dP
+  MMA dot 3: dV += P.T @ dO         → TMEM dV
+  Compute:   dS = P * (dP - D)      → TMEM dS, then copy to sdS
+  DSMEM exchange: swap M-halves of sdS with peer
+  Reduce:    dQ TMEM → TMA reduce-add to global
+
+Epilog (last M-block's dk/dq):
+  MMA dot 5: dK += dS.T[last] @ Q[last]
+  MMA dot 4: dQ = dS[last] @ K
 
 Epilogue: store dK, dV via TMA (each CTA to its own N-block)
 ```
