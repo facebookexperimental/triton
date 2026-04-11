@@ -117,14 +117,42 @@ struct AllocateWarpGroups
       SmallVector<std::pair<unsigned, int32_t>> idxAndSize;
       for (auto [i, size] : llvm::enumerate(arr))
         idxAndSize.emplace_back(i, size);
-      llvm::sort(idxAndSize,
-                 [&](auto lhs, auto rhs) { return lhs.second > rhs.second; });
 
+      // If user-provided warpGroupStartIds exist, they cover only the
+      // original (non-padding) partitions. Respect the user-provided IDs
+      // for those partitions and assign IDs to padding partitions after.
       SmallVector<int32_t> startIds(arr.size());
-      int startId = baseNumWarps;
-      for (auto [i, size] : idxAndSize) {
-        startIds[i] = startId;
-        startId += size;
+      if (auto existingIds = op.getWarpGroupStartIds();
+          existingIds && existingIds->size() < arr.size()) {
+        // User provided IDs for the first N partitions. Compute the max
+        // warp used by those, then assign padding partitions after.
+        int maxWarp = 0;
+        for (auto [id, numWarps] :
+             llvm::zip(*existingIds, arr.take_front(existingIds->size())))
+          maxWarp = std::max(maxWarp, (int)(id + numWarps));
+
+        // Copy user-provided IDs.
+        for (unsigned i = 0; i < existingIds->size(); ++i)
+          startIds[i] = (*existingIds)[i];
+
+        // Assign padding partitions sequentially after the real ones.
+        int startId = maxWarp;
+        for (unsigned i = existingIds->size(); i < arr.size(); ++i) {
+          startIds[i] = startId;
+          startId += arr[i];
+        }
+      } else {
+        // No user-provided IDs (or they cover all partitions already).
+        // Sort by size descending (stable to preserve order for equal sizes).
+        llvm::stable_sort(idxAndSize, [&](auto lhs, auto rhs) {
+          return lhs.second > rhs.second;
+        });
+
+        int startId = baseNumWarps;
+        for (auto [i, size] : idxAndSize) {
+          startIds[i] = startId;
+          startId += size;
+        }
       }
       op.setWarpGroupStartIds(startIds);
 
