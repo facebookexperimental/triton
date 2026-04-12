@@ -438,7 +438,7 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
     fwd_config["USE_WHERE"] = USE_WHERE
     sm_scale = 0.5
 
-    for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
+    for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:  # (4, 8, 1024, 128)
         q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
 
         # Reference backward via PyTorch autograd
@@ -515,12 +515,6 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
         desc_m = TensorDescriptor(M, shape=[Z * H * N_CTX], strides=[1], block_shape=[1])
         desc_delta = TensorDescriptor(delta, shape=[Z * H * N_CTX], strides=[1], block_shape=[1])
 
-        # 2-CTA descriptors
-        desc_kt = TensorDescriptor(arg_k, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                   block_shape=dummy_block)
-        desc_qt = TensorDescriptor(q, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-        desc_dot = TensorDescriptor(do, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-
         BLK_SLICE_FACTOR = 2
 
         def grid_persistent(meta):
@@ -555,9 +549,6 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
             H,
             Z,
             N_CTX,
-            desc_kt,
-            desc_qt,
-            desc_dot,
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
             HEAD_DIM=HEAD_DIM,
             STAGE=stage,
