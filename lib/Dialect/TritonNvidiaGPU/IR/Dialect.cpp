@@ -70,14 +70,6 @@ TMemAllocation getTmemAllocSizes(MemDescType memDescType) {
     nRow /= 2;
   }
 
-  // Workaround for ptxas bug: the I16x32bx2 TMEM message with
-  // secondHalfOffset=0 doesn't work. When only 1 column is needed, we use
-  // secondHalfOffset=1 instead, which writes to the adjacent column. Pad the
-  // allocation to 2 columns so that column 1 is within bounds.
-  if (nCol == 1 && bitwidth == 32) {
-    nCol = 2;
-  }
-
   // Hack: We should represent this in the LL. Remove the block dimension
   if (auto tmemEnc =
           dyn_cast<TensorMemoryEncodingAttr>(memDescType.getEncoding())) {

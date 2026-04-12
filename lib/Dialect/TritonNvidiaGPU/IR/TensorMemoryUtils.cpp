@@ -239,7 +239,14 @@ lowerTMemLdSt(const LinearLayout &cvt, int maxnreg, int bitwidth, bool isScales,
       if (*secondHalfOffset == 0) {
         // Workaround for ptxas bug, we cannot use secondHalfOffset = 0 to write
         // only 16 elements. We use secondHalfOffset = 1 instead and we pad the
-        // allocation (see getTmemAllocSizes).
+        // allocation.
+        if (!isScales) {
+          if (emitError) {
+            emitError()
+                << "Only supported for scales as we pad the allocation.";
+          }
+          return failure();
+        }
         secondHalfOffset = 1;
       }
       // We "quotient it out", meaning we remove the last basis from reps
