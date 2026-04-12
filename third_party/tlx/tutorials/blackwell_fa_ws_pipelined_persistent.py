@@ -1068,9 +1068,15 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
     nargs["desc_dk"].block_shape = [BLOCK_N1, DKV_STORE_NCOL]
     nargs["desc_m"].block_shape = [BLOCK_M1]
     nargs["desc_delta"].block_shape = [BLOCK_M1]
+    # 2-CTA: separate B-operand descriptors for the transposed views.
+    if "desc_kt" in nargs:
+        nargs["desc_kt"].block_shape = [BLOCK_N1 * NUM_CTAS, HEAD_DIM // NUM_CTAS]
+        nargs["desc_qt"].block_shape = [BLOCK_M1 // NUM_CTAS, HEAD_DIM]
+        nargs["desc_dot"].block_shape = [BLOCK_M1 // NUM_CTAS, HEAD_DIM]
 
 
 configs_bwd_tlx = [
+    # 1-CTA config
     triton.Config(
         {
             "BLOCK_M1": bm1,
@@ -1084,6 +1090,7 @@ configs_bwd_tlx = [
             "NUM_COMPUTE_SLICES": 2,
             "DQ_REDUCE_STAGES": 2,
             "DQ_REDUCE_NCOL": 32,
+            "EPILOGUE_SUBTILE": 4,
             "GROUP_SIZE_M": 1,
             "USE_WARP_BARRIER": True,
             "NUM_CTAS": 1,
@@ -1230,6 +1237,10 @@ def _attn_bwd_ws(
     H,
     Z,
     N_CTX,  #
+    # 2-CTA descriptors (pass dummy descriptors for 1-CTA).
+    desc_kt,
+    desc_qt,
+    desc_dot,
     BLOCK_M1: tl.constexpr,  #
     BLOCK_N1: tl.constexpr,  #
     BLK_SLICE_FACTOR: tl.constexpr,  #
@@ -1246,9 +1257,9 @@ def _attn_bwd_ws(
     STAGE: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     USE_WARP_BARRIER: tl.constexpr = False,
+    EPILOGUE_SUBTILE: tl.constexpr = 4,
+    NUM_CTAS: tl.constexpr = 1,
 ):
-    # Kernel hangs if NUM_BUFFERS_Q != 2.
-    tl.static_assert(NUM_BUFFERS_Q == 2)
     # Runtime error if NUM_BUFFERS_DO != 1
     tl.static_assert(NUM_BUFFERS_DO == 1)
 
@@ -1257,7 +1268,9 @@ def _attn_bwd_ws(
     # the future.
     # Note: Setting REUSE_DP_FOR_DQ=False with BLOCK_M1 == 64 and
     # HEAD_DIM == 128 will result in an accuracy issue.
-    REUSE_DP_FOR_DQ: tl.constexpr = (BLOCK_M1 == 128) and (HEAD_DIM == 128)
+    REUSE_DP_FOR_DQ: tl.constexpr = (BLOCK_M1 == 128) and (HEAD_DIM == 128) and (NUM_CTAS == 1)
+
+    USE_2CTA: tl.constexpr = NUM_CTAS == 2  # noqa: F841 (used in follow-up 2-CTA commits)
 
     # Compute bytes per element for each tensor type
     Q_BYTES_PER_ELEM: tl.constexpr = tlx.size_of(tlx.dtype_of(desc_q))
