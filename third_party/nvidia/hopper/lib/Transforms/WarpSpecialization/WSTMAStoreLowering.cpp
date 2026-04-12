@@ -388,9 +388,9 @@ struct NVGPUTMAStoreTokenWaitLoweringPass
       OpBuilder builder(op);
       auto loc = op.getLoc();
       int pendings = computePendings(op);
-      builder.create<ttng::TMAStoreWaitOp>(loc, pendings);
+      ttng::TMAStoreWaitOp::create(builder, loc, pendings);
       for (auto barrier : op.getBarriers()) {
-        builder.create<ttng::ArriveBarrierOp>(loc, barrier, /*count=*/1);
+        ttng::ArriveBarrierOp::create(builder, loc, barrier, /*count=*/1);
       }
       op.erase();
     }

@@ -274,7 +274,7 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         deprecatedOps.push_back(user);
         return true;
       } else if (auto op = dyn_cast<ttng::TMAStoreTokenWaitOp>(user)) {
-        Value truePred = builder.create<arith::ConstantIntOp>(loc, 1, 1);
+        Value truePred = arith::ConstantIntOp::create(builder, loc, 1, 1);
         for (auto [nvwsTok, nvwsIdx] :
              llvm::zip(op.getNvwsTokens(), op.getNvwsTokenIndices())) {
           Value bufferEmpty = extractBufferEmpty(loc, nvwsIdx);

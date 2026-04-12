@@ -1801,8 +1801,8 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
         auto slicedValType = RankedTensorType::get(
             slicedShape, srcType.getElementType(), srcType.getEncoding());
         auto slicedValAttr = DenseElementsAttr::get(slicedValType, *splatAttr);
-        Value splatConst = builder.create<arith::ConstantOp>(
-            descStoreOp.getLoc(), slicedValAttr);
+        Value splatConst = arith::ConstantOp::create(
+            builder, descStoreOp.getLoc(), slicedValAttr);
         for (int i = 0; i < partitionScheme.numPartitions; i++)
           slicedSrcs.push_back(splatConst);
       } else if (partitionScheme.numPartitions == 2) {
@@ -1828,8 +1828,8 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
           }
         }
 
-        auto reshapeOp = builder.create<ReshapeOp>(loc, reshapedShape, src,
-                                                   /*allowReorder=*/false);
+        auto reshapeOp = ReshapeOp::create(builder, loc, reshapedShape, src,
+                                           /*allowReorder=*/false);
 
         // Build trans order: move dim (the size-2 position) to last.
         int rank = reshapedShape.size();
@@ -1841,9 +1841,9 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
         transOrder.push_back(dim);
 
         auto transOp =
-            builder.create<TransOp>(loc, reshapeOp.getResult(), transOrder);
+            TransOp::create(builder, loc, reshapeOp.getResult(), transOrder);
 
-        auto splitOp = builder.create<SplitOp>(loc, transOp.getResult());
+        auto splitOp = SplitOp::create(builder, loc, transOp.getResult());
         slicedSrcs.push_back(splitOp.getOutLHS());
         slicedSrcs.push_back(splitOp.getOutRHS());
       } else {
@@ -1855,14 +1855,14 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
       for (int i = 0; i < partitionScheme.numPartitions; i++) {
         SmallVector<Value> indices(descStoreOp.getIndices());
         if (i > 0) {
-          Value offset = builder.create<arith::ConstantIntOp>(
-              descStoreOp.getLoc(), i * slicedSize, 32);
-          indices[dim] = builder.create<arith::AddIOp>(descStoreOp.getLoc(),
-                                                       indices[dim], offset);
+          Value offset = arith::ConstantIntOp::create(
+              builder, descStoreOp.getLoc(), i * slicedSize, 32);
+          indices[dim] = arith::AddIOp::create(builder, descStoreOp.getLoc(),
+                                               indices[dim], offset);
         }
-        builder.create<DescriptorStoreOp>(descStoreOp.getLoc(),
-                                          descStoreOp.getDesc(), slicedSrcs[i],
-                                          indices);
+        DescriptorStoreOp::create(builder, descStoreOp.getLoc(),
+                                  descStoreOp.getDesc(), slicedSrcs[i],
+                                  indices);
       }
 
       descStoreOp.erase();
@@ -1918,19 +1918,20 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
         SmallVector<Value> indices(descLoadOp.getIndices());
         if (i > 0) {
           Value offset =
-              builder.create<arith::ConstantIntOp>(loc, i * slicedSize, 32);
+              arith::ConstantIntOp::create(builder, loc, i * slicedSize, 32);
           indices[dim] =
-              builder.create<arith::AddIOp>(loc, indices[dim], offset);
+              arith::AddIOp::create(builder, loc, indices[dim], offset);
         }
-        auto slicedLoad = builder.create<DescriptorLoadOp>(
-            loc, slicedResultType, descLoadOp.getDesc(), indices);
+        auto slicedLoad = DescriptorLoadOp::create(
+            builder, loc, slicedResultType, descLoadOp.getDesc(), indices);
         slicedLoads.push_back(slicedLoad.getResult());
       }
 
       // Reconstruct the full tensor: join + trans + reshape.
       // join: tensor<S0x...x(S[dim]/2)x...> x2 →
       // tensor<S0x...x(S[dim]/2)x...x2>
-      auto joinOp = builder.create<JoinOp>(loc, slicedLoads[0], slicedLoads[1]);
+      auto joinOp =
+          JoinOp::create(builder, loc, slicedLoads[0], slicedLoads[1]);
 
       // trans: move the last dim (size 2) to position dim.
       int rank = resultShape.size() + 1; // after join, rank increased by 1
@@ -1943,13 +1944,13 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
       }
 
       auto transOp =
-          builder.create<TransOp>(loc, joinOp.getResult(), transOrder);
+          TransOp::create(builder, loc, joinOp.getResult(), transOrder);
 
       // reshape: merge the partition dim back.
       // e.g. tensor<2x128x128> → tensor<256x128>
       auto reshapeOp =
-          builder.create<ReshapeOp>(loc, resultShape, transOp.getResult(),
-                                    /*allowReorder=*/false);
+          ReshapeOp::create(builder, loc, resultShape, transOp.getResult(),
+                            /*allowReorder=*/false);
 
       descLoadOp.getResult().replaceAllUsesWith(reshapeOp.getResult());
       descLoadOp.erase();

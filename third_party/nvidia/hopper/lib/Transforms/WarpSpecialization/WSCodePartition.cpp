@@ -3285,8 +3285,8 @@ void insertAsyncComm(
           //   tmem_store overwrites the buffer.
           OpBuilder tokenBuilder(funcOp);
           tokenBuilder.setInsertionPointToStart(&(funcOp.getBody().front()));
-          Value guardToken = tokenBuilder.create<ttnvws::CreateTokenOp>(
-              funcOp.getLoc(), masterChannel->getNumBuffers(),
+          Value guardToken = ttnvws::CreateTokenOp::create(
+              tokenBuilder, funcOp.getLoc(), masterChannel->getNumBuffers(),
               ttnvws::TokenLoadType::TmemLoadOp);
 
           // Insert ProducerAcquireOp before the tmem_store.

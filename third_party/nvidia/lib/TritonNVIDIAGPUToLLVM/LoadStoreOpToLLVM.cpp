@@ -1696,8 +1696,8 @@ convertTMAStoreLikeOp(Operation *op, const TypeConverter *typeConverter,
   if (op->getNumResults() > 0) {
     // The token is a dummy i32 value; it only exists for SSA linkage at the
     // TTGIR level and is consumed by TMAStoreTokenWaitOp.
-    Value dummy = rewriter.create<LLVM::ConstantOp>(
-        loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
+    Value dummy = LLVM::ConstantOp::create(rewriter, loc, rewriter.getI32Type(),
+                                           rewriter.getI32IntegerAttr(0));
     rewriter.replaceOp(op, dummy);
   } else {
     rewriter.eraseOp(op);

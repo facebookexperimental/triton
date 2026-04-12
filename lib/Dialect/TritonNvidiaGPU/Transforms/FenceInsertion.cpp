@@ -83,8 +83,8 @@ public:
         return WalkResult::advance();
 
       OpBuilder builder(tmaStoreOp);
-      auto fence = builder.create<FenceAsyncSharedOp>(tmaStoreOp.getLoc(),
-                                                      /*bCluster=*/false);
+      auto fence = FenceAsyncSharedOp::create(builder, tmaStoreOp.getLoc(),
+                                              /*bCluster=*/false);
       // Try to hoist the fence out of loops if all dependencies are outside.
       while (auto loopOp = fence->getParentOfType<LoopLikeOpInterface>()) {
         if (llvm::any_of(copyRegToSharedOps, [&](Operation *op) {

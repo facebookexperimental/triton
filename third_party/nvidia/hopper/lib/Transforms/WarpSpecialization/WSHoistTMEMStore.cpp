@@ -127,8 +127,8 @@ public:
       int tokArgNo = depArg.getArgNumber() - 1; // arg 0 is induction var
 
       rewriter.setInsertionPoint(outerFor);
-      auto hoistedStore = rewriter.create<ttng::TMEMStoreOp>(
-          store.getLoc(), tokType, store.getDst(),
+      auto hoistedStore = ttng::TMEMStoreOp::create(
+          rewriter, store.getLoc(), tokType, store.getDst(),
           outerFor.getInitArgs()[tokArgNo], store.getSrc(), store.getPred());
       copyAttrs(hoistedStore);
 
@@ -140,8 +140,8 @@ public:
     } else {
       // Dep is defined outside the loop — just move the store before the loop.
       rewriter.setInsertionPoint(outerFor);
-      auto hoistedStore = rewriter.create<ttng::TMEMStoreOp>(
-          store.getLoc(), tokType, store.getDst(), store.getDep(),
+      auto hoistedStore = ttng::TMEMStoreOp::create(
+          rewriter, store.getLoc(), tokType, store.getDst(), store.getDep(),
           store.getSrc(), store.getPred());
       copyAttrs(hoistedStore);
 
