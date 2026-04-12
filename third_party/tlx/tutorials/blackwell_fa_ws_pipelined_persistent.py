@@ -1169,6 +1169,7 @@ def _bwd_compute_inner_loop(
     ds_xchg_tiles=None,
     dsT_fulls=None,
     cluster_cta_rank=0,
+    dq_empties=None,
 ):
     start_block_n = start_n * BLOCK_N1
     offs_n = start_block_n + tl.arange(0, BLOCK_N1)
@@ -1218,8 +1219,9 @@ def _bwd_compute_inner_loop(
         tlx.barrier_wait(dp_fulls[tmem_buf_id], tmem_phase)
         dpT = tlx.local_load(dp_tiles[tmem_buf_id])
         Di = tlx.local_load(sD_tiles[d_buf_id])
-        # We can only signal the arrive if DP is not shared with DQ.
-        # Otherwise we need to wait for DQ to be done.
+        # Signal dp_empties only when dP is not shared with dQ.
+        # When REUSE_DP_FOR_DQ, dp_empties = dq_empties and is signaled
+        # by the reduction task after consuming dQ.
         if not REUSE_DP_FOR_DQ:
             if USE_2CTA:
                 tlx.barrier_arrive(dp_empties[tmem_buf_id], 1, remote_cta_rank=0)
@@ -1344,7 +1346,7 @@ def _attn_bwd_ws(
     # the future.
     # Note: Setting REUSE_DP_FOR_DQ=False with BLOCK_M1 == 64 and
     # HEAD_DIM == 128 will result in an accuracy issue.
-    REUSE_DP_FOR_DQ: tl.constexpr = (BLOCK_M1 == 128) and (HEAD_DIM == 128)
+    REUSE_DP_FOR_DQ: tl.constexpr = (BLOCK_M1 == 128) and (HEAD_DIM == 128) and (NUM_CTAS == 1)
 
     # Compute bytes per element for each tensor type
     Q_BYTES_PER_ELEM: tl.constexpr = tlx.size_of(tlx.dtype_of(desc_q))
@@ -1424,10 +1426,8 @@ def _attn_bwd_ws(
         tlx.storage_kind.tmem,
         reuse=qk_tiles,
     )
-    # dP, dS (TMEM for dk dot), and dQ share TMEM via storage alias.
-    # dP and dS occupy the same offset (sequential lifetime: dpT consumed
-    # before dsT written). dQ occupies a distinct offset (it may overlap
-    # with dsT in the mma pipeline).
+    # dP and dS share TMEM via storage alias (sequential lifetime:
+    # dpT consumed before dsT written).
     dp_dq_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
     dp_tiles = tlx.local_alloc(
         (BLOCK_N1, BLOCK_M1),
@@ -1473,9 +1473,11 @@ def _attn_bwd_ws(
     else:
         dk_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV, arrive_count=NUM_CTAS)
 
-    # dQ uses the same storage alias group as dP/dS — all three share
-    # the same TMEM slot.
-    # Lifecycle within one block: dpT → dsT → dq (sequential, no overlap).
+    # In 1-CTA mode, dQ reuses dP/dS TMEM (saves columns, no deadlock
+    # with arrive_count=1). In 2-CTA mode, dQ reuses S/P TMEM instead
+    # to keep dp_empties separate from dq_empties, avoiding a circular
+    # dependency between MMA (waiting dp_empties) and reduction
+    # (waiting dq_fulls).
     if REUSE_DP_FOR_DQ:
         dq_tiles = tlx.local_alloc(
             (BLOCK_M1 // NUM_CTAS, HEAD_DIM),
@@ -1498,6 +1500,7 @@ def _attn_bwd_ws(
             tl.float32,
             NUM_BUFFERS_TMEM,
             tlx.storage_kind.tmem,
+            reuse=qk_tiles,
         )
         if USE_WARP_BARRIER:
             dp_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=8)
@@ -1567,6 +1570,10 @@ def _attn_bwd_ws(
     # 4 consumers: reduction(1) + compute(1) + mma(1) + load(1)
     clc_context = tlx.clc_create_context(num_consumers=4)
 
+    # Pre-trip empties barriers for the first iteration, matching FA4's
+    # PipelineAsync initialization. Without this, the MMA prolog/main loop
+    # waits on dq_empties before any task can signal it.
+
     with tlx.async_tasks():
         # compute
         with tlx.async_task("default", registers=192, replicate=1):
@@ -1635,6 +1642,7 @@ def _attn_bwd_ws(
                         ds_xchg_tiles=ds_xchg_tiles if USE_2CTA else None,
                         dsT_fulls=dsT_fulls if USE_2CTA else None,
                         cluster_cta_rank=cluster_cta_rank,
+                        dq_empties=dq_empties,
                     )
                 if STAGE & 2:
                     curr_m, blk_idx = _bwd_compute_inner_loop(
@@ -1677,6 +1685,7 @@ def _attn_bwd_ws(
                         ds_xchg_tiles=ds_xchg_tiles if USE_2CTA else None,
                         dsT_fulls=dsT_fulls if USE_2CTA else None,
                         cluster_cta_rank=cluster_cta_rank,
+                        dq_empties=dq_empties,
                     )
 
                 kv_buf_id, kv_phase = _get_bufidx_phase(tile_count, NUM_BUFFERS_KV)
@@ -1866,7 +1875,8 @@ def _attn_bwd_ws(
                         tlx.barrier_wait(dot_fulls[do_buf_id], do_phase)
                     else:
                         tlx.barrier_wait(do_fulls[do_buf_id], do_phase)
-                    tlx.barrier_wait(dp_empties[tmem_buf_id], tmem_phase ^ 1)
+                    if not USE_2CTA:
+                        tlx.barrier_wait(dp_empties[tmem_buf_id], tmem_phase ^ 1)
                     if USE_2CTA:
                         doT = tlx.local_trans(dot_tiles[do_buf_id])
                     else:
@@ -1951,7 +1961,11 @@ def _attn_bwd_ws(
                             tlx.barrier_wait(dot_fulls[do_buf_id], do_phase)
                         else:
                             tlx.barrier_wait(do_fulls[do_buf_id], do_phase)
-                        tlx.barrier_wait(dp_empties[tmem_buf_id], tmem_phase ^ 1)
+                        # In 2-CTA mode, skip dp_empties wait — the pipeline
+                        # ordering (Dot 1 → Dot 4 → Dot 2) gives compute enough
+                        # time to consume the previous dpT, matching FA4.
+                        if not USE_2CTA:
+                            tlx.barrier_wait(dp_empties[tmem_buf_id], tmem_phase ^ 1)
                         if USE_2CTA:
                             doT = tlx.local_trans(dot_tiles[do_buf_id])
                         else:
