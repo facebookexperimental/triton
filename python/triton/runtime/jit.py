@@ -24,12 +24,6 @@ from triton._C.libtriton import get_cache_invalidating_env_vars, native_speciali
 TRITON_MODULE = "triton.language"
 GLUON_MODULE = "triton.experimental.gluon.language"
 
-# Global monotonic counter incremented on every _unsafe_update_src() call.
-# Used by the Layer 1 fast path to detect source modifications on JITCallable
-# objects that are passed as arguments (identity check alone is insufficient
-# because the same Python object can have its source mutated in-place).
-_src_update_version = 0
-
 T = TypeVar("T")
 
 # -----------------------------------------------------------------------------
@@ -552,8 +546,6 @@ class JITCallable:
 
         Note that it is the callers responsibility to make sure any triton functions that call this function have the `.hash` value reset to None.
         """
-        global _src_update_version
-        _src_update_version += 1
         self.hash = None
         self._src = new_src
 
@@ -609,23 +601,6 @@ def convert_to_tuple_if_list(item):
         item[i] = convert_to_tuple_if_list(nested_value)
 
     return tuple(item)
-
-
-class _DeviceCaches(defaultdict):
-    """A defaultdict that also invalidates the Layer 1 fast-path cache
-    (``_last_call``) whenever the in-memory kernel cache is cleared.
-    Without this, ``device_caches.clear()`` would wipe Layer 2 but
-    leave a stale Layer 1 entry, causing the fast path to return a
-    kernel that is no longer in the device cache."""
-
-    def __init__(self, jit_function, default_factory):
-        super().__init__(default_factory)
-        self._jit_function = jit_function
-
-    def clear(self):
-        super().clear()
-        self._jit_function._last_call = None
-        self._jit_function._last_kwargs = {}
 
 
 class JITFunction(JITCallable, KernelInterface[T]):
@@ -806,8 +781,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
         # This is just N pointer comparisons with zero attribute access.
         if not warmup and not self.pre_run_hooks:
             last = self._last_call
-            if last is not None and last[0] is device and last[4] == _src_update_version and last[
-                    5] == knobs.compilation.instrumentation_mode:
+            if last is not None and last[0] is device:
                 last_args = last[1]
                 if len(args) == len(last_args):
                     identical = True
@@ -948,13 +922,8 @@ class JITFunction(JITCallable, KernelInterface[T]):
             # Populate fast-path caches for future calls.
             # Store both raw args (for identity check) and bound_args values
             # (for launching — includes default parameter values).
-            # Only populate when the fast path guard would allow reuse —
-            # if pre_run_hooks are active, the compiled kernel may depend on
-            # hook-controlled state that the fast path doesn't check.
-            if not self.pre_run_hooks:
-                self._last_call = (device, args, kernel, tuple(bound_args.values()), _src_update_version,
-                                   knobs.compilation.instrumentation_mode)
-                self._last_kwargs = _user_kwargs
+            self._last_call = (device, args, kernel, tuple(bound_args.values()))
+            self._last_kwargs = _user_kwargs
             if fast_key is not None:
                 self._run_cache[fast_key] = kernel
 
@@ -983,11 +952,10 @@ class JITFunction(JITCallable, KernelInterface[T]):
             self.params.append(KernelParam(i, param, dns, dns_oa))
 
         # cache of just-in-time compiled kernels
-        self.device_caches = _DeviceCaches(self, self.create_binder)
+        self.device_caches = defaultdict(self.create_binder)
 
         # Last-call cache for identity-based fast path (Layer 1).
-        # Stores (device, args, kernel, bound_vals, src_update_version, instrumentation_mode)
-        # from the previous successful launch.
+        # Stores (device, args, kernel, bound_vals) from the previous successful launch.
         self._last_call = None
         self._last_kwargs = {}
         # Signature-based fast-path cache (Layer 2).
