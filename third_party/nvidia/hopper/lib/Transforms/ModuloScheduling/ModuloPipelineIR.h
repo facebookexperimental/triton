@@ -40,12 +40,12 @@ enum class MemoryKind { SMEM, TMEM, Register, BARRIER };
 struct PipelineBuffer {
   unsigned id{};
   MemoryKind kind{MemoryKind::SMEM};
-  llvm::SmallVector<int64_t, 4> shape;  // e.g., {128, 64}
-  unsigned elementBitWidth{16};       // e.g., 16 for f16
-  unsigned count{1};                  // number of buffers (from stageDiff + 1)
+  llvm::SmallVector<int64_t, 4> shape; // e.g., {128, 64}
+  unsigned elementBitWidth{16};        // e.g., 16 for f16
+  unsigned count{1};                   // number of buffers (from stageDiff + 1)
 
-  // For data buffers: index of the corresponding BARRIER buffer (UINT_MAX if none)
-  // For barrier buffers: index of the data buffer this barrier guards
+  // For data buffers: index of the corresponding BARRIER buffer (UINT_MAX if
+  // none) For barrier buffers: index of the data buffer this barrier guards
   unsigned pairedBufferId{UINT_MAX};
 
   // The MLIR op that originally defines this buffer (e.g., local_alloc)
@@ -72,17 +72,17 @@ struct PipelineNode {
 
   // Schedule assignment (from Phase 0)
   HWPipeline pipeline{HWPipeline::NONE};
-  int cycle{0};          // absolute cycle within the II
-  int stage{0};          // cycle / II
-  int latency{0};        // cycles until result available
-  int selfLatency{0};    // cycles this op occupies its pipeline
+  int cycle{0};       // absolute cycle within the II
+  int stage{0};       // cycle / II
+  int latency{0};     // cycles until result available
+  int selfLatency{0}; // cycles this op occupies its pipeline
 
   // Super-node: if this node represents a child pipeline (inner loop)
   unsigned childPipelineId{UINT_MAX}; // index into PipelineGraph::pipelines
   int prologueLatency{0};             // cycles before TC starts in child
 
   // Buffer references
-  unsigned producesBuffer{UINT_MAX};  // index into PipelineLoop::buffers
+  unsigned producesBuffer{UINT_MAX}; // index into PipelineLoop::buffers
   llvm::SmallVector<unsigned, 2> consumesBuffers; // indices into buffers
 
   // Warp specialization (from Phase 1.5)
@@ -120,8 +120,9 @@ struct PipelineLoop {
   int II{0};
   int maxStage{0};
   int prologueLatency{0}; // cycles before TC starts (for parent's super-node)
-  int tripCount{0};        // loop trip count (0 = unknown/not set)
-  bool tripCountIsEstimated{false}; // true if tripCount is estimated, not constant
+  int tripCount{0};       // loop trip count (0 = unknown/not set)
+  bool tripCountIsEstimated{
+      false}; // true if tripCount is estimated, not constant
 
   // Body (kernel loop steady state)
   llvm::SmallVector<PipelineNode, 16> nodes;
@@ -137,9 +138,10 @@ struct PipelineLoop {
   // Memory interface (inputs/outputs crossing loop boundary)
   // These drive multi-buffering at the parent level.
   //
-  // isInput is intentionally kept alongside the separate inputs/outputs vectors:
-  // it allows generic iteration over all ports (e.g., when building the parent's
-  // buffer map) without needing to know which vector a port came from.
+  // isInput is intentionally kept alongside the separate inputs/outputs
+  // vectors: it allows generic iteration over all ports (e.g., when building
+  // the parent's buffer map) without needing to know which vector a port came
+  // from.
   struct MemPort {
     unsigned bufferId{UINT_MAX}; // index into parent's buffers
     Operation *op{nullptr};      // the MLIR op at the boundary
