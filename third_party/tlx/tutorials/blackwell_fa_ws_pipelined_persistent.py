@@ -1792,7 +1792,7 @@ def _attn_bwd_ws(
                         desc_dq.atomic_add([(off_bh + curr_m + dq_m_offset).to(tl.int32), slice_id * slice_size], dq)
 
                     # release dq
-                    # 2-CTA: non-leader signals leader's dq_empties
+                    # 2-CTA: both CTAs signal leader's dq_empties
                     # (also serves as dp_empties when REUSE_DP_FOR_DQ)
                     if USE_2CTA:
                         tlx.barrier_arrive(dq_empties[tmem_buf_id], 1, remote_cta_rank=0)
