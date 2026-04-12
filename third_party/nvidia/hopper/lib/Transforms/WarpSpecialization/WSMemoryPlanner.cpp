@@ -2720,6 +2720,8 @@ public:
         LDBG("\nallInterfere");
         bool hasSpace = allocateNewSpace(candBuf, true);
         if (!hasSpace) {
+          LDBG("\nFailed: allInterfere and no space."
+               << " candBuf->rowSize=" << candBuf->rowSize);
           return alloc.emitError("can't find tmem space: no new space for "
                                  "tmem alloc when all buffers interfere");
         }
@@ -2730,6 +2732,8 @@ public:
           reuseBuf = findReuseChannel(candBuf, 1 /*partitionCondition*/,
                                       1 /*depChainCondition*/);
         if (reuseBuf) {
+          LDBG("\nReusing buffer from: ");
+          LLVM_DEBUG(reuseBuf->owner->dump());
           alloc.getOperation()->setAttr(
               "buffer.id",
               IntegerAttr::get(IntegerType::get(alloc->getContext(), 32),
@@ -2739,9 +2743,24 @@ public:
               IntegerAttr::get(IntegerType::get(alloc->getContext(), 32),
                                candBuf->colOffset));
         } else {
+          LDBG("\nNo reuse found, trying new space."
+               << " candBuf->rowSize=" << candBuf->rowSize);
           if (allocateNewSpace(candBuf, false))
             allocateNewSpace(candBuf, true);
           else {
+            LDBG("\nFailed: no reuse and no new space. limit=512");
+            // Dump all allocated buffers for debugging
+            LLVM_DEBUG({
+              LDBG("Allocated buffers so far:");
+              for (auto &[op, interval] : bufferSet) {
+                auto *buf = getBuffer(op);
+                DBGS() << "  rowOffset=" << buf->rowOffset
+                       << " rowSize=" << buf->rowSize
+                       << " colOffset=" << buf->colOffset
+                       << " isOwner=" << buf->isOwnerOfSpace << " ";
+                op->dump();
+              }
+            });
             return alloc.emitError(
                 "can't find tmem space: failed to allocate new space");
           }

@@ -1699,7 +1699,8 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
     if (repChannelsForValue.count(srcValue)) {
       for (auto *tCh : repChannelsForValue[srcValue]) {
         if (tCh->getDstOp()->getBlock() ==
-            channelInOrder->getDstOp()->getBlock()) {
+                channelInOrder->getDstOp()->getBlock() &&
+            tCh->relation.second == channelInOrder->relation.second) {
           repCh = tCh;
           break;
         }

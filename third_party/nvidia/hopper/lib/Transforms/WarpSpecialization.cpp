@@ -104,8 +104,8 @@ public:
     });
     if (hasElse) {
       LDBG("Warp specialization does not support else blocks. Skipping.");
-      removeWarpSpecializeAttr(funcOp);
-      return;
+      //removeWarpSpecializeAttr(funcOp);
+      //return;
     }
 
     OpBuilder builder(funcOp);

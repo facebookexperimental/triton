@@ -478,9 +478,10 @@ private:
     // Build opToDpId map for ALL ops reachable from MMAs.
     // This is the single source of truth for data partition ID assignment.
     if (dataPartitionFactor > 1) {
-      // Normalize group IDs to contiguous 0..dpFactor-1 range.
+      // Normalize group IDs to contiguous 1..dpFactor range.
+      // Start from 1 so that dpId=0 remains the "not assigned" sentinel.
       DenseMap<unsigned, unsigned> rootToGroupId;
-      unsigned nextGroupId = 0;
+      unsigned nextGroupId = 1;
       for (unsigned i = 0; i < n; ++i) {
         unsigned root = find(i);
         if (!rootToGroupId.count(root))
@@ -930,7 +931,8 @@ static bool hasDefPartition(scf::ForOp loop, Operation *op,
 // encountering an operation that is already assigned.
 // If \p partition is null, a new partition will be created if needed.
 static Partition *scheduleUsers(scf::ForOp loop, PartitionSet &schedule,
-                                Partition *partition, Operation *op) {
+                                Partition *partition, Operation *op,
+                                const DenseMap<Operation *, unsigned> *opToDpId = nullptr) {
   SmallVector<OpOperand *> uses;
   for (OpOperand &use : op->getUses())
     uses.push_back(&use);
@@ -947,6 +949,25 @@ static Partition *scheduleUsers(scf::ForOp loop, PartitionSet &schedule,
 
     if (hasPartition(user))
       continue;
+    // Skip ops that have a data partition dpId — they belong to computation
+    // partitions and should not be claimed by load-user propagation.
+    // Also skip SHARED_DPID ops — they're in MMA backward slices and will
+    // be handled by the dpId-based assignment or propagatePartitions.
+    if (opToDpId) {
+      auto it = opToDpId->find(user);
+      if (it != opToDpId->end() && it->second != 0) {
+        LLVM_DEBUG({
+          DBGS() << "[scheduleUsers] SKIPPING op with dpId=" << it->second
+                 << ": ";
+          user->dump();
+        });
+        continue;
+      }
+    }
+    LLVM_DEBUG({
+      DBGS() << "[scheduleUsers] ASSIGNING to partition: ";
+      user->dump();
+    });
     if (!partition) {
       partition = schedule.addPartition(/* stage is unused */ 0);
       partition->setType("computation");
@@ -1345,7 +1366,8 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
         // Skip pre-loop ops that don't have a parent loop
         continue;
       }
-      scheduleUsers(parentLoop, schedule, defaultPartition, loadOrAlloc);
+      scheduleUsers(parentLoop, schedule, defaultPartition, loadOrAlloc,
+                    &categorizer.getOpToDpIdMap());
     }
   }
 
@@ -1363,9 +1385,22 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
         for (OpOperand &use :
              loop.getRegionIterArg(use.getOperandNumber()).getUses()) {
           tryScheduleOp(corrDest, use.getOwner());
-          scheduleUsers(loop, schedule, corrDest, use.getOwner());
+          scheduleUsers(loop, schedule, corrDest, use.getOwner(),
+                        &categorizer.getOpToDpIdMap());
         }
         break;
+      }
+    }
+    // For correction tmem_stores (acc rescaling), also pull their tensor
+    // source (e.g., acc *= alpha mulf) into the correction partition.
+    // The tmem_store writes the rescaled acc back — the mulf that produces
+    // the rescaled value is part of correction, not computation.
+    for (Operation *op : corrDest->getOps()) {
+      if (auto tmemStore = dyn_cast<ttng::TMEMStoreOp>(op)) {
+        if (auto *defOp = tmemStore.getSrc().getDefiningOp()) {
+          if (!hasPartition(defOp))
+            tryScheduleOp(corrDest, defOp);
+        }
       }
     }
   }
@@ -1668,15 +1703,26 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
 
     scf::ForOp innermostLoop = loops[0];
     for (Operation &op : innermostLoop.getOps()) {
-      if (hasPartition(&op))
+      if (hasPartition(&op)) {
+        LLVM_DEBUG({
+          auto dpId = categorizer.getDpId(&op);
+          if (dpId != 0) {
+            DBGS() << "[dpId-assign] SKIP (already has partition) dpId="
+                   << dpId << ": ";
+            op.dump();
+          }
+        });
         continue;
+      }
       if (isa<arith::ConstantOp, scf::YieldOp>(&op))
         continue;
       // Skip loop counter increment ops (scalar integer arithmetic that
       // feeds the yield). These are loop-control ops, not data-partition
-      // computation ops.
-      if (op.getNumResults() == 1 && op.getResult(0).getType().isIntOrIndex() &&
-          !isa<RankedTensorType>(op.getResult(0).getType()))
+      // computation ops. Also skip pointer-typed ops (sparse indexing,
+      // tt.addptr) which are shared control-flow infrastructure.
+      if (op.getNumResults() == 1 &&
+          !isa<RankedTensorType>(op.getResult(0).getType()) &&
+          !isa<mlir::triton::gpu::MemDescType>(op.getResult(0).getType()))
         continue;
       unsigned dpId = findDpIdFromOperands(&op);
       if (dpId != SHARED_DPID) {
@@ -1687,7 +1733,6 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
     }
   }
 
-  // Pre-schedule post-loop ops before propagatePartitions claims them.
   schedulePostLoopOps(mainLoop, schedule, layout, schedOpts,
                       categorizer.getOpToDpIdMap(), dpIdToPartition);
 
@@ -1944,6 +1989,25 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
           setPartition(op, cluster.sinkPartitions.front());
         }
         continue;
+      }
+      // For data-partitioned kernels with a correction/default partition:
+      // assign ambiguous clusters to the default partition instead of
+      // creating extra computation partitions that inflate TMEM usage.
+      {
+        Partition *defaultPartition = nullptr;
+        for (Partition &p : schedule.getPartitions()) {
+          if (p.getType() == "correction" || p.getType() == "default") {
+            defaultPartition = &p;
+            break;
+          }
+        }
+        if (defaultPartition) {
+          for (Operation *op : cluster.ops) {
+            if (isScalarOp(op)) continue;
+            setPartition(op, defaultPartition);
+          }
+          continue;
+        }
       }
       Partition *newPartition = schedule.addPartition(0);
       newPartition->setType("computation");
