@@ -154,6 +154,35 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         usersForToken.push_back(user);
       }
     }
+    // Detect and skip same-partition ProducerCommit/ConsumerWait pairs.
+    // When both ops are in the same warp-specialize partition, the
+    // synchronization is redundant — program order within a partition
+    // already guarantees correctness. This happens for OperandD channels
+    // where the MMA accumulator is both produced and consumed in the
+    // Gemm partition.
+    DenseSet<Operation *> samePartitionOps;
+    {
+      DenseMap<int, SmallVector<Operation *>> commitsByTask, waitsByTask;
+      for (Operation *user : usersForToken) {
+        auto taskIds = getAsyncTaskIds(user);
+        if (taskIds.size() != 1)
+          continue;
+        int tid = taskIds[0];
+        if (isa<ttnvws::ProducerCommitOp>(user))
+          commitsByTask[tid].push_back(user);
+        else if (isa<ttnvws::ConsumerWaitOp>(user))
+          waitsByTask[tid].push_back(user);
+      }
+      for (auto &[tid, commits] : commitsByTask) {
+        if (waitsByTask.count(tid)) {
+          for (auto *op : commits)
+            samePartitionOps.insert(op);
+          for (auto *op : waitsByTask[tid])
+            samePartitionOps.insert(op);
+        }
+      }
+    }
+
     for (Operation *user : usersForToken) {
       if (dyn_cast<ttnvws::ProducerCommitOp>(user) ||
           dyn_cast<ttnvws::ProducerAcquireOp>(user)) {
@@ -161,7 +190,8 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         assert(producerWarps == 0 || producerWarps == nWarps);
         producerWarps = nWarps;
       } else if (dyn_cast<ttnvws::ConsumerReleaseOp>(user) ||
-                 dyn_cast<ttnvws::ConsumerWaitOp>(user)) {
+                 dyn_cast<ttnvws::ConsumerWaitOp>(user) ||
+                 dyn_cast<ttng::TMAStoreTokenWaitOp>(user)) {
         auto nWarps = mlir::triton::gpu::lookupNumWarps(user);
         assert(consumerWarps == 0 || consumerWarps == nWarps);
         consumerWarps = nWarps;
@@ -203,6 +233,12 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
                                          bufferEmptyArray, idx);
     };
     auto handleOneUser = [&](Operation *user) -> bool {
+      // Skip same-partition ProducerCommit/ConsumerWait pairs — the
+      // synchronization is redundant within a single warp group.
+      if (samePartitionOps.count(user)) {
+        deprecatedOps.push_back(user);
+        return true;
+      }
       // Here builder is at the user, make sure usage of values outside of
       // warp_specialize is via capture if user is in a partition region.
       // We need bufferFullArray and bufferEmptyArray.
@@ -236,6 +272,18 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         processConsumerReleaseOp(builder, op, bufferEmpty, numCTAs,
                                  bufferEmptyCount);
         deprecatedOps.push_back(user);
+        return true;
+      } else if (auto op = dyn_cast<ttng::TMAStoreTokenWaitOp>(user)) {
+        Value truePred = arith::ConstantIntOp::create(builder, loc, 1, 1);
+        for (auto [nvwsTok, nvwsIdx] :
+             llvm::zip(op.getNvwsTokens(), op.getNvwsTokenIndices())) {
+          Value bufferEmpty = extractBufferEmpty(loc, nvwsIdx);
+          setAsyncTaskIds(bufferEmpty.getDefiningOp(), getAsyncTaskIds(user));
+          op.addBarrier(bufferEmpty, truePred);
+        }
+        op.getNvwsTokensMutable().clear();
+        op.getNvwsTokenIndicesMutable().clear();
+        // Do NOT erase — the op stays with its newly-added real barriers.
         return true;
       }
       return false;

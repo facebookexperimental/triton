@@ -49,6 +49,7 @@ inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
     "TRITON_F32_DEFAULT",
     "TRITON_PREFER_TMEM_16x256_LAYOUT",
     "TRITON_DUMP_TTGIR_TO_TLX",
+    "TRITON_DUMP_TLX_BENCHMARK",
     "TRITON_ENABLE_EXPERIMENTAL_CONSAN",
     "TRITON_PASS_PLUGIN_PATH"
     // clang-format on
@@ -58,6 +59,7 @@ inline const std::set<std::string> CACHE_NEUTRAL_ENV_VARS = {
     // clang-format off
     "TRITON_REPRODUCER_PATH",
     "TRITON_ENABLE_PYTHON_STACKTRACE",
+    "TRITON_TLX_DUMP_DIR",
     // clang-format on
 };
 

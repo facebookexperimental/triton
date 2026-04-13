@@ -628,6 +628,37 @@ void TCGen5MMAOp::addCompletionBarrier(Value barrier, Value pred) {
   getBarriersMutable().append(barrier);
 }
 
+void TMAStoreTokenWaitOp::addBarrier(Value barrier, Value pred) {
+  getBarriersMutable().append(barrier);
+  getBarrierPredsMutable().append(pred);
+}
+
+void TMAStoreTokenWaitOp::addToken(Value token, Value idx) {
+  getNvwsTokensMutable().append(token);
+  getNvwsTokenIndicesMutable().append(idx);
+}
+
+// nvws-tokens-and-indices := (`nvws_token` ssa-value `[` ssa-value `]`)*
+static ParseResult parseNvwsTokensAndIndices(
+    OpAsmParser &p, SmallVectorImpl<OpAsmParser::UnresolvedOperand> &nvwsTokens,
+    SmallVectorImpl<OpAsmParser::UnresolvedOperand> &nvwsTokenIndices) {
+  while (succeeded(p.parseOptionalKeyword("nvws_token"))) {
+    if (p.parseOperand(nvwsTokens.emplace_back()) || p.parseLSquare() ||
+        p.parseOperand(nvwsTokenIndices.emplace_back()) || p.parseRSquare())
+      return failure();
+  }
+  return success();
+}
+
+static void printNvwsTokensAndIndices(OpAsmPrinter &p, Operation *op,
+                                      OperandRange nvwsTokens,
+                                      OperandRange nvwsTokenIndices) {
+  assert(nvwsTokens.size() == nvwsTokenIndices.size());
+  for (auto [tok, idx] : llvm::zip(nvwsTokens, nvwsTokenIndices)) {
+    p << " nvws_token " << tok << '[' << idx << ']';
+  }
+}
+
 TypedValue<MemDescType> TCGen5MMAOp::getAccumulator() { return getD(); }
 
 void TCGen5MMAOp::setAccumulator(Value accum) { getDMutable().assign(accum); }

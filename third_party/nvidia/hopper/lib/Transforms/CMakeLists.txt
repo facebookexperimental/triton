@@ -7,12 +7,14 @@ add_triton_library(NVHopperTransforms
   WarpSpecialization/TMEMAlloc1D.cpp
   WarpSpecialization/Utility.cpp
   WarpSpecialization/WSBuffer.cpp
+  WarpSpecialization/WSHoistTMEMStore.cpp
   WarpSpecialization/WSCodePartition.cpp
   WarpSpecialization/WSDataPartition.cpp
   WarpSpecialization/WSLowerMem.cpp
   WarpSpecialization/WSLowerToken.cpp
   WarpSpecialization/WSMemoryPlanner.cpp
   WarpSpecialization/WSSpecialize.cpp
+  WarpSpecialization/WSTMAStoreLowering.cpp
   WarpSpecialization/WSTaskIdPropagate.cpp
   WarpSpecialization/WSTaskPartition.cpp
   WarpSpecialization/PartitionSchedulingMeta.cpp

@@ -169,6 +169,7 @@ class CUDAOptions:
     sanitize_overflow: bool = False
     arch: str = None
     instrumentation_mode: str = ""
+    early_tma_store_lowering: bool = False
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / 'lib'
@@ -332,6 +333,10 @@ class CUDABackend(BaseBackend):
         if opt.maxRegAutoWS is not None:
             mod.set_attr("ttg.max_reg_auto_ws", ir.builder(mod.context).get_int32_attr(opt.maxRegAutoWS))
 
+        # Add early TMA store lowering attribute
+        if opt.early_tma_store_lowering:
+            mod.set_attr("ttg.early_tma_store_lowering", ir.builder(mod.context).get_bool_attr(True))
+
         if opt.cluster_dims is not None:
             # Set cluster_info attributes on the module
             mod.set_attr(
@@ -371,6 +376,7 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_triton_licm(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+            nvidia.passes.hopper.add_tma_store_lowering(pm)
             smem_budget = _max_shared_mem_for_capability(capability)
             nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled,
                                                      smem_budget)
@@ -394,6 +400,7 @@ class CUDABackend(BaseBackend):
                 passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
             else:
                 # use Meta's WS internally which supports both hopper and blackwell
+                nvidia.passes.hopper.add_tma_store_lowering(pm)
                 if knobs.nvidia.use_meta_partition:
                     nvidia.passes.hopper.add_partition_scheduling_meta(pm)
                 else:
@@ -487,11 +494,18 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_allocate_global_scratch_memory(pm)
         nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
         # Print TTGIR to TLX mapping before final emission (for debugging/analysis)
-        if knobs.nvidia.dump_ttgir_to_tlx:
+        tlx_dump_dir = None
+        tlx_saved_fd = None
+        tlx_capture_file = None
+        if knobs.nvidia.dump_tlx_benchmark:
+            from triton.tools.tlx_benchmark_gen import setup_tlx_dump
+            tlx_dump_dir, tlx_saved_fd, tlx_capture_file = setup_tlx_dump(pm, tlx.tlx_passes)
+        elif knobs.nvidia.dump_ttgir_to_tlx:
             tlx.tlx_passes.add_tlx_print_ttgir_to_tlx(pm)
         # instrumentation point here so we can override IRs above (e.g., ttir and ttgir)
         if CUDABackend.instrumentation:
             CUDABackend.instrumentation.patch("ttgpuir_to_llvmir", pm, mod.context)
+        nvidia.passes.hopper.add_tma_store_token_wait_lowering(pm)
         nvidia.passes.ttgpuir.add_to_llvmir(pm, capability, ptx_version)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
@@ -509,6 +523,11 @@ class CUDABackend(BaseBackend):
             CUDABackend.instrumentation.patch("llvmir_to_llvm", pm, mod.context)
 
         pm.run(mod, 'make_llir')
+
+        # After pm.run(), restore stdout and generate TLX benchmark artifacts
+        if tlx_dump_dir is not None:
+            from triton.tools.tlx_benchmark_gen import finalize_tlx_dump
+            finalize_tlx_dump(tlx_dump_dir, tlx_saved_fd, tlx_capture_file, metadata)
 
         if knobs.compilation.dump_ir_extract_di_local_variables:
             # comments below on why separate it

@@ -15,48 +15,29 @@ description: >
 **Do NOT run `third_party/tlx/tutorials/testing/test_correctness.py` for autoWS.**
 Those tests cover manual warp specialization via TLX, which is a separate system.
 
+The canonical test list lives in `third_party/nvidia/hopper/run_all.sh` — check
+that file if the list below seems out of date.
+
 ## Python tests
 
 ```bash
-# Primary autoWS Python test
+# GEMM autoWS Python test
 pytest python/test/unit/language/test_tutorial09_warp_specialization.py
 
-# Additional autoWS tests
-pytest python/test/unit/language/test_warp_specialization.py
+# Addmm autoWS Python test
+pytest python/test/unit/language/test_autows_addmm.py
+
+# FA autoWS tutorial kernels (with Meta WS/partition)
+TRITON_USE_META_PARTITION=1 TRITON_ALWAYS_COMPILE=1 TRITON_USE_META_WS=1 pytest python/tutorials/fused-attention-ws-device-tma.py
+TRITON_USE_META_PARTITION=1 TRITON_ALWAYS_COMPILE=1 TRITON_USE_META_WS=1 python python/tutorials/test_tlx_bwd_from_fused_attention.py
 ```
 
 ## LIT tests
 
-Run individual LIT tests with `triton-opt` (after rebuilding if C++ changed):
+Run all WarpSpecialization LIT tests:
 
 ```bash
-# Run all WarpSpecialization LIT tests
-python bin/run-lit.py test/Hopper/WarpSpecialization/
-
-# Or run individual tests:
-python bin/run-lit.py test/Hopper/WarpSpecialization/ws_task_partition.mlir
-python bin/run-lit.py test/Hopper/WarpSpecialization/ws_task_id_propagation.mlir
-python bin/run-lit.py test/Hopper/WarpSpecialization/ws_data_partition.mlir
-python bin/run-lit.py test/Hopper/WarpSpecialization/ws_code_partition.mlir
-python bin/run-lit.py test/Hopper/WarpSpecialization/ws_code_partition_merged_barrier.mlir
-python bin/run-lit.py test/Hopper/WarpSpecialization/ws_memory_planner.mlir
-python bin/run-lit.py test/Hopper/WarpSpecialization/ws_memory_planner_bwd.mlir
-python bin/run-lit.py test/Hopper/WarpSpecialization/ws_memory_planner_merged_barrier.mlir
-python bin/run-lit.py test/Hopper/WarpSpecialization/ws_memory_planner_split_copy.mlir
-python bin/run-lit.py test/Hopper/WarpSpecialization/fa_code_partition.mlir
-python bin/run-lit.py test/Hopper/WarpSpecialization/blackwell_fa_code_partition.mlir
-python bin/run-lit.py test/Hopper/WarpSpecialization/blackwell_ws_data_partition.mlir
-python bin/run-lit.py test/Hopper/WarpSpecialization/blackwell_ws_matmul_tma.mlir
-python bin/run-lit.py test/Hopper/WarpSpecialization/swap_transposed_local_alloc.mlir
-python bin/run-lit.py test/Hopper/WarpSpecialization/1D_tmem.mlir
-```
-
-### Additional upstream LIT tests
-
-```bash
-python bin/run-lit.py test/Conversion/warp_specialize_to_llvm.mlir
-python bin/run-lit.py test/TritonGPU/partition-scheduling.mlir
-python bin/run-lit.py test/TritonGPU/partition-loops.mlir
+lit test/Hopper/WarpSpecialization/
 ```
 
 ## If tests hang
