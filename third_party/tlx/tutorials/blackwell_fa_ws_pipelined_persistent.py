@@ -1076,13 +1076,13 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
 
 
 configs_bwd_tlx = [
-    # 1-CTA config
+    # 2-CTA config
     triton.Config(
         {
             "BLOCK_M1": bm1,
             "BLOCK_N1": 128,
             "NUM_BUFFERS_KV": 1,
-            "NUM_BUFFERS_Q": 2,
+            "NUM_BUFFERS_Q": 1,
             "NUM_BUFFERS_DO": 1,
             "NUM_BUFFERS_DS": 1,
             "NUM_BUFFERS_TMEM": 1,
@@ -1092,13 +1092,14 @@ configs_bwd_tlx = [
             "DQ_REDUCE_NCOL": 32,
             "EPILOGUE_SUBTILE": 4,
             "GROUP_SIZE_M": 1,
-            "USE_WARP_BARRIER": True,
-            "NUM_CTAS": 1,
+            "USE_WARP_BARRIER": False,
+            "NUM_CTAS": 2,
         },
         num_warps=8,
         num_stages=1,
         pre_hook=_bwd_host_descriptor_pre_hook_tlx,
-    ) for bm1 in [64, 128]
+        ctas_per_cga=(2, 1, 1),
+    ) for bm1 in [128]
 ]
 
 
@@ -1368,12 +1369,19 @@ def _bwd_mma_dots_2cta(
     dot_fulls,
     dot_empties,
     kt_fulls,
+    kt_empties,
+    k_fulls,
+    v_fulls,
 ):
     """2-CTA MMA dot sequence: prolog + main loop + epilog.
 
     Uses qt_tiles/dot_tiles for dots 1,2 and kt_tiles for dot 5.
     All dots use two_ctas=True.
     """
+
+    # Wait for K and V loads to complete (not bundled into q_fulls/do_fulls in 2-CTA).
+    tlx.barrier_wait(k_fulls[kv_buf_id], kv_phase)
+    tlx.barrier_wait(v_fulls[kv_buf_id], kv_phase)
 
     q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
     do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
@@ -1595,7 +1603,6 @@ def _bwd_load_1cta(
     NUM_CTAS: tl.constexpr,
     cluster_cta_rank,
     is_leader,
-    USE_2CTA: tl.constexpr,
 ):
     """1-CTA load: one while-loop iteration (base code verbatim)."""
     off_chz, off_bh, start_m, start_n, num_steps = bwd_calculate_offsets(
@@ -1635,7 +1642,6 @@ def _bwd_load_1cta(
         q_tiles[q_buf_id],
         [(off_bh + curr_m).to(tl.int32), cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
         q_fulls[q_buf_id],
-        two_ctas=USE_2CTA,
     )
 
     # Load M
@@ -1665,7 +1671,6 @@ def _bwd_load_1cta(
         do_tiles[do_buf_id],
         [(off_bh + curr_m).to(tl.int32), cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
         do_fulls[do_buf_id],
-        two_ctas=USE_2CTA,
     )
 
     # Load D
@@ -1677,43 +1682,6 @@ def _bwd_load_1cta(
         [(off_chz + curr_m).to(tl.int32)],
         d_fulls[d_buf_id],
     )
-
-    # 2-CTA: load transposed views for dots 1,2 and Kt for dot 5
-    if USE_2CTA:
-        # Load Qt [BLOCK_M1//2, HEAD_DIM] for dots 1,2
-        tlx.barrier_wait(qt_empties[q_buf_id], q_phase ^ 1)
-        if is_leader:
-            tlx.barrier_expect_bytes(qt_fulls[q_buf_id], Q_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
-        tlx.async_descriptor_load(
-            desc_qt,
-            qt_tiles[q_buf_id],
-            [(off_bh + curr_m + cluster_cta_rank * (BLOCK_M1 // NUM_CTAS)).to(tl.int32), 0],
-            qt_fulls[q_buf_id],
-            two_ctas=True,
-        )
-        # Load dOt [BLOCK_M1//2, HEAD_DIM] for dots 1,2
-        tlx.barrier_wait(dot_empties[do_buf_id], do_phase ^ 1)
-        if is_leader:
-            tlx.barrier_expect_bytes(dot_fulls[do_buf_id], DO_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
-        tlx.async_descriptor_load(
-            desc_dot,
-            dot_tiles[do_buf_id],
-            [(off_bh + curr_m + cluster_cta_rank * (BLOCK_M1 // NUM_CTAS)).to(tl.int32), 0],
-            dot_fulls[do_buf_id],
-            two_ctas=True,
-        )
-        # Load Kt [BLOCK_N1*2, HEAD_DIM//2] for dot 5
-        tlx.barrier_wait(kt_empties[kv_buf_id], kv_phase ^ 1)
-        lower_start_block_n = start_block_n - cluster_cta_rank * BLOCK_N1
-        if is_leader:
-            tlx.barrier_expect_bytes(kt_fulls[kv_buf_id], K_BYTES_PER_ELEM * BLOCK_N1 * HEAD_DIM * NUM_CTAS)
-        tlx.async_descriptor_load(
-            desc_kt,
-            kt_tiles[kv_buf_id],
-            [(off_bh + lower_start_block_n).to(tl.int32), cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
-            kt_fulls[kv_buf_id],
-            two_ctas=True,
-        )
 
     curr_m += step_m
     blk_idx += 1
@@ -1729,7 +1697,6 @@ def _bwd_load_1cta(
             q_tiles[q_buf_id],
             [(off_bh + curr_m).to(tl.int32), cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
             q_fulls[q_buf_id],
-            two_ctas=USE_2CTA,
         )
 
         # Load M
@@ -1750,7 +1717,6 @@ def _bwd_load_1cta(
             do_tiles[do_buf_id],
             [(off_bh + curr_m).to(tl.int32), cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
             do_fulls[do_buf_id],
-            two_ctas=USE_2CTA,
         )
 
         # Load D
@@ -1762,29 +1728,6 @@ def _bwd_load_1cta(
             [(off_chz + curr_m).to(tl.int32)],
             d_fulls[d_buf_id],
         )
-
-        # 2-CTA: load Qt and dOt for current M-block
-        if USE_2CTA:
-            tlx.barrier_wait(qt_empties[q_buf_id], q_phase ^ 1)
-            if is_leader:
-                tlx.barrier_expect_bytes(qt_fulls[q_buf_id], Q_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
-            tlx.async_descriptor_load(
-                desc_qt,
-                qt_tiles[q_buf_id],
-                [(off_bh + curr_m + cluster_cta_rank * (BLOCK_M1 // NUM_CTAS)).to(tl.int32), 0],
-                qt_fulls[q_buf_id],
-                two_ctas=True,
-            )
-            tlx.barrier_wait(dot_empties[do_buf_id], do_phase ^ 1)
-            if is_leader:
-                tlx.barrier_expect_bytes(dot_fulls[do_buf_id], DO_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
-            tlx.async_descriptor_load(
-                desc_dot,
-                dot_tiles[do_buf_id],
-                [(off_bh + curr_m + cluster_cta_rank * (BLOCK_M1 // NUM_CTAS)).to(tl.int32), 0],
-                dot_fulls[do_buf_id],
-                two_ctas=True,
-            )
 
         curr_m += step_m
         blk_idx += 1
@@ -1896,35 +1839,22 @@ def _bwd_load_2cta(
         two_ctas=tl.constexpr(True),
     )
 
-    # Load Q: [BLOCK_M1, HEAD_DIM//NUM_CTAS] per CTA
     # In 2-CTA, skip q_tiles prolog load — dot1 uses qt_tiles, not q_tiles.
     # q_tiles will be first loaded in the inner loop for dk.
     curr_m = start_m
     step_m = BLOCK_M1
     q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
-    if False:
-        tlx.barrier_wait(q_empties[q_buf_id], q_phase ^ 1)
-        if is_leader:
-            tlx.barrier_expect_bytes(q_fulls[q_buf_id], Q_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
-        tlx.async_descriptor_load(
-            desc_q,
-            q_tiles[q_buf_id],
-            [(off_bh + curr_m).to(tl.int32), cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
-            q_fulls[q_buf_id],
-            two_ctas=tl.constexpr(True),
-        )
-    # 2-CTA: Load Qt [HEAD_DIM, BLOCK_M1//2] per CTA (for dots 1,2)
-    if True:
-        tlx.barrier_wait(qt_empties[q_buf_id], q_phase ^ 1)
-        if is_leader:
-            tlx.barrier_expect_bytes(qt_fulls[q_buf_id], Q_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
-        tlx.async_descriptor_load(
-            desc_qt,
-            qt_tiles[q_buf_id],
-            [(off_bh + curr_m + cluster_cta_rank * (BLOCK_M1 // NUM_CTAS)).to(tl.int32), 0],
-            qt_fulls[q_buf_id],
-            two_ctas=tl.constexpr(True),
-        )
+    # Load Qt [HEAD_DIM, BLOCK_M1//2] per CTA (for dots 1,2)
+    tlx.barrier_wait(qt_empties[q_buf_id], q_phase ^ 1)
+    if is_leader:
+        tlx.barrier_expect_bytes(qt_fulls[q_buf_id], Q_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
+    tlx.async_descriptor_load(
+        desc_qt,
+        qt_tiles[q_buf_id],
+        [(off_bh + curr_m + cluster_cta_rank * (BLOCK_M1 // NUM_CTAS)).to(tl.int32), 0],
+        qt_fulls[q_buf_id],
+        two_ctas=tl.constexpr(True),
+    )
 
     # Load M
     m_buf_id, _ = _get_bufidx_phase(blk_idx, M_STAGE)
@@ -1948,18 +1878,17 @@ def _bwd_load_2cta(
         do_fulls[do_buf_id],
         two_ctas=tl.constexpr(True),
     )
-    # 2-CTA: Load dOt [HEAD_DIM, BLOCK_M1//2] per CTA (for dots 1,2)
-    if True:
-        tlx.barrier_wait(dot_empties[do_buf_id], do_phase ^ 1)
-        if is_leader:
-            tlx.barrier_expect_bytes(dot_fulls[do_buf_id], DO_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
-        tlx.async_descriptor_load(
-            desc_dot,
-            dot_tiles[do_buf_id],
-            [(off_bh + curr_m + cluster_cta_rank * (BLOCK_M1 // NUM_CTAS)).to(tl.int32), 0],
-            dot_fulls[do_buf_id],
-            two_ctas=tl.constexpr(True),
-        )
+    # Load dOt [HEAD_DIM, BLOCK_M1//2] per CTA (for dots 1,2)
+    tlx.barrier_wait(dot_empties[do_buf_id], do_phase ^ 1)
+    if is_leader:
+        tlx.barrier_expect_bytes(dot_fulls[do_buf_id], DO_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
+    tlx.async_descriptor_load(
+        desc_dot,
+        dot_tiles[do_buf_id],
+        [(off_bh + curr_m + cluster_cta_rank * (BLOCK_M1 // NUM_CTAS)).to(tl.int32), 0],
+        dot_fulls[do_buf_id],
+        two_ctas=tl.constexpr(True),
+    )
 
     # Load D
     d_buf_id, _ = _get_bufidx_phase(blk_idx, D_STAGE)
@@ -1971,19 +1900,18 @@ def _bwd_load_2cta(
         d_fulls[d_buf_id],
     )
 
-    # 2-CTA: Load Kt (B for dQ = dS @ K), [BLOCK_N1, HEAD_DIM//2] per CTA.
-    if True:
-        tlx.barrier_wait(kt_empties[kv_buf_id], kv_phase ^ 1)
-        lower_start_block_n = start_block_n - cluster_cta_rank * BLOCK_N1
-        if is_leader:
-            tlx.barrier_expect_bytes(kt_fulls[kv_buf_id], K_BYTES_PER_ELEM * BLOCK_N1 * HEAD_DIM * NUM_CTAS)
-        tlx.async_descriptor_load(
-            desc_kt,
-            kt_tiles[kv_buf_id],
-            [(off_bh + lower_start_block_n).to(tl.int32), cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
-            kt_fulls[kv_buf_id],
-            two_ctas=tl.constexpr(True),
-        )
+    # Load Kt (B for dQ = dS @ K), [BLOCK_N1*2, HEAD_DIM//2] per CTA.
+    tlx.barrier_wait(kt_empties[kv_buf_id], kv_phase ^ 1)
+    lower_start_block_n = start_block_n - cluster_cta_rank * BLOCK_N1
+    if is_leader:
+        tlx.barrier_expect_bytes(kt_fulls[kv_buf_id], K_BYTES_PER_ELEM * BLOCK_N1 * HEAD_DIM * NUM_CTAS)
+    tlx.async_descriptor_load(
+        desc_kt,
+        kt_tiles[kv_buf_id],
+        [(off_bh + lower_start_block_n).to(tl.int32), cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
+        kt_fulls[kv_buf_id],
+        two_ctas=tl.constexpr(True),
+    )
 
     curr_m += step_m
     blk_idx += 1
@@ -1992,55 +1920,42 @@ def _bwd_load_2cta(
         q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
         do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
 
-        # 2-CTA: Load qt_tiles for current M-block (dot1) FIRST,
+        # Load qt_tiles for current M-block (dot1) FIRST,
         # then q_tiles for prev M-block (dk). Qt must come first so
         # dot1 can proceed; dk will then free q_empties for next iter.
-        if True:
-            tlx.barrier_wait(qt_empties[q_buf_id], q_phase ^ 1)
-            if is_leader:
-                tlx.barrier_expect_bytes(qt_fulls[q_buf_id], Q_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
-            tlx.async_descriptor_load(
-                desc_qt,
-                qt_tiles[q_buf_id],
-                [(off_bh + curr_m + cluster_cta_rank * (BLOCK_M1 // NUM_CTAS)).to(tl.int32), 0],
-                qt_fulls[q_buf_id],
-                two_ctas=tl.constexpr(True),
-            )
+        tlx.barrier_wait(qt_empties[q_buf_id], q_phase ^ 1)
+        if is_leader:
+            tlx.barrier_expect_bytes(qt_fulls[q_buf_id], Q_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
+        tlx.async_descriptor_load(
+            desc_qt,
+            qt_tiles[q_buf_id],
+            [(off_bh + curr_m + cluster_cta_rank * (BLOCK_M1 // NUM_CTAS)).to(tl.int32), 0],
+            qt_fulls[q_buf_id],
+            two_ctas=tl.constexpr(True),
+        )
 
-            tlx.barrier_wait(dot_empties[do_buf_id], do_phase ^ 1)
-            if is_leader:
-                tlx.barrier_expect_bytes(dot_fulls[do_buf_id], DO_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
-            tlx.async_descriptor_load(
-                desc_dot,
-                dot_tiles[do_buf_id],
-                [(off_bh + curr_m + cluster_cta_rank * (BLOCK_M1 // NUM_CTAS)).to(tl.int32), 0],
-                dot_fulls[do_buf_id],
-                two_ctas=tl.constexpr(True),
-            )
+        tlx.barrier_wait(dot_empties[do_buf_id], do_phase ^ 1)
+        if is_leader:
+            tlx.barrier_expect_bytes(dot_fulls[do_buf_id], DO_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
+        tlx.async_descriptor_load(
+            desc_dot,
+            dot_tiles[do_buf_id],
+            [(off_bh + curr_m + cluster_cta_rank * (BLOCK_M1 // NUM_CTAS)).to(tl.int32), 0],
+            dot_fulls[do_buf_id],
+            two_ctas=tl.constexpr(True),
+        )
 
-            prev_q_buf_id, prev_q_phase = _get_bufidx_phase(blk_idx - 1, NUM_BUFFERS_Q)
-            tlx.barrier_wait(q_empties[prev_q_buf_id], prev_q_phase ^ 1)
-            if is_leader:
-                tlx.barrier_expect_bytes(q_fulls[prev_q_buf_id], Q_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
-            tlx.async_descriptor_load(
-                desc_q,
-                q_tiles[prev_q_buf_id],
-                [(off_bh + curr_m - step_m).to(tl.int32), cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
-                q_fulls[prev_q_buf_id],
-                two_ctas=tl.constexpr(True),
-            )
-        else:
-            # 1-CTA: Load Q for current M-block (dot1 and dk both use q_tiles)
-            tlx.barrier_wait(q_empties[q_buf_id], q_phase ^ 1)
-            if is_leader:
-                tlx.barrier_expect_bytes(q_fulls[q_buf_id], Q_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
-            tlx.async_descriptor_load(
-                desc_q,
-                q_tiles[q_buf_id],
-                [(off_bh + curr_m).to(tl.int32), cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
-                q_fulls[q_buf_id],
-                two_ctas=tl.constexpr(True),
-            )
+        prev_q_buf_id, prev_q_phase = _get_bufidx_phase(blk_idx - 1, NUM_BUFFERS_Q)
+        tlx.barrier_wait(q_empties[prev_q_buf_id], prev_q_phase ^ 1)
+        if is_leader:
+            tlx.barrier_expect_bytes(q_fulls[prev_q_buf_id], Q_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
+        tlx.async_descriptor_load(
+            desc_q,
+            q_tiles[prev_q_buf_id],
+            [(off_bh + curr_m - step_m).to(tl.int32), cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
+            q_fulls[prev_q_buf_id],
+            two_ctas=tl.constexpr(True),
+        )
 
         # Load M
         m_buf_id, _ = _get_bufidx_phase(blk_idx, M_STAGE)
@@ -2077,19 +1992,18 @@ def _bwd_load_2cta(
         curr_m += step_m
         blk_idx += 1
 
-    # 2-CTA: Load q_tiles for the last M-block (epilog dk will consume)
-    if True:
-        last_q_buf_id, last_q_phase = _get_bufidx_phase(blk_idx - 1, NUM_BUFFERS_Q)
-        tlx.barrier_wait(q_empties[last_q_buf_id], last_q_phase ^ 1)
-        if is_leader:
-            tlx.barrier_expect_bytes(q_fulls[last_q_buf_id], Q_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
-        tlx.async_descriptor_load(
-            desc_q,
-            q_tiles[last_q_buf_id],
-            [(off_bh + curr_m - step_m).to(tl.int32), cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
-            q_fulls[last_q_buf_id],
-            two_ctas=tl.constexpr(True),
-        )
+    # Load q_tiles for the last M-block (epilog dk will consume)
+    last_q_buf_id, last_q_phase = _get_bufidx_phase(blk_idx - 1, NUM_BUFFERS_Q)
+    tlx.barrier_wait(q_empties[last_q_buf_id], last_q_phase ^ 1)
+    if is_leader:
+        tlx.barrier_expect_bytes(q_fulls[last_q_buf_id], Q_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
+    tlx.async_descriptor_load(
+        desc_q,
+        q_tiles[last_q_buf_id],
+        [(off_bh + curr_m - step_m).to(tl.int32), cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
+        q_fulls[last_q_buf_id],
+        two_ctas=tl.constexpr(True),
+    )
 
     return blk_idx
 
@@ -2311,11 +2225,13 @@ def _attn_bwd_ws(
     # allocate smem buffers
     k_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
     v_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_v), NUM_BUFFERS_KV)
-    q_tiles = tlx.local_alloc((BLOCK_M1, HEAD_DIM), tlx.dtype_of(desc_q), NUM_BUFFERS_Q)
-    do_tiles = tlx.local_alloc((BLOCK_M1, HEAD_DIM), tlx.dtype_of(desc_do), NUM_BUFFERS_DO)
+    q_tiles = tlx.local_alloc((BLOCK_M1, HEAD_DIM // NUM_CTAS), tlx.dtype_of(desc_q), NUM_BUFFERS_Q)
+    do_tiles = tlx.local_alloc((BLOCK_M1, HEAD_DIM // NUM_CTAS), tlx.dtype_of(desc_do), NUM_BUFFERS_DO)
 
     # Use SMEM for dsT
-    ds_tiles = tlx.local_alloc((BLOCK_N1, BLOCK_M1), tlx.dtype_of(desc_q), NUM_BUFFERS_DS)
+    DS_ROWS: tl.constexpr = BLOCK_N1 * NUM_CTAS
+    DS_COLS: tl.constexpr = BLOCK_M1 // NUM_CTAS
+    ds_tiles = tlx.local_alloc((DS_ROWS, DS_COLS), tlx.dtype_of(desc_q), NUM_BUFFERS_DS)
 
     # SMEM staging buffer for async TMA reduce-add of dQ.
     # Uses smaller column width (DQ_REDUCE_NCOL) than dK/dV to fit in SMEM.
@@ -2351,7 +2267,10 @@ def _attn_bwd_ws(
     do_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DO)
     m_fulls = tlx.alloc_barriers(num_barriers=M_STAGE)
     d_fulls = tlx.alloc_barriers(num_barriers=D_STAGE)
-    ds_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
+    if USE_WARP_BARRIER:
+        ds_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=8)
+    else:
+        ds_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM, arrive_count=NUM_CTAS)
     dsT_tmem_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS)
 
     # allocate tmem buffers
@@ -2392,25 +2311,25 @@ def _attn_bwd_ws(
         qk_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=8)
         p_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=8)
     else:
-        qk_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
-        p_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
+        qk_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM, arrive_count=NUM_CTAS)
+        p_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM, arrive_count=NUM_CTAS)
     dp_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     dq_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     if USE_WARP_BARRIER:
         dq_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=4)
     else:
-        dq_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
+        dq_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM, arrive_count=NUM_CTAS)
 
     dv_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     if USE_WARP_BARRIER:
         dv_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_KV, num_warps=8)
     else:
-        dv_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
+        dv_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV, arrive_count=NUM_CTAS)
     dk_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     if USE_WARP_BARRIER:
         dk_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_KV, num_warps=8)
     else:
-        dk_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
+        dk_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV, arrive_count=NUM_CTAS)
 
     # dQ uses the same storage alias group as dP/dS — all three share
     # the same TMEM slot.
@@ -2432,16 +2351,27 @@ def _attn_bwd_ws(
                 group_type=tlx.reuse_group_type.shared,
             ))
     else:
-        dq_tiles = tlx.local_alloc(
-            (BLOCK_M1, HEAD_DIM),
-            tl.float32,
-            NUM_BUFFERS_TMEM,
-            tlx.storage_kind.tmem,
-        )
+        if USE_2CTA:
+            # 2-CTA: dQ reuses S/P TMEM, each CTA produces M1//2 rows
+            dq_tiles = tlx.local_alloc(
+                (BLOCK_M1 // NUM_CTAS, HEAD_DIM),
+                tl.float32,
+                NUM_BUFFERS_TMEM,
+                tlx.storage_kind.tmem,
+                reuse=qk_tiles,
+            )
+        else:
+            # 1-CTA with bm1=64: separate dQ TMEM
+            dq_tiles = tlx.local_alloc(
+                (BLOCK_M1, HEAD_DIM),
+                tl.float32,
+                NUM_BUFFERS_TMEM,
+                tlx.storage_kind.tmem,
+            )
         if USE_WARP_BARRIER:
             dp_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=8)
         else:
-            dp_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
+            dp_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM, arrive_count=NUM_CTAS)
 
     LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
 
@@ -2465,6 +2395,8 @@ def _attn_bwd_ws(
                                     tlx.storage_kind.tmem,  # noqa: F841
                                     reuse=dp_tiles)
         # 2-CTA barriers for transposed views
+        k_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)  # noqa: F841
+        v_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)  # noqa: F841
         kt_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)  # noqa: F841
         kt_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)  # noqa: F841
         qt_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)  # noqa: F841
@@ -2757,97 +2689,99 @@ def _attn_bwd_ws(
                     kv_buf_id, kv_phase = _get_bufidx_phase(tile_count, NUM_BUFFERS_KV)
                     if USE_2CTA:
                         blk_idx = _bwd_mma_dots_2cta(
-                            blk_idx,
-                            num_steps,
-                            kv_buf_id,
-                            kv_phase,
-                            k_tiles,
-                            v_tiles,
-                            q_tiles,
-                            do_tiles,
-                            qk_tiles,
-                            qk_fulls,
-                            qk_empties,
-                            p_tiles,
-                            p_fulls,
-                            dp_tiles,
-                            dp_fulls,
-                            dp_empties,
-                            dv_tiles,
-                            dv_fulls,
-                            dv_empties,
-                            dk_tiles,
-                            dk_fulls,
-                            dk_empties,
-                            dq_tiles,
-                            dq_fulls,
-                            dq_empties,
-                            ds_tiles,
-                            ds_fulls,
-                            dsT_tmem_tiles,
-                            dsT_tmem_fulls,
-                            do_fulls,
-                            do_empties,
-                            q_fulls,
-                            q_empties,
-                            k_mma_done,
-                            NUM_BUFFERS_Q,
-                            NUM_BUFFERS_DO,
-                            NUM_BUFFERS_TMEM,
-                            NUM_BUFFERS_DS,
-                            BLOCK_M1,
-                            BLOCK_N1,
-                            qt_tiles,
-                            dot_tiles,
-                            kt_tiles,
-                            qt_fulls,
-                            qt_empties,
-                            dot_fulls,
-                            dot_empties,
-                            kt_fulls,
+                            blk_idx=blk_idx,
+                            num_steps=num_steps,
+                            kv_buf_id=kv_buf_id,
+                            kv_phase=kv_phase,
+                            k_tiles=k_tiles,
+                            v_tiles=v_tiles,
+                            q_tiles=q_tiles,
+                            do_tiles=do_tiles,
+                            qk_tiles=qk_tiles,
+                            qk_fulls=qk_fulls,
+                            qk_empties=qk_empties,
+                            p_tiles=p_tiles,
+                            p_fulls=p_fulls,
+                            dp_tiles=dp_tiles,
+                            dp_fulls=dp_fulls,
+                            dp_empties=dp_empties,
+                            dv_tiles=dv_tiles,
+                            dv_fulls=dv_fulls,
+                            dv_empties=dv_empties,
+                            dk_tiles=dk_tiles,
+                            dk_fulls=dk_fulls,
+                            dk_empties=dk_empties,
+                            dq_tiles=dq_tiles,
+                            dq_fulls=dq_fulls,
+                            dq_empties=dq_empties,
+                            ds_tiles=ds_tiles,
+                            ds_fulls=ds_fulls,
+                            dsT_tmem_tiles=dsT_tmem_tiles,
+                            dsT_tmem_fulls=dsT_tmem_fulls,
+                            do_fulls=do_fulls,
+                            do_empties=do_empties,
+                            q_fulls=q_fulls,
+                            q_empties=q_empties,
+                            k_mma_done=k_mma_done,
+                            NUM_BUFFERS_Q=NUM_BUFFERS_Q,
+                            NUM_BUFFERS_DO=NUM_BUFFERS_DO,
+                            NUM_BUFFERS_TMEM=NUM_BUFFERS_TMEM,
+                            NUM_BUFFERS_DS=NUM_BUFFERS_DS,
+                            BLOCK_N1=BLOCK_N1,
+                            qt_tiles=qt_tiles,
+                            dot_tiles=dot_tiles,
+                            kt_tiles=kt_tiles,
+                            qt_fulls=qt_fulls,
+                            qt_empties=qt_empties,
+                            dot_fulls=dot_fulls,
+                            dot_empties=dot_empties,
+                            kt_fulls=kt_fulls,
+                            kt_empties=kt_empties,
+                            k_fulls=k_fulls,
+                            v_fulls=v_fulls,
                         )
                     else:
                         blk_idx = _bwd_mma_dots_1cta(
-                            blk_idx,
-                            num_steps,
-                            kv_buf_id,
-                            kv_phase,
-                            k_tiles,
-                            v_tiles,
-                            q_tiles,
-                            do_tiles,
-                            qk_tiles,
-                            qk_fulls,
-                            qk_empties,
-                            p_tiles,
-                            p_fulls,
-                            dp_tiles,
-                            dp_fulls,
-                            dp_empties,
-                            dv_tiles,
-                            dv_fulls,
-                            dv_empties,
-                            dk_tiles,
-                            dk_fulls,
-                            dk_empties,
-                            dq_tiles,
-                            dq_fulls,
-                            dq_empties,
-                            ds_tiles,
-                            ds_fulls,
-                            dsT_tmem_tiles,
-                            dsT_tmem_fulls,
-                            do_fulls,
-                            do_empties,
-                            q_fulls,
-                            q_empties,
-                            k_mma_done,
-                            NUM_BUFFERS_Q,
-                            NUM_BUFFERS_DO,
-                            NUM_BUFFERS_TMEM,
-                            NUM_BUFFERS_DS,
-                            BLOCK_M1,
-                            BLOCK_N1,
+                            blk_idx=blk_idx,
+                            num_steps=num_steps,
+                            kv_buf_id=kv_buf_id,
+                            kv_phase=kv_phase,
+                            k_tiles=k_tiles,
+                            v_tiles=v_tiles,
+                            q_tiles=q_tiles,
+                            do_tiles=do_tiles,
+                            qk_tiles=qk_tiles,
+                            qk_fulls=qk_fulls,
+                            qk_empties=qk_empties,
+                            p_tiles=p_tiles,
+                            p_fulls=p_fulls,
+                            dp_tiles=dp_tiles,
+                            dp_fulls=dp_fulls,
+                            dp_empties=dp_empties,
+                            dv_tiles=dv_tiles,
+                            dv_fulls=dv_fulls,
+                            dv_empties=dv_empties,
+                            dk_tiles=dk_tiles,
+                            dk_fulls=dk_fulls,
+                            dk_empties=dk_empties,
+                            dq_tiles=dq_tiles,
+                            dq_fulls=dq_fulls,
+                            dq_empties=dq_empties,
+                            ds_tiles=ds_tiles,
+                            ds_fulls=ds_fulls,
+                            dsT_tmem_tiles=dsT_tmem_tiles,
+                            dsT_tmem_fulls=dsT_tmem_fulls,
+                            do_fulls=do_fulls,
+                            do_empties=do_empties,
+                            q_fulls=q_fulls,
+                            q_empties=q_empties,
+                            k_mma_done=k_mma_done,
+                            NUM_BUFFERS_Q=NUM_BUFFERS_Q,
+                            NUM_BUFFERS_DO=NUM_BUFFERS_DO,
+                            NUM_BUFFERS_TMEM=NUM_BUFFERS_TMEM,
+                            NUM_BUFFERS_DS=NUM_BUFFERS_DS,
+                            BLOCK_M1=BLOCK_M1,
+                            BLOCK_N1=BLOCK_N1,
                         )
                     tile_count += 1
                 tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
@@ -2971,7 +2905,6 @@ def _attn_bwd_ws(
                         NUM_CTAS=NUM_CTAS,
                         cluster_cta_rank=cluster_cta_rank,
                         is_leader=is_leader,
-                        USE_2CTA=USE_2CTA,
                     )
                 tile_count += 1
                 tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
