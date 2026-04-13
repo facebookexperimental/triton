@@ -1048,6 +1048,11 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
     # multiple configs are present (e.g., USE_WARP_BARRIER in [False, True]).
     nargs["desc_dq"].base.zero_()
 
+    # Reset dq accumulator to zeros before each autotuner warmup run.
+    # Without this, dq accumulates across autotuner benchmark runs when
+    # multiple configs are present (e.g., USE_WARP_BARRIER in [False, True]).
+    nargs["desc_dq"].base.zero_()
+
     nargs["desc_q"].block_shape = [BLOCK_M1, HEAD_DIM]
     nargs["desc_do"].block_shape = [BLOCK_M1, HEAD_DIM]
     nargs["desc_v"].block_shape = [BLOCK_N1, HEAD_DIM]
@@ -1075,12 +1080,12 @@ configs_bwd_tlx = [
             "DQ_REDUCE_STAGES": 2,
             "DQ_REDUCE_NCOL": 32,
             "GROUP_SIZE_M": 1,
-            "USE_WARP_BARRIER": True,
+            "USE_WARP_BARRIER": uwb,
         },
         num_warps=8,
         num_stages=1,
         pre_hook=_bwd_host_descriptor_pre_hook_tlx,
-    ) for bm1 in [64, 128]
+    ) for bm1 in [64, 128] for uwb in [False, True]
 ]
 
 

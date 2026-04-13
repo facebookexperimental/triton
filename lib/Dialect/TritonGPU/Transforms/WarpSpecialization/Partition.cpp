@@ -1,5 +1,6 @@
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/ADT/SCCIterator.h"

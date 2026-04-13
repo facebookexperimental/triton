@@ -526,6 +526,10 @@ def TTNG_AsyncTMACopyLocalToGlobalOp : TTNG_Op<"async_tma_copy_local_to_global">
     local memory pointed by the memory descriptor instead of a distributed
     tensor. The data copied depends on the global memory descriptor pointed to
     by `desc`.
+
+    When the optional token result is present, the token can be passed to
+    `async_tma_store_token_wait` to wait for this specific TMA store to finish
+    reading from shared memory.
   }];
 
   let arguments = (ins
@@ -535,10 +539,23 @@ def TTNG_AsyncTMACopyLocalToGlobalOp : TTNG_Op<"async_tma_copy_local_to_global">
     DefaultValuedAttr<TT_EvictionPolicyAttr, "triton::EvictionPolicy::NORMAL">:$evict
   );
 
+  let results = (outs Optional<TTG_AsyncToken>:$token);
+
+  let builders = [
+    OpBuilder<(ins "Value":$desc, "ValueRange":$coord, "Value":$src,
+               "triton::EvictionPolicy":$evict), [{
+      build($_builder, $_state, Type(), desc, coord, src, evict);
+    }]>,
+    OpBuilder<(ins "Value":$desc, "ValueRange":$coord, "Value":$src), [{
+      build($_builder, $_state, Type(), desc, coord, src,
+            triton::EvictionPolicy::NORMAL);
+    }]>
+  ];
+
   let assemblyFormat = [{
     $desc `[` $coord `]` $src
     oilist(`evictionPolicy` `=` $evict)
-    attr-dict `:` qualified(type($desc)) `,` qualified(type($src))
+    attr-dict `:` qualified(type($desc)) `,` qualified(type($src)) (`->` type($token)^)?
   }];
   let hasVerifier = 1;
 }
@@ -629,6 +646,33 @@ def TTNG_TMAStoreWaitOp : TTNG_Op<"async_tma_store_wait", [MemWaitOpTrait]> {
   }];
 
   let assemblyFormat = "attr-dict";
+}
+
+def TTNG_TMAStoreTokenWaitOp : TTNG_Op<"async_tma_store_token_wait", [AttrSizedOperandSegments]> {
+  let summary = "wait for a specific TMA store to finish reading from shared memory.";
+  let arguments = (ins
+    TTG_AsyncToken:$token,
+    Variadic<TTG_MemDescType>:$barriers,
+    Variadic<I1>:$barrier_preds,
+    Variadic<AnyType>:$nvws_tokens,
+    Variadic<I32>:$nvws_token_indices
+  );
+  let description = [{
+    Wait for a specific TMA store (identified by its token) to finish reading
+    from shared memory. This allows the shared memory buffer to be rewritten.
+
+    Optionally, after the wait completes, arrive on the given barriers. This
+    is used by warp specialization to embed the consumer release barrier
+    directly into the wait op.
+
+    nvws_tokens / nvws_token_indices carry deferred consumer-release tokens
+    that are resolved into real mbarriers during token lowering.
+  }];
+  let assemblyFormat = "$token custom<BarriersAndPreds>($barriers, $barrier_preds) custom<NvwsTokensAndIndices>($nvws_tokens, $nvws_token_indices) attr-dict `:` type($token) (`,` qualified(type($barriers))^)? (`,` type($nvws_tokens)^)?";
+  let extraClassDeclaration = [{
+    void addBarrier(Value barrier, Value pred);
+    void addToken(Value token, Value idx);
+  }];
 }
 
 def TTNG_TCGen5MMAOp : TTNG_Op<"tc_gen5_mma", [

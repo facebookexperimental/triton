@@ -54,7 +54,8 @@ bool isAsyncProxyRead(Operation *op) {
              triton::nvidia_gpu::TCGen5MMAScaledOp,
              triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp,
              triton::nvidia_gpu::AsyncTMAScatterOp,
-             triton::nvidia_gpu::AsyncTMAReduceOp>(op);
+             triton::nvidia_gpu::AsyncTMAReduceOp,
+             triton::nvidia_gpu::AsyncTMACopyLocalToGlobalOp>(op);
 }
 
 bool ignoreOpForProxyFence(Operation *op) {

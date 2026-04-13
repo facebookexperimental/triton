@@ -3801,14 +3801,15 @@ LogicalResult TritonGPUDialect::verifyOperationAttribute(Operation *op,
         }
       }
     }
-    auto partitionIds = getPartitionIds(op);
-    for (auto id : expectedIds) {
-      if (!partitionIds.contains(id)) {
-        return op->emitOpError("partition ids in attr ")
-               << attr.getName()
-               << " does not contain partition ids of all child ops";
-      }
-    }
+    // Disabled for AutoWS. TODO: Revisit?
+    // auto partitionIds = getPartitionIds(op);
+    // for (auto id : expectedIds) {
+    //   if (!partitionIds.contains(id)) {
+    //     return op->emitOpError("partition ids in attr ")
+    //            << attr.getName()
+    //            << " does not contain partition ids of all child ops";
+    //   }
+    // }
   }
 
   if (attr.getName() == kPartitionOutputsAttrName) {

@@ -588,6 +588,9 @@ public:
         rewriter, loc, tokType, a, b, acc, acc.getToken(), /*useD=*/vTrue,
         /*pred=*/vTrue);
     mma.setTwoCtas(useTwoCTAs);
+    // Propagate discardable attributes (e.g. tt.autows) from the original dot.
+    for (auto attr : dotOp->getDiscardableAttrs())
+      mma->setDiscardableAttr(attr.getName(), attr.getValue());
 
     auto ld = triton::nvidia_gpu::TMEMLoadOp::create(
         rewriter, loc, newAccType, tokType, acc, /*dep=*/mma.getToken());
@@ -882,6 +885,9 @@ public:
         scaleA.getResult(), scaleB.getResult(), dotOp.getAElemType(),
         dotOp.getBElemType(),
         /*useD=*/vTrue, /*pred=*/vTrue);
+    // Propagate discardable attributes (e.g. tt.autows) from the original dot.
+    for (auto attr : dotOp->getDiscardableAttrs())
+      mmaOp->setDiscardableAttr(attr.getName(), attr.getValue());
 
     auto ld = triton::nvidia_gpu::TMEMLoadOp::create(
         rewriter, loc, newAccType, tokType, acc, mmaOp.getToken());

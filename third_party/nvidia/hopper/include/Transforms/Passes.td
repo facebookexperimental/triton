@@ -164,6 +164,14 @@ def NVGPUTestWSBufferAllocation : Pass<"nvgpu-test-ws-buffer-allocation", "mlir:
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
 }
 
+def NVGPUTestWSHoistTMEMStore : Pass<"nvgpu-test-ws-hoist-tmem-store", "mlir::ModuleOp"> {
+  let summary = "test hoisting loop-invariant TMEM stores";
+
+  let description = "This pass hoists loop-invariant TMEM stores out of outer loops.";
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
+}
+
 def NVGPUTestPingPongPrep : Pass<"nvgpu-test-ping-pong-prep", "mlir::ModuleOp"> {
   let summary = "test ping pong preprocessing";
 
@@ -182,6 +190,74 @@ def NVGPUTestPingPongPrep : Pass<"nvgpu-test-ping-pong-prep", "mlir::ModuleOp"> 
            "int32_t", /*default*/"3",
            "number of stages for software pipelining">,
   ];
+}
+
+def NVGPUWSTMAStoreLowering : Pass<"nvgpu-ws-tma-store-lowering", "mlir::ModuleOp"> {
+  let summary = "Lower descriptor stores to async TMA copies via shared memory";
+
+  let description = [{
+    This pass lowers `tt.descriptor_store` ops into an SMEM local_alloc +
+    local_store + async TMA copy sequence.  Running it as a standalone pass
+    (before partition scheduling) ensures the created `local_alloc` is visible
+    to the scheduler and can later be hoisted by buffer allocation.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+}
+
+def NVGPUTestAnnotateTMAStoreWaits : Pass<"nvgpu-test-annotate-tma-store-waits", "mlir::ModuleOp"> {
+  let summary = "Annotate TMA store waits with can_rotate_by_buffer_count";
+
+  let description = [{
+    This pass walks `scf.for` loops to find `ttng.async_tma_store_token_wait`
+    ops whose SMEM buffer has a `buffer.copy` attribute (set by the memory
+    planner).  For each such wait, it sets `can_rotate_by_buffer_count = K`
+    where K = buffer.copy - 1, indicating that the wait can be delayed by
+    up to K iterations because K+1 buffer slots are available.
+  }];
+
+  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+}
+
+def NVGPUTestTMAStoreTokenWaitReorder : Pass<"nvgpu-test-tma-store-token-wait-reorder", "mlir::ModuleOp"> {
+  let summary = "Reschedule TMA store waits using the SWP CoarseSchedule";
+
+  let description = [{
+    When a `ttng.async_tma_store_token_wait` op carries the
+    `can_rotate_by_buffer_count` attribute (an integer K representing the
+    number of SMEM buffer copies), this pass uses the software pipeliner's
+    CoarseSchedule to reschedule the wait K positions forward in the
+    linearized pipeline order.
+
+    The pass deserializes the CoarseSchedule from the `scf.for` loop,
+    walks the linearized schedule from the defining TMA store to find the
+    K-th `local_store` to the same buffer, then assigns the wait to a new
+    cluster just before that K-th write's cluster.  This ensures the wait
+    is placed at the correct pipeline stage for buffer reuse without
+    physically moving ops in the IR.
+
+    If the loop has no SWP schedule (no stage/cluster attributes), the
+    pass creates a basic single-stage schedule for the entire loop before
+    attempting the reorder.
+  }];
+
+  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+}
+
+def NVGPUTMAStoreTokenWaitLowering : Pass<"nvgpu-tma-store-token-wait-lowering", "mlir::ModuleOp"> {
+  let summary = "Lower TMAStoreTokenWaitOp with barriers into TMAStoreWaitOp + ArriveBarrierOp";
+
+  let description = [{
+    This pass splits `ttng.async_tma_store_token_wait` ops that have attached
+    barriers into a `ttng.async_tma_store_wait` followed by one
+    `ttng.arrive_barrier` per barrier.  Running this before the LLVM lowering
+    pass allows the membar analysis to insert CTA-level barriers (bar.sync 0)
+    between the wait and the arrive, ensuring all warps complete the wait
+    before any thread signals the mbarrier.
+  }];
+
+  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
 
 def NVGPUPartitionSchedulingMeta : Pass<"nvgpu-partition-scheduling-meta", "mlir::ModuleOp"> {
