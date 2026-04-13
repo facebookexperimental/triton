@@ -1384,6 +1384,7 @@ def _bwd_mma_dots_2cta(
     NUM_BUFFERS_DO: tl.constexpr,
     NUM_BUFFERS_TMEM: tl.constexpr,
     NUM_BUFFERS_DS: tl.constexpr,
+    BLOCK_M1: tl.constexpr,
     BLOCK_N1: tl.constexpr,
     qt_tiles,
     dot_tiles,
@@ -1393,6 +1394,7 @@ def _bwd_mma_dots_2cta(
     dot_fulls,
     dot_empties,
     kt_fulls,
+    kt_empties,
 ):
     """2-CTA MMA dot sequence: prolog + main loop + epilog.
 
@@ -1499,7 +1501,7 @@ def _bwd_mma_dots_2cta(
             dp_tiles[tmem_buf_id],
             use_acc=False,
             mBarriers=[dp_fulls[tmem_buf_id], dot_empties[do_buf_id]],
-            two_ctas=True,
+            two_ctas=tl.constexpr(True),
         )
 
         # Dot 5: dq = tl.dot(tl.trans(dsT), k)
@@ -1513,7 +1515,7 @@ def _bwd_mma_dots_2cta(
             dq_tiles[tmem_buf_id_prev],
             use_acc=False,
             mBarriers=[dq_fulls[tmem_buf_id_prev]],
-            two_ctas=True,
+            two_ctas=tl.constexpr(True),
         )
         # Dot 3: dv += tl.dot(ppT, do)
         tlx.barrier_wait(p_fulls[tmem_buf_id], tmem_phase)
@@ -1523,12 +1525,12 @@ def _bwd_mma_dots_2cta(
             dv_tiles[kv_buf_id],
             use_acc=True,
             mBarriers=[do_empties[do_buf_id]],
-            two_ctas=True,
+            two_ctas=tl.constexpr(True),
         )
         blk_idx += 1
 
     # Commit dv accumulation after all loop iterations
-    tlx.tcgen05_commit(dv_fulls[kv_buf_id], two_ctas=True)
+    tlx.tcgen05_commit(dv_fulls[kv_buf_id], two_ctas=tl.constexpr(True))
 
     # -----------------------------------------------------------
     # Epilog
@@ -1548,7 +1550,7 @@ def _bwd_mma_dots_2cta(
         dk_tiles[kv_buf_id],
         use_acc=num_steps > 1,
         mBarriers=[q_empties[q_buf_id], dk_fulls[kv_buf_id]],
-        two_ctas=True,
+        two_ctas=tl.constexpr(True),
     )
 
     # Compute dq = tl.dot(tl.trans(dsT), k)
@@ -1564,10 +1566,10 @@ def _bwd_mma_dots_2cta(
         mBarriers=[
             dq_fulls[tmem_buf_id],
         ],
-        two_ctas=True,
+        two_ctas=tl.constexpr(True),
     )
     tlx.tcgen05_commit(k_mma_done[kv_buf_id])
-    tlx.tcgen05_commit(kt_empties[kv_buf_id], two_ctas=True)
+    tlx.tcgen05_commit(kt_empties[kv_buf_id], two_ctas=tl.constexpr(True))
 
     return blk_idx
 
@@ -1910,16 +1912,18 @@ def _attn_bwd_ws(
                 group_type=tlx.reuse_group_type.shared,
             ))
     else:
+        # 2-CTA: dQ reuses S/P TMEM. Each CTA produces M1//NUM_CTAS rows.
         dq_tiles = tlx.local_alloc(
-            (BLOCK_M1, HEAD_DIM),
+            (BLOCK_M1 // NUM_CTAS, HEAD_DIM),
             tl.float32,
             NUM_BUFFERS_TMEM,
             tlx.storage_kind.tmem,
+            reuse=qk_tiles,
         )
         if USE_WARP_BARRIER:
             dp_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=8)
         else:
-            dp_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
+            dp_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM, arrive_count=NUM_CTAS)
 
     LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
 
@@ -2283,6 +2287,7 @@ def _attn_bwd_ws(
                             dot_fulls,
                             dot_empties,
                             kt_fulls,
+                            kt_empties,
                         )
                     else:
                         blk_idx = _bwd_mma_dots_1cta(
