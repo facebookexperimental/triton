@@ -1424,6 +1424,39 @@ def _attn_bwd_ws(
 
     LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
 
+    # 2-CTA setup
+    if USE_2CTA:
+        cluster_cta_rank = tlx.cluster_cta_rank()
+        is_leader = cluster_cta_rank == 0
+        # Kt tiles: B operand for dQ = dS @ K, shape [BLOCK_N1*2, HEAD_DIM//2] per CTA.
+        kt_tiles = tlx.local_alloc((BLOCK_N1 * NUM_CTAS, HEAD_DIM // NUM_CTAS), tlx.dtype_of(desc_k),
+                                   NUM_BUFFERS_KV)  # noqa: F841
+        # Qt tiles: [BLOCK_M1//2, HEAD_DIM] — for dots 1,2 (transposed B, split along M)
+        qt_tiles = tlx.local_alloc((BLOCK_M1 // NUM_CTAS, HEAD_DIM), tlx.dtype_of(desc_q), NUM_BUFFERS_Q)  # noqa: F841
+        # dOt tiles: [BLOCK_M1//2, HEAD_DIM] — for dots 1,2
+        dot_tiles = tlx.local_alloc((BLOCK_M1 // NUM_CTAS, HEAD_DIM), tlx.dtype_of(desc_do),
+                                    NUM_BUFFERS_DO)  # noqa: F841
+        # DSMEM exchange staging buffer
+        ds_xchg_tiles = tlx.local_alloc((BLOCK_N1, BLOCK_M1 // NUM_CTAS), tlx.dtype_of(desc_q),
+                                        NUM_BUFFERS_DS)  # noqa: F841
+        # TMEM copy of dS for dot 5 (before DSMEM exchange)
+        dsT_tiles = tlx.local_alloc((BLOCK_N1, BLOCK_M1), tlx.dtype_of(desc_q), NUM_BUFFERS_DS,
+                                    tlx.storage_kind.tmem,  # noqa: F841
+                                    reuse=dp_tiles)
+        # 2-CTA barriers for transposed views
+        kt_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)  # noqa: F841
+        kt_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)  # noqa: F841
+        qt_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)  # noqa: F841
+        qt_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)  # noqa: F841
+        dot_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DO)  # noqa: F841
+        dot_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DO)  # noqa: F841
+        # DSMEM exchange barriers
+        ds_peer_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS)  # noqa: F841
+        dsT_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS, arrive_count=NUM_CTAS)  # noqa: F841
+    else:
+        cluster_cta_rank = 0
+        is_leader = True  # noqa: F841
+
     # 4 consumers: reduction(1) + compute(1) + mma(1) + load(1)
     clc_context = tlx.clc_create_context(num_consumers=4)
 
