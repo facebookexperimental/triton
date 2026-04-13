@@ -1645,7 +1645,10 @@ def _attn_bwd_ws(
                         sdv_store_buf[kv_buf_id],
                         [(off_bh + start_block_n).to(tl.int32), slice_id * DKV_STORE_NCOL],
                     )
-                tlx.barrier_arrive(dv_empties[kv_buf_id])
+                if USE_2CTA:
+                    tlx.barrier_arrive(dv_empties[kv_buf_id], 1, remote_cta_rank=0)
+                else:
+                    tlx.barrier_arrive(dv_empties[kv_buf_id])
                 tlx.barrier_wait(dk_fulls[kv_buf_id], kv_phase)
                 # Wait for MMA's dq dot (last k_tiles read) before writing
                 # sdk_store_buf which aliases k_tiles.
@@ -1670,7 +1673,10 @@ def _attn_bwd_ws(
                 # All staging stores done + MMA done reading k_tiles →
                 # safe for load task to refill both k_tiles and v_tiles.
                 tlx.barrier_arrive(k_empties[kv_buf_id])
-                tlx.barrier_arrive(dk_empties[kv_buf_id])
+                if USE_2CTA:
+                    tlx.barrier_arrive(dk_empties[kv_buf_id], 1, remote_cta_rank=0)
+                else:
+                    tlx.barrier_arrive(dk_empties[kv_buf_id])
                 tile_count += 1
                 tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                 clc_phase_consumer ^= 1
@@ -1707,33 +1713,51 @@ def _attn_bwd_ws(
 
                     # wait for dq = tl.dot(tl.trans(dsT), k)
                     tlx.barrier_wait(dq_fulls[tmem_buf_id], tmem_phase)
-                    for slice_id in tl.static_range(DQ_REDUCE_ITERS):
-                        dq_smem_idx = slice_id % DQ_REDUCE_STAGES
-                        dq_slice = tlx.local_slice(
-                            dq_tiles[tmem_buf_id],
-                            [0, slice_id * DQ_REDUCE_NCOL],
-                            [BLOCK_M1, DQ_REDUCE_NCOL],
-                        )
-                        dq = tlx.local_load(dq_slice)
-                        dq = dq * LN2
-                        tlx.async_descriptor_store_wait(DQ_REDUCE_STAGES - 1)
-                        tlx.local_store(
-                            dq_store_buf[dq_smem_idx],
-                            dq.to(tlx.dtype_of(desc_dq)),
-                        )
-                        tlx.fence("async_shared")
-                        tlx.async_descriptor_store(
-                            desc_dq,
-                            dq_store_buf[dq_smem_idx],
-                            [
-                                (off_bh + curr_m).to(tl.int32),
-                                slice_id * DQ_REDUCE_NCOL,
-                            ],
-                            store_reduce="add",
-                        )
+                    if USE_2CTA:
+                        slice_size: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
+                        DQ_ROWS: tl.constexpr = BLOCK_M1 // NUM_CTAS
+                        dq_m_offset = cluster_cta_rank * DQ_ROWS
+                        for slice_id in tl.static_range(EPILOGUE_SUBTILE):
+                            dq_slice = tlx.local_slice(
+                                dq_tiles[tmem_buf_id],
+                                [0, slice_id * slice_size],
+                                [DQ_ROWS, slice_size],
+                            )
+                            dq = tlx.local_load(dq_slice)
+                            dq = dq * LN2
+                            desc_dq.atomic_add([(off_bh + curr_m + dq_m_offset).to(tl.int32), slice_id * slice_size],
+                                               dq)
+                    else:
+                        for slice_id in tl.static_range(DQ_REDUCE_ITERS):
+                            dq_smem_idx = slice_id % DQ_REDUCE_STAGES
+                            dq_slice = tlx.local_slice(
+                                dq_tiles[tmem_buf_id],
+                                [0, slice_id * DQ_REDUCE_NCOL],
+                                [BLOCK_M1, DQ_REDUCE_NCOL],
+                            )
+                            dq = tlx.local_load(dq_slice)
+                            dq = dq * LN2
+                            tlx.async_descriptor_store_wait(DQ_REDUCE_STAGES - 1)
+                            tlx.local_store(
+                                dq_store_buf[dq_smem_idx],
+                                dq.to(tlx.dtype_of(desc_dq)),
+                            )
+                            tlx.fence("async_shared")
+                            tlx.async_descriptor_store(
+                                desc_dq,
+                                dq_store_buf[dq_smem_idx],
+                                [
+                                    (off_bh + curr_m).to(tl.int32),
+                                    slice_id * DQ_REDUCE_NCOL,
+                                ],
+                                store_reduce="add",
+                            )
 
                     # release dq
-                    tlx.barrier_arrive(dq_empties[tmem_buf_id])
+                    if USE_2CTA:
+                        tlx.barrier_arrive(dq_empties[tmem_buf_id], 1, remote_cta_rank=0)
+                    else:
+                        tlx.barrier_arrive(dq_empties[tmem_buf_id])
                     # Increment pointers.
                     curr_m += step_m
                     blk_idx += 1
