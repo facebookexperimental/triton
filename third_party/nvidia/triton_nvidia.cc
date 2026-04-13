@@ -99,6 +99,10 @@ void init_triton_hopper_passes(py::module &&m) {
                             bool, int);
   ADD_PASS_OPTION_WRAPPER_1("add_data_partitioning",
                             mlir::createNVGPUWSDataPartition, int);
+  ADD_PASS_WRAPPER_0("add_tma_store_lowering",
+                     mlir::createNVGPUWSTMAStoreLowering);
+  ADD_PASS_WRAPPER_0("add_tma_store_token_wait_lowering",
+                     mlir::createNVGPUTMAStoreTokenWaitLowering);
   ADD_PASS_WRAPPER_0("add_partition_scheduling_meta",
                      mlir::createNVGPUPartitionSchedulingMeta);
   ADD_PASS_WRAPPER_0("add_multi_cta_reduction",

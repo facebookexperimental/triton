@@ -793,6 +793,23 @@ class CodeGenerator(ast.NodeVisitor):
         args = [self.visit(x) for x in node.elts]
         return language.tuple(args)
 
+    def visit_Dict(self, node):
+        keys = [self.visit(k) for k in node.keys]
+        values = [self.visit(v) for v in node.values]
+
+        def _unwrap(v):
+            if isinstance(v, language.constexpr):
+                return _unwrap(v.value)
+            if isinstance(v, language.tuple):
+                return list(_unwrap(x) for x in v.values)
+            if isinstance(v, (list, builtins.tuple)):
+                return list(_unwrap(x) for x in v)
+            return v
+
+        keys = [_unwrap(k) for k in keys]
+        values = [_unwrap(v) for v in values]
+        return dict(zip(keys, values))
+
     def _apply_binary_method(self, node, method_name, lhs, rhs):
         # TODO: raise something meaningful if getattr fails below, esp for reverse method
         if _is_triton_tensor(lhs):

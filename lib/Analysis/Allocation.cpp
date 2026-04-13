@@ -391,6 +391,26 @@ private:
         minId = 0;
         maxId = operationId.size();
       }
+      // For SMEM buffers used by AsyncTMACopyLocalToGlobalOp (early TMA
+      // store lowering), the buffer must remain live until the corresponding
+      // TMAStoreTokenWaitOp completes. SSA liveness only tracks the memdesc
+      // use at the async_tma_copy op, but the TMA hardware continues reading
+      // from the buffer asynchronously until the token wait. Without this
+      // extension, two such buffers can be assigned the same SMEM offset,
+      // causing a data race when the second local_alloc overwrites the first
+      // buffer while the TMA is still reading it.
+      if (hasOpOfAnyTypeInForwardSlice<ttng::AsyncTMACopyLocalToGlobalOp>(
+              defOp)) {
+        llvm::SetVector<Operation *> forwardSlice;
+        getForwardSlice(defOp, &forwardSlice);
+        for (Operation *op : forwardSlice) {
+          if (isa<ttng::TMAStoreTokenWaitOp>(op)) {
+            if ((operationId[op] + 1) > maxId) {
+              maxId = operationId[op] + 1;
+            }
+          }
+        }
+      }
       return Interval(minId, maxId);
     };
 

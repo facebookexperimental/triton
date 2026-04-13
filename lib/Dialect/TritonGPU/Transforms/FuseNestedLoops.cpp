@@ -1008,6 +1008,14 @@ static void fuseOneLevel(LoopNestNode *parent, mlir::DominanceInfo &domInfo) {
   if (disallowAccMultiBuffer)
     fused->setAttr(kDisallowAccMultiBufferAttrName, b.getUnitAttr());
 
+  // Propagate integer attributes from the outer loop that downstream passes
+  // (data partition, memory planning) read from the fused loop.
+  for (StringRef attrName :
+       {"tt.data_partition_factor", "tt.smem_alloc_algo"}) {
+    if (auto attr = outer->getAttrOfType<IntegerAttr>(attrName))
+      fused->setAttr(attrName, attr);
+  }
+
   // Update the parent's loop to the fused loop. Set the new stage count to the
   // max stage count of the inner loops.
   int numStages = 1;

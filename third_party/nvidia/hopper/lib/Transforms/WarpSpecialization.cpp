@@ -38,6 +38,8 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
                               bool smemCircularReuse = false);
 bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups);
 void doBufferAllocation(triton::FuncOp &funcOp);
+void doHoistLoopInvariantTMEMStore(triton::FuncOp &funcOp);
+void removeRedundantTmemZeroStores(triton::FuncOp &funcOp);
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers);
 void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers);
 void doTokenLowering(triton::FuncOp &funcOp, unsigned numConsumerGroups);
@@ -45,6 +47,9 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
                     int capability, int defaultNumStages);
 void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
                     int capability);
+void doTMAStoreWaitReorder(triton::FuncOp &funcOp);
+void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp);
+void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp);
 
 #define GEN_PASS_DEF_NVGPUWARPSPECIALIZATION
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
@@ -54,6 +59,15 @@ class NVGPUWarpSpecializationPass
 public:
   using impl::NVGPUWarpSpecializationBase<
       NVGPUWarpSpecializationPass>::NVGPUWarpSpecializationBase;
+
+  // Remove the warp_specialize attribute from all loops in the function so
+  // downstream passes (pipelining, latency assignment) don't mistakenly
+  // treat the loop as warp-specialized.
+  void removeWarpSpecializeAttr(triton::FuncOp funcOp) {
+    funcOp->walk([&](scf::ForOp forOp) {
+      forOp->removeAttr(mlir::triton::kWarpSpecializeAttrName);
+    });
+  }
 
   void runOnFuncOp(triton::FuncOp funcOp, int defaultNumStages) {
     bool enabled = false;
@@ -77,8 +91,12 @@ public:
       return;
 
     int numWarps = mlir::triton::gpu::lookupNumWarps(funcOp);
-    if (numWarps != 4)
+    if (numWarps != 4) {
+      LDBG("Warp specialization requires num_warps=4, but got "
+           << numWarps << ". Skipping.");
+      removeWarpSpecializeAttr(funcOp);
       return;
+    }
 
     // FIXME: skip warpspec if there is else block. Need to improve
     // CodePartitioning to correctly handle channels in else block.
@@ -91,8 +109,11 @@ public:
         }
       }
     });
-    if (hasElse)
+    if (hasElse) {
+      LDBG("Warp specialization does not support else blocks. Skipping.");
+      removeWarpSpecializeAttr(funcOp);
       return;
+    }
 
     OpBuilder builder(funcOp);
     auto moduleOp = funcOp->getParentOfType<ModuleOp>();
@@ -158,12 +179,31 @@ public:
       }
     }
 
+    // Remove redundant TMEM zeroing stores before buffer allocation.
+    // When a TMEMAllocOp is used as operand D of a TCGen5MMAOp with
+    // useAccumulator=false (on the first iteration), any preceding
+    // tmem_store of zeros is redundant — the MMA's useD=false already
+    // zeros the accumulator. Removing the store prevents the autoWS
+    // compiler from creating a cross-partition channel for it, which
+    // would otherwise cause a race condition between the reduction
+    // partition (zeroing) and the computation partition (reading) in
+    // persistent kernels.
+    removeRedundantTmemZeroStores(funcOp);
+
     // Canonicalize the SMEM/TEM buffers.
     // Create buffers for register channels.
     doBufferAllocation(funcOp);
     if (dumpIntermediateSteps) {
       llvm::dbgs()
           << "// -----// WarpSpec internal IR Dump After: doBufferAllocation\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
+    }
+
+    doHoistLoopInvariantTMEMStore(funcOp);
+    if (dumpIntermediateSteps) {
+      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                      "doHoistLoopInvariantTMEMStore\n";
       moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
       llvm::dbgs() << "\n\n\n";
     }
@@ -177,6 +217,22 @@ public:
     if (dumpIntermediateSteps) {
       llvm::dbgs()
           << "// -----// WarpSpec internal IR Dump After: doMemoryPlanner\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
+    }
+
+    doAnnotateTMAStoreWaits(funcOp);
+    if (dumpIntermediateSteps) {
+      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                      "doAnnotateTMAStoreWaits\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
+    }
+
+    doValidateTMAStoreAnnotations(funcOp);
+    if (dumpIntermediateSteps) {
+      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                      "doValidateTMAStoreAnnotations\n";
       moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
       llvm::dbgs() << "\n\n\n";
     }
@@ -218,6 +274,14 @@ public:
     if (dumpIntermediateSteps) {
       llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
                       "doLoopSchedule\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
+    }
+
+    doTMAStoreWaitReorder(funcOp);
+    if (dumpIntermediateSteps) {
+      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                      "doTMAStoreWaitReorder\n";
       moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
       llvm::dbgs() << "\n\n\n";
     }

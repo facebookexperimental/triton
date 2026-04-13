@@ -51,12 +51,45 @@ public:
       // the fence.
       while (auto loopOp = fence->getParentOfType<LoopLikeOpInterface>()) {
         if (!copyRegToSharedOpsA.empty() &&
-            llvm::any_of(copyRegToSharedOpsA,
-                         [&](Operation *op) { return loopOp->isAncestor(op); }))
+            llvm::any_of(copyRegToSharedOpsA, [&](Operation *op) {
+              return shouldPreventFenceHoist(op, loopOp);
+            }))
           break;
         if (!copyRegToSharedOpsB.empty() &&
-            llvm::any_of(copyRegToSharedOpsB,
-                         [&](Operation *op) { return loopOp->isAncestor(op); }))
+            llvm::any_of(copyRegToSharedOpsB, [&](Operation *op) {
+              return shouldPreventFenceHoist(op, loopOp);
+            }))
+          break;
+        loopOp.moveOutOfLoop(fence);
+      }
+
+      // If the previous op is already a fence, this one isn't needed.
+      if (auto lastFence =
+              dyn_cast_or_null<FenceAsyncSharedOp>(fence->getPrevNode())) {
+        if (lastFence.getBCluster() == fence.getBCluster())
+          fence.erase();
+      }
+
+      return WalkResult::advance();
+    });
+
+    // AsyncTMACopyLocalToGlobalOp reads shared memory via the async proxy.
+    // If the SMEM was written via the generic proxy (e.g. LocalAllocOp with a
+    // source), we need a fence between the write and the TMA store.
+    mod.walk([&](AsyncTMACopyLocalToGlobalOp tmaStoreOp) {
+      Value src = tmaStoreOp.getSrc();
+      SmallVector<Operation *> copyRegToSharedOps = findCopyRegToSharedOps(src);
+      if (copyRegToSharedOps.empty())
+        return WalkResult::advance();
+
+      OpBuilder builder(tmaStoreOp);
+      auto fence = FenceAsyncSharedOp::create(builder, tmaStoreOp.getLoc(),
+                                              /*bCluster=*/false);
+      // Try to hoist the fence out of loops if all dependencies are outside.
+      while (auto loopOp = fence->getParentOfType<LoopLikeOpInterface>()) {
+        if (llvm::any_of(copyRegToSharedOps, [&](Operation *op) {
+              return shouldPreventFenceHoist(op, loopOp);
+            }))
           break;
         loopOp.moveOutOfLoop(fence);
       }
@@ -73,6 +106,55 @@ public:
   }
 
 private:
+  // Walk users of `root` transitively through memdesc view ops, collecting
+  // any LocalStoreOp found into `result`.
+  void findLocalStoresThroughViews(Value root,
+                                   llvm::SetVector<Operation *> &result) {
+    SmallVector<Value> worklist = {root};
+    DenseSet<Value> seen;
+    while (!worklist.empty()) {
+      Value v = worklist.pop_back_val();
+      if (!seen.insert(v).second)
+        continue;
+      for (auto *user : v.getUsers()) {
+        if (isa<ttg::LocalStoreOp>(user)) {
+          result.insert(user);
+        } else if (user->hasTrait<OpTrait::MemDescViewTrait>()) {
+          for (auto res : user->getResults())
+            worklist.push_back(res);
+        }
+      }
+    }
+  }
+
+  // Return true if the fence should NOT be hoisted past `loopOp` because
+  // `writeOp` (a generic-proxy SMEM write) executes concurrently with the
+  // loop in a different region of the same warp_specialize.
+  bool shouldPreventFenceHoist(Operation *writeOp, LoopLikeOpInterface loopOp) {
+    if (loopOp->isAncestor(writeOp))
+      return true;
+    // Don't hoist if the write and the loop are in different concurrent
+    // regions of the same warp_specialize (default body vs partition, or
+    // different partitions). These regions execute in parallel, so the
+    // write happens each loop iteration and the fence must too.
+    auto writeWsPartitions =
+        writeOp->getParentOfType<ttg::WarpSpecializePartitionsOp>();
+    auto loopWsPartitions =
+        loopOp->getParentOfType<ttg::WarpSpecializePartitionsOp>();
+    if (writeWsPartitions && writeWsPartitions == loopWsPartitions)
+      return true;
+    // Check for default body vs partition: one has a
+    // WarpSpecializePartitionsOp parent and the other doesn't, but both
+    // are inside the same WarpSpecializeOp.
+    if (bool(writeWsPartitions) != bool(loopWsPartitions)) {
+      auto writeWs = writeOp->getParentOfType<ttg::WarpSpecializeOp>();
+      if (writeWs &&
+          writeWs == loopOp->getParentOfType<ttg::WarpSpecializeOp>())
+        return true;
+    }
+    return false;
+  }
+
   // Return true if the operand depends on a copy from register to shared.
   SmallVector<Operation *> findCopyRegToSharedOps(Value operand) {
     DenseSet<Value> visited;
@@ -91,6 +173,17 @@ private:
     if (!isa<triton::gpu::MemDescType>(operand.getType()))
       return;
 
+    // Check if any user of this memdesc is a LocalStoreOp, indicating
+    // a generic-proxy write to this buffer. This handles the case where
+    // the buffer was pre-allocated (e.g. by NVGPUWSTMAStoreLowering) and
+    // written via a separate local_store rather than local_alloc with source.
+    for (auto *user : operand.getUsers()) {
+      if (isa<ttg::LocalStoreOp>(user)) {
+        result.insert(user);
+        return;
+      }
+    }
+
     auto op = operand.getDefiningOp();
     if (op) {
       // reach an alloc copying from register, we need a fence.
@@ -98,15 +191,34 @@ private:
         if (localAlloc.getSrc()) {
           result.insert(op);
         }
-        // Check if there are local_store ops that write to that buffer.
-        for (auto user : localAlloc.getResult().getUsers()) {
-          while (user->hasOneUse() &&
-                 user->hasTrait<OpTrait::MemDescViewTrait>()) {
-            user = *user->getUsers().begin();
-          }
-          if (isa<ttg::LocalStoreOp>(user)) {
-            result.insert(user);
-            return;
+        // Check if there are local_store ops that write to that buffer,
+        // following through memdesc view ops (which may have multiple users
+        // e.g. when EPILOGUE_SUBTILE > 1 writes multiple sub-tiles).
+        findLocalStoresThroughViews(localAlloc.getResult(), result);
+        if (!result.empty())
+          return;
+        // When the alloc is captured by a warp_specialize op, check all
+        // partition regions for local_store ops to the corresponding block
+        // arg. This handles the case where early TMA store lowering creates
+        // a local_alloc + async_tma_copy in the epilogue partition, and
+        // code partitioning splits the alloc: the local_store ends up in
+        // the computation partition while the TMA copy stays in the
+        // epilogue partition.
+        for (auto *user : localAlloc.getResult().getUsers()) {
+          auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(user);
+          if (!wsOp)
+            continue;
+          auto captures = wsOp.getExplicitCaptures();
+          for (unsigned i = 0; i < captures.size(); i++) {
+            if (captures[i] != localAlloc.getResult())
+              continue;
+            for (Region *region : wsOp.getPartitionRegions()) {
+              Value blockArg = region->getArgument(i);
+              findLocalStoresThroughViews(blockArg, result);
+              if (!result.empty())
+                return;
+            }
+            break;
           }
         }
       }
