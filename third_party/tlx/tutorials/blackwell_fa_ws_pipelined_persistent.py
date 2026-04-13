@@ -1161,6 +1161,14 @@ def _bwd_compute_inner_loop(
     REUSE_DP_FOR_DQ: tl.constexpr,
     M_STAGE: tl.constexpr,
     D_STAGE: tl.constexpr,
+    # 2-CTA params (defaults for 1-CTA)
+    USE_2CTA: tl.constexpr = False,
+    NUM_CTAS: tl.constexpr = 1,
+    dsT_tiles=None,
+    ds_xchg_tiles=None,
+    ds_peer_fulls=None,
+    dsT_fulls=None,
+    cluster_cta_rank=0,
 ):
     start_block_n = start_n * BLOCK_N1
     offs_n = start_block_n + tl.arange(0, BLOCK_N1)
@@ -1185,7 +1193,10 @@ def _bwd_compute_inner_loop(
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
         m = tlx.local_load(sM_tiles[m_buf_id])
         qkT = tlx.local_load(qk_tiles[tmem_buf_id])
-        tlx.barrier_arrive(qk_empties[tmem_buf_id])
+        if USE_2CTA:
+            tlx.barrier_arrive(qk_empties[tmem_buf_id], 1, remote_cta_rank=0)
+        else:
+            tlx.barrier_arrive(qk_empties[tmem_buf_id])
 
         pT = tl.math.exp2(_sub_f32x2(qkT, m[None, :]))
         if STAGE == 1:
@@ -1195,7 +1206,10 @@ def _bwd_compute_inner_loop(
         # Store P to TMEM. ---
         ppT = pT.to(do_out_dtype)
         tlx.local_store(p_tiles[tmem_buf_id], ppT)
-        tlx.barrier_arrive(p_fulls[tmem_buf_id])
+        if USE_2CTA:
+            tlx.barrier_arrive(p_fulls[tmem_buf_id], 1, remote_cta_rank=0)
+        else:
+            tlx.barrier_arrive(p_fulls[tmem_buf_id])
 
         # --- Phase 3: Compute dS = pT * (dpT - Di). ---
         tlx.barrier_wait(dp_fulls[tmem_buf_id], tmem_phase)
@@ -1203,12 +1217,52 @@ def _bwd_compute_inner_loop(
         Di = tlx.local_load(sD_tiles[d_buf_id])
         dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
         dsT = dsT.to(q_out_dtype)
-        tlx.local_store(ds_tiles[ds_buf_id], dsT)
         tlx.local_store(dsT_tmem_tiles[ds_buf_id], dsT)
         if not REUSE_DP_FOR_DQ:
-            tlx.barrier_arrive(dp_empties[tmem_buf_id])
+            if USE_2CTA:
+                tlx.barrier_arrive(dp_empties[tmem_buf_id], 1, remote_cta_rank=0)
+            else:
+                tlx.barrier_arrive(dp_empties[tmem_buf_id])
         tlx.fence("async_shared")
-        tlx.barrier_arrive(ds_fulls[ds_buf_id])
+        # 2-CTA: exchange half of dS with peer via DSMEM, then
+        # overwrite ds_tiles so it contains mixed dS from both CTAs.
+        if USE_2CTA:
+            ds_phase, _ = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
+            # Store pre-exchange dS to TMEM for Dot 5 (dK += dS @ Q).
+            tlx.local_store(dsT_tiles[ds_buf_id], dsT)
+            tlx.barrier_arrive(dsT_fulls[ds_buf_id], 1, remote_cta_rank=0)
+            peer_rank = 1 - cluster_cta_rank
+            # Load own/peer M-columns from TMEM, store to ds_tiles/ds_xchg.
+            if cluster_cta_rank == 0:
+                own_tmem = tlx.local_slice(dsT_tiles[ds_buf_id], [0, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
+                peer_tmem = tlx.local_slice(dsT_tiles[ds_buf_id], [0, BLOCK_M1 // NUM_CTAS],
+                                            [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
+                own_smem = tlx.local_slice(ds_tiles[ds_buf_id], [0, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
+            else:
+                own_tmem = tlx.local_slice(dsT_tiles[ds_buf_id], [0, BLOCK_M1 // NUM_CTAS],
+                                           [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
+                peer_tmem = tlx.local_slice(dsT_tiles[ds_buf_id], [0, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
+                own_smem = tlx.local_slice(ds_tiles[ds_buf_id], [BLOCK_N1, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
+            own_data = tlx.local_load(own_tmem)
+            tlx.local_store(own_smem, own_data)
+            peer_data = tlx.local_load(peer_tmem)
+            tlx.local_store(ds_xchg_tiles[ds_buf_id], peer_data)
+            tlx.fence("async_shared")
+            send_data = tlx.local_load(ds_xchg_tiles[ds_buf_id])
+            remote_dst = own_smem
+            tlx.barrier_expect_bytes(ds_peer_fulls[ds_buf_id], 2 * BLOCK_N1 * (BLOCK_M1 // NUM_CTAS))
+            tlx.async_remote_shmem_store(
+                dst=remote_dst,
+                src=send_data,
+                remote_cta_rank=peer_rank,
+                barrier=ds_peer_fulls[ds_buf_id],
+            )
+            tlx.barrier_wait(ds_peer_fulls[ds_buf_id], ds_phase)
+            tlx.barrier_arrive(ds_fulls[ds_buf_id], 1, remote_cta_rank=0)
+        else:
+            tlx.local_store(ds_tiles[ds_buf_id], dsT)
+            tlx.fence("async_shared")
+            tlx.barrier_arrive(ds_fulls[ds_buf_id])
         tlx.barrier_arrive(dsT_tmem_fulls[ds_buf_id])
 
         curr_m += step_m
@@ -1521,6 +1575,13 @@ def _attn_bwd_ws(
                         REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
                         M_STAGE=M_STAGE,
                         D_STAGE=D_STAGE,
+                        USE_2CTA=USE_2CTA,
+                        NUM_CTAS=NUM_CTAS,
+                        dsT_tiles=dsT_tiles if USE_2CTA else None,
+                        ds_xchg_tiles=ds_xchg_tiles if USE_2CTA else None,
+                        ds_peer_fulls=ds_peer_fulls if USE_2CTA else None,
+                        dsT_fulls=dsT_fulls if USE_2CTA else None,
+                        cluster_cta_rank=cluster_cta_rank,
                     )
                 if STAGE & 2:
                     curr_m, blk_idx = _bwd_compute_inner_loop(
@@ -1556,6 +1617,13 @@ def _attn_bwd_ws(
                         REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
                         M_STAGE=M_STAGE,
                         D_STAGE=D_STAGE,
+                        USE_2CTA=USE_2CTA,
+                        NUM_CTAS=NUM_CTAS,
+                        dsT_tiles=dsT_tiles if USE_2CTA else None,
+                        ds_xchg_tiles=ds_xchg_tiles if USE_2CTA else None,
+                        ds_peer_fulls=ds_peer_fulls if USE_2CTA else None,
+                        dsT_fulls=dsT_fulls if USE_2CTA else None,
+                        cluster_cta_rank=cluster_cta_rank,
                     )
 
                 kv_buf_id, kv_phase = _get_bufidx_phase(tile_count, NUM_BUFFERS_KV)
