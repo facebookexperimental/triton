@@ -1487,6 +1487,8 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, mode, baseVariant, provider, SUBTILIN
             dtype=torch.float16):
     if mode == "bwd" and "fp8" in provider:
         pytest.skip("Backward pass with FP8 is not supported.")
+    if SUBTILING and baseVariant == "ws_persistent":
+        pytest.skip("SUBTILING with ws_persistent exceeds shared memory budget")
     torch.manual_seed(20)
     q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
     k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())

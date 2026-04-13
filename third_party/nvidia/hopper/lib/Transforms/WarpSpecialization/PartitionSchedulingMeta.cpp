@@ -1778,12 +1778,16 @@ void PartitionSchedulingMeta::runOnOperation() {
       });
 
       // Step 2: Remove partition attribute from non-ForOp ops that have
-      // regions (e.g. tt.reduce, scf.if). The partition verifier infers
-      // their partition sets from their children's partitions.
+      // regions (e.g. tt.reduce, scf.if), but only when the parent op
+      // does not itself have a partition attribute. If the parent is
+      // partitioned the dialect verifier will require all its children
+      // to carry the attribute, so we must keep it.
       loop->walk([&](Operation *op) {
         if (!isa<scf::ForOp>(op) && hasPartition(op) &&
             op->getNumRegions() > 0) {
-          op->removeAttr(kPartitionAttrName);
+          auto *parent = op->getParentOp();
+          if (!parent || !hasPartition(parent))
+            op->removeAttr(kPartitionAttrName);
         }
       });
 

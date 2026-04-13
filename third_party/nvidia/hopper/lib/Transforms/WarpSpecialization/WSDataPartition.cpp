@@ -1952,7 +1952,19 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
           ReshapeOp::create(builder, loc, resultShape, transOp.getResult(),
                             /*allowReorder=*/false);
 
-      descLoadOp.getResult().replaceAllUsesWith(reshapeOp.getResult());
+      // TODO: Patch with open PR?
+      // The reshape may produce a different encoding (e.g. #linear) than
+      // the original descriptor_load result (#blocked).  Insert a
+      // convert_layout to restore the original encoding so that
+      // downstream elementwise users (arith.extf, etc.) remain valid.
+      Value replacement = reshapeOp.getResult();
+      auto reshapeType = cast<RankedTensorType>(replacement.getType());
+      if (reshapeType.getEncoding() != resultType.getEncoding()) {
+        auto cvt =
+            ConvertLayoutOp::create(builder, loc, resultType, replacement);
+        replacement = cvt.getResult();
+      }
+      descLoadOp.getResult().replaceAllUsesWith(replacement);
       descLoadOp.erase();
     }
   }

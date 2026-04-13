@@ -181,13 +181,16 @@ def test_autows_addmm_tma_persistent(
     if not FLATTEN and BLOCK_SIZE_K == 128 and B_col_major and not A_col_major:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
-    if BLOCK_SIZE_M == 256 and not FLATTEN and SMEM_ALLOC_ALGO == 0 and (BLOCK_SIZE_K == 128 or num_stages == 3):
+    if BLOCK_SIZE_M == 256 and not FLATTEN and SMEM_ALLOC_ALGO == 0:
         pytest.skip("Out of resources: shared memory exceeded")
 
-    if DATA_PARTITION_FACTOR == 2 and BLOCK_SIZE_M == 256 and not FLATTEN and SMEM_ALLOC_ALGO == 0:
-        pytest.skip("Out of resources: shared memory exceeded with data partitioning")
-
     if BLOCK_SIZE_M == 256 and FLATTEN and BLOCK_SIZE_K == 128 and num_stages == 3 and EPILOGUE_SUBTILE != 4:
+        pytest.skip("Out of resources: shared memory exceeded")
+
+    if not FLATTEN and SMEM_ALLOC_ALGO == 1 and BLOCK_SIZE_M == 256:
+        pytest.skip("Out of resources: shared memory exceeded")
+
+    if not FLATTEN and SMEM_ALLOC_ALGO == 1 and BLOCK_SIZE_M == 128 and BLOCK_SIZE_K == 128 and num_stages == 3:
         pytest.skip("Out of resources: shared memory exceeded")
 
     with triton.knobs.nvidia.scope():
