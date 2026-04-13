@@ -1,7 +1,9 @@
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -291,6 +293,28 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
                              atomicRMWOp.getMask(), pred);
     atomicRMWOp.getMaskMutable().assign(mask);
     return op;
+  }
+  // Ops without a built-in pred operand: wrap in scf.if.
+  if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::TMAStoreTokenWaitOp>(op)) {
+    rewriter.setInsertionPoint(op);
+    bool hasResults = op->getNumResults() > 0;
+    auto ifOp =
+        scf::IfOp::create(rewriter, op->getLoc(), op->getResultTypes(), pred,
+                          /*withElseRegion=*/hasResults);
+    rewriter.setInsertionPointToStart(ifOp.thenBlock());
+    auto *clonedOp = rewriter.clone(*op);
+    if (hasResults) {
+      scf::YieldOp::create(rewriter, op->getLoc(), clonedOp->getResults());
+      rewriter.setInsertionPointToStart(ifOp.elseBlock());
+      SmallVector<Value> poisonResults;
+      for (auto result : op->getResults())
+        poisonResults.push_back(mlir::ub::PoisonOp::create(
+            rewriter, op->getLoc(), result.getType()));
+      scf::YieldOp::create(rewriter, op->getLoc(), poisonResults);
+    }
+    op->replaceAllUsesWith(ifOp->getResults());
+    rewriter.eraseOp(op);
+    return ifOp;
   }
   if (!op->isRegistered()) {
     // Skip ops from unregistered dialects to make writing lit tests easier.
