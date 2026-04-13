@@ -1994,7 +1994,8 @@ def _attn_bwd_ws(
                 tlx.barrier_wait(k_empties[kv_buf_id], kv_phase ^ 1)
                 tlx.barrier_wait(q_empties[q_buf_id], q_phase ^ 1)
                 tlx.barrier_expect_bytes(
-                    q_fulls[q_buf_id], K_BYTES_PER_ELEM * BLOCK_N1 * HEAD_DIM + Q_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
+                    q_fulls[q_buf_id],
+                    K_BYTES_PER_ELEM * BLOCK_N1 * HEAD_DIM + Q_BYTES_PER_ELEM * BLOCK_M1 * (HEAD_DIM // NUM_CTAS))
                 tlx.async_descriptor_load(
                     desc_k,
                     k_tiles[kv_buf_id],
@@ -2004,8 +2005,9 @@ def _attn_bwd_ws(
                 tlx.async_descriptor_load(
                     desc_q,
                     q_tiles[q_buf_id],
-                    [(off_bh + curr_m).to(tl.int32), 0],
+                    [(off_bh + curr_m).to(tl.int32), cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
                     q_fulls[q_buf_id],
+                    two_ctas=USE_2CTA,
                 )
 
                 # Load M
@@ -2023,7 +2025,7 @@ def _attn_bwd_ws(
                 tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
                 tlx.barrier_expect_bytes(
                     do_fulls[do_buf_id],
-                    V_BYTES_PER_ELEM * BLOCK_N1 * HEAD_DIM + DO_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
+                    V_BYTES_PER_ELEM * BLOCK_N1 * HEAD_DIM + DO_BYTES_PER_ELEM * BLOCK_M1 * (HEAD_DIM // NUM_CTAS))
                 tlx.async_descriptor_load(
                     desc_v,
                     v_tiles[kv_buf_id],
@@ -2033,8 +2035,9 @@ def _attn_bwd_ws(
                 tlx.async_descriptor_load(
                     desc_do,
                     do_tiles[do_buf_id],
-                    [(off_bh + curr_m).to(tl.int32), 0],
+                    [(off_bh + curr_m).to(tl.int32), cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
                     do_fulls[do_buf_id],
+                    two_ctas=USE_2CTA,
                 )
 
                 # Load D
@@ -2047,6 +2050,43 @@ def _attn_bwd_ws(
                     d_fulls[d_buf_id],
                 )
 
+                # 2-CTA: load transposed views for dots 1,2 and Kt for dot 5
+                if USE_2CTA:
+                    # Load Qt [BLOCK_M1//2, HEAD_DIM] for dots 1,2
+                    tlx.barrier_wait(qt_empties[q_buf_id], q_phase ^ 1)
+                    if is_leader:
+                        tlx.barrier_expect_bytes(qt_fulls[q_buf_id], Q_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
+                    tlx.async_descriptor_load(
+                        desc_qt,
+                        qt_tiles[q_buf_id],
+                        [(off_bh + curr_m + cluster_cta_rank * (BLOCK_M1 // NUM_CTAS)).to(tl.int32), 0],
+                        qt_fulls[q_buf_id],
+                        two_ctas=True,
+                    )
+                    # Load dOt [BLOCK_M1//2, HEAD_DIM] for dots 1,2
+                    tlx.barrier_wait(dot_empties[do_buf_id], do_phase ^ 1)
+                    if is_leader:
+                        tlx.barrier_expect_bytes(dot_fulls[do_buf_id], DO_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
+                    tlx.async_descriptor_load(
+                        desc_dot,
+                        dot_tiles[do_buf_id],
+                        [(off_bh + curr_m + cluster_cta_rank * (BLOCK_M1 // NUM_CTAS)).to(tl.int32), 0],
+                        dot_fulls[do_buf_id],
+                        two_ctas=True,
+                    )
+                    # Load Kt [BLOCK_N1*2, HEAD_DIM//2] for dot 5
+                    tlx.barrier_wait(kt_empties[kv_buf_id], kv_phase ^ 1)
+                    lower_start_block_n = start_block_n - cluster_cta_rank * BLOCK_N1
+                    if is_leader:
+                        tlx.barrier_expect_bytes(kt_fulls[kv_buf_id], K_BYTES_PER_ELEM * BLOCK_N1 * HEAD_DIM * NUM_CTAS)
+                    tlx.async_descriptor_load(
+                        desc_kt,
+                        kt_tiles[kv_buf_id],
+                        [(off_bh + lower_start_block_n).to(tl.int32), cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
+                        kt_fulls[kv_buf_id],
+                        two_ctas=True,
+                    )
+
                 curr_m += step_m
                 blk_idx += 1
 
@@ -2055,12 +2095,13 @@ def _attn_bwd_ws(
                     do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
                     # Load Q
                     tlx.barrier_wait(q_empties[q_buf_id], q_phase ^ 1)
-                    tlx.barrier_expect_bytes(q_fulls[q_buf_id], Q_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
+                    tlx.barrier_expect_bytes(q_fulls[q_buf_id], Q_BYTES_PER_ELEM * BLOCK_M1 * (HEAD_DIM // NUM_CTAS))
                     tlx.async_descriptor_load(
                         desc_q,
                         q_tiles[q_buf_id],
-                        [(off_bh + curr_m).to(tl.int32), 0],
+                        [(off_bh + curr_m).to(tl.int32), cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
                         q_fulls[q_buf_id],
+                        two_ctas=USE_2CTA,
                     )
 
                     # Load M
@@ -2075,12 +2116,13 @@ def _attn_bwd_ws(
 
                     # Load dO
                     tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
-                    tlx.barrier_expect_bytes(do_fulls[do_buf_id], DO_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
+                    tlx.barrier_expect_bytes(do_fulls[do_buf_id], DO_BYTES_PER_ELEM * BLOCK_M1 * (HEAD_DIM // NUM_CTAS))
                     tlx.async_descriptor_load(
                         desc_do,
                         do_tiles[do_buf_id],
-                        [(off_bh + curr_m).to(tl.int32), 0],
+                        [(off_bh + curr_m).to(tl.int32), cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
                         do_fulls[do_buf_id],
+                        two_ctas=USE_2CTA,
                     )
 
                     # Load D
@@ -2092,6 +2134,29 @@ def _attn_bwd_ws(
                         [(off_chz + curr_m).to(tl.int32)],
                         d_fulls[d_buf_id],
                     )
+
+                    # 2-CTA: load Qt and dOt for current M-block
+                    if USE_2CTA:
+                        tlx.barrier_wait(qt_empties[q_buf_id], q_phase ^ 1)
+                        if is_leader:
+                            tlx.barrier_expect_bytes(qt_fulls[q_buf_id], Q_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
+                        tlx.async_descriptor_load(
+                            desc_qt,
+                            qt_tiles[q_buf_id],
+                            [(off_bh + curr_m + cluster_cta_rank * (BLOCK_M1 // NUM_CTAS)).to(tl.int32), 0],
+                            qt_fulls[q_buf_id],
+                            two_ctas=True,
+                        )
+                        tlx.barrier_wait(dot_empties[do_buf_id], do_phase ^ 1)
+                        if is_leader:
+                            tlx.barrier_expect_bytes(dot_fulls[do_buf_id], DO_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
+                        tlx.async_descriptor_load(
+                            desc_dot,
+                            dot_tiles[do_buf_id],
+                            [(off_bh + curr_m + cluster_cta_rank * (BLOCK_M1 // NUM_CTAS)).to(tl.int32), 0],
+                            dot_fulls[do_buf_id],
+                            two_ctas=True,
+                        )
 
                     curr_m += step_m
                     blk_idx += 1
