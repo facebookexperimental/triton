@@ -1817,6 +1817,7 @@ def _attn_bwd_ws(
                         qk_tiles[tmem_buf_id],
                         use_acc=False,
                         mBarriers=[qk_fulls[tmem_buf_id]],
+                        two_ctas=USE_2CTA,
                     )
 
                     # Compute dpT = tl.dot(v, tl.trans(do))
@@ -1829,6 +1830,7 @@ def _attn_bwd_ws(
                         dp_tiles[tmem_buf_id],
                         use_acc=False,
                         mBarriers=[dp_fulls[tmem_buf_id]],
+                        two_ctas=USE_2CTA,
                     )
 
                     # Compute dv += tl.dot(ppT, do)
@@ -1840,6 +1842,7 @@ def _attn_bwd_ws(
                         dv_tiles[kv_buf_id],
                         use_acc=False,
                         mBarriers=[do_empties[do_buf_id]],
+                        two_ctas=USE_2CTA,
                     )
                     blk_idx += 1
                     # -----------------------------------------------------------
@@ -1864,6 +1867,7 @@ def _attn_bwd_ws(
                             qk_tiles[tmem_buf_id],
                             use_acc=False,
                             mBarriers=[qk_fulls[tmem_buf_id]],
+                            two_ctas=USE_2CTA,
                         )
 
                         prev_blk_idx = blk_idx - 1
@@ -1883,6 +1887,7 @@ def _attn_bwd_ws(
                             mBarriers=[
                                 q_empties[q_buf_id_prev],
                             ],
+                            two_ctas=USE_2CTA,
                         )
 
                         # Compute dq = tl.dot(tl.trans(dsT), k) from previous iteration
@@ -1897,6 +1902,7 @@ def _attn_bwd_ws(
                             mBarriers=[
                                 dq_fulls[tmem_buf_id_prev],
                             ],
+                            two_ctas=USE_2CTA,
                         )
 
                         do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
@@ -1910,6 +1916,7 @@ def _attn_bwd_ws(
                             dp_tiles[tmem_buf_id],
                             use_acc=False,
                             mBarriers=[dp_fulls[tmem_buf_id]],
+                            two_ctas=USE_2CTA,
                         )
 
                         # Compute dv += tl.dot(ppT, do)
@@ -1920,10 +1927,11 @@ def _attn_bwd_ws(
                             dv_tiles[kv_buf_id],
                             use_acc=True,
                             mBarriers=[do_empties[do_buf_id]],
+                            two_ctas=USE_2CTA,
                         )
                         blk_idx += 1
 
-                    tlx.tcgen05_commit(dv_fulls[kv_buf_id])
+                    tlx.tcgen05_commit(dv_fulls[kv_buf_id], two_ctas=USE_2CTA)
 
                     # -----------------------------------------------------------
                     # Epilog
@@ -1943,6 +1951,7 @@ def _attn_bwd_ws(
                         dk_tiles[kv_buf_id],
                         use_acc=num_steps > 1,
                         mBarriers=[q_empties[q_buf_id], dk_fulls[tmem_buf_id]],
+                        two_ctas=USE_2CTA,
                     )
 
                     # Compute dq = tl.dot(tl.trans(dsT), k)
@@ -1957,6 +1966,7 @@ def _attn_bwd_ws(
                         mBarriers=[
                             dq_fulls[tmem_buf_id],
                         ],
+                        two_ctas=USE_2CTA,
                     )
                     tlx.tcgen05_commit(k_mma_done[kv_buf_id])
                     tile_count += 1
