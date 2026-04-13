@@ -7,7 +7,7 @@ import itertools
 import threading
 import re
 import textwrap
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Callable, Generic, Iterable, Optional, TypeVar, overload, Dict, Any, Tuple
@@ -23,6 +23,9 @@ from triton._C.libtriton import get_cache_invalidating_env_vars, native_speciali
 
 TRITON_MODULE = "triton.language"
 GLUON_MODULE = "triton.experimental.gluon.language"
+
+# Structured cache entry for the Layer 1 identity-based fast path.
+_LastCall = namedtuple("_LastCall", ["device", "args", "kernel", "bound_vals", "instrumentation_mode"])
 
 T = TypeVar("T")
 
@@ -603,6 +606,37 @@ def convert_to_tuple_if_list(item):
     return tuple(item)
 
 
+class _DeviceCaches(defaultdict):
+    """A defaultdict that also invalidates the Layer 1 fast-path cache
+    (``_last_call``) whenever the in-memory kernel cache is cleared.
+    Without this, ``device_caches.clear()`` would wipe Layer 2 but
+    leave a stale Layer 1 entry, causing the fast path to return a
+    kernel that is no longer in the device cache."""
+
+    def __init__(self, jit_function=None, default_factory=None):
+        super().__init__(default_factory)
+        self._jit_function = jit_function
+
+    def clear(self):
+        super().clear()
+        if self._jit_function is not None:
+            self._jit_function.clear_fast_path_caches()
+
+    def __reduce__(self):
+        # Return as a plain defaultdict for pickling/deepcopy.
+        # The _jit_function back-reference is not meaningful in a copy.
+        return (defaultdict, (self.default_factory, ), None, None, iter(self.items()))
+
+    def __deepcopy__(self, memo):
+        # Deepcopy as a plain defaultdict — the _jit_function
+        # back-reference should not be copied.
+        result = defaultdict(self.default_factory)
+        memo[id(self)] = result
+        for k, v in self.items():
+            result[copy.deepcopy(k, memo)] = copy.deepcopy(v, memo)
+        return result
+
+
 class JITFunction(JITCallable, KernelInterface[T]):
 
     def is_gluon(self):
@@ -693,7 +727,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
         """
         if len(args) + len(kwargs) != len(self.params):
             return None
-        parts = [device]
+        parts = [device, knobs.compilation.instrumentation_mode]
         for i, arg in enumerate(args):
             kp = self.params[i]
             if kp.is_constexpr:
@@ -770,6 +804,16 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
         return options, signature, constexprs, attrs
 
+    def clear_fast_path_caches(self):
+        """Invalidate Layer 1 (identity) and Layer 2 (signature) fast-path caches.
+
+        Call this after mutating any JITCallable that was previously passed as
+        an argument to this kernel (e.g. via ``_unsafe_update_src``).
+        """
+        self._last_call = None
+        self._last_kwargs = {}
+        self._run_cache.clear()
+
     def run(self, *args, grid, warmup, **kwargs):
         device = driver.active.get_current_device()
         stream = driver.active.get_current_stream(device)
@@ -779,10 +823,10 @@ class JITFunction(JITCallable, KernelInterface[T]):
         # (common in training loops where the same tensors/kwargs are reused),
         # skip the binder, cache key computation, and most dispatch overhead.
         # This is just N pointer comparisons with zero attribute access.
-        if not warmup and not self.pre_run_hooks:
+        if not warmup and not self.pre_run_hooks and not knobs.compilation.always_compile:
             last = self._last_call
-            if last is not None and last[0] is device:
-                last_args = last[1]
+            if last is not None and last.device is device and last.instrumentation_mode == knobs.compilation.instrumentation_mode:
+                last_args = last.args
                 if len(args) == len(last_args):
                     identical = True
                     for i in range(len(args)):
@@ -799,7 +843,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
                                     identical = False
                                     break
                     if identical:
-                        kernel = last[2]
+                        kernel = last.kernel
                         if self.used_global_vals:
                             not_present = object()
                             for (name, _), (val, globals_dict) in self.used_global_vals.items():
@@ -807,7 +851,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
                                     kernel = None
                                     break
                         if kernel is not None:
-                            bound_vals = last[3]
+                            bound_vals = last.bound_vals
                             assert grid is not None
                             if callable(grid):
                                 grid = grid(dict(zip(self.arg_names, bound_vals)))
@@ -857,12 +901,13 @@ class JITFunction(JITCallable, KernelInterface[T]):
                         kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata,
                                    launch_metadata, knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook,
                                    *bound_vals)
-                        self._last_call = (device, args, kernel, bound_vals)
+                        self._last_call = _LastCall(device, args, kernel, bound_vals,
+                                                    knobs.compilation.instrumentation_mode)
                         self._last_kwargs = dict(kwargs) if kwargs else {}
                         return kernel
         _user_kwargs = dict(kwargs) if kwargs else {}
         fast_key = None
-        if not warmup and not self.pre_run_hooks:
+        if not warmup and not self.pre_run_hooks and not knobs.compilation.always_compile:
             fast_key = self._compute_fast_key(args, kwargs, device)
 
         kwargs["debug"] = kwargs.get("debug", self.debug) or knobs.runtime.debug
@@ -922,8 +967,13 @@ class JITFunction(JITCallable, KernelInterface[T]):
             # Populate fast-path caches for future calls.
             # Store both raw args (for identity check) and bound_args values
             # (for launching — includes default parameter values).
-            self._last_call = (device, args, kernel, tuple(bound_args.values()))
-            self._last_kwargs = _user_kwargs
+            # Only populate when the fast path guard would allow reuse —
+            # if pre_run_hooks are active, the compiled kernel may depend on
+            # hook-controlled state that the fast path doesn't check.
+            if not self.pre_run_hooks and not knobs.compilation.always_compile:
+                self._last_call = _LastCall(device, args, kernel, tuple(bound_args.values()),
+                                            knobs.compilation.instrumentation_mode)
+                self._last_kwargs = _user_kwargs
             if fast_key is not None:
                 self._run_cache[fast_key] = kernel
 
@@ -952,10 +1002,10 @@ class JITFunction(JITCallable, KernelInterface[T]):
             self.params.append(KernelParam(i, param, dns, dns_oa))
 
         # cache of just-in-time compiled kernels
-        self.device_caches = defaultdict(self.create_binder)
+        self.device_caches = _DeviceCaches(self, self.create_binder)
 
         # Last-call cache for identity-based fast path (Layer 1).
-        # Stores (device, args, kernel, bound_vals) from the previous successful launch.
+        # Stores a _LastCall namedtuple from the previous successful launch.
         self._last_call = None
         self._last_kwargs = {}
         # Signature-based fast-path cache (Layer 2).
