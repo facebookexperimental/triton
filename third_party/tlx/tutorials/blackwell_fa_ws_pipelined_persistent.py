@@ -1393,7 +1393,6 @@ def _bwd_mma_dots_2cta(
     dot_fulls,
     dot_empties,
     kt_fulls,
-    USE_2CTA: tl.constexpr,
 ):
     """2-CTA MMA dot sequence: prolog + main loop + epilog.
 
@@ -1406,42 +1405,28 @@ def _bwd_mma_dots_2cta(
     tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
 
     # Dot 1: qkT = tl.dot(k, qT)
-    if USE_2CTA:
-        tlx.barrier_wait(qt_fulls[q_buf_id], q_phase)
-    else:
-        tlx.barrier_wait(q_fulls[q_buf_id], q_phase)
+    tlx.barrier_wait(qt_fulls[q_buf_id], q_phase)
     tlx.barrier_wait(qk_empties[tmem_buf_id], tmem_phase ^ 1)
-    if USE_2CTA:
-        qT = tlx.local_trans(qt_tiles[q_buf_id])
-    else:
-        qT = tlx.local_trans(q_tiles[q_buf_id])
+    qT = tlx.local_trans(qt_tiles[q_buf_id])
     tlx.async_dot(
         k_tiles[kv_buf_id],
         qT,
         qk_tiles[tmem_buf_id],
         use_acc=False,
-        mBarriers=[qk_fulls[tmem_buf_id], qt_empties[q_buf_id]] if USE_2CTA else [qk_fulls[tmem_buf_id]],
-        two_ctas=USE_2CTA,
+        mBarriers=[qk_fulls[tmem_buf_id], qt_empties[q_buf_id]],
+        two_ctas=True,
     )
 
     # Dot 2: dpT = tl.dot(v, tl.trans(do))
-    if USE_2CTA:
-        tlx.barrier_wait(dot_fulls[do_buf_id], do_phase)
-    else:
-        tlx.barrier_wait(do_fulls[do_buf_id], do_phase)
-    if not USE_2CTA:
-        tlx.barrier_wait(dp_empties[tmem_buf_id], tmem_phase ^ 1)
-    if USE_2CTA:
-        doT = tlx.local_trans(dot_tiles[do_buf_id])
-    else:
-        doT = tlx.local_trans(do_tiles[do_buf_id])
+    tlx.barrier_wait(dot_fulls[do_buf_id], do_phase)
+    doT = tlx.local_trans(dot_tiles[do_buf_id])
     tlx.async_dot(
         v_tiles[kv_buf_id],
         doT,
         dp_tiles[tmem_buf_id],
         use_acc=False,
-        mBarriers=[dp_fulls[tmem_buf_id], dot_empties[do_buf_id]] if USE_2CTA else [dp_fulls[tmem_buf_id]],
-        two_ctas=USE_2CTA,
+        mBarriers=[dp_fulls[tmem_buf_id], dot_empties[do_buf_id]],
+        two_ctas=True,
     )
 
     # Dot 3: dv += tl.dot(ppT, do)
@@ -1453,7 +1438,7 @@ def _bwd_mma_dots_2cta(
         dv_tiles[kv_buf_id],
         use_acc=False,
         mBarriers=[do_empties[do_buf_id]],
-        two_ctas=USE_2CTA,
+        two_ctas=True,
     )
     blk_idx += 1
 
@@ -1470,23 +1455,17 @@ def _bwd_mma_dots_2cta(
         # In the main loop, S/P/dQ share TMEM. dQ is the last
         # consumer (from previous iteration), so wait dq_empties
         # instead of qk_empties.
-        if USE_2CTA:
-            tlx.barrier_wait(qt_fulls[q_buf_id], q_phase)
-        else:
-            tlx.barrier_wait(q_fulls[q_buf_id], q_phase)
+        tlx.barrier_wait(qt_fulls[q_buf_id], q_phase)
         prev_tmem_buf_id, prev_tmem_phase = _get_bufidx_phase(blk_idx - 1, NUM_BUFFERS_TMEM)
         tlx.barrier_wait(dq_empties[prev_tmem_buf_id], prev_tmem_phase ^ 1)
-        if USE_2CTA:
-            qT = tlx.local_trans(qt_tiles[q_buf_id])
-        else:
-            qT = tlx.local_trans(q_tiles[q_buf_id])
+        qT = tlx.local_trans(qt_tiles[q_buf_id])
         tlx.async_dot(
             k_tiles[kv_buf_id],
             qT,
             qk_tiles[tmem_buf_id],
             use_acc=False,
-            mBarriers=[qk_fulls[tmem_buf_id], qt_empties[q_buf_id]] if USE_2CTA else [qk_fulls[tmem_buf_id]],
-            two_ctas=USE_2CTA,
+            mBarriers=[qk_fulls[tmem_buf_id], qt_empties[q_buf_id]],
+            two_ctas=True,
         )
 
         prev_blk_idx = blk_idx - 1
@@ -1504,56 +1483,38 @@ def _bwd_mma_dots_2cta(
             dk_tiles[kv_buf_id],
             use_acc=(j - 1) > 0,
             mBarriers=[q_empties[q_buf_id_prev]],
-            two_ctas=USE_2CTA,
+            two_ctas=True,
         )
 
         do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
         # Dot 2: dpT = tl.dot(v, doT)
-        if USE_2CTA:
-            tlx.barrier_wait(dot_fulls[do_buf_id], do_phase)
-        else:
-            tlx.barrier_wait(do_fulls[do_buf_id], do_phase)
+        tlx.barrier_wait(dot_fulls[do_buf_id], do_phase)
         # In 2-CTA mode, skip dp_empties wait — the pipeline
         # ordering (Dot 1 → Dot 4 → Dot 2) gives compute enough
         # time to consume the previous dpT, matching FA4.
-        if not USE_2CTA:
-            tlx.barrier_wait(dp_empties[tmem_buf_id], tmem_phase ^ 1)
-        if USE_2CTA:
-            doT = tlx.local_trans(dot_tiles[do_buf_id])
-        else:
-            doT = tlx.local_trans(do_tiles[do_buf_id])
+        doT = tlx.local_trans(dot_tiles[do_buf_id])
         tlx.async_dot(
             v_tiles[kv_buf_id],
             doT,
             dp_tiles[tmem_buf_id],
             use_acc=False,
-            mBarriers=[dp_fulls[tmem_buf_id], dot_empties[do_buf_id]] if USE_2CTA else [dp_fulls[tmem_buf_id]],
-            two_ctas=USE_2CTA,
+            mBarriers=[dp_fulls[tmem_buf_id], dot_empties[do_buf_id]],
+            two_ctas=True,
         )
 
         # Dot 5: dq = tl.dot(tl.trans(dsT), k)
         tlx.barrier_wait(ds_fulls[ds_buf_id_prev], ds_phase_prev)
         tlx.barrier_wait(dq_empties[tmem_buf_id_prev], tmem_phase_prev ^ 1)
         dsT_view = tlx.local_trans(ds_tiles[ds_buf_id_prev])
-        if USE_2CTA:
-            tlx.barrier_wait(kt_fulls[kv_buf_id], kv_phase)
-            tlx.async_dot(
-                dsT_view,
-                kt_tiles[kv_buf_id],
-                dq_tiles[tmem_buf_id_prev],
-                use_acc=False,
-                mBarriers=[dq_fulls[tmem_buf_id_prev]],
-                two_ctas=True,
-            )
-        else:
-            tlx.async_dot(
-                dsT_view,
-                k_tiles[kv_buf_id],
-                dq_tiles[tmem_buf_id_prev],
-                use_acc=False,
-                mBarriers=[dq_fulls[tmem_buf_id_prev]],
-            )
-
+        tlx.barrier_wait(kt_fulls[kv_buf_id], kv_phase)
+        tlx.async_dot(
+            dsT_view,
+            kt_tiles[kv_buf_id],
+            dq_tiles[tmem_buf_id_prev],
+            use_acc=False,
+            mBarriers=[dq_fulls[tmem_buf_id_prev]],
+            two_ctas=True,
+        )
         # Dot 3: dv += tl.dot(ppT, do)
         tlx.barrier_wait(p_fulls[tmem_buf_id], tmem_phase)
         tlx.async_dot(
@@ -1562,12 +1523,12 @@ def _bwd_mma_dots_2cta(
             dv_tiles[kv_buf_id],
             use_acc=True,
             mBarriers=[do_empties[do_buf_id]],
-            two_ctas=USE_2CTA,
+            two_ctas=True,
         )
         blk_idx += 1
 
     # Commit dv accumulation after all loop iterations
-    tlx.tcgen05_commit(dv_fulls[kv_buf_id], two_ctas=USE_2CTA)
+    tlx.tcgen05_commit(dv_fulls[kv_buf_id], two_ctas=True)
 
     # -----------------------------------------------------------
     # Epilog
@@ -1587,38 +1548,26 @@ def _bwd_mma_dots_2cta(
         dk_tiles[kv_buf_id],
         use_acc=num_steps > 1,
         mBarriers=[q_empties[q_buf_id], dk_fulls[kv_buf_id]],
-        two_ctas=USE_2CTA,
+        two_ctas=True,
     )
 
     # Compute dq = tl.dot(tl.trans(dsT), k)
     tlx.barrier_wait(ds_fulls[ds_buf_id], ds_phase)
     tlx.barrier_wait(dq_empties[tmem_buf_id], tmem_phase ^ 1)
     dsT_view = tlx.local_trans(ds_tiles[ds_buf_id])
-    if USE_2CTA:
-        tlx.barrier_wait(kt_fulls[kv_buf_id], kv_phase)
-        tlx.async_dot(
-            dsT_view,
-            kt_tiles[kv_buf_id],
-            dq_tiles[tmem_buf_id],
-            use_acc=False,
-            mBarriers=[
-                dq_fulls[tmem_buf_id],
-            ],
-            two_ctas=True,
-        )
-    else:
-        tlx.async_dot(
-            dsT_view,
-            k_tiles[kv_buf_id],
-            dq_tiles[tmem_buf_id],
-            use_acc=False,
-            mBarriers=[
-                dq_fulls[tmem_buf_id],
-            ],
-        )
+    tlx.barrier_wait(kt_fulls[kv_buf_id], kv_phase)
+    tlx.async_dot(
+        dsT_view,
+        kt_tiles[kv_buf_id],
+        dq_tiles[tmem_buf_id],
+        use_acc=False,
+        mBarriers=[
+            dq_fulls[tmem_buf_id],
+        ],
+        two_ctas=True,
+    )
     tlx.tcgen05_commit(k_mma_done[kv_buf_id])
-    if USE_2CTA:
-        tlx.tcgen05_commit(kt_empties[kv_buf_id], two_ctas=USE_2CTA)
+    tlx.tcgen05_commit(kt_empties[kv_buf_id], two_ctas=True)
 
     return blk_idx
 
@@ -2334,7 +2283,6 @@ def _attn_bwd_ws(
                             dot_fulls,
                             dot_empties,
                             kt_fulls,
-                            USE_2CTA,
                         )
                     else:
                         blk_idx = _bwd_mma_dots_1cta(
