@@ -410,7 +410,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %accumulator_21 = ttng.tmem_store %cst, %accumulator[%accumulator_20], %true : tensor<128x128xf32, #blocked11> -> !ttg.memdesc<128x128xf32, #tmem5, #ttng.tensor_memory, mutable>
       // Inner K-loop with partition annotations
       %accumulator_22:2 = scf.for %i = %c0_i32 to %k_tiles_14 step %c1_i32 iter_args(%arg21 = %false, %accumulator_37 = %accumulator_21) -> (i1, !ttg.async.token)  : i32 {
-        %offs_k = arith.muli %i, %c128_i32 {loop.cluster = 2 : i32, loop.stage = 0 : i32} : i32
+        %offs_k = arith.muli %i, %c128_i32 {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : i32
         // Partition 2: Load operations
         %a = tt.descriptor_load %a_desc[%offs_am, %offs_k] {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<128x128xf16, #shared8>> -> tensor<128x128xf16, #blocked12>
         %a_alloc = ttg.local_alloc %a {loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : (tensor<128x128xf16, #blocked12>) -> !ttg.memdesc<128x128xf16, #shared8, #smem5>
