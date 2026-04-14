@@ -1,4 +1,7 @@
 // RUN: triton-opt %s -split-input-file -test-print-backward-slice-with-ws 2>&1 | FileCheck %s
+// CHECK-NOT/CHECK-DAG cannot reliably exclude patterns that appear between
+// out-of-order DAG matches. Use grep to assert NOT-IN-SLICE tags never appear.
+// RUN: triton-opt %s -split-input-file -test-print-backward-slice-with-ws 2>&1 | not grep "NOT-IN-SLICE"
 
 // Test 1: CF block args are traced through predecessors.
 // %a feeds ^bb1 via cf.br. The slice of %add should include both %a and %b.
@@ -32,7 +35,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c1_i32 = arith.constant 1 : i32
 
     %cta_bars = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #shared, #smem, mutable>  // cta-bars-def
-    %other_bar = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #shared, #smem, mutable>  // other-bar-def
+    %other_bar = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #shared, #smem, mutable>  // NOT-IN-SLICE-other-bar-def
 
     ttg.warp_specialize(%other_bar, %cta_bars) attributes {warpGroupStartIds = array<i32: 4>}
     default {
@@ -67,7 +70,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK-DAG: cta-bars-def
 // CHECK-DAG: bar-def
 // CHECK-DAG: remote-def
-// CHECK-NOT: other-bar-def
 
 // -----
 
@@ -267,7 +269,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c4 = arith.constant 4 : index
-    %initA = arith.constant 0 : i32          // multi-initA
+    %initA = arith.constant 0 : i32          // NOT-IN-SLICE-multi-initA
     %initB = arith.constant 10 : i32         // multi-initB
     %step = arith.constant 1 : i32           // multi-step
     %rA, %rB = scf.for %iv = %c0 to %c4 step %c1
@@ -285,7 +287,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK-DAG: multi-initB
 // CHECK-DAG: multi-step
 // CHECK-DAG: multi-nextB
-// CHECK-NOT: multi-initA
 
 // -----
 
@@ -309,3 +310,32 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // CHECK-DAG: above-bias
 // CHECK-DAG: above-next
+
+// -----
+
+// Test 12: scf.for with multiple results — slice target uses only
+// result #1, so result #0's init and yield should NOT be in the slice.
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @test_scf_for_multi_result() {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    %initA = arith.constant 0 : i32          // NOT-IN-SLICE-forres-initA
+    %initB = arith.constant 10 : i32         // forres-initB
+    %step = arith.constant 1 : i32           // forres-step
+    %rA, %rB = scf.for %iv = %c0 to %c4 step %c1
+        iter_args(%a = %initA, %b = %initB) -> (i32, i32) {
+      %nextA = arith.addi %a, %step : i32    // NOT-IN-SLICE-forres-nextA
+      %nextB = arith.addi %b, %step : i32   // forres-nextB
+      scf.yield %nextA, %nextB : i32, i32
+    }
+    %out = arith.addi %rB, %rB {slice_target} : i32  // forres-out
+    tt.return
+  }
+}
+
+// CHECK-DAG: forres-initB
+// CHECK-DAG: forres-step
+// CHECK-DAG: forres-nextB
+// CHECK-DAG: forres-out

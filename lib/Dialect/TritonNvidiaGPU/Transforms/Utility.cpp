@@ -17,6 +17,12 @@ void getBackwardSliceWithWS(Value target,
   options.omitUsesFromAbove = false;
   options.omitBlockArguments = true;
   options.inclusive = true;
+  // Exclude RegionBranchOpInterface ops from getBackwardSlice so it doesn't
+  // pull in all their operands indiscriminately. We handle them precisely
+  // in the operand loop, tracing only the specific result index.
+  options.filter = [](Operation *op) {
+    return !isa<RegionBranchOpInterface>(op);
+  };
 
   while (!worklist.empty()) {
     Value nextTarget = worklist.back();
@@ -119,21 +125,48 @@ void getBackwardSliceWithWS(Value target,
         for (auto operand : op->getOperands()) {
           if (isa<BlockArgument>(operand)) {
             worklist.insert(operand);
-          }
-        }
-        // If this op is a RegionBranchOpInterface, trace its results back
-        // through region terminators to find the values that produce them
-        // (e.g. scf.while results come from scf.condition operands).
-        // NOTE: This traces all results, not just those used in the slice,
-        // so it may over-approximate. This is safe (conservative) but could
-        // be tightened to only trace results used by ops in the slice.
-        if (auto regionBranch = dyn_cast<RegionBranchOpInterface>(op)) {
-          RegionSuccessor parentSuccessor(op, op->getResults());
-          for (unsigned i = 0, e = op->getNumResults(); i < e; ++i) {
-            SmallVector<Value> predValues;
-            regionBranch.getPredecessorValues(parentSuccessor, i, predValues);
-            for (auto val : predValues)
-              worklist.insert(val);
+          } else if (auto opResult = dyn_cast<OpResult>(operand)) {
+            if (auto regionBranch =
+                    dyn_cast<RegionBranchOpInterface>(opResult.getOwner())) {
+              // Trace through region terminators at this specific result
+              // index (e.g. scf.for result #1 → init #1 and yield #1).
+              auto *branchOp = regionBranch.getOperation();
+              RegionSuccessor parentSuccessor(branchOp, branchOp->getResults());
+              SmallVector<Value> predValues;
+              regionBranch.getPredecessorValues(
+                  parentSuccessor, opResult.getResultNumber(), predValues);
+              for (auto val : predValues)
+                worklist.insert(val);
+              // The filter excluded this op from getBackwardSlice, so add
+              // it and its control operands (e.g. lb, ub, step for scf.for)
+              // manually. Skip entry/init operands — they're already traced
+              // precisely by getPredecessorValues at the right index.
+              if (backwardSlice->insert(branchOp)) {
+                unsigned entryBegin = 0, entryEnd = 0;
+                SmallVector<RegionSuccessor> successors;
+                regionBranch.getSuccessorRegions(RegionBranchPoint::parent(),
+                                                 successors);
+                for (auto &succ : successors) {
+                  if (succ.getSuccessor()) {
+                    auto entryOps =
+                        regionBranch.getEntrySuccessorOperands(succ);
+                    if (!entryOps.empty()) {
+                      entryBegin = entryOps.getBeginOperandIndex();
+                      entryEnd = entryBegin + entryOps.size();
+                    }
+                    break;
+                  }
+                }
+                for (auto [idx, branchOperand] :
+                     llvm::enumerate(branchOp->getOperands())) {
+                  if (idx >= entryBegin && idx < entryEnd)
+                    continue;
+                  worklist.insert(branchOperand);
+                }
+              }
+            }
+            // Non-RegionBranchOpInterface results are already in ops
+            // via getBackwardSlice — no action needed.
           }
         }
       }
