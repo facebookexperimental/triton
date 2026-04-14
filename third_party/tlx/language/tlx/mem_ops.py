@@ -694,6 +694,24 @@ def local_load(
 
 
 @tl.builtin
+def local_gather(
+    src: tlx.buffered_tensor,
+    indices: tlx.buffered_tensor,
+    axis: int,
+    token: tlx.async_token = None,
+    _semantic=None,
+) -> tl.tensor:
+    """
+    gather elements from shared memory along a specified axis using an indices tensor.
+    """
+    block_type = tl.block_type(src.type.element_ty, indices.type.shape)
+    storage = src.type.storage
+    assert storage == tlx.storage_kind.smem, "local_gather only supports shared memory!"
+    output = _semantic.builder.create_local_gather(src.handle, indices.handle, axis)
+    return tl.tensor(output, block_type)
+
+
+@tl.builtin
 def local_store(
     dst: tlx.buffered_tensor,
     src: tl.tensor,

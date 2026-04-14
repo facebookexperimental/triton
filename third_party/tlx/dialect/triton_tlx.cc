@@ -108,12 +108,16 @@ void init_triton_tlx_ir(py::module &&m) {
              self.create<ttg::LocalStoreOp>(regValues, dst);
            })
       .def("create_local_gather",
-           [](TritonOpBuilder &self, Type resultTy, Value memDesc, Value indices,
+           [](TritonOpBuilder &self, Value subView, Value indices,
               int32_t axis) -> Value {
              auto ctx = self.getContext();
              auto i32Ty = IntegerType::get(ctx, 32);
              auto axisAttr = IntegerAttr::get(i32Ty, axis);
-             return self.create<ttg::LocalGatherOp>(resultTy, memDesc, indices,
+             auto subViewType = cast<ttg::MemDescType>(subView.getType());
+             auto indicesType = dyn_cast<RankedTensorType>(indices.getType());
+             auto resultType = RankedTensorType::get(indicesType.getShape(),
+                                                     subViewType.getElementType());
+             return self.create<ttg::LocalGatherOp>(resultType, subView, indices,
                                                     axisAttr);
            })
       .def("create_local_scatter",
