@@ -112,6 +112,8 @@ static const TTGIRToTLXMapping opMappings[] = {
     // Memory load/store operations
     {"ttg.local_load", "tlx.local_load",
      "Load from shared memory to registers"},
+    {"ttg.local_gather", "tlx.local_gather",
+     "Gather elements from shared memory to registers"},
     {"ttng.tmem_load", "tlx.tmem_load",
      "Load from tensor memory to registers (Blackwell)"},
     {"ttg.local_store", "tlx.local_store", "Store registers to shared memory"},
