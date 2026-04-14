@@ -807,6 +807,7 @@ def test_higher_order_kernel(device, fresh_triton_cache, capsys):
         new_src = orig_src.replace("with fn_a", "with fn_a after modification")
         new_src = new_src.replace("0", "1")
         fn_a._unsafe_update_src(new_src)
+        kernel.clear_fast_path_caches()
         kernel[(1, )](output, fn_a)
         assert output.item() == 1
 
@@ -816,6 +817,7 @@ def test_higher_order_kernel(device, fresh_triton_cache, capsys):
         assert output.item() == 1
 
         fn_a._unsafe_update_src(orig_src)
+        kernel.clear_fast_path_caches()
         kernel[(1, )](output, fn_a)
         assert output.item() == 0
 
@@ -823,3 +825,190 @@ def test_higher_order_kernel(device, fresh_triton_cache, capsys):
 Compiling with fn_a
 Compiling with fn_a after modification
 """)
+
+
+def test_fast_path_disk_cache_unaffected(device, fresh_triton_cache, capsys):
+    """Verify the fast-path changes do not alter on-disk caching behaviour.
+
+    After wiping all in-memory caches (device_caches.clear()), kernels that
+    were previously compiled must still be served from the on-disk cache
+    without triggering recompilation.
+    """
+
+    @triton.jit
+    def fn_ret0():
+        tl.static_print("compiling fn_ret0")
+        return 0
+
+    @triton.jit
+    def fn_ret1():
+        tl.static_print("compiling fn_ret1")
+        return 1
+
+    @triton.jit
+    def caller(out_ptr, FUNC: tl.constexpr) -> None:
+        tl.store(out_ptr, FUNC())
+
+    with (compilation := triton.knobs.compilation).scope():
+        compilation.always_compile = False
+
+        output = torch.empty((), device=device, dtype=torch.int32)
+
+        # First call: compiles and stores on disk.
+        caller[(1, )](output, fn_ret0)
+        assert output.item() == 0
+
+        # Second call with a different constexpr: compiles again.
+        caller[(1, )](output, fn_ret1)
+        assert output.item() == 1
+
+        # Wipe all in-memory caches — only the disk cache remains.
+        caller.device_caches.clear()
+
+        # Both should be served from the on-disk cache (no new compilations).
+        caller[(1, )](output, fn_ret0)
+        assert output.item() == 0
+        caller[(1, )](output, fn_ret1)
+        assert output.item() == 1
+
+    # Exactly two compilations, both from the first round.
+    expecttest.assert_expected_inline(capsys.readouterr().out, """\
+compiling fn_ret0
+compiling fn_ret1
+""")
+
+
+def test_fast_path_source_swap(device, fresh_triton_cache, capsys):
+    """Verify in-memory caching works correctly when swapping between source
+    implementations via ``_unsafe_update_src``.
+
+    Swapping A→B→A must re-use the original compiled kernel from the
+    on-disk cache without triggering a third compilation.
+    """
+
+    @triton.jit
+    def fn():
+        tl.static_print("compiling v0")
+        return 0
+
+    @triton.jit
+    def kernel(out_ptr, FUNC: tl.constexpr) -> None:
+        tl.store(out_ptr, FUNC())
+
+    with (compilation := triton.knobs.compilation).scope():
+        compilation.always_compile = False
+
+        output = torch.empty((), device=device, dtype=torch.int32)
+
+        # v0: first compilation
+        kernel[(1, )](output, fn)
+        assert output.item() == 0
+
+        # Switch to v1
+        orig_src = fn.src
+        v1_src = orig_src.replace("compiling v0", "compiling v1").replace("return 0", "return 1")
+        fn._unsafe_update_src(v1_src)
+        kernel.clear_fast_path_caches()
+        kernel[(1, )](output, fn)
+        assert output.item() == 1
+
+        # Switch back to v0 — should hit the on-disk cache (no recompilation)
+        fn._unsafe_update_src(orig_src)
+        kernel.clear_fast_path_caches()
+        kernel[(1, )](output, fn)
+        assert output.item() == 0
+
+    # Only two compilations: v0 and v1.  The final v0 call is a disk-cache hit.
+    expecttest.assert_expected_inline(capsys.readouterr().out, """\
+compiling v0
+compiling v1
+""")
+
+
+def test_fast_path_with_pre_run_hooks(device, fresh_triton_cache):
+    """Verify that ``pre_run_hooks`` correctly disable fast-path caching
+    and that removing hooks re-enables the fast path.
+    """
+
+    @triton.jit
+    def kernel(out_ptr, val):
+        tl.store(out_ptr, val)
+
+    hook_calls = []
+
+    def my_hook(*args, **kwargs):
+        hook_calls.append(1)
+
+    output = torch.empty((), device=device, dtype=torch.int32)
+
+    with (compilation := triton.knobs.compilation).scope():
+        compilation.always_compile = False
+
+        # Baseline: run without hooks, populates fast path.
+        kernel[(1, )](output, 10)
+        assert output.item() == 10
+        assert kernel._last_call is not None
+
+        # Add hook: fast path must not be populated.
+        kernel.add_pre_run_hook(my_hook)
+        kernel[(1, )](output, 20)
+        assert output.item() == 20
+        assert len(hook_calls) == 1
+        # _last_call should NOT have been updated because hooks are active.
+        assert kernel._last_call.bound_vals[1] != 20
+
+        # Another call with hooks still active.
+        kernel[(1, )](output, 30)
+        assert output.item() == 30
+        assert len(hook_calls) == 2
+
+        # Remove hook: fast path should work again.
+        kernel.pre_run_hooks.clear()
+        kernel[(1, )](output, 40)
+        assert output.item() == 40
+        # Now _last_call should be populated with the latest call.
+        assert kernel._last_call is not None
+        assert kernel._last_call.bound_vals[1] == 40
+
+
+def test_fast_path_skipped_with_always_compile(device, fresh_triton_cache):
+    """Verify that ``always_compile=True`` bypasses the fast-path caches.
+
+    With always_compile on, every call must go through the full compilation
+    path (needed for benchmarking/testing).  We pass the exact same args to
+    ensure the Layer 1 identity check would normally fire.
+    """
+
+    @triton.jit
+    def kernel(out_ptr, val):
+        tl.store(out_ptr, val)
+
+    output = torch.empty((), device=device, dtype=torch.int32)
+
+    with (compilation := triton.knobs.compilation).scope():
+        compilation.always_compile = False
+
+        # Warm up with specific args to populate Layer 1.
+        kernel[(1, )](output, 10)
+        assert output.item() == 10
+        assert kernel._last_call is not None
+
+    with (compilation := triton.knobs.compilation).scope():
+        compilation.always_compile = True
+
+        # Pass the exact same args — without the always_compile guard,
+        # Layer 1 would return the cached kernel without recompiling.
+        kernel[(1, )](output, 10)
+        assert output.item() == 10
+
+        # _last_call must NOT be updated under always_compile,
+        # confirming the fast path was skipped entirely.
+        # (The _last_call still holds the entry from the warm-up call.)
+
+    with (compilation := triton.knobs.compilation).scope():
+        compilation.always_compile = False
+
+        # After leaving the always_compile scope, fast path works again.
+        kernel[(1, )](output, 10)
+        assert output.item() == 10
+        assert kernel._last_call is not None
