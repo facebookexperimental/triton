@@ -27,6 +27,8 @@ add_triton_library(NVHopperTransforms
   ModuloScheduling/ModuloBufferAllocPass.cpp
   ModuloScheduling/ModuloExpandPass.cpp
   ModuloScheduling/ModuloLowerPass.cpp
+  Insert2CTASync.cpp
+  Transform2CTALoads.cpp
 
   DEPENDS
   NVHopperTransformsIncGen

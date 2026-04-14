@@ -290,4 +290,55 @@ def NVGPUMultiCTAReduction : Pass<"nvgpu-multi-cta-reduction", "mlir::ModuleOp">
                            "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
 
+
+def NVGPUInsert2CTASync : Pass<"nvgpu-insert-2cta-sync", "mlir::ModuleOp"> {
+  let summary = "Insert cross-CTA synchronization for 2-CTA MMA operations";
+
+  let description = [{
+    This pass inserts cross-CTA synchronization barriers for TCGen5MMAOp
+    operations that use 2-CTA mode (tcgen05.mma.cta_group::2).
+
+    It implements the "arrive remote, wait local" pattern:
+    - Both CTAs arrive on the leader CTA's barrier
+    - Only the leader CTA (even-ranked) waits
+    - Then both CTAs issue the 2-CTA MMA instruction
+
+    This pattern is compatible with warp specialization because the sync
+    ops are inserted after the pipeline pass, and the MMA hardware handles
+    the actual cross-CTA execution synchronization.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+    "mlir::triton::nvgpu::NVGPUDialect"
+  ];
+}
+
+def NVGPU2CTATransformLoads : Pass<"nvgpu-2cta-transform-loads", "mlir::ModuleOp"> {
+  let summary = "Transform B matrix loads for 2-CTA MMA operations";
+
+  let description = [{
+    This pass transforms B matrix descriptor loads for 2-CTA mode. When a
+    TCGen5MMAOp has two_ctas=true (and is not async/TLX-managed), each CTA
+    should load only half of B (BLOCK_N/2 columns). This pass:
+
+    1. Traces the B operand from the MMA back to its DescriptorLoadOp
+    2. Clones the MakeTensorDescOp with half-width block shape
+    3. Inserts ClusterCTAIdOp to compute per-CTA offset
+    4. Creates a new DescriptorLoadOp loading BLOCK_K x BLOCK_N/2
+    5. Updates the LocalAllocOp and MemDesc shapes to match
+
+    This pass is required for the ctas_per_cga=(2,1,1) approach where
+    num_ctas=1 (bypasses PlanCTA). It must run after accelerate_matmul
+    and before insert_2cta_sync.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+    "mlir::triton::nvgpu::NVGPUDialect"
+  ];
+}
+
 #endif // NV_TRANSFORMS_PASSES
