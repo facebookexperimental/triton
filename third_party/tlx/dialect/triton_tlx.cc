@@ -107,6 +107,24 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value &dst, Value &regValues) -> void {
              self.create<ttg::LocalStoreOp>(regValues, dst);
            })
+      .def("create_local_gather",
+           [](TritonOpBuilder &self, Type resultTy, Value memDesc, Value indices,
+              int32_t axis) -> Value {
+             auto ctx = self.getContext();
+             auto i32Ty = IntegerType::get(ctx, 32);
+             auto axisAttr = IntegerAttr::get(i32Ty, axis);
+             return self.create<ttg::LocalGatherOp>(resultTy, memDesc, indices,
+                                                    axisAttr);
+           })
+      .def("create_local_scatter",
+           [](TritonOpBuilder &self, Value memDesc, Value values, Value indices,
+              int32_t axis) {
+             auto ctx = self.getContext();
+             auto i32Ty = IntegerType::get(ctx, 32);
+             auto axisAttr = IntegerAttr::get(i32Ty, axis);
+             self.create<ttg::LocalScatterOp>(memDesc, values, indices,
+                                              axisAttr);
+           })
       .def("create_tmem_copy",
            [](TritonOpBuilder &self, Value src, Value dst) {
              self.create<ttng::TMEMCopyOp>(src, dst, /*barrier=*/Value());
