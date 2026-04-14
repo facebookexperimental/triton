@@ -24,8 +24,8 @@ void getBackwardSliceWithWS(Value target,
 
     if (auto arg = dyn_cast<BlockArgument>(nextTarget)) {
       auto *block = arg.getOwner();
-      if (auto wsPartitionOp = dyn_cast<ttg::WarpSpecializePartitionsOp>(
-              block->getParentOp());
+      if (auto wsPartitionOp =
+              dyn_cast<ttg::WarpSpecializePartitionsOp>(block->getParentOp());
           wsPartitionOp && block->isEntryBlock()) {
         auto argIndex = arg.getArgNumber();
         auto wsOp = wsPartitionOp->getParentOfType<ttg::WarpSpecializeOp>();
@@ -72,13 +72,12 @@ void getBackwardSliceWithWS(Value target,
           // Some regions are only reachable from siblings, not from the
           // parent (e.g. scf.while's "after" region).
           if (!searchSuccessors([&](auto &s) {
-                regionBranch.getSuccessorRegions(
-                    RegionBranchPoint::parent(), s);
+                regionBranch.getSuccessorRegions(RegionBranchPoint::parent(),
+                                                 s);
               })) {
             for (auto &r : parentOp->getRegions()) {
-              if (searchSuccessors([&](auto &s) {
-                    regionBranch.getSuccessorRegions(r, s);
-                  }))
+              if (searchSuccessors(
+                      [&](auto &s) { regionBranch.getSuccessorRegions(r, s); }))
                 break;
             }
           }
@@ -128,8 +127,7 @@ void getBackwardSliceWithWS(Value target,
         // NOTE: This traces all results, not just those used in the slice,
         // so it may over-approximate. This is safe (conservative) but could
         // be tightened to only trace results used by ops in the slice.
-        if (auto regionBranch =
-                dyn_cast<RegionBranchOpInterface>(op)) {
+        if (auto regionBranch = dyn_cast<RegionBranchOpInterface>(op)) {
           RegionSuccessor parentSuccessor(op, op->getResults());
           for (unsigned i = 0, e = op->getNumResults(); i < e; ++i) {
             SmallVector<Value> predValues;
