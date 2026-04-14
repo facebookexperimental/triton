@@ -304,11 +304,13 @@ def test_blackwell_fa_ws_pipelined():
 
 @pytest.mark.parametrize("RESCALE_OPT,USE_WHERE", [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("BLOCK_M", [256, 128])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
-def test_blackwell_fa_ws_pipelined_persistent(causal, RESCALE_OPT, USE_WHERE):
+def test_blackwell_fa_ws_pipelined_persistent(causal, RESCALE_OPT, USE_WHERE, BLOCK_M):
     config = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent"].copy()
     config["RESCALE_OPT"] = RESCALE_OPT
     config["USE_WHERE"] = USE_WHERE
+    config["BLOCK_M"] = BLOCK_M
     sm_scale = 0.5
     for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
         q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
