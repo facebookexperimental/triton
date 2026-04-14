@@ -749,7 +749,8 @@ getTaskTopRegion(triton::FuncOp funcOp,
 
 // Create an allocation to hold the mbarriers.
 static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance,
-                                StringRef srcName = "") {
+                                StringRef srcName = "",
+                                unsigned arriveCount = 1) {
   OpBuilder builder(funcOp);
   builder.setInsertionPointToStart(&(funcOp.getBody().front()));
   Attribute sharedMemorySpace =
@@ -773,7 +774,8 @@ static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance,
     Value idx = arith::ConstantIntOp::create(builder, loc, i, 32);
     Value barrierView = ttg::MemDescIndexOp::create(
         builder, loc, singleBarrierMemDescType, barrierAlloc, idx);
-    ttng::InitBarrierOp::create(builder, funcOp->getLoc(), barrierView, 1);
+    ttng::InitBarrierOp::create(builder, funcOp->getLoc(), barrierView,
+                                arriveCount);
   }
   return barrierAlloc;
 }
@@ -3143,12 +3145,16 @@ void insertAsyncComm(
             }
           }
           if (!replaced) {
+            // Propagate two_ctas from the MMA op so the commit uses
+            // cta_group::2, which is required to wait for cta_group::2 MMA
+            // operations to finish writing to TMEM.
             auto indexedBarrier = getBarrierForPipelineStage(
                 builder, *commChannel.producerBarrier, bufferIdx);
+            bool twoCTAs = cast<ttng::TCGen5MMAOp>(mmaOp).getTwoCtas();
             builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
-                mmaOp->getLoc(), indexedBarrier);
+                mmaOp->getLoc(), indexedBarrier, twoCTAs);
+            builder.clearLoopScheduleInfo();
           }
-          builder.clearLoopScheduleInfo();
         }
         // Still call desyncTCGen5MMAOp to handle the consumer.
         desyncTCGen5MMAOp(builder, cast<ttng::TCGen5MMAOp>(mmaOp),
@@ -3228,8 +3234,11 @@ void insertAsyncComm(
           builder.setAsyncTaskIdsFromOp(mmaOp);
           auto indexedConsumerBarrier =
               getBarrierForPipelineStage(builder, consumerBarrier, bufferIdx);
+          // Propagate two_ctas from the MMA op so the commit uses
+          // cta_group::2, matching the MMA's commit group.
+          bool twoCTAs = mmaOp.getTwoCtas();
           builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
-              mmaOp->getLoc(), indexedConsumerBarrier);
+              mmaOp->getLoc(), indexedConsumerBarrier, twoCTAs);
           builder.clearLoopScheduleInfo();
         }
 

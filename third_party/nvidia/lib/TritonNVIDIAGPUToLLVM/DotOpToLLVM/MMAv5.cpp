@@ -379,13 +379,19 @@ void convertDotImpl(const LLVMTypeConverter &typeConverter,
   if (twoCTAs) {
     // - In TLX 2cta mode, we'll have explicit remote barrier arrival in kernel,
     // and implicit cluster sync inserted earlier than this.
-    // - In non-TLX 2cta mode (Triton default), we keep the code unchanged. Note
-    // inserting cluster sync here will hang WarpSpec - only MMA warps would
-    // execute ClusterArriveOp but ClusterWaitOp expects all threads in the
-    // cluster
-    if (!tlxPairedMMA) {
+    // - In WarpSpec mode (autoWS), the Insert2CTASync pass provides explicit
+    // cross-CTA mbarrier sync. ClusterArrive/Wait will deadlock because only
+    // the consumer warp group executes it while the cluster barrier expects
+    // all threads.
+    // - In non-TLX non-WS 2cta mode, we keep the cluster sync.
+    bool hasExplicitCTASync =
+        tlxPairedMMA ||
+        rewriter.getInsertionBlock()
+                ->getParentOp()
+                ->getParentOfType<triton::gpu::WarpSpecializeOp>() != nullptr;
+    if (!hasExplicitCTASync) {
       // TODO: we have to sync the two CTAs because we currently don't use
-      // remove barriers for the copies.
+      // remote barriers for the copies.
       ttng::ClusterArriveOp::create(rewriter, loc, false);
       ttng::ClusterWaitOp::create(rewriter, loc);
     }
@@ -706,8 +712,22 @@ struct TCGen5CommitOpConversion
     if (adaptor.getPred())
       pred = b.and_(adaptor.getPred(), pred);
 
-    createMMACommit(rewriter, op.getLoc(), smemObj.getBase(), pred,
-                    ttng::getModuleTwoCTAs(op) || tlx::tlxEnablePairedMMA(op));
+    bool twoCTAs = ttng::getModuleTwoCTAs(op) || tlx::tlxEnablePairedMMA(op);
+    if (op.getTwoCtas()) {
+      // For auto-WS 2-CTA commits (op has explicit two_ctas attribute):
+      // With cta_group::2 + multicast::cluster, only the leader CTA (rank 0
+      // within the pair) should issue the commit. Otherwise both CTAs arrive
+      // on the barrier via multicast, causing double-arrive that advances
+      // the barrier phase too fast and desynchronizes the pipeline.
+      // Note: We gate on op.getTwoCtas() (not twoCTAs) to avoid changing
+      // behavior for TLX commits from LowerAref, which don't set two_ctas.
+      Value clusterCTARank = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
+      Value isLeader =
+          b.icmp_eq(b.and_(clusterCTARank, b.i32_val(1)), b.i32_val(0));
+      pred = b.and_(pred, isLeader);
+    }
+
+    createMMACommit(rewriter, op.getLoc(), smemObj.getBase(), pred, twoCTAs);
     rewriter.eraseOp(op);
     return success();
   }
