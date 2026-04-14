@@ -270,6 +270,7 @@ def _softmax_inner_loop(
     NUM_MMA_SLICES: tl.constexpr,
     STAGE: tl.constexpr,
     RESCALE_OPT: tl.constexpr,
+    SCALAR_N: tl.constexpr,
 ):
     lo, hi = _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE)
 
@@ -307,7 +308,7 @@ def _softmax_inner_loop(
         else:
             alpha = tl.math.exp2(m_i - m_ij)
         tlx.barrier_wait(tlx.local_view(alpha_empties, cid), qk_phase ^ 1)
-        tlx.local_store(tlx.local_view(alpha_tiles, cid), alpha[:, None])
+        tlx.local_store(tlx.local_view(alpha_tiles, cid), tl.join(alpha, alpha) if SCALAR_N == 2 else alpha[:, None])
         tlx.barrier_arrive(tlx.local_view(alpha_fulls, cid))
 
         # scale_subtract_rowmax:
@@ -415,22 +416,26 @@ def _attn_fwd_ws(
         tlx.storage_kind.tmem,
         reuse=qk_storage_alias,
     )
+    # When BLOCK_M_SPLIT == 64 == blockM, the TMEM lowering selects the
+    # I16x32bx2 message whose secondHalfOffset=0 hits a ptxas bug. Pad to
+    # blockN=2 so secondHalfOffset is naturally non-zero.
+    SCALAR_N: tl.constexpr = 2 if BLOCK_M_SPLIT == 64 else 1
     alpha_tiles = tlx.local_alloc(
-        (BLOCK_M_SPLIT, 1),
+        (BLOCK_M_SPLIT, SCALAR_N),
         tl.float32,
         NUM_MMA_GROUPS * NUM_BUFFERS_QK,
         tlx.storage_kind.tmem,
         reuse=qk_storage_alias,
     )
     l_tiles = tlx.local_alloc(
-        (BLOCK_M_SPLIT, 1),
+        (BLOCK_M_SPLIT, SCALAR_N),
         tl.float32,
         NUM_MMA_GROUPS * NUM_BUFFERS_QK,
         tlx.storage_kind.tmem,
         reuse=qk_storage_alias,
     )
     m_tiles = tlx.local_alloc(
-        (BLOCK_M_SPLIT, 1),
+        (BLOCK_M_SPLIT, SCALAR_N),
         tl.float32,
         NUM_MMA_GROUPS * NUM_BUFFERS_QK,
         tlx.storage_kind.tmem,
@@ -513,7 +518,8 @@ def _attn_fwd_ws(
                     for cid in tl.static_range(0, NUM_MMA_GROUPS):
                         # -- update output accumulator --
                         tlx.barrier_wait(alpha_fulls[cid], phase)
-                        alpha_1 = tlx.local_load(alpha_tiles[cid])
+                        alpha_loaded = tlx.local_load(alpha_tiles[cid])
+                        alpha_1 = tl.split(alpha_loaded)[0][:, None] if SCALAR_N == 2 else alpha_loaded
                         tlx.barrier_arrive(alpha_empties[cid])
                         # Perform warp-level ballot vote to check if any thread needs rescaling
                         # 0xFFFFFFFF means all 32 threads in the warp participate
@@ -569,8 +575,10 @@ def _attn_fwd_ws(
                 for cid in tl.static_range(0, NUM_MMA_GROUPS):
                     # epilogue
                     tlx.barrier_wait(l_fulls[cid], phase)
-                    l = tlx.local_load(l_tiles[cid])
-                    m = tlx.local_load(m_tiles[cid])
+                    l_loaded = tlx.local_load(l_tiles[cid])
+                    m_loaded = tlx.local_load(m_tiles[cid])
+                    l = tl.split(l_loaded)[0][:, None] if SCALAR_N == 2 else l_loaded
+                    m = tl.split(m_loaded)[0][:, None] if SCALAR_N == 2 else m_loaded
                     # Signal qk_empties after both l and m loads complete,
                     # since both tiles share the same synchronization group.
                     tlx.barrier_arrive(qk_empties[cid])
@@ -660,8 +668,8 @@ def _attn_fwd_ws(
                         NUM_MMA_SLICES,
                         STAGE=4 - STAGE,
                         RESCALE_OPT=RESCALE_OPT,
+                        SCALAR_N=SCALAR_N,
                     )
-
                 if STAGE & 2:
                     m_i, l_i, accum_cnt_qk = _softmax_inner_loop(
                         qk_fulls,
@@ -685,11 +693,12 @@ def _attn_fwd_ws(
                         NUM_MMA_SLICES,
                         STAGE=2,
                         RESCALE_OPT=RESCALE_OPT,
+                        SCALAR_N=SCALAR_N,
                     )
 
                 # prepare l_i for the epilog
-                tlx.local_store(l_tiles[cid], l_i[:, None])
-                tlx.local_store(m_tiles[cid], m_i[:, None])
+                tlx.local_store(l_tiles[cid], tl.join(l_i, l_i) if SCALAR_N == 2 else l_i[:, None])
+                tlx.local_store(m_tiles[cid], tl.join(m_i, m_i) if SCALAR_N == 2 else m_i[:, None])
                 tlx.barrier_arrive(l_fulls[cid])
                 tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                 clc_phase_consumer ^= 1
