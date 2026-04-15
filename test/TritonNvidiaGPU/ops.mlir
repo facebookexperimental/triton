@@ -97,4 +97,42 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     %1 = ttng.tmem_alloc %arg1 : (tensor<128x8xf8E5M2, #scales>) -> !ttg.memdesc<128x8xf8E5M2, #tmem_scales, #ttng.tensor_memory>
     tt.return
   }
+
+  // CHECK-LABEL: @subtiled_region
+  // CHECK-SAME: %[[BAR:arg[0-9]+]]: !ttg.memdesc<1xi64, #shared2, #smem, mutable>
+  // CHECK-SAME: %[[PHASE:arg[0-9]+]]: i32
+  tt.func @subtiled_region(
+      %bar: !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>,
+      %phase: i32) {
+    // CHECK: ttng.subtiled_region
+    // CHECK-SAME: barriers(%[[BAR]] : !ttg.memdesc<1xi64, #shared2, #smem, mutable>)
+    // CHECK-SAME: phases(%[[PHASE]] : i32)
+    // CHECK-SAME: tile_mappings = [array<i32: 0>, array<i32: 1>]
+    // CHECK-SAME: barrier_annotations = [#ttng.barrier_annotation<barrierIdx = 0, placement = after, targetOpIdx = 0, barrierOpKind = "arrive_barrier">]
+    // CHECK: setup
+    // CHECK: ttng.subtiled_region_yield
+    // CHECK: tile
+    // CHECK: ttng.subtiled_region_yield
+    // CHECK: teardown
+    // CHECK: ttng.subtiled_region_yield
+    ttng.subtiled_region
+        barriers(%bar : !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>)
+        phases(%phase : i32)
+        tile_mappings = [array<i32: 0>, array<i32: 1>]
+        barrier_annotations = [
+          #ttng.barrier_annotation<barrierIdx = 0, placement = after,
+              targetOpIdx = 0, barrierOpKind = "arrive_barrier">
+        ]
+      setup {
+        %c0 = arith.constant 0 : i32
+        %c1 = arith.constant 1 : i32
+        ttng.subtiled_region_yield %c0, %c1 : i32, i32
+      } tile(%arg0: i32) {
+        %res = arith.addi %arg0, %arg0 : i32
+        ttng.subtiled_region_yield
+      } teardown {
+        ttng.subtiled_region_yield
+      }
+    tt.return
+  }
 }
