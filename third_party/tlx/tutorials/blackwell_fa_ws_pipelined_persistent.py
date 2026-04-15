@@ -1413,6 +1413,8 @@ def _bwd_mma_dots_2cta(
     )
 
     # Dot 3: dv += tl.dot(ppT, do)
+    # Wait for do_tiles to be loaded (2-CTA: not bundled into dot_fulls)
+    tlx.barrier_wait(do_fulls[do_buf_id], do_phase)
     tlx.barrier_wait(p_fulls[tmem_buf_id], tmem_phase)
     tlx.barrier_wait(dv_empties[kv_buf_id], kv_phase ^ 1)
     tlx.async_dot(
@@ -1499,6 +1501,8 @@ def _bwd_mma_dots_2cta(
             two_ctas=True,
         )
         # Dot 3: dv += tl.dot(ppT, do)
+        # Wait for do_tiles to be loaded (2-CTA: not bundled into dot_fulls)
+        tlx.barrier_wait(do_fulls[do_buf_id], do_phase)
         tlx.barrier_wait(p_fulls[tmem_buf_id], tmem_phase)
         tlx.async_dot(
             p_tiles[tmem_buf_id],
