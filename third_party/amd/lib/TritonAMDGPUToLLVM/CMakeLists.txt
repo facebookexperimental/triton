@@ -6,6 +6,7 @@ add_triton_library(TritonAMDGPUToLLVM
     BufferOpsEmitter.cpp
     TensorPtrOpsToLLVM.cpp
     ConvertLayoutOpToLLVM.cpp
+    ConvertWarpPipeline.cpp
     MemoryOpToLLVM.cpp
     MaskedOpsToLLVM.cpp
     DotOpToLLVM/FMA.cpp
