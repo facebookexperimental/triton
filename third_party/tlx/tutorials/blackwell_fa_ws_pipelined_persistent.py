@@ -2072,7 +2072,7 @@ def _bwd_compute_inner_loop(
         tlx.barrier_wait(qk_fulls[tmem_buf_id], tmem_phase)
 
         # Read S from TMEM and compute pT.
-        # S and P alias the same TMEM (p_tiles reuse=qk_tiles).  The
+        # S and P alias the same TMEM (via qk_p_storage_alias).  The
         # Triton compiler inserts the necessary sync between the S read
         # and P write automatically.
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
@@ -2278,13 +2278,18 @@ def _attn_bwd_ws(
     dsT_tmem_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS)
 
     # allocate tmem buffers
-    qk_tiles = tlx.local_alloc((BLOCK_N1, BLOCK_M1), tl.float32, NUM_BUFFERS_TMEM, tlx.storage_kind.tmem)
+    # S/P/dQ share TMEM via storage alias. S and P fully overlap (shared).
+    # In 2-CTA, P and dQ must be distinct (non-overlapping) so that
+    # Dot 5 (dQ) doesn't overwrite P before Dot 3 (dV) reads it.
+    qk_p_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
+    qk_tiles = tlx.local_alloc((BLOCK_N1, BLOCK_M1), tl.float32, NUM_BUFFERS_TMEM, tlx.storage_kind.tmem,
+                               reuse=qk_p_storage_alias)
     p_tiles = tlx.local_alloc(
         (BLOCK_N1, BLOCK_M1),
         tlx.dtype_of(desc_do),
         NUM_BUFFERS_TMEM,
         tlx.storage_kind.tmem,
-        reuse=qk_tiles,
+        reuse=qk_p_storage_alias,
     )
     # dP, dS (TMEM for dk dot), and dQ share TMEM via storage alias.
     # dP and dS occupy the same offset (sequential lifetime: dpT consumed
@@ -2356,14 +2361,23 @@ def _attn_bwd_ws(
             ))
     else:
         if USE_2CTA:
-            # 2-CTA: dQ reuses S/P TMEM, each CTA produces M1//2 rows
+            # 2-CTA: dQ reuses S/P TMEM but must be distinct from P.
+            # Each CTA produces M1//2 rows of dQ.
             dq_tiles = tlx.local_alloc(
                 (BLOCK_M1 // NUM_CTAS, HEAD_DIM),
                 tl.float32,
                 NUM_BUFFERS_TMEM,
                 tlx.storage_kind.tmem,
-                reuse=qk_tiles,
+                reuse=qk_p_storage_alias,
             )
+            # S/P shared (full overlap), P/dQ distinct (non-overlapping).
+            # This ensures Dot 5 (dQ) doesn't overwrite P before Dot 3 (dV) reads it.
+            qk_p_storage_alias.set_buffer_overlap(
+                tlx.reuse_group(
+                    qk_tiles,
+                    tlx.reuse_group(p_tiles, dq_tiles, group_type=tlx.reuse_group_type.distinct),
+                    group_type=tlx.reuse_group_type.shared,
+                ))
         else:
             # 1-CTA with bm1=64: separate dQ TMEM
             dq_tiles = tlx.local_alloc(

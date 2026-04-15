@@ -266,12 +266,10 @@ CTA 0: sKt = [ a b ]         CTA 1: sKt = [ c d ]
 
 ## TLX design: tile scheduling
 
-Each CTA gets a different N-block:
-```python
-n_tile_num = tl.cdiv(N_CTX, BLOCK_N1 * NUM_CTAS)
-start_n = tile_n_idx * NUM_CTAS + cluster_cta_rank
-start_block_n = start_n * BLOCK_N1  # different per CTA
-```
+In TLX with CLC, each CTA in a cluster gets its own `program_id` and
+tile_id. Two CTAs naturally get consecutive tiles (pid 0, pid 1).
+No special tile scheduling is needed — `start_n = pid` works as-is.
+Grid size and `n_tile_num` do NOT change between 1-CTA and 2-CTA.
 
 ## TLX design: loads
 
@@ -327,30 +325,40 @@ For dot 4 where M = `tile_m` = 128, each CTA gets 64 TMEM columns.
 
 | Buffer | TMEM columns | Per-CTA shape | Overlaps with | Notes |
 |--------|-------------|---------------|---------------|-------|
-| `qk_tiles` (S) | 128 | (tile_n, tile_m) | `p_tiles`, `dq_tiles` (reuse) | Dot 1 output |
-| `p_tiles` (P) | 128 | (tile_n, tile_m) | `qk_tiles`, `dq_tiles` (reuse) | P = softmax(S) overwrites S |
-| `dp_tiles` (dP) | 128 | (tile_n, tile_m) | — | Dot 2 output |
-| `dq_tiles` (dQ) | 128 | (tile_m, tile_hdim) | `qk_tiles`/`p_tiles` (reuse) | Dot 4 output. Reuses S/P after they are consumed |
+| `qk_tiles` (S) | 128 | (tile_n, tile_m) | `p_tiles` (full), `dq_tiles` (partial) | Dot 1 output |
+| `p_tiles` (P) | 128 | (tile_n, tile_m) | `qk_tiles` (full), `dq_tiles` (partial) | P = softmax(S) overwrites S |
+| `dq_tiles` (dQ) | 64 | (tile_m/2, tile_hdim) | `qk_tiles`/`p_tiles` cols 64-127 | Dot 4 output. Partial overlap with S/P |
+| `dp_tiles` (dP) | 128 | (tile_n, tile_m) | `dsT_tmem_tiles` | Dot 2 output |
+| `dsT_tmem_tiles` | 128 | (tile_n, tile_m) | `dp_tiles` | dS in TMEM for Dot 5 |
 | `dv_tiles` (dV) | 128 | (tile_n, tile_hdim) | — | Dot 3 accumulator |
 | `dk_tiles` (dK) | 128 | (tile_n, tile_hdim) | — | Dot 5 accumulator |
 
 Overlaps:
-- **S → P**: P = softmax(S) overwrites S in-place
-- **S/P → dQ**: dQ reuses S/P's TMEM after P is consumed by dot 3 (dV)
-  and dS computation. dQ is computed last (dot 4), so S/P is dead by then.
+- **S → P**: P = softmax(S) overwrites S in-place (full overlap)
+- **S/P ↔ dQ**: dQ (64 cols) partially overlaps S/P (128 cols) at columns
+  64-127. In FA4, dQ is placed at `tmem_S_offset + tile_hdim//2 = 64`.
+  This is safe because each CTA only reads P columns 0-63 (from the
+  M-split), and dQ only writes to columns 64-127.
+- **dP ↔ dsT_tmem**: dS overwrites dP in-place (sequential lifetime)
 
 ```
-Column:  0                 128        256                384       512
-         |-----------------|----------|------------------|---------|
-         |    S/P/dQ       |    dV    |     dP/dS        |   dK    |
-         |     (128)       |  (128)   |     (128)        |  (128)  |
-         |_________________|__________|__________________|_________|
+Column:  0          64    128        256                384       512
+         |----------|------|----------|------------------|---------|
+         |    S/P   | dQ   |    dV    |     dP/dS        |   dK    |
+         |  (128)   | (64) |  (128)   |     (128)        |  (128)  |
+         |__________|______|__________|__________________|_________|
 ```
 
-dQ reuses S/P's 128 columns. dP is separate (not shared with dQ) since
-dP may still be needed when dQ is computed (dS is derived from dP).
+dQ partially overlaps S/P at columns 64-127. In FA4, this is safe with
+the loop order (dQ before dV) because FA4 controls the TMEM offset
+(`tmem_dQ_offset = 64`), placing dQ at columns 64-127 while each CTA
+reads P from columns 0-63. TLX does not have TMEM offset control —
+`reuse=qk_tiles` places dQ at offset 0, fully overlapping P. Therefore,
+TLX uses a different loop order: **dV before dQ** (S → dK → dP → dV → dQ),
+ensuring P is consumed before dQ overwrites it.
 
-Total: 512 TMEM columns fully packed with overlaps.
+Total: 512 TMEM columns (128 + 64 + 128 + 128 + 128 = 576, but dQ
+overlaps 64 columns with S/P, so net = 512).
 
 ## TLX design: data flow (per N-block group)
 
