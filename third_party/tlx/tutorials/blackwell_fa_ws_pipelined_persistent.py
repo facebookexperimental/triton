@@ -2049,7 +2049,7 @@ def _bwd_compute_inner_loop(
     # 2-CTA params (defaults for 1-CTA)
     USE_2CTA: tl.constexpr = False,
     NUM_CTAS: tl.constexpr = 1,
-    dsT_tiles=None,
+    dsT_xchg_tiles=None,
     ds_xchg_tiles=None,
     ds_peer_fulls=None,
     dsT_fulls=None,
@@ -2114,19 +2114,19 @@ def _bwd_compute_inner_loop(
         if USE_2CTA:
             ds_phase, _ = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
             # Store pre-exchange dS to TMEM for Dot 5 (dK += dS @ Q).
-            tlx.local_store(dsT_tiles[ds_buf_id], dsT)
+            tlx.local_store(dsT_xchg_tiles[ds_buf_id], dsT)
             tlx.barrier_arrive(dsT_fulls[ds_buf_id], 1, remote_cta_rank=0)
             peer_rank = 1 - cluster_cta_rank
             # Load own/peer M-columns from TMEM, store to ds_tiles/ds_xchg.
             if cluster_cta_rank == 0:
-                own_tmem = tlx.local_slice(dsT_tiles[ds_buf_id], [0, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
-                peer_tmem = tlx.local_slice(dsT_tiles[ds_buf_id], [0, BLOCK_M1 // NUM_CTAS],
+                own_tmem = tlx.local_slice(dsT_xchg_tiles[ds_buf_id], [0, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
+                peer_tmem = tlx.local_slice(dsT_xchg_tiles[ds_buf_id], [0, BLOCK_M1 // NUM_CTAS],
                                             [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
                 own_smem = tlx.local_slice(ds_tiles[ds_buf_id], [0, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
             else:
-                own_tmem = tlx.local_slice(dsT_tiles[ds_buf_id], [0, BLOCK_M1 // NUM_CTAS],
+                own_tmem = tlx.local_slice(dsT_xchg_tiles[ds_buf_id], [0, BLOCK_M1 // NUM_CTAS],
                                            [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
-                peer_tmem = tlx.local_slice(dsT_tiles[ds_buf_id], [0, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
+                peer_tmem = tlx.local_slice(dsT_xchg_tiles[ds_buf_id], [0, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
                 own_smem = tlx.local_slice(ds_tiles[ds_buf_id], [BLOCK_N1, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
             own_data = tlx.local_load(own_tmem)
             tlx.local_store(own_smem, own_data)
@@ -2409,9 +2409,13 @@ def _attn_bwd_ws(
         ds_xchg_tiles = tlx.local_alloc((BLOCK_N1, BLOCK_M1 // NUM_CTAS), tlx.dtype_of(desc_q),
                                         NUM_BUFFERS_DS)  # noqa: F841
         # TMEM copy of dS for dot 5 (before DSMEM exchange)
-        dsT_tiles = tlx.local_alloc((BLOCK_N1, BLOCK_M1), tlx.dtype_of(desc_q), NUM_BUFFERS_DS,
-                                    tlx.storage_kind.tmem,  # noqa: F841
-                                    reuse=dp_tiles)
+        dsT_xchg_tiles = tlx.local_alloc(
+            (BLOCK_N1, BLOCK_M1),
+            tlx.dtype_of(desc_q),
+            NUM_BUFFERS_DS,
+            tlx.storage_kind.tmem,  # noqa: F841
+            reuse=dp_tiles,
+        )
         # 2-CTA barriers for transposed views
         k_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)  # noqa: F841
         v_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)  # noqa: F841
@@ -2494,7 +2498,7 @@ def _attn_bwd_ws(
                         D_STAGE=D_STAGE,
                         USE_2CTA=USE_2CTA,
                         NUM_CTAS=NUM_CTAS,
-                        dsT_tiles=dsT_tiles if USE_2CTA else None,
+                        dsT_xchg_tiles=dsT_xchg_tiles if USE_2CTA else None,
                         ds_xchg_tiles=ds_xchg_tiles if USE_2CTA else None,
                         ds_peer_fulls=ds_peer_fulls if USE_2CTA else None,
                         dsT_fulls=dsT_fulls if USE_2CTA else None,
@@ -2536,7 +2540,7 @@ def _attn_bwd_ws(
                         D_STAGE=D_STAGE,
                         USE_2CTA=USE_2CTA,
                         NUM_CTAS=NUM_CTAS,
-                        dsT_tiles=dsT_tiles if USE_2CTA else None,
+                        dsT_xchg_tiles=dsT_xchg_tiles if USE_2CTA else None,
                         ds_xchg_tiles=ds_xchg_tiles if USE_2CTA else None,
                         ds_peer_fulls=ds_peer_fulls if USE_2CTA else None,
                         dsT_fulls=dsT_fulls if USE_2CTA else None,
