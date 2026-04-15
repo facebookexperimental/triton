@@ -197,9 +197,9 @@ def TritonNvidiaGPULowerSubtiledRegionPass
   ];
 }
 
-def TritonNvidiaGPUGenerateSubtiledRegionPass
-    : Pass<"triton-nvidia-gpu-generate-subtiled-region", "mlir::ModuleOp"> {
-  let summary = "Generate subtiled_region ops from split patterns";
+def TritonNvidiaGPUTestGenerateSubtiledRegionPass
+    : Pass<"triton-nvidia-gpu-test-generate-subtiled-region", "mlir::ModuleOp"> {
+  let summary = "Test pass: generate subtiled_region ops from split patterns";
 
   let description = [{
     This pass finds the GEMM epilogue subtiling pattern:

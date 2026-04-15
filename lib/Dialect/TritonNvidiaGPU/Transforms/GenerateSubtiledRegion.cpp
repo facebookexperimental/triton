@@ -9,7 +9,7 @@ namespace mlir {
 namespace triton {
 namespace nvidia_gpu {
 
-#define GEN_PASS_DEF_TRITONNVIDIAGPUGENERATESUBTILEDREGIONPASS
+#define GEN_PASS_DEF_TRITONNVIDIAGPUTESTGENERATESUBTILEDREGIONPASS
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h.inc"
 
 namespace {
@@ -240,12 +240,12 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
 
 namespace {
 
-class TritonNvidiaGPUGenerateSubtiledRegionPass
-    : public impl::TritonNvidiaGPUGenerateSubtiledRegionPassBase<
-          TritonNvidiaGPUGenerateSubtiledRegionPass> {
+class TritonNvidiaGPUTestGenerateSubtiledRegionPass
+    : public impl::TritonNvidiaGPUTestGenerateSubtiledRegionPassBase<
+          TritonNvidiaGPUTestGenerateSubtiledRegionPass> {
 public:
-  using TritonNvidiaGPUGenerateSubtiledRegionPassBase::
-      TritonNvidiaGPUGenerateSubtiledRegionPassBase;
+  using TritonNvidiaGPUTestGenerateSubtiledRegionPassBase::
+      TritonNvidiaGPUTestGenerateSubtiledRegionPassBase;
 
   void runOnOperation() override {
     SmallVector<triton::SplitOp> splitOps;

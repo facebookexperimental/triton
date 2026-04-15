@@ -55,8 +55,8 @@ void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp);
 void doGenerateSubtiledRegion(triton::FuncOp &funcOp) {
   auto moduleOp = funcOp->getParentOfType<ModuleOp>();
   PassManager pm(moduleOp.getContext());
-  pm.addPass(
-      triton::nvidia_gpu::createTritonNvidiaGPUGenerateSubtiledRegionPass());
+  pm.addPass(triton::nvidia_gpu::
+                 createTritonNvidiaGPUTestGenerateSubtiledRegionPass());
   (void)pm.run(moduleOp);
 }
 
