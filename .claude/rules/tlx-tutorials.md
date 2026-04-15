@@ -20,3 +20,12 @@ Available kernels: `blackwell_gemm_ws`, `blackwell_gemm_clc`, `blackwell_gemm_pi
 **Never run performance tests unless explicitly asked.**
 
 Performance testing: use the `kernel-perf-testing` skill.
+
+## 2-CTA / Cluster Design
+
+See the `tlx-api-reference` skill for detailed 2-CTA barrier semantics,
+tile scheduling, and MMA behavior. Key rule: **do NOT modify
+`bwd_calculate_offsets`, `n_tile_num`, or grid functions for 2-CTA** —
+each CTA gets its own `program_id` naturally.
+
+See `third_party/tlx/tutorials/tlx_attention_ws_pipelined_2cta.md` for the full design doc.

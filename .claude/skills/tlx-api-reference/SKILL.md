@@ -43,7 +43,12 @@ with tlx.async_tasks():
 | `tlx.cluster_barrier()` | Full cluster-wide synchronization barrier | Both |
 
 **arrive_count rules:**
-- Implicit arrive from `barrier_expect_bytes`: use `arrive_count=1`
+- `arrive_count` controls how many times `barrier_expect_bytes` must be called
+  before the barrier can complete a phase. It is NOT a count of `barrier_arrive` calls.
+- For TMA barriers where only the leader CTA calls `barrier_expect_bytes`:
+  use `arrive_count=1` (default).
+- For barriers arrived by software from both CTAs (via `barrier_arrive` with
+  `remote_cta_rank`), use `arrive_count=NUM_CTAS`.
 - `barrier_arrive` inside `tlx.async_task`: `arrive_count` = number of warp groups
 - `barrier_arrive` outside `tlx.async_task`: `arrive_count=1` (only tid==0 arrives)
 
@@ -114,6 +119,33 @@ Used for PingPong scheduling to prevent tensor core contention between consumer 
 specifies **total CTAs**; hardware divides by ctas_per_cga to get the number
 of clusters. E.g., grid=(2,1,1) with ctas_per_cga=(2,1,1) = 1 cluster of
 2 CTAs.
+
+### 2-CTA tile scheduling in TLX
+
+Each CTA in a cluster gets its own `program_id` and its own tile_id from
+CLC. Two CTAs in a cluster naturally get consecutive tiles (pid 0, pid 1).
+**No special tile scheduling is needed for 2-CTA** — `start_n = pid` works
+as-is. Grid size and `n_tile_num` do NOT change between 1-CTA and 2-CTA.
+
+Think of 2-CTA as two independent 1-CTAs that handle their own K/V tiles
+and share Q/dO via multicast. For L2 efficiency, they process consecutive
+N-blocks.
+
+### 2-CTA MMA semantics (`two_ctas=True`)
+
+- **A operand** (TMEM): per-CTA, each CTA has different data
+- **B operand** (SMEM): split across CTAs and combined by hardware via multicast
+- **Output** (TMEM): split across CTAs along the M dimension, written to both CTAs
+- Leader MMA writes to both leader TMEM and peer TMEM
+
+### 2-CTA barrier patterns
+
+- TMA loads with `two_ctas=True`: only leader calls `barrier_expect_bytes`
+  (guarded by `if is_leader:`). Use `arrive_count=1`.
+- Software arrives (`barrier_arrive` with `remote_cta_rank=0`): both CTAs
+  arrive on leader's barrier. Use `arrive_count=NUM_CTAS`.
+- MMA `mBarriers` with `two_ctas=True`: hardware signals when input reads
+  complete. The TMEM output write may still be in-flight.
 
 
 **input_precision options:** `tf32`, `tf32x3`, `ieee`
