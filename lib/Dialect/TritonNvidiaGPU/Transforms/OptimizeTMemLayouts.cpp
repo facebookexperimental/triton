@@ -284,7 +284,7 @@ public:
     if (!ll)
       return failure();
     Attribute newEncoding =
-        gpu::LinearEncodingAttr::get(tmemStoreOp.getContext(), *ll);
+        gpu::LinearEncodingAttr::get(tmemStoreOp.getContext(), std::move(*ll));
     auto oldType = tmemStoreOp.getSrc().getType();
     auto newType = oldType.cloneWithEncoding(newEncoding);
     if (newType == oldType)
@@ -353,7 +353,7 @@ public:
     if (!ll)
       return failure();
     Attribute newEncoding =
-        gpu::LinearEncodingAttr::get(tmemLoadOp.getContext(), *ll);
+        gpu::LinearEncodingAttr::get(tmemLoadOp.getContext(), std::move(*ll));
     auto newType = oldType.cloneWithEncoding(newEncoding);
     if (newType == oldType)
       return failure();

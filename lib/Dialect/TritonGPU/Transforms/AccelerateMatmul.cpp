@@ -734,7 +734,7 @@ public:
 
       auto ll = triton::gpu::getSM120DotScaledScaleLayout(
           ctx, shape, opIdx, mmaWarps, blocked.getCGALayout());
-      auto newEnc = triton::gpu::LinearEncodingAttr::get(ctx, ll);
+      auto newEnc = triton::gpu::LinearEncodingAttr::get(ctx, std::move(ll));
       auto newTy = RankedTensorType::get(shape, ty.getElementType(), newEnc);
       return ConvertLayoutOp::create(rewriter, scale.getLoc(), newTy, scale);
     };
