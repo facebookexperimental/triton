@@ -202,6 +202,21 @@ LinearLayout nvmmaSharedToLinearLayout(ArrayRef<int64_t> shape,
   auto kOffset = S("offset");
   auto tmaShape = triton::nvidia_gpu::getTMABlockShape(shared, shapePerCTA,
                                                        /*packedSize=*/true);
+  // The memdesc shape rank may exceed the encoding's CGALayout rank (the
+  // verifier allows encoding_rank == shape_rank - 1 for the leading buffer
+  // dimension from local_alloc with num_buffers). Extend the CGALayout by
+  // prepending trivial output dimensions to preserve the original layout.
+  auto cgaLayout = shared.getCGALayout();
+  if (cgaLayout.getRank() < (unsigned)rank) {
+    int extraDims = rank - cgaLayout.getRank();
+    auto bases = cgaLayout.getLinearLayout().getBases();
+    // Insert zeros at the front of each basis vector for the new leading dims.
+    for (auto &[name, bvs] : bases)
+      for (auto &bv : bvs)
+        bv.insert(bv.begin(), extraDims, 0);
+    cgaLayout =
+        CGAEncodingAttr::get(ctx, LinearLayout(bases, standardOutDimNames(ctx, rank)));
+  }
   if (shared.getSwizzlingByteWidth() == 0) {
     auto outDimNames = standardOutDimNames(ctx, rank);
     LinearLayout layout = LinearLayout::identity1D(tmaShape[rank - 1], kOffset,
@@ -210,7 +225,7 @@ LinearLayout nvmmaSharedToLinearLayout(ArrayRef<int64_t> shape,
       layout *= LinearLayout::identity1D(tmaShape[i], kOffset, outDimNames[i]);
     }
     layout = ensureLayoutNotSmallerThan(layout, outDimNames, shapePerCTA);
-    return combineCtaCgaWithShape(layout, shared.getCGALayout(), shape);
+    return combineCtaCgaWithShape(layout, cgaLayout, shape);
   }
   assert(rank >= 2);
 
@@ -268,7 +283,7 @@ LinearLayout nvmmaSharedToLinearLayout(ArrayRef<int64_t> shape,
   reshapedLayout = ensureLayoutNotSmallerThan(
       reshapedLayout, standardOutDimNames(ctx, shapePerCTA.size()),
       shapePerCTA);
-  return combineCtaCgaWithShape(reshapedLayout, shared.getCGALayout(), shape);
+  return combineCtaCgaWithShape(reshapedLayout, cgaLayout, shape);
 }
 
 /// Function to generate lane and warp layout for dot operands.

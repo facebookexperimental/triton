@@ -632,3 +632,28 @@ tt.func @warpgroup_dot_wait_2_inputs(%arg0: tensor<128xf32, #blocked>, %arg1: te
 }
 
 }
+
+// -----
+
+// Test that local_store from #mma to a memdesc_index'd #nvmma_shared works
+// when the shared encoding has rank 2 but the source memdesc is 3D (from
+// local_alloc with num_buffers=1). The memdesc_index result is 2D. This
+// triggered a "Dimensions must match" crash in nvmmaSharedToLinearLayout
+// because combineCtaCgaWithShape received a rank-2 CGALayout for a rank-3
+// shape.
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 128, 16]}>
+#smem = #ttg.shared_memory
+// CHECK-LABEL: local_store_mma_to_indexed_nvmma_shared
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @local_store_mma_to_indexed_nvmma_shared(%a: tensor<128x128xf16, #mma>) {
+    // Verify the pass doesn't crash with a dimension mismatch.
+    // CHECK-COUNT-16: nvvm.stmatrix
+    //          CHECK: llvm.return
+    %c0 = arith.constant 0 : i32
+    %buf = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
+    %view = ttg.memdesc_index %buf[%c0] : !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+    ttg.local_store %a, %view : tensor<128x128xf16, #mma> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
