@@ -214,8 +214,8 @@ LinearLayout nvmmaSharedToLinearLayout(ArrayRef<int64_t> shape,
     for (auto &[name, bvs] : bases)
       for (auto &bv : bvs)
         bv.insert(bv.begin(), extraDims, 0);
-    cgaLayout =
-        CGAEncodingAttr::get(ctx, LinearLayout(bases, standardOutDimNames(ctx, rank)));
+    cgaLayout = CGAEncodingAttr::get(
+        ctx, LinearLayout(bases, standardOutDimNames(ctx, rank)));
   }
   if (shared.getSwizzlingByteWidth() == 0) {
     auto outDimNames = standardOutDimNames(ctx, rank);
