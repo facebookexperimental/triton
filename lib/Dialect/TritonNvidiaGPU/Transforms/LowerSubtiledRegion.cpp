@@ -120,7 +120,7 @@ private:
 
     // 6. Replace op results with teardown yield values.
     auto teardownTerminator =
-        cast<SubtiledRegionTeardownOp>(teardownBlock.getTerminator());
+        cast<SubtiledRegionYieldOp>(teardownBlock.getTerminator());
     for (auto [opResult, teardownVal] :
          llvm::zip(op.getResults(), teardownTerminator.getResults()))
       opResult.replaceAllUsesWith(teardownMapping.lookupOrDefault(teardownVal));

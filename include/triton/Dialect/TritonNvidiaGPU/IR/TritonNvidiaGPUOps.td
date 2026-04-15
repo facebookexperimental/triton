@@ -249,7 +249,7 @@ def TTNG_WaitBarrierOp : TTNG_Op<"wait_barrier", [AttrSizedOperandSegments]> {
     its current phase.
 
     This lowers a waitloop using PTX instruction
-    mbarrier.try_wait.parity.shared.b64.
+    mbarrier.try_wait.parity.shared::cta.b64.
 
     Accepts optional list of memory. If present, it is assumed that any of the
     dependencies may be accessed until the barrier completes.
@@ -1140,10 +1140,10 @@ def TTNG_SubtiledRegionOp : TTNG_Op<"subtiled_region", [
       constants). Terminated by `subtiled_region_yield`.
     - `tileRegion`: per-tile body that is replicated during lowering. Block
       arguments are substituted from setup outputs via `tileMappings`.
-      Terminated by `subtiled_region_return`.
+      Terminated by `subtiled_region_yield`.
     - `teardownRegion`: runs once after all tiles are processed (e.g. final
       reductions, epilogue barriers for FA). Terminated by
-      `subtiled_region_teardown` which yields the op's results.
+      `subtiled_region_yield` which yields the op's results.
 
     `tileMappings` is an array of arrays: one per tile, each entry is an index
     into the setup yield values. The length of each inner array must equal the
@@ -1181,48 +1181,15 @@ def TTNG_SubtiledRegionYieldOp : TTNG_Op<"subtiled_region_yield", [
     Pure, Terminator, ReturnLike,
     ParentOneOf<["SubtiledRegionOp"]>
 ]> {
-  let summary = "Yield values from the setup region of subtiled_region";
+  let summary = "Terminate a region of subtiled_region and optionally yield values";
 
   let description = [{
-    Terminates the setup region of a `subtiled_region` op. The yielded values
-    are referenced by the tile mappings to provide arguments to each tile
-    replication.
-  }];
-
-  let arguments = (ins Variadic<AnyType>:$results);
-  let assemblyFormat = "($results^ `:` type($results))? attr-dict";
-}
-
-//===----------------------------------------------------------------------===//
-// SubtiledRegionReturnOp
-//===----------------------------------------------------------------------===//
-
-def TTNG_SubtiledRegionReturnOp : TTNG_Op<"subtiled_region_return", [
-    Pure, Terminator, ReturnLike,
-    ParentOneOf<["SubtiledRegionOp"]>
-]> {
-  let summary = "Terminate the tile region of subtiled_region";
-
-  let description = [{
-    Terminates the tile region of a `subtiled_region` op. Takes no operands.
-  }];
-
-  let assemblyFormat = "attr-dict";
-}
-
-//===----------------------------------------------------------------------===//
-// SubtiledRegionTeardownOp
-//===----------------------------------------------------------------------===//
-
-def TTNG_SubtiledRegionTeardownOp : TTNG_Op<"subtiled_region_teardown", [
-    Pure, Terminator, ReturnLike,
-    ParentOneOf<["SubtiledRegionOp"]>
-]> {
-  let summary = "Terminate the teardown region of subtiled_region and yield results";
-
-  let description = [{
-    Terminates the teardown region of a `subtiled_region` op. The yielded values
-    become the results of the enclosing `subtiled_region` op.
+    Terminates any region of a `subtiled_region` op.
+    - In the setup region, the yielded values are referenced by the tile
+      mappings to provide arguments to each tile replication.
+    - In the tile region, no values are yielded.
+    - In the teardown region, the yielded values become the results of the
+      enclosing `subtiled_region` op.
   }];
 
   let arguments = (ins Variadic<AnyType>:$results);

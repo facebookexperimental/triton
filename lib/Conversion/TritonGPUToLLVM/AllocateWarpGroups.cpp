@@ -80,32 +80,7 @@ struct AllocateWarpGroups
       padToMaxWarpGroups(op, numExtraWarpGroups);
     });
 
-    // Determine the maximum number of registers per thread. This may have
-    // been set by the user.
-    int threadsPerWarp = TritonGPUDialect::getThreadsPerWarp(mod);
     int baseNumWarps = lookupNumWarps(mod);
-    int maxnreg;
-    if (auto maxnregAttr =
-            mod->getAttrOfType<IntegerAttr>(AttrMaxRegistersName)) {
-      maxnreg = maxnregAttr.getInt();
-    } else {
-      // Assume the user wants to use all 64K registers.
-      maxnreg = (64 * 1024) / (baseNumWarps + numExtraWarpGroups * 4) /
-                threadsPerWarp;
-      maxnreg = maxnreg / 8 * 8;
-    }
-
-    struct WarpGroupInfo {
-      SmallVector<Region *> partitions;
-      int maxRequestedRegs = 0;
-      unsigned numWarps = 0;
-    };
-    struct WarpGroupPartition {
-      int startId;
-      Region *partition;
-      int32_t estRegs;
-      int numWarps;
-    };
 
     // Compute the total number of warps required at any given time.
     mod.walk([&](WarpSpecializeOp op) {
@@ -155,6 +130,51 @@ struct AllocateWarpGroups
         }
       }
       op.setWarpGroupStartIds(startIds);
+    });
+
+    Builder b(&getContext());
+    mod->setAttr("ttg.total-num-warps",
+                 b.getI32IntegerAttr(baseNumWarps + numExtraWarpGroups * 4));
+
+    bool needsRegisterOptimization = false;
+    mod.walk([&](WarpSpecializeOp op) {
+      if (op.getRequestedRegisters())
+        needsRegisterOptimization = true;
+    });
+
+    if (!needsRegisterOptimization)
+      return;
+
+    // Determine the maximum number of registers per thread. This may have
+    // been set by the user.
+    int threadsPerWarp = TritonGPUDialect::getThreadsPerWarp(mod);
+    int maxnreg;
+    if (auto maxnregAttr =
+            mod->getAttrOfType<IntegerAttr>(AttrMaxRegistersName)) {
+      maxnreg = maxnregAttr.getInt();
+    } else {
+      // Assume the user wants to use all 64K registers.
+      maxnreg = (64 * 1024) / (baseNumWarps + numExtraWarpGroups * 4) /
+                threadsPerWarp;
+      maxnreg = maxnreg / 8 * 8;
+    }
+
+    struct WarpGroupInfo {
+      SmallVector<Region *> partitions;
+      int maxRequestedRegs = 0;
+      unsigned numWarps = 0;
+    };
+    struct WarpGroupPartition {
+      int startId;
+      Region *partition;
+      int32_t estRegs;
+      int numWarps;
+    };
+
+    // Compute register allocation for each warp specialize op.
+    mod.walk([&](WarpSpecializeOp op) {
+      ArrayRef<int32_t> arr = op.getPartitionNumWarps();
+      auto startIds = *op.getWarpGroupStartIds();
 
       // Require that an estimate has been set and that we have even warpgroups.
       auto regsAttr = op.getRequestedRegisters();
@@ -219,10 +239,6 @@ struct AllocateWarpGroups
       mod->setAttr(AttrMaxRegistersName,
                    Builder(op.getContext()).getI32IntegerAttr(maxnreg));
     });
-
-    Builder b(&getContext());
-    mod->setAttr("ttg.total-num-warps",
-                 b.getI32IntegerAttr(baseNumWarps + numExtraWarpGroups * 4));
   }
 };
 } // namespace

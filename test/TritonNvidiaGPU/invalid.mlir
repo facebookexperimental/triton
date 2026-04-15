@@ -197,9 +197,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %c0 = arith.constant 0.0 : f32
         ttng.subtiled_region_yield %c0 : f32
       } tile(%arg0: f32) {
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       } teardown {
-        ttng.subtiled_region_teardown
+        ttng.subtiled_region_yield
       }
     tt.return
   }
@@ -224,9 +224,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %c1 = arith.constant 1 : i32
         ttng.subtiled_region_yield %c0, %c1 : i32, i32
       } tile(%arg0: i32, %arg1: i32) {
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       } teardown {
-        ttng.subtiled_region_teardown
+        ttng.subtiled_region_yield
       }
     tt.return
   }
@@ -251,9 +251,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %c1 = arith.constant 1 : i32
         ttng.subtiled_region_yield %c0, %c1 : i32, i32
       } tile(%arg0: i32) {
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       } teardown {
-        ttng.subtiled_region_teardown
+        ttng.subtiled_region_yield
       }
     tt.return
   }
@@ -277,9 +277,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %c0 = arith.constant 0 : i32
         ttng.subtiled_region_yield %c0 : i32
       } tile(%arg0: f32) {
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       } teardown {
-        ttng.subtiled_region_teardown
+        ttng.subtiled_region_yield
       }
     tt.return
   }
@@ -307,9 +307,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         ttng.subtiled_region_yield %c0 : i32
       } tile(%arg0: i32) {
         %res = arith.addi %arg0, %arg0 : i32
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       } teardown {
-        ttng.subtiled_region_teardown
+        ttng.subtiled_region_yield
       }
     tt.return
   }
@@ -338,9 +338,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         ttng.subtiled_region_yield %c0 : i32
       } tile(%arg0: i32) {
         %res = arith.addi %arg0, %arg0 : i32
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       } teardown {
-        ttng.subtiled_region_teardown
+        ttng.subtiled_region_yield
       }
     tt.return
   }
@@ -368,9 +368,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         ttng.subtiled_region_yield %c0 : i32
       } tile(%arg0: i32) {
         %res = arith.addi %arg0, %arg0 : i32
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       } teardown {
-        ttng.subtiled_region_teardown
+        ttng.subtiled_region_yield
       }
     tt.return
   }
@@ -398,9 +398,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         ttng.subtiled_region_yield %c0 : i32
       } tile(%arg0: i32) {
         %res = arith.addi %arg0, %arg0 : i32
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       } teardown {
-        ttng.subtiled_region_teardown
+        ttng.subtiled_region_yield
       }
     tt.return
   }
@@ -424,10 +424,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %c0 = arith.constant 0 : i32
         ttng.subtiled_region_yield %c0 : i32
       } tile(%arg0: i32) {
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       } teardown {
         %c42 = arith.constant 42 : i32
-        ttng.subtiled_region_teardown %c42 : i32
+        ttng.subtiled_region_yield %c42 : i32
       }
     tt.return
   }

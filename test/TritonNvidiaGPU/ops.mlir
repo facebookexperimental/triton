@@ -112,9 +112,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     // CHECK: setup
     // CHECK: ttng.subtiled_region_yield
     // CHECK: tile
-    // CHECK: ttng.subtiled_region_return
+    // CHECK: ttng.subtiled_region_yield
     // CHECK: teardown
-    // CHECK: ttng.subtiled_region_teardown
+    // CHECK: ttng.subtiled_region_yield
     ttng.subtiled_region
         barriers(%bar : !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>)
         phases(%phase : i32)
@@ -129,9 +129,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
         ttng.subtiled_region_yield %c0, %c1 : i32, i32
       } tile(%arg0: i32) {
         %res = arith.addi %arg0, %arg0 : i32
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       } teardown {
-        ttng.subtiled_region_teardown
+        ttng.subtiled_region_yield
       }
     tt.return
   }

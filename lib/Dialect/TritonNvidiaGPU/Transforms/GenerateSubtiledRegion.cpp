@@ -220,12 +220,12 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
 
   for (Operation *op : chain0)
     tileBuilder.clone(*op, tileMapping);
-  SubtiledRegionReturnOp::create(tileBuilder, loc);
+  SubtiledRegionYieldOp::create(tileBuilder, loc, ValueRange{});
 
   // --- Teardown Region ---
   Block *teardownBlock = &regionOp.getTeardownRegion().emplaceBlock();
   OpBuilder teardownBuilder = OpBuilder::atBlockEnd(teardownBlock);
-  SubtiledRegionTeardownOp::create(teardownBuilder, loc, ValueRange{});
+  SubtiledRegionYieldOp::create(teardownBuilder, loc, ValueRange{});
 
   // --- Erase original ops (reverse program order) ---
   for (Operation *op : llvm::reverse(chain1))

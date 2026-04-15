@@ -559,13 +559,18 @@ static void createRelinquishAlloc(IRRewriter &rewriter, Location loc,
 }
 
 void freeTMAlloc(LLVM::LLVMFuncOp func, Value alloc, size_t size, Value pred,
-                 bool twoCTAs) {
+                 bool twoCTAs, bool tlxPairedMMA) {
   func.walk([&](LLVM::ReturnOp ret) {
     OpBuilder b(ret);
     auto ctx = ret->getContext();
     auto loc = ret.getLoc();
     auto voidTy = void_ty(ctx);
-    NVVM::Barrier0Op::create(b, loc);
+    if (twoCTAs && !tlxPairedMMA) {
+      NVVM::ClusterArriveOp::create(b, loc, UnitAttr::get(ctx));
+      NVVM::ClusterWaitOp::create(b, loc, UnitAttr::get(ctx));
+    } else {
+      NVVM::Barrier0Op::create(b, loc);
+    }
     PTXBuilder ptxBuilder;
     // Calculate the predicate in the inline asm to avoid creating long
     // liveranges.
@@ -600,8 +605,9 @@ static Value initTensorMemory(LLVM::LLVMFuncOp func) {
     return LLVM::UndefOp::create(rewriter, loc, ptr_ty(ctx, 6));
   }
 
+  bool isTlxPairedMMA = tlx::tlxEnablePairedMMA(mod);
   bool useTwoCTAs = mlir::triton::nvidia_gpu::getModuleTwoCTAs(mod) ||
-                    tlx::tlxEnablePairedMMA(mod);
+                    isTlxPairedMMA;
   // This code is only executed by the default warp group.
   Value threadId = NVVM::ThreadIdXOp::create(rewriter, loc, i32_ty);
   Value pred = b.icmp_ult(threadId, b.i32_val(32));
@@ -609,7 +615,7 @@ static Value initTensorMemory(LLVM::LLVMFuncOp func) {
   createRelinquishAlloc(rewriter, loc, pred, useTwoCTAs);
   // TODO: pred will have a long liverange, we need to check if this is a
   // problem and how it can be fixed.
-  freeTMAlloc(func, alloc, size, pred, useTwoCTAs);
+  freeTMAlloc(func, alloc, size, pred, useTwoCTAs, isTlxPairedMMA);
   return alloc;
 }
 

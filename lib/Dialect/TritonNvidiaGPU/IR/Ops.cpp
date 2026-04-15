@@ -518,6 +518,10 @@ LogicalResult TCGen5MMAOp::verify() {
     return emitOpError("The col stride of the return operand must be 32 / ")
            << retType.getElementTypeBitWidth() << " but got "
            << retEnc.getColStride();
+  // The maximum size of a MMA instruction is 128x256
+  if (retEnc.getBlockN() > 256)
+    return emitOpError("The block size of the return operand must be less than "
+                       "or equal to 256");
 
   // if (getTwoCtas()) {
   // Once we have a `block` dimension in TMEM, we can look at this via the
@@ -621,6 +625,11 @@ Value TCGen5MMAOp::useAccumulator() { return getUseD(); }
 
 void TCGen5MMAOp::setUseAccumulator(Value flag) {
   getUseDMutable().assign(flag);
+}
+
+ValueRange TCGen5MMAOp::getCompletionBarriers() { return getBarriers(); }
+ValueRange TCGen5MMAOp::getCompletionBarrierPreds() {
+  return getBarrierPreds();
 }
 
 void TCGen5MMAOp::addCompletionBarrier(Value barrier, Value pred) {
@@ -782,6 +791,11 @@ Value TCGen5MMAScaledOp::useAccumulator() { return getUseD(); }
 
 void TCGen5MMAScaledOp::setUseAccumulator(Value flag) {
   getUseDMutable().assign(flag);
+}
+
+ValueRange TCGen5MMAScaledOp::getCompletionBarriers() { return getBarriers(); }
+ValueRange TCGen5MMAScaledOp::getCompletionBarrierPreds() {
+  return getBarrierPreds();
 }
 
 void TCGen5MMAScaledOp::addCompletionBarrier(Value barrier, Value pred) {
@@ -1081,21 +1095,20 @@ LogicalResult SubtiledRegionOp::verify() {
     return emitOpError("setup region must terminate with "
                        "'ttng.subtiled_region_yield'");
 
-  // 2. Tile region terminates with SubtiledRegionReturnOp
+  // 2. Tile region terminates with SubtiledRegionYieldOp
   auto &tileBlock = getTileRegion().front();
-  if (!isa<SubtiledRegionReturnOp>(tileBlock.getTerminator()))
+  if (!isa<SubtiledRegionYieldOp>(tileBlock.getTerminator()))
     return emitOpError("tile region must terminate with "
-                       "'ttng.subtiled_region_return'");
+                       "'ttng.subtiled_region_yield'");
 
-  // 3. Teardown region terminates with SubtiledRegionTeardownOp
+  // 3. Teardown region terminates with SubtiledRegionYieldOp
   auto &teardownBlock = getTeardownRegion().front();
-  if (!isa<SubtiledRegionTeardownOp>(teardownBlock.getTerminator()))
+  if (!isa<SubtiledRegionYieldOp>(teardownBlock.getTerminator()))
     return emitOpError("teardown region must terminate with "
-                       "'ttng.subtiled_region_teardown'");
+                       "'ttng.subtiled_region_yield'");
 
   // 4. Teardown results must match op results
-  auto teardownOp =
-      cast<SubtiledRegionTeardownOp>(teardownBlock.getTerminator());
+  auto teardownOp = cast<SubtiledRegionYieldOp>(teardownBlock.getTerminator());
   if (teardownOp.getResults().size() != getNumResults())
     return emitOpError("teardown yields ")
            << teardownOp.getResults().size() << " values but op has "
