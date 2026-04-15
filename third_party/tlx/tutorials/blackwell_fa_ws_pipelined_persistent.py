@@ -2154,7 +2154,10 @@ def _bwd_compute_inner_loop(
             tlx.local_store(ds_tiles[ds_buf_id], dsT)
             tlx.fence("async_shared")
             tlx.barrier_arrive(ds_fulls[ds_buf_id])
-        tlx.barrier_arrive(dsT_tmem_fulls[ds_buf_id])
+        if USE_2CTA:
+            tlx.barrier_arrive(dsT_tmem_fulls[ds_buf_id], 1, remote_cta_rank=0)
+        else:
+            tlx.barrier_arrive(dsT_tmem_fulls[ds_buf_id])
 
         curr_m += step_m
         blk_idx += 1
@@ -2281,7 +2284,7 @@ def _attn_bwd_ws(
         ds_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=8)
     else:
         ds_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM, arrive_count=NUM_CTAS)
-    dsT_tmem_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS)
+    dsT_tmem_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS, arrive_count=NUM_CTAS)
 
     # allocate tmem buffers
     # S/P/dQ share TMEM via storage alias. S and P fully overlap (shared).
