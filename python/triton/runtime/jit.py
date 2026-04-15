@@ -26,7 +26,22 @@ TRITON_MODULE = "triton.language"
 GLUON_MODULE = "triton.experimental.gluon.language"
 
 # Structured cache entry for the Layer 1 identity-based fast path.
-_LastCall = namedtuple("_LastCall", ["device", "args", "kernel", "bound_vals", "instrumentation_mode"])
+# A namedtuple is used so guard code can use readable .field access while
+# the hot launch path uses fast [index] access (same cost as plain tuple).
+_LastCall = namedtuple("_LastCall", [
+    "device",
+    "args",
+    "kernel",
+    "bound_vals",
+    "launch_fn",
+    "function",
+    "packed_metadata",
+    "coop",
+    "cluster",
+    "pdl",
+    "no_scratch",
+    "instrumentation_mode",
+])
 
 T = TypeVar("T")
 
@@ -803,6 +818,33 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
         return options, signature, constexprs, attrs
 
+    def _fast_launch(self, kernel, grid, stream, bound_vals, launch_fn, function, packed_metadata, coop, cluster, pdl,
+                     no_scratch):
+        """Resolve grid and dispatch kernel using cached launch properties.
+
+        Shared between Layer 1 and Layer 2 fast paths to avoid code
+        divergence — any change to the launch sequence only needs to
+        happen in one place.
+        """
+        assert grid is not None
+        if callable(grid):
+            grid = grid(dict(zip(self.arg_names, bound_vals)))
+        grid_size = len(grid)
+        grid_0 = grid[0]
+        grid_1 = grid[1] if grid_size > 1 else 1
+        grid_2 = grid[2] if grid_size > 2 else 1
+        launch_enter = knobs.runtime.launch_enter_hook
+        launch_exit = knobs.runtime.launch_exit_hook
+        launch_metadata = None
+        if launch_enter is not None:
+            launch_metadata = kernel.launch_metadata(grid, stream, *bound_vals)
+        if no_scratch:
+            launch_fn(grid_0, grid_1, grid_2, stream, function, coop, cluster, pdl, None, None, packed_metadata,
+                      launch_metadata, launch_enter, launch_exit, *bound_vals)
+        else:
+            kernel.run(grid_0, grid_1, grid_2, stream, function, packed_metadata, launch_metadata, launch_enter,
+                       launch_exit, *bound_vals)
+
     def clear_fast_path_caches(self):
         """Invalidate Layer 1 (identity) and Layer 2 (signature) fast-path caches.
 
@@ -823,6 +865,13 @@ class JITFunction(JITCallable, KernelInterface[T]):
         # skip the binder, cache key computation, and most dispatch overhead.
         # This is just N pointer comparisons with zero attribute access.
         if not warmup and not self.pre_run_hooks and not knobs.compilation.always_compile:
+            # `last` is a _LastCall namedtuple built by _make_launch_cache():
+            #   [0]  device              [1]  args               [2]  kernel
+            #   [3]  bound_vals          [4]  launch_fn          [5]  function
+            #   [6]  packed_metadata     [7]  coop               [8]  cluster
+            #   [9]  pdl                 [10] no_scratch          [11] instrumentation_mode
+            # Guard code uses .field access for readability; the hot launch
+            # path uses [index] access (same cost as plain tuple on namedtuple).
             last = self._last_call
             if last is not None and last.device is device and last.instrumentation_mode == knobs.compilation.instrumentation_mode:
                 last_args = last.args
@@ -851,17 +900,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
                                     break
                         if kernel is not None:
                             bound_vals = last.bound_vals
-                            assert grid is not None
-                            if callable(grid):
-                                grid = grid(dict(zip(self.arg_names, bound_vals)))
-                            grid_size = len(grid)
-                            grid_0 = grid[0]
-                            grid_1 = grid[1] if grid_size > 1 else 1
-                            grid_2 = grid[2] if grid_size > 2 else 1
-                            launch_metadata = kernel.launch_metadata(grid, stream, *bound_vals)
-                            kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata,
-                                       launch_metadata, knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook,
-                                       *bound_vals)
+                            self._fast_launch(kernel, grid, stream, bound_vals, *last[4:11])
                             return kernel
 
             # Layer 2: Signature-based dict lookup.
@@ -871,9 +910,14 @@ class JITFunction(JITCallable, KernelInterface[T]):
             # current args for launch (not cached bound_vals — those point to old data).
             fast_key = self._compute_fast_key(args, kwargs, device)
             if fast_key is not None:
-                cached_kernel = self._run_cache.get(fast_key)
-                if cached_kernel is not None:
-                    kernel = cached_kernel
+                # `cached` is _last_call[2:] -- same layout as `last` above but
+                # without device/args (indices shifted down by 2):
+                #   [0] kernel  [1] bound_vals  [2] launch_fn  [3] function
+                #   [4] packed_metadata  [5] coop  [6] cluster  [7] pdl
+                #   [8] no_scratch  [9] instrumentation_mode
+                cached = self._run_cache.get(fast_key)
+                if cached is not None:
+                    kernel = cached[0]
                     if self.used_global_vals:
                         not_present = object()
                         for (name, _), (val, globals_dict) in self.used_global_vals.items():
@@ -889,19 +933,8 @@ class JITFunction(JITCallable, KernelInterface[T]):
                             bound_dict = dict(zip(param_names, args))
                             bound_dict.update(kwargs)
                             bound_vals = tuple(bound_dict[n] for n in param_names)
-                        assert grid is not None
-                        if callable(grid):
-                            grid = grid(dict(zip(self.arg_names, bound_vals)))
-                        grid_size = len(grid)
-                        grid_0 = grid[0]
-                        grid_1 = grid[1] if grid_size > 1 else 1
-                        grid_2 = grid[2] if grid_size > 2 else 1
-                        launch_metadata = kernel.launch_metadata(grid, stream, *bound_vals)
-                        kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata,
-                                   launch_metadata, knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook,
-                                   *bound_vals)
-                        self._last_call = _LastCall(device, args, kernel, bound_vals,
-                                                    knobs.compilation.instrumentation_mode)
+                        self._fast_launch(kernel, grid, stream, bound_vals, *cached[2:9])
+                        self._last_call = self._make_launch_cache(device, args, kernel, bound_vals)
                         self._last_kwargs = dict(kwargs) if kwargs else {}
                         return kernel
         _user_kwargs = dict(kwargs) if kwargs else {}
@@ -989,13 +1022,36 @@ class JITFunction(JITCallable, KernelInterface[T]):
             # if pre_run_hooks are active, the compiled kernel may depend on
             # hook-controlled state that the fast path doesn't check.
             if not self.pre_run_hooks and not knobs.compilation.always_compile:
-                self._last_call = _LastCall(device, args, kernel, tuple(bound_args.values()),
-                                            knobs.compilation.instrumentation_mode)
+                self._last_call = self._make_launch_cache(device, args, kernel, tuple(bound_args.values()))
                 self._last_kwargs = _user_kwargs
-            if fast_key is not None:
-                self._run_cache[fast_key] = kernel
+                if fast_key is not None:
+                    self._run_cache[fast_key] = self._last_call[2:]  # skip device, args
 
         return kernel
+
+    @staticmethod
+    def _make_launch_cache(device, args, kernel, bound_vals):
+        """Build a _LastCall namedtuple caching everything needed for fast-path launch.
+
+        Returns a 12-element _LastCall -- see the layout comment in run()
+        above ``last = self._last_call``.  Layer 2 stores ``tuple[2:]``
+        (without device/args) in ``_run_cache``.
+        """
+        launcher = kernel.run  # CudaLauncher instance (resolves property once)
+        return _LastCall(
+            device=device,
+            args=args,
+            kernel=kernel,
+            bound_vals=bound_vals,
+            launch_fn=launcher.launch,
+            function=kernel.function,
+            packed_metadata=kernel.packed_metadata,
+            coop=launcher.launch_cooperative_grid,
+            cluster=launcher.launch_cluster,
+            pdl=launcher.launch_pdl,
+            no_scratch=launcher.global_scratch_size == 0 and launcher.profile_scratch_size == 0,
+            instrumentation_mode=knobs.compilation.instrumentation_mode,
+        )
 
     def repr(self, _):
         return self._fn_name if self._repr is None else self._repr(_)
@@ -1023,7 +1079,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
         self.device_caches = _DeviceCaches(self, self.create_binder)
 
         # Last-call cache for identity-based fast path (Layer 1).
-        # Stores a _LastCall namedtuple from the previous successful launch.
+        # _LastCall namedtuple built by _make_launch_cache(); see run() for layout.
         self._last_call = None
         self._last_kwargs = {}
         # Signature-based fast-path cache (Layer 2).
