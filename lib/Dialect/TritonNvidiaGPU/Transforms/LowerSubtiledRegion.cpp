@@ -17,10 +17,10 @@ static void emitBarrierOp(OpBuilder &builder, Location loc,
   unsigned idx = annotation.getBarrierIdx();
   StringRef kind = annotation.getBarrierOpKind().getValue();
   if (kind == "wait_barrier") {
-    builder.create<WaitBarrierOp>(loc, barriers[idx], phases[idx]);
+    WaitBarrierOp::create(builder, loc, barriers[idx], phases[idx]);
   } else {
     assert(kind == "arrive_barrier");
-    builder.create<ArriveBarrierOp>(loc, barriers[idx], annotation.getCount());
+    ArriveBarrierOp::create(builder, loc, barriers[idx], annotation.getCount());
   }
 }
 
@@ -57,17 +57,18 @@ private:
     for (Value v : yieldOp.getResults())
       setupOutputs.push_back(setupMapping.lookupOrDefault(v));
 
-    // 3. Pre-process barrier annotations.
-    //    beforeFirst[opName] -> annotations with placement=BEFORE
-    //    afterLast[opName]   -> annotations with placement=AFTER
-    llvm::StringMap<SmallVector<BarrierAnnotationAttr>> beforeFirst, afterLast;
+    // 3. Pre-process barrier annotations by target op index.
+    //    beforeFirst[opIdx] -> annotations with placement=BEFORE
+    //    afterLast[opIdx]   -> annotations with placement=AFTER
+    llvm::DenseMap<unsigned, SmallVector<BarrierAnnotationAttr>> beforeFirst,
+        afterLast;
     for (Attribute attr : op.getBarrierAnnotations()) {
       auto annotation = cast<BarrierAnnotationAttr>(attr);
-      StringRef opName = annotation.getTargetOpName().getValue();
+      unsigned opIdx = annotation.getTargetOpIdx();
       if (annotation.getPlacement() == BarrierPlacement::BEFORE)
-        beforeFirst[opName].push_back(annotation);
+        beforeFirst[opIdx].push_back(annotation);
       else
-        afterLast[opName].push_back(annotation);
+        afterLast[opIdx].push_back(annotation);
     }
 
     ArrayAttr tileMappings = op.getTileMappings();
@@ -86,12 +87,11 @@ private:
       for (auto [j, idx] : llvm::enumerate(indices.asArrayRef()))
         tileMapping.map(tileBlock.getArgument(j), setupOutputs[idx]);
 
+      unsigned opIdx = 0;
       for (Operation &tileOp : tileBlock.without_terminator()) {
-        StringRef opName = tileOp.getName().getStringRef();
-
-        // Before first tile: emit BEFORE annotations
+        // Before first tile: emit BEFORE annotations for this op index
         if (tileIdx == 0) {
-          auto it = beforeFirst.find(opName);
+          auto it = beforeFirst.find(opIdx);
           if (it != beforeFirst.end()) {
             for (auto &annotation : it->second)
               emitBarrierOp(builder, loc, annotation, barriers, phases);
@@ -100,18 +100,32 @@ private:
 
         builder.clone(tileOp, tileMapping);
 
-        // After last tile: emit AFTER annotations
+        // After last tile: emit AFTER annotations for this op index
         if (tileIdx == numTiles - 1) {
-          auto it = afterLast.find(opName);
+          auto it = afterLast.find(opIdx);
           if (it != afterLast.end()) {
             for (auto &annotation : it->second)
               emitBarrierOp(builder, loc, annotation, barriers, phases);
           }
         }
+        ++opIdx;
       }
     }
 
-    // 5. Erase the SubtiledRegionOp.
+    // 5. Clone teardown region ops (except terminator) and collect results.
+    Block &teardownBlock = op.getTeardownRegion().front();
+    IRMapping teardownMapping;
+    for (Operation &teardownOp : teardownBlock.without_terminator())
+      builder.clone(teardownOp, teardownMapping);
+
+    // 6. Replace op results with teardown yield values.
+    auto teardownTerminator =
+        cast<SubtiledRegionTeardownOp>(teardownBlock.getTerminator());
+    for (auto [opResult, teardownVal] :
+         llvm::zip(op.getResults(), teardownTerminator.getResults()))
+      opResult.replaceAllUsesWith(teardownMapping.lookupOrDefault(teardownVal));
+
+    // 7. Erase the SubtiledRegionOp.
     op.erase();
   }
 };

@@ -1135,19 +1135,23 @@ def TTNG_SubtiledRegionOp : TTNG_Op<"subtiled_region", [
     This gives the compiler a structured way to reason about per-tile operations
     and barrier placement.
 
-    The op has two regions:
+    The op has three regions:
     - `setupRegion`: computes subtile values (e.g. tmem_subslice + tmem_load,
       constants). Terminated by `subtiled_region_yield`.
     - `tileRegion`: per-tile body that is replicated during lowering. Block
       arguments are substituted from setup outputs via `tileMappings`.
       Terminated by `subtiled_region_return`.
+    - `teardownRegion`: runs once after all tiles are processed (e.g. final
+      reductions, epilogue barriers for FA). Terminated by
+      `subtiled_region_teardown` which yields the op's results.
 
     `tileMappings` is an array of arrays: one per tile, each entry is an index
     into the setup yield values. The length of each inner array must equal the
     number of tile block arguments.
 
     `barrierAnnotations` describes where to insert barrier operations during
-    lowering, relative to the first or last tile.
+    lowering. Each annotation references a target op by index in the tile body
+    (0-based, non-terminator ops only).
   }];
 
   let arguments = (ins
@@ -1157,9 +1161,12 @@ def TTNG_SubtiledRegionOp : TTNG_Op<"subtiled_region", [
     ArrayAttr:$barrierAnnotations
   );
 
+  let results = (outs Variadic<AnyType>:$results);
+
   let regions = (region
     SizedRegion<1>:$setupRegion,
-    SizedRegion<1>:$tileRegion
+    SizedRegion<1>:$tileRegion,
+    SizedRegion<1>:$teardownRegion
   );
 
   let hasCustomAssemblyFormat = 1;
@@ -1201,6 +1208,25 @@ def TTNG_SubtiledRegionReturnOp : TTNG_Op<"subtiled_region_return", [
   }];
 
   let assemblyFormat = "attr-dict";
+}
+
+//===----------------------------------------------------------------------===//
+// SubtiledRegionTeardownOp
+//===----------------------------------------------------------------------===//
+
+def TTNG_SubtiledRegionTeardownOp : TTNG_Op<"subtiled_region_teardown", [
+    Pure, Terminator, ReturnLike,
+    ParentOneOf<["SubtiledRegionOp"]>
+]> {
+  let summary = "Terminate the teardown region of subtiled_region and yield results";
+
+  let description = [{
+    Terminates the teardown region of a `subtiled_region` op. The yielded values
+    become the results of the enclosing `subtiled_region` op.
+  }];
+
+  let arguments = (ins Variadic<AnyType>:$results);
+  let assemblyFormat = "($results^ `:` type($results))? attr-dict";
 }
 
 #endif

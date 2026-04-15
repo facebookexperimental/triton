@@ -198,6 +198,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         ttng.subtiled_region_yield %c0 : f32
       } tile(%arg0: f32) {
         ttng.subtiled_region_return
+      } teardown {
+        ttng.subtiled_region_teardown
       }
     tt.return
   }
@@ -223,6 +225,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         ttng.subtiled_region_yield %c0, %c1 : i32, i32
       } tile(%arg0: i32, %arg1: i32) {
         ttng.subtiled_region_return
+      } teardown {
+        ttng.subtiled_region_teardown
       }
     tt.return
   }
@@ -248,6 +252,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         ttng.subtiled_region_yield %c0, %c1 : i32, i32
       } tile(%arg0: i32) {
         ttng.subtiled_region_return
+      } teardown {
+        ttng.subtiled_region_teardown
       }
     tt.return
   }
@@ -272,6 +278,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         ttng.subtiled_region_yield %c0 : i32
       } tile(%arg0: f32) {
         ttng.subtiled_region_return
+      } teardown {
+        ttng.subtiled_region_teardown
       }
     tt.return
   }
@@ -291,15 +299,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         phases(%phase : i32)
         tile_mappings = [array<i32: 0>]
         barrier_annotations = [
-          #ttng.barrier_annotation<barrierIdx = 3 : ui32, placement = after,
-              targetOpName = "tt.store", barrierOpKind = "arrive_barrier",
-              count = 1 : ui32>
+          #ttng.barrier_annotation<barrierIdx = 3, placement = after,
+              targetOpIdx = 0, barrierOpKind = "arrive_barrier">
         ]
       setup {
         %c0 = arith.constant 0 : i32
         ttng.subtiled_region_yield %c0 : i32
       } tile(%arg0: i32) {
+        %res = arith.addi %arg0, %arg0 : i32
         ttng.subtiled_region_return
+      } teardown {
+        ttng.subtiled_region_teardown
       }
     tt.return
   }
@@ -320,15 +330,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         phases(%phase : i32)
         tile_mappings = [array<i32: 0>]
         barrier_annotations = [
-          #ttng.barrier_annotation<barrierIdx = 1 : ui32, placement = before,
-              targetOpName = "arith.addi", barrierOpKind = "wait_barrier",
-              count = 1 : ui32>
+          #ttng.barrier_annotation<barrierIdx = 1, placement = before,
+              targetOpIdx = 0, barrierOpKind = "wait_barrier">
         ]
       setup {
         %c0 = arith.constant 0 : i32
         ttng.subtiled_region_yield %c0 : i32
       } tile(%arg0: i32) {
+        %res = arith.addi %arg0, %arg0 : i32
         ttng.subtiled_region_return
+      } teardown {
+        ttng.subtiled_region_teardown
       }
     tt.return
   }
@@ -348,15 +360,74 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         phases(%phase : i32)
         tile_mappings = [array<i32: 0>]
         barrier_annotations = [
-          #ttng.barrier_annotation<barrierIdx = 0 : ui32, placement = after,
-              targetOpName = "tt.store", barrierOpKind = "bogus",
-              count = 1 : ui32>
+          #ttng.barrier_annotation<barrierIdx = 0, placement = after,
+              targetOpIdx = 0, barrierOpKind = "bogus">
         ]
       setup {
         %c0 = arith.constant 0 : i32
         ttng.subtiled_region_yield %c0 : i32
       } tile(%arg0: i32) {
+        %res = arith.addi %arg0, %arg0 : i32
         ttng.subtiled_region_return
+      } teardown {
+        ttng.subtiled_region_teardown
+      }
+    tt.return
+  }
+}
+
+// -----
+
+// Verify: targetOpIdx out of range
+#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func @subtiled_region_target_op_idx_out_of_range(
+      %bar: !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>,
+      %phase: i32) {
+    // expected-error @+1 {{barrierAnnotations[0] has targetOpIdx=5 but tile region has only 1 non-terminator ops}}
+    ttng.subtiled_region
+        barriers(%bar : !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>)
+        phases(%phase : i32)
+        tile_mappings = [array<i32: 0>]
+        barrier_annotations = [
+          #ttng.barrier_annotation<barrierIdx = 0, placement = after,
+              targetOpIdx = 5, barrierOpKind = "arrive_barrier">
+        ]
+      setup {
+        %c0 = arith.constant 0 : i32
+        ttng.subtiled_region_yield %c0 : i32
+      } tile(%arg0: i32) {
+        %res = arith.addi %arg0, %arg0 : i32
+        ttng.subtiled_region_return
+      } teardown {
+        ttng.subtiled_region_teardown
+      }
+    tt.return
+  }
+}
+
+// -----
+
+// Verify: teardown result count mismatch
+#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func @subtiled_region_teardown_result_mismatch(
+      %bar: !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>,
+      %phase: i32) {
+    // expected-error @+1 {{teardown yields 1 values but op has 0 results}}
+    ttng.subtiled_region
+        barriers(%bar : !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>)
+        phases(%phase : i32)
+        tile_mappings = [array<i32: 0>]
+        barrier_annotations = []
+      setup {
+        %c0 = arith.constant 0 : i32
+        ttng.subtiled_region_yield %c0 : i32
+      } tile(%arg0: i32) {
+        ttng.subtiled_region_return
+      } teardown {
+        %c42 = arith.constant 42 : i32
+        ttng.subtiled_region_teardown %c42 : i32
       }
     tt.return
   }

@@ -107,7 +107,10 @@ def TTNG_BarrierAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnota
 
     - `barrierIdx`: index into the op's barriers operand list
     - `placement`: BEFORE first tile or AFTER last tile
-    - `targetOpName`: registered op name to anchor the barrier to
+    - `targetOpIdx`: index of the target op in the tile region body (0-based,
+      counting only non-terminator ops). The barrier is placed immediately
+      before (BEFORE placement, first tile) or after (AFTER placement, last
+      tile) this op.
     - `barrierOpKind`: "wait_barrier" or "arrive_barrier"
     - `count`: arrive count for arrive_barrier (default 1)
   }];
@@ -115,7 +118,7 @@ def TTNG_BarrierAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnota
     ins
     "unsigned":$barrierIdx,
     "BarrierPlacement":$placement,
-    "StringAttr":$targetOpName,
+    "unsigned":$targetOpIdx,
     "StringAttr":$barrierOpKind,
     DefaultValuedParameter<"unsigned", "1">:$count
   );

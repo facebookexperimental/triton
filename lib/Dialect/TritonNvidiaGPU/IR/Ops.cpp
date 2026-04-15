@@ -1087,36 +1087,58 @@ LogicalResult SubtiledRegionOp::verify() {
     return emitOpError("tile region must terminate with "
                        "'ttng.subtiled_region_return'");
 
+  // 3. Teardown region terminates with SubtiledRegionTeardownOp
+  auto &teardownBlock = getTeardownRegion().front();
+  if (!isa<SubtiledRegionTeardownOp>(teardownBlock.getTerminator()))
+    return emitOpError("teardown region must terminate with "
+                       "'ttng.subtiled_region_teardown'");
+
+  // 4. Teardown results must match op results
+  auto teardownOp =
+      cast<SubtiledRegionTeardownOp>(teardownBlock.getTerminator());
+  if (teardownOp.getResults().size() != getNumResults())
+    return emitOpError("teardown yields ")
+           << teardownOp.getResults().size() << " values but op has "
+           << getNumResults() << " results";
+  for (auto [i, pair] :
+       llvm::enumerate(llvm::zip(teardownOp.getResults(), getResults()))) {
+    auto [teardownVal, opResult] = pair;
+    if (teardownVal.getType() != opResult.getType())
+      return emitOpError("teardown result ")
+             << i << " has type " << teardownVal.getType()
+             << " but op result has type " << opResult.getType();
+  }
+
   auto yieldOp = cast<SubtiledRegionYieldOp>(setupBlock.getTerminator());
   unsigned numSetupOutputs = yieldOp.getResults().size();
   unsigned numTileArgs = tileBlock.getNumArguments();
 
-  // 3. tileMappings is non-empty
+  // 5. tileMappings is non-empty
   ArrayAttr tileMappings = getTileMappings();
   if (tileMappings.empty())
     return emitOpError("tileMappings must have at least one tile");
 
-  // 4-6. Validate each tile mapping
+  // 6-8. Validate each tile mapping
   for (auto [i, mapping] : llvm::enumerate(tileMappings)) {
     auto indices = dyn_cast<DenseI32ArrayAttr>(mapping);
     if (!indices)
       return emitOpError("tileMappings[")
              << i << "] must be a DenseI32ArrayAttr";
 
-    // 4. Inner array length = number of tile block args
+    // 6. Inner array length = number of tile block args
     if (static_cast<unsigned>(indices.size()) != numTileArgs)
       return emitOpError("tileMappings[") << i << "] has " << indices.size()
                                           << " entries but tile region has "
                                           << numTileArgs << " block arguments";
 
     for (auto [j, idx] : llvm::enumerate(indices.asArrayRef())) {
-      // 5. Indices in range
+      // 7. Indices in range
       if (idx < 0 || static_cast<unsigned>(idx) >= numSetupOutputs)
         return emitOpError("tileMappings[")
                << i << "][" << j << "] = " << idx << " is out of range [0, "
                << numSetupOutputs << ")";
 
-      // 6. Types match
+      // 8. Types match
       Type setupType = yieldOp.getResults()[idx].getType();
       Type tileArgType = tileBlock.getArgument(j).getType();
       if (setupType != tileArgType)
@@ -1126,7 +1148,12 @@ LogicalResult SubtiledRegionOp::verify() {
     }
   }
 
-  // 7-8. Validate barrier annotations
+  // Count non-terminator ops in tile body for targetOpIdx validation.
+  unsigned numTileOps = 0;
+  for (Operation &op : tileBlock.without_terminator())
+    ++numTileOps;
+
+  // 9-10. Validate barrier annotations
   unsigned numBarriers = getBarriers().size();
   unsigned numPhases = getBarrierPhases().size();
   for (auto [i, attr] : llvm::enumerate(getBarrierAnnotations())) {
@@ -1135,13 +1162,13 @@ LogicalResult SubtiledRegionOp::verify() {
       return emitOpError("barrierAnnotations[")
              << i << "] must be a BarrierAnnotationAttr";
 
-    // 7. barrierIdx in range
+    // 9. barrierIdx in range
     if (annotation.getBarrierIdx() >= numBarriers)
       return emitOpError("barrierAnnotations[")
              << i << "] has barrierIdx=" << annotation.getBarrierIdx()
              << " but there are only " << numBarriers << " barriers";
 
-    // 8. For wait_barrier, check phase exists
+    // 10. For wait_barrier, check phase exists
     if (annotation.getBarrierOpKind().getValue() == "wait_barrier") {
       if (annotation.getBarrierIdx() >= numPhases)
         return emitOpError("barrierAnnotations[")
@@ -1155,6 +1182,13 @@ LogicalResult SubtiledRegionOp::verify() {
     if (kind != "wait_barrier" && kind != "arrive_barrier")
       return emitOpError("barrierAnnotations[")
              << i << "] has unknown barrierOpKind '" << kind << "'";
+
+    // Validate targetOpIdx is in range
+    if (annotation.getTargetOpIdx() >= numTileOps)
+      return emitOpError("barrierAnnotations[")
+             << i << "] has targetOpIdx=" << annotation.getTargetOpIdx()
+             << " but tile region has only " << numTileOps
+             << " non-terminator ops";
   }
 
   return success();
@@ -1203,6 +1237,17 @@ void SubtiledRegionOp::print(OpAsmPrinter &p) {
   // Print tile region with block args
   p << " tile";
   p.printRegion(getTileRegion(), /*printEntryBlockArgs=*/true);
+
+  // Print teardown region
+  p << " teardown ";
+  p.printRegion(getTeardownRegion(), /*printEntryBlockArgs=*/false);
+
+  // Print result types if any
+  if (getNumResults() > 0) {
+    p << " -> (";
+    llvm::interleaveComma(getResultTypes(), p, [&](Type t) { p.printType(t); });
+    p << ")";
+  }
 }
 
 ParseResult SubtiledRegionOp::parse(OpAsmParser &parser,
@@ -1274,6 +1319,22 @@ ParseResult SubtiledRegionOp::parse(OpAsmParser &parser,
   Region *tileRegion = result.addRegion();
   if (parser.parseRegion(*tileRegion, tileArgs))
     return failure();
+
+  // Parse teardown region
+  if (parser.parseKeyword("teardown"))
+    return failure();
+  Region *teardownRegion = result.addRegion();
+  if (parser.parseRegion(*teardownRegion))
+    return failure();
+
+  // Parse optional result types: -> (type, ...)
+  if (succeeded(parser.parseOptionalArrow())) {
+    SmallVector<Type> resultTypes;
+    if (parser.parseLParen() || parser.parseTypeList(resultTypes) ||
+        parser.parseRParen())
+      return failure();
+    result.addTypes(resultTypes);
+  }
 
   return success();
 }
