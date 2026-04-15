@@ -159,7 +159,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
     elem_type = dtype.to_ir(_semantic.builder)
     if layout is None:
         if storage == tlx.storage_kind.smem:
-            if len(shape) == 1:
+            if len(shape) == 1 or len(shape) == 2:
                 layout = tlx.swizzled_shared_layout_encoding.make_default(rank=len(shape))
                 layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
                     layout.vectorSize,
