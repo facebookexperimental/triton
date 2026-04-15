@@ -425,7 +425,7 @@ void convertDotImpl(const LLVMTypeConverter &typeConverter,
   auto tensorMemAttr =
       cast<ttng::TensorMemoryEncodingAttr>(dTensorTy.getEncoding());
   unsigned mmaSizeM = tensorMemAttr.getBlockM();
-  unsigned mmaSizeN = tensorMemAttr.getBlockN();
+  unsigned mmaSizeN = std::min(tensorMemAttr.getBlockN(), 256u);
   unsigned mmaSizeK = op.mmaSizeK;
   int numRepM = ceil<unsigned>(M, mmaSizeM);
   int numRepN = ceil<unsigned>(N, mmaSizeN);
@@ -516,8 +516,8 @@ void convertDot(const LLVMTypeConverter &typeConverter,
       DotOpMmaV5TmemLoader::build(loc, rewriter, dTensorTy, adaptor.getD());
   dot.getAccAddress = [&](ConversionPatternRewriter &rewriter, Location loc,
                           int m, int n, const DotConversion::InstDesc &desc) {
-    return dLoader.tmemLoad(m * dLayout.getBlockM(), n * dLayout.getBlockN(),
-                            rewriter, loc);
+    return dLoader.tmemLoad(m * desc.mmaSizeM, n * desc.mmaSizeN, rewriter,
+                            loc);
   };
 
   dot.createMMAInst = [&](ConversionPatternRewriter &rewriter, Location loc,
