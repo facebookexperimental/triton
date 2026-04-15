@@ -387,11 +387,11 @@ Prolog (first M-block):
 Per M-block (main loop, from 2nd block onward):
   Load (multicast): Q → q_tiles/qt_tiles, dO → do_tiles/dot_tiles
 
-  MMA dot 5: dK += dS.T[prev] @ Q[prev]  → TMEM dK (from prev iteration's dS)
-  MMA dot 4: dQ = dS[prev] @ K            → TMEM dQ (frees q_empties[prev])
   MMA dot 1: S.T = K @ Q.T         → TMEM S
   Compute:   P = exp(S - LSE)       → TMEM P
+  MMA dot 5: dK += dS.T[prev] @ Q[prev]  → TMEM dK (from prev iteration's dS)
   MMA dot 2: dP.T = V @ dO.T       → TMEM dP
+  MMA dot 4: dQ = dS[prev] @ K            → TMEM dQ (frees q_empties[prev])
   MMA dot 3: dV += P.T @ dO         → TMEM dV
   Compute:   dS = P * (dP - D)      → TMEM dS, then copy to sdS
   DSMEM exchange: swap M-halves of sdS with peer
