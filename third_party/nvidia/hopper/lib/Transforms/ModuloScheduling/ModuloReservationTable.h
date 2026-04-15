@@ -57,8 +57,9 @@ struct ModuloScheduleResult {
 
 /// Run modulo scheduling on the DDG.
 /// Algorithm selected by TRITON_MODULO_SCHEDULE_ALGO env var:
-///   "sms" → Swing Modulo Scheduling (Llosa et al., PACT 1996)
-///   default → Rau's Iterative Modulo Scheduling (Rau, 1994)
+///   "exhaustive" → Exhaustive search with joint memory feasibility
+///   "sms"        → Swing Modulo Scheduling (Llosa et al., PACT 1996)
+///   default      → Rau's Iterative Modulo Scheduling (Rau, 1994)
 /// maxII defaults to 2 * MinII. maxBacktracks limits ejection in Rau's IMS.
 FailureOr<ModuloScheduleResult>
 runModuloScheduling(const DataDependenceGraph &ddg, int maxII = 0,

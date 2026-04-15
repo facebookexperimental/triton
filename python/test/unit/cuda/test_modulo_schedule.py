@@ -74,13 +74,7 @@ def _run_in_subprocess(algo=""):
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
         f.write(KERNEL_SCRIPT)
         f.flush()
-        result = subprocess.run(
-            [sys.executable, f.name],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
+        result = subprocess.run([sys.executable, f.name], env=env, capture_output=True, text=True, timeout=120)
     os.unlink(f.name)
     return result
 
@@ -95,7 +89,12 @@ class TestModuloSchedule:
         result = _run_in_subprocess(algo="sms")
         assert result.returncode == 0, (f"SMS failed:\nstdout: {result.stdout}\nstderr: {result.stderr[-500:]}")
 
-    @pytest.mark.xfail(reason="Rau IMS produces incorrect schedule for tl.load-based GEMM (pre-existing)")
+    @pytest.mark.xfail(reason="Exhaustive pins NONE ops to stage 0, collapsing tl.load pipeline")
+    def test_exhaustive(self):
+        result = _run_in_subprocess(algo="exhaustive")
+        assert result.returncode == 0, (f"Exhaustive failed:\nstdout: {result.stdout}\nstderr: {result.stderr[-500:]}")
+
+    @pytest.mark.xfail(reason="Rau places addptr at stage 0, breaking tl.load pointer update timing")
     def test_rau(self):
         result = _run_in_subprocess(algo="")
         assert result.returncode == 0, (f"Rau IMS failed:\nstdout: {result.stdout}\nstderr: {result.stderr[-500:]}")
