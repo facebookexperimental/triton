@@ -501,10 +501,9 @@ def preprocess_configs(configs, named_args, **kwargs):
         num_tiles_n = math.ceil(N / BLOCK_N)
         num_mn_tiles = num_tiles_m * num_tiles_n
 
-        # BM=64 tiles only help when MN is too small with larger tiles.
-        # Skip them for shapes that already have enough spatial tiles
-        # to avoid bloating the autotuner search space.
-        if BLOCK_M == 64 and math.ceil(M / 128) * math.ceil(N / 128) > 16:
+        # BM=64 tiles help unsaturated shapes by providing more spatial tiles.
+        # Skip them when the shape is already GPU-saturated with 128-tiles.
+        if BLOCK_M == 64 and math.ceil(M / 128) * math.ceil(N / 128) >= NUM_SMS:
             continue
 
         # --- Split-K gating: only allow SPLIT_K > 1 for small shapes ---
