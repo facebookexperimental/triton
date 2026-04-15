@@ -181,12 +181,16 @@ bool LoopPipelinerInternal::initializeLoopInfo(
     emitPredicateStageFn = mlir::triton::emitPredicateForStage;
   }
 
-  // All operations need to have a stage.
+  // All operations need to have a stage. Ops created by downstream passes
+  // (e.g., WS partitioning, canonicalization) may not have loop.stage
+  // attributes. Assign them to stage 0 rather than bailing — they are
+  // typically infrastructure ops (constants, index casts) that should
+  // execute in the prologue alongside stage-0 ops.
   for (Operation &op : forOp.getBody()->without_terminator()) {
     if (!stages.contains(&op)) {
-      op.emitOpError("not assigned a pipeline stage");
-      LDBG("--op not assigned a pipeline stage: " << op << " -> BAIL");
-      return false;
+      LDBG("--op not assigned a pipeline stage, defaulting to 0: " << op);
+      stages[&op] = 0;
+      opOrder.push_back(&op);
     }
   }
 
