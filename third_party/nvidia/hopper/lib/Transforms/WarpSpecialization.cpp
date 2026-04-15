@@ -13,6 +13,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 #include "llvm/Support/LogicalResult.h"
 
 #define DEBUG_TYPE "nvgpu-warp-specialization"
@@ -50,6 +51,14 @@ void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
 void doTMAStoreWaitReorder(triton::FuncOp &funcOp);
 void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp);
 void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp);
+
+void doGenerateSubtiledRegion(triton::FuncOp &funcOp) {
+  auto moduleOp = funcOp->getParentOfType<ModuleOp>();
+  PassManager pm(moduleOp.getContext());
+  pm.addPass(
+      triton::nvidia_gpu::createTritonNvidiaGPUGenerateSubtiledRegionPass());
+  (void)pm.run(moduleOp);
+}
 
 #define GEN_PASS_DEF_NVGPUWARPSPECIALIZATION
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
@@ -219,6 +228,16 @@ public:
           << "// -----// WarpSpec internal IR Dump After: doMemoryPlanner\n";
       moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
       llvm::dbgs() << "\n\n\n";
+    }
+
+    if (generateSubtiledRegion) {
+      doGenerateSubtiledRegion(funcOp);
+      if (dumpIntermediateSteps) {
+        llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                        "doGenerateSubtiledRegion\n";
+        moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+        llvm::dbgs() << "\n\n\n";
+      }
     }
 
     doAnnotateTMAStoreWaits(funcOp);

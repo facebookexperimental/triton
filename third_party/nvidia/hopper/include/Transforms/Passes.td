@@ -31,7 +31,10 @@ def NVGPUWarpSpecialization : Pass<"nvgpu-warp-specialization", "mlir::ModuleOp"
              "Dump intermediate steps">,
     Option<"smemBudget", "smem-budget",
              "int32_t", /*default*/"0",
-             "SMEM budget in bytes (0 = auto-detect from target)">
+             "SMEM budget in bytes (0 = auto-detect from target)">,
+    Option<"generateSubtiledRegion", "generate-subtiled-region",
+             "bool", /*default*/"false",
+             "Generate SubtiledRegionOp from epilogue split patterns">
     ];
 }
 

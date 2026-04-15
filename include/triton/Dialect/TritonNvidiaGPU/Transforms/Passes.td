@@ -197,6 +197,27 @@ def TritonNvidiaGPULowerSubtiledRegionPass
   ];
 }
 
+def TritonNvidiaGPUGenerateSubtiledRegionPass
+    : Pass<"triton-nvidia-gpu-generate-subtiled-region", "mlir::ModuleOp"> {
+  let summary = "Generate subtiled_region ops from split patterns";
+
+  let description = [{
+    This pass finds the GEMM epilogue subtiling pattern:
+      tmem_load -> reshape -> trans{[0,2,1]} -> split
+    followed by per-tile code (truncf, convert_layout, TMA store), and wraps
+    it in a `ttng.subtiled_region` op.
+
+    The pass runs after the memory planner and before code partition in the WS
+    pipeline. It captures the setup chain (tmem_load through split) in the
+    setup region and the per-tile code in the tile region body.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+    "mlir::arith::ArithDialect"
+  ];
+}
+
 def TritonNvidiaGPURemoveTMEMTokensPass : Pass<"triton-nvidia-gpu-remove-tmem-tokens", "mlir::ModuleOp"> {
   let summary = "remove TMEM tokens";
 
