@@ -135,7 +135,7 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
       %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
       %c0_i32 = arith.constant 0 : i32
       %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
-      // expected-error @+1 {{Barrier init outside of the first block in function is not supported for remote barriers}}
+      // expected-error @+1 {{Barrier init outside of the first block in function is not supported}}
       ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
       %9 = ttng.map_to_remote_buffer %1, %c0_i32 : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
       ttg.warp_yield
