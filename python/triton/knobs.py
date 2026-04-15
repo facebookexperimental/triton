@@ -515,6 +515,7 @@ class nvidia_knobs(base_knobs):
     force_trunk_swp_schedule: env_bool = env_bool("TRITON_FORCE_TRUNK_SWP_SCHEDULE")
     dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
     dump_tlx_benchmark: env_bool = env_bool("TRITON_DUMP_TLX_BENCHMARK")
+    enable_pipelining_analysis: env_bool = env_bool("TRITON_ENABLE_PIPELINING_ANALYSIS")
     use_no_compile_launcher: env_bool = env_bool("TRITON_USE_NO_COMPILE_LAUNCHER")
 
 

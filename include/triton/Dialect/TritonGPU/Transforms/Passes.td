@@ -374,4 +374,23 @@ def TritonGPUCoalesceAsyncCopy: Pass<"tritongpu-coalesce-async-copy", "mlir::Mod
                            "mlir::triton::TritonDialect"];
 }
 
+def TritonGPUPipeliningAnalysis: Pass<"tritongpu-pipelining-analysis", "mlir::ModuleOp"> {
+  let summary = "Analyze pipelining failures and emit diagnostics";
+
+  let description = [{
+    The `tritongpu-pipelining-analysis` pass runs after the software pipeliner
+    and analyzes which scf.ForOp loops were not pipelined. For each unpipelined
+    loop, it emits an MLIR remark explaining the reason (e.g., num_stages <= 1,
+    distance > 1, outer loop, barrier ops, no latency assigned).
+
+    This is a read-only analysis pass that does not modify the IR.
+  }];
+
+  let options = [
+    Option<"numStages", "num-stages",
+           "int32_t", /*default*/"3",
+           "number of pipeline stages">
+  ];
+}
+
 #endif
