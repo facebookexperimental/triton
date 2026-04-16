@@ -2387,6 +2387,8 @@ def _attn_bwd_ws(
                     tlx.reuse_group(p_tiles, dq_tiles, group_type=tlx.reuse_group_type.distinct),
                     group_type=tlx.reuse_group_type.shared,
                 ))
+            # dp_dq_storage_alias.set_buffer_overlap is called after dsT_xchg_tiles
+            # is allocated in the USE_2CTA block below.
         else:
             # 1-CTA with bm1=64: separate dQ TMEM
             dq_tiles = tlx.local_alloc(
@@ -2423,8 +2425,17 @@ def _attn_bwd_ws(
             tlx.dtype_of(desc_q),
             NUM_BUFFERS_DS,
             tlx.storage_kind.tmem,  # noqa: F841
-            reuse=dp_tiles,
+            reuse=dp_dq_storage_alias,
         )
+        # dp_tiles, dsT_tmem_tiles, and dsT_xchg_tiles share the same TMEM
+        # (sequential lifetime). All use dp_dq_storage_alias consistently.
+        dp_dq_storage_alias.set_buffer_overlap(
+            tlx.reuse_group(
+                dp_tiles,
+                dsT_tmem_tiles,
+                dsT_xchg_tiles,
+                group_type=tlx.reuse_group_type.shared,
+            ))
         # 2-CTA barriers for transposed views
         k_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)  # noqa: F841
         v_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)  # noqa: F841
