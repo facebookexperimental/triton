@@ -212,7 +212,7 @@ def local_gather_kernel(
     gathered = tlx.local_gather(smem_1d, indices, 0)
 
     # store result to global memory
-    tl.store(output_ptr, offsets_1d, gathered)
+    tl.store(output_ptr + offsets_1d, gathered)
 
 
 @pytest.mark.parametrize("N,M", [(32, 32), (64, 64), (128, 128)])
