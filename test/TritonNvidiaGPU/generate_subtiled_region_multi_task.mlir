@@ -210,3 +210,64 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// Test: identity insertion with descriptor_store epilogue (no early TMA store
+// lowering). This mirrors the real addmm GEMM epilogue:
+//   split → convert_layout → bias_load → extf → addf → truncf → descriptor_store
+// Chain1 has an extra arith.addi for the second subtile's column offset.
+
+#tmem5 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 256, colStride = 1>
+#blocked3d5 = #ttg.blocked<{sizePerThread = [1, 2, 128], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 2, 1]}>
+#blocked3d_perm5 = #ttg.blocked<{sizePerThread = [1, 128, 2], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 1, 2]}>
+#blocked_full5 = #ttg.blocked<{sizePerThread = [1, 256], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#blocked2d5 = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#shared5 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+
+  // CHECK-LABEL: @identity_descriptor_store_epilogue
+  // The tile body should include the full epilogue chain with arith.addi:
+  // CHECK: ttng.subtiled_region
+  // CHECK:   } tile{
+  // CHECK:     ttg.convert_layout
+  // CHECK:     arith.addi
+  // CHECK:     arith.extf
+  // CHECK:     arith.addf
+  // CHECK:     arith.truncf
+  // CHECK:     tt.descriptor_store
+  // CHECK:     ttng.subtiled_region_yield
+  // CHECK:   }
+  // CHECK-NOT: tt.split
+  tt.func @identity_descriptor_store_epilogue(
+      %tmem_buf: !ttg.memdesc<128x256xf32, #tmem5, #ttng.tensor_memory, mutable>,
+      %acc_tok: !ttg.async.token,
+      %c_desc: !tt.tensordesc<tensor<128x128xf16, #shared5>>,
+      %bias_desc: !tt.tensordesc<tensor<128x128xf16, #shared5>>,
+      %off_m: i32, %off_n: i32, %c128: i32) {
+    %loaded:2 = ttng.tmem_load %tmem_buf[%acc_tok] : !ttg.memdesc<128x256xf32, #tmem5, #ttng.tensor_memory, mutable> -> tensor<128x256xf32, #blocked_full5>
+    %reshaped = tt.reshape %loaded#0 : tensor<128x256xf32, #blocked_full5> -> tensor<128x2x128xf32, #blocked3d5>
+    %transposed = tt.trans %reshaped {order = array<i32: 0, 2, 1>} : tensor<128x2x128xf32, #blocked3d5> -> tensor<128x128x2xf32, #blocked3d_perm5>
+    %lhs, %rhs = tt.split %transposed : tensor<128x128x2xf32, #blocked3d_perm5> -> tensor<128x128xf32, #blocked2d5>
+
+    // Chain 0 (lhs): cvt → bias_load → extf → addf → truncf → store
+    %cvt0 = ttg.convert_layout %lhs : tensor<128x128xf32, #blocked2d5> -> tensor<128x128xf32, #blocked2d5>
+    %bias0 = tt.descriptor_load %bias_desc[%off_m, %off_n] : !tt.tensordesc<tensor<128x128xf16, #shared5>> -> tensor<128x128xf16, #blocked2d5>
+    %bias0_f32 = arith.extf %bias0 : tensor<128x128xf16, #blocked2d5> to tensor<128x128xf32, #blocked2d5>
+    %acc0 = arith.addf %cvt0, %bias0_f32 : tensor<128x128xf32, #blocked2d5>
+    %c0 = arith.truncf %acc0 : tensor<128x128xf32, #blocked2d5> to tensor<128x128xf16, #blocked2d5>
+    tt.descriptor_store %c_desc[%off_m, %off_n], %c0 : !tt.tensordesc<tensor<128x128xf16, #shared5>>, tensor<128x128xf16, #blocked2d5>
+
+    // Chain 1 (rhs): cvt → addi(offset) → bias_load → extf → addf → truncf → store
+    %cvt1 = ttg.convert_layout %rhs : tensor<128x128xf32, #blocked2d5> -> tensor<128x128xf32, #blocked2d5>
+    %off_n2 = arith.addi %off_n, %c128 : i32
+    %bias1 = tt.descriptor_load %bias_desc[%off_m, %off_n2] : !tt.tensordesc<tensor<128x128xf16, #shared5>> -> tensor<128x128xf16, #blocked2d5>
+    %bias1_f32 = arith.extf %bias1 : tensor<128x128xf16, #blocked2d5> to tensor<128x128xf32, #blocked2d5>
+    %acc1 = arith.addf %cvt1, %bias1_f32 : tensor<128x128xf32, #blocked2d5>
+    %c1 = arith.truncf %acc1 : tensor<128x128xf32, #blocked2d5> to tensor<128x128xf16, #blocked2d5>
+    tt.descriptor_store %c_desc[%off_m, %off_n2], %c1 : !tt.tensordesc<tensor<128x128xf16, #shared5>>, tensor<128x128xf16, #blocked2d5>
+
+    tt.return
+  }
+}
