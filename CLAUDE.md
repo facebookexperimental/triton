@@ -1,3 +1,7 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # Codebase Architecture
 
 ## Compilation Pipeline
@@ -10,6 +14,7 @@ Python DSL → TTIR (Triton IR) → TTGIR (Triton GPU IR) → LLVM IR → PTX/AM
 - **Core Triton compiler** (`python/triton/compiler/`, `lib/`, `include/`): TTIR and TTGIR lowering
 - **NVIDIA backend** (`third_party/nvidia/`): PTX codegen, CUDA-specific passes
 - **AMD backend** (`third_party/amd/`): AMDGPU codegen
+- **AutoWS** (`third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/`): Automatic Warp Specialization compiler pass — partitions kernels into producer/consumer warp groups automatically. Has extensive design docs in `docs/` subdirectory; read docs before source.
 - **Gluon** (`python/triton/experimental/gluon/`): Experimental high-level abstraction layer (upstream-synced, do not modify)
 
 ## Glossary
