@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-partition-scheduling-meta="merge-epilogue-to-computation" | FileCheck %s
+// RUN: TRITON_USE_META_PARTITION=1 triton-opt %s --nvgpu-partition-scheduling-meta="merge-epilogue-to-computation" | FileCheck %s
 
 // Tests that the full FA BWD persistent kernel (bwd.part.prior) gets the correct
 // 4-partition layout: reduction + gemm + load + computation.

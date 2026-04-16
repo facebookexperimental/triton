@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-partition-scheduling-meta="merge-epilogue" | FileCheck %s
+// RUN: TRITON_USE_META_PARTITION=1 triton-opt %s --nvgpu-partition-scheduling-meta="merge-epilogue" | FileCheck %s
 
 // Tests that flex attention (dpFactor=2, no epilogue stores, scf.if masking)
 // gets two separate computation partitions with symmetric split.
