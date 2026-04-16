@@ -2,6 +2,7 @@
 
 #include "ModuloReservationTable.h"
 
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/Debug.h"
 #include <algorithm>
 #include <climits>
@@ -100,18 +101,9 @@ static int computeEarliestStart(unsigned nodeIdx,
   return earliest;
 }
 
-FailureOr<ModuloScheduleResult>
-runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
-                    int maxBacktracks) {
-  LLVM_DEBUG(DBGS() << "Computing MinII...\n");
-  const int minII = ddg.computeMinII();
-  LLVM_DEBUG(DBGS() << "MinII=" << minII << "\n");
-  if (minII <= 0)
-    return failure();
-
-  if (maxII <= 0)
-    maxII = 2 * minII;
-
+static FailureOr<ModuloScheduleResult> runRauIMS(const DataDependenceGraph &ddg,
+                                                 int minII, int maxII,
+                                                 int maxBacktracks) {
   LLVM_DEBUG(DBGS() << "Computing critical path heights...\n");
   auto heights = ddg.computeCriticalPathHeights();
   LLVM_DEBUG(DBGS() << "Heights computed for " << heights.size() << " nodes\n");
@@ -247,6 +239,270 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
   LLVM_DEBUG(DBGS() << "EXHAUSTED: failed to schedule within maxII=" << maxII
                     << "\n");
   return failure();
+}
+
+// ── Swing Modulo Scheduling (SMS) ───────────────────────────────────────────
+//
+// J. Llosa, A. González, E. Ayguadé, M. Valero,
+// "Swing Modulo Scheduling: A Lifetime-Sensitive Approach", PACT 1996.
+//
+// Simplifications relative to the paper:
+//
+// 1. ASAP/ALAP ignore loop-carried edges (distance > 0) and are computed
+//    once, not per-II. The paper uses II-dependent bounds:
+//      ASAP[v] >= ASAP[u] + latency - distance * II
+//    Our slack values are therefore approximate for nodes in recurrences.
+//    For FA backward (multiple interacting recurrence circuits), this
+//    could produce a suboptimal ordering.
+//
+// 2. No recurrence-aware ordering. The paper identifies SCCs, orders them
+//    by RecMII contribution, and schedules the most critical recurrence
+//    first. We use a simple BFS from the minimum-slack node. This works
+//    for GEMM (trivial single-node recurrence) but may not prioritize
+//    correctly when multiple recurrences compete (e.g., FA backward with
+//    accumulator, softmax state, and pointer update recurrences).
+//
+// 3. Fallback on placement failure. When the directional scan (top-down
+//    or bottom-up) finds no free slot, we fall back to findFreeSlot from
+//    earliest. The paper would fail at this II and increment. Our fallback
+//    avoids unnecessary II inflation but may place a bottom-up node early,
+//    defeating the register pressure benefit.
+//
+// 4. The BFS swing expansion follows all DDG edges including loop-carried
+//    ones (distance > 0). The paper's ordering only follows distance-0
+//    edges. This may add nodes based on cross-iteration dependencies
+//    rather than intra-iteration structure.
+//
+// These simplifications are acceptable for the current use case (GPU
+// inner loops with ≤20 ops and ≤4 pipeline resources) where the graphs
+// are small enough that suboptimal ordering rarely affects the achieved II.
+
+/// Get the duration (pipeline occupancy slots) for a DDG node.
+static int getNodeDuration(const DDGNode &node) {
+  if (node.pipeline == HWPipeline::NONE)
+    return 1;
+  return std::max(node.selfLatency, 1);
+}
+
+/// Compute ASAP (as-soon-as-possible) times via forward relaxation.
+/// Only considers distance-0 edges (see simplification #1 above).
+static llvm::DenseMap<unsigned, int>
+computeASAP(const DataDependenceGraph &ddg) {
+  llvm::DenseMap<unsigned, int> asap;
+  for (unsigned i = 0; i < ddg.getNumNodes(); ++i)
+    asap[i] = 0;
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (const auto &edge : ddg.getEdges()) {
+      if (edge.distance > 0)
+        continue;
+      int candidate = asap[edge.srcIdx] + edge.latency;
+      if (candidate > asap[edge.dstIdx]) {
+        asap[edge.dstIdx] = candidate;
+        changed = true;
+      }
+    }
+  }
+  return asap;
+}
+
+/// Compute ALAP (as-late-as-possible) times via backward relaxation.
+/// Bounded by the schedule horizon (max ASAP across all nodes).
+/// Only considers distance-0 edges (see simplification #1 above).
+static llvm::DenseMap<unsigned, int>
+computeALAP(const DataDependenceGraph &ddg,
+            const llvm::DenseMap<unsigned, int> &asap) {
+  int horizon = 0;
+  for (auto &[idx, t] : asap)
+    horizon = std::max(horizon, t);
+
+  llvm::DenseMap<unsigned, int> alap;
+  for (unsigned i = 0; i < ddg.getNumNodes(); ++i)
+    alap[i] = horizon;
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (const auto &edge : ddg.getEdges()) {
+      if (edge.distance > 0)
+        continue;
+      int candidate = alap[edge.dstIdx] - edge.latency;
+      if (candidate < alap[edge.srcIdx]) {
+        alap[edge.srcIdx] = candidate;
+        changed = true;
+      }
+    }
+  }
+  return alap;
+}
+
+/// Compute the latest start for a node given already-scheduled successors.
+static int computeLatestStart(unsigned nodeIdx, const DataDependenceGraph &ddg,
+                              const llvm::DenseMap<unsigned, int> &scheduled,
+                              int II) {
+  int latest = INT_MAX;
+  for (const auto *edge : ddg.getOutEdges(nodeIdx)) {
+    auto it = scheduled.find(edge->dstIdx);
+    if (it == scheduled.end())
+      continue;
+    int constraint =
+        it->second - edge->latency + static_cast<int>(edge->distance) * II;
+    latest = std::min(latest, constraint);
+  }
+  return latest;
+}
+
+static FailureOr<ModuloScheduleResult> runSMS(const DataDependenceGraph &ddg,
+                                              int minII, int maxII) {
+  // ASAP/ALAP computed once outside the II loop (simplification #1).
+  auto asap = computeASAP(ddg);
+  auto alap = computeALAP(ddg, asap);
+
+  LLVM_DEBUG({
+    for (unsigned i = 0; i < ddg.getNumNodes(); ++i) {
+      DBGS() << "  N" << i << " ASAP=" << asap[i] << " ALAP=" << alap[i]
+             << " slack=" << (alap[i] - asap[i])
+             << " pipeline=" << getPipelineName(ddg.getNode(i).pipeline)
+             << "\n";
+    }
+  });
+
+  for (int II = minII; II <= maxII; ++II) {
+    ModuloReservationTable table{II};
+    llvm::DenseMap<unsigned, int> scheduled;
+    bool success = true;
+
+    // ── Ordering phase (simplifications #2, #4) ─────────────────────
+    // Seed with minimum-slack node, then BFS-expand: successors
+    // (top-down) then predecessors (bottom-up), sorted by slack.
+    // NOTE: follows all edges including loop-carried (#4), and does not
+    // identify or prioritize SCCs/recurrences (#2).
+    llvm::SmallVector<std::pair<unsigned, bool>> swingOrder;
+    llvm::DenseSet<unsigned> inOrder;
+
+    unsigned seed = 0;
+    int seedSlack = INT_MAX;
+    for (unsigned i = 0; i < ddg.getNumNodes(); ++i) {
+      int slack = alap[i] - asap[i];
+      if (slack < seedSlack) {
+        seedSlack = slack;
+        seed = i;
+      }
+    }
+    swingOrder.push_back({seed, true});
+    inOrder.insert(seed);
+
+    for (unsigned i = 0; i < swingOrder.size(); ++i) {
+      unsigned cur = swingOrder[i].first;
+
+      // Successors → top-down
+      llvm::SmallVector<std::pair<int, unsigned>> succs;
+      for (unsigned s : ddg.getNode(cur).succs)
+        if (inOrder.insert(s).second)
+          succs.push_back({alap[s] - asap[s], s});
+      llvm::sort(succs);
+      for (auto &[sl, idx] : succs)
+        swingOrder.push_back({idx, true});
+
+      // Predecessors → bottom-up
+      llvm::SmallVector<std::pair<int, unsigned>> preds;
+      for (unsigned p : ddg.getNode(cur).preds)
+        if (inOrder.insert(p).second)
+          preds.push_back({alap[p] - asap[p], p});
+      llvm::sort(preds);
+      for (auto &[sl, idx] : preds)
+        swingOrder.push_back({idx, false});
+    }
+
+    // ── Scheduling phase ────────────────────────────────────────────
+    for (auto &[nodeIdx, topDown] : swingOrder) {
+      const auto &node = ddg.getNode(nodeIdx);
+      int duration = getNodeDuration(node);
+
+      int earliest = computeEarliestStart(nodeIdx, ddg, scheduled, II);
+      int latest = computeLatestStart(nodeIdx, ddg, scheduled, II);
+
+      earliest = std::max(earliest, asap[nodeIdx]);
+      if (latest == INT_MAX)
+        latest = alap[nodeIdx] + II - 1;
+      if (latest < earliest)
+        latest = earliest + II - 1;
+
+      int slot = -1;
+      if (topDown) {
+        slot = table.findFreeSlot(earliest, node.pipeline, duration);
+      } else {
+        for (int t = latest; t >= earliest; --t) {
+          if (table.isIntervalFree(t, node.pipeline, duration)) {
+            slot = t;
+            break;
+          }
+        }
+      }
+
+      // Fallback: try anywhere from earliest (simplification #3).
+      // The paper would fail at this II instead.
+      if (slot < 0)
+        slot = table.findFreeSlot(earliest, node.pipeline, duration);
+
+      if (slot < 0) {
+        success = false;
+        LLVM_DEBUG(DBGS() << "  SMS: II=" << II << " FAILED to place N"
+                          << nodeIdx << "\n");
+        break;
+      }
+
+      table.reserve(slot, node.pipeline, nodeIdx, duration);
+      scheduled[nodeIdx] = slot;
+      LLVM_DEBUG(DBGS() << "  SMS: II=" << II << " placed N" << nodeIdx << " ("
+                        << getPipelineName(node.pipeline) << " dur=" << duration
+                        << ") at cycle=" << slot << " stage=" << slot / II
+                        << (topDown ? " [top-down]" : " [bottom-up]") << "\n");
+    }
+
+    if (success) {
+      LLVM_DEBUG(DBGS() << "SMS: SUCCESS at II=" << II << "\n");
+      ModuloScheduleResult result;
+      result.II = II;
+      result.nodeToCycle = std::move(scheduled);
+      return result;
+    }
+
+    LLVM_DEBUG(DBGS() << "SMS: FAILED at II=" << II << "\n");
+  }
+
+  return failure();
+}
+
+// ── Public entry point ──────────────────────────────────────────────────────
+
+FailureOr<ModuloScheduleResult>
+runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
+                    int maxBacktracks) {
+  const int minII = ddg.computeMinII();
+  if (minII <= 0)
+    return failure();
+  if (maxII <= 0)
+    maxII = 2 * minII;
+
+  LLVM_DEBUG({
+    DBGS() << "MinII=" << minII << " MaxII=" << maxII
+           << " Nodes=" << ddg.getNumNodes() << "\n";
+    DBGS() << "ResMII=" << ddg.computeResMII()
+           << " RecMII=" << ddg.computeRecMII() << "\n";
+  });
+
+  // TRITON_MODULO_SCHEDULE_ALGO: "sms" for SMS, anything else for Rau's IMS.
+  bool useSMS =
+      mlir::triton::tools::getStrEnv("TRITON_MODULO_SCHEDULE_ALGO") == "sms";
+
+  if (useSMS) {
+    LLVM_DEBUG(DBGS() << "Using Swing Modulo Scheduling (SMS)\n");
+    return runSMS(ddg, minII, maxII);
+  }
+
+  LLVM_DEBUG(DBGS() << "Using Rau's Iterative Modulo Scheduling (IMS)\n");
+  return runRauIMS(ddg, minII, maxII, maxBacktracks);
 }
 
 } // namespace mlir::triton::gpu

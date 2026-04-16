@@ -55,8 +55,11 @@ struct ModuloScheduleResult {
   }
 };
 
-/// Run Rau's iterative modulo scheduling on the DDG.
-/// maxII defaults to 2 * MinII. maxBacktracks limits ejection attempts per II.
+/// Run modulo scheduling on the DDG.
+/// Algorithm selected by TRITON_MODULO_SCHEDULE_ALGO env var:
+///   "sms" → Swing Modulo Scheduling (Llosa et al., PACT 1996)
+///   default → Rau's Iterative Modulo Scheduling (Rau, 1994)
+/// maxII defaults to 2 * MinII. maxBacktracks limits ejection in Rau's IMS.
 FailureOr<ModuloScheduleResult>
 runModuloScheduling(const DataDependenceGraph &ddg, int maxII = 0,
                     int maxBacktracks = 20);
