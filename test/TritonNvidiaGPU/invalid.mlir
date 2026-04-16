@@ -432,3 +432,26 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func @subtiled_region_mixed_task_ids() {
+    // expected-error @+1 {{tile body ops must have uniform async_task_id}}
+    ttng.subtiled_region
+        tile_mappings = [array<i32: 0>, array<i32: 1>]
+        barrier_annotations = []
+      setup {
+        %c0 = arith.constant 0 : i32
+        %c1 = arith.constant 1 : i32
+        ttng.subtiled_region_yield %c0, %c1 : i32, i32
+      } tile(%arg0: i32) {
+        %a = arith.index_cast %arg0 {async_task_id = array<i32: 3>} : i32 to index
+        %b = arith.index_cast %arg0 {async_task_id = array<i32: 4>} : i32 to index
+        ttng.subtiled_region_yield
+      } teardown {
+        ttng.subtiled_region_yield
+      }
+    tt.return
+  }
+}
