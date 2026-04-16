@@ -12,9 +12,10 @@ This document is based on the original design in [WS global instruction scheduli
   - [Limitations and Assumptions](#limitations-and-assumptions)
 - [Inputs](#inputs)
   - [1. Instruction Dependency Graph (DDG)](#1-instruction-dependency-graph-ddg)
-  - [2. Functional Unit Mapping](#2-functional-unit-mapping)
-  - [3. Latency Table](#3-latency-table)
-  - [4. Resource Model](#4-resource-model)
+  - [2. Op Lowering](#2-op-lowering)
+  - [3. Functional Unit Mapping](#3-functional-unit-mapping)
+  - [4. Latency Table](#4-latency-table)
+  - [5. Resource Model](#5-resource-model)
 - [Pass A: Modulo Scheduling](#pass-a-modulo-scheduling)
   - [Step 1: Compute Minimum Initiation Interval (II)](#step-1-compute-minimum-initiation-interval-ii)
   - [Step 2: Modulo Reservation Table Scheduling](#step-2-modulo-reservation-table-scheduling)
@@ -218,7 +219,7 @@ Key observations:
 
 The algorithm proceeds in three main passes:
 
-**Pass A — Scheduling (iterative):** An iterative refinement loop that schedules all code regions, derives pipeline depths, checks resource budgets, and applies DDG transformations — re-running until the schedule stabilizes. **Loop regions** use modulo scheduling (Rau's algorithm) to minimize II; **non-loop regions** use list scheduling to minimize makespan. Both produce the same `(cycle, pipeline, stage, cluster)` output. From the schedule, it derives buffer depths (with live intervals), checks SMEM/TMEM budget, and merges buffers with non-overlapping lifetimes. Then it considers two DDG transformations: **data partitioning** (Pass A.5) splits underutilized loop ops into sub-tiles, and **epilogue subtiling** (Pass A.7) splits monolithic TMA stores into independent sub-chains. If either transformation modifies a DDG, Pass A re-runs from the top — the freed SMEM may enable higher pipeline depth, changing II and the entire schedule. Converges in 1-2 iterations. The final output is a **ScheduleGraph** (Step 5) that packages all accumulated decisions — cycles, stages, buffers with lifetimes, merge groups — into a single side data structure for downstream passes.
+**Pass A — Scheduling (iterative):** An iterative refinement loop that schedules all code regions, derives pipeline depths, checks resource budgets, and applies DDG transformations — re-running until the schedule stabilizes. DDG nodes are lowered during construction (see [Op Lowering](#2-op-lowering)): each node has target-accurate `selfLatency` (pipeline occupancy) and `latency` (edge weight), and synthetic `local_load`/`local_store` nodes make buffer access explicit with symbolic, unaliased buffer references. **Loop regions** use modulo scheduling (Rau's algorithm) to minimize II; **non-loop regions** use list scheduling to minimize makespan. Both produce the same `(cycle, pipeline, stage, cluster)` output. From the schedule, it derives buffer depths (with live intervals) for all regions and merges buffers with non-overlapping lifetimes (Step 4.5). Then it considers two DDG transformations: **data partitioning** (Pass A.5) splits underutilized loop ops into sub-tiles, and **epilogue subtiling** (Pass A.7) splits monolithic TMA stores into independent sub-chains. If either transformation modifies a DDG, Pass A re-runs from the top — the freed SMEM may enable higher pipeline depth, changing II and the entire schedule. Converges in 1-2 iterations. The final output is a **ScheduleGraph** (Step 5) that packages all accumulated decisions — cycles, stages, buffers with lifetimes, merge groups — into a single side data structure for downstream passes.
 
 **Pass B — Warp Specialization Reconstruction:** Partitions ops into warp groups based on per-pipeline utilization derived from the schedule. Pipelines with >30% utilization get dedicated warp groups; underutilized pipelines are merged into the group with the most data dependency edges. The pass then inserts barrier synchronization at cross-group boundaries, computes prologue/epilogue loop structure (prolog depth = max stage across all ops), assigns warp counts and registers, and generates the warp-specialized code structure.
 
@@ -245,10 +246,10 @@ The algorithm proceeds in three main passes:
 │                      │                              │
 │                      ▼                              │
 │  ┌────────────────────────────────────────────────┐ │
-│  │  Step 3: Derive pipeline depths                │ │
+│  │  Step 3: Derive pipeline depths (all regions)  │ │
 │  │    num_buffers(R) = floor(lifetime(R) / II) + 1│ │
 │  │  Step 4: Memory budget check                   │ │
-│  │    Step 4.5: Merge non-overlapping buffers     │ │
+│  │  Step 4.5: Merge non-overlapping buffers       │ │
 │  └───────────────────┬────────────────────────────┘ │
 │                      │                              │
 │                      ▼                              │
@@ -375,18 +376,121 @@ Each edge `(u, v)` carries:
 - `latency(u, v)`: minimum cycles between start of u and start of v
 - `distance(u, v)`: iteration distance (0 = same iteration, 1 = next iteration, etc.)
 
-### 2. Functional Unit Mapping
+### 2. Op Lowering
+
+The DDG is not a literal mirror of the IR. During DDG construction, ops are **lowered** to expose target-specific details that the scheduler needs but the IR does not represent. **Op lowering does not modify the IR** — it only affects how DDG nodes are constructed.
+
+#### Why Lower
+
+1. **Fine-grained modeling**: The scheduler sees actual pipeline occupancy (`selfLatency`) separately from async completion time (`latency`). This enables better overlap — e.g., back-to-back TMA issues on the MEM pipeline instead of serialized loads that block for the full transfer time.
+
+2. **Target portability**: The same DDG structure (nodes, edges, buffer references) works across targets. For AMDGPU, where memory ops have different pipeline characteristics, only the `selfLatency` / `latency` values change — the scheduling algorithm and buffer tracking are target-independent.
+
+3. **Symbolic memory**: Buffers are named and unaliased in the DDG — no index arithmetic, no phase cycling, no `buf_idx = i % depth`. All buffer indexing is deferred to code generation (Pass C). This keeps the scheduling model clean and enables buffer merging (Step 4.5) without rewriting index expressions. The DDG reasons about `buf_A` and `buf_B` as abstract names; the physical layout is decided later.
+
+#### DDG Node to IR Mapping
+
+Each DDG node has an optional `irOp` pointer back to the TTGIR op it models:
+
+- **Real nodes** (e.g., `tma_load`, `mma`, `local_store`): `irOp` points to the corresponding TTGIR op. Phase 3 (Pass C) uses this pointer to apply schedule decisions (cycle, stage, cluster) to the original IR.
+- **Synthetic nodes** (e.g., `local_load`): `irOp = NULL` — there is no corresponding IR op. These nodes exist only in the DDG for buffer lifetime tracking and barrier placement. Pass C skips them.
+
+Additionally, each node carries a buffer reference (`→buf` for producers, `←buf` for consumers) that connects it to the symbolic buffer it accesses. This is how the scheduler traces the data flow through SMEM/TMEM without relying on IR pointers.
+
+| DDG Node | `irOp` | Buffer Ref | Used By |
+|----------|--------|-----------|---------|
+| `tma_load` (real) | → `tt.descriptor_load` | `→buf` (producer) | Pass C: schedule the IR op |
+| `local_load` (synthetic) | NULL | `←buf` (consumer) | Step 3: end buffer lifetime; Pass B: place barrier |
+| `mma` (real) | → `ttng.tc_gen5_mma` | — | Pass C: schedule the IR op |
+| `local_store` (real) | → `ttg.local_store` | `→buf` (producer) | Pass C: schedule the IR op |
+| `tma_store` (real) | → `tt.descriptor_store` | `←buf` (consumer) | Pass C: schedule the IR op |
+
+#### Lowering Refinements
+
+Lowering introduces two kinds of refinements:
+
+1. **selfLatency ≠ latency**: A single DDG node with `selfLatency` (pipeline occupancy) shorter than `latency` (time until result is available). The modulo scheduler blocks `selfLatency` consecutive reservation table slots, while using `latency` as the edge weight to consumers. This models async ops like TMA loads without extra nodes.
+
+2. **Synthetic DDG nodes**: Nodes with `irOp = NULL` that do not correspond to any IR op. Currently only `local_load` — it makes buffer consumption explicit so the scheduler can track buffer lifetimes precisely and Pass B can insert barriers at the correct producer-consumer boundaries.
+
+#### Synthetic Nodes: local_load and local_store
+
+The DDG introduces **synthetic nodes** that do not correspond to any IR op. These make buffer access explicit so the scheduler can track buffer lifetimes precisely.
+
+- **`local_load`** (synthetic): Marks the point where an op **finishes reading** from a buffer. The buffer lifetime **ends** here. Has `selfLatency = 0` and `pipeline = NONE` — it doesn't occupy any hardware resource. It exists as the explicit buffer consumer that drives lifetime analysis and barrier insertion.
+
+- **`local_store`** (real or synthetic): Marks the point where data is **written** to a buffer. For TMA loads, there is no synthetic `local_store` — the TMA hardware writes directly to SMEM, so the `tma_load` DDG node itself is the buffer producer (`→buf`). For the epilogue path, `local_store` corresponds to a real IR op (`ttg.local_store`) that writes registers to SMEM.
+
+Each buffer reference is:
+- **Symbolic**: Named (e.g., `buf_A`, `buf_B`), not a raw SMEM address
+- **Trackable**: The scheduler can trace the full chain: `tma_load →buf→ local_load → consumer`
+- **Unaliased**: Each symbolic buffer maps to exactly one logical allocation. No two buffer names alias the same memory — until Step 4.5 explicitly merges them via `mergeGroupId`
+
+#### Example: GEMM K-loop with Lowered DDG
+
+The IR has three ops: `tt.descriptor_load` (×2) and `ttng.tc_gen5_mma`. The lowered DDG exposes the buffer flow, matching the TLX `blackwell_gemm_ws` kernel where `async_descriptor_load` writes directly into SMEM buffers and `async_dot` reads from them:
+
+```
+IR ops (unchanged):          DDG nodes (lowered):
+
+tt.descriptor_load A    →    tma_load_A  {pipe: MEM, selfLat: 20, lat: 520, →buf_A}
+                             local_load_A {pipe: NONE, selfLat: 0, ←buf_A}  // synthetic
+
+tt.descriptor_load B    →    tma_load_B  {pipe: MEM, selfLat: 20, lat: 520, →buf_B}
+                             local_load_B {pipe: NONE, selfLat: 0, ←buf_B}  // synthetic
+
+ttng.tc_gen5_mma        →    mma {pipe: TC, selfLat: 900, lat: 900}
+
+Edges:
+  tma_load_A → local_load_A (lat: 520)    // TMA writes directly to SMEM buf_A
+  local_load_A → mma (lat: 0)             // MMA reads operand A from buf_A
+  tma_load_B → local_load_B (lat: 520)
+  local_load_B → mma (lat: 0)             // MMA reads operand B from buf_B
+
+Buffer lifetimes (for Step 3):
+  buf_A: live from tma_load_A (producer) to local_load_A (last consumer)
+  buf_B: live from tma_load_B (producer) to local_load_B (last consumer)
+```
+
+The `tma_load` is the buffer **producer** — TMA writes directly to the SMEM buffer, no intermediate store. The synthetic `local_load` is the buffer **consumer** — it marks when MMA finishes reading from the buffer, ending the buffer's lifetime. This matches the TLX pattern where `async_descriptor_load` fills `buffers_A[buf]` and `async_dot` reads from it, with `mBarriers=[A_smem_empty_bars[buf]]` signaling when the read is done.
+
+#### Epilogue Path: local_store as Real IR Op
+
+In the epilogue, `local_store` corresponds to a real IR op (`ttg.local_store`). The data flows from TMEM through registers into SMEM, then out via TMA:
+
+```
+tmem_load {pipe: TC, selfLat: 200}
+  → truncf {pipe: CUDA, selfLat: 100}
+    → local_store {pipe: MEM, selfLat: 150, →buf_out}    // real IR op, writes to SMEM
+      → tma_store {pipe: MEM, selfLat: 20, lat: 600, ←buf_out}
+```
+
+Here `local_store` is a real DDG node (not synthetic) with `pipeline = MEM` and real `selfLatency` because it's an actual SMEM write that occupies the MEM pipeline.
+
+#### selfLatency / latency Summary (Blackwell)
+
+| TTGIR Op | DDG Node(s) | selfLatency | latency | Pipeline |
+|----------|------------|----------:|--------:|----------|
+| `tt.descriptor_load` | `tma_load` (→buf) + `local_load` (←buf, synthetic) | 20 / 0 | 520 / 0 | MEM / NONE |
+| `tt.descriptor_store` | `tma_store` (←buf) | 20 | 600 | MEM |
+| `ttg.local_store` | `local_store` (→buf, real IR op) | 150 | 150 | MEM |
+| `ttng.tc_gen5_mma` | `mma` | 900 | 900 | TC |
+| `ttng.tmem_load` | `tmem_load` | 200 | 200 | TC |
+| CUDA/SFU ops | 1:1 | varies | = selfLatency | CUDA/SFU |
+
+### 3. Functional Unit Mapping
 
 Each op is assigned to exactly one hardware pipeline:
 
 | Pipeline | Operations |
 |----------|-----------|
-| **MEM** | TMA loads, TMA stores |
-| **TC** | wgmma / tcgen05.mma |
+| **MEM** | TMA loads, TMA stores, local_store (real IR op) |
+| **TC** | wgmma / tcgen05.mma, tmem_load |
 | **CUDA** | rowmax, rowsum, scale, acc update, type conversions |
 | **SFU** | exp2, rsqrt, other transcendentals |
+| **NONE** | Synthetic local_load (buffer lifetime endpoint) |
 
-### 3. Latency Table
+### 4. Latency Table
 
 Execution time per operation in cycles (from microbenchmarks):
 
@@ -402,7 +506,7 @@ Execution time per operation in cycles (from microbenchmarks):
 | RowSum (P) | 508 | CUDA |
 | Acc x Alpha | 105 | CUDA |
 
-### 4. Resource Model
+### 5. Resource Model
 
 - Each pipeline can execute **one op at a time** per warpgroup
 - Distinct pipelines **can overlap** (MEM + TC + CUDA + SFU all concurrent)
@@ -419,6 +523,10 @@ def pass_a(kernel_regions, latency_model, memory_budget):
     """
     Iterative scheduling loop. Converges when no DDG transformation
     improves the schedule. Typically 1-2 iterations.
+
+    Precondition: each DDG node has target-accurate selfLatency
+    (pipeline occupancy) and latency (edge weight to consumers),
+    set during DDG construction.
     """
     while True:
         # Schedule all regions
@@ -434,7 +542,7 @@ def pass_a(kernel_regions, latency_model, memory_budget):
             # Step 2.5: cluster IDs
             region.cluster_ids = compute_cluster_ids(region.schedule, region.II)
 
-        # Steps 3-4: pipeline depths + budget check (loop regions)
+        # Steps 3-4: pipeline depths + budget check
         pipeline_config = derive_pipeline_depths(kernel_regions)
         pipeline_config = adjust_for_memory(pipeline_config, memory_budget)
         pipeline_config = merge_buffers(pipeline_config)  # Step 4.5
@@ -603,13 +711,19 @@ def modulo_schedule(DDG, latencies, unit_map, MinII):
                         pred_cycle + latencies[pred] - edge.distance * II
                     )
 
-            # Search for a free slot in [earliest, earliest + II)
-            # on the required pipeline
+            # Search for selfLatency consecutive free slots in
+            # [earliest, earliest + II) on the required pipeline.
+            # selfLatency is how long the op blocks the pipeline;
+            # latency (used for edge weights) may be longer for
+            # async ops like TMA loads.
+            self_lat = self_latencies[op]
             placed = False
             for t in range(earliest, earliest + II):
-                slot = t % II
-                if res_table[slot][pipe] is None:
-                    res_table[slot][pipe] = op
+                # Check that all slots [t, t+selfLatency) are free (mod II)
+                if all(res_table[(t + d) % II][pipe] is None
+                       for d in range(self_lat)):
+                    for d in range(self_lat):
+                        res_table[(t + d) % II][pipe] = op
                     schedule[op] = (t, pipe)
                     placed = True
                     break
