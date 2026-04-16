@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-partition-scheduling-meta | FileCheck %s
+// RUN: triton-opt %s --nvgpu-partition-scheduling-meta="separate-epilogue-store" | FileCheck %s
 
 // Tests that GEMM partition scheduling does not create a separate "computation"
 // partition. Multi-def/sink clusters should merge into the default partition.
@@ -17,8 +17,41 @@
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 // CHECK-LABEL: @persistent_gemm_no_computation_partition
+//
+// --- Pre-loop: acc init → epilogue partition (no default partition) ---
+// CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: [[EPIL:[0-9]+]]>
+//
+// --- Inner k-loop: loads → load partition ---
+// CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD:[0-9]+]]>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// --- Inner k-loop: memdesc_trans and MMA → gemm partition ---
+// CHECK: ttg.memdesc_trans {{.*}}ttg.partition = array<i32: [[GEMM:[0-9]+]]>
+// CHECK: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: [[GEMM]]>
+//
+// --- Epilogue: tmem_load, reshape, trans, split → computation partition ---
+// CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[COMP:[0-9]+]]>
+// CHECK: tt.reshape {{.*}}ttg.partition = array<i32: [[COMP]]>
+// CHECK: tt.trans {{.*}}ttg.partition = array<i32: [[COMP]]>
+// CHECK: tt.split {{.*}}ttg.partition = array<i32: [[COMP]]>
+// --- Epilogue: truncf, convert_layout, local_alloc → computation partition ---
+// CHECK: arith.truncf {{.*}}ttg.partition = array<i32: [[COMP]]>
+// CHECK: ttg.convert_layout {{.*}}ttg.partition = array<i32: [[COMP]]>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[COMP]]>
+// --- Epilogue: TMA store → epilogue partition ---
+// CHECK: ttng.async_tma_copy_local_to_global {{.*}}ttg.partition = array<i32: [[EPIL_STORE:[0-9]+]]>
+// CHECK: ttng.async_tma_store_token_wait {{.*}}ttg.partition = array<i32: [[EPIL_STORE]]>
+// --- Second half: truncf, convert_layout, local_alloc → computation; TMA store → epilogue ---
+// CHECK: arith.truncf {{.*}}ttg.partition = array<i32: [[COMP]]>
+// CHECK: ttg.convert_layout {{.*}}ttg.partition = array<i32: [[COMP]]>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[COMP]]>
+// CHECK: ttng.async_tma_copy_local_to_global {{.*}}ttg.partition = array<i32: [[EPIL_STORE]]>
+// CHECK: ttng.async_tma_store_token_wait {{.*}}ttg.partition = array<i32: [[EPIL_STORE]]>
+//
+// --- Partition types ---
 // CHECK: tt.warp_specialize
-// CHECK-SAME: ttg.partition.types = ["default", "gemm", "load", "epilogue"]
+// CHECK-SAME: ttg.partition.types = ["gemm", "load", "epilogue", "epilogue_store", "computation"]
 tt.func public @persistent_gemm_no_computation_partition(
   %a_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
   %b_desc: !tt.tensordesc<tensor<256x64xf16, #shared>>,
