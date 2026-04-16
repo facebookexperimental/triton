@@ -518,6 +518,10 @@ LogicalResult TCGen5MMAOp::verify() {
     return emitOpError("The col stride of the return operand must be 32 / ")
            << retType.getElementTypeBitWidth() << " but got "
            << retEnc.getColStride();
+  // The maximum size of a MMA instruction is 128x256
+  if (retEnc.getBlockN() > 256)
+    return emitOpError("The block size of the return operand must be less than "
+                       "or equal to 256");
 
   // if (getTwoCtas()) {
   // Once we have a `block` dimension in TMEM, we can look at this via the
@@ -621,6 +625,11 @@ Value TCGen5MMAOp::useAccumulator() { return getUseD(); }
 
 void TCGen5MMAOp::setUseAccumulator(Value flag) {
   getUseDMutable().assign(flag);
+}
+
+ValueRange TCGen5MMAOp::getCompletionBarriers() { return getBarriers(); }
+ValueRange TCGen5MMAOp::getCompletionBarrierPreds() {
+  return getBarrierPreds();
 }
 
 void TCGen5MMAOp::addCompletionBarrier(Value barrier, Value pred) {
@@ -782,6 +791,11 @@ Value TCGen5MMAScaledOp::useAccumulator() { return getUseD(); }
 
 void TCGen5MMAScaledOp::setUseAccumulator(Value flag) {
   getUseDMutable().assign(flag);
+}
+
+ValueRange TCGen5MMAScaledOp::getCompletionBarriers() { return getBarriers(); }
+ValueRange TCGen5MMAScaledOp::getCompletionBarrierPreds() {
+  return getBarrierPreds();
 }
 
 void TCGen5MMAScaledOp::addCompletionBarrier(Value barrier, Value pred) {

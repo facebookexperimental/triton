@@ -180,7 +180,7 @@ struct BarrierExpectConversion
     pred = b.and_(pred, adaptor.getPred());
     ::mlir::triton::PTXBuilder ptxBuilder;
     const std::string ptx =
-        "@$0 mbarrier.arrive.expect_tx.shared.b64 _, [$1], " +
+        "@$0 mbarrier.arrive.expect_tx.shared::cta.b64 _, [$1], " +
         std::to_string(op.getSize()) + ";";
     auto &barSyncOp = *ptxBuilder.create(ptx);
     barSyncOp({ptxBuilder.newOperand(pred, "b"),
@@ -219,7 +219,7 @@ struct WaitBarrierOpConversion
 {
 	.reg .pred complete;
 	waitLoop:
-	mbarrier.test_wait.parity.shared.b64 complete, [$0], $1;
+	mbarrier.test_wait.parity.shared::cta.b64 complete, [$0], $1;
 	@!complete nanosleep.u32 20;
 	@!complete bra.uni waitLoop;
 }
@@ -230,7 +230,7 @@ struct WaitBarrierOpConversion
 	@!$2 bra.uni skipWait;
 	.reg .pred complete;
 	waitLoop:
-	mbarrier.test_wait.parity.shared.b64 complete, [$0], $1;
+	mbarrier.test_wait.parity.shared::cta.b64 complete, [$0], $1;
 	@!complete nanosleep.u32 20;
 	@!complete bra.uni waitLoop;
 	skipWait:
@@ -243,7 +243,7 @@ struct WaitBarrierOpConversion
 {
 	.reg .pred complete;
 	waitLoop:
-	mbarrier.try_wait.parity.shared.b64 complete, [$0], $1;
+	mbarrier.try_wait.parity.shared::cta.b64 complete, [$0], $1;
 	@!complete bra.uni waitLoop;
 }
 )";
@@ -253,7 +253,7 @@ struct WaitBarrierOpConversion
 	@!$2 bra.uni skipWait;
 	.reg .pred complete;
 	waitLoop:
-	mbarrier.try_wait.parity.shared.b64 complete, [$0], $1;
+	mbarrier.try_wait.parity.shared::cta.b64 complete, [$0], $1;
 	@!complete bra.uni waitLoop;
 	skipWait:
 }
