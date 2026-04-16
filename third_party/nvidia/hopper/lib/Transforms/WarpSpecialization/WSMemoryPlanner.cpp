@@ -816,7 +816,7 @@ parseChannelAnnotations(Operation *parentOp) {
   std::map<unsigned, std::pair<unsigned, Operation *>> bufferIdToInfo;
 
   parentOp->walk([&](Operation *op) {
-    if (!isa<ttng::MMAv5OpInterface>(op))
+    if (!op->hasAttr("tt.autows"))
       return;
     auto attr = op->getAttrOfType<StringAttr>("tt.autows");
     if (!attr)

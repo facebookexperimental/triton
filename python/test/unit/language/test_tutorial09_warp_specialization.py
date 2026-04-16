@@ -68,7 +68,7 @@ def matmul_kernel_tma_ws(
 
     # Always use warp_specialize=True
     for k in tl.range(k_tiles, warp_specialize=True, data_partition_factor=DATA_PARTITION_FACTOR,
-                      smem_alloc_algo=SMEM_ALLOC_ALGO):
+                      smem_alloc_algo=SMEM_ALLOC_ALGO, separate_epilogue_store=False):
         offs_k = k * BLOCK_SIZE_K
         if A_COL_MAJOR:
             a = a_desc.load([offs_k, offs_am]).T
@@ -131,6 +131,7 @@ def matmul_kernel_tma_persistent_ws(
             warp_specialize=True,
             data_partition_factor=DATA_PARTITION_FACTOR,
             smem_alloc_algo=SMEM_ALLOC_ALGO,
+            separate_epilogue_store=True,
     ):
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
@@ -263,6 +264,7 @@ def matmul_kernel_descriptor_persistent_ws(
             warp_specialize=True,
             data_partition_factor=DATA_PARTITION_FACTOR,
             smem_alloc_algo=SMEM_ALLOC_ALGO,
+            separate_epilogue_store=True,
     ):
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
