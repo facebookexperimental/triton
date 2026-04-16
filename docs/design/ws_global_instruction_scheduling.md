@@ -20,6 +20,7 @@ This document is based on the original design in [WS global instruction scheduli
   - [Step 1: Compute Minimum Initiation Interval (II)](#step-1-compute-minimum-initiation-interval-ii)
   - [Step 2: Modulo Reservation Table Scheduling](#step-2-modulo-reservation-table-scheduling)
     - [Background: Rau's Iterative Modulo Scheduling](#background-raus-iterative-modulo-scheduling)
+    - [Alternative: Swing Modulo Scheduling (SMS)](#alternative-swing-modulo-scheduling-sms)
   - [Step 2.5: Compute Cluster IDs from the Modulo Schedule](#step-25-compute-cluster-ids-from-the-modulo-schedule)
   - [Step 3: Derive Per-Region Pipeline Depth from the Modulo Schedule](#step-3-derive-per-region-pipeline-depth-from-the-modulo-schedule)
   - [Step 4: Handling Resource Pressure (SMEM/TMEM Budget)](#step-4-handling-resource-pressure-smemtmem-budget)
@@ -348,6 +349,8 @@ The algorithm as described has several limitations:
 6. **No multi-CTA or cluster-level scheduling**: The algorithm schedules within a single CTA. Multi-CTA kernels (e.g., `blackwell_gemm_2cta.py`) require additional coordination for cross-CTA B-tile sharing and cluster-level barrier synchronization, which is handled separately.
 
 7. **Register allocation is approximate**: Pass B Step 4 estimates register usage from live variable counts but doesn't perform full register allocation. The actual register count is determined by the compiler backend (ptxas), which may differ from the estimate and cause spills that the schedule didn't anticipate.
+
+8. **SMS limitations**: The SMS implementation's simplified ASAP/ALAP computation (no II-dependent recurrence bounds) and BFS ordering (no SCC prioritization) may produce suboptimal schedules for kernels with multiple interacting recurrence circuits, such as FA backward with 5 MMA ops and cross-iteration accumulator/softmax/pointer dependencies. For single-MMA kernels (GEMM), SMS and Rau produce identical schedules.
 
 ---
 
@@ -759,6 +762,89 @@ def modulo_schedule(DDG, latencies, unit_map, MinII):
 
         II += 1  # Try larger II
 ```
+
+#### Alternative: Swing Modulo Scheduling (SMS)
+
+An alternative to Rau's IMS is Swing Modulo Scheduling (J. Llosa, A. Gonzalez, E. Ayguade, M. Valero, "Swing Modulo Scheduling: A Lifetime-Sensitive Approach", PACT 1996). SMS avoids backtracking by using a slack-based node ordering and directional placement.
+
+**Key differences from Rau's IMS:**
+
+| Property | Rau's IMS | SMS |
+|----------|-----------|-----|
+| Complexity | Potentially exponential (backtracking) | O(n) per II attempt |
+| Node ordering | Critical-path height (bottom-up) | Slack = ALAP - ASAP (tightest first) |
+| Placement | Earliest free slot, eject if blocked | Top-down for successors, bottom-up for predecessors |
+| Register pressure | Not considered | Reduced by keeping producer-consumer pairs close |
+
+**SMS Algorithm:**
+
+1. **Compute ASAP/ALAP**: Forward/backward relaxation on distance-0 edges to determine each op's scheduling window. Slack = ALAP - ASAP measures scheduling freedom.
+
+2. **Ordering phase (swing)**: Start with the minimum-slack op (most constrained). Then BFS-expand: add its successors (marked top-down) sorted by ascending slack, then its predecessors (marked bottom-up) sorted by ascending slack. This alternation is the "swing" — it keeps producers and consumers adjacent in the schedule.
+
+3. **Scheduling phase**: For each op in swing order:
+   - **Top-down** ops: place at the earliest free slot from `earliest` upward (data is ready, issue immediately).
+   - **Bottom-up** ops: place at the latest free slot from `latest` downward (defer production, reducing live range and register pressure).
+
+```python
+def sms_schedule(DDG, latencies, unit_map, MinII):
+    asap = compute_ASAP(DDG, latencies)  # forward relaxation, distance-0 only
+    alap = compute_ALAP(DDG, latencies, asap)  # backward from max ASAP
+    slack = {op: alap[op] - asap[op] for op in DDG.nodes}
+
+    for II in range(MinII, 2 * MinII + 1):
+        table = ReservationTable(II)
+        scheduled = {}
+
+        # Ordering: BFS from min-slack seed
+        seed = min(DDG.nodes, key=lambda n: slack[n])
+        order = [(seed, True)]  # (node, is_top_down)
+        visited = {seed}
+        for node, _ in order:
+            # Successors → top-down
+            for s in sorted(successors(node), key=lambda n: slack[n]):
+                if s not in visited:
+                    order.append((s, True))
+                    visited.add(s)
+            # Predecessors → bottom-up
+            for p in sorted(predecessors(node), key=lambda n: slack[n]):
+                if p not in visited:
+                    order.append((p, False))
+                    visited.add(p)
+
+        # Placement
+        success = True
+        for op, top_down in order:
+            earliest = compute_earliest(op, scheduled, DDG, latencies, II)
+            latest = compute_latest(op, scheduled, DDG, latencies, II)
+            if top_down:
+                slot = table.find_free(earliest, unit_map[op])
+            else:
+                slot = table.find_free_reverse(latest, earliest, unit_map[op])
+            if slot is None:
+                slot = table.find_free(earliest, unit_map[op])  # fallback
+            if slot is None:
+                success = False
+                break
+            table.reserve(slot, unit_map[op], op)
+            scheduled[op] = slot
+
+        if success:
+            return scheduled, II
+    return None
+```
+
+**Implementation status:** SMS is available via `TRITON_MODULO_SCHEDULE_ALGO=sms`. The implementation has the following simplifications relative to the paper:
+
+1. **ASAP/ALAP ignore loop-carried edges** and are computed once (not per-II). The paper uses II-dependent bounds: `ASAP[v] >= ASAP[u] + latency - distance * II`. This means slack values are approximate for nodes in recurrences.
+
+2. **No recurrence-aware ordering.** The paper identifies Strongly Connected Components (recurrences), orders them by RecMII contribution, and schedules the most critical recurrence first. The implementation uses simple BFS from the minimum-slack node.
+
+3. **Fallback on placement failure.** When the directional scan finds no free slot, the implementation falls back to `find_free` from earliest. The paper would fail at this II and increment.
+
+4. **BFS follows all DDG edges** including loop-carried (distance > 0). The paper's ordering only follows distance-0 edges.
+
+These simplifications are acceptable for GPU inner loops with 10-20 ops where suboptimal ordering rarely affects the achieved II. On a GEMM kernel (1 MMA, 8 ops total), SMS and Rau produce the same II and stage assignments for all key ops.
 
 ### Step 2.5: Compute Cluster IDs from the Modulo Schedule
 
