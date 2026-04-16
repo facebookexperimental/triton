@@ -139,6 +139,11 @@ getDistributedLayoutForTmemLdSt(gpu::MemDescType memType, TMemAccessAtom atom,
                                 unsigned numWarps,
                                 gpu::CGAEncodingAttr cgaLayout);
 
+/// Lower a single SubtiledRegionOp into flat IR with barrier insertion.
+/// This is the core logic shared by the LowerSubtiledRegion pass and
+/// the WS code partition pre-lowering for multi-task subtiled regions.
+void lowerSubtiledRegion(SubtiledRegionOp op);
+
 } // namespace mlir::triton::nvidia_gpu
 
 #endif // TRITON_DIALECT_TRITONNVIDIAGPU_IR_DIALECT_H_
