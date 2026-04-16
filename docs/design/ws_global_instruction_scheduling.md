@@ -24,6 +24,7 @@ This document is based on the original design in [WS global instruction scheduli
   - [Step 3: Derive Per-Region Pipeline Depth from the Modulo Schedule](#step-3-derive-per-region-pipeline-depth-from-the-modulo-schedule)
   - [Step 4: Handling Resource Pressure (SMEM/TMEM Budget)](#step-4-handling-resource-pressure-smemtmem-budget)
   - [Step 4.5: Lifetime-Aware Buffer Merging](#step-45-lifetime-aware-buffer-merging)
+  - [Step 4.6: Global Memory Budget Check](#step-46-per-region-memory-budget-allocation)
   - [Step 5: Emit ScheduleGraph](#step-5-emit-schedulegraph)
 - [Pass A.5: Data Partitioning for Improved Overlap (Optional)](#pass-a5-data-partitioning-for-improved-overlap-optional)
 - [Pass A.6: Scheduling Non-Loop Regions](#pass-a6-scheduling-non-loop-regions)
@@ -219,7 +220,7 @@ Key observations:
 
 The algorithm proceeds in three main passes:
 
-**Pass A — Scheduling (iterative):** An iterative refinement loop that schedules all code regions, derives pipeline depths, checks resource budgets, and applies DDG transformations — re-running until the schedule stabilizes. DDG nodes are lowered during construction (see [Op Lowering](#2-op-lowering)): each node has target-accurate `selfLatency` (pipeline occupancy) and `latency` (edge weight), and synthetic `local_load`/`local_store` nodes make buffer access explicit with symbolic, unaliased buffer references. **Loop regions** use modulo scheduling (Rau's algorithm) to minimize II; **non-loop regions** use list scheduling to minimize makespan. Both produce the same `(cycle, pipeline, stage, cluster)` output. From the schedule, it derives buffer depths (with live intervals) for all regions and merges buffers with non-overlapping lifetimes (Step 4.5). Then it considers two DDG transformations: **data partitioning** (Pass A.5) splits underutilized loop ops into sub-tiles, and **epilogue subtiling** (Pass A.7) splits monolithic TMA stores into independent sub-chains. If either transformation modifies a DDG, Pass A re-runs from the top — the freed SMEM may enable higher pipeline depth, changing II and the entire schedule. Converges in 1-2 iterations. The final output is a **ScheduleGraph** (Step 5) that packages all accumulated decisions — cycles, stages, buffers with lifetimes, merge groups — into a single side data structure for downstream passes.
+**Pass A — Scheduling (iterative):** An iterative refinement loop that schedules all code regions, derives pipeline depths, checks resource budgets, and applies DDG transformations — re-running until the schedule stabilizes. DDG nodes are lowered during construction (see [Op Lowering](#2-op-lowering)): each node has target-accurate `selfLatency` (pipeline occupancy) and `latency` (edge weight), and synthetic `local_load`/`local_store` nodes make buffer access explicit with symbolic, unaliased buffer references. **Loop regions** use modulo scheduling (Rau's algorithm) to minimize II; **non-loop regions** use list scheduling to minimize makespan. Both produce the same `(cycle, pipeline, stage, cluster)` output. From the schedule, it derives buffer depths (with live intervals) for all regions, merges buffers with non-overlapping lifetimes (Step 4.5), and then performs a **kernel-wide** SMEM/TMEM budget check (Step 4.6) — the budget is a global constraint checked after all regions have their pipeline depths, not per-region. Then it considers two DDG transformations: **data partitioning** (Pass A.5) splits underutilized loop ops into sub-tiles, and **epilogue subtiling** (Pass A.7) splits monolithic TMA stores into independent sub-chains. If either transformation modifies a DDG, Pass A re-runs from the top — the freed SMEM may enable higher pipeline depth, changing II and the entire schedule. Converges in 1-2 iterations. The final output is a **ScheduleGraph** (Step 5) that packages all accumulated decisions — cycles, stages, buffers with lifetimes, merge groups — into a single side data structure for downstream passes.
 
 **Pass B — Warp Specialization Reconstruction:** Partitions ops into warp groups based on per-pipeline utilization derived from the schedule. Pipelines with >30% utilization get dedicated warp groups; underutilized pipelines are merged into the group with the most data dependency edges. The pass then inserts barrier synchronization at cross-group boundaries, computes prologue/epilogue loop structure (prolog depth = max stage across all ops), assigns warp counts and registers, and generates the warp-specialized code structure.
 
@@ -248,8 +249,9 @@ The algorithm proceeds in three main passes:
 │  ┌────────────────────────────────────────────────┐ │
 │  │  Step 3: Derive pipeline depths (all regions)  │ │
 │  │    num_buffers(R) = floor(lifetime(R) / II) + 1│ │
-│  │  Step 4: Memory budget check                   │ │
 │  │  Step 4.5: Merge non-overlapping buffers       │ │
+│  │  Step 4.6: Global memory budget check          │ │
+│  │    (kernel-wide: after all regions pipelined)  │ │
 │  └───────────────────┬────────────────────────────┘ │
 │                      │                              │
 │                      ▼                              │
@@ -542,10 +544,17 @@ def pass_a(kernel_regions, latency_model, memory_budget):
             # Step 2.5: cluster IDs
             region.cluster_ids = compute_cluster_ids(region.schedule, region.II)
 
-        # Steps 3-4: pipeline depths + budget check
+        # Steps 3-4: pipeline depths + budget check (all regions)
         pipeline_config = derive_pipeline_depths(kernel_regions)
-        pipeline_config = adjust_for_memory(pipeline_config, memory_budget)
-        pipeline_config = merge_buffers(pipeline_config)  # Step 4.5
+        pipeline_config = merge_buffers(pipeline_config)  # Step 4.5: free savings first
+
+        # Step 4.6: compute global buffer usage across all regions,
+        # then reduce if over budget
+        usage = compute_global_buffer_usage(kernel_regions, pipeline_config)
+        if usage.smem > memory_budget.smem or usage.tmem > memory_budget.tmem:
+            pipeline_config = reduce_memory_to_budget(
+                pipeline_config, memory_budget, kernel_regions
+            )
 
         # DDG transformations
         ddg_changed = False
@@ -1019,7 +1028,7 @@ def derive_pipeline_config(schedule, DDG, latencies, regions, II):
 
 ### Step 4: Handling Resource Pressure (SMEM/TMEM Budget)
 
-If the derived pipeline depth exceeds available SMEM or TMEM, the algorithm must back off:
+If the derived pipeline depths across **all regions** exceed available SMEM or TMEM, the algorithm must back off. This check is kernel-wide — it runs after pipeline depths have been derived for every region (loop and non-loop), because the SMEM/TMEM budget is shared across the entire kernel. See Step 4.6 for the full global budget check and reduction strategy.
 
 ```python
 def adjust_pipeline_for_memory(pipeline_config, memory_budget):
@@ -1223,6 +1232,308 @@ def any_instances_overlap(iv1, iv2, II):
 - **Alignment**: TMA loads require 128-byte aligned SMEM, and tcgen05.mma has its own TMEM alignment rules. The physical buffer must satisfy the strictest alignment among all merged resources.
 - **No partial overlap**: Two resources must be fully non-overlapping. If they overlap even partially, they cannot share a buffer regardless of size.
 - **Deadlock safety**: Every proposed merge must pass the cycle-freedom check. This is a hard constraint — a deadlock is never acceptable, even if it would save significant memory.
+
+### Step 4.6: Global Memory Budget Check
+
+After all regions have been scheduled and pipeline depths derived (Steps 1–3, A.6), the algorithm computes the **global buffer usage** and checks it against the hardware budget. This is the first point where buffer costs from all regions are visible simultaneously.
+
+The key insight: buffer lifetimes should be computed **kernel-wide**, not per-region. Each buffer gets an absolute lifetime based on its region's position in the kernel timeline. Two buffers — even from different regions — can share physical memory if their absolute lifetimes don't overlap. This unifies intra-region merging (Step 4.5) and cross-region sharing into a single mechanism.
+
+#### Kernel-Wide Buffer Lifetimes
+
+Each region occupies a time interval in the kernel timeline. The schedule from Steps 1–2 and A.6 provides makespan (for non-loop regions) or steady-state latency (for loop regions). These are composed into absolute region intervals:
+
+```python
+def compute_region_intervals(kernel_regions):
+    """
+    Assign each region an absolute time interval [start, end)
+    in the kernel timeline.
+
+    For non-persistent kernels: regions are sequential.
+    For persistent kernels: the outer tile loop's modulo schedule
+    determines which regions overlap across tile iterations.
+    """
+    intervals = {}
+    cursor = 0
+
+    for region in kernel_regions:
+        start = cursor
+        if region.is_loop:
+            # Loop region: prologue + steady-state + epilogue
+            max_depth = max(region.buffer_depths.values(), default=1)
+            prologue_lat = (max_depth - 1) * region.II
+            steady_lat = region.trip_count * region.II
+            epilogue_lat = (max_depth - 1) * region.II
+            end = start + prologue_lat + steady_lat + epilogue_lat
+        else:
+            # Non-loop region: makespan from list schedule
+            end = start + region.makespan
+
+        intervals[region] = (start, end)
+        cursor = end
+
+    return intervals
+```
+
+Each buffer's **absolute lifetime** is derived from its intra-region live interval (computed in Step 3) plus the region's absolute start time:
+
+```python
+def compute_absolute_buffer_lifetimes(pipeline_config, region_intervals):
+    """
+    Convert each buffer's intra-region live interval to an absolute
+    lifetime in the kernel timeline.
+
+    For loop regions with multi-buffered resources, the buffer has
+    D instances in flight. The absolute lifetime of each instance
+    is offset by the region's start time.
+
+    For buffers that cross region boundaries (e.g., TMEM accumulator
+    live from K-loop into epilogue), the lifetime spans from the
+    producer's region start to the consumer's region end.
+    """
+    absolute_lifetimes = {}
+
+    for buf in pipeline_config.buffers:
+        producer_region = buf.producer_region
+        consumer_region = buf.consumer_region
+
+        prod_start = region_intervals[producer_region][0]
+        cons_end = region_intervals[consumer_region][1]
+
+        if producer_region == consumer_region:
+            # Intra-region buffer: offset by region start
+            absolute_lifetimes[buf] = AbsoluteLifetime(
+                start=prod_start + buf.liveStart,
+                end=prod_start + buf.liveEnd,
+                size=buf.size_bytes,
+                count=buf.count,
+                kind=buf.kind,
+            )
+        else:
+            # Cross-region buffer: spans from producer to consumer region
+            absolute_lifetimes[buf] = AbsoluteLifetime(
+                start=prod_start + buf.liveStart,
+                end=cons_end,  # live until consumer region finishes
+                size=buf.size_bytes,
+                count=buf.count,
+                kind=buf.kind,
+            )
+
+    return absolute_lifetimes
+```
+
+#### Global Buffer Usage via Interval Coloring
+
+With absolute lifetimes, the global budget check becomes the same interval-graph coloring problem as Step 4.5 — but applied to **all buffers across all regions**, not just within a single modulo schedule:
+
+```python
+def compute_global_buffer_usage(pipeline_config, region_intervals):
+    """
+    Compute the peak SMEM and TMEM usage across the entire kernel
+    by finding the maximum simultaneous buffer usage at any point
+    in the kernel timeline.
+
+    This is the same conflict-graph approach as Step 4.5, but
+    kernel-wide: two buffers from different regions can share
+    physical memory if their absolute lifetimes don't overlap.
+    """
+    lifetimes = compute_absolute_buffer_lifetimes(
+        pipeline_config, region_intervals
+    )
+
+    # Build conflict graph: two buffers conflict if they could be
+    # simultaneously live at any point in the kernel timeline
+    conflicts = {}
+    for b1, lt1 in lifetimes.items():
+        for b2, lt2 in lifetimes.items():
+            if b1 >= b2 or lt1.kind != lt2.kind:
+                continue
+            # For multi-buffered resources, check all instance pairs
+            # (same cross-iteration check as Step 4.5)
+            if any_instances_overlap_absolute(lt1, lt2):
+                conflicts[(b1, b2)] = True
+
+    # Graph coloring: each color = a physical buffer slot
+    # Buffers with the same color share physical memory
+    coloring = greedy_color(lifetimes.keys(), conflicts)
+
+    # Peak usage = sum of physical buffer sizes
+    physical_buffers = {}
+    for color, bufs in group_by_color(coloring).items():
+        kind = lifetimes[bufs[0]].kind
+        physical_buffers[color] = PhysicalBuffer(
+            size=max(lifetimes[b].size for b in bufs),
+            count=max(lifetimes[b].count for b in bufs),
+            kind=kind,
+        )
+
+    peak_smem = sum(
+        pb.size * pb.count
+        for pb in physical_buffers.values()
+        if pb.kind == SMEM
+    )
+    peak_tmem = sum(
+        pb.size * pb.count
+        for pb in physical_buffers.values()
+        if pb.kind == TMEM
+    )
+
+    return GlobalBufferUsage(
+        smem=peak_smem,
+        tmem=peak_tmem,
+        physical_buffers=physical_buffers,
+        coloring=coloring,
+    )
+```
+
+This subsumes both Step 4.5's intra-region merging and cross-region time-sharing into one unified mechanism. For example:
+- K-loop's `buf_A` (SMEM, live during K-loop) and epilogue's `buf_out` (SMEM, live during epilogue) get different colors if their lifetimes overlap, same color if they don't — no special "cross-region time-sharing" logic needed.
+- FA backward's `dP` and `dQ` accumulators (TMEM, both in K-loop but non-overlapping lifetimes) share a color — same as Step 4.5's intra-region merging, but now it works identically for cross-region buffers.
+
+#### Worked Example: Non-Persistent GEMM
+
+```
+Region intervals:
+  K-loop:   [0, 5000)     — 3 SMEM buffers: buf_A (8KB×3), buf_B (8KB×3)
+  Epilogue: [5000, 6600)  — 1 SMEM buffer:  buf_out (32KB×1)
+
+Absolute buffer lifetimes:
+  buf_A:   [0, 4500)      kind=SMEM   (3 instances, live during K-loop)
+  buf_B:   [500, 5000)    kind=SMEM   (3 instances, live during K-loop)
+  buf_out: [5000, 6600)   kind=SMEM   (1 instance, live during epilogue)
+
+Conflict check:
+  buf_A vs buf_B:   overlap [500, 4500) → conflict
+  buf_A vs buf_out: no overlap (4500 < 5000) → no conflict, can share
+  buf_B vs buf_out: no overlap (5000 = 5000, half-open) → no conflict, can share
+
+Coloring:
+  color 0: buf_A, buf_out  → physical size = max(8KB, 32KB) = 32KB, count = max(3,1) = 3
+  color 1: buf_B            → physical size = 8KB, count = 3
+
+Peak SMEM = 32KB×3 + 8KB×3 = 96KB + 24KB = 120KB
+  (vs. naive sum: 8KB×3 + 8KB×3 + 32KB = 80KB — actually worse due to max(size)×max(count))
+```
+
+Note: merging buf_A with buf_out increases the physical buffer size to 32KB×3 = 96KB, which is worse than keeping them separate (24KB + 32KB = 56KB). The coloring algorithm must account for this — only merge when `max(size) × max(count) < sum(size × count)`:
+
+```python
+def should_merge(bufs, lifetimes):
+    """Only merge if it actually saves memory."""
+    separate_cost = sum(lifetimes[b].size * lifetimes[b].count for b in bufs)
+    merged_cost = (
+        max(lifetimes[b].size for b in bufs) *
+        max(lifetimes[b].count for b in bufs)
+    )
+    return merged_cost < separate_cost
+```
+
+#### Reduction Strategy
+
+When the global budget check finds that peak SMEM or TMEM exceeds the hardware limit, the algorithm must reduce buffer usage. Buffer merging (global coloring above) is always applied first — it's free. Epilogue subtiling (A.7) is tried next — it reduces epilogue buffer size S× with minimal performance cost. If these are insufficient, the algorithm must reduce buffer depth, which increases II and slows the kernel.
+
+The key question: **which buffer's depth to reduce?** The cost metric is **total kernel execution time increase per KB saved**, not just II increase:
+
+```python
+def kernel_time_cost(buf, pipeline_config):
+    """
+    Compute the total kernel execution time increase from reducing
+    this buffer's depth by 1.
+
+    The cost depends on the region's trip count:
+    - K-loop buffer (trip_count=1000): II increase × 1000 iterations
+    - Epilogue buffer (runs once): makespan increase × 1
+    - Outer tile loop buffer: II increase × num_tiles
+
+    This automatically prioritizes reducing epilogue/prologue buffers
+    (low trip count) over K-loop buffers (high trip count).
+    """
+    region = buf.region
+
+    if buf.count <= 1:
+        return float('inf')  # Can't reduce further
+
+    # New II or makespan if we reduce this buffer's depth by 1
+    new_lifetime_bound = (buf.count - 1) * region.II
+    if buf.lifetime > new_lifetime_bound:
+        # Producer must stall — effective II increases
+        new_II = ceil(buf.lifetime / (buf.count - 1))
+        ii_increase = new_II - region.II
+    else:
+        # Buffer has slack — depth reduction doesn't affect II
+        ii_increase = 0
+
+    smem_saved = buf.size_bytes  # one fewer buffer instance
+
+    if region.is_loop:
+        # Loop region: II increase is paid every iteration
+        time_increase = ii_increase * region.trip_count
+    else:
+        # Non-loop region: makespan increase is paid once
+        time_increase = ii_increase  # (for non-loop, "II" = makespan)
+
+    # Cost: kernel time increase per KB saved
+    # Lower is better — greedily reduce the cheapest buffer first
+    return time_increase / smem_saved if smem_saved > 0 else float('inf')
+```
+
+```python
+def reduce_memory_to_budget(pipeline_config, memory_budget,
+                            kernel_regions, region_intervals):
+    """
+    Reduce SMEM/TMEM usage to fit within budget.
+
+    1. Buffer merging via global coloring — already applied (free).
+    2. Epilogue subtiling (A.7) — try before depth reduction.
+    3. Reduce buffer depth — greedily pick the buffer with the
+       lowest kernel_time_cost per KB saved.
+    """
+    # Try epilogue subtiling first (cheap)
+    for region in kernel_regions:
+        if not region.is_loop and has_tma_store(region):
+            for S in [2, 4, 8]:
+                subtiled_config = try_subtile(pipeline_config, region, S)
+                usage = compute_global_buffer_usage(
+                    subtiled_config, region_intervals
+                )
+                if usage.smem <= memory_budget.smem:
+                    split_epilogue_stores(region, S)
+                    return subtiled_config
+
+    # Greedily reduce buffer depths by kernel-time cost
+    while True:
+        usage = compute_global_buffer_usage(
+            pipeline_config, region_intervals
+        )
+        if (usage.smem <= memory_budget.smem and
+                usage.tmem <= memory_budget.tmem):
+            break
+
+        # Pick the buffer with the lowest cost to reduce
+        best_buf = min(
+            (b for b in pipeline_config.buffers if b.count > 1),
+            key=lambda b: kernel_time_cost(b, pipeline_config),
+            default=None,
+        )
+
+        if best_buf is None:
+            raise Error("Cannot fit within budget even with all depths = 1")
+
+        best_buf.count -= 1
+        if best_buf.region.is_loop:
+            best_buf.region.II = recompute_II(best_buf.region)
+
+    return pipeline_config
+```
+
+This cost model makes the region priority **automatic** — no hardcoded table needed. The trip count naturally drives the decision:
+
+| Region | Trip Count | Cost of 100-cycle II increase | Priority |
+|--------|----------:|-----------------------------:|----------|
+| **Prologue** | 1 | 100 cycles | Reduce first |
+| **Epilogue** | 1 | 100 cycles | Reduce first |
+| **Outer tile loop** | ~num_tiles (e.g., 64) | 6,400 cycles | Reduce second |
+| **K-loop** | ~K/BLOCK_K (e.g., 1024) | 102,400 cycles | Reduce last |
 
 ### Step 5: Emit ScheduleGraph
 
