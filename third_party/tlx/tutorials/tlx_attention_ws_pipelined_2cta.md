@@ -323,16 +323,16 @@ In 2-CTA mode, the output M dimension is split across CTAs. For dots 1,2,3,5
 where M = `cta_group_size * tile_n` = 256, each CTA gets 128 TMEM columns.
 For dot 4 where M = `tile_m` = 128, each CTA gets 64 TMEM columns.
 
-| Buffer | TMEM columns | Per-CTA shape | Overlaps with | Notes |
-|--------|-------------|---------------|---------------|-------|
-| `qk_tiles` (S) | 128 | (tile_n, tile_m) | `p_tiles` (full), `dq_tiles` (partial) | Dot 1 output |
-| `p_tiles` (P) | 128 | (tile_n, tile_m) | `qk_tiles` (full), `dq_tiles` (partial) | P = softmax(S) overwrites S |
-| `dq_tiles` (dQ) | 64 | (tile_m/2, tile_hdim) | `qk_tiles`/`p_tiles` cols 64-127 | Dot 4 output. Partial overlap with S/P |
-| `dp_tiles` (dP) | 128 | (tile_n, tile_m) | `dsT_tmem_tiles`, `dsT_xchg_tiles` | Dot 2 output |
-| `dsT_tmem_tiles` | 128 | (tile_n, tile_m) | `dp_tiles` | dS in TMEM for Dot 4 (dk) |
-| `dsT_xchg_tiles` | 128 | (tile_n, tile_m) | `dp_tiles` (direct reuse) | dS copy for DSMEM exchange (2-CTA only) |
-| `dv_tiles` (dV) | 128 | (tile_n, tile_hdim) | — | Dot 3 accumulator |
-| `dk_tiles` (dK) | 128 | (tile_n, tile_hdim) | — | Dot 5 accumulator |
+| Buffer | Per-CTA shape | dtype | TMEM cols | Overlaps with | Notes |
+|--------|--------------|-------|-----------|---------------|-------|
+| `qk_tiles` (S) | (tile_n, tile_m) = (128, 128) | f32 | tile_n = 128 | `p_tiles` (shared), `dq_tiles` (distinct) | Dot 1 output |
+| `p_tiles` (P) | (tile_n, tile_m) = (128, 128) | f16 | tile_n/2 = 64 | `qk_tiles` (shared), `dq_tiles` (distinct) | P = softmax(S) overwrites S |
+| `dq_tiles` (dQ) | (tile_m/2, tile_hdim) = (64, 128) | f32 | tile_m/2 = 64 | `qk_tiles`/`p_tiles` cols 64-127 | Dot 4 output. Distinct from P |
+| `dp_tiles` (dP) | (tile_n, tile_m) = (128, 128) | f32 | tile_n = 128 | `dsT_tmem_tiles`, `dsT_xchg_tiles` (shared) | Dot 2 output |
+| `dsT_tmem_tiles` | (tile_n, tile_m) = (128, 128) | f16 | tile_n/2 = 64 | `dp_tiles`, `dsT_xchg_tiles` (shared) | dS in TMEM for Dot 5 (dk) |
+| `dsT_xchg_tiles` | (tile_n, tile_m) = (128, 128) | f16 | tile_n/2 = 64 | `dp_tiles`, `dsT_tmem_tiles` (shared) | dS copy for DSMEM exchange (2-CTA only) |
+| `dv_tiles` (dV) | (tile_n, tile_hdim) = (128, 128) | f32 | tile_n = 128 | — | Dot 3 accumulator |
+| `dk_tiles` (dK) | (tile_n, tile_hdim) = (128, 128) | f32 | tile_n = 128 | — | Dot 5 accumulator |
 
 Overlaps:
 - **S → P**: P = softmax(S) overwrites S in-place (full overlap)
@@ -340,14 +340,9 @@ Overlaps:
   64-127. In FA4, dQ is placed at `tmem_S_offset + tile_hdim//2 = 64`.
   This is safe because each CTA only reads P columns 0-63 (from the
   M-split), and dQ only writes to columns 64-127.
-- **dP ↔ dsT_tmem ↔ dsT_xchg**: all three share `dp_dq_storage_alias`.
-  dP (fp32) and dsT_tmem (fp16) have sequential lifetime. `dsT_xchg_tiles`
-  directly reuses `dp_tiles` for the DSMEM exchange copy in 2-CTA.
-  **CAUTION**: `dsT_xchg_tiles` reuses `dp_tiles` via legacy `reuse=dp_tiles`
-  (not via storage_alias_spec). This places dsT_xchg_tiles at the same offset
-  as dp_tiles (fp32 layout), which may differ from dsT_tmem_tiles (fp16
-  layout within dp_dq_storage_alias). Dot 4 reads dsT_tmem_tiles — if
-  dsT_xchg_tiles overwrites it at a different sub-offset, dk could be wrong.
+- **dP ↔ dsT_tmem ↔ dsT_xchg**: all three share `dp_dq_storage_alias`
+  with `shared` overlap (same TMEM offset). dP (fp32, 128 cols) and
+  dsT_tmem/dsT_xchg (fp16, 64 cols each) have sequential lifetime.
 
 ```
 Column:  0          64    128        256                384       512
@@ -355,6 +350,9 @@ Column:  0          64    128        256                384       512
          |    S/P   | dQ   |    dV    |     dP/dS        |   dK    |
          |  (128)   | (64) |  (128)   |     (128)        |  (128)  |
          |__________|______|__________|__________________|_________|
+
+qk_p_storage_alias (128 cols):  S/P shared at 0, dQ distinct at 64
+dp_dq_storage_alias (128 cols): dP/dsT_tmem/dsT_xchg all shared at 0
 ```
 
 dQ partially overlaps S/P at columns 64-127. In FA4, this is safe with
