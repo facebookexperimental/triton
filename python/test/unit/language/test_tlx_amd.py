@@ -185,3 +185,60 @@ def test_async_token_loop_compiles_gfx950(device):
     ttgir = compiled.asm["ttgir"]
     assert "local_load" in ttgir
     assert "async_wait" in ttgir
+
+
+@triton.jit
+def local_gather_kernel(
+    matrix_ptr, indices_ptr, output_ptr, 
+    N: tl.constexpr, 
+    M: tl.constexpr,
+):
+    """Test lds gather using tlx.local_gather() with axis-based API."""
+    indices_x = tl.arange(0, N)
+    indices_y = tl.arange(0, M)
+    offsets_2d = indices_x[:, None] * M + indices_y[None, :]
+    matrix_regs = tl.load(matrix_ptr + offsets_2d)
+
+    # Allocate 2D shared memory and store the matrix
+    smem_1d_buffers = tlx.local_alloc((N * M, ), tlx.dtype_of(matrix_ptr), 1)
+    smem_1d = tlx.local_view(smem_1d_buffers, 0)
+    tlx.local_store(smem_1d, matrix_regs.reshape((N * M, )))
+
+    # Load the gather indices
+    offsets_1d = tl.arange(0, N)
+    indices = tl.load(indices_ptr + offsets_1d)
+
+    # Gather using axis-based API: result[i] = smem_1d[indices[i]]
+    gathered = tlx.local_gather(smem_1d, indices, 0)
+
+    # store result to global memory
+    tl.store(output_ptr, offsets_1d, gathered)
+
+
+@pytest.mark.parametrize("N,M", [(32, 32), (64, 64), (128, 128)])
+def test_shared_gather(N, M):
+    """Test gathering from 1D reshaped shared memory (diagonal of 2D matrix)."""
+    device = torch.device("cuda")
+
+    # Create a test matrix with known values
+    matrix = torch.arange(N * M, dtype=torch.float32, device=device).reshape(N, M)
+
+    # Create gather indices for diagonal elements: 0, M+1, 2*(M+1), ...
+    indices = torch.arange(N, dtype=torch.int32, device=device) * (M + 1)
+
+    output = torch.zeros(N, dtype=torch.float32, device=device)
+
+    # Compute expected result: diagonal elements
+    expected = matrix.flatten()[indices]
+
+    # Launch kernel
+    local_gather_kernel[(1, )](
+        matrix,
+        indices,
+        output,
+        N=N,
+        M=M,
+        num_warps=1,
+    )
+
+    torch.testing.assert_close(output, expected)
