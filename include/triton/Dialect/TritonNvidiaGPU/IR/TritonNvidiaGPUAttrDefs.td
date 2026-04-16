@@ -2,6 +2,7 @@
 #define TRITONNVIDIAGPU_ATTRDEFS
 
 include "mlir/IR/AttrTypeBase.td"
+include "mlir/IR/EnumAttr.td"
 include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUDialect.td"
 include "triton/Dialect/Triton/IR/TritonInterfaces.td"
 
@@ -78,6 +79,48 @@ def TTG_TensorMemoryScalesEncodingAttr : AttrDef<TritonNvidiaGPU_Dialect, "Tenso
     ins
     DefaultValuedParameter<"unsigned", "1">:$CTASplitM,
     DefaultValuedParameter<"unsigned", "1">:$CTASplitN
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+//===----------------------------------------------------------------------===//
+// BarrierPlacement enum
+//===----------------------------------------------------------------------===//
+
+def TTNG_BarrierPlacementBefore : I32EnumAttrCase<"BEFORE", 0, "before">;
+def TTNG_BarrierPlacementAfter  : I32EnumAttrCase<"AFTER",  1, "after">;
+
+def TTNG_BarrierPlacement : I32EnumAttr<"BarrierPlacement",
+    "Barrier placement relative to first/last tile",
+    [TTNG_BarrierPlacementBefore, TTNG_BarrierPlacementAfter]> {
+  let cppNamespace = "::mlir::triton::nvidia_gpu";
+}
+
+//===----------------------------------------------------------------------===//
+// BarrierAnnotation attribute
+//===----------------------------------------------------------------------===//
+
+def TTNG_BarrierAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnotation"> {
+  let mnemonic = "barrier_annotation";
+  let description = [{
+    Describes where to insert a barrier operation during subtiled region lowering.
+
+    - `barrierIdx`: index into the op's barriers operand list
+    - `placement`: BEFORE first tile or AFTER last tile
+    - `targetOpIdx`: index of the target op in the tile region body (0-based,
+      counting only non-terminator ops). The barrier is placed immediately
+      before (BEFORE placement, first tile) or after (AFTER placement, last
+      tile) this op.
+    - `barrierOpKind`: "wait_barrier" or "arrive_barrier"
+    - `count`: arrive count for arrive_barrier (default 1)
+  }];
+  let parameters = (
+    ins
+    "unsigned":$barrierIdx,
+    "BarrierPlacement":$placement,
+    "unsigned":$targetOpIdx,
+    "StringAttr":$barrierOpKind,
+    DefaultValuedParameter<"unsigned", "1">:$count
   );
   let assemblyFormat = "`<` struct(params) `>`";
 }
