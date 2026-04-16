@@ -600,6 +600,7 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::gpu::AsyncCopyGlobalToLocalOp>,
       GenericOpPattern<triton::gpu::LocalStoreOp>,
       GenericOpPattern<triton::gpu::LocalLoadOp>,
+      GenericOpPattern<triton::gpu::LocalGatherOp>,
       GenericOpPattern<triton::nvidia_gpu::WarpGroupDotWaitOp>,
       TritonFuncOpPattern
       // clang-format on
