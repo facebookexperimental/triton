@@ -705,6 +705,24 @@ def local_gather(
 
 
 @tl.builtin
+def local_scatter(
+    dst: tlx.buffered_tensor,
+    src: tlx.tensor,
+    indices: tlx.buffered_tensor,
+    axis: int,
+    token: tlx.async_token = None,
+    _semantic=None,
+) -> tl.tensor:
+    """
+    gather elements from shared memory along a specified axis using an indices tensor.
+    """
+    block_type = tl.block_type(src.type.element_ty, indices.type.shape)
+    storage = src.type.storage
+    assert storage == tlx.storage_kind.smem, "local_scatter only supports shared memory!"
+    return tl.tensor(_semantic.builder.create_local_scatter(dst.handle, src.handle, indices.handle, axis), tl.void)
+
+
+@tl.builtin
 def local_store(
     dst: tlx.buffered_tensor,
     src: tl.tensor,
