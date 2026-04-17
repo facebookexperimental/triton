@@ -146,6 +146,10 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::registerNVGPUModuloExpand();
   mlir::registerNVGPUModuloLower();
 
+  // Modulo scheduling passes (manually registered, not tablegen-generated)
+  mlir::registerPass([]() { return mlir::createNVGPUModuloSchedule(); });
+  mlir::registerPass([]() { return mlir::createNVGPUModuloWSPartition(); });
+
   // Proton passes
   mlir::test::proton::registerTestScopeIdAllocationPass();
   mlir::triton::proton::registerConvertProtonToProtonGPU();
