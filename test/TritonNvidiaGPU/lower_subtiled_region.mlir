@@ -416,4 +416,54 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       }
     tt.return
   }
+
+  // Test per-tile buffer reuse: TILE_START acquire + TILE_END release with
+  // accumCnt-based phase computation. Uses a single barrier shared across
+  // tiles with numBuffers=1 (serialized access).
+  //
+  // The lowering should emit for each tile:
+  //   wait_barrier(bar, phase) → op → arrive_barrier(bar)
+  //
+  // CHECK-LABEL: @per_tile_buffer_reuse
+  tt.func @per_tile_buffer_reuse(
+      %bar: !ttg.memdesc<1xi64, #shared, #smem, mutable>,
+      %accum_cnt: i64) {
+    // Tile 0: acquire, op, release
+    // CHECK: arith.divui
+    // CHECK: arith.andi
+    // CHECK: arith.trunci
+    // CHECK: ttng.wait_barrier
+    // CHECK: arith.index_cast
+    // CHECK: ttng.arrive_barrier
+    // Tile 1: acquire, op, release
+    // CHECK: arith.divui
+    // CHECK: arith.andi
+    // CHECK: arith.trunci
+    // CHECK: ttng.wait_barrier
+    // CHECK: arith.index_cast
+    // CHECK: ttng.arrive_barrier
+    // CHECK-NOT: ttng.subtiled_region
+    ttng.subtiled_region
+        barriers(%bar : !ttg.memdesc<1xi64, #shared, #smem, mutable>)
+        accum_cnts(%accum_cnt : i64)
+        tile_mappings = [array<i32: 0>, array<i32: 1>]
+        barrier_annotations = [
+          #ttng.barrier_annotation<barrierIdx = 0, placement = tile_start,
+            targetOpIdx = 0, barrierOpKind = "wait_barrier",
+            numBuffers = 1>,
+          #ttng.barrier_annotation<barrierIdx = 0, placement = tile_end,
+            targetOpIdx = 0, barrierOpKind = "arrive_barrier">
+        ]
+      setup {
+        %c0 = arith.constant 0 : i32
+        %c1 = arith.constant 1 : i32
+        ttng.subtiled_region_yield %c0, %c1 : i32, i32
+      } tile(%arg0: i32) {
+        %idx = arith.index_cast %arg0 : i32 to index
+        ttng.subtiled_region_yield
+      } teardown {
+        ttng.subtiled_region_yield
+      }
+    tt.return
+  }
 }
