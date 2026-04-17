@@ -92,10 +92,25 @@ public:
 
     int numWarps = mlir::triton::gpu::lookupNumWarps(funcOp);
     if (numWarps != 4) {
-      LDBG("Warp specialization requires num_warps=4, but got "
-           << numWarps << ". Skipping.");
-      removeWarpSpecializeAttr(funcOp);
-      return;
+      bool unsupported = false;
+      funcOp->walk([&](scf::ForOp forOp) {
+        if (auto factor = forOp->getAttrOfType<IntegerAttr>(
+                "tt.data_partition_factor")) {
+          if (factor.getInt() > 1)
+            unsupported = true;
+        }
+        if (auto tmpl = forOp->getAttrOfType<StringAttr>("tt.ws_template")) {
+          if (tmpl.getValue() == "UnifiedFA")
+            unsupported = true;
+        }
+      });
+      if (unsupported) {
+        LDBG("num_warps != 4 with UnifiedFA template or "
+             "data_partition_factor > 1 is not supported. "
+             "Falling back to non-warp-specialized path.");
+        removeWarpSpecializeAttr(funcOp);
+        return;
+      }
     }
 
     // FIXME: skip warpspec if there is else block. Need to improve
