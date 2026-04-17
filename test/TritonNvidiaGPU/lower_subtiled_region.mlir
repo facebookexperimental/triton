@@ -283,4 +283,75 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       } -> (i32)
     tt.return %result : i32
   }
+
+  // Test wait_barrier BEFORE a setup op (region = setup).
+  // The barrier should be emitted in the setup region, before the target op.
+  // CHECK-LABEL: @wait_before_setup_op
+  tt.func @wait_before_setup_op(
+      %bar: !ttg.memdesc<1xi64, #shared, #smem, mutable>,
+      %phase: i32) {
+    // wait_barrier should appear before the first setup op (arith.constant):
+    // CHECK: ttng.wait_barrier
+    // CHECK-NEXT: arith.constant 0
+    // CHECK: arith.constant 1
+    // Tiles:
+    // CHECK: arith.index_cast
+    // CHECK: arith.index_cast
+    // CHECK-NOT: ttng.subtiled_region
+    ttng.subtiled_region
+        barriers(%bar : !ttg.memdesc<1xi64, #shared, #smem, mutable>)
+        phases(%phase : i32)
+        tile_mappings = [array<i32: 0>, array<i32: 1>]
+        barrier_annotations = [
+          #ttng.barrier_annotation<barrierIdx = 0, placement = before,
+            targetOpIdx = 0, barrierOpKind = "wait_barrier",
+            region = setup>
+        ]
+      setup {
+        %c0 = arith.constant 0 : i32
+        %c1 = arith.constant 1 : i32
+        ttng.subtiled_region_yield %c0, %c1 : i32, i32
+      } tile(%arg0: i32) {
+        %idx = arith.index_cast %arg0 : i32 to index
+        ttng.subtiled_region_yield
+      } teardown {
+        ttng.subtiled_region_yield
+      }
+    tt.return
+  }
+
+  // Test arrive_barrier AFTER a teardown op (region = teardown).
+  // CHECK-LABEL: @arrive_after_teardown_op
+  tt.func @arrive_after_teardown_op(
+      %bar: !ttg.memdesc<1xi64, #shared, #smem, mutable>) -> i32 {
+    // Setup + tiles:
+    // CHECK: arith.constant 0
+    // CHECK: arith.constant 1
+    // CHECK: arith.index_cast
+    // CHECK: arith.index_cast
+    // Teardown: arrive_barrier after the constant in teardown:
+    // CHECK: arith.constant 42
+    // CHECK-NEXT: ttng.arrive_barrier
+    // CHECK-NOT: ttng.subtiled_region
+    %result = ttng.subtiled_region
+        barriers(%bar : !ttg.memdesc<1xi64, #shared, #smem, mutable>)
+        tile_mappings = [array<i32: 0>, array<i32: 1>]
+        barrier_annotations = [
+          #ttng.barrier_annotation<barrierIdx = 0, placement = after,
+            targetOpIdx = 0, barrierOpKind = "arrive_barrier",
+            region = teardown>
+        ]
+      setup {
+        %c0 = arith.constant 0 : i32
+        %c1 = arith.constant 1 : i32
+        ttng.subtiled_region_yield %c0, %c1 : i32, i32
+      } tile(%arg0: i32) {
+        %idx = arith.index_cast %arg0 : i32 to index
+        ttng.subtiled_region_yield
+      } teardown {
+        %c42 = arith.constant 42 : i32
+        ttng.subtiled_region_yield %c42 : i32
+      } -> (i32)
+    tt.return %result : i32
+  }
 }

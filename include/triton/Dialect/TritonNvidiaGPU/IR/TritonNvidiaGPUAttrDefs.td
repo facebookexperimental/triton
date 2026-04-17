@@ -97,6 +97,21 @@ def TTNG_BarrierPlacement : I32EnumAttr<"BarrierPlacement",
 }
 
 //===----------------------------------------------------------------------===//
+// BarrierRegion enum
+//===----------------------------------------------------------------------===//
+
+def TTNG_BarrierRegionTile     : I32EnumAttrCase<"TILE",     0, "tile">;
+def TTNG_BarrierRegionSetup    : I32EnumAttrCase<"SETUP",    1, "setup">;
+def TTNG_BarrierRegionTeardown : I32EnumAttrCase<"TEARDOWN", 2, "teardown">;
+
+def TTNG_BarrierRegion : I32EnumAttr<"BarrierRegion",
+    "Which region of a subtiled_region the barrier targets",
+    [TTNG_BarrierRegionTile, TTNG_BarrierRegionSetup,
+     TTNG_BarrierRegionTeardown]> {
+  let cppNamespace = "::mlir::triton::nvidia_gpu";
+}
+
+//===----------------------------------------------------------------------===//
 // BarrierAnnotation attribute
 //===----------------------------------------------------------------------===//
 
@@ -106,13 +121,15 @@ def TTNG_BarrierAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnota
     Describes where to insert a barrier operation during subtiled region lowering.
 
     - `barrierIdx`: index into the op's barriers operand list
-    - `placement`: BEFORE first tile or AFTER last tile
-    - `targetOpIdx`: index of the target op in the tile region body (0-based,
-      counting only non-terminator ops). The barrier is placed immediately
-      before (BEFORE placement, first tile) or after (AFTER placement, last
-      tile) this op.
+    - `placement`: BEFORE or AFTER the target op
+    - `targetOpIdx`: index of the target op in the target region body (0-based,
+      counting only non-terminator ops)
     - `barrierOpKind`: "wait_barrier" or "arrive_barrier"
     - `count`: arrive count for arrive_barrier (default 1)
+    - `region`: which region the barrier targets (default TILE):
+        - TILE: placed relative to first/last tile replication (existing behavior)
+        - SETUP: placed in the setup region (runs once before all tiles)
+        - TEARDOWN: placed in the teardown region (runs once after all tiles)
   }];
   let parameters = (
     ins
@@ -120,7 +137,8 @@ def TTNG_BarrierAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnota
     "BarrierPlacement":$placement,
     "unsigned":$targetOpIdx,
     "StringAttr":$barrierOpKind,
-    DefaultValuedParameter<"unsigned", "1">:$count
+    DefaultValuedParameter<"unsigned", "1">:$count,
+    DefaultValuedParameter<"BarrierRegion", "BarrierRegion::TILE">:$region
   );
   let assemblyFormat = "`<` struct(params) `>`";
 }

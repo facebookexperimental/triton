@@ -1161,10 +1161,16 @@ LogicalResult SubtiledRegionOp::verify() {
     }
   }
 
-  // Count non-terminator ops in tile body for targetOpIdx validation.
+  // Count non-terminator ops in each region for targetOpIdx validation.
   unsigned numTileOps = 0;
   for (Operation &op : tileBlock.without_terminator())
     ++numTileOps;
+  unsigned numSetupOps = 0;
+  for (Operation &op : setupBlock.without_terminator())
+    ++numSetupOps;
+  unsigned numTeardownOps = 0;
+  for (Operation &op : teardownBlock.without_terminator())
+    ++numTeardownOps;
 
   // 9-10. Validate barrier annotations
   unsigned numBarriers = getBarriers().size();
@@ -1196,11 +1202,18 @@ LogicalResult SubtiledRegionOp::verify() {
       return emitOpError("barrierAnnotations[")
              << i << "] has unknown barrierOpKind '" << kind << "'";
 
-    // Validate targetOpIdx is in range
-    if (annotation.getTargetOpIdx() >= numTileOps)
+    // Validate targetOpIdx is in range for the target region
+    BarrierRegion region = annotation.getRegion();
+    unsigned maxOps = (region == BarrierRegion::SETUP)      ? numSetupOps
+                      : (region == BarrierRegion::TEARDOWN) ? numTeardownOps
+                                                            : numTileOps;
+    const char *regionName = (region == BarrierRegion::SETUP)      ? "setup"
+                             : (region == BarrierRegion::TEARDOWN) ? "teardown"
+                                                                   : "tile";
+    if (annotation.getTargetOpIdx() >= maxOps)
       return emitOpError("barrierAnnotations[")
              << i << "] has targetOpIdx=" << annotation.getTargetOpIdx()
-             << " but tile region has only " << numTileOps
+             << " but " << regionName << " region has only " << maxOps
              << " non-terminator ops";
   }
 

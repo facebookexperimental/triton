@@ -22,15 +22,82 @@ static void emitBarrierOp(OpBuilder &builder, Location loc,
   }
 }
 
+/// Emit barrier ops for a list of annotations at a given op index in a
+/// region block, using the provided builder.
+static void emitBarriersForRegion(
+    OpBuilder &builder, Location loc, Block &block,
+    llvm::DenseMap<unsigned, SmallVector<BarrierAnnotationAttr>> &beforeMap,
+    llvm::DenseMap<unsigned, SmallVector<BarrierAnnotationAttr>> &afterMap,
+    ValueRange barriers, ValueRange phases, IRMapping &mapping) {
+  unsigned opIdx = 0;
+  for (Operation &op : block.without_terminator()) {
+    auto itBefore = beforeMap.find(opIdx);
+    if (itBefore != beforeMap.end()) {
+      for (auto &annotation : itBefore->second)
+        emitBarrierOp(builder, loc, annotation, barriers, phases);
+    }
+
+    builder.clone(op, mapping);
+
+    auto itAfter = afterMap.find(opIdx);
+    if (itAfter != afterMap.end()) {
+      for (auto &annotation : itAfter->second)
+        emitBarrierOp(builder, loc, annotation, barriers, phases);
+    }
+    ++opIdx;
+  }
+}
+
 void lowerSubtiledRegion(SubtiledRegionOp op) {
   OpBuilder builder(op);
   Location loc = op.getLoc();
 
-  // 1. Clone setup region ops (except yield) before the op.
+  ValueRange barriers = op.getBarriers();
+  ValueRange phases = op.getBarrierPhases();
+
+  // Pre-process barrier annotations by region and target op index.
+  // For TILE region: beforeFirst[opIdx] / afterLast[opIdx]
+  // For SETUP/TEARDOWN: before[opIdx] / after[opIdx]
+  llvm::DenseMap<unsigned, SmallVector<BarrierAnnotationAttr>> tileBeforeFirst,
+      tileAfterLast;
+  llvm::DenseMap<unsigned, SmallVector<BarrierAnnotationAttr>> setupBefore,
+      setupAfter, teardownBefore, teardownAfter;
+
+  for (Attribute attr : op.getBarrierAnnotations()) {
+    auto annotation = cast<BarrierAnnotationAttr>(attr);
+    unsigned opIdx = annotation.getTargetOpIdx();
+    BarrierRegion region = annotation.getRegion();
+
+    if (region == BarrierRegion::SETUP) {
+      if (annotation.getPlacement() == BarrierPlacement::BEFORE)
+        setupBefore[opIdx].push_back(annotation);
+      else
+        setupAfter[opIdx].push_back(annotation);
+    } else if (region == BarrierRegion::TEARDOWN) {
+      if (annotation.getPlacement() == BarrierPlacement::BEFORE)
+        teardownBefore[opIdx].push_back(annotation);
+      else
+        teardownAfter[opIdx].push_back(annotation);
+    } else {
+      // TILE region: existing behavior (BEFORE first tile, AFTER last tile).
+      if (annotation.getPlacement() == BarrierPlacement::BEFORE)
+        tileBeforeFirst[opIdx].push_back(annotation);
+      else
+        tileAfterLast[opIdx].push_back(annotation);
+    }
+  }
+
+  // 1. Clone setup region ops (except yield), emitting setup barriers.
   Block &setupBlock = op.getSetupRegion().front();
   IRMapping setupMapping;
-  for (Operation &setupOp : setupBlock.without_terminator())
-    builder.clone(setupOp, setupMapping);
+  if (setupBefore.empty() && setupAfter.empty()) {
+    // Fast path: no setup barriers.
+    for (Operation &setupOp : setupBlock.without_terminator())
+      builder.clone(setupOp, setupMapping);
+  } else {
+    emitBarriersForRegion(builder, loc, setupBlock, setupBefore, setupAfter,
+                          barriers, phases, setupMapping);
+  }
 
   // 2. Collect remapped setup outputs from the cloned yield operands.
   auto yieldOp = cast<SubtiledRegionYieldOp>(setupBlock.getTerminator());
@@ -38,28 +105,11 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
   for (Value v : yieldOp.getResults())
     setupOutputs.push_back(setupMapping.lookupOrDefault(v));
 
-  // 3. Pre-process barrier annotations by target op index.
-  //    beforeFirst[opIdx] -> annotations with placement=BEFORE
-  //    afterLast[opIdx]   -> annotations with placement=AFTER
-  llvm::DenseMap<unsigned, SmallVector<BarrierAnnotationAttr>> beforeFirst,
-      afterLast;
-  for (Attribute attr : op.getBarrierAnnotations()) {
-    auto annotation = cast<BarrierAnnotationAttr>(attr);
-    unsigned opIdx = annotation.getTargetOpIdx();
-    if (annotation.getPlacement() == BarrierPlacement::BEFORE)
-      beforeFirst[opIdx].push_back(annotation);
-    else
-      afterLast[opIdx].push_back(annotation);
-  }
-
   ArrayAttr tileMappings = op.getTileMappings();
   unsigned numTiles = tileMappings.size();
   Block &tileBlock = op.getTileRegion().front();
 
-  ValueRange barriers = op.getBarriers();
-  ValueRange phases = op.getBarrierPhases();
-
-  // 4. For each tile, clone tile region ops with substitution.
+  // 3. For each tile, clone tile region ops with substitution.
   for (unsigned tileIdx = 0; tileIdx < numTiles; ++tileIdx) {
     auto indices = cast<DenseI32ArrayAttr>(tileMappings[tileIdx]);
     IRMapping tileMapping;
@@ -72,8 +122,8 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
     for (Operation &tileOp : tileBlock.without_terminator()) {
       // Before first tile: emit BEFORE annotations for this op index
       if (tileIdx == 0) {
-        auto it = beforeFirst.find(opIdx);
-        if (it != beforeFirst.end()) {
+        auto it = tileBeforeFirst.find(opIdx);
+        if (it != tileBeforeFirst.end()) {
           for (auto &annotation : it->second)
             emitBarrierOp(builder, loc, annotation, barriers, phases);
         }
@@ -83,8 +133,8 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
 
       // After last tile: emit AFTER annotations for this op index
       if (tileIdx == numTiles - 1) {
-        auto it = afterLast.find(opIdx);
-        if (it != afterLast.end()) {
+        auto it = tileAfterLast.find(opIdx);
+        if (it != tileAfterLast.end()) {
           for (auto &annotation : it->second)
             emitBarrierOp(builder, loc, annotation, barriers, phases);
         }
@@ -93,20 +143,26 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
     }
   }
 
-  // 5. Clone teardown region ops (except terminator) and collect results.
+  // 4. Clone teardown region ops (except terminator), emitting teardown
+  // barriers.
   Block &teardownBlock = op.getTeardownRegion().front();
   IRMapping teardownMapping;
-  for (Operation &teardownOp : teardownBlock.without_terminator())
-    builder.clone(teardownOp, teardownMapping);
+  if (teardownBefore.empty() && teardownAfter.empty()) {
+    for (Operation &teardownOp : teardownBlock.without_terminator())
+      builder.clone(teardownOp, teardownMapping);
+  } else {
+    emitBarriersForRegion(builder, loc, teardownBlock, teardownBefore,
+                          teardownAfter, barriers, phases, teardownMapping);
+  }
 
-  // 6. Replace op results with teardown yield values.
+  // 5. Replace op results with teardown yield values.
   auto teardownTerminator =
       cast<SubtiledRegionYieldOp>(teardownBlock.getTerminator());
   for (auto [opResult, teardownVal] :
        llvm::zip(op.getResults(), teardownTerminator.getResults()))
     opResult.replaceAllUsesWith(teardownMapping.lookupOrDefault(teardownVal));
 
-  // 7. Erase the SubtiledRegionOp.
+  // 6. Erase the SubtiledRegionOp.
   op.erase();
 }
 
@@ -128,7 +184,7 @@ public:
   }
 };
 
-} // anonymous namespace
+} // namespace
 
 } // namespace nvidia_gpu
 } // namespace triton
