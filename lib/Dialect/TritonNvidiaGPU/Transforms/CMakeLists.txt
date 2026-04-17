@@ -1,6 +1,7 @@
 add_triton_library(TritonNvidiaGPUTransforms
   CheckMatmulTwoCTAs.cpp
   FenceInsertion.cpp
+  GenerateSubtiledRegion.cpp
   InterleaveTMem.cpp
   LowerSubtiledRegion.cpp
   MMALowering.cpp

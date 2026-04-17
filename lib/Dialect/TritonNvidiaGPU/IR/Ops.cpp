@@ -1108,8 +1108,7 @@ LogicalResult SubtiledRegionOp::verify() {
                        "'ttng.subtiled_region_yield'");
 
   // 4. Teardown results must match op results
-  auto teardownOp =
-      cast<SubtiledRegionYieldOp>(teardownBlock.getTerminator());
+  auto teardownOp = cast<SubtiledRegionYieldOp>(teardownBlock.getTerminator());
   if (teardownOp.getResults().size() != getNumResults())
     return emitOpError("teardown yields ")
            << teardownOp.getResults().size() << " values but op has "
