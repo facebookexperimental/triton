@@ -87,15 +87,12 @@ def TTG_TensorMemoryScalesEncodingAttr : AttrDef<TritonNvidiaGPU_Dialect, "Tenso
 // BarrierPlacement enum
 //===----------------------------------------------------------------------===//
 
-def TTNG_BarrierPlacementBefore    : I32EnumAttrCase<"BEFORE",     0, "before">;
-def TTNG_BarrierPlacementAfter     : I32EnumAttrCase<"AFTER",      1, "after">;
-def TTNG_BarrierPlacementTileStart : I32EnumAttrCase<"TILE_START", 2, "tile_start">;
-def TTNG_BarrierPlacementTileEnd   : I32EnumAttrCase<"TILE_END",   3, "tile_end">;
+def TTNG_BarrierPlacementBefore : I32EnumAttrCase<"BEFORE", 0, "before">;
+def TTNG_BarrierPlacementAfter  : I32EnumAttrCase<"AFTER",  1, "after">;
 
 def TTNG_BarrierPlacement : I32EnumAttr<"BarrierPlacement",
-    "Barrier placement relative to tile operations",
-    [TTNG_BarrierPlacementBefore, TTNG_BarrierPlacementAfter,
-     TTNG_BarrierPlacementTileStart, TTNG_BarrierPlacementTileEnd]> {
+    "Barrier placement relative to target op",
+    [TTNG_BarrierPlacementBefore, TTNG_BarrierPlacementAfter]> {
   let cppNamespace = "::mlir::triton::nvidia_gpu";
 }
 
@@ -124,29 +121,26 @@ def TTNG_BarrierAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnota
     Describes where to insert a barrier operation during subtiled region lowering.
 
     - `barrierIdx`: index into the op's barriers/accumCnts operand lists.
-      For TILE_START/TILE_END placement, the lowering computes the per-tile
-      barrier index as `(outerAccumCnt + tileIdx) % numBuffers` and uses
-      that to index into the barriers/accumCnts arrays. The static
-      `barrierIdx` is used for BEFORE/AFTER and SETUP/TEARDOWN placement.
-    - `placement`: when the barrier fires:
-        - BEFORE: before the target op on the first tile only
-        - AFTER: after the target op on the last tile only
-        - TILE_START: before the target op on every tile
-        - TILE_END: after the target op on every tile
+      For tile-region annotations with a tileMask, the lowering computes the
+      per-tile barrier index as `(outerAccumCnt + tileIdx) % numBuffers`.
+    - `placement`: BEFORE or AFTER the target op
     - `targetOpIdx`: index of the target op in the target region body (0-based,
       counting only non-terminator ops)
     - `barrierOpKind`: "wait_barrier" or "arrive_barrier"
     - `count`: arrive count for arrive_barrier (default 1)
     - `region`: which region the barrier targets (default TILE):
-        - TILE: placed in the per-tile body
-        - SETUP: placed in the setup region (runs once before all tiles)
-        - TEARDOWN: placed in the teardown region (runs once after all tiles)
+        - TILE: placed in the per-tile body, controlled by tileMask
+        - SETUP: placed in the setup region (runs once, no mask)
+        - TEARDOWN: placed in the teardown region (runs once, no mask)
     - `numBuffers`: number of buffers for phase and buffer index computation
-      (default 1). At lowering time, for each tile replication:
+      (default 1). At lowering time, for each tile replication where
+      tileMask[tileIdx] is true:
         tileAccumCnt = outerAccumCnt + tileIdx
         bufferIdx    = tileAccumCnt % numBuffers
         phase        = (tileAccumCnt / numBuffers) & 1
-      The outer accumCnt must be incremented by numTiles each loop iteration.
+    - `tileMask`: per-tile boolean mask (one entry per tile). The barrier is
+      only emitted for tiles where the mask is true. Empty mask means emit
+      on all tiles. Only used for TILE region annotations.
   }];
   let parameters = (
     ins
@@ -156,7 +150,8 @@ def TTNG_BarrierAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnota
     "StringAttr":$barrierOpKind,
     DefaultValuedParameter<"unsigned", "1">:$count,
     DefaultValuedParameter<"BarrierRegion", "BarrierRegion::TILE">:$region,
-    DefaultValuedParameter<"unsigned", "1">:$numBuffers
+    DefaultValuedParameter<"unsigned", "1">:$numBuffers,
+    OptionalParameter<"DenseI32ArrayAttr">:$tileMask
   );
   let assemblyFormat = "`<` struct(params) `>`";
 }
