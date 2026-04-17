@@ -167,24 +167,23 @@ struct NVGPUTestAnnotateTMAStoreWaitsPass
 
 void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp) {
   funcOp.walk([&](scf::ForOp forOp) {
-    for (auto &op : forOp.getBody()->without_terminator()) {
-      auto waitOp = dyn_cast<ttng::TMAStoreTokenWaitOp>(&op);
-      if (!waitOp || !waitOp->hasAttr(kCanRotateByBufferCount))
-        continue;
+    forOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
+      if (!waitOp->hasAttr(kCanRotateByBufferCount))
+        return;
 
       auto tmaStore = getDefiningTMAStore(waitOp);
       if (!tmaStore) {
         waitOp->removeAttr(kCanRotateByBufferCount);
-        continue;
+        return;
       }
 
       Value buffer = tmaStore.getSrc();
       auto allocOp = buffer.getDefiningOp<ttg::LocalAllocOp>();
       if (!allocOp) {
         waitOp->removeAttr(kCanRotateByBufferCount);
-        continue;
+        return;
       }
-    }
+    });
   });
 }
 
