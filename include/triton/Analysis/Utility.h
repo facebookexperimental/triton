@@ -63,6 +63,8 @@ public:
 
   unsigned getScratchSizeInBytes();
 
+  unsigned getNumContiguousGroupsOnAxis();
+
   bool isReduceWithinCTA();
 
   bool isAssociative();
