@@ -270,6 +270,8 @@ def TLX_ReleaseLayoutOp : TLX_Op<"release_layout",
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
+
+  let hasFolder = 1;
 }
 
 def TLX_LocalAliasOp : TLX_Op<"local_alias",
