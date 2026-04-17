@@ -484,7 +484,7 @@ static unsigned estimateConvertScratchCost(Value value, Attribute encoding) {
     auto dstTy = srcTy.cloneWithEncoding(encoding);
     if (cvtNeedsSharedMemory(srcTy, dstTy)) {
       unsigned elems = getNumScratchElemsSwizzledCvt(srcTy, dstTy);
-      cost += elems * srcTy.getElementTypeBitWidth() / 8;
+      cost += elems * getElementBitWidth(srcTy) / 8;
     }
   }
   return cost;
@@ -1946,9 +1946,8 @@ public:
         auto dstTy = cvt.getType();
         if (!cvtNeedsSharedMemory(srcTy, dstTy))
           return;
-        unsigned scratchBytes =
-            getNumScratchElemsSwizzledCvt(srcTy, dstTy) *
-            srcTy.getElementTypeBitWidth() / 8;
+        unsigned scratchBytes = getNumScratchElemsSwizzledCvt(srcTy, dstTy) *
+                                getElementBitWidth(srcTy) / 8;
         if (baseSmem + scratchBytes > smemBudget) {
           overBudgetConverts.push_back(cvt);
         }
@@ -1985,9 +1984,9 @@ public:
           continue;
         // Elementwise ops are layout-transparent — propagate through them.
         if (user->hasTrait<OpTrait::Elementwise>() ||
-            isa<arith::ExtFOp, arith::TruncFOp, arith::ExtUIOp,
-                arith::ExtSIOp, arith::TruncIOp, arith::SIToFPOp,
-                arith::FPToSIOp, arith::BitcastOp>(user)) {
+            isa<arith::ExtFOp, arith::TruncFOp, arith::ExtUIOp, arith::ExtSIOp,
+                arith::TruncIOp, arith::SIToFPOp, arith::FPToSIOp,
+                arith::BitcastOp>(user)) {
           for (Value result : user->getResults()) {
             if (isa<RankedTensorType>(result.getType()))
               worklist.push_back(result);
@@ -2101,8 +2100,8 @@ public:
     cvt.erase();
 
     LLVM_DEBUG({
-      DBGS() << "Eliminated over-budget convert_layout, propagated "
-             << srcEnc << " through " << opsToRewrite.size() << " ops\n";
+      DBGS() << "Eliminated over-budget convert_layout, propagated " << srcEnc
+             << " through " << opsToRewrite.size() << " ops\n";
     });
   }
 };
