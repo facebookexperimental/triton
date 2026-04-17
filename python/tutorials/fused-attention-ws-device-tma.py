@@ -891,28 +891,6 @@ configs_bwd = [
 configs_bwd_persist = [
     triton.Config(
         {
-            "BLOCK_M1": 128,
-            "BLOCK_N1": 128,
-            "BLOCK_M2": 128,
-            "BLOCK_N2": 128,
-            "EPILOGUE_SUBTILE": 4,
-            "BWD_DOT_ATTRS": _DEFAULT_BWD_DOT_ATTRS,
-        },
-        num_warps=4,
-        num_stages=2,
-        pre_hook=_bwd_host_descriptor_pre_hook,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M1": 128, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 128, "EPILOGUE_SUBTILE": 4, "BWD_DOT_ATTRS":
-            _BWD_DOT_ATTRS_SCHED,  # use memory planner heuristics
-        },
-        num_warps=4,
-        num_stages=2,
-        pre_hook=_bwd_host_descriptor_pre_hook,
-    ),
-    triton.Config(
-        {
             "BLOCK_M1": 64,
             "BLOCK_N1": 128,
             "BLOCK_M2": 128,
