@@ -58,7 +58,8 @@ public:
   }
 
   void print(raw_ostream &os) const;
-  friend raw_ostream &operator<<(raw_ostream &os, const LayoutEncoding &layout) {
+  friend raw_ostream &operator<<(raw_ostream &os,
+                                 const LayoutEncoding &layout) {
     layout.print(os);
     return os;
   }
@@ -113,9 +114,9 @@ public:
 
   void setToExitState(LayoutEncodingLattice *lattice) override;
 
-  void visitNonControlFlowArguments(
-      RegionSuccessor &successor,
-      ArrayRef<BlockArgument> arguments) override {
+  void
+  visitNonControlFlowArguments(RegionSuccessor &successor,
+                               ArrayRef<BlockArgument> arguments) override {
     // Default: do nothing
   }
   LogicalResult visitRegionInReverse(Operation *op);
@@ -137,7 +138,6 @@ public:
   visitOperation(Operation *op,
                  ArrayRef<const LayoutEncodingLattice *> operands,
                  ArrayRef<LayoutEncodingLattice *> results) override;
-
 
   void setToEntryState(LayoutEncodingLattice *lattice) override;
 
@@ -232,9 +232,9 @@ public:
 
   void setToExitState(TensorLayoutLattice *lattice) override;
 
-  void visitNonControlFlowArguments(
-      RegionSuccessor &successor,
-      ArrayRef<BlockArgument> arguments) override {
+  void
+  visitNonControlFlowArguments(RegionSuccessor &successor,
+                               ArrayRef<BlockArgument> arguments) override {
     // Default: do nothing
   }
 };

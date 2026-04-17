@@ -97,9 +97,9 @@ static Type getTensorCandidateType(Value value, DataFlowSolver &solver,
   return getNewTensorType(tensorType, lattice->getValue().getLayoutEncoding());
 }
 
-static void rewriteTensorValueFromLattice(
-    Value value, DataFlowSolver &solver,
-    const llvm::DenseSet<Value> &blockedValues) {
+static void
+rewriteTensorValueFromLattice(Value value, DataFlowSolver &solver,
+                              const llvm::DenseSet<Value> &blockedValues) {
   if (!isRetaggableTensorProducerValue(value))
     return;
 
@@ -126,8 +126,8 @@ lookupMemDescLatticeOrEmitError(Value value, DataFlowSolver &solver,
   if (lattice)
     return lattice;
 
-  diagnosticOp->emitError() << "expected memdesc layout lattice for value "
-                            << value;
+  diagnosticOp->emitError()
+      << "expected memdesc layout lattice for value " << value;
   return failure();
 }
 
@@ -239,7 +239,8 @@ computeBlockedTensorValues(triton::FuncOp funcOp, DataFlowSolver &solver) {
             continue;
 
           LDBG("Blocking tensor carrier value due to inconsistent predecessor "
-               "layouts at " << branchOp->getName());
+               "layouts at "
+               << branchOp->getName());
           changed |= blockedValues.insert(successorInput).second;
           for (Value predecessorValue : predecessorValues) {
             if (!isa<RankedTensorType>(predecessorValue.getType()))
@@ -256,9 +257,9 @@ computeBlockedTensorValues(triton::FuncOp funcOp, DataFlowSolver &solver) {
   return blockedValues;
 }
 
-static void updateTensorRegionBranchTypes(
-    triton::FuncOp funcOp, DataFlowSolver &solver,
-    const llvm::DenseSet<Value> &blockedValues) {
+static void
+updateTensorRegionBranchTypes(triton::FuncOp funcOp, DataFlowSolver &solver,
+                              const llvm::DenseSet<Value> &blockedValues) {
   funcOp.walk<WalkOrder::PostOrder>([&](RegionBranchOpInterface branchOp) {
     SmallVector<RegionSuccessor> successors;
     collectRegionBranchSuccessors(branchOp, successors);
