@@ -22,6 +22,7 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/StrUtil.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/MathExtras.h"
@@ -3783,8 +3784,11 @@ LogicalResult TritonGPUDialect::verifyOperationAttribute(Operation *op,
   // Verify that op partitions include partitions of all child ops.
   // Skip for ReduceOp and MapElementwiseOp whose regions contain function-like
   // bodies where individual ops don't need partition annotations.
+  // Meta's partition scheduler intentionally leaves some ops unpartitioned for
+  // doTaskIdPropagate).
   if (attr.getName() == kPartitionAttrName && op->getNumRegions() != 0 &&
-      !isa<triton::ReduceOp, triton::MapElementwiseOp>(op)) {
+      !isa<triton::ReduceOp, triton::MapElementwiseOp>(op) &&
+      !triton::tools::getBoolEnv("TRITON_USE_META_PARTITION")) {
     SetVector<int> expectedIds;
     for (auto &region : op->getRegions()) {
       for (auto &block : region.getBlocks()) {
