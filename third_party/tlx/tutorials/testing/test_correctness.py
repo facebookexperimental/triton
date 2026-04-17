@@ -12,6 +12,8 @@ from triton.language.extra.tlx.tutorials.blackwell_gemm_pipelined import (
     matmul as _blackwell_gemm_pipelined, )
 from triton.language.extra.tlx.tutorials.blackwell_gemm_2cta import (
     matmul as _blackwell_gemm_2cta, )
+from triton.language.extra.tlx.tutorials.blackwell_gemm_ws_persist_b import (
+    matmul as _blackwell_gemm_ws_persist_b, )
 from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent import (
     attention as _blackwell_fa_ws_pipelined_persistent,
     _attn_bwd_preprocess as _blackwell_fa_bwd_preprocess,
@@ -334,6 +336,19 @@ def test_blackwell_gemm_pipelined(dtype):
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_gemm_2cta(dtype):
     Gemm.run_test(_blackwell_gemm_2cta, Gemm.CONFIGS["blackwell_gemm_2cta"], dtype=dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("M", [4096, 8192, 32768])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_ws_persist_b(M, dtype):
+    N, K = 384, 384
+    torch.manual_seed(0)
+    a = torch.randn((M, K), device=DEVICE, dtype=dtype)
+    b = torch.randn((K, N), device=DEVICE, dtype=dtype)
+    torch_output = torch.matmul(a, b)
+    triton_output = _blackwell_gemm_ws_persist_b(a, b)
+    torch.testing.assert_close(triton_output, torch_output)
 
 
 # =============================================================================

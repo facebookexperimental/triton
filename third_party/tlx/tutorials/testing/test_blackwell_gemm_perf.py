@@ -12,6 +12,8 @@ from triton.language.extra.tlx.tutorials.blackwell_gemm_pipelined import (
     matmul as _tlx_matmul_pipelined, )
 from triton.language.extra.tlx.tutorials.blackwell_gemm_2cta import (
     matmul as _tlx_matmul_2cta, )
+from triton.language.extra.tlx.tutorials.blackwell_gemm_ws_persist_b import (
+    matmul as _tlx_matmul_persist_b, )
 
 from triton._internal_testing import is_blackwell
 
@@ -23,6 +25,7 @@ MATMUL_METHODS = {
     "clc": _tlx_matmul_clc,
     "pipelined": _tlx_matmul_pipelined,
     "2cta": _tlx_matmul_2cta,
+    "persist_b": _tlx_matmul_persist_b,
 }
 
 ref_lib = "cuBLAS"
@@ -42,7 +45,7 @@ def create_benchmark(versions, dtype=torch.float16):
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=["M", "N", "K"],
-            x_vals=[2048, 4096, 8192],
+            x_vals=[(2686391, 384, 384)],
             line_arg="provider",
             line_vals=line_vals,
             line_names=line_names,
