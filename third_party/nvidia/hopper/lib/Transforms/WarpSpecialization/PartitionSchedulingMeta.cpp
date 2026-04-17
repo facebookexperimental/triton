@@ -35,7 +35,8 @@ namespace ttng = triton::nvidia_gpu;
 namespace {
 
 inline bool isEpilogueStoreOp(Operation *op) {
-  return isa<DescriptorStoreOp, ttng::AsyncTMACopyLocalToGlobalOp>(op);
+  return isa<DescriptorStoreOp, ttng::AsyncTMACopyLocalToGlobalOp,
+             ttng::TMAStoreTokenWaitOp>(op);
 }
 
 /// Check if an operation is an MMA-like operation (MMAv5 or WarpGroupDot).
