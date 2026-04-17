@@ -1,3 +1,4 @@
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 
@@ -8,14 +9,31 @@ namespace nvidia_gpu {
 #define GEN_PASS_DEF_TRITONNVIDIAGPULOWERSUBTILEDREGIONPASS
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h.inc"
 
+/// Compute the phase from an accumulation count and number of buffers:
+///   phase = (accumCnt / numBuffers) & 1
+/// Returns an i32 value.
+static Value computePhase(OpBuilder &builder, Location loc, Value accumCnt,
+                          unsigned numBuffers) {
+  Value numBuf = arith::ConstantOp::create(
+      builder, loc, builder.getI64IntegerAttr(numBuffers));
+  Value div = arith::DivUIOp::create(builder, loc, accumCnt, numBuf);
+  Value one64 =
+      arith::ConstantOp::create(builder, loc, builder.getI64IntegerAttr(1));
+  Value andOp = arith::AndIOp::create(builder, loc, div, one64);
+  return arith::TruncIOp::create(builder, loc, builder.getI32Type(), andOp);
+}
+
 /// Emit a barrier operation based on the annotation kind.
+/// For wait_barrier, computes the phase from the accumulation count.
 static void emitBarrierOp(OpBuilder &builder, Location loc,
                           BarrierAnnotationAttr annotation, ValueRange barriers,
-                          ValueRange phases) {
+                          ValueRange accumCnts) {
   unsigned idx = annotation.getBarrierIdx();
   StringRef kind = annotation.getBarrierOpKind().getValue();
   if (kind == "wait_barrier") {
-    WaitBarrierOp::create(builder, loc, barriers[idx], phases[idx]);
+    Value phase =
+        computePhase(builder, loc, accumCnts[idx], annotation.getNumBuffers());
+    WaitBarrierOp::create(builder, loc, barriers[idx], phase);
   } else {
     assert(kind == "arrive_barrier");
     ArriveBarrierOp::create(builder, loc, barriers[idx], annotation.getCount());
@@ -28,13 +46,13 @@ static void emitBarriersForRegion(
     OpBuilder &builder, Location loc, Block &block,
     llvm::DenseMap<unsigned, SmallVector<BarrierAnnotationAttr>> &beforeMap,
     llvm::DenseMap<unsigned, SmallVector<BarrierAnnotationAttr>> &afterMap,
-    ValueRange barriers, ValueRange phases, IRMapping &mapping) {
+    ValueRange barriers, ValueRange accumCnts, IRMapping &mapping) {
   unsigned opIdx = 0;
   for (Operation &op : block.without_terminator()) {
     auto itBefore = beforeMap.find(opIdx);
     if (itBefore != beforeMap.end()) {
       for (auto &annotation : itBefore->second)
-        emitBarrierOp(builder, loc, annotation, barriers, phases);
+        emitBarrierOp(builder, loc, annotation, barriers, accumCnts);
     }
 
     builder.clone(op, mapping);
@@ -42,7 +60,7 @@ static void emitBarriersForRegion(
     auto itAfter = afterMap.find(opIdx);
     if (itAfter != afterMap.end()) {
       for (auto &annotation : itAfter->second)
-        emitBarrierOp(builder, loc, annotation, barriers, phases);
+        emitBarrierOp(builder, loc, annotation, barriers, accumCnts);
     }
     ++opIdx;
   }
@@ -53,7 +71,7 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
   Location loc = op.getLoc();
 
   ValueRange barriers = op.getBarriers();
-  ValueRange phases = op.getBarrierPhases();
+  ValueRange accumCnts = op.getAccumCnts();
 
   // Pre-process barrier annotations by region and target op index.
   // For TILE region with BEFORE/AFTER: first/last tile only.
@@ -107,7 +125,7 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
       builder.clone(setupOp, setupMapping);
   } else {
     emitBarriersForRegion(builder, loc, setupBlock, setupBefore, setupAfter,
-                          barriers, phases, setupMapping);
+                          barriers, accumCnts, setupMapping);
   }
 
   // 2. Collect remapped setup outputs from the cloned yield operands.
@@ -136,7 +154,7 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
         auto it = tileBeforeFirst.find(opIdx);
         if (it != tileBeforeFirst.end()) {
           for (auto &annotation : it->second)
-            emitBarrierOp(builder, loc, annotation, barriers, phases);
+            emitBarrierOp(builder, loc, annotation, barriers, accumCnts);
         }
       }
 
@@ -145,7 +163,7 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
         auto it = tileEveryStart.find(opIdx);
         if (it != tileEveryStart.end()) {
           for (auto &annotation : it->second)
-            emitBarrierOp(builder, loc, annotation, barriers, phases);
+            emitBarrierOp(builder, loc, annotation, barriers, accumCnts);
         }
       }
 
@@ -156,7 +174,7 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
         auto it = tileEveryEnd.find(opIdx);
         if (it != tileEveryEnd.end()) {
           for (auto &annotation : it->second)
-            emitBarrierOp(builder, loc, annotation, barriers, phases);
+            emitBarrierOp(builder, loc, annotation, barriers, accumCnts);
         }
       }
 
@@ -165,7 +183,7 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
         auto it = tileAfterLast.find(opIdx);
         if (it != tileAfterLast.end()) {
           for (auto &annotation : it->second)
-            emitBarrierOp(builder, loc, annotation, barriers, phases);
+            emitBarrierOp(builder, loc, annotation, barriers, accumCnts);
         }
       }
       ++opIdx;
@@ -181,7 +199,7 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
       builder.clone(teardownOp, teardownMapping);
   } else {
     emitBarriersForRegion(builder, loc, teardownBlock, teardownBefore,
-                          teardownAfter, barriers, phases, teardownMapping);
+                          teardownAfter, barriers, accumCnts, teardownMapping);
   }
 
   // 5. Replace op results with teardown yield values.

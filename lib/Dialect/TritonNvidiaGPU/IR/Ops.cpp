@@ -1174,7 +1174,7 @@ LogicalResult SubtiledRegionOp::verify() {
 
   // 9-10. Validate barrier annotations
   unsigned numBarriers = getBarriers().size();
-  unsigned numPhases = getBarrierPhases().size();
+  unsigned numAccumCnts = getAccumCnts().size();
   for (auto [i, attr] : llvm::enumerate(getBarrierAnnotations())) {
     auto annotation = dyn_cast<BarrierAnnotationAttr>(attr);
     if (!annotation)
@@ -1187,13 +1187,13 @@ LogicalResult SubtiledRegionOp::verify() {
              << i << "] has barrierIdx=" << annotation.getBarrierIdx()
              << " but there are only " << numBarriers << " barriers";
 
-    // 10. For wait_barrier, check phase exists
+    // 10. For wait_barrier, check accumCnt exists
     if (annotation.getBarrierOpKind().getValue() == "wait_barrier") {
-      if (annotation.getBarrierIdx() >= numPhases)
+      if (annotation.getBarrierIdx() >= numAccumCnts)
         return emitOpError("barrierAnnotations[")
                << i << "] is a wait_barrier with barrierIdx="
                << annotation.getBarrierIdx() << " but there are only "
-               << numPhases << " phases";
+               << numAccumCnts << " accumCnts";
     }
 
     // Validate barrierOpKind is one of the known values
@@ -1253,13 +1253,13 @@ void SubtiledRegionOp::print(OpAsmPrinter &p) {
     p << ")";
   }
 
-  // Print phases
-  if (!getBarrierPhases().empty()) {
-    p << " phases(";
-    llvm::interleaveComma(getBarrierPhases(), p,
+  // Print accumCnts
+  if (!getAccumCnts().empty()) {
+    p << " accum_cnts(";
+    llvm::interleaveComma(getAccumCnts(), p,
                           [&](Value v) { p.printOperand(v); });
     p << " : ";
-    llvm::interleaveComma(getBarrierPhases().getTypes(), p,
+    llvm::interleaveComma(getAccumCnts().getTypes(), p,
                           [&](Type t) { p.printType(t); });
     p << ")";
   }
@@ -1311,8 +1311,8 @@ ParseResult SubtiledRegionOp::parse(OpAsmParser &parser,
       return failure();
   }
 
-  // Parse optional phases(...)
-  if (succeeded(parser.parseOptionalKeyword("phases"))) {
+  // Parse optional accum_cnts(...)
+  if (succeeded(parser.parseOptionalKeyword("accum_cnts"))) {
     if (parser.parseLParen() || parser.parseOperandList(phaseOperands) ||
         parser.parseColonTypeList(phaseTypes) || parser.parseRParen())
       return failure();

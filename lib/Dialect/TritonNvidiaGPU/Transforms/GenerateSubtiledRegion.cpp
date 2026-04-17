@@ -421,8 +421,8 @@ static void buildSingleSubtiledRegion(OpBuilder &builder, Location loc,
 
   auto regionOp = SubtiledRegionOp::create(
       builder, loc, /*resultTypes=*/TypeRange{},
-      /*barriers=*/ValueRange{}, /*barrierPhases=*/ValueRange{},
-      tileMappingsAttr, barrierAnnotationsAttr);
+      /*barriers=*/ValueRange{}, /*accumCnts=*/ValueRange{}, tileMappingsAttr,
+      barrierAnnotationsAttr);
 
   // --- Setup Region ---
   Block *setupBlock = &regionOp.getSetupRegion().emplaceBlock();

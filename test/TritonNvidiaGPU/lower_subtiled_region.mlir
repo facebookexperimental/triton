@@ -37,7 +37,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK-LABEL: @arrive_after_last
   tt.func @arrive_after_last(
       %bar: !ttg.memdesc<1xi64, #shared, #smem, mutable>,
-      %phase: i32,
+      %accum_cnt: i64,
       %desc: !tt.tensordesc<tensor<128x128xf32, #blocked>>,
       %row: i32) {
     // Tile 0:
@@ -50,7 +50,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // CHECK-NOT: ttng.subtiled_region
     ttng.subtiled_region
         barriers(%bar : !ttg.memdesc<1xi64, #shared, #smem, mutable>)
-        phases(%phase : i32)
+        accum_cnts(%accum_cnt : i64)
         tile_mappings = [array<i32: 0>, array<i32: 1>]
         barrier_annotations = [
           #ttng.barrier_annotation<barrierIdx = 0, placement = after,
@@ -73,7 +73,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK-LABEL: @wait_before_first
   tt.func @wait_before_first(
       %bar: !ttg.memdesc<1xi64, #shared, #smem, mutable>,
-      %phase: i32) {
+      %accum_cnt: i64) {
     // wait_barrier emitted BEFORE first tile's op at index 0:
     // CHECK: ttng.wait_barrier %{{.*}}, %{{.*}}
     // CHECK-NEXT: arith.addi
@@ -83,7 +83,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // CHECK-NOT: ttng.subtiled_region
     ttng.subtiled_region
         barriers(%bar : !ttg.memdesc<1xi64, #shared, #smem, mutable>)
-        phases(%phase : i32)
+        accum_cnts(%accum_cnt : i64)
         tile_mappings = [array<i32: 0>, array<i32: 1>]
         barrier_annotations = [
           #ttng.barrier_annotation<barrierIdx = 0, placement = before,
@@ -140,7 +140,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   tt.func @wait_and_arrive(
       %bar_wait: !ttg.memdesc<1xi64, #shared, #smem, mutable>,
       %bar_arrive: !ttg.memdesc<1xi64, #shared, #smem, mutable>,
-      %phase: i32) {
+      %accum_cnt: i64) {
     // wait_barrier BEFORE first tile's op at index 0:
     // CHECK: ttng.wait_barrier %{{.*}}, %{{.*}}
     // CHECK-NEXT: arith.muli
@@ -151,7 +151,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // CHECK-NOT: ttng.subtiled_region
     ttng.subtiled_region
         barriers(%bar_wait, %bar_arrive : !ttg.memdesc<1xi64, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #shared, #smem, mutable>)
-        phases(%phase, %phase : i32, i32)
+        accum_cnts(%accum_cnt, %accum_cnt : i64, i64)
         tile_mappings = [array<i32: 0>, array<i32: 1>]
         barrier_annotations = [
           #ttng.barrier_annotation<barrierIdx = 0, placement = before,
@@ -177,7 +177,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK-LABEL: @single_tile
   tt.func @single_tile(
       %bar: !ttg.memdesc<1xi64, #shared, #smem, mutable>,
-      %phase: i32) {
+      %accum_cnt: i64) {
     // Both BEFORE and AFTER fire on the same (only) tile:
     // CHECK: ttng.wait_barrier
     // CHECK-NEXT: arith.addi
@@ -185,7 +185,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // CHECK-NOT: ttng.subtiled_region
     ttng.subtiled_region
         barriers(%bar : !ttg.memdesc<1xi64, #shared, #smem, mutable>)
-        phases(%phase : i32)
+        accum_cnts(%accum_cnt : i64)
         tile_mappings = [array<i32: 0>]
         barrier_annotations = [
           #ttng.barrier_annotation<barrierIdx = 0, placement = before,
@@ -289,7 +289,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK-LABEL: @wait_before_setup_op
   tt.func @wait_before_setup_op(
       %bar: !ttg.memdesc<1xi64, #shared, #smem, mutable>,
-      %phase: i32) {
+      %accum_cnt: i64) {
     // wait_barrier should appear before the first setup op (arith.constant):
     // CHECK: ttng.wait_barrier
     // CHECK-NEXT: arith.constant 0
@@ -300,7 +300,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // CHECK-NOT: ttng.subtiled_region
     ttng.subtiled_region
         barriers(%bar : !ttg.memdesc<1xi64, #shared, #smem, mutable>)
-        phases(%phase : i32)
+        accum_cnts(%accum_cnt : i64)
         tile_mappings = [array<i32: 0>, array<i32: 1>]
         barrier_annotations = [
           #ttng.barrier_annotation<barrierIdx = 0, placement = before,
@@ -359,7 +359,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK-LABEL: @wait_tile_start
   tt.func @wait_tile_start(
       %bar: !ttg.memdesc<1xi64, #shared, #smem, mutable>,
-      %phase: i32) {
+      %accum_cnt: i64) {
     // wait_barrier before EVERY tile's op:
     // CHECK: ttng.wait_barrier
     // CHECK-NEXT: arith.index_cast
@@ -368,7 +368,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // CHECK-NOT: ttng.subtiled_region
     ttng.subtiled_region
         barriers(%bar : !ttg.memdesc<1xi64, #shared, #smem, mutable>)
-        phases(%phase : i32)
+        accum_cnts(%accum_cnt : i64)
         tile_mappings = [array<i32: 0>, array<i32: 1>]
         barrier_annotations = [
           #ttng.barrier_annotation<barrierIdx = 0, placement = tile_start,

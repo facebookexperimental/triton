@@ -137,6 +137,10 @@ def TTNG_BarrierAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnota
         - TILE: placed in the per-tile body
         - SETUP: placed in the setup region (runs once before all tiles)
         - TEARDOWN: placed in the teardown region (runs once after all tiles)
+    - `numBuffers`: number of buffers for phase computation (default 1).
+      For wait_barrier, the phase is computed at lowering time from the
+      accumulation count (accumCnts operand) as:
+        phase = (accumCnt / numBuffers) & 1
   }];
   let parameters = (
     ins
@@ -145,7 +149,8 @@ def TTNG_BarrierAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnota
     "unsigned":$targetOpIdx,
     "StringAttr":$barrierOpKind,
     DefaultValuedParameter<"unsigned", "1">:$count,
-    DefaultValuedParameter<"BarrierRegion", "BarrierRegion::TILE">:$region
+    DefaultValuedParameter<"BarrierRegion", "BarrierRegion::TILE">:$region,
+    DefaultValuedParameter<"unsigned", "1">:$numBuffers
   );
   let assemblyFormat = "`<` struct(params) `>`";
 }
