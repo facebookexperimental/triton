@@ -5,6 +5,7 @@
 #include "mlir/Analysis/DataFlow/Utils.h"
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "tlx/dialect/include/Analysis/LayoutPropagation.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
@@ -141,12 +142,18 @@ static bool isTrackedDotValue(Value value) {
   return isa<RankedTensorType>(value.getType());
 }
 
-static bool isAllowedDotOperandUser(Operation *op, unsigned operandIndex) {
+static bool
+isTransparentDotUserBeforeConstraintMaterialization(Operation *op,
+                                                    unsigned operandIndex) {
+  // This is the pre-materialization half of the shared dot-layout policy. The
+  // insert pass sees raw tt.dot users and the convert_layout chain that still
+  // connects them to local_load. After those converts are rewritten into
+  // explicit tlx.require_layout anchors, tlx-propagate-layout enforces the same
+  // transparent-carrier policy from the tensor constraints instead.
   if (auto dotOp = dyn_cast<tt::DotOp>(op))
     return operandIndex < 2 && operandIndex < dotOp->getNumOperands();
 
-  return isa<ttg::ConvertLayoutOp, RegionBranchOpInterface,
-             RegionBranchTerminatorOpInterface>(op);
+  return isa<ttg::ConvertLayoutOp>(op) || isTransparentLayoutCarrierOp(op);
 }
 
 class DotRewriteBackward
@@ -185,7 +192,7 @@ public:
     for (auto [index, operand] : llvm::enumerate(op->getOperands())) {
       if (!isTrackedDotValue(operand))
         continue;
-      if (isAllowedDotOperandUser(op, index))
+      if (isTransparentDotUserBeforeConstraintMaterialization(op, index))
         continue;
 
       DotRewriteState operandState = operands[index]->getValue();
@@ -291,7 +298,7 @@ static void materializeTensorRequireLayout(tt::DotOp dotOp,
     return;
 
   auto dstType = dyn_cast<RankedTensorType>(cvt.getType());
-  if (!dstType || !isa<ttg::DotOperandEncodingAttr>(dstType.getEncoding()))
+  if (!dstType || !isSupportedDotConstraintEncoding(dstType.getEncoding()))
     return;
 
   builder.setInsertionPoint(cvt);
