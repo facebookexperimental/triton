@@ -142,14 +142,14 @@ def _attn_fwd_inner_oss_dp(
 
     # loop over k, v and update accumulator
     for start_n in tl.range(
-            lo,
-            hi,
-            BLOCK_N,
-            warp_specialize=warp_specialize,
-            merge_epilogue=True,
-            separate_epilogue_store=True,
-            # disallow_acc_multi_buffer=True,
-            data_partition_factor=DP_FACTOR,
+        lo,
+        hi,
+        BLOCK_N,
+        warp_specialize=warp_specialize,
+        merge_epilogue=True,
+        separate_epilogue_store=True,
+        # disallow_acc_multi_buffer=True,
+        data_partition_factor=DP_FACTOR,
     ):
         start_n = tl.multiple_of(start_n, BLOCK_N)
 
@@ -213,15 +213,23 @@ configs = [
         num_warps=w,
         pre_hook=_host_descriptor_pre_hook,
         # ir_override=f"/home/mren/OpenSource/tritonbench/override/_attn_fwd_persist.ttgir"
-    ) for BM in [256] for BN in [128] for s in NUM_STAGES_OPTIONS for w in [4]
+    )
+    for BM in [256]
+    for BN in [128]
+    for s in NUM_STAGES_OPTIONS
+    for w in [4]
 ]
 
 
 def keep(conf):
     BLOCK_M = conf.kwargs["BLOCK_M"]
     BLOCK_N = conf.kwargs["BLOCK_N"]
-    return not (is_cuda() and torch.cuda.get_device_capability()[0] == 9 and BLOCK_M * BLOCK_N < 128 * 128
-                and conf.num_warps == 8)
+    return not (
+        is_cuda()
+        and torch.cuda.get_device_capability()[0] == 9
+        and BLOCK_M * BLOCK_N < 128 * 128
+        and conf.num_warps == 8
+    )
 
 
 def prune_invalid_configs(configs, named_args, **kwargs):
@@ -564,12 +572,12 @@ def _attn_fwd_persist(
 
     # inner loop warpspec vs. outer loop warpspec
     for _ in tl.range(
-            0,
-            tiles_per_sm,
-            warp_specialize=warp_specialize and OUTER_LOOP,
-            merge_epilogue=True,
-            separate_epilogue_store=True,
-            data_partition_factor=DP_FACTOR,
+        0,
+        tiles_per_sm,
+        warp_specialize=warp_specialize and OUTER_LOOP,
+        merge_epilogue=True,
+        separate_epilogue_store=True,
+        data_partition_factor=DP_FACTOR,
     ):
         pid = tile_idx % n_tile_num
         off_hz = tile_idx // n_tile_num
@@ -609,18 +617,23 @@ def torch_dtype_to_triton(dtype):
 @triton.jit
 def _split_n(x, SPLIT_FACTOR: tl.constexpr):
     if SPLIT_FACTOR == 1:
-        return (x, )
+        return (x,)
     else:
         x0, x1 = x.reshape([x.shape[0], 2, x.shape[1] // 2]).permute(0, 2, 1).split()
         return _split_n(x0, SPLIT_FACTOR // 2) + _split_n(x1, SPLIT_FACTOR // 2)
 
 
 @triton.jit
-def _attn_bwd_preprocess(O, DO,  #
-                         Delta,  #
-                         Z, H, N_CTX,  #
-                         BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr,  #
-                         ):
+def _attn_bwd_preprocess(
+    O,
+    DO,  #
+    Delta,  #
+    Z,
+    H,
+    N_CTX,  #
+    BLOCK_M: tl.constexpr,
+    HEAD_DIM: tl.constexpr,  #
+):
     off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     off_hz = tl.program_id(1)
     off_n = tl.arange(0, HEAD_DIM)
@@ -635,7 +648,6 @@ def _attn_bwd_preprocess(O, DO,  #
 # Frozen (hashable) wrapper for dot attrs configuration, usable in triton.Config.
 # Supports .get(key) like a dict but is hashable for Triton's JIT cache key.
 class FrozenDotAttrs:
-
     def __init__(self, d):
         self._data = d
         self._hash = hash(json.dumps(d, sort_keys=True)) if d else hash(None)
@@ -662,31 +674,41 @@ class FrozenDotAttrs:
 # Each key corresponds to a dot operation in _attn_bwd_dkdv_inner.
 # Set to None to disable attrs for a given dot (heuristic allocation).
 # Format: {"stage": str, "order": str, "channels": [str, ...]}
-_DEFAULT_BWD_DOT_ATTRS = FrozenDotAttrs({
-    "qkT": {"stage": "0", "order": "0", "channels": ["opndA,smem,1,0", "opndB,smem,2,1", "opndD,tmem,1,2"]},
-    "dpT": {"stage": "0", "order": "2", "channels": ["opndA,smem,1,3", "opndB,smem,1,4", "opndD,tmem,1,5"]},
-    "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},
-    "dq": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,5"]},
-    "dk": {"stage": "1", "order": "1", "channels": ["opndD,tmem,1,10"]},
-})
+_DEFAULT_BWD_DOT_ATTRS = FrozenDotAttrs(
+    {
+        "qkT": {"stage": "0", "order": "0", "channels": ["opndA,smem,1,0", "opndB,smem,2,1", "opndD,tmem,1,2"]},
+        "dpT": {"stage": "0", "order": "2", "channels": ["opndA,smem,1,3", "opndB,smem,1,4", "opndD,tmem,1,5"]},
+        "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},
+        "dq": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,5"]},
+        "dk": {"stage": "1", "order": "1", "channels": ["opndD,tmem,1,10"]},
+    }
+)
 
-_BWD_DOT_ATTRS_BM64 = FrozenDotAttrs({
-    # qkT inputs: k, q; dpT inputs: v, do; dv inputs: ppT, do; dq inputs: dsT, k; dk inputs: dsT, q
-    # no need to reuse between dq and dpT
-    "qkT": {"stage": "0", "order": "0", "channels": ["opndA,smem,1,0", "opndB,smem,2,1", "opndD,tmem,1,2"]},  # k, q
-    "dpT": {"stage": "0", "order": "2", "channels": ["opndA,smem,1,3", "opndB,smem,1,4", "opndD,tmem,1,5"]},  # v, do
-    "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},  # ppT
-    "dq": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,11"]},  # dsT
-    "dk": {"stage": "1", "order": "1", "channels": ["opndD,tmem,1,10"]},
-})
+_BWD_DOT_ATTRS_BM64 = FrozenDotAttrs(
+    {
+        # qkT inputs: k, q; dpT inputs: v, do; dv inputs: ppT, do; dq inputs: dsT, k; dk inputs: dsT, q
+        # no need to reuse between dq and dpT
+        "qkT": {"stage": "0", "order": "0", "channels": ["opndA,smem,1,0", "opndB,smem,2,1", "opndD,tmem,1,2"]},  # k, q
+        "dpT": {
+            "stage": "0",
+            "order": "2",
+            "channels": ["opndA,smem,1,3", "opndB,smem,1,4", "opndD,tmem,1,5"],
+        },  # v, do
+        "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},  # ppT
+        "dq": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,11"]},  # dsT
+        "dk": {"stage": "1", "order": "1", "channels": ["opndD,tmem,1,10"]},
+    }
+)
 
-_BWD_DOT_ATTRS_SCHED = FrozenDotAttrs({
-    "qkT": {"stage": "0", "order": "0"},
-    "dpT": {"stage": "0", "order": "2"},
-    "dv": {"stage": "0", "order": "2"},
-    "dq": {"stage": "1", "order": "1"},
-    "dk": {"stage": "1", "order": "1"},
-})
+_BWD_DOT_ATTRS_SCHED = FrozenDotAttrs(
+    {
+        "qkT": {"stage": "0", "order": "0"},
+        "dpT": {"stage": "0", "order": "2"},
+        "dv": {"stage": "0", "order": "2"},
+        "dq": {"stage": "1", "order": "1"},
+        "dk": {"stage": "1", "order": "1"},
+    }
+)
 
 
 @triton.jit
@@ -698,9 +720,10 @@ def _attn_bwd_dkdv_inner(
     v,
     desc_do,
     desc_dq,
-    M,
-    D,
+    desc_m,
+    desc_delta,
     off_bh,
+    off_chz,
     curr_m,
     step_m,
     start_n,
@@ -716,14 +739,15 @@ def _attn_bwd_dkdv_inner(
 ):
     q = desc_q.load([(off_bh + curr_m).to(tl.int32), 0])
     qT = tl.trans(q)
-    offs_m = curr_m + tl.arange(0, BLOCK_M1)
-    m = tl.load(M + offs_m)
+    offs_m_start = off_chz + curr_m
+    m = desc_m.load([offs_m_start.to(tl.int32)])
     if RESCHED:
         qkT = tl.dot(k, qT, attrs=BWD_DOT_ATTRS.get("qkT"))
     else:
         qkT = tl.dot(k, qT)
     pT = tl.math.exp2(qkT - m[None, :])
     if MASK:
+        offs_m = curr_m + tl.arange(0, BLOCK_M1)
         mask = offs_m[None, :] >= offs_n[:, None]
         pT = tl.where(mask, pT, 0.0)
     do = desc_do.load([(off_bh + curr_m).to(tl.int32), 0])
@@ -731,11 +755,11 @@ def _attn_bwd_dkdv_inner(
     ppT = ppT.to(dtype)
     if RESCHED:
         dpT = tl.dot(v, tl.trans(do), attrs=BWD_DOT_ATTRS.get("dpT")).to(tl.float32)
-        Di = tl.load(D + offs_m)
+        Di = desc_delta.load([offs_m_start.to(tl.int32)])
         dv += tl.dot(ppT, do, attrs=BWD_DOT_ATTRS.get("dv"))
     else:
         dv += tl.dot(ppT, do)
-        Di = tl.load(D + offs_m)
+        Di = desc_delta.load([offs_m_start.to(tl.int32)])
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
     dsT = pT * (dpT - Di[None, :])
     dsT = dsT.to(dtype)
@@ -764,12 +788,13 @@ def _attn_bwd_dkdv(
     sm_scale,  #
     desc_do,  #
     desc_dq,
-    M,
-    D,  #
+    desc_m,
+    desc_delta,  #
     # shared by Q/K/V/DO.
     stride_tok,
     stride_d,  #
     off_bh,
+    off_chz,
     H,
     N_CTX,
     BLOCK_M1: tl.constexpr,  #
@@ -794,8 +819,15 @@ def _attn_bwd_dkdv(
     curr_m = start_m
     step_m = BLOCK_M1
     if warp_specialize:
-        for blk_idx in tl.range(0, num_steps, warp_specialize=True, merge_epilogue_to_computation=True,
-                                tmem_alloc_algo=2, smem_alloc_algo=1, smem_budget=200000):
+        for blk_idx in tl.range(
+            0,
+            num_steps,
+            warp_specialize=True,
+            merge_epilogue_to_computation=True,
+            tmem_alloc_algo=2,
+            smem_alloc_algo=1,
+            smem_budget=200000,
+        ):
             dk, dv, curr_m = _attn_bwd_dkdv_inner(
                 dk,
                 dv,
@@ -804,9 +836,10 @@ def _attn_bwd_dkdv(
                 v,
                 desc_do,
                 desc_dq,
-                M,
-                D,
+                desc_m,
+                desc_delta,
                 off_bh,
+                off_chz,
                 curr_m,
                 step_m,
                 start_n,
@@ -830,9 +863,10 @@ def _attn_bwd_dkdv(
                 v,
                 desc_do,
                 desc_dq,
-                M,
-                D,
+                desc_m,
+                desc_delta,
                 off_bh,
+                off_chz,
                 curr_m,
                 step_m,
                 start_n,
@@ -870,6 +904,8 @@ def _bwd_host_descriptor_pre_hook(nargs):
     nargs["desc_k"].block_shape = [BLOCK_N1, HEAD_DIM]
     nargs["desc_dv"].block_shape = [BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
     nargs["desc_dk"].block_shape = [BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
+    nargs["desc_m"].block_shape = [BLOCK_M1]
+    nargs["desc_delta"].block_shape = [BLOCK_M1]
 
 
 configs_bwd = [
@@ -915,8 +951,8 @@ def _attn_bwd_core(
     desc_dq,
     desc_dk,
     desc_dv,  #
-    M,
-    D,  #
+    desc_m,
+    desc_delta,  #
     stride_tok,
     stride_d,  #
     stride_z,
@@ -937,9 +973,6 @@ def _attn_bwd_core(
     off_chz = (bhid * N_CTX).to(tl.int64)
     off_bh = ((stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)) // stride_tok
 
-    M += off_chz
-    D += off_chz
-
     dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
     dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
 
@@ -958,11 +991,12 @@ def _attn_bwd_core(
         sm_scale,  #
         desc_do,  #
         desc_dq,
-        M,
-        D,  #
+        desc_m,
+        desc_delta,  #
         stride_tok,
         stride_d,  #
         off_bh,
+        off_chz,
         H,
         N_CTX,  #
         BLOCK_M1,
@@ -1007,8 +1041,8 @@ def _attn_bwd(
     desc_dq,
     desc_dk,
     desc_dv,  #
-    M,
-    D,
+    desc_m,
+    desc_delta,
     # shared by Q/K/V/DO.
     stride_z,
     stride_h,
@@ -1040,8 +1074,8 @@ def _attn_bwd(
         desc_dq,
         desc_dk,
         desc_dv,
-        M,
-        D,
+        desc_m,
+        desc_delta,
         stride_tok,
         stride_d,
         stride_z,
@@ -1072,8 +1106,8 @@ def _attn_bwd_persist(
     desc_dq,
     desc_dk,
     desc_dv,  #
-    M,
-    D,
+    desc_m,
+    desc_delta,
     # shared by Q/K/V/DO.
     stride_z,
     stride_h,
@@ -1147,9 +1181,28 @@ def _attn_bwd_persist(
         strides=[HEAD_DIM, 1],
         block_shape=[BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE],
     )
+    desc_m = _maybe_make_tensor_desc(
+        desc_m,
+        shape=[y_dim],
+        strides=[1],
+        block_shape=[BLOCK_M1],
+    )
+    desc_delta = _maybe_make_tensor_desc(
+        desc_delta,
+        shape=[y_dim],
+        strides=[1],
+        block_shape=[BLOCK_M1],
+    )
 
-    for _ in tl.range(0, tiles_per_sm, warp_specialize=True, merge_epilogue_to_computation=True, tmem_alloc_algo=2,
-                      smem_alloc_algo=1, smem_budget=200000):
+    for _ in tl.range(
+        0,
+        tiles_per_sm,
+        warp_specialize=True,
+        merge_epilogue_to_computation=True,
+        tmem_alloc_algo=2,
+        smem_alloc_algo=1,
+        smem_budget=200000,
+    ):
         pid = tile_idx % n_tile_num
         bhid = tile_idx // n_tile_num
         _attn_bwd_core(
@@ -1161,8 +1214,8 @@ def _attn_bwd_persist(
             desc_dq,
             desc_dk,
             desc_dv,
-            M,
-            D,
+            desc_m,
+            desc_delta,
             stride_tok,
             stride_d,
             stride_z,
@@ -1184,7 +1237,6 @@ def _attn_bwd_persist(
 
 
 class _attention_opt(torch.autograd.Function):
-
     @staticmethod
     def forward(ctx, q, k, v, causal, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE):
         # shape constraints
@@ -1312,10 +1364,14 @@ class _attention_opt(torch.autograd.Function):
         pre_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
         delta = torch.empty_like(M)
         _attn_bwd_preprocess[pre_grid](
-            o, do,  #
+            o,
+            do,  #
             delta,  #
-            BATCH, N_HEAD, N_CTX,  #
-            BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM,  #
+            BATCH,
+            N_HEAD,
+            N_CTX,  #
+            BLOCK_M=PRE_BLOCK,
+            HEAD_DIM=ctx.HEAD_DIM,  #
         )
         warp_specialize = True
 
@@ -1373,6 +1429,19 @@ class _attention_opt(torch.autograd.Function):
             strides=[HEAD_DIM, 1],
             block_shape=dummy_block,
         )
+        dummy_block_1d = [1]
+        desc_m = TensorDescriptor(
+            M,
+            shape=[BATCH * N_HEAD * N_CTX],
+            strides=[1],
+            block_shape=dummy_block_1d,
+        )
+        desc_delta = TensorDescriptor(
+            delta,
+            shape=[BATCH * N_HEAD * N_CTX],
+            strides=[1],
+            block_shape=dummy_block_1d,
+        )
 
         def grid(meta):
             return (
@@ -1403,8 +1472,8 @@ class _attention_opt(torch.autograd.Function):
                 desc_dq,
                 desc_dk,
                 desc_dv,  #
-                M,
-                delta,  #
+                desc_m,
+                desc_delta,  #
                 q.stride(0),
                 q.stride(1),
                 q.stride(2),
@@ -1428,8 +1497,8 @@ class _attention_opt(torch.autograd.Function):
                 desc_dq,
                 desc_dk,
                 desc_dv,  #
-                M,
-                delta,  #
+                desc_m,
+                desc_delta,  #
                 q.stride(0),
                 q.stride(1),
                 q.stride(2),
@@ -1456,18 +1525,31 @@ attention = _attention_opt.apply
 )
 @pytest.mark.parametrize("Z", [8])
 @pytest.mark.parametrize("H", [16])
-@pytest.mark.parametrize("N_CTX", [1024])  #, 2048])
+@pytest.mark.parametrize("N_CTX", [1024])  # , 2048])
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("mode", ["fwd", "bwd"])
 @pytest.mark.parametrize("baseVariant", ["ws_persistent", "ws"])
 @pytest.mark.parametrize("provider", ["triton-fp16"])
 @pytest.mark.parametrize("SUBTILING", [False, True])
-@pytest.mark.parametrize("VECT_MUL", [0])  #, 1, 2, 3])
+@pytest.mark.parametrize("VECT_MUL", [0])  # , 1, 2, 3])
 @pytest.mark.parametrize("FADD2_REDUCE", [False])
 @pytest.mark.parametrize("bwd_config_idx", range(len(configs_bwd_persist)))
-def test_op(Z, H, N_CTX, HEAD_DIM, causal, mode, baseVariant, provider, SUBTILING, VECT_MUL, FADD2_REDUCE,
-            bwd_config_idx, dtype=torch.float16):
+def test_op(
+    Z,
+    H,
+    N_CTX,
+    HEAD_DIM,
+    causal,
+    mode,
+    baseVariant,
+    provider,
+    SUBTILING,
+    VECT_MUL,
+    FADD2_REDUCE,
+    bwd_config_idx,
+    dtype=torch.float16,
+):
     # For fwd mode, only run once (bwd_config_idx=0) to avoid redundant tests
     if mode == "fwd" and bwd_config_idx > 0:
         pytest.skip("bwd_config_idx only applies to bwd mode")
@@ -1482,9 +1564,9 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, mode, baseVariant, provider, SUBTILIN
         _attn_bwd.configs = [configs_bwd_persist[bwd_config_idx]]
         _attn_bwd.cache = {}
     torch.manual_seed(20)
-    q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    v = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    q = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
+    k = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
+    v = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
     sm_scale = 0.5
     # reference implementation
     ref_dtype = dtype
@@ -1536,8 +1618,8 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, mode, baseVariant, provider, SUBTILIN
 
 
 try:
-    from flash_attn.flash_attn_interface import \
-        flash_attn_qkvpacked_func as flash_attn_func
+    from flash_attn.flash_attn_interface import flash_attn_qkvpacked_func as flash_attn_func
+
     HAS_FLASH = True
 except BaseException:
     HAS_FLASH = False
@@ -1546,13 +1628,13 @@ TORCH_HAS_FP8 = False
 BATCH, N_HEADS = 4, 32
 # vary seq length for fixed head and batch=4
 configs = []
-for HEAD_DIM in [128]:  #64, 128]:
+for HEAD_DIM in [128]:  # 64, 128]:
     for baseVariant in ["ws", "ws_persistent"]:
         for mode in ["fwd", "bwd"]:
             configs.append(
                 triton.testing.Benchmark(
                     x_names=["N_CTX"],
-                    x_vals=[2**i for i in range(12, 13)],  #0, 15)],
+                    x_vals=[2**i for i in range(12, 13)],  # 0, 15)],
                     line_arg="provider",
                     line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
                     line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),
@@ -1566,7 +1648,8 @@ for HEAD_DIM in [128]:  #64, 128]:
                         "mode": mode,
                         "baseVariant": baseVariant,
                     },
-                ))
+                )
+            )
 
 
 @triton.testing.perf_report(configs)
