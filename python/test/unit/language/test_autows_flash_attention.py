@@ -6,6 +6,9 @@ The kernel is ported from tritonbench's blackwell_triton_fused_attention_dp
 to remove the external dependency.
 """
 
+import importlib.util
+import os
+
 import pytest
 import torch
 import triton
@@ -488,7 +491,7 @@ def _attn_fwd_persist(
 # =============================================================================
 
 
-def attention_forward(q, k, v, causal, sm_scale):
+def attention_forward(q, k, v, causal, sm_scale, num_warps=4):
     """Launch the persistent WS flash attention DP kernel."""
     HEAD_DIM = q.shape[-1]
     Z, H, N_CTX = q.shape[0], q.shape[1], q.shape[2]
@@ -563,7 +566,7 @@ def attention_forward(q, k, v, causal, sm_scale):
         FADD2_REDUCE=False,
         GROUP_SIZE_N=1,
         num_stages=3,
-        num_warps=4,
+        num_warps=num_warps,
         maxnreg=128,
     )
     return o
@@ -595,8 +598,12 @@ class FlashAttention:
 
 @pytest.mark.parametrize("causal", [False, True], ids=["non_causal", "causal"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bf16"])
+@pytest.mark.parametrize("num_warps", [4, 8])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
-def test_blackwell_fa_autows_dp(causal, dtype):
+def test_blackwell_fa_autows_dp(causal, dtype, num_warps):
+    if num_warps != 4:
+        pytest.skip("FA kernel exceeds shared memory limits with num_warps != 4")
+
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
         triton.knobs.nvidia.use_meta_partition = True
@@ -605,5 +612,62 @@ def test_blackwell_fa_autows_dp(causal, dtype):
             sm_scale = 1.0 / (HEAD_DIM**0.5)
             q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM, dtype)
             ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
-            tri_out = attention_forward(q, k, v, causal, sm_scale)
+            tri_out = attention_forward(q, k, v, causal, sm_scale, num_warps=num_warps)
             torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=1e-2)
+
+
+# =============================================================================
+# Backward test — imports fwd+bwd from the tutorial kernel
+# =============================================================================
+
+def _import_tutorial(name, filename):
+    tutorials_dir = os.path.join(os.path.dirname(__file__), "..", "..", "..", "tutorials")
+    spec = importlib.util.spec_from_file_location(name, os.path.join(tutorials_dir, filename))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.parametrize("causal", [False], ids=["non_causal"])
+@pytest.mark.parametrize("dtype", [torch.float16], ids=["fp16"])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_fa_autows_bwd(causal, dtype):
+    """Test backward pass of Flash Attention with autoWS."""
+    fused_attn = _import_tutorial("fused_attention_ws_device_tma", "fused-attention-ws-device-tma.py")
+    attention = fused_attn._attention_opt.apply
+
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.use_meta_partition = True
+
+        Z, H, N_CTX, HEAD_DIM = 4, 32, 1024, 128
+        sm_scale = 0.5
+        torch.manual_seed(20)
+        q = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_()
+        k = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_()
+        v = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_()
+
+        # Reference
+        M = torch.tril(torch.ones((N_CTX, N_CTX), device="cuda"))
+        p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
+        if causal:
+            p[:, :, M == 0] = float("-inf")
+        p = torch.softmax(p.float(), dim=-1).to(dtype)
+        ref_out = torch.matmul(p, v).half()
+        dout = torch.randn_like(q)
+        ref_out.backward(dout)
+        ref_dv, v.grad = v.grad.clone(), None
+        ref_dk, k.grad = k.grad.clone(), None
+        ref_dq, q.grad = q.grad.clone(), None
+
+        # Triton
+        tri_out = attention(q, k, v, causal, sm_scale, "ws_persistent", True, 0, False).half()
+        tri_out.backward(dout)
+        tri_dv, v.grad = v.grad.clone(), None
+        tri_dk, k.grad = k.grad.clone(), None
+        tri_dq, q.grad = q.grad.clone(), None
+
+        torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
+        torch.testing.assert_close(tri_dv, ref_dv, atol=1e-2, rtol=0)
+        torch.testing.assert_close(tri_dk, ref_dk, atol=1e-2, rtol=0)
+        torch.testing.assert_close(tri_dq, ref_dq, atol=1e-2, rtol=0)

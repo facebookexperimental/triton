@@ -1011,6 +1011,8 @@ getInitialSchedule(scf::ForOp mainLoop,
   //===--------------------------------------------------------------------===//
   std::unique_ptr<SchedulingTemplate> tmpl =
       selectTemplate(categorizer, mergeEpilogueIntoComputation);
+  mainLoop->setAttr("tt.ws_template",
+                    StringAttr::get(mainLoop.getContext(), tmpl->getName()));
   LLVM_DEBUG(
       llvm::dbgs() << "[tritongpu-partition-scheduling] Selected template: "
                    << tmpl->getName() << "\n");

@@ -321,7 +321,7 @@ def matmul_kernel_descriptor_persistent_ws(
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
 @pytest.mark.parametrize("num_stages", [2, 3])
-@pytest.mark.parametrize("num_warps", [4])
+@pytest.mark.parametrize("num_warps", [4, 8])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
 @pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
@@ -347,6 +347,9 @@ def test_tutorial09_matmul_tma_warp_specialize(
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
+
+    if num_warps != 4 and DATA_PARTITION_FACTOR > 1:
+        pytest.skip("DATA_PARTITION_FACTOR > 1 requires num_warps == 4")
 
     if DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256 and BLOCK_SIZE_N == 256:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
@@ -433,7 +436,7 @@ def test_tutorial09_matmul_tma_warp_specialize(
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
 @pytest.mark.parametrize("num_stages", [2, 3])
-@pytest.mark.parametrize("num_warps", [4])
+@pytest.mark.parametrize("num_warps", [4, 8])
 @pytest.mark.parametrize("FLATTEN", [True, False])
 @pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
 @pytest.mark.parametrize("A_col_major", [False, True])
@@ -463,6 +466,9 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
+
+    if num_warps != 4 and DATA_PARTITION_FACTOR > 1:
+        pytest.skip("DATA_PARTITION_FACTOR > 1 requires num_warps == 4")
 
     if (DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256
             and (BLOCK_SIZE_N == 256 or (BLOCK_SIZE_K == 128 and not FLATTEN))):
@@ -589,7 +595,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
 @pytest.mark.parametrize("num_stages", [2, 3])
-@pytest.mark.parametrize("num_warps", [4])
+@pytest.mark.parametrize("num_warps", [4, 8])
 @pytest.mark.parametrize("FLATTEN", [True, False])
 @pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
 @pytest.mark.parametrize("A_col_major", [False, True])
@@ -619,6 +625,9 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
+
+    if num_warps != 4 and DATA_PARTITION_FACTOR > 1:
+        pytest.skip("DATA_PARTITION_FACTOR > 1 requires num_warps == 4")
 
     if DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256 and num_stages == 3 and FLATTEN:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
