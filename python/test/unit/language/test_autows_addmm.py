@@ -193,6 +193,9 @@ def test_autows_addmm_tma_persistent(
     if BLOCK_SIZE_M == 256 and FLATTEN and BLOCK_SIZE_K == 128 and num_stages == 3 and EPILOGUE_SUBTILE != 4:
         pytest.skip("Out of resources: shared memory exceeded")
 
+    if num_warps == 8 and SMEM_ALLOC_ALGO == 1 and EPILOGUE_SUBTILE == 4 and not FLATTEN:
+        pytest.skip("Out of resources: shared memory exceeded with num_warps=8")
+
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
         triton.knobs.nvidia.use_meta_partition = True
