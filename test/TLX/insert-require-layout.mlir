@@ -63,30 +63,30 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     %alloc_a = ttg.local_alloc : () -> !ttg.memdesc<2x64x32xf16, #shared_1, #smem_1, mutable>
     %buf_a0 = ttg.memdesc_index %alloc_a[%c0_i32] : !ttg.memdesc<2x64x32xf16, #shared_1, #smem_1, mutable> -> !ttg.memdesc<64x32xf16, #shared_1, #smem_1, mutable>
     // CHECK: %[[REQ_A_MEM:.*]] = tlx.require_layout %{{.*}} {{.*}} -> !ttg.memdesc<64x32xf16, #{{.*}}, #smem, mutable>
-    // CHECK-NEXT: %[[A_INIT:.*]] = ttg.local_load %[[REQ_A_MEM]] : !ttg.memdesc<64x32xf16, #{{.*}}, #smem, mutable> -> tensor<64x32xf16, #blocked_1>
+    // CHECK-NEXT: %[[A_INIT:.*]] = ttg.local_load %[[REQ_A_MEM]] : !ttg.memdesc<64x32xf16, #{{.*}}, #smem, mutable> -> tensor<64x32xf16, #{{.*}}>
     %a_init = ttg.local_load %buf_a0 : !ttg.memdesc<64x32xf16, #shared_1, #smem_1, mutable> -> tensor<64x32xf16, #blocked_1>
     %alloc_b = ttg.local_alloc : () -> !ttg.memdesc<2x32x64xf16, #shared_1, #smem_1, mutable>
     %buf_b0 = ttg.memdesc_index %alloc_b[%c0_i32] : !ttg.memdesc<2x32x64xf16, #shared_1, #smem_1, mutable> -> !ttg.memdesc<32x64xf16, #shared_1, #smem_1, mutable>
     // CHECK: %[[REQ_B_MEM:.*]] = tlx.require_layout %{{.*}} {{.*}} -> !ttg.memdesc<32x64xf16, #{{.*}}, #smem, mutable>
-    // CHECK-NEXT: %[[B_INIT:.*]] = ttg.local_load %[[REQ_B_MEM]] : !ttg.memdesc<32x64xf16, #{{.*}}, #smem, mutable> -> tensor<32x64xf16, #blocked_1>
+    // CHECK-NEXT: %[[B_INIT:.*]] = ttg.local_load %[[REQ_B_MEM]] : !ttg.memdesc<32x64xf16, #{{.*}}, #smem, mutable> -> tensor<32x64xf16, #{{.*}}>
     %b_init = ttg.local_load %buf_b0 : !ttg.memdesc<32x64xf16, #shared_1, #smem_1, mutable> -> tensor<32x64xf16, #blocked_1>
     // CHECK: scf.for {{.*}} iter_args({{.*}} = {{.*}}, %[[A_ARG:.*]] = %[[A_INIT]], %[[B_ARG:.*]] = %[[B_INIT]])
     %result:3 = scf.for %i = %c0_i32 to %c4_i32 step %c1_i32
         iter_args(%acc = %cst, %a_reg = %a_init, %b_reg = %b_init)
         -> (tensor<64x64xf32, #mma_1>, tensor<64x32xf16, #blocked_1>, tensor<32x64xf16, #blocked_1>) : i32 {
-      // CHECK: %[[A_REQ:.*]] = tlx.require_layout %[[A_ARG]] : tensor<64x32xf16, #blocked_1> -> tensor<64x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>>
+      // CHECK: %[[A_REQ:.*]] = tlx.require_layout %[[A_ARG]] : tensor<64x32xf16, #{{.*}}> -> tensor<64x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>>
       %a_dot = ttg.convert_layout %a_reg : tensor<64x32xf16, #blocked_1> -> tensor<64x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_1, kWidth = 4}>>
-      // CHECK: %[[B_REQ:.*]] = tlx.require_layout %[[B_ARG]] : tensor<32x64xf16, #blocked_1> -> tensor<32x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>>
+      // CHECK: %[[B_REQ:.*]] = tlx.require_layout %[[B_ARG]] : tensor<32x64xf16, #{{.*}}> -> tensor<32x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>>
       %b_dot = ttg.convert_layout %b_reg : tensor<32x64xf16, #blocked_1> -> tensor<32x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma_1, kWidth = 4}>>
       // CHECK: tt.dot %[[A_REQ]], %[[B_REQ]]
       %dot = tt.dot %a_dot, %b_dot, %acc : tensor<64x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_1, kWidth = 4}>> * tensor<32x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma_1, kWidth = 4}>> -> tensor<64x64xf32, #mma_1>
       %buf_a1 = ttg.memdesc_index %alloc_a[%c1_i32] : !ttg.memdesc<2x64x32xf16, #shared_1, #smem_1, mutable> -> !ttg.memdesc<64x32xf16, #shared_1, #smem_1, mutable>
       // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<64x32xf16, #{{.*}}, #smem, mutable>
-      // CHECK-NEXT: ttg.local_load {{.*}} -> tensor<64x32xf16, #blocked_1>
+      // CHECK-NEXT: ttg.local_load {{.*}} -> tensor<64x32xf16, #{{.*}}>
       %a_next = ttg.local_load %buf_a1 : !ttg.memdesc<64x32xf16, #shared_1, #smem_1, mutable> -> tensor<64x32xf16, #blocked_1>
       %buf_b1 = ttg.memdesc_index %alloc_b[%c1_i32] : !ttg.memdesc<2x32x64xf16, #shared_1, #smem_1, mutable> -> !ttg.memdesc<32x64xf16, #shared_1, #smem_1, mutable>
       // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<32x64xf16, #{{.*}}, #smem, mutable>
-      // CHECK-NEXT: ttg.local_load {{.*}} -> tensor<32x64xf16, #blocked_1>
+      // CHECK-NEXT: ttg.local_load {{.*}} -> tensor<32x64xf16, #{{.*}}>
       %b_next = ttg.local_load %buf_b1 : !ttg.memdesc<32x64xf16, #shared_1, #smem_1, mutable> -> tensor<32x64xf16, #blocked_1>
       scf.yield %dot, %a_next, %b_next : tensor<64x64xf32, #mma_1>, tensor<64x32xf16, #blocked_1>, tensor<32x64xf16, #blocked_1>
     }
@@ -115,14 +115,14 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     %buf_a = ttg.memdesc_index %alloc_a[%c0_i32] : !ttg.memdesc<1x128x64xf16, #shared_default, #smem_2, mutable> -> !ttg.memdesc<128x64xf16, #shared_default, #smem_2, mutable>
     %buf_b = ttg.memdesc_index %alloc_b[%c0_i32] : !ttg.memdesc<1x64x128xf16, #shared_k_contig, #smem_2, mutable> -> !ttg.memdesc<64x128xf16, #shared_k_contig, #smem_2, mutable>
     // CHECK: %[[A_REQ_MEM:.*]] = tlx.require_layout %{{.*}} {{.*}} -> !ttg.memdesc<128x64xf16, #{{.*}}, #smem, mutable>
-    // CHECK-NEXT: %[[A_LOAD:.*]] = ttg.local_load %[[A_REQ_MEM]] : !ttg.memdesc<128x64xf16, #{{.*}}, #smem, mutable> -> tensor<128x64xf16, #blocked_2>
+    // CHECK-NEXT: %[[A_LOAD:.*]] = ttg.local_load %[[A_REQ_MEM]] : !ttg.memdesc<128x64xf16, #{{.*}}, #smem, mutable> -> tensor<128x64xf16, #{{.*}}>
     %a = ttg.local_load %buf_a : !ttg.memdesc<128x64xf16, #shared_default, #smem_2, mutable> -> tensor<128x64xf16, #blocked_2>
     // CHECK: %[[B_REQ_MEM:.*]] = tlx.require_layout %{{.*}} {{.*}} -> !ttg.memdesc<64x128xf16, #{{.*}}, #smem, mutable>
-    // CHECK-NEXT: %[[B_LOAD:.*]] = ttg.local_load %[[B_REQ_MEM]] : !ttg.memdesc<64x128xf16, #{{.*}}, #smem, mutable> -> tensor<64x128xf16, #blocked_2>
+    // CHECK-NEXT: %[[B_LOAD:.*]] = ttg.local_load %[[B_REQ_MEM]] : !ttg.memdesc<64x128xf16, #{{.*}}, #smem, mutable> -> tensor<64x128xf16, #{{.*}}>
     %b = ttg.local_load %buf_b : !ttg.memdesc<64x128xf16, #shared_k_contig, #smem_2, mutable> -> tensor<64x128xf16, #blocked_2>
-    // CHECK: tlx.require_layout %[[A_LOAD]] : tensor<128x64xf16, #blocked_2> -> tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>
+    // CHECK: tlx.require_layout %[[A_LOAD]] : tensor<128x64xf16, #{{.*}}> -> tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>
     %a_dot = ttg.convert_layout %a : tensor<128x64xf16, #blocked_2> -> tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_2, kWidth = 8}>>
-    // CHECK: tlx.require_layout %[[B_LOAD]] : tensor<64x128xf16, #blocked_2> -> tensor<64x128xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>>
+    // CHECK: tlx.require_layout %[[B_LOAD]] : tensor<64x128xf16, #{{.*}}> -> tensor<64x128xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>>
     %b_dot = ttg.convert_layout %b : tensor<64x128xf16, #blocked_2> -> tensor<64x128xf16, #ttg.dot_op<{opIdx = 1, parent = #mma_2, kWidth = 8}>>
     %dot = tt.dot %a_dot, %b_dot, %cst : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_2, kWidth = 8}>> * tensor<64x128xf16, #ttg.dot_op<{opIdx = 1, parent = #mma_2, kWidth = 8}>> -> tensor<128x128xf32, #mma_2>
     tt.return %dot : tensor<128x128xf32, #mma_2>
@@ -151,27 +151,27 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     %buf_b0 = ttg.memdesc_index %alloc_b[%c0_i32] : !ttg.memdesc<2x32x64xf16, #shared_3, #smem_3, mutable> -> !ttg.memdesc<32x64xf16, #shared_3, #smem_3, mutable>
     %buf_a1 = ttg.memdesc_index %alloc_a[%c1_i32] : !ttg.memdesc<2x64x32xf16, #shared_3, #smem_3, mutable> -> !ttg.memdesc<64x32xf16, #shared_3, #smem_3, mutable>
     %buf_b1 = ttg.memdesc_index %alloc_b[%c1_i32] : !ttg.memdesc<2x32x64xf16, #shared_3, #smem_3, mutable> -> !ttg.memdesc<32x64xf16, #shared_3, #smem_3, mutable>
-    // CHECK: scf.if {{.*}} -> (tensor<64x32xf16, #blocked_3>, tensor<32x64xf16, #blocked_3>)
+    // CHECK: scf.if {{.*}} -> (tensor<64x32xf16, #{{.*}}>, tensor<32x64xf16, #{{.*}}>)
     %if_result:2 = scf.if %cond -> (tensor<64x32xf16, #blocked_3>, tensor<32x64xf16, #blocked_3>) {
       // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<64x32xf16, #{{.*}}, #smem, mutable>
-      // CHECK-NEXT: ttg.local_load {{.*}} -> tensor<64x32xf16, #blocked_3>
+      // CHECK-NEXT: ttg.local_load {{.*}} -> tensor<64x32xf16, #{{.*}}>
       %a = ttg.local_load %buf_a0 : !ttg.memdesc<64x32xf16, #shared_3, #smem_3, mutable> -> tensor<64x32xf16, #blocked_3>
       // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<32x64xf16, #{{.*}}, #smem, mutable>
-      // CHECK-NEXT: ttg.local_load {{.*}} -> tensor<32x64xf16, #blocked_3>
+      // CHECK-NEXT: ttg.local_load {{.*}} -> tensor<32x64xf16, #{{.*}}>
       %b = ttg.local_load %buf_b0 : !ttg.memdesc<32x64xf16, #shared_3, #smem_3, mutable> -> tensor<32x64xf16, #blocked_3>
       scf.yield %a, %b : tensor<64x32xf16, #blocked_3>, tensor<32x64xf16, #blocked_3>
     } else {
       // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<64x32xf16, #{{.*}}, #smem, mutable>
-      // CHECK-NEXT: ttg.local_load {{.*}} -> tensor<64x32xf16, #blocked_3>
+      // CHECK-NEXT: ttg.local_load {{.*}} -> tensor<64x32xf16, #{{.*}}>
       %a = ttg.local_load %buf_a1 : !ttg.memdesc<64x32xf16, #shared_3, #smem_3, mutable> -> tensor<64x32xf16, #blocked_3>
       // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<32x64xf16, #{{.*}}, #smem, mutable>
-      // CHECK-NEXT: ttg.local_load {{.*}} -> tensor<32x64xf16, #blocked_3>
+      // CHECK-NEXT: ttg.local_load {{.*}} -> tensor<32x64xf16, #{{.*}}>
       %b = ttg.local_load %buf_b1 : !ttg.memdesc<32x64xf16, #shared_3, #smem_3, mutable> -> tensor<32x64xf16, #blocked_3>
       scf.yield %a, %b : tensor<64x32xf16, #blocked_3>, tensor<32x64xf16, #blocked_3>
     }
-    // CHECK: %[[IF_A_REQ:.*]] = tlx.require_layout %if_result#0 : tensor<64x32xf16, #blocked_3> -> tensor<64x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>>
+    // CHECK: %[[IF_A_REQ:.*]] = tlx.require_layout %{{.*}}#0 : tensor<64x32xf16, #{{.*}}> -> tensor<64x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>>
     %a_dot = ttg.convert_layout %if_result#0 : tensor<64x32xf16, #blocked_3> -> tensor<64x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_3, kWidth = 4}>>
-    // CHECK: %[[IF_B_REQ:.*]] = tlx.require_layout %if_result#1 : tensor<32x64xf16, #blocked_3> -> tensor<32x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>>
+    // CHECK: %[[IF_B_REQ:.*]] = tlx.require_layout %{{.*}}#1 : tensor<32x64xf16, #{{.*}}> -> tensor<32x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>>
     %b_dot = ttg.convert_layout %if_result#1 : tensor<32x64xf16, #blocked_3> -> tensor<32x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma_3, kWidth = 4}>>
     // CHECK: tt.dot %[[IF_A_REQ]], %[[IF_B_REQ]], %{{.*}}
     %dot = tt.dot %a_dot, %b_dot, %cst : tensor<64x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_3, kWidth = 4}>> * tensor<32x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma_3, kWidth = 4}>> -> tensor<64x64xf32, #mma_3>

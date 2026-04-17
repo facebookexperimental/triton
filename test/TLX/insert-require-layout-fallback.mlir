@@ -28,7 +28,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
       scf.yield %zero_a : tensor<64x32xf16, #blocked>
     }
     %b = ttg.local_load %buf_b : !ttg.memdesc<32x64xf16, #shared, #smem, mutable> -> tensor<32x64xf16, #blocked>
-    // CHECK: %[[A_DOT:.*]] = ttg.convert_layout %if_a : tensor<64x32xf16, #blocked> -> tensor<64x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>>
+    // CHECK: %[[A_DOT:.*]] = ttg.convert_layout %{{.*}} : tensor<64x32xf16, #{{.*}}> -> tensor<64x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>>
     %a_dot = ttg.convert_layout %if_a : tensor<64x32xf16, #blocked> -> tensor<64x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>>
     %b_dot = ttg.convert_layout %b : tensor<32x64xf16, #blocked> -> tensor<32x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>>
     // CHECK: tt.dot %[[A_DOT]], %{{.*}}, %{{.*}}

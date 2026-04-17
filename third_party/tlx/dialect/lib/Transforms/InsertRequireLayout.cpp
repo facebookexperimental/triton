@@ -282,63 +282,32 @@ static void applyRequireLayout(ttg::SwizzledSharedEncodingAttr encoding,
   }
 }
 
-static void
-collectRegionBranchSuccessors(RegionBranchOpInterface branchOp,
-                              SmallVectorImpl<RegionSuccessor> &successors) {
-  auto appendUniqueSuccessors = [&](ArrayRef<RegionSuccessor> newSuccessors) {
-    for (RegionSuccessor successor : newSuccessors) {
-      if (!llvm::is_contained(successors, successor))
-        successors.push_back(successor);
-    }
-  };
+static void materializeTensorRequireLayout(tt::DotOp dotOp,
+                                           unsigned operandIndex,
+                                           OpBuilder &builder) {
+  Value operand = dotOp.getOperand(operandIndex);
+  auto cvt = operand.getDefiningOp<ttg::ConvertLayoutOp>();
+  if (!cvt)
+    return;
 
-  SmallVector<RegionSuccessor> newSuccessors;
-  branchOp.getSuccessorRegions(RegionBranchPoint::parent(), newSuccessors);
-  appendUniqueSuccessors(newSuccessors);
-  for (Region &region : branchOp->getRegions()) {
-    newSuccessors.clear();
-    branchOp.getSuccessorRegions(region, newSuccessors);
-    appendUniqueSuccessors(newSuccessors);
-  }
+  auto dstType = dyn_cast<RankedTensorType>(cvt.getType());
+  if (!dstType || !isa<ttg::DotOperandEncodingAttr>(dstType.getEncoding()))
+    return;
+
+  builder.setInsertionPoint(cvt);
+  auto requireOp = tlx::RequireLayoutOp::create(builder, cvt.getLoc(),
+                                                cvt.getType(), cvt.getSrc());
+  dotOp->setOperand(operandIndex, requireOp.getResult());
+  if (cvt.getResult().use_empty())
+    cvt.erase();
 }
 
-static std::optional<Type> getConsensusType(ValueRange values) {
-  if (values.empty())
-    return std::nullopt;
-
-  Type consensusType = values.front().getType();
-  for (Value value : values.drop_front()) {
-    if (value.getType() != consensusType)
-      return std::nullopt;
-  }
-  return consensusType;
-}
-
-static void updateRegionBranchTypes(RegionBranchOpInterface branchOp) {
-  SmallVector<RegionSuccessor> successors;
-  collectRegionBranchSuccessors(branchOp, successors);
-
-  bool changed = true;
-  while (changed) {
-    changed = false;
-    for (RegionSuccessor successor : successors) {
-      ValueRange successorInputs = branchOp.getSuccessorInputs(successor);
-      for (auto [index, successorInput] : llvm::enumerate(successorInputs)) {
-        SmallVector<Value> predecessorValues;
-        branchOp.getPredecessorValues(successor, index, predecessorValues);
-        std::optional<Type> consensusType =
-            getConsensusType(ValueRange(predecessorValues));
-        if (!consensusType || successorInput.getType() == *consensusType)
-          continue;
-
-        LDBG("Updating region-branch type for "
-             << successorInput << " from " << successorInput.getType() << " to "
-             << *consensusType);
-        successorInput.setType(*consensusType);
-        changed = true;
-      }
-    }
-  }
+static void materializeDotUserTensorConstraints(ModuleOp m,
+                                                OpBuilder &builder) {
+  m.walk([&](tt::DotOp dotOp) {
+    for (unsigned i = 0; i < 2; ++i)
+      materializeTensorRequireLayout(dotOp, i, builder);
+  });
 }
 
 } // namespace
@@ -359,17 +328,13 @@ LogicalResult insertRequireLayout(ModuleOp m) {
   if (failed(solver.initializeAndRun(m)))
     return failure();
 
-  // Proposed long-term flow.
-  // 1. InsertRequireLayout should discover dot-fed local_load ops and insert
-  //    the missing memdesc-side tlx.require_layout constraints for shared
-  //    memory.
-  // 2. Tensor-side tlx.require_layout and tlx.release_layout constraints
-  //    should then be propagated by tlx-propagate-layout, which already owns
-  //    TLX layout propagation and lowering to ttg.convert_layout.
-  // 3. The direct local_load result retagging below is a temporary bridge
-  //    until tlx-propagate-layout owns register-side propagation for this
-  //    AMD local_load-to-dot path.
-  // --- Rewrite local_loads whose results require a dot-operand encoding ---
+  // InsertRequireLayout owns constraint synthesis only:
+  // 1. Discover dot-fed local_load ops and add the missing memdesc-side
+  //    tlx.require_layout constraints for shared memory.
+  // 2. Rewrite matched dot-path ttg.convert_layout ops into explicit tensor
+  //    tlx.require_layout constraints.
+  // 3. Leave tensor/register propagation, region-branch retagging, and final
+  //    convert cleanup to tlx-propagate-layout and downstream cleanup passes.
   m.walk([&](ttg::LocalLoadOp localLoadOp) {
     auto *lattice =
         solver.lookupState<DotRewriteLattice>(localLoadOp.getResult());
@@ -391,49 +356,9 @@ LogicalResult insertRequireLayout(ModuleOp m) {
     // Insert RequireLayoutOp for memdesc swizzling.
     auto sharedEnc = computeSharedEncFromDotEnc(dotEnc, localLoadOp);
     applyRequireLayout(sharedEnc, localLoadOp, builder);
-
-    // Set local_load output type to #dot_op.
-    auto resultType = cast<RankedTensorType>(localLoadOp.getType());
-    auto newType = RankedTensorType::get(resultType.getShape(),
-                                         resultType.getElementType(), dotEnc);
-    localLoadOp->getResult(0).setType(newType);
   });
 
-  // --- Fix region-branch result and block-argument types ---
-  // After rewriting local_load results, region-branch edges may no longer have
-  // matching source and destination types. Recompute those destination types
-  // from the RegionBranch interfaces and only retag slots whose predecessors
-  // all agree on the same type.
-  m.walk<WalkOrder::PostOrder>([&](RegionBranchOpInterface branchOp) {
-    updateRegionBranchTypes(branchOp);
-  });
-
-  // --- Clean up redundant convert_layout ops ---
-
-  // Shortcut convert chains where the source already has the target type
-  // (e.g. body_arg(#dot_op) -> cvt(#other) -> cvt(#dot_op) -> dot can be
-  // replaced by body_arg -> dot).
-  m.walk([&](tt::DotOp dotOp) {
-    for (unsigned i = 0; i < 2; ++i) {
-      Value operand = dotOp.getOperand(i);
-      Value src = operand;
-      while (auto cvt = src.getDefiningOp<ttg::ConvertLayoutOp>())
-        src = cvt.getSrc();
-      if (src != operand && src.getType() == operand.getType())
-        dotOp->setOperand(i, src);
-    }
-  });
-
-  // Remove identity converts and DCE dead ones. Post-order walk allows
-  // erasing the current op inside the callback.
-  m.walk([&](ttg::ConvertLayoutOp cvt) {
-    if (cvt.getSrc().getType() == cvt.getType()) {
-      cvt.replaceAllUsesWith(cvt.getSrc());
-      cvt.erase();
-    } else if (cvt.getResult().use_empty()) {
-      cvt.erase();
-    }
-  });
+  materializeDotUserTensorConstraints(m, builder);
 
   return success();
 }
