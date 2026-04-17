@@ -367,41 +367,6 @@ groupByContiguousTaskSetWithIdentity(ArrayRef<Operation *> chain0,
       ++oi;
     }
   }
-
-  // Merge segments that have non-tensor (token/scalar) cross-segment
-  // dependencies into their predecessor. For example, tma_store_token_wait
-  // (partition 4) depends on the async_tma_copy token (partition 3) and
-  // cannot be a separate SubtiledRegionOp.
-  for (size_t i = 1; i < segments.size();) {
-    DenseSet<Value> prevResults;
-    for (auto *op : segments[i - 1].ops0)
-      for (Value r : op->getResults())
-        prevResults.insert(r);
-
-    bool hasNonTensorDep = false;
-    for (auto *op : segments[i].ops0) {
-      for (Value operand : op->getOperands()) {
-        if (prevResults.contains(operand) &&
-            !isa<RankedTensorType>(operand.getType()) &&
-            !isa<gpu::MemDescType>(operand.getType())) {
-          hasNonTensorDep = true;
-          break;
-        }
-      }
-      if (hasNonTensorDep)
-        break;
-    }
-
-    if (hasNonTensorDep) {
-      // Merge segment i into segment i-1.
-      segments[i - 1].ops0.append(segments[i].ops0);
-      segments[i - 1].ops1.append(segments[i].ops1);
-      segments.erase(segments.begin() + i);
-    } else {
-      ++i;
-    }
-  }
-
   return segments;
 }
 
