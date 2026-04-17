@@ -123,8 +123,11 @@ def TTNG_BarrierAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnota
   let description = [{
     Describes where to insert a barrier operation during subtiled region lowering.
 
-    - `barrierIdx`: default index into the op's barriers/accumCnts operand lists.
-      Used when `bufferIdxArgIdx` is not set (static barrier selection).
+    - `barrierIdx`: index into the op's barriers/accumCnts operand lists.
+      For TILE_START/TILE_END placement, the lowering computes the per-tile
+      barrier index as `(outerAccumCnt + tileIdx) % numBuffers` and uses
+      that to index into the barriers/accumCnts arrays. The static
+      `barrierIdx` is used for BEFORE/AFTER and SETUP/TEARDOWN placement.
     - `placement`: when the barrier fires:
         - BEFORE: before the target op on the first tile only
         - AFTER: after the target op on the last tile only
@@ -138,15 +141,12 @@ def TTNG_BarrierAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnota
         - TILE: placed in the per-tile body
         - SETUP: placed in the setup region (runs once before all tiles)
         - TEARDOWN: placed in the teardown region (runs once after all tiles)
-    - `numBuffers`: number of buffers for phase computation (default 1).
-      For wait_barrier, the phase is computed at lowering time from the
-      accumulation count (accumCnts operand) as:
-        phase = (accumCnt / numBuffers) & 1
-    - `bufferIdxArgIdx`: optional tile body argument index that provides the
-      buffer index per tile (default -1 = not set, use static barrierIdx).
-      When set, the lowering uses the tile arg's value (resolved via
-      tileMappings) to index into the barriers/accumCnts arrays instead of
-      using the static barrierIdx.
+    - `numBuffers`: number of buffers for phase and buffer index computation
+      (default 1). At lowering time, for each tile replication:
+        tileAccumCnt = outerAccumCnt + tileIdx
+        bufferIdx    = tileAccumCnt % numBuffers
+        phase        = (tileAccumCnt / numBuffers) & 1
+      The outer accumCnt must be incremented by numTiles each loop iteration.
   }];
   let parameters = (
     ins
@@ -156,8 +156,7 @@ def TTNG_BarrierAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnota
     "StringAttr":$barrierOpKind,
     DefaultValuedParameter<"unsigned", "1">:$count,
     DefaultValuedParameter<"BarrierRegion", "BarrierRegion::TILE">:$region,
-    DefaultValuedParameter<"unsigned", "1">:$numBuffers,
-    DefaultValuedParameter<"int", "-1">:$bufferIdxArgIdx
+    DefaultValuedParameter<"unsigned", "1">:$numBuffers
   );
   let assemblyFormat = "`<` struct(params) `>`";
 }
