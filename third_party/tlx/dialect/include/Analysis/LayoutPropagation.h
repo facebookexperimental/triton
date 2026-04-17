@@ -31,6 +31,11 @@ public:
   bool isUninitialized() const { return !encoding.has_value(); }
 
   /// Whether the state is unknown.
+  ///
+  /// Unknown is the conservative "conflicting or unsupported" state for layout
+  /// propagation: forward joins widen to unknown when distinct concrete
+  /// encodings meet at a merge point, and backward meets also collapse to
+  /// unknown when any side is already unknown.
   bool isUnknown() const { return encoding == nullptr; }
 
   Attribute getLayoutEncoding() const {
@@ -41,6 +46,11 @@ public:
   void print(raw_ostream &os) const;
   static LayoutEncoding meet(const LayoutEncoding &lhs,
                              const LayoutEncoding &rhs);
+  /// Lattice join used by forward propagation.
+  ///
+  /// Uninitialized yields to any concrete state, unknown dominates, equal
+  /// concrete encodings stay concrete, and conflicting concrete encodings widen
+  /// to unknown so region merges stay conservative instead of asserting.
   static LayoutEncoding join(const LayoutEncoding &lhs,
                              const LayoutEncoding &rhs);
   static LayoutEncoding getUnknownLayout() {
@@ -84,10 +94,6 @@ public:
       ArrayRef<BlockArgument> arguments) override {
     // Default: do nothing
   }
-
-  
-
-
   LogicalResult visitRegionInReverse(Operation *op);
 
   void visitWarpSpecRegionArgs(Operation *op, Value opnd,

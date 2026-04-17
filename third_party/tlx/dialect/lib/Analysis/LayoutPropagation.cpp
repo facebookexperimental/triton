@@ -41,8 +41,17 @@ void LayoutEncoding::print(raw_ostream &os) const {
 
 LayoutEncoding LayoutEncoding::join(const LayoutEncoding &lhs,
                                     const LayoutEncoding &rhs) {
-  assert(lhs == rhs && "Conflicting layouts");
-  return lhs;
+  // Forward merges should stay conservative: distinct concrete layouts widen to
+  // unknown instead of asserting so region joins can fall back cleanly.
+  if (lhs.isUnknown() || rhs.isUnknown())
+    return LayoutEncoding::getUnknownLayout();
+  if (lhs.isUninitialized())
+    return rhs;
+  if (rhs.isUninitialized())
+    return lhs;
+  if (lhs == rhs)
+    return lhs;
+  return LayoutEncoding::getUnknownLayout();
 }
 
 LayoutEncoding LayoutEncoding::meet(const LayoutEncoding &lhs,
@@ -198,17 +207,23 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
     return success();
   }
 
-  // Similar to MemDescTransOp, we need to specially handle TMEMSubSliceOp
+  // TMEMSubSliceOp preserves the source tile shape and only refines the
+  // column-stride/CTA-split details on the 2D slice view. The verifier already
+  // guarantees tensor-memory encodings on both source and result.
   if (auto tmemSliceOp = dyn_cast<ttng::TMEMSubSliceOp>(op)) {
-    // Slice resultLayoutEncoding
     auto resultLattice = results[0];
     LayoutEncoding resultLayoutEncoding = resultLattice->getValue();
-    if (!resultLayoutEncoding.isUninitialized()) {
+    if (!resultLayoutEncoding.isUninitialized() &&
+        !resultLayoutEncoding.isUnknown()) {
       if (auto tmemEncoding = dyn_cast<ttng::TensorMemoryEncodingAttr>(
               resultLattice->getValue().getLayoutEncoding())) {
         auto srcTy = cast<ttg::MemDescType>(tmemSliceOp.getSrc().getType());
         auto srcEncoding =
             dyn_cast<ttng::TensorMemoryEncodingAttr>(srcTy.getEncoding());
+        if (!srcEncoding)
+          return tmemSliceOp.emitOpError(
+              "expected tensor memory source encoding while propagating "
+              "through tmem_subslice");
         auto newTmemEncoding = ttng::TensorMemoryEncodingAttr::get(
             tmemEncoding.getContext(), srcEncoding.getBlockM(),
             srcEncoding.getBlockN(), tmemEncoding.getColStride(),
@@ -488,14 +503,20 @@ LogicalResult LayoutForwardPropagation::visitOperation(
       continue;
     LayoutEncoding operandLayoutEncoding = operandLattice->getValue();
 
-    // Slice operandLayoutEncoding
+    // Unknown layouts do not provide enough information to refine a TMEM slice
+    // result, so only splice concrete tensor-memory encodings through.
     if (auto sliceOp = dyn_cast<ttng::TMEMSubSliceOp>(op)) {
-      if (!operandLayoutEncoding.isUninitialized()) {
+      if (!operandLayoutEncoding.isUninitialized() &&
+          !operandLayoutEncoding.isUnknown()) {
         auto dstTy = cast<ttg::MemDescType>(sliceOp.getType());
         auto dstEncoding =
             dyn_cast<ttng::TensorMemoryEncodingAttr>(dstTy.getEncoding());
         auto encoding = dyn_cast<ttng::TensorMemoryEncodingAttr>(
             operandLayoutEncoding.getLayoutEncoding());
+        if (!encoding)
+          return sliceOp.emitOpError(
+              "expected tensor memory layout while propagating through "
+              "tmem_subslice");
         auto newEncoding = ttng::TensorMemoryEncodingAttr::get(
             op->getContext(), dstEncoding.getBlockM(), dstEncoding.getBlockN(),
             encoding.getColStride(), encoding.getCGALayout(),
