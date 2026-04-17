@@ -223,12 +223,6 @@ void setPartition(Operation *op, ArrayRef<int> partitionIds) {
   auto sorted = llvm::to_vector(partitionIds);
   llvm::sort(sorted);
   op->setAttr(kPartitionAttrName, b.getDenseI32ArrayAttr(sorted));
-  for (auto &region : op->getRegions()) {
-    for (auto &block : region.getBlocks()) {
-      auto terminator = block.getTerminator();
-      terminator->setAttr(kPartitionAttrName, b.getDenseI32ArrayAttr(sorted));
-    }
-  }
 }
 
 void setPartitionOutputs(Operation *op,

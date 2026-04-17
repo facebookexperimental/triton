@@ -22,6 +22,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "llvm/ADT/MapVector.h"
 #include <unordered_set>
@@ -1822,8 +1823,12 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
         llvm_unreachable("Unexpected srcOp type");
     } else if (auto tensorType =
                    dyn_cast<RankedTensorType>(srcValue.getType())) {
+      int cc = getNVIDIAComputeCapability(funcOp->getParentOfType<ModuleOp>());
       auto res = createLocalAlloc(
-          builder, channel, isPost ? tensorType.getShape().size() == 1 : false,
+          builder, channel,
+          isPost ? (cc >= 100 && tensorType.getShape().size() == 1 &&
+                    tensorType.getElementType().isIntOrFloat())
+                 : false,
           isPost);
       buffer = res.first;
       newProducer = res.second;
@@ -2018,10 +2023,41 @@ DenseMap<Channel *, Value> createBufferPost(
               regionsWithChannels, config, reuseGrp);
         }
       } else if (auto forOp = user->getParentOfType<scf::ForOp>()) {
-        // Goes through channels here. Make sure the channel is not partilly
-        // mutated.
-        getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
-                             bufferIdx, _phase, config, reuseGrp, channel);
+        // Check if the channel's producer (local_store) is in an outer loop
+        // while the user (consumer) is in an inner loop. This happens for Q
+        // buffers in persistent FA: Q is loaded in the outer tile loop but
+        // consumed inside the inner KV loop. The buffer index/phase must
+        // use the outer loop's accumCnt, not the inner KV loop's.
+        // Detect this by checking if the producer op is NOT inside the
+        // user's immediate parent ForOp.
+        Operation *producerOp = channel->getSrcOp();
+        bool producerInOuterScope =
+            producerOp && !forOp->isAncestor(producerOp);
+        LDBG("createBufferPost user: producerInOuterScope="
+             << producerInOuterScope << " channel=" << channel->uniqID
+             << " numBuffers=" << numBuffers << " user=");
+        LLVM_DEBUG(user->getLoc().print(llvm::dbgs()));
+        LLVM_DEBUG(llvm::dbgs() << "\n");
+        if (producerOp) {
+          LDBG("  producerOp=");
+          LLVM_DEBUG(producerOp->getLoc().print(llvm::dbgs()));
+          LLVM_DEBUG(llvm::dbgs() << "\n");
+        }
+        LDBG("  forOp=");
+        LLVM_DEBUG(forOp->getLoc().print(llvm::dbgs()));
+        LLVM_DEBUG(llvm::dbgs() << "\n");
+        if (producerInOuterScope) {
+          LDBG("  -> using forOp as op for getBufferIdxAndPhase");
+          // User is in a deeper loop than the producer. Pass the inner
+          // ForOp as 'op' so getAccumCount looks up to the outer loop
+          // for the accumCnt.
+          getBufferIdxAndPhase(builder, forOp.getOperation(), numBuffers,
+                               regionsWithChannels, bufferIdx, _phase, config,
+                               reuseGrp, channel);
+        } else {
+          getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
+                               bufferIdx, _phase, config, reuseGrp, channel);
+        }
       } else {
         // For operations outside loops (epilogue), compute the
         // correct bufferIdx and phase based on the parent loop's final
@@ -3506,13 +3542,33 @@ void insertAsyncComm(
       builder.setAsynTaskIdsFromArray(token.first);
       // Insert ConsumerWaitOp
       if (!commChannel.producerBarrier) {
-        auto consumerWaitPoint = getSameLevelOp(headProducer, headConsumer);
+        // For channels with multiple consumer task IDs, find the correct
+        // headConsumer for this token's task ID. Each consumer partition
+        // needs its own wait point.
+        int tokenTaskId = token.first;
+        LDBG("ConsumerWaitOp: tokenTaskId=" << tokenTaskId
+                                            << " headConsumer task=");
+        Operation *tokenHeadConsumer = headConsumer;
+        for (auto &op : headConsumer->getBlock()->getOperations()) {
+          if (consumerOps.count(&op)) {
+            auto taskIds = getAsyncTaskIds(&op);
+            if (std::find(taskIds.begin(), taskIds.end(), tokenTaskId) !=
+                taskIds.end()) {
+              tokenHeadConsumer = &op;
+              LDBG("  found tokenHeadConsumer for task " << tokenTaskId);
+              break;
+            }
+          }
+        }
+        auto consumerWaitPoint =
+            getSameLevelOp(headProducer, tokenHeadConsumer);
         builder.setInsertionPoint(consumerWaitPoint);
         // Use the actual consumer's stage/cluster instead of the prep op's.
         // consumerWaitPoint may be a memdesc_trans at stage 0, but the real
         // consumer (e.g. dQ/dK MMA) may be at stage 1.
         auto *actualCons = getUniqueActualConsumer(consumerWaitPoint);
         builder.setLoopScheduleInfoFromOp(actualCons);
+        LDBG("  inserting ConsumerWaitOp for task " << tokenTaskId);
         auto waitOp = builder.createWithAsyncTaskIds<ttnvws::ConsumerWaitOp>(
             headConsumer->getLoc(), token.second, bufferIdx, phase);
         // Propagate the actual consumer's loop schedule to the phase/bufferIdx
@@ -3574,9 +3630,19 @@ void insertAsyncComm(
     if (tmaLoads.size() > 0) {
       // Instead of headConsumer, need to lift out to the same scope.
       auto consumerWaitPoint = getSameLevelOp(tmaHeadProducer, headConsumer);
+      // Collect additional consumer task IDs beyond the primary headConsumer.
+      SmallVector<int> additionalConsumerTaskIds;
+      auto primaryTaskIds = getAsyncTaskIds(headConsumer);
+      for (const auto &token : commChannel.tokens) {
+        int taskId = token.first;
+        if (std::find(primaryTaskIds.begin(), primaryTaskIds.end(), taskId) ==
+            primaryTaskIds.end())
+          additionalConsumerTaskIds.push_back(taskId);
+      }
       optimizeTMALoads(builder, tmaLoads, buffers, *commChannel.producerBarrier,
                        bufferIdx, bufferIdx, phase, tmaHeadProducer,
-                       headConsumer, consumerWaitPoint, isPost);
+                       headConsumer, consumerWaitPoint,
+                       additionalConsumerTaskIds, isPost);
     }
   }
 

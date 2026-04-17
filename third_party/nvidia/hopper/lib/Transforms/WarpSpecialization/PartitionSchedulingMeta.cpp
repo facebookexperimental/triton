@@ -1014,8 +1014,7 @@ schedulePostLoopOps(scf::ForOp loop, PartitionSet &schedule,
       if (layout.correctionPartition)
         return layout.correctionPartition;
       if (layout.reductionPartition)
-        if (layout.reductionPartition)
-          return layout.reductionPartition;
+        return layout.reductionPartition;
       // When no correction/reduction partition exists (e.g., mergeCorrection +
       // mergeEpilogue on Hopper), route epilogue ops to their dpId-based
       // computation partition so each data partition's epilogue stays local.
@@ -2125,7 +2124,8 @@ void optimizeSchedule(scf::ForOp loop, PartitionSet &schedule) {
   // Walk everything in reverse so that operations are visited before their
   // operands.
   loop.walk<WalkOrder::PostOrder, ReverseIterator>([&](Operation *op) {
-    if (!isa<BroadcastOp, ExpandDimsOp>(op))
+    if (op->getNumResults() != 1 || !isPure(op) ||
+        isa<scf::YieldOp, scf::ForOp, scf::IfOp>(op))
       return;
 
     Partition *partition = getPartition(op);
@@ -2403,9 +2403,9 @@ void PartitionSchedulingMeta::runOnOperation() {
       loop.walk<WalkOrder::PostOrder, ReverseIterator>([](Operation *op) {
         // By default, the walk is in postorder so it is safe to delete ops
         // while we walk.
-        if (isa<BroadcastOp, ExpandDimsOp>(op))
-          if (op->use_empty())
-            op->erase();
+        if (op->use_empty() && isPure(op) && op->getNumResults() == 1 &&
+            !isa<scf::YieldOp, scf::ForOp, scf::IfOp>(op))
+          op->erase();
       });
     }
   }
