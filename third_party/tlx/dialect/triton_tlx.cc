@@ -121,6 +121,15 @@ void init_triton_tlx_ir(py::module &&m) {
                                                     axisAttr);
            })
       .def("create_local_scatter",
+           [](TritonOpBuilder &self, Value subView, Value values, Value indices,
+              int32_t axis) {
+             auto ctx = self.getContext();
+             auto i32Ty = IntegerType::get(ctx, 32);
+             auto axisAttr = IntegerAttr::get(i32Ty, axis);
+             self.create<ttg::LocalScatterOp>(subView, values, indices,
+                                              axisAttr);
+           })
+      .def("create_local_scatter",
            [](TritonOpBuilder &self, Value memDesc, Value values, Value indices,
               int32_t axis) {
              auto ctx = self.getContext();
