@@ -845,25 +845,20 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
     setupOps.push_back(&*it);
   setupOps.push_back(splitOp);
 
-  // Position the SubtiledRegionOp after all values it references from outer
-  // scope. The differing operands and identity varying operands may be defined
-  // after the tmem_load/split chain, so the insertion point must be after the
-  // last such definition.
+  // Position the SubtiledRegionOps after all chain ops and their external
+  // operands. The SubtiledRegionOps replace the entire chain, so they must
+  // come after the last chain op in program order.
   Operation *insertBefore = nullptr;
   {
     Operation *latest = splitOp;
-    auto updateLatest = [&](Value v) {
-      if (auto defOp = v.getDefiningOp())
-        if (defOp->getBlock() == block && latest->isBeforeInBlock(defOp))
-          latest = defOp;
+    auto updateLatest = [&](Operation *op) {
+      if (op && op->getBlock() == block && latest->isBeforeInBlock(op))
+        latest = op;
     };
-    for (auto &[v0, v1] : differing->differingOperands) {
-      updateLatest(v0);
-      updateLatest(v1);
-    }
-    for (auto &id : differing->identityOps)
-      updateLatest(id.varyingOperand);
-    // Insert right after the latest referenced value.
+    for (auto *op : chain0)
+      updateLatest(op);
+    for (auto *op : chain1)
+      updateLatest(op);
     insertBefore = latest->getNextNode();
   }
   OpBuilder builder(insertBefore);

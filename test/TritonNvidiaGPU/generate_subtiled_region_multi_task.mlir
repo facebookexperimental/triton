@@ -271,3 +271,71 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// Test: identity insertion combined with multi-task splitting (early TMA store
+// lowering). Chain1 has an extra arith.addi AND the chain crosses partition
+// boundaries at local_alloc. This should produce two SubtiledRegionOps:
+//   1. compute + local_store (partition 4, uniform)
+//   2. async_tma_copy + tma_store_token_wait (partition 3+4, merged by token)
+
+#tmem6 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 256, colStride = 1>
+#blocked3d6 = #ttg.blocked<{sizePerThread = [1, 2, 128], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 2, 1]}>
+#blocked3d_perm6 = #ttg.blocked<{sizePerThread = [1, 128, 2], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 1, 2]}>
+#blocked_full6 = #ttg.blocked<{sizePerThread = [1, 256], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#blocked2d6 = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#shared6 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem6 = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+
+  // CHECK-LABEL: @identity_plus_multi_task_tma_store
+  // Two outer-scope empty SMEM allocations:
+  // CHECK: ttg.local_alloc : () -> !ttg.memdesc<128x128xf16
+  // CHECK: ttg.local_alloc : () -> !ttg.memdesc<128x128xf16
+  //
+  // First SubtiledRegionOp: compute + store to SMEM (partition 4)
+  // CHECK: ttng.subtiled_region
+  // CHECK:   } tile{
+  // CHECK:     arith.truncf
+  // CHECK:     arith.addi
+  // CHECK:     ttg.local_store
+  // CHECK:     ttng.subtiled_region_yield
+  // CHECK:   }
+  //
+  // Second SubtiledRegionOp: TMA copy + wait (partition 3+4)
+  // CHECK: ttng.subtiled_region
+  // CHECK:   } tile{
+  // CHECK:     ttng.async_tma_copy_local_to_global
+  // CHECK:     ttng.async_tma_store_token_wait
+  // CHECK:     ttng.subtiled_region_yield
+  // CHECK:   }
+  //
+  // CHECK-NOT: tt.split
+  tt.func @identity_plus_multi_task_tma_store(
+      %tmem_buf: !ttg.memdesc<128x256xf32, #tmem6, #ttng.tensor_memory, mutable>,
+      %acc_tok: !ttg.async.token,
+      %c_desc: !tt.tensordesc<tensor<128x128xf16, #shared6>>,
+      %off_m: i32, %off_n: i32, %c128: i32) {
+    %loaded:2 = ttng.tmem_load %tmem_buf[%acc_tok] : !ttg.memdesc<128x256xf32, #tmem6, #ttng.tensor_memory, mutable> -> tensor<128x256xf32, #blocked_full6>
+    %reshaped = tt.reshape %loaded#0 : tensor<128x256xf32, #blocked_full6> -> tensor<128x2x128xf32, #blocked3d6>
+    %transposed = tt.trans %reshaped {order = array<i32: 0, 2, 1>} : tensor<128x2x128xf32, #blocked3d6> -> tensor<128x128x2xf32, #blocked3d_perm6>
+    %lhs, %rhs = tt.split %transposed : tensor<128x128x2xf32, #blocked3d_perm6> -> tensor<128x128xf32, #blocked2d6>
+
+    // Chain 0 (lhs): truncf{4} → local_alloc{4} → async_tma_copy{3} → wait{4}
+    %trunc0 = arith.truncf %lhs {async_task_id = array<i32: 4>} : tensor<128x128xf32, #blocked2d6> to tensor<128x128xf16, #blocked2d6>
+    %smem0 = ttg.local_alloc %trunc0 {async_task_id = array<i32: 4>} : (tensor<128x128xf16, #blocked2d6>) -> !ttg.memdesc<128x128xf16, #shared6, #smem6, mutable>
+    %tok0 = ttng.async_tma_copy_local_to_global %c_desc[%off_m, %off_n] %smem0 {async_task_id = array<i32: 3>} : !tt.tensordesc<tensor<128x128xf16, #shared6>>, !ttg.memdesc<128x128xf16, #shared6, #smem6, mutable> -> !ttg.async.token
+    ttng.async_tma_store_token_wait %tok0 {async_task_id = array<i32: 4>} : !ttg.async.token
+
+    // Chain 1 (rhs): truncf{4} → addi{4} → local_alloc{4} → async_tma_copy{3} → wait{4}
+    %trunc1 = arith.truncf %rhs {async_task_id = array<i32: 4>} : tensor<128x128xf32, #blocked2d6> to tensor<128x128xf16, #blocked2d6>
+    %off_n2 = arith.addi %off_n, %c128 {async_task_id = array<i32: 4>} : i32
+    %smem1 = ttg.local_alloc %trunc1 {async_task_id = array<i32: 4>} : (tensor<128x128xf16, #blocked2d6>) -> !ttg.memdesc<128x128xf16, #shared6, #smem6, mutable>
+    %tok1 = ttng.async_tma_copy_local_to_global %c_desc[%off_m, %off_n2] %smem1 {async_task_id = array<i32: 3>} : !tt.tensordesc<tensor<128x128xf16, #shared6>>, !ttg.memdesc<128x128xf16, #shared6, #smem6, mutable> -> !ttg.async.token
+    ttng.async_tma_store_token_wait %tok1 {async_task_id = array<i32: 4>} : !ttg.async.token
+
+    tt.return
+  }
+}

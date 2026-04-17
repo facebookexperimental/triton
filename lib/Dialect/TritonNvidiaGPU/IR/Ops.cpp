@@ -1217,20 +1217,24 @@ LogicalResult SubtiledRegionOp::verify() {
              << " non-terminator ops";
   }
 
-  // 11. All ops in tile body with async_task_id must have the same task set.
-  std::optional<ArrayRef<int32_t>> uniformTaskSet;
+  // 11. Task IDs in the tile body must form contiguous groups (no
+  // interleaving). A single uniform task set is the common case; contiguous
+  // groups arise when segments with different partitions are merged due to
+  // non-tensor (token) dependencies.
+  SmallVector<ArrayRef<int32_t>> seenTaskSets;
   for (Operation &op : tileBlock.without_terminator()) {
     auto attr = op.getAttrOfType<DenseI32ArrayAttr>("async_task_id");
     if (!attr)
       continue;
     ArrayRef<int32_t> taskIds = attr.asArrayRef();
-    if (!uniformTaskSet) {
-      uniformTaskSet = taskIds;
-    } else if (*uniformTaskSet != taskIds) {
-      return emitOpError(
-                 "tile body ops must have uniform async_task_id: found ")
-             << attr << " but expected "
-             << DenseI32ArrayAttr::get(getContext(), *uniformTaskSet);
+    if (seenTaskSets.empty() || seenTaskSets.back() != taskIds) {
+      // Check that this task set hasn't appeared before (no interleaving).
+      for (size_t i = 0; i + 1 < seenTaskSets.size(); ++i) {
+        if (seenTaskSets[i] == taskIds)
+          return emitOpError("tile body has interleaved async_task_id groups: ")
+                 << attr << " appeared non-contiguously";
+      }
+      seenTaskSets.push_back(taskIds);
     }
   }
 
