@@ -25,23 +25,46 @@ static Value computePhase(OpBuilder &builder, Location loc, Value accumCnt,
 
 /// Emit a barrier operation based on the annotation kind.
 /// For wait_barrier, computes the phase from the accumulation count.
+/// `resolvedBarrierIdx` overrides the annotation's barrierIdx when
+/// bufferIdxArgIdx is used (per-tile dynamic barrier selection).
 static void emitBarrierOp(OpBuilder &builder, Location loc,
                           BarrierAnnotationAttr annotation, ValueRange barriers,
-                          ValueRange accumCnts) {
-  unsigned idx = annotation.getBarrierIdx();
+                          ValueRange accumCnts, unsigned resolvedBarrierIdx) {
   StringRef kind = annotation.getBarrierOpKind().getValue();
   if (kind == "wait_barrier") {
-    Value phase =
-        computePhase(builder, loc, accumCnts[idx], annotation.getNumBuffers());
-    WaitBarrierOp::create(builder, loc, barriers[idx], phase);
+    Value phase = computePhase(builder, loc, accumCnts[resolvedBarrierIdx],
+                               annotation.getNumBuffers());
+    WaitBarrierOp::create(builder, loc, barriers[resolvedBarrierIdx], phase);
   } else {
     assert(kind == "arrive_barrier");
-    ArriveBarrierOp::create(builder, loc, barriers[idx], annotation.getCount());
+    ArriveBarrierOp::create(builder, loc, barriers[resolvedBarrierIdx],
+                            annotation.getCount());
   }
 }
 
+/// Resolve the barrier index for an annotation. If bufferIdxArgIdx is set,
+/// look up the tile arg's value from the setup outputs (via tileMappings).
+/// The setup yield value must be a constant integer.
+static unsigned resolveBarrierIdx(BarrierAnnotationAttr annotation,
+                                  ArrayRef<Value> setupOutputs,
+                                  ArrayRef<int32_t> tileIndices) {
+  int argIdx = annotation.getBufferIdxArgIdx();
+  if (argIdx < 0)
+    return annotation.getBarrierIdx();
+
+  // Look up the setup yield value for this tile's buffer index arg.
+  unsigned setupYieldIdx = tileIndices[argIdx];
+  Value setupVal = setupOutputs[setupYieldIdx];
+
+  // The setup yield must be a constant integer (produced by arith.constant).
+  auto constOp = setupVal.getDefiningOp<arith::ConstantIntOp>();
+  assert(constOp && "bufferIdxArgIdx must resolve to a constant integer");
+  return constOp.value();
+}
+
 /// Emit barrier ops for a list of annotations at a given op index in a
-/// region block, using the provided builder.
+/// region block, using the provided builder. Uses static barrierIdx
+/// (no tile-mapped resolution — for setup/teardown regions).
 static void emitBarriersForRegion(
     OpBuilder &builder, Location loc, Block &block,
     llvm::DenseMap<unsigned, SmallVector<BarrierAnnotationAttr>> &beforeMap,
@@ -52,7 +75,8 @@ static void emitBarriersForRegion(
     auto itBefore = beforeMap.find(opIdx);
     if (itBefore != beforeMap.end()) {
       for (auto &annotation : itBefore->second)
-        emitBarrierOp(builder, loc, annotation, barriers, accumCnts);
+        emitBarrierOp(builder, loc, annotation, barriers, accumCnts,
+                      annotation.getBarrierIdx());
     }
 
     builder.clone(op, mapping);
@@ -60,7 +84,8 @@ static void emitBarriersForRegion(
     auto itAfter = afterMap.find(opIdx);
     if (itAfter != afterMap.end()) {
       for (auto &annotation : itAfter->second)
-        emitBarrierOp(builder, loc, annotation, barriers, accumCnts);
+        emitBarrierOp(builder, loc, annotation, barriers, accumCnts,
+                      annotation.getBarrierIdx());
     }
     ++opIdx;
   }
@@ -147,6 +172,11 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
     for (auto [j, idx] : llvm::enumerate(indices.asArrayRef()))
       tileMapping.map(tileBlock.getArgument(j), setupOutputs[idx]);
 
+    // Helper to resolve barrier index for this tile's annotations.
+    auto resolve = [&](BarrierAnnotationAttr annotation) -> unsigned {
+      return resolveBarrierIdx(annotation, setupOutputs, indices.asArrayRef());
+    };
+
     unsigned opIdx = 0;
     for (Operation &tileOp : tileBlock.without_terminator()) {
       // BEFORE first tile only.
@@ -154,7 +184,8 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
         auto it = tileBeforeFirst.find(opIdx);
         if (it != tileBeforeFirst.end()) {
           for (auto &annotation : it->second)
-            emitBarrierOp(builder, loc, annotation, barriers, accumCnts);
+            emitBarrierOp(builder, loc, annotation, barriers, accumCnts,
+                          resolve(annotation));
         }
       }
 
@@ -163,7 +194,8 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
         auto it = tileEveryStart.find(opIdx);
         if (it != tileEveryStart.end()) {
           for (auto &annotation : it->second)
-            emitBarrierOp(builder, loc, annotation, barriers, accumCnts);
+            emitBarrierOp(builder, loc, annotation, barriers, accumCnts,
+                          resolve(annotation));
         }
       }
 
@@ -174,7 +206,8 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
         auto it = tileEveryEnd.find(opIdx);
         if (it != tileEveryEnd.end()) {
           for (auto &annotation : it->second)
-            emitBarrierOp(builder, loc, annotation, barriers, accumCnts);
+            emitBarrierOp(builder, loc, annotation, barriers, accumCnts,
+                          resolve(annotation));
         }
       }
 
@@ -183,7 +216,8 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
         auto it = tileAfterLast.find(opIdx);
         if (it != tileAfterLast.end()) {
           for (auto &annotation : it->second)
-            emitBarrierOp(builder, loc, annotation, barriers, accumCnts);
+            emitBarrierOp(builder, loc, annotation, barriers, accumCnts,
+                          resolve(annotation));
         }
       }
       ++opIdx;

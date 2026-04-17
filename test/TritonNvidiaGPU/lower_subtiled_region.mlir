@@ -466,4 +466,50 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       }
     tt.return
   }
+
+  // Test per-tile barrier selection via bufferIdxArgIdx. Two barriers (one
+  // per buffer), tile body arg %buf_idx selects which barrier to use.
+  // Tile 0 gets buf_idx=0 → bar0, tile 1 gets buf_idx=1 → bar1.
+  //
+  // CHECK-LABEL: @tile_mapped_barrier_selection
+  tt.func @tile_mapped_barrier_selection(
+      %bar0: !ttg.memdesc<1xi64, #shared, #smem, mutable>,
+      %bar1: !ttg.memdesc<1xi64, #shared, #smem, mutable>,
+      %accum_cnt: i64) {
+    // Tile 0: wait on bar0, op, arrive on bar0
+    // CHECK: ttng.wait_barrier %arg0
+    // CHECK: arith.index_cast
+    // CHECK: ttng.arrive_barrier %arg0
+    // Tile 1: wait on bar1, op, arrive on bar1
+    // CHECK: ttng.wait_barrier %arg1
+    // CHECK: arith.index_cast
+    // CHECK: ttng.arrive_barrier %arg1
+    // CHECK-NOT: ttng.subtiled_region
+    ttng.subtiled_region
+        barriers(%bar0, %bar1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>,
+                                !ttg.memdesc<1xi64, #shared, #smem, mutable>)
+        accum_cnts(%accum_cnt, %accum_cnt : i64, i64)
+        tile_mappings = [array<i32: 0, 2>, array<i32: 1, 3>]
+        barrier_annotations = [
+          #ttng.barrier_annotation<barrierIdx = 0, placement = tile_start,
+            targetOpIdx = 0, barrierOpKind = "wait_barrier",
+            numBuffers = 2, bufferIdxArgIdx = 1>,
+          #ttng.barrier_annotation<barrierIdx = 0, placement = tile_end,
+            targetOpIdx = 0, barrierOpKind = "arrive_barrier",
+            bufferIdxArgIdx = 1>
+        ]
+      setup {
+        %c0 = arith.constant 0 : i32
+        %c1 = arith.constant 1 : i32
+        %buf0 = arith.constant 0 : i32
+        %buf1 = arith.constant 1 : i32
+        ttng.subtiled_region_yield %c0, %c1, %buf0, %buf1 : i32, i32, i32, i32
+      } tile(%arg0: i32, %buf_idx: i32) {
+        %idx = arith.index_cast %arg0 : i32 to index
+        ttng.subtiled_region_yield
+      } teardown {
+        ttng.subtiled_region_yield
+      }
+    tt.return
+  }
 }

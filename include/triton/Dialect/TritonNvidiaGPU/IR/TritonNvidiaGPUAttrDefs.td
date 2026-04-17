@@ -123,7 +123,8 @@ def TTNG_BarrierAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnota
   let description = [{
     Describes where to insert a barrier operation during subtiled region lowering.
 
-    - `barrierIdx`: index into the op's barriers operand list
+    - `barrierIdx`: default index into the op's barriers/accumCnts operand lists.
+      Used when `bufferIdxArgIdx` is not set (static barrier selection).
     - `placement`: when the barrier fires:
         - BEFORE: before the target op on the first tile only
         - AFTER: after the target op on the last tile only
@@ -141,6 +142,11 @@ def TTNG_BarrierAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnota
       For wait_barrier, the phase is computed at lowering time from the
       accumulation count (accumCnts operand) as:
         phase = (accumCnt / numBuffers) & 1
+    - `bufferIdxArgIdx`: optional tile body argument index that provides the
+      buffer index per tile (default -1 = not set, use static barrierIdx).
+      When set, the lowering uses the tile arg's value (resolved via
+      tileMappings) to index into the barriers/accumCnts arrays instead of
+      using the static barrierIdx.
   }];
   let parameters = (
     ins
@@ -150,7 +156,8 @@ def TTNG_BarrierAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnota
     "StringAttr":$barrierOpKind,
     DefaultValuedParameter<"unsigned", "1">:$count,
     DefaultValuedParameter<"BarrierRegion", "BarrierRegion::TILE">:$region,
-    DefaultValuedParameter<"unsigned", "1">:$numBuffers
+    DefaultValuedParameter<"unsigned", "1">:$numBuffers,
+    DefaultValuedParameter<"int", "-1">:$bufferIdxArgIdx
   );
   let assemblyFormat = "`<` struct(params) `>`";
 }
