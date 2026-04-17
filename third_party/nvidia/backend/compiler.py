@@ -572,6 +572,7 @@ class CUDABackend(BaseBackend):
 
         # Get some metadata
         # warp-specialization mutates num_warps
+        metadata["num_warps_base"] = metadata["num_warps"]
         total_num_warps = src.get_int_attr("ttg.total-num-warps")
         if total_num_warps is not None:
             metadata["num_warps"] = total_num_warps
