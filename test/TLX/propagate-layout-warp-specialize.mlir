@@ -65,3 +65,55 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
     tt.return
   }
 }
+
+// -----
+
+// Test that warp-specialize memdesc retagging only happens when all partitions
+// agree on the captured memdesc layout. Conflicting partition-local memdesc
+// constraints must stay explicit instead of retagging the capture or partition
+// block arguments.
+
+#blocked_ws = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 1], order = [1, 0]}>
+#shared_ws_src = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#shared_ws_a = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0, 1]}>
+#shared_ws_b = #ttg.swizzled_shared<{vec = 2, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem_ws = #ttg.shared_memory
+
+module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = true, tlx.has_warp_spec_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @warp_specialize_partition_memdesc_conflict_fallback
+  tt.func public @warp_specialize_partition_memdesc_conflict_fallback() -> i32 {
+    %c0_i32 = arith.constant 0 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<1x64x32xf16, #shared_ws_src, #smem_ws, mutable>
+    %token = ttg.warp_specialize(%alloc)
+    default {
+      ttg.warp_yield %c0_i32 : i32
+    }
+    // CHECK: partition0(%[[ARG0:.*]]: !ttg.memdesc<1x64x32xf16, #[[$WS_SRC:[^,]+]], #smem, mutable>) num_warps(1)
+    partition0(%arg0: !ttg.memdesc<1x64x32xf16, #shared_ws_src, #smem_ws, mutable>) num_warps(1) {
+      %c0_i32_p0 = arith.constant 0 : i32
+      // CHECK: %[[BUF0:.*]] = ttg.memdesc_index %[[ARG0]][%{{.*}}] : !ttg.memdesc<1x64x32xf16, #[[$WS_SRC]], #smem, mutable> -> !ttg.memdesc<64x32xf16, #[[$WS_SRC]], #smem, mutable>
+      %buf = ttg.memdesc_index %arg0[%c0_i32_p0] : !ttg.memdesc<1x64x32xf16, #shared_ws_src, #smem_ws, mutable> -> !ttg.memdesc<64x32xf16, #shared_ws_src, #smem_ws, mutable>
+      // CHECK: %[[REQ0:.*]] = tlx.require_layout %[[BUF0]] : !ttg.memdesc<64x32xf16, #[[$WS_SRC]], #smem, mutable> -> !ttg.memdesc<64x32xf16, #[[$WS_A:[^,]+]], #smem, mutable>
+      %req = tlx.require_layout %buf : !ttg.memdesc<64x32xf16, #shared_ws_src, #smem_ws, mutable> -> !ttg.memdesc<64x32xf16, #shared_ws_a, #smem_ws, mutable>
+      // CHECK: ttg.local_load %[[REQ0]] : !ttg.memdesc<64x32xf16, #[[$WS_A]], #smem, mutable> -> tensor<64x32xf16, #{{.*}}>
+      %load = ttg.local_load %req : !ttg.memdesc<64x32xf16, #shared_ws_a, #smem_ws, mutable> -> tensor<64x32xf16, #blocked_ws>
+      // CHECK: ttg.local_store %{{.*}}, %[[REQ0]] : tensor<64x32xf16, #{{.*}}> -> !ttg.memdesc<64x32xf16, #[[$WS_A]], #smem, mutable>
+      ttg.local_store %load, %req : tensor<64x32xf16, #blocked_ws> -> !ttg.memdesc<64x32xf16, #shared_ws_a, #smem_ws, mutable>
+      ttg.warp_return
+    }
+    // CHECK: partition1(%[[ARG1:.*]]: !ttg.memdesc<1x64x32xf16, #[[$WS_SRC]], #smem, mutable>) num_warps(1)
+    partition1(%arg0: !ttg.memdesc<1x64x32xf16, #shared_ws_src, #smem_ws, mutable>) num_warps(1) {
+      %c0_i32_p1 = arith.constant 0 : i32
+      // CHECK: %[[BUF1:.*]] = ttg.memdesc_index %[[ARG1]][%{{.*}}] : !ttg.memdesc<1x64x32xf16, #[[$WS_SRC]], #smem, mutable> -> !ttg.memdesc<64x32xf16, #[[$WS_SRC]], #smem, mutable>
+      %buf = ttg.memdesc_index %arg0[%c0_i32_p1] : !ttg.memdesc<1x64x32xf16, #shared_ws_src, #smem_ws, mutable> -> !ttg.memdesc<64x32xf16, #shared_ws_src, #smem_ws, mutable>
+      // CHECK: %[[REQ1:.*]] = tlx.require_layout %[[BUF1]] : !ttg.memdesc<64x32xf16, #[[$WS_SRC]], #smem, mutable> -> !ttg.memdesc<64x32xf16, #[[$WS_B:[^,]+]], #smem, mutable>
+      %req = tlx.require_layout %buf : !ttg.memdesc<64x32xf16, #shared_ws_src, #smem_ws, mutable> -> !ttg.memdesc<64x32xf16, #shared_ws_b, #smem_ws, mutable>
+      // CHECK: ttg.local_load %[[REQ1]] : !ttg.memdesc<64x32xf16, #[[$WS_B]], #smem, mutable> -> tensor<64x32xf16, #{{.*}}>
+      %load = ttg.local_load %req : !ttg.memdesc<64x32xf16, #shared_ws_b, #smem_ws, mutable> -> tensor<64x32xf16, #blocked_ws>
+      // CHECK: ttg.local_store %{{.*}}, %[[REQ1]] : tensor<64x32xf16, #{{.*}}> -> !ttg.memdesc<64x32xf16, #[[$WS_B]], #smem, mutable>
+      ttg.local_store %load, %req : tensor<64x32xf16, #blocked_ws> -> !ttg.memdesc<64x32xf16, #shared_ws_b, #smem_ws, mutable>
+      ttg.warp_return
+    } : (!ttg.memdesc<1x64x32xf16, #shared_ws_src, #smem_ws, mutable>) -> i32
+    tt.return %token : i32
+  }
+}

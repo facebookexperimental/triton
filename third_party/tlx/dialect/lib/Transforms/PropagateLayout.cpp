@@ -112,6 +112,65 @@ static void rewriteTensorValueFromLattice(
     value.setType(newType);
 }
 
+static ttg::MemDescType getNewMemDescType(ttg::MemDescType origType,
+                                          Attribute encoding) {
+  return ttg::MemDescType::get(origType.getShape(), origType.getElementType(),
+                               encoding, origType.getMemorySpace(),
+                               origType.getMutableMemory());
+}
+
+static FailureOr<const LayoutEncodingLattice *>
+lookupMemDescLatticeOrEmitError(Value value, DataFlowSolver &solver,
+                                Operation *diagnosticOp) {
+  auto *lattice = solver.lookupState<LayoutEncodingLattice>(value);
+  if (lattice)
+    return lattice;
+
+  diagnosticOp->emitError() << "expected memdesc layout lattice for value "
+                            << value;
+  return failure();
+}
+
+static FailureOr<LayoutEncoding>
+getMemDescConsensusLayout(ArrayRef<Value> values, DataFlowSolver &solver,
+                          Operation *diagnosticOp) {
+  LayoutEncoding consensus;
+  for (Value value : values) {
+    FailureOr<const LayoutEncodingLattice *> lattice =
+        lookupMemDescLatticeOrEmitError(value, solver, diagnosticOp);
+    if (failed(lattice))
+      return failure();
+    consensus = LayoutEncoding::join(consensus, (*lattice)->getValue());
+  }
+  return consensus;
+}
+
+static LogicalResult rewriteMemDescValueFromLattice(Value value,
+                                                    DataFlowSolver &solver,
+                                                    Operation *diagnosticOp) {
+  auto origType = dyn_cast<ttg::MemDescType>(value.getType());
+  if (!origType)
+    return success();
+
+  FailureOr<const LayoutEncodingLattice *> lattice =
+      lookupMemDescLatticeOrEmitError(value, solver, diagnosticOp);
+  if (failed(lattice))
+    return failure();
+
+  LayoutEncoding layout = (*lattice)->getValue();
+  if (layout.isUninitialized())
+    return success();
+  if (layout.isUnknown()) {
+    LDBG("Leaving memdesc value unchanged due to unknown layout: " << value);
+    return success();
+  }
+
+  auto newType = getNewMemDescType(origType, layout.getLayoutEncoding());
+  if (newType != origType)
+    value.setType(newType);
+  return success();
+}
+
 static void
 collectRegionBranchSuccessors(RegionBranchOpInterface branchOp,
                               SmallVectorImpl<RegionSuccessor> &successors) {
@@ -179,6 +238,8 @@ computeBlockedTensorValues(triton::FuncOp funcOp, DataFlowSolver &solver) {
                                      blockedValues))
             continue;
 
+          LDBG("Blocking tensor carrier value due to inconsistent predecessor "
+               "layouts at " << branchOp->getName());
           changed |= blockedValues.insert(successorInput).second;
           for (Value predecessorValue : predecessorValues) {
             if (!isa<RankedTensorType>(predecessorValue.getType()))
@@ -242,7 +303,6 @@ public:
     if (!walkResult.wasInterrupted())
       return;
 
-    PatternRewriter rewriter(&getContext());
     SymbolTableCollection symbolTable;
     Operation *op = getOperation();
     DataFlowSolver solver;
@@ -258,87 +318,63 @@ public:
     llvm::DenseSet<Value> blockedTensorValues =
         computeBlockedTensorValues(funcOp, solver);
 
-    auto getNewMemDescType = [&](ttg::MemDescType origType,
-                                 Attribute encoding) {
-      return ttg::MemDescType::get(
-          origType.getShape(), origType.getElementType(), encoding,
-          origType.getMemorySpace(), origType.getMutableMemory());
-    };
-
-    funcOp.walk([&](mlir::Operation *op) {
+    WalkResult typeRewriteWalk = funcOp.walk([&](mlir::Operation *op) {
       if (isa<tlx::RequireLayoutOp>(op))
         return WalkResult::advance();
 
       if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(op)) {
-        Region *firstRegion = wsOp.getPartitionRegions()[0];
-        for (auto [i, blockArg] :
-             llvm::enumerate(firstRegion->getArguments())) {
-          if (!isa<ttg::MemDescType>(blockArg.getType()))
+        for (auto [i, capture] :
+             llvm::enumerate(wsOp.getPartitionOp().getExplicitCaptures())) {
+          auto captureType = dyn_cast<ttg::MemDescType>(capture.getType());
+          if (!captureType)
             continue;
-          auto lattice = solver.lookupState<LayoutEncodingLattice>(blockArg);
-          if (!lattice)
-            llvm_unreachable("Lattice not found.");
-          if (lattice->getValue().isUninitialized() ||
-              lattice->getValue().isUnknown())
+
+          SmallVector<Value> relatedValues;
+          relatedValues.push_back(capture);
+          for (Region *partitionRegion : wsOp.getPartitionRegions())
+            relatedValues.push_back(partitionRegion->getArgument(i));
+
+          FailureOr<LayoutEncoding> consensus =
+              getMemDescConsensusLayout(relatedValues, solver, wsOp);
+          if (failed(consensus))
+            return WalkResult::interrupt();
+          if (consensus->isUninitialized())
             continue;
+          if (consensus->isUnknown()) {
+            LDBG("Leaving warp_specialize capture #" << i
+                                                     << " unchanged due to "
+                                                        "non-concrete "
+                                                        "partition consensus");
+            continue;
+          }
+
+          auto newType =
+              getNewMemDescType(captureType, consensus->getLayoutEncoding());
+          if (capture.getType() != newType)
+            capture.setType(newType);
           for (Region *partitionRegion : wsOp.getPartitionRegions()) {
-            if (auto origType =
-                    dyn_cast<ttg::MemDescType>(blockArg.getType())) {
-              auto newType = getNewMemDescType(
-                  origType, lattice->getValue().getLayoutEncoding());
+            if (partitionRegion->getArgument(i).getType() != newType)
               partitionRegion->getArgument(i).setType(newType);
-            }
           }
         }
         return WalkResult::advance();
       }
 
       for (auto [i, result] : llvm::enumerate(op->getResults())) {
-        if (!isa<ttg::MemDescType>(result.getType()))
+        if (!isa<ttg::MemDescType>(result.getType())) {
           rewriteTensorValueFromLattice(result, solver, blockedTensorValues);
-        else {
-          auto *lattice = solver.lookupState<LayoutEncodingLattice>(result);
-          if (!lattice)
-            llvm_unreachable("Lattice not found.");
-          if (lattice->getValue().isUninitialized() ||
-              lattice->getValue().isUnknown())
-            continue;
-          if (auto origType = dyn_cast<ttg::MemDescType>(result.getType())) {
-            auto newType = getNewMemDescType(
-                origType, lattice->getValue().getLayoutEncoding());
-            op->getResult(i).setType(newType);
-          }
+          continue;
         }
+
+        if (failed(rewriteMemDescValueFromLattice(result, solver, op)))
+          return WalkResult::interrupt();
       }
       return WalkResult::advance();
     });
+    if (typeRewriteWalk.wasInterrupted())
+      return signalPassFailure();
 
     updateTensorRegionBranchTypes(funcOp, solver, blockedTensorValues);
-
-    // Fix up RequireLayoutOps feeding into TMEMStoreOps with scales encoding.
-    // ResolvePlaceholderLayouts assigned a generic TMEM-compatible register
-    // layout, but for scales the register layout must use
-    // getScaleTMEMStoreLinearLayout.
-    funcOp.walk([&](ttng::TMEMStoreOp storeOp) {
-      auto memTy = storeOp.getDst().getType();
-      if (!isa<ttng::TensorMemoryScalesEncodingAttr>(memTy.getEncoding()))
-        return WalkResult::advance();
-
-      auto requireOp = storeOp.getSrc().getDefiningOp<RequireLayoutOp>();
-      if (!requireOp)
-        return WalkResult::advance();
-
-      auto srcTy = cast<RankedTensorType>(requireOp.getResult().getType());
-      int numWarps = ttg::lookupNumWarps(storeOp);
-      // TODO: port getScaleTMEMStoreLinearLayout to upstream
-      // // TODO: port getScaleTMEMStoreLinearLayout
-      // auto scalesLL = ttg::getScaleTMEMStoreLinearLayout(srcTy, numWarps);
-      // auto newEncoding = ttg::LinearEncodingAttr::get(srcTy.getContext(), scalesLL);
-      // auto newType = RankedTensorType::get(srcTy.getShape(),
-      //                                      srcTy.getElementType(), newEncoding);
-      // requireOp->getResult(0).setType(newType);
-      return WalkResult::advance();
-    });
 
     // Verify that no DummyTMEMLayoutAttr remains after layout propagation
     bool hasDummyLayout = false;

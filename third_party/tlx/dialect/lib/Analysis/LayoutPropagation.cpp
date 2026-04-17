@@ -64,7 +64,9 @@ LayoutEncoding LayoutEncoding::meet(const LayoutEncoding &lhs,
     return lhs;
   if (lhs == rhs)
     return lhs;
-  llvm_unreachable("Conflicting layouts");
+  LDBG("Conflicting memdesc layouts " << lhs << " vs " << rhs
+                                      << "; widening to unknown");
+  return LayoutEncoding::getUnknownLayout();
 }
 
 static bool isValidPermutation(ArrayRef<int32_t> order, unsigned rank) {
@@ -364,19 +366,20 @@ static bool isTrackedTensorValue(Value value) {
   return isa<RankedTensorType>(value.getType());
 }
 
-static bool isSupportedTensorLayoutEncoding(Attribute encoding) {
-  return isa<ttg::DotOperandEncodingAttr>(encoding);
-}
-
 static bool isAllowedTensorLayoutUser(Operation *op, unsigned operandIndex) {
+  // This mirrors InsertRequireLayout's pre-materialization policy. Before the
+  // insert pass runs, dot operands flow through convert_layout and transparent
+  // region carriers. After convert_layout is rewritten into explicit
+  // tlx.require_layout anchors, tensor propagation treats those anchors plus
+  // the same transparent carriers as the legal local_load-to-dot path.
   if (auto requireLayoutOp = dyn_cast<RequireLayoutOp>(op)) {
     if (!isa<RankedTensorType>(requireLayoutOp.getType()) || operandIndex != 0)
       return false;
-    return isSupportedTensorLayoutEncoding(
+    return isSupportedDotConstraintEncoding(
         cast<RankedTensorType>(requireLayoutOp.getType()).getEncoding());
   }
 
-  return isa<RegionBranchOpInterface, RegionBranchTerminatorOpInterface>(op);
+  return isTransparentLayoutCarrierOp(op);
 }
 
 static bool canRewriteTensorResult(Operation *op) {
@@ -397,7 +400,7 @@ LogicalResult TensorBackwardPropagation::visitOperation(
       return success();
 
     Attribute layout = requireLayoutOp.getType().getEncoding();
-    if (!isSupportedTensorLayoutEncoding(layout))
+    if (!isSupportedDotConstraintEncoding(layout))
       return success();
 
     const auto layoutLattice = TensorLayout(layout);
@@ -426,6 +429,8 @@ LogicalResult TensorBackwardPropagation::visitOperation(
     if (operandState.isUninitialized())
       continue;
 
+    LDBG("Marking tensor layout unknown due to unsupported user "
+         << op->getName() << " on operand #" << index);
     ChangeResult changed =
         operands[index]->meet(TensorLayout::getUnknownLayout());
     propagateIfChanged(operands[index], changed);
@@ -443,6 +448,8 @@ LogicalResult TensorBackwardPropagation::visitOperation(
       if (resultState.isUninitialized())
         continue;
 
+      LDBG("Keeping explicit tensor layout conversion because producer "
+           << op->getName() << " cannot be retagged directly");
       ChangeResult changed =
           resultLattice->meet(TensorLayout::getUnknownLayout());
       propagateIfChanged(resultLattice, changed);

@@ -1,8 +1,8 @@
 // RUN: triton-opt -split-input-file --tlx-insert-require-layout --tlx-propagate-layout %s | FileCheck %s
 
-// Test that when tensor propagation through a region-branch carrier cannot make
-// all predecessors agree, the pipeline stays valid by keeping an explicit
-// layout conversion instead of failing.
+// Test that when the combined insert+propagate pipeline cannot make all tensor
+// carrier predecessors agree on a concrete layout, it stays valid by keeping an
+// explicit layout conversion instead of retagging the carrier.
 
 #blocked = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [2, 2], instrShape = [32, 32, 8], isTransposed = true}>

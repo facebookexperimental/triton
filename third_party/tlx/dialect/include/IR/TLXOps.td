@@ -248,7 +248,18 @@ def TLX_RequireLayoutOp : TLX_Op<"require_layout",
                                   SameOperandsAndResultElementType,
                                   MemDescViewTrait,
                                   Pure]> {
-  let summary = "require specific layout for a local memory buffer";
+  let summary = "materialize an explicit layout constraint on a memdesc or tensor value";
+
+  let description = [{
+    `tlx.require_layout` makes a layout requirement explicit in the IR.
+
+    - On memdesc values, it acts as a view-like layout constraint that
+      `tlx-propagate-layout` tries to absorb into the producing or carried
+      memdesc types.
+    - On tensor values, it acts as an explicit register-layout anchor that
+      `tlx-propagate-layout` propagates back to supported producers when
+      possible and otherwise lowers to `ttg.convert_layout`.
+  }];
 
   let arguments = (ins TTG_TensorOrMemDesc:$src);
 

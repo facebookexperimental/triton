@@ -32,10 +32,24 @@ def TlxPropagateLayout : Pass<"tlx-propagate-layout", "mlir::ModuleOp"> {
   let summary = "Propagate layout information";
 
   let description = [{
-    This pass propagates layout information from the tlx::RequireLayoutOp and
-    tlx::ReleaseLayoutOp by doing a backward and forward dataflow analysis. It
-    is expected that these ops would be either completely eliminated or turned
-    into ttg::ConvertLayoutOp(s).
+    This pass propagates explicit layout constraints from tlx::RequireLayoutOp
+    and tlx::ReleaseLayoutOp using backward and forward dataflow analyses.
+
+    The pass owns the downstream consequences of those constraints:
+    - retagging memdesc producers and carriers when the memdesc lattice reaches
+      a concrete encoding
+    - retagging supported tensor producers (`ttg.local_load`) and region-carried
+      tensor values when the tensor lattice reaches a concrete encoding
+    - applying consensus-based updates for RegionBranchOpInterface carriers and
+      `ttg.warp_specialize` partition captures/arguments
+    - lowering residual tensor constraints to `ttg.convert_layout`
+    - validating post-conditions such as the absence of unresolved
+      DummyTMEMLayoutAttr allocations
+
+    Tensor constraints are expected to be either eliminated or lowered to
+    `ttg.convert_layout`. Memdesc constraints usually fold into retagged types,
+    but may remain explicit when propagation conservatively falls back on an
+    unknown/conflicting layout.
   }];
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
