@@ -438,15 +438,18 @@ void LayoutPropagation::propagateLayout() {
 }
 
 // Compute a score for a layout to guide conflict resolution.
-// Currently based on sizePerThread (vectorization), but can be extended
-// with other heuristics. Higher score is preferred.
-// Returns 0 for non-blocked encodings.
+// Based on sizePerThread (vectorization) for both blocked and linear encodings.
+// Higher score is preferred — layouts with more elements per thread allow better
+// vectorized memory access (ld.shared, st.shared).
 static int64_t getLayoutScore(Attribute encoding) {
-  auto blocked = dyn_cast<BlockedEncodingAttr>(encoding);
-  if (!blocked)
+  SmallVector<unsigned> sizePerThread;
+  if (auto blocked = dyn_cast<BlockedEncodingAttr>(encoding)) {
+    sizePerThread = SmallVector<unsigned>(blocked.getSizePerThread());
+  } else if (auto linear = dyn_cast<LinearEncodingAttr>(encoding)) {
+    sizePerThread = linear.getSizePerThread();
+  }
+  if (sizePerThread.empty())
     return 0;
-  auto sizePerThread = blocked.getSizePerThread();
-  // Compute product of sizePerThread values as the vectorization score.
   int64_t score = 1;
   for (auto size : sizePerThread) {
     score *= size;
@@ -466,8 +469,10 @@ void LayoutPropagation::resolveConflicts() {
     bool isLoadOrStore =
         op && isa<LoadOp, StoreOp, AtomicRMWOp, AtomicCASOp>(op);
     // Pick the layout with maximum score.
-    // This prefers layouts with larger sizePerThread values (e.g., TMEM's
-    // [1, 128] over SMEM's [1, 8]) for better memory access patterns.
+    // This prefers layouts with larger sizePerThread values for better
+    // vectorized memory access. Both blocked and linear encodings are scored,
+    // so e.g. a linear layout from TMEMLoadOp (sizePerThread=[1,32]) beats
+    // a blocked layout from local_load (sizePerThread=[1,8]).
     int64_t bestScore = getLayoutScore(encoding);
     for (Attribute e : info.encodings) {
       int64_t score = getLayoutScore(e);
@@ -476,7 +481,7 @@ void LayoutPropagation::resolveConflicts() {
         encoding = e;
       }
     }
-    // If no blocked layout with vectorization found, fall back to the original
+    // If no layout with vectorization found, fall back to the original
     // heuristic (prefer blocked for load/store, MMA for compute).
     if (bestScore == 0) {
       for (Attribute e : info.encodings) {
