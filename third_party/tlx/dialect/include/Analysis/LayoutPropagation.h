@@ -117,6 +117,80 @@ public:
                                         const LayoutEncoding &opndEncoding);
 };
 
+//===----------------------------------------------------------------------===//
+// TensorLayout
+//===----------------------------------------------------------------------===//
+
+class TensorLayout {
+public:
+  /// Construct a TensorLayout value as uninitialized.
+  explicit TensorLayout() = default;
+
+  /// Construct a TensorLayout value with a known constant.
+  TensorLayout(Attribute encoding) : encoding(std::move(encoding)) {}
+
+  bool operator==(const TensorLayout &rhs) const {
+    return encoding == rhs.encoding;
+  }
+
+  /// Whether the state is uninitialized.
+  bool isUninitialized() const { return !encoding.has_value(); }
+
+  /// Whether the state is unknown.
+  bool isUnknown() const { return encoding == nullptr; }
+
+  Attribute getLayoutEncoding() const {
+    assert(!isUninitialized());
+    assert(!isUnknown());
+    return *encoding;
+  }
+
+  void print(raw_ostream &os) const;
+  static TensorLayout meet(const TensorLayout &lhs, const TensorLayout &rhs);
+  static TensorLayout join(const TensorLayout &lhs, const TensorLayout &rhs);
+  static TensorLayout getUnknownLayout() {
+    return TensorLayout{/*layoutEncoding=*/nullptr};
+  }
+
+private:
+  std::optional<Attribute> encoding;
+};
+
+//===----------------------------------------------------------------------===//
+// TensorLayoutLattice
+//===----------------------------------------------------------------------===//
+
+class TensorLayoutLattice : public Lattice<TensorLayout> {
+public:
+  using Lattice::Lattice;
+};
+
+//===----------------------------------------------------------------------===//
+// TensorBackwardPropagation
+//===----------------------------------------------------------------------===//
+
+class TensorBackwardPropagation
+    : public SparseBackwardDataFlowAnalysis<TensorLayoutLattice> {
+public:
+  using SparseBackwardDataFlowAnalysis::SparseBackwardDataFlowAnalysis;
+
+  LogicalResult
+  visitOperation(Operation *op, ArrayRef<TensorLayoutLattice *> operands,
+                 ArrayRef<const TensorLayoutLattice *> results) override;
+
+  void visitBranchOperand(OpOperand &operand) override;
+
+  void visitCallOperand(OpOperand &operand) override;
+
+  void setToExitState(TensorLayoutLattice *lattice) override;
+
+  void visitNonControlFlowArguments(
+      RegionSuccessor &successor,
+      ArrayRef<BlockArgument> arguments) override {
+    // Default: do nothing
+  }
+};
+
 } // namespace mlir::triton::tlx
 
 #endif // TLX_ANALYSIS_LAYOUTPROPAGATION_H

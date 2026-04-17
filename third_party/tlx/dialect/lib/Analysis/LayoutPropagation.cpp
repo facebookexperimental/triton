@@ -312,6 +312,164 @@ void LayoutBackwardPropagation::setToExitState(LayoutEncodingLattice *lattice) {
 }
 
 //===----------------------------------------------------------------------===//
+// TensorLayout
+//===----------------------------------------------------------------------===//
+
+void TensorLayout::print(raw_ostream &os) const {
+  if (isUninitialized()) {
+    os << "<UNINITIALIZED>";
+    return;
+  }
+  if (isUnknown()) {
+    os << "<UNKNOWN>";
+    return;
+  }
+  return getLayoutEncoding().print(os);
+}
+
+TensorLayout TensorLayout::join(const TensorLayout &lhs,
+                                const TensorLayout &rhs) {
+  return meet(lhs, rhs);
+}
+
+TensorLayout TensorLayout::meet(const TensorLayout &lhs,
+                                const TensorLayout &rhs) {
+  if (lhs.isUnknown() || rhs.isUnknown())
+    return TensorLayout::getUnknownLayout();
+  if (lhs.isUninitialized())
+    return rhs;
+  if (rhs.isUninitialized())
+    return lhs;
+  if (lhs == rhs)
+    return lhs;
+  return TensorLayout::getUnknownLayout();
+}
+
+static bool isTrackedTensorValue(Value value) {
+  return isa<RankedTensorType>(value.getType());
+}
+
+static bool isSupportedTensorLayoutEncoding(Attribute encoding) {
+  return isa<ttg::DotOperandEncodingAttr>(encoding);
+}
+
+static bool isAllowedTensorLayoutUser(Operation *op, unsigned operandIndex) {
+  if (auto requireLayoutOp = dyn_cast<RequireLayoutOp>(op)) {
+    if (!isa<RankedTensorType>(requireLayoutOp.getType()) || operandIndex != 0)
+      return false;
+    return isSupportedTensorLayoutEncoding(
+        cast<RankedTensorType>(requireLayoutOp.getType()).getEncoding());
+  }
+
+  return isa<RegionBranchOpInterface, RegionBranchTerminatorOpInterface>(op);
+}
+
+static bool canRewriteTensorResult(Operation *op) {
+  return isa<ttg::LocalLoadOp, RegionBranchOpInterface>(op);
+}
+
+//===----------------------------------------------------------------------===//
+// TensorBackwardPropagation
+//===----------------------------------------------------------------------===//
+
+LogicalResult TensorBackwardPropagation::visitOperation(
+    Operation *op, ArrayRef<TensorLayoutLattice *> operands,
+    ArrayRef<const TensorLayoutLattice *> results) {
+  LDBG("Visiting tensor operation " << *op << "\n");
+
+  if (auto requireLayoutOp = dyn_cast<RequireLayoutOp>(op)) {
+    if (!isa<RankedTensorType>(requireLayoutOp.getType()))
+      return success();
+
+    Attribute layout = requireLayoutOp.getType().getEncoding();
+    if (!isSupportedTensorLayoutEncoding(layout))
+      return success();
+
+    const auto layoutLattice = TensorLayout(layout);
+    for (auto [operandLattice, operand] :
+         llvm::zip_equal(operands, requireLayoutOp->getOperands())) {
+      if (!isTrackedTensorValue(operand))
+        continue;
+      ChangeResult changed = operandLattice->meet(layoutLattice);
+      propagateIfChanged(operandLattice, changed);
+    }
+    return success();
+  }
+
+  if (isa<ReleaseLayoutOp>(op))
+    return success();
+
+  // If a tracked tensor value is used by an unsupported operation, rewriting
+  // the producer chain is no longer legal for that entire component.
+  for (auto [index, operand] : llvm::enumerate(op->getOperands())) {
+    if (!isTrackedTensorValue(operand))
+      continue;
+    if (isAllowedTensorLayoutUser(op, index))
+      continue;
+
+    TensorLayout operandState = operands[index]->getValue();
+    if (operandState.isUninitialized())
+      continue;
+
+    ChangeResult changed =
+        operands[index]->meet(TensorLayout::getUnknownLayout());
+    propagateIfChanged(operands[index], changed);
+  }
+
+  // Only a narrow set of tensor-producing operations can absorb a propagated
+  // layout directly. Everything else falls back to a local convert.
+  if (!canRewriteTensorResult(op)) {
+    for (Value result : op->getResults()) {
+      if (!isTrackedTensorValue(result))
+        continue;
+
+      auto *resultLattice = getLatticeElement(result);
+      TensorLayout resultState = resultLattice->getValue();
+      if (resultState.isUninitialized())
+        continue;
+
+      ChangeResult changed =
+          resultLattice->meet(TensorLayout::getUnknownLayout());
+      propagateIfChanged(resultLattice, changed);
+    }
+  }
+
+  return success();
+}
+
+void TensorBackwardPropagation::visitBranchOperand(OpOperand &operand) {
+  if (!isTrackedTensorValue(operand.get()))
+    return;
+
+  Operation *owner = operand.getOwner();
+  if (isa<RegionBranchOpInterface, RegionBranchTerminatorOpInterface>(owner))
+    return;
+
+  auto *lattice = getLatticeElement(operand.get());
+  TensorLayout state = lattice->getValue();
+  if (state.isUninitialized())
+    return;
+
+  ChangeResult changed = lattice->meet(TensorLayout::getUnknownLayout());
+  propagateIfChanged(lattice, changed);
+}
+
+void TensorBackwardPropagation::visitCallOperand(OpOperand &operand) {
+  if (!isTrackedTensorValue(operand.get()))
+    return;
+
+  auto *lattice = getLatticeElement(operand.get());
+  TensorLayout state = lattice->getValue();
+  if (state.isUninitialized())
+    return;
+
+  ChangeResult changed = lattice->meet(TensorLayout::getUnknownLayout());
+  propagateIfChanged(lattice, changed);
+}
+
+void TensorBackwardPropagation::setToExitState(TensorLayoutLattice *lattice) {}
+
+//===----------------------------------------------------------------------===//
 // LayoutForwardPropagation
 //===----------------------------------------------------------------------===//
 
