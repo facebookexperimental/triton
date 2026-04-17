@@ -45,11 +45,20 @@ def TlxPropagateLayout : Pass<"tlx-propagate-layout", "mlir::ModuleOp"> {
 }
 
 def TLXInsertRequireLayout : Pass<"tlx-insert-require-layout", "mlir::ModuleOp"> {
-  let summary = "Inserts a tlx::RequireLayoutOp op before the LocalLoad that feeds a tl.dot";
+  let summary = "Insert explicit TLX layout constraints for local_load-to-dot paths";
 
   let description = [{
-    This pass inserts a tlx::RequireLayoutOp op before the LocalLoad that feeds a tl.dot.
-    This layout will then be propagated to the local alloc, by the layout propagation pass.
+    This pass discovers dot-fed ttg.local_load operations and inserts the
+    missing tlx.require_layout constraints needed for the AMD local_load-to-dot
+    path.
+
+    The pass only synthesizes explicit TLX layout constraints:
+    - memdesc-side tlx.require_layout constraints for shared-memory swizzling
+    - tensor-side tlx.require_layout constraints in place of dot-path
+      ttg.convert_layout operations
+
+    It does not own tensor/register propagation or convert cleanup; those are
+    handled by tlx-propagate-layout and downstream cleanup passes.
   }];
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
