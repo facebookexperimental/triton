@@ -354,4 +354,66 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       } -> (i32)
     tt.return %result : i32
   }
+
+  // Test wait_barrier at TILE_START: emitted before every tile replication.
+  // CHECK-LABEL: @wait_tile_start
+  tt.func @wait_tile_start(
+      %bar: !ttg.memdesc<1xi64, #shared, #smem, mutable>,
+      %phase: i32) {
+    // wait_barrier before EVERY tile's op:
+    // CHECK: ttng.wait_barrier
+    // CHECK-NEXT: arith.index_cast
+    // CHECK: ttng.wait_barrier
+    // CHECK-NEXT: arith.index_cast
+    // CHECK-NOT: ttng.subtiled_region
+    ttng.subtiled_region
+        barriers(%bar : !ttg.memdesc<1xi64, #shared, #smem, mutable>)
+        phases(%phase : i32)
+        tile_mappings = [array<i32: 0>, array<i32: 1>]
+        barrier_annotations = [
+          #ttng.barrier_annotation<barrierIdx = 0, placement = tile_start,
+            targetOpIdx = 0, barrierOpKind = "wait_barrier">
+        ]
+      setup {
+        %c0 = arith.constant 0 : i32
+        %c1 = arith.constant 1 : i32
+        ttng.subtiled_region_yield %c0, %c1 : i32, i32
+      } tile(%arg0: i32) {
+        %idx = arith.index_cast %arg0 : i32 to index
+        ttng.subtiled_region_yield
+      } teardown {
+        ttng.subtiled_region_yield
+      }
+    tt.return
+  }
+
+  // Test arrive_barrier at TILE_END: emitted after every tile replication.
+  // CHECK-LABEL: @arrive_tile_end
+  tt.func @arrive_tile_end(
+      %bar: !ttg.memdesc<1xi64, #shared, #smem, mutable>) {
+    // arrive_barrier after EVERY tile's op:
+    // CHECK: arith.index_cast
+    // CHECK-NEXT: ttng.arrive_barrier %{{.*}}, 1
+    // CHECK: arith.index_cast
+    // CHECK-NEXT: ttng.arrive_barrier %{{.*}}, 1
+    // CHECK-NOT: ttng.subtiled_region
+    ttng.subtiled_region
+        barriers(%bar : !ttg.memdesc<1xi64, #shared, #smem, mutable>)
+        tile_mappings = [array<i32: 0>, array<i32: 1>]
+        barrier_annotations = [
+          #ttng.barrier_annotation<barrierIdx = 0, placement = tile_end,
+            targetOpIdx = 0, barrierOpKind = "arrive_barrier">
+        ]
+      setup {
+        %c0 = arith.constant 0 : i32
+        %c1 = arith.constant 1 : i32
+        ttng.subtiled_region_yield %c0, %c1 : i32, i32
+      } tile(%arg0: i32) {
+        %idx = arith.index_cast %arg0 : i32 to index
+        ttng.subtiled_region_yield
+      } teardown {
+        ttng.subtiled_region_yield
+      }
+    tt.return
+  }
 }

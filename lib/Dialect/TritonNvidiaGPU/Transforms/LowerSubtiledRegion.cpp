@@ -56,10 +56,11 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
   ValueRange phases = op.getBarrierPhases();
 
   // Pre-process barrier annotations by region and target op index.
-  // For TILE region: beforeFirst[opIdx] / afterLast[opIdx]
-  // For SETUP/TEARDOWN: before[opIdx] / after[opIdx]
+  // For TILE region with BEFORE/AFTER: first/last tile only.
+  // For TILE region with TILE_START/TILE_END: every tile.
+  // For SETUP/TEARDOWN: placed in the respective region.
   llvm::DenseMap<unsigned, SmallVector<BarrierAnnotationAttr>> tileBeforeFirst,
-      tileAfterLast;
+      tileAfterLast, tileEveryStart, tileEveryEnd;
   llvm::DenseMap<unsigned, SmallVector<BarrierAnnotationAttr>> setupBefore,
       setupAfter, teardownBefore, teardownAfter;
 
@@ -79,11 +80,21 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
       else
         teardownAfter[opIdx].push_back(annotation);
     } else {
-      // TILE region: existing behavior (BEFORE first tile, AFTER last tile).
-      if (annotation.getPlacement() == BarrierPlacement::BEFORE)
+      // TILE region.
+      switch (annotation.getPlacement()) {
+      case BarrierPlacement::BEFORE:
         tileBeforeFirst[opIdx].push_back(annotation);
-      else
+        break;
+      case BarrierPlacement::AFTER:
         tileAfterLast[opIdx].push_back(annotation);
+        break;
+      case BarrierPlacement::TILE_START:
+        tileEveryStart[opIdx].push_back(annotation);
+        break;
+      case BarrierPlacement::TILE_END:
+        tileEveryEnd[opIdx].push_back(annotation);
+        break;
+      }
     }
   }
 
@@ -120,7 +131,7 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
 
     unsigned opIdx = 0;
     for (Operation &tileOp : tileBlock.without_terminator()) {
-      // Before first tile: emit BEFORE annotations for this op index
+      // BEFORE first tile only.
       if (tileIdx == 0) {
         auto it = tileBeforeFirst.find(opIdx);
         if (it != tileBeforeFirst.end()) {
@@ -129,9 +140,27 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
         }
       }
 
+      // TILE_START: before every tile.
+      {
+        auto it = tileEveryStart.find(opIdx);
+        if (it != tileEveryStart.end()) {
+          for (auto &annotation : it->second)
+            emitBarrierOp(builder, loc, annotation, barriers, phases);
+        }
+      }
+
       builder.clone(tileOp, tileMapping);
 
-      // After last tile: emit AFTER annotations for this op index
+      // TILE_END: after every tile.
+      {
+        auto it = tileEveryEnd.find(opIdx);
+        if (it != tileEveryEnd.end()) {
+          for (auto &annotation : it->second)
+            emitBarrierOp(builder, loc, annotation, barriers, phases);
+        }
+      }
+
+      // AFTER last tile only.
       if (tileIdx == numTiles - 1) {
         auto it = tileAfterLast.find(opIdx);
         if (it != tileAfterLast.end()) {

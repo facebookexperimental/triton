@@ -87,12 +87,15 @@ def TTG_TensorMemoryScalesEncodingAttr : AttrDef<TritonNvidiaGPU_Dialect, "Tenso
 // BarrierPlacement enum
 //===----------------------------------------------------------------------===//
 
-def TTNG_BarrierPlacementBefore : I32EnumAttrCase<"BEFORE", 0, "before">;
-def TTNG_BarrierPlacementAfter  : I32EnumAttrCase<"AFTER",  1, "after">;
+def TTNG_BarrierPlacementBefore    : I32EnumAttrCase<"BEFORE",     0, "before">;
+def TTNG_BarrierPlacementAfter     : I32EnumAttrCase<"AFTER",      1, "after">;
+def TTNG_BarrierPlacementTileStart : I32EnumAttrCase<"TILE_START", 2, "tile_start">;
+def TTNG_BarrierPlacementTileEnd   : I32EnumAttrCase<"TILE_END",   3, "tile_end">;
 
 def TTNG_BarrierPlacement : I32EnumAttr<"BarrierPlacement",
-    "Barrier placement relative to first/last tile",
-    [TTNG_BarrierPlacementBefore, TTNG_BarrierPlacementAfter]> {
+    "Barrier placement relative to tile operations",
+    [TTNG_BarrierPlacementBefore, TTNG_BarrierPlacementAfter,
+     TTNG_BarrierPlacementTileStart, TTNG_BarrierPlacementTileEnd]> {
   let cppNamespace = "::mlir::triton::nvidia_gpu";
 }
 
@@ -121,13 +124,17 @@ def TTNG_BarrierAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnota
     Describes where to insert a barrier operation during subtiled region lowering.
 
     - `barrierIdx`: index into the op's barriers operand list
-    - `placement`: BEFORE or AFTER the target op
+    - `placement`: when the barrier fires:
+        - BEFORE: before the target op on the first tile only
+        - AFTER: after the target op on the last tile only
+        - TILE_START: before the target op on every tile
+        - TILE_END: after the target op on every tile
     - `targetOpIdx`: index of the target op in the target region body (0-based,
       counting only non-terminator ops)
     - `barrierOpKind`: "wait_barrier" or "arrive_barrier"
     - `count`: arrive count for arrive_barrier (default 1)
     - `region`: which region the barrier targets (default TILE):
-        - TILE: placed relative to first/last tile replication (existing behavior)
+        - TILE: placed in the per-tile body
         - SETUP: placed in the setup region (runs once before all tiles)
         - TEARDOWN: placed in the teardown region (runs once after all tiles)
   }];
