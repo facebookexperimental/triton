@@ -53,7 +53,8 @@ Step 12: specializeRegion          — clone ops into WarpSpecializeOp regions
 
 **Function**: `doBufferAllocation(funcOp)`
 
-A separate entry point for pre-processing before the main pipeline:
+A separate entry point for pre-processing before the main pipeline.
+See [Buffer Allocation](BufferAllocation.md) for details.
 
 ```
 Step 0:   swapTransposedLocalAllocs   — normalize transposed alloc layouts
