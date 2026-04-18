@@ -377,12 +377,19 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_triton_licm(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+            if knobs.nvidia.use_meta_ws:
+                nvidia.passes.hopper.add_data_partitioning(pm, 1)
+                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
+                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
             nvidia.passes.hopper.add_tma_store_lowering(pm)
+            if knobs.nvidia.use_meta_ws and knobs.nvidia.use_meta_partition:
+                nvidia.passes.hopper.add_partition_scheduling_meta(pm)
             smem_budget = _max_shared_mem_for_capability(capability)
             nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled,
                                                      smem_budget, knobs.nvidia.generate_subtiled_region)
-            passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
-            passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
+            if not knobs.nvidia.use_meta_ws:
+                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
+                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
         elif capability // 10 >= 10:
             passes.ttgpuir.add_fuse_nested_loops(pm)

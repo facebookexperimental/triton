@@ -601,6 +601,7 @@ void collectRegionsWithChannelsPost(
       }
     }
     auto *dst = channel->getDstOp();
+    auto *src = channel->getSrcOp();
     auto *pOp = dst->getParentOp();
     if (!pOp)
       continue;
@@ -608,6 +609,21 @@ void collectRegionsWithChannelsPost(
       regionsWithChannels.insert(pOp);
     if (auto ifOp = dyn_cast<scf::IfOp>(pOp))
       regionsWithChannels.insert(pOp);
+    // When producer is in a different (outer) scope than consumer,
+    // also register the producer's parent. This handles Q buffers in
+    // persistent FA kernels: Q is produced in the outer tile loop but
+    // consumed inside the inner KV loop. Without this, the outer loop
+    // only gets 1 accumCnt (for the inner loop), and Q's phase uses
+    // the inner loop's K/V counter instead of a separate Q counter.
+    if (src) {
+      auto *srcParent = src->getParentOp();
+      if (srcParent && srcParent != pOp) {
+        if (isa<scf::ForOp>(srcParent))
+          regionsWithChannels.insert(srcParent);
+        if (isa<scf::IfOp>(srcParent))
+          regionsWithChannels.insert(srcParent);
+      }
+    }
   }
 }
 
