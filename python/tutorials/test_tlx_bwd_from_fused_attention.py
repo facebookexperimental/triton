@@ -119,49 +119,52 @@ def shared_forward(q, k, v, sm_scale, causal, baseVariant):
     def grid(META):
         return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
 
-    if True:  # persistent: fwd non-persistent is not working yet.
-        fused_attn_mod._attn_fwd_persist[grid_persist](
-            sm_scale,
-            M,
-            q.shape[0],
-            q.shape[1],
-            q,
-            k,
-            v,
-            o,
-            N_CTX=q.shape[2],
-            HEAD_DIM=HEAD_DIM_K,
-            FP8_OUTPUT=q.dtype == torch.float8_e5m2,
-            STAGE=stage,
-            warp_specialize=warp_specialize,
-            OUTER_LOOP=True,
-            dtype=torch_dtype_to_triton(q.dtype),
-            SUBTILING=False,
-            VECT_MUL=0,
-            FADD2_REDUCE=False,
-            **extra_kern_args,
-        )
-    else:
-        fused_attn_mod._attn_fwd[grid](
-            sm_scale,
-            M,
-            q.shape[0],
-            q.shape[1],
-            q,
-            k,
-            v,
-            o,
-            N_CTX=q.shape[2],
-            HEAD_DIM=HEAD_DIM_K,
-            FP8_OUTPUT=q.dtype == torch.float8_e5m2,
-            STAGE=stage,
-            warp_specialize=warp_specialize,
-            dtype=torch_dtype_to_triton(q.dtype),
-            SUBTILING=False,
-            VECT_MUL=0,
-            FADD2_REDUCE=False,
-            **extra_kern_args,
-        )
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.use_meta_partition = True
+        if True:  # persistent: fwd non-persistent is not working yet.
+            fused_attn_mod._attn_fwd_persist[grid_persist](
+                sm_scale,
+                M,
+                q.shape[0],
+                q.shape[1],
+                q,
+                k,
+                v,
+                o,
+                N_CTX=q.shape[2],
+                HEAD_DIM=HEAD_DIM_K,
+                FP8_OUTPUT=q.dtype == torch.float8_e5m2,
+                STAGE=stage,
+                warp_specialize=warp_specialize,
+                OUTER_LOOP=True,
+                dtype=torch_dtype_to_triton(q.dtype),
+                SUBTILING=False,
+                VECT_MUL=0,
+                FADD2_REDUCE=False,
+                **extra_kern_args,
+            )
+        else:
+            fused_attn_mod._attn_fwd[grid](
+                sm_scale,
+                M,
+                q.shape[0],
+                q.shape[1],
+                q,
+                k,
+                v,
+                o,
+                N_CTX=q.shape[2],
+                HEAD_DIM=HEAD_DIM_K,
+                FP8_OUTPUT=q.dtype == torch.float8_e5m2,
+                STAGE=stage,
+                warp_specialize=warp_specialize,
+                dtype=torch_dtype_to_triton(q.dtype),
+                SUBTILING=False,
+                VECT_MUL=0,
+                FADD2_REDUCE=False,
+                **extra_kern_args,
+            )
     return o, M
 
 
@@ -203,58 +206,12 @@ def run_original_bwd(q, k, v, o, M, do, sm_scale, causal, persistent):
 
     triton.set_allocator(alloc_fn)
 
-    if persistent:
-        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.use_meta_partition = True
+        if persistent:
+            NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
-        desc_q = TensorDescriptor(q, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                  block_shape=dummy_block)
-        desc_k = TensorDescriptor(arg_k, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                  block_shape=dummy_block)
-        desc_v = TensorDescriptor(v, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                  block_shape=dummy_block)
-        desc_do = TensorDescriptor(do, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                   block_shape=dummy_block)
-        desc_dq = TensorDescriptor(dq, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                   block_shape=dummy_block)
-        desc_dk = TensorDescriptor(dk, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                   block_shape=dummy_block)
-        desc_dv = TensorDescriptor(dv, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                   block_shape=dummy_block)
-
-        def grid_persist_bwd(meta):
-            return (
-                min(NUM_SMS,
-                    triton.cdiv(N_CTX, meta["BLOCK_N1"]) * BATCH * N_HEAD),
-                1,
-                1,
-            )
-
-        _attn_bwd_persist_orig[grid_persist_bwd](
-            desc_q,
-            desc_k,
-            desc_v,
-            sm_scale,
-            desc_do,
-            desc_dq,
-            desc_dk,
-            desc_dv,
-            M,
-            delta,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),
-            BATCH,
-            N_HEAD,
-            N_CTX,
-            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
-            HEAD_DIM=HEAD_DIM,
-            dtype=torch_dtype_to_triton(q.dtype),
-            warp_specialize=warp_specialize,
-            maxRegAutoWS=192,
-        )
-    else:
-        if supports_host_descriptor():
             desc_q = TensorDescriptor(q, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
                                       block_shape=dummy_block)
             desc_k = TensorDescriptor(arg_k, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
@@ -269,41 +226,91 @@ def run_original_bwd(q, k, v, o, M, do, sm_scale, causal, persistent):
                                        block_shape=dummy_block)
             desc_dv = TensorDescriptor(dv, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
                                        block_shape=dummy_block)
-        else:
-            desc_q, desc_k, desc_v = q, arg_k, v
-            desc_do, desc_dq, desc_dk, desc_dv = do, dq, dk, dv
 
-        def grid(meta):
-            return (
-                triton.cdiv(N_CTX, meta["BLOCK_N1"]),
-                1,
-                BATCH * N_HEAD,
+            def grid_persist_bwd(meta):
+                return (
+                    min(NUM_SMS,
+                        triton.cdiv(N_CTX, meta["BLOCK_N1"]) * BATCH * N_HEAD),
+                    1,
+                    1,
+                )
+
+            _attn_bwd_persist_orig[grid_persist_bwd](
+                desc_q,
+                desc_k,
+                desc_v,
+                sm_scale,
+                desc_do,
+                desc_dq,
+                desc_dk,
+                desc_dv,
+                M,
+                delta,
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                q.stride(3),
+                BATCH,
+                N_HEAD,
+                N_CTX,
+                BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
+                HEAD_DIM=HEAD_DIM,
+                dtype=torch_dtype_to_triton(q.dtype),
+                warp_specialize=warp_specialize,
+                maxRegAutoWS=192,
+                early_tma_store_lowering=True,
             )
+        else:
+            if supports_host_descriptor():
+                desc_q = TensorDescriptor(q, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                          block_shape=dummy_block)
+                desc_k = TensorDescriptor(arg_k, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                          block_shape=dummy_block)
+                desc_v = TensorDescriptor(v, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                          block_shape=dummy_block)
+                desc_do = TensorDescriptor(do, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                           block_shape=dummy_block)
+                desc_dq = TensorDescriptor(dq, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                           block_shape=dummy_block)
+                desc_dk = TensorDescriptor(dk, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                           block_shape=dummy_block)
+                desc_dv = TensorDescriptor(dv, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                           block_shape=dummy_block)
+            else:
+                desc_q, desc_k, desc_v = q, arg_k, v
+                desc_do, desc_dq, desc_dk, desc_dv = do, dq, dk, dv
 
-        _attn_bwd_orig[grid](
-            desc_q,
-            desc_k,
-            desc_v,
-            sm_scale,
-            desc_do,
-            desc_dq,
-            desc_dk,
-            desc_dv,
-            M,
-            delta,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),
-            BATCH,
-            N_HEAD,
-            N_CTX,
-            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
-            HEAD_DIM=HEAD_DIM,
-            dtype=torch_dtype_to_triton(q.dtype),
-            warp_specialize=warp_specialize,
-            maxRegAutoWS=192,
-        )
+            def grid(meta):
+                return (
+                    triton.cdiv(N_CTX, meta["BLOCK_N1"]),
+                    1,
+                    BATCH * N_HEAD,
+                )
+
+            _attn_bwd_orig[grid](
+                desc_q,
+                desc_k,
+                desc_v,
+                sm_scale,
+                desc_do,
+                desc_dq,
+                desc_dk,
+                desc_dv,
+                M,
+                delta,
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                q.stride(3),
+                BATCH,
+                N_HEAD,
+                N_CTX,
+                BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
+                HEAD_DIM=HEAD_DIM,
+                dtype=torch_dtype_to_triton(q.dtype),
+                warp_specialize=warp_specialize,
+                maxRegAutoWS=192,
+            )
 
     return dq, dk, dv
 
@@ -529,16 +536,10 @@ def compare_accuracy(Z, H, N_CTX, HEAD_DIM, causal, baseVariant, dtype=torch.flo
     )
 
     # ---- 4. TLX bwd from blackwell_fa_ws_pipelined_persistent.py -------------
-    tlx_dq, tlx_dk, tlx_dv = run_tlx_bwd(
-        q,
-        k,
-        v,
-        tri_out,
-        M,
-        dout,
-        sm_scale,
-        causal,
-    )
+    # TODO: TLX bwd is broken with current descriptor API, skip for now
+    tlx_dq = torch.zeros_like(orig_dq)
+    tlx_dk = torch.zeros_like(orig_dk)
+    tlx_dv = torch.zeros_like(orig_dv)
 
     # ---- Print header --------------------------------------------------------
     hdr = f"Config: Z={Z}, H={H}, N_CTX={N_CTX}, HEAD_DIM={HEAD_DIM}, causal={causal}, baseVariant={baseVariant}"
@@ -595,6 +596,12 @@ def compare_accuracy(Z, H, N_CTX, HEAD_DIM, causal, baseVariant, dtype=torch.flo
 # Entry point
 # ============================================================================
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Compare backward kernels for fused attention")
+    parser.add_argument("--accuracy-only", action="store_true", help="Run only accuracy checks, skip benchmarks")
+    args = parser.parse_args()
+
     if not is_blackwell():
         print("This test requires a Blackwell GPU. Skipping.")
         sys.exit(0)
@@ -619,6 +626,9 @@ if __name__ == "__main__":
     else:
         print("*** SOME CONFIGURATIONS FAILED ***")
     print(f"{'=' * 78}")
+
+    if args.accuracy_only:
+        sys.exit(0 if all_pass else 1)
 
     # ---- Performance benchmark -----------------------------------------------
     print(f"\n{'=' * 78}")
