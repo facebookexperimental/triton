@@ -948,10 +948,19 @@ static void iterateUsers(scf::ForOp loop, Operation *op,
 }
 
 // Helper: schedule an operation to a partition if it is not already scheduled.
+// Current scheduling phase name for debug logging.
+static const char *currentPhase = "";
+
+static void scheduleOp(Partition *partition, Operation *op) {
+  LDBG("[" << currentPhase << "] " << partition->getIndex() << "("
+           << partition->getType() << ") <- " << prettyOp(op));
+  setPartition(op, partition);
+}
+
 static bool tryScheduleOp(Partition *partition, Operation *op) {
   if (hasPartition(op))
     return false;
-  setPartition(op, partition);
+  scheduleOp(partition, op);
   return true;
 }
 
@@ -1128,7 +1137,7 @@ schedulePostLoopOps(scf::ForOp loop, PartitionSet &schedule,
           target = getEpilogueTarget(user);
       }
       if (target)
-        setPartition(user, target);
+        scheduleOp(target, user);
     }
 
     for (OpResult result : user->getResults())
@@ -1212,6 +1221,7 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
 
   //===--------------------------------------------------------------------===//
   // Phase 3: Schedule ops using template-based partition assignment
+  currentPhase = "phase3";
   //===--------------------------------------------------------------------===//
 
   // Schedule loads and their associated allocs (both in-loop and pre-loop)
@@ -1416,11 +1426,18 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
   //===--------------------------------------------------------------------===//
   // Phase 4: Propagate users (load users, correction, reductions)
   //===--------------------------------------------------------------------====//
+  currentPhase = "phase4";
+  //===--------------------------------------------------------------------===//
+  // Phase 4: Propagate users (load users, correction, reductions)
+  //===--------------------------------------------------------------------====//
 
   // Load users go to default partition (shared computation).
-  // When default is absent (e.g., bwd), skip — MMA user propagation in
-  // Phase 5 will capture these ops through the use chain.
-  if (defaultPartition) {
+  // When default is absent or equals the reduction partition (e.g., bwd),
+  // skip — MMA user propagation in Phase 5 will capture these ops through
+  // the use chain. Without this guard, load-user scheduling from
+  // descriptor_load (m/Di metadata) transitively pulls the entire softmax
+  // chain into the reduction partition.
+  if (defaultPartition && defaultPartition != reductionPartition) {
     for (Operation *loadOrAlloc : loadsAndAllocs) {
       scf::ForOp parentLoop = loadOrAlloc->getParentOfType<scf::ForOp>();
       if (!parentLoop) {
@@ -1510,6 +1527,7 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
   }
 
   //===--------------------------------------------------------------------===//
+  currentPhase = "phase5";
   // Phase 5: Create per-MMA computation partitions
   //===--------------------------------------------------------------------===//
   // MMA users create computation partitions. This runs AFTER correction/load
@@ -1526,10 +1544,11 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
 
   // For dpFactor==1, pre-create a single shared computation partition.
   // For dpFactor>1, let scheduleUsers(nullptr) create per-group partitions.
+  // (sharedComputePartition tracks the BWD computation partition.)
   Partition *sharedComputePartition = nullptr;
   if (dataPartitionFactor <= 1) {
     // All MMA users go to one computation partition (bwd pattern).
-    sharedComputePartition = nullptr; // lazy-created on first use
+    // Keep whatever was set by inner-loop MMA scheduling.
   }
 
   // When dpFactor > 1 and there is no defaultPartition, pre-assign
@@ -1772,6 +1791,7 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
     }
   }
 
+  currentPhase = "post-loop";
   // Pre-schedule post-loop ops before propagatePartitions claims them.
   schedulePostLoopOps(mainLoop, schedule, layout, schedOpts,
                       categorizer.getOpToDpIdMap(), dpIdToPartition);
@@ -1990,7 +2010,7 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
         for (Operation *op : cluster.ops) {
           if (isScalarOp(op))
             continue;
-          setPartition(op, existingComputation);
+          scheduleOp(existingComputation, op);
         }
         continue;
       }
@@ -2019,7 +2039,7 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
           for (Operation *op : cluster.ops) {
             if (isScalarOp(op))
               continue;
-            setPartition(op, fallbackPartition);
+            scheduleOp(fallbackPartition, op);
           }
           continue;
         }
@@ -2034,7 +2054,7 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
         for (Operation *op : cluster.ops) {
           if (isScalarOp(op))
             continue;
-          setPartition(op, cluster.sinkPartitions.front());
+          scheduleOp(cluster.sinkPartitions.front(), op);
         }
         continue;
       }
@@ -2043,7 +2063,7 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
       for (Operation *op : cluster.ops) {
         if (isScalarOp(op))
           continue;
-        setPartition(op, newPartition);
+        scheduleOp(newPartition, op);
       }
       continue;
     }
@@ -2055,7 +2075,7 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
       for (Operation *op : cluster.ops) {
         if (isScalarOp(op))
           continue;
-        setPartition(op, defPartition);
+        scheduleOp(defPartition, op);
       }
       continue;
     }
@@ -2084,7 +2104,7 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
       for (Operation *op : cluster.ops) {
         if (isScalarOp(op))
           continue;
-        setPartition(op, defPartition);
+        scheduleOp(defPartition, op);
       }
       continue;
     }
@@ -2102,12 +2122,12 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
         return sinkOps.contains(use.getOwner());
       });
       sinkOps.insert(clone);
-      setPartition(clone, sinkPartition);
+      scheduleOp(sinkPartition, clone);
     }
     for (Operation *op : cluster.ops) {
       if (isScalarOp(op))
         continue;
-      setPartition(op, defPartition);
+      scheduleOp(defPartition, op);
     }
   }
 }
@@ -2189,7 +2209,7 @@ void optimizeSchedule(scf::ForOp loop, PartitionSet &schedule) {
     for (auto *userPartition : userPartitions) {
       // Clone the instruction into each user partition.
       Operation *clone = OpBuilder(op).clone(*op);
-      setPartition(clone, userPartition);
+      scheduleOp(userPartition, clone);
       // Replace all users in that partition with the clone.
       op->replaceUsesWithIf(clone->getResults(), [&](OpOperand &otherUse) {
         return getPartition(otherUse.getOwner()) == userPartition;
@@ -2431,8 +2451,10 @@ void PartitionSchedulingMeta::runOnOperation() {
     if (std::optional<ScheduleResult> result =
             getInitialSchedule(loop, schedOpts)) {
       PartitionSet &schedule = result->schedule;
+      currentPhase = "propagate";
       propagatePartitions(loop, schedule, result->createComputePartitions);
 
+      currentPhase = "optimize";
       optimizeSchedule(loop, schedule);
 
       // Split scf.if ops whose results feed different computation partitions.

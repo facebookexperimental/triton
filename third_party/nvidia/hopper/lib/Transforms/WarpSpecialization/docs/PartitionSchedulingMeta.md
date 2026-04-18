@@ -200,6 +200,11 @@ those ops go to the next available partition in the fallback chain.
 
 1. **Load users** → routed with the uncategorized op fallback priority:
    correction → reduction → epilogue → computation.
+   **Guard**: When `defaultPartition == reductionPartition` (BWD case where
+   no real correction/epilogue/computation partition exists yet), load-user
+   scheduling is **skipped** to prevent transitively pulling the softmax
+   chain into the reduction partition. Phase 5's MMA forward walk handles
+   these ops instead.
 2. **Correction ops** → correction partition (+ `scheduleUsers` for transitive
    users). `scheduleUsers` walks **forward only** through the use chain
    starting from the correction-categorized op (the `tmem_load` of the PV
