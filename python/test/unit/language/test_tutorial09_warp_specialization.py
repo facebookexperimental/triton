@@ -67,8 +67,13 @@ def matmul_kernel_tma_ws(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     # Always use warp_specialize=True
-    for k in tl.range(k_tiles, warp_specialize=True, data_partition_factor=DATA_PARTITION_FACTOR,
-                      smem_alloc_algo=SMEM_ALLOC_ALGO, separate_epilogue_store=False):
+    for k in tl.range(
+            k_tiles,
+            warp_specialize=True,
+            data_partition_factor=DATA_PARTITION_FACTOR,
+            smem_alloc_algo=SMEM_ALLOC_ALGO,
+            separate_epilogue_store=True,
+    ):
         offs_k = k * BLOCK_SIZE_K
         if A_COL_MAJOR:
             a = a_desc.load([offs_k, offs_am]).T

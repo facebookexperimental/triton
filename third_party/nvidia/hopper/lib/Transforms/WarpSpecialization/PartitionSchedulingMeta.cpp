@@ -2291,7 +2291,9 @@ void splitDataPartitionedIfOps(scf::ForOp loop, PartitionSet &schedule) {
       continue;
 
     // Create one scf.if per partition group.
-    for (auto &[partId, resultIndices] : partitionToResultIndices) {
+    for (auto &entry : partitionToResultIndices) {
+      auto &partId = entry.first;
+      auto &resultIndices = entry.second;
       auto *origThenBlock = ifOp.thenBlock();
       auto *origElseBlock = ifOp.elseBlock();
       auto *origThenYield = origThenBlock->getTerminator();
