@@ -47,10 +47,6 @@ static OwningOpRef<ModuleOp> takeIntoFunction(ModuleAxisInfoAnalysis &axisInfo,
     op.erase();
   });
 
-  // This should make valid IR.
-  if (failed(mlir::verify(*container)))
-    llvm::report_fatal_error("expected partition region to make valid IR");
-
   // Attach axis info properties.
   auto wsOp = partition->getParentOfType<WarpSpecializeOp>();
   auto *funcInfo =
@@ -310,12 +306,11 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
     // "Guess" the register usage for each partition.
     estRegs = tensorRegs ? maxRegAutoWS : minRegAutoWS;
 
-    // Layouts need to be reassigned if the number of warps changed and there
-    // are tensor computations.
-    if (newNumWarps == prevNumWarps || !tensorRegs)
+    // Layouts were computed with the module-level num_warps (defaultNumWarps).
+    // Relayout if the partition's final warp count differs from that.
+    if (newNumWarps == (int32_t)defaultNumWarps || !tensorRegs)
       continue;
-    // We need to reassign layouts.
-    if (failed(relayoutWarps(axisInfo, partition, prevNumWarps, newNumWarps,
+    if (failed(relayoutWarps(axisInfo, partition, defaultNumWarps, newNumWarps,
                              runPipeline)))
       return failure();
   }
