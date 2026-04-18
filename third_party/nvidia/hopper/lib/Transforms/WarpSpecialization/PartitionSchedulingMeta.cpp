@@ -272,7 +272,6 @@ struct PartitionLayout {
     return nullptr;
   }
 
-  /// Get the opToDpId map (for schedulePostLoopOps).
   bool hasGemm() const { return gemmPartition != nullptr; }
 };
 
@@ -1018,7 +1017,8 @@ static Partition *scheduleUsers(scf::ForOp loop, PartitionSet &schedule,
 // (e.g., TMAStoreTokenWaitOp) go to the epilogue partition. All other post-loop
 // ops (e.g., tmem_load for accumulator reads, arithmetic for normalization) go
 // to the default partition. This prevents TMEM ops from landing in the
-// epilogue, which would force it to use 4 warps (TMEM lane coverage hardware
+// epilogue, which would force it to use 4 warps (TMEM lane coverage
+// requires full warp group).
 
 static void
 schedulePostLoopOps(scf::ForOp loop, PartitionSet &schedule,
@@ -1194,8 +1194,8 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
 
   unsigned dataPartitionFactor = categorizer.getDataPartitionFactor();
   LLVM_DEBUG(
-      llvm::dbgs() << "[tritongpu-partition-scheduling] Using template-based "
-                      "scheduling with data partition factor: "
+      llvm::dbgs() << "[tritongpu-partition-scheduling] Scheduling with data "
+                      "partition factor: "
                    << dataPartitionFactor << "\n");
 
   //===--------------------------------------------------------------------===//
@@ -1220,7 +1220,7 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
     reductionPartition = defaultPartition;
 
   //===--------------------------------------------------------------------===//
-  // Phase 3: Schedule ops using template-based partition assignment
+  // Phase 3: Schedule anchor ops (loads, epilogue stores, MMAs)
   currentPhase = "phase3";
   //===--------------------------------------------------------------------===//
 
@@ -1425,11 +1425,8 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
 
   //===--------------------------------------------------------------------===//
   // Phase 4: Propagate users (load users, correction, reductions)
-  //===--------------------------------------------------------------------====//
-  currentPhase = "phase4";
   //===--------------------------------------------------------------------===//
-  // Phase 4: Propagate users (load users, correction, reductions)
-  //===--------------------------------------------------------------------====//
+  currentPhase = "phase4";
 
   // Load users go to default partition (shared computation).
   // When default is absent or equals the reduction partition (e.g., bwd),
@@ -1505,25 +1502,6 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
         }
       }
     }
-
-    // For BWD (hasReduction): tag pre-loop TMEMStoreOp with the reduction
-    // partition index. These ops initialize accumulators (e.g., zeroing
-    // dK/dV) before the loop. Without explicit assignment, they would get
-    // pulled into the gemm partition via token chains to the in-loop MMA,
-    // causing gemm to require >=4 warps (TMEM ops need 4 warps). We set the
-    // attribute directly rather than using schedule.trySchedule because
-    // pre-loop ops must not be added to the partition's ops list
-    // (optimizeSchedule only handles in-loop ops).
-    if (reductionPartition) {
-      Builder b(mainLoop->getContext());
-      for (Operation &op : *mainLoop->getBlock()) {
-        if (&op == mainLoop)
-          break;
-        if (isa<ttng::TMEMStoreOp>(op))
-          op.setAttr(kPartitionAttrName,
-                     b.getDenseI32ArrayAttr({reductionPartition->getIndex()}));
-      }
-    }
   }
 
   //===--------------------------------------------------------------------===//
@@ -1546,10 +1524,6 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
   // For dpFactor>1, let scheduleUsers(nullptr) create per-group partitions.
   // (sharedComputePartition tracks the BWD computation partition.)
   Partition *sharedComputePartition = nullptr;
-  if (dataPartitionFactor <= 1) {
-    // All MMA users go to one computation partition (bwd pattern).
-    // Keep whatever was set by inner-loop MMA scheduling.
-  }
 
   // When dpFactor > 1 and there is no defaultPartition, pre-assign
   // DataPartition-categorized ops to their respective computation partitions
@@ -2189,8 +2163,6 @@ void optimizeSchedule(scf::ForOp loop, PartitionSet &schedule) {
   // operands.
   loop.walk<WalkOrder::PostOrder, ReverseIterator>([&](Operation *op) {
     if (!isa<MemDescTransOp, ConvertLayoutOp, BroadcastOp, ExpandDimsOp>(op))
-      // if (op->getNumResults() != 1 || !isPure(op) ||
-      //     isa<scf::YieldOp, scf::ForOp, scf::IfOp>(op))
       return;
 
     Partition *partition = getPartition(op);
@@ -2259,7 +2231,6 @@ void splitDataPartitionedIfOps(scf::ForOp loop, PartitionSet &schedule) {
 
     // Check if results feed different partitions.
     DenseSet<int> resultPartitions;
-    bool hasDifferentPartitions = false;
     for (OpResult result : ifOp.getResults()) {
       for (Operation *user : result.getUsers()) {
         auto ids = safeGetPartitionIds(user);

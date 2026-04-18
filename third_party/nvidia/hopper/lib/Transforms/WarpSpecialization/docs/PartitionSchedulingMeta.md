@@ -18,8 +18,9 @@ Phase 2: Create partition layout       (createPartitionLayout with tuning knobs)
 Phase 3: Schedule anchor ops           (loads, epilogue stores, MMAs)
 Phase 4: Propagate users               (load users, correction, reductions)
 Phase 5: Create computation partitions (per-MMA user scheduling + dpId assignment)
-Post:    propagatePartitions + schedulePostLoopOps + optimizeSchedule
-         + splitDataPartitionedIfOps
+Phase 6: Schedule post-loop ops        (schedulePostLoopOps — epilogue routing)
+  ─── end of getInitialSchedule ───
+Post:    propagatePartitions + optimizeSchedule + splitDataPartitionedIfOps
 ```
 
 ## Tuning Knobs
@@ -153,8 +154,6 @@ so all MMAs group together → `dpFactor=1`.
 ## Phase 2: Partition Layout (`createPartitionLayout`)
 
 Creates partitions based on the categorizer results and `SchedulingOptions`.
-Replaces the old template system (`UnifiedFATemplate`, `GEMMTemplate`,
-`selectTemplate`).
 
 Partition creation order determines the partition index. The first partition
 created gets index 0, which becomes the "default" warp group in
@@ -222,7 +221,7 @@ those ops go to the next available partition in the fallback chain.
 
 Pre-creates computation partitions for each dpId that has `DataPartition`-
 categorized ops (in reverse dpId order to match legacy partition index ordering).
-Then iterates over MMAs:
+Then iterates over MMAs (calling `scheduleUsers` to walk forward from each):
 
 - **Pre-assigned MMAs** (PV MMAs): Use the pre-assigned computation partition.
 - **Non-pre-assigned MMAs** (QK MMAs): First check user partitions, then look up
@@ -230,6 +229,11 @@ Then iterates over MMAs:
   prevents creating extra partitions.
 - **Non-MMAv5** (Hopper): MMA ops themselves are scheduled into the computation
   partition (not gemm, since no gemm partition exists).
+- **BWD (dpFactor≤1)**: All MMA users share one `sharedComputePartition`.
+  `scheduleUsers` walks forward from each MMA: token result → tmem_load →
+  subf/exp2/mulf → truncf → tmem_alloc/local_alloc, assigning all to computation.
+- **3-loop causal**: MMAs in the second loop are matched to first-loop MMAs
+  and `scheduleUsers` reuses their partition.
 
 ### dpId-Based Inner-Loop Assignment
 
@@ -246,6 +250,25 @@ For each unscheduled inner-loop op with a tensor result:
 
 Scalar integer ops (loop counters) and `scf.yield` are excluded from this
 assignment since they are loop-control ops, not data-partition computation ops.
+
+### Phase 6: `schedulePostLoopOps`
+
+Schedules post-loop operations (called at the end of `getInitialSchedule`,
+before `propagatePartitions`):
+
+- **Epilogue store ops** → `epilogue_store` partition (when it exists), else
+  follow the same routing as regular epilogue ops.
+- **Epilogue ops** (non-store) → routing depends on tuning knobs:
+  - `mergeEpilogueToComputation`: → computation[dpId] directly
+  - `mergeEpilogue`: → correction (if exists) → reduction → computation[dpId]
+  - Neither: → `epiloguePartition` (if exists) → correction/reduction →
+    computation
+
+The `postLoopPartition` fallback order (for epilogue ops when no merge knob
+is active) is:
+1. `epiloguePartition` (when it exists)
+2. Correction/reduction partition (whichever serves as default)
+3. First `dpIdToPartition` entry (Hopper with all merges, last resort)
 
 ## Post-Processing
 
@@ -286,24 +309,6 @@ Cluster assignment rules:
    the entire cluster to its def partition.
 3. **Single def and single sink**: Assign to the sink partition (downstream
    consumer), or to the def partition if they're the same.
-
-### `schedulePostLoopOps`
-
-Schedules post-loop operations:
-
-- **Epilogue store ops** → `epilogue_store` partition (when it exists), else
-  follow the same routing as regular epilogue ops.
-- **Epilogue ops** (non-store) → routing depends on tuning knobs:
-  - `mergeEpilogueToComputation`: → computation[dpId] directly
-  - `mergeEpilogue`: → correction (if exists) → reduction → computation[dpId]
-  - Neither: → `epiloguePartition` (if exists) → correction/reduction →
-    computation
-
-The `postLoopPartition` fallback order (for epilogue ops when no merge knob
-is active) is:
-1. `epiloguePartition` (when it exists)
-2. Correction/reduction partition (whichever serves as default)
-3. First `dpIdToPartition` entry (Hopper with all merges, last resort)
 
 ### `optimizeSchedule`
 
