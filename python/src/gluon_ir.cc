@@ -914,9 +914,9 @@ void init_gluon_ir(py::module &&m) {
              self.create<ttag::WaitBarrierOp>(memDesc, phase);
            })
       .def("create_lds_barrier_arrive",
-           [](GluonOpBuilder &self, Value memDesc, int count,
-              int expectedCount) {
-             self.create<ttag::ArriveBarrierOp>(memDesc, count, expectedCount);
+           [](GluonOpBuilder &self, Value memDesc, int count) {
+             auto i32Ty = IntegerType::get(self.getContext(), 32);
+             self.create<ttag::ArriveBarrierOp>(i32Ty, memDesc, count);
            })
       .def("create_warp_pipeline_border",
            [](GluonOpBuilder &self, const std::string &marker) {
