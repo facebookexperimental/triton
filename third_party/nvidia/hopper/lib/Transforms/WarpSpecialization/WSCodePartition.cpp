@@ -22,6 +22,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "llvm/ADT/MapVector.h"
 #include <unordered_set>
@@ -4122,6 +4123,22 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
     funcOp.dump();
   });
 
+  // Lower SubtiledRegionOps whose tile body spans multiple async tasks.
+  {
+    SmallVector<ttng::SubtiledRegionOp> multiTaskOps;
+    funcOp.walk([&](ttng::SubtiledRegionOp op) {
+      llvm::DenseSet<AsyncTaskId> taskIds;
+      op.getTileRegion().walk([&](Operation *childOp) {
+        for (auto tid : getAsyncTaskIds(childOp))
+          taskIds.insert(tid);
+      });
+      if (taskIds.size() > 1)
+        multiTaskOps.push_back(op);
+    });
+    for (auto op : multiTaskOps)
+      ttng::lowerSubtiledRegion(op);
+  }
+
   specializeRegion(funcOp, 0 /*requestedRegisters*/);
   LLVM_DEBUG({
     LDBG("\n\nwith specializeRegion");
@@ -4371,6 +4388,23 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
     LDBG("\n\nreplace buffer reuse");
     funcOp.dump();
   });
+
+  // Lower SubtiledRegionOps whose tile body spans multiple async tasks.
+  // Single-task SubtiledRegionOps are preserved and handled by SpecializeOp.
+  {
+    SmallVector<ttng::SubtiledRegionOp> multiTaskOps;
+    funcOp.walk([&](ttng::SubtiledRegionOp op) {
+      llvm::DenseSet<AsyncTaskId> taskIds;
+      op.getTileRegion().walk([&](Operation *childOp) {
+        for (auto tid : getAsyncTaskIds(childOp))
+          taskIds.insert(tid);
+      });
+      if (taskIds.size() > 1)
+        multiTaskOps.push_back(op);
+    });
+    for (auto op : multiTaskOps)
+      ttng::lowerSubtiledRegion(op);
+  }
 
   specializeRegion(funcOp, 0 /*requestedRegisters*/);
   LLVM_DEBUG({

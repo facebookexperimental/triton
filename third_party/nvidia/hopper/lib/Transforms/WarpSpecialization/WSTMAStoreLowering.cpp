@@ -125,32 +125,30 @@ getDefiningTMAStore(ttng::TMAStoreTokenWaitOp waitOp) {
 
 void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp) {
   MLIRContext *ctx = funcOp.getContext();
+  // Use walk to find TMAStoreTokenWaitOp ops inside ForOp bodies, including
+  // those nested inside SubtiledRegionOp regions.
   funcOp.walk([&](scf::ForOp forOp) {
-    for (auto &op : forOp.getBody()->without_terminator()) {
-      auto waitOp = dyn_cast<ttng::TMAStoreTokenWaitOp>(&op);
-      if (!waitOp)
-        continue;
-
+    forOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
       auto tmaStore = getDefiningTMAStore(waitOp);
       if (!tmaStore)
-        continue;
+        return;
 
       Value buffer = tmaStore.getSrc();
       auto allocOp = buffer.getDefiningOp<ttg::LocalAllocOp>();
       if (!allocOp)
-        continue;
+        return;
 
       auto bufferCopy = allocOp->getAttrOfType<IntegerAttr>("buffer.copy");
       if (!bufferCopy)
-        continue;
+        return;
 
       int k = bufferCopy.getInt();
       if (k <= 0)
-        continue;
+        return;
 
       waitOp->setAttr(kCanRotateByBufferCount,
                       IntegerAttr::get(IntegerType::get(ctx, 32), k));
-    }
+    });
   });
 }
 

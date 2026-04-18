@@ -23,6 +23,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include <list>
 #include <unordered_set>
@@ -400,6 +401,15 @@ Operation *SpecializeOp(Operation *op, IRMapping &mapping,
     } else if (isa<triton::MapElementwiseOp>(op)) {
       Operation *newOp = builder.clone(*op, mapping);
       // recursively set async task ids for child ops
+      newOp->walk(
+          [&](Operation *childOp) { setAsyncTaskIds(childOp, asyncTaskId); });
+      for (unsigned i = 0; i < op->getNumResults(); ++i)
+        mapping.map(op->getResult(i), newOp->getResult(i));
+      return newOp;
+    } else if (isa<triton::nvidia_gpu::SubtiledRegionOp>(op)) {
+      // Single-task SubtiledRegionOp: clone wholesale and set task IDs.
+      // Multi-task ops are lowered before specializeRegion is called.
+      Operation *newOp = builder.clone(*op, mapping);
       newOp->walk(
           [&](Operation *childOp) { setAsyncTaskIds(childOp, asyncTaskId); });
       for (unsigned i = 0; i < op->getNumResults(); ++i)

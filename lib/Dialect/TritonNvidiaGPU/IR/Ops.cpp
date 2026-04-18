@@ -1204,6 +1204,23 @@ LogicalResult SubtiledRegionOp::verify() {
              << " non-terminator ops";
   }
 
+  // 11. All ops in tile body with async_task_id must have the same task set.
+  std::optional<ArrayRef<int32_t>> uniformTaskSet;
+  for (Operation &op : tileBlock.without_terminator()) {
+    auto attr = op.getAttrOfType<DenseI32ArrayAttr>("async_task_id");
+    if (!attr)
+      continue;
+    ArrayRef<int32_t> taskIds = attr.asArrayRef();
+    if (!uniformTaskSet) {
+      uniformTaskSet = taskIds;
+    } else if (*uniformTaskSet != taskIds) {
+      return emitOpError(
+                 "tile body ops must have uniform async_task_id: found ")
+             << attr << " but expected "
+             << DenseI32ArrayAttr::get(getContext(), *uniformTaskSet);
+    }
+  }
+
   return success();
 }
 
