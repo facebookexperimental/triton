@@ -418,11 +418,13 @@ static void buildSingleSubtiledRegion(OpBuilder &builder, Location loc,
       builder.getArrayAttr({DenseI32ArrayAttr::get(ctx, tile0Mapping),
                             DenseI32ArrayAttr::get(ctx, tile1Mapping)});
   auto barrierAnnotationsAttr = builder.getArrayAttr({});
+  auto tokenAnnotationsAttr = builder.getArrayAttr({});
 
   auto regionOp = SubtiledRegionOp::create(
       builder, loc, /*resultTypes=*/TypeRange{},
-      /*barriers=*/ValueRange{}, /*accumCnts=*/ValueRange{}, tileMappingsAttr,
-      barrierAnnotationsAttr);
+      /*barriers=*/ValueRange{}, /*accumCnts=*/ValueRange{},
+      /*tokenValues=*/ValueRange{}, tileMappingsAttr, barrierAnnotationsAttr,
+      tokenAnnotationsAttr);
 
   // --- Setup Region ---
   Block *setupBlock = &regionOp.getSetupRegion().emplaceBlock();
@@ -685,10 +687,12 @@ static void buildMultiTaskSubtiledRegions(OpBuilder &outerBuilder, Location loc,
         outerBuilder.getArrayAttr({DenseI32ArrayAttr::get(ctx, tile0Map),
                                    DenseI32ArrayAttr::get(ctx, tile1Map)});
     auto barrierAnnotationsAttr = outerBuilder.getArrayAttr({});
+    auto tokenAnnotationsAttr = outerBuilder.getArrayAttr({});
 
     auto regionOp = SubtiledRegionOp::create(
         outerBuilder, loc, TypeRange{}, ValueRange{}, ValueRange{},
-        tileMappingsAttr, barrierAnnotationsAttr);
+        /*tokenValues=*/ValueRange{}, tileMappingsAttr, barrierAnnotationsAttr,
+        tokenAnnotationsAttr);
 
     // --- Setup Region ---
     Block *setupBlock = &regionOp.getSetupRegion().emplaceBlock();

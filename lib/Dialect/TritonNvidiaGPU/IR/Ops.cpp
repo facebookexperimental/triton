@@ -1283,6 +1283,17 @@ void SubtiledRegionOp::print(OpAsmPrinter &p) {
     p << ")";
   }
 
+  // Print tokenValues
+  if (!getTokenValues().empty()) {
+    p << " token_values(";
+    llvm::interleaveComma(getTokenValues(), p,
+                          [&](Value v) { p.printOperand(v); });
+    p << " : ";
+    llvm::interleaveComma(getTokenValues().getTypes(), p,
+                          [&](Type t) { p.printType(t); });
+    p << ")";
+  }
+
   // Print tileMappings
   p << " tile_mappings = ";
   p.printAttribute(getTileMappings());
@@ -1291,10 +1302,16 @@ void SubtiledRegionOp::print(OpAsmPrinter &p) {
   p << " barrier_annotations = ";
   p.printAttribute(getBarrierAnnotations());
 
+  // Print tokenAnnotations
+  if (!getTokenAnnotations().empty()) {
+    p << " token_annotations = ";
+    p.printAttribute(getTokenAnnotations());
+  }
+
   // Print attr-dict (excluding our custom attrs and operand segment sizes)
-  p.printOptionalAttrDict(
-      (*this)->getAttrs(),
-      {"tileMappings", "barrierAnnotations", getOperandSegmentSizeAttr()});
+  p.printOptionalAttrDict((*this)->getAttrs(),
+                          {"tileMappings", "barrierAnnotations",
+                           "tokenAnnotations", getOperandSegmentSizeAttr()});
 
   // Print setup region
   p << " setup ";
@@ -1322,6 +1339,8 @@ ParseResult SubtiledRegionOp::parse(OpAsmParser &parser,
   SmallVector<Type> barrierTypes;
   SmallVector<OpAsmParser::UnresolvedOperand> phaseOperands;
   SmallVector<Type> phaseTypes;
+  SmallVector<OpAsmParser::UnresolvedOperand> tokenOperands;
+  SmallVector<Type> tokenTypes;
 
   // Parse optional barriers(...)
   if (succeeded(parser.parseOptionalKeyword("barriers"))) {
@@ -1334,6 +1353,13 @@ ParseResult SubtiledRegionOp::parse(OpAsmParser &parser,
   if (succeeded(parser.parseOptionalKeyword("accum_cnts"))) {
     if (parser.parseLParen() || parser.parseOperandList(phaseOperands) ||
         parser.parseColonTypeList(phaseTypes) || parser.parseRParen())
+      return failure();
+  }
+
+  // Parse optional token_values(...)
+  if (succeeded(parser.parseOptionalKeyword("token_values"))) {
+    if (parser.parseLParen() || parser.parseOperandList(tokenOperands) ||
+        parser.parseColonTypeList(tokenTypes) || parser.parseRParen())
       return failure();
   }
 
@@ -1351,6 +1377,17 @@ ParseResult SubtiledRegionOp::parse(OpAsmParser &parser,
     return failure();
   result.addAttribute("barrierAnnotations", barrierAnnotationsAttr);
 
+  // Parse optional token_annotations = <attr>
+  if (succeeded(parser.parseOptionalKeyword("token_annotations"))) {
+    Attribute tokenAnnotationsAttr;
+    if (parser.parseEqual() || parser.parseAttribute(tokenAnnotationsAttr))
+      return failure();
+    result.addAttribute("tokenAnnotations", tokenAnnotationsAttr);
+  } else {
+    result.addAttribute("tokenAnnotations",
+                        parser.getBuilder().getArrayAttr({}));
+  }
+
   // Parse optional attr-dict
   if (parser.parseOptionalAttrDict(result.attributes))
     return failure();
@@ -1359,6 +1396,8 @@ ParseResult SubtiledRegionOp::parse(OpAsmParser &parser,
   if (parser.resolveOperands(barrierOperands, barrierTypes,
                              parser.getCurrentLocation(), result.operands) ||
       parser.resolveOperands(phaseOperands, phaseTypes,
+                             parser.getCurrentLocation(), result.operands) ||
+      parser.resolveOperands(tokenOperands, tokenTypes,
                              parser.getCurrentLocation(), result.operands))
     return failure();
 
@@ -1366,7 +1405,8 @@ ParseResult SubtiledRegionOp::parse(OpAsmParser &parser,
   result.addAttribute(SubtiledRegionOp::getOperandSegmentSizeAttr(),
                       parser.getBuilder().getDenseI32ArrayAttr(
                           {static_cast<int32_t>(barrierOperands.size()),
-                           static_cast<int32_t>(phaseOperands.size())}));
+                           static_cast<int32_t>(phaseOperands.size()),
+                           static_cast<int32_t>(tokenOperands.size())}));
 
   // Parse setup region
   if (parser.parseKeyword("setup"))
