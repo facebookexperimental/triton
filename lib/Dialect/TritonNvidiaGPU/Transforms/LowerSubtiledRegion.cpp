@@ -161,6 +161,13 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
   unsigned numTiles = tileMappings.size();
   Block &tileBlock = op.getTileRegion().front();
 
+  // Detect optional tile index argument: present when tile block has one more
+  // arg than the tile mapping entries.
+  unsigned numTileArgs = tileBlock.getNumArguments();
+  unsigned mappingSize =
+      cast<DenseI32ArrayAttr>(tileMappings[0]).asArrayRef().size();
+  bool hasTileIndex = (numTileArgs == mappingSize + 1);
+
   // 3. For each tile, clone tile region ops with substitution.
   for (unsigned tileIdx = 0; tileIdx < numTiles; ++tileIdx) {
     auto indices = cast<DenseI32ArrayAttr>(tileMappings[tileIdx]);
@@ -168,6 +175,12 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
 
     for (auto [j, idx] : llvm::enumerate(indices.asArrayRef()))
       tileMapping.map(tileBlock.getArgument(j), setupOutputs[idx]);
+
+    if (hasTileIndex) {
+      Value tileIdxConst = arith::ConstantOp::create(
+          builder, loc, builder.getI32IntegerAttr(tileIdx));
+      tileMapping.map(tileBlock.getArgument(numTileArgs - 1), tileIdxConst);
+    }
 
     unsigned opIdx = 0;
     for (Operation &tileOp : tileBlock.without_terminator()) {

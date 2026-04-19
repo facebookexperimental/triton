@@ -464,6 +464,36 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 
+  // Test tile index argument: the trailing i32 arg is substituted with
+  // the tile index constant (0, 1, ...) during lowering.
+  // CHECK-LABEL: @tile_index_arg
+  tt.func @tile_index_arg() {
+    // Setup:
+    // CHECK: %[[C10:.*]] = arith.constant 10 : i32
+    // CHECK: %[[C20:.*]] = arith.constant 20 : i32
+    // Tile 0: arg0 = c10, tileIdx = 0
+    // CHECK: %[[T0:.*]] = arith.constant 0 : i32
+    // CHECK: arith.addi %[[C10]], %[[T0]]
+    // Tile 1: arg0 = c20, tileIdx = 1
+    // CHECK: %[[T1:.*]] = arith.constant 1 : i32
+    // CHECK: arith.addi %[[C20]], %[[T1]]
+    // CHECK-NOT: ttng.subtiled_region
+    ttng.subtiled_region
+        tile_mappings = [array<i32: 0>, array<i32: 1>]
+        barrier_annotations = []
+      setup {
+        %c10 = arith.constant 10 : i32
+        %c20 = arith.constant 20 : i32
+        ttng.subtiled_region_yield %c10, %c20 : i32, i32
+      } tile(%arg0: i32, %tileIdx: i32) {
+        %sum = arith.addi %arg0, %tileIdx : i32
+        ttng.subtiled_region_yield
+      } teardown {
+        ttng.subtiled_region_yield
+      }
+    tt.return
+  }
+
   // Test tileMask selective barrier: wait only on tile 1 (tmem_load pattern).
   // tileMask = [0, 1] — skip tile 0, fire on tile 1.
   //

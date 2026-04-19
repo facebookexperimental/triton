@@ -57,6 +57,13 @@ void doGenerateSubtiledRegion(triton::FuncOp &funcOp) {
   PassManager pm(moduleOp.getContext());
   pm.addPass(triton::nvidia_gpu::
                  createTritonNvidiaGPUTestGenerateSubtiledRegionPass());
+  // Convert tmem_load → reshape → trans → split chains in SubtiledRegionOp
+  // setup regions into tmem_subslice + tmem_load pairs.
+  pm.addPass(
+      triton::nvidia_gpu::createTritonNvidiaGPUOptimizeTMemLayoutsPass());
+  // Push setup values that are shared across all tiles into the tile body.
+  pm.addPass(
+      triton::nvidia_gpu::createTritonNvidiaGPUPushSharedSetupToTilePass());
   (void)pm.run(moduleOp);
 }
 

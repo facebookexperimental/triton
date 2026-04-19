@@ -1131,18 +1131,29 @@ LogicalResult SubtiledRegionOp::verify() {
   if (tileMappings.empty())
     return emitOpError("tileMappings must have at least one tile");
 
-  // 6-8. Validate each tile mapping
+  // 6-8. Validate each tile mapping.
+  // The tile region may have an optional trailing i32 tile index argument,
+  // so tileMappings entries may have numTileArgs or numTileArgs-1 elements.
+  bool hasTileIndex = false;
   for (auto [i, mapping] : llvm::enumerate(tileMappings)) {
     auto indices = dyn_cast<DenseI32ArrayAttr>(mapping);
     if (!indices)
       return emitOpError("tileMappings[")
              << i << "] must be a DenseI32ArrayAttr";
 
-    // 6. Inner array length = number of tile block args
-    if (static_cast<unsigned>(indices.size()) != numTileArgs)
-      return emitOpError("tileMappings[") << i << "] has " << indices.size()
-                                          << " entries but tile region has "
-                                          << numTileArgs << " block arguments";
+    // 6. Inner array length = numTileArgs or numTileArgs-1 (tile index).
+    unsigned mappingSize = static_cast<unsigned>(indices.size());
+    if (mappingSize == numTileArgs) {
+      // No tile index arg.
+    } else if (mappingSize + 1 == numTileArgs) {
+      hasTileIndex = true;
+    } else {
+      return emitOpError("tileMappings[")
+             << i << "] has " << indices.size()
+             << " entries but tile region has " << numTileArgs
+             << " block arguments (expected " << numTileArgs << " or "
+             << numTileArgs - 1 << ")";
+    }
 
     for (auto [j, idx] : llvm::enumerate(indices.asArrayRef())) {
       // 7. Indices in range
@@ -1159,6 +1170,14 @@ LogicalResult SubtiledRegionOp::verify() {
                << idx << " has type " << setupType << " but tile block arg "
                << j << " has type " << tileArgType;
     }
+  }
+
+  // Validate the tile index argument type if present.
+  if (hasTileIndex) {
+    Type lastArgType = tileBlock.getArgument(numTileArgs - 1).getType();
+    if (!lastArgType.isInteger(32))
+      return emitOpError("tile index argument must be i32 but got ")
+             << lastArgType;
   }
 
   // Count non-terminator ops in each region for targetOpIdx validation.

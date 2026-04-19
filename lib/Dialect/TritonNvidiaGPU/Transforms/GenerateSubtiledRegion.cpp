@@ -455,6 +455,7 @@ static void buildSingleSubtiledRegion(OpBuilder &builder, Location loc,
   Block *tileBlock = &regionOp.getTileRegion().emplaceBlock();
   for (Type ty : tileArgTypes)
     tileBlock->addArgument(ty, loc);
+  tileBlock->addArgument(builder.getI32Type(), loc);
 
   OpBuilder tileBuilder = OpBuilder::atBlockEnd(tileBlock);
   IRMapping tileMapping;
@@ -724,6 +725,7 @@ static void buildMultiTaskSubtiledRegions(OpBuilder &outerBuilder, Location loc,
     Block *tileBlock = &regionOp.getTileRegion().emplaceBlock();
     for (Type ty : tileArgTypes)
       tileBlock->addArgument(ty, loc);
+    tileBlock->addArgument(outerBuilder.getI32Type(), loc);
 
     OpBuilder tileBuilder = OpBuilder::atBlockEnd(tileBlock);
     IRMapping tileMapping;
