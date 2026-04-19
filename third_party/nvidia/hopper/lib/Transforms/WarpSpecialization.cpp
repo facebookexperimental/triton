@@ -51,6 +51,7 @@ void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
 void doTMAStoreWaitReorder(triton::FuncOp &funcOp);
 void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp);
 void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp);
+void lowerTokenAnnotations(triton::nvidia_gpu::SubtiledRegionOp op);
 
 void doGenerateSubtiledRegion(triton::FuncOp &funcOp) {
   auto moduleOp = funcOp->getParentOfType<ModuleOp>();
@@ -279,6 +280,19 @@ public:
         moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
         llvm::dbgs() << "\n\n\n";
       }
+    }
+
+    // Lower any remaining SubtiledRegionOps (single-task ops that survived
+    // doCodePartitionPost and were cloned into WarpSpecializeOp partitions).
+    {
+      SmallVector<triton::nvidia_gpu::SubtiledRegionOp> remaining;
+      funcOp.walk([&](triton::nvidia_gpu::SubtiledRegionOp op) {
+        remaining.push_back(op);
+      });
+      for (auto op : remaining)
+        lowerTokenAnnotations(op);
+      for (auto op : remaining)
+        triton::nvidia_gpu::lowerSubtiledRegion(op);
     }
 
     doTokenLowering(funcOp, numWarpGroups - 1);

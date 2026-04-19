@@ -40,7 +40,7 @@ namespace mlir {
 /// Lower token annotations on a SubtiledRegionOp by emitting inline
 /// ConsumerWaitOp / ConsumerReleaseOp ops in the tile body. Must be called
 /// before lowerSubtiledRegion so that the emitted ops get replicated per tile.
-static void lowerTokenAnnotations(ttng::SubtiledRegionOp op) {
+void lowerTokenAnnotations(ttng::SubtiledRegionOp op) {
   ArrayAttr tokenAnnotations = op.getTokenAnnotations();
   if (tokenAnnotations.empty())
     return;
