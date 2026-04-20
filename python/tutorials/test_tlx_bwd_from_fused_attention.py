@@ -310,6 +310,7 @@ def run_original_bwd(q, k, v, o, M, do, sm_scale, causal, persistent):
                 dtype=torch_dtype_to_triton(q.dtype),
                 warp_specialize=warp_specialize,
                 maxRegAutoWS=192,
+                early_tma_store_lowering=True,
             )
 
     return dq, dk, dv
