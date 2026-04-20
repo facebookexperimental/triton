@@ -711,31 +711,6 @@ def LocalLoadPackedTransposedOp : TT_AMDGPU_Op<"local_load_packed_tranposed", [L
 }
 
 //===----------------------------------------------------------------------===//
-// ArriveBarrierOp
-//===----------------------------------------------------------------------===//
-def ArriveBarrierOp : TT_AMDGPU_Op<"arrive_barrier",  [MemoryEffects<[MemWrite<SharedMemory>, MemRead<SharedMemory>]>]> {
-  let summary = "barrier arrive";
-
-  let description = [{
-    This operation defines the arriving action for a named barrier.
-    `count` is the number by which the arrival count of the barrier is decremented
-    'expectedCount' is the expected arrival count of the barrier.
-     The count of the barrier is set to this value after all threads have arrived
-  }];
-
-  let arguments = (ins
-    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$alloc,
-    I32Attr:$count,
-    I32Attr:$expectedCount
-  );
-
-  let assemblyFormat = [{
-    $alloc `,` $count `,` $expectedCount attr-dict `:` qualified(type($alloc))
-  }];
-  let hasVerifier = 1;
-}
-
-//===----------------------------------------------------------------------===//
 // InitBarrierOp
 //===----------------------------------------------------------------------===//
 def InitBarrierOp : TT_AMDGPU_Op<"init_barrier", [MemoryEffects<[MemWrite<SharedMemory>]>]> {
@@ -816,7 +791,7 @@ def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local",
 // AsyncTDMCopyLocalToGlobalOp
 //===----------------------------------------------------------------------===//
 
-def AsyncTDMCopyLocalToGlobalOp : TT_AMDGPU_Op<"async_tdm_copy_local_to_global"> {
+def AsyncTDMCopyLocalToGlobalOp : TT_AMDGPU_Op<"async_tdm_copy_local_to_global", [AttrSizedOperandSegments]> {
   let summary = "Copy data based on descriptor from local memory to global memory asynchronously";
 
   let description = [{
@@ -825,17 +800,20 @@ def AsyncTDMCopyLocalToGlobalOp : TT_AMDGPU_Op<"async_tdm_copy_local_to_global">
     local memory pointed by `src` instead of a distributed tensor. The copy
     destination depends on the global memory pointed to by `desc`. This
     operation does not support shared memory padding or swizzling.
+    The operation can also take an optional 64bit LDS barrier address, in which case
+    it sends an "LDS atomic arrive" to signal its completion.
   }];
 
   let arguments = (ins
     Arg<TT_TensorDescType, "", [MemWrite<GlobalMemory>]>:$desc,
     Variadic<I32>:$indices,
-    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src
+    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
+    Optional<TTG_MemDescType>:$barrier
   );
 
   let assemblyFormat = [{
-    $desc `[` $indices `]` `from` $src
-    attr-dict `:` qualified(type($src)) `->` qualified(type($desc))
+    $desc `[` $indices `]` `from` $src (`,` `barrier` `=` $barrier^)?
+    attr-dict `:` qualified(type($src)) (`,` qualified(type($barrier))^)? `->` qualified(type($desc))
   }];
 
   let hasVerifier = 1;
@@ -920,6 +898,38 @@ def WaitBarrierOp : TT_AMDGPU_Op<"wait_barrier"> {
   let assemblyFormat = [{
     $alloc `,` $phase attr-dict `:` qualified(type($alloc))
   }];
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// ArriveBarrierOp
+//===----------------------------------------------------------------------===//
+def ArriveBarrierOp : TT_AMDGPU_Op<"arrive_barrier"> {
+  let summary = "perform the arrive operation on an mbarrier";
+  let description = [{
+    Performs the "arrive" operation on an mbarrier object in shared memory. The operation requires a `count` attribute
+    of at least 1, and decreases the pending arrival count of the mbarrier by the specific count. If the pending count reaches
+    zero, the phase changes (is decremented in a wraparound manner) and the pending count is reloaded with the init count value. Returns the phase
+    parity (0 for even, 1 for odd) of the mbarrier object prior to the "arrive" operation.
+
+    Example:
+
+    ```mlir
+    ttag.arrive_barrier %barrier, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ```
+  }];
+
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$alloc,
+    I32Attr:$count
+  );
+
+  let results = (outs I32:$result);
+
+  let assemblyFormat = [{
+    $alloc `,` $count attr-dict `:` qualified(type($alloc)) `->` type($result)
+  }];
+
   let hasVerifier = 1;
 }
 

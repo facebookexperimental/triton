@@ -233,56 +233,8 @@ private:
         static_cast<unsigned>(NVVM::NVVMMemorySpace::Shared));
   }
 
-  void getBackwardSliceWithWS(Value target,
-                              SetVector<Operation *> *backwardSlice) {
-    SetVector<Value> worklist;
-    worklist.insert(target);
-
-    BackwardSliceOptions options;
-    options.omitUsesFromAbove = false;
-    options.omitBlockArguments = true;
-    options.inclusive = true;
-
-    while (!worklist.empty()) {
-      Value nextTarget = worklist.back();
-      worklist.pop_back();
-
-      if (auto arg = dyn_cast<BlockArgument>(nextTarget)) {
-        if (auto wsPartitionOp = dyn_cast<ttg::WarpSpecializePartitionsOp>(
-                arg.getOwner()->getParentOp())) {
-          auto argIndex = arg.getArgNumber();
-          auto wsOp = wsPartitionOp->getParentOfType<ttg::WarpSpecializeOp>();
-          // map to WSOp's operand at the same index
-          nextTarget = wsOp.getOperand(argIndex);
-        } else {
-          // ttg::WarpSpecializeOp's default region just captures
-          // from trunk so no need to special handle the defining block args.
-          // We should omit block args for other block structures like scf.For,
-          // and the captures would still be handled automatically
-          continue;
-        }
-      }
-
-      SetVector<Operation *> ops;
-      if (failed(getBackwardSlice(nextTarget, &ops, options))) {
-        llvm_unreachable("getBackwardSlice failed");
-      }
-
-      for (auto op : ops) {
-        if (backwardSlice->insert(op)) {
-          for (auto operand : op->getOperands()) {
-            if (isa<BlockArgument>(operand)) {
-              worklist.insert(operand);
-            }
-          }
-        }
-      }
-    }
-  }
-
-  LogicalResult
-  ensureEarlyRemoteBarInit(ModuleOp &mod,
-                           SetVector<Operation *> &remoteBarInitOps) {
+  LogicalResult ensureEarlyBarInit(ModuleOp &mod,
+                                   SetVector<Operation *> &barInitOps) {
     triton::FuncOp funcOp = nullptr;
     mod.walk([&](triton::FuncOp op) {
       if (triton::isKernel(op)) {
@@ -292,10 +244,10 @@ private:
       return WalkResult::advance();
     });
     assert(funcOp && "Expecting to find a kernel func but got none.");
-    for (auto op : remoteBarInitOps) {
+    for (auto op : barInitOps) {
       if (op->getBlock() != &funcOp.front()) {
         op->emitError() << "Barrier init outside of the first block in "
-                           "function is not supported for remote barriers";
+                           "function is not supported for CTA clusters";
         return failure();
       }
     }
@@ -404,48 +356,29 @@ private:
     }
 
     bool hasRemoteBar = false;
-    SetVector<Operation *> barAllocOps;
-    // Find all bar alloc op in the back slice of a remote bar
+    // Find if we have a remote bar
     mod.walk([&](Operation *op) {
       SetVector<Operation *> ops;
       auto remoteBar = getRemoteBarrier(op);
       if (remoteBar.has_value()) {
         hasRemoteBar = true;
-        for (auto bar : remoteBar.value()) {
-          getBackwardSliceWithWS(bar, &ops);
-
-          for (auto opInSlice : ops) {
-            if (isa<ttg::LocalAllocOp>(opInSlice)) {
-              barAllocOps.insert(opInSlice);
-            }
-          }
-        }
+        return WalkResult::interrupt();
       }
+      return WalkResult::advance();
     });
-
-    // If there's no remote barrier,
-    // skipping
+    // If there's no remote barrier, skipping
     if (!hasRemoteBar) {
       return success();
     }
 
-    assert(!barAllocOps.empty() &&
-           "Failed to find bar alloc op for remote bar");
-
-    // Find the init op for remote barriers
-    SetVector<Operation *> remoteBarInitOps;
+    // Find all bar init ops
+    SetVector<Operation *> remoteOrLocalBarInitOps;
     mod.walk([&](ttng::InitBarrierOp barInitOp) {
-      SetVector<Operation *> ops;
-      getBackwardSliceWithWS(barInitOp.getAlloc(), &ops);
-      if (llvm::any_of(
-              ops, [&](Operation *op) { return barAllocOps.contains(op); })) {
-        // barInitOp is for remote bar
-        remoteBarInitOps.insert(barInitOp);
-      }
+      remoteOrLocalBarInitOps.insert(barInitOp);
     });
 
-    assert(!remoteBarInitOps.empty() &&
-           "Failed to find bar init op for remote bar");
+    assert(!remoteOrLocalBarInitOps.empty() &&
+           "Failed to find bar init op when we know there's remote bar");
 
     // Enforcing front end for 2cta kernels:
     // All remote barrier init ops need to happen at the first block of
@@ -453,7 +386,7 @@ private:
     // case. If in the future there's a need to really alloc/init barriers after
     // a WS op, we can seek to relax this limitation and fix cluster sync
     // insertions.
-    if (failed(ensureEarlyRemoteBarInit(mod, remoteBarInitOps))) {
+    if (failed(ensureEarlyBarInit(mod, remoteOrLocalBarInitOps))) {
       return failure();
     }
 
@@ -462,10 +395,10 @@ private:
     // block of the kernel func op, as we currently enforce earlier in this
     // pass. If that assumption changes, we should revisit this heuristic here.
     ttng::InitBarrierOp lastBarInitOp;
-    auto firstBlock = remoteBarInitOps.front()->getBlock();
+    auto firstBlock = remoteOrLocalBarInitOps.front()->getBlock();
     for (auto it = firstBlock->rbegin(), e = firstBlock->rend(); it != e;
          ++it) {
-      if (remoteBarInitOps.contains(&*it)) {
+      if (remoteOrLocalBarInitOps.contains(&*it)) {
         lastBarInitOp = cast<ttng::InitBarrierOp>(*it);
         break;
       }
