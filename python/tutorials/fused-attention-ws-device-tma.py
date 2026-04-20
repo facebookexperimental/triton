@@ -674,7 +674,11 @@ _BWD_DOT_ATTRS_BM64 = FrozenDotAttrs({
     # qkT inputs: k, q; dpT inputs: v, do; dv inputs: ppT, do; dq inputs: dsT, k; dk inputs: dsT, q
     # no need to reuse between dq and dpT
     "qkT": {"stage": "0", "order": "0", "channels": ["opndA,smem,1,0", "opndB,smem,2,1", "opndD,tmem,1,2"]},  # k, q
-    "dpT": {"stage": "0", "order": "2", "channels": ["opndA,smem,1,3", "opndB,smem,1,4", "opndD,tmem,1,5"]},  # v, do
+    "dpT": {
+        "stage": "0",
+        "order": "2",
+        "channels": ["opndA,smem,1,3", "opndB,smem,1,4", "opndD,tmem,1,5"],
+    },  # v, do
     "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},  # ppT
     "dq": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,11"]},  # dsT
     "dk": {"stage": "1", "order": "1", "channels": ["opndD,tmem,1,10"]},
@@ -794,8 +798,15 @@ def _attn_bwd_dkdv(
     curr_m = start_m
     step_m = BLOCK_M1
     if warp_specialize:
-        for blk_idx in tl.range(0, num_steps, warp_specialize=True, merge_epilogue_to_computation=True,
-                                tmem_alloc_algo=2, smem_alloc_algo=1, smem_budget=200000):
+        for blk_idx in tl.range(
+                0,
+                num_steps,
+                warp_specialize=True,
+                merge_epilogue_to_computation=True,
+                tmem_alloc_algo=2,
+                smem_alloc_algo=1,
+                smem_budget=200000,
+        ):
             dk, dv, curr_m = _attn_bwd_dkdv_inner(
                 dk,
                 dv,
@@ -902,28 +913,32 @@ configs_bwd_persist = [
         num_stages=2,
         pre_hook=_bwd_host_descriptor_pre_hook,
     ),
-    triton.Config(
-        {
-            "BLOCK_M1": 128, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 128, "EPILOGUE_SUBTILE": 4, "BWD_DOT_ATTRS":
-            _BWD_DOT_ATTRS_SCHED,  # use memory planner heuristics
-        },
-        num_warps=4,
-        num_stages=2,
-        pre_hook=_bwd_host_descriptor_pre_hook,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M1": 64,
-            "BLOCK_N1": 128,
-            "BLOCK_M2": 128,
-            "BLOCK_N2": 128,
-            "EPILOGUE_SUBTILE": 2,
-            "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM64,
-        },
-        num_warps=4,
-        num_stages=2,
-        pre_hook=_bwd_host_descriptor_pre_hook,
-    ),
+    # triton.Config(
+    #     {
+    #         "BLOCK_M1": 128,
+    #         "BLOCK_N1": 128,
+    #         "BLOCK_M2": 128,
+    #         "BLOCK_N2": 128,
+    #         "EPILOGUE_SUBTILE": 4,
+    #         "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_SCHED,  # use memory planner heuristics
+    #     },
+    #     num_warps=4,
+    #     num_stages=2,
+    #     pre_hook=_bwd_host_descriptor_pre_hook,
+    # ),
+    # triton.Config(
+    #     {
+    #         "BLOCK_M1": 64,
+    #         "BLOCK_N1": 128,
+    #         "BLOCK_M2": 128,
+    #         "BLOCK_N2": 128,
+    #         "EPILOGUE_SUBTILE": 2,
+    #         "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM64,
+    #     },
+    #     num_warps=4,
+    #     num_stages=2,
+    #     pre_hook=_bwd_host_descriptor_pre_hook,
+    # ),
 ]
 
 
@@ -1170,8 +1185,15 @@ def _attn_bwd_persist(
         block_shape=[BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE],
     )
 
-    for _ in tl.range(0, tiles_per_sm, warp_specialize=True, merge_epilogue_to_computation=True, tmem_alloc_algo=2,
-                      smem_alloc_algo=1, smem_budget=200000):
+    for _ in tl.range(
+            0,
+            tiles_per_sm,
+            warp_specialize=True,
+            merge_epilogue_to_computation=True,
+            tmem_alloc_algo=2,
+            smem_alloc_algo=1,
+            smem_budget=200000,
+    ):
         pid = tile_idx % n_tile_num
         bhid = tile_idx // n_tile_num
         _attn_bwd_core(
@@ -1478,18 +1500,31 @@ attention = _attention_opt.apply
 )
 @pytest.mark.parametrize("Z", [8])
 @pytest.mark.parametrize("H", [16])
-@pytest.mark.parametrize("N_CTX", [1024])  #, 2048])
+@pytest.mark.parametrize("N_CTX", [1024])  # , 2048])
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("mode", ["fwd", "bwd"])
 @pytest.mark.parametrize("baseVariant", ["ws_persistent", "ws"])
 @pytest.mark.parametrize("provider", ["triton-fp16"])
 @pytest.mark.parametrize("SUBTILING", [False, True])
-@pytest.mark.parametrize("VECT_MUL", [0])  #, 1, 2, 3])
+@pytest.mark.parametrize("VECT_MUL", [0])  # , 1, 2, 3])
 @pytest.mark.parametrize("FADD2_REDUCE", [False])
 @pytest.mark.parametrize("bwd_config_idx", range(len(configs_bwd_persist)))
-def test_op(Z, H, N_CTX, HEAD_DIM, causal, mode, baseVariant, provider, SUBTILING, VECT_MUL, FADD2_REDUCE,
-            bwd_config_idx, dtype=torch.float16):
+def test_op(
+    Z,
+    H,
+    N_CTX,
+    HEAD_DIM,
+    causal,
+    mode,
+    baseVariant,
+    provider,
+    SUBTILING,
+    VECT_MUL,
+    FADD2_REDUCE,
+    bwd_config_idx,
+    dtype=torch.float16,
+):
     # For fwd mode, only run once (bwd_config_idx=0) to avoid redundant tests
     if mode == "fwd" and bwd_config_idx > 0:
         pytest.skip("bwd_config_idx only applies to bwd mode")
@@ -1504,9 +1539,9 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, mode, baseVariant, provider, SUBTILIN
         _attn_bwd.configs = [configs_bwd_persist[bwd_config_idx]]
         _attn_bwd.cache = {}
     torch.manual_seed(20)
-    q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    v = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    q = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
+    k = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
+    v = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
     sm_scale = 0.5
     # reference implementation
     ref_dtype = dtype
@@ -1558,8 +1593,8 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, mode, baseVariant, provider, SUBTILIN
 
 
 try:
-    from flash_attn.flash_attn_interface import \
-        flash_attn_qkvpacked_func as flash_attn_func
+    from flash_attn.flash_attn_interface import flash_attn_qkvpacked_func as flash_attn_func
+
     HAS_FLASH = True
 except BaseException:
     HAS_FLASH = False
@@ -1568,13 +1603,13 @@ TORCH_HAS_FP8 = False
 BATCH, N_HEADS = 4, 32
 # vary seq length for fixed head and batch=4
 configs = []
-for HEAD_DIM in [128]:  #64, 128]:
+for HEAD_DIM in [128]:  # 64, 128]:
     for baseVariant in ["ws", "ws_persistent"]:
         for mode in ["fwd", "bwd"]:
             configs.append(
                 triton.testing.Benchmark(
                     x_names=["N_CTX"],
-                    x_vals=[2**i for i in range(12, 13)],  #0, 15)],
+                    x_vals=[2**i for i in range(12, 13)],  # 0, 15)],
                     line_arg="provider",
                     line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
                     line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),
