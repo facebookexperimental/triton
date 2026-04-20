@@ -86,64 +86,13 @@ struct ArriveBarrierOpConversion
         typeConverter->convertType(op.getAlloc().getType().getElementType()),
         rewriter);
 
-    // TODO: Support decCount > 1 with DS_SUB_RTN_U32 and
-    // reset barrier arrival count to expected count with DS_WRITE_B32 when
-    // phase flip condition is met
-    int decCount = op.getCount();
-    assert(decCount == 1 && "Only support decCount == 1 for now");
+    auto count = op.getCount();
 
-    // Calulate the address of phase from the base address
-    // of the barrier smem object
     auto b = TritonLLVMOpBuilder(loc, rewriter);
-    auto countBaseAddr = getCountBaseAddress(b, barrierSmemObj);
-    auto phaseBaseAddr = getPhaseBaseAddress(b, barrierSmemObj);
-
-    // Decrement the arrival count
-    // Arrival count will be reset to resetVal if
-    // preDecrementCountVal == 0
-    auto resetVal = b.i32_val(op.getExpectedCount() - 1);
-    GCNBuilder gcnBuilder;
-    auto &dec_rtn = *gcnBuilder.create("ds_dec_rtn_u32");
-    auto retVal = gcnBuilder.newOperand("=v");
-    auto countBaseAddrArg = gcnBuilder.newOperand(countBaseAddr, "v");
-    auto resetValArg = gcnBuilder.newOperand(resetVal, "v");
-    dec_rtn(retVal, countBaseAddrArg, resetValArg);
-    auto &wait_cnt = *gcnBuilder.create("s_waitcnt lgkmcnt(0)");
-    wait_cnt();
-    auto preDecrementCountVal =
-        gcnBuilder.launch(rewriter, loc, i32_ty, true /*hasSideEffects*/);
-
-    // If barrier's count is 0 before the decrement, then
-    // sufficient threads have arrived and we can flip the phase
-    MLIRContext *ctx = rewriter.getContext();
-    Value zero = b.i32_val(0);
-    Value allArrived = b.icmp_eq(preDecrementCountVal, zero);
-
-    Block *currentBlock = rewriter.getInsertionBlock();
-    Block *afterPhaseFlipBlock =
-        rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
-    Block *phaseFlipBlock = rewriter.createBlock(afterPhaseFlipBlock);
-    rewriter.setInsertionPointToEnd(currentBlock);
-
-    LLVM::CondBrOp::create(rewriter, loc, allArrived, phaseFlipBlock,
-                           afterPhaseFlipBlock);
-
-    rewriter.setInsertionPointToStart(phaseFlipBlock);
-    GCNBuilder phaseFlipBuilder;
-    auto &xor_phase = *phaseFlipBuilder.create("ds_xor_b32");
-    auto baseAddrArg = phaseFlipBuilder.newOperand(phaseBaseAddr, "v");
-    Value one = b.i32_val(1);
-    auto oneArg = phaseFlipBuilder.newOperand(one, "v");
-    xor_phase(baseAddrArg, oneArg);
-
-    // Wakeup the wavefronts that are sleeping in the
-    // barrier spin wait loop
-    auto &s_wakeup = *phaseFlipBuilder.create("s_wakeup");
-    s_wakeup();
-    auto xor_op = phaseFlipBuilder.launch(rewriter, loc, void_ty(ctx),
-                                          true /*hasSideEffects*/);
-
-    auto br = LLVM::BrOp::create(rewriter, loc, afterPhaseFlipBlock);
+    // Use the AMDGCN barrier arrive intrinsic
+    LLVM::createLLVMIntrinsicCallOp(
+        rewriter, loc, "llvm.amdgcn.ds.atomic.barrier.arrive.rtn.b64", i64_ty,
+        {barrierSmemObj.getBase(), b.i64_val(count)});
 
     rewriter.eraseOp(op);
     return success();

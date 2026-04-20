@@ -137,53 +137,15 @@ public:
     // FIXME: skip data partitioning for Blackwell.
     bool ForBlackWell = (capability / 10) > 9;
     unsigned numWarpGroups = ForBlackWell ? 2 : 3;
-    if (!ForBlackWell) {
-      bool success = false;
-      for (; numWarpGroups >= 2; numWarpGroups--) {
-        // Partition key ops into multiple async tasks.
-        doTaskPartition(funcOp, numWarpGroups);
-        if (dumpIntermediateSteps) {
-          llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                          "doTaskPartition\n";
-          moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-          llvm::dbgs() << "\n\n\n";
-        }
-        // Propagate taskId.
-        int retCode = doTaskIdPropagate(funcOp);
-        if (retCode == -1)
-          continue;
-        if (dumpIntermediateSteps) {
-          llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                          "doTaskIdPropagate\n";
-          moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-          llvm::dbgs() << "\n\n\n";
-        }
 
-        // Partition ops into parallel sub ops.
-        if (doDataPartition(funcOp, numWarpGroups - 1)) {
-          if (dumpIntermediateSteps) {
-            llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                            "doDataPartition\n";
-            moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-            llvm::dbgs() << "\n\n\n";
-          }
-          success = true;
-          break;
-        }
-        // Clear async_task.
-      }
-      if (!success)
-        signalPassFailure();
-    } else {
-      int retCode = doTaskIdPropagate(funcOp);
-      if (retCode == -1)
-        signalPassFailure();
-      if (dumpIntermediateSteps) {
-        llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                        "doTaskIdPropagate\n";
-        moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-        llvm::dbgs() << "\n\n\n";
-      }
+    int retCode = doTaskIdPropagate(funcOp);
+    if (retCode == -1)
+      signalPassFailure();
+    if (dumpIntermediateSteps) {
+      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                      "doTaskIdPropagate\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
     }
 
     if (pingpongAutoWS) {

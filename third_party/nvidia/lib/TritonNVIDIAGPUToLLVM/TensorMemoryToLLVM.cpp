@@ -599,10 +599,12 @@ createBlockedScalesSMEMDescriptor(ConversionPatternRewriter &rewriter,
                b.lshr(b.shl(smemAddr, b.int_val(64, 46)), b.int_val(64, 50)));
 }
 
-static void copySharedToTmem(ConversionPatternRewriter &rewriter, Location loc,
-                             const TypeConverter *typeConverter,
-                             triton::nvidia_gpu::TMEMCopyOp op, Value src,
-                             Value baseDst, Value pred, bool useTwoCTAs) {
+static LogicalResult copySharedToTmem(ConversionPatternRewriter &rewriter,
+                                      Location loc,
+                                      const TypeConverter *typeConverter,
+                                      triton::nvidia_gpu::TMEMCopyOp op,
+                                      Value src, Value baseDst, Value pred,
+                                      bool useTwoCTAs) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   auto *ctx = op.getContext();
   auto kOffset = str_attr("offset");
@@ -635,7 +637,12 @@ static void copySharedToTmem(ConversionPatternRewriter &rewriter, Location loc,
 
   auto loader = DotOpMmaSmemLoader::build(loc, rewriter, cvtWarp, bitwidth,
                                           smemBase, instrShape, 0, 5);
-  assert(!loader.getDescriptor().transposed);
+  if (failed(loader)) {
+    return op->emitOpError("failed to find valid tcgen05.copy layout from "
+                           "shared memory descriptor ")
+           << srcTy << " to tensor memory descriptor " << dstTy;
+  }
+  assert(!loader->getDescriptor().transposed);
   bool twoCTAs = useTwoCTAs || getModuleTwoCTAs(op);
   // Check correct lbo/sbo along the multicast
   auto strideRow = cvt.getBasis(kRow, llvm::Log2_32(8), kOffset);
@@ -649,12 +656,13 @@ static void copySharedToTmem(ConversionPatternRewriter &rewriter, Location loc,
   }
 
   for (int col = 0; col < cvt.getInDimSize(kCol); col += instrShape[1]) {
-    auto desc = loader.smemLoad(0, col, rewriter, loc);
+    auto desc = loader->smemLoad(0, col, rewriter, loc);
     auto tmemAddr =
         b.or_(b.ptrtoint(i32_ty, baseDst), b.i32_val(col * bitwidth / 32),
               /*disjoint=*/true);
     createTcgen05Cp(rewriter, loc, tmemAddr, desc, pred, atom, twoCTAs);
   }
+  return success();
 }
 
 static void copyScales(ConversionPatternRewriter &rewriter, Location loc,
@@ -771,8 +779,10 @@ struct TensorMemoryCopyOpConversion
       copyScales(rewriter, loc, typeConverter, op, adaptor.getSrc(),
                  adaptor.getDst(), pred, twoCTAs);
     } else {
-      copySharedToTmem(rewriter, loc, typeConverter, op, adaptor.getSrc(),
-                       adaptor.getDst(), pred, twoCTAs);
+      if (failed(copySharedToTmem(rewriter, loc, typeConverter, op,
+                                  adaptor.getSrc(), adaptor.getDst(), pred,
+                                  twoCTAs)))
+        return failure();
     }
 
     if (op.getBarrier()) {
