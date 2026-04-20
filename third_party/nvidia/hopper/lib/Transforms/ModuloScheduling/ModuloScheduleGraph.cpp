@@ -56,7 +56,8 @@ static void dumpNodeOneLine(const ScheduleNode &node, llvm::raw_ostream &os,
       os << "(" << innerName << ")";
   }
   os << "  {pipe: " << getPipelineName(node.pipeline)
-     << ", cycle: " << node.cycle;
+     << ", cycle: " << node.cycle
+     << ", cluster: " << node.cluster;
   if (node.latency)
     os << ", latency: " << node.latency;
   if (node.selfLatency)
@@ -220,7 +221,7 @@ static void dumpLoop(const ScheduleGraph &graph, const ScheduleLoop &loop,
   os << "}\n";
 }
 
-void ScheduleGraph::dump() const {
+void ScheduleGraph::dump(llvm::raw_ostream &os) const {
   llvm::DenseSet<unsigned> childIds;
   for (const auto &loop : loops)
     for (const auto &node : loop.nodes)
@@ -230,9 +231,11 @@ void ScheduleGraph::dump() const {
   for (const auto &loop : loops) {
     if (childIds.count(loop.id))
       continue;
-    dumpLoop(*this, loop, llvm::dbgs(), 0);
-    llvm::dbgs() << "\n";
+    dumpLoop(*this, loop, os, 0);
+    os << "\n";
   }
 }
+
+void ScheduleGraph::dump() const { dump(llvm::dbgs()); }
 
 } // namespace mlir::triton::gpu

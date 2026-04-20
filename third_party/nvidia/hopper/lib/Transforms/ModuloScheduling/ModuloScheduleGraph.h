@@ -70,10 +70,11 @@ struct ScheduleNode {
   unsigned id{};
   Operation *op{nullptr};
 
-  // Schedule assignment (from Phase 0)
+  // Schedule assignment (from Phase 0 + Step 2.5)
   HWPipeline pipeline{HWPipeline::NONE};
   int cycle{0};       // absolute cycle within the II
   int stage{0};       // cycle / II
+  int cluster{0};     // dense rank of cycle within stage (Step 2.5)
   int latency{0};     // cycles until result available
   int selfLatency{0}; // cycles this op occupies its pipeline
 
@@ -252,8 +253,13 @@ struct ScheduleGraph {
     return order;
   }
 
-  /// Dump the graph for debugging.
+  /// Dump the graph for debugging. The no-arg overload writes to
+  /// llvm::dbgs() (gated by `-debug-only=...`); the ostream overload
+  /// writes unconditionally and is used by passes that expose a
+  /// `print-schedule-graph` option (lit tests rely on this since
+  /// `-debug-only` is debug-build only).
   void dump() const;
+  void dump(llvm::raw_ostream &os) const;
 };
 
 } // namespace mlir::triton::gpu
