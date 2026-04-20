@@ -39,7 +39,7 @@
 
 // expected-error @below{{expected token after element type in 0-d tensor_view}}
 %0 = "use_type"() : () -> !cuda_tile.tensor_view<f16,>
- 
+
 // -----
 
 // expected-error @below{{dimensions must have strictly positive constant sizes but got [0]}}
@@ -447,4 +447,3 @@ cuda_tile.module @module {
     %t = store_view_tko acquire %tile, %view[%c0, %c0] : tile<1024x1024xf32>, partition_view<tile=(1024x1024), tensor_view<4096x4096xf32, strides=[4096,1]>>, tile<i32> -> token
   }
 }
-

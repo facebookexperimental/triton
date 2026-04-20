@@ -85,8 +85,7 @@ struct ControlFlowImplicitTerminatorOpType {
   /// The following methods are all used when interacting with the "implicit"
   /// terminator.
 
-  template <typename... Args>
-  static void build(Args &&...args) {
+  template <typename... Args> static void build(Args &&...args) {
     ImplicitOpT::build(std::forward<Args>(args)...);
   }
   static constexpr StringLiteral getOperationName() {

@@ -28,7 +28,7 @@ cuda_tile.module @optional_attribute_version_error_test {
 
 // -----
 
-// Test case 3: Operand version error  
+// Test case 3: Operand version error
 cuda_tile.module @operand_version_error_test {
   entry @test_operand_error() {
     %input = constant <f32: [1.0, 2.0]> : !cuda_tile.tile<2xf32>

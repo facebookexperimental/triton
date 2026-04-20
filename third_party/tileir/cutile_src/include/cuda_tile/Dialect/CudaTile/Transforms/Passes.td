@@ -42,17 +42,17 @@ def FuseFMAPass : InterfacePass<
   let summary = "Fuse multiply-add and multiply-subtract operations into FMA operations (non-numeric-preserving)";
   let description = [{
     Fuses multiply-add and multiply-subtract operations into FMA operations.
-    
-    NON-NUMERIC-PRESERVING: Changes rounding behavior from double-round 
+
+    NON-NUMERIC-PRESERVING: Changes rounding behavior from double-round
     to single-round FMA, affecting exact bit patterns.
-    
+
     Patterns:
     1. MulAddPattern: (a * b) + c → FMA(a, b, c)
     2. MulSubPattern: (a * b) - c → FMA(a, b, -c)
-    
+
     Additional optimizations:
     - Applies canonicalization patterns for AddFOp to enable more fusion opportunities
-    
+
     Constraints: Preserves rounding modes/FTZ modifiers, requires single-use multiply.
     Targets: Any FunctionOpInterface operation.
   }];

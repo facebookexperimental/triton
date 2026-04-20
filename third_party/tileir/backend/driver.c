@@ -76,22 +76,20 @@ static PyObject *loadtileIRBinary(PyObject *self, PyObject *args) {
       cuFuncGetAttribute(&n_regs, CU_FUNC_ATTRIBUTE_NUM_REGS, fun));
   CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(
       cuFuncGetAttribute(&n_spills, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, fun));
-  n_spills /= 4;  // Convert bytes to number of 32-bit registers.
-  CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(
-      cuFuncGetAttribute(&static_smem_bytes, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, fun));
+  n_spills /= 4; // Convert bytes to number of 32-bit registers.
   CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(cuFuncGetAttribute(
-    &n_max_threads, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, fun));
+      &static_smem_bytes, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, fun));
+  CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(cuFuncGetAttribute(
+      &n_max_threads, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, fun));
 
   Py_END_ALLOW_THREADS;
 
   if (PyErr_Occurred()) {
     return NULL;
   }
-  return Py_BuildValue(
-    "(KKiii)", (uint64_t)mod, (uint64_t)fun, n_regs, n_spills, n_max_threads
-  );
+  return Py_BuildValue("(KKiii)", (uint64_t)mod, (uint64_t)fun, n_regs,
+                       n_spills, n_max_threads);
 }
-
 
 static PyMethodDef ModuleMethods[] = {
     {"load_tileir_binary", loadtileIRBinary, METH_VARARGS,
@@ -114,4 +112,3 @@ PyMODINIT_FUNC PyInit_tileir_utils(void) {
 
   return m;
 }
-

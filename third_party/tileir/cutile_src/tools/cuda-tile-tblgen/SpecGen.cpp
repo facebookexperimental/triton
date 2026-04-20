@@ -33,9 +33,9 @@
 #include "llvm/TableGen/Record.h"
 #include "llvm/TableGen/TableGenBackend.h"
 
+#include "CudaTileAttr.h"
 #include "CudaTileOp.h"
 #include "Emitter.h"
-#include "CudaTileAttr.h"
 #include <sstream>
 #include <string>
 #include <variant>
@@ -47,13 +47,11 @@ using namespace cudatile::tblgen;
 using mlir::tblgen::Operator;
 
 // Helper type to make it cleaner to write visitor for std::variant.
-template <class... Ts>
-struct overloaded : Ts... {
+template <class... Ts> struct overloaded : Ts... {
   using Ts::operator()...;
 };
 // explicit deduction guide (not needed as of C++20)
-template <class... Ts>
-overloaded(Ts...) -> overloaded<Ts...>;
+template <class... Ts> overloaded(Ts...) -> overloaded<Ts...>;
 
 // The path to the file containing the pre-written header text for each section.
 static const char *OP_CLASS_HEADING_PATH = "/sections/op_class_headings/";
@@ -647,8 +645,8 @@ static void emitOpDoc(SpecEmitter &emitter, CudaTileOp &cudaTileOp,
 
 // These are the declared sections.
 static const char *const cudaTileSections[] = {
-    "Core",         "Conversions", "Control Flow", "Memory", "Floating Point",
-    "Integer",      "Bitwise",     "Atomics",      "Views",  "Miscellaneous",
+    "Core",    "Conversions", "Control Flow", "Memory", "Floating Point",
+    "Integer", "Bitwise",     "Atomics",      "Views",  "Miscellaneous",
 };
 
 static const int NUMBER_SECTIONS =
@@ -770,6 +768,5 @@ void cudatile::tblgen::generateSpec(
       // Call emitOpDoc with the emitter and the operation.
       emitOpDoc(emitter, cudaTileOp, attrDefs);
     }
-
   }
 }

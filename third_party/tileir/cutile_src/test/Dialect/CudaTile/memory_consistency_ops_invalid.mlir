@@ -55,7 +55,7 @@ cuda_tile.module @invalid_load_ptr_tko {
   cuda_tile.testing$func @load_with_mask(%arg0: !cuda_tile.tile<16x32x!cuda_tile.ptr<f32>>, %arg1: !cuda_tile.tile<16x32x!cuda_tile.ptr<f32>>) {
     %t = make_token : !cuda_tile.token
     // expected-error @below{{operand #1 must be tile of i1 values, but got '!cuda_tile.tile<16x32xptr<f32>>'}}
-    cuda_tile.load_ptr_tko weak %arg0, %arg1 token=%t 
+    cuda_tile.load_ptr_tko weak %arg0, %arg1 token=%t
       : tile<16x32xptr<f32>>, tile<16x32xptr<f32>> -> tile<16x32xf32>, token
   }
 }
@@ -66,7 +66,7 @@ cuda_tile.module @invalid_load_ptr_tko {
   cuda_tile.testing$func @load_with_mask(%arg0: !cuda_tile.tile<16x32x!cuda_tile.ptr<f32>>, %arg1: !cuda_tile.tile<16x64xi1>) {
     %t = make_token : !cuda_tile.token
     // expected-error @below{{shape of 'mask' must match the shape of 'source'}}
-    cuda_tile.load_ptr_tko weak %arg0, %arg1 token=%t 
+    cuda_tile.load_ptr_tko weak %arg0, %arg1 token=%t
       : tile<16x32xptr<f32>>, tile<16x64xi1> -> tile<16x32xf32>, token
   }
 }
@@ -190,7 +190,7 @@ cuda_tile.module @release_token_ordered_load {
   testing$func @invalid_weak_load_with_scope(%ptr: !cuda_tile.tile<16x32x!cuda_tile.ptr<f32>>) {
     %t = make_token : !cuda_tile.token
     // expected-error@below {{weak load must not have memory scope}}
-    %0, %new_t = load_ptr_tko weak device %ptr token=%t 
+    %0, %new_t = load_ptr_tko weak device %ptr token=%t
       : tile<16x32xptr<f32>> -> tile<16x32xf32>, token
     return
   }
@@ -203,7 +203,7 @@ cuda_tile.module @release_token_ordered_load {
     %t = make_token : !cuda_tile.token
     // The error here is not really great but that's the best we can do using assembly format.
     // expected-error@below {{expected SSA operand}}
-    %0, %new_t = load_ptr_tko weak blah %ptr token=%t 
+    %0, %new_t = load_ptr_tko weak blah %ptr token=%t
       : tile<16x32xptr<f32>> -> tile<16x32xf32>, token
     return
   }

@@ -17,6 +17,8 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+
+
 def format_compute_capability(capability: int) -> str:
     """
     Format compute capability for GPU architecture.
@@ -52,6 +54,7 @@ else:
             if delete:
                 shutil.rmtree(temp_dir)
 
+
 @dataclass(frozen=True)
 class TileIROptions:
     ########################## tileIR core options ##########################
@@ -59,7 +62,7 @@ class TileIROptions:
     arch: str = None
     num_ctas: int = 1
     # tileir use num_stages to control the op cost, see <tileir_link>
-    num_stages: int = 3 
+    num_stages: int = 3
     # tileir use opt_level to control the optimization level, see <tileir_link>
     opt_level: int = 3
     # tileir use occupancy to control the register usage, see <tileir_link>
@@ -103,10 +106,10 @@ class TileIROptions:
     @property
     def enable_approx(self):
         return TileIREnvConf.enable_approx()
+
     def __post_init__(self):
-        assert (
-            self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0
-        ), "num_warps must be a power of 2"
+        assert (self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0), "num_warps must be a power of 2"
+
     def hash(self):
         hash_dict = dict(self.__dict__)
         # Get all property values from class __dict__
@@ -115,13 +118,7 @@ class TileIROptions:
                 hash_dict[name] = getattr(self, name)
         # Exclude num_warps from hash since it doesn't affect compilation output.
         # This enables kernel cache sharing for configs that only differ in num_warps.
-        key = "_".join(
-            [
-                f"{name}-{val}"
-                for name, val in sorted(hash_dict.items())
-                if name != "num_warps"
-            ]
-        )
+        key = "_".join([f"{name}-{val}" for name, val in sorted(hash_dict.items()) if name != "num_warps"])
         return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
@@ -130,6 +127,7 @@ def get_tileir_version():
 
 
 class TileIRBackend(BaseBackend):
+
     def get_module_map(self):
         from triton.language.extra.cuda import libdevice
 
@@ -152,14 +150,7 @@ class TileIRBackend(BaseBackend):
 
     def parse_options(self, opts) -> Any:
         args = {"arch": os.getenv("TRITON_OVERRIDE_ARCH", f"sm{self.target.arch}")}
-        args.update(
-            {
-                k: opts[k]
-                for k in TileIROptions.__dataclass_fields__.keys()
-                if k in opts
-                if opts[k] is not None
-            }
-        )
+        args.update({k: opts[k] for k in TileIROptions.__dataclass_fields__.keys() if k in opts if opts[k] is not None})
         capability = int(self._parse_arch(args["arch"]))
         if "supported_fp8_dtypes" not in args:
             supported_fp8_dtypes = set(TileIROptions.supported_fp8_dtypes)
@@ -288,19 +279,14 @@ class TileIRBackend(BaseBackend):
             opt.occupancy,
             metadata["num_stages"],
         )
-        tileir.passes.add_auto_gen_memtoken(
-            pm,
-            opt.enable_autogen_alias_mem_token
-        )
+        tileir.passes.add_auto_gen_memtoken(pm, opt.enable_autogen_alias_mem_token)
         passes.common.add_inliner(pm)
         if opt.enable_fp_fusion:
             tileir.passes.add_fma_fusion(pm)
         tileir.passes.add_strip_debuginfo(pm)
         pm.run(mod, "make_tileir")
         if not tileir.only_contain_legal_dialects(mod):
-            raise RuntimeError(
-                "Triton ttir to tileir ir failed. Some ttir ops cannot be converted to tileir."
-            )
+            raise RuntimeError("Triton ttir to tileir ir failed. Some ttir ops cannot be converted to tileir.")
 
         pattern = r"entry @([a-zA-Z0-9_]*)\("
         match = re.findall(pattern, mod.__str__())
@@ -316,15 +302,9 @@ class TileIRBackend(BaseBackend):
     def add_stages(self, stages, options, language):
         assert language == Language.TRITON, "Only TRITON language is supported for now"
         capability = int(self._parse_arch(options.arch))
-        stages["ttir"] = lambda src, metadata: self.make_ttir(
-            src, metadata, options, capability
-        )
-        stages["tileIR"] = lambda src, metadata: self.make_tileir(
-            src, metadata, options, capability
-        )
-        stages["cubin"] = lambda src, metadata: self.make_cubin(
-            src, metadata, options, capability
-        )
+        stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options, capability)
+        stages["tileIR"] = lambda src, metadata: self.make_tileir(src, metadata, options, capability)
+        stages["cubin"] = lambda src, metadata: self.make_cubin(src, metadata, options, capability)
 
     @functools.lru_cache()
     def hash(self):

@@ -785,7 +785,7 @@ cuda_tile.module @kernels {
 #compile_unit = #cuda_tile.di_compile_unit<>
 
 // -----
-// CHECK: struct is missing required parameter: name 
+// CHECK: struct is missing required parameter: name
 #file = #cuda_tile.di_file<"foo.py" in "/tmp/">
 #compile_unit = #cuda_tile.di_compile_unit<file = #file>
 #subprogram1 = #cuda_tile.di_subprogram<file = #file, line = 1, linkageName = "test", compileUnit = #compile_unit, scopeLine = 2>

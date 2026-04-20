@@ -11,7 +11,7 @@ cuda_tile.module @kernels {
     %2 = constant <i32: 0x12345678> : tile<i32>
     // CHECK: %{{.*}} = constant <i16: 4267> : tile<i16>
     %3 = constant <i16: 0x10AB> : tile<i16>
-    
+
     // Valid scalar splats
     // CHECK: %{{.*}} = constant <i32: 42> : tile<4x4xi32>
     %4 = constant <i32: 42> : tile<4x4xi32>
@@ -19,7 +19,7 @@ cuda_tile.module @kernels {
     %5 = constant <f32: 1.5> : tile<2x4x4xf32>
     // CHECK: %{{.*}} = constant <i1: true> : tile<8xi1>
     %6 = constant <i1: true> : tile<8xi1>
-    
+
     // Valid arrays with matching shapes
     // CHECK: %{{.*}} = constant <i32: {{\[}}{{\[}}1, 2{{\]}}, {{\[}}3, 4{{\]}}{{\]}}> : tile<2x2xi32>
     %7 = constant <i32: [[1, 2], [3, 4]]> : tile<2x2xi32>
@@ -39,15 +39,15 @@ cuda_tile.module @kernels {
     // i8 tests
     // CHECK: %{{.*}} = constant <i8: -1> : tile<i8>
     %1 = constant <i8: 0xFF> : tile<i8>
-    
+
     // i16 tests
     // CHECK: %{{.*}} = constant <i16: 4660> : tile<i16>
     %3 = constant <i16: 0x1234> : tile<i16>
-    
+
     // i32 tests
     // CHECK: %{{.*}} = constant <i32: 305419896> : tile<i32>
     %5 = constant <i32: 0x12345678> : tile<i32>
-    
+
     // i64 tests
     // CHECK: %{{.*}} = constant <i64: 1311768467463790320> : tile<i64>
     %7 = constant <i64: 0x123456789ABCDEF0> : tile<i64>
@@ -68,11 +68,11 @@ cuda_tile.module @kernels {
     // f16 tests
     // CHECK: %{{.*}} = constant <f16: 1.000000e+00> : tile<f16>
     %1 = constant <f16: 0x3C00> : tile<f16>  // 1.0 in f16
-    
+
     // f32 tests
     // CHECK: %{{.*}} = constant <f32: 1.000000e+00> : tile<f32>
     %3 = constant <f32: 0x3F800000> : tile<f32>  // 1.0 in f32
-  
+
     // f64 tests
     // CHECK: %{{.*}} = constant <f64: 1.000000e+00> : tile<f64>
     %5 = constant <f64: 0x3FF0000000000000> : tile<f64>  // 1.0 in f64
@@ -110,13 +110,13 @@ cuda_tile.module @kernels {
     %0 = constant <f16: 70000.0> : tile<f16>
     // CHECK: %{{.*}} = constant <f16: 0xFC00> : tile<f16>
     %1 = constant <f16: -70000.0> : tile<f16>
-    
+
     // f32 overflow tests
     // CHECK: %{{.*}} = constant <f32: 0x7F800000> : tile<f32>
     %2 = constant <f32: 10000000000000000000000000000000000000000.0> : tile<f32>
     // CHECK: %{{.*}} = constant <f32: 0xFF800000> : tile<f32>
     %3 = constant <f32: -10000000000000000000000000000000000000000.0> : tile<f32>
-    
+
     // f64 overflow test
     // CHECK: %{{.*}} = constant <f64: 0x7FF0000000000000> : tile<f64>
     %4 = constant <f64: 10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000.0> : tile<f64>

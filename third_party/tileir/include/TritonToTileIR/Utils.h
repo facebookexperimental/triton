@@ -73,30 +73,31 @@ public:
           // For DivSIOp and RemSIOp, triton assume the LHS is positive in axis
           // analysis pass, see
           // https://github.com/triton-lang/triton/issues/7749. tileir backend
-          // also assume the LHS is positive here for simplicity of the axis analysis pass.
+          // also assume the LHS is positive here for simplicity of the axis
+          // analysis pass.
           // TODO: write a more general pass to analyze the all positive value.
           if constexpr (std::is_same_v<TritonOp, arith::DivSIOp>) {
             auto lhs = cuda_tile::AssumeOp::create(
                            rewriter, loc, operands[0],
-                               cuda_tile::BoundedAttr::get(
-                                   rewriter.getContext(), 0, std::nullopt))
+                           cuda_tile::BoundedAttr::get(rewriter.getContext(), 0,
+                                                       std::nullopt))
                            .getResult();
             auto tileSignedness = signedness == Signedness::Unsigned
                                       ? cuda_tile::Signedness::Unsigned
                                       : cuda_tile::Signedness::Signed;
             return CudaTileOp::create(builder, loc, type, lhs, operands[1],
-                                              tileSignedness);
+                                      tileSignedness);
           } else if constexpr (std::is_same_v<TritonOp, arith::RemSIOp>) {
             auto tileSignedness = signedness == Signedness::Unsigned
                                       ? cuda_tile::Signedness::Unsigned
                                       : cuda_tile::Signedness::Signed;
             auto lhs = cuda_tile::AssumeOp::create(
                            rewriter, loc, operands[0],
-                               cuda_tile::BoundedAttr::get(
-                                   rewriter.getContext(), 0, std::nullopt))
+                           cuda_tile::BoundedAttr::get(rewriter.getContext(), 0,
+                                                       std::nullopt))
                            .getResult();
             return CudaTileOp::create(builder, loc, type, lhs, operands[1],
-                                              tileSignedness);
+                                      tileSignedness);
           } else if constexpr (std::is_same_v<TritonOp, arith::DivSIOp> ||
                                std::is_same_v<TritonOp, arith::DivUIOp> ||
                                std::is_same_v<TritonOp, arith::CeilDivSIOp> ||
@@ -112,8 +113,8 @@ public:
             auto tileSignedness = signedness == Signedness::Unsigned
                                       ? cuda_tile::Signedness::Unsigned
                                       : cuda_tile::Signedness::Signed;
-            return CudaTileOp::create(builder, 
-                loc, type, operands[0], operands[1], tileSignedness, rounding);
+            return CudaTileOp::create(builder, loc, type, operands[0],
+                                      operands[1], tileSignedness, rounding);
           } else if constexpr (std::is_same_v<TritonOp, arith::AddFOp> ||
                                std::is_same_v<TritonOp, arith::MulFOp> ||
                                std::is_same_v<TritonOp, arith::SubFOp>) {
@@ -121,15 +122,15 @@ public:
                    "expect two operands for add/mul/sub");
             bool isF32 = getElementTypeOrSelf(op.getResult().getType()).isF32();
             bool ftzModifier = (this->flushToZeroModifier && isF32);
-            return CudaTileOp::create(builder, 
-                loc, type, operands[0], operands[1],
+            return CudaTileOp::create(
+                builder, loc, type, operands[0], operands[1],
                 cuda_tile::RoundingMode::NEAREST_EVEN, ftzModifier);
           } else if constexpr (std::is_same_v<TritonOp, math::FmaOp>) {
             assert(operands.size() == 3 && "expect two operands for fma");
             bool isF32 = getElementTypeOrSelf(op.getResult().getType()).isF32();
             bool ftzModifier = (this->flushToZeroModifier && isF32);
-            return CudaTileOp::create(builder, 
-                loc, type, operands[0], operands[1], operands[2],
+            return CudaTileOp::create(
+                builder, loc, type, operands[0], operands[1], operands[2],
                 cuda_tile::RoundingMode::NEAREST_EVEN, ftzModifier);
           } else if constexpr (std::is_same_v<TritonOp, arith::DivFOp>) {
             assert(operands.size() == 2 && "expect two operands for div");
@@ -142,14 +143,13 @@ public:
             }
             bool ftzModifier = (this->flushToZeroModifier && isF32);
             return CudaTileOp::create(builder, loc, operands[0], operands[1],
-                                              rounding, ftzModifier);
+                                      rounding, ftzModifier);
           } else if constexpr (std::is_same_v<TritonOp,
                                               triton::PreciseDivFOp>) {
             // Lower a precise div operation. The ftz flag will not
             // have any effect.
-            return CudaTileOp::create(builder, 
-                loc, operands[0], operands[1],
-                cuda_tile::RoundingMode::NEAREST_EVEN);
+            return CudaTileOp::create(builder, loc, operands[0], operands[1],
+                                      cuda_tile::RoundingMode::NEAREST_EVEN);
           } else if constexpr (std::is_same_v<TritonOp, math::Exp2Op>) {
             assert(operands.size() == 1 && "expect single operand for ex2");
             bool isF32 = getElementTypeOrSelf(op.getResult().getType()).isF32();
@@ -163,19 +163,19 @@ public:
               rounding = cuda_tile::RoundingMode::APPROX;
             bool ftzModifier = (this->flushToZeroModifier && isF32);
             return CudaTileOp::create(builder, loc, operands[0], rounding,
-                                              ftzModifier);
+                                      ftzModifier);
           } else if constexpr (std::is_same_v<TritonOp,
                                               triton::PreciseSqrtOp>) {
             // Lower a precise sqrt operation. The ftz flag will not
             // have any effect.
-            return CudaTileOp::create(builder, 
-                loc, operands[0], cuda_tile::RoundingMode::NEAREST_EVEN);
+            return CudaTileOp::create(builder, loc, operands[0],
+                                      cuda_tile::RoundingMode::NEAREST_EVEN);
           } else if constexpr (signedness != Signedness::None) {
             auto tileSignedness = signedness == Signedness::Unsigned
                                       ? cuda_tile::Signedness::Unsigned
                                       : cuda_tile::Signedness::Signed;
             return CudaTileOp::create(builder, loc, type, operands,
-                                              tileSignedness);
+                                      tileSignedness);
           } else {
             return CudaTileOp::create(builder, loc, type, operands);
           }

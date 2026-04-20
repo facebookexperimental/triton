@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 """
 Cross-platform replacement for round_trip_test.sh
 Tests MLIR -> CudaTileBC -> MLIR round-trip conversion
@@ -14,9 +13,7 @@ import difflib
 def run_command(cmd, check=True):
     """Run a command and return the result"""
     try:
-        result = subprocess.run(
-            cmd, shell=True, check=check, capture_output=True, text=True
-        )
+        result = subprocess.run(cmd, shell=True, check=check, capture_output=True, text=True)
         return result
     except subprocess.CalledProcessError as e:
         print(f"Command failed: {' '.join(cmd) if isinstance(cmd, list) else cmd}")
@@ -62,9 +59,7 @@ def main():
 
         # Remove blank lines for comparison (equivalent to diff -B)
         ref_lines = [line for line in ref_content.splitlines() if line.strip()]
-        roundtrip_lines = [
-            line for line in roundtrip_content.splitlines() if line.strip()
-        ]
+        roundtrip_lines = [line for line in roundtrip_content.splitlines() if line.strip()]
 
         if ref_lines != roundtrip_lines:
             print("Round-trip test failed: files differ")

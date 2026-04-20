@@ -30,20 +30,20 @@ include "cuda_tile/Dialect/CudaTile/IR/AttrDefs.td"
 //===----------------------------------------------------------------------===//
 
 def CudaTile_Test_FuncOp : CudaTileTestingOpDef<"func", "250.0", [
-  IsolatedFromAbove, FunctionOpInterface, SingleBlock, OpAsmOpInterface, 
+  IsolatedFromAbove, FunctionOpInterface, SingleBlock, OpAsmOpInterface,
   SingleBlockImplicitTerminator<"ReturnOp">
 ]> {
 
-  let arguments = (ins 
+  let arguments = (ins
     CudaTileArg<SymbolNameAttr, "The name of the function.", "250.0">:$sym_name,
     CudaTileArg<TypeAttrOf<FunctionType>, "The type of the function.", "250.0">:$function_type,
     CudaTileUnusedArg<OptionalAttr<DictArrayAttr>, "The argument attributes of the function.", "250.0">:$arg_attrs,
     CudaTileUnusedArg<OptionalAttr<DictArrayAttr>, "The result attributes of the function.", "250.0">:$res_attrs);
-  
+
   let regions = (region SizedRegion<1>:$body);
-  
+
   let hasCustomAssemblyFormat = 1;
-  
+
   let extraClassDeclaration = CudaTile_DefaultDialect.classDecl # [{
     // FunctionOpInterface Methods
 

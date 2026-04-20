@@ -5,13 +5,13 @@ cuda_tile.module @kernels {
   cuda_tile.entry @optional_attrs_test(%a: !cuda_tile.tile<f32>, %b: !cuda_tile.tile<f32>) {
     // Operation with optional flush_to_zero attribute present
     %0 = cuda_tile.addf %a, %b rounding<nearest_even> flush_to_zero : tile<f32>
-    
+
     // Operation with optional flush_to_zero attribute absent
     %1 = cuda_tile.addf %a, %b rounding<nearest_even> : tile<f32>
-    
+
     // Operation with different optional attributes
     %2 = cuda_tile.addf %a, %b rounding<zero> : tile<f32>
-    
+
     // Operation with flush_to_zero attribute present
     %3 = cuda_tile.addf %a, %b rounding<zero> flush_to_zero : tile<f32>
   }
@@ -47,11 +47,11 @@ cuda_tile.module @kernels {
     // Test with optional attribute and optional operand
     %0, %res_token0 = cuda_tile.load_ptr_tko relaxed device %ptr, %mask
         : tile<ptr<f32>>, tile<i1> -> tile<f32>, token
-    
+
     // Test with optional attribute but no optional operands
     %1, %res_token1 = cuda_tile.load_ptr_tko relaxed device %ptr
         : tile<ptr<f32>> -> tile<f32>, token
-        
+
     // Test with no optional attribute but with optional operand
     %2, %res_token2 = cuda_tile.load_ptr_tko weak %ptr, %mask
         : tile<ptr<f32>>, tile<i1> -> tile<f32>, token

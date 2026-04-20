@@ -96,5 +96,3 @@ std::unique_ptr<Pass> createLiftTTCFToSCFPass() {
   return std::make_unique<LiftTTCFToSCFPass>();
 }
 } // namespace mlir::triton
-
-

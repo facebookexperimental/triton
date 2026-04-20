@@ -211,7 +211,7 @@ cuda_tile.module @iota_invalid_shape {
 
 // -----
 
-cuda_tile.module @iota_mismatched_shape { 
+cuda_tile.module @iota_mismatched_shape {
   cuda_tile.entry @func() {
     // expected-error @below{{expects result type to be 1-d tile}}
     cuda_tile.iota : !cuda_tile.tile<32x64xi32>

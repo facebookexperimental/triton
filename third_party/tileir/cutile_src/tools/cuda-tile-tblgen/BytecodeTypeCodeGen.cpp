@@ -295,7 +295,7 @@ generateBuiltinTypeDeserializers(const BytecodeTypeStructure &structure,
                   .str()
             : formatv("{0}::get(&context)", bt.floatMlirTypeName).str();
     std::string check = formatv(R"(
-  if (typeTag == {0}) {{  
+  if (typeTag == {0}) {{
     result = {1};
     return success();
   })",
@@ -311,7 +311,7 @@ generateBuiltinTypeDeserializers(const BytecodeTypeStructure &structure,
   if (!intChecks.empty())
     os << formatv(R"(// Auto-generated integer type deserialization
 LogicalResult parseIntegerType(uint8_t typeTag, Type &result, MLIRContext &context) {{
-{0}  
+{0}
   return ::emitError(UnknownLoc::get(&context)) << "invalid integer type tag: " << static_cast<int>(typeTag);
 })",
                   intChecks);
@@ -319,7 +319,7 @@ LogicalResult parseIntegerType(uint8_t typeTag, Type &result, MLIRContext &conte
   if (!floatChecks.empty())
     os << formatv(R"(// Auto-generated float type deserialization
 LogicalResult parseFloatType(uint8_t typeTag, Type &result, MLIRContext &context) {{
-{0}  
+{0}
   return ::emitError(UnknownLoc::get(&context)) << "unsupported float type tag: " << static_cast<int>(typeTag);
 })",
                   floatChecks);

@@ -9,12 +9,7 @@ from pathlib import Path
 import tempfile
 import threading
 import torch
-from triton.backends.nvidia.driver import (
-    library_dirs,
-    include_dirs,
-    libraries,
-    ty_to_cpp
-)
+from triton.backends.nvidia.driver import (library_dirs, include_dirs, libraries, ty_to_cpp)
 
 from triton import knobs
 from triton.runtime.build import compile_module_from_src
@@ -24,13 +19,13 @@ from triton.backends.driver import GPUDriver
 from triton.backends.tileir.conf import TileIREnvConf
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-
 # ------------------------
 # Utils
 # ------------------------
 
 
 class TileIRUtils(object):
+
     def __new__(cls):
         if not hasattr(cls, "instance"):
             cls.instance = super(TileIRUtils, cls).__new__(cls)
@@ -40,11 +35,11 @@ class TileIRUtils(object):
         tile_mod_path = dirname
         nvidia_mod_path = os.path.join(os.path.dirname(dirname), "nvidia")
         tile_mod = compile_module_from_src(
-            Path(os.path.join(tile_mod_path, "driver.c")).read_text(), "tileir_utils", library_dirs(), include_dirs, libraries
-        )
+            Path(os.path.join(tile_mod_path, "driver.c")).read_text(), "tileir_utils", library_dirs(), include_dirs,
+            libraries)
         nvidia_mod = compile_module_from_src(
-            Path(os.path.join(nvidia_mod_path, "driver.c")).read_text(), "cuda_utils", library_dirs(), include_dirs, libraries
-        )
+            Path(os.path.join(nvidia_mod_path, "driver.c")).read_text(), "cuda_utils", library_dirs(), include_dirs,
+            libraries)
         self.init_nvidia_function(nvidia_mod)
         self.init_tileir_function(tile_mod)
 
@@ -60,7 +55,6 @@ class TileIRUtils(object):
 # ------------------------
 # Launcher
 # ------------------------
-
 
 dirname = os.path.dirname(__file__)
 
@@ -79,12 +73,12 @@ FLOAT_PACK_FUNCTION = {
     "fp64": "pack_fp64",
 }
 
-
 _BASE_ARGS_FORMAT = "iiiKKpOOOO"
 _BASE_ARGS_FORMAT_LEN = len(_BASE_ARGS_FORMAT)
 
 
 def make_launcher(constants, signature):
+
     def _flatten_signature(sig, output):
         # Flatten tuples
         if isinstance(sig, tuple):
@@ -353,7 +347,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature.items()])};
   {newline.join(float_storage_decls)}
   Py_BEGIN_ALLOW_THREADS;
-  
+
   _launch(numTilesX, numTilesY, numTilesZ, launch_pdl, (CUstream)_stream, (CUfunction)_function{', ' + ', '.join(internal_args_list) if len(internal_args_list) > 0 else ''});
   Py_END_ALLOW_THREADS;
   if (PyErr_Occurred()) {{
@@ -399,7 +393,6 @@ PyMODINIT_FUNC PyInit___triton_launcher(void) {{
     return src
 
 
-
 # This function unpacks a tensordesc object into its components:
 # - data pointer
 # - shape dimensions
@@ -418,6 +411,7 @@ def make_tensordesc_arg(arg):
 
 
 def wrap_handle_tensordesc(launcher):
+
     def inner(*args):
         # 9 is the metadata arguments in `args` defined in `make_launcher`
         meta_args = args[:9]
@@ -429,6 +423,7 @@ def wrap_handle_tensordesc(launcher):
             else:
                 final_args.append(arg)
         return launcher(*meta_args, *final_args)
+
     return inner
 
 
@@ -438,7 +433,7 @@ class TileIRLauncher(object):
         ids = {"ids_of_const_exprs": src.fn.constexprs if hasattr(src, "fn") else tuple()}
 
         constants = src.constants if hasattr(src, "constants") else dict()
-        arg_idx = lambda x: (src.fn.arg_names.index(x),) if isinstance(x, str) else x
+        arg_idx = lambda x: (src.fn.arg_names.index(x), ) if isinstance(x, str) else x
         constants = {arg_idx(idx): value for idx, value in constants.items()}
         signature = {idx: value for idx, value in src.signature.items()}
         has_tensordesc = any("tensordesc" in value for value in signature.values())
@@ -473,7 +468,6 @@ class TileIRLauncher(object):
             self.launch = mod.launch
         self.launch_pdl = metadata.launch_pdl
 
-
     def __call__(self, *args, **kwargs):
         # TODO: below if branch is for torch 2.8.0a0+5228986c39.nvinternal commit
         # where constexpr arguments are not passed to the launch function by inductor
@@ -482,13 +476,11 @@ class TileIRLauncher(object):
         num_launch_args = 9
         num_params = len(args) - num_launch_args
         if num_params < self.ori_signature_len:
-            extra_args = [
-                self.constants[(i,)] for i in range(num_params, self.ori_signature_len)
-            ]
+            extra_args = [self.constants[(i, )] for i in range(num_params, self.ori_signature_len)]
             model_args = args + tuple(extra_args)
         else:
             model_args = args
-        model_args = model_args[:5] + (self.launch_pdl,) + model_args[5:]
+        model_args = model_args[:5] + (self.launch_pdl, ) + model_args[5:]
 
         self.launch(*model_args, **kwargs)
 
@@ -542,5 +534,6 @@ class TileIRDriver(GPUDriver):
 
     def clear_cache(self, cache):
         cache.zero_()
+
 
 GlobalTileIRDriver = TileIRDriver()

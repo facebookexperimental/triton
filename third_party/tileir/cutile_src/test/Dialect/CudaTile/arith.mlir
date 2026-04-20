@@ -39,49 +39,49 @@ cuda_tile.module @kernels {
       // CHECK: cmpi less_than %[[c1_i1]], %[[c1_i1]], signed : tile<i1>
       // CHECK: cmpi less_than %[[c1_i1]], %[[c1_i1]], signed : tile<i1>
       %c1_i1 = constant <i1: true> : !cuda_tile.tile<i1>
-      %cmpi_i1_asm = cmpi less_than %c1_i1, %c1_i1, signed : tile<i1> -> tile<i1> 
+      %cmpi_i1_asm = cmpi less_than %c1_i1, %c1_i1, signed : tile<i1> -> tile<i1>
       %cmpi_i1_generic = "cuda_tile.cmpi"(%c1_i1, %c1_i1) {comparison_predicate = #cuda_tile.comparison_predicate<less_than>, signedness = #cuda_tile.signedness<signed>} : (!cuda_tile.tile<i1>, !cuda_tile.tile<i1>) -> !cuda_tile.tile<i1>
 
       // CHECK: %[[c42_i8:.*]] = constant <i8: 42> : tile<i8>
       // CHECK: cmpi less_than %[[c42_i8]], %[[c42_i8]], signed : tile<i8>
       // CHECK: cmpi less_than %[[c42_i8]], %[[c42_i8]], signed : tile<i8>
       %c42_i8 = constant <i8: 42> : !cuda_tile.tile<i8>
-      %cmpi_i8_asm = cmpi less_than %c42_i8, %c42_i8, signed : tile<i8> -> tile<i1> 
+      %cmpi_i8_asm = cmpi less_than %c42_i8, %c42_i8, signed : tile<i8> -> tile<i1>
       %cmpi_i8_generic = "cuda_tile.cmpi"(%c42_i8, %c42_i8) {comparison_predicate = #cuda_tile.comparison_predicate<less_than>, signedness = #cuda_tile.signedness<signed>} : (!cuda_tile.tile<i8>, !cuda_tile.tile<i8>) -> !cuda_tile.tile<i1>
 
       // CHECK: %[[c42_i16:.*]] = constant <i16: 42> : tile<i16>
       // CHECK: cmpi less_than %[[c42_i16]], %[[c42_i16]], signed : tile<i16>
       // CHECK: cmpi less_than %[[c42_i16]], %[[c42_i16]], signed : tile<i16>
       %c42_i16 = constant <i16: 42> : !cuda_tile.tile<i16>
-      %cmpi_i16_asm = cmpi less_than %c42_i16, %c42_i16, signed : tile<i16> -> tile<i1> 
+      %cmpi_i16_asm = cmpi less_than %c42_i16, %c42_i16, signed : tile<i16> -> tile<i1>
       %cmpi_i16_generic = "cuda_tile.cmpi"(%c42_i16, %c42_i16) {comparison_predicate = #cuda_tile.comparison_predicate<less_than>, signedness = #cuda_tile.signedness<signed>} : (!cuda_tile.tile<i16>, !cuda_tile.tile<i16>) -> !cuda_tile.tile<i1>
 
       // CHECK: %[[c42_i32:.*]] = constant <i32: 42> : tile<i32>
       // CHECK: cmpi less_than %[[c42_i32]], %[[c42_i32]], signed : tile<i32>
       // CHECK: cmpi less_than %[[c42_i32]], %[[c42_i32]], signed : tile<i32>
       %c42_i32 = constant <i32: 42> : !cuda_tile.tile<i32>
-      %cmpi_i32_asm = cmpi less_than %c42_i32, %c42_i32, signed : tile<i32> -> tile<i1> 
+      %cmpi_i32_asm = cmpi less_than %c42_i32, %c42_i32, signed : tile<i32> -> tile<i1>
       %cmpi_i32_generic = "cuda_tile.cmpi"(%c42_i32, %c42_i32) {comparison_predicate = #cuda_tile.comparison_predicate<less_than>, signedness = #cuda_tile.signedness<signed>} : (!cuda_tile.tile<i32>, !cuda_tile.tile<i32>) -> !cuda_tile.tile<i1>
 
       // CHECK: %[[c42_i64:.*]] = constant <i64: 42> : tile<i64>
       // CHECK: cmpi less_than %[[c42_i64]], %[[c42_i64]], signed : tile<i64>
       // CHECK: cmpi less_than %[[c42_i64]], %[[c42_i64]], signed : tile<i64>
       %c42_i64 = constant <i64: 42> : !cuda_tile.tile<i64>
-      %cmpi_i64_asm = cmpi less_than %c42_i64, %c42_i64, signed : tile<i64> -> tile<i1> 
+      %cmpi_i64_asm = cmpi less_than %c42_i64, %c42_i64, signed : tile<i64> -> tile<i1>
       %cmpi_i64_generic = "cuda_tile.cmpi"(%c42_i64, %c42_i64) {comparison_predicate = #cuda_tile.comparison_predicate<less_than>, signedness = #cuda_tile.signedness<signed>} : (!cuda_tile.tile<i64>, !cuda_tile.tile<i64>) -> !cuda_tile.tile<i1>
 
       // CHECK: %[[v0_i32:.*]] = constant <i32: [1, 2, 3, 4]> : tile<4xi32>
       // CHECK: cmpi less_than %[[v0_i32]], %[[v0_i32]], signed : tile<4xi32>
       // CHECK: cmpi less_than %[[v0_i32]], %[[v0_i32]], signed : tile<4xi32>
       %v0_i32 = constant <i32: [1, 2, 3, 4]> : !cuda_tile.tile<4xi32>
-      %cmpi_vector_asm = cmpi less_than %v0_i32, %v0_i32, signed : tile<4xi32> -> tile<4xi1> 
+      %cmpi_vector_asm = cmpi less_than %v0_i32, %v0_i32, signed : tile<4xi32> -> tile<4xi1>
       %cmpi_vector_generic = "cuda_tile.cmpi"(%v0_i32, %v0_i32) {comparison_predicate = #cuda_tile.comparison_predicate<less_than>, signedness = #cuda_tile.signedness<signed>} : (!cuda_tile.tile<4xi32>, !cuda_tile.tile<4xi32>) -> !cuda_tile.tile<4xi1>
 
       // CHECK: %[[t0_i64:.*]] = constant <i64: {{\[\[}}1, 2], [3, 4]]> : tile<2x2xi64>
       // CHECK: cmpi equal %[[t0_i64]], %[[t0_i64]], signed : tile<2x2xi64>
       // CHECK: cmpi equal %[[t0_i64]], %[[t0_i64]], signed : tile<2x2xi64>
       %t0_i64 = constant <i64: [[1, 2], [3, 4]]> : !cuda_tile.tile<2x2xi64>
-      %cmpi_tensor_asm = cmpi equal %t0_i64, %t0_i64, signed : tile<2x2xi64> -> tile<2x2xi1> 
+      %cmpi_tensor_asm = cmpi equal %t0_i64, %t0_i64, signed : tile<2x2xi64> -> tile<2x2xi1>
       %cmpi_tensor_generic = "cuda_tile.cmpi"(%t0_i64, %t0_i64) {comparison_predicate = #cuda_tile.comparison_predicate<equal>, signedness = #cuda_tile.signedness<signed>} : (!cuda_tile.tile<2x2xi64>, !cuda_tile.tile<2x2xi64>) -> !cuda_tile.tile<2x2xi1>
 
   }
@@ -553,7 +553,7 @@ entry @floordivi() {
     // CHECK: addf %[[c42_f64]], %[[c42_f64]] : tile<f64>
     %add_f64 = cuda_tile.addf %c42_f64, %c42_f64 rounding<nearest_even> : tile<f64>
   }
-  
+
   entry @addf_tensor() {
     // CHECK-LABEL: entry @addf_tensor
     // CHECK: %[[c_f16tensor:.*]] = constant <f16: {{\[}}[1.000000e+00, 2.000000e+00], [4.000000e+00, 5.000000e+00]]> : tile<2x2xf16>
@@ -766,22 +766,22 @@ entry @floordivi() {
     // CHECK: %[[c42_f16:.*]] = constant <f16: 4.200000e+01> : tile<f16>
     %c42_f16 = constant <f16: 42.000000e+00> : !cuda_tile.tile<f16>
     // CHECK: cmpf less_than ordered %[[c42_f16]], %[[c42_f16]] : tile<f16>
-    %cmp_f16 = cmpf less_than ordered %c42_f16, %c42_f16 : tile<f16> -> tile<i1> 
+    %cmp_f16 = cmpf less_than ordered %c42_f16, %c42_f16 : tile<f16> -> tile<i1>
 
     // CHECK: %[[c42_bf16:.*]] = constant <bf16: 4.200000e+01> : tile<bf16>
     %c42_bf16 = constant <bf16: 42.000000e+00> : !cuda_tile.tile<bf16>
     // CHECK: cmpf less_than ordered %[[c42_bf16]], %[[c42_bf16]] : tile<bf16>
-    %cmp_bf16 = cmpf less_than ordered %c42_bf16, %c42_bf16 : tile<bf16> -> tile<i1> 
+    %cmp_bf16 = cmpf less_than ordered %c42_bf16, %c42_bf16 : tile<bf16> -> tile<i1>
 
     // CHECK: %[[c42_f32:.*]] = constant <f32: 4.200000e+01> : tile<f32>
     %c42_f32 = constant <f32: 42.000000e+00> : !cuda_tile.tile<f32>
     // CHECK: cmpf less_than ordered %[[c42_f32]], %[[c42_f32]] : tile<f32>
-    %cmp_f32 = cmpf less_than ordered %c42_f32, %c42_f32 : tile<f32> -> tile<i1> 
+    %cmp_f32 = cmpf less_than ordered %c42_f32, %c42_f32 : tile<f32> -> tile<i1>
 
     // CHECK: %[[c42_f64:.*]] = constant <f64: 4.200000e+01> : tile<f64>
     %c42_f64 = constant <f64: 42.000000e+00> : !cuda_tile.tile<f64>
     // CHECK: cmpf less_than ordered %[[c42_f64]], %[[c42_f64]] : tile<f64>
-    %cmp_f64 = cmpf less_than ordered %c42_f64, %c42_f64 : tile<f64> -> tile<i1> 
+    %cmp_f64 = cmpf less_than ordered %c42_f64, %c42_f64 : tile<f64> -> tile<i1>
   }
 
   entry @cmpf_tensor() {

@@ -307,9 +307,9 @@ def CudaTile_Atan2Op : CudaTileMathOpDef<"atan2", "13.2", [
   ]> {
   let summary = "Element-wise atan2";
   let description = !strconcat([{
-    The :code:`atan2` operation calculates the principal value 
-    of the arc tangent of the ratio of first and second input 
-    arguments x / y. The quadrant of the result is determined 
+    The :code:`atan2` operation calculates the principal value
+    of the arc tangent of the ratio of first and second input
+    arguments x / y. The quadrant of the result is determined
     by the signs of inputs x and y.
 
     .. math::
@@ -1644,8 +1644,8 @@ def CudaTile_ForOp : CudaTileControlFlowOpDef<"for", "13.1", [
     loop-carried values yielded by the previous loop iteration.
 
     The loop terminates when the induction variable is greater than or equal to
-    :code:`upperBound`. By default, signed comparison is used between the 
-    upperBound and the induction variable. To use unsigned comparison instead, 
+    :code:`upperBound`. By default, signed comparison is used between the
+    upperBound and the induction variable. To use unsigned comparison instead,
     specify the optional :code:`unsigned` unit attribute.
 
     The body of the loop must be terminated by a :ref:`op-cuda_tile.continue` that yields

@@ -1,5 +1,4 @@
 # RUN: %PYTHON -m pytest %s
-
 """
 Tests direct Python bindings to CudaTile's C API.
 """
@@ -101,28 +100,28 @@ def test_invalid_tensor_view_type():
     with Context() as ctx:
         register_dialect(ctx, load=True)
         with pytest.raises(
-            ValueError,
-            match="expected strictly positive value for tensor_view dimension, got -5",
+                ValueError,
+                match="expected strictly positive value for tensor_view dimension, got -5",
         ):
             TensorViewType.get(T.i32(), [-5, 32], [32, 1])
 
         with pytest.raises(
-            ValueError,
-            match="expected strictly positive value for tensor_view dimension, got 0",
+                ValueError,
+                match="expected strictly positive value for tensor_view dimension, got 0",
         ):
             TensorViewType.get(T.i32(), [32, 32], [32, 0])
 
         # Ensure kDynamic is not treated as such from Python.
         with pytest.raises(
-            ValueError,
-            match="expected strictly positive value for tensor_view dimension, got -9223372036854775808",
+                ValueError,
+                match="expected strictly positive value for tensor_view dimension, got -9223372036854775808",
         ):
             TensorViewType.get(T.i32(), [-9223372036854775808, 32], [32, 1])
 
         # Ensure kDynamic is not treated as such from Python.
         with pytest.raises(
-            ValueError,
-            match="expected strictly positive value for tensor_view dimension, got -9223372036854775808",
+                ValueError,
+                match="expected strictly positive value for tensor_view dimension, got -9223372036854775808",
         ):
             TensorViewType.get(T.i32(), [32, 32], [-9223372036854775808, 1])
 
@@ -276,8 +275,7 @@ def test_write_tile_ir_bytecode():
 
         # Create a simple cuda_tile module.
         with Location.unknown(ctx):
-            mlir_module = Module.parse(
-                """
+            mlir_module = Module.parse("""
                 module {
                     cuda_tile.module @test_module {
                         cuda_tile.entry @test_entry() {
@@ -285,8 +283,7 @@ def test_write_tile_ir_bytecode():
                         }
                     }
                 }
-            """
-            )
+            """)
 
         # Test writing to a temporary file.
         with tempfile.NamedTemporaryFile(mode="wb", delete=False) as f:
@@ -307,8 +304,7 @@ def test_write_tile_ir_bytecode_with_nested_module():
 
         # Create a module with nested cuda_tile.module.
         with Location.unknown(ctx):
-            mlir_module = Module.parse(
-                """
+            mlir_module = Module.parse("""
                 module {
                     cuda_tile.module @nested_test {
                         cuda_tile.entry @entry_func() {
@@ -316,8 +312,7 @@ def test_write_tile_ir_bytecode_with_nested_module():
                         }
                     }
                 }
-            """
-            )
+            """)
 
         with tempfile.NamedTemporaryFile(mode="wb", delete=False) as f:
             temp_filename = f.name
@@ -335,12 +330,10 @@ def test_write_tile_ir_bytecode_invalid_module():
     with Context() as ctx:
         # Create a module without cuda_tile content.
         with Location.unknown(ctx):
-            mlir_module = Module.parse(
-                """
+            mlir_module = Module.parse("""
                 builtin.module {
                 }
-            """
-            )
+            """)
 
         with tempfile.NamedTemporaryFile(mode="wb", delete=False) as f:
             temp_filename = f.name

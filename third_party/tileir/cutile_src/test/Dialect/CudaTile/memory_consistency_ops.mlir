@@ -106,7 +106,7 @@ testing$func @store_with_mask(%arg0: !cuda_tile.tile<16x32xptr<f32>>, %arg1: !cu
 // CHECK-LABEL: load_ptr_tko_optional_token
 testing$func @load_ptr_tko_optional_token(%arg0: !cuda_tile.tile<16x32xptr<f32>>) {
   // CHECK: load_ptr_tko weak %{{.+}} : tile<16x32xptr<f32>> -> tile<16x32xf32>, token
-  %0, %t = load_ptr_tko weak %arg0  
+  %0, %t = load_ptr_tko weak %arg0
     : tile<16x32xptr<f32>> -> tile<16x32xf32>, token
 }
 
@@ -116,11 +116,11 @@ testing$func @tiled_view_load(%arg0: !cuda_tile.partition_view<tile=(1024x1024x8
   // CHECK: %{{.+}}, %{{.+}} = load_view_tko weak %{{.+}}[%{{.+}}, %{{.+}}, %{{.+}}] token = %{{.+}} : partition_view<tile=(1024x1024x8), tensor_view<8192x8192x64xf32, strides=[524288,64,1]>>, tile<i32>
   // CHECK-SAME:  -> tile<1024x1024x8xf32>, token
   %tile_2, %tok_out = load_view_tko weak %arg0[%0, %0, %0] token = %arg1 : partition_view<tile=(1024x1024x8), tensor_view<8192x8192x64xf32, strides=[524288,64,1]>>, tile<i32> -> tile<1024x1024x8xf32>, token
-  
+
   // CHECK: %{{.+}}, %{{.+}} = load_view_tko weak %{{.+}}[%{{.+}}, %{{.+}}, %{{.+}}] : partition_view<tile=(1024x1024x8), tensor_view<8192x8192x64xf32, strides=[524288,64,1]>>, tile<i32>
   // CHECK-SAME:  -> tile<1024x1024x8xf32>, token
   %tile_3, %tok_out_1 = load_view_tko weak %arg0[%0, %0, %0] : partition_view<tile=(1024x1024x8), tensor_view<8192x8192x64xf32, strides=[524288,64,1]>>, tile<i32> -> tile<1024x1024x8xf32>, token
-  
+
   // CHECK: %{{.+}}, %{{.+}} = load_view_tko relaxed device %{{.+}}[%{{.+}}, %{{.+}}, %{{.+}}] token = %{{.+}}: partition_view<tile=(1024x1024x8), tensor_view<8192x8192x64xf32, strides=[524288,64,1]>>, tile<i32>
   // CHECK-SAME: -> tile<1024x1024x8xf32>, token
   %tile_4, %tok_out_2 = load_view_tko relaxed device %arg0[%0, %0, %0] token = %arg1 : partition_view<tile=(1024x1024x8), tensor_view<8192x8192x64xf32, strides=[524288,64,1]>>, tile<i32> -> tile<1024x1024x8xf32>, token
@@ -132,10 +132,10 @@ testing$func @tiled_view_store(%arg0: !cuda_tile.tile<8xf32>, %arg1: !cuda_tile.
   %0 = constant <i32: 0> : !cuda_tile.tile<i32>
   // CHECK: %{{.+}} = store_view_tko weak %{{.+}}, %{{.+}}[%{{.+}}] : tile<8xf32>, partition_view<tile=(8), tensor_view<128xf32, strides=[1]>>, tile<i32> -> token
   %1 = store_view_tko weak %arg0, %arg1[%0] : tile<8xf32>, partition_view<tile=(8), tensor_view<128xf32, strides=[1]>>, tile<i32> -> token
-  
+
   // CHECK-NEXT: %{{.+}} = store_view_tko weak %{{.+}}, %{{.+}}[%{{.+}}] token = %{{.+}} : tile<8xf32>, partition_view<tile=(8), tensor_view<128xf32, strides=[1]>>, tile<i32> -> token
   %2 = store_view_tko weak %arg0, %arg1[%0] token = %token : tile<8xf32>, partition_view<tile=(8), tensor_view<128xf32, strides=[1]>>, tile<i32> -> token
-  
+
   // CHECK-NEXT: %{{.+}} = store_view_tko relaxed device %{{.+}}, %{{.+}}[%{{.+}}] token = %{{.+}} : tile<8xf32>, partition_view<tile=(8), tensor_view<128xf32, strides=[1]>>, tile<i32> -> token
   %3 = store_view_tko relaxed device %arg0, %arg1[%0] token = %token : tile<8xf32>, partition_view<tile=(8), tensor_view<128xf32, strides=[1]>>, tile<i32> -> token
   return

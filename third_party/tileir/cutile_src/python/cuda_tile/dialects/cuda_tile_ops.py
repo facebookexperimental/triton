@@ -18,7 +18,6 @@ from . import _cuda_tile_enum_gen as _cuda_tile_enum
 from . import _cuda_tile_ops_gen as _cuda_tile
 from .._mlir_libs import _cuda_tile as _cuda_tile_capi
 
-
 # =============================================================================
 # Minimal Element Type Wrappers (for MmaDescriptor and make_tile_type)
 # =============================================================================
@@ -106,7 +105,6 @@ def _infer_mlir_type_from_python(value):
 # End Element Type Wrappers
 # =============================================================================
 
-
 # Global imports
 from itertools import chain
 from functools import wraps as _wraps, partialmethod
@@ -125,7 +123,6 @@ from typing import (
 from numbers import Number
 from enum import Enum
 from abc import ABC, abstractmethod
-
 
 # =============================================================================
 # Types
@@ -269,9 +266,7 @@ class ComparisonOrdering(Enum):
     UNORDERED = "unordered"
 
 
-def get_atomic_rmw_mode_attr(
-    mode: AtomicRMWMode, context: Optional[Context] = None
-) -> AtomicRMWModeAttr:
+def get_atomic_rmw_mode_attr(mode: AtomicRMWMode, context: Optional[Context] = None) -> AtomicRMWModeAttr:
     """
     Convert an enum value to the corresponding AtomicRMWModeAttr.
 
@@ -287,9 +282,7 @@ def get_atomic_rmw_mode_attr(
     return AtomicRMWModeAttr.get(mode.value, context)
 
 
-def get_memory_scope_attr(
-    scope: MemoryScope, context: Optional[Context] = None
-) -> MemoryScopeAttr:
+def get_memory_scope_attr(scope: MemoryScope, context: Optional[Context] = None) -> MemoryScopeAttr:
     """
     Convert an enum value to the corresponding MemoryScopeAttr.
 
@@ -305,18 +298,15 @@ def get_memory_scope_attr(
     return MemoryScopeAttr.get(scope.value, context)
 
 
-def get_padding_value_attr(
-    padding_value: PaddingValue, context: Optional[Context] = None
-) -> PaddingValueAttr:
+def get_padding_value_attr(padding_value: PaddingValue, context: Optional[Context] = None) -> PaddingValueAttr:
     """
     Convert an enum value to the corresponding PaddingValueAttr.
     """
     return PaddingValueAttr.get(padding_value.value, context)
 
 
-def get_memory_ordering_semantics_attr(
-    semantics: MemoryOrderingSemantics, context: Optional[Context] = None
-) -> MemoryOrderingSemanticsAttr:
+def get_memory_ordering_semantics_attr(semantics: MemoryOrderingSemantics,
+                                       context: Optional[Context] = None) -> MemoryOrderingSemanticsAttr:
     """
     Convert an enum value to the corresponding MemoryOrderingSemanticsAttr.
 
@@ -332,9 +322,7 @@ def get_memory_ordering_semantics_attr(
     return MemoryOrderingSemanticsAttr.get(semantics.value, context)
 
 
-def get_rounding_mode_attr(
-    mode: RoundingMode, context: Optional[Context] = None
-) -> RoundingModeAttr:
+def get_rounding_mode_attr(mode: RoundingMode, context: Optional[Context] = None) -> RoundingModeAttr:
     """
     Convert an enum value to the corresponding RoundingModeAttr.
 
@@ -351,9 +339,7 @@ def get_rounding_mode_attr(
     return RoundingModeAttr.get(mode.value, context)
 
 
-def get_integer_overflow_attr(
-    overflow: IntegerOverflow, context: Optional[Context] = None
-) -> IntegerOverflowAttr:
+def get_integer_overflow_attr(overflow: IntegerOverflow, context: Optional[Context] = None) -> IntegerOverflowAttr:
     """
     Convert an enum value to the corresponding IntegerOverflowAttr.
     """
@@ -361,9 +347,8 @@ def get_integer_overflow_attr(
     return IntegerOverflowAttr.get(overflow.value, context)
 
 
-def get_comparison_predicate_attr(
-    predicate: ComparisonPredicates, context: Optional[Context] = None
-) -> ComparisonPredicateAttr:
+def get_comparison_predicate_attr(predicate: ComparisonPredicates,
+                                  context: Optional[Context] = None) -> ComparisonPredicateAttr:
     """
     Convert an enum value to the corresponding ComparisonPredicateAttr.
     """
@@ -373,9 +358,7 @@ def get_comparison_predicate_attr(
     return ComparisonPredicateAttr.get(predicate.value, context)
 
 
-def get_signedness_attr(
-    signedness: Signedness, context: Optional[Context] = None
-) -> SignednessAttr:
+def get_signedness_attr(signedness: Signedness, context: Optional[Context] = None) -> SignednessAttr:
     """
     Convert an enum value to the corresponding SignednessAttr.
     """
@@ -385,9 +368,8 @@ def get_signedness_attr(
     return SignednessAttr.get(signedness.value, context)
 
 
-def get_comparison_ordering_attr(
-    ordering: ComparisonOrdering, context: Optional[Context] = None
-) -> ComparisonOrderingAttr:
+def get_comparison_ordering_attr(ordering: ComparisonOrdering,
+                                 context: Optional[Context] = None) -> ComparisonOrderingAttr:
     """
     Convert an enum value to the corresponding ComparisonOrderingAttr.
     """
@@ -432,11 +414,8 @@ class MMAConfig:
         lhs_mlir_type_expected = _get_mlir_type(self.lhs_dtype)
         rhs_mlir_type_expected = _get_mlir_type(self.rhs_dtype)
         acc_mlir_type_expected = _get_mlir_type(self.acc_dtype)
-        return (
-            lhs_mlir_type_expected == lhs_mlir_type
-            and rhs_mlir_type_expected == rhs_mlir_type
-            and acc_mlir_type_expected == acc_mlir_type
-        )
+        return (lhs_mlir_type_expected == lhs_mlir_type and rhs_mlir_type_expected == rhs_mlir_type
+                and acc_mlir_type_expected == acc_mlir_type)
 
 
 # Concrete MMA Configuration Classes
@@ -657,18 +636,12 @@ def _comparison_op(
 
     rhs = _check_is_rhs_tile(lhs, rhs)
 
-    if isinstance(lhs.element_type, _ods_ir.IntegerType) and isinstance(
-        rhs.element_type, _ods_ir.IntegerType
-    ):
+    if isinstance(lhs.element_type, _ods_ir.IntegerType) and isinstance(rhs.element_type, _ods_ir.IntegerType):
         return cmpi(comparison_predicate, lhs, rhs, signedness)
-    elif isinstance(lhs.element_type, _ods_ir.FloatType) and isinstance(
-        rhs.element_type, _ods_ir.FloatType
-    ):
+    elif isinstance(lhs.element_type, _ods_ir.FloatType) and isinstance(rhs.element_type, _ods_ir.FloatType):
         return cmpf(comparison_predicate, ordering, lhs, rhs)
     else:
-        raise TypeError(
-            f"Unsupported element types: {lhs.element_type}, {rhs.element_type}"
-        )
+        raise TypeError(f"Unsupported element types: {lhs.element_type}, {rhs.element_type}")
 
 
 class Tile(_ods_ir.Value):
@@ -705,9 +678,7 @@ class Tile(_ods_ir.Value):
         return self.value
 
     def __repr__(self):
-        shape_str = "x".join(
-            map(str, chain(self.tile_type.shape, (self.tile_type.element_type,)))
-        )
+        shape_str = "x".join(map(str, chain(self.tile_type.shape, (self.tile_type.element_type, ))))
         return f"cuda_tile.Tile({shape_str})"
 
     def __abs__(self):
@@ -735,9 +706,7 @@ class Tile(_ods_ir.Value):
             return negi(self)
         if isinstance(self.element_type, _ods_ir.FloatType):
             return negf(self)
-        raise TypeError(
-            "Cannot perform neg on non-numeric element type ", self.element_type
-        )
+        raise TypeError("Cannot perform neg on non-numeric element type ", self.element_type)
 
     def __radd__(self, rhs):
         return add(self, rhs)
@@ -982,9 +951,7 @@ def cuda_tile_op(opFunc):
         loc = kwargs.pop("loc", None)
         if loc is None:
             frame = _inspect.currentframe().f_back
-            file_loc = _ods_ir.Location.file(
-                frame.f_code.co_filename, frame.f_lineno, 0
-            )
+            file_loc = _ods_ir.Location.file(frame.f_code.co_filename, frame.f_lineno, 0)
             loc = _ods_ir.Location.name(frame.f_code.co_name, childLoc=file_loc)
         res_or_list = opFunc(*args, **kwargs, loc=loc)
         return res_or_list
@@ -999,17 +966,10 @@ def _index_list_to_tiles(index: List[Tile | int]) -> List[Tile]:
     """
 
     dynamic_indices = filter(lambda x: isinstance(x, Tile), index)
-    index_type = next(
-        map(lambda x: x.tile_type, dynamic_indices), make_tile_type(Int64, [])
-    )
+    index_type = next(map(lambda x: x.tile_type, dynamic_indices), make_tile_type(Int64, []))
 
-    if (
-        not isinstance(index_type.element_type, _ods_ir.IntegerType)
-        or len(index_type.shape) != 0
-    ):
-        raise ValueError(
-            f"Expected index values to be scalar integer tiles, got {index_type}"
-        )
+    if (not isinstance(index_type.element_type, _ods_ir.IntegerType) or len(index_type.shape) != 0):
+        raise ValueError(f"Expected index values to be scalar integer tiles, got {index_type}")
 
     index_type_bitwidth = index_type.element_type.width
 
@@ -1017,24 +977,18 @@ def _index_list_to_tiles(index: List[Tile | int]) -> List[Tile]:
     for i, v in enumerate(index):
         if isinstance(v, Tile):
             if v.tile_type != index_type:
-                raise TypeError(
-                    f"Expected indices of type {index_type}, "
-                    f"got index {i} of type {v.tile_type}"
-                )
+                raise TypeError(f"Expected indices of type {index_type}, "
+                                f"got index {i} of type {v.tile_type}")
             index_tiles.append(v)
         else:
             if v.bit_length() > index_type_bitwidth:
-                raise ValueError(
-                    f"Constant index value {v} is too large for index type {index_type}"
-                )
+                raise ValueError(f"Constant index value {v} is too large for index type {index_type}")
             index_tiles.append(constant(v, tile_type=index_type))
 
     return index_tiles
 
 
-def return_results(
-    op,
-) -> Union[Tile, Tuple[Tile, ...], Tuple[Tile, Token], Token]:
+def return_results(op, ) -> Union[Tile, Tuple[Tile, ...], Tuple[Tile, Token], Token]:
     """
     Return op results as Tile(s), Token, or (Tile, Token) depending on context.
 
@@ -1108,9 +1062,7 @@ def _ensure_attr(value, type):
         if isinstance(type, _ods_ir.FloatType):
             return _ods_ir.FloatAttr.get(type, value)
         else:
-            assert isinstance(
-                type, _ods_ir.IntegerType
-            ), "expected integer or float type"
+            assert isinstance(type, _ods_ir.IntegerType), "expected integer or float type"
             return _ods_ir.IntegerAttr.get(type, value)
 
 
@@ -1121,9 +1073,7 @@ class _ConstantOp(_cuda_tile.ConstantOp):
     def __init__(self, ty, values, *, loc=None, ip=None):
         assert isinstance(ty, TileType), "expected tile type"
         el_ty = ty.element_type
-        assert isinstance(
-            el_ty, (_ods_ir.FloatType, _ods_ir.IntegerType)
-        ), "expected integer or float element type"
+        assert isinstance(el_ty, (_ods_ir.FloatType, _ods_ir.IntegerType)), "expected integer or float element type"
         attrs = [_ensure_attr(v, el_ty) for v in values]
         super().__init__(_ods_ir.DenseElementsAttr.get(attrs, ty), loc=loc, ip=ip)
 
@@ -1135,13 +1085,9 @@ class _GlobalOp(_cuda_tile.GlobalOp):
     def __init__(self, ty, sym_name, values, *, loc=None, ip=None):
         assert isinstance(ty, TileType), "expected tile type"
         el_ty = ty.element_type
-        assert isinstance(
-            el_ty, (_ods_ir.FloatType, _ods_ir.IntegerType)
-        ), "expected integer or float element type"
+        assert isinstance(el_ty, (_ods_ir.FloatType, _ods_ir.IntegerType)), "expected integer or float element type"
         attrs = [_ensure_attr(v, el_ty) for v in values]
-        super().__init__(
-            sym_name, _ods_ir.DenseElementsAttr.get(attrs, ty), loc=loc, ip=ip
-        )
+        super().__init__(sym_name, _ods_ir.DenseElementsAttr.get(attrs, ty), loc=loc, ip=ip)
 
 
 def make_tile_type(el_type, shape: Union[int, List[int]] = None) -> TileType:
@@ -1153,17 +1099,13 @@ def make_tile_type(el_type, shape: Union[int, List[int]] = None) -> TileType:
     """
     shape = [shape] if isinstance(shape, int) else shape if shape is not None else []
     if not all(isinstance(dim, int) and dim >= 0 for dim in shape):
-        raise ValueError(
-            f"Shape must be a non-negative int or list of non-negative ints, got {shape}"
-        )
+        raise ValueError(f"Shape must be a non-negative int or list of non-negative ints, got {shape}")
     mlir_type = _get_mlir_type(el_type)
     tile_type = TileType.get(shape, mlir_type)
 
     if tile_type is None:
         type_name = getattr(el_type, "__name__", type(el_type).__name__)
-        raise RuntimeError(
-            f"Error creating TileType with shape {shape} and element type {type_name}"
-        )
+        raise RuntimeError(f"Error creating TileType with shape {shape} and element type {type_name}")
 
     return tile_type
 
@@ -1184,23 +1126,17 @@ def make_tensor_view_type(
     strides = strides if strides is not None else []
 
     if not all(dim is None or (isinstance(dim, int) and dim >= 0) for dim in shape):
-        raise ValueError(
-            f"Shape must be a list of non-negative ints or None values, got {shape}"
-        )
+        raise ValueError(f"Shape must be a list of non-negative ints or None values, got {shape}")
     if not all(dim is None or (isinstance(dim, int) and dim >= 0) for dim in strides):
-        raise ValueError(
-            f"Strides must be a list of non-negative ints or None values, got {strides}"
-        )
+        raise ValueError(f"Strides must be a list of non-negative ints or None values, got {strides}")
 
     elem_mlir_type = _get_mlir_type(el_type)
     tensor_view_type = TensorViewType.get(elem_mlir_type, shape, strides)
 
     if tensor_view_type is None:
         type_name = getattr(el_type, "__name__", type(el_type).__name__)
-        raise RuntimeError(
-            f"Error creating TensorViewType with element type {type_name}, "
-            f"shape {shape}, strides {strides}"
-        )
+        raise RuntimeError(f"Error creating TensorViewType with element type {type_name}, "
+                           f"shape {shape}, strides {strides}")
 
     return tensor_view_type
 
@@ -1223,36 +1159,24 @@ def make_partition_view_type(
         raise TypeError(f"Expected tensor view type, got {tensor_view_type}")
 
     if not all(isinstance(dim, int) for dim in tile_shape):
-        raise TypeError(
-            f"Expected tile_shape to be an array of integers, got {tile_shape}"
-        )
+        raise TypeError(f"Expected tile_shape to be an array of integers, got {tile_shape}")
 
     tensor_view_shape = tensor_view_type.shape
     if len(tile_shape) != len(tensor_view_shape):
-        raise ValueError(
-            "Expected tile shape of same rank as tensor view, got tile shape"
-            f"{tile_shape} and tensor view shape {tensor_view_shape}"
-        )
+        raise ValueError("Expected tile shape of same rank as tensor view, got tile shape"
+                         f"{tile_shape} and tensor view shape {tensor_view_shape}")
 
     if set(dim_map) != set(range(len(tensor_view_shape))):
-        raise ValueError(
-            "Dim map should map exactly to the dimensions "
-            f"of the tensor view, got {dim_map}"
-        )
+        raise ValueError("Dim map should map exactly to the dimensions "
+                         f"of the tensor view, got {dim_map}")
 
-    padding_value_attr = (
-        get_padding_value_attr(padding_value) if padding_value else None
-    )
-    partition_view_type = PartitionViewType.get(
-        tile_shape, tensor_view_type, dim_map, padding_value_attr
-    )
+    padding_value_attr = (get_padding_value_attr(padding_value) if padding_value else None)
+    partition_view_type = PartitionViewType.get(tile_shape, tensor_view_type, dim_map, padding_value_attr)
 
     if partition_view_type is None:
-        raise RuntimeError(
-            f"Error creating PartitionViewType with element type {tensor_view_type}, "
-            f"tile_shape {tile_shape}, dim_map {dim_map} "
-            f"{'with padding value ' + str(padding_value) if padding_value else ''}"
-        )
+        raise RuntimeError(f"Error creating PartitionViewType with element type {tensor_view_type}, "
+                           f"tile_shape {tile_shape}, dim_map {dim_map} "
+                           f"{'with padding value ' + str(padding_value) if padding_value else ''}")
 
     return partition_view_type
 
@@ -1273,13 +1197,12 @@ def check_data_type_binary(tile_name, expected_type):
     """Decorator to check if the specified tile has the expected data type."""
 
     def decorator(func):
+
         @_wraps(func)
         def wrapper(lhs, rhs, *args, **kwargs):
             tile = lhs if tile_name == "lhs" else rhs
             if not isinstance(tile.element_type, expected_type):
-                raise TypeError(
-                    f"expected {tile_name} to have element type {expected_type}"
-                )
+                raise TypeError(f"expected {tile_name} to have element type {expected_type}")
             return func(lhs, rhs, *args, **kwargs)
 
         return wrapper
@@ -1291,12 +1214,11 @@ def check_data_type_unary(tile_name, expected_type):
     """Decorator to check if the specified tile has the expected data type."""
 
     def decorator(func):
+
         @_wraps(func)
         def wrapper(source, *args, **kwargs):
             if not isinstance(source.element_type, expected_type):
-                raise TypeError(
-                    f"expected {tile_name} to have element type {expected_type}"
-                )
+                raise TypeError(f"expected {tile_name} to have element type {expected_type}")
             return func(source, *args, **kwargs)
 
         return wrapper
@@ -1339,21 +1261,15 @@ def broadcast(shape: List[int], source: Tile, *, loc=None, ip=None) -> Tile:
 def print_tko(str, args: Iterable[Tile], *, input_token=None, loc=None, ip=None):
     """Prints the provided string and arguments to the output."""
     if not all(isinstance(arg, Tile) for arg in args):
-        raise TypeError(
-            "All elements in 'args' must be of type Tile. Constexpr cannot be printed direclty."
-        )
-    return return_results(
-        _cuda_tile.PrintTkoOp(str, args, token=input_token, loc=loc, ip=ip)
-    )
+        raise TypeError("All elements in 'args' must be of type Tile. Constexpr cannot be printed direclty.")
+    return return_results(_cuda_tile.PrintTkoOp(str, args, token=input_token, loc=loc, ip=ip))
 
 
 @cuda_tile_op
 def printf(str, args: Iterable[Tile], *, loc=None, ip=None):
     """Prints the provided string and arguments to the output."""
     if not all(isinstance(arg, Tile) for arg in args):
-        raise TypeError(
-            "All elements in 'args' must be of type Tile. Constexpr cannot be printed direclty."
-        )
+        raise TypeError("All elements in 'args' must be of type Tile. Constexpr cannot be printed direclty.")
     _cuda_tile.PrintOp(str, args, loc=loc, ip=ip)
 
 
@@ -1386,21 +1302,15 @@ def _check_is_rhs_tile(lhs: Tile, rhs: Tile):
         try:
             rhs_shape, _ = _flatten_constants(rhs)
         except AssertionError as e:
-            raise AssertionError(
-                f"can not promote irregular rhs list ({rhs}) to tile: {e}"
-            )
+            raise AssertionError(f"can not promote irregular rhs list ({rhs}) to tile: {e}")
         if rhs_shape != list(lhs.tile_type.shape):
-            raise ValueError(
-                f"rhs list shape {rhs_shape} does not match lhs tile shape {list(lhs.tile_type.shape)}"
-            )
+            raise ValueError(f"rhs list shape {rhs_shape} does not match lhs tile shape {list(lhs.tile_type.shape)}")
         return constant(rhs, tile_type=lhs.tile_type)
 
     if isinstance(rhs, Number):
         return constant([rhs], tile_type=lhs.tile_type)
 
-    raise TypeError(
-        f"rhs must be a cuda_tile.tile, list, or Python scalar, got {type(rhs).__name__}"
-    )
+    raise TypeError(f"rhs must be a cuda_tile.tile, list, or Python scalar, got {type(rhs).__name__}")
 
 
 @cuda_tile_op
@@ -1422,14 +1332,8 @@ def absf(source: Tile, *, loc=None, ip=None) -> Tile:
 @check_data_type_binary("lhs", _ods_ir.IntegerType)
 @check_data_type_binary("rhs", _ods_ir.IntegerType)
 @check_same_type
-def _addi(
-    lhs: Tile, rhs: Tile, *, overflow: IntegerOverflow, loc=None, ip=None
-) -> Tile:
-    return return_results(
-        _cuda_tile.AddIOp(
-            lhs, rhs, overflow=get_integer_overflow_attr(overflow), loc=loc, ip=ip
-        )
-    )
+def _addi(lhs: Tile, rhs: Tile, *, overflow: IntegerOverflow, loc=None, ip=None) -> Tile:
+    return return_results(_cuda_tile.AddIOp(lhs, rhs, overflow=get_integer_overflow_attr(overflow), loc=loc, ip=ip))
 
 
 @cuda_tile_op
@@ -1448,10 +1352,10 @@ def _addf(
 ) -> Tile:
 
     if rounding_mode not in [
-        RoundingMode.NEAREST_EVEN,
-        RoundingMode.ZERO,
-        RoundingMode.NEGATIVE_INF,
-        RoundingMode.POSITIVE_INF,
+            RoundingMode.NEAREST_EVEN,
+            RoundingMode.ZERO,
+            RoundingMode.NEGATIVE_INF,
+            RoundingMode.POSITIVE_INF,
     ]:
         raise ValueError(
             f"Invalid rounding mode for addf: {rounding_mode}, expected one of NEAREST_EVEN, ZERO, NEGATIVE_INF, POSITIVE_INF"
@@ -1465,8 +1369,7 @@ def _addf(
             rounding_mode=get_rounding_mode_attr(rounding_mode),
             loc=loc,
             ip=ip,
-        )
-    )
+        ))
 
 
 @cuda_tile_op
@@ -1487,10 +1390,10 @@ def fma(
 ) -> Tile:
 
     if rounding_mode not in [
-        RoundingMode.NEAREST_EVEN,
-        RoundingMode.ZERO,
-        RoundingMode.NEGATIVE_INF,
-        RoundingMode.POSITIVE_INF,
+            RoundingMode.NEAREST_EVEN,
+            RoundingMode.ZERO,
+            RoundingMode.NEGATIVE_INF,
+            RoundingMode.POSITIVE_INF,
     ]:
         raise ValueError(
             f"Invalid rounding mode for fma: {rounding_mode}, expected one of NEAREST_EVEN, ZERO, NEGATIVE_INF, POSITIVE_INF"
@@ -1505,8 +1408,7 @@ def fma(
             flush_to_zero=flush_to_zero,
             loc=loc,
             ip=ip,
-        )
-    )
+        ))
 
 
 @cuda_tile_op
@@ -1534,9 +1436,7 @@ def add(
     # Performs element-wise addition of two tiles.
     if isinstance(lhs.element_type, _ods_ir.IntegerType):
         if flush_to_zero:
-            raise Exception(
-                "flush_to_zero modifier can only be used with floating point tiles"
-            )
+            raise Exception("flush_to_zero modifier can only be used with floating point tiles")
         return _addi(lhs, rhs, overflow=overflow, loc=loc, ip=ip)
     elif isinstance(lhs.element_type, _ods_ir.FloatType):
         if overflow != IntegerOverflow.NONE:
@@ -1551,9 +1451,7 @@ def add(
         )
     elif PointerType.isinstance(lhs.element_type):
         if flush_to_zero:
-            raise Exception(
-                "flush_to_zero modifier can only be used with floating point tiles"
-            )
+            raise Exception("flush_to_zero modifier can only be used with floating point tiles")
         return _offset(lhs, rhs, loc=loc, ip=ip)
     else:
         raise TypeError("expected integer, float or pointer element type")
@@ -1582,6 +1480,7 @@ def assume_div_by(
     loc=None,
     ip=None,
 ) -> Tile:
+
     def _build_div_by_attr(divisor: int):
         # TODO: There are no Python bindings for cuda_tile.div_by, so we parse
         # the textual representation as a workaround.
@@ -1601,14 +1500,13 @@ def assume_div_by(
 
 @cuda_tile_op
 def assume_same_elements(value: Tile, group_size: List[int], loc=None, ip=None) -> Tile:
+
     def _build_same_elements_attr(group_size: List[int], rank: int):
         if len(group_size) != rank:
             raise TypeError("expected length of same_elements to match tile rank")
         # TODO: There are no Python bindings for cuda_tile.same_elements, so we
         # parse the textual representation as a workaround.
-        return _ods_ir.Attribute.parse(
-            f'#cuda_tile.same_elements<[{", ".join([str(x) for x in group_size])}]>'
-        )
+        return _ods_ir.Attribute.parse(f'#cuda_tile.same_elements<[{", ".join([str(x) for x in group_size])}]>')
 
     el_ty = value.element_type
     if not isinstance(el_ty, _ods_ir.IntegerType) and not PointerType.isinstance(el_ty):
@@ -1680,9 +1578,7 @@ def atomic_cas_tko(
 
     # Create the operation with or without the mask parameter
     if mask is None:
-        op = _cuda_tile.AtomicCASTkoOp(
-            sem_attr, scope_attr, pointers, cmp, val, token=input_token, loc=loc, ip=ip
-        )
+        op = _cuda_tile.AtomicCASTkoOp(sem_attr, scope_attr, pointers, cmp, val, token=input_token, loc=loc, ip=ip)
     else:
         op = _cuda_tile.AtomicCASTkoOp(
             sem_attr,
@@ -1745,9 +1641,8 @@ def atomic_rmw_tko(
     :rtype: Tile | Tuple[Tile, Token]
     """
 
-    assert isinstance(mode, AtomicRMWMode), (
-        "Expected mode to be an AtomicRMWMode enum value, got " + type(mode).__name__
-    )
+    assert isinstance(mode,
+                      AtomicRMWMode), ("Expected mode to be an AtomicRMWMode enum value, got " + type(mode).__name__)
 
     mode_attr = get_atomic_rmw_mode_attr(mode)
     sem_attr = get_memory_ordering_semantics_attr(memory_ordering_semantics)
@@ -1790,13 +1685,9 @@ def bitcast(el_type, src: Tile, *, loc=None, ip=None) -> Tile:
     from_width = src.element_type.width
     to_width = el_type.width
     if from_width != to_width:
-        raise TypeError(
-            f"mismatching bitwidth between {src.element_type} ({from_width}) "
-            f"and {result_type.element_type} ({to_width})"
-        )
-    return return_results(
-        _cuda_tile.BitcastOp(result=result_type, source=src, loc=loc, ip=ip)
-    )
+        raise TypeError(f"mismatching bitwidth between {src.element_type} ({from_width}) "
+                        f"and {result_type.element_type} ({to_width})")
+    return return_results(_cuda_tile.BitcastOp(result=result_type, source=src, loc=loc, ip=ip))
 
 
 @cuda_tile_op
@@ -1804,19 +1695,14 @@ def int_to_ptr(el_type, src: Tile, *, loc=None, ip=None) -> Tile:
     el_type = _get_mlir_type(el_type)
 
     # Ensure src is a tile with i64 element type
-    if not (
-        isinstance(src.element_type, _ods_ir.IntegerType)
-        and src.element_type.width == 64
-    ):
+    if not (isinstance(src.element_type, _ods_ir.IntegerType) and src.element_type.width == 64):
         raise TypeError("expected source to have i64 element type")
 
     to_is_ptr = PointerType.isinstance(el_type)
     result_type = TileType.get(src.shape, el_type)
     if not to_is_ptr:
         raise TypeError("expected destination type to be a tile of pointers")
-    return return_results(
-        _cuda_tile.IntToPtrOp(result=result_type, source=src, loc=loc, ip=ip)
-    )
+    return return_results(_cuda_tile.IntToPtrOp(result=result_type, source=src, loc=loc, ip=ip))
 
 
 @cuda_tile_op
@@ -1826,18 +1712,14 @@ def ptr_to_int(src: Tile, *, loc=None, ip=None) -> Tile:
     result_type = TileType.get(src.shape, i64)
     if not from_is_ptr:
         raise TypeError("expected tile of pointer source type")
-    return return_results(
-        _cuda_tile.PtrToIntOp(result=result_type, source=src, loc=loc, ip=ip)
-    )
+    return return_results(_cuda_tile.PtrToIntOp(result=result_type, source=src, loc=loc, ip=ip))
 
 
 @cuda_tile_op
 def ptr_to_ptr(el_type, src: Tile, *, loc=None, ip=None) -> Tile:
     el_type = _get_mlir_type(el_type)
     result_type = TileType.get(src.shape, el_type)
-    return return_results(
-        _cuda_tile.PtrToPtrOp(result=result_type, source=src, loc=loc, ip=ip)
-    )
+    return return_results(_cuda_tile.PtrToPtrOp(result=result_type, source=src, loc=loc, ip=ip))
 
 
 @cuda_tile_op
@@ -1905,14 +1787,12 @@ def exp2(
     ip=None,
 ) -> Tile:
     """Raises 2 to the power of source."""
-    return return_results(
-        _cuda_tile.Exp2Op(
-            source=source,
-            flush_to_zero=flush_to_zero,
-            loc=loc,
-            ip=ip,
-        )
-    )
+    return return_results(_cuda_tile.Exp2Op(
+        source=source,
+        flush_to_zero=flush_to_zero,
+        loc=loc,
+        ip=ip,
+    ))
 
 
 @cuda_tile_op
@@ -1937,13 +1817,12 @@ def divi(
     rounding_mode: RoundingMode = RoundingMode.ZERO,
 ) -> Tile:
     if rounding_mode not in [
-        RoundingMode.ZERO,
-        RoundingMode.NEGATIVE_INF,
-        RoundingMode.POSITIVE_INF,
+            RoundingMode.ZERO,
+            RoundingMode.NEGATIVE_INF,
+            RoundingMode.POSITIVE_INF,
     ]:
         raise ValueError(
-            f"Invalid rounding mode for divi: {rounding_mode}, expected one of ZERO, NEGATIVE_INF, or POSITIVE_INF"
-        )
+            f"Invalid rounding mode for divi: {rounding_mode}, expected one of ZERO, NEGATIVE_INF, or POSITIVE_INF")
     return return_results(
         _cuda_tile.DivIOp(
             lhs,
@@ -1952,8 +1831,7 @@ def divi(
             loc=loc,
             ip=ip,
             rounding=get_rounding_mode_attr(rounding_mode),
-        )
-    )
+        ))
 
 
 @cuda_tile_op
@@ -1972,12 +1850,12 @@ def divf(
 ) -> Tile:
 
     if rounding_mode not in [
-        RoundingMode.NEAREST_EVEN,
-        RoundingMode.ZERO,
-        RoundingMode.NEGATIVE_INF,
-        RoundingMode.POSITIVE_INF,
-        RoundingMode.APPROX,
-        RoundingMode.FULL,
+            RoundingMode.NEAREST_EVEN,
+            RoundingMode.ZERO,
+            RoundingMode.NEGATIVE_INF,
+            RoundingMode.POSITIVE_INF,
+            RoundingMode.APPROX,
+            RoundingMode.FULL,
     ]:
         raise ValueError(
             f"Invalid rounding mode for divf: {rounding_mode}, expected one of NEAREST_EVEN, ZERO, NEGATIVE_INF, POSITIVE_INF, APPROX, FULL"
@@ -1991,8 +1869,7 @@ def divf(
             flush_to_zero=flush_to_zero,
             loc=loc,
             ip=ip,
-        )
-    )
+        ))
 
 
 @cuda_tile_op
@@ -2011,9 +1888,7 @@ def div(
     """Performs element-wise division of two tiles."""
     if isinstance(lhs.element_type, _ods_ir.IntegerType):
         if flush_to_zero:
-            raise ValueError(
-                "flush_to_zero is only valid for floating-point operations"
-            )
+            raise ValueError("flush_to_zero is only valid for floating-point operations")
         if approx:
             raise ValueError("approx is only valid for floating-point operations")
         if full:
@@ -2052,8 +1927,7 @@ def remi(
             signedness=get_signedness_attr(signedness),
             loc=loc,
             ip=ip,
-        )
-    )
+        ))
 
 
 @cuda_tile_op
@@ -2109,10 +1983,10 @@ def _subf(
 ) -> Tile:
 
     if rounding_mode not in [
-        RoundingMode.NEAREST_EVEN,
-        RoundingMode.ZERO,
-        RoundingMode.NEGATIVE_INF,
-        RoundingMode.POSITIVE_INF,
+            RoundingMode.NEAREST_EVEN,
+            RoundingMode.ZERO,
+            RoundingMode.NEGATIVE_INF,
+            RoundingMode.POSITIVE_INF,
     ]:
         raise ValueError(
             f"Invalid rounding mode for subf: {rounding_mode}, expected one of NEAREST_EVEN, ZERO, NEGATIVE_INF, POSITIVE_INF"
@@ -2126,8 +2000,7 @@ def _subf(
             rounding_mode=get_rounding_mode_attr(rounding_mode),
             loc=loc,
             ip=ip,
-        )
-    )
+        ))
 
 
 @cuda_tile_op
@@ -2143,9 +2016,7 @@ def sub(
     """Performs element-wise subtraction of two tiles."""
     if isinstance(lhs.element_type, _ods_ir.IntegerType):
         if flush_to_zero:
-            raise Exception(
-                "flush_to_zero modifier can only be used with floating point tiles"
-            )
+            raise Exception("flush_to_zero modifier can only be used with floating point tiles")
         return _subi(lhs, rhs, loc=loc, ip=ip)
     elif isinstance(lhs.element_type, _ods_ir.FloatType):
         return _subf(
@@ -2181,10 +2052,8 @@ def cat(lhs: Tile, rhs: Tile, dim, *, loc=None, ip=None) -> Tile:
 
     for idx in range(rank):
         if idx != dim and lhs_shape[idx] != rhs_shape[idx]:
-            raise ValueError(
-                f"Expected lhs and rhs shapes to match at position {idx}, "
-                f"but got: {lhs_shape[idx]} and {rhs_shape[idx]}"
-            )
+            raise ValueError(f"Expected lhs and rhs shapes to match at position {idx}, "
+                             f"but got: {lhs_shape[idx]} and {rhs_shape[idx]}")
 
     # Compute result type.
     result_shape = lhs_shape
@@ -2192,9 +2061,7 @@ def cat(lhs: Tile, rhs: Tile, dim, *, loc=None, ip=None) -> Tile:
     result_type = TileType.get(result_shape, lhs.element_type)
 
     # Perform the concatenation operation
-    return return_results(
-        _cuda_tile.CatOp(result=result_type, lhs=lhs, rhs=rhs, dim=dim, loc=loc, ip=ip)
-    )
+    return return_results(_cuda_tile.CatOp(result=result_type, lhs=lhs, rhs=rhs, dim=dim, loc=loc, ip=ip))
 
 
 @cuda_tile_op
@@ -2226,23 +2093,15 @@ def mma(
     batched = int(lhs_rank == 3)
     if batched:
         if lhs.tile_type.shape[0] != rhs.tile_type.shape[0]:
-            raise ValueError(
-                "dim 0 of lhs and dim 0 of rhs (batch dimension) must match"
-            )
+            raise ValueError("dim 0 of lhs and dim 0 of rhs (batch dimension) must match")
         if lhs.tile_type.shape[0] != acc.tile_type.shape[0]:
-            raise ValueError(
-                "dim 0 of lhs and dim 0 of acc (batch dimension) must match"
-            )
+            raise ValueError("dim 0 of lhs and dim 0 of acc (batch dimension) must match")
     if lhs.tile_type.shape[batched + 1] != rhs.tile_type.shape[batched]:
-        raise ValueError(
-            f"dim {batched + 1} of lhs and dim {batched} of rhs must match"
-        )
+        raise ValueError(f"dim {batched + 1} of lhs and dim {batched} of rhs must match")
     if lhs.tile_type.shape[batched] != acc.tile_type.shape[batched]:
         raise ValueError(f"dim {batched} of lhs and dim {batched} of acc must match")
     if rhs.tile_type.shape[batched + 1] != acc.tile_type.shape[batched + 1]:
-        raise ValueError(
-            f"dim {batched + 1} of rhs and dim {batched + 1} of acc must match"
-        )
+        raise ValueError(f"dim {batched + 1} of rhs and dim {batched + 1} of acc must match")
 
     # Validate MMA element type combinations using registry
     lhs_element_type = lhs.element_type
@@ -2257,17 +2116,13 @@ def mma(
         supported_configs = get_supported_mma_configs()
         if supported_configs:
             config_descriptions = [config.name for config in supported_configs]
-            raise TypeError(
-                f"Unsupported MMA element type combination: "
-                f"{lhs_element_type} x {rhs_element_type} -> {acc_element_type}. "
-                f"Supported configurations: {', '.join(config_descriptions)}"
-            )
+            raise TypeError(f"Unsupported MMA element type combination: "
+                            f"{lhs_element_type} x {rhs_element_type} -> {acc_element_type}. "
+                            f"Supported configurations: {', '.join(config_descriptions)}")
         else:
             # Fallback error if configurations haven't been initialized yet
-            raise TypeError(
-                f"Unsupported MMA element type combination: "
-                f"{lhs_element_type} x {rhs_element_type} -> {acc_element_type}"
-            )
+            raise TypeError(f"Unsupported MMA element type combination: "
+                            f"{lhs_element_type} x {rhs_element_type} -> {acc_element_type}")
 
     if isinstance(acc.element_type, _ods_ir.IntegerType):
         return return_results(
@@ -2279,18 +2134,15 @@ def mma(
                 signedness_rhs=get_signedness_attr(signedness_rhs),
                 loc=loc,
                 ip=ip,
-            )
-        )
+            ))
     else:
-        return return_results(
-            _cuda_tile.MmaFOp(
-                lhs=lhs,
-                rhs=rhs,
-                acc=acc,
-                loc=loc,
-                ip=ip,
-            )
-        )
+        return return_results(_cuda_tile.MmaFOp(
+            lhs=lhs,
+            rhs=rhs,
+            acc=acc,
+            loc=loc,
+            ip=ip,
+        ))
 
 
 @cuda_tile_op
@@ -2299,11 +2151,7 @@ def extract(result, source, indices, *, loc=None, ip=None) -> Tile:
     if isinstance(result, TileType) is False:
         raise Exception("result type must be cuda_tile.TileType")
 
-    return return_results(
-        _cuda_tile.ExtractOp(
-            result=result, source=source, indices=indices, loc=loc, ip=ip
-        )
-    )
+    return return_results(_cuda_tile.ExtractOp(result=result, source=source, indices=indices, loc=loc, ip=ip))
 
 
 @cuda_tile_op
@@ -2321,22 +2169,17 @@ def get_num_tile_blocks(*, loc=None, ip=None) -> Tile:
 @cuda_tile_op
 def trunci(el_type, from_, *, loc=None, ip=None) -> Tile:
     """Truncates the source integer to the specified target type."""
-    if not isinstance(el_type, type) or not isinstance(
-        el_type.mlir_type, _ods_ir.IntegerType
-    ):
+    if not isinstance(el_type, type) or not isinstance(el_type.mlir_type, _ods_ir.IntegerType):
         raise TypeError(f"expected integer destination el_type, but got {el_type}")
     src_el_type = from_.tile_type.element_type
     if not isinstance(src_el_type, _ods_ir.IntegerType):
         raise TypeError(f"expected integer tile type for source, but got {src_el_type}")
     if src_el_type.width <= el_type.mlir_type.width:
         raise TypeError(
-            f"source type {src_el_type} has a bitwidth smaller than or equal to destination type {el_type.mlir_type}"
-        )
+            f"source type {src_el_type} has a bitwidth smaller than or equal to destination type {el_type.mlir_type}")
 
     result_type = make_tile_type(el_type, from_.tile_type.shape)
-    return return_results(
-        _cuda_tile.TruncIOp(to=result_type, from_=from_, loc=loc, ip=ip)
-    )
+    return return_results(_cuda_tile.TruncIOp(to=result_type, from_=from_, loc=loc, ip=ip))
 
 
 @cuda_tile_op
@@ -2407,10 +2250,7 @@ def load_ptr_tko(
     if mask is not None:
         if not isinstance(mask, Tile):
             raise ValueError("mask must be a Tile")
-        if not (
-            isinstance(mask.element_type, _ods_ir.IntegerType)
-            and mask.element_type.width == 1
-        ):
+        if not (isinstance(mask.element_type, _ods_ir.IntegerType) and mask.element_type.width == 1):
             raise ValueError("mask must have boolean element type")
         if mask.tile_type.shape != result.shape:
             raise ValueError("mask must have the same shape as the result")
@@ -2421,24 +2261,18 @@ def load_ptr_tko(
         if not isinstance(padding_value, Tile):
             raise ValueError("padding_value must be a Tile")
         if padding_value.element_type != result.element_type:
-            raise ValueError(
-                "padding_value must have the same element type as the result"
-            )
+            raise ValueError("padding_value must have the same element type as the result")
         if padding_value.tile_type.shape != result.shape:
             raise ValueError("padding_value must have the same shape as the result")
 
     if memory_ordering_semantics not in [
-        MemoryOrderingSemantics.RELAXED,
-        MemoryOrderingSemantics.ACQUIRE,
-        MemoryOrderingSemantics.WEAK,
+            MemoryOrderingSemantics.RELAXED,
+            MemoryOrderingSemantics.ACQUIRE,
+            MemoryOrderingSemantics.WEAK,
     ]:
-        raise ValueError(
-            "memory_ordering_semantics must be one of: relaxed, acquire, or weak"
-        )
+        raise ValueError("memory_ordering_semantics must be one of: relaxed, acquire, or weak")
 
-    memory_ordering_semantics_attr = get_memory_ordering_semantics_attr(
-        memory_ordering_semantics
-    )
+    memory_ordering_semantics_attr = get_memory_ordering_semantics_attr(memory_ordering_semantics)
 
     memory_scope_attr = None
     if memory_ordering_semantics != MemoryOrderingSemantics.WEAK:
@@ -2454,10 +2288,8 @@ def load_ptr_tko(
         )
     elif latency != None:
         # (arch == None) and hint values are specified
-        raise ValueError(
-            "Expected arch to be specified for OptimizationHint:"
-            f" latency = {latency}"
-        )
+        raise ValueError("Expected arch to be specified for OptimizationHint:"
+                         f" latency = {latency}")
 
     # Create the load_ptr_tko operation, which returns both a tile and a token
     result_token_type = TokenType.get()
@@ -2503,9 +2335,7 @@ def load_view_tko(
         raise TypeError(f"Expected a tile view, got {view}")
 
     if view.view_index_rank != len(indices):
-        raise ValueError(
-            f"Expected {view.view_index_rank} index values, got {len(indices)}"
-        )
+        raise ValueError(f"Expected {view.view_index_rank} index values, got {len(indices)}")
 
     if input_token is not None:
         if not isinstance(input_token, Token):
@@ -2513,19 +2343,14 @@ def load_view_tko(
 
     # Add memory ordering semantics validation aligned with C++ implementation
     if memory_ordering_semantics not in [
-        MemoryOrderingSemantics.WEAK,
-        MemoryOrderingSemantics.RELAXED,
-        MemoryOrderingSemantics.ACQUIRE,
+            MemoryOrderingSemantics.WEAK,
+            MemoryOrderingSemantics.RELAXED,
+            MemoryOrderingSemantics.ACQUIRE,
     ]:
-        raise ValueError(
-            "memory_ordering_semantics must be one of: weak, relaxed, or acquire"
-        )
+        raise ValueError("memory_ordering_semantics must be one of: weak, relaxed, or acquire")
 
     # Add memory scope validation aligned with C++ implementation
-    if (
-        memory_ordering_semantics == MemoryOrderingSemantics.WEAK
-        and memory_scope is not None
-    ):
+    if (memory_ordering_semantics == MemoryOrderingSemantics.WEAK and memory_scope is not None):
         raise ValueError("weak load must not have memory scope")
 
     index_tiles = _index_list_to_tiles(indices)
@@ -2547,10 +2372,8 @@ def load_view_tko(
         )
     elif (allow_tma != None) or (latency != None):
         # (arch == None) and hint values are specified
-        raise ValueError(
-            "Expected arch to be specified for OptimizationHint:"
-            f" allow_tma = {allow_tma}, latency = {latency}"
-        )
+        raise ValueError("Expected arch to be specified for OptimizationHint:"
+                         f" allow_tma = {allow_tma}, latency = {latency}")
 
     load_op = _cuda_tile.LoadViewTkoOp(
         tile=view.view_tile_type,
@@ -2585,33 +2408,24 @@ def permute(source: Tile, permutation, *, loc=None, ip=None) -> Tile:
     # Verify permutation.
     permutation_sz = len(permutation)
     if permutation_sz != rank:
-        raise Exception(
-            f"expected permutation size {permutation_sz} to equal the rank of the source {rank}"
-        )
+        raise Exception(f"expected permutation size {permutation_sz} to equal the rank of the source {rank}")
     if len(tuple(set(permutation))) != rank:
         raise Exception(f"expected permutation elements {permutation} to be unique")
     for idx, perm in enumerate(permutation):
         if perm < 0 or perm >= rank:
-            raise Exception(
-                f"permutation element at index {idx} '{perm}' is out of bounds [0, {rank})"
-            )
+            raise Exception(f"permutation element at index {idx} '{perm}' is out of bounds [0, {rank})")
 
     # Compute result type and create op.
     result_shape = [src_shape[i] for i in permutation]
     result_type = TileType.get(result_shape, source.element_type)
     return return_results(
-        _cuda_tile.PermuteOp(
-            result=result_type, source=source, permutation=permutation, loc=loc, ip=ip
-        )
-    )
+        _cuda_tile.PermuteOp(result=result_type, source=source, permutation=permutation, loc=loc, ip=ip))
 
 
 @cuda_tile_op
 def reshape(shape: List[int], source: Tile, *, loc=None, ip=None) -> Tile:
     result_type = TileType.get(shape, source.element_type)
-    return return_results(
-        _cuda_tile.ReshapeOp(result=result_type, source=source, loc=loc, ip=ip)
-    )
+    return return_results(_cuda_tile.ReshapeOp(result=result_type, source=source, loc=loc, ip=ip))
 
 
 @cuda_tile_op
@@ -2699,36 +2513,27 @@ def store_ptr_tko(
     if mask is not None:
         if not isinstance(mask, Tile):
             raise ValueError("mask must be a Tile")
-        if not (
-            isinstance(mask.element_type, _ods_ir.IntegerType)
-            and mask.element_type.width == 1
-        ):
+        if not (isinstance(mask.element_type, _ods_ir.IntegerType) and mask.element_type.width == 1):
             raise ValueError("mask must have boolean element type")
         if mask.tile_type.shape != value.tile_type.shape:
             raise ValueError("mask must have the same shape as the value")
 
     if memory_ordering_semantics not in [
-        MemoryOrderingSemantics.RELAXED,
-        MemoryOrderingSemantics.RELEASE,
-        MemoryOrderingSemantics.WEAK,
+            MemoryOrderingSemantics.RELAXED,
+            MemoryOrderingSemantics.RELEASE,
+            MemoryOrderingSemantics.WEAK,
     ]:
-        raise ValueError(
-            "memory_ordering_semantics must be one of: relaxed, release, or weak"
-        )
+        raise ValueError("memory_ordering_semantics must be one of: relaxed, release, or weak")
 
-    memory_ordering_semantics_attr = get_memory_ordering_semantics_attr(
-        memory_ordering_semantics
-    )
+    memory_ordering_semantics_attr = get_memory_ordering_semantics_attr(memory_ordering_semantics)
 
     if memory_scope is not None:
         if memory_scope not in [
-            MemoryScope.DEVICE,
-            MemoryScope.SYS,
-            MemoryScope.TL_BLK,
+                MemoryScope.DEVICE,
+                MemoryScope.SYS,
+                MemoryScope.TL_BLK,
         ]:
-            raise ValueError(
-                "memory_ordering_semantics must be one of: device, sys and tl_blk"
-            )
+            raise ValueError("memory_ordering_semantics must be one of: device, sys and tl_blk")
         memory_scope_attr = get_memory_scope_attr(memory_scope)
     else:
         memory_scope_attr = None
@@ -2743,10 +2548,8 @@ def store_ptr_tko(
         )
     elif latency != None:
         # (arch == None) and hint values are specified
-        raise ValueError(
-            "Expected arch to be specified for OptimizationHint:"
-            f" latency = {latency}"
-        )
+        raise ValueError("Expected arch to be specified for OptimizationHint:"
+                         f" latency = {latency}")
 
     return return_results(
         _cuda_tile.StorePtrTkoOp(
@@ -2759,8 +2562,7 @@ def store_ptr_tko(
             optimization_hints=optimization_hints,
             loc=loc,
             ip=ip,
-        )
-    )
+        ))
 
 
 @cuda_tile_op
@@ -2784,9 +2586,7 @@ def store_view_tko(
         raise TypeError(f"Expected a tile view, got {view}")
 
     if tile.tile_type != view.view_tile_type:
-        raise TypeError(
-            f"Expected tile type to be {view.view_tile_type}, got {tile.tile_type}"
-        )
+        raise TypeError(f"Expected tile type to be {view.view_tile_type}, got {tile.tile_type}")
 
     if input_token is not None:
         if not isinstance(input_token, Token):
@@ -2794,26 +2594,19 @@ def store_view_tko(
 
     # Add memory ordering semantics validation aligned with C++ implementation
     if memory_ordering_semantics not in [
-        MemoryOrderingSemantics.WEAK,
-        MemoryOrderingSemantics.RELAXED,
-        MemoryOrderingSemantics.RELEASE,
+            MemoryOrderingSemantics.WEAK,
+            MemoryOrderingSemantics.RELAXED,
+            MemoryOrderingSemantics.RELEASE,
     ]:
-        raise ValueError(
-            "memory_ordering_semantics must be one of: weak, relaxed, or release"
-        )
+        raise ValueError("memory_ordering_semantics must be one of: weak, relaxed, or release")
 
     # Add memory scope validation aligned with C++ implementation
-    if (
-        memory_ordering_semantics == MemoryOrderingSemantics.WEAK
-        and memory_scope is not None
-    ):
+    if (memory_ordering_semantics == MemoryOrderingSemantics.WEAK and memory_scope is not None):
         raise ValueError("weak store must not have memory scope")
 
     # Add index count validation
     if view.view_index_rank != len(indices):
-        raise ValueError(
-            f"Expected {view.view_index_rank} index values, got {len(indices)}"
-        )
+        raise ValueError(f"Expected {view.view_index_rank} index values, got {len(indices)}")
 
     index_tiles = _index_list_to_tiles(indices)
     sem_attr = get_memory_ordering_semantics_attr(memory_ordering_semantics)
@@ -2831,10 +2624,8 @@ def store_view_tko(
         )
     elif (allow_tma != None) or (latency != None):
         # (arch == None) and hint values are specified
-        raise ValueError(
-            "Expected arch to be specified for OptimizationHint:"
-            f" allow_tma = {allow_tma}, latency = {latency}"
-        )
+        raise ValueError("Expected arch to be specified for OptimizationHint:"
+                         f" allow_tma = {allow_tma}, latency = {latency}")
 
     store_op = _cuda_tile.StoreViewTkoOp(
         memory_ordering_semantics=sem_attr,
@@ -2854,19 +2645,11 @@ def store_view_tko(
 def select(condition, trueval, falseval, *, loc=None, ip=None) -> Tile:
     if trueval.element_type != falseval.element_type:
         raise TypeError("trueval and falseval must have the same element type")
-    if (
-        not isinstance(condition.element_type, _ods_ir.IntegerType)
-        or condition.element_type.width != 1
-    ):
+    if (not isinstance(condition.element_type, _ods_ir.IntegerType) or condition.element_type.width != 1):
         raise TypeError("condition must have boolean element type")
-    if (
-        trueval.tile_type.shape != falseval.tile_type.shape
-        or condition.tile_type.shape != trueval.tile_type.shape
-    ):
+    if (trueval.tile_type.shape != falseval.tile_type.shape or condition.tile_type.shape != trueval.tile_type.shape):
         raise TypeError("trueval, falseval and condition must have the same shape")
-    return return_results(
-        _cuda_tile.SelectOp(condition, trueval, falseval, loc=loc, ip=ip)
-    )
+    return return_results(_cuda_tile.SelectOp(condition, trueval, falseval, loc=loc, ip=ip))
 
 
 @cuda_tile_op
@@ -2878,9 +2661,7 @@ def ftof(
     loc=None,
     ip=None,
 ) -> Tile:
-    if not isinstance(el_type, type) or not isinstance(
-        el_type.mlir_type, _ods_ir.FloatType
-    ):
+    if not isinstance(el_type, type) or not isinstance(el_type.mlir_type, _ods_ir.FloatType):
         raise TypeError(f"expected float destination el_type, but got {el_type}")
     src_el_type = from_.tile_type.element_type
     if not isinstance(src_el_type, _ods_ir.FloatType):
@@ -2890,9 +2671,7 @@ def ftof(
         raise TypeError(f"source and destination types are identical: {src_el_type}")
 
     if rounding_mode != RoundingMode.NEAREST_EVEN:
-        raise ValueError(
-            f"Invalid rounding mode for ftof: {rounding_mode}, expected NEAREST_EVEN"
-        )
+        raise ValueError(f"Invalid rounding mode for ftof: {rounding_mode}, expected NEAREST_EVEN")
     result_type = make_tile_type(el_type, from_.tile_type.shape)
     return return_results(
         _cuda_tile.FToFOp(
@@ -2901,20 +2680,13 @@ def ftof(
             rounding_mode=get_rounding_mode_attr(rounding_mode),
             loc=loc,
             ip=ip,
-        )
-    )
+        ))
 
 
 @cuda_tile_op
-def ftoi(
-    el_type, from_, *, signedness: Signedness = Signedness.SIGNED, loc=None, ip=None
-) -> Tile:
-    if not isinstance(el_type, type) or not isinstance(
-        el_type.mlir_type, _ods_ir.IntegerType
-    ):
-        raise TypeError(
-            f"expected integer destination el_type, but got {el_type.mlir_type}"
-        )
+def ftoi(el_type, from_, *, signedness: Signedness = Signedness.SIGNED, loc=None, ip=None) -> Tile:
+    if not isinstance(el_type, type) or not isinstance(el_type.mlir_type, _ods_ir.IntegerType):
+        raise TypeError(f"expected integer destination el_type, but got {el_type.mlir_type}")
     src_el_type = from_.tile_type.element_type
     if not isinstance(src_el_type, _ods_ir.FloatType):
         raise TypeError(f"expected float tile type for source, but got {src_el_type}")
@@ -2928,8 +2700,7 @@ def ftoi(
             rounding_mode=get_rounding_mode_attr(RoundingMode.NEAREST_INT_TO_ZERO),
             loc=loc,
             ip=ip,
-        )
-    )
+        ))
 
 
 @cuda_tile_op
@@ -2939,31 +2710,22 @@ def iota(n: int, el_type, *, loc=None, ip=None) -> Tile:
         raise TypeError(f"iota requires an integer element type, got {mlir_type}")
     bitwidth = mlir_type.width
     if n > (1 << bitwidth):
-        raise Exception(
-            f"the number of elements {n} exceeds the maximum value of {bitwidth}-bit integer"
-        )
-    result_type = make_tile_type(mlir_type, (n,))
+        raise Exception(f"the number of elements {n} exceeds the maximum value of {bitwidth}-bit integer")
+    result_type = make_tile_type(mlir_type, (n, ))
     return return_results(_cuda_tile.IotaOp(result=result_type, loc=loc, ip=ip))
 
 
 @cuda_tile_op
-def exti(
-    el_type, from_, *, signedness: Signedness = Signedness.SIGNED, loc=None, ip=None
-) -> Tile:
-    if not isinstance(el_type, type) or not isinstance(
-        el_type.mlir_type, _ods_ir.IntegerType
-    ):
-        raise TypeError(
-            f"expected integer destination el_type, but got {el_type.mlir_type}"
-        )
+def exti(el_type, from_, *, signedness: Signedness = Signedness.SIGNED, loc=None, ip=None) -> Tile:
+    if not isinstance(el_type, type) or not isinstance(el_type.mlir_type, _ods_ir.IntegerType):
+        raise TypeError(f"expected integer destination el_type, but got {el_type.mlir_type}")
     src_el_type = from_.tile_type.element_type
     if not isinstance(src_el_type, _ods_ir.IntegerType):
         raise TypeError(f"expected integer tile type for source, but got {src_el_type}")
 
     if src_el_type.width >= el_type.mlir_type.width:
         raise TypeError(
-            f"source type {src_el_type} has a bitwidth greater than or equal to destination type {el_type.mlir_type}"
-        )
+            f"source type {src_el_type} has a bitwidth greater than or equal to destination type {el_type.mlir_type}")
 
     result_type = make_tile_type(el_type, from_.tile_type.shape)
     return return_results(
@@ -2973,20 +2735,13 @@ def exti(
             signedness=get_signedness_attr(signedness),
             loc=loc,
             ip=ip,
-        )
-    )
+        ))
 
 
 @cuda_tile_op
-def itof(
-    el_type, from_, *, signedness: Signedness = Signedness.SIGNED, loc=None, ip=None
-):
-    if not isinstance(el_type, type) or not isinstance(
-        el_type.mlir_type, _ods_ir.FloatType
-    ):
-        raise TypeError(
-            f"expected float destination el_type, but got {el_type.mlir_type}"
-        )
+def itof(el_type, from_, *, signedness: Signedness = Signedness.SIGNED, loc=None, ip=None):
+    if not isinstance(el_type, type) or not isinstance(el_type.mlir_type, _ods_ir.FloatType):
+        raise TypeError(f"expected float destination el_type, but got {el_type.mlir_type}")
     src_el_type = from_.tile_type.element_type
     if not isinstance(src_el_type, _ods_ir.IntegerType):
         raise TypeError(f"expected integer tile type for source, but got {src_el_type}")
@@ -3000,8 +2755,7 @@ def itof(
             rounding_mode=get_rounding_mode_attr(RoundingMode.NEAREST_EVEN),
             loc=loc,
             ip=ip,
-        )
-    )
+        ))
 
 
 @cuda_tile_op
@@ -3074,10 +2828,10 @@ def _mulf(
 ) -> Tile:
 
     if rounding_mode not in [
-        RoundingMode.NEAREST_EVEN,
-        RoundingMode.ZERO,
-        RoundingMode.NEGATIVE_INF,
-        RoundingMode.POSITIVE_INF,
+            RoundingMode.NEAREST_EVEN,
+            RoundingMode.ZERO,
+            RoundingMode.NEGATIVE_INF,
+            RoundingMode.POSITIVE_INF,
     ]:
         raise ValueError(
             f"Invalid rounding mode for mulf: {rounding_mode}, expected one of NEAREST_EVEN, ZERO, NEGATIVE_INF, POSITIVE_INF"
@@ -3091,8 +2845,7 @@ def _mulf(
             rounding_mode=get_rounding_mode_attr(rounding_mode),
             loc=loc,
             ip=ip,
-        )
-    )
+        ))
 
 
 @cuda_tile_op
@@ -3104,9 +2857,7 @@ def mulhii(lhs: Tile, rhs: Tile, *, loc=None, ip=None) -> Tile:
     # Performs element-wise high-n bits of multiplication of two tiles.
     el_type = lhs.element_type
     if el_type.width not in [1, 8, 16, 32, 64]:
-        raise TypeError(
-            f"expected i1, i8, i16, i32, or i64 element types in rhs/lhs, but got ({el_type})"
-        )
+        raise TypeError(f"expected i1, i8, i16, i32, or i64 element types in rhs/lhs, but got ({el_type})")
     return return_results(_cuda_tile.MulhiIOp(lhs, rhs, loc=loc, ip=ip))
 
 
@@ -3123,9 +2874,7 @@ def mul(
     """Performs element-wise multiplication of two tiles."""
     if isinstance(lhs.element_type, _ods_ir.IntegerType):
         if flush_to_zero:
-            raise ValueError(
-                "flush_to_zero is only valid for floating-point operations"
-            )
+            raise ValueError("flush_to_zero is only valid for floating-point operations")
         return _muli(lhs, rhs, loc=loc, ip=ip)
     elif isinstance(lhs.element_type, _ods_ir.FloatType):
         return _mulf(
@@ -3174,9 +2923,7 @@ def loop_generate(
 
 
 @cuda_tile_op
-def loop_break(
-    operands: Union[Tile, Token, Iterable[Union[Tile, Token]]], *, loc=None, ip=None
-):
+def loop_break(operands: Union[Tile, Token, Iterable[Union[Tile, Token]]], *, loc=None, ip=None):
     # Normalize operands into an iterable
     if isinstance(operands, (Tile, Token)):
         operands = [operands]  # Wrap single Tile or Token in a list
@@ -3190,9 +2937,7 @@ def loop_break(
 
 
 @cuda_tile_op
-def loop_continue(
-    operands: Union[Tile, Token, Iterable[Union[Tile, Token]]], *, loc=None, ip=None
-):
+def loop_continue(operands: Union[Tile, Token, Iterable[Union[Tile, Token]]], *, loc=None, ip=None):
     # Normalize operands into an iterable
     if isinstance(operands, (Tile, Token)):
         operands = [operands]  # Wrap single Tile or Token in a list
@@ -3207,15 +2952,15 @@ def loop_continue(
 
 @cuda_tile_op
 def for_loop(
-    body: Callable,
-    lower_bound: int | Tile,
-    upper_bound: int | Tile,
-    step: int | Tile = 1,
-    init_values: Sequence[Tile] = (),
-    el_type=Int32,
-    *,
-    loc=None,
-    ip=None,
+        body: Callable,
+        lower_bound: int | Tile,
+        upper_bound: int | Tile,
+        step: int | Tile = 1,
+        init_values: Sequence[Tile] = (),
+        el_type=Int32,
+        *,
+        loc=None,
+        ip=None,
 ) -> Tuple[Tile, ...]:
     """
     Constructs a for loop with the provided body. The body is a function taking
@@ -3240,9 +2985,7 @@ def for_loop(
         elif isinstance(x, Tile) and x.element_type == index_type and len(x.shape) == 0:
             return x
         else:
-            raise TypeError(
-                f"For loop {name} must be an integer or a scalar {el_type} tile value, got {x}"
-            )
+            raise TypeError(f"For loop {name} must be an integer or a scalar {el_type} tile value, got {x}")
 
     lower_bound = check_scalar(lower_bound, "lower bound")
     upper_bound = check_scalar(upper_bound, "upper bound")
@@ -3259,7 +3002,7 @@ def for_loop(
         ip=ip,
     )
 
-    block_arg_types = list(chain((step.value.type,), iter_arg_types))
+    block_arg_types = list(chain((step.value.type, ), iter_arg_types))
     body_block = _ods_ir.Block.create_at_start(_for_op.region, block_arg_types)
     iteration_variables = (Tile(arg, arg.type) for arg in body_block.arguments)
     with _ods_ir.InsertionPoint(body_block):
@@ -3289,10 +3032,8 @@ def entry(
         )
     elif (num_cta != None) or (occupancy != None):
         # (arch == None) and hint values are specified
-        raise ValueError(
-            "Expected arch to be specified for OptimizationHint:"
-            f" num_cta = {num_cta}, occupancy = {occupancy}"
-        )
+        raise ValueError("Expected arch to be specified for OptimizationHint:"
+                         f" num_cta = {num_cta}, occupancy = {occupancy}")
     return _cuda_tile.EntryOp(
         sym_name=sym_name,
         function_type=function_type,
@@ -3319,6 +3060,7 @@ def make_tensor_view(
     loc=None,
     ip=None,
 ) -> TensorView:
+
     def tile_to_none(x):
         return None if isinstance(x, Tile) else x
 
@@ -3326,34 +3068,19 @@ def make_tensor_view(
     strides = strides or []
 
     def valid_dim(dim):
-        return (isinstance(dim, int) and dim >= 0) or (
-            isinstance(dim, Tile)
-            and dim.shape == []
-            and isinstance(dim.element_type, _ods_ir.IntegerType)
-        )
+        return (isinstance(dim, int) and dim >= 0) or (isinstance(dim, Tile) and dim.shape == []
+                                                       and isinstance(dim.element_type, _ods_ir.IntegerType))
 
     if not all(valid_dim(dim) for dim in shape):
-        raise ValueError(
-            f"Shape must be a list of non-negative ints or scalar integer tile values, got {shape}"
-        )
+        raise ValueError(f"Shape must be a list of non-negative ints or scalar integer tile values, got {shape}")
 
     if not all(valid_dim(dim) for dim in strides):
-        raise ValueError(
-            f"Strides must be a list of non-negative ints or scalar integer tile values, got {strides}"
-        )
+        raise ValueError(f"Strides must be a list of non-negative ints or scalar integer tile values, got {strides}")
 
-    if not (
-        isinstance(base_ptr, Tile)
-        and base_ptr.shape == []
-        and PointerType.isinstance(base_ptr.element_type)
-    ):
-        raise ValueError(
-            f"Base pointer must be a scalar tile of pointer, got {base_ptr}"
-        )
+    if not (isinstance(base_ptr, Tile) and base_ptr.shape == [] and PointerType.isinstance(base_ptr.element_type)):
+        raise ValueError(f"Base pointer must be a scalar tile of pointer, got {base_ptr}")
 
-    tensor_view_type = make_tensor_view_type(
-        el_type, list(map(tile_to_none, shape)), list(map(tile_to_none, strides))
-    )
+    tensor_view_type = make_tensor_view_type(el_type, list(map(tile_to_none, shape)), list(map(tile_to_none, strides)))
     dynamic_shape = list(filter(lambda x: not isinstance(x, int), shape))
     dynamic_strides = list(filter(lambda x: not isinstance(x, int), strides))
     return return_tensor_view(
@@ -3364,8 +3091,7 @@ def make_tensor_view(
             dynamicStrides=dynamic_strides,
             loc=loc,
             ip=ip,
-        )
-    )
+        ))
 
 
 @cuda_tile_op
@@ -3390,8 +3116,7 @@ def maxf(
             flush_to_zero=flush_to_zero,
             loc=loc,
             ip=ip,
-        )
-    )
+        ))
 
 
 @cuda_tile_op
@@ -3407,15 +3132,13 @@ def maxi(
     loc=None,
     ip=None,
 ) -> Tile:
-    return return_results(
-        _cuda_tile.MaxIOp(
-            lhs,
-            rhs,
-            get_signedness_attr(signedness),
-            loc=loc,
-            ip=ip,
-        )
-    )
+    return return_results(_cuda_tile.MaxIOp(
+        lhs,
+        rhs,
+        get_signedness_attr(signedness),
+        loc=loc,
+        ip=ip,
+    ))
 
 
 @cuda_tile_op
@@ -3431,9 +3154,7 @@ def max(
 ) -> Tile:
     if isinstance(lhs.element_type, _ods_ir.IntegerType):
         if propagate_nan or flush_to_zero:
-            raise Exception(
-                "nan modifier or flush_to_zero modifier can only be used with floating point tiles"
-            )
+            raise Exception("nan modifier or flush_to_zero modifier can only be used with floating point tiles")
         signedness = Signedness.SIGNED if not signedness else signedness
         return maxi(lhs=lhs, rhs=rhs, signedness=signedness, loc=loc, ip=ip)
 
@@ -3470,8 +3191,7 @@ def mini(
             signedness=get_signedness_attr(signedness),
             loc=loc,
             ip=ip,
-        )
-    )
+        ))
 
 
 @cuda_tile_op
@@ -3496,8 +3216,7 @@ def minf(
             flush_to_zero=flush_to_zero,
             loc=loc,
             ip=ip,
-        )
-    )
+        ))
 
 
 @cuda_tile_op
@@ -3514,8 +3233,7 @@ def min(
     if isinstance(lhs.element_type, _ods_ir.IntegerType):
         if propagate_nan or flush_to_zero:
             raise Exception(
-                "propagate_nan modifier or flush_to_zero modifier can only be used with floating point tiles"
-            )
+                "propagate_nan modifier or flush_to_zero modifier can only be used with floating point tiles")
         signedness = Signedness.SIGNED if not signedness else signedness
         return mini(lhs=lhs, rhs=rhs, signedness=signedness, loc=loc, ip=ip)
     elif isinstance(lhs.element_type, _ods_ir.FloatType):
@@ -3532,14 +3250,8 @@ def min(
 
 
 @cuda_tile_op
-def optimization_barrier(
-    value: Tile, keep_axis_info: bool = False, *, loc=None, ip=None
-) -> Tile:
-    return return_results(
-        _cuda_tile.OptimizationBarrierOp(
-            value, keep_axis_info=keep_axis_info, loc=loc, ip=ip
-        )
-    )
+def optimization_barrier(value: Tile, keep_axis_info: bool = False, *, loc=None, ip=None) -> Tile:
+    return return_results(_cuda_tile.OptimizationBarrierOp(value, keep_axis_info=keep_axis_info, loc=loc, ip=ip))
 
 
 # Helper function for both reduce and scan operations
@@ -3588,14 +3300,11 @@ def _prepare_aggregate_op(operand, dim, reverse, identities, operation_type):
 @cuda_tile_op
 def reduce(operand: Tile, dim, identities, reduce_body: Callable, *, loc=None, ip=None):
     # Prepare common components
-    result_type, dim_attr, _, identities_attr, bb_arg_ty, el_type = (
-        _prepare_aggregate_op(operand, dim, False, identities, "reduce")
-    )
+    result_type, dim_attr, _, identities_attr, bb_arg_ty, el_type = (_prepare_aggregate_op(
+        operand, dim, False, identities, "reduce"))
 
     # Create reduce operation
-    reduce_op = _cuda_tile.ReduceOp(
-        [result_type], [operand.value], dim_attr, identities_attr, loc=loc, ip=ip
-    )
+    reduce_op = _cuda_tile.ReduceOp([result_type], [operand.value], dim_attr, identities_attr, loc=loc, ip=ip)
 
     # Set up the block and body
     block = reduce_op.regions[0].blocks.append(bb_arg_ty, bb_arg_ty)
@@ -3613,13 +3322,10 @@ def reduce(operand: Tile, dim, identities, reduce_body: Callable, *, loc=None, i
 
 
 @cuda_tile_op
-def scan(
-    operand: Tile, dim, reverse, identities, scan_body: Callable, *, loc=None, ip=None
-):
+def scan(operand: Tile, dim, reverse, identities, scan_body: Callable, *, loc=None, ip=None):
     # Prepare common components
-    result_type, dim_attr, reverse_attr, identities_attr, bb_arg_ty, el_type = (
-        _prepare_aggregate_op(operand, dim, reverse, identities, "scan")
-    )
+    result_type, dim_attr, reverse_attr, identities_attr, bb_arg_ty, el_type = (_prepare_aggregate_op(
+        operand, dim, reverse, identities, "scan"))
 
     # Create scan operation
     scan_op = _cuda_tile.ScanOp(
@@ -3673,14 +3379,9 @@ def shli(lhs, rhs, *, loc=None, ip=None) -> Tile:
 @check_data_type_binary("lhs", _ods_ir.IntegerType)
 @check_data_type_binary("rhs", _ods_ir.IntegerType)
 @check_same_type
-def shri(
-    lhs, rhs, *, signedness: Signedness = Signedness.SIGNED, loc=None, ip=None
-) -> Tile:
+def shri(lhs, rhs, *, signedness: Signedness = Signedness.SIGNED, loc=None, ip=None) -> Tile:
     return return_results(
-        _cuda_tile.ShRIOp(
-            lhs=lhs, rhs=rhs, signedness=get_signedness_attr(signedness), loc=loc, ip=ip
-        )
-    )
+        _cuda_tile.ShRIOp(lhs=lhs, rhs=rhs, signedness=get_signedness_attr(signedness), loc=loc, ip=ip))
 
 
 @cuda_tile_op
@@ -3715,8 +3416,7 @@ def cmpf(
             rhs=rhs,
             loc=loc,
             ip=ip,
-        )
-    )
+        ))
 
 
 @cuda_tile_op
@@ -3739,8 +3439,7 @@ def cmpi(
             signedness=get_signedness_attr(signedness),
             loc=loc,
             ip=ip,
-        )
-    )
+        ))
 
 
 @cuda_tile_op
@@ -3757,9 +3456,7 @@ def cmp(
     """Performs element-wise comparison of two tiles."""
 
     if comparison_predicate not in ComparisonPredicates:
-        raise ValueError(
-            f"Invalid cuda_tile.cmpf 'comparison_predicate' argument: {comparison_predicate}"
-        )
+        raise ValueError(f"Invalid cuda_tile.cmpf 'comparison_predicate' argument: {comparison_predicate}")
 
     if lhs.tile_type.element_type != rhs.tile_type.element_type:
         raise ValueError("expected matching lhs/rhs tile types")
@@ -3767,9 +3464,7 @@ def cmp(
         raise ValueError("expected matching lhs/rhs tile shapes")
 
     if isinstance(lhs.element_type, _ods_ir.IntegerType):
-        return cmpi(
-            comparison_predicate, lhs, rhs, signedness=signedness, loc=loc, ip=ip
-        )
+        return cmpi(comparison_predicate, lhs, rhs, signedness=signedness, loc=loc, ip=ip)
     elif isinstance(lhs.element_type, _ods_ir.FloatType):
         return cmpf(
             comparison_predicate,
@@ -3798,8 +3493,7 @@ def floordivi(lhs, rhs, *, loc=None, ip=None) -> Tile:
             loc=loc,
             ip=ip,
             rounding=get_rounding_mode_attr(RoundingMode.NEGATIVE_INF),
-        )
-    )
+        ))
 
 
 def _flatten_constants(value):
@@ -3818,14 +3512,10 @@ def _flatten_constants(value):
             else:
                 shape.append(len(val))
                 if isinstance(val[0], list):
-                    assert all(
-                        isinstance(v, list) for v in val
-                    ), "inconsistent nesting level"
+                    assert all(isinstance(v, list) for v in val), "inconsistent nesting level"
                     compute_shape(val[0])
                 else:
-                    assert not any(
-                        isinstance(v, list) for v in val
-                    ), "inconsistent nesting level"
+                    assert not any(isinstance(v, list) for v in val), "inconsistent nesting level"
 
         compute_shape(value)
 
@@ -3841,9 +3531,7 @@ def _flatten_constants(value):
 
         flatten(value, 0)
     else:
-        assert isinstance(value, int) or isinstance(
-            value, float
-        ), "expected int or float"
+        assert isinstance(value, int) or isinstance(value, float), "expected int or float"
         flattened_values = [value]
     assert len(flattened_values) > 0, "empty tiles are not allowed"
     return shape, flattened_values
@@ -3854,9 +3542,7 @@ def _flatten_constants(value):
 @check_data_type_binary("lhs", _ods_ir.IntegerType)
 @check_data_type_binary("rhs", _ods_ir.IntegerType)
 @check_same_type
-def ceildivi(
-    lhs, rhs, *, signedness: Signedness = Signedness.SIGNED, loc=None, ip=None
-) -> Tile:
+def ceildivi(lhs, rhs, *, signedness: Signedness = Signedness.SIGNED, loc=None, ip=None) -> Tile:
     """Integer ceiling division operation."""
     return return_results(
         _cuda_tile.DivIOp(
@@ -3866,8 +3552,7 @@ def ceildivi(
             loc=loc,
             ip=ip,
             rounding=get_rounding_mode_attr(RoundingMode.POSITIVE_INF),
-        )
-    )
+        ))
 
 
 @cuda_tile_op
@@ -3878,9 +3563,7 @@ def ceil(source: Tile, *, loc=None, ip=None) -> Tile:
 
 
 @cuda_tile_op
-def constant(
-    value, el_type=None, tile_type: TileType = None, loc=None, ip=None
-) -> Tile:
+def constant(value, el_type=None, tile_type: TileType = None, loc=None, ip=None) -> Tile:
     """
     Helper function that builds a cuda_tile.constant op for the given value,
     which is either a scalar (integer/float) or a Python list. Nested lists
@@ -3912,9 +3595,7 @@ _cuda_tile.GlobalOp.counter = 0
 
 
 @cuda_tile_op
-def global_(
-    symbol_name, value, el_type=None, tile_type: TileType = None, loc=None, ip=None
-):
+def global_(symbol_name, value, el_type=None, tile_type: TileType = None, loc=None, ip=None):
     """
     Create a cuda_tile.global in the enclosing cuda_tile.module.
     """
@@ -3924,9 +3605,7 @@ def global_(
     current_op = current_ip.block.owner
     while current_op and current_op.name != "cuda_tile.module":
         current_op = current_op.parent
-    assert (
-        current_op and current_op.name == "cuda_tile.module"
-    ), "could not find enclosing module"
+    assert (current_op and current_op.name == "cuda_tile.module"), "could not find enclosing module"
 
     if tile_type is not None and isinstance(tile_type, TileType) is False:
         issue = f'tile_type must be "TileType" type but it is {tile_type}'
@@ -3960,15 +3639,11 @@ def get_global(global_op, loc=None, ip=None):
     tile_type = TileType.upcast_type(global_op.value.type)
     ptr_type = PointerType.get(tile_type.element_type)
     ptr_tile_ty = TileType.get([], ptr_type)
-    return return_results(
-        _cuda_tile.GetGlobalOp(ptr_tile_ty, global_op.sym_name.value, loc=loc, ip=ip)
-    )
+    return return_results(_cuda_tile.GetGlobalOp(ptr_tile_ty, global_op.sym_name.value, loc=loc, ip=ip))
 
 
 @cuda_tile_op
-def create_and_get_global(
-    value, el_type=None, tile_type: TileType = None, loc=None, ip=None
-):
+def create_and_get_global(value, el_type=None, tile_type: TileType = None, loc=None, ip=None):
     """
     Helper function that inserts a new cuda_tile.global in the enclosing module
     and a cuda_tile.get_global at the current insertion point.
@@ -3984,31 +3659,23 @@ def create_and_get_global(
 
 
 @cuda_tile_op
-def get_index_space_shape(
-    view: TileView, result_type=Int64, loc=None, ip=None
-) -> Tuple[Tile, ...]:
+def get_index_space_shape(view: TileView, result_type=Int64, loc=None, ip=None) -> Tuple[Tile, ...]:
     if not isinstance(view, TileView):
         raise TypeError(f"view must be a TileView")
 
     result_types = [make_tile_type(result_type, [])] * view.view_index_rank
 
-    return return_results(
-        _cuda_tile.GetIndexSpaceShapeOp(result_types, view, loc=loc, ip=ip)
-    )
+    return return_results(_cuda_tile.GetIndexSpaceShapeOp(result_types, view, loc=loc, ip=ip))
 
 
 @cuda_tile_op
-def get_tensor_shape(
-    view: TensorView, result_type=Int64, loc=None, ip=None
-) -> Tuple[Tile, ...]:
+def get_tensor_shape(view: TensorView, result_type=Int64, loc=None, ip=None) -> Tuple[Tile, ...]:
     if not isinstance(view, TensorView):
         raise TypeError(f"view must be a TensorView")
 
     result_types = [make_tile_type(result_type, [])] * len(view.shape)
 
-    return return_results(
-        _cuda_tile.GetTensorShapeOp(result_types, view, loc=loc, ip=ip)
-    )
+    return return_results(_cuda_tile.GetTensorShapeOp(result_types, view, loc=loc, ip=ip))
 
 
 @cuda_tile_op
@@ -4049,14 +3716,12 @@ def rsqrt(
     ip=None,
 ) -> Tile:
     """Compute the approximate reciprocal square root of source."""
-    return return_results(
-        _cuda_tile.RsqrtOp(
-            source=source,
-            flush_to_zero=flush_to_zero,
-            loc=loc,
-            ip=ip,
-        )
-    )
+    return return_results(_cuda_tile.RsqrtOp(
+        source=source,
+        flush_to_zero=flush_to_zero,
+        loc=loc,
+        ip=ip,
+    ))
 
 
 @cuda_tile_op
@@ -4072,11 +3737,11 @@ def sqrt(
     """Compute the square root of source."""
 
     if rounding_mode not in [
-        RoundingMode.NEAREST_EVEN,
-        RoundingMode.ZERO,
-        RoundingMode.NEGATIVE_INF,
-        RoundingMode.POSITIVE_INF,
-        RoundingMode.APPROX,
+            RoundingMode.NEAREST_EVEN,
+            RoundingMode.ZERO,
+            RoundingMode.NEGATIVE_INF,
+            RoundingMode.POSITIVE_INF,
+            RoundingMode.APPROX,
     ]:
         raise ValueError(
             f"Invalid rounding mode for sqrt: {rounding_mode}, expected one of NEAREST_EVEN, ZERO, NEGATIVE_INF, POSITIVE_INF, APPROX"
@@ -4089,8 +3754,7 @@ def sqrt(
             flush_to_zero=flush_to_zero,
             loc=loc,
             ip=ip,
-        )
-    )
+        ))
 
 
 @cuda_tile_op
@@ -4113,53 +3777,34 @@ def make_partition_view(
         raise TypeError(f"Expected TensorView, got {type(tensor_view).__name__}")
 
     if not isinstance(tile_shape, list) and not isinstance(tile_shape, tuple):
-        raise TypeError(
-            f"Expected tile_shape to be a list or tuple, got {type(tile_shape).__name__}"
-        )
+        raise TypeError(f"Expected tile_shape to be a list or tuple, got {type(tile_shape).__name__}")
 
     if not all(isinstance(dim, int) for dim in tile_shape):
-        raise TypeError(
-            f"Expected tile_shape to be an array of integers, got {tile_shape}"
-        )
+        raise TypeError(f"Expected tile_shape to be an array of integers, got {tile_shape}")
 
     if not all(dim > 0 for dim in tile_shape):
-        raise ValueError(
-            f"Expected tile_shape dimensions to be positive, got {tile_shape}"
-        )
+        raise ValueError(f"Expected tile_shape dimensions to be positive, got {tile_shape}")
 
     if len(tile_shape) != len(tensor_view.shape):
-        raise ValueError(
-            f"Expected tile shape of same rank as tensor view, got tile shape "
-            f"{tile_shape} and tensor view shape {tensor_view.shape}"
-        )
+        raise ValueError(f"Expected tile shape of same rank as tensor view, got tile shape "
+                         f"{tile_shape} and tensor view shape {tensor_view.shape}")
 
     if dim_map is not None:
         if not isinstance(dim_map, list) and not isinstance(dim_map, tuple):
-            raise TypeError(
-                f"Expected dim_map to be a list or tuple, got {type(dim_map).__name__}"
-            )
+            raise TypeError(f"Expected dim_map to be a list or tuple, got {type(dim_map).__name__}")
 
         if not all(isinstance(dim, int) for dim in dim_map):
-            raise TypeError(
-                f"Expected dim_map to be an array of integers, got {dim_map}"
-            )
+            raise TypeError(f"Expected dim_map to be an array of integers, got {dim_map}")
 
         if len(dim_map) != len(tile_shape):
             raise ValueError(
-                f"Expected dim_map length to match tile_shape length, got {len(dim_map)} vs {len(tile_shape)}"
-            )
+                f"Expected dim_map length to match tile_shape length, got {len(dim_map)} vs {len(tile_shape)}")
 
         if set(dim_map) != set(range(len(tensor_view.shape))):
-            raise ValueError(
-                f"Dim map should map exactly to the dimensions of the tensor view, got {dim_map}"
-            )
+            raise ValueError(f"Dim map should map exactly to the dimensions of the tensor view, got {dim_map}")
 
-    partition_view_type = make_partition_view_type(
-        tensor_view.tensor_view_type, tile_shape, dim_map, padding_value
-    )
-    return return_partition_view(
-        _cuda_tile.MakePartitionViewOp(partition_view_type, tensor_view, loc=loc, ip=ip)
-    )
+    partition_view_type = make_partition_view_type(tensor_view.tensor_view_type, tile_shape, dim_map, padding_value)
+    return return_partition_view(_cuda_tile.MakePartitionViewOp(partition_view_type, tensor_view, loc=loc, ip=ip))
 
 
 @cuda_tile_op
@@ -4281,5 +3926,3 @@ class TileIrGenerator:
         Prints the CUDA Tile IR module.
         """
         self.module.operation.print(enable_debug_info=enable_location)
-
-

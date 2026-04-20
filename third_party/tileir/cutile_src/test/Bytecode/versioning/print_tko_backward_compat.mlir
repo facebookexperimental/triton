@@ -40,4 +40,3 @@
 
 // Verify mmaf gets tile operands, not token operands.
 // CHECK: mmaf %{{.*}}, %{{.*}}, %{{.*}} : tile<256x256xf64>, tile<256x256xf64>, tile<256x256xf64>
-

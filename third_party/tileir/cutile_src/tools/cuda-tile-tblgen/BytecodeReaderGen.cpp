@@ -286,28 +286,28 @@ generateOperandDeserialization(const Operator &opDef, raw_ostream &os,
 
       if (isOptional) {
         size_t operandBitIndex = bitAssignments.lookup(odsOperandName);
-       // Public operations: check operand version compatibility.
-          auto [majorStr, minorStr] = extractVersionFromOperand(i, opDef);
-          std::string version = majorStr + "." + minorStr;
-          std::string opVersion = extractVersionFromOperation(opDef);
+        // Public operations: check operand version compatibility.
+        auto [majorStr, minorStr] = extractVersionFromOperand(i, opDef);
+        std::string version = majorStr + "." + minorStr;
+        std::string opVersion = extractVersionFromOperation(opDef);
 
-          if (version == opVersion) {
-            // Operand from original operation - simple flag reading.
-            os << llvm::formatv(optionalOdsOperandSegmentTemplate,
-                                odsOperandName, opName, i, operandBitIndex);
-          } else {
-            // Versioned operand - validate flag consistency.
-            std::string templateCode =
-                llvm::formatv(optionalOdsOperandSegmentTemplate, odsOperandName,
-                              opName, i, operandBitIndex)
-                    .str();
+        if (version == opVersion) {
+          // Operand from original operation - simple flag reading.
+          os << llvm::formatv(optionalOdsOperandSegmentTemplate, odsOperandName,
+                              opName, i, operandBitIndex);
+        } else {
+          // Versioned operand - validate flag consistency.
+          std::string templateCode =
+              llvm::formatv(optionalOdsOperandSegmentTemplate, odsOperandName,
+                            opName, i, operandBitIndex)
+                  .str();
 
-            os << llvm::formatv(R"(
+          os << llvm::formatv(R"(
   auto requiredVersionFor_{0} = BytecodeVersion::fromVersion({1}, {2}, 0);
   assert(requiredVersionFor_{0} && "TableGen should guarantee valid versions");
   if (bytecodeVersion >= *requiredVersionFor_{0}) {{
     // Operand supported - read flag normally.
-    {3}  
+    {3}
   } else {{
     // Operand not supported in this bytecode version - validate consistency.
     if (flags & (1ULL << {4}))
@@ -316,9 +316,9 @@ generateOperandDeserialization(const Operator &opDef, raw_ostream &os,
     currentSegmentLengthOds_{6} = 0;
   }
 )",
-                                odsOperandName, majorStr, minorStr,
-                                templateCode, operandBitIndex, version, i);
-          }
+                              odsOperandName, majorStr, minorStr, templateCode,
+                              operandBitIndex, version, i);
+        }
       } else if (isVariadic) {
         // Read variadic operand size from stream.
         os << llvm::formatv(variadicOdsOperandSegmentTemplate, odsOperandName,
@@ -404,76 +404,76 @@ generateAttributeDeserialization(const Operator &op, raw_ostream &os,
     // Emit the expected type declaration if needed.
     os << expectedTypeDeclaration;
 
-      os << "  // Public operations: use version checking\n";
-      // For public operations, add version checking.
-      auto [majorStr, minorStr] = extractVersionFromAttribute(namedAttr, op);
-      auto defaultValue = extractDefaultValue(namedAttr);
-      std::string version = majorStr + "." + minorStr;
+    os << "  // Public operations: use version checking\n";
+    // For public operations, add version checking.
+    auto [majorStr, minorStr] = extractVersionFromAttribute(namedAttr, op);
+    auto defaultValue = extractDefaultValue(namedAttr);
+    std::string version = majorStr + "." + minorStr;
 
-      os << llvm::formatv(R"(
+    os << llvm::formatv(R"(
   auto requiredVersionFor_{0} = BytecodeVersion::fromVersion({1}, {2}, 0);
   assert(requiredVersionFor_{0} && "TableGen should guarantee valid versions");
   if (bytecodeVersion >= *requiredVersionFor_{0}) {{
 )",
-                          attrName, majorStr, minorStr);
+                        attrName, majorStr, minorStr);
 
-      // Generate parsing logic within version check.
-      int bitPos =
-          isOptional ? static_cast<int>(bitAssignments.lookup(attrName)) : -1;
-      generateAttributeParsingLogic(os, varName, expectedTypeArg, attrName,
-                                    baseCppTypeStr, isOptional, isUnitAttr,
-                                    bitPos);
+    // Generate parsing logic within version check.
+    int bitPos =
+        isOptional ? static_cast<int>(bitAssignments.lookup(attrName)) : -1;
+    generateAttributeParsingLogic(os, varName, expectedTypeArg, attrName,
+                                  baseCppTypeStr, isOptional, isUnitAttr,
+                                  bitPos);
 
-      os << "  } else {\n"
-         << "    // For older bytecode versions, use default value\n";
-      if (defaultValue.has_value()) {
-        // Handle different attribute types with their specific construction
-        // patterns
-        if (baseCppTypeStr.contains("UnitAttr")) {
-          // UnitAttr with false default means don't create the attribute
-          // (nullptr).
-          if (*defaultValue == "false")
-            os << "    " << varName << " = nullptr;\n";
-          else
-            os << "    " << varName << " = ::mlir::UnitAttr::get(&context);\n";
-        } else if (baseCppTypeStr.contains("IntegerAttr")) {
-          // IntegerAttr needs a type.
-          os << "    " << varName << " = ::mlir::IntegerAttr::get("
-             << expectedTypeArg << ", " << *defaultValue << ");\n";
-        } else if (baseCppTypeStr.contains("cuda_tile::")) {
-          // Custom cuda_tile attributes follow the standard pattern.
-          os << "    " << varName << " = " << baseCppTypeStr
-             << "::get(&context, " << *defaultValue << ");\n";
-        } else {
-          PrintFatalError("Versioned attribute type '" + baseCppTypeStr.str() +
-                          "' is not supported. Please add explicit handling in "
-                          "BytecodeReaderGen.cpp for operation '" +
-                          op.getOperationName() + "'");
-        }
+    os << "  } else {\n"
+       << "    // For older bytecode versions, use default value\n";
+    if (defaultValue.has_value()) {
+      // Handle different attribute types with their specific construction
+      // patterns
+      if (baseCppTypeStr.contains("UnitAttr")) {
+        // UnitAttr with false default means don't create the attribute
+        // (nullptr).
+        if (*defaultValue == "false")
+          os << "    " << varName << " = nullptr;\n";
+        else
+          os << "    " << varName << " = ::mlir::UnitAttr::get(&context);\n";
+      } else if (baseCppTypeStr.contains("IntegerAttr")) {
+        // IntegerAttr needs a type.
+        os << "    " << varName << " = ::mlir::IntegerAttr::get("
+           << expectedTypeArg << ", " << *defaultValue << ");\n";
+      } else if (baseCppTypeStr.contains("cuda_tile::")) {
+        // Custom cuda_tile attributes follow the standard pattern.
+        os << "    " << varName << " = " << baseCppTypeStr << "::get(&context, "
+           << *defaultValue << ");\n";
       } else {
-        // No default value available.
-        std::string opVersion = extractVersionFromOperation(op);
-        if (version != opVersion) {
-          // For attributes introduced after the operation itself
-          if (namedAttr.attr.isOptional()) {
-            // Optional attributes should be nullptr (missing) for older
-            // versions
-            os << "    " << varName << " = nullptr;\n";
-          } else {
-            // Required attributes introduced after the operation must have
-            // default value
-            PrintFatalError(
-                "Versioned attribute '" + namedAttr.name + "' in operation '" +
-                op.getOperationName() + "' (since " + version +
-                ") was introduced after the operation itself (since " +
-                opVersion +
-                ") and must have a default value for backward compatibility");
-          }
-        }
-        // Note: Attributes introduced with the operation itself don't need
-        // defaults.
+        PrintFatalError("Versioned attribute type '" + baseCppTypeStr.str() +
+                        "' is not supported. Please add explicit handling in "
+                        "BytecodeReaderGen.cpp for operation '" +
+                        op.getOperationName() + "'");
       }
-      os << "  }\n";
+    } else {
+      // No default value available.
+      std::string opVersion = extractVersionFromOperation(op);
+      if (version != opVersion) {
+        // For attributes introduced after the operation itself
+        if (namedAttr.attr.isOptional()) {
+          // Optional attributes should be nullptr (missing) for older
+          // versions
+          os << "    " << varName << " = nullptr;\n";
+        } else {
+          // Required attributes introduced after the operation must have
+          // default value
+          PrintFatalError(
+              "Versioned attribute '" + namedAttr.name + "' in operation '" +
+              op.getOperationName() + "' (since " + version +
+              ") was introduced after the operation itself (since " +
+              opVersion +
+              ") and must have a default value for backward compatibility");
+        }
+      }
+      // Note: Attributes introduced with the operation itself don't need
+      // defaults.
+    }
+    os << "  }\n";
     // Generate attribute addition to the attributes vector.
     os << formatv(R"(  if ({0}) {{
     attributes.emplace_back(innerBuilder.getStringAttr("{1}"), {2});})",
@@ -611,7 +611,7 @@ static void generateVersionAwareResultDeserialization(const Operator &op,
   if (op.isVariadic()) {
     os << llvm::formatv(R"(
   if (numSerializedResults != expectedResults)
-    return reader.emitError() << "result count mismatch for {0}: expected " << expectedResults 
+    return reader.emitError() << "result count mismatch for {0}: expected " << expectedResults
                               << " compatible results but got " << numSerializedResults;
 )",
                         opClassName);

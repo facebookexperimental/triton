@@ -9,9 +9,9 @@ cuda_tile.module @kernels{
 
   // Test function with many parameters
   cuda_tile.entry @many_parameters(
-    %p0: !cuda_tile.tile<i32>, %p1: !cuda_tile.tile<i32>, %p2: !cuda_tile.tile<i32>, 
-    %p3: !cuda_tile.tile<i32>, %p4: !cuda_tile.tile<i32>, %p5: !cuda_tile.tile<i32>, 
-    %p6: !cuda_tile.tile<i32>, %p7: !cuda_tile.tile<i32>, %p8: !cuda_tile.tile<i32>, 
+    %p0: !cuda_tile.tile<i32>, %p1: !cuda_tile.tile<i32>, %p2: !cuda_tile.tile<i32>,
+    %p3: !cuda_tile.tile<i32>, %p4: !cuda_tile.tile<i32>, %p5: !cuda_tile.tile<i32>,
+    %p6: !cuda_tile.tile<i32>, %p7: !cuda_tile.tile<i32>, %p8: !cuda_tile.tile<i32>,
     %p9: !cuda_tile.tile<i32>
   ) {
     %0 = cuda_tile.addi %p0, %p1 : !cuda_tile.tile<i32>

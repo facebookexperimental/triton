@@ -61,8 +61,9 @@ ParseResult parseCudaTileType(AsmParser &p, SmallVectorImpl<Type> &types);
 
 /// Parses a single cuda tile type and splats 'types' to contain as many
 /// instances of that type as 'values'.
-ParseResult parseCudaTileTypeSplat(AsmParser &p, SmallVectorImpl<Type> &types,
-                                   ArrayRef<OpAsmParser::UnresolvedOperand> values);
+ParseResult
+parseCudaTileTypeSplat(AsmParser &p, SmallVectorImpl<Type> &types,
+                       ArrayRef<OpAsmParser::UnresolvedOperand> values);
 
 /// Print a type, stripping prefix if belonging to cuda_tile dialect
 void printCudaTileType(AsmPrinter &p, Type type);

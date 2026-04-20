@@ -99,8 +99,7 @@ struct TileIRType {
 
   TileIRType() : ty_ptr(std::make_shared<TileIRTypeBase>()) {}
 
-  template <typename T>
-  T *as() const {
+  template <typename T> T *as() const {
     return std::static_pointer_cast<T>(ty_ptr).get();
   }
 

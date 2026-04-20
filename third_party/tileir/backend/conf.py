@@ -5,6 +5,7 @@ import functools
 
 
 class TileIREnvConf:
+
     @staticmethod
     def enable_approx():
         # Enable approximate calculation, trading off numerical precision for performance gains
@@ -35,7 +36,8 @@ class TileIREnvConf:
             path = os.path.join(cuda_home, "bin", "tileiras")
             if os.path.exists(path):
                 import subprocess
-                version_output = subprocess.check_output([path, "--version"], encoding="utf-8", stderr=subprocess.STDOUT)
+                version_output = subprocess.check_output([path, "--version"], encoding="utf-8",
+                                                         stderr=subprocess.STDOUT)
                 if "release 13.1" in version_output:
                     return path
         from shutil import which
@@ -70,6 +72,7 @@ class TileIREnvConf:
     @staticmethod
     def enable_tma_offset_assert_check():
         return os.getenv("NVT_TMA_OFFSET_CHECK", "0") == "1"
+
 
 @contextmanager
 def set_env_var(var_name, new_value):

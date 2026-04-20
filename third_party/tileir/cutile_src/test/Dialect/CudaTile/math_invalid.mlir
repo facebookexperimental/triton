@@ -11,7 +11,7 @@ cuda_tile.module @absi_invalid_fp_element {
 
 // -----
 
-cuda_tile.module @absi_mismatched_type {       
+cuda_tile.module @absi_mismatched_type {
   // expected-note @below{{prior use here}}
   cuda_tile.testing$func @func(%arg0 : !cuda_tile.tile<i32>) {
     // expected-error @below{{use of value '%arg0' expects different type than prior uses}}
@@ -858,4 +858,4 @@ cuda_tile.module @tanh_invalid_f8_element {
         // expected-error @below{{'cuda_tile.tanh' op operand #0 must be tile of f16 or bf16 or f32 or f64 values, but got '!cuda_tile.tile<2x4x8xf8E5M2>'}}
         %0 = cuda_tile.tanh %arg0 : !cuda_tile.tile<2x4x8xf8E5M2>
     }
-} 
+}

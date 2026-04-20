@@ -10,15 +10,15 @@ cuda_tile.module @test {
     %a = cuda_tile.constant <f32: 2.0> : !cuda_tile.tile<f32>
     %b = cuda_tile.constant <f32: 3.0> : !cuda_tile.tile<f32>
     %c = cuda_tile.constant <f32: 4.0> : !cuda_tile.tile<f32>
-    
+
     %bcast_c = cuda_tile.broadcast %c : !cuda_tile.tile<f32> -> !cuda_tile.tile<f32>
     %mul = cuda_tile.mulf %a, %b rounding<nearest_even> : !cuda_tile.tile<f32>
-    
+
     // This should be canonicalized to put %mul on the left
     // CHECK: %[[RESULT:.*]] = addf %[[MUL:.*]], %[[BCAST:.*]] : tile<f32>
     // CHECK-NOT: addf %[[BCAST:.*]], %[[MUL:.*]]
     %result = cuda_tile.addf %bcast_c, %mul rounding<nearest_even> : !cuda_tile.tile<f32>
-    
+
     return %result : !cuda_tile.tile<f32>
   }
 }
@@ -31,15 +31,15 @@ cuda_tile.module @test {
     %a = cuda_tile.constant <f32: 2.0> : !cuda_tile.tile<f32>
     %b = cuda_tile.constant <f32: 3.0> : !cuda_tile.tile<f32>
     %c = cuda_tile.constant <f32: 4.0> : !cuda_tile.tile<f32>
-    
+
     %bcast_c = cuda_tile.broadcast %c : !cuda_tile.tile<f32> -> !cuda_tile.tile<f32>
     %mul = cuda_tile.mulf %a, %b : !cuda_tile.tile<f32>
-    
+
     // This should be canonicalized to put %mul on the left
     // CHECK: %[[RESULT:.*]] = addf %[[MUL:.*]], %[[BCAST:.*]] : tile<f32>
     // CHECK-NOT: addf %[[BCAST:.*]], %[[MUL:.*]]
     %result = cuda_tile.addf %bcast_c, %mul : !cuda_tile.tile<f32>
-    
+
     return %result : !cuda_tile.tile<f32>
   }
 }
@@ -51,14 +51,14 @@ cuda_tile.module @test {
     %a = cuda_tile.constant <f32: 2.0> : !cuda_tile.tile<f32>
     %b = cuda_tile.constant <f32: 3.0> : !cuda_tile.tile<f32>
     %c = cuda_tile.constant <f32: 4.0> : !cuda_tile.tile<f32>
-    
+
     %mul = cuda_tile.mulf %a, %b rounding<nearest_even> : !cuda_tile.tile<f32>
-    
+
     // This should be canonicalized to put %mul on the left
     // CHECK: %[[RESULT:.*]] = addf %[[MUL:.*]], %[[C:.*]] : tile<f32>
     // CHECK-NOT: addf %[[C:.*]], %[[MUL:.*]]
     %result = cuda_tile.addf %c, %mul rounding<nearest_even> : !cuda_tile.tile<f32>
-    
+
     return %result : !cuda_tile.tile<f32>
   }
 }
@@ -71,13 +71,13 @@ cuda_tile.module @test {
     %a = cuda_tile.constant <f32: 2.0> : !cuda_tile.tile<f32>
     %b = cuda_tile.constant <f32: 3.0> : !cuda_tile.tile<f32>
     %c = cuda_tile.constant <f32: 4.0> : !cuda_tile.tile<f32>
-    
+
     %mul = cuda_tile.mulf %a, %b rounding<nearest_even> : !cuda_tile.tile<f32>
-    
+
     // This should NOT be reordered since mul is already on LHS
     // CHECK: %[[RESULT:.*]] = addf %[[MUL:.*]], %[[C:.*]] : tile<f32>
     %result = cuda_tile.addf %mul, %c rounding<nearest_even> : !cuda_tile.tile<f32>
-    
+
     return %result : !cuda_tile.tile<f32>
   }
 }
@@ -91,14 +91,14 @@ cuda_tile.module @test {
     %b = cuda_tile.constant <f32: 3.0> : !cuda_tile.tile<f32>
     %c = cuda_tile.constant <f32: 4.0> : !cuda_tile.tile<f32>
     %d = cuda_tile.constant <f32: 5.0> : !cuda_tile.tile<f32>
-    
+
     %mul1 = cuda_tile.mulf %a, %b rounding<nearest_even> : !cuda_tile.tile<f32>
     %mul2 = cuda_tile.mulf %c, %d rounding<nearest_even> : !cuda_tile.tile<f32>
-    
+
     // This should NOT be reordered since both operands are multiply operations
     // CHECK: %[[RESULT:.*]] = addf %[[MUL1:.*]], %[[MUL2:.*]] : tile<f32>
     %result = cuda_tile.addf %mul1, %mul2 rounding<nearest_even> : !cuda_tile.tile<f32>
-    
+
     return %result : !cuda_tile.tile<f32>
   }
 }

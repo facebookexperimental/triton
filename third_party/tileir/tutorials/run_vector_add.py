@@ -1,5 +1,4 @@
 # NOTE: copied from ~/fbsource/third-party/triton/beta/triton/python/tutorials/01-vector-add.py
-
 """
 Vector Addition
 ===============

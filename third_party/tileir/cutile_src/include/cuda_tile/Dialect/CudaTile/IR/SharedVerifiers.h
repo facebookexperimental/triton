@@ -25,8 +25,7 @@ namespace cuda_tile {
 // View Load and Store Utilities
 //===----------------------------------------------------------------------===//
 
-template <typename Op>
-static LogicalResult verifyOptHintsCommon(Op op) {
+template <typename Op> static LogicalResult verifyOptHintsCommon(Op op) {
   auto hints = op->getOptimizationHints();
   if (hints && !hints->getValue().empty() &&
       failed(op->getOptimizationHintsAttr().verifyWithOp(

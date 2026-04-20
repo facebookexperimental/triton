@@ -1,18 +1,19 @@
 #include "mlir/Bytecode/BytecodeWriter.h"
+#include "mlir/Conversion/Passes.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Index/IR/IndexDialect.h"
 #include "mlir/Dialect/Index/IR/IndexOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
-#include "mlir/IR/Types.h"
-#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/Types.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/Pass.h"
@@ -24,7 +25,6 @@
 #include "mlir/Target/LLVMIR/Dialect/NVVM/NVVMToLLVMIRTranslation.h"
 #include "mlir/Transforms/LocationSnapshot.h"
 #include "mlir/Transforms/Passes.h"
-#include "mlir/Conversion/Passes.h"
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
@@ -38,8 +38,8 @@
 #include "cuda_tile/Dialect/CudaTile/IR/Ops.h"
 #include "cuda_tile/Dialect/CudaTile/IR/Types.h"
 #include "cuda_tile/Dialect/CudaTile/Transforms/Passes.h"
-#include "passes.h"
 #include "ir.h"
+#include "passes.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
@@ -49,7 +49,6 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
-#include "triton/Dialect/Triton/IR/Types.h"
 
 namespace py = pybind11;
 using namespace mlir;
@@ -59,12 +58,12 @@ void init_triton_to_cudatile_passes(py::module &&m) {
   using namespace mlir::triton;
   // TODO: it is weird to pass mlir::triton::NVVM here since the conversion is
   // nvidia-specificontext
-  m.def("add_triton_to_cudatile", [](mlir::PassManager &pm, bool approx,
-                                    bool ftz, int capability, int num_ctas,
-                                    int occupancy, std::optional<int> num_stages) {
-    pm.addPass(mlir::triton::createConvertTritonToCudaTilePass(
-        approx, ftz, capability, num_ctas, occupancy, num_stages));
-  });
+  m.def("add_triton_to_cudatile",
+        [](mlir::PassManager &pm, bool approx, bool ftz, int capability,
+           int num_ctas, int occupancy, std::optional<int> num_stages) {
+          pm.addPass(mlir::triton::createConvertTritonToCudaTilePass(
+              approx, ftz, capability, num_ctas, occupancy, num_stages));
+        });
   m.def("add_fma_fusion", [](mlir::PassManager &pm) {
     // Add FMA fusion pass to cuda tile entry operations
     auto &mpm = pm.nest<cuda_tile::ModuleOp>();
@@ -96,11 +95,11 @@ void init_triton_to_cudatile_passes(py::module &&m) {
   m.def("add_assume_to_tileir", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createRewriteAssumeWithCudaTilePass());
   });
-  m.def("add_auto_gen_memtoken", [](mlir::PassManager &pm,
-                                    bool enable_autogen_alias_mem_token
-    ) {
-    pm.addPass(mlir::triton::createAutoGenMemoryTokenPass(enable_autogen_alias_mem_token));
-  });
+  m.def("add_auto_gen_memtoken",
+        [](mlir::PassManager &pm, bool enable_autogen_alias_mem_token) {
+          pm.addPass(mlir::triton::createAutoGenMemoryTokenPass(
+              enable_autogen_alias_mem_token));
+        });
 }
 
 void init_triton_cutile(py::module &&m) {
@@ -122,8 +121,7 @@ void init_triton_cutile(py::module &&m) {
     mod->walk([&](mlir::Operation *op) {
       if (!llvm::isa<mlir::ModuleOp>(op) &&
           (op->getName().getDialectNamespace() !=
-              mlir::cuda_tile::CudaTileDialect::getDialectNamespace()
-          )) {
+           mlir::cuda_tile::CudaTileDialect::getDialectNamespace())) {
         only_contain_legal_dialects = false;
       }
     });

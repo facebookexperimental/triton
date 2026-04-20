@@ -2327,9 +2327,8 @@ cuda_tile.testing$func @ftof(%arg0: !cuda_tile.tile<2x2xf32>) -> !cuda_tile.tile
 // -----
 
 cuda_tile.entry @tensor_view_store_dynamic(%tensor_view: !cuda_tile.tensor_view<?x4096xf64, strides=[4096,1]>) {
-  %view = make_partition_view %tensor_view 
+  %view = make_partition_view %tensor_view
   // expected-error @below {{'cuda_tile.make_partition_view' expected 'partition_view' type, but got '!cuda_tile.tensor_view<?x4096xf64, strides=[4096,1]>'}}
-    : !cuda_tile.tensor_view<?x4096xf64, strides=[4096,1]> 
+    : !cuda_tile.tensor_view<?x4096xf64, strides=[4096,1]>
     -> !cuda_tile.partition_view<tile=(1024x1024), tensor_view<?x4096xf64, strides=[4096,1]>>
 }
-
