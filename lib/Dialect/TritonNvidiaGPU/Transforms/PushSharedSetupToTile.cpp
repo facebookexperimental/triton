@@ -88,6 +88,166 @@ void addSubsliceRangeToSetup(SubtiledRegionOp op) {
   op.setTileMappingsAttr(ArrayAttr::get(ctx, newMappingAttrs));
 }
 
+/// Push tmem_load ops from setup into the tile body so that loads are
+/// interleaved with per-tile compute during lowering.
+///
+/// For per-tile yield values defined by a chain of tmem_load (+ optional
+/// convert_layout) from a tmem_subslice, this replaces the yield value with
+/// the memdesc (tmem_subslice result), changes the tile arg type, and clones
+/// the tmem_load chain into the tile body.
+void pushTmemLoadsToTile(SubtiledRegionOp op) {
+  ArrayAttr tileMappings = op.getTileMappings();
+  unsigned numTiles = tileMappings.size();
+  if (numTiles <= 1)
+    return;
+
+  Block &setupBlock = op.getSetupRegion().front();
+  auto setupYield = cast<SubtiledRegionYieldOp>(setupBlock.getTerminator());
+  Block &tileBlock = op.getTileRegion().front();
+  unsigned mappingSize =
+      cast<DenseI32ArrayAttr>(tileMappings[0]).asArrayRef().size();
+
+  // Find per-tile arg positions where tile mappings differ and the yield
+  // values trace back through convert_layout* → tmem_load → tmem_subslice.
+  struct LoadChain {
+    unsigned argPosition;
+    SmallVector<unsigned> yieldIndices; // one per tile
+    SmallVector<Operation *> opsToClone;
+    Value memDescValue; // the tmem_subslice result to yield instead
+  };
+  SmallVector<LoadChain> loadChains;
+
+  for (unsigned p = 0; p < mappingSize; ++p) {
+    // Skip args with no users in the tile body.
+    BlockArgument arg = tileBlock.getArgument(p);
+    if (arg.use_empty())
+      continue;
+
+    // Check if this arg is per-tile (different yield indices across tiles).
+    SmallVector<unsigned> yieldIndices;
+    for (unsigned t = 0; t < numTiles; ++t)
+      yieldIndices.push_back(
+          cast<DenseI32ArrayAttr>(tileMappings[t]).asArrayRef()[p]);
+
+    bool allSame = llvm::all_of(
+        yieldIndices, [&](unsigned idx) { return idx == yieldIndices[0]; });
+    if (allSame)
+      continue;
+
+    // Trace back from the first tile's yield value to find tmem_load chain.
+    Value yieldVal = setupYield.getResults()[yieldIndices[0]];
+
+    // Collect the chain: (convert_layout)* → tmem_load.
+    SmallVector<Operation *> chain;
+    Value current = yieldVal;
+    while (auto cvt = current.getDefiningOp<gpu::ConvertLayoutOp>()) {
+      chain.push_back(cvt);
+      current = cvt.getSrc();
+    }
+
+    auto tmemLoad = current.getDefiningOp<TMEMLoadOp>();
+    if (!tmemLoad)
+      continue;
+    chain.push_back(tmemLoad);
+
+    // Verify the tmem_load source is a tmem_subslice.
+    auto subslice = tmemLoad.getSrc().getDefiningOp<TMEMSubSliceOp>();
+    if (!subslice)
+      continue;
+
+    // Verify all tiles have the same chain structure (just different
+    // subslice N offsets).
+    bool allValid = true;
+    for (unsigned t = 1; t < numTiles; ++t) {
+      Value otherYield = setupYield.getResults()[yieldIndices[t]];
+      Value otherCur = otherYield;
+      for (size_t i = 0; i + 1 < chain.size(); ++i) {
+        auto otherCvt = otherCur.getDefiningOp<gpu::ConvertLayoutOp>();
+        if (!otherCvt) {
+          allValid = false;
+          break;
+        }
+        otherCur = otherCvt.getSrc();
+      }
+      if (!allValid)
+        break;
+      if (!otherCur.getDefiningOp<TMEMLoadOp>()) {
+        allValid = false;
+        break;
+      }
+    }
+    if (!allValid)
+      continue;
+
+    // Reverse chain so it's in program order (tmem_load first).
+    std::reverse(chain.begin(), chain.end());
+
+    loadChains.push_back(
+        {p, std::move(yieldIndices), std::move(chain), subslice.getResult()});
+  }
+
+  if (loadChains.empty())
+    return;
+
+  MLIRContext *ctx = op.getContext();
+  Location loc = op.getLoc();
+
+  // For each load chain:
+  // 1. Replace yield values with the memdesc (tmem_subslice result)
+  // 2. Change tile arg type from tensor to memdesc
+  // 3. Clone tmem_load chain into tile body
+  for (auto &lc : loadChains) {
+    // Update yield values for all tiles: yield the memdesc instead.
+    // Each tile's yield index points to a different tmem_load result;
+    // replace with the corresponding tmem_subslice result.
+    SmallVector<Value> yieldValues(setupYield.getResults());
+    for (unsigned t = 0; t < numTiles; ++t) {
+      Value tileYield = yieldValues[lc.yieldIndices[t]];
+      // Trace back to tmem_load → tmem_subslice for this tile.
+      Value cur = tileYield;
+      while (auto cvt = cur.getDefiningOp<gpu::ConvertLayoutOp>())
+        cur = cvt.getSrc();
+      auto load = cur.getDefiningOp<TMEMLoadOp>();
+      yieldValues[lc.yieldIndices[t]] = load.getSrc();
+    }
+    OpBuilder setupBuilder(setupYield);
+    SubtiledRegionYieldOp::create(setupBuilder, setupYield.getLoc(),
+                                  yieldValues);
+    setupYield.erase();
+    setupYield = cast<SubtiledRegionYieldOp>(setupBlock.getTerminator());
+
+    // Change tile arg type from tensor to memdesc.
+    BlockArgument oldArg = tileBlock.getArgument(lc.argPosition);
+    Type memDescType = lc.memDescValue.getType();
+    BlockArgument newArg =
+        tileBlock.insertArgument(lc.argPosition, memDescType, loc);
+    // Don't replace uses yet — we need to clone the chain first.
+
+    // Clone the tmem_load chain into the tile body, right before the first
+    // user of the old arg.
+    Operation *firstUser = nullptr;
+    for (Operation *user : oldArg.getUsers()) {
+      if (!firstUser || user->isBeforeInBlock(firstUser))
+        firstUser = user;
+    }
+
+    OpBuilder tileBuilder(&tileBlock, firstUser ? Block::iterator(firstUser)
+                                                : tileBlock.begin());
+    IRMapping tileCloneMapping;
+    // Map tmem_load's source (memdesc) to the new tile arg.
+    tileCloneMapping.map(lc.opsToClone.front()->getOperand(0), newArg);
+    for (Operation *chainOp : lc.opsToClone)
+      tileBuilder.clone(*chainOp, tileCloneMapping);
+
+    // The last cloned op produces the tensor that replaces the old arg.
+    Operation *lastCloned = lc.opsToClone.back();
+    Value clonedResult =
+        tileCloneMapping.lookupOrDefault(lastCloned->getResult(0));
+    oldArg.replaceAllUsesWith(clonedResult);
+    tileBlock.eraseArgument(lc.argPosition + 1); // remove old arg (shifted)
+  }
+}
+
 void pushSharedSetupToTile(SubtiledRegionOp op) {
   ArrayAttr tileMappings = op.getTileMappings();
   unsigned numTiles = tileMappings.size();
@@ -321,6 +481,8 @@ public:
 
     for (auto op : ops)
       addSubsliceRangeToSetup(op);
+    for (auto op : ops)
+      pushTmemLoadsToTile(op);
     for (auto op : ops)
       pushSharedSetupToTile(op);
   }
