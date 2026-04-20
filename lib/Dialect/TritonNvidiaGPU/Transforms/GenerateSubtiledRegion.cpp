@@ -167,8 +167,11 @@ checkStructuralEquivalence(ArrayRef<Operation *> chain0,
     if (isIdentityCompatibleOp(tOp) && tOp->getNumResults() == 1) {
       // Try each operand as the pass-through. The pass-through operand's
       // mapped value (in the other chain) replaces the template op's result.
+      // For subi, only operand 0 can be the pass-through (x - 0 = x, but
+      // 0 - x != x).
       bool skipped = false;
-      for (unsigned opIdx = 0; opIdx < tOp->getNumOperands(); ++opIdx) {
+      unsigned numCandidates = isa<arith::SubIOp>(tOp) ? 1 : 2;
+      for (unsigned opIdx = 0; opIdx < numCandidates; ++opIdx) {
         Value passThrough = tOp->getOperand(opIdx);
         Value varying = tOp->getOperand(1 - opIdx);
 
