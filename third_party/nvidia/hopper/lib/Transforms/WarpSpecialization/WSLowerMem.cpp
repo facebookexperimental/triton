@@ -328,7 +328,9 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             Value bufferIdx, Value bufferIdxExtract,
                             Value phase, Operation *headProducer,
                             Operation *headConsumer,
-                            Operation *headConsumerSameLevel, bool isPost) {
+                            Operation *headConsumerSameLevel,
+                            SmallVector<int> additionalConsumerTaskIds,
+                            bool isPost) {
   auto loc = barrierAlloc.getLoc();
 
   // Compute the total size of the loads.
@@ -365,21 +367,32 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   }
 
   // Create a wait_barrier before the first consumer.
+  // For data-partitioned channels, shared ops (consBarrier, phase, pred)
+  // need ALL consumer task IDs so they survive specializeRegion.
   builder.setInsertionPoint(headConsumerSameLevel);
-  builder.setAsyncTaskIdsFromOp(headConsumer);
+  SmallVector<int> allConsumerTaskIds;
+  for (int id : getAsyncTaskIds(headConsumer))
+    allConsumerTaskIds.push_back(id);
+  for (int id : additionalConsumerTaskIds)
+    allConsumerTaskIds.push_back(id);
+  builder.setAsynTaskIdsFromArray(allConsumerTaskIds);
   builder.setLoopScheduleInfoFromOp(headConsumerSameLevel);
   auto consBarrier =
       getBarrierForPipelineStage(builder, barrierAlloc, bufferIdxExtract);
   phase = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
       loc, builder.getI32Type(), phase);
-
-  // Create a constant true predicate for the wait_barrier
-  // This ensures barriers are never skipped, preventing deadlocks
   Value waitPred =
       builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
 
+  // Create one WaitBarrierOp per consumer task ID.
+  builder.setAsyncTaskIdsFromOp(headConsumer);
   auto wait = builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
       loc, consBarrier, phase, waitPred);
+  for (int extraTaskId : additionalConsumerTaskIds) {
+    builder.setAsynTaskIdsFromArray(extraTaskId);
+    builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(loc, consBarrier, phase,
+                                                        waitPred);
+  }
 
   // Convert all the consumers to local_load
   for (auto [tmaLoad, buffer] : zip(tmaLoads, buffers)) {
