@@ -1037,7 +1037,12 @@ class JITFunction(JITCallable, KernelInterface[T]):
         above ``last = self._last_call``.  Layer 2 stores ``tuple[2:]``
         (without device/args) in ``_run_cache``.
         """
-        launcher = kernel.run  # CudaLauncher instance (resolves property once)
+        launcher = kernel.run  # CudaLauncher or HIPLauncher instance (resolves property once)
+        # HIPLauncher lacks launch_cluster, launch_pdl, and global_scratch_size.
+        # Use getattr for these CUDA-specific attributes.  When they are absent
+        # the launcher.launch() C function has a different call signature, so
+        # no_scratch must be False to route through kernel.run() (__call__).
+        has_direct_launch = hasattr(launcher, "launch_cluster")
         return _LastCall(
             device=device,
             args=args,
@@ -1047,9 +1052,9 @@ class JITFunction(JITCallable, KernelInterface[T]):
             function=kernel.function,
             packed_metadata=kernel.packed_metadata,
             coop=launcher.launch_cooperative_grid,
-            cluster=launcher.launch_cluster,
-            pdl=launcher.launch_pdl,
-            no_scratch=launcher.global_scratch_size == 0 and launcher.profile_scratch_size == 0,
+            cluster=getattr(launcher, "launch_cluster", False),
+            pdl=getattr(launcher, "launch_pdl", False),
+            no_scratch=(has_direct_launch and launcher.global_scratch_size == 0 and launcher.profile_scratch_size == 0),
             instrumentation_mode=knobs.compilation.instrumentation_mode,
         )
 

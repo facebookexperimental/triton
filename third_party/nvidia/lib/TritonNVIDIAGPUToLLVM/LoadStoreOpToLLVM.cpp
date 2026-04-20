@@ -1342,6 +1342,18 @@ static LinearLayout getMsgToPackedOffsetLayout(ttg::MemDescType ty) {
                                 blockShape[dim], kMsg, outDimNames[dim]);
   }
   auto cgaLayout = getCGALayout(ty.getEncoding());
+  // The memdesc shape rank may exceed the encoding's CGALayout rank (the
+  // verifier allows encoding_rank == shape_rank - 1 for the leading buffer
+  // dimension). Extend the CGALayout by prepending trivial output dimensions.
+  if (cgaLayout.getRank() < (unsigned)rank) {
+    int extraDims = rank - cgaLayout.getRank();
+    auto bases = cgaLayout.getLinearLayout().getBases();
+    for (auto &[name, bvs] : bases)
+      for (auto &bv : bvs)
+        bv.insert(bv.begin(), extraDims, 0);
+    cgaLayout =
+        ttg::CGAEncodingAttr::get(ctx, LinearLayout(bases, outDimNames));
+  }
   for (int i = 0; i < rank; ++i) {
     auto dim = cgaLayout.getCTAOrder()[i];
     msgToOffset *= LinearLayout::identity1D(cgaLayout.getCTASplitNum()[dim],
