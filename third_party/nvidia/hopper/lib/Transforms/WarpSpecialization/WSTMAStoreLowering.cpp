@@ -3,6 +3,7 @@
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
@@ -16,6 +17,13 @@ namespace mlir {
 #define DEBUG_TYPE "nvgpu-ws-tma-store-lowering"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+
+static void copyLoopScheduleAttrs(Operation *from, Operation *to) {
+  if (auto attr = from->getAttr(tt::kLoopStageAttrName))
+    to->setAttr(tt::kLoopStageAttrName, attr);
+  if (auto attr = from->getAttr(tt::kLoopClusterAttrName))
+    to->setAttr(tt::kLoopClusterAttrName, attr);
+}
 
 void doTMAStoreLowering(triton::FuncOp &funcOp) {
   SmallVector<tt::DescriptorStoreOp> storeOps;
@@ -53,6 +61,7 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
 
     // Allocate SMEM and copy register data into it in one step.
     auto alloc = builder.create<ttg::LocalAllocOp>(loc, memDescType, src);
+    copyLoopScheduleAttrs(storeOp, alloc);
 
     // Translate indices for TMA.
     auto indices = ttng::translateTMAIndices(
@@ -63,11 +72,13 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
     auto tokenType = ttg::AsyncTokenType::get(ctx);
     auto tmaStore = builder.create<ttng::AsyncTMACopyLocalToGlobalOp>(
         loc, tokenType, desc, indices, alloc, tt::EvictionPolicy::NORMAL);
+    copyLoopScheduleAttrs(storeOp, tmaStore);
 
     // Wait for this specific TMA store to finish reading from SMEM.
-    builder.create<ttng::TMAStoreTokenWaitOp>(loc, tmaStore.getToken(),
-                                              ValueRange{}, ValueRange{},
-                                              ValueRange{}, ValueRange{});
+    auto waitOp = builder.create<ttng::TMAStoreTokenWaitOp>(
+        loc, tmaStore.getToken(), ValueRange{}, ValueRange{}, ValueRange{},
+        ValueRange{});
+    copyLoopScheduleAttrs(storeOp, waitOp);
 
     storeOp.erase();
   }
