@@ -218,6 +218,15 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
         schedule.insert(&op, 0, cluster);
     }
 
+    // Bail out if the loop body contains any allocation ops. Reordering
+    // waits in such loops would serialize a multi-stage schedule that
+    // covers only a subset of the body ops, causing the pipeliner to fail
+    // on the unscheduled allocations.
+    for (auto &op : forOp.getBody()->without_terminator()) {
+      if (isa<ttg::LocalAllocOp, ttng::TMEMAllocOp>(op))
+        return;
+    }
+
     // Collect annotated TMA store waits that are direct children of this
     // loop and whose defining TMA store is in the same loop.
     SmallVector<ttng::TMAStoreTokenWaitOp> waits;
