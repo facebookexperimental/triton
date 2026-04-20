@@ -11,10 +11,10 @@ cuda_tile.module @test {
     %0 = constant <f32: 2.0> : !cuda_tile.tile<f32>
     %1 = constant <f32: 3.0> : !cuda_tile.tile<f32>
     %2 = constant <f32: 4.0> : !cuda_tile.tile<f32>
-    
+
     %3 = cuda_tile.mulf %0, %1 rounding<nearest_even> : !cuda_tile.tile<f32>
     %4 = cuda_tile.addf %3, %2 rounding<nearest_even> : !cuda_tile.tile<f32>
-    
+
     return %4 : !cuda_tile.tile<f32>
   }
 }
@@ -32,10 +32,10 @@ cuda_tile.module @test {
     %0 = constant <f32: 2.0> : !cuda_tile.tile<f32>
     %1 = constant <f32: 3.0> : !cuda_tile.tile<f32>
     %2 = constant <f32: 4.0> : !cuda_tile.tile<f32>
-    
+
     %3 = cuda_tile.mulf %0, %1 : !cuda_tile.tile<f32>
     %4 = cuda_tile.addf %3, %2 rounding<nearest_even> : !cuda_tile.tile<f32>
-    
+
     return %4 : !cuda_tile.tile<f32>
   }
 }
@@ -53,10 +53,10 @@ cuda_tile.module @test {
     %0 = constant <f32: 2.0> : !cuda_tile.tile<f32>
     %1 = constant <f32: 3.0> : !cuda_tile.tile<f32>
     %2 = constant <f32: 4.0> : !cuda_tile.tile<f32>
-    
+
     %3 = cuda_tile.mulf %0, %1 : !cuda_tile.tile<f32>
     %4 = cuda_tile.addf %3, %2 : !cuda_tile.tile<f32>
-    
+
     return %4 : !cuda_tile.tile<f32>
   }
 }
@@ -76,12 +76,12 @@ cuda_tile.module @test {
     %0 = constant <f32: 2.0> : !cuda_tile.tile<2x2xf32>
     %1 = constant <f32: 3.0> : !cuda_tile.tile<2x2xf32>
     %2 = constant <f32: 4.0> : !cuda_tile.tile<f32>
-    
+
     %3 = cuda_tile.mulf %0, %1 rounding<nearest_even> : !cuda_tile.tile<2x2xf32>
     %4 = cuda_tile.reshape %2 : !cuda_tile.tile<f32> -> !cuda_tile.tile<1x1xf32>
     %5 = cuda_tile.broadcast %4 : !cuda_tile.tile<1x1xf32> -> !cuda_tile.tile<2x2xf32>
     %6 = cuda_tile.addf %3, %5 rounding<nearest_even> : !cuda_tile.tile<2x2xf32>
-    
+
     return %6 : !cuda_tile.tile<2x2xf32>
   }
 }
@@ -102,12 +102,12 @@ cuda_tile.module @test {
     %0 = constant <f32: 2.0> : !cuda_tile.tile<1x1xf32>
     %1 = constant <f32: 3.0> : !cuda_tile.tile<1x1xf32>
     %2 = constant <f32: 4.0> : !cuda_tile.tile<f32>
-    
+
     %3 = cuda_tile.mulf %0, %1 rounding<nearest_even> : !cuda_tile.tile<1x1xf32>
     %4 = cuda_tile.reshape %2 : !cuda_tile.tile<f32> -> !cuda_tile.tile<1x1xf32>
     %5 = cuda_tile.broadcast %4 : !cuda_tile.tile<1x1xf32> -> !cuda_tile.tile<1x1xf32>
     %6 = cuda_tile.addf %3, %5 rounding<nearest_even> : !cuda_tile.tile<1x1xf32>
-    
+
     return %6 : !cuda_tile.tile<1x1xf32>
   }
 }
@@ -125,10 +125,10 @@ cuda_tile.module @test {
     %0 = constant <f32: 2.0> : !cuda_tile.tile<f32>
     %1 = constant <f32: 3.0> : !cuda_tile.tile<f32>
     %2 = constant <f32: 4.0> : !cuda_tile.tile<f32>
-    
+
     %3 = cuda_tile.mulf %0, %1 rounding<nearest_even> : !cuda_tile.tile<f32>
     %4 = cuda_tile.subf %3, %2 rounding<nearest_even> : !cuda_tile.tile<f32>
-    
+
     return %4 : !cuda_tile.tile<f32>
   }
 }
@@ -147,11 +147,11 @@ cuda_tile.module @test {
     %0 = constant <f32: 2.0> : !cuda_tile.tile<f32>
     %1 = constant <f32: 3.0> : !cuda_tile.tile<f32>
     %2 = constant <f32: 4.0> : !cuda_tile.tile<f32>
-    
+
     %3 = cuda_tile.mulf %0, %1 rounding<nearest_even> : !cuda_tile.tile<f32>
     %4 = cuda_tile.broadcast %2 : !cuda_tile.tile<f32> -> !cuda_tile.tile<f32>
     %5 = cuda_tile.subf %3, %4 rounding<nearest_even> : !cuda_tile.tile<f32>
-    
+
     return %5 : !cuda_tile.tile<f32>
   }
 }
@@ -172,12 +172,12 @@ cuda_tile.module @test {
     %0 = constant <f32: 2.0> : !cuda_tile.tile<2x2xf32>
     %1 = constant <f32: 3.0> : !cuda_tile.tile<2x2xf32>
     %2 = constant <f32: 4.0> : !cuda_tile.tile<f32>
-    
+
     %3 = cuda_tile.mulf %0, %1 rounding<nearest_even> : !cuda_tile.tile<2x2xf32>
     %4 = cuda_tile.reshape %2 : !cuda_tile.tile<f32> -> !cuda_tile.tile<1x1xf32>
     %5 = cuda_tile.broadcast %4 : !cuda_tile.tile<1x1xf32> -> !cuda_tile.tile<2x2xf32>
     %6 = cuda_tile.subf %3, %5 rounding<nearest_even> : !cuda_tile.tile<2x2xf32>
-    
+
     return %6 : !cuda_tile.tile<2x2xf32>
   }
 }
@@ -195,10 +195,10 @@ cuda_tile.module @test {
     %0 = constant <f32: 2.0> : !cuda_tile.tile<f32>
     %1 = constant <f32: 3.0> : !cuda_tile.tile<f32>
     %2 = constant <f32: 4.0> : !cuda_tile.tile<f32>
-    
+
     %3 = cuda_tile.mulf %0, %1 rounding<nearest_even> : !cuda_tile.tile<f32>
     %4 = cuda_tile.addf %3, %2 rounding<zero> : !cuda_tile.tile<f32>
-    
+
     return %4 : !cuda_tile.tile<f32>
   }
 }
@@ -216,10 +216,10 @@ cuda_tile.module @test {
     %0 = constant <f32: 2.0> : !cuda_tile.tile<f32>
     %1 = constant <f32: 3.0> : !cuda_tile.tile<f32>
     %2 = constant <f32: 4.0> : !cuda_tile.tile<f32>
-    
+
     %3 = cuda_tile.mulf %0, %1 rounding<nearest_even> flush_to_zero : !cuda_tile.tile<f32>
     %4 = cuda_tile.addf %3, %2 rounding<nearest_even> flush_to_zero : !cuda_tile.tile<f32>
-    
+
     return %4 : !cuda_tile.tile<f32>
   }
 }
@@ -237,10 +237,10 @@ cuda_tile.module @test {
     %0 = constant <f32: 2.0> : !cuda_tile.tile<f32>
     %1 = constant <f32: 3.0> : !cuda_tile.tile<f32>
     %2 = constant <f32: 4.0> : !cuda_tile.tile<f32>
-    
+
     %3 = cuda_tile.mulf %0, %1 rounding<nearest_even> flush_to_zero : !cuda_tile.tile<f32>
     %4 = cuda_tile.addf %3, %2 rounding<nearest_even> : !cuda_tile.tile<f32>
-    
+
     return %4 : !cuda_tile.tile<f32>
   }
 }
@@ -258,10 +258,10 @@ cuda_tile.module @test {
     %0 = constant <f32: 2.0> : !cuda_tile.tile<f32>
     %1 = constant <f32: 3.0> : !cuda_tile.tile<f32>
     %2 = constant <f32: 4.0> : !cuda_tile.tile<f32>
-    
+
     %3 = cuda_tile.mulf %0, %1 rounding<zero> flush_to_zero : !cuda_tile.tile<f32>
     %4 = cuda_tile.addf %3, %2 rounding<zero> flush_to_zero : !cuda_tile.tile<f32>
-    
+
     return %4 : !cuda_tile.tile<f32>
   }
 }
@@ -279,10 +279,10 @@ cuda_tile.module @test {
     %0 = constant <f32: 2.0> : !cuda_tile.tile<f32>
     %1 = constant <f32: 3.0> : !cuda_tile.tile<f32>
     %2 = constant <f32: 4.0> : !cuda_tile.tile<f32>
-    
+
     %3 = cuda_tile.mulf %0, %1 rounding<nearest_even> flush_to_zero : !cuda_tile.tile<f32>
     %4 = cuda_tile.addf %3, %2 rounding<zero> : !cuda_tile.tile<f32>
-    
+
     return %4 : !cuda_tile.tile<f32>
   }
 }
@@ -302,11 +302,11 @@ cuda_tile.module @test {
     %1 = constant <f32: 3.0> : !cuda_tile.tile<f32>
     %2 = constant <f32: 4.0> : !cuda_tile.tile<f32>
     %3 = constant <f32: 5.0> : !cuda_tile.tile<f32>
-    
+
     %4 = cuda_tile.mulf %0, %1 rounding<nearest_even> : !cuda_tile.tile<f32>
     %5 = cuda_tile.addf %4, %2 rounding<nearest_even> : !cuda_tile.tile<f32>
     %6 = cuda_tile.subf %4, %3 rounding<nearest_even> : !cuda_tile.tile<f32>
-    
+
     return %5, %6 : !cuda_tile.tile<f32>, !cuda_tile.tile<f32>
   }
 }
@@ -325,11 +325,11 @@ cuda_tile.module @test {
     %0 = constant <f32: 2.0> : !cuda_tile.tile<f32>
     %1 = constant <f32: 3.0> : !cuda_tile.tile<f32>
     %2 = constant <f32: 4.0> : !cuda_tile.tile<f32>
-    
+
     %3 = cuda_tile.mulf %0, %1 rounding<nearest_even> : !cuda_tile.tile<f32>
     // This should be canonicalized to put %3 on LHS, then fused into FMA
     %4 = cuda_tile.addf %2, %3 rounding<nearest_even> : !cuda_tile.tile<f32>
-    
+
     return %4 : !cuda_tile.tile<f32>
   }
 }
@@ -348,12 +348,12 @@ cuda_tile.module @test {
     %0 = constant <f32: 2.0> : !cuda_tile.tile<f32>
     %1 = constant <f32: 3.0> : !cuda_tile.tile<f32>
     %2 = constant <f32: 4.0> : !cuda_tile.tile<f32>
-    
+
     %3 = cuda_tile.mulf %0, %1 rounding<nearest_even> : !cuda_tile.tile<f32>
     %4 = cuda_tile.broadcast %2 : !cuda_tile.tile<f32> -> !cuda_tile.tile<f32>
     // This should be canonicalized to put %3 on LHS, then fused into FMA
     %5 = cuda_tile.addf %4, %3 rounding<nearest_even> : !cuda_tile.tile<f32>
-    
+
     return %5 : !cuda_tile.tile<f32>
   }
 }
@@ -370,11 +370,11 @@ cuda_tile.module @test {
     %0 = constant <f32: 2.0> : !cuda_tile.tile<f32>
     %1 = constant <f32: 3.0> : !cuda_tile.tile<f32>
     %2 = constant <f32: 4.0> : !cuda_tile.tile<f32>
-    
+
     %3 = cuda_tile.mulf %0, %1 rounding<nearest_even> : !cuda_tile.tile<f32>
     // This should be canonicalized to put %3 on LHS, but not fused due to different rounding
     %4 = cuda_tile.addf %2, %3 rounding<zero> : !cuda_tile.tile<f32>
-    
+
     return %4 : !cuda_tile.tile<f32>
   }
 }
@@ -391,11 +391,11 @@ cuda_tile.module @test {
     %0 = constant <f32: 2.0> : !cuda_tile.tile<f32>
     %1 = constant <f32: 3.0> : !cuda_tile.tile<f32>
     %2 = constant <f32: 4.0> : !cuda_tile.tile<f32>
-    
+
     %3 = cuda_tile.mulf %0, %1 rounding<nearest_even> flush_to_zero : !cuda_tile.tile<f32>
     // This should be canonicalized to put %3 on LHS, but not fused due to FTZ mismatch
     %4 = cuda_tile.addf %2, %3 rounding<nearest_even> : !cuda_tile.tile<f32>
-    
+
     return %4 : !cuda_tile.tile<f32>
   }
 }
@@ -416,16 +416,16 @@ cuda_tile.module @test {
     %2 = constant <f32: 4.0> : !cuda_tile.tile<f32>
     %3 = constant <f32: 5.0> : !cuda_tile.tile<f32>
     %4 = constant <f32: 6.0> : !cuda_tile.tile<f32>
-    
+
     %5 = cuda_tile.mulf %0, %1 rounding<nearest_even> : !cuda_tile.tile<f32>
     %6 = cuda_tile.mulf %2, %3 rounding<nearest_even> : !cuda_tile.tile<f32>
-    
+
     // First: canonicalize and fuse z + (x * y) -> FMA(x, y, z)
     %7 = cuda_tile.addf %4, %5 rounding<nearest_even> : !cuda_tile.tile<f32>
-    
+
     // Second: canonicalize and fuse result + (a * b) -> FMA(a, b, result)
     %8 = cuda_tile.addf %7, %6 rounding<nearest_even> : !cuda_tile.tile<f32>
-    
+
     return %8 : !cuda_tile.tile<f32>
   }
 }
@@ -444,12 +444,12 @@ cuda_tile.module @test {
     %0 = constant <f32: 2.0> : !cuda_tile.tile<f32>
     %1 = constant <f32: 3.0> : !cuda_tile.tile<f32>
     %2 = constant <f32: 4.0> : !cuda_tile.tile<f32>
-    
+
     %3 = cuda_tile.mulf %0, %1 rounding<nearest_even> : !cuda_tile.tile<f32>
     %4 = cuda_tile.broadcast %2 : !cuda_tile.tile<f32> -> !cuda_tile.tile<f32>
     // This should be canonicalized to put %3 on LHS, then fused into FMA
     %5 = cuda_tile.addf %4, %3 rounding<nearest_even> : !cuda_tile.tile<f32>
-    
+
     return %5 : !cuda_tile.tile<f32>
   }
 }

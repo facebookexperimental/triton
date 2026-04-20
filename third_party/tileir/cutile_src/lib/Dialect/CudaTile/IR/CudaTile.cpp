@@ -320,13 +320,13 @@ static bool isValidDenseElementType(Type elementType) {
          elementType.isTF32() ||               // tf32
          isa<Float8E4M3FNType>(elementType) || // f8E4M3FN
          isa<Float8E5M2Type>(elementType) ||   // f8E5M2
-         isa<Float8E8M0FNUType>(elementType); // f8E8M0FNU
+         isa<Float8E8M0FNUType>(elementType);  // f8E8M0FNU
 }
 
 // Parse format: constant <f32: 0x7F800000> : tile<f32>
 static ParseResult parseDenseTypedElementsAttr(OpAsmParser &parser,
-                                                 DenseTypedElementsAttr &attr,
-                                                 Type &resultType) {
+                                               DenseTypedElementsAttr &attr,
+                                               Type &resultType) {
   if (parser.parseLess())
     return failure();
 
@@ -598,8 +598,8 @@ static ParseResult parseDenseTypedElementsAttr(OpAsmParser &parser,
 
 // constant <f32: 42.0> : tile<f32>
 static void printDenseTypedElementsAttr(OpAsmPrinter &p, Operation *op,
-                                          DenseTypedElementsAttr attr,
-                                          Type resultType) {
+                                        DenseTypedElementsAttr attr,
+                                        Type resultType) {
   // Print the dense values part (everything before the colon)
   std::string attrStr;
   llvm::raw_string_ostream attrStream(attrStr);
@@ -628,14 +628,13 @@ static void printDenseTypedElementsAttr(OpAsmPrinter &p, Operation *op,
 
 static ParseResult
 parseDenseTypedElementsAttrNoResult(OpAsmParser &parser,
-                                      DenseTypedElementsAttr &attr) {
+                                    DenseTypedElementsAttr &attr) {
   Type resultType;
   return parseDenseTypedElementsAttr(parser, attr, resultType);
 }
 
-static void
-printDenseTypedElementsAttrNoResult(OpAsmPrinter &p, Operation *op,
-                                      DenseTypedElementsAttr attr) {
+static void printDenseTypedElementsAttrNoResult(OpAsmPrinter &p, Operation *op,
+                                                DenseTypedElementsAttr attr) {
   printDenseTypedElementsAttr(p, op, attr, attr.getType());
 }
 
@@ -1956,8 +1955,7 @@ LogicalResult IToFOp::verify() {
 // MmaFOp
 //===----------------------------------------------------------------------===//
 
-template <typename MmaOpT>
-LogicalResult verifyMmaShapes(MmaOpT op) {
+template <typename MmaOpT> LogicalResult verifyMmaShapes(MmaOpT op) {
   cuda_tile::TileType lhsType = op.getLhs().getType();
   cuda_tile::TileType rhsType = op.getRhs().getType();
   cuda_tile::TileType accType = op.getAcc().getType();
@@ -4159,9 +4157,7 @@ ScanOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
 // SelectOp
 //===----------------------------------------------------------------------===//
 
-LogicalResult SelectOp::verify() {
-  return success();
-}
+LogicalResult SelectOp::verify() { return success(); }
 
 struct SelectConsts : public OpRewritePattern<SelectOp> {
   using OpRewritePattern<SelectOp>::OpRewritePattern;
@@ -4567,9 +4563,9 @@ struct CudaTileinlinerInterface : public DialectInlinerInterface {
     // Create a new loop operation that will contain the inlined block, and
     // update the original return to use the loops results.
     builder.setInsertionPointToStart(&block);
-    auto loopOp = LoopOp::create(
-        builder, block.front().getLoc(), returnOp->getOperandTypes(),
-        /*operands=*/ValueRange());
+    auto loopOp = LoopOp::create(builder, block.front().getLoc(),
+                                 returnOp->getOperandTypes(),
+                                 /*operands=*/ValueRange());
     returnOp->setOperands(loopOp.getResults());
     returnOp->moveAfter(loopOp);
 

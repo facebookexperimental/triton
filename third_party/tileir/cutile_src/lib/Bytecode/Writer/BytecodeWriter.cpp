@@ -107,14 +107,12 @@ public:
     }
   }
 
-  template <typename T>
-  void writeLE(ArrayRef<T> values) {
+  template <typename T> void writeLE(ArrayRef<T> values) {
     for (T value : values)
       writeLE<T>(value);
   }
 
-  template <typename T>
-  void writeLEVarSize(ArrayRef<T> values) {
+  template <typename T> void writeLEVarSize(ArrayRef<T> values) {
     writeVarInt(values.size());
     writeLE(values);
   }
@@ -396,14 +394,14 @@ private:
 #define GEN_TYPE_WRITERS
 #include "TypeBytecode.inc"
 
-  LogicalResult serializeType(Type type, EncodingWriter &writer){
-  // Generated type serialization dispatch.
+  LogicalResult serializeType(Type type, EncodingWriter &writer) {
+    // Generated type serialization dispatch.
 #define GEN_TYPE_WRITER_DISPATCH
 #include "TypeBytecode.inc"
   }
 
-  LogicalResult
-      serializeFunctionType(FunctionType type, EncodingWriter &writer) {
+  LogicalResult serializeFunctionType(FunctionType type,
+                                      EncodingWriter &writer) {
     // Write the function type with tag
     writer.writeVarInt(Bytecode::TypeTag::FunctionType);
     // Using VarInt for numParams per spec
@@ -1067,28 +1065,28 @@ struct FunctionTableWriter {
           writer.writeByte(boolAttr.getValue() ? 0x01 : 0x00);
           return success();
         })
-        .Case<DenseElementsAttr>([&](DenseElementsAttr denseAttr)
-                                     -> LogicalResult {
-          if (isSelfContained) {
-            writer.writeVarInt(Bytecode::AttributeTag::DenseElements);
-            if (failed(typeMgr.writeTypeIndex(denseAttr.getType(), writer)))
-              return op->emitError(
-                  "failed to write type index for DenseElementsAttr");
-          }
+        .Case<DenseElementsAttr>(
+            [&](DenseElementsAttr denseAttr) -> LogicalResult {
+              if (isSelfContained) {
+                writer.writeVarInt(Bytecode::AttributeTag::DenseElements);
+                if (failed(typeMgr.writeTypeIndex(denseAttr.getType(), writer)))
+                  return op->emitError(
+                      "failed to write type index for DenseElementsAttr");
+              }
 
-          if (auto intOrFPAttr =
-                  dyn_cast<DenseTypedElementsAttr>(denseAttr)) {
-            uint64_t constantIndex;
-            if (failed(constMgr.addConstant(intOrFPAttr, constantIndex)))
-              return op->emitError("failed to add constant attribute '")
-                     << attrName << "' to pool: " << intOrFPAttr;
-            writer.writeVarInt(constantIndex);
-            return success();
-          }
+              if (auto intOrFPAttr =
+                      dyn_cast<DenseTypedElementsAttr>(denseAttr)) {
+                uint64_t constantIndex;
+                if (failed(constMgr.addConstant(intOrFPAttr, constantIndex)))
+                  return op->emitError("failed to add constant attribute '")
+                         << attrName << "' to pool: " << intOrFPAttr;
+                writer.writeVarInt(constantIndex);
+                return success();
+              }
 
-          return op->emitError("unsupported DenseElementsAttr element type "
-                               "during serialization");
-        })
+              return op->emitError("unsupported DenseElementsAttr element type "
+                                   "during serialization");
+            })
         .Case<cuda_tile::DivByAttr>([&](cuda_tile::DivByAttr attr) {
           if (isSelfContained)
             writer.writeVarInt(Bytecode::AttributeTag::DivBy);

@@ -371,7 +371,7 @@ cuda_tile.module @kernels {
     // CHECK: extract %{{.*}}[%{{.*}}] : tile<8xf32> -> tile<4xf32>
     %0 = extract %t[%idx] : tile<8xf32> -> tile<4xf32>
   }
-  
+
   // CHECK-LABEL: add_ptr_i8
   testing$func @add_ptr_i8(%ptr: !cuda_tile.tile<8x!cuda_tile.ptr<f32>>, %idx: !cuda_tile.tile<8xi8>) {
     // CHECK:  %{{.+}} = offset %{{.+}}, %{{.+}} : tile<8xptr<f32>>, tile<8xi8> -> tile<8xptr<f32>>
@@ -413,7 +413,7 @@ cuda_tile.module @kernels {
 
     // CHECK: make_tensor_view %[[BASE]], shape = [32, 32], strides = [%[[CI64]], 1] : tile<i64> -> tensor_view<32x32xf32, strides=[?,1]>
     make_tensor_view %base, shape = [32, 32], strides = [%ci64, 1] : tile<i64> -> tensor_view<32x32xf32, strides=[?,1]>
-    
+
     // CHECK: make_tensor_view %[[BASE]], shape = [%[[CI64]], %[[CI64]]], strides = [%[[CI64]], 1] : tile<i64> -> tensor_view<?x?xf32, strides=[?,1]>
     make_tensor_view %base, shape = [%ci64, %ci64], strides = [%ci64, 1] : tile<i64> -> tensor_view<?x?xf32, strides=[?,1]>
 
@@ -524,19 +524,19 @@ cuda_tile.module @kernels {
     %c0i8 = constant <i8: 0> : !cuda_tile.tile<i8>
     // CHECK: %[[C0I1:.+]] = constant <i1: false> : tile<i1>
     %c0i1 = constant <i1: false> : !cuda_tile.tile<i1>
-    
+
     // Stores
 
     // CHECK: %{{.+}} = store_view_tko weak %[[T1]], %[[VIEW1]][%[[C0I64]]] : tile<8xf32>, partition_view<tile=(8), tensor_view<128xf32, strides=[1]>>, tile<i64> -> token
     // CHECK: %{{.+}} = store_view_tko weak %[[T3]], %[[VIEW3]][%[[C0I64]], %[[C0I64]], %[[C0I64]]] : tile<1024x1024x8xf32>, partition_view<tile=(1024x1024x8), tensor_view<8192x8192x64xf32, strides=[524288,64,1]>>, tile<i64> -> token
     %s1i64 = store_view_tko weak %t1, %view1[%c0i64] : tile<8xf32>, partition_view<tile=(8), tensor_view<128xf32, strides=[1]>>, tile<i64> -> token
     %s2i64 = store_view_tko weak %t3, %view3[%c0i64, %c0i64, %c0i64] : tile<1024x1024x8xf32>, partition_view<tile=(1024x1024x8), tensor_view<8192x8192x64xf32, strides=[524288,64,1]>>, tile<i64> -> token
-  
+
     // CHECK: %{{.+}} = store_view_tko weak %[[T1]], %[[VIEW1]][%[[C0I32]]] : tile<8xf32>, partition_view<tile=(8), tensor_view<128xf32, strides=[1]>>, tile<i32> -> token
     // CHECK: %{{.+}} = store_view_tko weak %[[T3]], %[[VIEW3]][%[[C0I32]], %[[C0I32]], %[[C0I32]]] : tile<1024x1024x8xf32>, partition_view<tile=(1024x1024x8), tensor_view<8192x8192x64xf32, strides=[524288,64,1]>>, tile<i32> -> token
     %s1i32 = store_view_tko weak %t1, %view1[%c0i32] : tile<8xf32>, partition_view<tile=(8), tensor_view<128xf32, strides=[1]>>, tile<i32> -> token
     %s2i32 = store_view_tko weak %t3, %view3[%c0i32, %c0i32, %c0i32] : tile<1024x1024x8xf32>, partition_view<tile=(1024x1024x8), tensor_view<8192x8192x64xf32, strides=[524288,64,1]>>, tile<i32> -> token
-  
+
     // CHECK: %{{.+}} = store_view_tko weak %[[T1]], %[[VIEW1]][%[[C0I16]]] : tile<8xf32>, partition_view<tile=(8), tensor_view<128xf32, strides=[1]>>, tile<i16> -> token
     // CHECK: %{{.+}} = store_view_tko weak %[[T3]], %[[VIEW3]][%[[C0I16]], %[[C0I16]], %[[C0I16]]] : tile<1024x1024x8xf32>, partition_view<tile=(1024x1024x8), tensor_view<8192x8192x64xf32, strides=[524288,64,1]>>, tile<i16> -> token
     %s1i16 = store_view_tko weak %t1, %view1[%c0i16] : tile<8xf32>, partition_view<tile=(8), tensor_view<128xf32, strides=[1]>>, tile<i16> -> token
@@ -608,7 +608,7 @@ cuda_tile.module @kernels {
   testing$func @concat(%arg0: !cuda_tile.tile<1x2xf32>) {
     // CHECK: cat %{{.+}}, %{{.+}} dim = 0 : tile<1x2xf32>, tile<1x2xf32>
     // CHECK-SAME:  -> tile<2x2xf32>
-    %0 = cat %arg0, %arg0 dim = 0 
+    %0 = cat %arg0, %arg0 dim = 0
       : tile<1x2xf32>, tile<1x2xf32> -> tile<2x2xf32>
   }
 
@@ -730,7 +730,7 @@ cuda_tile.module @kernels {
       // CHECK: cmpf equal ordered %[[s0]], %[[s0]] : tile<f16>
       // CHECK: cmpf equal ordered %[[s0]], %[[s0]] : tile<f16>
       %s0 = constant <f16: 42.0> : tile<f16>
-      %cmpf_scalar_asm = cmpf equal ordered %s0, %s0 : tile<f16> -> tile<i1> 
+      %cmpf_scalar_asm = cmpf equal ordered %s0, %s0 : tile<f16> -> tile<i1>
       %cmpf_scalar_generic = "cuda_tile.cmpf"(%s0, %s0) {comparison_predicate = #cuda_tile.comparison_predicate<equal>, comparison_ordering = #cuda_tile.comparison_ordering<ordered>} : (!cuda_tile.tile<f16>, !cuda_tile.tile<f16>) -> !cuda_tile.tile<i1>
 
       // CHECK: %[[v0:.*]] = constant <f32: {{\[.*\]}}> : tile<4xf32>
@@ -860,7 +860,7 @@ cuda_tile.module @kernels {
     %4 = tan %arg0 : tile<2xf32>
     // CHECK: tanh %{{.*}} : tile<2xf32>
     %5 = tanh %arg0 : tile<2xf32>
-    
+
     // f64 operations
     // CHECK: cos %{{.*}} : tile<2xf64>
     %6 = cos %arg1 : tile<2xf64>

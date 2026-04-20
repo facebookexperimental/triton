@@ -67,7 +67,7 @@ def CudaTile_TileView : TypeInterface<"TileView"> {
 
 class AllElementTypeMatch<string summary, list<string> names>
   : PredOpTrait<summary,
-                AllMatchSameOperatorPred<names, 
+                AllMatchSameOperatorPred<names,
                   "::llvm::cast<::mlir::cuda_tile::TileType>($_self.getType()).getElementType()">> {
   list<string> values = names;
 }

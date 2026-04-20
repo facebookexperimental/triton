@@ -11,4 +11,3 @@ cuda_tile.module @test_future_version_rejection {
     %result = cuda_tile.negi %input overflow<no_signed_wrap> : !cuda_tile.tile<2xi32>
   }
 }
-

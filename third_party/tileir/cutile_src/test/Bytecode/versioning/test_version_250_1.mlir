@@ -7,7 +7,7 @@ cuda_tile.module @version_250_1_features {
   entry @test_operand_parsing() {
     %input = constant <f32: [1.0, 2.0]> : !cuda_tile.tile<2xf32>
     %token_in = make_token : !cuda_tile.token
-    %token_out = testing$bytecode_test_evolution (%input : !cuda_tile.tile<2xf32>) 
+    %token_out = testing$bytecode_test_evolution (%input : !cuda_tile.tile<2xf32>)
       token = %token_in : !cuda_tile.token -> !cuda_tile.token
     // CHECK: %{{.*}} = testing$bytecode_test_evolution(%{{.*}} : !cuda_tile.tile<2xf32>) token = %{{.*}} : token -> token
     return

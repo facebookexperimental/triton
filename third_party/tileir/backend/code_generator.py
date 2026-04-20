@@ -35,6 +35,7 @@ from triton.runtime.jit import (
 
 from triton.backends.tileir.conf import TileIREnvConf
 
+
 def mangle_fn(name, arg_tys, caller_context):
     # doesn't mangle ret type, which must be a function of arg tys
     mangled_args = '_'.join([tileir_mangle_ty(ty) for ty in arg_tys])
@@ -46,6 +47,7 @@ def mangle_fn(name, arg_tys, caller_context):
         ret += caller_context.mangle()
     return ret
 
+
 def tileir_mangle_ty(ty):
     return ty.mangle()
 
@@ -53,13 +55,10 @@ def tileir_mangle_ty(ty):
 def tileir_mangle_fn(name, arg_tys, constants):
     # doesn't mangle ret type, which must be a function of arg tys
     mangled_arg_names = "_".join([tileir_mangle_ty(ty) for ty in arg_tys])
-    mangled_constants = "_".join(
-        [f"{i}c{repr(constants[i])}" for i in sorted(constants)]
-    )
+    mangled_constants = "_".join([f"{i}c{repr(constants[i])}" for i in sorted(constants)])
     mangled_constants = mangled_constants.replace(".", "_d_")
     mangled_constants = mangled_constants.replace("'", "_sq_")
     # [ and ] are not allowed in LLVM identifiers
     mangled_constants = mangled_constants.replace('[', '_').replace(']', '_')
     ret = f'{name}__{mangled_arg_names}__{mangled_constants}'
     return ret
-

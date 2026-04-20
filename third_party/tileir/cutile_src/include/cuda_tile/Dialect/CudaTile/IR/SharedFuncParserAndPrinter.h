@@ -77,8 +77,7 @@ ParseResult parseFuncOp(OpAsmParser &parser, OperationState &result) {
   return success();
 }
 
-template <typename OpTy>
-void printFuncOp(OpTy op, OpAsmPrinter &printer) {
+template <typename OpTy> void printFuncOp(OpTy op, OpAsmPrinter &printer) {
   // Print the operation and the function name.
   auto funcName =
       op.getOperation()

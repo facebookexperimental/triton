@@ -50,12 +50,12 @@ struct Header {
   friend raw_ostream &operator<<(raw_ostream &os, const Header &header);
 };
 
-raw_ostream& operator<<(raw_ostream& os, const Header& header);
+raw_ostream &operator<<(raw_ostream &os, const Header &header);
 
 struct CodeBlockStart {
-    size_t start;
-    size_t length;
-    std::string language;
+  size_t start;
+  size_t length;
+  std::string language;
 };
 
 /// Finds the starting prefix of an exapmle which may be the start
@@ -66,8 +66,8 @@ struct CodeBlockStart {
 CodeBlockStart findExampleStart(size_t start, StringRef content);
 
 struct CodeBlock {
-    std::string language;
-    std::string code;
+  std::string language;
+  std::string code;
 };
 struct TableRow {
   std::vector<std::string> columns;
@@ -119,10 +119,10 @@ struct Table {
 raw_ostream &operator<<(raw_ostream &os, const Table &table);
 
 struct CodeBlockOptions {
-    std::string language;
+  std::string language;
 
-    CodeBlockOptions() : language("") {}
-    CodeBlockOptions(const std::string &language) : language(language) {}
+  CodeBlockOptions() : language("") {}
+  CodeBlockOptions(const std::string &language) : language(language) {}
 };
 
 enum BadgeType {
@@ -191,7 +191,7 @@ raw_ostream &operator<<(raw_ostream &os, const Badge &badge);
 
 /// Emits the specification into a textual form.
 class SpecEmitter {
-// For now leak the implementation to enable gradual transition to this class.
+  // For now leak the implementation to enable gradual transition to this class.
 public:
   // The output stream for writing out the file specification.
   raw_indented_ostream &os;

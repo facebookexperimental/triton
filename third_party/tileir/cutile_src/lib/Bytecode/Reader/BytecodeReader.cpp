@@ -826,8 +826,7 @@ public:
         : reader(reader), opIndex(opIndex) {}
 
     /// Return the next debug info attribute for the current operation.
-    template <typename T>
-    T next() {
+    template <typename T> T next() {
       // Check if the index is reserved for special debug info attributes.
       if (opIndex == static_cast<uint64_t>(Bytecode::DebugReserved::UnknownLoc))
         return dyn_cast<T>(UnknownLoc::get(&reader.context));
@@ -874,8 +873,7 @@ public:
 
 private:
   /// This method returns a debug info attribute for a given index.
-  template <typename T>
-  T getDebugInfo(uint64_t diIndex) {
+  template <typename T> T getDebugInfo(uint64_t diIndex) {
     // Check if the index is reserved for special debug info attributes.
     if (diIndex == static_cast<uint64_t>(Bytecode::DebugReserved::UnknownLoc))
       return dyn_cast<T>(UnknownLoc::get(&context));
@@ -892,8 +890,7 @@ private:
   }
 
   /// This method reads an index and converts it to a debug info attribute.
-  template <typename T>
-  T readAndGetDebugInfo(EncodingReader &reader) {
+  template <typename T> T readAndGetDebugInfo(EncodingReader &reader) {
     uint64_t diIndex;
     if (failed(reader.readVarInt(diIndex)))
       return T();
@@ -1718,7 +1715,7 @@ class InstructionParser {
                                   dictAttr, expectedType)))
         return failure();
       nativeValue = cuda_tile::OptimizationHintsAttr::getChecked(
-          [&]() {  return reader.emitError(); }, &context, dictAttr);
+          [&]() { return reader.emitError(); }, &context, dictAttr);
       if (!nativeValue)
         return reader.emitError() << "failed to parse OptimizationHintsAttr";
       return success();
@@ -1886,8 +1883,8 @@ public:
     if (!loc)
       return reader.emitError() << "failed to read operation location.";
 
-      // Includes the generated switch statement for dispatching to the
-      // appropriate 'parse<OpName>' function based on the opcode.
+    // Includes the generated switch statement for dispatching to the
+    // appropriate 'parse<OpName>' function based on the opcode.
 #define GEN_OP_READER_DISPATCH
 #include "BytecodeReader.inc"
 
@@ -2106,8 +2103,8 @@ static LogicalResult parseFunctionTableSection(
              << " bytes for function body";
 
     funcInfo.functionBody =
-      StringRef(reinterpret_cast<const char *>(bodyBytes.data()),
-                    funcInfo.lengthOfFunction);
+        StringRef(reinterpret_cast<const char *>(bodyBytes.data()),
+                  funcInfo.lengthOfFunction);
 
     functionInfoList.emplace_back(funcInfo);
   }
@@ -2354,7 +2351,7 @@ std::optional<size_t> cuda_tile::getBytecodeSize(const char *bytecodeBuffer) {
   if (!isTileIRBytecode(bytecodeBuffer))
     return std::nullopt;
 
-  auto charBuffer = reinterpret_cast<const unsigned char*>(bytecodeBuffer);
+  auto charBuffer = reinterpret_cast<const unsigned char *>(bytecodeBuffer);
   if (charBuffer[sizeof(kTileIRBytecodeMagic)] == 0)
     return std::nullopt;
 

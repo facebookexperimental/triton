@@ -707,7 +707,7 @@ module attributes {gpu.container_module} {
         }
         %98 = addi %8, %96 : tile<i32>
         continue %98 : tile<i32>
-      } 
+      }
       %10 = addi %4, %c7 : tile<i32>
       %20 = store_ptr_tko weak %arg0, %10 : tile<ptr<i32>>, tile<i32> -> token
       return

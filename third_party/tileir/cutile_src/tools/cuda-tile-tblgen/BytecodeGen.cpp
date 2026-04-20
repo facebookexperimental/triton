@@ -154,19 +154,19 @@ static void generateFlagsFieldSerialization(const Operator &op,
       std::string getterName = op.getGetterName(attrName);
       size_t bitPos = bitAssignments.lookup(attrName);
 
-        auto [majorStr, minorStr] = extractVersionFromAttribute(namedAttr, op);
-        std::string version = majorStr + "." + minorStr;
+      auto [majorStr, minorStr] = extractVersionFromAttribute(namedAttr, op);
+      std::string version = majorStr + "." + minorStr;
 
-        if (version == opVersion) {
-          // Attribute from original operation - simple flag setting.
-          os << llvm::formatv(R"(
+      if (version == opVersion) {
+        // Attribute from original operation - simple flag setting.
+        os << llvm::formatv(R"(
   auto flagsAttrValue_{0} = op.{1}();
   if (flagsAttrValue_{0}) flags |= (1ULL << {2});
 )",
-                              attrName, getterName, bitPos);
-        } else {
-          // Versioned attribute - validate version compatibility.
-          os << llvm::formatv(R"(
+                            attrName, getterName, bitPos);
+      } else {
+        // Versioned attribute - validate version compatibility.
+        os << llvm::formatv(R"(
   auto flagsAttrValue_{0} = op.{1}();
   if (flagsAttrValue_{0}) {{
     auto flagsRequiredVersionFor_{0} = BytecodeVersion::fromVersion({2}, {3}, 0);
@@ -180,9 +180,9 @@ static void generateFlagsFieldSerialization(const Operator &op,
   }
   // Attribute not provided - don't set flag.
 )",
-                              attrName, getterName, majorStr, minorStr, version,
-                              bitPos);
-        }
+                            attrName, getterName, majorStr, minorStr, version,
+                            bitPos);
+      }
     }
   }
 
@@ -190,8 +190,7 @@ static void generateFlagsFieldSerialization(const Operator &op,
   if (op.getTrait("::mlir::OpTrait::AttrSizedOperandSegments")) {
     for (const auto &[operandIndex, odsOperand] :
          llvm::enumerate(op.getOperands())) {
-      if (!odsOperand.isOptional()
-      ) {
+      if (!odsOperand.isOptional()) {
         // Validate that required operands were introduced with the operation
         // itself.
         auto [majorStr, minorStr] = extractVersionFromOperand(operandIndex, op);
@@ -209,19 +208,18 @@ static void generateFlagsFieldSerialization(const Operator &op,
 )",
                             operandIndex);
 
-          auto [majorStr, minorStr] =
-              extractVersionFromOperand(operandIndex, op);
-          std::string version = majorStr + "." + minorStr;
+        auto [majorStr, minorStr] = extractVersionFromOperand(operandIndex, op);
+        std::string version = majorStr + "." + minorStr;
 
-          if (version == opVersion) {
-            // Operand from original operation - no version checking needed.
-            os << llvm::formatv(R"(
+        if (version == opVersion) {
+          // Operand from original operation - no version checking needed.
+          os << llvm::formatv(R"(
   if (!operandGroup_{0}.empty()) flags |= (1ULL << {1});
 )",
-                                operandIndex, bitPos);
-          } else {
-            // Versioned operand - validate version compatibility.
-            os << llvm::formatv(R"(
+                              operandIndex, bitPos);
+        } else {
+          // Versioned operand - validate version compatibility.
+          os << llvm::formatv(R"(
   if (!operandGroup_{0}.empty()) {{
     auto requiredVersionFor_{1} = BytecodeVersion::fromVersion({2}, {3}, 0);
     assert(requiredVersionFor_{1} && "TableGen should guarantee valid versions");
@@ -234,9 +232,9 @@ static void generateFlagsFieldSerialization(const Operator &op,
   }
   // Operand not provided - don't set flag.
 )",
-                                operandIndex, operandName, majorStr, minorStr,
-                                version, bitPos);
-          }
+                              operandIndex, operandName, majorStr, minorStr,
+                              version, bitPos);
+        }
       }
     }
   }
@@ -323,20 +321,20 @@ static void generateAttributeSerialization(const Operator &op,
     } else {
       // Required attributes: need version checking and default value
       // validation.
-        auto [majorStr, minorStr] = extractVersionFromAttribute(namedAttr, op);
-        auto defaultValue = extractDefaultValue(namedAttr);
-        std::string version = majorStr + "." + minorStr;
+      auto [majorStr, minorStr] = extractVersionFromAttribute(namedAttr, op);
+      auto defaultValue = extractDefaultValue(namedAttr);
+      std::string version = majorStr + "." + minorStr;
 
-        os << llvm::formatv(R"(
+      os << llvm::formatv(R"(
   auto requiredVersionFor_{0} = BytecodeVersion::fromVersion({1}, {2}, 0);
   assert(requiredVersionFor_{0} && "TableGen should guarantee valid versions");
   if (config.bytecodeVersion >= *requiredVersionFor_{0}) {{
 )",
-                            attrName, majorStr, minorStr);
-        generateAttributeSerializationLogic(os, getterName, attrName, "    ");
-        os << "  } else {\n";
-        if (defaultValue.has_value()) {
-          os << llvm::formatv(R"(
+                          attrName, majorStr, minorStr);
+      generateAttributeSerializationLogic(os, getterName, attrName, "    ");
+      os << "  } else {\n";
+      if (defaultValue.has_value()) {
+        os << llvm::formatv(R"(
     // Check that attribute equals default value for older versions.
     auto nativeAttrValue_{0} = op.{1}();
     if (nativeAttrValue_{0} != {2}) {{
@@ -344,24 +342,24 @@ static void generateAttributeSerialization(const Operator &op,
       return failure();
     }
 )",
-                              attrName, getterName, *defaultValue, version);
-        } else {
-          // No default value available.
-          std::string opVersion = extractVersionFromOperation(op);
-          if (version != opVersion) {
-            // Required attributes introduced after the operation must have
-            // default value.
-            PrintFatalError(
-                "Versioned attribute '" + namedAttr.name + "' in operation '" +
-                op.getOperationName() + "' (since " + version +
-                ") was introduced after the operation itself (since " +
-                opVersion +
-                ") and must have a default value for backward compatibility");
-          }
-          // Note: Attributes introduced with the operation itself don't need
-          // defaults.
+                            attrName, getterName, *defaultValue, version);
+      } else {
+        // No default value available.
+        std::string opVersion = extractVersionFromOperation(op);
+        if (version != opVersion) {
+          // Required attributes introduced after the operation must have
+          // default value.
+          PrintFatalError(
+              "Versioned attribute '" + namedAttr.name + "' in operation '" +
+              op.getOperationName() + "' (since " + version +
+              ") was introduced after the operation itself (since " +
+              opVersion +
+              ") and must have a default value for backward compatibility");
         }
-        os << "  }\n";
+        // Note: Attributes introduced with the operation itself don't need
+        // defaults.
+      }
+      os << "  }\n";
     }
   }
   os << "\n";

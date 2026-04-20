@@ -1,5 +1,4 @@
 # RUN: %PYTHON -m pytest %s
-
 """
 Tests for element type wrappers in cuda_tile.dialects.cuda_tile_ops.
 
