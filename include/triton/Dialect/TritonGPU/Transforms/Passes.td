@@ -290,10 +290,22 @@ def TritonGPURemoveLayoutConversions : Pass<"tritongpu-remove-layout-conversions
     `BlockedEncodingAttr` layout for "expensive" loads and stores
     (good for coalescing) and `NvidiaMmaEncodingAttr` otherwise
     (good for tensor ops).
+
+    When `smemBudget` is nonzero, the pass additionally checks whether the
+    chosen layout would produce a `convert_layout` whose scratch buffer
+    causes total shared memory usage to exceed the budget. In that case it
+    overrides the default heuristic and picks the layout that can be absorbed
+    by a `local_load` or `local_store` without scratch.
   }];
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::TritonDialect"];
+
+  let options = [
+    Option<"smemBudget", "smem-budget", "unsigned", /*default=*/"0",
+           "When nonzero, override layout choices whose convert_layout "
+           "scratch would push shared memory usage above this budget (bytes)">
+  ];
 
 }
 

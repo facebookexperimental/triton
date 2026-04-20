@@ -427,6 +427,10 @@ public:
           rewriter, dotOp.getLoc(), mmaResult.newRetType, a, b,
           mmaResult.newAcc, nullptr, dotOp.getInputPrecision(),
           dotOp.getMaxNumImpreciseAcc(), false);
+      // Propagate discardable attributes (e.g. tt.autows) from the original
+      // dot.
+      for (auto attr : dotOp->getDiscardableAttrs())
+        newDot->setDiscardableAttr(attr.getName(), attr.getValue());
     } else {
       int minBitwidth =
           std::min(computeOrigBitWidth(a), computeOrigBitWidth(b));

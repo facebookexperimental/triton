@@ -1258,6 +1258,9 @@ class CodeGenerator(ast.NodeVisitor):
         disallow_acc_multi_buffer = False
         data_partition_factor = None
         merge_epilogue = False
+        merge_epilogue_to_computation = False
+        merge_correction = False
+        separate_epilogue_store = False
         tmem_alloc_algo = None
         smem_alloc_algo = None
         smem_budget = None
@@ -1279,6 +1282,9 @@ class CodeGenerator(ast.NodeVisitor):
             disallow_acc_multi_buffer = iterator.disallow_acc_multi_buffer
             data_partition_factor = iterator.data_partition_factor
             merge_epilogue = iterator.merge_epilogue
+            merge_epilogue_to_computation = iterator.merge_epilogue_to_computation
+            merge_correction = iterator.merge_correction
+            separate_epilogue_store = iterator.separate_epilogue_store
             tmem_alloc_algo = iterator.tmem_alloc_algo
             smem_alloc_algo = iterator.smem_alloc_algo
             smem_budget = iterator.smem_budget
@@ -1355,6 +1361,12 @@ class CodeGenerator(ast.NodeVisitor):
                 for_op.set_attr("tt.multi_cta", self.builder.get_unit_attr())
             if merge_epilogue:
                 for_op.set_attr("tt.merge_epilogue", self.builder.get_bool_attr(True))
+            if merge_correction:
+                for_op.set_attr("tt.merge_correction", self.builder.get_bool_attr(True))
+            if merge_epilogue_to_computation:
+                for_op.set_attr("tt.merge_epilogue_to_computation", self.builder.get_bool_attr(True))
+            if separate_epilogue_store:
+                for_op.set_attr("tt.separate_epilogue_store", self.builder.get_bool_attr(True))
             if tmem_alloc_algo is not None:
                 for_op.set_attr("tt.tmem_alloc_algo", self.builder.get_int32_attr(tmem_alloc_algo))
             if smem_alloc_algo is not None:
