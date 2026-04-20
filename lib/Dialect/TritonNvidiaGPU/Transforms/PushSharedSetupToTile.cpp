@@ -175,16 +175,39 @@ void pushSharedSetupToTile(SubtiledRegionOp op) {
   if (movableArgs.empty())
     return;
 
-  // Step 3: Clone ops into the tile body and replace tile args.
+  // Step 3: Clone ops into the tile body, sinking each shared arg's
+  // dependency chain to right before its first use. This keeps tmem_load
+  // close to its consumer rather than hoisting it above barrier waits.
+
   // Sort ops in program order for correct cloning.
   SmallVector<Operation *> sortedOps(opsToMove.begin(), opsToMove.end());
   llvm::sort(sortedOps,
              [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
 
-  OpBuilder tileBuilder(&tileBlock, tileBlock.begin());
+  // Record original tile ops so we can distinguish them from cloned ops
+  // when adjusting barrier annotations.
+  DenseSet<Operation *> originalTileOps;
+  for (Operation &tileOp : tileBlock.without_terminator())
+    originalTileOps.insert(&tileOp);
+
+  // For each movable arg, find the earliest op in the tile body that uses
+  // it. This is where we will sink the shared dependency chain.
+  Operation *earliestUser = nullptr;
+  for (auto &sa : movableArgs) {
+    BlockArgument arg = tileBlock.getArgument(sa.argPosition);
+    for (Operation *user : arg.getUsers()) {
+      if (!earliestUser || user->isBeforeInBlock(earliestUser))
+        earliestUser = user;
+    }
+  }
+
+  // Clone the dependency chain right before the earliest consumer.
   IRMapping cloneMapping;
-  for (Operation *o : sortedOps)
-    tileBuilder.clone(*o, cloneMapping);
+  if (earliestUser) {
+    OpBuilder tileBuilder(&tileBlock, Block::iterator(earliestUser));
+    for (Operation *o : sortedOps)
+      tileBuilder.clone(*o, cloneMapping);
+  }
 
   // Replace tile block args with cloned values (or external values).
   for (auto &sa : movableArgs) {
@@ -250,20 +273,32 @@ void pushSharedSetupToTile(SubtiledRegionOp op) {
                                 newYieldValues);
   setupYield.erase();
 
-  // Step 5: Update barrier annotations — increment targetOpIdx for TILE
-  // annotations by the number of ops inserted at the tile body start.
-  unsigned numInserted = sortedOps.size();
-  if (numInserted > 0) {
+  // Step 5: Update barrier annotations — for each TILE annotation, count
+  // how many cloned ops were inserted before its target op.
+  unsigned numCloned = sortedOps.size();
+  if (numCloned > 0) {
+    SmallVector<unsigned> clonedBeforeOrigOp;
+    unsigned clonedSoFar = 0;
+    for (Operation &tileOp : tileBlock.without_terminator()) {
+      if (!originalTileOps.contains(&tileOp))
+        clonedSoFar++;
+      else
+        clonedBeforeOrigOp.push_back(clonedSoFar);
+    }
+
     SmallVector<Attribute> newAnnotations;
     for (Attribute attr : op.getBarrierAnnotations()) {
       auto annotation = cast<BarrierAnnotationAttr>(attr);
       if (annotation.getRegion() == BarrierRegion::TILE) {
+        unsigned origTarget = annotation.getTargetOpIdx();
+        unsigned offset = origTarget < clonedBeforeOrigOp.size()
+                              ? clonedBeforeOrigOp[origTarget]
+                              : clonedSoFar;
         auto newAnnotation = BarrierAnnotationAttr::get(
             ctx, annotation.getBarrierIdx(), annotation.getPlacement(),
-            annotation.getTargetOpIdx() + numInserted,
-            annotation.getBarrierOpKind(), annotation.getCount(),
-            annotation.getRegion(), annotation.getNumBuffers(),
-            annotation.getTileMask());
+            origTarget + offset, annotation.getBarrierOpKind(),
+            annotation.getCount(), annotation.getRegion(),
+            annotation.getNumBuffers(), annotation.getTileMask());
         newAnnotations.push_back(newAnnotation);
       } else {
         newAnnotations.push_back(attr);
