@@ -2620,13 +2620,9 @@ void insertAsyncComm(
               // directly from memory anyway.
               while (llvm::isa<ttg::ConvertLayoutOp>(user) && user->hasOneUse())
                 user = *user->getUsers().begin();
-              if (llvm::isa<tt::DescriptorStoreOp>(user)) {
-                consumerOps.insert(user);
-                actualConsumerOps.insert(user);
-              }
-              // Also handle the early-lowered TMA store pattern:
-              // AsyncTMACopyLocalToGlobalOp -> TMAStoreTokenWaitOp
-              if (llvm::isa<ttng::AsyncTMACopyLocalToGlobalOp>(user)) {
+              // Handle descriptor store or early lowered TMA store
+              if (llvm::isa<tt::DescriptorStoreOp,
+                            ttng::AsyncTMACopyLocalToGlobalOp>(user)) {
                 consumerOps.insert(user);
                 actualConsumerOps.insert(user);
               }
