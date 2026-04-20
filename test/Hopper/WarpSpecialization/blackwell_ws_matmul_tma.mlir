@@ -447,3 +447,66 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     tt.return
   }
 }
+
+// -----
+
+// Test case: Blackwell GEMM with two chained MMAs sharing the same TMEM as
+// operand D. This tests that handleOperandD in the warp specialization code
+// partition correctly handles multiple MMAs writing to the same accumulator
+// (e.g., for v-subtiling in flash attention: acc = dot(p0, v0) + dot(p1, v1)).
+
+// CHECK-LABEL: @matmul_kernel_chained_mma_ws
+// CHECK: ttg.warp_specialize
+// Default group: Both chained MMAs share the same TMEM accumulator
+// CHECK: default
+// CHECK: ttng.tc_gen5_mma
+// CHECK: ttng.tc_gen5_mma
+// Group 0: Descriptor load operations (producer)
+// CHECK: partition0
+// CHECK: ttng.async_tma_copy_global_to_local
+// Group 1: Epilogue operations
+// CHECK: partition1
+// CHECK: ttng.tmem_load
+// CHECK: tt.descriptor_store
+
+#blocked13 = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#blocked14 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
+#blocked15 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+#shared10 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared11 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem6 = #ttg.shared_memory
+#tmem6 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @matmul_kernel_chained_mma_ws(%a_desc: !tt.tensordesc<tensor<128x64xf16, #shared10>>, %b_desc: !tt.tensordesc<tensor<128x64xf16, #shared10>>, %c_desc: !tt.tensordesc<tensor<128x128xf16, #shared10>>, %M: i32 {tt.divisibility = 16 : i32}, %K: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    %false = arith.constant false
+    %true = arith.constant true
+    %c128_i32 = arith.constant 128 : i32
+    %c64_i32 = arith.constant 64 : i32
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %c127_i32 = arith.constant 127 : i32
+    %k_tiles = arith.addi %K, %c127_i32 : i32
+    %k_tiles_div = arith.divsi %k_tiles, %c64_i32 : i32
+    %pid = tt.get_program_id x : i32
+    %offs_am = arith.muli %pid, %c128_i32 : i32
+    %accumulator, %accumulator_tok = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem6, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    %result:2 = scf.for %i = %c0_i32 to %k_tiles_div step %c1_i32 iter_args(%use_acc = %false, %tok = %accumulator_tok) -> (i1, !ttg.async.token)  : i32 {
+      %offs_k = arith.muli %i, %c64_i32 {loop.cluster = 1 : i32, loop.stage = 0 : i32} : i32
+      // Partition 2: Load A and B
+      %a = tt.descriptor_load %a_desc[%offs_am, %offs_k] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<128x64xf16, #shared10>> -> tensor<128x64xf16, #blocked14>
+      %a_sh = ttg.local_alloc %a {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 2>} : (tensor<128x64xf16, #blocked14>) -> !ttg.memdesc<128x64xf16, #shared10, #smem6>
+      %b = tt.descriptor_load %b_desc[%offs_am, %offs_k] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<128x64xf16, #shared10>> -> tensor<128x64xf16, #blocked14>
+      %b_sh = ttg.local_alloc %b {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 2>} : (tensor<128x64xf16, #blocked14>) -> !ttg.memdesc<128x64xf16, #shared10, #smem6>
+      %b_t = ttg.memdesc_trans %b_sh {loop.cluster = 0 : i32, loop.stage = 1 : i32, order = array<i32: 1, 0>, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared10, #smem6> -> !ttg.memdesc<64x128xf16, #shared11, #smem6>
+      // Partition 1: Two chained MMAs sharing the same TMEM accumulator
+      %mma_tok1 = ttng.tc_gen5_mma %a_sh, %b_t, %accumulator[%tok], %use_acc, %true {loop.cluster = 0 : i32, loop.stage = 1 : i32, tt.self_latency = 1 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared10, #smem6>, !ttg.memdesc<64x128xf16, #shared11, #smem6>, !ttg.memdesc<128x128xf32, #tmem6, #ttng.tensor_memory, mutable>
+      %mma_tok2 = ttng.tc_gen5_mma %a_sh, %b_t, %accumulator[%mma_tok1], %true, %true {loop.cluster = 0 : i32, loop.stage = 1 : i32, tt.self_latency = 1 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared10, #smem6>, !ttg.memdesc<64x128xf16, #shared11, #smem6>, !ttg.memdesc<128x128xf32, #tmem6, #ttng.tensor_memory, mutable>
+      scf.yield %true, %mma_tok2 : i1, !ttg.async.token
+    } {tt.disallow_acc_multi_buffer, tt.scheduled_max_stage = 1 : i32, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    %tmem_result, %tmem_token = ttng.tmem_load %accumulator[%result#1] {ttg.partition = array<i32: 3>} : !ttg.memdesc<128x128xf32, #tmem6, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked13>
+    %c = arith.truncf %tmem_result {ttg.partition = array<i32: 3>} : tensor<128x128xf32, #blocked13> to tensor<128x128xf16, #blocked13>
+    %c_out = ttg.convert_layout %c {ttg.partition = array<i32: 3>} : tensor<128x128xf16, #blocked13> -> tensor<128x128xf16, #blocked15>
+    tt.descriptor_store %c_desc[%offs_am, %c0_i32], %c_out {ttg.partition = array<i32: 3>} : !tt.tensordesc<tensor<128x128xf16, #shared10>>, tensor<128x128xf16, #blocked15>
+    tt.return
+  }
+}

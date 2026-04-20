@@ -2364,8 +2364,9 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
       continue;
     handledUsers.insert(&op);
     if (auto mmaOpT = dyn_cast<ttng::TCGen5MMAOp>(&op)) {
-      if (&op == mmaOp.getOperation()) {
+      if (mmaOpT.getD() == tmemAllocOp.getResult()) {
         // This uses and defines D. Will be both producer and consumer.
+        // Multiple MMAs may share the same TMEM as operand D (chained MMAs).
         // If useAcc is false, the MMA doesn't read the accumulator - it
         // overwrites it completely. In this case, the MMA is the first
         // producer and doesn't need a prior producer.
@@ -2403,7 +2404,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
           }
         }
         if (currentProds.empty()) {
-          mmaOp.emitError(
+          mmaOpT.emitError(
               "handleOperandD: no producer found for MMA operand D. "
               "Expected a tmem_store before the loop or use_acc=false.");
           return failure();
@@ -2412,7 +2413,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
         auto producerTaskIds = getAsyncTaskIds(currentProds.front());
         auto consumerIds = getAsyncTaskIds(&op);
         if (producerTaskIds.size() != 1) {
-          mmaOp.emitError(
+          mmaOpT.emitError(
               "handleOperandD: expected exactly one producer task ID, got ")
               << producerTaskIds.size();
           return failure();
@@ -2432,11 +2433,6 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
           currentProds.push_back(&op);
         }
       } else {
-        if (mmaOpT.getD() == tmemAllocOp.getResult()) {
-          mmaOp.emitError(
-              "handleOperandD: unexpected MMA using same TMEM as operand D");
-          return failure();
-        }
         // This uses tmem. mark as tmem.end = channel_id
         if (currentProds.empty()) {
           mmaOpT.emitError(
