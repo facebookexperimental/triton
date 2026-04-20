@@ -146,6 +146,8 @@ def _attn_fwd_inner_oss_dp(
             hi,
             BLOCK_N,
             warp_specialize=warp_specialize,
+            merge_epilogue=True,
+            separate_epilogue_store=True,
             # disallow_acc_multi_buffer=True,
             data_partition_factor=DP_FACTOR,
     ):
@@ -565,6 +567,8 @@ def _attn_fwd_persist(
             0,
             tiles_per_sm,
             warp_specialize=warp_specialize and OUTER_LOOP,
+            merge_epilogue=True,
+            separate_epilogue_store=True,
             data_partition_factor=DP_FACTOR,
     ):
         pid = tile_idx % n_tile_num
@@ -790,8 +794,8 @@ def _attn_bwd_dkdv(
     curr_m = start_m
     step_m = BLOCK_M1
     if warp_specialize:
-        for blk_idx in tl.range(0, num_steps, warp_specialize=True, merge_epilogue=True, tmem_alloc_algo=2,
-                                smem_alloc_algo=1, smem_budget=200000):
+        for blk_idx in tl.range(0, num_steps, warp_specialize=True, merge_epilogue_to_computation=True,
+                                tmem_alloc_algo=2, smem_alloc_algo=1, smem_budget=200000):
             dk, dv, curr_m = _attn_bwd_dkdv_inner(
                 dk,
                 dv,
@@ -1166,8 +1170,8 @@ def _attn_bwd_persist(
         block_shape=[BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE],
     )
 
-    for _ in tl.range(0, tiles_per_sm, warp_specialize=True, merge_epilogue=True, tmem_alloc_algo=2, smem_alloc_algo=1,
-                      smem_budget=200000):
+    for _ in tl.range(0, tiles_per_sm, warp_specialize=True, merge_epilogue_to_computation=True, tmem_alloc_algo=2,
+                      smem_alloc_algo=1, smem_budget=200000):
         pid = tile_idx % n_tile_num
         bhid = tile_idx // n_tile_num
         _attn_bwd_core(
@@ -1259,7 +1263,7 @@ class _attention_opt(torch.autograd.Function):
                 extra_kern_args["maxnreg"] = 128
             else:
                 extra_kern_args["maxnreg"] = 128
-        if True:  # persistent: forward non-persistent has some issues
+        if persistent:
             _attn_fwd_persist[grid_persist](
                 sm_scale,
                 M,  #
@@ -1475,20 +1479,30 @@ attention = _attention_opt.apply
 @pytest.mark.parametrize("Z", [8])
 @pytest.mark.parametrize("H", [16])
 @pytest.mark.parametrize("N_CTX", [1024])  #, 2048])
-@pytest.mark.parametrize("HEAD_DIM", [128])
+@pytest.mark.parametrize("HEAD_DIM", [64, 128])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("mode", ["fwd", "bwd"])
-@pytest.mark.parametrize("baseVariant", ["ws_persistent"])
+@pytest.mark.parametrize("baseVariant", ["ws_persistent", "ws"])
 @pytest.mark.parametrize("provider", ["triton-fp16"])
 @pytest.mark.parametrize("SUBTILING", [False, True])
 @pytest.mark.parametrize("VECT_MUL", [0])  #, 1, 2, 3])
 @pytest.mark.parametrize("FADD2_REDUCE", [False])
+@pytest.mark.parametrize("bwd_config_idx", range(len(configs_bwd_persist)))
 def test_op(Z, H, N_CTX, HEAD_DIM, causal, mode, baseVariant, provider, SUBTILING, VECT_MUL, FADD2_REDUCE,
-            dtype=torch.float16):
+            bwd_config_idx, dtype=torch.float16):
+    # For fwd mode, only run once (bwd_config_idx=0) to avoid redundant tests
+    if mode == "fwd" and bwd_config_idx > 0:
+        pytest.skip("bwd_config_idx only applies to bwd mode")
     if mode == "bwd" and "fp8" in provider:
         pytest.skip("Backward pass with FP8 is not supported.")
-    if SUBTILING and baseVariant == "ws_persistent":
-        pytest.skip("SUBTILING with ws_persistent exceeds shared memory budget")
+    if mode == "bwd" and HEAD_DIM == 64 and bwd_config_idx == 1:
+        pytest.skip("bwd_config_idx of 1 does not work with hDim 64")
+    if mode == "bwd" and baseVariant == "ws_persistent":
+        _attn_bwd_persist.configs = [configs_bwd_persist[bwd_config_idx]]
+        _attn_bwd_persist.cache = {}
+    if mode == "bwd" and baseVariant == "ws":
+        _attn_bwd.configs = [configs_bwd_persist[bwd_config_idx]]
+        _attn_bwd.cache = {}
     torch.manual_seed(20)
     q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
     k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
