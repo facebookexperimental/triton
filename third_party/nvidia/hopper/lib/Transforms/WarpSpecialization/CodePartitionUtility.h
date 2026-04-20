@@ -263,6 +263,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             Value phase, Operation *headProducer,
                             Operation *headConsumer,
                             Operation *headConsumerSameLevel,
+                            SmallVector<int> additionalConsumerTaskIds = {},
                             bool isPost = false);
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters);
 Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
