@@ -217,7 +217,7 @@ class HIPBackend(BaseBackend):
         emuTF32 = False
         passes.ttgpuir.add_coalesce(pm)
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm, 0)
         passes.ttgpuir.add_optimize_thread_locality(pm)
         amd.passes.ttgpuir.add_lower_barrier_ops(pm)
 
@@ -231,7 +231,7 @@ class HIPBackend(BaseBackend):
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
         tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
 
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm, 0)
         amd.passes.ttgpuir.add_optimize_epilogue(pm)
         amd.passes.ttgpuir.add_optimize_dot_operands(pm, options.arch)
         amd.passes.ttgpuir.add_hoist_layout_conversions(pm)
@@ -252,11 +252,11 @@ class HIPBackend(BaseBackend):
         if options.schedule_hint.lower() != "none":
             for hint in options.schedule_hint.split(","):
                 amd.passes.ttgpuir.insert_instruction_sched_hints(pm, hint)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm, 0)
         passes.ttgpuir.add_reduce_data_duplication(pm)
         if is_in_thread_transpose_enabled(options.arch):
             amd.passes.ttgpuir.add_in_thread_transpose(pm)
-            passes.ttgpuir.add_remove_layout_conversions(pm)
+            passes.ttgpuir.add_remove_layout_conversions(pm, 0)
         amd.passes.ttgpuir.add_reorder_instructions(pm)
         if use_block_pingpong and options.num_stages > 1:
             amd.passes.ttgpuir.add_block_pingpong(pm, options.num_stages)
@@ -298,6 +298,7 @@ class HIPBackend(BaseBackend):
         passes.gluon.add_canonicalizer(pm)
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
         amd.passes.ttgpuir.add_warp_pipeline(pm)
+        passes.ttgpuir.add_allocate_warp_groups(pm)
 
         pm.run(mod, 'gluon_to_ttgir')
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
@@ -328,6 +329,7 @@ class HIPBackend(BaseBackend):
         ##    For now it is used as a controller for developers only.
         __HIP_FTZ = True
         amd.passes.ttgpuir.add_to_llvmir(pm, options.arch, __HIP_FTZ)
+        amd.passes.ttgpuir.add_warp_specialize_to_llvm(pm, options.arch)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
 
@@ -391,7 +393,12 @@ class HIPBackend(BaseBackend):
         fns = [fn for fn in llvm_mod.get_functions() if not fn.is_declaration()]
         # The public kernel should be kernel 0.
         fns[0].set_calling_conv(amd.CALLING_CONV_AMDGPU_KERNEL)
-        fns[0].add_fn_attr("amdgpu-flat-work-group-size", f"1,{options.num_warps*options.warp_size}")
+        # warp-specialization mutates num_warps
+        total_warps_num = options.num_warps
+        total_num_warps = src.get_int_attr("ttg.total-num-warps")
+        if total_num_warps is not None:
+            total_warps_num = total_num_warps
+        fns[0].add_fn_attr("amdgpu-flat-work-group-size", f"1,{total_warps_num*options.warp_size}")
         if "memory-bound-attention" in options.schedule_hint.split(','):
             fns[0].add_fn_attr("amdgpu-sched-strategy", "iterative-ilp")
         fns[0].add_fn_attr("uniform-work-group-size", "true")
@@ -414,7 +421,8 @@ class HIPBackend(BaseBackend):
         # Hint the compiler that we'd like the firmware to set the kernel arguments
         # to user SGPRs so that the kernel does not need to s_load its arguments
         # from memory.
-        amd.set_all_fn_arg_inreg(fns[0])
+        if options.arch != "gfx1250":
+            amd.set_all_fn_arg_inreg(fns[0])
 
         if knobs.compilation.enable_asan:
             default_libdir = Path(__file__).parent / 'lib'
@@ -444,6 +452,7 @@ class HIPBackend(BaseBackend):
             amd.add_scalarize_packed_fops_llvm_pass(fns[0])
 
         # Get some metadata
+        metadata["num_warps"] = total_warps_num
         metadata["shared"] = src.get_int_attr("ttg.shared")
         metadata["profile_scratch_size"] = src.get_int_attr("ttg.profile_scratch_memory_size") or 0
         metadata["profile_scratch_align"] = src.get_int_attr("ttg.profile_scratch_memory_alignment") or 1

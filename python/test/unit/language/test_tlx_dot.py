@@ -197,6 +197,52 @@ def test_async_dot(device):
     torch.testing.assert_close(z, z_ref)
 
 
+@pytest.mark.skipif(not is_hopper(), reason="Need Hopper")
+@pytest.mark.parametrize("BLOCK", [64, 128])
+def test_async_dot_local_store(BLOCK, device):
+    """Test WGMMA dot result stored to SMEM via local_store then TMA-stored out."""
+
+    @triton.jit
+    def _kernel(desc_a, desc_b, desc_c, BLOCK: tl.constexpr):
+        a_tiles = tlx.local_alloc((BLOCK, BLOCK), tlx.dtype_of(desc_a), 1)
+        b_tiles = tlx.local_alloc((BLOCK, BLOCK), tlx.dtype_of(desc_b), 1)
+        out_tiles = tlx.local_alloc((BLOCK, BLOCK), tlx.dtype_of(desc_c), 1)
+        a_fulls = tlx.alloc_barriers(num_barriers=1, arrive_count=tl.constexpr(1))
+        b_fulls = tlx.alloc_barriers(num_barriers=1, arrive_count=tl.constexpr(1))
+
+        a_full = tlx.local_view(a_fulls, 0)
+        tlx.barrier_expect_bytes(a_full, 2 * BLOCK * BLOCK)
+        tlx.async_descriptor_load(desc_a, a_tiles, [0, 0], a_full)
+        b_full = tlx.local_view(b_fulls, 0)
+        tlx.barrier_expect_bytes(b_full, 2 * BLOCK * BLOCK)
+        tlx.async_descriptor_load(desc_b, b_tiles, [0, 0], b_full)
+
+        tlx.barrier_wait(a_full, 0)
+        tlx.barrier_wait(b_full, 0)
+        a_view = tlx.local_view(a_tiles, 0)
+        b_view = tlx.local_view(b_tiles, 0)
+        acc = tlx.async_dot(a_view, b_view)
+        acc = tlx.async_dot_wait(0, acc)
+
+        acc_fp16 = acc.to(tlx.dtype_of(desc_c))
+        out_view = tlx.local_view(out_tiles, 0)
+        tlx.local_store(out_view, acc_fp16)
+        tlx.fence_async_shared()
+        tlx.async_descriptor_store(desc_c, out_view, [0, 0])
+        tlx.async_descriptor_store_wait(0)
+
+    a = torch.randn(BLOCK, BLOCK, device=device, dtype=torch.float16)
+    b = torch.randn(BLOCK, BLOCK, device=device, dtype=torch.float16)
+    c = torch.empty(BLOCK, BLOCK, device=device, dtype=torch.float16)
+    desc_a = TensorDescriptor(a, shape=[BLOCK, BLOCK], strides=[BLOCK, 1], block_shape=[BLOCK, BLOCK])
+    desc_b = TensorDescriptor(b, shape=[BLOCK, BLOCK], strides=[BLOCK, 1], block_shape=[BLOCK, BLOCK])
+    desc_c = TensorDescriptor(c, shape=[BLOCK, BLOCK], strides=[BLOCK, 1], block_shape=[BLOCK, BLOCK])
+
+    _kernel[(1, )](desc_a, desc_b, desc_c, BLOCK=BLOCK, num_stages=0, num_warps=4)
+    z_ref = torch.matmul(a, b)
+    torch.testing.assert_close(c, z_ref)
+
+
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_async_dot_blackwell(device):
     """
