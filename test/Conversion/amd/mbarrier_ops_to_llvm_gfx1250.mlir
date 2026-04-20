@@ -27,7 +27,7 @@ module attributes {"ttg.target" = "hip:gfx1250", "ttg.num-ctas" = 1 : i32, "ttg.
     // GFX1250: %[[UPDATE_VAL1:.+]] = llvm.mlir.constant(1 : i64) : i64
     // GFX1250: %[[ALLOC_PTR:.+]] = llvm.extractvalue %arg0[0] : !llvm.struct<(ptr<3>, i32)>
     // GFX1250: llvm.call_intrinsic "llvm.amdgcn.ds.atomic.barrier.arrive.rtn.b64"(%[[ALLOC_PTR]], %[[UPDATE_VAL1]])
-    amdg.arrive_barrier %alloc, 1, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %0 = amdg.arrive_barrier %alloc, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> i32
     tt.return
   }
 

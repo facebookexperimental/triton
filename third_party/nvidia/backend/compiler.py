@@ -363,10 +363,10 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
         # TODO(Qingyi): Move PlanCTAPass to the front of CoalescePass
         nvidia.passes.ttnvgpuir.add_plan_cta(pm)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm, 0)
         passes.ttgpuir.add_optimize_thread_locality(pm)
         passes.ttgpuir.add_accelerate_matmul(pm)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm, 0)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
         passes.ttir.add_loop_aware_cse(pm)
@@ -377,12 +377,19 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_triton_licm(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+            if knobs.nvidia.use_meta_ws:
+                nvidia.passes.hopper.add_data_partitioning(pm, 1)
+                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
+                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
             nvidia.passes.hopper.add_tma_store_lowering(pm)
+            if knobs.nvidia.use_meta_ws and knobs.nvidia.use_meta_partition:
+                nvidia.passes.hopper.add_partition_scheduling_meta(pm)
             smem_budget = _max_shared_mem_for_capability(capability)
             nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled,
                                                      smem_budget, knobs.nvidia.generate_subtiled_region)
-            passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
-            passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
+            if not knobs.nvidia.use_meta_ws:
+                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
+                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
         elif capability // 10 >= 10:
             passes.ttgpuir.add_fuse_nested_loops(pm)
@@ -427,7 +434,8 @@ class CUDABackend(BaseBackend):
         if capability // 10 >= 9:
             nvidia.passes.ttnvgpuir.add_tma_lowering(pm)
             nvidia.passes.ttnvgpuir.add_tma_store_buffer_reuse(pm)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        smem_budget = _max_shared_mem_for_capability(capability)
+        passes.ttgpuir.add_remove_layout_conversions(pm, 0)
         nvidia.passes.hopper.add_multi_cta_reduction(pm)
         # TODO: Find the optimal place in the pipeline for this pass.
         nvidia.passes.ttnvgpuir.add_prune_unused_barriers(pm)
@@ -445,6 +453,10 @@ class CUDABackend(BaseBackend):
         passes.common.add_sccp(pm)
         passes.common.add_cse(pm)
         passes.common.add_canonicalizer(pm)
+        # Budget-aware layout conversion elimination — runs last to ensure
+        # converts whose scratch would exceed SMEM budget are eliminated
+        # after all other passes that may introduce layout conversions.
+        passes.ttgpuir.add_remove_layout_conversions(pm, smem_budget)
 
         pm.run(mod, 'make_ttgir')
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
