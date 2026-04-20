@@ -150,6 +150,13 @@ void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp) {
       if (!allocOp)
         continue;
 
+      // Only annotate buffers that were hoisted to function scope by
+      // doBufferAllocation. Buffers still inside a loop (e.g. from early
+      // TMA store lowering) were not planned by the memory planner and
+      // cannot safely be rotated.
+      if (allocOp->getParentOfType<scf::ForOp>())
+        continue;
+
       auto bufferCopy = allocOp->getAttrOfType<IntegerAttr>("buffer.copy");
       if (!bufferCopy)
         continue;
