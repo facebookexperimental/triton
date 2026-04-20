@@ -4,6 +4,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/Support/Debug.h"
 
 namespace mlir {
@@ -517,7 +518,7 @@ static void buildMultiTaskSubtiledRegions(OpBuilder &outerBuilder, Location loc,
         for (Value r : op->getResults())
           seg0Results.insert(r);
 
-      DenseMap<Value, Value> seen; // chain0Val -> chain1Val
+      llvm::MapVector<Value, Value> seen; // chain0Val -> chain1Val
       for (auto [op0, op1] :
            llvm::zip(segments[i + 1].ops0, segments[i + 1].ops1)) {
         for (auto [v0, v1] : llvm::zip(op0->getOperands(), op1->getOperands()))
