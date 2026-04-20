@@ -892,9 +892,9 @@ void init_gluon_ir(py::module &&m) {
            })
       .def("create_async_tdm_copy_local_to_global",
            [](GluonOpBuilder &self, Value descPtr, std::vector<Value> &indices,
-              Value src) {
+              Value src, Value barrier) {
              self.create<ttag::AsyncTDMCopyLocalToGlobalOp>(descPtr, indices,
-                                                            src);
+                                                            src, barrier);
            })
       .def("create_async_tdm_wait",
            [](GluonOpBuilder &self, int num) {
@@ -916,7 +916,9 @@ void init_gluon_ir(py::module &&m) {
       .def("create_lds_barrier_arrive",
            [](GluonOpBuilder &self, Value memDesc, int count,
               int expectedCount) {
-             self.create<ttag::ArriveBarrierOp>(memDesc, count, expectedCount);
+             auto i32Ty = IntegerType::get(self.getContext(), 32);
+             self.create<ttag::ArriveBarrierOp>(i32Ty, memDesc, count,
+                                                expectedCount);
            })
       .def("create_warp_pipeline_border",
            [](GluonOpBuilder &self, const std::string &marker) {

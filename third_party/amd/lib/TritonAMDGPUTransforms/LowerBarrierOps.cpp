@@ -32,9 +32,7 @@ namespace {
 static const int THREADS_PER_WAVE = 64;
 static const int WAVES_PER_TASK = 4;
 
-void lowerArriveBarrierOps(ModuleOp m,
-                           const std::map<mlir::triton::gpu::LocalAllocOp, int>
-                               &localAllocToBarrierExpectedCount) {
+void lowerArriveBarrierOps(ModuleOp m) {
   SmallVector<Operation *> eraseOps;
   auto cond = Value();
   m.walk([&](ttng::ArriveBarrierOp op) {
@@ -42,7 +40,6 @@ void lowerArriveBarrierOps(ModuleOp m,
     auto loc = op.getLoc();
     OpBuilder builder(op);
     if (!cond) {
-      auto ctx = op.getContext();
       // Create if condition for the arrive
       auto i32ty = builder.getIntegerType(32);
       auto threadId = ROCDL::ThreadIdXOp::create(builder, loc, i32ty);
@@ -55,25 +52,10 @@ void lowerArriveBarrierOps(ModuleOp m,
     }
     auto ifOp = scf::IfOp::create(builder, loc, cond);
     auto thenBuilder = ifOp.getThenBodyBuilder();
-    if (auto defOp = dyn_cast<triton::gpu::MemDescIndexOp>(
-            op.getAlloc().getDefiningOp())) {
-      if (auto srcOp = dyn_cast<triton::gpu::LocalAllocOp>(
-              defOp.getSrc().getDefiningOp())) {
-        auto it = localAllocToBarrierExpectedCount.find(srcOp);
-        if (it != localAllocToBarrierExpectedCount.end()) {
-          auto expectedCount = it->second;
-          auto incrementCount = op.getCount();
-          LDBG("srcOp: " << srcOp << " inc: " << incrementCount
-                         << "expected: " << expectedCount << "\n");
-          triton::amdgpu::ArriveBarrierOp::create(
-              thenBuilder, loc, op.getAlloc(), incrementCount, expectedCount);
-        } else {
-          assert(false && "Cannot find LocalAlllocOp for ArriveBarrierOp");
-        }
-      }
-    } else {
-      assert(false && "ArriveBarrierOp not connected to LocalAllocOp");
-    }
+    auto incrementCount = op.getCount();
+    LDBG("Lowering arrive with inc: " << incrementCount << "\n");
+    triton::amdgpu::ArriveBarrierOp::create(
+        thenBuilder, loc, builder.getI32Type(), op.getAlloc(), incrementCount);
     eraseOps.push_back(op);
   });
   for (auto op : eraseOps) {
@@ -130,9 +112,7 @@ void lowerWaitBarrierOps(ModuleOp m) {
   }
 }
 
-void lowerInitBarrierOps(ModuleOp m,
-                         std::map<mlir::triton::gpu::LocalAllocOp, int>
-                             &localAllocToBarrierExpectedCount) {
+void lowerInitBarrierOps(ModuleOp m) {
   SmallVector<Operation *> eraseOps;
   auto cond = Value();
   m.walk([&](ttng::InitBarrierOp op) {
@@ -140,8 +120,7 @@ void lowerInitBarrierOps(ModuleOp m,
     auto loc = op.getLoc();
     OpBuilder builder(op);
     if (!cond) {
-      auto ctx = op.getContext();
-      // Create if tid == 0 condition for the arrive
+      // Create if tid == 0 condition for the init
       auto i32ty = builder.getIntegerType(32);
       auto threadId = ROCDL::ThreadIdXOp::create(builder, loc, i32ty);
       auto zero = arith::ConstantIntOp::create(builder, loc, 0, 32);
@@ -152,16 +131,6 @@ void lowerInitBarrierOps(ModuleOp m,
     auto thenBuilder = ifOp.getThenBodyBuilder();
     triton::amdgpu::InitBarrierOp::create(thenBuilder, loc, op.getAlloc(),
                                           op.getCount());
-    if (auto defOp = dyn_cast<triton::gpu::MemDescIndexOp>(
-            op.getAlloc().getDefiningOp())) {
-      if (auto srcOp = dyn_cast<triton::gpu::LocalAllocOp>(
-              defOp.getSrc().getDefiningOp())) {
-        LDBG("srcOp: " << srcOp << " count: " << op.getCount() << "\n");
-        localAllocToBarrierExpectedCount[srcOp] = op.getCount();
-      }
-    } else {
-      assert(false && "InitBarrierOp not connected to LocalAllocOp");
-    }
     eraseOps.push_back(op);
   });
   for (auto op : eraseOps) {
@@ -184,19 +153,8 @@ public:
 
   void runOnOperation() override {
     ModuleOp m = getOperation();
-    // Barrier arrive needs expected_arrival_count so it can be reset at phase
-    // flip This map saves the expected_arrival_count while processing
-    // InitBarrierOp
-    std::map<mlir::triton::gpu::LocalAllocOp, int>
-        localAllocToBarrierExpectedCount;
-    lowerInitBarrierOps(m, localAllocToBarrierExpectedCount);
-    LLVM_DEBUG({
-      for (auto [op, count] : localAllocToBarrierExpectedCount) {
-        llvm::dbgs() << "localAllocToBarrierExpectedCount " << op << " "
-                     << count << "\n";
-      }
-    });
-    lowerArriveBarrierOps(m, localAllocToBarrierExpectedCount);
+    lowerInitBarrierOps(m);
+    lowerArriveBarrierOps(m);
     lowerWaitBarrierOps(m);
   }
 };
