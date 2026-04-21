@@ -31,7 +31,10 @@ from .standard import (
     zeros_like,
 )
 from .core import (
+    CompositeReductionOrdering,
     PropagateNan,
+    ReductionOrdering,
+    ReductionOrderingBase,
     TRITON_MAX_TENSOR_NUMEL,
     _experimental_descriptor_load,
     _experimental_descriptor_store,
@@ -145,7 +148,10 @@ from .random import (
 from . import target_info
 
 __all__ = [
+    "CompositeReductionOrdering",
     "PropagateNan",
+    "ReductionOrdering",
+    "ReductionOrderingBase",
     "TRITON_MAX_TENSOR_NUMEL",
     "_experimental_descriptor_load",
     "_experimental_descriptor_store",
