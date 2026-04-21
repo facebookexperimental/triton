@@ -100,13 +100,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
   // CHECK-LABEL: @subtiled_region
   // CHECK-SAME: %[[BAR:arg[0-9]+]]: !ttg.memdesc<1xi64, #shared2, #smem, mutable>
-  // CHECK-SAME: %[[PHASE:arg[0-9]+]]: i32
+  // CHECK-SAME: %[[ACC:arg[0-9]+]]: i64
   tt.func @subtiled_region(
       %bar: !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>,
-      %phase: i32) {
+      %accum_cnt: i64) {
     // CHECK: ttng.subtiled_region
     // CHECK-SAME: barriers(%[[BAR]] : !ttg.memdesc<1xi64, #shared2, #smem, mutable>)
-    // CHECK-SAME: phases(%[[PHASE]] : i32)
+    // CHECK-SAME: accum_cnts(%[[ACC]] : i64)
     // CHECK-SAME: tile_mappings = [array<i32: 0>, array<i32: 1>]
     // CHECK-SAME: barrier_annotations = [#ttng.barrier_annotation<barrierIdx = 0, placement = after, targetOpIdx = 0, barrierOpKind = "arrive_barrier">]
     // CHECK: setup
@@ -117,7 +117,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     // CHECK: ttng.subtiled_region_yield
     ttng.subtiled_region
         barriers(%bar : !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>)
-        phases(%phase : i32)
+        accum_cnts(%accum_cnt : i64)
         tile_mappings = [array<i32: 0>, array<i32: 1>]
         barrier_annotations = [
           #ttng.barrier_annotation<barrierIdx = 0, placement = after,
