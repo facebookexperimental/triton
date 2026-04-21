@@ -101,13 +101,12 @@ static bool isTileEnabled(BarrierAnnotationAttr annotation, unsigned tileIdx) {
   return tileIdx < static_cast<unsigned>(mask.size()) && mask[tileIdx] != 0;
 }
 
-void lowerSubtiledRegion(SubtiledRegionOp op, TokenEmitter tokenEmitter) {
+void lowerSubtiledRegion(SubtiledRegionOp op) {
   OpBuilder builder(op);
   Location loc = op.getLoc();
 
   ValueRange barriers = op.getBarriers();
   ValueRange accumCnts = op.getAccumCnts();
-  ValueRange tokenValues = op.getTokenValues();
 
   static constexpr const char *kSubtileOpId = "subtile_op_id";
 
@@ -138,18 +137,6 @@ void lowerSubtiledRegion(SubtiledRegionOp op, TokenEmitter tokenEmitter) {
       else
         tileAfter[targetId].push_back(annotation);
     }
-  }
-
-  // Pre-process token annotations by target op ID.
-  llvm::DenseMap<unsigned, SmallVector<TokenAnnotationAttr>> tokenBefore,
-      tokenAfter;
-  for (Attribute attr : op.getTokenAnnotations()) {
-    auto annotation = cast<TokenAnnotationAttr>(attr);
-    unsigned targetId = annotation.getTargetOpIdx();
-    if (annotation.getPlacement() == BarrierPlacement::BEFORE)
-      tokenBefore[targetId].push_back(annotation);
-    else
-      tokenAfter[targetId].push_back(annotation);
   }
 
   // 1. Clone setup region ops (except yield), emitting setup barriers.
@@ -208,13 +195,6 @@ void lowerSubtiledRegion(SubtiledRegionOp op, TokenEmitter tokenEmitter) {
                             tileIdx);
           }
         }
-        if (tokenEmitter) {
-          auto it2 = tokenBefore.find(opId);
-          if (it2 != tokenBefore.end()) {
-            for (auto &annotation : it2->second)
-              tokenEmitter(builder, loc, annotation, tokenValues, tileIdx);
-          }
-        }
       }
 
       if (idAttr)
@@ -225,13 +205,6 @@ void lowerSubtiledRegion(SubtiledRegionOp op, TokenEmitter tokenEmitter) {
 
       // AFTER annotations.
       if (idAttr) {
-        if (tokenEmitter) {
-          auto it2 = tokenAfter.find(opId);
-          if (it2 != tokenAfter.end()) {
-            for (auto &annotation : it2->second)
-              tokenEmitter(builder, loc, annotation, tokenValues, tileIdx);
-          }
-        }
         auto it = tileAfter.find(opId);
         if (it != tileAfter.end()) {
           for (auto &annotation : it->second) {

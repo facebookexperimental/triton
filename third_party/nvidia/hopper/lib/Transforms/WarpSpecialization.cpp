@@ -51,10 +51,6 @@ void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
 void doTMAStoreWaitReorder(triton::FuncOp &funcOp);
 void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp);
 void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp);
-void emitTokenOp(OpBuilder &builder, Location loc,
-                 triton::nvidia_gpu::TokenAnnotationAttr annotation,
-                 ValueRange tokenValues, unsigned tileIdx);
-
 void doGenerateSubtiledRegion(triton::FuncOp &funcOp) {
   auto moduleOp = funcOp->getParentOfType<ModuleOp>();
   PassManager pm(moduleOp.getContext());
@@ -254,7 +250,7 @@ public:
         remaining.push_back(op);
       });
       for (auto op : remaining)
-        triton::nvidia_gpu::lowerSubtiledRegion(op, emitTokenOp);
+        triton::nvidia_gpu::lowerSubtiledRegion(op);
     }
 
     doTokenLowering(funcOp, numWarpGroups - 1);

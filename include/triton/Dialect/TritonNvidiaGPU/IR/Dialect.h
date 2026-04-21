@@ -24,8 +24,6 @@
 #ifndef TRITON_DIALECT_TRITONNVIDIAGPU_IR_DIALECT_H_
 #define TRITON_DIALECT_TRITONNVIDIAGPU_IR_DIALECT_H_
 
-#include <functional>
-
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -141,19 +139,10 @@ getDistributedLayoutForTmemLdSt(gpu::MemDescType memType, TMemAccessAtom atom,
                                 unsigned numWarps,
                                 gpu::CGAEncodingAttr cgaLayout);
 
-/// Callback to emit a token-based synchronization op (e.g., ConsumerWaitOp
-/// or ConsumerReleaseOp) during subtiled region lowering. The core lowering
-/// logic is backend-agnostic; backends provide this callback to emit
-/// backend-specific token ops.
-using TokenEmitter = std::function<void(
-    OpBuilder &builder, Location loc, TokenAnnotationAttr annotation,
-    ValueRange tokenValues, unsigned tileIdx)>;
-
 /// Lower a single SubtiledRegionOp into flat IR with barrier insertion.
 /// This is the core logic shared by the LowerSubtiledRegion pass and
 /// the WS code partition pre-lowering for multi-task subtiled regions.
-void lowerSubtiledRegion(SubtiledRegionOp op,
-                         TokenEmitter tokenEmitter = nullptr);
+void lowerSubtiledRegion(SubtiledRegionOp op);
 
 } // namespace mlir::triton::nvidia_gpu
 

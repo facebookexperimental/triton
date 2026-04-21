@@ -40,25 +40,6 @@ namespace mlir {
 
 static constexpr const char *kSubtileOpId = "subtile_op_id";
 
-/// Token emitter callback for lowerSubtiledRegion. Emits ConsumerWaitOp
-/// or ConsumerReleaseOp at the current builder position.
-void emitTokenOp(OpBuilder &builder, Location loc,
-                 ttng::TokenAnnotationAttr annotation, ValueRange tokenValues,
-                 unsigned tileIdx) {
-  Value token = tokenValues[annotation.getTokenIdx()];
-  Value bufferIdx = tokenValues[annotation.getBufferIdxIdx()];
-  StringRef kind = annotation.getTokenOpKind().getValue();
-  if (kind == "consumer_wait") {
-    int phaseIdx = annotation.getPhaseIdx();
-    assert(phaseIdx >= 0);
-    Value phase = tokenValues[phaseIdx];
-    ttnvws::ConsumerWaitOp::create(builder, loc, token, bufferIdx, phase);
-  } else {
-    assert(kind == "consumer_release");
-    ttnvws::ConsumerReleaseOp::create(builder, loc, token, bufferIdx);
-  }
-}
-
 /// If `op` is inside a SubtiledRegionOp's tile region, return that op.
 static ttng::SubtiledRegionOp getEnclosingSubtiledRegionTile(Operation *op) {
   for (Operation *parent = op->getParentOp(); parent;
@@ -4315,7 +4296,7 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
         multiTaskOps.push_back(op);
     });
     for (auto op : multiTaskOps)
-      ttng::lowerSubtiledRegion(op, emitTokenOp);
+      ttng::lowerSubtiledRegion(op);
   }
 
   specializeRegion(funcOp, 0 /*requestedRegisters*/);
@@ -4582,7 +4563,7 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
         multiTaskOps.push_back(op);
     });
     for (auto op : multiTaskOps)
-      ttng::lowerSubtiledRegion(op, emitTokenOp);
+      ttng::lowerSubtiledRegion(op);
   }
 
   specializeRegion(funcOp, 0 /*requestedRegisters*/);
