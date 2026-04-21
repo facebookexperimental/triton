@@ -344,12 +344,6 @@ void pushSharedSetupToTile(SubtiledRegionOp op) {
   llvm::sort(sortedOps,
              [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
 
-  // Record original tile ops so we can distinguish them from cloned ops
-  // when adjusting barrier annotations.
-  DenseSet<Operation *> originalTileOps;
-  for (Operation &tileOp : tileBlock.without_terminator())
-    originalTileOps.insert(&tileOp);
-
   // For each movable arg, find the earliest op in the tile body that uses
   // it. This is where we will sink the shared dependency chain.
   Operation *earliestUser = nullptr;
@@ -433,39 +427,8 @@ void pushSharedSetupToTile(SubtiledRegionOp op) {
                                 newYieldValues);
   setupYield.erase();
 
-  // Step 5: Update barrier annotations — for each TILE annotation, count
-  // how many cloned ops were inserted before its target op.
-  unsigned numCloned = sortedOps.size();
-  if (numCloned > 0) {
-    SmallVector<unsigned> clonedBeforeOrigOp;
-    unsigned clonedSoFar = 0;
-    for (Operation &tileOp : tileBlock.without_terminator()) {
-      if (!originalTileOps.contains(&tileOp))
-        clonedSoFar++;
-      else
-        clonedBeforeOrigOp.push_back(clonedSoFar);
-    }
-
-    SmallVector<Attribute> newAnnotations;
-    for (Attribute attr : op.getBarrierAnnotations()) {
-      auto annotation = cast<BarrierAnnotationAttr>(attr);
-      if (annotation.getRegion() == BarrierRegion::TILE) {
-        unsigned origTarget = annotation.getTargetOpIdx();
-        unsigned offset = origTarget < clonedBeforeOrigOp.size()
-                              ? clonedBeforeOrigOp[origTarget]
-                              : clonedSoFar;
-        auto newAnnotation = BarrierAnnotationAttr::get(
-            ctx, annotation.getBarrierIdx(), annotation.getPlacement(),
-            origTarget + offset, annotation.getBarrierOpKind(),
-            annotation.getCount(), annotation.getRegion(),
-            annotation.getNumBuffers(), annotation.getTileMask());
-        newAnnotations.push_back(newAnnotation);
-      } else {
-        newAnnotations.push_back(attr);
-      }
-    }
-    op.setBarrierAnnotationsAttr(ArrayAttr::get(ctx, newAnnotations));
-  }
+  // No barrier annotation adjustment needed — annotations use stable op IDs
+  // (subtile_op_id attributes) that survive tile body transformations.
 }
 
 class TritonNvidiaGPUPushSharedSetupToTilePass

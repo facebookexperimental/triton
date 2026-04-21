@@ -108,9 +108,11 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
   ValueRange barriers = op.getBarriers();
   ValueRange accumCnts = op.getAccumCnts();
 
-  // Pre-process barrier annotations by region and target op index.
-  // Tile annotations are stored per (opIdx, placement) and filtered by
-  // tileMask at each tile replication.
+  static constexpr const char *kSubtileOpId = "subtile_op_id";
+
+  // Pre-process barrier annotations by region and target op ID.
+  // Tile annotations use stable IDs (from subtile_op_id attributes on ops).
+  // Setup/teardown annotations still use positional indices.
   llvm::DenseMap<unsigned, SmallVector<BarrierAnnotationAttr>> tileBefore,
       tileAfter;
   llvm::DenseMap<unsigned, SmallVector<BarrierAnnotationAttr>> setupBefore,
@@ -118,25 +120,25 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
 
   for (Attribute attr : op.getBarrierAnnotations()) {
     auto annotation = cast<BarrierAnnotationAttr>(attr);
-    unsigned opIdx = annotation.getTargetOpIdx();
+    unsigned targetId = annotation.getTargetOpIdx();
     BarrierRegion region = annotation.getRegion();
 
     if (region == BarrierRegion::SETUP) {
       if (annotation.getPlacement() == BarrierPlacement::BEFORE)
-        setupBefore[opIdx].push_back(annotation);
+        setupBefore[targetId].push_back(annotation);
       else
-        setupAfter[opIdx].push_back(annotation);
+        setupAfter[targetId].push_back(annotation);
     } else if (region == BarrierRegion::TEARDOWN) {
       if (annotation.getPlacement() == BarrierPlacement::BEFORE)
-        teardownBefore[opIdx].push_back(annotation);
+        teardownBefore[targetId].push_back(annotation);
       else
-        teardownAfter[opIdx].push_back(annotation);
+        teardownAfter[targetId].push_back(annotation);
     } else {
-      // TILE region — placement is BEFORE or AFTER, filtered by tileMask.
+      // TILE region — keyed by stable op ID, filtered by tileMask.
       if (annotation.getPlacement() == BarrierPlacement::BEFORE)
-        tileBefore[opIdx].push_back(annotation);
+        tileBefore[targetId].push_back(annotation);
       else
-        tileAfter[opIdx].push_back(annotation);
+        tileAfter[targetId].push_back(annotation);
     }
   }
 
@@ -182,11 +184,14 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
       tileMapping.map(tileBlock.getArgument(numTileArgs - 1), tileIdxConst);
     }
 
-    unsigned opIdx = 0;
     for (Operation &tileOp : tileBlock.without_terminator()) {
+      // Look up stable op ID for barrier annotation matching.
+      auto idAttr = tileOp.getAttrOfType<IntegerAttr>(kSubtileOpId);
+      unsigned opId = idAttr ? idAttr.getInt() : ~0u;
+
       // BEFORE: emit if tileMask allows this tile.
-      {
-        auto it = tileBefore.find(opIdx);
+      if (idAttr) {
+        auto it = tileBefore.find(opId);
         if (it != tileBefore.end()) {
           for (auto &annotation : it->second) {
             if (isTileEnabled(annotation, tileIdx))
@@ -196,11 +201,17 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
         }
       }
 
+      // Strip the stable ID attribute before cloning so it doesn't leak
+      // into the lowered IR.
+      if (idAttr)
+        tileOp.removeAttr(kSubtileOpId);
       builder.clone(tileOp, tileMapping);
+      if (idAttr)
+        tileOp.setAttr(kSubtileOpId, idAttr);
 
       // AFTER: emit if tileMask allows this tile.
-      {
-        auto it = tileAfter.find(opIdx);
+      if (idAttr) {
+        auto it = tileAfter.find(opId);
         if (it != tileAfter.end()) {
           for (auto &annotation : it->second) {
             if (isTileEnabled(annotation, tileIdx))
@@ -209,7 +220,6 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
           }
         }
       }
-      ++opIdx;
     }
   }
 

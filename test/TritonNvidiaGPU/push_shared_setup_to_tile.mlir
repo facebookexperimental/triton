@@ -156,11 +156,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
   // CHECK-LABEL: @barrier_annotation_reindex
-  // The barrier annotation targetOpIdx should be incremented by the number
-  // of pushed ops (1 constant op pushed).
+  // Barrier annotations use stable op IDs (subtile_op_id attribute), so
+  // targetOpIdx is unchanged even when ops are inserted before the target.
   // CHECK: ttng.subtiled_region
   // CHECK-SAME: barrier_annotations =
-  // CHECK-SAME: targetOpIdx = 1
+  // CHECK-SAME: targetOpIdx = 0
   tt.func @barrier_annotation_reindex(
       %bar: !ttg.memdesc<1xi64, #shared5, #smem5, mutable>,
       %accum_cnt: i64) {
@@ -178,7 +178,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %c42 = arith.constant 42 : i32
         ttng.subtiled_region_yield %c0, %c128, %c42 : i32, i32, i32
       } tile(%arg0: i32, %arg1: i32) {
-        %sum = arith.addi %arg0, %arg1 : i32
+        %sum = arith.addi %arg0, %arg1 {subtile_op_id = 0 : i32} : i32
         ttng.subtiled_region_yield
       } teardown {
         ttng.subtiled_region_yield

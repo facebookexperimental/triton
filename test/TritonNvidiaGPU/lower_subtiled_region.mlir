@@ -62,7 +62,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %c128 = arith.constant 128 : i32
         ttng.subtiled_region_yield %c0, %c128 : i32, i32
       } tile(%arg0: i32) {
-        %off = arith.addi %arg0, %row : i32
+        %off = arith.addi %arg0, %row {subtile_op_id = 0 : i32} : i32
         ttng.subtiled_region_yield
       } teardown {
         ttng.subtiled_region_yield
@@ -96,7 +96,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %c1 = arith.constant 1 : i32
         ttng.subtiled_region_yield %c0, %c1 : i32, i32
       } tile(%arg0: i32) {
-        %res = arith.addi %arg0, %arg0 : i32
+        %res = arith.addi %arg0, %arg0 {subtile_op_id = 0 : i32} : i32
         ttng.subtiled_region_yield
       } teardown {
         ttng.subtiled_region_yield
@@ -168,7 +168,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %c5 = arith.constant 5 : i32
         ttng.subtiled_region_yield %c3, %c5 : i32, i32
       } tile(%arg0: i32) {
-        %res = arith.muli %arg0, %arg0 : i32
+        %res = arith.muli %arg0, %arg0 {subtile_op_id = 0 : i32} : i32
         ttng.subtiled_region_yield
       } teardown {
         ttng.subtiled_region_yield
@@ -200,7 +200,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %c42 = arith.constant 42 : i32
         ttng.subtiled_region_yield %c42 : i32
       } tile(%arg0: i32) {
-        %res = arith.addi %arg0, %arg0 : i32
+        %res = arith.addi %arg0, %arg0 {subtile_op_id = 0 : i32} : i32
         ttng.subtiled_region_yield
       } teardown {
         ttng.subtiled_region_yield
@@ -315,7 +315,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %c1 = arith.constant 1 : i32
         ttng.subtiled_region_yield %c0, %c1 : i32, i32
       } tile(%arg0: i32) {
-        %idx = arith.index_cast %arg0 : i32 to index
+        %idx = arith.index_cast %arg0 {subtile_op_id = 0 : i32} : i32 to index
         ttng.subtiled_region_yield
       } teardown {
         ttng.subtiled_region_yield
@@ -349,7 +349,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %c1 = arith.constant 1 : i32
         ttng.subtiled_region_yield %c0, %c1 : i32, i32
       } tile(%arg0: i32) {
-        %idx = arith.index_cast %arg0 : i32 to index
+        %idx = arith.index_cast %arg0 {subtile_op_id = 0 : i32} : i32 to index
         ttng.subtiled_region_yield
       } teardown {
         %c42 = arith.constant 42 : i32
@@ -382,7 +382,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %c1 = arith.constant 1 : i32
         ttng.subtiled_region_yield %c0, %c1 : i32, i32
       } tile(%arg0: i32) {
-        %idx = arith.index_cast %arg0 : i32 to index
+        %idx = arith.index_cast %arg0 {subtile_op_id = 0 : i32} : i32 to index
         ttng.subtiled_region_yield
       } teardown {
         ttng.subtiled_region_yield
@@ -412,7 +412,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %c1 = arith.constant 1 : i32
         ttng.subtiled_region_yield %c0, %c1 : i32, i32
       } tile(%arg0: i32) {
-        %idx = arith.index_cast %arg0 : i32 to index
+        %idx = arith.index_cast %arg0 {subtile_op_id = 0 : i32} : i32 to index
         ttng.subtiled_region_yield
       } teardown {
         ttng.subtiled_region_yield
@@ -456,7 +456,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %c1 = arith.constant 1 : i32
         ttng.subtiled_region_yield %c0, %c1 : i32, i32
       } tile(%arg0: i32) {
-        %idx = arith.index_cast %arg0 : i32 to index
+        %idx = arith.index_cast %arg0 {subtile_op_id = 0 : i32} : i32 to index
         ttng.subtiled_region_yield
       } teardown {
         ttng.subtiled_region_yield
@@ -521,7 +521,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %c1 = arith.constant 1 : i32
         ttng.subtiled_region_yield %c0, %c1 : i32, i32
       } tile(%arg0: i32) {
-        %idx = arith.index_cast %arg0 : i32 to index
+        %idx = arith.index_cast %arg0 {subtile_op_id = 0 : i32} : i32 to index
         ttng.subtiled_region_yield
       } teardown {
         ttng.subtiled_region_yield

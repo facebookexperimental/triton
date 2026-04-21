@@ -38,6 +38,8 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
+static constexpr const char *kSubtileOpId = "subtile_op_id";
+
 /// Lower token annotations on a SubtiledRegionOp by emitting inline
 /// ConsumerWaitOp / ConsumerReleaseOp ops in the tile body. Must be called
 /// before lowerSubtiledRegion so that the emitted ops get replicated per tile.
@@ -49,28 +51,20 @@ void lowerTokenAnnotations(ttng::SubtiledRegionOp op) {
   Block &tileBlock = op.getTileRegion().front();
   ValueRange tokenValues = op.getTokenValues();
 
-  // Collect non-terminator ops for targetOpIdx lookup.
-  SmallVector<Operation *> tileOps;
-  for (Operation &tileOp : tileBlock.without_terminator())
-    tileOps.push_back(&tileOp);
-
-  // Process annotations in reverse order so that insertions don't shift
-  // targetOpIdx for later annotations.
-  SmallVector<ttng::TokenAnnotationAttr> sorted;
-  for (Attribute attr : tokenAnnotations)
-    sorted.push_back(cast<ttng::TokenAnnotationAttr>(attr));
-  llvm::sort(sorted, [](const ttng::TokenAnnotationAttr &a,
-                        const ttng::TokenAnnotationAttr &b) {
-    if (a.getTargetOpIdx() != b.getTargetOpIdx())
-      return a.getTargetOpIdx() > b.getTargetOpIdx();
-    return a.getPlacement() == ttng::BarrierPlacement::AFTER;
-  });
+  // Build a map from stable op ID to Operation*.
+  llvm::DenseMap<unsigned, Operation *> idToOp;
+  for (Operation &tileOp : tileBlock.without_terminator()) {
+    if (auto idAttr = tileOp.getAttrOfType<IntegerAttr>(kSubtileOpId))
+      idToOp[idAttr.getInt()] = &tileOp;
+  }
 
   OpBuilder builder(op);
-  for (auto annotation : sorted) {
-    unsigned targetIdx = annotation.getTargetOpIdx();
-    assert(targetIdx < tileOps.size());
-    Operation *targetOp = tileOps[targetIdx];
+  for (Attribute attr : tokenAnnotations) {
+    auto annotation = cast<ttng::TokenAnnotationAttr>(attr);
+    unsigned targetId = annotation.getTargetOpIdx();
+    auto it = idToOp.find(targetId);
+    assert(it != idToOp.end() && "target op ID not found in tile body");
+    Operation *targetOp = it->second;
 
     if (annotation.getPlacement() == ttng::BarrierPlacement::BEFORE)
       builder.setInsertionPoint(targetOp);
@@ -113,18 +107,27 @@ static ttng::SubtiledRegionOp getEnclosingSubtiledRegionTile(Operation *op) {
   return nullptr;
 }
 
-/// Compute the 0-based index of `targetOp` among non-terminator ops in the
-/// tile body of `subtiled`.
-static unsigned computeTargetOpIdx(ttng::SubtiledRegionOp subtiled,
-                                   Operation *targetOp) {
+/// Assign a stable ID to `targetOp` via an integer attribute and return it.
+/// If the op already has an ID, return the existing one. The ID is unique
+/// within the tile body and survives op insertions/removals by other passes,
+/// unlike positional indices.
+static unsigned getOrAssignStableId(ttng::SubtiledRegionOp subtiled,
+                                    Operation *targetOp) {
+  if (auto existing = targetOp->getAttrOfType<IntegerAttr>(kSubtileOpId))
+    return existing.getInt();
+
+  // Find the next available ID by scanning existing IDs.
+  unsigned nextId = 0;
   Block &tileBlock = subtiled.getTileRegion().front();
-  unsigned idx = 0;
   for (Operation &op : tileBlock.without_terminator()) {
-    if (&op == targetOp)
-      return idx;
-    ++idx;
+    if (auto idAttr = op.getAttrOfType<IntegerAttr>(kSubtileOpId))
+      nextId = std::max(nextId, static_cast<unsigned>(idAttr.getInt()) + 1);
   }
-  llvm_unreachable("targetOp not found in tile body");
+
+  targetOp->setAttr(
+      kSubtileOpId,
+      IntegerAttr::get(IntegerType::get(targetOp->getContext(), 32), nextId));
+  return nextId;
 }
 
 /// Add a token annotation to a SubtiledRegionOp instead of creating an
@@ -3687,7 +3690,7 @@ void insertAsyncComm(
         auto subtiled = getEnclosingSubtiledRegionTile(consumerWaitPoint);
         if (subtiled) {
           unsigned targetOpIdx =
-              computeTargetOpIdx(subtiled, consumerWaitPoint);
+              getOrAssignStableId(subtiled, consumerWaitPoint);
           addTokenAnnotation(subtiled, token.second, bufferIdx, phase,
                              ttng::BarrierPlacement::BEFORE, targetOpIdx,
                              "consumer_wait");
@@ -3742,7 +3745,7 @@ void insertAsyncComm(
         auto subtiled = getEnclosingSubtiledRegionTile(consumerReleasePoint);
         if (subtiled) {
           unsigned targetOpIdx =
-              computeTargetOpIdx(subtiled, consumerReleasePoint);
+              getOrAssignStableId(subtiled, consumerReleasePoint);
           addTokenAnnotation(subtiled, token.second, bufferIdx,
                              /*phase=*/Value(), ttng::BarrierPlacement::AFTER,
                              targetOpIdx, "consumer_release");
