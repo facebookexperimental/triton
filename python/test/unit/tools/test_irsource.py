@@ -1,9 +1,17 @@
 import pathlib
+import pytest
 import triton
 from triton.compiler import IRSource, make_backend
 from triton._C.libtriton import ir
 
-target = triton.runtime.driver.active.get_current_target()
+try:
+    target = triton.runtime.driver.active.get_current_target()
+except RuntimeError:
+    target = None
+
+if target is None:
+    pytest.skip("No active GPU driver", allow_module_level=True)
+
 backend = make_backend(target)
 
 

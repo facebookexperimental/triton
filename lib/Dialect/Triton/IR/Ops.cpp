@@ -588,6 +588,11 @@ llvm::SmallVector<Type> ReduceOp::getElementTypes() {
   return reduceOp;
 }
 
+bool ReduceOp::hasDefinedOrdering() {
+  auto attr = getReductionOrderingAttr();
+  return attr && attr.getValue() != "unordered";
+}
+
 unsigned ReduceOp::getNumOperands() { return this->getOperands().size(); }
 
 //-- ScanOp --

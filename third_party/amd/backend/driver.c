@@ -452,11 +452,12 @@ static PyObject *createTDMDescriptor(PyObject *self, PyObject *args) {
   uint32_t blockSizeInt[5];
   uint32_t shapeInt[5];
   uint32_t stridesInt[5];
+  int rank = 0;
 
   blockSizeFast = PySequence_Fast(blockSize, "blockSize must be a sequence");
   if (!blockSizeFast)
     goto cleanup;
-  int rank = PySequence_Fast_GET_SIZE(blockSizeFast);
+  rank = PySequence_Fast_GET_SIZE(blockSizeFast);
   if (rank == 0 || rank > 5) {
     PyErr_SetString(PyExc_RuntimeError, "rank must be between 1 and 5");
     goto cleanup;
