@@ -121,39 +121,57 @@ static void emitMMAAnnotations(scf::ForOp loop,
   const int II = schedule.II;
   auto ctx = loop.getContext();
 
-  // Compute MMA stages to match the baseline's assign_latencies model:
-  // - MMA ops that read directly from load buffers (via SMEM) → stage 1
-  // - MMA ops that depend on another MMA's result (loop-carried or via
-  //   softmax) → stage 2
-  // This mirrors the baseline's latency=1 per pipelined load.
+  // Compute MMA stages from transitive MMA dependency count.
   //
-  // Heuristic: count MMA predecessors in the DDG. First MMA in the
-  // dependency chain → stage 1. MMA that depends on another MMA → stage 2.
+  // For each MMA, walk backward through distance-0 DDG edges and count
+  // how many other MMA nodes are transitively reachable. This captures
+  // the data flow structure:
+  //   - MMAs depending on 0-1 other MMAs → stage 0 (can be prefetched)
+  //   - MMAs depending on 2+ other MMAs → stage 1 (gated on multiple
+  //     prior results, natural pipeline boundary)
+  //
+  // Example: FA backward has 5 MMAs:
+  //   qkT (0 MMA deps) → stage 0
+  //   dpT (0 MMA deps) → stage 0
+  //   dv  (1 MMA dep: qkT) → stage 0
+  //   dq  (2 MMA deps: qkT, dpT via dsT) → stage 1
+  //   dk  (2 MMA deps: qkT, dpT via dsT) → stage 1
   llvm::DenseSet<unsigned> mmaNodes;
   for (const auto &node : ddg.getNodes()) {
     if (isa<ttng::MMAv5OpInterface>(node.op) || isa<tt::DotOp>(node.op))
       mmaNodes.insert(node.idx);
   }
 
-  // Assign stages matching the baseline's pipelining pattern:
-  // - All MMAs at stage 1 (one stage after loads at stage 0)
-  // - The LAST MMA in the modulo schedule gets stage 2 (deferred for
-  //   cross-iteration overlap — this is the PV_g1 pattern from the
-  //   pipelined FA design doc)
+  // For each MMA, compute transitive MMA predecessors via backward BFS
+  // through distance-0 edges only.
   llvm::DenseMap<unsigned, int> mmaStage;
-  int lastMmaCycle = -1;
-  unsigned lastMmaIdx = 0;
   for (unsigned mmaIdx : mmaNodes) {
-    mmaStage[mmaIdx] = 1; // default: stage 1
-    auto it = schedule.nodeToCycle.find(mmaIdx);
-    if (it != schedule.nodeToCycle.end() && it->second > lastMmaCycle) {
-      lastMmaCycle = it->second;
-      lastMmaIdx = mmaIdx;
+    llvm::DenseSet<unsigned> visited;
+    llvm::SmallVector<unsigned> worklist;
+    worklist.push_back(mmaIdx);
+    visited.insert(mmaIdx);
+
+    int mmaPredCount = 0;
+    while (!worklist.empty()) {
+      unsigned cur = worklist.pop_back_val();
+      for (const auto *edge : ddg.getInEdges(cur)) {
+        if (edge->distance > 0)
+          continue; // skip loop-carried edges
+        if (!visited.insert(edge->srcIdx).second)
+          continue;
+        if (mmaNodes.count(edge->srcIdx))
+          mmaPredCount++;
+        worklist.push_back(edge->srcIdx);
+      }
     }
+
+    // 0-1 MMA predecessors → stage 0 (prefetchable)
+    // 2+  MMA predecessors → stage 1 (pipeline boundary)
+    mmaStage[mmaIdx] = (mmaPredCount >= 2) ? 1 : 0;
+    LDBG("MMA node " << mmaIdx << ": " << mmaPredCount
+                     << " transitive MMA predecessors → stage "
+                     << mmaStage[mmaIdx]);
   }
-  // The last MMA (highest cycle) gets stage 2 for cross-iteration overlap.
-  if (mmaNodes.size() > 1 && lastMmaCycle >= 0)
-    mmaStage[lastMmaIdx] = 2;
 
   // Collect MMA ops with their stage and cycle, then assign dense cluster IDs.
   struct MMAInfo {
@@ -175,14 +193,61 @@ static void emitMMAAnnotations(scf::ForOp loop,
     mmas.push_back({node.idx, node.op, stage, it->second});
   }
 
-  // Sort by (stage, cycle) and assign dense cluster IDs per stage.
-  llvm::sort(mmas, [](const MMAInfo &a, const MMAInfo &b) {
-    return std::tie(a.stage, a.cycle) < std::tie(b.stage, b.cycle);
-  });
+  // Skip annotation if all MMAs are in the same stage — the dependency
+  // analysis found no multi-MMA fan-in, so annotations won't help and
+  // may break the downstream pipeliner (e.g., GEMM with 1 dot tiled
+  // into 4 MMAs, or FA FWD with 2 dots tiled into 4+ MMAs).
+  {
+    llvm::DenseSet<int> stages;
+    for (auto &mma : mmas)
+      stages.insert(mma.stage);
+    if (stages.size() <= 1) {
+      LDBG("Skipping MMA annotations: all " << mmas.size()
+                                            << " MMAs in same stage");
+      return;
+    }
+  }
 
-  llvm::DenseMap<int, int> nextClusterPerStage;
+  // Assign order (cluster) within each stage based on MMA dependency depth.
+  // MMAs that are independent within the same stage get the same order,
+  // matching the hand-tuned convention (e.g., dpT and dv both at order 2,
+  // dq and dk both at order 1).
+  //
+  // Depth = number of same-stage MMA predecessors in the DDG.
+  // This groups independent MMAs into the same cluster.
+  llvm::DenseMap<unsigned, int> mmaDepthInStage;
   for (auto &mma : mmas) {
-    int cluster = nextClusterPerStage[mma.stage]++;
+    int depth = 0;
+    for (auto &other : mmas) {
+      if (other.stage != mma.stage || other.nodeIdx == mma.nodeIdx)
+        continue;
+      // Check if 'other' is a transitive predecessor of 'mma' (distance-0).
+      llvm::DenseSet<unsigned> visited;
+      llvm::SmallVector<unsigned> worklist;
+      worklist.push_back(mma.nodeIdx);
+      visited.insert(mma.nodeIdx);
+      bool found = false;
+      while (!worklist.empty() && !found) {
+        unsigned cur = worklist.pop_back_val();
+        for (const auto *edge : ddg.getInEdges(cur)) {
+          if (edge->distance > 0)
+            continue;
+          if (edge->srcIdx == other.nodeIdx) {
+            found = true;
+            break;
+          }
+          if (visited.insert(edge->srcIdx).second)
+            worklist.push_back(edge->srcIdx);
+        }
+      }
+      if (found)
+        depth++;
+    }
+    mmaDepthInStage[mma.nodeIdx] = depth;
+  }
+
+  for (auto &mma : mmas) {
+    int cluster = mmaDepthInStage[mma.nodeIdx];
     std::string json = "{\"stage\": \"" + std::to_string(mma.stage) +
                        "\", \"order\": \"" + std::to_string(cluster) + "\"}";
     mma.op->setAttr("tt.autows", StringAttr::get(ctx, json));
@@ -349,16 +414,28 @@ struct ModuloSchedulePass
       // Check direct children of loop body for MMA/load ops.
       bool hasTMALoad = false;
       bool hasMMAv5 = false;
+      bool hasExistingAnnotation = false;
       for (auto &op : loop.getBody()->without_terminator()) {
         if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(&op))
           hasTMALoad = true;
         if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(&op))
           hasTMALoad = true;
-        if (isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp>(&op))
+        if (isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp>(&op)) {
           hasMMAv5 = true;
+          if (op.hasAttr("tt.autows"))
+            hasExistingAnnotation = true;
+        }
       }
       if (!hasTMALoad && !hasMMAv5)
         return;
+      // Skip loops that already have hand-tuned tt.autows annotations
+      // from Python attrs=. These are set at the Python level and
+      // propagated through accelerateMatmul. Re-annotating would
+      // override the hand-tuned schedule.
+      if (hasExistingAnnotation) {
+        LDBG("Skipping loop with existing tt.autows annotations");
+        return;
+      }
       innerLoops.push_back(loop);
     });
 
@@ -419,6 +496,9 @@ struct ModuloSchedulePass
       // 1. The WS pass's scheduleLoops overwrites them anyway
       // 2. Their presence sets stageAssigned=true which disables
       //    annotation-based scheduling in scheduleLoops
+      //
+      // emitMMAAnnotations internally skips annotation when all MMAs end
+      // up in the same stage (no multi-stage partition found).
       emitMMAAnnotations(innerLoop, ddg, *schedResult);
 
       // Step 3: Derive SMEM buffer depths from cycle-level lifetimes.
