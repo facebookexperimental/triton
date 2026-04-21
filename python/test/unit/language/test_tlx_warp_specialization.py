@@ -26,7 +26,7 @@ def test_async_tasks(BLOCK_SIZE, device):
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         with tlx.async_tasks():
-            with tlx.async_task("default", registers=120, replicate=2):
+            with tlx.async_task("default", replicate=2):
                 offsets = block_start + tl.arange(0, BLOCK_SIZE)
                 mask = offsets < n_elements
                 x = tl.load(x_ptr + offsets, mask=mask)
@@ -36,7 +36,7 @@ def test_async_tasks(BLOCK_SIZE, device):
                 y1 = y - replica_id
                 output = x1 + y1
                 tl.store(z_ptr + offsets, output, mask=mask)
-            with tlx.async_task(num_warps=1, registers=100, replicate=2):
+            with tlx.async_task(num_warps=1, replicate=2):
                 offsets = block_start + tl.arange(0, BLOCK_SIZE)
                 mask = offsets < n_elements
                 a = tl.load(a_ptr + offsets, mask=mask)
@@ -75,9 +75,6 @@ def test_async_tasks(BLOCK_SIZE, device):
         num_warps=4,
     )
     ttgir = kernel.asm["ttgir"]
-    # print(ttgir)
-    pattern_ws = r"ttg.warp_specialize(.*) attributes {requestedRegisters = array<i32: 120, 100, 100>}"
-    assert re.search(pattern_ws, ttgir, flags=re.DOTALL)
     pattern_p0 = r"partition0\([^\n]*\)\s+num_warps\(4\)"
     assert re.search(pattern_p0, ttgir, flags=re.DOTALL)
     pattern_p1 = r"partition1\([^\n]*\)\s+num_warps\(1\)"
@@ -135,7 +132,7 @@ def test_async_tasks_constexpr_guard(BLOCK_SIZE, ENABLE_SECOND_TASK, device):
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         with tlx.async_tasks():
-            with tlx.async_task("default", registers=120):
+            with tlx.async_task("default"):
                 offsets = block_start + tl.arange(0, BLOCK_SIZE)
                 mask = offsets < n_elements
                 x = tl.load(x_ptr + offsets, mask=mask)
@@ -286,6 +283,16 @@ def test_async_tasks_region_error(device):
         ws_error_kernel[grid]()
     exc_msg = str(e.value)
     assert "division by zero" in exc_msg, "\n\nExpected 'division by zero' but got: \n\n" + exc_msg + "\n\n"
+
+
+def test_default_task_rejects_registers():
+    """Specifying registers on the default async_task is banned because the
+    default always receives leftover registers from the partition budget."""
+    with pytest.raises(AssertionError, match="Cannot specify registers"):
+        tlx.async_task("default", registers=128)
+
+    with pytest.raises(AssertionError, match="Cannot specify registers"):
+        tlx.async_task("default", num_regs=128)
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
@@ -504,7 +511,7 @@ def test_async_tasks_thread_safety(device):
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         with tlx.async_tasks():
-            with tlx.async_task("default", registers=120, replicate=2):
+            with tlx.async_task("default", replicate=2):
                 offsets = block_start + tl.arange(0, BLOCK_SIZE)
                 mask = offsets < n_elements
                 x = tl.load(x_ptr + offsets, mask=mask)
@@ -512,7 +519,7 @@ def test_async_tasks_thread_safety(device):
                 replica_id = tlx.async_task_replica_id()
                 output = x + y + replica_id - replica_id
                 tl.store(out_ptr + offsets, output, mask=mask)
-            with tlx.async_task(num_warps=1, registers=100, replicate=2):
+            with tlx.async_task(num_warps=1, replicate=2):
                 offsets = block_start + tl.arange(0, BLOCK_SIZE)
                 mask = offsets < n_elements
                 x = tl.load(x_ptr + offsets, mask=mask)
@@ -532,7 +539,7 @@ def test_async_tasks_thread_safety(device):
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         with tlx.async_tasks():
-            with tlx.async_task("default", registers=120, replicate=2):
+            with tlx.async_task("default", replicate=2):
                 offsets = block_start + tl.arange(0, BLOCK_SIZE)
                 mask = offsets < n_elements
                 a = tl.load(a_ptr + offsets, mask=mask)
@@ -540,7 +547,7 @@ def test_async_tasks_thread_safety(device):
                 replica_id = tlx.async_task_replica_id()
                 output = a * b + replica_id - replica_id
                 tl.store(out_ptr + offsets, output, mask=mask)
-            with tlx.async_task(num_warps=1, registers=100, replicate=2):
+            with tlx.async_task(num_warps=1, replicate=2):
                 offsets = block_start + tl.arange(0, BLOCK_SIZE)
                 mask = offsets < n_elements
                 a = tl.load(a_ptr + offsets, mask=mask)
@@ -602,14 +609,14 @@ def test_async_tasks_thread_exception_isolation(device):
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         with tlx.async_tasks():
-            with tlx.async_task("default", registers=120, replicate=2):
+            with tlx.async_task("default", replicate=2):
                 offsets = block_start + tl.arange(0, BLOCK_SIZE)
                 mask = offsets < n_elements
                 x = tl.load(x_ptr + offsets, mask=mask)
                 replica_id = tlx.async_task_replica_id()
                 output = x + replica_id - replica_id
                 tl.store(out_ptr + offsets, output, mask=mask)
-            with tlx.async_task(num_warps=1, registers=100, replicate=2):
+            with tlx.async_task(num_warps=1, replicate=2):
                 offsets = block_start + tl.arange(0, BLOCK_SIZE)
                 mask = offsets < n_elements
                 x = tl.load(x_ptr + offsets, mask=mask)
@@ -628,7 +635,7 @@ def test_async_tasks_thread_exception_isolation(device):
         block_start = pid * BLOCK_SIZE
         with tlx.async_tasks():
             # Missing "default" task — this should fail during compilation
-            with tlx.async_task(num_warps=1, registers=100, replicate=2):
+            with tlx.async_task(num_warps=1, replicate=2):
                 offsets = block_start + tl.arange(0, BLOCK_SIZE)
                 mask = offsets < n_elements
                 x = tl.load(x_ptr + offsets, mask=mask)
