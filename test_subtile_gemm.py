@@ -5,9 +5,6 @@ and verify numerical correctness against a torch reference.
 import os
 import sys
 
-# Set env vars BEFORE importing triton
-os.environ["TRITON_GENERATE_SUBTILED_REGION"] = "1"
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "python"))
 
 import torch
@@ -61,7 +58,7 @@ print(f"Running addmm kernel: M={M}, N={N}, K={K}, "
       f"BLOCK_M={BLOCK_SIZE_M}, BLOCK_N={BLOCK_SIZE_N}")
 print(f"  EPILOGUE_SUBTILE={EPILOGUE_SUBTILE}, "
       f"DATA_PARTITION_FACTOR={DATA_PARTITION_FACTOR}")
-print("  early_tma_store_lowering=True, TRITON_GENERATE_SUBTILED_REGION=1")
+print("  early_tma_store_lowering=True, generate_subtiled_region=True")
 
 with triton.knobs.nvidia.scope():
     triton.knobs.nvidia.use_meta_ws = True
@@ -89,6 +86,7 @@ with triton.knobs.nvidia.scope():
         num_stages=num_stages,
         num_warps=num_warps,
         early_tma_store_lowering=True,
+        generate_subtiled_region=True,
     )
 
 ref = torch.matmul(A.float(), B.T.float()).to(dtype) + bias
