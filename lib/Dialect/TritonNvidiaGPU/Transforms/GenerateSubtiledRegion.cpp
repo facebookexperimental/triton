@@ -1149,15 +1149,12 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
                                *equiv);
 
     // Erase original ops (reverse program order).
+    // Chains first, then setup (which includes inner setup ops).
     for (auto &chain : llvm::reverse(chains)) {
       for (Operation *op : llvm::reverse(chain)) {
         if (op->use_empty())
           op->erase();
       }
-    }
-    for (Operation *op : llvm::reverse(innerSetupOps)) {
-      if (op->use_empty())
-        op->erase();
     }
     for (Operation *op : llvm::reverse(setupOps)) {
       if (op->use_empty())
