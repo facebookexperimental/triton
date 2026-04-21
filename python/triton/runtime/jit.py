@@ -859,109 +859,29 @@ class JITFunction(JITCallable, KernelInterface[T]):
         self._run_cache.clear()
 
     def run(self, *args, grid, warmup, **kwargs):
-        device = driver.active.get_current_device()
-        stream = driver.active.get_current_stream(device)
-
-        # --- FAST PATH (Layer 1: Identity check) ---
-        # If the exact same Python objects are passed as the previous call
-        # (common in training loops where the same tensors/kwargs are reused),
-        # skip the binder, cache key computation, and most dispatch overhead.
-        # This is just N pointer comparisons with zero attribute access.
-        if not warmup and not self.pre_run_hooks and not knobs.compilation.always_compile:
-            # `last` is a _LastCall namedtuple built by _make_launch_cache():
-            #   [0]  device              [1]  args               [2]  kernel
-            #   [3]  bound_vals          [4]  launch_fn          [5]  function
-            #   [6]  packed_metadata     [7]  coop               [8]  cluster
-            #   [9]  pdl                 [10] no_scratch          [11] instrumentation_mode
-            # Guard code uses .field access for readability; the hot launch
-            # path uses [index] access (same cost as plain tuple on namedtuple).
-            last = self._last_call
-            if last is not None and last.device is device and last.instrumentation_mode == knobs.compilation.instrumentation_mode:
-                last_args = last.args
-                if len(args) == len(last_args):
-                    identical = True
-                    for i in range(len(args)):
-                        if args[i] is not last_args[i]:
-                            identical = False
-                            break
-                    if identical:
-                        last_kw = self._last_kwargs
-                        if len(kwargs) != len(last_kw):
-                            identical = False
-                        else:
-                            for k, v in kwargs.items():
-                                if k not in last_kw or v is not last_kw[k]:
-                                    identical = False
-                                    break
-                    if identical:
-                        kernel = last.kernel
-                        if self.used_global_vals:
-                            not_present = object()
-                            for (name, _), (val, globals_dict) in self.used_global_vals.items():
-                                if globals_dict.get(name, not_present) != val:
-                                    kernel = None
-                                    break
-                        if kernel is not None:
-                            bound_vals = last.bound_vals
-                            self._fast_launch(kernel, grid, stream, bound_vals, *last[4:11])
-                            return kernel
-
-            # Layer 2: Signature-based dict lookup.
-            # Handles cases where arg objects differ but specialization is the same
-            # (e.g., new tensors with same dtype/alignment, same int values).
-            # On hit, we skip the binder + cache key + compilation, but must use
-            # current args for launch (not cached bound_vals — those point to old data).
-            fast_key = self._compute_fast_key(args, kwargs, device)
-            if fast_key is not None:
-                # `cached` is _last_call[2:] -- same layout as `last` above but
-                # without device/args (indices shifted down by 2):
-                #   [0] kernel  [1] bound_vals  [2] launch_fn  [3] function
-                #   [4] packed_metadata  [5] coop  [6] cluster  [7] pdl
-                #   [8] no_scratch  [9] instrumentation_mode
-                cached = self._run_cache.get(fast_key)
-                if cached is not None:
-                    kernel = cached[0]
-                    if self.used_global_vals:
-                        not_present = object()
-                        for (name, _), (val, globals_dict) in self.used_global_vals.items():
-                            if globals_dict.get(name, not_present) != val:
-                                kernel = None
-                                break
-                    if kernel is not None:
-                        # Reconstruct bound_vals from current args + kwargs.
-                        # This is much cheaper than calling the binder (~0.3 µs vs ~9 µs).
-                        bound_vals = args
-                        if kwargs:
-                            param_names = [p.name for p in self.params]
-                            bound_dict = dict(zip(param_names, args))
-                            bound_dict.update(kwargs)
-                            bound_vals = tuple(bound_dict[n] for n in param_names)
-                        self._fast_launch(kernel, grid, stream, bound_vals, *cached[2:9])
-                        self._last_call = self._make_launch_cache(device, args, kernel, bound_vals)
-                        self._last_kwargs = dict(kwargs) if kwargs else {}
-                        return kernel
-        _user_kwargs = dict(kwargs) if kwargs else {}
-        fast_key = None
-        if not warmup and not self.pre_run_hooks and not knobs.compilation.always_compile:
-            fast_key = self._compute_fast_key(args, kwargs, device)
+        # Fast path: if cache is populated, try identity/signature check
+        # (separate method to keep run() bytecode compact).
+        if not warmup and self._last_call is not None and not self.pre_run_hooks and not knobs.compilation.always_compile:
+            result = self._try_fast_path(args, grid, kwargs)
+            if result is not None:
+                return result
 
         kwargs["debug"] = kwargs.get("debug", self.debug) or knobs.runtime.debug
-        # Enable sanitize_overflow if explicitly set via kwarg, env var (TRITON_SANITIZE_OVERFLOW), or if debug is enabled
         kwargs["sanitize_overflow"] = kwargs.get("sanitize_overflow",
                                                  False) or knobs.runtime.sanitize_overflow or kwargs["debug"]
         kwargs["instrumentation_mode"] = knobs.compilation.instrumentation_mode
+
+        # parse options
+        device = driver.active.get_current_device()
+        stream = driver.active.get_current_stream(device)
 
         # Execute pre run hooks with args and kwargs
         for hook in self.pre_run_hooks:
             hook(*args, **kwargs)
 
         kernel_cache, kernel_key_cache, target, backend, binder = self.device_caches[device]
-        # specialization is list[tuple[str, Any]], where first element of tuple is
-        # the type and the second parameter is the 'specialization' value.
         bound_args, specialization, options = binder(*args, **kwargs)
 
-        # add a cache field to the kernel specializations for kernel specific
-        # pass pipelines
         if knobs.runtime.add_stages_inspection_hook is not None:
             inspect_stages_key, inspect_stages_hash = knobs.runtime.add_stages_inspection_hook()
             specialization.append(f'("custom_pipeline", {inspect_stages_hash})')
@@ -969,12 +889,10 @@ class JITFunction(JITCallable, KernelInterface[T]):
         key = compute_cache_key(kernel_key_cache, specialization, options)
         kernel = kernel_cache.get(key, None)
 
-        # Kernel is not cached; we have to compile.
         if kernel is None:
             options, signature, constexprs, attrs = self._pack_args(backend, kwargs, bound_args, specialization,
                                                                     options)
 
-            # Capture kernel argument metadata for TLX benchmark generation
             if os.environ.get("TRITON_DUMP_TLX_BENCHMARK"):
                 try:
                     from triton.tools.tlx_benchmark_gen import capture_kernel_args
@@ -986,7 +904,6 @@ class JITFunction(JITCallable, KernelInterface[T]):
             if kernel is None:
                 return None
 
-        # Check that used global values have not changed.
         not_present = object()
         for (name, _), (val, globals_dict) in self.used_global_vals.items():
             if (newVal := globals_dict.get(name, not_present)) != val:
@@ -994,7 +911,6 @@ class JITFunction(JITCallable, KernelInterface[T]):
                     f"Global variable {name} has changed since we compiled this kernel, from {val} to {newVal}")
 
         if not warmup:
-            # canonicalize grid
             assert grid is not None
             if callable(grid):
                 grid = grid(bound_args)
@@ -1003,7 +919,6 @@ class JITFunction(JITCallable, KernelInterface[T]):
             grid_1 = grid[1] if grid_size > 1 else 1
             grid_2 = grid[2] if grid_size > 2 else 1
 
-            # Capture actual grid values for TLX benchmark generation
             if os.environ.get("TRITON_DUMP_TLX_BENCHMARK"):
                 try:
                     from triton.tools.tlx_benchmark_gen import capture_grid
@@ -1013,24 +928,92 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
             if hasattr(kernel, "result"):
                 kernel = kernel.result()
-            # launch kernel
             launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
             kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,
                        knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *bound_args.values())
 
-            # Populate fast-path caches for future calls.
-            # Store both raw args (for identity check) and bound_args values
-            # (for launching — includes default parameter values).
-            # Only populate when the fast path guard would allow reuse —
-            # if pre_run_hooks are active, the compiled kernel may depend on
-            # hook-controlled state that the fast path doesn't check.
-            if not self.pre_run_hooks and not knobs.compilation.always_compile:
+            # Populate fast-path cache on first launch only.  Subsequent calls
+            # hit the fast path (Layer 1/2) which updates the cache itself.
+            # Populating on every slow-path call is too expensive for kernels
+            # with many parameters (~5-7 µs for 50 kwargs) and measurably
+            # regresses short-running kernels.
+            if self._last_call is None and not self.pre_run_hooks and not knobs.compilation.always_compile:
                 self._last_call = self._make_launch_cache(device, args, kernel, tuple(bound_args.values()))
-                self._last_kwargs = _user_kwargs
+                self._last_kwargs = {k: v for k, v in kwargs.items()
+                                     if k not in ('debug', 'sanitize_overflow', 'instrumentation_mode')}
+                fast_key = self._compute_fast_key(args, self._last_kwargs, device)
                 if fast_key is not None:
-                    self._run_cache[fast_key] = self._last_call[2:]  # skip device, args
+                    self._run_cache[fast_key] = self._last_call[2:]
 
         return kernel
+
+    def _try_fast_path(self, args, grid, kwargs):
+        """Attempt Layer 1 (identity) and Layer 2 (signature) fast paths.
+
+        Returns the kernel on hit, or None on miss so run() falls through
+        to the slow path.
+        """
+        device = driver.active.get_current_device()
+        stream = driver.active.get_current_stream(device)
+
+        # Layer 1: Identity check — same Python objects as last call?
+        last = self._last_call
+        if last is not None and last.device is device and last.instrumentation_mode == knobs.compilation.instrumentation_mode:
+            last_args = last.args
+            if len(args) == len(last_args):
+                identical = True
+                for i in range(len(args)):
+                    if args[i] is not last_args[i]:
+                        identical = False
+                        break
+                if identical:
+                    last_kw = self._last_kwargs
+                    if len(kwargs) != len(last_kw):
+                        identical = False
+                    else:
+                        for k, v in kwargs.items():
+                            if k not in last_kw or v is not last_kw[k]:
+                                identical = False
+                                break
+                if identical:
+                    kernel = last.kernel
+                    if self.used_global_vals:
+                        not_present = object()
+                        for (name, _), (val, globals_dict) in self.used_global_vals.items():
+                            if globals_dict.get(name, not_present) != val:
+                                kernel = None
+                                break
+                    if kernel is not None:
+                        bound_vals = last.bound_vals
+                        self._fast_launch(kernel, grid, stream, bound_vals, *last[4:11])
+                        return kernel
+
+        # Layer 2: Signature-based dict lookup — same specialization?
+        fast_key = self._compute_fast_key(args, kwargs, device)
+        if fast_key is not None:
+            cached = self._run_cache.get(fast_key)
+            if cached is not None:
+                kernel = cached[0]
+                if self.used_global_vals:
+                    not_present = object()
+                    for (name, _), (val, globals_dict) in self.used_global_vals.items():
+                        if globals_dict.get(name, not_present) != val:
+                            kernel = None
+                            break
+                if kernel is not None:
+                    bound_vals = args
+                    if kwargs:
+                        param_names = [p.name for p in self.params]
+                        bound_dict = dict(zip(param_names, args))
+                        bound_dict.update(kwargs)
+                        bound_vals = tuple(bound_dict[n] for n in param_names)
+                    self._fast_launch(kernel, grid, stream, bound_vals, *cached[2:9])
+                    self._last_call = self._make_launch_cache(device, args, kernel, bound_vals)
+                    self._last_kwargs = {k: v for k, v in kwargs.items()
+                                         if k not in ('debug', 'sanitize_overflow', 'instrumentation_mode')}
+                    return kernel
+
+        return None
 
     @staticmethod
     def _make_launch_cache(device, args, kernel, bound_vals):
