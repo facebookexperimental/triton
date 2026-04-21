@@ -1,4 +1,4 @@
-name: Meta Triton TLX Tests
+name: Meta Triton TritonBench Tests
 on:
   push:
     branches:
@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  h100-tlx-test:
+  h100-tritonbench-test:
     if: github.repository_owner == 'facebookexperimental'
     runs-on: [linux.gcp.h100]
     env:
