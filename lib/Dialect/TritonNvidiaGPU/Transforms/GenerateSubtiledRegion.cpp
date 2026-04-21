@@ -1388,10 +1388,6 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
       }
     }
 
-    // Identity + multi-task + N-tile is not supported.
-    if (multiTask && !equiv->identityOps.empty())
-      return;
-
     // Collect setup ops: tmemLoad → root split + inner setup ops.
     SmallVector<Operation *> setupOps;
     for (auto it = Block::iterator(tmemLoad); it != Block::iterator(splitOp);
