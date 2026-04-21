@@ -1161,6 +1161,15 @@ static bool buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
       }
     }
 
+    // Bail if any cross-segment value is not a tensor (e.g., pre-allocated
+    // SMEM memdesc from the memory planner). These need to be passed through
+    // as differing operands without re-buffering, which requires the
+    // per-segment refactor.
+    for (auto &[v0, perTile] : seen) {
+      if (!isa<RankedTensorType>(v0.getType()))
+        return false;
+    }
+
     SmallVector<BufferEntryN> bufs;
     for (auto &[v0, perTile] : seen) {
       auto tensorTy = cast<RankedTensorType>(v0.getType());
