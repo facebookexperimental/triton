@@ -26,10 +26,9 @@ static SmallVector<int32_t> getOpAsyncTaskIds(Operation *op) {
 }
 
 /// A segment of structurally equivalent per-tile chain ops with a uniform
-/// async task set.
+/// async task set. opsPerTile[t] holds the ops for tile t.
 struct ChainSegment {
-  SmallVector<Operation *> ops0; // from chain0
-  SmallVector<Operation *> ops1; // from chain1
+  SmallVector<SmallVector<Operation *>> opsPerTile;
   SmallVector<int32_t> taskIds;
 };
 
@@ -444,23 +443,24 @@ groupByContiguousTaskSet(ArrayRef<Operation *> chain0,
     auto taskIds0 = getOpAsyncTaskIds(chain0[i]);
     auto taskIds1 = getOpAsyncTaskIds(chain1[i]);
 
-    // Corresponding ops must have the same task set.
     if (taskIds0 != taskIds1)
       return std::nullopt;
 
-    // Ops without task IDs join the current segment.
     if (taskIds0.empty() && !segments.empty()) {
-      segments.back().ops0.push_back(chain0[i]);
-      segments.back().ops1.push_back(chain1[i]);
+      segments.back().opsPerTile[0].push_back(chain0[i]);
+      segments.back().opsPerTile[1].push_back(chain1[i]);
       continue;
     }
 
-    // Start a new segment if the task set changes.
-    if (segments.empty() || segments.back().taskIds != taskIds0)
-      segments.push_back({{}, {}, taskIds0});
+    if (segments.empty() || segments.back().taskIds != taskIds0) {
+      ChainSegment seg;
+      seg.opsPerTile.resize(2);
+      seg.taskIds = taskIds0;
+      segments.push_back(std::move(seg));
+    }
 
-    segments.back().ops0.push_back(chain0[i]);
-    segments.back().ops1.push_back(chain1[i]);
+    segments.back().opsPerTile[0].push_back(chain0[i]);
+    segments.back().opsPerTile[1].push_back(chain1[i]);
   }
   return segments;
 }
@@ -468,7 +468,8 @@ groupByContiguousTaskSet(ArrayRef<Operation *> chain0,
 /// Group chains by contiguous async task set when the chains have different
 /// lengths (due to identity-compatible ops). Uses the template chain from the
 /// equivalence result for task set boundaries. Identity ops (present only in
-/// the template chain) are placed in both ops0 and ops1 of their segment.
+/// the template chain) are placed in both opsPerTile[0] and [1] of their
+/// segment.
 static std::optional<SmallVector<ChainSegment>>
 groupByContiguousTaskSetWithIdentity(ArrayRef<Operation *> chain0,
                                      ArrayRef<Operation *> chain1,
@@ -491,24 +492,25 @@ groupByContiguousTaskSetWithIdentity(ArrayRef<Operation *> chain0,
     if (taskIds.empty() && !segments.empty()) {
       // Ops without task IDs join the current segment.
     } else if (segments.empty() || segments.back().taskIds != taskIds) {
-      segments.push_back({{}, {}, taskIds});
+      ChainSegment seg;
+      seg.opsPerTile.resize(2);
+      seg.taskIds = taskIds;
+      segments.push_back(std::move(seg));
     }
 
     bool isIdentity = equiv.identityOpSet.count(tplChain[ti]);
 
     if (isIdentity) {
-      // Identity op only exists in template chain. Place it in both slots
-      // so the segment has the op for cloning.
-      segments.back().ops0.push_back(tplChain[ti]);
-      segments.back().ops1.push_back(tplChain[ti]);
+      segments.back().opsPerTile[0].push_back(tplChain[ti]);
+      segments.back().opsPerTile[1].push_back(tplChain[ti]);
     } else {
       assert(oi < otherChain.size());
       Operation *op0 =
           (equiv.templateChainIdx == 0) ? tplChain[ti] : otherChain[oi];
       Operation *op1 =
           (equiv.templateChainIdx == 0) ? otherChain[oi] : tplChain[ti];
-      segments.back().ops0.push_back(op0);
-      segments.back().ops1.push_back(op1);
+      segments.back().opsPerTile[0].push_back(op0);
+      segments.back().opsPerTile[1].push_back(op1);
       ++oi;
     }
   }
@@ -806,12 +808,12 @@ static void buildMultiTaskSubtiledRegions(OpBuilder &outerBuilder, Location loc,
 
   for (size_t i = 0; i + 1 < segments.size(); ++i) {
     TransitionInfo tr;
-    Operation *lastOp0 = segments[i].ops0.back();
+    Operation *lastOp0 = segments[i].opsPerTile[0].back();
     auto alloc0 = dyn_cast<gpu::LocalAllocOp>(lastOp0);
 
     if (alloc0 && alloc0.getSrc()) {
       // Option 1: explicit memory store at local_alloc.
-      auto alloc1 = cast<gpu::LocalAllocOp>(segments[i].ops1.back());
+      auto alloc1 = cast<gpu::LocalAllocOp>(segments[i].opsPerTile[1].back());
       tr.alloc0 = alloc0;
       tr.alloc1 = alloc1;
 
@@ -835,13 +837,13 @@ static void buildMultiTaskSubtiledRegions(OpBuilder &outerBuilder, Location loc,
     } else {
       // Option 2: implicit buffer. Find cross-segment tensor values.
       DenseSet<Value> seg0Results;
-      for (auto *op : segments[i].ops0)
+      for (auto *op : segments[i].opsPerTile[0])
         for (Value r : op->getResults())
           seg0Results.insert(r);
 
       llvm::MapVector<Value, Value> seen; // chain0Val -> chain1Val
-      for (auto [op0, op1] :
-           llvm::zip(segments[i + 1].ops0, segments[i + 1].ops1)) {
+      for (auto [op0, op1] : llvm::zip(segments[i + 1].opsPerTile[0],
+                                       segments[i + 1].opsPerTile[1])) {
         for (auto [v0, v1] : llvm::zip(op0->getOperands(), op1->getOperands()))
           if (seg0Results.contains(v0) && !seen.count(v0))
             seen[v0] = v1;
@@ -873,8 +875,8 @@ static void buildMultiTaskSubtiledRegions(OpBuilder &outerBuilder, Location loc,
     // Build the sub-chain for structural equivalence.
     // For option 1, exclude the transition local_alloc (replaced by
     // local_store).
-    SmallVector<Operation *> subOps0(seg.ops0);
-    SmallVector<Operation *> subOps1(seg.ops1);
+    SmallVector<Operation *> subOps0(seg.opsPerTile[0]);
+    SmallVector<Operation *> subOps1(seg.opsPerTile[1]);
     if (hasOutgoingTransition && transitions[segIdx].isExplicitStore()) {
       subOps0.pop_back(); // remove local_alloc
       subOps1.pop_back();
@@ -1211,12 +1213,12 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
                               *differing);
   } else {
     for (size_t i = 0; i + 1 < segments->size(); ++i) {
-      Operation *lastOp = (*segments)[i].ops0.back();
+      Operation *lastOp = (*segments)[i].opsPerTile[0].back();
       auto alloc = dyn_cast<gpu::LocalAllocOp>(lastOp);
 
       if (alloc && alloc.getSrc()) {
-        for (size_t j = 0; j + 1 < (*segments)[i].ops0.size(); ++j) {
-          for (Value operand : (*segments)[i].ops0[j]->getOperands()) {
+        for (size_t j = 0; j + 1 < (*segments)[i].opsPerTile[0].size(); ++j) {
+          for (Value operand : (*segments)[i].opsPerTile[0][j]->getOperands()) {
             if (operand == alloc.getResult())
               return;
           }
