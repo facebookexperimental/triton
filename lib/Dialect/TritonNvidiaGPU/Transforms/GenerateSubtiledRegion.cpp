@@ -1096,7 +1096,7 @@ static void buildMultiTaskSubtiledRegions(OpBuilder &outerBuilder, Location loc,
 /// Build multiple SubtiledRegionOps for N-tile chains spanning multiple
 /// async task sets. Uses implicit buffering (Option 2) at segment
 /// transitions — cross-segment tensor values are communicated through SMEM.
-static void buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
+static bool buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
                                            Location loc,
                                            ArrayRef<Operation *> setupOps,
                                            ArrayRef<Value> leafValues,
@@ -1119,7 +1119,7 @@ static void buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
     Operation *lastOp0 = segments[i].opsPerTile[0].back();
     if (auto alloc = dyn_cast<gpu::LocalAllocOp>(lastOp0)) {
       if (alloc.getSrc())
-        return; // Option 1 not supported for N-tile yet
+        return false; // Option 1 not supported for N-tile yet
     }
 
     // Find cross-segment values: results of segment i ops used by segment i+1.
@@ -1186,7 +1186,7 @@ static void buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
 
     auto segEquiv = checkStructuralEquivalenceN(segChains);
     if (!segEquiv)
-      return;
+      return false;
     auto &segDiff = segEquiv->differingOperands;
 
     // Resolve cross-segment operands.
@@ -1329,6 +1329,7 @@ static void buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
     OpBuilder teardownBuilder = OpBuilder::atBlockEnd(teardownBlock);
     SubtiledRegionYieldOp::create(teardownBuilder, loc, ValueRange{});
   }
+  return true;
 }
 
 } // anonymous namespace
@@ -1423,6 +1424,7 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
     OpBuilder builder(insertBefore);
     Location loc = splitOp.getLoc();
 
+    bool built = false;
     if (multiTask) {
       auto segments = groupByContiguousTaskSetN(chains);
       if (!segments || segments->empty())
@@ -1430,14 +1432,18 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
       if (segments->size() == 1) {
         buildSingleSubtiledRegionN(builder, loc, setupOps, leafValues, chains,
                                    *equiv);
+        built = true;
       } else {
-        buildMultiTaskSubtiledRegionsN(builder, loc, setupOps, leafValues,
-                                       *segments);
+        built = buildMultiTaskSubtiledRegionsN(builder, loc, setupOps,
+                                               leafValues, *segments);
       }
     } else {
       buildSingleSubtiledRegionN(builder, loc, setupOps, leafValues, chains,
                                  *equiv);
+      built = true;
     }
+    if (!built)
+      return;
 
     // Erase original ops (reverse program order).
     // Chains first, then setup (which includes inner setup ops).
