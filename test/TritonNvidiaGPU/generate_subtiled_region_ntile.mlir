@@ -157,3 +157,77 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// Test: 4-tile multi-task with implicit buffer transition.
+// Each leaf chain: truncf{3} → convert_layout{4}
+// The task boundary produces two SubtiledRegionOps with 4 tile mappings each.
+
+#tmem_mt = #ttng.tensor_memory_encoding<blockM = 128, blockN = 256, colStride = 1>
+#full_mt = #ttg.blocked<{sizePerThread = [1, 256], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#r3d_128_mt = #ttg.blocked<{sizePerThread = [1, 2, 128], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 2, 1]}>
+#t3d_128_mt = #ttg.blocked<{sizePerThread = [1, 128, 2], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 1, 2]}>
+#d2_128_mt = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#r3d_64_mt = #ttg.blocked<{sizePerThread = [1, 2, 64], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 2, 1]}>
+#t3d_64_mt = #ttg.blocked<{sizePerThread = [1, 64, 2], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 1, 2]}>
+#d2_64_mt = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#d2_64_mt2 = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+
+  // CHECK-LABEL: @four_tile_multi_task
+  // Two SubtiledRegionOps, each with 4 tile mappings.
+  // First: truncf (task 3) + local_store
+  // CHECK: ttg.local_alloc
+  // CHECK: ttg.local_alloc
+  // CHECK: ttg.local_alloc
+  // CHECK: ttg.local_alloc
+  // CHECK: ttng.subtiled_region
+  // CHECK-SAME: tile_mappings = [array<i32: 0,
+  // CHECK-SAME: array<i32: 1,
+  // CHECK-SAME: array<i32: 2,
+  // CHECK-SAME: array<i32: 3,
+  // CHECK:   } tile{
+  // CHECK:     arith.truncf
+  // CHECK:     ttg.local_store
+  // CHECK:     ttng.subtiled_region_yield
+  // CHECK:   }
+  // Second: local_load + convert_layout (task 4)
+  // CHECK: ttng.subtiled_region tile_mappings = [array<i32: 0>, array<i32: 1>, array<i32: 2>, array<i32: 3>]
+  // CHECK:   } tile{
+  // CHECK:     ttg.local_load
+  // CHECK:     ttg.convert_layout
+  // CHECK:     ttng.subtiled_region_yield
+  // CHECK:   }
+  // CHECK-NOT: tt.split
+  tt.func @four_tile_multi_task(
+      %buf: !ttg.memdesc<128x256xf32, #tmem_mt, #ttng.tensor_memory, mutable>,
+      %tok: !ttg.async.token) {
+    %l:2 = ttng.tmem_load %buf[%tok] : !ttg.memdesc<128x256xf32, #tmem_mt, #ttng.tensor_memory, mutable> -> tensor<128x256xf32, #full_mt>
+    %r1 = tt.reshape %l#0 : tensor<128x256xf32, #full_mt> -> tensor<128x2x128xf32, #r3d_128_mt>
+    %t1 = tt.trans %r1 {order = array<i32: 0, 2, 1>} : tensor<128x2x128xf32, #r3d_128_mt> -> tensor<128x128x2xf32, #t3d_128_mt>
+    %h0, %h1 = tt.split %t1 : tensor<128x128x2xf32, #t3d_128_mt> -> tensor<128x128xf32, #d2_128_mt>
+    %r2a = tt.reshape %h0 : tensor<128x128xf32, #d2_128_mt> -> tensor<128x2x64xf32, #r3d_64_mt>
+    %t2a = tt.trans %r2a {order = array<i32: 0, 2, 1>} : tensor<128x2x64xf32, #r3d_64_mt> -> tensor<128x64x2xf32, #t3d_64_mt>
+    %a0, %a1 = tt.split %t2a : tensor<128x64x2xf32, #t3d_64_mt> -> tensor<128x64xf32, #d2_64_mt>
+    %r2b = tt.reshape %h1 : tensor<128x128xf32, #d2_128_mt> -> tensor<128x2x64xf32, #r3d_64_mt>
+    %t2b = tt.trans %r2b {order = array<i32: 0, 2, 1>} : tensor<128x2x64xf32, #r3d_64_mt> -> tensor<128x64x2xf32, #t3d_64_mt>
+    %a2, %a3 = tt.split %t2b : tensor<128x64x2xf32, #t3d_64_mt> -> tensor<128x64xf32, #d2_64_mt>
+
+    // Chain 0: truncf{3} → convert_layout{4}
+    %x0 = arith.truncf %a0 {async_task_id = array<i32: 3>} : tensor<128x64xf32, #d2_64_mt> to tensor<128x64xf16, #d2_64_mt>
+    %y0 = ttg.convert_layout %x0 {async_task_id = array<i32: 4>} : tensor<128x64xf16, #d2_64_mt> -> tensor<128x64xf16, #d2_64_mt2>
+    // Chain 1
+    %x1 = arith.truncf %a1 {async_task_id = array<i32: 3>} : tensor<128x64xf32, #d2_64_mt> to tensor<128x64xf16, #d2_64_mt>
+    %y1 = ttg.convert_layout %x1 {async_task_id = array<i32: 4>} : tensor<128x64xf16, #d2_64_mt> -> tensor<128x64xf16, #d2_64_mt2>
+    // Chain 2
+    %x2 = arith.truncf %a2 {async_task_id = array<i32: 3>} : tensor<128x64xf32, #d2_64_mt> to tensor<128x64xf16, #d2_64_mt>
+    %y2 = ttg.convert_layout %x2 {async_task_id = array<i32: 4>} : tensor<128x64xf16, #d2_64_mt> -> tensor<128x64xf16, #d2_64_mt2>
+    // Chain 3
+    %x3 = arith.truncf %a3 {async_task_id = array<i32: 3>} : tensor<128x64xf32, #d2_64_mt> to tensor<128x64xf16, #d2_64_mt>
+    %y3 = ttg.convert_layout %x3 {async_task_id = array<i32: 4>} : tensor<128x64xf16, #d2_64_mt> -> tensor<128x64xf16, #d2_64_mt2>
+
+    tt.return
+  }
+}
