@@ -757,7 +757,11 @@ def TT_ReduceOp: TT_Op<"reduce",
                         SingleBlock,
                         DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
     let summary = "Reduction using generic combination algorithm";
-    let arguments = (ins Variadic<TT_Tensor>:$srcs, I32Attr:$axis);
+    let arguments = (ins
+      Variadic<TT_Tensor>:$srcs,
+      I32Attr:$axis,
+      OptionalAttr<StrAttr>:$reduction_ordering
+    );
     let results = (outs Variadic<TT_Type>:$result);
     let regions = (region SizedRegion<1>:$combineOp);
     let hasVerifier = 1;
@@ -770,6 +774,11 @@ def TT_ReduceOp: TT_Op<"reduce",
       // Returns the CombineOp iff this ReduceOp's region contains only
       // one CombineOp other than the return, or nullptr if not applicable.
       ::mlir::Operation *getSingleCombiner();
+
+      // Returns true when a non-default reduction ordering is specified,
+      // indicating that the reduction has a defined ordering that must be
+      // preserved by compiler passes.
+      bool hasDefinedOrdering();
     }];
 }
 

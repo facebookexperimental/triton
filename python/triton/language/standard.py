@@ -171,14 +171,18 @@ def _elementwise_max(a, b):
 @core._tensor_member_fn
 @jit
 @core._add_reduction_docstr("maximum", return_indices_arg="return_indices",
-                            tie_break_arg="return_indices_tie_break_left")
-def max(input, axis=None, return_indices=False, return_indices_tie_break_left=True, keep_dims=False):
+                            tie_break_arg="return_indices_tie_break_left",
+                            reduction_ordering_arg="reduction_ordering")
+def max(input, axis=None, return_indices=False, return_indices_tie_break_left=True, keep_dims=False,
+        reduction_ordering: core.constexpr = None):
     input = core._promote_bfloat16_to_float32(input)
     if return_indices:
         if return_indices_tie_break_left:
-            return core._reduce_with_indices(input, axis, _argmax_combine_tie_break_left, keep_dims=keep_dims)
+            return core._reduce_with_indices(input, axis, _argmax_combine_tie_break_left, keep_dims=keep_dims,
+                                             reduction_ordering=reduction_ordering)
         else:
-            return core._reduce_with_indices(input, axis, _argmax_combine_tie_break_fast, keep_dims=keep_dims)
+            return core._reduce_with_indices(input, axis, _argmax_combine_tie_break_fast, keep_dims=keep_dims,
+                                             reduction_ordering=reduction_ordering)
     else:
         if core.constexpr(input.dtype.primitive_bitwidth) < core.constexpr(32):
             if core.constexpr(input.dtype.is_floating()):
@@ -186,14 +190,16 @@ def max(input, axis=None, return_indices=False, return_indices_tie_break_left=Tr
             else:
                 assert input.dtype.is_int(), "Expecting input to be integer type"
                 input = input.to(core.int32)
-        return core.reduce(input, axis, _elementwise_max, keep_dims=keep_dims)
+        return core.reduce(input, axis, _elementwise_max, keep_dims=keep_dims, reduction_ordering=reduction_ordering)
 
 
 @core._tensor_member_fn
 @jit
-@core._add_reduction_docstr("maximum index", tie_break_arg="tie_break_left")
-def argmax(input, axis, tie_break_left=True, keep_dims=False):
-    (_, ret) = max(input, axis, return_indices=True, return_indices_tie_break_left=tie_break_left, keep_dims=keep_dims)
+@core._add_reduction_docstr("maximum index", tie_break_arg="tie_break_left",
+                            reduction_ordering_arg="reduction_ordering")
+def argmax(input, axis, tie_break_left=True, keep_dims=False, reduction_ordering: core.constexpr = None):
+    (_, ret) = max(input, axis, return_indices=True, return_indices_tie_break_left=tie_break_left, keep_dims=keep_dims,
+                   reduction_ordering=reduction_ordering)
     return ret
 
 
@@ -230,14 +236,18 @@ def _elementwise_min(a, b):
 @core._tensor_member_fn
 @jit
 @core._add_reduction_docstr("minimum", return_indices_arg="return_indices",
-                            tie_break_arg="return_indices_tie_break_left")
-def min(input, axis=None, return_indices=False, return_indices_tie_break_left=True, keep_dims=False):
+                            tie_break_arg="return_indices_tie_break_left",
+                            reduction_ordering_arg="reduction_ordering")
+def min(input, axis=None, return_indices=False, return_indices_tie_break_left=True, keep_dims=False,
+        reduction_ordering: core.constexpr = None):
     input = core._promote_bfloat16_to_float32(input)
     if return_indices:
         if return_indices_tie_break_left:
-            return core._reduce_with_indices(input, axis, _argmin_combine_tie_break_left, keep_dims=keep_dims)
+            return core._reduce_with_indices(input, axis, _argmin_combine_tie_break_left, keep_dims=keep_dims,
+                                             reduction_ordering=reduction_ordering)
         else:
-            return core._reduce_with_indices(input, axis, _argmin_combine_tie_break_fast, keep_dims=keep_dims)
+            return core._reduce_with_indices(input, axis, _argmin_combine_tie_break_fast, keep_dims=keep_dims,
+                                             reduction_ordering=reduction_ordering)
     else:
         if core.constexpr(input.dtype.primitive_bitwidth) < 32:
             if core.constexpr(input.dtype.is_floating()):
@@ -245,14 +255,16 @@ def min(input, axis=None, return_indices=False, return_indices_tie_break_left=Tr
             else:
                 assert input.dtype.is_int(), "Expecting input to be integer type"
                 input = input.to(core.int32)
-        return core.reduce(input, axis, _elementwise_min, keep_dims=keep_dims)
+        return core.reduce(input, axis, _elementwise_min, keep_dims=keep_dims, reduction_ordering=reduction_ordering)
 
 
 @core._tensor_member_fn
 @jit
-@core._add_reduction_docstr("minimum index", tie_break_arg="tie_break_left")
-def argmin(input, axis, tie_break_left=True, keep_dims=False):
-    _, ret = min(input, axis, return_indices=True, return_indices_tie_break_left=tie_break_left, keep_dims=keep_dims)
+@core._add_reduction_docstr("minimum index", tie_break_arg="tie_break_left",
+                            reduction_ordering_arg="reduction_ordering")
+def argmin(input, axis, tie_break_left=True, keep_dims=False, reduction_ordering: core.constexpr = None):
+    _, ret = min(input, axis, return_indices=True, return_indices_tie_break_left=tie_break_left, keep_dims=keep_dims,
+                 reduction_ordering=reduction_ordering)
     return ret
 
 
@@ -281,8 +293,8 @@ def _pick_sum_dtype(in_dtype, dtype):
 
 @core._tensor_member_fn
 @jit
-@core._add_reduction_docstr("sum", dtype_arg="dtype")
-def sum(input, axis=None, keep_dims=False, dtype: core.constexpr = None):
+@core._add_reduction_docstr("sum", dtype_arg="dtype", reduction_ordering_arg="reduction_ordering")
+def sum(input, axis=None, keep_dims=False, dtype: core.constexpr = None, reduction_ordering: core.constexpr = None):
     # Pick a default dtype for the reduction if one was not specified.
     out_dtype: core.constexpr = _pick_sum_dtype(input.dtype, dtype)
 
@@ -298,7 +310,7 @@ def sum(input, axis=None, keep_dims=False, dtype: core.constexpr = None):
     # https://fb.workplace.com/groups/1405155842844877/posts/24616028937997573/?comment_id=24616575671276233&reply_comment_id=24617223141211486
     # Facebook. end
 
-    return core.reduce(input, axis, _sum_combine, keep_dims=keep_dims)
+    return core.reduce(input, axis, _sum_combine, keep_dims=keep_dims, reduction_ordering=reduction_ordering)
 
 
 @jit

@@ -267,7 +267,8 @@ void cloneReduceOp(triton::ReduceOp reduceOp,
     }
     auto axis = reduceOp.getAxis();
     auto newReduceOp =
-        b.create<triton::ReduceOp>(reduceOp.getLoc(), srcs, axis);
+        triton::ReduceOp::create(b, reduceOp.getLoc(), srcs, axis,
+                                 reduceOp.getReductionOrderingAttr());
     newReduceOp->setAttrs(reduceOp->getAttrs());
     newReduceOps.push_back(newReduceOp);
 
