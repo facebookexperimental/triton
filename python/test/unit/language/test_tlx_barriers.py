@@ -347,10 +347,13 @@ def test_named_wait_arrive(BLOCK_SIZE, device):
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
     kernel = add2_warp_specialized_pingpong_kernel[grid](x, y, output1, a, b, output2, n_elements, BLOCK_SIZE)
     ttgir = kernel.asm["ttgir"]
-    assert ttgir.count("ttng.wait_barrier_named %c9_i32, %c256_i32") == 1
-    assert ttgir.count("ttng.arrive_barrier_named %c10_i32, %c256_i32") == 1
-    assert ttgir.count("ttng.arrive_barrier_named %c9_i32_1, %c256_i32") == 1
-    assert ttgir.count("ttng.wait_barrier_named %c10_i32_0, %c256_i32") == 1
+    # Use regex to match barrier ops by barrier ID and thread count,
+    # since SSA name suffixes (e.g. %c10_i32 vs %c10_i32_0) are unstable
+    # across compiler pass changes.
+    assert len(re.findall(r"ttng\.wait_barrier_named %c9_i32(?:_\d+)?, %c256_i32(?:_\d+)?", ttgir)) == 1
+    assert len(re.findall(r"ttng\.arrive_barrier_named %c10_i32(?:_\d+)?, %c256_i32(?:_\d+)?", ttgir)) == 1
+    assert len(re.findall(r"ttng\.arrive_barrier_named %c9_i32(?:_\d+)?, %c256_i32(?:_\d+)?", ttgir)) == 1
+    assert len(re.findall(r"ttng\.wait_barrier_named %c10_i32(?:_\d+)?, %c256_i32(?:_\d+)?", ttgir)) == 1
 
     ref_out1, ref_out2 = dual_add(x, y, a, b)
     torch.testing.assert_close(output1, ref_out1, check_dtype=False)

@@ -261,6 +261,11 @@ class TritonGPUOptimizeThreadLocalityPass
                arith::MaxNumFOp, arith::MinimumFOp, arith::MinNumFOp>(
               reductionOp.value()))
         return;
+      // Skip reduces with a defined ordering — this optimization changes the
+      // reduction tree shape (different elemsPerThread across num_warps), which
+      // breaks the bitwise reproducibility guarantee.
+      if (reduce.hasDefinedOrdering())
+        return;
       // TODO: relax this restriction
       if (!(isa<triton::gpu::BlockedEncodingAttr>(srcEncoding) && rank > 1))
         return;

@@ -101,7 +101,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 //
 // --- Partition types ---
 // CHECK: tt.warp_specialize
-// CHECK-SAME: ttg.partition.types = ["correction", "gemm", "load", "epilogue_store", "computation", "computation"]
+// CHECK-SAME: ttg.partition.types = ["correction", "gemm", "epilogue_store", "load", "computation", "computation"]
 //
 // --- Post-loop: acc tmem_load, normalize → correction partition (via mergeEpilogue) ---
 // CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[CORR]]>
