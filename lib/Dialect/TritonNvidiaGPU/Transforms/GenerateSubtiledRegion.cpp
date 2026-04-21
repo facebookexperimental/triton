@@ -1110,18 +1110,22 @@ static bool buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
   struct BufferEntryN {
     SmallVector<Value> chainVals; // one per tile
     SmallVector<Value> smemVals;  // one per tile
+    bool needsLocalLoad;
   };
 
   SmallVector<SmallVector<BufferEntryN>> transitions; // one per transition
 
   for (size_t i = 0; i + 1 < segments.size(); ++i) {
-    // Bail on explicit store transitions (local_alloc with data).
     Operation *lastOp0 = segments[i].opsPerTile[0].back();
-    if (auto alloc = dyn_cast<gpu::LocalAllocOp>(lastOp0)) {
-      if (alloc.getSrc())
-        return false; // Option 1 not supported for N-tile yet
+    auto alloc0 = dyn_cast<gpu::LocalAllocOp>(lastOp0);
+
+    if (alloc0 && alloc0.getSrc()) {
+      // Option 1: explicit memory store at local_alloc.
+      // Not yet supported for N-tile multi-task.
+      return false;
     }
 
+    // Option 2: implicit buffer.
     // Find cross-segment values: results of segment i ops used by segment i+1.
     DenseSet<Value> seg0Results;
     for (auto *op : segments[i].opsPerTile[0])
@@ -1167,7 +1171,7 @@ static bool buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
             gpu::LocalAllocOp::create(outerBuilder, loc, memDescType, Value{});
         smems.push_back(alloc.getResult());
       }
-      bufs.push_back({perTile, smems});
+      bufs.push_back({perTile, smems, /*needsLocalLoad=*/true});
     }
     transitions.push_back(std::move(bufs));
   }
@@ -1179,7 +1183,6 @@ static bool buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
     bool hasOutgoing = (segIdx < transitions.size());
     bool hasIncoming = (segIdx > 0);
 
-    // Per-segment equivalence check.
     SmallVector<SmallVector<Operation *>> segChains;
     for (auto &ops : seg.opsPerTile)
       segChains.push_back(SmallVector<Operation *>(ops));
@@ -1313,7 +1316,7 @@ static bool buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
     for (size_t i = 0; i < outBufs.size(); ++i)
       outSmemArgs.push_back(tileBlock->getArgument(argIdx++));
 
-    for (Operation *op : seg.opsPerTile[0])
+    for (Operation *op : segChains[0])
       tileBuilder.clone(*op, tileMapping);
 
     if (hasOutgoing) {
