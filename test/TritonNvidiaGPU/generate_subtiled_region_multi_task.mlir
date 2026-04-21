@@ -344,3 +344,74 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// Test: 4-tile subtiling via nested splits.
+
+#tmem7 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 256, colStride = 1>
+#blocked3d7 = #ttg.blocked<{sizePerThread = [1, 2, 128], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 2, 1]}>
+#blocked3d_perm7 = #ttg.blocked<{sizePerThread = [1, 128, 2], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 1, 2]}>
+#blocked_full7 = #ttg.blocked<{sizePerThread = [1, 256], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#blocked2d7 = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#blocked3d7b = #ttg.blocked<{sizePerThread = [1, 2, 64], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 2, 1]}>
+#blocked3d_perm7b = #ttg.blocked<{sizePerThread = [1, 64, 2], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 1, 2]}>
+#blocked2d7b = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#shared7 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+
+  // CHECK-LABEL: @four_tile_nested_split
+  // Should produce a single SubtiledRegionOp with 4 tile mappings.
+  // CHECK: ttng.subtiled_region
+  // CHECK-SAME: tile_mappings = [array<i32: 0,
+  // CHECK-SAME: array<i32: 1,
+  // CHECK-SAME: array<i32: 2,
+  // CHECK-SAME: array<i32: 3,
+  // CHECK:   setup {
+  // CHECK:     tt.split
+  // CHECK:     tt.split
+  // CHECK:     tt.split
+  // CHECK:     ttng.subtiled_region_yield
+  // CHECK:   } tile{
+  // CHECK:     arith.truncf
+  // CHECK:     tt.descriptor_store
+  // CHECK:     ttng.subtiled_region_yield
+  // CHECK:   }
+  // CHECK-NOT: tt.split
+  tt.func @four_tile_nested_split(
+      %tmem_buf: !ttg.memdesc<128x256xf32, #tmem7, #ttng.tensor_memory, mutable>,
+      %acc_tok: !ttg.async.token,
+      %c_desc: !tt.tensordesc<tensor<128x64xf16, #shared7>>,
+      %off_m: i32, %off_n: i32, %c64: i32, %c128: i32, %c192: i32) {
+    %loaded:2 = ttng.tmem_load %tmem_buf[%acc_tok] : !ttg.memdesc<128x256xf32, #tmem7, #ttng.tensor_memory, mutable> -> tensor<128x256xf32, #blocked_full7>
+    %reshaped = tt.reshape %loaded#0 : tensor<128x256xf32, #blocked_full7> -> tensor<128x2x128xf32, #blocked3d7>
+    %transposed = tt.trans %reshaped {order = array<i32: 0, 2, 1>} : tensor<128x2x128xf32, #blocked3d7> -> tensor<128x128x2xf32, #blocked3d_perm7>
+    %lhs, %rhs = tt.split %transposed : tensor<128x128x2xf32, #blocked3d_perm7> -> tensor<128x128xf32, #blocked2d7>
+
+    %lhs_r = tt.reshape %lhs : tensor<128x128xf32, #blocked2d7> -> tensor<128x2x64xf32, #blocked3d7b>
+    %lhs_t = tt.trans %lhs_r {order = array<i32: 0, 2, 1>} : tensor<128x2x64xf32, #blocked3d7b> -> tensor<128x64x2xf32, #blocked3d_perm7b>
+    %acc00, %acc01 = tt.split %lhs_t : tensor<128x64x2xf32, #blocked3d_perm7b> -> tensor<128x64xf32, #blocked2d7b>
+
+    %rhs_r = tt.reshape %rhs : tensor<128x128xf32, #blocked2d7> -> tensor<128x2x64xf32, #blocked3d7b>
+    %rhs_t = tt.trans %rhs_r {order = array<i32: 0, 2, 1>} : tensor<128x2x64xf32, #blocked3d7b> -> tensor<128x64x2xf32, #blocked3d_perm7b>
+    %acc10, %acc11 = tt.split %rhs_t : tensor<128x64x2xf32, #blocked3d_perm7b> -> tensor<128x64xf32, #blocked2d7b>
+
+    %c00 = arith.truncf %acc00 : tensor<128x64xf32, #blocked2d7b> to tensor<128x64xf16, #blocked2d7b>
+    tt.descriptor_store %c_desc[%off_m, %off_n], %c00 : !tt.tensordesc<tensor<128x64xf16, #shared7>>, tensor<128x64xf16, #blocked2d7b>
+
+    %c01 = arith.truncf %acc01 : tensor<128x64xf32, #blocked2d7b> to tensor<128x64xf16, #blocked2d7b>
+    %off1 = arith.addi %off_n, %c64 : i32
+    tt.descriptor_store %c_desc[%off_m, %off1], %c01 : !tt.tensordesc<tensor<128x64xf16, #shared7>>, tensor<128x64xf16, #blocked2d7b>
+
+    %c10 = arith.truncf %acc10 : tensor<128x64xf32, #blocked2d7b> to tensor<128x64xf16, #blocked2d7b>
+    %off2 = arith.addi %off_n, %c128 : i32
+    tt.descriptor_store %c_desc[%off_m, %off2], %c10 : !tt.tensordesc<tensor<128x64xf16, #shared7>>, tensor<128x64xf16, #blocked2d7b>
+
+    %c11 = arith.truncf %acc11 : tensor<128x64xf32, #blocked2d7b> to tensor<128x64xf16, #blocked2d7b>
+    %off3 = arith.addi %off_n, %c192 : i32
+    tt.descriptor_store %c_desc[%off_m, %off3], %c11 : !tt.tensordesc<tensor<128x64xf16, #shared7>>, tensor<128x64xf16, #blocked2d7b>
+
+    tt.return
+  }
+}

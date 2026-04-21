@@ -1236,8 +1236,11 @@ public:
   void runOnOperation() override {
     SmallVector<triton::SplitOp> splitOps;
     getOperation().walk([&](triton::SplitOp op) { splitOps.push_back(op); });
-    for (auto splitOp : splitOps)
+    for (auto splitOp : splitOps) {
+      if (!splitOp->getParentOp())
+        continue;
       tryGenerateForSplit(splitOp);
+    }
   }
 };
 
