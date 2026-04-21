@@ -1,6 +1,6 @@
 // (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-#include "ModuloPipelineIR.h"
+#include "ModuloScheduleGraph.h"
 
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Debug.h"
@@ -27,7 +27,7 @@ static void dumpIndent(llvm::raw_ostream &os, unsigned depth) {
     os << "  ";
 }
 
-static void dumpNodeOneLine(const PipelineNode &node, llvm::raw_ostream &os,
+static void dumpNodeOneLine(const ScheduleNode &node, llvm::raw_ostream &os,
                             unsigned depth) {
   dumpIndent(os, depth);
   if (node.op && node.op->getNumResults() > 0)
@@ -56,7 +56,8 @@ static void dumpNodeOneLine(const PipelineNode &node, llvm::raw_ostream &os,
       os << "(" << innerName << ")";
   }
   os << "  {pipe: " << getPipelineName(node.pipeline)
-     << ", cycle: " << node.cycle;
+     << ", cycle: " << node.cycle
+     << ", cluster: " << node.cluster;
   if (node.latency)
     os << ", latency: " << node.latency;
   if (node.selfLatency)
@@ -70,7 +71,7 @@ static void dumpNodeOneLine(const PipelineNode &node, llvm::raw_ostream &os,
   os << "}\n";
 }
 
-static void dumpPort(const PipelineLoop::MemPort &port, llvm::raw_ostream &os) {
+static void dumpPort(const ScheduleLoop::MemPort &port, llvm::raw_ostream &os) {
   if (!port.op) {
     if (port.bufferId != UINT_MAX)
       os << "buf" << port.bufferId;
@@ -86,10 +87,10 @@ static void dumpPort(const PipelineLoop::MemPort &port, llvm::raw_ostream &os) {
   }
 }
 
-static void dumpLoop(const PipelineGraph &graph, const PipelineLoop &loop,
+static void dumpLoop(const ScheduleGraph &graph, const ScheduleLoop &loop,
                      llvm::raw_ostream &os, unsigned depth) {
   dumpIndent(os, depth);
-  os << "modulo.pipeline @loop" << loop.id << " {\n";
+  os << "modulo.schedule @loop" << loop.id << " {\n";
   unsigned inner = depth + 1;
 
   // Schedule parameters
@@ -220,7 +221,7 @@ static void dumpLoop(const PipelineGraph &graph, const PipelineLoop &loop,
   os << "}\n";
 }
 
-void PipelineGraph::dump() const {
+void ScheduleGraph::dump(llvm::raw_ostream &os) const {
   llvm::DenseSet<unsigned> childIds;
   for (const auto &loop : loops)
     for (const auto &node : loop.nodes)
@@ -230,9 +231,11 @@ void PipelineGraph::dump() const {
   for (const auto &loop : loops) {
     if (childIds.count(loop.id))
       continue;
-    dumpLoop(*this, loop, llvm::dbgs(), 0);
-    llvm::dbgs() << "\n";
+    dumpLoop(*this, loop, os, 0);
+    os << "\n";
   }
 }
+
+void ScheduleGraph::dump() const { dump(llvm::dbgs()); }
 
 } // namespace mlir::triton::gpu
