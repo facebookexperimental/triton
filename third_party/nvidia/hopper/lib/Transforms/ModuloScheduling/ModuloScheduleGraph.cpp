@@ -1,6 +1,6 @@
 // (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-#include "ModuloPipelineIR.h"
+#include "ModuloScheduleGraph.h"
 
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Debug.h"
@@ -27,7 +27,7 @@ static void dumpIndent(llvm::raw_ostream &os, unsigned depth) {
     os << "  ";
 }
 
-static void dumpNodeOneLine(const PipelineNode &node, llvm::raw_ostream &os,
+static void dumpNodeOneLine(const ScheduleNode &node, llvm::raw_ostream &os,
                             unsigned depth) {
   dumpIndent(os, depth);
   if (node.op && node.op->getNumResults() > 0)
@@ -70,7 +70,7 @@ static void dumpNodeOneLine(const PipelineNode &node, llvm::raw_ostream &os,
   os << "}\n";
 }
 
-static void dumpPort(const PipelineLoop::MemPort &port, llvm::raw_ostream &os) {
+static void dumpPort(const ScheduleLoop::MemPort &port, llvm::raw_ostream &os) {
   if (!port.op) {
     if (port.bufferId != UINT_MAX)
       os << "buf" << port.bufferId;
@@ -86,10 +86,10 @@ static void dumpPort(const PipelineLoop::MemPort &port, llvm::raw_ostream &os) {
   }
 }
 
-static void dumpLoop(const PipelineGraph &graph, const PipelineLoop &loop,
+static void dumpLoop(const ScheduleGraph &graph, const ScheduleLoop &loop,
                      llvm::raw_ostream &os, unsigned depth) {
   dumpIndent(os, depth);
-  os << "modulo.pipeline @loop" << loop.id << " {\n";
+  os << "modulo.schedule @loop" << loop.id << " {\n";
   unsigned inner = depth + 1;
 
   // Schedule parameters
@@ -220,7 +220,7 @@ static void dumpLoop(const PipelineGraph &graph, const PipelineLoop &loop,
   os << "}\n";
 }
 
-void PipelineGraph::dump() const {
+void ScheduleGraph::dump() const {
   llvm::DenseSet<unsigned> childIds;
   for (const auto &loop : loops)
     for (const auto &node : loop.nodes)
