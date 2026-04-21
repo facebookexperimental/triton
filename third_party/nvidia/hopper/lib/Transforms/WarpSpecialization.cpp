@@ -242,11 +242,22 @@ public:
       }
     }
 
-    // Convert token annotations on SubtiledRegionOps to barrier annotations,
-    // then lower the SubtiledRegionOps. doTokenLowering must run first so
-    // that token annotations are resolved to barriers before subtile lowering
-    // materializes them.
+    // Primary SubtiledRegionOp lowering path. By this point the tile body
+    // has been optimized (OptimizeTMemLayouts + PushSharedSetupToTile ran
+    // inside doGenerateSubtiledRegion), so tmem_loads are sunk close to
+    // their consumers. doTokenLowering converts token annotations to
+    // barrier annotations, then lowerSubtiledRegion unrolls the tile body
+    // with per-tile barrier materialization.
+    //
+    // Multi-task SubtiledRegionOps were already lowered as fallbacks in
+    // doCodePartition/doCodePartitionPost (before specializeRegion).
     doTokenLowering(funcOp, numWarpGroups - 1);
+    if (dumpIntermediateSteps) {
+      llvm::dbgs()
+          << "// -----// WarpSpec internal IR Dump After: doTokenLowering\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
+    }
 
     {
       SmallVector<triton::nvidia_gpu::SubtiledRegionOp> remaining;
@@ -257,8 +268,8 @@ public:
         triton::nvidia_gpu::lowerSubtiledRegion(op);
     }
     if (dumpIntermediateSteps) {
-      llvm::dbgs()
-          << "// -----// WarpSpec internal IR Dump After: doTokenLowering\n";
+      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                      "lowerSubtiledRegion\n";
       moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
       llvm::dbgs() << "\n\n\n";
     }
