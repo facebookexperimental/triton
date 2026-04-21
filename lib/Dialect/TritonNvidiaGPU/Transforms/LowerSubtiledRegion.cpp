@@ -108,8 +108,6 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
   ValueRange barriers = op.getBarriers();
   ValueRange accumCnts = op.getAccumCnts();
 
-  static constexpr const char *kSubtileOpId = "subtile_op_id";
-
   // Pre-process barrier annotations by region and target op ID.
   llvm::DenseMap<unsigned, SmallVector<BarrierAnnotationAttr>> tileBefore,
       tileAfter;

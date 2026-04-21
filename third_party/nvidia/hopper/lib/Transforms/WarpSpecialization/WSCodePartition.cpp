@@ -38,8 +38,6 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
-static constexpr const char *kSubtileOpId = "subtile_op_id";
-
 /// Lower token annotations by injecting inline ConsumerWaitOp/ConsumerReleaseOp
 /// into the tile body. Used for multi-task SubtiledRegionOps that are lowered
 /// before doTokenLowering runs (the inline ops survive into warp partitions
@@ -54,7 +52,7 @@ static void lowerTokenAnnotations(ttng::SubtiledRegionOp op) {
 
   llvm::DenseMap<unsigned, Operation *> idToOp;
   for (Operation &tileOp : tileBlock.without_terminator()) {
-    if (auto idAttr = tileOp.getAttrOfType<IntegerAttr>(kSubtileOpId))
+    if (auto idAttr = tileOp.getAttrOfType<IntegerAttr>(ttng::kSubtileOpId))
       idToOp[idAttr.getInt()] = &tileOp;
   }
 
@@ -112,19 +110,19 @@ static ttng::SubtiledRegionOp getEnclosingSubtiledRegionTile(Operation *op) {
 /// unlike positional indices.
 static unsigned getOrAssignStableId(ttng::SubtiledRegionOp subtiled,
                                     Operation *targetOp) {
-  if (auto existing = targetOp->getAttrOfType<IntegerAttr>(kSubtileOpId))
+  if (auto existing = targetOp->getAttrOfType<IntegerAttr>(ttng::kSubtileOpId))
     return existing.getInt();
 
   // Find the next available ID by scanning existing IDs.
   unsigned nextId = 0;
   Block &tileBlock = subtiled.getTileRegion().front();
   for (Operation &op : tileBlock.without_terminator()) {
-    if (auto idAttr = op.getAttrOfType<IntegerAttr>(kSubtileOpId))
+    if (auto idAttr = op.getAttrOfType<IntegerAttr>(ttng::kSubtileOpId))
       nextId = std::max(nextId, static_cast<unsigned>(idAttr.getInt()) + 1);
   }
 
   targetOp->setAttr(
-      kSubtileOpId,
+      ttng::kSubtileOpId,
       IntegerAttr::get(IntegerType::get(targetOp->getContext(), 32), nextId));
   return nextId;
 }
