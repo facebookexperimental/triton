@@ -69,7 +69,7 @@ print(f'The maximum difference between torch and triton is '
 # -------------------------------------
 # We can also customize the libdevice library path by passing the path to the `libdevice` library to the `asin` kernel.
 def is_cuda():
-    return triton.runtime.driver.active.get_current_target().backend == "cuda"
+    return triton.runtime.driver.active.get_current_target().is_cuda_backend()
 
 
 def is_hip():

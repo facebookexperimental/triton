@@ -65,7 +65,7 @@ t5 = importlib.import_module("05-wgmma")
 
 def is_hopper_or_newer():
     target = triton.runtime.driver.active.get_current_target()
-    return target.backend == "cuda" and torch.cuda.get_device_capability()[0] >= 9
+    return target.is_cuda_backend() and torch.cuda.get_device_capability()[0] >= 9
 
 
 if __name__ == "__main__" and not is_hopper_or_newer():
