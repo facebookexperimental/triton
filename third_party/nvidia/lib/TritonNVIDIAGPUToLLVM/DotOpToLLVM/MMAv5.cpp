@@ -667,12 +667,11 @@ LogicalResult convertScaledDot(const LLVMTypeConverter &typeConverter,
                         mxfpInstKind, twoCTAs);
   };
 
-  return convertDotImpl(typeConverter, rewriter, loc, op.getA(), op.getB(),
-                        adaptor.getA(), adaptor.getB(), dTensorTy,
-                        adaptor.getUseD(), adaptor.getPred(),
-                        adaptor.getBarriers(), adaptor.getBarrierPreds(),
-                        twoCTAs, tlx::tlxEnablePairedMMA(op), opKindIsMXFP4,
-                        dot);
+  return convertDotImpl(
+      typeConverter, rewriter, loc, op.getA(), op.getB(), adaptor.getA(),
+      adaptor.getB(), dTensorTy, adaptor.getUseD(), adaptor.getPred(),
+      adaptor.getBarriers(), adaptor.getBarrierPreds(), twoCTAs,
+      tlx::tlxEnablePairedMMA(op), opKindIsMXFP4, dot);
 }
 
 //===----------------------------------------------------------------------===//

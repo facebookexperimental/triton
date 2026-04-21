@@ -828,10 +828,6 @@ static PartitionLayout createPartitionLayout(PartitionSet &schedule,
     layout.gemmPartition->setType("gemm");
   }
 
-  // Load partition: always.
-  layout.loadPartition = schedule.addPartition(0);
-  layout.loadPartition->setType("load");
-
   // Epilogue partition: for non-store epilogue ops when not merging.
   if (hasEpilogue && !options.mergeEpilogue &&
       !options.mergeEpilogueToComputation) {
@@ -844,6 +840,11 @@ static PartitionLayout createPartitionLayout(PartitionSet &schedule,
     layout.epilogueStorePartition = schedule.addPartition(0);
     layout.epilogueStorePartition->setType("epilogue_store");
   }
+
+  // Load partition: always created last so it gets the highest partition index,
+  // which maps to the default (producer) warp group at runtime.
+  layout.loadPartition = schedule.addPartition(0);
+  layout.loadPartition->setType("load");
 
   // Set default partition alias using fallback chain.
   layout.defaultPartition = layout.getDefaultPartition();
