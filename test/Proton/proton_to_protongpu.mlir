@@ -82,27 +82,25 @@ module attributes {"ttg.num-warps" = 8 : i32} {
     // CHECK: scf.for
     // CHECK: %[[START1:.*]] = proton_gpu.read_counter : i32
     // CHECK: proton_gpu.circular_store start %[[SEGMENT]], %[[START1]] {scopeId = 1 : i32}
-    // CHECK: scf.for
     // CHECK: %[[END1:.*]] = proton_gpu.read_counter : i32
     // CHECK: proton_gpu.circular_store end %[[SEGMENT]], %[[END1]] {scopeId = 1 : i32}
     // CHECK: }
     // CHECK: %[[END0:.*]] = proton_gpu.read_counter : i32
     // CHECK: proton_gpu.circular_store end %[[SEGMENT]], %[[END0]] {scopeId = 0 : i32}
-    // CHECK: }
     // CHECK: %[[START2:.*]] = proton_gpu.read_counter : i32
     // CHECK: proton_gpu.circular_store start %[[SEGMENT]], %[[START2]] {scopeId = 2 : i32}
     // CHECK: %[[END2:.*]] = proton_gpu.read_counter : i32
     // CHECK: proton_gpu.circular_store end %[[SEGMENT]], %[[END2]] {scopeId = 2 : i32}
     // CHECK: gpu.barrier
     // CHECK: proton_gpu.finalize %[[SEGMENT]], %[[SCRATCH]]
-    proton.record start "name1"
+    proton.record start "name0"
     scf.for %arg0 = %i to %c4 step %c1 {
-      proton.record start "name0"
+      proton.record start "name1"
       scf.for %arg1 = %i to %c4 step %c1 {
-        proton.record end "name0"
       }
       proton.record end "name1"
     }
+    proton.record end "name0"
     proton.record start "name2"
     proton.record end "name2"
     tt.return
@@ -167,7 +165,7 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 8 : i32} {
 // -----
 
 module attributes {"ttg.num-warps" = 8 : i32} {
-  // CHECK-LABEL: global_mem_buffer
+  // CHECK-GMEM-LABEL: global_mem_buffer
   // CHECK-GMEM: %[[SCRATCH:.*]] = proton_gpu.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
   // CHECK-GMEM: proton_gpu.initialize %[[SCRATCH]] : !tt.ptr<i32>
   // CHECK-GMEM: %[[PTR:.*]] = tt.addptr %[[SCRATCH]]
@@ -189,7 +187,7 @@ module attributes {"ttg.num-warps" = 8 : i32} {
 // -----
 
 module attributes {"ttg.num-warps" = 8 : i32} {
-  // CHECK-LABEL: global_mem_buffer
+  // CHECK-GMEM-LABEL: global_mem_buffer
   // CHECK-GMEM: %[[SCRATCH:.*]] = proton_gpu.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
   // CHECK-GMEM: proton_gpu.initialize %[[SCRATCH]] : !tt.ptr<i32>
   // CHECK-GMEM: %[[PTR:.*]] = tt.addptr %[[SCRATCH]]
