@@ -778,7 +778,7 @@ An alternative to Rau's IMS is Swing Modulo Scheduling (J. Llosa, A. Gonzalez, E
 
 **SMS Algorithm:**
 
-1. **Compute ASAP/ALAP**: Forward/backward relaxation on distance-0 edges to determine each op's scheduling window. Slack = ALAP - ASAP measures scheduling freedom.
+1. **Compute ASAP/ALAP**: Forward/backward relaxation including loop-carried edges (II-dependent: `ASAP[v] >= ASAP[u] + latency - distance * II`), recomputed for each candidate II. Slack = ALAP - ASAP measures scheduling freedom.
 
 2. **Ordering phase (swing)**: Start with the minimum-slack op (most constrained). Then BFS-expand: add its successors (marked top-down) sorted by ascending slack, then its predecessors (marked bottom-up) sorted by ascending slack. This alternation is the "swing" — it keeps producers and consumers adjacent in the schedule.
 
@@ -788,11 +788,12 @@ An alternative to Rau's IMS is Swing Modulo Scheduling (J. Llosa, A. Gonzalez, E
 
 ```python
 def sms_schedule(DDG, latencies, unit_map, MinII):
-    asap = compute_ASAP(DDG, latencies)  # forward relaxation, distance-0 only
-    alap = compute_ALAP(DDG, latencies, asap)  # backward from max ASAP
-    slack = {op: alap[op] - asap[op] for op in DDG.nodes}
+    for II in range(MinII, MinII + 11):  # capped at MinII+10
+        # Recompute per-II: loop-carried edges depend on II
+        asap = compute_ASAP(DDG, latencies, II)
+        alap = compute_ALAP(DDG, latencies, asap, II)
+        slack = {op: alap[op] - asap[op] for op in DDG.nodes}
 
-    for II in range(MinII, 2 * MinII + 1):
         table = ReservationTable(II)
         scheduled = {}
 
@@ -834,17 +835,44 @@ def sms_schedule(DDG, latencies, unit_map, MinII):
     return None
 ```
 
-**Implementation status:** SMS is available via `TRITON_MODULO_SCHEDULE_ALGO=sms`. The implementation has the following simplifications relative to the paper:
+**Implementation status:** SMS is available via `TRITON_USE_MODULO_SCHEDULE=sms`. Source: `SwingScheduler.cpp`. The implementation has the following simplifications relative to the paper:
 
-1. **ASAP/ALAP ignore loop-carried edges** and are computed once (not per-II). The paper uses II-dependent bounds: `ASAP[v] >= ASAP[u] + latency - distance * II`. This means slack values are approximate for nodes in recurrences.
+1. **No recurrence-aware ordering.** The paper identifies SCCs, orders them by RecMII contribution, and schedules the most critical recurrence first. The implementation uses simple BFS from the minimum-slack node.
 
-2. **No recurrence-aware ordering.** The paper identifies Strongly Connected Components (recurrences), orders them by RecMII contribution, and schedules the most critical recurrence first. The implementation uses simple BFS from the minimum-slack node.
+2. **Fallback on placement failure.** When the directional scan finds no free slot, the implementation falls back to `find_free` from earliest. The paper would fail at this II and increment.
 
-3. **Fallback on placement failure.** When the directional scan finds no free slot, the implementation falls back to `find_free` from earliest. The paper would fail at this II and increment.
+3. **BFS follows all DDG edges** including loop-carried (distance > 0). The paper's ordering only follows distance-0 edges.
 
-4. **BFS follows all DDG edges** including loop-carried (distance > 0). The paper's ordering only follows distance-0 edges.
+ASAP/ALAP include loop-carried edges and are recomputed per-II: `ASAP[v] >= ASAP[u] + latency - distance * II`, with a convergence limit of 1000 iterations.
 
-These simplifications are acceptable for GPU inner loops with 10-20 ops where suboptimal ordering rarely affects the achieved II. On a GEMM kernel (1 MMA, 8 ops total), SMS and Rau produce the same II and stage assignments for all key ops.
+**selfLatency model:** All pipelines use `selfLatency = 1` because GPU execution units are deeply pipelined — a new instruction can be issued every ~1 cycle. This makes ResMII negligible (equal to the op count on the busiest pipeline) and lets RecMII (data dependencies) drive the schedule. Without this fix, SMS fails on FA backward (ResMII=4500 from 5 MMAs × 900 selfLatency each).
+
+**Stage assignment (emitMMAAnnotations):** After SMS assigns cycles, the pass derives pipeline stage annotations (`tt.autows`) for MMA ops using transitive MMA dependency counting:
+
+- 0-1 transitive MMA predecessors → stage 0 (can be prefetched)
+- 2+ transitive MMA predecessors → stage 1 (gated on multiple prior results)
+
+Within each stage, independent MMAs share the same order (cluster ID) to avoid barrier deadlocks.
+
+Example (FA backward, 5 MMAs):
+
+| MMA | Transitive MMA deps | Stage | Order |
+|-----|---------------------|-------|-------|
+| qkT = dot(k, qT) | 0 | 0 | 0 |
+| dpT = dot(v, do^T) | 0 | 0 | 0 |
+| dv += dot(ppT, do) | 1 (qkT) | 0 | 1 |
+| dq = dot(dsT^T, k) | 2 (qkT, dpT) | 1 | 0 |
+| dk += dot(dsT, qT) | 2 (qkT, dpT) | 1 | 0 |
+
+This matches the hand-tuned annotation partition exactly. Annotations are skipped when all MMAs land in the same stage (e.g., GEMM, FA forward) or when the loop already has `tt.autows` from Python `attrs=`.
+
+FA BWD performance (B200, `TRITON_USE_META_WS=1 TRITON_USE_META_PARTITION=1`):
+
+| Shape | Baseline TFLOPS | SMS TFLOPS | Diff |
+|---|---|---|---|
+| Z=4 H=16 N=2048 D=128 | 409.4 | 409.9 | +0.1% |
+| Z=8 H=16 N=1024 D=128 | 324.7 | 323.3 | -0.4% |
+| Z=1 H=32 N=4096 D=128 | 471.2 | 472.0 | +0.2% |
 
 ### Step 2.5: Compute Cluster IDs from the Modulo Schedule
 
