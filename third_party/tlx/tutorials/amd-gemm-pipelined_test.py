@@ -185,7 +185,6 @@ def matmul_kernel_pipelined_mi300(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, strid
         a_k_smem_view = tlx.local_view(buffers_A, k % NUM_BUFFERS)
         b_k_smem_view = tlx.local_view(buffers_B, k % NUM_BUFFERS)
         a_load_reg = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K)
-        b_load_reg = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K)
 
         # do compute on data fetched ahead by NUM_STAGES - 1
         buf = (k - NUM_STAGES - 1) % NUM_BUFFERS
@@ -193,6 +192,7 @@ def matmul_kernel_pipelined_mi300(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, strid
         b_k_prev_shmem = tlx.local_view(buffers_B, buf)
         a_k_prev_reg = tlx.local_load(a_k_prev_shmem)
         b_k_prev_reg = tlx.local_load(b_k_prev_shmem)
+        b_load_reg = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K)
         acc = tl.dot(a_k_prev_reg, b_k_prev_reg, acc)
 
         # store data for k from regs to shmem, this is NUM_STAGES - 1 ahead of the k in the prev tl.dot
