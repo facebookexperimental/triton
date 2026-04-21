@@ -1089,6 +1089,26 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
     if (!equiv)
       return;
 
+    // Bail out if chains span multiple async task sets (multi-task N-tile
+    // is not yet supported — only the 2-tile path handles multi-task).
+    {
+      SmallVector<int32_t> firstTaskIds;
+      bool multiTask = false;
+      for (auto &chain : chains) {
+        for (auto *op : chain) {
+          auto taskIds = getOpAsyncTaskIds(op);
+          if (taskIds.empty())
+            continue;
+          if (firstTaskIds.empty())
+            firstTaskIds = taskIds;
+          else if (taskIds != firstTaskIds)
+            multiTask = true;
+        }
+      }
+      if (multiTask)
+        return;
+    }
+
     // Collect setup ops: tmemLoad → root split + inner setup ops.
     SmallVector<Operation *> setupOps;
     for (auto it = Block::iterator(tmemLoad); it != Block::iterator(splitOp);
@@ -1234,12 +1254,41 @@ public:
       TritonNvidiaGPUTestGenerateSubtiledRegionPassBase;
 
   void runOnOperation() override {
-    SmallVector<triton::SplitOp> splitOps;
-    getOperation().walk([&](triton::SplitOp op) { splitOps.push_back(op); });
-    for (auto splitOp : splitOps) {
-      if (!splitOp->getParentOp())
-        continue;
-      tryGenerateForSplit(splitOp);
+    // Collect root splits (those tracing to tmem_load) in function bodies.
+    // Process them one at a time, re-walking after each success to avoid
+    // dangling pointers from erased inner splits. Track failed splits to
+    // avoid infinite loops on splits that can't be processed (e.g.,
+    // multi-task N-tile).
+    DenseSet<Operation *> failedSplits;
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      SmallVector<triton::SplitOp> splitOps;
+      getOperation().walk([&](triton::FuncOp funcOp) {
+        for (auto &block : funcOp.getBody()) {
+          for (auto &op : block) {
+            if (auto splitOp = dyn_cast<triton::SplitOp>(&op))
+              if (!failedSplits.contains(&op))
+                splitOps.push_back(splitOp);
+          }
+        }
+      });
+      for (auto splitOp : splitOps) {
+        auto tmemLoad = traceSetupChain(splitOp);
+        if (!tmemLoad)
+          continue;
+        unsigned opCountBefore = 0;
+        getOperation().walk([&](Operation *) { opCountBefore++; });
+        tryGenerateForSplit(splitOp);
+        unsigned opCountAfter = 0;
+        getOperation().walk([&](Operation *) { opCountAfter++; });
+        if (opCountBefore != opCountAfter) {
+          changed = true;
+        } else {
+          failedSplits.insert(splitOp);
+        }
+        break;
+      }
     }
   }
 };
