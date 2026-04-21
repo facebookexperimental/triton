@@ -66,11 +66,11 @@ def _run_in_subprocess(algo=""):
     """Run GEMM kernel in a fresh subprocess with the given schedule algo."""
     import tempfile
     env = os.environ.copy()
-    env["TRITON_USE_MODULO_SCHEDULE"] = "1"
+    # TRITON_USE_MODULO_SCHEDULE=<algo> enables modulo scheduling and
+    # selects the algorithm (sms, exhaustive, random, or 1 for rau).
+    env["TRITON_USE_MODULO_SCHEDULE"] = algo if algo else "1"
     env["TRITON_USE_META_WS"] = "1"
     env["TRITON_ALWAYS_COMPILE"] = "1"
-    if algo:
-        env["TRITON_MODULO_SCHEDULE_ALGO"] = algo
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
         f.write(KERNEL_SCRIPT)
         f.flush()

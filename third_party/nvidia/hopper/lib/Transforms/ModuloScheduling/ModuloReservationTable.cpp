@@ -505,12 +505,12 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
            << " RecMII=" << ddg.computeRecMII() << "\n";
   });
 
-  // TRITON_MODULO_SCHEDULE_ALGO selects the scheduling algorithm:
+  // TRITON_USE_MODULO_SCHEDULE selects the scheduling algorithm:
   //   "sms"        → Swing Modulo Scheduling (Llosa et al., PACT 1996)
   //   "exhaustive" → Exhaustive search with joint memory feasibility
   //   "random"     → Random sampling with greedy placement
-  //   default      → Rau's Iterative Modulo Scheduling (Rau, 1994)
-  auto algo = mlir::triton::tools::getStrEnv("TRITON_MODULO_SCHEDULE_ALGO");
+  //   "1" or other → Rau's Iterative Modulo Scheduling (Rau, 1994)
+  auto algo = mlir::triton::tools::getStrEnv("TRITON_USE_MODULO_SCHEDULE");
 
   if (algo == "exhaustive") {
     LLVM_DEBUG(DBGS() << "Using exhaustive search with memory feasibility\n");

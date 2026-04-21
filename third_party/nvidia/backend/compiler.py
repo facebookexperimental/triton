@@ -398,10 +398,12 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_optimize_accumulator_init(pm)
             passes.ttgpuir.add_hoist_tmem_alloc(pm, False)
             nvidia.passes.ttnvgpuir.add_promote_lhs_to_tmem(pm)
-            if knobs.nvidia.use_modulo_schedule:
+            if knobs.nvidia.use_modulo_schedule is not None:
                 # Modulo schedule runs BEFORE data partitioning so it can
                 # see MMA ops before they're moved into WS regions. It
                 # sets tt.autows annotations (stage/order) on MMA ops.
+                # TRITON_USE_MODULO_SCHEDULE=1 (default algo: rau)
+                # TRITON_USE_MODULO_SCHEDULE=sms|exhaustive|random
                 nvidia.passes.hopper.add_modulo_schedule(pm)
             nvidia.passes.hopper.add_data_partitioning(pm, 1)
             # assign_latencies sets tt.latency on loads/MMAs (stage-distance
