@@ -1,22 +1,22 @@
 // (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 //
-// ModuloPipeline IR — abstract representation of a modulo-scheduled
+// ModuloScheduleGraph — abstract representation of a modulo-scheduled
 // loop nest with multi-buffered memory, pipeline stages, and optional
 // warp specialization.
 //
-// The IR is a side data structure (not MLIR ops). It references MLIR
+// The graph is a side data structure (not MLIR ops). It references MLIR
 // Operations but adds scheduling metadata (cycles, stages, buffers,
 // edges) that drive the lowering passes.
 //
 // Transformation phases:
-//   Phase 0: SCHEDULE  — DDG + Rau's → populate PipelineNode cycle/stage
-//   Phase 1: BUFFERS   — stage diffs → populate PipelineBuffer count
+//   Phase 0: SCHEDULE  — DDG + Rau's → populate ScheduleNode cycle/stage
+//   Phase 1: BUFFERS   — stage diffs → populate ScheduleBuffer count
 //   Phase 1.5: WS      — utilization → assign warp_group per stage
 //   Phase 2: EXPAND    — bottom-up prologue/kernel/epilogue per loop
 //   Phase 3: LOWER     — replace MLIR ops with async copies + barriers
 
-#ifndef TRITON_NVIDIA_HOPPER_MODULO_PIPELINE_IR_H
-#define TRITON_NVIDIA_HOPPER_MODULO_PIPELINE_IR_H
+#ifndef TRITON_NVIDIA_HOPPER_MODULO_SCHEDULE_GRAPH_H
+#define TRITON_NVIDIA_HOPPER_MODULO_SCHEDULE_GRAPH_H
 
 #include "LatencyModel.h"
 
@@ -37,7 +37,7 @@ enum class MemoryKind { SMEM, TMEM, Register, BARRIER };
 
 /// A multi-buffered memory allocation.
 /// Represents SMEM or TMEM that needs multiple copies for pipelining.
-struct PipelineBuffer {
+struct ScheduleBuffer {
   unsigned id{};
   MemoryKind kind{MemoryKind::SMEM};
   llvm::SmallVector<int64_t, 4> shape; // e.g., {128, 64}
@@ -66,23 +66,24 @@ struct PipelineBuffer {
 // ============================================================================
 
 /// A node in the pipeline graph. Wraps an MLIR Operation with scheduling info.
-struct PipelineNode {
+struct ScheduleNode {
   unsigned id{};
   Operation *op{nullptr};
 
-  // Schedule assignment (from Phase 0)
+  // Schedule assignment (from Phase 0 + Step 2.5)
   HWPipeline pipeline{HWPipeline::NONE};
   int cycle{0};       // absolute cycle within the II
   int stage{0};       // cycle / II
+  int cluster{0};     // dense rank of cycle within stage (Step 2.5)
   int latency{0};     // cycles until result available
   int selfLatency{0}; // cycles this op occupies its pipeline
 
   // Super-node: if this node represents a child pipeline (inner loop)
-  unsigned childPipelineId{UINT_MAX}; // index into PipelineGraph::pipelines
+  unsigned childPipelineId{UINT_MAX}; // index into ScheduleGraph::pipelines
   int prologueLatency{0};             // cycles before TC starts in child
 
   // Buffer references
-  unsigned producesBuffer{UINT_MAX}; // index into PipelineLoop::buffers
+  unsigned producesBuffer{UINT_MAX}; // index into ScheduleLoop::buffers
   llvm::SmallVector<unsigned, 2> consumesBuffers; // indices into buffers
 
   // Warp specialization (from Phase 1.5)
@@ -98,7 +99,7 @@ struct PipelineNode {
 // Pipeline edge — producer-consumer dependency
 // ============================================================================
 
-struct PipelineEdge {
+struct ScheduleEdge {
   unsigned srcId{};
   unsigned dstId{};
   int latency{};
@@ -112,7 +113,7 @@ struct PipelineEdge {
 /// A pipelined loop with its schedule, nodes, edges, and buffers.
 /// Analogous to a function: has inputs (consumed from outer scope),
 /// outputs (produced for outer scope), and a body (nodes + edges).
-struct PipelineLoop {
+struct ScheduleLoop {
   unsigned id{};
   scf::ForOp forOp;
 
@@ -125,15 +126,15 @@ struct PipelineLoop {
       false}; // true if tripCount is estimated, not constant
 
   // Body (kernel loop steady state)
-  llvm::SmallVector<PipelineNode, 16> nodes;
-  llvm::SmallVector<PipelineEdge, 16> edges;
+  llvm::SmallVector<ScheduleNode, 16> nodes;
+  llvm::SmallVector<ScheduleEdge, 16> edges;
 
   // Expanded structure (populated after expansion, empty before)
   // Prologue: ops cloned before the loop (stage 0 of first iterations)
   // Epilogue: ops cloned after the loop (drain of last stage)
-  llvm::SmallVector<PipelineNode, 8> prologueNodes;
-  llvm::SmallVector<PipelineNode, 8> epilogueNodes;
-  bool isExpanded{false}; // true after expandPipelineGraph
+  llvm::SmallVector<ScheduleNode, 8> prologueNodes;
+  llvm::SmallVector<ScheduleNode, 8> epilogueNodes;
+  bool isExpanded{false}; // true after expandScheduleGraph
 
   // Memory interface (inputs/outputs crossing loop boundary)
   // These drive multi-buffering at the parent level.
@@ -151,18 +152,18 @@ struct PipelineLoop {
   llvm::SmallVector<MemPort, 4> outputs; // produced for outer scope
 
   // Multi-buffered allocations within this loop
-  llvm::SmallVector<PipelineBuffer, 4> buffers;
+  llvm::SmallVector<ScheduleBuffer, 4> buffers;
 
   // Lookup
   llvm::DenseMap<Operation *, unsigned> opToNodeId;
 
   // Helpers
-  const PipelineNode &getNode(unsigned id) const {
+  const ScheduleNode &getNode(unsigned id) const {
     assert(id < nodes.size() && "node id out of range");
     return nodes[id];
   }
   /// Find the node for an MLIR op, or nullptr if not in this loop.
-  const PipelineNode *findNode(Operation *op) const {
+  const ScheduleNode *findNode(Operation *op) const {
     auto it = opToNodeId.find(op);
     if (it == opToNodeId.end())
       return nullptr;
@@ -171,8 +172,8 @@ struct PipelineLoop {
   int numStages() const { return maxStage + 1; }
 
   /// Get all nodes in a given stage.
-  llvm::SmallVector<const PipelineNode *> getNodesInStage(int stage) const {
-    llvm::SmallVector<const PipelineNode *> result;
+  llvm::SmallVector<const ScheduleNode *> getNodesInStage(int stage) const {
+    llvm::SmallVector<const ScheduleNode *> result;
     for (const auto &n : nodes)
       if (n.stage == stage)
         result.push_back(&n);
@@ -186,24 +187,24 @@ struct PipelineLoop {
 
 /// The complete pipeline graph for a kernel. Contains all pipelined loops
 /// (potentially nested) and their relationships.
-struct PipelineGraph {
-  llvm::SmallVector<PipelineLoop, 4> loops;
+struct ScheduleGraph {
+  llvm::SmallVector<ScheduleLoop, 4> loops;
 
   /// Add a new loop and return its id.
   unsigned addLoop(scf::ForOp forOp) {
     unsigned id = loops.size();
-    PipelineLoop loop;
+    ScheduleLoop loop;
     loop.id = id;
     loop.forOp = forOp;
     loops.push_back(std::move(loop));
     return id;
   }
 
-  PipelineLoop &getLoop(unsigned id) {
+  ScheduleLoop &getLoop(unsigned id) {
     assert(id < loops.size() && "loop id out of range");
     return loops[id];
   }
-  const PipelineLoop &getLoop(unsigned id) const {
+  const ScheduleLoop &getLoop(unsigned id) const {
     assert(id < loops.size() && "loop id out of range");
     return loops[id];
   }
@@ -252,10 +253,15 @@ struct PipelineGraph {
     return order;
   }
 
-  /// Dump the graph for debugging.
+  /// Dump the graph for debugging. The no-arg overload writes to
+  /// llvm::dbgs() (gated by `-debug-only=...`); the ostream overload
+  /// writes unconditionally and is used by passes that expose a
+  /// `print-schedule-graph` option (lit tests rely on this since
+  /// `-debug-only` is debug-build only).
   void dump() const;
+  void dump(llvm::raw_ostream &os) const;
 };
 
 } // namespace mlir::triton::gpu
 
-#endif // TRITON_NVIDIA_HOPPER_MODULO_PIPELINE_IR_H
+#endif // TRITON_NVIDIA_HOPPER_MODULO_SCHEDULE_GRAPH_H

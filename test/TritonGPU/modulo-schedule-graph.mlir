@@ -1,4 +1,8 @@
-// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -nvgpu-modulo-schedule | FileCheck %s
+// RUN: triton-opt %s -allow-unregistered-dialect "-nvgpu-modulo-schedule=print-schedule-graph=true" 2>&1 | FileCheck %s
+
+//===----------------------------------------------------------------------===//
+// Test: Basic ScheduleGraph — graph structure, nodes, and edges
+//===----------------------------------------------------------------------===//
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #acc_layout = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
@@ -8,27 +12,40 @@
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
-// Verify that the modulo schedule pass annotates ops with loop.stage/loop.cluster
-// and sets tt.modulo_ii on the loop.
+// --- Graph structure: II=1038, max_stage=2, trip_count=32 ---
+// CHECK: [PASS-A] === Inner Loop ScheduleGraph ===
+// CHECK-NEXT: modulo.schedule @loop0 {
+// CHECK-NEXT:   ii = 1038, max_stage = 2, prologue_latency = 1038, trip_count = 32
 //
-// CHECK-LABEL: @gemm_inner_loop
-// Cluster IDs are dense ranks of modulo cycles within each stage (Step 2.5).
-// Stages processed in reverse order: higher stage -> lower cluster ID.
-// Same cycle -> same cluster; different cycle -> different cluster.
-// CHECK: tt.descriptor_load {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32}
-// CHECK: tt.descriptor_load {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
-// CHECK: ttg.local_alloc {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
-// CHECK: ttg.local_alloc {{.*}} {loop.cluster = 3 : i32, loop.stage = 0 : i32}
-// CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 0 : i32, loop.stage = 1 : i32}
-// CHECK: ttng.tmem_load {{.*}} {loop.cluster = 0 : i32, loop.stage = 2 : i32}
-// tt.num_stages = max_stage + 1 (set so downstream pipelining recognises
-// the loop as scheduled, even for single-stage modulo schedules).
-// tt.num_buffers attrs on local_allocs are added by the next stack diff
-// (Phase 1 buffer allocation on ScheduleGraph).
-// CHECK: tt.modulo_ii = 1038 : i32
-// CHECK-SAME: tt.num_stages = 3 : i32
-// CHECK-SAME: tt.scheduled_max_stage = 2 : i32
-tt.func @gemm_inner_loop(
+// --- Nodes: loads+allocs@s0, MMA@s1, tmem_load@s2 with cluster IDs ---
+// CHECK: modulo.stage @s0 {
+// CHECK:   tt.descriptor_load  {pipe: MEM, cycle: 0, cluster: 0, latency: 1218, selfLatency: 518}
+// CHECK:   tt.descriptor_load  {pipe: MEM, cycle: 518, cluster: 1, latency: 1218, selfLatency: 518}
+// CHECK:   ttg.local_alloc  {pipe: MEM, cycle: 1036, cluster: 2, latency: 700
+// CHECK:   ttg.local_alloc  {pipe: MEM, cycle: 1037, cluster: 3, latency: 700
+// CHECK: }
+// CHECK: modulo.stage @s1 {
+// CHECK:   ttng.tc_gen5_mma  {pipe: TC, cycle: 1737, cluster: 0, latency: 900, selfLatency: 900
+// CHECK: }
+// CHECK: modulo.stage @s2 {
+// CHECK:   ttng.tmem_load  {pipe: CUDA, cycle: 2637, cluster: 0, latency: 130, selfLatency: 130
+// CHECK: }
+//
+// --- Edges: SSA + loop-carried ---
+// CHECK: edges {
+// CHECK-DAG: N0 -> N1  lat=0  dist=0
+// CHECK-DAG: N0 -> N2  lat=0  dist=0
+// CHECK-DAG: N1 -> N3  lat=518  dist=0
+// CHECK-DAG: N2 -> N4  lat=518  dist=0
+// CHECK-DAG: N3 -> N6  lat=700  dist=0
+// CHECK-DAG: N4 -> N6  lat=700  dist=0
+// CHECK-DAG: N5 -> N6  lat=0  dist=0
+// CHECK-DAG: N5 -> N7  lat=0  dist=0
+// CHECK-DAG: N6 -> N7  lat=900  dist=0
+// CHECK-DAG: N7 -> N5  lat=130  dist=1
+// CHECK: }
+// CHECK: }
+tt.func @test_basic_graph(
   %a_desc: !tt.tensordesc<tensor<128x64xf16>>,
   %b_desc: !tt.tensordesc<tensor<64x128xf16>>
 ) {
