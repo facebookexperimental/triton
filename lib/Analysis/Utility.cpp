@@ -113,6 +113,15 @@ bool ReduceOpHelper::isWarpSynchronous() {
   return getWarpsPerCTA(srcEncoding, srcShape)[axis] == 1;
 }
 
+unsigned ReduceOpHelper::getNumContiguousGroupsOnAxis() {
+  if (!op.hasDefinedOrdering())
+    return 1;
+  unsigned elemsPerThread = triton::gpu::getElemsPerThread(srcTy)[axis];
+  unsigned contigPerThread = triton::gpu::getContigPerThread(srcTy)[axis];
+  assert(contigPerThread > 0 && "contigPerThread must be > 0");
+  return elemsPerThread / contigPerThread;
+}
+
 SmallVector<unsigned> ReduceOpHelper::getScratchRepShape() {
   SmallVector<unsigned> smemShape;
   // This case doesn't need inter-warp communication
@@ -120,7 +129,8 @@ SmallVector<unsigned> ReduceOpHelper::getScratchRepShape() {
     return {0, 0};
 
   smemShape = convertType<unsigned>(srcShape);
-  smemShape[axis] = getInterWarpSizeWithUniqueData();
+  unsigned K = getNumContiguousGroupsOnAxis();
+  smemShape[axis] = K * getInterWarpSizeWithUniqueData();
 
   return smemShape;
 }
