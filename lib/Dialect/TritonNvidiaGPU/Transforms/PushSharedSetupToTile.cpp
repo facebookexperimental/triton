@@ -246,6 +246,92 @@ void pushTmemLoadsToTile(SubtiledRegionOp op) {
     oldArg.replaceAllUsesWith(clonedResult);
     tileBlock.eraseArgument(lc.argPosition + 1); // remove old arg (shifted)
   }
+
+  // Clean up: remove tile args that have no users in the tile body,
+  // compact the tile mappings and yield, then erase dead setup ops.
+  tileMappings = op.getTileMappings();
+  mappingSize = cast<DenseI32ArrayAttr>(tileMappings[0]).asArrayRef().size();
+  setupYield = cast<SubtiledRegionYieldOp>(setupBlock.getTerminator());
+
+  // Detect optional tile index arg (not in mappings).
+  bool hasTileIndex =
+      (tileBlock.getNumArguments() >
+       cast<DenseI32ArrayAttr>(tileMappings[0]).asArrayRef().size());
+
+  // Find unused mapped arg positions.
+  DenseSet<unsigned> unusedPositions;
+  for (unsigned p = 0; p < mappingSize; ++p) {
+    if (tileBlock.getArgument(p).use_empty())
+      unusedPositions.insert(p);
+  }
+
+  if (!unusedPositions.empty()) {
+    // Rebuild tile mappings and yield without unused positions.
+    DenseSet<unsigned> usedYieldIndices;
+    SmallVector<SmallVector<int32_t>> newMappingsRaw(numTiles);
+    for (unsigned p = 0; p < mappingSize; ++p) {
+      if (unusedPositions.contains(p))
+        continue;
+      for (unsigned t = 0; t < numTiles; ++t) {
+        int32_t yIdx = cast<DenseI32ArrayAttr>(tileMappings[t]).asArrayRef()[p];
+        newMappingsRaw[t].push_back(yIdx);
+        usedYieldIndices.insert(yIdx);
+      }
+    }
+
+    // Compact yield values and remap indices.
+    unsigned numYieldValues = setupYield.getResults().size();
+    SmallVector<int32_t> oldToNew(numYieldValues, -1);
+    SmallVector<Value> newYieldValues;
+    int32_t newIdx = 0;
+    for (unsigned i = 0; i < numYieldValues; ++i) {
+      if (usedYieldIndices.contains(i)) {
+        oldToNew[i] = newIdx++;
+        newYieldValues.push_back(setupYield.getResults()[i]);
+      }
+    }
+    for (auto &mapping : newMappingsRaw)
+      for (auto &idx : mapping)
+        idx = oldToNew[idx];
+
+    // Erase unused tile block args (reverse order).
+    SmallVector<unsigned> toRemove(unusedPositions.begin(),
+                                   unusedPositions.end());
+    llvm::sort(toRemove, std::greater<unsigned>());
+    for (unsigned p : toRemove)
+      tileBlock.eraseArgument(p);
+
+    // Update tile mappings.
+    SmallVector<Attribute> mappingAttrs;
+    for (auto &mapping : newMappingsRaw)
+      mappingAttrs.push_back(DenseI32ArrayAttr::get(ctx, mapping));
+    op.setTileMappingsAttr(ArrayAttr::get(ctx, mappingAttrs));
+
+    // Rebuild setup yield.
+    OpBuilder setupBuilder(setupYield);
+    SubtiledRegionYieldOp::create(setupBuilder, setupYield.getLoc(),
+                                  newYieldValues);
+    setupYield.erase();
+  }
+
+  // Erase dead ops in the setup block. Collect then erase in reverse
+  // program order, repeating until no more dead ops are found.
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    SmallVector<Operation *> deadOps;
+    for (Operation &setupOp : setupBlock.without_terminator()) {
+      if (setupOp.getResults().empty())
+        continue;
+      if (llvm::all_of(setupOp.getResults(),
+                       [](Value v) { return v.use_empty(); }))
+        deadOps.push_back(&setupOp);
+    }
+    for (auto *op : llvm::reverse(deadOps)) {
+      op->erase();
+      changed = true;
+    }
+  }
 }
 
 void pushSharedSetupToTile(SubtiledRegionOp op) {
