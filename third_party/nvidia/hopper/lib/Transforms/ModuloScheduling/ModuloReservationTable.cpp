@@ -248,27 +248,20 @@ static FailureOr<ModuloScheduleResult> runRauIMS(const DataDependenceGraph &ddg,
 //
 // Simplifications relative to the paper:
 //
-// 1. ASAP/ALAP ignore loop-carried edges (distance > 0) and are computed
-//    once, not per-II. The paper uses II-dependent bounds:
-//      ASAP[v] >= ASAP[u] + latency - distance * II
-//    Our slack values are therefore approximate for nodes in recurrences.
-//    For FA backward (multiple interacting recurrence circuits), this
-//    could produce a suboptimal ordering.
-//
-// 2. No recurrence-aware ordering. The paper identifies SCCs, orders them
+// 1. No recurrence-aware ordering. The paper identifies SCCs, orders them
 //    by RecMII contribution, and schedules the most critical recurrence
 //    first. We use a simple BFS from the minimum-slack node. This works
 //    for GEMM (trivial single-node recurrence) but may not prioritize
 //    correctly when multiple recurrences compete (e.g., FA backward with
 //    accumulator, softmax state, and pointer update recurrences).
 //
-// 3. Fallback on placement failure. When the directional scan (top-down
+// 2. Fallback on placement failure. When the directional scan (top-down
 //    or bottom-up) finds no free slot, we fall back to findFreeSlot from
 //    earliest. The paper would fail at this II and increment. Our fallback
 //    avoids unnecessary II inflation but may place a bottom-up node early,
 //    defeating the register pressure benefit.
 //
-// 4. The BFS swing expansion follows all DDG edges including loop-carried
+// 3. The BFS swing expansion follows all DDG edges including loop-carried
 //    ones (distance > 0). The paper's ordering only follows distance-0
 //    edges. This may add nodes based on cross-iteration dependencies
 //    rather than intra-iteration structure.
@@ -285,7 +278,8 @@ static int getNodeDuration(const DDGNode &node) {
 }
 
 /// Compute ASAP (as-soon-as-possible) times via forward relaxation.
-/// Only considers distance-0 edges (see simplification #1 above).
+/// Only considers distance-0 edges. A follow-up diff adds II-dependent
+/// loop-carried edge support (ASAP[v] >= ASAP[u] + latency - distance * II).
 static llvm::DenseMap<unsigned, int>
 computeASAP(const DataDependenceGraph &ddg) {
   llvm::DenseMap<unsigned, int> asap;
@@ -309,7 +303,7 @@ computeASAP(const DataDependenceGraph &ddg) {
 
 /// Compute ALAP (as-late-as-possible) times via backward relaxation.
 /// Bounded by the schedule horizon (max ASAP across all nodes).
-/// Only considers distance-0 edges (see simplification #1 above).
+/// Only considers distance-0 edges (same as ASAP).
 static llvm::DenseMap<unsigned, int>
 computeALAP(const DataDependenceGraph &ddg,
             const llvm::DenseMap<unsigned, int> &asap) {
@@ -354,7 +348,7 @@ static int computeLatestStart(unsigned nodeIdx, const DataDependenceGraph &ddg,
 
 static FailureOr<ModuloScheduleResult> runSMS(const DataDependenceGraph &ddg,
                                               int minII, int maxII) {
-  // ASAP/ALAP computed once outside the II loop (simplification #1).
+  // ASAP/ALAP computed once outside the II loop (distance-0 edges only).
   auto asap = computeASAP(ddg);
   auto alap = computeALAP(ddg, asap);
 
@@ -372,11 +366,11 @@ static FailureOr<ModuloScheduleResult> runSMS(const DataDependenceGraph &ddg,
     llvm::DenseMap<unsigned, int> scheduled;
     bool success = true;
 
-    // ── Ordering phase (simplifications #2, #4) ─────────────────────
+    // ── Ordering phase ─────────────────────────────────────────────
     // Seed with minimum-slack node, then BFS-expand: successors
     // (top-down) then predecessors (bottom-up), sorted by slack.
-    // NOTE: follows all edges including loop-carried (#4), and does not
-    // identify or prioritize SCCs/recurrences (#2).
+    // NOTE: follows all edges including loop-carried, and does not
+    // identify or prioritize SCCs/recurrences.
     llvm::SmallVector<std::pair<unsigned, bool>> swingOrder;
     llvm::DenseSet<unsigned> inOrder;
 
@@ -440,7 +434,7 @@ static FailureOr<ModuloScheduleResult> runSMS(const DataDependenceGraph &ddg,
         }
       }
 
-      // Fallback: try anywhere from earliest (simplification #3).
+      // Fallback: try anywhere from earliest.
       // The paper would fail at this II instead.
       if (slot < 0)
         slot = table.findFreeSlot(earliest, node.pipeline, duration);
