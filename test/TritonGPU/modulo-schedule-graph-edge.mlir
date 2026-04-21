@@ -1,4 +1,5 @@
-// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect "-nvgpu-modulo-schedule=print-schedule-graph=true" 2>&1 | FileCheck %s
+// REQUIRES: asserts
+// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -nvgpu-modulo-schedule -debug-only=nvgpu-modulo-schedule 2>&1 | FileCheck %s
 
 //===----------------------------------------------------------------------===//
 // Edge case 0: Single-stage schedule (maxStage=0).

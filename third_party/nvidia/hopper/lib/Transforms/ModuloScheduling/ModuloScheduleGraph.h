@@ -37,12 +37,33 @@ enum class MemoryKind { SMEM, TMEM, Register, BARRIER };
 
 /// A multi-buffered memory allocation.
 /// Represents SMEM or TMEM that needs multiple copies for pipelining.
+///
+/// Per design doc §125 (type table) and §215 (Step 3 worked example): each
+/// buffer carries the absolute live-range cycles (`liveStart`/`liveEnd`)
+/// derived from `producer.cycle` and `last_consumer.cycle + selfLatency`.
+/// The `count` is then `floor((liveEnd - liveStart) / II) + 1`, and Step 4.5
+/// projects `[liveStart, liveEnd) % II` for the modular overlap check.
+///
+/// `mergeGroupId` is filled by Step 4.5 — buffers in the same group share a
+/// physical allocation (size = max(sizeBytes), count = max(count)).
 struct ScheduleBuffer {
   unsigned id{};
   MemoryKind kind{MemoryKind::SMEM};
   llvm::SmallVector<int64_t, 4> shape; // e.g., {128, 64}
   unsigned elementBitWidth{16};        // e.g., 16 for f16
-  unsigned count{1};                   // number of buffers (from stageDiff + 1)
+  unsigned count{1};                   // floor((liveEnd-liveStart)/II) + 1
+
+  // Live interval in absolute cycles within the loop's modulo schedule.
+  // liveStart = producer.cycle.
+  // liveEnd   = max over consumers of (consumer.cycle + consumer.selfLatency
+  //             + edge.distance * II).
+  // Step 4.5 takes these mod II to build the modular overlap intervals.
+  int liveStart{0};
+  int liveEnd{0};
+
+  // Step 4.5 buffer merging: buffers with the same mergeGroupId share a
+  // physical allocation. UINT_MAX = ungrouped (own physical allocation).
+  unsigned mergeGroupId{UINT_MAX};
 
   // For data buffers: index of the corresponding BARRIER buffer (UINT_MAX if
   // none) For barrier buffers: index of the data buffer this barrier guards
@@ -59,6 +80,25 @@ struct ScheduleBuffer {
       elems *= d;
     return elems * elementBitWidth / 8;
   }
+
+  // Total bytes including multi-buffering. For a merge group, callers should
+  // sum max(sizeBytes) × max(count) across the group instead.
+  int64_t totalBytes() const { return sizeBytes() * count; }
+};
+
+/// A merge group materialised by Step 4.5. Buffers with the same
+/// mergeGroupId share a physical allocation of `size × count` bytes.
+/// Doc §1140-1147: "physical_buffers[color] = PhysicalBuffer{
+///   size = max(intervals[r].size for r in resources),
+///   depth = max(intervals[r].depth for r in resources), ... }"
+struct PhysicalBuffer {
+  unsigned id{};
+  MemoryKind kind{MemoryKind::SMEM};
+  int64_t sizeBytes{0};
+  unsigned count{1};
+  llvm::SmallVector<unsigned, 4> memberBufferIds;
+
+  int64_t totalBytes() const { return sizeBytes * count; }
 };
 
 // ============================================================================
@@ -151,8 +191,19 @@ struct ScheduleLoop {
   llvm::SmallVector<MemPort, 4> inputs;  // consumed from outer scope
   llvm::SmallVector<MemPort, 4> outputs; // produced for outer scope
 
-  // Multi-buffered allocations within this loop
+  // Multi-buffered allocations within this loop (logical buffers).
   llvm::SmallVector<ScheduleBuffer, 4> buffers;
+
+  // Physical buffer groups produced by Step 4.5 merging. Empty until
+  // mergeBuffers runs. Each PhysicalBuffer.memberBufferIds lists the
+  // ScheduleBuffer ids that share that physical allocation.
+  llvm::SmallVector<PhysicalBuffer, 4> physicalBuffers;
+
+  // Absolute kernel-time interval for this loop (set by Step 4.6's
+  // compute_region_intervals). Used for cross-region buffer lifetime
+  // analysis. liveStart=liveEnd=0 means "not yet computed".
+  int regionStart{0};
+  int regionEnd{0};
 
   // Lookup
   llvm::DenseMap<Operation *, unsigned> opToNodeId;

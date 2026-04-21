@@ -115,12 +115,12 @@ static void emitScheduleAttributes(scf::ForOp loop,
 // Blackwell sm_100 SMEM budget (reserve some for barriers/scratch).
 constexpr int kSmemBudgetBytes = 228 * 1024;
 
-// Fallback trip count used when the loop bounds are not constant.
-// Marked via `tripCountIsEstimated = true` so callers can detect it.
-// Chosen as a small but non-trivial number (e.g., a 256x256 GEMM with
-// BLOCK_K=64 has K_TILES=4) — keeps stage/buffer-depth heuristics from
-// degenerating, but downstream code that needs a precise trip count
-// must check the `tripCountIsEstimated` flag.
+// Blackwell TMEM budget: 256KB total tensor memory (128 lanes × 512 cols × 4B).
+constexpr int kTmemBudgetBytes = 256 * 1024;
+
+// Fallback trip count when the loop bounds aren't constant-foldable.
+// Used so kernel_time_cost can give a finite (rather than div-by-zero)
+// answer for cost-based depth reduction.
 constexpr int kEstimatedTripCount = 4;
 
 // computeBufferDepths removed — buffer allocation is now done via
@@ -339,14 +339,207 @@ static unsigned buildScheduleLoop(scf::ForOp loop,
   return loopId;
 }
 
+// ============================================================================
+// Phase 1: Buffer Allocation
+// ============================================================================
+
+static ttg::MemoryKind classifyMemoryKind(Operation *op) {
+  if (isa<ttng::TMEMAllocOp>(op))
+    return ttg::MemoryKind::TMEM;
+  // Both local_alloc (pre-lowering) and async_tma_copy (post-lowering)
+  // produce SMEM buffers that need multi-buffering.
+  if (isa<ttg::LocalAllocOp, ttng::AsyncTMACopyGlobalToLocalOp>(op))
+    return ttg::MemoryKind::SMEM;
+  return ttg::MemoryKind::Register;
+}
+
+static void extractBufferShape(Operation *op, ttg::ScheduleBuffer &buf) {
+  Type resultType;
+  if (auto alloc = dyn_cast<ttg::LocalAllocOp>(op))
+    resultType = alloc.getType();
+  else if (auto tmemAlloc = dyn_cast<ttng::TMEMAllocOp>(op))
+    resultType = tmemAlloc.getType();
+  else if (auto tmaCopy = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(op))
+    resultType = tmaCopy.getResult().getType();
+  else if (op->getNumResults() > 0)
+    resultType = op->getResult(0).getType();
+
+  auto extractFromShapedType = [&](llvm::ArrayRef<int64_t> shape, Type elemTy) {
+    for (auto dim : shape) {
+      if (dim <= 0 || ShapedType::isDynamic(dim))
+        return;
+    }
+    if (!elemTy.isIntOrFloat())
+      return;
+    for (auto dim : shape)
+      buf.shape.push_back(dim);
+    buf.elementBitWidth = elemTy.getIntOrFloatBitWidth();
+  };
+
+  if (auto memDesc = dyn_cast_or_null<ttg::MemDescType>(resultType)) {
+    extractFromShapedType(memDesc.getShape(), memDesc.getElementType());
+  } else if (auto tensorType = dyn_cast_or_null<RankedTensorType>(resultType)) {
+    extractFromShapedType(tensorType.getShape(), tensorType.getElementType());
+  }
+}
+
+/// Step 3: Compute buffer count from cycle-level lifetime.
+///
+/// Design doc formula (§Step 3):
+///   lifetime(R) = lastConsumerEnd - producerStart
+///   num_buffers(R) = floor(lifetime(R) / II) + 1
+///
+/// For loop-carried edges (distance > 0), the consumer in iteration i+d
+/// effectively ends at: consumerEnd + d * II (in absolute time).
+/// This is equivalent to adding d * II to the lifetime.
+///
+/// Returns the absolute cycle range the buffer is live for. The hold time is
+/// `selfLatency` (pipeline occupancy of the consumer) per design doc §414;
+/// `latency` (when the consumer's *output* becomes available) is the edge
+/// weight, not the buffer hold. We fall back to `latency` when `selfLatency`
+/// is 0 (synthetic local_load nodes have selfLat=0 but still need a non-zero
+/// hold time = latency).
+struct LifetimeRange {
+  int liveStart{0};
+  int liveEnd{0};
+  unsigned count{1};
+};
+
+static LifetimeRange computeLifetimeAndCount(const ttg::ScheduleLoop &loop,
+                                              unsigned producerNodeId) {
+  const auto &producer = loop.getNode(producerNodeId);
+  int prodCycle = producer.cycle;
+  int II = loop.II;
+  if (II <= 0)
+    return {prodCycle, prodCycle, 1};
+
+  // Find the latest DIRECT consumer end cycle.
+  int lastConsumerEnd = prodCycle;
+  for (const auto &edge : loop.edges) {
+    if (edge.srcId != producerNodeId)
+      continue;
+    const auto &consumer = loop.getNode(edge.dstId);
+    int hold = consumer.selfLatency > 0 ? consumer.selfLatency : consumer.latency;
+    int consumerEnd = consumer.cycle + hold + edge.distance * II;
+    lastConsumerEnd = std::max(lastConsumerEnd, consumerEnd);
+  }
+
+  int lifetime = lastConsumerEnd - prodCycle;
+  unsigned numBuffers = static_cast<unsigned>(std::max(lifetime / II + 1, 1));
+  return {prodCycle, lastConsumerEnd, numBuffers};
+}
+
+static void allocateBuffersForLoop(ttg::ScheduleLoop &loop) {
+  llvm::SmallVector<unsigned, 4> dataBufferIds;
+  for (auto &node : loop.nodes) {
+    if (!node.op)
+      continue;
+
+    auto kind = classifyMemoryKind(node.op);
+    if (kind == ttg::MemoryKind::Register)
+      continue;
+
+    unsigned bufId = loop.buffers.size();
+    ttg::ScheduleBuffer buf;
+    buf.id = bufId;
+    buf.kind = kind;
+    buf.defOp = node.op;
+    extractBufferShape(node.op, buf);
+
+    auto life = computeLifetimeAndCount(loop, node.id);
+    buf.liveStart = life.liveStart;
+    buf.liveEnd = life.liveEnd;
+    buf.count = life.count;
+
+    loop.buffers.push_back(buf);
+    node.producesBuffer = bufId;
+
+    if (buf.count > 1)
+      dataBufferIds.push_back(bufId);
+
+    llvm::DenseSet<unsigned> markedConsumers;
+    for (const auto &edge : loop.edges) {
+      if (edge.srcId == node.id && markedConsumers.insert(edge.dstId).second)
+        loop.nodes[edge.dstId].consumesBuffers.push_back(bufId);
+    }
+  }
+
+  for (unsigned dataBufId : dataBufferIds) {
+    unsigned barId = loop.buffers.size();
+    ttg::ScheduleBuffer bar;
+    bar.id = barId;
+    bar.kind = ttg::MemoryKind::BARRIER;
+    bar.count = loop.buffers[dataBufId].count;
+    bar.liveStart = loop.buffers[dataBufId].liveStart;
+    bar.liveEnd = loop.buffers[dataBufId].liveEnd;
+    bar.defOp = loop.buffers[dataBufId].defOp;
+    bar.pairedBufferId = dataBufId;
+    loop.buffers[dataBufId].pairedBufferId = barId;
+    loop.buffers.push_back(bar);
+  }
+}
+
+// ============================================================================
+// Step 4: SMEM/TMEM Budget Check
+// ============================================================================
+
+/// Per design doc §Step 4 (lines 1029-1063): each loop's buffer footprint
+/// must fit within the per-tile SMEM/TMEM budgets. This is the per-loop
+/// check; Step 4.6 (next diff) adds the kernel-wide cross-region check.
+///
+/// Sums `sizeBytes() × count` for each buffer (excluding mergeGroupId
+/// duplicates — though Phase 1 doesn't merge yet, accept the field for
+/// forward compat). BARRIER buffers are charged to SMEM (mbarriers live in
+/// SMEM). Returns true if within budget.
+static bool checkLoopMemoryBudget(const ttg::ScheduleLoop &loop) {
+  int64_t smemBytes = 0;
+  int64_t tmemBytes = 0;
+  llvm::DenseSet<unsigned> seenGroups;
+  for (const auto &buf : loop.buffers) {
+    // For merged groups, charge once at max(size×count). Step 4.5 fills
+    // mergeGroupId; before then this just walks every buffer individually.
+    if (buf.mergeGroupId != UINT_MAX &&
+        !seenGroups.insert(buf.mergeGroupId).second)
+      continue;
+    int64_t bytes = buf.totalBytes();
+    if (buf.kind == ttg::MemoryKind::TMEM)
+      tmemBytes += bytes;
+    else // SMEM and BARRIER both use SMEM space
+      smemBytes += bytes;
+  }
+  bool ok = true;
+  if (smemBytes > kSmemBudgetBytes) {
+    LDBG("[Step4] SMEM over budget: " << smemBytes << " > "
+                                       << kSmemBudgetBytes << " bytes");
+    ok = false;
+  }
+  if (tmemBytes > kTmemBudgetBytes) {
+    LDBG("[Step4] TMEM over budget: " << tmemBytes << " > "
+                                       << kTmemBudgetBytes << " bytes");
+    ok = false;
+  }
+  if (ok)
+    LDBG("[Step4] Budget OK: SMEM=" << smemBytes << "B, TMEM=" << tmemBytes
+                                     << "B");
+  return ok;
+}
+
 /// Top-level: build a ScheduleGraph from DDG + schedule result.
-/// Phase 0 only (DDG→nodes/edges). Buffer allocation is a separate step.
+/// Includes Phase 0 (DDG→nodes/edges) and Phase 1 (buffer allocation).
 static ttg::ScheduleGraph
 buildScheduleGraph(scf::ForOp loop, const ttg::DataDependenceGraph &ddg,
                    const ttg::ModuloScheduleResult &sched,
                    const ttg::LatencyModel &model) {
   ttg::ScheduleGraph graph;
   buildScheduleLoop(loop, ddg, sched, graph, model);
+
+  for (auto &schedLoop : graph.loops) {
+    allocateBuffersForLoop(schedLoop);
+    // Step 4: per-loop budget check (Step 4.5 merging + Step 4.6 cross-
+    // region budget come in the next stack diff).
+    checkLoopMemoryBudget(schedLoop);
+  }
+
   return graph;
 }
 

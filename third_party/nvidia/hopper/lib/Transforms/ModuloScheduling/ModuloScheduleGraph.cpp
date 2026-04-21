@@ -105,7 +105,27 @@ static void dumpLoop(const ScheduleGraph &graph, const ScheduleLoop &loop,
   }
   os << "\n";
 
-  // Buffer declarations
+  // Buffer declarations.
+  // Format per design doc §1546-1556:
+  //   %buf<id> = modulo.alloc <KIND> [<count> x <shape> x <dtype>]
+  //     live=[<start>, <end>)  // <size> bytes total
+  //   %bar<id> = modulo.alloc BARRIER [<count>] for buf<paired_id>
+  auto dtypeName = [](unsigned bits) -> const char * {
+    switch (bits) {
+    case 1:
+      return "i1";
+    case 8:
+      return "i8";
+    case 16:
+      return "f16";
+    case 32:
+      return "f32";
+    case 64:
+      return "f64";
+    default:
+      return "?";
+    }
+  };
   if (!loop.buffers.empty()) {
     os << "\n";
     for (const auto &buf : loop.buffers) {
@@ -123,9 +143,28 @@ static void dumpLoop(const ScheduleGraph &graph, const ScheduleLoop &loop,
             os << "x";
           os << buf.shape[i];
         }
-        os << " x " << (buf.elementBitWidth <= 16 ? "f16" : "f32") << "]";
+        os << " x " << dtypeName(buf.elementBitWidth) << "]";
       }
+      // Live range (per design doc §215 Step 3 example).
+      if (buf.liveStart != 0 || buf.liveEnd != 0)
+        os << "  live=[" << buf.liveStart << ", " << buf.liveEnd << ")";
+      // Merge group (filled by Step 4.5).
+      if (buf.mergeGroupId != UINT_MAX)
+        os << "  merged=" << buf.mergeGroupId;
       os << "  // " << buf.sizeBytes() * buf.count << " bytes total\n";
+    }
+
+    // Merge groups (per design doc §1555-1556).
+    for (const auto &pb : loop.physicalBuffers) {
+      dumpIndent(os, inner);
+      os << "modulo.merge_group " << pb.id << " {";
+      for (size_t i = 0; i < pb.memberBufferIds.size(); ++i) {
+        if (i > 0)
+          os << ", ";
+        os << "buf" << pb.memberBufferIds[i];
+      }
+      os << "}  // physical: " << pb.sizeBytes << " bytes x " << pb.count
+         << "\n";
     }
   }
 

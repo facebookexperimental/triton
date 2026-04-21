@@ -2,7 +2,9 @@
 // RUN: triton-opt %s -allow-unregistered-dialect -nvgpu-modulo-schedule -debug-only=nvgpu-modulo-schedule 2>&1 | FileCheck %s
 
 //===----------------------------------------------------------------------===//
-// Test: Basic ScheduleGraph — graph structure, nodes, and edges
+// Test: Buffer allocations and barrier pairing
+//   SMEM buffers for A (128x64xf16) and B (64x128xf16) tiles,
+//   TMEM buffer for accumulator (128x128xf32), each with paired barriers.
 //===----------------------------------------------------------------------===//
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -13,40 +15,38 @@
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
-// --- Graph structure: II=1038, max_stage=2, trip_count=32 ---
-// CHECK: [PASS-A] === Inner Loop ScheduleGraph ===
-// CHECK-NEXT: modulo.schedule @loop0 {
-// CHECK-NEXT:   ii = 1038, max_stage = 2, prologue_latency = 1038, trip_count = 32
+// --- SMEM buffers: count=2, shapes match tiles, live=[start, end) per
+//     design doc §215 worked example. ---
+// CHECK: %buf0 = modulo.alloc SMEM [2 x 128x64 x f16]
+// CHECK-SAME: live=[
+// CHECK-SAME: bytes total
+// CHECK: %buf1 = modulo.alloc SMEM [2 x 64x128 x f16]
+// CHECK-SAME: live=[
+// CHECK-SAME: bytes total
 //
-// --- Nodes: loads+allocs@s0, MMA@s1, tmem_load@s2 with cluster IDs ---
-// CHECK: modulo.stage @s0 {
-// CHECK:   tt.descriptor_load  {pipe: MEM, cycle: 0, cluster: 0, latency: 1218, selfLatency: 518}
-// CHECK:   tt.descriptor_load  {pipe: MEM, cycle: 518, cluster: 1, latency: 1218, selfLatency: 518}
-// CHECK:   ttg.local_alloc  {pipe: MEM, cycle: 1036, cluster: 2, latency: 700
-// CHECK:   ttg.local_alloc  {pipe: MEM, cycle: 1037, cluster: 3, latency: 700
-// CHECK: }
-// CHECK: modulo.stage @s1 {
-// CHECK:   ttng.tc_gen5_mma  {pipe: TC, cycle: 1737, cluster: 0, latency: 900, selfLatency: 900
-// CHECK: }
-// CHECK: modulo.stage @s2 {
-// CHECK:   ttng.tmem_load  {pipe: CUDA, cycle: 2637, cluster: 0, latency: 130, selfLatency: 130
-// CHECK: }
+// --- TMEM buffer: count=3 for accumulator ---
+// CHECK: %buf2 = modulo.alloc TMEM [3 x 128x128 x f32]
+// CHECK-SAME: live=[
+// CHECK-SAME: 196608 bytes total
 //
-// --- Edges: SSA + loop-carried ---
-// CHECK: edges {
-// CHECK-DAG: N0 -> N1  lat=0  dist=0
-// CHECK-DAG: N0 -> N2  lat=0  dist=0
-// CHECK-DAG: N1 -> N3  lat=518  dist=0
-// CHECK-DAG: N2 -> N4  lat=518  dist=0
-// CHECK-DAG: N3 -> N6  lat=700  dist=0
-// CHECK-DAG: N4 -> N6  lat=700  dist=0
-// CHECK-DAG: N5 -> N6  lat=0  dist=0
-// CHECK-DAG: N5 -> N7  lat=0  dist=0
-// CHECK-DAG: N6 -> N7  lat=900  dist=0
-// CHECK-DAG: N7 -> N5  lat=130  dist=1
-// CHECK: }
-// CHECK: }
-tt.func @test_basic_graph(
+// --- Paired barriers carry the same live interval as their data buffer ---
+// CHECK: %bar3 = modulo.alloc BARRIER [2] for buf0
+// CHECK-SAME: live=[
+// CHECK: %bar4 = modulo.alloc BARRIER [2] for buf1
+// CHECK-SAME: live=[
+// CHECK: %bar5 = modulo.alloc BARRIER [3] for buf2
+// CHECK-SAME: live=[
+//
+// --- Producers: local_alloc → ->buf ---
+// CHECK: ttg.local_alloc  {pipe: MEM, {{.*}}->buf0}
+// CHECK: ttg.local_alloc  {pipe: MEM, {{.*}}->buf1}
+//
+// --- Consumer: MMA consumes all three buffers ---
+// CHECK: ttng.tc_gen5_mma  {pipe: TC, {{.*}}<-buf0, <-buf1, <-buf2}
+//
+// --- tmem_load consumes TMEM buffer ---
+// CHECK: ttng.tmem_load  {pipe: CUDA, {{.*}}<-buf2}
+tt.func @test_buffers(
   %a_desc: !tt.tensordesc<tensor<128x64xf16>>,
   %b_desc: !tt.tensordesc<tensor<64x128xf16>>
 ) {
