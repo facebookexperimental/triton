@@ -191,3 +191,30 @@ tt.func @mma_inside_warp_specialize(%src: tensor<64x64xf16, #blocked>) {
 }
 
 }
+
+// -----
+
+#linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // Test that a fence inserted for a TMA store is elided when one already
+  // exists earlier in the block, separated only by pure arithmetic.
+  // CHECK-LABEL: no_duplicate_fence_tma_store
+  tt.func public @no_duplicate_fence_tma_store(
+      %desc: !tt.tensordesc<tensor<128x32xf16, #shared>>,
+      %data: tensor<128x32xf16, #linear>,
+      %smem: !ttg.memdesc<128x32xf16, #shared, #smem, mutable>,
+      %offs_am: i32, %offs_bn: i32) {
+    %c32_i32 = arith.constant 32 : i32
+    ttg.local_store %data, %smem : tensor<128x32xf16, #linear> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+    ttng.fence_async_shared {bCluster = false}
+    %offs_bn_1 = arith.addi %offs_bn, %c32_i32 : i32
+    // CHECK: ttng.fence_async_shared
+    // CHECK: arith.addi
+    // CHECK-NOT: ttng.fence_async_shared
+    // CHECK: ttng.async_tma_copy_local_to_global
+    ttng.async_tma_copy_local_to_global %desc[%offs_am, %offs_bn_1] %smem : !tt.tensordesc<tensor<128x32xf16, #shared>>, !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
