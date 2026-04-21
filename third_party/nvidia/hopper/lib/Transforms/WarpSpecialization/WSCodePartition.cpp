@@ -4351,8 +4351,6 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
     for (auto op : multiTaskOps)
       lowerTokenAnnotations(op);
     for (auto op : multiTaskOps)
-      lowerTokenAnnotations(op);
-    for (auto op : multiTaskOps)
       ttng::lowerSubtiledRegion(op);
   }
 
