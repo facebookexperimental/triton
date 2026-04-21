@@ -242,8 +242,12 @@ public:
       }
     }
 
-    // Lower any remaining SubtiledRegionOps (single-task ops that survived
-    // doCodePartitionPost and were cloned into WarpSpecializeOp partitions).
+    // Convert token annotations on SubtiledRegionOps to barrier annotations,
+    // then lower the SubtiledRegionOps. doTokenLowering must run first so
+    // that token annotations are resolved to barriers before subtile lowering
+    // materializes them.
+    doTokenLowering(funcOp, numWarpGroups - 1);
+
     {
       SmallVector<triton::nvidia_gpu::SubtiledRegionOp> remaining;
       funcOp.walk([&](triton::nvidia_gpu::SubtiledRegionOp op) {
@@ -252,8 +256,6 @@ public:
       for (auto op : remaining)
         triton::nvidia_gpu::lowerSubtiledRegion(op);
     }
-
-    doTokenLowering(funcOp, numWarpGroups - 1);
     if (dumpIntermediateSteps) {
       llvm::dbgs()
           << "// -----// WarpSpec internal IR Dump After: doTokenLowering\n";

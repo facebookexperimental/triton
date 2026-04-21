@@ -40,6 +40,59 @@ namespace mlir {
 
 static constexpr const char *kSubtileOpId = "subtile_op_id";
 
+/// Lower token annotations by injecting inline ConsumerWaitOp/ConsumerReleaseOp
+/// into the tile body. Used for multi-task SubtiledRegionOps that are lowered
+/// before doTokenLowering runs (the inline ops survive into warp partitions
+/// and get converted to mbarriers by doTokenLowering later).
+static void lowerTokenAnnotations(ttng::SubtiledRegionOp op) {
+  ArrayAttr tokenAnnotations = op.getTokenAnnotations();
+  if (tokenAnnotations.empty())
+    return;
+
+  Block &tileBlock = op.getTileRegion().front();
+  ValueRange tokenValues = op.getTokenValues();
+
+  llvm::DenseMap<unsigned, Operation *> idToOp;
+  for (Operation &tileOp : tileBlock.without_terminator()) {
+    if (auto idAttr = tileOp.getAttrOfType<IntegerAttr>(kSubtileOpId))
+      idToOp[idAttr.getInt()] = &tileOp;
+  }
+
+  OpBuilder builder(op);
+  for (Attribute attr : tokenAnnotations) {
+    auto annotation = cast<ttng::TokenAnnotationAttr>(attr);
+    unsigned targetId = annotation.getTargetOpIdx();
+    auto it = idToOp.find(targetId);
+    assert(it != idToOp.end() && "target op ID not found in tile body");
+    Operation *targetOp = it->second;
+
+    if (annotation.getPlacement() == ttng::BarrierPlacement::BEFORE)
+      builder.setInsertionPoint(targetOp);
+    else
+      builder.setInsertionPointAfter(targetOp);
+
+    Value token = tokenValues[annotation.getTokenIdx()];
+    Value bufferIdx = tokenValues[annotation.getBufferIdxIdx()];
+    StringRef kind = annotation.getTokenOpKind().getValue();
+
+    if (kind == "consumer_wait") {
+      int phaseIdx = annotation.getPhaseIdx();
+      assert(phaseIdx >= 0);
+      Value phase = tokenValues[phaseIdx];
+      ttnvws::ConsumerWaitOp::create(builder, targetOp->getLoc(), token,
+                                     bufferIdx, phase);
+    } else {
+      assert(kind == "consumer_release");
+      ttnvws::ConsumerReleaseOp::create(builder, targetOp->getLoc(), token,
+                                        bufferIdx);
+    }
+  }
+
+  MLIRContext *ctx = op.getContext();
+  op.setTokenAnnotationsAttr(ArrayAttr::get(ctx, {}));
+  op.getTokenValuesMutable().assign(ValueRange{});
+}
+
 /// If `op` is inside a SubtiledRegionOp's tile region, return that op.
 static ttng::SubtiledRegionOp getEnclosingSubtiledRegionTile(Operation *op) {
   for (Operation *parent = op->getParentOp(); parent;
@@ -4296,6 +4349,10 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
         multiTaskOps.push_back(op);
     });
     for (auto op : multiTaskOps)
+      lowerTokenAnnotations(op);
+    for (auto op : multiTaskOps)
+      lowerTokenAnnotations(op);
+    for (auto op : multiTaskOps)
       ttng::lowerSubtiledRegion(op);
   }
 
@@ -4562,6 +4619,8 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
       if (taskIds.size() > 1)
         multiTaskOps.push_back(op);
     });
+    for (auto op : multiTaskOps)
+      lowerTokenAnnotations(op);
     for (auto op : multiTaskOps)
       ttng::lowerSubtiledRegion(op);
   }
