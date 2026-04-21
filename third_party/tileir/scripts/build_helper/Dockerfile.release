@@ -1,0 +1,87 @@
+# syntax=docker/dockerfile:1
+ARG BASE_IMAGE=nvcr.io/nvidia/cuda:13.1.0-devel-ubuntu22.04
+FROM ${BASE_IMAGE}
+
+# Debug: Check what CUDA tools are available
+RUN echo "=== CUDA version ===" && \
+    cat /usr/local/cuda/version.json 2>/dev/null || cat /usr/local/cuda/version.txt 2>/dev/null || echo "version file not found" && \
+    echo "=== /usr/local/cuda/bin contents ===" && \
+    ls -la /usr/local/cuda/bin/ | head -30 && \
+    echo "=== Check tileiras ===" && \
+    ls -la /usr/local/cuda/bin/tileiras 2>/dev/null || echo "tileiras NOT found in /usr/local/cuda/bin/" && \
+    which tileiras 2>/dev/null || echo "tileiras not in PATH"
+
+ARG TORCH_VERSION=2.9.1
+
+ENV PYTHONUNBUFFERED=1
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-pip \
+    python3-dev \
+    python-is-python3 \
+    git \
+    wget \
+    curl \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip
+RUN python -m pip install --upgrade pip setuptools wheel
+
+# Install PyTorch with CUDA 13.0 support (after CUDA toolkit)
+RUN pip install --no-cache-dir --pre "torch==${TORCH_VERSION}" --index-url https://download.pytorch.org/whl/cu130
+
+ARG TRITON_SRC_DIR=/workspace/triton-src
+
+# Uninstall preinstalled triton variants to avoid conflicts
+RUN pip uninstall -y triton triton-nightly pytorch-triton || true
+
+# Install gcc-13/g++-13 (used by CC/CXX during build) and ccache, then clean cache
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        software-properties-common ca-certificates gnupg && \
+    add-apt-repository -y ppa:ubuntu-toolchain-r/test && \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        gcc-13 g++-13 ccache && \
+    rm -rf /var/lib/apt/lists/*
+
+# Configure ccache for faster rebuilds
+ENV CCACHE_DIR=/ccache
+ENV PATH=/usr/lib/ccache:$PATH
+
+# Install build dependencies BEFORE copying source for better cache efficiency
+# These match pyproject.toml [build-system] requires
+RUN pip install "setuptools>=40.8.0" "cmake>=3.20,<4.0" "ninja>=1.11.1" "pybind11>=2.13.1"
+
+# Install test dependencies directly
+RUN pip install --no-cache-dir \
+    autopep8 \
+    isort \
+    numpy \
+    pytest \
+    pytest-forked \
+    pytest-xdist \
+    "scipy>=1.7.1" \
+    llnl-hatchet \
+    expecttest \
+    tabulate
+
+# Copy source (this layer changes frequently, so keep it late)
+COPY src ${TRITON_SRC_DIR}
+
+WORKDIR ${TRITON_SRC_DIR}
+# Remove host build cache to prevent CMake source/build dir mismatch
+RUN rm -rf ${TRITON_SRC_DIR}/build || true
+
+# Clean up any triton residue in site-packages that could shadow editable install
+# This prevents namespace package issues where an empty triton/ dir takes precedence
+RUN rm -rf /usr/local/lib/python*/dist-packages/triton* || true
+RUN rm -rf /usr/lib/python*/dist-packages/triton* || true
+
+# Use --no-build-isolation so cmake path in build.ninja points to installed cmake
+# Mount ccache for faster C++ compilation across builds
+# id=triton-ccache ensures consistent cache identification across builds
+RUN --mount=type=cache,target=/ccache,id=triton-ccache \
+    CC="ccache gcc-13" CXX="ccache g++-13" pip install -e . --no-build-isolation

@@ -131,6 +131,12 @@ static LogicalResult transformMultiCTALoop(scf::ForOp forOp,
   for (auto reduceOp : reduces) {
     if (failed(verifyReduceCombinerIsAdd(reduceOp)))
       return failure();
+    if (reduceOp.hasDefinedOrdering())
+      return reduceOp.emitError(
+          "multi-CTA reduction is incompatible with reduction_ordering='")
+             << reduceOp.getReductionOrderingAttr().getValue()
+             << "'; partitioning across CTAs changes the reduction tree and "
+                "breaks bitwise reproducibility guarantees";
   }
 
   auto *context = forOp->getContext();
@@ -335,7 +341,8 @@ static LogicalResult transformMultiCTALoop(scf::ForOp forOp,
     if (isScalar) {
       // Scalar case: extract from tensor<1xelemType> via tt.reduce(axis=0).
       auto finalReduce = triton::ReduceOp::create(
-          builder, loc, SmallVector<Value>{combined}, 0);
+          builder, loc, SmallVector<Value>{combined}, 0,
+          reduceOp.getReductionOrderingAttr());
       IRMapping finalMapping;
       reduceOp.getCombineOp().cloneInto(&finalReduce.getCombineOp(),
                                         finalMapping);
