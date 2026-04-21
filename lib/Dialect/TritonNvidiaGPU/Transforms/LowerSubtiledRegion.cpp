@@ -101,18 +101,17 @@ static bool isTileEnabled(BarrierAnnotationAttr annotation, unsigned tileIdx) {
   return tileIdx < static_cast<unsigned>(mask.size()) && mask[tileIdx] != 0;
 }
 
-void lowerSubtiledRegion(SubtiledRegionOp op) {
+void lowerSubtiledRegion(SubtiledRegionOp op, TokenEmitter tokenEmitter) {
   OpBuilder builder(op);
   Location loc = op.getLoc();
 
   ValueRange barriers = op.getBarriers();
   ValueRange accumCnts = op.getAccumCnts();
+  ValueRange tokenValues = op.getTokenValues();
 
   static constexpr const char *kSubtileOpId = "subtile_op_id";
 
   // Pre-process barrier annotations by region and target op ID.
-  // Tile annotations use stable IDs (from subtile_op_id attributes on ops).
-  // Setup/teardown annotations still use positional indices.
   llvm::DenseMap<unsigned, SmallVector<BarrierAnnotationAttr>> tileBefore,
       tileAfter;
   llvm::DenseMap<unsigned, SmallVector<BarrierAnnotationAttr>> setupBefore,
@@ -134,12 +133,23 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
       else
         teardownAfter[targetId].push_back(annotation);
     } else {
-      // TILE region — keyed by stable op ID, filtered by tileMask.
       if (annotation.getPlacement() == BarrierPlacement::BEFORE)
         tileBefore[targetId].push_back(annotation);
       else
         tileAfter[targetId].push_back(annotation);
     }
+  }
+
+  // Pre-process token annotations by target op ID.
+  llvm::DenseMap<unsigned, SmallVector<TokenAnnotationAttr>> tokenBefore,
+      tokenAfter;
+  for (Attribute attr : op.getTokenAnnotations()) {
+    auto annotation = cast<TokenAnnotationAttr>(attr);
+    unsigned targetId = annotation.getTargetOpIdx();
+    if (annotation.getPlacement() == BarrierPlacement::BEFORE)
+      tokenBefore[targetId].push_back(annotation);
+    else
+      tokenAfter[targetId].push_back(annotation);
   }
 
   // 1. Clone setup region ops (except yield), emitting setup barriers.
@@ -185,11 +195,10 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
     }
 
     for (Operation &tileOp : tileBlock.without_terminator()) {
-      // Look up stable op ID for barrier annotation matching.
       auto idAttr = tileOp.getAttrOfType<IntegerAttr>(kSubtileOpId);
       unsigned opId = idAttr ? idAttr.getInt() : ~0u;
 
-      // BEFORE: emit if tileMask allows this tile.
+      // BEFORE annotations.
       if (idAttr) {
         auto it = tileBefore.find(opId);
         if (it != tileBefore.end()) {
@@ -199,18 +208,30 @@ void lowerSubtiledRegion(SubtiledRegionOp op) {
                             tileIdx);
           }
         }
+        if (tokenEmitter) {
+          auto it2 = tokenBefore.find(opId);
+          if (it2 != tokenBefore.end()) {
+            for (auto &annotation : it2->second)
+              tokenEmitter(builder, loc, annotation, tokenValues, tileIdx);
+          }
+        }
       }
 
-      // Strip the stable ID attribute before cloning so it doesn't leak
-      // into the lowered IR.
       if (idAttr)
         tileOp.removeAttr(kSubtileOpId);
       builder.clone(tileOp, tileMapping);
       if (idAttr)
         tileOp.setAttr(kSubtileOpId, idAttr);
 
-      // AFTER: emit if tileMask allows this tile.
+      // AFTER annotations.
       if (idAttr) {
+        if (tokenEmitter) {
+          auto it2 = tokenAfter.find(opId);
+          if (it2 != tokenAfter.end()) {
+            for (auto &annotation : it2->second)
+              tokenEmitter(builder, loc, annotation, tokenValues, tileIdx);
+          }
+        }
         auto it = tileAfter.find(opId);
         if (it != tileAfter.end()) {
           for (auto &annotation : it->second) {
