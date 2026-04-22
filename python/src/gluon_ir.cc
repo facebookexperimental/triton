@@ -795,7 +795,7 @@ void init_gluon_ir(py::module &&m) {
 
       .def("create_async_tma_copy_global_to_local",
            [](GluonOpBuilder &self, Value descPtr, std::vector<Value> &coord,
-              Value barrier, Value result, Value pred) {
+              Value barrier, Value result, Value pred, bool multicast) {
              self.create<ttng::AsyncTMACopyGlobalToLocalOp>(
                  /*multicastTargets*/ Value(), descPtr, coord, barrier, result,
                  pred);

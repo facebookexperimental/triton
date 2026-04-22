@@ -749,6 +749,7 @@ getTaskTopRegion(triton::FuncOp funcOp,
   return asyncTaskOps;
 }
 
+
 // Create an allocation to hold the mbarriers.
 static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance,
                                 StringRef srcName = "") {
@@ -760,16 +761,17 @@ static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance,
   auto context = funcOp.getContext();
   if (!srcName.empty())
     loc = NameLoc::get(StringAttr::get(context, srcName), loc);
-  auto barrierCGALayout = ttg::CGAEncodingAttr::get1DLayout(
-      context, triton::gpu::lookupNumCTAs(funcOp));
+  auto numCTAs = triton::gpu::lookupNumCTAs(funcOp);
+  auto barrierCGALayout = ttg::CGAEncodingAttr::get1DLayout(context, numCTAs);
   auto barrierEncoding = ttg::SwizzledSharedEncodingAttr::get(
       context, 1, 1, 1, {0}, barrierCGALayout);
-  ttg::MemDescType barrierMemDescType = ttg::MemDescType::get(
-      {distance, 1}, builder.getI64Type(), barrierEncoding, sharedMemorySpace,
-      /*mutableMemory=*/true);
-  Type singleBarrierMemDescType = ttg::MemDescType::get(
-      {1}, builder.getI64Type(), barrierEncoding,
-      barrierMemDescType.getMemorySpace(), /*mutableMemory=*/true);
+  Type barrierMemDescType =
+      ttg::MemDescType::get({distance, numCTAs}, builder.getI64Type(),
+                            barrierEncoding, sharedMemorySpace,
+                            /*mutableMemory=*/true);
+  Type singleBarrierMemDescType =
+      ttg::MemDescType::get({numCTAs}, builder.getI64Type(), barrierEncoding,
+                            sharedMemorySpace, /*mutableMemory=*/true);
   Value barrierAlloc = mlir::triton::gpu::LocalAllocOp::create(
       builder, loc, barrierMemDescType, Value());
   for (unsigned i = 0; i < distance; i++) {
