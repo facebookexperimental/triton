@@ -44,7 +44,17 @@ class TileIRUtils(object):
         self.init_tileir_function(tile_mod)
 
     def init_tileir_function(self, mod):
-        self.load_binary = mod.load_tileir_binary
+        # TODO: FIXME HACK: ADAPT LOAD_BINARY SIGNATURE.
+        # The underlying load_tileir_binary returns 6 values including
+        # static_smem_bytes, but Triton's runtime expects 5. Wrap to drop
+        # the extra value and ignore the shared memory arg from the caller.
+        self._load_binary_impl = mod.load_tileir_binary
+
+    def load_binary(self, name, kernel, shared, device):
+        mod, func, n_reg, n_spills, static_smem_bytes, n_max_threads = self._load_binary_impl(
+            name, kernel, device
+        )
+        return (mod, func, n_reg, n_spills, n_max_threads)
 
     def init_nvidia_function(self, mod):
         self.get_device_properties = mod.get_device_properties
@@ -509,10 +519,12 @@ class TileIRDriver(GPUDriver):
 
     @staticmethod
     def is_active():
+        if not knobs.nvidia.enable_tileir:
+            return False
+
         try:
-            from triton.backends.tileir.conf import TileIREnvConf
-            tileiras = TileIREnvConf.get_tileiras_path()
-            return tileiras is not None and (torch.cuda.is_available() and (torch.version.hip is None))
+            import torch
+            return torch.cuda.is_available() and (torch.version.hip is None)
         except ImportError:
             return False
 
@@ -535,5 +547,8 @@ class TileIRDriver(GPUDriver):
     def clear_cache(self, cache):
         cache.zero_()
 
+    def tensor_descriptor(self, handle, shape, strides, type, base):
+        from .fb.language import tileir_tensor_descriptor
+        return tileir_tensor_descriptor(handle, shape, strides, type, base)
 
-GlobalTileIRDriver = TileIRDriver()
+__all__ = ["TileIRUtils", "TileIRLauncher", "TileIRDriver"]

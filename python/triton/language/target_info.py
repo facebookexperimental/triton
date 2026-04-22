@@ -19,7 +19,7 @@ current_target.__triton_builtin__ = True
 @constexpr_function
 def is_cuda():
     target = current_target()
-    return target is not None and target.backend == "cuda"
+    return target is not None and target.is_cuda_backend()
 
 
 @constexpr_function
@@ -30,7 +30,7 @@ def cuda_capability_geq(major, minor=0):
     inline asm implementations that require a certain compute capability.
     """
     target = current_target()
-    if target is None or target.backend != "cuda":
+    if target is None or not target.is_cuda_backend():
         return False
     assert isinstance(target.arch, int)
     return target.arch >= major * 10 + minor
