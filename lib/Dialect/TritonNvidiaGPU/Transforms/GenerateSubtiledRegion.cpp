@@ -402,15 +402,19 @@ collectPerTileChain(Value splitResult, Operation *splitOp, Block *block,
 
   if (includeAuxiliary) {
     llvm::DenseSet<Operation *> chainSet(chain.begin(), chain.end());
-    for (Operation *op : chain) {
+    SmallVector<Operation *> auxWorklist(chain.begin(), chain.end());
+    while (!auxWorklist.empty()) {
+      Operation *op = auxWorklist.pop_back_val();
       for (Value operand : op->getOperands()) {
         auto defOp = operand.getDefiningOp();
         if (!defOp || defOp->getBlock() != block)
           continue;
         if (defOp->isBeforeInBlock(splitOp) || defOp == splitOp)
           continue;
-        if (!chainSet.contains(defOp) && visited.insert(defOp).second)
+        if (!chainSet.contains(defOp) && visited.insert(defOp).second) {
           chainSet.insert(defOp);
+          auxWorklist.push_back(defOp);
+        }
       }
     }
     SmallVector<Operation *> fullChain;
@@ -1519,21 +1523,105 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
     buildSingleSubtiledRegion(builder, loc, setupOps, lhs, rhs, chain0, chain1,
                               *differing);
   } else {
-    for (size_t i = 0; i + 1 < segments->size(); ++i) {
-      Operation *lastOp = (*segments)[i].opsPerTile[0].back();
-      auto alloc = dyn_cast<gpu::LocalAllocOp>(lastOp);
-
-      if (alloc && alloc.getSrc()) {
-        for (size_t j = 0; j + 1 < (*segments)[i].opsPerTile[0].size(); ++j) {
-          for (Value operand : (*segments)[i].opsPerTile[0][j]->getOperands()) {
-            if (operand == alloc.getResult())
-              return;
+    // Check if task IDs form non-contiguous groups (e.g., task A → B → A).
+    // This happens in addmm where the bias load (task 3) is interleaved
+    // between compute ops (task 2). Merge segments with the same task ID
+    // and reorder by data dependency to produce contiguous task groups.
+    bool hasNonContiguousTasks = false;
+    {
+      SmallVector<SmallVector<int32_t>> seenTaskSets;
+      for (auto &seg : *segments) {
+        if (seenTaskSets.empty() || seenTaskSets.back() != seg.taskIds) {
+          for (size_t i = 0; i + 1 < seenTaskSets.size(); ++i) {
+            if (seenTaskSets[i] == seg.taskIds) {
+              hasNonContiguousTasks = true;
+              break;
+            }
           }
+          seenTaskSets.push_back(seg.taskIds);
         }
       }
     }
 
-    buildMultiTaskSubtiledRegions(builder, loc, setupOps, lhs, rhs, *segments);
+    if (hasNonContiguousTasks) {
+      // Merge segments with the same task ID.
+      SmallVector<ChainSegment> merged;
+      for (auto &seg : *segments) {
+        ChainSegment *target = nullptr;
+        for (auto &m : merged) {
+          if (m.taskIds == seg.taskIds) {
+            target = &m;
+            break;
+          }
+        }
+        if (target) {
+          for (size_t t = 0; t < seg.opsPerTile.size(); ++t)
+            target->opsPerTile[t].append(seg.opsPerTile[t].begin(),
+                                         seg.opsPerTile[t].end());
+        } else {
+          merged.push_back(seg);
+        }
+      }
+
+      // Topological sort by data dependency: if segment A produces values
+      // consumed by segment B, A must come before B.
+      unsigned n = merged.size();
+      SmallVector<DenseSet<Value>> segResults(n);
+      for (unsigned i = 0; i < n; ++i)
+        for (auto *op : merged[i].opsPerTile[0])
+          for (Value r : op->getResults())
+            segResults[i].insert(r);
+
+      SmallVector<unsigned> inDegree(n, 0);
+      SmallVector<SmallVector<unsigned>> adj(n);
+      for (unsigned i = 0; i < n; ++i) {
+        DenseSet<unsigned> deps;
+        for (auto *op : merged[i].opsPerTile[0])
+          for (Value v : op->getOperands())
+            for (unsigned j = 0; j < n; ++j)
+              if (j != i && segResults[j].contains(v) && deps.insert(j).second)
+                adj[j].push_back(i);
+        inDegree[i] = deps.size();
+      }
+
+      SmallVector<unsigned> order;
+      SmallVector<unsigned> worklist;
+      for (unsigned i = 0; i < n; ++i)
+        if (inDegree[i] == 0)
+          worklist.push_back(i);
+      while (!worklist.empty()) {
+        unsigned u = worklist.pop_back_val();
+        order.push_back(u);
+        for (unsigned v : adj[u])
+          if (--inDegree[v] == 0)
+            worklist.push_back(v);
+      }
+
+      SmallVector<ChainSegment> reordered;
+      for (unsigned idx : order)
+        reordered.push_back(std::move(merged[idx]));
+
+      buildMultiTaskSubtiledRegions(builder, loc, setupOps, lhs, rhs,
+                                    reordered);
+    } else {
+      for (size_t i = 0; i + 1 < segments->size(); ++i) {
+        Operation *lastOp = (*segments)[i].opsPerTile[0].back();
+        auto alloc = dyn_cast<gpu::LocalAllocOp>(lastOp);
+
+        if (alloc && alloc.getSrc()) {
+          for (size_t j = 0; j + 1 < (*segments)[i].opsPerTile[0].size(); ++j) {
+            for (Value operand :
+                 (*segments)[i].opsPerTile[0][j]->getOperands()) {
+              if (operand == alloc.getResult())
+                return;
+            }
+          }
+        }
+      }
+
+      buildMultiTaskSubtiledRegions(builder, loc, setupOps, lhs, rhs,
+                                    *segments);
+    }
   }
 
   for (Operation *op : llvm::reverse(chain1)) {

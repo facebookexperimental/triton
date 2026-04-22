@@ -231,14 +231,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
 
   // CHECK-LABEL: @identity_descriptor_store_epilogue
-  // The tile body should include the full epilogue chain with arith.addi.
-  // The split result, bias, and offset operands must be tile block arguments.
+  // With recursive auxiliary collection, the full bias chain
+  // (descriptor_load → extf) is pulled into the tile body. The bias tensor
+  // is no longer a tile arg — descriptor_load produces it per tile.
   // CHECK: ttng.subtiled_region
   // CHECK:   } tile{
-  // CHECK: ^bb0(%{{.*}}: tensor<{{.*}}>, %[[SPLIT:.*]]: tensor<{{.*}}>, %[[BIAS:.*]]: tensor<{{.*}}>, %[[VARY:.*]]: i32, %[[TIDX:.*]]: i32):
+  // CHECK: ^bb0(%{{.*}}: tensor<{{.*}}>, %[[SPLIT:.*]]: tensor<{{.*}}>, %[[VARY:.*]]: i32, %[[TIDX:.*]]: i32):
   // CHECK:     ttg.convert_layout %[[SPLIT]]
   // CHECK:     arith.addi %{{.*}}, %[[VARY]]
-  // CHECK:     arith.extf %[[BIAS]]
+  // CHECK:     tt.descriptor_load
+  // CHECK:     arith.extf
   // CHECK:     arith.addf
   // CHECK:     arith.truncf
   // CHECK:     tt.descriptor_store
@@ -272,6 +274,92 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %acc1 = arith.addf %cvt1, %bias1_f32 : tensor<128x128xf32, #blocked2d5>
     %c1 = arith.truncf %acc1 : tensor<128x128xf32, #blocked2d5> to tensor<128x128xf16, #blocked2d5>
     tt.descriptor_store %c_desc[%off_m, %off_n2], %c1 : !tt.tensordesc<tensor<128x128xf16, #shared5>>, tensor<128x128xf16, #blocked2d5>
+
+    tt.return
+  }
+}
+
+// -----
+
+// Test: multi-task addmm epilogue with descriptor_store (no early TMA store
+// lowering). The chain crosses 3 task boundaries (load→compute→store).
+// Non-contiguous task 2 segments are merged and reordered by dependency,
+// producing 3 SubtiledRegionOps: task 3 (bias load), task 2 (compute),
+// task 1 (store), with SMEM transitions between them.
+
+#tmem5mt = #ttng.tensor_memory_encoding<blockM = 128, blockN = 256, colStride = 1>
+#blocked3d5mt = #ttg.blocked<{sizePerThread = [1, 2, 128], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 2, 1]}>
+#blocked3d_perm5mt = #ttg.blocked<{sizePerThread = [1, 128, 2], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 1, 2]}>
+#blocked_full5mt = #ttg.blocked<{sizePerThread = [1, 256], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#blocked2d5mt = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#shared5mt = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+
+  // CHECK-LABEL: @multi_task_addmm_descriptor_store
+  // Two outer-scope SMEM buffer allocations (bias + output):
+  // CHECK: ttg.local_alloc : () -> !ttg.memdesc<128x128xf16
+  // CHECK: ttg.local_alloc : () -> !ttg.memdesc<128x128xf16
+  // CHECK: ttg.local_alloc : () -> !ttg.memdesc<128x128xf16
+  // CHECK: ttg.local_alloc : () -> !ttg.memdesc<128x128xf16
+  //
+  // First SubtiledRegionOp (task 3): bias descriptor_load + store to SMEM
+  // CHECK: ttng.subtiled_region
+  // CHECK:   } tile{
+  // CHECK:     arith.addi
+  // CHECK:     tt.descriptor_load
+  // CHECK:     ttg.local_store
+  // CHECK:     ttng.subtiled_region_yield
+  // CHECK:   }
+  //
+  // Second SubtiledRegionOp (task 2): compute (cvt + extf + addf + truncf)
+  // CHECK: ttng.subtiled_region
+  // CHECK:   } tile{
+  // CHECK:     ttg.local_load
+  // CHECK:     ttg.convert_layout
+  // CHECK:     arith.extf
+  // CHECK:     arith.addf
+  // CHECK:     arith.truncf
+  // CHECK:     ttg.local_store
+  // CHECK:     ttng.subtiled_region_yield
+  // CHECK:   }
+  //
+  // Third SubtiledRegionOp (task 1): descriptor_store from SMEM
+  // CHECK: ttng.subtiled_region
+  // CHECK:   } tile{
+  // CHECK:     ttg.local_load
+  // CHECK:     tt.descriptor_store
+  // CHECK:     ttng.subtiled_region_yield
+  // CHECK:   }
+  //
+  // CHECK-NOT: tt.split
+  tt.func @multi_task_addmm_descriptor_store(
+      %tmem_buf: !ttg.memdesc<128x256xf32, #tmem5mt, #ttng.tensor_memory, mutable>,
+      %acc_tok: !ttg.async.token,
+      %c_desc: !tt.tensordesc<tensor<128x128xf16, #shared5mt>>,
+      %bias_desc: !tt.tensordesc<tensor<128x128xf16, #shared5mt>>,
+      %off_m: i32, %off_n: i32, %c128: i32) {
+    %loaded:2 = ttng.tmem_load %tmem_buf[%acc_tok] {async_task_id = array<i32: 2>} : !ttg.memdesc<128x256xf32, #tmem5mt, #ttng.tensor_memory, mutable> -> tensor<128x256xf32, #blocked_full5mt>
+    %reshaped = tt.reshape %loaded#0 {async_task_id = array<i32: 2>} : tensor<128x256xf32, #blocked_full5mt> -> tensor<128x2x128xf32, #blocked3d5mt>
+    %transposed = tt.trans %reshaped {order = array<i32: 0, 2, 1>, async_task_id = array<i32: 2>} : tensor<128x2x128xf32, #blocked3d5mt> -> tensor<128x128x2xf32, #blocked3d_perm5mt>
+    %lhs, %rhs = tt.split %transposed {async_task_id = array<i32: 2>} : tensor<128x128x2xf32, #blocked3d_perm5mt> -> tensor<128x128xf32, #blocked2d5mt>
+
+    // Chain 0 (lhs): cvt{2} → bias_load{3} → extf{2} → addf{2} → truncf{2} → store{1}
+    %cvt0 = ttg.convert_layout %lhs {async_task_id = array<i32: 2>} : tensor<128x128xf32, #blocked2d5mt> -> tensor<128x128xf32, #blocked2d5mt>
+    %bias0 = tt.descriptor_load %bias_desc[%off_m, %off_n] {async_task_id = array<i32: 3>} : !tt.tensordesc<tensor<128x128xf16, #shared5mt>> -> tensor<128x128xf16, #blocked2d5mt>
+    %bias0_f32 = arith.extf %bias0 {async_task_id = array<i32: 2>} : tensor<128x128xf16, #blocked2d5mt> to tensor<128x128xf32, #blocked2d5mt>
+    %acc0 = arith.addf %cvt0, %bias0_f32 {async_task_id = array<i32: 2>} : tensor<128x128xf32, #blocked2d5mt>
+    %c0 = arith.truncf %acc0 {async_task_id = array<i32: 2>} : tensor<128x128xf32, #blocked2d5mt> to tensor<128x128xf16, #blocked2d5mt>
+    tt.descriptor_store %c_desc[%off_m, %off_n], %c0 {async_task_id = array<i32: 1>} : !tt.tensordesc<tensor<128x128xf16, #shared5mt>>, tensor<128x128xf16, #blocked2d5mt>
+
+    // Chain 1 (rhs): cvt{2} → addi{3} → bias_load{3} → extf{2} → addf{2} → truncf{2} → store{1}
+    %cvt1 = ttg.convert_layout %rhs {async_task_id = array<i32: 2>} : tensor<128x128xf32, #blocked2d5mt> -> tensor<128x128xf32, #blocked2d5mt>
+    %off_n2 = arith.addi %off_n, %c128 {async_task_id = array<i32: 3>} : i32
+    %bias1 = tt.descriptor_load %bias_desc[%off_m, %off_n2] {async_task_id = array<i32: 3>} : !tt.tensordesc<tensor<128x128xf16, #shared5mt>> -> tensor<128x128xf16, #blocked2d5mt>
+    %bias1_f32 = arith.extf %bias1 {async_task_id = array<i32: 2>} : tensor<128x128xf16, #blocked2d5mt> to tensor<128x128xf32, #blocked2d5mt>
+    %acc1 = arith.addf %cvt1, %bias1_f32 {async_task_id = array<i32: 2>} : tensor<128x128xf32, #blocked2d5mt>
+    %c1 = arith.truncf %acc1 {async_task_id = array<i32: 2>} : tensor<128x128xf32, #blocked2d5mt> to tensor<128x128xf16, #blocked2d5mt>
+    tt.descriptor_store %c_desc[%off_m, %off_n2], %c1 {async_task_id = array<i32: 1>} : !tt.tensordesc<tensor<128x128xf16, #shared5mt>>, tensor<128x128xf16, #blocked2d5mt>
 
     tt.return
   }
