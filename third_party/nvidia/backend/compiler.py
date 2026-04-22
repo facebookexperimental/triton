@@ -170,6 +170,7 @@ class CUDAOptions:
     arch: str = None
     instrumentation_mode: str = ""
     early_tma_store_lowering: bool = False
+    generate_subtiled_region: bool = False
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / 'lib'
@@ -385,8 +386,9 @@ class CUDABackend(BaseBackend):
             if knobs.nvidia.use_meta_ws and knobs.nvidia.use_meta_partition:
                 nvidia.passes.hopper.add_partition_scheduling_meta(pm)
             smem_budget = _max_shared_mem_for_capability(capability)
+            generate_subtiled = opt.generate_subtiled_region or knobs.nvidia.generate_subtiled_region
             nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled,
-                                                     smem_budget, knobs.nvidia.generate_subtiled_region)
+                                                     smem_budget, generate_subtiled)
             if not knobs.nvidia.use_meta_ws:
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
                 passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
@@ -416,9 +418,9 @@ class CUDABackend(BaseBackend):
                 else:
                     passes.ttgpuir.add_partition_scheduling(pm)
                 smem_budget = _max_shared_mem_for_capability(capability)
+                generate_subtiled = opt.generate_subtiled_region or knobs.nvidia.generate_subtiled_region
                 nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS,
-                                                         dump_enabled, smem_budget,
-                                                         knobs.nvidia.generate_subtiled_region)
+                                                         dump_enabled, smem_budget, generate_subtiled)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_optimize_partition_warps(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)

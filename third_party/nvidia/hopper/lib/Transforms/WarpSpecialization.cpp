@@ -51,12 +51,18 @@ void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
 void doTMAStoreWaitReorder(triton::FuncOp &funcOp);
 void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp);
 void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp);
-
 void doGenerateSubtiledRegion(triton::FuncOp &funcOp) {
   auto moduleOp = funcOp->getParentOfType<ModuleOp>();
   PassManager pm(moduleOp.getContext());
   pm.addPass(triton::nvidia_gpu::
                  createTritonNvidiaGPUTestGenerateSubtiledRegionPass());
+  // Convert tmem_load → reshape → trans → split chains in SubtiledRegionOp
+  // setup regions into tmem_subslice + tmem_load pairs.
+  pm.addPass(
+      triton::nvidia_gpu::createTritonNvidiaGPUOptimizeTMemLayoutsPass());
+  // Push setup values that are shared across all tiles into the tile body.
+  pm.addPass(
+      triton::nvidia_gpu::createTritonNvidiaGPUPushSharedSetupToTilePass());
   (void)pm.run(moduleOp);
 }
 
@@ -236,10 +242,34 @@ public:
       }
     }
 
+    // Primary SubtiledRegionOp lowering path. By this point the tile body
+    // has been optimized (OptimizeTMemLayouts + PushSharedSetupToTile ran
+    // inside doGenerateSubtiledRegion), so tmem_loads are sunk close to
+    // their consumers. doTokenLowering converts token annotations to
+    // barrier annotations, then lowerSubtiledRegion unrolls the tile body
+    // with per-tile barrier materialization.
+    //
+    // Multi-task SubtiledRegionOps were already lowered as fallbacks in
+    // doCodePartition/doCodePartitionPost (before specializeRegion).
     doTokenLowering(funcOp, numWarpGroups - 1);
     if (dumpIntermediateSteps) {
       llvm::dbgs()
           << "// -----// WarpSpec internal IR Dump After: doTokenLowering\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
+    }
+
+    {
+      SmallVector<triton::nvidia_gpu::SubtiledRegionOp> remaining;
+      funcOp.walk([&](triton::nvidia_gpu::SubtiledRegionOp op) {
+        remaining.push_back(op);
+      });
+      for (auto op : remaining)
+        triton::nvidia_gpu::lowerSubtiledRegion(op);
+    }
+    if (dumpIntermediateSteps) {
+      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                      "lowerSubtiledRegion\n";
       moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
       llvm::dbgs() << "\n\n\n";
     }
