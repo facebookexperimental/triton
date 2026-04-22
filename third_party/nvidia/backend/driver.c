@@ -163,6 +163,39 @@ static PyObject *loadBinary(PyObject *self, PyObject *args) {
                        n_spills, n_max_threads);
 }
 
+static PyObject *unloadBinary(PyObject *self, PyObject *args) {
+  uint64_t mod;
+  if (!PyArg_ParseTuple(args, "K", &mod)) {
+    return NULL;
+  }
+  if (mod != 0) {
+    Py_BEGIN_ALLOW_THREADS;
+    CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(cuModuleUnload((CUmodule)mod));
+    Py_END_ALLOW_THREADS;
+    if (PyErr_Occurred()) {
+      return NULL;
+    }
+  }
+  Py_RETURN_NONE;
+}
+
+static PyObject *isStreamCapturing(PyObject *self, PyObject *args) {
+  uint64_t stream;
+  if (!PyArg_ParseTuple(args, "K", &stream)) {
+    return NULL;
+  }
+  CUstreamCaptureStatus status;
+  CUresult err = cuStreamIsCapturing((CUstream)stream, &status);
+  if (err != CUDA_SUCCESS) {
+    // If the call fails (e.g., no context), assume not capturing.
+    Py_RETURN_FALSE;
+  }
+  if (status == CU_STREAM_CAPTURE_STATUS_ACTIVE) {
+    Py_RETURN_TRUE;
+  }
+  Py_RETURN_FALSE;
+}
+
 typedef CUresult (*cuOccupancyMaxActiveClusters_t)(
     int *numClusters, CUfunction func, const CUlaunchConfig *config);
 
@@ -744,6 +777,10 @@ cleanup:
 static PyMethodDef ModuleMethods[] = {
     {"load_binary", loadBinary, METH_VARARGS,
      "Load provided cubin into CUDA driver"},
+    {"unload_binary", unloadBinary, METH_VARARGS,
+     "Unload a CUDA module to free GPU resources"},
+    {"is_stream_capturing", isStreamCapturing, METH_VARARGS,
+     "Check if a CUDA stream is in graph capture mode"},
     {"get_device_properties", getDeviceProperties, METH_VARARGS,
      "Get the properties for a given device"},
     {"cuOccupancyMaxActiveClusters", occupancyMaxActiveClusters, METH_VARARGS,
