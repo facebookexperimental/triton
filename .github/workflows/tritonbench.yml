@@ -1,0 +1,54 @@
+name: Meta Triton TritonBench Tests
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  h100-tritonbench-test:
+    if: github.repository_owner == 'facebookexperimental'
+    runs-on: [linux.gcp.h100]
+    env:
+      CONDA_ENV: meta-triton
+      SETUP_SCRIPT: /workspace/setup_instance.sh
+    timeout-minutes: 240
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Tune Nvidia GPU
+        run: |
+          sudo nvidia-smi -pm 1
+          sudo ldconfig
+          nvidia-smi
+      - name: Compile Triton
+        run: |
+          . "${SETUP_SCRIPT}"
+          . /workspace/tritonbench/.ci/triton/triton_install_utils.sh
+          install_triton $PWD
+          set -x
+          TRITONBENCH_TRITON_COMMIT_HASH=$(git rev-parse --verify HEAD)
+          TRITONBENCH_TRITON_REPO=$(git config --get remote.origin.url | sed -E 's|.*github.com[:/](.+)\.git|\1|')
+          TRITONBENCH_TRITON_COMMIT=${GITHUB_REF_NAME}
+          TRITONBENCH_INSTALL_DIR=${PWD}
+          # If the current conda env matches the env we just created
+          # then export all Triton related envs to shell env
+          cat <<EOF >> "${SETUP_SCRIPT}"
+          if [ \${CONDA_ENV} == "${CONDA_ENV}" ] ; then
+              export TRITONBENCH_TRITON_COMMIT_HASH="${TRITONBENCH_TRITON_COMMIT_HASH}"
+              export TRITONBENCH_TRITON_REPO="${TRITONBENCH_TRITON_REPO}"
+              export TRITONBENCH_TRITON_COMMIT="${TRITONBENCH_TRITON_COMMIT}"
+              export TRITONBENCH_TRITON_INSTALL_DIR="${TRITONBENCH_INSTALL_DIR}"
+          fi
+          EOF
+      - name: Run TritonBench tests on H100 GPU
+        working-directory: /workspace/tritonbench
+        run: |
+          bash ./.ci/tritonbench/test-gpu.sh
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
+  cancel-in-progress: true

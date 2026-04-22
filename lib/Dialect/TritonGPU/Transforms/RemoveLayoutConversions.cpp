@@ -473,6 +473,7 @@ static unsigned estimateConvertScratchCost(Value value, Attribute encoding) {
   Operation *op = value.getDefiningOp();
   if (!op)
     return 0;
+  auto encTrait = dyn_cast<LayoutEncodingTrait>(encoding);
   unsigned cost = 0;
   for (Value operand : op->getOperands()) {
     auto srcTy = dyn_cast<RankedTensorType>(operand.getType());
@@ -480,6 +481,8 @@ static unsigned estimateConvertScratchCost(Value value, Attribute encoding) {
       continue;
     Attribute srcEnc = srcTy.getEncoding();
     if (!srcEnc || srcEnc == encoding)
+      continue;
+    if (encTrait && srcTy.getRank() != encTrait.getRank())
       continue;
     auto dstTy = srcTy.cloneWithEncoding(encoding);
     if (cvtNeedsSharedMemory(srcTy, dstTy)) {
@@ -491,15 +494,18 @@ static unsigned estimateConvertScratchCost(Value value, Attribute encoding) {
 }
 
 // Compute a score for a layout to guide conflict resolution.
-// Currently based on sizePerThread (vectorization), but can be extended
-// with other heuristics. Higher score is preferred.
-// Returns 0 for non-blocked encodings.
+// Based on sizePerThread (vectorization) for both blocked and linear encodings.
+// Higher score is preferred — layouts with more elements per thread allow better
+// vectorized memory access (ld.shared, st.shared).
 static int64_t getLayoutScore(Attribute encoding) {
-  auto blocked = dyn_cast<BlockedEncodingAttr>(encoding);
-  if (!blocked)
+  SmallVector<unsigned> sizePerThread;
+  if (auto blocked = dyn_cast<BlockedEncodingAttr>(encoding)) {
+    sizePerThread = SmallVector<unsigned>(blocked.getSizePerThread());
+  } else if (auto linear = dyn_cast<LinearEncodingAttr>(encoding)) {
+    sizePerThread = linear.getSizePerThread();
+  }
+  if (sizePerThread.empty())
     return 0;
-  auto sizePerThread = blocked.getSizePerThread();
-  // Compute product of sizePerThread values as the vectorization score.
   int64_t score = 1;
   for (auto size : sizePerThread) {
     score *= size;
@@ -519,8 +525,10 @@ void LayoutPropagation::resolveConflicts() {
     bool isLoadOrStore =
         op && isa<LoadOp, StoreOp, AtomicRMWOp, AtomicCASOp>(op);
     // Pick the layout with maximum score.
-    // This prefers layouts with larger sizePerThread values (e.g., TMEM's
-    // [1, 128] over SMEM's [1, 8]) for better memory access patterns.
+    // This prefers layouts with larger sizePerThread values for better
+    // vectorized memory access. Both blocked and linear encodings are scored,
+    // so e.g. a linear layout from TMEMLoadOp (sizePerThread=[1,32]) beats
+    // a blocked layout from local_load (sizePerThread=[1,8]).
     int64_t bestScore = getLayoutScore(encoding);
     for (Attribute e : info.encodings) {
       int64_t score = getLayoutScore(e);
@@ -529,7 +537,7 @@ void LayoutPropagation::resolveConflicts() {
         encoding = e;
       }
     }
-    // If no blocked layout with vectorization found, fall back to the original
+    // If no layout with vectorization found, fall back to the original
     // heuristic (prefer blocked for load/store, MMA for compute).
     if (bestScore == 0) {
       for (Attribute e : info.encodings) {
@@ -1968,6 +1976,10 @@ public:
   // layout that doesn't match srcEnc.
   bool canPropagateSrcEncodingThroughUsers(ConvertLayoutOp cvt,
                                            Attribute srcEnc) {
+    unsigned srcEncRank = 0;
+    if (auto encTrait = dyn_cast<LayoutEncodingTrait>(srcEnc))
+      srcEncRank = encTrait.getRank();
+
     SmallVector<Value> worklist;
     worklist.push_back(cvt.getResult());
     DenseSet<Value> visited;
@@ -1988,14 +2000,19 @@ public:
                 arith::TruncIOp, arith::SIToFPOp, arith::FPToSIOp,
                 arith::BitcastOp>(user)) {
           for (Value result : user->getResults()) {
-            if (isa<RankedTensorType>(result.getType()))
-              worklist.push_back(result);
+            auto rtt = dyn_cast<RankedTensorType>(result.getType());
+            if (!rtt)
+              continue;
+            if (srcEncRank > 0 && rtt.getRank() != srcEncRank)
+              return false;
+            worklist.push_back(result);
           }
           continue;
         }
-        // scf.yield just passes values through — propagate.
+        // TODO: propagate through scf.yield by updating parent op result
+        // types, scf.for iter_args, and init values to match srcEnc.
         if (isa<scf::YieldOp>(user))
-          continue;
+          return false;
         // Any other user (dot, reduce, another convert, etc.) blocks
         // propagation.
         return false;
@@ -2087,9 +2104,14 @@ public:
     }
 
     // Rewrite result types to use srcEnc.
+    unsigned srcEncRank = 0;
+    if (auto encTrait = dyn_cast<LayoutEncodingTrait>(srcEnc))
+      srcEncRank = encTrait.getRank();
     for (Operation *op : opsToRewrite) {
       for (Value result : op->getResults()) {
         if (auto ty = dyn_cast<RankedTensorType>(result.getType())) {
+          if (srcEncRank > 0 && ty.getRank() != srcEncRank)
+            continue;
           result.setType(ty.cloneWithEncoding(srcEnc));
         }
       }
