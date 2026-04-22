@@ -303,12 +303,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK: ttg.local_alloc : () -> !ttg.memdesc<128x128xf16
   // CHECK: ttg.local_alloc : () -> !ttg.memdesc<128x128xf16
   //
-  // First SubtiledRegionOp (task 3): bias descriptor_load + store to SMEM
+  // First SubtiledRegionOp (task 3): bias descriptor_load + store to SMEM.
+  // The addi uses the identity tile arg (%vary: 0 for tile 0, c128 for tile 1)
+  // to compute the per-tile column offset, and descriptor_load uses that result.
   // CHECK: ttng.subtiled_region
   // CHECK:   } tile{
-  // CHECK:     arith.addi
-  // CHECK:     tt.descriptor_load
-  // CHECK:     ttg.local_store
+  // CHECK: ^bb0(%{{.*}}: tensor<{{.*}}>, %[[VARY:.*]]: i32, %[[BUF:.*]]: !ttg.memdesc<{{.*}}>, %{{.*}}: i32):
+  // CHECK:     %[[OFF:.*]] = arith.addi %{{.*}}, %[[VARY]]
+  // CHECK:     %[[BIAS:.*]] = tt.descriptor_load %{{.*}}[%{{.*}}, %[[OFF]]]
+  // CHECK:     ttg.local_store %[[BIAS]], %[[BUF]]
   // CHECK:     ttng.subtiled_region_yield
   // CHECK:   }
   //

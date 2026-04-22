@@ -933,6 +933,9 @@ static void buildMultiTaskSubtiledRegions(OpBuilder &outerBuilder, Location loc,
     if (!segEquiv)
       return;
     auto &segDiff = segEquiv->differingOperands;
+    auto &segIdentity = segEquiv->identityOps;
+    ArrayRef<Operation *> tplOps =
+        (segEquiv->templateChainIdx == 0) ? subOps0 : subOps1;
 
     // Resolve cross-segment operands: replace original values with outer-scope
     // SMEM values.  Track which entries need a local_load in the tile body.
@@ -982,6 +985,21 @@ static void buildMultiTaskSubtiledRegions(OpBuilder &outerBuilder, Location loc,
       yieldIdx += 2;
     }
 
+    // Identity insertion tile args: (varying, identity_const) pairs.
+    for (auto &id : segIdentity) {
+      tileArgTypes.push_back(id.varyingOperand.getType());
+      int32_t tplSlot = yieldIdx;
+      int32_t otherSlot = yieldIdx + 1;
+      if (segEquiv->templateChainIdx == 0) {
+        tile0Map.push_back(tplSlot);
+        tile1Map.push_back(otherSlot);
+      } else {
+        tile0Map.push_back(otherSlot);
+        tile1Map.push_back(tplSlot);
+      }
+      yieldIdx += 2;
+    }
+
     // Outgoing SMEM args (for local_store at the end of this segment).
     // Collect the buffer entries for the outgoing transition so we can add
     // tile args for the SMEM destinations.
@@ -1023,10 +1041,24 @@ static void buildMultiTaskSubtiledRegions(OpBuilder &outerBuilder, Location loc,
         setupYields.push_back(setupMapping.lookupOrDefault(entry.setupVal0));
         setupYields.push_back(setupMapping.lookupOrDefault(entry.setupVal1));
       }
+      for (auto &id : segIdentity) {
+        setupYields.push_back(setupMapping.lookupOrDefault(id.varyingOperand));
+        setupYields.push_back(arith::ConstantOp::create(
+            setupBuilder, loc,
+            setupBuilder.getIntegerAttr(id.varyingOperand.getType(),
+                                        id.identityVal)));
+      }
     } else {
       for (auto &entry : resolvedDiff) {
         setupYields.push_back(entry.setupVal0);
         setupYields.push_back(entry.setupVal1);
+      }
+      for (auto &id : segIdentity) {
+        setupYields.push_back(id.varyingOperand);
+        setupYields.push_back(arith::ConstantOp::create(
+            setupBuilder, loc,
+            setupBuilder.getIntegerAttr(id.varyingOperand.getType(),
+                                        id.identityVal)));
       }
     }
 
@@ -1063,26 +1095,39 @@ static void buildMultiTaskSubtiledRegions(OpBuilder &outerBuilder, Location loc,
       }
     }
 
+    // Map identity insertion operands: the template chain's identity op
+    // references the varying operand, which is mapped to the tile arg.
+    for (auto &id : segIdentity)
+      tileMapping.map(id.varyingOperand, tileBlock->getArgument(argIdx++));
+
     // Collect outgoing SMEM tile args.
     SmallVector<Value> outgoingSmemArgs;
     for (size_t i = 0; i < outgoingBuffers.size(); ++i)
       outgoingSmemArgs.push_back(tileBlock->getArgument(argIdx++));
 
-    // Clone segment ops into the tile body.
-    for (Operation *op : subOps0)
+    // Clone segment ops into the tile body (from the template chain which
+    // includes identity ops).
+    for (Operation *op : tplOps)
       tileBuilder.clone(*op, tileMapping);
 
-    // Emit outgoing stores.
+    // Emit outgoing stores. Use the template chain's value for lookup since
+    // the tile body was cloned from the template chain.
     if (hasOutgoingTransition) {
       auto &tr = transitions[segIdx];
+      bool tplIs1 = (segEquiv->templateChainIdx == 1);
       if (tr.isExplicitStore()) {
         // Option 1: store the local_alloc's source data.
-        Value data = tileMapping.lookupOrDefault(tr.alloc0.getSrc());
+        auto srcAlloc =
+            tplIs1
+                ? cast<gpu::LocalAllocOp>(segments[segIdx].opsPerTile[1].back())
+                : tr.alloc0;
+        Value data = tileMapping.lookupOrDefault(srcAlloc.getSrc());
         gpu::LocalStoreOp::create(tileBuilder, loc, data, outgoingSmemArgs[0]);
       } else {
         // Option 2: store each cross-segment value.
         for (auto [buf, smemArg] : llvm::zip(tr.buffers, outgoingSmemArgs)) {
-          Value data = tileMapping.lookupOrDefault(buf.chain0Val);
+          Value bufVal = tplIs1 ? buf.chain1Val : buf.chain0Val;
+          Value data = tileMapping.lookupOrDefault(bufVal);
           gpu::LocalStoreOp::create(tileBuilder, loc, data, smemArg);
         }
       }
@@ -1600,6 +1645,20 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
       SmallVector<ChainSegment> reordered;
       for (unsigned idx : order)
         reordered.push_back(std::move(merged[idx]));
+
+      // Strip identity ops from the non-template side so that per-segment
+      // checkStructuralEquivalence correctly detects identity insertions.
+      // Without this, both sides have the same Operation* and the identity
+      // op becomes dead code in the tile body.
+      unsigned nonTpl = (differing->templateChainIdx == 0) ? 1 : 0;
+      for (auto &seg : reordered) {
+        SmallVector<Operation *> filtered;
+        for (auto *op : seg.opsPerTile[nonTpl]) {
+          if (!differing->identityOpSet.count(op))
+            filtered.push_back(op);
+        }
+        seg.opsPerTile[nonTpl] = std::move(filtered);
+      }
 
       buildMultiTaskSubtiledRegions(builder, loc, setupOps, lhs, rhs,
                                     reordered);
