@@ -75,5 +75,6 @@ exclude: |
     ^third_party/nvidia/backend/include/cuda.h|
     ^third_party/tlx/language/__init__.py|
     ^third_party/f2reduce|
+    ^third_party/tileir|
     ^python/test/gluon/
   )

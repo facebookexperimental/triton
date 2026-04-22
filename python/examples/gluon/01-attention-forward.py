@@ -952,7 +952,7 @@ def attention_forward(q, k, v, causal, sm_scale):
 
 
 def is_cuda():
-    return triton.runtime.driver.active.get_current_target().backend == "cuda"
+    return triton.runtime.driver.active.get_current_target().is_cuda_backend()
 
 
 def is_blackwell():

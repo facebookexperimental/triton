@@ -56,8 +56,7 @@ static void dumpNodeOneLine(const ScheduleNode &node, llvm::raw_ostream &os,
       os << "(" << innerName << ")";
   }
   os << "  {pipe: " << getPipelineName(node.pipeline)
-     << ", cycle: " << node.cycle
-     << ", cluster: " << node.cluster;
+     << ", cycle: " << node.cycle << ", cluster: " << node.cluster;
   if (node.latency)
     os << ", latency: " << node.latency;
   if (node.selfLatency)
