@@ -8,7 +8,7 @@ import os
 import threading
 import re
 import textwrap
-from collections import defaultdict, namedtuple
+from collections import OrderedDict, defaultdict, namedtuple
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Callable, Generic, Iterable, Optional, TypeVar, overload, Dict, Any, Tuple
@@ -44,6 +44,117 @@ _LastCall = namedtuple("_LastCall", [
 ])
 
 T = TypeVar("T")
+
+
+class _LRUDict:
+    """Thread-safe bounded LRU cache backed by OrderedDict.
+
+    Used for kernel_cache and _run_cache to prevent unbounded CUDA memory
+    growth when kernels are compiled for many distinct shapes.
+
+    Each public method is guarded by a lock so that compound operations
+    (e.g. move_to_end + __getitem__) are atomic even when multiple threads
+    invoke a JITFunction concurrently.
+    """
+
+    __slots__ = ("_maxsize", "_data", "_lock", "_on_evict")
+
+    def __init__(self, maxsize: int = 256, on_evict=None):
+        self._maxsize = maxsize
+        self._data: OrderedDict = OrderedDict()
+        self._lock = threading.Lock()
+        self._on_evict = on_evict
+
+    def get(self, key):
+        with self._lock:
+            try:
+                self._data.move_to_end(key)
+                return self._data[key]
+            except KeyError:
+                return None
+
+    def put(self, key, value):
+        if self._maxsize <= 0:
+            return
+        with self._lock:
+            try:
+                self._data.move_to_end(key)
+            except KeyError:
+                if len(self._data) >= self._maxsize:
+                    evicted_key, evicted_val = self._data.popitem(last=False)
+                    if self._on_evict is not None:
+                        self._on_evict(evicted_key, evicted_val)
+            self._data[key] = value
+
+    def clear(self):
+        with self._lock:
+            if self._on_evict is not None:
+                for k, v in self._data.items():
+                    self._on_evict(k, v)
+            self._data.clear()
+
+    def __len__(self):
+        with self._lock:
+            return len(self._data)
+
+    def values(self):
+        with self._lock:
+            return list(self._data.values())
+
+    def __contains__(self, key):
+        with self._lock:
+            return key in self._data
+
+    def __deepcopy__(self, memo):
+        with self._lock:
+            new = _LRUDict(self._maxsize)
+            new._data = OrderedDict(self._data)
+            return new
+
+    def __copy__(self):
+        with self._lock:
+            new = _LRUDict(self._maxsize)
+            new._data = OrderedDict(self._data)
+            return new
+
+
+class _DeferredModuleUnloader:
+    """Deferred queue for cuModuleUnload calls.
+
+    CUDA modules cannot be unloaded during CUDA graph capture (it would
+    invalidate CUfunction handles referenced by the graph).  Instead,
+    evicted module handles are queued here and flushed at the next kernel
+    launch when the stream is NOT in capture mode.
+    """
+
+    __slots__ = ("_queue", "_lock")
+
+    def __init__(self):
+        self._queue = []
+        self._lock = threading.Lock()
+
+    def queue_module(self, module_handle):
+        if module_handle is not None and module_handle != 0:
+            with self._lock:
+                self._queue.append(module_handle)
+
+    def flush(self, stream):
+        if not self._queue:
+            return
+        try:
+            if driver.active.utils.is_stream_capturing(stream):
+                return
+        except Exception:
+            return
+        with self._lock:
+            handles = list(self._queue)
+            self._queue.clear()
+        for handle in handles:
+            try:
+                driver.active.utils.unload_binary(handle)
+            except Exception:
+                pass
+
 
 # -----------------------------------------------------------------------------
 # Dependencies Finder
@@ -795,7 +906,16 @@ class JITFunction(JITCallable, KernelInterface[T]):
         self.compile = compile
         self.ASTSource = ASTSource
         binder = create_function_from_signature(self.signature, self.params, backend)
-        return {}, {}, target, backend, binder
+
+        def _on_kernel_evict(_key, compiled_kernel):
+            # Invalidate fast-path caches that may hold stale CUfunction
+            # handles from the evicted module. Without this, Layer 1/2
+            # would try to launch with an unloaded CUfunction → CUDA error.
+            self.clear_fast_path_caches()
+            if hasattr(compiled_kernel, 'module') and compiled_kernel.module is not None:
+                self._deferred_unloader.queue_module(compiled_kernel.module)
+
+        return _LRUDict(knobs.runtime.kernel_cache_size, on_evict=_on_kernel_evict), {}, target, backend, binder
 
     def _pack_args(self, backend, kwargs, bound_args, specialization, options):
         # options
@@ -874,6 +994,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
         # parse options
         device = driver.active.get_current_device()
         stream = driver.active.get_current_stream(device)
+        self._deferred_unloader.flush(stream)
 
         # Execute pre run hooks with args and kwargs
         for hook in self.pre_run_hooks:
@@ -887,7 +1008,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
             specialization.append(f'("custom_pipeline", {inspect_stages_hash})')
 
         key = compute_cache_key(kernel_key_cache, specialization, options)
-        kernel = kernel_cache.get(key, None)
+        kernel = kernel_cache.get(key)
 
         if kernel is None:
             options, signature, constexprs, attrs = self._pack_args(backend, kwargs, bound_args, specialization,
@@ -939,11 +1060,14 @@ class JITFunction(JITCallable, KernelInterface[T]):
             # regresses short-running kernels.
             if self._last_call is None and not self.pre_run_hooks and not knobs.compilation.always_compile:
                 self._last_call = self._make_launch_cache(device, args, kernel, tuple(bound_args.values()))
-                self._last_kwargs = {k: v for k, v in kwargs.items()
-                                     if k not in ('debug', 'sanitize_overflow', 'instrumentation_mode')}
+                self._last_kwargs = {
+                    k: v
+                    for k, v in kwargs.items()
+                    if k not in ('debug', 'sanitize_overflow', 'instrumentation_mode')
+                }
                 fast_key = self._compute_fast_key(args, self._last_kwargs, device)
                 if fast_key is not None:
-                    self._run_cache[fast_key] = self._last_call[2:]
+                    self._run_cache.put(fast_key, self._last_call[2:])
 
         return kernel
 
@@ -955,6 +1079,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
         """
         device = driver.active.get_current_device()
         stream = driver.active.get_current_stream(device)
+        self._deferred_unloader.flush(stream)
 
         # Layer 1: Identity check — same Python objects as last call?
         last = self._last_call
@@ -1005,12 +1130,21 @@ class JITFunction(JITCallable, KernelInterface[T]):
                     if kwargs:
                         param_names = [p.name for p in self.params]
                         bound_dict = dict(zip(param_names, args))
+                        # Fill in defaults for params not covered by positional args,
+                        # in case non-param kwargs (e.g. num_warps) inflated the
+                        # length check in _compute_fast_key.
+                        for p in self.params[len(args):]:
+                            if p.has_default:
+                                bound_dict[p.name] = p.default
                         bound_dict.update(kwargs)
                         bound_vals = tuple(bound_dict[n] for n in param_names)
                     self._fast_launch(kernel, grid, stream, bound_vals, *cached[2:9])
                     self._last_call = self._make_launch_cache(device, args, kernel, bound_vals)
-                    self._last_kwargs = {k: v for k, v in kwargs.items()
-                                         if k not in ('debug', 'sanitize_overflow', 'instrumentation_mode')}
+                    self._last_kwargs = {
+                        k: v
+                        for k, v in kwargs.items()
+                        if k not in ('debug', 'sanitize_overflow', 'instrumentation_mode')
+                    }
                     return kernel
 
         return None
@@ -1069,13 +1203,18 @@ class JITFunction(JITCallable, KernelInterface[T]):
         # cache of just-in-time compiled kernels
         self.device_caches = _DeviceCaches(self, self.create_binder)
 
+        # Deferred queue for cuModuleUnload — flushed at kernel launch
+        # when stream is not in CUDA graph capture mode.
+        self._deferred_unloader = _DeferredModuleUnloader()
+
         # Last-call cache for identity-based fast path (Layer 1).
         # _LastCall namedtuple built by _make_launch_cache(); see run() for layout.
         self._last_call = None
         self._last_kwargs = {}
         # Signature-based fast-path cache (Layer 2).
         # Maps (device, fast_arg_signature) -> compiled kernel.
-        self._run_cache = {}
+        # Bounded LRU to prevent unbounded CUDA memory growth with varying shapes.
+        self._run_cache = _LRUDict(knobs.runtime.kernel_cache_size)
 
         # JITFunction can be instantiated as kernel
         # when called with a grid using __getitem__
@@ -1147,14 +1286,14 @@ class JITFunction(JITCallable, KernelInterface[T]):
                 return self.compile(src, target=target, options=options.__dict__, _env_vars=env_vars)
 
             def finalize_compile(kernel):
-                kernel_cache[key] = kernel
+                kernel_cache.put(key, kernel)
                 self._call_hook(knobs.runtime.jit_post_compile_hook, key, signature, device, constexprs, options,
                                 [attrs], warmup)
 
             kernel = async_mode.submit(cache_key, async_compile, finalize_compile)
         else:
             kernel = self.compile(src, target=target, options=options.__dict__)
-            kernel_cache[key] = kernel
+            kernel_cache.put(key, kernel)
             self._call_hook(knobs.runtime.jit_post_compile_hook, key, signature, device, constexprs, options, [attrs],
                             warmup)
         return kernel

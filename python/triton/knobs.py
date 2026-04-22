@@ -423,6 +423,9 @@ class HookChain(Generic[F]):
         if func in self.calls:
             self.calls.remove(func)
 
+    def __bool__(self):
+        return len(self.calls) > 0
+
     def __call__(self, *args, **kwargs):
         for call in self.calls if not self.reversed else reversed(self.calls):
             call(*args, **kwargs)
@@ -473,6 +476,13 @@ class runtime_knobs(base_knobs):
     # sanitize_overflow enables overflow checking for integer operations
     sanitize_overflow: bool = env_bool("TRITON_SANITIZE_OVERFLOW").get()
     override_arch: env_opt_str = env_opt_str("TRITON_OVERRIDE_ARCH")
+
+    # Maximum number of compiled kernels kept in-memory per JITFunction per
+    # device.  Each entry holds a CompiledKernel with a loaded CUDA module.
+    # Evicted kernels will be re-compiled on next use (fast: on-disk cache hit).
+    # This also bounds the Layer 2 fast-path cache (_run_cache).
+    # Set to 0 to disable both caches entirely.
+    kernel_cache_size: int = env_int("TRITON_KERNEL_CACHE_SIZE", 256).get()
 
     launch_enter_hook: HookChain[LaunchHook] = HookChain()
     launch_exit_hook: HookChain[LaunchHook] = HookChain(reversed=True)
