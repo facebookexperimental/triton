@@ -1540,6 +1540,31 @@ static unsigned allocateSmemBuffers(
                               << " buffer.copy=" << buf.numCopies);
   }
 
+  // ── Phase 6: Hoist in-loop TMA store allocs to before the loop ──────
+  // Early TMA store lowering creates local_alloc ops inside the loop.
+  // These must be hoisted so the pipeliner can rotate them by buffer.copy.
+  for (auto &buf : wsBuffers) {
+    auto allocOp = buf.allocOp;
+    if (auto forOp = allocOp->getParentOfType<scf::ForOp>()) {
+      bool feedsTMAStore = false;
+      for (auto user : allocOp->getUsers()) {
+        if (isa<ttng::AsyncTMACopyLocalToGlobalOp>(user)) {
+          feedsTMAStore = true;
+          break;
+        }
+      }
+      if (feedsTMAStore) {
+        // Walk to the outermost enclosing loop.
+        auto outermost = forOp;
+        while (auto parent = outermost->getParentOfType<scf::ForOp>())
+          outermost = parent;
+        allocOp->moveBefore(outermost);
+        LDBG("Phase 6: hoisted WSBuffer[" << buf.bufferId
+                                          << "] before outermost loop");
+      }
+    }
+  }
+
   return nextBufferId;
 }
 

@@ -61,7 +61,6 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
 
     // Allocate SMEM and copy register data into it in one step.
     auto alloc = builder.create<ttg::LocalAllocOp>(loc, memDescType, src);
-    copyLoopScheduleAttrs(storeOp, alloc);
 
     // Translate indices for TMA.
     auto indices = ttng::translateTMAIndices(
@@ -216,6 +215,10 @@ void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp) {
 
 void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
   funcOp.walk([&](scf::ForOp forOp) {
+    bool hasNestedFor = false;
+    forOp.getBody()->walk([&](scf::ForOp) { hasNestedFor = true; });
+    if (hasNestedFor)
+      return;
     // Deserialize the SWP schedule. If there is no schedule, create a basic
     // single-stage schedule so the reorder logic can still work.
     tt::CoarseSchedule schedule;
