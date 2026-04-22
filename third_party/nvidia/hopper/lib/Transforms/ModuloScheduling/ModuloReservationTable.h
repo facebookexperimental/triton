@@ -61,6 +61,14 @@ FailureOr<ModuloScheduleResult>
 runModuloScheduling(const DataDependenceGraph &ddg, int maxII = 0,
                     int maxBacktracks = 20);
 
+/// Result of list scheduling for a non-loop region. The algorithm itself
+/// lives in `ListSchedulePass.cpp` (kept there so its debug output is
+/// gated by `-debug-only=nvgpu-list-schedule`).
+struct ListScheduleResult {
+  int makespan{}; // total cycles from first op start to last op end
+  llvm::DenseMap<unsigned, int> nodeToCycle; // DDG node idx -> absolute cycle
+};
+
 } // namespace mlir::triton::gpu
 
 #endif // TRITON_NVIDIA_HOPPER_MODULO_SCHEDULING_RESERVATION_TABLE_H

@@ -391,6 +391,6 @@ def make_opt_flags(
     backend = triton.runtime.driver.active.get_current_target().backend
     if backend == "hip":
         return make_default_opt_flags_amd(*args)
-    if backend == "cuda":
+    if triton.runtime.driver.active.get_current_target().is_cuda_backend():
         return make_default_opt_flags_nvidia(*args)
     assert False
