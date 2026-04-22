@@ -7,11 +7,15 @@ from types import ModuleType
 
 @dataclass(frozen=True)
 class GPUTarget(object):
-    # Target backend, e.g., cuda, hip
+    # Target backend, e.g., cuda, tileir, hip
     backend: str
     # Target architecture, e.g., 90 (for cuda compute capability), gfx940 (for hip)
     arch: Union[int, str]
     warp_size: int
+
+    def is_cuda_backend(self) -> bool:
+        """Returns True if this target uses a CUDA-compatible backend (cuda or tileir)."""
+        return self.backend in ("cuda", "tileir")
 
 
 class Language(Enum):
