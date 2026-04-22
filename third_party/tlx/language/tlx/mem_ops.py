@@ -714,7 +714,7 @@ def local_scatter(
     _semantic=None,
 ) -> tl.tensor:
     """
-    gather elements from shared memory along a specified axis using an indices tensor.
+    scatter elements to shared memory along a specified axis using an indices tensor.
     """
     block_type = tl.block_type(src.type.element_ty, indices.type.shape)
     storage = dst.type.storage
