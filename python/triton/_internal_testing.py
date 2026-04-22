@@ -38,7 +38,7 @@ def get_current_target():
 
 def is_cuda():
     target = get_current_target()
-    return False if target is None else target.backend == "cuda"
+    return False if target is None else target.is_cuda_backend()
 
 
 def is_ampere_or_newer():

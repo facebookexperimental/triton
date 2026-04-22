@@ -63,12 +63,7 @@ public:
         loopOp.moveOutOfLoop(fence);
       }
 
-      // If the previous op is already a fence, this one isn't needed.
-      if (auto lastFence =
-              dyn_cast_or_null<FenceAsyncSharedOp>(fence->getPrevNode())) {
-        if (lastFence.getBCluster() == fence.getBCluster())
-          fence.erase();
-      }
+      eraseIfDuplicateFence(fence);
 
       return WalkResult::advance();
     });
@@ -94,18 +89,29 @@ public:
         loopOp.moveOutOfLoop(fence);
       }
 
-      // If the previous op is already a fence, this one isn't needed.
-      if (auto lastFence =
-              dyn_cast_or_null<FenceAsyncSharedOp>(fence->getPrevNode())) {
-        if (lastFence.getBCluster() == fence.getBCluster())
-          fence.erase();
-      }
+      eraseIfDuplicateFence(fence);
 
       return WalkResult::advance();
     });
   }
 
 private:
+  // Erase `fence` if a matching FenceAsyncSharedOp already exists earlier
+  // in the same block, with only pure (memory-effect-free) ops in between.
+  void eraseIfDuplicateFence(FenceAsyncSharedOp fence) {
+    Operation *prev = fence->getPrevNode();
+    while (prev) {
+      if (auto lastFence = dyn_cast<FenceAsyncSharedOp>(prev)) {
+        if (lastFence.getBCluster() == fence.getBCluster())
+          fence.erase();
+        break;
+      }
+      if (!isMemoryEffectFree(prev))
+        break;
+      prev = prev->getPrevNode();
+    }
+  }
+
   // Walk users of `root` transitively through memdesc view ops, collecting
   // any LocalStoreOp found into `result`.
   void findLocalStoresThroughViews(Value root,
