@@ -387,9 +387,7 @@ LogicalResult convertDotImpl(const LLVMTypeConverter &typeConverter,
       // TODO: we have to sync the two CTAs because we currently don't use
       // remove barriers for the copies.
       ttng::ClusterArriveOp::create(rewriter, loc, false);
-      ttng::ClusterWaitOp::create(rewriter, loc);
     }
-
     Value leftClusterId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
     leftClusterId = tb.and_(leftClusterId, tb.i32_val(1));
     Value cluster0 = tb.icmp_eq(leftClusterId, tb.i32_val(0));
