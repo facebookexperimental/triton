@@ -39,7 +39,7 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
 def is_cuda():
-    return triton.runtime.driver.active.get_current_target().backend == "cuda"
+    return triton.runtime.driver.active.get_current_target().is_cuda_backend()
 
 
 def supports_tma():
