@@ -473,6 +473,7 @@ static unsigned estimateConvertScratchCost(Value value, Attribute encoding) {
   Operation *op = value.getDefiningOp();
   if (!op)
     return 0;
+  auto encTrait = dyn_cast<LayoutEncodingTrait>(encoding);
   unsigned cost = 0;
   for (Value operand : op->getOperands()) {
     auto srcTy = dyn_cast<RankedTensorType>(operand.getType());
@@ -480,6 +481,8 @@ static unsigned estimateConvertScratchCost(Value value, Attribute encoding) {
       continue;
     Attribute srcEnc = srcTy.getEncoding();
     if (!srcEnc || srcEnc == encoding)
+      continue;
+    if (encTrait && srcTy.getRank() != encTrait.getRank())
       continue;
     auto dstTy = srcTy.cloneWithEncoding(encoding);
     if (cvtNeedsSharedMemory(srcTy, dstTy)) {
@@ -1968,6 +1971,10 @@ public:
   // layout that doesn't match srcEnc.
   bool canPropagateSrcEncodingThroughUsers(ConvertLayoutOp cvt,
                                            Attribute srcEnc) {
+    unsigned srcEncRank = 0;
+    if (auto encTrait = dyn_cast<LayoutEncodingTrait>(srcEnc))
+      srcEncRank = encTrait.getRank();
+
     SmallVector<Value> worklist;
     worklist.push_back(cvt.getResult());
     DenseSet<Value> visited;
@@ -1988,14 +1995,19 @@ public:
                 arith::TruncIOp, arith::SIToFPOp, arith::FPToSIOp,
                 arith::BitcastOp>(user)) {
           for (Value result : user->getResults()) {
-            if (isa<RankedTensorType>(result.getType()))
-              worklist.push_back(result);
+            auto rtt = dyn_cast<RankedTensorType>(result.getType());
+            if (!rtt)
+              continue;
+            if (srcEncRank > 0 && rtt.getRank() != srcEncRank)
+              return false;
+            worklist.push_back(result);
           }
           continue;
         }
-        // scf.yield just passes values through — propagate.
+        // TODO: propagate through scf.yield by updating parent op result
+        // types, scf.for iter_args, and init values to match srcEnc.
         if (isa<scf::YieldOp>(user))
-          continue;
+          return false;
         // Any other user (dot, reduce, another convert, etc.) blocks
         // propagation.
         return false;
@@ -2087,9 +2099,14 @@ public:
     }
 
     // Rewrite result types to use srcEnc.
+    unsigned srcEncRank = 0;
+    if (auto encTrait = dyn_cast<LayoutEncodingTrait>(srcEnc))
+      srcEncRank = encTrait.getRank();
     for (Operation *op : opsToRewrite) {
       for (Value result : op->getResults()) {
         if (auto ty = dyn_cast<RankedTensorType>(result.getType())) {
+          if (srcEncRank > 0 && ty.getRank() != srcEncRank)
+            continue;
           result.setType(ty.cloneWithEncoding(srcEnc));
         }
       }
