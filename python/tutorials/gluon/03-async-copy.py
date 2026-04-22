@@ -23,7 +23,7 @@ from triton.experimental.gluon.language.nvidia.ampere import async_copy as cp
 
 def is_ampere_or_newer():
     target = triton.runtime.driver.active.get_current_target()
-    return target.backend == "cuda" and torch.cuda.get_device_capability()[0] >= 8
+    return target.is_cuda_backend() and torch.cuda.get_device_capability()[0] >= 8
 
 
 if __name__ == "__main__" and not is_ampere_or_newer():

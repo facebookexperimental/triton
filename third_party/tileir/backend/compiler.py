@@ -4,6 +4,7 @@ from triton.runtime.cache import get_cache_manager
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton.backends.tileir.conf import TileIREnvConf
 from triton._C.libtriton import ir, passes, tileir
+from triton import knobs
 
 from dataclasses import dataclass
 import functools
@@ -121,6 +122,11 @@ class TileIROptions:
         key = "_".join([f"{name}-{val}" for name, val in sorted(hash_dict.items()) if name != "num_warps"])
         return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
+    @property
+    def ast_to_ttir(self):
+        from .code_generator import ast_to_ttir
+        return ast_to_ttir
+
 
 def get_tileir_version():
     return "13.1"
@@ -134,8 +140,10 @@ class TileIRBackend(BaseBackend):
         return {"triton.language.extra.libdevice": libdevice}
 
     @staticmethod
-    def supports_target(target: GPUTarget):
-        return target.backend == "tileir"
+    def supports_target(target: GPUTarget) -> bool:
+        # Only supported on Blackwell with Cuda
+        # TODO: Enable Ampere with Cuda 13.2
+        return knobs.nvidia.enable_tileir and target.backend == "tileir" and target.arch >= 100 and target.arch < 110
 
     def _parse_arch(self, arch):
         pattern = r"^sm(\d+)$"
@@ -191,6 +199,11 @@ class TileIRBackend(BaseBackend):
 
     @staticmethod
     def call_tileiras(mod, metadata, opt: TileIROptions, capability):
+        # HACK: TileIR does not report shared memory usage, but the Triton runtime
+        # expects metadata["shared"] to be set. Default to 0 to satisfy the calling
+        # convention. This should be replaced with actual shared memory reporting
+        # once tileiras supports it.
+        metadata["shared"] = 0
         tileiras = opt.tileir_tileiras_path
         tileiras_cmd = [
             tileiras,
@@ -211,7 +224,11 @@ class TileIRBackend(BaseBackend):
             tileiras_cmd.append(fbin)
 
             try:
-                subprocess.run(tileiras_cmd, check=True, close_fds=False, stderr=flog)
+                # Workaround: Buck injects environment variables that break
+                # the tileiras subprocess. Clear env when running in fbcode.
+                from triton.runtime.fbcode_gating import is_fbcode_dependant
+                env = {} if is_fbcode_dependant() else None
+                subprocess.run(tileiras_cmd, check=True, close_fds=False, stderr=flog, env=env)
                 if os.path.exists(fbytecode.name):
                     os.remove(fbytecode.name)
             except subprocess.CalledProcessError as e:
@@ -310,3 +327,5 @@ class TileIRBackend(BaseBackend):
     def hash(self):
         version = get_tileir_version()
         return f"{'tileir'}-{version}-{self.target.arch}"
+
+__all__ = ["TileIROptions", "TileIRBackend"]
