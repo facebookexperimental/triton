@@ -61,6 +61,7 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
 
     // Allocate SMEM and copy register data into it in one step.
     auto alloc = builder.create<ttg::LocalAllocOp>(loc, memDescType, src);
+    copyLoopScheduleAttrs(storeOp, alloc);
 
     // Translate indices for TMA.
     auto indices = ttng::translateTMAIndices(
