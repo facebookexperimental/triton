@@ -45,6 +45,7 @@ def matmul_kernel_tma_ws(
     B_COL_MAJOR: tl.constexpr,
     DATA_PARTITION_FACTOR: tl.constexpr,
     SMEM_ALLOC_ALGO: tl.constexpr,
+    SEPARATE_EPILOGUE_STORE: tl.constexpr,
 ):
     """TMA-based matmul with warp specialization in K-loop (always enabled)."""
     dtype = tl.float16
@@ -72,7 +73,7 @@ def matmul_kernel_tma_ws(
             warp_specialize=True,
             data_partition_factor=DATA_PARTITION_FACTOR,
             smem_alloc_algo=SMEM_ALLOC_ALGO,
-            separate_epilogue_store=True,
+            separate_epilogue_store=SEPARATE_EPILOGUE_STORE,
     ):
         offs_k = k * BLOCK_SIZE_K
         if A_COL_MAJOR:
@@ -115,6 +116,7 @@ def matmul_kernel_tma_persistent_ws(
     B_COL_MAJOR: tl.constexpr,
     DATA_PARTITION_FACTOR: tl.constexpr,
     SMEM_ALLOC_ALGO: tl.constexpr,
+    SEPARATE_EPILOGUE_STORE: tl.constexpr,
 ):
     """Persistent TMA matmul with warp specialization (always enabled)."""
     dtype = tl.float16
@@ -136,7 +138,7 @@ def matmul_kernel_tma_persistent_ws(
             warp_specialize=True,
             data_partition_factor=DATA_PARTITION_FACTOR,
             smem_alloc_algo=SMEM_ALLOC_ALGO,
-            separate_epilogue_store=True,
+            separate_epilogue_store=SEPARATE_EPILOGUE_STORE,
     ):
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
@@ -210,6 +212,7 @@ def matmul_kernel_descriptor_persistent_ws(
     B_COL_MAJOR: tl.constexpr,
     DATA_PARTITION_FACTOR: tl.constexpr,
     SMEM_ALLOC_ALGO: tl.constexpr,
+    SEPARATE_EPILOGUE_STORE: tl.constexpr,
 ):
     """Persistent matmul with device-side TMA descriptors and warp specialization (always enabled)."""
     dtype = c_ptr.dtype.element_ty
@@ -269,7 +272,7 @@ def matmul_kernel_descriptor_persistent_ws(
             warp_specialize=True,
             data_partition_factor=DATA_PARTITION_FACTOR,
             smem_alloc_algo=SMEM_ALLOC_ALGO,
-            separate_epilogue_store=True,
+            separate_epilogue_store=SEPARATE_EPILOGUE_STORE,
     ):
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
@@ -334,6 +337,7 @@ def matmul_kernel_descriptor_persistent_ws(
 @pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
+@pytest.mark.parametrize("separate_epilogue_store", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tutorial09_matmul_tma_warp_specialize(
     M,
@@ -349,6 +353,7 @@ def test_tutorial09_matmul_tma_warp_specialize(
     use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     SMEM_ALLOC_ALGO,
+    separate_epilogue_store,
 ):
     """Test matmul_kernel_tma with warp_specialize=True (K-loop based)."""
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
@@ -415,6 +420,7 @@ def test_tutorial09_matmul_tma_warp_specialize(
             B_COL_MAJOR=B_col_major,
             DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
             SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
+            SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
@@ -448,6 +454,7 @@ def test_tutorial09_matmul_tma_warp_specialize(
 @pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
+@pytest.mark.parametrize("separate_epilogue_store", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tutorial09_matmul_tma_persistent_warp_specialize(
     M,
@@ -465,6 +472,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     SMEM_ALLOC_ALGO,
+    separate_epilogue_store,
 ):
     """Test matmul_kernel_tma_persistent with warp_specialize=True for both Flatten values."""
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
@@ -571,6 +579,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
             B_COL_MAJOR=B_col_major,
             DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
             SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
+            SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
@@ -604,6 +613,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 @pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
+@pytest.mark.parametrize("separate_epilogue_store", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     M,
@@ -621,6 +631,7 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     SMEM_ALLOC_ALGO,
+    separate_epilogue_store,
 ):
     """Test matmul_kernel_descriptor_persistent with warp_specialize=True for both Flatten values."""
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
@@ -693,6 +704,7 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
             B_COL_MAJOR=B_col_major,
             DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
             SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
+            SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
@@ -815,6 +827,7 @@ def test_tutorial09_multi_epilogue_subtile():
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
 @pytest.mark.parametrize("enable_pingpong", [False, True])
+@pytest.mark.parametrize("separate_epilogue_store", [True, False])
 @pytest.mark.skipif(not is_hopper(), reason="Requires Hopper")
 def test_hopper_matmul_tma_warp_specialize(
     M,
@@ -831,6 +844,7 @@ def test_hopper_matmul_tma_warp_specialize(
     DATA_PARTITION_FACTOR,
     SMEM_ALLOC_ALGO,
     enable_pingpong,
+    separate_epilogue_store,
 ):
     """Test matmul_kernel_tma with warp_specialize=True on Hopper (K-loop based)."""
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 128:
@@ -889,6 +903,7 @@ def test_hopper_matmul_tma_warp_specialize(
             B_COL_MAJOR=B_col_major,
             DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
             SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
+            SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
@@ -920,6 +935,7 @@ def test_hopper_matmul_tma_warp_specialize(
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
 @pytest.mark.parametrize("enable_pingpong", [False, True])
+@pytest.mark.parametrize("separate_epilogue_store", [True, False])
 @pytest.mark.skipif(not is_hopper(), reason="Requires Hopper")
 def test_hopper_matmul_tma_persistent_warp_specialize(
     M,
@@ -936,6 +952,7 @@ def test_hopper_matmul_tma_persistent_warp_specialize(
     DATA_PARTITION_FACTOR,
     SMEM_ALLOC_ALGO,
     enable_pingpong,
+    separate_epilogue_store,
 ):
     """Test matmul_kernel_tma_persistent with warp_specialize=True on Hopper.
 
@@ -1012,6 +1029,7 @@ def test_hopper_matmul_tma_persistent_warp_specialize(
             B_COL_MAJOR=B_col_major,
             DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
             SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
+            SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
@@ -1044,6 +1062,7 @@ def test_hopper_matmul_tma_persistent_warp_specialize(
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
 @pytest.mark.parametrize("enable_pingpong", [False, True])
+@pytest.mark.parametrize("separate_epilogue_store", [True, False])
 @pytest.mark.skipif(not is_hopper(), reason="Requires Hopper")
 def test_hopper_matmul_descriptor_persistent_warp_specialize(
     M,
@@ -1060,6 +1079,7 @@ def test_hopper_matmul_descriptor_persistent_warp_specialize(
     DATA_PARTITION_FACTOR,
     SMEM_ALLOC_ALGO,
     enable_pingpong,
+    separate_epilogue_store,
 ):
     """Test matmul_kernel_descriptor_persistent with warp_specialize=True on Hopper.
 
@@ -1121,6 +1141,7 @@ def test_hopper_matmul_descriptor_persistent_warp_specialize(
             B_COL_MAJOR=B_col_major,
             DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
             SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
+            SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
