@@ -24,6 +24,26 @@ jobs:
           sudo nvidia-smi -pm 1
           sudo ldconfig
           nvidia-smi
+      - name: Compile Triton
+        run: |
+          . "${SETUP_SCRIPT}"
+          . /workspace/tritonbench/.ci/triton/triton_install_utils.sh
+          install_triton $PWD
+          set -x
+          TRITONBENCH_TRITON_COMMIT_HASH=$(git rev-parse --verify HEAD)
+          TRITONBENCH_TRITON_REPO=$(git config --get remote.origin.url | sed -E 's|.*github.com[:/](.+)\.git|\1|')
+          TRITONBENCH_TRITON_COMMIT=${GITHUB_REF_NAME}
+          TRITONBENCH_INSTALL_DIR=${PWD}
+          # If the current conda env matches the env we just created
+          # then export all Triton related envs to shell env
+          cat <<EOF >> "${SETUP_SCRIPT}"
+          if [ \${CONDA_ENV} == "${CONDA_ENV}" ] ; then
+              export TRITONBENCH_TRITON_COMMIT_HASH="${TRITONBENCH_TRITON_COMMIT_HASH}"
+              export TRITONBENCH_TRITON_REPO="${TRITONBENCH_TRITON_REPO}"
+              export TRITONBENCH_TRITON_COMMIT="${TRITONBENCH_TRITON_COMMIT}"
+              export TRITONBENCH_TRITON_INSTALL_DIR="${TRITONBENCH_INSTALL_DIR}"
+          fi
+          EOF
       - name: Run TritonBench tests on H100 GPU
         working-directory: /workspace/tritonbench
         run: |
