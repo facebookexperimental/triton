@@ -75,6 +75,11 @@ struct EquivalenceResult {
     int64_t identityVal; // 0 for addi/subi, 1 for muli
   };
   SmallVector<IdentityOp> identityOps;
+
+  /// The actual operations in the template chain that are identity-inserted
+  /// (no counterpart in the other chain). Used by groupByContiguousTaskSet
+  /// to align segments.
+  DenseSet<Operation *> identityOpSet;
 };
 
 /// Return true if `op` is an integer address computation op that can act as
@@ -186,6 +191,7 @@ checkStructuralEquivalence(ArrayRef<Operation *> chain0,
 
         int64_t identityVal = getIdentityValue(tOp);
         result.identityOps.push_back({varying, identityVal});
+        result.identityOpSet.insert(tOp);
         ti++;
         skipped = true;
         break;
@@ -211,6 +217,7 @@ checkStructuralEquivalence(ArrayRef<Operation *> chain0,
       otherVal = passThrough;
     valueMap[tOp->getResult(0)] = otherVal;
     result.identityOps.push_back({varying, getIdentityValue(tOp)});
+    result.identityOpSet.insert(tOp);
     ti++;
   }
 
@@ -317,6 +324,56 @@ groupByContiguousTaskSet(ArrayRef<Operation *> chain0,
   return segments;
 }
 
+/// Group chains by contiguous async task set when the chains have different
+/// lengths (due to identity-compatible ops). Uses the template chain from the
+/// equivalence result for task set boundaries. Identity ops (present only in
+/// the template chain) are placed in both ops0 and ops1 of their segment.
+static std::optional<SmallVector<ChainSegment>>
+groupByContiguousTaskSetWithIdentity(ArrayRef<Operation *> chain0,
+                                     ArrayRef<Operation *> chain1,
+                                     const EquivalenceResult &equiv) {
+  ArrayRef<Operation *> tplChain =
+      (equiv.templateChainIdx == 0) ? chain0 : chain1;
+  ArrayRef<Operation *> otherChain =
+      (equiv.templateChainIdx == 0) ? chain1 : chain0;
+
+  if (tplChain.empty())
+    return std::nullopt;
+
+  // Two-pointer alignment: walk the template chain and pair with the other
+  // chain, skipping identity ops.
+  SmallVector<ChainSegment> segments;
+  unsigned oi = 0;
+  for (size_t ti = 0; ti < tplChain.size(); ++ti) {
+    auto taskIds = getOpAsyncTaskIds(tplChain[ti]);
+
+    if (taskIds.empty() && !segments.empty()) {
+      // Ops without task IDs join the current segment.
+    } else if (segments.empty() || segments.back().taskIds != taskIds) {
+      segments.push_back({{}, {}, taskIds});
+    }
+
+    bool isIdentity = equiv.identityOpSet.count(tplChain[ti]);
+
+    if (isIdentity) {
+      // Identity op only exists in template chain. Place it in both slots
+      // so the segment has the op for cloning.
+      segments.back().ops0.push_back(tplChain[ti]);
+      segments.back().ops1.push_back(tplChain[ti]);
+    } else {
+      assert(oi < otherChain.size());
+      Operation *op0 =
+          (equiv.templateChainIdx == 0) ? tplChain[ti] : otherChain[oi];
+      Operation *op1 =
+          (equiv.templateChainIdx == 0) ? otherChain[oi] : tplChain[ti];
+      segments.back().ops0.push_back(op0);
+      segments.back().ops1.push_back(op1);
+      ++oi;
+    }
+  }
+  return segments;
+}
+
 /// Build a single SubtiledRegionOp.
 static void buildSingleSubtiledRegion(OpBuilder &builder, Location loc,
                                       ArrayRef<Operation *> setupOps, Value lhs,
@@ -368,8 +425,8 @@ static void buildSingleSubtiledRegion(OpBuilder &builder, Location loc,
 
   auto regionOp = SubtiledRegionOp::create(
       builder, loc, /*resultTypes=*/TypeRange{},
-      /*barriers=*/ValueRange{}, /*barrierPhases=*/ValueRange{},
-      tileMappingsAttr, barrierAnnotationsAttr);
+      /*barriers=*/ValueRange{}, /*accumCnts=*/ValueRange{}, tileMappingsAttr,
+      barrierAnnotationsAttr);
 
   // --- Setup Region ---
   Block *setupBlock = &regionOp.getSetupRegion().emplaceBlock();
@@ -527,7 +584,9 @@ static void buildMultiTaskSubtiledRegions(OpBuilder &outerBuilder, Location loc,
       }
 
       for (auto &[v0, v1] : seen) {
-        auto tensorTy = cast<RankedTensorType>(v0.getType());
+        auto tensorTy = dyn_cast<RankedTensorType>(v0.getType());
+        if (!tensorTy)
+          continue; // skip tokens, scalars — only buffer tensors
         auto memDescType = createBufferMemDescType(ctx, tensorTy);
         auto e0 =
             gpu::LocalAllocOp::create(outerBuilder, loc, memDescType, Value{});
@@ -755,64 +814,54 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
     setupOps.push_back(&*it);
   setupOps.push_back(splitOp);
 
-  // Position the SubtiledRegionOp after all values it references from outer
-  // scope. The differing operands and identity varying operands may be defined
-  // after the tmem_load/split chain, so the insertion point must be after the
-  // last such definition.
+  // Position the SubtiledRegionOps after all chain ops and their external
+  // operands. The SubtiledRegionOps replace the entire chain, so they must
+  // come after the last chain op in program order.
   Operation *insertBefore = nullptr;
   {
     Operation *latest = splitOp;
-    auto updateLatest = [&](Value v) {
-      if (auto defOp = v.getDefiningOp())
-        if (defOp->getBlock() == block && latest->isBeforeInBlock(defOp))
-          latest = defOp;
+    auto updateLatest = [&](Operation *op) {
+      if (op && op->getBlock() == block && latest->isBeforeInBlock(op))
+        latest = op;
     };
-    for (auto &[v0, v1] : differing->differingOperands) {
-      updateLatest(v0);
-      updateLatest(v1);
-    }
-    for (auto &id : differing->identityOps)
-      updateLatest(id.varyingOperand);
-    // Insert right after the latest referenced value.
+    for (auto *op : chain0)
+      updateLatest(op);
+    for (auto *op : chain1)
+      updateLatest(op);
     insertBefore = latest->getNextNode();
   }
   OpBuilder builder(insertBefore);
   Location loc = splitOp.getLoc();
 
-  if (hasIdentityInsertions) {
-    // With identity insertions, generate a single SubtiledRegionOp (the tile
-    // body includes the identity-compatible op from the longer chain).
+  // Group by contiguous async task set.
+  std::optional<SmallVector<ChainSegment>> segments;
+  if (hasIdentityInsertions)
+    segments = groupByContiguousTaskSetWithIdentity(chain0, chain1, *differing);
+  else
+    segments = groupByContiguousTaskSet(chain0, chain1);
+  if (!segments || segments->empty())
+    return;
+
+  if (segments->size() == 1) {
     buildSingleSubtiledRegion(builder, loc, setupOps, lhs, rhs, chain0, chain1,
                               *differing);
   } else {
-    // No identity insertions: chains are the same length.
-    // Group by contiguous async task set.
-    auto segments = groupByContiguousTaskSet(chain0, chain1);
-    if (!segments || segments->empty())
-      return;
+    // Multiple task sets: verify transitions are valid.
+    for (size_t i = 0; i + 1 < segments->size(); ++i) {
+      Operation *lastOp = (*segments)[i].ops0.back();
+      auto alloc = dyn_cast<gpu::LocalAllocOp>(lastOp);
 
-    if (segments->size() == 1) {
-      buildSingleSubtiledRegion(builder, loc, setupOps, lhs, rhs, chain0,
-                                chain1, *differing);
-    } else {
-      // Multiple task sets: verify transitions are valid.
-      for (size_t i = 0; i + 1 < segments->size(); ++i) {
-        Operation *lastOp = (*segments)[i].ops0.back();
-        auto alloc = dyn_cast<gpu::LocalAllocOp>(lastOp);
-
-        if (alloc && alloc.getSrc()) {
-          for (size_t j = 0; j + 1 < (*segments)[i].ops0.size(); ++j) {
-            for (Value operand : (*segments)[i].ops0[j]->getOperands()) {
-              if (operand == alloc.getResult())
-                return;
-            }
+      if (alloc && alloc.getSrc()) {
+        for (size_t j = 0; j + 1 < (*segments)[i].ops0.size(); ++j) {
+          for (Value operand : (*segments)[i].ops0[j]->getOperands()) {
+            if (operand == alloc.getResult())
+              return;
           }
         }
       }
-
-      buildMultiTaskSubtiledRegions(builder, loc, setupOps, lhs, rhs,
-                                    *segments);
     }
+
+    buildMultiTaskSubtiledRegions(builder, loc, setupOps, lhs, rhs, *segments);
   }
 
   // Erase original ops (reverse program order).

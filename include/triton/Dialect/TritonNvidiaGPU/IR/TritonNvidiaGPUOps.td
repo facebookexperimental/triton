@@ -1156,7 +1156,7 @@ def TTNG_SubtiledRegionOp : TTNG_Op<"subtiled_region", [
 
   let arguments = (ins
     Variadic<TTG_MemDescType>:$barriers,
-    Variadic<I32>:$barrierPhases,
+    Variadic<I64>:$accumCnts,
     ArrayAttr:$tileMappings,
     ArrayAttr:$barrierAnnotations
   );
