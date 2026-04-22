@@ -1,7 +1,28 @@
 from contextlib import contextmanager
 import os
+import warnings
 import triton
 import functools
+
+
+_tileir_info_msg = """
+The Triton-TileIR backend is an experimental feature and is not supported for production use.
+If you would like to use this for benchmarking/investigation purposes, please set
+TRITON_TILEIRAS_PATH to the path of the tileiras binary. This can be found in the
+Cuda 13.1 toolkit under bin and is available by default on most devservers.
+
+If you find substantial performance results when benchmarking please report your results
+to the Triton team.
+"""
+
+_tileir_enabled_msg = """
+The Triton-TileIR backend is enabled. This is an experimental feature and is
+not supported for production use.
+
+If you are using this solely for benchmarking purposes you can ignore this message.
+If you find substantial performance results when benchmarking please report your results
+to the Triton team.
+"""
 
 
 class TileIREnvConf:
@@ -30,6 +51,7 @@ class TileIREnvConf:
     def get_tileiras_path():
         env_path = os.getenv("TRITON_TILEIRAS_PATH")
         if env_path:
+            warnings.warn(_tileir_enabled_msg)
             return os.path.join(env_path, "tileiras")
         cuda_home = os.getenv("CUDA_HOME")
         if cuda_home:
@@ -39,11 +61,20 @@ class TileIREnvConf:
                 version_output = subprocess.check_output([path, "--version"], encoding="utf-8",
                                                          stderr=subprocess.STDOUT)
                 if "release 13.1" in version_output:
+                    warnings.warn(_tileir_enabled_msg)
                     return path
         from shutil import which
         tileiras_path = which("tileiras")
         if tileiras_path:
+            warnings.warn(_tileir_enabled_msg)
             return tileiras_path
+        # TODO: FIXME HACK: FBCODE FALLBACK.
+        # Buck does not always propagate environment variables to subprocesses,
+        # so fall back to a well-known devserver path when no tileiras is found.
+        from triton.runtime.fbcode_gating import is_fbcode_dependant
+        if is_fbcode_dependant():
+            warnings.warn(_tileir_info_msg)
+            return "/usr/local/cuda/bin/tileiras"
         return None
 
     # todo: DKG CI related, need to be removed
