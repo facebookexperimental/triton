@@ -1198,7 +1198,7 @@ class TritonSemantic(Generic[TensorTy]):
 
     def _has_native_tma(self, ):
         target = driver.active.get_current_target()
-        return target.backend == "cuda" and target.arch >= 90
+        return target.is_cuda_backend() and target.arch >= 90
 
     def _descriptor_atomic_min_max_supported(self, dtype):
         assert dtype in {tl.uint32, tl.int32, tl.uint64, tl.int64, tl.float16, tl.bfloat16}, "Unsupported dtype"

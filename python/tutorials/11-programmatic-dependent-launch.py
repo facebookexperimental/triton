@@ -16,7 +16,7 @@ import triton.language as tl
 
 
 def is_cuda():
-    return triton.runtime.driver.active.get_current_target().backend == "cuda"
+    return triton.runtime.driver.active.get_current_target().is_cuda_backend()
 
 
 def supports_pdl():
