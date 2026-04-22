@@ -760,7 +760,8 @@ static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance,
   auto context = funcOp.getContext();
   if (!srcName.empty())
     loc = NameLoc::get(StringAttr::get(context, srcName), loc);
-  auto barrierCGALayout = ttg::CGAEncodingAttr::getDefault(context, 1);
+  auto barrierCGALayout = ttg::CGAEncodingAttr::get1DLayout(
+      context, triton::gpu::lookupNumCTAs(funcOp));
   auto barrierEncoding = ttg::SwizzledSharedEncodingAttr::get(
       context, 1, 1, 1, {0}, barrierCGALayout);
   ttg::MemDescType barrierMemDescType = ttg::MemDescType::get(
