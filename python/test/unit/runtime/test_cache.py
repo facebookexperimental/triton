@@ -233,7 +233,7 @@ def test_annotation(device):
     kernel[(1, )](x, 8)
     kernel[(1, )](x, 16)
     kernel[(1, )](x, 17)
-    assert len(kernel.device_caches[device][0]) == 3
+    assert len(kernel.device_caches[(device, None)][0]) == 3
 
 
 GLOBAL_DEFAULT_ARG = 1
@@ -257,7 +257,7 @@ def test_kernel_default_arg(device):
     assert x == torch.ones_like(x)
 
     device = getattr(torch, device).current_device()
-    assert len(kernel.device_caches[device][0]) == 1
+    assert len(kernel.device_caches[(device, None)][0]) == 1
 
 
 GLOBAL_VAR = tl.constexpr(1)
@@ -469,13 +469,13 @@ def test_jit_warmup_cache(device) -> None:
         32,
     ]
     device = getattr(torch, device).current_device()
-    assert len(kernel_add.device_caches[device][0]) == 0
+    assert len(kernel_add.device_caches[(device, None)][0]) == 0
     kernel_add.warmup(torch.float32, torch.float32, torch.float32, 32, grid=(1, ))
-    assert len(kernel_add.device_caches[device][0]) == 1
+    assert len(kernel_add.device_caches[(device, None)][0]) == 1
     kernel_add.warmup(*args, grid=(1, ))
-    assert len(kernel_add.device_caches[device][0]) == 1
+    assert len(kernel_add.device_caches[(device, None)][0]) == 1
     kernel_add.warmup(*args, grid=(1, ))
-    assert len(kernel_add.device_caches[device][0]) == 1
+    assert len(kernel_add.device_caches[(device, None)][0]) == 1
 
 
 def test_jit_debug(device) -> None:
@@ -486,12 +486,12 @@ def test_jit_debug(device) -> None:
 
     device = getattr(torch, device).current_device()
     tmp = torch.tensor([1], dtype=torch.int32, device=device)
-    assert len(kernel.device_caches[device][0]) == 0
+    assert len(kernel.device_caches[(device, None)][0]) == 0
     kernel[(1, )](tmp, debug=False)
-    assert len(kernel.device_caches[device][0]) == 1
+    assert len(kernel.device_caches[(device, None)][0]) == 1
     kernel[(1, )](tmp, debug=True)
-    assert len(kernel.device_caches[device][0]) == 2
-    bins = list(kernel.device_caches[device][0].values())
+    assert len(kernel.device_caches[(device, None)][0]) == 2
+    bins = list(kernel.device_caches[(device, None)][0].values())
     assert bins[0].asm['ttir'] != bins[1].asm['ttir']
 
 
@@ -508,18 +508,18 @@ def test_jit_noinline(device) -> None:
         add_fn(a, b, o, N)
 
     device = getattr(torch, device).current_device()
-    assert len(kernel_add_device.device_caches[device][0]) == 0
+    assert len(kernel_add_device.device_caches[(device, None)][0]) == 0
     kernel_add_device.warmup(torch.float32, torch.float32, torch.float32, 32, grid=(1, ))
-    assert len(kernel_add_device.device_caches[device][0]) == 1
-    bins = list(kernel_add_device.device_caches[device][0].values())
+    assert len(kernel_add_device.device_caches[(device, None)][0]) == 1
+    bins = list(kernel_add_device.device_caches[(device, None)][0].values())
     inline_ttir = bins[0].asm['ttir']
     add_fn.noinline = True
     add_fn.hash = None
     kernel_add_device.hash = None
-    kernel_add_device.device_caches[device][0].clear()
+    kernel_add_device.device_caches[(device, None)][0].clear()
     kernel_add_device.warmup(torch.float32, torch.float32, torch.float32, 32, grid=(1, ))
-    assert len(kernel_add_device.device_caches[device][0]) == 1
-    bins = list(kernel_add_device.device_caches[device][0].values())
+    assert len(kernel_add_device.device_caches[(device, None)][0]) == 1
+    bins = list(kernel_add_device.device_caches[(device, None)][0].values())
     noinline_ttir = bins[0].asm['ttir']
     assert inline_ttir != noinline_ttir
 
@@ -554,12 +554,12 @@ def test_preload(device, fresh_triton_cache) -> None:
 
     # clear the cache
     shutil.rmtree(fresh_triton_cache)
-    kernel_add.device_caches[device][0].clear()
+    kernel_add.device_caches[(device, None)][0].clear()
 
     # preload the kernel
     kernel_preload = kernel_add.preload(specialization_data)
     assert kernel_preload.hash == hash
-    assert len(kernel_add.device_caches[device][0]) == 1
+    assert len(kernel_add.device_caches[(device, None)][0]) == 1
 
     # we should hit the cache and not compile anything
     counter = 0
@@ -571,7 +571,7 @@ def test_preload(device, fresh_triton_cache) -> None:
     triton.knobs.runtime.jit_cache_hook = inc_counter
     final_kernel = kernel_add.warmup(torch.float32, torch.float32, torch.float32, 32, tl.float32, grid=(1, ))
     assert counter == 0
-    assert len(kernel_add.device_caches[device][0]) == 1
+    assert len(kernel_add.device_caches[(device, None)][0]) == 1
     assert final_kernel.hash == hash
 
     # test that we can't preload a mismatched kernel
@@ -614,7 +614,7 @@ def test_hooks(device, fresh_triton_cache) -> None:
     kernel_add.warmup(torch.float32, torch.float32, torch.float32, 32, tl.float32, grid=(1, ))
     assert specialization_data is not None and specialization_data_compiled == specialization_data
     assert is_warmup is True
-    assert key in kernel_add.device_caches[getattr(torch, device).current_device()][0]
+    assert key in kernel_add.device_caches[(getattr(torch, device).current_device(), None)][0]
     assert name == "test_hooks.<locals>.kernel_add"
 
 
@@ -680,7 +680,7 @@ def test_function_arguments(device):
     kernel[(1, )](y[2], func3, (3, ))
     kernel[(1, )](y[3], func4, (3, 4))
     kernel[(1, )](y[4], func1, tuple())
-    assert len(kernel.device_caches[0][0]) == 4
+    assert len(kernel.device_caches[(0, None)][0]) == 4
     assert y.tolist() == [1, 2, 3, 7, 1]
 
 
@@ -735,18 +735,18 @@ def test_async_compile_mock(device, fresh_triton_cache):
         kernel.warmup(b, 1, grid=(1, ))
 
         # Nothing has actually compiled yet
-        assert len(kernel.device_caches[0][0]) == 0
+        assert len(kernel.device_caches[(0, None)][0]) == 0
         assert len(pool.work_queue) == 4
 
         # Duplicates are only submitted once
         kernel.warmup(a, 0, grid=(1, ))
         kernel.warmup(a, 1, grid=(1, ))
-        assert len(kernel.device_caches[0][0]) == 0
+        assert len(kernel.device_caches[(0, None)][0]) == 0
         assert len(pool.work_queue) == 4
 
         pool.run_one()
         kernel[(1, )](a, 0)
-        assert len(kernel.device_caches[0][0]) == 1
+        assert len(kernel.device_caches[(0, None)][0]) == 1
         assert a[0, 0] == 0.0
 
         pool.run_all()
@@ -769,7 +769,7 @@ def test_async_compile(device, fresh_triton_cache):
         kernel.warmup(b, 0, grid=(1, ))
         kernel.warmup(b, 1, grid=(1, ))
 
-        assert len(kernel.device_caches[0][0]) == 0
+        assert len(kernel.device_caches[(0, None)][0]) == 0
 
         kernel[(1, )](b, 1)
         assert b[0, 0] == 1

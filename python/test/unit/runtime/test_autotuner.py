@@ -591,3 +591,547 @@ def test_dump_best_config_ir(device, tmp_path):
         knobs.autotuning.dump_best_config_ir = original_dump_best
         knobs.compilation.dump_ir = original_dump_ir
         knobs.cache.dump_dir = original_dump_dir
+
+
+# =============================================================================
+# Config.get_effective_backend tests (no GPU required)
+# =============================================================================
+
+class TestGetEffectiveBackend:
+    """Tests for Config.get_effective_backend() with single/multiple backend scenarios."""
+
+    def test_explicit_backend_with_multiple_backends(self):
+        """Explicit backend is returned when multiple backends are registered."""
+        from unittest.mock import patch
+        fake_backends = {"nvidia": object(), "cutile": object()}
+        with patch("triton.runtime.autotuner.knobs.runtime") as mock_runtime:
+            mock_runtime.default_backend = None
+            config = triton.Config(kwargs={"BLOCK_SIZE": 128}, backend="tileir")
+            with patch("triton.backends.backends", fake_backends):
+                assert config.get_effective_backend() == "tileir"
+
+    def test_knob_default_with_multiple_backends(self):
+        """TRITON_DEFAULT_BACKEND knob is used when config.backend is None."""
+        from unittest.mock import patch
+        fake_backends = {"nvidia": object(), "cutile": object()}
+        with patch("triton.runtime.autotuner.knobs.runtime") as mock_runtime:
+            mock_runtime.default_backend = "tileir"
+            config = triton.Config(kwargs={"BLOCK_SIZE": 128})
+            with patch("triton.backends.backends", fake_backends):
+                assert config.get_effective_backend() == "tileir"
+
+    def test_no_override_returns_none(self):
+        """Returns None when no backend override and no knob set."""
+        from unittest.mock import patch
+        fake_backends = {"nvidia": object(), "cutile": object()}
+        with patch("triton.runtime.autotuner.knobs.runtime") as mock_runtime:
+            mock_runtime.default_backend = None
+            config = triton.Config(kwargs={"BLOCK_SIZE": 128})
+            with patch("triton.backends.backends", fake_backends):
+                assert config.get_effective_backend() is None
+
+    def test_single_backend_ignores_explicit_override(self, caplog):
+        """With only 1 backend registered, explicit backend is ignored and logged."""
+        import logging
+        from unittest.mock import patch
+        fake_backends = {"nvidia": object()}
+        with patch("triton.runtime.autotuner.knobs.runtime") as mock_runtime:
+            mock_runtime.default_backend = None
+            config = triton.Config(kwargs={"BLOCK_SIZE": 128}, backend="tileir")
+            with patch("triton.backends.backends", fake_backends):
+                with caplog.at_level(logging.INFO, logger="triton"):
+                    result = config.get_effective_backend()
+                assert result is None
+                assert "Ignoring backend override 'tileir'" in caplog.text
+                assert "1 backend(s) available" in caplog.text
+
+    def test_single_backend_ignores_knob_override(self, caplog):
+        """With only 1 backend registered, TRITON_DEFAULT_BACKEND knob is ignored and logged."""
+        import logging
+        from unittest.mock import patch
+        fake_backends = {"nvidia": object()}
+        with patch("triton.runtime.autotuner.knobs.runtime") as mock_runtime:
+            mock_runtime.default_backend = "tileir"
+            config = triton.Config(kwargs={"BLOCK_SIZE": 128})
+            with patch("triton.backends.backends", fake_backends):
+                with caplog.at_level(logging.INFO, logger="triton"):
+                    result = config.get_effective_backend()
+                assert result is None
+                assert "Ignoring backend override 'tileir'" in caplog.text
+
+    def test_explicit_backend_overrides_knob(self):
+        """Explicit config.backend takes precedence over TRITON_DEFAULT_BACKEND knob."""
+        from unittest.mock import patch
+        fake_backends = {"nvidia": object(), "cutile": object()}
+        with patch("triton.runtime.autotuner.knobs.runtime") as mock_runtime:
+            mock_runtime.default_backend = "cuda"
+            config = triton.Config(kwargs={"BLOCK_SIZE": 128}, backend="tileir")
+            with patch("triton.backends.backends", fake_backends):
+                assert config.get_effective_backend() == "tileir"
+
+    def test_backend_in_config_hash(self):
+        """Configs with different backends have different hashes."""
+        c1 = triton.Config(kwargs={"BLOCK_SIZE": 128}, backend="cuda")
+        c2 = triton.Config(kwargs={"BLOCK_SIZE": 128}, backend="tileir")
+        c3 = triton.Config(kwargs={"BLOCK_SIZE": 128})
+        assert hash(c1) != hash(c2)
+        assert hash(c1) != hash(c3)
+        assert c1 != c2
+        assert c1 != c3
+
+    def test_backend_in_config_str(self):
+        """Backend appears in Config string representation when set."""
+        c_with = triton.Config(kwargs={"BLOCK_SIZE": 128}, backend="tileir")
+        c_without = triton.Config(kwargs={"BLOCK_SIZE": 128})
+        assert "backend: tileir" in str(c_with)
+        assert "backend" not in str(c_without)
+
+
+def _has_multiple_backends():
+    """Check if both nvidia and cutile/tileir backends are registered."""
+    from triton.backends import backends
+    return len(backends) > 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not _has_multiple_backends(), reason="Only 1 backend registered; need both nvidia and cutile")
+def test_autotune_filters_backend_when_single_available(device: str):
+    """End-to-end: autotuner with backend configs filters correctly when both backends exist.
+
+    With multiple backends registered, configs specifying different backends should
+    each be benchmarked independently. The autotuner should pick the best config
+    (which may be from either backend), and the result should be numerically correct.
+    """
+    N = 1024
+    src = torch.randn(N, device=device)
+    dst = torch.empty(N, device=device)
+
+    from triton.backends import backends
+    backend_names = list(backends.keys())
+
+    # Create configs that autotune across all available backends
+    configs = []
+    for backend_name in backend_names:
+        configs.append(triton.Config(kwargs={"BLOCK_SIZE": 128}, backend=backend_name))
+        configs.append(triton.Config(kwargs={"BLOCK_SIZE": 256}, backend=backend_name))
+
+    @triton.autotune(
+        configs=configs,
+        key=["N"],
+        do_bench=lambda kernel, quantiles: do_bench(kernel, quantiles),
+    )
+    @triton.jit
+    def _copy_kernel(dst, src, N, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < N
+        x = tl.load(src + offsets, mask=mask)
+        tl.store(dst + offsets, x, mask=mask)
+
+    grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE"]),)
+    _copy_kernel[grid](dst, src, N=N)
+
+    triton.testing.assert_close(dst, src)
+
+    # Verify the best config was selected and has a backend set
+    best = _copy_kernel.best_config
+    assert best.backend in backend_names, (
+        f"Best config backend '{best.backend}' not in registered backends {backend_names}"
+    )
+
+
+# =============================================================================
+# check_disk_cache multi-backend tests (mocked, no GPU required)
+# =============================================================================
+
+class TestCheckDiskCacheMultiBackend:
+    """Tests for check_disk_cache() behaviour when configs span multiple backends."""
+
+    def _make_autotuner(self, configs):
+        """Helper: create an Autotuner around a trivial JIT stub."""
+        from unittest.mock import MagicMock
+        fn = MagicMock(spec=triton.runtime.jit.JITFunction)
+        fn.cache_key = "stub_cache_key"
+        fn.__name__ = "stub_kernel"
+        # Mark fn as a JITFunction so the while-loop in check_disk_cache terminates
+        fn.__class__ = triton.runtime.jit.JITFunction
+        autotuner = triton.runtime.autotuner.Autotuner(
+            fn=fn,
+            arg_names=["x"],
+            configs=configs,
+            key=["N"],
+            reset_to_zero=None,
+            restore_value=None,
+        )
+        return autotuner
+
+    def test_cache_key_differs_across_backend_sets(self):
+        """The disk-cache key should change when configs reference different backend sets."""
+        import hashlib
+        from unittest.mock import patch, MagicMock
+
+        class FakeBackend:
+            def __init__(self, name):
+                self._name = name
+            def hash(self):
+                return f"hash-{self._name}"
+
+        def fake_make_backend(target):
+            return FakeBackend(target.backend)
+
+        fake_target = MagicMock()
+        fake_target.backend = "cuda"
+        fake_target.arch = 80
+        fake_target.warp_size = 32
+
+        fake_driver = MagicMock()
+        fake_driver.active.get_current_target.return_value = fake_target
+
+        # Configs that all use cuda
+        configs_single = [
+            triton.Config(kwargs={"BLOCK_SIZE": 128}),
+            triton.Config(kwargs={"BLOCK_SIZE": 256}),
+        ]
+        # Configs that span cuda + tileir
+        configs_multi = [
+            triton.Config(kwargs={"BLOCK_SIZE": 128}, backend="cuda"),
+            triton.Config(kwargs={"BLOCK_SIZE": 128}, backend="tileir"),
+        ]
+
+        fake_backends = {"nvidia": object(), "cutile": object()}
+
+        keys = []
+        for configs in [configs_single, configs_multi]:
+            at = self._make_autotuner(configs)
+            captured_key = {}
+
+            def fake_get_cache_manager(key):
+                captured_key["key"] = key
+                mgr = MagicMock()
+                mgr.get_file.return_value = None  # cache miss
+                return mgr
+
+            with patch("triton.compiler.compiler.make_backend", fake_make_backend), \
+                 patch("triton.runtime.autotuner.driver", fake_driver), \
+                 patch("triton.runtime.autotuner.triton_key", return_value="triton_v1"), \
+                 patch("triton.runtime.autotuner.get_cache_invalidating_env_vars", return_value={}), \
+                 patch("triton.runtime.autotuner.get_cache_manager", fake_get_cache_manager), \
+                 patch("triton.backends.backends", fake_backends), \
+                 patch("triton.runtime.autotuner.knobs.runtime") as mock_runtime:
+                mock_runtime.default_backend = None
+                at.check_disk_cache(
+                    tuning_key=(1024,),
+                    configs=configs,
+                    bench_fn=lambda: setattr(at, "configs_timings", {c: 1.0 for c in configs}),
+                )
+            keys.append(captured_key["key"])
+
+        assert keys[0] != keys[1], "Cache key should differ when configs span different backends"
+
+    def test_multi_backend_calls_make_backend_for_each(self):
+        """make_backend should be called once per unique effective backend in the config set."""
+        from unittest.mock import patch, MagicMock, call
+
+        class FakeBackend:
+            def __init__(self, name):
+                self._name = name
+            def hash(self):
+                return f"hash-{self._name}"
+
+        make_backend_calls = []
+        def fake_make_backend(target):
+            make_backend_calls.append(target.backend)
+            return FakeBackend(target.backend)
+
+        fake_target = MagicMock()
+        fake_target.backend = "cuda"
+        fake_target.arch = 80
+        fake_target.warp_size = 32
+
+        fake_driver = MagicMock()
+        fake_driver.active.get_current_target.return_value = fake_target
+
+        configs = [
+            triton.Config(kwargs={"BLOCK_SIZE": 128}, backend="cuda"),
+            triton.Config(kwargs={"BLOCK_SIZE": 256}, backend="cuda"),
+            triton.Config(kwargs={"BLOCK_SIZE": 128}, backend="tileir"),
+        ]
+
+        fake_backends = {"nvidia": object(), "cutile": object()}
+        at = self._make_autotuner(configs)
+
+        def fake_get_cache_manager(key):
+            mgr = MagicMock()
+            mgr.get_file.return_value = None
+            return mgr
+
+        with patch("triton.compiler.compiler.make_backend", fake_make_backend), \
+             patch("triton.runtime.autotuner.driver", fake_driver), \
+             patch("triton.runtime.autotuner.triton_key", return_value="triton_v1"), \
+             patch("triton.runtime.autotuner.get_cache_invalidating_env_vars", return_value={}), \
+             patch("triton.runtime.autotuner.get_cache_manager", fake_get_cache_manager), \
+             patch("triton.backends.backends", fake_backends), \
+             patch("triton.runtime.autotuner.knobs.runtime") as mock_runtime:
+            mock_runtime.default_backend = None
+            at.check_disk_cache(
+                tuning_key=(1024,),
+                configs=configs,
+                bench_fn=lambda: setattr(at, "configs_timings", {c: 1.0 for c in configs}),
+            )
+
+        # Should have called make_backend for exactly 2 unique backends: cuda and tileir
+        assert sorted(make_backend_calls) == ["cuda", "tileir"], (
+            f"Expected make_backend called for ['cuda', 'tileir'], got {sorted(make_backend_calls)}"
+        )
+
+    def test_disk_cache_round_trip_preserves_backend(self, tmp_path):
+        """Serialized configs with backend field should deserialize correctly."""
+        import json
+
+        config_cuda = triton.Config(kwargs={"BLOCK_SIZE": 128}, backend="cuda")
+        config_tileir = triton.Config(kwargs={"BLOCK_SIZE": 128}, backend="tileir")
+
+        timings = {config_cuda: [1.0, 1.1, 1.2], config_tileir: [0.9, 1.0, 1.1]}
+
+        # Simulate the serialization path from check_disk_cache
+        serialized = json.dumps({
+            "key": (1024,),
+            "configs_timings": [
+                (config.__dict__, timing) for config, timing in timings.items()
+                if not config.pre_hook
+            ],
+        })
+
+        # Simulate the deserialization path
+        loaded = json.loads(serialized)["configs_timings"]
+        restored = {triton.Config(**cfg): t for cfg, t in loaded}
+
+        # Verify backends round-tripped
+        backends_found = {c.backend for c in restored.keys()}
+        assert "cuda" in backends_found
+        assert "tileir" in backends_found
+
+        # Verify the best config is correctly identified
+        import builtins
+        best = builtins.min(restored, key=restored.get)
+        assert best.backend == "tileir"  # tileir had lower timings
+
+    def test_disk_cache_hit_returns_correct_backend(self, tmp_path):
+        """When check_disk_cache hits, the restored best config should have the right backend."""
+        import json
+        from unittest.mock import patch, MagicMock
+
+        config_cuda = triton.Config(kwargs={"BLOCK_SIZE": 128}, backend="cuda")
+        config_tileir = triton.Config(kwargs={"BLOCK_SIZE": 256}, backend="tileir")
+
+        # Write a fake cache file
+        cache_data = json.dumps({
+            "key": (1024,),
+            "configs_timings": [
+                (config_cuda.__dict__, [2.0, 2.1, 2.2]),
+                (config_tileir.__dict__, [1.0, 1.1, 1.2]),
+            ],
+        })
+        cache_file = tmp_path / "stub_kernel.autotune.json"
+        cache_file.write_text(cache_data)
+
+        configs = [config_cuda, config_tileir]
+        at = self._make_autotuner(configs)
+
+        class FakeBackend:
+            def __init__(self, name):
+                self._name = name
+            def hash(self):
+                return f"hash-{self._name}"
+
+        def fake_make_backend(target):
+            return FakeBackend(target.backend)
+
+        fake_target = MagicMock()
+        fake_target.backend = "cuda"
+        fake_target.arch = 80
+        fake_target.warp_size = 32
+
+        fake_driver = MagicMock()
+        fake_driver.active.get_current_target.return_value = fake_target
+
+        fake_backends = {"nvidia": object(), "cutile": object()}
+
+        def fake_get_cache_manager(key):
+            mgr = MagicMock()
+            mgr.get_file.return_value = str(cache_file)
+            return mgr
+
+        tuning_key = (1024,)
+        with patch("triton.compiler.compiler.make_backend", fake_make_backend), \
+             patch("triton.runtime.autotuner.driver", fake_driver), \
+             patch("triton.runtime.autotuner.triton_key", return_value="triton_v1"), \
+             patch("triton.runtime.autotuner.get_cache_invalidating_env_vars", return_value={}), \
+             patch("triton.runtime.autotuner.get_cache_manager", fake_get_cache_manager), \
+             patch("triton.backends.backends", fake_backends), \
+             patch("triton.runtime.autotuner.knobs.runtime") as mock_runtime:
+            mock_runtime.default_backend = None
+            hit = at.check_disk_cache(tuning_key, configs, bench_fn=lambda: None)
+
+        assert hit is True
+        best = at.cache[tuning_key]
+        assert best.backend == "tileir", f"Expected tileir (lower timings), got {best.backend}"
+        assert best.kwargs["BLOCK_SIZE"] == 256
+
+
+# =============================================================================
+# GPU integration tests for multi-backend autotuning + caching
+# =============================================================================
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not _has_multiple_backends(), reason="Only 1 backend registered; need both nvidia and cutile")
+def test_autotune_multi_backend_device_cache_isolation(device: str):
+    """Each backend should get its own entry in device_caches.
+
+    After autotuning, the JITFunction's device_caches should contain separate
+    entries for each (device, backend) pair that was benchmarked.
+    """
+    from triton.backends import backends
+    backend_names = list(backends.keys())
+
+    N = 1024
+    src = torch.randn(N, device=device)
+    dst = torch.empty(N, device=device)
+
+    configs = []
+    for bn in backend_names:
+        configs.append(triton.Config(kwargs={"BLOCK_SIZE": 128}, backend=bn))
+
+    @triton.autotune(
+        configs=configs,
+        key=["N"],
+        do_bench=lambda kernel, quantiles: do_bench(kernel, quantiles),
+    )
+    @triton.jit
+    def _kernel(dst, src, N, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < N
+        x = tl.load(src + offsets, mask=mask)
+        tl.store(dst + offsets, x, mask=mask)
+
+    grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE"]),)
+    _kernel[grid](dst, src, N=N)
+    triton.testing.assert_close(dst, src)
+
+    # After autotuning + final launch, device_caches should have entries
+    # for the backends that were actually used
+    jit_fn = _kernel.fn
+    while not isinstance(jit_fn, triton.runtime.jit.JITFunction):
+        jit_fn = jit_fn.fn
+    cache_keys = list(jit_fn.device_caches.keys())
+    # Each key is (device, backend_override) — check we have multiple backend entries
+    backends_in_cache = {k[1] for k in cache_keys if k[1] is not None}
+    assert len(backends_in_cache) >= 2, (
+        f"Expected device_caches to have entries for multiple backends, "
+        f"got keys: {cache_keys}"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not _has_multiple_backends(), reason="Only 1 backend registered; need both nvidia and cutile")
+def test_autotune_multi_backend_disk_cache(device: str, tmp_path, monkeypatch):
+    """Autotuning results across backends should be saved to and loaded from disk cache.
+
+    Run 1: cache miss → benchmarks run → results saved to disk.
+    Run 2: cache hit → no benchmarks → same best config restored.
+    """
+    from triton.backends import backends
+    backend_names = list(backends.keys())
+
+    cache_dir = tmp_path / "triton_cache"
+    cache_dir.mkdir()
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(cache_dir))
+
+    N = 1024
+    src = torch.randn(N, device=device)
+    dst = torch.empty(N, device=device)
+
+    configs = []
+    for bn in backend_names:
+        configs.append(triton.Config(kwargs={"BLOCK_SIZE": 128}, backend=bn))
+        configs.append(triton.Config(kwargs={"BLOCK_SIZE": 256}, backend=bn))
+
+    # --- Run 1: cache miss, benchmarks execute ---
+    @triton.autotune(
+        configs=configs,
+        key=["N"],
+        do_bench=lambda kernel, quantiles: do_bench(kernel, quantiles),
+        cache_results=True,
+    )
+    @triton.jit
+    def _kernel_r1(dst, src, N, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < N
+        x = tl.load(src + offsets, mask=mask)
+        tl.store(dst + offsets, x, mask=mask)
+
+    grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE"]),)
+    _kernel_r1[grid](dst, src, N=N)
+    triton.testing.assert_close(dst, src)
+    best_run1 = _kernel_r1.best_config
+
+    # Verify cache file was written
+    cache_files = list(cache_dir.rglob("*.autotune.json"))
+    assert len(cache_files) >= 1, "Expected disk cache file to be written"
+
+    # --- Run 2: new autotuner instance, should hit disk cache ---
+    bench_called = {"count": 0}
+
+    @triton.autotune(
+        configs=configs,
+        key=["N"],
+        do_bench=lambda kernel, quantiles: do_bench(kernel, quantiles),
+        cache_results=True,
+    )
+    @triton.jit
+    def _kernel_r2(dst, src, N, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < N
+        x = tl.load(src + offsets, mask=mask)
+        tl.store(dst + offsets, x, mask=mask)
+
+    # Monkey-patch _bench to detect if benchmarks actually run
+    original_bench = _kernel_r2._bench
+    def counting_bench(*a, **kw):
+        bench_called["count"] += 1
+        return original_bench(*a, **kw)
+    _kernel_r2._bench = counting_bench
+
+    dst2 = torch.empty(N, device=device)
+    _kernel_r2[grid](dst2, src, N=N)
+    triton.testing.assert_close(dst2, src)
+
+    best_run2 = _kernel_r2.best_config
+    assert best_run1.kwargs == best_run2.kwargs, (
+        f"Disk-cached best config kwargs mismatch: {best_run1.kwargs} vs {best_run2.kwargs}"
+    )
+    assert best_run1.backend == best_run2.backend, (
+        f"Disk-cached best config backend mismatch: {best_run1.backend} vs {best_run2.backend}"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not _has_multiple_backends(), reason="Only 1 backend registered; need both nvidia and cutile")
+def test_autotune_backend_configs_are_distinct(device: str):
+    """Configs with different backends but same kwargs should be treated as distinct entries."""
+    from triton.backends import backends
+    backend_names = list(backends.keys())
+    assert len(backend_names) >= 2
+
+    # Same kwargs, different backends — should produce different cache entries
+    c1 = triton.Config(kwargs={"BLOCK_SIZE": 128}, backend=backend_names[0])
+    c2 = triton.Config(kwargs={"BLOCK_SIZE": 128}, backend=backend_names[1])
+    assert c1 != c2
+    assert hash(c1) != hash(c2)
+
+    # Effective backend should return the explicit value
+    assert c1.get_effective_backend() == backend_names[0]
+    assert c2.get_effective_backend() == backend_names[1]

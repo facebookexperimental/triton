@@ -151,6 +151,8 @@ class Autotuner(KernelInterface):
         # augment meta-parameters with tunable ones
         current = dict(meta, **config.all_kwargs())
         full_nargs = {**self.nargs, **current}
+        # Resolve the effective backend for this config
+        effective_backend = config.get_effective_backend()
 
         def kernel_call():
             if config.pre_hook:
@@ -160,6 +162,7 @@ class Autotuner(KernelInterface):
                 self.fn.run(
                     *args,
                     **current,
+                    _backend_override=effective_backend,
                 )
             except Exception as e:
                 try:
@@ -184,15 +187,31 @@ class Autotuner(KernelInterface):
             return False
 
         from triton.compiler.compiler import make_backend
+        from ..backends.compiler import GPUTarget
 
         fn = self.fn
         while not isinstance(fn, JITFunction):
             fn = fn.fn
 
+        # Collect backend hashes for all backends referenced by configs.
+        # When autotuning across multiple backends, the disk cache key must
+        # reflect all of them so that results are invalidated when any
+        # backend's compiler changes.
+        target = driver.active.get_current_target()
+        effective_backends = {c.get_effective_backend() for c in configs}
+        backend_hashes = []
+        for eb in sorted(effective_backends, key=lambda x: (x is None, x)):
+            if eb is not None:
+                t = GPUTarget(eb, target.arch, target.warp_size)
+            else:
+                t = target
+            backend_hashes.append(make_backend(t).hash())
+        backend_hash = "+".join(backend_hashes)
+
         env_vars = get_cache_invalidating_env_vars()
         cache_key = [
             triton_key(),
-            make_backend(driver.active.get_current_target()).hash(),
+            backend_hash,
             fn.cache_key,
             str(sorted(env_vars.items())),
             str(tuning_key),
@@ -297,6 +316,7 @@ class Autotuner(KernelInterface):
                 *args,
                 **kwargs,
                 **config.all_kwargs(),
+                _backend_override=config.get_effective_backend(),
             )
         finally:
             if dump_best:
@@ -374,6 +394,9 @@ class Config:
         required, this is a hint: the driver may use a smaller cluster if resources are constrained.
         Maps to CU_LAUNCH_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION. The per dim grid size must be divisible by this per dim cluster size.
     :type preferred_ctas_per_cga: tuple[int, int, int]
+    :ivar backend: the backend to use for compilation (e.g. "cuda", "tileir"). If None, uses the
+                   TRITON_DEFAULT_BACKEND knob, or falls back to the driver's default target.
+    :type backend: Optional[str]
     """
 
     def __init__(
@@ -395,6 +418,7 @@ class Config:
         ctas_per_cga=None,
         early_tma_store_lowering=None,
         preferred_ctas_per_cga=None,
+        backend=None,
     ):
         self.kwargs = kwargs
         self.num_warps = num_warps
@@ -409,6 +433,27 @@ class Config:
         self.ctas_per_cga = ctas_per_cga
         self.early_tma_store_lowering = early_tma_store_lowering
         self.preferred_ctas_per_cga = preferred_ctas_per_cga
+        self.backend = backend
+
+    def get_effective_backend(self):
+        """Resolve the backend to use: explicit config > TRITON_DEFAULT_BACKEND knob > None (driver default).
+
+        If only one backend is registered, the override is ignored with a log message.
+        """
+        from ..backends import backends as registered_backends
+
+        effective = self.backend if self.backend is not None else knobs.runtime.default_backend
+        if effective is not None and len(registered_backends) <= 1:
+            import logging
+            logger = logging.getLogger("triton")
+            logger.info(
+                "Ignoring backend override '%s' because only %d backend(s) available: %s",
+                effective,
+                len(registered_backends),
+                list(registered_backends.keys()),
+            )
+            return None
+        return effective
 
     def __setstate__(self, state):
         self.kwargs = state.get("kwargs", {})
@@ -424,6 +469,7 @@ class Config:
         self.ctas_per_cga = state.get("ctas_per_cga", None)
         self.early_tma_store_lowering = state.get("early_tma_store_lowering", None)
         self.preferred_ctas_per_cga = state.get("preferred_ctas_per_cga", None)
+        self.backend = state.get("backend", None)
 
     def all_kwargs(self):
         return {
@@ -460,19 +506,23 @@ class Config:
         res.append(f"ctas_per_cga: {self.ctas_per_cga}")
         res.append(f"early_tma_store_lowering: {self.early_tma_store_lowering}")
         res.append(f"preferred_ctas_per_cga: {self.preferred_ctas_per_cga}")
+        if self.backend is not None:
+            res.append(f"backend: {self.backend}")
         return ", ".join(res)
 
     def __hash__(self):
-        return hash((*self.all_kwargs().items(), self.pre_hook))
+        return hash((*self.all_kwargs().items(), self.pre_hook, self.backend))
 
     def __eq__(self, other):
         self_tuple = tuple((
             *self.all_kwargs().items(),
             self.pre_hook,
+            self.backend,
         ))
         other_tuple = tuple((
             *other.all_kwargs().items(),
             other.pre_hook,
+            other.backend,
         ))
         return self_tuple == other_tuple
 
