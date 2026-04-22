@@ -9,6 +9,7 @@ import typing
 from typing import Union, Callable, List, Sequence, TypeVar, Optional, Tuple
 from dataclasses import dataclass
 import builtins
+from .. import knobs
 from ..runtime.jit import JITCallable
 import inspect
 
@@ -2783,7 +2784,10 @@ def reduce(input, axis, combine_fn, keep_dims=False, reduction_ordering=None, _s
     keep_dims = _unwrap_if_constexpr(keep_dims)
     reduction_ordering = _unwrap_if_constexpr(reduction_ordering)
     if reduction_ordering is None:
-        reduction_ordering = ReductionOrdering.UNORDERED
+        if knobs.language.strict_reduction_ordering:
+            reduction_ordering = ReductionOrdering.INNER_TREE
+        else:
+            reduction_ordering = ReductionOrdering.UNORDERED
     if isinstance(reduction_ordering, CompositeReductionOrdering):
         raise TypeError("CompositeReductionOrdering is not yet supported")
     if not isinstance(reduction_ordering, ReductionOrdering):
