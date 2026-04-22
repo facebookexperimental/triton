@@ -1160,12 +1160,13 @@ struct ModuloSchedulePass
         }
       });
 
+      // Build ScheduleGraph for outer loop.
       auto outerGraph =
           buildScheduleGraph(outerLoop, outerDDG, *outerSched, model);
 
       LLVM_DEBUG({
         llvm::dbgs()
-            << "[PASS-A] === Outer Loop ScheduleGraph (BEFORE expand) ===\n";
+            << "[PASS-A] === Outer Loop ScheduleGraph ===\n";
         outerGraph.dump();
       });
       if (printScheduleGraph) {
@@ -1184,6 +1185,274 @@ struct ModuloSchedulePass
   }
 };
 
+// ============================================================================
+// Pass A.6: List scheduling for non-loop regions
+// ============================================================================
+//
+// Degenerate Rau's algorithm — no modulo wrap, no loop-carried edges. All
+// ops get stage 0; goal is minimum makespan instead of minimum II. Lives
+// here (not its own file) so the ScheduleGraph is constructed in one place
+// alongside the modulo case. DEBUG_TYPE is redefined for this section so
+// debug output is gated by `-debug-only=nvgpu-list-schedule` per reviewer
+// feedback (was previously leaking under `-debug-only=modulo-scheduling-rau`).
+
+#undef DEBUG_TYPE
+#undef DBGS
+#undef LDBG
+#define DEBUG_TYPE "nvgpu-list-schedule"
+#define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
+#define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+
+/// Per-pipeline occupancy tracker without modulo wrap. Each pipeline has
+/// a "next free" cycle — no fixed II, no wrap-around. Mirrors the modulo
+/// reservation table for the linear (no-wrap) case.
+struct PipelineTracker {
+  llvm::DenseMap<ttg::HWPipeline, int> nextFree;
+
+  /// Earliest cycle the pipeline is available. The `duration` parameter
+  /// is the prospective op's hold time and is unused here (the tracker
+  /// only records when the previously placed op's hold ends); kept for
+  /// API symmetry with the modulo case.
+  int findFreeSlot(int earliest, ttg::HWPipeline pipeline,
+                   int /*duration*/) const {
+    if (pipeline == ttg::HWPipeline::NONE)
+      return earliest;
+    auto it = nextFree.find(pipeline);
+    int pipeReady = (it != nextFree.end()) ? it->second : 0;
+    return std::max(earliest, pipeReady);
+  }
+
+  void reserve(int cycle, ttg::HWPipeline pipeline, int duration) {
+    if (pipeline == ttg::HWPipeline::NONE)
+      return;
+    nextFree[pipeline] = std::max(nextFree.lookup(pipeline), cycle + duration);
+  }
+};
+
+/// Earliest cycle a node may start, given predecessors already placed.
+/// Predecessor result-ready time is `pred.cycle + edge.latency`; the DDG
+/// builder records the producer's `latency` (result-ready) on outgoing
+/// edges, so we don't add `pred.selfLatency` separately.
+static int listEarliestStart(unsigned nodeIdx,
+                             const ttg::DataDependenceGraph &ddg,
+                             const llvm::DenseMap<unsigned, int> &scheduled) {
+  int earliest = 0;
+  for (const auto *edge : ddg.getInEdges(nodeIdx)) {
+    auto it = scheduled.find(edge->srcIdx);
+    if (it == scheduled.end())
+      continue;
+    earliest = std::max(earliest, it->second + edge->latency);
+  }
+  return earliest;
+}
+
+/// Priority-based list scheduling on the DDG. Minimises makespan rather
+/// than II. Critical-path height is the priority (highest first).
+static FailureOr<ttg::ListScheduleResult>
+runListScheduling(const ttg::DataDependenceGraph &ddg) {
+  if (ddg.getNumNodes() == 0)
+    return failure();
+
+  auto heights = ddg.computeCriticalPathHeights();
+
+  llvm::SmallVector<unsigned> order;
+  for (unsigned i = 0; i < ddg.getNumNodes(); ++i)
+    order.push_back(i);
+  llvm::sort(order, [&](unsigned a, unsigned b) {
+    if (heights[a] != heights[b])
+      return heights[a] > heights[b];
+    return a < b;
+  });
+
+  PipelineTracker tracker;
+  llvm::DenseMap<unsigned, int> scheduled;
+
+  for (unsigned nodeIdx : order) {
+    const auto &node = ddg.getNode(nodeIdx);
+    int duration = std::max(node.selfLatency, 1);
+    if (node.pipeline == ttg::HWPipeline::NONE)
+      duration = 1;
+
+    int earliest = listEarliestStart(nodeIdx, ddg, scheduled);
+    int slot = tracker.findFreeSlot(earliest, node.pipeline, duration);
+
+    tracker.reserve(slot, node.pipeline, duration);
+    scheduled[nodeIdx] = slot;
+
+    LLVM_DEBUG(DBGS() << "  List placed N" << nodeIdx << " ("
+                      << ttg::getPipelineName(node.pipeline)
+                      << " dur=" << duration << ") at cycle=" << slot << "\n");
+  }
+
+  // makespan = max(start + occupancy) across all nodes.
+  int makespan = 0;
+  for (auto &[idx, cycle] : scheduled) {
+    const auto &node = ddg.getNode(idx);
+    makespan = std::max(makespan, cycle + std::max(node.selfLatency, 1));
+  }
+
+  LLVM_DEBUG(DBGS() << "List schedule: makespan=" << makespan
+                    << " nodes=" << ddg.getNumNodes() << "\n");
+
+  ttg::ListScheduleResult result;
+  result.makespan = makespan;
+  result.nodeToCycle = std::move(scheduled);
+  return result;
+}
+
+/// Build a ScheduleGraph from a list-scheduled loop. All ops get stage 0,
+/// cluster from cycle rank.
+static ttg::ScheduleGraph
+buildListScheduleGraph(scf::ForOp loop,
+                       const ttg::DataDependenceGraph &ddg,
+                       const ttg::ListScheduleResult &result) {
+  ttg::ScheduleGraph graph;
+  unsigned loopId = graph.addLoop(loop);
+  auto &schedLoop = graph.getLoop(loopId);
+  schedLoop.II = result.makespan; // For non-loop regions, "II" = makespan
+  schedLoop.maxStage = 0;
+
+  for (const auto &ddgNode : ddg.getNodes()) {
+    ttg::ScheduleNode sn;
+    sn.id = schedLoop.nodes.size();
+    sn.op = ddgNode.op;
+    sn.pipeline = ddgNode.pipeline;
+    sn.latency = ddgNode.latency;
+    sn.selfLatency = ddgNode.selfLatency;
+    sn.stage = 0;
+
+    auto cycleIt = result.nodeToCycle.find(ddgNode.idx);
+    if (cycleIt != result.nodeToCycle.end())
+      sn.cycle = cycleIt->second;
+
+    schedLoop.nodes.push_back(sn);
+    schedLoop.opToNodeId[ddgNode.op] = sn.id;
+  }
+
+  llvm::DenseMap<unsigned, unsigned> ddgToPipe;
+  for (unsigned i = 0; i < ddg.getNodes().size(); ++i)
+    ddgToPipe[ddg.getNodes()[i].idx] = i;
+
+  for (const auto &ddgEdge : ddg.getEdges()) {
+    auto srcIt = ddgToPipe.find(ddgEdge.srcIdx);
+    auto dstIt = ddgToPipe.find(ddgEdge.dstIdx);
+    if (srcIt == ddgToPipe.end() || dstIt == ddgToPipe.end())
+      continue;
+    ttg::ScheduleEdge se;
+    se.srcId = srcIt->second;
+    se.dstId = dstIt->second;
+    se.latency = ddgEdge.latency;
+    se.distance = ddgEdge.distance;
+    schedLoop.edges.push_back(se);
+  }
+
+  // Cluster IDs (same logic as Step 2.5, all stage 0).
+  SmallVector<int> cycles;
+  for (const auto &node : schedLoop.nodes)
+    cycles.push_back(node.cycle);
+  llvm::sort(cycles);
+  cycles.erase(llvm::unique(cycles), cycles.end());
+  llvm::DenseMap<int, int> cycleToCluster;
+  for (int i = 0, e = cycles.size(); i < e; ++i)
+    cycleToCluster[cycles[i]] = i;
+  for (auto &node : schedLoop.nodes)
+    node.cluster = cycleToCluster[node.cycle];
+
+  return graph;
+}
+
+struct ListSchedulePass
+    : public PassWrapper<ListSchedulePass, OperationPass<ModuleOp>> {
+
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ListSchedulePass)
+
+  StringRef getArgument() const override { return "nvgpu-list-schedule"; }
+
+  StringRef getDescription() const override {
+    return "List scheduling for non-loop regions (Pass A.6)";
+  }
+
+  void runOnOperation() override {
+    auto moduleOp = getOperation();
+    ttg::LatencyModel model;
+
+    moduleOp.walk([&](scf::ForOp loop) {
+      if (loop->hasAttr("tt.modulo_ii"))
+        return;
+
+      bool hasPipelineOps = false;
+      loop.getBody()->walk([&](Operation *op) {
+        if (isa<tt::DescriptorLoadOp, tt::DescriptorStoreOp,
+                ttng::AsyncTMACopyGlobalToLocalOp,
+                ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp,
+                ttng::TMEMLoadOp>(op))
+          hasPipelineOps = true;
+      });
+      if (!hasPipelineOps)
+        return;
+
+      auto ddg = ttg::DataDependenceGraph::build(loop, model);
+      if (ddg.getNumNodes() == 0)
+        return;
+
+      LDBG("List scheduling loop with " << ddg.getNumNodes() << " nodes");
+
+      auto result = runListScheduling(ddg);
+      if (failed(result)) {
+        LDBG("List scheduling FAILED");
+        return;
+      }
+
+      LDBG("List schedule: makespan=" << result->makespan);
+
+      auto schedGraph = buildListScheduleGraph(loop, ddg, *result);
+
+      LLVM_DEBUG({
+        llvm::dbgs() << "[A.6] === List ScheduleGraph ===\n";
+        schedGraph.dump();
+      });
+
+      auto ctx = loop.getContext();
+      for (const auto &schedLoop : schedGraph.loops) {
+        for (const auto &node : schedLoop.nodes) {
+          if (!node.op)
+            continue;
+          node.op->setAttr(tt::kLoopStageAttrName,
+                           IntegerAttr::get(IntegerType::get(ctx, 32), 0));
+          node.op->setAttr(
+              tt::kLoopClusterAttrName,
+              IntegerAttr::get(IntegerType::get(ctx, 32), node.cluster));
+        }
+      }
+
+      // Default unscheduled ops to stage 0, max cluster.
+      int maxCluster = 0;
+      for (const auto &schedLoop : schedGraph.loops)
+        for (const auto &node : schedLoop.nodes)
+          maxCluster = std::max(maxCluster, node.cluster);
+      for (auto &op : loop.getBody()->without_terminator()) {
+        if (!op.hasAttr(tt::kLoopStageAttrName))
+          op.setAttr(tt::kLoopStageAttrName,
+                     IntegerAttr::get(IntegerType::get(ctx, 32), 0));
+        if (!op.hasAttr(tt::kLoopClusterAttrName))
+          op.setAttr(tt::kLoopClusterAttrName,
+                     IntegerAttr::get(IntegerType::get(ctx, 32), maxCluster));
+      }
+
+      // Mark the loop scheduled so downstream `processScheduledLoop`
+      // (which gates on `tt.modulo_ii`) preserves the schedule attrs.
+      // `tt.list_schedule_makespan` distinguishes list-scheduled loops
+      // from true modulo-scheduled ones for any consumer that cares.
+      loop->setAttr("tt.modulo_ii",
+                    IntegerAttr::get(IntegerType::get(ctx, 32),
+                                    result->makespan));
+      loop->setAttr("tt.list_schedule_makespan",
+                    IntegerAttr::get(IntegerType::get(ctx, 32),
+                                    result->makespan));
+    });
+  }
+};
+
 } // namespace
 
 namespace mlir {
@@ -1192,4 +1461,10 @@ std::unique_ptr<Pass> createNVGPUModuloSchedule() {
 }
 
 void registerNVGPUModuloSchedule() { PassRegistration<ModuloSchedulePass>(); }
+
+std::unique_ptr<Pass> createNVGPUListSchedule() {
+  return std::make_unique<ListSchedulePass>();
+}
+
+void registerNVGPUListSchedule() { PassRegistration<ListSchedulePass>(); }
 } // namespace mlir
