@@ -473,6 +473,9 @@ class runtime_knobs(base_knobs):
     # sanitize_overflow enables overflow checking for integer operations
     sanitize_overflow: bool = env_bool("TRITON_SANITIZE_OVERFLOW").get()
     override_arch: env_opt_str = env_opt_str("TRITON_OVERRIDE_ARCH")
+    # default_backend overrides the backend used for compilation (e.g. "cuda", "tileir")
+    # when not explicitly specified by a Config or @triton.jit decorator.
+    default_backend: env_opt_str = env_opt_str("TRITON_DEFAULT_BACKEND")
 
     launch_enter_hook: HookChain[LaunchHook] = HookChain()
     launch_exit_hook: HookChain[LaunchHook] = HookChain(reversed=True)

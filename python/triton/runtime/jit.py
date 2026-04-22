@@ -784,12 +784,20 @@ class JITFunction(JITCallable, KernelInterface[T]):
                 return None
         return tuple(parts)
 
-    def create_binder(self):
+    def create_binder(self, backend_override=None):
         """
         Precompute as much as possible.
+
+        Args:
+            backend_override: Optional backend name (e.g. "tileir") to override the
+                driver's default target backend. When set, the GPUTarget's backend
+                field is replaced before calling make_backend().
         """
         from ..compiler import CompiledKernel, compile, ASTSource, make_backend
         target = driver.active.get_current_target()
+        if backend_override is not None:
+            from ..backends.compiler import GPUTarget
+            target = GPUTarget(backend_override, target.arch, target.warp_size)
         backend = make_backend(target)
         self.CompiledKernel = CompiledKernel
         self.compile = compile
@@ -859,9 +867,12 @@ class JITFunction(JITCallable, KernelInterface[T]):
         self._run_cache.clear()
 
     def run(self, *args, grid, warmup, **kwargs):
+        # Extract backend override before it reaches the kernel kwargs
+        backend_override = kwargs.pop("_backend_override", None)
+
         # Fast path: if cache is populated, try identity/signature check
         # (separate method to keep run() bytecode compact).
-        if not warmup and self._last_call is not None and not self.pre_run_hooks and not knobs.compilation.always_compile:
+        if not warmup and not backend_override and self._last_call is not None and not self.pre_run_hooks and not knobs.compilation.always_compile:
             result = self._try_fast_path(args, grid, kwargs)
             if result is not None:
                 return result
@@ -879,7 +890,12 @@ class JITFunction(JITCallable, KernelInterface[T]):
         for hook in self.pre_run_hooks:
             hook(*args, **kwargs)
 
-        kernel_cache, kernel_key_cache, target, backend, binder = self.device_caches[device]
+        # Use (device, backend_override) as cache key so each backend gets its own
+        # kernel_cache, target, backend, and binder.
+        cache_key = (device, backend_override)
+        if cache_key not in self.device_caches:
+            self.device_caches[cache_key] = self.create_binder(backend_override)
+        kernel_cache, kernel_key_cache, target, backend, binder = self.device_caches[cache_key]
         bound_args, specialization, options = binder(*args, **kwargs)
 
         if knobs.runtime.add_stages_inspection_hook is not None:
@@ -900,7 +916,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
                 except Exception:
                     pass
 
-            kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+            kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup, backend_override)
             if kernel is None:
                 return None
 
@@ -1118,7 +1134,10 @@ class JITFunction(JITCallable, KernelInterface[T]):
             for key, value in deserialized_obj['options'].items()
         }
         key = deserialized_obj['key']
-        _, _, _, backend, _ = self.device_caches[device]
+        cache_key = (device, None)
+        if cache_key not in self.device_caches:
+            self.device_caches[cache_key] = self.create_binder()
+        _, _, _, backend, _ = self.device_caches[cache_key]
         options = backend.parse_options(options)
         return self._do_compile(
             key,
@@ -1130,8 +1149,9 @@ class JITFunction(JITCallable, KernelInterface[T]):
             warmup=True,
         )
 
-    def _do_compile(self, key, signature, device, constexprs, options, attrs, warmup):
-        kernel_cache, _, target, backend, _ = self.device_caches[device]
+    def _do_compile(self, key, signature, device, constexprs, options, attrs, warmup, backend_override=None):
+        cache_key = (device, backend_override)
+        kernel_cache, _, target, backend, _ = self.device_caches[cache_key]
 
         if self._call_hook(knobs.runtime.jit_cache_hook, key, signature, device, constexprs, options, [attrs], warmup):
             return None
