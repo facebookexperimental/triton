@@ -368,6 +368,11 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_accelerate_matmul(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm, 0)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
+        # 2-CTA: Split B descriptor loads before optimize_descriptor_encoding
+        # so the cloned half-width descriptor gets its encoding set properly.
+        if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
+                and opt.ctas_per_cga is not None):
+            nvidia.passes.hopper.add_2cta_transform_loads(pm)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
         passes.ttir.add_loop_aware_cse(pm)
         use_meta_swp_schedule = knobs.nvidia.use_meta_ws and not knobs.nvidia.force_trunk_swp_schedule
@@ -437,6 +442,15 @@ class CUDABackend(BaseBackend):
             # hoist again and allow hoisting out of if statements
             passes.ttgpuir.add_hoist_tmem_alloc(pm, True)
             nvidia.passes.ttnvgpuir.add_remove_tmem_tokens(pm)
+            # 2-CTA support for Meta WS: Insert cross-CTA sync AFTER all
+            # WS-related passes (pipeline, optimize_partition_warps, etc.).
+            # This avoids scheduling/pipeline interference — the barrier ops
+            # won't be reordered or erased by any subsequent WS pass.
+            # getThreadId() returns relative IDs inside WarpSpecializeOp
+            # partition regions, so InitBarrierOp and ArriveBarrierOp work
+            # correctly in the consumer warp group.
+            if (opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and knobs.nvidia.use_meta_ws):
+                nvidia.passes.hopper.add_insert_2cta_sync(pm)
         else:
             passes.ttir.add_triton_licm(pm)
         passes.common.add_canonicalizer(pm)
