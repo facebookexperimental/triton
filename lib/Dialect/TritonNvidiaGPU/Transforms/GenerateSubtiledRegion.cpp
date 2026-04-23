@@ -422,11 +422,13 @@ static void buildSingleSubtiledRegion(OpBuilder &builder, Location loc,
       builder.getArrayAttr({DenseI32ArrayAttr::get(ctx, tile0Mapping),
                             DenseI32ArrayAttr::get(ctx, tile1Mapping)});
   auto barrierAnnotationsAttr = builder.getArrayAttr({});
+  auto tokenAnnotationsAttr = builder.getArrayAttr({});
 
   auto regionOp = SubtiledRegionOp::create(
       builder, loc, /*resultTypes=*/TypeRange{},
-      /*barriers=*/ValueRange{}, /*accumCnts=*/ValueRange{}, tileMappingsAttr,
-      barrierAnnotationsAttr);
+      /*barriers=*/ValueRange{}, /*accumCnts=*/ValueRange{},
+      /*tokenValues=*/ValueRange{}, tileMappingsAttr, barrierAnnotationsAttr,
+      tokenAnnotationsAttr);
 
   // --- Setup Region ---
   Block *setupBlock = &regionOp.getSetupRegion().emplaceBlock();
@@ -459,15 +461,17 @@ static void buildSingleSubtiledRegion(OpBuilder &builder, Location loc,
   Block *tileBlock = &regionOp.getTileRegion().emplaceBlock();
   for (Type ty : tileArgTypes)
     tileBlock->addArgument(ty, loc);
+  tileBlock->addArgument(builder.getI32Type(), loc);
 
   OpBuilder tileBuilder = OpBuilder::atBlockEnd(tileBlock);
   IRMapping tileMapping;
-  tileMapping.map(lhs, tileBlock->getArgument(0));
+  Value tplSplitResult = (equiv.templateChainIdx == 0) ? lhs : rhs;
+  tileMapping.map(tplSplitResult, tileBlock->getArgument(0));
   unsigned argIdx = 1;
-  // Map differing operands: use chain0 values as keys (the template chain's
-  // values are resolved through the value map built during equivalence).
-  for (auto [i, pair] : llvm::enumerate(differing))
-    tileMapping.map(pair.first, tileBlock->getArgument(argIdx++));
+  for (auto [i, pair] : llvm::enumerate(differing)) {
+    Value tplVal = (equiv.templateChainIdx == 0) ? pair.first : pair.second;
+    tileMapping.map(tplVal, tileBlock->getArgument(argIdx++));
+  }
 
   // Map identity insertion operands: the template chain's op references the
   // varying operand, which is mapped to the tile arg.
@@ -688,10 +692,12 @@ static void buildMultiTaskSubtiledRegions(OpBuilder &outerBuilder, Location loc,
         outerBuilder.getArrayAttr({DenseI32ArrayAttr::get(ctx, tile0Map),
                                    DenseI32ArrayAttr::get(ctx, tile1Map)});
     auto barrierAnnotationsAttr = outerBuilder.getArrayAttr({});
+    auto tokenAnnotationsAttr = outerBuilder.getArrayAttr({});
 
     auto regionOp = SubtiledRegionOp::create(
         outerBuilder, loc, TypeRange{}, ValueRange{}, ValueRange{},
-        tileMappingsAttr, barrierAnnotationsAttr);
+        /*tokenValues=*/ValueRange{}, tileMappingsAttr, barrierAnnotationsAttr,
+        tokenAnnotationsAttr);
 
     // --- Setup Region ---
     Block *setupBlock = &regionOp.getSetupRegion().emplaceBlock();
@@ -728,6 +734,7 @@ static void buildMultiTaskSubtiledRegions(OpBuilder &outerBuilder, Location loc,
     Block *tileBlock = &regionOp.getTileRegion().emplaceBlock();
     for (Type ty : tileArgTypes)
       tileBlock->addArgument(ty, loc);
+    tileBlock->addArgument(outerBuilder.getI32Type(), loc);
 
     OpBuilder tileBuilder = OpBuilder::atBlockEnd(tileBlock);
     IRMapping tileMapping;

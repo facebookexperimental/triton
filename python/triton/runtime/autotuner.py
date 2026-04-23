@@ -394,6 +394,7 @@ class Config:
         reg_inc_consumer=0,
         ctas_per_cga=None,
         early_tma_store_lowering=None,
+        generate_subtiled_region=None,
         preferred_ctas_per_cga=None,
     ):
         self.kwargs = kwargs
@@ -408,6 +409,7 @@ class Config:
         self.pingpongAutoWS = pingpongAutoWS
         self.ctas_per_cga = ctas_per_cga
         self.early_tma_store_lowering = early_tma_store_lowering
+        self.generate_subtiled_region = generate_subtiled_region
         self.preferred_ctas_per_cga = preferred_ctas_per_cga
 
     def __setstate__(self, state):
@@ -423,6 +425,7 @@ class Config:
         self.pingpongAutoWS = state.get("pingpongAutoWS", None)
         self.ctas_per_cga = state.get("ctas_per_cga", None)
         self.early_tma_store_lowering = state.get("early_tma_store_lowering", None)
+        self.generate_subtiled_region = state.get("generate_subtiled_region", None)
         self.preferred_ctas_per_cga = state.get("preferred_ctas_per_cga", None)
 
     def all_kwargs(self):
@@ -441,6 +444,7 @@ class Config:
                     ("pingpongAutoWS", self.pingpongAutoWS),
                     ("ctas_per_cga", self.ctas_per_cga),
                     ("early_tma_store_lowering", self.early_tma_store_lowering),
+                    ("generate_subtiled_region", self.generate_subtiled_region),
                     ("preferred_ctas_per_cga", self.preferred_ctas_per_cga),
                 ) if v is not None
             },
@@ -459,6 +463,7 @@ class Config:
         res.append(f"pingpongAutoWS: {self.pingpongAutoWS}")
         res.append(f"ctas_per_cga: {self.ctas_per_cga}")
         res.append(f"early_tma_store_lowering: {self.early_tma_store_lowering}")
+        res.append(f"generate_subtiled_region: {self.generate_subtiled_region}")
         res.append(f"preferred_ctas_per_cga: {self.preferred_ctas_per_cga}")
         return ", ".join(res)
 

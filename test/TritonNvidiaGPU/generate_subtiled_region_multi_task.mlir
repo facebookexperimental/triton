@@ -181,11 +181,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
 
   // CHECK-LABEL: @identity_insertion_addi
-  // The tile body should include the arith.addi from the longer chain:
+  // The tile body should include the arith.addi from the longer chain.
+  // The split result and differing operands must use tile block arguments.
   // CHECK: ttng.subtiled_region
   // CHECK:   } tile{
-  // CHECK:     arith.truncf
-  // CHECK:     arith.addi
+  // CHECK: ^bb0(%{{.*}}: tensor<{{.*}}>, %[[DIFF:.*]]: tensor<{{.*}}>, %[[VARY:.*]]: i32, %[[TIDX:.*]]: i32):
+  // CHECK:     arith.truncf %[[DIFF]]
+  // CHECK:     arith.addi %{{.*}}, %[[VARY]]
+  // CHECK:     tt.descriptor_store
   // CHECK:     ttng.subtiled_region_yield
   // CHECK:   }
   tt.func @identity_insertion_addi(
@@ -228,12 +231,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
 
   // CHECK-LABEL: @identity_descriptor_store_epilogue
-  // The tile body should include the full epilogue chain with arith.addi:
+  // The tile body should include the full epilogue chain with arith.addi.
+  // The split result, bias, and offset operands must be tile block arguments.
   // CHECK: ttng.subtiled_region
   // CHECK:   } tile{
-  // CHECK:     ttg.convert_layout
-  // CHECK:     arith.addi
-  // CHECK:     arith.extf
+  // CHECK: ^bb0(%{{.*}}: tensor<{{.*}}>, %[[SPLIT:.*]]: tensor<{{.*}}>, %[[BIAS:.*]]: tensor<{{.*}}>, %[[VARY:.*]]: i32, %[[TIDX:.*]]: i32):
+  // CHECK:     ttg.convert_layout %[[SPLIT]]
+  // CHECK:     arith.addi %{{.*}}, %[[VARY]]
+  // CHECK:     arith.extf %[[BIAS]]
   // CHECK:     arith.addf
   // CHECK:     arith.truncf
   // CHECK:     tt.descriptor_store

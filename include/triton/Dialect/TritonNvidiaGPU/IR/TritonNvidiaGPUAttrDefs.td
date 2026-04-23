@@ -156,4 +156,41 @@ def TTNG_BarrierAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnota
   let assemblyFormat = "`<` struct(params) `>`";
 }
 
+//===----------------------------------------------------------------------===//
+// TokenAnnotation attribute
+//===----------------------------------------------------------------------===//
+
+def TTNG_TokenAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "TokenAnnotation"> {
+  let mnemonic = "token_annotation";
+  let description = [{
+    Describes where to insert a token-based synchronization operation during
+    subtiled region lowering. This is the token-layer analog of
+    `BarrierAnnotationAttr` — it references NVWS tokens (ConsumerWaitOp /
+    ConsumerReleaseOp) instead of mbarrier ops (WaitBarrierOp /
+    ArriveBarrierOp). Token annotations are resolved to barrier annotations
+    during `doTokenLowering`.
+
+    - `tokenIdx`: index into the op's `tokenValues` operand list (the NVWS
+      token Value).
+    - `bufferIdxIdx`: index into `tokenValues` for the buffer index (i32).
+    - `phaseIdx`: index into `tokenValues` for the phase (i1). Set to -1
+      for consumer_release ops that have no phase operand.
+    - `placement`: BEFORE or AFTER the target op.
+    - `targetOpIdx`: index of the target op in the target region body.
+    - `tokenOpKind`: "consumer_wait" or "consumer_release".
+    - `region`: which region the token op targets (default TILE).
+  }];
+  let parameters = (
+    ins
+    "unsigned":$tokenIdx,
+    "unsigned":$bufferIdxIdx,
+    "int":$phaseIdx,
+    "BarrierPlacement":$placement,
+    "unsigned":$targetOpIdx,
+    "StringAttr":$tokenOpKind,
+    DefaultValuedParameter<"BarrierRegion", "BarrierRegion::TILE">:$region
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
 #endif
