@@ -76,8 +76,8 @@ struct EquivalenceResult {
   SmallVector<IdentityOp> identityOps;
 
   /// The actual operations in the template chain that are identity-inserted
-  /// (no counterpart in the other chain). Used by groupByContiguousTaskSet
-  /// to align segments.
+  /// (no counterpart in the other chain). Used by groupByContiguousTaskSetN
+  /// and groupByContiguousTaskSetWithIdentity to align segments.
   DenseSet<Operation *> identityOpSet;
 };
 
@@ -431,44 +431,6 @@ collectPerTileChain(Value splitResult, Operation *splitOp, Block *block,
   return chain;
 }
 
-/// Group structurally equivalent chain ops by contiguous async task set.
-/// Ops without task IDs are merged into the current segment.
-/// Returns nullopt if corresponding ops in chain0/chain1 have different task
-/// sets.
-static std::optional<SmallVector<ChainSegment>>
-groupByContiguousTaskSet(ArrayRef<Operation *> chain0,
-                         ArrayRef<Operation *> chain1) {
-  assert(chain0.size() == chain1.size());
-  if (chain0.empty())
-    return std::nullopt;
-
-  SmallVector<ChainSegment> segments;
-  for (size_t i = 0; i < chain0.size(); ++i) {
-    auto taskIds0 = getOpAsyncTaskIds(chain0[i]);
-    auto taskIds1 = getOpAsyncTaskIds(chain1[i]);
-
-    if (taskIds0 != taskIds1)
-      return std::nullopt;
-
-    if (taskIds0.empty() && !segments.empty()) {
-      segments.back().opsPerTile[0].push_back(chain0[i]);
-      segments.back().opsPerTile[1].push_back(chain1[i]);
-      continue;
-    }
-
-    if (segments.empty() || segments.back().taskIds != taskIds0) {
-      ChainSegment seg;
-      seg.opsPerTile.resize(2);
-      seg.taskIds = taskIds0;
-      segments.push_back(std::move(seg));
-    }
-
-    segments.back().opsPerTile[0].push_back(chain0[i]);
-    segments.back().opsPerTile[1].push_back(chain1[i]);
-  }
-  return segments;
-}
-
 /// Group N chains by contiguous async task set. All chains must have the
 /// same length (no identity-compatible ops — the N-tile path excludes
 /// auxiliary ops so chains are uniform).
@@ -561,6 +523,19 @@ groupByContiguousTaskSetWithIdentity(ArrayRef<Operation *> chain0,
     }
   }
   return segments;
+}
+
+/// Convert a 2-tile EquivalenceResult to an NWayEquivalenceResult.
+static NWayEquivalenceResult toNWayEquivalence(const EquivalenceResult &equiv) {
+  NWayEquivalenceResult result;
+  result.templateChainIdx = equiv.templateChainIdx;
+  result.identityOps = equiv.identityOps;
+  result.identityOpSet = equiv.identityOpSet;
+  for (auto &[v0, v1] : equiv.differingOperands) {
+    SmallVector<Value> perTile = {v0, v1};
+    result.differingOperands.push_back(std::move(perTile));
+  }
+  return result;
 }
 
 /// Build a single SubtiledRegionOp for N tiles (generalized).
@@ -683,118 +658,18 @@ static void buildSingleSubtiledRegionN(
 }
 
 /// Build a single SubtiledRegionOp (2-tile path).
+/// Convenience wrapper: build a single SubtiledRegionOp for 2 tiles by
+/// converting the 2-tile inputs to the generalized N-tile form.
 static void buildSingleSubtiledRegion(OpBuilder &builder, Location loc,
                                       ArrayRef<Operation *> setupOps, Value lhs,
                                       Value rhs, ArrayRef<Operation *> chain0,
                                       ArrayRef<Operation *> chain1,
                                       const EquivalenceResult &equiv) {
-  MLIRContext *ctx = builder.getContext();
-  auto &differing = equiv.differingOperands;
-  ArrayRef<Operation *> tplChain =
-      (equiv.templateChainIdx == 0) ? chain0 : chain1;
-
-  // Tile arg types and mappings.
-  SmallVector<Type> tileArgTypes;
-  SmallVector<int32_t> tile0Mapping, tile1Mapping;
-
-  // Tile arg 0: split result.
-  tileArgTypes.push_back(lhs.getType());
-  tile0Mapping.push_back(0);
-  tile1Mapping.push_back(1);
-
-  // Additional tile args from differing operands.
-  for (auto [i, pair] : llvm::enumerate(differing)) {
-    tileArgTypes.push_back(pair.first.getType());
-    tile0Mapping.push_back(2 + 2 * i);
-    tile1Mapping.push_back(2 + 2 * i + 1);
-  }
-
-  // Additional tile args from identity insertions.
-  unsigned identityBase = 2 + 2 * differing.size();
-  for (auto [i, id] : llvm::enumerate(equiv.identityOps)) {
-    tileArgTypes.push_back(id.varyingOperand.getType());
-    // For the template chain's tile, use the varying operand.
-    // For the other tile, use the identity constant.
-    unsigned tplSlot = identityBase + 2 * i;
-    unsigned otherSlot = identityBase + 2 * i + 1;
-    if (equiv.templateChainIdx == 0) {
-      tile0Mapping.push_back(tplSlot);
-      tile1Mapping.push_back(otherSlot);
-    } else {
-      tile0Mapping.push_back(otherSlot);
-      tile1Mapping.push_back(tplSlot);
-    }
-  }
-
-  auto tileMappingsAttr =
-      builder.getArrayAttr({DenseI32ArrayAttr::get(ctx, tile0Mapping),
-                            DenseI32ArrayAttr::get(ctx, tile1Mapping)});
-  auto barrierAnnotationsAttr = builder.getArrayAttr({});
-  auto tokenAnnotationsAttr = builder.getArrayAttr({});
-
-  auto regionOp = SubtiledRegionOp::create(
-      builder, loc, /*resultTypes=*/TypeRange{},
-      /*barriers=*/ValueRange{}, /*accumCnts=*/ValueRange{},
-      /*tokenValues=*/ValueRange{}, tileMappingsAttr, barrierAnnotationsAttr,
-      tokenAnnotationsAttr);
-
-  // --- Setup Region ---
-  Block *setupBlock = &regionOp.getSetupRegion().emplaceBlock();
-  OpBuilder setupBuilder = OpBuilder::atBlockEnd(setupBlock);
-  IRMapping setupMapping;
-  for (Operation *op : setupOps)
-    setupBuilder.clone(*op, setupMapping);
-
-  SmallVector<Value> setupYieldValues;
-  setupYieldValues.push_back(setupMapping.lookupOrDefault(lhs));
-  setupYieldValues.push_back(setupMapping.lookupOrDefault(rhs));
-  for (auto [v0, v1] : differing) {
-    setupYieldValues.push_back(setupMapping.lookupOrDefault(v0));
-    setupYieldValues.push_back(setupMapping.lookupOrDefault(v1));
-  }
-  // Yield identity insertion operands: (varying, identity_const) pairs.
-  for (auto &id : equiv.identityOps) {
-    Value varying = setupMapping.lookupOrDefault(id.varyingOperand);
-    Value identityConst = arith::ConstantOp::create(
-        setupBuilder, loc,
-        setupBuilder.getIntegerAttr(id.varyingOperand.getType(),
-                                    id.identityVal));
-    // Template side gets the varying operand, other side gets the constant.
-    setupYieldValues.push_back(varying);
-    setupYieldValues.push_back(identityConst);
-  }
-  SubtiledRegionYieldOp::create(setupBuilder, loc, setupYieldValues);
-
-  // --- Tile Region ---
-  Block *tileBlock = &regionOp.getTileRegion().emplaceBlock();
-  for (Type ty : tileArgTypes)
-    tileBlock->addArgument(ty, loc);
-  tileBlock->addArgument(builder.getI32Type(), loc);
-
-  OpBuilder tileBuilder = OpBuilder::atBlockEnd(tileBlock);
-  IRMapping tileMapping;
-  Value tplSplitResult = (equiv.templateChainIdx == 0) ? lhs : rhs;
-  tileMapping.map(tplSplitResult, tileBlock->getArgument(0));
-  unsigned argIdx = 1;
-  for (auto [i, pair] : llvm::enumerate(differing)) {
-    Value tplVal = (equiv.templateChainIdx == 0) ? pair.first : pair.second;
-    tileMapping.map(tplVal, tileBlock->getArgument(argIdx++));
-  }
-
-  // Map identity insertion operands: the template chain's op references the
-  // varying operand, which is mapped to the tile arg.
-  for (auto &id : equiv.identityOps)
-    tileMapping.map(id.varyingOperand, tileBlock->getArgument(argIdx++));
-
-  // Clone from the template chain (which has all ops including identity ones).
-  for (Operation *op : tplChain)
-    tileBuilder.clone(*op, tileMapping);
-  SubtiledRegionYieldOp::create(tileBuilder, loc, ValueRange{});
-
-  // --- Teardown Region ---
-  Block *teardownBlock = &regionOp.getTeardownRegion().emplaceBlock();
-  OpBuilder teardownBuilder = OpBuilder::atBlockEnd(teardownBlock);
-  SubtiledRegionYieldOp::create(teardownBuilder, loc, ValueRange{});
+  SmallVector<Value> leafValues = {lhs, rhs};
+  SmallVector<SmallVector<Operation *>> chains = {
+      SmallVector<Operation *>(chain0), SmallVector<Operation *>(chain1)};
+  buildSingleSubtiledRegionN(builder, loc, setupOps, leafValues, chains,
+                             toNWayEquivalence(equiv));
 }
 
 /// Create a mutable MemDescType with a trivial shared encoding for buffering
@@ -1578,7 +1453,7 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
   if (hasIdentityInsertions)
     segments = groupByContiguousTaskSetWithIdentity(chain0, chain1, *differing);
   else
-    segments = groupByContiguousTaskSet(chain0, chain1);
+    segments = groupByContiguousTaskSetN(twoChains);
   if (!segments || segments->empty())
     return;
 
