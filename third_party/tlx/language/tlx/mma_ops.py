@@ -244,7 +244,6 @@ def async_dot_scaled(
     assert version == 5, "async_dot_scaled is only available on Blackwell"
 
     assert isinstance(A, tlx.buffered_tensor), "input must be a buffered tensor"
-    assert A.type.storage == tlx.storage_kind.smem, "input must be a shared memory tensor"
     assert isinstance(B, tlx.buffered_tensor), "input must be a buffered tensor"
     assert B.type.storage == tlx.storage_kind.smem, "input must be a shared memory tensor"
 
@@ -257,19 +256,19 @@ def async_dot_scaled(
     A_type = _semantic._str_to_fp_type(A_format)
     B_type = _semantic._str_to_fp_type(B_format)
 
-    # Require the shared memory layout for A and B
-    # For fp4 (e2m1) format with mixed precision, we need fp4Padded=True for correct swizzling
-    # This follows the same logic as Triton's AccelerateMatmul.cpp:
-    # https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-packing-formats-mxf8f6f4-smem
+    # Require layout for A: SMEM or TMEM (mirroring async_dot's 3-way branch)
     is_A_fp4 = A_format == "e2m1"
     is_B_fp4 = B_format == "e2m1"
     is_mixed_precision = A_format != B_format
-    # fp4Padded is needed when:
-    # 1. The operand is FP4 and it's mixed precision (the other operand is not FP4)
-    # Note: When both operands are FP4 (not mixed precision), they use packed format
-    A_fp4Padded = is_A_fp4 and is_mixed_precision
+    if A.type.storage == tlx.storage_kind.smem:
+        A_fp4Padded = is_A_fp4 and is_mixed_precision
+        A_handle = require_nv_mma_shared_layout(A, True, _semantic.builder, fp4Padded=A_fp4Padded)
+    else:
+        assert A.type.storage == tlx.storage_kind.tmem, "A must be in SMEM or TMEM"
+        A_handle = require_tmem_layout_col_stride(A, 1, _semantic.builder)
+
+    # Require layout for B (always SMEM)
     B_fp4Padded = is_B_fp4 and is_mixed_precision
-    A_handle = require_nv_mma_shared_layout(A, True, _semantic.builder, fp4Padded=A_fp4Padded)
     B_handle = require_nv_mma_shared_layout(B, True, _semantic.builder, fp4Padded=B_fp4Padded)
 
     # Handle scale tensors - can be in SMEM or TMEM (auto-detected from storage type)

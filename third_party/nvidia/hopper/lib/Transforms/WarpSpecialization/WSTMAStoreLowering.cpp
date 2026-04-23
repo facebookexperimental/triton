@@ -195,6 +195,11 @@ void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp) {
 
 void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
   funcOp.walk([&](scf::ForOp forOp) {
+    bool hasNestedFor = false;
+    forOp.getBody()->walk([&](scf::ForOp) { hasNestedFor = true; });
+    if (hasNestedFor)
+      return;
+
     // Deserialize the SWP schedule. If there is no schedule, create a basic
     // single-stage schedule so the reorder logic can still work.
     tt::CoarseSchedule schedule;
