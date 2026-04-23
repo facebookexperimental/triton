@@ -33,10 +33,6 @@ loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
 
 }; // namespace gpu
 
-/// Pipeline already-lowered TMA stores (AsyncTMACopyLocalToGlobalOp with
-/// token waits) by converting them to the pendings-based wait pattern.
-bool pipelineEarlyLoweredTMAStores(scf::ForOp forOp);
-
 /// Pipeline the TMA stores in the loop.
 bool pipelineTMAStores(scf::ForOp forOp);
 

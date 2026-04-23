@@ -233,12 +233,6 @@ public:
       llvm::dbgs() << "\n\n\n";
     }
 
-    // Convert early-lowered TMA stores (token-based waits) to the
-    // pendings-based pattern after code partitioning is complete.
-    funcOp->walk([&](scf::ForOp forOp) {
-      triton::pipelineEarlyLoweredTMAStores(forOp);
-    });
-
     if (pingpongAutoWS) {
       doPingPongSync(funcOp, numWarpGroups, capability);
       if (dumpIntermediateSteps) {
