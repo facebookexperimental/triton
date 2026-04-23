@@ -75,6 +75,10 @@ void populateWarpIdOpToLLVMPattern(LLVMTypeConverter &typeConverter,
                                    const TargetInfo &targetInfo,
                                    RewritePatternSet &patterns,
                                    PatternBenefit benefit);
+void populateFuncOpConversionPattern(LLVMTypeConverter &typeConverter,
+                                     RewritePatternSet &patterns,
+                                     const TargetInfoBase &targetInfo,
+                                     PatternBenefit benefit);
 
 } // namespace mlir::triton::AMD
 
