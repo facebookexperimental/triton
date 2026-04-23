@@ -48,6 +48,14 @@ While this approach places more responsibility on the user, it reduces the compi
 
     Store a distributed tensor into a buffer in local memory or tensor memory.
 
+- `distributed_tensor = tlx.local_gather(src, indices, axis, optional_token)`
+
+    Gather elements from shared memory along a specified axis using an indices tensor. The output shape matches the indices shape, and elements are gathered from `src` at positions specified by `indices` along the given `axis`.
+
+- `tlx.local_scatter(dst, src, indices, axis, optional_token)`
+
+    Scatter elements to shared memory along a specified axis using an indices tensor. Elements from `src` are written to `dst` at positions specified by `indices` along the given `axis`.
+
 - `buffer = tlx.local_trans(buffer, dims)`
 
     Permutes the dimensions of a tensor.

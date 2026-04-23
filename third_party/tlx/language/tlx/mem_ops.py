@@ -183,14 +183,14 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
                     layout.swizzled,
                 )
         else:
-            # For 8-bit element types (uint8/int8), use a dummy TMEM layout that will
-            # be resolved during layout propagation. This is used for scales in
-            # scaled MMA operations where the final layout depends on usage context.
+            # For sub-16-bit element types:
+            # - FP8 data tiles get a proper TMEM layout (used as MMA operands)
+            # - Integer scales (uint8/int8) use a dummy layout resolved during propagation
             if dtype.primitive_bitwidth < 16:
-                if dtype == tl.uint8 or dtype == tl.int8:
-                    layout = tlx.DummyTMEMLayoutEncoding()
+                if dtype.is_fp8():
+                    layout = tlx.tensor_memory_layout_encoding.make_default(shape)
                 else:
-                    raise NotImplementedError(f"TMEM Layouts not supported for {dtype} yet")
+                    layout = tlx.DummyTMEMLayoutEncoding()
             else:
                 layout = tlx.tensor_memory_layout_encoding.make_default(shape)
             layout_handle = layout.to_ir(_semantic.builder)
@@ -691,6 +691,42 @@ def local_load(
     else:
         output = _semantic.builder.create_local_load(src.handle, token.handle if token else None)
         return tl.tensor(output, block_type)
+
+
+@tl.builtin
+def local_gather(
+    src: tlx.buffered_tensor,
+    indices: tlx.buffered_tensor,
+    axis: int,
+    token: tlx.async_token = None,
+    _semantic=None,
+) -> tl.tensor:
+    """
+    gather elements from shared memory along a specified axis using an indices tensor.
+    """
+    block_type = tl.block_type(src.type.element_ty, indices.type.shape)
+    storage = src.type.storage
+    assert storage == tlx.storage_kind.smem, "local_gather only supports shared memory!"
+    output = _semantic.builder.create_local_gather(src.handle, indices.handle, axis)
+    return tl.tensor(output, block_type)
+
+
+@tl.builtin
+def local_scatter(
+    dst: tlx.buffered_tensor,
+    src: tl.tensor,
+    indices: tlx.buffered_tensor,
+    axis: int,
+    token: tlx.async_token = None,
+    _semantic=None,
+) -> tl.tensor:
+    """
+    Scatter elements to shared memory along a specified axis using an indices tensor.
+    """
+    block_type = tl.block_type(src.type.element_ty, indices.type.shape)
+    storage = dst.type.storage
+    assert storage == tlx.storage_kind.smem, "local_scatter only supports shared memory!"
+    return tl.tensor(_semantic.builder.create_local_scatter(dst.handle, src.handle, indices.handle, axis), tl.void)
 
 
 @tl.builtin

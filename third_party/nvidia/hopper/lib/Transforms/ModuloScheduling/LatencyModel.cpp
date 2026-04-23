@@ -123,6 +123,17 @@ int LatencyModel::getMMALatency(Operation *op) const {
 }
 
 int LatencyModel::getCUDALatency(Operation *op) const {
+  // Ops that don't produce tensor results but have real latency.
+  // Check these before the scalar early-return.
+  if (isa<ttng::WaitBarrierOp>(op))
+    return 30;
+  if (isa<ttng::ArriveBarrierOp, ttng::BarrierExpectOp>(op))
+    return 20;
+  if (isa<ttng::TMEMLoadOp, ttng::TMEMStoreOp>(op))
+    return 105;
+  if (isa<triton::gpu::LocalLoadOp, triton::gpu::LocalStoreOp>(op))
+    return 105;
+
   int64_t elements = getTensorElements(op);
   if (elements == 0)
     return 0; // scalar
@@ -148,7 +159,17 @@ int LatencyModel::getCUDALatency(Operation *op) const {
   if (isa<arith::MulFOp>(op))
     return 105;
 
-  // Scale & Subtract, AddF: ~130 cycles.
+  // TMEM load/store, SMEM load/store, layout conversions: ~105 cycles.
+  if (isa<ttng::TMEMLoadOp, ttng::TMEMStoreOp, triton::gpu::LocalLoadOp,
+          triton::gpu::LocalStoreOp, triton::gpu::ConvertLayoutOp>(op))
+    return 105;
+
+  // Integer type conversions: ~105 cycles (same as float conversions).
+  if (isa<arith::ExtUIOp, arith::ExtSIOp, arith::TruncIOp, arith::IndexCastOp>(
+          op))
+    return 105;
+
+  // Integer arithmetic, comparisons, selects, other elementwise: ~130 cycles.
   return 130;
 }
 
@@ -188,9 +209,33 @@ HWPipeline LatencyModel::classifyPipeline(Operation *op) const {
   if (isa<tt::DotOp>(op))
     return HWPipeline::TC;
 
-  // CUDA: TMEM load (reads accumulator from TMEM to registers — epilogue op)
-  if (isa<ttng::TMEMLoadOp>(op))
+  // CUDA: TMEM load/store (data movement between registers and TMEM)
+  if (isa<ttng::TMEMLoadOp, ttng::TMEMStoreOp>(op))
     return HWPipeline::CUDA;
+
+  // CUDA: SMEM load/store (data movement between registers and SMEM)
+  if (isa<triton::gpu::LocalLoadOp, triton::gpu::LocalStoreOp>(op))
+    return HWPipeline::CUDA;
+
+  // CUDA: Layout conversions on tensors (may involve SMEM round-trips)
+  if (isa<triton::gpu::ConvertLayoutOp>(op))
+    return HWPipeline::CUDA;
+
+  // CUDA: Barrier operations (synchronization between warp groups).
+  // These carry timing dependencies between producers and consumers
+  // in warp-specialized kernels.
+  if (isa<ttng::WaitBarrierOp, ttng::ArriveBarrierOp, ttng::BarrierExpectOp>(
+          op))
+    return HWPipeline::CUDA;
+
+  // MEM: Regular tensor stores to global memory
+  if (isa<tt::StoreOp>(op)) {
+    if (op->getNumOperands() > 1) {
+      auto valOperand = op->getOperand(1);
+      if (isa<RankedTensorType>(valOperand.getType()))
+        return HWPipeline::MEM;
+    }
+  }
 
   // SFU: Transcendental math operations on tensors
   if (isa<math::Exp2Op, math::ExpOp, math::Log2Op, math::LogOp, math::SqrtOp,
@@ -208,13 +253,32 @@ HWPipeline LatencyModel::classifyPipeline(Operation *op) const {
 
   // CUDA: Tensor arithmetic (elementwise operations on tensors)
   if (isa<arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::DivFOp,
-          arith::MaximumFOp, arith::MinimumFOp, arith::NegFOp>(op)) {
+          arith::MaximumFOp, arith::MinimumFOp, arith::NegFOp, arith::CmpFOp,
+          arith::CmpIOp, arith::SelectOp>(op)) {
     if (op->getNumResults() > 0 &&
         isa<RankedTensorType>(op->getResult(0).getType()))
       return HWPipeline::CUDA;
   }
 
-  // CUDA: Type conversions on tensors
+  // CUDA: Integer tensor arithmetic (index computation, masking)
+  if (isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::DivUIOp,
+          arith::DivSIOp, arith::RemUIOp, arith::RemSIOp, arith::AndIOp,
+          arith::OrIOp, arith::XOrIOp, arith::ShLIOp, arith::ShRUIOp,
+          arith::ShRSIOp>(op)) {
+    if (op->getNumResults() > 0 &&
+        isa<RankedTensorType>(op->getResult(0).getType()))
+      return HWPipeline::CUDA;
+  }
+
+  // CUDA: Integer type conversions on tensors
+  if (isa<arith::ExtUIOp, arith::ExtSIOp, arith::TruncIOp, arith::IndexCastOp>(
+          op)) {
+    if (op->getNumResults() > 0 &&
+        isa<RankedTensorType>(op->getResult(0).getType()))
+      return HWPipeline::CUDA;
+  }
+
+  // CUDA: Float type conversions on tensors
   if (isa<arith::TruncFOp, arith::ExtFOp, arith::FPToSIOp, arith::SIToFPOp,
           tt::FpToFpOp, tt::BitcastOp>(op)) {
     if (op->getNumResults() > 0 &&
@@ -278,21 +342,34 @@ OpLatencyInfo LatencyModel::getLatency(Operation *op) const {
       }
     } else
       occupancy = getTMALoadLatency(op);
-    selfLatency = occupancy;
+    // selfLatency = 1: GPU TMA unit is deeply pipelined and can accept
+    // new requests every cycle. The occupancy value reflects data transfer
+    // time, not issue blocking. Using occupancy as selfLatency inflates
+    // ResMII and causes modulo scheduling to fail on kernels with many
+    // loads (e.g., FA backward with 6 MEM ops would need ResMII=3400+).
+    selfLatency = 1;
     latency = occupancy + kTMAAsyncOverhead;
     break;
   }
   case HWPipeline::TC:
     latency = getMMALatency(op);
-    selfLatency = latency;
+    // selfLatency = 1: GPU tensor core pipeline is deeply pipelined —
+    // a new MMA can be issued every ~1-32 cycles while the previous one
+    // is still computing. Using latency (900 cycles) as selfLatency
+    // inflates ResMII to 4500 for 5 MMAs, causing SMS to fail.
+    selfLatency = 1;
     break;
   case HWPipeline::CUDA:
     latency = getCUDALatency(op);
-    selfLatency = latency;
+    // selfLatency = 1: CUDA ALUs are wide vector units that can accept
+    // new instructions every cycle. The latency value reflects execution
+    // time, not issue blocking.
+    selfLatency = 1;
     break;
   case HWPipeline::SFU:
     latency = getSFULatency(op);
-    selfLatency = latency;
+    // selfLatency = 1: SFU is pipelined, accepts new instructions quickly.
+    selfLatency = 1;
     break;
   case HWPipeline::NONE:
     latency = 0;

@@ -45,6 +45,7 @@ def matmul_kernel_tma_ws(
     B_COL_MAJOR: tl.constexpr,
     DATA_PARTITION_FACTOR: tl.constexpr,
     SMEM_ALLOC_ALGO: tl.constexpr,
+    SEPARATE_EPILOGUE_STORE: tl.constexpr,
 ):
     """TMA-based matmul with warp specialization in K-loop (always enabled)."""
     dtype = tl.float16
@@ -72,7 +73,7 @@ def matmul_kernel_tma_ws(
             warp_specialize=True,
             data_partition_factor=DATA_PARTITION_FACTOR,
             smem_alloc_algo=SMEM_ALLOC_ALGO,
-            separate_epilogue_store=True,
+            separate_epilogue_store=SEPARATE_EPILOGUE_STORE,
     ):
         offs_k = k * BLOCK_SIZE_K
         if A_COL_MAJOR:
@@ -115,6 +116,7 @@ def matmul_kernel_tma_persistent_ws(
     B_COL_MAJOR: tl.constexpr,
     DATA_PARTITION_FACTOR: tl.constexpr,
     SMEM_ALLOC_ALGO: tl.constexpr,
+    SEPARATE_EPILOGUE_STORE: tl.constexpr,
 ):
     """Persistent TMA matmul with warp specialization (always enabled)."""
     dtype = tl.float16
@@ -136,7 +138,7 @@ def matmul_kernel_tma_persistent_ws(
             warp_specialize=True,
             data_partition_factor=DATA_PARTITION_FACTOR,
             smem_alloc_algo=SMEM_ALLOC_ALGO,
-            separate_epilogue_store=True,
+            separate_epilogue_store=SEPARATE_EPILOGUE_STORE,
     ):
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
@@ -210,6 +212,7 @@ def matmul_kernel_descriptor_persistent_ws(
     B_COL_MAJOR: tl.constexpr,
     DATA_PARTITION_FACTOR: tl.constexpr,
     SMEM_ALLOC_ALGO: tl.constexpr,
+    SEPARATE_EPILOGUE_STORE: tl.constexpr,
 ):
     """Persistent matmul with device-side TMA descriptors and warp specialization (always enabled)."""
     dtype = c_ptr.dtype.element_ty
@@ -269,7 +272,7 @@ def matmul_kernel_descriptor_persistent_ws(
             warp_specialize=True,
             data_partition_factor=DATA_PARTITION_FACTOR,
             smem_alloc_algo=SMEM_ALLOC_ALGO,
-            separate_epilogue_store=True,
+            separate_epilogue_store=SEPARATE_EPILOGUE_STORE,
     ):
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
@@ -321,6 +324,138 @@ def matmul_kernel_descriptor_persistent_ws(
 
 
 # ============================================================================
+# Kernel 4: matmul_kernel_tma_persistent_ws_splitk
+# Persistent TMA matmul + warp specialization + deterministic Split-K.
+# Mirrors Kernel 2 but expands the persistent grid by SPLIT_K. Each split
+# writes its partial sum into a (SPLIT_K * M, N) workspace at row split_id*M;
+# a separate _reduce_k_kernel folds the slabs into C in fp32.
+# Requires SPLIT_K > 1 — the data-parallel case is already covered by Kernel 2.
+# ============================================================================
+@triton.jit
+def matmul_kernel_tma_persistent_ws_splitk(
+    a_desc,
+    b_desc,
+    workspace_desc,
+    M,
+    N,
+    K,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    EPILOGUE_SUBTILE: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    FLATTEN: tl.constexpr,
+):
+    """Persistent TMA matmul with warp specialization + deterministic Split-K.
+
+    Caller must guarantee cdiv(k_tiles, SPLIT_K) * (SPLIT_K - 1) < k_tiles
+    so every split has at least one K tile — otherwise the warp-specialized
+    inner loop runs zero iterations and the producer/consumer partition can
+    deadlock waiting on barriers that are never armed.
+    """
+    tl.static_assert(SPLIT_K > 1, "splitk kernel requires SPLIT_K > 1")
+    dtype = tl.float16
+    start_pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    k_tiles_total = tl.cdiv(K, BLOCK_SIZE_K)
+    num_mn_tiles = num_pid_m * num_pid_n
+    num_tiles = num_mn_tiles * SPLIT_K
+
+    tile_id_c = start_pid - NUM_SMS
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    for tile_id in tl.range(
+            start_pid,
+            num_tiles,
+            NUM_SMS,
+            flatten=FLATTEN,
+            warp_specialize=True,
+            disallow_acc_multi_buffer=True,
+    ):
+        split_id = tile_id // num_mn_tiles
+        mn_tile_id = tile_id % num_mn_tiles
+        k_per_split = tl.cdiv(k_tiles_total, SPLIT_K)
+        k_start = split_id * k_per_split
+        k_end = tl.minimum(k_start + k_per_split, k_tiles_total)
+
+        pid_m, pid_n = _compute_pid(mn_tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        offs_am = pid_m * BLOCK_SIZE_M
+        offs_bn = pid_n * BLOCK_SIZE_N
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_start, k_end):
+            offs_k = ki * BLOCK_SIZE_K
+            a = a_desc.load([offs_am, offs_k])
+            b = b_desc.load([offs_bn, offs_k])
+            accumulator = tl.dot(a, b.T, accumulator)
+
+        tile_id_c += NUM_SMS
+        split_id_c = tile_id_c // num_mn_tiles
+        mn_tile_id_c = tile_id_c % num_mn_tiles
+        pid_m, pid_n = _compute_pid(mn_tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        offs_am_c = pid_m * BLOCK_SIZE_M
+        offs_bn_c = pid_n * BLOCK_SIZE_N
+        row_base = split_id_c * M
+
+        # EPILOGUE_SUBTILE in {1, 2, 4} — chunk the (BM, BN) accumulator along
+        # N into EPILOGUE_SUBTILE pieces of (BM, BN/EPILOGUE_SUBTILE) and
+        # store each. tl.split only does 2-way, so 4-way uses recursive splits.
+        slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
+        if EPILOGUE_SUBTILE == 1:
+            c = accumulator.to(dtype)
+            workspace_desc.store([row_base + offs_am_c, offs_bn_c], c)
+        elif EPILOGUE_SUBTILE == 2:
+            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, slice_size))
+            acc = tl.permute(acc, (0, 2, 1))
+            acc0, acc1 = tl.split(acc)
+            workspace_desc.store([row_base + offs_am_c, offs_bn_c + 0 * slice_size], acc0.to(dtype))
+            workspace_desc.store([row_base + offs_am_c, offs_bn_c + 1 * slice_size], acc1.to(dtype))
+        else:
+            tl.static_assert(EPILOGUE_SUBTILE == 4, "EPILOGUE_SUBTILE must be 1, 2, or 4")
+            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+            acc = tl.permute(acc, (0, 2, 1))
+            left, right = tl.split(acc)
+            left = tl.reshape(left, (BLOCK_SIZE_M, 2, slice_size))
+            left = tl.permute(left, (0, 2, 1))
+            acc0, acc1 = tl.split(left)
+            right = tl.reshape(right, (BLOCK_SIZE_M, 2, slice_size))
+            right = tl.permute(right, (0, 2, 1))
+            acc2, acc3 = tl.split(right)
+            workspace_desc.store([row_base + offs_am_c, offs_bn_c + 0 * slice_size], acc0.to(dtype))
+            workspace_desc.store([row_base + offs_am_c, offs_bn_c + 1 * slice_size], acc1.to(dtype))
+            workspace_desc.store([row_base + offs_am_c, offs_bn_c + 2 * slice_size], acc2.to(dtype))
+            workspace_desc.store([row_base + offs_am_c, offs_bn_c + 3 * slice_size], acc3.to(dtype))
+
+
+@triton.jit
+def _reduce_k_kernel(
+    workspace_ptr,
+    c_ptr,
+    M,
+    N,
+    SPLIT_K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    OUTPUT_DTYPE: tl.constexpr,
+):
+    """Fold SPLIT_K partial-sum slabs from workspace into C, accumulating in fp32."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    base = offs_m[:, None] * N + offs_n[None, :]
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for s in range(SPLIT_K):
+        partial = tl.load(workspace_ptr + base + s * M * N, mask=mask, other=0.0)
+        acc += partial.to(tl.float32)
+    tl.store(c_ptr + base, acc.to(OUTPUT_DTYPE), mask=mask)
+
+
+# ============================================================================
 # Test 1: matmul_kernel_tma warp specialization (K-loop based)
 # ============================================================================
 @pytest.mark.parametrize("M, N, K", [(128, 128, 128), (512, 512, 256), (8192, 8192, 1024)])
@@ -334,6 +469,7 @@ def matmul_kernel_descriptor_persistent_ws(
 @pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
+@pytest.mark.parametrize("separate_epilogue_store", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tutorial09_matmul_tma_warp_specialize(
     M,
@@ -349,6 +485,7 @@ def test_tutorial09_matmul_tma_warp_specialize(
     use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     SMEM_ALLOC_ALGO,
+    separate_epilogue_store,
 ):
     """Test matmul_kernel_tma with warp_specialize=True (K-loop based)."""
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
@@ -415,6 +552,7 @@ def test_tutorial09_matmul_tma_warp_specialize(
             B_COL_MAJOR=B_col_major,
             DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
             SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
+            SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
@@ -448,6 +586,7 @@ def test_tutorial09_matmul_tma_warp_specialize(
 @pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
+@pytest.mark.parametrize("separate_epilogue_store", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tutorial09_matmul_tma_persistent_warp_specialize(
     M,
@@ -465,6 +604,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     SMEM_ALLOC_ALGO,
+    separate_epilogue_store,
 ):
     """Test matmul_kernel_tma_persistent with warp_specialize=True for both Flatten values."""
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
@@ -571,6 +711,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
             B_COL_MAJOR=B_col_major,
             DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
             SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
+            SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
@@ -604,6 +745,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 @pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
+@pytest.mark.parametrize("separate_epilogue_store", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     M,
@@ -621,6 +763,7 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     SMEM_ALLOC_ALGO,
+    separate_epilogue_store,
 ):
     """Test matmul_kernel_descriptor_persistent with warp_specialize=True for both Flatten values."""
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
@@ -693,6 +836,7 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
             B_COL_MAJOR=B_col_major,
             DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
             SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
+            SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
@@ -796,6 +940,123 @@ def test_tutorial09_multi_epilogue_subtile():
 
 
 # ============================================================================
+# Test 5: matmul_kernel_tma_persistent_ws_splitk (deterministic Split-K)
+# Targets large-K, undersaturated-MN shapes where Split-K is the right call.
+# Config matrix is intentionally narrow: one (BM, BN, BK) tile, FLATTEN=True,
+# fixed num_stages/num_warps — vary only the Split-K-relevant axes.
+# ============================================================================
+@pytest.mark.parametrize("M, N, K", [
+    (256, 256, 32768),
+    (256, 256, 65536),
+])
+@pytest.mark.parametrize("SPLIT_K", [2, 4, 8])
+@pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+def test_tutorial09_matmul_tma_persistent_warp_specialize_splitk(
+    M,
+    N,
+    K,
+    SPLIT_K,
+    EPILOGUE_SUBTILE,
+):
+    """Test deterministic Split-K variant: workspace partial sums + reduce."""
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 64
+    GROUP_SIZE_M = 8
+    FLATTEN = True
+    num_stages = 3
+    num_warps = 4
+
+    # Empty-trailing-split guard: kernel deadlocks if any split has 0 K-tiles.
+    k_tiles = triton.cdiv(K, BLOCK_SIZE_K)
+    k_per_split = triton.cdiv(k_tiles, SPLIT_K)
+    if k_per_split * (SPLIT_K - 1) >= k_tiles:
+        pytest.skip("SPLIT_K leaves trailing split empty (would deadlock kernel)")
+
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.use_meta_partition = True
+
+        dtype = torch.float16
+        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+        device = "cuda"
+
+        torch.manual_seed(42)
+        # TritonBench-style scaling: (randn + 1) / K keeps |C| ~ O(1)
+        # regardless of K, so error doesn't grow with K and we can use
+        # standard fp16 tolerances. The +1 avoids denormals.
+        A = (torch.randn((M, K), dtype=dtype, device=device) + 1) / K
+        B = (torch.randn((N, K), dtype=dtype, device=device) + 1) / K
+        C = torch.empty((M, N), dtype=dtype, device=device)
+        workspace = torch.empty((SPLIT_K * M, N), dtype=dtype, device=device)
+
+        def alloc_fn(size, align, stream):
+            return torch.empty(size, dtype=torch.int8, device="cuda")
+
+        triton.set_allocator(alloc_fn)
+
+        a_desc = TensorDescriptor(A, A.shape, A.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_K])
+        b_desc = TensorDescriptor(B, B.shape, B.stride(), [BLOCK_SIZE_N, BLOCK_SIZE_K])
+        ws_desc = TensorDescriptor(
+            workspace,
+            workspace.shape,
+            workspace.stride(),
+            [BLOCK_SIZE_M, BLOCK_SIZE_N // EPILOGUE_SUBTILE],
+        )
+
+        grid = lambda META: (min(
+            NUM_SMS,
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]) * META["SPLIT_K"],
+        ), )
+
+        kernel = matmul_kernel_tma_persistent_ws_splitk[grid](
+            a_desc,
+            b_desc,
+            ws_desc,
+            M,
+            N,
+            K,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=GROUP_SIZE_M,
+            EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
+            NUM_SMS=NUM_SMS,
+            SPLIT_K=SPLIT_K,
+            FLATTEN=FLATTEN,
+            num_stages=num_stages,
+            num_warps=num_warps,
+        )
+
+        # Reduce SPLIT_K partial-sum slabs into final C.
+        REDUCE_BM, REDUCE_BN = 32, 32
+        reduce_grid = (triton.cdiv(M, REDUCE_BM), triton.cdiv(N, REDUCE_BN))
+        _reduce_k_kernel[reduce_grid](
+            workspace,
+            C,
+            M,
+            N,
+            SPLIT_K=SPLIT_K,
+            BLOCK_SIZE_M=REDUCE_BM,
+            BLOCK_SIZE_N=REDUCE_BN,
+            OUTPUT_DTYPE=tl.float16,
+            num_warps=4,
+        )
+
+        # Verify IR contains warp_specialize
+        ttgir = kernel.asm["ttgir"]
+        assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
+        assert "ttng.tc_gen5_mma" in ttgir, "Expected Blackwell MMA instruction"
+        assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
+
+        # Verify correctness — TritonBench fp16 tolerances. Inputs are
+        # scaled by 1/K so |C| ~ O(1) and error doesn't grow with K.
+        ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
+        torch.testing.assert_close(ref_out, C, atol=1e-2, rtol=1e-1)
+
+
+# ============================================================================
 # Hopper Tests
 # ============================================================================
 
@@ -815,6 +1076,7 @@ def test_tutorial09_multi_epilogue_subtile():
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
 @pytest.mark.parametrize("enable_pingpong", [False, True])
+@pytest.mark.parametrize("separate_epilogue_store", [True, False])
 @pytest.mark.skipif(not is_hopper(), reason="Requires Hopper")
 def test_hopper_matmul_tma_warp_specialize(
     M,
@@ -831,6 +1093,7 @@ def test_hopper_matmul_tma_warp_specialize(
     DATA_PARTITION_FACTOR,
     SMEM_ALLOC_ALGO,
     enable_pingpong,
+    separate_epilogue_store,
 ):
     """Test matmul_kernel_tma with warp_specialize=True on Hopper (K-loop based)."""
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 128:
@@ -889,6 +1152,7 @@ def test_hopper_matmul_tma_warp_specialize(
             B_COL_MAJOR=B_col_major,
             DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
             SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
+            SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
@@ -920,6 +1184,7 @@ def test_hopper_matmul_tma_warp_specialize(
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
 @pytest.mark.parametrize("enable_pingpong", [False, True])
+@pytest.mark.parametrize("separate_epilogue_store", [True, False])
 @pytest.mark.skipif(not is_hopper(), reason="Requires Hopper")
 def test_hopper_matmul_tma_persistent_warp_specialize(
     M,
@@ -936,6 +1201,7 @@ def test_hopper_matmul_tma_persistent_warp_specialize(
     DATA_PARTITION_FACTOR,
     SMEM_ALLOC_ALGO,
     enable_pingpong,
+    separate_epilogue_store,
 ):
     """Test matmul_kernel_tma_persistent with warp_specialize=True on Hopper.
 
@@ -1012,6 +1278,7 @@ def test_hopper_matmul_tma_persistent_warp_specialize(
             B_COL_MAJOR=B_col_major,
             DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
             SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
+            SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
@@ -1044,6 +1311,7 @@ def test_hopper_matmul_tma_persistent_warp_specialize(
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
 @pytest.mark.parametrize("enable_pingpong", [False, True])
+@pytest.mark.parametrize("separate_epilogue_store", [True, False])
 @pytest.mark.skipif(not is_hopper(), reason="Requires Hopper")
 def test_hopper_matmul_descriptor_persistent_warp_specialize(
     M,
@@ -1060,6 +1328,7 @@ def test_hopper_matmul_descriptor_persistent_warp_specialize(
     DATA_PARTITION_FACTOR,
     SMEM_ALLOC_ALGO,
     enable_pingpong,
+    separate_epilogue_store,
 ):
     """Test matmul_kernel_descriptor_persistent with warp_specialize=True on Hopper.
 
@@ -1121,6 +1390,7 @@ def test_hopper_matmul_descriptor_persistent_warp_specialize(
             B_COL_MAJOR=B_col_major,
             DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
             SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
+            SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,

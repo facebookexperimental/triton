@@ -240,7 +240,6 @@ def _softmax_inner_loop(
             VEC_SIZE,
             out_dtype,
         )
-        tlx.fence("async_shared")
         tlx.barrier_arrive(tlx.local_view(p_fulls, cid))
 
         l_ij = tl.sum(p_i, 1)
@@ -273,26 +272,10 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                       ):
     """
     This kernel is adapted from the Blackwell FA kernel for MXFP8.
-    This requires the following changes for correctness:
 
-    1. P must move to SMEM. As a result, for HEAD-DIM=64 it is no longer
-    necessary/helpful to share buffers QK (you have enough TMEM). This
-    kernel moves P, alpha, m, and l to their own individual buffers and
-    adds corresponding barriers (including for qk_empties).
-
-    2. The FP8 data is generated with scales, converting the dots to scale
-    dots. This follows the pattern of going bf16 -> torchao CuBlas format
-    -> 5D TMA format. This creates separate Tensor Descriptors which
-    currently match the load placement of the original tensors.
-
-    3. P is converted to FP8 online and both the data and scales are placed
-    in SMEM.
-
-    4. Subtiling is removed. It is an open question to explore how this will
-    work with scale dots.
-
-    This kernel has not yet been tuned in its autotuning configs and future work
-    will further modify this kernel.
+    P is converted to FP8 online with per-block E8M0 scales and stored in
+    TMEM alongside its scales, matching the BF16 kernel's pattern of keeping
+    P in TMEM for the PV scaled dot.
     """
     tl.static_assert(NUM_MMA_GROUPS == 2)
     tl.static_assert(NUM_BUFFERS_QK == 1)
@@ -363,12 +346,6 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     kv_scale_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     kv_scale_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
 
-    p_tiles = tlx.local_alloc(
-        (BLOCK_M_SPLIT, BLOCK_N),
-        tlx.dtype_of(desc_v),
-        NUM_MMA_GROUPS,
-    )
-
     # Calculate scale bytes for barrier expect
     Q_SCALE_BYTES: tl.constexpr = REP_M * REP_HEAD * 2 * 256
     K_SCALE_BYTES: tl.constexpr = REP_N * REP_HEAD * 2 * 256
@@ -434,6 +411,13 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
             tlx.storage_kind.tmem,
             reuse=qk_storage_alias,
         )
+        p_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, BLOCK_N),
+            tlx.dtype_of(desc_v),
+            NUM_MMA_GROUPS,
+            tlx.storage_kind.tmem,
+            reuse=qk_storage_alias,
+        )
         p_scale_tiles = tlx.local_alloc(
             (BLOCK_M_SPLIT, BLOCK_N // VEC_SIZE),
             tl.uint8,
@@ -442,9 +426,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
             reuse=qk_storage_alias,
         )
         # Define the reuse strategy.
-        # Here we share 1 buffer of QK with all other buffers. However,
-        # because Q_SCALES is needed to compute QK we must store the opposite
-        # scale index.
+        # QK and P have sequential lifetimes (QK consumed by softmax before P produced),
+        # so they share the same TMEM region. P in FP8 (32 cols) fits within QK's FP32 space (128 cols).
         # QK[0] : |                              BLK_M/2 * BLOCK_N * fp32                                       |
         # Alpha[0]: |BLK_M/2*1*fp32|
         # L[0]:                    |BLK_M/2*1*fp32|
@@ -452,7 +435,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
         # Q_SCALES[1]:                                           |512*uint8|
         # K_SCALES[1]:                                                     |512*uint8|
         # V_SCALES[0]:                                                               |512*uint8|
-        # P_SCALES[0]:                                                                         |BLK_M/2*32*uint8|
+        # P[0]:                                                                      |BLK_M/2*BLK_N*fp8|
+        # P_SCALES[0]:                                                                         |BLK_M/2*4*uint8|
         qk_storage_alias.set_buffer_overlap(
             tlx.reuse_group(
                 qk_tiles,
@@ -463,6 +447,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     q_scale_tmem,
                     v_scale_tmem,
                     k_scale_tmem,
+                    p_tiles,
                     p_scale_tiles,
                     group_type=tlx.reuse_group_type.distinct,
                 ),
@@ -496,6 +481,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                                        tlx.storage_kind.tmem)
         v_scale_tmem = tlx.local_alloc((HEAD_DIM, V_SCALE_TMEM_COLS), tl.uint8, NUM_KV_SCALE_TMEM_BUFFERS,
                                        tlx.storage_kind.tmem)
+        p_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), tlx.dtype_of(desc_v), NUM_MMA_GROUPS, tlx.storage_kind.tmem)
         p_scale_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N // VEC_SIZE), tl.uint8, NUM_MMA_GROUPS,
                                         tlx.storage_kind.tmem)
 
