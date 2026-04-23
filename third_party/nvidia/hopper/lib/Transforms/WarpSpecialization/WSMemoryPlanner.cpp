@@ -1165,15 +1165,23 @@ static unsigned computeTotalSmem(const SmallVector<WSBuffer> &wsBuffers) {
   return total;
 }
 
-/// Group P2_Other WSBuffers by their original load op and assign the same
-/// buffer.id to buffers within each group that have compatible types/sizes.
+/// Group P2_Other WSBuffers by their original load op (or by compatible
+/// type/size for TMA store staging buffers) and assign the same buffer.id
+/// to buffers within each group.
 static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
                                   SmallVector<Channel *> &channels) {
   DenseMap<Operation *, SmallVector<unsigned>> loadGroups;
+  // TMA store staging buffers don't have channels — group them by a
+  // sentinel key (nullptr) since they're all compatible by construction.
+  SmallVector<unsigned> tmaStoreIndices;
   for (unsigned i = 0; i < wsBuffers.size(); ++i) {
     auto &buf = wsBuffers[i];
     if (buf.priority != WSBufferPriority::P2_Other)
       continue;
+    if (buf.isTMAStoreStaging) {
+      tmaStoreIndices.push_back(i);
+      continue;
+    }
     Channel *ch = findChannelForOp(buf.allocOp, channels);
     Operation *origLoad = findOriginalLoadForChannel(ch);
     if (!origLoad)
@@ -1181,10 +1189,9 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
     loadGroups[origLoad].push_back(i);
   }
 
-  for (auto &[origLoad, indices] : loadGroups) {
+  auto mergeGroup = [&](ArrayRef<unsigned> indices, const char *label) {
     if (indices.size() < 2)
-      continue;
-
+      return;
     SmallVector<Operation *> allocs;
     SmallVector<unsigned> sizes;
     for (unsigned idx : indices) {
@@ -1192,14 +1199,18 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
       sizes.push_back(wsBuffers[idx].sizeBytes);
     }
     if (!allAllocsCompatible(allocs, sizes))
-      continue;
-
+      return;
     unsigned sharedId = wsBuffers[indices[0]].bufferId;
     for (unsigned k = 1; k < indices.size(); ++k)
       wsBuffers[indices[k]].bufferId = sharedId;
-    LDBG("Phase 3.5 (epilogue fusion): merged "
-         << indices.size() << " P2_Other buffers into bufferId=" << sharedId);
-  }
+    LDBG("Phase 3.5 (" << label << "): merged " << indices.size()
+                       << " buffers into bufferId=" << sharedId);
+  };
+
+  for (auto &[origLoad, indices] : loadGroups)
+    mergeGroup(indices, "epilogue fusion");
+
+  mergeGroup(tmaStoreIndices, "TMA store staging fusion");
 }
 
 /// Phase 4.5: Iterative copy increase for fused P2_Other groups.
