@@ -14,18 +14,18 @@
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
 
   // CHECK-LABEL: @multi_task_setup_tmem_split_optimized
-  // First SubtiledRegionOp setup should have subslice loads:
+  // After optimize_tmem_layouts (which now also pushes setup to tile),
+  // the setup has only tmem_subslice ops and the tile body has the
+  // tmem_load + compute chain:
   // CHECK: ttng.subtiled_region
   // CHECK:   setup {
   // CHECK:     ttng.tmem_subslice
-  // CHECK:     ttng.tmem_load
-  // CHECK:     ttg.convert_layout
   // CHECK:     ttng.tmem_subslice
-  // CHECK:     ttng.tmem_load
-  // CHECK:     ttg.convert_layout
   // CHECK-NOT: tt.split
   // CHECK:     ttng.subtiled_region_yield
   // CHECK:   } tile{
+  // CHECK:     ttng.tmem_load
+  // CHECK:     ttg.convert_layout
   // CHECK:     arith.truncf
   // CHECK:     ttg.local_store
   // CHECK:     ttng.subtiled_region_yield

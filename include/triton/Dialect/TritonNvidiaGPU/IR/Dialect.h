@@ -149,6 +149,10 @@ inline constexpr const char *kSubtileOpId = "subtile_op_id";
 /// the WS code partition pre-lowering for multi-task subtiled regions.
 void lowerSubtiledRegion(SubtiledRegionOp op);
 
+/// Push shared setup ops into the tile body of a SubtiledRegionOp.
+/// Called from OptimizeTMemLayouts after tmem layout patterns have fired.
+void pushSubtiledRegionSetupToTile(SubtiledRegionOp op);
+
 } // namespace mlir::triton::nvidia_gpu
 
 #endif // TRITON_DIALECT_TRITONNVIDIAGPU_IR_DIALECT_H_

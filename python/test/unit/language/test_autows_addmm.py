@@ -167,10 +167,6 @@ def test_autows_addmm_tma_persistent(
     generate_subtiled_region,
 ):
     """Test addmm kernel (bias + matmul) with warp_specialize=True."""
-    # TODO: Fix e2e pipeline for generate_subtiled_region (OptimizeTMemLayouts
-    # leaves bare tmem_subslice ops without async_task_id, crashing createChannelPost).
-    if generate_subtiled_region:
-        pytest.skip("generate_subtiled_region not yet supported e2e")
 
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:

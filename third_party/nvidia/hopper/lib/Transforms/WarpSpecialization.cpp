@@ -56,13 +56,11 @@ void doGenerateSubtiledRegion(triton::FuncOp &funcOp) {
   PassManager pm(moduleOp.getContext());
   pm.addPass(triton::nvidia_gpu::
                  createTritonNvidiaGPUTestGenerateSubtiledRegionPass());
-  // Convert tmem_load → reshape → trans → split chains in SubtiledRegionOp
-  // setup regions into tmem_subslice + tmem_load pairs.
-  pm.addPass(
-      triton::nvidia_gpu::createTritonNvidiaGPUOptimizeTMemLayoutsPass());
-  // Push setup values that are shared across all tiles into the tile body.
-  pm.addPass(
-      triton::nvidia_gpu::createTritonNvidiaGPUPushSharedSetupToTilePass());
+  // OptimizeTMemLayouts and PushSharedSetupToTile are deferred: they run
+  // later via the main add_optimize_tmem_layouts invocation in compiler.py,
+  // followed by add_lower_subtiled_region.  This avoids transforming bare
+  // (non-SubtiledRegionOp) splits into tmem_subslice ops that lack
+  // async_task_id and would crash createChannelPost.
   (void)pm.run(moduleOp);
 }
 
@@ -242,12 +240,11 @@ public:
       }
     }
 
-    // Primary SubtiledRegionOp lowering path. By this point the tile body
-    // has been optimized (OptimizeTMemLayouts + PushSharedSetupToTile ran
-    // inside doGenerateSubtiledRegion), so tmem_loads are sunk close to
-    // their consumers. doTokenLowering converts token annotations to
-    // barrier annotations, then lowerSubtiledRegion unrolls the tile body
-    // with per-tile barrier materialization.
+    // doTokenLowering converts token annotations on SubtiledRegionOps to
+    // barrier annotations. The SubtiledRegionOps themselves are NOT lowered
+    // here — they survive through to the main add_optimize_tmem_layouts
+    // invocation (which also pushes setup to tile), followed by
+    // add_lower_subtiled_region in compiler.py.
     //
     // Multi-task SubtiledRegionOps were already lowered as fallbacks in
     // doCodePartition/doCodePartitionPost (before specializeRegion).
@@ -255,21 +252,6 @@ public:
     if (dumpIntermediateSteps) {
       llvm::dbgs()
           << "// -----// WarpSpec internal IR Dump After: doTokenLowering\n";
-      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-      llvm::dbgs() << "\n\n\n";
-    }
-
-    {
-      SmallVector<triton::nvidia_gpu::SubtiledRegionOp> remaining;
-      funcOp.walk([&](triton::nvidia_gpu::SubtiledRegionOp op) {
-        remaining.push_back(op);
-      });
-      for (auto op : remaining)
-        triton::nvidia_gpu::lowerSubtiledRegion(op);
-    }
-    if (dumpIntermediateSteps) {
-      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                      "lowerSubtiledRegion\n";
       moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
       llvm::dbgs() << "\n\n\n";
     }

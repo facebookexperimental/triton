@@ -517,6 +517,16 @@ void pushSharedSetupToTile(SubtiledRegionOp op) {
   // (subtile_op_id attributes) that survive tile body transformations.
 }
 
+} // anonymous namespace
+
+void pushSubtiledRegionSetupToTile(SubtiledRegionOp op) {
+  addSubsliceRangeToSetup(op);
+  pushTmemLoadsToTile(op);
+  pushSharedSetupToTile(op);
+}
+
+namespace {
+
 class TritonNvidiaGPUPushSharedSetupToTilePass
     : public impl::TritonNvidiaGPUPushSharedSetupToTilePassBase<
           TritonNvidiaGPUPushSharedSetupToTilePass> {
