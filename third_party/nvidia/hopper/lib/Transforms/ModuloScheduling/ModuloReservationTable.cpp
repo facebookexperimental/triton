@@ -2,6 +2,9 @@
 
 #include "ModuloReservationTable.h"
 
+#include "ExhaustiveScheduler.h"
+#include "SwingScheduler.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/Debug.h"
 #include <algorithm>
 #include <climits>
@@ -100,18 +103,9 @@ static int computeEarliestStart(unsigned nodeIdx,
   return earliest;
 }
 
-FailureOr<ModuloScheduleResult>
-runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
-                    int maxBacktracks) {
-  LLVM_DEBUG(DBGS() << "Computing MinII...\n");
-  const int minII = ddg.computeMinII();
-  LLVM_DEBUG(DBGS() << "MinII=" << minII << "\n");
-  if (minII <= 0)
-    return failure();
-
-  if (maxII <= 0)
-    maxII = 2 * minII;
-
+static FailureOr<ModuloScheduleResult> runRauIMS(const DataDependenceGraph &ddg,
+                                                 int minII, int maxII,
+                                                 int maxBacktracks) {
   LLVM_DEBUG(DBGS() << "Computing critical path heights...\n");
   auto heights = ddg.computeCriticalPathHeights();
   LLVM_DEBUG(DBGS() << "Heights computed for " << heights.size() << " nodes\n");
@@ -251,5 +245,52 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
 
 // runListScheduling moved to ListSchedulePass.cpp so its DEBUG_TYPE matches
 // the rest of the list-scheduling pass output (-debug-only=nvgpu-list-schedule).
+
+// ── Public entry point ──────────────────────────────────────────────────────
+
+FailureOr<ModuloScheduleResult>
+runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
+                    int maxBacktracks) {
+  const int minII = ddg.computeMinII();
+  if (minII <= 0)
+    return failure();
+  if (maxII <= 0)
+    maxII = 2 * minII;
+
+  // Cap maxII to avoid spending too long on large DDGs.
+  maxII = std::min(maxII, minII + 10);
+
+  LLVM_DEBUG({
+    DBGS() << "MinII=" << minII << " MaxII=" << maxII
+           << " Nodes=" << ddg.getNumNodes() << "\n";
+    DBGS() << "ResMII=" << ddg.computeResMII()
+           << " RecMII=" << ddg.computeRecMII() << "\n";
+  });
+
+  // TRITON_USE_MODULO_SCHEDULE selects the scheduling algorithm:
+  //   "sms"        → Swing Modulo Scheduling (Llosa et al., PACT 1996)
+  //   "exhaustive" → Exhaustive search with joint memory feasibility
+  //   "random"     → Random sampling with greedy placement
+  //   "1" or other → Rau's Iterative Modulo Scheduling (Rau, 1994)
+  auto algo = mlir::triton::tools::getStrEnv("TRITON_USE_MODULO_SCHEDULE");
+
+  if (algo == "exhaustive") {
+    LLVM_DEBUG(DBGS() << "Using exhaustive search with memory feasibility\n");
+    return runExhaustiveSearch(ddg, maxII);
+  }
+
+  if (algo == "random") {
+    LLVM_DEBUG(DBGS() << "Using random sampling search\n");
+    return runRandomSearch(ddg, maxII);
+  }
+
+  if (algo == "sms") {
+    LLVM_DEBUG(DBGS() << "Using Swing Modulo Scheduling (SMS)\n");
+    return runSMS(ddg, minII, maxII);
+  }
+
+  LLVM_DEBUG(DBGS() << "Using Rau's Iterative Modulo Scheduling (IMS)\n");
+  return runRauIMS(ddg, minII, maxII, maxBacktracks);
+}
 
 } // namespace mlir::triton::gpu
