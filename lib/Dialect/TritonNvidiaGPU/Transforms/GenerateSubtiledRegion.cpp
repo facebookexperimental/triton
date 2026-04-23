@@ -76,9 +76,15 @@ struct EquivalenceResult {
   SmallVector<IdentityOp> identityOps;
 
   /// The actual operations in the template chain that are identity-inserted
-  /// (no counterpart in the other chain). Used by groupByContiguousTaskSetN
-  /// and groupByContiguousTaskSetWithIdentity to align segments.
+  /// (no counterpart in the other chain). Used by groupByContiguousTaskSet
+  /// to align segments when chains have different lengths.
   DenseSet<Operation *> identityOpSet;
+
+  /// When forcedIdentityOps is used: for each identity op, the other chain's
+  /// varying operand if the op matched (non-null), or null if the other chain
+  /// lacked the op (use identity constant). Empty when forcedIdentityOps is
+  /// not used.
+  SmallVector<Value> identityMatchedVarying;
 };
 
 /// Return true if `op` is an integer address computation op that can act as
@@ -140,9 +146,15 @@ static bool matchOps(Operation *op0, Operation *op1,
 /// alignment is used: extra ops in the longer chain are accepted if they are
 /// identity-compatible, and their results are mapped to their pass-through
 /// operand in the shorter chain's value space.
-static std::optional<EquivalenceResult>
-checkStructuralEquivalence(ArrayRef<Operation *> chain0,
-                           ArrayRef<Operation *> chain1) {
+///
+/// When `forcedIdentityOps` is provided, those template ops are ALWAYS
+/// treated as identity — even if they match the other chain's op. When a
+/// forced-identity op matches, both pointers advance but the match is
+/// recorded as identity with the other chain's varying operand stored in
+/// `identityMatchedVarying` for per-tile value tracking.
+static std::optional<EquivalenceResult> checkStructuralEquivalence(
+    ArrayRef<Operation *> chain0, ArrayRef<Operation *> chain1,
+    const DenseSet<Operation *> *forcedIdentityOps = nullptr) {
   // Determine which chain is the template (longer or chain0 if same length).
   unsigned tplIdx = (chain1.size() > chain0.size()) ? 1 : 0;
   ArrayRef<Operation *> tplChain = (tplIdx == 0) ? chain0 : chain1;
@@ -155,10 +167,62 @@ checkStructuralEquivalence(ArrayRef<Operation *> chain0,
   llvm::DenseMap<Value, Value> valueMap;
   SmallVector<std::pair<Value, Value>> differingOperands;
 
+  auto handleIdentityOp = [&](Operation *tOp) -> bool {
+    if (!isIdentityCompatibleOp(tOp) || tOp->getNumResults() != 1)
+      return false;
+    bool skipped = false;
+    unsigned numCandidates = isa<arith::SubIOp>(tOp) ? 1 : 2;
+    for (unsigned opIdx = 0; opIdx < numCandidates; ++opIdx) {
+      Value passThrough = tOp->getOperand(opIdx);
+      Value varying = tOp->getOperand(1 - opIdx);
+      Value otherVal = valueMap.lookup(passThrough);
+      if (!otherVal)
+        otherVal = passThrough;
+      valueMap[tOp->getResult(0)] = otherVal;
+      result.identityOps.push_back({varying, getIdentityValue(tOp)});
+      result.identityOpSet.insert(tOp);
+      skipped = true;
+      break;
+    }
+    return skipped;
+  };
+
   unsigned ti = 0, oi = 0;
   while (ti < tplChain.size() && oi < otherChain.size()) {
     Operation *tOp = tplChain[ti];
     Operation *oOp = otherChain[oi];
+
+    // If this template op is forced to be identity, handle it without
+    // calling matchOps (which would mutate valueMap/differingOperands).
+    // Check if the other chain has a corresponding op (same name) — if
+    // yes, it's a "matched identity" and we extract its varying operand.
+    if (forcedIdentityOps && forcedIdentityOps->count(tOp)) {
+      unsigned varIdx = (getIdentityValue(tOp) == 0) ? 1 : 0;
+      unsigned passIdx = 1 - varIdx;
+
+      if (oOp->getName() == tOp->getName()) {
+        // Other chain has the matching op. Map the template's result to
+        // the other chain's result so that downstream matchOps comparisons
+        // resolve correctly (valueMap maps template → other).
+        valueMap[tOp->getResult(0)] = oOp->getResult(0);
+
+        Value otherVarying = oOp->getOperand(varIdx);
+        result.identityOps.push_back(
+            {tOp->getOperand(varIdx), getIdentityValue(tOp)});
+        result.identityOpSet.insert(tOp);
+        result.identityMatchedVarying.push_back(otherVarying);
+        ti++;
+        oi++;
+        continue;
+      }
+      // Other chain lacks the op — pure identity.
+      if (handleIdentityOp(tOp)) {
+        result.identityMatchedVarying.push_back(Value());
+        ti++;
+        continue;
+      }
+      return std::nullopt;
+    }
 
     if (matchOps(tOp, oOp, valueMap, differingOperands)) {
       ti++;
@@ -166,61 +230,25 @@ checkStructuralEquivalence(ArrayRef<Operation *> chain0,
       continue;
     }
 
-    // Ops don't match. Check if the template op is identity-compatible and
-    // can be skipped (i.e., its result can be treated as equal to one of its
-    // operands in the other chain).
-    if (isIdentityCompatibleOp(tOp) && tOp->getNumResults() == 1) {
-      // Try each operand as the pass-through. The pass-through operand's
-      // mapped value (in the other chain) replaces the template op's result.
-      // For subi, only operand 0 can be the pass-through (x - 0 = x, but
-      // 0 - x != x).
-      bool skipped = false;
-      unsigned numCandidates = isa<arith::SubIOp>(tOp) ? 1 : 2;
-      for (unsigned opIdx = 0; opIdx < numCandidates; ++opIdx) {
-        Value passThrough = tOp->getOperand(opIdx);
-        Value varying = tOp->getOperand(1 - opIdx);
-
-        // Resolve the pass-through operand to the other chain's value.
-        Value otherVal = valueMap.lookup(passThrough);
-        if (!otherVal)
-          otherVal = passThrough; // external value, same in both chains
-
-        // Map the template op's result to the other chain's pass-through.
-        valueMap[tOp->getResult(0)] = otherVal;
-
-        int64_t identityVal = getIdentityValue(tOp);
-        result.identityOps.push_back({varying, identityVal});
-        result.identityOpSet.insert(tOp);
-        ti++;
-        skipped = true;
-        break;
-      }
-      if (skipped)
-        continue;
+    // Ops don't match. Try identity insertion.
+    if (handleIdentityOp(tOp)) {
+      ti++;
+      continue;
     }
 
-    // Can't align — not structurally equivalent.
     return std::nullopt;
   }
 
   // Handle remaining ops in the template chain.
   while (ti < tplChain.size()) {
     Operation *tOp = tplChain[ti];
-    if (!isIdentityCompatibleOp(tOp) || tOp->getNumResults() != 1)
+    if (!handleIdentityOp(tOp))
       return std::nullopt;
-
-    Value passThrough = tOp->getOperand(0);
-    Value varying = tOp->getOperand(1);
-    Value otherVal = valueMap.lookup(passThrough);
-    if (!otherVal)
-      otherVal = passThrough;
-    valueMap[tOp->getResult(0)] = otherVal;
-    result.identityOps.push_back({varying, getIdentityValue(tOp)});
-    result.identityOpSet.insert(tOp);
+    if (forcedIdentityOps)
+      result.identityMatchedVarying.push_back(Value());
     ti++;
   }
 
-  // All other-chain ops must be consumed.
   if (oi != otherChain.size())
     return std::nullopt;
 
@@ -228,7 +256,6 @@ checkStructuralEquivalence(ArrayRef<Operation *> chain0,
   if (tplIdx == 0) {
     result.differingOperands = std::move(differingOperands);
   } else {
-    // Template is chain1, so valueMap is chain1→chain0. Swap pairs.
     for (auto &[v0, v1] : differingOperands)
       result.differingOperands.push_back({v1, v0});
   }
@@ -243,10 +270,23 @@ struct NWayEquivalenceResult {
   unsigned templateChainIdx = 0;
   SmallVector<EquivalenceResult::IdentityOp> identityOps;
   DenseSet<Operation *> identityOpSet;
+
+  /// Per-tile varying values for each identity op. identityPerTile[i][t] is
+  /// the varying value for identity op i at tile t. A null Value means the
+  /// tile needs the identity constant (the op was missing from that tile's
+  /// chain). A non-null Value means the tile had a matching op with its own
+  /// varying operand value.
+  SmallVector<SmallVector<Value>> identityPerTile;
 };
 
 /// Check structural equivalence across N chains. Finds the longest chain
 /// as the template and compares all others against it pairwise.
+///
+/// Uses a "master set" approach for identity ops: first compares the
+/// template against the shortest non-template chain to discover all
+/// identity ops (the master set). Then re-compares all other chains with
+/// the master set forced, so identity counts are consistent across all
+/// pairs. Per-tile varying values are recorded in `identityPerTile`.
 static std::optional<NWayEquivalenceResult>
 checkStructuralEquivalenceN(ArrayRef<SmallVector<Operation *>> chains) {
   assert(chains.size() >= 2);
@@ -259,56 +299,81 @@ checkStructuralEquivalenceN(ArrayRef<SmallVector<Operation *>> chains) {
       tplIdx = t;
   }
 
-  // Compare each non-template chain against the template.
-  SmallVector<EquivalenceResult> pairResults(numTiles);
+  // Find the shortest non-template chain — comparing template against this
+  // chain discovers the maximum set of identity ops (the "master set").
+  unsigned shortIdx = 0;
+  bool firstNonTpl = true;
   for (unsigned t = 0; t < numTiles; ++t) {
     if (t == tplIdx)
       continue;
-    auto res = checkStructuralEquivalence(chains[tplIdx], chains[t]);
-    if (!res)
-      return std::nullopt;
-    if (res->templateChainIdx != 0)
+    if (firstNonTpl || chains[t].size() < chains[shortIdx].size()) {
+      shortIdx = t;
+      firstNonTpl = false;
+    }
+  }
+
+  // Step 1: Compare template vs shortest chain to build the master set.
+  auto masterRes = checkStructuralEquivalence(chains[tplIdx], chains[shortIdx]);
+  if (!masterRes || masterRes->templateChainIdx != 0)
+    return std::nullopt;
+
+  // Step 2: Re-compare all other chains with forcedIdentityOps so identity
+  // counts are consistent. The shortest chain's result is already correct.
+  SmallVector<EquivalenceResult> pairResults(numTiles);
+  pairResults[shortIdx] = std::move(*masterRes);
+
+  DenseSet<Operation *> &masterIdentity = pairResults[shortIdx].identityOpSet;
+
+  for (unsigned t = 0; t < numTiles; ++t) {
+    if (t == tplIdx || t == shortIdx)
+      continue;
+    auto res =
+        checkStructuralEquivalence(chains[tplIdx], chains[t], &masterIdentity);
+    if (!res || res->templateChainIdx != 0)
       return std::nullopt;
     pairResults[t] = std::move(*res);
   }
 
-  // All pairs must have the same number of differing operands and identity ops.
-  unsigned numDiff = 0;
-  unsigned numIdentity = 0;
-  bool first = true;
+  // Validate consistent counts.
+  unsigned numDiff = pairResults[shortIdx].differingOperands.size();
+  unsigned numIdentity = pairResults[shortIdx].identityOps.size();
   for (unsigned t = 0; t < numTiles; ++t) {
     if (t == tplIdx)
       continue;
-    if (first) {
-      numDiff = pairResults[t].differingOperands.size();
-      numIdentity = pairResults[t].identityOps.size();
-      first = false;
-    } else {
-      if (pairResults[t].differingOperands.size() != numDiff)
-        return std::nullopt;
-      if (pairResults[t].identityOps.size() != numIdentity)
-        return std::nullopt;
-    }
+    if (pairResults[t].differingOperands.size() != numDiff ||
+        pairResults[t].identityOps.size() != numIdentity)
+      return std::nullopt;
   }
-
-  // Find the first non-template index for reference.
-  unsigned refIdx = (tplIdx == 0) ? 1 : 0;
 
   NWayEquivalenceResult result;
   result.templateChainIdx = tplIdx;
-  result.identityOps = pairResults[refIdx].identityOps;
-  result.identityOpSet = pairResults[refIdx].identityOpSet;
+  result.identityOps = pairResults[shortIdx].identityOps;
+  result.identityOpSet = pairResults[shortIdx].identityOpSet;
 
+  // Build differing operands.
   for (unsigned i = 0; i < numDiff; ++i) {
     SmallVector<Value> perTile(numTiles);
-    // The template chain's value is .first from any pair result.
-    perTile[tplIdx] = pairResults[refIdx].differingOperands[i].first;
+    perTile[tplIdx] = pairResults[shortIdx].differingOperands[i].first;
     for (unsigned t = 0; t < numTiles; ++t) {
       if (t == tplIdx)
         continue;
       perTile[t] = pairResults[t].differingOperands[i].second;
     }
     result.differingOperands.push_back(std::move(perTile));
+  }
+
+  // Build per-tile identity varying values.
+  for (unsigned i = 0; i < numIdentity; ++i) {
+    SmallVector<Value> perTile(numTiles);
+    perTile[tplIdx] = result.identityOps[i].varyingOperand;
+    for (unsigned t = 0; t < numTiles; ++t) {
+      if (t == tplIdx)
+        continue;
+      if (!pairResults[t].identityMatchedVarying.empty())
+        perTile[t] = pairResults[t].identityMatchedVarying[i]; // may be null
+      // else: null (identity constant)
+    }
+    result.identityPerTile.push_back(std::move(perTile));
   }
 
   return result;
@@ -370,15 +435,15 @@ collectSplitTreeLeaves(triton::SplitOp rootSplit,
 }
 
 /// Collect the per-tile op chain for a split result: all ops in the block
-/// that transitively depend on `splitResult`.
-/// When `includeAuxiliary` is true, also collects ops that are needed by the
-/// chain but don't depend on the split result (e.g., address offset
-/// computations like arith.addi). This is used for the 2-tile path where
-/// identity insertion handles these ops. For the N-tile path, auxiliary ops
-/// are left out and treated as differing operands.
+/// that transitively depend on `splitResult`, plus auxiliary ops that are
+/// needed by the chain but don't depend on the split result (e.g., address
+/// offset computations like arith.addi).
+///
+/// `excludeOps` allows callers to prevent specific ops (e.g., inner setup
+/// ops from nested split trees) from being captured by the auxiliary walk.
 static SmallVector<Operation *>
 collectPerTileChain(Value splitResult, Operation *splitOp, Block *block,
-                    bool includeAuxiliary = true) {
+                    const DenseSet<Operation *> &excludeOps = {}) {
   SmallVector<Operation *> chain;
   llvm::DenseSet<Operation *> visited;
   SmallVector<Value> worklist;
@@ -392,6 +457,8 @@ collectPerTileChain(Value splitResult, Operation *splitOp, Block *block,
         continue;
       if (user->isBeforeInBlock(splitOp) || user == splitOp)
         continue;
+      if (excludeOps.contains(user))
+        continue;
       if (!visited.insert(user).second)
         continue;
       chain.push_back(user);
@@ -400,98 +467,55 @@ collectPerTileChain(Value splitResult, Operation *splitOp, Block *block,
     }
   }
 
-  if (includeAuxiliary) {
-    llvm::DenseSet<Operation *> chainSet(chain.begin(), chain.end());
-    SmallVector<Operation *> auxWorklist(chain.begin(), chain.end());
-    while (!auxWorklist.empty()) {
-      Operation *op = auxWorklist.pop_back_val();
-      for (Value operand : op->getOperands()) {
-        auto defOp = operand.getDefiningOp();
-        if (!defOp || defOp->getBlock() != block)
-          continue;
-        if (defOp->isBeforeInBlock(splitOp) || defOp == splitOp)
-          continue;
-        if (!chainSet.contains(defOp) && visited.insert(defOp).second) {
-          chainSet.insert(defOp);
-          auxWorklist.push_back(defOp);
-        }
+  // Auxiliary walk: recursively collect ops that chain ops depend on but
+  // that don't themselves depend on the split result.
+  llvm::DenseSet<Operation *> chainSet(chain.begin(), chain.end());
+  SmallVector<Operation *> auxWorklist(chain.begin(), chain.end());
+  while (!auxWorklist.empty()) {
+    Operation *op = auxWorklist.pop_back_val();
+    for (Value operand : op->getOperands()) {
+      auto defOp = operand.getDefiningOp();
+      if (!defOp || defOp->getBlock() != block)
+        continue;
+      if (defOp->isBeforeInBlock(splitOp) || defOp == splitOp)
+        continue;
+      if (excludeOps.contains(defOp))
+        continue;
+      if (!chainSet.contains(defOp) && visited.insert(defOp).second) {
+        chainSet.insert(defOp);
+        auxWorklist.push_back(defOp);
       }
     }
-    SmallVector<Operation *> fullChain;
-    for (Operation *op : chainSet)
-      fullChain.push_back(op);
-    llvm::sort(fullChain, [](Operation *a, Operation *b) {
-      return a->isBeforeInBlock(b);
-    });
-    return fullChain;
   }
 
-  llvm::sort(chain,
+  SmallVector<Operation *> fullChain;
+  for (Operation *op : chainSet)
+    fullChain.push_back(op);
+  llvm::sort(fullChain,
              [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
-  return chain;
+  return fullChain;
 }
 
-/// Group N chains by contiguous async task set. All chains must have the
-/// same length (no identity-compatible ops — the N-tile path excludes
-/// auxiliary ops so chains are uniform).
+/// Group N chains by contiguous async task set, handling identity-compatible
+/// ops that may make the template chain longer than the others.
+///
+/// Walks the template chain (identified by `equiv.templateChainIdx`) and
+/// pairs each non-identity op with the corresponding op in every other chain.
+/// Identity ops (present only in the template) are placed in all tiles'
+/// opsPerTile. When chains have equal length (no identity ops), this
+/// degenerates to simple positional pairing.
 static std::optional<SmallVector<ChainSegment>>
-groupByContiguousTaskSetN(ArrayRef<SmallVector<Operation *>> chains) {
+groupByContiguousTaskSet(ArrayRef<SmallVector<Operation *>> chains,
+                         const NWayEquivalenceResult &equiv) {
   unsigned numTiles = chains.size();
   assert(numTiles >= 2);
-  size_t chainLen = chains[0].size();
-  for (auto &c : chains) {
-    if (c.size() != chainLen)
-      return std::nullopt;
-  }
-  if (chainLen == 0)
-    return std::nullopt;
-
-  SmallVector<ChainSegment> segments;
-  for (size_t i = 0; i < chainLen; ++i) {
-    auto taskIds = getOpAsyncTaskIds(chains[0][i]);
-    for (unsigned t = 1; t < numTiles; ++t) {
-      if (getOpAsyncTaskIds(chains[t][i]) != taskIds)
-        return std::nullopt;
-    }
-
-    if (taskIds.empty() && !segments.empty()) {
-      for (unsigned t = 0; t < numTiles; ++t)
-        segments.back().opsPerTile[t].push_back(chains[t][i]);
-      continue;
-    }
-
-    if (segments.empty() || segments.back().taskIds != taskIds) {
-      ChainSegment seg;
-      seg.opsPerTile.resize(numTiles);
-      seg.taskIds = taskIds;
-      segments.push_back(std::move(seg));
-    }
-
-    for (unsigned t = 0; t < numTiles; ++t)
-      segments.back().opsPerTile[t].push_back(chains[t][i]);
-  }
-  return segments;
-}
-
-/// Group chains by contiguous async task set when the chains have different
-/// lengths (due to identity-compatible ops). Uses the template chain from the
-/// equivalence result for task set boundaries. Identity ops (present only in
-/// the template chain) are placed in both opsPerTile[0] and [1] of their
-/// segment.
-static std::optional<SmallVector<ChainSegment>>
-groupByContiguousTaskSetWithIdentity(ArrayRef<Operation *> chain0,
-                                     ArrayRef<Operation *> chain1,
-                                     const EquivalenceResult &equiv) {
-  ArrayRef<Operation *> tplChain =
-      (equiv.templateChainIdx == 0) ? chain0 : chain1;
-  ArrayRef<Operation *> otherChain =
-      (equiv.templateChainIdx == 0) ? chain1 : chain0;
-
+  unsigned tplIdx = equiv.templateChainIdx;
+  ArrayRef<Operation *> tplChain = chains[tplIdx];
   if (tplChain.empty())
     return std::nullopt;
 
-  // Two-pointer alignment: walk the template chain and pair with the other
-  // chain, skipping identity ops.
+  // All non-template chains have the same length (template length minus
+  // identity ops). Use a single "other" pointer that advances for all.
   SmallVector<ChainSegment> segments;
   unsigned oi = 0;
   for (size_t ti = 0; ti < tplChain.size(); ++ti) {
@@ -501,24 +525,21 @@ groupByContiguousTaskSetWithIdentity(ArrayRef<Operation *> chain0,
       // Ops without task IDs join the current segment.
     } else if (segments.empty() || segments.back().taskIds != taskIds) {
       ChainSegment seg;
-      seg.opsPerTile.resize(2);
+      seg.opsPerTile.resize(numTiles);
       seg.taskIds = taskIds;
       segments.push_back(std::move(seg));
     }
 
-    bool isIdentity = equiv.identityOpSet.count(tplChain[ti]);
-
-    if (isIdentity) {
-      segments.back().opsPerTile[0].push_back(tplChain[ti]);
-      segments.back().opsPerTile[1].push_back(tplChain[ti]);
+    if (equiv.identityOpSet.count(tplChain[ti])) {
+      for (unsigned t = 0; t < numTiles; ++t)
+        segments.back().opsPerTile[t].push_back(tplChain[ti]);
     } else {
-      assert(oi < otherChain.size());
-      Operation *op0 =
-          (equiv.templateChainIdx == 0) ? tplChain[ti] : otherChain[oi];
-      Operation *op1 =
-          (equiv.templateChainIdx == 0) ? otherChain[oi] : tplChain[ti];
-      segments.back().opsPerTile[0].push_back(op0);
-      segments.back().opsPerTile[1].push_back(op1);
+      for (unsigned t = 0; t < numTiles; ++t) {
+        if (t == tplIdx)
+          segments.back().opsPerTile[t].push_back(tplChain[ti]);
+        else
+          segments.back().opsPerTile[t].push_back(chains[t][oi]);
+      }
       ++oi;
     }
   }
@@ -572,19 +593,27 @@ static void buildSingleSubtiledRegionN(
   }
 
   // Identity insertions: one tile arg per identity op.
-  // Yield 2 values per identity op: (varying, identity_const).
-  // Template tile maps to varying; all other tiles map to identity_const.
+  // When identityPerTile is populated (mixed identity — some tiles have
+  // the op, others don't), yield N values per identity op (one per tile).
+  // Otherwise, yield 2 values (varying + identity_const).
+  bool hasMixedIdentity = !equiv.identityPerTile.empty();
   for (auto [i, id] : llvm::enumerate(equiv.identityOps)) {
     tileArgTypes.push_back(id.varyingOperand.getType());
-    unsigned varyingSlot = yieldIdx;
-    unsigned constSlot = yieldIdx + 1;
-    for (unsigned t = 0; t < numTiles; ++t) {
-      if (t == equiv.templateChainIdx)
-        tileMappings[t].push_back(varyingSlot);
-      else
-        tileMappings[t].push_back(constSlot);
+    if (hasMixedIdentity) {
+      for (unsigned t = 0; t < numTiles; ++t)
+        tileMappings[t].push_back(yieldIdx + t);
+      yieldIdx += numTiles;
+    } else {
+      unsigned varyingSlot = yieldIdx;
+      unsigned constSlot = yieldIdx + 1;
+      for (unsigned t = 0; t < numTiles; ++t) {
+        if (t == equiv.templateChainIdx)
+          tileMappings[t].push_back(varyingSlot);
+        else
+          tileMappings[t].push_back(constSlot);
+      }
+      yieldIdx += 2;
     }
-    yieldIdx += 2;
   }
 
   SmallVector<Attribute> mappingAttrs;
@@ -615,14 +644,31 @@ static void buildSingleSubtiledRegionN(
       setupYieldValues.push_back(setupMapping.lookupOrDefault(v));
   }
   // Yield identity insertion operands.
-  for (auto &id : equiv.identityOps) {
-    Value varying = setupMapping.lookupOrDefault(id.varyingOperand);
-    Value identityConst = arith::ConstantOp::create(
-        setupBuilder, loc,
-        setupBuilder.getIntegerAttr(id.varyingOperand.getType(),
-                                    id.identityVal));
-    setupYieldValues.push_back(varying);
-    setupYieldValues.push_back(identityConst);
+  if (!equiv.identityPerTile.empty()) {
+    // Mixed identity: yield N values per identity op (per-tile varying
+    // values, with identity constants for tiles missing the op).
+    for (auto [i, id] : llvm::enumerate(equiv.identityOps)) {
+      for (unsigned t = 0; t < numTiles; ++t) {
+        Value v = equiv.identityPerTile[i][t];
+        if (v)
+          setupYieldValues.push_back(setupMapping.lookupOrDefault(v));
+        else
+          setupYieldValues.push_back(arith::ConstantOp::create(
+              setupBuilder, loc,
+              setupBuilder.getIntegerAttr(id.varyingOperand.getType(),
+                                          id.identityVal)));
+      }
+    }
+  } else {
+    for (auto &id : equiv.identityOps) {
+      Value varying = setupMapping.lookupOrDefault(id.varyingOperand);
+      Value identityConst = arith::ConstantOp::create(
+          setupBuilder, loc,
+          setupBuilder.getIntegerAttr(id.varyingOperand.getType(),
+                                      id.identityVal));
+      setupYieldValues.push_back(varying);
+      setupYieldValues.push_back(identityConst);
+    }
   }
   SubtiledRegionYieldOp::create(setupBuilder, loc, setupYieldValues);
 
@@ -1356,10 +1402,13 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
     Operation *lastSetupOp = innerSetupOps.empty()
                                  ? static_cast<Operation *>(splitOp)
                                  : innerSetupOps.back();
+    // Exclude inner setup ops from auxiliary collection so the per-tile
+    // chains don't capture reshape/trans/split from other split-tree branches.
+    DenseSet<Operation *> excludeOps(innerSetupOps.begin(),
+                                     innerSetupOps.end());
     SmallVector<SmallVector<Operation *>> chains;
     for (Value leaf : leafValues) {
-      auto chain = collectPerTileChain(leaf, lastSetupOp, block,
-                                       /*includeAuxiliary=*/false);
+      auto chain = collectPerTileChain(leaf, lastSetupOp, block, excludeOps);
       if (chain.empty())
         return;
       chains.push_back(std::move(chain));
@@ -1391,7 +1440,7 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
 
     bool built = false;
     if (multiTask) {
-      auto segments = groupByContiguousTaskSetN(chains);
+      auto segments = groupByContiguousTaskSet(chains, *equiv);
       if (!segments || segments->empty())
         return;
       if (segments->size() == 1) {
@@ -1436,8 +1485,6 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
   if (!differing)
     return;
 
-  bool hasIdentityInsertions = !differing->identityOps.empty();
-
   SmallVector<Operation *> setupOps;
   for (auto it = Block::iterator(tmemLoad); it != Block::iterator(splitOp);
        ++it)
@@ -1445,15 +1492,13 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
   setupOps.push_back(splitOp);
 
   SmallVector<SmallVector<Operation *>> twoChains = {chain0, chain1};
+  auto nwayEquiv = toNWayEquivalence(*differing);
+
   Operation *insertBefore = findInsertionPoint(block, splitOp, twoChains);
   OpBuilder builder(insertBefore);
   Location loc = splitOp.getLoc();
 
-  std::optional<SmallVector<ChainSegment>> segments;
-  if (hasIdentityInsertions)
-    segments = groupByContiguousTaskSetWithIdentity(chain0, chain1, *differing);
-  else
-    segments = groupByContiguousTaskSetN(twoChains);
+  auto segments = groupByContiguousTaskSet(twoChains, nwayEquiv);
   if (!segments || segments->empty())
     return;
 
@@ -1601,7 +1646,10 @@ public:
           for (auto &op : block) {
             if (auto splitOp = dyn_cast<triton::SplitOp>(&op))
               if (!failedSplits.contains(&op))
-                splitOps.push_back(splitOp);
+                // Skip splits inside SubtiledRegionOp regions (cloned setup
+                // chains) to avoid infinite re-processing.
+                if (!op.getParentOfType<SubtiledRegionOp>())
+                  splitOps.push_back(splitOp);
           }
         }
       });
