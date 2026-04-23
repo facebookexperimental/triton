@@ -124,3 +124,91 @@ def _to_mxfp8_block(
 
     # Step 3: Store scales
     tlx.local_store(scale_out_tile, scale_e8m0)
+
+
+@triton.jit
+def _amax_to_e8m0_and_quantize(
+    data_input,
+    block_amax,
+    VEC_SIZE: tl.constexpr,
+    dtype: tl.constexpr,
+):
+    """
+    Compute E8M0 scales from pre-computed block amaxes and quantize data to FP8.
+
+    Instead of computing max(abs(data)) per block (128 max ops per row), this
+    function accepts pre-computed block amaxes derived from the raw QK values
+    via monotonicity of exp2: max(exp2(x)) == exp2(max(x)).
+
+    Args:
+        data_input: Input tensor [BLOCK_M, BLOCK_K] in float32
+        block_amax: Pre-computed block amaxes [BLOCK_M, NUM_SCALES]
+        VEC_SIZE: MX block size (32)
+        dtype: tl.float8e4nv or tl.float8e5
+
+    Returns:
+        scale_e8m0: E8M0 biased exponent scales [BLOCK_M, NUM_SCALES]
+        data_fp8: Quantized FP8 data [BLOCK_M, BLOCK_K]
+    """
+    BLOCK_M: tl.constexpr = data_input.shape[0]
+    BLOCK_K: tl.constexpr = data_input.shape[1]
+    NUM_SCALES: tl.constexpr = BLOCK_K // VEC_SIZE
+
+    if dtype == tl.float8e4nv:
+        FLOAT_MAX: tl.constexpr = 448.0
+    else:
+        tl.static_assert(dtype == tl.float8e5)
+        FLOAT_MAX: tl.constexpr = 57344.0
+
+    max_abs = block_amax
+
+    descale = max_abs / FLOAT_MAX
+    descale_exponent = (descale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
+    descale_rounded = descale_exponent.to(tl.float32, bitcast=True)
+    scale_e8m0 = (descale_exponent >> 23).to(tl.uint8)
+    quant_scale = tl.where(descale_rounded == 0, 0.0, 1.0 / descale_rounded)
+
+    data_reshaped = tl.reshape(data_input, [BLOCK_M, NUM_SCALES, VEC_SIZE])
+    quant_scale_expanded = tl.reshape(quant_scale, [BLOCK_M, NUM_SCALES, 1])
+    scaled_data = data_reshaped * quant_scale_expanded
+    scaled_data = tl.clamp(scaled_data, -FLOAT_MAX, FLOAT_MAX)
+    data_scaled_flat = tl.reshape(scaled_data, [BLOCK_M, BLOCK_K])
+    data_fp8 = data_scaled_flat.to(dtype)
+
+    return scale_e8m0, data_fp8
+
+
+@triton.jit
+def _to_mxfp8_block_with_block_amax(
+    data_input,
+    block_amax,
+    data_out_tile,
+    scale_out_tile,
+    VEC_SIZE: tl.constexpr,
+    dtype: tl.constexpr,
+):
+    """
+    Convert float32 data to MXFP8 using pre-computed block amaxes.
+
+    This is the blockscaled variant of _to_mxfp8_block that skips the expensive
+    max(abs(data)) computation per 32-element block by accepting pre-computed
+    block amaxes derived from raw QK values.
+
+    Args:
+        data_input: Input tensor [BLOCK_M, BLOCK_K] in float32
+        block_amax: Pre-computed block amaxes [BLOCK_M, NUM_SCALES]
+        data_out_tile: Preallocated buffer for FP8 data output
+        scale_out_tile: Preallocated buffer for E8M0 scale output
+        VEC_SIZE: MX block size (32)
+        dtype: tl.float8e4nv or tl.float8e5
+    """
+    BLOCK_M: tl.constexpr = data_input.shape[0]
+    BLOCK_K: tl.constexpr = data_input.shape[1]
+    tl.static_assert(BLOCK_M == 128)
+    tl.static_assert(BLOCK_K == 128)
+    tl.static_assert(VEC_SIZE == 32)
+
+    scale_e8m0, data_fp8 = _amax_to_e8m0_and_quantize(data_input, block_amax, VEC_SIZE, dtype)
+
+    tlx.local_store(data_out_tile, data_fp8)
+    tlx.local_store(scale_out_tile, scale_e8m0)
