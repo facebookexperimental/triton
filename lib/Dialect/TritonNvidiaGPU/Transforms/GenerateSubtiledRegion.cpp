@@ -287,8 +287,9 @@ struct NWayEquivalenceResult {
 /// identity ops (the canonical identity set). Then re-compares all other chains
 /// with the canonical identity set forced, so identity counts are consistent
 /// across all pairs. Per-tile varying values are recorded in `identityPerTile`.
-static std::optional<NWayEquivalenceResult>
-checkStructuralEquivalenceN(ArrayRef<SmallVector<Operation *>> chains) {
+static std::optional<NWayEquivalenceResult> checkStructuralEquivalenceN(
+    ArrayRef<SmallVector<Operation *>> chains,
+    const DenseSet<Operation *> *outerIdentityOps = nullptr) {
   assert(chains.size() >= 2);
   unsigned numTiles = chains.size();
 
@@ -314,25 +315,29 @@ checkStructuralEquivalenceN(ArrayRef<SmallVector<Operation *>> chains) {
   }
 
   // Step 1: Compare template vs shortest chain to build the canonical identity
-  // set.
-  auto canonicalRes =
-      checkStructuralEquivalence(chains[tplIdx], chains[shortIdx]);
+  // set. If an outer identity set is provided (from the full-chain
+  // equivalence), use it to force consistent identity detection.
+  auto canonicalRes = checkStructuralEquivalence(
+      chains[tplIdx], chains[shortIdx], outerIdentityOps);
   if (!canonicalRes || canonicalRes->templateChainIdx != 0)
     return std::nullopt;
 
   // Step 2: Re-compare all other chains with forcedIdentityOps so identity
-  // counts are consistent. The shortest chain's result is already correct.
+  // counts are consistent. Use whichever identity set is larger: the one
+  // discovered in step 1 or the outer one.
   SmallVector<EquivalenceResult> pairResults(numTiles);
   pairResults[shortIdx] = std::move(*canonicalRes);
 
   DenseSet<Operation *> &canonicalIdentity =
       pairResults[shortIdx].identityOpSet;
+  const DenseSet<Operation *> *forcedSet = &canonicalIdentity;
+  if (outerIdentityOps && outerIdentityOps->size() > canonicalIdentity.size())
+    forcedSet = outerIdentityOps;
 
   for (unsigned t = 0; t < numTiles; ++t) {
     if (t == tplIdx || t == shortIdx)
       continue;
-    auto res = checkStructuralEquivalence(chains[tplIdx], chains[t],
-                                          &canonicalIdentity);
+    auto res = checkStructuralEquivalence(chains[tplIdx], chains[t], forcedSet);
     if (!res || res->templateChainIdx != 0)
       return std::nullopt;
     pairResults[t] = std::move(*res);
@@ -714,11 +719,10 @@ static gpu::MemDescType createBufferMemDescType(MLIRContext *ctx,
 /// Build multiple SubtiledRegionOps for N-tile chains spanning multiple
 /// async task sets. Uses implicit buffering (Option 2) at segment
 /// transitions — cross-segment tensor values are communicated through SMEM.
-static bool buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
-                                           Location loc,
-                                           ArrayRef<Operation *> setupOps,
-                                           ArrayRef<Value> leafValues,
-                                           ArrayRef<ChainSegment> segments) {
+static bool buildMultiTaskSubtiledRegionsN(
+    OpBuilder &outerBuilder, Location loc, ArrayRef<Operation *> setupOps,
+    ArrayRef<Value> leafValues, ArrayRef<ChainSegment> segments,
+    const DenseSet<Operation *> *canonicalIdentityOps = nullptr) {
   MLIRContext *ctx = outerBuilder.getContext();
   unsigned numTiles = leafValues.size();
 
@@ -785,7 +789,8 @@ static bool buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
     SmallVector<SmallVector<Operation *>> segChains;
     for (auto &ops : segments[segIdx].opsPerTile)
       segChains.push_back(SmallVector<Operation *>(ops));
-    auto segEquiv = checkStructuralEquivalenceN(segChains);
+    auto segEquiv =
+        checkStructuralEquivalenceN(segChains, canonicalIdentityOps);
     if (!segEquiv)
       return false;
     segEquivs.push_back(std::move(*segEquiv));
@@ -1148,21 +1153,42 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
 
       // Strip identity ops from the non-template side so that per-segment
       // checkStructuralEquivalence correctly detects identity insertions.
-      unsigned nonTpl = (equiv->templateChainIdx == 0) ? 1 : 0;
       for (auto &seg : reordered) {
-        SmallVector<Operation *> filtered;
-        for (auto *op : seg.opsPerTile[nonTpl]) {
-          if (!equiv->identityOpSet.count(op))
-            filtered.push_back(op);
+        for (unsigned t = 0; t < seg.opsPerTile.size(); ++t) {
+          if (t == equiv->templateChainIdx)
+            continue;
+          SmallVector<Operation *> filtered;
+          for (auto *op : seg.opsPerTile[t]) {
+            if (!equiv->identityOpSet.count(op))
+              filtered.push_back(op);
+          }
+          seg.opsPerTile[t] = std::move(filtered);
         }
-        seg.opsPerTile[nonTpl] = std::move(filtered);
       }
 
       built = buildMultiTaskSubtiledRegionsN(builder, loc, setupOps, leafValues,
-                                             reordered);
+                                             reordered, &equiv->identityOpSet);
     } else {
+      // Strip identity ops from non-template tiles so per-segment
+      // equivalence detects them correctly (otherwise all tiles have the
+      // same Operation* and identity is invisible).
+      SmallVector<ChainSegment> strippedSegments(segments->begin(),
+                                                 segments->end());
+      for (auto &seg : strippedSegments) {
+        for (unsigned t = 0; t < seg.opsPerTile.size(); ++t) {
+          if (t == equiv->templateChainIdx)
+            continue;
+          SmallVector<Operation *> filtered;
+          for (auto *op : seg.opsPerTile[t]) {
+            if (!equiv->identityOpSet.count(op))
+              filtered.push_back(op);
+          }
+          seg.opsPerTile[t] = std::move(filtered);
+        }
+      }
       built = buildMultiTaskSubtiledRegionsN(builder, loc, setupOps, leafValues,
-                                             *segments);
+                                             strippedSegments,
+                                             &equiv->identityOpSet);
     }
   }
 
