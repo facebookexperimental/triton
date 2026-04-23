@@ -161,7 +161,7 @@ def _to_mxfp8_block(
 
     Args:
         data_input: Input tensor of shape [BLOCK_M, BLOCK_K] in float32 (in registers)
-        data_out_tile: Preallocated SMEM buffer for FP8 data output
+        data_out_tile: Preallocated buffer for FP8 data output (SMEM or TMEM)
         scale_out_tile: Preallocated buffer for int8 (E8M0) scale output (SMEM or TMEM)
         VEC_SIZE: The MX block size (typically 32)
         dtype: Target output dtype, either tl.float8e4nv or tl.float8e5
