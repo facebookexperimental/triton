@@ -28,8 +28,8 @@ void addSubsliceRangeToSetup(SubtiledRegionOp op) {
   // Collect tmem_subslice ops in the setup, grouped by source.
   // We expect exactly numTiles subslice ops from the same source.
   SmallVector<TMEMSubSliceOp> subsliceOps;
-  for (Operation &op : setupBlock.without_terminator()) {
-    if (auto subslice = dyn_cast<TMEMSubSliceOp>(&op))
+  for (Operation &setupOp : setupBlock.without_terminator()) {
+    if (auto subslice = dyn_cast<TMEMSubSliceOp>(&setupOp))
       subsliceOps.push_back(subslice);
   }
 
@@ -401,11 +401,23 @@ void pushSharedSetupToTile(SubtiledRegionOp op) {
       Operation *curr = worklist.pop_back_val();
       if (!visited.insert(curr).second)
         continue;
+
+      if (!isPure(curr)) {
+        allMovable = false;
+        break;
+      }
       slice.push_back(curr);
 
       for (Value operand : curr->getOperands()) {
         Operation *operandDef = operand.getDefiningOp();
-        if (!operandDef || operandDef->getBlock() != &setupBlock)
+        if (!operandDef) {
+          if (cast<BlockArgument>(operand).getOwner() == &setupBlock) {
+            allMovable = false;
+            break;
+          }
+          continue;
+        }
+        if (operandDef->getBlock() != &setupBlock)
           continue;
         worklist.push_back(operandDef);
       }

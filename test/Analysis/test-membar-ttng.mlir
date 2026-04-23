@@ -132,8 +132,8 @@ tt.func @tma_special_cases_cf(%arg1: !tt.tensordesc<tensor<256x64xf16, #shared>>
 #shared_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 1024 : i32} {
-// CHECK-LABEL: @no_barrier_between_different_index_init_inval
-tt.func @no_barrier_between_different_index_init_inval() {
+// CHECK-LABEL: @barrier_between_different_index_init_inval
+tt.func @barrier_between_different_index_init_inval() {
   %c0 = arith.constant 0 : i32
   %c1 = arith.constant 1 : i32
   %bars = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #shared_bar, #ttg.shared_memory, mutable>

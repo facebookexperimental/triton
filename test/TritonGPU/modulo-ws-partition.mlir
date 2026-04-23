@@ -8,21 +8,18 @@
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
-// Verify that Pass B assigns utilization-driven ttg.partition attrs on a
-// persistent kernel with a WS outer loop containing an inner K-loop.
-// Expected partitions: MEM=0, TC=1, CUDA(tmem_load)=2.
-// Shared/scalar ops get allParts [0,1,2].
+// Verify that the modulo schedule pass runs on the inner loop and the
+// ws-partition pass processes the outer WS loop. With selfLatency=1, the
+// single-MMA GEMM inner loop gets tt.num_stages=2 and no tt.autows
+// (all MMAs in same stage). The outer loop gets tt.warp_specialize.
 //
 // CHECK-LABEL: @persistent_gemm_ws_partition
-// MEM ops (descriptor_load, local_alloc) → partition 0
-// CHECK: tt.descriptor_load {{.*}} ttg.partition = array<i32: 0>
-// CHECK: tt.descriptor_load {{.*}} ttg.partition = array<i32: 0>
-// CHECK: ttg.local_alloc {{.*}} ttg.partition = array<i32: 0>
-// CHECK: ttg.local_alloc {{.*}} ttg.partition = array<i32: 0>
-// TC ops (tc_gen5_mma) → partition 1
-// CHECK: ttng.tc_gen5_mma {{.*}} ttg.partition = array<i32: 1>
-// CUDA ops (tmem_load) → partition 2
-// CHECK: ttng.tmem_load {{.*}} ttg.partition = array<i32: 2>
+// CHECK: scf.for
+// Inner loop has tt.num_stages from modulo schedule
+// CHECK: scf.for
+// CHECK: tt.num_stages = 2 : i32
+// Outer loop has tt.warp_specialize
+// CHECK: tt.warp_specialize
 tt.func @persistent_gemm_ws_partition(
   %a_desc: !tt.tensordesc<tensor<128x64xf16>>,
   %b_desc: !tt.tensordesc<tensor<64x128xf16>>,
