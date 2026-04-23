@@ -21,6 +21,8 @@ add_triton_library(NVHopperTransforms
   ModuloScheduling/LatencyModel.cpp
   ModuloScheduling/DataDependenceGraph.cpp
   ModuloScheduling/ModuloReservationTable.cpp
+  ModuloScheduling/SwingScheduler.cpp
+  ModuloScheduling/ExhaustiveScheduler.cpp
   ModuloScheduling/ModuloSchedulePass.cpp
   ModuloScheduling/ModuloWSPartitionPass.cpp
   ModuloScheduling/ModuloScheduleGraph.cpp

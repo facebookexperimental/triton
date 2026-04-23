@@ -20,6 +20,7 @@ This document is based on the original design in [WS global instruction scheduli
   - [Step 1: Compute Minimum Initiation Interval (II)](#step-1-compute-minimum-initiation-interval-ii)
   - [Step 2: Modulo Reservation Table Scheduling](#step-2-modulo-reservation-table-scheduling)
     - [Background: Rau's Iterative Modulo Scheduling](#background-raus-iterative-modulo-scheduling)
+    - [Alternative: Swing Modulo Scheduling (SMS)](#alternative-swing-modulo-scheduling-sms)
   - [Step 2.5: Compute Cluster IDs from the Modulo Schedule](#step-25-compute-cluster-ids-from-the-modulo-schedule)
   - [Step 3: Derive Per-Region Pipeline Depth from the Modulo Schedule](#step-3-derive-per-region-pipeline-depth-from-the-modulo-schedule)
   - [Step 4: Handling Resource Pressure (SMEM/TMEM Budget)](#step-4-handling-resource-pressure-smemtmem-budget)
@@ -348,6 +349,8 @@ The algorithm as described has several limitations:
 6. **No multi-CTA or cluster-level scheduling**: The algorithm schedules within a single CTA. Multi-CTA kernels (e.g., `blackwell_gemm_2cta.py`) require additional coordination for cross-CTA B-tile sharing and cluster-level barrier synchronization, which is handled separately.
 
 7. **Register allocation is approximate**: Pass B Step 4 estimates register usage from live variable counts but doesn't perform full register allocation. The actual register count is determined by the compiler backend (ptxas), which may differ from the estimate and cause spills that the schedule didn't anticipate.
+
+8. **SMS limitations**: The SMS implementation's simplified ASAP/ALAP computation (no II-dependent recurrence bounds) and BFS ordering (no SCC prioritization) may produce suboptimal schedules for kernels with multiple interacting recurrence circuits, such as FA backward with 5 MMA ops and cross-iteration accumulator/softmax/pointer dependencies. For single-MMA kernels (GEMM), SMS and Rau produce identical schedules.
 
 ---
 
@@ -759,6 +762,117 @@ def modulo_schedule(DDG, latencies, unit_map, MinII):
 
         II += 1  # Try larger II
 ```
+
+#### Alternative: Swing Modulo Scheduling (SMS)
+
+Swing Modulo Scheduling (J. Llosa, A. Gonzalez, E. Ayguade, M. Valero, "Swing Modulo Scheduling: A Lifetime-Sensitive Approach", PACT 1996), SMS, avoids backtracking by using a slack-based node ordering and directional placement.
+
+**Key differences from Rau's IMS:**
+
+| Property | Rau's IMS | SMS |
+|----------|-----------|-----|
+| Complexity | Potentially exponential (backtracking) | O(n) per II attempt |
+| Node ordering | Critical-path height (bottom-up) | Slack = ALAP - ASAP (tightest first) |
+| Placement | Earliest free slot, eject if blocked | Top-down for successors, bottom-up for predecessors |
+| Register pressure | Not considered | Reduced by keeping producer-consumer pairs close |
+
+**SMS Algorithm:**
+
+1. **Compute ASAP/ALAP**: Forward/backward relaxation including loop-carried edges (II-dependent: `ASAP[v] >= ASAP[u] + latency - distance * II`), recomputed for each candidate II. Slack = ALAP - ASAP measures scheduling freedom.
+
+2. **Ordering phase (swing)**: Start with the minimum-slack op (most constrained). Then BFS-expand: add its successors (marked top-down) sorted by ascending slack, then its predecessors (marked bottom-up) sorted by ascending slack. This alternation is the "swing" — it keeps producers and consumers adjacent in the schedule.
+
+3. **Scheduling phase**: For each op in swing order:
+   - **Top-down** ops: place at the earliest free slot from `earliest` upward (data is ready, issue immediately).
+   - **Bottom-up** ops: place at the latest free slot from `latest` downward (defer production, reducing live range and register pressure).
+
+```python
+def sms_schedule(DDG, latencies, unit_map, MinII):
+    for II in range(MinII, MinII + 11):  # capped at MinII+10
+        # Recompute per-II: loop-carried edges depend on II
+        asap = compute_ASAP(DDG, latencies, II)
+        alap = compute_ALAP(DDG, latencies, asap, II)
+        slack = {op: alap[op] - asap[op] for op in DDG.nodes}
+
+        table = ReservationTable(II)
+        scheduled = {}
+
+        # Ordering: BFS from min-slack seed
+        seed = min(DDG.nodes, key=lambda n: slack[n])
+        order = [(seed, True)]  # (node, is_top_down)
+        visited = {seed}
+        for node, _ in order:
+            # Successors → top-down
+            for s in sorted(successors(node), key=lambda n: slack[n]):
+                if s not in visited:
+                    order.append((s, True))
+                    visited.add(s)
+            # Predecessors → bottom-up
+            for p in sorted(predecessors(node), key=lambda n: slack[n]):
+                if p not in visited:
+                    order.append((p, False))
+                    visited.add(p)
+
+        # Placement
+        success = True
+        for op, top_down in order:
+            earliest = compute_earliest(op, scheduled, DDG, latencies, II)
+            latest = compute_latest(op, scheduled, DDG, latencies, II)
+            if top_down:
+                slot = table.find_free(earliest, unit_map[op])
+            else:
+                slot = table.find_free_reverse(latest, earliest, unit_map[op])
+            if slot is None:
+                slot = table.find_free(earliest, unit_map[op])  # fallback
+            if slot is None:
+                success = False
+                break
+            table.reserve(slot, unit_map[op], op)
+            scheduled[op] = slot
+
+        if success:
+            return scheduled, II
+    return None
+```
+
+**Implementation status:** SMS is available via `TRITON_USE_MODULO_SCHEDULE=sms`. Source: `SwingScheduler.cpp`. The implementation has the following simplifications relative to the paper:
+
+1. **No recurrence-aware ordering.** The paper identifies SCCs, orders them by RecMII contribution, and schedules the most critical recurrence first. The implementation uses simple BFS from the minimum-slack node.
+
+2. **Fallback on placement failure.** When the directional scan finds no free slot, the implementation falls back to `find_free` from earliest. The paper would fail at this II and increment.
+
+3. **BFS follows all DDG edges** including loop-carried (distance > 0). The paper's ordering only follows distance-0 edges.
+
+ASAP/ALAP include loop-carried edges and are recomputed per-II: `ASAP[v] >= ASAP[u] + latency - distance * II`, with a convergence limit of 1000 iterations.
+
+**selfLatency model:** All pipelines use `selfLatency = 1` because GPU execution units are deeply pipelined — a new instruction can be issued every ~1 cycle. This makes ResMII negligible (equal to the op count on the busiest pipeline) and lets RecMII (data dependencies) drive the schedule. Without this fix, SMS fails on FA backward (ResMII=4500 from 5 MMAs × 900 selfLatency each).
+
+**Stage assignment (emitMMAAnnotations):** After SMS assigns cycles, the pass derives pipeline stage annotations (`tt.autows`) for MMA ops using transitive MMA dependency counting:
+
+- 0-1 transitive MMA predecessors → stage 0 (can be prefetched)
+- 2+ transitive MMA predecessors → stage 1 (gated on multiple prior results)
+
+Within each stage, independent MMAs share the same order (cluster ID) to avoid barrier deadlocks.
+
+Example (FA backward, 5 MMAs):
+
+| MMA | Transitive MMA deps | Stage | Order |
+|-----|---------------------|-------|-------|
+| qkT = dot(k, qT) | 0 | 0 | 0 |
+| dpT = dot(v, do^T) | 0 | 0 | 0 |
+| dv += dot(ppT, do) | 1 (qkT) | 0 | 1 |
+| dq = dot(dsT^T, k) | 2 (qkT, dpT) | 1 | 0 |
+| dk += dot(dsT, qT) | 2 (qkT, dpT) | 1 | 0 |
+
+This matches the hand-tuned annotation partition exactly. Annotations are skipped when all MMAs land in the same stage (e.g., GEMM, FA forward) or when the loop already has `tt.autows` from Python `attrs=`.
+
+FA BWD performance (B200, `TRITON_USE_META_WS=1 TRITON_USE_META_PARTITION=1`):
+
+| Shape | Baseline TFLOPS | SMS TFLOPS | Diff |
+|---|---|---|---|
+| Z=4 H=16 N=2048 D=128 | 409.4 | 409.9 | +0.1% |
+| Z=8 H=16 N=1024 D=128 | 324.7 | 323.3 | -0.4% |
+| Z=1 H=32 N=4096 D=128 | 471.2 | 472.0 | +0.2% |
 
 ### Step 2.5: Compute Cluster IDs from the Modulo Schedule
 
