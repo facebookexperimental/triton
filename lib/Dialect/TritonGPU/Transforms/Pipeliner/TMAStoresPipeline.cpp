@@ -91,9 +91,8 @@ static void lowerTMADescriptorCreation(scf::ForOp forOp) {
 
 bool mlir::triton::pipelineEarlyLoweredTMAStores(scf::ForOp forOp) {
   // Convert early-lowered TMA stores from the token-based wait pattern to
-  // the pendings-based pattern. At this point the LocalAllocOp has been
-  // split (LocalAllocOp() outside loop + LocalStoreOp inside loop) and
-  // the alloc hoisted before the loop by the memory planner.
+  // the pendings-based pattern. Alloc sharing and hoisting are already
+  // handled by doTMAStoreLowering and the memory planner (Phase 6).
   //
   // Input pattern (inside loop):
   //   LocalStoreOp(src, alloc)
@@ -122,32 +121,13 @@ bool mlir::triton::pipelineEarlyLoweredTMAStores(scf::ForOp forOp) {
   if (tmaStores.empty())
     return false;
 
-  // Reuse a single alloc per shape/element-type, matching pipelineTMAStores.
-  // Since each subtile store does TMAStoreWaitOp(0) before overwriting,
-  // sharing is safe.
-  DenseMap<std::pair<ArrayRef<int64_t>, Type>, Value> sharedAllocs;
-  DenseSet<Operation *> origAllocsToErase;
-
   for (auto copyOp : tmaStores) {
     Location loc = copyOp.getLoc();
-    Value origAlloc = copyOp.getSrc();
-    auto allocOp = origAlloc.getDefiningOp<ttg::LocalAllocOp>();
-    auto memDescType = cast<ttg::MemDescType>(origAlloc.getType());
-    auto key =
-        std::make_pair(memDescType.getShape(), memDescType.getElementType());
-    Value &sharedAlloc = sharedAllocs[key];
-    if (!sharedAlloc) {
-      if (allocOp && !allocOp->getParentOfType<scf::ForOp>()) {
-        sharedAlloc = origAlloc;
-      } else {
-        OpBuilder hoistBuilder(forOp);
-        sharedAlloc = ttg::LocalAllocOp::create(hoistBuilder, loc, memDescType);
-      }
-    }
+    Value alloc = copyOp.getSrc();
 
     // Find the LocalStoreOp that writes to this alloc.
     ttg::LocalStoreOp localStore = nullptr;
-    for (auto user : origAlloc.getUsers()) {
+    for (auto user : alloc.getUsers()) {
       if (auto s = dyn_cast<ttg::LocalStoreOp>(user)) {
         if (s->getParentOfType<scf::ForOp>() == forOp) {
           localStore = s;
@@ -160,9 +140,6 @@ bool mlir::triton::pipelineEarlyLoweredTMAStores(scf::ForOp forOp) {
     if (localStore) {
       OpBuilder builder(localStore);
       ttng::TMAStoreWaitOp::create(builder, loc, 0);
-      // Redirect LocalStoreOp to the shared alloc.
-      if (sharedAlloc != origAlloc)
-        localStore.getDstMutable().assign(sharedAlloc);
     }
 
     // Insert FenceAsyncSharedOp before the TMA copy.
@@ -177,24 +154,14 @@ bool mlir::triton::pipelineEarlyLoweredTMAStores(scf::ForOp forOp) {
         waitOp->erase();
     }
 
-    // Replace with fire-and-forget copy using the shared alloc.
+    // Replace with fire-and-forget copy (no token).
     {
       OpBuilder builder(copyOp);
       ttng::AsyncTMACopyLocalToGlobalOp::create(builder, loc, copyOp.getDesc(),
-                                                copyOp.getCoord(), sharedAlloc,
+                                                copyOp.getCoord(), alloc,
                                                 copyOp.getEvict());
       copyOp->erase();
     }
-
-    // Mark the original alloc for removal if it's not the shared one.
-    if (allocOp && sharedAlloc != origAlloc)
-      origAllocsToErase.insert(allocOp);
-  }
-
-  // Erase unused original allocs.
-  for (auto *op : origAllocsToErase) {
-    if (op->use_empty())
-      op->erase();
   }
 
   // Final wait after the loop.
