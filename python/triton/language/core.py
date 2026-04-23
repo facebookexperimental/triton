@@ -2094,7 +2094,7 @@ def cast(input, dtype: dtype, fp_downcast_rounding: Optional[str] = None, bitcas
 
 @builtin
 def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_imprecise_acc=None, out_dtype=float32,
-        attrs=None, _semantic=None):
+        attrs=None, two_ctas=False, _semantic=None):
     """
     Returns the matrix product of two blocks.
 
@@ -2118,6 +2118,10 @@ def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_i
       specified (i.e. at least one must be :code:`None`).
     :param attrs: Optional dictionary of string-valued attributes to attach to the dot operation.
     :type attrs: dict, optional
+    :param two_ctas: If True, enables 2-CTA collective matmul on Blackwell (SM100+).
+      The user must partition the B operand across two CTAs and launch with
+      ``ctas_per_cga=(2, 1, 1)``. Generates ``tcgen05.mma.cta_group::2``.
+    :type two_ctas: bool
     """
     attrs = _unwrap_if_constexpr(attrs)
     out_dtype = _unwrap_if_constexpr(out_dtype)
@@ -2146,7 +2150,8 @@ def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_i
         if acc is not None:
             acc = _semantic.reshape(acc, [batch_size] + c_shape[-2:], can_reorder=False)
 
-    res = _semantic.dot(input, other, acc, input_precision, allow_tf32, max_num_imprecise_acc, out_dtype, attrs)
+    res = _semantic.dot(input, other, acc, input_precision, allow_tf32, max_num_imprecise_acc, out_dtype, attrs,
+                        two_ctas)
 
     if rank >= 4:
         res = _semantic.reshape(res, c_shape, can_reorder=False)
