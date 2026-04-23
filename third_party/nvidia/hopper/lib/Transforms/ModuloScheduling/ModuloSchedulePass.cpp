@@ -1163,226 +1163,303 @@ struct ModuloSchedulePass
                      "(test-only; bypasses LLVM_DEBUG)"),
       llvm::cl::init(false)};
 
+  /// DDG transformation hooks for iterative refinement.
+  /// Return true if any DDG was modified (triggers re-scheduling).
+
+  /// Pass A.5: Data partitioning — split underutilized loop ops into sub-tiles.
+  /// TODO: Implement when needed.
+  bool applyDataPartitioning(ModuleOp moduleOp,
+                             const ttg::LatencyModel &model) {
+    return false;
+  }
+
+  /// Pass A.7: Epilogue subtiling — split monolithic TMA stores into
+  /// independent sub-chains for better pipeline interleaving.
+  ///
+  /// The actual IR splitting (tensor extract_slice + sub-stores) requires
+  /// encoding-aware tensor operations that are better handled at a higher
+  /// level (Python frontend or dedicated TTGIR pass). This hook identifies
+  /// candidate stores and returns true if subtiling would be beneficial,
+  /// allowing the iterative loop to signal that the DDG should be refined.
+  ///
+  /// For now, this is a stub that returns false. The epilogue subtiling
+  /// concept is demonstrated by the list scheduler test
+  /// (epilogue-subtiling.mlir) which shows interleaving of pre-split
+  /// independent store chains.
+  /// TODO: Implement tensor splitting with proper TTGIR encoding handling.
+  bool applyEpilogueSubtiling(ModuleOp moduleOp,
+                              const ttg::LatencyModel &model) {
+    return false;
+  }
+
   void runOnOperation() override {
     auto moduleOp = getOperation();
     ttg::LatencyModel model;
 
-    // Find loops that directly contain MMA ops in their body (not nested).
-    // Unlike the original innermost-loop filter, this handles deeply nested
-    // kernels like FA backward where MMAs are at depth 3-4 with epilogue
-    // loops nested deeper.
-    SmallVector<scf::ForOp> innerLoops;
-    moduleOp.walk([&](scf::ForOp loop) {
-      // Check direct children of loop body for MMA/load ops.
-      bool hasTMALoad = false;
-      bool hasMMAv5 = false;
-      bool hasExistingAnnotation = false;
-      for (auto &op : loop.getBody()->without_terminator()) {
-        if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(&op))
-          hasTMALoad = true;
-        if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(&op))
-          hasTMALoad = true;
-        if (isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp>(&op)) {
-          hasMMAv5 = true;
-          if (op.hasAttr("tt.autows"))
-            hasExistingAnnotation = true;
+    // ================================================================
+    // Iterative scheduling loop (design doc Pass A orchestrator)
+    //
+    // Each iteration: schedule → derive depths → check budget →
+    // apply DDG transformations → re-run if any DDG changed.
+    // Converges in 1-2 iterations.
+    // ================================================================
+    constexpr int kMaxIterations = 3;
+    for (int iteration = 0; iteration < kMaxIterations; ++iteration) {
+      LDBG("=== Iterative scheduling: iteration " << iteration << " ===");
+
+      // Step 1: Find loops that directly contain MMA ops in their body
+      // (not nested). Unlike the original innermost-loop filter, this
+      // handles deeply nested kernels like FA backward where MMAs are at
+      // depth 3-4 with epilogue loops nested deeper.
+      SmallVector<scf::ForOp> innerLoops;
+      moduleOp.walk([&](scf::ForOp loop) {
+        // Check direct children of loop body for MMA/load ops.
+        bool hasTMALoad = false;
+        bool hasMMAv5 = false;
+        bool hasExistingAnnotation = false;
+        for (auto &op : loop.getBody()->without_terminator()) {
+          if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(&op))
+            hasTMALoad = true;
+          if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(&op))
+            hasTMALoad = true;
+          if (isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp>(&op)) {
+            hasMMAv5 = true;
+            if (op.hasAttr("tt.autows"))
+              hasExistingAnnotation = true;
+          }
         }
-      }
-      if (!hasTMALoad && !hasMMAv5)
-        return;
-      // Skip loops that already have hand-tuned tt.autows annotations
-      // from Python attrs=. These are set at the Python level and
-      // propagated through accelerateMatmul. Re-annotating would
-      // override the hand-tuned schedule.
-      if (hasExistingAnnotation) {
-        LDBG("Skipping loop with existing tt.autows annotations");
-        return;
-      }
-      innerLoops.push_back(loop);
-    });
-
-    LDBG("Found " << innerLoops.size() << " innermost loop(s)");
-
-    for (auto innerLoop : innerLoops) {
-      // Build DDG for this inner loop.
-      auto ddg = ttg::DataDependenceGraph::build(innerLoop, model);
-      if (ddg.getNumNodes() == 0)
-        continue;
-
-      LDBG("DDG: " << ddg.getNumNodes() << " nodes, " << ddg.getEdges().size()
-                   << " edges");
-
-      // Run modulo scheduling.
-      // Count key ops for diagnostics.
-      int nMEM = 0, nTC = 0, nCUDA = 0, nSFU = 0, nNONE = 0;
-      for (const auto &node : ddg.getNodes()) {
-        switch (node.pipeline) {
-        case ttg::HWPipeline::MEM:
-          nMEM++;
-          break;
-        case ttg::HWPipeline::TC:
-          nTC++;
-          break;
-        case ttg::HWPipeline::CUDA:
-          nCUDA++;
-          break;
-        case ttg::HWPipeline::SFU:
-          nSFU++;
-          break;
-        case ttg::HWPipeline::NONE:
-          nNONE++;
-          break;
+        if (!hasTMALoad && !hasMMAv5)
+          return;
+        // Skip loops that already have hand-tuned tt.autows annotations
+        // from Python attrs=. These are set at the Python level and
+        // propagated through accelerateMatmul. Re-annotating would
+        // override the hand-tuned schedule.
+        if (hasExistingAnnotation) {
+          LDBG("Skipping loop with existing tt.autows annotations");
+          return;
         }
-      }
-      LDBG("Running scheduling on "
-           << ddg.getNumNodes() << " nodes (MEM=" << nMEM << " TC=" << nTC
-           << " CUDA=" << nCUDA << " SFU=" << nSFU << " NONE=" << nNONE << ")");
-      auto schedResult = ttg::runModuloScheduling(ddg);
-      if (failed(schedResult)) {
-        LDBG("Scheduling FAILED");
-        continue;
-      }
-      LDBG("Scheduling SUCCESS: II=" << schedResult->II);
+        innerLoops.push_back(loop);
+      });
 
-      LLVM_DEBUG(llvm::dbgs()
-                 << "[PASS-A] Schedule: II=" << schedResult->II << " ResMII="
-                 << ddg.computeResMII() << " RecMII=" << ddg.computeRecMII()
-                 << " maxStage=" << schedResult->getMaxStage() << "\n");
+      LDBG("Found " << innerLoops.size() << " innermost loop(s)");
 
-      // Log per-node schedule.
-      LLVM_DEBUG({
+      for (auto innerLoop : innerLoops) {
+        // Build DDG for this inner loop.
+        auto ddg = ttg::DataDependenceGraph::build(innerLoop, model);
+        if (ddg.getNumNodes() == 0)
+          continue;
+
+        LDBG("DDG: " << ddg.getNumNodes() << " nodes, " << ddg.getEdges().size()
+                     << " edges");
+
+        // Run modulo scheduling.
+        // Count key ops for diagnostics.
+        int nMEM = 0, nTC = 0, nCUDA = 0, nSFU = 0, nNONE = 0;
         for (const auto &node : ddg.getNodes()) {
-          auto it = schedResult->nodeToCycle.find(node.idx);
-          if (it == schedResult->nodeToCycle.end())
-            continue;
-          int cycle = it->second;
-          int stage = cycle / schedResult->II;
-          llvm::dbgs() << "[PASS-A]   N" << node.idx << "  cycle=" << cycle
-                       << "  stage=" << stage << "  "
-                       << ttg::getPipelineName(node.pipeline)
-                       << "  selfLat=" << node.selfLatency << "  ";
-          node.op->print(
-              llvm::dbgs(),
-              OpPrintingFlags().skipRegions().elideLargeElementsAttrs());
-          llvm::dbgs() << "\n";
+          switch (node.pipeline) {
+          case ttg::HWPipeline::MEM:
+            nMEM++;
+            break;
+          case ttg::HWPipeline::TC:
+            nTC++;
+            break;
+          case ttg::HWPipeline::CUDA:
+            nCUDA++;
+            break;
+          case ttg::HWPipeline::SFU:
+            nSFU++;
+            break;
+          case ttg::HWPipeline::NONE:
+            nNONE++;
+            break;
+          }
         }
-      });
-
-      // Emit tt.autows annotations on MMA ops instead of loop.stage attrs.
-      // tt.autows survives through the WS pass (which preserves discardable
-      // attrs on MMA ops) and is read by scheduleKeyOpsAnnotation() inside
-      // the WS pass's internal scheduleLoops call.
-      //
-      // We don't emit loop.stage/loop.cluster here because:
-      // 1. The WS pass's scheduleLoops overwrites them anyway
-      // 2. Their presence sets stageAssigned=true which disables
-      //    annotation-based scheduling in scheduleLoops
-      //
-      // emitMMAAnnotations internally skips annotation when all MMAs end
-      // up in the same stage (no multi-stage partition found).
-      emitMMAAnnotations(innerLoop, ddg, *schedResult);
-
-      // Emit tt.num_stages so downstream pipelining recognises this loop
-      // as scheduled. Even single-stage (maxStage=0) loops need the attr
-      // present — without it, they're treated as unpipelined and skip
-      // latency/buffering behaviour.
-      if (!innerLoop->hasAttr(tt::kNumStagesAttrName)) {
-        int numStages = schedResult->getMaxStage() + 1;
-        auto ctx = innerLoop.getContext();
-        innerLoop->setAttr(
-            tt::kNumStagesAttrName,
-            IntegerAttr::get(IntegerType::get(ctx, 32), numStages));
-      }
-
-      // Build ScheduleGraph for analysis/debug.
-      auto pipelineGraph =
-          buildScheduleGraph(innerLoop, ddg, *schedResult, model);
-
-      LLVM_DEBUG({
-        llvm::dbgs() << "[PASS-A] === Inner Loop ScheduleGraph ===\n";
-        pipelineGraph.dump();
-      });
-      if (printScheduleGraph) {
-        llvm::errs() << "[PASS-A] === Inner Loop ScheduleGraph ===\n";
-        pipelineGraph.dump(llvm::errs());
-      }
-
-      // Clean up tt.modulo_cycle — internal attr, not needed downstream.
-      for (auto &op : innerLoop.getBody()->without_terminator())
-        op.removeAttr("tt.modulo_cycle");
-    }
-
-    // Step 2: Schedule outer loops (persistent kernels).
-    SmallVector<scf::ForOp> outerLoops;
-    moduleOp.walk([&](scf::ForOp loop) {
-      bool hasInnerLoop = false;
-      loop.getBody()->walk([&](scf::ForOp) { hasInnerLoop = true; });
-      if (!hasInnerLoop)
-        return;
-      if (loop->getParentOfType<scf::ForOp>())
-        return;
-      outerLoops.push_back(loop);
-    });
-
-    LDBG("Found " << outerLoops.size() << " outer loop(s)");
-
-    for (auto outerLoop : outerLoops) {
-      auto outerDDG = ttg::DataDependenceGraph::build(outerLoop, model);
-      if (outerDDG.getNumNodes() == 0)
-        continue;
-
-      LDBG("Outer DDG: " << outerDDG.getNumNodes() << " nodes, "
-                         << outerDDG.getEdges().size() << " edges");
-
-      auto outerSched = ttg::runModuloScheduling(outerDDG);
-      if (failed(outerSched)) {
-        LDBG("Outer scheduling FAILED");
-        continue;
-      }
-
-      LDBG("Outer schedule: II=" << outerSched->II
-                                 << " ResMII=" << outerDDG.computeResMII()
-                                 << " RecMII=" << outerDDG.computeRecMII()
-                                 << " maxStage=" << outerSched->getMaxStage());
-
-      // Log per-node outer DDG schedule.
-      LLVM_DEBUG({
-        for (const auto &node : outerDDG.getNodes()) {
-          auto it = outerSched->nodeToCycle.find(node.idx);
-          if (it == outerSched->nodeToCycle.end())
-            continue;
-          int cycle = it->second;
-          int stage = cycle / outerSched->II;
-          llvm::dbgs() << "[PASS-A]   N" << node.idx << "  cycle=" << cycle
-                       << "  stage=" << stage << "  "
-                       << ttg::getPipelineName(node.pipeline)
-                       << "  selfLat=" << node.selfLatency << "  "
-                       << node.op->getName().getStringRef() << "\n";
+        LDBG("Running scheduling on "
+             << ddg.getNumNodes() << " nodes (MEM=" << nMEM << " TC=" << nTC
+             << " CUDA=" << nCUDA << " SFU=" << nSFU << " NONE=" << nNONE
+             << ")");
+        auto schedResult = ttg::runModuloScheduling(ddg);
+        if (failed(schedResult)) {
+          LDBG("Scheduling FAILED");
+          continue;
         }
-      });
+        LDBG("Scheduling SUCCESS: II=" << schedResult->II);
 
-      // Build ScheduleGraph for outer loop.
-      auto outerGraph =
-          buildScheduleGraph(outerLoop, outerDDG, *outerSched, model);
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[PASS-A] Schedule: II=" << schedResult->II << " ResMII="
+                   << ddg.computeResMII() << " RecMII=" << ddg.computeRecMII()
+                   << " maxStage=" << schedResult->getMaxStage() << "\n");
 
-      LLVM_DEBUG({
-        llvm::dbgs()
-            << "[PASS-A] === Outer Loop ScheduleGraph ===\n";
-        outerGraph.dump();
-      });
-      if (printScheduleGraph) {
-        llvm::errs()
-            << "[PASS-A] === Outer Loop ScheduleGraph (BEFORE expand) ===\n";
-        outerGraph.dump(llvm::errs());
+        // Log per-node schedule.
+        LLVM_DEBUG({
+          for (const auto &node : ddg.getNodes()) {
+            auto it = schedResult->nodeToCycle.find(node.idx);
+            if (it == schedResult->nodeToCycle.end())
+              continue;
+            int cycle = it->second;
+            int stage = cycle / schedResult->II;
+            llvm::dbgs() << "[PASS-A]   N" << node.idx << "  cycle=" << cycle
+                         << "  stage=" << stage << "  "
+                         << ttg::getPipelineName(node.pipeline)
+                         << "  selfLat=" << node.selfLatency << "  ";
+            node.op->print(
+                llvm::dbgs(),
+                OpPrintingFlags().skipRegions().elideLargeElementsAttrs());
+            llvm::dbgs() << "\n";
+          }
+        });
+
+        // Emit tt.autows annotations on MMA ops instead of loop.stage attrs.
+        // tt.autows survives through the WS pass (which preserves discardable
+        // attrs on MMA ops) and is read by scheduleKeyOpsAnnotation() inside
+        // the WS pass's internal scheduleLoops call.
+        //
+        // We don't emit loop.stage/loop.cluster here because:
+        // 1. The WS pass's scheduleLoops overwrites them anyway
+        // 2. Their presence sets stageAssigned=true which disables
+        //    annotation-based scheduling in scheduleLoops
+        //
+        // emitMMAAnnotations internally skips annotation when all MMAs end
+        // up in the same stage (no multi-stage partition found).
+        emitMMAAnnotations(innerLoop, ddg, *schedResult);
+
+        // Emit tt.num_stages so downstream pipelining recognises this loop
+        // as scheduled. Even single-stage (maxStage=0) loops need the attr
+        // present — without it, they're treated as unpipelined and skip
+        // latency/buffering behaviour.
+        if (!innerLoop->hasAttr(tt::kNumStagesAttrName)) {
+          int numStages = schedResult->getMaxStage() + 1;
+          auto ctx = innerLoop.getContext();
+          innerLoop->setAttr(
+              tt::kNumStagesAttrName,
+              IntegerAttr::get(IntegerType::get(ctx, 32), numStages));
+        }
+
+        // Build ScheduleGraph for analysis/debug.
+        auto pipelineGraph =
+            buildScheduleGraph(innerLoop, ddg, *schedResult, model);
+
+        LLVM_DEBUG({
+          llvm::dbgs() << "[PASS-A] === Inner Loop ScheduleGraph ===\n";
+          pipelineGraph.dump();
+        });
+        if (printScheduleGraph) {
+          llvm::errs() << "[PASS-A] === Inner Loop ScheduleGraph ===\n";
+          pipelineGraph.dump(llvm::errs());
+        }
+
+        // Clean up tt.modulo_cycle — internal attr, not needed downstream.
+        for (auto &op : innerLoop.getBody()->without_terminator())
+          op.removeAttr("tt.modulo_cycle");
       }
 
-      // Emit outer loop schedule attrs for downstream passes.
-      emitScheduleAttributes(outerLoop, outerDDG, *outerSched);
+      // Step 2: Schedule outer loops (persistent kernels).
+      SmallVector<scf::ForOp> outerLoops;
+      moduleOp.walk([&](scf::ForOp loop) {
+        bool hasInnerLoop = false;
+        loop.getBody()->walk([&](scf::ForOp) { hasInnerLoop = true; });
+        if (!hasInnerLoop)
+          return;
+        if (loop->getParentOfType<scf::ForOp>())
+          return;
+        outerLoops.push_back(loop);
+      });
 
-      // Clean up tt.modulo_cycle — internal attr, not needed downstream.
-      for (auto &op : outerLoop.getBody()->without_terminator())
-        op.removeAttr("tt.modulo_cycle");
-    }
+      LDBG("Found " << outerLoops.size() << " outer loop(s)");
+
+      for (auto outerLoop : outerLoops) {
+        auto outerDDG = ttg::DataDependenceGraph::build(outerLoop, model);
+        if (outerDDG.getNumNodes() == 0)
+          continue;
+
+        LDBG("Outer DDG: " << outerDDG.getNumNodes() << " nodes, "
+                           << outerDDG.getEdges().size() << " edges");
+
+        auto outerSched = ttg::runModuloScheduling(outerDDG);
+        if (failed(outerSched)) {
+          LDBG("Outer scheduling FAILED");
+          continue;
+        }
+
+        LDBG("Outer schedule: II="
+             << outerSched->II << " ResMII=" << outerDDG.computeResMII()
+             << " RecMII=" << outerDDG.computeRecMII()
+             << " maxStage=" << outerSched->getMaxStage());
+
+        // Log per-node outer DDG schedule.
+        LLVM_DEBUG({
+          for (const auto &node : outerDDG.getNodes()) {
+            auto it = outerSched->nodeToCycle.find(node.idx);
+            if (it == outerSched->nodeToCycle.end())
+              continue;
+            int cycle = it->second;
+            int stage = cycle / outerSched->II;
+            llvm::dbgs() << "[PASS-A]   N" << node.idx << "  cycle=" << cycle
+                         << "  stage=" << stage << "  "
+                         << ttg::getPipelineName(node.pipeline)
+                         << "  selfLat=" << node.selfLatency << "  "
+                         << node.op->getName().getStringRef() << "\n";
+          }
+        });
+
+        // Build ScheduleGraph for outer loop.
+        auto outerGraph =
+            buildScheduleGraph(outerLoop, outerDDG, *outerSched, model);
+
+        LLVM_DEBUG({
+          llvm::dbgs() << "[PASS-A] === Outer Loop ScheduleGraph ===\n";
+          outerGraph.dump();
+        });
+        if (printScheduleGraph) {
+          llvm::errs()
+              << "[PASS-A] === Outer Loop ScheduleGraph (BEFORE expand) ===\n";
+          outerGraph.dump(llvm::errs());
+        }
+
+        // Emit outer loop schedule attrs for downstream passes.
+        emitScheduleAttributes(outerLoop, outerDDG, *outerSched);
+
+        // Clean up tt.modulo_cycle — internal attr, not needed downstream.
+        for (auto &op : outerLoop.getBody()->without_terminator())
+          op.removeAttr("tt.modulo_cycle");
+      }
+
+      // ================================================================
+      // Iterative refinement: apply DDG transformations and check if
+      // we need to re-schedule.
+      // ================================================================
+      bool ddgChanged = false;
+      ddgChanged |= applyDataPartitioning(moduleOp, model);
+      ddgChanged |= applyEpilogueSubtiling(moduleOp, model);
+
+      if (!ddgChanged) {
+        LDBG("Converged after " << iteration + 1 << " iteration(s)");
+        break;
+      }
+
+      // Don't strip attrs on the last iteration — preserve the valid
+      // schedule from this iteration rather than leaving the loop
+      // unscheduled.
+      if (iteration + 1 >= kMaxIterations) {
+        LDBG("Hit iteration limit (" << kMaxIterations
+                                     << ") — keeping last valid schedule");
+        break;
+      }
+
+      LDBG("DDG changed by transformation — re-scheduling");
+
+      // Strip OUTPUT schedule attrs before re-running. Do NOT strip
+      // INPUT attrs like tt.num_stages (user-provided pipeline depth).
+      moduleOp.walk([](Operation *op) {
+        op->removeAttr("loop.stage");
+        op->removeAttr("loop.cluster");
+        op->removeAttr("tt.modulo_cycle");
+        op->removeAttr("tt.modulo_ii");
+        op->removeAttr("tt.num_buffers");
+        op->removeAttr("tt.self_latency");
+        op->removeAttr("tt.scheduled_max_stage");
+      });
+    } // end iterative loop
   }
 };
 
@@ -1504,8 +1581,7 @@ runListScheduling(const ttg::DataDependenceGraph &ddg) {
 /// Build a ScheduleGraph from a list-scheduled loop. All ops get stage 0,
 /// cluster from cycle rank.
 static ttg::ScheduleGraph
-buildListScheduleGraph(scf::ForOp loop,
-                       const ttg::DataDependenceGraph &ddg,
+buildListScheduleGraph(scf::ForOp loop, const ttg::DataDependenceGraph &ddg,
                        const ttg::ListScheduleResult &result) {
   ttg::ScheduleGraph graph;
   unsigned loopId = graph.addLoop(loop);
@@ -1584,9 +1660,8 @@ struct ListSchedulePass
       bool hasPipelineOps = false;
       loop.getBody()->walk([&](Operation *op) {
         if (isa<tt::DescriptorLoadOp, tt::DescriptorStoreOp,
-                ttng::AsyncTMACopyGlobalToLocalOp,
-                ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp,
-                ttng::TMEMLoadOp>(op))
+                ttng::AsyncTMACopyGlobalToLocalOp, ttng::TCGen5MMAOp,
+                ttng::TCGen5MMAScaledOp, ttng::TMEMLoadOp>(op))
           hasPipelineOps = true;
       });
       if (!hasPipelineOps)
@@ -1644,12 +1719,11 @@ struct ListSchedulePass
       // (which gates on `tt.modulo_ii`) preserves the schedule attrs.
       // `tt.list_schedule_makespan` distinguishes list-scheduled loops
       // from true modulo-scheduled ones for any consumer that cares.
-      loop->setAttr("tt.modulo_ii",
-                    IntegerAttr::get(IntegerType::get(ctx, 32),
-                                    result->makespan));
-      loop->setAttr("tt.list_schedule_makespan",
-                    IntegerAttr::get(IntegerType::get(ctx, 32),
-                                    result->makespan));
+      loop->setAttr("tt.modulo_ii", IntegerAttr::get(IntegerType::get(ctx, 32),
+                                                     result->makespan));
+      loop->setAttr(
+          "tt.list_schedule_makespan",
+          IntegerAttr::get(IntegerType::get(ctx, 32), result->makespan));
     });
   }
 };
