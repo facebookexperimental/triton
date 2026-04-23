@@ -606,10 +606,10 @@ def convert_to_tuple_if_list(item):
 
 
 class _DeviceCaches(defaultdict):
-    """A defaultdict that also invalidates the Layer 1 fast-path cache
+    """A defaultdict that also invalidates the fast-path cache
     (``_last_call``) whenever the in-memory kernel cache is cleared.
-    Without this, ``device_caches.clear()`` would wipe Layer 2 but
-    leave a stale Layer 1 entry, causing the fast path to return a
+    Without this, ``device_caches.clear()`` would wipe the kernel cache but
+    leave a stale ``_last_call`` entry, causing the fast path to return a
     kernel that is no longer in the device cache."""
 
     def __init__(self, jit_function=None, default_factory=None):
@@ -718,54 +718,6 @@ class JITFunction(JITCallable, KernelInterface[T]):
         assert callable(hook)
         self.pre_run_hooks.append(hook)
 
-    def _compute_fast_key(self, args, kwargs, device):
-        """Compute a minimal tuple that uniquely determines the compiled kernel.
-
-        Returns None if the args contain types that can't be fast-path'd,
-        or if the total number of args + kwargs doesn't match the param count.
-        """
-        if len(args) + len(kwargs) != len(self.params):
-            return None
-        parts = [device, knobs.compilation.instrumentation_mode]
-        for i, arg in enumerate(args):
-            kp = self.params[i]
-            if kp.is_constexpr:
-                parts.append(arg)
-            elif arg is None:
-                parts.append(None)
-            elif type(arg) is bool:
-                parts.append(bool)
-            elif type(arg) is int:
-                parts.append(arg)
-            elif type(arg) is float:
-                parts.append(float)
-            elif hasattr(arg, 'data_ptr'):
-                parts.append((arg.dtype, arg.data_ptr() % 16 == 0))
-            elif hasattr(arg, 'tma_desc_cpu_ptr'):
-                parts.append('tma')
-            else:
-                return None
-        param_by_name = {p.name: p for p in self.params}
-        for k, v in sorted(kwargs.items()):
-            kp = param_by_name.get(k)
-            if kp is not None and kp.is_constexpr:
-                parts.append((k, v))
-            elif v is None:
-                parts.append((k, None))
-            elif type(v) is bool:
-                parts.append((k, bool))
-            elif type(v) is int:
-                parts.append((k, v))
-            elif type(v) is float:
-                parts.append((k, float))
-            elif hasattr(v, 'data_ptr'):
-                parts.append((k, v.dtype, v.data_ptr() % 16 == 0))
-            elif hasattr(v, 'tma_desc_cpu_ptr'):
-                parts.append((k, 'tma'))
-            else:
-                return None
-        return tuple(parts)
-
     def create_binder(self):
         """
         Precompute as much as possible.
@@ -804,14 +756,13 @@ class JITFunction(JITCallable, KernelInterface[T]):
         return options, signature, constexprs, attrs
 
     def clear_fast_path_caches(self):
-        """Invalidate Layer 1 (identity) and Layer 2 (signature) fast-path caches.
+        """Invalidate the identity-based fast-path cache.
 
         Call this after mutating any JITCallable that was previously passed as
         an argument to this kernel (e.g. via ``_unsafe_update_src``).
         """
         self._last_call = None
         self._last_kwargs = {}
-        self._run_cache.clear()
 
     def run(self, *args, grid, warmup, **kwargs):
         device = driver.active.get_current_device()
@@ -864,50 +815,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
                                        *bound_vals)
                             return kernel
 
-            # Layer 2: Signature-based dict lookup.
-            # Handles cases where arg objects differ but specialization is the same
-            # (e.g., new tensors with same dtype/alignment, same int values).
-            # On hit, we skip the binder + cache key + compilation, but must use
-            # current args for launch (not cached bound_vals — those point to old data).
-            fast_key = self._compute_fast_key(args, kwargs, device)
-            if fast_key is not None:
-                cached_kernel = self._run_cache.get(fast_key)
-                if cached_kernel is not None:
-                    kernel = cached_kernel
-                    if self.used_global_vals:
-                        not_present = object()
-                        for (name, _), (val, globals_dict) in self.used_global_vals.items():
-                            if globals_dict.get(name, not_present) != val:
-                                kernel = None
-                                break
-                    if kernel is not None:
-                        # Reconstruct bound_vals from current args + kwargs.
-                        # This is much cheaper than calling the binder (~0.3 µs vs ~9 µs).
-                        bound_vals = args
-                        if kwargs:
-                            param_names = [p.name for p in self.params]
-                            bound_dict = dict(zip(param_names, args))
-                            bound_dict.update(kwargs)
-                            bound_vals = tuple(bound_dict[n] for n in param_names)
-                        assert grid is not None
-                        if callable(grid):
-                            grid = grid(dict(zip(self.arg_names, bound_vals)))
-                        grid_size = len(grid)
-                        grid_0 = grid[0]
-                        grid_1 = grid[1] if grid_size > 1 else 1
-                        grid_2 = grid[2] if grid_size > 2 else 1
-                        launch_metadata = kernel.launch_metadata(grid, stream, *bound_vals)
-                        kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata,
-                                   launch_metadata, knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook,
-                                   *bound_vals)
-                        self._last_call = _LastCall(device, args, kernel, bound_vals,
-                                                    knobs.compilation.instrumentation_mode)
-                        self._last_kwargs = dict(kwargs) if kwargs else {}
-                        return kernel
         _user_kwargs = dict(kwargs) if kwargs else {}
-        fast_key = None
-        if not warmup and not self.pre_run_hooks and not knobs.compilation.always_compile:
-            fast_key = self._compute_fast_key(args, kwargs, device)
 
         kwargs["debug"] = kwargs.get("debug", self.debug) or knobs.runtime.debug
         # Enable sanitize_overflow if explicitly set via kwarg, env var (TRITON_SANITIZE_OVERFLOW), or if debug is enabled
@@ -992,8 +900,6 @@ class JITFunction(JITCallable, KernelInterface[T]):
                 self._last_call = _LastCall(device, args, kernel, tuple(bound_args.values()),
                                             knobs.compilation.instrumentation_mode)
                 self._last_kwargs = _user_kwargs
-            if fast_key is not None:
-                self._run_cache[fast_key] = kernel
 
         return kernel
 
@@ -1026,9 +932,6 @@ class JITFunction(JITCallable, KernelInterface[T]):
         # Stores a _LastCall namedtuple from the previous successful launch.
         self._last_call = None
         self._last_kwargs = {}
-        # Signature-based fast-path cache (Layer 2).
-        # Maps (device, fast_arg_signature) -> compiled kernel.
-        self._run_cache = {}
 
         # JITFunction can be instantiated as kernel
         # when called with a grid using __getitem__
