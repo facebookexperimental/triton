@@ -804,7 +804,8 @@ static gpu::MemDescType createBufferMemDescType(MLIRContext *ctx,
   SmallVector<unsigned> order;
   for (int i = tensorType.getRank() - 1; i >= 0; --i)
     order.push_back(static_cast<unsigned>(i));
-  auto cgaLayout = gpu::CGAEncodingAttr::get1CTALayout(ctx, tensorType.getRank());
+  auto cgaLayout =
+      gpu::CGAEncodingAttr::get1CTALayout(ctx, tensorType.getRank());
   auto sharedEncoding = gpu::SwizzledSharedEncodingAttr::get(
       ctx, /*vec=*/1, /*perPhase=*/1, /*maxPhase=*/1, order, cgaLayout);
   auto sharedMemorySpace = gpu::SharedMemorySpaceAttr::get(ctx);
@@ -1393,6 +1394,66 @@ static bool buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
   return true;
 }
 
+/// Return true if any op across the N chains has a different async_task_id
+/// than the first task-annotated op.
+static bool isMultiTask(ArrayRef<SmallVector<Operation *>> chains) {
+  SmallVector<int32_t> firstTaskIds;
+  for (auto &chain : chains) {
+    for (auto *op : chain) {
+      auto taskIds = getOpAsyncTaskIds(op);
+      if (taskIds.empty())
+        continue;
+      if (firstTaskIds.empty())
+        firstTaskIds = taskIds;
+      else if (taskIds != firstTaskIds)
+        return true;
+    }
+  }
+  return false;
+}
+
+/// Find the latest op in `block` among all chain ops and differing operand
+/// definitions, then return the op immediately after it (the insertion point
+/// for the SubtiledRegionOp).
+static Operation *
+findInsertionPoint(Block *block, Operation *anchor,
+                   ArrayRef<SmallVector<Operation *>> chains,
+                   ArrayRef<SmallVector<Value>> differingOperands = {},
+                   ArrayRef<EquivalenceResult::IdentityOp> identityOps = {}) {
+  Operation *latest = anchor;
+  auto updateLatest = [&](Operation *op) {
+    if (op && op->getBlock() == block && latest->isBeforeInBlock(op))
+      latest = op;
+  };
+  for (auto &chain : chains)
+    for (auto *op : chain)
+      updateLatest(op);
+  for (auto &perTile : differingOperands)
+    for (Value v : perTile)
+      if (auto defOp = v.getDefiningOp())
+        updateLatest(defOp);
+  for (auto &id : identityOps)
+    if (auto defOp = id.varyingOperand.getDefiningOp())
+      updateLatest(defOp);
+  return latest->getNextNode();
+}
+
+/// Return true if any task ID set appears non-contiguously in the segment
+/// list (e.g., task A → B → A).
+static bool hasNonContiguousTaskIds(ArrayRef<ChainSegment> segments) {
+  SmallVector<SmallVector<int32_t>> seenTaskSets;
+  for (auto &seg : segments) {
+    if (seenTaskSets.empty() || seenTaskSets.back() != seg.taskIds) {
+      for (size_t i = 0; i + 1 < seenTaskSets.size(); ++i) {
+        if (seenTaskSets[i] == seg.taskIds)
+          return true;
+      }
+      seenTaskSets.push_back(seg.taskIds);
+    }
+  }
+  return false;
+}
+
 } // anonymous namespace
 
 void tryGenerateForSplit(triton::SplitOp splitOp) {
@@ -1433,22 +1494,7 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
     if (!equiv)
       return;
 
-    // Check if chains are multi-task.
-    bool multiTask = false;
-    {
-      SmallVector<int32_t> firstTaskIds;
-      for (auto &chain : chains) {
-        for (auto *op : chain) {
-          auto taskIds = getOpAsyncTaskIds(op);
-          if (taskIds.empty())
-            continue;
-          if (firstTaskIds.empty())
-            firstTaskIds = taskIds;
-          else if (taskIds != firstTaskIds)
-            multiTask = true;
-        }
-      }
-    }
+    bool multiTask = isMultiTask(chains);
 
     // Collect setup ops: tmemLoad → root split + inner setup ops.
     SmallVector<Operation *> setupOps;
@@ -1462,26 +1508,9 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
     for (auto *op : innerSetupOps)
       setupOps.push_back(op);
 
-    // Position the SubtiledRegionOp after all chain ops.
-    Operation *insertBefore = nullptr;
-    {
-      Operation *latest = lastSetupOp;
-      auto updateLatest = [&](Operation *op) {
-        if (op && op->getBlock() == block && latest->isBeforeInBlock(op))
-          latest = op;
-      };
-      for (auto &chain : chains)
-        for (auto *op : chain)
-          updateLatest(op);
-      for (auto &perTile : equiv->differingOperands)
-        for (Value v : perTile)
-          if (auto defOp = v.getDefiningOp())
-            updateLatest(defOp);
-      for (auto &id : equiv->identityOps)
-        if (auto defOp = id.varyingOperand.getDefiningOp())
-          updateLatest(defOp);
-      insertBefore = latest->getNextNode();
-    }
+    Operation *insertBefore =
+        findInsertionPoint(block, lastSetupOp, chains, equiv->differingOperands,
+                           equiv->identityOps);
     OpBuilder builder(insertBefore);
     Location loc = splitOp.getLoc();
 
@@ -1540,19 +1569,8 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
     setupOps.push_back(&*it);
   setupOps.push_back(splitOp);
 
-  Operation *insertBefore = nullptr;
-  {
-    Operation *latest = splitOp;
-    auto updateLatest = [&](Operation *op) {
-      if (op && op->getBlock() == block && latest->isBeforeInBlock(op))
-        latest = op;
-    };
-    for (auto *op : chain0)
-      updateLatest(op);
-    for (auto *op : chain1)
-      updateLatest(op);
-    insertBefore = latest->getNextNode();
-  }
+  SmallVector<SmallVector<Operation *>> twoChains = {chain0, chain1};
+  Operation *insertBefore = findInsertionPoint(block, splitOp, twoChains);
   OpBuilder builder(insertBefore);
   Location loc = splitOp.getLoc();
 
@@ -1572,21 +1590,7 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
     // This happens in addmm where the bias load (task 3) is interleaved
     // between compute ops (task 2). Merge segments with the same task ID
     // and reorder by data dependency to produce contiguous task groups.
-    bool hasNonContiguousTasks = false;
-    {
-      SmallVector<SmallVector<int32_t>> seenTaskSets;
-      for (auto &seg : *segments) {
-        if (seenTaskSets.empty() || seenTaskSets.back() != seg.taskIds) {
-          for (size_t i = 0; i + 1 < seenTaskSets.size(); ++i) {
-            if (seenTaskSets[i] == seg.taskIds) {
-              hasNonContiguousTasks = true;
-              break;
-            }
-          }
-          seenTaskSets.push_back(seg.taskIds);
-        }
-      }
-    }
+    bool hasNonContiguousTasks = hasNonContiguousTaskIds(*segments);
 
     if (hasNonContiguousTasks) {
       // Merge segments with the same task ID.
