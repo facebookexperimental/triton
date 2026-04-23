@@ -60,7 +60,6 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
         sharedMemorySpace, /*mutableMemory=*/true);
 
     auto alloc = builder.create<ttg::LocalAllocOp>(loc, memDescType, src);
-    copyLoopScheduleAttrs(storeOp, alloc);
 
     // Translate indices for TMA.
     auto indices = ttng::translateTMAIndices(
