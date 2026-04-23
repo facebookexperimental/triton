@@ -622,7 +622,7 @@ if __name__ == "__main__":
         # (8,  16, 1024,  64,  False, "ws"),
         # (8,  16, 1024,  128, False, "ws"),
         # (8, 16, 1024, 64, False, "ws_persistent"), # data race
-        (4, 32, 4096, 128, False, "ws_persistent"),  # works
+        (8, 16, 1024, 128, False, "ws_persistent"),  # works
     ]
 
     all_pass = True
@@ -648,9 +648,9 @@ if __name__ == "__main__":
 
     bench_configs = [
         # (Z,  H,  N_CTX, HEAD_DIM, causal, baseVariant)
-        #(8, 16, 1024, 128, False, "ws_persistent"),
-        #(8, 16, 2048, 128, False, "ws_persistent"),
-        #(8, 16, 4096, 128, False, "ws_persistent"),
+        (8, 16, 1024, 128, False, "ws_persistent"),
+        (8, 16, 2048, 128, False, "ws_persistent"),
+        (8, 16, 4096, 128, False, "ws_persistent"),
         (4, 32, 4096, 128, False, "ws_persistent"),
     ]
 

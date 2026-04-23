@@ -1094,7 +1094,7 @@ configs_bwd_tlx = [
         num_warps=8,
         num_stages=1,
         pre_hook=_bwd_host_descriptor_pre_hook_tlx,
-    ) for bm1 in [64] for uwb in [False]
+    ) for bm1 in [64, 128] for uwb in [False, True]
 ]
 
 
