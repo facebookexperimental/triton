@@ -735,333 +735,22 @@ static gpu::MemDescType createBufferMemDescType(MLIRContext *ctx,
                                sharedMemorySpace, /*mutableMemory=*/true);
 }
 
-/// Build multiple SubtiledRegionOps for a chain that spans multiple contiguous
-/// async task sets.
-///
-/// Two transition types are handled:
-///   Option 1 (explicit store): The last op of a segment is a local_alloc with
-///     data. It is split into an empty outer-scope alloc + local_store.
-///   Option 2 (implicit buffer): No memory op at the boundary. Cross-segment
-///     tensor values are buffered through SMEM via local_store + local_load.
-static void buildMultiTaskSubtiledRegions(OpBuilder &outerBuilder, Location loc,
+// Forward declaration.
+static bool buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
+                                           Location loc,
+                                           ArrayRef<Operation *> setupOps,
+                                           ArrayRef<Value> leafValues,
+                                           ArrayRef<ChainSegment> segments);
+
+/// Convenience wrapper: build multi-task SubtiledRegionOps for 2 tiles by
+/// converting to the generalized N-tile form.
+static bool buildMultiTaskSubtiledRegions(OpBuilder &outerBuilder, Location loc,
                                           ArrayRef<Operation *> setupOps,
                                           Value lhs, Value rhs,
                                           ArrayRef<ChainSegment> segments) {
-  MLIRContext *ctx = outerBuilder.getContext();
-
-  // --- Transition analysis ---
-  // For each transition i between segments[i] and segments[i+1], collect
-  // buffer info.  A buffer entry describes one value that needs to be stored
-  // to SMEM in the producing segment and (optionally) loaded in the consuming
-  // segment.
-  struct BufferEntry {
-    Value chain0Val;     // value in chain0 being buffered
-    Value chain1Val;     // corresponding value in chain1
-    Value smem0;         // outer-scope empty alloc for tile 0
-    Value smem1;         // outer-scope empty alloc for tile 1
-    bool needsLocalLoad; // true for option 2 (consuming segment needs load)
-  };
-
-  struct TransitionInfo {
-    // Non-null for option 1 (explicit store at local_alloc).
-    gpu::LocalAllocOp alloc0;
-    gpu::LocalAllocOp alloc1;
-
-    SmallVector<BufferEntry> buffers;
-
-    bool isExplicitStore() const { return alloc0 != nullptr; }
-  };
-
-  SmallVector<TransitionInfo> transitions;
-
-  for (size_t i = 0; i + 1 < segments.size(); ++i) {
-    TransitionInfo tr;
-    Operation *lastOp0 = segments[i].opsPerTile[0].back();
-    auto alloc0 = dyn_cast<gpu::LocalAllocOp>(lastOp0);
-
-    if (alloc0 && alloc0.getSrc()) {
-      // Option 1: explicit memory store at local_alloc.
-      auto alloc1 = cast<gpu::LocalAllocOp>(segments[i].opsPerTile[1].back());
-      tr.alloc0 = alloc0;
-      tr.alloc1 = alloc1;
-
-      auto memDescType = cast<gpu::MemDescType>(alloc0.getType());
-      if (!memDescType.getMutableMemory()) {
-        memDescType = gpu::MemDescType::get(
-            memDescType.getShape(), memDescType.getElementType(),
-            memDescType.getEncoding(), memDescType.getMemorySpace(),
-            /*mutableMemory=*/true, memDescType.getAllocShape());
-      }
-
-      auto e0 =
-          gpu::LocalAllocOp::create(outerBuilder, loc, memDescType, Value{});
-      auto e1 =
-          gpu::LocalAllocOp::create(outerBuilder, loc, memDescType, Value{});
-      // The alloc result (memdesc) is consumed directly by the next segment
-      // (e.g., async_tma_copy), so no local_load is needed.
-      tr.buffers.push_back({alloc0.getResult(), alloc1.getResult(),
-                            e0.getResult(), e1.getResult(),
-                            /*needsLocalLoad=*/false});
-    } else {
-      // Option 2: implicit buffer. Find cross-segment tensor values.
-      DenseSet<Value> seg0Results;
-      for (auto *op : segments[i].opsPerTile[0])
-        for (Value r : op->getResults())
-          seg0Results.insert(r);
-
-      llvm::MapVector<Value, Value> seen; // chain0Val -> chain1Val
-      for (auto [op0, op1] : llvm::zip(segments[i + 1].opsPerTile[0],
-                                       segments[i + 1].opsPerTile[1])) {
-        for (auto [v0, v1] : llvm::zip(op0->getOperands(), op1->getOperands()))
-          if (seg0Results.contains(v0) && !seen.count(v0))
-            seen[v0] = v1;
-      }
-
-      for (auto &[v0, v1] : seen) {
-        auto tensorTy = dyn_cast<RankedTensorType>(v0.getType());
-        if (!tensorTy)
-          continue; // skip tokens, scalars — only buffer tensors
-        auto memDescType = createBufferMemDescType(ctx, tensorTy);
-        auto e0 =
-            gpu::LocalAllocOp::create(outerBuilder, loc, memDescType, Value{});
-        auto e1 =
-            gpu::LocalAllocOp::create(outerBuilder, loc, memDescType, Value{});
-        tr.buffers.push_back({v0, v1, e0.getResult(), e1.getResult(),
-                              /*needsLocalLoad=*/true});
-      }
-    }
-    transitions.push_back(std::move(tr));
-  }
-
-  // --- Generate a SubtiledRegionOp for each segment ---
-  for (size_t segIdx = 0; segIdx < segments.size(); ++segIdx) {
-    const auto &seg = segments[segIdx];
-    bool isFirstSegment = (segIdx == 0);
-    bool hasOutgoingTransition = (segIdx < transitions.size());
-    bool hasIncomingTransition = (segIdx > 0);
-
-    // Build the sub-chain for structural equivalence.
-    // For option 1, exclude the transition local_alloc (replaced by
-    // local_store).
-    SmallVector<Operation *> subOps0(seg.opsPerTile[0]);
-    SmallVector<Operation *> subOps1(seg.opsPerTile[1]);
-    if (hasOutgoingTransition && transitions[segIdx].isExplicitStore()) {
-      subOps0.pop_back(); // remove local_alloc
-      subOps1.pop_back();
-    }
-
-    // Compute per-segment differing operands.
-    auto segEquiv = checkStructuralEquivalence(subOps0, subOps1);
-    if (!segEquiv)
-      return;
-    auto &segDiff = segEquiv->differingOperands;
-    auto &segIdentity = segEquiv->identityOps;
-    ArrayRef<Operation *> tplOps =
-        (segEquiv->templateChainIdx == 0) ? subOps0 : subOps1;
-
-    // Resolve cross-segment operands: replace original values with outer-scope
-    // SMEM values.  Track which entries need a local_load in the tile body.
-    struct DiffEntry {
-      Value chain0Val; // original value in chain0 ops (for tileMapping)
-      Value setupVal0; // value to yield in setup for tile 0
-      Value setupVal1; // value to yield in setup for tile 1
-      bool needsLocalLoad = false;
-    };
-    SmallVector<DiffEntry> resolvedDiff;
-    for (auto &[v0, v1] : segDiff) {
-      Value setupV0 = v0, setupV1 = v1;
-      bool needsLoad = false;
-      for (auto &tr : transitions) {
-        for (auto &buf : tr.buffers) {
-          if (v0 == buf.chain0Val) {
-            setupV0 = buf.smem0;
-            needsLoad = buf.needsLocalLoad;
-          }
-          if (v1 == buf.chain1Val)
-            setupV1 = buf.smem1;
-        }
-      }
-      resolvedDiff.push_back({v0, setupV0, setupV1, needsLoad});
-    }
-
-    // Build tile arg types and mappings.
-    SmallVector<Type> tileArgTypes;
-    SmallVector<int32_t> tile0Map, tile1Map;
-    int32_t yieldIdx = 0;
-
-    if (isFirstSegment) {
-      tileArgTypes.push_back(lhs.getType());
-      tile0Map.push_back(0);
-      tile1Map.push_back(1);
-      yieldIdx = 2;
-    }
-
-    for (auto &entry : resolvedDiff) {
-      // For implicit-buffer entries the tile arg is a memdesc, not the
-      // original tensor type.
-      Type argType = entry.needsLocalLoad ? entry.setupVal0.getType()
-                                          : entry.chain0Val.getType();
-      tileArgTypes.push_back(argType);
-      tile0Map.push_back(yieldIdx);
-      tile1Map.push_back(yieldIdx + 1);
-      yieldIdx += 2;
-    }
-
-    // Identity insertion tile args: (varying, identity_const) pairs.
-    for (auto &id : segIdentity) {
-      tileArgTypes.push_back(id.varyingOperand.getType());
-      int32_t tplSlot = yieldIdx;
-      int32_t otherSlot = yieldIdx + 1;
-      if (segEquiv->templateChainIdx == 0) {
-        tile0Map.push_back(tplSlot);
-        tile1Map.push_back(otherSlot);
-      } else {
-        tile0Map.push_back(otherSlot);
-        tile1Map.push_back(tplSlot);
-      }
-      yieldIdx += 2;
-    }
-
-    // Outgoing SMEM args (for local_store at the end of this segment).
-    // Collect the buffer entries for the outgoing transition so we can add
-    // tile args for the SMEM destinations.
-    SmallVector<BufferEntry *> outgoingBuffers;
-    if (hasOutgoingTransition) {
-      for (auto &buf : transitions[segIdx].buffers) {
-        tileArgTypes.push_back(buf.smem0.getType());
-        tile0Map.push_back(yieldIdx);
-        tile1Map.push_back(yieldIdx + 1);
-        yieldIdx += 2;
-        outgoingBuffers.push_back(&buf);
-      }
-    }
-
-    auto tileMappingsAttr =
-        outerBuilder.getArrayAttr({DenseI32ArrayAttr::get(ctx, tile0Map),
-                                   DenseI32ArrayAttr::get(ctx, tile1Map)});
-    auto barrierAnnotationsAttr = outerBuilder.getArrayAttr({});
-    auto tokenAnnotationsAttr = outerBuilder.getArrayAttr({});
-
-    auto regionOp = SubtiledRegionOp::create(
-        outerBuilder, loc, TypeRange{}, ValueRange{}, ValueRange{},
-        /*tokenValues=*/ValueRange{}, tileMappingsAttr, barrierAnnotationsAttr,
-        tokenAnnotationsAttr);
-
-    // --- Setup Region ---
-    Block *setupBlock = &regionOp.getSetupRegion().emplaceBlock();
-    OpBuilder setupBuilder = OpBuilder::atBlockEnd(setupBlock);
-
-    SmallVector<Value> setupYields;
-    if (isFirstSegment) {
-      IRMapping setupMapping;
-      for (Operation *op : setupOps)
-        setupBuilder.clone(*op, setupMapping);
-      setupYields.push_back(setupMapping.lookupOrDefault(lhs));
-      setupYields.push_back(setupMapping.lookupOrDefault(rhs));
-
-      for (auto &entry : resolvedDiff) {
-        setupYields.push_back(setupMapping.lookupOrDefault(entry.setupVal0));
-        setupYields.push_back(setupMapping.lookupOrDefault(entry.setupVal1));
-      }
-      for (auto &id : segIdentity) {
-        setupYields.push_back(setupMapping.lookupOrDefault(id.varyingOperand));
-        setupYields.push_back(arith::ConstantOp::create(
-            setupBuilder, loc,
-            setupBuilder.getIntegerAttr(id.varyingOperand.getType(),
-                                        id.identityVal)));
-      }
-    } else {
-      for (auto &entry : resolvedDiff) {
-        setupYields.push_back(entry.setupVal0);
-        setupYields.push_back(entry.setupVal1);
-      }
-      for (auto &id : segIdentity) {
-        setupYields.push_back(id.varyingOperand);
-        setupYields.push_back(arith::ConstantOp::create(
-            setupBuilder, loc,
-            setupBuilder.getIntegerAttr(id.varyingOperand.getType(),
-                                        id.identityVal)));
-      }
-    }
-
-    // Yield SMEM values for outgoing stores.
-    for (auto *buf : outgoingBuffers) {
-      setupYields.push_back(buf->smem0);
-      setupYields.push_back(buf->smem1);
-    }
-
-    SubtiledRegionYieldOp::create(setupBuilder, loc, setupYields);
-
-    // --- Tile Region ---
-    Block *tileBlock = &regionOp.getTileRegion().emplaceBlock();
-    for (Type ty : tileArgTypes)
-      tileBlock->addArgument(ty, loc);
-    tileBlock->addArgument(outerBuilder.getI32Type(), loc);
-
-    OpBuilder tileBuilder = OpBuilder::atBlockEnd(tileBlock);
-    IRMapping tileMapping;
-    unsigned argIdx = 0;
-
-    if (isFirstSegment)
-      tileMapping.map(lhs, tileBlock->getArgument(argIdx++));
-
-    for (auto &entry : resolvedDiff) {
-      Value tileArg = tileBlock->getArgument(argIdx++);
-      if (entry.needsLocalLoad) {
-        // Option 2: tile arg is a memdesc — emit local_load to get the tensor.
-        auto loaded = gpu::LocalLoadOp::create(
-            tileBuilder, loc, entry.chain0Val.getType(), tileArg);
-        tileMapping.map(entry.chain0Val, loaded.getResult());
-      } else {
-        tileMapping.map(entry.chain0Val, tileArg);
-      }
-    }
-
-    // Map identity insertion operands: the template chain's identity op
-    // references the varying operand, which is mapped to the tile arg.
-    for (auto &id : segIdentity)
-      tileMapping.map(id.varyingOperand, tileBlock->getArgument(argIdx++));
-
-    // Collect outgoing SMEM tile args.
-    SmallVector<Value> outgoingSmemArgs;
-    for (size_t i = 0; i < outgoingBuffers.size(); ++i)
-      outgoingSmemArgs.push_back(tileBlock->getArgument(argIdx++));
-
-    // Clone segment ops into the tile body (from the template chain which
-    // includes identity ops).
-    for (Operation *op : tplOps)
-      tileBuilder.clone(*op, tileMapping);
-
-    // Emit outgoing stores. Use the template chain's value for lookup since
-    // the tile body was cloned from the template chain.
-    if (hasOutgoingTransition) {
-      auto &tr = transitions[segIdx];
-      bool tplIs1 = (segEquiv->templateChainIdx == 1);
-      if (tr.isExplicitStore()) {
-        // Option 1: store the local_alloc's source data.
-        auto srcAlloc =
-            tplIs1
-                ? cast<gpu::LocalAllocOp>(segments[segIdx].opsPerTile[1].back())
-                : tr.alloc0;
-        Value data = tileMapping.lookupOrDefault(srcAlloc.getSrc());
-        gpu::LocalStoreOp::create(tileBuilder, loc, data, outgoingSmemArgs[0]);
-      } else {
-        // Option 2: store each cross-segment value.
-        for (auto [buf, smemArg] : llvm::zip(tr.buffers, outgoingSmemArgs)) {
-          Value bufVal = tplIs1 ? buf.chain1Val : buf.chain0Val;
-          Value data = tileMapping.lookupOrDefault(bufVal);
-          gpu::LocalStoreOp::create(tileBuilder, loc, data, smemArg);
-        }
-      }
-    }
-
-    SubtiledRegionYieldOp::create(tileBuilder, loc, ValueRange{});
-
-    // --- Teardown Region ---
-    Block *teardownBlock = &regionOp.getTeardownRegion().emplaceBlock();
-    OpBuilder teardownBuilder = OpBuilder::atBlockEnd(teardownBlock);
-    SubtiledRegionYieldOp::create(teardownBuilder, loc, ValueRange{});
-  }
+  SmallVector<Value> leafValues = {lhs, rhs};
+  return buildMultiTaskSubtiledRegionsN(outerBuilder, loc, setupOps, leafValues,
+                                        segments);
 }
 
 /// Build multiple SubtiledRegionOps for N-tile chains spanning multiple
@@ -1095,12 +784,6 @@ static bool buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
   SmallVector<TransitionInfoN> transitionInfos;
 
   for (size_t i = 0; i + 1 < segments.size(); ++i) {
-    Operation *lastOp0 = segments[i].opsPerTile[0].back();
-    if (auto alloc0 = dyn_cast<gpu::LocalAllocOp>(lastOp0)) {
-      if (alloc0.getSrc())
-        return false; // Option 1 not yet supported for N-tile.
-    }
-
     DenseSet<Value> seg0Results;
     for (auto *op : segments[i].opsPerTile[0])
       for (Value r : op->getResults())
@@ -1592,26 +1275,13 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
         seg.opsPerTile[nonTpl] = std::move(filtered);
       }
 
-      buildMultiTaskSubtiledRegions(builder, loc, setupOps, lhs, rhs,
-                                    reordered);
+      if (!buildMultiTaskSubtiledRegions(builder, loc, setupOps, lhs, rhs,
+                                         reordered))
+        return;
     } else {
-      for (size_t i = 0; i + 1 < segments->size(); ++i) {
-        Operation *lastOp = (*segments)[i].opsPerTile[0].back();
-        auto alloc = dyn_cast<gpu::LocalAllocOp>(lastOp);
-
-        if (alloc && alloc.getSrc()) {
-          for (size_t j = 0; j + 1 < (*segments)[i].opsPerTile[0].size(); ++j) {
-            for (Value operand :
-                 (*segments)[i].opsPerTile[0][j]->getOperands()) {
-              if (operand == alloc.getResult())
-                return;
-            }
-          }
-        }
-      }
-
-      buildMultiTaskSubtiledRegions(builder, loc, setupOps, lhs, rhs,
-                                    *segments);
+      if (!buildMultiTaskSubtiledRegions(builder, loc, setupOps, lhs, rhs,
+                                         *segments))
+        return;
     }
   }
 
