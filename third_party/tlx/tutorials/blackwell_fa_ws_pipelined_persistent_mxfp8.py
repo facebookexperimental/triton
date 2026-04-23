@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.tools.tensor_descriptor import TensorDescriptor
-from triton.language.extra.tlx.mxfp8_utils import _to_mxfp8_block
+from triton.language.extra.tlx.mxfp8_utils import _to_mxfp8_block_with_block_amax
 from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -207,6 +207,9 @@ def _softmax_inner_loop(
     VEC_SIZE: tl.constexpr,
     STAGE: tl.constexpr,
 ):
+    BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // 2
+    NUM_BLOCKS: tl.constexpr = BLOCK_N // VEC_SIZE
+
     lo, hi = _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE)
 
     for start_n in tl.range(lo, hi, BLOCK_N):
@@ -219,22 +222,29 @@ def _softmax_inner_loop(
             col_limit_right = (offs_m - start_n + 1)[:, None]
             qk = _apply_causal_mask(qk, col_limit_right, BLOCK_N)
 
-        # compute m_i, p in registers
-        m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+        qk_reshaped = tl.reshape(qk, [BLOCK_M_SPLIT, NUM_BLOCKS, VEC_SIZE])
+        block_maxes = tl.max(qk_reshaped, 2)
+        row_max = tl.max(block_maxes, 1)
 
-        # -- compute correction factor
+        m_ij = tl.maximum(m_i, row_max * qk_scale)
         alpha = tl.math.exp2(m_i - m_ij)
+
         tlx.barrier_wait(tlx.local_view(alpha_empties, cid), qk_phase ^ 1)
-        # Use alpha[0] for cid=0, and alpha[BLOCK_N] for cid=1
         tlx.local_store(tlx.local_view(alpha_tiles, cid), alpha[:, None])
         tlx.barrier_arrive(tlx.local_view(alpha_fulls, cid))
 
         qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
         p_i = tl.math.exp2(qk)
+
+        # Derive block amax from pre-computed block maxes via monotonicity
+        # of exp2: max(exp2(x)) == exp2(max(x)), avoiding 128 max(abs())
+        # ops per row in the MXFP8 conversion.
+        block_amax = tl.math.exp2(block_maxes * qk_scale - m_ij[:, None])
+
         tlx.barrier_wait(tlx.local_view(p_empties, cid), qk_phase ^ 1)
-        # Convert p_i to mxFP8 + write out the scales.
-        _to_mxfp8_block(
+        _to_mxfp8_block_with_block_amax(
             p_i,
+            block_amax,
             tlx.local_view(p_tiles, cid),
             tlx.local_view(p_scale_tiles, cid),
             VEC_SIZE,
@@ -439,7 +449,6 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     for cid in tl.static_range(0, NUM_MMA_GROUPS):
                         # -- update output accumulator --
                         tlx.barrier_wait(alpha_fulls[cid], phase)
-                        # Use alpha[0] for cid=0, and alpha[BLOCK_N] for cid=1
                         alpha_1 = tlx.local_load(alpha_tiles[cid])
                         tlx.barrier_arrive(alpha_empties[cid])
                         acc = tlx.local_load(acc_tiles[cid])
