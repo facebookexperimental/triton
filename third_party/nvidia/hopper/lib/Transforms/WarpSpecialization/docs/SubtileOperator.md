@@ -46,21 +46,31 @@ per-tile chains into `SubtiledRegionOp`s.
 
 Key capabilities:
 - **2-tile and N-tile** (4, 8, …) via nested split tree walking
-  (`collectSplitTreeLeaves`)
+  (`collectSplitTreeLeaves`). Both paths share the same N-tile build
+  functions (`buildSingleSubtiledRegionN`, `buildMultiTaskSubtiledRegionsN`)
+  — the 2-tile path is a thin wrapper that converts inputs.
+- **Auxiliary collection** (`collectPerTileChain`): always recursively
+  captures ops needed by the chain but not depending on the split result
+  (e.g., `descriptor_load`, `arith.addi` for address computation). For
+  N-tile nested splits, inner setup ops are excluded via `excludeOps`.
 - **Identity insertion** for asymmetric chains (e.g., one tile has an extra
-  `arith.addi` for column offset)
+  `arith.addi` for column offset). The "canonical identity set" approach in
+  `checkStructuralEquivalenceN` compares the template against the shortest
+  chain first to discover all identity ops, then re-compares other chains
+  with `forcedIdentityOps` for consistent identity counts.
 - **Multi-task segmentation** for chains crossing async task boundaries.
   Each segment becomes a separate `SubtiledRegionOp` with SMEM transitions
-  (Option 1: explicit `local_alloc`; Option 2: implicit buffer via
-  `local_store`/`local_load`)
-- **Multi-chain support** (addmm): recursive auxiliary collection captures
-  independent data flows (e.g., bias `descriptor_load` chain) in the per-tile
-  chain. When task IDs are non-contiguous (e.g., task 2 → 3 → 2 → 1),
-  segments are merged by task ID and topologically sorted by data dependency,
-  producing contiguous regions (e.g., task 3 → 2 → 1)
+  (implicit buffer via `local_store`/`local_load`). Allocs are assumed to
+  be pre-hoisted by the memory planner.
+- **Multi-chain support** (addmm): when task IDs are non-contiguous
+  (e.g., task 2 → 3 → 2 → 1), segments are merged by task ID and
+  topologically sorted by data dependency, producing contiguous regions
+  (e.g., task 3 → 2 → 1).
 
 Structural equivalence (`checkStructuralEquivalence`) compares per-tile
-chains, recording differing operands and identity-compatible ops.
+chains pairwise, recording differing operands and identity-compatible ops.
+`checkStructuralEquivalenceN` wraps this for N chains with consistent
+identity handling.
 
 #### 2. OptimizeTMemLayouts (+ PushSharedSetupToTile)
 **File:** `lib/Dialect/TritonNvidiaGPU/Transforms/OptimizeTMemLayouts.cpp`
@@ -188,30 +198,29 @@ Default: `False`.
 
 ## Known TODOs
 
-1. **Cross-SubtiledRegionOp barrier insertion for multi-chain (addmm).**
-   The 3-region model (task 3 bias load → task 2 compute → task 1 store)
-   produces 3 single-task SubtiledRegionOps with SMEM transitions. The code
-   partition pass needs to detect `local_store`/`local_load` crossing task
-   boundaries between SubtiledRegionOps and insert barrier annotations. This
-   has not been validated e2e yet.
+1. **N-tile multi-task with identity ops in segments.** When per-segment
+   chains have identity ops (from the canonical-identity forced identity),
+   `checkStructuralEquivalenceN` on the segment bails. This prevents
+   N-tile multi-task subtiling when tiles have asymmetric address offsets
+   (e.g., 4-tile with `arith.addi` in 3 of 4 tiles). The fix: propagate
+   `forcedIdentityOps` into per-segment equivalence checks.
 
-2. **N-tile multi-task Option 1** (explicit `local_alloc` at segment
-   boundaries) is not yet supported for N > 2. The code bails out.
+2. **Merge `tryGenerateForSplit` 2-tile/N-tile branches.** The two branches
+   (~120 lines each) share ~60% logic. Now that `buildSingleSubtiledRegion`
+   and `buildMultiTaskSubtiledRegions` both delegate to N-tile versions,
+   the branch condition (`numTiles > 2`) could be eliminated by always using
+   the N-tile data structures. The 2-tile path's non-contiguous task
+   merging + topological sort needs to be generalized to N tiles.
 
 3. **Non-tensor cross-segment values in N-tile multi-task** (e.g., scalar
    offsets) bail out. These need to be passed through as differing operands
    without SMEM buffering.
 
-4. **`PushSharedSetupToTile` for multi-segment SubtiledRegionOps.** Non-first
-   segments don't clone setup ops. The push pass may not handle SMEM buffer
-   tile args correctly.
-
-5. **The `isFirstSegment` assumption in `buildMultiTaskSubtiledRegions`.**
+4. **The `isFirstSegment` assumption in `buildMultiTaskSubtiledRegionsN`.**
    After merge-and-reorder, the first segment may not use the split result
    (e.g., task 3 bias load segment). The unused split result tile arg is
-   wasted. The setup region also clones the entire tmem_load → split chain
-   unnecessarily.
+   wasted.
 
-6. **Full e2e test coverage.** The `generate_subtiled_region=True` parameter
+5. **Full e2e test coverage.** The `generate_subtiled_region=True` parameter
    is added to `test_tutorial09_warp_specialization.py` and
    `test_autows_addmm.py` but full test suite results are pending validation.

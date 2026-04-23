@@ -282,11 +282,11 @@ struct NWayEquivalenceResult {
 /// Check structural equivalence across N chains. Finds the longest chain
 /// as the template and compares all others against it pairwise.
 ///
-/// Uses a "master set" approach for identity ops: first compares the
-/// template against the shortest non-template chain to discover all
-/// identity ops (the master set). Then re-compares all other chains with
-/// the master set forced, so identity counts are consistent across all
-/// pairs. Per-tile varying values are recorded in `identityPerTile`.
+/// Uses a "canonical identity set" approach for identity ops: first compares
+/// the template against the shortest non-template chain to discover all
+/// identity ops (the canonical identity set). Then re-compares all other chains
+/// with the canonical identity set forced, so identity counts are consistent
+/// across all pairs. Per-tile varying values are recorded in `identityPerTile`.
 static std::optional<NWayEquivalenceResult>
 checkStructuralEquivalenceN(ArrayRef<SmallVector<Operation *>> chains) {
   assert(chains.size() >= 2);
@@ -300,7 +300,8 @@ checkStructuralEquivalenceN(ArrayRef<SmallVector<Operation *>> chains) {
   }
 
   // Find the shortest non-template chain — comparing template against this
-  // chain discovers the maximum set of identity ops (the "master set").
+  // chain discovers the maximum set of identity ops (the "canonical identity
+  // set").
   unsigned shortIdx = 0;
   bool firstNonTpl = true;
   for (unsigned t = 0; t < numTiles; ++t) {
@@ -312,23 +313,26 @@ checkStructuralEquivalenceN(ArrayRef<SmallVector<Operation *>> chains) {
     }
   }
 
-  // Step 1: Compare template vs shortest chain to build the master set.
-  auto masterRes = checkStructuralEquivalence(chains[tplIdx], chains[shortIdx]);
-  if (!masterRes || masterRes->templateChainIdx != 0)
+  // Step 1: Compare template vs shortest chain to build the canonical identity
+  // set.
+  auto canonicalRes =
+      checkStructuralEquivalence(chains[tplIdx], chains[shortIdx]);
+  if (!canonicalRes || canonicalRes->templateChainIdx != 0)
     return std::nullopt;
 
   // Step 2: Re-compare all other chains with forcedIdentityOps so identity
   // counts are consistent. The shortest chain's result is already correct.
   SmallVector<EquivalenceResult> pairResults(numTiles);
-  pairResults[shortIdx] = std::move(*masterRes);
+  pairResults[shortIdx] = std::move(*canonicalRes);
 
-  DenseSet<Operation *> &masterIdentity = pairResults[shortIdx].identityOpSet;
+  DenseSet<Operation *> &canonicalIdentity =
+      pairResults[shortIdx].identityOpSet;
 
   for (unsigned t = 0; t < numTiles; ++t) {
     if (t == tplIdx || t == shortIdx)
       continue;
-    auto res =
-        checkStructuralEquivalence(chains[tplIdx], chains[t], &masterIdentity);
+    auto res = checkStructuralEquivalence(chains[tplIdx], chains[t],
+                                          &canonicalIdentity);
     if (!res || res->templateChainIdx != 0)
       return std::nullopt;
     pairResults[t] = std::move(*res);
