@@ -453,6 +453,7 @@ def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local",
     Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$barrier,
     Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$result,
     I1:$pred,
+    UnitAttr:$multicast,
     DefaultValuedAttr<TT_CacheModifierAttr, "triton::CacheModifier::NONE">:$cache,
     DefaultValuedAttr<TT_EvictionPolicyAttr, "triton::EvictionPolicy::NORMAL">:$evict,
     DefaultValuedAttr<BoolAttr, "false">:$isVolatile,
@@ -1147,7 +1148,10 @@ def TTNG_SubtiledRegionOp : TTNG_Op<"subtiled_region", [
 
     `tileMappings` is an array of arrays: one per tile, each entry is an index
     into the setup yield values. The length of each inner array must equal the
-    number of tile block arguments.
+    number of tile block arguments, or the number of tile block arguments minus
+    one if the tile region has an extra trailing `i32` block argument for the
+    tile index. When present, the tile index argument is substituted with the
+    concrete tile index (0, 1, ...) during lowering.
 
     `barrierAnnotations` describes where to insert barrier operations during
     lowering. Each annotation references a target op by index in the tile body
@@ -1156,9 +1160,11 @@ def TTNG_SubtiledRegionOp : TTNG_Op<"subtiled_region", [
 
   let arguments = (ins
     Variadic<TTG_MemDescType>:$barriers,
-    Variadic<I32>:$barrierPhases,
+    Variadic<I64>:$accumCnts,
+    Variadic<AnyType>:$tokenValues,
     ArrayAttr:$tileMappings,
-    ArrayAttr:$barrierAnnotations
+    ArrayAttr:$barrierAnnotations,
+    ArrayAttr:$tokenAnnotations
   );
 
   let results = (outs Variadic<AnyType>:$results);

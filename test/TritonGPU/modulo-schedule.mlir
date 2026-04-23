@@ -8,22 +8,17 @@
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
-// Verify that the modulo schedule pass annotates ops with loop.stage/loop.cluster
-// and sets tt.modulo_ii on the loop.
+// Verify that the modulo schedule pass sets tt.num_stages on the inner loop.
+// For a single-MMA GEMM, all MMAs are in the same stage so tt.autows is
+// skipped, and inner loops no longer emit loop.stage/loop.cluster attrs
+// (those are only emitted on outer loops via emitScheduleAttributes).
 //
 // CHECK-LABEL: @gemm_inner_loop
-// Cluster IDs are dense ranks of modulo cycles within each stage (Step 2.5).
-// Stages processed in reverse order: higher stage -> lower cluster ID.
-// Same cycle -> same cluster; different cycle -> different cluster.
-// CHECK: tt.descriptor_load {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32}
-// CHECK: tt.descriptor_load {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
-// CHECK: ttg.local_alloc {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32, tt.num_buffers = 3 : i32}
-// CHECK: ttg.local_alloc {{.*}} {loop.cluster = 3 : i32, loop.stage = 0 : i32, tt.num_buffers = 3 : i32}
-// CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 0 : i32, loop.stage = 1 : i32}
-// CHECK: ttng.tmem_load {{.*}} {loop.cluster = 0 : i32, loop.stage = 2 : i32}
-// CHECK: tt.modulo_ii = 1038 : i32
-// CHECK-SAME: tt.num_stages = 3 : i32
-// CHECK-SAME: tt.scheduled_max_stage = 2 : i32
+// CHECK: scf.for
+// CHECK-NOT: loop.stage
+// CHECK-NOT: loop.cluster
+// CHECK-NOT: tt.autows
+// CHECK: tt.num_stages = 2 : i32
 tt.func @gemm_inner_loop(
   %a_desc: !tt.tensordesc<tensor<128x64xf16>>,
   %b_desc: !tt.tensordesc<tensor<64x128xf16>>

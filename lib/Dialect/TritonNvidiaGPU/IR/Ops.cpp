@@ -349,6 +349,34 @@ LogicalResult AsyncTMACopyLocalToGlobalOp::verify() {
   return verifyTMAEncoding(this, getDesc(), getSrc().getType().getEncoding());
 }
 
+static LogicalResult verifyGatherScatterOp(Operation *op,
+                                           RankedTensorType blockType,
+                                           MemDescType smemType,
+                                           RankedTensorType indicesType) {
+  // Gather from `!tt.tensordesc<tensor<1xMxdtype>>`.
+  if (blockType.getRank() != 2)
+    return op->emitOpError("descriptor block must be 2D, but got ")
+           << blockType;
+  if (blockType.getShape()[0] != 1)
+    return op->emitOpError("descriptor block must have exactly 1 row, but got ")
+           << blockType;
+
+  // Re-use the result verifier from the functional API
+  auto resultType =
+      RankedTensorType::get(smemType.getShape(), smemType.getElementType());
+  if (failed(DescriptorGatherOp::verifyResultType(op, resultType, indicesType)))
+    return failure();
+
+  if (resultType.getShape()[1] != blockType.getShape()[1])
+    return op->emitOpError("result tensor number of columns must match block (")
+           << blockType.getShape()[1] << "), but got " << resultType;
+  if (resultType.getElementType() != blockType.getElementType())
+    return op->emitOpError("result tensor element type must match block (")
+           << blockType.getElementType() << "), but got " << resultType;
+
+  return success();
+}
+
 // -- AsyncTMAGatherOp --
 LogicalResult AsyncTMAGatherOp::verify() {
   if (failed(verifyBarrierType(*this, getBarrier().getType())))
@@ -359,8 +387,9 @@ LogicalResult AsyncTMAGatherOp::verify() {
     return emitOpError("cannot store into immutable memory");
   if (failed(verifyTMAEncoding(this, getDesc(), resultType.getEncoding())))
     return failure();
-  return DescriptorGatherOp::verifyResultType(*this, resultType,
-                                              getXOffsets().getType());
+  return verifyGatherScatterOp(*this,
+                               getDesc().getType().getSignlessBlockType(),
+                               resultType, getXOffsets().getType());
 }
 
 // -- AsyncTMAScatter --
@@ -368,8 +397,9 @@ LogicalResult AsyncTMAScatterOp::verify() {
   auto srcType = getSrc().getType();
   if (failed(verifyTMAEncoding(this, getDesc(), srcType.getEncoding())))
     return failure();
-  return DescriptorGatherOp::verifyResultType(*this, srcType,
-                                              getXOffsets().getType());
+  return verifyGatherScatterOp(*this,
+                               getDesc().getType().getSignlessBlockType(),
+                               srcType, getXOffsets().getType());
 }
 
 // -- TCGen5MMAOp --
@@ -697,7 +727,13 @@ LogicalResult TCGen5MMAScaledOp::verify() {
   Type dtype = getD().getType().getElementType();
   if (failed(verifyMMADType(*this, atype, btype, dtype)))
     return failure();
-  return success();
+  auto enc = dyn_cast<TensorMemoryEncodingAttr>(getD().getType().getEncoding());
+  if (!enc) {
+    return emitOpError(
+        "expected accumulator layout to be a TensorMemoryLayout");
+  }
+  if (enc.getBlockM() != 128)
+    return emitOpError("only supports instruction shape blockM=128");
   return success();
 }
 
@@ -1027,7 +1063,7 @@ LogicalResult TMEMCopyOp::verify() {
       return emitOpError("Incorrect tmem layout.");
     }
     if (tmemEnc.getBlockM() != 128) {
-      return emitOpError("Tmem layout ahouls have M=128.");
+      return emitOpError("Tmem layout must have blockM=128.");
     }
     if (nvmmaEnc && nvmmaEnc.getSwizzlingByteWidth() == 0) {
       return emitOpError("Source layout should be swizzled.");
@@ -1131,18 +1167,29 @@ LogicalResult SubtiledRegionOp::verify() {
   if (tileMappings.empty())
     return emitOpError("tileMappings must have at least one tile");
 
-  // 6-8. Validate each tile mapping
+  // 6-8. Validate each tile mapping.
+  // The tile region may have an optional trailing i32 tile index argument,
+  // so tileMappings entries may have numTileArgs or numTileArgs-1 elements.
+  bool hasTileIndex = false;
   for (auto [i, mapping] : llvm::enumerate(tileMappings)) {
     auto indices = dyn_cast<DenseI32ArrayAttr>(mapping);
     if (!indices)
       return emitOpError("tileMappings[")
              << i << "] must be a DenseI32ArrayAttr";
 
-    // 6. Inner array length = number of tile block args
-    if (static_cast<unsigned>(indices.size()) != numTileArgs)
-      return emitOpError("tileMappings[") << i << "] has " << indices.size()
-                                          << " entries but tile region has "
-                                          << numTileArgs << " block arguments";
+    // 6. Inner array length = numTileArgs or numTileArgs-1 (tile index).
+    unsigned mappingSize = static_cast<unsigned>(indices.size());
+    if (mappingSize == numTileArgs) {
+      // No tile index arg.
+    } else if (mappingSize + 1 == numTileArgs) {
+      hasTileIndex = true;
+    } else {
+      return emitOpError("tileMappings[")
+             << i << "] has " << indices.size()
+             << " entries but tile region has " << numTileArgs
+             << " block arguments (expected " << numTileArgs << " or "
+             << numTileArgs - 1 << ")";
+    }
 
     for (auto [j, idx] : llvm::enumerate(indices.asArrayRef())) {
       // 7. Indices in range
@@ -1161,14 +1208,28 @@ LogicalResult SubtiledRegionOp::verify() {
     }
   }
 
-  // Count non-terminator ops in tile body for targetOpIdx validation.
+  // Validate the tile index argument type if present.
+  if (hasTileIndex) {
+    Type lastArgType = tileBlock.getArgument(numTileArgs - 1).getType();
+    if (!lastArgType.isInteger(32))
+      return emitOpError("tile index argument must be i32 but got ")
+             << lastArgType;
+  }
+
+  // Count non-terminator ops in each region for targetOpIdx validation.
   unsigned numTileOps = 0;
   for (Operation &op : tileBlock.without_terminator())
     ++numTileOps;
+  unsigned numSetupOps = 0;
+  for (Operation &op : setupBlock.without_terminator())
+    ++numSetupOps;
+  unsigned numTeardownOps = 0;
+  for (Operation &op : teardownBlock.without_terminator())
+    ++numTeardownOps;
 
   // 9-10. Validate barrier annotations
   unsigned numBarriers = getBarriers().size();
-  unsigned numPhases = getBarrierPhases().size();
+  unsigned numAccumCnts = getAccumCnts().size();
   for (auto [i, attr] : llvm::enumerate(getBarrierAnnotations())) {
     auto annotation = dyn_cast<BarrierAnnotationAttr>(attr);
     if (!annotation)
@@ -1181,13 +1242,13 @@ LogicalResult SubtiledRegionOp::verify() {
              << i << "] has barrierIdx=" << annotation.getBarrierIdx()
              << " but there are only " << numBarriers << " barriers";
 
-    // 10. For wait_barrier, check phase exists
+    // 10. For wait_barrier, check accumCnt exists
     if (annotation.getBarrierOpKind().getValue() == "wait_barrier") {
-      if (annotation.getBarrierIdx() >= numPhases)
+      if (annotation.getBarrierIdx() >= numAccumCnts)
         return emitOpError("barrierAnnotations[")
                << i << "] is a wait_barrier with barrierIdx="
                << annotation.getBarrierIdx() << " but there are only "
-               << numPhases << " phases";
+               << numAccumCnts << " accumCnts";
     }
 
     // Validate barrierOpKind is one of the known values
@@ -1196,12 +1257,40 @@ LogicalResult SubtiledRegionOp::verify() {
       return emitOpError("barrierAnnotations[")
              << i << "] has unknown barrierOpKind '" << kind << "'";
 
-    // Validate targetOpIdx is in range
-    if (annotation.getTargetOpIdx() >= numTileOps)
+    // Validate targetOpIdx is in range for the target region
+    BarrierRegion region = annotation.getRegion();
+    unsigned maxOps = (region == BarrierRegion::SETUP)      ? numSetupOps
+                      : (region == BarrierRegion::TEARDOWN) ? numTeardownOps
+                                                            : numTileOps;
+    const char *regionName = (region == BarrierRegion::SETUP)      ? "setup"
+                             : (region == BarrierRegion::TEARDOWN) ? "teardown"
+                                                                   : "tile";
+    if (annotation.getTargetOpIdx() >= maxOps)
       return emitOpError("barrierAnnotations[")
              << i << "] has targetOpIdx=" << annotation.getTargetOpIdx()
-             << " but tile region has only " << numTileOps
+             << " but " << regionName << " region has only " << maxOps
              << " non-terminator ops";
+  }
+
+  // 11. Task IDs in the tile body must form contiguous groups (no
+  // interleaving). A single uniform task set is the common case; contiguous
+  // groups arise when segments with different partitions are merged due to
+  // non-tensor (token) dependencies.
+  SmallVector<ArrayRef<int32_t>> seenTaskSets;
+  for (Operation &op : tileBlock.without_terminator()) {
+    auto attr = op.getAttrOfType<DenseI32ArrayAttr>("async_task_id");
+    if (!attr)
+      continue;
+    ArrayRef<int32_t> taskIds = attr.asArrayRef();
+    if (seenTaskSets.empty() || seenTaskSets.back() != taskIds) {
+      // Check that this task set hasn't appeared before (no interleaving).
+      for (size_t i = 0; i + 1 < seenTaskSets.size(); ++i) {
+        if (seenTaskSets[i] == taskIds)
+          return emitOpError("tile body has interleaved async_task_id groups: ")
+                 << attr << " appeared non-contiguously";
+      }
+      seenTaskSets.push_back(taskIds);
+    }
   }
 
   return success();
@@ -1219,13 +1308,24 @@ void SubtiledRegionOp::print(OpAsmPrinter &p) {
     p << ")";
   }
 
-  // Print phases
-  if (!getBarrierPhases().empty()) {
-    p << " phases(";
-    llvm::interleaveComma(getBarrierPhases(), p,
+  // Print accumCnts
+  if (!getAccumCnts().empty()) {
+    p << " accum_cnts(";
+    llvm::interleaveComma(getAccumCnts(), p,
                           [&](Value v) { p.printOperand(v); });
     p << " : ";
-    llvm::interleaveComma(getBarrierPhases().getTypes(), p,
+    llvm::interleaveComma(getAccumCnts().getTypes(), p,
+                          [&](Type t) { p.printType(t); });
+    p << ")";
+  }
+
+  // Print tokenValues
+  if (!getTokenValues().empty()) {
+    p << " token_values(";
+    llvm::interleaveComma(getTokenValues(), p,
+                          [&](Value v) { p.printOperand(v); });
+    p << " : ";
+    llvm::interleaveComma(getTokenValues().getTypes(), p,
                           [&](Type t) { p.printType(t); });
     p << ")";
   }
@@ -1238,10 +1338,16 @@ void SubtiledRegionOp::print(OpAsmPrinter &p) {
   p << " barrier_annotations = ";
   p.printAttribute(getBarrierAnnotations());
 
+  // Print tokenAnnotations
+  if (!getTokenAnnotations().empty()) {
+    p << " token_annotations = ";
+    p.printAttribute(getTokenAnnotations());
+  }
+
   // Print attr-dict (excluding our custom attrs and operand segment sizes)
-  p.printOptionalAttrDict(
-      (*this)->getAttrs(),
-      {"tileMappings", "barrierAnnotations", getOperandSegmentSizeAttr()});
+  p.printOptionalAttrDict((*this)->getAttrs(),
+                          {"tileMappings", "barrierAnnotations",
+                           "tokenAnnotations", getOperandSegmentSizeAttr()});
 
   // Print setup region
   p << " setup ";
@@ -1269,6 +1375,8 @@ ParseResult SubtiledRegionOp::parse(OpAsmParser &parser,
   SmallVector<Type> barrierTypes;
   SmallVector<OpAsmParser::UnresolvedOperand> phaseOperands;
   SmallVector<Type> phaseTypes;
+  SmallVector<OpAsmParser::UnresolvedOperand> tokenOperands;
+  SmallVector<Type> tokenTypes;
 
   // Parse optional barriers(...)
   if (succeeded(parser.parseOptionalKeyword("barriers"))) {
@@ -1277,10 +1385,17 @@ ParseResult SubtiledRegionOp::parse(OpAsmParser &parser,
       return failure();
   }
 
-  // Parse optional phases(...)
-  if (succeeded(parser.parseOptionalKeyword("phases"))) {
+  // Parse optional accum_cnts(...)
+  if (succeeded(parser.parseOptionalKeyword("accum_cnts"))) {
     if (parser.parseLParen() || parser.parseOperandList(phaseOperands) ||
         parser.parseColonTypeList(phaseTypes) || parser.parseRParen())
+      return failure();
+  }
+
+  // Parse optional token_values(...)
+  if (succeeded(parser.parseOptionalKeyword("token_values"))) {
+    if (parser.parseLParen() || parser.parseOperandList(tokenOperands) ||
+        parser.parseColonTypeList(tokenTypes) || parser.parseRParen())
       return failure();
   }
 
@@ -1298,6 +1413,17 @@ ParseResult SubtiledRegionOp::parse(OpAsmParser &parser,
     return failure();
   result.addAttribute("barrierAnnotations", barrierAnnotationsAttr);
 
+  // Parse optional token_annotations = <attr>
+  if (succeeded(parser.parseOptionalKeyword("token_annotations"))) {
+    Attribute tokenAnnotationsAttr;
+    if (parser.parseEqual() || parser.parseAttribute(tokenAnnotationsAttr))
+      return failure();
+    result.addAttribute("tokenAnnotations", tokenAnnotationsAttr);
+  } else {
+    result.addAttribute("tokenAnnotations",
+                        parser.getBuilder().getArrayAttr({}));
+  }
+
   // Parse optional attr-dict
   if (parser.parseOptionalAttrDict(result.attributes))
     return failure();
@@ -1306,6 +1432,8 @@ ParseResult SubtiledRegionOp::parse(OpAsmParser &parser,
   if (parser.resolveOperands(barrierOperands, barrierTypes,
                              parser.getCurrentLocation(), result.operands) ||
       parser.resolveOperands(phaseOperands, phaseTypes,
+                             parser.getCurrentLocation(), result.operands) ||
+      parser.resolveOperands(tokenOperands, tokenTypes,
                              parser.getCurrentLocation(), result.operands))
     return failure();
 
@@ -1313,7 +1441,8 @@ ParseResult SubtiledRegionOp::parse(OpAsmParser &parser,
   result.addAttribute(SubtiledRegionOp::getOperandSegmentSizeAttr(),
                       parser.getBuilder().getDenseI32ArrayAttr(
                           {static_cast<int32_t>(barrierOperands.size()),
-                           static_cast<int32_t>(phaseOperands.size())}));
+                           static_cast<int32_t>(phaseOperands.size()),
+                           static_cast<int32_t>(tokenOperands.size())}));
 
   // Parse setup region
   if (parser.parseKeyword("setup"))

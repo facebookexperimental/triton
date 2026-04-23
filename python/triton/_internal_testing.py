@@ -30,12 +30,15 @@ def is_interpreter():
 def get_current_target():
     if is_interpreter():
         return None
-    return triton.runtime.driver.active.get_current_target()
+    try:
+        return triton.runtime.driver.active.get_current_target()
+    except RuntimeError:
+        return None
 
 
 def is_cuda():
     target = get_current_target()
-    return False if target is None else target.backend == "cuda"
+    return False if target is None else target.is_cuda_backend()
 
 
 def is_ampere_or_newer():

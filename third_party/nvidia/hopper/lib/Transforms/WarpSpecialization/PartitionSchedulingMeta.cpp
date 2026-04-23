@@ -568,6 +568,28 @@ private:
       // Assign dpId to post-loop ops: follow loop results forward.
       // Each loop result traces back to a specific MMA group's yield.
       auto yieldOp = innermostLoop.getBody()->getTerminator();
+      // Helper: find dpId for an in-loop op by walking backward through its
+      // operand chain until we find an op in opToDpId. This handles ops like
+      // l_i0 (softmax sum accumulation) that are not in any MMA's backward
+      // slice but whose operands (e.g., alpha from the correction chain) are.
+      auto findDpIdBackward = [&](Operation *startOp) -> unsigned {
+        SmallVector<Operation *> bwWorklist;
+        DenseSet<Operation *> bwVisited;
+        bwWorklist.push_back(startOp);
+        while (!bwWorklist.empty()) {
+          Operation *op = bwWorklist.pop_back_val();
+          if (!bwVisited.insert(op).second)
+            continue;
+          auto foundIt = opToDpId.find(op);
+          if (foundIt != opToDpId.end())
+            return foundIt->second;
+          for (Value operand : op->getOperands())
+            if (auto *defOp = operand.getDefiningOp())
+              if (innermostLoop->isAncestor(defOp))
+                bwWorklist.push_back(defOp);
+        }
+        return SHARED_DPID;
+      };
       for (unsigned argIdx = 0; argIdx < innermostLoop.getNumResults();
            ++argIdx) {
         Value yieldVal = yieldOp->getOperand(argIdx);
@@ -575,8 +597,16 @@ private:
         if (!yieldDef)
           continue;
         auto it = opToDpId.find(yieldDef);
-        if (it == opToDpId.end())
-          continue;
+        // If the yield def is not directly in opToDpId (e.g., softmax sum
+        // accumulation ops that don't feed any MMA), walk backward through
+        // its operand chain to find an ancestor with a known dpId.
+        if (it == opToDpId.end()) {
+          unsigned backwardDpId = findDpIdBackward(yieldDef);
+          if (backwardDpId == SHARED_DPID)
+            continue;
+          opToDpId[yieldDef] = backwardDpId;
+          it = opToDpId.find(yieldDef);
+        }
         unsigned yieldDpId = it->second;
         if (yieldDpId == SHARED_DPID)
           continue;
@@ -798,10 +828,6 @@ static PartitionLayout createPartitionLayout(PartitionSet &schedule,
     layout.gemmPartition->setType("gemm");
   }
 
-  // Load partition: always.
-  layout.loadPartition = schedule.addPartition(0);
-  layout.loadPartition->setType("load");
-
   // Epilogue partition: for non-store epilogue ops when not merging.
   if (hasEpilogue && !options.mergeEpilogue &&
       !options.mergeEpilogueToComputation) {
@@ -814,6 +840,11 @@ static PartitionLayout createPartitionLayout(PartitionSet &schedule,
     layout.epilogueStorePartition = schedule.addPartition(0);
     layout.epilogueStorePartition->setType("epilogue_store");
   }
+
+  // Load partition: always created last so it gets the highest partition index,
+  // which maps to the default (producer) warp group at runtime.
+  layout.loadPartition = schedule.addPartition(0);
+  layout.loadPartition->setType("load");
 
   // Set default partition alias using fallback chain.
   layout.defaultPartition = layout.getDefaultPartition();
@@ -1000,6 +1031,18 @@ schedulePostLoopOps(scf::ForOp loop, PartitionSet &schedule,
     return SHARED_DPID;
   };
 
+  // Deterministic fallback: pick the partition with the smallest dpId key.
+  // DenseMap iteration order is non-deterministic, so .begin() can return
+  // different entries across builds. Use min_element on the key instead.
+  auto dpIdFallbackPartition = [&]() -> Partition * {
+    if (dpIdToPartition.empty())
+      return nullptr;
+    auto minIt = std::min_element(
+        dpIdToPartition.begin(), dpIdToPartition.end(),
+        [](const auto &a, const auto &b) { return a.first < b.first; });
+    return minIt->second;
+  };
+
   auto getEpilogueTarget = [&](Operation *op) -> Partition * {
     if (options.mergeEpilogueToComputation) {
       unsigned dpId = findDpId(op);
@@ -1008,15 +1051,14 @@ schedulePostLoopOps(scf::ForOp loop, PartitionSet &schedule,
         if (it != dpIdToPartition.end())
           return it->second;
       }
-      if (!dpIdToPartition.empty())
-        return dpIdToPartition.begin()->second;
+      if (auto *p = dpIdFallbackPartition())
+        return p;
     }
     if (options.mergeEpilogue) {
       if (layout.correctionPartition)
         return layout.correctionPartition;
       if (layout.reductionPartition)
-        if (layout.reductionPartition)
-          return layout.reductionPartition;
+        return layout.reductionPartition;
       // When no correction/reduction partition exists (e.g., mergeCorrection +
       // mergeEpilogue on Hopper), route epilogue ops to their dpId-based
       // computation partition so each data partition's epilogue stays local.
@@ -1026,8 +1068,8 @@ schedulePostLoopOps(scf::ForOp loop, PartitionSet &schedule,
         if (it != dpIdToPartition.end())
           return it->second;
       }
-      if (!dpIdToPartition.empty())
-        return dpIdToPartition.begin()->second;
+      if (auto *p = dpIdFallbackPartition())
+        return p;
     }
     if (layout.epiloguePartition)
       return layout.epiloguePartition;
@@ -2126,7 +2168,9 @@ void optimizeSchedule(scf::ForOp loop, PartitionSet &schedule) {
   // Walk everything in reverse so that operations are visited before their
   // operands.
   loop.walk<WalkOrder::PostOrder, ReverseIterator>([&](Operation *op) {
-    if (!isa<BroadcastOp, ExpandDimsOp>(op))
+    if (!isa<MemDescTransOp, ConvertLayoutOp, BroadcastOp, ExpandDimsOp>(op))
+      // if (op->getNumResults() != 1 || !isPure(op) ||
+      //     isa<scf::YieldOp, scf::ForOp, scf::IfOp>(op))
       return;
 
     Partition *partition = getPartition(op);
@@ -2249,7 +2293,7 @@ void splitDataPartitionedIfOps(scf::ForOp loop, PartitionSet &schedule) {
 
     // Create one scf.if per partition group.
     for (auto &entry : partitionToResultIndices) {
-      auto partId = entry.first;
+      auto &partId = entry.first;
       auto &resultIndices = entry.second;
       auto *origThenBlock = ifOp.thenBlock();
       auto *origElseBlock = ifOp.elseBlock();
@@ -2406,9 +2450,9 @@ void PartitionSchedulingMeta::runOnOperation() {
       loop.walk<WalkOrder::PostOrder, ReverseIterator>([](Operation *op) {
         // By default, the walk is in postorder so it is safe to delete ops
         // while we walk.
-        if (isa<BroadcastOp, ExpandDimsOp>(op))
-          if (op->use_empty())
-            op->erase();
+        if (op->use_empty() && isPure(op) && op->getNumResults() == 1 &&
+            !isa<scf::YieldOp, scf::ForOp, scf::IfOp>(op))
+          op->erase();
       });
     }
   }

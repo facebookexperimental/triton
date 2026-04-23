@@ -2,15 +2,15 @@
 Explicit unit tests for all warp-specialized variations of Tutorial 09 (Persistent Matmul).
 
 These tests validate the warp specialization feature for persistent matmul kernels
-with both Flatten=True and Flatten=False configurations. Tests are restricted to
-Blackwell GPUs only.
+with both Flatten=True and Flatten=False configurations. Tests cover both
+Blackwell and Hopper GPUs.
 """
 
 import pytest
 import torch
 import triton
 import triton.language as tl
-from triton._internal_testing import is_blackwell
+from triton._internal_testing import is_blackwell, is_hopper
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 
@@ -45,6 +45,7 @@ def matmul_kernel_tma_ws(
     B_COL_MAJOR: tl.constexpr,
     DATA_PARTITION_FACTOR: tl.constexpr,
     SMEM_ALLOC_ALGO: tl.constexpr,
+    SEPARATE_EPILOGUE_STORE: tl.constexpr,
 ):
     """TMA-based matmul with warp specialization in K-loop (always enabled)."""
     dtype = tl.float16
@@ -67,8 +68,13 @@ def matmul_kernel_tma_ws(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     # Always use warp_specialize=True
-    for k in tl.range(k_tiles, warp_specialize=True, data_partition_factor=DATA_PARTITION_FACTOR,
-                      smem_alloc_algo=SMEM_ALLOC_ALGO, separate_epilogue_store=False):
+    for k in tl.range(
+            k_tiles,
+            warp_specialize=True,
+            data_partition_factor=DATA_PARTITION_FACTOR,
+            smem_alloc_algo=SMEM_ALLOC_ALGO,
+            separate_epilogue_store=SEPARATE_EPILOGUE_STORE,
+    ):
         offs_k = k * BLOCK_SIZE_K
         if A_COL_MAJOR:
             a = a_desc.load([offs_k, offs_am]).T
@@ -110,6 +116,7 @@ def matmul_kernel_tma_persistent_ws(
     B_COL_MAJOR: tl.constexpr,
     DATA_PARTITION_FACTOR: tl.constexpr,
     SMEM_ALLOC_ALGO: tl.constexpr,
+    SEPARATE_EPILOGUE_STORE: tl.constexpr,
 ):
     """Persistent TMA matmul with warp specialization (always enabled)."""
     dtype = tl.float16
@@ -131,7 +138,7 @@ def matmul_kernel_tma_persistent_ws(
             warp_specialize=True,
             data_partition_factor=DATA_PARTITION_FACTOR,
             smem_alloc_algo=SMEM_ALLOC_ALGO,
-            separate_epilogue_store=True,
+            separate_epilogue_store=SEPARATE_EPILOGUE_STORE,
     ):
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
@@ -205,6 +212,7 @@ def matmul_kernel_descriptor_persistent_ws(
     B_COL_MAJOR: tl.constexpr,
     DATA_PARTITION_FACTOR: tl.constexpr,
     SMEM_ALLOC_ALGO: tl.constexpr,
+    SEPARATE_EPILOGUE_STORE: tl.constexpr,
 ):
     """Persistent matmul with device-side TMA descriptors and warp specialization (always enabled)."""
     dtype = c_ptr.dtype.element_ty
@@ -264,7 +272,7 @@ def matmul_kernel_descriptor_persistent_ws(
             warp_specialize=True,
             data_partition_factor=DATA_PARTITION_FACTOR,
             smem_alloc_algo=SMEM_ALLOC_ALGO,
-            separate_epilogue_store=True,
+            separate_epilogue_store=SEPARATE_EPILOGUE_STORE,
     ):
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
@@ -329,6 +337,7 @@ def matmul_kernel_descriptor_persistent_ws(
 @pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
+@pytest.mark.parametrize("separate_epilogue_store", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tutorial09_matmul_tma_warp_specialize(
     M,
@@ -344,6 +353,7 @@ def test_tutorial09_matmul_tma_warp_specialize(
     use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     SMEM_ALLOC_ALGO,
+    separate_epilogue_store,
 ):
     """Test matmul_kernel_tma with warp_specialize=True (K-loop based)."""
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
@@ -410,6 +420,7 @@ def test_tutorial09_matmul_tma_warp_specialize(
             B_COL_MAJOR=B_col_major,
             DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
             SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
+            SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
@@ -443,6 +454,7 @@ def test_tutorial09_matmul_tma_warp_specialize(
 @pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
+@pytest.mark.parametrize("separate_epilogue_store", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tutorial09_matmul_tma_persistent_warp_specialize(
     M,
@@ -460,6 +472,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     SMEM_ALLOC_ALGO,
+    separate_epilogue_store,
 ):
     """Test matmul_kernel_tma_persistent with warp_specialize=True for both Flatten values."""
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
@@ -566,6 +579,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
             B_COL_MAJOR=B_col_major,
             DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
             SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
+            SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
@@ -599,6 +613,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 @pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
+@pytest.mark.parametrize("separate_epilogue_store", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     M,
@@ -616,6 +631,7 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     SMEM_ALLOC_ALGO,
+    separate_epilogue_store,
 ):
     """Test matmul_kernel_descriptor_persistent with warp_specialize=True for both Flatten values."""
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
@@ -688,6 +704,7 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
             B_COL_MAJOR=B_col_major,
             DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
             SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
+            SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
@@ -786,5 +803,355 @@ def test_tutorial09_multi_epilogue_subtile():
         assert "ttng.tc_gen5_mma" in ttgir, "Expected Blackwell MMA instruction"
 
         # Verify correctness
+        ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
+        torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
+
+
+# ============================================================================
+# Hopper Tests
+# ============================================================================
+
+
+# ============================================================================
+# Hopper Test 1: matmul_kernel_tma warp specialization (K-loop based)
+# ============================================================================
+@pytest.mark.parametrize("M, N, K", [(128, 128, 128), (512, 512, 256), (8192, 8192, 1024)])
+@pytest.mark.parametrize("BLOCK_SIZE_M", [64, 128])
+@pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
+@pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
+@pytest.mark.parametrize("num_stages", [2, 3])
+@pytest.mark.parametrize("num_warps", [4])
+@pytest.mark.parametrize("A_col_major", [False, True])
+@pytest.mark.parametrize("B_col_major", [False, True])
+@pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
+@pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
+@pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
+@pytest.mark.parametrize("enable_pingpong", [False, True])
+@pytest.mark.parametrize("separate_epilogue_store", [True, False])
+@pytest.mark.skipif(not is_hopper(), reason="Requires Hopper")
+def test_hopper_matmul_tma_warp_specialize(
+    M,
+    N,
+    K,
+    BLOCK_SIZE_M,
+    BLOCK_SIZE_N,
+    BLOCK_SIZE_K,
+    num_stages,
+    num_warps,
+    A_col_major,
+    B_col_major,
+    use_early_tma_store_lowering,
+    DATA_PARTITION_FACTOR,
+    SMEM_ALLOC_ALGO,
+    enable_pingpong,
+    separate_epilogue_store,
+):
+    """Test matmul_kernel_tma with warp_specialize=True on Hopper (K-loop based)."""
+    if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 128:
+        pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 128")
+    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and not (BLOCK_SIZE_M == 64 and num_stages == 2):
+        pytest.skip("OOM: shared memory exceeds H100 limit")
+
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.use_meta_partition = True
+
+        dtype = torch.float16
+        GROUP_SIZE_M = 8
+        device = "cuda"
+
+        torch.manual_seed(42)
+        if A_col_major:
+            A = torch.randn((K, M), dtype=dtype, device=device).t()
+        else:
+            A = torch.randn((M, K), dtype=dtype, device=device)
+        if B_col_major:
+            B = torch.randn((K, N), dtype=dtype, device=device).t()
+        else:
+            B = torch.randn((N, K), dtype=dtype, device=device)
+        C = torch.empty((M, N), dtype=dtype, device=device)
+
+        def alloc_fn(size, align, stream):
+            return torch.empty(size, dtype=torch.int8, device="cuda")
+
+        triton.set_allocator(alloc_fn)
+
+        if A_col_major:
+            a_desc = TensorDescriptor(A, [K, M], [M, 1], [BLOCK_SIZE_K, BLOCK_SIZE_M])
+        else:
+            a_desc = TensorDescriptor(A, [M, K], [K, 1], [BLOCK_SIZE_M, BLOCK_SIZE_K])
+        if B_col_major:
+            b_desc = TensorDescriptor(B, [K, N], [N, 1], [BLOCK_SIZE_K, BLOCK_SIZE_N])
+        else:
+            b_desc = TensorDescriptor(B, [N, K], [K, 1], [BLOCK_SIZE_N, BLOCK_SIZE_K])
+        c_desc = TensorDescriptor(C, C.shape, C.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_N])
+
+        grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]), )
+
+        kernel = matmul_kernel_tma_ws[grid](
+            a_desc,
+            b_desc,
+            c_desc,
+            M,
+            N,
+            K,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=GROUP_SIZE_M,
+            A_COL_MAJOR=A_col_major,
+            B_COL_MAJOR=B_col_major,
+            DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
+            SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
+            SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
+            num_stages=num_stages,
+            num_warps=num_warps,
+            early_tma_store_lowering=use_early_tma_store_lowering,
+            pingpongAutoWS=enable_pingpong,
+        )
+
+        ttgir = kernel.asm["ttgir"]
+        assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
+        assert "ttng.warp_group_dot" in ttgir, "Expected Hopper MMA instruction"
+        assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
+
+        ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
+        torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
+
+
+# ============================================================================
+# Hopper Test 2: matmul_kernel_tma_persistent warp specialization (tile-loop)
+# Hopper constraints: FLATTEN=False, EPILOGUE_SUBTILE=1
+# ============================================================================
+@pytest.mark.parametrize("M, N, K", [(128, 128, 128), (512, 512, 256), (8192, 8192, 1024)])
+@pytest.mark.parametrize("BLOCK_SIZE_M", [64, 128])
+@pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
+@pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
+@pytest.mark.parametrize("num_stages", [2, 3])
+@pytest.mark.parametrize("num_warps", [4])
+@pytest.mark.parametrize("A_col_major", [False, True])
+@pytest.mark.parametrize("B_col_major", [False, True])
+@pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
+@pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
+@pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
+@pytest.mark.parametrize("enable_pingpong", [False, True])
+@pytest.mark.parametrize("separate_epilogue_store", [True, False])
+@pytest.mark.skipif(not is_hopper(), reason="Requires Hopper")
+def test_hopper_matmul_tma_persistent_warp_specialize(
+    M,
+    N,
+    K,
+    BLOCK_SIZE_M,
+    BLOCK_SIZE_N,
+    BLOCK_SIZE_K,
+    num_stages,
+    num_warps,
+    A_col_major,
+    B_col_major,
+    use_early_tma_store_lowering,
+    DATA_PARTITION_FACTOR,
+    SMEM_ALLOC_ALGO,
+    enable_pingpong,
+    separate_epilogue_store,
+):
+    """Test matmul_kernel_tma_persistent with warp_specialize=True on Hopper.
+
+    Hopper constraints: FLATTEN=False (not supported with WS), EPILOGUE_SUBTILE=1 (no TMEM).
+    """
+    if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 128:
+        pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 128")
+    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and not (BLOCK_SIZE_M == 64 and num_stages == 2):
+        pytest.skip("OOM: shared memory exceeds H100 limit")
+
+    FLATTEN = False
+    EPILOGUE_SUBTILE = 1
+
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.use_meta_partition = True
+
+        dtype = torch.float16
+        GROUP_SIZE_M = 8
+        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+        device = "cuda"
+
+        torch.manual_seed(42)
+        if A_col_major:
+            A = torch.randn((K, M), dtype=dtype, device=device).t()
+        else:
+            A = torch.randn((M, K), dtype=dtype, device=device)
+        if B_col_major:
+            B = torch.randn((K, N), dtype=dtype, device=device).t()
+        else:
+            B = torch.randn((N, K), dtype=dtype, device=device)
+        C = torch.empty((M, N), dtype=dtype, device=device)
+
+        def alloc_fn(size, align, stream):
+            return torch.empty(size, dtype=torch.int8, device="cuda")
+
+        triton.set_allocator(alloc_fn)
+
+        if A_col_major:
+            a_desc = TensorDescriptor(A, [K, M], [M, 1], [BLOCK_SIZE_K, BLOCK_SIZE_M])
+        else:
+            a_desc = TensorDescriptor(A, [M, K], [K, 1], [BLOCK_SIZE_M, BLOCK_SIZE_K])
+        if B_col_major:
+            b_desc = TensorDescriptor(B, [K, N], [N, 1], [BLOCK_SIZE_K, BLOCK_SIZE_N])
+        else:
+            b_desc = TensorDescriptor(B, [N, K], [K, 1], [BLOCK_SIZE_N, BLOCK_SIZE_K])
+        c_desc = TensorDescriptor(
+            C,
+            C.shape,
+            C.stride(),
+            [BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        grid = lambda META: (min(
+            NUM_SMS,
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        ), )
+
+        kernel = matmul_kernel_tma_persistent_ws[grid](
+            a_desc,
+            b_desc,
+            c_desc,
+            M,
+            N,
+            K,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=GROUP_SIZE_M,
+            EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
+            NUM_SMS=NUM_SMS,
+            FLATTEN=FLATTEN,
+            A_COL_MAJOR=A_col_major,
+            B_COL_MAJOR=B_col_major,
+            DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
+            SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
+            SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
+            num_stages=num_stages,
+            num_warps=num_warps,
+            early_tma_store_lowering=use_early_tma_store_lowering,
+            pingpongAutoWS=enable_pingpong,
+        )
+
+        ttgir = kernel.asm["ttgir"]
+        assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
+        assert "ttng.warp_group_dot" in ttgir, "Expected Hopper MMA instruction"
+        assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
+
+        ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
+        torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
+
+
+# ============================================================================
+# Hopper Test 3: matmul_kernel_descriptor_persistent warp specialization
+# (device-side TMA descriptors)
+# Hopper constraints: FLATTEN=False, EPILOGUE_SUBTILE=1
+# ============================================================================
+@pytest.mark.parametrize("M, N, K", [(128, 128, 128), (512, 512, 256), (8192, 8192, 1024)])
+@pytest.mark.parametrize("BLOCK_SIZE_M", [64, 128])
+@pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
+@pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
+@pytest.mark.parametrize("num_stages", [2, 3])
+@pytest.mark.parametrize("num_warps", [4])
+@pytest.mark.parametrize("A_col_major", [False, True])
+@pytest.mark.parametrize("B_col_major", [False, True])
+@pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
+@pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
+@pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
+@pytest.mark.parametrize("enable_pingpong", [False, True])
+@pytest.mark.parametrize("separate_epilogue_store", [True, False])
+@pytest.mark.skipif(not is_hopper(), reason="Requires Hopper")
+def test_hopper_matmul_descriptor_persistent_warp_specialize(
+    M,
+    N,
+    K,
+    BLOCK_SIZE_M,
+    BLOCK_SIZE_N,
+    BLOCK_SIZE_K,
+    num_stages,
+    num_warps,
+    A_col_major,
+    B_col_major,
+    use_early_tma_store_lowering,
+    DATA_PARTITION_FACTOR,
+    SMEM_ALLOC_ALGO,
+    enable_pingpong,
+    separate_epilogue_store,
+):
+    """Test matmul_kernel_descriptor_persistent with warp_specialize=True on Hopper.
+
+    Hopper constraints: FLATTEN=False (not supported with WS), EPILOGUE_SUBTILE=1 (no TMEM).
+    """
+    if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 128:
+        pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 128")
+    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and not (BLOCK_SIZE_M == 64 and num_stages == 2):
+        pytest.skip("OOM: shared memory exceeds H100 limit")
+
+    FLATTEN = False
+    EPILOGUE_SUBTILE = 1
+
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.use_meta_partition = True
+
+        dtype = torch.float16
+        GROUP_SIZE_M = 8
+        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+        device = "cuda"
+
+        torch.manual_seed(42)
+        if A_col_major:
+            A = torch.randn((K, M), dtype=dtype, device=device).t()
+        else:
+            A = torch.randn((M, K), dtype=dtype, device=device)
+        if B_col_major:
+            B = torch.randn((K, N), dtype=dtype, device=device).t()
+        else:
+            B = torch.randn((N, K), dtype=dtype, device=device)
+        C = torch.empty((M, N), dtype=dtype, device=device)
+
+        def alloc_fn(size, align, stream):
+            return torch.empty(size, dtype=torch.int8, device="cuda")
+
+        triton.set_allocator(alloc_fn)
+
+        grid = lambda META: (min(
+            NUM_SMS,
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        ), )
+
+        kernel = matmul_kernel_descriptor_persistent_ws[grid](
+            A,
+            B,
+            C,
+            M,
+            N,
+            K,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=GROUP_SIZE_M,
+            EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
+            NUM_SMS=NUM_SMS,
+            FLATTEN=FLATTEN,
+            A_COL_MAJOR=A_col_major,
+            B_COL_MAJOR=B_col_major,
+            DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
+            SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
+            SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
+            num_stages=num_stages,
+            num_warps=num_warps,
+            early_tma_store_lowering=use_early_tma_store_lowering,
+            pingpongAutoWS=enable_pingpong,
+        )
+
+        ttgir = kernel.asm["ttgir"]
+        assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
+        assert "ttng.warp_group_dot" in ttgir, "Expected Hopper MMA instruction"
+        assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
+
         ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
         torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)

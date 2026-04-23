@@ -26,6 +26,7 @@ static mlir::Location accumCntLoc(mlir::Location loc) {
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include <list>
 #include <unordered_set>
@@ -203,7 +204,20 @@ static void generateYieldCntsForThenBlock(
   }
 }
 
-// Increment by one for unique channels.
+// Determine the per-iteration accumCnt increment for a ForOp.  When the loop
+// body contains a SubtiledRegionOp, each iteration processes numTiles tiles,
+// so the increment must be numTiles instead of 1.
+static int64_t getAccumCntIncrement(scf::ForOp forOp) {
+  int64_t increment = 1;
+  forOp.walk([&](triton::nvidia_gpu::SubtiledRegionOp subOp) {
+    unsigned numTiles = subOp.getTileMappings().size();
+    if (numTiles > static_cast<unsigned>(increment))
+      increment = numTiles;
+  });
+  return increment;
+}
+
+// Increment by the appropriate amount for unique channels.
 static Value generateYieldCntsForForOp(scf::ForOp forOp, unsigned accumArgId) {
   Operation *yieldOp = forOp.getBody()->getTerminator();
   Value arg = forOp.getBody()->getArgument(accumArgId);
@@ -211,9 +225,11 @@ static Value generateYieldCntsForForOp(scf::ForOp forOp, unsigned accumArgId) {
   builder.setAsynTaskIdsFromArray(getNestedAsyncTaskIds(forOp));
   builder.setInsertionPoint(yieldOp);
   auto loc = forOp.getLoc();
-  Value one = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
-  Value endAccum =
-      builder.createWithAsyncTaskIds<arith::AddIOp>(accumCntLoc(loc), arg, one);
+  int64_t increment = getAccumCntIncrement(forOp);
+  Value incVal =
+      builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, increment, 64);
+  Value endAccum = builder.createWithAsyncTaskIds<arith::AddIOp>(
+      accumCntLoc(loc), arg, incVal);
   return endAccum;
 }
 
@@ -601,6 +617,7 @@ void collectRegionsWithChannelsPost(
       }
     }
     auto *dst = channel->getDstOp();
+    auto *src = channel->getSrcOp();
     auto *pOp = dst->getParentOp();
     if (!pOp)
       continue;
@@ -608,6 +625,21 @@ void collectRegionsWithChannelsPost(
       regionsWithChannels.insert(pOp);
     if (auto ifOp = dyn_cast<scf::IfOp>(pOp))
       regionsWithChannels.insert(pOp);
+    // When producer is in a different (outer) scope than consumer,
+    // also register the producer's parent. This handles Q buffers in
+    // persistent FA kernels: Q is produced in the outer tile loop but
+    // consumed inside the inner KV loop. Without this, the outer loop
+    // only gets 1 accumCnt (for the inner loop), and Q's phase uses
+    // the inner loop's K/V counter instead of a separate Q counter.
+    if (src) {
+      auto *srcParent = src->getParentOp();
+      if (srcParent && srcParent != pOp) {
+        if (isa<scf::ForOp>(srcParent))
+          regionsWithChannels.insert(srcParent);
+        if (isa<scf::IfOp>(srcParent))
+          regionsWithChannels.insert(srcParent);
+      }
+    }
   }
 }
 

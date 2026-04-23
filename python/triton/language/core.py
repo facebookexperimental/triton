@@ -9,6 +9,7 @@ import typing
 from typing import Union, Callable, List, Sequence, TypeVar, Optional, Tuple
 from dataclasses import dataclass
 import builtins
+from .. import knobs
 from ..runtime.jit import JITCallable
 import inspect
 
@@ -20,6 +21,70 @@ T = TypeVar('T')
 TRITON_BUILTIN = "__triton_builtin__"
 
 PropagateNan = ir.PROPAGATE_NAN
+
+
+class ReductionOrderingBase:
+    """Base class for all reduction ordering specifications.
+
+    When passed to tl.sum() or tl.reduce() via the reduction_ordering parameter,
+    guarantees that the reduction is performed in a deterministic order independent
+    of the thread layout, enabling bitwise reproducibility across different Triton
+    configurations (num_warps, BLOCK_SIZE, etc.).
+
+    See the Formal Triton Reduction Ordering design for details.
+    """
+    pass
+
+
+class ReductionOrdering(ReductionOrderingBase):
+    """A single reduction ordering strategy.
+
+    Predefined strategies are available as class constants, e.g.
+    ``tl.ReductionOrdering.INNER_TREE``.
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def __eq__(self, other):
+        return isinstance(other, ReductionOrdering) and self.name == other.name
+
+    def __hash__(self):
+        return hash(self.name)
+
+    def __repr__(self):
+        return f"ReductionOrdering.{self.name.upper()}"
+
+
+ReductionOrdering.UNORDERED = ReductionOrdering("unordered")
+ReductionOrdering.INNER_TREE = ReductionOrdering("inner_tree")
+
+
+class CompositeReductionOrdering(ReductionOrderingBase):
+    """Chains multiple ReductionOrdering strategies across sections of the reduction tree.
+
+    Each component handles a portion of the reduction levels, applied in sequence.
+
+    Example (future)::
+
+        tl.sum(x, axis=0, reduction_ordering=tl.CompositeReductionOrdering(
+            tl.ReductionOrdering.INNER_TREE,
+            tl.ReductionOrdering.OUTER_TREE,
+        ))
+    """
+
+    def __init__(self, *components: ReductionOrdering):
+        self.components = components
+
+    def __eq__(self, other):
+        return isinstance(other, CompositeReductionOrdering) and self.components == other.components
+
+    def __hash__(self):
+        return hash(self.components)
+
+    def __repr__(self):
+        parts = ", ".join(repr(c) for c in self.components)
+        return f"CompositeReductionOrdering({parts})"
 
 
 def must_use_result(x, s=True):
@@ -2628,8 +2693,8 @@ def clamp(x, min, max, propagate_nan: constexpr = PropagateNan.NONE, _semantic=N
 # -----------------------
 
 
-def _add_reduction_docstr(name: str, return_indices_arg: str = None, tie_break_arg: str = None,
-                          dtype_arg: str = None) -> Callable[[T], T]:
+def _add_reduction_docstr(name: str, return_indices_arg: str = None, tie_break_arg: str = None, dtype_arg: str = None,
+                          reduction_ordering_arg: str = None) -> Callable[[T], T]:
 
     def _decorator(func: T) -> T:
         docstr = """
@@ -2653,6 +2718,10 @@ def _add_reduction_docstr(name: str, return_indices_arg: str = None, tie_break_a
             docstr += f"""
     :param {dtype_arg}: the desired data type of the returned tensor. If specified, the input tensor is casted to :code:`{dtype_arg}` before the operation is performed. This is useful for preventing data overflows. If not specified, integer and bool dtypes are upcasted to :code:`tl.int32` and float dtypes are upcasted to at least :code:`tl.float32`.
     :type {dtype_arg}: tl.dtype"""
+        if reduction_ordering_arg is not None:
+            docstr += f"""
+    :param {reduction_ordering_arg}: specifies the ordering strategy for the reduction. When None (default), the reduction order is layout-dependent and may vary across configurations. Pass a ReductionOrderingBase instance (e.g. ``tl.ReductionOrdering.INNER_TREE``) for deterministic, layout-independent ordering.
+    :type {reduction_ordering_arg}: None | ReductionOrderingBase"""
 
         func.__doc__ = docstr.format(name=name)
         return func
@@ -2669,7 +2738,7 @@ def _insertion_guard(builder):
 
 @_tensor_member_fn
 @builtin
-def reduce(input, axis, combine_fn, keep_dims=False, _semantic=None, _generator=None):
+def reduce(input, axis, combine_fn, keep_dims=False, reduction_ordering=None, _semantic=None, _generator=None):
     """Applies the combine_fn to all elements in :code:`input` tensors along the provided :code:`axis`
 
     :param input: the input tensor, or tuple of tensors
@@ -2680,10 +2749,16 @@ def reduce(input, axis, combine_fn, keep_dims=False, _semantic=None, _generator=
     :type combine_fn: Callable
     :param keep_dims: if true, keep the reduced dimensions with length 1
     :type keep_dims: bool
+    :param reduction_ordering: specifies the ordering strategy for the reduction. When None (default),
+        the reduction order is layout-dependent and may vary across configurations. Pass a
+        ReductionOrderingBase instance (e.g. ``tl.ReductionOrdering.INNER_TREE``) for deterministic,
+        layout-independent ordering.
+    :type reduction_ordering: None | ReductionOrderingBase
 
     """
     if isinstance(input, tensor):
-        return reduce((input, ), axis, combine_fn, keep_dims=keep_dims, _semantic=_semantic, _generator=_generator)[0]
+        return reduce((input, ), axis, combine_fn, keep_dims=keep_dims, reduction_ordering=reduction_ordering,
+                      _semantic=_semantic, _generator=_generator)[0]
 
     def make_combine_region(reduce_op):
         param_types = [t.type.scalar for t in input] * 2
@@ -2707,9 +2782,19 @@ def reduce(input, axis, combine_fn, keep_dims=False, _semantic=None, _generator=
 
     axis = _unwrap_if_constexpr(axis)
     keep_dims = _unwrap_if_constexpr(keep_dims)
+    reduction_ordering = _unwrap_if_constexpr(reduction_ordering)
+    if reduction_ordering is None:
+        if knobs.language.strict_reduction_ordering:
+            reduction_ordering = ReductionOrdering.INNER_TREE
+        else:
+            reduction_ordering = ReductionOrdering.UNORDERED
+    if isinstance(reduction_ordering, CompositeReductionOrdering):
+        raise TypeError("CompositeReductionOrdering is not yet supported")
+    if not isinstance(reduction_ordering, ReductionOrdering):
+        raise TypeError(f"reduction_ordering must be None or a ReductionOrdering, got {type(reduction_ordering)}")
     if axis is not None:
         axis = _wrap_axis(axis, len(input[0].shape))
-    ret = _semantic.reduction(input, axis, make_combine_region)
+    ret = _semantic.reduction(input, axis, make_combine_region, reduction_ordering=reduction_ordering)
     if keep_dims:
         if axis is not None:
             ret = tuple(expand_dims(t, axis, _semantic=_semantic) for t in ret)
@@ -2729,7 +2814,8 @@ def _promote_bfloat16_to_float32(t, _semantic=None):
 
 
 @builtin
-def _reduce_with_indices(input, axis, combine_fn, keep_dims=False, _semantic=None, _generator=None):
+def _reduce_with_indices(input, axis, combine_fn, keep_dims=False, reduction_ordering=None, _semantic=None,
+                         _generator=None):
     axis = _unwrap_if_constexpr(axis)
     n = input.shape[axis]
     index = arange(0, n, _semantic=_semantic)
@@ -2741,8 +2827,8 @@ def _reduce_with_indices(input, axis, combine_fn, keep_dims=False, _semantic=Non
         index = expand_dims(index, axes_to_expand, _semantic=_semantic)
         index = broadcast_to(index, input.shape, _semantic=_semantic)
 
-    rvalue, rindices = reduce((input, index), axis, combine_fn, keep_dims=keep_dims, _semantic=_semantic,
-                              _generator=_generator)
+    rvalue, rindices = reduce((input, index), axis, combine_fn, keep_dims=keep_dims,
+                              reduction_ordering=reduction_ordering, _semantic=_semantic, _generator=_generator)
     return rvalue, rindices
 
 

@@ -25,7 +25,7 @@ tt.func @async_store_wait(%arg: tensor<32x16xf16, #AL>) {
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 18944 : i32} {
 // CHECK-LABEL: tma_special_cases
-tt.func @tma_special_cases(%arg1: !tt.tensordesc<tensor<256x64xf16, #shared>>) -> (tensor<256x64xf16, #blocked>){
+tt.func @tma_special_cases(%arg1: !tt.tensordesc<tensor<256x64xf16, #shared>>, %arg2: !tt.tensordesc<tensor<1x64xf16, #shared>>) -> (tensor<256x64xf16, #blocked>){
   %true = arith.constant 1 : i1
   %cx = arith.constant dense<1> : tensor<32xi32>
   %c0 = arith.constant 0 : i32
@@ -70,7 +70,7 @@ tt.func @tma_special_cases(%arg1: !tt.tensordesc<tensor<256x64xf16, #shared>>) -
   // CHECK-NEXT: ttng.wait_barrier
   %view = ttg.memdesc_subslice %alloc [0, 0]  : !ttg.memdesc<256x64xf16, #shared, #ttg.shared_memory, mutable> -> !ttg.memdesc<32x64xf16, #shared, #ttg.shared_memory, mutable>
   ttng.barrier_expect %barrier, 49152, %true : !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>
-  ttng.async_tma_gather %arg1[%cx, %c0] %view, %barrier, %true : !tt.tensordesc<tensor<256x64xf16, #shared>>, tensor<32xi32>, i32, !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>, !ttg.memdesc<32x64xf16, #shared, #ttg.shared_memory, mutable>, i1
+  ttng.async_tma_gather %arg2[%cx, %c0] %view, %barrier, %true : !tt.tensordesc<tensor<1x64xf16, #shared>>, tensor<32xi32>, i32, !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>, !ttg.memdesc<32x64xf16, #shared, #ttg.shared_memory, mutable>, i1
   ttng.wait_barrier %barrier, %c0 : !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>
 
   // CHECK-NEXT: ttg.local_barrier
@@ -125,24 +125,23 @@ tt.func @tma_special_cases_cf(%arg1: !tt.tensordesc<tensor<256x64xf16, #shared>>
 // -----
 
 // Verify that init_barrier followed by inval_barrier on *different* constant
-// indices of the same barrier array does NOT insert a spurious gpu.barrier.
-// The canSkipBarSync filter does NOT skip init_barrier + inval_barrier pairs,
-// so this exercises the narrowIntervalForSubview fix: without it the membar
-// analysis tracks at parent-buffer granularity and would see a false WAW.
+// indices of the same barrier array inserts a local_barrier.
+// With explicit async op semantics, init_barrier and inval_barrier require
+// barriers to ensure visibility of shared memory operations.
 
 #shared_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 1024 : i32} {
-// CHECK-LABEL: @no_barrier_between_different_index_init_inval
-tt.func @no_barrier_between_different_index_init_inval() {
+// CHECK-LABEL: @barrier_between_different_index_init_inval
+tt.func @barrier_between_different_index_init_inval() {
   %c0 = arith.constant 0 : i32
   %c1 = arith.constant 1 : i32
   %bars = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #shared_bar, #ttg.shared_memory, mutable>
   %bar0 = ttg.memdesc_index %bars[%c0] : !ttg.memdesc<2xi64, #shared_bar, #ttg.shared_memory, mutable> -> !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
   %bar1 = ttg.memdesc_index %bars[%c1] : !ttg.memdesc<2xi64, #shared_bar, #ttg.shared_memory, mutable> -> !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
   //      CHECK: ttng.init_barrier
+  // CHECK-NEXT: ttg.local_barrier
   // CHECK-NEXT: ttng.inval_barrier
-  //  CHECK-NOT: ttg.local_barrier
   //      CHECK: tt.return
   ttng.init_barrier %bar0, 1 : !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
   ttng.inval_barrier %bar1 : !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>

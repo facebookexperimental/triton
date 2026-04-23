@@ -22,6 +22,8 @@
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "llvm/ADT/MapVector.h"
 #include <unordered_set>
@@ -35,6 +37,129 @@ namespace mlir {
 #define DEBUG_TYPE "nvgpu-ws-code-partition"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+
+static constexpr const char *kSubtileOpId = "subtile_op_id";
+
+/// Lower token annotations by injecting inline ConsumerWaitOp/ConsumerReleaseOp
+/// into the tile body. Used for multi-task SubtiledRegionOps that are lowered
+/// before doTokenLowering runs (the inline ops survive into warp partitions
+/// and get converted to mbarriers by doTokenLowering later).
+static void lowerTokenAnnotations(ttng::SubtiledRegionOp op) {
+  ArrayAttr tokenAnnotations = op.getTokenAnnotations();
+  if (tokenAnnotations.empty())
+    return;
+
+  Block &tileBlock = op.getTileRegion().front();
+  ValueRange tokenValues = op.getTokenValues();
+
+  llvm::DenseMap<unsigned, Operation *> idToOp;
+  for (Operation &tileOp : tileBlock.without_terminator()) {
+    if (auto idAttr = tileOp.getAttrOfType<IntegerAttr>(kSubtileOpId))
+      idToOp[idAttr.getInt()] = &tileOp;
+  }
+
+  OpBuilder builder(op);
+  for (Attribute attr : tokenAnnotations) {
+    auto annotation = cast<ttng::TokenAnnotationAttr>(attr);
+    unsigned targetId = annotation.getTargetOpIdx();
+    auto it = idToOp.find(targetId);
+    assert(it != idToOp.end() && "target op ID not found in tile body");
+    Operation *targetOp = it->second;
+
+    if (annotation.getPlacement() == ttng::BarrierPlacement::BEFORE)
+      builder.setInsertionPoint(targetOp);
+    else
+      builder.setInsertionPointAfter(targetOp);
+
+    Value token = tokenValues[annotation.getTokenIdx()];
+    Value bufferIdx = tokenValues[annotation.getBufferIdxIdx()];
+    StringRef kind = annotation.getTokenOpKind().getValue();
+
+    if (kind == "consumer_wait") {
+      int phaseIdx = annotation.getPhaseIdx();
+      assert(phaseIdx >= 0);
+      Value phase = tokenValues[phaseIdx];
+      ttnvws::ConsumerWaitOp::create(builder, targetOp->getLoc(), token,
+                                     bufferIdx, phase);
+    } else {
+      assert(kind == "consumer_release");
+      ttnvws::ConsumerReleaseOp::create(builder, targetOp->getLoc(), token,
+                                        bufferIdx);
+    }
+  }
+
+  MLIRContext *ctx = op.getContext();
+  op.setTokenAnnotationsAttr(ArrayAttr::get(ctx, {}));
+  op.getTokenValuesMutable().assign(ValueRange{});
+}
+
+/// If `op` is inside a SubtiledRegionOp's tile region, return that op.
+static ttng::SubtiledRegionOp getEnclosingSubtiledRegionTile(Operation *op) {
+  for (Operation *parent = op->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    if (auto subtiled = dyn_cast<ttng::SubtiledRegionOp>(parent)) {
+      if (op->getParentRegion() == &subtiled.getTileRegion())
+        return subtiled;
+      return nullptr;
+    }
+  }
+  return nullptr;
+}
+
+/// Assign a stable ID to `targetOp` via an integer attribute and return it.
+/// If the op already has an ID, return the existing one. The ID is unique
+/// within the tile body and survives op insertions/removals by other passes,
+/// unlike positional indices.
+static unsigned getOrAssignStableId(ttng::SubtiledRegionOp subtiled,
+                                    Operation *targetOp) {
+  if (auto existing = targetOp->getAttrOfType<IntegerAttr>(kSubtileOpId))
+    return existing.getInt();
+
+  // Find the next available ID by scanning existing IDs.
+  unsigned nextId = 0;
+  Block &tileBlock = subtiled.getTileRegion().front();
+  for (Operation &op : tileBlock.without_terminator()) {
+    if (auto idAttr = op.getAttrOfType<IntegerAttr>(kSubtileOpId))
+      nextId = std::max(nextId, static_cast<unsigned>(idAttr.getInt()) + 1);
+  }
+
+  targetOp->setAttr(
+      kSubtileOpId,
+      IntegerAttr::get(IntegerType::get(targetOp->getContext(), 32), nextId));
+  return nextId;
+}
+
+/// Add a token annotation to a SubtiledRegionOp instead of creating an
+/// inline ConsumerWaitOp or ConsumerReleaseOp.
+static void addTokenAnnotation(ttng::SubtiledRegionOp subtiled, Value token,
+                               Value bufferIdx, Value phase,
+                               ttng::BarrierPlacement placement,
+                               unsigned targetOpIdx, StringRef kind) {
+  MLIRContext *ctx = subtiled.getContext();
+
+  // Add token, bufferIdx, phase to the tokenValues operand list.
+  unsigned tokenIdx = subtiled.getTokenValues().size();
+  unsigned bufferIdxIdx = tokenIdx + 1;
+  int phaseIdx = (phase) ? static_cast<int>(tokenIdx + 2) : -1;
+
+  SmallVector<Value> newTokenValues(subtiled.getTokenValues());
+  newTokenValues.push_back(token);
+  newTokenValues.push_back(bufferIdx);
+  if (phase)
+    newTokenValues.push_back(phase);
+  subtiled.getTokenValuesMutable().assign(newTokenValues);
+
+  // Create the annotation.
+  auto kindAttr = StringAttr::get(ctx, kind);
+  auto annotation = ttng::TokenAnnotationAttr::get(
+      ctx, tokenIdx, bufferIdxIdx, phaseIdx, placement, targetOpIdx, kindAttr,
+      ttng::BarrierRegion::TILE);
+
+  SmallVector<Attribute> annotations(subtiled.getTokenAnnotations().begin(),
+                                     subtiled.getTokenAnnotations().end());
+  annotations.push_back(annotation);
+  subtiled.setTokenAnnotationsAttr(ArrayAttr::get(ctx, annotations));
+}
 
 static unsigned getNumBuffersOrDefault(scf::ForOp forOp, unsigned numBuffers) {
   // Use the attribute attached to the loop if it exists otherwise use the
@@ -758,15 +883,17 @@ static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance,
   auto context = funcOp.getContext();
   if (!srcName.empty())
     loc = NameLoc::get(StringAttr::get(context, srcName), loc);
-  auto barrierCGALayout = ttg::CGAEncodingAttr::getDefault(context, 1);
+  auto numCTAs = triton::gpu::lookupNumCTAs(funcOp);
+  auto barrierCGALayout = ttg::CGAEncodingAttr::get1DLayout(context, numCTAs);
   auto barrierEncoding = ttg::SwizzledSharedEncodingAttr::get(
       context, 1, 1, 1, {0}, barrierCGALayout);
-  ttg::MemDescType barrierMemDescType = ttg::MemDescType::get(
-      {distance, 1}, builder.getI64Type(), barrierEncoding, sharedMemorySpace,
-      /*mutableMemory=*/true);
-  Type singleBarrierMemDescType = ttg::MemDescType::get(
-      {1}, builder.getI64Type(), barrierEncoding,
-      barrierMemDescType.getMemorySpace(), /*mutableMemory=*/true);
+  Type barrierMemDescType =
+      ttg::MemDescType::get({distance, numCTAs}, builder.getI64Type(),
+                            barrierEncoding, sharedMemorySpace,
+                            /*mutableMemory=*/true);
+  Type singleBarrierMemDescType =
+      ttg::MemDescType::get({numCTAs}, builder.getI64Type(), barrierEncoding,
+                            sharedMemorySpace, /*mutableMemory=*/true);
   Value barrierAlloc = mlir::triton::gpu::LocalAllocOp::create(
       builder, loc, barrierMemDescType, Value());
   for (unsigned i = 0; i < distance; i++) {
@@ -1822,8 +1949,12 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
         llvm_unreachable("Unexpected srcOp type");
     } else if (auto tensorType =
                    dyn_cast<RankedTensorType>(srcValue.getType())) {
+      int cc = getNVIDIAComputeCapability(funcOp->getParentOfType<ModuleOp>());
       auto res = createLocalAlloc(
-          builder, channel, isPost ? tensorType.getShape().size() == 1 : false,
+          builder, channel,
+          isPost ? (cc >= 100 && tensorType.getShape().size() == 1 &&
+                    tensorType.getElementType().isIntOrFloat())
+                 : false,
           isPost);
       buffer = res.first;
       newProducer = res.second;
@@ -2018,10 +2149,41 @@ DenseMap<Channel *, Value> createBufferPost(
               regionsWithChannels, config, reuseGrp);
         }
       } else if (auto forOp = user->getParentOfType<scf::ForOp>()) {
-        // Goes through channels here. Make sure the channel is not partilly
-        // mutated.
-        getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
-                             bufferIdx, _phase, config, reuseGrp, channel);
+        // Check if the channel's producer (local_store) is in an outer loop
+        // while the user (consumer) is in an inner loop. This happens for Q
+        // buffers in persistent FA: Q is loaded in the outer tile loop but
+        // consumed inside the inner KV loop. The buffer index/phase must
+        // use the outer loop's accumCnt, not the inner KV loop's.
+        // Detect this by checking if the producer op is NOT inside the
+        // user's immediate parent ForOp.
+        Operation *producerOp = channel->getSrcOp();
+        bool producerInOuterScope =
+            producerOp && !forOp->isAncestor(producerOp);
+        LDBG("createBufferPost user: producerInOuterScope="
+             << producerInOuterScope << " channel=" << channel->uniqID
+             << " numBuffers=" << numBuffers << " user=");
+        LLVM_DEBUG(user->getLoc().print(llvm::dbgs()));
+        LLVM_DEBUG(llvm::dbgs() << "\n");
+        if (producerOp) {
+          LDBG("  producerOp=");
+          LLVM_DEBUG(producerOp->getLoc().print(llvm::dbgs()));
+          LLVM_DEBUG(llvm::dbgs() << "\n");
+        }
+        LDBG("  forOp=");
+        LLVM_DEBUG(forOp->getLoc().print(llvm::dbgs()));
+        LLVM_DEBUG(llvm::dbgs() << "\n");
+        if (producerInOuterScope) {
+          LDBG("  -> using forOp as op for getBufferIdxAndPhase");
+          // User is in a deeper loop than the producer. Pass the inner
+          // ForOp as 'op' so getAccumCount looks up to the outer loop
+          // for the accumCnt.
+          getBufferIdxAndPhase(builder, forOp.getOperation(), numBuffers,
+                               regionsWithChannels, bufferIdx, _phase, config,
+                               reuseGrp, channel);
+        } else {
+          getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
+                               bufferIdx, _phase, config, reuseGrp, channel);
+        }
       } else {
         // For operations outside loops (epilogue), compute the
         // correct bufferIdx and phase based on the parent loop's final
@@ -3502,41 +3664,74 @@ void insertAsyncComm(
       builder.setAsynTaskIdsFromArray(token.first);
       // Insert ConsumerWaitOp
       if (!commChannel.producerBarrier) {
-        auto consumerWaitPoint = getSameLevelOp(headProducer, headConsumer);
-        builder.setInsertionPoint(consumerWaitPoint);
-        // Use the actual consumer's stage/cluster instead of the prep op's.
-        // consumerWaitPoint may be a memdesc_trans at stage 0, but the real
-        // consumer (e.g. dQ/dK MMA) may be at stage 1.
-        auto *actualCons = getUniqueActualConsumer(consumerWaitPoint);
-        builder.setLoopScheduleInfoFromOp(actualCons);
-        auto waitOp = builder.createWithAsyncTaskIds<ttnvws::ConsumerWaitOp>(
-            headConsumer->getLoc(), token.second, bufferIdx, phase);
-        // Propagate the actual consumer's loop schedule to the phase/bufferIdx
-        // value ops. These were computed earlier (by getBufferIdxAndPhase) with
-        // no loop.stage/loop.cluster, but they must match the consumer_wait's
-        // stage so SWP pipelines them together.
-        auto schedInfo = builder.getLoopScheduleInfo();
-        for (Value v : {bufferIdx, phase}) {
-          SmallVector<Value> worklist = {v};
-          DenseSet<Value> visited;
-          while (!worklist.empty()) {
-            Value cur = worklist.pop_back_val();
-            if (!visited.insert(cur).second)
-              continue;
-            auto *defOp = cur.getDefiningOp();
-            if (!defOp || defOp->getBlock() != waitOp->getBlock())
-              continue;
-            if (!defOp->hasAttr(triton::kLoopStageAttrName)) {
-              if (schedInfo.stage)
-                defOp->setAttr(triton::kLoopStageAttrName, schedInfo.stage);
-              if (schedInfo.cluster)
-                defOp->setAttr(triton::kLoopClusterAttrName, schedInfo.cluster);
-              for (Value operand : defOp->getOperands())
-                worklist.push_back(operand);
+        // For channels with multiple consumer task IDs, find the correct
+        // headConsumer for this token's task ID. Each consumer partition
+        // needs its own wait point.
+        int tokenTaskId = token.first;
+        LDBG("ConsumerWaitOp: tokenTaskId=" << tokenTaskId
+                                            << " headConsumer task=");
+        Operation *tokenHeadConsumer = headConsumer;
+        for (auto &op : headConsumer->getBlock()->getOperations()) {
+          if (consumerOps.count(&op)) {
+            auto taskIds = getAsyncTaskIds(&op);
+            if (std::find(taskIds.begin(), taskIds.end(), tokenTaskId) !=
+                taskIds.end()) {
+              tokenHeadConsumer = &op;
+              LDBG("  found tokenHeadConsumer for task " << tokenTaskId);
+              break;
             }
           }
         }
-        LDBG("create ConsumerWait " << masterChannel->uniqID << " ");
+        auto consumerWaitPoint =
+            getSameLevelOp(headProducer, tokenHeadConsumer);
+        auto subtiled = getEnclosingSubtiledRegionTile(consumerWaitPoint);
+        if (subtiled) {
+          unsigned targetOpIdx =
+              getOrAssignStableId(subtiled, consumerWaitPoint);
+          addTokenAnnotation(subtiled, token.second, bufferIdx, phase,
+                             ttng::BarrierPlacement::BEFORE, targetOpIdx,
+                             "consumer_wait");
+          LDBG("create ConsumerWait annotation on SubtiledRegionOp "
+               << masterChannel->uniqID << " ");
+        } else {
+          builder.setInsertionPoint(consumerWaitPoint);
+          // Use the actual consumer's stage/cluster instead of the prep op's.
+          // consumerWaitPoint may be a memdesc_trans at stage 0, but the real
+          // consumer (e.g. dQ/dK MMA) may be at stage 1.
+          auto *actualCons = getUniqueActualConsumer(consumerWaitPoint);
+          builder.setLoopScheduleInfoFromOp(actualCons);
+          LDBG("  inserting ConsumerWaitOp for task " << tokenTaskId);
+          auto waitOp = builder.createWithAsyncTaskIds<ttnvws::ConsumerWaitOp>(
+              headConsumer->getLoc(), token.second, bufferIdx, phase);
+          // Propagate the actual consumer's loop schedule to the
+          // phase/bufferIdx value ops. These were computed earlier (by
+          // getBufferIdxAndPhase) with no loop.stage/loop.cluster, but they
+          // must match the consumer_wait's stage so SWP pipelines them
+          // together.
+          auto schedInfo = builder.getLoopScheduleInfo();
+          for (Value v : {bufferIdx, phase}) {
+            SmallVector<Value> worklist = {v};
+            DenseSet<Value> visited;
+            while (!worklist.empty()) {
+              Value cur = worklist.pop_back_val();
+              if (!visited.insert(cur).second)
+                continue;
+              auto *defOp = cur.getDefiningOp();
+              if (!defOp || defOp->getBlock() != waitOp->getBlock())
+                continue;
+              if (!defOp->hasAttr(triton::kLoopStageAttrName)) {
+                if (schedInfo.stage)
+                  defOp->setAttr(triton::kLoopStageAttrName, schedInfo.stage);
+                if (schedInfo.cluster)
+                  defOp->setAttr(triton::kLoopClusterAttrName,
+                                 schedInfo.cluster);
+                for (Value operand : defOp->getOperands())
+                  worklist.push_back(operand);
+              }
+            }
+          }
+          LDBG("create ConsumerWait " << masterChannel->uniqID << " ");
+        }
       }
 
       // Insert ConsumerReleaseOp, if consumer is not a TCGen5MMAOp. For
@@ -3544,24 +3739,35 @@ void insertAsyncComm(
       if (commChannel.consumerBarriers.empty()) {
         auto consumerReleasePoint =
             consumerReleaseHeuristic(tailProducer, tailConsumer, token.first);
-        builder.setLoopScheduleInfoFromOp(consumerReleasePoint);
-        if (auto tokenWaitOp =
-                dyn_cast<ttng::TMAStoreTokenWaitOp>(consumerReleasePoint)) {
-          tokenWaitOp.addToken(token.second, bufferIdx);
-          LLVM_DEBUG({
-            LDBG("attached ConsumerRelease token to TMAStoreTokenWaitOp "
-                 << masterChannel->uniqID << " ");
-            token.second.dump();
-          });
+        auto subtiled = getEnclosingSubtiledRegionTile(consumerReleasePoint);
+        if (subtiled) {
+          unsigned targetOpIdx =
+              getOrAssignStableId(subtiled, consumerReleasePoint);
+          addTokenAnnotation(subtiled, token.second, bufferIdx,
+                             /*phase=*/Value(), ttng::BarrierPlacement::AFTER,
+                             targetOpIdx, "consumer_release");
+          LDBG("create ConsumerRelease annotation on SubtiledRegionOp "
+               << masterChannel->uniqID << " ");
         } else {
-          builder.setInsertionPointAfter(consumerReleasePoint);
-          auto releaseOp =
-              builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
-                  consumerReleasePoint->getLoc(), token.second, bufferIdx);
-          LLVM_DEBUG({
-            LDBG("create ConsumerRelease " << masterChannel->uniqID << " ");
-            token.second.dump();
-          });
+          builder.setLoopScheduleInfoFromOp(consumerReleasePoint);
+          if (auto tokenWaitOp =
+                  dyn_cast<ttng::TMAStoreTokenWaitOp>(consumerReleasePoint)) {
+            tokenWaitOp.addToken(token.second, bufferIdx);
+            LLVM_DEBUG({
+              LDBG("attached ConsumerRelease token to TMAStoreTokenWaitOp "
+                   << masterChannel->uniqID << " ");
+              token.second.dump();
+            });
+          } else {
+            builder.setInsertionPointAfter(consumerReleasePoint);
+            auto releaseOp =
+                builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
+                    consumerReleasePoint->getLoc(), token.second, bufferIdx);
+            LLVM_DEBUG({
+              LDBG("create ConsumerRelease " << masterChannel->uniqID << " ");
+              token.second.dump();
+            });
+          }
         }
       }
     }
@@ -3570,9 +3776,19 @@ void insertAsyncComm(
     if (tmaLoads.size() > 0) {
       // Instead of headConsumer, need to lift out to the same scope.
       auto consumerWaitPoint = getSameLevelOp(tmaHeadProducer, headConsumer);
+      // Collect additional consumer task IDs beyond the primary headConsumer.
+      SmallVector<int> additionalConsumerTaskIds;
+      auto primaryTaskIds = getAsyncTaskIds(headConsumer);
+      for (const auto &token : commChannel.tokens) {
+        int taskId = token.first;
+        if (std::find(primaryTaskIds.begin(), primaryTaskIds.end(), taskId) ==
+            primaryTaskIds.end())
+          additionalConsumerTaskIds.push_back(taskId);
+      }
       optimizeTMALoads(builder, tmaLoads, buffers, *commChannel.producerBarrier,
                        bufferIdx, bufferIdx, phase, tmaHeadProducer,
-                       headConsumer, consumerWaitPoint, isPost);
+                       headConsumer, consumerWaitPoint,
+                       additionalConsumerTaskIds, isPost);
     }
   }
 
@@ -4118,6 +4334,24 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
     funcOp.dump();
   });
 
+  // Lower SubtiledRegionOps whose tile body spans multiple async tasks.
+  {
+    SmallVector<ttng::SubtiledRegionOp> multiTaskOps;
+    funcOp.walk([&](ttng::SubtiledRegionOp op) {
+      llvm::DenseSet<AsyncTaskId> taskIds;
+      op.getTileRegion().walk([&](Operation *childOp) {
+        for (auto tid : getAsyncTaskIds(childOp))
+          taskIds.insert(tid);
+      });
+      if (taskIds.size() > 1)
+        multiTaskOps.push_back(op);
+    });
+    for (auto op : multiTaskOps)
+      lowerTokenAnnotations(op);
+    for (auto op : multiTaskOps)
+      ttng::lowerSubtiledRegion(op);
+  }
+
   specializeRegion(funcOp, 0 /*requestedRegisters*/);
   LLVM_DEBUG({
     LDBG("\n\nwith specializeRegion");
@@ -4367,6 +4601,25 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
     LDBG("\n\nreplace buffer reuse");
     funcOp.dump();
   });
+
+  // Lower SubtiledRegionOps whose tile body spans multiple async tasks.
+  // Single-task SubtiledRegionOps are preserved and handled by SpecializeOp.
+  {
+    SmallVector<ttng::SubtiledRegionOp> multiTaskOps;
+    funcOp.walk([&](ttng::SubtiledRegionOp op) {
+      llvm::DenseSet<AsyncTaskId> taskIds;
+      op.getTileRegion().walk([&](Operation *childOp) {
+        for (auto tid : getAsyncTaskIds(childOp))
+          taskIds.insert(tid);
+      });
+      if (taskIds.size() > 1)
+        multiTaskOps.push_back(op);
+    });
+    for (auto op : multiTaskOps)
+      lowerTokenAnnotations(op);
+    for (auto op : multiTaskOps)
+      ttng::lowerSubtiledRegion(op);
+  }
 
   specializeRegion(funcOp, 0 /*requestedRegisters*/);
   LLVM_DEBUG({

@@ -15,8 +15,10 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Transforms/RegionUtils.h"
+#include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
@@ -66,7 +68,8 @@ public:
     LayoutInfo() {}
     llvm::SmallSetVector<Attribute, 8> encodings;
   };
-  LayoutPropagation(FuncOp F) : funcOp(F) {}
+  LayoutPropagation(FuncOp F, unsigned smemBudget = 0)
+      : funcOp(F), smemBudget(smemBudget) {}
   // Find the anchor ops and set their layout in the data structure.
   void initAnchorLayout();
   // Recursively Propagate the layout to all the users of the anchor ops until
@@ -113,6 +116,7 @@ private:
   DenseMap<std::pair<Value, Attribute>, Value> rewriteMapping;
   SetVector<Operation *> opToDelete;
   FuncOp funcOp;
+  unsigned smemBudget;
 };
 
 class LayoutRematerialization {
@@ -437,16 +441,71 @@ void LayoutPropagation::propagateLayout() {
   }
 }
 
-// Compute a score for a layout to guide conflict resolution.
-// Currently based on sizePerThread (vectorization), but can be extended
-// with other heuristics. Higher score is preferred.
-// Returns 0 for non-blocked encodings.
-static int64_t getLayoutScore(Attribute encoding) {
-  auto blocked = dyn_cast<BlockedEncodingAttr>(encoding);
-  if (!blocked)
+// Compute the base shared memory usage from all existing local_alloc ops in the
+// function. This accounts for explicit buffers (data tiles, mbarriers) but not
+// scratch buffers from convert_layout ops, which are what we're trying to
+// eliminate.
+static unsigned computeBaseSmem(FuncOp funcOp) {
+  unsigned total = 0;
+  funcOp->walk([&](LocalAllocOp alloc) {
+    if (!alloc.isSharedMemoryAlloc())
+      return;
+    auto allocType = alloc.getType();
+    int64_t numElems;
+    if (auto paddedEnc =
+            dyn_cast<PaddedSharedEncodingAttr>(allocType.getEncoding())) {
+      SmallVector<int64_t> unpaddedShape = getShapePerCTA(allocType);
+      numElems = paddedEnc.getPaddedSize(unpaddedShape);
+    } else {
+      auto shapePerCTA = getAllocationShapePerCTA(allocType);
+      numElems = product<int64_t>(shapePerCTA);
+    }
+    total += numElems * allocType.getElementTypeBitWidth() / 8;
+  });
+  return total;
+}
+
+// Estimate the scratch buffer cost (in bytes) that would result from choosing
+// `encoding` for `value`. This checks each operand of value's defining op: if
+// an operand is an anchor with a different layout, a convert_layout will be
+// needed, and we estimate its scratch size.
+static unsigned estimateConvertScratchCost(Value value, Attribute encoding) {
+  Operation *op = value.getDefiningOp();
+  if (!op)
     return 0;
-  auto sizePerThread = blocked.getSizePerThread();
-  // Compute product of sizePerThread values as the vectorization score.
+  auto encTrait = dyn_cast<LayoutEncodingTrait>(encoding);
+  unsigned cost = 0;
+  for (Value operand : op->getOperands()) {
+    auto srcTy = dyn_cast<RankedTensorType>(operand.getType());
+    if (!srcTy)
+      continue;
+    Attribute srcEnc = srcTy.getEncoding();
+    if (!srcEnc || srcEnc == encoding)
+      continue;
+    if (encTrait && srcTy.getRank() != encTrait.getRank())
+      continue;
+    auto dstTy = srcTy.cloneWithEncoding(encoding);
+    if (cvtNeedsSharedMemory(srcTy, dstTy)) {
+      unsigned elems = getNumScratchElemsSwizzledCvt(srcTy, dstTy);
+      cost += elems * getElementBitWidth(srcTy) / 8;
+    }
+  }
+  return cost;
+}
+
+// Compute a score for a layout to guide conflict resolution.
+// Based on sizePerThread (vectorization) for both blocked and linear encodings.
+// Higher score is preferred — layouts with more elements per thread allow better
+// vectorized memory access (ld.shared, st.shared).
+static int64_t getLayoutScore(Attribute encoding) {
+  SmallVector<unsigned> sizePerThread;
+  if (auto blocked = dyn_cast<BlockedEncodingAttr>(encoding)) {
+    sizePerThread = SmallVector<unsigned>(blocked.getSizePerThread());
+  } else if (auto linear = dyn_cast<LinearEncodingAttr>(encoding)) {
+    sizePerThread = linear.getSizePerThread();
+  }
+  if (sizePerThread.empty())
+    return 0;
   int64_t score = 1;
   for (auto size : sizePerThread) {
     score *= size;
@@ -466,8 +525,10 @@ void LayoutPropagation::resolveConflicts() {
     bool isLoadOrStore =
         op && isa<LoadOp, StoreOp, AtomicRMWOp, AtomicCASOp>(op);
     // Pick the layout with maximum score.
-    // This prefers layouts with larger sizePerThread values (e.g., TMEM's
-    // [1, 128] over SMEM's [1, 8]) for better memory access patterns.
+    // This prefers layouts with larger sizePerThread values for better
+    // vectorized memory access. Both blocked and linear encodings are scored,
+    // so e.g. a linear layout from TMEMLoadOp (sizePerThread=[1,32]) beats
+    // a blocked layout from local_load (sizePerThread=[1,8]).
     int64_t bestScore = getLayoutScore(encoding);
     for (Attribute e : info.encodings) {
       int64_t score = getLayoutScore(e);
@@ -476,7 +537,7 @@ void LayoutPropagation::resolveConflicts() {
         encoding = e;
       }
     }
-    // If no blocked layout with vectorization found, fall back to the original
+    // If no layout with vectorization found, fall back to the original
     // heuristic (prefer blocked for load/store, MMA for compute).
     if (bestScore == 0) {
       for (Attribute e : info.encodings) {
@@ -487,6 +548,33 @@ void LayoutPropagation::resolveConflicts() {
         }
       }
     }
+    // Budget-aware override: if the chosen encoding would introduce a
+    // convert_layout whose scratch buffer pushes SMEM over budget, pick the
+    // candidate with the lowest scratch cost instead.
+    if (smemBudget > 0) {
+      unsigned baseCost = computeBaseSmem(funcOp);
+      unsigned scratchCost = estimateConvertScratchCost(it.first, encoding);
+      if (baseCost + scratchCost > smemBudget) {
+        LDBG("Budget override: base=" << baseCost << " scratch=" << scratchCost
+                                      << " total=" << (baseCost + scratchCost)
+                                      << " budget=" << smemBudget);
+        // Try each candidate and pick the one with lowest scratch cost.
+        Attribute bestEncoding = encoding;
+        unsigned bestScratchCost = scratchCost;
+        for (Attribute e : info.encodings) {
+          unsigned cost = estimateConvertScratchCost(it.first, e);
+          if (cost < bestScratchCost) {
+            bestScratchCost = cost;
+            bestEncoding = e;
+          }
+        }
+        if (bestEncoding != encoding) {
+          LDBG("  Overriding to encoding with scratch=" << bestScratchCost);
+          encoding = bestEncoding;
+        }
+      }
+    }
+
     info.encodings.clear();
     info.encodings.insert(encoding);
   }
@@ -1766,6 +1854,9 @@ class TritonGPURemoveLayoutConversionsPass
     : public impl::TritonGPURemoveLayoutConversionsBase<
           TritonGPURemoveLayoutConversionsPass> {
 public:
+  using Base = impl::TritonGPURemoveLayoutConversionsBase<
+      TritonGPURemoveLayoutConversionsPass>;
+  using Base::Base;
   // Cleanup convert ops.
   void cleanupConvertOps() {
     MLIRContext *context = &getContext();
@@ -1787,8 +1878,8 @@ public:
     ModuleOp m = getOperation();
 
     // 1. Propagate layout forward starting from "anchor" ops.
-    m.walk([](FuncOp funcOp) {
-      LayoutPropagation layoutPropagation(funcOp);
+    m.walk([this](FuncOp funcOp) {
+      LayoutPropagation layoutPropagation(funcOp, smemBudget);
       layoutPropagation.initAnchorLayout();
       layoutPropagation.propagateLayout();
       layoutPropagation.resolveConflicts();
@@ -1837,6 +1928,202 @@ public:
     LLVM_DEBUG({
       DBGS() << "Module after final cleanups:\n";
       m.dump();
+    });
+
+    // 5. Budget-aware convert elimination. If smemBudget is set, find remaining
+    // convert_layout ops whose scratch would push SMEM over budget, and try to
+    // eliminate them by propagating the source encoding through their users.
+    if (smemBudget > 0) {
+      eliminateOverBudgetConverts(m);
+    }
+  }
+
+  // Find convert_layout ops that need SMEM scratch and would push total SMEM
+  // over budget. For each such convert, if the source is an anchor (like
+  // tmem_load) and the users are elementwise ops feeding into local_store/
+  // local_load (which can accept any layout), propagate the source layout
+  // through the convert's users and erase the convert.
+  void eliminateOverBudgetConverts(ModuleOp m) {
+    m.walk([this](FuncOp funcOp) {
+      unsigned baseSmem = computeBaseSmem(funcOp);
+
+      // Collect converts whose scratch would push SMEM over budget.
+      SmallVector<ConvertLayoutOp> overBudgetConverts;
+      funcOp->walk([&](ConvertLayoutOp cvt) {
+        auto srcTy = cvt.getSrc().getType();
+        auto dstTy = cvt.getType();
+        if (!cvtNeedsSharedMemory(srcTy, dstTy))
+          return;
+        unsigned scratchBytes = getNumScratchElemsSwizzledCvt(srcTy, dstTy) *
+                                getElementBitWidth(srcTy) / 8;
+        if (baseSmem + scratchBytes > smemBudget) {
+          overBudgetConverts.push_back(cvt);
+        }
+      });
+
+      for (ConvertLayoutOp cvt : overBudgetConverts) {
+        Attribute srcEnc = cvt.getSrc().getType().getEncoding();
+        if (canPropagateSrcEncodingThroughUsers(cvt, srcEnc)) {
+          propagateSrcEncodingAndErase(cvt, srcEnc);
+        }
+      }
+    });
+  }
+
+  // Check whether we can propagate srcEnc through all transitive users of the
+  // convert result until we hit local_store or local_load (which accept any
+  // layout) or the value dies. Returns false if any user requires a specific
+  // layout that doesn't match srcEnc.
+  bool canPropagateSrcEncodingThroughUsers(ConvertLayoutOp cvt,
+                                           Attribute srcEnc) {
+    unsigned srcEncRank = 0;
+    if (auto encTrait = dyn_cast<LayoutEncodingTrait>(srcEnc))
+      srcEncRank = encTrait.getRank();
+
+    SmallVector<Value> worklist;
+    worklist.push_back(cvt.getResult());
+    DenseSet<Value> visited;
+
+    while (!worklist.empty()) {
+      Value v = worklist.pop_back_val();
+      if (!visited.insert(v).second)
+        continue;
+
+      for (OpOperand &use : v.getUses()) {
+        Operation *user = use.getOwner();
+        // local_store accepts any register layout — it's a sink.
+        if (isa<LocalStoreOp>(user))
+          continue;
+        // Elementwise ops are layout-transparent — propagate through them.
+        if (user->hasTrait<OpTrait::Elementwise>() ||
+            isa<arith::ExtFOp, arith::TruncFOp, arith::ExtUIOp, arith::ExtSIOp,
+                arith::TruncIOp, arith::SIToFPOp, arith::FPToSIOp,
+                arith::BitcastOp>(user)) {
+          for (Value result : user->getResults()) {
+            auto rtt = dyn_cast<RankedTensorType>(result.getType());
+            if (!rtt)
+              continue;
+            if (srcEncRank > 0 && rtt.getRank() != srcEncRank)
+              return false;
+            worklist.push_back(result);
+          }
+          continue;
+        }
+        // TODO: propagate through scf.yield by updating parent op result
+        // types, scf.for iter_args, and init values to match srcEnc.
+        if (isa<scf::YieldOp>(user))
+          return false;
+        // Any other user (dot, reduce, another convert, etc.) blocks
+        // propagation.
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Propagate the source encoding through all users of the convert result,
+  // rewriting types in place, then erase the convert. For elementwise ops
+  // whose other operands have a different encoding, change their local_load
+  // to produce the new encoding directly (local_load can produce any layout).
+  // If a non-local_load operand has a mismatched encoding, insert a
+  // convert_layout on it.
+  void propagateSrcEncodingAndErase(ConvertLayoutOp cvt, Attribute srcEnc) {
+    IRRewriter rewriter(cvt.getContext());
+    Value src = cvt.getSrc();
+    Value dst = cvt.getResult();
+
+    // Collect all ops that need type rewriting (forward from convert users).
+    SmallVector<Operation *> opsToRewrite;
+    SmallVector<Value> worklist = {dst};
+    DenseSet<Value> visited;
+
+    while (!worklist.empty()) {
+      Value v = worklist.pop_back_val();
+      if (!visited.insert(v).second)
+        continue;
+      for (OpOperand &use : v.getUses()) {
+        Operation *user = use.getOwner();
+        if (isa<LocalStoreOp>(user) || isa<scf::YieldOp>(user))
+          continue;
+        opsToRewrite.push_back(user);
+        for (Value result : user->getResults()) {
+          if (isa<RankedTensorType>(result.getType()))
+            worklist.push_back(result);
+        }
+      }
+    }
+
+    // For each op we're rewriting, fix up any operands that aren't in srcEnc.
+    // When an operand comes through a chain of elementwise ops from a
+    // local_load, rewrite the entire chain to srcEnc.
+    for (Operation *op : opsToRewrite) {
+      for (OpOperand &operand : op->getOpOperands()) {
+        auto ty = dyn_cast<RankedTensorType>(operand.get().getType());
+        if (!ty || ty.getEncoding() == srcEnc)
+          continue;
+        // Walk backward through elementwise ops to find a local_load.
+        // Rewrite each op's result type along the way.
+        SmallVector<Operation *> backwardChain;
+        Value current = operand.get();
+        bool foundLocalLoad = false;
+        while (auto defOp = current.getDefiningOp()) {
+          if (auto localLoad = dyn_cast<LocalLoadOp>(defOp)) {
+            localLoad.getResult().setType(
+                cast<RankedTensorType>(localLoad.getType())
+                    .cloneWithEncoding(srcEnc));
+            foundLocalLoad = true;
+            break;
+          }
+          if (defOp->hasTrait<OpTrait::Elementwise>() ||
+              isa<arith::ExtFOp, arith::TruncFOp, arith::ExtUIOp,
+                  arith::ExtSIOp, arith::TruncIOp>(defOp)) {
+            backwardChain.push_back(defOp);
+            // Elementwise ops have one primary input.
+            current = defOp->getOperand(0);
+            continue;
+          }
+          break;
+        }
+        if (foundLocalLoad) {
+          // Rewrite all ops in the backward chain to srcEnc.
+          for (Operation *chainOp : backwardChain) {
+            for (Value result : chainOp->getResults()) {
+              if (auto rty = dyn_cast<RankedTensorType>(result.getType()))
+                result.setType(rty.cloneWithEncoding(srcEnc));
+            }
+          }
+        } else {
+          // Fallback: insert a convert_layout on this operand.
+          rewriter.setInsertionPoint(op);
+          auto newTy = ty.cloneWithEncoding(srcEnc);
+          auto newCvt = ConvertLayoutOp::create(rewriter, op->getLoc(), newTy,
+                                                operand.get());
+          operand.set(newCvt);
+        }
+      }
+    }
+
+    // Rewrite result types to use srcEnc.
+    unsigned srcEncRank = 0;
+    if (auto encTrait = dyn_cast<LayoutEncodingTrait>(srcEnc))
+      srcEncRank = encTrait.getRank();
+    for (Operation *op : opsToRewrite) {
+      for (Value result : op->getResults()) {
+        if (auto ty = dyn_cast<RankedTensorType>(result.getType())) {
+          if (srcEncRank > 0 && ty.getRank() != srcEncRank)
+            continue;
+          result.setType(ty.cloneWithEncoding(srcEnc));
+        }
+      }
+    }
+
+    // Replace all uses of the convert result with the convert source.
+    dst.replaceAllUsesWith(src);
+    cvt.erase();
+
+    LLVM_DEBUG({
+      DBGS() << "Eliminated over-budget convert_layout, propagated " << srcEnc
+             << " through " << opsToRewrite.size() << " ops\n";
     });
   }
 };

@@ -218,6 +218,9 @@ OpPrintingFlags getOpPrintingFlags() {
 }
 
 py::list getTensorDescMetadata(ModuleOp &mod) {
+  TritonSourceMgrDiagnosticHandler handler =
+      setupTritonDiagnosticHandler(mod.getContext());
+
   py::list result;
   triton::FuncOp kernelFunc;
   mod.walk([&](triton::FuncOp func) {
@@ -229,8 +232,8 @@ py::list getTensorDescMetadata(ModuleOp &mod) {
   });
   assert(kernelFunc);
 
-  for (auto [i, argTy] : llvm::enumerate(kernelFunc.getArgumentTypes())) {
-    auto descTy = dyn_cast<TensorDescType>(argTy);
+  for (auto [i, arg] : llvm::enumerate(kernelFunc.getArguments())) {
+    auto descTy = dyn_cast<TensorDescType>(arg.getType());
     if (!descTy)
       continue;
 
@@ -240,10 +243,10 @@ py::list getTensorDescMetadata(ModuleOp &mod) {
     py::dict metadata;
     if (isa<ttg::NVMMASharedEncodingAttr>(encoding)) {
       auto mmaEncoding = dyn_cast<ttg::NVMMASharedEncodingAttr>(encoding);
-      auto swizzle = ttng::getTMASwizzleMode(nullptr, descTy);
-      auto elemType = ttng::getTMAElementType(nullptr, descTy);
-      assert(swizzle.has_value());
-      assert(elemType.has_value());
+      auto swizzle = ttng::getTMASwizzleMode(arg.getLoc(), descTy);
+      auto elemType = ttng::getTMAElementType(arg.getLoc(), descTy);
+      if (failed(swizzle) || failed(elemType))
+        throw py::type_error("invalid TMA descriptor type");
       auto blockSize = ttng::getTMABlockShape(blockType, /*packedSize=*/false);
       metadata["swizzle"] = *swizzle;
       metadata["elem_size"] =
@@ -1804,9 +1807,19 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value &val) -> Value {
              return self.create<math::AbsIOp>(val);
            })
-      .def("create_reduce",
-           [](TritonOpBuilder &self, std::vector<Value> operands, int axis)
-               -> OpState { return self.create<ReduceOp>(operands, axis); })
+      .def(
+          "create_reduce",
+          [](TritonOpBuilder &self, std::vector<Value> operands, int axis,
+             const std::string &reductionOrdering) -> OpState {
+            StringAttr orderingAttr;
+            if (!reductionOrdering.empty()) {
+              orderingAttr = StringAttr::get(self.getBuilder().getContext(),
+                                             reductionOrdering);
+            }
+            return self.create<ReduceOp>(operands, axis, orderingAttr);
+          },
+          py::arg("operands"), py::arg("axis"),
+          py::arg("reduction_ordering") = "")
       .def("create_reduce_ret",
            [](TritonOpBuilder &self, py::args args) -> OpState {
              llvm::SmallVector<Value> return_values;

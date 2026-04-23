@@ -51,12 +51,18 @@ void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
 void doTMAStoreWaitReorder(triton::FuncOp &funcOp);
 void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp);
 void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp);
-
 void doGenerateSubtiledRegion(triton::FuncOp &funcOp) {
   auto moduleOp = funcOp->getParentOfType<ModuleOp>();
   PassManager pm(moduleOp.getContext());
   pm.addPass(triton::nvidia_gpu::
                  createTritonNvidiaGPUTestGenerateSubtiledRegionPass());
+  // Convert tmem_load → reshape → trans → split chains in SubtiledRegionOp
+  // setup regions into tmem_subslice + tmem_load pairs.
+  pm.addPass(
+      triton::nvidia_gpu::createTritonNvidiaGPUOptimizeTMemLayoutsPass());
+  // Push setup values that are shared across all tiles into the tile body.
+  pm.addPass(
+      triton::nvidia_gpu::createTritonNvidiaGPUPushSharedSetupToTilePass());
   (void)pm.run(moduleOp);
 }
 
@@ -129,53 +135,15 @@ public:
     // FIXME: skip data partitioning for Blackwell.
     bool ForBlackWell = (capability / 10) > 9;
     unsigned numWarpGroups = ForBlackWell ? 2 : 3;
-    if (!ForBlackWell) {
-      bool success = false;
-      for (; numWarpGroups >= 2; numWarpGroups--) {
-        // Partition key ops into multiple async tasks.
-        doTaskPartition(funcOp, numWarpGroups);
-        if (dumpIntermediateSteps) {
-          llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                          "doTaskPartition\n";
-          moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-          llvm::dbgs() << "\n\n\n";
-        }
-        // Propagate taskId.
-        int retCode = doTaskIdPropagate(funcOp);
-        if (retCode == -1)
-          continue;
-        if (dumpIntermediateSteps) {
-          llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                          "doTaskIdPropagate\n";
-          moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-          llvm::dbgs() << "\n\n\n";
-        }
 
-        // Partition ops into parallel sub ops.
-        if (doDataPartition(funcOp, numWarpGroups - 1)) {
-          if (dumpIntermediateSteps) {
-            llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                            "doDataPartition\n";
-            moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-            llvm::dbgs() << "\n\n\n";
-          }
-          success = true;
-          break;
-        }
-        // Clear async_task.
-      }
-      if (!success)
-        signalPassFailure();
-    } else {
-      int retCode = doTaskIdPropagate(funcOp);
-      if (retCode == -1)
-        signalPassFailure();
-      if (dumpIntermediateSteps) {
-        llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                        "doTaskIdPropagate\n";
-        moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-        llvm::dbgs() << "\n\n\n";
-      }
+    int retCode = doTaskIdPropagate(funcOp);
+    if (retCode == -1)
+      signalPassFailure();
+    if (dumpIntermediateSteps) {
+      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                      "doTaskIdPropagate\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
     }
 
     if (pingpongAutoWS) {
@@ -281,10 +249,34 @@ public:
       }
     }
 
+    // Primary SubtiledRegionOp lowering path. By this point the tile body
+    // has been optimized (OptimizeTMemLayouts + PushSharedSetupToTile ran
+    // inside doGenerateSubtiledRegion), so tmem_loads are sunk close to
+    // their consumers. doTokenLowering converts token annotations to
+    // barrier annotations, then lowerSubtiledRegion unrolls the tile body
+    // with per-tile barrier materialization.
+    //
+    // Multi-task SubtiledRegionOps were already lowered as fallbacks in
+    // doCodePartition/doCodePartitionPost (before specializeRegion).
     doTokenLowering(funcOp, numWarpGroups - 1);
     if (dumpIntermediateSteps) {
       llvm::dbgs()
           << "// -----// WarpSpec internal IR Dump After: doTokenLowering\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
+    }
+
+    {
+      SmallVector<triton::nvidia_gpu::SubtiledRegionOp> remaining;
+      funcOp.walk([&](triton::nvidia_gpu::SubtiledRegionOp op) {
+        remaining.push_back(op);
+      });
+      for (auto op : remaining)
+        triton::nvidia_gpu::lowerSubtiledRegion(op);
+    }
+    if (dumpIntermediateSteps) {
+      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                      "lowerSubtiledRegion\n";
       moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
       llvm::dbgs() << "\n\n\n";
     }

@@ -63,12 +63,7 @@ public:
         loopOp.moveOutOfLoop(fence);
       }
 
-      // If the previous op is already a fence, this one isn't needed.
-      if (auto lastFence =
-              dyn_cast_or_null<FenceAsyncSharedOp>(fence->getPrevNode())) {
-        if (lastFence.getBCluster() == fence.getBCluster())
-          fence.erase();
-      }
+      eraseIfDuplicateFence(fence);
 
       return WalkResult::advance();
     });
@@ -94,18 +89,29 @@ public:
         loopOp.moveOutOfLoop(fence);
       }
 
-      // If the previous op is already a fence, this one isn't needed.
-      if (auto lastFence =
-              dyn_cast_or_null<FenceAsyncSharedOp>(fence->getPrevNode())) {
-        if (lastFence.getBCluster() == fence.getBCluster())
-          fence.erase();
-      }
+      eraseIfDuplicateFence(fence);
 
       return WalkResult::advance();
     });
   }
 
 private:
+  // Erase `fence` if a matching FenceAsyncSharedOp already exists earlier
+  // in the same block, with only pure (memory-effect-free) ops in between.
+  void eraseIfDuplicateFence(FenceAsyncSharedOp fence) {
+    Operation *prev = fence->getPrevNode();
+    while (prev) {
+      if (auto lastFence = dyn_cast<FenceAsyncSharedOp>(prev)) {
+        if (lastFence.getBCluster() == fence.getBCluster())
+          fence.erase();
+        break;
+      }
+      if (!isMemoryEffectFree(prev))
+        break;
+      prev = prev->getPrevNode();
+    }
+  }
+
   // Walk users of `root` transitively through memdesc view ops, collecting
   // any LocalStoreOp found into `result`.
   void findLocalStoresThroughViews(Value root,
@@ -204,21 +210,32 @@ private:
         // code partitioning splits the alloc: the local_store ends up in
         // the computation partition while the TMA copy stays in the
         // epilogue partition.
-        for (auto *user : localAlloc.getResult().getUsers()) {
-          auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(user);
-          if (!wsOp)
+        // Walk through memdesc view ops (e.g. memdesc_index) since the
+        // warp_specialize may capture a view of the alloc rather than the
+        // alloc directly.
+        SmallVector<Value> wsWorklist = {localAlloc.getResult()};
+        DenseSet<Value> wsSeen;
+        while (!wsWorklist.empty()) {
+          Value v = wsWorklist.pop_back_val();
+          if (!wsSeen.insert(v).second)
             continue;
-          auto captures = wsOp.getExplicitCaptures();
-          for (unsigned i = 0; i < captures.size(); i++) {
-            if (captures[i] != localAlloc.getResult())
-              continue;
-            for (Region *region : wsOp.getPartitionRegions()) {
-              Value blockArg = region->getArgument(i);
-              findLocalStoresThroughViews(blockArg, result);
-              if (!result.empty())
-                return;
+          for (auto *user : v.getUsers()) {
+            if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(user)) {
+              auto captures = wsOp.getExplicitCaptures();
+              for (unsigned i = 0; i < captures.size(); i++) {
+                if (captures[i] != v)
+                  continue;
+                for (Region *region : wsOp.getPartitionRegions()) {
+                  Value blockArg = region->getArgument(i);
+                  findLocalStoresThroughViews(blockArg, result);
+                  if (!result.empty())
+                    return;
+                }
+              }
+            } else if (user->hasTrait<OpTrait::MemDescViewTrait>()) {
+              for (auto res : user->getResults())
+                wsWorklist.push_back(res);
             }
-            break;
           }
         }
       }

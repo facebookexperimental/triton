@@ -118,12 +118,11 @@ static void getAllConsumers(ChannelPost *ch,
         !isa<ttng::AsyncTMACopyGlobalToLocalOp>(user))
       consumers.push_back(user);
   }
-  // assume all consumers are in the same block, with same taskId
-  auto taskIds = getAsyncTaskIds(consumers[0]);
-  for (unsigned i = 1; i < consumers.size(); ++i) {
-    auto taskIds2 = getAsyncTaskIds(consumers[i]);
-    assert(taskIds == taskIds2);
-    if (sameBlock)
+  // With data partitioning, consumers of shared buffers (e.g., K, V) may
+  // belong to different computation partitions and have different taskIds.
+  // Only assert same-block when requested.
+  if (sameBlock) {
+    for (unsigned i = 1; i < consumers.size(); ++i)
       assert(consumers[i]->getBlock() == consumers[0]->getBlock());
   }
 }
@@ -366,7 +365,9 @@ unsigned getAccumCnts(Operation *ctrlOp,
                       const DenseSet<Operation *> &regionsWithChannels,
                       ReuseConfig *config) {
   unsigned cnt = 0;
-  LDBG("getAccumCnts: " << ctrlOp);
+  LDBG("getAccumCnts: ctrlOp=" << ctrlOp->getName().getStringRef());
+  LLVM_DEBUG(ctrlOp->getLoc().print(llvm::dbgs()));
+  LLVM_DEBUG(llvm::dbgs() << "\n");
   for (auto *op : regionsWithChannels) {
     LDBG("-- getAccumCnts: " << ctrlOp << " regionsWithChannels " << op);
     if (ctrlOp == op) {
@@ -621,9 +622,19 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   Value accumCnt =
       parentForOp.getBody()->getArgument(tSize - parentTCnts + accumArgId);
 
-  LDBG("getAccumCount: parentForOp " << parentForOp.getOperation() << " pOp "
-                                     << pOp << " " << tSize << " "
-                                     << parentTCnts << " " << accumArgId);
+  LDBG("getAccumCount: op=" << op->getName().getStringRef());
+  LLVM_DEBUG(op->getLoc().print(llvm::dbgs()));
+  LLVM_DEBUG(llvm::dbgs() << "\n");
+  LDBG("  parentForOp=");
+  LLVM_DEBUG(parentForOp->getLoc().print(llvm::dbgs()));
+  LLVM_DEBUG(llvm::dbgs() << "\n");
+  LDBG("  pOp=" << pOp->getName().getStringRef());
+  LLVM_DEBUG(pOp->getLoc().print(llvm::dbgs()));
+  LLVM_DEBUG(llvm::dbgs() << "\n");
+  LDBG("  tSize=" << tSize << " parentTCnts=" << parentTCnts
+                  << " accumArgId=" << accumArgId
+                  << " argNum=" << (tSize - parentTCnts + accumArgId)
+                  << " reuseGroupIdx=" << reuseGroupIdx);
   return accumCnt;
 }
 
@@ -2722,11 +2733,17 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
   auto producerTaskIds = getAsyncTaskIds(producerOp);
   assert(producerTaskIds.size() == 1);
   auto producerTaskId = producerTaskIds.front();
-  // Either a single consumer op with multiple taskIds, or multiple consumer ops
-  // with the same taskId.
-  auto consumerTaskIds = getAsyncTaskIds(consumers[0]);
-  if (consumerTaskIds.size() > 1)
-    assert(consumers.size() == 1);
+  // Collect consumer task IDs from all consumers. With data partitioning,
+  // different consumers may have different task IDs (e.g., K/V buffers
+  // consumed by multiple computation partitions).
+  SmallVector<int> consumerTaskIds;
+  DenseSet<int> seenTaskIds;
+  for (auto *consumer : consumers) {
+    for (int id : getAsyncTaskIds(consumer)) {
+      if (seenTaskIds.insert(id).second)
+        consumerTaskIds.push_back(id);
+    }
+  }
   // Remove producer task id from consumerTaskIds.
   auto iter = std::remove(consumerTaskIds.begin(), consumerTaskIds.end(),
                           producerTaskId);

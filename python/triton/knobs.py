@@ -492,6 +492,7 @@ class runtime_knobs(base_knobs):
 class language_knobs(base_knobs):
     fp32_default: env_opt_str = env_opt_str("TRITON_F32_DEFAULT")
     default_fp_fusion: env_bool = env_bool("TRITON_DEFAULT_FP_FUSION", True)
+    strict_reduction_ordering: env_bool = env_bool("TRITON_STRICT_REDUCTION_ORDERING")
 
 
 class nvidia_knobs(base_knobs):
@@ -510,13 +511,14 @@ class nvidia_knobs(base_knobs):
     libcuda_path: env_opt_str = env_opt_str("TRITON_LIBCUDA_PATH")
     use_meta_ws: env_bool = env_bool("TRITON_USE_META_WS")
     use_meta_partition: env_bool = env_bool("TRITON_USE_META_PARTITION")
-    use_modulo_schedule: env_bool = env_bool("TRITON_USE_MODULO_SCHEDULE")
+    use_modulo_schedule: env_opt_str = env_opt_str("TRITON_USE_MODULO_SCHEDULE")
     # Force OAI SWP schedule even when using Meta's WS implementation.
     force_trunk_swp_schedule: env_bool = env_bool("TRITON_FORCE_TRUNK_SWP_SCHEDULE")
     dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
     dump_tlx_benchmark: env_bool = env_bool("TRITON_DUMP_TLX_BENCHMARK")
     use_no_compile_launcher: env_bool = env_bool("TRITON_USE_NO_COMPILE_LAUNCHER")
     generate_subtiled_region: env_bool = env_bool("TRITON_GENERATE_SUBTILED_REGION")
+    enable_tileir: env_bool = env_bool("ENABLE_TILE")
 
 
 class amd_knobs(base_knobs):

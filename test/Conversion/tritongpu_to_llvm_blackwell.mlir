@@ -291,7 +291,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16, CGALayout = [[0, 1]]}>
 #shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1, CTASplitM = 2, twoCTAs = true>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttng.two-ctas" = true} {
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 8 : i32, "ttng.two-ctas" = true} {
   // CHECK-LABEL: @tc_gen5_mma_2ctas
   tt.func @tc_gen5_mma_2ctas(%a: !ttg.memdesc<256x32xf16, #shared, #ttg.shared_memory>,
                        %b: !ttg.memdesc<32x128xf16, #shared1, #ttg.shared_memory>,
@@ -320,7 +320,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttng.tw
 
 #tmem_scales_2ctas = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1, CTASplitM = 2>
 #tmem_scales_enc = #ttng.tensor_memory_scales_encoding<>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttng.two-ctas" = true} {
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 8 : i32, "ttng.two-ctas" = true} {
   // CHECK-LABEL: @tc_gen5_mma_scaled_2ctas
   tt.func @tc_gen5_mma_scaled_2ctas(%a: !ttg.memdesc<256x64xf8E4M3FN, #shared_scales, #ttg.shared_memory>,
                        %b: !ttg.memdesc<64x128xf8E4M3FN, #shared1_scales, #ttg.shared_memory>,
@@ -352,10 +352,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttng.tw
 #shared = #ttg.shared_linear<{offset = [[0, 1], [0, 2], [32, 0], [64, 0], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 4], [0, 8], [0, 16]]}, alignment = 16>
 #shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #shared2 = #ttg.shared_linear<{offset = [[0, 1], [0, 2], [32, 0], [64, 0], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 4], [0, 8], [0, 16], [128, 0], [256, 0]]}, alignment = 16>
+#shared3 = #ttg.shared_linear<{offset = [[0, 1], [0, 2], [32, 0], [64, 0], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [128, 0]]}, alignment = 128>
 #tmem_scales = #ttng.tensor_memory_scales_encoding<>
 
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
 
+// CHECK-LABEL: @tmem_copy_2d
 tt.func public @tmem_copy_2d(%src: !ttg.memdesc<128x32xi8, #shared, #ttg.shared_memory>,
                              %dst: !ttg.memdesc<128x32xi8, #tmem_scales, #ttng.tensor_memory, mutable>,
 		                         %barrier: !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory>) {
@@ -365,6 +367,22 @@ tt.func public @tmem_copy_2d(%src: !ttg.memdesc<128x32xi8, #shared, #ttg.shared_
   tt.return
 }
 
+// CHECK-LABEL: @tmem_copy_2d_256
+tt.func public @tmem_copy_2d_256(%src: !ttg.memdesc<256x4xi8, #shared3, #ttg.shared_memory>,
+                                 %dst: !ttg.memdesc<256x4xi8, #tmem_scales, #ttng.tensor_memory, mutable>) {
+  // CHECK: [[C0:%.*]] = llvm.mlir.constant(0 : i32)
+  // CHECK: [[BASE:%.*]] = llvm.ptrtoint %arg1
+  // CHECK: [[OFFS0:%.*]] = llvm.add [[BASE]], [[C0]]
+  // CHECK: tcgen05.cp.cta_group::1.warpx4.32x128b {{.*}} "r,l,b" [[OFFS0]]
+  // CHECK: [[C4:%.*]] = llvm.mlir.constant(4 : i32)
+  // CHECK: [[OFFS1:%.*]] = llvm.add [[BASE]], [[C4]]
+  // CHECK: tcgen05.cp.cta_group::1.warpx4.32x128b {{.*}} "r,l,b" [[OFFS1]]
+  // CHECK-NOT: tcgen05.cp
+  ttng.tmem_copy %src, %dst : !ttg.memdesc<256x4xi8, #shared3, #ttg.shared_memory>, !ttg.memdesc<256x4xi8, #tmem_scales, #ttng.tensor_memory, mutable>
+  tt.return
+}
+
+// CHECK-LABEL: @tmem_copy_2d_slice
 tt.func public @tmem_copy_2d_slice(%src: !ttg.memdesc<128x32xi8, #shared2, #ttg.shared_memory, 512x32>,
                                    %dst: !ttg.memdesc<128x32xi8, #tmem_scales, #ttng.tensor_memory, mutable>) {
   // CHECK: [[OFF0:%.*]] = llvm.extractvalue %arg0[1]
@@ -1010,8 +1028,8 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
 
 // -----
 
-#shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8}>
+#shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, CGALayout = [[1, 0]]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: tma_copy_global_to_local_two_cta
@@ -1019,8 +1037,8 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // The TMA instruction should include .cta_group::2 for cross-CTA mbarrier signaling
   // CHECK: cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2
   // CHECK: return
-  tt.func @tma_copy_global_to_local_two_cta(%tma: !tt.tensordesc<tensor<128x128xf32, #shared1>>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem, mutable>, %x: i32, %barrier: !ttg.memdesc<1xi64, #shared0, #smem>, %pred: i1) {
-    ttng.async_tma_copy_global_to_local %tma[%x, %x] %alloc, %barrier, %pred {two_cta = true} : !tt.tensordesc<tensor<128x128xf32, #shared1>>, !ttg.memdesc<1xi64, #shared0, #smem> -> !ttg.memdesc<128x128xf32, #shared1, #smem, mutable>
+  tt.func @tma_copy_global_to_local_two_cta(%tma: !tt.tensordesc<tensor<128x128xf32, #shared1>>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem, mutable>, %x: i32, %barrier: !ttg.memdesc<2xi64, #shared0, #smem>, %pred: i1) {
+    ttng.async_tma_copy_global_to_local %tma[%x, %x] %alloc, %barrier, %pred {two_cta = true} : !tt.tensordesc<tensor<128x128xf32, #shared1>>, !ttg.memdesc<2xi64, #shared0, #smem> -> !ttg.memdesc<128x128xf32, #shared1, #smem, mutable>
     tt.return
   }
 }

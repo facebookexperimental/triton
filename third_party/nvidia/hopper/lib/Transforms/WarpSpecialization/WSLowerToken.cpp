@@ -111,16 +111,16 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
 
     Attribute sharedMemorySpace =
         triton::gpu::SharedMemorySpaceAttr::get(context);
-    auto barrierCGALayout = ttg::CGAEncodingAttr::getDefault(context, 1);
+    auto barrierCGALayout = ttg::CGAEncodingAttr::get1DLayout(context, numCTAs);
     auto barrierEncoding = ttg::SwizzledSharedEncodingAttr::get(
         context, 1, 1, 1, {0}, barrierCGALayout);
-    ttg::MemDescType barrierMemDescType = ttg::MemDescType::get(
-        {createTokenOp.getNumBuffers(), 1}, builder.getI64Type(),
+    Type barrierMemDescType = ttg::MemDescType::get(
+        {createTokenOp.getNumBuffers(), numCTAs}, builder.getI64Type(),
         barrierEncoding, sharedMemorySpace,
         /*mutableMemory=*/true);
-    Type singleBarrierMemDescType = ttg::MemDescType::get(
-        {1}, builder.getI64Type(), barrierEncoding,
-        barrierMemDescType.getMemorySpace(), /*mutableMemory=*/true);
+    Type singleBarrierMemDescType =
+        ttg::MemDescType::get({numCTAs}, builder.getI64Type(), barrierEncoding,
+                              sharedMemorySpace, /*mutableMemory=*/true);
     // These are created prior to warp_specialize.
     Value bufferFullArray = mlir::triton::gpu::LocalAllocOp::create(
         builder, loc, barrierMemDescType, Value());
@@ -272,6 +272,92 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         processConsumerReleaseOp(builder, op, bufferEmpty, numCTAs,
                                  bufferEmptyCount);
         deprecatedOps.push_back(user);
+        return true;
+      } else if (auto op = dyn_cast<ttng::SubtiledRegionOp>(user)) {
+        // Convert TokenAnnotationAttr → BarrierAnnotationAttr for annotations
+        // that reference this token.
+        Value tokenVal = createTokenOp.getResult();
+        // Find which tokenValues indices reference this token.
+        SmallVector<unsigned> tokenIndices;
+        for (unsigned i = 0; i < op.getTokenValues().size(); ++i) {
+          if (op.getTokenValues()[i] == tokenVal)
+            tokenIndices.push_back(i);
+        }
+        if (tokenIndices.empty())
+          return false;
+
+        // For each matching token annotation, convert to barrier annotation.
+        SmallVector<Attribute> remainingTokenAnnotations;
+        SmallVector<Attribute> newBarrierAnnotations(
+            op.getBarrierAnnotations().begin(),
+            op.getBarrierAnnotations().end());
+
+        for (Attribute attr : op.getTokenAnnotations()) {
+          auto annotation = cast<ttng::TokenAnnotationAttr>(attr);
+          bool matchesToken =
+              llvm::is_contained(tokenIndices, annotation.getTokenIdx());
+          if (!matchesToken) {
+            remainingTokenAnnotations.push_back(attr);
+            continue;
+          }
+
+          // Determine barrier kind and memdesc.
+          StringRef kind = annotation.getTokenOpKind().getValue();
+          Value idx = op.getTokenValues()[annotation.getBufferIdxIdx()];
+          Value barrier;
+          StringRef barrierKind;
+          unsigned count = 1;
+          if (kind == "consumer_wait") {
+            barrier = extractBufferFull(loc, idx);
+            barrierKind = "wait_barrier";
+          } else {
+            barrier = extractBufferEmpty(loc, idx);
+            barrierKind = "arrive_barrier";
+            count = bufferEmptyCount;
+          }
+
+          // Add barrier to SubtiledRegionOp's barriers/accumCnts.
+          unsigned barrierIdx = op.getBarriers().size();
+          SmallVector<Value> newBarriers(op.getBarriers());
+          newBarriers.push_back(barrier);
+          op.getBarriersMutable().assign(newBarriers);
+
+          // For consumer_wait, we need the phase/accumCnt.
+          if (kind == "consumer_wait") {
+            int phaseIdx = annotation.getPhaseIdx();
+            assert(phaseIdx >= 0);
+            Value phase = op.getTokenValues()[phaseIdx];
+            // Convert phase (i1) to accumCnt (i64) for the barrier system.
+            // phase = (accumCnt / numBuffers) & 1, so accumCnt = phase.
+            Value accumCnt = arith::ExtUIOp::create(
+                builder, loc, builder.getI64Type(), phase);
+            SmallVector<Value> newAccumCnts(op.getAccumCnts());
+            newAccumCnts.push_back(accumCnt);
+            op.getAccumCntsMutable().assign(newAccumCnts);
+          } else {
+            // For arrive_barrier, accumCnt isn't used but we need a
+            // placeholder to keep barriers/accumCnts parallel.
+            Value zero = arith::ConstantOp::create(
+                builder, loc, builder.getI64IntegerAttr(0));
+            SmallVector<Value> newAccumCnts(op.getAccumCnts());
+            newAccumCnts.push_back(zero);
+            op.getAccumCntsMutable().assign(newAccumCnts);
+          }
+
+          auto barrierAnnotation = ttng::BarrierAnnotationAttr::get(
+              op.getContext(), barrierIdx, annotation.getPlacement(),
+              annotation.getTargetOpIdx(),
+              StringAttr::get(op.getContext(), barrierKind), count,
+              annotation.getRegion(),
+              /*numBuffers=*/1, /*tileMask=*/nullptr);
+          newBarrierAnnotations.push_back(barrierAnnotation);
+        }
+
+        op.setTokenAnnotationsAttr(
+            ArrayAttr::get(op.getContext(), remainingTokenAnnotations));
+        op.setBarrierAnnotationsAttr(
+            ArrayAttr::get(op.getContext(), newBarrierAnnotations));
+        // Don't erase the SubtiledRegionOp itself.
         return true;
       } else if (auto op = dyn_cast<ttng::TMAStoreTokenWaitOp>(user)) {
         Value truePred = arith::ConstantIntOp::create(builder, loc, 1, 1);

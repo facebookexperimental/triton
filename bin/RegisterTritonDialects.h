@@ -105,6 +105,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
 
   // TritonAMDGPUToLLVM passes
   mlir::triton::registerAllocateAMDGPUSharedMemory();
+  mlir::triton::registerTritonAMDGPUConvertWarpSpecializeToLLVM();
   mlir::triton::registerConvertTritonAMDGPUToLLVM();
   mlir::triton::registerConvertBuiltinFuncToLLVM();
   mlir::triton::registerConvertWarpPipeline();
@@ -145,6 +146,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::registerNVGPUModuloBufferAlloc();
   mlir::registerNVGPUModuloExpand();
   mlir::registerNVGPUModuloLower();
+  mlir::registerNVGPUListSchedule();
 
   // Proton passes
   mlir::test::proton::registerTestScopeIdAllocationPass();

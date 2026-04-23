@@ -29,7 +29,7 @@ NUM_WARPS = 8
 
 def is_hopper():
     target = triton.runtime.driver.active.get_current_target()
-    return target.backend == "cuda" and torch.cuda.get_device_capability()[0] == 9
+    return target.is_cuda_backend() and torch.cuda.get_device_capability()[0] == 9
 
 
 def config_helper(description: str):
