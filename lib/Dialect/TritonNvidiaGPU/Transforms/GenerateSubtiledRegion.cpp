@@ -496,7 +496,7 @@ static gpu::MemDescType createBufferMemDescType(MLIRContext *ctx,
   SmallVector<unsigned> order;
   for (int i = tensorType.getRank() - 1; i >= 0; --i)
     order.push_back(static_cast<unsigned>(i));
-  auto cgaLayout = gpu::CGAEncodingAttr::getDefault(ctx, tensorType.getRank());
+  auto cgaLayout = gpu::CGAEncodingAttr::get1CTALayout(ctx, tensorType.getRank());
   auto sharedEncoding = gpu::SwizzledSharedEncodingAttr::get(
       ctx, /*vec=*/1, /*perPhase=*/1, /*maxPhase=*/1, order, cgaLayout);
   auto sharedMemorySpace = gpu::SharedMemorySpaceAttr::get(ctx);
