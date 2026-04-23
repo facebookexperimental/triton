@@ -1084,65 +1084,78 @@ static bool buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
     bool needsLocalLoad;
   };
 
-  SmallVector<SmallVector<BufferEntryN>> transitions; // one per transition
+  // --- Validation pass: check all bail conditions and segment equivalence
+  // before creating any IR. This prevents partial modifications that would
+  // change the op count and cause the fixpoint loop to retry indefinitely.
+
+  // Detect cross-segment tensor values for each transition.
+  struct TransitionInfoN {
+    llvm::MapVector<Value, SmallVector<Value>> crossSegVals;
+  };
+  SmallVector<TransitionInfoN> transitionInfos;
 
   for (size_t i = 0; i + 1 < segments.size(); ++i) {
     Operation *lastOp0 = segments[i].opsPerTile[0].back();
-    auto alloc0 = dyn_cast<gpu::LocalAllocOp>(lastOp0);
-
-    if (alloc0 && alloc0.getSrc()) {
-      // Option 1: explicit memory store at local_alloc.
-      // Not yet supported for N-tile multi-task.
-      return false;
+    if (auto alloc0 = dyn_cast<gpu::LocalAllocOp>(lastOp0)) {
+      if (alloc0.getSrc())
+        return false; // Option 1 not yet supported for N-tile.
     }
 
-    // Option 2: implicit buffer.
-    // Find cross-segment values: results of segment i ops used by segment i+1.
     DenseSet<Value> seg0Results;
     for (auto *op : segments[i].opsPerTile[0])
       for (Value r : op->getResults())
         seg0Results.insert(r);
 
-    // Use MapVector for deterministic ordering.
-    llvm::MapVector<Value, SmallVector<Value>> seen;
+    TransitionInfoN info;
     for (size_t opIdx = 0; opIdx < segments[i + 1].opsPerTile[0].size();
          ++opIdx) {
       for (unsigned t = 0; t < numTiles; ++t) {
         for (Value v : segments[i + 1].opsPerTile[t][opIdx]->getOperands()) {
-          if (t == 0 && seg0Results.contains(v) && !seen.count(v)) {
+          if (t == 0 && seg0Results.contains(v) &&
+              !info.crossSegVals.count(v)) {
             SmallVector<Value> perTile(numTiles);
             perTile[0] = v;
-            seen[v] = std::move(perTile);
+            info.crossSegVals[v] = std::move(perTile);
           }
         }
       }
     }
-    // Fill in non-zero tiles by matching operand position.
     for (size_t opIdx = 0; opIdx < segments[i + 1].opsPerTile[0].size();
          ++opIdx) {
       auto *op0 = segments[i + 1].opsPerTile[0][opIdx];
       for (auto [oprIdx, v0] : llvm::enumerate(op0->getOperands())) {
-        auto it = seen.find(v0);
-        if (it == seen.end())
+        auto it = info.crossSegVals.find(v0);
+        if (it == info.crossSegVals.end())
           continue;
-        for (unsigned t = 1; t < numTiles; ++t) {
-          Value vt = segments[i + 1].opsPerTile[t][opIdx]->getOperand(oprIdx);
-          it->second[t] = vt;
-        }
+        for (unsigned t = 1; t < numTiles; ++t)
+          it->second[t] =
+              segments[i + 1].opsPerTile[t][opIdx]->getOperand(oprIdx);
       }
     }
-
-    // Bail if any cross-segment value is not a tensor (e.g., pre-allocated
-    // SMEM memdesc from the memory planner). These need to be passed through
-    // as differing operands without re-buffering, which requires the
-    // per-segment refactor.
-    for (auto &[v0, perTile] : seen) {
+    for (auto &[v0, perTile] : info.crossSegVals) {
       if (!isa<RankedTensorType>(v0.getType()))
         return false;
     }
+    transitionInfos.push_back(std::move(info));
+  }
 
+  SmallVector<NWayEquivalenceResult, 4> segEquivs;
+  for (size_t segIdx = 0; segIdx < segments.size(); ++segIdx) {
+    SmallVector<SmallVector<Operation *>> segChains;
+    for (auto &ops : segments[segIdx].opsPerTile)
+      segChains.push_back(SmallVector<Operation *>(ops));
+    auto segEquiv = checkStructuralEquivalenceN(segChains);
+    if (!segEquiv)
+      return false;
+    segEquivs.push_back(std::move(*segEquiv));
+  }
+
+  // --- All checks passed. Now create SMEM allocs and SubtiledRegionOps.
+
+  SmallVector<SmallVector<BufferEntryN>> transitions;
+  for (size_t i = 0; i < transitionInfos.size(); ++i) {
     SmallVector<BufferEntryN> bufs;
-    for (auto &[v0, perTile] : seen) {
+    for (auto &[v0, perTile] : transitionInfos[i].crossSegVals) {
       auto tensorTy = cast<RankedTensorType>(v0.getType());
       auto memDescType = createBufferMemDescType(ctx, tensorTy);
       SmallVector<Value> smems;
@@ -1163,14 +1176,8 @@ static bool buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
     bool hasOutgoing = (segIdx < transitions.size());
     bool hasIncoming = (segIdx > 0);
 
-    SmallVector<SmallVector<Operation *>> segChains;
-    for (auto &ops : seg.opsPerTile)
-      segChains.push_back(SmallVector<Operation *>(ops));
-
-    auto segEquiv = checkStructuralEquivalenceN(segChains);
-    if (!segEquiv)
-      return false;
-    auto &segDiff = segEquiv->differingOperands;
+    auto &segEquiv = segEquivs[segIdx];
+    auto &segDiff = segEquiv.differingOperands;
 
     // Resolve cross-segment operands.
     struct DiffEntryN {
@@ -1296,7 +1303,8 @@ static bool buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
     for (size_t i = 0; i < outBufs.size(); ++i)
       outSmemArgs.push_back(tileBlock->getArgument(argIdx++));
 
-    for (Operation *op : segChains[0])
+    // Clone from tile 0's ops (the template chain for this segment).
+    for (Operation *op : seg.opsPerTile[0])
       tileBuilder.clone(*op, tileMapping);
 
     if (hasOutgoing) {
