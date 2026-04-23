@@ -46,7 +46,6 @@ mxfp8_configs = [
             "NUM_Q_SCALE_TMEM_BUFFERS": 1,
             "NUM_KV_SCALE_TMEM_BUFFERS": 2,
             "GROUP_SIZE_N": 1,
-            "RESCALE_OPT": False,
         },
         num_stages=1,
         num_warps=4,
@@ -207,7 +206,6 @@ def _softmax_inner_loop(
     NUM_MMA_GROUPS: tl.constexpr,
     VEC_SIZE: tl.constexpr,
     STAGE: tl.constexpr,
-    RESCALE_OPT: tl.constexpr,
 ):
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // 2
     NUM_BLOCKS: tl.constexpr = BLOCK_N // VEC_SIZE
@@ -224,43 +222,24 @@ def _softmax_inner_loop(
             col_limit_right = (offs_m - start_n + 1)[:, None]
             qk = _apply_causal_mask(qk, col_limit_right, BLOCK_N)
 
-        # Blockscaled row-max: compute per-32-element block maxes, then derive
-        # row max from the 4 block maxes. Saves 128 max ops later in MXFP8
-        # conversion since we reuse these block maxes for E8M0 scale computation.
         qk_reshaped = tl.reshape(qk, [BLOCK_M_SPLIT, NUM_BLOCKS, VEC_SIZE])
         block_maxes = tl.max(qk_reshaped, 2)
         row_max = tl.max(block_maxes, 1)
 
-        if RESCALE_OPT:
-            m_ij = tl.maximum(m_i, row_max)
-            alpha_ = (m_i - m_ij) * qk_scale
-            alpha = tl.math.exp2(alpha_)
-            rescale_mask = alpha_ >= -8.0
-            alpha = tl.where(rescale_mask, 1.0, alpha)
-            m_ij = tl.where(rescale_mask, m_i, m_ij)
-        else:
-            m_ij = tl.maximum(m_i, row_max * qk_scale)
-            alpha = tl.math.exp2(m_i - m_ij)
+        m_ij = tl.maximum(m_i, row_max * qk_scale)
+        alpha = tl.math.exp2(m_i - m_ij)
 
-        # -- compute correction factor
         tlx.barrier_wait(tlx.local_view(alpha_empties, cid), qk_phase ^ 1)
         tlx.local_store(tlx.local_view(alpha_tiles, cid), alpha[:, None])
         tlx.barrier_arrive(tlx.local_view(alpha_fulls, cid))
 
-        if RESCALE_OPT:
-            m_scaled = m_ij * qk_scale
-            qk = _fma_f32x2(qk, qk_scale, -m_scaled[:, None])
-        else:
-            qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
+        qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
         p_i = tl.math.exp2(qk)
 
         # Derive block amax from pre-computed block maxes via monotonicity
         # of exp2: max(exp2(x)) == exp2(max(x)), avoiding 128 max(abs())
         # ops per row in the MXFP8 conversion.
-        if RESCALE_OPT:
-            block_amax = tl.math.exp2((block_maxes - m_ij[:, None]) * qk_scale)
-        else:
-            block_amax = tl.math.exp2(block_maxes * qk_scale - m_ij[:, None])
+        block_amax = tl.math.exp2(block_maxes * qk_scale - m_ij[:, None])
 
         tlx.barrier_wait(tlx.local_view(p_empties, cid), qk_phase ^ 1)
         _to_mxfp8_block_with_block_amax(
@@ -300,7 +279,6 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                       NUM_Q_SCALE_TMEM_BUFFERS: tl.constexpr,  #
                       NUM_KV_SCALE_TMEM_BUFFERS: tl.constexpr,  #
                       GROUP_SIZE_N: tl.constexpr,  #
-                      RESCALE_OPT: tl.constexpr,  #
                       ):
     """
     This kernel is adapted from the Blackwell FA kernel for MXFP8.
@@ -555,16 +533,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         tlx.barrier_wait(alpha_fulls[cid], phase)
                         alpha_1 = tlx.local_load(alpha_tiles[cid])
                         tlx.barrier_arrive(alpha_empties[cid])
-                        if RESCALE_OPT:
-                            pred = alpha_1 < 1.0
-                            ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
-                            should_rescale = ballot_result != 0
                         acc = tlx.local_load(acc_tiles[cid])
-                        if RESCALE_OPT:
-                            scaled_acc = _mul_f32x2(acc, alpha_1)
-                            acc = tl.where(should_rescale, scaled_acc, acc)
-                        else:
-                            acc = _mul_f32x2(acc, alpha_1)
+                        acc = _mul_f32x2(acc, alpha_1)
                         tlx.local_store(acc_tiles[cid], acc)
                         tlx.barrier_arrive(acc_fulls[cid])
                     accum_cnt += 1
@@ -576,8 +546,6 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     l = tlx.local_load(l_tiles[cid])
                     m = tlx.local_load(m_tiles[cid])
                     tlx.barrier_arrive(l_empties[cid])
-                    if RESCALE_OPT:
-                        m = m * sm_scale * 1.44269504
                     m += tl.math.log2(l)
                     offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
                     m_ptrs = M + off_hz * N_CTX + offs_m
@@ -645,7 +613,6 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         NUM_MMA_GROUPS,
                         VEC_SIZE,
                         STAGE=4 - STAGE,
-                        RESCALE_OPT=RESCALE_OPT,
                     )
 
                 if STAGE & 2:
@@ -675,7 +642,6 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         NUM_MMA_GROUPS,
                         VEC_SIZE,
                         STAGE=2,
-                        RESCALE_OPT=RESCALE_OPT,
                     )
 
                 # prepare l_i for the epilog
