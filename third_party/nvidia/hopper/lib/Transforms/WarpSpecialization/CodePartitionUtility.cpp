@@ -2685,6 +2685,20 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
   } else {
     assert(isa<ttg::LocalAllocOp>(allocOp));
     auto localAlloc = cast<ttg::LocalAllocOp>(allocOp);
+
+    // Skip TMA store staging buffers — they have multiple LocalStoreOp
+    // producers (one per subtile) and AsyncTMACopyLocalToGlobalOp consumers,
+    // and don't participate in producer-consumer channels.
+    bool hasTMAStoreConsumer = false;
+    for (auto user : allocOp->getUsers()) {
+      if (isa<ttng::AsyncTMACopyLocalToGlobalOp>(user)) {
+        hasTMAStoreConsumer = true;
+        break;
+      }
+    }
+    if (hasTMAStoreConsumer)
+      return;
+
     for (auto user : allocOp->getUsers()) {
       if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
         // Alloc associated with operand D can have multiple producers.

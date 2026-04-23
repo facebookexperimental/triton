@@ -202,6 +202,7 @@ public:
     // Canonicalize the SMEM/TEM buffers.
     // Create buffers for register channels.
     doBufferAllocation(funcOp);
+
     if (dumpIntermediateSteps) {
       llvm::dbgs()
           << "// -----// WarpSpec internal IR Dump After: doBufferAllocation\n";
@@ -263,6 +264,12 @@ public:
       moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
       llvm::dbgs() << "\n\n\n";
     }
+
+    // Convert early-lowered TMA stores (token-based waits) to the
+    // pendings-based pattern after code partitioning is complete.
+    funcOp->walk([&](scf::ForOp forOp) {
+      triton::pipelineEarlyLoweredTMAStores(forOp);
+    });
 
     if (pingpongAutoWS) {
       doPingPongSync(funcOp, numWarpGroups, capability);

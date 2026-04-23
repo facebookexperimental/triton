@@ -793,6 +793,7 @@ struct WSBuffer {
   unsigned numCopies;
   WSBufferPriority priority;
   bool isPinned = false; // Set by user annotation; skips heuristic phases.
+  bool isTMAStoreStaging = false; // Buffer used for TMA store staging.
 };
 
 /// Parsed channel annotation from tt.autows JSON on an MMA op.
@@ -1146,6 +1147,10 @@ static unsigned computeTotalSmem(const SmallVector<WSBuffer> &wsBuffers) {
   DenseMap<unsigned, std::pair<unsigned, unsigned>>
       idInfo; // id -> (maxSize, copies)
   for (const auto &buf : wsBuffers) {
+    // TMA store staging buffers live outside the pipelined inner loop
+    // and don't compete with channel buffers for pipeline depth.
+    if (buf.isTMAStoreStaging)
+      continue;
     auto it = idInfo.find(buf.bufferId);
     if (it == idInfo.end()) {
       idInfo[buf.bufferId] = {buf.sizeBytes, buf.numCopies};
@@ -1300,12 +1305,22 @@ static unsigned allocateSmemBuffers(
            << buf.bufferId << " numCopies=" << buf.numCopies);
     }
 
+    // Detect TMA store staging buffers: allocs whose users include
+    // AsyncTMACopyLocalToGlobalOp (from early TMA store lowering).
+    for (auto user : alloc->getUsers()) {
+      if (isa<ttng::AsyncTMACopyLocalToGlobalOp>(user)) {
+        buf.isTMAStoreStaging = true;
+        break;
+      }
+    }
+
     wsBuffers.push_back(buf);
 
     LDBG("Phase 1: WSBuffer["
          << buf.bufferId << "] " << buf.sizeBytes << " bytes"
          << " innermost=" << buf.isInnermost << " TMA=" << buf.isTMA
-         << " crossStage=" << buf.isCrossStage << " pinned=" << buf.isPinned);
+         << " crossStage=" << buf.isCrossStage << " pinned=" << buf.isPinned
+         << " tmaStoreStaging=" << buf.isTMAStoreStaging);
   });
 
   if (wsBuffers.empty())

@@ -33,6 +33,14 @@ loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
 
 }; // namespace gpu
 
+/// Merge LocalAllocOp buffers used by early-lowered TMA stores that share
+/// the same shape/type to reduce SMEM usage.
+bool mergeEarlyLoweredTMAStoreAllocs(scf::ForOp forOp);
+
+/// Pipeline already-lowered TMA stores (AsyncTMACopyLocalToGlobalOp with
+/// token waits) by converting them to the pendings-based wait pattern.
+bool pipelineEarlyLoweredTMAStores(scf::ForOp forOp);
+
 /// Pipeline the TMA stores in the loop.
 bool pipelineTMAStores(scf::ForOp forOp);
 

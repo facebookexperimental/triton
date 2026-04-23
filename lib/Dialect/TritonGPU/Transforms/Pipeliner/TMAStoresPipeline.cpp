@@ -89,6 +89,168 @@ static void lowerTMADescriptorCreation(scf::ForOp forOp) {
   triton::lowerTMADescriptors(forOp, schedule);
 }
 
+bool mlir::triton::mergeEarlyLoweredTMAStoreAllocs(scf::ForOp forOp) {
+  // Merge LocalAllocOp buffers used by early-lowered TMA stores that have
+  // the same shape and element type. This reduces SMEM usage and frees
+  // budget for double-buffering channel buffers.
+  SmallVector<ttng::AsyncTMACopyLocalToGlobalOp> tmaStores;
+  forOp.getBody()->walk<WalkOrder::PreOrder>([&](Operation *op) {
+    if (auto copyOp = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(op)) {
+      if (copyOp.getToken())
+        tmaStores.push_back(copyOp);
+    } else if (isa<scf::ForOp>(op)) {
+      return WalkResult::skip();
+    }
+    return WalkResult::advance();
+  });
+
+  if (tmaStores.empty())
+    return false;
+
+  DenseMap<std::pair<ArrayRef<int64_t>, Type>, Value> sharedAllocs;
+  bool changed = false;
+
+  for (auto copyOp : tmaStores) {
+    Value origAlloc = copyOp.getSrc();
+    auto allocOp = origAlloc.getDefiningOp<ttg::LocalAllocOp>();
+    if (!allocOp)
+      continue;
+    auto memDescType = cast<ttg::MemDescType>(origAlloc.getType());
+    auto key =
+        std::make_pair(memDescType.getShape(), memDescType.getElementType());
+    Value &sharedAlloc = sharedAllocs[key];
+    if (!sharedAlloc) {
+      sharedAlloc = origAlloc;
+      continue;
+    }
+    if (sharedAlloc == origAlloc)
+      continue;
+
+    // Redirect all in-loop users of this alloc to the shared one.
+    origAlloc.replaceAllUsesWith(sharedAlloc);
+    allocOp->erase();
+    changed = true;
+  }
+
+  return changed;
+}
+
+bool mlir::triton::pipelineEarlyLoweredTMAStores(scf::ForOp forOp) {
+  // Convert early-lowered TMA stores from the token-based wait pattern to
+  // the pendings-based pattern. At this point the LocalAllocOp has been
+  // split (LocalAllocOp() outside loop + LocalStoreOp inside loop) and
+  // the alloc hoisted before the loop by the memory planner.
+  //
+  // Input pattern (inside loop):
+  //   LocalStoreOp(src, alloc)
+  //   AsyncTMACopyLocalToGlobalOp(desc, coord, alloc) -> token
+  //   TMAStoreTokenWaitOp(token)
+  //
+  // Output pattern (inside loop):
+  //   TMAStoreWaitOp(0)
+  //   LocalStoreOp(src, alloc)
+  //   FenceAsyncSharedOp
+  //   AsyncTMACopyLocalToGlobalOp(desc, coord, alloc)  // no token
+  //
+  // Plus TMAStoreWaitOp(0) after the loop.
+
+  SmallVector<ttng::AsyncTMACopyLocalToGlobalOp> tmaStores;
+  forOp.getBody()->walk<WalkOrder::PreOrder>([&](Operation *op) {
+    if (auto copyOp = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(op)) {
+      if (copyOp.getToken())
+        tmaStores.push_back(copyOp);
+    } else if (isa<scf::ForOp>(op)) {
+      return WalkResult::skip();
+    }
+    return WalkResult::advance();
+  });
+
+  if (tmaStores.empty())
+    return false;
+
+  // Reuse a single alloc per shape/element-type, matching pipelineTMAStores.
+  // Since each subtile store does TMAStoreWaitOp(0) before overwriting,
+  // sharing is safe.
+  DenseMap<std::pair<ArrayRef<int64_t>, Type>, Value> sharedAllocs;
+  DenseSet<Operation *> origAllocsToErase;
+
+  for (auto copyOp : tmaStores) {
+    Location loc = copyOp.getLoc();
+    Value origAlloc = copyOp.getSrc();
+    auto allocOp = origAlloc.getDefiningOp<ttg::LocalAllocOp>();
+    auto memDescType = cast<ttg::MemDescType>(origAlloc.getType());
+    auto key =
+        std::make_pair(memDescType.getShape(), memDescType.getElementType());
+    Value &sharedAlloc = sharedAllocs[key];
+    if (!sharedAlloc) {
+      if (allocOp && !allocOp->getParentOfType<scf::ForOp>()) {
+        sharedAlloc = origAlloc;
+      } else {
+        OpBuilder hoistBuilder(forOp);
+        sharedAlloc = ttg::LocalAllocOp::create(hoistBuilder, loc, memDescType);
+      }
+    }
+
+    // Find the LocalStoreOp that writes to this alloc.
+    ttg::LocalStoreOp localStore = nullptr;
+    for (auto user : origAlloc.getUsers()) {
+      if (auto s = dyn_cast<ttg::LocalStoreOp>(user)) {
+        if (s->getParentOfType<scf::ForOp>() == forOp) {
+          localStore = s;
+          break;
+        }
+      }
+    }
+
+    // Insert TMAStoreWaitOp(0) before the LocalStoreOp.
+    if (localStore) {
+      OpBuilder builder(localStore);
+      ttng::TMAStoreWaitOp::create(builder, loc, 0);
+      // Redirect LocalStoreOp to the shared alloc.
+      if (sharedAlloc != origAlloc)
+        localStore.getDstMutable().assign(sharedAlloc);
+    }
+
+    // Insert FenceAsyncSharedOp before the TMA copy.
+    {
+      OpBuilder builder(copyOp);
+      ttng::FenceAsyncSharedOp::create(builder, loc, false);
+    }
+
+    // Remove the token wait.
+    for (auto user : llvm::make_early_inc_range(copyOp->getUsers())) {
+      if (auto waitOp = dyn_cast<ttng::TMAStoreTokenWaitOp>(user))
+        waitOp->erase();
+    }
+
+    // Replace with fire-and-forget copy using the shared alloc.
+    {
+      OpBuilder builder(copyOp);
+      ttng::AsyncTMACopyLocalToGlobalOp::create(builder, loc, copyOp.getDesc(),
+                                                copyOp.getCoord(), sharedAlloc,
+                                                copyOp.getEvict());
+      copyOp->erase();
+    }
+
+    // Mark the original alloc for removal if it's not the shared one.
+    if (allocOp && sharedAlloc != origAlloc)
+      origAllocsToErase.insert(allocOp);
+  }
+
+  // Erase unused original allocs.
+  for (auto *op : origAllocsToErase) {
+    if (op->use_empty())
+      op->erase();
+  }
+
+  // Final wait after the loop.
+  OpBuilder builder(forOp);
+  builder.setInsertionPointAfter(forOp);
+  ttng::TMAStoreWaitOp::create(builder, forOp->getLoc(), 0);
+
+  return true;
+}
+
 bool mlir::triton::pipelineTMAStores(scf::ForOp forOp) {
   SmallVector<TMAStore> tmaStores = getTMAStores(forOp);
   if (tmaStores.empty())

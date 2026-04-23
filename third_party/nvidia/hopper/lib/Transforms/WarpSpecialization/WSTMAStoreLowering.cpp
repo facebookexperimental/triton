@@ -42,6 +42,11 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
   MLIRContext *ctx = funcOp.getContext();
   Attribute sharedMemorySpace = ttg::SharedMemorySpaceAttr::get(ctx);
 
+  // Reuse SMEM allocs across stores of the same shape/encoding to reduce
+  // SMEM usage, matching pipelineTMAStores behavior. The token wait
+  // after each copy ensures the previous copy completes before reuse.
+  DenseMap<ttg::MemDescType, ttg::LocalAllocOp> sharedAllocs;
+
   for (auto storeOp : storeOps) {
     auto loc = storeOp.getLoc();
     auto asyncTaskIds = getAsyncTaskIds(storeOp);
@@ -59,8 +64,17 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
         tensorType.getShape(), tensorType.getElementType(), encoding,
         sharedMemorySpace, /*mutableMemory=*/true);
 
-    // Allocate SMEM and copy register data into it in one step.
-    auto alloc = builder.create<ttg::LocalAllocOp>(loc, memDescType, src);
+    auto &cachedAlloc = sharedAllocs[memDescType];
+    ttg::LocalAllocOp alloc;
+    if (cachedAlloc) {
+      alloc = cachedAlloc;
+      auto storeToSmem = builder.create<ttg::LocalStoreOp>(loc, src, alloc);
+      copyLoopScheduleAttrs(storeOp, storeToSmem);
+    } else {
+      alloc = builder.create<ttg::LocalAllocOp>(loc, memDescType, src);
+      copyLoopScheduleAttrs(storeOp, alloc);
+      cachedAlloc = alloc;
+    }
 
     // Translate indices for TMA.
     auto indices = ttng::translateTMAIndices(
