@@ -550,19 +550,6 @@ groupByContiguousTaskSet(ArrayRef<SmallVector<Operation *>> chains,
   return segments;
 }
 
-/// Convert a 2-tile EquivalenceResult to an NWayEquivalenceResult.
-static NWayEquivalenceResult toNWayEquivalence(const EquivalenceResult &equiv) {
-  NWayEquivalenceResult result;
-  result.templateChainIdx = equiv.templateChainIdx;
-  result.identityOps = equiv.identityOps;
-  result.identityOpSet = equiv.identityOpSet;
-  for (auto &[v0, v1] : equiv.differingOperands) {
-    SmallVector<Value> perTile = {v0, v1};
-    result.differingOperands.push_back(std::move(perTile));
-  }
-  return result;
-}
-
 /// Build a single SubtiledRegionOp for N tiles (generalized).
 /// `leafValues` has one value per tile (the split leaf result).
 /// `chains` has one chain per tile.
@@ -707,21 +694,6 @@ static void buildSingleSubtiledRegionN(
   SubtiledRegionYieldOp::create(teardownBuilder, loc, ValueRange{});
 }
 
-/// Build a single SubtiledRegionOp (2-tile path).
-/// Convenience wrapper: build a single SubtiledRegionOp for 2 tiles by
-/// converting the 2-tile inputs to the generalized N-tile form.
-static void buildSingleSubtiledRegion(OpBuilder &builder, Location loc,
-                                      ArrayRef<Operation *> setupOps, Value lhs,
-                                      Value rhs, ArrayRef<Operation *> chain0,
-                                      ArrayRef<Operation *> chain1,
-                                      const EquivalenceResult &equiv) {
-  SmallVector<Value> leafValues = {lhs, rhs};
-  SmallVector<SmallVector<Operation *>> chains = {
-      SmallVector<Operation *>(chain0), SmallVector<Operation *>(chain1)};
-  buildSingleSubtiledRegionN(builder, loc, setupOps, leafValues, chains,
-                             toNWayEquivalence(equiv));
-}
-
 /// Create a mutable MemDescType with a trivial shared encoding for buffering
 /// a tensor value through SMEM.
 static gpu::MemDescType createBufferMemDescType(MLIRContext *ctx,
@@ -737,24 +709,6 @@ static gpu::MemDescType createBufferMemDescType(MLIRContext *ctx,
   return gpu::MemDescType::get(tensorType.getShape(),
                                tensorType.getElementType(), sharedEncoding,
                                sharedMemorySpace, /*mutableMemory=*/true);
-}
-
-// Forward declaration.
-static bool buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
-                                           Location loc,
-                                           ArrayRef<Operation *> setupOps,
-                                           ArrayRef<Value> leafValues,
-                                           ArrayRef<ChainSegment> segments);
-
-/// Convenience wrapper: build multi-task SubtiledRegionOps for 2 tiles by
-/// converting to the generalized N-tile form.
-static bool buildMultiTaskSubtiledRegions(OpBuilder &outerBuilder, Location loc,
-                                          ArrayRef<Operation *> setupOps,
-                                          Value lhs, Value rhs,
-                                          ArrayRef<ChainSegment> segments) {
-  SmallVector<Value> leafValues = {lhs, rhs};
-  return buildMultiTaskSubtiledRegionsN(outerBuilder, loc, setupOps, leafValues,
-                                        segments);
 }
 
 /// Build multiple SubtiledRegionOps for N-tile chains spanning multiple
@@ -1078,137 +1032,66 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
     return;
 
   Block *block = splitOp->getBlock();
-  Value lhs = splitOp.getOutLHS();
-  Value rhs = splitOp.getOutRHS();
 
   // Check for nested split tree (4-tile, 8-tile, etc.).
   SmallVector<Value> leafValues;
   SmallVector<Operation *> innerSetupOps;
   collectSplitTreeLeaves(splitOp, leafValues, innerSetupOps);
-
-  // If any leaf feeds into yet another split (not caught by the tree walker),
-  // bail out — we only support complete trees.
   unsigned numTiles = leafValues.size();
 
-  if (numTiles > 2) {
-    // --- N-tile path (4, 8, ...) ---
-    // Collect per-tile chains for each leaf value. The "barrier" for chain
-    // collection is the last split in the tree, not the root split.
-    Operation *lastSetupOp = innerSetupOps.empty()
-                                 ? static_cast<Operation *>(splitOp)
-                                 : innerSetupOps.back();
-    // Exclude inner setup ops from auxiliary collection so the per-tile
-    // chains don't capture reshape/trans/split from other split-tree branches.
-    DenseSet<Operation *> excludeOps(innerSetupOps.begin(),
-                                     innerSetupOps.end());
-    SmallVector<SmallVector<Operation *>> chains;
-    for (Value leaf : leafValues) {
-      auto chain = collectPerTileChain(leaf, lastSetupOp, block, excludeOps);
-      if (chain.empty())
-        return;
-      chains.push_back(std::move(chain));
-    }
-
-    auto equiv = checkStructuralEquivalenceN(chains);
-    if (!equiv)
+  // Collect per-tile chains. For nested splits, exclude inner setup ops
+  // from auxiliary collection to avoid capturing other branches.
+  Operation *lastSetupOp = innerSetupOps.empty()
+                               ? static_cast<Operation *>(splitOp)
+                               : innerSetupOps.back();
+  DenseSet<Operation *> excludeOps(innerSetupOps.begin(), innerSetupOps.end());
+  SmallVector<SmallVector<Operation *>> chains;
+  for (Value leaf : leafValues) {
+    auto chain = collectPerTileChain(leaf, lastSetupOp, block, excludeOps);
+    if (chain.empty())
       return;
-
-    bool multiTask = isMultiTask(chains);
-
-    // Collect setup ops: tmemLoad → root split + inner setup ops.
-    SmallVector<Operation *> setupOps;
-    for (auto it = Block::iterator(tmemLoad); it != Block::iterator(splitOp);
-         ++it)
-      setupOps.push_back(&*it);
-    setupOps.push_back(splitOp);
-    llvm::sort(innerSetupOps, [](Operation *a, Operation *b) {
-      return a->isBeforeInBlock(b);
-    });
-    for (auto *op : innerSetupOps)
-      setupOps.push_back(op);
-
-    Operation *insertBefore =
-        findInsertionPoint(block, lastSetupOp, chains, equiv->differingOperands,
-                           equiv->identityOps);
-    OpBuilder builder(insertBefore);
-    Location loc = splitOp.getLoc();
-
-    bool built = false;
-    if (multiTask) {
-      auto segments = groupByContiguousTaskSet(chains, *equiv);
-      if (!segments || segments->empty())
-        return;
-      if (segments->size() == 1) {
-        buildSingleSubtiledRegionN(builder, loc, setupOps, leafValues, chains,
-                                   *equiv);
-        built = true;
-      } else {
-        built = buildMultiTaskSubtiledRegionsN(builder, loc, setupOps,
-                                               leafValues, *segments);
-      }
-    } else {
-      buildSingleSubtiledRegionN(builder, loc, setupOps, leafValues, chains,
-                                 *equiv);
-      built = true;
-    }
-    if (!built)
-      return;
-
-    // Erase original ops (reverse program order).
-    // Chains first, then setup (which includes inner setup ops).
-    for (auto &chain : llvm::reverse(chains)) {
-      for (Operation *op : llvm::reverse(chain)) {
-        if (op->use_empty())
-          op->erase();
-      }
-    }
-    for (Operation *op : llvm::reverse(setupOps)) {
-      if (op->use_empty())
-        op->erase();
-    }
-    return;
+    chains.push_back(std::move(chain));
   }
 
-  // --- 2-tile path (existing) ---
-  SmallVector<Operation *> chain0 = collectPerTileChain(lhs, splitOp, block);
-  SmallVector<Operation *> chain1 = collectPerTileChain(rhs, splitOp, block);
-
-  if (chain0.empty() || chain1.empty())
+  auto equiv = checkStructuralEquivalenceN(chains);
+  if (!equiv)
     return;
 
-  auto differing = checkStructuralEquivalence(chain0, chain1);
-  if (!differing)
-    return;
-
+  // Collect setup ops: tmemLoad → root split + inner setup ops.
   SmallVector<Operation *> setupOps;
   for (auto it = Block::iterator(tmemLoad); it != Block::iterator(splitOp);
        ++it)
     setupOps.push_back(&*it);
   setupOps.push_back(splitOp);
+  llvm::sort(innerSetupOps,
+             [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
+  for (auto *op : innerSetupOps)
+    setupOps.push_back(op);
 
-  SmallVector<SmallVector<Operation *>> twoChains = {chain0, chain1};
-  auto nwayEquiv = toNWayEquivalence(*differing);
-
-  Operation *insertBefore = findInsertionPoint(block, splitOp, twoChains);
+  Operation *insertBefore = findInsertionPoint(
+      block, lastSetupOp, chains, equiv->differingOperands, equiv->identityOps);
   OpBuilder builder(insertBefore);
   Location loc = splitOp.getLoc();
 
-  auto segments = groupByContiguousTaskSet(twoChains, nwayEquiv);
-  if (!segments || segments->empty())
-    return;
+  bool built = false;
+  bool multiTask = isMultiTask(chains);
 
-  if (segments->size() == 1) {
-    buildSingleSubtiledRegion(builder, loc, setupOps, lhs, rhs, chain0, chain1,
-                              *differing);
+  if (!multiTask) {
+    buildSingleSubtiledRegionN(builder, loc, setupOps, leafValues, chains,
+                               *equiv);
+    built = true;
   } else {
-    // Check if task IDs form non-contiguous groups (e.g., task A → B → A).
-    // This happens in addmm where the bias load (task 3) is interleaved
-    // between compute ops (task 2). Merge segments with the same task ID
-    // and reorder by data dependency to produce contiguous task groups.
-    bool hasNonContiguousTasks = hasNonContiguousTaskIds(*segments);
+    auto segments = groupByContiguousTaskSet(chains, *equiv);
+    if (!segments || segments->empty())
+      return;
 
-    if (hasNonContiguousTasks) {
-      // Merge segments with the same task ID.
+    if (segments->size() == 1) {
+      buildSingleSubtiledRegionN(builder, loc, setupOps, leafValues, chains,
+                                 *equiv);
+      built = true;
+    } else if (hasNonContiguousTaskIds(*segments)) {
+      // Merge segments with the same task ID and topologically sort by
+      // data dependency to produce contiguous task groups.
       SmallVector<ChainSegment> merged;
       for (auto &seg : *segments) {
         ChainSegment *target = nullptr;
@@ -1227,8 +1110,6 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
         }
       }
 
-      // Topological sort by data dependency: if segment A produces values
-      // consumed by segment B, A must come before B.
       unsigned n = merged.size();
       SmallVector<DenseSet<Value>> segResults(n);
       for (unsigned i = 0; i < n; ++i)
@@ -1267,35 +1148,33 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
 
       // Strip identity ops from the non-template side so that per-segment
       // checkStructuralEquivalence correctly detects identity insertions.
-      // Without this, both sides have the same Operation* and the identity
-      // op becomes dead code in the tile body.
-      unsigned nonTpl = (differing->templateChainIdx == 0) ? 1 : 0;
+      unsigned nonTpl = (equiv->templateChainIdx == 0) ? 1 : 0;
       for (auto &seg : reordered) {
         SmallVector<Operation *> filtered;
         for (auto *op : seg.opsPerTile[nonTpl]) {
-          if (!differing->identityOpSet.count(op))
+          if (!equiv->identityOpSet.count(op))
             filtered.push_back(op);
         }
         seg.opsPerTile[nonTpl] = std::move(filtered);
       }
 
-      if (!buildMultiTaskSubtiledRegions(builder, loc, setupOps, lhs, rhs,
-                                         reordered))
-        return;
+      built = buildMultiTaskSubtiledRegionsN(builder, loc, setupOps, leafValues,
+                                             reordered);
     } else {
-      if (!buildMultiTaskSubtiledRegions(builder, loc, setupOps, lhs, rhs,
-                                         *segments))
-        return;
+      built = buildMultiTaskSubtiledRegionsN(builder, loc, setupOps, leafValues,
+                                             *segments);
     }
   }
 
-  for (Operation *op : llvm::reverse(chain1)) {
-    if (op->use_empty())
-      op->erase();
-  }
-  for (Operation *op : llvm::reverse(chain0)) {
-    if (op->use_empty())
-      op->erase();
+  if (!built)
+    return;
+
+  // Erase original ops (reverse program order).
+  for (auto &chain : llvm::reverse(chains)) {
+    for (Operation *op : llvm::reverse(chain)) {
+      if (op->use_empty())
+        op->erase();
+    }
   }
   for (Operation *op : llvm::reverse(setupOps)) {
     if (op->use_empty())
