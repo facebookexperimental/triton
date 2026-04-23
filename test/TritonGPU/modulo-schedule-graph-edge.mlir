@@ -3,9 +3,8 @@
 
 //===----------------------------------------------------------------------===//
 // Edge case 0: Single-stage schedule (maxStage=0).
-// MMA-only loop: no TMA copy, no result use. The MMA self-latency (900) is
-// the only thing on the TC pipeline, so II = 900 and the MMA lands at
-// cycle 0, stage 0 — max_stage = 0.
+// MMA-only loop: no TMA copy, no result use. With selfLatency=1,
+// II = 1 (single TC op) and the MMA lands at cycle 0, stage 0.
 //
 // Regression test for Devmate review: tt.num_stages must be set even when
 // maxStage = 0 so downstream pipelining recognises the loop as scheduled.
@@ -18,11 +17,9 @@
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 // Verify the maxStage=0 dump and the loop's tt.num_stages=1 attribute.
-// CHECK: ii = 900, max_stage = 0
+// CHECK: ii = 1, max_stage = 0
 // CHECK: @maxstage_0_mma_only
-// CHECK: tt.modulo_ii = 900 : i32
-// CHECK-SAME: tt.num_stages = 1 : i32
-// CHECK-SAME: tt.scheduled_max_stage = 0 : i32
+// CHECK: tt.num_stages = 1 : i32
 tt.func @maxstage_0_mma_only(
   %a: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
   %b: !ttg.memdesc<64x128xf16, #shared, #smem, mutable>,

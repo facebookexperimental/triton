@@ -13,37 +13,37 @@
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
-// --- Graph structure: II=1038, max_stage=2, trip_count=32 ---
+// --- Graph structure: II=1005, max_stage=1, trip_count=32 ---
+// With selfLatency=1, loads issue every cycle (not every 518 cycles),
+// so II is driven by RecMII (loop-carried dep: MMA→tmem_load→tmem_alloc→MMA).
 // CHECK: [PASS-A] === Inner Loop ScheduleGraph ===
 // CHECK-NEXT: modulo.schedule @loop0 {
-// CHECK-NEXT:   ii = 1038, max_stage = 2, prologue_latency = 1038, trip_count = 32
+// CHECK-NEXT:   ii = 1005, max_stage = 1, prologue_latency = 703, trip_count = 32
 //
-// --- Nodes: loads+allocs@s0, MMA@s1, tmem_load@s2 with cluster IDs ---
+// --- Nodes: loads+allocs+MMA@s0, tmem_load@s1 ---
 // CHECK: modulo.stage @s0 {
-// CHECK:   tt.descriptor_load  {pipe: MEM, cycle: 0, cluster: 0, latency: 1218, selfLatency: 518}
-// CHECK:   tt.descriptor_load  {pipe: MEM, cycle: 518, cluster: 1, latency: 1218, selfLatency: 518}
-// CHECK:   ttg.local_alloc  {pipe: MEM, cycle: 1036, cluster: 2, latency: 700
-// CHECK:   ttg.local_alloc  {pipe: MEM, cycle: 1037, cluster: 3, latency: 700
+// CHECK:   tt.descriptor_load  {pipe: MEM, cycle: 0, cluster: 0, latency: 1218, selfLatency: 1}
+// CHECK:   tt.descriptor_load  {pipe: MEM, cycle: 1, cluster: 1, latency: 1218, selfLatency: 1}
+// CHECK:   ttg.local_alloc  {pipe: MEM, cycle: 2, cluster: 2, latency: 700
+// CHECK:   ttg.local_alloc  {pipe: MEM, cycle: 3, cluster: 3, latency: 700
+// CHECK:   ttng.tc_gen5_mma  {pipe: TC, cycle: 703, cluster: 4, latency: 900, selfLatency: 1
 // CHECK: }
 // CHECK: modulo.stage @s1 {
-// CHECK:   ttng.tc_gen5_mma  {pipe: TC, cycle: 1737, cluster: 0, latency: 900, selfLatency: 900
-// CHECK: }
-// CHECK: modulo.stage @s2 {
-// CHECK:   ttng.tmem_load  {pipe: CUDA, cycle: 2637, cluster: 0, latency: 130, selfLatency: 130
+// CHECK:   ttng.tmem_load  {pipe: CUDA, cycle: 1603, cluster: 0, latency: 105, selfLatency: 1
 // CHECK: }
 //
 // --- Edges: SSA + loop-carried ---
 // CHECK: edges {
 // CHECK-DAG: N0 -> N1  lat=0  dist=0
 // CHECK-DAG: N0 -> N2  lat=0  dist=0
-// CHECK-DAG: N1 -> N3  lat=518  dist=0
-// CHECK-DAG: N2 -> N4  lat=518  dist=0
+// CHECK-DAG: N1 -> N3  lat=1  dist=0
+// CHECK-DAG: N2 -> N4  lat=1  dist=0
 // CHECK-DAG: N3 -> N6  lat=700  dist=0
 // CHECK-DAG: N4 -> N6  lat=700  dist=0
 // CHECK-DAG: N5 -> N6  lat=0  dist=0
 // CHECK-DAG: N5 -> N7  lat=0  dist=0
 // CHECK-DAG: N6 -> N7  lat=900  dist=0
-// CHECK-DAG: N7 -> N5  lat=130  dist=1
+// CHECK-DAG: N7 -> N5  lat=105  dist=1
 // CHECK: }
 // CHECK: }
 tt.func @test_basic_graph(
