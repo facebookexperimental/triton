@@ -62,26 +62,32 @@ Key capabilities:
 Structural equivalence (`checkStructuralEquivalence`) compares per-tile
 chains, recording differing operands and identity-compatible ops.
 
-#### 2. OptimizeTMemLayouts
+#### 2. OptimizeTMemLayouts (+ PushSharedSetupToTile)
+**File:** `lib/Dialect/TritonNvidiaGPU/Transforms/OptimizeTMemLayouts.cpp`
 **Pass:** `triton-nvidia-optimize-tmem-layouts`
 
-Converts `tmem_load → reshape → trans → split` inside SubtiledRegionOp setup
-regions into `tmem_subslice → tmem_load` pairs, eliminating the reshape/trans
-overhead.
+This pass serves dual purposes:
 
-#### 3. PushSharedSetupToTile
-**File:** `lib/Dialect/TritonNvidiaGPU/Transforms/PushSharedSetupToTile.cpp`
-**Pass:** `triton-nvidia-gpu-push-shared-setup-to-tile`
+1. **TMem layout optimization** (pattern-based): Converts
+   `tmem_load → reshape → trans → split` chains into
+   `tmem_subslice → tmem_load` pairs, eliminating reshape/trans overhead.
+   Also handles `tmem_store + join` patterns and layout selection for
+   vectorization.
 
-Three transformations on each `SubtiledRegionOp`:
-1. `addSubsliceRangeToSetup` — extracts per-tile N offsets from
-   `tmem_subslice` ops as i32 tile args
-2. `pushTmemLoadsToTile` — moves per-tile `tmem_load` chains from setup into
-   tile body, interleaving loads with compute
-3. `pushSharedSetupToTile` — sinks "shared" tile arguments (uniform across
-   tiles) into the tile body
+2. **SubtiledRegionOp setup push** (imperative, after patterns fire): Walks
+   all `SubtiledRegionOp`s and calls `pushSubtiledRegionSetupToTile()`, which
+   runs three transformations:
+   - `addSubsliceRangeToSetup` — extracts per-tile N offsets from
+     `tmem_subslice` ops as i32 tile args
+   - `pushTmemLoadsToTile` — moves per-tile `tmem_load` chains from setup
+     into tile body, interleaving loads with compute
+   - `pushSharedSetupToTile` — sinks "shared" tile arguments (uniform across
+     tiles) into the tile body
 
-#### 4. LowerSubtiledRegion
+The push logic lives in `PushSharedSetupToTile.cpp` and is exposed via the
+`pushSubtiledRegionSetupToTile()` entry point declared in `Dialect.h`.
+
+#### 3. LowerSubtiledRegion
 **File:** `lib/Dialect/TritonNvidiaGPU/Transforms/LowerSubtiledRegion.cpp`
 **Pass:** `triton-nvidia-gpu-lower-subtiled-region`
 
@@ -98,24 +104,50 @@ for use by other passes (e.g., WSCodePartition for multi-task fallback).
 
 ### Pipeline Integration
 
-Inside `NVGPUWarpSpecialization` pass (`WarpSpecialization.cpp`):
+The subtile pipeline spans two compilation phases: the WS mega-pass generates
+and annotates the SubtiledRegionOps, then the main TTGIR pipeline optimizes
+and lowers them.
+
+**Inside `NVGPUWarpSpecialization` pass** (`WarpSpecialization.cpp`):
 
 ```
 doTaskIdPropagate
 doBufferAllocation
 doHoistLoopInvariantTMEMStore
 doMemoryPlanner
-doGenerateSubtiledRegion          ← sub-pipeline: Generate + OptimizeTMem + PushShared
+doGenerateSubtiledRegion          ← only runs GenerateSubtiledRegion pass
 doAnnotateTMAStoreWaits
 doValidateTMAStoreAnnotations
-doCodePartitionPost               ← adds token annotations on SubtiledRegionOps
+doCodePartitionPost               ← adds token annotations on SubtiledRegionOps;
+                                    multi-task SubtiledRegionOps lowered here
 doTokenLowering                   ← converts tokens → barrier annotations
-lowerSubtiledRegion               ← expands tile bodies with per-tile barriers
-scheduleLoops
+scheduleLoops                       (SubtiledRegionOps survive with annotations)
 ```
 
-Multi-task SubtiledRegionOps (tile body spanning multiple tasks) are lowered
-as a fallback inside `doCodePartitionPost` before `specializeRegion`.
+**In the main TTGIR pipeline** (`compiler.py`), after the WS pass:
+
+```
+...
+add_optimize_tmem_layouts         ← pattern rewrites (split → tmem_subslice)
+                                    + pushSubtiledRegionSetupToTile()
+add_lower_subtiled_region         ← expands tile bodies with per-tile barriers
+add_tma_lowering
+...
+```
+
+This separation is critical: `doGenerateSubtiledRegion` only creates the
+SubtiledRegionOps (no tmem optimization, no setup push). The SubtiledRegionOps
+survive through the WS pass where they receive barrier annotations via token
+lowering. Only after the WS pass completes does `add_optimize_tmem_layouts`
+transform the setup chains (both inside SubtiledRegionOps and bare splits
+elsewhere), and `add_lower_subtiled_region` expands the tile bodies.
+
+This avoids the earlier problem where `OptimizeTMemLayouts` ran inside
+`doGenerateSubtiledRegion` and transformed bare (non-SubtiledRegionOp) splits
+into `tmem_subslice` ops lacking `async_task_id`, crashing `createChannelPost`.
+
+Multi-task SubtiledRegionOps (tile body spanning multiple tasks) are still
+lowered as a fallback inside `doCodePartitionPost` before `specializeRegion`.
 
 ### Compiler Option
 
@@ -147,45 +179,39 @@ Default: `False`.
 | `test/TritonNvidiaGPU/lower_subtiled_region.mlir` | 13 LIT tests for lowering |
 | `test/TritonNvidiaGPU/generate_subtiled_region_multi_task.mlir` | Multi-task, identity, addmm patterns |
 | `test/TritonNvidiaGPU/generate_subtiled_region_ntile.mlir` | 4-tile, 8-tile nested splits |
-| `test/TritonNvidiaGPU/generate_subtiled_region_tmem_split.mlir` | tmem_subslice optimization |
+| `test/TritonNvidiaGPU/generate_subtiled_region_tmem_split.mlir` | tmem_subslice + push-to-tile optimization |
 | `test/TritonNvidiaGPU/push_shared_setup_to_tile.mlir` | Setup-to-tile push transformations |
 | `test/TritonNvidiaGPU/invalid.mlir` | Verifier error cases |
-| `python/test/unit/language/test_tutorial09_warp_specialization.py` | Blackwell GEMM e2e (parametrized) |
-| `python/test/unit/language/test_autows_addmm.py` | Addmm e2e (parametrized) |
+| `python/test/unit/language/test_tutorial09_warp_specialization.py` | Blackwell GEMM e2e (parametrized with `generate_subtiled_region`) |
+| `python/test/unit/language/test_autows_addmm.py` | Addmm e2e (parametrized with `generate_subtiled_region`) |
 | `test_subtile_gemm.py` | Standalone addmm + subtile e2e |
 
 ## Known TODOs
 
-1. **E2e pipeline crash with `generate_subtiled_region=True`.**
-   `OptimizeTMemLayouts` runs unconditionally inside `doGenerateSubtiledRegion`
-   and replaces `tmem_load → reshape → trans → split` with `tmem_subslice →
-   tmem_load` even when the generation pass doesn't wrap the split in a
-   SubtiledRegionOp. The resulting bare `tmem_subslice` ops have no
-   `async_task_id`, causing an assertion failure in `createChannelPost`
-   (`CodePartitionUtility.cpp:2666`). Fix: scope `OptimizeTMemLayouts` to
-   only operate inside SubtiledRegionOp setup regions, or propagate task IDs
-   to the new ops.
-
-2. **Cross-SubtiledRegionOp barrier insertion for multi-chain (addmm).**
+1. **Cross-SubtiledRegionOp barrier insertion for multi-chain (addmm).**
    The 3-region model (task 3 bias load → task 2 compute → task 1 store)
    produces 3 single-task SubtiledRegionOps with SMEM transitions. The code
    partition pass needs to detect `local_store`/`local_load` crossing task
    boundaries between SubtiledRegionOps and insert barrier annotations. This
-   path is blocked by TODO 1.
+   has not been validated e2e yet.
 
-3. **N-tile multi-task Option 1** (explicit `local_alloc` at segment
+2. **N-tile multi-task Option 1** (explicit `local_alloc` at segment
    boundaries) is not yet supported for N > 2. The code bails out.
 
-4. **Non-tensor cross-segment values in N-tile multi-task** (e.g., scalar
+3. **Non-tensor cross-segment values in N-tile multi-task** (e.g., scalar
    offsets) bail out. These need to be passed through as differing operands
    without SMEM buffering.
 
-5. **`PushSharedSetupToTile` for multi-segment SubtiledRegionOps.** Non-first
+4. **`PushSharedSetupToTile` for multi-segment SubtiledRegionOps.** Non-first
    segments don't clone setup ops. The push pass may not handle SMEM buffer
    tile args correctly.
 
-6. **The `isFirstSegment` assumption in `buildMultiTaskSubtiledRegions`.**
+5. **The `isFirstSegment` assumption in `buildMultiTaskSubtiledRegions`.**
    After merge-and-reorder, the first segment may not use the split result
    (e.g., task 3 bias load segment). The unused split result tile arg is
    wasted. The setup region also clones the entire tmem_load → split chain
    unnecessarily.
+
+6. **Full e2e test coverage.** The `generate_subtiled_region=True` parameter
+   is added to `test_tutorial09_warp_specialization.py` and
+   `test_autows_addmm.py` but full test suite results are pending validation.
