@@ -167,7 +167,7 @@ void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp) {
       // TMA store lowering) were not planned by the memory planner and
       // cannot safely be rotated.
       if (allocOp->getParentOfType<scf::ForOp>())
-        continue;
+        return;
 
       auto bufferCopy = allocOp->getAttrOfType<IntegerAttr>("buffer.copy");
       if (!bufferCopy)

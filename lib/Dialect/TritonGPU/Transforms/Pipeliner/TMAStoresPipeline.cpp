@@ -89,52 +89,6 @@ static void lowerTMADescriptorCreation(scf::ForOp forOp) {
   triton::lowerTMADescriptors(forOp, schedule);
 }
 
-bool mlir::triton::mergeEarlyLoweredTMAStoreAllocs(scf::ForOp forOp) {
-  // Merge LocalAllocOp buffers used by early-lowered TMA stores that have
-  // the same shape and element type. This reduces SMEM usage and frees
-  // budget for double-buffering channel buffers.
-  SmallVector<ttng::AsyncTMACopyLocalToGlobalOp> tmaStores;
-  forOp.getBody()->walk<WalkOrder::PreOrder>([&](Operation *op) {
-    if (auto copyOp = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(op)) {
-      if (copyOp.getToken())
-        tmaStores.push_back(copyOp);
-    } else if (isa<scf::ForOp>(op)) {
-      return WalkResult::skip();
-    }
-    return WalkResult::advance();
-  });
-
-  if (tmaStores.empty())
-    return false;
-
-  DenseMap<std::pair<ArrayRef<int64_t>, Type>, Value> sharedAllocs;
-  bool changed = false;
-
-  for (auto copyOp : tmaStores) {
-    Value origAlloc = copyOp.getSrc();
-    auto allocOp = origAlloc.getDefiningOp<ttg::LocalAllocOp>();
-    if (!allocOp)
-      continue;
-    auto memDescType = cast<ttg::MemDescType>(origAlloc.getType());
-    auto key =
-        std::make_pair(memDescType.getShape(), memDescType.getElementType());
-    Value &sharedAlloc = sharedAllocs[key];
-    if (!sharedAlloc) {
-      sharedAlloc = origAlloc;
-      continue;
-    }
-    if (sharedAlloc == origAlloc)
-      continue;
-
-    // Redirect all in-loop users of this alloc to the shared one.
-    origAlloc.replaceAllUsesWith(sharedAlloc);
-    allocOp->erase();
-    changed = true;
-  }
-
-  return changed;
-}
-
 bool mlir::triton::pipelineEarlyLoweredTMAStores(scf::ForOp forOp) {
   // Convert early-lowered TMA stores from the token-based wait pattern to
   // the pendings-based pattern. At this point the LocalAllocOp has been
