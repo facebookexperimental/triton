@@ -474,14 +474,20 @@ Here `local_store` is a real DDG node (not synthetic) with `pipeline = MEM` and 
 
 #### selfLatency / latency Summary (Blackwell)
 
-| TTGIR Op | DDG Node(s) | selfLatency | latency | Pipeline |
-|----------|------------|----------:|--------:|----------|
-| `tt.descriptor_load` | `tma_load` (→buf) + `local_load` (←buf, synthetic) | 20 / 0 | 520 / 0 | MEM / NONE |
-| `tt.descriptor_store` | `tma_store` (←buf) | 20 | 600 | MEM |
-| `ttg.local_store` | `local_store` (→buf, real IR op) | 150 | 150 | MEM |
-| `ttng.tc_gen5_mma` | `mma` | 900 | 900 | TC |
-| `ttng.tmem_load` | `tmem_load` | 200 | 200 | TC |
-| CUDA/SFU ops | 1:1 | varies | = selfLatency | CUDA/SFU |
+| TTGIR Op | DDG Node(s) | selfLatency | transferLatency | latency | Pipeline |
+|----------|------------|----------:|----------------:|--------:|----------|
+| `tt.descriptor_load` | `tma_load` (→buf) + `local_load` (←buf, synthetic) | 30 / 0 | 520 / — | 1220 / 0 | MEM / NONE |
+| `tt.descriptor_store` | `tma_store` (←buf) | 30 | 520 | 1220 | MEM |
+| `ttg.local_store` | `local_store` (→buf, real IR op) | 150 | 150 | 150 | MEM |
+| `ttng.tc_gen5_mma` | `mma` | 30 | — | 900 | TC |
+| `ttng.tmem_load` | `tmem_load` | 200 | — | 200 | TC |
+| CUDA/SFU ops | 1:1 | varies | — | = selfLatency | CUDA/SFU |
+
+**selfLatency** is the issue cost — how long the SM's dispatch pipeline is busy before it can accept the next operation. For async ops (TMA loads/stores, MMA), this is much smaller than the full execution time because the hardware unit (TMA engine, tensor cores) runs independently after the SM issues the command.
+
+**transferLatency** is the full transfer/execution time on the hardware unit. For MEM ops, this is used as the edge weight from `tma_load` to `local_alloc` so that the alloc is placed at the correct cycle (when data actually arrives in SMEM), independent of the SM's dispatch cost.
+
+**latency** is the total time from op issue to result availability for consumers. For TMA loads: `transferLatency + kTMAAsyncOverhead` (DRAM round-trip). For MMA: the full tensor core execution time.
 
 ### 3. Functional Unit Mapping
 
@@ -515,7 +521,7 @@ Execution time per operation in cycles (from microbenchmarks):
 
 - Each pipeline can execute **one op at a time** per warpgroup
 - Distinct pipelines **can overlap** (MEM + TC + CUDA + SFU all concurrent)
-- An op **occupies** its pipeline for its full latency duration
+- An op **occupies** its pipeline for its **selfLatency** (issue cost), not its full execution time. For async ops (TMA, MMA), the hardware unit executes independently after the SM issues the command, so the pipeline is free to accept the next op after the issue cost
 
 ---
 
