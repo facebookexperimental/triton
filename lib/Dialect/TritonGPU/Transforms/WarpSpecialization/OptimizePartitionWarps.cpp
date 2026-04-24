@@ -164,6 +164,7 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
   SmallVector<unsigned> maxTensorRegs;
   for (Region *partition : wsOp.getPartitionRegions()) {
     unsigned &tensorRegs = maxTensorRegs.emplace_back(0);
+
     partition->walk([&](Operation *op) {
       for (Type type :
            llvm::concat<Type>(op->getOperandTypes(), op->getResultTypes())) {
@@ -308,7 +309,6 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
   for (auto [partition, newNumWarps, prevNumWarps, tensorRegs, estRegs] :
        llvm::zip(wsOp.getPartitionRegions(), partitionNumWarps,
                  wsOp.getPartitionNumWarps(), maxTensorRegs, estRegUsage)) {
-
     // "Guess" the register usage for each partition.
     estRegs = tensorRegs ? maxRegAutoWS : minRegAutoWS;
 

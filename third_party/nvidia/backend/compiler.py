@@ -393,8 +393,6 @@ class CUDABackend(BaseBackend):
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
                 passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
-            if knobs.nvidia.use_meta_ws:
-                passes.ttgpuir.add_optimize_partition_warps(pm)
         elif capability // 10 >= 10:
             passes.ttgpuir.add_fuse_nested_loops(pm)
             passes.common.add_canonicalizer(pm)
@@ -462,7 +460,7 @@ class CUDABackend(BaseBackend):
         passes.common.add_symbol_dce(pm)
         # Optimize the number of warps and registers after TMA lowering, so
         # that any local loads eliminated by TMA lowering do not inflate them.
-        if capability // 10 >= 10 and knobs.nvidia.use_meta_ws:
+        if capability // 10 >= 9 and knobs.nvidia.use_meta_ws:
             passes.ttgpuir.add_optimize_partition_warps(pm)
         nvidia.passes.ttnvgpuir.add_fence_insertion(pm, capability)
         nvidia.passes.ttnvgpuir.add_lower_mma(pm)
