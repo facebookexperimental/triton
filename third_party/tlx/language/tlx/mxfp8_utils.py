@@ -11,6 +11,92 @@ import triton.language.extra.tlx as tlx
 
 
 @triton.jit
+def _fused_amax_to_e8m0(amax, max_norm_rcp):
+    """
+    Fused amax-to-E8M0 scale conversion in a single PTX asm block.
+
+    Computes E8M0 biased exponent (RCEIL of amax / max_norm) and the
+    reciprocal quantization scale (power-of-two inv_scale) in one pass,
+    replacing ~8 separate Python/Triton operations.
+
+    Returns (e8m0_exp as uint32, inv_scale as float32).
+    Caller should cast e8m0_exp to uint8.
+    """
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .f32 fae_scale;
+            .reg .u32 fae_bits, fae_exp, fae_mantissa, fae_inv_exp, fae_inv_bits;
+            .reg .pred fae_has_mantissa;
+            mul.f32 fae_scale, $2, $3;
+            mov.b32 fae_bits, fae_scale;
+            bfe.u32 fae_exp, fae_bits, 23, 8;
+            and.b32 fae_mantissa, fae_bits, 0x7FFFFF;
+            setp.ne.u32 fae_has_mantissa, fae_mantissa, 0;
+            @fae_has_mantissa add.u32 fae_exp, fae_exp, 1;
+            min.u32 fae_exp, fae_exp, 254;
+            mov.u32 $0, fae_exp;
+            sub.u32 fae_inv_exp, 254, fae_exp;
+            shl.b32 fae_inv_bits, fae_inv_exp, 23;
+            mov.b32 $1, fae_inv_bits;
+        }
+        """,
+        "=r,=f,f,f",
+        [amax, max_norm_rcp],
+        dtype=(tl.uint32, tl.float32),
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _cvt_e4m3x4_f32(a):
+    """
+    Vectorized FP32 → FP8 E4M3 conversion using packed cvt.rn.satfinite.e4m3x2
+    instructions. Converts 4 float32 values to 4 packed FP8 values, avoiding
+    scalar conversions and PRMT byte-permute instructions.
+
+    The satfinite modifier saturates to ±448 (e4m3 max), eliminating the need
+    for an explicit clamp.
+    """
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .b16 lo, hi;
+            cvt.rn.satfinite.e4m3x2.f32 lo, $2, $1;
+            cvt.rn.satfinite.e4m3x2.f32 hi, $4, $3;
+            mov.b32 $0, {lo, hi};
+        }
+        """,
+        "=r,f,f,f,f",
+        [a],
+        dtype=tl.float8e4nv,
+        is_pure=True,
+        pack=4,
+    )
+
+
+@triton.jit
+def _cvt_e5m2x4_f32(a):
+    """Vectorized FP32 → FP8 E5M2 conversion. See _cvt_e4m3x4_f32."""
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .b16 lo, hi;
+            cvt.rn.satfinite.e5m2x2.f32 lo, $2, $1;
+            cvt.rn.satfinite.e5m2x2.f32 hi, $4, $3;
+            mov.b32 $0, {lo, hi};
+        }
+        """,
+        "=r,f,f,f,f",
+        [a],
+        dtype=tl.float8e5,
+        is_pure=True,
+        pack=4,
+    )
+
+
+@triton.jit
 def _compute_scale_and_quantize(
     data_block,
     VEC_SIZE: tl.constexpr,
@@ -21,66 +107,39 @@ def _compute_scale_and_quantize(
 
     Args:
         data_block: Input tensor of shape [BLOCK_M, BLOCK_K] in float32
-        BLOCK_SIZE: The MX block size (typically 32)
-        dtype: Target output dtype, either tl.float or torch.float8_e5m2
+        VEC_SIZE: The MX block size (typically 32)
+        dtype: Target output dtype, either tl.float8e4nv or tl.float8e5
 
     Returns:
-        scale_e8m0: E8M0 biased exponent scales [BLOCK_M, BLOCK_K // BLOCK_SIZE]
-        data_fp8: Quantized FP8 E4M3 data [BLOCK_M, BLOCK_K]
+        scale_e8m0: E8M0 biased exponent scales [BLOCK_M, BLOCK_K // VEC_SIZE]
+        data_fp8: Quantized FP8 data [BLOCK_M, BLOCK_K]
     """
-    # Get dimensions from constexpr
     BLOCK_M: tl.constexpr = data_block.shape[0]
     BLOCK_K: tl.constexpr = data_block.shape[1]
     NUM_SCALES: tl.constexpr = BLOCK_K // VEC_SIZE
 
-    # Constants for MXFP8 conversion
     if dtype == tl.float8e4nv:
-        # torch.finfo(torch.float8_e4m3fn).max
         FLOAT_MAX: tl.constexpr = 448.0
     else:
         tl.static_assert(dtype == tl.float8e5)
-        # torch.finfo(torch.float8_e5m2).max
         FLOAT_MAX: tl.constexpr = 57344.0
 
-    # Reshape to [BLOCK_M, NUM_SCALES, BLOCK_SIZE] for per-group operations
     data_reshaped = tl.reshape(data_block, [BLOCK_M, NUM_SCALES, VEC_SIZE])
 
-    # Compute max absolute value per group
-    # tl.max reduces along the last axis by default
     abs_data = tl.abs(data_reshaped)
     max_abs = tl.max(abs_data, axis=2)  # [BLOCK_M, NUM_SCALES]
 
-    # Compute descale = max_abs / FLOAT_MAX
-    descale = max_abs / FLOAT_MAX
+    scale_u32, quant_scale = _fused_amax_to_e8m0(max_abs, 1.0 / FLOAT_MAX)
+    scale_e8m0 = scale_u32.to(tl.uint8)
 
-    # Round descale up to the next power of 2 using exact bit manipulation (RCEIL).
-    # Adding 0x007FFFFF bumps the exponent by 1 unless the mantissa is already zero
-    # (i.e., the value is already an exact power of 2). This avoids precision issues
-    # with the floating-point log2/ceil approach.
-    descale_exponent = (descale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
-    descale_rounded = descale_exponent.to(tl.float32, bitcast=True)
-
-    # Extract E8M0 biased exponent: the IEEE 754 exponent field >> 23
-    scale_e8m0 = (descale_exponent >> 23).to(tl.uint8)  # [BLOCK_M, NUM_SCALES]
-
-    # Compute the quantization scale (reciprocal of the dequant scale).
-    # When descale_rounded is 0 (all values in the block are zero), use 0 to zero out data.
-    quant_scale = tl.where(descale_rounded == 0, 0.0, 1.0 / descale_rounded)
-
-    # Expand quant_scale for broadcasting: [BLOCK_M, NUM_SCALES, 1]
     quant_scale_expanded = tl.reshape(quant_scale, [BLOCK_M, NUM_SCALES, 1])
-
-    # Scale the data
     scaled_data = data_reshaped * quant_scale_expanded
-
-    # Clamp to FP8 E4M3 representable range
-    scaled_data = tl.clamp(scaled_data, -FLOAT_MAX, FLOAT_MAX)
-
-    # Reshape back to [BLOCK_M, BLOCK_K]
     data_scaled_flat = tl.reshape(scaled_data, [BLOCK_M, BLOCK_K])
 
-    # Cast to FP8 E4M3
-    data_fp8 = data_scaled_flat.to(dtype)
+    if dtype == tl.float8e4nv:
+        data_fp8 = _cvt_e4m3x4_f32(data_scaled_flat)
+    else:
+        data_fp8 = _cvt_e5m2x4_f32(data_scaled_flat)
 
     return scale_e8m0, data_fp8
 
@@ -160,20 +219,18 @@ def _amax_to_e8m0_and_quantize(
         tl.static_assert(dtype == tl.float8e5)
         FLOAT_MAX: tl.constexpr = 57344.0
 
-    max_abs = block_amax
-
-    descale = max_abs / FLOAT_MAX
-    descale_exponent = (descale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
-    descale_rounded = descale_exponent.to(tl.float32, bitcast=True)
-    scale_e8m0 = (descale_exponent >> 23).to(tl.uint8)
-    quant_scale = tl.where(descale_rounded == 0, 0.0, 1.0 / descale_rounded)
+    scale_u32, quant_scale = _fused_amax_to_e8m0(block_amax, 1.0 / FLOAT_MAX)
+    scale_e8m0 = scale_u32.to(tl.uint8)
 
     data_reshaped = tl.reshape(data_input, [BLOCK_M, NUM_SCALES, VEC_SIZE])
     quant_scale_expanded = tl.reshape(quant_scale, [BLOCK_M, NUM_SCALES, 1])
     scaled_data = data_reshaped * quant_scale_expanded
-    scaled_data = tl.clamp(scaled_data, -FLOAT_MAX, FLOAT_MAX)
     data_scaled_flat = tl.reshape(scaled_data, [BLOCK_M, BLOCK_K])
-    data_fp8 = data_scaled_flat.to(dtype)
+
+    if dtype == tl.float8e4nv:
+        data_fp8 = _cvt_e4m3x4_f32(data_scaled_flat)
+    else:
+        data_fp8 = _cvt_e5m2x4_f32(data_scaled_flat)
 
     return scale_e8m0, data_fp8
 
