@@ -207,7 +207,9 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
       if (isa<ttng::AsyncTMAGatherOp, ttng::AsyncTMAScatterOp>(op))
         *minWarps = 2;
       // TMEM ops require at least 4 warps to be able to read all lanes.
-      else if (isa<ttng::TMEMLoadOp, ttng::TMEMStoreOp, ttng::TMEMAllocOp>(op))
+      // WarpGroupDotOp requires a full warp group (4 warps).
+      else if (isa<ttng::TMEMLoadOp, ttng::TMEMStoreOp, ttng::TMEMAllocOp,
+                   ttng::WarpGroupDotOp>(op))
         *minWarps = 4;
     });
   }
