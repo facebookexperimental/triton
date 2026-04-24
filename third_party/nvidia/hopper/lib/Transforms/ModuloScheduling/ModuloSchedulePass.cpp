@@ -333,86 +333,8 @@ static void computeClusterIds(ttg::ScheduleLoop &loop) {
   }
 }
 
-/// Build a child ScheduleLoop for an inner scf.for loop (super-node).
-static unsigned buildChildScheduleLoop(scf::ForOp innerLoop,
-                                       ttg::ScheduleGraph &graph,
-                                       const ttg::LatencyModel &model) {
-  auto innerDDG = ttg::DataDependenceGraph::build(innerLoop, model);
-  unsigned loopId = graph.addLoop(innerLoop);
-  auto &schedLoop = graph.getLoop(loopId);
-
-  if (innerDDG.getNumNodes() == 0)
-    return loopId;
-
-  auto innerSched = ttg::runModuloScheduling(innerDDG);
-  if (failed(innerSched))
-    return loopId;
-
-  schedLoop.II = innerSched->II;
-  schedLoop.maxStage = innerSched->getMaxStage();
-
-  int tcStart = innerSched->II;
-  for (const auto &node : innerDDG.getNodes()) {
-    if (node.pipeline == ttg::HWPipeline::TC) {
-      auto it = innerSched->nodeToCycle.find(node.idx);
-      if (it != innerSched->nodeToCycle.end())
-        tcStart = std::min(tcStart, it->second);
-    }
-  }
-  schedLoop.prologueLatency = tcStart;
-
-  schedLoop.tripCount = kEstimatedTripCount;
-  schedLoop.tripCountIsEstimated = true;
-  {
-    auto lb = innerLoop.getLowerBound().getDefiningOp<arith::ConstantIntOp>();
-    auto ub = innerLoop.getUpperBound().getDefiningOp<arith::ConstantIntOp>();
-    auto step = innerLoop.getStep().getDefiningOp<arith::ConstantIntOp>();
-    if (lb && ub && step && step.value() > 0) {
-      int64_t tc = (ub.value() - lb.value() + step.value() - 1) / step.value();
-      if (tc > 0) {
-        schedLoop.tripCount = static_cast<int>(tc);
-        schedLoop.tripCountIsEstimated = false;
-      }
-    }
-  }
-
-  llvm::DenseMap<unsigned, unsigned> ddgToPipe;
-  for (const auto &ddgNode : innerDDG.getNodes()) {
-    unsigned nodeId = schedLoop.nodes.size();
-    ddgToPipe[ddgNode.idx] = nodeId;
-    auto sn = convertDDGNode(ddgNode, nodeId, *innerSched);
-
-    if (ddgNode.isSuperNode) {
-      if (auto nestedLoop = dyn_cast<scf::ForOp>(ddgNode.op)) {
-        unsigned childId = buildChildScheduleLoop(nestedLoop, graph, model);
-        sn.childPipelineId = childId;
-      }
-    }
-
-    schedLoop.nodes.push_back(sn);
-    schedLoop.opToNodeId[ddgNode.op] = nodeId;
-  }
-
-  for (const auto &ddgEdge : innerDDG.getEdges()) {
-    auto srcIt = ddgToPipe.find(ddgEdge.srcIdx);
-    auto dstIt = ddgToPipe.find(ddgEdge.dstIdx);
-    if (srcIt == ddgToPipe.end() || dstIt == ddgToPipe.end())
-      continue;
-    ttg::ScheduleEdge se;
-    se.srcId = srcIt->second;
-    se.dstId = dstIt->second;
-    se.latency = ddgEdge.latency;
-    se.distance = ddgEdge.distance;
-    schedLoop.edges.push_back(se);
-  }
-
-  // Step 2.5: compute cluster IDs
-  computeClusterIds(schedLoop);
-
-  return loopId;
-}
-
-/// Build the top-level ScheduleLoop for a scheduled loop.
+/// Build a ScheduleLoop for a loop. For super-nodes (nested loops), builds
+/// its own DDG and schedule recursively — works at any nesting depth.
 static unsigned buildScheduleLoop(scf::ForOp loop,
                                   const ttg::DataDependenceGraph &ddg,
                                   const ttg::ModuloScheduleResult &sched,
@@ -457,14 +379,21 @@ static unsigned buildScheduleLoop(scf::ForOp loop,
 
     if (ddgNode.isSuperNode) {
       if (auto innerLoop = dyn_cast<scf::ForOp>(ddgNode.op)) {
-        unsigned childId = buildChildScheduleLoop(innerLoop, graph, model);
-        sn.childPipelineId = childId;
-        // Do NOT overwrite sn.prologueLatency: it was copied from
-        // ddgNode.prologueLatency by convertDDGNode and represents the
-        // latency the parent scheduler actually used for this super-node's
-        // edge model. The child's recomputed prologueLatency belongs to
-        // the child ScheduleLoop's own metadata; for empty/unscheduled
-        // children it's 0 and would underestimate the super-node here.
+        auto childDDG = ttg::DataDependenceGraph::build(innerLoop, model);
+        if (childDDG.getNumNodes() > 0) {
+          auto childSched = ttg::runModuloScheduling(childDDG);
+          if (succeeded(childSched)) {
+            unsigned childId =
+                buildScheduleLoop(innerLoop, childDDG, *childSched,
+                                  graph, model);
+            sn.childPipelineId = childId;
+            sn.prologueLatency = graph.getLoop(childId).prologueLatency;
+          }
+        }
+        if (sn.childPipelineId == UINT_MAX) {
+          unsigned childId = graph.addLoop(innerLoop);
+          sn.childPipelineId = childId;
+        }
       }
     }
 
@@ -1359,27 +1288,124 @@ static void mergeNonOverlappingBuffers(ttg::ScheduleLoop &loop) {
 /// Top-level: build a ScheduleGraph from DDG + schedule result.
 /// Includes Phase 0 (DDG→nodes/edges), Step 2.5 (clusters),
 /// Step 3 (buffer allocation), Step 4.5 (merging), Step 4.6 (budget).
+///
+/// Cross-level SMEM propagation: parent loop SMEM is automatically
+/// reserved when checking child loop budgets, so nested loops share
+/// the global SMEM budget correctly at any nesting depth.
 static ttg::ScheduleGraph
 buildScheduleGraph(scf::ForOp loop, const ttg::DataDependenceGraph &ddg,
                    const ttg::ModuloScheduleResult &sched,
-                   const ttg::LatencyModel &model,
-                   int64_t smemReserved = 0) {
+                   const ttg::LatencyModel &model) {
   ttg::ScheduleGraph graph;
   buildScheduleLoop(loop, ddg, sched, graph, model);
 
   for (auto &schedLoop : graph.loops) {
-    // Step 3: Buffer allocation (cycle-based depths)
     allocateBuffersForLoop(schedLoop);
-
-    // Step 4.5: Merge non-overlapping buffers (before budget check —
-    // merging reduces memory footprint, giving tighter budget).
     mergeNonOverlappingBuffers(schedLoop);
-
-    // Step 4.6: Global memory budget check and reduction.
-    // smemReserved accounts for SMEM used by other simultaneously-live
-    // regions (e.g., inner loop buffers during outer loop execution).
-    reduceBuffersForBudget(schedLoop, smemReserved);
   }
+
+  llvm::DenseMap<unsigned, unsigned> parentMap;
+  for (auto &schedLoop : graph.loops)
+    for (auto &node : schedLoop.nodes)
+      if (node.childPipelineId != UINT_MAX)
+        parentMap[node.childPipelineId] = schedLoop.id;
+
+  llvm::DenseMap<unsigned, int64_t> loopSmem;
+  for (auto &schedLoop : graph.loops) {
+    int64_t ancestorSmem = 0;
+    for (unsigned id = schedLoop.id; parentMap.count(id);) {
+      id = parentMap[id];
+      auto it = loopSmem.find(id);
+      if (it != loopSmem.end())
+        ancestorSmem += it->second;
+    }
+    reduceBuffersForBudget(schedLoop, ancestorSmem);
+    loopSmem[schedLoop.id] = computeTotalSmem(schedLoop);
+  }
+
+  return graph;
+}
+
+// ============================================================================
+// Schedule a single loop
+// ============================================================================
+
+static std::optional<ttg::ScheduleGraph>
+scheduleOneLoop(scf::ForOp loop, const ttg::LatencyModel &model,
+                StringRef label) {
+  auto ddg = ttg::DataDependenceGraph::build(loop, model);
+  if (ddg.getNumNodes() == 0)
+    return std::nullopt;
+
+  LDBG(label << " DDG: " << ddg.getNumNodes() << " nodes, "
+             << ddg.getEdges().size() << " edges");
+
+  auto schedResult = ttg::runModuloScheduling(ddg);
+  if (failed(schedResult)) {
+    LDBG(label << " scheduling FAILED");
+    return std::nullopt;
+  }
+
+  LLVM_DEBUG(llvm::dbgs()
+             << "[PASS-A] " << label
+             << " Schedule: II=" << schedResult->II
+             << " ResMII=" << ddg.computeResMII()
+             << " RecMII=" << ddg.computeRecMII()
+             << " maxStage=" << schedResult->getMaxStage() << "\n");
+
+  LLVM_DEBUG({
+    for (const auto &node : ddg.getNodes()) {
+      auto it = schedResult->nodeToCycle.find(node.idx);
+      if (it == schedResult->nodeToCycle.end())
+        continue;
+      int cycle = it->second;
+      int stage = cycle / schedResult->II;
+      llvm::dbgs() << "[PASS-A]   N" << node.idx
+                   << "  cycle=" << cycle << "  stage=" << stage
+                   << "  " << ttg::getPipelineName(node.pipeline)
+                   << "  selfLat=" << node.selfLatency << "  ";
+      node.op->print(
+          llvm::dbgs(),
+          OpPrintingFlags().skipRegions().elideLargeElementsAttrs());
+      llvm::dbgs() << "\n";
+    }
+  });
+
+  auto graph = buildScheduleGraph(loop, ddg, *schedResult, model);
+
+  auto &schedLoop = graph.getLoop(0);
+
+  bool hasInnerLoop = false;
+  loop.getBody()->walk([&](scf::ForOp) { hasInnerLoop = true; });
+
+  if (hasInnerLoop) {
+    if (schedLoop.II != schedResult->II) {
+      LDBG(label << " budget adjusted II: " << schedResult->II << " → "
+           << schedLoop.II << ", maxStage=" << schedLoop.maxStage);
+      auto adjustedResult = *schedResult;
+      adjustedResult.II = schedLoop.II;
+      emitScheduleAttributes(loop, ddg, adjustedResult);
+    } else {
+      emitScheduleAttributes(loop, ddg, *schedResult);
+    }
+  } else {
+    emitMMAAnnotations(loop, ddg, *schedResult);
+
+    if (!loop->hasAttr(tt::kNumStagesAttrName)) {
+      int numStages = schedResult->getMaxStage() + 1;
+      auto ctx = loop.getContext();
+      loop->setAttr(tt::kNumStagesAttrName,
+                    IntegerAttr::get(IntegerType::get(ctx, 32), numStages));
+    }
+  }
+
+  LLVM_DEBUG({
+    llvm::dbgs() << "[PASS-A] === " << label << " ScheduleGraph ===\n";
+    graph.dump();
+  });
+
+  for (auto &op : loop.getBody()->without_terminator())
+    op.removeAttr("tt.modulo_cycle");
 
   return graph;
 }
@@ -1456,265 +1482,31 @@ struct ModuloSchedulePass
     for (int iteration = 0; iteration < kMaxIterations; ++iteration) {
       LDBG("=== Iterative scheduling: iteration " << iteration << " ===");
 
-      // Step 1: Find loops that directly contain MMA ops in their body
-      // (not nested). Unlike the original innermost-loop filter, this
-      // handles deeply nested kernels like FA backward where MMAs are at
-      // depth 3-4 with epilogue loops nested deeper.
-      SmallVector<scf::ForOp> innerLoops;
-      moduleOp.walk([&](scf::ForOp loop) {
-        // Check direct children of loop body for MMA/load ops.
-        bool hasTMALoad = false;
-        bool hasMMAv5 = false;
-        bool hasExistingAnnotation = false;
-        for (auto &op : loop.getBody()->without_terminator()) {
-          if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(&op))
-            hasTMALoad = true;
-          if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(&op))
-            hasTMALoad = true;
-          if (isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp>(&op)) {
-            hasMMAv5 = true;
-            if (op.hasAttr("tt.autows"))
-              hasExistingAnnotation = true;
-          }
-        }
-        if (!hasTMALoad && !hasMMAv5)
-          return;
-        // Skip loops that already have hand-tuned tt.autows annotations
-        // from Python attrs=. These are set at the Python level and
-        // propagated through accelerateMatmul. Re-annotating would
-        // override the hand-tuned schedule.
-        if (hasExistingAnnotation) {
-          LDBG("Skipping loop with existing tt.autows annotations");
-          return;
-        }
-        innerLoops.push_back(loop);
+    SmallVector<std::pair<scf::ForOp, unsigned>> loopsWithDepth;
+    moduleOp.walk([&](scf::ForOp loop) {
+      bool hasSchedulableOps = false;
+      loop->walk([&](Operation *op) {
+        if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp,
+                ttng::AsyncTMACopyGlobalToLocalOp,
+                ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp>(op))
+          hasSchedulableOps = true;
       });
+      if (!hasSchedulableOps)
+        return;
+      unsigned depth = 0;
+      for (auto parent = loop->getParentOfType<scf::ForOp>(); parent;
+           parent = parent->getParentOfType<scf::ForOp>())
+        ++depth;
+      loopsWithDepth.push_back({loop, depth});
+    });
+    llvm::sort(loopsWithDepth, [](const auto &a, const auto &b) {
+      return a.second < b.second;
+    });
 
-      LDBG("Found " << innerLoops.size() << " innermost loop(s)");
+    LDBG("Found " << loopsWithDepth.size() << " schedulable loop(s)");
 
-      for (auto innerLoop : innerLoops) {
-        // Build DDG for this inner loop.
-        auto ddg = ttg::DataDependenceGraph::build(innerLoop, model);
-        if (ddg.getNumNodes() == 0)
-          continue;
-
-        LDBG("DDG: " << ddg.getNumNodes() << " nodes, " << ddg.getEdges().size()
-                     << " edges");
-
-        // Run modulo scheduling.
-        // Count key ops for diagnostics.
-        int nMEM = 0, nTC = 0, nCUDA = 0, nSFU = 0, nNONE = 0;
-        for (const auto &node : ddg.getNodes()) {
-          switch (node.pipeline) {
-          case ttg::HWPipeline::MEM:
-            nMEM++;
-            break;
-          case ttg::HWPipeline::TC:
-            nTC++;
-            break;
-          case ttg::HWPipeline::CUDA:
-            nCUDA++;
-            break;
-          case ttg::HWPipeline::SFU:
-            nSFU++;
-            break;
-          case ttg::HWPipeline::NONE:
-            nNONE++;
-            break;
-          }
-        }
-        LDBG("Running scheduling on "
-             << ddg.getNumNodes() << " nodes (MEM=" << nMEM << " TC=" << nTC
-             << " CUDA=" << nCUDA << " SFU=" << nSFU << " NONE=" << nNONE
-             << ")");
-        auto schedResult = ttg::runModuloScheduling(ddg);
-        if (failed(schedResult)) {
-          LDBG("Scheduling FAILED");
-          continue;
-        }
-        LDBG("Scheduling SUCCESS: II=" << schedResult->II);
-
-        LLVM_DEBUG(llvm::dbgs()
-                   << "[PASS-A] Schedule: II=" << schedResult->II << " ResMII="
-                   << ddg.computeResMII() << " RecMII=" << ddg.computeRecMII()
-                   << " maxStage=" << schedResult->getMaxStage() << "\n");
-
-        // Log per-node schedule.
-        LLVM_DEBUG({
-          for (const auto &node : ddg.getNodes()) {
-            auto it = schedResult->nodeToCycle.find(node.idx);
-            if (it == schedResult->nodeToCycle.end())
-              continue;
-            int cycle = it->second;
-            int stage = cycle / schedResult->II;
-            llvm::dbgs() << "[PASS-A]   N" << node.idx << "  cycle=" << cycle
-                         << "  stage=" << stage << "  "
-                         << ttg::getPipelineName(node.pipeline)
-                         << "  selfLat=" << node.selfLatency << "  ";
-            node.op->print(
-                llvm::dbgs(),
-                OpPrintingFlags().skipRegions().elideLargeElementsAttrs());
-            llvm::dbgs() << "\n";
-          }
-        });
-
-        // Emit tt.autows annotations on MMA ops instead of loop.stage attrs.
-        // tt.autows survives through the WS pass (which preserves discardable
-        // attrs on MMA ops) and is read by scheduleKeyOpsAnnotation() inside
-        // the WS pass's internal scheduleLoops call.
-        //
-        // We don't emit loop.stage/loop.cluster here because:
-        // 1. The WS pass's scheduleLoops overwrites them anyway
-        // 2. Their presence sets stageAssigned=true which disables
-        //    annotation-based scheduling in scheduleLoops
-        //
-        // emitMMAAnnotations internally skips annotation when all MMAs end
-        // up in the same stage (no multi-stage partition found).
-        emitMMAAnnotations(innerLoop, ddg, *schedResult);
-
-        // Emit tt.num_stages so downstream pipelining recognises this loop
-        // as scheduled. Even single-stage (maxStage=0) loops need the attr
-        // present — without it, they're treated as unpipelined and skip
-        // latency/buffering behaviour.
-        if (!innerLoop->hasAttr(tt::kNumStagesAttrName)) {
-          int numStages = schedResult->getMaxStage() + 1;
-          auto ctx = innerLoop.getContext();
-          innerLoop->setAttr(
-              tt::kNumStagesAttrName,
-              IntegerAttr::get(IntegerType::get(ctx, 32), numStages));
-        }
-
-        // Build ScheduleGraph for analysis/debug.
-        auto pipelineGraph =
-            buildScheduleGraph(innerLoop, ddg, *schedResult, model);
-
-        LLVM_DEBUG({
-          llvm::dbgs() << "[PASS-A] === Inner Loop ScheduleGraph ===\n";
-          pipelineGraph.dump();
-        });
-        if (printScheduleGraph) {
-          llvm::errs() << "[PASS-A] === Inner Loop ScheduleGraph ===\n";
-          pipelineGraph.dump(llvm::errs());
-        }
-
-        // Clean up tt.modulo_cycle — internal attr, not needed downstream.
-        for (auto &op : innerLoop.getBody()->without_terminator())
-          op.removeAttr("tt.modulo_cycle");
-      }
-
-      // Step 2: Schedule outer loops (persistent kernels).
-      SmallVector<scf::ForOp> outerLoops;
-      moduleOp.walk([&](scf::ForOp loop) {
-        bool hasInnerLoop = false;
-        loop.getBody()->walk([&](scf::ForOp) { hasInnerLoop = true; });
-        if (!hasInnerLoop)
-          return;
-        if (loop->getParentOfType<scf::ForOp>())
-          return;
-        outerLoops.push_back(loop);
-      });
-
-      LDBG("Found " << outerLoops.size() << " outer loop(s)");
-
-      for (auto outerLoop : outerLoops) {
-        auto outerDDG = ttg::DataDependenceGraph::build(outerLoop, model);
-        if (outerDDG.getNumNodes() == 0)
-          continue;
-
-        LDBG("Outer DDG: " << outerDDG.getNumNodes() << " nodes, "
-                           << outerDDG.getEdges().size() << " edges");
-
-        auto outerSched = ttg::runModuloScheduling(outerDDG);
-        if (failed(outerSched)) {
-          LDBG("Outer scheduling FAILED");
-          continue;
-        }
-
-        LDBG("Outer schedule: II="
-             << outerSched->II << " ResMII=" << outerDDG.computeResMII()
-             << " RecMII=" << outerDDG.computeRecMII()
-             << " maxStage=" << outerSched->getMaxStage());
-
-        // Log per-node outer DDG schedule.
-        LLVM_DEBUG({
-          for (const auto &node : outerDDG.getNodes()) {
-            auto it = outerSched->nodeToCycle.find(node.idx);
-            if (it == outerSched->nodeToCycle.end())
-              continue;
-            int cycle = it->second;
-            int stage = cycle / outerSched->II;
-            llvm::dbgs() << "[PASS-A]   N" << node.idx << "  cycle=" << cycle
-                         << "  stage=" << stage << "  "
-                         << ttg::getPipelineName(node.pipeline)
-                         << "  selfLat=" << node.selfLatency << "  "
-                         << node.op->getName().getStringRef() << "\n";
-          }
-        });
-
-        // Build ScheduleGraph for outer loop.
-        auto outerGraph =
-            buildScheduleGraph(outerLoop, outerDDG, *outerSched, model);
-
-        LLVM_DEBUG({
-          llvm::dbgs() << "[PASS-A] === Outer Loop ScheduleGraph ===\n";
-          outerGraph.dump();
-        });
-        if (printScheduleGraph) {
-          llvm::errs()
-              << "[PASS-A] === Outer Loop ScheduleGraph (BEFORE expand) ===\n";
-          outerGraph.dump(llvm::errs());
-        }
-
-        // Kernel-wide SMEM budget check: the inner loop's buffers and
-        // the outer loop's buffers are live simultaneously. If their
-        // combined SMEM exceeds the budget, re-run the inner loop's
-        // budget check with the outer loop's SMEM reserved.
-        int64_t outerSmem = computeTotalSmem(outerGraph.getLoop(0));
-        if (outerSmem > 0 && !innerLoops.empty()) {
-          LDBG("Kernel-wide check: outer SMEM=" << outerSmem);
-          for (auto innerLoop : innerLoops) {
-            auto innerDDG =
-                ttg::DataDependenceGraph::build(innerLoop, model);
-            if (innerDDG.getNumNodes() == 0)
-              continue;
-            auto innerSched = ttg::runModuloScheduling(innerDDG);
-            if (failed(innerSched))
-              continue;
-
-            auto innerGraph = buildScheduleGraph(innerLoop, innerDDG,
-                                                 *innerSched, model,
-                                                 outerSmem);
-            auto &innerSchedLoop = innerGraph.getLoop(0);
-
-            if (innerSchedLoop.II != innerSched->II) {
-              LDBG("Kernel-wide: inner II adjusted "
-                   << innerSched->II << " → " << innerSchedLoop.II
-                   << ", maxStage=" << innerSchedLoop.maxStage
-                   << " (outer SMEM reserved " << outerSmem << " B)");
-              auto adjustedResult = *innerSched;
-              adjustedResult.II = innerSchedLoop.II;
-              emitScheduleAttributes(innerLoop, innerDDG, adjustedResult);
-            }
-
-            LLVM_DEBUG({
-              llvm::dbgs()
-                  << "[PASS-A] === Inner Loop ScheduleGraph (kernel-wide) "
-                     "===\n";
-              innerGraph.dump();
-            });
-
-            for (auto &op : innerLoop.getBody()->without_terminator())
-              op.removeAttr("tt.modulo_cycle");
-          }
-        }
-
-        // Emit outer loop schedule attrs for downstream passes.
-        emitScheduleAttributes(outerLoop, outerDDG, *outerSched);
-
-        // Clean up tt.modulo_cycle — internal attr, not needed downstream.
-        for (auto &op : outerLoop.getBody()->without_terminator())
-          op.removeAttr("tt.modulo_cycle");
-      }
+    for (auto &[loop, depth] : loopsWithDepth)
+      scheduleOneLoop(loop, model, "Loop");
 
       // ================================================================
       // Iterative refinement: apply DDG transformations and check if
