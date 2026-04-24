@@ -197,6 +197,28 @@ def TritonNvidiaGPULowerSubtiledRegionPass
   ];
 }
 
+def TritonNvidiaGPUPostSubtileWaitReorderPass
+    : Pass<"triton-nvidia-gpu-post-subtile-wait-reorder", "mlir::ModuleOp"> {
+  let summary = "Reorder TMA store waits after subtiled region lowering";
+
+  let description = [{
+    After LowerSubtiledRegion unrolls SubtiledRegionOps into flat code,
+    TMA store token waits annotated with `can_rotate_by_buffer_count`
+    become direct children of the enclosing scf.for. This pass reorders
+    those waits to overlap TMA store completion with subsequent computation,
+    using the same rotation logic as doTMAStoreWaitReorder but operating
+    on the post-lowering flat IR.
+
+    Safety guards: only fires on loops with annotated waits, validates
+    buffer.copy consistency, and skips the entire loop if any wait fails
+    validation.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 def TritonNvidiaGPUTestGenerateSubtiledRegionPass
     : Pass<"triton-nvidia-gpu-test-generate-subtiled-region", "mlir::ModuleOp"> {
   let summary = "Test pass: generate subtiled_region ops from split patterns";

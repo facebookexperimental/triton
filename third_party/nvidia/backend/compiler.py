@@ -448,6 +448,8 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_coalesce_async_copy(pm)
         nvidia.passes.ttnvgpuir.add_optimize_tmem_layouts(pm)
         nvidia.passes.ttnvgpuir.add_lower_subtiled_region(pm)
+        nvidia.passes.ttnvgpuir.add_post_subtile_wait_reorder(pm)
+        passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
         if capability // 10 >= 9:
             nvidia.passes.ttnvgpuir.add_tma_lowering(pm)
             nvidia.passes.ttnvgpuir.add_tma_store_buffer_reuse(pm)
