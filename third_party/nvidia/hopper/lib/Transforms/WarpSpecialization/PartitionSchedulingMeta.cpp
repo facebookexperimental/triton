@@ -850,7 +850,9 @@ static PartitionLayout createPartitionLayout(PartitionSet &schedule,
   }
 
   // Epilogue store partition: dedicated 1-warp partition for epilogue stores.
-  if (options.separateEpilogueStore && hasEpilogue) {
+  // When deferLoadPartition is true, defer creation so computation
+  // partitions get lower indices (= default region).
+  if (options.separateEpilogueStore && hasEpilogue && !deferLoadPartition) {
     layout.epilogueStorePartition = schedule.addPartition(0);
     layout.epilogueStorePartition->setType("epilogue_store");
   }
@@ -1260,6 +1262,13 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
       llvm::sort(sortedDpIds, std::greater<unsigned>());
       for (unsigned dpId : sortedDpIds)
         dpIdToPartition[dpId] = layout.makeDefaultPartition(schedule);
+
+      // Create epilogue_store after computation partitions so it doesn't
+      // become the default.
+      if (localSchedOpts.separateEpilogueStore) {
+        layout.epilogueStorePartition = schedule.addPartition(0);
+        layout.epilogueStorePartition->setType("epilogue_store");
+      }
 
       // Create the load partition last so it gets the highest index
       // (producer warp group).
