@@ -23,6 +23,7 @@ struct DDGNode {
   HWPipeline pipeline{HWPipeline::NONE};
   int latency{};
   int selfLatency{};
+  int transferLatency{};
   bool isSuperNode{false}; // True if this node represents an inner loop
   int innerII{0};          // If super-node, the inner loop's II
   int prologueLatency{0};  // If super-node, cycles before TC starts (MEM busy)

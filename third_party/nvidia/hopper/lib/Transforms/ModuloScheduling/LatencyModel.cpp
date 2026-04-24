@@ -65,6 +65,19 @@ static constexpr TMALatencyEntry kTMALoadTable[] = {
 // hierarchy (L2/DRAM) and arrive in SMEM. On top of pipeline occupancy.
 constexpr int kTMAAsyncOverhead = 700;
 
+// Issue latency for async TMA operations. The SM spends this many cycles
+// programming the TMA descriptor and triggering the copy, then the TMA engine
+// runs independently. This is the MEM pipeline occupancy (selfLatency), NOT
+// the full transfer time — the transfer time only affects edge weights (when
+// data becomes available to consumers).
+constexpr int kTMAIssueLatency = 30;
+
+// Issue latency for async MMA operations (tcgen05.mma on Blackwell).
+// The SM issues the MMA instruction to the tensor cores asynchronously,
+// then the TC hardware executes independently. The SM can issue subsequent
+// instructions (including more MMAs) after the issue cost.
+constexpr int kMMAIssueLatency = 30;
+
 /// Look up TMA load occupancy by total bytes. Table lookup first, then
 /// linear interpolation from 128x64 baseline as fallback.
 static int lookupTMALoadOccupancy(int64_t totalBytes) {
@@ -349,7 +362,7 @@ OpLatencyInfo LatencyModel::getLatency(Operation *op) const {
     // loads (e.g., FA backward with 6 MEM ops would need ResMII=3400+).
     selfLatency = 1;
     latency = occupancy + kTMAAsyncOverhead;
-    break;
+    return OpLatencyInfo{pipeline, latency, selfLatency, occupancy};
   }
   case HWPipeline::TC:
     latency = getMMALatency(op);
@@ -377,7 +390,7 @@ OpLatencyInfo LatencyModel::getLatency(Operation *op) const {
     break;
   }
 
-  return OpLatencyInfo{pipeline, latency, selfLatency};
+  return OpLatencyInfo{pipeline, latency, selfLatency, selfLatency};
 }
 
 } // namespace mlir::triton::gpu

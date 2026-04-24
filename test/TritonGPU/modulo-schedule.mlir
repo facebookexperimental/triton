@@ -18,7 +18,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CHECK-NOT: loop.stage
 // CHECK-NOT: loop.cluster
 // CHECK-NOT: tt.autows
-// CHECK: tt.num_stages = 2 : i32
+// CHECK: tt.num_stages = 3 : i32
 tt.func @gemm_inner_loop(
   %a_desc: !tt.tensordesc<tensor<128x64xf16>>,
   %b_desc: !tt.tensordesc<tensor<64x128xf16>>
