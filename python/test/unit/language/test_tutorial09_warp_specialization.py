@@ -469,6 +469,7 @@ def _reduce_k_kernel(
 @pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
+@pytest.mark.parametrize("generate_subtiled_region", [True, False])
 @pytest.mark.parametrize("separate_epilogue_store", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tutorial09_matmul_tma_warp_specialize(
@@ -485,9 +486,11 @@ def test_tutorial09_matmul_tma_warp_specialize(
     use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     SMEM_ALLOC_ALGO,
+    generate_subtiled_region,
     separate_epilogue_store,
 ):
     """Test matmul_kernel_tma with warp_specialize=True (K-loop based)."""
+
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
@@ -556,6 +559,7 @@ def test_tutorial09_matmul_tma_warp_specialize(
             num_stages=num_stages,
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
+            generate_subtiled_region=generate_subtiled_region,
         )
 
         # Verify IR contains warp_specialize
@@ -586,6 +590,7 @@ def test_tutorial09_matmul_tma_warp_specialize(
 @pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
+@pytest.mark.parametrize("generate_subtiled_region", [True, False])
 @pytest.mark.parametrize("separate_epilogue_store", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tutorial09_matmul_tma_persistent_warp_specialize(
@@ -604,9 +609,11 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     SMEM_ALLOC_ALGO,
+    generate_subtiled_region,
     separate_epilogue_store,
 ):
     """Test matmul_kernel_tma_persistent with warp_specialize=True for both Flatten values."""
+
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
@@ -715,6 +722,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
             num_stages=num_stages,
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
+            generate_subtiled_region=generate_subtiled_region,
         )
 
         # Verify IR contains expected ops
@@ -745,6 +753,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 @pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
+@pytest.mark.parametrize("generate_subtiled_region", [True, False])
 @pytest.mark.parametrize("separate_epilogue_store", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
@@ -763,9 +772,11 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     SMEM_ALLOC_ALGO,
+    generate_subtiled_region,
     separate_epilogue_store,
 ):
     """Test matmul_kernel_descriptor_persistent with warp_specialize=True for both Flatten values."""
+
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
@@ -840,6 +851,7 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
             num_stages=num_stages,
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
+            generate_subtiled_region=generate_subtiled_region,
         )
 
         # Verify IR contains expected ops

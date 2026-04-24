@@ -139,10 +139,19 @@ getDistributedLayoutForTmemLdSt(gpu::MemDescType memType, TMemAccessAtom atom,
                                 unsigned numWarps,
                                 gpu::CGAEncodingAttr cgaLayout);
 
+/// Attribute name for stable op IDs on tile body ops. Used by barrier
+/// and token annotations to reference ops that survive tile body
+/// transformations (insertions, reorderings).
+inline constexpr const char *kSubtileOpId = "subtile_op_id";
+
 /// Lower a single SubtiledRegionOp into flat IR with barrier insertion.
 /// This is the core logic shared by the LowerSubtiledRegion pass and
 /// the WS code partition pre-lowering for multi-task subtiled regions.
 void lowerSubtiledRegion(SubtiledRegionOp op);
+
+/// Push shared setup ops into the tile body of a SubtiledRegionOp.
+/// Called from OptimizeTMemLayouts after tmem layout patterns have fired.
+void pushSubtiledRegionSetupToTile(SubtiledRegionOp op);
 
 } // namespace mlir::triton::nvidia_gpu
 

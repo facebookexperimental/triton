@@ -529,3 +529,55 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// Test: barrier annotations produced by token→barrier conversion.
+// This mirrors the output of WSLowerToken's SubtiledRegionOp handling:
+//   consumer_wait → wait_barrier (barrierIdx=0, numBuffers=1)
+//   consumer_release → arrive_barrier (barrierIdx=1, numBuffers=1)
+// The wait fires BEFORE the first op on all tiles; the arrive fires
+// AFTER the last op on all tiles.
+
+#shared10 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem10 = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+
+  // CHECK-LABEL: @token_converted_barriers
+  // Tile 0: wait → compute → (no arrive, tileMask=[0,1])
+  // CHECK: ttng.wait_barrier %arg0
+  // CHECK: arith.addi
+  // Tile 1: wait → compute → arrive (tileMask=[0,1] enables tile 1)
+  // CHECK: ttng.wait_barrier %arg0
+  // CHECK: arith.addi
+  // CHECK: ttng.arrive_barrier %arg0, 1
+  // CHECK-NOT: ttng.subtiled_region
+  tt.func @token_converted_barriers(
+      %bar: !ttg.memdesc<1xi64, #shared10, #smem10, mutable>,
+      %accum_cnt: i64) {
+    ttng.subtiled_region
+        barriers(%bar : !ttg.memdesc<1xi64, #shared10, #smem10, mutable>)
+        accum_cnts(%accum_cnt : i64)
+        tile_mappings = [array<i32: 0>, array<i32: 1>]
+        barrier_annotations = [
+          #ttng.barrier_annotation<barrierIdx = 0, placement = before,
+              targetOpIdx = 0, barrierOpKind = "wait_barrier",
+              numBuffers = 1>,
+          #ttng.barrier_annotation<barrierIdx = 0, placement = after,
+              targetOpIdx = 0, barrierOpKind = "arrive_barrier",
+              numBuffers = 1, tileMask = [0, 1]>
+        ]
+      setup {
+        %c0 = arith.constant 0 : i32
+        %c1 = arith.constant 1 : i32
+        ttng.subtiled_region_yield %c0, %c1 : i32, i32
+      } tile(%arg0: i32) {
+        %sum = arith.addi %arg0, %arg0 {subtile_op_id = 0 : i32} : i32
+        ttng.subtiled_region_yield
+      } teardown {
+        ttng.subtiled_region_yield
+      }
+    tt.return
+  }
+}
