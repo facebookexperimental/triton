@@ -151,6 +151,7 @@ public:
 // TensorLayout
 //===----------------------------------------------------------------------===//
 
+/// Tracks the required register encoding for RankedTensor values.
 class TensorLayout {
 public:
   /// Construct a TensorLayout value as uninitialized.

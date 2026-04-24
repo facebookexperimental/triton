@@ -149,7 +149,7 @@ isTransparentDotUserBeforeConstraintMaterialization(Operation *op,
   // insert pass sees raw tt.dot users and the convert_layout chain that still
   // connects them to local_load. After those converts are rewritten into
   // explicit tlx.require_layout anchors, tlx-propagate-layout enforces the same
-  // transparent-carrier policy from the tensor constraints instead.
+  // transparent-carrier policy from the tlx.require_layout anchors instead.
   if (auto dotOp = dyn_cast<tt::DotOp>(op))
     return operandIndex < 2 && operandIndex < dotOp->getNumOperands();
 
@@ -208,35 +208,31 @@ public:
   }
 
   void visitBranchOperand(OpOperand &operand) override {
-    if (!isTrackedDotValue(operand.get()))
-      return;
-
-    auto *lattice = getLatticeElement(operand.get());
-    DotRewriteState state = lattice->getValue();
-    if (state.isUninitialized())
-      return;
-
-    ChangeResult changed = lattice->meet(DotRewriteState::getIllegal());
-    propagateIfChanged(lattice, changed);
+    poisonUnhandledCase(operand);
   }
 
   void visitCallOperand(OpOperand &operand) override {
-    if (!isTrackedDotValue(operand.get()))
-      return;
-
-    auto *lattice = getLatticeElement(operand.get());
-    DotRewriteState state = lattice->getValue();
-    if (state.isUninitialized())
-      return;
-
-    ChangeResult changed = lattice->meet(DotRewriteState::getIllegal());
-    propagateIfChanged(lattice, changed);
+    poisonUnhandledCase(operand);
   }
 
   void
   visitNonControlFlowArguments(RegionSuccessor &successor,
                                ArrayRef<BlockArgument> arguments) override {}
   void setToExitState(DotRewriteLattice *lattice) override {}
+
+private:
+  void poisonUnhandledCase(OpOperand &operand) {
+    if (!isTrackedDotValue(operand.get()))
+      return;
+
+    auto *lattice = getLatticeElement(operand.get());
+    DotRewriteState state = lattice->getValue();
+    if (state.isUninitialized())
+      return;
+
+    ChangeResult changed = lattice->meet(DotRewriteState::getIllegal());
+    propagateIfChanged(lattice, changed);
+  }
 };
 
 // ============================================================================
@@ -328,6 +324,8 @@ LogicalResult insertRequireLayout(ModuleOp m) {
   LDBG("insertRequireLayout");
 
   // --- Run backward dataflow analysis ---
+  // SparseBackwardDataFlowAnalysis requires a SymbolTableCollection even though
+  // this analysis does not query symbol tables directly.
   SymbolTableCollection symbolTable;
   DataFlowSolver solver;
   loadBaselineAnalyses(solver);
@@ -350,6 +348,10 @@ LogicalResult insertRequireLayout(ModuleOp m) {
 
     if (lattice->getValue().isIllegal() || lattice->getValue().isConflict()) {
       LDBG("Skipping local_load rewrite due to state: " << lattice->getValue());
+      localLoadOp->emitRemark()
+          << "dot operand layout constraint cannot be folded into local_load "
+             "because the value has incompatible users or conflicting dot "
+             "requirements";
       return;
     }
 

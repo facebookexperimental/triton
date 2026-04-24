@@ -46,10 +46,8 @@ def TlxPropagateLayout : Pass<"tlx-propagate-layout", "mlir::ModuleOp"> {
     - validating post-conditions such as the absence of unresolved
       DummyTMEMLayoutAttr allocations
 
-    Tensor constraints are expected to be either eliminated or lowered to
-    `ttg.convert_layout`. Memdesc constraints usually fold into retagged types,
-    but may remain explicit when propagation conservatively falls back on an
-    unknown/conflicting layout.
+    Tensor and memdesc constraints are either folded away when propagation
+    successfully retags the producer, or lowered to `ttg.convert_layout`.
   }];
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
