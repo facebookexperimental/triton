@@ -793,6 +793,7 @@ struct WSBuffer {
   unsigned numCopies;
   WSBufferPriority priority;
   bool isPinned = false; // Set by user annotation; skips heuristic phases.
+  bool isTMAStoreStaging = false; // Buffer used for TMA store staging.
 };
 
 /// Parsed channel annotation from tt.autows JSON on an MMA op.
@@ -1146,6 +1147,10 @@ static unsigned computeTotalSmem(const SmallVector<WSBuffer> &wsBuffers) {
   DenseMap<unsigned, std::pair<unsigned, unsigned>>
       idInfo; // id -> (maxSize, copies)
   for (const auto &buf : wsBuffers) {
+    // TMA store staging buffers live outside the pipelined inner loop
+    // and don't compete with channel buffers for pipeline depth.
+    if (buf.isTMAStoreStaging)
+      continue;
     auto it = idInfo.find(buf.bufferId);
     if (it == idInfo.end()) {
       idInfo[buf.bufferId] = {buf.sizeBytes, buf.numCopies};
@@ -1160,15 +1165,23 @@ static unsigned computeTotalSmem(const SmallVector<WSBuffer> &wsBuffers) {
   return total;
 }
 
-/// Group P2_Other WSBuffers by their original load op and assign the same
-/// buffer.id to buffers within each group that have compatible types/sizes.
+/// Group P2_Other WSBuffers by their original load op (or by compatible
+/// type/size for TMA store staging buffers) and assign the same buffer.id
+/// to buffers within each group.
 static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
                                   SmallVector<Channel *> &channels) {
   DenseMap<Operation *, SmallVector<unsigned>> loadGroups;
+  // TMA store staging buffers don't have channels — group them by a
+  // sentinel key (nullptr) since they're all compatible by construction.
+  SmallVector<unsigned> tmaStoreIndices;
   for (unsigned i = 0; i < wsBuffers.size(); ++i) {
     auto &buf = wsBuffers[i];
     if (buf.priority != WSBufferPriority::P2_Other)
       continue;
+    if (buf.isTMAStoreStaging) {
+      tmaStoreIndices.push_back(i);
+      continue;
+    }
     Channel *ch = findChannelForOp(buf.allocOp, channels);
     Operation *origLoad = findOriginalLoadForChannel(ch);
     if (!origLoad)
@@ -1176,10 +1189,9 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
     loadGroups[origLoad].push_back(i);
   }
 
-  for (auto &[origLoad, indices] : loadGroups) {
+  auto mergeGroup = [&](ArrayRef<unsigned> indices, const char *label) {
     if (indices.size() < 2)
-      continue;
-
+      return;
     SmallVector<Operation *> allocs;
     SmallVector<unsigned> sizes;
     for (unsigned idx : indices) {
@@ -1187,14 +1199,18 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
       sizes.push_back(wsBuffers[idx].sizeBytes);
     }
     if (!allAllocsCompatible(allocs, sizes))
-      continue;
-
+      return;
     unsigned sharedId = wsBuffers[indices[0]].bufferId;
     for (unsigned k = 1; k < indices.size(); ++k)
       wsBuffers[indices[k]].bufferId = sharedId;
-    LDBG("Phase 3.5 (epilogue fusion): merged "
-         << indices.size() << " P2_Other buffers into bufferId=" << sharedId);
-  }
+    LDBG("Phase 3.5 (" << label << "): merged " << indices.size()
+                       << " buffers into bufferId=" << sharedId);
+  };
+
+  for (auto &[origLoad, indices] : loadGroups)
+    mergeGroup(indices, "epilogue fusion");
+
+  mergeGroup(tmaStoreIndices, "TMA store staging fusion");
 }
 
 /// Phase 4.5: Iterative copy increase for fused P2_Other groups.
@@ -1300,12 +1316,22 @@ static unsigned allocateSmemBuffers(
            << buf.bufferId << " numCopies=" << buf.numCopies);
     }
 
+    // Detect TMA store staging buffers: allocs whose users include
+    // AsyncTMACopyLocalToGlobalOp (from early TMA store lowering).
+    for (auto user : alloc->getUsers()) {
+      if (isa<ttng::AsyncTMACopyLocalToGlobalOp>(user)) {
+        buf.isTMAStoreStaging = true;
+        break;
+      }
+    }
+
     wsBuffers.push_back(buf);
 
     LDBG("Phase 1: WSBuffer["
          << buf.bufferId << "] " << buf.sizeBytes << " bytes"
          << " innermost=" << buf.isInnermost << " TMA=" << buf.isTMA
-         << " crossStage=" << buf.isCrossStage << " pinned=" << buf.isPinned);
+         << " crossStage=" << buf.isCrossStage << " pinned=" << buf.isPinned
+         << " tmaStoreStaging=" << buf.isTMAStoreStaging);
   });
 
   if (wsBuffers.empty())
@@ -1538,6 +1564,31 @@ static unsigned allocateSmemBuffers(
                          IntegerAttr::get(i32Type, buf.numCopies));
     LDBG("Phase 5: WSBuffer[" << buf.bufferId << "] buffer.id=" << buf.bufferId
                               << " buffer.copy=" << buf.numCopies);
+  }
+
+  // ── Phase 6: Hoist in-loop TMA store allocs to before the loop ──────
+  // Early TMA store lowering creates local_alloc ops inside the loop.
+  // These must be hoisted so the pipeliner can rotate them by buffer.copy.
+  for (auto &buf : wsBuffers) {
+    auto allocOp = buf.allocOp;
+    if (auto forOp = allocOp->getParentOfType<scf::ForOp>()) {
+      bool feedsTMAStore = false;
+      for (auto user : allocOp->getUsers()) {
+        if (isa<ttng::AsyncTMACopyLocalToGlobalOp>(user)) {
+          feedsTMAStore = true;
+          break;
+        }
+      }
+      if (feedsTMAStore) {
+        // Walk to the outermost enclosing loop.
+        auto outermost = forOp;
+        while (auto parent = outermost->getParentOfType<scf::ForOp>())
+          outermost = parent;
+        allocOp->moveBefore(outermost);
+        LDBG("Phase 6: hoisted WSBuffer[" << buf.bufferId
+                                          << "] before outermost loop");
+      }
+    }
   }
 
   return nextBufferId;
