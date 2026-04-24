@@ -61,15 +61,11 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
 
     auto alloc = builder.create<ttg::LocalAllocOp>(loc, memDescType, src);
 
-    // Translate indices for TMA.
-    auto indices = ttng::translateTMAIndices(
-        builder, loc, desc.getType().getBlockType().getEncoding(),
-        storeOp.getIndices());
-
     // Async TMA copy from local (SMEM) to global, producing a token.
     auto tokenType = ttg::AsyncTokenType::get(ctx);
     auto tmaStore = builder.create<ttng::AsyncTMACopyLocalToGlobalOp>(
-        loc, tokenType, desc, indices, alloc, tt::EvictionPolicy::NORMAL);
+        loc, tokenType, desc, storeOp.getIndices(), alloc,
+        tt::EvictionPolicy::NORMAL);
     copyLoopScheduleAttrs(storeOp, tmaStore);
 
     // Wait for this specific TMA store to finish reading from SMEM.
