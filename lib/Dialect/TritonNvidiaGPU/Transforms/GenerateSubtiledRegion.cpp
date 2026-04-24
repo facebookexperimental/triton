@@ -818,7 +818,6 @@ static bool buildMultiTaskSubtiledRegionsN(
   // --- Generate a SubtiledRegionOp per segment ---
   for (size_t segIdx = 0; segIdx < segments.size(); ++segIdx) {
     auto &seg = segments[segIdx];
-    bool isFirstSegment = (segIdx == 0);
     bool hasOutgoing = (segIdx < transitions.size());
     bool hasIncoming = (segIdx > 0);
 
@@ -848,12 +847,24 @@ static bool buildMultiTaskSubtiledRegionsN(
       resolvedDiff.push_back({perTile, setupVals, needsLoad});
     }
 
+    // Check if this segment's task IDs match any setup op's task IDs.
+    // If so, this segment "owns" the setup — it clones the setup ops and
+    // gets the leaf values as tile args.
+    bool ownsSetup = false;
+    for (auto *op : setupOps) {
+      auto opTasks = getOpAsyncTaskIds(op);
+      if (!opTasks.empty() && opTasks == seg.taskIds) {
+        ownsSetup = true;
+        break;
+      }
+    }
+
     // Build tile arg types and N-way mappings.
     SmallVector<Type> tileArgTypes;
     SmallVector<SmallVector<int32_t>> tileMaps(numTiles);
     int32_t yieldIdx = 0;
 
-    if (isFirstSegment) {
+    if (ownsSetup) {
       tileArgTypes.push_back(leafValues[0].getType());
       for (unsigned t = 0; t < numTiles; ++t)
         tileMaps[t].push_back(yieldIdx + t);
@@ -898,7 +909,7 @@ static bool buildMultiTaskSubtiledRegionsN(
     OpBuilder setupBuilder = OpBuilder::atBlockEnd(setupBlock);
 
     SmallVector<Value> setupYields;
-    if (isFirstSegment) {
+    if (ownsSetup) {
       IRMapping setupMapping;
       for (Operation *op : setupOps)
         setupBuilder.clone(*op, setupMapping);
@@ -931,7 +942,7 @@ static bool buildMultiTaskSubtiledRegionsN(
     IRMapping tileMapping;
     unsigned argIdx = 0;
 
-    if (isFirstSegment)
+    if (ownsSetup)
       tileMapping.map(leafValues[0], tileBlock->getArgument(argIdx++));
 
     for (auto &entry : resolvedDiff) {
