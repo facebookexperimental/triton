@@ -1209,16 +1209,16 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
                       "scheduling with data partition factor: "
                    << dataPartitionFactor << "\n");
 
-  // When WSDataPartition has already split WarpGroupDotOps but left no
-  // DataPartition-categorized ops, the epilogue must be merged into the
-  // computation partitions so each can store its own MMA result directly.
-  bool useWgmmaDpFallback =
-      dataPartitionFactor > 1 &&
-      categorizer.getOpsInCategory(OpCategory::DataPartition).empty() &&
-      llvm::all_of(mmas,
-                   [](Operation *op) { return isa<ttng::WarpGroupDotOp>(op); });
+  // For Hopper data-partitioned GEMM with WarpGroupDotOps, the epilogue
+  // must be merged into the computation partitions so each can store its
+  // own MMA result directly, and computation partitions must be created
+  // before Phase 3/4 to prevent load-user propagation from claiming MMAs.
+  bool useHopperDpSchedule =
+      dataPartitionFactor > 1 && llvm::all_of(mmas, [](Operation *op) {
+        return isa<ttng::WarpGroupDotOp>(op);
+      });
   SchedulingOptions localSchedOpts = schedOpts;
-  if (useWgmmaDpFallback)
+  if (useHopperDpSchedule)
     localSchedOpts.mergeEpilogueToComputation = true;
 
   //===--------------------------------------------------------------------===//
@@ -1226,7 +1226,7 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
   //===--------------------------------------------------------------------===//
   PartitionSet schedule;
   PartitionLayout layout = createPartitionLayout(
-      schedule, categorizer, localSchedOpts, useWgmmaDpFallback);
+      schedule, categorizer, localSchedOpts, useHopperDpSchedule);
 
   //===--------------------------------------------------------------------===//
   // Phase 2b: Pre-create per-dpId computation partitions and pre-schedule
@@ -1243,13 +1243,10 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
     for (const auto &catOp : dpOps)
       usedDpIds.insert(catOp.dataPartitionId);
 
-    // When WSDataPartition has already split the dot ops, the backward
-    // slices may contain only ops that are already categorized (e.g.,
-    // descriptor_loads as Load), leaving no DataPartition-categorized ops.
-    // Fall back to the WarpGroupDotOp dpIds directly, using
-    // makeDefaultPartition so computation partitions get lower indices
-    // than the load partition (making them the default warp group).
-    if (useWgmmaDpFallback) {
+    // For Hopper WarpGroupDotOps: also collect dpIds from the MMA ops
+    // directly, since backward slices may miss exclusive ops due to
+    // inclusive=false or prior categorization.
+    if (useHopperDpSchedule) {
       for (auto mmaOp : mmas) {
         if (!isa<ttng::WarpGroupDotOp>(mmaOp))
           continue;
@@ -1258,6 +1255,8 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
           usedDpIds.insert(dpId);
       }
 
+      // Create computation partitions first via makeDefaultPartition so
+      // they get lower indices than load (= default warp group).
       SmallVector<unsigned> sortedDpIds(usedDpIds.begin(), usedDpIds.end());
       llvm::sort(sortedDpIds, std::greater<unsigned>());
       for (unsigned dpId : sortedDpIds)
@@ -1275,7 +1274,8 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
       layout.loadPartition = schedule.addPartition(0);
       layout.loadPartition->setType("load");
 
-      // Pre-schedule MMA ops into their computation partitions.
+      // Pre-schedule MMA ops into their computation partitions so
+      // Phase 3/4 load-user propagation doesn't claim them.
       for (auto mmaOp : mmas) {
         if (!isa<ttng::WarpGroupDotOp>(mmaOp))
           continue;
@@ -1298,6 +1298,10 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
     }
 
     for (const auto &catOp : dpOps) {
+      // Don't pre-schedule loads or allocs to computation partitions —
+      // they belong in the load partition. Phase 3 will place them there.
+      if (isa<DescriptorLoadOp, DescriptorGatherOp, LocalAllocOp>(catOp.op))
+        continue;
       unsigned dpId = catOp.dataPartitionId;
       auto it = dpIdToPartition.find(dpId);
       if (it != dpIdToPartition.end()) {
@@ -1309,10 +1313,12 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
 
     // Pre-assign shared ops to the default partition so that
     // propagatePartitions doesn't merge computation partitions.
-    // Skip this for the WarpGroupDotOp fallback path — Phase 3/4
+    // Skip for Hopper data-partitioned WarpGroupDotOps — Phase 3/4
     // will correctly route loads to the load partition and other
-    // shared ops to the default partition.
-    if (layout.defaultPartition && !dpOps.empty()) {
+    // shared ops to the default partition. Pre-scheduling shared ops
+    // here would claim descriptor_loads before Phase 3, putting B
+    // loads in the computation partition instead of the load partition.
+    if (layout.defaultPartition && !dpOps.empty() && !useHopperDpSchedule) {
       for (Operation *sharedOp : categorizer.getSharedOps()) {
         if (!isa<arith::ConstantOp>(sharedOp))
           tryScheduleOp(layout.defaultPartition, sharedOp);
