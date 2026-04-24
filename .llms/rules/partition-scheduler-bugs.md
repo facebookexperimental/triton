@@ -59,7 +59,7 @@
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)
 - IR after doTaskIdPropagate converts `ttg.partition` to `async_task_id` annotations
 - To check partition assignments: look at IR between `NVGPUPartitionSchedulingMeta` and `NVGPUWarpSpecialization` dump sections
-- Build: see `devmate/step1.txt`
+- Build: see xxx/build-triton.txt
 - To run a single pass: `triton-opt --nvgpu-partition-scheduling-meta="merge-epilogue-to-computation=true" input.mlir`
 - To enable debug: add `-debug-only=tritongpu-partition-scheduling`
 - To add stack traces on specific ops: instrument `setPartition()` in `lib/Dialect/TritonGPU/Transforms/WarpSpecialization/Partition.cpp`
