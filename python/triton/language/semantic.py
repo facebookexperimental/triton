@@ -1629,8 +1629,8 @@ class TritonSemantic(Generic[TensorTy]):
         assert input_precision is None or tl._unwrap_if_constexpr(allow_tf32) is None, (
             "Only one of input_precision and allow_tf32 can be specified")
         if input_precision is None:
-            supports_tf32 = "tf32" in self.builder.options.allowed_dot_input_precisions
-            input_precision = knobs.language.fp32_default or ("tf32" if
+            supports_tf32 = "tf32x3" in self.builder.options.allowed_dot_input_precisions
+            input_precision = knobs.language.fp32_default or ("tf32x3" if
                                                               (supports_tf32 and
                                                                (allow_tf32 or allow_tf32 is None)) else "ieee")
 
