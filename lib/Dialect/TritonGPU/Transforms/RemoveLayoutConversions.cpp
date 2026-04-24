@@ -2009,10 +2009,25 @@ public:
           }
           continue;
         }
-        // TODO: propagate through scf.yield by updating parent op result
-        // types, scf.for iter_args, and init values to match srcEnc.
-        if (isa<scf::YieldOp>(user))
+        // scf.yield passes values through to the parent op's results.
+        // For ForOp/WhileOp, the parent results are tied to block arguments
+        // and init operands via loop-carried dependencies — in-place type
+        // rewriting cannot safely update all of them, so block propagation.
+        // For IfOp, the results are simple branches with no loop-carried
+        // deps, so propagation is safe if we also follow the IfOp results.
+        if (auto yieldOp = dyn_cast<scf::YieldOp>(user)) {
+          Operation *parent = yieldOp->getParentOp();
+          if (isa<scf::ForOp, scf::WhileOp>(parent))
+            return false;
+          if (auto ifOp = dyn_cast<scf::IfOp>(parent)) {
+            for (Value result : ifOp.getResults()) {
+              if (isa<RankedTensorType>(result.getType()))
+                worklist.push_back(result);
+            }
+            continue;
+          }
           return false;
+        }
         // Any other user (dot, reduce, another convert, etc.) blocks
         // propagation.
         return false;
@@ -2034,6 +2049,7 @@ public:
 
     // Collect all ops that need type rewriting (forward from convert users).
     SmallVector<Operation *> opsToRewrite;
+    SetVector<Operation *> ifOpsToRewrite;
     SmallVector<Value> worklist = {dst};
     DenseSet<Value> visited;
 
@@ -2043,8 +2059,20 @@ public:
         continue;
       for (OpOperand &use : v.getUses()) {
         Operation *user = use.getOwner();
-        if (isa<LocalStoreOp>(user) || isa<scf::YieldOp>(user))
+        if (isa<LocalStoreOp>(user))
           continue;
+        // For scf.yield under scf.if, follow through to the IfOp results.
+        // ForOp/WhileOp yields are blocked by canPropagateSrcEncodingThroughUsers.
+        if (auto yieldOp = dyn_cast<scf::YieldOp>(user)) {
+          if (auto ifOp = dyn_cast<scf::IfOp>(yieldOp->getParentOp())) {
+            ifOpsToRewrite.insert(ifOp.getOperation());
+            for (Value result : ifOp.getResults()) {
+              if (isa<RankedTensorType>(result.getType()))
+                worklist.push_back(result);
+            }
+          }
+          continue;
+        }
         opsToRewrite.push_back(user);
         for (Value result : user->getResults()) {
           if (isa<RankedTensorType>(result.getType()))
@@ -2112,6 +2140,14 @@ public:
         if (auto ty = dyn_cast<RankedTensorType>(result.getType())) {
           if (srcEncRank > 0 && ty.getRank() != srcEncRank)
             continue;
+          result.setType(ty.cloneWithEncoding(srcEnc));
+        }
+      }
+    }
+    // Rewrite IfOp result types that we propagated through.
+    for (Operation *op : ifOpsToRewrite) {
+      for (Value result : op->getResults()) {
+        if (auto ty = dyn_cast<RankedTensorType>(result.getType())) {
           result.setType(ty.cloneWithEncoding(srcEnc));
         }
       }
