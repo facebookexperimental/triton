@@ -360,7 +360,6 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
     builder.setLoopScheduleInfoFromOp(tmaLoad);
     auto pipelineBuffer = getBufferForPipelineStage(builder, tmaLoad.getType(),
                                                     buffer, bufferIdx, true);
-    // FIXME: translateTMAIndices
     copy = builder.createWithAsyncTaskIds<ttng::AsyncTMACopyGlobalToLocalOp>(
         loc, /*multicastTargets*/ Value(), tmaLoad.getDesc(),
         tmaLoad.getIndices(), prodBarrier, pipelineBuffer, pred);
