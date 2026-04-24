@@ -396,7 +396,8 @@ class CUDABackend(BaseBackend):
             if knobs.nvidia.use_meta_ws:
                 passes.ttgpuir.add_optimize_partition_warps(pm)
         elif capability // 10 >= 10:
-            passes.ttgpuir.add_fuse_nested_loops(pm)
+            if not knobs.nvidia.use_modulo_schedule:
+                passes.ttgpuir.add_fuse_nested_loops(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttir.add_triton_licm(pm)
             passes.ttgpuir.add_optimize_accumulator_init(pm)
