@@ -1213,9 +1213,8 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
   bool useWgmmaDpFallback =
       dataPartitionFactor > 1 &&
       categorizer.getOpsInCategory(OpCategory::DataPartition).empty() &&
-      llvm::all_of(mmas, [](Operation *op) {
-        return isa<ttng::WarpGroupDotOp>(op);
-      });
+      llvm::all_of(mmas,
+                   [](Operation *op) { return isa<ttng::WarpGroupDotOp>(op); });
   SchedulingOptions localSchedOpts = schedOpts;
   if (useWgmmaDpFallback)
     localSchedOpts.mergeEpilogueToComputation = true;
@@ -1224,9 +1223,8 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
   // Phase 2: Create partition layout using tuning knobs
   //===--------------------------------------------------------------------===//
   PartitionSet schedule;
-  PartitionLayout layout = createPartitionLayout(schedule, categorizer,
-                                                 localSchedOpts,
-                                                 useWgmmaDpFallback);
+  PartitionLayout layout = createPartitionLayout(
+      schedule, categorizer, localSchedOpts, useWgmmaDpFallback);
 
   //===--------------------------------------------------------------------===//
   // Phase 2b: Pre-create per-dpId computation partitions and pre-schedule
