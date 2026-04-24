@@ -29,6 +29,11 @@ struct OpLatencyInfo {
   int selfLatency{0}; // Pipeline occupancy: cycles this op blocks its pipeline.
                       // Used for resource conflict analysis (ResMII — how much
                       // pipeline bandwidth is consumed).
+  int transferLatency{0}; // For async MEM ops: the full TMA transfer time
+                          // (pipeline occupancy from the TMA engine's
+                          // perspective). Used as edge weight from load to
+                          // local_alloc so the alloc stays at the right stage.
+                          // For non-async ops, equals selfLatency.
 };
 
 /// Hardware latency model for Blackwell SM100.

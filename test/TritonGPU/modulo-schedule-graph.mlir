@@ -16,7 +16,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // --- Graph structure: II=1005, max_stage=1, trip_count=32 ---
 // With selfLatency=1, loads issue every cycle (not every 518 cycles),
 // so II is driven by RecMII (loop-carried dep: MMA→tmem_load→tmem_alloc→MMA).
-// CHECK: [PASS-A] === Inner Loop ScheduleGraph ===
+// CHECK: [PASS-A] === Loop ScheduleGraph ===
 // CHECK-NEXT: modulo.schedule @loop0 {
 // CHECK-NEXT:   ii = 1005, max_stage = 1, prologue_latency = 703, trip_count = 32
 //

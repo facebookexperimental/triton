@@ -31,6 +31,7 @@ unsigned DataDependenceGraph::addNode(Operation *op,
   node.pipeline = info.pipeline;
   node.latency = info.latency;
   node.selfLatency = info.selfLatency;
+  node.transferLatency = info.transferLatency;
   nodes.push_back(node);
   opToIdx[op] = idx;
   return idx;
@@ -71,14 +72,15 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
         continue;
       unsigned srcIdx = it->second;
       // Edge latency = producer's latency (time until result available).
-      // Exception: for MEM → local_alloc edges, use selfLatency instead of
-      // the full async latency. local_alloc is a format conversion (registers
-      // → SMEM) that must stay at the same pipeline stage as its load.
-      // The async overhead only applies to the MMA consumer, not local_alloc.
+      // Exception: for MEM → local_alloc edges, use transferLatency (the TMA
+      // transfer time) instead of the full async latency. local_alloc is a
+      // bookkeeping op that represents data arrival — it must wait for the
+      // transfer to complete, but not for the async DRAM overhead that only
+      // applies to the MMA consumer.
       int edgeLatency = ddg.nodes[srcIdx].latency;
       if (ddg.nodes[srcIdx].pipeline == HWPipeline::MEM &&
           isa<triton::gpu::LocalAllocOp>(node.op)) {
-        edgeLatency = ddg.nodes[srcIdx].selfLatency;
+        edgeLatency = ddg.nodes[srcIdx].transferLatency;
       }
       ddg.addEdge(srcIdx, node.idx, edgeLatency, /*distance=*/0);
     }
@@ -106,7 +108,16 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
       auto userIt = ddg.opToIdx.find(user);
       if (userIt == ddg.opToIdx.end())
         continue;
-      ddg.addEdge(srcIdx, userIt->second, ddg.nodes[srcIdx].latency,
+      // For async ops (TC, MEM), the loop-carried recurrence latency
+      // is the issue cost (selfLatency), not the full execution time.
+      // The hardware pipelines successive iterations internally — e.g.,
+      // tcgen05.mma with useAcc=true pipelines accumulator updates in
+      // TMEM, so the next MMA can issue after the dispatch cost.
+      int backEdgeLat = ddg.nodes[srcIdx].latency;
+      if (ddg.nodes[srcIdx].pipeline == HWPipeline::TC ||
+          ddg.nodes[srcIdx].pipeline == HWPipeline::MEM)
+        backEdgeLat = ddg.nodes[srcIdx].selfLatency;
+      ddg.addEdge(srcIdx, userIt->second, backEdgeLat,
                   /*distance=*/1);
     }
   }
