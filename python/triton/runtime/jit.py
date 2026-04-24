@@ -621,15 +621,32 @@ class _DeviceCaches(defaultdict):
         if self._jit_function is not None:
             self._jit_function.clear_fast_path_caches()
 
+    def __copy__(self):
+        # Explicit shallow copy — Python 3.12 copy.copy() on dict
+        # subclasses calls the constructor, which fails because
+        # _DeviceCaches.__init__ has a different signature than
+        # defaultdict.__init__.
+        result = _DeviceCaches(self._jit_function, self.default_factory)
+        result.update(self)
+        return result
+
     def __reduce__(self):
-        # Return as a plain defaultdict for pickling/deepcopy.
-        # The _jit_function back-reference is not meaningful in a copy.
-        return (defaultdict, (self.default_factory, ), None, None, iter(self.items()))
+        # Return as a plain defaultdict for pickling.
+        # Drop both _jit_function and default_factory: the back-reference
+        # is not meaningful in a serialized copy, and default_factory is a
+        # bound method (create_binder) whose JITFunction instance may not
+        # be picklable.
+        return (defaultdict, (None, ), None, None, iter(self.items()))
 
     def __deepcopy__(self, memo):
         # Deepcopy as a plain defaultdict — the _jit_function
         # back-reference should not be copied.
-        result = defaultdict(self.default_factory)
+        # Use memo for default_factory so that if the factory is a bound
+        # method of a JITFunction being deepcopied, it resolves to the
+        # *new* JITFunction (via memo) instead of keeping a cross-reference
+        # back to the original.
+        new_factory = copy.deepcopy(self.default_factory, memo)
+        result = defaultdict(new_factory)
         memo[id(self)] = result
         for k, v in self.items():
             result[copy.deepcopy(k, memo)] = copy.deepcopy(v, memo)
