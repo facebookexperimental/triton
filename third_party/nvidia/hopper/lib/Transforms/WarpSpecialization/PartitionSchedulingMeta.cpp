@@ -1214,9 +1214,10 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
   // own MMA result directly, and computation partitions must be created
   // before Phase 3/4 to prevent load-user propagation from claiming MMAs.
   bool useHopperDpSchedule =
-      dataPartitionFactor > 1 && llvm::all_of(mmas, [](Operation *op) {
-        return isa<ttng::WarpGroupDotOp>(op);
-      });
+      dataPartitionFactor > 1 &&
+      categorizer.getOpsInCategory(OpCategory::Correction).empty() &&
+      llvm::all_of(mmas,
+                   [](Operation *op) { return isa<ttng::WarpGroupDotOp>(op); });
   SchedulingOptions localSchedOpts = schedOpts;
   if (useHopperDpSchedule)
     localSchedOpts.mergeEpilogueToComputation = true;
