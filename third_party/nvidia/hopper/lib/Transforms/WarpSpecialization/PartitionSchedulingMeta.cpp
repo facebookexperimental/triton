@@ -1166,6 +1166,36 @@ struct ScheduleResult {
   bool createComputePartitions;
 };
 
+// Pre-schedule DataPartition-categorized ops and shared ops to their
+// respective partitions. Loads and allocs are skipped (Phase 3 handles them).
+// Shared ops go to the default partition unless on the Hopper DP schedule
+// path where Phase 3/4 handles routing.
+static void
+preScheduleDpOps(SmallVector<CategorizedOp> &dpOps,
+                 DenseMap<unsigned, Partition *> &dpIdToPartition,
+                 DenseMap<Operation *, Partition *> &mmaToPreassignedPartition,
+                 PartitionLayout &layout, const OpCategorizer &categorizer,
+                 bool useHopperDpSchedule) {
+  for (const auto &catOp : dpOps) {
+    if (isa<DescriptorLoadOp, DescriptorGatherOp, LocalAllocOp>(catOp.op))
+      continue;
+    unsigned dpId = catOp.dataPartitionId;
+    auto it = dpIdToPartition.find(dpId);
+    if (it != dpIdToPartition.end()) {
+      tryScheduleOp(it->second, catOp.op);
+      if (catOp.parentMMA)
+        mmaToPreassignedPartition[catOp.parentMMA] = it->second;
+    }
+  }
+
+  if (layout.defaultPartition && !dpOps.empty() && !useHopperDpSchedule) {
+    for (Operation *sharedOp : categorizer.getSharedOps()) {
+      if (!isa<arith::ConstantOp>(sharedOp))
+        tryScheduleOp(layout.defaultPartition, sharedOp);
+    }
+  }
+}
+
 // Given a partitioning scheme, determine an initial schedule by performing a
 // first-order partition assignment to the operations in the scheme and its
 // users and/or dependencies. This sets up the initial partitioning of the ops.
@@ -1208,6 +1238,9 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
       llvm::dbgs() << "[tritongpu-partition-scheduling] Using template-based "
                       "scheduling with data partition factor: "
                    << dataPartitionFactor << "\n");
+
+  int cc = getNVIDIAComputeCapability(mainLoop->getParentOfType<ModuleOp>());
+  bool isHopper = cc / 10 == 9;
 
   // For Hopper data-partitioned GEMM with WarpGroupDotOps, the epilogue
   // must be merged into the computation partitions so each can store its
@@ -1298,33 +1331,13 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
       }
     }
 
-    for (const auto &catOp : dpOps) {
-      // Don't pre-schedule loads or allocs to computation partitions —
-      // they belong in the load partition. Phase 3 will place them there.
-      if (isa<DescriptorLoadOp, DescriptorGatherOp, LocalAllocOp>(catOp.op))
-        continue;
-      unsigned dpId = catOp.dataPartitionId;
-      auto it = dpIdToPartition.find(dpId);
-      if (it != dpIdToPartition.end()) {
-        tryScheduleOp(it->second, catOp.op);
-        if (catOp.parentMMA)
-          mmaToPreassignedPartition[catOp.parentMMA] = it->second;
-      }
-    }
-
-    // Pre-assign shared ops to the default partition so that
-    // propagatePartitions doesn't merge computation partitions.
-    // Skip for Hopper data-partitioned WarpGroupDotOps — Phase 3/4
-    // will correctly route loads to the load partition and other
-    // shared ops to the default partition. Pre-scheduling shared ops
-    // here would claim descriptor_loads before Phase 3, putting B
-    // loads in the computation partition instead of the load partition.
-    if (layout.defaultPartition && !dpOps.empty() && !useHopperDpSchedule) {
-      for (Operation *sharedOp : categorizer.getSharedOps()) {
-        if (!isa<arith::ConstantOp>(sharedOp))
-          tryScheduleOp(layout.defaultPartition, sharedOp);
-      }
-    }
+    // On Hopper (sm_9x), schedule dpOps now (Phase 2b) since MMA ops
+    // are already pre-scheduled and won't be stolen by Phase 4.
+    // On Blackwell (sm_10x+), defer to Phase 5 so correction scheduling
+    // in Phase 4 gets first pick of rescaling ops (acc * alpha).
+    if (isHopper)
+      preScheduleDpOps(dpOps, dpIdToPartition, mmaToPreassignedPartition,
+                       layout, categorizer, useHopperDpSchedule);
   }
 
   // Extract partition references from layout (after Phase 2b which may
@@ -1664,7 +1677,13 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
     sharedComputePartition = nullptr; // lazy-created on first use
   }
 
-  // Data partition pre-assignment is handled in Phase 2b above.
+  // On Blackwell, schedule dpOps here (Phase 5, after Phase 4 correction)
+  // so correction scheduling gets first pick of rescaling ops.
+  if (dataPartitionFactor > 1 && !isHopper) {
+    auto dpOps = categorizer.getOpsInCategory(OpCategory::DataPartition);
+    preScheduleDpOps(dpOps, dpIdToPartition, mmaToPreassignedPartition, layout,
+                     categorizer, useHopperDpSchedule);
+  }
 
   for (auto mmaOp : llvm::reverse(mmas)) {
     if (mmaOp->getParentOfType<scf::ForOp>() == loops[0]) {
