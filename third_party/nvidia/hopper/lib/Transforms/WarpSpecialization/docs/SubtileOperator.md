@@ -195,32 +195,3 @@ Default: `False`.
 | `python/test/unit/language/test_tutorial09_warp_specialization.py` | Blackwell GEMM e2e (parametrized with `generate_subtiled_region`) |
 | `python/test/unit/language/test_autows_addmm.py` | Addmm e2e (parametrized with `generate_subtiled_region`) |
 | `test_subtile_gemm.py` | Standalone addmm + subtile e2e |
-
-## Known TODOs
-
-1. **N-tile multi-task with identity ops in segments.** When per-segment
-   chains have identity ops (from the canonical-identity forced identity),
-   `checkStructuralEquivalenceN` on the segment bails. This prevents
-   N-tile multi-task subtiling when tiles have asymmetric address offsets
-   (e.g., 4-tile with `arith.addi` in 3 of 4 tiles). The fix: propagate
-   `forcedIdentityOps` into per-segment equivalence checks.
-
-2. **Merge `tryGenerateForSplit` 2-tile/N-tile branches.** The two branches
-   (~120 lines each) share ~60% logic. Now that `buildSingleSubtiledRegion`
-   and `buildMultiTaskSubtiledRegions` both delegate to N-tile versions,
-   the branch condition (`numTiles > 2`) could be eliminated by always using
-   the N-tile data structures. The 2-tile path's non-contiguous task
-   merging + topological sort needs to be generalized to N tiles.
-
-3. **Non-tensor cross-segment values in N-tile multi-task** (e.g., scalar
-   offsets) bail out. These need to be passed through as differing operands
-   without SMEM buffering.
-
-4. **The `isFirstSegment` assumption in `buildMultiTaskSubtiledRegionsN`.**
-   After merge-and-reorder, the first segment may not use the split result
-   (e.g., task 3 bias load segment). The unused split result tile arg is
-   wasted.
-
-5. **Full e2e test coverage.** The `generate_subtiled_region=True` parameter
-   is added to `test_tutorial09_warp_specialization.py` and
-   `test_autows_addmm.py` but full test suite results are pending validation.
