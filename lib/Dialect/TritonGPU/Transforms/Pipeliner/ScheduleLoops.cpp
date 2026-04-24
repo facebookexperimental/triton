@@ -25,9 +25,12 @@ namespace mlir::triton::gpu {
 // scheduleLoops
 //===----------------------------------------------------------------------===//
 
-bool hasGpuBarriers(scf::ForOp forOp) {
-  WalkResult result = forOp.walk(
-      [&](mlir::gpu::BarrierOp barrier) { return WalkResult::interrupt(); });
+template <typename... OpTypes> bool containsAny(scf::ForOp forOp) {
+  WalkResult result = forOp.walk([&](Operation *op) {
+    if (isa<OpTypes...>(op))
+      return WalkResult::interrupt();
+    return WalkResult::advance();
+  });
   return result.wasInterrupted();
 }
 
@@ -39,9 +42,10 @@ bool isSafeToPipeline(scf::ForOp forOp) {
   // Don't pipeline outer loops.
   if (isOuterLoop(forOp))
     return false;
-  // Skip loops with barriers.
-  if (hasGpuBarriers(forOp))
+  // Skip loops with barriers, asserts or prints
+  if (containsAny<mlir::gpu::BarrierOp, tt::AssertOp, tt::PrintOp>(forOp))
     return false;
+
   return true;
 }
 
