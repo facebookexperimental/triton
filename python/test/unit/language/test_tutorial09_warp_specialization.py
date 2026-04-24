@@ -731,6 +731,16 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
         assert "ttng.tc_gen5_mma" in ttgir, "Expected Blackwell MMA instruction"
         assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
 
+        # When subtile generation is enabled with EPILOGUE_SUBTILE > 1,
+        # verify each tmem_load has its own local_store (subtile structure
+        # was correctly generated and lowered).
+        if generate_subtiled_region and EPILOGUE_SUBTILE > 1 and separate_epilogue_store:
+            num_tmem_loads = ttgir.count("ttng.tmem_load")
+            num_local_stores = ttgir.count("ttg.local_store")
+            assert num_tmem_loads == EPILOGUE_SUBTILE, (f"Expected {EPILOGUE_SUBTILE} tmem_loads, got {num_tmem_loads}")
+            assert num_local_stores >= EPILOGUE_SUBTILE, (
+                f"Expected at least {EPILOGUE_SUBTILE} local_stores, got {num_local_stores}")
+
         # Verify correctness
         ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
         torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
