@@ -11,6 +11,7 @@
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -41,7 +42,11 @@ public:
                   mlir::PatternRewriter &rewriter) const override {
     if (!isa<RankedTensorType>(requireLayoutOp.getSrc().getType()))
       return failure();
-    auto convertLayoutOp = rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(
+    if (requireLayoutOp.getSrc().getType() == requireLayoutOp.getType()) {
+      rewriter.replaceOp(requireLayoutOp, requireLayoutOp.getSrc());
+      return success();
+    }
+    rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(
         requireLayoutOp, requireLayoutOp.getType(), requireLayoutOp.getSrc());
     return success();
   }
@@ -54,11 +59,234 @@ public:
   mlir::LogicalResult
   matchAndRewrite(ReleaseLayoutOp releaseLayoutOp,
                   mlir::PatternRewriter &rewriter) const override {
-    auto convertLayoutOp = rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(
+    if (releaseLayoutOp.getSrc().getType() == releaseLayoutOp.getType()) {
+      rewriter.replaceOp(releaseLayoutOp, releaseLayoutOp.getSrc());
+      return success();
+    }
+    rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(
         releaseLayoutOp, releaseLayoutOp.getType(), releaseLayoutOp.getSrc());
     return success();
   }
 };
+
+static RankedTensorType getNewTensorType(RankedTensorType origType,
+                                         Attribute encoding) {
+  return RankedTensorType::get(origType.getShape(), origType.getElementType(),
+                               encoding);
+}
+
+static bool isRetaggableTensorProducerValue(Value value) {
+  if (!isa<RankedTensorType>(value.getType()))
+    return false;
+
+  Operation *definingOp = value.getDefiningOp();
+  return isa_and_nonnull<ttg::LocalLoadOp>(definingOp);
+}
+
+static Type getTensorCandidateType(Value value, DataFlowSolver &solver,
+                                   const llvm::DenseSet<Value> &blockedValues) {
+  auto tensorType = cast<RankedTensorType>(value.getType());
+  if (blockedValues.contains(value))
+    return tensorType;
+
+  auto *lattice = solver.lookupState<TensorLayoutLattice>(value);
+  if (!lattice || lattice->getValue().isUninitialized() ||
+      lattice->getValue().isUnknown())
+    return tensorType;
+
+  return getNewTensorType(tensorType, lattice->getValue().getLayoutEncoding());
+}
+
+static void
+rewriteTensorValueFromLattice(Value value, DataFlowSolver &solver,
+                              const llvm::DenseSet<Value> &blockedValues) {
+  if (!isRetaggableTensorProducerValue(value))
+    return;
+
+  auto tensorType = dyn_cast<RankedTensorType>(value.getType());
+  if (!tensorType)
+    return;
+  auto newType = cast<RankedTensorType>(
+      getTensorCandidateType(value, solver, blockedValues));
+  if (newType != tensorType)
+    value.setType(newType);
+}
+
+static ttg::MemDescType getNewMemDescType(ttg::MemDescType origType,
+                                          Attribute encoding) {
+  return ttg::MemDescType::get(origType.getShape(), origType.getElementType(),
+                               encoding, origType.getMemorySpace(),
+                               origType.getMutableMemory());
+}
+
+static FailureOr<const LayoutEncodingLattice *>
+lookupMemDescLatticeOrEmitError(Value value, DataFlowSolver &solver,
+                                Operation *diagnosticOp) {
+  auto *lattice = solver.lookupState<LayoutEncodingLattice>(value);
+  if (lattice)
+    return lattice;
+
+  diagnosticOp->emitError()
+      << "expected memdesc layout lattice for value " << value;
+  return failure();
+}
+
+static FailureOr<LayoutEncoding>
+getMemDescConsensusLayout(ArrayRef<Value> values, DataFlowSolver &solver,
+                          Operation *diagnosticOp) {
+  LayoutEncoding consensus;
+  for (Value value : values) {
+    FailureOr<const LayoutEncodingLattice *> lattice =
+        lookupMemDescLatticeOrEmitError(value, solver, diagnosticOp);
+    if (failed(lattice))
+      return failure();
+    consensus = LayoutEncoding::join(consensus, (*lattice)->getValue());
+  }
+  return consensus;
+}
+
+static LogicalResult rewriteMemDescValueFromLattice(Value value,
+                                                    DataFlowSolver &solver,
+                                                    Operation *diagnosticOp) {
+  auto origType = dyn_cast<ttg::MemDescType>(value.getType());
+  if (!origType)
+    return success();
+
+  FailureOr<const LayoutEncodingLattice *> lattice =
+      lookupMemDescLatticeOrEmitError(value, solver, diagnosticOp);
+  if (failed(lattice))
+    return failure();
+
+  LayoutEncoding layout = (*lattice)->getValue();
+  if (layout.isUninitialized())
+    return success();
+  if (layout.isUnknown()) {
+    LDBG("Leaving memdesc value unchanged due to unknown layout: " << value);
+    return success();
+  }
+
+  auto newType = getNewMemDescType(origType, layout.getLayoutEncoding());
+  if (newType != origType)
+    value.setType(newType);
+  return success();
+}
+
+static void
+collectRegionBranchSuccessors(RegionBranchOpInterface branchOp,
+                              SmallVectorImpl<RegionSuccessor> &successors) {
+  auto appendUniqueSuccessors = [&](ArrayRef<RegionSuccessor> newSuccessors) {
+    for (RegionSuccessor successor : newSuccessors) {
+      if (!llvm::is_contained(successors, successor))
+        successors.push_back(successor);
+    }
+  };
+
+  SmallVector<RegionSuccessor> newSuccessors;
+  branchOp.getSuccessorRegions(RegionBranchPoint::parent(), newSuccessors);
+  appendUniqueSuccessors(newSuccessors);
+  for (Region &region : branchOp->getRegions()) {
+    newSuccessors.clear();
+    branchOp.getSuccessorRegions(region, newSuccessors);
+    appendUniqueSuccessors(newSuccessors);
+  }
+}
+
+static std::optional<Type>
+getTensorConsensusType(ValueRange values, DataFlowSolver &solver,
+                       const llvm::DenseSet<Value> &blockedValues) {
+  if (values.empty())
+    return std::nullopt;
+
+  std::optional<Type> consensusType;
+  for (Value value : values) {
+    if (!isa<RankedTensorType>(value.getType()))
+      return std::nullopt;
+
+    Type candidateType = getTensorCandidateType(value, solver, blockedValues);
+    if (!consensusType) {
+      consensusType = candidateType;
+      continue;
+    }
+    if (*consensusType != candidateType)
+      return std::nullopt;
+  }
+  return consensusType;
+}
+
+static llvm::DenseSet<Value>
+computeBlockedTensorValues(triton::FuncOp funcOp, DataFlowSolver &solver) {
+  llvm::DenseSet<Value> blockedValues;
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    funcOp.walk([&](RegionBranchOpInterface branchOp) {
+      SmallVector<RegionSuccessor> successors;
+      collectRegionBranchSuccessors(branchOp, successors);
+
+      for (RegionSuccessor successor : successors) {
+        ValueRange successorInputs = branchOp.getSuccessorInputs(successor);
+        for (auto [index, successorInput] : llvm::enumerate(successorInputs)) {
+          if (!isa<RankedTensorType>(successorInput.getType()))
+            continue;
+
+          SmallVector<Value> predecessorValues;
+          branchOp.getPredecessorValues(successor, index, predecessorValues);
+          if (predecessorValues.empty())
+            continue;
+
+          if (getTensorConsensusType(ValueRange(predecessorValues), solver,
+                                     blockedValues))
+            continue;
+
+          LDBG("Blocking tensor carrier value due to inconsistent predecessor "
+               "layouts at "
+               << branchOp->getName());
+          changed |= blockedValues.insert(successorInput).second;
+          for (Value predecessorValue : predecessorValues) {
+            if (!isa<RankedTensorType>(predecessorValue.getType()))
+              continue;
+            changed |= blockedValues.insert(predecessorValue).second;
+          }
+        }
+      }
+
+      return WalkResult::advance();
+    });
+  }
+
+  return blockedValues;
+}
+
+static void
+updateTensorRegionBranchTypes(triton::FuncOp funcOp, DataFlowSolver &solver,
+                              const llvm::DenseSet<Value> &blockedValues) {
+  funcOp.walk<WalkOrder::PostOrder>([&](RegionBranchOpInterface branchOp) {
+    SmallVector<RegionSuccessor> successors;
+    collectRegionBranchSuccessors(branchOp, successors);
+
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (RegionSuccessor successor : successors) {
+        ValueRange successorInputs = branchOp.getSuccessorInputs(successor);
+        for (auto [index, successorInput] : llvm::enumerate(successorInputs)) {
+          if (!isa<RankedTensorType>(successorInput.getType()))
+            continue;
+
+          SmallVector<Value> predecessorValues;
+          branchOp.getPredecessorValues(successor, index, predecessorValues);
+          std::optional<Type> consensusType = getTensorConsensusType(
+              ValueRange(predecessorValues), solver, blockedValues);
+          if (!consensusType || successorInput.getType() == *consensusType)
+            continue;
+
+          successorInput.setType(*consensusType);
+          changed = true;
+        }
+      }
+    }
+  });
+}
 
 class TlxPropagateLayoutPass
     : public impl::TlxPropagateLayoutBase<TlxPropagateLayoutPass> {
@@ -69,15 +297,13 @@ public:
   void runOnFuncOp(triton::FuncOp funcOp) {
     // We can terminate early if we don't have a layout constraint.
     WalkResult walkResult = funcOp.walk([&](mlir::Operation *op) {
-      if (auto requireLayoutOp = dyn_cast<tlx::RequireLayoutOp>(op))
-        if (isa<gpu::MemDescType>(requireLayoutOp.getType()))
-          return WalkResult::interrupt();
+      if (isa<tlx::RequireLayoutOp, tlx::ReleaseLayoutOp>(op))
+        return WalkResult::interrupt();
       return WalkResult::advance();
     });
     if (!walkResult.wasInterrupted())
       return;
 
-    PatternRewriter rewriter(&getContext());
     SymbolTableCollection symbolTable;
     Operation *op = getOperation();
     DataFlowSolver solver;
@@ -86,86 +312,70 @@ public:
     solver.load<SparseConstantPropagation>();
     solver.load<LayoutBackwardPropagation>(symbolTable);
     solver.load<LayoutForwardPropagation>();
+    solver.load<TensorBackwardPropagation>(symbolTable);
     if (failed(solver.initializeAndRun(op)))
       return signalPassFailure();
 
-    auto getNewMemDescType = [&](ttg::MemDescType origType,
-                                 Attribute encoding) {
-      return ttg::MemDescType::get(
-          origType.getShape(), origType.getElementType(), encoding,
-          origType.getMemorySpace(), origType.getMutableMemory());
-    };
+    llvm::DenseSet<Value> blockedTensorValues =
+        computeBlockedTensorValues(funcOp, solver);
 
-    funcOp.walk([&](mlir::Operation *op) {
+    WalkResult typeRewriteWalk = funcOp.walk([&](mlir::Operation *op) {
       if (isa<tlx::RequireLayoutOp>(op))
         return WalkResult::advance();
 
       if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(op)) {
-        Region *firstRegion = wsOp.getPartitionRegions()[0];
-        for (auto [i, blockArg] :
-             llvm::enumerate(firstRegion->getArguments())) {
-          if (!isa<ttg::MemDescType>(blockArg.getType()))
+        for (auto [i, capture] :
+             llvm::enumerate(wsOp.getPartitionOp().getExplicitCaptures())) {
+          auto captureType = dyn_cast<ttg::MemDescType>(capture.getType());
+          if (!captureType)
             continue;
-          auto lattice = solver.lookupState<LayoutEncodingLattice>(blockArg);
-          if (!lattice)
-            llvm_unreachable("Lattice not found.");
-          if (lattice->getValue().isUninitialized() ||
-              lattice->getValue().isUnknown())
+
+          SmallVector<Value> relatedValues;
+          relatedValues.push_back(capture);
+          for (Region *partitionRegion : wsOp.getPartitionRegions())
+            relatedValues.push_back(partitionRegion->getArgument(i));
+
+          FailureOr<LayoutEncoding> consensus =
+              getMemDescConsensusLayout(relatedValues, solver, wsOp);
+          if (failed(consensus))
+            return WalkResult::interrupt();
+          if (consensus->isUninitialized())
             continue;
+          if (consensus->isUnknown()) {
+            LDBG("Leaving warp_specialize capture #" << i
+                                                     << " unchanged due to "
+                                                        "non-concrete "
+                                                        "partition consensus");
+            continue;
+          }
+
+          auto newType =
+              getNewMemDescType(captureType, consensus->getLayoutEncoding());
+          if (capture.getType() != newType)
+            capture.setType(newType);
           for (Region *partitionRegion : wsOp.getPartitionRegions()) {
-            if (auto origType =
-                    dyn_cast<ttg::MemDescType>(blockArg.getType())) {
-              auto newType = getNewMemDescType(
-                  origType, lattice->getValue().getLayoutEncoding());
+            if (partitionRegion->getArgument(i).getType() != newType)
               partitionRegion->getArgument(i).setType(newType);
-            }
           }
         }
         return WalkResult::advance();
       }
 
       for (auto [i, result] : llvm::enumerate(op->getResults())) {
-        if (!isa<ttg::MemDescType>(result.getType()))
+        if (!isa<ttg::MemDescType>(result.getType())) {
+          rewriteTensorValueFromLattice(result, solver, blockedTensorValues);
           continue;
-        auto *lattice = solver.lookupState<LayoutEncodingLattice>(result);
-        if (!lattice)
-          llvm_unreachable("Lattice not found.");
-        if (lattice->getValue().isUninitialized() ||
-            lattice->getValue().isUnknown())
-          continue;
-        if (auto origType = dyn_cast<ttg::MemDescType>(result.getType())) {
-          auto newType = getNewMemDescType(
-              origType, lattice->getValue().getLayoutEncoding());
-          op->getResult(i).setType(newType);
         }
+
+        if (failed(rewriteMemDescValueFromLattice(result, solver, op)))
+          return WalkResult::interrupt();
       }
       return WalkResult::advance();
     });
+    if (typeRewriteWalk.wasInterrupted())
+      return signalPassFailure();
 
-    // Fix up RequireLayoutOps feeding into TMEMStoreOps with scales encoding.
-    // ResolvePlaceholderLayouts assigned a generic TMEM-compatible register
-    // layout, but for scales the register layout must use
-    // getScaleTMEMStoreLinearLayout.
-    funcOp.walk([&](ttng::TMEMStoreOp storeOp) {
-      auto memTy = storeOp.getDst().getType();
-      if (!isa<ttng::TensorMemoryScalesEncodingAttr>(memTy.getEncoding()))
-        return WalkResult::advance();
-
-      auto requireOp = storeOp.getSrc().getDefiningOp<RequireLayoutOp>();
-      if (!requireOp)
-        return WalkResult::advance();
-
-      auto srcTy = cast<RankedTensorType>(requireOp.getResult().getType());
-      int numWarps = ttg::lookupNumWarps(storeOp);
-      // TODO: port getScaleTMEMStoreLinearLayout to upstream
-      // // TODO: port getScaleTMEMStoreLinearLayout
-      // auto scalesLL = ttg::getScaleTMEMStoreLinearLayout(srcTy, numWarps);
-      // auto newEncoding = ttg::LinearEncodingAttr::get(srcTy.getContext(), scalesLL);
-      // auto newType = RankedTensorType::get(srcTy.getShape(),
-      //                                      srcTy.getElementType(), newEncoding);
-      // requireOp->getResult(0).setType(newType);
-      return WalkResult::advance();
-    });
+    updateTensorRegionBranchTypes(funcOp, solver, blockedTensorValues);
 
     // Verify that no DummyTMEMLayoutAttr remains after layout propagation
     bool hasDummyLayout = false;
