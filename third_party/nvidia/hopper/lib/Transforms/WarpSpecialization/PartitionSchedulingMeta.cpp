@@ -272,7 +272,6 @@ struct PartitionLayout {
     return nullptr;
   }
 
-  /// Get the opToDpId map (for schedulePostLoopOps).
   bool hasGemm() const { return gemmPartition != nullptr; }
 };
 
@@ -948,10 +947,19 @@ static void iterateUsers(scf::ForOp loop, Operation *op,
 }
 
 // Helper: schedule an operation to a partition if it is not already scheduled.
+// Current scheduling phase name for debug logging.
+static const char *currentPhase = "";
+
+static void scheduleOp(Partition *partition, Operation *op) {
+  LDBG("[" << currentPhase << "] " << partition->getIndex() << "("
+           << partition->getType() << ") <- " << prettyOp(op));
+  setPartition(op, partition);
+}
+
 static bool tryScheduleOp(Partition *partition, Operation *op) {
   if (hasPartition(op))
     return false;
-  setPartition(op, partition);
+  scheduleOp(partition, op);
   return true;
 }
 
@@ -1009,7 +1017,8 @@ static Partition *scheduleUsers(scf::ForOp loop, PartitionSet &schedule,
 // (e.g., TMAStoreTokenWaitOp) go to the epilogue partition. All other post-loop
 // ops (e.g., tmem_load for accumulator reads, arithmetic for normalization) go
 // to the default partition. This prevents TMEM ops from landing in the
-// epilogue, which would force it to use 4 warps (TMEM lane coverage hardware
+// epilogue, which would force it to use 4 warps (TMEM lane coverage
+// requires full warp group).
 
 static void
 schedulePostLoopOps(scf::ForOp loop, PartitionSet &schedule,
@@ -1128,7 +1137,7 @@ schedulePostLoopOps(scf::ForOp loop, PartitionSet &schedule,
           target = getEpilogueTarget(user);
       }
       if (target)
-        setPartition(user, target);
+        scheduleOp(target, user);
     }
 
     for (OpResult result : user->getResults())
@@ -1185,8 +1194,8 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
 
   unsigned dataPartitionFactor = categorizer.getDataPartitionFactor();
   LLVM_DEBUG(
-      llvm::dbgs() << "[tritongpu-partition-scheduling] Using template-based "
-                      "scheduling with data partition factor: "
+      llvm::dbgs() << "[tritongpu-partition-scheduling] Scheduling with data "
+                      "partition factor: "
                    << dataPartitionFactor << "\n");
 
   //===--------------------------------------------------------------------===//
@@ -1211,7 +1220,8 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
     reductionPartition = defaultPartition;
 
   //===--------------------------------------------------------------------===//
-  // Phase 3: Schedule ops using template-based partition assignment
+  // Phase 3: Schedule anchor ops (loads, epilogue stores, MMAs)
+  currentPhase = "phase3";
   //===--------------------------------------------------------------------===//
 
   // Schedule loads and their associated allocs (both in-loop and pre-loop)
@@ -1415,12 +1425,16 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
 
   //===--------------------------------------------------------------------===//
   // Phase 4: Propagate users (load users, correction, reductions)
-  //===--------------------------------------------------------------------====//
+  //===--------------------------------------------------------------------===//
+  currentPhase = "phase4";
 
   // Load users go to default partition (shared computation).
-  // When default is absent (e.g., bwd), skip — MMA user propagation in
-  // Phase 5 will capture these ops through the use chain.
-  if (defaultPartition) {
+  // When default is absent or equals the reduction partition (e.g., bwd),
+  // skip — MMA user propagation in Phase 5 will capture these ops through
+  // the use chain. Without this guard, load-user scheduling from
+  // descriptor_load (m/Di metadata) transitively pulls the entire softmax
+  // chain into the reduction partition.
+  if (defaultPartition && defaultPartition != reductionPartition) {
     for (Operation *loadOrAlloc : loadsAndAllocs) {
       scf::ForOp parentLoop = loadOrAlloc->getParentOfType<scf::ForOp>();
       if (!parentLoop) {
@@ -1488,28 +1502,10 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
         }
       }
     }
-
-    // For BWD (hasReduction): tag pre-loop TMEMStoreOp with the reduction
-    // partition index. These ops initialize accumulators (e.g., zeroing
-    // dK/dV) before the loop. Without explicit assignment, they would get
-    // pulled into the gemm partition via token chains to the in-loop MMA,
-    // causing gemm to require >=4 warps (TMEM ops need 4 warps). We set the
-    // attribute directly rather than using schedule.trySchedule because
-    // pre-loop ops must not be added to the partition's ops list
-    // (optimizeSchedule only handles in-loop ops).
-    if (reductionPartition) {
-      Builder b(mainLoop->getContext());
-      for (Operation &op : *mainLoop->getBlock()) {
-        if (&op == mainLoop)
-          break;
-        if (isa<ttng::TMEMStoreOp>(op))
-          op.setAttr(kPartitionAttrName,
-                     b.getDenseI32ArrayAttr({reductionPartition->getIndex()}));
-      }
-    }
   }
 
   //===--------------------------------------------------------------------===//
+  currentPhase = "phase5";
   // Phase 5: Create per-MMA computation partitions
   //===--------------------------------------------------------------------===//
   // MMA users create computation partitions. This runs AFTER correction/load
@@ -1526,11 +1522,8 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
 
   // For dpFactor==1, pre-create a single shared computation partition.
   // For dpFactor>1, let scheduleUsers(nullptr) create per-group partitions.
+  // (sharedComputePartition tracks the BWD computation partition.)
   Partition *sharedComputePartition = nullptr;
-  if (dataPartitionFactor <= 1) {
-    // All MMA users go to one computation partition (bwd pattern).
-    sharedComputePartition = nullptr; // lazy-created on first use
-  }
 
   // When dpFactor > 1 and there is no defaultPartition, pre-assign
   // DataPartition-categorized ops to their respective computation partitions
@@ -1772,6 +1765,7 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
     }
   }
 
+  currentPhase = "post-loop";
   // Pre-schedule post-loop ops before propagatePartitions claims them.
   schedulePostLoopOps(mainLoop, schedule, layout, schedOpts,
                       categorizer.getOpToDpIdMap(), dpIdToPartition);
@@ -1990,7 +1984,7 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
         for (Operation *op : cluster.ops) {
           if (isScalarOp(op))
             continue;
-          setPartition(op, existingComputation);
+          scheduleOp(existingComputation, op);
         }
         continue;
       }
@@ -2019,7 +2013,7 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
           for (Operation *op : cluster.ops) {
             if (isScalarOp(op))
               continue;
-            setPartition(op, fallbackPartition);
+            scheduleOp(fallbackPartition, op);
           }
           continue;
         }
@@ -2034,7 +2028,7 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
         for (Operation *op : cluster.ops) {
           if (isScalarOp(op))
             continue;
-          setPartition(op, cluster.sinkPartitions.front());
+          scheduleOp(cluster.sinkPartitions.front(), op);
         }
         continue;
       }
@@ -2043,7 +2037,7 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
       for (Operation *op : cluster.ops) {
         if (isScalarOp(op))
           continue;
-        setPartition(op, newPartition);
+        scheduleOp(newPartition, op);
       }
       continue;
     }
@@ -2055,7 +2049,7 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
       for (Operation *op : cluster.ops) {
         if (isScalarOp(op))
           continue;
-        setPartition(op, defPartition);
+        scheduleOp(defPartition, op);
       }
       continue;
     }
@@ -2084,7 +2078,7 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
       for (Operation *op : cluster.ops) {
         if (isScalarOp(op))
           continue;
-        setPartition(op, defPartition);
+        scheduleOp(defPartition, op);
       }
       continue;
     }
@@ -2102,12 +2096,12 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
         return sinkOps.contains(use.getOwner());
       });
       sinkOps.insert(clone);
-      setPartition(clone, sinkPartition);
+      scheduleOp(sinkPartition, clone);
     }
     for (Operation *op : cluster.ops) {
       if (isScalarOp(op))
         continue;
-      setPartition(op, defPartition);
+      scheduleOp(defPartition, op);
     }
   }
 }
@@ -2169,8 +2163,6 @@ void optimizeSchedule(scf::ForOp loop, PartitionSet &schedule) {
   // operands.
   loop.walk<WalkOrder::PostOrder, ReverseIterator>([&](Operation *op) {
     if (!isa<MemDescTransOp, ConvertLayoutOp, BroadcastOp, ExpandDimsOp>(op))
-      // if (op->getNumResults() != 1 || !isPure(op) ||
-      //     isa<scf::YieldOp, scf::ForOp, scf::IfOp>(op))
       return;
 
     Partition *partition = getPartition(op);
@@ -2189,7 +2181,7 @@ void optimizeSchedule(scf::ForOp loop, PartitionSet &schedule) {
     for (auto *userPartition : userPartitions) {
       // Clone the instruction into each user partition.
       Operation *clone = OpBuilder(op).clone(*op);
-      setPartition(clone, userPartition);
+      scheduleOp(userPartition, clone);
       // Replace all users in that partition with the clone.
       op->replaceUsesWithIf(clone->getResults(), [&](OpOperand &otherUse) {
         return getPartition(otherUse.getOwner()) == userPartition;
@@ -2239,7 +2231,6 @@ void splitDataPartitionedIfOps(scf::ForOp loop, PartitionSet &schedule) {
 
     // Check if results feed different partitions.
     DenseSet<int> resultPartitions;
-    bool hasDifferentPartitions = false;
     for (OpResult result : ifOp.getResults()) {
       for (Operation *user : result.getUsers()) {
         auto ids = safeGetPartitionIds(user);
@@ -2431,8 +2422,10 @@ void PartitionSchedulingMeta::runOnOperation() {
     if (std::optional<ScheduleResult> result =
             getInitialSchedule(loop, schedOpts)) {
       PartitionSet &schedule = result->schedule;
+      currentPhase = "propagate";
       propagatePartitions(loop, schedule, result->createComputePartitions);
 
+      currentPhase = "optimize";
       optimizeSchedule(loop, schedule);
 
       // Split scf.if ops whose results feed different computation partitions.

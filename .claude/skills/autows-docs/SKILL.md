@@ -38,7 +38,7 @@ Use the file map below to match your task to the relevant doc(s):
 | Splitting ops across warp groups | `docs/DataPartition.md` |
 | Channel insertion, async copies, barriers | `docs/CodePartition.md` |
 | Code specialization / cloning into regions | `docs/CodeSpecialization.md` |
-| SMEM/TMEM allocation, multi-buffering | `docs/BufferAllocation.md`, `docs/SmemAllocationDesign.md` |
+| SMEM/TMEM allocation, multi-buffering | `docs/BufferAllocation.md`, `docs/AccumulationCounters.md`, `docs/SmemAllocationDesign.md` |
 | Memory planner liveness analysis | `docs/MemoryPlannerVisualization.md` |
 | Memory lowering (global/shared/tensor) | `docs/MemoryLowering.md` |
 | Token/barrier lowering to hardware | `docs/TokenBarrierLowering.md` |

@@ -7,6 +7,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
+#include "llvm/Support/JSON.h"
 
 namespace ttg = mlir::triton::gpu;
 
@@ -18,6 +19,39 @@ namespace nvidia_gpu {
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h.inc"
 
 namespace {
+
+/// Extract the memory type for opndA from a tt.autows annotation.
+/// Returns "tmem", "smem", or "" if no annotation or no opndA entry.
+static StringRef getOpndAMemType(Operation *op) {
+  auto attr = op->getAttrOfType<StringAttr>("tt.autows");
+  if (!attr)
+    return "";
+  auto parsed = llvm::json::parse(attr.getValue());
+  if (!parsed) {
+    llvm::consumeError(parsed.takeError());
+    return "";
+  }
+  auto *obj = parsed->getAsObject();
+  if (!obj)
+    return "";
+  auto *channelsArr = obj->getArray("channels");
+  if (!channelsArr)
+    return "";
+  for (auto &elem : *channelsArr) {
+    auto str = elem.getAsString();
+    if (!str)
+      continue;
+    if (str->starts_with("opndA,")) {
+      // Format: "opndA,memType,numCopies,bufferId"
+      auto comma = str->find(',');
+      auto comma2 = str->find(',', comma + 1);
+      if (comma != StringRef::npos && comma2 != StringRef::npos)
+        return str->slice(comma + 1, comma2);
+    }
+  }
+  return "";
+}
+
 template <class MMAOpTy>
 Attribute getLHSTMemLayout(MMAOpTy tcGen5MMAOp, gpu::MemDescType lhsTMEMType,
                            ttg::CGAEncodingAttr cgaLayout) {
@@ -42,26 +76,37 @@ public:
     if (localAllocOp->getParentRegion() != tcGen5MMAOp->getParentRegion())
       return failure();
     Value src = localAllocOp.getSrc();
+    // Check tt.autows annotation for explicit opndA memory type.
+    // If annotated as "smem", skip promotion. If "tmem", promote directly
+    // (skip the transposed-shared-source heuristic). If no annotation,
+    // fall through to the heuristic.
+    StringRef opndAMem = getOpndAMemType(tcGen5MMAOp);
+    if (opndAMem == "smem")
+      return failure();
+    bool annotatedTmem = (opndAMem == "tmem");
+
     // If the same source value is also allocated and transposed for use as
     // operand A of another gen5 MMA, skip promotion. The transposed path
     // cannot be promoted to tmem, so keeping both in smem avoids a redundant
     // tmem allocation and copy for the same data. This covers both:
     //   1. Same local_alloc used directly + through memdesc_trans
     //   2. Separate local_allocs from the same src, one transposed
-    for (Operation *srcUser : src.getUsers()) {
-      auto otherAlloc = dyn_cast<ttg::LocalAllocOp>(srcUser);
-      if (!otherAlloc)
-        continue;
-      for (Operation *allocUser : otherAlloc->getResult(0).getUsers()) {
-        if (auto transOp = dyn_cast<ttg::MemDescTransOp>(allocUser)) {
-          for (Operation *transUser : transOp->getResult(0).getUsers()) {
-            if (auto mmaOp = dyn_cast<TCGen5MMAOp>(transUser)) {
-              if (mmaOp.getA() == transOp->getResult(0))
-                return failure();
-            } else if (auto mmaScaledOp =
-                           dyn_cast<TCGen5MMAScaledOp>(transUser)) {
-              if (mmaScaledOp.getA() == transOp->getResult(0))
-                return failure();
+    if (!annotatedTmem) {
+      for (Operation *srcUser : src.getUsers()) {
+        auto otherAlloc = dyn_cast<ttg::LocalAllocOp>(srcUser);
+        if (!otherAlloc)
+          continue;
+        for (Operation *allocUser : otherAlloc->getResult(0).getUsers()) {
+          if (auto transOp = dyn_cast<ttg::MemDescTransOp>(allocUser)) {
+            for (Operation *transUser : transOp->getResult(0).getUsers()) {
+              if (auto mmaOp = dyn_cast<TCGen5MMAOp>(transUser)) {
+                if (mmaOp.getA() == transOp->getResult(0))
+                  return failure();
+              } else if (auto mmaScaledOp =
+                             dyn_cast<TCGen5MMAScaledOp>(transUser)) {
+                if (mmaScaledOp.getA() == transOp->getResult(0))
+                  return failure();
+              }
             }
           }
         }

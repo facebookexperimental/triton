@@ -40,7 +40,8 @@ an earlier partition scheduling pass (`PartitionSchedulingMeta`).
 | `WSTaskIdPropagate.cpp` | `doTaskIdPropagate` | Runs analysis and materializes task IDs |
 | `WSDataPartition.cpp` | `doDataPartition` | Splits ops along M/N dimensions across warp groups — Hopper only |
 | `PingPong.cpp` | `doPingPongPrep` / `doPingPongSync` | Named barrier insertion for ping-pong scheduling |
-| `WSBuffer.cpp` | `doBufferAllocation` | Inserts accumulation counters for multi-buffer indexing |
+| `WSCodePartition.cpp` | `doBufferAllocation` | Channel discovery and SMEM/TMEM allocation hoisting (pre-pass) |
+| `WSBuffer.cpp` | `appendAccumCntsForOps` | Accumulation counter infrastructure for multi-buffer indexing |
 | `WSMemoryPlanner.cpp` | `doMemoryPlanner` | Plans SMEM and TMEM allocation (multi-buffering, liveness) |
 | `WSCodePartition.cpp` | `doCodePartitionPost` | Creates channels, inserts async copies and barriers |
 | `WSLowerMem.cpp` | — | Memory lowering: async copies between global/shared/tensor memory |
@@ -86,7 +87,8 @@ an earlier partition scheduling pass (`PartitionSchedulingMeta`).
 - [Code Specialization](CodeSpecialization.md) — how ops are cloned into WarpSpecializeOp regions
 - [Memory Lowering](MemoryLowering.md) — async copy creation and TMA store lowering
 - [Token & Barrier Lowering](TokenBarrierLowering.md) — lowering abstract tokens to hardware mbarriers
-- [Buffer Allocation](BufferAllocation.md) — accumulation counter infrastructure for multi-buffering
+- [Buffer Allocation](BufferAllocation.md) — channel discovery and SMEM/TMEM allocation hoisting
+- [Accumulation Counters](AccumulationCounters.md) — accumulation counter infrastructure for multi-buffering
 - [Operand D Handling](OperandDHandling.md) — MMA accumulator lifecycle through WS
 - [TMEM Allocation Heuristics](TMEMAllocationHeuristics.md) — TMEM memory planning algorithms
 - [SMEM Allocation Design](SmemAllocationDesign.md) — SMEM budget-aware allocation

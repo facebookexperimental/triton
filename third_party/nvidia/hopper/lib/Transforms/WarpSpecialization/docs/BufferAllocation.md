@@ -1,101 +1,110 @@
 # Buffer Allocation
 
-Buffer allocation inserts accumulation counters (`accumCnt`) into the IR —
-loop-carried values that track which buffer slot to use in multi-buffered
-pipelines. This step runs after memory planning (which decides how many
-buffer copies each channel gets) and before code partitioning (which creates
-the actual async copies).
+Buffer allocation is a pre-pass that discovers cross-partition channels,
+creates or hoists SMEM and TMEM allocations to function scope, and
+normalizes `local_alloc` ops for downstream code partitioning passes.
 
-**File**: `WSBuffer.cpp`
-**Function**: `doBufferAllocation(funcOp, channels, ...)`
+**File**: `WSCodePartition.cpp`
+**Function**: `doBufferAllocation(funcOp)`
+**Pass**: `NVGPUTestWSBufferAllocation`
 
 ## Pipeline Context
 
 ```
-doMemoryPlanner         ← decides buffer.copy for each channel
-  → doBufferAllocation  ← THIS STEP: inserts accumCnt loop arguments
-  → doCodePartitionPost ← uses accumCnt to index into multi-buffered allocs
+doTaskIdPropagate       ← assigns async_task_id to all ops
+  → doBufferAllocation  ← THIS STEP: channels + alloc hoisting
+  → doMemoryPlanner     ← decides multi-buffering (buffer.copy)
+  → doCodePartitionPost ← inserts accumCnts, async copies, sync ops
 ```
 
-## What Is an Accumulation Counter?
-
-An **accumulation counter** (`accumCnt`) is an `i64` loop-carried value that
-starts at 0 and increments by 1 each time a buffer slot is consumed. It is
-used to compute:
-
-```
-bufferIdx = accumCnt % numBuffers    // which buffer slot
-phase     = (accumCnt / numBuffers) & 1  // mbarrier phase bit
-```
-
-Each channel (or reuse group of channels) that is multi-buffered needs its
-own `accumCnt` argument threaded through the enclosing control flow.
+`doBufferAllocation` creates single-copy buffers. Multi-buffering is
+decided later by the memory planner. Code partitioning then uses
+[accumulation counters](AccumulationCounters.md) to index into
+multi-buffered allocations.
 
 ## Algorithm
 
-### Step 1: Identify Channels Needing AccumCnt
+### Step 0: `swapTransposedLocalAllocs`
 
-A channel needs an accumulation counter when it has `numBuffers > 1` (is
-multi-buffered). Channels in a reuse group share a single `accumCnt`.
+When a `local_alloc` uses a transposed `#shared2` (NVMMAShared with
+`transposed=true`) layout and its only use is a `memdesc_trans` back to
+non-transposed `#shared` feeding MMA operand A, swap the layouts:
 
-### Step 2: Extend Loop Arguments (`createNewLoop`)
+```
+Before:  local_alloc → #shared_transposed  →  memdesc_trans → #shared
+After:   local_alloc → #shared             →  memdesc_trans → #shared_transposed
+```
 
-For each `scf::ForOp` that contains multi-buffered channels:
+This enables the alloc to share a buffer with other allocs of the same
+source that already use `#shared` layout.
 
-1. Create a new loop with additional `i64` block arguments — one per
-   accumulation counter.
-2. All arguments start at 0 (`arith::ConstantOp(0)`).
-3. The original loop body is moved into the new loop.
+### Step 0.5: `mergeDuplicateLocalAllocs`
 
-`createNewLoopWrapper` handles the case where the loop is wrapped in an
-outer structure.
+After layout normalization, merge `LocalAllocOp`s that have the same
+source value and the same `MemDescType` — replace duplicates with the
+first alloc.
 
-### Step 3: Extend If-Op Results (`rewriteIfOp`)
+### Step 1: `collectAsyncChannels`
 
-When `scf::IfOp` appears inside a loop with accumulation counters, its
-results must be extended to carry the `accumCnt` values through both the
-then and else branches:
+Walk the function to find cross-partition data dependencies. For each
+operation with a single `async_task_id` that is a **channel anchor op**
+(loads, dots, allocs with source, etc.), call `createChannel` to identify
+consumers in different partitions. All channels are created with
+`numBuffers=1` (single-buffered).
 
-- `generateYieldCntsForThenBlock`: generates yield values for the then branch
-- `generateYieldCntsForIfOp`: generates yield values for both branches
+### Step 2: `reorderEpilogOps`
 
-### Step 4: Update Counter Values (`updateAccumLoopCount`)
+Reorder epilogue operations (stores after the main loop) to align with
+the expected producer completion order. Groups stores by type
+(`DescriptorStoreOp` vs `StoreOp`) and interleaves them so
+earlier-completed producers are consumed first.
 
-Recursively processes nested `ForOp`/`IfOp` to thread `accumCnt` values
-correctly through all control flow. The counter is incremented at each
-point where a buffer slot is consumed (i.e., at the channel's destination
-operation).
+### Step 3: `createBuffer`
 
-### Step 5: Generate Yield Values
+The core step. For each channel (grouped by producer), create or hoist
+the backing allocation to function entry:
 
-- `generateYieldCntsForForOp`: at each loop yield, the `accumCnt` is
-  incremented by the number of times it was consumed in the loop body.
-- For reuse groups, the counter is shared — each channel in the group
-  offsets its buffer index by its position within the group.
+- **TMEM channels** (existing `TMEMAllocOp` or `TCGen5MMAOp` source):
+  Hoist the existing alloc to function entry via `hoistLocalAlloc`.
 
-## Interaction with Reuse Groups
+- **SMEM channels** (existing `LocalAllocOp` source):
+  Hoist the existing alloc to function entry via `hoistLocalAlloc`.
 
-When channels share a reuse group (same `buffer.id`), they share a single
-`accumCnt`:
+- **Tensor-typed channels** (no existing alloc):
+  Call `createLocalAlloc` which creates a new `LocalAllocOp` (SMEM)
+  or `TMEMAllocOp` (for 1D tensors on Blackwell ≥ cc100). For
+  post-channels (`isPost=true`), also inserts `LocalStoreOp` after
+  the producer and `LocalLoadOp` before the consumer.
 
-- `getAccumForReuseGroup`: computes the `accumCnt` SSA value at a given
-  operation by walking back through the channel list.
-- `getBufferIdxAndPhase`: for the first channel in the group, uses
-  `accumCnt` directly. Each subsequent channel at position N adds N to
-  stagger its slot within the shared circular buffer.
+Channels sharing the same producer value share the same buffer.
 
-See [Reuse Groups](ReuseGroups.md) for more details.
+### Step 4: `separateLocalAllocWithSrc`
+
+Split any remaining `local_alloc %val` (alloc-with-source) into
+`local_alloc` + `local_store %val`. This normalization exposes
+cross-partition SMEM dependencies as separate store ops, enabling
+downstream `doCodePartition`/`doCodePartitionPost` to detect them
+as channels.
+
+## Key Distinction
+
+`doBufferAllocation` does **not** insert:
+- Accumulation counters (see [Accumulation Counters](AccumulationCounters.md))
+- Async copies or TMA lowering
+- Tokens or synchronization ops (barriers, acquire/release)
+
+Those are handled by `doCodePartition` / `doCodePartitionPost`.
 
 ## Key Functions
 
-| Function | Description |
-|----------|-------------|
-| `appendAccumCntsForOps` | Entry point: identifies channels needing counters |
-| `createNewLoop` / `createNewLoopWrapper` | Extends `scf::ForOp` with extra block arguments |
-| `rewriteIfOp` | Extends `scf::IfOp` results with accumCnt outputs |
-| `updateAccumLoopCount` | Recursively threads counters through nested control flow |
-| `generateYieldCntsForForOp` | Generates loop yield values for counters |
-| `generateYieldCntsForIfOp` | Generates if-op yield values for counters |
-| `getAccumCount` | Retrieves the accumCnt value for an op from its enclosing loop |
-| `getAccumCnts` | Returns the number of accumCnt arguments for a control flow op |
-| `getAccumArgIdx` | Returns the starting index of accumCnt arguments in a block argument list |
+| Function | File | Description |
+|----------|------|-------------|
+| `doBufferAllocation` | `WSCodePartition.cpp` | Entry point |
+| `swapTransposedLocalAllocs` | `WSCodePartition.cpp` | Layout normalization for buffer sharing |
+| `mergeDuplicateLocalAllocs` | `WSCodePartition.cpp` | Dedup same-source allocs |
+| `collectAsyncChannels` | `WSCodePartition.cpp` | Channel discovery |
+| `reorderEpilogOps` | `WSCodePartition.cpp` | Epilogue store reordering |
+| `createBuffer` | `WSCodePartition.cpp` | Buffer creation / hoisting |
+| `createLocalAlloc` | `WSCodePartition.cpp` | New SMEM/TMEM alloc for tensor channels |
+| `hoistLocalAlloc` | `WSCodePartition.cpp` | Move existing alloc to function entry |
+| `separateLocalAllocWithSrc` | `WSCodePartition.cpp` | Split alloc+src into alloc + store |

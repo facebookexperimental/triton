@@ -1948,12 +1948,10 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
     } else if (auto tensorType =
                    dyn_cast<RankedTensorType>(srcValue.getType())) {
       int cc = getNVIDIAComputeCapability(funcOp->getParentOfType<ModuleOp>());
-      auto res = createLocalAlloc(
-          builder, channel,
-          isPost ? (cc >= 100 && tensorType.getShape().size() == 1 &&
-                    tensorType.getElementType().isIntOrFloat())
-                 : false,
-          isPost);
+      bool useTMEM = isPost && cc >= 100 && tensorType.getShape().size() == 1 &&
+                     tensorType.getElementType().isIntOrFloat() &&
+                     !isa<tt::DescriptorLoadOp>(srcOp);
+      auto res = createLocalAlloc(builder, channel, useTMEM, isPost);
       buffer = res.first;
       newProducer = res.second;
     } else {
