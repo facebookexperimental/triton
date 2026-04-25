@@ -18,7 +18,7 @@ class async_task:
         self.warp_group_start_id = None
         if args:
             assert len(args) == 1
-            if isinstance(args[0], core.constexpr) and args[0] == "default":
+            if core._unwrap_if_constexpr(args[0]) == "default":
                 self.is_explict = True
                 self.is_default = True
                 assert "num_regs" not in kwargs and "registers" not in kwargs, \
