@@ -1057,7 +1057,7 @@ LinearLayout tensorMemoryToLinearLayout(ArrayRef<int64_t> shape,
     auto newEncoding = TensorMemoryEncodingAttr::get(
         ctx, encoding.getBlockM(), encoding.getBlockN(),
         encoding.getColStride(), encoding.getCTASplitM(), 1,
-        encoding.getTwoCTAs());
+        encoding.getTwoCTAs(), encoding.getCtaMode());
     return tensorMemoryToLinearLayout(
                {shape[0], shape[1] / encoding.getCTASplitN()}, newEncoding) *
            split;
@@ -1074,7 +1074,7 @@ LinearLayout tensorMemoryToLinearLayout(ArrayRef<int64_t> shape,
     }
     auto newEncoding = TensorMemoryEncodingAttr::get(
         ctx, blockM, encoding.getBlockN(), encoding.getColStride(), 1,
-        encoding.getCTASplitN(), encoding.getTwoCTAs());
+        encoding.getCTASplitN(), encoding.getTwoCTAs(), encoding.getCtaMode());
     auto ret =
         tensorMemoryToLinearLayout({shape[0] / splitM, shape[1]}, newEncoding);
     // In this case, we swap the basis of the last row and last column

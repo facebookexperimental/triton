@@ -320,7 +320,8 @@ ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
     assert(false && "Unsupported encoding");
   }
   auto outputEncoding = ttng::TensorMemoryEncodingAttr::get(
-      context, blockM, blockN, colStride, CTASplitM, CTASplitN, twoCTAs);
+      context, blockM, blockN, colStride, CTASplitM, CTASplitN, twoCTAs,
+      ttng::TensorMemoryCTAMode::DEFAULT);
   if (highShape > 0) {
     llvm::SmallVector<int64_t> shapeVec{highShape, blockM, blockN};
     llvm::ArrayRef<int64_t> shape(shapeVec);

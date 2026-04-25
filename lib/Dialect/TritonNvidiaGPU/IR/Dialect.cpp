@@ -413,11 +413,10 @@ bool isDistributedLayoutTMemCompatible(Operation *op,
   return succeeded(computeTMemLdStEncodingInfo(tensorType, memType, maxnreg));
 }
 
-LogicalResult
-TensorMemoryEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
-                                 unsigned blockM, unsigned blockN,
-                                 unsigned colStride, unsigned CTASplitM,
-                                 unsigned CTASplitN, bool) {
+LogicalResult TensorMemoryEncodingAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, unsigned blockM,
+    unsigned blockN, unsigned colStride, unsigned CTASplitM, unsigned CTASplitN,
+    bool, TensorMemoryCTAMode) {
   if (!(CTASplitM >= 1 && CTASplitN >= 1 && llvm::isPowerOf2_32(CTASplitM) &&
         llvm::isPowerOf2_32(CTASplitN))) {
     return emitError()

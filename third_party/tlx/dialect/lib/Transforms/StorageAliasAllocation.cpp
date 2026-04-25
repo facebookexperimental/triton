@@ -154,7 +154,8 @@ LogicalResult materializeStorageAliasAllocations(
       auto tmemEncoding = ttng::TensorMemoryEncodingAttr::get(
           m.getContext(), blockM, blockN,
           /*colStride=*/1, /*CTASplitM=*/1, /*CTASplitN=*/1,
-          /*twoCTAs=*/false);
+          /*twoCTAs=*/false,
+          ttng::TensorMemoryCTAMode::DEFAULT); // todo: use non-default CTAMode?
       auto memDescType =
           ttg::MemDescType::get(tmemShape, tmemElemType, tmemEncoding,
                                 memorySpace, /*mutableMemory=*/true);

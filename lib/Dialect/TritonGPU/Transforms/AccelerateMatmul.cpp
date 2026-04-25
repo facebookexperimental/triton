@@ -576,7 +576,8 @@ public:
     unsigned colStride = 32 / bitwidth;
     Attribute accEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
         context, instrShape[0], instrShape[1], colStride, CTASplitNum[0],
-        CTASplitNum[1], useTwoCTAs);
+        CTASplitNum[1], useTwoCTAs,
+        triton::nvidia_gpu::TensorMemoryCTAMode::DEFAULT);
     Attribute tensorMemorySpace =
         triton::nvidia_gpu::TensorMemorySpaceAttr::get(context);
     MemDescType accMemDescType =
@@ -833,7 +834,8 @@ public:
     auto bitwidth = oldRetType.getElementType().getIntOrFloatBitWidth();
     unsigned colStride = 32 / bitwidth;
     Attribute accEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
-        context, m, n, colStride, CTASplitNum[0], CTASplitNum[1], false);
+        context, m, n, colStride, CTASplitNum[0], CTASplitNum[1], false,
+        triton::nvidia_gpu::TensorMemoryCTAMode::DEFAULT);
     Attribute tensorMemorySpace =
         triton::nvidia_gpu::TensorMemorySpaceAttr::get(context);
     MemDescType accMemDescType =

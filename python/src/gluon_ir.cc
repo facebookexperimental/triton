@@ -537,7 +537,7 @@ void init_gluon_ir(py::module &&m) {
              check(ctaSplitNum.size() == 2, "expected 2D CTA dimensions");
              return self.getChecked<ttng::TensorMemoryEncodingAttr>(
                  ctx, block[0], block[1], colStride, ctaSplitNum[0],
-                 ctaSplitNum[1], twoCTAs);
+                 ctaSplitNum[1], twoCTAs, ttng::TensorMemoryCTAMode::DEFAULT);
            })
       .def("get_tensor_memory_scales_layout",
            [](GluonOpBuilder &self,

@@ -925,7 +925,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
                     builder.getContext(), tmem.getBlockM(),
                     dim == 1 ? tmem.getBlockN() / 2 : tmem.getBlockN(),
                     tmem.getColStride(), tmem.getCTASplitM(),
-                    tmem.getCTASplitN(), tmem.getTwoCTAs());
+                    tmem.getCTASplitN(), tmem.getTwoCTAs(), tmem.getCtaMode());
             auto newType = MemDescType::get(shape, type.getElementType(),
                                             accEncoding, type.getMemorySpace(),
                                             type.getMutableMemory());
@@ -1104,7 +1104,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
           builder.getContext(), tmem.getBlockM(),
           dim == 1 ? tmem.getBlockN() / 2 : tmem.getBlockN(),
           tmem.getColStride(), tmem.getCTASplitM(), tmem.getCTASplitN(),
-          tmem.getTwoCTAs());
+          tmem.getTwoCTAs(), tmem.getCtaMode());
       auto newType = MemDescType::get(shape, retType.getElementType(),
                                       accEncoding, retType.getMemorySpace(),
                                       retType.getMutableMemory());

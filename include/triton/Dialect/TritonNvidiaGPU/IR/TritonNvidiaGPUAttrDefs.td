@@ -6,6 +6,21 @@ include "mlir/IR/EnumAttr.td"
 include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUDialect.td"
 include "triton/Dialect/Triton/IR/TritonInterfaces.td"
 
+//===----------------------------------------------------------------------===//
+// TensorMemoryCTAMode enum
+//===----------------------------------------------------------------------===//
+
+def TTNG_TensorMemoryCTAMode_Default    : I32EnumAttrCase<"DEFAULT",    0, "default">;
+def TTNG_TensorMemoryCTAMode_TwoCTA_LHS : I32EnumAttrCase<"TwoCTA_LHS", 1, "twocta_lhs">;
+def TTNG_TensorMemoryCTAMode_TwoCTA_RHS : I32EnumAttrCase<"TwoCTA_RHS", 2, "twocta_rhs">;
+
+def TTNG_TensorMemoryCTAMode : I32EnumAttr<"TensorMemoryCTAMode",
+    "Tensor memory CTA mode for LinearLayout conversion",
+    [TTNG_TensorMemoryCTAMode_Default, TTNG_TensorMemoryCTAMode_TwoCTA_LHS,
+     TTNG_TensorMemoryCTAMode_TwoCTA_RHS]> {
+  let cppNamespace = "::mlir::triton::nvidia_gpu";
+}
+
 def TTG_SharedClusterMemorySpace : AttrDef<TritonNvidiaGPU_Dialect, "SharedClusterMemorySpace"> {
   let mnemonic = "shared_cluster_memory";
   let description = [{
@@ -59,7 +74,8 @@ def TTG_TensorMemoryEncodingAttr : AttrDef<TritonNvidiaGPU_Dialect, "TensorMemor
     "unsigned":$colStride,
     DefaultValuedParameter<"unsigned", "1">:$CTASplitM,
     DefaultValuedParameter<"unsigned", "1">:$CTASplitN,
-    DefaultValuedParameter<"bool", "false">:$twoCTAs
+    DefaultValuedParameter<"bool", "false">:$twoCTAs,
+    DefaultValuedParameter<"TensorMemoryCTAMode", "TensorMemoryCTAMode::DEFAULT">:$ctaMode
   );
   let genVerifyDecl = 1;
   let assemblyFormat = "`<` struct(params) `>`";
