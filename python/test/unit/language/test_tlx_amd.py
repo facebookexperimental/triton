@@ -41,16 +41,20 @@ def is_gfx950_available():
 # Test: async_load compiles on gfx950 and produces the expected ops.
 # ---------------------------------------------------------------------------
 
+
 @triton.jit
 def _async_load_kernel(
-    x_ptr, y_ptr, output_ptr, n_elements,
+    x_ptr,
+    y_ptr,
+    output_ptr,
+    n_elements,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < n_elements
 
-    buffers = tlx.local_alloc((BLOCK_SIZE,), tl.float32, 2)
+    buffers = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, 2)
 
     buf0 = tlx.local_view(buffers, 0)
     buf1 = tlx.local_view(buffers, 1)
@@ -90,7 +94,7 @@ def test_async_load_correctness(device):
     x = torch.rand(size, dtype=torch.float32, device=device)
     y = torch.rand(size, dtype=torch.float32, device=device)
     output = torch.empty_like(x)
-    grid = (triton.cdiv(size, 64),)
+    grid = (triton.cdiv(size, 64), )
     _async_load_kernel[grid](x, y, output, size, BLOCK_SIZE=64)
     torch.testing.assert_close(x + y, output)
 
@@ -99,16 +103,19 @@ def test_async_load_correctness(device):
 # Test: local_load with relaxed=True sets the syncedViaAsyncWait attribute.
 # ---------------------------------------------------------------------------
 
+
 @triton.jit
 def _relaxed_load_kernel(
-    x_ptr, output_ptr, n_elements,
+    x_ptr,
+    output_ptr,
+    n_elements,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < n_elements
 
-    buf = tlx.local_alloc((BLOCK_SIZE,), tl.float32, 1)
+    buf = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, 1)
     buf0 = tlx.local_view(buf, 0)
     tok = tlx.async_load(x_ptr + offs, buf0, mask=mask)
     tlx.async_load_commit_group([tok])
@@ -136,7 +143,7 @@ def test_relaxed_local_load_correctness(device):
     size = 256
     x = torch.rand(size, dtype=torch.float32, device=device)
     output = torch.empty_like(x)
-    grid = (triton.cdiv(size, 64),)
+    grid = (triton.cdiv(size, 64), )
     _relaxed_load_kernel[grid](x, output, size, BLOCK_SIZE=64)
     torch.testing.assert_close(x, output)
 
@@ -145,9 +152,12 @@ def test_relaxed_local_load_correctness(device):
 # Test: async_token survives in scope around tl.range without crashing.
 # ---------------------------------------------------------------------------
 
+
 @triton.jit
 def _token_in_loop_kernel(
-    x_ptr, output_ptr, n_elements,
+    x_ptr,
+    output_ptr,
+    n_elements,
     BLOCK_SIZE: tl.constexpr,
     NUM_ITERS: tl.constexpr,
 ):
@@ -158,13 +168,13 @@ def _token_in_loop_kernel(
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < n_elements
 
-    buf = tlx.local_alloc((BLOCK_SIZE,), tl.float32, 1)
+    buf = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, 1)
     buf0 = tlx.local_view(buf, 0)
 
     tok = tlx.async_load(x_ptr + offs, buf0, mask=mask)
     tlx.async_load_commit_group([tok])
 
-    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_SIZE, ), dtype=tl.float32)
 
     # tok is in scope here -- that's what we're testing.
     for i in tl.range(0, NUM_ITERS, num_stages=0):
@@ -190,8 +200,10 @@ def test_async_token_loop_compiles_gfx950(device):
 # 1D gather test
 @triton.jit
 def local_gather_kernel(
-    matrix_ptr, indices_ptr, output_ptr, 
-    N: tl.constexpr, 
+    matrix_ptr,
+    indices_ptr,
+    output_ptr,
+    N: tl.constexpr,
     M: tl.constexpr,
 ):
     """Test lds gather using tlx.local_gather() with axis-based API."""
@@ -247,8 +259,10 @@ def test_local_gather(N, M):
 
 @triton.jit
 def local_scatter_kernel(
-    indices_ptr, values_ptr, output_ptr, 
-    N: tl.constexpr, 
+    indices_ptr,
+    values_ptr,
+    output_ptr,
+    N: tl.constexpr,
     M: tl.constexpr,
 ):
     """Test lds scatter using tlx.local_scatter() with axis-based API."""

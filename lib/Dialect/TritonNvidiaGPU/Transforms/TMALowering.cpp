@@ -182,8 +182,8 @@ public:
       return failure();
     }
     TensormapFenceproxyAcquireOp::create(rewriter, loc, descPtr);
-    auto newDesc = ReinterpretTensorDescOp::create(rewriter, loc, op.getType(),
-                                                   descPtr);
+    auto newDesc =
+        ReinterpretTensorDescOp::create(rewriter, loc, op.getType(), descPtr);
     rewriter.replaceOp(op, newDesc);
     return success();
   }

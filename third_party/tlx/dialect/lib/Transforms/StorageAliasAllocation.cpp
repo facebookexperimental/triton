@@ -152,12 +152,14 @@ LogicalResult materializeStorageAliasAllocations(
       auto memorySpace = ttng::TensorMemorySpaceAttr::get(m.getContext());
       auto tmemEncoding = ttng::TensorMemoryEncodingAttr::get(
           m.getContext(), blockM, blockN,
-          /*colStride=*/1, ttg::CGAEncodingAttr::get1CTALayout(m.getContext(), 2), /*twoCTAs=*/false);
+          /*colStride=*/1,
+          ttg::CGAEncodingAttr::get1CTALayout(m.getContext(), 2),
+          /*twoCTAs=*/false);
       auto memDescType =
           ttg::MemDescType::get(tmemShape, tmemElemType, tmemEncoding,
                                 memorySpace, /*mutableMemory=*/true);
       auto allocOp = ttng::TMEMAllocOp::create(builder, specOp.getLoc(),
-                                                       memDescType, nullptr);
+                                               memDescType, nullptr);
       allocResult = allocOp.getResult();
     }
 

@@ -681,8 +681,7 @@ def local_load(
         output = _semantic.builder.create_local_load(src.handle, token.handle if token else None)
         result = tl.tensor(output, block_type)
         if relaxed:
-            result.handle.set_attr("ttg.amdg.syncedViaAsyncWait",
-                                   _semantic.builder.get_bool_attr(True))
+            result.handle.set_attr("ttg.amdg.syncedViaAsyncWait", _semantic.builder.get_bool_attr(True))
         return result
 
 
@@ -716,7 +715,6 @@ def local_scatter(
     """
     scatter elements to shared memory along a specified axis using an indices tensor.
     """
-    block_type = tl.block_type(src.type.element_ty, indices.type.shape)
     storage = dst.type.storage
     assert storage == tlx.storage_kind.smem, "local_scatter only supports shared memory!"
     return tl.tensor(_semantic.builder.create_local_scatter(dst.handle, src.handle, indices.handle, axis), tl.void)
