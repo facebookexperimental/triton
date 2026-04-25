@@ -29,6 +29,16 @@ OpFoldResult RequireLayoutOp::fold(FoldAdaptor adaptor) {
   return {};
 }
 
+//-- ReleaseLayoutOp --
+
+OpFoldResult ReleaseLayoutOp::fold(FoldAdaptor adaptor) {
+  if (getType() == getSrc().getType()) {
+    // no-op
+    return getSrc();
+  }
+  return {};
+}
+
 //-- StorageAliasSpecOp --
 
 LogicalResult StorageAliasSpecOp::verify() {
