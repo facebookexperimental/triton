@@ -442,6 +442,12 @@ LogicalResult TensorMemoryEncodingAttr::verify(
 LogicalResult impl::verifyMMAv5Op(Operation *op) {
   auto isInterleaved = [](MemDescType memdesc) {
     auto enc = dyn_cast<TensorMemoryEncodingAttr>(memdesc.getEncoding());
+    if (!enc)
+      return false;
+    if (enc.getCtaMode() == TensorMemoryCTAMode::TwoCTA_LHS ||
+        enc.getCtaMode() == TensorMemoryCTAMode::TwoCTA_RHS) {
+      return false;
+    }
     return enc && getTmemAllocSizes(memdesc).numRows != 64 &&
            enc.getBlockM() == 64;
   };

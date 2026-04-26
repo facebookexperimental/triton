@@ -1096,20 +1096,40 @@ LinearLayout tensorMemoryToLinearLayout(ArrayRef<int64_t> shape,
   LinearLayout tile =
       LinearLayout::zeros1D(encoding.getColStride(), kCol, dims[1]);
   if (blockM == 64) {
-    tile *= LinearLayout::identity1D(16, kRow, dims[0]) *
-            LinearLayout::identity1D(blockN, kCol, dims[1]);
-    auto bases = tile.getBases();
-    if (shape[0] > blockM) {
-      bases[kRow].push_back({64, 0});
-    } else if (shape[1] > blockN) {
-      bases[kRow].push_back({0, blockN});
+    // BlockM=64(per CTA) in 2cta mode has special layouts for both LHS (A) and
+    // RHS (D)
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-data-path-layout-b
+    if (encoding.getCtaMode() ==
+        triton::nvidia_gpu::TensorMemoryCTAMode::TwoCTA_LHS) {
+      // This applies to all TMEM encoding in 2cta_m64 except accumulator of MMA
+      tile *= LinearLayout::identity1D(blockM, kRow, dims[0]) *
+              LinearLayout::identity1D(blockN, kCol, dims[1]);
+      tile *= LinearLayout::zeros1D(2, kRow, dims[0]);
+
+    } else if (encoding.getCtaMode() ==
+               triton::nvidia_gpu::TensorMemoryCTAMode::TwoCTA_RHS) {
+      // This applies to TMEM encoding in 2cta_m64 accumulator of MMA
+      tile = LinearLayout::identity1D(blockM, kRow, dims[0]) *
+             LinearLayout::identity1D(blockN / 2, kCol, dims[1]);
+      // row 64~127 stores the right half of the logical tensor (D[0:64, N/2:N])
+      tile *= LinearLayout::identity1D(2, kRow, dims[1]);
     } else {
-      // Empty, meaning the element is not defined
-      bases[kRow].push_back({0, 0});
+      // non 2cta_m64 cases
+      tile *= LinearLayout::identity1D(16, kRow, dims[0]) *
+              LinearLayout::identity1D(blockN, kCol, dims[1]);
+      auto bases = tile.getBases();
+      if (shape[0] > blockM) {
+        bases[kRow].push_back({64, 0});
+      } else if (shape[1] > blockN) {
+        bases[kRow].push_back({0, blockN});
+      } else {
+        // Empty, meaning the element is not defined
+        bases[kRow].push_back({0, 0});
+      }
+      bases[kRow].push_back({16, 0});
+      bases[kRow].push_back({32, 0});
+      tile = LinearLayout(std::move(bases), dims);
     }
-    bases[kRow].push_back({16, 0});
-    bases[kRow].push_back({32, 0});
-    tile = LinearLayout(std::move(bases), dims);
   } else {
     tile *= LinearLayout::identity1D(blockM, kRow, dims[0]) *
             LinearLayout::identity1D(blockN, kCol, dims[1]);
