@@ -2717,8 +2717,6 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
   if (!producerOp)
     return;
   auto producerTaskIds = getAsyncTaskIds(producerOp);
-  assert(producerTaskIds.size() == 1);
-  auto producerTaskId = producerTaskIds.front();
   // Collect consumer task IDs from all consumers. With data partitioning,
   // different consumers may have different task IDs (e.g., K/V buffers
   // consumed by multiple computation partitions).
@@ -2729,6 +2727,25 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
       if (seenTaskIds.insert(id).second)
         consumerTaskIds.push_back(id);
     }
+  }
+
+  // When a producer has multiple task IDs (e.g., a shared local_alloc
+  // consumed by data-partitioned computation groups), no channel is needed
+  // for any producer that is co-located with a consumer. It is unclear if
+  // is sufficient when there are multiple consumers.
+  AsyncTaskId producerTaskId = -1;
+  if (producerTaskIds.size() > 1 && consumerTaskIds.size() == 1) {
+    auto consumerTaskId = consumerTaskIds.front();
+    for (auto id : producerTaskIds) {
+      if (id != consumerTaskId) {
+        assert(producerTaskId == -1 &&
+               "Multiple producers encountered for 1 consumer");
+        producerTaskId = id;
+      }
+    }
+  } else {
+    assert(producerTaskIds.size() == 1);
+    producerTaskId = producerTaskIds.front();
   }
   // Remove producer task id from consumerTaskIds.
   auto iter = std::remove(consumerTaskIds.begin(), consumerTaskIds.end(),

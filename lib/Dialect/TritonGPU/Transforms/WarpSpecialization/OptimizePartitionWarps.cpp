@@ -164,6 +164,7 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
   SmallVector<unsigned> maxTensorRegs;
   for (Region *partition : wsOp.getPartitionRegions()) {
     unsigned &tensorRegs = maxTensorRegs.emplace_back(0);
+
     partition->walk([&](Operation *op) {
       for (Type type :
            llvm::concat<Type>(op->getOperandTypes(), op->getResultTypes())) {
@@ -207,7 +208,9 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
       if (isa<ttng::AsyncTMAGatherOp, ttng::AsyncTMAScatterOp>(op))
         *minWarps = 2;
       // TMEM ops require at least 4 warps to be able to read all lanes.
-      else if (isa<ttng::TMEMLoadOp, ttng::TMEMStoreOp, ttng::TMEMAllocOp>(op))
+      // WarpGroupDotOp requires a full warp group (4 warps).
+      else if (isa<ttng::TMEMLoadOp, ttng::TMEMStoreOp, ttng::TMEMAllocOp,
+                   ttng::WarpGroupDotOp>(op))
         *minWarps = 4;
     });
   }
@@ -306,7 +309,6 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
   for (auto [partition, newNumWarps, prevNumWarps, tensorRegs, estRegs] :
        llvm::zip(wsOp.getPartitionRegions(), partitionNumWarps,
                  wsOp.getPartitionNumWarps(), maxTensorRegs, estRegUsage)) {
-
     // "Guess" the register usage for each partition.
     estRegs = tensorRegs ? maxRegAutoWS : minRegAutoWS;
 
