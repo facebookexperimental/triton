@@ -170,11 +170,13 @@ void init_triton_tlx_ir(py::module &&m) {
            })
       .def("make_tensor_memory_encoding_attr",
            [](TritonOpBuilder &self, unsigned blockM, unsigned blockN,
-              unsigned colStride, unsigned CTASplitM, unsigned CTASplitN) {
+              unsigned colStride, unsigned CTASplitM, unsigned CTASplitN,
+              unsigned ctaMode) {
              auto context = self.getBuilder().getContext();
              return mlir::cast<Attribute>(ttng::TensorMemoryEncodingAttr::get(
                  context, blockM, blockN, colStride, CTASplitM, CTASplitN,
-                 /*twoCTAs=*/false, ttng::TensorMemoryCTAMode::DEFAULT));
+                 /*twoCTAs=*/false,
+                 static_cast<ttng::TensorMemoryCTAMode>(ctaMode)));
            })
       .def("make_tensor_memory_scales_encoding_attr",
            [](TritonOpBuilder &self, unsigned CTASplitM, unsigned CTASplitN) {

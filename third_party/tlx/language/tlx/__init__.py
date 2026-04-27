@@ -75,6 +75,7 @@ from .types import (
     tensor_descriptor_ptr,
     tensor_descriptor_ptr_type,
     tensor_memory_layout_encoding,
+    TMemCTAMode,
 )
 from .utility import (
     async_task_replica_id,
@@ -100,6 +101,7 @@ __all__ = [
     "shared_layout_encoding",
     "swizzled_shared_layout_encoding",
     "tensor_memory_layout_encoding",
+    "TMemCTAMode",
     "nv_mma_shared_layout_encoding",
     "storage_kind",
     "buffered_tensor",

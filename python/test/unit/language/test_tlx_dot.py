@@ -414,19 +414,9 @@ def test_async_dot_blackwell_not_use_d(device):
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
-def test_async_dot_blackwell_2cta_tma(device):
-    run_async_dot_blackwell_2cta_tma(device, False, 256)  # A in SMEM
-    run_async_dot_blackwell_2cta_tma(device, True, 256)  # A in TMEM
-
-    # M=64 per CTA, explicitly unsupported for now
-    # should throw a compilation error for users, but not NE assertion error
-    with pytest.raises(Exception) as e:
-        run_async_dot_blackwell_2cta_tma(device, False, 128)
-    assert isinstance(e.value, triton.CompilationError), "expecting a compilation error"
-    assert "only supports M=128 per CTA for pair-CTA mma" in e.value.error_message
-
-
-def run_async_dot_blackwell_2cta_tma(device, A_TMEM, SAMPLE_M):
+@pytest.mark.parametrize("A_TMEM", [False, True])
+@pytest.mark.parametrize("SAMPLE_M", [256, 128])
+def test_async_dot_blackwell_2cta_tma(device, A_TMEM, SAMPLE_M):
     """
     Test 2cta collective D = A*B for 1 tile.
     """
