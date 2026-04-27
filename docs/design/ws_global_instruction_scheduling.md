@@ -26,12 +26,13 @@ This document is based on the original design in [WS global instruction scheduli
   - [Step 4: Handling Resource Pressure (SMEM/TMEM Budget)](#step-4-handling-resource-pressure-smemtmem-budget)
   - [Step 4.5: Lifetime-Aware Buffer Merging](#step-45-lifetime-aware-buffer-merging)
   - [Step 4.6: Global Memory Budget Check](#step-46-per-region-memory-budget-allocation)
+  - [Step 4.7: Warp Group Partitioning](#step-47-warp-group-partitioning)
   - [Step 5: Emit ScheduleGraph](#step-5-emit-schedulegraph)
 - [Pass A.5: Data Partitioning for Improved Overlap (Optional)](#pass-a5-data-partitioning-for-improved-overlap-optional)
 - [Pass A.6: Scheduling Non-Loop Regions](#pass-a6-scheduling-non-loop-regions)
 - [Pass A.7: Epilogue Subtiling](#pass-a7-epilogue-subtiling)
 - [Pass B: Warp Specialization Reconstruction](#pass-b-warp-specialization-reconstruction)
-  - [Step 1: Partition Ops into Warp Groups](#step-1-partition-ops-into-warp-groups)
+  - [Step 1: Read Warp Groups from ScheduleGraph](#step-1-read-warp-groups-from-schedulegraph)
   - [Step 1.5: Replicate Shared Infrastructure Ops](#step-15-replicate-shared-infrastructure-ops)
   - [Step 2: Insert Synchronization](#step-2-insert-synchronization)
   - [Step 3: Compute Per-Region Loop Structure](#step-3-compute-per-region-loop-structure)
@@ -48,11 +49,11 @@ This document is based on the original design in [WS global instruction scheduli
   - [Pass A.7 Applied: Epilogue Subtiling (EPILOGUE_SUBTILE=4)](#pass-a7-applied-epilogue-subtiling-epilogue_subtile4)
   - [Pass A, Step 4: Memory Budget Check (After A.7)](#pass-a-step-4-memory-budget-check-after-a7)
   - [Pass A, Step 5: Emit ScheduleGraph](#pass-a-step-5-emit-schedulegraph)
-  - [Pass B, Step 1: Partition into Warp Groups](#pass-b-step-1-partition-into-warp-groups)
+  - [Pass A, Step 4.7: Warp Group Partition](#pass-a-step-47-warp-group-partition)
   - [Pass B, Step 2: Insert Synchronization](#pass-b-step-2-insert-synchronization)
   - [Pass B, Step 5: Generated TLX Code](#pass-b-step-5-generated-tlx-code)
   - [Algorithm → TLX Code Mapping Summary](#algorithm--tlx-code-mapping-summary)
-  - [Pass B, Step 1: Partition into Warp Groups](#pass-b-step-1-partition-into-warp-groups)
+  - [Pass A, Step 4.7: Warp Group Partition](#pass-a-step-47-warp-group-partition)
   - [Pass B, Step 2: Insert Synchronization](#pass-b-step-2-insert-synchronization)
   - [Pass B, Step 5: Generated TLX Code](#pass-b-step-5-generated-tlx-code)
   - [Algorithm → TLX Code Mapping Summary](#algorithm--tlx-code-mapping-summary)
@@ -63,7 +64,7 @@ This document is based on the original design in [WS global instruction scheduli
   - [Pass A, Step 2: Modulo Schedule](#pass-a-step-2-modulo-schedule-1)
   - [Pass A, Step 3: Derive Pipeline Depths](#pass-a-step-3-derive-pipeline-depths-1)
   - [Pass A, Step 4: Memory Budget Check](#pass-a-step-4-memory-budget-check-1)
-  - [Pass B, Step 1: Partition into Warp Groups](#pass-b-step-1-partition-into-warp-groups-1)
+  - [Pass A, Step 4.7: Warp Group Partition](#pass-a-step-47-warp-group-partition-1)
   - [Pass B, Step 2: Insert Synchronization](#pass-b-step-2-insert-synchronization-1)
   - [Pass B, Step 5: Generated TLX Code](#pass-b-step-5-generated-tlx-code-1)
   - [Algorithm → TLX Code Mapping Summary](#algorithm--tlx-code-mapping-summary-1)
@@ -75,7 +76,7 @@ This document is based on the original design in [WS global instruction scheduli
   - [Pass A, Step 2: Modulo Schedule](#pass-a-step-2-modulo-schedule-2)
   - [Pass A, Step 3: Derive Pipeline Depths](#pass-a-step-3-derive-pipeline-depths-2)
   - [Pass A, Step 4: Memory Budget Check](#pass-a-step-4-memory-budget-check-2)
-  - [Pass B, Step 1: Partition into Warp Groups](#pass-b-step-1-partition-into-warp-groups-2)
+  - [Pass A, Step 4.7: Warp Group Partition](#pass-a-step-47-warp-group-partition-2)
   - [Pass B, Step 2: Insert Synchronization](#pass-b-step-2-insert-synchronization-2)
   - [Pass B, Step 5: Generated TLX Code](#pass-b-step-5-generated-tlx-code-2)
   - [Algorithm → TLX Code Mapping Summary](#algorithm--tlx-code-mapping-summary-2)
@@ -134,7 +135,7 @@ The design doc describes the algorithm using TLX (the Python DSL) for illustrati
 ```
 Phase 0 (Schedule):   DDG + Rau's → populate ScheduleNode.cycle/stage
 Phase 1 (Buffers):    Stage diffs → populate ScheduleBuffer.count
-Phase 1.5 (WS):       Utilization → assign ScheduleNode.warpGroup
+Phase 1.5 (WS):       Separation cost + makespan → assign ScheduleNode.warpGroup
 Phase 2 (Expand):     Bottom-up → populate prologueNodes/epilogueNodes
 Phase 3 (Lower):      ScheduleGraph → replace MLIR ops with async copies + barriers
 ```
@@ -152,11 +153,12 @@ Phases 0-2 (Pass A + Pass B) operate entirely on the ScheduleGraph, accumulating
 | A.3 Buffer depths | `ScheduleBuffer.count` (from stage diffs) |
 | A.4 SMEM/TMEM budget | `ScheduleBuffer.sizeBytes()` × `count` |
 | A.4.5 Buffer merging | `ScheduleBuffer.mergeGroupId` (planned) |
+| A.4.7 Warp group partition | `ScheduleNode.warpGroup`, `ScheduleLoop.warpGroups` |
 | Step 5: Emit ScheduleGraph | All fields — packages accumulated decisions into the final graph output |
 | A.5 Data partitioning | DDG transform → rebuild ScheduleGraph from fresh DDG |
 | A.6 List scheduling | Same `ScheduleNode`/`ScheduleEdge`, stage always 0 |
 | A.7 Epilogue subtiling | DDG transform → rebuild ScheduleGraph from fresh DDG |
-| B.1 Warp group partition | `ScheduleNode.warpGroup` |
+| B.1 Read warp groups | Read `ScheduleNode.warpGroup` from ScheduleGraph |
 | B.1.5 Replicate infra ops | Ops with `pipeline == NONE` cloned per group |
 | B.2 Barrier insertion | `ScheduleBuffer(kind=BARRIER, pairedBufferId)` |
 | B.3 Prologue/epilogue structure | `ScheduleLoop.{prologueNodes, epilogueNodes, maxStage}` |
@@ -221,9 +223,9 @@ Key observations:
 
 The algorithm proceeds in three main passes:
 
-**Pass A — Scheduling (iterative):** An iterative refinement loop that schedules all code regions, derives pipeline depths, checks resource budgets, and applies DDG transformations — re-running until the schedule stabilizes. DDG nodes are lowered during construction (see [Op Lowering](#2-op-lowering)): each node has target-accurate `selfLatency` (pipeline occupancy) and `latency` (edge weight), and synthetic `local_load`/`local_store` nodes make buffer access explicit with symbolic, unaliased buffer references. **Loop regions** use modulo scheduling (Rau's algorithm) to minimize II; **non-loop regions** use list scheduling to minimize makespan. Both produce the same `(cycle, pipeline, stage, cluster)` output. From the schedule, it derives buffer depths (with live intervals) for all regions, merges buffers with non-overlapping lifetimes (Step 4.5), and then performs a **kernel-wide** SMEM/TMEM budget check (Step 4.6) — the budget is a global constraint checked after all regions have their pipeline depths, not per-region. Then it considers two DDG transformations: **data partitioning** (Pass A.5) splits underutilized loop ops into sub-tiles, and **epilogue subtiling** (Pass A.7) splits monolithic TMA stores into independent sub-chains. If either transformation modifies a DDG, Pass A re-runs from the top — the freed SMEM may enable higher pipeline depth, changing II and the entire schedule. Converges in 1-2 iterations. The final output is a **ScheduleGraph** (Step 5) that packages all accumulated decisions — cycles, stages, buffers with lifetimes, merge groups — into a single side data structure for downstream passes.
+**Pass A — Scheduling (iterative):** An iterative refinement loop that schedules all code regions, derives pipeline depths, checks resource budgets, partitions ops into warp groups, and applies DDG transformations — re-running until the schedule stabilizes. DDG nodes are lowered during construction (see [Op Lowering](#2-op-lowering)): each node has target-accurate `selfLatency` (pipeline occupancy) and `latency` (edge weight), and synthetic `local_load`/`local_store` nodes make buffer access explicit with symbolic, unaliased buffer references. **Loop regions** use modulo scheduling (Rau's algorithm) to minimize II; **non-loop regions** use list scheduling to minimize makespan. Both produce the same `(cycle, pipeline, stage, cluster)` output. From the schedule, it derives buffer depths (with live intervals) for all regions, merges buffers with non-overlapping lifetimes (Step 4.5), and then performs a **kernel-wide** SMEM/TMEM budget check (Step 4.6) — the budget is a global constraint checked after all regions have their pipeline depths, not per-region. After the budget check, **Step 4.7 partitions ops into warp groups** using latency-aware multi-pipeline clustering: it computes a **separation cost** for each cross-pipeline DDG edge (barrier overhead relative to the cycle gap) and uses **multi-pipeline makespan** analysis to validate that merged groups can execute within II. This naturally produces mixed-pipeline groups when the latency structure demands it (e.g., CUDA+SFU for compute, CUDA+MEM for epilogue) while keeping well-separated pipelines in dedicated groups (e.g., GEMM's MEM and TC). Then it considers two DDG transformations: **data partitioning** (Pass A.5) splits underutilized loop ops into sub-tiles, and **epilogue subtiling** (Pass A.7) splits monolithic TMA stores into independent sub-chains. If either transformation modifies a DDG, Pass A re-runs from the top — the freed SMEM may enable higher pipeline depth, changing II, the warp group partition, and the entire schedule. Converges in 1-2 iterations. The final output is a **ScheduleGraph** (Step 5) that packages all accumulated decisions — cycles, stages, buffers with lifetimes, merge groups, and warp group assignments — into a single side data structure for downstream passes.
 
-**Pass B — Warp Specialization Reconstruction:** Partitions ops into warp groups based on per-pipeline utilization derived from the schedule. Pipelines with >30% utilization get dedicated warp groups; underutilized pipelines are merged into the group with the most data dependency edges. The pass then inserts barrier synchronization at cross-group boundaries, computes prologue/epilogue loop structure (prolog depth = max stage across all ops), assigns warp counts and registers, and generates the warp-specialized code structure.
+**Pass B — Warp Specialization Reconstruction:** Reads the pre-computed warp group partition from the ScheduleGraph (Step 1), then replicates shared infrastructure ops into each group (Step 1.5), inserts barrier synchronization at cross-group boundaries (Step 2), computes prologue/epilogue loop structure (Step 3, prolog depth = max stage across all ops), assigns warp counts and registers (Step 4), and generates the warp-specialized code structure (Step 5). Pass B makes no partitioning decisions — it reconstructs the code from Pass A's ScheduleGraph.
 
 **Pass C — Code Generation and Instruction Ordering:** Takes the `(stage, cluster)` assignments from Pass A and the warp-specialized code skeleton from Pass B. For **loop regions**, generates the prologue/kernel/epilogue loop structure. For **non-loop regions**, reorders ops by cluster ID. Pass C makes no scheduling decisions — all ordering is determined by Pass A's cluster IDs.
 
@@ -257,6 +259,14 @@ The algorithm proceeds in three main passes:
 │                      │                              │
 │                      ▼                              │
 │  ┌────────────────────────────────────────────────┐ │
+│  │  Step 4.7: Warp group partitioning             │ │
+│  │    Separation cost from cycle gaps + DDG       │ │
+│  │    Multi-pipeline makespan validation          │ │
+│  │    Greedy merge of tightly-coupled pipelines   │ │
+│  └───────────────────┬────────────────────────────┘ │
+│                      │                              │
+│                      ▼                              │
+│  ┌────────────────────────────────────────────────┐ │
 │  │  DDG transformations:                          │ │
 │  │    A.5: Data partitioning (loop DDGs)          │ │
 │  │    A.7: Epilogue subtiling (epilogue DDG)      │ │
@@ -280,14 +290,16 @@ The algorithm proceeds in three main passes:
 ┌─────────────────────────────────────────────────────┐
 │  Step 5: Emit ScheduleGraph                         │
 │    Package all decisions into a ScheduleGraph:      │
-│    cycles, stages, buffers, lifetimes, merge groups  │
+│    cycles, stages, buffers, lifetimes, merge groups, │
+│    warp group assignments (from Step 4.7)            │
 └──────────────────────┬──────────────────────────────┘
                        │
-                       ▼  ScheduleGraph
+                       ▼  ScheduleGraph (with warp groups)
 ┌─────────────────────────────────────────────────────┐
 │  Pass B: Reconstruct warp specialization            │
 │    Input: ScheduleGraph from Pass A                 │
-│    Step 1: Partition ops into warp groups            │
+│    Step 1: Read warp groups from ScheduleGraph      │
+│    Step 1.5: Replicate shared infrastructure ops    │
 │    Step 2: Insert barriers at group boundaries      │
 │    Step 3: Compute per-region loop structure         │
 │    Step 4: Assign warp counts and registers         │
@@ -309,9 +321,9 @@ The algorithm proceeds in three main passes:
 │      · Per-op (cycle, pipeline, stage, cluster)     │
 │      · Per-buffer (count, liveStart, liveEnd)       │
 │      · Buffer merge groups                          │
-│    - Warp group partitioning (Pass B)               │
+│      · Warp group assignments (Step 4.7)            │
 │    - Barrier synchronization (Pass B)               │
-│    - Prologue/epilogue structure (Pass C)            │
+│    - Prologue/epilogue structure (Pass B/C)          │
 │    - Per-warp instruction ordering (Pass C)         │
 └─────────────────────────────────────────────────────┘
 
@@ -344,7 +356,7 @@ The algorithm as described has several limitations:
 
 4. **Barrier overhead not modeled in Pass A**: The modulo schedule does not account for the ~20-30 cycle cost of barrier wait/arrive operations. For kernels with many cross-group barriers per iteration (e.g., FA backward with ~20 barrier types), this overhead can shift actual timings relative to the schedule. A more accurate model would include barrier costs in the latency table.
 
-5. **1:1 pipeline-to-warp-group assumption**: Pass A assumes each warp group maps to a single pipeline. This holds for MMA (TC) and producer (MEM) groups but breaks for mixed groups like the epilogue (CUDA + MEM) or compute (CUDA + SFU). For mixed groups, Pass A would need to schedule across multiple pipelines within one warp group.
+5. **~~1:1 pipeline-to-warp-group assumption~~ (addressed)**: Pass A Step 4.7 now uses latency-aware multi-pipeline clustering instead of a 1:1 pipeline-to-warp-group mapping. The algorithm computes separation cost from the modulo schedule's cycle assignments and validates merged groups via multi-pipeline makespan analysis, naturally producing mixed-pipeline warp groups (e.g., CUDA+SFU for compute, CUDA+MEM for epilogue) when tightly-coupled cross-pipeline ops would incur excessive barrier overhead if separated. See [Step 4.7: Warp Group Partitioning](#step-47-warp-group-partitioning) for details.
 
 6. **No multi-CTA or cluster-level scheduling**: The algorithm schedules within a single CTA. Multi-CTA kernels (e.g., `blackwell_gemm_2cta.py`) require additional coordination for cross-CTA B-tile sharing and cluster-level barrier synchronization, which is handled separately.
 
@@ -474,14 +486,20 @@ Here `local_store` is a real DDG node (not synthetic) with `pipeline = MEM` and 
 
 #### selfLatency / latency Summary (Blackwell)
 
-| TTGIR Op | DDG Node(s) | selfLatency | latency | Pipeline |
-|----------|------------|----------:|--------:|----------|
-| `tt.descriptor_load` | `tma_load` (→buf) + `local_load` (←buf, synthetic) | 20 / 0 | 520 / 0 | MEM / NONE |
-| `tt.descriptor_store` | `tma_store` (←buf) | 20 | 600 | MEM |
-| `ttg.local_store` | `local_store` (→buf, real IR op) | 150 | 150 | MEM |
-| `ttng.tc_gen5_mma` | `mma` | 900 | 900 | TC |
-| `ttng.tmem_load` | `tmem_load` | 200 | 200 | TC |
-| CUDA/SFU ops | 1:1 | varies | = selfLatency | CUDA/SFU |
+| TTGIR Op | DDG Node(s) | selfLatency | transferLatency | latency | Pipeline |
+|----------|------------|----------:|----------------:|--------:|----------|
+| `tt.descriptor_load` | `tma_load` (→buf) + `local_load` (←buf, synthetic) | 30 / 0 | 520 / — | 1220 / 0 | MEM / NONE |
+| `tt.descriptor_store` | `tma_store` (←buf) | 30 | 520 | 1220 | MEM |
+| `ttg.local_store` | `local_store` (→buf, real IR op) | 150 | 150 | 150 | MEM |
+| `ttng.tc_gen5_mma` | `mma` | 30 | — | 900 | TC |
+| `ttng.tmem_load` | `tmem_load` | 200 | — | 200 | TC |
+| CUDA/SFU ops | 1:1 | varies | — | = selfLatency | CUDA/SFU |
+
+**selfLatency** is the issue cost — how long the SM's dispatch pipeline is busy before it can accept the next operation. For async ops (TMA loads/stores, MMA), this is much smaller than the full execution time because the hardware unit (TMA engine, tensor cores) runs independently after the SM issues the command.
+
+**transferLatency** is the full transfer/execution time on the hardware unit. For MEM ops, this is used as the edge weight from `tma_load` to `local_alloc` so that the alloc is placed at the correct cycle (when data actually arrives in SMEM), independent of the SM's dispatch cost.
+
+**latency** is the total time from op issue to result availability for consumers. For TMA loads: `transferLatency + kTMAAsyncOverhead` (DRAM round-trip). For MMA: the full tensor core execution time.
 
 ### 3. Functional Unit Mapping
 
@@ -515,7 +533,7 @@ Execution time per operation in cycles (from microbenchmarks):
 
 - Each pipeline can execute **one op at a time** per warpgroup
 - Distinct pipelines **can overlap** (MEM + TC + CUDA + SFU all concurrent)
-- An op **occupies** its pipeline for its full latency duration
+- An op **occupies** its pipeline for its **selfLatency** (issue cost), not its full execution time. For async ops (TMA, MMA), the hardware unit executes independently after the SM issues the command, so the pipeline is free to accept the next op after the issue cost
 
 ---
 
@@ -559,6 +577,17 @@ def pass_a(kernel_regions, latency_model, memory_budget):
                 pipeline_config, memory_budget, kernel_regions
             )
 
+        # Step 4.7: warp group partitioning (latency-aware multi-pipeline clustering)
+        # Uses cycle assignments from the modulo schedule to compute separation
+        # costs, then greedily merges tightly-coupled pipeline groups validated
+        # by multi-pipeline makespan analysis. Inside the loop so it gets
+        # recomputed when DDG transformations change the schedule.
+        for region in kernel_regions:
+            region.warp_groups = partition_into_warp_groups(
+                region.schedule, region.DDG, unit_map,
+                self_latencies, latencies, region.II
+            )
+
         # DDG transformations
         ddg_changed = False
 
@@ -579,7 +608,7 @@ def pass_a(kernel_regions, latency_model, memory_budget):
         if not ddg_changed:
             break  # Converged
 
-    # Step 5: Emit ScheduleGraph
+    # Step 5: Emit ScheduleGraph (includes warp group assignments)
     return build_schedule_graph(kernel_regions, pipeline_config)
 ```
 
@@ -1649,6 +1678,222 @@ This cost model makes the region priority **automatic** — no hardcoded table n
 | **Outer tile loop** | ~num_tiles (e.g., 64) | 6,400 cycles | Reduce second |
 | **K-loop** | ~K/BLOCK_K (e.g., 1024) | 102,400 cycles | Reduce last |
 
+### Step 4.7: Warp Group Partitioning
+
+After the memory budget is resolved, Pass A partitions ops into warp groups using **latency-aware multi-pipeline clustering**. This step uses the modulo schedule's cycle assignments and DDG latencies — both already computed — to determine which pipelines should share a warp group and which should be separated.
+
+This decision is made in Pass A (not Pass B) because:
+1. It depends entirely on Pass A's outputs (cycles, latencies, pipeline utilization)
+2. It must be recomputed when DDG transformations change the schedule
+3. It belongs in the ScheduleGraph so Pass B can reconstruct the code without re-deriving the partition
+
+The algorithm uses two signals:
+
+1. **Separation cost**: For each cross-pipeline DDG edge, the barrier overhead (∼30 cycles) relative to the cycle gap between the two ops. High cost means tightly coupled (should stay together); low cost means loosely coupled (safe to separate).
+
+2. **Multi-pipeline makespan**: Whether a candidate merged group can execute all its ops within II, given that different pipelines overlap but data dependencies serialize. Computed via list scheduling with per-pipeline resource tracking.
+
+#### Separation Cost
+
+```python
+def compute_separation_cost(DDG, schedule, unit_map):
+    """
+    For each pair of pipelines, compute the total cost of separating them
+    into different warp groups.
+
+    Cost = barrier overhead / cycle gap for each cross-pipeline edge.
+    High cost means tight coupling (should stay together).
+    Low cost means loose coupling (safe to separate).
+    """
+    BARRIER_OVERHEAD = 30  # cycles for mbarrier arrive+wait round-trip
+
+    coupling = defaultdict(float)
+
+    for edge in DDG.edges:
+        p_src = unit_map[edge.src]
+        p_dst = unit_map[edge.dst]
+        if p_src == p_dst:
+            continue
+
+        # Cycle gap from the modulo schedule tells us how much slack
+        # exists between these ops. Large gap = barrier is cheap relative
+        # to the gap. Small gap = barrier overhead dominates.
+        cycle_gap = schedule[edge.dst].cycle - schedule[edge.src].cycle
+        if cycle_gap <= 0:
+            # Loop-carried or negative offset: treat as maximally tight
+            cycle_gap = 1
+
+        coupling[(p_src, p_dst)] += BARRIER_OVERHEAD / cycle_gap
+
+    return coupling
+```
+
+**Examples:**
+- GEMM: `tma_load(MEM, cycle=0) → mma(TC, cycle=1038)` → `coupling(MEM,TC) += 30/1038 ≈ 0.03` (very low — safe to separate)
+- FA epilogue: `truncf(CUDA, cycle=200) → local_store(MEM, cycle=300)` → `coupling(CUDA,MEM) += 30/100 = 0.30` (high — should keep together)
+- FA compute: `Scale(CUDA, cycle=130) → Exp2(SFU, cycle=260)` → `coupling(CUDA,SFU) += 30/130 ≈ 0.23` (moderate-high — benefits from co-location)
+
+#### Multi-Pipeline Makespan
+
+```python
+def compute_multi_pipeline_makespan(ops, DDG, self_latencies, latencies, unit_map):
+    """
+    Compute the critical path through a set of ops executing on multiple
+    pipelines within a single warp group.
+
+    Key property: different pipelines overlap (each tracks its own
+    availability), but data dependencies between them serialize.
+
+    Returns the makespan. If <= II, the group can sustain the
+    steady-state iteration rate.
+    """
+    pipe_avail = defaultdict(lambda: 0)  # pipe -> earliest free cycle
+    op_start = {}
+
+    for op in topological_sort(ops, DDG):
+        # Data dependency constraint: wait for all predecessors
+        data_ready = max(
+            (op_start[p] + latencies[p] for p in preds(op, DDG) if p in op_start),
+            default=0
+        )
+
+        # Pipeline constraint: wait for same-pipeline predecessor to finish
+        # issuing (selfLatency, not full latency — async ops free the
+        # pipeline after issue)
+        pipe_ready = pipe_avail[unit_map[op]]
+
+        start = max(data_ready, pipe_ready)
+        op_start[op] = start
+        pipe_avail[unit_map[op]] = start + self_latencies[op]
+
+    # Makespan = latest completion time across all ops
+    return max(
+        op_start[op] + self_latencies[op] for op in ops
+    )
+```
+
+**How this handles mixed-pipeline groups:**
+- **CUDA + SFU** (e.g., FA compute): CUDA and SFU track separate `pipe_avail`, so `Scale(CUDA)` and `Exp2(SFU)` can overlap if data-independent. But `Scale → Exp2` has a data edge, so it serializes through `data_ready`. The makespan correctly reflects the critical path through both pipelines.
+- **TC + CUDA + MEM** (e.g., epilogue): `tmem_load(TC) → truncf(CUDA) → local_store(MEM) → tma_store(MEM)`. Each op uses a different pipeline (except the last two on MEM), so pipeline conflicts are minimal. The makespan is dominated by the data dependency chain, not pipeline contention.
+
+#### Partitioning Algorithm
+
+```python
+def partition_into_warp_groups(schedule, DDG, unit_map, self_latencies, latencies, II):
+    """
+    Latency-aware multi-pipeline warp group partitioning.
+
+    Starts with one group per active pipeline, then greedily merges
+    tightly-coupled pairs. Each merge is validated by checking that
+    the merged group's multi-pipeline makespan fits within II.
+    """
+    coupling = compute_separation_cost(DDG, schedule, unit_map)
+
+    # Compute per-pipeline utilization (for fast feasibility rejection)
+    pipe_util = {}
+    for pipe in [MEM, TC, CUDA, SFU]:
+        busy = sum(self_latencies[op] for op in schedule if unit_map[op] == pipe)
+        pipe_util[pipe] = busy / II
+
+    # Initialize: one candidate group per active pipeline
+    groups = []
+    for pipe in [MEM, TC, CUDA, SFU]:
+        ops = [op for op in schedule if unit_map[op] == pipe]
+        if ops:
+            groups.append(WarpGroup(
+                pipelines={pipe},
+                ops=ops,
+                util={pipe: pipe_util[pipe]},
+            ))
+
+    # Greedy agglomerative merging
+    while len(groups) > 1:
+        best_pair = None
+        best_savings = 0
+
+        for i, g1 in enumerate(groups):
+            for j, g2 in enumerate(groups):
+                if i >= j:
+                    continue
+
+                # Benefit: total barrier overhead saved by merging
+                savings = sum(
+                    coupling.get((p1, p2), 0) + coupling.get((p2, p1), 0)
+                    for p1 in g1.pipelines
+                    for p2 in g2.pipelines
+                )
+
+                if savings <= best_savings:
+                    continue
+
+                # Fast reject: if any single pipeline is oversubscribed
+                # in the merged group, skip (utilization > 1.0 means
+                # more work on that pipeline than II allows)
+                merged_util = {**g1.util}
+                for pipe, u in g2.util.items():
+                    merged_util[pipe] = merged_util.get(pipe, 0) + u
+                if any(u > 1.0 for u in merged_util.values()):
+                    continue
+
+                # Precise check: multi-pipeline makespan
+                merged_ops = g1.ops + g2.ops
+                makespan = compute_multi_pipeline_makespan(
+                    merged_ops, DDG, self_latencies, latencies, unit_map
+                )
+                if makespan > II:
+                    continue
+
+                best_pair = (i, j)
+                best_savings = savings
+
+        if best_pair is None:
+            break  # No beneficial merge found
+
+        # Execute the merge
+        i, j = best_pair
+        merged = WarpGroup(
+            pipelines=groups[i].pipelines | groups[j].pipelines,
+            ops=groups[i].ops + groups[j].ops,
+            util={p: groups[i].util.get(p, 0) + groups[j].util.get(p, 0)
+                  for p in groups[i].pipelines | groups[j].pipelines},
+        )
+        groups[i] = merged
+        del groups[j]
+
+    return groups
+```
+
+#### Worked Examples
+
+**GEMM (2 active pipelines: MEM, TC):**
+- Initial groups: `[WarpGroup({MEM}), WarpGroup({TC})]`
+- `coupling(MEM, TC)` = 30/1038 ≈ 0.03 (loads fire 1038 cycles before MMA)
+- Savings from merging = 0.03 (negligible)
+- Result: **no merge** → 2 groups, same as before
+
+**FA Forward epilogue (TC → CUDA → MEM chain):**
+- Initial groups: `[WarpGroup({TC}), WarpGroup({CUDA}), WarpGroup({MEM})]`
+- `coupling(TC, CUDA)` = 0.15, `coupling(CUDA, MEM)` = 0.30, `coupling(TC, MEM)` ≈ 0
+- First merge: CUDA + MEM (highest savings = 0.30), makespan check passes (ops are sequential on different pipelines, well within II)
+- Second merge: TC + {CUDA, MEM} (savings = 0.15), makespan check passes
+- Result: **single group {TC, CUDA, MEM}** — all epilogue ops in one warp group, no barriers needed
+
+**FA Forward compute (CUDA + SFU):**
+- Initial groups: `[WarpGroup({CUDA}), WarpGroup({SFU})]`
+- `coupling(CUDA, SFU)` = 0.23 (tight data dependency chain: Scale → Exp2 → RowSum)
+- Makespan check: CUDA and SFU ops overlap (different pipelines), critical path ≈ sum of data-dependent latencies, fits within II
+- Result: **single group {CUDA, SFU}** — compute ops co-located, avoiding barrier overhead on the tight Scale→Exp2→RowSum chain
+
+**FA Forward main loop (all 4 pipelines):**
+- MEM util = 0.80, TC util = 0.97, CUDA util = 0.67, SFU util = 0.44
+- MEM↔TC coupling ≈ 0.03 (loads far from MMA)
+- CUDA↔SFU coupling ≈ 0.23 (tightly coupled compute chain)
+- CUDA↔TC coupling ≈ 0.05 (moderate: softmax feeds MMA but with slack)
+- Merge 1: CUDA + SFU → {CUDA, SFU}, makespan OK (different pipelines overlap)
+- Merge 2: MEM + TC? savings = 0.03, but merged util(MEM+TC) feasible → not worth it (savings too low)
+- Merge 3: {CUDA, SFU} + TC? TC util = 0.97, merged makespan likely > II → rejected
+- Result: **3 groups: {MEM}, {TC}, {CUDA, SFU}** — matches the hand-tuned FA kernel structure
+
 ### Step 5: Emit ScheduleGraph
 
 After the iterative loop converges, all scheduling decisions are packaged into a **ScheduleGraph** — the sole output of Pass A. This graph carries every decision needed by downstream passes (B and C) without requiring them to re-derive anything from the IR or DDG.
@@ -1669,9 +1914,12 @@ modulo.schedule @loop<id> {
   // Merge groups (from Step 4.5): buffers sharing physical memory
   modulo.merge_group <group_id> { buf<id1>, buf<id2> }  // physical: <max_size> bytes x <max_count>
 
+  // Warp groups: multi-pipeline partitions from Step 4.7
+  modulo.warp_group @wg<id> { pipelines: [<PIPE>, ...], ops: [N<id>, ...] }
+
   // Stages: ops grouped by stage, ordered by cluster within each stage
   modulo.stage @s<N> {
-    %N<id> = <mlir_op>  {pipe: <PIPE>, cycle: <C>, cluster: <K>, latency: <L>, selfLatency: <SL>, ->buf<id>, <-buf<id>}
+    %N<id> = <mlir_op>  {pipe: <PIPE>, cycle: <C>, cluster: <K>, latency: <L>, selfLatency: <SL>, wg: <WG>, ->buf<id>, <-buf<id>}
   }
 
   // Edges: producer-consumer dependencies
@@ -1692,6 +1940,8 @@ modulo.schedule @loop<id> {
 | `%bar` | Step 3 | Paired barrier with same count as its data buffer |
 | `merge_group` | Step 4.5 | Buffers sharing physical memory (non-overlapping lifetimes) |
 | `pipe`, `cycle`, `cluster`, `stage` | Steps 1-2, 2.5 | Hardware pipeline, scheduled cycle, within-stage emission order, pipeline stage |
+| `wg` | Step 4.7 | Warp group assignment (index into `modulo.warp_group` list) |
+| `modulo.warp_group` | Step 4.7 | Warp group definition: set of pipelines and assigned ops |
 | `latency`, `selfLatency` | Latency model | Total latency and pipeline-occupancy latency |
 | `->buf`, `<-buf` | DDG | Buffer produce/consume references |
 | `lat`, `dist` | DDG | Edge latency and iteration distance |
@@ -1712,6 +1962,13 @@ def build_schedule_graph(kernel_regions, pipeline_config):
         loop.II = region.II
         loop.maxStage = region.schedule.max_stage
 
+        # Warp groups: from Step 4.7 (multi-pipeline partitions)
+        op_to_wg = {}
+        for wg_idx, wg in enumerate(region.warp_groups):
+            loop.add_warp_group(wg.pipelines, wg.ops)
+            for op in wg.ops:
+                op_to_wg[op] = wg_idx
+
         # Nodes: one per scheduled DDG node
         for node in region.DDG.nodes:
             sn = loop.add_node(node.op)
@@ -1720,6 +1977,7 @@ def build_schedule_graph(kernel_regions, pipeline_config):
             sn.pipeline = node.pipeline
             sn.latency = node.latency
             sn.selfLatency = node.selfLatency
+            sn.warpGroup = op_to_wg.get(node, -1)
 
         # Edges: inherited from DDG
         for edge in region.DDG.edges:
@@ -2044,7 +2302,7 @@ The generalization affects all three passes:
 
 1. **Pass A**: The scheduling algorithm dispatches to modulo or list scheduling based on whether the DDG has loop-carried edges. The output format `(cycle, pipeline, stage, cluster)` is the same. For non-loop regions, Pass A computes and stores the schedule (cluster IDs on ops as attributes) but does not reorder the IR — the schedule metadata flows to outer region scheduling via super-node latencies.
 
-2. **Pass B**: Warp group partitioning works identically — per-pipeline utilization is computed from the schedule regardless of whether it came from modulo or list scheduling. Barriers are inserted based on the schedule's cross-group boundaries.
+2. **Pass A, Step 4.7**: Warp group partitioning works identically for both region types — separation cost and multi-pipeline makespan are computed from the schedule regardless of whether it came from modulo or list scheduling. **Pass B** reads the pre-computed partition from the ScheduleGraph and inserts barriers at cross-group boundaries.
 
 3. **Pass C**: Applies all reorderings. For loop regions, expands into prologue/kernel/epilogue. For non-loop regions, reorders ops in the basic block by cluster ID. This runs after Pass B, so barriers are already in place and move with their associated ops.
 
@@ -2233,52 +2491,41 @@ SMEM budget impact (K-loop depth=3):
 
 ## Pass B: Warp Specialization Reconstruction
 
-Given the modulo schedule and pipeline configuration, reconstruct the warp-specialized program.
+Given the ScheduleGraph from Pass A — containing the modulo schedule, pipeline configuration, and warp group partition — reconstruct the warp-specialized program.
 
-### Step 1: Partition Ops into Warp Groups
+### Step 1: Read Warp Groups from ScheduleGraph
+
+The warp group partition is computed by Pass A (Step 4.7) and stored in the ScheduleGraph. Pass B reads it directly — no re-derivation needed.
 
 ```python
-def partition_into_warp_groups(schedule, unit_map, latencies, II):
+def read_warp_groups(schedule_graph):
     """
-    Assign ops to warp groups based on pipeline affinity and workload balance.
+    Read the pre-computed warp group partition from the ScheduleGraph.
 
-    Heuristic:
-    - Each pipeline with > 30% utilization gets its own warp group
-    - Underutilized pipelines are merged with compatible groups
+    Each warp group carries:
+    - pipelines: set of hardware pipelines it owns (may be multi-pipeline)
+    - ops: the pipeline ops assigned to this group
+    - util: per-pipeline utilization within the group
+
+    The partition was computed by Pass A Step 4.7 using latency-aware
+    multi-pipeline clustering (separation cost + makespan validation).
+    See Step 4.7 for the algorithm and worked examples.
     """
-    # Compute per-pipeline utilization
-    pipe_util = {}
-    for pipe in [MEM, TC, CUDA, SFU]:
-        busy = sum(latencies[op] for op in schedule if unit_map[op] == pipe)
-        pipe_util[pipe] = busy / II
-
-    # Create warp groups for well-utilized pipelines
     groups = []
-    for pipe in [MEM, TC, CUDA, SFU]:
-        if pipe_util[pipe] > 0.3:
-            groups.append(WarpGroup(
-                pipeline=pipe,
-                ops=[op for op in schedule if unit_map[op] == pipe],
-            ))
-
-    # Merge underutilized pipelines into nearest group
-    for pipe in [MEM, TC, CUDA, SFU]:
-        if pipe_util[pipe] <= 0.3:
-            # Merge into the group whose ops have the most
-            # data dependencies with this pipeline's ops
-            best_group = argmax(groups, key=lambda g:
-                count_cross_edges(pipe_ops, g.ops, DDG)
-            )
-            best_group.ops.extend(
-                op for op in schedule if unit_map[op] == pipe
-            )
-
+    for wg in schedule_graph.warp_groups:
+        groups.append(WarpGroup(
+            pipelines=wg.pipelines,
+            ops=[node.op for node in schedule_graph.nodes if node.warpGroup == wg.id],
+            util=wg.util,
+        ))
     return groups
 ```
 
+Because the partition is pre-computed, Pass B can focus on its core responsibilities: replicating infrastructure ops (Step 1.5), inserting barriers (Step 2), computing loop structure (Step 3), and generating code (Step 5).
+
 ### Step 1.5: Replicate Shared Infrastructure Ops
 
-Pass A's modulo schedule and Step 1's partitioning only cover **pipeline ops** — the operations that execute on MEM, TC, CUDA, or SFU. But a real kernel also contains **infrastructure ops** that don't belong to any pipeline: loop control flow, buffer index arithmetic, constants, scalar computations, and conditional logic. These ops must be present in every warp group that needs them.
+Pass A's modulo schedule and warp group partition (Step 4.7) only cover **pipeline ops** — the operations that execute on MEM, TC, CUDA, or SFU. But a real kernel also contains **infrastructure ops** that don't belong to any pipeline: loop control flow, buffer index arithmetic, constants, scalar computations, and conditional logic. These ops must be present in every warp group that needs them.
 
 #### Categories of Shared Ops
 
@@ -2423,10 +2670,13 @@ def compute_region_loop_structure(groups, pipeline_config, schedule, II):
     The consumer group's loop starts after the prologue,
     and runs an extra epilogue_iters iterations to drain.
     """
-    # Find the producer group (typically MEM)
-    producer_group = find_group_by_pipeline(groups, MEM)
+    # Find the producer group (the group whose pipelines include MEM).
+    # With multi-pipeline groups, MEM may share a group with other
+    # pipelines (e.g., epilogue's {TC, CUDA, MEM}). The producer is
+    # whichever group owns MEM ops.
+    producer_group = find_group_containing_pipeline(groups, MEM)
 
-    # Find consumer groups (typically TC, CUDA+SFU)
+    # Find consumer groups (all groups that don't own MEM ops)
     consumer_groups = [g for g in groups if g != producer_group]
 
     max_depth = max(pipeline_config.buffer_depths.values())
@@ -2469,13 +2719,16 @@ def assign_warp_resources(groups, latencies, II):
     2. Spill avoidance: keep below hardware limit per warp
     """
     for g in groups:
-        # Total issue slots needed per iteration
-        total_work = sum(latencies[op] for op in g.ops)
+        # For multi-pipeline groups, the bottleneck is the busiest
+        # pipeline within the group, not the total across all pipelines
+        # (since different pipelines overlap).
+        per_pipe_work = defaultdict(int)
+        for op in g.ops:
+            per_pipe_work[unit_map[op]] += self_latencies[op]
+        bottleneck_work = max(per_pipe_work.values())
 
-        # Each warp can issue one instruction per cycle
-        # But ops occupy their pipeline for 'latency' cycles
-        # The group needs enough warps to keep the pipeline fed
-        g.num_warps = max(1, ceil(total_work / II))
+        # The group needs enough warps to keep its busiest pipeline fed
+        g.num_warps = max(1, ceil(bottleneck_work / II))
 
         # Register estimation
         live_vars = compute_max_live_variables(g.ops)
@@ -2891,17 +3144,19 @@ modulo.pipeline @outer {
 
 With `NUM_TMEM_BUFFERS=1`, the epilogue must complete before the next tile's MMA can start, so MMA/epilogue overlap is not possible. The outer loop is effectively sequential: each tile processes K-loop → epilogue → next tile.
 
-### Pass B, Step 1: Partition into Warp Groups
+### Pass A, Step 4.7: Warp Group Partition
 
 Pipeline utilization within II=960:
 ```
-MEM:  960/960 = 100%  → dedicated warp group  ✓  (> 30%)
-TC:   559/960 =  58%  → dedicated warp group  ✓  (> 30%)
+MEM:  960/960 = 100%
+TC:   559/960 =  58%
 CUDA:   0/960 =   0%  → no inner-loop ops
 SFU:    0/960 =   0%  → no ops
 ```
 
-The epilogue (TMEM→registers→SMEM→TMA store) uses CUDA cores and MEM but runs *between* tiles, not in the inner K-loop. It gets its own warp group.
+Separation cost analysis: `coupling(MEM, TC)` = 30/960 ≈ 0.03 — loads execute ~960 cycles before MMA, so barrier overhead is negligible. MEM and TC stay in separate groups.
+
+The epilogue (TMEM→registers→SMEM→TMA store) uses TC, CUDA, and MEM in a tight chain. Separation cost between adjacent ops is high (30/200 = 0.15 for tmem_load→truncf, 30/100 = 0.30 for truncf→local_store), and multi-pipeline makespan ≈ 480 (well within II). The algorithm merges them into a single mixed-pipeline warp group.
 
 **Result: 3 warp groups:**
 
@@ -3469,19 +3724,27 @@ TMEM:
 
 The buffer merging (`reuse=qk_tiles`) is essential — without it, QK + P + acc would require 384KB of TMEM, exceeding the limit.
 
-### Pass B, Step 1: Partition into Warp Groups
+### Pass A, Step 4.7: Warp Group Partition
 
 Pipeline utilization within II=1800:
 ```
-MEM:  1280/1800 = 71%  → dedicated warp group  ✓  (> 30%)
-TC:   1800/1800 = 100% → dedicated warp group  ✓  (> 30%)
-CUDA: 1079/1800 = 60%  → dedicated warp group  ✓  (> 30%)
-SFU:   705/1800 = 39%  → dedicated warp group  ✓  (> 30%)
+MEM:  1280/1800 = 71%
+TC:   1800/1800 = 100%
+CUDA: 1079/1800 = 60%
+SFU:   705/1800 = 39%
 ```
 
-All four pipelines exceed the 30% threshold. However, SFU (Exp2) and CUDA (RowMax, Scale, RowSum, AccUpdate) are tightly coupled by data dependencies — Exp2 produces P which RowSum consumes, and both feed into AccUpdate. Merging them into a single "softmax" warp group is more practical than adding cross-group barriers between every softmax sub-op.
+Separation cost analysis:
+- `coupling(MEM, TC)` ≈ 0.03 — loads fire far ahead of MMA, low coupling
+- `coupling(CUDA, SFU)` ≈ 0.23 — tight data dependency chain (Scale→Exp2→RowSum), high coupling
+- `coupling(CUDA, TC)` ≈ 0.05 — softmax feeds MMA but with sufficient slack
+- `coupling(MEM, CUDA)` ≈ 0.02 — minimal direct interaction
 
-The actual kernel uses a different grouping that accounts for the recurrence structure:
+The algorithm first merges CUDA + SFU (highest coupling at 0.23). Multi-pipeline makespan check: CUDA and SFU ops overlap on different pipelines, critical path ≈ 1784 cycles (dominated by the data dependency chain), fits within II=1800. Merge accepted.
+
+Next candidate: {CUDA, SFU} + TC? TC util = 100%, merged makespan would exceed II — rejected. MEM + TC? Coupling = 0.03, not worth merging. The algorithm settles on 3 pipeline groups: {MEM}, {TC}, {CUDA, SFU}.
+
+The actual kernel further splits the {CUDA, SFU} group into Softmax and Correction to account for the recurrence structure (accumulator update must be isolated for ping-pong buffering):
 
 **Result: 4 warp groups:**
 
@@ -3691,7 +3954,7 @@ with tlx.async_tasks():
 | Algorithm Decision | TLX Code |
 |---|---|
 | ResMII = 1800 (TC-bound) | MMA gets dedicated warp group; TC pipeline is the bottleneck |
-| All 4 pipelines > 30% utilization | 4 warp groups (Producer, MMA, Softmax, Correction) |
+| CUDA↔SFU tightly coupled (separation cost 0.23), MEM and TC loosely coupled | 4 warp groups (Producer, MMA, Softmax, Correction) — Softmax/Correction split from {CUDA, SFU} for recurrence isolation |
 | Softmax needs register-heavy reductions | `tlx.async_task(num_warps=4, registers=152, replicate=NUM_MMA_GROUPS)` |
 | NUM_BUFFERS_KV = 3 | `kv_tiles = tlx.local_alloc(..., 3)` — K and V share a 3-deep pool |
 | NUM_BUFFERS_QK = 1 | Single-buffered QK result — softmax must complete before next QK_MMA |
@@ -4019,17 +4282,23 @@ TMEM:
 
 The `REUSE_DP_FOR_DQ` flag is **essential** for the 128×128 config — without it, dP and dQ would each need 64KB, pushing TMEM to 320KB (over the 256KB limit). This is another application of lifetime-aware buffer merging: dP is consumed before dQ is produced within the same iteration.
 
-### Pass B, Step 1: Partition into Warp Groups
+### Pass A, Step 4.7: Warp Group Partition
 
 Pipeline utilization within II=4500:
 ```
-MEM:  1280/4500 = 28%  → below 30% threshold
-TC:   4500/4500 = 100% → dedicated warp group  ✓
-CUDA:  700/4500 = 16%  → below 30% threshold
-SFU:   merged with CUDA
+MEM:  1280/4500 = 28%
+TC:   4500/4500 = 100%
+CUDA:  700/4500 = 16%
+SFU:   merged with CUDA (tight data dependency chain)
 ```
 
-With MEM and CUDA both below 30%, the algorithm merges them. But the actual kernel groups differently based on the dataflow structure:
+Separation cost analysis:
+- `coupling(CUDA, SFU)` ≈ 0.35 — Exp2 and masking ops are tightly interleaved, high coupling → merge into {CUDA, SFU}
+- `coupling(MEM, TC)` ≈ 0.02 — loads fire far ahead of MMA, low coupling → keep separate
+- `coupling({CUDA, SFU}, TC)` ≈ 0.04 — softmax/ds results feed MMA but through TMEM with slack
+- `coupling(MEM, {CUDA, SFU})` ≈ 0.01 — minimal direct interaction
+
+MEM and {CUDA, SFU} are both low-utilization. The algorithm considers merging them, but the actual kernel groups differently based on the dataflow structure (the compute group needs 8 warps and 192 registers for softmax + ds gradients, while the producer is lightweight at 1 warp):
 
 **Result: 4 warp groups:**
 

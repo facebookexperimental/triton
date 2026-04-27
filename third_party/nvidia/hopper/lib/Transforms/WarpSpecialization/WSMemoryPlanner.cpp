@@ -2085,8 +2085,34 @@ public:
                                     operationId, ctrlOp, bufferId);
       } else {
         LDBG("using tmem allocation algorithm 2 (backtracking)");
-        result = allocateTMemAllocs2(allocsForThisLoop, buffers, allocToChannel,
-                                     operationId, ctrlOp, bufferId);
+        // Build initial state from pre-assigned allocs whose liveness
+        // intersects this loop, so un-annotated allocs can reuse them.
+        AllocationState initialState;
+        size_t seedColStart = 0;
+        for (auto alloc : allocs) {
+          if (!handledAllocs.count(alloc.getOperation()))
+            continue;
+          auto *buf = getBuffer(alloc.getOperation());
+          auto allocInt = bufferRange.lookup(buf);
+          if (!ctrlInt.intersects(allocInt))
+            continue;
+          if (buf->isOwnerOfSpace) {
+            int rowGroup =
+                (buf->rowSize == 2 * kRowGroupSize) ? -1 : 0; // default rg0
+            OwnerPlacement placement{seedColStart, rowGroup};
+            addOwnerToState(initialState, buf, placement);
+            seedColStart += buf->colSize;
+            LDBG("seeding owner [" << allocInt.start() << "-" << allocInt.end()
+                                   << ") at col " << placement.colStart
+                                   << " rowGroup " << rowGroup << " size "
+                                   << buf->rowSize << "x" << buf->colSize);
+          } else {
+            initialState.assignment[buf] = {buf->reuseOwner, buf->colOffset};
+          }
+        }
+        result =
+            allocateTMemAllocs2(allocsForThisLoop, buffers, allocToChannel,
+                                operationId, ctrlOp, bufferId, initialState);
       }
       if (failed(result))
         return failure();
@@ -2118,6 +2144,9 @@ public:
 
     unsigned totalCols = 0;
     for (auto alloc : allocs) {
+      // Skip reusers — their columns are already counted via their owner
+      if (alloc->hasAttr("buffer.offset"))
+        continue;
       ttng::TMemAllocation allocSize = ttng::getTmemAllocSizes(alloc.getType());
       unsigned baseCols = allocSize.numCols;
       unsigned copy = 1;
@@ -2179,16 +2208,123 @@ public:
   // ---------------------------------------------------------------
   // allocateTMemAllocs2 — backtracking search allocation algorithm.
   // ---------------------------------------------------------------
+  // TMEM has 128 physical rows (2 row groups of 64 each) × 512 columns.
+  // A 128-row alloc occupies both row groups. A 64-row alloc occupies one.
+  // Two 64-row allocs in different row groups can co-use the same columns.
 
-  /// State for backtracking search.
-  struct AllocationState {
-    /// For each buffer, stores (reuseOwner, colOffset). nullptr means owner.
-    DenseMap<BufferT *, std::pair<BufferT *, size_t>> assignment;
-    /// Set of buffers that own their space.
-    DenseSet<BufferT *> owners;
-    /// Total rows used.
-    size_t usedRows = 0;
+  static constexpr size_t kMaxTMemCols = 512;
+  static constexpr size_t kColAlignment = 4;
+  static constexpr int kNumRowGroups = 2;
+  static constexpr size_t kRowGroupSize = 64;
+
+  /// 2D placement for an owner buffer in the TMEM grid.
+  struct OwnerPlacement {
+    size_t colStart; // starting column
+    int rowGroup;    // 0, 1, or -1 meaning "both" (128-row owner)
   };
+
+  /// State for backtracking search with 2D TMEM model.
+  struct AllocationState {
+    /// For each reuser buffer, stores (reuseOwner, colOffset).
+    DenseMap<BufferT *, std::pair<BufferT *, size_t>> assignment;
+    /// Owners with their 2D placement.
+    DenseMap<BufferT *, OwnerPlacement> owners;
+    /// Column intervals occupied per row group, sorted by start.
+    /// rowGroupCols[0] = row group 0 (rows 0-63)
+    /// rowGroupCols[1] = row group 1 (rows 64-127)
+    SmallVector<std::pair<size_t, size_t>, 8> rowGroupCols[kNumRowGroups];
+
+    bool containsOwner(BufferT *buf) const { return owners.count(buf); }
+  };
+
+  /// Add an owner with its placement to the state, updating rowGroupCols.
+  void addOwnerToState(AllocationState &state, BufferT *buf,
+                       OwnerPlacement placement) const {
+    state.owners[buf] = placement;
+    auto interval =
+        std::make_pair(placement.colStart, placement.colStart + buf->colSize);
+    auto insertSorted = [](SmallVectorImpl<std::pair<size_t, size_t>> &vec,
+                           std::pair<size_t, size_t> iv) {
+      auto it = llvm::lower_bound(
+          vec, iv,
+          [](const std::pair<size_t, size_t> &a,
+             const std::pair<size_t, size_t> &b) { return a.first < b.first; });
+      vec.insert(it, iv);
+    };
+    if (placement.rowGroup == -1) {
+      // 128-row: occupies both row groups
+      insertSorted(state.rowGroupCols[0], interval);
+      insertSorted(state.rowGroupCols[1], interval);
+    } else {
+      insertSorted(state.rowGroupCols[placement.rowGroup], interval);
+    }
+  }
+
+  /// Find the first gap of at least `size` columns (with alignment) in a
+  /// sorted interval list, not exceeding maxCol.
+  std::optional<size_t>
+  findFirstGap(const SmallVectorImpl<std::pair<size_t, size_t>> &intervals,
+               size_t size, size_t maxCol) const {
+    size_t candidate = 0;
+    for (auto &[start, end] : intervals) {
+      // Align candidate
+      if (candidate % kColAlignment != 0)
+        candidate = (candidate / kColAlignment + 1) * kColAlignment;
+      if (candidate + size <= start)
+        return (candidate + size <= maxCol) ? std::optional(candidate)
+                                            : std::nullopt;
+      candidate = std::max(candidate, end);
+    }
+    // Check after the last interval
+    if (candidate % kColAlignment != 0)
+      candidate = (candidate / kColAlignment + 1) * kColAlignment;
+    if (candidate + size <= maxCol)
+      return candidate;
+    return std::nullopt;
+  }
+
+  /// Find valid 2D placements for a new owner in the TMEM grid.
+  /// Returns a list of OwnerPlacement sorted by colStart (tightest first).
+  SmallVector<OwnerPlacement, 4> findPlacements(BufferT *buf,
+                                                const AllocationState &state,
+                                                size_t maxCols) const {
+    SmallVector<OwnerPlacement, 4> result;
+
+    if (buf->rowSize == 2 * kRowGroupSize) {
+      // 128-row: needs both row groups free at the same column range.
+      // Merge intervals from both groups and find a gap in the union.
+      SmallVector<std::pair<size_t, size_t>, 16> merged;
+      merged.append(state.rowGroupCols[0].begin(), state.rowGroupCols[0].end());
+      merged.append(state.rowGroupCols[1].begin(), state.rowGroupCols[1].end());
+      llvm::sort(merged, [](const auto &a, const auto &b) {
+        return a.first < b.first;
+      });
+      // Merge overlapping intervals
+      SmallVector<std::pair<size_t, size_t>, 16> mergedUnion;
+      for (auto &iv : merged) {
+        if (!mergedUnion.empty() && iv.first <= mergedUnion.back().second) {
+          mergedUnion.back().second =
+              std::max(mergedUnion.back().second, iv.second);
+        } else {
+          mergedUnion.push_back(iv);
+        }
+      }
+      if (auto col = findFirstGap(mergedUnion, buf->colSize, maxCols))
+        result.push_back({*col, -1});
+    } else {
+      // 64-row: try each row group
+      for (int rg = 0; rg < kNumRowGroups; ++rg) {
+        if (auto col =
+                findFirstGap(state.rowGroupCols[rg], buf->colSize, maxCols))
+          result.push_back({*col, rg});
+      }
+      // Sort by colStart so we prefer tighter packing
+      llvm::sort(result, [](const auto &a, const auto &b) {
+        return a.colStart < b.colStart;
+      });
+    }
+    return result;
+  }
 
   /// Check if candidate can potentially reuse owner's space.
   /// Returns priority: 0 = cannot reuse, 1 = can reuse, 2 = exact size match.
@@ -2260,7 +2396,7 @@ public:
 
   /// Recursive backtracking search for buffer allocation.
   bool tryAllocate(SmallVectorImpl<ttng::TMEMAllocOp> &allocs, size_t idx,
-                   AllocationState &state, size_t maxRows, Operation *ctrlOp) {
+                   AllocationState &state, size_t maxCols, Operation *ctrlOp) {
     // Base case: all buffers allocated
     if (idx == allocs.size())
       return true;
@@ -2269,7 +2405,7 @@ public:
 
     // Collect reuse candidates sorted by priority (descending)
     SmallVector<std::pair<BufferT *, int>> candidates;
-    for (BufferT *owner : state.owners) {
+    for (auto &[owner, placement] : state.owners) {
       int priority = hasPotentialReuse(owner, buf, ctrlOp);
       if (priority > 0)
         candidates.push_back({owner, priority});
@@ -2297,7 +2433,7 @@ public:
       });
 
       // Recurse
-      if (tryAllocate(allocs, idx + 1, newState, maxRows, ctrlOp)) {
+      if (tryAllocate(allocs, idx + 1, newState, maxCols, ctrlOp)) {
         state = newState;
         return true;
       }
@@ -2310,26 +2446,27 @@ public:
       });
     }
 
-    // Try allocating new space
-    if (state.usedRows + buf->rowSize <= maxRows) {
+    // Try allocating new space with 2D placement
+    auto placements = findPlacements(buf, state, maxCols);
+    for (auto &placement : placements) {
       AllocationState newState = state;
-      newState.owners.insert(buf);
-      newState.usedRows += buf->rowSize;
+      addOwnerToState(newState, buf, placement);
 
       LLVM_DEBUG({
         LDBG("tryAllocate: trying new space for ["
              << bufferRange[buf].start() << "-" << bufferRange[buf].end()
-             << ") at row " << state.usedRows);
+             << ") at col " << placement.colStart << " rowGroup "
+             << placement.rowGroup);
       });
 
-      if (tryAllocate(allocs, idx + 1, newState, maxRows, ctrlOp)) {
+      if (tryAllocate(allocs, idx + 1, newState, maxCols, ctrlOp)) {
         state = newState;
         return true;
       }
       LLVM_DEBUG({
         LDBG("tryAllocate: backtracking from new space for ["
              << bufferRange[buf].start() << "-" << bufferRange[buf].end()
-             << ")");
+             << ") at col " << placement.colStart);
       });
     }
 
@@ -2338,14 +2475,23 @@ public:
 
   /// Apply the allocation state to the actual buffers.
   void applyAllocationState(SmallVectorImpl<ttng::TMEMAllocOp> &allocs,
-                            const AllocationState &state, unsigned &bufferId) {
-    // First pass: assign owners
-    size_t rowOffset = 0;
+                            const AllocationState &state, unsigned &bufferId,
+                            const AllocationState *initialState = nullptr) {
+    // First pass: assign owners (skip pre-assigned ones from initialState)
     DenseMap<BufferT *, unsigned> ownerToBufferId;
+    // Carry over buffer IDs from pre-assigned owners in initial state
+    if (initialState) {
+      for (auto &[buf, placement] : initialState->owners) {
+        auto idAttr = buf->owner->getAttrOfType<IntegerAttr>("buffer.id");
+        if (idAttr)
+          ownerToBufferId[buf] = idAttr.getInt();
+      }
+    }
     for (auto alloc : allocs) {
       BufferT *buf = getBuffer(alloc.getOperation());
-      if (state.owners.contains(buf)) {
-        buf->rowOffset = rowOffset;
+      if (state.containsOwner(buf)) {
+        auto &placement = state.owners.find(buf)->second;
+        buf->rowOffset = placement.rowGroup == 1 ? kRowGroupSize : 0;
         buf->colOffset = 0;
         buf->isOwnerOfSpace = true;
         buf->reuseOwner = buf;
@@ -2355,16 +2501,16 @@ public:
             IntegerAttr::get(IntegerType::get(alloc->getContext(), 32),
                              bufferId));
         ++bufferId;
-        rowOffset += buf->rowSize;
       }
     }
 
-    // Second pass: assign reusers
+    // Second pass: assign reusers (skip pre-assigned ones from initialState)
     for (auto alloc : allocs) {
       BufferT *buf = getBuffer(alloc.getOperation());
-      if (!state.owners.contains(buf)) {
+      if (!state.containsOwner(buf)) {
         auto it = state.assignment.find(buf);
-        assert(it != state.assignment.end());
+        if (it == state.assignment.end())
+          continue; // pre-assigned reuser, already has attributes
         auto [owner, colOffset] = it->second;
         buf->rowOffset = owner->rowOffset;
         buf->colOffset = colOffset;
@@ -2379,10 +2525,11 @@ public:
             IntegerAttr::get(IntegerType::get(alloc->getContext(), 32),
                              colOffset));
       }
-      // Set buffer.copy attribute
-      alloc.getOperation()->setAttr(
-          "buffer.copy",
-          IntegerAttr::get(IntegerType::get(alloc->getContext(), 32), 1));
+      // Set buffer.copy attribute if not already set
+      if (!alloc.getOperation()->hasAttr("buffer.copy"))
+        alloc.getOperation()->setAttr(
+            "buffer.copy",
+            IntegerAttr::get(IntegerType::get(alloc->getContext(), 32), 1));
     }
   }
 
@@ -2390,9 +2537,12 @@ public:
       SmallVector<ttng::TMEMAllocOp> &allocs, SmallVector<BufferT *> &buffers,
       DenseMap<Operation *, ttng::TmemDataChannelPost *> &allocToChannel,
       DenseMap<Operation *, size_t> &operationId, Operation *ctrlOp,
-      unsigned bufferId) {
+      unsigned bufferId,
+      const AllocationState &initialState = AllocationState()) {
 
-    LDBG("allocateTMemAllocs2: starting with " << allocs.size() << " allocs");
+    LDBG("allocateTMemAllocs2: starting with "
+         << allocs.size() << " allocs"
+         << ", initial owners: " << initialState.owners.size());
 
     // Debug: dump allocation order and liveness
     LLVM_DEBUG({
@@ -2424,20 +2574,35 @@ public:
           }
         }
       }
+      // Also check reuse with seeded owners
+      for (auto &[seedOwner, placement] : initialState.owners) {
+        for (auto alloc : allocs) {
+          auto *buf = getBuffer(alloc.getOperation());
+          int p1 = hasPotentialReuse(seedOwner, buf, ctrlOp);
+          int p2 = hasPotentialReuse(buf, seedOwner, ctrlOp);
+          if (p1 > 0 || p2 > 0) {
+            llvm::dbgs() << "  hasPotentialReuse(seeded ["
+                         << bufferRange[seedOwner].start() << "-"
+                         << bufferRange[seedOwner].end() << "), ["
+                         << bufferRange[buf].start() << "-"
+                         << bufferRange[buf].end() << ")) = " << p1 << "/" << p2
+                         << "\n";
+          }
+        }
+      }
       llvm::dbgs() << "=== End hasPotentialReuse ===\n\n";
     });
 
-    // Initialize state and run backtracking search
-    AllocationState state;
-    constexpr size_t maxRows = 512; // TMEM has 512 rows
+    // Start from the seeded state (includes pre-assigned owners)
+    AllocationState state = initialState;
 
-    if (!tryAllocate(allocs, 0, state, maxRows, ctrlOp)) {
+    if (!tryAllocate(allocs, 0, state, kMaxTMemCols, ctrlOp)) {
       return allocs[0].emitError(
           "allocateTMemAllocs2: failed to allocate TMEM buffers");
     }
 
-    // Apply the final allocation state
-    applyAllocationState(allocs, state, bufferId);
+    // Apply the final allocation state (skip pre-assigned buffers)
+    applyAllocationState(allocs, state, bufferId, &initialState);
 
     LLVM_DEBUG({
       llvm::dbgs() << "\n=== allocateTMemAllocs2: Final Allocation ===\n";

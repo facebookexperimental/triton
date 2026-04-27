@@ -393,10 +393,9 @@ class CUDABackend(BaseBackend):
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
                 passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
-            if knobs.nvidia.use_meta_ws:
-                passes.ttgpuir.add_optimize_partition_warps(pm)
         elif capability // 10 >= 10:
-            passes.ttgpuir.add_fuse_nested_loops(pm)
+            if not knobs.nvidia.use_modulo_schedule:
+                passes.ttgpuir.add_fuse_nested_loops(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttir.add_triton_licm(pm)
             passes.ttgpuir.add_optimize_accumulator_init(pm)
@@ -465,7 +464,7 @@ class CUDABackend(BaseBackend):
         passes.common.add_symbol_dce(pm)
         # Optimize the number of warps and registers after TMA lowering, so
         # that any local loads eliminated by TMA lowering do not inflate them.
-        if capability // 10 >= 10 and knobs.nvidia.use_meta_ws:
+        if capability // 10 >= 9 and knobs.nvidia.use_meta_ws:
             passes.ttgpuir.add_optimize_partition_warps(pm)
         nvidia.passes.ttnvgpuir.add_fence_insertion(pm, capability)
         nvidia.passes.ttnvgpuir.add_lower_mma(pm)
@@ -475,7 +474,9 @@ class CUDABackend(BaseBackend):
         # Budget-aware layout conversion elimination — runs last to ensure
         # converts whose scratch would exceed SMEM budget are eliminated
         # after all other passes that may introduce layout conversions.
-        passes.ttgpuir.add_remove_layout_conversions(pm, smem_budget)
+        # TODO(njriasan): Re-enable once propagateSrcEncodingAndErase handles
+        # scf::ForOp/WhileOp loop-carried values correctly.
+        passes.ttgpuir.add_remove_layout_conversions(pm, 0)
 
         pm.run(mod, 'make_ttgir')
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()

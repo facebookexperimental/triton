@@ -12,7 +12,7 @@ add_triton_library(TritonNvidiaGPUTransforms
   PushSharedSetupToTile.cpp
   PromoteLHSToTMem.cpp
   PruneUnusedBarriers.cpp
-  ProxFenceInsertion.cpp
+  ProxyFenceInsertion.cpp
   RemoveTMEMTokens.cpp
   TensorMemoryAllocation.cpp
   TMALowering.cpp

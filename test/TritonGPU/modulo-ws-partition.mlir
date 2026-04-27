@@ -17,7 +17,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CHECK: scf.for
 // Inner loop has tt.num_stages from modulo schedule
 // CHECK: scf.for
-// CHECK: tt.num_stages = 2 : i32
+// CHECK: tt.num_stages = 3 : i32
 // Outer loop has tt.warp_specialize
 // CHECK: tt.warp_specialize
 tt.func @persistent_gemm_ws_partition(

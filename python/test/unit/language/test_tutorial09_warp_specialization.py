@@ -1120,6 +1120,7 @@ def test_hopper_matmul_tma_warp_specialize(
     """Test matmul_kernel_tma with warp_specialize=True on Hopper (K-loop based)."""
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 128:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 128")
+
     if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and not (BLOCK_SIZE_M == 64 and num_stages == 2):
         pytest.skip("OOM: shared memory exceeds H100 limit")
 
@@ -1179,6 +1180,7 @@ def test_hopper_matmul_tma_warp_specialize(
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
             pingpongAutoWS=enable_pingpong,
+            maxRegAutoWS=208 if DATA_PARTITION_FACTOR > 1 else 252,
         )
 
         ttgir = kernel.asm["ttgir"]
@@ -1231,6 +1233,7 @@ def test_hopper_matmul_tma_persistent_warp_specialize(
     """
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 128:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 128")
+
     if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and not (BLOCK_SIZE_M == 64 and num_stages == 2):
         pytest.skip("OOM: shared memory exceeds H100 limit")
 
@@ -1305,6 +1308,7 @@ def test_hopper_matmul_tma_persistent_warp_specialize(
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
             pingpongAutoWS=enable_pingpong,
+            maxRegAutoWS=208 if DATA_PARTITION_FACTOR > 1 else 252,
         )
 
         ttgir = kernel.asm["ttgir"]
@@ -1358,6 +1362,7 @@ def test_hopper_matmul_descriptor_persistent_warp_specialize(
     """
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 128:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 128")
+
     if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and not (BLOCK_SIZE_M == 64 and num_stages == 2):
         pytest.skip("OOM: shared memory exceeds H100 limit")
 
@@ -1417,6 +1422,7 @@ def test_hopper_matmul_descriptor_persistent_warp_specialize(
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
             pingpongAutoWS=enable_pingpong,
+            maxRegAutoWS=208 if DATA_PARTITION_FACTOR > 1 else 252,
         )
 
         ttgir = kernel.asm["ttgir"]

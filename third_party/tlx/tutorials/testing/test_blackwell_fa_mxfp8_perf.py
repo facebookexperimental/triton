@@ -20,7 +20,7 @@ Facebook: If you are developing in fbsource, use tritonbench instead to collect 
 """
 
 
-def create_benchmark():
+def create_benchmark(head_dim):
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
@@ -30,8 +30,8 @@ def create_benchmark():
             line_vals=["ws_pipelined_persistent_mxfp8"],
             line_names=["ws_pipelined_persistent_mxfp8"],
             ylabel="TFLOPS",
-            plot_name="flash-attention-performance-mxfp8",
-            args={"BATCH": 4, "H": 32, "HEAD_DIM": 64, "causal": False},
+            plot_name=f"flash-attention-performance-mxfp8-d{head_dim}",
+            args={"BATCH": 4, "H": 32, "HEAD_DIM": head_dim, "causal": False},
         ))
     def benchmark(BATCH, H, N_CTX, HEAD_DIM, causal, provider):
         shape = (BATCH, H, N_CTX, HEAD_DIM)
@@ -57,7 +57,9 @@ def create_benchmark():
 if __name__ == "__main__":
     if is_blackwell():
         print("Running MXFP8 flash attention benchmarks")
-        benchmark = create_benchmark()
-        benchmark.run(print_data=True)
+        for hd in [64, 128]:
+            print(f"\nBATCH=4, H=32, HEAD_DIM={hd}, causal=False")
+            benchmark = create_benchmark(hd)
+            benchmark.run(print_data=True)
     else:
         print("Skipping benchmarks, no Blackwell GPU found.")

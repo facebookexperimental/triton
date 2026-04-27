@@ -46,6 +46,7 @@ mxfp8_configs = [
             "NUM_Q_SCALE_TMEM_BUFFERS": 1,
             "NUM_KV_SCALE_TMEM_BUFFERS": 2,
             "GROUP_SIZE_N": 1,
+            "RESCALE_OPT": True,
         },
         num_stages=1,
         num_warps=4,
@@ -83,6 +84,11 @@ def _mul_f32x2(a, b):
         is_pure=True,
         pack=2,
     )
+
+
+@triton.jit
+def _reduce_or(x, y):
+    return x | y
 
 
 @triton.jit
@@ -206,6 +212,8 @@ def _softmax_inner_loop(
     NUM_MMA_GROUPS: tl.constexpr,
     VEC_SIZE: tl.constexpr,
     STAGE: tl.constexpr,
+    SHARE_SCALE_BUFFERS: tl.constexpr = False,
+    RESCALE_OPT: tl.constexpr = False,
 ):
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // 2
     NUM_BLOCKS: tl.constexpr = BLOCK_N // VEC_SIZE
@@ -216,7 +224,12 @@ def _softmax_inner_loop(
         _, qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
         tlx.barrier_wait(tlx.local_view(qk_fulls, cid), qk_phase)
         qk = tlx.local_load(tlx.local_view(qk_tiles, cid))
-        tlx.barrier_arrive(tlx.local_view(qk_empties, cid))
+        if SHARE_SCALE_BUFFERS:
+            NAMED_BAR_QK_EMPTY: tl.constexpr = 9
+            NUM_THREADS_QK_EMPTY: tl.constexpr = 160
+            tlx.named_barrier_arrive(NAMED_BAR_QK_EMPTY + cid, NUM_THREADS_QK_EMPTY)
+        else:
+            tlx.barrier_arrive(tlx.local_view(qk_empties, cid))
 
         if STAGE == 2:
             col_limit_right = (offs_m - start_n + 1)[:, None]
@@ -226,20 +239,32 @@ def _softmax_inner_loop(
         block_maxes = tl.max(qk_reshaped, 2)
         row_max = tl.max(block_maxes, 1)
 
-        m_ij = tl.maximum(m_i, row_max * qk_scale)
-        alpha = tl.math.exp2(m_i - m_ij)
+        if RESCALE_OPT:
+            m_ij = tl.maximum(m_i, row_max)
+            alpha_ = (m_i - m_ij) * qk_scale
+            alpha = tl.math.exp2(alpha_)
+            rescale_mask = alpha_ >= -8.0
+            alpha = tl.where(rescale_mask, 1.0, alpha)
+            m_ij = tl.where(rescale_mask, m_i, m_ij)
+        else:
+            m_ij = tl.maximum(m_i, row_max * qk_scale)
+            alpha = tl.math.exp2(m_i - m_ij)
 
         tlx.barrier_wait(tlx.local_view(alpha_empties, cid), qk_phase ^ 1)
         tlx.local_store(tlx.local_view(alpha_tiles, cid), alpha[:, None])
         tlx.barrier_arrive(tlx.local_view(alpha_fulls, cid))
 
-        qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
+        if RESCALE_OPT:
+            m_scaled = m_ij * qk_scale
+        else:
+            m_scaled = m_ij
+        qk = _fma_f32x2(qk, qk_scale, -m_scaled[:, None])
         p_i = tl.math.exp2(qk)
 
         # Derive block amax from pre-computed block maxes via monotonicity
         # of exp2: max(exp2(x)) == exp2(max(x)), avoiding 128 max(abs())
         # ops per row in the MXFP8 conversion.
-        block_amax = tl.math.exp2(block_maxes * qk_scale - m_ij[:, None])
+        block_amax = tl.math.exp2(block_maxes * qk_scale - m_scaled[:, None])
 
         tlx.barrier_wait(tlx.local_view(p_empties, cid), qk_phase ^ 1)
         _to_mxfp8_block_with_block_amax(
@@ -279,6 +304,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                       NUM_Q_SCALE_TMEM_BUFFERS: tl.constexpr,  #
                       NUM_KV_SCALE_TMEM_BUFFERS: tl.constexpr,  #
                       GROUP_SIZE_N: tl.constexpr,  #
+                      RESCALE_OPT: tl.constexpr,  #
                       ):
     """
     This kernel is adapted from the Blackwell FA kernel for MXFP8.
@@ -533,9 +559,20 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         tlx.barrier_wait(alpha_fulls[cid], phase)
                         alpha_1 = tlx.local_load(alpha_tiles[cid])
                         tlx.barrier_arrive(alpha_empties[cid])
-                        acc = tlx.local_load(acc_tiles[cid])
-                        acc = _mul_f32x2(acc, alpha_1)
-                        tlx.local_store(acc_tiles[cid], acc)
+                        if RESCALE_OPT:
+                            pred = alpha_1 < 1.0
+                            ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
+                            should_rescale = ballot_result != 0
+                            should_rescale_red = tl.reduce(should_rescale, axis=0, combine_fn=_reduce_or)
+                            should_rescale_scalar = tl.reshape(should_rescale_red, ())
+                            if should_rescale_scalar:
+                                acc = tlx.local_load(acc_tiles[cid])
+                                acc = _mul_f32x2(acc, alpha_1)
+                                tlx.local_store(acc_tiles[cid], acc)
+                        else:
+                            acc = tlx.local_load(acc_tiles[cid])
+                            acc = _mul_f32x2(acc, alpha_1)
+                            tlx.local_store(acc_tiles[cid], acc)
                         tlx.barrier_arrive(acc_fulls[cid])
                     accum_cnt += 1
 
@@ -546,6 +583,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     l = tlx.local_load(l_tiles[cid])
                     m = tlx.local_load(m_tiles[cid])
                     tlx.barrier_arrive(l_empties[cid])
+                    if RESCALE_OPT:
+                        m = m * sm_scale * 1.44269504
                     m += tl.math.log2(l)
                     offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
                     m_ptrs = M + off_hz * N_CTX + offs_m
@@ -613,6 +652,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         NUM_MMA_GROUPS,
                         VEC_SIZE,
                         STAGE=4 - STAGE,
+                        SHARE_SCALE_BUFFERS=SHARE_SCALE_BUFFERS,
+                        RESCALE_OPT=RESCALE_OPT,
                     )
 
                 if STAGE & 2:
@@ -642,6 +683,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         NUM_MMA_GROUPS,
                         VEC_SIZE,
                         STAGE=2,
+                        SHARE_SCALE_BUFFERS=SHARE_SCALE_BUFFERS,
+                        RESCALE_OPT=RESCALE_OPT,
                     )
 
                 # prepare l_i for the epilog
@@ -707,11 +750,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 # Wait for Q and K scales to be loaded by the load group
                 tlx.barrier_wait(q_scale_fulls[q_bufIdx], q_phase)
                 tlx.barrier_wait(kv_scale_fulls[k_bufIdx], k_phase)
-                if SHARE_SCALE_BUFFERS:
-                    # If we share scale buffers q_scale_tmem[q0_tmem] overlaps
-                    # with qk[1], so we must wait for the previous qk[1] to be
-                    # done.
-                    tlx.barrier_wait(qk_empties[1], qk_phase ^ 1)
+                NAMED_BAR_QK_EMPTY: tl.constexpr = 9
+                NUM_THREADS_QK_EMPTY: tl.constexpr = 160
 
                 # Explicit SMEM->TMEM scale transfer
                 tlx.tmem_copy(q_scale_tiles[0], q_scale_tmem[q0_tmem])
@@ -743,10 +783,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.barrier_wait(q_scale_fulls[q_bufIdx + NUM_BUFFERS_Q], q_phase)
 
                 if SHARE_SCALE_BUFFERS:
-                    # If we share scale buffers q_scale_tmem[q1_tmem] overlaps
-                    # with qk[0], so we must wait for the previous qk[0] to be
-                    # done.
-                    tlx.barrier_wait(qk_empties[0], qk_phase)
+                    tlx.named_barrier_wait(NAMED_BAR_QK_EMPTY, NUM_THREADS_QK_EMPTY)
 
                 # Explicit SMEM->TMEM scale transfer
                 tlx.tmem_copy(q_scale_tiles[1], q_scale_tmem[q1_tmem])
@@ -835,10 +872,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
 
                     _, qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
                     if SHARE_SCALE_BUFFERS:
-                        # If we share scale buffers q_scale_tmem[q0_tmem] overlaps
-                        # with qk[1], so we must wait for the previous qk[1] to be
-                        # done.
-                        tlx.barrier_wait(qk_empties[1], qk_phase ^ 1)
+                        tlx.named_barrier_wait(NAMED_BAR_QK_EMPTY + 1, NUM_THREADS_QK_EMPTY)
                         tlx.tmem_copy(q_scale_tiles[0], q_scale_tmem[q0_tmem])
 
                     # Explicit SMEM->TMEM scale transfer
@@ -882,10 +916,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
 
                     # -- compute q1 @ k ----
                     if SHARE_SCALE_BUFFERS:
-                        # If we share scale buffers q_scale_tmem[q1_tmem] overlaps
-                        # with qk[0], so we must wait for the previous qk[0] to be
-                        # done.
-                        tlx.barrier_wait(qk_empties[0], qk_phase)
+                        tlx.named_barrier_wait(NAMED_BAR_QK_EMPTY, NUM_THREADS_QK_EMPTY)
                         tlx.tmem_copy(q_scale_tiles[1], q_scale_tmem[q1_tmem])
                         # Copy k into the new buffer space
                         tlx.tmem_copy(kv_scale_tiles[k_bufIdx], k_scale_tmem[k1_tmem])
@@ -936,6 +967,9 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     tlx.tcgen05_commit(q_scale_empties[q_bufIdx])
                     tlx.tcgen05_commit(q_scale_empties[q_bufIdx + NUM_BUFFERS_Q])
                 tlx.tcgen05_commit(acc_empties[0])
+
+                if SHARE_SCALE_BUFFERS:
+                    tlx.named_barrier_wait(NAMED_BAR_QK_EMPTY + 1, NUM_THREADS_QK_EMPTY)
 
                 # -- compute p1 @ v ----
                 tlx.barrier_wait(acc_fulls[1], qk_phase)

@@ -272,8 +272,20 @@ struct PartitionLayout {
     return nullptr;
   }
 
-  /// Get the opToDpId map (for schedulePostLoopOps).
   bool hasGemm() const { return gemmPartition != nullptr; }
+
+  /// Create a computation partition and set it as the default.
+  /// Used by the WarpGroupDotOp data partition fallback to ensure
+  /// computation partitions get lower indices than the load partition,
+  /// making one of them the default (index 0) warp group.
+  Partition *makeDefaultPartition(PartitionSet &schedule) {
+    auto *part = schedule.addPartition(0);
+    part->setType("computation");
+    computationPartitions.push_back(part);
+    if (!defaultPartition)
+      defaultPartition = part;
+    return part;
+  }
 };
 
 //===----------------------------------------------------------------------===//
@@ -793,7 +805,8 @@ private:
 /// selectTemplate).
 static PartitionLayout createPartitionLayout(PartitionSet &schedule,
                                              const OpCategorizer &categorizer,
-                                             const SchedulingOptions &options) {
+                                             const SchedulingOptions &options,
+                                             bool deferLoadPartition = false) {
   PartitionLayout layout;
   unsigned dpFactor = categorizer.getDataPartitionFactor();
   bool hasCorrection =
@@ -836,15 +849,21 @@ static PartitionLayout createPartitionLayout(PartitionSet &schedule,
   }
 
   // Epilogue store partition: dedicated 1-warp partition for epilogue stores.
-  if (options.separateEpilogueStore && hasEpilogue) {
+  // When deferLoadPartition is true, defer creation so computation
+  // partitions get lower indices (= default region).
+  if (options.separateEpilogueStore && hasEpilogue && !deferLoadPartition) {
     layout.epilogueStorePartition = schedule.addPartition(0);
     layout.epilogueStorePartition->setType("epilogue_store");
   }
 
-  // Load partition: always created last so it gets the highest partition index,
+  // Load partition: created last so it gets the highest partition index,
   // which maps to the default (producer) warp group at runtime.
-  layout.loadPartition = schedule.addPartition(0);
-  layout.loadPartition->setType("load");
+  // When deferLoadPartition is true, the caller creates it after
+  // computation partitions so they get lower indices (= default region).
+  if (!deferLoadPartition) {
+    layout.loadPartition = schedule.addPartition(0);
+    layout.loadPartition->setType("load");
+  }
 
   // Set default partition alias using fallback chain.
   layout.defaultPartition = layout.getDefaultPartition();
@@ -948,10 +967,19 @@ static void iterateUsers(scf::ForOp loop, Operation *op,
 }
 
 // Helper: schedule an operation to a partition if it is not already scheduled.
+// Current scheduling phase name for debug logging.
+static const char *currentPhase = "";
+
+static void scheduleOp(Partition *partition, Operation *op) {
+  LDBG("[" << currentPhase << "] " << partition->getIndex() << "("
+           << partition->getType() << ") <- " << prettyOp(op));
+  setPartition(op, partition);
+}
+
 static bool tryScheduleOp(Partition *partition, Operation *op) {
   if (hasPartition(op))
     return false;
-  setPartition(op, partition);
+  scheduleOp(partition, op);
   return true;
 }
 
@@ -1009,7 +1037,8 @@ static Partition *scheduleUsers(scf::ForOp loop, PartitionSet &schedule,
 // (e.g., TMAStoreTokenWaitOp) go to the epilogue partition. All other post-loop
 // ops (e.g., tmem_load for accumulator reads, arithmetic for normalization) go
 // to the default partition. This prevents TMEM ops from landing in the
-// epilogue, which would force it to use 4 warps (TMEM lane coverage hardware
+// epilogue, which would force it to use 4 warps (TMEM lane coverage
+// requires full warp group).
 
 static void
 schedulePostLoopOps(scf::ForOp loop, PartitionSet &schedule,
@@ -1128,7 +1157,7 @@ schedulePostLoopOps(scf::ForOp loop, PartitionSet &schedule,
           target = getEpilogueTarget(user);
       }
       if (target)
-        setPartition(user, target);
+        scheduleOp(target, user);
     }
 
     for (OpResult result : user->getResults())
@@ -1145,6 +1174,36 @@ struct ScheduleResult {
   DenseMap<unsigned, Partition *> dpIdToPartition;
   bool createComputePartitions;
 };
+
+// Pre-schedule DataPartition-categorized ops and shared ops to their
+// respective partitions. Loads and allocs are skipped (Phase 3 handles them).
+// Shared ops go to the default partition unless on the Hopper DP schedule
+// path where Phase 3/4 handles routing.
+static void
+preScheduleDpOps(SmallVector<CategorizedOp> &dpOps,
+                 DenseMap<unsigned, Partition *> &dpIdToPartition,
+                 DenseMap<Operation *, Partition *> &mmaToPreassignedPartition,
+                 PartitionLayout &layout, const OpCategorizer &categorizer,
+                 bool useHopperDpSchedule) {
+  for (const auto &catOp : dpOps) {
+    if (isa<DescriptorLoadOp, DescriptorGatherOp, LocalAllocOp>(catOp.op))
+      continue;
+    unsigned dpId = catOp.dataPartitionId;
+    auto it = dpIdToPartition.find(dpId);
+    if (it != dpIdToPartition.end()) {
+      tryScheduleOp(it->second, catOp.op);
+      if (catOp.parentMMA)
+        mmaToPreassignedPartition[catOp.parentMMA] = it->second;
+    }
+  }
+
+  if (layout.defaultPartition && !dpOps.empty() && !useHopperDpSchedule) {
+    for (Operation *sharedOp : categorizer.getSharedOps()) {
+      if (!isa<arith::ConstantOp>(sharedOp))
+        tryScheduleOp(layout.defaultPartition, sharedOp);
+    }
+  }
+}
 
 // Given a partitioning scheme, determine an initial schedule by performing a
 // first-order partition assignment to the operations in the scheme and its
@@ -1185,18 +1244,116 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
 
   unsigned dataPartitionFactor = categorizer.getDataPartitionFactor();
   LLVM_DEBUG(
-      llvm::dbgs() << "[tritongpu-partition-scheduling] Using template-based "
-                      "scheduling with data partition factor: "
+      llvm::dbgs() << "[tritongpu-partition-scheduling] Scheduling with data "
+                      "partition factor: "
                    << dataPartitionFactor << "\n");
+
+  int cc = getNVIDIAComputeCapability(mainLoop->getParentOfType<ModuleOp>());
+  bool isHopper = cc / 10 == 9;
+
+  // For Hopper data-partitioned GEMM with WarpGroupDotOps, the epilogue
+  // must be merged into the computation partitions so each can store its
+  // own MMA result directly, and computation partitions must be created
+  // before Phase 3/4 to prevent load-user propagation from claiming MMAs.
+  bool useHopperDpSchedule =
+      dataPartitionFactor > 1 &&
+      categorizer.getOpsInCategory(OpCategory::Correction).empty() &&
+      llvm::all_of(mmas,
+                   [](Operation *op) { return isa<ttng::WarpGroupDotOp>(op); });
+  SchedulingOptions localSchedOpts = schedOpts;
+  if (useHopperDpSchedule)
+    localSchedOpts.mergeEpilogueToComputation = true;
 
   //===--------------------------------------------------------------------===//
   // Phase 2: Create partition layout using tuning knobs
   //===--------------------------------------------------------------------===//
   PartitionSet schedule;
-  PartitionLayout layout =
-      createPartitionLayout(schedule, categorizer, schedOpts);
+  PartitionLayout layout = createPartitionLayout(
+      schedule, categorizer, localSchedOpts, useHopperDpSchedule);
 
-  // Extract partition references from layout
+  //===--------------------------------------------------------------------===//
+  // Phase 2b: Pre-create per-dpId computation partitions and pre-schedule
+  // WarpGroupDotOps when data partitioning is active. This must run before
+  // Phase 3/4 so that load-user propagation doesn't pull the MMA ops into
+  // the default partition.
+  //===--------------------------------------------------------------------===//
+  DenseMap<unsigned, Partition *> dpIdToPartition;
+  DenseMap<Operation *, Partition *> mmaToPreassignedPartition;
+  if (dataPartitionFactor > 1) {
+    auto dpOps = categorizer.getOpsInCategory(OpCategory::DataPartition);
+
+    DenseSet<unsigned> usedDpIds;
+    for (const auto &catOp : dpOps)
+      usedDpIds.insert(catOp.dataPartitionId);
+
+    // For Hopper WarpGroupDotOps: also collect dpIds from the MMA ops
+    // directly, since backward slices may miss exclusive ops due to
+    // inclusive=false or prior categorization.
+    if (useHopperDpSchedule) {
+      for (auto mmaOp : mmas) {
+        if (!isa<ttng::WarpGroupDotOp>(mmaOp))
+          continue;
+        unsigned dpId = categorizer.getDpId(mmaOp);
+        if (dpId != SHARED_DPID)
+          usedDpIds.insert(dpId);
+      }
+
+      // Create computation partitions first via makeDefaultPartition so
+      // they get lower indices than load (= default warp group).
+      SmallVector<unsigned> sortedDpIds(usedDpIds.begin(), usedDpIds.end());
+      llvm::sort(sortedDpIds, std::greater<unsigned>());
+      for (unsigned dpId : sortedDpIds)
+        dpIdToPartition[dpId] = layout.makeDefaultPartition(schedule);
+
+      // Create epilogue_store after computation partitions so it doesn't
+      // become the default. Mirror the hasEpilogue guard from
+      // createPartitionLayout to avoid creating a stray partition.
+      bool hasEpilogue =
+          !categorizer.getOpsInCategory(OpCategory::EpilogueStore).empty();
+      if (localSchedOpts.separateEpilogueStore && hasEpilogue) {
+        layout.epilogueStorePartition = schedule.addPartition(0);
+        layout.epilogueStorePartition->setType("epilogue_store");
+      }
+
+      // Create the load partition last so it gets the highest index
+      // (producer warp group).
+      layout.loadPartition = schedule.addPartition(0);
+      layout.loadPartition->setType("load");
+
+      // Pre-schedule MMA ops into their computation partitions so
+      // Phase 3/4 load-user propagation doesn't claim them.
+      for (auto mmaOp : mmas) {
+        if (!isa<ttng::WarpGroupDotOp>(mmaOp))
+          continue;
+        unsigned dpId = categorizer.getDpId(mmaOp);
+        if (dpId != SHARED_DPID) {
+          auto it = dpIdToPartition.find(dpId);
+          if (it != dpIdToPartition.end()) {
+            mmaToPreassignedPartition[mmaOp] = it->second;
+            tryScheduleOp(it->second, mmaOp);
+          }
+        }
+      }
+    } else {
+      SmallVector<unsigned> sortedDpIds(usedDpIds.begin(), usedDpIds.end());
+      llvm::sort(sortedDpIds, std::greater<unsigned>());
+      for (unsigned dpId : sortedDpIds) {
+        dpIdToPartition[dpId] = schedule.addPartition(0);
+        dpIdToPartition[dpId]->setType("computation");
+      }
+    }
+
+    // On Hopper (sm_9x), schedule dpOps now (Phase 2b) since MMA ops
+    // are already pre-scheduled and won't be stolen by Phase 4.
+    // On Blackwell (sm_10x+), defer to Phase 5 so correction scheduling
+    // in Phase 4 gets first pick of rescaling ops (acc * alpha).
+    if (isHopper)
+      preScheduleDpOps(dpOps, dpIdToPartition, mmaToPreassignedPartition,
+                       layout, categorizer, useHopperDpSchedule);
+  }
+
+  // Extract partition references from layout (after Phase 2b which may
+  // create computation and load partitions for the wgmma fallback path).
   Partition *defaultPartition = layout.defaultPartition;
   Partition *mmaPartition = layout.gemmPartition;
   Partition *loadPartition = layout.loadPartition;
@@ -1211,7 +1368,8 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
     reductionPartition = defaultPartition;
 
   //===--------------------------------------------------------------------===//
-  // Phase 3: Schedule ops using template-based partition assignment
+  // Phase 3: Schedule anchor ops (loads, epilogue stores, MMAs)
+  currentPhase = "phase3";
   //===--------------------------------------------------------------------===//
 
   // Schedule loads and their associated allocs (both in-loop and pre-loop)
@@ -1415,12 +1573,16 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
 
   //===--------------------------------------------------------------------===//
   // Phase 4: Propagate users (load users, correction, reductions)
-  //===--------------------------------------------------------------------====//
+  //===--------------------------------------------------------------------===//
+  currentPhase = "phase4";
 
   // Load users go to default partition (shared computation).
-  // When default is absent (e.g., bwd), skip — MMA user propagation in
-  // Phase 5 will capture these ops through the use chain.
-  if (defaultPartition) {
+  // When default is absent or equals the reduction partition (e.g., bwd),
+  // skip — MMA user propagation in Phase 5 will capture these ops through
+  // the use chain. Without this guard, load-user scheduling from
+  // descriptor_load (m/Di metadata) transitively pulls the entire softmax
+  // chain into the reduction partition.
+  if (defaultPartition && defaultPartition != reductionPartition) {
     for (Operation *loadOrAlloc : loadsAndAllocs) {
       scf::ForOp parentLoop = loadOrAlloc->getParentOfType<scf::ForOp>();
       if (!parentLoop) {
@@ -1488,28 +1650,10 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
         }
       }
     }
-
-    // For BWD (hasReduction): tag pre-loop TMEMStoreOp with the reduction
-    // partition index. These ops initialize accumulators (e.g., zeroing
-    // dK/dV) before the loop. Without explicit assignment, they would get
-    // pulled into the gemm partition via token chains to the in-loop MMA,
-    // causing gemm to require >=4 warps (TMEM ops need 4 warps). We set the
-    // attribute directly rather than using schedule.trySchedule because
-    // pre-loop ops must not be added to the partition's ops list
-    // (optimizeSchedule only handles in-loop ops).
-    if (reductionPartition) {
-      Builder b(mainLoop->getContext());
-      for (Operation &op : *mainLoop->getBlock()) {
-        if (&op == mainLoop)
-          break;
-        if (isa<ttng::TMEMStoreOp>(op))
-          op.setAttr(kPartitionAttrName,
-                     b.getDenseI32ArrayAttr({reductionPartition->getIndex()}));
-      }
-    }
   }
 
   //===--------------------------------------------------------------------===//
+  currentPhase = "phase5";
   // Phase 5: Create per-MMA computation partitions
   //===--------------------------------------------------------------------===//
   // MMA users create computation partitions. This runs AFTER correction/load
@@ -1526,66 +1670,15 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
 
   // For dpFactor==1, pre-create a single shared computation partition.
   // For dpFactor>1, let scheduleUsers(nullptr) create per-group partitions.
+  // (sharedComputePartition tracks the BWD computation partition.)
   Partition *sharedComputePartition = nullptr;
-  if (dataPartitionFactor <= 1) {
-    // All MMA users go to one computation partition (bwd pattern).
-    sharedComputePartition = nullptr; // lazy-created on first use
-  }
 
-  // When dpFactor > 1 and there is no defaultPartition, pre-assign
-  // DataPartition-categorized ops to their respective computation partitions
-  // BEFORE scheduleUsers runs. Without a defaultPartition, Phase 4 (load user
-  // propagation) is skipped, so shared/correction ops are not pre-claimed.
-  // This causes the first MMA's scheduleUsers to greedily absorb all
-  // computation ops into a single partition (e.g., when an scf.if merges both
-  // partitions' values). The categorizer already knows which ops belong to
-  // which data partition via backward slice analysis.
-  //
-  // When defaultPartition exists (e.g., FA with epilogue stores), the
-  // original Phase 4 → Phase 5 flow works correctly — skip pre-assignment to
-  // avoid changing the partition creation order that downstream passes
-  // expect.
-  DenseMap<unsigned, Partition *> dpIdToPartition;
-  DenseMap<Operation *, Partition *> mmaToPreassignedPartition;
-  if (dataPartitionFactor > 1) {
-    // Pre-assign exclusive DataPartition ops to per-dpId computation
-    // partitions.
+  // On Blackwell, schedule dpOps here (Phase 5, after Phase 4 correction)
+  // so correction scheduling gets first pick of rescaling ops.
+  if (dataPartitionFactor > 1 && !isHopper) {
     auto dpOps = categorizer.getOpsInCategory(OpCategory::DataPartition);
-
-    // Collect which dpIds actually have ops.
-    DenseSet<unsigned> usedDpIds;
-    for (const auto &catOp : dpOps)
-      usedDpIds.insert(catOp.dataPartitionId);
-
-    // Pre-create computation partitions in reverse dpId order to match
-    // the original partition creation order.
-    SmallVector<unsigned> sortedDpIds(usedDpIds.begin(), usedDpIds.end());
-    llvm::sort(sortedDpIds, std::greater<unsigned>());
-    for (unsigned dpId : sortedDpIds) {
-      dpIdToPartition[dpId] = schedule.addPartition(0);
-      dpIdToPartition[dpId]->setType("computation");
-    }
-
-    for (const auto &catOp : dpOps) {
-      unsigned dpId = catOp.dataPartitionId;
-      auto it = dpIdToPartition.find(dpId);
-      if (it != dpIdToPartition.end()) {
-        tryScheduleOp(it->second, catOp.op);
-        if (catOp.parentMMA)
-          mmaToPreassignedPartition[catOp.parentMMA] = it->second;
-      }
-    }
-    // Pre-assign shared ops (ops appearing in multiple MMA backward slices,
-    // e.g., scf.if for masking) to the default partition. Without this,
-    // propagatePartitions forms clusters around the unscheduled scf.if with
-    // multiple sink partitions (one per data partition), collapsing them
-    // into a single partition.
-    if (defaultPartition) {
-      for (Operation *sharedOp : categorizer.getSharedOps()) {
-        if (!isa<arith::ConstantOp>(sharedOp))
-          tryScheduleOp(defaultPartition, sharedOp);
-      }
-    }
+    preScheduleDpOps(dpOps, dpIdToPartition, mmaToPreassignedPartition, layout,
+                     categorizer, useHopperDpSchedule);
   }
 
   for (auto mmaOp : llvm::reverse(mmas)) {
@@ -1772,8 +1865,9 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
     }
   }
 
+  currentPhase = "post-loop";
   // Pre-schedule post-loop ops before propagatePartitions claims them.
-  schedulePostLoopOps(mainLoop, schedule, layout, schedOpts,
+  schedulePostLoopOps(mainLoop, schedule, layout, localSchedOpts,
                       categorizer.getOpToDpIdMap(), dpIdToPartition);
 
   // Update defaultPartition after computation partitions are created.
@@ -1786,7 +1880,7 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
 
   return ScheduleResult{std::move(schedule),
                         layout,
-                        schedOpts,
+                        localSchedOpts,
                         categorizer.getOpToDpIdMap(),
                         std::move(dpIdToPartition),
                         createComputePartitions};
@@ -1990,7 +2084,7 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
         for (Operation *op : cluster.ops) {
           if (isScalarOp(op))
             continue;
-          setPartition(op, existingComputation);
+          scheduleOp(existingComputation, op);
         }
         continue;
       }
@@ -2019,7 +2113,7 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
           for (Operation *op : cluster.ops) {
             if (isScalarOp(op))
               continue;
-            setPartition(op, fallbackPartition);
+            scheduleOp(fallbackPartition, op);
           }
           continue;
         }
@@ -2034,7 +2128,7 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
         for (Operation *op : cluster.ops) {
           if (isScalarOp(op))
             continue;
-          setPartition(op, cluster.sinkPartitions.front());
+          scheduleOp(cluster.sinkPartitions.front(), op);
         }
         continue;
       }
@@ -2043,7 +2137,7 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
       for (Operation *op : cluster.ops) {
         if (isScalarOp(op))
           continue;
-        setPartition(op, newPartition);
+        scheduleOp(newPartition, op);
       }
       continue;
     }
@@ -2055,7 +2149,7 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
       for (Operation *op : cluster.ops) {
         if (isScalarOp(op))
           continue;
-        setPartition(op, defPartition);
+        scheduleOp(defPartition, op);
       }
       continue;
     }
@@ -2084,7 +2178,7 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
       for (Operation *op : cluster.ops) {
         if (isScalarOp(op))
           continue;
-        setPartition(op, defPartition);
+        scheduleOp(defPartition, op);
       }
       continue;
     }
@@ -2102,12 +2196,12 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
         return sinkOps.contains(use.getOwner());
       });
       sinkOps.insert(clone);
-      setPartition(clone, sinkPartition);
+      scheduleOp(sinkPartition, clone);
     }
     for (Operation *op : cluster.ops) {
       if (isScalarOp(op))
         continue;
-      setPartition(op, defPartition);
+      scheduleOp(defPartition, op);
     }
   }
 }
@@ -2169,8 +2263,6 @@ void optimizeSchedule(scf::ForOp loop, PartitionSet &schedule) {
   // operands.
   loop.walk<WalkOrder::PostOrder, ReverseIterator>([&](Operation *op) {
     if (!isa<MemDescTransOp, ConvertLayoutOp, BroadcastOp, ExpandDimsOp>(op))
-      // if (op->getNumResults() != 1 || !isPure(op) ||
-      //     isa<scf::YieldOp, scf::ForOp, scf::IfOp>(op))
       return;
 
     Partition *partition = getPartition(op);
@@ -2189,7 +2281,7 @@ void optimizeSchedule(scf::ForOp loop, PartitionSet &schedule) {
     for (auto *userPartition : userPartitions) {
       // Clone the instruction into each user partition.
       Operation *clone = OpBuilder(op).clone(*op);
-      setPartition(clone, userPartition);
+      scheduleOp(userPartition, clone);
       // Replace all users in that partition with the clone.
       op->replaceUsesWithIf(clone->getResults(), [&](OpOperand &otherUse) {
         return getPartition(otherUse.getOwner()) == userPartition;
@@ -2239,7 +2331,6 @@ void splitDataPartitionedIfOps(scf::ForOp loop, PartitionSet &schedule) {
 
     // Check if results feed different partitions.
     DenseSet<int> resultPartitions;
-    bool hasDifferentPartitions = false;
     for (OpResult result : ifOp.getResults()) {
       for (Operation *user : result.getUsers()) {
         auto ids = safeGetPartitionIds(user);
@@ -2431,8 +2522,10 @@ void PartitionSchedulingMeta::runOnOperation() {
     if (std::optional<ScheduleResult> result =
             getInitialSchedule(loop, schedOpts)) {
       PartitionSet &schedule = result->schedule;
+      currentPhase = "propagate";
       propagatePartitions(loop, schedule, result->createComputePartitions);
 
+      currentPhase = "optimize";
       optimizeSchedule(loop, schedule);
 
       // Split scf.if ops whose results feed different computation partitions.

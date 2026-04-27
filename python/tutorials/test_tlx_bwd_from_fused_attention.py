@@ -346,20 +346,30 @@ def run_tlx_bwd(q, k, v, o, M, do, sm_scale, causal):
     )
 
     dummy_block = [1, 1]
-    desc_q = TensorDescriptor(q, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
-                              block_shape=dummy_block)
-    desc_k = TensorDescriptor(arg_k, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
-                              block_shape=dummy_block)
-    desc_v = TensorDescriptor(v, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
-                              block_shape=dummy_block)
-    desc_do = TensorDescriptor(do, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
-                               block_shape=dummy_block)
-    desc_dq = TensorDescriptor(dq, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
-                               block_shape=dummy_block)
-    desc_dk = TensorDescriptor(dk, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
-                               block_shape=dummy_block)
-    desc_dv = TensorDescriptor(dv, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
-                               block_shape=dummy_block)
+    dummy_block_1d = [1]
+    desc_q = TensorDescriptor(
+        q, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
+    )
+    desc_k = TensorDescriptor(
+        arg_k, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
+    )
+    desc_v = TensorDescriptor(
+        v, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
+    )
+    desc_do = TensorDescriptor(
+        do, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
+    )
+    desc_dq = TensorDescriptor(
+        dq, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
+    )
+    desc_dk = TensorDescriptor(
+        dk, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
+    )
+    desc_dv = TensorDescriptor(
+        dv, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
+    )
+    desc_m = TensorDescriptor(M, shape=[BATCH * N_HEAD * N_CTX], strides=[1], block_shape=dummy_block_1d)
+    desc_delta = TensorDescriptor(delta, shape=[BATCH * N_HEAD * N_CTX], strides=[1], block_shape=dummy_block_1d)
 
     def alloc_fn(size: int, align: int, _):
         return torch.empty(size, dtype=torch.int8, device="cuda")
@@ -391,8 +401,8 @@ def run_tlx_bwd(q, k, v, o, M, do, sm_scale, causal):
         desc_dq,
         desc_dk,
         desc_dv,
-        M,
-        delta,
+        desc_m,
+        desc_delta,
         q.stride(0),
         q.stride(1),
         q.stride(2),
