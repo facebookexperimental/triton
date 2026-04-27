@@ -66,6 +66,7 @@ public:
       function_ref<void(OpResult, OpOperand &, unsigned)> callback) const;
 
 private:
+  friend class PartitionSet;
   void setIndex(int idx) { this->idx = idx; }
 
   // The partition number.
@@ -112,6 +113,9 @@ public:
 
   // Utility to be used when the op is known to belong to one partition
   Partition *getPartition(Operation *op);
+
+  // Swap two partitions' indices and update all op annotations in the loop.
+  void swapPartitions(unsigned idxA, unsigned idxB, scf::ForOp loop);
 
 private:
   // WarpSpecialization tag

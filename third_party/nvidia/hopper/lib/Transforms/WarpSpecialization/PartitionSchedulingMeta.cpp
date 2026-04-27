@@ -286,6 +286,17 @@ struct PartitionLayout {
       defaultPartition = part;
     return part;
   }
+
+  /// Promote an existing partition to index 0 (default warp group) by
+  /// swapping it with whatever is currently at index 0. Call after ops
+  /// have been assigned so that op annotations are updated correctly.
+  void makeDefaultPartition(PartitionSet &schedule, Partition *part,
+                            scf::ForOp loop) {
+    if (!part || part->getIndex() == 0)
+      return;
+    schedule.swapPartitions(0, part->getIndex(), loop);
+    defaultPartition = part;
+  }
 };
 
 //===----------------------------------------------------------------------===//
@@ -1872,6 +1883,33 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
 
   // Update defaultPartition after computation partitions are created.
   layout.defaultPartition = layout.getDefaultPartition();
+
+  // Scan partitions for one that requires 4 warps (TMEM or WarpGroupDot
+  // ops) and promote it to index 0 so it becomes the default warp group.
+  // Skip if partition 0 already contains 4-warp ops.
+  auto needs4Warps = [](Partition &p) {
+    return llvm::any_of(p.getOps(), [](Operation *op) {
+      return isa<ttng::TMEMLoadOp, ttng::TMEMStoreOp, ttng::TMEMAllocOp,
+                 ttng::WarpGroupDotOp>(op);
+    });
+  };
+  bool defaultNeeds4Warps = false;
+  for (Partition &p : schedule.getPartitions()) {
+    if (p.getIndex() == 0) {
+      defaultNeeds4Warps = needs4Warps(p);
+      break;
+    }
+  }
+  if (!defaultNeeds4Warps) {
+    for (Partition &p : schedule.getPartitions()) {
+      if (p.getIndex() == 0)
+        continue;
+      if (needs4Warps(p)) {
+        layout.makeDefaultPartition(schedule, &p, mainLoop);
+        break;
+      }
+    }
+  }
 
   bool createComputePartitions =
       (layout.correctionPartition != nullptr ||

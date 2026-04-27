@@ -29,7 +29,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 //
 // --- Partition types ---
 // CHECK: tt.warp_specialize
-// CHECK-SAME: ttg.partition.types = ["gemm", "load", "computation"]
+// CHECK-SAME: ttg.partition.types = ["computation", "load", "gemm"]
 //
 // --- Post-loop: use → no partition annotation (unregistered dialect op) ---
 tt.func public @simple_gemm_partition_types(
