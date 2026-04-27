@@ -8,6 +8,7 @@
 #include "mlir/Support/LLVM.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "third_party/tlx/dialect/include/IR/Dialect.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -113,12 +114,15 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
       triton::nvidia_gpu::VoteBallotSyncOp, triton::tlx::RequireLayoutOp,
       triton::tlx::ReleaseLayoutOp, triton::tlx::LocalAliasOp,
       triton::amdgpu::BufferLoadOp, triton::amdgpu::BufferStoreOp,
-      triton::amdgpu::BufferLoadToLocalOp>([&](Operation *op) -> bool {
-    // make sure every RankedTensorType operand has encoding
-    for (auto operandType : op->getOperandTypes()) {
-      if (auto rankedTensorType = dyn_cast<RankedTensorType>(operandType)) {
-        if (rankedTensorType.getEncoding() == nullptr) {
-          return false;
+      triton::amdgpu::BufferLoadToLocalOp>(
+      [&](Operation *op) -> bool {
+        // make sure every RankedTensorType operand has encoding
+        for (auto operandType : op->getOperandTypes()) {
+          if (auto rankedTensorType = dyn_cast<RankedTensorType>(operandType)) {
+            if (rankedTensorType.getEncoding() == nullptr) {
+              return false;
+            }
+          }
         }
       }
     }
