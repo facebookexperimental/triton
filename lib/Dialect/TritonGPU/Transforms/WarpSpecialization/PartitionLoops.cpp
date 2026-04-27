@@ -250,9 +250,8 @@ void cloneReduceOp(triton::ReduceOp reduceOp,
       srcs.push_back(b.mapping.lookupOrDefault(src));
     }
     auto axis = reduceOp.getAxis();
-    auto newReduceOp =
-        triton::ReduceOp::create(b, reduceOp.getLoc(), srcs, axis,
-                                 reduceOp.getReductionOrderingAttr());
+    auto newReduceOp = triton::ReduceOp::create(
+        b, reduceOp.getLoc(), srcs, axis, reduceOp.getReductionOrderingAttr());
     newReduceOp->setAttrs(reduceOp->getAttrs());
     if (reduceOp->hasAttr(kPartitionOutputsAttrName)) {
       newReduceOp->removeAttr(kPartitionOutputsAttrName);

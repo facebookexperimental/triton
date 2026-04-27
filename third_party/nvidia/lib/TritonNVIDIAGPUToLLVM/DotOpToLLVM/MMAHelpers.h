@@ -178,12 +178,10 @@ public:
     // Compute the base address at runtime to prevent LLVM from folding the
     // per-tile offset into a unique 64-bit constant. This produces a short
     // dependency chain (add→and→zext→add) that helps hide WGMMA latency.
-    Value fullAddrb128 =
-        tb.add(baseSrcb128, tb.i32_val(smemByteOffsetb128));
+    Value fullAddrb128 = tb.add(baseSrcb128, tb.i32_val(smemByteOffsetb128));
     Value addrMasked = tb.and_(fullAddrb128, tb.i32_val(0x3FFF));
     Value addr64 = tb.zext(i64_ty, addrMasked);
-    Value descVal =
-        tb.add(tb.int_val(64, currDesc.descriptor), addr64);
+    Value descVal = tb.add(tb.int_val(64, currDesc.descriptor), addr64);
     return descVal;
   }
   MemDescOperand memLoad(int a, int b, ConversionPatternRewriter &rewriter,

@@ -241,15 +241,15 @@ void createTMAAsyncLoad(scf::ForOp forOp, tt::DescriptorLoadOp loadOp,
                         Value alloc, Value insertIdx, Value extractIdx,
                         Value barrier, Operation *waitOp,
                         CoarseSchedule &schedule) {
-  return createTMAAsyncCopy(
-      forOp, loadOp, loadOp.getDesc(), alloc, insertIdx, extractIdx, barrier,
-      waitOp, schedule,
-      [&](OpBuilderForStage &builder, Value desc, Value barrier, Value view,
-          Value pred) {
-        ttng::AsyncTMACopyGlobalToLocalOp::create(
-            builder, loadOp.getLoc(), /*multicastTargets*/ Value(), desc,
-            loadOp.getIndices(), barrier, view, pred);
-      });
+  return createTMAAsyncCopy(forOp, loadOp, loadOp.getDesc(), alloc, insertIdx,
+                            extractIdx, barrier, waitOp, schedule,
+                            [&](OpBuilderForStage &builder, Value desc,
+                                Value barrier, Value view, Value pred) {
+                              ttng::AsyncTMACopyGlobalToLocalOp::create(
+                                  builder, loadOp.getLoc(),
+                                  /*multicastTargets*/ Value(), desc,
+                                  loadOp.getIndices(), barrier, view, pred);
+                            });
 }
 
 void createTMAAsyncGather(scf::ForOp forOp, tt::DescriptorGatherOp gatherOp,

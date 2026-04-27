@@ -347,27 +347,20 @@ def run_tlx_bwd(q, k, v, o, M, do, sm_scale, causal):
 
     dummy_block = [1, 1]
     dummy_block_1d = [1]
-    desc_q = TensorDescriptor(
-        q, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
-    )
-    desc_k = TensorDescriptor(
-        arg_k, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
-    )
-    desc_v = TensorDescriptor(
-        v, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
-    )
-    desc_do = TensorDescriptor(
-        do, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
-    )
-    desc_dq = TensorDescriptor(
-        dq, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
-    )
-    desc_dk = TensorDescriptor(
-        dk, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
-    )
-    desc_dv = TensorDescriptor(
-        dv, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
-    )
+    desc_q = TensorDescriptor(q, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                              block_shape=dummy_block)
+    desc_k = TensorDescriptor(arg_k, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                              block_shape=dummy_block)
+    desc_v = TensorDescriptor(v, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                              block_shape=dummy_block)
+    desc_do = TensorDescriptor(do, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                               block_shape=dummy_block)
+    desc_dq = TensorDescriptor(dq, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                               block_shape=dummy_block)
+    desc_dk = TensorDescriptor(dk, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                               block_shape=dummy_block)
+    desc_dv = TensorDescriptor(dv, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                               block_shape=dummy_block)
     desc_m = TensorDescriptor(M, shape=[BATCH * N_HEAD * N_CTX], strides=[1], block_shape=dummy_block_1d)
     desc_delta = TensorDescriptor(delta, shape=[BATCH * N_HEAD * N_CTX], strides=[1], block_shape=dummy_block_1d)
 

@@ -3252,8 +3252,7 @@ def test_reduction_ordering_sum_multi_group(num_warps, device):
     BLOCK_N = 1024
 
     @triton.jit
-    def sum_kernel_1row(X, Z, stride_row, stride_col,
-                        BLOCK_N: tl.constexpr, ORDERING: tl.constexpr):
+    def sum_kernel_1row(X, Z, stride_row, stride_col, BLOCK_N: tl.constexpr, ORDERING: tl.constexpr):
         pid = tl.program_id(0)
         offs_n = tl.arange(0, BLOCK_N)
         x = tl.load(X + pid * stride_row + offs_n * stride_col)
@@ -3262,23 +3261,18 @@ def test_reduction_ordering_sum_multi_group(num_warps, device):
 
     torch.manual_seed(42)
     x = torch.randn((TOTAL_ROWS, BLOCK_N), device=device, dtype=torch.float32)
-    grid = (TOTAL_ROWS,)
+    grid = (TOTAL_ROWS, )
 
     # Reference: num_warps=1 (K=1, no multi-group path)
     ref = torch.empty(TOTAL_ROWS, device=device, dtype=torch.float32)
-    sum_kernel_1row[grid](x, ref, x.stride(0), x.stride(1),
-                          BLOCK_N=BLOCK_N,
-                          ORDERING=tl.ReductionOrdering.INNER_TREE,
+    sum_kernel_1row[grid](x, ref, x.stride(0), x.stride(1), BLOCK_N=BLOCK_N, ORDERING=tl.ReductionOrdering.INNER_TREE,
                           num_warps=1)
 
     out = torch.empty(TOTAL_ROWS, device=device, dtype=torch.float32)
-    sum_kernel_1row[grid](x, out, x.stride(0), x.stride(1),
-                          BLOCK_N=BLOCK_N,
-                          ORDERING=tl.ReductionOrdering.INNER_TREE,
+    sum_kernel_1row[grid](x, out, x.stride(0), x.stride(1), BLOCK_N=BLOCK_N, ORDERING=tl.ReductionOrdering.INNER_TREE,
                           num_warps=num_warps)
-    assert torch.equal(out, ref), (
-        f"INNER_TREE sum K>1 not bitwise equal to K=1 reference: "
-        f"num_warps={num_warps}")
+    assert torch.equal(out, ref), (f"INNER_TREE sum K>1 not bitwise equal to K=1 reference: "
+                                   f"num_warps={num_warps}")
 
 
 # ---------------

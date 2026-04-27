@@ -495,8 +495,8 @@ static unsigned estimateConvertScratchCost(Value value, Attribute encoding) {
 
 // Compute a score for a layout to guide conflict resolution.
 // Based on sizePerThread (vectorization) for both blocked and linear encodings.
-// Higher score is preferred — layouts with more elements per thread allow better
-// vectorized memory access (ld.shared, st.shared).
+// Higher score is preferred — layouts with more elements per thread allow
+// better vectorized memory access (ld.shared, st.shared).
 static int64_t getLayoutScore(Attribute encoding) {
   SmallVector<unsigned> sizePerThread;
   if (auto blocked = dyn_cast<BlockedEncodingAttr>(encoding)) {
@@ -2046,7 +2046,8 @@ public:
         if (isa<LocalStoreOp>(user))
           continue;
         // For scf.yield under scf.if, follow through to the IfOp results.
-        // ForOp/WhileOp yields are blocked by canPropagateSrcEncodingThroughUsers.
+        // ForOp/WhileOp yields are blocked by
+        // canPropagateSrcEncodingThroughUsers.
         if (auto yieldOp = dyn_cast<scf::YieldOp>(user)) {
           if (auto ifOp = dyn_cast<scf::IfOp>(yieldOp->getParentOp())) {
             ifOpsToRewrite.insert(ifOp.getOperation());

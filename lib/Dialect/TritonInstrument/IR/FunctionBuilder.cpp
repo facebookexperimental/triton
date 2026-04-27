@@ -69,7 +69,7 @@ Value createBitwiseOrReduce(ImplicitLocOpBuilder &b, Value tensor, int axis) {
   OpBuilder::InsertionGuard guard(b);
   auto tensorType = cast<RankedTensorType>(tensor.getType());
   auto reduceOp = triton::ReduceOp::create(b, std::vector<Value>{tensor}, axis,
-                                             /*reduction_ordering=*/nullptr);
+                                           /*reduction_ordering=*/nullptr);
   auto &region = reduceOp.getRegion();
   auto &block = region.emplaceBlock();
   block.addArguments({tensorType.getElementType(), tensorType.getElementType()},

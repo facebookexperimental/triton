@@ -743,8 +743,10 @@ def test_inline_tmem(BLOCK_SIZE, device):
 # 1D gather test
 @triton.jit
 def local_gather_kernel(
-    matrix_ptr, indices_ptr, output_ptr, 
-    N: tl.constexpr, 
+    matrix_ptr,
+    indices_ptr,
+    output_ptr,
+    N: tl.constexpr,
     M: tl.constexpr,
 ):
     """Test lds gather using tlx.local_gather() with axis-based API."""
@@ -800,8 +802,10 @@ def test_local_gather(N, M):
 
 @triton.jit
 def local_scatter_kernel(
-    indices_ptr, values_ptr, output_ptr, 
-    N: tl.constexpr, 
+    indices_ptr,
+    values_ptr,
+    output_ptr,
+    N: tl.constexpr,
     M: tl.constexpr,
 ):
     """Test lds scatter using tlx.local_scatter() with axis-based API."""

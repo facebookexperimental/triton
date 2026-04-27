@@ -383,9 +383,8 @@ static unsigned buildScheduleLoop(scf::ForOp loop,
         if (childDDG.getNumNodes() > 0) {
           auto childSched = ttg::runModuloScheduling(childDDG);
           if (succeeded(childSched)) {
-            unsigned childId =
-                buildScheduleLoop(innerLoop, childDDG, *childSched,
-                                  graph, model);
+            unsigned childId = buildScheduleLoop(innerLoop, childDDG,
+                                                 *childSched, graph, model);
             sn.childPipelineId = childId;
             sn.prologueLatency = graph.getLoop(childId).prologueLatency;
           }
@@ -567,8 +566,7 @@ static void allocateBuffersForLoop(ttg::ScheduleLoop &loop) {
       // If this node produces an SMEM buffer, collect it.
       if (curNode.producesBuffer != UINT_MAX &&
           curNode.producesBuffer < loop.buffers.size() &&
-          loop.buffers[curNode.producesBuffer].kind ==
-              ttg::MemoryKind::SMEM)
+          loop.buffers[curNode.producesBuffer].kind == ttg::MemoryKind::SMEM)
         upstreamBufs.push_back(curNode.producesBuffer);
       // Walk upstream through predecessors (NONE-pipeline only, to
       // avoid crossing pipeline boundaries).
@@ -592,11 +590,10 @@ static void allocateBuffersForLoop(ttg::ScheduleLoop &loop) {
       maxDepth = std::max(maxDepth, loop.buffers[bufId].count);
     for (unsigned bufId : upstreamBufs) {
       if (loop.buffers[bufId].count != maxDepth) {
-        LLVM_DEBUG(llvm::dbgs()
-                   << "[Step3] Equalized buf" << bufId << " depth from "
-                   << loop.buffers[bufId].count << " to " << maxDepth
-                   << " (co-consumed by "
-                   << node.op->getName().getStringRef() << ")\n");
+        LLVM_DEBUG(llvm::dbgs() << "[Step3] Equalized buf" << bufId
+                                << " depth from " << loop.buffers[bufId].count
+                                << " to " << maxDepth << " (co-consumed by "
+                                << node.op->getName().getStringRef() << ")\n");
         loop.buffers[bufId].count = maxDepth;
       }
     }
@@ -740,8 +737,7 @@ buildCoConsumedGroups(const ttg::ScheduleLoop &loop) {
       const auto &curNode = loop.nodes[cur];
       if (curNode.producesBuffer != UINT_MAX &&
           curNode.producesBuffer < loop.buffers.size() &&
-          loop.buffers[curNode.producesBuffer].kind ==
-              ttg::MemoryKind::SMEM)
+          loop.buffers[curNode.producesBuffer].kind == ttg::MemoryKind::SMEM)
         upstreamBufs.push_back(curNode.producesBuffer);
       for (const auto &edge : loop.edges) {
         if (edge.dstId != cur || edge.distance > 0)
@@ -769,8 +765,8 @@ buildCoConsumedGroups(const ttg::ScheduleLoop &loop) {
     if (existingGroups.empty()) {
       mergedGroupId = nextGroup++;
     } else {
-      mergedGroupId = *std::min_element(existingGroups.begin(),
-                                        existingGroups.end());
+      mergedGroupId =
+          *std::min_element(existingGroups.begin(), existingGroups.end());
       // Rewrite all buffers in the other groups to the merged ID.
       if (existingGroups.size() > 1) {
         for (auto &[bufId, gid] : bufToGroup) {
@@ -877,9 +873,8 @@ static bool reduceBuffersForBudget(ttg::ScheduleLoop &loop,
       unsigned barId = loop.buffers[bestIdx].pairedBufferId;
       if (barId != UINT_MAX)
         loop.buffers[barId].count = newDepth;
-      LLVM_DEBUG(llvm::dbgs()
-                 << "[Step4.6] Reduced SMEM buf" << bestIdx << " to count="
-                 << newDepth << "\n");
+      LLVM_DEBUG(llvm::dbgs() << "[Step4.6] Reduced SMEM buf" << bestIdx
+                              << " to count=" << newDepth << "\n");
     }
   }
 
@@ -904,8 +899,8 @@ static bool reduceBuffersForBudget(ttg::ScheduleLoop &loop,
     if (barId != UINT_MAX)
       loop.buffers[barId].count = loop.buffers[bestIdx].count;
     LLVM_DEBUG(llvm::dbgs()
-               << "[Step4.6] Reduced TMEM buf" << bestIdx << " to count="
-               << loop.buffers[bestIdx].count << "\n");
+               << "[Step4.6] Reduced TMEM buf" << bestIdx
+               << " to count=" << loop.buffers[bestIdx].count << "\n");
   }
 
   // Recompute II from reduced buffer depths.
@@ -921,18 +916,16 @@ static bool reduceBuffersForBudget(ttg::ScheduleLoop &loop,
       continue;
     int requiredII = (it->second + buf.count - 1) / buf.count;
     if (requiredII > newII) {
-      LLVM_DEBUG(llvm::dbgs()
-                 << "[Step4.6] buf" << i << " lifetime=" << it->second
-                 << " depth=" << buf.count
-                 << " → requires II=" << requiredII << "\n");
+      LLVM_DEBUG(llvm::dbgs() << "[Step4.6] buf" << i << " lifetime="
+                              << it->second << " depth=" << buf.count
+                              << " → requires II=" << requiredII << "\n");
       newII = requiredII;
     }
   }
 
   if (newII != originalII) {
     LLVM_DEBUG(llvm::dbgs()
-               << "[Step4.6] Raising II from " << originalII
-               << " to " << newII
+               << "[Step4.6] Raising II from " << originalII << " to " << newII
                << " due to buffer depth reduction\n");
     loop.II = newII;
     loop.maxStage = 0;
@@ -1346,12 +1339,11 @@ scheduleOneLoop(scf::ForOp loop, const ttg::LatencyModel &model,
     return std::nullopt;
   }
 
-  LLVM_DEBUG(llvm::dbgs()
-             << "[PASS-A] " << label
-             << " Schedule: II=" << schedResult->II
-             << " ResMII=" << ddg.computeResMII()
-             << " RecMII=" << ddg.computeRecMII()
-             << " maxStage=" << schedResult->getMaxStage() << "\n");
+  LLVM_DEBUG(llvm::dbgs() << "[PASS-A] " << label
+                          << " Schedule: II=" << schedResult->II
+                          << " ResMII=" << ddg.computeResMII()
+                          << " RecMII=" << ddg.computeRecMII() << " maxStage="
+                          << schedResult->getMaxStage() << "\n");
 
   LLVM_DEBUG({
     for (const auto &node : ddg.getNodes()) {
@@ -1360,13 +1352,12 @@ scheduleOneLoop(scf::ForOp loop, const ttg::LatencyModel &model,
         continue;
       int cycle = it->second;
       int stage = cycle / schedResult->II;
-      llvm::dbgs() << "[PASS-A]   N" << node.idx
-                   << "  cycle=" << cycle << "  stage=" << stage
-                   << "  " << ttg::getPipelineName(node.pipeline)
+      llvm::dbgs() << "[PASS-A]   N" << node.idx << "  cycle=" << cycle
+                   << "  stage=" << stage << "  "
+                   << ttg::getPipelineName(node.pipeline)
                    << "  selfLat=" << node.selfLatency << "  ";
-      node.op->print(
-          llvm::dbgs(),
-          OpPrintingFlags().skipRegions().elideLargeElementsAttrs());
+      node.op->print(llvm::dbgs(),
+                     OpPrintingFlags().skipRegions().elideLargeElementsAttrs());
       llvm::dbgs() << "\n";
     }
   });
@@ -1381,7 +1372,7 @@ scheduleOneLoop(scf::ForOp loop, const ttg::LatencyModel &model,
   if (hasInnerLoop) {
     if (schedLoop.II != schedResult->II) {
       LDBG(label << " budget adjusted II: " << schedResult->II << " → "
-           << schedLoop.II << ", maxStage=" << schedLoop.maxStage);
+                 << schedLoop.II << ", maxStage=" << schedLoop.maxStage);
       auto adjustedResult = *schedResult;
       adjustedResult.II = schedLoop.II;
       emitScheduleAttributes(loop, ddg, adjustedResult);
@@ -1482,31 +1473,31 @@ struct ModuloSchedulePass
     for (int iteration = 0; iteration < kMaxIterations; ++iteration) {
       LDBG("=== Iterative scheduling: iteration " << iteration << " ===");
 
-    SmallVector<std::pair<scf::ForOp, unsigned>> loopsWithDepth;
-    moduleOp.walk([&](scf::ForOp loop) {
-      bool hasSchedulableOps = false;
-      loop->walk([&](Operation *op) {
-        if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp,
-                ttng::AsyncTMACopyGlobalToLocalOp,
-                ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp>(op))
-          hasSchedulableOps = true;
+      SmallVector<std::pair<scf::ForOp, unsigned>> loopsWithDepth;
+      moduleOp.walk([&](scf::ForOp loop) {
+        bool hasSchedulableOps = false;
+        loop->walk([&](Operation *op) {
+          if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp,
+                  ttng::AsyncTMACopyGlobalToLocalOp, ttng::TCGen5MMAOp,
+                  ttng::TCGen5MMAScaledOp>(op))
+            hasSchedulableOps = true;
+        });
+        if (!hasSchedulableOps)
+          return;
+        unsigned depth = 0;
+        for (auto parent = loop->getParentOfType<scf::ForOp>(); parent;
+             parent = parent->getParentOfType<scf::ForOp>())
+          ++depth;
+        loopsWithDepth.push_back({loop, depth});
       });
-      if (!hasSchedulableOps)
-        return;
-      unsigned depth = 0;
-      for (auto parent = loop->getParentOfType<scf::ForOp>(); parent;
-           parent = parent->getParentOfType<scf::ForOp>())
-        ++depth;
-      loopsWithDepth.push_back({loop, depth});
-    });
-    llvm::sort(loopsWithDepth, [](const auto &a, const auto &b) {
-      return a.second < b.second;
-    });
+      llvm::sort(loopsWithDepth, [](const auto &a, const auto &b) {
+        return a.second < b.second;
+      });
 
-    LDBG("Found " << loopsWithDepth.size() << " schedulable loop(s)");
+      LDBG("Found " << loopsWithDepth.size() << " schedulable loop(s)");
 
-    for (auto &[loop, depth] : loopsWithDepth)
-      scheduleOneLoop(loop, model, "Loop");
+      for (auto &[loop, depth] : loopsWithDepth)
+        scheduleOneLoop(loop, model, "Loop");
 
       // ================================================================
       // Iterative refinement: apply DDG transformations and check if

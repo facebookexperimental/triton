@@ -117,7 +117,7 @@ static const TTGIRToTLXMapping opMappings[] = {
     {"ttg.local_gather", "tlx.local_gather",
      "Gather elements from shared memory to registers"},
     {"ttg.local_scatter", "tlx.local_scatter",
-     "Scatter elements from registers to shared memory"},     
+     "Scatter elements from registers to shared memory"},
     {"ttng.tmem_load", "tlx.local_load",
      "Load from tensor memory to registers (Blackwell)"},
     {"ttg.local_store", "tlx.local_store", "Store registers to shared memory"},

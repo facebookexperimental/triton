@@ -533,12 +533,10 @@ private:
     // innerTreeReducedVals[j] = tree-reduced values for all operands at
     // position j.
     SmallVector<SmallVector<Value>> innerTreeReducedVals;
-    bool isTensorResult =
-        isa<RankedTensorType>(op.getResult()[0].getType());
+    bool isTensorResult = isa<RankedTensorType>(op.getResult()[0].getType());
     if (K > 1) {
       if (isTensorResult) {
-        auto resultTy =
-            cast<RankedTensorType>(op.getResult()[0].getType());
+        auto resultTy = cast<RankedTensorType>(op.getResult()[0].getType());
         auto resultLayout = cast<SliceEncodingAttr>(resultTy.getEncoding());
         unsigned resultElems = getTotalElemsPerThread(resultTy);
         auto resultIndices = emitIndices(loc, rewriter, targetInfo,
@@ -551,8 +549,7 @@ private:
           readIdx.insert(readIdx.begin() + op.getAxis(), b.i32_val(0));
           for (size_t resultIdx = 0, resultDim = resultShape.size();
                resultIdx < resultDim; ++resultIdx) {
-            auto smemIdx =
-                resultIdx < op.getAxis() ? resultIdx : resultIdx + 1;
+            auto smemIdx = resultIdx < op.getAxis() ? resultIdx : resultIdx + 1;
             if (resultShape[resultIdx] > smemShape[smemIdx]) {
               readIdx[smemIdx] =
                   b.urem(readIdx[smemIdx], b.i32_val(smemShape[smemIdx]));
@@ -567,8 +564,8 @@ private:
             SmallVector<Value> groupVals;
             for (unsigned ii = 0; ii < op.getNumOperands(); ++ii) {
               auto eTy = getElementType(op, ii);
-              Value readPtr = b.gep(smemBases[ii].getType(), eTy,
-                                    smemBases[ii], readOffset);
+              Value readPtr = b.gep(smemBases[ii].getType(), eTy, smemBases[ii],
+                                    readOffset);
               groupVals.push_back(b.load(eTy, readPtr));
             }
             groups.push_back(std::move(groupVals));
@@ -595,8 +592,8 @@ private:
           SmallVector<Value> groupVals;
           for (unsigned ii = 0; ii < op.getNumOperands(); ++ii) {
             auto eTy = getElementType(op, ii);
-            Value readPtr = b.gep(smemBases[ii].getType(), eTy,
-                                  smemBases[ii], readOffset);
+            Value readPtr =
+                b.gep(smemBases[ii].getType(), eTy, smemBases[ii], readOffset);
             groupVals.push_back(b.load(eTy, readPtr));
           }
           groups.push_back(std::move(groupVals));

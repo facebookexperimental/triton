@@ -244,7 +244,8 @@ static FailureOr<ModuloScheduleResult> runRauIMS(const DataDependenceGraph &ddg,
 }
 
 // runListScheduling moved to ListSchedulePass.cpp so its DEBUG_TYPE matches
-// the rest of the list-scheduling pass output (-debug-only=nvgpu-list-schedule).
+// the rest of the list-scheduling pass output
+// (-debug-only=nvgpu-list-schedule).
 
 // ── Public entry point ──────────────────────────────────────────────────────
 

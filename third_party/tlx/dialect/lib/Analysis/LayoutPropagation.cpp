@@ -205,7 +205,8 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
       auto ctx = srcType.getContext();
 
       // Build unswizzled NVMMASharedEncodingAttr with default CTA layout
-      auto ctaLayout = ttg::CGAEncodingAttr::get1CTALayout(ctx, srcType.getRank());
+      auto ctaLayout =
+          ttg::CGAEncodingAttr::get1CTALayout(ctx, srcType.getRank());
       auto unswizzledEncoding = ttg::NVMMASharedEncodingAttr::get(
           ctx,
           /*swizzlingByteWidth=*/0,
