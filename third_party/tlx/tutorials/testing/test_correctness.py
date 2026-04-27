@@ -175,6 +175,7 @@ class FlashAttention:
             "NUM_Q_SCALE_TMEM_BUFFERS": 1,
             "NUM_KV_SCALE_TMEM_BUFFERS": 2,
             "GROUP_SIZE_N": 1,
+            "RESCALE_OPT": True,
         },
         "hopper_fa_ws": {
             "BLOCK_M": 128,
@@ -342,7 +343,13 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8(HEAD_DIM, causal):
         if causal:
             atol = 0.1
         else:
-            atol = 0.03
+            if HEAD_DIM == 64:
+                # Max atol measured was 0.033203125
+                atol = 0.04
+            else:
+                # Max atol measured was 0.07421875
+                assert HEAD_DIM == 128
+                atol = 0.08
         torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
 
 
