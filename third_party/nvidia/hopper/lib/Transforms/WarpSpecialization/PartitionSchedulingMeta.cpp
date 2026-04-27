@@ -1297,8 +1297,11 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
         dpIdToPartition[dpId] = layout.makeDefaultPartition(schedule);
 
       // Create epilogue_store after computation partitions so it doesn't
-      // become the default.
-      if (localSchedOpts.separateEpilogueStore) {
+      // become the default. Mirror the hasEpilogue guard from
+      // createPartitionLayout to avoid creating a stray partition.
+      bool hasEpilogue =
+          !categorizer.getOpsInCategory(OpCategory::EpilogueStore).empty();
+      if (localSchedOpts.separateEpilogueStore && hasEpilogue) {
         layout.epilogueStorePartition = schedule.addPartition(0);
         layout.epilogueStorePartition->setType("epilogue_store");
       }

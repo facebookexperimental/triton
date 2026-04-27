@@ -2731,18 +2731,22 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
 
   // When a producer has multiple task IDs (e.g., a shared local_alloc
   // consumed by data-partitioned computation groups), no channel is needed
-  // if every consumer task matches one of the producer tasks — producer and
-  // consumer are co-located.
-  if (producerTaskIds.size() > 1) {
-    DenseSet<int> producerSet(producerTaskIds.begin(), producerTaskIds.end());
-    bool allConsumersMatch = llvm::all_of(
-        consumerTaskIds, [&](int id) { return producerSet.contains(id); });
-    if (allConsumersMatch)
-      return;
+  // for any producer that is co-located with a consumer. It is unclear if
+  // is sufficient when there are multiple consumers.
+  AsyncTaskId producerTaskId = -1;
+  if (producerTaskIds.size() > 1 && consumerTaskIds.size() == 1) {
+    auto consumerTaskId = consumerTaskIds.front();
+    for (auto id : producerTaskIds) {
+      if (id != consumerTaskId) {
+        assert(producerTaskId == -1 &&
+               "Multiple producers encountered for 1 consumer");
+        producerTaskId = id;
+      }
+    }
+  } else {
+    assert(producerTaskIds.size() == 1);
+    producerTaskId = producerTaskIds.front();
   }
-
-  assert(producerTaskIds.size() == 1);
-  auto producerTaskId = producerTaskIds.front();
   // Remove producer task id from consumerTaskIds.
   auto iter = std::remove(consumerTaskIds.begin(), consumerTaskIds.end(),
                           producerTaskId);
