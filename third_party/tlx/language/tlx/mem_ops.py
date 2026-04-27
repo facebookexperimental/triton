@@ -14,6 +14,142 @@ def _assert_blackwell_for_tmem(arch):
     assert capability >= 100, "tmem is only available on Blackwell"
 
 
+def _verify_buffer_ops(ptr, offsets, mask=None, other=None):
+    """Validate arguments for AMD buffer load/store operations."""
+    assert ptr.type.is_ptr(), "ptr must be a scalar pointer type"
+    assert offsets.type.is_block(), "offsets must be a tensor type"
+    assert offsets.dtype.is_int32() or offsets.dtype.is_uint32(), \
+        "offsets element type must be int32 or uint32"
+    if other is not None:
+        assert mask is not None, "when other is set, mask must also be set"
+
+
+@tl.builtin
+def buffer_load(ptr, offsets, mask=None, other=None, cache=None, _semantic=None):
+    """
+    AMD buffer load from global memory via a scalar base pointer and a tensor
+    of i32 element offsets. Loads data directly into registers.
+
+    Directly emits amdg.buffer_load. The ConvertTritonToTritonGPU pass adds
+    tensor encoding, and the AMD backend lowers it to LLVM.
+
+    Args:
+        ptr: Global memory scalar base pointer.
+        offsets: Tensor of i32 element offsets.
+        mask: Optional bool tensor for predicated loads.
+        other: Optional tensor/scalar providing default values for masked elements.
+        cache: Optional cache modifier string.
+    """
+    _verify_buffer_ops(ptr, offsets, mask, other)
+
+    mask = tl._unwrap_if_constexpr(mask)
+    if mask is not None:
+        mask = _semantic.to_tensor(mask)
+        mask = _semantic.cast(mask, tl.int1)
+        offsets, mask = _semantic.broadcast_impl_value(offsets, mask)
+
+    other = tl._unwrap_if_constexpr(other)
+    if other is not None:
+        other = _semantic.to_tensor(other)
+        other = _semantic.cast(other, ptr.type.scalar.element_ty)
+        offsets, other = _semantic.broadcast_impl_value(offsets, other)
+
+    mask_handle = mask.handle if mask is not None else None
+    other_handle = other.handle if other is not None else None
+    cache_modifier = _semantic._str_to_load_cache_modifier(cache) if cache else ir.CACHE_MODIFIER.NONE
+
+    ret_ty = tl.block_type(ptr.type.scalar.element_ty, offsets.type.get_block_shapes())
+    handle = _semantic.builder.create_buffer_load(
+        ptr.handle, offsets.handle,
+        mask_handle, other_handle, cache_modifier)
+    return tl.tensor(handle, ret_ty)
+
+
+@tl.builtin
+def buffer_store(stored_value, ptr, offsets, mask=None, cache=None, _semantic=None):
+    """
+    AMD buffer store to global memory via a scalar base pointer and a tensor
+    of i32 element offsets.
+
+    Directly emits amdg.buffer_store. The ConvertTritonToTritonGPU pass adds
+    tensor encoding, and the AMD backend lowers it to LLVM.
+
+    Args:
+        stored_value: Tensor to store.
+        ptr: Global memory scalar base pointer.
+        offsets: Tensor of i32 element offsets.
+        mask: Optional bool tensor for predicated stores.
+        cache: Optional cache modifier string.
+    """
+    _verify_buffer_ops(ptr, offsets, mask)
+
+    mask = tl._unwrap_if_constexpr(mask)
+    if mask is not None:
+        mask = _semantic.to_tensor(mask)
+        mask = _semantic.cast(mask, tl.int1)
+
+    if mask is None:
+        offsets, stored_value = _semantic.broadcast_impl_value(offsets, stored_value)
+    else:
+        offsets, stored_value = _semantic.broadcast_impl_value(offsets, stored_value)
+        offsets, mask = _semantic.broadcast_impl_value(offsets, mask)
+
+    mask_handle = mask.handle if mask is not None else None
+    cache_modifier = _semantic._str_to_store_cache_modifier(cache) if cache else ir.CACHE_MODIFIER.NONE
+
+    _semantic.builder.create_buffer_store(
+        stored_value.handle, ptr.handle, offsets.handle, mask_handle, cache_modifier)
+
+
+@tl.builtin
+def buffer_load_to_local(
+    dest: tlx.buffered_tensor,
+    ptr,
+    offsets,
+    mask=None,
+    other=None,
+    cache_modifier: str = "",
+    _semantic=None,
+) -> tlx.async_token:
+    """
+    AMD buffer load from global memory directly to local (shared) memory
+    via a scalar base pointer and a tensor of i32 element offsets.
+
+    Directly emits amdg.buffer_load_to_local. The ConvertTritonToTritonGPU pass
+    adds tensor encoding, and the AMD backend lowers it to LLVM.
+
+    Args:
+        dest: Destination buffer in shared memory (buffered_tensor).
+        ptr: Global memory scalar base pointer.
+        offsets: Tensor of i32 element offsets.
+        mask: Optional bool tensor for predicated loads.
+        other: Optional tensor/scalar providing default values for masked elements.
+        cache_modifier: Cache modifier string (default "").
+    """
+    _verify_buffer_ops(ptr, offsets, mask, other)
+
+    mask = tl._unwrap_if_constexpr(mask)
+    if mask is not None:
+        mask = _semantic.to_tensor(mask)
+        mask = _semantic.cast(mask, tl.int1)
+        offsets, mask = _semantic.broadcast_impl_value(offsets, mask)
+
+    other = tl._unwrap_if_constexpr(other)
+    if other is not None:
+        other = _semantic.to_tensor(other)
+        other = _semantic.cast(other, ptr.type.scalar.element_ty)
+        offsets, other = _semantic.broadcast_impl_value(offsets, other)
+
+    mask_handle = mask.handle if mask is not None else None
+    other_handle = other.handle if other is not None else None
+    cache_mod = _semantic._str_to_load_cache_modifier(cache_modifier) if cache_modifier else ir.CACHE_MODIFIER.NONE
+
+    handle = _semantic.builder.create_buffer_load_to_local(
+        dest.handle, ptr.handle, offsets.handle,
+        mask_handle, other_handle, cache_mod)
+    return tlx.async_token(handle)
+
+
 @tl.builtin
 def storage_alias_spec(
     storage: tlx.storage_kind = tlx.storage_kind.smem,
@@ -681,7 +817,8 @@ def local_load(
         output = _semantic.builder.create_local_load(src.handle, token.handle if token else None)
         result = tl.tensor(output, block_type)
         if relaxed:
-            result.handle.set_attr("ttg.amdg.syncedViaAsyncWait", _semantic.builder.get_bool_attr(True))
+            result.handle.set_attr("ttg.amdg.syncedViaAsyncWait",
+                                   _semantic.builder.get_bool_attr(True))
         return result
 
 
@@ -715,6 +852,7 @@ def local_scatter(
     """
     scatter elements to shared memory along a specified axis using an indices tensor.
     """
+    block_type = tl.block_type(src.type.element_ty, indices.type.shape)
     storage = dst.type.storage
     assert storage == tlx.storage_kind.smem, "local_scatter only supports shared memory!"
     return tl.tensor(_semantic.builder.create_local_scatter(dst.handle, src.handle, indices.handle, axis), tl.void)
