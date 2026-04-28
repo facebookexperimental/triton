@@ -69,12 +69,24 @@ public:
   using impl::NVGPUWarpSpecializationBase<
       NVGPUWarpSpecializationPass>::NVGPUWarpSpecializationBase;
 
-  // Remove the warp_specialize attribute from all loops in the function so
-  // downstream passes (pipelining, latency assignment) don't mistakenly
-  // treat the loop as warp-specialized.
+  // Remove the warp_specialize attribute from all loops in the function, plus
+  // any partition metadata that the earlier `tritongpu-partition-scheduling`
+  // pass may have written. The two passes form a pair: when this pass takes
+  // an early-exit and skips warp specialization (e.g. else-block fallback),
+  // leaving `ttg.partition` / `ttg.partition.stages` / `ttg.warp_specialize.tag`
+  // behind on ops + loops produces a half-tagged state — the downstream
+  // `tritongpu-pipeline` pass treats partition-tagged regions as WS regions
+  // and crashes when sibling ops in an scf.if/else aren't tagged. Stripping
+  // everything ensures downstream sees a plain (non-WS) loop.
   void removeWarpSpecializeAttr(triton::FuncOp funcOp) {
     funcOp->walk([&](scf::ForOp forOp) {
       forOp->removeAttr(mlir::triton::kWarpSpecializeAttrName);
+      forOp->removeAttr(mlir::triton::gpu::kPartitionStagesAttrName);
+      forOp->removeAttr(mlir::triton::gpu::kWarpSpecializeTagAttrName);
+    });
+    funcOp->walk([&](Operation *op) {
+      op->removeAttr(mlir::triton::gpu::kPartitionAttrName);
+      op->removeAttr(mlir::triton::gpu::kPartitionOutputsAttrName);
     });
   }
 
