@@ -30,18 +30,15 @@ static OpPrintingFlags getOpPrintingFlagsWithLoc() {
   return flags;
 }
 
-void doTaskPartition(triton::FuncOp &funcOp, unsigned numWarpGroups);
 int doTaskIdPropagate(triton::FuncOp &funcOp);
 LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
                               StringRef readDecisionFile = "",
                               StringRef writeDecisionFile = "",
                               int smemAllocAlgo = 0, unsigned smemBudget = 0,
                               bool smemCircularReuse = false);
-bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups);
 void doBufferAllocation(triton::FuncOp &funcOp);
 void doHoistLoopInvariantTMEMStore(triton::FuncOp &funcOp);
 void removeRedundantTmemZeroStores(triton::FuncOp &funcOp);
-void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers);
 void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers);
 void doTokenLowering(triton::FuncOp &funcOp, unsigned numConsumerGroups);
 void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
@@ -135,8 +132,10 @@ public:
     unsigned numWarpGroups = ForBlackWell ? 2 : 3;
 
     int retCode = doTaskIdPropagate(funcOp);
-    if (retCode == -1)
+    if (retCode == -1) {
       signalPassFailure();
+      return;
+    }
     if (dumpIntermediateSteps) {
       llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
                       "doTaskIdPropagate\n";

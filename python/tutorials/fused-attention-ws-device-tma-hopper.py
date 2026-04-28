@@ -1328,10 +1328,7 @@ class _attention_opt(torch.autograd.Function):
         ctx.grid = grid
         persistent = baseVariant == "persistent" or baseVariant == "ws_persistent"
         if is_blackwell() and warp_specialize:
-            if HEAD_DIM_K == 128 and (q.dtype == torch.float16 or q.dtype == torch.bfloat16):
-                extra_kern_args["maxnreg"] = 128
-            else:
-                extra_kern_args["maxnreg"] = 128
+            extra_kern_args["maxnreg"] = 128
         if persistent:
             _attn_fwd_persist[grid_persist](
                 sm_scale,

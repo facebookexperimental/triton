@@ -329,7 +329,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             Value phase, Operation *headProducer,
                             Operation *headConsumer,
                             Operation *headConsumerSameLevel,
-                            SmallVector<int> additionalConsumerTaskIds,
+                            ArrayRef<int> additionalConsumerTaskIds,
                             bool isPost) {
   auto loc = barrierAlloc.getLoc();
 
@@ -388,7 +388,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   auto wait = builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
       loc, consBarrier, phase, waitPred);
   for (int extraTaskId : additionalConsumerTaskIds) {
-    builder.setAsynTaskIdsFromArray(extraTaskId);
+    builder.setAsynTaskIdsFromArray({extraTaskId});
     builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(loc, consBarrier, phase,
                                                         waitPred);
   }
