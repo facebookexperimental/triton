@@ -17,7 +17,7 @@ module attributes {"ttg.num-warps" = 8 : i32} {
 
     ttng.init_barrier %barrier, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
 
-    %scratch = proton_gpu.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
+    %scratch = ttg.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
     proton_gpu.initialize %scratch : !tt.ptr<i32>
     %buf = ttg.local_alloc : () -> !ttg.memdesc<256xi32, #shared, #smem, mutable>
     %segment = proton_gpu.segment_alloc %buf : !ttg.memdesc<256xi32, #shared, #smem, mutable> -> <1024, #smem, warp>
@@ -56,7 +56,7 @@ module attributes {"ttg.num-warps" = 8 : i32} {
 
     %barriers = ttg.local_alloc {mpp.op.id = 200 : i64} : () -> !ttg.memdesc<4xi64, #shared, #smem, mutable>
 
-    %scratch = proton_gpu.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
+    %scratch = ttg.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
     proton_gpu.initialize %scratch : !tt.ptr<i32>
     %buf = ttg.local_alloc : () -> !ttg.memdesc<256xi32, #shared, #smem, mutable>
     %segment = proton_gpu.segment_alloc %buf : !ttg.memdesc<256xi32, #shared, #smem, mutable> -> <1024, #smem, warp>
@@ -103,7 +103,7 @@ module attributes {"ttg.num-warps" = 8 : i32, ttg.target = "cuda:90"} {
     ttng.init_barrier %barriers, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     ttng.barrier_expect %barriers, 4096, %true : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
 
-    %scratch = proton_gpu.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
+    %scratch = ttg.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
     proton_gpu.initialize %scratch : !tt.ptr<i32>
     %buf = ttg.local_alloc : () -> !ttg.memdesc<256xi32, #shared1, #smem, mutable>
     %segment = proton_gpu.segment_alloc %buf : !ttg.memdesc<256xi32, #shared1, #smem, mutable> -> <1024, #smem, warp>
@@ -146,7 +146,7 @@ module attributes {"ttg.num-warps" = 8 : i32} {
     ttng.init_barrier %barrier_a, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     ttng.init_barrier %barrier_b, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
 
-    %scratch = proton_gpu.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
+    %scratch = ttg.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
     proton_gpu.initialize %scratch : !tt.ptr<i32>
     %buf = ttg.local_alloc : () -> !ttg.memdesc<256xi32, #shared, #smem, mutable>
     %segment = proton_gpu.segment_alloc %buf : !ttg.memdesc<256xi32, #shared, #smem, mutable> -> <1024, #smem, warp>
@@ -203,7 +203,7 @@ module attributes {"ttg.num-warps" = 8 : i32} {
     %barrier = ttg.memdesc_index %barriers[%selected_index] : !ttg.memdesc<2xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     ttng.init_barrier %barrier, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
 
-    %scratch = proton_gpu.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
+    %scratch = ttg.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
     proton_gpu.initialize %scratch : !tt.ptr<i32>
     %buf = ttg.local_alloc : () -> !ttg.memdesc<256xi32, #shared, #smem, mutable>
     %segment = proton_gpu.segment_alloc %buf : !ttg.memdesc<256xi32, #shared, #smem, mutable> -> <1024, #smem, warp>
@@ -249,7 +249,7 @@ module attributes {"ttg.num-warps" = 8 : i32} {
     ttng.init_barrier %barrier_0, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     ttng.init_barrier %barrier_1, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
 
-    %scratch = proton_gpu.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
+    %scratch = ttg.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
     proton_gpu.initialize %scratch : !tt.ptr<i32>
     %buf = ttg.local_alloc : () -> !ttg.memdesc<256xi32, #shared, #smem, mutable>
     %segment = proton_gpu.segment_alloc %buf : !ttg.memdesc<256xi32, #shared, #smem, mutable> -> <1024, #smem, warp>
@@ -320,7 +320,7 @@ module attributes {"ttg.num-warps" = 8 : i32} {
     ttng.init_barrier %outer_bar_0, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     ttng.init_barrier %inner_bar_0, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
 
-    %scratch = proton_gpu.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
+    %scratch = ttg.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
     proton_gpu.initialize %scratch : !tt.ptr<i32>
     %buf = ttg.local_alloc : () -> !ttg.memdesc<256xi32, #shared, #smem, mutable>
     %segment = proton_gpu.segment_alloc %buf : !ttg.memdesc<256xi32, #shared, #smem, mutable> -> <1024, #smem, warp>
@@ -395,7 +395,7 @@ module attributes {"ttg.num-warps" = 8 : i32} {
     ttng.init_barrier %barrier_0, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     ttng.init_barrier %barrier_1, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
 
-    %scratch = proton_gpu.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
+    %scratch = ttg.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
     proton_gpu.initialize %scratch : !tt.ptr<i32>
     %buf = ttg.local_alloc : () -> !ttg.memdesc<256xi32, #shared, #smem, mutable>
     %segment = proton_gpu.segment_alloc %buf : !ttg.memdesc<256xi32, #shared, #smem, mutable> -> <1024, #smem, warp>
@@ -466,7 +466,7 @@ module attributes {"ttg.num-warps" = 8 : i32, ttg.target = "cuda:100"} {
     %b_smem = ttg.local_alloc : () -> !ttg.memdesc<128x128xbf16, #shared3, #smem, mutable>
     %acc_tmem = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
 
-    %scratch = proton_gpu.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
+    %scratch = ttg.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
     proton_gpu.initialize %scratch : !tt.ptr<i32>
     %buf = ttg.local_alloc : () -> !ttg.memdesc<256xi32, #shared, #smem, mutable>
     %segment = proton_gpu.segment_alloc %buf : !ttg.memdesc<256xi32, #shared, #smem, mutable> -> <1024, #smem, warp>
@@ -545,7 +545,7 @@ module attributes {"ttg.num-warps" = 8 : i32} {
     ttng.init_barrier %acc_45, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     ttng.init_barrier %acc_46, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
 
-    %scratch = proton_gpu.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
+    %scratch = ttg.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
     proton_gpu.initialize %scratch : !tt.ptr<i32>
     %buf = ttg.local_alloc : () -> !ttg.memdesc<256xi32, #shared, #smem, mutable>
     %segment = proton_gpu.segment_alloc %buf : !ttg.memdesc<256xi32, #shared, #smem, mutable> -> <1024, #smem, warp>
