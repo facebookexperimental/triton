@@ -3664,8 +3664,10 @@ void insertAsyncComm(
         // headConsumer for this token's task ID. Each consumer partition
         // needs its own wait point.
         int tokenTaskId = token.first;
-        LDBG("ConsumerWaitOp: tokenTaskId=" << tokenTaskId
-                                            << " headConsumer task=");
+        auto headConsumerTaskIds = getAsyncTaskIds(headConsumer);
+        LDBG("ConsumerWaitOp: tokenTaskId="
+             << tokenTaskId << " headConsumer task="
+             << (headConsumerTaskIds.empty() ? -1 : headConsumerTaskIds[0]));
         Operation *tokenHeadConsumer = headConsumer;
         for (auto &op : headConsumer->getBlock()->getOperations()) {
           if (consumerOps.count(&op)) {
@@ -3698,7 +3700,7 @@ void insertAsyncComm(
           builder.setLoopScheduleInfoFromOp(actualCons);
           LDBG("  inserting ConsumerWaitOp for task " << tokenTaskId);
           auto waitOp = builder.createWithAsyncTaskIds<ttnvws::ConsumerWaitOp>(
-              headConsumer->getLoc(), token.second, bufferIdx, phase);
+              tokenHeadConsumer->getLoc(), token.second, bufferIdx, phase);
           // Propagate the actual consumer's loop schedule to the
           // phase/bufferIdx value ops. These were computed earlier (by
           // getBufferIdxAndPhase) with no loop.stage/loop.cluster, but they
