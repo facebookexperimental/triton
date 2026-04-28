@@ -585,6 +585,7 @@ def TTNG_AsyncTMAReduceOp : TTNG_Op<"async_tma_reduce", [MemoryEffects<[MemRead<
     oilist(`evictionPolicy` `=` $evict)
     attr-dict `:` qualified(type($desc)) `,` qualified(type($src))
   }];
+  let hasVerifier = 1;
 }
 
 def TTNG_AsyncTMAGatherOp : TTNG_Op<"async_tma_gather"> {
