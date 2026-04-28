@@ -1,4 +1,10 @@
 // RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=2 post-channel-creation=1" | FileCheck %s
+// RUN: triton-opt %s --nvws-meta-to-nvws-convert --nvws-order-buffer-groups \
+// RUN:   --nvws-insert-semas="use-meta-partitioner=true num-stages=2" \
+// RUN:   --nvws-lower-semaphore=num-stages=2 --tritongpu-partition-loops \
+// RUN:   --nvws-lower-warp-group \
+// RUN:   --tritongpu-schedule-loops="num-stages=2 use-meta-ws=true" \
+// RUN:   --tritongpu-pipeline=num-stages=2 -o /dev/null
 
 // Regression test for the early-TMA same-partition staging slot rotation
 // (bug #10/#11 in .llms/rules/partition-scheduler-bugs.md / D110063164,

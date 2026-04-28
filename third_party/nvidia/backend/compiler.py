@@ -722,6 +722,7 @@ class CUDABackend(BaseBackend):
             if knobs.nvidia.use_meta_ws:
                 nvidia.passes.hopper.add_sink_broadcast(pm)
                 nvidia.passes.hopper.add_partition_scheduling_meta(pm)
+                nvidia.passes.nvws.add_strip_partition_attrs_outside_ws(pm)
             smem_budget = _max_shared_mem_for_capability(capability)
             generate_subtiled = (opt.generate_subtiled_region or knobs.nvidia.generate_subtiled_region)
             nvidia.passes.hopper.add_hopper_warpspec(
@@ -739,6 +740,11 @@ class CUDABackend(BaseBackend):
                 passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
         elif capability // 10 >= 10:
+            smem_budget = _max_shared_mem_for_capability(capability)
+            # NVWS default/Meta-port pipeline map and pass contracts:
+            # sema-docs/nvws-aws-overview.md
+            use_nvws_meta = knobs.nvidia.use_nvws_meta
+            use_meta_ws = knobs.nvidia.use_meta_ws and not use_nvws_meta
             if not knobs.nvidia.use_modulo_schedule:
                 passes.ttgpuir.add_fuse_nested_loops(pm)
             passes.common.add_canonicalizer(pm)
@@ -768,12 +774,29 @@ class CUDABackend(BaseBackend):
             # them on the default path where no custom scheduler set the schedule.
             uses_custom_schedule = knobs.nvidia.use_llm_schedule or knobs.nvidia.use_modulo_schedule is not None
             if not uses_custom_schedule:
-                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
-                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
-            if not knobs.nvidia.use_meta_ws:
+                use_meta_schedule = knobs.nvidia.use_meta_ws or use_nvws_meta
+                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_schedule)
+                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_schedule)
+            if not use_meta_ws:
                 # 2-CTA + upstream WS is not supported
                 if opt.cluster_dims is None or max(opt.cluster_dims) < 2:
-                    passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
+                    if use_nvws_meta:
+                        # TMA-store lowering and broadcast sinking have valid
+                        # standalone boundaries. The remaining canonical Meta
+                        # planning prefix runs with verification deferred inside
+                        # core AWS; NVWS conversion is its first verified suffix
+                        # pass, so no verifier observes Meta's intentionally
+                        # incomplete intermediate partition form.
+                        nvidia.passes.hopper.add_tma_store_lowering(pm)
+                        nvidia.passes.hopper.add_sink_broadcast(pm)
+                        passes.ttgpuir.add_warp_specialize(
+                            pm,
+                            num_stages=opt.num_stages,
+                            use_meta_partitioner=True,
+                            smem_budget=smem_budget,
+                        )
+                    else:
+                        passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
             else:
                 # use Meta's WS internally which supports both hopper and blackwell
                 nvidia.passes.hopper.add_tma_store_lowering(pm)
@@ -804,7 +827,7 @@ class CUDABackend(BaseBackend):
             # 2-CTA: Insert cross-CTA sync AFTER all WS passes.
             # Only for Meta WS path — non-WS 2-CTA sync is handled by
             # MMAv5.cpp's inline ClusterArriveOp.
-            if (opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and knobs.nvidia.use_meta_ws):
+            if (opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and use_meta_ws):
                 nvidia.passes.hopper.add_insert_2cta_sync(pm)
         else:
             passes.ttir.add_triton_licm(pm)
@@ -831,7 +854,8 @@ class CUDABackend(BaseBackend):
         passes.common.add_symbol_dce(pm)
         # Optimize the number of warps and registers after TMA lowering, so
         # that any local loads eliminated by TMA lowering do not inflate them.
-        if capability // 10 >= 9 and knobs.nvidia.use_meta_ws:
+        if capability // 10 >= 9 and (
+                knobs.nvidia.use_meta_ws or (capability // 10 >= 10 and knobs.nvidia.use_nvws_meta)):
             passes.ttgpuir.add_optimize_partition_warps(pm)
         nvidia.passes.ttnvgpuir.add_fence_insertion(pm, capability)
         nvidia.passes.ttnvgpuir.add_lower_mma(pm)

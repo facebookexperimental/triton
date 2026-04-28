@@ -4,6 +4,7 @@
 #include "Dialect/NVGPU/IR/Dialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -683,6 +684,18 @@ static void lowerTensorMemoryAlloc(ModuleOp mod) {
     if (auto offsetAttr =
             tcgen5Alloc->getAttrOfType<IntegerAttr>("allocation.offset"))
       smemOffset = offsetAttr.getInt();
+  }
+  if (insertionPoint) {
+    DominanceInfo dominance(mod);
+    bool dominatesBaseOps = llvm::all_of(baseOps, [&](Operation *baseOp) {
+      return dominance.dominates(insertionPoint, baseOp);
+    });
+    if (!dominatesBaseOps) {
+      // Instrumentation may prepend TensorMemoryBaseAddress users ahead of the
+      // allocation marker. Put the allocation at entry in that case so the
+      // single replacement value dominates every base-address use.
+      insertionPoint = &kernel.front().front();
+    }
   }
   Value newBase = initTensorMemory(kernel, insertionPoint, smemOffset);
   if (tcgen5Alloc)

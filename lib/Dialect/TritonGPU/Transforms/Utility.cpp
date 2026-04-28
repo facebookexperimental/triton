@@ -1710,7 +1710,7 @@ void replaceUsesAndPropagateType(
     } else if (auto reshape = dyn_cast<ttg::MemDescReshapeOp>(user)) {
       ttg::MemDescType oldType = reshape.getType();
       bool isMutable = cast<ttg::MemDescType>(val.getType()).getMutableMemory();
-      auto newDstType = ttg::MemDescType::get(
+      Type newDstType = ttg::MemDescType::get(
           oldType.getShape(), oldType.getElementType(), oldType.getEncoding(),
           oldType.getMemorySpace(), isMutable, oldType.getAllocShape());
       newVal = ttg::MemDescReshapeOp::create(builder, reshape.getLoc(),

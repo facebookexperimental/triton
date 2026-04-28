@@ -4,6 +4,9 @@ import pathlib
 import triton
 import triton.language as tl
 
+from triton._C.libtriton import nvidia as nvidia_lib, passes
+from triton.backends.compiler import GPUTarget
+from triton.compiler import ASTSource
 from triton._internal_testing import is_hip, is_hopper, is_blackwell
 from triton.tools.tensor_descriptor import TensorDescriptor
 
@@ -17,6 +20,41 @@ else:
 
 def is_hopper_or_blackwell():
     return is_hopper() or is_blackwell()
+
+
+def test_nvws_meta_dispatch_precedes_meta_ws(monkeypatch, fresh_knobs):
+    nvws_meta_calls = []
+    full_meta_calls = []
+    add_warp_specialize = passes.ttgpuir.add_warp_specialize
+    add_hopper_warpspec = nvidia_lib.passes.hopper.add_hopper_warpspec
+
+    def record_warp_specialize(*args, **kwargs):
+        nvws_meta_calls.append(kwargs.get("use_meta_partitioner", False))
+        return add_warp_specialize(*args, **kwargs)
+
+    def record_hopper_warpspec(*args, **kwargs):
+        full_meta_calls.append(True)
+        return add_hopper_warpspec(*args, **kwargs)
+
+    monkeypatch.setattr(passes.ttgpuir, "add_warp_specialize", record_warp_specialize)
+    monkeypatch.setattr(nvidia_lib.passes.hopper, "add_hopper_warpspec", record_hopper_warpspec)
+
+    with triton.knobs.nvidia.scope(), triton.knobs.compilation.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.use_nvws_meta = True
+        triton.knobs.compilation.always_compile = True
+
+        @triton.jit
+        def precedence_kernel(out):
+            tl.store(out, 0)
+
+        triton.compile(
+            ASTSource(fn=precedence_kernel, signature={"out": "*i32"}, constexprs={}),
+            target=GPUTarget("cuda", 100, 32),
+        )
+
+    assert True in nvws_meta_calls
+    assert not full_meta_calls
 
 
 @pytest.mark.skipif(is_hip(), reason="warp specialization is not supported on hip devices")

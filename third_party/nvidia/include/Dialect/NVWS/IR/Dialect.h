@@ -33,6 +33,7 @@
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
+#include <cstdint>
 
 #include "nvidia/include/Dialect/NVWS/IR/NVWSAttrEnums.h.inc"
 
@@ -46,10 +47,37 @@
 #include "nvidia/include/Dialect/NVWS/IR/NVWSOpInterfaces.h.inc"
 #include "nvidia/include/Dialect/NVWS/IR/Ops.h.inc"
 
-namespace mlir {
-namespace triton {
-namespace nvws {} // namespace nvws
-} // namespace triton
-} // namespace mlir
+namespace mlir::triton::nvws {
+
+inline constexpr uint32_t getAllReleasedMask() {
+  return ~uint32_t(0);
+}
+
+inline uint32_t getPhysicalStageMask(unsigned depth) {
+  return depth >= 32 ? getAllReleasedMask() : (uint32_t(1) << depth) - 1;
+}
+
+inline uint32_t resizeReleasedMask(uint32_t mask, unsigned oldDepth,
+                                   unsigned newDepth) {
+  if (!mask || mask == getAllReleasedMask() || oldDepth == newDepth)
+    return mask;
+  uint32_t resized = 0;
+  for (unsigned stage = 0; stage < newDepth; ++stage)
+    if (mask & (uint32_t(1) << (stage % oldDepth)))
+      resized |= uint32_t(1) << stage;
+  return resized;
+}
+
+inline uint32_t getReleasedMask(SemaphoreCreateOp op) {
+  IntegerAttr mask = op.getReleasedMaskAttr();
+  return mask ? static_cast<uint32_t>(mask.getInt()) : 0;
+}
+
+inline uint32_t getEffectiveReleasedMask(SemaphoreCreateOp op) {
+  return getReleasedMask(op) &
+         getPhysicalStageMask(op.getType().getNumStages());
+}
+
+} // namespace mlir::triton::nvws
 
 #endif // DIALECT_NVWS_IR_DIALECT_H_

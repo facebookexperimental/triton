@@ -21,9 +21,11 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/Interfaces/InferIntRangeInterface.h"
 #include "mlir/Interfaces/Utils/InferIntRangeCommon.h"
 #include "mlir/Pass/Pass.h"
@@ -33,6 +35,7 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
+#include "triton/Dialect/TritonGPU/Transforms/PartitionBuilder.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -50,6 +53,127 @@ namespace triton {
 #define GEN_PASS_DEF_NVWSHOISTTMEMSTORE
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h.inc"
 namespace {
+
+void insertAll(SetVector<int> &dst, const SetVector<int> &src) {
+  dst.insert(src.begin(), src.end());
+}
+
+SetVector<int> getChildPartitionUnion(Operation *op) {
+  SetVector<int> result;
+  for (Region &region : op->getRegions()) {
+    for (Block &block : region.getBlocks()) {
+      for (Operation &child : block.getOperations()) {
+        if (isa<ub::PoisonOp>(child))
+          continue;
+        if (hasPartition(&child))
+          insertAll(result, getPartitionIds(&child));
+      }
+    }
+  }
+  return result;
+}
+
+SetVector<int> getConsumerPartitionUnion(Value value) {
+  SetVector<int> result;
+  for (Operation *user : value.getUsers()) {
+    if (hasPartition(user))
+      insertAll(result, getPartitionIds(user));
+  }
+  return result;
+}
+
+SetVector<int> inferMissingPartition(Operation *op) {
+  SetVector<int> result;
+  for (Value resultValue : op->getResults())
+    insertAll(result, getConsumerPartitionUnion(resultValue));
+
+  for (Value operand : op->getOperands()) {
+    if (Operation *def = operand.getDefiningOp()) {
+      if (hasPartition(def))
+        insertAll(result, getPartitionIds(def));
+    }
+  }
+
+  insertAll(result, getChildPartitionUnion(op));
+
+  if (result.empty()) {
+    if (Operation *parent = op->getParentOp()) {
+      if (hasPartition(parent))
+        insertAll(result, getPartitionIds(parent));
+    }
+  }
+  return result;
+}
+
+void repairPartitionMetadata(scf::ForOp loop) {
+  bool changed = false;
+  do {
+    changed = false;
+    loop.walk<WalkOrder::PostOrder>([&](Operation *op) {
+      if (isa<ub::PoisonOp>(op))
+        return;
+
+      if (!hasPartition(op)) {
+        SetVector<int> ids = inferMissingPartition(op);
+        if (!ids.empty()) {
+          setPartition(op, ids);
+          changed = true;
+        }
+      }
+
+      if (op->getNumRegions() != 0 && hasPartition(op)) {
+        SetVector<int> ids = getPartitionIds(op);
+        insertAll(ids, getChildPartitionUnion(op));
+        if (op->hasAttr(kPartitionOutputsAttrName)) {
+          for (auto outputIds : getPartitionOutputs(op))
+            insertAll(ids, outputIds);
+        }
+        if (ids != getPartitionIds(op)) {
+          setPartition(op, ids);
+          changed = true;
+        }
+      }
+    });
+  } while (changed);
+}
+
+bool mergeStageCluster(Operation *neighbor, Operation *op,
+                       StageCluster &inferred) {
+  if (!neighbor || neighbor->getBlock() != op->getBlock())
+    return true;
+
+  StageCluster neighborStageCluster = getStageCluster(neighbor);
+  if (!neighborStageCluster)
+    return true;
+
+  if (!inferred) {
+    inferred = neighborStageCluster;
+    return true;
+  }
+
+  return *inferred == *neighborStageCluster;
+}
+
+void repairReshapeScheduleMetadata(scf::ForOp loop) {
+  OpBuilder builder(loop.getContext());
+  loop.walk([&](ReshapeOp reshape) {
+    Operation *op = reshape.getOperation();
+    if (getStageCluster(op))
+      return;
+
+    StageCluster inferred;
+    if (!mergeStageCluster(reshape.getSrc().getDefiningOp(), op, inferred))
+      return;
+
+    for (Operation *user : reshape.getResult().getUsers()) {
+      if (!mergeStageCluster(user, op, inferred))
+        return;
+    }
+
+    if (inferred)
+      setStageCluster(builder, op, inferred);
+  });
+}
 
 bool underWSLoop(Operation *op) {
   scf::ForOp topLevelFor = op->getParentOfType<scf::ForOp>();
@@ -99,8 +223,8 @@ public:
             }
             if (hasPartition(store)) {
               // The alloc op can have multiple partitions at this point. But
-              // aref-tmem-insert requires a single owner, which should be the
-              // partiton that tmem_store belongs to.
+              // InsertSemas requires a single owner, which should be the
+              // partition that tmem_store belongs to.
               setPartition(newAlloc, getPartitionIds(store));
             }
             rewriter.eraseOp(store);
@@ -318,6 +442,21 @@ bool hoistTmemAlloc(ttng::TMEMAllocOp allocToHoist) {
   return true;
 }
 
+SetVector<int> getFallbackTmemOwnerPartition(ttng::TMEMAllocOp alloc) {
+  if (auto opt = getUniqueUserLoopAndMMA(alloc)) {
+    Operation *mma = opt->second.getOperation();
+    if (hasPartition(mma)) {
+      SetVector<int> mmaPartition = getPartitionIds(mma);
+      if (mmaPartition.size() == 1)
+        return mmaPartition;
+    }
+  }
+
+  SetVector<int> fallbackPartition;
+  fallbackPartition.insert(1);
+  return fallbackPartition;
+}
+
 } // namespace
 
 class NVWSHoistTmemStore
@@ -336,6 +475,13 @@ public:
 
     m.walk([&](scf::ForOp loop) {
       if (loop->hasAttr(kWarpSpecializeAttrName)) {
+        repairPartitionMetadata(loop);
+        repairReshapeScheduleMetadata(loop);
+      }
+    });
+
+    m.walk([&](scf::ForOp loop) {
+      if (loop->hasAttr(kWarpSpecializeAttrName)) {
         SmallVector<ttng::TMEMAllocOp> tmemAllocToHoist;
         loop.walk([&](ttng::TMEMAllocOp tmemAlloc) {
           if (tmemAlloc.getSrc() && canRemoveTmemStore(tmemAlloc)) {
@@ -345,12 +491,10 @@ public:
 
         for (auto alloc : tmemAllocToHoist) {
           if (!hoistTmemAlloc(alloc)) {
-            SetVector<int> mmaPartition;
-            mmaPartition.insert(1);
             // tmem store remaining in the outer loop must belong to the MMA
-            // partition. This is required by aref-tmem-insert for correctly
-            // double buffering this accumulator.
-            setPartition(alloc, mmaPartition);
+            // partition. This is required by InsertSemas to correctly double
+            // buffer this accumulator.
+            setPartition(alloc, getFallbackTmemOwnerPartition(alloc));
           }
         }
       }

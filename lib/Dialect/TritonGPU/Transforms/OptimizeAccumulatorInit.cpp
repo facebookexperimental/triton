@@ -209,6 +209,118 @@ findZeroInitOp(Value accUse, scf::ForOp forOp, bool &loopArgIsZero) {
   return std::nullopt;
 }
 
+// Coalesce two chained accumulating MMAv5 ops that target one logical
+// accumulator into a single in-place accumulation. The pattern matches the
+// SECOND accumulator's TMEM tile (`t2`), whose init value is (through
+// single-use, layout-preserving ops) the TMEM read-out of the FIRST MMA's tile
+// (`t1`). It repoints the second MMA (and its read-out) at `t1` and deletes the
+// intermediate tile + read-out, so both MMAs accumulate into one TMEM tile.
+//
+// This is the shape produced when a kernel chains two accumulating dots into
+// the same value, e.g. `dk = tl.dot(a0, b0, dk); dk = tl.dot(a1, b1, dk)`:
+// AccelerateMatmul lowers each dot into its own `tmem_alloc + mma + tmem_load`,
+// threading the accumulator through registers. Left alone, HoistTMEMAlloc turns
+// that register hand-off into a TMEM<->TMEM load/store bridge across two
+// persistent tiles, which later blocks TMEM slot reuse (the WSCodePartition
+// reuse-order check aborts on the two co-live tiles sharing one buffer.id).
+class ChainAccumulatorInPlace
+    : public OpRewritePattern<triton::nvidia_gpu::TMEMAllocOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(triton::nvidia_gpu::TMEMAllocOp t2,
+                                PatternRewriter &rewriter) const override {
+    Value init2 = t2.getSrc();
+    if (!init2)
+      return failure();
+
+    // t2's memdesc is used by exactly one accumulator-writing MMAv5 (mma2) and
+    // at most one tmem_load (load2).
+    triton::nvidia_gpu::MMAv5OpInterface mma2 = nullptr;
+    triton::nvidia_gpu::TMEMLoadOp load2 = nullptr;
+    for (Operation *u : t2.getResult().getUsers()) {
+      if (auto m = dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(u)) {
+        if (mma2)
+          return failure();
+        mma2 = m;
+      } else if (auto l = dyn_cast<triton::nvidia_gpu::TMEMLoadOp>(u)) {
+        if (load2)
+          return failure();
+        load2 = l;
+      } else {
+        return failure();
+      }
+    }
+    if (!mma2 || mma2.getAccumulator() != t2.getResult() ||
+        mma2->getParentRegion() != t2->getParentRegion())
+      return failure();
+    // mma2 must accumulate onto its (chained) init with a constant-true flag;
+    // fusing a use_acc=false MMA would drop the first MMA's contribution.
+    auto useAcc2 = getBoolFromConstant(mma2.useAccumulator());
+    if (!useAcc2 || *useAcc2 == false)
+      return failure();
+
+    // Walk init2 back through single-use, data-preserving ops to a tmem_load.
+    SmallVector<Operation *> chain;
+    Value v = init2;
+    while (Operation *d = v.getDefiningOp()) {
+      if (isa<triton::nvidia_gpu::TMEMLoadOp>(d))
+        break;
+      if (!v.hasOneUse() || !isa<ConvertLayoutOp, ReshapeOp, TransOp,
+                                 BroadcastOp, ExpandDimsOp, SplitOp>(d))
+        return failure();
+      chain.push_back(d);
+      v = d->getOperand(0);
+    }
+    auto load1 = v.getDefiningOp<triton::nvidia_gpu::TMEMLoadOp>();
+    // load1's read-out must feed only this chain, and be a plain
+    // (non-reduction) load whose tensor result is what we traced.
+    if (!load1 || !v.hasOneUse() || load1.getRed() || load1.getResult() != v)
+      return failure();
+
+    // load1 reads t1 (the first MMA's tile), written by mma1 before mma2 in the
+    // same region; t1 and t2 must be the same TMEM tile type.
+    Value t1 = load1.getSrc();
+    Value dep = load1.getDep();
+    if (!dep)
+      return failure();
+    auto mma1 = dep.getDefiningOp<triton::nvidia_gpu::MMAv5OpInterface>();
+    if (!mma1 || mma1.getAccumulator() != t1 ||
+        mma1->getParentRegion() != mma2->getParentRegion() ||
+        !mma1->isBeforeInBlock(mma2))
+      return failure();
+    if (t1.getType() != t2.getResult().getType())
+      return failure();
+    // t1's only accesses may be mma1 (write) and load1 (read); an intervening
+    // access would make accumulating mma2 in place after mma1 unsafe.
+    for (Operation *u : t1.getUsers())
+      if (u != mma1.getOperation() && u != load1.getOperation())
+        return failure();
+
+    // Rewrite: mma2 accumulates into t1 in place (reading mma1's result via
+    // mma1's completion token); load2 reads t1.
+    Value mma1Token = mma1.getToken();
+    rewriter.modifyOpInPlace(mma2, [&]() {
+      mma2.setAccumulator(t1);
+      mma2.getAccDepMutable().assign(mma1Token);
+    });
+    if (load2)
+      rewriter.modifyOpInPlace(load2,
+                               [&]() { load2.getSrcMutable().assign(t1); });
+    // Any consumer of load1's read token is re-anchored on mma1's write token.
+    if (Value readTok = load1.getToken())
+      rewriter.replaceAllUsesWith(readTok, mma1Token);
+
+    // The intermediate tile, the layout-preserving chain, and the read-out are
+    // now dead; erase from the t2 end back to load1 so uses drop first.
+    rewriter.eraseOp(t2);
+    for (Operation *op : chain)
+      rewriter.eraseOp(op);
+    rewriter.eraseOp(load1);
+    return success();
+  }
+};
+
 } // namespace
 
 class OptimizeAccumulatorInitPass
@@ -338,7 +450,8 @@ public:
 
     // Cleanup unused init values in tmem allocs
     mlir::RewritePatternSet patterns(m.getContext());
-    patterns.add<TMEMAllocWithUnusedInit>(m.getContext());
+    patterns.add<TMEMAllocWithUnusedInit, ChainAccumulatorInPlace>(
+        m.getContext());
     if (applyPatternsGreedily(m, std::move(patterns)).failed())
       signalPassFailure();
   }

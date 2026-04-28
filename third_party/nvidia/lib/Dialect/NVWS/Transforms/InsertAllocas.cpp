@@ -1,0 +1,1276 @@
+#include "Utilities.h"
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/Support/DebugStringHelper.h"
+#include "mlir/Transforms/Passes.h"
+#include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
+#include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/OpInterfaces.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
+#include "triton/Dialect/TritonGPU/Transforms/PartitionBuilder.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
+
+namespace mlir {
+namespace triton {
+
+#define GEN_PASS_DEF_NVWSINSERTALLOCAS
+#include "nvidia/include/Dialect/NVWS/Transforms/Passes.h.inc"
+
+namespace {
+
+// Algorithm and the triton-01 InsertSemaphore split:
+// sema-docs/insert-allocas.md.
+using namespace mlir;
+using namespace triton::gpu;
+using namespace triton::nvidia_gpu;
+using namespace triton::nvws;
+
+struct ProducedValueInfo {
+  SetVector<int> partitions;
+  Value result;
+};
+
+SmallVector<ProducedValueInfo> getProducedValues(Operation *op,
+                                                 Block *loopBody) {
+  SmallVector<ProducedValueInfo> producedValues;
+
+  if (!hasPartition(op))
+    return {};
+
+  // For ops without regions, all results share the same partition IDs
+  auto partitionOutputs = op->getNumRegions() == 0
+                              ? SmallVector<SetVector<int>, 4>(
+                                    op->getNumResults(), getPartitionIds(op))
+                              : getPartitionOutputs(op);
+
+  for (auto result : op->getResults()) {
+    if (isa<AsyncTokenType>(result.getType()))
+      continue;
+    producedValues.push_back(
+        {partitionOutputs[result.getResultNumber()], result});
+  }
+
+  return producedValues;
+};
+
+template <typename AllocOp, typename LoadOp>
+std::optional<std::pair<AllocOp, LoadOp>> isLoadAndAlloc(Value result) {
+  auto alloc = result.getDefiningOp<AllocOp>();
+  if (!alloc || !alloc.getSrc())
+    return std::nullopt;
+  if (auto load = alloc.getSrc().template getDefiningOp<LoadOp>();
+      load && getPartitionIds(alloc) == getPartitionIds(load)) {
+    // if alloc and load are in different partitions, they are treated as two
+    // different producer operations.
+    return std::make_pair(alloc, load);
+  }
+  return std::nullopt;
+}
+
+// if result is defined by descriptor_load followed by alloc, return the alloc
+// and the load ops as a pair.
+template <typename AllocOp> auto isDescLoadAndAlloc(Value result) {
+  return isLoadAndAlloc<AllocOp, triton::DescriptorOpInterface>(result);
+}
+
+template <typename AllocOp> auto isGlobalLoadAndAlloc(Value result) {
+  return isLoadAndAlloc<AllocOp, triton::LoadOp>(result);
+}
+
+RankedTensorType getTensorTypeFromScalar(OpBuilder &builder, Value scalar) {
+  auto mod = scalar.getParentRegion()->getParentOfType<ModuleOp>();
+  auto nWarps = lookupNumWarps(mod);
+  auto threadsPerWarp = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
+  int CTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);
+  Attribute encoding = getDefaultBlockedEncoding(builder.getContext(), {1},
+                                                 nWarps, threadsPerWarp, CTAs);
+  return RankedTensorType::get({1}, scalar.getType(), encoding);
+}
+
+bool hasBlackwellOrNewerTarget(Value value) {
+  auto mod = value.getParentRegion()->getParentOfType<ModuleOp>();
+  auto targetAttr =
+      mod ? mod->getAttrOfType<StringAttr>(triton::gpu::AttrTargetName)
+          : StringAttr();
+  if (!targetAttr)
+    return false;
+
+  StringRef target = targetAttr.strref();
+  if (!target.starts_with("cuda:"))
+    return false;
+
+  int cc = 0;
+  if (target.drop_front(5).getAsInteger(10, cc))
+    return false;
+  return cc >= 100;
+}
+
+std::optional<Attribute> getExpandedRank1Encoding(RankedTensorType tensorType) {
+  Attribute encoding = tensorType.getEncoding();
+  if (auto sliceEnc = dyn_cast_or_null<SliceEncodingAttr>(encoding)) {
+    if (sliceEnc.getDim() != 1)
+      return std::nullopt;
+    return sliceEnc.getParent();
+  }
+
+  auto blockedEnc = dyn_cast_or_null<BlockedEncodingAttr>(encoding);
+  if (!blockedEnc || tensorType.getRank() != 1)
+    return std::nullopt;
+
+  constexpr unsigned axis = 1;
+  MLIRContext *ctx = tensorType.getContext();
+  SmallVector<unsigned> sizePerThread(blockedEnc.getSizePerThread());
+  SmallVector<unsigned> threadsPerWarp(blockedEnc.getThreadsPerWarp());
+  SmallVector<unsigned> warpsPerCTA(blockedEnc.getWarpsPerCTA());
+  SmallVector<unsigned> order{axis, blockedEnc.getOrder()[0]};
+  sizePerThread.insert(sizePerThread.begin() + axis, 1);
+  threadsPerWarp.insert(threadsPerWarp.begin() + axis, 1);
+  warpsPerCTA.insert(warpsPerCTA.begin() + axis, 1);
+
+  auto cgaLayout = blockedEnc.getCGALayout();
+  SmallVector<unsigned> ctasPerCGA = cgaLayout.getCTAsPerCGA();
+  SmallVector<unsigned> ctaSplitNum = cgaLayout.getCTASplitNum();
+  SmallVector<unsigned> ctaOrder{axis, cgaLayout.getCTAOrder()[0]};
+  ctasPerCGA.insert(ctasPerCGA.begin() + axis, 1);
+  ctaSplitNum.insert(ctaSplitNum.begin() + axis, 1);
+  auto expandedCGALayout =
+      CGAEncodingAttr::fromSplitParams(ctx, ctasPerCGA, ctaSplitNum, ctaOrder);
+  return BlockedEncodingAttr::get(ctx, sizePerThread, threadsPerWarp,
+                                  warpsPerCTA, order, expandedCGALayout);
+}
+
+std::optional<RankedTensorType>
+getExpandedRank1TensorType(RankedTensorType tensorType) {
+  auto encoding = getExpandedRank1Encoding(tensorType);
+  if (!encoding)
+    return std::nullopt;
+  return RankedTensorType::get({tensorType.getShape()[0], 1},
+                               tensorType.getElementType(), *encoding);
+}
+
+std::optional<RankedTensorType>
+getExpandDimsInputTensorType(RankedTensorType tensorType) {
+  auto expandedType = getExpandedRank1TensorType(tensorType);
+  if (!expandedType)
+    return std::nullopt;
+
+  if (isa<BlockedEncodingAttr>(tensorType.getEncoding())) {
+    auto sliceEnc =
+        SliceEncodingAttr::get(tensorType.getContext(), 1,
+                               cast<DistributedEncodingTrait>(
+                                   (*expandedType).getEncoding()));
+    return RankedTensorType::get(tensorType.getShape(),
+                                 tensorType.getElementType(), sliceEnc);
+  }
+  return tensorType;
+}
+
+bool isEligibleSsaTmemTensor(RankedTensorType tensorType) {
+  if (tensorType.getRank() != 1)
+    return false;
+  if (!isa<FloatType>(tensorType.getElementType()))
+    return false;
+  int64_t blockM = tensorType.getShape()[0];
+  if (blockM != 64 && blockM != 128)
+    return false;
+  unsigned elemBitWidth = tensorType.getElementType().getIntOrFloatBitWidth();
+  if (elemBitWidth != 16 && elemBitWidth != 32)
+    return false;
+  return getExpandedRank1TensorType(tensorType).has_value();
+}
+
+bool useSsaTmemChannel(Value value, RankedTensorType tensorType) {
+  return triton::tools::getBoolEnv("NVWS_USE_SSA_TMEM") &&
+         hasBlackwellOrNewerTarget(value) && isEligibleSsaTmemTensor(tensorType);
+}
+
+MemDescType getTmemDescType(RankedTensorType tensorType) {
+  auto blockM = tensorType.getShape()[0];
+  auto elemType = tensorType.getElementType();
+  unsigned elemBitWidth = elemType.getIntOrFloatBitWidth();
+  unsigned colStride = 32 / elemBitWidth;
+  auto encoding = TensorMemoryEncodingAttr::get(
+      tensorType.getContext(), blockM, /*blockN=*/1, colStride,
+      CGAEncodingAttr::get1CTALayout(tensorType.getContext(), 2),
+      /*twoCTAs=*/false, TensorMemoryCTAMode::DEFAULT);
+  return MemDescType::get({blockM, 1}, elemType, encoding,
+                          TensorMemorySpaceAttr::get(tensorType.getContext()),
+                          /*mutableMemory=*/true);
+}
+
+bool isTensorMemoryBuffer(Value value) {
+  auto memDescType = dyn_cast<MemDescType>(value.getType());
+  return memDescType &&
+         isa<TensorMemorySpaceAttr>(memDescType.getMemorySpace());
+}
+
+struct CommunicationBuffer {
+  Value empty; // semaphore initially released (producer acquires)
+  Value full;  // semaphore initially not released (consumer acquires)
+  Value alloc; // underlying buffer allocation
+  bool hasStageDimension = false;
+
+  bool hasSemaphores() const { return empty && full; }
+};
+
+MemDescType withMutableMemory(MemDescType type, bool mutableMemory) {
+  if (type.getMutableMemory() == mutableMemory)
+    return type;
+  return MemDescType::get(type.getShape(), type.getElementType(),
+                          type.getEncoding(), type.getMemorySpace(),
+                          mutableMemory, type.getAllocShape());
+}
+
+struct InsertCommunicationOptions {
+  bool createSemaphores = true;
+};
+
+template <typename OpT> OpT setTagIfPresent(OpT op, std::optional<int> wsTag) {
+  if (wsTag)
+    setWarpSpecializeTag(op, *wsTag);
+  return op;
+}
+
+template <typename OpT, typename... Args>
+OpT createInto(OpBuilder &builder, Location loc,
+               std::optional<SetVector<int>> partitionSet,
+               StageCluster stageCluster, std::optional<int> wsTag,
+               Args &&...args) {
+  auto op = triton::gpu::createInto<OpT>(
+      builder, loc, partitionSet, stageCluster, std::forward<Args>(args)...);
+  return setTagIfPresent(op, wsTag);
+}
+
+Value prepareRank1TmemStoreSrc(OpBuilder &builder, Location loc, Value src,
+                               const SetVector<int> &partitions,
+                               StageCluster stageCluster,
+                               std::optional<int> wsTag, MemDescType tmemDesc) {
+  auto tensorType = cast<RankedTensorType>(src.getType());
+  auto expandInputType = *getExpandDimsInputTensorType(tensorType);
+  Value expandInput = src;
+  if (expandInputType != tensorType) {
+    expandInput = createInto<ConvertLayoutOp>(
+        builder, loc, partitions, stageCluster, wsTag, expandInputType, src);
+  }
+
+  auto expanded = createInto<triton::ExpandDimsOp>(
+      builder, loc, partitions, stageCluster, wsTag, expandInput, 1);
+  Value storeSrc = expanded.getResult();
+  auto expandedType = cast<RankedTensorType>(storeSrc.getType());
+  if (!isDistributedLayoutTMemCompatible(expanded, expandedType, tmemDesc)) {
+    auto compatibleLayouts =
+        getTmemCompatibleLayouts(expanded, expandedType, tmemDesc);
+    assert(!compatibleLayouts.empty() && "no TMEM-compatible layout found");
+    auto compatibleType =
+        expandedType.cloneWithEncoding(compatibleLayouts.front());
+    storeSrc = createInto<ConvertLayoutOp>(
+        builder, loc, partitions, stageCluster, wsTag, compatibleType, storeSrc);
+  }
+  return storeSrc;
+}
+
+void createRank1TmemStore(OpBuilder &builder, Location loc, Value src,
+                          Value dataBuf, const SetVector<int> &partitions,
+                          StageCluster stageCluster,
+                          std::optional<int> wsTag) {
+  auto tmemDesc = cast<MemDescType>(dataBuf.getType());
+  Value storeSrc = prepareRank1TmemStoreSrc(builder, loc, src, partitions,
+                                            stageCluster, wsTag, tmemDesc);
+  auto pred = createInto<arith::ConstantIntOp>(
+      builder, loc, partitions, stageCluster, wsTag, true, 1);
+  createInto<TMEMStoreOp>(builder, loc, partitions, stageCluster, wsTag, Type(),
+                          dataBuf, Value(), storeSrc, pred);
+}
+
+static void copyTmemInitPlacementAttrs(Operation *from, Operation *to) {
+  for (StringRef name :
+       {StringRef(kPartitionAttrName), StringRef(kLoopStageAttrName),
+        StringRef(kLoopClusterAttrName), StringRef(kWarpSpecializeTagAttrName),
+        StringRef("async_task_id")}) {
+    if (Attribute attr = from->getAttr(name))
+      to->setAttr(name, attr);
+  }
+}
+
+static bool isTmemInitPlacementAttr(StringRef name) {
+  return name == kPartitionAttrName || name == kLoopStageAttrName ||
+         name == kLoopClusterAttrName ||
+         name == kWarpSpecializeTagAttrName || name == "async_task_id";
+}
+
+static bool isTmemMemDescAlias(Operation *op) {
+  StringRef name = op->getName().getStringRef();
+  return name == "ttg.memdesc_index" || name == "ttg.memdesc_subview" ||
+         name == "ttg.memdesc_subslice" || name == "ttg.memdesc_trans" ||
+         name == "ttg.memdesc_reinterpret" ||
+         name == "ttg.memdesc_reshape";
+}
+
+static bool isUsedInMultiplePartitions(TMEMAllocOp alloc) {
+  SetVector<int> partitions;
+  bool hasRootOwner = false;
+  auto addOwner = [&](Operation *op) {
+    if (!hasPartition(op)) {
+      hasRootOwner = true;
+    } else {
+      SetVector<int> ids = getPartitionIds(op);
+      partitions.insert(ids.begin(), ids.end());
+    }
+    return partitions.size() + static_cast<unsigned>(hasRootOwner) > 1;
+  };
+  auto addUseOwner = [&](OpOperand &use) {
+    Operation *user = use.getOwner();
+    if (!hasPartition(user)) {
+      hasRootOwner = true;
+    } else {
+      SetVector<int> ids = getPartitionIds(&use);
+      partitions.insert(ids.begin(), ids.end());
+    }
+    return partitions.size() + static_cast<unsigned>(hasRootOwner) > 1;
+  };
+
+  if (addOwner(alloc))
+    return true;
+
+  SmallVector<Value, 4> worklist{alloc.getResult()};
+  DenseSet<Value> seen;
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!seen.insert(value).second)
+      continue;
+    for (OpOperand &use : value.getUses()) {
+      Operation *user = use.getOwner();
+      if (isTmemMemDescAlias(user) && user->getNumResults() == 1 &&
+          isa<MemDescType>(user->getResult(0).getType())) {
+        worklist.push_back(user->getResult(0));
+        continue;
+      }
+      if (addUseOwner(use))
+        return true;
+    }
+  }
+  return false;
+}
+
+// Make TMEM initialization an ordinary memory access before InsertSemas. The
+// backing allocation is hoisted, while the explicit store remains at the
+// sourceful allocation's original scheduled point.
+void normalizeSourcefulTmemAlloc(TMEMAllocOp alloc) {
+  assert(alloc.getSrc() && "expected a sourceful TMEM allocation");
+
+  Operation *anchor = alloc;
+  if (auto parentFor = alloc->getParentOfType<scf::ForOp>()) {
+    if (auto wsLoop = getOuterWSLoop(parentFor))
+      anchor = wsLoop;
+  }
+
+  OpBuilder allocBuilder(anchor);
+  MemDescType backingType = withMutableMemory(alloc.getType(), true);
+  auto backing =
+      TMEMAllocOp::create(allocBuilder, alloc.getLoc(), backingType, Value());
+  // Physical allocation metadata stays on the backing. ODS segment sizes are
+  // reconstructed by the tokenless/sourceless builder and must not be copied.
+  for (NamedAttribute attr : alloc->getAttrs()) {
+    StringRef name = attr.getName().strref();
+    if (isTmemInitPlacementAttr(name) || name == "operandSegmentSizes" ||
+        name == "resultSegmentSizes")
+      continue;
+    backing->setAttr(attr.getName(), attr.getValue());
+  }
+
+  if (Value token = alloc.getToken(); token && !token.use_empty()) {
+    Value poison =
+        ub::PoisonOp::create(allocBuilder, alloc.getLoc(), token.getType());
+    token.replaceAllUsesWith(poison);
+  }
+
+  OpBuilder storeBuilder(alloc);
+  auto pred =
+      arith::ConstantIntOp::create(storeBuilder, alloc.getLoc(), true, 1);
+  auto store = TMEMStoreOp::create(storeBuilder, alloc.getLoc(),
+                                   backing.getResult(), alloc.getSrc(), pred);
+  copyTmemInitPlacementAttrs(alloc, pred);
+  copyTmemInitPlacementAttrs(alloc, store);
+
+  if (alloc.getType() == backing.getType()) {
+    alloc.getResult().replaceAllUsesWith(backing.getResult());
+  } else {
+    replaceUsesAndPropagateType(storeBuilder, alloc, backing.getResult());
+  }
+  alloc.erase();
+}
+
+Value createRank1TmemLoad(OpBuilder &builder, Location loc,
+                          RankedTensorType resultType, Value dataBuf,
+                          const SetVector<int> &partitions,
+                          StageCluster stageCluster,
+                          std::optional<int> wsTag) {
+  auto tmemDesc = cast<MemDescType>(dataBuf.getType());
+  auto expandedType = *getExpandedRank1TensorType(resultType);
+  auto compatibleLayouts =
+      getTmemCompatibleLayouts(dataBuf.getDefiningOp(), expandedType, tmemDesc);
+  assert(!compatibleLayouts.empty() && "no TMEM-compatible layout found");
+  auto loadType = expandedType.cloneWithEncoding(compatibleLayouts.front());
+
+  auto load = createInto<TMEMLoadOp>(
+      builder, loc, partitions, stageCluster, wsTag, loadType,
+      builder.getType<AsyncTokenType>(), dataBuf, Value());
+  auto reshape = createInto<triton::ReshapeOp>(
+      builder, loc, partitions, stageCluster, wsTag, resultType.getShape(),
+      load.getResult());
+  auto converted = createInto<ConvertLayoutOp>(
+      builder, loc, partitions, stageCluster, wsTag, resultType,
+      reshape.getResult());
+  return converted.getResult();
+}
+
+static triton::DescriptorStoreOp findDescriptorStoreConsumer(Value value,
+                                                             Operation *user) {
+  if (auto store = dyn_cast<triton::DescriptorStoreOp>(user)) {
+    return store.getSrc() == value ? store : triton::DescriptorStoreOp();
+  }
+
+  auto convert = dyn_cast<ConvertLayoutOp>(user);
+  if (!convert || convert.getSrc() != value)
+    return {};
+
+  Value converted = convert.getResult();
+  for (Operation *convertUser : converted.getUsers()) {
+    if (auto store = dyn_cast<triton::DescriptorStoreOp>(convertUser)) {
+      if (store.getSrc() == converted)
+        return store;
+    }
+  }
+
+  return {};
+}
+
+static Attribute getDescriptorStoreConsumerEncoding(
+    RankedTensorType tensorType,
+    const DenseMap<int, SmallVector<OpOperand *>> &usesPerPartition) {
+  Attribute descriptorEncoding;
+
+  for (const auto &entry : usesPerPartition) {
+    for (OpOperand *use : entry.second) {
+      auto store = findDescriptorStoreConsumer(use->get(), use->getOwner());
+      if (!store)
+        continue;
+
+      Attribute encoding =
+          getEncodingFromDescriptor(store, tensorType, store.getDesc());
+      if (descriptorEncoding && descriptorEncoding != encoding)
+        return {};
+      descriptorEncoding = encoding;
+    }
+  }
+
+  return descriptorEncoding;
+}
+
+CommunicationBuffer createCommunicationBuffer(
+    OpBuilder &builder, ProducedValueInfo &producedValue,
+    const DenseMap<int, SmallVector<OpOperand *>> &usesPerPartition,
+    InsertCommunicationOptions options) {
+  auto result = producedValue.result;
+
+  auto getSmemDescType = [](RankedTensorType tensorType, Value tensorResult,
+                            Attribute encodingOverride = {}) {
+    Attribute SharedMemorySpace =
+        SharedMemorySpaceAttr::get(tensorType.getContext());
+    Operation *defOp = tensorResult ? tensorResult.getDefiningOp() : nullptr;
+    Attribute encoding =
+        encodingOverride ? encodingOverride
+                         : (defOp && !isa<scf::ForOp>(defOp)
+                                ? getSharedEncoding(defOp)
+                                : getSharedEncoding(tensorType));
+    return MemDescType::get(tensorType.getShape(), tensorType.getElementType(),
+                            encoding, SharedMemorySpace);
+  };
+
+  MemDescType memDescType;
+  if (result.getDefiningOp<LocalAllocOp>()) {
+    memDescType = dyn_cast<MemDescType>(result.getType());
+  } else if (auto tensorType = dyn_cast<RankedTensorType>(result.getType())) {
+    if (useSsaTmemChannel(result, tensorType)) {
+      memDescType = getTmemDescType(tensorType);
+    } else {
+      Attribute descriptorEncoding =
+          getDescriptorStoreConsumerEncoding(tensorType, usesPerPartition);
+      memDescType = getSmemDescType(tensorType, result, descriptorEncoding);
+    }
+  } else if (isa<FloatType, IntegerType>(result.getType())) {
+    auto tensorType = getTensorTypeFromScalar(builder, result);
+    memDescType = getSmemDescType(tensorType, Value());
+  } else {
+    std::string msg = "createSemaphores: unsupported produced value type: " +
+                      mlir::debugString(result.getType());
+    llvm::report_fatal_error(msg.c_str());
+  }
+
+  MemDescType allocBufType;
+  bool hasStageDimension = false;
+  if (isa<TensorMemorySpaceAttr>(memDescType.getMemorySpace())) {
+    if (options.createSemaphores) {
+      allocBufType = getSemaphoreMultiBufferedType(memDescType, 1);
+      hasStageDimension = true;
+    } else {
+      allocBufType = memDescType;
+    }
+  } else if (options.createSemaphores) {
+    allocBufType = getMultiBufferedType(memDescType, 1);
+    hasStageDimension = true;
+  } else {
+    allocBufType = withMutableMemory(memDescType, true);
+  }
+  auto loc = result.getLoc();
+  auto alloc = triton::nvws::createAlloc(builder, loc, allocBufType, Value());
+
+  if (!options.createSemaphores)
+    return CommunicationBuffer{Value(), Value(), alloc->getResult(0),
+                               hasStageDimension};
+
+  auto baseTypes = TypeArrayAttr::get(builder.getContext(), {allocBufType});
+  auto semaTy = SemaphoreType::get(builder.getContext(), baseTypes);
+  auto empty = SemaphoreCreateOp::create(
+      builder, loc, semaTy, alloc->getResults(),
+      getAllReleasedMask());
+  auto full =
+      SemaphoreCreateOp::create(builder, loc, semaTy, alloc->getResults());
+  return CommunicationBuffer{empty, full, alloc->getResult(0),
+                             hasStageDimension};
+}
+
+int getTxCount(Operation *descOp) {
+  auto getTensorTypeAndDesc =
+      [](Operation *op) -> std::pair<RankedTensorType, Value> {
+    if (auto loadOp = dyn_cast<triton::DescriptorLoadOp>(op)) {
+      return {loadOp.getType(), loadOp.getDesc()};
+    } else if (auto gatherOp = dyn_cast<triton::DescriptorGatherOp>(op)) {
+      return {gatherOp.getType(), gatherOp.getDesc()};
+    } else {
+      llvm_unreachable("Unsupported operation type");
+    }
+  };
+  auto [tensorType, desc] = getTensorTypeAndDesc(descOp);
+  auto encoding = getEncodingFromDescriptor(descOp, tensorType, desc);
+  auto shapePerCTA = getShapePerCTA(encoding, tensorType.getShape());
+  return product(shapePerCTA) *
+         getIntOrFloatOrPtrBitWidth(tensorType.getElementType()) / 8;
+}
+
+void createNVWSDescriptorLoadOp(OpBuilder &builder, Operation *ttDescLoadOp,
+                                Value dataBuf,
+                                SetVector<int> const &producerPartitions,
+                                Location loc) {
+  auto txCount = getTxCount(ttDescLoadOp);
+  if (auto descLoad = dyn_cast<triton::DescriptorLoadOp>(ttDescLoadOp)) {
+    auto newDescLoad = triton::nvws::DescriptorLoadOp::create(
+        builder, loc, descLoad.getDesc(), descLoad.getIndices(), txCount,
+        dataBuf, descLoad.getCache(), descLoad.getEvict());
+    newDescLoad->setAttrs(descLoad->getAttrs());
+    setPartition(newDescLoad, producerPartitions);
+  } else if (auto descGather =
+                 dyn_cast<triton::DescriptorGatherOp>(ttDescLoadOp)) {
+    auto newDescGather = triton::nvws::DescriptorGatherOp::create(
+        builder, loc, descGather.getDesc(), descGather.getXOffsets(),
+        descGather.getYOffset(), txCount, dataBuf);
+    newDescGather->setAttrs(descGather->getAttrs());
+    setPartition(newDescGather, producerPartitions);
+  } else {
+    llvm_unreachable("unknown descriptor op.");
+  }
+}
+
+StageCluster getStageClusterForProducer(Value producedValue) {
+  if (auto arg = dyn_cast<BlockArgument>(producedValue)) {
+    Value prevProducedValue;
+    do {
+      prevProducedValue = producedValue;
+      auto terminator = arg.getOwner()->getTerminator();
+      if (!isa<scf::YieldOp>(terminator)) {
+        return {};
+      }
+      producedValue = terminator->getOperand(arg.getArgNumber() - 1);
+      arg = dyn_cast<BlockArgument>(producedValue);
+    } while (arg && prevProducedValue != producedValue);
+  }
+
+  if (auto opt = isDescLoadAndAlloc<LocalAllocOp>(producedValue)) {
+    return getStageCluster(opt->second);
+  } else if (auto opt = isGlobalLoadAndAlloc<LocalAllocOp>(producedValue)) {
+    return getStageCluster(opt->second);
+  } else if (auto op = producedValue.getDefiningOp()) {
+    return getStageCluster(op);
+  } else {
+    return {};
+  }
+}
+
+Value createStage0BufferView(OpBuilder &builder, Location loc, Value alloc,
+                             bool mutableMemory,
+                             bool hasStageDimension,
+                             const SetVector<int> &partitions,
+                             StageCluster stageCluster,
+                             std::optional<int> wsTag) {
+  auto allocBufType = cast<MemDescType>(alloc.getType());
+  if (isa<TensorMemorySpaceAttr>(allocBufType.getMemorySpace()))
+    return alloc;
+
+  if (!hasStageDimension)
+    return alloc;
+
+  auto viewType = MemDescType::get(
+      allocBufType.getShape().drop_front(), allocBufType.getElementType(),
+      allocBufType.getEncoding(), allocBufType.getMemorySpace(),
+      mutableMemory);
+  auto zero = createInto<arith::ConstantIntOp>(
+      builder, loc, partitions, stageCluster, wsTag, 0, 32);
+  return createInto<MemDescIndexOp>(builder, loc, partitions, stageCluster,
+                                    wsTag, viewType, alloc, zero)
+      .getResult();
+}
+
+SmallVector<Operation *>
+createSemaphoreProducer(OpBuilder &builder, CommunicationBuffer &sema,
+                        ProducedValueInfo producedValue,
+                        std::optional<int> wsTag = std::nullopt) {
+  auto loc = producedValue.result.getLoc();
+  auto allocBufType = cast<MemDescType>(sema.alloc.getType());
+  Value result = producedValue.result;
+  StageCluster stageCluster = getStageClusterForProducer(result);
+
+  // elect a partition to put result into aref-buffer
+  SetVector<int> producerPartitions;
+  producerPartitions.insert(producedValue.partitions.front());
+
+  Value token;
+  Value dataBuf;
+  if (sema.hasSemaphores()) {
+    Type dataBufType = getBufferViewType(allocBufType, /*mutable*/ true);
+    // Acquire empty semaphore.
+    auto acquire = createInto<SemaphoreAcquireOp>(
+        builder, loc, producerPartitions, stageCluster, wsTag, sema.empty,
+        builder.getType<AsyncTokenType>());
+    token = acquire.getToken();
+
+    // Get buffer view.
+    auto bufOp = createInto<SemaphoreBufferOp>(
+        builder, loc, producerPartitions, stageCluster, wsTag, sema.empty,
+        TypeRange{dataBufType}, token);
+    dataBuf = bufOp.getBuffers()[0];
+  } else {
+    dataBuf = createStage0BufferView(builder, loc, sema.alloc,
+                                     /*mutableMemory=*/true,
+                                     sema.hasStageDimension,
+                                     producerPartitions, stageCluster, wsTag);
+  }
+
+  auto producerKind = AsyncOp::NONE;
+  SmallVector<Operation *> staleOps;
+  if (auto opt = isDescLoadAndAlloc<LocalAllocOp>(result)) {
+    auto [alloc, descOp] = *opt;
+    createNVWSDescriptorLoadOp(builder, descOp, dataBuf, producerPartitions,
+                               loc);
+    producerKind = AsyncOp::TMALoad;
+    staleOps.push_back(alloc);
+    staleOps.push_back(descOp);
+  } else if (auto opt = isGlobalLoadAndAlloc<LocalAllocOp>(result)) {
+    auto [alloc, load] = *opt;
+    (void)load;
+    // Meta schedules the regular load/local_alloc producer independently from
+    // its MMA consumers. NVWS represents that channel as the original load
+    // followed by an explicit store into the managed semaphore buffer.
+    createInto<LocalStoreOp>(builder, loc, producerPartitions, stageCluster,
+                             wsTag, alloc.getSrc(), dataBuf);
+    staleOps.push_back(alloc);
+  } else if (auto alloc = result.getDefiningOp<LocalAllocOp>()) {
+    createInto<LocalStoreOp>(builder, loc, producerPartitions, stageCluster,
+                             wsTag, alloc.getSrc(), dataBuf);
+    staleOps.push_back(alloc);
+  } else if (auto tensorType = dyn_cast<RankedTensorType>(result.getType())) {
+    if (auto descOp = result.getDefiningOp<triton::DescriptorOpInterface>()) {
+      createNVWSDescriptorLoadOp(builder, descOp, dataBuf, producerPartitions,
+                                 loc);
+      producerKind = AsyncOp::TMALoad;
+      staleOps.push_back(descOp);
+    } else if (auto loadOp = result.getDefiningOp<triton::LoadOp>()) {
+      (void)loadOp;
+      createInto<LocalStoreOp>(builder, loc, producerPartitions, stageCluster,
+                               wsTag, result, dataBuf);
+    } else {
+      if (isTensorMemoryBuffer(dataBuf)) {
+        createRank1TmemStore(builder, loc, result, dataBuf, producerPartitions,
+                             stageCluster, wsTag);
+      } else {
+        createInto<LocalStoreOp>(builder, loc, producerPartitions, stageCluster,
+                                 wsTag, result, dataBuf);
+      }
+      producerKind = AsyncOp::NONE;
+    }
+  } else if (isa<FloatType, IntegerType>(result.getType())) {
+    auto tensorType = getTensorTypeFromScalar(builder, result);
+    auto splatOp = createInto<triton::SplatOp>(
+        builder, loc, producerPartitions, stageCluster, wsTag, tensorType,
+        result);
+    createInto<LocalStoreOp>(builder, loc, producerPartitions, stageCluster,
+                             wsTag, splatOp, dataBuf);
+    producerKind = AsyncOp::NONE;
+  } else {
+    std::string msg =
+        "createSemaphoreProducer: unsupported produced value type: " +
+        mlir::debugString(result.getType());
+    llvm::report_fatal_error(msg.c_str());
+  }
+
+  if (sema.hasSemaphores()) {
+    // Cross-release: producer releases full semaphore.
+    auto rel = createInto<SemaphoreReleaseOp>(
+        builder, loc, producerPartitions, stageCluster, wsTag, sema.full, token,
+        builder.getArrayAttr(SmallVector<Attribute>{
+            AsyncOpAttr::get(builder.getContext(), producerKind)}));
+    rel.setArriveCountAttr(builder.getI32IntegerAttr(1));
+  }
+
+  return staleOps;
+}
+
+SetVector<Operation *>
+getTransitiveConsumers(Operation *op,
+                       SetVector<int> const &consumerPartitions) {
+  SetVector<Operation *> opConsumers;
+  auto isMemDesc = [](auto res) { return isa<MemDescType>(res.getType()); };
+  for (auto &use : op->getUses()) {
+    if (llvm::count_if(use.getOwner()->getResults(), isMemDesc) > 0) {
+      // Recurse into consumers of memdesc ops, since the liveness of the
+      // produced value extends beyond such ops.
+      auto consumers =
+          getTransitiveConsumers(use.getOwner(), consumerPartitions);
+      opConsumers.insert(consumers.begin(), consumers.end());
+    } else {
+      if (getPartitionIds(&use) == consumerPartitions) {
+        opConsumers.insert(use.getOwner());
+        // If an op is defined before an inner loop and used inside, the loop
+        // itself should be considered as an additional consumer. This is
+        // necessary for persistent attention, where the load of Q is done
+        // before the inner loop.
+        opConsumers.insert(
+            op->getBlock()->findAncestorOpInBlock(*use.getOwner()));
+      }
+    }
+  }
+  return opConsumers;
+}
+
+SmallVector<Operation *>
+getTransitiveConsumers(const SetVector<Value> &results,
+                       SetVector<int> const &consumerPartitions) {
+  SetVector<Operation *> opSet;
+  for (auto result : results) {
+    if (isa<BlockArgument>(result)) {
+      for (auto &use : result.getUses()) {
+        if (getPartitionIds(&use) == consumerPartitions) {
+          opSet.insert(use.getOwner());
+        }
+      }
+    } else {
+      auto consumers =
+          getTransitiveConsumers(result.getDefiningOp(), consumerPartitions);
+      opSet.insert(consumers.begin(), consumers.end());
+    }
+  }
+  return SmallVector<Operation *>{opSet.begin(), opSet.end()};
+}
+
+SmallVector<Attribute> getConsumerAsyncOpKinds(ArrayRef<Operation *> consumers,
+                                               MLIRContext *ctx) {
+  SetVector<AsyncOp> kindSet;
+  for (auto consumer : consumers) {
+    if (isa<scf::ForOp>(consumer) && consumers.size() > 1) {
+      // In this case, a getExit is placed after the consumer loop. The
+      // corresponding async kind attributes should be determined from other
+      // consumer ops in the loop.
+      continue;
+    }
+    if (isa<WarpGroupDotOp>(consumer)) {
+      kindSet.insert(AsyncOp::WGMMA);
+    } else if (isa<MMAv5OpInterface>(consumer)) {
+      kindSet.insert(AsyncOp::TC5MMA);
+    } else {
+      kindSet.insert(AsyncOp::NONE);
+    }
+  }
+
+  SmallVector<Attribute> kindAttrs;
+  for (auto kind : kindSet) {
+    kindAttrs.push_back(AsyncOpAttr::get(ctx, kind));
+  }
+
+  return kindAttrs;
+}
+
+std::pair<StageCluster, StageCluster>
+getEnterAndExitStageClustersOfUses(const SetVector<Value> &producedResults,
+                                   std::function<bool(Operation *)> filterUse,
+                                   scf::ForOp forOp) {
+  CoarseSchedule coarseSchedule;
+  if (!forOp || failed(coarseSchedule.deSerialize(forOp)) ||
+      producedResults.empty()) {
+    return std::make_pair(std::nullopt, std::nullopt);
+  }
+
+  SmallVector<Operation *> ops;
+  for (auto res : producedResults) {
+    if (auto blockArg = dyn_cast<BlockArgument>(res)) {
+      // If the producer is a block argument, this means we need to communicate
+      // iteration arguments from the producer partition in the previous
+      // iteration to the consumer partition in the current iteration. There
+      // must be only one produced result in this case.
+      assert(producedResults.size() == 1);
+      auto block = blockArg.getOwner();
+      auto forOp = cast<scf::ForOp>(block->getParentOp());
+      auto opnd = forOp.getYieldedValues()[blockArg.getArgNumber() - 1];
+      auto op = opnd.getDefiningOp();
+      auto stageCluster = getStageCluster(op);
+      return std::make_pair(stageCluster, stageCluster);
+    }
+    auto op = res.getDefiningOp();
+    ops.push_back(op);
+  }
+
+  auto firstOp =
+      triton::getFirstUseOfPipelinedOp(ops, forOp, coarseSchedule, filterUse);
+  auto lastOp =
+      triton::getLastUseOfPipelinedOp(ops, forOp, coarseSchedule, filterUse);
+  if (!firstOp || !lastOp)
+    return std::make_pair(std::nullopt, std::nullopt);
+
+  return std::make_pair(getStageCluster(firstOp), getStageCluster(lastOp));
+}
+
+void createSemaphoreConsumer(OpBuilder &builder, scf::ForOp loop,
+                             CommunicationBuffer &sema,
+                             const SetVector<Value> &results,
+                             int consumerPartition,
+                             SmallVector<OpOperand *> &uses,
+                             std::optional<int> wsTag = std::nullopt) {
+
+  // The vector "results" contains either
+  // 1. One of local_load(desc_load()) or desc_load()
+  // 2. Both of them
+  // In the second case, we only need to emit one enter / exit since we know
+  // that the two results are used by consumers in the same partition.
+  assert(results.size() == 1 || results.size() == 2);
+  auto loc = results[0].getLoc();
+
+  scf::ForOp scheduledLoop;
+  loop->walk([&](scf::ForOp op) {
+    if (op->hasAttr(mlir::triton::kScheduledMaxStageAttrName)) {
+      scheduledLoop = op;
+    }
+  });
+
+  auto filterUse = [&](Operation *user) {
+    if (hasPartition(user)) {
+      return llvm::is_contained(getPartitionIds(user), consumerPartition);
+    } else {
+      return false;
+    }
+  };
+
+  // Filter results to include only those defined inside the scheduled loop
+  // (if any). This is done because otherwise the result might not have its
+  // last use (in either direction) inside the scheduled loop and we will not be
+  // able to get `stageClusterEnter` and/or `stageClusterExit`.
+  SetVector<Value> resultsInScheduledLoop;
+  for (Value v : results) {
+    if (Operation *defOp = v.getDefiningOp()) {
+      if (scheduledLoop && defOp != scheduledLoop &&
+          scheduledLoop->isAncestor(defOp))
+        resultsInScheduledLoop.insert(v);
+    }
+  }
+
+  auto [stageClusterEnter, stageClusterExit] =
+      getEnterAndExitStageClustersOfUses(resultsInScheduledLoop, filterUse,
+                                         scheduledLoop);
+
+  SetVector<int> consumerPartitions;
+  consumerPartitions.insert(consumerPartition);
+  if (!sema.hasSemaphores()) {
+    for (OpOperand *use : uses) {
+      if (getPartitionIds(use) != consumerPartitions)
+        continue;
+      StageCluster useStageCluster = getStageCluster(use->getOwner());
+      if (!useStageCluster)
+        continue;
+      if (!stageClusterEnter)
+        stageClusterEnter = useStageCluster;
+      if (!stageClusterExit)
+        stageClusterExit = useStageCluster;
+    }
+  }
+  auto allocBufType = cast<MemDescType>(sema.alloc.getType());
+
+  Value token;
+  Value dataBuf;
+  if (sema.hasSemaphores()) {
+    Type bufferType = getBufferViewType(allocBufType, /*mutable*/ false);
+    // Acquire full semaphore.
+    auto acquire = createInto<SemaphoreAcquireOp>(
+        builder, loc, consumerPartitions, stageClusterEnter, wsTag, sema.full,
+        builder.getType<AsyncTokenType>());
+    token = acquire.getToken();
+
+    // Get buffer view.
+    auto bufOp = createInto<SemaphoreBufferOp>(
+        builder, loc, consumerPartitions, stageClusterEnter, wsTag, sema.full,
+        TypeRange{bufferType}, token);
+    dataBuf = bufOp.getBuffers()[0];
+  } else {
+    dataBuf = createStage0BufferView(builder, loc, sema.alloc,
+                                     /*mutableMemory=*/false,
+                                     sema.hasStageDimension,
+                                     consumerPartitions, stageClusterEnter,
+                                     wsTag);
+  }
+
+  auto consumers = getTransitiveConsumers(results, consumerPartitions);
+  if (consumers.empty()) {
+    SetVector<Operation *> directConsumers;
+    for (OpOperand *use : uses) {
+      Operation *owner = use->getOwner();
+      Operation *ancestor = loop.getBody()->findAncestorOpInBlock(*owner);
+      directConsumers.insert(ancestor ? ancestor : owner);
+    }
+    consumers = SmallVector<Operation *>{directConsumers.begin(),
+                                         directConsumers.end()};
+  }
+  auto asyncKinds = getConsumerAsyncOpKinds(consumers, builder.getContext());
+
+  Operation *exitInsertPointAfter = nullptr;
+
+  auto replaceUsesWithLocalLoad = [&](Value result, StageCluster stageCluster) {
+    Operation *loadOp = nullptr;
+    Value loaded;
+    if (isTensorMemoryBuffer(dataBuf)) {
+      auto resultType = cast<RankedTensorType>(result.getType());
+      loaded = createRank1TmemLoad(builder, loc, resultType, dataBuf,
+                                   consumerPartitions, stageCluster, wsTag);
+      loadOp = loaded.getDefiningOp();
+    } else {
+      auto localLoadOp = createInto<LocalLoadOp>(
+          builder, loc, consumerPartitions, stageCluster, wsTag, result.getType(),
+          dataBuf);
+      loaded = localLoadOp.getResult();
+      loadOp = localLoadOp;
+    }
+
+    for (auto use : uses) {
+      if (use->get() == result) {
+        use->set(loaded);
+      }
+    }
+    if (dataBuf.hasOneUse()) {
+      // If there is only one consumer for dataBuf, it is the load created
+      // above, and we hit this code path, the empty barrier can be released
+      // after the reload sequence.
+      exitInsertPointAfter = loadOp;
+    }
+  };
+
+  for (auto result : results) {
+    if (auto localAlloc = result.getDefiningOp<LocalAllocOp>()) {
+      auto callback = [&](Operation *oldOp, Operation *newOp) {
+        assert(llvm::is_contained(getPartitionIds(oldOp), consumerPartition));
+        setPartition(newOp, consumerPartitions);
+      };
+      replaceUsesAndPropagateType(builder, localAlloc, dataBuf, callback);
+    } else if (isa<RankedTensorType>(result.getType())) {
+      replaceUsesWithLocalLoad(result, stageClusterEnter);
+    } else if (isa<FloatType, IntegerType>(result.getType())) {
+      auto tensorType = getTensorTypeFromScalar(builder, result);
+      auto localLoadOp = createInto<LocalLoadOp>(
+          builder, loc, consumerPartitions, stageClusterEnter, wsTag, tensorType,
+          dataBuf);
+      auto scalar = createInto<triton::UnsplatOp>(
+          builder, loc, consumerPartitions, stageClusterEnter, wsTag,
+          localLoadOp);
+      for (auto use : uses) {
+        use->set(scalar);
+      }
+      exitInsertPointAfter = localLoadOp;
+    } else {
+      std::string msg =
+          "createSemaphoreConsumer: unsupported produced value type: " +
+          mlir::debugString(result.getType());
+      llvm::report_fatal_error(msg.c_str());
+    }
+  }
+
+  if (!sema.hasSemaphores())
+    return;
+
+  if (exitInsertPointAfter == nullptr) {
+    PostDominanceInfo dom(loop);
+    exitInsertPointAfter = findNearestCommonPostDominator(consumers, dom);
+  }
+
+  builder.setInsertionPointAfter(exitInsertPointAfter);
+
+  // Cross-release: consumer releases empty semaphore
+  auto rel = createInto<SemaphoreReleaseOp>(
+      builder, loc, consumerPartitions, stageClusterExit, wsTag, sema.empty,
+      token,
+      builder.getArrayAttr(asyncKinds));
+  rel.setArriveCountAttr(builder.getI32IntegerAttr(1));
+}
+
+Operation *getEarliestUserInBlock(Block *block, ArrayRef<OpOperand *> uses) {
+  OpOperand *use =
+      *llvm::min_element(uses, [block](OpOperand *lhs, OpOperand *rhs) {
+        auto lhsOwner = block->findAncestorOpInBlock(*lhs->getOwner());
+        auto rhsOwner = block->findAncestorOpInBlock(*rhs->getOwner());
+        return lhsOwner->isBeforeInBlock(rhsOwner);
+      });
+  return block->findAncestorOpInBlock(*use->getOwner());
+}
+
+bool insertSemaphoresForUses(
+    OpBuilder &builder, scf::ForOp loop, Block *block,
+    ProducedValueInfo producedValue,
+    DenseMap<int, SetVector<Value>> &resultsPerPartition,
+    DenseMap<int, SmallVector<OpOperand *>> &usesPerPartition,
+    InsertCommunicationOptions options,
+    std::optional<int> wsTag = std::nullopt) {
+  if (resultsPerPartition.empty()) {
+    return false;
+  }
+
+  CommunicationBuffer sema;
+  {
+    OpBuilder::InsertionGuard g(builder);
+    auto wsLoop = getOuterWSLoop(loop);
+    builder.setInsertionPoint(wsLoop);
+    sema = createCommunicationBuffer(builder, producedValue, usesPerPartition,
+                                     options);
+  }
+
+  auto staleOps = createSemaphoreProducer(builder, sema, producedValue, wsTag);
+
+  for (auto [consumerPartition, results] : resultsPerPartition) {
+    OpBuilder::InsertionGuard g(builder);
+    auto earliestUser =
+        getEarliestUserInBlock(block, usesPerPartition[consumerPartition]);
+    builder.setInsertionPoint(earliestUser);
+    createSemaphoreConsumer(builder, loop, sema, results, consumerPartition,
+                            usesPerPartition[consumerPartition], wsTag);
+  }
+
+  for (auto op : staleOps) {
+    op->erase();
+  }
+
+  return true;
+}
+
+bool insertSemaphores(OpBuilder &builder, scf::ForOp loop, Block *block,
+                      ProducedValueInfo producedValue,
+                      InsertCommunicationOptions options) {
+  // Collect uses of local_alloc(desc_load()) or desc_load() results by each
+  // partition
+  DenseMap<int, SetVector<Value>> resultsPerPartition;
+  DenseMap<int, SmallVector<OpOperand *>> usesPerPartition;
+  auto processResultUses = [&](Value result) {
+    for (auto &use : result.getUses()) {
+      auto user = use.getOwner();
+      // if use is outside ttg.ws, it may not have partition ids, skip it
+      if (!hasPartition(user))
+        continue;
+      auto userPartitions = getPartitionIds(&use);
+      for (auto id : producedValue.partitions) {
+        userPartitions.remove(id);
+      }
+      for (auto id : userPartitions) {
+        resultsPerPartition[id].insert(result);
+        usesPerPartition[id].push_back(&use);
+      }
+    }
+  };
+
+  processResultUses(producedValue.result);
+
+  if (auto opt = isDescLoadAndAlloc<LocalAllocOp>(producedValue.result)) {
+    // Process the register use as well
+    auto alloc = opt->first;
+    processResultUses(alloc.getSrc());
+  }
+
+  return insertSemaphoresForUses(builder, loop, block, producedValue,
+                                 resultsPerPartition, usesPerPartition,
+                                 options);
+}
+
+bool insertLoopResultSemaphores(OpBuilder &builder, scf::ForOp loop,
+                                InsertCommunicationOptions options) {
+  auto wsTag = getWarpSpecializeTag(loop);
+  auto partitionOutputs = getPartitionOutputs(loop);
+  bool changed = false;
+
+  for (auto [idx, result] : llvm::enumerate(loop.getResults())) {
+    if (!isa<RankedTensorType>(result.getType()))
+      continue;
+    if (idx >= partitionOutputs.size())
+      continue;
+
+    ProducedValueInfo producedValue{partitionOutputs[idx], result};
+    DenseMap<int, SetVector<Value>> resultsPerPartition;
+    DenseMap<int, SmallVector<OpOperand *>> usesPerPartition;
+
+    for (auto &use : result.getUses()) {
+      Operation *user = use.getOwner();
+      if (!hasPartition(user))
+        continue;
+      if (wsTag) {
+        auto userTag = getWarpSpecializeTag(user);
+        if (!userTag || *userTag != *wsTag)
+          continue;
+      }
+      if (loop->getBlock() != user->getBlock() &&
+          !loop->getBlock()->findAncestorOpInBlock(*user))
+        continue;
+
+      auto userPartitions = getPartitionIds(&use);
+      for (auto id : producedValue.partitions)
+        userPartitions.remove(id);
+      for (auto id : userPartitions) {
+        resultsPerPartition[id].insert(result);
+        usesPerPartition[id].push_back(&use);
+      }
+    }
+
+    OpBuilder::InsertionGuard g(builder);
+    builder.setInsertionPointAfter(loop);
+    changed |= insertSemaphoresForUses(builder, loop, loop->getBlock(),
+                                       producedValue, resultsPerPartition,
+                                       usesPerPartition, options, wsTag);
+  }
+
+  return changed;
+}
+
+} // namespace
+
+class NVWSInsertAllocas
+    : public triton::impl::NVWSInsertAllocasBase<NVWSInsertAllocas> {
+public:
+  void runOnFunction(triton::FuncOp func, InsertCommunicationOptions options) {
+    SmallVector<scf::ForOp> loops;
+    func.walk([&](scf::ForOp loop) {
+      if (loop->hasAttr(triton::kWarpSpecializeAttrName) && hasPartition(loop))
+        loops.push_back(loop);
+    });
+
+    if (loops.empty())
+      return;
+
+    // Canonicalize sourceful TMEM allocations only when ownership crosses a
+    // partition boundary. Same-partition allocations need no semaphore and
+    // keep their compact sourceful representation.
+    SmallVector<TMEMAllocOp> sourcefulTmemAllocs;
+    func.walk([&](TMEMAllocOp alloc) {
+      if (alloc.getSrc() && isUsedInMultiplePartitions(alloc))
+        sourcefulTmemAllocs.push_back(alloc);
+    });
+    for (TMEMAllocOp alloc : sourcefulTmemAllocs)
+      normalizeSourcefulTmemAlloc(alloc);
+
+    for (scf::ForOp loop : loops) {
+      // Communicate iter_args across partitions
+      loop.walk([&](scf::ForOp forOp) {
+        // Communicate tensor arguments in iter_args from producer partition in
+        // current iteration to consumer partition in previous iteration or
+        // initial value
+        for (auto arg : forOp.getRegionIterArgs()) {
+          if (isa<RankedTensorType, FloatType, IntegerType>(arg.getType())) {
+            auto producerPartition =
+                getPartitionOutputs(forOp)[arg.getArgNumber() - 1];
+            ProducedValueInfo producedValue{producerPartition, arg};
+            OpBuilder builder(forOp);
+            builder.setInsertionPointToStart(forOp.getBody());
+            insertSemaphores(builder, loop, forOp.getBody(), producedValue,
+                             options);
+          }
+        }
+      });
+
+      // To handle cases where desc_load result in registers is used as is in
+      // addition to being consumed by local_alloc op, we process
+      // local_alloc(desc_load()) first, followed by remaining register uses of
+      // desc_load results.
+      SmallVector<Operation *> memoryOps;
+      loop.walk([&](Operation *op) {
+        if (op->getNumResults() > 0 &&
+            (isDescLoadAndAlloc<LocalAllocOp>(op->getResult(0)) ||
+             isa<LocalAllocOp>(op))) {
+          memoryOps.push_back(op);
+        }
+      });
+
+      for (auto op : memoryOps) {
+        auto producedValues = getProducedValues(op, loop.getBody());
+        for (auto producedValue : producedValues) {
+          OpBuilder builder(op);
+          insertSemaphores(builder, loop, op->getBlock(), producedValue,
+                           options);
+        }
+      }
+
+      // handle non-tmem ops in the loop, including uses of desc_load results.
+      DenseSet<Operation *> preExistingOps;
+      loop.walk([&](Operation *op) { preExistingOps.insert(op); });
+      loop.walk([&](Operation *op) {
+        if (!preExistingOps.contains(op))
+          return WalkResult::advance();
+        if (op == loop || op->hasTrait<OpTrait::MemDescViewTrait>() ||
+            isa<MMAv5OpInterface, TMEMAllocOp, TMEMStoreOp>(op)) {
+          return WalkResult::advance();
+        }
+        auto producedValues = getProducedValues(op, loop.getBody());
+        for (auto producedValue : producedValues) {
+          OpBuilder builder(op);
+          builder.setInsertionPointAfter(op);
+          insertSemaphores(builder, loop, op->getBlock(), producedValue,
+                           options);
+        }
+        return WalkResult::advance();
+      });
+
+      OpBuilder builder(loop);
+      insertLoopResultSemaphores(builder, loop, options);
+    }
+  }
+
+  void runOnOperation() override {
+    InsertCommunicationOptions options;
+    options.createSemaphores = false;
+    getOperation().walk([&](triton::FuncOp func) {
+      runOnFunction(func, options);
+    });
+  }
+};
+
+} // namespace triton
+} // namespace mlir

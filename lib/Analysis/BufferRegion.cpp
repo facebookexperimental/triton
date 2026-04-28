@@ -35,22 +35,12 @@ uint64_t getAllocationOffset(ttng::TMEMAllocOp op) {
   return colOffset | (rowOffset << 16);
 }
 
-unsigned getMemDescSize(ttg::MemDescType ty) {
-  if (isa<ttng::TensorMemorySpaceAttr>(ty.getMemorySpace())) {
-    return ttng::getTmemAllocSizes(ty).numCols;
-  }
-  assert(isa<ttg::SharedMemorySpaceAttr>(ty.getMemorySpace()) &&
-         "Unsupported memory space");
-  unsigned elSize = ty.getElementType().getIntOrFloatBitWidth() / 8;
-  return product(ttg::getShapePerCTA(ty)) * elSize;
-}
-
 unsigned getAllocSize(ttg::LocalAllocOp op) {
-  return getMemDescSize(op.getType());
+  return mlir::triton::getMemDescSize(op.getType());
 }
 
 unsigned getAllocSize(ttng::TMEMAllocOp op) {
-  return getMemDescSize(op.getType());
+  return mlir::triton::getMemDescSize(op.getType());
 }
 
 unsigned getNumBuffers(ttg::MemDescIndexOp memdescIndexOp) {
@@ -187,6 +177,16 @@ std::optional<triton::BufferRegionAnalysis::RegionType> getRegionType(Value v) {
 } // namespace
 
 namespace mlir::triton {
+
+unsigned getMemDescSize(gpu::MemDescType ty) {
+  if (isa<nvidia_gpu::TensorMemorySpaceAttr>(ty.getMemorySpace())) {
+    return nvidia_gpu::getTmemAllocSizes(ty).numCols;
+  }
+  assert(isa<gpu::SharedMemorySpaceAttr>(ty.getMemorySpace()) &&
+         "Unsupported memory space");
+  unsigned elSize = ty.getElementType().getIntOrFloatBitWidth() / 8;
+  return product(gpu::getShapePerCTA(ty)) * elSize;
+}
 
 LogicalResult BufferRegionAnalysis::initialize(Operation *top) {
   // Mark all warp-specialize partitions as live.

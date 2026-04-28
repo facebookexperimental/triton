@@ -553,6 +553,7 @@ class nvidia_knobs(base_knobs):
 
     libdevice_path: env_opt_str = env_opt_str("TRITON_LIBDEVICE_PATH")
     libcuda_path: env_opt_str = env_opt_str("TRITON_LIBCUDA_PATH")
+    use_nvws_meta: env_bool = env_bool("TRITON_NVWS_USE_META")
     use_meta_ws: env_bool = env_bool("TRITON_USE_META_WS")
     # Number of buffers for the dynamic-persistent tile-id broadcast channel
     # (cross-partition run-once atomic support). 1 = single-stage.

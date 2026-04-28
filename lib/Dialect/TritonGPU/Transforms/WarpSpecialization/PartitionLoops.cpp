@@ -143,6 +143,16 @@ void mapRange(ValueRange fromRange, ValueRange toRange, IRMapping &mapping) {
 void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
                      const PartitionSet &partitions);
 
+bool isNestedInWarpSpecializedLoop(scf::ForOp forOp) {
+  for (Operation *parent = forOp->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    auto parentForOp = dyn_cast<scf::ForOp>(parent);
+    if (parentForOp && parentForOp->hasAttr(kWarpSpecializeAttrName))
+      return true;
+  }
+  return false;
+}
+
 void cloneForOp(scf::ForOp forOp, SmallVector<WarpGroupBuilder> &builders,
                 const PartitionSet &partitions) {
   auto forOpPartitions = getPartitionIds(forOp);
@@ -163,6 +173,14 @@ void cloneForOp(scf::ForOp forOp, SmallVector<WarpGroupBuilder> &builders,
     auto newForOp =
         scf::ForOp::create(b, forOp.getLoc(), lb, ub, step, initArgs);
     newForOp->setAttrs(forOp->getAttrs());
+    if (forOp->hasAttr(kScheduledMaxStageAttrName)) {
+      newForOp->setAttr(kScheduledMaxStageAttrName,
+                        b.getI32IntegerAttr(partition->getStage()));
+    }
+    if (forOp->hasAttr(kScheduledMaxStageAttrName) &&
+        isNestedInWarpSpecializedLoop(forOp)) {
+      newForOp->setAttr(kWarpSpecializeAttrName, b.getUnitAttr());
+    }
     if (forOp->hasAttr(kPartitionOutputsAttrName)) {
       newForOp->removeAttr(kPartitionOutputsAttrName);
     }
