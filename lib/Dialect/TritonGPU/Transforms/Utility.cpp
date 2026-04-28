@@ -1642,7 +1642,6 @@ std::optional<bool> getBoolFromConstant(Value cst) {
   return std::nullopt;
 }
 
-
 } // namespace mlir::triton
 
 namespace mlir {

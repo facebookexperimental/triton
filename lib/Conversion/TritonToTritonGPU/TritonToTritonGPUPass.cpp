@@ -3,6 +3,7 @@
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "third_party/tlx/dialect/include/IR/Dialect.h"
 #include "triton/Conversion/TritonToTritonGPU/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -11,7 +12,6 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
-#include "third_party/tlx/dialect/include/IR/Dialect.h"
 
 namespace mlir::triton {
 #define GEN_PASS_DEF_CONVERTTRITONTOTRITONGPU
@@ -540,10 +540,12 @@ public:
 };
 
 void populateTLXPatterns(TritonGPUTypeConverter &typeConverter,
-                        RewritePatternSet &patterns) {
+                         RewritePatternSet &patterns) {
   MLIRContext *context = patterns.getContext();
-  patterns.add<GenericOpPattern<triton::tlx::RequireLayoutOp>>(typeConverter, context);
-  patterns.add<GenericOpPattern<triton::tlx::ReleaseLayoutOp>>(typeConverter, context);
+  patterns.add<GenericOpPattern<triton::tlx::RequireLayoutOp>>(typeConverter,
+                                                               context);
+  patterns.add<GenericOpPattern<triton::tlx::ReleaseLayoutOp>>(typeConverter,
+                                                               context);
 }
 
 void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,

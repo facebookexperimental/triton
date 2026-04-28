@@ -753,7 +753,6 @@ struct TensorMemoryCopyOpConversion
     if (twoCTAs) {
       Value cluster0 = LLVM::NVIDIA::createLeadCTAPredicate(loc, rewriter);
       pred = TritonLLVMOpBuilder(loc, rewriter).and_(pred, cluster0);
-
     }
 
     if (failed(copySharedToTmem(rewriter, loc, typeConverter, op,
@@ -831,7 +830,6 @@ struct TMEMSubSliceOpConversion
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     auto dstTy = cast<MemDescType>(op.getResult().getType());
     uint32_t offset = getTMemSubSliceOffset(dstTy, op.getN());
-
 
     Value tmemBase = adaptor.getSrc();
     Value offsetVal = b.i32_val(offset);

@@ -1,6 +1,7 @@
-import triton.language.core as tl
-
 import re
+
+import triton.language.core as tl
+import triton.runtime.driver as driver
 
 
 def is_hip():
