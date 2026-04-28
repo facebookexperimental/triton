@@ -69,7 +69,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %43 = tt.addptr %24, %42 : tensor<128x!tt.ptr<f32>, #blocked2>, tensor<128xi32, #blocked2>
       %44 = tt.load %43 : tensor<128x!tt.ptr<f32>, #blocked2>
       // qkT MMA: operands from outside loop + pipelined descriptor_load
-      // CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32, tt.self_latency = 1 : i32}
+      // CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32, tt.self_latency = 0 : i32}
       %45 = ttng.tc_gen5_mma %19, %40, %result[%arg46], %false, %true : !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xbf16, #shared2, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       %46 = ttg.convert_layout %44 : tensor<128xf32, #blocked2> -> tensor<128xf32, #ttg.slice<{dim = 0, parent = #blocked}>>
       %47 = tt.expand_dims %46 {axis = 0 : i32} : tensor<128xf32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x128xf32, #blocked>
@@ -88,7 +88,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %56 = tt.load %55 : tensor<128x!tt.ptr<f32>, #blocked2>
       %57 = ttg.memdesc_trans %52 {order = array<i32: 1, 0>} : !ttg.memdesc<128x128xbf16, #shared, #smem> -> !ttg.memdesc<128x128xbf16, #shared2, #smem>
       // dpT MMA: operands from outside loop + pipelined descriptor_load
-      // CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32, tt.self_latency = 1 : i32}
+      // CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32, tt.self_latency = 0 : i32}
       %58 = ttng.tc_gen5_mma %21, %57, %result_3[%arg48], %false, %true : !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xbf16, #shared2, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       %59 = ttg.convert_layout %56 : tensor<128xf32, #blocked2> -> tensor<128xf32, #ttg.slice<{dim = 0, parent = #blocked}>>
       %60 = tt.expand_dims %59 {axis = 0 : i32} : tensor<128xf32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x128xf32, #blocked>
