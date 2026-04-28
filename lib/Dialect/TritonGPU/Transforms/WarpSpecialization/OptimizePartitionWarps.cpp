@@ -255,6 +255,27 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
     }
   } while (changed);
 
+  // Compute the warp budget from maxnreg if specified by the user.
+  // When maxnreg is set, the total warps across all partitions (including
+  // default) must not exceed nTotalRegs / maxnreg / threadsPerWarp.
+  // When maxnreg is not set, AllocateWarpGroups auto-derives it from the
+  // total warp count, so there is no hard budget to enforce.
+  ModuleOp mod = axisInfo.getModuleOp();
+  int32_t maxWarps = 0;
+  if (auto maxnregAttr =
+          mod->getAttrOfType<IntegerAttr>(AttrMaxRegistersName)) {
+    maxWarps = nTotalRegs / maxnregAttr.getInt() / threadsPerWarp;
+  }
+
+  // Helper to compute actual total warps including warp group padding.
+  // Non-default partitions are packed into warp groups of 4 warps each.
+  auto computeTotalWarps = [&]() -> int32_t {
+    int32_t extraWarps =
+        std::accumulate(partitionNumWarps.begin(), partitionNumWarps.end(), 0);
+    int32_t extraWarpGroups = llvm::divideCeil(extraWarps, 4);
+    return defaultNumWarps + extraWarpGroups * 4;
+  };
+
   // Read partition types if available for type-aware warp assignment.
   SmallVector<StringRef> partitionTypes;
   if (auto typesAttr =
@@ -271,8 +292,12 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
   // This ensures layouts are computed with the correct warp counts.
   //
   // For bwd FA (has reduction): computation partition gets 8 warps.
-  // With reduction=4 (TMEM floor), gemm=1, load=1, computation=8,
+  // The warp budget is nTotalRegs / maxnreg / threadsPerWarp (e.g., 16 warps
+  // with maxnreg=128 on Blackwell).
+  // With num_warps=4: reduction=4 (TMEM floor), gemm=1, load=1, computation=8,
   // total = 14, within the 16 warp budget.
+  // With num_warps=8: total = 18 (4 extra warps in default partition),
+  // exceeds the budget - the override is skipped.
   //
   // Note: the types array comes from the scheduler and may be longer than
   // partitionNumWarps (the WarpSpecializeOp may have fewer regions). We scan
@@ -288,11 +313,40 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
   }
 
   if (hasReduction && hasComputation && !partitionNumWarps.empty()) {
+    int32_t saved = partitionNumWarps.back();
     partitionNumWarps.back() = 8;
+    if (maxWarps > 0 && computeTotalWarps() > maxWarps)
+      partitionNumWarps.back() = saved;
   }
 
-  // Read the attribute from the module
-  ModuleOp mod = axisInfo.getModuleOp();
+  // Budget enforcement: if maxnreg is specified and total warps exceed the
+  // budget, shrink the largest partitions (respecting minimums).
+  //
+  // TODO: if shrinking alone is insufficient (all partitions at minimums but
+  // still over budget), try merging same-type partitions (e.g., two
+  // "computation" partitions into one). If that also fails, fall back to
+  // non-warp-specialized compilation.
+  if (maxWarps > 0) {
+    bool shrunk;
+    do {
+      shrunk = false;
+      if (computeTotalWarps() <= maxWarps)
+        break;
+      int32_t bestIdx = -1;
+      int32_t bestWarps = 0;
+      for (int32_t i = 0; i < (int32_t)partitionNumWarps.size(); ++i) {
+        if (partitionNumWarps[i] > minWarpsForPartition[i] &&
+            partitionNumWarps[i] > bestWarps) {
+          bestWarps = partitionNumWarps[i];
+          bestIdx = i;
+        }
+      }
+      if (bestIdx >= 0) {
+        partitionNumWarps[bestIdx] /= 2;
+        shrunk = true;
+      }
+    } while (shrunk);
+  }
   int minRegAutoWS = 24; // default value
   if (auto attr = mod->getAttrOfType<IntegerAttr>(AttrMinRegAutoWSName)) {
     minRegAutoWS = attr.getInt();
