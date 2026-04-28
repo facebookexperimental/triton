@@ -20,23 +20,23 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
 // CHECK-LABEL: @hopper_fa_forward_3_partitions
 //
 // --- memdesc_trans must be cloned: one copy per computation partition ---
-// CHECK: ttg.memdesc_trans {{.*}} ttg.partition = array<i32: 1>
+// CHECK: ttg.memdesc_trans {{.*}} ttg.partition = array<i32: 0>
 // CHECK: ttg.memdesc_trans {{.*}} ttg.partition = array<i32: 2>
 //
-// --- Partition types: load + two computation partitions ---
+// --- Partition types: computation (promoted to default) + load + computation ---
 // CHECK: tt.warp_specialize
 // CHECK-SAME: ttg.partition.types =
-// CHECK-SAME: "load"
 // CHECK-SAME: "computation"
+// CHECK-SAME: "load"
 // CHECK-SAME: "computation"
 //
 // --- Post-loop epilogue: each data partition's ops must stay in its own
-//     computation partition (dp0 → partition 2, dp1 → partition 1).
+//     computation partition (dp0 → partition 2, dp1 → partition 0).
 //     Verifies the dpId backward walk assigns the correct partition to
 //     post-loop consumers of yield values not in MMA backward slices
 //     (e.g. l_i sum accumulation).
 // CHECK: tt.expand_dims {{.*}}#1 {{.*}} ttg.partition = array<i32: 2>
-// CHECK: tt.expand_dims {{.*}}#4 {{.*}} ttg.partition = array<i32: 1>
+// CHECK: tt.expand_dims {{.*}}#4 {{.*}} ttg.partition = array<i32: 0>
 
 tt.func public @hopper_fa_forward_3_partitions(
   %Q: !tt.ptr<f16> {tt.divisibility = 16 : i32},

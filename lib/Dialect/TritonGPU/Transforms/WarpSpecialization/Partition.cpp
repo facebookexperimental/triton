@@ -1,5 +1,6 @@
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -146,6 +147,40 @@ Partition *PartitionSet::getPartition(Operation *op) {
   auto id = getPartitionIds(op);
   assert(id.size() == 1);
   return getPartition(id[0]);
+}
+
+void PartitionSet::swapPartitions(unsigned idxA, unsigned idxB,
+                                  scf::ForOp loop) {
+  if (idxA == idxB)
+    return;
+
+  // Swap the partition objects in the vector.
+  std::swap(partitions[idxA], partitions[idxB]);
+
+  // Update the internal indices to match their new positions.
+  partitions[idxA]->setIndex(idxA);
+  partitions[idxB]->setIndex(idxB);
+
+  // Walk all ops in the loop and update their partition annotations.
+  Builder b(loop->getContext());
+  auto remapIds = [&](DenseI32ArrayAttr attr) -> DenseI32ArrayAttr {
+    SmallVector<int32_t> ids(attr.asArrayRef());
+    for (int32_t &id : ids) {
+      if (id == static_cast<int32_t>(idxA))
+        id = static_cast<int32_t>(idxB);
+      else if (id == static_cast<int32_t>(idxB))
+        id = static_cast<int32_t>(idxA);
+    }
+    llvm::sort(ids);
+    return b.getDenseI32ArrayAttr(ids);
+  };
+
+  // Walk the containing function to update annotations both inside and
+  // outside the loop (post-loop ops also carry partition annotations).
+  loop->getParentOfType<FuncOp>().walk([&](Operation *op) {
+    if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName))
+      op->setAttr(kPartitionAttrName, remapIds(attr));
+  });
 }
 
 FailureOr<PartitionSet> PartitionSet::fromLoop(scf::ForOp loop) {
