@@ -109,3 +109,7 @@ python/triton/compile_iq
 
 # plugins
 python/triton/plugins/
+
+# v4 per-edge-sema-plan verification logs — user-only review artifacts,
+# not source of truth.
+logs/per-edge-plan/

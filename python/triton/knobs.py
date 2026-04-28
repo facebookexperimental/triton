@@ -553,6 +553,7 @@ class nvidia_knobs(base_knobs):
 
     libdevice_path: env_opt_str = env_opt_str("TRITON_LIBDEVICE_PATH")
     libcuda_path: env_opt_str = env_opt_str("TRITON_LIBCUDA_PATH")
+    use_nvws_meta: env_bool = env_bool("TRITON_NVWS_USE_META")
     use_meta_ws: env_bool = env_bool("TRITON_USE_META_WS")
     use_modulo_schedule: env_opt_str = env_opt_str("TRITON_USE_MODULO_SCHEDULE")
     use_llm_schedule: env_bool = env_bool("TRITON_USE_LLM_SCHEDULE")

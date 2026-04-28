@@ -117,10 +117,13 @@ public:
     auto cgaLayout = triton::gpu::getCGALayout(srcLayout);
     // TMem encoding for A operand is the same as for D (Acc), but packed for
     // bitwidth=16
-    unsigned elemBitWidth =
-        lhs.getType().getElementType().getIntOrFloatBitWidth();
-    // We don't currently support fp8 (not sure if we can)
-    if (elemBitWidth != 16 && elemBitWidth != 32) {
+    Type elemType = lhs.getType().getElementType();
+    unsigned elemBitWidth = elemType.getIntOrFloatBitWidth();
+    bool isFP8 = llvm::isa<Float8E5M2Type, Float8E4M3FNType,
+                           Float8E5M2FNUZType, Float8E4M3FNUZType>(elemType);
+    if (elemBitWidth != 16 && elemBitWidth != 32 &&
+        (!isFP8 ||
+         !triton::tools::getBoolEnv("TRITON_FP8_PROMOTE_TO_TMEM"))) {
       return failure();
     }
     const unsigned colStride = 1;

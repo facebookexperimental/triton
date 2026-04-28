@@ -161,6 +161,13 @@ private:
   static void verifyOpIsSupported(Operation *op);
 };
 
+namespace gpu { class MemDescType; }
+
+// Layout-correct size of a `MemDescType` in its native memory-space unit:
+//   - SharedMemorySpace: bytes (product(shape) * elementBitWidth / 8)
+//   - TensorMemorySpace: columns (from the tensor_memory_encoding layout)
+unsigned getMemDescSize(gpu::MemDescType ty);
+
 } // namespace mlir::triton
 
 #endif // TRITON_ANALYSIS_BUFFER_REGION_H

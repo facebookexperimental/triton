@@ -8,6 +8,7 @@
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"
 #include "passes.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 #include "llvm/IR/Constants.h"
@@ -193,13 +194,22 @@ void init_triton_nvidia_passes_ttnvgpuir(py::module &&m) {
 }
 
 void init_triton_nvidia_passes_nvws(py::module &&m) {
+  ADD_PASS_OPTION_WRAPPER_1("add_data_partitioning",
+                            mlir::triton::createNVWSWSDataPartition, int32_t);
   ADD_PASS_WRAPPER_0("add_lower_warp_group",
                      mlir::triton::createNVWSLowerWarpGroup);
-  ADD_PASS_WRAPPER_0("add_lower_aref", mlir::triton::createNVWSLowerAref);
   ADD_PASS_WRAPPER_0("add_assign_stage_phase",
                      mlir::triton::createNVWSAssignStagePhase);
-  ADD_PASS_WRAPPER_0("add_insert_tmem_aref",
-                     mlir::triton::createNVWSInsertTmemAref);
+  ADD_PASS_WRAPPER_0("add_lower_semaphore",
+                     mlir::triton::createNVWSLowerSemaphore);
+  ADD_PASS_WRAPPER_0("add_insert_semaphore",
+                     mlir::triton::createNVWSInsertSemaphore);
+  ADD_PASS_WRAPPER_0("add_insert_tmem_semaphore",
+                     mlir::triton::createNVWSInsertTmemSemaphore);
+  m.def("add_strip_partition_attrs_outside_ws", [](mlir::PassManager &pm) {
+    pm.nest<mlir::triton::FuncOp>().addPass(
+        mlir::triton::createNVWSStripPartitionAttrsOutsideWS());
+  });
 }
 
 void init_triton_hopper_passes(py::module &&m) {

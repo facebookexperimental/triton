@@ -1,10 +1,10 @@
+#include "PartitionAttrs.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "third_party/nvidia/include/Dialect/NVWS/Transforms/Passes.h"
-#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
@@ -13,7 +13,6 @@
 using namespace mlir;
 using namespace triton;
 using namespace triton::gpu;
-namespace tlx = mlir::triton::tlx;
 
 //===----------------------------------------------------------------------===//
 // Pass Definition
@@ -25,17 +24,30 @@ namespace mlir::triton::gpu {
 } // namespace mlir::triton::gpu
 
 namespace {
+struct VerifyWarpSpecializationPartitions
+    : PassWrapper<VerifyWarpSpecializationPartitions, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+      VerifyWarpSpecializationPartitions)
+
+  void runOnOperation() override {
+    WalkResult result = getOperation().walk([&](scf::ForOp loop) {
+      if (!loop->hasAttr(kPartitionStagesAttrName))
+        return WalkResult::advance();
+      if (failed(verifyPartitionedLoop(loop))) {
+        signalPassFailure();
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    (void)result;
+  }
+};
+
 struct AutomaticWarpSpecialization
     : triton::gpu::impl::TritonGPUAutomaticWarpSpecializationBase<
           AutomaticWarpSpecialization> {
   using TritonGPUAutomaticWarpSpecializationBase::
       TritonGPUAutomaticWarpSpecializationBase;
-
-  bool shouldBail(ModuleOp &mod) const {
-    auto hasManualWarpSpec =
-        mod->getAttrOfType<BoolAttr>(tlx::AttrHasWarpSpecOpsName);
-    return hasManualWarpSpec != nullptr && hasManualWarpSpec.getValue() == true;
-  }
 
   void runOnOperation() override;
 };
@@ -65,53 +77,61 @@ void multiBufferTMADescriptors(ModuleOp mod, int numStages) {
   }
 }
 
+void clearInternalWarpSpecializationAttrs(ModuleOp mod) {
+  mod.walk([](Operation *op) {
+    op->removeAttr(kPartitionAttrName);
+    op->removeAttr(kPartitionOutputsAttrName);
+    op->removeAttr(kPartitionStagesAttrName);
+    op->removeAttr(kWarpSpecializeTagAttrName);
+  });
+}
+
+std::unique_ptr<Pass> createVerifyWarpSpecializationPartitionsPass() {
+  return std::make_unique<VerifyWarpSpecializationPartitions>();
+}
+
 } // namespace
 
 void AutomaticWarpSpecialization::runOnOperation() {
-  ModuleOp m = getOperation();
-  if (shouldBail(m))
-    return;
   OpPassManager pm;
-  pm.addPass(createTritonGPUPartitionScheduling());
-  pm.addPass(createNVWSHoistTmemStore());
-  pm.addPass(createNVWSInsertAref());
-  // TODO(triton-reactor): InsertTmemAref fails with Meta's partition layout
-  // (getInitialSchedule + schedulePostLoopOps). Keep disabled until partition
-  // scheduling is aligned with upstream. LoadMMASpecialization is retained
-  // locally as the fallback.
-#if 0
-  pm.addPass(createNVWSInsertTmemAref());
-#else
-  pm.addPass(createTritonGPULoadMMASpecialization({numStages}));
-#endif
-  // `int-range-optimizations` and SCCP are good at cleaning up loop arithmetic.
-  // FIXME: Re-enable integer range analysis once it is fixed.
-  // pm.addPass(arith::createIntRangeOptimizationsPass());
-  pm.addPass(createSCCPPass());
-  pm.addPass(createCSEPass());
-  pm.addPass(createNVWSLowerAref({numStages}));
+  auto addPassWithPartitionVerifier = [&](std::unique_ptr<Pass> pass) {
+    pm.addPass(std::move(pass));
+    pm.addPass(createVerifyWarpSpecializationPartitionsPass());
+  };
+
+  if (useMetaPartitioner) {
+    NVWSPartitionSchedulingMetaOptions options;
+    pm.nest<FuncOp>().addPass(createNVWSPartitionSchedulingMeta(options));
+    pm.nest<FuncOp>().addPass(createNVWSStripPartitionAttrsOutsideWS());
+    pm.addPass(createVerifyWarpSpecializationPartitionsPass());
+  } else {
+    addPassWithPartitionVerifier(createTritonGPUPartitionScheduling());
+  }
+
+  addPassWithPartitionVerifier(createNVWSHoistTmemStore());
+  addPassWithPartitionVerifier(createNVWSInsertAllocas());
+  if (useMetaPartitioner) {
+    NVWSMemoryPlannerOptions memoryPlannerOptions;
+    memoryPlannerOptions.numBuffers = numStages;
+    memoryPlannerOptions.smemBudget = smemBudget;
+    addPassWithPartitionVerifier(createNVWSMemoryPlanner(memoryPlannerOptions));
+  }
+  NVWSInsertSemasOptions insertSemasOptions;
+  insertSemasOptions.useMetaPartitioner = useMetaPartitioner;
+  insertSemasOptions.numStages = numStages;
+  addPassWithPartitionVerifier(createNVWSInsertSemas(insertSemasOptions));
+  addPassWithPartitionVerifier(createNVWSLowerSemaphore({numStages}));
+  TritonGPUScheduleLoopsOptions scheduleLoopsOptions;
   pm.addPass(createTritonGPUPartitionLoops());
   pm.addPass(createNVWSLowerWarpGroup());
-  pm.addPass(createTritonGPUScheduleLoops());
-  if (failed(runPipeline(pm, getOperation())))
-    return signalPassFailure();
-
-  // Cleanup code generated by warp specialization.
-  RewritePatternSet patterns(&getContext());
-  populateForOpDeadArgumentElimination(patterns);
-  scf::ForOp::getCanonicalizationPatterns(patterns, &getContext());
-  scf::IfOp::getCanonicalizationPatterns(patterns, &getContext());
-  WarpSpecializeOp::getCanonicalizationPatterns(patterns, &getContext());
-  if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
-    return signalPassFailure();
-
-  pm.clear();
-  pm.addPass(createTritonGPUOptimizePartitionWarps());
-  pm.addPass(createTritonGPUScheduleLoops());
+  scheduleLoopsOptions.numStages = numStages;
+  scheduleLoopsOptions.useMetaWS = useMetaPartitioner;
+  pm.addPass(createTritonGPUScheduleLoops(scheduleLoopsOptions));
   if (failed(runPipeline(pm, getOperation())))
     return signalPassFailure();
 
   // Multi-buffer TMA descriptors. We cannot rely on SWP to do it, to support
   // desc updates in nested loops.
   multiBufferTMADescriptors(getOperation(), numStages);
+  clearInternalWarpSpecializationAttrs(getOperation());
 }

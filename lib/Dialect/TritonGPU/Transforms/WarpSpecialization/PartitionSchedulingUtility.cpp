@@ -39,13 +39,12 @@ Flags getNodeFlags(Node *node) {
   if (node->isOp()) {
     auto op = node->getOp();
 
-    // if it is manually tagged with a node type
     if (op->hasAttr("store"))
       return Flags::STORE;
 
     if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op))
       return Flags::LOAD;
-    if (isa<tt::DescriptorStoreOp, tt::DescriptorScatterOp>(op))
+    if (isa<tt::DescriptorStoreLikeOpInterface>(op))
       return Flags::STORE;
     if (isa<ttng::MMAv5OpInterface>(op) || op->hasAttr("mma"))
       return Flags::MMA;
@@ -60,18 +59,17 @@ Flags getNodeFlags(Node *node) {
 }
 
 size_t computeCost(Operation *op) {
-  if (auto mma = dyn_cast<nvidia_gpu::TCGen5MMAOp>(op)) {
+  if (auto mma = dyn_cast<nvidia_gpu::MMAv5OpInterface>(op)) {
     auto a = mma.getA();
     auto b = mma.getB();
-    auto a_shape = a.getType().getShape();
-    auto b_shape = b.getType().getShape();
-    assert(a_shape.size() == 2);
-    assert(b_shape.size() == 2);
-    auto M = a_shape[0];
-    auto N = b_shape[0];
-    auto K = a_shape[1];
-    auto cycles = M * N * K / 8192;
-    return cycles;
+    auto aShape = a.getType().getShape();
+    auto bShape = b.getType().getShape();
+    assert(aShape.size() == 2);
+    assert(bShape.size() == 2);
+    auto m = aShape[0];
+    auto n = bShape[0];
+    auto k = aShape[1];
+    return m * n * k / 8192;
   }
 
   if (isa<math::Exp2Op, ElementwiseInlineAsmOp>(op)) {
@@ -87,21 +85,18 @@ size_t computeCost(Operation *op) {
 }
 
 void Partition::add(Node *node) {
-  auto node_flags = getNodeFlags(node);
+  auto nodeFlags = getNodeFlags(node);
 
-  // Note: only set view flag for partition,
-  // if it consists of all view ops
-  // FIXME: have a set kinds of flag to make this generic?
-  bool all_view = true;
+  bool allView = true;
   if (!nodes.empty() && !(flags & Flags::VIEW))
-    all_view = false;
-  if (!(node_flags & Flags::VIEW))
-    all_view = false;
+    allView = false;
+  if (!(nodeFlags & Flags::VIEW))
+    allView = false;
 
   nodes.insert(node);
 
-  flags |= node_flags;
-  if (!all_view)
+  flags |= nodeFlags;
+  if (!allView)
     flags = static_cast<Flags>(flags & ~Flags::VIEW);
 
   if (node->hasCost())
@@ -110,22 +105,16 @@ void Partition::add(Node *node) {
 
 void Partition::merge(Partition *lhs, Partition *rhs) {
   assert(lhs != rhs);
-
-  // Should never be merging MANUAL partitions
   assert(!((lhs->getFlags() & Flags::MANUAL) &&
            (rhs->getFlags() & Flags::MANUAL)));
 
-  // Always keep the MANUAL partition,
-  // and prefer emptying the NONE partition
   if (lhs->getFlags() & Flags::MANUAL || rhs->getFlags() == Flags::NONE)
     std::swap(lhs, rhs);
 
   auto nodes = lhs->getNodes();
-  for (auto node : nodes) {
+  for (auto node : nodes)
     node->setPartition(rhs);
-  }
 
-  // remove the now empty partition
   lhs->graph->erasePartition(lhs);
 }
 
@@ -149,8 +138,6 @@ bool Edge::crossesPartitions() const {
     return false;
   if (!from.getNode()->hasPartition() || !to.getNode()->hasPartition())
     return false;
-  // FIXME: only considers edges between nodes assigned to single partitions
-  // as crossing a boundary
   if (from.getNode()->getPartitions().size() != 1 ||
       to.getNode()->getPartitions().size() != 1)
     return false;
@@ -186,19 +173,17 @@ size_t Edge::getSize() const {
 
 void visualize(std::string key, std::string filename, std::string title,
                Graph *graph, VisualizationInfo &info) {
-
   if (!tools::getBoolEnv("TRITON_PARTITION_SCHEDULING_ENABLE_DUMP_DOT"))
     return;
 
-  const auto dump_data_only =
+  const auto dumpDataOnly =
       tools::getBoolEnv("TRITON_PARTITION_SCHEDULING_DUMP_DATA_ONLY");
-  const auto dump_loop_only =
+  const auto dumpLoopOnly =
       tools::getBoolEnv("TRITON_PARTITION_SCHEDULING_DUMP_LOOP_ONLY");
 
   static std::map<std::string, int> keys;
-  if (keys.find(key) == keys.end()) {
+  if (keys.find(key) == keys.end())
     keys[key] = 0;
-  }
   auto idx = keys[key];
   keys[key]++;
 
@@ -215,7 +200,7 @@ void visualize(std::string key, std::string filename, std::string title,
   dot << "labelloc=\"t\";\n";
   dot << "labeljust=\"c\";\n";
 
-  DenseMap<Node *, size_t> node_ids;
+  DenseMap<Node *, size_t> nodeIds;
 
   auto getPartitionId = [&](Partition *partition) {
     if (info.partition_ids.count(partition) == 0)
@@ -233,25 +218,21 @@ void visualize(std::string key, std::string filename, std::string title,
     return info.partition_colors[partition];
   };
 
-  // add nodes
   std::function<void(Node *)> visitNodes = [&](Node *graph) {
-    for (auto &node_obj : graph->getNodes()) {
-      auto node = node_obj.get();
+    for (auto &nodeObj : graph->getNodes()) {
+      auto node = nodeObj.get();
 
-      if (dump_data_only && !node->isData() && !node->containsData())
-        // skip if dumping data nodes only, and this op is non-data or doesn't
-        // contain a data node
+      if (dumpDataOnly && !node->isData() && !node->containsData())
         continue;
-      if (dump_loop_only && !node->inLoopBody() && !node->containsLoopBody())
-        // skip if dumping loop body nodes only
+      if (dumpLoopOnly && !node->inLoopBody() && !node->containsLoopBody())
         continue;
 
-      node_ids[node] = node_ids.size();
+      nodeIds[node] = nodeIds.size();
 
       if (!node->getNodes().empty())
-        dot << "subgraph cluster_cx" << node_ids[node] << " {\n"
+        dot << "subgraph cluster_cx" << nodeIds[node] << " {\n"
             << "label=\"\"\n";
-      dot << "x" << node_ids[node] << "[shape=plaintext, ";
+      dot << "x" << nodeIds[node] << "[shape=plaintext, ";
       if (node->isData())
         dot << "color=blue, ";
       dot << "label=<";
@@ -307,24 +288,23 @@ void visualize(std::string key, std::string filename, std::string title,
   };
   visitNodes(graph->getRoot());
 
-  // add edges
   std::function<void(Node *)> visitEdges = [&](Node *node) {
     size_t idx = 0;
     for (auto inputPorts : node->getOutputs()) {
       OutputPort outputPort{node, idx};
       for (auto inputPort : inputPorts) {
         Edge edge(outputPort, inputPort);
-        if (node_ids.count(outputPort.getNode()) == 0 ||
-            node_ids.count(inputPort.getNode()) == 0)
+        if (nodeIds.count(outputPort.getNode()) == 0 ||
+            nodeIds.count(inputPort.getNode()) == 0)
           continue;
-        dot << "x" << node_ids[outputPort.getNode()];
+        dot << "x" << nodeIds[outputPort.getNode()];
         dot << ":";
         if (outputPort.getNode()->getNumOutputs() == 1)
           dot << "inout";
         else
           dot << "out" << outputPort.getIdx();
         dot << " -> ";
-        dot << "x" << node_ids[inputPort.getNode()];
+        dot << "x" << nodeIds[inputPort.getNode()];
         dot << ":";
         if (inputPort.getNode()->getNumInputs() == 1)
           dot << "inout";
@@ -334,23 +314,20 @@ void visualize(std::string key, std::string filename, std::string title,
         if (edge.isDataValue()) {
           if (edge.getFromNode()->getPartitions().size() > 1 ||
               edge.getToNode()->getPartitions().size() > 1)
-            // invalid edge, should only have one partition
             attrs.push_back("color=\"green\"");
           else if (edge.crossesPartitions())
             attrs.push_back("color=\"red\"");
           else
             attrs.push_back("color=\"blue\"");
           auto size = edge.getSize();
-          if (size != 1) {
+          if (size != 1)
             attrs.push_back("label=\"" + std::to_string(size) + "\"");
-          }
         }
         if (!attrs.empty()) {
           dot << "[";
           for (auto attr = attrs.begin(); attr != attrs.end(); attr++) {
-            if (attr != attrs.begin()) {
+            if (attr != attrs.begin())
               dot << ",";
-            }
             dot << *attr;
           }
           dot << "]";

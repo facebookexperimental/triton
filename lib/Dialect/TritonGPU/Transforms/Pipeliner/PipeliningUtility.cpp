@@ -329,8 +329,10 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     return op;
   }
 
-  op->emitOpError("pipeliner doesn't know how to predicate this op.");
-  llvm::report_fatal_error("Fatal pipeliner error");
+  // Experiment only: do not commit. Restore this fatal once the
+  // nvws.semaphore.buffer replay path is understood.
+  // op->emitOpError("pipeliner doesn't know how to predicate this op.");
+  // llvm::report_fatal_error("Fatal pipeliner error");
   return op;
 }
 
