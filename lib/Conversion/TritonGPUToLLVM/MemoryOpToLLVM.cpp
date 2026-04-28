@@ -125,6 +125,7 @@ SmallVector<Value> lowerLocalScGt(Location loc, MLIRContext *ctx,
   return results;
 }
 
+
 LogicalResult lowerLocalStore(Location loc, MLIRContext *ctx, Value regVal,
                               MemDescType memDescTy, SharedMemoryObject smemObj,
                               ArrayRef<Value> inVals,
@@ -581,6 +582,7 @@ public:
 private:
   const TargetInfoBase &targetInfo;
 };
+
 
 class LocalBarrierOpConversion
     : public ConvertOpToLLVMPattern<triton::gpu::LocalBarrierOp> {
