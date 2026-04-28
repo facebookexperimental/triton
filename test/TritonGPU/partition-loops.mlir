@@ -418,6 +418,64 @@ tt.func @if_stmt_split(%arg1: !ty, %ub: i32, %lb: i32, %step: i32) {
   tt.return
 }
 
+// CHECK-LABEL: @partition_stage_sets_loop_scheduled_max_stage
+tt.func @partition_stage_sets_loop_scheduled_max_stage(%lb: i32, %ub: i32, %step: i32) {
+  // CHECK: nvws.warp_group
+  // CHECK: partition0
+  // CHECK-NEXT: scf.for
+  // CHECK-NEXT: "op_p0"
+  // CHECK-NEXT: } {tt.scheduled_max_stage = 0 : i32
+  // CHECK: partition1
+  // CHECK-NEXT: scf.for
+  // CHECK-NEXT: "op_p1"
+  // CHECK-NEXT: } {tt.scheduled_max_stage = 1 : i32
+  // CHECK: partition2
+  // CHECK-NEXT: scf.for
+  // CHECK-NEXT: "op_p2"
+  // CHECK-NEXT: } {tt.scheduled_max_stage = 0 : i32
+  scf.for %i = %lb to %ub step %step : i32 {
+    "op_p0"(%i) {ttg.partition = array<i32: 0>} : (i32) -> ()
+    "op_p1"(%i) {ttg.partition = array<i32: 1>} : (i32) -> ()
+    "op_p2"(%i) {ttg.partition = array<i32: 2>} : (i32) -> ()
+  } {tt.scheduled_max_stage = 1 : i32, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32, ttg.partition = array<i32: 0, 1, 2>}
+  tt.return
+}
+
+// CHECK-LABEL: @scheduled_inner_loop_gets_warp_specialize
+tt.func @scheduled_inner_loop_gets_warp_specialize(%lb: i32, %ub: i32, %step: i32) {
+  // CHECK-NEXT: [[C0:%.*]] = arith.constant 0
+  %c0_i32 = arith.constant 0 : i32
+  // CHECK-NEXT: [[WG:%.*]] = nvws.warp_group
+  // CHECK-NEXT: partition0
+  // CHECK-NEXT: [[OUTER:%.*]] = scf.for [[I:%arg[0-9]+]] = {{.*}} iter_args([[ARG:%.*]] = [[C0]]) -> (i32) : i32 {
+  // CHECK-NEXT:   [[INNER:%.*]] = scf.for [[J:%arg[0-9]+]] = {{.*}} iter_args([[INNER_ARG:%.*]] = [[ARG]]) -> (i32) : i32 {
+  // CHECK-NEXT:     [[NEXT:%.*]] = "op_inner"([[INNER_ARG]])
+  // CHECK-SAME: loop.cluster = 1 : i32
+  // CHECK-SAME: loop.stage = 1 : i32
+  // CHECK-NEXT:     scf.yield [[NEXT]] : i32
+  // CHECK-NEXT:   } {tt.scheduled_max_stage = 0 : i32, tt.warp_specialize}
+  // CHECK-NEXT:   scf.yield [[INNER]] : i32
+  // CHECK-NEXT: }
+  // CHECK-SAME: tt.warp_specialize
+  // CHECK-NEXT: nvws.warp_group.yield [[OUTER]] : i32
+  // CHECK: partition1
+  // CHECK-NEXT: scf.for
+  // CHECK-NEXT:   "op_outer"
+  // CHECK-NEXT: }
+  // CHECK-NEXT: nvws.warp_group.return
+  // CHECK: "use_result"([[WG]])
+  %out = scf.for %i = %lb to %ub step %step iter_args(%arg = %c0_i32) -> i32 : i32 {
+    %inner = scf.for %j = %lb to %ub step %step iter_args(%inner_arg = %arg) -> i32 : i32 {
+      %next = "op_inner"(%inner_arg) {loop.cluster = 1 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 0>} : (i32) -> i32
+      scf.yield {ttg.partition = array<i32: 0>} %next : i32
+    } {tt.scheduled_max_stage = 1 : i32, ttg.partition = array<i32: 0>, ttg.partition.outputs = [array<i32: 0>]}
+    "op_outer"(%i) {ttg.partition = array<i32: 1>} : (i32) -> ()
+    scf.yield {ttg.partition = array<i32: 0, 1>} %inner : i32
+  } {tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32], ttg.warp_specialize.tag = 0 : i32, ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 0>]}
+  "use_result"(%out) : (i32) -> ()
+  tt.return
+}
+
 }
 
 // -----

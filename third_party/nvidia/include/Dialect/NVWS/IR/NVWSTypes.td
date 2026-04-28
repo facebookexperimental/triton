@@ -31,21 +31,6 @@ class NVWS_TypeDef<string name, string _mnemonic, list<Trait> traits = []>
     let mnemonic = _mnemonic;
 }
 
-def NVWS_ArefType : NVWS_TypeDef<"Aref", "aref"> {
-  let summary = "Asynchronous Reference";
-  let description = [{
-        A meta-type that holds an asynchronous reference to an underlying Type.
-
-        Can wrap multiple underlying values simultaneously.
-
-        Useful for syncing asynchronous operations while doing transformations such
-        as pipelining and warp specialization. Lowers to the underlying type, and
-        operations that use this should insert appropriate barriers during lowering.
-    }];
-  let parameters = (ins "TypeArrayAttr":$baseType);
-  let assemblyFormat = "`<` $baseType `>`";
-}
-
 def NVWS_SemaphoreType : NVWS_TypeDef<"Semaphore", "semaphore"> {
   let summary = "Semaphore with embedded buffer type";
   let description = [{

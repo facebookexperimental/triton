@@ -222,7 +222,7 @@ configs = [
         num_stages=s,
         num_warps=w,
         pre_hook=_host_descriptor_pre_hook,
-    ) for BM in [128] for BN in [128] for s in NUM_STAGES_OPTIONS for w in [4]
+    ) for BM in [256] for BN in [128] for s in NUM_STAGES_OPTIONS for w in [4]
 ]
 
 
@@ -1606,7 +1606,7 @@ except BaseException:
     HAS_FLASH = False
 
 TORCH_HAS_FP8 = False
-BATCH, N_HEADS = 2, 4  # 8
+BATCH, N_HEADS = 4, 32
 # vary seq length for fixed head and batch=4
 configs = []
 for HEAD_DIM in [128]:  # 64, 128]:
@@ -1615,10 +1615,10 @@ for HEAD_DIM in [128]:  # 64, 128]:
             configs.append(
                 triton.testing.Benchmark(
                     x_names=["N_CTX"],
-                    x_vals=[2**i for i in range(11, 12)],  # 0, 15)],
+                    x_vals=[2**i for i in range(10, 17)],
                     line_arg="provider",
-                    line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
-                    line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),
+                    line_vals=["triton-fp16"] + (["triton-fp8"] if is_blackwell() else []),
+                    line_names=["Triton [FP16]"] + (["Triton [FP8]"] if is_blackwell() else []),
                     styles=[("red", "-"), ("blue", "-"), ("green", "-")],
                     ylabel="TFLOPS",
                     plot_name=f"fused-attention-{baseVariant}-{mode}-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}",
@@ -1634,7 +1634,8 @@ for HEAD_DIM in [128]:  # 64, 128]:
 
 @triton.testing.perf_report(configs)
 def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, baseVariant, provider, device=DEVICE):
-    assert mode in ["fwd"]  # , "bwd"]
+    assert mode in ["fwd", "bwd"]
+    print(f"BATCH: {BATCH}, H: {H}, N_CTX: {N_CTX}, HEAD_DIM: {HEAD_DIM}, mode: {mode}, provider: {provider}")
     dtype = torch.float16
     if "triton" in provider:
         q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
@@ -1679,6 +1680,19 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, baseVariant, provider
 
 if __name__ == "__main__":
     if is_hopper() or is_blackwell():
+        if is_blackwell():
+            import sys
+
+            print("Test op fp16...")
+            sys.stdout.flush()
+            test_op(Z=8, H=16, N_CTX=1024, HEAD_DIM=128, causal=False, mode="fwd",
+                    baseVariant="ws_persistent", provider="triton-fp16", SUBTILING=True, VECT_MUL=1,
+                    FADD2_REDUCE=False, bwd_config_idx=0)
+            print("Test op fp8...")
+            sys.stdout.flush()
+            test_op(Z=8, H=16, N_CTX=1024, HEAD_DIM=128, causal=False, mode="fwd",
+                    baseVariant="ws_persistent", provider="triton-fp8", SUBTILING=True, VECT_MUL=1,
+                    FADD2_REDUCE=False, bwd_config_idx=0)
         print("Running benchmarks...")
         bench_flash_attention.run(print_data=True)
     else:

@@ -29,6 +29,7 @@
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/LLVM.h"
@@ -649,6 +650,209 @@ LogicalResult verifyLoweringPreconditions(ModuleOp module) {
   return result;
 }
 
+// Finish the buffer reuse plan after semaphore users have been lowered.
+static constexpr StringLiteral kBufferIdAttrName = "buffer.id";
+static constexpr StringLiteral kBufferCopyAttrName = "buffer.copy";
+static constexpr StringLiteral kBufferOffsetAttrName = "buffer.offset";
+
+std::optional<int64_t> getIntegerAttr(Operation *op, StringRef name) {
+  if (auto attr = op->getAttrOfType<IntegerAttr>(name))
+    return attr.getInt();
+  return std::nullopt;
+}
+
+int64_t getIntegerAttrOr(Operation *op, StringRef name, int64_t defaultValue) {
+  return getIntegerAttr(op, name).value_or(defaultValue);
+}
+
+bool isEligibleBufferReuseAlloc(TMEMAllocOp allocOp) {
+  if (!getIntegerAttr(allocOp, kBufferIdAttrName))
+    return false;
+  if (allocOp.getSrc())
+    return false;
+  if (auto token = allocOp.getToken(); token && !token.use_empty())
+    return false;
+
+  auto type = allocOp.getResult().getType();
+  if (type.getRank() < 2)
+    return false;
+  if (!isa<TensorMemorySpaceAttr>(type.getMemorySpace()))
+    return false;
+  if (!isa<TensorMemoryEncodingAttr>(type.getEncoding()))
+    return false;
+
+  return true;
+}
+
+bool hasSameBufferReuseKey(TMEMAllocOp lhs, TMEMAllocOp rhs) {
+  return getIntegerAttr(lhs, kBufferIdAttrName) ==
+             getIntegerAttr(rhs, kBufferIdAttrName) &&
+         getIntegerAttrOr(lhs, kBufferCopyAttrName, -1) ==
+             getIntegerAttrOr(rhs, kBufferCopyAttrName, -1);
+}
+
+struct TmemReuseView {
+  int64_t offset = 0;
+  int64_t sliceSize = 0;
+};
+
+std::optional<TmemReuseView> getReuseView(TMEMAllocOp representative,
+                                          TMEMAllocOp duplicate) {
+  int64_t baseOffset =
+      getIntegerAttrOr(representative, kBufferOffsetAttrName, 0);
+  if (baseOffset != 0)
+    return std::nullopt;
+
+  auto baseType = representative.getResult().getType();
+  auto duplicateType = duplicate.getResult().getType();
+  if (baseType.getRank() != duplicateType.getRank())
+    return std::nullopt;
+
+  ArrayRef<int64_t> baseShape = baseType.getShape();
+  ArrayRef<int64_t> duplicateShape = duplicateType.getShape();
+  for (int i = 0, e = baseType.getRank() - 1; i < e; ++i)
+    if (baseShape[i] != duplicateShape[i])
+      return std::nullopt;
+
+  int64_t duplicateOffset =
+      getIntegerAttrOr(duplicate, kBufferOffsetAttrName, 0);
+  if (duplicateOffset < 0)
+    return std::nullopt;
+
+  int64_t baseBlockN = baseShape.back();
+  int64_t duplicateBlockN = duplicateShape.back();
+  int64_t baseElemWidth = baseType.getElementTypeBitWidth();
+  int64_t duplicateElemWidth = duplicateType.getElementTypeBitWidth();
+
+  int64_t sliceSize = 0;
+  if (baseElemWidth == duplicateElemWidth) {
+    sliceSize = duplicateBlockN;
+  } else if (baseElemWidth == duplicateElemWidth * 2) {
+    if (duplicateBlockN % 2 != 0)
+      return std::nullopt;
+    sliceSize = duplicateBlockN / 2;
+  } else {
+    return std::nullopt;
+  }
+
+  if (sliceSize <= 0 || duplicateOffset + sliceSize > baseBlockN)
+    return std::nullopt;
+
+  return TmemReuseView{duplicateOffset, sliceSize};
+}
+
+MemDescType createReinterpretType(OpBuilder &builder, MemDescType type) {
+  int64_t elemBitWidth = type.getElementTypeBitWidth();
+  assert((elemBitWidth == 16 || elemBitWidth == 32) &&
+         "unsupported TMEM element bit width");
+
+  auto encoding = cast<TensorMemoryEncodingAttr>(type.getEncoding());
+  unsigned colStride = 32 / elemBitWidth;
+  auto outputEncoding = TensorMemoryEncodingAttr::get(
+      builder.getContext(), type.getShape()[type.getRank() - 2],
+      type.getShape().back(), colStride, encoding.getCGALayout(),
+      encoding.getTwoCTAs(), encoding.getCtaMode());
+  return MemDescType::get(type.getShape(), type.getElementType(),
+                          outputEncoding, type.getMemorySpace(),
+                          type.getMutableMemory(), type.getAllocShape());
+}
+
+Value createReuseView(OpBuilder &builder, TMEMAllocOp representative,
+                      TMEMAllocOp duplicate, TmemReuseView view) {
+  auto duplicateType = duplicate.getResult().getType();
+  if (representative.getResult().getType() == duplicateType &&
+      view.offset == 0) {
+    return representative.getResult();
+  }
+
+  builder.setInsertionPoint(duplicate);
+  auto representativeType = representative.getResult().getType();
+  auto subSlice = TMEMSubSliceOp::create(
+      builder, duplicate.getLoc(), representative.getResult(), view.offset,
+      view.sliceSize, representativeType.getRank() - 1);
+  auto reinterpretType = createReinterpretType(builder, duplicateType);
+  auto reinterpret = MemDescReinterpretOp::create(
+      builder, duplicate.getLoc(), reinterpretType, subSlice);
+  assignStageCluster(subSlice, getPartitionWsTagIds(duplicate),
+                     getStageCluster(duplicate), builder);
+  assignStageCluster(reinterpret, getPartitionWsTagIds(duplicate),
+                     getStageCluster(duplicate), builder);
+  return reinterpret.getResult();
+}
+
+void coalesceDuplicateTmemAllocsByBufferId(triton::FuncOp funcOp) {
+  SmallVector<TMEMAllocOp> allocs;
+  funcOp.walk([&](TMEMAllocOp allocOp) {
+    if (isEligibleBufferReuseAlloc(allocOp))
+      allocs.push_back(allocOp);
+  });
+
+  DominanceInfo domInfo(funcOp);
+  SmallVector<Operation *> processed;
+
+  for (TMEMAllocOp allocOp : allocs) {
+    if (llvm::is_contained(processed, allocOp.getOperation()))
+      continue;
+
+    SmallVector<TMEMAllocOp> group;
+    for (TMEMAllocOp candidate : allocs) {
+      if (llvm::is_contained(processed, candidate.getOperation()))
+        continue;
+      if (hasSameBufferReuseKey(allocOp, candidate))
+        group.push_back(candidate);
+    }
+    for (TMEMAllocOp groupAlloc : group)
+      processed.push_back(groupAlloc.getOperation());
+    if (group.size() < 2)
+      continue;
+
+    TMEMAllocOp representative;
+    for (TMEMAllocOp candidate : group) {
+      bool canRepresentGroup = true;
+      for (TMEMAllocOp duplicate : group) {
+        if (candidate == duplicate)
+          continue;
+        if (!domInfo.dominates(candidate.getOperation(),
+                               duplicate.getOperation()) ||
+            !getReuseView(candidate, duplicate)) {
+          canRepresentGroup = false;
+          break;
+        }
+      }
+      if (canRepresentGroup) {
+        representative = candidate;
+        break;
+      }
+    }
+    if (!representative)
+      continue;
+
+    OpBuilder builder(funcOp.getContext());
+    for (TMEMAllocOp duplicate : group) {
+      if (duplicate == representative)
+        continue;
+      std::optional<TmemReuseView> view =
+          getReuseView(representative, duplicate);
+      assert(view && "representative compatibility changed");
+
+      Value replacement =
+          createReuseView(builder, representative, duplicate, *view);
+      duplicate.getResult().replaceAllUsesWith(replacement);
+      if (duplicate.getResult().use_empty() &&
+          (!duplicate.getToken() || duplicate.getToken().use_empty())) {
+        duplicate.erase();
+      }
+    }
+  }
+}
+
+void stripTmemBufferAttrs(triton::FuncOp funcOp) {
+  funcOp.walk([&](TMEMAllocOp allocOp) {
+    allocOp->removeAttr(kBufferIdAttrName);
+    allocOp->removeAttr(kBufferOffsetAttrName);
+    allocOp->removeAttr(kBufferCopyAttrName);
+  });
+}
 } // anonymous namespace
 
 class NVWSLowerSemaphore
@@ -685,7 +889,11 @@ public:
 
     // Poison tokens replace erased semaphore tokens. Keep them outside
     // partitioned regions for the downstream partitioning passes.
-    m.walk([&](triton::FuncOp funcOp) { hoistPoisonOps(funcOp); });
+    m.walk([&](triton::FuncOp funcOp) {
+      hoistPoisonOps(funcOp);
+      coalesceDuplicateTmemAllocsByBufferId(funcOp);
+      stripTmemBufferAttrs(funcOp);
+    });
   }
 };
 

@@ -148,33 +148,10 @@ LogicalResult SemaphoreCreateOp::verify() {
     auto releaseOp = dyn_cast<SemaphoreReleaseOp>(user);
     if (!releaseOp)
       continue;
+
     if (failed(verifyNoDuplicateAsyncOps(releaseOp, releaseOp.getAsyncOps())))
       return failure();
   }
-
-  return success();
-}
-
-LogicalResult ArefCreateOp::verify() {
-  SmallVector<int> dims;
-  for (auto operand : getOperands()) {
-    SmallVector<Operation *> users(operand.user_begin(), operand.user_end());
-    if (!llvm::all_of(users, [](Operation *op) {
-          return isa<ArefCreateOp, gpu::LocalDeallocOp>(op);
-        }))
-      return emitError("Aref buffer is used elsewhere, Aref cannot guarantee "
-                       "async safety");
-    auto type = operand.getType();
-    if (auto mType = dyn_cast<gpu::MemDescType>(type)) {
-      dims.push_back(mType.getShape()[0]);
-    } else if (auto rType = dyn_cast<RankedTensorType>(type)) {
-      dims.push_back(rType.getShape()[0]);
-    } else {
-      return emitError("Aref is sliced, but input type isn't supported.");
-    }
-  }
-  if (!llvm::all_equal(dims))
-    return emitError("Leading dims of sliced aref inputs don't match.");
 
   return success();
 }
@@ -204,42 +181,6 @@ static std::optional<Twine> verifySlice(T &origType, T &newType) {
     }
   }
   return std::nullopt;
-}
-
-std::optional<Twine> static arefEnterVerify(
-    ArefType aref, mlir::ValueTypeRange<ResultRange> resultTypes) {
-  auto typeArray = aref.getBaseType();
-  if (typeArray.size() != resultTypes.size())
-    return "Aref has different number of arguments than enter";
-  // This should probably rely on the memdescSubsliceOp verifier?
-  for (auto [orig, arg] : llvm::zip(typeArray, resultTypes)) {
-    if (auto origT = dyn_cast<RankedTensorType>(orig)) {
-      auto argT = dyn_cast<RankedTensorType>(arg);
-      if (auto result = verifySlice(origT, argT))
-        return result;
-    } else if (auto origT = dyn_cast<triton::gpu::MemDescType>(orig)) {
-      auto argT = dyn_cast<triton::gpu::MemDescType>(arg);
-      if (auto result = verifySlice(origT, argT))
-        return result;
-    } else {
-      return "Slicing not Implemented for this type";
-    }
-  }
-  return std::nullopt;
-}
-
-LogicalResult ArefPutEnterOp::verify() {
-  if (auto result =
-          arefEnterVerify(getAref().getType(), getBuffers().getType()))
-    return emitError(*result);
-  return success();
-}
-
-LogicalResult ArefGetEnterOp::verify() {
-  if (auto result =
-          arefEnterVerify(getAref().getType(), getBuffers().getType()))
-    return emitError(*result);
-  return success();
 }
 
 static std::optional<Twine>
@@ -317,6 +258,12 @@ ParseResult WarpGroupOp::parse(OpAsmParser &p, OperationState &result) {
   result.addAttribute(getNumWarpsAttrName(result.name),
                       p.getBuilder().getDenseI32ArrayAttr(partitionNumWarps));
 
+  if (!result.regions.empty() && !result.regions.front()->empty()) {
+    Operation *terminator = result.regions.front()->front().getTerminator();
+    if (auto yieldOp = dyn_cast<WarpGroupYieldOp>(terminator))
+      result.addTypes(yieldOp.getOperandTypes());
+  }
+
   return success();
 }
 
@@ -374,9 +321,11 @@ ParseResult SemaphoreAcquireOp::parse(OpAsmParser &parser,
   if (parser.resolveOperand(semaphore, semaphoreType, result.operands))
     return failure();
   Type i32Type = builder.getI32Type();
-  if (hasStage && parser.resolveOperand(stage, i32Type, result.operands))
+  if (hasStage &&
+      parser.resolveOperand(stage, i32Type, result.operands))
     return failure();
-  if (hasPhase && parser.resolveOperand(phase, i32Type, result.operands))
+  if (hasPhase &&
+      parser.resolveOperand(phase, i32Type, result.operands))
     return failure();
 
   result.addAttribute("operand_segment_sizes",
@@ -418,11 +367,5 @@ void SemaphoreReleaseOp::setStage(Value stage) {
 void SemaphoreBufferOp::setStage(Value stage) {
   getStageMutable().assign(stage);
 }
-
-void ArefPutEnterOp::setStage(Value stage) { getStageMutable().assign(stage); }
-void ArefPutExitOp::setStage(Value stage) { getStageMutable().assign(stage); }
-void ArefGetExitOp::setStage(Value stage) { getStageMutable().assign(stage); }
-void ArefGetEnterOp::setStage(Value stage) { getStageMutable().assign(stage); }
-void ArefBufferOp::setStage(Value stage) { getStageMutable().assign(stage); }
 
 } // namespace mlir::triton::nvws
