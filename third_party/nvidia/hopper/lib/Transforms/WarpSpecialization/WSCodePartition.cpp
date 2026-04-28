@@ -2536,7 +2536,11 @@ void replaceBufferReuse(triton::FuncOp funcOp,
       bool channelIsTMEM = isa<ttng::TMEMAllocOp>(channel->getAllocOp());
       bool repChIsTMEM = isa<ttng::TMEMAllocOp>(repCh->getAllocOp());
 
-      assert(channelIsTMEM && repChIsTMEM && "TMEM allocations required");
+      // Skip non-TMEM channels — buffer reuse currently only supports TMEM.
+      // SMEM channels may share buffer.id from epilogue fusion but are handled
+      // by AllocateSharedMemoryNv's liveness-based allocation.
+      if (!channelIsTMEM || !repChIsTMEM)
+        continue;
 
       // Collect all users of the allocation
       SmallVector<Operation *> users;
@@ -2778,9 +2782,11 @@ void insertAsyncComm(
               // directly from memory anyway.
               while (llvm::isa<ttg::ConvertLayoutOp>(user) && user->hasOneUse())
                 user = *user->getUsers().begin();
-              // Handle descriptor store or early lowered TMA store
+              // Handle descriptor store/reduce or early lowered TMA
+              // store/reduce
               if (llvm::isa<tt::DescriptorStoreOp,
-                            ttng::AsyncTMACopyLocalToGlobalOp>(user)) {
+                            ttng::AsyncTMACopyLocalToGlobalOp,
+                            ttng::AsyncTMAReduceOp>(user)) {
                 consumerOps.insert(user);
                 actualConsumerOps.insert(user);
               }
@@ -2794,13 +2800,14 @@ void insertAsyncComm(
       }
     }
 
-    // If any actual consumer is an AsyncTMACopyLocalToGlobalOp, follow
-    // its token result to find TMAStoreTokenWaitOp and add it to
-    // actualConsumerOps. This enables barrier fusion for the early-lowered
-    // TMA store pattern (local_alloc → async_tma_copy → token_wait).
+    // If any actual consumer is a TMA store-like op, follow its token
+    // result to find TMAStoreTokenWaitOp and add it to actualConsumerOps.
+    // This enables barrier fusion for the early-lowered TMA store/reduce
+    // pattern (local_alloc → async_tma_copy/reduce → token_wait).
     DenseSet<Operation *> additionalConsumerOps;
     for (auto *op : actualConsumerOps) {
-      if (llvm::isa<ttng::AsyncTMACopyLocalToGlobalOp>(op)) {
+      if (llvm::isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
+              op)) {
         for (auto user : op->getUsers()) {
           if (llvm::isa<ttng::TMAStoreTokenWaitOp>(user)) {
             additionalConsumerOps.insert(user);

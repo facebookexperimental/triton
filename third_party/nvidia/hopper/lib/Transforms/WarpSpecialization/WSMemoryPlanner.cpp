@@ -793,7 +793,10 @@ struct WSBuffer {
   unsigned numCopies;
   WSBufferPriority priority;
   bool isPinned = false; // Set by user annotation; skips heuristic phases.
-  bool isTMAStoreStaging = false; // Buffer used for TMA store staging.
+  unsigned tmaStaging =
+      0; // 0=normal, 1=TMA store staging, 2=TMA reduce staging
+  bool isAllocated =
+      false; // Has dedicated SMEM; false = reuses another buffer.
 };
 
 /// Parsed channel annotation from tt.autows JSON on an MMA op.
@@ -1073,6 +1076,11 @@ static int getLoopStage(Operation *op) {
   return attr ? attr.getValue().getSExtValue() : -1;
 }
 
+static int getLoopCluster(Operation *op) {
+  auto attr = op->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
+  return attr ? attr.getValue().getSExtValue() : -1;
+}
+
 /// Check if a channel's actual consumers are in different loop.stage values.
 /// The producer stage is not considered because it may be in a different
 /// partition. We follow through memdesc_trans operations to find the actual
@@ -1147,9 +1155,7 @@ static unsigned computeTotalSmem(const SmallVector<WSBuffer> &wsBuffers) {
   DenseMap<unsigned, std::pair<unsigned, unsigned>>
       idInfo; // id -> (maxSize, copies)
   for (const auto &buf : wsBuffers) {
-    // TMA store staging buffers live outside the pipelined inner loop
-    // and don't compete with channel buffers for pipeline depth.
-    if (buf.isTMAStoreStaging)
+    if (!buf.isAllocated)
       continue;
     auto it = idInfo.find(buf.bufferId);
     if (it == idInfo.end()) {
@@ -1165,23 +1171,49 @@ static unsigned computeTotalSmem(const SmallVector<WSBuffer> &wsBuffers) {
   return total;
 }
 
+/// Compute the actual SMEM cost of TMA store staging buffers. Each entry
+/// is a separate physical alloc (they are NOT merged downstream), so count
+/// numEntries × size × copies, not max(size) × copies.
+static unsigned
+computeTMAStoreStagingSmem(const SmallVector<WSBuffer> &wsBuffers) {
+  unsigned total = 0;
+  for (const auto &buf : wsBuffers) {
+    if (buf.tmaStaging > 0 && buf.isAllocated)
+      total += buf.sizeBytes * buf.numCopies;
+  }
+  return total;
+}
+
 /// Group P2_Other WSBuffers by their original load op (or by compatible
 /// type/size for TMA store staging buffers) and assign the same buffer.id
 /// to buffers within each group.
 static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
                                   SmallVector<Channel *> &channels) {
   DenseMap<Operation *, SmallVector<unsigned>> loadGroups;
-  // TMA store staging buffers don't have channels — group them by a
-  // sentinel key (nullptr) since they're all compatible by construction.
-  SmallVector<unsigned> tmaStoreIndices;
+  // TMA staging buffers: group per descriptor so dk slices share one id,
+  // dv slices share another, dq reduce slices share a third, etc.
+  DenseMap<Value, SmallVector<unsigned>> tmaStagingGroups;
   for (unsigned i = 0; i < wsBuffers.size(); ++i) {
     auto &buf = wsBuffers[i];
-    if (buf.priority != WSBufferPriority::P2_Other)
-      continue;
-    if (buf.isTMAStoreStaging) {
-      tmaStoreIndices.push_back(i);
+    // TMA staging buffers: group per descriptor regardless of priority.
+    if (buf.tmaStaging > 0) {
+      Value desc;
+      for (auto user : buf.allocOp->getUsers()) {
+        if (auto storeOp = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(user)) {
+          desc = storeOp.getDesc();
+          break;
+        }
+        if (auto reduceOp = dyn_cast<ttng::AsyncTMAReduceOp>(user)) {
+          desc = reduceOp.getDesc();
+          break;
+        }
+      }
+      if (desc)
+        tmaStagingGroups[desc].push_back(i);
       continue;
     }
+    if (buf.priority != WSBufferPriority::P2_Other)
+      continue;
     Channel *ch = findChannelForOp(buf.allocOp, channels);
     Operation *origLoad = findOriginalLoadForChannel(ch);
     if (!origLoad)
@@ -1210,7 +1242,8 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
   for (auto &[origLoad, indices] : loadGroups)
     mergeGroup(indices, "epilogue fusion");
 
-  mergeGroup(tmaStoreIndices, "TMA store staging fusion");
+  for (auto &[desc, indices] : tmaStagingGroups)
+    mergeGroup(indices, "TMA staging per-descriptor fusion");
 }
 
 /// Phase 4.5: Iterative copy increase for fused P2_Other groups.
@@ -1275,6 +1308,75 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
   }
 }
 
+/// Get the maximum linearized order among a buffer's consumers via its channel.
+/// Linearized order = stage * numClusters + cluster, providing finer-grained
+/// ordering than stage alone. Returns -1 if the buffer has no channel or
+/// consumers have no loop.stage.
+static int getLastConsumerOrder(const WSBuffer &buf,
+                                SmallVector<Channel *> &channels,
+                                int numClusters) {
+  Channel *ch = findChannelForOp(buf.allocOp, channels);
+  if (!ch)
+    return -1;
+
+  SmallVector<Operation *> dstOps;
+  ch->getDstOps(dstOps);
+  if (dstOps.empty()) {
+    if (Operation *dst = ch->getDstOp())
+      dstOps.push_back(dst);
+  }
+
+  int maxOrder = -1;
+  for (Operation *dstOp : dstOps) {
+    auto consumers = getActualConsumers(dstOp);
+    for (auto *consumer : consumers) {
+      int stage = getLoopStage(consumer);
+      int cluster = getLoopCluster(consumer);
+      if (stage >= 0) {
+        int order = stage * numClusters + std::max(cluster, 0);
+        if (order > maxOrder)
+          maxOrder = order;
+      }
+    }
+  }
+  return maxOrder;
+}
+
+/// Find an allocated buffer that a non-innermost candidate can reuse.
+/// The candidate must NOT be innermost (partition-unaware liveness is
+/// inaccurate within the inner loop). Can scan allocated innermost buffers
+/// as reuse targets — later passes insert synchronization as needed.
+/// Returns null if no suitable target found.
+static WSBuffer *findReuseCandidate(WSBuffer &candidate,
+                                    SmallVector<WSBuffer> &wsBuffers,
+                                    SmallVector<Channel *> &channels,
+                                    int numClusters) {
+  // Innermost buffers cannot be reuse candidates — they're live during
+  // the inner loop and would conflict with the reuse target.
+  if (candidate.isInnermost)
+    return nullptr;
+
+  WSBuffer *best = nullptr;
+  int bestOrder = INT_MAX;
+
+  for (auto &buf : wsBuffers) {
+    if (!buf.isAllocated)
+      continue;
+    if (buf.sizeBytes * buf.numCopies < candidate.sizeBytes)
+      continue;
+
+    int order = getLastConsumerOrder(buf, channels, numClusters);
+    // -1 means no channel/unknown — treat as worst case (INT_MAX).
+    if (order < 0)
+      order = INT_MAX;
+    if (order < bestOrder) {
+      best = &buf;
+      bestOrder = order;
+    }
+  }
+  return best;
+}
+
 /// New SMEM allocation: Phases 1–5.
 ///
 /// Phase 1: Create one WSBuffer per local_alloc, all copy=1, unique IDs.
@@ -1287,10 +1389,13 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
 static unsigned allocateSmemBuffers(
     triton::FuncOp funcOp, SmallVector<Channel *> &channels,
     unsigned numBuffers, unsigned smemBudget, bool smemCircularReuse,
-    const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation) {
+    const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation,
+    unsigned annotationMaxId = 0) {
   // ── Phase 1: Create WSBuffers ───────────────────────────────────────
   SmallVector<WSBuffer> wsBuffers;
-  unsigned nextBufferId = 0;
+  // Start non-pinned buffer IDs past all annotation IDs (SMEM + TMEM)
+  // to avoid collisions with any annotated buffer in either namespace.
+  unsigned nextBufferId = annotationMaxId;
 
   funcOp->walk<WalkOrder::PreOrder>([&](ttg::LocalAllocOp alloc) {
     if (!alloc.isSharedMemoryAlloc())
@@ -1305,6 +1410,7 @@ static unsigned allocateSmemBuffers(
     buf.bufferId = nextBufferId++;
     buf.numCopies = 1;
     buf.priority = WSBufferPriority::P2_Other;
+    buf.isAllocated = true; // default: every buffer gets dedicated SMEM
 
     // Check for annotation-based pre-assignment.
     auto it = allocToAnnotation.find(alloc.getOperation());
@@ -1316,11 +1422,16 @@ static unsigned allocateSmemBuffers(
            << buf.bufferId << " numCopies=" << buf.numCopies);
     }
 
-    // Detect TMA store staging buffers: allocs whose users include
-    // AsyncTMACopyLocalToGlobalOp (from early TMA store lowering).
+    // Detect TMA staging buffers: allocs whose users include
+    // AsyncTMACopyLocalToGlobalOp (store staging, type 1) or
+    // AsyncTMAReduceOp (reduce staging, type 2).
     for (auto user : alloc->getUsers()) {
       if (isa<ttng::AsyncTMACopyLocalToGlobalOp>(user)) {
-        buf.isTMAStoreStaging = true;
+        buf.tmaStaging = 1;
+        break;
+      }
+      if (isa<ttng::AsyncTMAReduceOp>(user)) {
+        buf.tmaStaging = 2;
         break;
       }
     }
@@ -1331,13 +1442,13 @@ static unsigned allocateSmemBuffers(
          << buf.bufferId << "] " << buf.sizeBytes << " bytes"
          << " innermost=" << buf.isInnermost << " TMA=" << buf.isTMA
          << " crossStage=" << buf.isCrossStage << " pinned=" << buf.isPinned
-         << " tmaStoreStaging=" << buf.isTMAStoreStaging);
+         << " tmaStaging=" << buf.tmaStaging);
   });
 
   if (wsBuffers.empty())
     return nextBufferId;
 
-  // Ensure heuristic-assigned IDs don't collide with annotated IDs.
+  // Ensure nextBufferId is past all pinned SMEM IDs too.
   for (auto &buf : wsBuffers)
     if (buf.isPinned)
       nextBufferId = std::max(nextBufferId, buf.bufferId + 1);
@@ -1393,6 +1504,63 @@ static unsigned allocateSmemBuffers(
   // the same buffer.id to reduce SMEM usage before the copy increase pass.
   fuseEpilogueWSBuffers(wsBuffers, channels);
 
+  // Compute numClusters from the max loop.cluster across all WSBuffer ops.
+  int numClusters = 1;
+  for (auto &buf : wsBuffers) {
+    int cluster = getLoopCluster(buf.allocOp);
+    if (cluster >= 0)
+      numClusters = std::max(numClusters, cluster + 1);
+    for (auto user : buf.allocOp->getUsers()) {
+      cluster = getLoopCluster(user);
+      if (cluster >= 0)
+        numClusters = std::max(numClusters, cluster + 1);
+    }
+  }
+
+  // ── Phase 3.6: Reuse allocated buffers when base total exceeds budget ──
+  // Non-innermost buffers and TMA staging buffers can reuse the SMEM of
+  // allocated buffers. Process epilogue (largest) buffers first to maximize
+  // the SMEM savings.
+  {
+    unsigned baseTotal = computeTotalSmem(wsBuffers);
+    if (baseTotal > smemBudget) {
+      LDBG("Phase 3.6: base SMEM " << baseTotal << " > budget " << smemBudget
+                                   << " — trying buffer reuse");
+
+      // Collect indices of reuse candidates, ordered by size (largest first)
+      // to maximize savings from each reuse.
+      SmallVector<unsigned> reuseIndices;
+      for (unsigned i = 0; i < wsBuffers.size(); ++i) {
+        auto &buf = wsBuffers[i];
+        if (buf.isPinned)
+          continue;
+        if (buf.isInnermost)
+          continue;
+        reuseIndices.push_back(i);
+      }
+      // Sort by size descending — reuse largest buffers first.
+      llvm::sort(reuseIndices, [&](unsigned a, unsigned b) {
+        return wsBuffers[a].sizeBytes > wsBuffers[b].sizeBytes;
+      });
+
+      for (unsigned idx : reuseIndices) {
+        auto &buf = wsBuffers[idx];
+        auto *target =
+            findReuseCandidate(buf, wsBuffers, channels, numClusters);
+        if (target) {
+          buf.isAllocated = false;
+          // Don't change bufferId — replaceBufferReuse uses same buffer.id
+          // to merge channels, which would fail for SMEM→TMEM mismatches.
+          // Instead, just mark as not allocated; computeTotalSmem skips it.
+          LDBG("Phase 3.6: WSBuffer[" << idx << "] (" << buf.sizeBytes
+                                      << "B) reuses WSBuffer["
+                                      << target->bufferId << "]");
+        }
+      }
+      LDBG("Phase 3.6: new total " << computeTotalSmem(wsBuffers));
+    }
+  }
+
   // ── Phase 4: Iterative copy increase ────────────────────────────────
   // Process P0 then P1. P2 is never increased.
   for (auto priority : {WSBufferPriority::P0_InnermostTMA,
@@ -1423,26 +1591,18 @@ static unsigned allocateSmemBuffers(
       bufB.bufferId = bufA.bufferId;
 
       // Compute starting copies for the group based on cross-stage.
-      unsigned maxCrossStageMin = 1;
-      if (bufA.isCrossStage)
-        maxCrossStageMin = std::max(maxCrossStageMin, 2u);
-      if (bufB.isCrossStage)
-        maxCrossStageMin = std::max(maxCrossStageMin, 2u);
-
-      unsigned groupStart = 1;
-      if (maxCrossStageMin >= 2)
-        groupStart = maxCrossStageMin * 2 - 1; // e.g., 3
-
-      // Clamp to num_buffers.
-      if (groupStart > numBuffers)
-        groupStart = numBuffers;
+      // A reuse group with a cross-stage buffer needs 3 copies minimum:
+      // 2 for the pair (one per buffer) + 1 for double-buffering the
+      // cross-stage read.
+      bool hasCrossStage = bufA.isCrossStage || bufB.isCrossStage;
+      unsigned groupStart = std::min(hasCrossStage ? 3u : 1u, numBuffers);
 
       bufA.numCopies = groupStart;
       bufB.numCopies = groupStart;
 
       LDBG("Phase 4: formed reuse group ["
            << bufA.bufferId << "] with startCopies=" << groupStart
-           << " (crossStageMin=" << maxCrossStageMin << ")");
+           << " (crossStage=" << hasCrossStage << ")");
     }
 
     // Step 1: Incremental loop.
@@ -1502,6 +1662,7 @@ static unsigned allocateSmemBuffers(
           auto &buf = wsBuffers[idx];
           unsigned saved = buf.numCopies;
           buf.numCopies = currentGroupCopies;
+          buf.isAllocated = true;
 
           unsigned totalSmem = computeTotalSmem(wsBuffers);
           if (totalSmem <= smemBudget) {
@@ -1512,10 +1673,21 @@ static unsigned allocateSmemBuffers(
                  << " totalSmem=" << totalSmem << " ≤ " << smemBudget);
           } else {
             buf.numCopies = saved;
-            LDBG("Phase 4: WSBuffer["
-                 << buf.bufferId << "] copies=" << currentGroupCopies
-                 << " totalSmem=" << totalSmem << " > " << smemBudget
-                 << " — skipped");
+            // Try reusing an already-allocated buffer instead.
+            if (auto *target =
+                    findReuseCandidate(buf, wsBuffers, channels, numClusters)) {
+              buf.isAllocated = false;
+              foundValidSolution = true;
+              LDBG("Phase 4: WSBuffer["
+                   << idx << "] reuses WSBuffer[" << target->bufferId
+                   << "] (size=" << target->sizeBytes << ")");
+            } else {
+              buf.isAllocated = true;
+              LDBG("Phase 4: WSBuffer["
+                   << buf.bufferId << "] copies=" << currentGroupCopies
+                   << " totalSmem=" << totalSmem << " > " << smemBudget
+                   << " — skipped");
+            }
           }
         }
 
@@ -1562,24 +1734,30 @@ static unsigned allocateSmemBuffers(
     buf.allocOp->setAttr("buffer.id", IntegerAttr::get(i32Type, buf.bufferId));
     buf.allocOp->setAttr("buffer.copy",
                          IntegerAttr::get(i32Type, buf.numCopies));
+    if (!buf.isAllocated) {
+      buf.allocOp->setAttr("allocation.shareGroup",
+                           IntegerAttr::get(i32Type, buf.bufferId));
+    }
     LDBG("Phase 5: WSBuffer[" << buf.bufferId << "] buffer.id=" << buf.bufferId
-                              << " buffer.copy=" << buf.numCopies);
+                              << " buffer.copy=" << buf.numCopies
+                              << " allocated=" << buf.isAllocated);
   }
 
-  // ── Phase 6: Hoist in-loop TMA store allocs to before the loop ──────
-  // Early TMA store lowering creates local_alloc ops inside the loop.
+  // ── Phase 6: Hoist in-loop TMA store/reduce allocs to before the loop ─
+  // Early TMA store/reduce lowering creates local_alloc ops inside the loop.
   // These must be hoisted so the pipeliner can rotate them by buffer.copy.
   for (auto &buf : wsBuffers) {
     auto allocOp = buf.allocOp;
     if (auto forOp = allocOp->getParentOfType<scf::ForOp>()) {
-      bool feedsTMAStore = false;
+      bool feedsTMA = false;
       for (auto user : allocOp->getUsers()) {
-        if (isa<ttng::AsyncTMACopyLocalToGlobalOp>(user)) {
-          feedsTMAStore = true;
+        if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
+                user)) {
+          feedsTMA = true;
           break;
         }
       }
-      if (feedsTMAStore) {
+      if (feedsTMA) {
         // Walk to the outermost enclosing loop.
         auto outermost = forOp;
         while (auto parent = outermost->getParentOfType<scf::ForOp>())
@@ -3315,13 +3493,20 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
     // Parse channel annotations from MMA ops for SMEM pre-assignment.
     auto mmaAnnotations = parseChannelAnnotations(funcOp);
     DenseMap<Operation *, ChannelAnnotation> smemAllocAnnotations;
-    if (!mmaAnnotations.empty())
+    // Compute the max buffer ID across ALL annotations (SMEM + TMEM) so
+    // that non-pinned SMEM buffers get IDs that don't collide with any
+    // annotated buffer in either namespace.
+    unsigned annotationMaxId = 0;
+    if (!mmaAnnotations.empty()) {
       smemAllocAnnotations =
           buildAllocToAnnotationMap(channels, mmaAnnotations);
+      for (auto &[key, ann] : mmaAnnotations)
+        annotationMaxId = std::max(annotationMaxId, ann.bufferId + 1);
+    }
 
-    bufferId =
-        allocateSmemBuffers(funcOp, channels, numBuffers, effectiveSmemBudget,
-                            effectiveSmemCircularReuse, smemAllocAnnotations);
+    bufferId = allocateSmemBuffers(
+        funcOp, channels, numBuffers, effectiveSmemBudget,
+        effectiveSmemCircularReuse, smemAllocAnnotations, annotationMaxId);
   } else {
     // Original SMEM allocation.
     LDBG("using SMEM allocation algorithm 0 (original)");

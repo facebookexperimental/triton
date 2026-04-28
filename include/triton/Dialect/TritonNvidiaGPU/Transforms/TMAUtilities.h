@@ -11,6 +11,10 @@ namespace mlir::triton::nvidia_gpu {
 constexpr inline int TMA_SIZE_BYTES = 128;
 constexpr inline int TMA_ALIGN = 128;
 
+SmallVector<Value> translateTMAIndices(OpBuilder &builder, Location loc,
+                                       Attribute encoding,
+                                       SmallVector<Value> indices);
+
 inline bool isFp4Padded(Attribute encoding) {
   auto mmaEnc = dyn_cast<gpu::NVMMASharedEncodingAttr>(encoding);
   return mmaEnc && mmaEnc.getFp4Padded();
