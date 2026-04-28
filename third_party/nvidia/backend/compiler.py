@@ -378,6 +378,8 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_triton_licm(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+            if knobs.compilation.enable_extra_analysis_passes:
+                passes.ttgpuir.add_pipelining_analysis(pm, opt.num_stages)
             if knobs.nvidia.use_meta_ws:
                 nvidia.passes.hopper.add_data_partitioning(pm, 1)
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
@@ -393,8 +395,6 @@ class CUDABackend(BaseBackend):
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
                 passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
-            if knobs.nvidia.enable_pipelining_analysis:
-                passes.ttgpuir.add_pipelining_analysis(pm, opt.num_stages)
         elif capability // 10 >= 10:
             if not knobs.nvidia.use_modulo_schedule:
                 passes.ttgpuir.add_fuse_nested_loops(pm)
@@ -411,6 +411,10 @@ class CUDABackend(BaseBackend):
                 # TRITON_USE_MODULO_SCHEDULE=sms|exhaustive|random
                 nvidia.passes.hopper.add_modulo_schedule(pm)
             nvidia.passes.hopper.add_data_partitioning(pm, 1)
+
+            if knobs.compilation.enable_extra_analysis_passes:
+                passes.ttgpuir.add_pipelining_analysis(pm, opt.num_stages)
+
             # assign_latencies sets tt.latency on loads/MMAs (stage-distance
             # latencies). schedule_loops reads tt.latency AND tt.autows:
             # when MMA ops have tt.autows, scheduleKeyOpsAnnotation places
@@ -435,8 +439,6 @@ class CUDABackend(BaseBackend):
                 nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS,
                                                          dump_enabled, smem_budget, generate_subtiled)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
-            if knobs.nvidia.enable_pipelining_analysis:
-                passes.ttgpuir.add_pipelining_analysis(pm, opt.num_stages)
             passes.ttgpuir.add_optimize_partition_warps(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             # hoist again and allow hoisting out of if statements

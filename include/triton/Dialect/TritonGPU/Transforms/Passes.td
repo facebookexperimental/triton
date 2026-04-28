@@ -390,10 +390,10 @@ def TritonGPUPipeliningAnalysis: Pass<"tritongpu-pipelining-analysis", "mlir::Mo
   let summary = "Analyze pipelining failures and emit diagnostics";
 
   let description = [{
-    The `tritongpu-pipelining-analysis` pass runs after the software pipeliner
-    and analyzes which scf.ForOp loops were not pipelined. For each unpipelined
-    loop, it emits an MLIR remark explaining the reason (e.g., num_stages <= 1,
-    distance > 1, outer loop, barrier ops, no latency assigned).
+    The `tritongpu-pipelining-analysis` pass runs before the software pipeliner
+    (after loop fusion) and diagnoses scf.ForOp loops that request pipelining
+    (num_stages > 1) but will be skipped. It emits MLIR remarks explaining the
+    reason (e.g., outer loop containing nested loops).
 
     This is a read-only analysis pass that does not modify the IR.
   }];
