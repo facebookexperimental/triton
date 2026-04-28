@@ -181,7 +181,7 @@ SmallVector<Value> getTiedArgs(Operation *op, int resultIdx) {
     return values;
   } else if (auto warpSpecializeOp = dyn_cast<ttg::WarpSpecializeOp>(op)) {
     // add arg for every partition including default partition
-    SmallVector<Value> values = {warpSpecializeOp.getOperands()[resultIdx]};
+    SmallVector<Value> values = {warpSpecializeOp.getPartitionOp().getOperands()[resultIdx]};
     for (auto region : warpSpecializeOp.getPartitionRegions()) {
       auto &firstBlock = region->getBlocks().front();
       values.push_back(firstBlock.getArguments()[resultIdx]);
@@ -488,6 +488,9 @@ LogicalResult assignMemoryLayouts(FuncOp &func) {
         auto vals = getTiedArgs(op->getParentOp(), use.getOperandNumber());
         updateEncoding(vals, EncodingInfo{});
       } else if (isa<ttg::WarpSpecializeOp>(op)) {
+        auto vals = getTiedArgs(op, use.getOperandNumber());
+        updateEncoding(vals, EncodingInfo{});
+      } else if (isa<ttg::WarpSpecializePartitionsOp>(op)) {
         auto vals = getTiedArgs(op, use.getOperandNumber());
         updateEncoding(vals, EncodingInfo{});
       }

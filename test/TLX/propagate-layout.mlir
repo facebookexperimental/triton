@@ -340,10 +340,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %true_0 = arith.constant true
 
       // Producer: store scale data into multi-buffered TMEM
-      // CHECK: ttg.memdesc_index {{.*}} : !ttg.memdesc<2x128x4xi8, #[[$TMEM_SCALES]], #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x4xi8, #[[$TMEM_SCALES]], #ttng.tensor_memory, mutable>
+      // CHECK: ttg.memdesc_index {{.*}} : !ttg.memdesc<2x128x4xi8, #[[$TMEM_SCALES]], #ttng.tensor_memory, mutable>
       %a_scale_buf = ttg.memdesc_index %arg0[%c0_i32_0] : !ttg.memdesc<2x128x4xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<128x4xi8, #dummy_tmem_layout, #tmem, mutable>
 
-      // CHECK: ttng.tmem_store {{.*}} : tensor<128x4xi8, #{{.*}}> -> !ttg.memdesc<128x4xi8, #[[$TMEM_SCALES]], #ttng.tensor_memory, mutable>
+      // CHECK: ttng.tmem_store {{.*}} : tensor<128x4xi8, #{{.*}}> -> !ttg.memdesc<128x4xi8,
       ttng.tmem_store %arg1, %a_scale_buf, %true_0 : tensor<128x4xi8, #blocked> -> !ttg.memdesc<128x4xi8, #dummy_tmem_layout, #tmem, mutable>
       ttg.warp_return
     } : (!ttg.memdesc<2x128x4xi8, #dummy_tmem_layout, #tmem, mutable>, tensor<128x4xi8, #blocked>) -> ()

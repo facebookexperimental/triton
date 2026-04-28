@@ -2030,6 +2030,9 @@ void TritonAMDGPUCanonicalizePointersPass::runOnOperation() {
 
   target.addDynamicallyLegalDialect<tt::TritonDialect>(isLegal);
   target.addDynamicallyLegalDialect<triton::gpu::TritonGPUDialect>(isLegal);
+  // WarpSpecializePartitionsOp is handled internally by
+  // ConvertWarpSpecializeOp, so always mark it as legal.
+  target.addLegalOp<triton::gpu::WarpSpecializePartitionsOp>();
   target.addDynamicallyLegalDialect<scf::SCFDialect>(isLegal);
   target.addDynamicallyLegalDialect<cf::ControlFlowDialect>(isLegal);
   target.addDynamicallyLegalDialect<arith::ArithDialect>(isLegal);

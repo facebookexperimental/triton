@@ -88,7 +88,7 @@ void LayoutBackwardPropagation::visitWarpSpecRegionArgs(
             op->getParentOfType<ttg::WarpSpecializePartitionsOp>()) {
       auto warpSpecializeOp = warpSpecializePartitionsOp.getParentOp();
       auto blockArgumentLattice = getLatticeElement(
-          warpSpecializeOp.getExplicitCaptures()[arg.getArgNumber()]);
+          warpSpecializePartitionsOp.getExplicitCaptures()[arg.getArgNumber()]);
       ChangeResult changed = blockArgumentLattice->meet(resultEncoding);
       propagateIfChanged(blockArgumentLattice, changed);
       // Propagate to all the partition regions

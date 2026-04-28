@@ -96,7 +96,7 @@ void pruneBarrier(ttg::LocalAllocOp alloc,
 
   // Phase 2: Clean up warp_specialize captures. Walk the alloc's uses and
   // remove captures that are now unused in all partition regions.
-  SmallVector<std::pair<ttg::WarpSpecializeOp, unsigned>> wsCaptures;
+  SmallVector<std::pair<ttg::WarpSpecializePartitionsOp, unsigned>> wsCaptures;
   std::function<void(Value)> collectWSCaptures = [&](Value val) {
     for (OpOperand &use : val.getUses()) {
       Operation *user = use.getOwner();
@@ -104,14 +104,15 @@ void pruneBarrier(ttg::LocalAllocOp alloc,
         collectWSCaptures(user->getResult(0));
         continue;
       }
-      if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(user)) {
-        wsCaptures.push_back({wsOp, use.getOperandNumber()});
+      if (auto partOp = dyn_cast<ttg::WarpSpecializePartitionsOp>(user)) {
+        wsCaptures.push_back({partOp, use.getOperandNumber()});
       }
     }
   };
   collectWSCaptures(alloc.getResult());
 
-  for (auto [wsOp, idx] : wsCaptures) {
+  for (auto [partOp, idx] : wsCaptures) {
+    auto wsOp = partOp.getParentOp();
     bool allUnused = true;
     for (Region *region : wsOp.getPartitionRegions()) {
       if (!region->getArgument(idx).use_empty()) {
@@ -120,11 +121,11 @@ void pruneBarrier(ttg::LocalAllocOp alloc,
       }
     }
     if (allUnused) {
-      llvm::BitVector toRemove(wsOp.getNumOperands());
+      llvm::BitVector toRemove(partOp.getNumOperands());
       toRemove.set(idx);
       for (Region *region : wsOp.getPartitionRegions())
         region->front().eraseArguments(toRemove);
-      wsOp->eraseOperands(toRemove);
+      partOp->eraseOperands(toRemove);
     }
   }
 

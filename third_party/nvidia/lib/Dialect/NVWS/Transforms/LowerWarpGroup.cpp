@@ -155,10 +155,8 @@ class LowerWarpGroup : public OpRewritePattern<WarpGroupOp> {
       }
     }
 
-    auto wsOp = WarpSpecializeOp::create(rewriter, loc,
-                                         warpGroupOp.getResultTypes(), inputs);
-
-    wsOp.setPartitionNumWarps(numWarps);
+    auto wsOp = WarpSpecializeOp::create(
+        rewriter, loc, warpGroupOp.getResultTypes(), numWarps);
 
     // Copy partition types attribute if present
     if (auto typesAttr = warpGroupOp->getAttr("ttg.partition.types")) {
@@ -183,8 +181,8 @@ class LowerWarpGroup : public OpRewritePattern<WarpGroupOp> {
 
     auto &block = wsOp.getPartitionOpHolder().emplaceBlock();
     rewriter.setInsertionPointToStart(&block);
-    auto wspOp =
-        WarpSpecializePartitionsOp::create(rewriter, loc, partitions.size());
+    auto wspOp = WarpSpecializePartitionsOp::create(rewriter, loc, inputs,
+                                                    partitions.size());
     auto regions = wspOp.getPartitionRegions();
 
     for (auto [in, out, mapping] : zip(partitions, regions, mappings))

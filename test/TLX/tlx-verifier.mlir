@@ -48,7 +48,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 8 : i32, "ttng.tw
        !ttg.memdesc<128x64xf16, #shared1, #ttg.shared_memory>,
        !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>,
        !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory>
-    // expected-error @+1 {{has an invalid layout}}
+    // expected-error @+1 {{Expecting all dot ops to be 2cta together or 1cta together}}
     ttng.tc_gen5_mma %a, %b2, %c, %useAcc, %pred, %barrier[%barrierPred] {is_async}:
            !ttg.memdesc<256x128xf16, #shared, #ttg.shared_memory>,
            !ttg.memdesc<128x128xf16, #shared1_nosplit, #ttg.shared_memory>,

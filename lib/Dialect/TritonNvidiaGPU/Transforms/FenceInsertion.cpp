@@ -220,8 +220,9 @@ private:
           if (!wsSeen.insert(v).second)
             continue;
           for (auto *user : v.getUsers()) {
-            if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(user)) {
-              auto captures = wsOp.getExplicitCaptures();
+            if (auto partOp = dyn_cast<ttg::WarpSpecializePartitionsOp>(user)) {
+              auto captures = partOp.getExplicitCaptures();
+              auto wsOp = cast<ttg::WarpSpecializeOp>(partOp->getParentOp());
               for (unsigned i = 0; i < captures.size(); i++) {
                 if (captures[i] != v)
                   continue;
@@ -265,8 +266,8 @@ private:
 
     // look through `ttg.warp_specialize`.
     if (auto wsOp = dyn_cast<ttg::WarpSpecializePartitionsOp>(argOwner)) {
-      findCopyRegToSharedOps(wsOp.getParentOp().getExplicitCaptures()[argNum],
-                             visited, result);
+      findCopyRegToSharedOps(wsOp.getExplicitCaptures()[argNum], visited,
+                             result);
       return;
     }
 

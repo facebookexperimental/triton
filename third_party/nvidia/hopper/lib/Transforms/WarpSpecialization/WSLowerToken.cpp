@@ -138,13 +138,13 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
     SmallVector<Operation *> usersForToken;
     for (OpOperand &use : createTokenOp.getResult().getUses()) {
       Operation *user = use.getOwner();
-      if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(user)) {
+      if (auto wsOp = dyn_cast<ttg::WarpSpecializePartitionsOp>(user)) {
         unsigned opndNum = use.getOperandNumber();
         // Handle the regions. Trace uses of the argument corresponding to the
         // captured value.
-        for (Region *region : wsOp.getPartitionRegions()) {
-          LDBG("-- region " << region->getNumArguments());
-          auto tArg = region->getArgument(opndNum);
+        for (Region &region : wsOp.getPartitionRegions()) {
+          LDBG("-- region " << region.getNumArguments());
+          auto tArg = region.getArgument(opndNum);
           for (Operation *tUser : tArg.getUsers()) {
             // Use of TokenOp via capture of warp_specialize.
             usersForToken.push_back(tUser);
@@ -408,7 +408,7 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
       // eraseArgument.
       for (OpOperand &use : llvm::make_early_inc_range(tokenOp->getUses())) {
         Operation *user = use.getOwner();
-        if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(user)) {
+        if (auto wsOp = dyn_cast<ttg::WarpSpecializePartitionsOp>(user)) {
           unsigned opndNum = use.getOperandNumber();
           LDBG("wsOp user numOperands: " << wsOp->getNumOperands() << " idx "
                                          << opndNum);
@@ -423,22 +423,22 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
           wsOp->insertOperands(wsOp.getNumOperands(), full);
           wsOp->insertOperands(wsOp.getNumOperands(), empty);
           // Handle the regions.
-          for (Region *region : wsOp.getPartitionRegions()) {
-            LDBG("-- region " << region->getNumArguments());
-            auto tArg = region->getArgument(opndNum);
+          for (Region &region : wsOp.getPartitionRegions()) {
+            LDBG("-- region " << region.getNumArguments());
+            auto tArg = region.getArgument(opndNum);
             for (Operation *tUser : tArg.getUsers()) {
               LLVM_DEBUG({
                 LDBG("user for arg");
                 tUser->dump();
               });
             }
-            region->eraseArgument(opndNum);
+            region.eraseArgument(opndNum);
             BlockArgument arg =
-                region->addArgument(full.getType(), full.getLoc());
-            replaceAllUsesInRegionWith(full, arg, *region);
+                region.addArgument(full.getType(), full.getLoc());
+            replaceAllUsesInRegionWith(full, arg, region);
             BlockArgument arg2 =
-                region->addArgument(empty.getType(), empty.getLoc());
-            replaceAllUsesInRegionWith(empty, arg2, *region);
+                region.addArgument(empty.getType(), empty.getLoc());
+            replaceAllUsesInRegionWith(empty, arg2, region);
           }
         }
       }

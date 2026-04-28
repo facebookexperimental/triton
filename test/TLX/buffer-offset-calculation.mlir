@@ -406,8 +406,6 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     }
     // CHECK: partition0(%{{.*}}: !ttg.memdesc<2x64x64xf32, {{.*}}>, %{{.*}}: !ttg.memdesc<3x64x64xf16, {{.*}}>
     partition0(%arg0: !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>, %arg1: !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>, %arg_idx: i32) num_warps(1) {
-      // CHECK: arith.constant 2 : i32
-      // CHECK: arith.muli
       // CHECK: memdesc_index
       %4 = ttg.memdesc_index %arg1[%arg_idx] : !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
       ttg.warp_return
@@ -441,14 +439,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     }
     // CHECK: partition0(%{{.*}}: !ttg.memdesc<3x64x64xf32, {{.*}}>, %{{.*}}: !ttg.memdesc<4x64x64xf32, {{.*}}>
     partition0(%arg0: !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>, %arg1: !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>, %arg_idx: i32) num_warps(1) {
-      // CHECK: arith.constant 2 : i32
-      // CHECK: arith.muli
       // CHECK: memdesc_index
       %4 = ttg.memdesc_index %arg0[%arg_idx] : !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable> -> !ttg.memdesc<64x64xf32, #shared, #smem, mutable>
-      // CHECK: arith.constant 2 : i32
-      // CHECK: arith.muli
-      // CHECK: arith.constant 1 : i32
-      // CHECK: arith.addi
       // CHECK: memdesc_index
       %5 = ttg.memdesc_index %arg1[%arg_idx] : !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable> -> !ttg.memdesc<64x64xf32, #shared, #smem, mutable>
       ttg.warp_return

@@ -1583,11 +1583,8 @@ module attributes {tlx.has_warp_spec_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.
 }
 
 // CHECK-LABEL:   tt.func @add2_warp_specialized_kernel(
-// CHECK:       %[[VAL_0:.*]] = arith.constant 0 : i32
-// CHECK:           ttg.warp_specialize(%arg3, %[[VAL_0]], %arg4, %arg5)
+// CHECK:           ttg.warp_specialize(%arg3, %arg4, %arg5)
 // CHECK:           default {
 // CHECK:           }
-// CHECK:           partition0(%[[VAL_7:.*]]: !tt.ptr<f32>, %[[VAL_8:.*]]: i32, %[[VAL_9:.*]]: !tt.ptr<f32>, %[[VAL_10:.*]]: !tt.ptr<f32>)
+// CHECK:           partition0(%[[VAL_7:.*]]: !tt.ptr<f32>, %[[VAL_9:.*]]: !tt.ptr<f32>, %[[VAL_10:.*]]: !tt.ptr<f32>)
 // CHECK:             %[[VAL_1:.*]] = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32
-// CHECK:             %[[VAL_2:.*]] = tt.splat %[[VAL_8]] : i32 -> tensor<1024xi32
-// CHECK:             %[[VAL_3:.*]] = arith.addi %[[VAL_1]], %[[VAL_2]] : tensor<1024xi32

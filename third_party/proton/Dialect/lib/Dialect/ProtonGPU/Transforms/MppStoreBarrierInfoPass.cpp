@@ -611,8 +611,8 @@ private:
     // Check warp specialize partitions
     if (auto partitionsOp =
             dyn_cast<triton::gpu::WarpSpecializePartitionsOp>(parentOp))
-      if (argIdx < partitionsOp.getParentOp().getNumOperands())
-        return getBarrierInfo(partitionsOp.getParentOp().getOperand(argIdx),
+      if (argIdx < partitionsOp.getNumOperands())
+        return getBarrierInfo(partitionsOp.getOperand(argIdx),
                               depth + 1);
 
     return std::nullopt;
