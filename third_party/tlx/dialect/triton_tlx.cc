@@ -1,9 +1,9 @@
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
 #include "IR/Dialect.h"
 #include "Transforms/Passes.h"
 #include "ir.h"
 #include "mlir/Pass/PassManager.h"
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 
 namespace ir {
 pybind11::class_<TritonOpBuilder> *getBuilderClass();
@@ -24,17 +24,17 @@ namespace ttg = triton::gpu;
 namespace ttng = triton::nvidia_gpu;
 namespace tlx = triton::tlx;
 
-
-static ttg::CGAEncodingAttr makeCGALayout(
-    mlir::MLIRContext *ctx,
-    llvm::ArrayRef<unsigned> CTAsPerCGA,
-    llvm::ArrayRef<unsigned> CTASplitNum,
-    llvm::ArrayRef<unsigned> CTAOrder) {
+static ttg::CGAEncodingAttr makeCGALayout(mlir::MLIRContext *ctx,
+                                          llvm::ArrayRef<unsigned> CTAsPerCGA,
+                                          llvm::ArrayRef<unsigned> CTASplitNum,
+                                          llvm::ArrayRef<unsigned> CTAOrder) {
   // Construct CGAEncodingAttr from legacy parameters
   // For simple 1-CTA case, use get1CTALayout
   unsigned rank = CTAsPerCGA.size();
   bool isSingleCTA = true;
-  for (auto c : CTAsPerCGA) if (c != 1) isSingleCTA = false;
+  for (auto c : CTAsPerCGA)
+    if (c != 1)
+      isSingleCTA = false;
   if (isSingleCTA) {
     return ttg::CGAEncodingAttr::get1CTALayout(ctx, rank);
   }
@@ -139,10 +139,10 @@ void init_triton_tlx_ir(py::module &&m) {
              auto axisAttr = IntegerAttr::get(i32Ty, axis);
              auto subViewType = cast<ttg::MemDescType>(subView.getType());
              auto indicesType = dyn_cast<RankedTensorType>(indices.getType());
-             auto resultType = RankedTensorType::get(indicesType.getShape(),
-                                                     subViewType.getElementType());
-             return self.create<ttg::LocalGatherOp>(resultType, subView, indices,
-                                                    axisAttr);
+             auto resultType = RankedTensorType::get(
+                 indicesType.getShape(), subViewType.getElementType());
+             return self.create<ttg::LocalGatherOp>(resultType, subView,
+                                                    indices, axisAttr);
            })
       .def("create_local_scatter",
            [](TritonOpBuilder &self, Value subView, Value values, Value indices,
@@ -181,7 +181,8 @@ void init_triton_tlx_ir(py::module &&m) {
              assert(order.size() == CTASplitNum.size() && "shape mismatch");
              assert(order.size() == CTAOrder.size() && "shape mismatch");
              auto context = self.getBuilder().getContext();
-             auto CTALayout = makeCGALayout(context, CTAsPerCGA, CTASplitNum, CTAOrder);
+             auto CTALayout =
+                 makeCGALayout(context, CTAsPerCGA, CTASplitNum, CTAOrder);
              return mlir::cast<Attribute>(ttg::SwizzledSharedEncodingAttr::get(
                  context, vectorSize, perPhase, maxPhase, order, CTALayout));
            })
@@ -189,13 +190,17 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, unsigned blockM, unsigned blockN,
               unsigned colStride, unsigned CTASplitM, unsigned CTASplitN) {
              auto context = self.getBuilder().getContext();
-             return mlir::cast<Attribute>(ttng::TensorMemoryEncodingAttr::get(context, blockM, blockN, colStride, ttg::CGAEncodingAttr::get1CTALayout(context, 2), /*twoCTAs=*/false));
+             return mlir::cast<Attribute>(ttng::TensorMemoryEncodingAttr::get(
+                 context, blockM, blockN, colStride,
+                 ttg::CGAEncodingAttr::get1CTALayout(context, 2),
+                 /*twoCTAs=*/false));
            })
       .def("make_tensor_memory_scales_encoding_attr",
            [](TritonOpBuilder &self, unsigned CTASplitM, unsigned CTASplitN) {
              auto context = self.getBuilder().getContext();
              return mlir::cast<Attribute>(
-                 ttng::TensorMemoryScalesEncodingAttr::get(context, ttg::CGAEncodingAttr::get1CTALayout(context, 2)));
+                 ttng::TensorMemoryScalesEncodingAttr::get(
+                     context, ttg::CGAEncodingAttr::get1CTALayout(context, 2)));
            })
       .def("make_nv_mma_shared_encoding_attr",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
@@ -211,7 +216,8 @@ void init_triton_tlx_ir(py::module &&m) {
              /* Validation logic for user defined layout encoding end */
 
              auto context = self.getBuilder().getContext();
-             auto CTALayout = makeCGALayout(context, CTAsPerCGA, CTASplitNum, CTAOrder);
+             auto CTALayout =
+                 makeCGALayout(context, CTAsPerCGA, CTASplitNum, CTAOrder);
              if (swizzled) {
                return mlir::cast<Attribute>(ttg::NVMMASharedEncodingAttr::get(
                    context, shape, order, CTALayout, elemType, fp4Padded));
@@ -241,7 +247,8 @@ void init_triton_tlx_ir(py::module &&m) {
              SmallVector<unsigned, 2> CTAsPerCGA = {1, 1};
              SmallVector<unsigned, 2> CTASplitNum = {1, 1};
              SmallVector<unsigned, 2> CTAOrder = {1, 0};
-             auto CTALayout = makeCGALayout(context, CTAsPerCGA, CTASplitNum, CTAOrder);
+             auto CTALayout =
+                 makeCGALayout(context, CTAsPerCGA, CTASplitNum, CTAOrder);
              return mlir::cast<Attribute>(ttg::NvidiaMmaEncodingAttr::get(
                  context, versionMajor, versionMinor, warpsPerCTA, CTALayout,
                  instrShape));
@@ -339,9 +346,8 @@ void init_triton_tlx_ir(py::module &&m) {
                // Obtain the single buffer view
                Value idx = self.getBuilder().create<arith::ConstantIntOp>(
                    bufferViews.getLoc(), i, 32);
-               mlir::Value buf =
-                   self.create<ttg::MemDescIndexOp>(
-                       singleBarrierMemDescType, bufferViews, idx);
+               mlir::Value buf = self.create<ttg::MemDescIndexOp>(
+                   singleBarrierMemDescType, bufferViews, idx);
 
                // Initialize mbarrier at buf view
                self.create<ttng::InitBarrierOp>(buf,
@@ -413,7 +419,8 @@ void init_triton_tlx_ir(py::module &&m) {
                                                   subViewType.getElementType(),
                                                   layoutEncoding);
              // TODO: TMEMLoadOp signature changed in upstream
-             return Value(); // self.create<ttng::TMEMLoadOp>(newType, subView, asyncToken.value_or(Value()));
+             return Value(); // self.create<ttng::TMEMLoadOp>(newType, subView,
+                             // asyncToken.value_or(Value()));
            })
       .def("create_tmem_store",
            [](TritonOpBuilder &self, Value &dst, Value &src) -> void {
@@ -447,8 +454,9 @@ void init_triton_tlx_ir(py::module &&m) {
              // TODO: upstream TCGen5MMAOp signature changed
              // self.create<ttng::TCGen5MMAOp>(
              //     tokType, a, b, d, Value(),
-             //     useD.has_value() ? useD.value() : predTrue, pred.has_value() ? pred.value() : predTrue,
-             //     twoCTAs, ValueRange(mBarriers), ValueRange(barrierPreds), isAsync);
+             //     useD.has_value() ? useD.value() : predTrue, pred.has_value()
+             //     ? pred.value() : predTrue, twoCTAs, ValueRange(mBarriers),
+             //     ValueRange(barrierPreds), isAsync);
            })
       .def("create_tcgen5_dot_scaled",
            [](TritonOpBuilder &self, Value a, Value b, Value d, Value aScale,
@@ -467,8 +475,9 @@ void init_triton_tlx_ir(py::module &&m) {
              // TODO: upstream TCGen5MMAScaledOp signature changed
              // self.create<ttng::TCGen5MMAScaledOp>(
              //     tokType, a, b, d, Value(), aScale, bScale, aType, bType,
-             //     useD.has_value() ? useD.value() : predTrue, pred.has_value() ? pred.value() : predTrue,
-             //     twoCTAs, ValueRange(mBarriers), ValueRange(barrierPreds), isAsync);
+             //     useD.has_value() ? useD.value() : predTrue, pred.has_value()
+             //     ? pred.value() : predTrue, twoCTAs, ValueRange(mBarriers),
+             //     ValueRange(barrierPreds), isAsync);
            })
       .def("create_tcgen05_commit",
            [](TritonOpBuilder &self, Value &barrier, Value &pred) -> void {
@@ -686,7 +695,8 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, std::vector<Value> &multicastTargets,
               Value desc, std::vector<Value> &coord, Value mbarrier, Value pred,
               Value result, mlir::triton::CacheModifier cacheModifier,
-              mlir::triton::EvictionPolicy evictionPolicy, bool isVolatile) -> void {
+              mlir::triton::EvictionPolicy evictionPolicy,
+              bool isVolatile) -> void {
              Value multicastTargetBitMask;
              if (multicastTargets.empty()) {
                multicastTargetBitMask = Value();
@@ -716,16 +726,19 @@ void init_triton_tlx_ir(py::module &&m) {
            })
       .def("create_async_TMA_store",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,
-              Value source, mlir::triton::EvictionPolicy evictionPolicy) -> void {
+              Value source,
+              mlir::triton::EvictionPolicy evictionPolicy) -> void {
              // TODO: upstream AsyncTMACopyLocalToGlobalOp signature changed
-             // self.create<ttng::AsyncTMACopyLocalToGlobalOp>(desc, coord, source,
+             // self.create<ttng::AsyncTMACopyLocalToGlobalOp>(desc, coord,
+             // source,
              //                                                evictionPolicy);
            })
       .def("create_async_TMA_reduce",
            [](TritonOpBuilder &self, tt::DescriptorReduceKind kind, Value desc,
               std::vector<Value> &coord, Value source,
               mlir::triton::EvictionPolicy evictionPolicy) -> void {
-             // self.create<ttng::AsyncTMAReduceOp>(kind, desc, coord, source, evictionPolicy);
+             // self.create<ttng::AsyncTMAReduceOp>(kind, desc, coord, source,
+             // evictionPolicy);
            })
       .def("create_async_TMA_store_wait",
            [](TritonOpBuilder &self, int pendings) {
@@ -772,9 +785,10 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_async_load",
            [](TritonOpBuilder &self, Value ptrTensor, Value result,
               std::optional<Value> mask, std::optional<Value> other,
-              mlir::triton::CacheModifier cacheModifier, mlir::triton::EvictionPolicy evictionPolicy,
-              bool isVolatile, std::optional<Value> bulkSize,
-              std::optional<Value> barrier, bool useBulk) -> mlir::Value {
+              mlir::triton::CacheModifier cacheModifier,
+              mlir::triton::EvictionPolicy evictionPolicy, bool isVolatile,
+              std::optional<Value> bulkSize, std::optional<Value> barrier,
+              bool useBulk) -> mlir::Value {
              return self.create<ttg::AsyncCopyGlobalToLocalOp>(
                  ptrTensor, result, mask.value_or(Value()),
                  other.value_or(Value()), cacheModifier, evictionPolicy,
@@ -802,7 +816,8 @@ void init_triton_tlx_ir(py::module &&m) {
              // Create rounding mode attribute
              auto roundingAttr = tt::RoundingModeAttr::get(
                  self.getContext(), tt::RoundingMode::RS);
-             return self.create<mlir::triton::FpToFpOp>(dstType, src, rbits, roundingAttr);
+             return self.create<mlir::triton::FpToFpOp>(dstType, src, rbits,
+                                                        roundingAttr);
            })
       .def("create_cluster_cta_rank",
            [](TritonOpBuilder &self) -> Value {

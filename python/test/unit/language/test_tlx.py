@@ -373,7 +373,7 @@ def _generate_test_params():
     dims_k = [16, 32, 64]
     dtype = torch.float16
     params = []
-    
+
     for M, N, K in itertools.product(dims_mn, dims_mn, dims_k):
         device_props = str(torch.cuda.get_device_properties())
         matmul_size = (M * K + K * N) * dtype.itemsize

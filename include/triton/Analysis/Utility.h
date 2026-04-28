@@ -280,7 +280,8 @@ multiRootTopologicalSort(const SetVector<Operation *> &toSort);
 
 /// This uses the toplogicalSort above
 SetVector<Operation *>
-multiRootGetSlice(Operation *op, TransitiveFilter backwardFilter = nullptr, TransitiveFilter forwardFilter = nullptr);
+multiRootGetSlice(Operation *op, TransitiveFilter backwardFilter = nullptr,
+                  TransitiveFilter forwardFilter = nullptr);
 
 // Check if the given operations's forward slice has an op of the template types
 template <typename... OpTs>
@@ -288,7 +289,9 @@ bool hasOpOfAnyTypeInForwardSlice(Operation *liveOp) {
   llvm::SetVector<Operation *> forwardSlice;
   getForwardSlice(liveOp, &forwardSlice);
 
-  for (Operation *op : forwardSlice) { if ((isa<OpTs>(op) || ...)) return true;
+  for (Operation *op : forwardSlice) {
+    if ((isa<OpTs>(op) || ...))
+      return true;
   }
   return false;
 }

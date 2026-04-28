@@ -645,17 +645,6 @@ def test_tma_store(FAILURE, device, run_wrapper, monkeypatch, num_ctas):
             assert result.exc is None
             assert result.driver_stderr_output == ""
         return
-@gluon.jit
-def tcgen5_mma_kernel(input_desc, XBLOCK: ttgl.constexpr, FAILURE: ttgl.constexpr, MEM_ACCESS_KIND: ttgl.constexpr):
-    acc_layout: ttgl.constexpr = blackwell.TensorMemoryLayout([XBLOCK, XBLOCK], col_stride=1, cta_split_num=[1, 1])
-    blocked_layout: ttgl.constexpr = ttgl.BlockedLayout(size_per_thread=[1, XBLOCK], threads_per_warp=[32, 1],
-                                                        warps_per_cta=[4, 1], order=[0, 1])
-    smemA = ttgl.allocate_shared_memory(ttgl.float16, [XBLOCK, XBLOCK], input_desc.layout)
-    smemB = ttgl.allocate_shared_memory(ttgl.float16, [XBLOCK, XBLOCK], input_desc.layout)
-    bar = ttgl.allocate_shared_memory(ttgl.int64, [2, 1], mbarrier.MBarrierLayout())
-    acc = blackwell.allocate_tensor_memory(ttgl.float32, [XBLOCK, XBLOCK], acc_layout)
-    mbarrier.init(bar.index(0), count=1)
-    mbarrier.init(bar.index(1), count=1)
 
     monkeypatch.setenv("TRITON_INSTRUMENTATION_MODE", "consan")
     monkeypatch.setenv("CUDA_LAUNCH_BLOCKING", "1")
@@ -936,7 +925,6 @@ def test_warpgroup_mma2(FAILURE, device, run_wrapper, monkeypatch, num_ctas):
 
     input = torch.randn((XBLOCK, XBLOCK), device=device, dtype=torch.float16)
     kernel[(1, )](input, FAILURE=FAILURE, num_ctas=num_ctas)
-    warpgroup_mma_kernel[(1, )](input, XBLOCK, FAILURE=FAILURE)
 
 
 @gluon.jit

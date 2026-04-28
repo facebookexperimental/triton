@@ -1,8 +1,8 @@
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "mlir/IR/DialectImplementation.h" // required by `Types.cpp.inc`
+#include "third_party/tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
-#include "third_party/tlx/dialect/include/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "llvm/ADT/TypeSwitch.h" // required by `Types.cpp.inc`
 
@@ -152,12 +152,10 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     }
   } else if (auto enc = dyn_cast<SharedEncodingTrait>(encoding)) {
     if (memorySpace != SharedMemorySpaceAttr::get(ctx) &&
-        memorySpace !=
-            nvidia_gpu::SharedClusterMemorySpaceAttr::get(ctx)) {
-      return emitError()
-             << "memorySpace must be SharedMemorySpace or "
-             << "SharedClusterMemorySpace for shared encoding. "
-             << "Got " << memorySpace;
+        memorySpace != nvidia_gpu::SharedClusterMemorySpaceAttr::get(ctx)) {
+      return emitError() << "memorySpace must be SharedMemorySpace or "
+                         << "SharedClusterMemorySpace for shared encoding. "
+                         << "Got " << memorySpace;
     }
     auto rank = cast<LayoutEncodingTrait>(enc).getRank();
     if (!(rank == shape.size() || rank == shape.size() - 1)) {

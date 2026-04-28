@@ -32,7 +32,8 @@ public:
     // ws should not capture RankedTensorType
     ttg::WarpSpecializeOp invalidWSOp = nullptr;
     auto result = mod.walk([&](ttg::WarpSpecializeOp op) {
-      for (auto argType : op.getPartitionOp().getExplicitCaptures().getTypes()) {
+      for (auto argType :
+           op.getPartitionOp().getExplicitCaptures().getTypes()) {
         if (isa<RankedTensorType>(argType)) {
           invalidWSOp = op;
           return WalkResult::interrupt();
