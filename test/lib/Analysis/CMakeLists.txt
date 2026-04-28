@@ -1,12 +1,10 @@
-add_mlir_library(TritonTestAnalysis
+add_library(TritonTestAnalysis
   TestAlias.cpp
   TestAxisInfo.cpp
   TestAllocation.cpp
   TestBufferRegion.cpp
   TestMembar.cpp
   TestPrintNesting.cpp
-
-  LINK_LIBS PUBLIC
-  MLIRPass
-  TritonAnalysis
 )
+target_link_libraries(TritonTestAnalysis PUBLIC MLIRPass TritonAnalysis)
+target_compile_options(TritonTestAnalysis PRIVATE ${TRITON_DISABLE_EH_RTTI_FLAGS})
