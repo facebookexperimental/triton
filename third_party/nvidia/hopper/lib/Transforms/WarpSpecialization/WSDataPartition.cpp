@@ -896,7 +896,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     }
     mappings.map(op, newOp);
     reverseMappings.map(newOp, op);
-    // set result shape
+    // set result shape for all results
     for (auto [v, newV] : llvm::zip(op->getResults(), newOp->getResults())) {
       bool needRetype = true;
       if (dim == DataPartitionScheme::noOpPartitionDim) {
