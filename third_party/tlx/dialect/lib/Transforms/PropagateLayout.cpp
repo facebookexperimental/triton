@@ -101,6 +101,7 @@ public:
         return WalkResult::advance();
 
       if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(op)) {
+        auto partitionsOp = wsOp.getPartitionOp();
         Region *firstRegion = wsOp.getPartitionRegions()[0];
         for (auto [i, blockArg] :
              llvm::enumerate(firstRegion->getArguments())) {
@@ -118,6 +119,13 @@ public:
                   origType, lattice->getValue().getLayoutEncoding());
               partitionRegion->getArgument(i).setType(newType);
             }
+          }
+          // Also update the capture value's type on the partitions op.
+          if (auto origType =
+                  dyn_cast<ttg::MemDescType>(blockArg.getType())) {
+            auto newType = getNewMemDescType(
+                origType, lattice->getValue().getLayoutEncoding());
+            partitionsOp.getExplicitCaptures()[i].setType(newType);
           }
         }
         return WalkResult::advance();
