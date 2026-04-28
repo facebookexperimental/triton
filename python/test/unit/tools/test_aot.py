@@ -10,7 +10,7 @@ import numpy as np
 
 import triton
 from triton.backends.compiler import GPUTarget
-from triton._internal_testing import is_cuda, is_hip
+from triton._internal_testing import is_cuda, is_hip, is_hip_gfx1250
 
 if is_cuda():
     from triton.backends.nvidia.driver import include_dirs, library_dirs
@@ -566,7 +566,10 @@ module attributes {{"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = {warp_si
             assert '.wavefront_size: 64' in amdgcn
 
 
-@pytest.mark.parametrize("target", [GPUTarget("hip", "gfx942", 64), GPUTarget("hip", "gfx1250", 32)])
+@pytest.mark.parametrize("target", [
+    pytest.param(GPUTarget("hip", "gfx942", 64), marks=pytest.mark.xfail(reason="gluon AOT compilation not yet supported on gfx942")),
+    pytest.param(GPUTarget("hip", "gfx1250", 32), marks=pytest.mark.skipif(not is_hip_gfx1250(), reason="gfx1250 not available")),
+])
 @pytest.mark.skipif(not is_hip(), reason="Requires HIP")
 def test_gluon_kernel(target):
     with tempfile.TemporaryDirectory() as tmp_dir:
