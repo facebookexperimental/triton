@@ -142,7 +142,7 @@ LogicalResult rewriteLocalAlias(ModuleOp m) {
       } else {
         assert(isa<ttng::TMEMAllocOp>(baseAllocOp) && "Unexpected alloc op");
         newAllocOp = ttng::TMEMAllocOp::create(builder, baseAllocOp->getLoc(),
-                                                       maxType, nullptr);
+                                               maxType, nullptr);
       }
       // Save mapping so we can rewrite uses later.
       allocToNewAlloc[baseAllocOp] = newAllocOp;
