@@ -3,7 +3,7 @@ import torch
 import re
 import triton
 import triton.language as tl
-from triton._internal_testing import is_hopper_or_newer, is_hip
+from triton._internal_testing import is_hopper_or_newer, is_hip, is_hip_gfx1250
 import triton.language.extra.tlx as tlx
 
 
@@ -125,7 +125,7 @@ def run_tlx_square(func, BLOCK_SIZE, device, expected_arrival_count=1):
 
 
 # Unit test for arrive/wait
-@pytest.mark.skipif(not (is_hip() or is_hopper_or_newer()), reason="Need Hopper or newer or AMD")
+@pytest.mark.skipif(not (is_hip_gfx1250() or is_hopper_or_newer()), reason="Need Hopper or newer or AMD gfx1250")
 @pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
 def test_wait_arrive_non_ws(BLOCK_SIZE, device):
     expected_arrival_count = 4 if is_hip() else 1
