@@ -307,8 +307,7 @@ class CUDABackend(BaseBackend):
         # Handle storage lowering. In the future this may need
         # dummy layouts
         tlx.tlx_passes.add_tlx_storage_alias_lowering(pm)
-        # Only determine layouts after inlining is finished.
-        tlx.tlx_passes.add_tlx_resolve_placeholder_layouts(pm)
+
         passes.ttir.add_rewrite_tensor_pointer(pm)
         if capability // 10 < 9:
             passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
@@ -360,6 +359,8 @@ class CUDABackend(BaseBackend):
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
+        # Only determine reg layouts after TMEM layout is finalized
+        tlx.tlx_passes.add_tlx_resolve_placeholder_layouts(pm)
         tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
         # TODO(Qingyi): Move PlanCTAPass to the front of CoalescePass
