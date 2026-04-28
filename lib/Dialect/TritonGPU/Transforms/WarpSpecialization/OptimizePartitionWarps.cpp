@@ -346,6 +346,14 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
         shrunk = true;
       }
     } while (shrunk);
+
+    // If still over budget after shrinking, signal that WS should be removed.
+    if (computeTotalWarps() > maxWarps) {
+      mlir::emitWarning(wsOp.getLoc())
+          << "Warp budget exceeded (" << computeTotalWarps() << " > "
+          << maxWarps << " warps). Falling back to non-warp-specialized code.";
+      return failure();
+    }
   }
   int minRegAutoWS = 24; // default value
   if (auto attr = mod->getAttrOfType<IntegerAttr>(AttrMinRegAutoWSName)) {
@@ -424,7 +432,24 @@ void OptimizePartitionWarps::runOnOperation() {
 
   for (auto wsOp : wsOps) {
     if (failed(optimizePartitionNumWarps(axisInfo, wsOp, runPipelineFn))) {
-      return signalPassFailure();
+      // Budget exceeded — inline the default region and remove the
+      // WarpSpecializeOp so the kernel compiles without warp specialization.
+      OpBuilder b(wsOp);
+      Block *parentBlock = wsOp->getBlock();
+      Block &defaultBlock = wsOp.getDefaultRegion().front();
+
+      // Replace WarpYieldOp results with the wsOp results' replacements.
+      auto yield = cast<WarpYieldOp>(defaultBlock.getTerminator());
+      for (auto [result, yieldVal] :
+           llvm::zip(wsOp.getResults(), yield.getOperands()))
+        result.replaceAllUsesWith(yieldVal);
+      yield->erase();
+
+      // Inline the default region before the WarpSpecializeOp.
+      b.setInsertionPoint(wsOp);
+      parentBlock->getOperations().splice(wsOp->getIterator(),
+                                          defaultBlock.getOperations());
+      wsOp->erase();
     }
   }
 }
