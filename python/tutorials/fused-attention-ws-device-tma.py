@@ -923,6 +923,28 @@ configs_bwd = [
 configs_bwd_persist = [
     triton.Config(
         {
+            "BLOCK_M1": 128,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 128,
+            "EPILOGUE_SUBTILE": 4,
+            "BWD_DOT_ATTRS": _DEFAULT_BWD_DOT_ATTRS,
+        },
+        num_warps=4,
+        num_stages=2,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M1": 128, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 128, "EPILOGUE_SUBTILE": 4, "BWD_DOT_ATTRS":
+            _BWD_DOT_ATTRS_SCHED,  # use memory planner heuristics
+        },
+        num_warps=4,
+        num_stages=2,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+    ),
+    triton.Config(
+        {
             "BLOCK_M1": 64,
             "BLOCK_N1": 128,
             "BLOCK_M2": 128,
@@ -1248,7 +1270,8 @@ def _attn_bwd_persist(
 class _attention_opt(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE):
+    def forward(ctx, q, k, v, causal, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE,
+                early_tma_store_lowering=False):
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         # when v is in float8_e5m2 it is transposed.
@@ -1299,53 +1322,53 @@ class _attention_opt(torch.autograd.Function):
         ctx.grid = grid
         persistent = baseVariant == "persistent" or baseVariant == "ws_persistent"
         if is_blackwell() and warp_specialize:
-            if HEAD_DIM_K == 128 and (q.dtype == torch.float16 or q.dtype == torch.bfloat16):
-                extra_kern_args["maxnreg"] = 128
+            extra_kern_args["maxnreg"] = 128
+        with triton.knobs.nvidia.scope():
+            triton.knobs.nvidia.use_meta_ws = True
+            triton.knobs.nvidia.use_meta_partition = True
+            if persistent:
+                _attn_fwd_persist[grid_persist](
+                    sm_scale,
+                    M,  #
+                    q.shape[0],
+                    q.shape[1],  #
+                    desc_q,
+                    desc_k,
+                    desc_v,
+                    desc_o,  #
+                    N_CTX=q.shape[2],  #
+                    HEAD_DIM=HEAD_DIM_K,  #
+                    FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
+                    STAGE=stage,  #
+                    warp_specialize=warp_specialize,
+                    OUTER_LOOP=True,
+                    dtype=torch_dtype_to_triton(q.dtype),
+                    SUBTILING=SUBTILING,
+                    VECT_MUL=VECT_MUL,
+                    FADD2_REDUCE=FADD2_REDUCE,
+                    **extra_kern_args,
+                )
             else:
-                extra_kern_args["maxnreg"] = 128
-        if persistent:
-            _attn_fwd_persist[grid_persist](
-                sm_scale,
-                M,  #
-                q.shape[0],
-                q.shape[1],  #
-                desc_q,
-                desc_k,
-                desc_v,
-                desc_o,  #
-                N_CTX=q.shape[2],  #
-                HEAD_DIM=HEAD_DIM_K,  #
-                FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
-                STAGE=stage,  #
-                warp_specialize=warp_specialize,
-                OUTER_LOOP=True,
-                dtype=torch_dtype_to_triton(q.dtype),
-                SUBTILING=SUBTILING,
-                VECT_MUL=VECT_MUL,
-                FADD2_REDUCE=FADD2_REDUCE,
-                **extra_kern_args,
-            )
-        else:
-            _attn_fwd[grid](
-                sm_scale,
-                M,  #
-                q.shape[0],
-                q.shape[1],  #
-                desc_q,
-                desc_k,
-                desc_v,
-                desc_o,  #
-                N_CTX=q.shape[2],  #
-                HEAD_DIM=HEAD_DIM_K,  #
-                FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
-                STAGE=stage,  #
-                warp_specialize=warp_specialize,
-                dtype=torch_dtype_to_triton(q.dtype),
-                SUBTILING=SUBTILING,
-                VECT_MUL=VECT_MUL,
-                FADD2_REDUCE=FADD2_REDUCE,
-                **extra_kern_args,
-            )
+                _attn_fwd[grid](
+                    sm_scale,
+                    M,  #
+                    q.shape[0],
+                    q.shape[1],  #
+                    desc_q,
+                    desc_k,
+                    desc_v,
+                    desc_o,  #
+                    N_CTX=q.shape[2],  #
+                    HEAD_DIM=HEAD_DIM_K,  #
+                    FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
+                    STAGE=stage,  #
+                    warp_specialize=warp_specialize,
+                    dtype=torch_dtype_to_triton(q.dtype),
+                    SUBTILING=SUBTILING,
+                    VECT_MUL=VECT_MUL,
+                    FADD2_REDUCE=FADD2_REDUCE,
+                    **extra_kern_args,
+                )
 
         ctx.save_for_backward(q, k, v, o, M)
 
@@ -1353,6 +1376,7 @@ class _attention_opt(torch.autograd.Function):
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
         ctx.persistent = persistent
+        ctx.early_tma_store_lowering = early_tma_store_lowering
         return o
 
     @staticmethod
@@ -1469,57 +1493,63 @@ class _attention_opt(torch.autograd.Function):
                     1,
                 )
 
-            _attn_bwd_persist[grid_persist_bwd](
-                desc_q,
-                desc_k,
-                desc_v,
-                ctx.sm_scale,
-                desc_do,
-                desc_dq,
-                desc_dk,
-                desc_dv,  #
-                desc_m,
-                desc_delta,  #
-                q.stride(0),
-                q.stride(1),
-                q.stride(2),
-                q.stride(3),  #
-                BATCH,
-                N_HEAD,
-                N_CTX,  #
-                BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
-                HEAD_DIM=ctx.HEAD_DIM,  #
-                dtype=torch_dtype_to_triton(q.dtype),
-                warp_specialize=warp_specialize,
-                maxRegAutoWS=192,
-            )
-        else:
-            _attn_bwd[grid](
-                desc_q,
-                desc_k,
-                desc_v,
-                ctx.sm_scale,
-                desc_do,
-                desc_dq,
-                desc_dk,
-                desc_dv,  #
-                desc_m,
-                desc_delta,  #
-                q.stride(0),
-                q.stride(1),
-                q.stride(2),
-                q.stride(3),  #
-                BATCH,
-                N_HEAD,
-                N_CTX,  #
-                BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
-                HEAD_DIM=ctx.HEAD_DIM,  #
-                dtype=torch_dtype_to_triton(q.dtype),
-                warp_specialize=warp_specialize,
-                maxRegAutoWS=192,
-            )
+        with triton.knobs.nvidia.scope():
+            triton.knobs.nvidia.use_meta_ws = True
+            triton.knobs.nvidia.use_meta_partition = True
+            if ctx.persistent:
+                _attn_bwd_persist[grid_persist_bwd](
+                    desc_q,
+                    desc_k,
+                    desc_v,
+                    ctx.sm_scale,
+                    desc_do,
+                    desc_dq,
+                    desc_dk,
+                    desc_dv,  #
+                    desc_m,
+                    desc_delta,  #
+                    q.stride(0),
+                    q.stride(1),
+                    q.stride(2),
+                    q.stride(3),  #
+                    BATCH,
+                    N_HEAD,
+                    N_CTX,  #
+                    BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
+                    HEAD_DIM=ctx.HEAD_DIM,  #
+                    dtype=torch_dtype_to_triton(q.dtype),
+                    warp_specialize=warp_specialize,
+                    maxRegAutoWS=192,
+                    early_tma_store_lowering=ctx.early_tma_store_lowering,
+                )
+            else:
+                _attn_bwd[grid](
+                    desc_q,
+                    desc_k,
+                    desc_v,
+                    ctx.sm_scale,
+                    desc_do,
+                    desc_dq,
+                    desc_dk,
+                    desc_dv,  #
+                    desc_m,
+                    desc_delta,  #
+                    q.stride(0),
+                    q.stride(1),
+                    q.stride(2),
+                    q.stride(3),  #
+                    BATCH,
+                    N_HEAD,
+                    N_CTX,  #
+                    BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
+                    HEAD_DIM=ctx.HEAD_DIM,  #
+                    dtype=torch_dtype_to_triton(q.dtype),
+                    warp_specialize=warp_specialize,
+                    maxRegAutoWS=192,
+                    early_tma_store_lowering=ctx.early_tma_store_lowering,
+                )
 
-        return dq, dk, dv, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None
 
 
 attention = _attention_opt.apply
@@ -1541,6 +1571,7 @@ attention = _attention_opt.apply
 @pytest.mark.parametrize("VECT_MUL", [0])  # , 1, 2, 3])
 @pytest.mark.parametrize("FADD2_REDUCE", [False])
 @pytest.mark.parametrize("bwd_config_idx", range(len(configs_bwd_persist)))
+@pytest.mark.parametrize("early_tma_store_lowering", [False])
 def test_op(
     Z,
     H,
@@ -1554,6 +1585,7 @@ def test_op(
     VECT_MUL,
     FADD2_REDUCE,
     bwd_config_idx,
+    early_tma_store_lowering,
     dtype=torch.float16,
 ):
     # For fwd mode, only run once (bwd_config_idx=0) to avoid redundant tests
@@ -1602,7 +1634,10 @@ def test_op(
         v = v.permute(0, 1, 3, 2).contiguous()
         v = v.permute(0, 1, 3, 2)
         v = v.to(torch.float8_e5m2)
-    tri_out = attention(q, k, v, causal, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE).half()
+    if mode == "fwd" and early_tma_store_lowering:
+        pytest.skip("early_tma_store_lowering only applies to bwd mode")
+    tri_out = attention(q, k, v, causal, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE,
+                        early_tma_store_lowering).half()
     if mode == "fwd":
         atol = 3 if "fp8" in provider else 1e-2
         torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
@@ -1675,7 +1710,7 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, baseVariant, provider
         SUBTILING = True
         VECT_MUL = 1
         FADD2_REDUCE = False
-        fn = lambda: attention(q, k, v, False, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE)
+        fn = lambda: attention(q, k, v, False, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE, True)
         if mode == "bwd":
             o = fn()
             do = torch.randn_like(o)
