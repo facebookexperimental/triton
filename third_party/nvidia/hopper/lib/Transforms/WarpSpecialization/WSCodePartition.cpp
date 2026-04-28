@@ -27,6 +27,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/MapVector.h"
 #include <unordered_set>
 
@@ -1794,8 +1795,12 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
       // in SMEM rather than promoting them to TMEM. After conversion these
       // appear as a local_load of an nvws.descriptor_load buffer; otherwise
       // such a channel overflows the 512-column TMEM limit in FA backward.
-      bool useTMEM = cc >= 100 && tensorType.getShape().size() == 1 &&
+      bool useChannelSmem =
+          triton::tools::getBoolEnv("TRITON_META_WS_USE_CHANNEL_SMEM");
+      bool useTMEM = !useChannelSmem && cc >= 100 &&
+                     tensorType.getShape().size() == 1 &&
                      tensorType.getElementType().isIntOrFloat() &&
+                     !isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(srcOp) &&
                      !getConvertedDescriptorLoad(srcOp);
       auto res = createLocalAlloc(builder, channel, useTMEM);
       buffer = res.first;

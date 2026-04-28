@@ -543,4 +543,19 @@ void setWarpSpecializeTag(Operation *op, int tag) {
   op->setAttr(kWarpSpecializeTagAttrName, b.getI32IntegerAttr(tag));
 }
 
+LogicalResult verifyPartitionedLoop(scf::ForOp loop) {
+  if (failed(verifyPartitionAttrs(loop)))
+    return failure();
+
+  LogicalResult result = success();
+  loop.walk([&](Operation *op) {
+    if (failed(verifyPartitionAttrs(op))) {
+      result = failure();
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return result;
+}
+
 } // namespace mlir::triton::gpu

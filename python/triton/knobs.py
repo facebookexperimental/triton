@@ -597,6 +597,7 @@ class nvidia_knobs(base_knobs):
 
     libdevice_path: env_opt_str = env_opt_str("TRITON_LIBDEVICE_PATH")
     libcuda_path: env_opt_str = env_opt_str("TRITON_LIBCUDA_PATH")
+    use_nvws_meta: env_bool = env_bool("TRITON_NVWS_USE_META")
     use_meta_ws: env_bool = env_bool("TRITON_USE_META_WS")
 
     # Environment used to spawn the NVIDIA tools above. `None` inherits the

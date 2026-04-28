@@ -44,7 +44,7 @@ tt.func @matmul_change_desc_in_prologue(
   // PIPELINE-NOT: tc_gen5_mma
   // CHECK-LABEL: partition1
   // OPT-LABEL: partition1
-  // OPT-SAME: num_warps(2)
+  // OPT-SAME: num_warps(1)
   // BASE-NOT: tt.make_tensor_descriptor
   // BASE-COUNT-2: ttg.global_scratch_alloc {alignment = 128 : i32, nbytes = 384 : i32}
   // BASE-COUNT-2: ttng.tensormap_create
