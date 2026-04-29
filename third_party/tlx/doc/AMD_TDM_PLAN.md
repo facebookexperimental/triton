@@ -126,10 +126,22 @@ honest about which hardware it targets, and matches the precedent set by
 Gluon's `ttgl.amd.gfx1250.tdm.*` namespace.
 
 **Why first:** Smallest stage with end-to-end value. After this commit
-the AMD-only TDM load case works on gfx1250 and exercises the downstream
-AMD pipeline (`Pipeline` → `UpdateAsyncWaitCount` → LLVM lowering).
-`ConvertToTensorOps` is bypassed for this path, but it still runs to
-catch any stray `tt.DescriptorLoadOp` (e.g., from `tl.load(desc, ...)`).
+the AMD-only TDM load case compiles on gfx1250 and exercises the
+downstream AMD pipeline (`Pipeline` → `UpdateAsyncWaitCount` → LLVM
+lowering). `ConvertToTensorOps` is bypassed for this path, but it still
+runs to catch any stray `tt.DescriptorLoadOp` (e.g., from
+`tl.load(desc, ...)`).
+
+**Known Stage A limitation (drives Stage B).** The default
+`tlx.local_alloc` returns a `SwizzledSharedEncodingAttr(maxPhase=1)`
+buffer. The TDM op verifier accepts this (its only check is "no
+swizzling"), so the kernel compiles cleanly, but on real gfx1250
+hardware `tensor_load_to_lds` requires a `PaddedSharedEncodingAttr`
+(or `PartitionedSharedEncodingAttr` containing one) to lay out LDS
+correctly — without it the load runs, the wait completes, and the
+subsequent `local_load` reads back garbage. Stage A's correctness
+test is marked `xfail(strict=True)` until Stage B exposes
+`PaddedSharedEncodingAttr` through `tlx.local_alloc`.
 
 ### Stage B — TDM-aware shared layouts in `local_alloc`
 
@@ -151,10 +163,14 @@ catch any stray `tt.DescriptorLoadOp` (e.g., from `tl.load(desc, ...)`).
   way it handles `NVMMASharedEncodingAttr` today (especially through
   `MemDescTransOp`).
 
-**Why after Stage A:** Stage A establishes that the TDM path works
-with whatever layout `ConvertToTensorOps` picks. Stage B gives users
-explicit control needed for kernels where the default layout splits
-TDM into too many intrinsics.
+**Why after Stage A:** Stage A wires up the IR-emission and proves the
+downstream AMD pipeline accepts the new ops, but its correctness test
+is `xfail` because `local_alloc`'s default
+`SwizzledSharedEncoding(maxPhase=1)` produces wrong LDS data on
+gfx1250 — `tensor_load_to_lds` needs a `PaddedSharedEncodingAttr`
+layout. Stage B exposes that encoding to TLX users (and turns the
+xfail green), and gives them explicit control needed for kernels where
+the default layout splits TDM into too many intrinsics.
 
 ### Stage C — Descriptor plumbing edges
 

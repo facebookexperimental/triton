@@ -756,6 +756,16 @@ def test_async_tdm_load_compiles_gfx1250(device):
         "expected tensor_load_to_lds intrinsic in AMDGCN, got:\n" + amdgcn)
 
 
+@pytest.mark.xfail(
+    reason=(
+        "TLX `local_alloc` defaults to SwizzledSharedEncoding(maxPhase=1), "
+        "which the TDM verifier accepts but gfx1250 hardware reads "
+        "incorrectly — TDM requires a PaddedSharedEncoding (or compatible) "
+        "to lay out the LDS the way `tensor_load_to_lds` expects. Exposing "
+        "PaddedSharedEncoding through `tlx.local_alloc` is Stage B of "
+        "third_party/tlx/doc/AMD_TDM_PLAN.md."),
+    strict=True,
+)
 def test_async_tdm_load_correctness_gfx1250(device):
     """tlx.async_tdm_load + async_tdm_wait produce correct results on gfx1250 hardware."""
     if not is_gfx1250_available():
