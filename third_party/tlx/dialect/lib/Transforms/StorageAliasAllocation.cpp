@@ -32,11 +32,11 @@ static void updateBlockArgTypesForUsers(Value newValue) {
   Type newType = newValue.getType();
   for (OpOperand &use : newValue.getUses()) {
     Operation *user = use.getOwner();
-    if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(user)) {
+    if (auto partOp = dyn_cast<ttg::WarpSpecializePartitionsOp>(user)) {
       unsigned idx = use.getOperandNumber();
-      for (Region *partition : wsOp.getPartitionRegions()) {
-        if (idx < partition->getNumArguments()) {
-          partition->getArgument(idx).setType(newType);
+      for (Region &partition : partOp.getPartitionRegions()) {
+        if (idx < partition.getNumArguments()) {
+          partition.getArgument(idx).setType(newType);
         }
       }
     }
@@ -59,14 +59,11 @@ collectMemDescIndexOps(Value memDesc,
     } else if (auto alias = dyn_cast<LocalAliasOp>(user)) {
       // Follow through nested aliases
       collectMemDescIndexOps(alias.getResult(), result);
-    } else if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(user)) {
-      // Follow through warp_specialize captures to partition block arguments.
-      // The alias may be captured as an operand; the corresponding block arg
-      // in each partition region is used inside the isolated region.
+    } else if (auto partOp = dyn_cast<ttg::WarpSpecializePartitionsOp>(user)) {
       unsigned idx = use.getOperandNumber();
-      for (Region *partition : wsOp.getPartitionRegions()) {
-        if (idx < partition->getNumArguments()) {
-          collectMemDescIndexOps(partition->getArgument(idx), result);
+      for (Region &partition : partOp.getPartitionRegions()) {
+        if (idx < partition.getNumArguments()) {
+          collectMemDescIndexOps(partition.getArgument(idx), result);
         }
       }
     }

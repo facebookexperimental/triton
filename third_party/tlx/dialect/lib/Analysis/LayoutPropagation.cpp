@@ -241,8 +241,11 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
 void LayoutBackwardPropagation::visitBranchOperand(OpOperand &operand) {
   auto branchOp = operand.getOwner();
   LDBG("Backward visiting branch op " << *branchOp << "\n");
-  if (isa<ttg::WarpSpecializeOp>(branchOp)) {
-    auto unused = visitRegionInReverse(branchOp);
+  if (isa<ttg::WarpSpecializeOp, ttg::WarpSpecializePartitionsOp>(branchOp)) {
+    auto *regionOp = isa<ttg::WarpSpecializePartitionsOp>(branchOp)
+                         ? branchOp->getParentOp()
+                         : branchOp;
+    auto unused = visitRegionInReverse(regionOp);
     (void)unused;
   }
 }
@@ -311,16 +314,15 @@ LogicalResult LayoutForwardPropagation::visitWarpSpecRegionArgs(
   // corresponding warp spec region arg if it is a captured arg.
   for (auto &use : result.getUses()) {
     Operation *user = use.getOwner();
-    if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(user)) {
+    if (auto partOp = dyn_cast<ttg::WarpSpecializePartitionsOp>(user)) {
       unsigned idx = use.getOperandNumber();
-      // Propagate to the i-th argument of every partition region
-      // Propagate to all the partition regions
-      for (Region *partitionRegion : wsOp.getPartitionRegions()) {
+      for (Region &partitionRegion : partOp.getPartitionRegions()) {
         auto blockArgumentLattice =
-            getLatticeElement(partitionRegion->getArgument(idx));
+            getLatticeElement(partitionRegion.getArgument(idx));
         ChangeResult changed = blockArgumentLattice->meet(resultEncoding);
         propagateIfChanged(blockArgumentLattice, changed);
       }
+      auto wsOp = partOp.getParentOp();
       if (failed(visitRegion(wsOp)))
         return failure();
     }
