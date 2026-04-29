@@ -148,31 +148,6 @@ public:
       return WalkResult::advance();
     });
 
-    // Fix up RequireLayoutOps feeding into TMEMStoreOps with scales encoding.
-    // ResolvePlaceholderLayouts assigned a generic TMEM-compatible register
-    // layout, but for scales the register layout must use a scales-compatible
-    // layout from getScaleTMEMStoreLinearLayout.
-    funcOp.walk([&](ttng::TMEMStoreOp storeOp) {
-      auto memTy = storeOp.getDst().getType();
-      if (!isa<ttng::TensorMemoryScalesEncodingAttr>(memTy.getEncoding()))
-        return WalkResult::advance();
-
-      auto requireOp = storeOp.getSrc().getDefiningOp<RequireLayoutOp>();
-      if (!requireOp)
-        return WalkResult::advance();
-
-      auto srcTy = cast<RankedTensorType>(requireOp.getResult().getType());
-      auto compatibleLayouts =
-          ttng::getTmemCompatibleLayouts(storeOp, srcTy, memTy);
-      assert(!compatibleLayouts.empty() &&
-             "No TMEM-compatible layout found for scales");
-      auto newEncoding = compatibleLayouts.front();
-      auto newType = RankedTensorType::get(srcTy.getShape(),
-                                           srcTy.getElementType(), newEncoding);
-      requireOp->getResult(0).setType(newType);
-      return WalkResult::advance();
-    });
-
     // Verify that no DummyTMEMLayoutAttr remains after layout propagation
     bool hasDummyLayout = false;
     funcOp.walk([&](ttng::TMEMAllocOp allocOp) {

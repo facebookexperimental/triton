@@ -48,8 +48,8 @@ static Attribute getDummyLayoutFromType(Type type) {
 /// BlockedEncodingAttr.
 ///
 static Attribute resolveRegisterLayout(DummyRegisterLayoutAttr dummyLayout,
-                                       Operation *contextOp,
-                                       ModuleOp moduleOp) {
+                                       Operation *contextOp, ModuleOp moduleOp,
+                                       Attribute tmemEncoding) {
   auto shape = dummyLayout.getShape();
   auto elementType = dummyLayout.getElementType();
   auto rank = shape.size();
@@ -61,22 +61,17 @@ static Attribute resolveRegisterLayout(DummyRegisterLayoutAttr dummyLayout,
 
   if (dummyLayout.getTmemCompatible()) {
     // Create a TMEM-compatible register layout
+    assert(tmemEncoding != nullptr &&
+           "missing TMEM layout when finding compatible reg layouts");
     assert(rank == 2 &&
            "Only supporting 2D tensors for TMEM compatible layout.");
     assert((numWarps == 4 || numWarps == 8) &&
            "Currently only support numWarps 4 or 8 for TMEM load and store.");
 
     auto *ctx = moduleOp.getContext();
-    unsigned bitwidth = elementType.getIntOrFloatBitWidth();
-    unsigned colStride = 32 / bitwidth;
-    auto tmemEncoding = ttng::TensorMemoryEncodingAttr::get(
-        ctx, shape[0], shape[1], colStride, /*CTASplitM=*/1,
-        /*CTASplitN=*/1, /*twoCTAs=*/false);
     auto memSpace = ttng::TensorMemorySpaceAttr::get(ctx);
     auto memDescType = ttg::MemDescType::get(shape, elementType, tmemEncoding,
                                              memSpace, /*mutableMemory=*/true);
-    auto ctaLayout =
-        ttg::CGAEncodingAttr::fromSplitParams(ctx, {1, 1}, {1, 1}, {1, 0});
 
     // Create a temporary RankedTensorType with a blocked encoding for
     // getTmemCompatibleLayout to use as a reference type.
@@ -109,9 +104,10 @@ static Attribute resolveRegisterLayout(DummyRegisterLayoutAttr dummyLayout,
 /// to determine the block dimensions.
 /// For register layouts from TMEMLoadOp, definingOp is used to get the source
 /// memdesc's allocation shape.
-static Attribute resolveDummyLayout(Attribute dummyLayout,
-                                    ArrayRef<int64_t> allocShape, Value value,
-                                    ModuleOp moduleOp) {
+static Attribute
+resolveDummyLayout(Attribute dummyLayout, ArrayRef<int64_t> allocShape,
+                   Value value, ModuleOp moduleOp,
+                   const DenseMap<Value, Attribute> &valuesToRefTMEMLayoutMap) {
   // Get the context operation for lookupNumWarps - this allows finding
   // partition-specific num_warps for warp specialized regions
   Operation *contextOp = nullptr;
@@ -124,8 +120,10 @@ static Attribute resolveDummyLayout(Attribute dummyLayout,
     contextOp = moduleOp;
   }
 
+  auto tmemLayout = valuesToRefTMEMLayoutMap.lookup_or(value, nullptr);
+
   if (auto regLayout = dyn_cast<DummyRegisterLayoutAttr>(dummyLayout))
-    return resolveRegisterLayout(regLayout, contextOp, moduleOp);
+    return resolveRegisterLayout(regLayout, contextOp, moduleOp, tmemLayout);
 
   llvm_unreachable("Unknown dummy layout type");
 }
@@ -153,13 +151,14 @@ static void replaceTypeWithNewEncoding(Value value, Attribute newEncoding) {
 
 LogicalResult resolvePlaceholderLayouts(ModuleOp moduleOp) {
   // Collect all values that have dummy layouts
-  SmallVector<std::pair<Value, Attribute>> valuesToResolve;
+  DenseMap<Value, Attribute> valuesToResolve;
+  DenseMap<Value, Attribute> valuesToRefTMEMLayoutMap;
 
   moduleOp.walk([&](Operation *op) {
     // Check all result types for dummy layouts
     for (Value result : op->getResults()) {
       if (Attribute dummyLayout = getDummyLayoutFromType(result.getType())) {
-        valuesToResolve.emplace_back(result, dummyLayout);
+        valuesToResolve.try_emplace(result, dummyLayout);
       }
     }
 
@@ -168,9 +167,25 @@ LogicalResult resolvePlaceholderLayouts(ModuleOp moduleOp) {
       for (Block &block : region) {
         for (BlockArgument arg : block.getArguments()) {
           if (Attribute dummyLayout = getDummyLayoutFromType(arg.getType())) {
-            valuesToResolve.emplace_back(arg, dummyLayout);
+            valuesToResolve.try_emplace(arg, dummyLayout);
           }
         }
+      }
+    }
+  });
+
+  moduleOp.walk([&](Operation *op) {
+    if (auto tmemLdOp = dyn_cast<ttng::TMEMLoadOp>(op)) {
+      auto v = tmemLdOp.getResult();
+      if (valuesToResolve.contains(v)) {
+        valuesToRefTMEMLayoutMap.try_emplace(
+            v, tmemLdOp.getSrc().getType().getEncoding());
+      }
+    } else if (auto tmemStOp = dyn_cast<ttng::TMEMStoreOp>(op)) {
+      auto v = tmemStOp.getSrc();
+      if (valuesToResolve.contains(v)) {
+        valuesToRefTMEMLayoutMap.try_emplace(
+            v, tmemStOp.getDst().getType().getEncoding());
       }
     }
   });
@@ -182,8 +197,8 @@ LogicalResult resolvePlaceholderLayouts(ModuleOp moduleOp) {
     if (auto memDescType = dyn_cast<ttg::MemDescType>(value.getType())) {
       allocShape = memDescType.getAllocShape();
     }
-    Attribute resolvedLayout =
-        resolveDummyLayout(dummyLayout, allocShape, value, moduleOp);
+    Attribute resolvedLayout = resolveDummyLayout(
+        dummyLayout, allocShape, value, moduleOp, valuesToRefTMEMLayoutMap);
     LLVM_DEBUG({
       DBGS() << "Resolving dummy layout: ";
       dummyLayout.dump();
