@@ -1120,8 +1120,12 @@ void init_gluon_ir(py::module &&m) {
             return *self.getPartitionRegions()[idx];
           },
           ret::reference)
-      .def("set_requested_registers", [](ttg::WarpSpecializeOp &self,
-                                         std::vector<int> &requestedRegisters) {
-        self.setRequestedRegisters(requestedRegisters);
+      .def("set_requested_registers",
+           [](ttg::WarpSpecializeOp &self,
+              std::vector<int> &requestedRegisters) {
+             self.setRequestedRegisters(requestedRegisters);
+           })
+      .def("get_partition_op", [](ttg::WarpSpecializeOp &self) -> OpState {
+        return self.getPartitionOp();
       });
 }

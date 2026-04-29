@@ -289,7 +289,9 @@ def visit_withAsyncTasks(self, node):
                 index += task_replicate
                 block.erase()
 
-        # Add captures
+        # Add captures to the partitions op (which owns explicitCaptures
+        # after the upstream refactor in PR #9133).
+        partition_op = ws_op.get_partition_op()
         captures = sorted(v for v in (liveins.keys() & self.used_vars) if not _is_constexpr(liveins[v]))
         for name in captures:
             val = liveins[name]
@@ -297,10 +299,10 @@ def visit_withAsyncTasks(self, node):
                 for field in val.type.fields:
                     v = getattr(val, field[0])
                     for h in _flatten_value_handles(v):
-                        ws_op.append_operand(h)
+                        partition_op.append_operand(h)
             else:
                 for h in _flatten_value_handles(val):
-                    ws_op.append_operand(h)
+                    partition_op.append_operand(h)
 
         # real codegen
         index = 0
