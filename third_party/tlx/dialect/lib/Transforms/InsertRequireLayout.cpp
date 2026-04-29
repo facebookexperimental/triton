@@ -1,4 +1,6 @@
 #include "IR/Dialect.h"
+#include "amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "amd/lib/TritonAMDGPUTransforms/Utility.h"
 #include "mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h"
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Analysis/DataFlow/SparseAnalysis.h"
@@ -22,6 +24,7 @@ using namespace mlir::dataflow;
 namespace tt = ::mlir::triton;
 namespace ttg = ::mlir::triton::gpu;
 namespace tlx = ::mlir::triton::tlx;
+namespace amdgpu = ::mlir::triton::amdgpu;
 
 namespace mlir {
 namespace triton {
@@ -313,6 +316,66 @@ static void materializeDotUserTensorConstraints(ModuleOp m,
   });
 }
 
+// ============================================================================
+// AMD TDM descriptor anchors
+// ============================================================================
+//
+// `amdgpu.async_tdm_copy_global_to_local` writes into a user-provided shared
+// memory buffer whose required encoding is determined by the descriptor's
+// shape and element type (the same fallback `OptimizeDescriptorEncoding`
+// applies). When TLX users allocate the buffer with the default
+// `local_alloc(...)` (no explicit `layout=`), the alloc's encoding is the
+// generic non-swizzled `SwizzledSharedEncoding(maxPhase=1)` — which the TDM
+// op verifier accepts but which produces wrong LDS data on real gfx1250
+// hardware. We anchor a `tlx.require_layout` on the buffer operand of every
+// TDM copy so `tlx-propagate-layout` rewrites the source `local_alloc` (and
+// any subview / loop-carrier chain) to the descriptor-compatible encoding.
+
+static void anchorTDMRequireLayout(amdgpu::AsyncTDMCopyGlobalToLocalOp tdmOp,
+                                   OpBuilder &builder) {
+  Value buf = tdmOp.getResult();
+
+  if (buf.getDefiningOp<tlx::RequireLayoutOp>())
+    return;
+
+  auto bufType = dyn_cast<ttg::MemDescType>(buf.getType());
+  if (!bufType)
+    return;
+
+  auto descTy = cast<tt::TensorDescType>(tdmOp.getDesc().getType());
+  ArrayRef<int64_t> shape = descTy.getBlockType().getShape();
+  Type elementType = descTy.getBlockType().getElementType();
+
+  // TLX descriptors don't carry a shared layout on their type; pick a
+  // row-major identity order, which matches what
+  // `AssignDescriptorMemoryLayouts::getFallbackSharedEncoding` would do.
+  unsigned rank = shape.size();
+  SmallVector<unsigned> order(rank);
+  for (unsigned i = 0; i < rank; ++i)
+    order[i] = rank - 1 - i;
+
+  auto cgaLayout = ttg::CGAEncodingAttr::get1CTALayout(buf.getContext(), rank);
+
+  Attribute encoding = buildDefaultTDMDescriptorEncoding(
+      buf.getContext(), shape, order, cgaLayout, elementType);
+  if (!encoding)
+    return;
+
+  builder.setInsertionPoint(tdmOp);
+  auto newType = ttg::MemDescType::get(
+      bufType.getShape(), bufType.getElementType(), encoding,
+      bufType.getMemorySpace(), bufType.getMutableMemory());
+  auto requireOp =
+      tlx::RequireLayoutOp::create(builder, tdmOp.getLoc(), newType, buf);
+  tdmOp.getResultMutable().assign(requireOp.getResult());
+}
+
+static void materializeTDMConstraints(ModuleOp m, OpBuilder &builder) {
+  m.walk([&](amdgpu::AsyncTDMCopyGlobalToLocalOp tdmOp) {
+    anchorTDMRequireLayout(tdmOp, builder);
+  });
+}
+
 } // namespace
 
 // ============================================================================
@@ -368,6 +431,11 @@ LogicalResult insertRequireLayout(ModuleOp m) {
   });
 
   materializeDotUserTensorConstraints(m, builder);
+
+  // Anchor `tlx.require_layout` on AMD TDM copy buffer operands so
+  // tlx-propagate-layout rewrites the source `local_alloc` to a
+  // descriptor-compatible encoding.
+  materializeTDMConstraints(m, builder);
 
   return success();
 }

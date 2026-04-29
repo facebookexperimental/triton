@@ -141,22 +141,8 @@ private:
 Attribute AMDGPUAssignDescriptorMemoryLayouts::buildFallbackSharedEncoding(
     mlir::MLIRContext *ctx, ArrayRef<int64_t> shape, ArrayRef<unsigned> order,
     ttg::CGAEncodingAttr cgaLayout, Type elementType) {
-  auto blockShapePerCTA =
-      triton::gpu::getShapePerCTA(cgaLayout.getCTASplitNum(), shape);
-  auto elemWidth = elementType.getIntOrFloatBitWidth();
-  unsigned padAmount = 128 / elemWidth;
-  // Restrict pad interval (calculated from TDM descriptor's pad
-  // interval field) Fallback to swizzled encoding if the interval
-  // exceeds this limit.
-  // TODO: Query pad interval limit from target info
-  unsigned maxPadIntervalElements = 256u * 32 / elemWidth;
-  unsigned padInterval = static_cast<unsigned>(blockShapePerCTA[order[0]]);
-  if (padInterval > maxPadIntervalElements) {
-    return ttg::SwizzledSharedEncodingAttr::get(ctx, 1, 1, 1, order, cgaLayout);
-  }
-
-  return ttg::PaddedSharedEncodingAttr::get(ctx, {{padInterval, padAmount}},
-                                            order, shape, cgaLayout);
+  return buildDefaultTDMDescriptorEncoding(ctx, shape, order, cgaLayout,
+                                           elementType);
 }
 
 bool AMDGPUAssignDescriptorMemoryLayouts::isCompatibleSharedEncoding(

@@ -192,6 +192,26 @@ also deferred until a kernel actually needs the transpose path.
   guard. Comment in the helper points to the upstream source of
   truth so the formula stays in sync.
 
+**Backward layout propagation (landed alongside this stage):**
+- Extended `TLXInsertRequireLayout` to walk
+  `amdgpu.async_tdm_copy_global_to_local` ops and anchor a
+  `tlx.require_layout` on the buffer operand using the
+  descriptor-compatible padded encoding. The existing
+  `tlx-propagate-layout` pass picks up the constraint via its already-in-place
+  `LayoutBackwardPropagation` lattice and rewrites the source
+  `local_alloc` (plus subview / loop-carrier chain) to match.
+- Exposed `triton::amdgpu::buildDefaultTDMDescriptorEncoding` as a public
+  helper in `third_party/amd/lib/TritonAMDGPUTransforms/Utility.h`; refactored
+  `AMDGPUAssignDescriptorMemoryLayouts::buildFallbackSharedEncoding` to
+  forward to it, so the formula is single-sourced. TLX's transforms lib
+  links `TritonAMDGPUTransforms` and calls the helper directly.
+- Effect: `tlx.local_alloc(..., /*no layout=*/)` followed by
+  `tlx.async_tdm_load(desc, smem, ...)` is now correct by construction
+  on gfx1250 — the alloc's encoding gets rewritten to
+  `padded_shared<[N:+M], ...>` automatically. The Python runtime warning
+  remains as a backstop for users who pass an explicit
+  *non-default-and-non-matching* layout.
+
 **Deferred (follow-up):**
 - Audit `TritonTLXFixup` to verify it does not strip metadata from
   `tt.DescriptorLoadOp` / `tt.MakeTensorDescOp`.
@@ -200,11 +220,9 @@ also deferred until a kernel actually needs the transpose path.
 - Drop `multicast_targets` on AMD with a diagnostic (NV-only concept;
   AMD has `cluster_load_async_to_lds` but it's not exposed via the
   descriptor surface).
-- Real backward layout-propagation pass that rewrites the source
-  `local_alloc`'s encoding from the descriptor type so users don't
-  need to call `descriptor_compatible_layout` at all (extends TLX's
-  existing `LayoutPropagation` for shared encodings — see Stage E
-  below).
+- Extend the TDM-anchor walk to the deferred siblings
+  (`async_tdm_copy_local_to_global`, gather, scatter, prefetch) once
+  those builtins land.
 
 ### Stage D — Tutorials + docs
 

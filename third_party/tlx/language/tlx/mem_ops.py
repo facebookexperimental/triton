@@ -162,6 +162,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
         if storage == tlx.storage_kind.smem:
             if len(shape) == 1:
                 layout = tlx.swizzled_shared_layout_encoding.make_default(rank=len(shape))
+                layout._tlx_default = True
                 layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
                     layout.vectorSize,
                     layout.perPhase,
@@ -176,6 +177,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
                 is_amd = arch.startswith("gfx")
                 if is_amd:
                     layout = tlx.swizzled_shared_layout_encoding.make_default(rank=len(shape))
+                    layout._tlx_default = True
                     layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
                         layout.vectorSize,
                         layout.perPhase,
@@ -952,16 +954,21 @@ def async_tdm_load(
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
-    expected_layout = _amd_tdm_descriptor_layout(desc)
+    # Only warn on user-supplied incompatible layouts. Auto-defaulted
+    # layouts (no `layout=` passed to local_alloc) are silently rewritten
+    # to the descriptor-compatible encoding by TLXInsertRequireLayout +
+    # TlxPropagateLayout in the AMD pipeline.
     layout = result.type.layout
-    if not _layouts_match(layout, expected_layout):
-        warnings.warn(
-            "tlx.async_tdm_load destination layout may be incompatible with AMD descriptor layout; "
-            f"expected {expected_layout}, got {layout}. Pass `layout=tlx.descriptor_compatible_layout(desc)` "
-            "(or a matching explicit layout) to tlx.local_alloc.",
-            UserWarning,
-            stacklevel=2,
-        )
+    if not getattr(layout, "_tlx_default", False):
+        expected_layout = _amd_tdm_descriptor_layout(desc)
+        if not _layouts_match(layout, expected_layout):
+            warnings.warn(
+                "tlx.async_tdm_load destination layout may be incompatible with AMD descriptor layout; "
+                f"expected {expected_layout}, got {layout}. Pass `layout=tlx.descriptor_compatible_layout(desc)` "
+                "(or omit `layout=` entirely to use auto-propagation).",
+                UserWarning,
+                stacklevel=2,
+            )
 
     offsets_handles = _semantic._convert_to_ir_values(offsets, require_i64=False)
     if pred is None:

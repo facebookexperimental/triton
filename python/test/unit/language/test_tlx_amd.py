@@ -958,3 +958,64 @@ def test_local_alloc_padded_layout_compiles_gfx1250(device):
     ttgir = compiled.asm["ttgir"]
     assert "ttg.padded_shared" in ttgir
     assert "32:+4" in ttgir
+
+
+@triton.jit
+def _async_tdm_load_default_alloc_kernel(
+    a_ptr,
+    output_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Default `local_alloc` (no explicit layout) feeding a TDM load.
+
+    Exercises the auto-propagation path: TLXInsertRequireLayout anchors a
+    `tlx.require_layout` on the TDM op's buffer operand, then
+    TlxPropagateLayout rewrites the source alloc's encoding from the
+    descriptor's expected padded layout.
+    """
+    desc = tl.make_tensor_descriptor(
+        a_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)  # no layout=
+    smem = tlx.local_view(buf, 0)
+
+    tlx.async_tdm_load(desc, smem, [0, 0])
+    tlx.async_tdm_wait(0)
+
+    data = tlx.local_load(smem)
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    out_ptrs = output_ptr + offs_m[:, None] * N + offs_n[None, :]
+    tl.store(out_ptrs, data)
+
+
+def test_async_tdm_load_default_alloc_propagates_padded_layout_gfx1250(device):
+    """Default-layout local_alloc should be rewritten to padded by layout propagation."""
+    compiled = compile_for_gfx1250(
+        _async_tdm_load_default_alloc_kernel,
+        signature={"a_ptr": "*fp16", "output_ptr": "*fp16", "M": "i32", "N": "i32"},
+        constexprs={"BLOCK_M": 16, "BLOCK_N": 32},
+    )
+    ttgir = compiled.asm["ttgir"]
+    # Auto-propagation should have replaced the default
+    # SwizzledSharedEncoding(maxPhase=1) on the alloc with the
+    # descriptor-compatible padded encoding.
+    assert "ttg.padded_shared" in ttgir, ("expected propagated padded_shared encoding in TTGIR, got:\n" + ttgir)
+    assert "32:+8" in ttgir, ("expected interval:+padding `32:+8` from descriptor (fp16, BLOCK_N=32), got:\n" + ttgir)
+
+
+def test_async_tdm_load_default_alloc_correctness_gfx1250(device, fresh_triton_cache):
+    """End-to-end: default `local_alloc` + auto-propagation should produce correct data on gfx1250 hw."""
+    if not is_gfx1250_available():
+        pytest.skip("Requires gfx1250 hardware")
+    M, N = 16, 32
+    a = torch.randn(M, N, dtype=torch.float16, device=device)
+    output = torch.empty_like(a)
+    _async_tdm_load_default_alloc_kernel[(1, )](a, output, M=M, N=N, BLOCK_M=M, BLOCK_N=N)
+    torch.testing.assert_close(output, a)
