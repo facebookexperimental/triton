@@ -85,7 +85,9 @@ struct ClipAsyncCopySizePerThread
     Value src = copyOp.getSrc();
     Value mask = copyOp.getMask();
     Value other = copyOp.getOther();
-    auto srcTy = cast<RankedTensorType>(src.getType());
+    auto srcTy = dyn_cast<RankedTensorType>(src.getType());
+    if (!srcTy)
+      return failure();
     auto dstTy = cast<MemDescType>(copyOp.getResult().getType());
     auto blockedEnc = dyn_cast<BlockedEncodingAttr>(srcTy.getEncoding());
     if (!blockedEnc)
@@ -153,7 +155,9 @@ struct CoalesceCheapAsyncCopyGlobalToLocal
     Value src = copyOp.getSrc();
     Value mask = copyOp.getMask();
     Value other = copyOp.getOther();
-    RankedTensorType srcTy = cast<RankedTensorType>(src.getType());
+    auto srcTy = dyn_cast<RankedTensorType>(src.getType());
+    if (!srcTy)
+      return failure();
     auto dstTy = cast<MemDescType>(copyOp.getResult().getType());
     int numWarps = triton::gpu::lookupNumWarps(copyOp);
     auto mod = copyOp->getParentOfType<ModuleOp>();
@@ -189,6 +193,10 @@ struct CoalesceAsyncCopyPass
     // axis analysis.
     DenseMap<AsyncCopyGlobalToLocalOp, Attribute> coalescedAsyncCopyMap;
     m.walk([&](AsyncCopyGlobalToLocalOp copyOp) {
+      if (copyOp.getUseBulk())
+        return;
+      if (!isa<RankedTensorType>(copyOp.getSrc().getType()))
+        return;
       auto dstTy = cast<MemDescType>(copyOp.getResult().getType());
       int numWarps = triton::gpu::lookupNumWarps(copyOp);
       int threadsPerWarp = triton::gpu::TritonGPUDialect::getThreadsPerWarp(m);
