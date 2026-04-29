@@ -174,17 +174,37 @@ also deferred until a kernel actually needs the transpose path.
 ### Stage C — Descriptor plumbing edges
 
 **Files:**
-- `third_party/tlx/dialect/lib/Transforms/Fixup.cpp` (audit)
 - `third_party/tlx/language/tlx/mem_ops.py`
+- `third_party/tlx/language/tlx/__init__.py`
+- `third_party/tlx/dialect/lib/Transforms/Fixup.cpp` (audit, deferred)
+- `python/test/unit/language/test_tlx_amd.py`
 
-**Changes:**
-- Verify `TritonTLXFixup` does not strip metadata from
+**Changes (landed):**
+- Add `tlx.descriptor_compatible_layout(desc)` builtin: returns a
+  shared-memory layout matching the AMD TDM descriptor's expected
+  encoding (the same formula upstream's
+  `AMDGPUAssignDescriptorMemoryLayouts::buildFallbackSharedEncoding`
+  applies). Replaces hand-coded `with_identity_for([(N, M)], ...)`
+  call sites.
+- Factor the descriptor-layout formula out of the runtime warning into
+  a private `_amd_tdm_descriptor_layout(desc)` helper shared by
+  `descriptor_compatible_layout` and the `async_tdm_load` mismatch
+  guard. Comment in the helper points to the upstream source of
+  truth so the formula stays in sync.
+
+**Deferred (follow-up):**
+- Audit `TritonTLXFixup` to verify it does not strip metadata from
   `tt.DescriptorLoadOp` / `tt.MakeTensorDescOp`.
 - Make `cache_modifier` and `eviction_policy` no-ops on AMD with a
   diagnostic (TDM intrinsics do not accept them).
 - Drop `multicast_targets` on AMD with a diagnostic (NV-only concept;
   AMD has `cluster_load_async_to_lds` but it's not exposed via the
   descriptor surface).
+- Real backward layout-propagation pass that rewrites the source
+  `local_alloc`'s encoding from the descriptor type so users don't
+  need to call `descriptor_compatible_layout` at all (extends TLX's
+  existing `LayoutPropagation` for shared encodings — see Stage E
+  below).
 
 ### Stage D — Tutorials + docs
 

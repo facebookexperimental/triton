@@ -862,6 +862,70 @@ def async_descriptor_load(
     )
 
 
+def _amd_tdm_descriptor_layout(desc):
+    """Compute the AMD TDM descriptor-compatible shared layout.
+
+    Mirrors ``AMDGPUAssignDescriptorMemoryLayouts::buildFallbackSharedEncoding``
+    in ``third_party/amd/lib/TritonAMDGPUTransforms/OptimizeDescriptorEncoding.cpp``
+    (the upstream source of truth for the layout the TDM descriptor expects).
+    Keep the formula in sync with that helper.
+    """
+    ndim = len(desc.block_shape)
+    order = list(reversed(range(ndim)))
+    block_shape = [int(dim) for dim in desc.block_shape]
+    elem_width = desc.dtype.primitive_bitwidth
+    pad_interval = int(block_shape[order[0]])
+    pad_amount = 128 // elem_width
+    # Pad-interval limit: the TDM descriptor's pad-interval field is bounded;
+    # fall back to a non-padded swizzled encoding above that limit.
+    max_pad_interval = 256 * 32 // elem_width
+    if pad_interval <= max_pad_interval:
+        return tlx.padded_shared_layout_encoding.with_identity_for([(pad_interval, pad_amount)], block_shape, order)
+    return tlx.swizzled_shared_layout_encoding.make_default(rank=ndim)
+
+
+def _layouts_match(actual, expected):
+    """True iff two TLX shared layouts are observably equivalent.
+
+    We only compare the fields that affect TDM-LDS layout; other CGA
+    fields use the default 1-CTA values in this code path.
+    """
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(actual, tlx.padded_shared_layout_encoding):
+        return (actual.intervals == expected.intervals and actual.paddings == expected.paddings
+                and actual.order == expected.order and actual.shape == expected.shape)
+    if isinstance(actual, tlx.swizzled_shared_layout_encoding):
+        return (actual.vectorSize == expected.vectorSize and actual.perPhase == expected.perPhase
+                and actual.maxPhase == expected.maxPhase and actual.order == expected.order)
+    return False
+
+
+@tl.builtin
+def descriptor_compatible_layout(desc, _semantic=None):
+    """Return a shared layout matching the AMD TDM descriptor's expected encoding.
+
+    Use this in place of hardcoding ``with_identity_for([(N, M)], ...)``:
+
+    .. code-block:: python
+
+        desc = tl.make_tensor_descriptor(...)
+        layout: tl.constexpr = tlx.descriptor_compatible_layout(desc)
+        buf = tlx.local_alloc(..., layout=layout)
+        tlx.async_tdm_load(desc, smem, [...])
+
+    Equivalent to the layout that ``AMDGPUAssignDescriptorMemoryLayouts``
+    would assign to a TDM descriptor of the same shape and element type.
+    Available only on AMD TDM-capable targets (gfx1250+).
+    """
+    arch = _semantic.builder.options.arch
+    assert is_amd_tdm_target(arch), (
+        f"descriptor_compatible_layout is only available on AMD TDM-capable targets, got arch={arch}")
+    assert isinstance(desc, tl.tensor_descriptor_base), \
+        f"descriptor_compatible_layout expects a tensor_descriptor, got {type(desc).__name__}"
+    return _amd_tdm_descriptor_layout(desc)
+
+
 @tl.builtin
 def async_tdm_load(
     desc: tl.tensor_descriptor_base,
@@ -888,32 +952,13 @@ def async_tdm_load(
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
-    order = list(reversed(range(ndim)))
-    block_shape = [int(dim) for dim in desc.block_shape]
-    elem_width = desc.dtype.primitive_bitwidth
-    pad_interval = int(block_shape[order[0]])
-    pad_amount = 128 // elem_width
-    max_pad_interval = 256 * 32 // elem_width
-    expected_layout = None
-    if pad_interval <= max_pad_interval:
-        expected_layout = tlx.padded_shared_layout_encoding.with_identity_for([(pad_interval, pad_amount)], block_shape,
-                                                                              order)
-    else:
-        expected_layout = tlx.swizzled_shared_layout_encoding.make_default(rank=ndim)
-
+    expected_layout = _amd_tdm_descriptor_layout(desc)
     layout = result.type.layout
-    layout_matches = type(layout) is type(expected_layout)
-    if layout_matches and isinstance(layout, tlx.padded_shared_layout_encoding):
-        layout_matches = (layout.intervals == expected_layout.intervals and layout.paddings == expected_layout.paddings
-                          and layout.order == expected_layout.order and layout.shape == expected_layout.shape)
-    elif layout_matches and isinstance(layout, tlx.swizzled_shared_layout_encoding):
-        layout_matches = (layout.vectorSize == expected_layout.vectorSize
-                          and layout.perPhase == expected_layout.perPhase
-                          and layout.maxPhase == expected_layout.maxPhase and layout.order == expected_layout.order)
-    if not layout_matches:
+    if not _layouts_match(layout, expected_layout):
         warnings.warn(
             "tlx.async_tdm_load destination layout may be incompatible with AMD descriptor layout; "
-            f"expected {expected_layout}, got {layout}. Pass a matching `layout=` to tlx.local_alloc.",
+            f"expected {expected_layout}, got {layout}. Pass `layout=tlx.descriptor_compatible_layout(desc)` "
+            "(or a matching explicit layout) to tlx.local_alloc.",
             UserWarning,
             stacklevel=2,
         )

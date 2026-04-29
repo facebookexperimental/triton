@@ -721,7 +721,7 @@ def _async_tdm_load_kernel(
         strides=[N, tl.constexpr(1)],
         block_shape=[BLOCK_M, BLOCK_N],
     )
-    layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(32, 8)], [BLOCK_M, BLOCK_N], [1, 0])
+    layout: tl.constexpr = tlx.descriptor_compatible_layout(desc)
     buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1, layout=layout)
     smem = tlx.local_view(buf, 0)
 
@@ -790,7 +790,7 @@ def _async_tdm_load_pred_kernel(
         strides=[N, tl.constexpr(1)],
         block_shape=[BLOCK_M, BLOCK_N],
     )
-    layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(32, 8)], [BLOCK_M, BLOCK_N], [1, 0])
+    layout: tl.constexpr = tlx.descriptor_compatible_layout(desc)
     buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1, layout=layout)
     smem = tlx.local_view(buf, 0)
 
@@ -841,7 +841,7 @@ def _async_tdm_load_token_kernel(
         strides=[N, tl.constexpr(1)],
         block_shape=[BLOCK_M, BLOCK_N],
     )
-    layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(32, 8)], [BLOCK_M, BLOCK_N], [1, 0])
+    layout: tl.constexpr = tlx.descriptor_compatible_layout(desc)
     buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1, layout=layout)
     smem = tlx.local_view(buf, 0)
 
@@ -914,8 +914,13 @@ def _async_tdm_load_incompatible_layout_kernel(
     tl.store(out_ptrs, data)
 
 
-def test_async_tdm_load_warns_on_incompatible_layout_gfx1250(device):
-    """Warn when the TDM destination layout does not match descriptor encoding."""
+def test_async_tdm_load_warns_on_incompatible_layout_gfx1250(device, fresh_triton_cache):
+    """Warn when the TDM destination layout does not match descriptor encoding.
+
+    Uses the ``fresh_triton_cache`` fixture so the warning fires from a
+    cold AST visit; without it Triton's on-disk cache returns a previously
+    compiled binary and the warning never re-emits.
+    """
     with pytest.warns(UserWarning, match="destination layout may be incompatible"):
         compile_for_gfx1250(
             _async_tdm_load_incompatible_layout_kernel,
