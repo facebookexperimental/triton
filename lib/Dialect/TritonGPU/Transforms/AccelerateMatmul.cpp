@@ -555,12 +555,20 @@ public:
       return failure();
     auto oldAType = dotOp.getA().getType();
     auto oldBType = dotOp.getB().getType();
-    // NYI: PTX 13+ requires all tcgen instructions in a kernel to have a
-    // consistent CTA mode, disabling 2CTA mode for now. To re-enable,
-    // change the line below to: bool useTwoCTAs = canUseTwoCTAs(dotOp);
-    bool useTwoCTAs = false;
-    if (useTwoCTAs) {
-      b = splitBOperand(b, rewriter);
+    bool useTwoCTAs;
+    if (dotOp.getTwoCtas()) {
+      // User-driven 2-CTA (ctas_per_cga): user already partitioned B.
+      // No splitBOperand needed — follows the TLX approach.
+      useTwoCTAs = true;
+    } else {
+      // NYI: PTX 13+ requires all tcgen instructions in a kernel to have a
+      // consistent CTA mode, disabling compiler-driven 2CTA mode for now.
+      // To re-enable, change the line below to:
+      //   useTwoCTAs = canUseTwoCTAs(dotOp);
+      useTwoCTAs = false;
+      if (useTwoCTAs) {
+        b = splitBOperand(b, rewriter);
+      }
     }
     // TF32 transpose is only supported with 128 swizzle mode with 32B
     // atomicity. As we currently don't support this layout we disallow
