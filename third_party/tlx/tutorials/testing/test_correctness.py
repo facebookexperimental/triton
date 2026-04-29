@@ -18,6 +18,8 @@ from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent im
     _attn_bwd_ws as _blackwell_fa_bwd_ws,
     _attn_fwd_ws as _blackwell_fa_fwd_ws,
     _host_descriptor_pre_hook as _blackwell_fa_fwd_pre_hook,
+    configs_bwd_1cta as _configs_bwd_1cta,
+    configs_bwd_2cta as _configs_bwd_2cta,
 )
 from triton.language.extra.tlx.tutorials.blackwell_fa_clc import (
     attention as _blackwell_fa_clc, )
@@ -426,10 +428,11 @@ def test_blackwell_fa_clc(N_CTX, causal, RESCALE_OPT, USE_WHERE):
     torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
 
 
+@pytest.mark.parametrize("NUM_CTAS", [1, 2])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("RESCALE_OPT,USE_WHERE", [(False, False), (True, False), (True, True)])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
-def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE):
+def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE, NUM_CTAS):
     from triton.tools.tensor_descriptor import TensorDescriptor
 
     fwd_config: dict[str,
@@ -524,13 +527,16 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
 
         BLK_SLICE_FACTOR = 2
 
+        bwd_configs = _configs_bwd_1cta if NUM_CTAS == 1 else _configs_bwd_2cta
+        bwd_kernel = triton.autotune(configs=bwd_configs, key=["N_CTX", "HEAD_DIM"])(_blackwell_fa_bwd_ws.fn)
+
         def grid_persistent(meta):
             total = triton.cdiv(N_CTX, meta["BLOCK_N1"]) * Z * H
             num_ctas = meta.get("NUM_CTAS", 1)
             total = triton.cdiv(total, num_ctas) * num_ctas
             return (total, )
 
-        _blackwell_fa_bwd_ws[grid_persistent](
+        bwd_kernel[grid_persistent](
             desc_bq,
             desc_bk,
             desc_bv,

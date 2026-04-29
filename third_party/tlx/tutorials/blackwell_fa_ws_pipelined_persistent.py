@@ -1075,11 +1075,36 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
         nargs["desc_dot"].block_shape = [BLOCK_M1 // NUM_CTAS, HEAD_DIM]
 
 
-configs_bwd_tlx = [
-    # 2-CTA config
+configs_bwd_1cta = [
     triton.Config(
         {
             "BLOCK_M1": bm1,
+            "BLOCK_N1": 128,
+            "NUM_BUFFERS_KV": 1,
+            "NUM_BUFFERS_Q": 2,
+            "NUM_BUFFERS_DO": 1,
+            "NUM_BUFFERS_DS": 1,
+            "NUM_BUFFERS_TMEM": 1,
+            "DKV_STORE_NCOL": 64,
+            "NUM_COMPUTE_SLICES": 2,
+            "DQ_REDUCE_STAGES": 2,
+            "DQ_REDUCE_NCOL": 32,
+            "EPILOGUE_SUBTILE": 4,
+            "GROUP_SIZE_M": 1,
+            "USE_WARP_BARRIER": True,
+            "NUM_CTAS": 1,
+        },
+        num_warps=8,
+        num_stages=1,
+        pre_hook=_bwd_host_descriptor_pre_hook_tlx,
+    ) for bm1 in [64, 128]
+]
+
+configs_bwd_2cta = [
+    # 2-CTA config
+    triton.Config(
+        {
+            "BLOCK_M1": 128,
             "BLOCK_N1": 128,
             "NUM_BUFFERS_KV": 1,
             "NUM_BUFFERS_Q": 1,
@@ -1099,8 +1124,10 @@ configs_bwd_tlx = [
         num_stages=1,
         pre_hook=_bwd_host_descriptor_pre_hook_tlx,
         ctas_per_cga=(2, 1, 1),
-    ) for bm1 in [128]
+    ),
 ]
+
+configs_bwd_tlx = configs_bwd_1cta + configs_bwd_2cta
 
 
 @triton.jit
@@ -3108,6 +3135,11 @@ class _attention(torch.autograd.Function):
             block_shape=[1],
         )
 
+        y_dim = BATCH * N_HEAD * N_CTX
+        desc_kt = TensorDescriptor(arg_k, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+        desc_qt = TensorDescriptor(q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+        desc_dot = TensorDescriptor(do, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+
         def alloc_fn(size: int, align: int, _):
             return torch.empty(size, dtype=torch.int8, device="cuda")
 
@@ -3126,6 +3158,7 @@ class _attention(torch.autograd.Function):
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
             N_HEAD, BATCH,  #
             N_CTX,  #
+            desc_kt, desc_qt, desc_dot,  #
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
             HEAD_DIM=ctx.HEAD_DIM,  #
             STAGE=stage,  #

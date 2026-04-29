@@ -43,7 +43,7 @@ def create_benchmark(versions, mode="fwd"):
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=["N_CTX"],
-            x_vals=[1024, 2048, 4096, 8192],
+            x_vals=[1024],
             line_arg="provider",
             line_vals=line_vals,
             line_names=line_names,
@@ -72,7 +72,7 @@ def create_benchmark(versions, mode="fwd"):
 
                     def fn():
                         q.grad, k.grad, v.grad = None, None, None
-                        o = attention(q, k, v, sm_scale, causal, 128, 1)
+                        o = attention(q, k, v, sm_scale, causal)
                         o.backward(do)
                 elif provider == "ws":
 
@@ -93,7 +93,7 @@ def create_benchmark(versions, mode="fwd"):
         elif provider in ATTENTION_METHODS:
             attention = ATTENTION_METHODS[provider]
             if provider == "ws_pipelined_persistent":
-                fn = lambda: attention(q, k, v, sm_scale, causal, 128, 1)
+                fn = lambda: attention(q, k, v, sm_scale, causal)
             elif provider == "ws":
                 fn = lambda: attention(q, k, v, sm_scale)
             else:
