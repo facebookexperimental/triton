@@ -721,7 +721,7 @@ def _async_tdm_load_kernel(
         strides=[N, tl.constexpr(1)],
         block_shape=[BLOCK_M, BLOCK_N],
     )
-    layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(32, 4)], [BLOCK_M, BLOCK_N], [1, 0])
+    layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(32, 8)], [BLOCK_M, BLOCK_N], [1, 0])
     buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1, layout=layout)
     smem = tlx.local_view(buf, 0)
 
@@ -760,11 +760,9 @@ def test_async_tdm_load_compiles_gfx1250(device):
 def test_async_tdm_load_correctness_gfx1250(device):
     """tlx.async_tdm_load + async_tdm_wait produce correct results on gfx1250 hardware.
 
-    Uses an explicit PaddedSharedLayout (matching the layout Gluon's TDM
-    tests pass) — the TDM ``tensor_load_to_lds`` instruction requires it
-    for correct LDS layout. See third_party/tlx/doc/AMD_TDM_PLAN.md
-    Stage B for the rationale and `tlx.padded_shared_layout_encoding`
-    docs.
+    Uses an explicit PaddedSharedLayout matching the AMD descriptor fallback.
+    The TDM ``tensor_load_to_lds`` instruction requires descriptor and
+    destination LDS layouts to agree.
     """
     if not is_gfx1250_available():
         pytest.skip("Requires gfx1250 hardware")
@@ -792,7 +790,7 @@ def _async_tdm_load_pred_kernel(
         strides=[N, tl.constexpr(1)],
         block_shape=[BLOCK_M, BLOCK_N],
     )
-    layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(32, 4)], [BLOCK_M, BLOCK_N], [1, 0])
+    layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(32, 8)], [BLOCK_M, BLOCK_N], [1, 0])
     buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1, layout=layout)
     smem = tlx.local_view(buf, 0)
 
@@ -843,7 +841,7 @@ def _async_tdm_load_token_kernel(
         strides=[N, tl.constexpr(1)],
         block_shape=[BLOCK_M, BLOCK_N],
     )
-    layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(32, 4)], [BLOCK_M, BLOCK_N], [1, 0])
+    layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(32, 8)], [BLOCK_M, BLOCK_N], [1, 0])
     buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1, layout=layout)
     smem = tlx.local_view(buf, 0)
 
@@ -884,7 +882,46 @@ def test_async_tdm_load_uses_padded_layout_gfx1250(device):
     )
     ttgir = compiled.asm["ttgir"]
     assert "ttg.padded_shared" in ttgir, ("expected padded_shared encoding in TTGIR, got:\n" + ttgir)
-    assert "32:+4" in ttgir, ("expected interval:+padding `32:+4` from with_identity_for, got:\n" + ttgir)
+    assert "32:+8" in ttgir, ("expected interval:+padding `32:+8` from with_identity_for, got:\n" + ttgir)
+
+
+@triton.jit
+def _async_tdm_load_incompatible_layout_kernel(
+    a_ptr,
+    output_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    desc = tl.make_tensor_descriptor(
+        a_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(32, 4)], [BLOCK_M, BLOCK_N], [1, 0])
+    buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1, layout=layout)
+    smem = tlx.local_view(buf, 0)
+
+    tlx.async_tdm_load(desc, smem, [0, 0])
+    tlx.async_tdm_wait(0)
+
+    data = tlx.local_load(smem)
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    out_ptrs = output_ptr + offs_m[:, None] * N + offs_n[None, :]
+    tl.store(out_ptrs, data)
+
+
+def test_async_tdm_load_warns_on_incompatible_layout_gfx1250(device):
+    """Warn when the TDM destination layout does not match descriptor encoding."""
+    with pytest.warns(UserWarning, match="destination layout may be incompatible"):
+        compile_for_gfx1250(
+            _async_tdm_load_incompatible_layout_kernel,
+            signature={"a_ptr": "*fp16", "output_ptr": "*fp16", "M": "i32", "N": "i32"},
+            constexprs={"BLOCK_M": 16, "BLOCK_N": 32},
+        )
 
 
 @triton.jit

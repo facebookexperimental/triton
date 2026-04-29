@@ -1,3 +1,4 @@
+import warnings
 from typing import Optional, overload, Tuple
 
 import triton.language.core as tl
@@ -886,6 +887,36 @@ def async_tdm_load(
     assert is_amd_tdm_target(arch), (f"async_tdm_load is only available on AMD TDM-capable targets, got arch={arch}")
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
+
+    order = list(reversed(range(ndim)))
+    block_shape = [int(dim) for dim in desc.block_shape]
+    elem_width = desc.dtype.primitive_bitwidth
+    pad_interval = int(block_shape[order[0]])
+    pad_amount = 128 // elem_width
+    max_pad_interval = 256 * 32 // elem_width
+    expected_layout = None
+    if pad_interval <= max_pad_interval:
+        expected_layout = tlx.padded_shared_layout_encoding.with_identity_for([(pad_interval, pad_amount)], block_shape,
+                                                                              order)
+    else:
+        expected_layout = tlx.swizzled_shared_layout_encoding.make_default(rank=ndim)
+
+    layout = result.type.layout
+    layout_matches = type(layout) is type(expected_layout)
+    if layout_matches and isinstance(layout, tlx.padded_shared_layout_encoding):
+        layout_matches = (layout.intervals == expected_layout.intervals and layout.paddings == expected_layout.paddings
+                          and layout.order == expected_layout.order and layout.shape == expected_layout.shape)
+    elif layout_matches and isinstance(layout, tlx.swizzled_shared_layout_encoding):
+        layout_matches = (layout.vectorSize == expected_layout.vectorSize
+                          and layout.perPhase == expected_layout.perPhase
+                          and layout.maxPhase == expected_layout.maxPhase and layout.order == expected_layout.order)
+    if not layout_matches:
+        warnings.warn(
+            "tlx.async_tdm_load destination layout may be incompatible with AMD descriptor layout; "
+            f"expected {expected_layout}, got {layout}. Pass a matching `layout=` to tlx.local_alloc.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     offsets_handles = _semantic._convert_to_ir_values(offsets, require_i64=False)
     if pred is None:
