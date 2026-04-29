@@ -176,7 +176,7 @@ class FlashAttention:
     """Common utilities and configs for Flash Attention tests."""
 
     # (Z, H, N_CTX, HEAD_DIM)
-    SHAPES = [(4, 8, 1024, 128)]
+    SHAPES = [(4, 8, 8192, 128)]
 
     CONFIGS = {
         "blackwell_fa_ws": {
@@ -476,8 +476,7 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
             return torch.empty(size, dtype=torch.int8, device="cuda")
 
         triton.set_allocator(alloc_fn)
-        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-        grid = (min(NUM_SMS, triton.cdiv(N_CTX, fwd_config["BLOCK_M"]) * Z * H), 1, 1)
+        grid = (triton.cdiv(N_CTX, fwd_config["BLOCK_M"]) * Z * H, 1, 1)
         _blackwell_fa_fwd_ws.fn[grid](
             sm_scale,
             M,
