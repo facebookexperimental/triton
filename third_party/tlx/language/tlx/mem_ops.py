@@ -6,7 +6,7 @@ from triton._C.libtriton import ir
 from . import types as tlx
 from .mma_ops import require_nv_mma_shared_layout
 from .types import storage_kind
-from .utility import cuda_parse_arch
+from .utility import cuda_parse_arch, is_amd_tdm_target
 
 
 def _assert_blackwell_for_tmem(arch):
@@ -854,6 +854,72 @@ def async_descriptor_load(
         eviction,
         False,
     )
+
+
+@tl.builtin
+def async_tdm_load(
+    desc: tl.tensor_descriptor_base,
+    result: tlx.buffered_tensor,
+    offsets: list[tl.tensor],
+    pred: tl.tensor = None,
+    _semantic=None,
+) -> tlx.async_token:
+    """Asynchronous TDM descriptor load from global to a local buffer.
+
+    Lowers to ``amdgpu.async_tdm_copy_global_to_local``; synchronize with
+    :func:`async_tdm_wait`. The returned token can be threaded into the
+    wait for per-token waitcnt precision; otherwise discard it.
+
+    Note: tokens currently do not survive ``scf.for`` boundaries
+    (``async_token._flatten_ir`` is a no-op), so collect the wait inside
+    the same block as the load if you thread tokens.
+
+    Available only on AMD TDM-capable targets (gfx1250+).
+    """
+    assert isinstance(desc, tl.tensor_descriptor_base)
+    arch = _semantic.builder.options.arch
+    assert is_amd_tdm_target(arch), (f"async_tdm_load is only available on AMD TDM-capable targets, got arch={arch}")
+    ndim = len(desc.block_shape)
+    assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
+
+    offsets_handles = _semantic._convert_to_ir_values(offsets, require_i64=False)
+    if pred is None:
+        pred_handle = _semantic.builder.get_int1(True)
+    else:
+        pred_handle = pred.handle
+    token_handle = _semantic.builder.create_async_tdm_copy_global_to_local(
+        desc.handle,
+        offsets_handles,
+        result.handle,
+        pred_handle,
+        None,
+    )
+    return tlx.async_token(token_handle)
+
+
+@tl.builtin
+def async_tdm_wait(
+    pendings: tl.constexpr = 0,
+    tokens: Optional[list[tlx.async_token]] = None,
+    _semantic=None,
+) -> tlx.async_token:
+    """Wait for outstanding AMD TDM operations.
+
+    Lowers to ``amdgpu.async_tdm_wait``. Pass ``pendings`` for the
+    count-based wait, or ``tokens`` from prior :func:`async_tdm_load`
+    calls for per-token min-waitcnt precision (mutually exclusive: when
+    tokens are supplied ``UpdateAsyncWaitCount`` ignores ``pendings``).
+
+    Available only on AMD TDM-capable targets (gfx1250+).
+    """
+    arch = _semantic.builder.options.arch
+    assert is_amd_tdm_target(arch), (f"async_tdm_wait is only available on AMD TDM-capable targets, got arch={arch}")
+    pendings = tl._unwrap_if_constexpr(pendings)
+    tokens = tokens or []
+    assert not (tokens and pendings != 0), ("async_tdm_wait: pass either `pendings` or `tokens`, not both;"
+                                            " UpdateAsyncWaitCount uses tokens when present and ignores `pendings`")
+    handles = [t.handle for t in tokens]
+    return tlx.async_token(_semantic.builder.create_async_tdm_wait(handles, pendings))
 
 
 @tl.builtin

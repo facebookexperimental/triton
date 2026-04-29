@@ -1,11 +1,17 @@
 """
-Tests for TLX AMD support (async_load, local_load with relaxed, async_token in loops).
+Tests for TLX AMD support.
 
-These tests compile kernels targeting gfx950 via triton.compile() with an
-explicit GPUTarget and verify the generated TTGIR/AMDGCN. No AMD hardware is
-required for the compilation checks. Correctness checks (actual execution) run
-only when gfx950 hardware is available.
+Covers the gfx950 async_load / relaxed local_load / async_token-in-loops
+paths and the gfx1250 TDM descriptor-load family
+(:func:`tlx.async_tdm_load`, :func:`tlx.async_tdm_wait`).
+
+These tests compile kernels via ``triton.compile()`` with an explicit
+``GPUTarget`` and verify the generated TTGIR/AMDGCN. No AMD hardware is
+required for the compilation checks; correctness checks (actual
+execution) run only when matching hardware is available.
 """
+import re
+
 import pytest
 import torch
 
@@ -20,6 +26,7 @@ from triton.backends.compiler import GPUTarget
 pytestmark = pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
 
 GFX950 = GPUTarget("hip", "gfx950", 64)
+GFX1250 = GPUTarget("hip", "gfx1250", 32)
 
 
 def compile_for_gfx950(fn, signature, constexprs):
@@ -28,11 +35,26 @@ def compile_for_gfx950(fn, signature, constexprs):
     return triton_compile(src, target=GFX950)
 
 
+def compile_for_gfx1250(fn, signature, constexprs):
+    """Compile a TLX kernel for gfx1250 and return the compiled object."""
+    src = ASTSource(fn=fn, signature=signature, constexprs=constexprs)
+    return triton_compile(src, target=GFX1250)
+
+
 def is_gfx950_available():
     """Check if the current device is gfx950."""
     try:
         target = triton.runtime.driver.active.get_current_target()
         return target.arch == "gfx950"
+    except Exception:
+        return False
+
+
+def is_gfx1250_available():
+    """Check if the current device is gfx1250."""
+    try:
+        target = triton.runtime.driver.active.get_current_target()
+        return target.arch == "gfx1250"
     except Exception:
         return False
 
@@ -676,3 +698,168 @@ def test_scatter_3d_native(N, M, P, axis):
     )
 
     torch.testing.assert_close(output, expected)
+
+
+# ----------------------------------------------------------------------------
+# gfx1250 TDM descriptor load tests
+# ----------------------------------------------------------------------------
+
+
+@triton.jit
+def _async_tdm_load_kernel(
+    a_ptr,
+    output_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Count-only TDM descriptor load: discard the token, wait by count."""
+    desc = tl.make_tensor_descriptor(
+        a_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+    smem = tlx.local_view(buf, 0)
+
+    tlx.async_tdm_load(desc, smem, [0, 0])
+    tlx.async_tdm_wait(0)
+
+    data = tlx.local_load(smem)
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    out_ptrs = output_ptr + offs_m[:, None] * N + offs_n[None, :]
+    tl.store(out_ptrs, data)
+
+
+def test_async_tdm_load_compiles_gfx1250(device):
+    """tlx.async_tdm_load + async_tdm_wait should compile to TDM ops on gfx1250."""
+    compiled = compile_for_gfx1250(
+        _async_tdm_load_kernel,
+        signature={"a_ptr": "*fp16", "output_ptr": "*fp16", "M": "i32", "N": "i32"},
+        constexprs={"BLOCK_M": 16, "BLOCK_N": 32},
+    )
+    ttgir = compiled.asm["ttgir"]
+    # The amdgpu dialect prints as `amdg`; check for the op mnemonic.
+    assert "amdg.async_tdm_copy_global_to_local" in ttgir, (
+        "expected amdg.async_tdm_copy_global_to_local in TTGIR, got:\n" + ttgir)
+    # AsyncTDMWait may be rewritten to AsyncTDMIntrinsicWait by
+    # UpdateAsyncWaitCount; accept either at the TTGIR layer.
+    assert ("amdg.async_tdm_wait" in ttgir) or ("amdg.async_tdm_intrinsic_wait" in ttgir), (
+        "expected amdg.async_tdm_wait or amdg.async_tdm_intrinsic_wait in TTGIR, got:\n" + ttgir)
+
+    amdgcn = compiled.asm["amdgcn"]
+    assert len(amdgcn) > 0
+    assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn, (
+        "expected tensor_load_to_lds intrinsic in AMDGCN, got:\n" + amdgcn)
+
+
+def test_async_tdm_load_correctness_gfx1250(device):
+    """tlx.async_tdm_load + async_tdm_wait produce correct results on gfx1250 hardware."""
+    if not is_gfx1250_available():
+        pytest.skip("Requires gfx1250 hardware")
+    M, N = 16, 32
+    a = torch.randn(M, N, dtype=torch.float16, device=device)
+    output = torch.empty_like(a)
+    _async_tdm_load_kernel[(1, )](a, output, M=M, N=N, BLOCK_M=M, BLOCK_N=N)
+    torch.testing.assert_close(output, a)
+
+
+@triton.jit
+def _async_tdm_load_pred_kernel(
+    a_ptr,
+    output_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    DO_LOAD: tl.constexpr,
+):
+    """Same shape as above, but with an i1 predicate threading through the load."""
+    desc = tl.make_tensor_descriptor(
+        a_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+    smem = tlx.local_view(buf, 0)
+
+    pred = tl.full([], DO_LOAD, dtype=tl.int1)
+    tlx.async_tdm_load(desc, smem, [0, 0], pred=pred)
+    tlx.async_tdm_wait(0)
+
+    data = tlx.local_load(smem)
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    out_ptrs = output_ptr + offs_m[:, None] * N + offs_n[None, :]
+    tl.store(out_ptrs, data)
+
+
+def test_async_tdm_load_pred_compiles_gfx1250(device):
+    """async_tdm_load with an i1 pred should be lifted to i32 by the binding."""
+    compiled = compile_for_gfx1250(
+        _async_tdm_load_pred_kernel,
+        signature={"a_ptr": "*fp16", "output_ptr": "*fp16", "M": "i32", "N": "i32"},
+        constexprs={"BLOCK_M": 16, "BLOCK_N": 32, "DO_LOAD": 1},
+    )
+    ttgir = compiled.asm["ttgir"]
+    # Capture the SSA name fed into the TDM op's pred operand and verify
+    # its definition is i32 — either an explicit i1->i32 extension, or
+    # (after constant folding) a fresh `arith.constant N : i32`.
+    tdm_match = re.search(r"amdg\.async_tdm_copy_global_to_local\b.*pred = (%\S+)", ttgir)
+    assert tdm_match, ("expected amdg.async_tdm_copy_global_to_local with pred operand, got:\n" + ttgir)
+    pred_ssa = re.escape(tdm_match.group(1))
+    has_extension = bool(re.search(rf"{pred_ssa}\s*=\s*arith\.extui\b.*:\s*i1\s+to\s+i32", ttgir))
+    has_folded = bool(re.search(rf"{pred_ssa}\s*=\s*arith\.constant\s+\S+\s*:\s*i32", ttgir))
+    assert has_extension or has_folded, (f"expected pred ({tdm_match.group(1)}) to be defined by arith.extui (i1->i32) "
+                                         f"or arith.constant : i32, got:\n" + ttgir)
+
+
+@triton.jit
+def _async_tdm_load_token_kernel(
+    a_ptr,
+    output_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Same as the count-only kernel but threads tokens through async_tdm_wait."""
+    desc = tl.make_tensor_descriptor(
+        a_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+    smem = tlx.local_view(buf, 0)
+
+    tok = tlx.async_tdm_load(desc, smem, [0, 0])
+    tlx.async_tdm_wait(0, [tok])
+
+    data = tlx.local_load(smem)
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    out_ptrs = output_ptr + offs_m[:, None] * N + offs_n[None, :]
+    tl.store(out_ptrs, data)
+
+
+def test_async_tdm_load_token_threaded_compiles_gfx1250(device):
+    """Token-threaded async_tdm_wait should produce a wait op that uses the copy's token."""
+    compiled = compile_for_gfx1250(
+        _async_tdm_load_token_kernel,
+        signature={"a_ptr": "*fp16", "output_ptr": "*fp16", "M": "i32", "N": "i32"},
+        constexprs={"BLOCK_M": 16, "BLOCK_N": 32},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_copy_global_to_local" in ttgir
+    # The wait must consume the copy's token (or its rewritten form), not be
+    # tokenless. Match a wait op that has any operand.
+    pattern = re.compile(r"amdg\.async_tdm(?:_intrinsic)?_wait\s+%\S+")
+    assert pattern.search(ttgir), ("expected token-threaded amdg.async_tdm_wait/intrinsic_wait, got:\n" + ttgir)
+
+    amdgcn = compiled.asm["amdgcn"]
+    assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn

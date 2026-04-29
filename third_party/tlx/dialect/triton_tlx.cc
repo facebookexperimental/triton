@@ -8,6 +8,7 @@
 namespace ir {
 pybind11::class_<TritonOpBuilder> *getBuilderClass();
 } // namespace ir
+#include "amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "passes.h"
 #include "tlx/dialect/include/Transforms/Passes.h"
@@ -23,6 +24,7 @@ namespace tt = triton;
 namespace ttg = triton::gpu;
 namespace ttng = triton::nvidia_gpu;
 namespace tlx = triton::tlx;
+namespace amdgpu = triton::amdgpu;
 
 static ttg::CGAEncodingAttr makeCGALayout(mlir::MLIRContext *ctx,
                                           llvm::ArrayRef<unsigned> CTAsPerCGA,
@@ -493,6 +495,29 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, std::vector<Value> asyncTokens,
               unsigned pendings) -> mlir::Value {
              return self.create<ttg::AsyncWaitOp>(asyncTokens, pendings);
+           })
+      // Emits `amdgpu.async_tdm_copy_global_to_local` directly into the
+      // user's local buffer (the Python wrapper restricts callers to AMD
+      // TDM-capable targets). The op's pred operand is i32; this binding
+      // extends an i1 pred to i32 for convenience.
+      .def("create_async_tdm_copy_global_to_local",
+           [](TritonOpBuilder &self, Value desc, std::vector<Value> indices,
+              Value result, Value pred,
+              std::optional<Value> barrier) -> mlir::Value {
+             Value pred32 = pred;
+             if (auto intTy = dyn_cast<IntegerType>(pred.getType())) {
+               if (intTy.getWidth() == 1) {
+                 pred32 = self.create<arith::ExtUIOp>(
+                     self.getBuilder().getI32Type(), pred);
+               }
+             }
+             return self.create<amdgpu::AsyncTDMCopyGlobalToLocalOp>(
+                 desc, indices, result, pred32, barrier.value_or(Value()));
+           })
+      .def("create_async_tdm_wait",
+           [](TritonOpBuilder &self, std::vector<Value> asyncTokens,
+              unsigned pendings) -> mlir::Value {
+             return self.create<amdgpu::AsyncTDMWait>(asyncTokens, pendings);
            })
       .def("create_memdesc_trans",
            [](TritonOpBuilder &self, Value &arg,

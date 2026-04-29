@@ -2,11 +2,22 @@ import re
 
 import triton.language.core as tl
 import triton.runtime.driver as driver
+from triton._C.libtriton import amd as _amd
 
 
 def is_hip():
     target = driver.active.get_current_target()
     return target.backend == "hip"
+
+
+def is_amd_tdm_target(arch):
+    """True iff the AMD backend reports TDM support for ``arch``.
+
+    Returns False for non-AMD targets.
+    """
+    if not isinstance(arch, str) or not arch.startswith("gfx"):
+        return False
+    return _amd.supports_tdm(arch)
 
 
 def cuda_parse_arch(arch):
