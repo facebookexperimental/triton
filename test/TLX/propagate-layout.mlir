@@ -322,7 +322,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // CHECK: ttng.tmem_alloc : () -> !ttg.memdesc<2x128x4xi8, #[[$TMEM_SCALES]], #ttng.tensor_memory, mutable>
     %a_scale_tmem = ttng.tmem_alloc : () -> !ttg.memdesc<2x128x4xi8, #dummy_tmem_layout, #tmem, mutable>
 
-    ttg.warp_specialize(%a_scale_tmem, %scale_data)
+    ttg.warp_specialize()
     default {
       // Consumer: index into multi-buffered TMEM and use in scaled MMA
       // CHECK: ttg.memdesc_index {{.*}} : !ttg.memdesc<2x128x4xi8, #[[$TMEM_SCALES]], #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x4xi8, #[[$TMEM_SCALES]], #ttng.tensor_memory, mutable>
@@ -381,7 +381,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     ttng.barrier_expect %7, 8192, %true : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     %9 = arith.muli %0, %c64_i32 : i32
     %10 = arith.muli %1, %c64_i32 : i32
-    ttg.warp_specialize(%7)
+    ttg.warp_specialize()
     default {
       ttng.wait_barrier %8, %c1_i32 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
       // CHECK-NOT: tlx.require_layout
@@ -484,7 +484,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     ttng.init_barrier %19, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     %20 = ttg.memdesc_index %17[%c2_i32] : !ttg.memdesc<3xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     ttng.init_barrier %20, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
-    ttg.warp_specialize(%arg3, %arg1, %arg24, %cst_1, %arg19, %5, %9, %1, %cst, %cst_0, %3, %0, %arg0, %13, %17, %2)
+    ttg.warp_specialize()
     default {
       %21 = tt.get_program_id x : i32
       %22 = tt.get_program_id y : i32
@@ -721,7 +721,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
     %result = ttng.tmem_alloc : () -> !ttg.memdesc<1x64x32xf32, #tmem, #ttng.tensor_memory, mutable>
     %result_0 = ttng.tmem_alloc : () -> !ttg.memdesc<1x64x32xf16, #tmem, #ttng.tensor_memory, mutable>
     %result_1 = ttng.tmem_alloc : () -> !ttg.memdesc<1x64x32xf32, #tmem, #ttng.tensor_memory, mutable>
-    ttg.warp_specialize(%0, %result, %1, %2, %result_1, %result_0)
+    ttg.warp_specialize()
     default {
       ttg.warp_yield
     }
@@ -870,7 +870,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
     %50 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     %51 = ttg.memdesc_index %50[%c0_i32] : !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     ttng.init_barrier %51, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
-    ttg.warp_specialize(%arg16, %arg3, %arg17, %arg5, %arg0, %arg1, %28, %20, %22, %32, %24, %26, %13, %17, %1, %3, %result_2, %result_3, %18, %19, %46, %50, %38, %42, %44, %48, %36, %40, %15, %16, %result, %result_1, %arg10, %arg14, %arg8, %2, %9, %14) attributes {requestedRegisters = array<i32: 192, 24, 24>}
+    ttg.warp_specialize() attributes {requestedRegisters = array<i32: 192, 24, 24>}
     default {
       %52:3 = scf.for %arg21 = %c0_i32 to %9 step %c1_i32 iter_args(%arg22 = %2, %arg23 = %c0_i32, %arg24 = %c0_i32) -> (i32, i32, i32)  : i32 {
         %53 = arith.divsi %arg22, %1 : i32
