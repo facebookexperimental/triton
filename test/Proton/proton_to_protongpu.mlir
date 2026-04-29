@@ -188,7 +188,7 @@ module attributes {"ttg.num-warps" = 8 : i32} {
 
 module attributes {"ttg.num-warps" = 8 : i32} {
   // CHECK-GMEM-LABEL: global_mem_buffer
-  // CHECK-GMEM: %[[SCRATCH:.*]] = proton_gpu.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
+  // CHECK-GMEM: %[[SCRATCH:.*]] = ttg.global_scratch_alloc {alignment = 128 : i32, backend = "proton", nbytes = 1152 : i32} : !tt.ptr<i32>
   // CHECK-GMEM: proton_gpu.initialize %[[SCRATCH]] : !tt.ptr<i32>
   // CHECK-GMEM: %[[PTR:.*]] = tt.addptr %[[SCRATCH]]
   // CHECK-GMEM: %[[SEGMENT:.*]] = proton_gpu.segment_alloc %[[PTR]] : !tt.ptr<i32> -> <1024, #proton_gpu.global_memory, warp>
