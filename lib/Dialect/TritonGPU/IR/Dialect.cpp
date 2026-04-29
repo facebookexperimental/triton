@@ -3313,14 +3313,19 @@ struct TritonGPUVerifyTensorLayoutInterface
     }
 
     // Number of warps per CTA.
+    // Skip this check inside WarpSpecializeOp partition regions: partitions
+    // may temporarily have layouts with the module-level warp count while
+    // the partition's num_warps is smaller. OptimizePartitionWarps fixes this.
     std::optional<int> moduleWarpsPerCTA = maybeLookupNumWarps(op);
     if (!moduleWarpsPerCTA) {
       return makeErr()
              << "Could not determine the number of warps per CTA. Operation "
                 "is not in a context with `ttg.num-warps`.";
     }
+    bool inPartitionRegion =
+        op->getParentOfType<WarpSpecializePartitionsOp>() != nullptr;
     auto kWarp = StringAttr::get(module.getContext(), "warp");
-    if (ll.getInDimSize(kWarp) != *moduleWarpsPerCTA) {
+    if (!inPartitionRegion && ll.getInDimSize(kWarp) != *moduleWarpsPerCTA) {
       return makeErr() << layout << ".\nLayout has " << ll.getInDimSize(kWarp)
                        << " warps per CTA, but the context requires "
                        << *moduleWarpsPerCTA << " warps per CTA.";

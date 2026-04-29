@@ -99,13 +99,15 @@ public:
     if (!enabled)
       return;
 
+    // num_warps != 4 is allowed. OptimizePartitionWarps enforces the warp
+    // budget and falls back to non-WS if the schedule can't fit.
+    //
+    // Known limitation: kernels with data_partition_factor > 1 (e.g., FA fwd
+    // dual-pass) create multiple computation partitions that exceed the warp
+    // budget with num_warps > 4. The budget fallback will remove WS for these.
+    // TODO: implement computation partition merging to support dp > 1 with
+    // num_warps > 4.
     int numWarps = mlir::triton::gpu::lookupNumWarps(funcOp);
-    if (numWarps != 4) {
-      LDBG("Warp specialization requires num_warps=4, but got "
-           << numWarps << ". Skipping.");
-      removeWarpSpecializeAttr(funcOp);
-      return;
-    }
 
     // FIXME: skip warpspec if there is else block. Need to improve
     // CodePartitioning to correctly handle channels in else block.
