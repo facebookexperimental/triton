@@ -49,7 +49,7 @@ def create_benchmark(versions, mode="fwd"):
             line_names=line_names,
             ylabel="TFLOPS",
             plot_name=f"flash-attention-{mode}-performance-fp16",
-            args={"BATCH": 4, "H": 8, "HEAD_DIM": 128, "causal": True},
+            args={"BATCH": 4, "H": 8, "HEAD_DIM": 128, "causal": False},
         ))
     def benchmark(BATCH, H, N_CTX, HEAD_DIM, causal, provider):
         q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=torch.float16).requires_grad_()
@@ -131,7 +131,23 @@ if __name__ == "__main__":
         choices=["fwd", "bwd"],
         help="Benchmark forward or backward pass (default: fwd)",
     )
+    parser.add_argument(
+        "--num-ctas",
+        type=int,
+        default=0,
+        choices=[0, 1, 2],
+        help="Filter BWD configs: 0=all (default), 1=1-CTA only, 2=2-CTA only",
+    )
     args = parser.parse_args()
+
+    if args.num_ctas and args.mode == "bwd":
+        from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent import (
+            _attn_bwd_ws,
+            configs_bwd_1cta,
+            configs_bwd_2cta,
+        )
+        _attn_bwd_ws.configs = configs_bwd_1cta if args.num_ctas == 1 else configs_bwd_2cta
+        print(f"Filtering BWD configs to {args.num_ctas}-CTA only")
 
     if is_blackwell():
         versions = args.version if args.version else list(ATTENTION_METHODS.keys())
