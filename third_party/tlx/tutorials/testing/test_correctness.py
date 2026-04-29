@@ -526,6 +526,8 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
 
         def grid_persistent(meta):
             total = triton.cdiv(N_CTX, meta["BLOCK_N1"]) * Z * H
+            num_ctas = meta.get("NUM_CTAS", 1)
+            total = triton.cdiv(total, num_ctas) * num_ctas
             return (total, )
 
         _blackwell_fa_bwd_ws[grid_persistent](

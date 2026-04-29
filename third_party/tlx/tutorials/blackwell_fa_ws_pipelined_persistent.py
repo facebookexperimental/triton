@@ -3113,7 +3113,11 @@ class _attention(torch.autograd.Function):
 
         triton.set_allocator(alloc_fn)
 
-        grid_persistent = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_N1"]) * BATCH * N_HEAD, )
+        def grid_persistent(meta):
+            total = triton.cdiv(N_CTX, meta["BLOCK_N1"]) * BATCH * N_HEAD
+            num_ctas = meta.get("NUM_CTAS", 1)
+            total = triton.cdiv(total, num_ctas) * num_ctas
+            return (total, )
 
         stage = 3 if ctx.causal else 1
         _attn_bwd_ws[grid_persistent](
