@@ -721,7 +721,8 @@ def _async_tdm_load_kernel(
         strides=[N, tl.constexpr(1)],
         block_shape=[BLOCK_M, BLOCK_N],
     )
-    buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+    layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(32, 4)], [BLOCK_M, BLOCK_N], [1, 0])
+    buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1, layout=layout)
     smem = tlx.local_view(buf, 0)
 
     tlx.async_tdm_load(desc, smem, [0, 0])
@@ -756,18 +757,15 @@ def test_async_tdm_load_compiles_gfx1250(device):
         "expected tensor_load_to_lds intrinsic in AMDGCN, got:\n" + amdgcn)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "TLX `local_alloc` defaults to SwizzledSharedEncoding(maxPhase=1), "
-        "which the TDM verifier accepts but gfx1250 hardware reads "
-        "incorrectly — TDM requires a PaddedSharedEncoding (or compatible) "
-        "to lay out the LDS the way `tensor_load_to_lds` expects. Exposing "
-        "PaddedSharedEncoding through `tlx.local_alloc` is Stage B of "
-        "third_party/tlx/doc/AMD_TDM_PLAN.md."),
-    strict=True,
-)
 def test_async_tdm_load_correctness_gfx1250(device):
-    """tlx.async_tdm_load + async_tdm_wait produce correct results on gfx1250 hardware."""
+    """tlx.async_tdm_load + async_tdm_wait produce correct results on gfx1250 hardware.
+
+    Uses an explicit PaddedSharedLayout (matching the layout Gluon's TDM
+    tests pass) — the TDM ``tensor_load_to_lds`` instruction requires it
+    for correct LDS layout. See third_party/tlx/doc/AMD_TDM_PLAN.md
+    Stage B for the rationale and `tlx.padded_shared_layout_encoding`
+    docs.
+    """
     if not is_gfx1250_available():
         pytest.skip("Requires gfx1250 hardware")
     M, N = 16, 32
@@ -794,7 +792,8 @@ def _async_tdm_load_pred_kernel(
         strides=[N, tl.constexpr(1)],
         block_shape=[BLOCK_M, BLOCK_N],
     )
-    buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+    layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(32, 4)], [BLOCK_M, BLOCK_N], [1, 0])
+    buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1, layout=layout)
     smem = tlx.local_view(buf, 0)
 
     pred = tl.full([], DO_LOAD, dtype=tl.int1)
@@ -844,7 +843,8 @@ def _async_tdm_load_token_kernel(
         strides=[N, tl.constexpr(1)],
         block_shape=[BLOCK_M, BLOCK_N],
     )
-    buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+    layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(32, 4)], [BLOCK_M, BLOCK_N], [1, 0])
+    buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1, layout=layout)
     smem = tlx.local_view(buf, 0)
 
     tok = tlx.async_tdm_load(desc, smem, [0, 0])
@@ -873,3 +873,46 @@ def test_async_tdm_load_token_threaded_compiles_gfx1250(device):
 
     amdgcn = compiled.asm["amdgcn"]
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
+
+
+def test_async_tdm_load_uses_padded_layout_gfx1250(device):
+    """The user-supplied PaddedSharedLayout must propagate to the local_alloc memdesc."""
+    compiled = compile_for_gfx1250(
+        _async_tdm_load_kernel,
+        signature={"a_ptr": "*fp16", "output_ptr": "*fp16", "M": "i32", "N": "i32"},
+        constexprs={"BLOCK_M": 16, "BLOCK_N": 32},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "ttg.padded_shared" in ttgir, ("expected padded_shared encoding in TTGIR, got:\n" + ttgir)
+    assert "32:+4" in ttgir, ("expected interval:+padding `32:+4` from with_identity_for, got:\n" + ttgir)
+
+
+@triton.jit
+def _local_alloc_padded_kernel(
+    output_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+):
+    """Allocate a buffer with an explicit padded layout and round-trip through it."""
+    layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(32, 4)], [M, N], [1, 0])
+    buf = tlx.local_alloc((M, N), tl.float16, 1, layout=layout)
+    smem = tlx.local_view(buf, 0)
+    zero = tl.zeros((M, N), dtype=tl.float16)
+    tlx.local_store(smem, zero)
+    out = tlx.local_load(smem)
+    offs_m = tl.arange(0, M)
+    offs_n = tl.arange(0, N)
+    out_ptrs = output_ptr + offs_m[:, None] * N + offs_n[None, :]
+    tl.store(out_ptrs, out)
+
+
+def test_local_alloc_padded_layout_compiles_gfx1250(device):
+    """tlx.local_alloc with an explicit padded layout should compile cleanly on gfx1250."""
+    compiled = compile_for_gfx1250(
+        _local_alloc_padded_kernel,
+        signature={"output_ptr": "*fp16"},
+        constexprs={"M": 16, "N": 32},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "ttg.padded_shared" in ttgir
+    assert "32:+4" in ttgir

@@ -132,45 +132,44 @@ lowering). `ConvertToTensorOps` is bypassed for this path, but it still
 runs to catch any stray `tt.DescriptorLoadOp` (e.g., from
 `tl.load(desc, ...)`).
 
-**Known Stage A limitation (drives Stage B).** The default
-`tlx.local_alloc` returns a `SwizzledSharedEncodingAttr(maxPhase=1)`
-buffer. The TDM op verifier accepts this (its only check is "no
-swizzling"), so the kernel compiles cleanly, but on real gfx1250
+**Known Stage A limitation (driven Stage B).** The default
+`tlx.local_alloc` returned a `SwizzledSharedEncodingAttr(maxPhase=1)`
+buffer. The TDM op verifier accepted this (its only check is "no
+swizzling"), so the kernel compiled cleanly, but on real gfx1250
 hardware `tensor_load_to_lds` requires a `PaddedSharedEncodingAttr`
 (or `PartitionedSharedEncodingAttr` containing one) to lay out LDS
 correctly — without it the load runs, the wait completes, and the
-subsequent `local_load` reads back garbage. Stage A's correctness
-test is marked `xfail(strict=True)` until Stage B exposes
-`PaddedSharedEncodingAttr` through `tlx.local_alloc`.
+subsequent `local_load` reads back garbage. Resolved in Stage B by
+exposing `tlx.padded_shared_layout_encoding`; users now pass an
+explicit `layout=` to `tlx.local_alloc`.
 
-### Stage B — TDM-aware shared layouts in `local_alloc`
+### Stage B — TDM-aware shared layouts in `local_alloc` ✓
 
 **Files:**
 - `third_party/tlx/language/tlx/types.py`
 - `third_party/tlx/language/tlx/mem_ops.py`
+- `third_party/tlx/language/tlx/__init__.py`
 - `third_party/tlx/dialect/triton_tlx.cc`
-- `third_party/tlx/dialect/lib/Analysis/LayoutPropagation.cpp`
+- `python/test/unit/language/test_tlx_amd.py`
 
-**Changes:**
-- Expose `PaddedSharedEncodingAttr` and (where relevant)
-  `PartitionedSharedEncodingAttr` as TLX layout encodings.
-- Bind `make_padded_shared_encoding_attr` /
-  `make_partitioned_shared_encoding_attr` in `triton_tlx.cc`.
-- On AMD gfx1250, if the user does not pass an explicit `layout=`,
-  default `tlx.local_alloc` to a TDM-friendly encoding when the buffer
-  is consumed by a TDM op. Otherwise keep `SwizzledSharedEncodingAttr`.
-- Extend `LayoutPropagation` to handle the new shared encodings the same
-  way it handles `NVMMASharedEncodingAttr` today (especially through
-  `MemDescTransOp`).
+**Changes (landed):**
+- Expose `tlx.padded_shared_layout_encoding`, the identity-mapping form
+  of `ttg.padded_shared_encoding`. Mirrors Gluon's
+  `PaddedSharedLayout.with_identity_for(intervals, shape, order)`.
+- Bind `make_padded_shared_encoding_attr` in `triton_tlx.cc`, calling
+  the second `PaddedSharedEncodingAttr::get(...)` builder
+  (`intervalPads`, `order`, `shape`, `cgaLayout`).
+- Wire `tlx.local_alloc(..., layout=...)` to honor a user-supplied
+  `tlx.shared_layout_encoding` (replaces the previous
+  `NotImplementedError`). Default-layout behavior is unchanged.
 
-**Why after Stage A:** Stage A wires up the IR-emission and proves the
-downstream AMD pipeline accepts the new ops, but its correctness test
-is `xfail` because `local_alloc`'s default
-`SwizzledSharedEncoding(maxPhase=1)` produces wrong LDS data on
-gfx1250 — `tensor_load_to_lds` needs a `PaddedSharedEncodingAttr`
-layout. Stage B exposes that encoding to TLX users (and turns the
-xfail green), and gives them explicit control needed for kernels where
-the default layout splits TDM into too many intrinsics.
+**Deferred (follow-up).** The plan originally proposed auto-defaulting
+`tlx.local_alloc` to a TDM-friendly encoding when the buffer is
+consumed by a TDM op. That requires forward-analysis at allocation
+time; Gluon also doesn't do it (every `tdm.async_load` test passes an
+explicit layout). Stays as user-explicit for now. Layout-propagation
+support for `PaddedSharedEncodingAttr` through `MemDescTransOp` is
+also deferred until a kernel actually needs the transpose path.
 
 ### Stage C — Descriptor plumbing edges
 

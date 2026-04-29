@@ -209,7 +209,12 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
                 layout = tlx.tensor_memory_layout_encoding.make_default(shape)
             layout_handle = layout.to_ir(_semantic.builder)
     else:
-        raise NotImplementedError("User-specified layout encoding not yet implemented.")
+        if storage != tlx.storage_kind.smem:
+            raise NotImplementedError("User-specified layout encoding is only supported for shared memory (smem)")
+        layout = tl._unwrap_if_constexpr(layout)
+        if not isinstance(layout, tlx.shared_layout_encoding):
+            raise TypeError(f"`layout` must be a tlx.shared_layout_encoding, got {type(layout).__name__}")
+        layout_handle = layout.to_ir(_semantic.builder)
 
     alias_handle = None
     shared_buffer_handle = None

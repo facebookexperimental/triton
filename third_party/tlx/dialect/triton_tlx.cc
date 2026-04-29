@@ -188,6 +188,36 @@ void init_triton_tlx_ir(py::module &&m) {
              return mlir::cast<Attribute>(ttg::SwizzledSharedEncodingAttr::get(
                  context, vectorSize, perPhase, maxPhase, order, CTALayout));
            })
+      // Identity-mapping form of ttg::PaddedSharedEncodingAttr — analogous
+      // to `PaddedSharedLayout.with_identity_for(...)` in Gluon. Inserts
+      // `paddings[i]` elements after every `intervals[i]` data elements,
+      // with a row-major identity map from the 1-D shared offset to the
+      // logical n-D tensor offsets implied by `shape` + `order`.
+      .def(
+          "make_padded_shared_encoding_attr",
+          [](TritonOpBuilder &self, std::vector<unsigned> intervals,
+             std::vector<unsigned> paddings, std::vector<unsigned> order,
+             std::vector<int64_t> shape, std::vector<unsigned> CTAsPerCGA,
+             std::vector<unsigned> CTASplitNum,
+             std::vector<unsigned> CTAOrder) {
+            assert(intervals.size() == paddings.size() &&
+                   "intervals/paddings size mismatch");
+            assert(order.size() == shape.size() && "order/shape rank mismatch");
+            assert(order.size() == CTAsPerCGA.size() &&
+                   "CTAsPerCGA rank mismatch");
+            assert(order.size() == CTASplitNum.size() &&
+                   "CTASplitNum rank mismatch");
+            assert(order.size() == CTAOrder.size() && "CTAOrder rank mismatch");
+            auto context = self.getBuilder().getContext();
+            llvm::SmallVector<std::pair<unsigned, unsigned>> intervalPads;
+            intervalPads.reserve(intervals.size());
+            for (auto [i, p] : llvm::zip(intervals, paddings))
+              intervalPads.emplace_back(i, p);
+            auto CTALayout =
+                makeCGALayout(context, CTAsPerCGA, CTASplitNum, CTAOrder);
+            return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
+                context, intervalPads, order, shape, CTALayout));
+          })
       .def("make_tensor_memory_encoding_attr",
            [](TritonOpBuilder &self, unsigned blockM, unsigned blockN,
               unsigned colStride, unsigned CTASplitM, unsigned CTASplitN) {
