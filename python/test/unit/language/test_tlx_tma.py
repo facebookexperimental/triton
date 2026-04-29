@@ -731,7 +731,7 @@ def test_prefetch_tensormap(device):
         tlx.prefetch(in_desc, tensormap=True)
         tlx.prefetch(out_desc, tensormap=True)
 
-        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float16, tl.constexpr(1))
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.int16, tl.constexpr(1))
         buffer = tlx.local_view(buffers, 0)
         bars = tlx.alloc_barriers(tl.constexpr(1))
         bar = tlx.local_view(bars, 0)
@@ -792,7 +792,7 @@ def test_prefetch_tensormap(device):
         tlx.prefetch(desc_in, tensormap=True)
         tlx.prefetch(desc_out, tensormap=True)
 
-        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float16, tl.constexpr(1))
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.int16, tl.constexpr(1))
         buffer = tlx.local_view(buffers, 0)
         bars = tlx.alloc_barriers(tl.constexpr(1))
         bar = tlx.local_view(bars, 0)
