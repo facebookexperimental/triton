@@ -429,7 +429,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 
 // -----
 
-#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0]}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: tma_copy_local_to_global_with_token_wait
@@ -447,17 +447,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 // -----
 
-#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0]}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8}>
+#bar_layout = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: tma_store_token_wait_with_barriers
   // CHECK: nvvm.cp.async.bulk.wait_group 0 {read}
   // CHECK: nvvm.barrier0
   // CHECK: mbarrier.arrive.shared::cta.b64
-  tt.func @tma_store_token_wait_with_barriers(%tma: !tt.tensordesc<tensor<128x128xf32, #shared1>>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32, %barrier: !ttg.memdesc<1xi64, #shared1, #smem, mutable>) {
+  tt.func @tma_store_token_wait_with_barriers(%tma: !tt.tensordesc<tensor<128x128xf32, #shared1>>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32, %barrier: !ttg.memdesc<1xi64, #bar_layout, #smem, mutable>) {
     %true = arith.constant true
     %token = ttng.async_tma_copy_local_to_global %tma[%x, %x] %alloc : !tt.tensordesc<tensor<128x128xf32, #shared1>>, !ttg.memdesc<128x128xf32, #shared1, #smem> -> !ttg.async.token
-    ttng.async_tma_store_token_wait %token, %barrier[%true] : !ttg.async.token, !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.async_tma_store_token_wait %token, %barrier[%true] : !ttg.async.token, !ttg.memdesc<1xi64, #bar_layout, #smem, mutable>
     tt.return
   }
 }
