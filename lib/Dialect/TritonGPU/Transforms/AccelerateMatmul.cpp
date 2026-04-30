@@ -85,7 +85,7 @@ SmallVector<unsigned> warpsPerTileV2(DotOpInterface dotOp,
   auto slices = mlir::getSlice(dotOp, {filter}, {filter});
   bool hasChainedDot = false;
   for (Operation *op : slices) {
-    if (isa<DotOpInterface>(op) && (op != dotOp)) {
+    if (isa<DotOp, DotScaledOp>(op) && (op != dotOp)) {
       auto resTy = cast<RankedTensorType>(op->getResult(0).getType());
       if (resTy.getRank() != rank) {
         continue;
