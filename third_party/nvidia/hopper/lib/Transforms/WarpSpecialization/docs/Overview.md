@@ -63,6 +63,8 @@ an earlier partition scheduling pass (`PartitionSchedulingMeta`).
 | `TaskIdPropagation.h` | `TaskId` lattice, `TaskIdLattice`, `TaskIdBackwardPropagation` analysis |
 | `CodePartitionUtility.h` | `Channel`, `ChannelPost`, `TmemDataChannel`, `TmemDataChannelPost`, `ReuseGroup`, `ReuseConfig`, `CommChannel` |
 | `TMEMUtils.h` | `TMEM1DAllocator`, `sliceAndReinterpretMDTMEM`, `createTMEMDesc` |
+| `WSBarrierAnalysis.h` | `WSBarrierAttr`, `buildChannelGraph`, `injectChannelGraph` — channel graph construction for barrier constraints |
+| `nvidia/hopper/include/Transforms/WSBarrierReorder.h` | `canAdvanceWSBarrier`, `sinkWSArrives`, `raiseWSWaits`, `buildBarrierToMemoryOpMap`, `optimizeWSBarrierLocations` — barrier reordering utilities consumed by `InterleaveTMem` |
 
 ## Glossary
 

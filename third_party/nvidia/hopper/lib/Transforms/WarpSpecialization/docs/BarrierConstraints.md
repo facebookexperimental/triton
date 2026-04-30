@@ -88,9 +88,9 @@ intervening waits).
    `buildChannelGraph()` + `injectChannelGraph()`.
 3. Both propagate through `doTokenLowering` to the resulting barrier ops.
 
-**Reordering rule:** Two WS barriers of opposite types (arrive, wait) can
-be reordered if they target different destination tasks. This is checked by
-`canAdvanceWSBarrier()`.
+**Reordering rule:** Two WS barriers can be safely swapped if their
+`channelGraph` sets are disjoint. This is checked by
+`canAdvanceWSBarrier()` (see [Barrier Reordering](#barrier-reordering) below).
 
 Example:
 ```mlir
@@ -206,3 +206,96 @@ attribute directly (as currently defined). The two approaches can coexist:
 - WSBarrier ops for barriers inside the tile body (attribute-based refs)
 - `constraints` dict for barriers outside the SubtiledRegionOp or after
   lowering
+
+## Barrier Reordering
+
+**Files:**
+- `nvidia/hopper/include/Transforms/WSBarrierReorder.h` — `canAdvanceWSBarrier`, `sinkWSArrives`, `raiseWSWaits`, `buildBarrierToMemoryOpMap`, `optimizeWSBarrierLocations`
+- `lib/Dialect/TritonNvidiaGPU/Transforms/InterleaveTMem.cpp` — consumer of the above
+
+### Motivation
+
+After token lowering, the epilogue region contains interleaved barrier
+ops from multiple channels. For example, a `tmem_load` channel's arrive
+barrier may sit between a store channel's wait/arrive barriers, preventing
+the `tmem_load` from sinking closer to its use. The barrier reordering
+step separates barriers from independent channels, unblocking tmem_load
+sinking and reducing register pressure.
+
+### Algorithm
+
+The reordering runs as part of the `triton-nvidia-interleave-tmem` pass,
+before the existing tmem_load sinking. Four steps:
+
+1. **`buildBarrierToMemoryOpMap`** — For each WS-annotated barrier, record
+   its nearest associated memory op (scan backward for arrives, forward for
+   waits). This map is used in step 4 to restore barriers near their ops.
+
+2. **`sinkWSArrives` / `raiseWSWaits`** — Push arrive barriers down and
+   pull wait barriers up within each basic block. An arrive can move past
+   any non-barrier op (delaying the signal is always safe) and past another
+   arrive. It can move past a wait only if `canAdvanceWSBarrier` confirms
+   their `channelGraph` sets are disjoint. Waits follow the mirror rule,
+   with an additional check to not move past definitions of their operands.
+
+3. **tmem_load sinking (channelGraph-aware)** — Each `tmem_load` inherits
+   the `channelGraph` from its associated arrive barrier. When the sinking
+   loop encounters a barrier, it calls `canAdvanceWSBarrier` with the
+   tmem_load's channelGraph to decide whether to pass it. All tmem_loads
+   in the same channel region (between the arrive and the preceding
+   same-channel barrier) get the same constraints, so split tmem_loads
+   are treated uniformly.
+
+4. **`optimizeWSBarrierLocations`** — After sinking, relocate each barrier
+   back to an optimal position right next to its associated memory op
+   (arrives after, waits before), respecting SSA dominance.
+
+### `canAdvanceWSBarrier`
+
+```cpp
+bool canAdvanceWSBarrier(optional<DictionaryAttr> constraintsA,
+                         optional<DictionaryAttr> constraintsB);
+```
+
+Returns true when both barriers have a `channelGraph` attribute and the
+two sets are disjoint (no shared task ID). Returns false conservatively
+if either barrier lacks `channelGraph`.
+
+### Barrier Movement Rules
+
+| Pair | Safety |
+|------|--------|
+| Arrive, Arrive | Always safe |
+| Wait, Wait | Always safe |
+| Arrive, Wait | Safe only if `canAdvanceWSBarrier` returns true |
+| Wait, Arrive | Same check (mirror direction) |
+
+### IR Example
+
+Before (barriers block tmem_load sinking):
+```mlir
+ttng.wait_barrier %bar0, %phase : ...                           // tmem_load wait
+ttng.tmem_load %s0 → %v0                                        // stuck here
+ttng.tmem_load %s1 → %v1
+ttng.arrive_barrier %bar0, 1 {channelGraph = [1, 3]} : ...      // ← blocks sinking
+ttng.wait_barrier %bar1, %phase {channelGraph = [2]} : ...      // store wait
+ttg.local_store %v0, %smem
+ttng.arrive_barrier %bar1, 1 {channelGraph = [2]} : ...
+ttng.wait_barrier %bar2, %phase {channelGraph = [2]} : ...
+ttg.local_store %v1, %smem
+ttng.arrive_barrier %bar2, 1 {channelGraph = [2]} : ...
+```
+
+After (tmem_loads interleaved with store pipeline):
+```mlir
+ttng.wait_barrier %bar0, %phase : ...                           // tmem_load wait
+ttng.wait_barrier %bar1, %phase {channelGraph = [2]} : ...      // store wait
+ttng.tmem_load %s0 → %v0                                        // sunk past store wait
+ttg.local_store %v0, %smem
+ttng.arrive_barrier %bar1, 1 {channelGraph = [2]} : ...
+ttng.wait_barrier %bar2, %phase {channelGraph = [2]} : ...
+ttng.tmem_load %s1 → %v1                                        // sunk past store wait
+ttg.local_store %v1, %smem
+ttng.arrive_barrier %bar0, 1 {channelGraph = [1, 3]} : ...      // sunk to end
+ttng.arrive_barrier %bar2, 1 {channelGraph = [2]} : ...
+```
