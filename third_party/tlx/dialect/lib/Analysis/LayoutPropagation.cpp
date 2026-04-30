@@ -41,6 +41,10 @@ void LayoutEncoding::print(raw_ostream &os) const {
 
 LayoutEncoding LayoutEncoding::join(const LayoutEncoding &lhs,
                                     const LayoutEncoding &rhs) {
+  if (lhs.isUninitialized())
+    return rhs;
+  if (rhs.isUninitialized())
+    return lhs;
   assert(lhs == rhs && "Conflicting layouts");
   return lhs;
 }
