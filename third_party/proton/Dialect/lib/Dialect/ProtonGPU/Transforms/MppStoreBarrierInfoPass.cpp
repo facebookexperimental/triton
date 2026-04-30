@@ -612,7 +612,8 @@ private:
     if (auto partitionsOp =
             dyn_cast<triton::gpu::WarpSpecializePartitionsOp>(parentOp))
       if (argIdx < partitionsOp.getNumOperands())
-        return getBarrierInfo(partitionsOp.getOperand(argIdx), depth + 1);
+        return getBarrierInfo(partitionsOp.getOperand(argIdx),
+                              depth + 1);
 
     return std::nullopt;
   }

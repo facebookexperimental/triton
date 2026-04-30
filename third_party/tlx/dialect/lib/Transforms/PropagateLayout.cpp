@@ -121,7 +121,8 @@ public:
             }
           }
           // Also update the capture value's type on the partitions op.
-          if (auto origType = dyn_cast<ttg::MemDescType>(blockArg.getType())) {
+          if (auto origType =
+                  dyn_cast<ttg::MemDescType>(blockArg.getType())) {
             auto newType = getNewMemDescType(
                 origType, lattice->getValue().getLayoutEncoding());
             partitionsOp.getExplicitCaptures()[i].setType(newType);

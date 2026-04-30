@@ -181,8 +181,7 @@ SmallVector<Value> getTiedArgs(Operation *op, int resultIdx) {
     return values;
   } else if (auto warpSpecializeOp = dyn_cast<ttg::WarpSpecializeOp>(op)) {
     // add arg for every partition including default partition
-    SmallVector<Value> values = {
-        warpSpecializeOp.getPartitionOp().getOperands()[resultIdx]};
+    SmallVector<Value> values = {warpSpecializeOp.getPartitionOp().getOperands()[resultIdx]};
     for (auto region : warpSpecializeOp.getPartitionRegions()) {
       auto &firstBlock = region->getBlocks().front();
       values.push_back(firstBlock.getArguments()[resultIdx]);

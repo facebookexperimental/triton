@@ -567,10 +567,8 @@ module attributes {{"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = {warp_si
 
 
 @pytest.mark.parametrize("target", [
-    pytest.param(GPUTarget("hip", "gfx942", 64),
-                 marks=pytest.mark.xfail(reason="gluon AOT compilation not yet supported on gfx942")),
-    pytest.param(GPUTarget("hip", "gfx1250", 32), marks=pytest.mark.skipif(not is_hip_gfx1250(),
-                                                                           reason="gfx1250 not available")),
+    pytest.param(GPUTarget("hip", "gfx942", 64), marks=pytest.mark.xfail(reason="gluon AOT compilation not yet supported on gfx942")),
+    pytest.param(GPUTarget("hip", "gfx1250", 32), marks=pytest.mark.skipif(not is_hip_gfx1250(), reason="gfx1250 not available")),
 ])
 @pytest.mark.skipif(not is_hip(), reason="Requires HIP")
 def test_gluon_kernel(target):
