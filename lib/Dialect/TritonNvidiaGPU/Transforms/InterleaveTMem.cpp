@@ -4,6 +4,9 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 #include "llvm/ADT/AddressRanges.h"
+#include "llvm/Support/Debug.h"
+
+#define DEBUG_TYPE "triton-nvidia-interleave-tmem"
 
 namespace ttg = mlir::triton::gpu;
 
@@ -193,8 +196,10 @@ bool tmemMayAlias(Value a, Value b) {
 }
 
 // Sink tmem_loads as close to their use as possible to reduce register
-// pressure.
-bool sinkOps(Value buffer, ArrayRef<Operation *> useChain) {
+// pressure. When opConstraints is provided, uses canAdvanceWSBarrier to
+// decide whether the op can sink past barriers from independent channels.
+bool sinkOps(Value buffer, ArrayRef<Operation *> useChain,
+             std::optional<DictionaryAttr> opConstraints) {
   Operation *insertBefore = nullptr;
   Operation *next = useChain.back()->getNextNode();
   while (next && !next->hasTrait<OpTrait::IsTerminator>()) {
@@ -208,10 +213,13 @@ bool sinkOps(Value buffer, ArrayRef<Operation *> useChain) {
         break;
       }
     }
-    // Don't sink past barrier signals, since they may guard the liverange
-    // of the buffer.
-    if (isa<ArriveBarrierOp>(next))
-      break;
+    if (auto arrive = dyn_cast<ArriveBarrierOp>(next)) {
+      if (!canAdvanceWSBarrier(opConstraints, arrive.getConstraints()))
+        break;
+    } else if (auto wait = dyn_cast<WaitBarrierOp>(next)) {
+      if (!canAdvanceWSBarrier(opConstraints, wait.getConstraints()))
+        break;
+    }
     if (!isMemoryEffectFree(next)) {
       SmallVector<MemoryEffects::EffectInstance> effects;
       collectEffects(next, effects);
@@ -243,14 +251,15 @@ bool sinkOps(Value buffer, ArrayRef<Operation *> useChain) {
 }
 
 // Try to sink a load and a collection of its users.
-bool trySinkOp(Operation *op, Value buffer) {
+bool trySinkOp(Operation *op, Value buffer,
+               std::optional<DictionaryAttr> opConstraints) {
   SmallVector<Operation *> useChain{op};
   while (useChain.back()->hasOneUse() &&
          isPure(*useChain.back()->user_begin()) &&
          useChain.back()->getNextNode() == *useChain.back()->user_begin()) {
     useChain.push_back(*useChain.back()->user_begin());
   }
-  return sinkOps(buffer, useChain);
+  return sinkOps(buffer, useChain, opConstraints);
 }
 
 } // anonymous namespace
@@ -261,9 +270,29 @@ struct TritonNvidiaGPUInterleaveTMemPass
   using impl::TritonNvidiaGPUInterleaveTMemPassBase<
       TritonNvidiaGPUInterleaveTMemPass>::TritonNvidiaGPUInterleaveTMemPassBase;
 
+  void dumpIR(ModuleOp m, StringRef label) {
+    const char *dir = std::getenv("TRITON_INTERLEAVE_TMEM_DUMP");
+    if (!dir)
+      return;
+    static int counter = 0;
+    std::string filename = std::string(dir) + "/interleave_tmem_" +
+                           std::to_string(counter++) + "_" + label.str() +
+                           ".mlir";
+    std::replace(filename.begin(), filename.end(), ' ', '_');
+    std::error_code ec;
+    llvm::raw_fd_ostream os(filename, ec);
+    if (ec)
+      return;
+    OpPrintingFlags flags;
+    flags.enableDebugInfo();
+    m.print(os, flags);
+  }
+
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     ModuleOp m = getOperation();
+
+    dumpIR(m, "Input IR");
 
     // Step 1: Record which memory op each WS barrier guards.
     SmallVector<DenseMap<Operation *, Operation *>> barrierMaps;
@@ -280,6 +309,33 @@ struct TritonNvidiaGPUInterleaveTMemPass
       raiseWSWaits(*block);
     });
 
+    dumpIR(m, "Step 2 - After barrier reordering");
+
+    // Build memOp → channelGraph constraints. For each arrive barrier with
+    // constraints, scan backward and assign its constraints to ALL tmem_loads
+    // in its channel region (between the arrive and the preceding same-channel
+    // wait or block start). This ensures all split tmem_loads inherit the
+    // channelGraph, not just the one nearest to the arrive.
+    DenseMap<Operation *, DictionaryAttr> memOpConstraints;
+    m.walk([&](ArriveBarrierOp arrive) {
+      auto constraints = arrive.getConstraints();
+      if (!constraints)
+        return;
+      DictionaryAttr dict = *constraints;
+      for (auto *cur = arrive->getPrevNode(); cur; cur = cur->getPrevNode()) {
+        if (isa<WaitBarrierOp>(cur) &&
+            !canAdvanceWSBarrier(constraints,
+                                 cast<WaitBarrierOp>(cur).getConstraints()))
+          break;
+        if (isa<ArriveBarrierOp>(cur) &&
+            !canAdvanceWSBarrier(constraints,
+                                 cast<ArriveBarrierOp>(cur).getConstraints()))
+          break;
+        if (isa<TMEMLoadOp>(cur))
+          memOpConstraints[cur] = dict;
+      }
+    });
+
     // Step 3: Sink tmem_loads closer to their uses.
     SmallVector<std::pair<Operation *, Value>> opsToSink;
     m.walk([&](Operation *op) {
@@ -289,13 +345,22 @@ struct TritonNvidiaGPUInterleaveTMemPass
         opsToSink.emplace_back(alloc, alloc.getResult());
     });
     for (auto [op, buffer] : opsToSink) {
-      while (trySinkOp(op, buffer)) {
+      auto it = memOpConstraints.find(op);
+      std::optional<DictionaryAttr> constraints =
+          it != memOpConstraints.end()
+              ? std::optional<DictionaryAttr>(it->second)
+              : std::nullopt;
+      while (trySinkOp(op, buffer, constraints)) {
       }
     }
+
+    dumpIR(m, "Step 3 - After tmem_load sinking");
 
     // Step 4: Restore barriers to optimal positions near their memory ops.
     for (auto &map : barrierMaps)
       optimizeWSBarrierLocations(map);
+
+    dumpIR(m, "Step 4 - After optimizeWSBarrierLocations");
   }
 };
 

@@ -213,4 +213,56 @@ tt.func @tmem_load_sinks_after_barrier_reorder(
   tt.return
 }
 
+// All split tmem_loads should inherit the channelGraph from their arrive
+// barrier and sink past store-channel barriers independently.
+// CHECK-LABEL: @split_tmem_loads_all_sink
+tt.func @split_tmem_loads_all_sink(
+    %tmem_wait_bar: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %store_bar0: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %store_bar1: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %smem_buf: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+    %phase: i32) {
+  %alloc = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  %s0 = ttng.tmem_subslice %alloc {N = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable>
+  %s1 = ttng.tmem_subslice %alloc {N = 64 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable>
+
+  // tmem_load wait (no constraints — from MMA channel)
+  ttng.wait_barrier %tmem_wait_bar, %phase : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+
+  // Two split tmem_loads
+  %v0 = ttng.tmem_load %s0 : !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x64xf32, #linear64>
+  %v1 = ttng.tmem_load %s1 : !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x64xf32, #linear64>
+
+  // tmem_load arrive (channelGraph disjoint from store channel)
+  ttng.arrive_barrier %tmem_wait_bar, 1 {constraints = {channelGraph = array<i32: 1, 3>}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+
+  // Store channel: wait → local_store → arrive, repeated for each subtile
+  ttng.wait_barrier %store_bar0, %phase {constraints = {channelGraph = array<i32: 2>}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  %t0 = arith.truncf %v0 : tensor<128x64xf32, #linear64> to tensor<128x64xf16, #linear64>
+  ttg.local_store %t0, %smem_buf : tensor<128x64xf16, #linear64> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+  ttng.arrive_barrier %store_bar0, 1 {constraints = {channelGraph = array<i32: 2>}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+
+  ttng.wait_barrier %store_bar1, %phase {constraints = {channelGraph = array<i32: 2>}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  %t1 = arith.truncf %v1 : tensor<128x64xf32, #linear64> to tensor<128x64xf16, #linear64>
+  ttg.local_store %t1, %smem_buf : tensor<128x64xf16, #linear64> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+  ttng.arrive_barrier %store_bar1, 1 {constraints = {channelGraph = array<i32: 2>}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+
+  // Expected: both tmem_loads sink past the store waits, interleaved with
+  // the store pipeline.
+  //
+  // CHECK:      ttng.wait_barrier %{{.*}}, %{{.*}} :
+  // CHECK-NEXT: ttng.tmem_load
+  // CHECK-NEXT: arith.truncf
+  // CHECK-NEXT: ttng.wait_barrier {{.*}}channelGraph = array<i32: 2>
+  // CHECK-NEXT: ttg.local_store
+  // CHECK-NEXT: ttng.arrive_barrier {{.*}}channelGraph = array<i32: 2>
+  // CHECK-NEXT: ttng.tmem_load
+  // CHECK-NEXT: ttng.arrive_barrier {{.*}}channelGraph = array<i32: 1, 3>
+  // CHECK-NEXT: arith.truncf
+  // CHECK-NEXT: ttng.wait_barrier {{.*}}channelGraph = array<i32: 2>
+  // CHECK-NEXT: ttg.local_store
+  // CHECK-NEXT: ttng.arrive_barrier {{.*}}channelGraph = array<i32: 2>
+  tt.return
+}
+
 }
