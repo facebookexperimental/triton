@@ -227,33 +227,29 @@ also deferred until a kernel actually needs the transpose path.
 ### Stage D — Tutorials + docs
 
 **Files:**
-- `third_party/tlx/tutorials/amd-tdm-pipelined-copy_test.py` (new)
+- `third_party/tlx/tutorials/amd-tdm-gemm-pipelined_test.py` (new)
 - `third_party/tlx/doc/AMD_TDM_PLAN.md` (this doc, mark stages done)
 
 **Changes (landed):**
-- `amd-tdm-pipelined-copy_test.py`: TDM-pipelined elementwise
-  scale (`y = scale * x`) on gfx1250. Demonstrates
-  `tl.make_tensor_descriptor` + `tlx.async_tdm_load` /
-  `tlx.async_tdm_wait` + a 2-buffer software pipeline (prefetch tile
-  k+1 while consuming tile k). Compile-only test runs everywhere;
-  correctness test gated on gfx1250 hardware.
+- `amd-tdm-gemm-pipelined_test.py`: TDM-pipelined ``C = A @ B`` GEMM
+  on gfx1250. Demonstrates `tl.make_tensor_descriptor` +
+  `tlx.async_tdm_load` / `tlx.async_tdm_wait` + a 2-buffer software
+  pipeline (prefetch tile k+1 while consuming tile k). Default
+  `tlx.local_alloc` is used — the propagation pass picks the
+  WMMA-tuned padded encoding via `composePaddedLayout` because the
+  `local_load` consumers feed `tt.dot`. Compile-only test runs
+  everywhere; correctness tests are gated on gfx1250 hardware.
 
-**Deferred (follow-up): TDM-pipelined GEMM tutorial.** A pipelined
-GEMM that feeds the TDM-loaded tile into `tl.dot` requires the
-WMMA-aware padded encoding from `composePaddedLayoutWMMA` (in
-`third_party/amd/lib/TritonAMDGPUTransforms/Utility.cpp`), not the
-plain `buildDefaultTDMDescriptorEncoding` fallback. Without it the
-local_load → dot lowering cannot satisfy the dot operand encoding
-constraints and surfaces as an `unrealized_conversion_cast` at LLVM
-translation time. To land a TDM GEMM, we need either:
-1. A second public AMD helper that returns the WMMA-aware padded
-   layout, exposed alongside `buildDefaultTDMDescriptorEncoding` and
-   wired into `TLXInsertRequireLayout` for buffers consumed by dots; or
-2. A user-facing `tlx.dot_compatible_layout(desc, dot_shape, ...)` so
-   GEMM tutorials can request the right encoding explicitly.
-
-The pipelined-copy tutorial covers the same TDM API surface, so
-landing the GEMM is a follow-up rather than a blocker.
+**Dot-aware encoding propagation (landed alongside this stage).**
+`TLXInsertRequireLayout` now walks the TDM buffer's downstream
+consumers; when it finds a `local_load → tt.dot` chain with a
+`DotOperandEncodingAttr`, it picks the WMMA-tuned padded layout from
+`composePaddedLayout` (instead of the plain
+`buildDefaultTDMDescriptorEncoding` fallback) so the dot lowering can
+satisfy the operand encoding constraints. The dot-path walk in the
+same pass now skips TDM-fed buffers — both walks targeting the same
+chain with different encodings would otherwise widen the propagation
+lattice to "unknown" and leave the alloc with the wrong encoding.
   choices in this doc.
 
 ## Deferred (follow-up work)

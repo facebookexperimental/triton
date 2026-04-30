@@ -255,12 +255,54 @@ computeSharedEncFromDotEnc(ttg::DotOperandEncodingAttr dotEnc,
                                               /*needTrans=*/false);
 }
 
+// True if any user of the memdesc value is a TDM copy op (transitively
+// through subview / reinterpret chains). Used by the dot-path walk to
+// hand off TDM-fed buffers to the TDM anchor — both walks targeting the
+// same buffer with different encodings would otherwise conflict in the
+// propagation lattice.
+static bool isFedByTDM(Value memdesc) {
+  llvm::SetVector<Value> worklist;
+  worklist.insert(memdesc);
+  // Walk up to the source alloc to discover sibling subviews.
+  Value root = memdesc;
+  while (root) {
+    Operation *def = root.getDefiningOp();
+    if (!def)
+      break;
+    if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp>(def)) {
+      root = def->getOperand(0);
+      worklist.insert(root);
+      continue;
+    }
+    break;
+  }
+  // Walk downstream from every reached value looking for a TDM writer.
+  for (size_t i = 0; i < worklist.size(); ++i) {
+    Value v = worklist[i];
+    for (Operation *u : v.getUsers()) {
+      if (isa<amdgpu::AsyncTDMCopyGlobalToLocalOp>(u))
+        return true;
+      if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp>(u))
+        worklist.insert(u->getResult(0));
+    }
+  }
+  return false;
+}
+
 static void applyRequireLayout(ttg::SwizzledSharedEncodingAttr encoding,
                                ttg::LocalLoadOp localLoadOp,
                                OpBuilder &builder) {
   auto loadMemDesc = localLoadOp->getOperand(0);
 
   if (loadMemDesc.getDefiningOp<tlx::RequireLayoutOp>())
+    return;
+
+  // Defer to the TDM anchor for buffers fed by `amdgpu.async_tdm_*`. The
+  // TDM walk uses the WMMA-tuned padded encoding from
+  // `composePaddedLayout` (which is correct for both the TDM op and the
+  // local_load -> dot path); inserting a sibling swizzled anchor here
+  // would conflict with that constraint and widen the lattice to unknown.
+  if (isFedByTDM(loadMemDesc))
     return;
 
   // Respect user-specified order on the source memdesc.
@@ -322,14 +364,64 @@ static void materializeDotUserTensorConstraints(ModuleOp m,
 //
 // `amdgpu.async_tdm_copy_global_to_local` writes into a user-provided shared
 // memory buffer whose required encoding is determined by the descriptor's
-// shape and element type (the same fallback `OptimizeDescriptorEncoding`
-// applies). When TLX users allocate the buffer with the default
-// `local_alloc(...)` (no explicit `layout=`), the alloc's encoding is the
-// generic non-swizzled `SwizzledSharedEncoding(maxPhase=1)` — which the TDM
-// op verifier accepts but which produces wrong LDS data on real gfx1250
-// hardware. We anchor a `tlx.require_layout` on the buffer operand of every
-// TDM copy so `tlx-propagate-layout` rewrites the source `local_alloc` (and
-// any subview / loop-carrier chain) to the descriptor-compatible encoding.
+// shape and element type — and, when the buffer feeds a `tt.dot`, by the
+// dot operand's WMMA encoding. When TLX users allocate the buffer with the
+// default `local_alloc(...)` (no explicit `layout=`), the alloc's encoding
+// is the generic non-swizzled `SwizzledSharedEncoding(maxPhase=1)` — which
+// the TDM op verifier accepts but which produces wrong LDS data on real
+// gfx1250 hardware. We anchor a `tlx.require_layout` on the buffer operand
+// of every TDM copy so `tlx-propagate-layout` rewrites the source
+// `local_alloc` (and any subview / loop-carrier chain) to the
+// descriptor-compatible encoding.
+
+namespace {
+struct DotConsumerInfo {
+  int opIdx;
+  unsigned kWidth;
+};
+} // namespace
+
+// Walk users of a memdesc value transitively through subview /
+// reinterpret ops; return the consistent dot-operand info if all reachable
+// `ttg.local_load` consumers produce a `DotOperandEncodingAttr` tensor
+// agreeing on opIdx/kWidth. Returns nullopt if no dot consumer is found,
+// if multiple disagree, or if a non-trivial carrier (loop iter-arg, etc.)
+// blocks the walk — the caller falls back to the descriptor-default
+// encoding in those cases.
+static std::optional<DotConsumerInfo> findDotConsumer(Value buffer) {
+  std::optional<DotConsumerInfo> info;
+  llvm::SetVector<Value> worklist;
+  worklist.insert(buffer);
+  for (size_t i = 0; i < worklist.size(); ++i) {
+    Value v = worklist[i];
+    for (Operation *user : v.getUsers()) {
+      if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp>(user)) {
+        worklist.insert(user->getResult(0));
+        continue;
+      }
+      if (auto load = dyn_cast<ttg::LocalLoadOp>(user)) {
+        auto resTy = dyn_cast<RankedTensorType>(load.getResult().getType());
+        if (!resTy)
+          continue;
+        auto dotEnc =
+            dyn_cast_or_null<ttg::DotOperandEncodingAttr>(resTy.getEncoding());
+        if (!dotEnc)
+          continue;
+        DotConsumerInfo cand{static_cast<int>(dotEnc.getOpIdx()),
+                             static_cast<unsigned>(dotEnc.getKWidth())};
+        if (info && (info->opIdx != cand.opIdx || info->kWidth != cand.kWidth))
+          return std::nullopt;
+        info = cand;
+        continue;
+      }
+      // Non-trivial users (TDM stores, scf.for iter-args wrapping the
+      // memdesc, warp_specialize captures, etc.) are ignored: missing a
+      // dot consumer downstream just means we use the descriptor default,
+      // which is the right behavior for non-dot pipelines.
+    }
+  }
+  return info;
+}
 
 static void anchorTDMRequireLayout(amdgpu::AsyncTDMCopyGlobalToLocalOp tdmOp,
                                    OpBuilder &builder) {
@@ -346,9 +438,8 @@ static void anchorTDMRequireLayout(amdgpu::AsyncTDMCopyGlobalToLocalOp tdmOp,
   ArrayRef<int64_t> shape = descTy.getBlockType().getShape();
   Type elementType = descTy.getBlockType().getElementType();
 
-  // TLX descriptors don't carry a shared layout on their type; pick a
-  // row-major identity order, which matches what
-  // `AssignDescriptorMemoryLayouts::getFallbackSharedEncoding` would do.
+  // Row-major identity order matches what `getFallbackSharedEncoding`
+  // would pick for a TLX descriptor with no upstream layout.
   unsigned rank = shape.size();
   SmallVector<unsigned> order(rank);
   for (unsigned i = 0; i < rank; ++i)
@@ -356,8 +447,27 @@ static void anchorTDMRequireLayout(amdgpu::AsyncTDMCopyGlobalToLocalOp tdmOp,
 
   auto cgaLayout = ttg::CGAEncodingAttr::get1CTALayout(buf.getContext(), rank);
 
-  Attribute encoding = buildDefaultTDMDescriptorEncoding(
-      buf.getContext(), shape, order, cgaLayout, elementType);
+  // First try the dot-operand-aware path: when the buffer is consumed by a
+  // `local_load -> tt.dot` chain, the WMMA-tuned padded encoding from
+  // `composePaddedLayout` is required for the local_load lowering to
+  // satisfy the dot's operand encoding constraints. Otherwise fall back
+  // to the descriptor-shape-only default.
+  Attribute encoding;
+  if (auto dotInfo = findDotConsumer(buf)) {
+    auto modOp = tdmOp->getParentOfType<ModuleOp>();
+    auto archAttr = mlir::getAMDArch(modOp);
+    if (archAttr) {
+      triton::AMD::TargetInfo targetInfo(archAttr->str());
+      auto srcTy = cast<ttg::TensorOrMemDesc>(bufType);
+      if (auto padded = composePaddedLayout(targetInfo, dotInfo->opIdx,
+                                            dotInfo->kWidth, srcTy, order))
+        encoding = padded;
+    }
+  }
+  if (!encoding) {
+    encoding = buildDefaultTDMDescriptorEncoding(buf.getContext(), shape, order,
+                                                 cgaLayout, elementType);
+  }
   if (!encoding)
     return;
 
