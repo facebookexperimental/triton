@@ -53,7 +53,9 @@ void processProducerAcquireOp(OpBuilder &builder, ttnvws::ProducerAcquireOp op,
   Value phase = getMBarrierPhaseBit(builder, op, true);
   auto i32Ty = builder.getIntegerType(32);
   phase = arith::ExtUIOp::create(builder, loc, i32Ty, phase);
-  auto waitOp = ttng::WaitBarrierOp::create(builder, loc, bufferEmpty, phase);
+  auto waitOp = ttng::WaitBarrierOp::create(builder, loc, bufferEmpty, phase,
+                                            /*pred=*/Value(), /*deps=*/{},
+                                            op.getConstraintsAttr());
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(waitOp, getAsyncTaskIds(op.getOperation()));
   copyLoopScheduleInfo(waitOp, op);
@@ -66,8 +68,9 @@ void processProducerCommitOp(OpBuilder &builder, ttnvws::ProducerCommitOp op,
   ttng::ArriveBarrierOp arriveOp;
 
   assert(loadType != ttnvws::TokenLoadType::AsyncLoadOp);
-  arriveOp =
-      ttng::ArriveBarrierOp::create(builder, loc, bufferFull, 1); // fullCnt);
+  arriveOp = ttng::ArriveBarrierOp::create(
+      builder, loc, bufferFull, 1, /*pred=*/Value(), /*perThread=*/false,
+      op.getConstraintsAttr());
 
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(arriveOp, getAsyncTaskIds(op.getOperation()));
@@ -80,7 +83,9 @@ void processConsumerWaitOp(OpBuilder &builder, ttnvws::ConsumerWaitOp op,
   Value phase = getMBarrierPhaseBit(builder, op, false);
   auto i32Ty = builder.getIntegerType(32);
   phase = arith::ExtUIOp::create(builder, loc, i32Ty, phase);
-  auto waitOp = ttng::WaitBarrierOp::create(builder, loc, bufferFull, phase);
+  auto waitOp = ttng::WaitBarrierOp::create(builder, loc, bufferFull, phase,
+                                            /*pred=*/Value(), /*deps=*/{},
+                                            op.getConstraintsAttr());
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(waitOp, getAsyncTaskIds(op.getOperation()));
   copyLoopScheduleInfo(waitOp, op);
@@ -90,8 +95,9 @@ void processConsumerReleaseOp(OpBuilder &builder, ttnvws::ConsumerReleaseOp op,
                               Value bufferEmpty, int numCTAs,
                               unsigned emptyCnt) {
   auto loc = op.getLoc();
-  auto arriveOp =
-      ttng::ArriveBarrierOp::create(builder, loc, bufferEmpty, 1); // emptyCnt);
+  auto arriveOp = ttng::ArriveBarrierOp::create(
+      builder, loc, bufferEmpty, 1, /*pred=*/Value(), /*perThread=*/false,
+      op.getConstraintsAttr());
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(arriveOp, getAsyncTaskIds(op.getOperation()));
   copyLoopScheduleInfo(arriveOp, op);

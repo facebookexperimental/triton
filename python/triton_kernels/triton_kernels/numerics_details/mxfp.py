@@ -7,7 +7,6 @@ import torch
 import torch.nn.functional as F
 from .mxfp_details._upcast_from_mxfp import _upcast_from_mxfp, _upcast_from_mxfp_tma
 from .mxfp_details._downcast_to_mxfp import _downcast_to_mxfp, MXFP_BLOCK_SIZE, _quantize_mxfp8_fn
-from triton.tools.tensor_descriptor import TensorDescriptor
 
 # -----------------------------------------------------------------------------
 #                      Dequantization / Quantization Utilities

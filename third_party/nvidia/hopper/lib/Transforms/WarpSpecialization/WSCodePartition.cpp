@@ -1,5 +1,6 @@
 #include "CodePartitionUtility.h"
 #include "TMEMUtils.h"
+#include "WSBarrierAnalysis.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
@@ -3448,7 +3449,10 @@ void insertAsyncComm(
           builder.setInsertionPoint(producerAcquirePoint);
           builder.setLoopScheduleInfoFromOp(producerAcquirePoint);
           builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
-              headProducer->getLoc(), guardToken, bufferIdx, phase);
+              headProducer->getLoc(), guardToken, bufferIdx, phase,
+              WSBarrierAttr::forDstTask(funcOp.getContext(),
+                                        foundGuardCh->relation.first)
+                  .build(funcOp.getContext()));
 
           // Insert ConsumerReleaseOp after the guard channel's
           // tmem_load (srcOp).
@@ -3469,7 +3473,10 @@ void insertAsyncComm(
                                regionsWithChannels, guardBufIdx, guardPhase,
                                config, reuseGrp, masterChannel);
           builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
-              guardConsumerReleasePoint->getLoc(), guardToken, guardBufIdx);
+              guardConsumerReleasePoint->getLoc(), guardToken, guardBufIdx,
+              WSBarrierAttr::forDstTask(funcOp.getContext(),
+                                        masterChannel->relation.first)
+                  .build(funcOp.getContext()));
 
           LLVM_DEBUG({
             LDBG("operand D race fix: guard channel "
@@ -3520,7 +3527,9 @@ void insertAsyncComm(
         }
         auto acquireOp =
             builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
-                headProducer->getLoc(), token.second, bufferIdx, phase);
+                headProducer->getLoc(), token.second, bufferIdx, phase,
+                WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
+                    .build(funcOp.getContext()));
         LLVM_DEBUG({
           LDBG("Insert ProducerAcquireOp " << masterChannel->uniqID << " ");
           producerAcquirePoint->dump();
@@ -3552,7 +3561,10 @@ void insertAsyncComm(
             auto acquireOp =
                 builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
                     headProducer->getLoc(), earlyToken.second, bufferIdx,
-                    phaseFlipped);
+                    phaseFlipped,
+                    WSBarrierAttr::forDstTask(funcOp.getContext(),
+                                              earlyToken.first)
+                        .build(funcOp.getContext()));
             LLVM_DEBUG({
               LDBG("Insert intra-iteration reuse ProducerAcquireOp for late "
                    "channel "
@@ -3580,7 +3592,10 @@ void insertAsyncComm(
             builder.setLoopScheduleInfoFromOp(headProducer);
             auto acquireOp =
                 builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
-                    headProducer->getLoc(), wrapToken.second, bufferIdx, phase);
+                    headProducer->getLoc(), wrapToken.second, bufferIdx, phase,
+                    WSBarrierAttr::forDstTask(funcOp.getContext(),
+                                              wrapToken.first)
+                        .build(funcOp.getContext()));
             LLVM_DEBUG({
               LDBG("Insert wrap-around reuse ProducerAcquireOp for channel "
                    << masterChannel->uniqID << " waiting on last channel "
@@ -3652,7 +3667,9 @@ void insertAsyncComm(
         builder.setLoopScheduleInfoFromOp(producerCommitPoint);
         auto commitOp =
             builder.createWithAsyncTaskIds<ttnvws::ProducerCommitOp>(
-                tailProducer->getLoc(), token.second, bufferIdx);
+                tailProducer->getLoc(), token.second, bufferIdx,
+                WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
+                    .build(funcOp.getContext()));
       }
     }
 
@@ -3700,7 +3717,10 @@ void insertAsyncComm(
           builder.setLoopScheduleInfoFromOp(actualCons);
           LDBG("  inserting ConsumerWaitOp for task " << tokenTaskId);
           auto waitOp = builder.createWithAsyncTaskIds<ttnvws::ConsumerWaitOp>(
-              tokenHeadConsumer->getLoc(), token.second, bufferIdx, phase);
+              tokenHeadConsumer->getLoc(), token.second, bufferIdx, phase,
+              WSBarrierAttr::forDstTask(funcOp.getContext(),
+                                        masterChannel->relation.first)
+                  .build(funcOp.getContext()));
           // Propagate the actual consumer's loop schedule to the
           // phase/bufferIdx value ops. These were computed earlier (by
           // getBufferIdxAndPhase) with no loop.stage/loop.cluster, but they
@@ -3760,7 +3780,10 @@ void insertAsyncComm(
             builder.setInsertionPointAfter(consumerReleasePoint);
             auto releaseOp =
                 builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
-                    consumerReleasePoint->getLoc(), token.second, bufferIdx);
+                    consumerReleasePoint->getLoc(), token.second, bufferIdx,
+                    WSBarrierAttr::forDstTask(funcOp.getContext(),
+                                              masterChannel->relation.first)
+                        .build(funcOp.getContext()));
             LLVM_DEBUG({
               LDBG("create ConsumerRelease " << masterChannel->uniqID << " ");
               token.second.dump();

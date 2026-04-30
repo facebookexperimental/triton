@@ -70,6 +70,41 @@ ttng.arrive_barrier %bar, 1 {
 } : !ttg.memdesc<1xi64, #shared, #smem, mutable>
 ```
 
+### WS Barrier Analysis (`WSBarrierAnalysis.h`)
+
+These keys annotate barriers with the channel-graph metadata needed for
+barrier reordering analysis (e.g., pushing a `tmem_load` arrive past
+intervening waits).
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `dstTask` | `I32Attr` | Destination task ID — the foreign partition this barrier communicates with. The source task is the partition where the barrier lives (available via `async_task_id`). |
+| `channelGraph` | `DenseI32ArrayAttr` | Set of task IDs reachable from the destination through the channel adjacency graph (excluding the source). Used by `canAdvanceWSBarrier` to check if two barriers can be safely reordered. |
+
+**Lifecycle:**
+1. `dstTask` is set when token ops are created in `insertAsyncComm`
+   (before code partitioning).
+2. `channelGraph` is injected after code partitioning via
+   `buildChannelGraph()` + `injectChannelGraph()`.
+3. Both propagate through `doTokenLowering` to the resulting barrier ops.
+
+**Reordering rule:** Two WS barriers of opposite types (arrive, wait) can
+be reordered if they target different destination tasks. This is checked by
+`canAdvanceWSBarrier()`.
+
+Example:
+```mlir
+// Producer commit to consumer task 2
+nvws.producer_commit %tok, %idx {
+  constraints = {dstTask = 2 : i32}
+} : tensor<1x!nvws.token>, i32
+
+// After channelGraph injection
+ttng.arrive_barrier %bar, 1 {
+  constraints = {dstTask = 2 : i32, channelGraph = array<i32: 1, 2>}
+} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+```
+
 ### Pipeline Scheduling (future)
 
 | Key | Type | Description |
@@ -79,15 +114,19 @@ ttng.arrive_barrier %bar, 1 {
 
 ### Token Ops
 
-The same `constraints` dict is available on the NVWS token ops:
+The same `constraints` dict is available on the NVWS token ops.
+`doTokenLowering` propagates constraints from token ops to the resulting
+barrier ops, so any key set on a token op will appear on the lowered
+`wait_barrier` / `arrive_barrier`.
 
 ```mlir
+// dstTask is set during insertAsyncComm
 nvws.producer_acquire %tok, %idx, %phase {
-  constraints = {subtileChannel = true}
+  constraints = {dstTask = 2 : i32}
 } : tensor<1x!nvws.token>, i32, i1
 
 nvws.consumer_wait %tok, %idx, %phase {
-  constraints = {subtileChannel = true}
+  constraints = {dstTask = 0 : i32}
 } : tensor<1x!nvws.token>, i32, i1
 ```
 

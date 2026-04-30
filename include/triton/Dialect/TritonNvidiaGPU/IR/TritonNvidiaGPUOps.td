@@ -279,6 +279,10 @@ def TTNG_WaitBarrierOp : TTNG_Op<"wait_barrier", [AttrSizedOperandSegments]> {
     [{
     build($_builder, $_state, alloc, phase, /*pred=*/static_cast<mlir::Value>(nullptr), deps, /*constraints=*/DictionaryAttr());
     }]>,
+    OpBuilder<(ins "Value":$alloc, "Value":$phase, "Value":$pred, "ValueRange":$deps),
+    [{
+    build($_builder, $_state, alloc, phase, pred, deps, /*constraints=*/DictionaryAttr());
+    }]>,
   ];
 
   let assemblyFormat = [{
@@ -322,8 +326,14 @@ def TTNG_ArriveBarrierOp : TTNG_Op<"arrive_barrier"> {
     OpBuilder<(ins "Value":$alloc, "uint32_t":$count), [{
       return build($_builder, $_state, alloc, count, /*pred=*/Value(), /*perThread=*/false, /*constraints=*/DictionaryAttr());
     }]>,
+    OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred), [{
+      return build($_builder, $_state, alloc, count, pred, /*perThread=*/false, /*constraints=*/DictionaryAttr());
+    }]>,
     OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "bool":$perThread), [{
       return build($_builder, $_state, alloc, count, /*pred=*/Value(), perThread, /*constraints=*/DictionaryAttr());
+    }]>,
+    OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred, "bool":$perThread), [{
+      return build($_builder, $_state, alloc, count, pred, perThread, /*constraints=*/DictionaryAttr());
     }]>
   ];
 
