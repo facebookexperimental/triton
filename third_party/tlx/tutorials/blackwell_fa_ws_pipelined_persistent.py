@@ -1394,7 +1394,7 @@ def _attn_bwd_ws(
 
     with tlx.async_tasks():
         # compute
-        with tlx.async_task("default", replicate=1):
+        with tlx.async_task("default"):
             blk_idx = 0
             tile_count = 0
             tile_id = start_pid
