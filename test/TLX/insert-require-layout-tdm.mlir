@@ -383,7 +383,77 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 
 // -----
 // =============================================================================
-// 15. End-to-end GEMM-shaped pattern: A and B descriptors, two TDM copies,
+// 15. Sibling-subview pattern (the real GEMM software-pipeline shape):
+//     the TDM op writes to slot N of a multi-buffer alloc while the
+//     `local_load` reads from slot M (different `memdesc_index` op on the
+//     same alloc). `findDotConsumer` must walk *up* to the alloc and back
+//     *down* to find the load — a downstream-only walk from the TDM op's
+//     buffer would miss it and silently fall back to the default encoding.
+// =============================================================================
+
+// CHECK-DAG: #{{.*}} = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}>
+// CHECK-NOT: #{{.*}} = #ttg.padded_shared<[32:+8]
+
+#mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 32]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tdm_sibling_subviews_dot
+  // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<128x32xf16, #{{.*}}, #smem, mutable>
+  // CHECK-NEXT: amdg.async_tdm_copy_global_to_local
+  tt.func public @tdm_sibling_subviews_dot(%desc: !tt.tensordesc<128x32xf16>, %m: i32, %k: i32, %p: i32, %slot_w: i32, %slot_r: i32)
+      -> tensor<128x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>> {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #shared, #smem, mutable>
+    %buf_w = ttg.memdesc_index %alloc[%slot_w] : !ttg.memdesc<2x128x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+    %tok = amdg.async_tdm_copy_global_to_local %desc[%m, %k] into %buf_w, pred = %p : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+    %buf_r = ttg.memdesc_index %alloc[%slot_r] : !ttg.memdesc<2x128x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+    %t = ttg.local_load %buf_r : !ttg.memdesc<128x32xf16, #shared, #smem, mutable> -> tensor<128x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>
+    tt.return %t : tensor<128x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>
+  }
+}
+
+// -----
+// =============================================================================
+// 16. scf.for iter-arg carrier: the buffer's subview is loop-carried. The
+//     proper sparse backward dataflow (DotConsumerBackward) handles the
+//     iter-arg via SparseBackwardDataFlowAnalysis's region-branch support;
+//     the previous hand-rolled walk would have stopped at the iter-arg
+//     boundary and missed the dot consumer.
+// =============================================================================
+
+// CHECK-DAG: #{{.*}} = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}>
+// CHECK-NOT: #{{.*}} = #ttg.padded_shared<[32:+8]
+
+#mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 32]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tdm_loop_carried_buffer
+  // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<128x32xf16, #{{.*}}, #smem, mutable>
+  // CHECK-NEXT: amdg.async_tdm_copy_global_to_local
+  tt.func public @tdm_loop_carried_buffer(%desc: !tt.tensordesc<128x32xf16>, %m: i32, %k_init: i32, %p: i32, %lo: i32, %hi: i32, %step: i32)
+      -> tensor<128x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>> {
+    %c0 = arith.constant 0 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #shared, #smem, mutable>
+    %buf_w = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x128x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+    %tok = amdg.async_tdm_copy_global_to_local %desc[%m, %k_init] into %buf_w, pred = %p : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+    %buf_r0 = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x128x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+    // The buffer subview is carried through iter_args of an scf.for loop;
+    // the local_load consuming it lives inside the loop body.
+    %r = scf.for %i = %lo to %hi step %step iter_args(%buf_iter = %buf_r0)
+        -> (!ttg.memdesc<128x32xf16, #shared, #smem, mutable>) : i32 {
+      scf.yield %buf_iter : !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+    }
+    %t = ttg.local_load %r : !ttg.memdesc<128x32xf16, #shared, #smem, mutable> -> tensor<128x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>
+    tt.return %t : tensor<128x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>
+  }
+}
+
+// -----
+// =============================================================================
+// 17. End-to-end GEMM-shaped pattern: A and B descriptors, two TDM copies,
 //     dot consumer. Both TDM ops anchor with the WMMA-tuned padded encoding;
 //     no swizzled-shared anchors from the dot-path walk on TDM-fed buffers.
 // =============================================================================
