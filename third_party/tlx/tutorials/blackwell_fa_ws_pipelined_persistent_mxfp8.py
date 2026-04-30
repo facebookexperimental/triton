@@ -1489,6 +1489,7 @@ def attention(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal, config=None)
         N_CTX=q.shape[2],
         HEAD_DIM=HEAD_DIM_K,
         STAGE=stage,
+        num_stages=1,
         **config,
     )
     return o
