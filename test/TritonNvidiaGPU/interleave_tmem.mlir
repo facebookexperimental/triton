@@ -136,4 +136,81 @@ tt.func @sink_alloc_op(%arg0: tensor<128x128xf32, #linear128>) {
   tt.return
 }
 
+// An arrive with channelGraph disjoint from a wait's channelGraph should be
+// sunk past the wait.
+// CHECK-LABEL: @sink_arrive_past_wait_disjoint
+tt.func @sink_arrive_past_wait_disjoint(
+    %bar1: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %bar2: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %phase: i32) {
+  // CHECK: ttng.wait_barrier
+  // CHECK-SAME: channelGraph = array<i32: 2>
+  // CHECK-NEXT: ttng.wait_barrier
+  // CHECK-SAME: channelGraph = array<i32: 1>
+  // CHECK-NEXT: ttng.arrive_barrier
+  // CHECK-SAME: channelGraph = array<i32: 2>
+  // CHECK-NEXT: ttng.arrive_barrier
+  // CHECK-SAME: channelGraph = array<i32: 1>
+  ttng.wait_barrier %bar1, %phase {constraints = {channelGraph = array<i32: 2>}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.arrive_barrier %bar1, 1 {constraints = {channelGraph = array<i32: 2>}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.wait_barrier %bar2, %phase {constraints = {channelGraph = array<i32: 1>}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.arrive_barrier %bar2, 1 {constraints = {channelGraph = array<i32: 1>}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  tt.return
+}
+
+// An arrive whose channelGraph overlaps the wait's channelGraph must NOT be
+// sunk past the wait.
+// CHECK-LABEL: @no_reorder_overlapping_graph
+tt.func @no_reorder_overlapping_graph(
+    %bar1: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %bar2: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %phase: i32) {
+  // CHECK: ttng.arrive_barrier
+  // CHECK-SAME: channelGraph = array<i32: 1, 2>
+  // CHECK-NEXT: ttng.wait_barrier
+  // CHECK-SAME: channelGraph = array<i32: 2, 3>
+  ttng.arrive_barrier %bar1, 1 {constraints = {channelGraph = array<i32: 1, 2>}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.wait_barrier %bar2, %phase {constraints = {channelGraph = array<i32: 2, 3>}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  tt.return
+}
+
+// Barriers without constraints are not moved.
+// CHECK-LABEL: @no_reorder_without_constraints
+tt.func @no_reorder_without_constraints(
+    %bar1: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %bar2: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %phase: i32) {
+  // CHECK: ttng.arrive_barrier
+  // CHECK-NEXT: ttng.wait_barrier
+  ttng.arrive_barrier %bar1, 1 : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.wait_barrier %bar2, %phase : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  tt.return
+}
+
+// After barrier reordering, tmem_load can sink past the wait that was
+// previously blocked by an arrive from a different channel.
+// CHECK-LABEL: @tmem_load_sinks_after_barrier_reorder
+tt.func @tmem_load_sinks_after_barrier_reorder(
+    %bar1: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %bar2: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %phase: i32) {
+  %alloc = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  // tmem_load is followed by its own arrive (channel 2), then a wait from
+  // channel 1. The arrive should sink past the wait, letting the tmem_load
+  // sink further.
+  //
+  // CHECK: ttng.wait_barrier
+  // CHECK-SAME: channelGraph = array<i32: 1>
+  // CHECK-NEXT: ttng.tmem_alloc
+  // CHECK-NEXT: tmem_load
+  // CHECK-NEXT: "user"
+  // CHECK-NEXT: ttng.arrive_barrier
+  // CHECK-SAME: channelGraph = array<i32: 2>
+  %0 = ttng.tmem_load %alloc : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear128>
+  ttng.arrive_barrier %bar1, 1 {constraints = {channelGraph = array<i32: 2>}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.wait_barrier %bar2, %phase {constraints = {channelGraph = array<i32: 1>}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  "user"(%0) : (tensor<128x128xf32, #linear128>) -> ()
+  tt.return
+}
+
 }

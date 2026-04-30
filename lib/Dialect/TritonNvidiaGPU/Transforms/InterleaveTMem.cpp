@@ -1,4 +1,5 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "nvidia/hopper/include/Transforms/WSBarrierReorder.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
@@ -263,6 +264,15 @@ struct TritonNvidiaGPUInterleaveTMemPass
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     ModuleOp m = getOperation();
+
+    // Reorder WS barriers before sinking tmem_loads. This pushes arrive
+    // barriers from independent channels past wait barriers, unblocking
+    // tmem_load sinking (which stops at arrive barriers).
+    m.walk([&](Block *block) {
+      sinkWSArrives(*block);
+      raiseWSWaits(*block);
+    });
+
     SmallVector<std::pair<Operation *, Value>> opsToSink;
     m.walk([&](Operation *op) {
       if (auto load = dyn_cast<TMEMLoadOp>(op))
