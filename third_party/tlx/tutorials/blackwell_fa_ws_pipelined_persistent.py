@@ -1394,7 +1394,7 @@ def _attn_bwd_ws(
 
     with tlx.async_tasks():
         # compute
-        with tlx.async_task("default", registers=192, replicate=1):
+        with tlx.async_task("default", replicate=1):
             blk_idx = 0
             tile_count = 0
             tile_id = start_pid
@@ -2156,6 +2156,7 @@ def attention(q, k, v, sm_scale, causal, config=None):
         N_CTX=q.shape[2],
         HEAD_DIM=HEAD_DIM_K,
         STAGE=stage,
+        num_stages=1,
         **config,
     )
     return o
