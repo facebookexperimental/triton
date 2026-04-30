@@ -7,10 +7,13 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/LogicalResult.h"
 
+namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
 namespace ttng = mlir::triton::nvidia_gpu;
 
@@ -198,8 +201,27 @@ public:
                                return WalkResult::advance();
                              })
                               .wasInterrupted();
+
+    // Detect warp pipeline border markers and disable auto software pipelining
+    // on affected loops so the markers survive through make_ttgir.
+    // Uses a recursive walk to handle markers nested under conditionals or
+    // other regions within the loop body.
+    bool hasWarpPipelineOps = false;
+    mod.walk([&](scf::ForOp forOp) {
+      bool hasBorders = false;
+      forOp.getBody()->walk([&](Operation *op) {
+        if (op->hasAttr("triton.warp_pipeline.border"))
+          hasBorders = true;
+      });
+      if (hasBorders) {
+        hasWarpPipelineOps = true;
+        forOp->setAttr(tt::kNumStagesAttrName,
+                       Builder(&getContext()).getI32IntegerAttr(0));
+      }
+    });
+
     if (!hasTLXOps && !hasExplicitLocalMemAccess && !hasWarpSpecOps &&
-        !hasTLXTwoCTAs) {
+        !hasTLXTwoCTAs && !hasWarpPipelineOps) {
       return;
     }
 
@@ -216,6 +238,8 @@ public:
       mod->setAttr(AttrHasExplicitLocalMemAccessName, b.getBoolAttr(true));
     if (hasWarpSpecOps)
       mod->setAttr(AttrHasWarpSpecOpsName, b.getBoolAttr(true));
+    if (hasWarpPipelineOps)
+      mod->setAttr(AttrHasWarpPipelineOpsName, b.getBoolAttr(true));
     if (hasTLXTwoCTAs) {
       mod->setAttr(AttrTLXEnablePairedCTAMMAName, b.getBoolAttr(true));
     }
