@@ -3,7 +3,9 @@
 
 #include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 
 namespace mlir {
@@ -91,6 +93,60 @@ inline bool raiseWSWaits(Block &block) {
     }
   }
   return changed;
+}
+
+// Build a map from each WS-annotated barrier to its nearest associated
+// memory op. For arrives, scans backward; for waits, scans forward.
+// Barrier ops and terminators are skipped when scanning.
+inline DenseMap<Operation *, Operation *>
+buildBarrierToMemoryOpMap(Block &block) {
+  DenseMap<Operation *, Operation *> map;
+  auto isMemoryOp = [](Operation *op) {
+    return !isMemoryEffectFree(op) &&
+           !isa<ArriveBarrierOp, WaitBarrierOp, InitBarrierOp>(op) &&
+           !op->hasTrait<OpTrait::IsTerminator>();
+  };
+
+  for (auto &op : block) {
+    if (auto arrive = dyn_cast<ArriveBarrierOp>(&op)) {
+      if (!arrive.getConstraints())
+        continue;
+      for (auto *cur = arrive->getPrevNode(); cur; cur = cur->getPrevNode()) {
+        if (isMemoryOp(cur)) {
+          map[arrive] = cur;
+          break;
+        }
+      }
+    } else if (auto wait = dyn_cast<WaitBarrierOp>(&op)) {
+      if (!wait.getConstraints())
+        continue;
+      for (auto *cur = wait->getNextNode(); cur; cur = cur->getNextNode()) {
+        if (isMemoryOp(cur)) {
+          map[wait] = cur;
+          break;
+        }
+      }
+    }
+  }
+  return map;
+}
+
+// After tmem_load sinking, relocate WS barriers back to optimal positions
+// relative to their associated memory ops. Arrives go right after their
+// memory op; waits go right before.
+inline void optimizeWSBarrierLocations(
+    const DenseMap<Operation *, Operation *> &barrierToMemOp) {
+  for (auto [barrier, memOp] : barrierToMemOp) {
+    if (barrier->getBlock() != memOp->getBlock())
+      continue;
+    if (isa<ArriveBarrierOp>(barrier)) {
+      if (barrier->getPrevNode() != memOp)
+        barrier->moveAfter(memOp);
+    } else {
+      if (barrier->getNextNode() != memOp)
+        barrier->moveBefore(memOp);
+    }
+  }
 }
 
 } // namespace nvidia_gpu

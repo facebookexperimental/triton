@@ -199,13 +199,13 @@ tt.func @tmem_load_sinks_after_barrier_reorder(
   // channel 1. The arrive should sink past the wait, letting the tmem_load
   // sink further.
   //
-  // CHECK: ttng.wait_barrier
-  // CHECK-SAME: channelGraph = array<i32: 1>
-  // CHECK-NEXT: ttng.tmem_alloc
+  // CHECK: ttng.tmem_alloc
   // CHECK-NEXT: tmem_load
-  // CHECK-NEXT: "user"
   // CHECK-NEXT: ttng.arrive_barrier
   // CHECK-SAME: channelGraph = array<i32: 2>
+  // CHECK-NEXT: ttng.wait_barrier
+  // CHECK-SAME: channelGraph = array<i32: 1>
+  // CHECK-NEXT: "user"
   %0 = ttng.tmem_load %alloc : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear128>
   ttng.arrive_barrier %bar1, 1 {constraints = {channelGraph = array<i32: 2>}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
   ttng.wait_barrier %bar2, %phase {constraints = {channelGraph = array<i32: 1>}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>

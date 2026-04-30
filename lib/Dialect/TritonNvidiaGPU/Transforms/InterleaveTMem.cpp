@@ -265,14 +265,22 @@ struct TritonNvidiaGPUInterleaveTMemPass
     MLIRContext *context = &getContext();
     ModuleOp m = getOperation();
 
-    // Reorder WS barriers before sinking tmem_loads. This pushes arrive
-    // barriers from independent channels past wait barriers, unblocking
-    // tmem_load sinking (which stops at arrive barriers).
+    // Step 1: Record which memory op each WS barrier guards.
+    SmallVector<DenseMap<Operation *, Operation *>> barrierMaps;
+    m.walk([&](Block *block) {
+      auto map = buildBarrierToMemoryOpMap(*block);
+      if (!map.empty())
+        barrierMaps.push_back(std::move(map));
+    });
+
+    // Step 2: Reorder WS barriers. Pushes arrives down and pulls waits up
+    // past barriers from independent channels, unblocking tmem_load sinking.
     m.walk([&](Block *block) {
       sinkWSArrives(*block);
       raiseWSWaits(*block);
     });
 
+    // Step 3: Sink tmem_loads closer to their uses.
     SmallVector<std::pair<Operation *, Value>> opsToSink;
     m.walk([&](Operation *op) {
       if (auto load = dyn_cast<TMEMLoadOp>(op))
@@ -282,9 +290,12 @@ struct TritonNvidiaGPUInterleaveTMemPass
     });
     for (auto [op, buffer] : opsToSink) {
       while (trySinkOp(op, buffer)) {
-        // Keep trying to sink loads and their users.
       }
     }
+
+    // Step 4: Restore barriers to optimal positions near their memory ops.
+    for (auto &map : barrierMaps)
+      optimizeWSBarrierLocations(map);
   }
 };
 

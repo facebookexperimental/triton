@@ -39,6 +39,35 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
+// After insertAsyncComm creates token ops with dstTask, inject the
+// channelGraph computed from the full set of channels.
+static void injectChannelGraphOnTokenOps(triton::FuncOp &funcOp,
+                                         ArrayRef<Channel *> channels) {
+  auto graph = buildChannelGraph(channels);
+  if (graph.empty())
+    return;
+  funcOp.walk([&](Operation *op) {
+    if (!isa<ttnvws::ProducerAcquireOp, ttnvws::ProducerCommitOp,
+             ttnvws::ConsumerWaitOp, ttnvws::ConsumerReleaseOp>(op))
+      return;
+    auto constraints = op->getAttrOfType<DictionaryAttr>("constraints");
+    if (!constraints)
+      return;
+    auto wsAttr = WSBarrierAttr::parse(constraints);
+    if (!wsAttr.dstTask)
+      return;
+    auto taskIds = getAsyncTaskIds(op);
+    if (taskIds.size() != 1)
+      return;
+    int srcTask = taskIds[0];
+    int dstTask = wsAttr.dstTask.getInt();
+    auto it = graph.find({srcTask, dstTask});
+    if (it != graph.end())
+      op->setAttr("constraints", injectChannelGraph(funcOp.getContext(),
+                                                    constraints, it->second));
+  });
+}
+
 /// Lower token annotations by injecting inline ConsumerWaitOp/ConsumerReleaseOp
 /// into the tile body. Used for multi-task SubtiledRegionOps that are lowered
 /// before doTokenLowering runs (the inline ops survive into warp partitions
@@ -4347,6 +4376,8 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
     funcOp.dump();
   });
 
+  injectChannelGraphOnTokenOps(funcOp, orderedChannels);
+
   // If loadResult has a single use which is LocalAlloc, we can get rid of
   // sharedLoad and replace all uses of LocalAlloc with viewLoad.
   foldLocalLoads(funcOp);
@@ -4591,6 +4622,8 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
     LDBG("\n\nwith SyncOps");
     funcOp.dump();
   });
+
+  injectChannelGraphOnTokenOps(funcOp, orderedChannels);
 
   // Prune any unnecessary barriers related to tgen05.commit
   fuseTcgen05CommitBarriers(funcOp);
