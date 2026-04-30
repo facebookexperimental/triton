@@ -27,6 +27,7 @@
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 #include "third_party/amd/include/Utils/Utility.h"
+#include "TritonAMDGPUToLLVM/TargetUtils.h"
 #include "triton/Dialect/Triton/IR/Interfaces.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -51,8 +52,8 @@ using ::mlir::triton::gpu::DotOperandEncodingAttr;
 
 // Local linearize helper to avoid circular dependency on TritonGPUToLLVM.
 static size_t linearizeIndices(llvm::ArrayRef<unsigned> multiDim,
-                               llvm::ArrayRef<unsigned> shape,
-                               llvm::ArrayRef<unsigned> order) {
+                                llvm::ArrayRef<unsigned> shape,
+                                llvm::ArrayRef<unsigned> order) {
   size_t linear = 0;
   for (unsigned dim : llvm::reverse(order))
     linear = linear * shape[dim] + multiDim[dim];
