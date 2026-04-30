@@ -212,17 +212,24 @@ also deferred until a kernel actually needs the transpose path.
   remains as a backstop for users who pass an explicit
   *non-default-and-non-matching* layout.
 
+**Stage C wrap-up (landed):**
+- `tlx.async_descriptor_load` now raises `NotImplementedError` on AMD
+  callers with a clear message pointing at `tlx.async_tdm_load` —
+  AMD users no longer silently fall through to the inert NV TMA stub.
+  This subsumes the original "diagnose `cache_modifier` /
+  `eviction_policy` / `multicast_targets` on AMD" item: the entire
+  builtin is rejected on AMD, so individual NV-only kwargs no longer
+  need per-arg checks.
+- `TritonTLXFixup` audit: verified that `Fixup.cpp` only sets
+  module-level attributes (numWarps, numCTAs, target, has-TLX-ops
+  flags) and inserts NV-only `InvalBarrierOp`s. It never touches
+  `tt.DescriptorLoadOp` or `tt.MakeTensorDescOp` — no descriptor
+  metadata stripping concern.
+
 **Deferred (follow-up):**
-- Audit `TritonTLXFixup` to verify it does not strip metadata from
-  `tt.DescriptorLoadOp` / `tt.MakeTensorDescOp`.
-- Make `cache_modifier` and `eviction_policy` no-ops on AMD with a
-  diagnostic (TDM intrinsics do not accept them).
-- Drop `multicast_targets` on AMD with a diagnostic (NV-only concept;
-  AMD has `cluster_load_async_to_lds` but it's not exposed via the
-  descriptor surface).
-- Extend the TDM-anchor walk to the deferred siblings
-  (`async_tdm_copy_local_to_global`, gather, scatter, prefetch) once
-  those builtins land.
+- Extend the TDM-anchor walk in `TLXInsertRequireLayout` to the
+  deferred siblings (`async_tdm_copy_local_to_global`, gather,
+  scatter, prefetch) once those builtins land.
 
 ### Stage D — Tutorials + docs
 

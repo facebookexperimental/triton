@@ -837,7 +837,20 @@ def async_descriptor_load(
     multicast_targets: list[tl.tensor] = [],
     _semantic=None,
 ) -> None:
+    """Asynchronous descriptor load via NV TMA.
+
+    NV-only. AMD users should call :func:`async_tdm_load` instead — TDM
+    has counter-based completion (no ``barrier``), no
+    ``cache_modifier`` / ``eviction_policy`` / ``multicast_targets``,
+    and the buffer encoding is determined by the descriptor (rather than
+    forced to NV-MMA shared).
+    """
     assert isinstance(desc, tl.tensor_descriptor_base)
+    arch = _semantic.builder.options.arch
+    if isinstance(arch, str) and arch.startswith("gfx"):
+        raise NotImplementedError(f"tlx.async_descriptor_load is NV-only; got AMD arch '{arch}'. "
+                                  "Use tlx.async_tdm_load on TDM-capable AMD targets (gfx1250+); "
+                                  "non-TDM AMD targets do not have a descriptor-based async load.")
     assert eviction_policy in ("", "evict_first", "evict_last"), \
         f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'"
     ndim = len(desc.block_shape)
