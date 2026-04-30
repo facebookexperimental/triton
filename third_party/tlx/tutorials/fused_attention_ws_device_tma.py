@@ -928,13 +928,13 @@ configs_bwd_persist = [
             "BLOCK_N1": 128,
             "BLOCK_M2": 128,
             "BLOCK_N2": 128,
-            "EPILOGUE_SUBTILE": 4,
+            "EPILOGUE_SUBTILE": 2,
             "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM64_TMEM,
         },
         num_warps=4,
         num_stages=2,
         pre_hook=_bwd_host_descriptor_pre_hook,
-        ir_override="/home/mren/local/MetaMain/triton/override/autows.ttgir",
+        #ir_override="/home/mren/local/MetaMain/triton/override/autows.ttgir",
     ),
 ]
 
