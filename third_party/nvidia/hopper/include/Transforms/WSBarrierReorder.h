@@ -30,6 +30,21 @@ inline bool canAdvanceWSBarrier(std::optional<DictionaryAttr> constraintsA,
   return true;
 }
 
+// Check whether moving `op` to just before `insertPt` would break SSA
+// dominance for any of op's operands. Both must be in the same block.
+inline bool wouldBreakOperandDominance(Operation *op, Operation *insertPt) {
+  for (auto operand : op->getOperands()) {
+    auto *defOp = operand.getDefiningOp();
+    if (!defOp)
+      continue;
+    if (defOp->getBlock() != op->getBlock())
+      continue;
+    if (!defOp->isBeforeInBlock(insertPt))
+      return true;
+  }
+  return false;
+}
+
 // Push WS arrive barriers as far down as possible within a block.
 // An arrive can freely move past non-barrier ops (it just delays the signal).
 // An arrive can move past another arrive (always safe).
@@ -68,6 +83,7 @@ inline bool sinkWSArrives(Block &block) {
 // A wait can move past another wait (always safe).
 // A wait can move past an arrive only if canAdvanceWSBarrier says their
 // channel graphs are disjoint.
+// Stops before moving past any op that defines an operand of the wait.
 inline bool raiseWSWaits(Block &block) {
   bool changed = false;
   SmallVector<WaitBarrierOp> waits;
@@ -81,6 +97,16 @@ inline bool raiseWSWaits(Block &block) {
       continue;
     Operation *insertPt = wait.getOperation();
     for (auto *cur = wait->getPrevNode(); cur; cur = cur->getPrevNode()) {
+      // Don't raise past the definition of any of our operands.
+      bool definesOperand = false;
+      for (auto result : cur->getResults()) {
+        if (llvm::is_contained(wait->getOperands(), result)) {
+          definesOperand = true;
+          break;
+        }
+      }
+      if (definesOperand)
+        break;
       if (auto arrive = dyn_cast<ArriveBarrierOp>(cur)) {
         if (!canAdvanceWSBarrier(arrive.getConstraints(), constraints))
           break;
@@ -133,18 +159,24 @@ buildBarrierToMemoryOpMap(Block &block) {
 
 // After tmem_load sinking, relocate WS barriers back to optimal positions
 // relative to their associated memory ops. Arrives go right after their
-// memory op; waits go right before.
+// memory op; waits go right before. Skips moves that would break SSA
+// dominance.
 inline void optimizeWSBarrierLocations(
     const DenseMap<Operation *, Operation *> &barrierToMemOp) {
   for (auto [barrier, memOp] : barrierToMemOp) {
     if (barrier->getBlock() != memOp->getBlock())
       continue;
     if (isa<ArriveBarrierOp>(barrier)) {
-      if (barrier->getPrevNode() != memOp)
-        barrier->moveAfter(memOp);
+      if (barrier->getPrevNode() != memOp) {
+        Operation *target = memOp->getNextNode();
+        if (!wouldBreakOperandDominance(barrier, target))
+          barrier->moveAfter(memOp);
+      }
     } else {
-      if (barrier->getNextNode() != memOp)
-        barrier->moveBefore(memOp);
+      if (barrier->getNextNode() != memOp) {
+        if (!wouldBreakOperandDominance(barrier, memOp))
+          barrier->moveBefore(memOp);
+      }
     }
   }
 }
