@@ -270,29 +270,9 @@ struct TritonNvidiaGPUInterleaveTMemPass
   using impl::TritonNvidiaGPUInterleaveTMemPassBase<
       TritonNvidiaGPUInterleaveTMemPass>::TritonNvidiaGPUInterleaveTMemPassBase;
 
-  void dumpIR(ModuleOp m, StringRef label) {
-    const char *dir = std::getenv("TRITON_INTERLEAVE_TMEM_DUMP");
-    if (!dir)
-      return;
-    static int counter = 0;
-    std::string filename = std::string(dir) + "/interleave_tmem_" +
-                           std::to_string(counter++) + "_" + label.str() +
-                           ".mlir";
-    std::replace(filename.begin(), filename.end(), ' ', '_');
-    std::error_code ec;
-    llvm::raw_fd_ostream os(filename, ec);
-    if (ec)
-      return;
-    OpPrintingFlags flags;
-    flags.enableDebugInfo();
-    m.print(os, flags);
-  }
-
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     ModuleOp m = getOperation();
-
-    dumpIR(m, "Input IR");
 
     // Step 1: Record which memory op each WS barrier guards.
     SmallVector<DenseMap<Operation *, Operation *>> barrierMaps;
@@ -308,8 +288,6 @@ struct TritonNvidiaGPUInterleaveTMemPass
       sinkWSArrives(*block);
       raiseWSWaits(*block);
     });
-
-    dumpIR(m, "Step 2 - After barrier reordering");
 
     // Build memOp → channelGraph constraints. For each arrive barrier with
     // constraints, scan backward and assign its constraints to ALL tmem_loads
@@ -354,13 +332,9 @@ struct TritonNvidiaGPUInterleaveTMemPass
       }
     }
 
-    dumpIR(m, "Step 3 - After tmem_load sinking");
-
     // Step 4: Restore barriers to optimal positions near their memory ops.
     for (auto &map : barrierMaps)
       optimizeWSBarrierLocations(map);
-
-    dumpIR(m, "Step 4 - After optimizeWSBarrierLocations");
   }
 };
 
