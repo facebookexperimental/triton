@@ -96,6 +96,7 @@ case $user_choice in
         echo "Measuring performance of TLX tutorial kernels"
         third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_blackwell_gemm_perf.py
         third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_blackwell_fa_perf.py
+        third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_blackwell_fa_mxfp8_perf.py
         third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_hopper_gemm_perf.py
         third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_hopper_fa_perf.py
         ;;

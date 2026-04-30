@@ -42,7 +42,9 @@ struct ClipAsyncCopySizePerThread
     Value src = copyOp.getSrc();
     Value mask = copyOp.getMask();
     Value other = copyOp.getOther();
-    auto srcTy = cast<RankedTensorType>(src.getType());
+    auto srcTy = dyn_cast<RankedTensorType>(src.getType());
+    if (!srcTy)
+      return failure();
     auto dstTy = cast<MemDescType>(copyOp.getResult().getType());
     auto blockedEnc = dyn_cast<BlockedEncodingAttr>(srcTy.getEncoding());
     if (!blockedEnc)
