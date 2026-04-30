@@ -106,19 +106,23 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
         )
 
 
+class TMemCTAMode:
+    # The order of fields here must be in sync with TTNG_TensorMemoryCTAMode enum
+    DEFAULT = 0
+    TwoCTA_LHS = 1
+    TwoCTA_RHS = 2
+
+
 class tensor_memory_layout_encoding(shared_layout_encoding):
 
-    def __init__(self, blockM, blockN, colStride, CTASplitM, CTASplitN):
+    def __init__(self, blockM, blockN, colStride, CTASplitM, CTASplitN, ctaMode=TMemCTAMode.DEFAULT):
         super().__init__()
         self.blockM = blockM
         self.blockN = blockN
         self.colStride = colStride
         self.CTASplitM = CTASplitM
         self.CTASplitN = CTASplitN
-
-    """
-    Make a default tensor memory layout encoding.
-    """
+        self.ctaMode = ctaMode
 
     @classmethod
     def make_default(cls, shape):
@@ -137,6 +141,7 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
             self.colStride,
             self.CTASplitM,
             self.CTASplitN,
+            self.ctaMode,
         )
 
 

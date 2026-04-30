@@ -137,7 +137,8 @@ public:
                                 unsigned colStride, unsigned ctaSplitM,
                                 unsigned ctaSplitN) {
     return TensorMemoryEncodingAttr::get(&ctx, blockM, blockN, colStride,
-                                         ctaSplitM, ctaSplitN, false);
+                                         ctaSplitM, ctaSplitN, false,
+                                         TensorMemoryCTAMode::DEFAULT);
   }
 
   TensorMemoryEncodingAttr tmem(unsigned blockM, unsigned blockN,

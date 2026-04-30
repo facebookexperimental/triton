@@ -318,13 +318,21 @@ allocateTMem(Operation *parentOp,
         } else {
           // TODO: we need to handle cases where the format is blockM and we
           // have multiple blocks.
-          assert((cast<TensorMemoryEncodingAttr>(
-                      mmaOp.getA().getType().getEncoding())
-                          .getBlockM() != 64 &&
-                  cast<TensorMemoryEncodingAttr>(
-                      mmaOp.getAccumulator().getType().getEncoding())
-                          .getBlockM() != 64) &&
-                 "interleaved layout with TMEM operand is not supported yet.");
+
+          // Special case: 2cta_m64 has operand A (AKA LHS) where allocSize is
+          // 128 for rows but blockM is 64. We allow this case.
+          auto aTmemEnc = cast<TensorMemoryEncodingAttr>(
+              mmaOp.getA().getType().getEncoding());
+          if (aTmemEnc.getCtaMode() != TensorMemoryCTAMode::TwoCTA_LHS) {
+            assert(
+                (cast<TensorMemoryEncodingAttr>(
+                     mmaOp.getA().getType().getEncoding())
+                         .getBlockM() != 64 &&
+                 cast<TensorMemoryEncodingAttr>(
+                     mmaOp.getAccumulator().getType().getEncoding())
+                         .getBlockM() != 64) &&
+                "interleaved layout with TMEM operand is not supported yet.");
+          }
         }
       }
     }

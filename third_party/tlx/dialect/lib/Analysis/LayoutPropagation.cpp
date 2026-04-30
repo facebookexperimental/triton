@@ -156,7 +156,7 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
             tmemEncoding.getContext(), srcEncoding.getBlockM(),
             srcEncoding.getBlockN(), tmemEncoding.getColStride(),
             tmemEncoding.getCTASplitM(), tmemEncoding.getCTASplitN(),
-            tmemEncoding.getTwoCTAs());
+            tmemEncoding.getTwoCTAs(), tmemEncoding.getCtaMode());
         const auto updatedResultLayoutEncoding =
             LayoutEncoding(newTmemEncoding);
         auto operandLattice = operands[0];
@@ -285,7 +285,8 @@ LogicalResult LayoutForwardPropagation::visitOperation(
         auto newEncoding = ttng::TensorMemoryEncodingAttr::get(
             op->getContext(), dstEncoding.getBlockM(), dstEncoding.getBlockN(),
             encoding.getColStride(), encoding.getCTASplitM(),
-            encoding.getCTASplitN(), encoding.getTwoCTAs());
+            encoding.getCTASplitN(), encoding.getTwoCTAs(),
+            encoding.getCtaMode());
         operandLayoutEncoding = LayoutEncoding(newEncoding);
       }
     }

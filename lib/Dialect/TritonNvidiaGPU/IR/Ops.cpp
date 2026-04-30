@@ -1144,7 +1144,7 @@ void TMEMSubSliceOp::build(OpBuilder &builder, OperationState &state,
   auto newEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
       builder.getContext(), encoding.getBlockM(), newBlockN,
       encoding.getColStride(), encoding.getCTASplitM(), encoding.getCTASplitN(),
-      encoding.getTwoCTAs());
+      encoding.getTwoCTAs(), encoding.getCtaMode());
   auto subsliceType = gpu::MemDescType::get(
       shape, allocTy.getElementType(), newEncoding, allocTy.getMemorySpace(),
       allocTy.getMutableMemory(), allocTy.getAllocShape());

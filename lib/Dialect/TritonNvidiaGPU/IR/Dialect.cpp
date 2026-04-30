@@ -413,11 +413,10 @@ bool isDistributedLayoutTMemCompatible(Operation *op,
   return succeeded(computeTMemLdStEncodingInfo(tensorType, memType, maxnreg));
 }
 
-LogicalResult
-TensorMemoryEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
-                                 unsigned blockM, unsigned blockN,
-                                 unsigned colStride, unsigned CTASplitM,
-                                 unsigned CTASplitN, bool) {
+LogicalResult TensorMemoryEncodingAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, unsigned blockM,
+    unsigned blockN, unsigned colStride, unsigned CTASplitM, unsigned CTASplitN,
+    bool, TensorMemoryCTAMode) {
   if (!(CTASplitM >= 1 && CTASplitN >= 1 && llvm::isPowerOf2_32(CTASplitM) &&
         llvm::isPowerOf2_32(CTASplitN))) {
     return emitError()
@@ -443,6 +442,12 @@ TensorMemoryEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
 LogicalResult impl::verifyMMAv5Op(Operation *op) {
   auto isInterleaved = [](MemDescType memdesc) {
     auto enc = dyn_cast<TensorMemoryEncodingAttr>(memdesc.getEncoding());
+    if (!enc)
+      return false;
+    if (enc.getCtaMode() == TensorMemoryCTAMode::TwoCTA_LHS ||
+        enc.getCtaMode() == TensorMemoryCTAMode::TwoCTA_RHS) {
+      return false;
+    }
     return enc && getTmemAllocSizes(memdesc).numRows != 64 &&
            enc.getBlockM() == 64;
   };
