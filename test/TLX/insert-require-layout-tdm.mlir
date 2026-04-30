@@ -7,9 +7,13 @@
 // `tlx-propagate-layout` can rewrite the source `local_alloc` to a
 // descriptor-compatible padded encoding. When the buffer is consumed by
 // a `local_load -> tt.dot` chain the WMMA-tuned padded layout is used
-// (`composePaddedLayout`); otherwise the descriptor-shape-only fallback
-// is used (`buildDefaultTDMDescriptorEncoding`). The dot-path walk in
-// the same pass skips TDM-fed buffers so the two anchors don't conflict.
+// (`composePaddedLayoutWMMA`); otherwise the descriptor-shape-only
+// fallback is used (`buildDefaultTDMDescriptorEncoding`). The
+// downstream AMD `OptimizeDescriptorEncoding` pass propagates the
+// chosen encoding back to the descriptor's `TensorDescType` so the
+// hardware lowering and the alloc agree.
+// The dot-path walk in the same pass skips TDM-fed buffers so the two
+// anchors don't conflict.
 
 // =============================================================================
 // 1. Smallest case: TDM copy with no consumer. Default fallback fires.
@@ -62,9 +66,12 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 
 // -----
 // =============================================================================
-// 3. TDM copy feeding tt.dot operand A (opIdx=0). Dot-aware encoding fires.
-// composePaddedLayoutWMMA, non-transposed (order=[1,0], opIdx=0):
-//   padInterval = block_shape[order[0]] = 128, padAmount = 128/16 = 8.
+// 3. TDM copy feeding tt.dot operand A (opIdx=0). The WMMA-tuned padded
+// encoding from `composePaddedLayoutWMMA` is selected:
+//   non-transposed (order[0]=1, 1-opIdx=1), padAmount=128/16=8, padInterval
+//   = max(innerDim=32, bankWrapInterval=128) = 128 -> `[128:+8]`.
+// `OptimizeDescriptorEncoding` propagates the same encoding back to the
+// descriptor type so the hardware lowering and the alloc agree.
 // =============================================================================
 
 // CHECK-DAG: #{{.*}} = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}>
@@ -90,10 +97,12 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 
 // -----
 // =============================================================================
-// 4. TDM copy feeding tt.dot operand B (opIdx=1). Dot-aware encoding fires.
-// composePaddedLayoutWMMA, transposed (order=[1,0], opIdx=1):
-//   padInterval = block_shape[order[0]] = 128.
-//   padAmount = 2 * ldsParams->instBitWidth / typeBits = 2 * 128 / 16 = 16.
+// 4. TDM copy feeding tt.dot operand B (opIdx=1). WMMA-tuned encoding from
+// `composePaddedLayoutWMMA`:
+//   transposed (order[0]=1, 1-opIdx=0), padAmount = 2*instBitWidth/elemBits
+//   = 2*128/16 = 16 (gfx1250 LDS-trans for fp16 has instBitWidth=128),
+//   padInterval = max(innerDim=128, bankWrapInterval=128) = 128
+//   -> `[128:+16]`.
 // =============================================================================
 
 // CHECK-DAG: #{{.*}} = #ttg.padded_shared<[128:+16] {order = [1, 0], shape = [32, 128]}>
@@ -119,13 +128,14 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 
 // -----
 // =============================================================================
-// 5. Conflicting dot consumers on the same TDM-fed buffer fall back to default.
-// Two local_loads from the same buffer with different opIdx
-// -> findDotConsumer returns nullopt -> default encoding [32:+8].
+// 5. Conflicting dot consumers on the same TDM-fed buffer.
+// `DotConsumerBackward` widens to `Conflict` (opIdx=0 and opIdx=1 disagree),
+// so `findDotConsumer` returns nullopt and the anchor falls back to the
+// descriptor-shape-only default `[32:+8]` instead of either WMMA-tuned variant.
 // =============================================================================
 
 // CHECK-DAG: #{{.*}} = #ttg.padded_shared<[32:+8] {order = [1, 0], shape = [128, 32]}>
-// CHECK-NOT: #{{.*}} = #ttg.padded_shared<[128
+// CHECK-NOT: #ttg.padded_shared<[128
 
 #mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 32]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
@@ -204,6 +214,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 // the isFedByTDM check the dot-path walk would insert a swizzled-shared
 // require_layout that conflicts with the TDM padded encoding. With the
 // check, only the TDM padded anchor is inserted; no swizzled anchor.
+// Encoding is the WMMA-tuned `[128:+8]` (opIdx=0, [128,32] fp16).
 // =============================================================================
 
 // CHECK-DAG: #{{.*}} = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}>
@@ -389,10 +400,10 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 //     same alloc). `findDotConsumer` must walk *up* to the alloc and back
 //     *down* to find the load — a downstream-only walk from the TDM op's
 //     buffer would miss it and silently fall back to the default encoding.
+//     With WMMA-tuned encoding propagation, the anchor uses `[128:+8]`.
 // =============================================================================
 
 // CHECK-DAG: #{{.*}} = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}>
-// CHECK-NOT: #{{.*}} = #ttg.padded_shared<[32:+8]
 
 #mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 32]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
@@ -419,11 +430,10 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 //     proper sparse backward dataflow (DotConsumerBackward) handles the
 //     iter-arg via SparseBackwardDataFlowAnalysis's region-branch support;
 //     the previous hand-rolled walk would have stopped at the iter-arg
-//     boundary and missed the dot consumer.
+//     boundary and missed the dot consumer. WMMA-tuned encoding `[128:+8]`.
 // =============================================================================
 
 // CHECK-DAG: #{{.*}} = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}>
-// CHECK-NOT: #{{.*}} = #ttg.padded_shared<[32:+8]
 
 #mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 32]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
@@ -454,8 +464,10 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 // -----
 // =============================================================================
 // 17. End-to-end GEMM-shaped pattern: A and B descriptors, two TDM copies,
-//     dot consumer. Both TDM ops anchor with the WMMA-tuned padded encoding;
-//     no swizzled-shared anchors from the dot-path walk on TDM-fed buffers.
+//     dot consumer. Both TDM ops anchor with the WMMA-tuned padded encoding
+//     (A: opIdx=0 non-transposed -> `[128:+8]`; B: opIdx=1 transposed ->
+//     `[128:+16]`); no swizzled-shared anchors from the dot-path walk on
+//     TDM-fed buffers.
 // =============================================================================
 
 // CHECK-DAG: #{{.*}} = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}>

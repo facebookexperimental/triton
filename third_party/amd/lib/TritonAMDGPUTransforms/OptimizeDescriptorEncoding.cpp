@@ -123,6 +123,61 @@ static void computeDesiredEncodingAttr(mlir::ModuleOp &m) {
   }
 }
 
+// TLX kernels emit `amdgpu.async_tdm_copy_global_to_local` directly, bypassing
+// `tt.descriptor_load`. The destination memdesc carries the encoding chosen by
+// TLX (e.g. WMMA-tuned `composePaddedLayout` when feeding `tt.dot`). Without
+// any propagation, the descriptor's `TensorDescType` keeps the fallback
+// encoding from `AssignDescriptorMemoryLayouts`, while the alloc gets the
+// TLX-picked encoding. The TDM hardware lowering in `LoadStoreOpToLLVM` reads
+// stride from the descriptor type but writes into the alloc — a stride
+// mismatch causes out-of-bounds LDS writes.
+//
+// This pass copies the destination memdesc encoding back to the descriptor
+// type so the two sides agree by construction. If multiple TDM copies share a
+// descriptor with conflicting destination encodings, we error out (no good
+// way to pick one over the other; TLX kernels currently never hit this).
+static LogicalResult alignTDMDescriptorEncodings(mlir::ModuleOp &m) {
+  llvm::DenseMap<Value, Attribute> descToEncoding;
+  WalkResult result =
+      m.walk(
+          [&](tt::amdgpu::AsyncTDMCopyGlobalToLocalOp copy) {
+            auto memDescTy = cast<ttg::MemDescType>(copy.getResult().getType());
+            Attribute encoding = memDescTy.getEncoding();
+            Value desc = copy.getDesc();
+
+            auto [it, inserted] = descToEncoding.try_emplace(desc, encoding);
+            if (!inserted && it->second != encoding) {
+              copy.emitError()
+                  << "TDM copies using the same descriptor require conflicting "
+                     "destination layouts";
+              return WalkResult::interrupt();
+            }
+            return WalkResult::advance();
+          });
+  if (result.wasInterrupted())
+    return failure();
+
+  for (auto [desc, encoding] : descToEncoding) {
+    auto descTy = cast<tt::TensorDescType>(desc.getType());
+    auto blockTy = descTy.getBlockType();
+    // Adjust order/CGA fields of paddedEncoding/swizzled/nvmma to the
+    // descriptor's block shape so a future rank-reducing TDM doesn't desync.
+    auto sharedEnc = cast<ttg::SharedEncodingTrait>(encoding);
+    Attribute fittedEnc =
+        ttg::updateEncodingForShape(desc.getDefiningOp(), sharedEnc, blockTy);
+    desc.setType(tt::TensorDescType::get(blockTy.getShape(),
+                                         blockTy.getElementType(), fittedEnc));
+  }
+
+  auto ctx = m.getContext();
+  for (auto func : m.getOps<tt::FuncOp>()) {
+    SmallVector<Type> argTypes(func.getBlocks().front().getArgumentTypes());
+    SmallVector<Type> resultTypes(func.getResultTypes());
+    func.setFunctionType(FunctionType::get(ctx, argTypes, resultTypes));
+  }
+  return success();
+}
+
 class AMDGPUAssignDescriptorMemoryLayouts
     : public ttg::AssignDescriptorMemoryLayouts {
 public:
@@ -183,6 +238,11 @@ public:
 
     AMDGPUAssignDescriptorMemoryLayouts assignMemoryLayouts;
     assignMemoryLayouts.assignMemoryLayouts(m);
+
+    if (failed(alignTDMDescriptorEncodings(m))) {
+      signalPassFailure();
+      return;
+    }
 
     // Remove temporary discardable attributes used during encoding assignment
     for (auto f : m.getOps<tt::FuncOp>()) {

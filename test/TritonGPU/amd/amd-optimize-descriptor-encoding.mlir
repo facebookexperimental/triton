@@ -193,3 +193,54 @@ tt.func public @descriptor_fallback(%arg0: !tt.ptr<f32>, %arg1: i32, %arg2: i32,
   tt.return
 }
 }
+
+// -----
+// =============================================================================
+// alignTDMDescriptorEncodings: TLX-emitted `amdgpu.async_tdm_copy_global_to_local`
+// ops are not seen by `AssignDescriptorMemoryLayouts`, so the descriptor would
+// otherwise keep the default fallback encoding while the destination memdesc
+// carries the TLX-picked (e.g. WMMA-tuned) encoding. The alignment pass copies
+// the destination memdesc encoding back to the descriptor's `TensorDescType`
+// so the hardware lowering and the alloc agree.
+// =============================================================================
+
+#shared = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+// CHECK-DAG: #[[$PADDED_TDM:.*]] = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}>
+// CHECK-LABEL: @tdm_descriptor_arg_aligns_to_alloc
+// CHECK-SAME: %[[DESC:.*]]: !tt.tensordesc<128x32xf16, #[[$PADDED_TDM]]>
+tt.func public @tdm_descriptor_arg_aligns_to_alloc(%desc: !tt.tensordesc<128x32xf16>, %m: i32, %k: i32, %p: i32) {
+  %c0 = arith.constant 0 : i32
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<1x128x32xf16, #shared, #smem, mutable>
+  %buf = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<1x128x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+  // CHECK: amdg.async_tdm_copy_global_to_local %[[DESC]][{{.*}}] into {{.*}} : !tt.tensordesc<128x32xf16, #[[$PADDED_TDM]]>
+  %tok = amdg.async_tdm_copy_global_to_local %desc[%m, %k] into %buf, pred = %p : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+  tt.return
+}
+}
+
+// -----
+// =============================================================================
+// alignTDMDescriptorEncodings: descriptor created by `tt.make_tensor_descriptor`
+// (op-result, not function arg) is updated in-place. The local `make_tensor_descriptor`
+// op's result type is rewritten and downstream TDM op picks up the new desc type.
+// =============================================================================
+
+#shared = #ttg.padded_shared<[128:+16] {order = [1, 0], shape = [32, 128]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+// CHECK-DAG: #[[$PADDED_TDM:.*]] = #ttg.padded_shared<[128:+16] {order = [1, 0], shape = [32, 128]}>
+// CHECK-LABEL: @tdm_local_descriptor_aligns_to_alloc
+tt.func public @tdm_local_descriptor_aligns_to_alloc(%ptr: !tt.ptr<f16>, %sz0: i32, %sz1: i32, %s0: i64, %k: i32, %n: i32, %p: i32) {
+  %c0 = arith.constant 0 : i32
+  %c1_i64 = arith.constant 1 : i64
+  // CHECK: tt.make_tensor_descriptor {{.*}} : !tt.ptr<f16>, !tt.tensordesc<32x128xf16, #[[$PADDED_TDM]]>
+  %desc = tt.make_tensor_descriptor %ptr, [%sz0, %sz1], [%s0, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<32x128xf16>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<1x32x128xf16, #shared, #smem, mutable>
+  %buf = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<1x32x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<32x128xf16, #shared, #smem, mutable>
+  // CHECK: amdg.async_tdm_copy_global_to_local {{.*}} : !tt.tensordesc<32x128xf16, #[[$PADDED_TDM]]>
+  %tok = amdg.async_tdm_copy_global_to_local %desc[%k, %n] into %buf, pred = %p : !tt.tensordesc<32x128xf16> -> !ttg.memdesc<32x128xf16, #shared, #smem, mutable>
+  tt.return
+}
+}

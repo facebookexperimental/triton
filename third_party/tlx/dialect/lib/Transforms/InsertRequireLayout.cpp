@@ -300,10 +300,10 @@ static void applyRequireLayout(ttg::SwizzledSharedEncodingAttr encoding,
     return;
 
   // Defer to the TDM anchor for buffers fed by `amdgpu.async_tdm_*`. The
-  // TDM walk uses the WMMA-tuned padded encoding from
-  // `composePaddedLayout` (which is correct for both the TDM op and the
-  // local_load -> dot path); inserting a sibling swizzled anchor here
-  // would conflict with that constraint and widen the lattice to unknown.
+  // TDM walk picks a padded encoding that's compatible with the descriptor
+  // (and dot-aware when applicable); inserting a sibling swizzled anchor
+  // here would conflict with that constraint and widen the lattice to
+  // unknown.
   if (isFedByTDM(loadMemDesc))
     return;
 
@@ -570,27 +570,30 @@ static void anchorTDMRequireLayout(amdgpu::AsyncTDMCopyGlobalToLocalOp tdmOp,
 
   auto cgaLayout = ttg::CGAEncodingAttr::get1CTALayout(buf.getContext(), rank);
 
-  // First try the dot-operand-aware path: when the buffer is consumed by a
-  // `local_load -> tt.dot` chain, the WMMA-tuned padded encoding from
-  // `composePaddedLayout` is required for the local_load lowering to
-  // satisfy the dot's operand encoding constraints. Otherwise fall back
-  // to the descriptor-shape-only default.
+  // Prefer the WMMA-tuned padded encoding when the buffer feeds a
+  // `tt.dot`: `composePaddedLayout` picks intervals/paddings to avoid bank
+  // conflicts on the `local_load -> tt.dot` lowering. Fall back to the
+  // descriptor-shape-only default for non-dot consumers.
+  //
+  // Using a dot-tuned encoding here is safe because the AMD
+  // `OptimizeDescriptorEncoding` pass walks TDM copies and propagates this
+  // encoding back to the descriptor's `TensorDescType`, so the hardware
+  // (which reads stride from the descriptor) and the alloc (which uses
+  // this encoding to size the LDS region) agree by construction.
   Attribute encoding;
-  if (auto dotInfo = findDotConsumer(buf, solver)) {
-    auto modOp = tdmOp->getParentOfType<ModuleOp>();
-    auto archAttr = mlir::getAMDArch(modOp);
-    if (archAttr) {
-      triton::AMD::TargetInfo targetInfo(archAttr->str());
-      auto srcTy = cast<ttg::TensorOrMemDesc>(bufType);
-      if (auto padded = composePaddedLayout(targetInfo, dotInfo->opIdx,
-                                            dotInfo->kWidth, srcTy, order))
-        encoding = padded;
-    }
+  if (auto info = findDotConsumer(buf, solver)) {
+    auto archStr = getAMDArch(tdmOp->getParentOfType<ModuleOp>());
+    auto targetInfo = tt::AMD::TargetInfo(archStr.value_or("").str());
+    // Use bufType (MemDescType) instead of the descriptor's block type:
+    // bufType carries the alloc's CGA layout, while the descriptor type
+    // is still un-encoded at this point (OptimizeDescriptorEncoding runs
+    // later and is what propagates the encoding back to the descriptor).
+    encoding = composePaddedLayout(targetInfo, info->opIdx, info->kWidth,
+                                   cast<ttg::TensorOrMemDesc>(bufType), order);
   }
-  if (!encoding) {
+  if (!encoding)
     encoding = buildDefaultTDMDescriptorEncoding(buf.getContext(), shape, order,
                                                  cgaLayout, elementType);
-  }
   if (!encoding)
     return;
 
