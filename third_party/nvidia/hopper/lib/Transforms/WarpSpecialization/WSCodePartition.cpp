@@ -3300,7 +3300,8 @@ void insertAsyncComm(
             auto indexedBarrier = getBarrierForPipelineStage(
                 builder, *commChannel.producerBarrier, bufferIdx);
             builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
-                mmaOp->getLoc(), indexedBarrier);
+                mmaOp->getLoc(), indexedBarrier, /*pred=*/Value(),
+                /*descs=*/ValueRange{});
           }
           builder.clearLoopScheduleInfo();
         }
@@ -3383,7 +3384,8 @@ void insertAsyncComm(
           auto indexedConsumerBarrier =
               getBarrierForPipelineStage(builder, consumerBarrier, bufferIdx);
           builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
-              mmaOp->getLoc(), indexedConsumerBarrier);
+              mmaOp->getLoc(), indexedConsumerBarrier, /*pred=*/Value(),
+              /*descs=*/ValueRange{});
           builder.clearLoopScheduleInfo();
         }
 

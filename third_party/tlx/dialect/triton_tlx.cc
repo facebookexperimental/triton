@@ -453,7 +453,8 @@ void init_triton_tlx_ir(py::module &&m) {
                  tokType, a, b, d, Value(),
                  useD.has_value() ? useD.value() : predTrue /*useD*/,
                  pred.has_value() ? pred.value() : predTrue /*pred */, twoCTAs,
-                 ValueRange(mBarriers), ValueRange(barrierPreds), isAsync);
+                 /*multicast=*/false, ValueRange(mBarriers),
+                 ValueRange(barrierPreds), isAsync);
            })
       .def("create_tcgen5_dot_scaled",
            [](TritonOpBuilder &self, Value a, Value b, Value d, Value aScale,
@@ -477,7 +478,8 @@ void init_triton_tlx_ir(py::module &&m) {
            })
       .def("create_tcgen05_commit",
            [](TritonOpBuilder &self, Value &barrier, Value &pred) -> void {
-             self.create<ttng::TCGen5CommitOp>(barrier, pred);
+             self.create<ttng::TCGen5CommitOp>(barrier, pred,
+                                               ValueRange{});
            })
       .def("create_async_commit_group",
            [](TritonOpBuilder &self,
