@@ -552,7 +552,9 @@ static void createCommit(ConversionPatternRewriter &rewriter, Location loc,
              "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::"
              "cluster.multicast::cluster.b64 [$1], $2;";
   } else {
-    opcode = "@$0 tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [$1];";
+    opcode = "@$0 "
+             "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::"
+             "cluster.b64 [$1];";
   }
   auto &barrierOp = *ptxBuilder.create(opcode);
   barrierOp(ptxOperands, /*onlyAttachMLIRArgs=*/true);
