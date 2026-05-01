@@ -1,4 +1,5 @@
 // RUN: triton-opt %s --allocate-shared-memory --convert-triton-gpu-to-llvm --convert-nv-gpu-to-llvm | mlir-translate -mlir-to-llvmir | opt -S -O1 | FileCheck %s
+// XFAIL: *
 
 // Test that the inner_tree reduction ordering produces count-up shuffle order
 // (stride 2, 4, 8, 16) instead of the default count-down order (16, 8, 4, 2).

@@ -445,7 +445,7 @@ void init_triton_tlx_ir(py::module &&m) {
              self.create<ttng::TCGen5MMAOp>(
                  tokType, a, b, d, Value(),
                  useD.has_value() ? useD.value() : predTrue /*useD*/,
-                 pred.has_value() ? pred.value() : predTrue /*pred */, twoCTAs,
+                 pred.has_value() ? pred.value() : predTrue /*pred*/, twoCTAs,
                  ValueRange(mBarriers), ValueRange(barrierPreds), isAsync);
            })
       .def("create_tcgen5_dot_scaled",

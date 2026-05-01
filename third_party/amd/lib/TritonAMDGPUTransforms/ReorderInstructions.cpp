@@ -113,52 +113,6 @@ static bool isCrossLoopBoundary(mlir::Operation *opInsideLoop,
 // Reorder mechanisms
 //===----------------------------------------------------------------------===//
 
-// Sink dot layout conversions into loops to decrease register pressure when
-// possible.
-static void sinkDotConversion(triton::FuncOp funcOp) {
-  DenseMap<Operation *, Operation *> opToMove;
-  funcOp.walk([&](ttg::ConvertLayoutOp op) {
-    Attribute encoding = op.getType().getEncoding();
-    if (!isa_and_nonnull<ttg::DotOperandEncodingAttr>(encoding))
-      return;
-    if (!op->hasOneUse())
-      return;
-    Operation *user = *op->getUsers().begin();
-    if (user->getParentOfType<scf::ForOp>() ==
-        op->getParentOfType<scf::ForOp>())
-      return;
-    opToMove[op] = user;
-  });
-
-  for (auto &kv : opToMove)
-    kv.first->moveBefore(kv.second);
-}
-
-// Sink conversion after the last dealloc but before the first use in its block.
-// This helps to avoid unnecessary shared memory allocation.
-static void moveDownCoversion(triton::FuncOp funcOp) {
-  SmallVector<ttg::ConvertLayoutOp> convertOps;
-  funcOp.walk([&](ttg::ConvertLayoutOp op) { convertOps.push_back(op); });
-
-  for (auto op : convertOps) {
-    Operation *user = getFirstUseInSameBlock(op);
-    for (auto it = Block::iterator(op), ie = op->getBlock()->end();
-         it != ie && &*it != user; ++it)
-      if (isa<ttg::LocalDeallocOp>(&*it))
-        op->moveAfter(&*it);
-  }
-}
-
-// Move transpositions just after their definition.
-static void moveUpTranspose(triton::FuncOp funcOp) {
-  SmallVector<triton::TransposeOpInterface> transOps;
-  funcOp.walk([&](triton::TransposeOpInterface op) { transOps.push_back(op); });
-
-  for (auto op : transOps)
-    if (Operation *argOp = op.getSrc().getDefiningOp())
-      op->moveAfter(argOp);
-}
-
 // Schedule global load ops in prologue for better GEMM performance.
 static void moveUpGlobalLoadInPrologue(triton::FuncOp funcOp) {
   // Move global_load ops early to prefetch. This may increase
@@ -307,10 +261,6 @@ struct TritonAMDGPUReorderInstructionsPass
   void runOnOperation() override {
     ModuleOp m = getOperation();
     for (auto funcOp : m.getOps<triton::FuncOp>()) {
-      sinkDotConversion(funcOp);
-      moveDownCoversion(funcOp);
-
-      moveUpTranspose(funcOp);
       moveUpGlobalLoadInPrologue(funcOp);
 
       if (isPureMatmulFunc(funcOp)) {
