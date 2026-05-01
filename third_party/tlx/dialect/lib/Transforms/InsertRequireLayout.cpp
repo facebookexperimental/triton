@@ -280,8 +280,9 @@ static Value findMemDescRoot(Value memdesc) {
 static bool isFedByTDM(Value memdesc) {
   llvm::SetVector<Value> worklist;
   worklist.insert(findMemDescRoot(memdesc));
-  for (size_t i = 0; i < worklist.size(); ++i) {
-    for (Operation *u : worklist[i].getUsers()) {
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    for (Operation *u : v.getUsers()) {
       if (isa<amdgpu::AsyncTDMCopyGlobalToLocalOp>(u))
         return true;
       if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp>(u))
