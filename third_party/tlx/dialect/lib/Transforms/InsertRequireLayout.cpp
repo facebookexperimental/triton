@@ -523,6 +523,11 @@ public:
     return success();
   }
 
+  // Required pure-virtual overrides. This is an info-only lattice (not a
+  // legality analysis like DotRewriteBackward, which poisons here): leaving
+  // unanalyzed cases as Uninitialized is safe because findDotConsumer
+  // returns nullopt for both Uninitialized and Conflict, and the caller
+  // falls back to buildDefaultTDMDescriptorEncoding.
   void visitBranchOperand(OpOperand &) override {}
   void visitCallOperand(OpOperand &) override {}
   void setToExitState(DotConsumerLattice *) override {}
