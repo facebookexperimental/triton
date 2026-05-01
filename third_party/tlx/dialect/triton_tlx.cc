@@ -479,7 +479,7 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_tcgen05_commit",
            [](TritonOpBuilder &self, Value &barrier, Value &pred) -> void {
              self.create<ttng::TCGen5CommitOp>(barrier, pred,
-                                              /*descs=*/ValueRange{});
+                                               /*descs=*/ValueRange{});
            })
       .def("create_async_commit_group",
            [](TritonOpBuilder &self,

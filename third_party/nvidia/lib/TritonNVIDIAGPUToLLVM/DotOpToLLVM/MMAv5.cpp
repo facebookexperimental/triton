@@ -387,8 +387,8 @@ LogicalResult convertDotImpl(const LLVMTypeConverter &typeConverter,
                              MemDescType dTensorTy, Value useDFlag, Value pred,
                              ValueRange barriers, ValueRange barrierPreds,
                              bool twoCTAs, bool tlxPairedMMA,
-                             ValueRange commitDescs,
-                             bool opKindIsMXFP4, const DotConversion &op) {
+                             ValueRange commitDescs, bool opKindIsMXFP4,
+                             const DotConversion &op) {
   auto tb = TritonLLVMOpBuilder(loc, rewriter);
 
   // Only run mma on one thread. We currently use elect as ptxas is not able to

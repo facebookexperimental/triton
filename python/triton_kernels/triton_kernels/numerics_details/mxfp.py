@@ -7,7 +7,6 @@ import torch
 import torch.nn.functional as F
 from .mxfp_details._upcast_from_mxfp import _upcast_from_mxfp, _upcast_from_mxfp_tma
 from .mxfp_details._downcast_to_mxfp import _downcast_to_mxfp, MXFP_BLOCK_SIZE, _quantize_mxfp8_fn
-from triton.tools.tensor_descriptor import TensorDescriptor
 from triton_kernels.tensor import Tensor, wrap_torch_tensor, empty
 from triton_kernels.tensor_details.layout import StridedLayout
 from triton_kernels.tensor_details.dtype import FP4, FP8_E4M3FN, FP8_E5M2, UINT8
