@@ -243,22 +243,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 
 // -----
 
-// Test that tc_gen5_commit with {two_ctas} triggers cluster sync after init_barrier.
-// The two_ctas flag means the barrier signal is multicast to other CTAs in the cluster.
+// Test that tc_gen5_commit with descs triggers cluster sync after init_barrier.
+// The descs indicate multicast across the cluster, so the barrier signal reaches other CTAs.
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#shared2d = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
-  // CHECK-LABEL: @tc_gen5_commit_two_ctas_bar_init
-  tt.func public @tc_gen5_commit_two_ctas_bar_init() attributes {noinline = false} {
+  // CHECK-LABEL: @tc_gen5_commit_descs_bar_init
+  tt.func public @tc_gen5_commit_descs_bar_init() attributes {noinline = false} {
     %c0_i32 = arith.constant 0 : i32
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %desc = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #shared2d, #smem, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
     // CHECK: nvvm.cluster.arrive {aligned}
     // CHECK: nvvm.cluster.wait {aligned}
     // CHECK: tcgen05.commit
     ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
-    ttng.tc_gen5_commit %1 {two_ctas} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.tc_gen5_commit %1 descs %desc : !ttg.memdesc<1xi64, #shared, #smem, mutable>, !ttg.memdesc<128x64xf16, #shared2d, #smem, mutable>
     tt.return
   }
 }
@@ -312,7 +314,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-// Test that tc_gen5_commit WITHOUT {two_ctas} does NOT trigger cluster sync.
+// Test that tc_gen5_commit WITHOUT descs does NOT trigger cluster sync.
 // The barrier signal stays local, so no cluster bootstrap is needed.
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
