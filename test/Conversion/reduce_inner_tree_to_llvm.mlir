@@ -2,9 +2,9 @@
 
 // Test that the inner_tree reduction ordering produces count-up shuffle order
 // (stride 2, 4, 8, 16) instead of the default count-down order (16, 8, 4, 2).
-// With this layout, each register is its own contiguous group (K=2 groups per
-// output position), so all 4 registers get shuffled independently, then the
-// per-group results are tree-reduced in the final pack step.
+// With this layout, register bit 1 maps to the reduction axis (row offset 2),
+// so SRC0+SRC2 and SRC1+SRC3 are first combined within-thread, then each
+// combined value gets a count-up warp reduction.
 
 #linear = #ttg.linear<{register = [[0, 2], [2, 0]], lane = [[0, 8], [8, 0], [1, 0], [4, 0], [16, 0]], warp = [[0, 1], [0, 4]], block = []}>
 
@@ -12,33 +12,23 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 // CHECK-LABEL: @reduce_inner_tree
 tt.func private @reduce_inner_tree(%arg0: tensor<32x16xi32, #linear>) -> tensor<16xi32, #ttg.slice<{dim = 0, parent = #linear}>> {
-  // Each register gets its own count-up warp reduction (stride 2, 4, 8, 16).
-  // SRC0:
   // CHECK: [[SRC0:%.*]] = extractvalue {{.*}} %0, 0
   // CHECK: [[SRC1:%.*]] = extractvalue {{.*}} %0, 1
   // CHECK: [[SRC2:%.*]] = extractvalue {{.*}} %0, 2
   // CHECK: [[SRC3:%.*]] = extractvalue {{.*}} %0, 3
 
-  // Count-up warp shuffle for SRC0: strides 2, 4, 8, 16
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[SRC0]], i32 2, i32 31)
+  // Within-thread reduction: combine registers that differ in the reduction axis
+  // CHECK: [[C0:%.*]] = add i32 [[SRC0]], [[SRC2]]
+  // CHECK: [[C1:%.*]] = add i32 [[SRC1]], [[SRC3]]
+
+  // Count-up warp shuffle for combined0: strides 2, 4, 8, 16
+  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[C0]], i32 2, i32 31)
   // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 4, i32 31)
   // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 8, i32 31)
   // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 16, i32 31)
 
-  // Count-up warp shuffle for SRC1: strides 2, 4, 8, 16
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[SRC1]], i32 2, i32 31)
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 4, i32 31)
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 8, i32 31)
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 16, i32 31)
-
-  // Count-up warp shuffle for SRC2: strides 2, 4, 8, 16
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[SRC2]], i32 2, i32 31)
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 4, i32 31)
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 8, i32 31)
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 16, i32 31)
-
-  // Count-up warp shuffle for SRC3: strides 2, 4, 8, 16
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[SRC3]], i32 2, i32 31)
+  // Count-up warp shuffle for combined1: strides 2, 4, 8, 16
+  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[C1]], i32 2, i32 31)
   // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 4, i32 31)
   // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 8, i32 31)
   // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 16, i32 31)
