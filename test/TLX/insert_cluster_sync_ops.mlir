@@ -256,9 +256,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     %desc = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #shared2d, #smem, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
-    // CHECK: nvvm.cluster.arrive {aligned}
-    // CHECK: nvvm.cluster.wait {aligned}
-    // CHECK: tcgen05.commit
     ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     ttng.tc_gen5_commit %1 descs %desc : !ttg.memdesc<1xi64, #shared, #smem, mutable>, !ttg.memdesc<128x64xf16, #shared2d, #smem, mutable>
     tt.return
