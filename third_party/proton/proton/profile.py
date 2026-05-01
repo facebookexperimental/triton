@@ -12,8 +12,9 @@ DEFAULT_PROFILE_NAME = "proton"
 
 
 def _select_backend() -> str:
-    backend = triton.runtime.driver.active.get_current_target().backend
-    if triton.runtime.driver.active.get_current_target().is_cuda_backend():
+    target = triton.runtime.driver.active.get_current_target()
+    backend = target.backend
+    if target.is_cuda_backend():
         return "cupti"
     elif backend == "hip":
         return "roctracer"
