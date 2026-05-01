@@ -423,6 +423,17 @@ def compile(src, target=None, options=None, _env_vars=None):
     # facebook end T207797237
     metadata_group[metadata_filename] = fn_cache_manager.put(json.dumps(metadata, default=vars), metadata_filename,
                                                              binary=False)
+    # Generate Level 0 launch metadata schema if the backend supports it.
+    if hasattr(backend, "make_launch_metadata"):
+        launch_metadata = backend.make_launch_metadata(metadata, src)
+        launch_metadata_filename = f"{file_name}.launch_metadata"
+        metadata_group[launch_metadata_filename] = fn_cache_manager.put(json.dumps(launch_metadata),
+                                                                        launch_metadata_filename, binary=False)
+    # Generate Level 1 standalone launcher C source if the backend supports it.
+    if hasattr(backend, "make_launcher_src"):
+        launcher_src = backend.make_launcher_src(metadata, src)
+        launcher_src_filename = f"{file_name}.launcher_src"
+        metadata_group[launcher_src_filename] = fn_cache_manager.put(launcher_src, launcher_src_filename, binary=False)
     fn_cache_manager.put_group(metadata_filename, metadata_group)
 
     # notify any listener
@@ -512,6 +523,14 @@ class CompiledKernel:
         self.module = None
         self.function = None
         self._run = None
+
+    @property
+    def launch_metadata_schema(self):
+        """Return the Level 0 launch metadata schema as a parsed dict, or None."""
+        raw = self.asm.get("launch_metadata")
+        if raw is None:
+            return None
+        return json.loads(raw) if isinstance(raw, str) else raw
 
     def _init_handles(self):
         if self.module is not None:

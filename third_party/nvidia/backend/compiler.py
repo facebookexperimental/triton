@@ -275,6 +275,252 @@ class CUDABackend(BaseBackend):
             preferred[2],
         )
 
+    def make_launch_metadata(self, metadata, src):
+        """Produce a versioned, machine-readable JSON dict describing the kernel launch contract.
+
+        This is the Level 0 metadata schema: a self-contained description of everything
+        a launcher needs to know to call cuLaunchKernelEx for this kernel.  It is stored
+        alongside the cubin as ``asm["launch_metadata"]`` and is intended to replace the
+        implicit metadata bag that downstream consumers currently probe with hasattr guards.
+
+        The schema is purely additive — existing ``pack_metadata()`` / ``make_launcher()``
+        paths are not affected.
+        """
+
+        def _get(key, default=None):
+            """Retrieve a field from metadata, which may be a dict or a namedtuple."""
+            if isinstance(metadata, dict):
+                return metadata.get(key, default)
+            return getattr(metadata, key, default)
+
+        cluster_dims = _get("cluster_dims") or (1, 1, 1)
+        preferred = _get("preferred_ctas_per_cga") or (0, 0, 0)
+
+        # Build the args array from src.signature, excluding compile-time constants.
+        constants = getattr(src, "constants", {})
+        # Normalize constant keys to tuple form for lookup.
+        constant_keys = set()
+        for k in constants:
+            if isinstance(k, str):
+                if hasattr(src, "fn"):
+                    constant_keys.add((src.fn.arg_names.index(k), ))
+                else:
+                    constant_keys.add((k, ))
+            elif isinstance(k, tuple):
+                constant_keys.add(k)
+            else:
+                constant_keys.add((k, ))
+
+        attrs = getattr(src, "attrs", {})
+        arg_names = src.fn.arg_names if hasattr(src, "fn") else None
+
+        args = []
+        for idx, (key, ty) in enumerate(src.signature.items()):
+            # Skip compile-time constants — they go in the "constants" dict.
+            if (idx, ) in constant_keys:
+                continue
+
+            name = key if isinstance(key, str) else (arg_names[idx] if arg_names and idx < len(arg_names) else str(idx))
+            arg_entry = {"name": name, "type": str(ty), "index": idx}
+
+            # Check for tt.divisibility attribute.
+            attr_specs = attrs.get((idx, ), [])
+            for attr_name, attr_val in attr_specs:
+                if attr_name == "tt.divisibility":
+                    arg_entry["divisible_by"] = attr_val
+            args.append(arg_entry)
+
+        # Serialize constants: keys are stringified indices, values are the constant values.
+        constants_dict = {}
+        for k, v in constants.items():
+            if isinstance(k, tuple):
+                str_key = str(k[0]) if len(k) == 1 else str(k)
+            elif isinstance(k, str):
+                if arg_names:
+                    str_key = str(arg_names.index(k))
+                else:
+                    str_key = k
+            else:
+                str_key = str(k)
+            # Convert to JSON-serializable value
+            if isinstance(v, (int, float, bool, str)) or v is None:
+                constants_dict[str_key] = v
+            else:
+                constants_dict[str_key] = str(v)
+
+        tensordesc_meta = _get("tensordesc_meta")
+
+        schema = {
+            "abi_version": 1,
+            "entry_name": _get("name", ""),
+            "num_warps": _get("num_warps"),
+            "num_ctas": _get("num_ctas"),
+            "shared_mem": _get("shared", 0),
+            "cluster_dims": list(cluster_dims),
+            "preferred_cluster_dims": list(preferred),
+            "launch_cooperative_grid": _get("launch_cooperative_grid", False),
+            "launch_cluster": _get("launch_cluster", False),
+            "launch_pdl": _get("launch_pdl", False),
+            "global_scratch_size": _get("global_scratch_size", 0),
+            "global_scratch_align": _get("global_scratch_align", 128),
+            "profile_scratch_size": _get("profile_scratch_size", 0),
+            "profile_scratch_align": _get("profile_scratch_align", 1),
+            "tmem_size": _get("tmem_size", 0),
+            "args": args,
+            "constants": constants_dict,
+            "tensordesc_meta": tensordesc_meta or [],
+        }
+        return schema
+
+    def make_launcher_src(self, metadata, src):
+        """Generate a standalone C launcher source from Level 0 metadata.
+
+        The generated C file includes ``triton/runtime/launch.h`` and implements
+        a single entry point ``triton_launch_<kernel>()`` that sets up
+        CUlaunchConfig with compile-time-known parameters baked in as constants,
+        builds the kernel parameter array, and calls ``cuLaunchKernelEx``.
+
+        The C source has NO dependency on Python.h — it is callable from C, C++,
+        or via ctypes/cffi.  It is stored as ``asm["launcher_src"]`` for
+        inspection and can be compiled by gcc/clang for use in TritonCC, AOT-T,
+        or other C/C++ consumers.
+        """
+        launch_meta = self.make_launch_metadata(metadata, src)
+        kernel_name = launch_meta["entry_name"]
+        safe_name = kernel_name.replace(".", "_")
+
+        # Type mapping: Triton type → C type for the args struct.
+        # WARNING: This map must be kept in sync with Triton's type system.
+        # If a new Triton type is added (e.g., fp8e4m3) and not present here,
+        # we raise an error rather than silently generating incorrect code.
+        _TYPE_TO_C = {
+            "i1": "int8_t",
+            "i8": "int8_t",
+            "i16": "int16_t",
+            "i32": "int32_t",
+            "i64": "int64_t",
+            "u1": "uint8_t",
+            "u8": "uint8_t",
+            "u16": "uint16_t",
+            "u32": "uint32_t",
+            "u64": "uint64_t",
+            "fp16": "uint16_t",
+            "bf16": "uint16_t",
+            "fp32": "float",
+            "f32": "float",
+            "fp64": "double",
+        }
+
+        def _c_type(triton_ty):
+            if triton_ty.startswith("*"):
+                return "CUdeviceptr"
+            if triton_ty.startswith("tensordesc"):
+                return "CUdeviceptr"  # host-side: passed as base pointer
+            c_ty = _TYPE_TO_C.get(triton_ty)
+            if c_ty is None:
+                raise ValueError(f"Unsupported Triton type '{triton_ty}' in launcher codegen. "
+                                 f"Add it to the _TYPE_TO_C map in make_launcher_src().")
+            return c_ty
+
+        args = launch_meta["args"]
+        num_warps = launch_meta["num_warps"]
+        num_ctas = launch_meta["num_ctas"]
+        shared_mem = launch_meta["shared_mem"]
+        cluster_dims = launch_meta["cluster_dims"]
+        preferred = launch_meta["preferred_cluster_dims"]
+        launch_coop = 1 if launch_meta["launch_cooperative_grid"] else 0
+        launch_cluster_flag = 1 if launch_meta.get("launch_cluster", False) else 0
+        launch_pdl = 1 if launch_meta["launch_pdl"] else 0
+        global_scratch_size = launch_meta["global_scratch_size"]
+        profile_scratch_size = launch_meta["profile_scratch_size"]
+
+        lines = []
+        lines.append("/* Generated by Triton compiler — do not edit. */")
+        lines.append(f"/* Kernel: {kernel_name} */")
+        lines.append(f"/* ABI version: {launch_meta['abi_version']} */")
+        lines.append("")
+        lines.append('#include "triton/runtime/launch.h"')
+        lines.append("")
+
+        # ---- Args struct ----
+        lines.append("typedef struct {")
+        for arg in args:
+            c_ty = _c_type(arg["type"])
+            lines.append(f"    {c_ty} {arg['name']};")
+        lines.append(f"}} {safe_name}_args_t;")
+        lines.append("")
+
+        # ---- Launch function ----
+        lines.append("/**")
+        lines.append(f" * Launch {kernel_name}.")
+        lines.append(" *")
+        lines.append(" * Compile-time constants baked in:")
+        lines.append(f" *   num_warps={num_warps}, num_ctas={num_ctas}, "
+                     f"shared_mem={shared_mem}")
+        lines.append(f" *   cluster_dims=[{cluster_dims[0]},{cluster_dims[1]},{cluster_dims[2]}]")
+        lines.append(f" *   launch_pdl={launch_pdl}, cooperative={launch_coop}")
+        if global_scratch_size > 0:
+            lines.append(f" *   global_scratch_size={global_scratch_size}")
+        if profile_scratch_size > 0:
+            lines.append(f" *   profile_scratch_size={profile_scratch_size}")
+        lines.append(" */")
+
+        lines.append(f"CUresult triton_launch_{safe_name}(")
+        lines.append("    const uint32_t grid[3],")
+        lines.append("    CUstream stream,")
+        lines.append("    CUfunction function,")
+        lines.append(f"    {safe_name}_args_t *args,")
+        # Always include scratch params for stable ABI across all kernels.
+        # Callers pass 0/NULL when the kernel doesn't use scratch buffers.
+        lines.append("    CUdeviceptr global_scratch,")
+        lines.append("    CUdeviceptr profile_scratch")
+        lines.append(") {")
+
+        # Null checks
+        lines.append("    if (!args) return CUDA_ERROR_INVALID_VALUE;")
+        lines.append("    if (!function) return CUDA_ERROR_INVALID_HANDLE;")
+        lines.append("")
+
+        # Build params array
+        param_names = [f"args->{arg['name']}" for arg in args]
+        param_names.append("global_scratch")
+        param_names.append("profile_scratch")
+
+        lines.append("    /* Kernel parameter pointers */")
+        for i, pname in enumerate(param_names):
+            lines.append(f"    void *_param{i} = (void *)&{pname};")
+        lines.append("    void *params[] = {")
+        for i in range(len(param_names)):
+            comma = "," if i < len(param_names) - 1 else ""
+            lines.append(f"        _param{i}{comma}")
+        lines.append("    };")
+        lines.append("")
+
+        # Build launch attributes (compile-time constants)
+        lines.append("    /* Launch attributes (compile-time constants) */")
+        lines.append("    CUlaunchAttribute attrs[TRITON_MAX_LAUNCH_ATTRS];")
+        lines.append("    unsigned num_attrs = triton_build_launch_attrs(")
+        lines.append("        attrs,")
+        lines.append(f"        /*launch_pdl=*/{launch_pdl},")
+        lines.append(f"        /*launch_cooperative_grid=*/{launch_coop},")
+        lines.append(f"        /*num_ctas=*/{num_ctas},")
+        lines.append(f"        /*launch_cluster=*/{launch_cluster_flag},")
+        lines.append(f"        /*preferred_cluster_dim_x=*/{preferred[0]},")
+        lines.append(f"        /*preferred_cluster_dim_y=*/{preferred[1]},")
+        lines.append(f"        /*preferred_cluster_dim_z=*/{preferred[2]}")
+        lines.append("    );")
+        lines.append("")
+
+        # Call triton_launch_kernel
+        lines.append("    return triton_launch_kernel(")
+        lines.append(f"        grid, /*num_warps=*/{num_warps}, /*num_ctas=*/{num_ctas},")
+        lines.append(f"        /*shared_mem=*/{shared_mem}u, stream, function,")
+        lines.append("        params, attrs, num_attrs")
+        lines.append("    );")
+        lines.append("}")
+
+        return "\n".join(lines) + "\n"
+
     def get_codegen_implementation(self, options):
         import triton.language.extra.cuda as cuda
         capability = int(self._parse_arch(options.arch))
