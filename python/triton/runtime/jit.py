@@ -573,8 +573,11 @@ class JitFunctionInfo:
 
 
 def compute_cache_key(kernel_key_cache, specialization, options):
-    env_vars = get_cache_invalidating_env_vars()
-    key = (tuple(specialization), str(options), tuple(sorted(env_vars.items())))
+    # TODO: Handle runtime knob swapping. This is currently too slow on the Python
+    # critial path.
+    # The original change was for testing, but we can invalidate caches explicitly if
+    # tests break.
+    key = (tuple(specialization), str(options))
     cache_key = kernel_key_cache.get(key, None)
     if cache_key is not None:
         return cache_key
@@ -592,7 +595,7 @@ def compute_cache_key(kernel_key_cache, specialization, options):
             return obj.cache_key
         return obj
 
-    cache_key = str(replace_callables(specialization)) + str(options) + str(sorted(env_vars.items()))
+    cache_key = str(replace_callables(specialization)) + str(options)
     kernel_key_cache[key] = cache_key
     return cache_key
 
