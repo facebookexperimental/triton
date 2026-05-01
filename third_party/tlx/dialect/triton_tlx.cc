@@ -452,7 +452,7 @@ void init_triton_tlx_ir(py::module &&m) {
              self.create<ttng::TCGen5MMAOp>(
                  tokType, a, b, d, Value(),
                  useD.has_value() ? useD.value() : predTrue /*useD*/,
-                 pred.has_value() ? pred.value() : predTrue /*pred */, twoCTAs,
+                 pred.has_value() ? pred.value() : predTrue /*pred*/, twoCTAs,
                  /*multicast=*/false, ValueRange(mBarriers),
                  ValueRange(barrierPreds), isAsync);
            })
@@ -479,7 +479,7 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_tcgen05_commit",
            [](TritonOpBuilder &self, Value &barrier, Value &pred) -> void {
              self.create<ttng::TCGen5CommitOp>(barrier, pred,
-                                               ValueRange{});
+                                              /*descs=*/ValueRange{});
            })
       .def("create_async_commit_group",
            [](TritonOpBuilder &self,
