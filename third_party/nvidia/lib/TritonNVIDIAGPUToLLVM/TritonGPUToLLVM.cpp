@@ -304,7 +304,7 @@ private:
       // all tcgen05 ops have to be consistent with module attr on this.
 
       // Case 1: explicit TCGen5CommitOp from front end or earlier passes
-      if (tcgen5CommitOp.getTwoCtas()) {
+      if (!tcgen5CommitOp.getDescs().empty()) {
         llvm::SetVector<Value> bars;
         bars.insert(tcgen5CommitOp.getBarrier());
         return bars;
