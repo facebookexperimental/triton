@@ -118,6 +118,7 @@ def _interpret_mode(mode_obj: Union[str, mode.InstrumentationMode]) -> mode.Inst
 
 def _get_backend_name() -> str:
     target = triton.runtime.driver.active.get_current_target()
+    backend = target.backend
     if target.is_cuda_backend():
         return "nvidia"
     elif backend == "hip":
