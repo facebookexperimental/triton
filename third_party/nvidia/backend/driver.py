@@ -301,11 +301,31 @@ class CudaLauncher(object):
         signature = {idx: value for idx, value in src.signature.items()}
         tensordesc_meta = getattr(metadata, "tensordesc_meta", None)
 
-        launcher = triton.runtime.driver.active.utils.launch
-        expanded_signature = expand_signature(signature.values(), tensordesc_meta)
-        self.arg_annotations = annotate_arguments(expanded_signature)
-        self.kernel_signature = make_kernel_signature(expanded_signature)
-        self.launch = wrap_handle_tensordesc(launcher, signature, tensordesc_meta)
+        if knobs.nvidia.use_launcher_src and tensordesc_meta is None:
+            try:
+                from triton.compiler.compiler import make_backend
+                from triton.backends.nvidia.launcher_llvm import make_launcher as make_llvm_launcher
+                backend = make_backend(metadata.target)
+                schema = backend.make_launch_metadata(metadata._asdict(), src)
+                launch_fn = make_llvm_launcher(schema)
+                self.launch = wrap_handle_tensordesc(launch_fn, signature, tensordesc_meta)
+                self.launch_cluster = metadata.launch_cluster
+                self._use_llvm_launcher = True
+            except Exception:
+                # Fall back to shared C launcher if LLVM compilation/linking fails
+                launcher = triton.runtime.driver.active.utils.launch
+                expanded_signature = expand_signature(signature.values(), tensordesc_meta)
+                self.arg_annotations = annotate_arguments(expanded_signature)
+                self.kernel_signature = make_kernel_signature(expanded_signature)
+                self.launch = wrap_handle_tensordesc(launcher, signature, tensordesc_meta)
+                self._use_llvm_launcher = False
+        else:
+            launcher = triton.runtime.driver.active.utils.launch
+            expanded_signature = expand_signature(signature.values(), tensordesc_meta)
+            self.arg_annotations = annotate_arguments(expanded_signature)
+            self.kernel_signature = make_kernel_signature(expanded_signature)
+            self.launch = wrap_handle_tensordesc(launcher, signature, tensordesc_meta)
+            self._use_llvm_launcher = False
         self.global_scratch_size = metadata.global_scratch_size
         self.global_scratch_align = metadata.global_scratch_align
         self.profile_scratch_size = metadata.profile_scratch_size
@@ -339,9 +359,14 @@ class CudaLauncher(object):
         profile_scratch = allocate_scratch(self.profile_scratch_size, self.profile_scratch_align,
                                            _allocation._profile_allocator)
 
-        self.launch(gridX, gridY, gridZ, stream, function, self.launch_cooperative_grid, self.launch_pdl,
-                    kernel_metadata, launch_metadata, launch_enter_hook, launch_exit_hook, global_scratch,
-                    profile_scratch, self.arg_annotations, self.kernel_signature, args)
+        if self._use_llvm_launcher:
+            self.launch(gridX, gridY, gridZ, stream, function, self.launch_cooperative_grid, self.launch_cluster,
+                        self.launch_pdl, global_scratch, profile_scratch, kernel_metadata, launch_metadata,
+                        launch_enter_hook, launch_exit_hook, *args)
+        else:
+            self.launch(gridX, gridY, gridZ, stream, function, self.launch_cooperative_grid, self.launch_pdl,
+                        kernel_metadata, launch_metadata, launch_enter_hook, launch_exit_hook, global_scratch,
+                        profile_scratch, self.arg_annotations, self.kernel_signature, args)
 
 
 class CudaDriver(GPUDriver):
