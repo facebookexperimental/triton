@@ -1,19 +1,20 @@
-from triton.backends.compiler import BaseBackend, GPUTarget, Language
-from triton._C.libtriton import ir, passes, llvm, nvidia, tlx
-from triton import knobs
-from triton.runtime.errors import PTXASError
-
-from dataclasses import dataclass
 import functools
-from typing import Any, Dict, Tuple, Optional
-from types import ModuleType
 import hashlib
-import re
-import tempfile
-import signal
 import os
+import re
+import signal
 import subprocess
+import tempfile
+import warnings
+from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
+from typing import Any, Dict, Optional, Tuple
+
+from triton import knobs
+from triton._C.libtriton import ir, llvm, nvidia, passes, tlx
+from triton.backends.compiler import BaseBackend, GPUTarget, Language
+from triton.runtime.errors import PTXASError
 
 
 def min_dot_size(target: GPUTarget):
@@ -416,10 +417,15 @@ class CUDABackend(BaseBackend):
                 return "CUdeviceptr"
             if triton_ty.startswith("tensordesc"):
                 return "CUdeviceptr"  # host-side: passed as base pointer
+            if triton_ty == "nvTmaDesc":
+                return "CUtensorMap"
             c_ty = _TYPE_TO_C.get(triton_ty)
             if c_ty is None:
-                raise ValueError(f"Unsupported Triton type '{triton_ty}' in launcher codegen. "
-                                 f"Add it to the _TYPE_TO_C map in make_launcher_src().")
+                # Unknown type — skip launcher generation so compilation
+                # isn't blocked by types we haven't mapped yet.
+                warnings.warn(f"Unknown Triton type '{triton_ty}' in launcher codegen, "
+                              f"skipping launcher generation. Add it to _TYPE_TO_C in make_launcher_src().")
+                return None
             return c_ty
 
         args = launch_meta["args"]
@@ -446,6 +452,9 @@ class CUDABackend(BaseBackend):
         lines.append("typedef struct {")
         for arg in args:
             c_ty = _c_type(arg["type"])
+            if c_ty is None:
+                # Unsupported type — cannot generate a correct launcher.
+                return f"/* Launcher not generated: unsupported arg type '{arg['type']}' for '{arg['name']}' */\n"
             lines.append(f"    {c_ty} {arg['name']};")
         lines.append(f"}} {safe_name}_args_t;")
         lines.append("")
