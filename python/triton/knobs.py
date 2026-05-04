@@ -517,6 +517,7 @@ class nvidia_knobs(base_knobs):
     dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
     dump_tlx_benchmark: env_bool = env_bool("TRITON_DUMP_TLX_BENCHMARK")
     use_no_compile_launcher: env_bool = env_bool("TRITON_USE_NO_COMPILE_LAUNCHER")
+    use_launcher_src: env_bool = env_bool("TRITON_USE_LAUNCHER_SRC")
     generate_subtiled_region: env_bool = env_bool("TRITON_GENERATE_SUBTILED_REGION")
     enable_tileir: env_bool = env_bool("ENABLE_TILE")
 

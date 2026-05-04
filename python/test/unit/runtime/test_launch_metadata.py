@@ -6,10 +6,19 @@ are consistent with the existing metadata bag.
 """
 
 import json
+import subprocess
+from types import SimpleNamespace
 
 import pytest
+import torch
 import triton
 import triton.language as tl
+from triton._C.libtriton import llvm
+from triton.backends.nvidia.compiler import CUDABackend
+from triton.backends.nvidia.launcher_llvm import (
+    make_launcher as make_llvm_launcher,
+    make_launcher_ir,
+)
 from triton.compiler.compiler import ASTSource, compile as triton_compile
 
 
@@ -310,3 +319,226 @@ def test_launcher_src_has_abi_version_comment():
     )
     src = compiled.asm["launcher_src"]
     assert "ABI version: 1" in src
+
+
+def test_tuple_args_excluded_from_schema():
+    """Tuple-typed args (implicitly constexpr) should not appear in schema args."""
+
+    # Build a minimal mock src with a tuple-typed arg in the signature.
+    mock_fn = SimpleNamespace(arg_names=["Y", "fn_args"])
+    mock_src = SimpleNamespace(
+        signature={"Y": "*i32", "fn_args": "()"},
+        constants={},
+        attrs={},
+        fn=mock_fn,
+    )
+
+    # Minimal metadata dict matching what make_launch_metadata expects.
+    metadata = {
+        "num_warps": 4,
+        "num_ctas": 1,
+        "shared": 0,
+        "cluster_dims": (1, 1, 1),
+        "preferred_ctas_per_cga": (0, 0, 0),
+        "launch_cooperative_grid": False,
+        "launch_cluster": False,
+        "launch_pdl": False,
+        "global_scratch_size": 0,
+        "profile_scratch_size": 0,
+        "target": ("cuda", 90),
+        "name": "test_kernel",
+    }
+
+    target = triton.runtime.driver.active.get_current_target()
+    backend = CUDABackend(target)
+    schema = backend.make_launch_metadata(metadata, mock_src)
+
+    arg_names = [a["name"] for a in schema["args"]]
+    assert "fn_args" not in arg_names, "tuple-typed arg should be excluded from schema args"
+    assert "Y" in arg_names
+
+
+# ---------------------------------------------------------------------------
+# Tests for LLVM-compiled launcher
+# ---------------------------------------------------------------------------
+
+
+def test_launcher_llvm_ir_generation():
+    """make_launcher_ir should produce valid LLVM IR with the launch function."""
+    compiled = _compile_kernel(
+        add_kernel,
+        signature={"X": "*fp32", "Y": "*fp32", "OUT": "*fp32", "N": "i32"},
+        constexprs={"BLOCK": 1024},
+    )
+    schema = json.loads(compiled.asm["launch_metadata"])
+    ir_text = make_launcher_ir(schema)
+
+    # Should be valid LLVM IR text
+    assert 'target triple = "x86_64-unknown-linux-gnu"' in ir_text
+    assert "define i32 @triton_launch_" in ir_text
+    assert "@cuLaunchKernelEx" in ir_text
+    # Constants should be baked in
+    block_dim_x = 32 * schema["num_warps"]
+    assert f"store i32 {block_dim_x}" in ir_text
+    assert f"store i32 {schema['shared_mem']}" in ir_text
+
+
+def test_launcher_llvm_ir_compiles():
+    """LLVM IR should compile to a host .o via translate_to_asm."""
+    compiled = _compile_kernel(
+        add_kernel,
+        signature={"X": "*fp32", "Y": "*fp32", "OUT": "*fp32", "N": "i32"},
+        constexprs={"BLOCK": 1024},
+    )
+    schema = json.loads(compiled.asm["launch_metadata"])
+
+    ir_text = make_launcher_ir(schema)
+    obj_bytes = llvm.translate_to_asm(
+        ir_text,
+        "x86_64-unknown-linux-gnu",
+        "generic",
+        "",
+        [],
+        False,
+        True,
+    )
+    # Should produce a non-empty ELF object
+    assert isinstance(obj_bytes, bytes)
+    assert len(obj_bytes) > 0
+    # ELF magic number
+    assert obj_bytes[:4] == b'\x7fELF'
+
+
+@pytest.mark.parametrize("dtype", ["*fp32"])
+def test_launcher_llvm_e2e(dtype):
+    """End-to-end test: compile kernel, build LLVM launcher, launch on GPU."""
+
+    N = 1024
+    BLOCK = 256
+    x = torch.randn(N, device="cuda")
+    y = torch.randn(N, device="cuda")
+    out = torch.empty(N, device="cuda")
+
+    compiled = _compile_kernel(
+        add_kernel,
+        signature={"X": dtype, "Y": dtype, "OUT": dtype, "N": "i32"},
+        constexprs={"BLOCK": BLOCK},
+    )
+    schema = json.loads(compiled.asm["launch_metadata"])
+
+    launch = make_llvm_launcher(schema)
+
+    # Get the CUfunction handle
+    compiled._init_handles()
+    function = compiled.function
+    stream = torch.cuda.current_stream().cuda_stream
+
+    grid_x = N // BLOCK
+    launch(
+        grid_x,
+        1,
+        1,
+        stream,
+        function,
+        False,
+        False,
+        False,  # cooperative, cluster, pdl
+        None,
+        None,  # global_scratch, profile_scratch
+        None,
+        None,  # kernel_metadata, launch_metadata
+        None,
+        None,  # enter_hook, exit_hook
+        x.data_ptr(),
+        y.data_ptr(),
+        out.data_ptr(),
+        N,
+    )
+    torch.cuda.synchronize()
+    assert torch.allclose(out, x + y), f"max diff: {(out - x - y).abs().max()}"
+
+
+@pytest.mark.parametrize("dtype_x,dtype_n", [("*fp32", "i32"), ("*fp32", "i64")])
+def test_launcher_llvm_mixed_types(dtype_x, dtype_n):
+    """Test with different scalar types."""
+
+    N = 512
+    BLOCK = 128
+
+    @triton.jit
+    def scale_kernel(X, OUT, N, SCALE, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < N
+        x = tl.load(X + offs, mask=mask)
+        tl.store(OUT + offs, x * SCALE, mask=mask)
+
+    x = torch.randn(N, device="cuda")
+    out = torch.empty(N, device="cuda")
+    scale = 2.0
+
+    compiled = _compile_kernel(
+        scale_kernel,
+        signature={"X": dtype_x, "OUT": dtype_x, "N": dtype_n, "SCALE": "fp32"},
+        constexprs={"BLOCK": BLOCK},
+    )
+    schema = json.loads(compiled.asm["launch_metadata"])
+
+    try:
+        launch = make_llvm_launcher(schema)
+    except subprocess.CalledProcessError:
+        pytest.skip("Cannot link launcher: libcuda not available in this environment")
+    compiled._init_handles()
+
+    stream = torch.cuda.current_stream().cuda_stream
+    grid_x = N // BLOCK
+    # Use a value exceeding 2^31 for i64 to exercise large integer handling
+    n_val = N if dtype_n == "i32" else (1 << 33) + N
+    launch(
+        grid_x,
+        1,
+        1,
+        stream,
+        compiled.function,
+        False,
+        False,
+        False,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        x.data_ptr(),
+        out.data_ptr(),
+        n_val,
+        scale,
+    )
+    torch.cuda.synchronize()
+    assert torch.allclose(out, x * scale, atol=1e-5), f"max diff: {(out - x * scale).abs().max()}"
+
+
+def test_launcher_llvm_via_jit_dispatch():
+    """End-to-end: LLVM launcher called through normal kernel[grid](*args) dispatch."""
+    import triton.knobs
+
+    # Skip if use_launcher_src is not supported
+    if not hasattr(triton.knobs, "nvidia") or not hasattr(triton.knobs.nvidia, "use_launcher_src"):
+        pytest.skip("use_launcher_src knob not available")
+
+    original = triton.knobs.nvidia.use_launcher_src
+    try:
+        triton.knobs.nvidia.use_launcher_src = True
+
+        N = 1024
+        BLOCK = 256
+        x = torch.randn(N, device="cuda")
+        y = torch.randn(N, device="cuda")
+        out = torch.empty(N, device="cuda")
+
+        # Call through normal JIT dispatch — exercises CudaLauncher.__call__
+        add_kernel[(N // BLOCK, )](x, y, out, N, BLOCK=BLOCK)
+        torch.cuda.synchronize()
+        assert torch.allclose(out, x + y), f"max diff: {(out - x - y).abs().max()}"
+    finally:
+        triton.knobs.nvidia.use_launcher_src = original
