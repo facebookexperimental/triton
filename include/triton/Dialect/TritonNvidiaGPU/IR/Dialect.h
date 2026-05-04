@@ -156,6 +156,15 @@ void lowerSubtiledRegion(SubtiledRegionOp op);
 /// Called from OptimizeTMemLayouts after tmem layout patterns have fired.
 void pushSubtiledRegionSetupToTile(SubtiledRegionOp op);
 
+/// Return the minimum number of warps required to execute an operation.
+inline int getMinWarpsForOp(Operation *op) {
+  if (isa<TMEMLoadOp, TMEMStoreOp, TMEMAllocOp, WarpGroupDotOp>(op))
+    return 4;
+  if (isa<AsyncTMAGatherOp, AsyncTMAScatterOp>(op))
+    return 2;
+  return 1;
+}
+
 } // namespace mlir::triton::nvidia_gpu
 
 #endif // TRITON_DIALECT_TRITONNVIDIAGPU_IR_DIALECT_H_
