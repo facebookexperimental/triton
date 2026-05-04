@@ -10,7 +10,7 @@ The Infra is a Kubernetes cluster built on top of Google Cloud Platform.
 docker login ghcr.io
 
 # Get credentials for the cluster so that kubectl could use it
-gcloud container clusters get-credentials --location us-east4 meta-triton-h100-runner-cluster
+gcloud container clusters get-credentials --location us-east4-a meta-triton-h100-runner-cluster
 
 # Install the ARC controller
 INSTALLATION_NAME="linux.gcp.h100"
