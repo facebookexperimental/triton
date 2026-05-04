@@ -1051,6 +1051,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
                                 options, [attrs], warmup)
 
             kernel = async_mode.submit(cache_key, async_compile, finalize_compile)
+            kernel_cache[key] = kernel
         else:
             kernel = self.compile(src, target=target, options=options.__dict__)
             kernel_cache[key] = kernel
