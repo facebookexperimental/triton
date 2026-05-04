@@ -158,8 +158,14 @@ void pushSubtiledRegionSetupToTile(SubtiledRegionOp op);
 
 /// Return the minimum number of warps required to execute an operation.
 inline int getMinWarpsForOp(Operation *op) {
+  // TMEM ops require at least 4 warps to be able to read all lanes.
+  // WarpGroupDotOp requires a full warp group (4 warps).
   if (isa<TMEMLoadOp, TMEMStoreOp, TMEMAllocOp, WarpGroupDotOp>(op))
     return 4;
+  // Some instructions have critical throughput if they have low register usage.
+  // Make sure there are enough warps for these ops to execute quickly.
+  // TODO: Should we keep a minimum of 2 warps for
+  // AsyncTMACopyGlobalToLocalOp under certain conditions?
   if (isa<AsyncTMAGatherOp, AsyncTMAScatterOp>(op))
     return 2;
   return 1;

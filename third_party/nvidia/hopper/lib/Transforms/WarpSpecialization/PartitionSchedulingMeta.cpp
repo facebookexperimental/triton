@@ -2605,42 +2605,40 @@ void PartitionSchedulingMeta::runOnOperation() {
 
       // Estimate total warps for the WS schedule. If the estimate exceeds
       // the hardware warp limit, skip WS for the entire function.
-      {
-        constexpr int kMaxWarps = 16; // 512 threads / 32 threads per warp
-        int defaultNumWarps = triton::gpu::lookupNumWarps(getOperation());
-        unsigned numPartitions = schedule.getNumPartitions();
+      constexpr int kMaxWarps = 16;
+      int defaultNumWarps = triton::gpu::lookupNumWarps(getOperation());
+      unsigned numPartitions = schedule.getNumPartitions();
 
-        // Map partition ID → minimum warps. Default partition (id 0) gets
-        // the module's num_warps; all others start at 1.
-        DenseMap<int, int> partitionWarps;
-        partitionWarps[0] = defaultNumWarps;
-        for (unsigned i = 1; i < numPartitions; ++i)
-          partitionWarps[i] = 1;
+      // Map partition ID → minimum warps. Default partition (id 0) gets
+      // the module's num_warps; all others start at 1.
+      DenseMap<int, int> partitionWarps;
+      partitionWarps[0] = defaultNumWarps;
+      for (unsigned i = 1; i < numPartitions; ++i)
+        partitionWarps[i] = 1;
 
-        // Walk all ops (including pre/post-loop) and update each partition's
-        // min warps based on its anchor ops.
-        auto funcOp = loop->getParentOfType<triton::FuncOp>();
-        funcOp->walk([&](Operation *op) {
-          int opWarps = ttng::getMinWarpsForOp(op);
-          if (opWarps <= 1)
-            return;
-          for (int id : safeGetPartitionIds(op)) {
-            if (partitionWarps.count(id))
-              partitionWarps[id] = std::max(partitionWarps[id], opWarps);
-          }
-        });
-
-        int estimatedTotal = 0;
-        for (auto [id, warps] : partitionWarps)
-          estimatedTotal += warps;
-
-        LDBG("Warp budget estimate: " << estimatedTotal << " / " << kMaxWarps);
-
-        if (estimatedTotal > kMaxWarps) {
-          LDBG("Warp budget exceeded. Skipping warp specialization.");
-          dropWarpSpec(funcOp);
+      // Walk all ops (including pre/post-loop) and update each partition's
+      // min warps based on its anchor ops.
+      auto funcOp = loop->getParentOfType<triton::FuncOp>();
+      funcOp->walk([&](Operation *op) {
+        int opWarps = ttng::getMinWarpsForOp(op);
+        if (opWarps <= 1)
           return;
+        for (int id : safeGetPartitionIds(op)) {
+          if (partitionWarps.count(id))
+            partitionWarps[id] = std::max(partitionWarps[id], opWarps);
         }
+      });
+
+      int estimatedTotal = 0;
+      for (auto [id, warps] : partitionWarps)
+        estimatedTotal += warps;
+
+      LDBG("Warp budget estimate: " << estimatedTotal << " / " << kMaxWarps);
+
+      if (estimatedTotal > kMaxWarps) {
+        LDBG("Warp budget exceeded. Skipping warp specialization.");
+        dropWarpSpec(funcOp);
+        return;
       }
 
       schedule.serialize(loop);
