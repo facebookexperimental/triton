@@ -263,21 +263,26 @@ def TTNG_WaitBarrierOp : TTNG_Op<"wait_barrier", [AttrSizedOperandSegments]> {
     Arg<TTG_MemDescType, "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$alloc,
     I32:$phase,
     Optional<I1>:$pred,
-    Variadic<TTG_MemDescType>:$deps
+    Variadic<TTG_MemDescType>:$deps,
+    OptionalAttr<DictionaryAttr>:$constraints
   );
 
   let builders = [
     OpBuilder<(ins "Value":$alloc, "Value":$phase),
     [{
-    build($_builder, $_state, alloc, phase, /*pred=*/static_cast<mlir::Value>(nullptr), /*deps=*/{});
+    build($_builder, $_state, alloc, phase, /*pred=*/static_cast<mlir::Value>(nullptr), /*deps=*/{}, /*constraints=*/DictionaryAttr());
     }]>,
     OpBuilder<(ins "Value":$alloc, "Value":$phase, "Value":$pred),
     [{
-    build($_builder, $_state, alloc, phase, pred, /*deps=*/{});
+    build($_builder, $_state, alloc, phase, pred, /*deps=*/{}, /*constraints=*/DictionaryAttr());
     }]>,
     OpBuilder<(ins "Value":$alloc, "Value":$phase, "ValueRange":$deps),
     [{
-    build($_builder, $_state, alloc, phase, /*pred=*/static_cast<mlir::Value>(nullptr), deps);
+    build($_builder, $_state, alloc, phase, /*pred=*/static_cast<mlir::Value>(nullptr), deps, /*constraints=*/DictionaryAttr());
+    }]>,
+    OpBuilder<(ins "Value":$alloc, "Value":$phase, "Value":$pred, "ValueRange":$deps),
+    [{
+    build($_builder, $_state, alloc, phase, pred, deps, /*constraints=*/DictionaryAttr());
     }]>,
   ];
 
@@ -310,7 +315,8 @@ def TTNG_ArriveBarrierOp : TTNG_Op<"arrive_barrier"> {
     Arg<TTG_MemDescType, "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$alloc,
     I32Attr:$count,
     Optional<I1>:$pred,
-    UnitAttr:$perThread
+    UnitAttr:$perThread,
+    OptionalAttr<DictionaryAttr>:$constraints
   );
 
   let assemblyFormat = [{
@@ -319,10 +325,16 @@ def TTNG_ArriveBarrierOp : TTNG_Op<"arrive_barrier"> {
 
   let builders = [
     OpBuilder<(ins "Value":$alloc, "uint32_t":$count), [{
-      return build($_builder, $_state, alloc, count, /*pred=*/Value(), /*perThread=*/false);
+      return build($_builder, $_state, alloc, count, /*pred=*/Value(), /*perThread=*/false, /*constraints=*/DictionaryAttr());
+    }]>,
+    OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred), [{
+      return build($_builder, $_state, alloc, count, pred, /*perThread=*/false, /*constraints=*/DictionaryAttr());
     }]>,
     OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "bool":$perThread), [{
-      return build($_builder, $_state, alloc, count, /*pred=*/Value(), perThread);
+      return build($_builder, $_state, alloc, count, /*pred=*/Value(), perThread, /*constraints=*/DictionaryAttr());
+    }]>,
+    OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred, "bool":$perThread), [{
+      return build($_builder, $_state, alloc, count, pred, perThread, /*constraints=*/DictionaryAttr());
     }]>
   ];
 

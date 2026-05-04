@@ -250,7 +250,14 @@ def NVWS_ProducerAcquireOp : NVWS_Op<"producer_acquire"> {
     releases the token.
   }];
 
-  let arguments = (ins TensorOf<[NVWS_TokenType]>:$token, I32:$idx, I1:$phase);
+  let arguments = (ins TensorOf<[NVWS_TokenType]>:$token, I32:$idx, I1:$phase,
+    OptionalAttr<DictionaryAttr>:$constraints);
+
+  let builders = [
+    OpBuilder<(ins "Value":$token, "Value":$idx, "Value":$phase), [{
+      build($_builder, $_state, token, idx, phase, /*constraints=*/DictionaryAttr());
+    }]>
+  ];
 
   let assemblyFormat = "$token `,` $idx `,` $phase attr-dict `:` type(operands)";
 }
@@ -261,7 +268,14 @@ def NVWS_ProducerCommitOp : NVWS_Op<"producer_commit"> {
     that the buffers are ready to be consumed.
   }];
 
-  let arguments = (ins TensorOf<[NVWS_TokenType]>:$token, I32:$idx);
+  let arguments = (ins TensorOf<[NVWS_TokenType]>:$token, I32:$idx,
+    OptionalAttr<DictionaryAttr>:$constraints);
+
+  let builders = [
+    OpBuilder<(ins "Value":$token, "Value":$idx), [{
+      build($_builder, $_state, token, idx, /*constraints=*/DictionaryAttr());
+    }]>
+  ];
 
   let assemblyFormat = "$token `,` $idx attr-dict `:` type(operands)";
 }
@@ -274,7 +288,14 @@ def NVWS_ConsumerWaitOp : NVWS_Op<"consumer_wait"> {
     releases the token.
   }];
 
-  let arguments = (ins TensorOf<[NVWS_TokenType]>:$token, I32:$idx, I1: $phase);
+  let arguments = (ins TensorOf<[NVWS_TokenType]>:$token, I32:$idx, I1: $phase,
+    OptionalAttr<DictionaryAttr>:$constraints);
+
+  let builders = [
+    OpBuilder<(ins "Value":$token, "Value":$idx, "Value":$phase), [{
+      build($_builder, $_state, token, idx, phase, /*constraints=*/DictionaryAttr());
+    }]>
+  ];
 
   let assemblyFormat = "$token `,` $idx `,` $phase attr-dict `:` type(operands)";
 }
@@ -285,7 +306,14 @@ def NVWS_ConsumerReleaseOp : NVWS_Op<"consumer_release"> {
     that the buffers are ready to be filled.
   }];
 
-  let arguments = (ins TensorOf<[NVWS_TokenType]>:$token, I32:$idx);
+  let arguments = (ins TensorOf<[NVWS_TokenType]>:$token, I32:$idx,
+    OptionalAttr<DictionaryAttr>:$constraints);
+
+  let builders = [
+    OpBuilder<(ins "Value":$token, "Value":$idx), [{
+      build($_builder, $_state, token, idx, /*constraints=*/DictionaryAttr());
+    }]>
+  ];
 
   let assemblyFormat = "$token `,` $idx attr-dict `:` type(operands)";
 }
