@@ -72,7 +72,8 @@ class CudaUtils(object):
         self.get_device_properties = mod.get_device_properties
         self.cuOccupancyMaxActiveClusters = mod.cuOccupancyMaxActiveClusters
         self.set_printf_fifo_size = mod.set_printf_fifo_size
-        self.fill_tma_descriptor = mod.fill_tma_descriptor
+        self.fill_tma_descriptor_tiled = mod.fill_tma_descriptor_tiled
+        self.fill_tma_descriptor_im2col = mod.fill_tma_descriptor_im2col
         self.fill_1d_tma_descriptor = mod.fill_1d_tma_descriptor
         self.fill_2d_tma_descriptor = mod.fill_2d_tma_descriptor
         self.fill_1d_tma_descriptor_type = mod.fill_1d_tma_descriptor_type
@@ -698,7 +699,7 @@ def make_tensordesc_arg(arg, metadata):
     else:
         expanded_shape = shape
 
-    cu_tensor_map = triton.runtime.driver.active.utils.fill_tma_descriptor(
+    cu_tensor_map = triton.runtime.driver.active.utils.fill_tma_descriptor_tiled(
         arg.base.data_ptr(),
         swizzle,
         elem_size,
