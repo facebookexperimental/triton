@@ -445,10 +445,10 @@ def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local",
     by `desc`. If `multicastTargets` is provided, it represents a bitmask specifying the
     destination CTA indices in a cluster for TMA multicast.
 
-    The operation supports two tensor modes:
-    - TILED (default): Regular tiled tensor memory access
+    The tensor mode is determined by the descriptor type:
+    - tt.tensordesc: TILED mode - Regular tiled tensor memory access
       - See: https://docs.nvidia.com/cuda/parallel-thread-execution/#tensor-tiled-mode
-    - IM2COL: Im2col mode for convolution-friendly access patterns
+    - ttng.tensordesc_im2col: IM2COL mode - Im2col mode for convolution-friendly access patterns
       - In IM2COL mode, 'coord' is the coordinates in the input tensor
         - For example, for a 4D tensor (NHWC), 'coord' is [batch_idx, channel_idx, h, w]
       - In IM2COL mode, additional `offsets` must be provided (uint16 values)
@@ -462,7 +462,7 @@ def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local",
   let hasVerifier = 1;
   let arguments = (ins
     Optional<I32>: $multicastTargets,
-    Arg<TT_TensorDescType, "", [MemRead<GlobalMemory>]>:$desc,
+    Arg<TT_AnyTensorDescType, "", [MemRead<GlobalMemory>]>:$desc,
     Variadic<I32>:$coord,
     Variadic<I16>:$offsets,
     Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$barrier,
