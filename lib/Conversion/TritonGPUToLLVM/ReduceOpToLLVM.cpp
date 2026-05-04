@@ -179,12 +179,29 @@ private:
     if (success)
       return;
 
-    for (unsigned N = numLaneToReduce / 2; N > 0; N >>= 1) {
-      SmallVector<Value> shfl(acc.size());
-      for (unsigned i = 0; i < acc.size(); ++i) {
-        shfl[i] = targetInfo.shuffleXor(rewriter, loc, acc[i], N * interleave);
+    if (isInnerTree(op)) {
+      // INNER_TREE: count-up shuffle order (1, 2, 4, ...) to build the
+      // reduction tree from adjacent lanes first. This ensures bitwise-
+      // identical results regardless of num_warps, because the tree
+      // structure is determined by lane proximity, not by the total
+      // number of active lanes.
+      for (unsigned N = 1; N <= numLaneToReduce / 2; N <<= 1) {
+        SmallVector<Value> shfl(acc.size());
+        for (unsigned i = 0; i < acc.size(); ++i) {
+          shfl[i] =
+              targetInfo.shuffleXor(rewriter, loc, acc[i], N * interleave);
+        }
+        accumulate(op.getLoc(), rewriter, op.getCombineOp(), acc, shfl, pred);
       }
-      accumulate(op.getLoc(), rewriter, op.getCombineOp(), acc, shfl, pred);
+    } else {
+      for (unsigned N = numLaneToReduce / 2; N > 0; N >>= 1) {
+        SmallVector<Value> shfl(acc.size());
+        for (unsigned i = 0; i < acc.size(); ++i) {
+          shfl[i] =
+              targetInfo.shuffleXor(rewriter, loc, acc[i], N * interleave);
+        }
+        accumulate(op.getLoc(), rewriter, op.getCombineOp(), acc, shfl, pred);
+      }
     }
   }
 

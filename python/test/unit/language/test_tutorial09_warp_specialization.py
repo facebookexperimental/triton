@@ -935,6 +935,7 @@ def test_tutorial09_multi_epilogue_subtile():
             B_COL_MAJOR=False,
             DATA_PARTITION_FACTOR=1,
             SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
+            SEPARATE_EPILOGUE_STORE=False,
             num_stages=num_stages,
             num_warps=num_warps,
             early_tma_store_lowering=True,
