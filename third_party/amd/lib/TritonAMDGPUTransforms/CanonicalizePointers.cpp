@@ -1950,8 +1950,7 @@ public:
     if (auto integerAttr =
             llvm::dyn_cast_or_null<mlir::IntegerAttr>(maybeAttr)) {
       if (integerAttr.getValue() == 0) {
-        rewriter.replaceAllUsesWith(castOp.getResult(0), fatPtrBase);
-        rewriter.eraseOp(castOp);
+        rewriter.replaceOp(castOp, fatPtrBase);
         return success();
       }
     }
