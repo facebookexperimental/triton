@@ -3847,8 +3847,8 @@ def test_dot(
         amdgcn = pgm.asm['amdgcn']
 
         if is_hip_cdna() and ((M, N) == (4, 64) or (M, N) == (64, 4)):
-            assert "v_mfma_f32_4x4" in amdgcn
-        elif (M, N) == (4, 32):
+            assert 'v_mfma_f32_4x4' in amdgcn
+        elif is_hip_cdna() and (M, N) == (4, 32):
             if in_dtype == 'float16':
                 assert 'v_dot2c_f32_f16' in amdgcn
             elif (in_dtype == 'bfloat16') and (is_hip_cdna4() or is_hip_gfx1250()):
