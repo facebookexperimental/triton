@@ -1583,7 +1583,7 @@ def test_zeros():
 @filecheck_test
 @gluon.jit
 def test_barrier():
-    # CHECK: gpu.barrier
+    # CHECK: ttg.barrier
     ttgl.barrier()
 
 
@@ -1620,7 +1620,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 @filecheck_test
 @gluon.jit
 def test_barrier_cluster_single_cta():
-    # CHECK: gpu.barrier
+    # CHECK: ttg.barrier
     ttgl.barrier(cluster=True)
 
 

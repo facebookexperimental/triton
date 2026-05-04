@@ -1652,7 +1652,8 @@ void finalizeTensorAtomicResults(Operation *op, RankedTensorType tensorTy,
             /*maskSpanAffineOffset=*/0, laneId, warpId, rewriter, targetInfo,
             /*maybeMaxVecElems=*/{}, emitSt,
             /*barrierPtr=*/std::nullopt);
-  b.barrier();
+  b.barrier(triton::gpu::AddrSpace::Local);
+
   resultVals = lowerLdSt(loc, ctx, dstLayout, resultVals, valueElemTy, smemBase,
                          /*calcPaddedOffset=*/noPaddingOffset,
                          /*affineOffset=*/b.i32_val(0),
