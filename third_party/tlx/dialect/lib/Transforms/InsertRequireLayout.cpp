@@ -208,6 +208,14 @@ public:
   }
 
   void visitBranchOperand(OpOperand &operand) override {
+    if (!isTrackedDotValue(operand.get()))
+      return;
+    // For RegionBranchTerminatorOpInterface (scf.yield) and
+    // RegionBranchOpInterface (scf.for init args), allow the dot encoding
+    // to propagate backward so local_load ops feeding loop-carried values
+    // produce dot_op layout directly.
+    if (isTransparentLayoutCarrierOp(operand.getOwner()))
+      return;
     poisonUnhandledCase(operand);
   }
 
@@ -343,8 +351,14 @@ LogicalResult insertRequireLayout(ModuleOp m) {
   m.walk([&](ttg::LocalLoadOp localLoadOp) {
     auto *lattice =
         solver.lookupState<DotRewriteLattice>(localLoadOp.getResult());
-    if (!lattice || lattice->getValue().isUninitialized())
+    if (!lattice) {
+      LDBG("local_load has NO lattice: " << localLoadOp);
       return;
+    }
+    if (lattice->getValue().isUninitialized()) {
+      LDBG("local_load lattice UNINITIALIZED: " << localLoadOp);
+      return;
+    }
 
     if (lattice->getValue().isIllegal() || lattice->getValue().isConflict()) {
       LDBG("Skipping local_load rewrite due to state: " << lattice->getValue());
@@ -360,7 +374,7 @@ LogicalResult insertRequireLayout(ModuleOp m) {
     if (!dotEnc)
       return;
 
-    LDBG("local_load needs dot encoding: " << dotEnc);
+    LDBG("local_load needs dot encoding: " << dotEnc << " for: " << localLoadOp);
 
     // Insert RequireLayoutOp for memdesc swizzling.
     auto sharedEnc = computeSharedEncFromDotEnc(dotEnc, localLoadOp);

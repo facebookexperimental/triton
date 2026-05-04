@@ -658,6 +658,7 @@ def local_load(
     src: tlx.buffered_tensor,
     token: tlx.async_token = None,
     relaxed: bool = False,
+    layout=None,
     _semantic=None,
 ) -> tl.tensor:
     """
@@ -667,6 +668,9 @@ def local_load(
     telling the AMD backend that no additional vmcnt wait is needed before
     this LDS read. Use this when the load is preceded by an async_wait +
     barrier that guarantees the data is ready.
+
+    When layout is specified, the load produces a tensor with that layout
+    directly, avoiding a separate convert_layout through shared memory.
     """
     block_type = tl.block_type(src.type.element_ty, src.type.shape)
     storage = src.type.storage
@@ -677,6 +681,18 @@ def local_load(
                                                          token.handle if token else None)
         output = _semantic.builder.create_release_layout(load_handle)
         return tl.tensor(output, block_type)
+    elif layout is not None:
+        from triton.language.core import _unwrap_if_constexpr
+        layout = _unwrap_if_constexpr(layout)
+        encoding = layout._to_ir(_semantic.builder)
+        from triton._C.libtriton.ir import RankedTensorType as _RankedTensorType
+        elem_ty = block_type.to_ir(_semantic.builder).element_type
+        ret_ty = _RankedTensorType.get(list(src.type.shape), elem_ty, encoding)
+        output = _semantic.builder.create_typed_local_load(ret_ty, src.handle)
+        result = tl.tensor(output, block_type)
+        if relaxed:
+            result.handle.set_attr("ttg.amdg.syncedViaAsyncWait", _semantic.builder.get_bool_attr(True))
+        return result
     else:
         output = _semantic.builder.create_local_load(src.handle, token.handle if token else None)
         result = tl.tensor(output, block_type)

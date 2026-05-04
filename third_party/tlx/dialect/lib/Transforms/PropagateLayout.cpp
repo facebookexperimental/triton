@@ -240,7 +240,11 @@ computeBlockedTensorValues(triton::FuncOp funcOp, DataFlowSolver &solver) {
 
           LDBG("Blocking tensor carrier value due to inconsistent predecessor "
                "layouts at "
-               << branchOp->getName());
+               << branchOp->getName() << " successor input: " << successorInput);
+          for (Value pv : predecessorValues) {
+            Type ct = getTensorCandidateType(pv, solver, blockedValues);
+            LDBG("  predecessor: " << pv << " candidate type: " << ct);
+          }
           changed |= blockedValues.insert(successorInput).second;
           for (Value predecessorValue : predecessorValues) {
             if (!isa<RankedTensorType>(predecessorValue.getType()))
@@ -264,22 +268,39 @@ updateTensorRegionBranchTypes(triton::FuncOp funcOp, DataFlowSolver &solver,
     SmallVector<RegionSuccessor> successors;
     collectRegionBranchSuccessors(branchOp, successors);
 
+    LDBG("updateTensorRegionBranchTypes for " << branchOp->getName()
+         << " with " << successors.size() << " successors");
+
     bool changed = true;
     while (changed) {
       changed = false;
       for (RegionSuccessor successor : successors) {
         ValueRange successorInputs = branchOp.getSuccessorInputs(successor);
+        LDBG("  successor has " << successorInputs.size() << " inputs");
         for (auto [index, successorInput] : llvm::enumerate(successorInputs)) {
+          LDBG("    input #" << index << ": " << successorInput.getType());
           if (!isa<RankedTensorType>(successorInput.getType()))
             continue;
 
           SmallVector<Value> predecessorValues;
           branchOp.getPredecessorValues(successor, index, predecessorValues);
+          LDBG("    has " << predecessorValues.size() << " predecessors");
           std::optional<Type> consensusType = getTensorConsensusType(
               ValueRange(predecessorValues), solver, blockedValues);
-          if (!consensusType || successorInput.getType() == *consensusType)
+          if (!consensusType) {
+            LDBG("No consensus for successor input " << successorInput
+                 << " with " << predecessorValues.size() << " predecessors");
+            for (Value pv : predecessorValues) {
+              Type ct = getTensorCandidateType(pv, solver, blockedValues);
+              LDBG("  pred value: " << pv << " -> candidate: " << ct);
+            }
+            continue;
+          }
+          if (successorInput.getType() == *consensusType)
             continue;
 
+          LDBG("Updating region branch type from " << successorInput.getType()
+               << " to " << *consensusType);
           successorInput.setType(*consensusType);
           changed = true;
         }
@@ -301,8 +322,11 @@ public:
         return WalkResult::interrupt();
       return WalkResult::advance();
     });
-    if (!walkResult.wasInterrupted())
+    if (!walkResult.wasInterrupted()) {
+      LDBG("No require/release layout ops found, skipping");
       return;
+    }
+    LDBG("Running PropagateLayout on " << funcOp.getName());
 
     SymbolTableCollection symbolTable;
     Operation *op = getOperation();

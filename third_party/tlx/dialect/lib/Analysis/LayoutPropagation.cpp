@@ -372,6 +372,8 @@ static bool isAllowedTensorLayoutUser(Operation *op, unsigned operandIndex) {
   // region carriers. After convert_layout is rewritten into explicit
   // tlx.require_layout anchors, tensor propagation treats those anchors plus
   // the same transparent carriers as the legal local_load-to-dot path.
+  // convert_layout may still sit between block args and require_layout when
+  // the insert pass materializes tensor constraints.
   if (auto requireLayoutOp = dyn_cast<RequireLayoutOp>(op)) {
     if (!isa<RankedTensorType>(requireLayoutOp.getType()) || operandIndex != 0)
       return false;
@@ -379,7 +381,7 @@ static bool isAllowedTensorLayoutUser(Operation *op, unsigned operandIndex) {
         cast<RankedTensorType>(requireLayoutOp.getType()).getEncoding());
   }
 
-  return isTransparentLayoutCarrierOp(op);
+  return isa<ttg::ConvertLayoutOp>(op) || isTransparentLayoutCarrierOp(op);
 }
 
 static bool canRewriteTensorResult(Operation *op) {
@@ -416,6 +418,21 @@ LogicalResult TensorBackwardPropagation::visitOperation(
 
   if (isa<ReleaseLayoutOp>(op))
     return success();
+
+  // For convert_layout, propagate the result constraint backward to the
+  // operand so the analysis reaches local_load through scf.for iter_args.
+  if (isa<ttg::ConvertLayoutOp>(op) && op->getNumOperands() == 1 &&
+      op->getNumResults() == 1) {
+    if (!results.empty() && isTrackedTensorValue(op->getOperand(0))) {
+      const TensorLayout &resultState = results[0]->getValue();
+      if (!resultState.isUninitialized() && !resultState.isUnknown()) {
+        ChangeResult changed = operands[0]->meet(resultState);
+        propagateIfChanged(operands[0], changed);
+      }
+    }
+    // Don't return early — fall through to let the poison check handle
+    // mixed-use cases where the operand has other non-allowed users.
+  }
 
   // If a tracked tensor value is used by an unsupported operation, rewriting
   // the producer chain is no longer legal for that entire component.
