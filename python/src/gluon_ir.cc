@@ -988,6 +988,14 @@ void init_gluon_ir(py::module &&m) {
              auto i32Ty = IntegerType::get(self.getContext(), 32);
              self.create<ttag::ArriveBarrierOp>(i32Ty, memDesc, count);
            })
+      .def("create_amd_cluster_arrive",
+           [](GluonOpBuilder &self) {
+             self.create<ttag::ClusterBarrierArriveOp>();
+           })
+      .def("create_amd_cluster_wait",
+           [](GluonOpBuilder &self) {
+             self.create<ttag::ClusterBarrierWaitOp>();
+           })
       .def("create_warp_pipeline_border",
            [](GluonOpBuilder &self, const std::string &marker) {
              auto border = self.create<ROCDL::SchedBarrier>(0);

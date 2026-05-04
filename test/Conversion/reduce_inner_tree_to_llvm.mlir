@@ -21,17 +21,17 @@ tt.func private @reduce_inner_tree(%arg0: tensor<32x16xi32, #linear>) -> tensor<
   // CHECK: [[C0:%.*]] = add i32 [[SRC0]], [[SRC2]]
   // CHECK: [[C1:%.*]] = add i32 [[SRC1]], [[SRC3]]
 
-  // Count-up warp shuffle for combined0: strides 2, 4, 8, 16
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[C0]], i32 2, i32 31)
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 4, i32 31)
+  // Count-down warp shuffle for combined0: strides 16, 8, 4, 2
+  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[C0]], i32 16, i32 31)
   // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 8, i32 31)
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 16, i32 31)
+  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 4, i32 31)
+  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 2, i32 31)
 
-  // Count-up warp shuffle for combined1: strides 2, 4, 8, 16
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[C1]], i32 2, i32 31)
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 4, i32 31)
+  // Count-down warp shuffle for combined1: strides 16, 8, 4, 2
+  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[C1]], i32 16, i32 31)
   // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 8, i32 31)
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 16, i32 31)
+  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 4, i32 31)
+  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 2, i32 31)
 
   %0 = "tt.reduce"(%arg0) ({
   ^bb0(%arg1: i32, %arg2: i32):
