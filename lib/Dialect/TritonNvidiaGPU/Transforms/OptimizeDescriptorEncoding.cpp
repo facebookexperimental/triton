@@ -95,7 +95,7 @@ std::optional<UseInfo> getUseInfo(Operation *op) {
     return info;
   }
   if (auto load = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
-    info.descriptor = load.getDesc();
+    info.descriptor = cast<TypedValue<TensorDescType>>(load.getDesc());
     info.desiredSharedEncoding = load.getResult().getType().getEncoding();
     assert(isTMACompatibleEncoding(info.desiredSharedEncoding) &&
            "expecting TMA compatible encoding");
@@ -106,7 +106,7 @@ std::optional<UseInfo> getUseInfo(Operation *op) {
     return info;
   }
   if (auto store = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(op)) {
-    info.descriptor = store.getDesc();
+    info.descriptor = cast<TypedValue<TensorDescType>>(store.getDesc());
     auto encoding = store.getSrc().getType().getEncoding();
     info.cgaLayout = ttg::getCGALayout(encoding);
     auto shape = store.getSrc().getType().getShape();

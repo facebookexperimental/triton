@@ -349,8 +349,7 @@ static void lowerTMACopy(PartitionBuilder &b, Partition &loadPartition,
   Value truePred = b.boolCst(true);
   if (auto load = dyn_cast<DescriptorLoadOp>(op)) {
     b.createInto<ttng::AsyncTMACopyGlobalToLocalOp>(
-        loadPartition, stageCluster,
-        /*multicastTargets*/ Value(), load.getDesc(), load.getIndices(),
+        loadPartition, stageCluster, load.getDesc(), load.getIndices(),
         barrier, view, truePred);
   } else {
     auto gather = cast<DescriptorGatherOp>(op);

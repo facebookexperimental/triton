@@ -717,7 +717,8 @@ void init_triton_tlx_ir(py::module &&m) {
              }
              bool multicast = !multicastTargets.empty();
              self.create<ttng::AsyncTMACopyGlobalToLocalOp>(
-                 multicastTargetBitMask, desc, coord, mbarrier, result, pred,
+                 multicastTargetBitMask, desc, coord,
+                 /*offsets=*/std::vector<Value>{}, mbarrier, result, pred,
                  multicast, cacheModifier, evictionPolicy, isVolatile, twoCta);
            })
       .def("create_async_TMA_prefetch",
