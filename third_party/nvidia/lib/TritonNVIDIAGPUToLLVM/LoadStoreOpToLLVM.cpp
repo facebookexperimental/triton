@@ -1328,13 +1328,14 @@ struct AsyncCopyGlobalToLocalOpConversion
   }
 };
 
-static LinearLayout getMsgToPackedOffsetLayout(ttg::MemDescType ty) {
+static LinearLayout getMsgToPackedOffsetLayout(ttg::MemDescType ty,
+                                               ttg::TMAMode mode) {
   auto ctx = ty.getContext();
   auto kMsg = str_attr("msg");
   auto kBlock = str_attr("block");
   auto shapePerCTA = ttg::getShapePerCTA(ty);
   int rank = shapePerCTA.size();
-  auto blockShape = ttng::getTMABlockShape(ty, /*packedSize=*/true);
+  auto blockShape = ttng::getTMABlockShape(ty, /*packedSize=*/true, mode);
   auto outDimNames = standardOutDimNames(ctx, rank);
   LinearLayout msgToOffset;
   for (int dim = 0; dim < rank; ++dim) {
@@ -1398,6 +1399,12 @@ struct AsyncTMACopyGlobalToLocalOpConversion
     if (op.getIsVolatile())
       return op.emitError("volatile not supported yet");
 
+    // Determine the TMA mode based on the descriptor type
+    auto descType = op.getDesc().getType();
+    bool isIm2Col = isa<ttng::TensorDescIm2ColType>(descType);
+    ttg::TMAMode tmaMode =
+        isIm2Col ? ttg::TMAMode::Im2Col : ttg::TMAMode::Tiled;
+
     auto loc = op.getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
 
@@ -1431,7 +1438,7 @@ struct AsyncTMACopyGlobalToLocalOpConversion
 
     int rank = op.getCoord().size();
 
-    auto msgToPackedOffset = getMsgToPackedOffsetLayout(smemTy);
+    auto msgToPackedOffset = getMsgToPackedOffsetLayout(smemTy, tmaMode);
     auto smemLayout = ttg::toLinearLayout(smemTy);
     auto msgToShared = msgToPackedOffset.invertAndCompose(smemLayout);
     auto msgToOffset = getMsgToUnpackedOffsetLayout(msgToPackedOffset, smemTy);
@@ -1546,6 +1553,21 @@ struct AsyncTMACopyGlobalToLocalOpConversion
       if (l2PolicyReg) {
         operands.push_back(ptxBuilderTMA.newOperand(l2PolicyReg, "l"));
         tmaInst += ", $" + std::to_string(operandIdx++);
+      }
+      if (isIm2Col) {
+        auto im2colOffsets = adaptor.getOffsets();
+        if (!im2colOffsets.empty()) {
+          tmaInst += ", {";
+          for (size_t i = 0; i < im2colOffsets.size(); i++) {
+            // Reverse the order: im2colOffsets[size - 1 - i]
+            operands.push_back(ptxBuilderTMA.newOperand(
+                im2colOffsets[im2colOffsets.size() - 1 - i], "h"));
+            tmaInst += "$" + std::to_string(operandIdx++);
+            if (i != im2colOffsets.size() - 1)
+              tmaInst += ", ";
+          }
+          tmaInst += "}";
+        }
       }
       tmaInst += ";";
 
@@ -1697,7 +1719,8 @@ convertTMAStoreLikeOp(Operation *op, const TypeConverter *typeConverter,
 
   auto rank = coords.size();
 
-  auto msgToPackedOffset = getMsgToPackedOffsetLayout(srcTy);
+  auto msgToPackedOffset =
+      getMsgToPackedOffsetLayout(srcTy, ttg::TMAMode::Tiled);
   auto smemLayout = ttg::toLinearLayout(srcTy);
   auto msgToShared = msgToPackedOffset.invertAndCompose(smemLayout);
   auto msgToOffset = getMsgToUnpackedOffsetLayout(msgToPackedOffset, srcTy);
@@ -1863,9 +1886,10 @@ static LinearLayout getUnswizzledLayout(triton::gpu::MemDescType type) {
     return ttg::toLinearLayout(type);
   }
   assert(type.getShape() == type.getAllocShape().take_back(type.getRank()));
+  // TMA gather/scatter only supports tiled mode
   return ttg::nvmmaSharedToLinearLayout(
       type.getShape(), cast<NVMMASharedEncodingAttr>(type.getEncoding()),
-      /*disableSwizzle=*/true);
+      ttg::TMAMode::Tiled, /*disableSwizzle=*/true);
 }
 
 // This function is shared between the TMA gather and scatter lowerings. It
@@ -1926,8 +1950,10 @@ static LogicalResult iterateGatherScatterIndices(
   unsigned threadsPerWarp = xCoordsLayout.getInDimSize(kLane);
 
   // Each gather4 instructions reads contigDimSize columns, 4 rows at a time.
+  // TMA gather/scatter only supports tiled mode
   auto shapePerCTA = ttg::getShapePerCTA(smemType);
-  auto tmaBlockShape = ttng::getTMABlockShape(smemType, /*packedSize=*/true);
+  auto tmaBlockShape = ttng::getTMABlockShape(smemType, /*packedSize=*/true,
+                                              ttg::TMAMode::Tiled);
   unsigned innerBlockSize = shapePerCTA.back();
   unsigned contigDimSize = tmaBlockShape.back();
   unsigned numMessagesPerRow = ceil<unsigned>(innerBlockSize, contigDimSize);

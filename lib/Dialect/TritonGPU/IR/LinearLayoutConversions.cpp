@@ -195,13 +195,14 @@ LinearLayout getCoreMatrixLinearLayout(NVMMASharedEncodingAttr shared,
 
 LinearLayout nvmmaSharedToLinearLayout(ArrayRef<int64_t> shape,
                                        NVMMASharedEncodingAttr shared,
-                                       bool disableSwizzle) {
+                                       TMAMode mode, bool disableSwizzle) {
   MLIRContext *ctx = shared.getContext();
   int rank = shape.size();
   auto shapePerCTA = getShapePerCTA(shared, shape);
   auto kOffset = S("offset");
-  auto tmaShape = triton::nvidia_gpu::getTMABlockShape(shared, shapePerCTA,
-                                                       /*packedSize=*/true);
+  auto tmaShape =
+      triton::nvidia_gpu::getTMABlockShape(shared, shapePerCTA,
+                                           /*packedSize=*/true, mode);
   // The memdesc shape rank may exceed the encoding's CGALayout rank (the
   // verifier allows encoding_rank == shape_rank - 1 for the leading buffer
   // dimension from local_alloc with num_buffers). Extend the CGALayout by
@@ -1221,7 +1222,8 @@ LinearLayout TritonGPUDialect::toLinearLayout(ArrayRef<int64_t> shape,
     } else if (auto shared = dyn_cast<SharedLinearEncodingAttr>(layout)) {
       result = shared.toLinearLayout(shape);
     } else if (auto shared = dyn_cast<NVMMASharedEncodingAttr>(layout)) {
-      result = nvmmaSharedToLinearLayout(shape, shared);
+      // The shared memory layout is independent of TMA mode (Tiled vs Im2Col)
+      result = nvmmaSharedToLinearLayout(shape, shared, TMAMode::Tiled);
     } else if (auto sbl = dyn_cast<AMDRotatingSharedEncodingAttr>(layout)) {
       result = sharedToLinearLayoutAMDRotating(shape, sbl);
     } else if (auto tensorMemoryEncoding =
