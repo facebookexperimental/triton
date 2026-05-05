@@ -196,7 +196,6 @@ def test_autows_addmm_tma_persistent(
 
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
-        triton.knobs.nvidia.use_meta_partition = True
 
         dtype = torch.float16
         GROUP_SIZE_M = 8

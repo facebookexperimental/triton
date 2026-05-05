@@ -121,7 +121,6 @@ def shared_forward(q, k, v, sm_scale, causal, baseVariant):
 
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
-        triton.knobs.nvidia.use_meta_partition = True
         if True:  # persistent: fwd non-persistent is not working yet.
             fused_attn_mod._attn_fwd_persist[grid_persist](
                 sm_scale,
@@ -208,7 +207,6 @@ def run_original_bwd(q, k, v, o, M, do, sm_scale, causal, persistent):
 
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
-        triton.knobs.nvidia.use_meta_partition = True
         if persistent:
             NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 

@@ -599,7 +599,6 @@ class FlashAttention:
 def test_blackwell_fa_autows_dp(causal, dtype):
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
-        triton.knobs.nvidia.use_meta_partition = True
 
         for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
             sm_scale = 1.0 / (HEAD_DIM**0.5)

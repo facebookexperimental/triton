@@ -231,7 +231,7 @@ Run all existing `partition-scheduling-meta-*.mlir` tests with default knobs (no
 1. `ninja -j$(nproc) triton-opt` to rebuild
 2. Run all partition-scheduling-meta lit tests with FileCheck
 3. Run `triton-opt` on `fa.part.prior`, `flex.part.prior`, `hopper.part.prior` and verify partition types
-4. Run FA fwd tutorial: `TRITON_USE_META_PARTITION=1 TRITON_USE_META_WS=1 python python/tutorials/fused-attention-ws-device-tma.py`
+4. Run FA fwd tutorial: `TRITON_USE_META_WS=1 python python/tutorials/fused-attention-ws-device-tma.py`
 
 ---
 

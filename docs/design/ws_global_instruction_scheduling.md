@@ -895,7 +895,7 @@ Example (FA backward, 5 MMAs):
 
 This matches the hand-tuned annotation partition exactly. Annotations are skipped when all MMAs land in the same stage (e.g., GEMM, FA forward) or when the loop already has `tt.autows` from Python `attrs=`.
 
-FA BWD performance (B200, `TRITON_USE_META_WS=1 TRITON_USE_META_PARTITION=1`):
+FA BWD performance (B200, `TRITON_USE_META_WS=1`):
 
 | Shape | Baseline TFLOPS | SMS TFLOPS | Diff |
 |---|---|---|---|

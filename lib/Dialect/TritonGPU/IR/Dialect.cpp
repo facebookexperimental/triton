@@ -3854,7 +3854,7 @@ LogicalResult TritonGPUDialect::verifyOperationAttribute(Operation *op,
   // doTaskIdPropagate).
   if (attr.getName() == kPartitionAttrName && op->getNumRegions() != 0 &&
       !isa<triton::ReduceOp, triton::MapElementwiseOp>(op) &&
-      !triton::tools::getBoolEnv("TRITON_USE_META_PARTITION")) {
+      !triton::tools::getBoolEnv("TRITON_USE_META_WS")) {
     SetVector<int> expectedIds;
     for (auto &region : op->getRegions()) {
       for (auto &block : region.getBlocks()) {
