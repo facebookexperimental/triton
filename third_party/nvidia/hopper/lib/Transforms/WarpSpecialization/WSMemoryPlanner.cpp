@@ -774,6 +774,51 @@ private:
 
 namespace {
 
+/// Extract a human-readable name from an op's location.
+/// Walks NameLoc, CallSiteLoc(NameLoc(...)), and FusedLoc chains.
+/// Falls back to "file:line" from FileLineColLoc if no NameLoc is found.
+static std::string getLocName(Operation *op) {
+  if (!op)
+    return "";
+  // First try to find a NameLoc.
+  auto walkName = [](Location loc, auto &self) -> std::string {
+    if (auto nameLoc = dyn_cast<NameLoc>(loc))
+      return nameLoc.getName().str();
+    if (auto callSiteLoc = dyn_cast<CallSiteLoc>(loc))
+      return self(callSiteLoc.getCallee(), self);
+    if (auto fusedLoc = dyn_cast<FusedLoc>(loc))
+      for (Location sub : fusedLoc.getLocations()) {
+        auto s = self(sub, self);
+        if (!s.empty())
+          return s;
+      }
+    return "";
+  };
+  std::string name = walkName(op->getLoc(), walkName);
+  if (!name.empty())
+    return name;
+  // Fallback: extract file:line from FileLineColLoc.
+  auto walkFile = [](Location loc, auto &self) -> std::string {
+    if (auto fileLoc = dyn_cast<FileLineColLoc>(loc)) {
+      std::string filename = fileLoc.getFilename().str();
+      size_t lastSlash = filename.rfind('/');
+      if (lastSlash != std::string::npos)
+        filename = filename.substr(lastSlash + 1);
+      return filename + ":" + std::to_string(fileLoc.getLine());
+    }
+    if (auto callSiteLoc = dyn_cast<CallSiteLoc>(loc))
+      return self(callSiteLoc.getCallee(), self);
+    if (auto fusedLoc = dyn_cast<FusedLoc>(loc))
+      for (Location sub : fusedLoc.getLocations()) {
+        auto s = self(sub, self);
+        if (!s.empty())
+          return s;
+      }
+    return "";
+  };
+  return walkFile(op->getLoc(), walkFile);
+}
+
 /// Priority levels for SMEM multi-buffering candidates.
 enum class WSBufferPriority {
   P0_InnermostTMA = 0, // innermost loop + TMA channel
@@ -797,6 +842,8 @@ struct WSBuffer {
       0; // 0=normal, 1=TMA store staging, 2=TMA reduce staging
   bool isAllocated =
       false; // Has dedicated SMEM; false = reuses another buffer.
+  int reuseTargetBufferId =
+      -1; // bufferId of the reuse target, -1 = no reuse.
 };
 
 /// Parsed channel annotation from tt.autows JSON on an MMA op.
@@ -1676,6 +1723,7 @@ static unsigned allocateSmemBuffers(
                                           claimedTargets);
         if (target) {
           buf.isAllocated = false;
+          buf.reuseTargetBufferId = target->bufferId;
           LDBG("Phase 3.6: WSBuffer[" << idx << "] (" << buf.sizeBytes
                                       << "B) reuses WSBuffer["
                                       << target->bufferId << "]");
@@ -1864,6 +1912,19 @@ static unsigned allocateSmemBuffers(
     if (!buf.isAllocated) {
       buf.allocOp->setAttr("allocation.shareGroup",
                            IntegerAttr::get(i32Type, buf.bufferId));
+      // Find the target buffer's name for the remark.
+      std::string targetName;
+      for (auto &other : wsBuffers) {
+        if ((int)other.bufferId == buf.reuseTargetBufferId) {
+          targetName = getLocName(other.allocOp);
+          break;
+        }
+      }
+      std::string bufName = getLocName(buf.allocOp);
+      auto diag = buf.allocOp->emitRemark()
+          << "SMEM buffer \"" << bufName << "\" (buffer.id=" << buf.bufferId
+          << ", " << buf.sizeBytes << "B) reuses \""
+          << targetName << "\" (buffer.id=" << buf.reuseTargetBufferId << ")";
     }
     if (buf.tmaStaging > 0) {
       buf.allocOp->setAttr("buffer.tmaStaging",

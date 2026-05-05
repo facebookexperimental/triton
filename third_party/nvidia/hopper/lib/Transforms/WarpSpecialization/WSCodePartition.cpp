@@ -3603,6 +3603,10 @@ void insertAsyncComm(
                     WSBarrierAttr::forDstTask(funcOp.getContext(),
                                               earlyToken.first)
                         .build(funcOp.getContext()));
+            acquireOp->emitRemark()
+                << "reuse barrier: channel " << masterChannel->uniqID
+                << " waits on channel " << earlyChannelForReuseSync->uniqID
+                << " (intra-iteration)";
             LLVM_DEBUG({
               LDBG("Insert intra-iteration reuse ProducerAcquireOp for late "
                    "channel "
@@ -3634,6 +3638,11 @@ void insertAsyncComm(
                     WSBarrierAttr::forDstTask(funcOp.getContext(),
                                               wrapToken.first)
                         .build(funcOp.getContext()));
+            acquireOp->emitRemark()
+                << "reuse barrier: channel " << masterChannel->uniqID
+                << " waits on channel "
+                << wrapAroundChannelForReuseSync->uniqID
+                << " (wrap-around)";
             LLVM_DEBUG({
               LDBG("Insert wrap-around reuse ProducerAcquireOp for channel "
                    << masterChannel->uniqID << " waiting on last channel "
