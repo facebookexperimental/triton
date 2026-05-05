@@ -176,7 +176,7 @@ class FlashAttention:
     """Common utilities and configs for Flash Attention tests."""
 
     # (Z, H, N_CTX, HEAD_DIM)
-    SHAPES = [(4, 8, 8192, 128)]
+    SHAPES = [(4, 8, 1024, 128)]
 
     CONFIGS = {
         "blackwell_fa_ws": {
@@ -448,7 +448,7 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
         ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
         do = torch.randn_like(ref_out)
         ref_out.backward(do)
-        _ref_dq, ref_dk, ref_dv = q.grad.clone(), k.grad.clone(), v.grad.clone()  # noqa: F841
+        ref_dq, ref_dk, ref_dv = q.grad.clone(), k.grad.clone(), v.grad.clone()
         q.grad, k.grad, v.grad = None, None, None
 
         # Forward with known-good config (no autotuning)
@@ -563,7 +563,7 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
 
         torch.testing.assert_close(dv, ref_dv, atol=1e-2, rtol=0)
         torch.testing.assert_close(dk, ref_dk, atol=1e-2, rtol=0)
-        # torch.testing.assert_close(tri_dq, ref_dq, atol=1e-2, rtol=0)  # TODO: fix dQ encoding mismatch
+        torch.testing.assert_close(dq.to(ref_dq.dtype), ref_dq, atol=1e-2, rtol=0)
 
 
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])
