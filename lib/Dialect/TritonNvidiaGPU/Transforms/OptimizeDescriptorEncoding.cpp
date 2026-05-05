@@ -488,9 +488,6 @@ LogicalResult assignMemoryLayouts(FuncOp &func) {
       } else if (isa<scf::YieldOp>(op)) {
         auto vals = getTiedArgs(op->getParentOp(), use.getOperandNumber());
         updateEncoding(vals, EncodingInfo{});
-      } else if (isa<ttg::WarpSpecializeOp>(op)) {
-        auto vals = getTiedArgs(op, use.getOperandNumber());
-        updateEncoding(vals, EncodingInfo{});
       } else if (isa<ttg::WarpSpecializePartitionsOp>(op)) {
         auto vals = getTiedArgs(op, use.getOperandNumber());
         updateEncoding(vals, EncodingInfo{});

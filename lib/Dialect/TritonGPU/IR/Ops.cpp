@@ -1169,18 +1169,7 @@ void WarpSpecializePartitionsOp::getSuccessorRegions(
 
 OperandRange
 WarpSpecializePartitionsOp::getEntrySuccessorOperands(RegionSuccessor) {
-  // Propagate capture types to block argument types. Passes may temporarily
-  // create type mismatches between captures and partition region arguments.
-  auto captures = getExplicitCaptures();
-  for (Region &region : getPartitionRegions()) {
-    for (auto [i, cap] : llvm::enumerate(captures)) {
-      if (i < region.getNumArguments() &&
-          region.getArgument(i).getType() != cap.getType()) {
-        region.getArgument(i).setType(cap.getType());
-      }
-    }
-  }
-  return captures;
+  return getExplicitCaptures();
 }
 
 LogicalResult WarpSpecializeOp::verify() {
@@ -1373,18 +1362,6 @@ LogicalResult WarpSpecializePartitionsOp::verify() {
 LogicalResult
 WarpSpecializePartitionsOp::canonicalize(WarpSpecializePartitionsOp op,
                                          PatternRewriter &b) {
-  // Propagate capture types to block argument types.
-  bool typesUpdated = false;
-  for (auto [i, capture] : llvm::enumerate(op.getExplicitCaptures())) {
-    for (Region &region : op.getPartitionRegions()) {
-      auto arg = region.getArgument(i);
-      if (arg.getType() != capture.getType()) {
-        arg.setType(capture.getType());
-        typesUpdated = true;
-      }
-    }
-  }
-
   llvm::BitVector unusedArgs(op.getNumOperands());
 
   // Remove duplicate captures.
@@ -1412,7 +1389,7 @@ WarpSpecializePartitionsOp::canonicalize(WarpSpecializePartitionsOp op,
   }
 
   if (unusedArgs.none())
-    return typesUpdated ? success() : failure();
+    return failure();
 
   b.modifyOpInPlace(op, [&] {
     for (Region &region : op.getPartitionRegions())

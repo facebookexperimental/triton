@@ -56,10 +56,10 @@ void traceBarrierUses(Value barrierVal,
     }
 
     // Follow through warp_specialize captures.
-    if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(user)) {
+    if (auto partOp = dyn_cast<ttg::WarpSpecializePartitionsOp>(user)) {
       unsigned operandIdx = use.getOperandNumber();
-      for (Region *region : wsOp.getPartitionRegions()) {
-        Value blockArg = region->getArgument(operandIdx);
+      for (Region &region : partOp.getPartitionRegions()) {
+        Value blockArg = region.getArgument(operandIdx);
         traceBarrierUses(blockArg, terminalUses);
       }
       continue;

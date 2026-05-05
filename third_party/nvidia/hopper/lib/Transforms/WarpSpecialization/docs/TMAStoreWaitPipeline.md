@@ -1,19 +1,84 @@
 # TMA Store Wait Pipeline
 
-**File**: `WSTMAStoreLowering.cpp`
+**File**: `WSTMAStoreLowering.cpp`, `WSMemoryPlanner.cpp`
 
 After `doTMAStoreLowering` converts `tt::DescriptorStoreOp` into
 `LocalAllocOp` + `AsyncTMACopyLocalToGlobalOp` + `TMAStoreTokenWaitOp`
-(see [Memory Lowering](MemoryLowering.md#tma-store-lowering)), a sequence
-of three sub-passes optimizes and then lowers the wait ops. The goal is to
-delay TMA store waits as long as safely possible — overlapping computation
-with the asynchronous SMEM-to-global copy — and then lower them to
-hardware-level operations.
+(see [Memory Lowering](MemoryLowering.md#tma-store-lowering)), the
+memory planner and a sequence of sub-passes handle these staging buffers.
 
-## Pipeline Position
+## Memory Planner: `isTMAStoreStaging` Handling
 
-Within the AutoWS monolithic pass (`WarpSpecialization.cpp`), the three
-functions run at different points:
+**File**: `WSMemoryPlanner.cpp` (within `allocateSmemBuffers`)
+
+When `early_tma_store_lowering` is enabled, the `local_alloc` ops created
+for TMA store staging are visible to the memory planner. These allocs feed
+`AsyncTMACopyLocalToGlobalOp` and are detected by checking users:
+
+```cpp
+for (auto user : alloc->getUsers()) {
+    if (isa<ttng::AsyncTMACopyLocalToGlobalOp>(user))
+        buf.isTMAStoreStaging = true;
+}
+```
+
+The `isTMAStoreStaging` flag triggers a special path through four phases:
+
+### Phase 3.5: TMA Store Staging Fusion
+
+All `isTMAStoreStaging` WSBuffers are merged into a single `bufferId`
+(via `fuseEpilogueWSBuffers`). This groups the dk/dv epilogue store
+staging buffers together. The merge uses the first buffer's ID for all.
+
+Note: the shared `bufferId` affects `computeTotalSmem`'s cost model
+(`max(size) × copies` per ID) but does **not** cause physical alloc
+merging downstream — each alloc remains separate through
+`AllocateSharedMemoryNv`.
+
+### Phase 4.5: Epilogue Group Copy Increase
+
+The merged TMA store group is treated as a P2_Other epilogue group.
+`increaseFusedEpilogueCopies` iteratively increases copies (up to
+`numBuffers`) while checking `computeTotalSmem ≤ smemBudget`.
+
+Since `computeTotalSmem` excludes `isTMAStoreStaging` buffers from its
+total, the budget check is effectively a no-op — copies always increase
+to `numBuffers`. This is by design: TMA store staging buffers live
+outside the pipelined inner loop and don't compete with channel buffers
+for pipeline depth.
+
+### Phase 4.6: Combined SMEM Budget Validation
+
+After Phase 4.5, the combined SMEM cost is checked:
+
+```
+channelSmem = computeTotalSmem(wsBuffers)           // excludes TMA staging
+tmaStoreSmem = computeTMAStoreStagingSmem(wsBuffers) // per-entry counting
+if (channelSmem + tmaStoreSmem > smemBudget):
+    cap all isTMAStoreStaging copies to 1
+```
+
+`computeTMAStoreStagingSmem` counts `numEntries × size × copies` (not
+`max(size) × copies`) because the allocs are NOT merged into one physical
+alloc downstream.
+
+This prevents SMEM overflow for tight-budget configs where Phase 4.5
+would otherwise increase TMA staging copies unchecked. For example:
+BWD config 1 (BLOCK_M1=64, EPILOGUE_SUBTILE=2) has 4 TMA store staging
+allocs of 16KB each — at 2 copies this is 128KB, exceeding the budget.
+Phase 4.6 caps copies to 1 (64KB), fitting within hardware limits.
+
+### Phase 6: Hoist Before Outermost Loop
+
+All `isTMAStoreStaging` allocs are moved before the outermost enclosing
+`scf.for` loop. This is required for the rotation mechanism
+(`doAnnotateTMAStoreWaits`) which reads `buffer.copy` and only annotates
+allocs that are outside all loops.
+
+## Wait Annotation and Reordering Pipeline
+
+Within the AutoWS monolithic pass (`WarpSpecialization.cpp`), three
+functions handle the wait ops after the memory planner:
 
 ```
 doMemoryPlanner
