@@ -13,7 +13,7 @@ docker login ghcr.io
 gcloud container clusters get-credentials --location us-east4-a meta-triton-h100-runner-cluster
 
 # Install the ARC controller
-INSTALLATION_NAME="linux.gcp.h100"
+INSTALLATION_NAME="linux-gcp-h100"
 NAMESPACE="arc-systems"
 helm install "${INSTALLATION_NAME}" \
     --namespace "${NAMESPACE}" \
@@ -26,7 +26,7 @@ helm install "${INSTALLATION_NAME}" \
 To uninstall the ARC controller:
 
 ```
-INSTALLATION_NAME="linux.gcp.h100"
+INSTALLATION_NAME="linux-gcp-h100"
 NAMESPACE="arc-systems"
 helm uninstall -n "${NAMESPACE}" "${INSTALLATION_NAME}"
 ```
@@ -36,8 +36,8 @@ To inspect the controller installation logs:
 ```
 NAMESPACE="arc-systems"
 kubectl get pods -n "${NAMESPACE}"
-# get the pod name like linux.gcp.h100-gha-rs-controller-...
-kubectl logs -n ${NAMESPACE} linux.gcp.h100-gha-rs-controller-...
+# get the pod name like linux-gcp-h100-gha-rs-controller-...
+kubectl logs -n ${NAMESPACE} linux-gcp-h100-gha-rs-controller-...
 ```
 
 ## Step 2: Create secrets and assign it to the namespace
@@ -72,7 +72,7 @@ kubectl edit secrets -n arc-runners arc-secret
 ## Step 3: Install runner scale set
 
 ```
-INSTALLATION_NAME="linux.gcp.h100"
+INSTALLATION_NAME="linux-gcp-h100"
 NAMESPACE="arc-runners"
 GITHUB_SECRET_NAME="arc-secret"
 helm install "${INSTALLATION_NAME}" \
@@ -86,17 +86,17 @@ To upgrade or uninstall the runner scale set:
 
 ```
 # command to upgrade
-helm upgrade --install linux.gcp.h100 -n arc-runners -f ./values.yaml oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+helm upgrade --install linux-gcp-h100 -n arc-runners -f ./values.yaml oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
 
 # command to uninstall
-helm uninstall -n arc-runners linux.gcp.h100
+helm uninstall -n arc-runners linux-gcp-h100
 ```
 
 To inspect runner sacle set logs:
 
 ```
 kubectl get pods -n arc-runners
-# get arc runner name like linux.gcp.h100-...
+# get arc runner name like linux-gcp-h100-...
 # inspect the logs
-kubectl logs -n arc-runners linux.gcp.h100-...
+kubectl logs -n arc-runners linux-gcp-h100-...
 ```
