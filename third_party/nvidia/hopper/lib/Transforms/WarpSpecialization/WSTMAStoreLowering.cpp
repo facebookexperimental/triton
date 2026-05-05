@@ -59,7 +59,31 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
         tensorType.getShape(), tensorType.getElementType(), encoding,
         sharedMemorySpace, /*mutableMemory=*/true);
 
-    auto alloc = builder.create<ttg::LocalAllocOp>(loc, memDescType, src);
+    // Derive a NameLoc for the staging alloc from the descriptor's name.
+    auto allocLoc = loc;
+    Location descLoc = desc.getLoc();
+    if (auto *defOp = desc.getDefiningOp())
+      descLoc = defOp->getLoc();
+    // Walk through CallSiteLoc/FusedLoc to find a NameLoc.
+    auto findName = [](Location l, auto &self) -> StringRef {
+      if (auto nameLoc = dyn_cast<NameLoc>(l))
+        return nameLoc.getName().strref();
+      if (auto callSiteLoc = dyn_cast<CallSiteLoc>(l))
+        return self(callSiteLoc.getCallee(), self);
+      if (auto fusedLoc = dyn_cast<FusedLoc>(l))
+        for (Location sub : fusedLoc.getLocations()) {
+          auto s = self(sub, self);
+          if (!s.empty())
+            return s;
+        }
+      return {};
+    };
+    auto descName = findName(descLoc, findName);
+    if (!descName.empty()) {
+      auto stagingName = (descName + "_staging").str();
+      allocLoc = NameLoc::get(StringAttr::get(ctx, stagingName), loc);
+    }
+    auto alloc = builder.create<ttg::LocalAllocOp>(allocLoc, memDescType, src);
 
     // Async TMA copy from local (SMEM) to global, producing a token.
     auto tokenType = ttg::AsyncTokenType::get(ctx);
@@ -99,7 +123,30 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
         tensorType.getShape(), tensorType.getElementType(), encoding,
         sharedMemorySpace, /*mutableMemory=*/true);
 
-    auto alloc = builder.create<ttg::LocalAllocOp>(loc, memDescType, src);
+    // Derive a NameLoc for the staging alloc from the descriptor's name.
+    auto allocLoc = loc;
+    Location descLoc = desc.getLoc();
+    if (auto *defOp = desc.getDefiningOp())
+      descLoc = defOp->getLoc();
+    auto findName = [](Location l, auto &self) -> StringRef {
+      if (auto nameLoc = dyn_cast<NameLoc>(l))
+        return nameLoc.getName().strref();
+      if (auto callSiteLoc = dyn_cast<CallSiteLoc>(l))
+        return self(callSiteLoc.getCallee(), self);
+      if (auto fusedLoc = dyn_cast<FusedLoc>(l))
+        for (Location sub : fusedLoc.getLocations()) {
+          auto s = self(sub, self);
+          if (!s.empty())
+            return s;
+        }
+      return {};
+    };
+    auto descName = findName(descLoc, findName);
+    if (!descName.empty()) {
+      auto stagingName = (descName + "_reduce_staging").str();
+      allocLoc = NameLoc::get(StringAttr::get(ctx, stagingName), loc);
+    }
+    auto alloc = builder.create<ttg::LocalAllocOp>(allocLoc, memDescType, src);
 
     auto tokenType = ttg::AsyncTokenType::get(ctx);
     auto tmaReduce = builder.create<ttng::AsyncTMAReduceOp>(
