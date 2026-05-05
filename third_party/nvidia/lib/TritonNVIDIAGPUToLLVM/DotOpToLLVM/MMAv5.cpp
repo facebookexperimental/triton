@@ -315,7 +315,9 @@ static void createMMACommit(ConversionPatternRewriter &rewriter, Location loc,
       }
     }
   } else if (twoCTAs) {
-    mask = LLVM::NVIDIA::createTMAMulticastMask(loc, rewriter, 0x1);
+    auto clusterCTARank = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
+    Value ctaPairBase = b.and_(clusterCTARank, b.i32_val(~1));
+    mask = b.shl(b.i32_val(3), ctaPairBase);
   }
 
   SmallVector<PTXBuilder::Operand *> ptxOperands;
