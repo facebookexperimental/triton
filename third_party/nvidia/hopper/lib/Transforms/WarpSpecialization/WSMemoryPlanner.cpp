@@ -1569,6 +1569,10 @@ static unsigned allocateSmemBuffers(
   // ── Phase 6: Hoist in-loop TMA store allocs to before the loop ──────
   // Early TMA store lowering creates local_alloc ops inside the loop.
   // These must be hoisted so the pipeliner can rotate them by buffer.copy.
+  // Note: the hoist is only safe when all of `local_alloc`'s operands are
+  // defined outside the target loop. If an operand is defined inside the
+  // loop (e.g. an in-loop convert_layout), hoisting would create an SSA
+  // violation, so we skip it.
   for (auto &buf : wsBuffers) {
     auto allocOp = buf.allocOp;
     if (auto forOp = allocOp->getParentOfType<scf::ForOp>()) {
@@ -1584,6 +1588,23 @@ static unsigned allocateSmemBuffers(
         auto outermost = forOp;
         while (auto parent = outermost->getParentOfType<scf::ForOp>())
           outermost = parent;
+        // Verify the operand chain doesn't depend on values defined inside
+        // `outermost`'s body. If any operand is defined inside the loop, the
+        // hoist would break SSA. Skip the hoist in that case — the alloc
+        // stays in place and the pipeliner will not be able to rotate it,
+        // but the IR remains well-formed.
+        bool operandsAreLoopInvariant = true;
+        for (Value operand : allocOp->getOperands()) {
+          if (outermost.getBodyRegion().isAncestor(operand.getParentRegion())) {
+            operandsAreLoopInvariant = false;
+            break;
+          }
+        }
+        if (!operandsAreLoopInvariant) {
+          LDBG("Phase 6: skipping hoist of WSBuffer["
+               << buf.bufferId << "] — operand defined inside the target loop");
+          continue;
+        }
         allocOp->moveBefore(outermost);
         LDBG("Phase 6: hoisted WSBuffer[" << buf.bufferId
                                           << "] before outermost loop");
