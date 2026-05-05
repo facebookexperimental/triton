@@ -93,6 +93,30 @@ public:
 
       return WalkResult::advance();
     });
+
+    // AsyncTMAReduceOp also reads shared memory via the async proxy.
+    // Same fence logic as AsyncTMACopyLocalToGlobalOp.
+    mod.walk([&](AsyncTMAReduceOp tmaReduceOp) {
+      Value src = tmaReduceOp.getSrc();
+      SmallVector<Operation *> copyRegToSharedOps = findCopyRegToSharedOps(src);
+      if (copyRegToSharedOps.empty())
+        return WalkResult::advance();
+
+      OpBuilder builder(tmaReduceOp);
+      auto fence = FenceAsyncSharedOp::create(builder, tmaReduceOp.getLoc(),
+                                              /*bCluster=*/false);
+      while (auto loopOp = fence->getParentOfType<LoopLikeOpInterface>()) {
+        if (llvm::any_of(copyRegToSharedOps, [&](Operation *op) {
+              return shouldPreventFenceHoist(op, loopOp);
+            }))
+          break;
+        loopOp.moveOutOfLoop(fence);
+      }
+
+      eraseIfDuplicateFence(fence);
+
+      return WalkResult::advance();
+    });
   }
 
 private:

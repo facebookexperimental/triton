@@ -14,7 +14,8 @@ def is_hip():
 
 
 def is_cuda():
-    return triton.runtime.driver.active.get_current_target().is_cuda_backend()
+    target = triton.runtime.driver.active.get_current_target()
+    return getattr(target, 'is_cuda_backend', lambda: target.backend == "cuda")()
 
 
 def supports_host_descriptor():
@@ -669,14 +670,6 @@ _DEFAULT_BWD_DOT_ATTRS = FrozenDotAttrs({
     "dq": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,5"]},
     "dk": {"stage": "1", "order": "1", "channels": ["opndD,tmem,1,10"]},
 })
-# dpT share with dq, qk share with ppT, dsT share with dpT
-_BWD_DOT_ATTRS_TMEM = FrozenDotAttrs({
-    "qkT": {"stage": "0", "order": "0", "channels": ["opndA,smem,1,0", "opndB,smem,2,1", "opndD,tmem,1,2"]},
-    "dpT": {"stage": "0", "order": "2", "channels": ["opndA,smem,1,3", "opndB,smem,1,4", "opndD,tmem,1,5"]},
-    "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},
-    "dq": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,5"]},
-    "dk": {"stage": "1", "order": "1", "channels": ["opndA,tmem,1,5", "opndD,tmem,1,10"]},
-})
 
 _BWD_DOT_ATTRS_BM64_TMEM = FrozenDotAttrs({
     # qkT inputs: k, q; dpT inputs: v, do; dv inputs: ppT, do; dq inputs: dsT, k; dk inputs: dsT, q
@@ -830,7 +823,7 @@ def _attn_bwd_dkdv(
                 merge_epilogue_to_computation=True,
                 tmem_alloc_algo=2,
                 smem_alloc_algo=1,
-                smem_budget=200000, #231000,
+                smem_budget=200000,
         ):
             dk, dv, curr_m = _attn_bwd_dkdv_inner(
                 dk,
@@ -931,64 +924,17 @@ configs_bwd = [
 configs_bwd_persist = [
     triton.Config(
         {
-            "BLOCK_M1": 128,
-            "BLOCK_N1": 128,
-            "BLOCK_M2": 128,
-            "BLOCK_N2": 128,
-            "EPILOGUE_SUBTILE": 4,
-            "BWD_DOT_ATTRS": _DEFAULT_BWD_DOT_ATTRS,
-        },
-        num_warps=4,
-        num_stages=2,
-        pre_hook=_bwd_host_descriptor_pre_hook,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M1": 128, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 128, "EPILOGUE_SUBTILE": 4, "BWD_DOT_ATTRS":
-            _BWD_DOT_ATTRS_SCHED,  # use memory planner heuristics
-        },
-        num_warps=4,
-        num_stages=2,
-        pre_hook=_bwd_host_descriptor_pre_hook,
-    ),
-    #triton.Config( # test dk/dv staging buffer reuse
-    #    {
-    #        "BLOCK_M1": 128,
-    #        "BLOCK_N1": 128,
-    #        "BLOCK_M2": 128,
-    #        "BLOCK_N2": 128,
-    #        "EPILOGUE_SUBTILE": 2,
-    #        "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_TMEM,
-    #    },
-    #    num_warps=4,
-    #    num_stages=2,
-    #    pre_hook=_bwd_host_descriptor_pre_hook,
-    #),
-    triton.Config(
-        {
             "BLOCK_M1": 64,
             "BLOCK_N1": 128,
             "BLOCK_M2": 128,
             "BLOCK_N2": 128,
-            "EPILOGUE_SUBTILE": 2,
+            "EPILOGUE_SUBTILE": 4,
             "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM64_TMEM,
         },
         num_warps=4,
         num_stages=2,
         pre_hook=_bwd_host_descriptor_pre_hook,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M1": 64,
-            "BLOCK_N1": 128,
-            "BLOCK_M2": 128,
-            "BLOCK_N2": 128,
-            "EPILOGUE_SUBTILE": 2,
-            "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM64,
-        },
-        num_warps=4,
-        num_stages=2,
-        pre_hook=_bwd_host_descriptor_pre_hook,
+        ir_override="/home/mren/local/MetaMain/triton/override/autows.ttgir",
     ),
 ]
 
@@ -1253,7 +1199,7 @@ def _attn_bwd_persist(
             merge_epilogue_to_computation=True,
             tmem_alloc_algo=2,
             smem_alloc_algo=1,
-            smem_budget=200000, #231000,
+            smem_budget=200000,
     ):
         pid = tile_idx % n_tile_num
         bhid = tile_idx // n_tile_num
@@ -1592,7 +1538,7 @@ attention = _attention_opt.apply
 @pytest.mark.parametrize("VECT_MUL", [0])  # , 1, 2, 3])
 @pytest.mark.parametrize("FADD2_REDUCE", [False])
 @pytest.mark.parametrize("bwd_config_idx", range(len(configs_bwd_persist)))
-@pytest.mark.parametrize("early_tma_store_lowering", [False])
+@pytest.mark.parametrize("early_tma_store_lowering", [False, True])
 def test_op(
     Z,
     H,
@@ -1614,6 +1560,8 @@ def test_op(
         pytest.skip("bwd_config_idx only applies to bwd mode")
     if mode == "bwd" and "fp8" in provider:
         pytest.skip("Backward pass with FP8 is not supported.")
+    if mode == "bwd" and HEAD_DIM == 128 and bwd_config_idx == 1 and early_tma_store_lowering:
+        pytest.skip("bwd_config_idx of 1 does not work with hDim 128 + early_tma_store")
     if mode == "bwd" and HEAD_DIM == 64 and bwd_config_idx == 1:
         pytest.skip("bwd_config_idx of 1 does not work with hDim 64")
     if mode == "bwd" and baseVariant == "ws_persistent":
@@ -1687,12 +1635,12 @@ except BaseException:
     HAS_FLASH = False
 
 TORCH_HAS_FP8 = False
-BATCH, N_HEADS = 4, 32
+BATCH, N_HEADS = 4, 48
 # vary seq length for fixed head and batch=4
 configs = []
 for HEAD_DIM in [128]:  # 64, 128]:
     for baseVariant in ["ws_persistent"]:
-        for mode in ["bwd"]:#"fwd", "bwd"]:
+        for mode in ["bwd"]:
             configs.append(
                 triton.testing.Benchmark(
                     x_names=["N_CTX"],
@@ -1731,7 +1679,9 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, baseVariant, provider
         SUBTILING = True
         VECT_MUL = 1
         FADD2_REDUCE = False
-        fn = lambda: attention(q, k, v, False, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE, True)
+        early_tma_store_lowering = True
+        fn = lambda: attention(q, k, v, False, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE,
+                               early_tma_store_lowering)
         if mode == "bwd":
             o = fn()
             do = torch.randn_like(o)
