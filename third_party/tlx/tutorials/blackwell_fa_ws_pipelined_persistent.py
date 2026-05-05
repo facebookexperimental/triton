@@ -1050,7 +1050,6 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
     BLOCK_M1 = nargs["BLOCK_M1"]
     BLOCK_N1 = nargs["BLOCK_N1"]
     HEAD_DIM = nargs["HEAD_DIM"]
-    DQ_REDUCE_NCOL = nargs["DQ_REDUCE_NCOL"]
     NUM_CTAS = nargs.get("NUM_CTAS", 1)
 
     # Reset dq accumulator to zeros before each autotuner warmup run.
@@ -1062,7 +1061,8 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
     nargs["desc_do"].block_shape = [BLOCK_M1, HEAD_DIM // NUM_CTAS]
     nargs["desc_v"].block_shape = [BLOCK_N1, HEAD_DIM]
     nargs["desc_k"].block_shape = [BLOCK_N1, HEAD_DIM]
-    nargs["desc_dq"].block_shape = [BLOCK_M1 // NUM_CTAS, DQ_REDUCE_NCOL]
+    EPILOGUE_SUBTILE = nargs.get("EPILOGUE_SUBTILE", 4)
+    nargs["desc_dq"].block_shape = [BLOCK_M1 // NUM_CTAS, HEAD_DIM // EPILOGUE_SUBTILE]
     DKV_STORE_NCOL = nargs["DKV_STORE_NCOL"]
     nargs["desc_dv"].block_shape = [BLOCK_N1, DKV_STORE_NCOL]
     nargs["desc_dk"].block_shape = [BLOCK_N1, DKV_STORE_NCOL]
@@ -2682,19 +2682,15 @@ def _attn_bwd_ws(
                     # wait for dq = tl.dot(tl.trans(dsT), k)
                     tlx.barrier_wait(dq_fulls[tmem_buf_id], tmem_phase)
                     if USE_2CTA:
-                        slice_size: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
                         DQ_ROWS: tl.constexpr = BLOCK_M1 // NUM_CTAS
+                        DQ_STORE_NCOL: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
                         dq_m_offset = cluster_cta_rank * DQ_ROWS
+                        dq_full = tlx.local_load(dq_tiles[tmem_buf_id])
+                        dq_full = dq_full * LN2
+                        dq_slices = _split_n(dq_full, EPILOGUE_SUBTILE)
                         for slice_id in tl.static_range(EPILOGUE_SUBTILE):
-                            dq_slice = tlx.local_slice(
-                                dq_tiles[tmem_buf_id],
-                                [0, slice_id * slice_size],
-                                [DQ_ROWS, slice_size],
-                            )
-                            dq = tlx.local_load(dq_slice)
-                            dq = dq * LN2
-                            desc_dq.atomic_add([(off_bh + curr_m + dq_m_offset).to(tl.int32), slice_id * slice_size],
-                                               dq)
+                            desc_dq.atomic_add([(off_bh + curr_m + dq_m_offset).to(tl.int32), slice_id * DQ_STORE_NCOL],
+                                               dq_slices[slice_id])
                     else:
                         for slice_id in tl.static_range(DQ_REDUCE_ITERS):
                             dq_smem_idx = slice_id % DQ_REDUCE_STAGES
