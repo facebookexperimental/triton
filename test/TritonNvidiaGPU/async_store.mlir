@@ -1,5 +1,5 @@
 // RUN: triton-opt --split-input-file %s | FileCheck %s
-// RUN: triton-opt --split-input-file --allocate-shared-memory-nv --convert-triton-gpu-to-llvm=compute-capability=90 --convert-nv-gpu-to-llvm %s | FileCheck %s --check-prefix=CHECK-LLVM
+// RUN: triton-opt --split-input-file --allocate-shared-memory-nv --tritongpu-allocate-warp-groups --convert-triton-gpu-to-llvm=compute-capability=90 --convert-nv-gpu-to-llvm %s | FileCheck %s --check-prefix=CHECK-LLVM
 // RUN: triton-opt --split-input-file --triton-nvidia-gpu-plan-cta --mlir-print-local-scope %s | FileCheck %s --check-prefix=CHECK-CTA
 
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
