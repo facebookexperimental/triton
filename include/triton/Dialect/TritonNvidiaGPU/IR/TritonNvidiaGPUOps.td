@@ -613,6 +613,10 @@ def TTNG_AsyncTMAReduceOp : TTNG_Op<"async_tma_reduce", [MemoryEffects<[MemRead<
     asynchronously, and atomically performs the specified reduction kind.
     Atomicity is at the granularity of individual elements, and only relaxed
     semantics are implied.
+
+    When the optional token result is present, the token can be passed to
+    `async_tma_store_token_wait` to wait for this specific TMA reduce to
+    finish reading from shared memory.
   }];
 
   let arguments = (ins
@@ -623,10 +627,25 @@ def TTNG_AsyncTMAReduceOp : TTNG_Op<"async_tma_reduce", [MemoryEffects<[MemRead<
     DefaultValuedAttr<TT_EvictionPolicyAttr, "triton::EvictionPolicy::NORMAL">:$evict
   );
 
+  let results = (outs Optional<TTG_AsyncToken>:$token);
+
+  let builders = [
+    OpBuilder<(ins "triton::DescriptorReduceKind":$kind, "Value":$desc,
+               "ValueRange":$coord, "Value":$src,
+               "triton::EvictionPolicy":$evict), [{
+      build($_builder, $_state, Type(), kind, desc, coord, src, evict);
+    }]>,
+    OpBuilder<(ins "triton::DescriptorReduceKind":$kind, "Value":$desc,
+               "ValueRange":$coord, "Value":$src), [{
+      build($_builder, $_state, Type(), kind, desc, coord, src,
+            triton::EvictionPolicy::NORMAL);
+    }]>
+  ];
+
   let assemblyFormat = [{
     $kind `,` $desc `[` $coord `]` $src
     oilist(`evictionPolicy` `=` $evict)
-    attr-dict `:` qualified(type($desc)) `,` qualified(type($src))
+    attr-dict `:` qualified(type($desc)) `,` qualified(type($src)) (`->` type($token)^)?
   }];
   let hasVerifier = 1;
 }

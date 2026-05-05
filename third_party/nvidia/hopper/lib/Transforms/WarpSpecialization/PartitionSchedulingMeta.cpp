@@ -2563,6 +2563,23 @@ void PartitionSchedulingMeta::runOnOperation() {
       currentPhase = "propagate";
       propagatePartitions(loop, schedule, result->createComputePartitions);
 
+      // Assign partition to TMAStoreTokenWaitOp ops that have no partition.
+      // These arise from early TMA reduce lowering: the wait's token comes
+      // from AsyncTMAReduceOp which was categorized as TMAReduction, but
+      // the wait itself wasn't categorized or propagated. Copy the partition
+      // from the token's defining op.
+      loop.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
+        if (hasPartition(waitOp))
+          return;
+        Value token = waitOp.getToken();
+        if (auto *defOp = token.getDefiningOp()) {
+          if (hasPartition(defOp)) {
+            auto ids = getPartitionIds(defOp);
+            setPartition(waitOp, ids);
+          }
+        }
+      });
+
       currentPhase = "optimize";
       optimizeSchedule(loop, schedule);
 

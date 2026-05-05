@@ -76,6 +76,44 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
 
     storeOp.erase();
   }
+
+  // Also lower DescriptorReduceOp → local_alloc + AsyncTMAReduceOp (with token)
+  // + TMAStoreTokenWaitOp, matching the early TMA store pattern.
+  SmallVector<tt::DescriptorReduceOp> reduceOps;
+  funcOp.walk([&](tt::DescriptorReduceOp op) { reduceOps.push_back(op); });
+
+  if (!reduceOps.empty())
+    LDBG("Lowering " << reduceOps.size() << " DescriptorReduceOp(s)");
+
+  for (auto reduceOp : reduceOps) {
+    auto loc = reduceOp.getLoc();
+    OpBuilderWithAsyncTaskIds builder(reduceOp);
+    builder.setInsertionPoint(reduceOp);
+
+    auto src = reduceOp.getSrc();
+    auto desc = reduceOp.getDesc();
+    auto tensorType = src.getType();
+
+    auto encoding = ttng::getEncodingFromDescriptor(reduceOp, tensorType, desc);
+    ttg::MemDescType memDescType = ttg::MemDescType::get(
+        tensorType.getShape(), tensorType.getElementType(), encoding,
+        sharedMemorySpace, /*mutableMemory=*/true);
+
+    auto alloc = builder.create<ttg::LocalAllocOp>(loc, memDescType, src);
+
+    auto tokenType = ttg::AsyncTokenType::get(ctx);
+    auto tmaReduce = builder.create<ttng::AsyncTMAReduceOp>(
+        loc, tokenType, reduceOp.getKind(), desc, reduceOp.getIndices(), alloc,
+        tt::EvictionPolicy::NORMAL);
+    copyLoopScheduleAttrs(reduceOp, tmaReduce);
+
+    auto waitOp = builder.create<ttng::TMAStoreTokenWaitOp>(
+        loc, tmaReduce.getToken(), ValueRange{}, ValueRange{}, ValueRange{},
+        ValueRange{});
+    copyLoopScheduleAttrs(reduceOp, waitOp);
+
+    reduceOp.erase();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -104,15 +142,25 @@ struct NVGPUWSTMAStoreLoweringPass
 static constexpr const char *kCanRotateByBufferCount =
     "can_rotate_by_buffer_count";
 
-// Trace the token back to the defining AsyncTMACopyLocalToGlobalOp, handling
-// both direct definitions and loop-carried block arguments.
-static ttng::AsyncTMACopyLocalToGlobalOp
-getDefiningTMAStore(ttng::TMAStoreTokenWaitOp waitOp) {
+// Trace the token back to the defining TMA store-like op
+// (AsyncTMACopyLocalToGlobalOp or AsyncTMAReduceOp), handling both direct
+// definitions and loop-carried block arguments. Returns the SMEM source
+// buffer and the defining op.
+static Operation *getDefiningTMAStoreOp(ttng::TMAStoreTokenWaitOp waitOp,
+                                        Value &buffer) {
   Value token = waitOp.getToken();
 
   // Direct case: token defined by AsyncTMACopyLocalToGlobalOp.
-  if (auto defOp = token.getDefiningOp<ttng::AsyncTMACopyLocalToGlobalOp>())
+  if (auto defOp = token.getDefiningOp<ttng::AsyncTMACopyLocalToGlobalOp>()) {
+    buffer = defOp.getSrc();
     return defOp;
+  }
+
+  // Direct case: token defined by AsyncTMAReduceOp.
+  if (auto defOp = token.getDefiningOp<ttng::AsyncTMAReduceOp>()) {
+    buffer = defOp.getSrc();
+    return defOp;
+  }
 
   // Loop-carried case: token is a block argument of an scf.for body.
   if (auto blockArg = dyn_cast<BlockArgument>(token)) {
@@ -122,10 +170,26 @@ getDefiningTMAStore(ttng::TMAStoreTokenWaitOp waitOp) {
     unsigned iterArgIdx = blockArg.getArgNumber() - 1;
     auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
     Value yieldedVal = yieldOp.getOperand(iterArgIdx);
-    return yieldedVal.getDefiningOp<ttng::AsyncTMACopyLocalToGlobalOp>();
+    if (auto defOp =
+            yieldedVal.getDefiningOp<ttng::AsyncTMACopyLocalToGlobalOp>()) {
+      buffer = defOp.getSrc();
+      return defOp;
+    }
+    if (auto defOp = yieldedVal.getDefiningOp<ttng::AsyncTMAReduceOp>()) {
+      buffer = defOp.getSrc();
+      return defOp;
+    }
   }
 
   return nullptr;
+}
+
+// Legacy wrapper for callers that only need AsyncTMACopyLocalToGlobalOp.
+static ttng::AsyncTMACopyLocalToGlobalOp
+getDefiningTMAStore(ttng::TMAStoreTokenWaitOp waitOp) {
+  Value buffer;
+  auto *op = getDefiningTMAStoreOp(waitOp, buffer);
+  return dyn_cast_or_null<ttng::AsyncTMACopyLocalToGlobalOp>(op);
 }
 
 void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp) {
@@ -134,22 +198,17 @@ void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp) {
   // those nested inside SubtiledRegionOp regions.
   funcOp.walk([&](scf::ForOp forOp) {
     forOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
-      auto tmaStore = getDefiningTMAStore(waitOp);
-      if (!tmaStore)
+      Value buffer;
+      auto *tmaOp = getDefiningTMAStoreOp(waitOp, buffer);
+      if (!tmaOp)
         return;
 
-      Value buffer = tmaStore.getSrc();
       auto allocOp = buffer.getDefiningOp<ttg::LocalAllocOp>();
       if (!allocOp)
         return;
 
-      // Only annotate buffers that were hoisted to function scope by
-      // doBufferAllocation. Buffers still inside a loop (e.g. from early
-      // TMA store lowering) were not planned by the memory planner and
-      // cannot safely be rotated.
-      if (allocOp->getParentOfType<scf::ForOp>())
-        return;
-
+      // Only annotate buffers that have buffer.copy from the memory planner.
+      // Buffers without buffer.copy were not planned and cannot be rotated.
       auto bufferCopy = allocOp->getAttrOfType<IntegerAttr>("buffer.copy");
       if (!bufferCopy)
         return;
@@ -183,13 +242,13 @@ void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp) {
       if (!waitOp->hasAttr(kCanRotateByBufferCount))
         return;
 
-      auto tmaStore = getDefiningTMAStore(waitOp);
-      if (!tmaStore) {
+      Value buffer;
+      auto *tmaOp = getDefiningTMAStoreOp(waitOp, buffer);
+      if (!tmaOp) {
         waitOp->removeAttr(kCanRotateByBufferCount);
         return;
       }
 
-      Value buffer = tmaStore.getSrc();
       auto allocOp = buffer.getDefiningOp<ttg::LocalAllocOp>();
       if (!allocOp) {
         waitOp->removeAttr(kCanRotateByBufferCount);
@@ -279,7 +338,8 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
         Operation *op = *it;
         int stageAtOp = it.currStage();
         ++it;
-        if (auto copyOp = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(op)) {
+        if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
+                op)) {
           ++copyCount;
           if (copyCount == k) {
             insertionTarget = op;
@@ -338,11 +398,12 @@ struct NVGPUTestTMAStoreTokenWaitReorderPass
 #define GEN_PASS_DEF_NVGPUTMASTORETOKENWAITLOWERING
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
 
-// Count AsyncTMACopyLocalToGlobalOp ops in [from, to) within a block.
+// Count TMA store-like ops (AsyncTMACopyLocalToGlobalOp and AsyncTMAReduceOp)
+// in [from, to) within a block.
 static int countTMAStoresInRange(Block::iterator from, Block::iterator to) {
   int count = 0;
   for (auto it = from; it != to; ++it) {
-    if (isa<ttng::AsyncTMACopyLocalToGlobalOp>(&*it))
+    if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(&*it))
       ++count;
   }
   return count;
@@ -354,11 +415,13 @@ static int countTMAStoresInRange(Block::iterator from, Block::iterator to) {
 static int computePendings(ttng::TMAStoreTokenWaitOp waitOp) {
   Value token = waitOp.getToken();
 
-  // Direct case: token defined by AsyncTMACopyLocalToGlobalOp in same block.
-  if (auto defOp = token.getDefiningOp<ttng::AsyncTMACopyLocalToGlobalOp>()) {
-    if (defOp->getBlock() == waitOp->getBlock()) {
-      // Count TMA stores strictly between def and wait.
-      return countTMAStoresInRange(std::next(defOp->getIterator()),
+  // Direct case: token defined by a TMA store-like op in same block.
+  auto directDef = token.getDefiningOp();
+  if (directDef &&
+      isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
+          directDef)) {
+    if (directDef->getBlock() == waitOp->getBlock()) {
+      return countTMAStoresInRange(std::next(directDef->getIterator()),
                                    waitOp->getIterator());
     }
     return 0;
@@ -370,17 +433,16 @@ static int computePendings(ttng::TMAStoreTokenWaitOp waitOp) {
     if (!forOp)
       return 0;
 
-    // Block args for scf.for body are [iv, iter_arg0, iter_arg1, ...].
-    // The iter_arg index is blockArg.getArgNumber() - 1 (subtract the IV).
     unsigned iterArgIdx = blockArg.getArgNumber() - 1;
-
-    // Find the corresponding yield operand.
     auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
     Value yieldedVal = yieldOp.getOperand(iterArgIdx);
 
-    // Trace the yielded value to its defining AsyncTMACopyLocalToGlobalOp.
-    auto defOp = yieldedVal.getDefiningOp<ttng::AsyncTMACopyLocalToGlobalOp>();
-    if (!defOp || defOp->getBlock() != forOp.getBody())
+    // Trace the yielded value to its defining TMA store-like op.
+    auto defOp = yieldedVal.getDefiningOp();
+    if (!defOp ||
+        !isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
+            defOp) ||
+        defOp->getBlock() != forOp.getBody())
       return 0;
 
     Block *body = forOp.getBody();
