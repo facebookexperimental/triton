@@ -18,7 +18,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %buf_a = ttg.memdesc_index %alloc_a[%c0] : !ttg.memdesc<1x128x32xf16, #shared_a, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared_a, #smem, mutable>
     %buf_b = ttg.memdesc_index %alloc_b[%c0] : !ttg.memdesc<1x128x32xf16, #shared_b, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared_b, #smem, mutable>
     %tok_a = amdg.async_tdm_copy_global_to_local %desc[%m, %k] into %buf_a, pred = %p : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #shared_a, #smem, mutable>
-    // expected-error @+1 {{TDM copies using the same descriptor require conflicting destination layouts}}
+    // expected-error @+1 {{TDM ops using the same descriptor require conflicting memdesc layouts}}
     %tok_b = amdg.async_tdm_copy_global_to_local %desc[%m, %k] into %buf_b, pred = %p : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #shared_b, #smem, mutable>
     tt.return
   }

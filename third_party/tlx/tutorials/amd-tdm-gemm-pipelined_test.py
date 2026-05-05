@@ -7,17 +7,26 @@ API on a pipelined matmul:
 - ``tl.make_tensor_descriptor`` + ``tlx.async_amd_descriptor_load`` to
   issue an async copy from global memory directly into a user-provided
   LDS buffer.
+- ``tlx.amd_descriptor_prefetch`` for a look-ahead L2 prefetch hint,
+  with an ``i1`` pred to gate against the trailing tail.
+- ``tlx.async_amd_descriptor_store`` to copy the accumulator tile back
+  to global memory via TDM (mirrors ``async_amd_descriptor_load``; no
+  token, count-based wait only because the store op produces no SSA
+  result).
 - ``tlx.async_amd_descriptor_wait(N)`` to drain the ``tensorcnt``
   hardware counter until at most ``N`` outstanding TDM ops remain.
+  Counts both load and store directions.
 - ``tlx.local_alloc`` *without* an explicit ``layout=``: the
   ``tlx-insert-require-layout`` + ``tlx-propagate-layout`` passes
-  rewrite the alloc's encoding from the descriptor automatically, and
-  pick the WMMA-tuned padded layout when the buffer feeds ``tl.dot``.
+  rewrite the alloc's encoding from the descriptor automatically.
+  A/B allocs get the WMMA-tuned padded layout (they feed ``tl.dot``),
+  while the C alloc gets the descriptor-shape default (the TDM store
+  hardware verifier requires ``padInterval == innermost block dim``).
 
 The kernel implements ``C = A @ B`` with a two-buffer software pipeline:
 prefetch tile k+1 while consuming tile k. Each iteration issues two TDM
-copies (A-tile and B-tile) and waits until at most two ops are
-outstanding (the just-issued pair).
+copies (A-tile and B-tile), a pair of L2 prefetches for tile k+2, and
+waits until at most two TDM ops are outstanding.
 """
 import pytest
 import torch
@@ -69,28 +78,52 @@ def matmul_tdm_pipelined_kernel(
         strides=[N, tl.constexpr(1)],
         block_shape=[BLOCK_K, BLOCK_N],
     )
+    c_desc = tl.make_tensor_descriptor(
+        c_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
 
     NUM_BUFFERS: tl.constexpr = 2
     a_buf = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), NUM_BUFFERS)
     b_buf = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(b_ptr), NUM_BUFFERS)
+    # One-shot C buffer: filled from the accumulator and TDM-stored to
+    # global. Default layout — propagation picks the descriptor-shape
+    # default (`[32:+8]` for fp16) which is what the TDM store verifier
+    # requires.
+    c_buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tlx.dtype_of(c_ptr), 1)
 
     K_ITERS = tl.cdiv(K, BLOCK_K)
     off_m = pid_m * BLOCK_M
     off_n = pid_n * BLOCK_N
 
-    # Prologue: kick off the first tile's loads (stage 0, slot 0).
+    # Prologue: kick off the first tile's loads (stage 0, slot 0) and
+    # prefetch tile 1 into L2 while tile 0 is in flight. The pred
+    # guards the K==BLOCK_K case where the prefetched offset would be
+    # out of bounds (hardware drops the prefetch silently anyway, but
+    # being explicit avoids relying on that fallback).
     tlx.async_amd_descriptor_load(a_desc, tlx.local_view(a_buf, 0), [off_m, 0])
     tlx.async_amd_descriptor_load(b_desc, tlx.local_view(b_buf, 0), [0, off_n])
+    prefetch_pred = BLOCK_K < K
+    tlx.amd_descriptor_prefetch(a_desc, [off_m, BLOCK_K], pred=prefetch_pred)
+    tlx.amd_descriptor_prefetch(b_desc, [BLOCK_K, off_n], pred=prefetch_pred)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # Steady state: at iter k, prefetch tile k+1 into the other slot,
-    # wait for tile k, consume it.
+    # Steady state: at iter k, issue loads for tile k+1, prefetch tile
+    # k+2 into L2, wait for tile k, consume it.
     for k in tl.range(0, K_ITERS - 1):
         next_k = k + 1
         next_slot = next_k % NUM_BUFFERS
         tlx.async_amd_descriptor_load(a_desc, tlx.local_view(a_buf, next_slot), [off_m, next_k * BLOCK_K])
         tlx.async_amd_descriptor_load(b_desc, tlx.local_view(b_buf, next_slot), [next_k * BLOCK_K, off_n])
+
+        # Look-ahead prefetch for tile k+2 (in bounds when k+2 < K_ITERS).
+        prefetch_k = next_k + 1
+        prefetch_pred = prefetch_k < K_ITERS
+        tlx.amd_descriptor_prefetch(a_desc, [off_m, prefetch_k * BLOCK_K], pred=prefetch_pred)
+        tlx.amd_descriptor_prefetch(b_desc, [prefetch_k * BLOCK_K, off_n], pred=prefetch_pred)
 
         # Drain everything older than the just-issued pair.
         tlx.async_amd_descriptor_wait(2)
@@ -107,12 +140,14 @@ def matmul_tdm_pipelined_kernel(
     b_reg = tlx.local_load(tlx.local_view(b_buf, last_slot))
     acc = tl.dot(a_reg, b_reg, acc)
 
+    # TDM-store the result tile: dot output -> LDS via local_store,
+    # then LDS -> global via async_amd_descriptor_store. The wait drains
+    # the outstanding store before the kernel exits.
     c = acc.to(tlx.dtype_of(c_ptr))
-    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    c_ptrs = c_ptr + N * offs_cm[:, None] + offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
+    c_view = tlx.local_view(c_buf, 0)
+    tlx.local_store(c_view, c)
+    tlx.async_amd_descriptor_store(c_desc, c_view, [off_m, off_n])
+    tlx.async_amd_descriptor_wait(0)
 
 
 def matmul_tdm_pipelined(a: torch.Tensor, b: torch.Tensor, BLOCK_M: int = 128, BLOCK_N: int = 128,
@@ -163,12 +198,25 @@ def test_matmul_tdm_pipelined_compiles_gfx1250():
 
     ttgir = compiled.asm["ttgir"]
     assert "amdg.async_tdm_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir, ("expected TDM store of C in TTGIR, got:\n" + ttgir)
+    assert "amdg.tdm_prefetch" in ttgir, ("expected TDM prefetch in TTGIR, got:\n" + ttgir)
     assert ("amdg.async_tdm_wait" in ttgir) or ("amdg.async_tdm_intrinsic_wait" in ttgir)
-    # Auto-propagation should pick up the WMMA-tuned padded encoding.
-    assert "ttg.padded_shared" in ttgir, "expected propagated padded encoding, got:\n" + ttgir
+    # Auto-propagation gives:
+    #   A: [128, 32] fp16 opIdx=0 -> WMMA-tuned `[128:+8]`
+    #   B: [32, 128] fp16 opIdx=1 transposed -> WMMA-tuned `[128:+16]`
+    #   C: [128, 128] fp16 -> default `[128:+8]` (innermost = 128)
+    # So three distinct encoding strings should be present.
+    assert "ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}" in ttgir, (
+        "expected WMMA-tuned encoding for A, got:\n" + ttgir)
+    assert "ttg.padded_shared<[128:+16] {order = [1, 0], shape = [32, 128]}" in ttgir, (
+        "expected WMMA-tuned encoding for B, got:\n" + ttgir)
+    assert "ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 128]}" in ttgir, (
+        "expected default encoding for C, got:\n" + ttgir)
 
     amdgcn = compiled.asm["amdgcn"]
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
+    assert "tensor_store_from_lds" in amdgcn or "tensor.store.from.lds" in amdgcn, (
+        "expected tensor_store_from_lds intrinsic in AMDGCN, got:\n" + amdgcn)
 
 
 @pytest.mark.skipif(not is_gfx1250_available(), reason="Requires gfx1250 hardware")

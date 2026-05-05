@@ -960,3 +960,193 @@ def test_local_alloc_padded_layout_compiles_gfx1250(device):
     ttgir = compiled.asm["ttgir"]
     assert "ttg.padded_shared" in ttgir
     assert "32:+4" in ttgir
+
+
+# ----------------------------------------------------------------------------
+# gfx1250 AMD descriptor store tests
+# ----------------------------------------------------------------------------
+
+
+@triton.jit
+def _async_amd_desc_store_kernel(
+    a_ptr,
+    output_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Round-trip: AMD-desc-load A into LDS, AMD-desc-store LDS to output. Tests
+    both directions of TDM end-to-end with default `local_alloc` (auto-propagation
+    handles the padded encoding)."""
+    a_desc = tl.make_tensor_descriptor(
+        a_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        output_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+    smem = tlx.local_view(buf, 0)
+
+    tlx.async_amd_descriptor_load(a_desc, smem, [0, 0])
+    tlx.async_amd_descriptor_wait(0)
+    tlx.async_amd_descriptor_store(out_desc, smem, [0, 0])
+    tlx.async_amd_descriptor_wait(0)
+
+
+def test_async_amd_desc_store_compiles_gfx1250(device):
+    """tlx.async_amd_descriptor_store should compile to amdg.async_tdm_copy_local_to_global."""
+    compiled = compile_for_gfx1250(
+        _async_amd_desc_store_kernel,
+        signature={"a_ptr": "*fp16", "output_ptr": "*fp16", "M": "i32", "N": "i32"},
+        constexprs={"BLOCK_M": 16, "BLOCK_N": 32},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir, (
+        "expected amdg.async_tdm_copy_local_to_global in TTGIR, got:\n" + ttgir)
+    # Auto-propagated padded encoding should reach the alloc; the store
+    # uses the default `[32:+8]` per the hardware verifier.
+    assert "ttg.padded_shared<[32:+8]" in ttgir, (
+        "expected propagated default `[32:+8]` padded encoding in TTGIR, got:\n" + ttgir)
+
+    amdgcn = compiled.asm["amdgcn"]
+    assert len(amdgcn) > 0
+    assert "tensor_store_from_lds" in amdgcn or "tensor.store.from.lds" in amdgcn, (
+        "expected tensor_store_from_lds intrinsic in AMDGCN, got:\n" + amdgcn)
+
+
+def test_async_amd_desc_store_correctness_gfx1250(device, fresh_triton_cache):
+    """End-to-end: TDM load + TDM store round-trips A -> output on gfx1250 hw."""
+    if not is_gfx1250_available():
+        pytest.skip("Requires gfx1250 hardware")
+    M, N = 16, 32
+    a = torch.randn(M, N, dtype=torch.float16, device=device)
+    output = torch.empty_like(a)
+    _async_amd_desc_store_kernel[(1, )](a, output, M=M, N=N, BLOCK_M=M, BLOCK_N=N)
+    torch.testing.assert_close(output, a)
+
+
+def test_async_descriptor_store_rejected_on_amd():
+    """The NV-only `tlx.async_descriptor_store` should raise on AMD targets."""
+
+    @triton.jit
+    def _kernel(a_ptr, M: tl.constexpr, N: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+        desc = tl.make_tensor_descriptor(
+            a_ptr,
+            shape=[M, N],
+            strides=[N, tl.constexpr(1)],
+            block_shape=[BLOCK_M, BLOCK_N],
+        )
+        buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+        smem = tlx.local_view(buf, 0)
+        tlx.async_descriptor_store(desc, smem, [0, 0])
+
+    with pytest.raises(triton.compiler.errors.CompilationError) as exc_info:
+        compile_for_gfx1250(
+            _kernel,
+            signature={"a_ptr": "*fp16", "M": "i32", "N": "i32"},
+            constexprs={"BLOCK_M": 16, "BLOCK_N": 32},
+        )
+    assert "NV-only" in str(exc_info.value) or "async_amd_descriptor_store" in str(exc_info.value)
+
+
+# ----------------------------------------------------------------------------
+# gfx1250 AMD descriptor prefetch tests
+# ----------------------------------------------------------------------------
+
+
+@triton.jit
+def _amd_desc_prefetch_kernel(
+    a_ptr,
+    output_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Issue an AMD descriptor prefetch hint, then a TDM load + store of the same tile."""
+    a_desc = tl.make_tensor_descriptor(
+        a_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        output_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    tlx.amd_descriptor_prefetch(a_desc, [0, 0])
+
+    buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+    smem = tlx.local_view(buf, 0)
+    tlx.async_amd_descriptor_load(a_desc, smem, [0, 0])
+    tlx.async_amd_descriptor_wait(0)
+    tlx.async_amd_descriptor_store(out_desc, smem, [0, 0])
+    tlx.async_amd_descriptor_wait(0)
+
+
+def test_amd_desc_prefetch_compiles_gfx1250(device):
+    """tlx.amd_descriptor_prefetch should compile to amdg.tdm_prefetch and not to a TDM copy."""
+    compiled = compile_for_gfx1250(
+        _amd_desc_prefetch_kernel,
+        signature={"a_ptr": "*fp16", "output_ptr": "*fp16", "M": "i32", "N": "i32"},
+        constexprs={"BLOCK_M": 16, "BLOCK_N": 32},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.tdm_prefetch" in ttgir, ("expected amdg.tdm_prefetch in TTGIR, got:\n" + ttgir)
+    # Sanity: the prefetch is a hint and shares the descriptor with the
+    # corresponding load, so descriptor encoding alignment still produces
+    # a single padded encoding for the load destination.
+    assert "ttg.padded_shared<[32:+8]" in ttgir
+
+
+def test_amd_desc_prefetch_speculative_compiles_gfx1250(device):
+    """amd_descriptor_prefetch with speculative=True should still compile."""
+
+    @triton.jit
+    def _spec_kernel(a_ptr, M: tl.constexpr, N: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+        desc = tl.make_tensor_descriptor(
+            a_ptr,
+            shape=[M, N],
+            strides=[N, tl.constexpr(1)],
+            block_shape=[BLOCK_M, BLOCK_N],
+        )
+        tlx.amd_descriptor_prefetch(desc, [0, 0], speculative=True)
+
+    compiled = compile_for_gfx1250(
+        _spec_kernel,
+        signature={"a_ptr": "*fp16", "M": "i32", "N": "i32"},
+        constexprs={"BLOCK_M": 16, "BLOCK_N": 32},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "speculative = true" in ttgir, ("expected speculative = true on tdm_prefetch, got:\n" + ttgir)
+
+
+def test_async_descriptor_prefetch_tensor_rejected_on_amd():
+    """The NV-only `tlx.async_descriptor_prefetch_tensor` should raise on AMD targets."""
+
+    @triton.jit
+    def _kernel(a_ptr, M: tl.constexpr, N: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+        desc = tl.make_tensor_descriptor(
+            a_ptr,
+            shape=[M, N],
+            strides=[N, tl.constexpr(1)],
+            block_shape=[BLOCK_M, BLOCK_N],
+        )
+        tlx.async_descriptor_prefetch_tensor(desc, [0, 0])
+
+    with pytest.raises(triton.compiler.errors.CompilationError) as exc_info:
+        compile_for_gfx1250(
+            _kernel,
+            signature={"a_ptr": "*fp16", "M": "i32", "N": "i32"},
+            constexprs={"BLOCK_M": 16, "BLOCK_N": 32},
+        )
+    assert "NV-only" in str(exc_info.value) or "amd_descriptor_prefetch" in str(exc_info.value)

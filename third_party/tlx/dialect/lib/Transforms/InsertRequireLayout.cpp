@@ -280,18 +280,21 @@ static Value findMemDescRoot(Value memdesc) {
   return root;
 }
 
-// True if any sibling-subview user of the memdesc value's source alloc
-// is a TDM copy op. Used by the dot-path walk to hand off TDM-fed
+// True if any sibling-subview user of the memdesc value's source alloc is
+// a TDM op (load or store). Used by the dot-path walk to hand off TDM-fed
 // buffers to the TDM anchor — both walks targeting the same alloc with
-// different encodings would otherwise conflict in the propagation
-// lattice.
+// different encodings would otherwise conflict in the propagation lattice.
+// Stores are included so a store-anchored alloc isn't also targeted by the
+// dot-path walk; the store's hardware verifier requires the default
+// padded-shared encoding, which the dot-path swizzled anchor would clobber.
 static bool isFedByTDM(Value memdesc) {
   llvm::SetVector<Value> worklist;
   worklist.insert(findMemDescRoot(memdesc));
   while (!worklist.empty()) {
     Value v = worklist.pop_back_val();
     for (Operation *u : v.getUsers()) {
-      if (isa<amdgpu::AsyncTDMCopyGlobalToLocalOp>(u))
+      if (isa<amdgpu::AsyncTDMCopyGlobalToLocalOp,
+              amdgpu::AsyncTDMCopyLocalToGlobalOp>(u))
         return true;
       if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp>(u))
         worklist.insert(u->getResult(0));
@@ -560,54 +563,67 @@ static std::optional<DotConsumerInfo> findDotConsumer(Value buffer,
   return state.getInfo();
 }
 
-static void anchorTDMRequireLayout(amdgpu::AsyncTDMCopyGlobalToLocalOp tdmOp,
-                                   OpBuilder &builder, DataFlowSolver &solver) {
-  Value buf = tdmOp.getResult();
-
-  if (buf.getDefiningOp<tlx::RequireLayoutOp>())
-    return;
-
-  auto bufType = dyn_cast<ttg::MemDescType>(buf.getType());
-  if (!bufType)
-    return;
-
-  auto descTy = cast<tt::TensorDescType>(tdmOp.getDesc().getType());
+// Pick a descriptor-compatible encoding for `buf`. For TDM loads, prefer
+// the WMMA-tuned `composePaddedLayout` when the buffer feeds a `tt.dot`
+// (correct for both the TDM op and the local_load -> tt.dot lowering).
+// For TDM stores, the hardware verifier requires
+// `padInterval == innermost block dim`, ruling out the WMMA-tuned form
+// (which sets `padInterval = max(innerDim, bankWrapInterval)`); always
+// fall back to the descriptor-shape-only default.
+//
+// Using a dot-tuned encoding for loads is safe because the AMD
+// `OptimizeDescriptorEncoding` pass walks TDM ops and propagates this
+// encoding back to the descriptor's `TensorDescType`, so the hardware
+// (which reads stride from the descriptor) and the alloc (which uses this
+// encoding to size the LDS region) agree by construction.
+static Attribute chooseTDMBufEncoding(Operation *tdmOp, Value buf,
+                                      ttg::MemDescType bufType,
+                                      tt::TensorDescType descTy,
+                                      bool allowDotAware,
+                                      DataFlowSolver &solver) {
   ArrayRef<int64_t> shape = descTy.getBlockType().getShape();
   Type elementType = descTy.getBlockType().getElementType();
-
-  // Row-major identity order matches what `getFallbackSharedEncoding`
-  // would pick for a TLX descriptor with no upstream layout.
   unsigned rank = shape.size();
   SmallVector<unsigned> order(rank);
   for (unsigned i = 0; i < rank; ++i)
     order[i] = rank - 1 - i;
-
   auto cgaLayout = ttg::CGAEncodingAttr::get1CTALayout(buf.getContext(), rank);
 
-  // Prefer the WMMA-tuned padded encoding when the buffer feeds a
-  // `tt.dot`: `composePaddedLayout` picks intervals/paddings to avoid bank
-  // conflicts on the `local_load -> tt.dot` lowering. Fall back to the
-  // descriptor-shape-only default for non-dot consumers.
-  //
-  // Using a dot-tuned encoding here is safe because the AMD
-  // `OptimizeDescriptorEncoding` pass walks TDM copies and propagates this
-  // encoding back to the descriptor's `TensorDescType`, so the hardware
-  // (which reads stride from the descriptor) and the alloc (which uses
-  // this encoding to size the LDS region) agree by construction.
   Attribute encoding;
-  if (auto info = findDotConsumer(buf, solver)) {
-    auto archStr = getAMDArch(tdmOp->getParentOfType<ModuleOp>());
-    auto targetInfo = tt::AMD::TargetInfo(archStr.value_or("").str());
-    // Use bufType (MemDescType) instead of the descriptor's block type:
-    // bufType carries the alloc's CGA layout, while the descriptor type
-    // is still un-encoded at this point (OptimizeDescriptorEncoding runs
-    // later and is what propagates the encoding back to the descriptor).
-    encoding = composePaddedLayout(targetInfo, info->opIdx, info->kWidth,
-                                   cast<ttg::TensorOrMemDesc>(bufType), order);
+  if (allowDotAware) {
+    if (auto info = findDotConsumer(buf, solver)) {
+      auto archStr = getAMDArch(tdmOp->getParentOfType<ModuleOp>());
+      auto targetInfo = tt::AMD::TargetInfo(archStr.value_or("").str());
+      // bufType (MemDescType) carries the alloc's CGA layout; the descriptor
+      // type is still un-encoded at this point.
+      encoding =
+          composePaddedLayout(targetInfo, info->opIdx, info->kWidth,
+                              cast<ttg::TensorOrMemDesc>(bufType), order);
+    }
   }
   if (!encoding)
     encoding = buildDefaultTDMDescriptorEncoding(buf.getContext(), shape, order,
                                                  cgaLayout, elementType);
+  return encoding;
+}
+
+// Insert `tlx.require_layout` between `buf` and `tdmOp`'s memdesc operand,
+// rewriting it to a descriptor-compatible padded encoding. Idempotent: if
+// the buffer is already produced by a `require_layout`, leave it alone.
+template <typename TDMOp>
+static void anchorTDMRequireLayout(TDMOp tdmOp, Value buf,
+                                   MutableOperandRange operandToRewire,
+                                   bool allowDotAware, OpBuilder &builder,
+                                   DataFlowSolver &solver) {
+  if (buf.getDefiningOp<tlx::RequireLayoutOp>())
+    return;
+  auto bufType = dyn_cast<ttg::MemDescType>(buf.getType());
+  if (!bufType)
+    return;
+  auto descTy = cast<tt::TensorDescType>(tdmOp.getDesc().getType());
+
+  Attribute encoding =
+      chooseTDMBufEncoding(tdmOp, buf, bufType, descTy, allowDotAware, solver);
   if (!encoding)
     return;
 
@@ -617,13 +633,18 @@ static void anchorTDMRequireLayout(amdgpu::AsyncTDMCopyGlobalToLocalOp tdmOp,
       bufType.getMemorySpace(), bufType.getMutableMemory());
   auto requireOp =
       tlx::RequireLayoutOp::create(builder, tdmOp.getLoc(), newType, buf);
-  tdmOp.getResultMutable().assign(requireOp.getResult());
+  operandToRewire.assign(requireOp.getResult());
 }
 
 static void materializeTDMConstraints(ModuleOp m, OpBuilder &builder,
                                       DataFlowSolver &solver) {
-  m.walk([&](amdgpu::AsyncTDMCopyGlobalToLocalOp tdmOp) {
-    anchorTDMRequireLayout(tdmOp, builder, solver);
+  m.walk([&](Operation *op) {
+    if (auto load = dyn_cast<amdgpu::AsyncTDMCopyGlobalToLocalOp>(op))
+      anchorTDMRequireLayout(load, load.getResult(), load.getResultMutable(),
+                             /*allowDotAware=*/true, builder, solver);
+    else if (auto store = dyn_cast<amdgpu::AsyncTDMCopyLocalToGlobalOp>(op))
+      anchorTDMRequireLayout(store, store.getSrc(), store.getSrcMutable(),
+                             /*allowDotAware=*/false, builder, solver);
   });
 }
 

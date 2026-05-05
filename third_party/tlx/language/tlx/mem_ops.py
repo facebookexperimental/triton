@@ -975,6 +975,108 @@ def async_amd_descriptor_load(
 
 
 @tl.builtin
+def async_amd_descriptor_store(
+    desc: tl.tensor_descriptor_base,
+    source: tlx.buffered_tensor,
+    offsets: list[tl.tensor],
+    _semantic=None,
+) -> None:
+    """Asynchronous descriptor store from a local buffer to global (AMD).
+
+    Lowers to ``amdgpu.async_tdm_copy_local_to_global``; synchronize with
+    :func:`async_amd_descriptor_wait`.
+
+    Asymmetry vs :func:`async_amd_descriptor_load`: the AMD store op has
+    no ``pred`` operand (TDM hardware doesn't gate stores) and produces
+    no SSA result, so there's no token to thread into
+    :func:`async_amd_descriptor_wait`. Wait by count only —
+    ``async_amd_descriptor_wait`` already counts outstanding stores
+    alongside loads/gathers/scatters.
+
+    The source memdesc encoding determines the LDS read stride; if you
+    allocate ``source`` via :func:`local_alloc` without an explicit
+    ``layout=``, ``TLXInsertRequireLayout`` rewrites it to a descriptor-
+    compatible padded encoding automatically (same auto-propagation
+    behavior as :func:`async_amd_descriptor_load`). Note: the AMD TDM
+    store hardware requires ``padInterval == innermost block dim``, so
+    unlike loads, the store path always uses the descriptor-shape
+    default encoding even when a ``tt.dot`` consumer is present
+    elsewhere on the same buffer.
+
+    Available only on AMD TDM-capable targets (gfx1250+).
+    """
+    assert isinstance(desc, tl.tensor_descriptor_base)
+    arch = _semantic.builder.options.arch
+    assert is_amd_tdm_target(arch), (
+        f"async_amd_descriptor_store is only available on AMD TDM-capable targets, got arch={arch}")
+    ndim = len(desc.block_shape)
+    assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
+
+    # Auto-propagated layouts (no `layout=` passed to local_alloc) are
+    # silently rewritten to the descriptor-compatible encoding by
+    # TLXInsertRequireLayout; warn only when the user supplied an
+    # incompatible layout explicitly.
+    layout = source.type.layout
+    if not getattr(layout, "_tlx_default", False):
+        expected_layout = _amd_tdm_descriptor_layout(desc)
+        if not _layouts_match(layout, expected_layout):
+            warnings.warn(
+                "tlx.async_amd_descriptor_store source layout may be incompatible with AMD descriptor layout; "
+                f"expected {expected_layout}, got {layout}. Omit `layout=` from `tlx.local_alloc` "
+                "to let TLXInsertRequireLayout auto-propagate a descriptor-compatible encoding.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+    offsets_handles = _semantic._convert_to_ir_values(offsets, require_i64=False)
+    _semantic.builder.create_async_tdm_copy_local_to_global(
+        desc.handle,
+        offsets_handles,
+        source.handle,
+        None,
+    )
+
+
+@tl.builtin
+def amd_descriptor_prefetch(
+    desc: tl.tensor_descriptor_base,
+    offsets: list[tl.tensor],
+    pred: tl.tensor = None,
+    speculative: bool = False,
+    _semantic=None,
+) -> None:
+    """L2 prefetch hint for an AMD descriptor tile.
+
+    Lowers to ``amdgpu.tdm_prefetch``. Unlike
+    :func:`async_amd_descriptor_load`, this is a fire-and-forget hint: it
+    doesn't touch LDS, isn't counted by :func:`async_amd_descriptor_wait`,
+    and returns no token. ``speculative=True`` allows the hardware to drop
+    the prefetch when the address translation isn't already cached at CU
+    level — slightly cheaper to encode but best-effort.
+
+    Available only on AMD TDM-capable targets (gfx1250+).
+    """
+    assert isinstance(desc, tl.tensor_descriptor_base)
+    arch = _semantic.builder.options.arch
+    assert is_amd_tdm_target(arch), (
+        f"amd_descriptor_prefetch is only available on AMD TDM-capable targets, got arch={arch}")
+    speculative = tl._unwrap_if_constexpr(speculative)
+    ndim = len(desc.block_shape)
+    assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
+    offsets_handles = _semantic._convert_to_ir_values(offsets, require_i64=False)
+    if pred is None:
+        pred_handle = _semantic.builder.get_int1(True)
+    else:
+        pred_handle = pred.handle
+    _semantic.builder.create_tdm_prefetch(
+        desc.handle,
+        offsets_handles,
+        pred_handle,
+        bool(speculative),
+    )
+
+
+@tl.builtin
 def async_amd_descriptor_wait(
     pendings: tl.constexpr = 0,
     tokens: Optional[list[tlx.async_token]] = None,
@@ -1011,8 +1113,17 @@ def async_descriptor_prefetch_tensor(
 ) -> None:
     """
     Hint the hardware to prefetch a tensor tile from global memory into L2 cache using TMA.
+
+    NV-only. AMD users should call :func:`amd_descriptor_prefetch`
+    instead — the AMD path is a fire-and-forget L2 hint with a
+    ``speculative`` flag and no ``eviction_policy``.
     """
     assert isinstance(desc, tl.tensor_descriptor_base)
+    arch = _semantic.builder.options.arch
+    if isinstance(arch, str) and arch.startswith("gfx"):
+        raise NotImplementedError(f"tlx.async_descriptor_prefetch_tensor is NV-only; got AMD arch '{arch}'. "
+                                  "Use tlx.amd_descriptor_prefetch on TDM-capable AMD targets (gfx1250+); "
+                                  "non-TDM AMD targets do not have a descriptor-based prefetch.")
     assert eviction_policy in ("", "evict_first", "evict_last"), \
         f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'"
     ndim = len(desc.block_shape)
@@ -1043,6 +1154,12 @@ def async_descriptor_store(
     """
     Asynchronously store data from shared memory to global memory using TMA.
 
+    NV-only. AMD users should call :func:`async_amd_descriptor_store`
+    instead — the AMD path has counter-based completion, no
+    ``eviction_policy``, no atomic ``store_reduce``, and the buffer
+    encoding is determined by the descriptor (rather than forced to
+    NV-MMA shared).
+
     Args:
         desc: Tensor descriptor for the destination
         source: Source buffer in shared memory
@@ -1051,6 +1168,11 @@ def async_descriptor_store(
         store_reduce: Atomic reduction kind ("", "add", "min", "max", "and", "or", "xor")
     """
     assert isinstance(desc, tl.tensor_descriptor_base)
+    arch = _semantic.builder.options.arch
+    if isinstance(arch, str) and arch.startswith("gfx"):
+        raise NotImplementedError(f"tlx.async_descriptor_store is NV-only; got AMD arch '{arch}'. "
+                                  "Use tlx.async_amd_descriptor_store on TDM-capable AMD targets (gfx1250+); "
+                                  "non-TDM AMD targets do not have a descriptor-based async store.")
     eviction_policy = tl._unwrap_if_constexpr(eviction_policy)
     store_reduce = tl._unwrap_if_constexpr(store_reduce)
     assert eviction_policy in ("", "evict_first", "evict_last"), (
