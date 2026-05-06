@@ -59,8 +59,8 @@ def gemm_wp_v7(
 
     # Wait for buffer 0
     tlx.async_load_wait_group((NUM_BUFFERS - 1) * 2)
-    a_tile = tlx.local_load(tlx.local_view(smemA, 0), relaxed=True)
-    b_tile = tlx.local_load(tlx.local_view(smemB, 0), relaxed=True)
+    a_tile = tlx.local_load(tlx.local_view(smemA, 0))
+    b_tile = tlx.local_load(tlx.local_view(smemB, 0))
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
@@ -85,16 +85,16 @@ def gemm_wp_v7(
             tok_b = tlx.async_load(b_ptr + b_offs, tlx.local_view(smemB, prefetch_buf),
                                    mask=offs_k[:, None] < K - k_prefetch)
             tlx.async_load_commit_group([tok_b])
-            a_tile = tlx.local_load(tlx.local_view(smemA, next_buf), relaxed=True)
-            b_tile = tlx.local_load(tlx.local_view(smemB, next_buf), relaxed=True)
+            a_tile = tlx.local_load(tlx.local_view(smemA, next_buf))
+            b_tile = tlx.local_load(tlx.local_view(smemB, next_buf))
 
     # Epilogue
     acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
     tlx.async_load_wait_group(0)
     for i in tl.range(0, NUM_BUFFERS - 1, loop_unroll_factor=NUM_BUFFERS - 1):
         buf = (K_ITERS - (NUM_BUFFERS - 1) + i) % NUM_BUFFERS
-        a_tile = tlx.local_load(tlx.local_view(smemA, buf), relaxed=True)
-        b_tile = tlx.local_load(tlx.local_view(smemB, buf), relaxed=True)
+        a_tile = tlx.local_load(tlx.local_view(smemA, buf))
+        b_tile = tlx.local_load(tlx.local_view(smemB, buf))
         acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
 
     c = acc.to(tlx.dtype_of(c_ptr))
