@@ -4643,6 +4643,79 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
 
   injectChannelGraphOnTokenOps(funcOp, orderedChannels);
 
+  // Step 8.5: Insert cross-partition sync barriers for TMA staging SMEM reuse.
+  // When a TMA staging buffer (epilogue dK/dV store) reuses an inner-loop
+  // channel's SMEM (V/dO), the staging writer must wait for the channel's last
+  // consumer to finish reading before overwriting the shared SMEM.
+  {
+    // Build a map from buffer.id → channel for looking up inner-loop channels.
+    DenseMap<unsigned, Channel *> bufferIdToChannel;
+    for (auto *ch : orderedChannels) {
+      auto *allocOp = ch->getAllocOp();
+      if (!allocOp)
+        continue;
+      if (auto attr = allocOp->getAttrOfType<IntegerAttr>("buffer.id"))
+        bufferIdToChannel[attr.getInt()] = ch;
+    }
+
+    // Walk all local_alloc ops to find TMA staging buffers with reuse targets.
+    funcOp.walk([&](ttg::LocalAllocOp allocOp) {
+      auto reuseAttr =
+          allocOp->getAttrOfType<IntegerAttr>("allocation.reuseTarget");
+      auto stagingAttr =
+          allocOp->getAttrOfType<IntegerAttr>("buffer.tmaStaging");
+      if (!reuseAttr || !stagingAttr)
+        return;
+      unsigned targetBufferId = reuseAttr.getInt();
+      auto targetIt = bufferIdToChannel.find(targetBufferId);
+      if (targetIt == bufferIdToChannel.end()) {
+        LDBG("TMA staging reuse barrier: target buffer.id="
+             << targetBufferId << " — channel not found, skipping");
+        return;
+      }
+      Channel *targetChannel = targetIt->second;
+      auto targetTokenIt = tokenMap.find(targetChannel);
+      if (targetTokenIt == tokenMap.end() ||
+          targetTokenIt->second.tokens.empty())
+        return;
+
+      // Find the first local_store into this staging buffer — that's the
+      // epilogue producer we need to guard.
+      Operation *firstStore = nullptr;
+      for (auto *user : allocOp->getUsers()) {
+        if (isa<ttg::LocalStoreOp>(user)) {
+          if (!firstStore || user->isBeforeInBlock(firstStore))
+            firstStore = user;
+        }
+      }
+      if (!firstStore)
+        return;
+
+      // Insert ProducerAcquireOp before the first store, waiting on the
+      // target channel's consumer_release barrier.
+      OpBuilderWithAsyncTaskIds builder(firstStore);
+      builder.setInsertionPoint(firstStore);
+      auto asyncTaskIds = getAsyncTaskIds(firstStore);
+      builder.setAsynTaskIdsFromArray(asyncTaskIds);
+
+      for (const auto &[taskId, tokenValue] :
+           targetTokenIt->second.tokens) {
+        Value bufIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+            firstStore->getLoc(), 0, 32);
+        Value phase = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+            firstStore->getLoc(), 0, 1);
+        auto acquireOp =
+            builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+                firstStore->getLoc(), tokenValue, bufIdx, phase);
+        acquireOp->emitRemark()
+            << "TMA staging reuse barrier: staging buffer waits on "
+            << "target buffer.id=" << targetBufferId << " consumer release";
+        LDBG("Inserted TMA staging reuse ProducerAcquireOp for staging → "
+             << "target " << targetBufferId);
+      }
+    });
+  }
+
   // Prune any unnecessary barriers related to tgen05.commit
   fuseTcgen05CommitBarriers(funcOp);
   LLVM_DEBUG({

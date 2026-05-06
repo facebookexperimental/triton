@@ -1912,6 +1912,8 @@ static unsigned allocateSmemBuffers(
     if (!buf.isAllocated) {
       buf.allocOp->setAttr("allocation.shareGroup",
                            IntegerAttr::get(i32Type, buf.bufferId));
+      buf.allocOp->setAttr("allocation.reuseTarget",
+                           IntegerAttr::get(i32Type, buf.reuseTargetBufferId));
       // Find the target buffer's name for the remark.
       std::string targetName;
       for (auto &other : wsBuffers) {

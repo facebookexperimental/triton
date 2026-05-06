@@ -27,10 +27,10 @@
 // CHECK: %m = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 14 : i32}
 
 // dV staging: reuses V (allocation.shareGroup = 20, different from dK)
-// CHECK: ttg.local_alloc {allocation.shareGroup = 20 : i32, buffer.copy = 2 : i32, buffer.id = 20 : i32, buffer.tmaStaging = 1 : i32}
+// CHECK: ttg.local_alloc {allocation.reuseTarget = 3 : i32, allocation.shareGroup = 20 : i32, buffer.copy = 2 : i32, buffer.id = 20 : i32, buffer.tmaStaging = 1 : i32}
 
 // dK staging: reuses dO, NOT V (allocation.shareGroup = 22)
-// CHECK: ttg.local_alloc {allocation.shareGroup = 22 : i32, buffer.copy = 2 : i32, buffer.id = 22 : i32, buffer.tmaStaging = 1 : i32}
+// CHECK: ttg.local_alloc {allocation.reuseTarget = 4 : i32, allocation.shareGroup = 22 : i32, buffer.copy = 2 : i32, buffer.id = 22 : i32, buffer.tmaStaging = 1 : i32}
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
