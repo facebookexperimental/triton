@@ -505,7 +505,6 @@ def test_tutorial09_matmul_tma_warp_specialize(
     # Use scope() to set use_meta_ws and automatically restore on exit
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
-        triton.knobs.nvidia.use_meta_partition = True
 
         dtype = torch.float16
         GROUP_SIZE_M = 8
@@ -656,7 +655,6 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     # Use scope() to set use_meta_ws and automatically restore on exit
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
-        triton.knobs.nvidia.use_meta_partition = True
 
         dtype = torch.float16
         GROUP_SIZE_M = 8
@@ -801,7 +799,6 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     # Use scope() to set use_meta_ws and automatically restore on exit
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
-        triton.knobs.nvidia.use_meta_partition = True
 
         dtype = torch.float16
         GROUP_SIZE_M = 8
@@ -886,7 +883,6 @@ def test_tutorial09_multi_epilogue_subtile():
 
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
-        triton.knobs.nvidia.use_meta_partition = True
 
         dtype = torch.float16
         GROUP_SIZE_M = 8
@@ -958,10 +954,13 @@ def test_tutorial09_multi_epilogue_subtile():
 # Config matrix is intentionally narrow: one (BM, BN, BK) tile, FLATTEN=True,
 # fixed num_stages/num_warps — vary only the Split-K-relevant axes.
 # ============================================================================
-@pytest.mark.parametrize("M, N, K", [
-    (256, 256, 32768),
-    (256, 256, 65536),
-])
+@pytest.mark.parametrize(
+    "M, N, K",
+    [
+        (256, 256, 32768),
+        (256, 256, 65536),
+    ],
+)
 @pytest.mark.parametrize("SPLIT_K", [2, 4, 8])
 @pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
@@ -989,7 +988,6 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize_splitk(
 
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
-        triton.knobs.nvidia.use_meta_partition = True
 
         dtype = torch.float16
         NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
@@ -1117,7 +1115,6 @@ def test_hopper_matmul_tma_warp_specialize(
 
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
-        triton.knobs.nvidia.use_meta_partition = True
 
         dtype = torch.float16
         GROUP_SIZE_M = 8
@@ -1233,7 +1230,6 @@ def test_hopper_matmul_tma_persistent_warp_specialize(
 
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
-        triton.knobs.nvidia.use_meta_partition = True
 
         dtype = torch.float16
         GROUP_SIZE_M = 8
@@ -1362,7 +1358,6 @@ def test_hopper_matmul_descriptor_persistent_warp_specialize(
 
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
-        triton.knobs.nvidia.use_meta_partition = True
 
         dtype = torch.float16
         GROUP_SIZE_M = 8

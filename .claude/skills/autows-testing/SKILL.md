@@ -32,7 +32,7 @@ TRITON_ALWAYS_COMPILE=1 pytest python/tutorials/fused-attention-ws-device-tma.py
 TRITON_ALWAYS_COMPILE=1 python python/tutorials/test_tlx_bwd_from_fused_attention.py
 
 # FA autoWS Hopper tutorial kernel
-TRITON_USE_META_PARTITION=1 TRITON_ALWAYS_COMPILE=1 TRITON_USE_META_WS=1 pytest python/tutorials/fused-attention-ws-device-tma-hopper.py
+TRITON_ALWAYS_COMPILE=1 TRITON_USE_META_WS=1 pytest python/tutorials/fused-attention-ws-device-tma-hopper.py
 ```
 
 ## LIT tests

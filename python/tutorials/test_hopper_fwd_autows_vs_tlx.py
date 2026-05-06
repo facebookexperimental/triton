@@ -6,8 +6,8 @@ Runs:
   2. Performance benchmark (autoWS SWP on/off vs all 4 TLX variants)
 
 Usage:
-  TRITON_USE_META_PARTITION=1 TRITON_USE_META_WS=1 python test_hopper_fwd_autows_vs_tlx.py
-  TRITON_USE_META_PARTITION=1 TRITON_USE_META_WS=1 python test_hopper_fwd_autows_vs_tlx.py --bench
+  TRITON_USE_META_WS=1 python test_hopper_fwd_autows_vs_tlx.py
+  TRITON_USE_META_WS=1 python test_hopper_fwd_autows_vs_tlx.py --bench
 """
 
 import os
