@@ -1093,14 +1093,6 @@ class CodeGenerator(ast.NodeVisitor):
         if isinstance(context, ast.Call):
             withitemClass = self.visit(context.func)
             handler = WITH_DISPATCH.get(withitemClass)
-            if handler is None:
-                try:
-                    from triton.experimental.gluon.language.amd import warp_pipeline_stage as _gluon_wps
-                    from triton.language.extra.tlx.compiler.code_generator import visit_withWarpPipelineStage
-                    WITH_DISPATCH[_gluon_wps] = visit_withWarpPipelineStage
-                    handler = WITH_DISPATCH.get(withitemClass)
-                except ImportError:
-                    pass
             if handler:
                 return handler(self, node)
         return self.visit_compound_statement(node.body)
