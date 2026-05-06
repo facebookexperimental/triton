@@ -422,7 +422,7 @@ private:
                                   /*relaxed*/ false);
     ttng::ClusterWaitOp::create(builder, lastBarInitOp.getLoc());
 
-    // For TLX paired MMA, insert a cluster sync right before the first
+    // For TLX paired MMA, insert a relaxed cluster sync right before the first
     // tmem_alloc so that both CTAs are synchronized before allocating tmem.
     // lowerWarpSpecialize inserts a matching arrive on the non-default side.
     if (tlx::tlxEnablePairedMMA(mod)) {
@@ -438,7 +438,7 @@ private:
         if (!prev || !isa<ttng::ClusterWaitOp>(prev)) {
           OpBuilder tmemBuilder(firstTMemAlloc);
           ttng::ClusterArriveOp::create(tmemBuilder, firstTMemAlloc.getLoc(),
-                                        /*relaxed*/ false);
+                                        /*relaxed*/ true);
           ttng::ClusterWaitOp::create(tmemBuilder, firstTMemAlloc.getLoc());
         }
       }
