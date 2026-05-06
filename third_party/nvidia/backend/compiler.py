@@ -729,9 +729,7 @@ class CUDABackend(BaseBackend):
         # Budget-aware layout conversion elimination — runs last to ensure
         # converts whose scratch would exceed SMEM budget are eliminated
         # after all other passes that may introduce layout conversions.
-        # TODO(njriasan): Re-enable once propagateSrcEncodingAndErase handles
-        # scf::ForOp/WhileOp loop-carried values correctly.
-        passes.ttgpuir.add_remove_layout_conversions(pm, 0)
+        passes.ttgpuir.add_remove_layout_conversions(pm, smem_budget)
 
         pm.run(mod, 'make_ttgir')
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
