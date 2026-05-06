@@ -238,8 +238,6 @@ public:
       mod->setAttr(AttrHasExplicitLocalMemAccessName, b.getBoolAttr(true));
     if (hasWarpSpecOps)
       mod->setAttr(AttrHasWarpSpecOpsName, b.getBoolAttr(true));
-    if (hasWarpPipelineOps)
-      mod->setAttr(AttrHasWarpPipelineOpsName, b.getBoolAttr(true));
     if (hasTLXTwoCTAs) {
       mod->setAttr(AttrTLXEnablePairedCTAMMAName, b.getBoolAttr(true));
     }
