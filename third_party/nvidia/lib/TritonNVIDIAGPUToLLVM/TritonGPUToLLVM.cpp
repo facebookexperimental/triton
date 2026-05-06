@@ -413,12 +413,36 @@ private:
     // need to insert fence to make mbar init visible to cluster
     ttng::FenceMBarrierInitReleaseClusterOp::create(builder,
                                                     lastBarInitOp.getLoc());
+    ttng::FenceAsyncSharedOp::create(builder, lastBarInitOp.getLoc(),
+                                      /*bCluster=*/true);
     // need to insert cluster arrive and wait to prevent CTA_X from arriving
     // CTA_Y's bar before CTA_Y inits it, as shown in ptx doc examples:
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-test-wait-try-wait
     ttng::ClusterArriveOp::create(builder, lastBarInitOp.getLoc(),
                                   /*relaxed*/ false);
     ttng::ClusterWaitOp::create(builder, lastBarInitOp.getLoc());
+
+    // For TLX paired MMA, insert a cluster sync right before the first
+    // tmem_alloc so that both CTAs are synchronized before allocating tmem.
+    // lowerWarpSpecialize inserts a matching arrive on the non-default side.
+    if (tlx::tlxEnablePairedMMA(mod)) {
+      ttng::TMEMAllocOp firstTMemAlloc;
+      mod.walk([&](ttng::TMEMAllocOp op) {
+        firstTMemAlloc = op;
+        return WalkResult::interrupt();
+      });
+      if (firstTMemAlloc) {
+        // Skip if the barrier init cluster sync is already right before
+        // the tmem_alloc (they share the same sync).
+        Operation *prev = firstTMemAlloc->getPrevNode();
+        if (!prev || !isa<ttng::ClusterWaitOp>(prev)) {
+          OpBuilder tmemBuilder(firstTMemAlloc);
+          ttng::ClusterArriveOp::create(tmemBuilder, firstTMemAlloc.getLoc(),
+                                        /*relaxed*/ false);
+          ttng::ClusterWaitOp::create(tmemBuilder, firstTMemAlloc.getLoc());
+        }
+      }
+    }
 
     return success();
   }

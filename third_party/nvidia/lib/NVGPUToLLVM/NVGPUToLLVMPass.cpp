@@ -585,7 +585,8 @@ void freeTMAlloc(LLVM::LLVMFuncOp func, Value alloc, size_t size, Value pred,
   });
 }
 
-static Value initTensorMemory(LLVM::LLVMFuncOp func) {
+static Value initTensorMemory(LLVM::LLVMFuncOp func,
+                              Operation *insertionPoint) {
   auto mod = func->getParentOfType<ModuleOp>();
   assert(mod->hasAttr("ttg.tensor_memory_size"));
   size_t size = cast<IntegerAttr>(mod->getAttr("ttg.tensor_memory_size"))
@@ -594,9 +595,18 @@ static Value initTensorMemory(LLVM::LLVMFuncOp func) {
   if (size == 0)
     return Value();
   IRRewriter rewriter(func.getContext());
-  rewriter.setInsertionPointToStart(&func.front());
   auto ctx = mod.getContext();
   auto loc = func.getLoc();
+
+  bool isTlxPairedMMA = tlx::tlxEnablePairedMMA(mod);
+  bool useTwoCTAs =
+      mlir::triton::nvidia_gpu::getModuleTwoCTAs(mod) || isTlxPairedMMA;
+
+  if (insertionPoint)
+    rewriter.setInsertionPoint(insertionPoint);
+  else
+    rewriter.setInsertionPointToStart(&func.front());
+
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   // A proper error will be raised by the frontend, but to allow compilation to
   // continue we emit a trap.
@@ -605,9 +615,6 @@ static Value initTensorMemory(LLVM::LLVMFuncOp func) {
     return LLVM::UndefOp::create(rewriter, loc, ptr_ty(ctx, 6));
   }
 
-  bool isTlxPairedMMA = tlx::tlxEnablePairedMMA(mod);
-  bool useTwoCTAs =
-      mlir::triton::nvidia_gpu::getModuleTwoCTAs(mod) || isTlxPairedMMA;
   // This code is only executed by the default warp group.
   Value threadId = NVVM::ThreadIdXOp::create(rewriter, loc, i32_ty);
   Value pred = b.icmp_ult(threadId, b.i32_val(32));
@@ -633,7 +640,20 @@ static void lowerTensorMemoryAlloc(ModuleOp mod) {
     return;
   // TODO: Handle cases of matmul used in noinline functions.
   assert(triton::isKernel(kernel));
-  Value newBase = initTensorMemory(kernel);
+  // For TLX paired MMA, insert tcgen05.alloc at the position of the first
+  // TensorMemoryBaseAddress in the entry block. A placeholder base op is
+  // created during TMEMAllocOp lowering to mark the original tmem_alloc
+  // position, ensuring the insertion point is on the trunk path.
+  Operation *insertionPoint = nullptr;
+  if (tlx::tlxEnablePairedMMA(kernel->getParentOfType<ModuleOp>())) {
+    for (auto &op : kernel.front()) {
+      if (isa<ttn::TensorMemoryBaseAddress>(&op)) {
+        insertionPoint = &op;
+        break;
+      }
+    }
+  }
+  Value newBase = initTensorMemory(kernel, insertionPoint);
   if (!newBase)
     return;
   for (auto baseOp : baseOps) {
