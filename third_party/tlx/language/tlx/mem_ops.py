@@ -917,31 +917,6 @@ def _layouts_match(actual, expected):
 
 
 @tl.builtin
-def descriptor_compatible_layout(desc, _semantic=None):
-    """Return a shared layout matching the AMD TDM descriptor's expected encoding.
-
-    Use this in place of hardcoding ``with_identity_for([(N, M)], ...)``:
-
-    .. code-block:: python
-
-        desc = tl.make_tensor_descriptor(...)
-        layout: tl.constexpr = tlx.descriptor_compatible_layout(desc)
-        buf = tlx.local_alloc(..., layout=layout)
-        tlx.async_tdm_load(desc, smem, [...])
-
-    Equivalent to the layout that ``AMDGPUAssignDescriptorMemoryLayouts``
-    would assign to a TDM descriptor of the same shape and element type.
-    Available only on AMD TDM-capable targets (gfx1250+).
-    """
-    arch = _semantic.builder.options.arch
-    assert is_amd_tdm_target(arch), (
-        f"descriptor_compatible_layout is only available on AMD TDM-capable targets, got arch={arch}")
-    assert isinstance(desc, tl.tensor_descriptor_base), \
-        f"descriptor_compatible_layout expects a tensor_descriptor, got {type(desc).__name__}"
-    return _amd_tdm_descriptor_layout(desc)
-
-
-@tl.builtin
 def async_tdm_load(
     desc: tl.tensor_descriptor_base,
     result: tlx.buffered_tensor,
@@ -977,8 +952,8 @@ def async_tdm_load(
         if not _layouts_match(layout, expected_layout):
             warnings.warn(
                 "tlx.async_tdm_load destination layout may be incompatible with AMD descriptor layout; "
-                f"expected {expected_layout}, got {layout}. Pass `layout=tlx.descriptor_compatible_layout(desc)` "
-                "(or omit `layout=` entirely to use auto-propagation).",
+                f"expected {expected_layout}, got {layout}. Omit `layout=` from `tlx.local_alloc` "
+                "to let TLXInsertRequireLayout auto-propagate a descriptor-compatible encoding.",
                 UserWarning,
                 stacklevel=2,
             )
