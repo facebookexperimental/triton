@@ -638,8 +638,9 @@ LogicalResult convertScaledDot(const LLVMTypeConverter &typeConverter,
 
   DotConversion dot;
 
-  dot.shape.M = op.getBlockM();
-  dot.shape.N = op.getBlockN();
+  SmallVector<int64_t> dstPerCTA = triton::gpu::getShapePerCTA(dTensorTy);
+  dot.shape.M = dstPerCTA[0];
+  dot.shape.N = dstPerCTA[1];
   dot.shape.K = op.getBlockK();
   dot.mmaSizeK = !opKindIsMXFP4 ? 32 : 64;
 

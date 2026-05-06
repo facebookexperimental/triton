@@ -1346,7 +1346,6 @@ class _attention_opt(torch.autograd.Function):
             extra_kern_args["maxnreg"] = 128
         with triton.knobs.nvidia.scope():
             triton.knobs.nvidia.use_meta_ws = True
-            triton.knobs.nvidia.use_meta_partition = True
             if persistent:
                 _attn_fwd_persist[grid_persist](
                     sm_scale,
@@ -1516,7 +1515,6 @@ class _attention_opt(torch.autograd.Function):
 
         with triton.knobs.nvidia.scope():
             triton.knobs.nvidia.use_meta_ws = True
-            triton.knobs.nvidia.use_meta_partition = True
             if ctx.persistent:
                 _attn_bwd_persist[grid_persist_bwd](
                     desc_q,

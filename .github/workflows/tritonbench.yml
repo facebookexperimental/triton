@@ -8,7 +8,7 @@ on:
 jobs:
   h100-tritonbench-test:
     if: github.repository_owner == 'facebookexperimental'
-    runs-on: [linux.gcp.h100]
+    runs-on: linux-gcp-h100
     env:
       CONDA_ENV: meta-triton
       SETUP_SCRIPT: /workspace/setup_instance.sh
