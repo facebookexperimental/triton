@@ -295,23 +295,23 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
     partitionNumWarps.back() = 8;
   }
 
-  // Read the attribute from the module
   ModuleOp mod = axisInfo.getModuleOp();
-  int minRegAutoWS = 24; // default value
-  if (auto attr = mod->getAttrOfType<IntegerAttr>(AttrMinRegAutoWSName)) {
-    minRegAutoWS = attr.getInt();
-  }
-  int maxRegAutoWS = 88; // default value (used to be 168)
-  if (auto attr = mod->getAttrOfType<IntegerAttr>(AttrMaxRegAutoWSName)) {
-    maxRegAutoWS = attr.getInt();
-  }
+  auto minRegAttr = mod->getAttrOfType<IntegerAttr>(AttrMinRegAutoWSName);
+  auto maxRegAttr = mod->getAttrOfType<IntegerAttr>(AttrMaxRegAutoWSName);
+  bool hasMax = !!maxRegAttr;
+  int minRegAutoWS = minRegAttr ? minRegAttr.getInt() : 24;
+  int maxRegAutoWS = hasMax ? maxRegAttr.getInt() : -1;
 
   SmallVector<int32_t> estRegUsage(partitionNumWarps.size());
   for (auto [partition, newNumWarps, prevNumWarps, tensorRegs, estRegs] :
        llvm::zip(wsOp.getPartitionRegions(), partitionNumWarps,
                  wsOp.getPartitionNumWarps(), maxTensorRegs, estRegUsage)) {
-    // "Guess" the register usage for each partition.
-    estRegs = tensorRegs ? maxRegAutoWS : minRegAutoWS;
+    // When both min and max are provided, use the current heuristic.
+    // When only min is provided (the default), tensor partitions get -1
+    // (sentinel for "split leftover evenly") while non-tensor partitions
+    // get the fixed minRegAutoWS allocation.
+    estRegs = hasMax ? (tensorRegs ? maxRegAutoWS : minRegAutoWS)
+                     : (tensorRegs ? -1 : minRegAutoWS);
 
     // Layouts need to be reassigned if the number of warps changed and there
     // are tensor computations.
