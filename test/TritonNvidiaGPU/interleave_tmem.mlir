@@ -351,6 +351,49 @@ tt.func @tmem_load_sinks_after_barrier_reorder(
   tt.return
 }
 
+// Ordered WSBarrier metadata lets a tmem_load inherit constraints and sink past
+// an overlapping wait when the wait's region is earlier than the arrive's
+// region in the same parent.
+// CHECK-LABEL: @tmem_load_sinks_with_ordered_regions
+tt.func @tmem_load_sinks_with_ordered_regions(
+    %bar1: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %bar2: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %phase: i32) {
+  %alloc = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  // CHECK: ttng.tmem_alloc
+  // CHECK-NEXT: tmem_load
+  // CHECK-NEXT: ttng.arrive_barrier
+  // CHECK-SAME: minRegionId = 3 : i32
+  // CHECK-NEXT: ttng.wait_barrier
+  // CHECK-SAME: minRegionId = 1 : i32
+  // CHECK-NEXT: "user"
+  %0 = ttng.tmem_load %alloc : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear128>
+  ttng.arrive_barrier %bar1, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 1>, maxRegionId = 3 : i32, minRegionId = 3 : i32, parentId = 0 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.wait_barrier %bar2, %phase {constraints = {WSBarrier = {channelGraph = array<i32: 1>, maxRegionId = 1 : i32, minRegionId = 1 : i32, parentId = 0 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  "user"(%0) : (tensor<128x128xf32, #linear128>) -> ()
+  tt.return
+}
+
+// Ordered WSBarrier metadata does not let a tmem_load sink past an overlapping
+// wait when the wait's region is not before the arrive's region.
+// CHECK-LABEL: @tmem_load_does_not_sink_with_later_wait_region
+tt.func @tmem_load_does_not_sink_with_later_wait_region(
+    %bar1: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %bar2: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %phase: i32) {
+  %alloc = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  // CHECK: ttng.tmem_load
+  // CHECK-NEXT: ttng.arrive_barrier
+  // CHECK-SAME: minRegionId = 1 : i32
+  // CHECK-NEXT: ttng.wait_barrier
+  // CHECK-SAME: minRegionId = 3 : i32
+  %0 = ttng.tmem_load %alloc : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear128>
+  ttng.arrive_barrier %bar1, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 1>, maxRegionId = 1 : i32, minRegionId = 1 : i32, parentId = 0 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.wait_barrier %bar2, %phase {constraints = {WSBarrier = {channelGraph = array<i32: 1>, maxRegionId = 3 : i32, minRegionId = 3 : i32, parentId = 0 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  "user"(%0) : (tensor<128x128xf32, #linear128>) -> ()
+  tt.return
+}
+
 // All split tmem_loads should inherit the channelGraph from their arrive
 // barrier and sink past store-channel barriers independently.
 // CHECK-LABEL: @split_tmem_loads_all_sink

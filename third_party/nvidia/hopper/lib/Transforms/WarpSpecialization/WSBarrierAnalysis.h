@@ -2,11 +2,15 @@
 #define NV_DIALECT_HOPPER_TRANSFORMS_WSBARRIERANALYSIS_H_
 
 #include "CodePartitionUtility.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include <functional>
+#include <optional>
 
 namespace mlir {
 
@@ -33,6 +37,16 @@ struct WSBarrierAttr {
   // buildChannelGraph() + injectChannelGraph().
   DenseI32ArrayAttr channelGraph;
 
+  // V2 ordered-region metadata. These fields are optional and only used to
+  // relax overlapping channelGraph checks when both barriers came from the same
+  // parent region and the wait is known to be earlier than the arrive.
+  // TODO: Refine parent/region construction to match the region-based design
+  // doc exactly; the initial implementation only provides the metadata shape
+  // and a conservative same-parent ordering hook.
+  IntegerAttr parentId;
+  IntegerAttr minRegionId;
+  IntegerAttr maxRegionId;
+
   // Build a constraints DictionaryAttr from the populated fields. Null fields
   // are omitted from the nested WSBarrier dictionary.
   DictionaryAttr build(MLIRContext *ctx) const {
@@ -41,6 +55,12 @@ struct WSBarrierAttr {
       entries.emplace_back(StringAttr::get(ctx, "channelGraph"), channelGraph);
     if (dstTask)
       entries.emplace_back(StringAttr::get(ctx, "dstTask"), dstTask);
+    if (parentId)
+      entries.emplace_back(StringAttr::get(ctx, "parentId"), parentId);
+    if (minRegionId)
+      entries.emplace_back(StringAttr::get(ctx, "minRegionId"), minRegionId);
+    if (maxRegionId)
+      entries.emplace_back(StringAttr::get(ctx, "maxRegionId"), maxRegionId);
     if (entries.empty())
       return {};
     auto wsBarrier = DictionaryAttr::get(ctx, entries);
@@ -59,6 +79,9 @@ struct WSBarrierAttr {
       return attr;
     attr.dstTask = wsBarrier.getAs<IntegerAttr>("dstTask");
     attr.channelGraph = wsBarrier.getAs<DenseI32ArrayAttr>("channelGraph");
+    attr.parentId = wsBarrier.getAs<IntegerAttr>("parentId");
+    attr.minRegionId = wsBarrier.getAs<IntegerAttr>("minRegionId");
+    attr.maxRegionId = wsBarrier.getAs<IntegerAttr>("maxRegionId");
     return attr;
   }
 
@@ -68,6 +91,11 @@ struct WSBarrierAttr {
     attr.dstTask = IntegerAttr::get(IntegerType::get(ctx, 32), taskId);
     return attr;
   }
+};
+
+struct WSBarrierRegionInfo {
+  int parentId = -1;
+  int regionId = -1;
 };
 
 // Build the WS barrier channel graph for all channels.
@@ -124,11 +152,19 @@ buildChannelGraph(ArrayRef<Channel *> channels) {
 }
 
 // Inject the channelGraph into a WSBarrierAttr stored in a constraints dict.
-static inline DictionaryAttr injectChannelGraph(MLIRContext *ctx,
-                                                DictionaryAttr existing,
-                                                ArrayRef<int> graphTaskIds) {
+static inline DictionaryAttr
+injectChannelGraph(MLIRContext *ctx, DictionaryAttr existing,
+                   ArrayRef<int> graphTaskIds,
+                   std::optional<int> parentId = std::nullopt,
+                   std::optional<int> regionId = std::nullopt) {
   auto attr = WSBarrierAttr::parse(existing);
   attr.channelGraph = DenseI32ArrayAttr::get(ctx, graphTaskIds);
+  if (parentId)
+    attr.parentId = IntegerAttr::get(IntegerType::get(ctx, 32), *parentId);
+  if (regionId) {
+    attr.minRegionId = IntegerAttr::get(IntegerType::get(ctx, 32), *regionId);
+    attr.maxRegionId = IntegerAttr::get(IntegerType::get(ctx, 32), *regionId);
+  }
   auto updated = attr.build(ctx);
   if (!existing)
     return updated;
@@ -148,6 +184,70 @@ static inline DictionaryAttr injectChannelGraph(MLIRContext *ctx,
     merged.emplace_back(StringAttr::get(ctx, WSBarrierAttr::kKey),
                         updated.getAs<DictionaryAttr>(WSBarrierAttr::kKey));
   return DictionaryAttr::get(ctx, merged);
+}
+
+static inline bool isWSBarrierBackwardToken(Operation *op) {
+  return isa<triton::nvws::ProducerAcquireOp, triton::nvws::ConsumerReleaseOp>(
+      op);
+}
+
+static inline bool isWSBarrierForwardToken(Operation *op) {
+  return isa<triton::nvws::ProducerCommitOp, triton::nvws::ConsumerWaitOp>(op);
+}
+
+// Initial ordered-region ID assignment for token ops. Blocks are treated as
+// parents, and control-flow ops split their parent block into ordered regions.
+// Ops nested under scf.if fall back to V1 by receiving invalid region IDs.
+// TODO: Replace this with parent-op based region construction from the design.
+static inline DenseMap<Operation *, WSBarrierRegionInfo>
+buildWSBarrierRegionInfo(Operation *scope) {
+  struct BaseInfo {
+    int parentId = -1;
+    int baseRegion = -1;
+    bool invalid = false;
+  };
+
+  DenseMap<Operation *, BaseInfo> baseInfo;
+  DenseMap<int, int> regionCount;
+  int nextParentId = 0;
+
+  std::function<void(Block &, bool)> assignBlock = [&](Block &block,
+                                                       bool invalid) {
+    int parentId = nextParentId++;
+    int baseRegion = 0;
+    for (Operation &op : block.without_terminator()) {
+      baseInfo[&op] = {parentId, baseRegion, invalid};
+      bool childInvalid = invalid || isa<scf::IfOp>(&op);
+      for (Region &region : op.getRegions())
+        for (Block &childBlock : region)
+          assignBlock(childBlock, childInvalid);
+      if (op.getNumRegions() != 0)
+        ++baseRegion;
+    }
+    regionCount[parentId] = baseRegion + 1;
+  };
+
+  for (Region &region : scope->getRegions())
+    for (Block &block : region)
+      assignBlock(block, /*invalid=*/false);
+
+  DenseMap<Operation *, WSBarrierRegionInfo> result;
+  for (auto &it : baseInfo) {
+    Operation *op = it.first;
+    const BaseInfo &info = it.second;
+    if (!isWSBarrierForwardToken(op) && !isWSBarrierBackwardToken(op))
+      continue;
+    if (info.invalid) {
+      result[op] = {-1, -1};
+      continue;
+    }
+    int numRegions = regionCount.lookup(info.parentId);
+    int regionId = info.baseRegion + 1;
+    if (isWSBarrierBackwardToken(op))
+      regionId += numRegions;
+    result[op] = {info.parentId, regionId};
+  }
+  return result;
 }
 
 // canAdvanceWSBarrier, sinkWSArrives, raiseWSWaits are defined in
