@@ -2,7 +2,6 @@
 #include "mlir/Analysis/DataFlow/SparseAnalysis.h"
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -384,6 +383,29 @@ static bool isAllowedTensorLayoutUser(Operation *op, unsigned operandIndex) {
   return isa<ttg::ConvertLayoutOp>(op) || isTransparentLayoutCarrierOp(op);
 }
 
+// Later layout cleanup may express a dot-operand conversion as
+// tensor -> local_alloc -> local_load(dot). Treat that fallback as another dot
+// layout constraint on the source tensor so propagation can retag the original
+// value instead of preserving the redundant LDS round trip.
+static bool isDotLocalAllocFallback(Operation *op, unsigned operandIndex) {
+  auto allocOp = dyn_cast<ttg::LocalAllocOp>(op);
+  if (!allocOp || operandIndex != 0 || !allocOp.getSrc())
+    return false;
+  if (allocOp->use_empty())
+    return false;
+
+  for (Operation *user : allocOp->getUsers()) {
+    auto localLoadOp = dyn_cast<ttg::LocalLoadOp>(user);
+    if (!localLoadOp)
+      return false;
+    auto resultType = dyn_cast<RankedTensorType>(localLoadOp.getType());
+    if (!resultType ||
+        !isSupportedDotConstraintEncoding(resultType.getEncoding()))
+      return false;
+  }
+  return true;
+}
+
 static bool canRewriteTensorResult(Operation *op) {
   return isa<ttg::LocalLoadOp, RegionBranchOpInterface>(op);
 }
@@ -434,6 +456,29 @@ LogicalResult TensorBackwardPropagation::visitOperation(
     }
     // Don't return early — fall through to let the poison check handle
     // mixed-use cases where the operand has other non-allowed users.
+  }
+
+  if (auto allocOp = dyn_cast<ttg::LocalAllocOp>(op)) {
+    if (!allocOp.getSrc() || !isTrackedTensorValue(allocOp.getSrc()) ||
+        !isDotLocalAllocFallback(op, /*operandIndex=*/0))
+      return success();
+
+    // Meet all fallback users so mixed or conflicting dot requirements still
+    // widen to unknown and keep the explicit conversion path.
+    TensorLayout state;
+    for (Operation *user : allocOp->getUsers()) {
+      auto localLoadOp = cast<ttg::LocalLoadOp>(user);
+      auto resultType = cast<RankedTensorType>(localLoadOp.getType());
+      state = TensorLayout::meet(state, TensorLayout(resultType.getEncoding()));
+      state = TensorLayout::meet(
+          state, getLatticeElement(localLoadOp.getResult())->getValue());
+    }
+
+    if (!state.isUninitialized()) {
+      ChangeResult changed = operands[0]->meet(state);
+      propagateIfChanged(operands[0], changed);
+    }
+    return success();
   }
 
   // If a tracked tensor value is used by an unsupported operation, rewriting
