@@ -15,8 +15,7 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
 @triton.jit
-def chiplet_transform_chunked(pid, num_workgroups, num_xcds: tl.constexpr,
-                              chunk_size: tl.constexpr):
+def chiplet_transform_chunked(pid, num_workgroups, num_xcds: tl.constexpr, chunk_size: tl.constexpr):
     """Group adjacent PIDs onto the same XCD in chunks of chunk_size for L2 reuse.
 
     PIDs in the trailing remainder (not a multiple of num_xcds*chunk_size) pass through.
@@ -26,18 +25,30 @@ def chiplet_transform_chunked(pid, num_workgroups, num_xcds: tl.constexpr,
         return pid
     xcd = pid % num_xcds
     local_pid = pid // num_xcds
-    return ((local_pid // chunk_size) * num_xcds * chunk_size
-            + xcd * chunk_size
-            + (local_pid % chunk_size))
+    return ((local_pid // chunk_size) * num_xcds * chunk_size + xcd * chunk_size + (local_pid % chunk_size))
 
 
 @triton.jit
 def gemm_wp_v7(
-    a_ptr, b_ptr, c_ptr, M, N, K,
-    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr, NUM_BUFFERS: tl.constexpr,
-    NUM_XCDS: tl.constexpr, XCD_CHUNK: tl.constexpr,
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    NUM_BUFFERS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    XCD_CHUNK: tl.constexpr,
 ):
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
@@ -76,11 +87,9 @@ def gemm_wp_v7(
         k_start = i * BLOCK_K
         a_offs = a_base_off + (k_start + offs_k[None, :]) * stride_ak
         b_offs = (k_start + offs_k[:, None]) * stride_bk + b_base_off
-        tok_a = tlx.async_load(a_ptr + a_offs, tlx.local_view(smemA, i),
-                               mask=offs_k[None, :] < K - k_start)
+        tok_a = tlx.async_load(a_ptr + a_offs, tlx.local_view(smemA, i), mask=offs_k[None, :] < K - k_start)
         tlx.async_load_commit_group([tok_a])
-        tok_b = tlx.async_load(b_ptr + b_offs, tlx.local_view(smemB, i),
-                               mask=offs_k[:, None] < K - k_start)
+        tok_b = tlx.async_load(b_ptr + b_offs, tlx.local_view(smemB, i), mask=offs_k[:, None] < K - k_start)
         tlx.async_load_commit_group([tok_b])
 
     # Wait for buffer 0
@@ -105,11 +114,11 @@ def gemm_wp_v7(
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_offs = a_base_off + (k_prefetch + offs_k[None, :]) * stride_ak
             b_offs = (k_prefetch + offs_k[:, None]) * stride_bk + b_base_off
-            tok_a = tlx.async_load(a_ptr + a_offs, tlx.local_view(smemA, prefetch_buf),
-                                   mask=offs_k[None, :] < K - k_prefetch)
+            tok_a = tlx.async_load(a_ptr + a_offs, tlx.local_view(smemA, prefetch_buf), mask=offs_k[None, :]
+                                   < K - k_prefetch)
             tlx.async_load_commit_group([tok_a])
-            tok_b = tlx.async_load(b_ptr + b_offs, tlx.local_view(smemB, prefetch_buf),
-                                   mask=offs_k[:, None] < K - k_prefetch)
+            tok_b = tlx.async_load(b_ptr + b_offs, tlx.local_view(smemB, prefetch_buf), mask=offs_k[:, None]
+                                   < K - k_prefetch)
             tlx.async_load_commit_group([tok_b])
             a_tile = tlx.local_load(tlx.local_view(smemA, next_buf))
             b_tile = tlx.local_load(tlx.local_view(smemB, next_buf))
@@ -141,14 +150,27 @@ XCD_CHUNK = 4
 def run(a, b, c, bm, bn, bk, nb, nw, gm):
     M, K = a.shape
     _, N = b.shape
-    grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+    grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn), )
     gemm_wp_v7[grid](
-        a, b, c, M, N, K,
-        a.stride(0), a.stride(1), b.stride(0), b.stride(1),
-        c.stride(0), c.stride(1),
-        BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk,
-        GROUP_M=gm, NUM_BUFFERS=nb,
-        NUM_XCDS=NUM_XCDS, XCD_CHUNK=XCD_CHUNK,
+        a,
+        b,
+        c,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
+        BLOCK_M=bm,
+        BLOCK_N=bn,
+        BLOCK_K=bk,
+        GROUP_M=gm,
+        NUM_BUFFERS=nb,
+        NUM_XCDS=NUM_XCDS,
+        XCD_CHUNK=XCD_CHUNK,
         num_warps=nw,
     )
     return c
@@ -192,5 +214,5 @@ if __name__ == "__main__":
             except Exception:
                 ok = "FAIL"
             ms = triton.testing.do_bench(
-                lambda bm=bm,bn=bn,bk=bk,nb=nb,nw=nw,gm=gm: run(a, b, c, bm, bn, bk, nb, nw, gm), rep=200)
+                lambda bm=bm, bn=bn, bk=bk, nb=nb, nw=nw, gm=gm: run(a, b, c, bm, bn, bk, nb, nw, gm), rep=200)
             print(f"  {name:<32s} {tflops(ms,M,N,K):7.1f} TFLOPS ({ms:.3f} ms) [{ok}]")
