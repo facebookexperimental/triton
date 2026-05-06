@@ -776,6 +776,9 @@ class buffered_tensor(tl.base_value):
         # Following the practice in pytorch, dtype is scalar type
         self.dtype = element_ty
 
+    def _set_name(self, builder: ir.builder, name: str) -> None:
+        self.handle.set_loc(builder.create_name_loc(name, self.handle.get_loc()))
+
     def _flatten_ir(self, handles) -> None:
         handles.append(self.handle)
 
