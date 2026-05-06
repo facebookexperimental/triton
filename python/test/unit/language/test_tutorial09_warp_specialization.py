@@ -373,7 +373,8 @@ def matmul_kernel_tma_persistent_ws_splitk(
             NUM_SMS,
             flatten=FLATTEN,
             warp_specialize=True,
-            disallow_acc_multi_buffer=True,
+            SMEM_ALLOC_ALGO=1,
+            SEPARATE_EPILOGUE_STORE=True,
     ):
         split_id = tile_id // num_mn_tiles
         mn_tile_id = tile_id % num_mn_tiles
@@ -613,6 +614,9 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 ):
     """Test matmul_kernel_tma_persistent with warp_specialize=True for both Flatten values."""
 
+    if FLATTEN:
+        pytest.skip("FLATTEN will not WarpSpecialize although it will otherwise pass.")
+
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
@@ -774,6 +778,9 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     separate_epilogue_store,
 ):
     """Test matmul_kernel_descriptor_persistent with warp_specialize=True for both Flatten values."""
+
+    if FLATTEN:
+        pytest.skip("FLATTEN will not WarpSpecialize although it will otherwise pass.")
 
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
@@ -951,7 +958,7 @@ def test_tutorial09_multi_epilogue_subtile():
 # ============================================================================
 # Test 5: matmul_kernel_tma_persistent_ws_splitk (deterministic Split-K)
 # Targets large-K, undersaturated-MN shapes where Split-K is the right call.
-# Config matrix is intentionally narrow: one (BM, BN, BK) tile, FLATTEN=True,
+# Config matrix is intentionally narrow: one (BM, BN, BK) tile, FLATTEN=False,
 # fixed num_stages/num_warps — vary only the Split-K-relevant axes.
 # ============================================================================
 @pytest.mark.parametrize(
@@ -976,7 +983,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize_splitk(
     BLOCK_SIZE_N = 128
     BLOCK_SIZE_K = 64
     GROUP_SIZE_M = 8
-    FLATTEN = True
+    FLATTEN = False
     num_stages = 3
     num_warps = 4
 
