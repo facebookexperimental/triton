@@ -12,15 +12,28 @@ namespace mlir {
 namespace triton {
 namespace nvidia_gpu {
 
+inline DictionaryAttr
+getWSBarrierConstraints(std::optional<DictionaryAttr> constraints) {
+  if (!constraints)
+    return {};
+  return constraints->getAs<DictionaryAttr>("WSBarrier");
+}
+
+inline bool hasWSBarrierConstraints(std::optional<DictionaryAttr> constraints) {
+  return static_cast<bool>(getWSBarrierConstraints(constraints));
+}
+
 // Check if two WS barriers can be safely swapped by verifying their
 // channelGraph sets are disjoint. Returns false if either barrier lacks
-// a channelGraph constraint (conservative).
+// a WSBarrier constraint or channelGraph constraint (conservative).
 inline bool canAdvanceWSBarrier(std::optional<DictionaryAttr> constraintsA,
                                 std::optional<DictionaryAttr> constraintsB) {
-  if (!constraintsA || !constraintsB)
+  auto wsBarrierA = getWSBarrierConstraints(constraintsA);
+  auto wsBarrierB = getWSBarrierConstraints(constraintsB);
+  if (!wsBarrierA || !wsBarrierB)
     return false;
-  auto graphA = constraintsA->getAs<DenseI32ArrayAttr>("channelGraph");
-  auto graphB = constraintsB->getAs<DenseI32ArrayAttr>("channelGraph");
+  auto graphA = wsBarrierA.getAs<DenseI32ArrayAttr>("channelGraph");
+  auto graphB = wsBarrierB.getAs<DenseI32ArrayAttr>("channelGraph");
   if (!graphA || !graphB)
     return false;
   DenseSet<int> setA(graphA.asArrayRef().begin(), graphA.asArrayRef().end());
@@ -28,6 +41,24 @@ inline bool canAdvanceWSBarrier(std::optional<DictionaryAttr> constraintsA,
     if (setA.contains(id))
       return false;
   return true;
+}
+
+inline bool hasArriveLikeSemantics(Operation *op) {
+  // TODO: Refine this using WSBarrier metadata so independent arrive-like ops
+  // can be reordered when their channel constraints prove it is safe.
+  return isa<AsyncTMACopyGlobalToLocalOp, AsyncTMAGatherOp, TMAStoreWaitOp,
+             TMAStoreTokenWaitOp, MMAv5OpInterface>(op);
+}
+
+inline bool canAdvanceWSBarrier(std::optional<DictionaryAttr> constraints,
+                                Operation *op) {
+  if (op->getNumRegions() != 0)
+    return false;
+  if (auto arrive = dyn_cast<ArriveBarrierOp>(op))
+    return canAdvanceWSBarrier(constraints, arrive.getConstraints());
+  if (auto wait = dyn_cast<WaitBarrierOp>(op))
+    return canAdvanceWSBarrier(constraints, wait.getConstraints());
+  return !hasArriveLikeSemantics(op);
 }
 
 // Check whether moving `op` to just before `insertPt` would break SSA
@@ -45,28 +76,44 @@ inline bool wouldBreakOperandDominance(Operation *op, Operation *insertPt) {
   return false;
 }
 
+// Return the latest same-block operation that an arrive must follow when it is
+// restored near its associated memory op.
+inline Operation *getArriveAnchorAfterOperands(ArriveBarrierOp arrive,
+                                               Operation *memOp) {
+  Operation *anchor = memOp;
+  for (auto operand : arrive->getOperands()) {
+    auto *defOp = operand.getDefiningOp();
+    if (!defOp || defOp->getBlock() != arrive->getBlock())
+      continue;
+    if (anchor->isBeforeInBlock(defOp))
+      anchor = defOp;
+  }
+  return anchor;
+}
+
 // Push WS arrive barriers as far down as possible within a block.
 // An arrive can freely move past non-barrier ops (it just delays the signal).
-// An arrive can move past another arrive (always safe).
+// An arrive can move past another WSBarrier arrive (always safe).
 // An arrive can move past a wait only if canAdvanceWSBarrier says their
 // channel graphs are disjoint.
 inline bool sinkWSArrives(Block &block) {
   bool changed = false;
   SmallVector<ArriveBarrierOp> arrives;
   for (auto &op : block)
-    if (auto arrive = dyn_cast<ArriveBarrierOp>(&op))
+    if (auto arrive = dyn_cast<ArriveBarrierOp>(&op);
+        arrive && hasWSBarrierConstraints(arrive.getConstraints()))
       arrives.push_back(arrive);
 
   for (auto arrive : arrives) {
     auto constraints = arrive.getConstraints();
-    if (!constraints)
-      continue;
     Operation *insertPt = arrive->getNextNode();
     for (auto *cur = insertPt; cur && !cur->hasTrait<OpTrait::IsTerminator>();
          cur = cur->getNextNode()) {
-      if (auto wait = dyn_cast<WaitBarrierOp>(cur)) {
-        if (!canAdvanceWSBarrier(constraints, wait.getConstraints()))
+      if (auto otherArrive = dyn_cast<ArriveBarrierOp>(cur)) {
+        if (!hasWSBarrierConstraints(otherArrive.getConstraints()))
           break;
+      } else if (!canAdvanceWSBarrier(constraints, cur)) {
+        break;
       }
       insertPt = cur->getNextNode();
     }
@@ -80,7 +127,7 @@ inline bool sinkWSArrives(Block &block) {
 
 // Pull WS wait barriers as far up as possible within a block.
 // A wait can freely move past non-barrier ops (it just starts waiting sooner).
-// A wait can move past another wait (always safe).
+// A wait can move past another WSBarrier wait (always safe).
 // A wait can move past an arrive only if canAdvanceWSBarrier says their
 // channel graphs are disjoint.
 // Stops before moving past any op that defines an operand of the wait.
@@ -88,13 +135,12 @@ inline bool raiseWSWaits(Block &block) {
   bool changed = false;
   SmallVector<WaitBarrierOp> waits;
   for (auto &op : block)
-    if (auto wait = dyn_cast<WaitBarrierOp>(&op))
+    if (auto wait = dyn_cast<WaitBarrierOp>(&op);
+        wait && hasWSBarrierConstraints(wait.getConstraints()))
       waits.push_back(wait);
 
   for (auto wait : llvm::reverse(waits)) {
     auto constraints = wait.getConstraints();
-    if (!constraints)
-      continue;
     Operation *insertPt = wait.getOperation();
     for (auto *cur = wait->getPrevNode(); cur; cur = cur->getPrevNode()) {
       // Don't raise past the definition of any of our operands.
@@ -107,9 +153,11 @@ inline bool raiseWSWaits(Block &block) {
       }
       if (definesOperand)
         break;
-      if (auto arrive = dyn_cast<ArriveBarrierOp>(cur)) {
-        if (!canAdvanceWSBarrier(arrive.getConstraints(), constraints))
+      if (auto otherWait = dyn_cast<WaitBarrierOp>(cur)) {
+        if (!hasWSBarrierConstraints(otherWait.getConstraints()))
           break;
+      } else if (!canAdvanceWSBarrier(constraints, cur)) {
+        break;
       }
       insertPt = cur;
     }
@@ -135,7 +183,7 @@ buildBarrierToMemoryOpMap(Block &block) {
 
   for (auto &op : block) {
     if (auto arrive = dyn_cast<ArriveBarrierOp>(&op)) {
-      if (!arrive.getConstraints())
+      if (!hasWSBarrierConstraints(arrive.getConstraints()))
         continue;
       for (auto *cur = arrive->getPrevNode(); cur; cur = cur->getPrevNode()) {
         if (isMemoryOp(cur)) {
@@ -144,7 +192,7 @@ buildBarrierToMemoryOpMap(Block &block) {
         }
       }
     } else if (auto wait = dyn_cast<WaitBarrierOp>(&op)) {
-      if (!wait.getConstraints())
+      if (!hasWSBarrierConstraints(wait.getConstraints()))
         continue;
       for (auto *cur = wait->getNextNode(); cur; cur = cur->getNextNode()) {
         if (isMemoryOp(cur)) {
@@ -158,19 +206,20 @@ buildBarrierToMemoryOpMap(Block &block) {
 }
 
 // After tmem_load sinking, relocate WS barriers back to optimal positions
-// relative to their associated memory ops. Arrives go right after their
-// memory op; waits go right before. Skips moves that would break SSA
-// dominance.
+// relative to their associated memory ops. Arrives go right after their memory
+// op, or after later same-block operand definitions required by SSA. Waits go
+// right before their memory op. Skips moves that would break SSA dominance.
 inline void optimizeWSBarrierLocations(
     const DenseMap<Operation *, Operation *> &barrierToMemOp) {
   for (auto [barrier, memOp] : barrierToMemOp) {
     if (barrier->getBlock() != memOp->getBlock())
       continue;
-    if (isa<ArriveBarrierOp>(barrier)) {
-      if (barrier->getPrevNode() != memOp) {
-        Operation *target = memOp->getNextNode();
+    if (auto arrive = dyn_cast<ArriveBarrierOp>(barrier)) {
+      Operation *anchor = getArriveAnchorAfterOperands(arrive, memOp);
+      if (barrier->getPrevNode() != anchor) {
+        Operation *target = anchor->getNextNode();
         if (!wouldBreakOperandDominance(barrier, target))
-          barrier->moveAfter(memOp);
+          barrier->moveAfter(anchor);
       }
     } else {
       if (barrier->getNextNode() != memOp) {

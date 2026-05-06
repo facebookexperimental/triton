@@ -213,13 +213,8 @@ bool sinkOps(Value buffer, ArrayRef<Operation *> useChain,
         break;
       }
     }
-    if (auto arrive = dyn_cast<ArriveBarrierOp>(next)) {
-      if (!canAdvanceWSBarrier(opConstraints, arrive.getConstraints()))
-        break;
-    } else if (auto wait = dyn_cast<WaitBarrierOp>(next)) {
-      if (!canAdvanceWSBarrier(opConstraints, wait.getConstraints()))
-        break;
-    }
+    if (!canAdvanceWSBarrier(opConstraints, next))
+      break;
     if (!isMemoryEffectFree(next)) {
       SmallVector<MemoryEffects::EffectInstance> effects;
       collectEffects(next, effects);
@@ -262,6 +257,11 @@ bool trySinkOp(Operation *op, Value buffer,
   return sinkOps(buffer, useChain, opConstraints);
 }
 
+bool hasTMEMLoad(Block *block) {
+  return llvm::any_of(*block,
+                      [](Operation &op) { return isa<TMEMLoadOp>(op); });
+}
+
 } // anonymous namespace
 
 struct TritonNvidiaGPUInterleaveTMemPass
@@ -274,9 +274,19 @@ struct TritonNvidiaGPUInterleaveTMemPass
     MLIRContext *context = &getContext();
     ModuleOp m = getOperation();
 
+    bool hasAnyTMEMLoad = false;
+    m.walk([&](TMEMLoadOp) {
+      hasAnyTMEMLoad = true;
+      return WalkResult::interrupt();
+    });
+    if (!hasAnyTMEMLoad)
+      return;
+
     // Step 1: Record which memory op each WS barrier guards.
     SmallVector<DenseMap<Operation *, Operation *>> barrierMaps;
     m.walk([&](Block *block) {
+      if (!hasTMEMLoad(block))
+        return;
       auto map = buildBarrierToMemoryOpMap(*block);
       if (!map.empty())
         barrierMaps.push_back(std::move(map));
@@ -285,6 +295,8 @@ struct TritonNvidiaGPUInterleaveTMemPass
     // Step 2: Reorder WS barriers. Pushes arrives down and pulls waits up
     // past barriers from independent channels, unblocking tmem_load sinking.
     m.walk([&](Block *block) {
+      if (!hasTMEMLoad(block))
+        return;
       sinkWSArrives(*block);
       raiseWSWaits(*block);
     });
@@ -296,18 +308,14 @@ struct TritonNvidiaGPUInterleaveTMemPass
     // channelGraph, not just the one nearest to the arrive.
     DenseMap<Operation *, DictionaryAttr> memOpConstraints;
     m.walk([&](ArriveBarrierOp arrive) {
+      if (!hasTMEMLoad(arrive->getBlock()))
+        return;
       auto constraints = arrive.getConstraints();
-      if (!constraints)
+      if (!hasWSBarrierConstraints(constraints))
         return;
       DictionaryAttr dict = *constraints;
       for (auto *cur = arrive->getPrevNode(); cur; cur = cur->getPrevNode()) {
-        if (isa<WaitBarrierOp>(cur) &&
-            !canAdvanceWSBarrier(constraints,
-                                 cast<WaitBarrierOp>(cur).getConstraints()))
-          break;
-        if (isa<ArriveBarrierOp>(cur) &&
-            !canAdvanceWSBarrier(constraints,
-                                 cast<ArriveBarrierOp>(cur).getConstraints()))
+        if (!canAdvanceWSBarrier(constraints, cur))
           break;
         if (isa<TMEMLoadOp>(cur))
           memOpConstraints[cur] = dict;

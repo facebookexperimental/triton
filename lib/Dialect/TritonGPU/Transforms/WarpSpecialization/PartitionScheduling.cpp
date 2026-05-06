@@ -1431,7 +1431,8 @@ void assignPartitionsForOpsWithNoUse(Graph *graph) {
 
 namespace {
 struct PartitionScheduling
-    : public mlir::triton::gpu::impl::TritonGPUPartitionSchedulingBase<PartitionScheduling> {
+    : public mlir::triton::gpu::impl::TritonGPUPartitionSchedulingBase<
+          PartitionScheduling> {
   using TritonGPUPartitionSchedulingBase::TritonGPUPartitionSchedulingBase;
 
   void runOnOperation() override {

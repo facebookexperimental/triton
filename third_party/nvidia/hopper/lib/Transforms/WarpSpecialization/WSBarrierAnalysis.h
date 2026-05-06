@@ -6,6 +6,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 
 namespace mlir {
 
@@ -15,9 +16,14 @@ namespace mlir {
 // from async_task_id). The destination is the partition on the other side of
 // the channel that this barrier communicates with.
 //
+// WS barrier metadata is stored under a top-level constraints.WSBarrier key so
+// generic barrier constraints can coexist without being treated as WS barriers.
+//
 // All fields are optional — unknown information is left null and filled in
 // by later passes.
 struct WSBarrierAttr {
+  static constexpr llvm::StringLiteral kKey = "WSBarrier";
+
   // Destination task ID — the foreign partition this barrier communicates with.
   // Set during insertAsyncComm.
   IntegerAttr dstTask;
@@ -27,7 +33,8 @@ struct WSBarrierAttr {
   // buildChannelGraph() + injectChannelGraph().
   DenseI32ArrayAttr channelGraph;
 
-  // Build a DictionaryAttr from the populated fields. Null fields are omitted.
+  // Build a constraints DictionaryAttr from the populated fields. Null fields
+  // are omitted from the nested WSBarrier dictionary.
   DictionaryAttr build(MLIRContext *ctx) const {
     SmallVector<NamedAttribute> entries;
     if (channelGraph)
@@ -36,7 +43,10 @@ struct WSBarrierAttr {
       entries.emplace_back(StringAttr::get(ctx, "dstTask"), dstTask);
     if (entries.empty())
       return {};
-    return DictionaryAttr::get(ctx, entries);
+    auto wsBarrier = DictionaryAttr::get(ctx, entries);
+    SmallVector<NamedAttribute> topLevel;
+    topLevel.emplace_back(StringAttr::get(ctx, kKey), wsBarrier);
+    return DictionaryAttr::get(ctx, topLevel);
   }
 
   // Parse from an existing constraints DictionaryAttr.
@@ -44,8 +54,11 @@ struct WSBarrierAttr {
     WSBarrierAttr attr;
     if (!dict)
       return attr;
-    attr.dstTask = dict.getAs<IntegerAttr>("dstTask");
-    attr.channelGraph = dict.getAs<DenseI32ArrayAttr>("channelGraph");
+    auto wsBarrier = dict.getAs<DictionaryAttr>(kKey);
+    if (!wsBarrier)
+      return attr;
+    attr.dstTask = wsBarrier.getAs<IntegerAttr>("dstTask");
+    attr.channelGraph = wsBarrier.getAs<DenseI32ArrayAttr>("channelGraph");
     return attr;
   }
 
@@ -116,7 +129,25 @@ static inline DictionaryAttr injectChannelGraph(MLIRContext *ctx,
                                                 ArrayRef<int> graphTaskIds) {
   auto attr = WSBarrierAttr::parse(existing);
   attr.channelGraph = DenseI32ArrayAttr::get(ctx, graphTaskIds);
-  return attr.build(ctx);
+  auto updated = attr.build(ctx);
+  if (!existing)
+    return updated;
+
+  SmallVector<NamedAttribute> merged;
+  bool replaced = false;
+  for (NamedAttribute namedAttr : existing) {
+    if (namedAttr.getName().getValue() == WSBarrierAttr::kKey) {
+      merged.emplace_back(StringAttr::get(ctx, WSBarrierAttr::kKey),
+                          updated.getAs<DictionaryAttr>(WSBarrierAttr::kKey));
+      replaced = true;
+    } else {
+      merged.push_back(namedAttr);
+    }
+  }
+  if (!replaced)
+    merged.emplace_back(StringAttr::get(ctx, WSBarrierAttr::kKey),
+                        updated.getAs<DictionaryAttr>(WSBarrierAttr::kKey));
+  return DictionaryAttr::get(ctx, merged);
 }
 
 // canAdvanceWSBarrier, sinkWSArrives, raiseWSWaits are defined in
