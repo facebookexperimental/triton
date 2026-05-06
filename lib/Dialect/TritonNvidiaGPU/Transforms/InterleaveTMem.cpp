@@ -213,13 +213,10 @@ bool sinkOps(Value buffer, ArrayRef<Operation *> useChain,
         break;
       }
     }
-    if (auto arrive = dyn_cast<ArriveBarrierOp>(next)) {
-      if (!canAdvanceWSBarrier(opConstraints, arrive.getConstraints()))
-        break;
-    } else if (auto wait = dyn_cast<WaitBarrierOp>(next)) {
-      if (!canAdvanceWSBarrier(opConstraints, wait.getConstraints()))
-        break;
-    }
+    // Don't sink past barrier signals, since they may guard the liverange
+    // of the buffer.
+    if (isa<ArriveBarrierOp>(next))
+      break;
     if (!isMemoryEffectFree(next)) {
       SmallVector<MemoryEffects::EffectInstance> effects;
       collectEffects(next, effects);
@@ -274,20 +271,8 @@ struct TritonNvidiaGPUInterleaveTMemPass
     MLIRContext *context = &getContext();
     ModuleOp m = getOperation();
 
-    // Step 1: Record which memory op each WS barrier guards.
+    // Steps 1-2 disabled: barrier reordering causes deadlocks on causal FA.
     SmallVector<DenseMap<Operation *, Operation *>> barrierMaps;
-    m.walk([&](Block *block) {
-      auto map = buildBarrierToMemoryOpMap(*block);
-      if (!map.empty())
-        barrierMaps.push_back(std::move(map));
-    });
-
-    // Step 2: Reorder WS barriers. Pushes arrives down and pulls waits up
-    // past barriers from independent channels, unblocking tmem_load sinking.
-    m.walk([&](Block *block) {
-      sinkWSArrives(*block);
-      raiseWSWaits(*block);
-    });
 
     // Build memOp → channelGraph constraints. For each arrive barrier with
     // constraints, scan backward and assign its constraints to ALL tmem_loads
@@ -323,18 +308,11 @@ struct TritonNvidiaGPUInterleaveTMemPass
         opsToSink.emplace_back(alloc, alloc.getResult());
     });
     for (auto [op, buffer] : opsToSink) {
-      auto it = memOpConstraints.find(op);
-      std::optional<DictionaryAttr> constraints =
-          it != memOpConstraints.end()
-              ? std::optional<DictionaryAttr>(it->second)
-              : std::nullopt;
-      while (trySinkOp(op, buffer, constraints)) {
+      while (trySinkOp(op, buffer, std::nullopt)) {
       }
     }
 
-    // Step 4: Restore barriers to optimal positions near their memory ops.
-    for (auto &map : barrierMaps)
-      optimizeWSBarrierLocations(map);
+    // Step 4: Disabled along with Steps 1-2.
   }
 };
 
