@@ -1593,7 +1593,8 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
   // the use chain. Without this guard, load-user scheduling from
   // descriptor_load (m/Di metadata) transitively pulls the entire softmax
   // chain into the reduction partition.
-  if (defaultPartition && defaultPartition != reductionPartition) {
+  if (defaultPartition &&
+      (!layout.reductionPartition || defaultPartition != reductionPartition)) {
     for (Operation *loadOrAlloc : loadsAndAllocs) {
       scf::ForOp parentLoop = loadOrAlloc->getParentOfType<scf::ForOp>();
       if (!parentLoop) {
