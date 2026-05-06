@@ -839,17 +839,17 @@ def async_descriptor_load(
 ) -> None:
     """Asynchronous descriptor load via NV TMA.
 
-    NV-only. AMD users should call :func:`async_tdm_load` instead — TDM
-    has counter-based completion (no ``barrier``), no
-    ``cache_modifier`` / ``eviction_policy`` / ``multicast_targets``,
-    and the buffer encoding is determined by the descriptor (rather than
-    forced to NV-MMA shared).
+    NV-only. AMD users should call :func:`async_amd_descriptor_load`
+    instead — the AMD path has counter-based completion (no
+    ``barrier``), no ``cache_modifier`` / ``eviction_policy`` /
+    ``multicast_targets``, and the buffer encoding is determined by the
+    descriptor (rather than forced to NV-MMA shared).
     """
     assert isinstance(desc, tl.tensor_descriptor_base)
     arch = _semantic.builder.options.arch
     if isinstance(arch, str) and arch.startswith("gfx"):
         raise NotImplementedError(f"tlx.async_descriptor_load is NV-only; got AMD arch '{arch}'. "
-                                  "Use tlx.async_tdm_load on TDM-capable AMD targets (gfx1250+); "
+                                  "Use tlx.async_amd_descriptor_load on TDM-capable AMD targets (gfx1250+); "
                                   "non-TDM AMD targets do not have a descriptor-based async load.")
     assert eviction_policy in ("", "evict_first", "evict_last"), \
         f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'"
@@ -917,18 +917,18 @@ def _layouts_match(actual, expected):
 
 
 @tl.builtin
-def async_tdm_load(
+def async_amd_descriptor_load(
     desc: tl.tensor_descriptor_base,
     result: tlx.buffered_tensor,
     offsets: list[tl.tensor],
     pred: tl.tensor = None,
     _semantic=None,
 ) -> tlx.async_token:
-    """Asynchronous TDM descriptor load from global to a local buffer.
+    """Asynchronous descriptor load from global to a local buffer (AMD).
 
     Lowers to ``amdgpu.async_tdm_copy_global_to_local``; synchronize with
-    :func:`async_tdm_wait`. The returned token can be threaded into the
-    wait for per-token waitcnt precision; otherwise discard it.
+    :func:`async_amd_descriptor_wait`. The returned token can be threaded
+    into the wait for per-token waitcnt precision; otherwise discard it.
 
     Note: tokens currently do not survive ``scf.for`` boundaries
     (``async_token._flatten_ir`` is a no-op), so collect the wait inside
@@ -938,7 +938,8 @@ def async_tdm_load(
     """
     assert isinstance(desc, tl.tensor_descriptor_base)
     arch = _semantic.builder.options.arch
-    assert is_amd_tdm_target(arch), (f"async_tdm_load is only available on AMD TDM-capable targets, got arch={arch}")
+    assert is_amd_tdm_target(arch), (
+        f"async_amd_descriptor_load is only available on AMD TDM-capable targets, got arch={arch}")
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
@@ -951,7 +952,7 @@ def async_tdm_load(
         expected_layout = _amd_tdm_descriptor_layout(desc)
         if not _layouts_match(layout, expected_layout):
             warnings.warn(
-                "tlx.async_tdm_load destination layout may be incompatible with AMD descriptor layout; "
+                "tlx.async_amd_descriptor_load destination layout may be incompatible with AMD descriptor layout; "
                 f"expected {expected_layout}, got {layout}. Omit `layout=` from `tlx.local_alloc` "
                 "to let TLXInsertRequireLayout auto-propagate a descriptor-compatible encoding.",
                 UserWarning,
@@ -974,25 +975,27 @@ def async_tdm_load(
 
 
 @tl.builtin
-def async_tdm_wait(
+def async_amd_descriptor_wait(
     pendings: tl.constexpr = 0,
     tokens: Optional[list[tlx.async_token]] = None,
     _semantic=None,
 ) -> tlx.async_token:
-    """Wait for outstanding AMD TDM operations.
+    """Wait for outstanding AMD async descriptor operations.
 
     Lowers to ``amdgpu.async_tdm_wait``. Pass ``pendings`` for the
-    count-based wait, or ``tokens`` from prior :func:`async_tdm_load`
-    calls for per-token min-waitcnt precision (mutually exclusive: when
-    tokens are supplied ``UpdateAsyncWaitCount`` ignores ``pendings``).
+    count-based wait, or ``tokens`` from prior
+    :func:`async_amd_descriptor_load` calls for per-token min-waitcnt
+    precision (mutually exclusive: when tokens are supplied
+    ``UpdateAsyncWaitCount`` ignores ``pendings``).
 
     Available only on AMD TDM-capable targets (gfx1250+).
     """
     arch = _semantic.builder.options.arch
-    assert is_amd_tdm_target(arch), (f"async_tdm_wait is only available on AMD TDM-capable targets, got arch={arch}")
+    assert is_amd_tdm_target(arch), (
+        f"async_amd_descriptor_wait is only available on AMD TDM-capable targets, got arch={arch}")
     pendings = tl._unwrap_if_constexpr(pendings)
     tokens = tokens or []
-    assert not (tokens and pendings != 0), ("async_tdm_wait: pass either `pendings` or `tokens`, not both;"
+    assert not (tokens and pendings != 0), ("async_amd_descriptor_wait: pass either `pendings` or `tokens`, not both;"
                                             " UpdateAsyncWaitCount uses tokens when present and ignores `pendings`")
     handles = [t.handle for t in tokens]
     return tlx.async_token(_semantic.builder.create_async_tdm_wait(handles, pendings))

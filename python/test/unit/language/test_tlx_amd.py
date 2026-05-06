@@ -3,7 +3,7 @@ Tests for TLX AMD support.
 
 Covers the gfx950 async_load / relaxed local_load / async_token-in-loops
 paths and the gfx1250 TDM descriptor-load family
-(:func:`tlx.async_tdm_load`, :func:`tlx.async_tdm_wait`).
+(:func:`tlx.async_amd_descriptor_load`, :func:`tlx.async_amd_descriptor_wait`).
 
 These tests compile kernels via ``triton.compile()`` with an explicit
 ``GPUTarget`` and verify the generated TTGIR/AMDGCN. No AMD hardware is
@@ -706,7 +706,7 @@ def test_scatter_3d_native(N, M, P, axis):
 
 
 @triton.jit
-def _async_tdm_load_kernel(
+def _async_amd_desc_load_kernel(
     a_ptr,
     output_ptr,
     M: tl.constexpr,
@@ -728,8 +728,8 @@ def _async_tdm_load_kernel(
     buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
     smem = tlx.local_view(buf, 0)
 
-    tlx.async_tdm_load(desc, smem, [0, 0])
-    tlx.async_tdm_wait(0)
+    tlx.async_amd_descriptor_load(desc, smem, [0, 0])
+    tlx.async_amd_descriptor_wait(0)
 
     data = tlx.local_load(smem)
     offs_m = tl.arange(0, BLOCK_M)
@@ -738,10 +738,10 @@ def _async_tdm_load_kernel(
     tl.store(out_ptrs, data)
 
 
-def test_async_tdm_load_compiles_gfx1250(device):
-    """tlx.async_tdm_load + async_tdm_wait should compile to TDM ops on gfx1250."""
+def test_async_amd_desc_load_compiles_gfx1250(device):
+    """tlx.async_amd_descriptor_load + wait should compile to TDM ops on gfx1250."""
     compiled = compile_for_gfx1250(
-        _async_tdm_load_kernel,
+        _async_amd_desc_load_kernel,
         signature={"a_ptr": "*fp16", "output_ptr": "*fp16", "M": "i32", "N": "i32"},
         constexprs={"BLOCK_M": 16, "BLOCK_N": 32},
     )
@@ -760,8 +760,8 @@ def test_async_tdm_load_compiles_gfx1250(device):
         "expected tensor_load_to_lds intrinsic in AMDGCN, got:\n" + amdgcn)
 
 
-def test_async_tdm_load_correctness_gfx1250(device):
-    """tlx.async_tdm_load + async_tdm_wait produce correct results on gfx1250 hardware.
+def test_async_amd_desc_load_correctness_gfx1250(device):
+    """tlx.async_amd_descriptor_load + wait produce correct results on gfx1250 hardware.
 
     Uses an explicit PaddedSharedLayout matching the AMD descriptor fallback.
     The TDM ``tensor_load_to_lds`` instruction requires descriptor and
@@ -772,12 +772,12 @@ def test_async_tdm_load_correctness_gfx1250(device):
     M, N = 16, 32
     a = torch.randn(M, N, dtype=torch.float16, device=device)
     output = torch.empty_like(a)
-    _async_tdm_load_kernel[(1, )](a, output, M=M, N=N, BLOCK_M=M, BLOCK_N=N)
+    _async_amd_desc_load_kernel[(1, )](a, output, M=M, N=N, BLOCK_M=M, BLOCK_N=N)
     torch.testing.assert_close(output, a)
 
 
 @triton.jit
-def _async_tdm_load_pred_kernel(
+def _async_amd_desc_load_pred_kernel(
     a_ptr,
     output_ptr,
     M: tl.constexpr,
@@ -797,8 +797,8 @@ def _async_tdm_load_pred_kernel(
     smem = tlx.local_view(buf, 0)
 
     pred = tl.full([], DO_LOAD, dtype=tl.int1)
-    tlx.async_tdm_load(desc, smem, [0, 0], pred=pred)
-    tlx.async_tdm_wait(0)
+    tlx.async_amd_descriptor_load(desc, smem, [0, 0], pred=pred)
+    tlx.async_amd_descriptor_wait(0)
 
     data = tlx.local_load(smem)
     offs_m = tl.arange(0, BLOCK_M)
@@ -807,10 +807,10 @@ def _async_tdm_load_pred_kernel(
     tl.store(out_ptrs, data)
 
 
-def test_async_tdm_load_pred_compiles_gfx1250(device):
-    """async_tdm_load with an i1 pred should be lifted to i32 by the binding."""
+def test_async_amd_desc_load_pred_compiles_gfx1250(device):
+    """async_amd_descriptor_load with an i1 pred should be lifted to i32 by the binding."""
     compiled = compile_for_gfx1250(
-        _async_tdm_load_pred_kernel,
+        _async_amd_desc_load_pred_kernel,
         signature={"a_ptr": "*fp16", "output_ptr": "*fp16", "M": "i32", "N": "i32"},
         constexprs={"BLOCK_M": 16, "BLOCK_N": 32, "DO_LOAD": 1},
     )
@@ -828,7 +828,7 @@ def test_async_tdm_load_pred_compiles_gfx1250(device):
 
 
 @triton.jit
-def _async_tdm_load_token_kernel(
+def _async_amd_desc_load_token_kernel(
     a_ptr,
     output_ptr,
     M: tl.constexpr,
@@ -836,7 +836,7 @@ def _async_tdm_load_token_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """Same as the count-only kernel but threads tokens through async_tdm_wait."""
+    """Same as the count-only kernel but threads tokens through async_amd_descriptor_wait."""
     desc = tl.make_tensor_descriptor(
         a_ptr,
         shape=[M, N],
@@ -846,8 +846,8 @@ def _async_tdm_load_token_kernel(
     buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
     smem = tlx.local_view(buf, 0)
 
-    tok = tlx.async_tdm_load(desc, smem, [0, 0])
-    tlx.async_tdm_wait(0, [tok])
+    tok = tlx.async_amd_descriptor_load(desc, smem, [0, 0])
+    tlx.async_amd_descriptor_wait(0, [tok])
 
     data = tlx.local_load(smem)
     offs_m = tl.arange(0, BLOCK_M)
@@ -856,10 +856,10 @@ def _async_tdm_load_token_kernel(
     tl.store(out_ptrs, data)
 
 
-def test_async_tdm_load_token_threaded_compiles_gfx1250(device):
-    """Token-threaded async_tdm_wait should produce a wait op that uses the copy's token."""
+def test_async_amd_desc_load_token_threaded_compiles_gfx1250(device):
+    """Token-threaded async_amd_descriptor_wait should produce a wait op that uses the copy's token."""
     compiled = compile_for_gfx1250(
-        _async_tdm_load_token_kernel,
+        _async_amd_desc_load_token_kernel,
         signature={"a_ptr": "*fp16", "output_ptr": "*fp16", "M": "i32", "N": "i32"},
         constexprs={"BLOCK_M": 16, "BLOCK_N": 32},
     )
@@ -874,11 +874,11 @@ def test_async_tdm_load_token_threaded_compiles_gfx1250(device):
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
 
 
-def test_async_tdm_load_uses_padded_layout_gfx1250(device):
+def test_async_amd_desc_load_uses_padded_layout_gfx1250(device):
     """Default-layout `local_alloc` should be rewritten to a descriptor-compatible
     padded encoding by `TLXInsertRequireLayout` + `TlxPropagateLayout`."""
     compiled = compile_for_gfx1250(
-        _async_tdm_load_kernel,
+        _async_amd_desc_load_kernel,
         signature={"a_ptr": "*fp16", "output_ptr": "*fp16", "M": "i32", "N": "i32"},
         constexprs={"BLOCK_M": 16, "BLOCK_N": 32},
     )
@@ -888,7 +888,7 @@ def test_async_tdm_load_uses_padded_layout_gfx1250(device):
 
 
 @triton.jit
-def _async_tdm_load_incompatible_layout_kernel(
+def _async_amd_desc_load_incompatible_layout_kernel(
     a_ptr,
     output_ptr,
     M: tl.constexpr,
@@ -906,8 +906,8 @@ def _async_tdm_load_incompatible_layout_kernel(
     buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1, layout=layout)
     smem = tlx.local_view(buf, 0)
 
-    tlx.async_tdm_load(desc, smem, [0, 0])
-    tlx.async_tdm_wait(0)
+    tlx.async_amd_descriptor_load(desc, smem, [0, 0])
+    tlx.async_amd_descriptor_wait(0)
 
     data = tlx.local_load(smem)
     offs_m = tl.arange(0, BLOCK_M)
@@ -916,7 +916,7 @@ def _async_tdm_load_incompatible_layout_kernel(
     tl.store(out_ptrs, data)
 
 
-def test_async_tdm_load_warns_on_incompatible_layout_gfx1250(device, fresh_triton_cache):
+def test_async_amd_desc_load_warns_on_incompatible_layout_gfx1250(device, fresh_triton_cache):
     """Warn when the TDM destination layout does not match descriptor encoding.
 
     Uses the ``fresh_triton_cache`` fixture so the warning fires from a
@@ -925,7 +925,7 @@ def test_async_tdm_load_warns_on_incompatible_layout_gfx1250(device, fresh_trito
     """
     with pytest.warns(UserWarning, match="destination layout may be incompatible"):
         compile_for_gfx1250(
-            _async_tdm_load_incompatible_layout_kernel,
+            _async_amd_desc_load_incompatible_layout_kernel,
             signature={"a_ptr": "*fp16", "output_ptr": "*fp16", "M": "i32", "N": "i32"},
             constexprs={"BLOCK_M": 16, "BLOCK_N": 32},
         )
