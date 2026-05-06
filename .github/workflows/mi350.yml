@@ -1,4 +1,4 @@
-name: Meta Triton TritonBench Tests
+name: Meta Triton MI350 Tests
 on:
   push:
     branches:
