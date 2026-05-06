@@ -13,5 +13,6 @@ add_triton_library(TritonToTritonGPU
     TritonIR
     ProtonIR
     TritonGPUIR
+    TritonAMDGPUIR
     TLXIR
 )

@@ -62,6 +62,7 @@ target_link_libraries(triton-lsp PRIVATE
 mlir_check_all_link_libraries(triton-lsp)
 
 
+if(TRITON_BUILD_UT)
 add_executable(triton-llvm-opt triton-llvm-opt.cpp)
 add_dependencies(triton-llvm-opt intrinsics_gen)
 target_compile_options(triton-llvm-opt PRIVATE ${TRITON_DISABLE_EH_RTTI_FLAGS})
@@ -75,6 +76,7 @@ target_link_libraries(triton-llvm-opt PRIVATE
   LLVMCodeGen
 )
 export_executable_symbols_for_plugins(triton-llvm-opt)
+endif()
 
 
 add_executable(triton-tensor-layout triton-tensor-layout.cpp)
@@ -90,12 +92,12 @@ target_link_libraries(triton-tensor-layout PRIVATE
   MLIRTransforms
 )
 
+set(_install_targets triton-opt triton-reduce triton-lsp triton-tensor-layout)
+if(TRITON_BUILD_UT)
+  list(APPEND _install_targets triton-llvm-opt)
+endif()
 install(TARGETS
-  triton-opt
-  triton-reduce
-  triton-lsp
-  triton-llvm-opt
-  triton-tensor-layout
+  ${_install_targets}
   COMPONENT binaries
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )

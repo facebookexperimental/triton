@@ -41,7 +41,6 @@ def is_gfx950_available():
 # Test: async_load compiles on gfx950 and produces the expected ops.
 # ---------------------------------------------------------------------------
 
-
 @triton.jit
 def _async_load_kernel(
     x_ptr,
@@ -676,3 +675,134 @@ def test_scatter_3d_native(N, M, P, axis):
     )
 
     torch.testing.assert_close(output, expected)
+# ---------------------------------------------------------------------------
+# Test: buffer_load compiles on gfx950 and produces the expected ops.
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _buffer_load_kernel(
+    x_ptr, output_ptr, n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = (pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)).to(tl.int32)
+    mask = offs < n_elements
+    x = tlx.buffer_load(x_ptr, offs, mask=mask)
+    tl.store(output_ptr + offs, x, mask=mask)
+
+
+def test_buffer_load_compiles_gfx950(device):
+    """buffer_load should produce amdgpu.buffer_load in TTGIR on gfx950."""
+    compiled = compile_for_gfx950(
+        _buffer_load_kernel,
+        signature={"x_ptr": "*fp32", "output_ptr": "*fp32", "n_elements": "i32"},
+        constexprs={"BLOCK_SIZE": 64},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "buffer_load" in ttgir
+    assert "amdgcn" in compiled.asm
+    assert len(compiled.asm["amdgcn"]) > 0
+
+
+def test_buffer_load_correctness(device):
+    """buffer_load produces correct results on gfx950 hardware."""
+    if not is_gfx950_available():
+        pytest.skip("Requires gfx950 hardware")
+    size = 256
+    x = torch.rand(size, dtype=torch.float32, device=device)
+    output = torch.empty_like(x)
+    grid = (triton.cdiv(size, 64),)
+    _buffer_load_kernel[grid](x, output, size, BLOCK_SIZE=64)
+    torch.testing.assert_close(x, output)
+
+
+# ---------------------------------------------------------------------------
+# Test: buffer_store compiles on gfx950 and produces the expected ops.
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _buffer_store_kernel(
+    x_ptr, output_ptr, n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = (pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)).to(tl.int32)
+    mask = offs < n_elements
+    x = tl.load(x_ptr + offs, mask=mask)
+    tlx.buffer_store(x, output_ptr, offs, mask=mask)
+
+
+def test_buffer_store_compiles_gfx950(device):
+    """buffer_store should produce amdgpu.buffer_store in TTGIR on gfx950."""
+    compiled = compile_for_gfx950(
+        _buffer_store_kernel,
+        signature={"x_ptr": "*fp32", "output_ptr": "*fp32", "n_elements": "i32"},
+        constexprs={"BLOCK_SIZE": 64},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "buffer_store" in ttgir
+    assert "amdgcn" in compiled.asm
+    assert len(compiled.asm["amdgcn"]) > 0
+
+
+def test_buffer_store_correctness(device):
+    """buffer_store produces correct results on gfx950 hardware."""
+    if not is_gfx950_available():
+        pytest.skip("Requires gfx950 hardware")
+    size = 256
+    x = torch.rand(size, dtype=torch.float32, device=device)
+    output = torch.empty_like(x)
+    grid = (triton.cdiv(size, 64),)
+    _buffer_store_kernel[grid](x, output, size, BLOCK_SIZE=64)
+    torch.testing.assert_close(x, output)
+
+
+# ---------------------------------------------------------------------------
+# Test: buffer_load_to_local compiles on gfx950 and produces the expected ops.
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _buffer_load_to_local_kernel(
+    x_ptr, output_ptr, n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = (pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)).to(tl.int32)
+    mask = offs < n_elements
+
+    buf = tlx.local_alloc((BLOCK_SIZE,), tl.float32, 1)
+    buf0 = tlx.local_view(buf, 0)
+    tok = tlx.buffer_load_to_local(buf0, x_ptr, offs, mask=mask)
+    tlx.async_load_commit_group([tok])
+    tlx.async_load_wait_group(0)
+
+    x = tlx.local_load(buf0)
+    tl.store(output_ptr + offs, x, mask=mask)
+
+
+def test_buffer_load_to_local_compiles_gfx950(device):
+    """buffer_load_to_local should produce amdgpu.buffer_load_to_local in TTGIR."""
+    compiled = compile_for_gfx950(
+        _buffer_load_to_local_kernel,
+        signature={"x_ptr": "*fp32", "output_ptr": "*fp32", "n_elements": "i32"},
+        constexprs={"BLOCK_SIZE": 64},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "buffer_load_to_local" in ttgir
+    assert "async_commit_group" in ttgir
+    assert "async_wait" in ttgir
+    assert "local_load" in ttgir
+    assert "amdgcn" in compiled.asm
+    assert len(compiled.asm["amdgcn"]) > 0
+
+
+def test_buffer_load_to_local_correctness(device):
+    """buffer_load_to_local produces correct results on gfx950 hardware."""
+    if not is_gfx950_available():
+        pytest.skip("Requires gfx950 hardware")
+    size = 256
+    x = torch.rand(size, dtype=torch.float32, device=device)
+    output = torch.empty_like(x)
+    grid = (triton.cdiv(size, 64),)
+    _buffer_load_to_local_kernel[grid](x, output, size, BLOCK_SIZE=64)
+    torch.testing.assert_close(x, output)
