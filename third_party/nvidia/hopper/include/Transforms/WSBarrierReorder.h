@@ -47,7 +47,7 @@ inline bool hasArriveLikeSemantics(Operation *op) {
   // TODO: Refine this using WSBarrier metadata so independent arrive-like ops
   // can be reordered when their channel constraints prove it is safe.
   return isa<AsyncTMACopyGlobalToLocalOp, AsyncTMAGatherOp, TMAStoreWaitOp,
-             TMAStoreTokenWaitOp, MMAv5OpInterface>(op);
+             TMAStoreTokenWaitOp, TCGen5CommitOp, MMAv5OpInterface>(op);
 }
 
 inline bool canAdvanceWSBarrier(std::optional<DictionaryAttr> constraints,

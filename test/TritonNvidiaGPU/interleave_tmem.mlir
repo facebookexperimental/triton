@@ -168,8 +168,8 @@ tt.func @sink_arrive_past_wait_disjoint(
   %unused = ttng.tmem_load %alloc : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear128>
   // CHECK: ttng.wait_barrier {{.*}}channelGraph = array<i32: 2>
   // CHECK: ttng.wait_barrier {{.*}}channelGraph = array<i32: 1>
-  // CHECK: ttng.arrive_barrier {{.*}}channelGraph = array<i32: 1>
   // CHECK: ttng.arrive_barrier {{.*}}channelGraph = array<i32: 2>
+  // CHECK: ttng.arrive_barrier {{.*}}channelGraph = array<i32: 1>
   ttng.wait_barrier %bar1, %phase {constraints = {WSBarrier = {channelGraph = array<i32: 2>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
   ttng.arrive_barrier %bar1, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 2>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
   ttng.wait_barrier %bar2, %phase {constraints = {WSBarrier = {channelGraph = array<i32: 1>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
@@ -280,6 +280,25 @@ tt.func @no_reorder_across_arrive_like_op(
   // CHECK-SAME: channelGraph = array<i32: 1>
   ttng.arrive_barrier %bar1, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 2>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
   ttng.async_tma_store_wait {pendings = 0 : i32}
+  ttng.wait_barrier %bar2, %phase {constraints = {WSBarrier = {channelGraph = array<i32: 1>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  tt.return
+}
+
+// WS barriers cannot move past tcgen05 commits.
+// CHECK-LABEL: @no_reorder_across_tcgen5_commit
+tt.func @no_reorder_across_tcgen5_commit(
+    %bar1: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %bar2: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %phase: i32) {
+  %alloc = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  %unused = ttng.tmem_load %alloc : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear128>
+  // CHECK: ttng.arrive_barrier
+  // CHECK-SAME: channelGraph = array<i32: 2>
+  // CHECK-NEXT: ttng.tc_gen5_commit
+  // CHECK-NEXT: ttng.wait_barrier
+  // CHECK-SAME: channelGraph = array<i32: 1>
+  ttng.arrive_barrier %bar1, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 2>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.tc_gen5_commit %bar1 : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
   ttng.wait_barrier %bar2, %phase {constraints = {WSBarrier = {channelGraph = array<i32: 1>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
   tt.return
 }
