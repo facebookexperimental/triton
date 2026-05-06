@@ -880,10 +880,12 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_buffer_load_to_local",
            [](TritonOpBuilder &self, Value dest, Value ptr, Value offsets,
               std::optional<Value> mask, std::optional<Value> other,
-              tt::CacheModifier cache) -> Value {
+              tt::CacheModifier cache,
+              unsigned contiguity) -> Value {
              return self.create<ttag::BufferLoadToLocalOp>(
                  dest, ptr, offsets, mask.value_or(Value()),
-                 other.value_or(Value()), Value() /*stride*/, cache);
+                 other.value_or(Value()), Value() /*stride*/, cache,
+                 contiguity);
            });
 }
 

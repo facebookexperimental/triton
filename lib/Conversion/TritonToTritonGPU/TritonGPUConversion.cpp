@@ -102,7 +102,7 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
     if (hasLegalRegions && typeConverter.isLegal(wsOp)) {
       return true;
     }
-    return false;
+    return false; 
   });
 
   addDynamicallyLegalOp<

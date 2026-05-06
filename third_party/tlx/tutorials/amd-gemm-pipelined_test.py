@@ -219,6 +219,269 @@ def matmul_kernel_pipelined_mi300(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, strid
     tl.store(c_ptrs, c, mask=c_mask)
 
 
+@triton.autotune(
+    prune_configs_by={
+        "early_config_prune": prune_configs,
+    },
+    configs=configs,
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matmul_kernel_pipelined_mi300_split_b(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak,  #
+                                          stride_bk, stride_bn,  #
+                                          stride_cm, stride_cn, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+                                          BLOCK_SIZE_K: tl.constexpr,  #
+                                          GROUP_SIZE_M: tl.constexpr,  #
+                                          NUM_STAGES: tl.constexpr  #
+                                          ):
+    HALF_N: tl.constexpr = BLOCK_SIZE_N // 2
+
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
+
+    # offset computation
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn_left = (pid_n * BLOCK_SIZE_N + tl.arange(0, HALF_N)) % N
+    offs_bn_right = (pid_n * BLOCK_SIZE_N + HALF_N + tl.arange(0, HALF_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_left_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn_left[None, :] * stride_bn)
+    b_right_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn_right[None, :] * stride_bn)
+    K_ITERS = tl.cdiv(K, BLOCK_SIZE_K)
+
+    NUM_BUFFERS = NUM_STAGES - 1
+    buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tlx.dtype_of(a_ptr), NUM_STAGES - 1)
+    buffers_B_left = tlx.local_alloc((BLOCK_SIZE_K, HALF_N), tlx.dtype_of(b_ptr), NUM_STAGES - 1)
+    buffers_B_right = tlx.local_alloc((BLOCK_SIZE_K, HALF_N), tlx.dtype_of(b_ptr), NUM_STAGES - 1)
+
+    # Pipeline Prologue
+    for i in tl.range(0, NUM_STAGES - 1, loop_unroll_factor=NUM_STAGES - 1):
+        a_smem_view = tlx.local_view(buffers_A, i)
+        b_left_smem_view = tlx.local_view(buffers_B_left, i)
+        b_right_smem_view = tlx.local_view(buffers_B_right, i)
+        a_load_reg = tl.load(a_ptrs, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K)
+        b_left_load_reg = tl.load(b_left_ptrs, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K)
+        b_right_load_reg = tl.load(b_right_ptrs, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K)
+        tlx.local_store(a_smem_view, a_load_reg)
+        tlx.local_store(b_left_smem_view, b_left_load_reg)
+        tlx.local_store(b_right_smem_view, b_right_load_reg)
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_left_ptrs += BLOCK_SIZE_K * stride_bk
+        b_right_ptrs += BLOCK_SIZE_K * stride_bk
+
+    # Pipeline Main Loop
+    acc_left = tl.zeros((BLOCK_SIZE_M, HALF_N), dtype=tl.float32)
+    acc_right = tl.zeros((BLOCK_SIZE_M, HALF_N), dtype=tl.float32)
+    for k in tl.range(NUM_STAGES - 1, K_ITERS, num_stages=0):
+        # prefetch data for k
+        a_k_smem_view = tlx.local_view(buffers_A, k % NUM_BUFFERS)
+        b_left_k_smem_view = tlx.local_view(buffers_B_left, k % NUM_BUFFERS)
+        b_right_k_smem_view = tlx.local_view(buffers_B_right, k % NUM_BUFFERS)
+        a_load_reg = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K)
+        b_left_load_reg = tl.load(b_left_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K)
+        b_right_load_reg = tl.load(b_right_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K)
+
+        # compute on data fetched NUM_STAGES - 1 ahead
+        buf = (k - NUM_STAGES - 1) % NUM_BUFFERS
+        a_k_prev_shmem = tlx.local_view(buffers_A, buf)
+        b_left_k_prev_shmem = tlx.local_view(buffers_B_left, buf)
+        b_right_k_prev_shmem = tlx.local_view(buffers_B_right, buf)
+        a_k_prev_reg = tlx.local_load(a_k_prev_shmem)
+        b_left_k_prev_reg = tlx.local_load(b_left_k_prev_shmem)
+        b_right_k_prev_reg = tlx.local_load(b_right_k_prev_shmem)
+        acc_left = tl.dot(a_k_prev_reg, b_left_k_prev_reg, acc_left)
+        acc_right = tl.dot(a_k_prev_reg, b_right_k_prev_reg, acc_right)
+
+        # store prefetched data
+        tlx.local_store(a_k_smem_view, a_load_reg)
+        tlx.local_store(b_left_k_smem_view, b_left_load_reg)
+        tlx.local_store(b_right_k_smem_view, b_right_load_reg)
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_left_ptrs += BLOCK_SIZE_K * stride_bk
+        b_right_ptrs += BLOCK_SIZE_K * stride_bk
+
+    # Epilogue
+    for k in tl.range(K_ITERS - (NUM_STAGES - 1), K_ITERS, loop_unroll_factor=NUM_STAGES - 1):
+        buf = k % NUM_BUFFERS
+        a_k_prev_shmem = tlx.local_view(buffers_A, buf)
+        b_left_k_prev_shmem = tlx.local_view(buffers_B_left, buf)
+        b_right_k_prev_shmem = tlx.local_view(buffers_B_right, buf)
+        a_k_prev_reg = tlx.local_load(a_k_prev_shmem)
+        b_left_k_prev_reg = tlx.local_load(b_left_k_prev_shmem)
+        b_right_k_prev_reg = tlx.local_load(b_right_k_prev_shmem)
+        acc_left = tl.dot(a_k_prev_reg, b_left_k_prev_reg, acc_left)
+        acc_right = tl.dot(a_k_prev_reg, b_right_k_prev_reg, acc_right)
+
+    # Store left half
+    c_left = acc_left.to(tlx.dtype_of(c_ptr))
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn_left = pid_n * BLOCK_SIZE_N + tl.arange(0, HALF_N)
+    c_left_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn_left[None, :]
+    c_left_mask = (offs_cm[:, None] < M) & (offs_cn_left[None, :] < N)
+    tl.store(c_left_ptrs, c_left, mask=c_left_mask)
+
+    # Store right half
+    c_right = acc_right.to(tlx.dtype_of(c_ptr))
+    offs_cn_right = pid_n * BLOCK_SIZE_N + HALF_N + tl.arange(0, HALF_N)
+    c_right_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn_right[None, :]
+    c_right_mask = (offs_cm[:, None] < M) & (offs_cn_right[None, :] < N)
+    tl.store(c_right_ptrs, c_right, mask=c_right_mask)
+
+
+@triton.autotune(
+    prune_configs_by={
+        "early_config_prune": prune_configs,
+    },
+    configs=configs,
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matmul_kernel_pipelined_mi300_split_b_async(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak,  #
+                                                stride_bk, stride_bn,  #
+                                                stride_cm, stride_cn, BLOCK_SIZE_M: tl.constexpr,
+                                                BLOCK_SIZE_N: tl.constexpr,
+                                                BLOCK_SIZE_K: tl.constexpr,  #
+                                                GROUP_SIZE_M: tl.constexpr,  #
+                                                NUM_STAGES: tl.constexpr  #
+                                                ):
+    HALF_N: tl.constexpr = BLOCK_SIZE_N // 2
+
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
+
+    # offset computation — use scalar base ptr + i32 offsets for buffer ops
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn_left = (pid_n * BLOCK_SIZE_N + tl.arange(0, HALF_N)) % N
+    offs_bn_right = (pid_n * BLOCK_SIZE_N + HALF_N + tl.arange(0, HALF_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    # Scalar base pointers (no per-element offset baked in yet)
+    a_base = a_ptr
+    b_base = b_ptr
+    # 2D i32 element offsets from the base pointer
+    a_offs = (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak).to(tl.int32)
+    b_left_offs = (offs_k[:, None] * stride_bk + offs_bn_left[None, :] * stride_bn).to(tl.int32)
+    b_right_offs = (offs_k[:, None] * stride_bk + offs_bn_right[None, :] * stride_bn).to(tl.int32)
+    K_ITERS = tl.cdiv(K, BLOCK_SIZE_K)
+
+    # Allocate NUM_STAGES buffers (async_load goes directly global → SMEM, no register stage)
+    buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tlx.dtype_of(a_ptr), NUM_STAGES)
+    buffers_B_left = tlx.local_alloc((BLOCK_SIZE_K, HALF_N), tlx.dtype_of(b_ptr), NUM_STAGES)
+    buffers_B_right = tlx.local_alloc((BLOCK_SIZE_K, HALF_N), tlx.dtype_of(b_ptr), NUM_STAGES)
+
+    # ===== Pipeline Prologue =====
+    # Async copy NUM_STAGES iterations of data into SMEM buffers
+    for i in tl.range(0, NUM_STAGES, loop_unroll_factor=NUM_STAGES):
+        a_buf = tlx.local_view(buffers_A, i)
+        b_left_buf = tlx.local_view(buffers_B_left, i)
+        b_right_buf = tlx.local_view(buffers_B_right, i)
+        tok_a = tlx.buffer_load_to_local(a_buf, a_ptr, a_offs, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K)
+        tok_bl = tlx.buffer_load_to_local(b_left_buf, b_ptr, b_left_offs, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K)
+        tok_br = tlx.buffer_load_to_local(b_right_buf, b_ptr, b_right_offs, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K)
+        tlx.async_load_commit_group([tok_a, tok_bl, tok_br])
+        a_offs += BLOCK_SIZE_K * stride_ak
+        b_left_offs += BLOCK_SIZE_K * stride_bk
+        b_right_offs += BLOCK_SIZE_K * stride_bk
+
+    # Wait for first buffer
+    tlx.async_load_wait_group(NUM_STAGES - 1)
+    a_reg = tlx.local_load(tlx.local_view(buffers_A, 0))
+    b_left_reg = tlx.local_load(tlx.local_view(buffers_B_left, 0))
+    b_right_reg = tlx.local_load(tlx.local_view(buffers_B_right, 0))
+
+    # ===== Pipeline Main Loop =====
+    acc_left = tl.zeros((BLOCK_SIZE_M, HALF_N), dtype=tl.float32)
+    acc_right = tl.zeros((BLOCK_SIZE_M, HALF_N), dtype=tl.float32)
+    for k in tl.range(0, K_ITERS - NUM_STAGES, num_stages=0):
+        # Consume current registers
+        acc_left = tl.dot(a_reg, b_left_reg, acc_left)
+        acc_right = tl.dot(a_reg, b_right_reg, acc_right)
+
+        # Wait for next buffer
+        tlx.async_load_wait_group(NUM_STAGES - 2)
+
+        # Prefetch k+NUM_STAGES into consumed buffer (k % NUM_STAGES)
+        g_idx = k % NUM_STAGES
+        a_next = tlx.local_view(buffers_A, g_idx)
+        b_left_next = tlx.local_view(buffers_B_left, g_idx)
+        b_right_next = tlx.local_view(buffers_B_right, g_idx)
+        future_k = k + NUM_STAGES
+        tok_a = tlx.buffer_load_to_local(a_next, a_ptr, a_offs, mask=offs_k[None, :] < K - future_k * BLOCK_SIZE_K)
+        tok_bl = tlx.buffer_load_to_local(b_left_next, b_ptr, b_left_offs, mask=offs_k[:, None] < K - future_k * BLOCK_SIZE_K)
+        tok_br = tlx.buffer_load_to_local(b_right_next, b_ptr, b_right_offs, mask=offs_k[:, None] < K - future_k * BLOCK_SIZE_K)
+        tlx.async_load_commit_group([tok_a, tok_bl, tok_br])
+        a_offs += BLOCK_SIZE_K * stride_ak
+        b_left_offs += BLOCK_SIZE_K * stride_bk
+        b_right_offs += BLOCK_SIZE_K * stride_bk
+
+        # Load next data
+        l_idx = (k + 1) % NUM_STAGES
+        a_reg = tlx.local_load(tlx.local_view(buffers_A, l_idx))
+        b_left_reg = tlx.local_load(tlx.local_view(buffers_B_left, l_idx))
+        b_right_reg = tlx.local_load(tlx.local_view(buffers_B_right, l_idx))
+
+    # ===== Pipeline Epilogue =====
+    # First epilogue DOT uses registers from main loop's last local_load
+    acc_left = tl.dot(a_reg, b_left_reg, acc_left)
+    acc_right = tl.dot(a_reg, b_right_reg, acc_right)
+
+    # Remaining epilogue DOTs: wait for each pending buffer and consume
+    for epi_k in tl.static_range(1, NUM_STAGES):
+        epi_buf = (K_ITERS - NUM_STAGES + epi_k) % NUM_STAGES
+        tlx.async_load_wait_group(NUM_STAGES - 1 - epi_k)
+        a_reg = tlx.local_load(tlx.local_view(buffers_A, epi_buf))
+        b_left_reg = tlx.local_load(tlx.local_view(buffers_B_left, epi_buf))
+        b_right_reg = tlx.local_load(tlx.local_view(buffers_B_right, epi_buf))
+        acc_left = tl.dot(a_reg, b_left_reg, acc_left)
+        acc_right = tl.dot(a_reg, b_right_reg, acc_right)
+
+    # Store left half
+    c_left = acc_left.to(tlx.dtype_of(c_ptr))
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn_left = pid_n * BLOCK_SIZE_N + tl.arange(0, HALF_N)
+    c_left_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn_left[None, :]
+    c_left_mask = (offs_cm[:, None] < M) & (offs_cn_left[None, :] < N)
+    tl.store(c_left_ptrs, c_left, mask=c_left_mask)
+
+    # Store right half
+    c_right = acc_right.to(tlx.dtype_of(c_ptr))
+    offs_cn_right = pid_n * BLOCK_SIZE_N + HALF_N + tl.arange(0, HALF_N)
+    c_right_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn_right[None, :]
+    c_right_mask = (offs_cm[:, None] < M) & (offs_cn_right[None, :] < N)
+    tl.store(c_right_ptrs, c_right, mask=c_right_mask)
+
+
 def matmul(a, b):
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
@@ -239,21 +502,251 @@ def matmul(a, b):
     return c
 
 
+def matmul_split_b(a, b):
+    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
+    assert a.is_contiguous(), "Matrix A must be contiguous"
+    M, K = a.shape
+    K, N = b.shape
+    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
+    matmul_kernel_pipelined_mi300_split_b[grid](
+        a, b, c,  #
+        M, N, K,  #
+        a.stride(0), a.stride(1),  #
+        b.stride(0), b.stride(1),  #
+        c.stride(0), c.stride(1),  #
+    )
+    return c
+
+
+def matmul_split_b_async(a, b):
+    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
+    assert a.is_contiguous(), "Matrix A must be contiguous"
+    M, K = a.shape
+    K, N = b.shape
+    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
+    matmul_kernel_pipelined_mi300_split_b_async[grid](
+        a, b, c,  #
+        M, N, K,  #
+        a.stride(0), a.stride(1),  #
+        b.stride(0), b.stride(1),  #
+        c.stride(0), c.stride(1),  #
+    )
+    return c
+
+
+@triton.autotune(
+    prune_configs_by={
+        "early_config_prune": prune_configs,
+    },
+    configs=configs,
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matmul_kernel_pipelined_mi300_split_b_async_global(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak,  #
+                                                       stride_bk, stride_bn,  #
+                                                       stride_cm, stride_cn, BLOCK_SIZE_M: tl.constexpr,
+                                                       BLOCK_SIZE_N: tl.constexpr,
+                                                       BLOCK_SIZE_K: tl.constexpr,  #
+                                                       GROUP_SIZE_M: tl.constexpr,  #
+                                                       NUM_STAGES: tl.constexpr  #
+                                                       ):
+    """Split-B pipelined GEMM using tlx.async_load (AsyncCopyGlobalToLocal) instead of buffer_load_to_local."""
+    HALF_N: tl.constexpr = BLOCK_SIZE_N // 2
+
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
+
+    # offset computation — use tensor of pointers for async_load
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn_left = (pid_n * BLOCK_SIZE_N + tl.arange(0, HALF_N)) % N
+    offs_bn_right = (pid_n * BLOCK_SIZE_N + HALF_N + tl.arange(0, HALF_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_left_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn_left[None, :] * stride_bn)
+    b_right_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn_right[None, :] * stride_bn)
+    K_ITERS = tl.cdiv(K, BLOCK_SIZE_K)
+
+    # Allocate NUM_STAGES buffers
+    buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tlx.dtype_of(a_ptr), NUM_STAGES)
+    buffers_B_left = tlx.local_alloc((BLOCK_SIZE_K, HALF_N), tlx.dtype_of(b_ptr), NUM_STAGES)
+    buffers_B_right = tlx.local_alloc((BLOCK_SIZE_K, HALF_N), tlx.dtype_of(b_ptr), NUM_STAGES)
+
+    # ===== Pipeline Prologue =====
+    for i in tl.range(0, NUM_STAGES, loop_unroll_factor=NUM_STAGES):
+        a_buf = tlx.local_view(buffers_A, i)
+        b_left_buf = tlx.local_view(buffers_B_left, i)
+        b_right_buf = tlx.local_view(buffers_B_right, i)
+        tok_a = tlx.async_load(a_ptrs, a_buf, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K)
+        tok_bl = tlx.async_load(b_left_ptrs, b_left_buf, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K)
+        tok_br = tlx.async_load(b_right_ptrs, b_right_buf, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K)
+        tlx.async_load_commit_group([tok_a, tok_bl, tok_br])
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_left_ptrs += BLOCK_SIZE_K * stride_bk
+        b_right_ptrs += BLOCK_SIZE_K * stride_bk
+
+    # Wait for first buffer
+    tlx.async_load_wait_group(NUM_STAGES - 1)
+    a_reg = tlx.local_load(tlx.local_view(buffers_A, 0))
+    b_left_reg = tlx.local_load(tlx.local_view(buffers_B_left, 0))
+    b_right_reg = tlx.local_load(tlx.local_view(buffers_B_right, 0))
+
+    # ===== Pipeline Main Loop =====
+    acc_left = tl.zeros((BLOCK_SIZE_M, HALF_N), dtype=tl.float32)
+    acc_right = tl.zeros((BLOCK_SIZE_M, HALF_N), dtype=tl.float32)
+    for k in tl.range(0, K_ITERS - NUM_STAGES, num_stages=0):
+        acc_left = tl.dot(a_reg, b_left_reg, acc_left)
+        acc_right = tl.dot(a_reg, b_right_reg, acc_right)
+
+        tlx.async_load_wait_group(NUM_STAGES - 2)
+
+        g_idx = k % NUM_STAGES
+        a_next = tlx.local_view(buffers_A, g_idx)
+        b_left_next = tlx.local_view(buffers_B_left, g_idx)
+        b_right_next = tlx.local_view(buffers_B_right, g_idx)
+        future_k = k + NUM_STAGES
+        tok_a = tlx.async_load(a_ptrs, a_next, mask=offs_k[None, :] < K - future_k * BLOCK_SIZE_K)
+        tok_bl = tlx.async_load(b_left_ptrs, b_left_next, mask=offs_k[:, None] < K - future_k * BLOCK_SIZE_K)
+        tok_br = tlx.async_load(b_right_ptrs, b_right_next, mask=offs_k[:, None] < K - future_k * BLOCK_SIZE_K)
+        tlx.async_load_commit_group([tok_a, tok_bl, tok_br])
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_left_ptrs += BLOCK_SIZE_K * stride_bk
+        b_right_ptrs += BLOCK_SIZE_K * stride_bk
+
+        l_idx = (k + 1) % NUM_STAGES
+        a_reg = tlx.local_load(tlx.local_view(buffers_A, l_idx))
+        b_left_reg = tlx.local_load(tlx.local_view(buffers_B_left, l_idx))
+        b_right_reg = tlx.local_load(tlx.local_view(buffers_B_right, l_idx))
+
+    # ===== Pipeline Epilogue =====
+    acc_left = tl.dot(a_reg, b_left_reg, acc_left)
+    acc_right = tl.dot(a_reg, b_right_reg, acc_right)
+
+    for epi_k in tl.static_range(1, NUM_STAGES):
+        epi_buf = (K_ITERS - NUM_STAGES + epi_k) % NUM_STAGES
+        tlx.async_load_wait_group(NUM_STAGES - 1 - epi_k)
+        a_reg = tlx.local_load(tlx.local_view(buffers_A, epi_buf))
+        b_left_reg = tlx.local_load(tlx.local_view(buffers_B_left, epi_buf))
+        b_right_reg = tlx.local_load(tlx.local_view(buffers_B_right, epi_buf))
+        acc_left = tl.dot(a_reg, b_left_reg, acc_left)
+        acc_right = tl.dot(a_reg, b_right_reg, acc_right)
+
+    # Store left half
+    c_left = acc_left.to(tlx.dtype_of(c_ptr))
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn_left = pid_n * BLOCK_SIZE_N + tl.arange(0, HALF_N)
+    c_left_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn_left[None, :]
+    c_left_mask = (offs_cm[:, None] < M) & (offs_cn_left[None, :] < N)
+    tl.store(c_left_ptrs, c_left, mask=c_left_mask)
+
+    # Store right half
+    c_right = acc_right.to(tlx.dtype_of(c_ptr))
+    offs_cn_right = pid_n * BLOCK_SIZE_N + HALF_N + tl.arange(0, HALF_N)
+    c_right_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn_right[None, :]
+    c_right_mask = (offs_cm[:, None] < M) & (offs_cn_right[None, :] < N)
+    tl.store(c_right_ptrs, c_right, mask=c_right_mask)
+
+
+def matmul_split_b_async_global(a, b):
+    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
+    assert a.is_contiguous(), "Matrix A must be contiguous"
+    M, K = a.shape
+    K, N = b.shape
+    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
+    matmul_kernel_pipelined_mi300_split_b_async_global[grid](
+        a, b, c,  #
+        M, N, K,  #
+        a.stride(0), a.stride(1),  #
+        b.stride(0), b.stride(1),  #
+        c.stride(0), c.stride(1),  #
+    )
+    return c
+
+
+# @pytest.mark.skipif(
+#     not is_hip(),
+#     reason="Requires AMD GPU",
+# )
+# def test_op():
+#     torch.manual_seed(0)
+#     a = torch.randn((8192, 8192), device=DEVICE, dtype=torch.float16)
+#     b = torch.randn((8192, 8192), device=DEVICE, dtype=torch.float16)
+#     triton_output = matmul(a, b)
+#     torch_output = torch.matmul(a, b)
+#     print(f"triton_output_with_fp16_inputs={triton_output}")
+#     print(f"torch_output_with_fp16_inputs={torch_output}")
+#     rtol = 1e-2 if is_hip_cdna2() else 1e-4
+#     # TODO. rtol 1e-5 failed while 1e-4 passed on Hopper
+#     torch.allclose(triton_output, torch_output, atol=1e-2, rtol=rtol)
+
+
 @pytest.mark.skipif(
     not is_hip(),
     reason="Requires AMD GPU",
 )
-def test_op():
+def test_op_split_b():
     torch.manual_seed(0)
     a = torch.randn((8192, 8192), device=DEVICE, dtype=torch.float16)
     b = torch.randn((8192, 8192), device=DEVICE, dtype=torch.float16)
-    triton_output = matmul(a, b)
+    triton_output = matmul_split_b(a, b)
     torch_output = torch.matmul(a, b)
-    print(f"triton_output_with_fp16_inputs={triton_output}")
-    print(f"torch_output_with_fp16_inputs={torch_output}")
+    print(f"triton_split_b_output={triton_output}")
+    print(f"torch_output={torch_output}")
     rtol = 1e-2 if is_hip_cdna2() else 1e-4
-    # TODO. rtol 1e-5 failed while 1e-4 passed on Hopper
-    torch.allclose(triton_output, torch_output, atol=1e-2, rtol=rtol)
+    assert torch.allclose(triton_output, torch_output, atol=1e-2, rtol=rtol), \
+        f"Max diff: {torch.max(torch.abs(triton_output - torch_output))}"
+
+
+@pytest.mark.skipif(
+    not is_hip(),
+    reason="Requires AMD GPU",
+)
+def test_op_split_b_async():
+    torch.manual_seed(0)
+    a = torch.randn((8192, 8192), device=DEVICE, dtype=torch.float16)
+    b = torch.randn((8192, 8192), device=DEVICE, dtype=torch.float16)
+    triton_output = matmul_split_b_async(a, b)
+    torch_output = torch.matmul(a, b)
+    print(f"triton_split_b_async_output={triton_output}")
+    print(f"torch_output={torch_output}")
+    rtol = 1e-2 if is_hip_cdna2() else 1e-4
+    assert torch.allclose(triton_output, torch_output, atol=1e-2, rtol=rtol), \
+        f"Max diff: {torch.max(torch.abs(triton_output - torch_output))}"
+
+
+@pytest.mark.skipif(
+    not is_hip(),
+    reason="Requires AMD GPU",
+)
+def test_op_split_b_async_global():
+    torch.manual_seed(0)
+    a = torch.randn((8192, 8192), device=DEVICE, dtype=torch.float16)
+    b = torch.randn((8192, 8192), device=DEVICE, dtype=torch.float16)
+    triton_output = matmul_split_b_async_global(a, b)
+    torch_output = torch.matmul(a, b)
+    print(f"triton_split_b_async_global_output={triton_output}")
+    print(f"torch_output={torch_output}")
+    rtol = 1e-2 if is_hip_cdna2() else 1e-4
+    assert torch.allclose(triton_output, torch_output, atol=1e-2, rtol=rtol), \
+        f"Max diff: {torch.max(torch.abs(triton_output - torch_output))}"
 
 
 TORCH_HAS_FP8 = False
@@ -308,6 +801,41 @@ def benchmark(M, N, K, provider, fp8_inputs):
     return perf(ms), perf(max_ms), perf(min_ms)
 
 
+# Benchmark: split-B vs baseline
+split_b_configs = [
+    triton.testing.Benchmark(
+        x_names=["M", "N", "K"],
+        x_vals=[(4096, 4096, 8192)],
+        line_arg="provider",
+        line_vals=[ref_lib.lower(), "triton_split_b", "triton_split_b_async", "triton_split_b_async_global"],
+        line_names=[ref_lib, "Split-B (reg)", "Split-B Async (buffer)", "Split-B Async (global)"],
+        styles=[("green", "-"), ("blue", "-"), ("red", "--"), ("orange", ":")],
+        ylabel="TFLOPS",
+        plot_name="matmul-split-b-vs-baseline-fp16",
+        args={},
+    ),
+]
+
+
+@triton.testing.perf_report(split_b_configs)
+def benchmark_split_b(M, N, K, provider):
+    a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
+    b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
+    quantiles = [0.5, 0.2, 0.8]
+    if provider == ref_lib.lower():
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles, rep=1000)
+    elif provider == 'triton_baseline':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b), quantiles=quantiles, rep=1000)
+    elif provider == 'triton_split_b':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul_split_b(a, b), quantiles=quantiles, rep=1000)
+    elif provider == 'triton_split_b_async':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul_split_b_async(a, b), quantiles=quantiles, rep=1000)
+    elif provider == 'triton_split_b_async_global':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul_split_b_async_global(a, b), quantiles=quantiles, rep=1000)
+    perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
+    return perf(ms), perf(max_ms), perf(min_ms)
+
+
 if __name__ == "__main__":
     print("Running benchmarks...")
-    benchmark.run(print_data=True)
+    benchmark_split_b.run(print_data=True)

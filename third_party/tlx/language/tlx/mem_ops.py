@@ -144,9 +144,14 @@ def buffer_load_to_local(
     other_handle = other.handle if other is not None else None
     cache_mod = _semantic._str_to_load_cache_modifier(cache_modifier) if cache_modifier else ir.CACHE_MODIFIER.NONE
 
+    # Compute minimum contiguity for direct-to-LDS: hardware requires ≥32-bit writes,
+    # so sub-32-bit elements need multiple contiguous elements per load.
+    elem_bits = ptr.type.scalar.element_ty.primitive_bitwidth
+    min_contiguity = max(1, 32 // elem_bits)
+
     handle = _semantic.builder.create_buffer_load_to_local(
         dest.handle, ptr.handle, offsets.handle,
-        mask_handle, other_handle, cache_mod)
+        mask_handle, other_handle, cache_mod, min_contiguity)
     return tlx.async_token(handle)
 
 
