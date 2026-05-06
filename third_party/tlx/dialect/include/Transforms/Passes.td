@@ -57,24 +57,29 @@ def TlxPropagateLayout : Pass<"tlx-propagate-layout", "mlir::ModuleOp"> {
 }
 
 def TLXInsertRequireLayout : Pass<"tlx-insert-require-layout", "mlir::ModuleOp"> {
-  let summary = "Insert explicit TLX layout constraints for local_load-to-dot paths";
+  let summary = "Insert explicit TLX layout constraints for local_load-to-dot and TDM paths";
 
   let description = [{
-    This pass discovers dot-fed ttg.local_load operations and inserts the
-    missing tlx.require_layout constraints needed for the AMD local_load-to-dot
-    path.
+    This pass discovers consumers with implicit shared-memory layout
+    requirements and synthesizes the missing tlx.require_layout
+    constraints so tlx-propagate-layout can rewrite the source allocs.
 
-    The pass only synthesizes explicit TLX layout constraints:
-    - memdesc-side tlx.require_layout constraints for shared-memory swizzling
-    - tensor-side tlx.require_layout constraints in place of dot-path
-      ttg.convert_layout operations
+    Today it covers two consumer flavors:
+    - Dot-fed `ttg.local_load` chains: insert memdesc-side and tensor-side
+      `tlx.require_layout` constraints for the AMD local_load-to-dot path.
+    - AMD TDM descriptor copies (`amdgpu.async_tdm_copy_global_to_local`):
+      insert a memdesc-side `tlx.require_layout` on the buffer operand
+      with the descriptor-compatible padded encoding.
 
-    It does not own tensor/register propagation or convert cleanup; those are
-    handled by tlx-propagate-layout and downstream cleanup passes.
+    The pass only synthesizes explicit TLX layout constraints. Tensor /
+    register propagation, region-branch retagging, and final convert
+    cleanup are handled by tlx-propagate-layout and downstream cleanup
+    passes.
   }];
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
-                           "mlir::triton::tlx::TLXDialect"];
+                           "mlir::triton::tlx::TLXDialect",
+                           "mlir::triton::amdgpu::TritonAMDGPUDialect"];
 
 }
 

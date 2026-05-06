@@ -5,7 +5,7 @@ add_subdirectory(include)
 add_subdirectory(lib)
 if(TRITON_BUILD_PYTHON_MODULE)
   add_triton_plugin(TritonTLX ${CMAKE_CURRENT_SOURCE_DIR}/triton_tlx.cc)
-  target_link_libraries(TritonTLX PRIVATE TLXIR Python3::Module pybind11::headers)
+  target_link_libraries(TritonTLX PRIVATE TLXIR TritonAMDGPUIR Python3::Module pybind11::headers)
 endif()
 
 target_compile_options(TritonTLX PRIVATE -Wno-deprecated-declarations)
