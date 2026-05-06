@@ -1,4 +1,6 @@
 #include "IR/Dialect.h"
+#include "amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "amd/lib/TritonAMDGPUTransforms/Utility.h"
 #include "mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h"
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Analysis/DataFlow/SparseAnalysis.h"
@@ -22,6 +24,7 @@ using namespace mlir::dataflow;
 namespace tt = ::mlir::triton;
 namespace ttg = ::mlir::triton::gpu;
 namespace tlx = ::mlir::triton::tlx;
+namespace amdgpu = ::mlir::triton::amdgpu;
 
 namespace mlir {
 namespace triton {
@@ -252,12 +255,57 @@ computeSharedEncFromDotEnc(ttg::DotOperandEncodingAttr dotEnc,
                                               /*needTrans=*/false);
 }
 
+// Walk up the memdesc def-chain through subview / reinterpret ops to
+// the source value (typically a `ttg.local_alloc`).
+static Value findMemDescRoot(Value memdesc) {
+  Value root = memdesc;
+  while (root) {
+    Operation *def = root.getDefiningOp();
+    if (!def)
+      break;
+    if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp>(def)) {
+      root = def->getOperand(0);
+      continue;
+    }
+    break;
+  }
+  return root;
+}
+
+// True if any sibling-subview user of the memdesc value's source alloc
+// is a TDM copy op. Used by the dot-path walk to hand off TDM-fed
+// buffers to the TDM anchor — both walks targeting the same alloc with
+// different encodings would otherwise conflict in the propagation
+// lattice.
+static bool isFedByTDM(Value memdesc) {
+  llvm::SetVector<Value> worklist;
+  worklist.insert(findMemDescRoot(memdesc));
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    for (Operation *u : v.getUsers()) {
+      if (isa<amdgpu::AsyncTDMCopyGlobalToLocalOp>(u))
+        return true;
+      if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp>(u))
+        worklist.insert(u->getResult(0));
+    }
+  }
+  return false;
+}
+
 static void applyRequireLayout(ttg::SwizzledSharedEncodingAttr encoding,
                                ttg::LocalLoadOp localLoadOp,
                                OpBuilder &builder) {
   auto loadMemDesc = localLoadOp->getOperand(0);
 
   if (loadMemDesc.getDefiningOp<tlx::RequireLayoutOp>())
+    return;
+
+  // Defer to the TDM anchor for buffers fed by `amdgpu.async_tdm_*`. The
+  // TDM walk picks a padded encoding that's compatible with the descriptor
+  // (and dot-aware when applicable); inserting a sibling swizzled anchor
+  // here would conflict with that constraint and widen the lattice to
+  // unknown.
+  if (isFedByTDM(loadMemDesc))
     return;
 
   // Respect user-specified order on the source memdesc.
@@ -313,6 +361,264 @@ static void materializeDotUserTensorConstraints(ModuleOp m,
   });
 }
 
+// ============================================================================
+// AMD TDM descriptor anchors
+// ============================================================================
+//
+// `amdgpu.async_tdm_copy_global_to_local` writes into a user-provided shared
+// memory buffer whose required encoding is determined by the descriptor's
+// shape and element type — and, when the buffer feeds a `tt.dot`, by the
+// dot operand's WMMA encoding. When TLX users allocate the buffer with the
+// default `local_alloc(...)` (no explicit `layout=`), the alloc's encoding
+// is the generic non-swizzled `SwizzledSharedEncoding(maxPhase=1)` — which
+// the TDM op verifier accepts but which produces wrong LDS data on real
+// gfx1250 hardware. We anchor a `tlx.require_layout` on the buffer operand
+// of every TDM copy so `tlx-propagate-layout` rewrites the source
+// `local_alloc` (and any subview / loop-carrier chain) to the
+// descriptor-compatible encoding.
+
+namespace {
+
+struct DotConsumerInfo {
+  int opIdx;
+  unsigned kWidth;
+  bool operator==(const DotConsumerInfo &o) const {
+    return opIdx == o.opIdx && kWidth == o.kWidth;
+  }
+};
+
+// Per-memdesc-value lattice tracking the dot-operand consumer info that
+// any downstream `ttg.local_load -> tt.dot` chain would impose.
+//
+//   Uninitialized — no consumer information observed yet.
+//   Required(info) — every reachable LocalLoadOp consumer agrees on info.
+//   Conflict       — two reachable consumers disagree; the TDM anchor
+//                    falls back to the descriptor-default encoding.
+class DotConsumerState {
+public:
+  enum class Kind { Uninitialized, Required, Conflict };
+
+  DotConsumerState() = default;
+  explicit DotConsumerState(DotConsumerInfo info)
+      : kind(Kind::Required), info(info) {}
+
+  static DotConsumerState getConflict() {
+    DotConsumerState s;
+    s.kind = Kind::Conflict;
+    return s;
+  }
+
+  bool isUninitialized() const { return kind == Kind::Uninitialized; }
+  bool isRequired() const { return kind == Kind::Required; }
+  bool isConflict() const { return kind == Kind::Conflict; }
+  DotConsumerInfo getInfo() const {
+    assert(isRequired());
+    return info;
+  }
+
+  bool operator==(const DotConsumerState &o) const {
+    return kind == o.kind && info == o.info;
+  }
+
+  // Backward propagation meet: uninitialized yields to any concrete
+  // state; equal concrete states stay concrete; conflicting concrete
+  // states widen to Conflict.
+  static DotConsumerState meet(const DotConsumerState &lhs,
+                               const DotConsumerState &rhs) {
+    if (lhs.isConflict() || rhs.isConflict())
+      return getConflict();
+    if (lhs.isUninitialized())
+      return rhs;
+    if (rhs.isUninitialized())
+      return lhs;
+    if (lhs == rhs)
+      return lhs;
+    return getConflict();
+  }
+  static DotConsumerState join(const DotConsumerState &lhs,
+                               const DotConsumerState &rhs) {
+    return meet(lhs, rhs);
+  }
+
+  void print(raw_ostream &os) const {
+    if (isUninitialized()) {
+      os << "<uninitialized>";
+      return;
+    }
+    if (isConflict()) {
+      os << "<conflict>";
+      return;
+    }
+    os << "Required{opIdx=" << info.opIdx << ", kWidth=" << info.kWidth << "}";
+  }
+
+  friend raw_ostream &operator<<(raw_ostream &os, const DotConsumerState &s) {
+    s.print(os);
+    return os;
+  }
+
+private:
+  Kind kind = Kind::Uninitialized;
+  DotConsumerInfo info{};
+};
+
+class DotConsumerLattice : public Lattice<DotConsumerState> {
+public:
+  using Lattice::Lattice;
+};
+
+// Sparse backward dataflow that propagates dot-operand consumer info
+// from `ttg.local_load` ops up through the memdesc def-chain (subview /
+// reinterpret / `tlx.require_layout`) to the source `ttg.local_alloc`,
+// and back down to all sibling subviews (including the TDM op's buffer
+// operand) via the framework's region-branch / scf.for iter-arg /
+// warp_specialize handling.
+class DotConsumerBackward
+    : public SparseBackwardDataFlowAnalysis<DotConsumerLattice> {
+public:
+  using SparseBackwardDataFlowAnalysis::SparseBackwardDataFlowAnalysis;
+
+  LogicalResult
+  visitOperation(Operation *op, ArrayRef<DotConsumerLattice *> operands,
+                 ArrayRef<const DotConsumerLattice *> results) override {
+    // Seed: a LocalLoadOp whose result tensor carries DotOperandEncoding
+    // imposes that encoding on its memdesc operand.
+    if (auto load = dyn_cast<ttg::LocalLoadOp>(op)) {
+      if (auto resTy = dyn_cast<RankedTensorType>(load.getResult().getType())) {
+        if (auto dotEnc = dyn_cast_or_null<ttg::DotOperandEncodingAttr>(
+                resTy.getEncoding())) {
+          DotConsumerState seed(
+              DotConsumerInfo{static_cast<int>(dotEnc.getOpIdx()),
+                              static_cast<unsigned>(dotEnc.getKWidth())});
+          if (!operands.empty()) {
+            ChangeResult changed = operands[0]->meet(seed);
+            propagateIfChanged(operands[0], changed);
+          }
+        }
+      }
+      return success();
+    }
+
+    // Transparent memdesc carriers: meet each result lattice into the
+    // corresponding memdesc operand lattice. This propagates from
+    // subview / reinterpret / require_layout results back to their
+    // source memdesc, which lets the alloc converge to the meet of
+    // every sibling subview's dot-consumer state.
+    if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
+            tlx::RequireLayoutOp>(op)) {
+      for (const auto resultLattice : results) {
+        for (auto [i, operandLattice] : llvm::enumerate(operands)) {
+          if (!isa<ttg::MemDescType>(op->getOpOperand(i).get().getType()))
+            continue;
+          ChangeResult changed =
+              operandLattice->meet(resultLattice->getValue());
+          propagateIfChanged(operandLattice, changed);
+        }
+      }
+      return success();
+    }
+
+    // Other users of memdesc values (TDM ops, local_store, etc.) impose
+    // no dot-consumer requirement — leaving the operand lattice alone.
+    return success();
+  }
+
+  // Required pure-virtual overrides. This is an info-only lattice (not a
+  // legality analysis like DotRewriteBackward, which poisons here): leaving
+  // unanalyzed cases as Uninitialized is safe because findDotConsumer
+  // returns nullopt for both Uninitialized and Conflict, and the caller
+  // falls back to buildDefaultTDMDescriptorEncoding.
+  void visitBranchOperand(OpOperand &) override {}
+  void visitCallOperand(OpOperand &) override {}
+  void setToExitState(DotConsumerLattice *) override {}
+  void visitNonControlFlowArguments(RegionSuccessor &,
+                                    ArrayRef<BlockArgument>) override {}
+};
+
+} // namespace
+
+// Read the dot-consumer info from the propagation lattice at the alloc
+// reachable from `buffer`. Returns nullopt for Uninitialized / Conflict
+// (the caller falls back to the descriptor-default encoding).
+static std::optional<DotConsumerInfo> findDotConsumer(Value buffer,
+                                                      DataFlowSolver &solver) {
+  Value root = findMemDescRoot(buffer);
+  auto *lattice = solver.lookupState<DotConsumerLattice>(root);
+  if (!lattice)
+    return std::nullopt;
+  const auto &state = lattice->getValue();
+  if (!state.isRequired())
+    return std::nullopt;
+  return state.getInfo();
+}
+
+static void anchorTDMRequireLayout(amdgpu::AsyncTDMCopyGlobalToLocalOp tdmOp,
+                                   OpBuilder &builder, DataFlowSolver &solver) {
+  Value buf = tdmOp.getResult();
+
+  if (buf.getDefiningOp<tlx::RequireLayoutOp>())
+    return;
+
+  auto bufType = dyn_cast<ttg::MemDescType>(buf.getType());
+  if (!bufType)
+    return;
+
+  auto descTy = cast<tt::TensorDescType>(tdmOp.getDesc().getType());
+  ArrayRef<int64_t> shape = descTy.getBlockType().getShape();
+  Type elementType = descTy.getBlockType().getElementType();
+
+  // Row-major identity order matches what `getFallbackSharedEncoding`
+  // would pick for a TLX descriptor with no upstream layout.
+  unsigned rank = shape.size();
+  SmallVector<unsigned> order(rank);
+  for (unsigned i = 0; i < rank; ++i)
+    order[i] = rank - 1 - i;
+
+  auto cgaLayout = ttg::CGAEncodingAttr::get1CTALayout(buf.getContext(), rank);
+
+  // Prefer the WMMA-tuned padded encoding when the buffer feeds a
+  // `tt.dot`: `composePaddedLayout` picks intervals/paddings to avoid bank
+  // conflicts on the `local_load -> tt.dot` lowering. Fall back to the
+  // descriptor-shape-only default for non-dot consumers.
+  //
+  // Using a dot-tuned encoding here is safe because the AMD
+  // `OptimizeDescriptorEncoding` pass walks TDM copies and propagates this
+  // encoding back to the descriptor's `TensorDescType`, so the hardware
+  // (which reads stride from the descriptor) and the alloc (which uses
+  // this encoding to size the LDS region) agree by construction.
+  Attribute encoding;
+  if (auto info = findDotConsumer(buf, solver)) {
+    auto archStr = getAMDArch(tdmOp->getParentOfType<ModuleOp>());
+    auto targetInfo = tt::AMD::TargetInfo(archStr.value_or("").str());
+    // Use bufType (MemDescType) instead of the descriptor's block type:
+    // bufType carries the alloc's CGA layout, while the descriptor type
+    // is still un-encoded at this point (OptimizeDescriptorEncoding runs
+    // later and is what propagates the encoding back to the descriptor).
+    encoding = composePaddedLayout(targetInfo, info->opIdx, info->kWidth,
+                                   cast<ttg::TensorOrMemDesc>(bufType), order);
+  }
+  if (!encoding)
+    encoding = buildDefaultTDMDescriptorEncoding(buf.getContext(), shape, order,
+                                                 cgaLayout, elementType);
+  if (!encoding)
+    return;
+
+  builder.setInsertionPoint(tdmOp);
+  auto newType = ttg::MemDescType::get(
+      bufType.getShape(), bufType.getElementType(), encoding,
+      bufType.getMemorySpace(), bufType.getMutableMemory());
+  auto requireOp =
+      tlx::RequireLayoutOp::create(builder, tdmOp.getLoc(), newType, buf);
+  tdmOp.getResultMutable().assign(requireOp.getResult());
+}
+
+static void materializeTDMConstraints(ModuleOp m, OpBuilder &builder,
+                                      DataFlowSolver &solver) {
+  m.walk([&](amdgpu::AsyncTDMCopyGlobalToLocalOp tdmOp) {
+    anchorTDMRequireLayout(tdmOp, builder, solver);
+  });
+}
+
 } // namespace
 
 // ============================================================================
@@ -330,6 +636,11 @@ LogicalResult insertRequireLayout(ModuleOp m) {
   DataFlowSolver solver;
   loadBaselineAnalyses(solver);
   solver.load<DotRewriteBackward>(symbolTable);
+  // Memdesc-level dot-consumer analysis used by the TDM anchor below to
+  // pick the WMMA-tuned padded encoding when a downstream `local_load`
+  // requires it. Conflict-widens-to-default; the framework handles
+  // scf.for iter-args, region branches, and warp_specialize captures.
+  solver.load<DotConsumerBackward>(symbolTable);
   if (failed(solver.initializeAndRun(m)))
     return failure();
 
@@ -368,6 +679,11 @@ LogicalResult insertRequireLayout(ModuleOp m) {
   });
 
   materializeDotUserTensorConstraints(m, builder);
+
+  // Anchor `tlx.require_layout` on AMD TDM copy buffer operands so
+  // tlx-propagate-layout rewrites the source `local_alloc` to a
+  // descriptor-compatible encoding.
+  materializeTDMConstraints(m, builder, solver);
 
   return success();
 }

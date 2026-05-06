@@ -16,6 +16,8 @@ add_triton_library(TritonTLXTransforms
   LINK_LIBS PUBLIC
   TritonGPUIR
   TLXIR
+  TritonAMDGPUIR
+  TritonAMDGPUTransforms
 )
 
 target_compile_options(TritonTLXTransforms PRIVATE -Wno-deprecated-declarations)

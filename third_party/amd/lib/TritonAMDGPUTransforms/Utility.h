@@ -43,6 +43,22 @@ triton::gpu::SharedEncodingTrait
 getEncodingFromDescriptor(Operation *op, RankedTensorType tensorType,
                           Value desc);
 
+/// Build the default shared encoding that AMD's TDM descriptor pipeline
+/// would assign to a descriptor of the given shape and element type when
+/// no upstream user (e.g., dot-operand consumer) constrains it further.
+///
+/// Returns a `PaddedSharedEncodingAttr` for shapes whose innermost
+/// dimension fits the TDM pad-interval limit, falling back to a
+/// non-swizzled `SwizzledSharedEncodingAttr` otherwise. This is the same
+/// fallback that
+/// `AMDGPUAssignDescriptorMemoryLayouts::buildFallbackSharedEncoding`
+/// applies inside the `OptimizeDescriptorEncoding` pass, exposed as a
+/// free function so other passes can compute the descriptor-compatible
+/// encoding without going through the full assignment pipeline.
+Attribute buildDefaultTDMDescriptorEncoding(
+    MLIRContext *ctx, ArrayRef<int64_t> shape, ArrayRef<unsigned> order,
+    triton::gpu::CGAEncodingAttr cgaLayout, Type elementType);
+
 // Returns the given |inputValue|'s dot user result encoding and updates |opIdx|
 // and |vecSize| with which dot operand |inputValue| is fed into if possible.
 template <class T>

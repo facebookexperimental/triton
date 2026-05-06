@@ -1,3 +1,4 @@
+import warnings
 from typing import Optional, overload, Tuple
 
 import triton.language.core as tl
@@ -6,7 +7,7 @@ from triton._C.libtriton import ir
 from . import types as tlx
 from .mma_ops import require_nv_mma_shared_layout
 from .types import storage_kind
-from .utility import cuda_parse_arch
+from .utility import cuda_parse_arch, is_amd_tdm_target
 
 
 def _assert_blackwell_for_tmem(arch):
@@ -161,6 +162,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
         if storage == tlx.storage_kind.smem:
             if len(shape) == 1:
                 layout = tlx.swizzled_shared_layout_encoding.make_default(rank=len(shape))
+                layout._tlx_default = True
                 layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
                     layout.vectorSize,
                     layout.perPhase,
@@ -175,6 +177,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
                 is_amd = arch.startswith("gfx")
                 if is_amd:
                     layout = tlx.swizzled_shared_layout_encoding.make_default(rank=len(shape))
+                    layout._tlx_default = True
                     layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
                         layout.vectorSize,
                         layout.perPhase,
@@ -209,7 +212,12 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
                 layout = tlx.tensor_memory_layout_encoding.make_default(shape)
             layout_handle = layout.to_ir(_semantic.builder)
     else:
-        raise NotImplementedError("User-specified layout encoding not yet implemented.")
+        if storage != tlx.storage_kind.smem:
+            raise NotImplementedError("User-specified layout encoding is only supported for shared memory (smem)")
+        layout = tl._unwrap_if_constexpr(layout)
+        if not isinstance(layout, tlx.shared_layout_encoding):
+            raise TypeError(f"`layout` must be a tlx.shared_layout_encoding, got {type(layout).__name__}")
+        layout_handle = layout.to_ir(_semantic.builder)
 
     alias_handle = None
     shared_buffer_handle = None
@@ -829,7 +837,20 @@ def async_descriptor_load(
     multicast_targets: list[tl.tensor] = [],
     _semantic=None,
 ) -> None:
+    """Asynchronous descriptor load via NV TMA.
+
+    NV-only. AMD users should call :func:`async_amd_descriptor_load`
+    instead — the AMD path has counter-based completion (no
+    ``barrier``), no ``cache_modifier`` / ``eviction_policy`` /
+    ``multicast_targets``, and the buffer encoding is determined by the
+    descriptor (rather than forced to NV-MMA shared).
+    """
     assert isinstance(desc, tl.tensor_descriptor_base)
+    arch = _semantic.builder.options.arch
+    if isinstance(arch, str) and arch.startswith("gfx"):
+        raise NotImplementedError(f"tlx.async_descriptor_load is NV-only; got AMD arch '{arch}'. "
+                                  "Use tlx.async_amd_descriptor_load on TDM-capable AMD targets (gfx1250+); "
+                                  "non-TDM AMD targets do not have a descriptor-based async load.")
     assert eviction_policy in ("", "evict_first", "evict_last"), \
         f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'"
     ndim = len(desc.block_shape)
@@ -854,6 +875,130 @@ def async_descriptor_load(
         eviction,
         False,
     )
+
+
+def _amd_tdm_descriptor_layout(desc):
+    """Compute the AMD TDM descriptor-compatible shared layout.
+
+    Mirrors ``AMDGPUAssignDescriptorMemoryLayouts::buildFallbackSharedEncoding``
+    in ``third_party/amd/lib/TritonAMDGPUTransforms/OptimizeDescriptorEncoding.cpp``
+    (the upstream source of truth for the layout the TDM descriptor expects).
+    Keep the formula in sync with that helper.
+    """
+    ndim = len(desc.block_shape)
+    order = list(reversed(range(ndim)))
+    block_shape = [int(dim) for dim in desc.block_shape]
+    elem_width = desc.dtype.primitive_bitwidth
+    pad_interval = int(block_shape[order[0]])
+    pad_amount = 128 // elem_width
+    # Pad-interval limit: the TDM descriptor's pad-interval field is bounded;
+    # fall back to a non-padded swizzled encoding above that limit.
+    max_pad_interval = 256 * 32 // elem_width
+    if pad_interval <= max_pad_interval:
+        return tlx.padded_shared_layout_encoding.with_identity_for([(pad_interval, pad_amount)], block_shape, order)
+    return tlx.swizzled_shared_layout_encoding.make_default(rank=ndim)
+
+
+def _layouts_match(actual, expected):
+    """True iff two TLX shared layouts are observably equivalent.
+
+    We only compare the fields that affect TDM-LDS layout; other CGA
+    fields use the default 1-CTA values in this code path.
+    """
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(actual, tlx.padded_shared_layout_encoding):
+        return (actual.intervals == expected.intervals and actual.paddings == expected.paddings
+                and actual.order == expected.order and actual.shape == expected.shape)
+    if isinstance(actual, tlx.swizzled_shared_layout_encoding):
+        return (actual.vectorSize == expected.vectorSize and actual.perPhase == expected.perPhase
+                and actual.maxPhase == expected.maxPhase and actual.order == expected.order)
+    return False
+
+
+@tl.builtin
+def async_amd_descriptor_load(
+    desc: tl.tensor_descriptor_base,
+    result: tlx.buffered_tensor,
+    offsets: list[tl.tensor],
+    pred: tl.tensor = None,
+    _semantic=None,
+) -> tlx.async_token:
+    """Asynchronous descriptor load from global to a local buffer (AMD).
+
+    Lowers to ``amdgpu.async_tdm_copy_global_to_local``; synchronize with
+    :func:`async_amd_descriptor_wait`. The returned token can be threaded
+    into the wait for per-token waitcnt precision; otherwise discard it.
+
+    Note: tokens currently do not survive ``scf.for`` boundaries
+    (``async_token._flatten_ir`` is a no-op), so collect the wait inside
+    the same block as the load if you thread tokens.
+
+    Available only on AMD TDM-capable targets (gfx1250+).
+    """
+    assert isinstance(desc, tl.tensor_descriptor_base)
+    arch = _semantic.builder.options.arch
+    assert is_amd_tdm_target(arch), (
+        f"async_amd_descriptor_load is only available on AMD TDM-capable targets, got arch={arch}")
+    ndim = len(desc.block_shape)
+    assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
+
+    # Only warn on user-supplied incompatible layouts. Auto-defaulted
+    # layouts (no `layout=` passed to local_alloc) are silently rewritten
+    # to the descriptor-compatible encoding by TLXInsertRequireLayout +
+    # TlxPropagateLayout in the AMD pipeline.
+    layout = result.type.layout
+    if not getattr(layout, "_tlx_default", False):
+        expected_layout = _amd_tdm_descriptor_layout(desc)
+        if not _layouts_match(layout, expected_layout):
+            warnings.warn(
+                "tlx.async_amd_descriptor_load destination layout may be incompatible with AMD descriptor layout; "
+                f"expected {expected_layout}, got {layout}. Omit `layout=` from `tlx.local_alloc` "
+                "to let TLXInsertRequireLayout auto-propagate a descriptor-compatible encoding.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+    offsets_handles = _semantic._convert_to_ir_values(offsets, require_i64=False)
+    if pred is None:
+        pred_handle = _semantic.builder.get_int1(True)
+    else:
+        pred_handle = pred.handle
+    token_handle = _semantic.builder.create_async_tdm_copy_global_to_local(
+        desc.handle,
+        offsets_handles,
+        result.handle,
+        pred_handle,
+        None,
+    )
+    return tlx.async_token(token_handle)
+
+
+@tl.builtin
+def async_amd_descriptor_wait(
+    pendings: tl.constexpr = 0,
+    tokens: Optional[list[tlx.async_token]] = None,
+    _semantic=None,
+) -> tlx.async_token:
+    """Wait for outstanding AMD async descriptor operations.
+
+    Lowers to ``amdgpu.async_tdm_wait``. Pass ``pendings`` for the
+    count-based wait, or ``tokens`` from prior
+    :func:`async_amd_descriptor_load` calls for per-token min-waitcnt
+    precision (mutually exclusive: when tokens are supplied
+    ``UpdateAsyncWaitCount`` ignores ``pendings``).
+
+    Available only on AMD TDM-capable targets (gfx1250+).
+    """
+    arch = _semantic.builder.options.arch
+    assert is_amd_tdm_target(arch), (
+        f"async_amd_descriptor_wait is only available on AMD TDM-capable targets, got arch={arch}")
+    pendings = tl._unwrap_if_constexpr(pendings)
+    tokens = tokens or []
+    assert not (tokens and pendings != 0), ("async_amd_descriptor_wait: pass either `pendings` or `tokens`, not both;"
+                                            " UpdateAsyncWaitCount uses tokens when present and ignores `pendings`")
+    handles = [t.handle for t in tokens]
+    return tlx.async_token(_semantic.builder.create_async_tdm_wait(handles, pendings))
 
 
 @tl.builtin

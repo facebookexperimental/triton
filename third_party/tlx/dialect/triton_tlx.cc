@@ -8,6 +8,7 @@
 namespace ir {
 pybind11::class_<TritonOpBuilder> *getBuilderClass();
 } // namespace ir
+#include "amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "passes.h"
 #include "tlx/dialect/include/Transforms/Passes.h"
@@ -23,6 +24,7 @@ namespace tt = triton;
 namespace ttg = triton::gpu;
 namespace ttng = triton::nvidia_gpu;
 namespace tlx = triton::tlx;
+namespace amdgpu = triton::amdgpu;
 
 static ttg::CGAEncodingAttr makeCGALayout(mlir::MLIRContext *ctx,
                                           llvm::ArrayRef<unsigned> CTAsPerCGA,
@@ -186,6 +188,36 @@ void init_triton_tlx_ir(py::module &&m) {
              return mlir::cast<Attribute>(ttg::SwizzledSharedEncodingAttr::get(
                  context, vectorSize, perPhase, maxPhase, order, CTALayout));
            })
+      // Identity-mapping form of ttg::PaddedSharedEncodingAttr — analogous
+      // to `PaddedSharedLayout.with_identity_for(...)` in Gluon. Inserts
+      // `paddings[i]` elements after every `intervals[i]` data elements,
+      // with a row-major identity map from the 1-D shared offset to the
+      // logical n-D tensor offsets implied by `shape` + `order`.
+      .def(
+          "make_padded_shared_encoding_attr",
+          [](TritonOpBuilder &self, std::vector<unsigned> intervals,
+             std::vector<unsigned> paddings, std::vector<unsigned> order,
+             std::vector<int64_t> shape, std::vector<unsigned> CTAsPerCGA,
+             std::vector<unsigned> CTASplitNum,
+             std::vector<unsigned> CTAOrder) {
+            assert(intervals.size() == paddings.size() &&
+                   "intervals/paddings size mismatch");
+            assert(order.size() == shape.size() && "order/shape rank mismatch");
+            assert(order.size() == CTAsPerCGA.size() &&
+                   "CTAsPerCGA rank mismatch");
+            assert(order.size() == CTASplitNum.size() &&
+                   "CTASplitNum rank mismatch");
+            assert(order.size() == CTAOrder.size() && "CTAOrder rank mismatch");
+            auto context = self.getBuilder().getContext();
+            llvm::SmallVector<std::pair<unsigned, unsigned>> intervalPads;
+            intervalPads.reserve(intervals.size());
+            for (auto [i, p] : llvm::zip(intervals, paddings))
+              intervalPads.emplace_back(i, p);
+            auto CTALayout =
+                makeCGALayout(context, CTAsPerCGA, CTASplitNum, CTAOrder);
+            return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
+                context, intervalPads, order, shape, CTALayout));
+          })
       .def("make_tensor_memory_encoding_attr",
            [](TritonOpBuilder &self, unsigned blockM, unsigned blockN,
               unsigned colStride, unsigned CTASplitM, unsigned CTASplitN) {
@@ -493,6 +525,29 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, std::vector<Value> asyncTokens,
               unsigned pendings) -> mlir::Value {
              return self.create<ttg::AsyncWaitOp>(asyncTokens, pendings);
+           })
+      // Emits `amdgpu.async_tdm_copy_global_to_local` directly into the
+      // user's local buffer (the Python wrapper restricts callers to AMD
+      // TDM-capable targets). The op's pred operand is i32; this binding
+      // extends an i1 pred to i32 for convenience.
+      .def("create_async_tdm_copy_global_to_local",
+           [](TritonOpBuilder &self, Value desc, std::vector<Value> indices,
+              Value result, Value pred,
+              std::optional<Value> barrier) -> mlir::Value {
+             Value pred32 = pred;
+             if (auto intTy = dyn_cast<IntegerType>(pred.getType())) {
+               if (intTy.getWidth() == 1) {
+                 pred32 = self.create<arith::ExtUIOp>(
+                     self.getBuilder().getI32Type(), pred);
+               }
+             }
+             return self.create<amdgpu::AsyncTDMCopyGlobalToLocalOp>(
+                 desc, indices, result, pred32, barrier.value_or(Value()));
+           })
+      .def("create_async_tdm_wait",
+           [](TritonOpBuilder &self, std::vector<Value> asyncTokens,
+              unsigned pendings) -> mlir::Value {
+             return self.create<amdgpu::AsyncTDMWait>(asyncTokens, pendings);
            })
       .def("create_memdesc_trans",
            [](TritonOpBuilder &self, Value &arg,
