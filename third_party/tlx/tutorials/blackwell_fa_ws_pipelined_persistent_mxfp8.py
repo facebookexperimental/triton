@@ -1003,16 +1003,17 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 # load q0 + scale
                 q_bufIdx, q_phase = _get_bufidx_phase(i, NUM_BUFFERS_Q)
                 tlx.barrier_wait(q_empties[q_bufIdx], q_phase ^ 1)
-                tlx.barrier_expect_bytes(q_fulls[q_bufIdx], (Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM) + Q_SCALE_BYTES)
+                tlx.barrier_expect_bytes(q_fulls[q_bufIdx],
+                                         (Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM) + Q_SCALE_BYTES)
                 qo_offset_y_split = qo_offset_y
                 tlx.async_descriptor_load(desc_q, q_tiles[q_bufIdx], [qo_offset_y_split, 0], q_fulls[q_bufIdx])
                 # 5D TMA offset: [batch_head, m_offset, head_offset, 0, 0]
                 # off_hz is the combined batch*H + head index
                 tlx.async_descriptor_load(
                     desc_q_scale,
-                    q_scale_tiles[0],
+                    q_scale_tiles[q_bufIdx],
                     [off_hz, q_scale_m_offset_q0, 0, 0, 0],
-                    q_fulls[0],
+                    q_fulls[q_bufIdx],
                 )
 
                 # loop over loading k, v
@@ -1037,12 +1038,14 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 # load q1 + scale
                 q_bufIdx += NUM_BUFFERS_Q
                 tlx.barrier_wait(q_empties[q_bufIdx], q_phase ^ 1)
-                tlx.barrier_expect_bytes(q_fulls[q_bufIdx], (Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM) + Q_SCALE_BYTES)
+                tlx.barrier_expect_bytes(q_fulls[q_bufIdx],
+                                         (Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM) + Q_SCALE_BYTES)
                 qo_offset_y_split = qo_offset_y + BLOCK_M_SPLIT
                 tlx.async_descriptor_load(desc_q, q_tiles[q_bufIdx], [qo_offset_y_split, 0], q_fulls[q_bufIdx])
 
                 tlx.async_descriptor_load(
                     desc_q_scale,
+                    q_scale_tiles[q_bufIdx],
                     [off_hz, q_scale_m_offset_q1, 0, 0, 0],
                     q_fulls[q_bufIdx],
                 )
