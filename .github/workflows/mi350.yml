@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  mi350-tritonbench-test:
+  mi350-meta-triton-test:
     if: github.repository_owner == 'facebookexperimental'
     runs-on: linux-fb-triton-mi350-1
     env:
