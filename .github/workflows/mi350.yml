@@ -10,6 +10,7 @@ jobs:
     if: github.repository_owner == 'facebookexperimental'
     runs-on: linux-fb-triton-mi350-1
     env:
+      DOCKER_IMAGE: "ghcr.io/meta-pytorch/tritonbench:rocm-latest"
       CONDA_ENV: meta-triton
       SETUP_SCRIPT: /workspace/setup_instance.sh
     timeout-minutes: 240
