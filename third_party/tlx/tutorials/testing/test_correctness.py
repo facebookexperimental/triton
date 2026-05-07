@@ -518,7 +518,7 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
         BLK_SLICE_FACTOR = 2
 
         def grid_persistent(meta):
-            return (min(NUM_SMS, triton.cdiv(N_CTX, meta["BLOCK_N1"]) * Z * H), 1, 1)
+            return (triton.cdiv(N_CTX, meta["BLOCK_N1"]) * Z * H, 1, 1)
 
         _blackwell_fa_bwd_ws[grid_persistent](
             desc_bq,
