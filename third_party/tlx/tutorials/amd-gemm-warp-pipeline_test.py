@@ -1,10 +1,12 @@
 """
-V7: Eliminate pointer iter_args — compute offsets from tile_id + base pointer.
-Reduces iter_args from 5 to 3 (acc, a_tile, b_tile), matching Gluon.
+TLX warp-pipelined GEMM tutorial for AMD gfx950.
 
-Adds XCD-aware PID remap (chunked) for L2 reuse across the 8 XCDs of
-MI300X-class chips — ported from the gluon f16_gemm_warp_pipeline_gfx950
-example. Helps smaller tile configs the most (+10–19% at 4K, +3–8% at 8K).
+Uses async_load with 3-buffer pipelining and computes offsets from tile_id
+(3 iter_args: acc, a_tile, b_tile). The main loop is split into "mfma" and
+"mem" warp-pipeline stages.
+
+Includes an XCD-aware PID remap (chunked) for L2 reuse across the 8 XCDs
+of MI300X-class chips.
 """
 import torch
 import triton
@@ -29,7 +31,7 @@ def chiplet_transform_chunked(pid, num_workgroups, num_xcds: tl.constexpr, chunk
 
 
 @triton.jit
-def gemm_wp_v7(
+def gemm_wp(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -151,7 +153,7 @@ def run(a, b, c, bm, bn, bk, nb, nw, gm):
     M, K = a.shape
     _, N = b.shape
     grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn), )
-    gemm_wp_v7[grid](
+    gemm_wp[grid](
         a,
         b,
         c,

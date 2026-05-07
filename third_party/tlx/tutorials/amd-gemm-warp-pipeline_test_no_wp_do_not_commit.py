@@ -1,18 +1,10 @@
 """
 DEBUG-ONLY companion to amd-gemm-warp-pipeline_test.py: identical kernel
 but with the `with tlx.warp_pipeline_stage(...)` context managers stripped.
-Used for IR / ThreadTrace comparison against the WP version to investigate
-whether BlockPingPong.cpp is engaging pingpong/warp pipelining by default.
+Used for IR / ThreadTrace comparison against the WP version.
 
 This file is intentionally kept under a `_do_not_commit` filename so it is
 removed before merging to main.
-
-V7: Eliminate pointer iter_args — compute offsets from tile_id + base pointer.
-Reduces iter_args from 5 to 3 (acc, a_tile, b_tile), matching Gluon.
-
-Adds XCD-aware PID remap (chunked) for L2 reuse across the 8 XCDs of
-MI300X-class chips — ported from the gluon f16_gemm_warp_pipeline_gfx950
-example. Helps smaller tile configs the most (+10–19% at 4K, +3–8% at 8K).
 """
 import torch
 import triton
@@ -37,7 +29,7 @@ def chiplet_transform_chunked(pid, num_workgroups, num_xcds: tl.constexpr, chunk
 
 
 @triton.jit
-def gemm_wp_v7(
+def gemm_wp(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -157,7 +149,7 @@ def run(a, b, c, bm, bn, bk, nb, nw, gm):
     M, K = a.shape
     _, N = b.shape
     grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn), )
-    gemm_wp_v7[grid](
+    gemm_wp[grid](
         a,
         b,
         c,
