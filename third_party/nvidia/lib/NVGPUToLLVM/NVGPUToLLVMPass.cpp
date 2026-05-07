@@ -541,13 +541,13 @@ static Value createTMAlloc(IRRewriter &rewriter, LLVM::LLVMFuncOp func,
       /*onlyAttachMLIRArgs=*/true);
   auto voidTy = void_ty(func->getContext());
   ptxBuilder.launch(rewriter, loc, void_ty(func->getContext()));
-  NVVM::Barrier0Op::create(rewriter, loc);
-  Value address = b.load(i32_ty, sharedMem);
-  NVVM::Barrier0Op::create(rewriter, loc);
   NVVM::FenceProxyOp::create(
       rewriter, loc, NVVM::ProxyKind::async_shared,
       NVVM::SharedSpaceAttr::get(func->getContext(),
                                  NVVM::SharedSpace::shared_cta));
+  NVVM::Barrier0Op::create(rewriter, loc);
+  Value address = b.load(i32_ty, sharedMem);
+  NVVM::Barrier0Op::create(rewriter, loc);
   address = b.inttoptr(ptr_ty(func.getContext(), 6), address);
   return address;
 }
