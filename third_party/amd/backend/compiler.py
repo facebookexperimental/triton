@@ -305,10 +305,6 @@ class HIPBackend(BaseBackend):
 
         amd.passes.ttgpuir.add_fold_true_cmpi(pm)
         amd.passes.ttgpuir.add_prepare_if_combining(pm)
-        # Late AMD passes can reintroduce dot-operand layout conversions as
-        # tensor local_alloc/local_load pairs. Run TLX propagation after them so
-        # the final cleanup sees and folds those fallbacks.
-        tlx.tlx_passes.add_tlx_propagate_layout(pm)
         passes.common.add_canonicalizer(pm)
         # Late AMD passes can reintroduce dot-operand layout conversions as
         # tensor local_alloc/local_load pairs. Run TLX propagation after
