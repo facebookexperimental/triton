@@ -270,7 +270,8 @@ static Value findMemDescRoot(Value memdesc) {
     Operation *def = root.getDefiningOp();
     if (!def)
       break;
-    if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp>(def)) {
+    if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
+            ttg::MemDescSubsliceOp>(def)) {
       root = def->getOperand(0);
       continue;
     }
@@ -295,7 +296,8 @@ static bool isFedByTDM(Value memdesc) {
       if (isa<amdgpu::AsyncTDMCopyGlobalToLocalOp,
               amdgpu::AsyncTDMCopyLocalToGlobalOp>(u))
         return true;
-      if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp>(u))
+      if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
+              ttg::MemDescSubsliceOp>(u))
         worklist.insert(u->getResult(0));
     }
   }
@@ -336,7 +338,7 @@ static void applyRequireLayout(ttg::SwizzledSharedEncodingAttr encoding,
   if (auto type = dyn_cast<ttg::MemDescType>(loadMemDesc.getType())) {
     auto newType = ttg::MemDescType::get(
         type.getShape(), type.getElementType(), mlir::cast<Attribute>(encoding),
-        type.getMemorySpace(), type.getMutableMemory());
+        type.getMemorySpace(), type.getMutableMemory(), type.getAllocShape());
     auto requireOp = tlx::RequireLayoutOp::create(
         builder, localLoadOp->getLoc(), newType, loadMemDesc);
     localLoadOp->setOperand(0, requireOp.getResult());
@@ -515,7 +517,7 @@ public:
     // source memdesc, which lets the alloc converge to the meet of
     // every sibling subview's dot-consumer state.
     if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
-            tlx::RequireLayoutOp>(op)) {
+            ttg::MemDescSubsliceOp, tlx::RequireLayoutOp>(op)) {
       for (const auto resultLattice : results) {
         for (auto [i, operandLattice] : llvm::enumerate(operands)) {
           if (!isa<ttg::MemDescType>(op->getOpOperand(i).get().getType()))
@@ -629,7 +631,8 @@ static void anchorTDMRequireLayout(TDMOp tdmOp, Value buf,
   builder.setInsertionPoint(tdmOp);
   auto newType = ttg::MemDescType::get(
       bufType.getShape(), bufType.getElementType(), encoding,
-      bufType.getMemorySpace(), bufType.getMutableMemory());
+      bufType.getMemorySpace(), bufType.getMutableMemory(),
+      bufType.getAllocShape());
   auto requireOp =
       tlx::RequireLayoutOp::create(builder, tdmOp.getLoc(), newType, buf);
   operandToRewire.assign(requireOp.getResult());

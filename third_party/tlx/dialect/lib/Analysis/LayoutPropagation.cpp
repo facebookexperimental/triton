@@ -565,8 +565,9 @@ LogicalResult LayoutForwardPropagation::visitOperation(
   if (isa<RegionBranchOpInterface, ttg::WarpSpecializePartitionsOp>(op))
     return visitRegion(op);
 
-  if (!isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp, ttng::TMEMSubSliceOp,
-           ttg::LocalAllocOp, ttng::TMEMAllocOp>(op))
+  if (!isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
+           ttg::MemDescSubsliceOp, ttng::TMEMSubSliceOp, ttg::LocalAllocOp,
+           ttng::TMEMAllocOp>(op))
     return success();
 
   for (const auto [operandIdx, operandLattice] : llvm::enumerate(operands)) {

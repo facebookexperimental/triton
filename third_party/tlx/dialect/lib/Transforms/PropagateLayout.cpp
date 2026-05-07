@@ -159,7 +159,8 @@ static ttg::MemDescType getNewMemDescType(ttg::MemDescType origType,
                                           Attribute encoding) {
   return ttg::MemDescType::get(origType.getShape(), origType.getElementType(),
                                encoding, origType.getMemorySpace(),
-                               origType.getMutableMemory());
+                               origType.getMutableMemory(),
+                               origType.getAllocShape());
 }
 
 static FailureOr<const LayoutEncodingLattice *>

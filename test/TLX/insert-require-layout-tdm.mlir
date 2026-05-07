@@ -582,3 +582,37 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     tt.return
   }
 }
+
+// -----
+// =============================================================================
+// 21. Dot consumer reached through memdesc_subslice.
+// This is the single-warp-per-SIMD GEMM shape: TDM loads the full
+// BLOCK_K=128 tile, while local_load consumes 32-wide LDS subtiles.
+// The TDM anchor must still discover the dot consumer through
+// memdesc_subslice and choose the WMMA-tuned full-tile encoding `[128:+8]`.
+// The dot-path walk should also recognize that the subslice is TDM-fed and
+// avoid inserting a sibling swizzled anchor on the local_load operand.
+// =============================================================================
+
+// CHECK-DAG: #{{.*}} = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [32, 128]}>
+
+#mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 32]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tdm_dot_consumer_through_subslice
+  // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<32x128xf16, #{{.*}}, #smem, mutable>
+  // CHECK-NEXT: amdg.async_tdm_copy_global_to_local
+  // CHECK-NOT: tlx.require_layout
+  tt.func public @tdm_dot_consumer_through_subslice(%desc: !tt.tensordesc<32x128xf16>, %m: i32, %k: i32, %p: i32)
+      -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>> {
+    %c0 = arith.constant 0 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x32x128xf16, #shared, #smem, mutable>
+    %buf = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x32x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<32x128xf16, #shared, #smem, mutable>
+    %tok = amdg.async_tdm_copy_global_to_local %desc[%m, %k] into %buf, pred = %p : !tt.tensordesc<32x128xf16> -> !ttg.memdesc<32x128xf16, #shared, #smem, mutable>
+    %sub = ttg.memdesc_subslice %buf[0, 0] : !ttg.memdesc<32x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable, 32x128>
+    %t = ttg.local_load %sub : !ttg.memdesc<32x32xf16, #shared, #smem, mutable, 32x128> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>
+    tt.return %t : tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>
+  }
+}
