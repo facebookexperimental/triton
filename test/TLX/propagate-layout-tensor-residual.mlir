@@ -127,3 +127,49 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     tt.return %dot1 : tensor<64x64xf32, #mma_multi>
   }
 }
+
+// -----
+// Same late fallback as above, but with the gfx1250 WMMA layout and 32x32
+// operands used by the single-warp-per-SIMD TDM GEMM. This guards the exact
+// shape that previously survived as LDS spill/reload traffic.
+
+#blocked_wmma = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#mma_wmma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 32]}>
+#shared_wmma = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem_wmma = #ttg.shared_memory
+
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @fold_wmma_loop_carried_dot_local_alloc
+  tt.func public @fold_wmma_loop_carried_dot_local_alloc() -> tensor<32x32xf32, #mma_wmma> {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %c2_i32 = arith.constant 2 : i32
+    %cst = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #mma_wmma>
+    %alloc_a = ttg.local_alloc : () -> !ttg.memdesc<2x32x32xf16, #shared_wmma, #smem_wmma, mutable>
+    %alloc_b = ttg.local_alloc : () -> !ttg.memdesc<2x32x32xf16, #shared_wmma, #smem_wmma, mutable>
+    %buf_a0 = ttg.memdesc_index %alloc_a[%c0_i32] : !ttg.memdesc<2x32x32xf16, #shared_wmma, #smem_wmma, mutable> -> !ttg.memdesc<32x32xf16, #shared_wmma, #smem_wmma, mutable>
+    %buf_b0 = ttg.memdesc_index %alloc_b[%c0_i32] : !ttg.memdesc<2x32x32xf16, #shared_wmma, #smem_wmma, mutable> -> !ttg.memdesc<32x32xf16, #shared_wmma, #smem_wmma, mutable>
+    // CHECK: %[[A_INIT:.*]] = ttg.local_load {{.*}} -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #{{.*}}, kWidth = 8}>>
+    %a_init = ttg.local_load %buf_a0 : !ttg.memdesc<32x32xf16, #shared_wmma, #smem_wmma, mutable> -> tensor<32x32xf16, #blocked_wmma>
+    // CHECK: %[[B_INIT:.*]] = ttg.local_load {{.*}} -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #{{.*}}, kWidth = 8}>>
+    %b_init = ttg.local_load %buf_b0 : !ttg.memdesc<32x32xf16, #shared_wmma, #smem_wmma, mutable> -> tensor<32x32xf16, #blocked_wmma>
+    // CHECK: scf.for {{.*}} iter_args(%[[A_ARG:.*]] = %[[A_INIT]], %[[B_ARG:.*]] = %[[B_INIT]], %[[ACC_ARG:.*]] = {{.*}}) -> (tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #{{.*}}, kWidth = 8}>>, tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #{{.*}}, kWidth = 8}>>, tensor<32x32xf32, #{{.*}}>)
+    %result:3 = scf.for %i = %c0_i32 to %c2_i32 step %c1_i32
+        iter_args(%a_reg = %a_init, %b_reg = %b_init, %acc = %cst)
+        -> (tensor<32x32xf16, #blocked_wmma>, tensor<32x32xf16, #blocked_wmma>, tensor<32x32xf32, #mma_wmma>) : i32 {
+      %a_tmp = ttg.local_alloc %a_reg : (tensor<32x32xf16, #blocked_wmma>) -> !ttg.memdesc<32x32xf16, #shared_wmma, #smem_wmma>
+      %a_dot = ttg.local_load %a_tmp : !ttg.memdesc<32x32xf16, #shared_wmma, #smem_wmma> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_wmma, kWidth = 8}>>
+      %b_tmp = ttg.local_alloc %b_reg : (tensor<32x32xf16, #blocked_wmma>) -> !ttg.memdesc<32x32xf16, #shared_wmma, #smem_wmma>
+      %b_dot = ttg.local_load %b_tmp : !ttg.memdesc<32x32xf16, #shared_wmma, #smem_wmma> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #mma_wmma, kWidth = 8}>>
+      // CHECK-NOT: ttg.local_alloc %
+      // CHECK: tt.dot %[[A_ARG]], %[[B_ARG]], %[[ACC_ARG]]
+      %dot = tt.dot %a_dot, %b_dot, %acc : tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_wmma, kWidth = 8}>> * tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #mma_wmma, kWidth = 8}>> -> tensor<32x32xf32, #mma_wmma>
+      %buf_a1 = ttg.memdesc_index %alloc_a[%c1_i32] : !ttg.memdesc<2x32x32xf16, #shared_wmma, #smem_wmma, mutable> -> !ttg.memdesc<32x32xf16, #shared_wmma, #smem_wmma, mutable>
+      %buf_b1 = ttg.memdesc_index %alloc_b[%c1_i32] : !ttg.memdesc<2x32x32xf16, #shared_wmma, #smem_wmma, mutable> -> !ttg.memdesc<32x32xf16, #shared_wmma, #smem_wmma, mutable>
+      %a_next = ttg.local_load %buf_a1 : !ttg.memdesc<32x32xf16, #shared_wmma, #smem_wmma, mutable> -> tensor<32x32xf16, #blocked_wmma>
+      %b_next = ttg.local_load %buf_b1 : !ttg.memdesc<32x32xf16, #shared_wmma, #smem_wmma, mutable> -> tensor<32x32xf16, #blocked_wmma>
+      scf.yield %a_next, %b_next, %dot : tensor<32x32xf16, #blocked_wmma>, tensor<32x32xf16, #blocked_wmma>, tensor<32x32xf32, #mma_wmma>
+    }
+    tt.return %result#2 : tensor<32x32xf32, #mma_wmma>
+  }
+}
