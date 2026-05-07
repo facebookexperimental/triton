@@ -348,6 +348,7 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
+    tl.assume(K_ITERS > 0)
     for i in tl.range(0, K_ITERS):
         a1, b1 = _single_warp_per_simd_load_subtile(
             a_buf,
