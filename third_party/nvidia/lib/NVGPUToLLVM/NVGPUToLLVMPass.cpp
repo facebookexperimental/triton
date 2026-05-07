@@ -544,6 +544,10 @@ static Value createTMAlloc(IRRewriter &rewriter, LLVM::LLVMFuncOp func,
   NVVM::Barrier0Op::create(rewriter, loc);
   Value address = b.load(i32_ty, sharedMem);
   NVVM::Barrier0Op::create(rewriter, loc);
+  NVVM::FenceProxyOp::create(
+      rewriter, loc, NVVM::ProxyKind::async_shared,
+      NVVM::SharedSpaceAttr::get(func->getContext(),
+                                 NVVM::SharedSpace::shared_cta));
   address = b.inttoptr(ptr_ty(func.getContext(), 6), address);
   return address;
 }
