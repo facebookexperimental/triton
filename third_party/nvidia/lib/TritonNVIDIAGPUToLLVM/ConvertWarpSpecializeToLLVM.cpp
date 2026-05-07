@@ -191,14 +191,15 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
   wid = targetInfo.shuffleIdx(b, b.getLoc(), wid, 0);
   Value isDefault = b.icmp_ult(wid, b.i32_val(defaultNumWarps));
   if (tlx::tlxIsClustered(func) && !tlx::tlxExplicitClusterSync(func)) {
-    // All these have to be true before we can insert an arrive here:
+    // All these have to be true before we can insert arrives here:
     // - The kernel is in clustered mode
     // - There's no user controlled explicit cluster sync
-    // - There's an ClusterWaitOp (then it had to be inserted by compiler)
-    bool hasClusterBarWait =
-        func.walk([&](NVVM::ClusterWaitOp) { return WalkResult::interrupt(); })
-            .wasInterrupted();
-    if (hasClusterBarWait) {
+    // - There are ClusterWaitOps (inserted by compiler for barrier init,
+    //   tmem alloc, and tmem dealloc). Non-default warps need a matching
+    //   arrive for each.
+    unsigned numClusterWaits = 0;
+    func.walk([&](NVVM::ClusterWaitOp) { ++numClusterWaits; });
+    for (unsigned i = 0; i < numClusterWaits; ++i) {
       // Non default warps should just do a cluster arrive unconditionally.
       // Note this instruction is at kernel beginning shared by all warps, and
       // we use `isDefault` as predicate here to select only non default warps

@@ -413,6 +413,8 @@ private:
     // need to insert fence to make mbar init visible to cluster
     ttng::FenceMBarrierInitReleaseClusterOp::create(builder,
                                                     lastBarInitOp.getLoc());
+    ttng::FenceAsyncSharedOp::create(builder, lastBarInitOp.getLoc(),
+                                        /*bCluster=*/true);
     // need to insert cluster arrive and wait to prevent CTA_X from arriving
     // CTA_Y's bar before CTA_Y inits it, as shown in ptx doc examples:
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-test-wait-try-wait

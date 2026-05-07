@@ -565,7 +565,7 @@ void freeTMAlloc(LLVM::LLVMFuncOp func, Value alloc, size_t size, Value pred,
     auto ctx = ret->getContext();
     auto loc = ret.getLoc();
     auto voidTy = void_ty(ctx);
-    if (twoCTAs && !tlxPairedMMA) {
+    if (twoCTAs) {
       NVVM::ClusterArriveOp::create(b, loc, UnitAttr::get(ctx));
       NVVM::ClusterWaitOp::create(b, loc, UnitAttr::get(ctx));
     } else {
@@ -619,6 +619,39 @@ static Value initTensorMemory(LLVM::LLVMFuncOp func) {
   return alloc;
 }
 
+// For TLX paired MMA, insert a cluster sync before tcgen05.alloc (at function
+// start) to ensure both CTAs are synchronized before the allocation.
+// This is separate from the barrier init cluster sync in maybeInsertClusterSync.
+// lowerWarpSpecialize emits a matching arrive on the non-default warp side.
+static void maybeInsertAllocClusterSync(LLVM::LLVMFuncOp kernel) {
+  auto mod = kernel->getParentOfType<ModuleOp>();
+  if (!tlx::tlxEnablePairedMMA(mod))
+    return;
+  if (!tlx::tlxIsClustered(mod) || tlx::tlxExplicitClusterSync(mod))
+    return;
+
+  // Find the tcgen05.alloc inline asm — the cluster sync goes right before it.
+  Operation *insertBefore = nullptr;
+  for (auto &op : kernel.front()) {
+    if (auto asmOp = dyn_cast<LLVM::InlineAsmOp>(&op)) {
+      if (asmOp.getAsmString().contains("tcgen05.alloc")) {
+        insertBefore = &op;
+        break;
+      }
+    }
+  }
+  if (!insertBefore)
+    return;
+
+  auto ctx = kernel->getContext();
+  IRRewriter rewriter(ctx);
+  rewriter.setInsertionPoint(insertBefore);
+  NVVM::ClusterArriveOp::create(rewriter, insertBefore->getLoc(),
+                                UnitAttr::get(ctx));
+  NVVM::ClusterWaitOp::create(rewriter, insertBefore->getLoc(),
+                              UnitAttr::get(ctx));
+}
+
 static void lowerTensorMemoryAlloc(ModuleOp mod) {
   SmallVector<Operation *> baseOps;
   LLVM::LLVMFuncOp kernel = nullptr;
@@ -640,6 +673,9 @@ static void lowerTensorMemoryAlloc(ModuleOp mod) {
     baseOp->getResult(0).replaceAllUsesWith(newBase);
     baseOp->erase();
   }
+
+  // Insert cluster sync after tcgen05.alloc for 2-CTA tmem alloc.
+  maybeInsertAllocClusterSync(kernel);
 }
 
 } // anonymous namespace

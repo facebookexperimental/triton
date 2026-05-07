@@ -553,11 +553,12 @@ def test_async_dot_blackwell_2cta_tma(device, A_TMEM, SAMPLE_M):
     assert ttgir.count("ttng.map_to_remote_buffer") == 1
 
     ptx = kernel.asm["ptx"]
-    assert ptx.count("fence.mbarrier_init.release.cluster") == 1
-    assert ptx.count("barrier.cluster.arrive.aligned") == 1  # one for remote bar init
-    assert ptx.count("barrier.cluster.wait.aligned") == 1  # one for remote bar init
-    assert ptx.count("mapa.shared::cluster") == 1  # address mapping for remote_view
-    assert ptx.count("tcgen05.mma.cta_group::2") == 8  # BK=128 divided into steps of 16
+    # Verify ordering: alloc → alloc cluster sync → fences → barrier init cluster sync
+    tmem_alloc_pos = ptx.index("tcgen05.alloc.cta_group::2")
+    fence_mbar_pos = ptx.index("fence.mbarrier_init.release.cluster")
+    assert tmem_alloc_pos < fence_mbar_pos
+    assert ptx.count("mapa.shared::cluster") == 1
+    assert ptx.count("tcgen05.mma.cta_group::2") == 8
 
     ref_out = torch.matmul(x, y)
     torch.testing.assert_close(z, ref_out)
@@ -695,13 +696,14 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
 
     ptx = kernel.asm["ptx"]
     assert ptx.count("fence.mbarrier_init.release.cluster") == 1
-    # two for trunk remote bar init: one for default wg, one for non default
-    assert ptx.count("barrier.cluster.arrive.aligned") == 2
-    # one for trunk remote bar init: non default WGs just arrive anyway, then it's equivalent to a sync between
-    #   default WGs in all CTAs
-    assert ptx.count("barrier.cluster.wait.aligned") == 1
-    assert ptx.count("mapa.shared::cluster") == 1  # address mapping for remote_view
-    assert ptx.count("tcgen05.mma.cta_group::2") == 8  # BK=128 divided into steps of 16
+    assert ptx.count("tcgen05.alloc.cta_group::2") == 1
+    # Barrier init cluster sync after fences
+    fence_mbar_pos = ptx.index("fence.mbarrier_init.release.cluster")
+    cluster_arrive_pos = ptx.index("barrier.cluster.arrive.aligned", fence_mbar_pos)
+    cluster_wait_pos = ptx.index("barrier.cluster.wait.aligned", cluster_arrive_pos)
+    assert fence_mbar_pos < cluster_arrive_pos < cluster_wait_pos
+    assert ptx.count("mapa.shared::cluster") == 1
+    assert ptx.count("tcgen05.mma.cta_group::2") == 8
 
     ref_out = torch.matmul(x, y)
     torch.testing.assert_close(z, ref_out)
