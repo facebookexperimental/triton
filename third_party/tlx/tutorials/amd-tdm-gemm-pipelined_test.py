@@ -254,14 +254,14 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
     off_n = pid_n * BLOCK_N
 
     a_desc = tl.make_tensor_descriptor(
-        a_ptr,
+        a_ptr + off_m * stride_am,
         shape=[M, K],
         strides=[stride_am, tl.constexpr(1)],
         block_shape=[BLOCK_M, BLOCK_K],
     )
     if not TRANSPOSE_B:
         b_desc = tl.make_tensor_descriptor(
-            b_ptr,
+            b_ptr + off_n * stride_bn,
             shape=[K, N],
             strides=[stride_bk, tl.constexpr(1)],
             block_shape=[BLOCK_K, BLOCK_N],
@@ -269,7 +269,7 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
         b_buf = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(b_ptr), NUM_BUFFERS)
     else:
         b_desc = tl.make_tensor_descriptor(
-            b_ptr,
+            b_ptr + off_n * stride_bn,
             shape=[N, K],
             strides=[stride_bn, tl.constexpr(1)],
             block_shape=[BLOCK_N, BLOCK_K],
@@ -297,8 +297,8 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
                 a_desc,
                 b_desc,
                 prefetch_offset,
-                off_m,
-                off_n,
+                0,
+                0,
                 prefetch_pred,
                 BLOCK_K,
                 TRANSPOSE_B,
@@ -311,8 +311,8 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
             a_buf,
             b_buf,
             producer,
-            off_m,
-            off_n,
+            0,
+            0,
             producer < K_ITERS,
             BLOCK_K,
             NUM_BUFFERS,
@@ -338,8 +338,8 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
         a_buf,
         b_buf,
         producer,
-        off_m,
-        off_n,
+        0,
+        0,
         producer < K_ITERS,
         BLOCK_K,
         NUM_BUFFERS,
@@ -368,8 +368,8 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
                 a_desc,
                 b_desc,
                 prefetch_iter,
-                off_m,
-                off_n,
+                0,
+                0,
                 prefetch_iter < K_ITERS,
                 BLOCK_K,
                 TRANSPOSE_B,
@@ -409,8 +409,8 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
             a_buf,
             b_buf,
             producer,
-            off_m,
-            off_n,
+            0,
+            0,
             producer < K_ITERS,
             BLOCK_K,
             NUM_BUFFERS,
