@@ -457,8 +457,8 @@ LogicalResult AsyncTMACopyGlobalToLocalOp::verify() {
                                   getResult().getType())))
     return failure();
   if (failed(verifyTMAMode(*this,
-                          isIm2Col ? TensorMode::IM2COL : TensorMode::TILED,
-                          getCoord(), getOffsets())))
+                           isIm2Col ? TensorMode::IM2COL : TensorMode::TILED,
+                           getCoord(), getOffsets())))
     return failure();
   return success();
 }

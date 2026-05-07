@@ -2362,9 +2362,10 @@ public:
           LDBG("TMEM pre-assign: reuser buffer.id="
                << bid << " colOffset=" << nextColOffset
                << " size=" << reuserBuf->rowSize << "x" << reuserBuf->colSize);
-          // When we have 3 buffers sharing one space, we don't move the colOffset.
-          // As moving the colOffset can make it exceed the size of the owner buffer.
-          nextColOffset += 0; //reuserBuf->colSize;
+          // When we have 3 buffers sharing one space, we don't move the
+          // colOffset. As moving the colOffset can make it exceed the size of
+          // the owner buffer.
+          nextColOffset += 0; // reuserBuf->colSize;
         }
       }
 

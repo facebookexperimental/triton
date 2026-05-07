@@ -823,15 +823,9 @@ def _attn_bwd_dkdv(
     curr_m = start_m
     step_m = BLOCK_M1
     if warp_specialize:
-        for blk_idx in tl.range(
-                0,
-                num_steps,
-                warp_specialize=True,
-                merge_epilogue_to_computation=True,
-                tmem_alloc_algo=2,
-                smem_alloc_algo=1,
-                smem_budget=200000, #231000,
-        ):
+        for blk_idx in tl.range(0, num_steps, warp_specialize=True, merge_epilogue_to_computation=True,
+                                tmem_alloc_algo=2, smem_alloc_algo=1, smem_budget=200000,  #231000,
+                                ):
             dk, dv, curr_m = _attn_bwd_dkdv_inner(
                 dk,
                 dv,
@@ -1246,15 +1240,9 @@ def _attn_bwd_persist(
         block_shape=[BLOCK_M1],
     )
 
-    for _ in tl.range(
-            0,
-            tiles_per_sm,
-            warp_specialize=True,
-            merge_epilogue_to_computation=True,
-            tmem_alloc_algo=2,
-            smem_alloc_algo=1,
-            smem_budget=200000, #231000,
-    ):
+    for _ in tl.range(0, tiles_per_sm, warp_specialize=True, merge_epilogue_to_computation=True, tmem_alloc_algo=2,
+                      smem_alloc_algo=1, smem_budget=200000,  #231000,
+                      ):
         pid = tile_idx % n_tile_num
         bhid = tile_idx // n_tile_num
         _attn_bwd_core(
@@ -1690,7 +1678,7 @@ BATCH, N_HEADS = 4, 32
 configs = []
 for HEAD_DIM in [128]:  # 64, 128]:
     for baseVariant in ["ws_persistent"]:
-        for mode in ["bwd"]:#"fwd", "bwd"]:
+        for mode in ["bwd"]:  #"fwd", "bwd"]:
             configs.append(
                 triton.testing.Benchmark(
                     x_names=["N_CTX"],
