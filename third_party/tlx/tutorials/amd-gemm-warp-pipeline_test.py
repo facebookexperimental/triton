@@ -172,6 +172,7 @@ def run(a, b, c, bm, bn, bk, nb, nw, gm):
         NUM_XCDS=NUM_XCDS,
         XCD_CHUNK=XCD_CHUNK,
         num_warps=nw,
+        num_stages=1,
     )
     return c
 

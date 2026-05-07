@@ -202,26 +202,8 @@ public:
                              })
                               .wasInterrupted();
 
-    // Detect warp pipeline border markers and disable auto software pipelining
-    // on affected loops so the markers survive through make_ttgir.
-    // Uses a recursive walk to handle markers nested under conditionals or
-    // other regions within the loop body.
-    bool hasWarpPipelineOps = false;
-    mod.walk([&](scf::ForOp forOp) {
-      bool hasBorders = false;
-      forOp.getBody()->walk([&](Operation *op) {
-        if (op->hasAttr("triton.warp_pipeline.border"))
-          hasBorders = true;
-      });
-      if (hasBorders) {
-        hasWarpPipelineOps = true;
-        forOp->setAttr(tt::kNumStagesAttrName,
-                       Builder(&getContext()).getI32IntegerAttr(0));
-      }
-    });
-
     if (!hasTLXOps && !hasExplicitLocalMemAccess && !hasWarpSpecOps &&
-        !hasTLXTwoCTAs && !hasWarpPipelineOps) {
+        !hasTLXTwoCTAs) {
       return;
     }
 
