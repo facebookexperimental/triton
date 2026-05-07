@@ -98,6 +98,45 @@ def _single_warp_per_simd_issue_loads(
 
 
 @triton.jit
+def _single_warp_per_simd_issue_loads_unpredicated(
+    a_desc,
+    b_desc,
+    a_buf,
+    b_buf,
+    producer,
+    off_m,
+    off_n,
+    BLOCK_K: tl.constexpr,
+    NUM_BUFFERS: tl.constexpr,
+    TRANSPOSE_B: tl.constexpr,
+):
+    slot = producer % NUM_BUFFERS
+    tlx.async_amd_descriptor_load(a_desc, tlx.local_view(a_buf, slot), [off_m, producer * BLOCK_K])
+    if not TRANSPOSE_B:
+        tlx.async_amd_descriptor_load(b_desc, tlx.local_view(b_buf, slot), [producer * BLOCK_K, off_n])
+    else:
+        tlx.async_amd_descriptor_load(b_desc, tlx.local_view(b_buf, slot), [off_n, producer * BLOCK_K])
+    return producer + 1
+
+
+@triton.jit
+def _single_warp_per_simd_prefetch_unpredicated(
+    a_desc,
+    b_desc,
+    prefetch_iter,
+    off_m,
+    off_n,
+    BLOCK_K: tl.constexpr,
+    TRANSPOSE_B: tl.constexpr,
+):
+    tlx.amd_descriptor_prefetch(a_desc, [off_m, prefetch_iter * BLOCK_K])
+    if not TRANSPOSE_B:
+        tlx.amd_descriptor_prefetch(b_desc, [prefetch_iter * BLOCK_K, off_n])
+    else:
+        tlx.amd_descriptor_prefetch(b_desc, [off_n, prefetch_iter * BLOCK_K])
+
+
+@triton.jit
 def _single_warp_per_simd_prefetch(
     a_desc,
     b_desc,
@@ -287,6 +326,7 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
     c_buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tlx.dtype_of(c_ptr), 1)
 
     K_ITERS = tl.cdiv(K, BLOCK_K)
+    tl.assume(K_ITERS >= NUM_BUFFERS)
     producer = 0
     consumer = 0
 
@@ -305,7 +345,7 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
             )
 
     for _ in tl.static_range(NUM_BUFFERS - 1):
-        producer = _single_warp_per_simd_issue_loads(
+        producer = _single_warp_per_simd_issue_loads_unpredicated(
             a_desc,
             b_desc,
             a_buf,
@@ -313,7 +353,6 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
             producer,
             0,
             0,
-            producer < K_ITERS,
             BLOCK_K,
             NUM_BUFFERS,
             TRANSPOSE_B,
@@ -332,7 +371,7 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
         SUBTILE_LEN,
     )
 
-    producer = _single_warp_per_simd_issue_loads(
+    producer = _single_warp_per_simd_issue_loads_unpredicated(
         a_desc,
         b_desc,
         a_buf,
@@ -340,13 +379,13 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
         producer,
         0,
         0,
-        producer < K_ITERS,
         BLOCK_K,
         NUM_BUFFERS,
         TRANSPOSE_B,
     )
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    epilogue_lb = K_ITERS - (NUM_BUFFERS - 1)
 
     tl.assume(K_ITERS > 0)
     for i in tl.range(0, K_ITERS):
@@ -365,13 +404,12 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
 
         if L2_PREFETCH_DISTANCE > 0:
             prefetch_iter = producer + L2_PREFETCH_DISTANCE - 1
-            _single_warp_per_simd_prefetch(
+            _single_warp_per_simd_prefetch_unpredicated(
                 a_desc,
                 b_desc,
                 prefetch_iter,
                 0,
                 0,
-                prefetch_iter < K_ITERS,
                 BLOCK_K,
                 TRANSPOSE_B,
             )
@@ -404,6 +442,8 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
 
         consumer += 1
         tlx.async_amd_descriptor_wait((NUM_BUFFERS - 2) * 2)
+        pred = (i + 1) - epilogue_lb
+        pred = (pred >> 31) & 1
         producer = _single_warp_per_simd_issue_loads(
             a_desc,
             b_desc,
@@ -412,7 +452,7 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
             producer,
             0,
             0,
-            producer < K_ITERS,
+            pred,
             BLOCK_K,
             NUM_BUFFERS,
             TRANSPOSE_B,
