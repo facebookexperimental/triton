@@ -484,6 +484,8 @@ class runtime_knobs(base_knobs):
     # Hook to signal that a kernel is done compiling and inspect compiled function.
     # jit_cache_hook will always be called before compilation and jit_post_compile_hook after.
     jit_post_compile_hook: Optional[JITHook] = None
+    # Hook for inspecting compiler pipeline stages
+    add_stages_inspection_hook: Optional[PipelineStagesHook] = None
 
     # Hook for inspecting compiler pipeline stages
     add_stages_inspection_hook: Optional[PipelineStagesHook] = None
