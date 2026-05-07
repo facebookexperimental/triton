@@ -4610,6 +4610,40 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
     LDBG("\n\nafter appendAccumCntsForOps");
     funcOp.dump();
   });
+  // Step 4.5: Collect TMA staging reuse info before createBufferPost
+  // rewrites the alloc ops (which would lose the local_store users).
+  struct StagingReuseInfo {
+    unsigned targetBufferId;
+    Operation *firstStore;
+  };
+  SmallVector<StagingReuseInfo> stagingReuseInfos;
+  funcOp.walk([&](ttg::LocalAllocOp allocOp) {
+    auto reuseAttr =
+        allocOp->getAttrOfType<IntegerAttr>("allocation.reuseTarget");
+    auto stagingAttr =
+        allocOp->getAttrOfType<IntegerAttr>("buffer.tmaStaging");
+    if (!reuseAttr || !stagingAttr)
+      return;
+    // Find the first local_store user.
+    Operation *firstStore = nullptr;
+    for (auto *user : allocOp->getUsers()) {
+      if (isa<ttg::LocalStoreOp>(user)) {
+        if (!firstStore || user->isBeforeInBlock(firstStore))
+          firstStore = user;
+      }
+    }
+    if (!firstStore) {
+      LDBG("Step 4.5: staging alloc has reuseTarget="
+           << reuseAttr.getInt() << " but no local_store user");
+      return;
+    }
+    stagingReuseInfos.push_back({(unsigned)reuseAttr.getInt(), firstStore});
+    LDBG("Step 4.5: collected staging reuse: target buffer.id="
+         << reuseAttr.getInt() << " firstStore found");
+  });
+  LDBG("Step 4.5: collected " << stagingReuseInfos.size()
+       << " staging reuse entries");
+
   // Step 5: Create buffers. An array of buffers for each channel.
   DenseMap<Channel *, Value> bufferMap =
       createBufferPost(channelsGroupedByProducers, channels, funcOp, &config,
@@ -4655,9 +4689,8 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
   injectChannelGraphOnTokenOps(funcOp, orderedChannels);
 
   // Step 8.5: Insert cross-partition sync barriers for TMA staging SMEM reuse.
-  // When a TMA staging buffer (epilogue dK/dV store) reuses an inner-loop
-  // channel's SMEM (V/dO), the staging writer must wait for the channel's last
-  // consumer to finish reading before overwriting the shared SMEM.
+  // Uses staging reuse info collected in Step 4.5 (before createBufferPost
+  // rewrote the alloc ops) combined with tokens from Step 7.
   {
     // Build a map from buffer.id → channel for looking up inner-loop channels.
     DenseMap<unsigned, Channel *> bufferIdToChannel;
@@ -4665,84 +4698,27 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
       auto *allocOp = ch->getAllocOp();
       if (!allocOp)
         continue;
-      if (auto attr = allocOp->getAttrOfType<IntegerAttr>("buffer.id")) {
+      if (auto attr = allocOp->getAttrOfType<IntegerAttr>("buffer.id"))
         bufferIdToChannel[attr.getInt()] = ch;
-        LDBG("Step 8.5: bufferIdToChannel[" << attr.getInt()
-             << "] = channel " << ch->uniqID);
-      }
     }
-    LDBG("Step 8.5: bufferIdToChannel has " << bufferIdToChannel.size()
-         << " entries");
 
-    // Walk all local_alloc ops to find TMA staging buffers with reuse targets.
-    unsigned stagingCount = 0;
-    unsigned totalAllocCount = 0;
-    funcOp.walk([&](ttg::LocalAllocOp allocOp) {
-      totalAllocCount++;
-      auto reuseAttr =
-          allocOp->getAttrOfType<IntegerAttr>("allocation.reuseTarget");
-      auto stagingAttr =
-          allocOp->getAttrOfType<IntegerAttr>("buffer.tmaStaging");
-      auto bufIdAttr =
-          allocOp->getAttrOfType<IntegerAttr>("buffer.id");
-      LDBG("Step 8.5: walk local_alloc #" << totalAllocCount
-           << " buffer.id="
-           << (bufIdAttr ? std::to_string(bufIdAttr.getInt()) : "none")
-           << " tmaStaging="
-           << (stagingAttr ? std::to_string(stagingAttr.getInt()) : "none")
-           << " reuseTarget="
-           << (reuseAttr ? std::to_string(reuseAttr.getInt()) : "none"));
-      if (stagingAttr) {
-        LDBG("Step 8.5: found staging alloc buffer.id="
-             << (bufIdAttr ? std::to_string(bufIdAttr.getInt()) : "none")
-             << " tmaStaging=" << stagingAttr.getInt()
-             << " reuseTarget="
-             << (reuseAttr ? std::to_string(reuseAttr.getInt()) : "none"));
-        LLVM_DEBUG(allocOp->dump());
-      }
-      if (!reuseAttr || !stagingAttr)
-        return;
-      stagingCount++;
-      unsigned targetBufferId = reuseAttr.getInt();
-      auto targetIt = bufferIdToChannel.find(targetBufferId);
+    for (auto &info : stagingReuseInfos) {
+      auto targetIt = bufferIdToChannel.find(info.targetBufferId);
       if (targetIt == bufferIdToChannel.end()) {
-        LDBG("Step 8.5: target buffer.id=" << targetBufferId
-             << " — channel not found in bufferIdToChannel, skipping");
-        return;
+        LDBG("Step 8.5: target buffer.id=" << info.targetBufferId
+             << " — channel not found, skipping");
+        continue;
       }
       Channel *targetChannel = targetIt->second;
-      LDBG("Step 8.5: found target channel " << targetChannel->uniqID
-           << " for buffer.id=" << targetBufferId);
       auto targetTokenIt = tokenMap.find(targetChannel);
-      if (targetTokenIt == tokenMap.end()) {
+      if (targetTokenIt == tokenMap.end() ||
+          targetTokenIt->second.tokens.empty()) {
         LDBG("Step 8.5: target channel " << targetChannel->uniqID
-             << " not in tokenMap, skipping");
-        return;
-      }
-      if (targetTokenIt->second.tokens.empty()) {
-        LDBG("Step 8.5: target channel " << targetChannel->uniqID
-             << " has empty tokens, skipping");
-        return;
-      }
-      LDBG("Step 8.5: target channel " << targetChannel->uniqID
-           << " has " << targetTokenIt->second.tokens.size() << " tokens");
-
-      // Find the first local_store into this staging buffer — that's the
-      // epilogue producer we need to guard.
-      Operation *firstStore = nullptr;
-      for (auto *user : allocOp->getUsers()) {
-        if (isa<ttg::LocalStoreOp>(user)) {
-          if (!firstStore || user->isBeforeInBlock(firstStore))
-            firstStore = user;
-        }
-      }
-      if (!firstStore) {
-        LDBG("Step 8.5: no local_store user found for staging alloc, skipping");
-        return;
+             << " has no tokens, skipping");
+        continue;
       }
 
-      // Insert ProducerAcquireOp before the first store, waiting on the
-      // target channel's consumer_release barrier.
+      Operation *firstStore = info.firstStore;
       OpBuilderWithAsyncTaskIds builder(firstStore);
       builder.setInsertionPoint(firstStore);
       auto asyncTaskIds = getAsyncTaskIds(firstStore);
@@ -4759,14 +4735,14 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
                 firstStore->getLoc(), tokenValue, bufIdx, phase);
         acquireOp->emitRemark()
             << "TMA staging reuse barrier: staging buffer waits on "
-            << "target buffer.id=" << targetBufferId << " consumer release";
+            << "target buffer.id=" << info.targetBufferId
+            << " consumer release";
         LDBG("Step 8.5: Inserted ProducerAcquireOp for staging → target "
-             << targetBufferId);
+             << info.targetBufferId);
       }
-    });
-    LDBG("Step 8.5: walked " << totalAllocCount << " local_alloc ops, "
-         << "processed " << stagingCount
-         << " staging allocs with reuseTarget");
+    }
+    LDBG("Step 8.5: processed " << stagingReuseInfos.size()
+         << " staging reuse entries");
   }
 
   // Prune any unnecessary barriers related to tgen05.commit
