@@ -8,6 +8,7 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Traits.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 #include "llvm/ADT/EquivalenceClasses.h"
@@ -18,6 +19,7 @@ namespace triton {
 namespace nvidia_gpu {
 
 namespace ttg = triton::gpu;
+namespace tlx = triton::tlx;
 
 #define GEN_PASS_DEF_TRITONTENSORMEMORYALLOCATIONPASS
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h.inc"
@@ -499,14 +501,31 @@ public:
       }
     }
     if (totalMemorySize > 0) {
-      // We use a small smem allocation to get the tensor memory base address
-      // from tcgen05.alloc, ensure the block has at least 4 bytes of smem
+      // Allocate 4 bytes at the end of SMEM for the tcgen05.alloc address
+      // buffer. This avoids overlapping with TMA tile data at offset 0.
       int shared = 0;
       if (auto sharedAttr = mod->getAttr("ttg.shared")) {
         shared = cast<IntegerAttr>(sharedAttr).getInt();
       }
-      if (shared < 4) {
-        mod->setAttr("ttg.shared", getI32Attr(4));
+      int tmemAllocSmemOffset = shared;
+      mod->setAttr("ttg.shared", getI32Attr(shared + 4));
+      mod->setAttr("ttg.tmem_alloc_smem_offset", getI32Attr(tmemAllocSmemOffset));
+
+      // For TLX paired MMA, insert a tcgen5_alloc op before the first
+      // tmem_alloc. This represents the single tcgen05.alloc for the entire
+      // kernel and is visible to maybeInsertClusterSync for cluster sync
+      // placement.
+      if (tlx::tlxEnablePairedMMA(mod)) {
+        TMEMAllocOp firstAlloc;
+        mod.walk([&](TMEMAllocOp op) {
+          firstAlloc = op;
+          return WalkResult::interrupt();
+        });
+        if (firstAlloc) {
+          OpBuilder builder(firstAlloc);
+          TCGen5AllocOp::create(builder, firstAlloc.getLoc(),
+                                totalMemorySize, /*twoCTAs=*/true);
+        }
       }
     }
     mod->setAttr("ttg.tensor_memory_size", getI32Attr(totalMemorySize));

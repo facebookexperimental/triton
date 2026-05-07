@@ -68,6 +68,9 @@ public:
     addIllegalDialect<mlir::gpu::GPUDialect>();
     addLegalOp<mlir::UnrealizedConversionCastOp>();
 
+    // TCGen5AllocOp has no operands/results, survives to NVGPUToLLVM.
+    addLegalOp<triton::nvidia_gpu::TCGen5AllocOp>();
+
     // Warp specialization is lowered later.
     addLegalOp<triton::gpu::WarpSpecializeOp>();
     addLegalOp<triton::gpu::WarpYieldOp>();
@@ -421,28 +424,6 @@ private:
     ttng::ClusterArriveOp::create(builder, lastBarInitOp.getLoc(),
                                   /*relaxed*/ false);
     ttng::ClusterWaitOp::create(builder, lastBarInitOp.getLoc());
-
-    // For TLX paired MMA, insert a relaxed cluster sync right before the first
-    // tmem_alloc so that both CTAs are synchronized before allocating tmem.
-    // lowerWarpSpecialize inserts a matching arrive on the non-default side.
-    if (tlx::tlxEnablePairedMMA(mod)) {
-      ttng::TMEMAllocOp firstTMemAlloc;
-      mod.walk([&](ttng::TMEMAllocOp op) {
-        firstTMemAlloc = op;
-        return WalkResult::interrupt();
-      });
-      if (firstTMemAlloc) {
-        // Skip if the barrier init cluster sync is already right before
-        // the tmem_alloc (they share the same sync).
-        Operation *prev = firstTMemAlloc->getPrevNode();
-        if (!prev || !isa<ttng::ClusterWaitOp>(prev)) {
-          OpBuilder tmemBuilder(firstTMemAlloc);
-          ttng::ClusterArriveOp::create(tmemBuilder, firstTMemAlloc.getLoc(),
-                                        /*relaxed*/ true);
-          ttng::ClusterWaitOp::create(tmemBuilder, firstTMemAlloc.getLoc());
-        }
-      }
-    }
 
     return success();
   }

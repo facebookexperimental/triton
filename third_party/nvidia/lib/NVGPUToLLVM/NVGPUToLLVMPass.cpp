@@ -3,6 +3,8 @@
 
 #include "Dialect/NVGPU/IR/Dialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/LogicalResult.h"
@@ -14,6 +16,7 @@
 #include "llvm/Support/ErrorHandling.h"
 
 namespace ttn = mlir::triton::nvgpu;
+namespace ttg = mlir::triton::gpu;
 using ttn::Constraints;
 using ttn::OperandsAndConstraints;
 
@@ -526,11 +529,17 @@ public:
 };
 
 static Value createTMAlloc(IRRewriter &rewriter, LLVM::LLVMFuncOp func,
-                           size_t size, Value pred, bool twoCTAs) {
+                           size_t size, Value pred, bool twoCTAs,
+                           int smemOffset = 0) {
   PTXBuilder ptxBuilder;
   Location loc = func.getLoc();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   Value sharedMem = mlir::LLVM::getStackPointer(rewriter, func);
+  if (smemOffset > 0) {
+    auto ptrTy = sharedMem.getType();
+    sharedMem = LLVM::GEPOp::create(rewriter, loc, ptrTy, i8_ty, sharedMem,
+                                     b.i32_val(smemOffset));
+  }
   std::string ptxString =
       "@$0 tcgen05.alloc.cta_group::" + std::to_string(twoCTAs ? 2 : 1) +
       ".sync.aligned.shared::cta.b32 [$1], " + std::to_string(size) + ";";
@@ -544,7 +553,8 @@ static Value createTMAlloc(IRRewriter &rewriter, LLVM::LLVMFuncOp func,
   NVVM::FenceProxyOp::create(
       rewriter, loc, NVVM::ProxyKind::async_shared,
       NVVM::SharedSpaceAttr::get(func->getContext(),
-                                 NVVM::SharedSpace::shared_cta));
+                                 twoCTAs ? NVVM::SharedSpace::shared_cluster
+                                         : NVVM::SharedSpace::shared_cta));
   NVVM::Barrier0Op::create(rewriter, loc);
   Value address = b.load(i32_ty, sharedMem);
   NVVM::Barrier0Op::create(rewriter, loc);
@@ -590,7 +600,7 @@ void freeTMAlloc(LLVM::LLVMFuncOp func, Value alloc, size_t size, Value pred,
 }
 
 static Value initTensorMemory(LLVM::LLVMFuncOp func,
-                              Operation *insertionPoint) {
+                              Operation *insertionPoint = nullptr) {
   auto mod = func->getParentOfType<ModuleOp>();
   assert(mod->hasAttr("ttg.tensor_memory_size"));
   size_t size = cast<IntegerAttr>(mod->getAttr("ttg.tensor_memory_size"))
@@ -599,6 +609,10 @@ static Value initTensorMemory(LLVM::LLVMFuncOp func,
   if (size == 0)
     return Value();
   IRRewriter rewriter(func.getContext());
+  if (insertionPoint)
+    rewriter.setInsertionPoint(insertionPoint);
+  else
+    rewriter.setInsertionPointToStart(&func.front());
   auto ctx = mod.getContext();
   auto loc = func.getLoc();
 
@@ -606,29 +620,27 @@ static Value initTensorMemory(LLVM::LLVMFuncOp func,
   bool useTwoCTAs =
       mlir::triton::nvidia_gpu::getModuleTwoCTAs(mod) || isTlxPairedMMA;
 
-  if (insertionPoint)
-    rewriter.setInsertionPoint(insertionPoint);
-  else
-    rewriter.setInsertionPointToStart(&func.front());
-
   auto b = TritonLLVMOpBuilder(loc, rewriter);
-  // A proper error will be raised by the frontend, but to allow compilation to
-  // continue we emit a trap.
   if (size > 512) {
     LLVM::Trap::create(rewriter, loc);
     return LLVM::UndefOp::create(rewriter, loc, ptr_ty(ctx, 6));
   }
 
+  // Read the SMEM offset for the tmem alloc buffer.
+  int smemOffset = 0;
+  if (auto offsetAttr = mod->getAttr("ttg.tmem_alloc_smem_offset"))
+    smemOffset = cast<IntegerAttr>(offsetAttr).getInt();
+
   // This code is only executed by the default warp group.
   Value threadId = NVVM::ThreadIdXOp::create(rewriter, loc, i32_ty);
   Value pred = b.icmp_ult(threadId, b.i32_val(32));
-  Value alloc = createTMAlloc(rewriter, func, size, pred, useTwoCTAs);
+  Value alloc = createTMAlloc(rewriter, func, size, pred, useTwoCTAs,
+                              smemOffset);
   createRelinquishAlloc(rewriter, loc, pred, useTwoCTAs);
-  // TODO: pred will have a long liverange, we need to check if this is a
-  // problem and how it can be fixed.
   freeTMAlloc(func, alloc, size, pred, useTwoCTAs, isTlxPairedMMA);
   return alloc;
 }
+
 
 static void lowerTensorMemoryAlloc(ModuleOp mod) {
   SmallVector<Operation *> baseOps;
@@ -640,24 +652,24 @@ static void lowerTensorMemoryAlloc(ModuleOp mod) {
     assert(kernel == baseOp->getParentOfType<LLVM::LLVMFuncOp>() &&
            "TODO: add support for function calls using tmem.");
   });
-  if (baseOps.empty())
+  // Find TCGen5AllocOp — it marks where tcgen05.alloc should be inserted.
+  triton::nvidia_gpu::TCGen5AllocOp tcgen5Alloc;
+  mod.walk([&](triton::nvidia_gpu::TCGen5AllocOp op) {
+    tcgen5Alloc = op;
+    if (!kernel)
+      kernel = op->getParentOfType<LLVM::LLVMFuncOp>();
+    return WalkResult::interrupt();
+  });
+  if (baseOps.empty() && !tcgen5Alloc)
     return;
-  // TODO: Handle cases of matmul used in noinline functions.
   assert(triton::isKernel(kernel));
-  // For TLX paired MMA, insert tcgen05.alloc at the position of the first
-  // TensorMemoryBaseAddress in the entry block. A placeholder base op is
-  // created during TMEMAllocOp lowering to mark the original tmem_alloc
-  // position, ensuring the insertion point is on the trunk path.
-  Operation *insertionPoint = nullptr;
-  if (tlx::tlxEnablePairedMMA(kernel->getParentOfType<ModuleOp>())) {
-    for (auto &op : kernel.front()) {
-      if (isa<ttn::TensorMemoryBaseAddress>(&op)) {
-        insertionPoint = &op;
-        break;
-      }
-    }
-  }
+
+  Operation *insertionPoint =
+      tcgen5Alloc ? tcgen5Alloc.getOperation() : nullptr;
   Value newBase = initTensorMemory(kernel, insertionPoint);
+  if (tcgen5Alloc)
+    tcgen5Alloc->erase();
+
   if (!newBase)
     return;
   for (auto baseOp : baseOps) {

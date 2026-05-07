@@ -1066,6 +1066,27 @@ def TTNG_TMEMAllocOp : TTNG_Op<"tmem_alloc", [DeclareOpInterfaceMethods<MemoryEf
   }];
 }
 
+def TTNG_TCGen5AllocOp : TTNG_Op<"tcgen5_alloc", []> {
+  let summary = "Global tensor memory allocation for the kernel";
+  let description = [{
+    Represents the single tcgen05.alloc instruction for the entire kernel.
+    Created by TensorMemoryAllocationPass before the first tmem_alloc op.
+    All individual tmem_alloc ops share this single allocation, each at
+    a different offset.
+
+    Uses a 4-byte shared memory buffer for address broadcast across warps.
+    Visible to maybeInsertClusterSync for proper cluster sync placement
+    in 2-CTA mode.
+  }];
+
+  let arguments = (ins
+    I32Attr:$tensor_memory_size,
+    DefaultValuedAttr<BoolAttr, "false">:$two_ctas
+  );
+
+  let assemblyFormat = "attr-dict";
+}
+
 def TTNG_TMEMSubSliceOp : TTNG_Op<"tmem_subslice", [Pure]> {
   let summary = "Take a subslice of a tensor memory allocation";
   let description = [{
