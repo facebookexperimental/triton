@@ -18,6 +18,8 @@ from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent im
     _attn_bwd_ws as _blackwell_fa_bwd_ws,
     _attn_fwd_ws as _blackwell_fa_fwd_ws,
     _host_descriptor_pre_hook as _blackwell_fa_fwd_pre_hook,
+    configs_bwd_1cta as _configs_bwd_1cta,
+    configs_bwd_2cta as _configs_bwd_2cta,
 )
 from triton.language.extra.tlx.tutorials.blackwell_fa_clc import (
     attention as _blackwell_fa_clc, )
@@ -426,10 +428,11 @@ def test_blackwell_fa_clc(N_CTX, causal, RESCALE_OPT, USE_WHERE):
     torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
 
 
+@pytest.mark.parametrize("NUM_CTAS", [1, 2])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("RESCALE_OPT,USE_WHERE", [(False, False), (True, False), (True, True)])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
-def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE):
+def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE, NUM_CTAS):
     from triton.tools.tensor_descriptor import TensorDescriptor
 
     fwd_config: dict[str,
@@ -438,7 +441,7 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
     fwd_config["USE_WHERE"] = USE_WHERE
     sm_scale = 0.5
 
-    for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
+    for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:  # (4, 8, 1024, 128)
         q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
 
         # Reference backward via PyTorch autograd
@@ -473,8 +476,7 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
             return torch.empty(size, dtype=torch.int8, device="cuda")
 
         triton.set_allocator(alloc_fn)
-        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-        grid = (min(NUM_SMS, triton.cdiv(N_CTX, fwd_config["BLOCK_M"]) * Z * H), 1, 1)
+        grid = (triton.cdiv(N_CTX, fwd_config["BLOCK_M"]) * Z * H, 1, 1)
         _blackwell_fa_fwd_ws.fn[grid](
             sm_scale,
             M,
@@ -515,12 +517,25 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
         desc_m = TensorDescriptor(M, shape=[Z * H * N_CTX], strides=[1], block_shape=[1])
         desc_delta = TensorDescriptor(delta, shape=[Z * H * N_CTX], strides=[1], block_shape=[1])
 
+        # Descriptors for 2-CTA B-operand transposed views.
+        # In 1-CTA mode these are passed but unused by the kernel.
+        desc_kt = TensorDescriptor(arg_k, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                   block_shape=dummy_block)
+        desc_qt = TensorDescriptor(q, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+        desc_dot = TensorDescriptor(do, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+
         BLK_SLICE_FACTOR = 2
 
-        def grid_persistent(meta):
-            return (min(NUM_SMS, triton.cdiv(N_CTX, meta["BLOCK_N1"]) * Z * H), 1, 1)
+        bwd_configs = _configs_bwd_1cta if NUM_CTAS == 1 else _configs_bwd_2cta
+        bwd_kernel = triton.autotune(configs=bwd_configs, key=["N_CTX", "HEAD_DIM"])(_blackwell_fa_bwd_ws.fn)
 
-        _blackwell_fa_bwd_ws[grid_persistent](
+        def grid_persistent(meta):
+            total = triton.cdiv(N_CTX, meta["BLOCK_N1"]) * Z * H
+            num_ctas = meta.get("NUM_CTAS", 1)
+            total = triton.cdiv(total, num_ctas) * num_ctas
+            return (total, )
+
+        bwd_kernel[grid_persistent](
             desc_bq,
             desc_bk,
             desc_bv,
@@ -538,15 +553,17 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
             H,
             Z,
             N_CTX,
+            desc_kt,
+            desc_qt,
+            desc_dot,
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
             HEAD_DIM=HEAD_DIM,
             STAGE=stage,
         )
 
-        tri_dq = dq.to(q.dtype)
-        torch.testing.assert_close(tri_dq, ref_dq, atol=1e-2, rtol=0)
-        torch.testing.assert_close(dk, ref_dk, atol=1e-2, rtol=0)
         torch.testing.assert_close(dv, ref_dv, atol=1e-2, rtol=0)
+        torch.testing.assert_close(dk, ref_dk, atol=1e-2, rtol=0)
+        torch.testing.assert_close(dq.to(ref_dq.dtype), ref_dq, atol=1e-2, rtol=0)
 
 
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])

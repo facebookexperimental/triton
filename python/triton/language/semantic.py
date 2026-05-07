@@ -1718,7 +1718,13 @@ class TritonSemantic(Generic[TensorTy]):
             N = rhs.type.shape[-1]
         K = lhs.type.shape[-1]
         B = lhs.type.shape[0] if lhs_rank == 3 else None
-        ret_ty = tl.block_type(ret_scalar_ty, [B, M, N] if B else [M, N])
+        # For pair-CTA MMA, allow acc with M/2 rows (per-CTA output with M-split).
+        # Dots 1,2,3,5 use acc with full M; dot 4 (dQ) uses acc with M/2.
+        if tlx_paired_ctas and acc is not None and tl._unwrap_if_constexpr(acc.type.shape[-2]) == M // 2:
+            M_ret = M // 2
+        else:
+            M_ret = M
+        ret_ty = tl.block_type(ret_scalar_ty, [B, M_ret, N] if B else [M_ret, N])
 
         if acc is None:
             acc_handle = self.builder.create_splat(ret_ty.to_ir(self.builder), _0)
