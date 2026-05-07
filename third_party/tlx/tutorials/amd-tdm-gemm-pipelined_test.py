@@ -67,7 +67,9 @@ def _single_warp_per_simd_load_subtile(
         b = tlx.local_load(b_view)
     else:
         b_view = tlx.local_slice(tlx.local_view(b_buf, slot), [0, start], [BLOCK_N, SUBTILE_LEN])
-        b = tlx.local_load(b_view).T
+        # Transpose the LDS view before loading so dot operand lowering can use
+        # a memdesc transpose instead of materializing a register transpose.
+        b = tlx.local_load(tlx.local_trans(b_view))
 
     return a, b
 
