@@ -270,8 +270,11 @@ static Value findMemDescRoot(Value memdesc) {
     Operation *def = root.getDefiningOp();
     if (!def)
       break;
+    // Treat memdesc views as aliases of the same allocation. This lets TDM
+    // anchors and dot-consumer discovery meet on the full buffer even when
+    // WMMA consumes a sliced or transposed view.
     if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
-            ttg::MemDescSubsliceOp>(def)) {
+            ttg::MemDescSubsliceOp, ttg::MemDescTransOp>(def)) {
       root = def->getOperand(0);
       continue;
     }
@@ -296,8 +299,10 @@ static bool isFedByTDM(Value memdesc) {
       if (isa<amdgpu::AsyncTDMCopyGlobalToLocalOp,
               amdgpu::AsyncTDMCopyLocalToGlobalOp>(u))
         return true;
+      // Follow sibling views from the root allocation so local_load(subslice)
+      // and local_load(transpose(subslice)) are recognized as TDM-fed too.
       if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
-              ttg::MemDescSubsliceOp>(u))
+              ttg::MemDescSubsliceOp, ttg::MemDescTransOp>(u))
         worklist.insert(u->getResult(0));
     }
   }
@@ -517,7 +522,8 @@ public:
     // source memdesc, which lets the alloc converge to the meet of
     // every sibling subview's dot-consumer state.
     if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
-            ttg::MemDescSubsliceOp, tlx::RequireLayoutOp>(op)) {
+            ttg::MemDescSubsliceOp, ttg::MemDescTransOp, tlx::RequireLayoutOp>(
+            op)) {
       for (const auto resultLattice : results) {
         for (auto [i, operandLattice] : llvm::enumerate(operands)) {
           if (!isa<ttg::MemDescType>(op->getOpOperand(i).get().getType()))

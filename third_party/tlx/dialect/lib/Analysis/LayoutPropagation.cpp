@@ -23,6 +23,29 @@ namespace ttng = ::mlir::triton::nvidia_gpu;
 
 namespace mlir::triton::tlx {
 
+// Reuse the dialect's transpose inference so TLX propagation stays in sync
+// with verifier/type inference for padded, swizzled, and MMA shared layouts.
+static FailureOr<Attribute> inferTransEncoding(Attribute encoding,
+                                               ArrayRef<int64_t> shape,
+                                               ArrayRef<int32_t> order,
+                                               Location loc) {
+  Dialect &dialect = encoding.getDialect();
+  auto inferLayoutInterface =
+      cast<::mlir::triton::DialectInferLayoutInterface>(&dialect);
+  Attribute resultEncoding;
+  if (failed(inferLayoutInterface->inferTransOpEncoding(encoding, shape, order,
+                                                        resultEncoding, loc)))
+    return failure();
+  return resultEncoding;
+}
+
+static SmallVector<int32_t> invertPermutation(ArrayRef<int32_t> order) {
+  SmallVector<int32_t> inverse(order.size());
+  for (auto [i, dim] : llvm::enumerate(order))
+    inverse[dim] = i;
+  return inverse;
+}
+
 //===----------------------------------------------------------------------===//
 // LayoutEncoding
 //===----------------------------------------------------------------------===//
@@ -194,6 +217,18 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
             swizzledEncoding.getContext(), swizzledEncoding.getVec(),
             swizzledEncoding.getPerPhase(), swizzledEncoding.getMaxPhase(),
             permutedOrder, swizzledEncoding.getCGALayout());
+      }
+      if (!srcEncoding) {
+        // Generic shared encodings, especially padded TDM layouts, need the
+        // inverse transpose to push a result-side requirement back to the
+        // source memdesc.
+        auto resultType = cast<ttg::MemDescType>(memDescTransOp.getType());
+        auto inverseOrder = invertPermutation(memDescTransOp.getOrder());
+        FailureOr<Attribute> inferred = inferTransEncoding(
+            resultEnc, resultType.getShape(), inverseOrder, op->getLoc());
+        if (failed(inferred))
+          return failure();
+        srcEncoding = *inferred;
       }
       if (srcEncoding) {
         const auto updatedResultLayoutEncoding = LayoutEncoding(srcEncoding);
@@ -566,14 +601,30 @@ LogicalResult LayoutForwardPropagation::visitOperation(
     return visitRegion(op);
 
   if (!isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
-           ttg::MemDescSubsliceOp, ttng::TMEMSubSliceOp, ttg::LocalAllocOp,
-           ttng::TMEMAllocOp>(op))
+           ttg::MemDescSubsliceOp, ttg::MemDescTransOp, ttng::TMEMSubSliceOp,
+           ttg::LocalAllocOp, ttng::TMEMAllocOp>(op))
     return success();
 
   for (const auto [operandIdx, operandLattice] : llvm::enumerate(operands)) {
     if (!isa<ttg::MemDescType>(op->getOperand(operandIdx).getType()))
       continue;
     LayoutEncoding operandLayoutEncoding = operandLattice->getValue();
+
+    if (auto transOp = dyn_cast<ttg::MemDescTransOp>(op)) {
+      if (!operandLayoutEncoding.isUninitialized() &&
+          !operandLayoutEncoding.isUnknown()) {
+        // Forward propagation must transpose the concrete source layout before
+        // meeting it into the transposed view; copying the attribute verbatim
+        // leaves verifier-incompatible memdesc_trans result types.
+        auto srcTy = cast<ttg::MemDescType>(transOp.getSrc().getType());
+        FailureOr<Attribute> inferred = inferTransEncoding(
+            operandLayoutEncoding.getLayoutEncoding(), srcTy.getShape(),
+            transOp.getOrder(), op->getLoc());
+        if (failed(inferred))
+          return failure();
+        operandLayoutEncoding = LayoutEncoding(*inferred);
+      }
+    }
 
     // Unknown layouts do not provide enough information to refine a TMEM slice
     // result, so only splice concrete tensor-memory encodings through.
