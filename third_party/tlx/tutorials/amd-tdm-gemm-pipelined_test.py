@@ -51,18 +51,23 @@ def _single_warp_per_simd_load_subtile(
     a_buf,
     b_buf,
     consumer,
-    subtile: tl.constexpr,
+    start: tl.constexpr,
     NUM_BUFFERS: tl.constexpr,
-    NUM_SUBTILES: tl.constexpr,
     TRANSPOSE_B: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    SUBTILE_LEN: tl.constexpr,
 ):
-    slot = (consumer % NUM_BUFFERS) * NUM_SUBTILES + subtile
-    a = tlx.local_load(tlx.local_view(a_buf, slot))
+    slot = consumer % NUM_BUFFERS
+    a_view = tlx.local_slice(tlx.local_view(a_buf, slot), [0, start], [BLOCK_M, SUBTILE_LEN])
+    a = tlx.local_load(a_view)
 
     if not TRANSPOSE_B:
-        b = tlx.local_load(tlx.local_view(b_buf, slot))
+        b_view = tlx.local_slice(tlx.local_view(b_buf, slot), [start, 0], [SUBTILE_LEN, BLOCK_N])
+        b = tlx.local_load(b_view)
     else:
-        b = tlx.local_load(tlx.local_view(b_buf, slot)).T
+        b_view = tlx.local_slice(tlx.local_view(b_buf, slot), [0, start], [BLOCK_N, SUBTILE_LEN])
+        b = tlx.local_load(b_view).T
 
     return a, b
 
@@ -78,21 +83,15 @@ def _single_warp_per_simd_issue_loads(
     off_n,
     pred,
     BLOCK_K: tl.constexpr,
-    SUBTILE_LEN: tl.constexpr,
     NUM_BUFFERS: tl.constexpr,
-    NUM_SUBTILES: tl.constexpr,
     TRANSPOSE_B: tl.constexpr,
 ):
-    base_slot = (producer % NUM_BUFFERS) * NUM_SUBTILES
-    base_k = producer * BLOCK_K
-    for subtile in tl.static_range(NUM_SUBTILES):
-        subtile_k = subtile * SUBTILE_LEN
-        slot = base_slot + subtile
-        tlx.async_amd_descriptor_load(a_desc, tlx.local_view(a_buf, slot), [off_m, base_k + subtile_k], pred=pred)
-        if not TRANSPOSE_B:
-            tlx.async_amd_descriptor_load(b_desc, tlx.local_view(b_buf, slot), [base_k + subtile_k, off_n], pred=pred)
-        else:
-            tlx.async_amd_descriptor_load(b_desc, tlx.local_view(b_buf, slot), [off_n, base_k + subtile_k], pred=pred)
+    slot = producer % NUM_BUFFERS
+    tlx.async_amd_descriptor_load(a_desc, tlx.local_view(a_buf, slot), [off_m, producer * BLOCK_K], pred=pred)
+    if not TRANSPOSE_B:
+        tlx.async_amd_descriptor_load(b_desc, tlx.local_view(b_buf, slot), [producer * BLOCK_K, off_n], pred=pred)
+    else:
+        tlx.async_amd_descriptor_load(b_desc, tlx.local_view(b_buf, slot), [off_n, producer * BLOCK_K], pred=pred)
     return producer + 1
 
 
@@ -105,18 +104,13 @@ def _single_warp_per_simd_prefetch(
     off_n,
     pred,
     BLOCK_K: tl.constexpr,
-    SUBTILE_LEN: tl.constexpr,
-    NUM_SUBTILES: tl.constexpr,
     TRANSPOSE_B: tl.constexpr,
 ):
-    base_k = prefetch_iter * BLOCK_K
-    for subtile in tl.static_range(NUM_SUBTILES):
-        subtile_k = subtile * SUBTILE_LEN
-        tlx.amd_descriptor_prefetch(a_desc, [off_m, base_k + subtile_k], pred=pred)
-        if not TRANSPOSE_B:
-            tlx.amd_descriptor_prefetch(b_desc, [base_k + subtile_k, off_n], pred=pred)
-        else:
-            tlx.amd_descriptor_prefetch(b_desc, [off_n, base_k + subtile_k], pred=pred)
+    tlx.amd_descriptor_prefetch(a_desc, [off_m, prefetch_iter * BLOCK_K], pred=pred)
+    if not TRANSPOSE_B:
+        tlx.amd_descriptor_prefetch(b_desc, [prefetch_iter * BLOCK_K, off_n], pred=pred)
+    else:
+        tlx.amd_descriptor_prefetch(b_desc, [off_n, prefetch_iter * BLOCK_K], pred=pred)
 
 
 @triton.jit
@@ -261,24 +255,24 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
         a_ptr,
         shape=[M, K],
         strides=[stride_am, tl.constexpr(1)],
-        block_shape=[BLOCK_M, SUBTILE_LEN],
+        block_shape=[BLOCK_M, BLOCK_K],
     )
     if not TRANSPOSE_B:
         b_desc = tl.make_tensor_descriptor(
             b_ptr,
             shape=[K, N],
             strides=[stride_bk, tl.constexpr(1)],
-            block_shape=[SUBTILE_LEN, BLOCK_N],
+            block_shape=[BLOCK_K, BLOCK_N],
         )
-        b_buf = tlx.local_alloc((SUBTILE_LEN, BLOCK_N), tlx.dtype_of(b_ptr), NUM_BUFFERS * NUM_SUBTILES)
+        b_buf = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(b_ptr), NUM_BUFFERS)
     else:
         b_desc = tl.make_tensor_descriptor(
             b_ptr,
             shape=[N, K],
             strides=[stride_bn, tl.constexpr(1)],
-            block_shape=[BLOCK_N, SUBTILE_LEN],
+            block_shape=[BLOCK_N, BLOCK_K],
         )
-        b_buf = tlx.local_alloc((BLOCK_N, SUBTILE_LEN), tlx.dtype_of(b_ptr), NUM_BUFFERS * NUM_SUBTILES)
+        b_buf = tlx.local_alloc((BLOCK_N, BLOCK_K), tlx.dtype_of(b_ptr), NUM_BUFFERS)
 
     c_desc = tl.make_tensor_descriptor(
         c_ptr,
@@ -287,7 +281,7 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
         block_shape=[BLOCK_M, BLOCK_N],
     )
 
-    a_buf = tlx.local_alloc((BLOCK_M, SUBTILE_LEN), tlx.dtype_of(a_ptr), NUM_BUFFERS * NUM_SUBTILES)
+    a_buf = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), NUM_BUFFERS)
     c_buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tlx.dtype_of(c_ptr), 1)
 
     K_ITERS = tl.cdiv(K, BLOCK_K)
@@ -305,8 +299,6 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
                 off_n,
                 prefetch_pred,
                 BLOCK_K,
-                SUBTILE_LEN,
-                NUM_SUBTILES,
                 TRANSPOSE_B,
             )
 
@@ -321,21 +313,21 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
             off_n,
             producer < K_ITERS,
             BLOCK_K,
-            SUBTILE_LEN,
             NUM_BUFFERS,
-            NUM_SUBTILES,
             TRANSPOSE_B,
         )
 
-    tlx.async_amd_descriptor_wait((NUM_BUFFERS - 2) * NUM_SUBTILES * 2)
+    tlx.async_amd_descriptor_wait((NUM_BUFFERS - 2) * 2)
     a0, b0 = _single_warp_per_simd_load_subtile(
         a_buf,
         b_buf,
         consumer,
         0,
         NUM_BUFFERS,
-        NUM_SUBTILES,
         TRANSPOSE_B,
+        BLOCK_M,
+        BLOCK_N,
+        SUBTILE_LEN,
     )
 
     producer = _single_warp_per_simd_issue_loads(
@@ -348,9 +340,7 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
         off_n,
         producer < K_ITERS,
         BLOCK_K,
-        SUBTILE_LEN,
         NUM_BUFFERS,
-        NUM_SUBTILES,
         TRANSPOSE_B,
     )
 
@@ -361,10 +351,12 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
             a_buf,
             b_buf,
             consumer,
-            1,
+            SUBTILE_LEN,
             NUM_BUFFERS,
-            NUM_SUBTILES,
             TRANSPOSE_B,
+            BLOCK_M,
+            BLOCK_N,
+            SUBTILE_LEN,
         )
         acc = tl.dot(a0, b0, acc)
 
@@ -378,8 +370,6 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
                 off_n,
                 prefetch_iter < K_ITERS,
                 BLOCK_K,
-                SUBTILE_LEN,
-                NUM_SUBTILES,
                 TRANSPOSE_B,
             )
 
@@ -387,10 +377,12 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
             a_buf,
             b_buf,
             consumer,
-            2,
+            2 * SUBTILE_LEN,
             NUM_BUFFERS,
-            NUM_SUBTILES,
             TRANSPOSE_B,
+            BLOCK_M,
+            BLOCK_N,
+            SUBTILE_LEN,
         )
         acc = tl.dot(a1, b1, acc)
 
@@ -398,15 +390,17 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
             a_buf,
             b_buf,
             consumer,
-            3,
+            3 * SUBTILE_LEN,
             NUM_BUFFERS,
-            NUM_SUBTILES,
             TRANSPOSE_B,
+            BLOCK_M,
+            BLOCK_N,
+            SUBTILE_LEN,
         )
         acc = tl.dot(a2, b2, acc)
 
         consumer += 1
-        tlx.async_amd_descriptor_wait((NUM_BUFFERS - 2) * NUM_SUBTILES * 2)
+        tlx.async_amd_descriptor_wait((NUM_BUFFERS - 2) * 2)
         producer = _single_warp_per_simd_issue_loads(
             a_desc,
             b_desc,
@@ -417,9 +411,7 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
             off_n,
             producer < K_ITERS,
             BLOCK_K,
-            SUBTILE_LEN,
             NUM_BUFFERS,
-            NUM_SUBTILES,
             TRANSPOSE_B,
         )
         a0, b0 = _single_warp_per_simd_load_subtile(
@@ -428,8 +420,10 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
             consumer,
             0,
             NUM_BUFFERS,
-            NUM_SUBTILES,
             TRANSPOSE_B,
+            BLOCK_M,
+            BLOCK_N,
+            SUBTILE_LEN,
         )
         acc = tl.dot(a3, b3, acc)
 
@@ -594,6 +588,12 @@ def test_matmul_tdm_pipelined_single_warp_per_simd_schedule_compiles_gfx1250(TRA
     assert "amdg.tdm_prefetch" in ttgir
     assert ("amdg.async_tdm_wait" in ttgir) or ("amdg.async_tdm_intrinsic_wait" in ttgir)
     assert "tt.dot" in ttgir
+
+    amdgcn = compiled.asm["amdgcn"]
+    tensor_load_count = amdgcn.count("tensor_load_to_lds") + amdgcn.count("tensor.load.to.lds")
+    tensor_store_count = amdgcn.count("tensor_store_from_lds") + amdgcn.count("tensor.store.from.lds")
+    assert tensor_load_count == 6, ("expected full-tile TDM loads with LDS subtile slicing, got:\n" + amdgcn)
+    assert tensor_store_count == 1, ("expected one TDM store of C, got:\n" + amdgcn)
 
 
 @pytest.mark.skipif(not is_gfx1250_available(), reason="Requires gfx1250 hardware")
