@@ -421,10 +421,13 @@ LogicalResult TensorBackwardPropagation::visitOperation(
 
   // For convert_layout, propagate the result constraint backward to the
   // operand so the analysis reaches local_load through scf.for iter_args.
+  // Skip the propagation when the result is Unknown: meet would return
+  // Unknown for the operand, poisoning its lattice state and preventing
+  // upstream values from being assigned a concrete dot_op encoding.
   if (auto convertLayout = dyn_cast<ttg::ConvertLayoutOp>(op)) {
     if (!results.empty() && isTrackedTensorValue(convertLayout.getSrc())) {
       const TensorLayout &resultState = results[0]->getValue();
-      if (!resultState.isUninitialized() && !resultState.isUnknown()) {
+      if (!resultState.isUnknown()) {
         ChangeResult changed = operands[0]->meet(resultState);
         propagateIfChanged(operands[0], changed);
       }
