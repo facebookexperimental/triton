@@ -64,6 +64,9 @@ public:
     addIllegalDialect<mlir::gpu::GPUDialect>();
     addLegalOp<mlir::UnrealizedConversionCastOp>();
 
+    // TCGen5AllocOp has no operands/results, survives to NVGPUToLLVM.
+    addLegalOp<triton::nvidia_gpu::TCGen5AllocOp>();
+
     // Warp specialization is lowered later.
     addLegalOp<triton::gpu::WarpSpecializeOp>();
     addLegalOp<triton::gpu::WarpYieldOp>();
@@ -365,6 +368,8 @@ private:
     OpBuilder builder(lastBarInitOp);
     builder.setInsertionPointAfter(lastBarInitOp);
     // need to insert fence to make mbar init visible to cluster
+    ttng::FenceMBarrierInitReleaseClusterOp::create(builder,
+                                                    lastBarInitOp.getLoc());
     ttng::FenceAsyncSharedOp::create(builder, lastBarInitOp.getLoc(),
                                       /*bCluster=*/true);
     // need to insert cluster arrive and wait to prevent CTA_X from arriving
