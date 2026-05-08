@@ -1,3 +1,4 @@
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/Pass/Pass.h"
@@ -9,7 +10,6 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/LogicalResult.h"
 

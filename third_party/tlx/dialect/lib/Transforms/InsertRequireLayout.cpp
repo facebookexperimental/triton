@@ -374,7 +374,8 @@ LogicalResult insertRequireLayout(ModuleOp m) {
     if (!dotEnc)
       return;
 
-    LDBG("local_load needs dot encoding: " << dotEnc << " for: " << localLoadOp);
+    LDBG("local_load needs dot encoding: " << dotEnc
+                                           << " for: " << localLoadOp);
 
     // Insert RequireLayoutOp for memdesc swizzling.
     auto sharedEnc = computeSharedEncFromDotEnc(dotEnc, localLoadOp);

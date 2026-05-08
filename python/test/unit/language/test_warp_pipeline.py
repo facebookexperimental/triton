@@ -14,14 +14,24 @@ def is_hip():
 
 # --- Runtime test: simple GEMM with warp pipeline ---
 
+
 @triton.jit
 def _gemm_warp_pipeline_kernel(
-    a_ptr, b_ptr, c_ptr,
-    M, N, K,
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -62,15 +72,25 @@ def test_gemm_warp_pipeline():
     b = torch.randn((K, N), dtype=torch.float16, device="cuda")
     c = torch.zeros((M, N), dtype=torch.float32, device="cuda")
 
-    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), )
     _gemm_warp_pipeline_kernel[grid](
-        a, b, c,
-        M, N, K,
-        a.stride(0), a.stride(1),
-        b.stride(0), b.stride(1),
-        c.stride(0), c.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        a,
+        b,
+        c,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
         num_warps=4,
+        num_stages=1,
     )
 
     ref = (a.float() @ b.float())
@@ -78,6 +98,7 @@ def test_gemm_warp_pipeline():
 
 
 # --- IR test: verify border markers in raw IR ---
+
 
 @triton.jit
 def _simple_pipeline_kernel(OUT, K: tl.constexpr):
@@ -111,9 +132,7 @@ def test_warp_pipeline_ir():
     codegen_fns = backend.get_codegen_implementation(opts)
     raw_ir = src.make_ir(target, opts, codegen_fns, {}, ctx)
     ir_str = str(raw_ir)
-    assert "triton.warp_pipeline.border" in ir_str, (
-        "Expected warp_pipeline border markers in IR, got:\n" + ir_str
-    )
+    assert "triton.warp_pipeline.border" in ir_str, ("Expected warp_pipeline border markers in IR, got:\n" + ir_str)
     assert '"stage0"' in ir_str
     assert '"stage1"' in ir_str
     assert 'triton.warp_pipeline.priority = 1' in ir_str
@@ -122,10 +141,11 @@ def test_warp_pipeline_ir():
 
 # --- IR test: verify warp pipeline lowering forms execute_region clusters ---
 
+
 @triton.jit
 def _two_stage_kernel(OUT, IN, N: tl.constexpr, K: tl.constexpr):
     offs = tl.program_id(0) * N + tl.arange(0, N)
-    acc = tl.zeros((N,), dtype=tl.float32)
+    acc = tl.zeros((N, ), dtype=tl.float32)
     for i in tl.range(0, K):
         with tlx.warp_pipeline_stage("load"):
             x = tl.load(IN + offs)
@@ -136,9 +156,21 @@ def _two_stage_kernel(OUT, IN, N: tl.constexpr, K: tl.constexpr):
 
 @triton.jit
 def _smem_warp_pipeline_kernel(
-    a_ptr, b_ptr, c_ptr, M, N, K,
-    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     NUM_BUFFERS: tl.constexpr,
 ):
     """GEMM with shared memory + warp pipeline to trigger full lowering."""
@@ -159,10 +191,8 @@ def _smem_warp_pipeline_kernel(
     buffers_A = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), NUM_BUFFERS)
     buffers_B = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(b_ptr), NUM_BUFFERS)
     for i in tl.range(0, NUM_BUFFERS - 1, loop_unroll_factor=NUM_BUFFERS - 1):
-        tok_a = tlx.async_load(a_ptrs, tlx.local_view(buffers_A, i),
-                               mask=offs_k[None, :] < K - i * BLOCK_K)
-        tok_b = tlx.async_load(b_ptrs, tlx.local_view(buffers_B, i),
-                               mask=offs_k[:, None] < K - i * BLOCK_K)
+        tok_a = tlx.async_load(a_ptrs, tlx.local_view(buffers_A, i), mask=offs_k[None, :] < K - i * BLOCK_K)
+        tok_b = tlx.async_load(b_ptrs, tlx.local_view(buffers_B, i), mask=offs_k[:, None] < K - i * BLOCK_K)
         tlx.async_load_commit_group([tok_a, tok_b])
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
@@ -176,10 +206,8 @@ def _smem_warp_pipeline_kernel(
             b_tile = tlx.local_load(tlx.local_view(buffers_B, consumer))
         tlx.async_load_wait_group(0)
         with tlx.warp_pipeline_stage("compute_and_load", priority=0):
-            tok_a = tlx.async_load(a_ptrs, tlx.local_view(buffers_A, producer),
-                                   mask=offs_k[None, :] < K - k * BLOCK_K)
-            tok_b = tlx.async_load(b_ptrs, tlx.local_view(buffers_B, producer),
-                                   mask=offs_k[:, None] < K - k * BLOCK_K)
+            tok_a = tlx.async_load(a_ptrs, tlx.local_view(buffers_A, producer), mask=offs_k[None, :] < K - k * BLOCK_K)
+            tok_b = tlx.async_load(b_ptrs, tlx.local_view(buffers_B, producer), mask=offs_k[:, None] < K - k * BLOCK_K)
             tlx.async_load_commit_group([tok_a, tok_b])
             acc = tl.dot(a_tile, b_tile, acc)
             a_ptrs += BLOCK_K * stride_ak
@@ -207,12 +235,26 @@ def test_warp_pipeline_lowering():
     b = torch.randn((K, N), dtype=torch.float16, device="cuda")
     c = torch.zeros((M, N), dtype=torch.float32, device="cuda")
     BM, BN, BK = 64, 64, 32
-    grid = (triton.cdiv(M, BM) * triton.cdiv(N, BN),)
+    grid = (triton.cdiv(M, BM) * triton.cdiv(N, BN), )
 
     kernel = _smem_warp_pipeline_kernel[grid](
-        a, b, c, M, N, K,
-        a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1),
-        BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, NUM_BUFFERS=3, num_warps=8,
+        a,
+        b,
+        c,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
+        BLOCK_M=BM,
+        BLOCK_N=BN,
+        BLOCK_K=BK,
+        NUM_BUFFERS=3,
+        num_warps=8,
     )
 
     # Check correctness
@@ -226,6 +268,7 @@ def test_warp_pipeline_lowering():
 
 
 # --- Validation tests ---
+
 
 def test_warp_pipeline_stage_label_validation():
     """Label must be string or None."""
