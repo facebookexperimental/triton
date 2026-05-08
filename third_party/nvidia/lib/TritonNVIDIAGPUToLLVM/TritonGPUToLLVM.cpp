@@ -302,71 +302,109 @@ private:
     return success();
   }
 
-  // If we're doing TLX 2cta paired MMA, insert cluster sync properly to
-  // bootstrap remote bars
-  LogicalResult maybeInsertClusterSync(ModuleOp &mod) {
-    if (!tlx::tlxEnablePairedMMA(mod)) {
-      return success();
-    }
-
-    bool hasMapaOp = false;
-    SetVector<Operation *> barAllocOps;
-    // Find all bar alloc op in the back slice of mapa ops
-    mod.walk([&](ttng::MapToRemoteBufferOp mapaOp) {
-      hasMapaOp = true;
-      SetVector<Operation *> ops;
-      getBackwardSliceWithWS(mapaOp.getResult(), &ops);
-
-      for (auto op : ops) {
-        if (isa<ttg::LocalAllocOp>(op)) {
-          barAllocOps.insert(op);
+  // Return the operand or result Value of a given op if the Value is used for
+  // cross CTA mbarrier arrival.
+  std::optional<SetVector<Value>> getRemoteBarrier(Operation *op) {
+    if (auto mapaOp = llvm::dyn_cast<ttng::MapToRemoteBufferOp>(op)) {
+      llvm::SetVector<Value> bars;
+      bars.insert(mapaOp.getResult());
+      return bars;
+    } else if (auto tmaLoadOp =
+                   llvm::dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
+      if (tmaLoadOp.getMulticastTargets()) {
+        llvm::SetVector<Value> bars;
+        bars.insert(tmaLoadOp.getBarrier());
+        return bars;
+      }
+    } else if (auto asyncCLCTryCancelOp =
+                   llvm::dyn_cast<ttng::AsyncCLCTryCancelOp>(op)) {
+      llvm::SetVector<Value> bars;
+      bars.insert(asyncCLCTryCancelOp.getMbarAlloc());
+      return bars;
+    } else if (auto tcgen5CommitOp = llvm::dyn_cast<ttng::TCGen5CommitOp>(op)) {
+      if (tcgen5CommitOp.getTwoCtas()) {
+        llvm::SetVector<Value> bars;
+        bars.insert(tcgen5CommitOp.getBarrier());
+        return bars;
+      }
+    } else if (auto tmemCopyOp = llvm::dyn_cast<ttng::TMEMCopyOp>(op)) {
+      if (auto bar = tmemCopyOp.getBarrier()) {
+        if (tlx::tlxEnablePairedMMA(op)) {
+          llvm::SetVector<Value> bars;
+          bars.insert(bar);
+          return bars;
         }
       }
-    });
+    } else if (llvm::isa<ttng::MMAv5OpInterface>(op)) {
+      if (tlx::tlxEnablePairedMMA(op)) {
+        llvm::SetVector<Value> bars;
+        if (auto mma = llvm::dyn_cast<ttng::TCGen5MMAOp>(op)) {
+          for (auto bar : mma.getBarriers())
+            bars.insert(bar);
+        } else {
+          auto scaledMMA = llvm::cast<ttng::TCGen5MMAScaledOp>(op);
+          for (auto bar : scaledMMA.getBarriers())
+            bars.insert(bar);
+        }
+        return bars;
+      }
+    }
 
-    // If there's no mapa, it's not possible to access remote barrier so
-    // skipping
-    if (!hasMapaOp) {
+    return std::nullopt;
+  }
+
+  // If the kernel is clustered, insert cluster sync properly to
+  // bootstrap remote bars
+  LogicalResult maybeInsertClusterSync(ModuleOp &mod) {
+    if (!tlx::tlxIsClustered(mod)) {
       return success();
     }
 
-    assert(!barAllocOps.empty() &&
-           "Failed to find bar alloc op for remote bar");
+    // If the kernel is in explicit(manual) cluster sync mode, users will be
+    // responsible for inserting cluster sync correctly from front end.
+    if (tlx::tlxExplicitClusterSync(mod)) {
+      return success();
+    }
 
-    // Find the init op for remote barriers
-    SetVector<Operation *> remoteBarInitOps;
-    mod.walk([&](ttng::InitBarrierOp barInitOp) {
+    bool hasRemoteBar = false;
+    // Find if we have a remote bar
+    mod.walk([&](Operation *op) {
       SetVector<Operation *> ops;
-      getBackwardSliceWithWS(barInitOp.getAlloc(), &ops);
-      if (llvm::any_of(
-              ops, [&](Operation *op) { return barAllocOps.contains(op); })) {
-        // barInitOp is for remote bar
-        remoteBarInitOps.insert(barInitOp);
+      auto remoteBar = getRemoteBarrier(op);
+      if (remoteBar.has_value()) {
+        hasRemoteBar = true;
+        return WalkResult::interrupt();
       }
+      return WalkResult::advance();
+    });
+    // If there's no remote barrier, skipping
+    if (!hasRemoteBar) {
+      return success();
+    }
+
+    // Find all bar init ops
+    SetVector<Operation *> remoteOrLocalBarInitOps;
+    mod.walk([&](ttng::InitBarrierOp barInitOp) {
+      remoteOrLocalBarInitOps.insert(barInitOp);
     });
 
-    assert(!remoteBarInitOps.empty() &&
-           "Failed to find bar init op for remote bar");
+    assert(!remoteOrLocalBarInitOps.empty() &&
+           "Failed to find bar init op when we know there's remote bar");
 
     // Enforcing front end for 2cta kernels:
     // All remote barrier init ops need to happen at the first block of
     // function. This is to make 2cta cluster sync insertion easier for WarpSpec
-    // case. If in the future there's a need to really alloc/init barriers after
-    // a WS op, we can seek to relax this limitation and fix cluster sync
-    // insertions.
-    if (failed(ensureEarlyRemoteBarInit(mod, remoteBarInitOps))) {
+    // case.
+    if (failed(ensureEarlyRemoteBarInit(mod, remoteOrLocalBarInitOps))) {
       return failure();
     }
 
     // Follow the program order and identify the last bar init op.
-    // This is based on the assumption that all bar init happens at the first
-    // block of the kernel func op, as we currently enforce earlier in this
-    // pass. If that assumption changes, we should revisit this heuristic here.
     ttng::InitBarrierOp lastBarInitOp;
-    auto firstBlock = remoteBarInitOps.front()->getBlock();
+    auto firstBlock = remoteOrLocalBarInitOps.front()->getBlock();
     for (auto it = firstBlock->rbegin(), e = firstBlock->rend(); it != e;
          ++it) {
-      if (remoteBarInitOps.contains(&*it)) {
+      if (remoteOrLocalBarInitOps.contains(&*it)) {
         lastBarInitOp = cast<ttng::InitBarrierOp>(*it);
         break;
       }
@@ -374,12 +412,14 @@ private:
 
     OpBuilder builder(lastBarInitOp);
     builder.setInsertionPointAfter(lastBarInitOp);
+    // need to insert fence to make mbar init visible to cluster
+    ttng::FenceAsyncSharedOp::create(builder, lastBarInitOp.getLoc(),
+                                      /*bCluster=*/true);
     // need to insert cluster arrive and wait to prevent CTA_X from arriving
-    // CTA_Y's bar before CTA_Y inits it, as shown in ptx doc examples:
-    // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-test-wait-try-wait
-    builder.create<ttng::ClusterArriveOp>(lastBarInitOp.getLoc(),
-                                          /*relaxed*/ false);
-    builder.create<ttng::ClusterWaitOp>(lastBarInitOp.getLoc());
+    // CTA_Y's bar before CTA_Y inits it
+    ttng::ClusterArriveOp::create(builder, lastBarInitOp.getLoc(),
+                                  /*relaxed*/ false);
+    ttng::ClusterWaitOp::create(builder, lastBarInitOp.getLoc());
 
     return success();
   }
