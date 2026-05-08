@@ -7,6 +7,7 @@ from .barrier import (
     barrier_expect_bytes,
     barrier_wait,
     cluster_barrier,
+    fence_mbarrier_init_cluster,
     named_barrier_arrive,
     named_barrier_wait,
 )
@@ -138,6 +139,7 @@ __all__ = [
     "async_remote_shmem_store",
     # barriers
     "cluster_barrier",
+    "fence_mbarrier_init_cluster",
     "alloc_barriers",
     "alloc_warp_barrier",
     "barrier_expect_bytes",

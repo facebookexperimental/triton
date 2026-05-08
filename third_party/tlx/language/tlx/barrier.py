@@ -10,6 +10,25 @@ def cluster_barrier(_semantic=None):
 
 
 @tl.builtin
+def fence_mbarrier_init_cluster(_semantic=None):
+    """
+    Emit a cluster fence instruction for mbarrier init.
+
+    This fence ensures that prior mbarrier.init operations (from alloc_barriers)
+    are visible to all CTAs in the cluster before any cross-CTA barrier
+    operations (barrier_arrive with remote_cta_rank, etc.).
+
+    Note: The compiler automatically inserts this fence in maybeInsertClusterSync.
+    This API is for explicit use when tlx.explicit_cluster_sync is set.
+    """
+    raise NotImplementedError(
+        "fence_mbarrier_init_cluster requires FenceMBarrierInitReleaseClusterOp "
+        "which is not available on this branch. The compiler inserts this fence "
+        "automatically via maybeInsertClusterSync."
+    )
+
+
+@tl.builtin
 def alloc_barriers(
         num_barriers: tl.constexpr,
         arrive_count: tl.constexpr = tl.constexpr(1),
