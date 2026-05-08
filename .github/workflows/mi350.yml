@@ -33,6 +33,8 @@ jobs:
           set -eux
           bash ./.ci/tritonbench/setup-env.sh --hip --no-build
       - name: Compile Triton
+        env:
+          MAX_JOBS: 16
         run: |
           set -eux
           . "${SETUP_SCRIPT}"
