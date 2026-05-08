@@ -189,52 +189,37 @@ LogicalResult InvalBarrierOp::verify() {
   return success();
 }
 
+static LogicalResult verifyClusterOp(Operation *op) {
+  auto mod = op->getParentOfType<ModuleOp>();
+  int numCTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);
+  if (numCTAs > 1)
+    return success();
+  const SmallVector<int> tlxClusterDims =
+      triton::gpu::TritonGPUDialect::getClusterDims(mod);
+  int tlxClusterSize = 1;
+  for (int d : tlxClusterDims)
+    tlxClusterSize *= d;
+  if (tlxClusterSize > 1)
+    return success();
+  if (mod->hasAttr("tlx.enable_paired_cta_mma"))
+    return success();
+  return op->emitOpError(
+      "requires ttg.num-ctas > 1 or TLX cluster size > 1");
+}
+
 // -- FenceMBarrierInitReleaseClusterOp --
 LogicalResult FenceMBarrierInitReleaseClusterOp::verify() {
-  int numCTAs = triton::gpu::lookupNumCTAs(getOperation());
-  if (numCTAs <= 1){
-    // upstream numCTA is 1, check TLX cluster size
-    const SmallVector<int> tlxClusterDims =
-      triton::gpu::TritonGPUDialect::getClusterDims(getOperation()->getParentOfType<ModuleOp>());
-    int tlxClusterSize = 1;
-    for (int d : tlxClusterDims)
-      tlxClusterSize *= d;
-      if(tlxClusterSize <= 1)
-        return emitOpError("requires ttg.num-ctas > 1 or TLX cluster size > 1");
-  }
-  return success();
+  return verifyClusterOp(getOperation());
 }
 
 // -- ClusterArriveOp --
 LogicalResult ClusterArriveOp::verify() {
-  int numCTAs = triton::gpu::lookupNumCTAs(getOperation());
-  if (numCTAs <= 1){
-    // upstream numCTA is 1, check TLX cluster size
-    const SmallVector<int> tlxClusterDims =
-      triton::gpu::TritonGPUDialect::getClusterDims(getOperation()->getParentOfType<ModuleOp>());
-    int tlxClusterSize = 1;
-    for (int d : tlxClusterDims)
-      tlxClusterSize *= d;
-      if(tlxClusterSize <= 1)
-        return emitOpError("requires ttg.num-ctas > 1 or TLX cluster size > 1");
-  }
-  return success();
+  return verifyClusterOp(getOperation());
 }
 
 // -- ClusterWaitOp --
 LogicalResult ClusterWaitOp::verify() {
-  int numCTAs = triton::gpu::lookupNumCTAs(getOperation());
-  if (numCTAs <= 1){
-    // upstream numCTA is 1, check TLX cluster size
-    const SmallVector<int> tlxClusterDims =
-      triton::gpu::TritonGPUDialect::getClusterDims(getOperation()->getParentOfType<ModuleOp>());
-    int tlxClusterSize = 1;
-    for (int d : tlxClusterDims)
-      tlxClusterSize *= d;
-      if(tlxClusterSize <= 1)
-        return emitOpError("requires ttg.num-ctas > 1 or TLX cluster size > 1");
-  }
-  return success();
+  return verifyClusterOp(getOperation());
 }
 
 // -- BarrierExpectOp --

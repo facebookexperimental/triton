@@ -10,6 +10,8 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
+    // CHECK: fence.mbarrier_init.release.cluster
+    // CHECK: nvvm.fence.proxy {kind = #nvvm.proxy_kind<async.shared>, space = #nvvm.shared_space<cluster>}
     // CHECK: nvvm.cluster.arrive {aligned}
     // CHECK: nvvm.cluster.wait {aligned}
     ttng.init_barrier %1, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -31,6 +33,8 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
+    // CHECK: fence.mbarrier_init.release.cluster
+    // CHECK: nvvm.fence.proxy {kind = #nvvm.proxy_kind<async.shared>, space = #nvvm.shared_space<cluster>}
     // CHECK: nvvm.cluster.arrive {aligned}
     // CHECK: nvvm.cluster.wait {aligned}
     ttng.init_barrier %1, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -64,6 +68,8 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
+    // CHECK: fence.mbarrier_init.release.cluster
+    // CHECK: nvvm.fence.proxy {kind = #nvvm.proxy_kind<async.shared>, space = #nvvm.shared_space<cluster>}
     // CHECK: nvvm.cluster.arrive {aligned}
     // CHECK: nvvm.cluster.wait {aligned}
     ttng.init_barrier %1, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -101,6 +107,7 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
     %c1_i32 = arith.constant 1 : i32
     %2 = ttg.memdesc_index %0[%c1_i32] : !ttg.memdesc<2xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
+    // CHECK: fence.mbarrier_init.release.cluster
     // CHECK: nvvm.fence.proxy {kind = #nvvm.proxy_kind<async.shared>, space = #nvvm.shared_space<cluster>}
     // CHECK: nvvm.cluster.arrive {aligned}
     // CHECK-NEXT: nvvm.cluster.wait {aligned}
@@ -159,6 +166,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
+    // CHECK: fence.mbarrier_init.release.cluster
+    // CHECK: nvvm.fence.proxy {kind = #nvvm.proxy_kind<async.shared>, space = #nvvm.shared_space<cluster>}
     // CHECK: nvvm.cluster.arrive {aligned}
     // CHECK: nvvm.cluster.wait {aligned}
     // CHECK: nvvm.mapa
@@ -182,6 +191,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
+    // CHECK: fence.mbarrier_init.release.cluster
+    // CHECK: nvvm.fence.proxy {kind = #nvvm.proxy_kind<async.shared>, space = #nvvm.shared_space<cluster>}
     // CHECK: nvvm.cluster.arrive {aligned}
     // CHECK: nvvm.cluster.wait {aligned}
     ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -202,6 +213,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
+    // CHECK: fence.mbarrier_init.release.cluster
+    // CHECK: nvvm.fence.proxy {kind = #nvvm.proxy_kind<async.shared>, space = #nvvm.shared_space<cluster>}
     // CHECK: nvvm.cluster.arrive {aligned}
     // CHECK: nvvm.cluster.wait {aligned}
     // CHECK: clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all
@@ -226,6 +239,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
+    // CHECK: fence.mbarrier_init.release.cluster
+    // CHECK: nvvm.fence.proxy {kind = #nvvm.proxy_kind<async.shared>, space = #nvvm.shared_space<cluster>}
     // CHECK: nvvm.cluster.arrive {aligned}
     // CHECK: nvvm.cluster.wait {aligned}
     // CHECK: cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster
@@ -288,6 +303,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
+    // CHECK: fence.mbarrier_init.release.cluster
     // CHECK: nvvm.fence.proxy {kind = #nvvm.proxy_kind<async.shared>, space = #nvvm.shared_space<cluster>}
     // CHECK: nvvm.cluster.arrive {aligned}
     // CHECK-NEXT: nvvm.cluster.wait {aligned}

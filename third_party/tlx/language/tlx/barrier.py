@@ -21,11 +21,7 @@ def fence_mbarrier_init_cluster(_semantic=None):
     Note: The compiler automatically inserts this fence in maybeInsertClusterSync.
     This API is for explicit use when tlx.explicit_cluster_sync is set.
     """
-    raise NotImplementedError(
-        "fence_mbarrier_init_cluster requires FenceMBarrierInitReleaseClusterOp "
-        "which is not available on this branch. The compiler inserts this fence "
-        "automatically via maybeInsertClusterSync."
-    )
+    _semantic.builder.create_fence_mbarrier_init_cluster()
 
 
 @tl.builtin

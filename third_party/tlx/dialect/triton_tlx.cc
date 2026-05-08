@@ -353,8 +353,10 @@ void init_triton_tlx_ir(py::module &&m) {
              self.create<triton::nvidia_gpu::ClusterArriveOp>(false);
              self.create<triton::nvidia_gpu::ClusterWaitOp>();
            })
-      // TODO: Port FenceMBarrierInitReleaseClusterOp from upstream
-      // .def("create_fence_mbarrier_init_cluster", ...)
+      .def("create_fence_mbarrier_init_cluster",
+           [](TritonOpBuilder &self) -> void {
+             self.create<triton::nvidia_gpu::FenceMBarrierInitReleaseClusterOp>();
+           })
       .def("create_tmem_alloc",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
               Type &elementType, Attribute &encoding,
