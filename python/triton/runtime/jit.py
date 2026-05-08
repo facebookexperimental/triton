@@ -8,7 +8,7 @@ import os
 import threading
 import re
 import textwrap
-from collections import defaultdict, namedtuple
+from collections import defaultdict
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Callable, Generic, Iterable, Optional, TypeVar, overload, Dict, Any, Tuple
@@ -24,9 +24,6 @@ from triton._C.libtriton import get_cache_invalidating_env_vars, native_speciali
 
 TRITON_MODULE = "triton.language"
 GLUON_MODULE = "triton.experimental.gluon.language"
-
-# Structured cache entry for the Layer 1 identity-based fast path.
-_LastCall = namedtuple("_LastCall", ["device", "args", "kernel", "bound_vals", "instrumentation_mode"])
 
 T = TypeVar("T")
 
@@ -612,54 +609,6 @@ def convert_to_tuple_if_list(item):
     return tuple(item)
 
 
-class _DeviceCaches(defaultdict):
-    """A defaultdict that also invalidates the fast-path cache
-    (``_last_call``) whenever the in-memory kernel cache is cleared.
-    Without this, ``device_caches.clear()`` would wipe the kernel cache but
-    leave a stale ``_last_call`` entry, causing the fast path to return a
-    kernel that is no longer in the device cache."""
-
-    def __init__(self, jit_function=None, default_factory=None):
-        super().__init__(default_factory)
-        self._jit_function = jit_function
-
-    def clear(self):
-        super().clear()
-        if self._jit_function is not None:
-            self._jit_function.clear_fast_path_caches()
-
-    def __copy__(self):
-        # Explicit shallow copy — Python 3.12 copy.copy() on dict
-        # subclasses calls the constructor, which fails because
-        # _DeviceCaches.__init__ has a different signature than
-        # defaultdict.__init__.
-        result = _DeviceCaches(self._jit_function, self.default_factory)
-        result.update(self)
-        return result
-
-    def __reduce__(self):
-        # Return as a plain defaultdict for pickling.
-        # Drop both _jit_function and default_factory: the back-reference
-        # is not meaningful in a serialized copy, and default_factory is a
-        # bound method (create_binder) whose JITFunction instance may not
-        # be picklable.
-        return (defaultdict, (None, ), None, None, iter(self.items()))
-
-    def __deepcopy__(self, memo):
-        # Deepcopy as a plain defaultdict — the _jit_function
-        # back-reference should not be copied.
-        # Use memo for default_factory so that if the factory is a bound
-        # method of a JITFunction being deepcopied, it resolves to the
-        # *new* JITFunction (via memo) instead of keeping a cross-reference
-        # back to the original.
-        new_factory = copy.deepcopy(self.default_factory, memo)
-        result = defaultdict(new_factory)
-        memo[id(self)] = result
-        for k, v in self.items():
-            result[copy.deepcopy(k, memo)] = copy.deepcopy(v, memo)
-        return result
-
-
 class JITFunction(JITCallable, KernelInterface[T]):
 
     def is_gluon(self):
@@ -781,67 +730,9 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
         return options, signature, constexprs, attrs
 
-    def clear_fast_path_caches(self):
-        """Invalidate the identity-based fast-path cache.
-
-        Call this after mutating any JITCallable that was previously passed as
-        an argument to this kernel (e.g. via ``_unsafe_update_src``).
-        """
-        self._last_call = None
-        self._last_kwargs = {}
-
     def run(self, *args, grid, warmup, **kwargs):
         device = driver.active.get_current_device()
         stream = driver.active.get_current_stream(device)
-
-        # --- FAST PATH (Layer 1: Identity check) ---
-        # If the exact same Python objects are passed as the previous call
-        # (common in training loops where the same tensors/kwargs are reused),
-        # skip the binder, cache key computation, and most dispatch overhead.
-        # This is just N pointer comparisons with zero attribute access.
-        if not warmup and not self.pre_run_hooks and not knobs.compilation.always_compile:
-            last = self._last_call
-            if last is not None and last.device is device and last.instrumentation_mode == knobs.compilation.instrumentation_mode:
-                last_args = last.args
-                if len(args) == len(last_args):
-                    identical = True
-                    for i in range(len(args)):
-                        if args[i] is not last_args[i]:
-                            identical = False
-                            break
-                    if identical:
-                        last_kw = self._last_kwargs
-                        if len(kwargs) != len(last_kw):
-                            identical = False
-                        else:
-                            for k, v in kwargs.items():
-                                if k not in last_kw or v is not last_kw[k]:
-                                    identical = False
-                                    break
-                    if identical:
-                        kernel = last.kernel
-                        if self.used_global_vals:
-                            not_present = object()
-                            for (name, _), (val, globals_dict) in self.used_global_vals.items():
-                                if globals_dict.get(name, not_present) != val:
-                                    kernel = None
-                                    break
-                        if kernel is not None:
-                            bound_vals = last.bound_vals
-                            assert grid is not None
-                            if callable(grid):
-                                grid = grid(dict(zip(self.arg_names, bound_vals)))
-                            grid_size = len(grid)
-                            grid_0 = grid[0]
-                            grid_1 = grid[1] if grid_size > 1 else 1
-                            grid_2 = grid[2] if grid_size > 2 else 1
-                            launch_metadata = kernel.launch_metadata(grid, stream, *bound_vals)
-                            kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata,
-                                       launch_metadata, knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook,
-                                       *bound_vals)
-                            return kernel
-
-        _user_kwargs = dict(kwargs) if kwargs else {}
 
         kwargs["debug"] = kwargs.get("debug", self.debug) or knobs.runtime.debug
         # Enable sanitize_overflow if explicitly set via kwarg, env var (TRITON_SANITIZE_OVERFLOW), or if debug is enabled
@@ -916,17 +807,6 @@ class JITFunction(JITCallable, KernelInterface[T]):
             kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,
                        knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *bound_args.values())
 
-            # Populate fast-path caches for future calls.
-            # Store both raw args (for identity check) and bound_args values
-            # (for launching — includes default parameter values).
-            # Only populate when the fast path guard would allow reuse —
-            # if pre_run_hooks are active, the compiled kernel may depend on
-            # hook-controlled state that the fast path doesn't check.
-            if not self.pre_run_hooks and not knobs.compilation.always_compile:
-                self._last_call = _LastCall(device, args, kernel, tuple(bound_args.values()),
-                                            knobs.compilation.instrumentation_mode)
-                self._last_kwargs = _user_kwargs
-
         return kernel
 
     def repr(self, _):
@@ -954,12 +834,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
             self.params.append(KernelParam(i, param, dns, dns_oa))
 
         # cache of just-in-time compiled kernels
-        self.device_caches = _DeviceCaches(self, self.create_binder)
-
-        # Last-call cache for identity-based fast path (Layer 1).
-        # Stores a _LastCall namedtuple from the previous successful launch.
-        self._last_call = None
-        self._last_kwargs = {}
+        self.device_caches = defaultdict(self.create_binder)
 
         # JITFunction can be instantiated as kernel
         # when called with a grid using __getitem__
