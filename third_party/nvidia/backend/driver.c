@@ -1295,20 +1295,50 @@ bool extractFP64(void *ptr, PyObject *obj) {
 }
 
 // Extract a CUtensorMap descriptor from a python object, and store it to the
-// memory location pointed by ptr.
+// memory location pointed by ptr. Supports both PyCUtensorMap objects (from
+// fill_tma_descriptor_tiled) and duck-typed wrappers with tma_desc_cpu_ptr()
+// (e.g., KernelParamWrapper from fast_moe/fbgemm).
+static PyObject *tma_desc_cpu_ptr_str = NULL;
+
 bool extractTmaDesc(void *ptr, PyObject *obj) {
   if (sizeof(CUtensorMap *) != 8) {
     PyErr_SetString(PyExc_SystemError,
                     "getTmaDesc() requires 64-bit compilation");
     return false;
   }
-  if (Py_TYPE(obj) != &PyCUtensorMapType) {
-    PyErr_Format(PyExc_TypeError,
-                 "object must be of type PyCUtensorMap, got %s",
-                 Py_TYPE(obj)->tp_name);
-    return false;
+
+  if (Py_TYPE(obj) == &PyCUtensorMapType) {
+    // Fast path: native PyCUtensorMap object
+    *((CUtensorMap *)ptr) = ((PyCUtensorMapObject *)obj)->tensorMap;
+  } else {
+    // Duck-typing fallback: try tma_desc_cpu_ptr() method
+    if (!tma_desc_cpu_ptr_str) {
+      tma_desc_cpu_ptr_str = PyUnicode_InternFromString("tma_desc_cpu_ptr");
+      if (!tma_desc_cpu_ptr_str)
+        return false;
+    }
+    PyObject *host_ptr_obj = PyObject_CallMethodNoArgs(obj, tma_desc_cpu_ptr_str);
+    if (!host_ptr_obj) {
+      // Only replace the error if the method doesn't exist (AttributeError).
+      // If the method exists but raised, propagate the real exception.
+      if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
+        PyErr_Clear();
+        PyErr_Format(PyExc_TypeError,
+                     "object must be of type PyCUtensorMap or have tma_desc_cpu_ptr() method, got %s",
+                     Py_TYPE(obj)->tp_name);
+      }
+      return false;
+    }
+    uintptr_t host_ptr = (uintptr_t)PyLong_AsUnsignedLongLong(host_ptr_obj);
+    Py_DECREF(host_ptr_obj);
+    if (PyErr_Occurred()) return false;
+    if (host_ptr == 0) {
+      PyErr_SetString(PyExc_ValueError, "tma_desc_cpu_ptr() returned NULL");
+      return false;
+    }
+    memcpy(ptr, (const void *)host_ptr, sizeof(CUtensorMap));
   }
-  *((CUtensorMap *)ptr) = ((PyCUtensorMapObject *)obj)->tensorMap;
+
   // Depending on the cuda version, alignof(CUtensorMap) may be 64 or 128.
   size_t alignment = alignof(CUtensorMap);
   uintptr_t remainder = (uintptr_t)ptr & (alignment - 1);
