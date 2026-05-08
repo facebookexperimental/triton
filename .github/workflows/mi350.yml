@@ -12,7 +12,7 @@ jobs:
     env:
       WORKSPACE_DIR: /workspace
       UV_VENV_DIR: /workspace/uv_venvs
-      CONDA_ENV: meta-triton
+      CONDA_ENV: pytorch
       SETUP_SCRIPT: /workspace/setup_instance.sh
     timeout-minutes: 240
     permissions:
