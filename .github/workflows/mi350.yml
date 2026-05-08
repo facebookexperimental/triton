@@ -10,7 +10,8 @@ jobs:
     if: github.repository_owner == 'facebookexperimental'
     runs-on: linux-fb-triton-mi350-1
     env:
-      DOCKER_IMAGE: "ghcr.io/meta-pytorch/tritonbench:rocm-latest"
+      WORKSPACE_DIR: /workspace
+      UV_VENV_DIR: /workspace/uv_venvs
       CONDA_ENV: meta-triton
       SETUP_SCRIPT: /workspace/setup_instance.sh
     timeout-minutes: 240
@@ -20,44 +21,29 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v3
-      - name: Pull docker image
-        uses: pytorch/test-infra/.github/actions/pull-docker-image@main
+      - name: Checkout Tritonbench
+        uses: actions/checkout@v3
         with:
-          docker-image: ${{ env.DOCKER_IMAGE }}
-      - name: Run Tritonbench Docker image
+          repository: meta-pytorch/tritonbench
+          path: tritonbench
+          submodules: recursive
+      - name: Setup Tritonbench environment
+        working-directory: tritonbench
         run: |
           set -eux
-          GPU_FLAG="--device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined --group-add video"
-
-          container_name=$(docker run \
-            ${GPU_FLAG:-} \
-            -e CONDA_ENV \
-            -e SETUP_SCRIPT \
-            --ipc=host \
-            --tty \
-            --detach \
-            --shm-size=32g \
-            --cap-add=SYS_PTRACE \
-            -v "${GITHUB_WORKSPACE}:/tmp/workspace" \
-            -w /tmp/workspace \
-            "${DOCKER_IMAGE}"
-          )
-          echo "container_name=${container_name}" >> "$GITHUB_ENV"
+          bash ./.ci/tritonbench/setup-env.sh --hip --no-build
       - name: Compile Triton
         run: |
-          docker exec -t -w /tmp/workspace "${container_name}" bash -c "
-            set -eux
-            bash /workspace/tritonbench/.ci/uv/install.sh
-            . ${SETUP_SCRIPT}
-            . /workspace/tritonbench/.ci/triton/triton_install_utils.sh
-            cd /tmp/workspace; install_triton .
-          "
+          set -eux
+          . "${SETUP_SCRIPT}"
+          . "${GITHUB_WORKSPACE}/tritonbench/.ci/triton/triton_install_utils.sh"
+          install_triton "${GITHUB_WORKSPACE}"
       - name: Run TritonBench
+        working-directory: tritonbench
         run: |
-          docker exec -t -w /tmp/workspace "${container_name}" bash -c "
-            set -eux
-            bash ./.ci/tritonbench/test-gpu.sh
-          "
+          set -eux
+          . "${SETUP_SCRIPT}"
+          bash ./.ci/tritonbench/test-gpu.sh
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
