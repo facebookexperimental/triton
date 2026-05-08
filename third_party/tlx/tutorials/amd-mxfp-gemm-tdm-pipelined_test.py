@@ -129,22 +129,22 @@ def _mxgemm_load_operands(
     b_view = tlx.local_view(b_buf, slot)
     b = tlx.local_load(tlx.local_trans(b_view) if TRANSPOSE_B else b_view)
 
-    scale_a_raw = tlx.local_load(tlx.local_view(a_scale_buf, slot))
-    scale_b_raw = tlx.local_load(tlx.local_view(b_scale_buf, slot))
-
-    scale_a = tl.reshape(
-        scale_a_raw,
-        (BLOCK_M_PRESHUFFLED, BLOCK_K_SCALE // SCALE_KWIDTH, 128 // 4, 4, SCALE_KWIDTH),
+    scale_a_view = tlx.local_reshape(
+        tlx.local_view(a_scale_buf, slot),
+        [BLOCK_M_PRESHUFFLED, BLOCK_K_SCALE // SCALE_KWIDTH, 128 // 4, 4, SCALE_KWIDTH],
     )
-    scale_a = tl.permute(scale_a, (0, 3, 2, 1, 4))
-    scale_a = tl.reshape(scale_a, (BLOCK_M, BLOCK_K_SCALE))
+    scale_a_view = tlx.local_trans(scale_a_view, (0, 3, 2, 1, 4))
+    scale_a_view = tlx.local_reshape(scale_a_view, [BLOCK_M, BLOCK_K_SCALE])
 
-    scale_b = tl.reshape(
-        scale_b_raw,
-        (BLOCK_N_PRESHUFFLED, BLOCK_K_SCALE // SCALE_KWIDTH, 128 // 4, 4, SCALE_KWIDTH),
+    scale_b_view = tlx.local_reshape(
+        tlx.local_view(b_scale_buf, slot),
+        [BLOCK_N_PRESHUFFLED, BLOCK_K_SCALE // SCALE_KWIDTH, 128 // 4, 4, SCALE_KWIDTH],
     )
-    scale_b = tl.permute(scale_b, (0, 3, 2, 1, 4))
-    scale_b = tl.reshape(scale_b, (BLOCK_N, BLOCK_K_SCALE))
+    scale_b_view = tlx.local_trans(scale_b_view, (0, 3, 2, 1, 4))
+    scale_b_view = tlx.local_reshape(scale_b_view, [BLOCK_N, BLOCK_K_SCALE])
+
+    scale_a = tlx.local_load(scale_a_view)
+    scale_b = tlx.local_load(scale_b_view)
 
     return a, b, scale_a, scale_b
 

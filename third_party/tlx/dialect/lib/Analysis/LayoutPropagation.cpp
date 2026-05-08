@@ -254,6 +254,31 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
     return success();
   }
 
+  if (auto memDescReshapeOp = dyn_cast<ttg::MemDescReshapeOp>(op)) {
+    auto resultLattice = results[0];
+    LayoutEncoding resultLayoutEncoding = resultLattice->getValue();
+    if (!resultLayoutEncoding.isUninitialized() &&
+        !resultLayoutEncoding.isUnknown()) {
+      auto srcType = cast<ttg::MemDescType>(memDescReshapeOp.getSrc().getType());
+      auto resultType = cast<ttg::MemDescType>(memDescReshapeOp.getType());
+      auto resultTypeWithLayout = ttg::MemDescType::get(
+          resultType.getShape(), resultType.getElementType(),
+          resultLayoutEncoding.getLayoutEncoding(), resultType.getMemorySpace(),
+          resultType.getMutableMemory(), resultType.getAllocShape());
+      ttg::MemDescType inferredSrcType;
+      if (failed(ttg::MemDescReshapeOp::inferReturnTypes(
+              op->getContext(), op->getLoc(), resultTypeWithLayout,
+              srcType.getShape(), inferredSrcType)))
+        return failure();
+      LayoutEncoding sourceLayout(inferredSrcType.getEncoding());
+      auto operandLattice = operands[0];
+      ChangeResult changed = operandLattice->meet(sourceLayout);
+      propagateIfChanged(operandLattice, changed);
+      visitWarpSpecRegionArgs(op, memDescReshapeOp.getSrc(), sourceLayout);
+    }
+    return success();
+  }
+
   // TMEMSubSliceOp preserves the source tile shape and only refines the
   // column-stride/CTA-split details on the 2D slice view. The verifier already
   // guarantees tensor-memory encodings on both source and result.
@@ -635,8 +660,9 @@ LogicalResult LayoutForwardPropagation::visitOperation(
     return visitRegion(op);
 
   if (!isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
-           ttg::MemDescSubsliceOp, ttg::MemDescTransOp, ttng::TMEMSubSliceOp,
-           ttg::LocalAllocOp, ttng::TMEMAllocOp>(op))
+           ttg::MemDescSubsliceOp, ttg::MemDescTransOp,
+           ttg::MemDescReshapeOp, ttng::TMEMSubSliceOp, ttg::LocalAllocOp,
+           ttng::TMEMAllocOp>(op))
     return success();
 
   for (const auto [operandIdx, operandLattice] : llvm::enumerate(operands)) {
@@ -657,6 +683,24 @@ LogicalResult LayoutForwardPropagation::visitOperation(
         if (failed(inferred))
           return failure();
         operandLayoutEncoding = LayoutEncoding(*inferred);
+      }
+    }
+
+    if (auto reshapeOp = dyn_cast<ttg::MemDescReshapeOp>(op)) {
+      if (!operandLayoutEncoding.isUninitialized() &&
+          !operandLayoutEncoding.isUnknown()) {
+        auto srcTy = cast<ttg::MemDescType>(reshapeOp.getSrc().getType());
+        auto srcTyWithLayout = ttg::MemDescType::get(
+            srcTy.getShape(), srcTy.getElementType(),
+            operandLayoutEncoding.getLayoutEncoding(), srcTy.getMemorySpace(),
+            srcTy.getMutableMemory(), srcTy.getAllocShape());
+        ttg::MemDescType inferredResultType;
+        auto dstTy = cast<ttg::MemDescType>(reshapeOp.getType());
+        if (failed(ttg::MemDescReshapeOp::inferReturnTypes(
+                op->getContext(), op->getLoc(), srcTyWithLayout,
+                dstTy.getShape(), inferredResultType)))
+          return failure();
+        operandLayoutEncoding = LayoutEncoding(inferredResultType.getEncoding());
       }
     }
 
