@@ -421,9 +421,8 @@ LogicalResult TensorBackwardPropagation::visitOperation(
 
   // For convert_layout, propagate the result constraint backward to the
   // operand so the analysis reaches local_load through scf.for iter_args.
-  if (isa<ttg::ConvertLayoutOp>(op) && op->getNumOperands() == 1 &&
-      op->getNumResults() == 1) {
-    if (!results.empty() && isTrackedTensorValue(op->getOperand(0))) {
+  if (auto convertLayout = dyn_cast<ttg::ConvertLayoutOp>(op)) {
+    if (!results.empty() && isTrackedTensorValue(convertLayout.getSrc())) {
       const TensorLayout &resultState = results[0]->getValue();
       if (!resultState.isUninitialized() && !resultState.isUnknown()) {
         ChangeResult changed = operands[0]->meet(resultState);
