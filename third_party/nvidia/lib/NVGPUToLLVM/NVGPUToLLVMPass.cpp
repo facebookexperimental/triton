@@ -600,7 +600,8 @@ void freeTMAlloc(LLVM::LLVMFuncOp func, Value alloc, size_t size, Value pred,
 }
 
 static Value initTensorMemory(LLVM::LLVMFuncOp func,
-                              Operation *insertionPoint = nullptr) {
+                              Operation *insertionPoint = nullptr,
+                              int smemOffset = 0) {
   auto mod = func->getParentOfType<ModuleOp>();
   assert(mod->hasAttr("ttg.tensor_memory_size"));
   size_t size = cast<IntegerAttr>(mod->getAttr("ttg.tensor_memory_size"))
@@ -625,11 +626,6 @@ static Value initTensorMemory(LLVM::LLVMFuncOp func,
     LLVM::Trap::create(rewriter, loc);
     return LLVM::UndefOp::create(rewriter, loc, ptr_ty(ctx, 6));
   }
-
-  // Read the SMEM offset for the tmem alloc buffer.
-  int smemOffset = 0;
-  if (auto offsetAttr = mod->getAttr("ttg.tmem_alloc_smem_offset"))
-    smemOffset = cast<IntegerAttr>(offsetAttr).getInt();
 
   // This code is only executed by the default warp group.
   Value threadId = NVVM::ThreadIdXOp::create(rewriter, loc, i32_ty);
@@ -666,7 +662,13 @@ static void lowerTensorMemoryAlloc(ModuleOp mod) {
 
   Operation *insertionPoint =
       tcgen5Alloc ? tcgen5Alloc.getOperation() : nullptr;
-  Value newBase = initTensorMemory(kernel, insertionPoint);
+  int smemOffset = 0;
+  if (tcgen5Alloc) {
+    if (auto offsetAttr =
+            tcgen5Alloc->getAttrOfType<IntegerAttr>("allocation.offset"))
+      smemOffset = offsetAttr.getInt();
+  }
+  Value newBase = initTensorMemory(kernel, insertionPoint, smemOffset);
   if (tcgen5Alloc)
     tcgen5Alloc->erase();
 

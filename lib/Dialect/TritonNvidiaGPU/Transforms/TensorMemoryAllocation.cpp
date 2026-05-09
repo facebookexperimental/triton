@@ -501,21 +501,11 @@ public:
       }
     }
     if (totalMemorySize > 0) {
-      // Allocate 4 bytes at the end of SMEM for the tcgen05.alloc address
-      // buffer. This avoids overlapping with TMA tile data at offset 0.
-      int shared = 0;
-      if (auto sharedAttr = mod->getAttr("ttg.shared")) {
-        shared = cast<IntegerAttr>(sharedAttr).getInt();
-      }
-      int tmemAllocSmemOffset = shared;
-      mod->setAttr("ttg.shared", getI32Attr(shared + 4));
-      mod->setAttr("ttg.tmem_alloc_smem_offset", getI32Attr(tmemAllocSmemOffset));
-
-      // For TLX paired MMA, insert a tcgen5_alloc op before the first
-      // tmem_alloc. This represents the single tcgen05.alloc for the entire
-      // kernel and is visible to maybeInsertClusterSync for cluster sync
-      // placement.
       if (tlx::tlxEnablePairedMMA(mod)) {
+        // For paired MMA, insert a TCGen5AllocOp before the first tmem_alloc.
+        // The SMEM allocation pass assigns its 4-byte scratch buffer offset
+        // via the allocation.offset attribute. The op also serves as a marker
+        // for cluster sync placement.
         TMEMAllocOp firstAlloc;
         mod.walk([&](TMEMAllocOp op) {
           firstAlloc = op;
