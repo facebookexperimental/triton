@@ -351,14 +351,8 @@ LogicalResult insertRequireLayout(ModuleOp m) {
   m.walk([&](ttg::LocalLoadOp localLoadOp) {
     auto *lattice =
         solver.lookupState<DotRewriteLattice>(localLoadOp.getResult());
-    if (!lattice) {
-      LDBG("local_load has NO lattice: " << localLoadOp);
+    if (!lattice || lattice->getValue().isUninitialized())
       return;
-    }
-    if (lattice->getValue().isUninitialized()) {
-      LDBG("local_load lattice UNINITIALIZED: " << localLoadOp);
-      return;
-    }
 
     if (lattice->getValue().isIllegal() || lattice->getValue().isConflict()) {
       LDBG("Skipping local_load rewrite due to state: " << lattice->getValue());
@@ -374,8 +368,7 @@ LogicalResult insertRequireLayout(ModuleOp m) {
     if (!dotEnc)
       return;
 
-    LDBG("local_load needs dot encoding: " << dotEnc
-                                           << " for: " << localLoadOp);
+    LDBG("local_load needs dot encoding: " << dotEnc);
 
     // Insert RequireLayoutOp for memdesc swizzling.
     auto sharedEnc = computeSharedEncFromDotEnc(dotEnc, localLoadOp);
