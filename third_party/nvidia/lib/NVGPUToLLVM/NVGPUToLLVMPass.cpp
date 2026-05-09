@@ -3,12 +3,12 @@
 
 #include "Dialect/NVGPU/IR/Dialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
-#include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
 #include "nvidia/lib/TritonNVIDIAGPUToLLVM/Utility.h"
 #include "tlx/dialect/include/IR/Dialect.h"
@@ -538,7 +538,7 @@ static Value createTMAlloc(IRRewriter &rewriter, LLVM::LLVMFuncOp func,
   if (smemOffset > 0) {
     auto ptrTy = sharedMem.getType();
     sharedMem = LLVM::GEPOp::create(rewriter, loc, ptrTy, i8_ty, sharedMem,
-                                     b.i32_val(smemOffset));
+                                    b.i32_val(smemOffset));
   }
   std::string ptxString =
       "@$0 tcgen05.alloc.cta_group::" + std::to_string(twoCTAs ? 2 : 1) +
@@ -630,13 +630,12 @@ static Value initTensorMemory(LLVM::LLVMFuncOp func,
   // This code is only executed by the default warp group.
   Value threadId = NVVM::ThreadIdXOp::create(rewriter, loc, i32_ty);
   Value pred = b.icmp_ult(threadId, b.i32_val(32));
-  Value alloc = createTMAlloc(rewriter, func, size, pred, useTwoCTAs,
-                              smemOffset);
+  Value alloc =
+      createTMAlloc(rewriter, func, size, pred, useTwoCTAs, smemOffset);
   createRelinquishAlloc(rewriter, loc, pred, useTwoCTAs);
   freeTMAlloc(func, alloc, size, pred, useTwoCTAs, isTlxPairedMMA);
   return alloc;
 }
-
 
 static void lowerTensorMemoryAlloc(ModuleOp mod) {
   SmallVector<Operation *> baseOps;

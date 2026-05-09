@@ -417,13 +417,14 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
 
 // -----
 
-// Test that TCGen5AllocOp is NOT created for non-paired-MMA kernels.
+// Test that TCGen5AllocOp is created at function start for non-paired-MMA
+// kernels (for SMEM scratch buffer allocation).
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65536 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
-  // CHECK-LABEL: no_tcgen5_alloc_without_paired_mma
-  // CHECK-NOT: ttng.tcgen5_alloc
+  // CHECK-LABEL: tcgen5_alloc_non_paired_mma
+  // CHECK: ttng.tcgen5_alloc
   // CHECK: ttng.tmem_alloc
-  tt.func public @no_tcgen5_alloc_without_paired_mma() {
+  tt.func public @tcgen5_alloc_non_paired_mma() {
     %alloc = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     tt.return
   }

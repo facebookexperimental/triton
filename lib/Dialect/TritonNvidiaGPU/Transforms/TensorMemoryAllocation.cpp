@@ -4,11 +4,11 @@
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Traits.h"
-#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 #include "llvm/ADT/EquivalenceClasses.h"
@@ -501,21 +501,26 @@ public:
       }
     }
     if (totalMemorySize > 0) {
-      if (tlx::tlxEnablePairedMMA(mod)) {
-        // For paired MMA, insert a TCGen5AllocOp before the first tmem_alloc.
-        // The SMEM allocation pass assigns its 4-byte scratch buffer offset
-        // via the allocation.offset attribute. The op also serves as a marker
-        // for cluster sync placement.
-        TMEMAllocOp firstAlloc;
-        mod.walk([&](TMEMAllocOp op) {
-          firstAlloc = op;
-          return WalkResult::interrupt();
-        });
-        if (firstAlloc) {
-          OpBuilder builder(firstAlloc);
-          TCGen5AllocOp::create(builder, firstAlloc.getLoc(),
-                                totalMemorySize, /*twoCTAs=*/true);
-        }
+      TMEMAllocOp firstAlloc;
+      mod.walk([&](TMEMAllocOp op) {
+        firstAlloc = op;
+        return WalkResult::interrupt();
+      });
+      if (firstAlloc) {
+        auto funcOp = firstAlloc->getParentOfType<triton::FuncOp>();
+        assert(triton::isKernel(funcOp) &&
+               "TODO: add support for function calls using tmem.");
+        // Insert at kernel start; the SMEM allocation pass assigns
+        // a non-overlapping 4-byte scratch buffer for tcgen05.alloc.
+        OpBuilder builder(&funcOp.front(), funcOp.front().begin());
+        bool twoCTAs = mlir::triton::nvidia_gpu::getModuleTwoCTAs(mod) ||
+                       tlx::tlxEnablePairedMMA(mod);
+        auto allocOp = TCGen5AllocOp::create(builder, firstAlloc.getLoc(),
+                                             totalMemorySize, twoCTAs);
+        // For paired MMA, move before the first tmem_alloc so it also
+        // serves as a marker for cluster sync placement.
+        if (tlx::tlxEnablePairedMMA(mod))
+          allocOp->moveBefore(firstAlloc);
       }
     }
     mod->setAttr("ttg.tensor_memory_size", getI32Attr(totalMemorySize));
