@@ -35,9 +35,9 @@ namespace {
 // tt.divisibility function-argument attributes and propagated through
 // arithmetic), so this gives the right answer regardless of the current
 // sizePerThread in the encoding.
-static unsigned computePerThread(Value ptr, Value offsets,
-                                 unsigned elemBitWidth,
-                                 triton::ModuleAxisInfoAnalysis &axisAnalysis) {
+static unsigned
+computePerThread(Value ptr, Value offsets, unsigned elemBitWidth,
+                 triton::ModuleAxisInfoAnalysis &axisAnalysis) {
   unsigned elemNumBytes = std::max(elemBitWidth / 8, 1u);
 
   // Alignment from the scalar base pointer divisibility.
@@ -70,8 +70,7 @@ static unsigned computePerThread(Value ptr, Value offsets,
 // Build the optimal blocked encoding for a buffer op.
 static ttg::BlockedEncodingAttr
 buildBufferOpEncoding(MLIRContext *ctx, Value ptr, Value offsets,
-                      RankedTensorType tensorTy, int numWarps,
-                      int threadsPerWarp,
+                      RankedTensorType tensorTy, int numWarps, int threadsPerWarp,
                       triton::ModuleAxisInfoAnalysis &axisAnalysis) {
   unsigned elemBitWidth = triton::getPointeeBitWidth(ptr.getType());
   unsigned perThread =
@@ -96,8 +95,9 @@ buildBufferOpEncoding(MLIRContext *ctx, Value ptr, Value offsets,
     numElems *= s;
   int numThreads = numWarps * threadsPerWarp;
   // Cap so each thread gets at most its fair share.
-  sizePerThread[order[0]] = std::min<unsigned>(
-      sizePerThread[order[0]], std::max<unsigned>(numElems / numThreads, 1u));
+  sizePerThread[order[0]] =
+      std::min<unsigned>(sizePerThread[order[0]],
+                         std::max<unsigned>(numElems / numThreads, 1u));
 
   auto cgaLayout = ttg::getCGALayout(tensorTy.getEncoding());
   return ttg::BlockedEncodingAttr::get(ctx, tensorTy.getShape(), sizePerThread,
@@ -150,8 +150,10 @@ public:
       int numWarps = ttg::lookupNumWarps(op);
       Value ptr = bufOp.getPtr();
       Value offsets = bufOp.getOffsets();
+
       auto newEnc = buildBufferOpEncoding(ctx, ptr, offsets, tensorTy, numWarps,
                                           threadsPerWarp, axisAnalysis);
+
       // Nothing to do if the encoding is already optimal.
       if (newEnc == tensorTy.getEncoding())
         return;
@@ -160,9 +162,8 @@ public:
       layoutMap[op] = newEnc;
     });
 
-    for (auto &kv : layoutMap) {
+    for (auto &kv : layoutMap)
       convertDistributedOpEncoding(kv.second, kv.first);
-    }
   }
 };
 
