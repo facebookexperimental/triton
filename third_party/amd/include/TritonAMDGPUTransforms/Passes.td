@@ -263,6 +263,21 @@ def TritonAMDGPUInThreadTranspose: Pass<"tritonamdgpu-in-thread-transpose", "mli
   let dependentDialects = ["mlir::triton::amdgpu::TritonAMDGPUDialect", "mlir::triton::gpu::TritonGPUDialect"];
 }
 
+def TritonAMDGPUCoalesceBufferOps: Pass<"tritonamdgpu-coalesce-buffer-ops", "mlir::ModuleOp"> {
+  let summary = "Vectorize buffer load/store ops";
+
+  let description = [{
+    The generic TritonGPUCoalesce pass only handles tensor-of-pointer loads/stores
+    and does not know about AMD buffer ops (which use a scalar base pointer +
+    offset tensor). This pass fills that gap: it computes the contiguity of each
+    BufferLoadOp and BufferStoreOp using axis-info analysis and rewrites their
+    encoding to maximally vectorize the access (up to 128 bits / element).
+  }];
+
+  let dependentDialects = ["mlir::triton::amdgpu::TritonAMDGPUDialect",
+                           "mlir::triton::gpu::TritonGPUDialect"];
+}
+
 def TritonAMDGPUCoalesceAsyncCopy: Pass<"tritonamdgpu-coalesce-async-copy", "mlir::ModuleOp"> {
   let summary = "Improve coalescing for async global to local copies";
 
