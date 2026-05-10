@@ -197,23 +197,16 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
     // - There's an ClusterWaitOp (then it had to be inserted by compiler)
     // Count the number of compiler-inserted cluster syncs (one for barrier
     // init, possibly one more for tmem alloc in TLX paired MMA). Non-default
-    // warps need a matching arrive for each, preserving aligned vs relaxed.
-    SmallVector<bool> arriveIsRelaxed;
-    func.walk([&](Operation *op) {
-      if (isa<NVVM::ClusterArriveOp>(op))
-        arriveIsRelaxed.push_back(false);
-      else if (isa<NVVM::ClusterArriveRelaxedOp>(op))
-        arriveIsRelaxed.push_back(true);
-    });
-    for (bool relaxed : arriveIsRelaxed) {
+    // warps need a matching arrive for each.
+    int numClusterWaits = 0;
+    func.walk([&](NVVM::ClusterWaitOp) { numClusterWaits++; });
+    for (int i = 0; i < numClusterWaits; i++) {
       // Non default warps should just do a cluster arrive unconditionally.
       // Note this instruction is at kernel beginning shared by all warps, and
       // we use `isDefault` as predicate here to select only non default warps
       PTXBuilder ptxBuilder;
-      std::string ptx = relaxed
-                             ? "@!$0 barrier.cluster.arrive.relaxed.aligned;"
-                             : "@!$0 barrier.cluster.arrive.aligned;";
-      auto clusterArriveOp = *ptxBuilder.create(ptx);
+      auto clusterArriveOp =
+          *ptxBuilder.create("@!$0 barrier.cluster.arrive.aligned;");
       clusterArriveOp({ptxBuilder.newOperand(isDefault, "b")},
                       /*onlyAttachMLIRArgs=*/true);
       auto voidTy = void_ty(ctx);
