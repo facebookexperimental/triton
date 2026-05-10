@@ -629,9 +629,9 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps,
     attributes[1].val.cooperative = launch_cooperative_grid;
 
     HIP_LAUNCH_CONFIG config = {
-        gridX * num_ctas,      gridY,  gridZ,        // Grid size
-        warp_size * num_warps, 1,      1,            // Block size
-        shared_memory,         stream, attributes, 2 // Number of attributes
+        (unsigned int)(gridX * num_ctas), (unsigned int)gridY, (unsigned int)gridZ,
+        (unsigned int)(warp_size * num_warps), 1, 1,
+        (unsigned int)shared_memory, stream, attributes, 2
     };
     HIP_CHECK(
         hipSymbolTable.hipDrvLaunchKernelEx(&config, function, params, 0));
@@ -651,7 +651,7 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps,
 static PyObject *data_ptr_str = NULL;
 
 bool extractPointer(void *ptr, PyObject *obj) {
-  hipDeviceptr_t *dev_ptr = ptr;
+  hipDeviceptr_t *dev_ptr = (hipDeviceptr_t *)ptr;
   if (obj == Py_None) {
     *dev_ptr = (hipDeviceptr_t)0; // valid nullptr
     return true;
@@ -814,50 +814,21 @@ typedef enum {
 } ExtractorTypeIndex;
 
 Extractor extraction_map[EXTRACTOR_TYPE_COUNT] = {
-    [EXTRACTOR_UNKOWN_INDEX] =
-        (Extractor){.extract = NULL, .size = 0, .name = NULL},
-    [EXTRACTOR_POINTER_INDEX] = (Extractor){.extract = extractPointer,
-                                            .size = sizeof(hipDeviceptr_t),
-                                            .name = NULL},
-    [EXTRACTOR_INT8_INDEX] = (Extractor){.extract = extractI8,
-                                         .size = sizeof(int8_t),
-                                         .name = {"i8"}},
-    [EXTRACTOR_INT16_INDEX] = (Extractor){.extract = extractI16,
-                                          .size = sizeof(int16_t),
-                                          .name = {"i16"}},
-    [EXTRACTOR_INT32_INDEX] = (Extractor){.extract = extractI32,
-                                          .size = sizeof(int32_t),
-                                          .name = {"i1", "i32"}},
-    [EXTRACTOR_INT64_INDEX] = (Extractor){.extract = extractI64,
-                                          .size = sizeof(int64_t),
-                                          .name = {"i64"}},
-    [EXTRACTOR_UINT8_INDEX] = (Extractor){.extract = extractU8,
-                                          .size = sizeof(uint8_t),
-                                          .name = {"u8"}},
-    [EXTRACTOR_UINT16_INDEX] = (Extractor){.extract = extractU16,
-                                           .size = sizeof(uint16_t),
-                                           .name = {"u16"}},
-    [EXTRACTOR_UINT32_INDEX] = (Extractor){.extract = extractU32,
-                                           .size = sizeof(uint32_t),
-                                           .name = {"u1", "u32"}},
-    [EXTRACTOR_UINT64_INDEX] = (Extractor){.extract = extractU64,
-                                           .size = sizeof(uint64_t),
-                                           .name = {"u64"}},
-    [EXTRACTOR_FP16_INDEX] = (Extractor){.extract = extractFP16,
-                                         .size = sizeof(uint16_t),
-                                         .name = {"fp16"}},
-    [EXTRACTOR_BF16_INDEX] = (Extractor){.extract = extractBF16,
-                                         .size = sizeof(uint16_t),
-                                         .name = {"bf16"}},
-    [EXTRACTOR_FP32_INDEX] = (Extractor){.extract = extractFP32,
-                                         .size = sizeof(uint32_t),
-                                         .name = {"fp32", "f32"}},
-    [EXTRACTOR_FP64_INDEX] = (Extractor){.extract = extractFP64,
-                                         .size = sizeof(uint64_t),
-                                         .name = {"fp64"}},
-    [EXTRACTOR_TDMDESC_INDEX] = (Extractor){.extract = extractTDMDescriptor,
-                                            .size = sizeof(TDMDescriptor),
-                                            .name = {"tensordesc"}},
+    /* EXTRACTOR_UNKOWN_INDEX   */ {NULL, 0, {NULL}},
+    /* EXTRACTOR_POINTER_INDEX  */ {extractPointer, sizeof(hipDeviceptr_t), {NULL}},
+    /* EXTRACTOR_INT8_INDEX     */ {extractI8, sizeof(int8_t), {"i8"}},
+    /* EXTRACTOR_INT16_INDEX    */ {extractI16, sizeof(int16_t), {"i16"}},
+    /* EXTRACTOR_INT32_INDEX    */ {extractI32, sizeof(int32_t), {"i1", "i32"}},
+    /* EXTRACTOR_INT64_INDEX    */ {extractI64, sizeof(int64_t), {"i64"}},
+    /* EXTRACTOR_UINT8_INDEX    */ {extractU8, sizeof(uint8_t), {"u8"}},
+    /* EXTRACTOR_UINT16_INDEX   */ {extractU16, sizeof(uint16_t), {"u16"}},
+    /* EXTRACTOR_UINT32_INDEX   */ {extractU32, sizeof(uint32_t), {"u1", "u32"}},
+    /* EXTRACTOR_UINT64_INDEX   */ {extractU64, sizeof(uint64_t), {"u64"}},
+    /* EXTRACTOR_FP16_INDEX     */ {extractFP16, sizeof(uint16_t), {"fp16"}},
+    /* EXTRACTOR_BF16_INDEX     */ {extractBF16, sizeof(uint16_t), {"bf16"}},
+    /* EXTRACTOR_FP32_INDEX     */ {extractFP32, sizeof(uint32_t), {"fp32", "f32"}},
+    /* EXTRACTOR_FP64_INDEX     */ {extractFP64, sizeof(uint64_t), {"fp64"}},
+    /* EXTRACTOR_TDMDESC_INDEX  */ {extractTDMDescriptor, sizeof(TDMDescriptor), {"tensordesc"}},
 };
 
 Extractor getExtractor(uint8_t index) {
@@ -892,10 +863,10 @@ ExtractorTypeIndex getExtractorIndex(PyObject *type) {
   if (type_bytes[0] == '*') {
     return EXTRACTOR_POINTER_INDEX;
   }
-  for (ExtractorTypeIndex i = EXTRACTOR_INT8_INDEX; i < EXTRACTOR_TYPE_COUNT;
+  for (int i = EXTRACTOR_INT8_INDEX; i < EXTRACTOR_TYPE_COUNT;
        i++) {
-    if (isMatch(type_bytes, i)) {
-      return i;
+    if (isMatch(type_bytes, (ExtractorTypeIndex)i)) {
+      return (ExtractorTypeIndex)i;
     }
   }
 
@@ -945,23 +916,28 @@ cleanup:
 
 bool extractArgs(PyObject **final_list, int *list_idx, PyObject *kernel_args,
                  PyObject *arg_annotations) {
+  Py_ssize_t num_annotations = 0;
+  PyObject **annotations = NULL;
+  PyObject *fast_args = NULL;
+  PyObject **args = NULL;
+  int arg_idx = 0;
+
   // Extract arg annotations
   PyObject *fast_annotations = PySequence_Fast(
       arg_annotations, "Expected arg_annotations to be a sequence or iterable");
   if (!fast_annotations) {
     goto cleanup;
   }
-  Py_ssize_t num_annotations = PySequence_Fast_GET_SIZE(fast_annotations);
-  PyObject **annotations = PySequence_Fast_ITEMS(fast_annotations);
+  num_annotations = PySequence_Fast_GET_SIZE(fast_annotations);
+  annotations = PySequence_Fast_ITEMS(fast_annotations);
 
-  PyObject *fast_args = PySequence_Fast(
+  fast_args = PySequence_Fast(
       kernel_args, "Expected kernel_args to be a sequence or iterable");
   if (!fast_args) {
     goto cleanup;
   }
-  PyObject **args = PySequence_Fast_ITEMS(fast_args);
+  args = PySequence_Fast_ITEMS(fast_args);
 
-  int arg_idx = 0;
   for (int i = 0; i < num_annotations; ++i) {
     PyKernelArgObject *annotation = (PyKernelArgObject *)annotations[i];
     switch (annotation->type) {
@@ -1014,6 +990,14 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   PyObject *arg_annotations = NULL;
   Py_buffer signature;
   PyObject *kernel_args = NULL;
+  uint8_t *extractor_data = NULL;
+  Py_ssize_t num_args = 0;
+  PyObject **args_data = NULL;
+  int list_idx = 0;
+  int num_params = 0;
+  void **params = NULL;
+  int params_idx = 0;
+
   if (!PyArg_ParseTuple(args, "piiiKKO(iii)OOOiOy*O", &launch_cooperative_grid,
                         &gridX, &gridY, &gridZ, &_stream, &_function,
                         &profile_scratch_obj, &num_warps, &num_ctas,
@@ -1028,23 +1012,21 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     goto cleanup;
   }
 
-  uint8_t *extractor_data = (uint8_t *)signature.buf;
-  Py_ssize_t num_args = signature.len;
+  extractor_data = (uint8_t *)signature.buf;
+  num_args = signature.len;
 
   // Extract kernel parameters - flatten tuples & remove constexpr.
-  PyObject **args_data = (PyObject **)alloca(num_args * sizeof(PyObject *));
+  args_data = (PyObject **)alloca(num_args * sizeof(PyObject *));
   if (args_data == NULL) {
     goto cleanup;
   }
-  int list_idx = 0;
   if (!extractArgs(args_data, &list_idx, kernel_args, arg_annotations)) {
     goto cleanup;
   }
 
   // Number of parameters passed to kernel. + 2 for global & profile scratch.
-  int num_params = num_args + 2;
-  void **params = (void **)alloca(num_params * sizeof(void *));
-  int params_idx = 0;
+  num_params = num_args + 2;
+  params = (void **)alloca(num_params * sizeof(void *));
   // This loop has to stay in the same function that owns params, since we are
   // using alloca to allocate pointers to it on the stack of the function.
   for (Py_ssize_t i = 0; i < num_args; ++i) {
