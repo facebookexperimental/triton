@@ -222,6 +222,26 @@ tt.func public @tdm_descriptor_arg_aligns_to_alloc(%desc: !tt.tensordesc<128x32x
 
 // -----
 // =============================================================================
+// alignTDMDescriptorEncodings: TDM store (local-to-global) propagates the
+// source memdesc encoding back to the descriptor type, mirroring the
+// load-side behavior. Both directions of TDM go through the same map.
+// =============================================================================
+
+#shared = #ttg.padded_shared<[32:+8] {order = [1, 0], shape = [128, 32]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+// CHECK-DAG: #[[$PADDED_TDM:.*]] = #ttg.padded_shared<[32:+8] {order = [1, 0], shape = [128, 32]}>
+// CHECK-LABEL: @tdm_store_descriptor_aligns_to_alloc
+// CHECK-SAME: %[[DESC:.*]]: !tt.tensordesc<128x32xf16, #[[$PADDED_TDM]]>
+tt.func public @tdm_store_descriptor_aligns_to_alloc(%desc: !tt.tensordesc<128x32xf16>, %m: i32, %k: i32, %buf: !ttg.memdesc<128x32xf16, #shared, #smem, mutable>) {
+  // CHECK: amdg.async_tdm_copy_local_to_global %[[DESC]][{{.*}}] from {{.*}} -> !tt.tensordesc<128x32xf16, #[[$PADDED_TDM]]>
+  amdg.async_tdm_copy_local_to_global %desc[%m, %k] from %buf : !ttg.memdesc<128x32xf16, #shared, #smem, mutable> -> !tt.tensordesc<128x32xf16>
+  tt.return
+}
+}
+
+// -----
+// =============================================================================
 // alignTDMDescriptorEncodings: descriptor created by `tt.make_tensor_descriptor`
 // (op-result, not function arg) is updated in-place. The local `make_tensor_descriptor`
 // op's result type is rewritten and downstream TDM op picks up the new desc type.

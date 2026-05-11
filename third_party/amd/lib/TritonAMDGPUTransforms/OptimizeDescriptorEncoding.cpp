@@ -123,37 +123,47 @@ static void computeDesiredEncodingAttr(mlir::ModuleOp &m) {
   }
 }
 
-// TLX kernels emit `amdgpu.async_tdm_copy_global_to_local` directly, bypassing
-// `tt.descriptor_load`. The destination memdesc carries the encoding chosen by
+// TLX kernels emit `amdgpu.async_tdm_*` directly, bypassing
+// `tt.descriptor_load` / `tt.descriptor_store`. The memdesc operand
+// (destination for loads, source for stores) carries the encoding chosen by
 // TLX (e.g. WMMA-tuned `composePaddedLayout` when feeding `tt.dot`). Without
 // any propagation, the descriptor's `TensorDescType` keeps the fallback
 // encoding from `AssignDescriptorMemoryLayouts`, while the alloc gets the
 // TLX-picked encoding. The TDM hardware lowering in `LoadStoreOpToLLVM` reads
-// stride from the descriptor type but writes into the alloc — a stride
-// mismatch causes out-of-bounds LDS writes.
+// stride from the descriptor type but reads/writes the alloc — a stride
+// mismatch causes out-of-bounds LDS access.
 //
-// This pass copies the destination memdesc encoding back to the descriptor
-// type so the two sides agree by construction. If multiple TDM copies share a
-// descriptor with conflicting destination encodings, we error out (no good
-// way to pick one over the other; TLX kernels currently never hit this).
+// This pass copies the memdesc encoding back to the descriptor type so the
+// two sides agree by construction. If multiple TDM ops share a descriptor
+// with conflicting memdesc encodings, we error out (no good way to pick one
+// over the other; TLX kernels currently never hit this).
 static LogicalResult alignTDMDescriptorEncodings(mlir::ModuleOp &m) {
   llvm::DenseMap<Value, Attribute> descToEncoding;
-  WalkResult result =
-      m.walk(
-          [&](tt::amdgpu::AsyncTDMCopyGlobalToLocalOp copy) {
-            auto memDescTy = cast<ttg::MemDescType>(copy.getResult().getType());
-            Attribute encoding = memDescTy.getEncoding();
-            Value desc = copy.getDesc();
 
-            auto [it, inserted] = descToEncoding.try_emplace(desc, encoding);
-            if (!inserted && it->second != encoding) {
-              copy.emitError()
-                  << "TDM copies using the same descriptor require conflicting "
-                     "destination layouts";
-              return WalkResult::interrupt();
-            }
-            return WalkResult::advance();
-          });
+  auto record = [&](Operation *op, Value desc,
+                    Attribute encoding) -> WalkResult {
+    auto [it, inserted] = descToEncoding.try_emplace(desc, encoding);
+    if (!inserted && it->second != encoding) {
+      op->emitError() << "TDM ops using the same descriptor require "
+                         "conflicting memdesc layouts";
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  };
+
+  WalkResult result = m.walk([&](Operation *op) {
+    if (auto load = dyn_cast<tt::amdgpu::AsyncTDMCopyGlobalToLocalOp>(op)) {
+      auto memDescTy = cast<ttg::MemDescType>(load.getResult().getType());
+      return record(load, load.getDesc(), memDescTy.getEncoding());
+    }
+    if (auto store = dyn_cast<tt::amdgpu::AsyncTDMCopyLocalToGlobalOp>(op)) {
+      auto memDescTy = cast<ttg::MemDescType>(store.getSrc().getType());
+      return record(store, store.getDesc(), memDescTy.getEncoding());
+    }
+    // tdm_prefetch carries no memdesc and so cannot anchor an encoding;
+    // it piggy-backs on whatever the corresponding load/store decided.
+    return WalkResult::advance();
+  });
   if (result.wasInterrupted())
     return failure();
 
