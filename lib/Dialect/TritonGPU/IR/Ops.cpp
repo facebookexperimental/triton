@@ -1155,7 +1155,13 @@ void WarpSpecializeOp::getSuccessorRegions(
   // And the default region branches transparently back to the parent.
   if (src.getTerminatorPredecessorOrNull()->getParentRegion() ==
       &getDefaultRegion())
-    successors.push_back(RegionSuccessor(getOperation(), getResults()));
+    successors.push_back(RegionSuccessor::parent());
+}
+
+ValueRange WarpSpecializeOp::getSuccessorInputs(RegionSuccessor successor) {
+  if (successor.isParent())
+    return getResults();
+  return ValueRange();
 }
 
 void WarpSpecializePartitionsOp::getSuccessorRegions(
@@ -1164,13 +1170,21 @@ void WarpSpecializePartitionsOp::getSuccessorRegions(
   // of the partition regions.
   if (src.isParent())
     for (Region &region : getPartitionRegions())
-      successors.emplace_back(&region, region.getArguments());
+      successors.emplace_back(&region);
 }
 
 OperandRange
 WarpSpecializePartitionsOp::getEntrySuccessorOperands(RegionSuccessor) {
   return getExplicitCaptures();
 }
+
+ValueRange
+WarpSpecializePartitionsOp::getSuccessorInputs(RegionSuccessor successor) {
+  if (Region *region = successor.getSuccessor())
+    return region->front().getArguments();
+  return ValueRange();
+}
+
 
 LogicalResult WarpSpecializeOp::verify() {
   // The default region is not isolated from above but the partition regions

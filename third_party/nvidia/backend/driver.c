@@ -1345,7 +1345,7 @@ bool extractTmaDesc(void *ptr, PyObject *obj) {
   if (remainder != 0) {
     PyErr_Format(
         PyExc_ValueError,
-        "CUtensorMap must be aligned to %ld, but got (&map) mod %ld = %ld",
+        "CUtensorMap must be aligned to %zuB, but got (&map) mod %zu = %zu",
         alignment, alignment, remainder);
     return false;
   }
