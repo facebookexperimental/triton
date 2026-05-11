@@ -504,6 +504,10 @@ static Attribute inferSrcEncoding(triton::ReshapeOp op, Attribute encoding) {
                                    op.getAllowReorder());
 }
 
+static Attribute inferSrcEncoding(triton::BroadcastOp op, Attribute encoding) {
+  return encoding;
+}
+
 static bool isSingleValue(Value value) {
   // Don't consider load as expensive if it is loading a scalar.
   if (auto tensorTy = dyn_cast<RankedTensorType>(value.getType()))
@@ -551,6 +555,8 @@ Attribute inferSrcEncoding(Operation *op, Attribute encoding) {
     return inferSrcEncoding(gather, encoding);
   if (auto fp4ToFp = dyn_cast<triton::gpu::Fp4ToFpOp>(op))
     return inferSrcEncoding(fp4ToFp, encoding);
+  if (auto broadcast = dyn_cast<triton::BroadcastOp>(op))
+    return inferSrcEncoding(broadcast, encoding);
 
   return {};
 }
