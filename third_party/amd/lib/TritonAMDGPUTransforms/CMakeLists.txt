@@ -10,6 +10,7 @@ add_triton_library(TritonAMDGPUTransforms
   OptimizeDotOperands.cpp
   HoistLayoutConversions.cpp
   SinkLayoutConversions.cpp
+  PrepareIfCombining.cpp
   ReorderInstructions.cpp
   Pipeline.cpp
   ScheduleLoops.cpp
