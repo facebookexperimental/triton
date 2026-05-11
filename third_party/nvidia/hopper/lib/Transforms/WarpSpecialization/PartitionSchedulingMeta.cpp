@@ -114,49 +114,7 @@ static SetVector<Operation *> collectMMABackwardSlice(scf::ForOp loop,
     (void)getBackwardSlice(operand, &slice, options);
   }
 
-  // Enter scf.if regions: follow yield operands backward until fixpoint.
-  // getBackwardSlice adds scf.if ops to the slice but does NOT enter their
-  // regions. Only follow yield operands that correspond to scf.if results
-  // actually consumed by ops already in the slice. This prevents pulling in
-  // ops from other data partitions (e.g., in flex attention, scf.if yields
-  // values for both dp0 and dp1 — we only want the one used by this MMA).
-  DenseSet<Operation *> visitedIfs;
-  bool changed = true;
-  while (changed) {
-    changed = false;
-    for (Operation *op : llvm::to_vector(slice)) {
-      auto ifOp = dyn_cast<scf::IfOp>(op);
-      if (!ifOp || !visitedIfs.insert(ifOp).second)
-        continue;
-      // Find which scf.if results are actually used by ops in the slice.
-      DenseSet<unsigned> usedResultIndices;
-      for (unsigned i = 0; i < ifOp.getNumResults(); ++i) {
-        for (Operation *user : ifOp.getResult(i).getUsers()) {
-          if (slice.contains(user) ||
-              llvm::any_of(mmaOp->getOperands(), [&](Value v) {
-                return v.getDefiningOp() == user;
-              })) {
-            usedResultIndices.insert(i);
-            break;
-          }
-        }
-      }
-      // Follow only the yield operands for used results.
-      for (Region *region : {&ifOp.getThenRegion(), &ifOp.getElseRegion()}) {
-        if (region->empty())
-          continue;
-        auto *yieldOp = region->front().getTerminator();
-        for (unsigned idx : usedResultIndices) {
-          if (idx < yieldOp->getNumOperands()) {
-            unsigned prevSize = slice.size();
-            (void)getBackwardSlice(yieldOp->getOperand(idx), &slice, options);
-            if (slice.size() > prevSize)
-              changed = true;
-          }
-        }
-      }
-    }
-  }
+  // NOTE: Do NOT enter scf.if regions (causal FA fix).
 
   return slice;
 }
@@ -476,6 +434,13 @@ private:
             continue; // Already visited
           for (Value result : user->getResults())
             worklist.push_back(result);
+          Operation *ancestor =
+              innermostLoop.getBody()->findAncestorOpInBlock(*user);
+          if (ancestor && ancestor != user &&
+              forwardSet.insert(ancestor).second) {
+            for (Value result : ancestor->getResults())
+              worklist.push_back(result);
+          }
         }
       }
 
@@ -1111,14 +1076,14 @@ schedulePostLoopOps(scf::ForOp loop, PartitionSet &schedule,
       if (auto *p = dpIdFallbackPartition())
         return p;
     }
-    if (layout.epiloguePartition)
-      return layout.epiloguePartition;
     return layout.defaultPartition;
   };
 
   auto getStoreTarget = [&](Operation *op) -> Partition * {
     if (layout.epilogueStorePartition)
       return layout.epilogueStorePartition;
+    if (layout.epiloguePartition)
+      return layout.epiloguePartition;
     return getEpilogueTarget(op);
   };
 
@@ -1347,10 +1312,22 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
       }
     } else {
       SmallVector<unsigned> sortedDpIds(usedDpIds.begin(), usedDpIds.end());
-      llvm::sort(sortedDpIds, std::greater<unsigned>());
-      for (unsigned dpId : sortedDpIds) {
-        dpIdToPartition[dpId] = schedule.addPartition(0);
-        dpIdToPartition[dpId]->setType("computation");
+      llvm::sort(sortedDpIds);
+      SmallVector<Partition *> compPartitions;
+      for (unsigned i = 0;
+           i < std::min((unsigned)sortedDpIds.size(), dataPartitionFactor);
+           ++i) {
+        compPartitions.push_back(schedule.addPartition(0));
+        compPartitions.back()->setType("computation");
+      }
+      for (unsigned i = 0; i < sortedDpIds.size(); ++i)
+        dpIdToPartition[sortedDpIds[i]] =
+            compPartitions[i % compPartitions.size()];
+      for (auto mmaOp : llvm::reverse(mmas)) {
+        unsigned mmaDpId = categorizer.getDpId(mmaOp);
+        if (mmaDpId != SHARED_DPID && !dpIdToPartition.count(mmaDpId))
+          dpIdToPartition[mmaDpId] =
+              compPartitions[mmaDpId % compPartitions.size()];
       }
     }
 
@@ -1593,8 +1570,7 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
   // the use chain. Without this guard, load-user scheduling from
   // descriptor_load (m/Di metadata) transitively pulls the entire softmax
   // chain into the reduction partition.
-  if (defaultPartition &&
-      (!layout.reductionPartition || defaultPartition != reductionPartition)) {
+  if (defaultPartition && defaultPartition != reductionPartition) {
     for (Operation *loadOrAlloc : loadsAndAllocs) {
       scf::ForOp parentLoop = loadOrAlloc->getParentOfType<scf::ForOp>();
       if (!parentLoop) {
@@ -1752,6 +1728,11 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
             // MMA op itself into the computation partition.
             if (!mmaPartition)
               tryScheduleOp(targetPart, mmaOp);
+            for (OpOperand &use : mmaOp->getUses()) {
+              if (auto tmemLoad = dyn_cast<ttng::TMEMLoadOp>(use.getOwner()))
+                if (!hasPartition(tmemLoad))
+                  tryScheduleOp(targetPart, tmemLoad);
+            }
             mmaToPartition[mmaOp] = targetPart;
             inFirstLoop.push_back(mmaOp);
             continue;

@@ -257,9 +257,77 @@ bool trySinkOp(Operation *op, Value buffer,
   return sinkOps(buffer, useChain, opConstraints);
 }
 
-bool hasTMEMLoad(Block *block) {
-  return llvm::any_of(*block,
-                      [](Operation &op) { return isa<TMEMLoadOp>(op); });
+struct BlockInterleaveInfo {
+  Block *block;
+  unsigned tmemLoadCount = 0;
+  SmallVector<std::pair<Operation *, Value>> opsToSink;
+};
+
+BlockInterleaveInfo collectBlockInterleaveInfo(Block *block) {
+  BlockInterleaveInfo info;
+  info.block = block;
+  for (Operation &op : *block) {
+    if (auto load = dyn_cast<TMEMLoadOp>(&op)) {
+      info.tmemLoadCount++;
+      info.opsToSink.emplace_back(load, load.getSrc());
+    } else if (auto alloc = dyn_cast<TMEMAllocOp>(&op)) {
+      info.opsToSink.emplace_back(alloc, alloc.getResult());
+    }
+  }
+  return info;
+}
+
+DenseMap<Operation *, DictionaryAttr> buildTMemLoadConstraints(Block &block) {
+  DenseMap<Operation *, DictionaryAttr> memOpConstraints;
+
+  // For each arrive barrier with constraints, scan backward and assign its
+  // constraints to ALL tmem_loads in its channel region (between the arrive and
+  // the preceding same-channel wait or block start). This ensures all split
+  // tmem_loads inherit the channelGraph, not just the one nearest to the
+  // arrive.
+  for (Operation &op : block) {
+    auto arrive = dyn_cast<ArriveBarrierOp>(&op);
+    if (!arrive)
+      continue;
+    auto constraints = arrive.getConstraints();
+    if (!hasWSBarrierConstraints(constraints))
+      continue;
+    DictionaryAttr dict = *constraints;
+    for (auto *cur = arrive->getPrevNode(); cur; cur = cur->getPrevNode()) {
+      if (!canAdvanceWSBarrier(constraints, cur))
+        break;
+      if (isa<TMEMLoadOp>(cur))
+        memOpConstraints[cur] = dict;
+    }
+  }
+
+  return memOpConstraints;
+}
+
+void processBlock(BlockInterleaveInfo &info) {
+  Block &block = *info.block;
+
+  // Step 1: Record which memory op each WS barrier guards.
+  auto barrierMap = buildBarrierToMemoryOpMap(block);
+
+  // Step 2: Reorder WS barriers. Pushes arrives down and pulls waits up past
+  // barriers from independent channels, unblocking tmem_load sinking.
+  sinkWSArrives(block);
+  raiseWSWaits(block);
+
+  // Step 3: Sink tmem_loads closer to their uses.
+  auto memOpConstraints = buildTMemLoadConstraints(block);
+  for (auto [op, buffer] : info.opsToSink) {
+    auto it = memOpConstraints.find(op);
+    std::optional<DictionaryAttr> constraints =
+        it != memOpConstraints.end() ? std::optional<DictionaryAttr>(it->second)
+                                     : std::nullopt;
+    while (trySinkOp(op, buffer, constraints)) {
+    }
+  }
+
+  // Step 4: Restore barriers to optimal positions near their memory ops.
+  optimizeWSBarrierLocations(barrierMap);
 }
 
 } // anonymous namespace
@@ -274,75 +342,15 @@ struct TritonNvidiaGPUInterleaveTMemPass
     MLIRContext *context = &getContext();
     ModuleOp m = getOperation();
 
-    bool hasAnyTMEMLoad = false;
-    m.walk([&](TMEMLoadOp) {
-      hasAnyTMEMLoad = true;
-      return WalkResult::interrupt();
-    });
-    if (!hasAnyTMEMLoad)
-      return;
-
-    // Step 1: Record which memory op each WS barrier guards.
-    SmallVector<DenseMap<Operation *, Operation *>> barrierMaps;
+    SmallVector<BlockInterleaveInfo> blocksToProcess;
     m.walk([&](Block *block) {
-      if (!hasTMEMLoad(block))
+      BlockInterleaveInfo info = collectBlockInterleaveInfo(block);
+      if (info.tmemLoadCount < 2)
         return;
-      auto map = buildBarrierToMemoryOpMap(*block);
-      if (!map.empty())
-        barrierMaps.push_back(std::move(map));
+      blocksToProcess.push_back(std::move(info));
     });
-
-    // Step 2: Reorder WS barriers. Pushes arrives down and pulls waits up
-    // past barriers from independent channels, unblocking tmem_load sinking.
-    m.walk([&](Block *block) {
-      if (!hasTMEMLoad(block))
-        return;
-      sinkWSArrives(*block);
-      raiseWSWaits(*block);
-    });
-
-    // Build memOp → channelGraph constraints. For each arrive barrier with
-    // constraints, scan backward and assign its constraints to ALL tmem_loads
-    // in its channel region (between the arrive and the preceding same-channel
-    // wait or block start). This ensures all split tmem_loads inherit the
-    // channelGraph, not just the one nearest to the arrive.
-    DenseMap<Operation *, DictionaryAttr> memOpConstraints;
-    m.walk([&](ArriveBarrierOp arrive) {
-      if (!hasTMEMLoad(arrive->getBlock()))
-        return;
-      auto constraints = arrive.getConstraints();
-      if (!hasWSBarrierConstraints(constraints))
-        return;
-      DictionaryAttr dict = *constraints;
-      for (auto *cur = arrive->getPrevNode(); cur; cur = cur->getPrevNode()) {
-        if (!canAdvanceWSBarrier(constraints, cur))
-          break;
-        if (isa<TMEMLoadOp>(cur))
-          memOpConstraints[cur] = dict;
-      }
-    });
-
-    // Step 3: Sink tmem_loads closer to their uses.
-    SmallVector<std::pair<Operation *, Value>> opsToSink;
-    m.walk([&](Operation *op) {
-      if (auto load = dyn_cast<TMEMLoadOp>(op))
-        opsToSink.emplace_back(load, load.getSrc());
-      else if (auto alloc = dyn_cast<TMEMAllocOp>(op))
-        opsToSink.emplace_back(alloc, alloc.getResult());
-    });
-    for (auto [op, buffer] : opsToSink) {
-      auto it = memOpConstraints.find(op);
-      std::optional<DictionaryAttr> constraints =
-          it != memOpConstraints.end()
-              ? std::optional<DictionaryAttr>(it->second)
-              : std::nullopt;
-      while (trySinkOp(op, buffer, constraints)) {
-      }
-    }
-
-    // Step 4: Restore barriers to optimal positions near their memory ops.
-    for (auto &map : barrierMaps)
-      optimizeWSBarrierLocations(map);
+    for (auto &info : blocksToProcess)
+      processBlock(info);
   }
 };
 
