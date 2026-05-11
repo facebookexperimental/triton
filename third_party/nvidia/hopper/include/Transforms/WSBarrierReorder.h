@@ -211,7 +211,17 @@ buildBarrierToMemoryOpMap(Block &block) {
 // right before their memory op. Skips moves that would break SSA dominance.
 inline void optimizeWSBarrierLocations(
     const DenseMap<Operation *, Operation *> &barrierToMemOp) {
-  for (auto [barrier, memOp] : barrierToMemOp) {
+  // DenseMap iteration order is non-deterministic. Sort barriers by block
+  // position and process in reverse so that when multiple arrives share the
+  // same anchor, moveAfter(anchor) naturally preserves their relative order.
+  SmallVector<std::pair<Operation *, Operation *>> sorted(
+      barrierToMemOp.begin(), barrierToMemOp.end());
+  llvm::sort(sorted, [](const auto &a, const auto &b) {
+    if (a.first->getBlock() != b.first->getBlock())
+      return a.first->getBlock() < b.first->getBlock();
+    return a.first->isBeforeInBlock(b.first);
+  });
+  for (auto [barrier, memOp] : llvm::reverse(sorted)) {
     if (barrier->getBlock() != memOp->getBlock())
       continue;
     if (auto arrive = dyn_cast<ArriveBarrierOp>(barrier)) {
