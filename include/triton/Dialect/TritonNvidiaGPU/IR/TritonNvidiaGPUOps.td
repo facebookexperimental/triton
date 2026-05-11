@@ -1071,8 +1071,8 @@ def TTNG_TCGen5AllocOp : TTNG_Op<"tcgen5_alloc", []> {
   let description = [{
     Represents the single tcgen05.alloc instruction for the entire kernel.
     Created by TensorMemoryAllocationPass before the first tmem_alloc op.
-    All individual tmem_alloc ops share this single allocation, each at
-    a different offset.
+    All individual tmem_alloc ops is a slice view from this single allocation,
+    each at a different offset.
 
     Uses a 4-byte shared memory buffer for address broadcast across warps.
     Visible to maybeInsertClusterSync for proper cluster sync placement
