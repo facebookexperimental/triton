@@ -757,6 +757,75 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
         channelOps[channel->relation.first].push_back(channel->getDstOp());
     }
 
+    // createBuffer inserts local_store ops in producer order, but TMA store
+    // consumers execute in descriptor_store order. Preserve that order for
+    // stores to the same descriptor so buffer reuse and wait rotation see the
+    // same sequence on both sides of the channel.
+    auto restoreDescriptorStoreProducerOrder = [&]() {
+      DenseMap<Operation *, unsigned> opOrder;
+      unsigned order = 0;
+      for (Operation &op : *block)
+        opOrder[&op] = order++;
+
+      auto getDescriptorStore = [](Operation *op) -> tt::DescriptorStoreOp {
+        if (auto store = dyn_cast<tt::DescriptorStoreOp>(op))
+          return store;
+        for (Operation *user : op->getUsers()) {
+          if (auto store = dyn_cast<tt::DescriptorStoreOp>(user))
+            return store;
+        }
+        return nullptr;
+      };
+
+      using StoreChannel = std::pair<tt::DescriptorStoreOp, Channel *>;
+      llvm::MapVector<Value, SmallVector<StoreChannel>> channelsByDesc;
+      for (auto *channel : channels) {
+        Operation *dstOp = channel->getDstOp();
+        if (!epilogOps.contains(dstOp))
+          continue;
+        auto store = getDescriptorStore(dstOp);
+        if (!store || store->getBlock() != block)
+          continue;
+        Operation *srcOp = channel->getSrcOp();
+        if (!srcOp || srcOp->getBlock() != block)
+          continue;
+        channelsByDesc[store.getDesc()].push_back({store, channel});
+      }
+
+      auto canMoveAfter = [](Operation *op, Operation *insertAfter) {
+        if (!op || !insertAfter || op == insertAfter)
+          return false;
+        if (op->getBlock() != insertAfter->getBlock())
+          return false;
+        if (insertAfter->isBeforeInBlock(op))
+          return false;
+        for (Operation *user : op->getUsers()) {
+          if (user->getBlock() != op->getBlock())
+            continue;
+          if (op->isBeforeInBlock(user) && !insertAfter->isBeforeInBlock(user))
+            return false;
+        }
+        return true;
+      };
+
+      for (auto &[desc, storeChannels] : channelsByDesc) {
+        if (storeChannels.size() < 2)
+          continue;
+        llvm::sort(storeChannels,
+                   [&](const StoreChannel &a, const StoreChannel &b) {
+                     return opOrder[a.first] < opOrder[b.first];
+                   });
+
+        Operation *prevSrcOp = nullptr;
+        for (auto &[store, channel] : storeChannels) {
+          Operation *srcOp = channel->getSrcOp();
+          if (canMoveAfter(srcOp, prevSrcOp))
+            srcOp->moveAfter(prevSrcOp);
+          prevSrcOp = srcOp;
+        }
+      }
+    };
+
     // Streamline ops on a channel chain.
     // Starting with producers with smaller task ids, moving forward
     // dependencies of the consumer ops close to the them.
@@ -784,8 +853,10 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
         storeBuckets[1].push_back(op);
     }
 
-    if (storeBuckets[0].size() != storeBuckets[1].size())
+    if (storeBuckets[0].size() != storeBuckets[1].size()) {
+      restoreDescriptorStoreProducerOrder();
       continue;
+    }
 
     // Reorder store operations in the sequence:
     //   bucket[0][N], bucket[1][N],
@@ -838,6 +909,8 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
           depOp->moveBefore(firstUser);
       }
     }
+
+    restoreDescriptorStoreProducerOrder();
 
     LLVM_DEBUG({
       LDBG("\n");
