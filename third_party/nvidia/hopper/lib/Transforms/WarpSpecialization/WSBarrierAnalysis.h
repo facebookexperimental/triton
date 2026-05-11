@@ -6,9 +6,11 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include <algorithm>
 #include <functional>
 #include <optional>
 
@@ -95,7 +97,19 @@ struct WSBarrierAttr {
 
 struct WSBarrierRegionInfo {
   int parentId = -1;
+  int minRegionId = -1;
+  int maxRegionId = -1;
+};
+
+struct WSBarrierOpRegionInfo {
+  Operation *parent = nullptr;
+  int parentId = -1;
   int regionId = -1;
+  int numRegions = -1;
+
+  bool isValid() const {
+    return parent && parentId >= 0 && regionId >= 0 && numRegions > 0;
+  }
 };
 
 // Build the WS barrier channel graph for all channels.
@@ -156,15 +170,18 @@ static inline DictionaryAttr
 injectChannelGraph(MLIRContext *ctx, DictionaryAttr existing,
                    ArrayRef<int> graphTaskIds,
                    std::optional<int> parentId = std::nullopt,
-                   std::optional<int> regionId = std::nullopt) {
+                   std::optional<int> minRegionId = std::nullopt,
+                   std::optional<int> maxRegionId = std::nullopt) {
   auto attr = WSBarrierAttr::parse(existing);
   attr.channelGraph = DenseI32ArrayAttr::get(ctx, graphTaskIds);
   if (parentId)
     attr.parentId = IntegerAttr::get(IntegerType::get(ctx, 32), *parentId);
-  if (regionId) {
-    attr.minRegionId = IntegerAttr::get(IntegerType::get(ctx, 32), *regionId);
-    attr.maxRegionId = IntegerAttr::get(IntegerType::get(ctx, 32), *regionId);
-  }
+  if (minRegionId)
+    attr.minRegionId =
+        IntegerAttr::get(IntegerType::get(ctx, 32), *minRegionId);
+  if (maxRegionId)
+    attr.maxRegionId =
+        IntegerAttr::get(IntegerType::get(ctx, 32), *maxRegionId);
   auto updated = attr.build(ctx);
   if (!existing)
     return updated;
@@ -195,57 +212,236 @@ static inline bool isWSBarrierForwardToken(Operation *op) {
   return isa<triton::nvws::ProducerCommitOp, triton::nvws::ConsumerWaitOp>(op);
 }
 
-// Initial ordered-region ID assignment for token ops. Blocks are treated as
-// parents, and control-flow ops split their parent block into ordered regions.
-// Ops nested under scf.if fall back to V1 by receiving invalid region IDs.
-// TODO: Replace this with parent-op based region construction from the design.
-static inline DenseMap<Operation *, WSBarrierRegionInfo>
-buildWSBarrierRegionInfo(Operation *scope) {
-  struct BaseInfo {
+static inline Operation *getNearestWSBarrierParent(Operation *op) {
+  for (Operation *cur = op->getParentOp(); cur; cur = cur->getParentOp()) {
+    if (isa<scf::IfOp>(cur))
+      return nullptr;
+    if (isa<scf::ForOp, scf::WhileOp>(cur))
+      return cur;
+    if (isa<triton::FuncOp>(cur))
+      return cur;
+  }
+  return nullptr;
+}
+
+static inline Operation *getDirectChildInParent(Operation *op,
+                                                Operation *parent) {
+  Operation *child = op;
+  while (child && child->getParentOp() != parent)
+    child = child->getParentOp();
+  return child;
+}
+
+static inline int getNumOrderedRegions(Block &block) {
+  int count = 1;
+  for (Operation &op : block.without_terminator())
+    if (op.getNumRegions() != 0)
+      ++count;
+  return count;
+}
+
+static inline DenseMap<Block *, int>
+getOrderedRegionBlockOffsets(Operation *parent, int &numRegions) {
+  DenseMap<Block *, int> blockOffsets;
+  numRegions = 0;
+  for (Region &region : parent->getRegions()) {
+    for (Block &block : region) {
+      blockOffsets[&block] = numRegions;
+      numRegions += getNumOrderedRegions(block);
+    }
+  }
+  return blockOffsets;
+}
+
+static inline std::optional<int>
+getBaseRegionInParent(Operation *parent, Operation *op,
+                      const DenseMap<Block *, int> &blockOffsets) {
+  Operation *child = getDirectChildInParent(op, parent);
+  if (!child || child->getBlock()->getParentOp() != parent)
+    return std::nullopt;
+
+  auto offsetIt = blockOffsets.find(child->getBlock());
+  if (offsetIt == blockOffsets.end())
+    return std::nullopt;
+  int baseRegion = offsetIt->second;
+  for (Operation &cur : child->getBlock()->without_terminator()) {
+    if (&cur == child)
+      return baseRegion;
+    if (cur.getNumRegions() != 0)
+      ++baseRegion;
+  }
+  return std::nullopt;
+}
+
+// Build deterministic ordered-region metadata for every operation under
+// `scope`. Parent IDs are assigned in DFS order. Region IDs are one-based and
+// split each ordered parent into basic-block regions separated by direct child
+// region-bearing ops. Ops nested under scf.if get invalid metadata so V2 falls
+// back to the V1 channelGraph rule for conditional channels.
+static inline DenseMap<Operation *, WSBarrierOpRegionInfo>
+buildWSBarrierOpRegionInfo(Operation *scope) {
+  struct ParentInfo {
     int parentId = -1;
-    int baseRegion = -1;
-    bool invalid = false;
+    int numRegions = -1;
+    DenseMap<Block *, int> blockOffsets;
   };
 
-  DenseMap<Operation *, BaseInfo> baseInfo;
-  DenseMap<int, int> regionCount;
-  int nextParentId = 0;
+  DenseMap<Operation *, WSBarrierOpRegionInfo> result;
+  DenseMap<Operation *, int> parentIds;
+  DenseMap<Operation *, ParentInfo> parentInfo;
 
-  std::function<void(Block &, bool)> assignBlock = [&](Block &block,
-                                                       bool invalid) {
-    int parentId = nextParentId++;
-    int baseRegion = 0;
+  auto getParentInfo = [&](Operation *parent) -> ParentInfo & {
+    auto [idIt, insertedId] = parentIds.try_emplace(parent, parentIds.size());
+    auto [infoIt, insertedInfo] = parentInfo.try_emplace(parent);
+    if (insertedInfo) {
+      infoIt->second.parentId = idIt->second;
+      infoIt->second.blockOffsets =
+          getOrderedRegionBlockOffsets(parent, infoIt->second.numRegions);
+    }
+    return infoIt->second;
+  };
+
+  std::function<void(Block &)> assignBlock = [&](Block &block) {
     for (Operation &op : block.without_terminator()) {
-      baseInfo[&op] = {parentId, baseRegion, invalid};
-      bool childInvalid = invalid || isa<scf::IfOp>(&op);
+      Operation *parent = getNearestWSBarrierParent(&op);
+      if (parent) {
+        ParentInfo &info = getParentInfo(parent);
+        auto baseRegionInfo =
+            getBaseRegionInParent(parent, &op, info.blockOffsets);
+        if (baseRegionInfo) {
+          result[&op] = {parent, info.parentId, *baseRegionInfo + 1,
+                         info.numRegions};
+        } else {
+          result[&op] = {};
+        }
+      } else {
+        result[&op] = {};
+      }
       for (Region &region : op.getRegions())
         for (Block &childBlock : region)
-          assignBlock(childBlock, childInvalid);
-      if (op.getNumRegions() != 0)
-        ++baseRegion;
+          assignBlock(childBlock);
     }
-    regionCount[parentId] = baseRegion + 1;
   };
 
   for (Region &region : scope->getRegions())
     for (Block &block : region)
-      assignBlock(block, /*invalid=*/false);
+      assignBlock(block);
 
+  return result;
+}
+
+// Initial ordered-region ID assignment for token ops. The parent is the nearest
+// valid ordered parent op: scf.for, scf.while, or the containing tt.func.
+// Backward resource-reuse tokens are shifted into the second half of the
+// parent's region ID space so forward and backward edges are never confused.
+static inline DenseMap<Operation *, WSBarrierRegionInfo>
+buildWSBarrierRegionInfo(Operation *scope) {
+  auto opRegionInfo = buildWSBarrierOpRegionInfo(scope);
   DenseMap<Operation *, WSBarrierRegionInfo> result;
-  for (auto &it : baseInfo) {
+  for (auto &it : opRegionInfo) {
     Operation *op = it.first;
-    const BaseInfo &info = it.second;
+    const WSBarrierOpRegionInfo &info = it.second;
     if (!isWSBarrierForwardToken(op) && !isWSBarrierBackwardToken(op))
       continue;
-    if (info.invalid) {
+    if (!info.isValid()) {
       result[op] = {-1, -1};
       continue;
     }
-    int numRegions = regionCount.lookup(info.parentId);
-    int regionId = info.baseRegion + 1;
+    int regionId = info.regionId;
     if (isWSBarrierBackwardToken(op))
-      regionId += numRegions;
-    result[op] = {info.parentId, regionId};
+      regionId += info.numRegions;
+    result[op] = {info.parentId, regionId, regionId};
+  }
+  return result;
+}
+
+// Complete the V2 ordered-region summary for each WS token. The V1
+// channelGraph remains a partition reachability set. V2 only adds ordered
+// parent/range information used when two overlapping V1 graphs are compared.
+//
+// The range is intentionally same-iteration only:
+//   1. Start from the token's own ordered region.
+//   2. Group sibling channels in the same parent, direction, and region. This
+//      makes equivalent same-region channel relationships visible from either
+//      participating partition.
+//   3. For waits, also union later regions in the waiting partition for the
+//      same direction. This evaluates an arrive-past-wait move from the delayed
+//      arrive's perspective and prevents proving a move that would cross later
+//      logical work in the waiting partition.
+// Channels under scf.if keep invalid metadata and therefore use the V1
+// disjoint-channelGraph fallback.
+static inline DenseMap<Operation *, WSBarrierRegionInfo>
+buildWSBarrierOrderedRegionRanges(
+    Operation *scope,
+    const DenseMap<std::pair<int, int>, SmallVector<int>> &channelGraph) {
+  struct TokenNode {
+    Operation *op = nullptr;
+    int srcTask = -1;
+    int dstTask = -1;
+    int parentId = -1;
+    int regionId = -1;
+    bool isBackward = false;
+    bool isWait = false;
+  };
+
+  auto tokenRegionInfo = buildWSBarrierRegionInfo(scope);
+  SmallVector<TokenNode> nodes;
+  scope->walk([&](Operation *op) {
+    if (!isWSBarrierForwardToken(op) && !isWSBarrierBackwardToken(op))
+      return;
+    auto constraints = op->getAttrOfType<DictionaryAttr>("constraints");
+    auto attr = WSBarrierAttr::parse(constraints);
+    if (!attr.dstTask)
+      return;
+    auto taskIds = getAsyncTaskIds(op);
+    if (taskIds.size() != 1)
+      return;
+    auto regionIt = tokenRegionInfo.find(op);
+    if (regionIt == tokenRegionInfo.end())
+      return;
+    nodes.push_back(
+        {op, taskIds[0], static_cast<int>(attr.dstTask.getInt()),
+         regionIt->second.parentId, regionIt->second.minRegionId,
+         isWSBarrierBackwardToken(op),
+         isa<triton::nvws::ProducerAcquireOp, triton::nvws::ConsumerWaitOp>(
+             op)});
+  });
+
+  DenseMap<Operation *, WSBarrierRegionInfo> result;
+  for (const TokenNode &node : nodes) {
+    if (node.parentId < 0 || node.regionId < 0) {
+      result[node.op] = {-1, -1, -1};
+      continue;
+    }
+
+    int minRegionId = node.regionId;
+    int maxRegionId = node.regionId;
+    DenseSet<int> reachableTasks;
+    if (auto it = channelGraph.find({node.srcTask, node.dstTask});
+        it != channelGraph.end()) {
+      reachableTasks.insert(it->second.begin(), it->second.end());
+    }
+
+    for (const TokenNode &other : nodes) {
+      if (other.parentId != node.parentId ||
+          other.isBackward != node.isBackward || other.regionId < 0)
+        continue;
+
+      bool sameRegionPeer = other.regionId == node.regionId &&
+                            (other.srcTask == node.srcTask ||
+                             reachableTasks.contains(other.srcTask) ||
+                             reachableTasks.contains(other.dstTask));
+      bool laterWaitInSamePartition = node.isWait &&
+                                      other.srcTask == node.srcTask &&
+                                      other.regionId >= node.regionId;
+      if (!sameRegionPeer && !laterWaitInSamePartition)
+        continue;
+
+      minRegionId = std::min(minRegionId, other.regionId);
+      maxRegionId = std::max(maxRegionId, other.regionId);
+    }
+
+    result[node.op] = {node.parentId, minRegionId, maxRegionId};
   }
   return result;
 }
