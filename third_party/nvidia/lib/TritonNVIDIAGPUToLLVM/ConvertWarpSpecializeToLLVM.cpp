@@ -202,16 +202,18 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
     func.walk([&](NVVM::ClusterWaitOp) { numClusterWaits++; });
     assert(numClusterWaits <= 1 &&
            "compiler should only insert one cluster barrier");
-    // Non default warps should just do a cluster arrive unconditionally.
-    // Note this instruction is at kernel beginning shared by all warps, and
-    // we use `isDefault` as predicate here to select only non default warps
-    PTXBuilder ptxBuilder;
-    auto clusterArriveOp =
-        *ptxBuilder.create("@!$0 barrier.cluster.arrive.aligned;");
-    clusterArriveOp({ptxBuilder.newOperand(isDefault, "b")},
-                    /*onlyAttachMLIRArgs=*/true);
-    auto voidTy = void_ty(ctx);
-    ptxBuilder.launch(b, func.getLoc(), voidTy);
+    if (numClusterWaits == 1) {
+      // Non default warps should just do a cluster arrive unconditionally.
+      // Note this instruction is at kernel beginning shared by all warps, and
+      // we use `isDefault` as predicate here to select only non default warps
+      PTXBuilder ptxBuilder;
+      auto clusterArriveOp =
+          *ptxBuilder.create("@!$0 barrier.cluster.arrive.aligned;");
+      clusterArriveOp({ptxBuilder.newOperand(isDefault, "b")},
+                      /*onlyAttachMLIRArgs=*/true);
+      auto voidTy = void_ty(ctx);
+      ptxBuilder.launch(b, func.getLoc(), voidTy);
+    }
   }
   LLVM::CondBrOp::create(b, b.getLoc(), isDefault, entry, switchLoop);
 

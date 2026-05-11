@@ -1066,7 +1066,7 @@ def TTNG_TMEMAllocOp : TTNG_Op<"tmem_alloc", [DeclareOpInterfaceMethods<MemoryEf
   }];
 }
 
-def TTNG_TCGen5AllocOp : TTNG_Op<"tcgen5_alloc", []> {
+def TTNG_TCGen5GlobalAllocOp : TTNG_Op<"tcgen5_global_alloc", []> {
   let summary = "Global tensor memory allocation for the kernel";
   let description = [{
     Represents the single tcgen05.alloc instruction for the entire kernel.
@@ -1075,7 +1075,7 @@ def TTNG_TCGen5AllocOp : TTNG_Op<"tcgen5_alloc", []> {
     each at a different offset.
 
     Uses a 4-byte shared memory buffer for address broadcast across warps.
-    Visible to maybeInsertClusterSync for proper cluster sync placement
+    Visible to cluster sync insertion passes at TTGIR level
     in 2-CTA mode.
   }];
 

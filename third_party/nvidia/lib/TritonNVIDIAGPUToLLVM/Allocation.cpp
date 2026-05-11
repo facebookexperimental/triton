@@ -74,7 +74,7 @@ getNvidiaAllocationAnalysisScratchSizeFn(TargetInfoBase &targetInfo) {
       auto elems = getNumScratchElemsSwizzledCvt(srcTy, dstTy, targetInfo);
       return elems * getBitwidth(srcTy) / 8;
     }
-    if (isa<triton::nvidia_gpu::TCGen5AllocOp>(op))
+    if (isa<triton::nvidia_gpu::TCGen5GlobalAllocOp>(op))
       return 4;
     return defaultAllocationAnalysisScratchSizeFn(op);
   };

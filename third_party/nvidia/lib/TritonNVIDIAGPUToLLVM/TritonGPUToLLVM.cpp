@@ -68,8 +68,8 @@ public:
     addIllegalDialect<mlir::gpu::GPUDialect>();
     addLegalOp<mlir::UnrealizedConversionCastOp>();
 
-    // TCGen5AllocOp has no operands/results, survives to NVGPUToLLVM.
-    addLegalOp<triton::nvidia_gpu::TCGen5AllocOp>();
+    // TCGen5GlobalAllocOp has no operands/results, survives to NVGPUToLLVM.
+    addLegalOp<triton::nvidia_gpu::TCGen5GlobalAllocOp>();
 
     // Warp specialization is lowered later.
     addLegalOp<triton::gpu::WarpSpecializeOp>();

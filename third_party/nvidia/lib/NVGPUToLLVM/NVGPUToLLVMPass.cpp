@@ -616,16 +616,17 @@ static Value initTensorMemory(LLVM::LLVMFuncOp func,
     rewriter.setInsertionPointToStart(&func.front());
   auto ctx = mod.getContext();
   auto loc = func.getLoc();
-
-  bool isTlxPairedMMA = tlx::tlxEnablePairedMMA(mod);
-  bool useTwoCTAs =
-      mlir::triton::nvidia_gpu::getModuleTwoCTAs(mod) || isTlxPairedMMA;
-
   auto b = TritonLLVMOpBuilder(loc, rewriter);
+  // A proper error will be raised by the frontend, but to allow compilation to
+  // continue we emit a trap.
   if (size > 512) {
     LLVM::Trap::create(rewriter, loc);
     return LLVM::UndefOp::create(rewriter, loc, ptr_ty(ctx, 6));
   }
+
+  bool isTlxPairedMMA = tlx::tlxEnablePairedMMA(mod);
+  bool useTwoCTAs =
+      mlir::triton::nvidia_gpu::getModuleTwoCTAs(mod) || isTlxPairedMMA;
 
   // This code is only executed by the default warp group.
   Value threadId = NVVM::ThreadIdXOp::create(rewriter, loc, i32_ty);
@@ -633,6 +634,8 @@ static Value initTensorMemory(LLVM::LLVMFuncOp func,
   Value alloc =
       createTMAlloc(rewriter, func, size, pred, useTwoCTAs, smemOffset);
   createRelinquishAlloc(rewriter, loc, pred, useTwoCTAs);
+  // TODO: pred will have a long liverange, we need to check if this is a
+  // problem and how it can be fixed.
   freeTMAlloc(func, alloc, size, pred, useTwoCTAs, isTlxPairedMMA);
   return alloc;
 }
@@ -647,9 +650,9 @@ static void lowerTensorMemoryAlloc(ModuleOp mod) {
     assert(kernel == baseOp->getParentOfType<LLVM::LLVMFuncOp>() &&
            "TODO: add support for function calls using tmem.");
   });
-  // Find TCGen5AllocOp — it marks where tcgen05.alloc should be inserted.
-  triton::nvidia_gpu::TCGen5AllocOp tcgen5Alloc;
-  mod.walk([&](triton::nvidia_gpu::TCGen5AllocOp op) {
+  // Find TCGen5GlobalAllocOp — it marks where tcgen05.alloc should be inserted.
+  triton::nvidia_gpu::TCGen5GlobalAllocOp tcgen5Alloc;
+  mod.walk([&](triton::nvidia_gpu::TCGen5GlobalAllocOp op) {
     tcgen5Alloc = op;
     if (!kernel)
       kernel = op->getParentOfType<LLVM::LLVMFuncOp>();
@@ -657,6 +660,7 @@ static void lowerTensorMemoryAlloc(ModuleOp mod) {
   });
   if (baseOps.empty() && !tcgen5Alloc)
     return;
+  // TODO: Handle cases of matmul used in noinline functions.
   assert(triton::isKernel(kernel));
 
   Operation *insertionPoint =

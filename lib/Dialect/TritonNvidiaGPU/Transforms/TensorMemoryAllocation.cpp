@@ -502,7 +502,7 @@ public:
     }
     if (totalMemorySize > 0) {
       TMEMAllocOp firstAlloc;
-      mod.walk([&](TMEMAllocOp op) {
+      mod.walk<WalkOrder::PostOrder>([&](TMEMAllocOp op) {
         firstAlloc = op;
         return WalkResult::interrupt();
       });
@@ -515,8 +515,8 @@ public:
         OpBuilder builder(&funcOp.front(), funcOp.front().begin());
         bool twoCTAs = mlir::triton::nvidia_gpu::getModuleTwoCTAs(mod) ||
                        tlx::tlxEnablePairedMMA(mod);
-        auto allocOp = TCGen5AllocOp::create(builder, firstAlloc.getLoc(),
-                                             totalMemorySize, twoCTAs);
+        auto allocOp = TCGen5GlobalAllocOp::create(builder, firstAlloc.getLoc(),
+                                                   totalMemorySize, twoCTAs);
         // For paired MMA, move before the first tmem_alloc so it also
         // serves as a marker for cluster sync placement.
         if (tlx::tlxEnablePairedMMA(mod))
