@@ -212,8 +212,7 @@ def _p_matmul(
         tl.program_id(0), num_blocks, NUM_SMS,
         flatten=FLATTEN_LOOPS,
         disallow_acc_multi_buffer=DISALLOW_ACC_MULTI_BUFFER,
-        # Workaround for compile error in hopper warp specialization
-        warp_specialize=FLATTEN_LOOPS,
+        warp_specialize=True,
     ):
 
         pid_z, pid_m, pid_n, pid_k = compute_pids(block_id, useful_grid_m, grid_n, num_blocks, XCD_SWIZZLE, GROUP_M, SPLIT_K)

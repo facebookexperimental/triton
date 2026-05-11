@@ -619,7 +619,7 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps,
 
     hipLaunchAttribute attributes[2];
     // Attribute0: Cluster dimensions
-    attributes[0].id = (hipLaunchAttributeID)4;
+    attributes[0].id = 4;
     int *cluster_dims = (int *)attributes[0].val.pad;
     cluster_dims[0] = num_ctas;
     cluster_dims[1] = 1;
@@ -919,9 +919,10 @@ bool extractArgs(PyObject **final_list, int *list_idx, PyObject *kernel_args,
   Py_ssize_t num_annotations = 0;
   PyObject **annotations = NULL;
   PyObject *fast_args = NULL;
-  PyObject **args_items = NULL;
+  PyObject **args = NULL;
   int arg_idx = 0;
 
+  // Extract arg annotations
   PyObject *fast_annotations = PySequence_Fast(
       arg_annotations, "Expected arg_annotations to be a sequence or iterable");
   if (!fast_annotations) {
@@ -935,16 +936,16 @@ bool extractArgs(PyObject **final_list, int *list_idx, PyObject *kernel_args,
   if (!fast_args) {
     goto cleanup;
   }
-  args_items = PySequence_Fast_ITEMS(fast_args);
+  args = PySequence_Fast_ITEMS(fast_args);
 
   for (int i = 0; i < num_annotations; ++i) {
     PyKernelArgObject *annotation = (PyKernelArgObject *)annotations[i];
     switch (annotation->type) {
     case ARG_KERNEL:
-      final_list[(*list_idx)++] = args_items[arg_idx++];
+      final_list[(*list_idx)++] = args[arg_idx++];
       break;
     case ARG_TUPLE:
-      if (!extractArgs(final_list, list_idx, args_items[arg_idx++],
+      if (!extractArgs(final_list, list_idx, args[arg_idx++],
                        annotation->nested_tuple)) {
         goto cleanup;
       }
@@ -989,6 +990,13 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   PyObject *arg_annotations = NULL;
   Py_buffer signature;
   PyObject *kernel_args = NULL;
+  uint8_t *extractor_data = NULL;
+  Py_ssize_t num_args = 0;
+  PyObject **args_data = NULL;
+  int list_idx = 0;
+  int num_params = 0;
+  void **params = NULL;
+  int params_idx = 0;
 
   if (!PyArg_ParseTuple(args, "piiiKKO(iii)OOOiOy*O", &launch_cooperative_grid,
                         &gridX, &gridY, &gridZ, &_stream, &_function,
@@ -999,27 +1007,26 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     return NULL;
   }
 
-  // Declare all variables before any goto to satisfy C++
-  uint8_t *extractor_data = (uint8_t *)signature.buf;
-  Py_ssize_t num_args = signature.len;
-  PyObject **args_data = (PyObject **)alloca(num_args * sizeof(PyObject *));
-  int list_idx = 0;
-  int num_params = (int)num_args + 2;
-  void **params = (void **)alloca(num_params * sizeof(void *));
-  int params_idx = 0;
-
   // launch entry hook.
   if (!launchHook(launch_enter_hook, launch_metadata)) {
     goto cleanup;
   }
 
+  extractor_data = (uint8_t *)signature.buf;
+  num_args = signature.len;
+
   // Extract kernel parameters - flatten tuples & remove constexpr.
+  args_data = (PyObject **)alloca(num_args * sizeof(PyObject *));
   if (args_data == NULL) {
     goto cleanup;
   }
   if (!extractArgs(args_data, &list_idx, kernel_args, arg_annotations)) {
     goto cleanup;
   }
+
+  // Number of parameters passed to kernel. + 2 for global & profile scratch.
+  num_params = num_args + 2;
+  params = (void **)alloca(num_params * sizeof(void *));
   // This loop has to stay in the same function that owns params, since we are
   // using alloca to allocate pointers to it on the stack of the function.
   for (Py_ssize_t i = 0; i < num_args; ++i) {
