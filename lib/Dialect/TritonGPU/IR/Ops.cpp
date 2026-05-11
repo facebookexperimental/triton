@@ -407,31 +407,6 @@ struct CanonicalizeConvertFromConvert
       return success();
     }
 
-    // cvt(broadcast(x)) -> broadcast(cvt(x))
-    // Hoists the convert before the broadcast so it operates on the smaller
-    // pre-broadcast tensor. This can dramatically reduce SMEM scratch for
-    // the convert (e.g., [1,256] * 4 bytes = 1KB vs [128,256] * 4 bytes =
-    // 128KB).
-    if (auto broadcast = dyn_cast<triton::BroadcastOp>(arg)) {
-      auto srcType = cast<RankedTensorType>(broadcast.getSrc().getType());
-      auto cvtDstEnc = op.getType().getEncoding();
-      // Skip if source and dest encodings are the same
-      if (srcType.getEncoding() == cvtDstEnc)
-        return failure();
-      auto newSrcType = srcType.cloneWithEncoding(cvtDstEnc);
-      auto cvtSrc = ConvertLayoutOp::create(rewriter, op.getLoc(), newSrcType,
-                                            broadcast.getSrc());
-      auto newBroadcast = rewriter.replaceOpWithNewOp<triton::BroadcastOp>(
-          op, op.getType(), cvtSrc.getResult());
-      // Propagate all attributes from original ops to new ones to preserve
-      // WS partition info (async_task_id, ttg.partition, etc.)
-      for (auto attr : op->getDialectAttrs())
-        cvtSrc->setAttr(attr.getName(), attr.getValue());
-      for (auto attr : broadcast->getDialectAttrs())
-        newBroadcast->setAttr(attr.getName(), attr.getValue());
-      return success();
-    }
-
     // cvt(type, constant) -> constant
     if (auto cst = llvm::dyn_cast<arith::ConstantOp>(arg))
       if (auto ret = dyn_cast<SplatElementsAttr>(cst.getValue())) {

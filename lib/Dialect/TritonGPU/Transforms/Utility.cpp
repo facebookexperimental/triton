@@ -504,6 +504,23 @@ static Attribute inferSrcEncoding(triton::ReshapeOp op, Attribute encoding) {
                                    op.getAllowReorder());
 }
 
+static Attribute inferSrcEncoding(triton::BroadcastOp op, Attribute encoding) {
+  auto srcShape = op.getSrc().getType().getShape();
+  auto dstShape = op.getResult().getType().getShape();
+  auto linearEnc = dyn_cast<ttg::LinearEncodingAttr>(encoding);
+  if (!linearEnc)
+    return encoding;
+  auto ll = linearEnc.getLinearLayout();
+  auto *ctx = op->getContext();
+  for (int i = 0, rank = srcShape.size(); i < rank; i++) {
+    if (srcShape[i] == 1 && dstShape[i] > 1) {
+      auto dimName = StringAttr::get(ctx, "dim" + llvm::Twine(i));
+      ll = ll.resizeOutDim(dimName, 1);
+    }
+  }
+  return ttg::LinearEncodingAttr::get(ctx, std::move(ll));
+}
+
 static bool isSingleValue(Value value) {
   // Don't consider load as expensive if it is loading a scalar.
   if (auto tensorTy = dyn_cast<RankedTensorType>(value.getType()))
@@ -551,6 +568,8 @@ Attribute inferSrcEncoding(Operation *op, Attribute encoding) {
     return inferSrcEncoding(gather, encoding);
   if (auto fp4ToFp = dyn_cast<triton::gpu::Fp4ToFpOp>(op))
     return inferSrcEncoding(fp4ToFp, encoding);
+  if (auto broadcast = dyn_cast<triton::BroadcastOp>(op))
+    return inferSrcEncoding(broadcast, encoding);
 
   return {};
 }
