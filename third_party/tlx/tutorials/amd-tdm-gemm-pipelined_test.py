@@ -7,7 +7,7 @@ API on a pipelined matmul:
 - ``tl.make_tensor_descriptor`` + ``tlx.async_amd_descriptor_load`` to
   issue an async copy from global memory directly into a user-provided
   LDS buffer.
-- ``tlx.amd_descriptor_prefetch`` for a look-ahead L2 prefetch hint,
+- ``tlx.amd_descriptor_prefetch_tensor`` for a look-ahead L2 prefetch hint,
   with an ``i1`` pred to gate against the trailing tail.
 - ``tlx.async_amd_descriptor_store`` to copy the accumulator tile back
   to global memory via TDM (mirrors ``async_amd_descriptor_load``; no
@@ -106,8 +106,8 @@ def matmul_tdm_pipelined_kernel(
     tlx.async_amd_descriptor_load(a_desc, tlx.local_view(a_buf, 0), [off_m, 0])
     tlx.async_amd_descriptor_load(b_desc, tlx.local_view(b_buf, 0), [0, off_n])
     prefetch_pred = BLOCK_K < K
-    tlx.amd_descriptor_prefetch(a_desc, [off_m, BLOCK_K], pred=prefetch_pred)
-    tlx.amd_descriptor_prefetch(b_desc, [BLOCK_K, off_n], pred=prefetch_pred)
+    tlx.amd_descriptor_prefetch_tensor(a_desc, [off_m, BLOCK_K], pred=prefetch_pred)
+    tlx.amd_descriptor_prefetch_tensor(b_desc, [BLOCK_K, off_n], pred=prefetch_pred)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
@@ -122,8 +122,8 @@ def matmul_tdm_pipelined_kernel(
         # Look-ahead prefetch for tile k+2 (in bounds when k+2 < K_ITERS).
         prefetch_k = next_k + 1
         prefetch_pred = prefetch_k < K_ITERS
-        tlx.amd_descriptor_prefetch(a_desc, [off_m, prefetch_k * BLOCK_K], pred=prefetch_pred)
-        tlx.amd_descriptor_prefetch(b_desc, [prefetch_k * BLOCK_K, off_n], pred=prefetch_pred)
+        tlx.amd_descriptor_prefetch_tensor(a_desc, [off_m, prefetch_k * BLOCK_K], pred=prefetch_pred)
+        tlx.amd_descriptor_prefetch_tensor(b_desc, [prefetch_k * BLOCK_K, off_n], pred=prefetch_pred)
 
         # Drain everything older than the just-issued pair.
         tlx.async_amd_descriptor_wait(2)

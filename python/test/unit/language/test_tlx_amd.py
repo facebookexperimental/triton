@@ -1083,7 +1083,7 @@ def _amd_desc_prefetch_kernel(
         strides=[N, tl.constexpr(1)],
         block_shape=[BLOCK_M, BLOCK_N],
     )
-    tlx.amd_descriptor_prefetch(a_desc, [0, 0])
+    tlx.amd_descriptor_prefetch_tensor(a_desc, [0, 0])
 
     buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
     smem = tlx.local_view(buf, 0)
@@ -1094,7 +1094,7 @@ def _amd_desc_prefetch_kernel(
 
 
 def test_amd_desc_prefetch_compiles_gfx1250(device):
-    """tlx.amd_descriptor_prefetch should compile to amdg.tdm_prefetch and not to a TDM copy."""
+    """tlx.amd_descriptor_prefetch_tensor should compile to amdg.tdm_prefetch and not to a TDM copy."""
     compiled = compile_for_gfx1250(
         _amd_desc_prefetch_kernel,
         signature={"a_ptr": "*fp16", "output_ptr": "*fp16", "M": "i32", "N": "i32"},
@@ -1109,7 +1109,7 @@ def test_amd_desc_prefetch_compiles_gfx1250(device):
 
 
 def test_amd_desc_prefetch_speculative_compiles_gfx1250(device):
-    """amd_descriptor_prefetch with speculative=True should still compile."""
+    """amd_descriptor_prefetch_tensor with speculative=True should still compile."""
 
     @triton.jit
     def _spec_kernel(a_ptr, M: tl.constexpr, N: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
@@ -1119,7 +1119,7 @@ def test_amd_desc_prefetch_speculative_compiles_gfx1250(device):
             strides=[N, tl.constexpr(1)],
             block_shape=[BLOCK_M, BLOCK_N],
         )
-        tlx.amd_descriptor_prefetch(desc, [0, 0], speculative=True)
+        tlx.amd_descriptor_prefetch_tensor(desc, [0, 0], speculative=True)
 
     compiled = compile_for_gfx1250(
         _spec_kernel,
@@ -1149,4 +1149,4 @@ def test_async_descriptor_prefetch_tensor_rejected_on_amd():
             signature={"a_ptr": "*fp16", "M": "i32", "N": "i32"},
             constexprs={"BLOCK_M": 16, "BLOCK_N": 32},
         )
-    assert "NV-only" in str(exc_info.value) or "amd_descriptor_prefetch" in str(exc_info.value)
+    assert "NV-only" in str(exc_info.value) or "amd_descriptor_prefetch_tensor" in str(exc_info.value)

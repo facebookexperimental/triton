@@ -1038,7 +1038,7 @@ def async_amd_descriptor_store(
 
 
 @tl.builtin
-def amd_descriptor_prefetch(
+def amd_descriptor_prefetch_tensor(
     desc: tl.tensor_descriptor_base,
     offsets: list[tl.tensor],
     pred: tl.tensor = None,
@@ -1059,7 +1059,7 @@ def amd_descriptor_prefetch(
     assert isinstance(desc, tl.tensor_descriptor_base)
     arch = _semantic.builder.options.arch
     assert is_amd_tdm_target(arch), (
-        f"amd_descriptor_prefetch is only available on AMD TDM-capable targets, got arch={arch}")
+        f"amd_descriptor_prefetch_tensor is only available on AMD TDM-capable targets, got arch={arch}")
     speculative = tl._unwrap_if_constexpr(speculative)
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
@@ -1114,7 +1114,7 @@ def async_descriptor_prefetch_tensor(
     """
     Hint the hardware to prefetch a tensor tile from global memory into L2 cache using TMA.
 
-    NV-only. AMD users should call :func:`amd_descriptor_prefetch`
+    NV-only. AMD users should call :func:`amd_descriptor_prefetch_tensor`
     instead — the AMD path is a fire-and-forget L2 hint with a
     ``speculative`` flag and no ``eviction_policy``.
     """
@@ -1122,7 +1122,7 @@ def async_descriptor_prefetch_tensor(
     arch = _semantic.builder.options.arch
     if isinstance(arch, str) and arch.startswith("gfx"):
         raise NotImplementedError(f"tlx.async_descriptor_prefetch_tensor is NV-only; got AMD arch '{arch}'. "
-                                  "Use tlx.amd_descriptor_prefetch on TDM-capable AMD targets (gfx1250+); "
+                                  "Use tlx.amd_descriptor_prefetch_tensor on TDM-capable AMD targets (gfx1250+); "
                                   "non-TDM AMD targets do not have a descriptor-based prefetch.")
     assert eviction_policy in ("", "evict_first", "evict_last"), \
         f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'"
