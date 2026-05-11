@@ -217,11 +217,10 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
             swizzledEncoding.getContext(), swizzledEncoding.getVec(),
             swizzledEncoding.getPerPhase(), swizzledEncoding.getMaxPhase(),
             permutedOrder, swizzledEncoding.getCGALayout());
-      }
-      if (!srcEncoding) {
-        // Generic shared encodings, especially padded TDM layouts, need the
-        // inverse transpose to push a result-side requirement back to the
-        // source memdesc.
+      } else {
+        // Other shared encodings (e.g. PaddedSharedEncodingAttr for TDM tiles)
+        // fall back on the dialect's transpose inference to push a result-side
+        // requirement back to the source memdesc via the inverse permutation.
         auto resultType = cast<ttg::MemDescType>(memDescTransOp.getType());
         auto inverseOrder = invertPermutation(memDescTransOp.getOrder());
         FailureOr<Attribute> inferred = inferTransEncoding(

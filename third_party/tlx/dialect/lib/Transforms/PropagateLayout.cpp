@@ -97,6 +97,10 @@ public:
       return success();
     }
 
+    // The matched local_alloc -> local_load pair is always an LDS round-trip.
+    // Replace it with a layout conversion: it lowers to register shuffles for
+    // the common encoding pairs and is no worse than the spill in the few
+    // cases where the conversion itself still goes through LDS.
     rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(
         localLoadOp, localLoadOp.getType(), allocOp.getSrc());
     return success();
