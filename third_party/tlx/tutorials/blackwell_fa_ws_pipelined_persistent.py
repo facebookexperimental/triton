@@ -349,30 +349,22 @@ def _softmax_inner_loop(
     prune_configs_by={"early_config_prune": prune_configs_by_hdim},
 )
 @triton.jit
-def _attn_fwd_ws(
-    sm_scale,
-    M,  #
-    Z,
-    H,
-    desc_q,
-    desc_k,
-    desc_v,
-    desc_o,
-    N_CTX,  #
-    HEAD_DIM: tl.constexpr,  #
-    BLOCK_M: tl.constexpr,  #
-    BLOCK_N: tl.constexpr,  #
-    STAGE: tl.constexpr,  #
-    NUM_BUFFERS_Q: tl.constexpr,  #
-    NUM_BUFFERS_KV: tl.constexpr,  #
-    NUM_BUFFERS_QK: tl.constexpr,  #
-    NUM_MMA_GROUPS: tl.constexpr,  #
-    NUM_MMA_SLICES: tl.constexpr,  #
-    GROUP_SIZE_N: tl.constexpr,  #
-    RESCALE_OPT: tl.constexpr,  #
-    USE_WHERE: tl.constexpr,  #
-    USE_WARP_BARRIER: tl.constexpr = False,
-):
+def _attn_fwd_ws(sm_scale, M,  #
+                 Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
+                 HEAD_DIM: tl.constexpr,  #
+                 BLOCK_M: tl.constexpr,  #
+                 BLOCK_N: tl.constexpr,  #
+                 STAGE: tl.constexpr,  #
+                 NUM_BUFFERS_Q: tl.constexpr,  #
+                 NUM_BUFFERS_KV: tl.constexpr,  #
+                 NUM_BUFFERS_QK: tl.constexpr,  #
+                 NUM_MMA_GROUPS: tl.constexpr,  #
+                 NUM_MMA_SLICES: tl.constexpr,  #
+                 GROUP_SIZE_N: tl.constexpr,  #
+                 RESCALE_OPT: tl.constexpr,  #
+                 USE_WHERE: tl.constexpr,  #
+                 USE_WARP_BARRIER: tl.constexpr,  #
+                 ):
     tl.static_assert(NUM_MMA_GROUPS == 2)
     tl.static_assert(NUM_BUFFERS_QK == 1)
     tl.static_assert(NUM_BUFFERS_Q == 1)
@@ -1057,11 +1049,6 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
     # multiple configs are present (e.g., USE_WARP_BARRIER in [False, True]).
     nargs["desc_dq"].base.zero_()
 
-    # Reset dq accumulator to zeros before each autotuner warmup run.
-    # Without this, dq accumulates across autotuner benchmark runs when
-    # multiple configs are present (e.g., USE_WARP_BARRIER in [False, True]).
-    nargs["desc_dq"].base.zero_()
-
     nargs["desc_q"].block_shape = [BLOCK_M1, HEAD_DIM]
     nargs["desc_do"].block_shape = [BLOCK_M1, HEAD_DIM]
     nargs["desc_v"].block_shape = [BLOCK_N1, HEAD_DIM]
@@ -1223,7 +1210,7 @@ def _attn_bwd_ws(
     DKV_STORE_NCOL: tl.constexpr,
     STAGE: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
-    USE_WARP_BARRIER: tl.constexpr = False,
+    USE_WARP_BARRIER: tl.constexpr,
 ):
     # Kernel hangs if NUM_BUFFERS_Q != 2.
     tl.static_assert(NUM_BUFFERS_Q == 2)
@@ -1605,6 +1592,9 @@ def _attn_bwd_ws(
                 tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                 clc_phase_consumer ^= 1
 
+            # Wait for the final tile
+            tlx.async_descriptor_store_wait(0)
+
         # mma
         with tlx.async_task(num_warps=1, registers=24):
             blk_idx = 0
@@ -1862,7 +1852,8 @@ def _attn_bwd_ws(
                 tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
                 tlx.barrier_expect_bytes(
                     do_fulls[do_buf_id],
-                    V_BYTES_PER_ELEM * BLOCK_N1 * HEAD_DIM + DO_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
+                    V_BYTES_PER_ELEM * BLOCK_N1 * HEAD_DIM + DO_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM,
+                )
                 tlx.async_descriptor_load(
                     desc_v,
                     v_tiles[kv_buf_id],

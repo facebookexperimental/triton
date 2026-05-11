@@ -1,4 +1,4 @@
-name: Meta Triton TritonBench Tests
+name: Meta Triton H100 Tests
 on:
   push:
     branches:
@@ -6,9 +6,9 @@ on:
   pull_request:
 
 jobs:
-  h100-tritonbench-test:
+  h100-meta-triton-test:
     if: github.repository_owner == 'facebookexperimental'
-    runs-on: [linux.gcp.h100]
+    runs-on: linux-gcp-h100
     env:
       CONDA_ENV: meta-triton
       SETUP_SCRIPT: /workspace/setup_instance.sh
