@@ -93,6 +93,10 @@ class CudaUtils(object):
         self.fill_1d_tma_descriptor_type = mod.fill_1d_tma_descriptor_type
         self.fill_2d_tma_descriptor_type = mod.fill_2d_tma_descriptor_type
         self.TmaDescKernelParam = TmaDescKernelParam
+        self._TritonDispatcher = mod._TritonDispatcher
+        self._TritonJITRunner = mod._TritonJITRunner
+        self._ProxyRunner = mod._ProxyRunner
+        self.create_fast_jit_type = mod.create_fast_jit_type
 
 
 # ------------------------

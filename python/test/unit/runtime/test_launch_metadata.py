@@ -8,14 +8,17 @@ are consistent with the existing metadata bag.
 import json
 
 import pytest
+import torch
 import triton
 import triton.language as tl
+from triton import knobs
 from triton.backends.nvidia.driver import (
     build_kernel_signature_from_schema,
     expand_signature,
     make_kernel_signature,
 )
 from triton.compiler.compiler import ASTSource, compile as triton_compile, make_backend
+from triton.knobs import HookChain
 
 
 @triton.jit
@@ -406,3 +409,126 @@ def test_schema_derived_signature_tensordesc(tensordesc_type, tensordesc_meta, o
                                                   f"  expanded sig: {expanded}\n"
                                                   f"  schema bytes: {list(schema_signature)}\n"
                                                   f"  legacy bytes: {list(legacy_signature)}")
+
+
+# =========================================================================
+# HookChain.__bool__, _TritonDispatcher, _TritonJITRunner
+# =========================================================================
+
+
+def test_hookchain_bool_empty():
+    """Empty HookChain should evaluate as False."""
+    chain = HookChain()
+    assert not chain
+    assert bool(chain) is False
+
+
+def test_hookchain_bool_nonempty():
+    """HookChain with hooks should evaluate as True."""
+    chain = HookChain()
+    chain.add(lambda: None)
+    assert chain
+    assert bool(chain) is True
+
+
+def test_hookchain_bool_after_remove():
+    """HookChain should become False again after removing all hooks."""
+    chain = HookChain()
+    fn = lambda: None
+    chain.add(fn)
+    assert bool(chain) is True
+    chain.remove(fn)
+    assert bool(chain) is False
+
+
+def test_dispatcher_created_with_flag(monkeypatch):
+    """CompiledKernel._dispatcher should be set when use_triton_dispatcher is enabled."""
+    monkeypatch.setenv("TRITON_USE_TRITON_DISPATCHER", "1")
+    compiled = _compile_kernel(
+        add_kernel,
+        signature={"X": "*fp32", "Y": "*fp32", "OUT": "*fp32", "N": "i32"},
+        constexprs={"BLOCK": 1024},
+    )
+    compiled._init_handles()
+    assert compiled._dispatcher is not None
+
+
+def test_dispatcher_not_created_without_flag(monkeypatch):
+    """CompiledKernel._dispatcher should be None without the flag."""
+    monkeypatch.setenv("TRITON_USE_TRITON_DISPATCHER", "0")
+    compiled = _compile_kernel(
+        add_kernel,
+        signature={"X": "*fp32", "Y": "*fp32", "OUT": "*fp32", "N": "i32"},
+        constexprs={"BLOCK": 1024},
+    )
+    compiled._init_handles()
+    assert compiled._dispatcher is None
+
+
+def test_dispatcher_is_callable(monkeypatch):
+    """_TritonDispatcher should be callable when created."""
+    monkeypatch.setenv("TRITON_USE_TRITON_DISPATCHER", "1")
+    compiled = _compile_kernel(
+        add_kernel,
+        signature={"X": "*fp32", "Y": "*fp32", "OUT": "*fp32", "N": "i32"},
+        constexprs={"BLOCK": 1024},
+    )
+    compiled._init_handles()
+    assert compiled._dispatcher is not None, "_dispatcher was not created"
+    assert callable(compiled._dispatcher)
+
+
+def test_launch_metadata_returns_none_without_hooks():
+    """launch_metadata should return None when no enter hooks are registered."""
+    compiled = _compile_kernel(
+        add_kernel,
+        signature={"X": "*fp32", "Y": "*fp32", "OUT": "*fp32", "N": "i32"},
+        constexprs={"BLOCK": 1024},
+    )
+    if knobs.runtime.launch_enter_hook:
+        pytest.skip("launch_enter_hook is registered, precondition not met")
+    result = compiled.launch_metadata((1, 1, 1), 0)
+    assert result is None
+
+
+def test_dispatcher_e2e(monkeypatch):
+    """End-to-end: _TritonDispatcher dispatches correctly on GPU."""
+    monkeypatch.setenv("TRITON_USE_TRITON_DISPATCHER", "1")
+    compiled = _compile_kernel(
+        add_kernel,
+        signature={"X": "*fp32", "Y": "*fp32", "OUT": "*fp32", "N": "i32"},
+        constexprs={"BLOCK": 1024},
+    )
+    compiled._init_handles()
+    if compiled._dispatcher is None:
+        pytest.skip("Dispatcher not available")
+
+    N = 1024
+    x = torch.randn(N, device="cuda", dtype=torch.float32)
+    y = torch.randn(N, device="cuda", dtype=torch.float32)
+    out = torch.empty_like(x)
+
+    stream = torch.cuda.current_stream().cuda_stream
+    compiled._dispatcher(1, 1, 1, stream, x.data_ptr(), y.data_ptr(), out.data_ptr(), N)
+    torch.cuda.synchronize()
+    assert torch.allclose(out, x + y, atol=1e-5), f"max diff: {(out - x - y).abs().max()}"
+
+
+def test_dispatcher_getitem_jit_runner(monkeypatch):
+    """CompiledKernel.__getitem__ should return a _TritonJITRunner when dispatcher is available."""
+    monkeypatch.setenv("TRITON_USE_TRITON_DISPATCHER", "1")
+    compiled = _compile_kernel(
+        add_kernel,
+        signature={"X": "*fp32", "Y": "*fp32", "OUT": "*fp32", "N": "i32"},
+        constexprs={"BLOCK": 1024},
+    )
+
+    N = 1024
+    x = torch.randn(N, device="cuda", dtype=torch.float32)
+    y = torch.randn(N, device="cuda", dtype=torch.float32)
+    out = torch.empty_like(x)
+
+    runner = compiled[(1, 1, 1)]
+    runner(x.data_ptr(), y.data_ptr(), out.data_ptr(), N)
+    torch.cuda.synchronize()
+    assert torch.allclose(out, x + y, atol=1e-5), f"max diff: {(out - x - y).abs().max()}"
