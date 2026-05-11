@@ -103,24 +103,36 @@ unsigned ReduceOpHelper::getIntraWarpSizeWithUniqueData() {
   return getThreadsPerWarp(srcEncoding, srcShape)[axis];
 }
 
+unsigned ReduceOpHelper::getNumRegGroupsOnAxis() {
+  if (!op.hasDefinedOrdering())
+    return 1;
+  unsigned elemsPerThread = triton::gpu::getElemsPerThread(srcTy)[axis];
+  unsigned contigPerThread = triton::gpu::getContigPerThread(srcTy)[axis];
+  assert(contigPerThread > 0 && "contigPerThread must be > 0");
+  return elemsPerThread / contigPerThread;
+}
+
 bool ReduceOpHelper::isWarpSynchronous() {
-  // If only 1 element along the reduce axis, inter-warp communication is
-  // unnecessary — only 1 thread has real data regardless of warpsPerCTA.
-  // This handles tensors from multi-CTA DSM exchange (e.g., tensor<1xf32>
-  // with warpsPerCTA=[4]) where warps 1-3 have no data.
   if (srcShape[axis] == 1)
     return true;
-  return getWarpsPerCTA(srcEncoding, srcShape)[axis] == 1;
+  if (getWarpsPerCTA(srcEncoding, srcShape)[axis] != 1)
+    return false;
+  // For inner_tree with non-contiguous register groups, we need the
+  // inter-warp shared memory path to combine groups even when there
+  // is only one warp on the reduction axis.
+  if (getNumRegGroupsOnAxis() > 1)
+    return false;
+  return true;
 }
 
 SmallVector<unsigned> ReduceOpHelper::getScratchRepShape() {
   SmallVector<unsigned> smemShape;
-  // This case doesn't need inter-warp communication
   if (isWarpSynchronous())
     return {0, 0};
 
   smemShape = convertType<unsigned>(srcShape);
-  smemShape[axis] = getInterWarpSizeWithUniqueData();
+  unsigned numRegGroups = getNumRegGroupsOnAxis();
+  smemShape[axis] = numRegGroups * getInterWarpSizeWithUniqueData();
 
   return smemShape;
 }
