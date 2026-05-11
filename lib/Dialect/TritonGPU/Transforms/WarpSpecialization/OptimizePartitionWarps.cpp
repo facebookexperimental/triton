@@ -202,17 +202,7 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
   for (auto [minWarps, region] :
        llvm::zip(minWarpsForPartition, wsOp.getPartitionRegions())) {
     region->walk([minWarps = &minWarps](Operation *op) {
-      // Some instructions have critical throughput if have low register usage.
-      // Make sure there are enough warps for these ops to execute quickly.
-      // TODO: Should we keep a minimum of 2 warps for
-      // AsyncTMACopyGlobalToLocalOp under certain conditions?
-      if (isa<ttng::AsyncTMAGatherOp, ttng::AsyncTMAScatterOp>(op))
-        *minWarps = 2;
-      // TMEM ops require at least 4 warps to be able to read all lanes.
-      // WarpGroupDotOp requires a full warp group (4 warps).
-      else if (isa<ttng::TMEMLoadOp, ttng::TMEMStoreOp, ttng::TMEMAllocOp,
-                   ttng::WarpGroupDotOp>(op))
-        *minWarps = 4;
+      *minWarps = std::max(*minWarps, ttng::getMinWarpsForOp(op));
     });
   }
 
