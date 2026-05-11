@@ -346,3 +346,26 @@ def visit_withAsyncTasks(self, node):
 
                 self.builder.create_warp_return_op()
                 region_replica_id_stack.pop()
+
+
+def visit_withWarpPipelineStage(self, node):
+    from triton.language.core import _unwrap_if_constexpr
+
+    # Reject on non-AMD targets early with a clear error.
+    target_str = getattr(self.builder.options, 'target', '')
+    if isinstance(target_str, str) and target_str and not target_str.startswith('hip'):
+        raise ValueError("tlx.warp_pipeline_stage is only supported on AMD (HIP) targets")
+
+    context = node.items[0].context_expr
+    args = [self.visit(arg) for arg in context.args]
+    kwargs = {kw.arg: self.visit(kw.value) for kw in context.keywords}
+
+    label = _unwrap_if_constexpr(args[0]) if args else None
+    if label is None:
+        label = "cluster"
+    priority = _unwrap_if_constexpr(kwargs.get("priority", None))
+    if priority is None:
+        priority = -1
+
+    self.visit_compound_statement(node.body)
+    self.builder.create_warp_pipeline_border(str(label), priority)

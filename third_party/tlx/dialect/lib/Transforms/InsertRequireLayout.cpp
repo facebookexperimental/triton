@@ -211,6 +211,14 @@ public:
   }
 
   void visitBranchOperand(OpOperand &operand) override {
+    if (!isTrackedDotValue(operand.get()))
+      return;
+    // For RegionBranchTerminatorOpInterface (scf.yield) and
+    // RegionBranchOpInterface (scf.for init args), allow the dot encoding
+    // to propagate backward so local_load ops feeding loop-carried values
+    // produce dot_op layout directly.
+    if (isTransparentLayoutCarrierOp(operand.getOwner()))
+      return;
     poisonUnhandledCase(operand);
   }
 
