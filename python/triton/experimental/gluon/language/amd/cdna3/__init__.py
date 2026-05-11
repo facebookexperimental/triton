@@ -168,8 +168,8 @@ def mfma(a, b, acc, _semantic: GluonSemantic = None):
     ret_type = acc.type
     acc = ttgl._unwrap_if_constexpr(acc)
 
-    handle = _semantic.dot(a, b, acc, input_precision=knobs.language.fp32_default, max_num_imprecise_acc=None,
-                           out_dtype=acc.dtype).handle
+    handle = _semantic.dot(a, b, acc, input_precision=knobs.language.fp32_default, allow_tf32=False,
+                           max_num_imprecise_acc=None, out_dtype=acc.dtype).handle
     return ttgl.tensor(handle, ret_type)
 
 
