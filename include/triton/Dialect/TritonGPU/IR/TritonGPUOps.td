@@ -640,7 +640,7 @@ def TTG_GlobalScratchAllocOp : TTG_Op<"global_scratch_alloc"> {
 
 def TTG_WarpSpecializeOp : TTG_Op<"warp_specialize", [
   RecursiveMemoryEffects, RecursivelySpeculatable, AsyncRegions,
-  DeclareOpInterfaceMethods<RegionBranchOpInterface, ["getSuccessorInputs"]>
+  DeclareOpInterfaceMethods<RegionBranchOpInterface>
 ]> {
   let summary = "asynchronously execute code on multiple warpgroups";
   let description = [{
@@ -716,8 +716,7 @@ def TTG_WarpSpecializePartitionsOp
               RecursivelySpeculatable, Terminator,
               HasParent<"WarpSpecializeOp">,
               DeclareOpInterfaceMethods<
-                  RegionBranchOpInterface, ["getEntrySuccessorOperands",
-                                            "getSuccessorInputs"]>]> {
+                  RegionBranchOpInterface, ["getEntrySuccessorOperands"]>]> {
   let summary = "container op for `ttg.warp_specialize`";
   let description = [{
     Because MLIR requires entire operations be isolated from above, this op

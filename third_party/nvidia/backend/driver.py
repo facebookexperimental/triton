@@ -412,11 +412,10 @@ class CudaLauncher(object):
         global_scratch = allocate_scratch(self.global_scratch_size, self.global_scratch_align, _allocation._allocator)
         profile_scratch = allocate_scratch(self.profile_scratch_size, self.profile_scratch_align,
                                            _allocation._profile_allocator)
-        self.launch(gridX, gridY, gridZ, stream, function,
-                    self.launch_cooperative_grid, self.launch_pdl,
-                    kernel_metadata, launch_metadata, launch_enter_hook, launch_exit_hook,
-                    global_scratch, profile_scratch,
-                    self.arg_annotations, self.kernel_signature, args)
+
+        self.launch(gridX, gridY, gridZ, stream, function, self.launch_cooperative_grid, self.launch_pdl,
+                    kernel_metadata, launch_metadata, launch_enter_hook, launch_exit_hook, global_scratch,
+                    profile_scratch, self.arg_annotations, self.kernel_signature, args)
 
 
 class CudaDriver(GPUDriver):
