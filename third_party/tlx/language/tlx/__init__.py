@@ -19,6 +19,11 @@ from .dynamic_launch import (
     clc_create_context,
     clc_producer,
 )
+from .grid_schedule import (
+    GridSchedule,
+    _get_max_num_sms,
+    compute_grid,
+)
 from .mem_ops import (
     allocate_tensor_descriptor,
     async_store,
@@ -186,4 +191,8 @@ __all__ = [
     "_to_mxfp8_block",
     # warp_ops
     "vote_ballot_sync",
+    # grid_schedule
+    "GridSchedule",
+    "_get_max_num_sms",
+    "compute_grid",
 ]
