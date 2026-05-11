@@ -1,0 +1,52 @@
+name: Meta Triton MI350 Tests
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  mi350-meta-triton-test:
+    if: github.repository_owner == 'facebookexperimental'
+    runs-on: linux-fb-triton-mi350-1
+    env:
+      WORKSPACE_DIR: /workspace
+      UV_VENV_DIR: /workspace/uv_venvs
+      CONDA_ENV: pytorch
+      SETUP_SCRIPT: /workspace/setup_instance.sh
+    timeout-minutes: 240
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Checkout Tritonbench
+        uses: actions/checkout@v3
+        with:
+          repository: meta-pytorch/tritonbench
+          path: tritonbench
+          submodules: recursive
+      - name: Setup Tritonbench environment
+        working-directory: tritonbench
+        run: |
+          set -eux
+          bash ./.ci/tritonbench/setup-env.sh --hip --no-build
+      - name: Compile Triton
+        env:
+          MAX_JOBS: 16
+        run: |
+          set -eux
+          . "${SETUP_SCRIPT}"
+          . "${GITHUB_WORKSPACE}/tritonbench/.ci/triton/triton_install_utils.sh"
+          install_triton "${GITHUB_WORKSPACE}"
+      - name: Run TritonBench
+        working-directory: tritonbench
+        run: |
+          set -eux
+          . "${SETUP_SCRIPT}"
+          bash ./.ci/tritonbench/test-gpu.sh
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
+  cancel-in-progress: true

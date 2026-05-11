@@ -20,7 +20,7 @@ from .. import knobs
 def _build(name: str, src: str, srcdir: str, library_dirs: list[str], include_dirs: list[str], libraries: list[str],
            ccflags: list[str]) -> str:
     if impl := knobs.build.impl:
-        return impl(name, src, srcdir, library_dirs, include_dirs, libraries)
+        return impl(name, src, srcdir, library_dirs, include_dirs, libraries, ccflags)
     suffix = sysconfig.get_config_var('EXT_SUFFIX')
     so = os.path.join(srcdir, '{name}{suffix}'.format(name=name, suffix=suffix))
     cc = os.environ.get("CC")

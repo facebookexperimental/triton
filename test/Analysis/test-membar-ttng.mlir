@@ -36,15 +36,17 @@ tt.func @tma_special_cases(%arg1: !tt.tensordesc<tensor<256x64xf16, #shared>>, %
   ttng.init_barrier %barrier, 1 : !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>
   ttng.init_barrier %barrier, 1 : !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>
 
-  // CHECK-NEXT: ttg.barrier local
   // CHECK-NEXT: ttng.barrier_expect
+  // CHECK-NEXT: ttg.barrier local
   // CHECK-NEXT: ttng.async_tma_copy_global_to_local
   // CHECK-NEXT: ttng.wait_barrier
   ttng.barrier_expect %barrier, 49152, %true : !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>
   ttng.async_tma_copy_global_to_local %arg1[%c0, %c0] %alloc, %barrier, %true : !tt.tensordesc<tensor<256x64xf16, #shared>>, !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable> -> !ttg.memdesc<256x64xf16, #shared, #ttg.shared_memory, mutable>
   ttng.wait_barrier %barrier, %c0 : !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>
 
+  // CHECK-NEXT: ttg.barrier local
   // CHECK-NEXT: ttng.async_tma_copy_global_to_local
+  // CHECK-NEXT: ttg.barrier local
   // CHECK-NEXT: ttng.barrier_expect
   // CHECK-NEXT: ttg.barrier local
   // CHECK-NEXT: ttng.wait_barrier
@@ -55,6 +57,7 @@ tt.func @tma_special_cases(%arg1: !tt.tensordesc<tensor<256x64xf16, #shared>>, %
   // CHECK-NEXT: ttg.local_load
   %t = ttg.local_load %alloc : !ttg.memdesc<256x64xf16, #shared, #ttg.shared_memory, mutable> -> tensor<256x64xf16, #blocked>
 
+  // CHECK-NEXT: ttg.barrier local
   // CHECK-NEXT: ttng.barrier_expect
   // CHECK-NEXT: ttg.barrier local
   // CHECK-NEXT: ttng.async_tma_copy_global_to_local
@@ -64,9 +67,10 @@ tt.func @tma_special_cases(%arg1: !tt.tensordesc<tensor<256x64xf16, #shared>>, %
   ttng.wait_barrier %barrier, %c0 : !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>
 
   // CHECK-NEXT: memdesc_subslice
-  // CHECK-NEXT: ttng.barrier_expect
-  // CHECK-NEXT: ttng.async_tma_gather
   // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttng.barrier_expect
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttng.async_tma_gather
   // CHECK-NEXT: ttng.wait_barrier
   %view = ttg.memdesc_subslice %alloc [0, 0]  : !ttg.memdesc<256x64xf16, #shared, #ttg.shared_memory, mutable> -> !ttg.memdesc<32x64xf16, #shared, #ttg.shared_memory, mutable>
   ttng.barrier_expect %barrier, 49152, %true : !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>
@@ -101,7 +105,9 @@ tt.func @tma_special_cases_cf(%arg1: !tt.tensordesc<tensor<256x64xf16, #shared>>
   scf.if %i1 {
     //  CHECK-NOT: ttg.barrier local
     //      CHECK: ttng.async_tma_copy_global_to_local
+    // CHECK-NEXT: ttg.barrier local
     // CHECK-NEXT: ttng.barrier_expect
+    // CHECK-NEXT: ttg.barrier local
     // CHECK-NEXT: ttng.wait_barrier
     // CF-NEXT: cf.br
     // SCF-NEXT: } else {
@@ -125,23 +131,23 @@ tt.func @tma_special_cases_cf(%arg1: !tt.tensordesc<tensor<256x64xf16, #shared>>
 // -----
 
 // Verify that init_barrier followed by inval_barrier on *different* constant
-// indices of the same barrier array inserts a local_barrier.
-// With explicit async op semantics, init_barrier and inval_barrier require
-// barriers to ensure visibility of shared memory operations.
+// indices of the same barrier array does NOT insert a spurious barrier.
+// canSkipBarSync skips init_barrier + inval_barrier pairs since these mbarrier
+// ops are single threaded and always synchronized wrt. each other.
 
 #shared_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 1024 : i32} {
-// CHECK-LABEL: @barrier_between_different_index_init_inval
-tt.func @barrier_between_different_index_init_inval() {
+// CHECK-LABEL: @no_barrier_between_different_index_init_inval
+tt.func @no_barrier_between_different_index_init_inval() {
   %c0 = arith.constant 0 : i32
   %c1 = arith.constant 1 : i32
   %bars = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #shared_bar, #ttg.shared_memory, mutable>
   %bar0 = ttg.memdesc_index %bars[%c0] : !ttg.memdesc<2xi64, #shared_bar, #ttg.shared_memory, mutable> -> !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
   %bar1 = ttg.memdesc_index %bars[%c1] : !ttg.memdesc<2xi64, #shared_bar, #ttg.shared_memory, mutable> -> !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
   //      CHECK: ttng.init_barrier
-  // CHECK-NEXT: ttg.barrier local
   // CHECK-NEXT: ttng.inval_barrier
+  //  CHECK-NOT: ttg.barrier local
   //      CHECK: tt.return
   ttng.init_barrier %bar0, 1 : !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
   ttng.inval_barrier %bar1 : !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
@@ -152,19 +158,19 @@ tt.func @barrier_between_different_index_init_inval() {
 // -----
 
 // Verify that init_barrier followed by inval_barrier on the SAME index
-// correctly inserts a barrier (true WAW hazard).
+// also does NOT insert a barrier, since canSkipBarSync skips all
+// init_barrier + inval_barrier pairs.
 
 #shared_bar_same = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 1024 : i32} {
-// CHECK-LABEL: @barrier_between_same_index_init_inval
-tt.func @barrier_between_same_index_init_inval() {
+// CHECK-LABEL: @no_barrier_between_same_index_init_inval
+tt.func @no_barrier_between_same_index_init_inval() {
   %c0 = arith.constant 0 : i32
   %bars = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #shared_bar_same, #ttg.shared_memory, mutable>
   %bar0a = ttg.memdesc_index %bars[%c0] : !ttg.memdesc<2xi64, #shared_bar_same, #ttg.shared_memory, mutable> -> !ttg.memdesc<1xi64, #shared_bar_same, #ttg.shared_memory, mutable>
   %bar0b = ttg.memdesc_index %bars[%c0] : !ttg.memdesc<2xi64, #shared_bar_same, #ttg.shared_memory, mutable> -> !ttg.memdesc<1xi64, #shared_bar_same, #ttg.shared_memory, mutable>
   //      CHECK: ttng.init_barrier
-  // CHECK-NEXT: ttg.barrier local
   // CHECK-NEXT: ttng.inval_barrier
   ttng.init_barrier %bar0a, 1 : !ttg.memdesc<1xi64, #shared_bar_same, #ttg.shared_memory, mutable>
   ttng.inval_barrier %bar0b : !ttg.memdesc<1xi64, #shared_bar_same, #ttg.shared_memory, mutable>

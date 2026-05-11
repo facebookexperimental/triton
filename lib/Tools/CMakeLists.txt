@@ -9,5 +9,6 @@ add_triton_library(TritonTools
   LINK_LIBS PUBLIC
   MLIRIR
   MLIRLLVMDialect
+  MLIRPluginsLib
   f2reduce
 )

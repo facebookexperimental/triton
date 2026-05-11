@@ -10,7 +10,12 @@ import json
 import pytest
 import triton
 import triton.language as tl
-from triton.compiler.compiler import ASTSource, compile as triton_compile
+from triton.backends.nvidia.driver import (
+    build_kernel_signature_from_schema,
+    expand_signature,
+    make_kernel_signature,
+)
+from triton.compiler.compiler import ASTSource, compile as triton_compile, make_backend
 
 
 @triton.jit
@@ -310,3 +315,94 @@ def test_launcher_src_has_abi_version_comment():
     )
     src = compiled.asm["launcher_src"]
     assert "ABI version: 1" in src
+
+
+# =============================================================================
+# Tests for schema-driven kernel_signature derivation
+# =============================================================================
+
+
+@triton.jit
+def multi_type_kernel(ptr_fp32, ptr_fp16, scalar_i32, scalar_i64, scalar_fp32, N, BLOCK: tl.constexpr):
+    """Kernel with diverse arg types to test schema-driven signature derivation."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    tl.store(ptr_fp32 + offs, tl.load(ptr_fp32 + offs, mask=offs < N), mask=offs < N)
+
+
+@pytest.mark.parametrize("kernel,signature,constexprs", [
+    (add_kernel, {"X": "*fp32", "Y": "*fp32", "OUT": "*fp32", "N": "i32"}, {"BLOCK": 1024}),
+    (kernel_with_constant, {"X": "*fp16", "N": "i64"}, {"BLOCK": 512}),
+    (multi_type_kernel, {
+        "ptr_fp32": "*fp32", "ptr_fp16": "*fp16", "scalar_i32": "i32", "scalar_i64": "i64", "scalar_fp32": "fp32", "N":
+        "i32"
+    }, {"BLOCK": 256}),
+])
+def test_schema_derived_signature_matches_legacy(kernel, signature, constexprs):
+    """kernel_signature from Level 0 schema must match legacy expand_signature path.
+
+    This validates that build_kernel_signature_from_schema() produces the exact
+    same byte sequence as the old make_kernel_signature(expand_signature(...)) path.
+    """
+    compiled = _compile_kernel(kernel, signature=signature, constexprs=constexprs)
+    src = compiled.src
+    md = compiled.metadata
+
+    # Legacy path: expand_signature → make_kernel_signature
+    sig = {idx: value for idx, value in src.signature.items()}
+    tensordesc_meta = getattr(md, "tensordesc_meta", None)
+    expanded = expand_signature(sig.values(), tensordesc_meta)
+    legacy_signature = make_kernel_signature(expanded)
+
+    # Schema path: make_launch_metadata → build_kernel_signature_from_schema
+    backend = make_backend(md.target)
+    schema = backend.make_launch_metadata(md._asdict(), src)
+    schema_signature = build_kernel_signature_from_schema(schema)
+
+    assert schema_signature == legacy_signature, (f"Schema-derived signature differs from legacy!\n"
+                                                  f"  schema args: {[a['type'] for a in schema['args']]}\n"
+                                                  f"  expanded sig: {expanded}\n"
+                                                  f"  schema bytes: {list(schema_signature)}\n"
+                                                  f"  legacy bytes: {list(legacy_signature)}")
+
+
+@pytest.mark.parametrize("tensordesc_type,tensordesc_meta,other_args", [
+    # Host TMA path (meta is None): 2D tensor descriptor
+    ("tensordesc<fp32[128, 64]>", [], [{"name": "N", "type": "i32", "index": 1}]),
+    # Device TMA path: 2D tensor descriptor with device TMA metadata
+    ("tensordesc<fp16[64, 64]>", [{"use_device_tma": True}], [{"name": "N", "type": "i32", "index": 1}]),
+    # Host TMA path: 1D tensor descriptor
+    ("tensordesc<fp32[256]>", [], []),
+    # Device TMA path: 1D tensor descriptor
+    ("tensordesc<bf16[128]>", [{"use_device_tma": True}], []),
+    # Mixed: tensordesc + regular pointer args
+    ("tensordesc<fp16[32, 32]>", [], [
+        {"name": "out_ptr", "type": "*fp16", "index": 1},
+        {"name": "N", "type": "i32", "index": 2},
+    ]),
+])
+def test_schema_derived_signature_tensordesc(tensordesc_type, tensordesc_meta, other_args):
+    """build_kernel_signature_from_schema handles tensordesc args (host and device TMA paths).
+
+    This directly constructs a schema dict to test tensordesc expansion logic
+    without requiring GPU compilation of a TMA kernel.
+    """
+    schema = {
+        "args": [{"name": "desc", "type": tensordesc_type, "index": 0}] + other_args,
+        "tensordesc_meta": tensordesc_meta,
+    }
+
+    # Schema path
+    schema_signature = build_kernel_signature_from_schema(schema)
+
+    # Legacy path: build equivalent flat signature list
+    sig_values = [tensordesc_type] + [a["type"] for a in other_args]
+    expanded = expand_signature(sig_values, tensordesc_meta or None)
+    legacy_signature = make_kernel_signature(expanded)
+
+    assert schema_signature == legacy_signature, (f"Schema-derived signature differs from legacy for tensordesc!\n"
+                                                  f"  tensordesc_type: {tensordesc_type}\n"
+                                                  f"  tensordesc_meta: {tensordesc_meta}\n"
+                                                  f"  expanded sig: {expanded}\n"
+                                                  f"  schema bytes: {list(schema_signature)}\n"
+                                                  f"  legacy bytes: {list(legacy_signature)}")

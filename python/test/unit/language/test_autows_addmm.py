@@ -167,6 +167,8 @@ def test_autows_addmm_tma_persistent(
     generate_subtiled_region,
 ):
     """Test addmm kernel (bias + matmul) with warp_specialize=True."""
+    if FLATTEN:
+        pytest.skip("FLATTEN will not WarpSpecialize although it will otherwise pass.")
 
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
