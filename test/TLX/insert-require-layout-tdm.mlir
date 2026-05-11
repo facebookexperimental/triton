@@ -499,3 +499,86 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     tt.return %a, %b : tensor<128x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>, tensor<32x128xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>>
   }
 }
+
+// -----
+// =============================================================================
+// 18. TDM store: anchor a `tlx.require_layout` on the source memdesc with
+//     the descriptor-shape default encoding `[32:+8]`. No dot consumer
+//     (the buffer is filled by `local_store`, not by a `local_load -> dot`),
+//     so the WMMA-tuned path doesn't fire.
+// =============================================================================
+
+// CHECK-DAG: #{{.*}} = #ttg.padded_shared<[32:+8] {order = [1, 0], shape = [128, 32]}>
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tdm_store_anchor
+  // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<128x32xf16, #{{.*}}, #smem, mutable>
+  // CHECK-NEXT: amdg.async_tdm_copy_local_to_global
+  tt.func public @tdm_store_anchor(%desc: !tt.tensordesc<128x32xf16>, %m: i32, %k: i32, %src: tensor<128x32xf16, #blocked>) {
+    %c0 = arith.constant 0 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<1x128x32xf16, #shared, #smem, mutable>
+    %buf = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<1x128x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+    ttg.local_store %src, %buf : tensor<128x32xf16, #blocked> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+    amdg.async_tdm_copy_local_to_global %desc[%m, %k] from %buf : !ttg.memdesc<128x32xf16, #shared, #smem, mutable> -> !tt.tensordesc<128x32xf16>
+    tt.return
+  }
+}
+
+// -----
+// =============================================================================
+// 19. TDM store with a dot-fed source memdesc (read-modify-write pattern):
+//     even though a `local_load -> tt.dot` reads the buffer, the store
+//     anchor uses the default `[32:+8]` because the TDM store hardware
+//     verifier requires `padInterval == innermost` (rejects WMMA-tuned).
+//     `isFedByTDM` returns true for store-touched buffers so the
+//     dot-path walk hands off to the TDM anchor (no swizzled anchor).
+// =============================================================================
+
+// CHECK-DAG: #{{.*}} = #ttg.padded_shared<[32:+8] {order = [1, 0], shape = [128, 32]}>
+// CHECK-NOT: #ttg.padded_shared<[128
+
+#mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 32]}>
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tdm_store_with_dot_reader
+  // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<128x32xf16, #{{.*}}, #smem, mutable>
+  // CHECK-NEXT: amdg.async_tdm_copy_local_to_global
+  tt.func public @tdm_store_with_dot_reader(%desc: !tt.tensordesc<128x32xf16>, %m: i32, %k: i32, %src: tensor<128x32xf16, #blocked>)
+      -> tensor<128x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>> {
+    %c0 = arith.constant 0 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<1x128x32xf16, #shared, #smem, mutable>
+    %buf = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<1x128x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+    ttg.local_store %src, %buf : tensor<128x32xf16, #blocked> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+    %t = ttg.local_load %buf : !ttg.memdesc<128x32xf16, #shared, #smem, mutable> -> tensor<128x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>
+    amdg.async_tdm_copy_local_to_global %desc[%m, %k] from %buf : !ttg.memdesc<128x32xf16, #shared, #smem, mutable> -> !tt.tensordesc<128x32xf16>
+    tt.return %t : tensor<128x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>
+  }
+}
+
+// -----
+// =============================================================================
+// 20. TDM prefetch is a fire-and-forget hint with no memdesc; the pass
+//     leaves it untouched and emits no anchor.
+// =============================================================================
+
+// CHECK-NOT: tlx.require_layout
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tdm_prefetch_only
+  // CHECK: amdg.tdm_prefetch
+  // CHECK-NOT: tlx.require_layout
+  tt.func public @tdm_prefetch_only(%desc: !tt.tensordesc<128x32xf16>, %m: i32, %k: i32, %p: i1) {
+    amdg.tdm_prefetch %desc[%m, %k], %p, speculative = false : !tt.tensordesc<128x32xf16>
+    tt.return
+  }
+}
