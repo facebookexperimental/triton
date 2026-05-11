@@ -459,7 +459,7 @@ def _reduce_k_kernel(
 # ============================================================================
 # Test 1: matmul_kernel_tma warp specialization (K-loop based)
 # ============================================================================
-@pytest.mark.parametrize("M, N, K", [(8192, 8192, 1024)])
+@pytest.mark.parametrize("M, N, K", [(128, 128, 128), (512, 512, 256), (8192, 8192, 1024)])
 @pytest.mark.parametrize("BLOCK_SIZE_M", [128])
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
@@ -577,7 +577,7 @@ def test_tutorial09_matmul_tma_warp_specialize(
 # Test 2: matmul_kernel_tma_persistent warp specialization (tile-loop based)
 # Tests both Flatten=True and Flatten=False
 # ============================================================================
-@pytest.mark.parametrize("M, N, K", [(8192, 8192, 1024)])
+@pytest.mark.parametrize("M, N, K", [(128, 128, 128), (512, 512, 256), (8192, 8192, 1024)])
 @pytest.mark.parametrize("BLOCK_SIZE_M", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
@@ -742,7 +742,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 # Test 3: matmul_kernel_descriptor_persistent warp specialization (device-side TMA)
 # Tests both Flatten=True and Flatten=False
 # ============================================================================
-@pytest.mark.parametrize("M, N, K", [(8192, 8192, 1024)])
+@pytest.mark.parametrize("M, N, K", [(128, 128, 128), (512, 512, 256), (8192, 8192, 1024)])
 @pytest.mark.parametrize("BLOCK_SIZE_M", [128])
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
@@ -964,6 +964,7 @@ def test_tutorial09_multi_epilogue_subtile():
 @pytest.mark.parametrize(
     "M, N, K",
     [
+        (256, 256, 32768),
         (256, 256, 65536),
     ],
 )
@@ -1081,7 +1082,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize_splitk(
 # ============================================================================
 # Hopper Test 1: matmul_kernel_tma warp specialization (K-loop based)
 # ============================================================================
-@pytest.mark.parametrize("M, N, K", [(8192, 8192, 1024)])
+@pytest.mark.parametrize("M, N, K", [(128, 128, 128), (512, 512, 256), (8192, 8192, 1024)])
 @pytest.mark.parametrize("BLOCK_SIZE_M", [64, 128])
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
@@ -1190,7 +1191,7 @@ def test_hopper_matmul_tma_warp_specialize(
 # Hopper Test 2: matmul_kernel_tma_persistent warp specialization (tile-loop)
 # Hopper constraints: FLATTEN=False, EPILOGUE_SUBTILE=1
 # ============================================================================
-@pytest.mark.parametrize("M, N, K", [(8192, 8192, 1024)])
+@pytest.mark.parametrize("M, N, K", [(128, 128, 128), (512, 512, 256), (8192, 8192, 1024)])
 @pytest.mark.parametrize("BLOCK_SIZE_M", [64, 128])
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
@@ -1318,7 +1319,7 @@ def test_hopper_matmul_tma_persistent_warp_specialize(
 # (device-side TMA descriptors)
 # Hopper constraints: FLATTEN=False, EPILOGUE_SUBTILE=1
 # ============================================================================
-@pytest.mark.parametrize("M, N, K", [(8192, 8192, 1024)])
+@pytest.mark.parametrize("M, N, K", [(128, 128, 128), (512, 512, 256), (8192, 8192, 1024)])
 @pytest.mark.parametrize("BLOCK_SIZE_M", [64, 128])
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
