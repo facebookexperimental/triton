@@ -190,30 +190,19 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
   // Tell PTXAS this value is warp-uniform.
   wid = targetInfo.shuffleIdx(b, b.getLoc(), wid, 0);
   Value isDefault = b.icmp_ult(wid, b.i32_val(defaultNumWarps));
-  if (tlx::tlxIsClustered(func) && !tlx::tlxExplicitClusterSync(func)) {
-    // All these have to be true before we can insert an arrive here:
-    // - The kernel is in clustered mode
-    // - There's no user controlled explicit cluster sync
-    // - There's an ClusterWaitOp (then it had to be inserted by compiler)
-    // Count the number of compiler-inserted cluster syncs (one for barrier
-    // init, possibly one more for tmem alloc in TLX paired MMA). Non-default
-    // warps need a matching arrive for each.
-    int numClusterWaits = 0;
-    func.walk([&](NVVM::ClusterWaitOp) { numClusterWaits++; });
-    assert(numClusterWaits <= 1 &&
-           "compiler should only insert one cluster barrier");
-    if (numClusterWaits == 1) {
-      // Non default warps should just do a cluster arrive unconditionally.
-      // Note this instruction is at kernel beginning shared by all warps, and
-      // we use `isDefault` as predicate here to select only non default warps
-      PTXBuilder ptxBuilder;
-      auto clusterArriveOp =
-          *ptxBuilder.create("@!$0 barrier.cluster.arrive.aligned;");
-      clusterArriveOp({ptxBuilder.newOperand(isDefault, "b")},
-                      /*onlyAttachMLIRArgs=*/true);
-      auto voidTy = void_ty(ctx);
-      ptxBuilder.launch(b, func.getLoc(), voidTy);
-    }
+  if (tlx::hasClusterSyncKernelInit(func)) {
+    // There was a cluster sync inserted by compiler for kernel init, and it
+    // would only be executed by default warps. We now need to insert an arrive
+    // for non default warps to unblock default warps. Note this instruction is
+    // at kernel beginning shared by all warps, and we use `isDefault` as
+    // predicate here to select only non default warps
+    PTXBuilder ptxBuilder;
+    auto clusterArriveOp =
+        *ptxBuilder.create("@!$0 barrier.cluster.arrive.aligned;");
+    clusterArriveOp({ptxBuilder.newOperand(isDefault, "b")},
+                    /*onlyAttachMLIRArgs=*/true);
+    auto voidTy = void_ty(ctx);
+    ptxBuilder.launch(b, func.getLoc(), voidTy);
   }
   LLVM::CondBrOp::create(b, b.getLoc(), isDefault, entry, switchLoop);
 
