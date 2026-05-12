@@ -628,11 +628,16 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps,
     attributes[1].id = hipLaunchAttributeCooperative;
     attributes[1].val.cooperative = launch_cooperative_grid;
 
-    HIP_LAUNCH_CONFIG config = {
-        (unsigned int)(gridX * num_ctas), (unsigned int)gridY, (unsigned int)gridZ,
-        (unsigned int)(warp_size * num_warps), 1, 1,
-        (unsigned int)shared_memory, stream, attributes, 2
-    };
+    HIP_LAUNCH_CONFIG config = {(unsigned int)(gridX * num_ctas),
+                                (unsigned int)gridY,
+                                (unsigned int)gridZ,
+                                (unsigned int)(warp_size * num_warps),
+                                1,
+                                1,
+                                (unsigned int)shared_memory,
+                                stream,
+                                attributes,
+                                2};
     HIP_CHECK(
         hipSymbolTable.hipDrvLaunchKernelEx(&config, function, params, 0));
     return;
@@ -815,20 +820,24 @@ typedef enum {
 
 Extractor extraction_map[EXTRACTOR_TYPE_COUNT] = {
     /* EXTRACTOR_UNKOWN_INDEX   */ {NULL, 0, {NULL}},
-    /* EXTRACTOR_POINTER_INDEX  */ {extractPointer, sizeof(hipDeviceptr_t), {NULL}},
+    /* EXTRACTOR_POINTER_INDEX  */
+    {extractPointer, sizeof(hipDeviceptr_t), {NULL}},
     /* EXTRACTOR_INT8_INDEX     */ {extractI8, sizeof(int8_t), {"i8"}},
     /* EXTRACTOR_INT16_INDEX    */ {extractI16, sizeof(int16_t), {"i16"}},
     /* EXTRACTOR_INT32_INDEX    */ {extractI32, sizeof(int32_t), {"i1", "i32"}},
     /* EXTRACTOR_INT64_INDEX    */ {extractI64, sizeof(int64_t), {"i64"}},
     /* EXTRACTOR_UINT8_INDEX    */ {extractU8, sizeof(uint8_t), {"u8"}},
     /* EXTRACTOR_UINT16_INDEX   */ {extractU16, sizeof(uint16_t), {"u16"}},
-    /* EXTRACTOR_UINT32_INDEX   */ {extractU32, sizeof(uint32_t), {"u1", "u32"}},
+    /* EXTRACTOR_UINT32_INDEX   */
+    {extractU32, sizeof(uint32_t), {"u1", "u32"}},
     /* EXTRACTOR_UINT64_INDEX   */ {extractU64, sizeof(uint64_t), {"u64"}},
     /* EXTRACTOR_FP16_INDEX     */ {extractFP16, sizeof(uint16_t), {"fp16"}},
     /* EXTRACTOR_BF16_INDEX     */ {extractBF16, sizeof(uint16_t), {"bf16"}},
-    /* EXTRACTOR_FP32_INDEX     */ {extractFP32, sizeof(uint32_t), {"fp32", "f32"}},
+    /* EXTRACTOR_FP32_INDEX     */
+    {extractFP32, sizeof(uint32_t), {"fp32", "f32"}},
     /* EXTRACTOR_FP64_INDEX     */ {extractFP64, sizeof(uint64_t), {"fp64"}},
-    /* EXTRACTOR_TDMDESC_INDEX  */ {extractTDMDescriptor, sizeof(TDMDescriptor), {"tensordesc"}},
+    /* EXTRACTOR_TDMDESC_INDEX  */
+    {extractTDMDescriptor, sizeof(TDMDescriptor), {"tensordesc"}},
 };
 
 Extractor getExtractor(uint8_t index) {
@@ -863,8 +872,7 @@ ExtractorTypeIndex getExtractorIndex(PyObject *type) {
   if (type_bytes[0] == '*') {
     return EXTRACTOR_POINTER_INDEX;
   }
-  for (int i = EXTRACTOR_INT8_INDEX; i < EXTRACTOR_TYPE_COUNT;
-       i++) {
+  for (int i = EXTRACTOR_INT8_INDEX; i < EXTRACTOR_TYPE_COUNT; i++) {
     if (isMatch(type_bytes, (ExtractorTypeIndex)i)) {
       return (ExtractorTypeIndex)i;
     }

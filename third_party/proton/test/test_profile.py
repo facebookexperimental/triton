@@ -286,7 +286,6 @@ def test_get_data(tmp_path: pathlib.Path):
     proton.deactivate(session, flushing=True)
 
     database = proton.data.get(session)
-    import triton.profiler.viewer as viewer
     gf, _, _, _ = viewer.get_raw_metrics(database)
     foo_frame = gf.filter("MATCH ('*', c) WHERE c.'name' =~ '.*foo.*' AND c IS LEAF").dataframe
     ones_frame = gf.filter("MATCH ('*', c) WHERE c.'name' =~ '.*elementwise.*' AND c IS LEAF").dataframe
