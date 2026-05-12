@@ -2,7 +2,6 @@
 #include "mlir/Analysis/DataFlow/SparseAnalysis.h"
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -23,6 +22,29 @@ namespace ttg = ::mlir::triton::gpu;
 namespace ttng = ::mlir::triton::nvidia_gpu;
 
 namespace mlir::triton::tlx {
+
+// Reuse the dialect's transpose inference so TLX propagation stays in sync
+// with verifier/type inference for padded, swizzled, and MMA shared layouts.
+static FailureOr<Attribute> inferTransEncoding(Attribute encoding,
+                                               ArrayRef<int64_t> shape,
+                                               ArrayRef<int32_t> order,
+                                               Location loc) {
+  Dialect &dialect = encoding.getDialect();
+  auto inferLayoutInterface =
+      cast<::mlir::triton::DialectInferLayoutInterface>(&dialect);
+  Attribute resultEncoding;
+  if (failed(inferLayoutInterface->inferTransOpEncoding(encoding, shape, order,
+                                                        resultEncoding, loc)))
+    return failure();
+  return resultEncoding;
+}
+
+static SmallVector<int32_t> invertPermutation(ArrayRef<int32_t> order) {
+  SmallVector<int32_t> inverse(order.size());
+  for (auto [i, dim] : llvm::enumerate(order))
+    inverse[dim] = i;
+  return inverse;
+}
 
 //===----------------------------------------------------------------------===//
 // LayoutEncoding
@@ -195,6 +217,17 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
             swizzledEncoding.getContext(), swizzledEncoding.getVec(),
             swizzledEncoding.getPerPhase(), swizzledEncoding.getMaxPhase(),
             permutedOrder, swizzledEncoding.getCGALayout());
+      } else {
+        // Other shared encodings (e.g. PaddedSharedEncodingAttr for TDM tiles)
+        // fall back on the dialect's transpose inference to push a result-side
+        // requirement back to the source memdesc via the inverse permutation.
+        auto resultType = cast<ttg::MemDescType>(memDescTransOp.getType());
+        auto inverseOrder = invertPermutation(memDescTransOp.getOrder());
+        FailureOr<Attribute> inferred = inferTransEncoding(
+            resultEnc, resultType.getShape(), inverseOrder, op->getLoc());
+        if (failed(inferred))
+          return failure();
+        srcEncoding = *inferred;
       }
       if (srcEncoding) {
         const auto updatedResultLayoutEncoding = LayoutEncoding(srcEncoding);
@@ -384,6 +417,29 @@ static bool isAllowedTensorLayoutUser(Operation *op, unsigned operandIndex) {
   return isa<ttg::ConvertLayoutOp>(op) || isTransparentLayoutCarrierOp(op);
 }
 
+// Later layout cleanup may express a dot-operand conversion as
+// tensor -> local_alloc -> local_load(dot). Treat that fallback as another dot
+// layout constraint on the source tensor so propagation can retag the original
+// value instead of preserving the redundant LDS round trip.
+static bool isDotLocalAllocFallback(Operation *op, unsigned operandIndex) {
+  auto allocOp = dyn_cast<ttg::LocalAllocOp>(op);
+  if (!allocOp || operandIndex != 0 || !allocOp.getSrc())
+    return false;
+  if (allocOp->use_empty())
+    return false;
+
+  for (Operation *user : allocOp->getUsers()) {
+    auto localLoadOp = dyn_cast<ttg::LocalLoadOp>(user);
+    if (!localLoadOp)
+      return false;
+    auto resultType = dyn_cast<RankedTensorType>(localLoadOp.getType());
+    if (!resultType ||
+        !isSupportedDotConstraintEncoding(resultType.getEncoding()))
+      return false;
+  }
+  return true;
+}
+
 static bool canRewriteTensorResult(Operation *op) {
   return isa<ttg::LocalLoadOp, RegionBranchOpInterface>(op);
 }
@@ -434,6 +490,29 @@ LogicalResult TensorBackwardPropagation::visitOperation(
     }
     // Don't return early — fall through to let the poison check handle
     // mixed-use cases where the operand has other non-allowed users.
+  }
+
+  if (auto allocOp = dyn_cast<ttg::LocalAllocOp>(op)) {
+    if (!allocOp.getSrc() || !isTrackedTensorValue(allocOp.getSrc()) ||
+        !isDotLocalAllocFallback(op, /*operandIndex=*/0))
+      return success();
+
+    // Meet all fallback users so mixed or conflicting dot requirements still
+    // widen to unknown and keep the explicit conversion path.
+    TensorLayout state;
+    for (Operation *user : allocOp->getUsers()) {
+      auto localLoadOp = cast<ttg::LocalLoadOp>(user);
+      auto resultType = cast<RankedTensorType>(localLoadOp.getType());
+      state = TensorLayout::meet(state, TensorLayout(resultType.getEncoding()));
+      state = TensorLayout::meet(
+          state, getLatticeElement(localLoadOp.getResult())->getValue());
+    }
+
+    if (!state.isUninitialized()) {
+      ChangeResult changed = operands[0]->meet(state);
+      propagateIfChanged(operands[0], changed);
+    }
+    return success();
   }
 
   // If a tracked tensor value is used by an unsupported operation, rewriting
@@ -520,7 +599,8 @@ LogicalResult LayoutForwardPropagation::visitOperation(
   if (isa<RegionBranchOpInterface, ttg::WarpSpecializePartitionsOp>(op))
     return visitRegion(op);
 
-  if (!isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp, ttng::TMEMSubSliceOp,
+  if (!isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
+           ttg::MemDescSubsliceOp, ttg::MemDescTransOp, ttng::TMEMSubSliceOp,
            ttg::LocalAllocOp, ttng::TMEMAllocOp>(op))
     return success();
 
@@ -528,6 +608,22 @@ LogicalResult LayoutForwardPropagation::visitOperation(
     if (!isa<ttg::MemDescType>(op->getOperand(operandIdx).getType()))
       continue;
     LayoutEncoding operandLayoutEncoding = operandLattice->getValue();
+
+    if (auto transOp = dyn_cast<ttg::MemDescTransOp>(op)) {
+      if (!operandLayoutEncoding.isUninitialized() &&
+          !operandLayoutEncoding.isUnknown()) {
+        // Forward propagation must transpose the concrete source layout before
+        // meeting it into the transposed view; copying the attribute verbatim
+        // leaves verifier-incompatible memdesc_trans result types.
+        auto srcTy = cast<ttg::MemDescType>(transOp.getSrc().getType());
+        FailureOr<Attribute> inferred = inferTransEncoding(
+            operandLayoutEncoding.getLayoutEncoding(), srcTy.getShape(),
+            transOp.getOrder(), op->getLoc());
+        if (failed(inferred))
+          return failure();
+        operandLayoutEncoding = LayoutEncoding(*inferred);
+      }
+    }
 
     // Unknown layouts do not provide enough information to refine a TMEM slice
     // result, so only splice concrete tensor-memory encodings through.

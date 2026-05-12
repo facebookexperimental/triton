@@ -219,6 +219,69 @@ def test_async_token_loop_compiles_gfx950(device):
     assert "async_wait" in ttgir
 
 
+# ---------------------------------------------------------------------------
+# Test: loop-carried dot operands do not fall back through tensor local_alloc.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _loop_carried_dot_layout_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    K_ITERS: tl.constexpr,
+):
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * (BLOCK_K * K_ITERS) + offs_k[None, :]
+    b_ptrs = b_ptr + offs_k[:, None] * BLOCK_N + offs_n[None, :]
+
+    a_buffers = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, 2)
+    b_buffers = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, 2)
+
+    a_buf = tlx.local_view(a_buffers, 0)
+    b_buf = tlx.local_view(b_buffers, 0)
+    tlx.local_store(a_buf, tl.load(a_ptrs))
+    tlx.local_store(b_buf, tl.load(b_ptrs))
+
+    a_reg = tlx.local_load(a_buf)
+    b_reg = tlx.local_load(b_buf)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in tl.range(0, K_ITERS - 1, num_stages=0):
+        acc = tl.dot(a_reg, b_reg, acc)
+        next_slot = (k + 1) % 2
+        next_a = tlx.local_view(a_buffers, next_slot)
+        next_b = tlx.local_view(b_buffers, next_slot)
+        tlx.local_store(next_a, tl.load(a_ptrs + (k + 1) * BLOCK_K))
+        tlx.local_store(next_b, tl.load(b_ptrs + (k + 1) * BLOCK_K * BLOCK_N))
+        a_reg = tlx.local_load(next_a)
+        b_reg = tlx.local_load(next_b)
+
+    acc = tl.dot(a_reg, b_reg, acc)
+    c_ptrs = c_ptr + offs_m[:, None] * BLOCK_N + offs_n[None, :]
+    tl.store(c_ptrs, acc)
+
+
+def test_loop_carried_dot_layout_cleanup_compiles_gfx950(device):
+    """Full AMD pipeline should remove late dot operand local_alloc fallbacks."""
+    compiled = compile_for_gfx950(
+        _loop_carried_dot_layout_kernel,
+        signature={"a_ptr": "*fp16", "b_ptr": "*fp16", "c_ptr": "*fp32"},
+        constexprs={"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 32, "K_ITERS": 3},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "ttg.local_alloc %" not in ttgir
+    assert "tt.dot" in ttgir
+    assert "amdgcn" in compiled.asm
+    assert len(compiled.asm["amdgcn"]) > 0
+
+
 # 1D gather test
 @triton.jit
 def local_gather_kernel(

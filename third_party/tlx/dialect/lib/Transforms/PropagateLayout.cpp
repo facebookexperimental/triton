@@ -69,6 +69,83 @@ public:
   }
 };
 
+// Late AMD passes can express a tensor layout conversion as a spill through
+// immutable local memory:
+//   tensor -> ttg.local_alloc -> ttg.local_load(dot)
+// Fold it back to either an identity or an explicit convert_layout so the
+// fallback does not survive to LLVM as LDS traffic.
+class FoldRetaggedLocalAllocLoad
+    : public mlir::OpRewritePattern<ttg::LocalLoadOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(ttg::LocalLoadOp localLoadOp,
+                  mlir::PatternRewriter &rewriter) const override {
+    auto allocOp = localLoadOp.getSrc().getDefiningOp<ttg::LocalAllocOp>();
+    if (!allocOp || !allocOp.getSrc())
+      return failure();
+    if (localLoadOp.getToken())
+      return failure();
+    auto resultType = dyn_cast<RankedTensorType>(localLoadOp.getType());
+    if (!resultType ||
+        !isSupportedDotConstraintEncoding(resultType.getEncoding()))
+      return failure();
+
+    if (allocOp.getSrc().getType() == localLoadOp.getType()) {
+      rewriter.replaceOp(localLoadOp, allocOp.getSrc());
+      return success();
+    }
+
+    // The matched local_alloc -> local_load pair is always an LDS round-trip.
+    // Replace it with a layout conversion: it lowers to register shuffles for
+    // the common encoding pairs and is no worse than the spill in the few
+    // cases where the conversion itself still goes through LDS.
+    rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(
+        localLoadOp, localLoadOp.getType(), allocOp.getSrc());
+    return success();
+  }
+};
+
+class FoldLocalAllocLoadFallback
+    : public mlir::OpRewritePattern<ttg::LocalAllocOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(ttg::LocalAllocOp allocOp,
+                  mlir::PatternRewriter &rewriter) const override {
+    Value src = allocOp.getSrc();
+    if (!src || !isa<RankedTensorType>(src.getType()))
+      return failure();
+    SmallVector<ttg::LocalLoadOp> loads;
+    for (Operation *user : allocOp->getUsers()) {
+      auto localLoadOp = dyn_cast<ttg::LocalLoadOp>(user);
+      if (!localLoadOp || localLoadOp.getToken())
+        return failure();
+      auto resultType = dyn_cast<RankedTensorType>(localLoadOp.getType());
+      if (!resultType ||
+          !isSupportedDotConstraintEncoding(resultType.getEncoding()))
+        return failure();
+      loads.push_back(localLoadOp);
+    }
+    if (loads.empty())
+      return failure();
+
+    for (ttg::LocalLoadOp localLoadOp : loads) {
+      rewriter.setInsertionPoint(localLoadOp);
+      Value replacement = src;
+      if (src.getType() != localLoadOp.getType())
+        replacement = ttg::ConvertLayoutOp::create(
+            rewriter, localLoadOp.getLoc(), localLoadOp.getType(), src);
+      rewriter.replaceOp(localLoadOp, replacement);
+    }
+    if (allocOp->use_empty())
+      rewriter.eraseOp(allocOp);
+    return success();
+  }
+};
+
 static RankedTensorType getNewTensorType(RankedTensorType origType,
                                          Attribute encoding) {
   return RankedTensorType::get(origType.getShape(), origType.getElementType(),
@@ -80,7 +157,9 @@ static bool isRetaggableTensorProducerValue(Value value) {
     return false;
 
   Operation *definingOp = value.getDefiningOp();
-  return isa_and_nonnull<ttg::LocalLoadOp>(definingOp);
+  // Sparse dataflow handles the RegionBranchOpInterface edge consistency; if
+  // all incoming values agree, retagging the region result is safe.
+  return isa_and_nonnull<ttg::LocalLoadOp, RegionBranchOpInterface>(definingOp);
 }
 
 static Type getTensorCandidateType(Value value, DataFlowSolver &solver,
@@ -95,6 +174,24 @@ static Type getTensorCandidateType(Value value, DataFlowSolver &solver,
     return tensorType;
 
   return getNewTensorType(tensorType, lattice->getValue().getLayoutEncoding());
+}
+
+static bool isRetaggableLocalAllocLoadFallback(ttg::LocalAllocOp allocOp) {
+  if (!allocOp.getSrc() || !isa<RankedTensorType>(allocOp.getSrc().getType()))
+    return false;
+  if (allocOp->use_empty())
+    return false;
+
+  for (Operation *user : allocOp->getUsers()) {
+    auto localLoadOp = dyn_cast<ttg::LocalLoadOp>(user);
+    if (!localLoadOp)
+      return false;
+    auto resultType = dyn_cast<RankedTensorType>(localLoadOp.getType());
+    if (!resultType ||
+        !isSupportedDotConstraintEncoding(resultType.getEncoding()))
+      return false;
+  }
+  return true;
 }
 
 static void
@@ -116,7 +213,8 @@ static ttg::MemDescType getNewMemDescType(ttg::MemDescType origType,
                                           Attribute encoding) {
   return ttg::MemDescType::get(origType.getShape(), origType.getElementType(),
                                encoding, origType.getMemorySpace(),
-                               origType.getMutableMemory());
+                               origType.getMutableMemory(),
+                               origType.getAllocShape());
 }
 
 static FailureOr<const LayoutEncodingLattice *>
@@ -299,6 +397,10 @@ public:
     WalkResult walkResult = funcOp.walk([&](mlir::Operation *op) {
       if (isa<tlx::RequireLayoutOp, tlx::ReleaseLayoutOp>(op))
         return WalkResult::interrupt();
+      if (auto allocOp = dyn_cast<ttg::LocalAllocOp>(op)) {
+        if (isRetaggableLocalAllocLoadFallback(allocOp))
+          return WalkResult::interrupt();
+      }
       return WalkResult::advance();
     });
     if (!walkResult.wasInterrupted())
@@ -401,6 +503,8 @@ public:
     RewritePatternSet patterns(context);
     patterns.add<RequireLayoutPattern>(context);
     patterns.add<ReleaseLayoutPattern>(context);
+    patterns.add<FoldRetaggedLocalAllocLoad>(context);
+    patterns.add<FoldLocalAllocLoadFallback>(context);
 
     if (applyPatternsGreedily(getOperation(), std::move(patterns)).failed())
       signalPassFailure();
