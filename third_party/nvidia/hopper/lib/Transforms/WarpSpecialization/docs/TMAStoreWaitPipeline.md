@@ -7,6 +7,12 @@ After `doTMAStoreLowering` converts `tt::DescriptorStoreOp` into
 (see [Memory Lowering](MemoryLowering.md#tma-store-lowering)), the
 memory planner and a sequence of sub-passes handle these staging buffers.
 
+Before this lowering, `doBufferAllocation` uses each `DescriptorStoreOp` as
+the ordering anchor for channels feeding TMA stores. The producer-side
+`local_store` order must match the descriptor-store order for the same TMA
+descriptor; later wait annotation and rotation reason about the sequence of
+stores to a shared staging buffer.
+
 ## Memory Planner: `isTMAStoreStaging` Handling
 
 **File**: `WSMemoryPlanner.cpp` (within `allocateSmemBuffers`)
