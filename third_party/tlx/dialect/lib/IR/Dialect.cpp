@@ -55,6 +55,60 @@ bool mlir::triton::tlx::tlxExplicitClusterSync(Operation *op) {
   return attr != nullptr && attr.getValue() == true;
 }
 
+bool mlir::triton::tlx::hasClusterSyncKernelInit(Operation *op) {
+  assert(op != nullptr &&
+         "expecting nonnull op for checking cluster sync kernel init");
+  auto module = op;
+  if (!isa<ModuleOp>(module)) {
+    module = op->getParentOfType<ModuleOp>();
+  }
+  assert(module != nullptr && "expecting op nested in a module for checking "
+                              "cluster sync kernel init marker");
+  auto attr = module->getAttrOfType<BoolAttr>(AttrClusterSyncKernelInitName);
+  return attr != nullptr && attr.getValue() == true;
+}
+
+void mlir::triton::tlx::setClusterSyncKernelInitOnMod(Operation *op,
+                                                      bool value) {
+  assert(op != nullptr &&
+         "expecting nonnull op for setting cluster sync kernel init");
+  auto module = op;
+  if (!isa<ModuleOp>(module)) {
+    module = op->getParentOfType<ModuleOp>();
+  }
+  assert(module != nullptr && "expecting op nested in a module for setting "
+                              "cluster sync kernel init marker");
+  module->setAttr(AttrClusterSyncKernelInitName,
+                  BoolAttr::get(module->getContext(), value));
+}
+
+bool mlir::triton::tlx::hasClusterSyncKernelCleanup(Operation *op) {
+  assert(op != nullptr &&
+         "expecting nonnull op for checking cluster sync kernel cleanup");
+  auto module = op;
+  if (!isa<ModuleOp>(module)) {
+    module = op->getParentOfType<ModuleOp>();
+  }
+  assert(module != nullptr && "expecting op nested in a module for checking "
+                              "cluster sync kernel cleanup marker");
+  auto attr = module->getAttrOfType<BoolAttr>(AttrClusterSyncKernelCleanupName);
+  return attr != nullptr && attr.getValue() == true;
+}
+
+void mlir::triton::tlx::setClusterSyncKernelCleanupOnMod(Operation *op,
+                                                         bool value) {
+  assert(op != nullptr &&
+         "expecting nonnull op for setting cluster sync kernel cleanup");
+  auto module = op;
+  if (!isa<ModuleOp>(module)) {
+    module = op->getParentOfType<ModuleOp>();
+  }
+  assert(module != nullptr && "expecting op nested in a module for setting "
+                              "cluster sync kernel cleanup marker");
+  module->setAttr(AttrClusterSyncKernelCleanupName,
+                  BoolAttr::get(module->getContext(), value));
+}
+
 bool mlir::triton::tlx::tlxIsClustered(Operation *op) {
   assert(op != nullptr && "expecting nonnull op for checking cluster dims");
   auto moduleOp = op;
