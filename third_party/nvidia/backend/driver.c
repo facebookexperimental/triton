@@ -1093,8 +1093,8 @@ static void ensureCudaContext() {
 static void _launch(int gridX, int gridY, int gridZ, int num_warps,
                     int num_ctas, int launch_cooperative_grid, int launch_pdl,
                     int preferredClusterDimX, int preferredClusterDimY,
-                    int preferredClusterDimZ, int shared_memory, CUstream stream,
-                    CUfunction function, void **params) {
+                    int preferredClusterDimZ, int shared_memory,
+                    CUstream stream, CUfunction function, void **params) {
   if (gridX * gridY * gridZ > 0) {
     // 5 attributes that we can currently pass maximum
     CUlaunchAttribute launchAttr[5];
@@ -1156,8 +1156,7 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps,
 #if CUDA_VERSION >= 12080
     if (preferredClusterDimX > 0) {
       CUlaunchAttribute preferredClusterAttr = {};
-      preferredClusterAttr.id =
-          CU_LAUNCH_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION;
+      preferredClusterAttr.id = CU_LAUNCH_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION;
       preferredClusterAttr.value.preferredClusterDim.x = preferredClusterDimX;
       preferredClusterAttr.value.preferredClusterDim.y = preferredClusterDimY;
       preferredClusterAttr.value.preferredClusterDim.z = preferredClusterDimZ;
@@ -1317,21 +1316,24 @@ bool extractTmaDesc(void *ptr, PyObject *obj) {
       if (!tma_desc_cpu_ptr_str)
         return false;
     }
-    PyObject *host_ptr_obj = PyObject_CallMethodNoArgs(obj, tma_desc_cpu_ptr_str);
+    PyObject *host_ptr_obj =
+        PyObject_CallMethodNoArgs(obj, tma_desc_cpu_ptr_str);
     if (!host_ptr_obj) {
       // Only replace the error if the method doesn't exist (AttributeError).
       // If the method exists but raised, propagate the real exception.
       if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
         PyErr_Clear();
         PyErr_Format(PyExc_TypeError,
-                     "object must be of type PyCUtensorMap or have tma_desc_cpu_ptr() method, got %s",
+                     "object must be of type PyCUtensorMap or have "
+                     "tma_desc_cpu_ptr() method, got %s",
                      Py_TYPE(obj)->tp_name);
       }
       return false;
     }
     uintptr_t host_ptr = (uintptr_t)PyLong_AsUnsignedLongLong(host_ptr_obj);
     Py_DECREF(host_ptr_obj);
-    if (PyErr_Occurred()) return false;
+    if (PyErr_Occurred())
+      return false;
     if (host_ptr == 0) {
       PyErr_SetString(PyExc_ValueError, "tma_desc_cpu_ptr() returned NULL");
       return false;
@@ -1597,14 +1599,13 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   PyObject *arg_annotations = NULL;
   Py_buffer signature;
   PyObject *kernel_args = NULL;
-  if (!PyArg_ParseTuple(args, "iiiKKpp(iiiiii)OOOOOOy*O", &gridX, &gridY, &gridZ,
-                        &_stream, &_function, &launch_cooperative_grid,
-                        &launch_pdl, &num_warps, &num_ctas, &shared_memory,
-                        &preferredClusterDimX, &preferredClusterDimY,
-                        &preferredClusterDimZ,
-                        &launch_metadata, &launch_enter_hook, &launch_exit_hook,
-                        &global_scratch_obj, &profile_scratch_obj,
-                        &arg_annotations, &signature, &kernel_args)) {
+  if (!PyArg_ParseTuple(
+          args, "iiiKKpp(iiiiii)OOOOOOy*O", &gridX, &gridY, &gridZ, &_stream,
+          &_function, &launch_cooperative_grid, &launch_pdl, &num_warps,
+          &num_ctas, &shared_memory, &preferredClusterDimX,
+          &preferredClusterDimY, &preferredClusterDimZ, &launch_metadata,
+          &launch_enter_hook, &launch_exit_hook, &global_scratch_obj,
+          &profile_scratch_obj, &arg_annotations, &signature, &kernel_args)) {
     return NULL;
   }
 
