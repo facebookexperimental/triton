@@ -373,8 +373,8 @@ def matmul_kernel_tma_persistent_ws_splitk(
             NUM_SMS,
             flatten=FLATTEN,
             warp_specialize=True,
-            SMEM_ALLOC_ALGO=1,
-            SEPARATE_EPILOGUE_STORE=True,
+            smem_alloc_algo=1,
+            separate_epilogue_store=True,
     ):
         split_id = tile_id // num_mn_tiles
         mn_tile_id = tile_id % num_mn_tiles
