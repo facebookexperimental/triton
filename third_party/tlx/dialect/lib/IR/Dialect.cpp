@@ -42,19 +42,6 @@ bool mlir::triton::tlx::tlxEnablePairedMMA(Operation *op) {
   return attr != nullptr && attr.getValue() == true;
 }
 
-bool mlir::triton::tlx::tlxExplicitClusterSync(Operation *op) {
-  assert(op != nullptr &&
-         "expecting nonnull op for checking explicit cluster sync");
-  auto module = op;
-  if (!isa<ModuleOp>(module)) {
-    module = op->getParentOfType<ModuleOp>();
-  }
-  assert(module != nullptr &&
-         "expecting op nested in a module for checking explicit cluster sync");
-  auto attr = module->getAttrOfType<BoolAttr>(AttrTLXExplicitClusterSyncName);
-  return attr != nullptr && attr.getValue() == true;
-}
-
 bool mlir::triton::tlx::hasClusterSyncKernelInit(Operation *op) {
   assert(op != nullptr &&
          "expecting nonnull op for checking cluster sync kernel init");
