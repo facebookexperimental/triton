@@ -41,3 +41,20 @@ bool mlir::triton::tlx::tlxEnablePairedMMA(Operation *op) {
   auto attr = module->getAttrOfType<BoolAttr>(AttrTLXEnablePairedCTAMMAName);
   return attr != nullptr && attr.getValue() == true;
 }
+
+bool mlir::triton::tlx::tlxIsClustered(Operation *op) {
+  assert(op != nullptr && "expecting nonnull op for checking cluster dims");
+  auto moduleOp = op;
+  if (!isa<ModuleOp>(moduleOp)) {
+    moduleOp = op->getParentOfType<ModuleOp>();
+  }
+  assert(moduleOp != nullptr &&
+         "expecting op nested in a module for checking cluster dims");
+  auto mod = cast<ModuleOp>(moduleOp);
+  const SmallVector<int> clusterDims =
+      triton::gpu::TritonGPUDialect::getClusterDims(mod);
+  int clusterSize = 1;
+  for (int d : clusterDims)
+    clusterSize *= d;
+  return clusterSize > 1;
+}
