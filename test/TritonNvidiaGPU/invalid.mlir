@@ -257,24 +257,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 // -----
 
-// Verify: tileMappings must have at least one tile
-#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+// Verify: perTileArgs not divisible by numTiles
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
-  tt.func @subtiled_region_empty_tile_mappings(
-      %bar: !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>,
-      %accum_cnt: i64) {
-    // expected-error @+1 {{tileMappings must have at least one tile}}
+  tt.func @subtiled_region_bad_per_tile_count(%v0: i32, %v1: i32, %v2: i32) {
+    // expected-error @+1 {{perTileArgs has 3 operands which is not divisible by numTiles=2}}
     ttng.subtiled_region
-        barriers(%bar : !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>)
-        accum_cnts(%accum_cnt : i64)
-        tile_mappings = []
-        barrier_annotations = []
-      setup {
-        %c0 = arith.constant 0.0 : f32
-        ttng.subtiled_region_yield %c0 : f32
-      } tile(%arg0: f32) {
-        ttng.subtiled_region_yield
-      } teardown {
+        per_tile(%v0, %v1, %v2 : i32, i32, i32)
+        {numTiles = 2 : i32}
+      tile(%arg0: i32) {
         ttng.subtiled_region_yield
       }
     tt.return
@@ -283,250 +273,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-// Verify: tileMappings inner array length must match tile block args
-#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+// Verify: wrong tile block arg count
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
-  tt.func @subtiled_region_wrong_mapping_length(
-      %bar: !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>,
-      %accum_cnt: i64) {
-    // expected-error @+1 {{tileMappings[0] has 0 entries but tile region has 2 block arguments (expected 2 or 1)}}
+  tt.func @subtiled_region_wrong_tile_args(%v0: i32, %v1: i32) {
+    // expected-error @+1 {{tile region has 3 block arguments but expected 1 or 2}}
     ttng.subtiled_region
-        barriers(%bar : !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>)
-        accum_cnts(%accum_cnt : i64)
-        tile_mappings = [array<i32>]
-        barrier_annotations = []
-      setup {
-        %c0 = arith.constant 0 : i32
-        %c1 = arith.constant 1 : i32
-        ttng.subtiled_region_yield %c0, %c1 : i32, i32
-      } tile(%arg0: i32, %arg1: i32) {
-        ttng.subtiled_region_yield
-      } teardown {
-        ttng.subtiled_region_yield
-      }
-    tt.return
-  }
-}
-
-// -----
-
-// Verify: setup index out of range
-#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
-  tt.func @subtiled_region_index_out_of_range(
-      %bar: !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>,
-      %accum_cnt: i64) {
-    // expected-error @+1 {{tileMappings[0][0] = 5 is out of range [0, 2)}}
-    ttng.subtiled_region
-        barriers(%bar : !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>)
-        accum_cnts(%accum_cnt : i64)
-        tile_mappings = [array<i32: 5>]
-        barrier_annotations = []
-      setup {
-        %c0 = arith.constant 0 : i32
-        %c1 = arith.constant 1 : i32
-        ttng.subtiled_region_yield %c0, %c1 : i32, i32
-      } tile(%arg0: i32) {
-        ttng.subtiled_region_yield
-      } teardown {
-        ttng.subtiled_region_yield
-      }
-    tt.return
-  }
-}
-
-// -----
-
-// Verify: type mismatch between setup output and tile block arg
-#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
-  tt.func @subtiled_region_type_mismatch(
-      %bar: !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>,
-      %accum_cnt: i64) {
-    // expected-error @+1 {{type mismatch: setup output 0 has type 'i32' but tile block arg 0 has type 'f32'}}
-    ttng.subtiled_region
-        barriers(%bar : !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>)
-        accum_cnts(%accum_cnt : i64)
-        tile_mappings = [array<i32: 0>]
-        barrier_annotations = []
-      setup {
-        %c0 = arith.constant 0 : i32
-        ttng.subtiled_region_yield %c0 : i32
-      } tile(%arg0: f32) {
-        ttng.subtiled_region_yield
-      } teardown {
-        ttng.subtiled_region_yield
-      }
-    tt.return
-  }
-}
-
-// -----
-
-// Verify: barrierIdx out of range
-#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
-  tt.func @subtiled_region_barrier_idx_out_of_range(
-      %bar: !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>,
-      %accum_cnt: i64) {
-    // expected-error @+1 {{barrierAnnotations[0] has barrierIdx=3 but there are only 1 barriers}}
-    ttng.subtiled_region
-        barriers(%bar : !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>)
-        accum_cnts(%accum_cnt : i64)
-        tile_mappings = [array<i32: 0>]
-        barrier_annotations = [
-          #ttng.barrier_annotation<barrierIdx = 3, placement = after,
-              targetOpIdx = 0, barrierOpKind = "arrive_barrier">
-        ]
-      setup {
-        %c0 = arith.constant 0 : i32
-        ttng.subtiled_region_yield %c0 : i32
-      } tile(%arg0: i32) {
-        %res = arith.addi %arg0, %arg0 : i32
-        ttng.subtiled_region_yield
-      } teardown {
-        ttng.subtiled_region_yield
-      }
-    tt.return
-  }
-}
-
-// -----
-
-// Verify: wait_barrier without corresponding phase
-#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
-  tt.func @subtiled_region_wait_no_phase(
-      %bar0: !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>,
-      %bar1: !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>,
-      %accum_cnt: i64) {
-    // expected-error @+1 {{barrierAnnotations[0] is a wait_barrier with barrierIdx=1 but there are only 1 accumCnts}}
-    ttng.subtiled_region
-        barriers(%bar0, %bar1 : !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>, !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>)
-        accum_cnts(%accum_cnt : i64)
-        tile_mappings = [array<i32: 0>]
-        barrier_annotations = [
-          #ttng.barrier_annotation<barrierIdx = 1, placement = before,
-              targetOpIdx = 0, barrierOpKind = "wait_barrier">
-        ]
-      setup {
-        %c0 = arith.constant 0 : i32
-        ttng.subtiled_region_yield %c0 : i32
-      } tile(%arg0: i32) {
-        %res = arith.addi %arg0, %arg0 : i32
-        ttng.subtiled_region_yield
-      } teardown {
-        ttng.subtiled_region_yield
-      }
-    tt.return
-  }
-}
-
-// -----
-
-// Verify: unknown barrierOpKind
-#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
-  tt.func @subtiled_region_unknown_barrier_kind(
-      %bar: !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>,
-      %accum_cnt: i64) {
-    // expected-error @+1 {{barrierAnnotations[0] has unknown barrierOpKind 'bogus'}}
-    ttng.subtiled_region
-        barriers(%bar : !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>)
-        accum_cnts(%accum_cnt : i64)
-        tile_mappings = [array<i32: 0>]
-        barrier_annotations = [
-          #ttng.barrier_annotation<barrierIdx = 0, placement = after,
-              targetOpIdx = 0, barrierOpKind = "bogus">
-        ]
-      setup {
-        %c0 = arith.constant 0 : i32
-        ttng.subtiled_region_yield %c0 : i32
-      } tile(%arg0: i32) {
-        %res = arith.addi %arg0, %arg0 : i32
-        ttng.subtiled_region_yield
-      } teardown {
-        ttng.subtiled_region_yield
-      }
-    tt.return
-  }
-}
-
-// -----
-
-// Verify: targetOpIdx out of range
-#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
-  tt.func @subtiled_region_target_op_idx_out_of_range(
-      %bar: !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>,
-      %accum_cnt: i64) {
-    // expected-error @+1 {{barrierAnnotations[0] has targetOpIdx=5 but tile region has only 1 non-terminator ops}}
-    ttng.subtiled_region
-        barriers(%bar : !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>)
-        accum_cnts(%accum_cnt : i64)
-        tile_mappings = [array<i32: 0>]
-        barrier_annotations = [
-          #ttng.barrier_annotation<barrierIdx = 0, placement = after,
-              targetOpIdx = 5, barrierOpKind = "arrive_barrier">
-        ]
-      setup {
-        %c0 = arith.constant 0 : i32
-        ttng.subtiled_region_yield %c0 : i32
-      } tile(%arg0: i32) {
-        %res = arith.addi %arg0, %arg0 : i32
-        ttng.subtiled_region_yield
-      } teardown {
-        ttng.subtiled_region_yield
-      }
-    tt.return
-  }
-}
-
-// -----
-
-// Verify: teardown result count mismatch
-#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
-  tt.func @subtiled_region_teardown_result_mismatch(
-      %bar: !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>,
-      %accum_cnt: i64) {
-    // expected-error @+1 {{teardown yields 1 values but op has 0 results}}
-    ttng.subtiled_region
-        barriers(%bar : !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>)
-        accum_cnts(%accum_cnt : i64)
-        tile_mappings = [array<i32: 0>]
-        barrier_annotations = []
-      setup {
-        %c0 = arith.constant 0 : i32
-        ttng.subtiled_region_yield %c0 : i32
-      } tile(%arg0: i32) {
-        ttng.subtiled_region_yield
-      } teardown {
-        %c42 = arith.constant 42 : i32
-        ttng.subtiled_region_yield %c42 : i32
-      }
-    tt.return
-  }
-}
-
-// -----
-
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
-  tt.func @subtiled_region_interleaved_task_ids() {
-    // expected-error @+1 {{tile body has interleaved async_task_id groups}}
-    ttng.subtiled_region
-        tile_mappings = [array<i32: 0>, array<i32: 1>]
-        barrier_annotations = []
-      setup {
-        %c0 = arith.constant 0 : i32
-        %c1 = arith.constant 1 : i32
-        ttng.subtiled_region_yield %c0, %c1 : i32, i32
-      } tile(%arg0: i32) {
-        %a = arith.index_cast %arg0 {async_task_id = array<i32: 3>} : i32 to index
-        %b = arith.index_cast %arg0 {async_task_id = array<i32: 4>} : i32 to index
-        %c = arith.index_cast %arg0 {async_task_id = array<i32: 3>} : i32 to index
-        ttng.subtiled_region_yield
-      } teardown {
+        per_tile(%v0, %v1 : i32, i32)
+        {numTiles = 2 : i32}
+      tile(%a: i32, %b: i32, %c: i32) {
         ttng.subtiled_region_yield
       }
     tt.return

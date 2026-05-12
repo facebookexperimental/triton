@@ -210,7 +210,7 @@ static void generateYieldCntsForThenBlock(
 static int64_t getAccumCntIncrement(scf::ForOp forOp) {
   int64_t increment = 1;
   forOp.walk([&](triton::nvidia_gpu::SubtiledRegionOp subOp) {
-    unsigned numTiles = subOp.getTileMappings().size();
+    unsigned numTiles = subOp.getNumTiles();
     if (numTiles > static_cast<unsigned>(increment))
       increment = numTiles;
   });

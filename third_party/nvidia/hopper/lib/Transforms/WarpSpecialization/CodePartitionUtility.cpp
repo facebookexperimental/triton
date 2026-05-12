@@ -82,13 +82,11 @@ bool hasLoopCarriedAccToken(Operation *tmemAlloc, scf::ForOp forOp) {
 // After createBufferPost, MemDescIndexOp will be used.
 Operation *skipIdxOp(Operation *op) {
   if (auto idx = dyn_cast<triton::gpu::MemDescIndexOp>(op)) {
-    unsigned numUsers = 0;
     Operation *first = nullptr;
     for (auto *user : idx.getOperation()->getUsers()) {
-      ++numUsers;
-      first = user;
+      if (!first)
+        first = user;
     }
-    assert(numUsers <= 1);
     return first;
   }
   return op;
@@ -99,10 +97,19 @@ Operation *ChannelPost::getSrcOp() {
     Operation *user = skipIdxOp(usr);
     if (!user)
       continue;
-    if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(user))
+    if (isa<ttg::LocalStoreOp>(user))
       return user;
     if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(user))
       return user;
+    // Look through SubtiledRegionOp: if the alloc is passed as an
+    // input, find the local_store in the tile region.
+    if (auto subtiled = dyn_cast<ttng::SubtiledRegionOp>(user)) {
+      Block &tileBlock = subtiled.getTileRegion().front();
+      for (auto &tileOp : tileBlock.without_terminator()) {
+        if (isa<ttg::LocalStoreOp>(&tileOp))
+          return &tileOp;
+      }
+    }
   }
   return nullptr;
 }
@@ -2704,6 +2711,47 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
       } else if (isa<ttg::LocalStoreOp>(user)) {
         assert(producerOp == nullptr);
         producerOp = user;
+      } else if (auto subtiled = dyn_cast<ttng::SubtiledRegionOp>(user)) {
+        // The SMEM buffer is passed as a per-tile or shared arg.
+        // Look inside the tile body for a local_store that uses the
+        // corresponding block arg as destination.
+        bool foundProducer = false;
+        Block &tileBlock = subtiled.getTileRegion().front();
+        Value allocVal = allocOp->getResult(0);
+        // Check per-tile args and shared args for the alloc value.
+        for (auto [idx, arg] : llvm::enumerate(subtiled.getPerTileArgs())) {
+          if (arg != allocVal)
+            continue;
+          unsigned nTiles = subtiled.getNumTiles();
+          unsigned pos = idx / nTiles;
+          BlockArgument tileArg = tileBlock.getArgument(pos);
+          for (auto &tileOp : tileBlock.without_terminator()) {
+            if (auto store = dyn_cast<ttg::LocalStoreOp>(&tileOp)) {
+              if (store.getDst() == tileArg) {
+                if (!producerOp)
+                  producerOp = &tileOp;
+                foundProducer = true;
+              }
+            }
+          }
+        }
+        unsigned numPerTile = subtiled.getNumPerTilePositions();
+        for (auto [idx, arg] : llvm::enumerate(subtiled.getSharedArgs())) {
+          if (arg != allocVal)
+            continue;
+          BlockArgument tileArg = tileBlock.getArgument(numPerTile + idx);
+          for (auto &tileOp : tileBlock.without_terminator()) {
+            if (auto store = dyn_cast<ttg::LocalStoreOp>(&tileOp)) {
+              if (store.getDst() == tileArg) {
+                if (!producerOp)
+                  producerOp = &tileOp;
+                foundProducer = true;
+              }
+            }
+          }
+        }
+        if (!foundProducer)
+          consumers.push_back(user);
       } else
         consumers.push_back(user);
     }
