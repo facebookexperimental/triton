@@ -638,6 +638,8 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_triton_licm(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+            if knobs.compilation.enable_extra_analysis_passes:
+                passes.ttgpuir.add_pipelining_analysis(pm, opt.num_stages)
             if knobs.nvidia.use_meta_ws:
                 nvidia.passes.hopper.add_data_partitioning(pm, 1)
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
@@ -669,6 +671,10 @@ class CUDABackend(BaseBackend):
                 # TRITON_USE_MODULO_SCHEDULE=sms|exhaustive|random
                 nvidia.passes.hopper.add_modulo_schedule(pm)
             nvidia.passes.hopper.add_data_partitioning(pm, 1)
+
+            if knobs.compilation.enable_extra_analysis_passes:
+                passes.ttgpuir.add_pipelining_analysis(pm, opt.num_stages)
+
             # assign_latencies sets tt.latency on loads/MMAs (stage-distance
             # latencies). schedule_loops reads tt.latency AND tt.autows:
             # when MMA ops have tt.autows, scheduleKeyOpsAnnotation places

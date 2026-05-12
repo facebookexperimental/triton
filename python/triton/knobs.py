@@ -370,6 +370,7 @@ class compilation_knobs(base_knobs):
     # We cache the value here to avoid the expensive check on every run.
     instrumentation_mode: str = env_str("TRITON_INSTRUMENTATION_MODE", "").get()
     listener: Union[CompilationListener, None] = None
+    enable_extra_analysis_passes: env_bool = env_bool("TRITON_ENABLE_EXTRA_ANALYSIS_PASSES")
 
 
 class autotuning_knobs(base_knobs):
