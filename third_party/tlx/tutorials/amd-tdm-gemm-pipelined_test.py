@@ -129,11 +129,11 @@ def _single_warp_per_simd_prefetch_unpredicated(
     BLOCK_K: tl.constexpr,
     TRANSPOSE_B: tl.constexpr,
 ):
-    tlx.amd_descriptor_prefetch(a_desc, [off_m, prefetch_iter * BLOCK_K])
+    tlx.amd_descriptor_prefetch_tensor(a_desc, [off_m, prefetch_iter * BLOCK_K])
     if not TRANSPOSE_B:
-        tlx.amd_descriptor_prefetch(b_desc, [prefetch_iter * BLOCK_K, off_n])
+        tlx.amd_descriptor_prefetch_tensor(b_desc, [prefetch_iter * BLOCK_K, off_n])
     else:
-        tlx.amd_descriptor_prefetch(b_desc, [off_n, prefetch_iter * BLOCK_K])
+        tlx.amd_descriptor_prefetch_tensor(b_desc, [off_n, prefetch_iter * BLOCK_K])
 
 
 @triton.jit
@@ -147,11 +147,11 @@ def _single_warp_per_simd_prefetch(
     BLOCK_K: tl.constexpr,
     TRANSPOSE_B: tl.constexpr,
 ):
-    tlx.amd_descriptor_prefetch(a_desc, [off_m, prefetch_iter * BLOCK_K], pred=pred)
+    tlx.amd_descriptor_prefetch_tensor(a_desc, [off_m, prefetch_iter * BLOCK_K], pred=pred)
     if not TRANSPOSE_B:
-        tlx.amd_descriptor_prefetch(b_desc, [prefetch_iter * BLOCK_K, off_n], pred=pred)
+        tlx.amd_descriptor_prefetch_tensor(b_desc, [prefetch_iter * BLOCK_K, off_n], pred=pred)
     else:
-        tlx.amd_descriptor_prefetch(b_desc, [off_n, prefetch_iter * BLOCK_K], pred=pred)
+        tlx.amd_descriptor_prefetch_tensor(b_desc, [off_n, prefetch_iter * BLOCK_K], pred=pred)
 
 
 @triton.jit
@@ -323,7 +323,7 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
     )
 
     a_buf = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), NUM_BUFFERS)
-    c_buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tlx.dtype_of(c_ptr), 1)
+    c_buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tlx.dtype_of(c_ptr), 1, reuse=a_buf)
 
     K_ITERS = tl.cdiv(K, BLOCK_K)
     tl.assume(K_ITERS >= NUM_BUFFERS)

@@ -176,6 +176,7 @@ class HIPBackend(BaseBackend):
 
     def load_dialects(self, ctx):
         amd.load_dialects(ctx)
+        tlx.load_dialects(ctx)
         if HIPBackend.instrumentation:
             HIPBackend.instrumentation.load_dialects(ctx)
 
@@ -310,6 +311,7 @@ class HIPBackend(BaseBackend):
         # tensor local_alloc/local_load pairs. Run TLX propagation after
         # canonicalization so the final cleanup sees and folds those fallbacks.
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
+        tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         if options.instrumentation_mode == "fpsan" and is_fpsan_supported(options.arch):

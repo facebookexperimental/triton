@@ -259,7 +259,8 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
     LayoutEncoding resultLayoutEncoding = resultLattice->getValue();
     if (!resultLayoutEncoding.isUninitialized() &&
         !resultLayoutEncoding.isUnknown()) {
-      auto srcType = cast<ttg::MemDescType>(memDescReshapeOp.getSrc().getType());
+      auto srcType =
+          cast<ttg::MemDescType>(memDescReshapeOp.getSrc().getType());
       auto resultType = cast<ttg::MemDescType>(memDescReshapeOp.getType());
       auto resultTypeWithLayout = ttg::MemDescType::get(
           resultType.getShape(), resultType.getElementType(),
@@ -637,9 +638,8 @@ LogicalResult LayoutForwardPropagation::visitOperation(
     return visitRegion(op);
 
   if (!isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
-           ttg::MemDescSubsliceOp, ttg::MemDescTransOp,
-           ttg::MemDescReshapeOp, ttng::TMEMSubSliceOp, ttg::LocalAllocOp,
-           ttng::TMEMAllocOp>(op))
+           ttg::MemDescSubsliceOp, ttg::MemDescTransOp, ttg::MemDescReshapeOp,
+           ttng::TMEMSubSliceOp, ttg::LocalAllocOp, ttng::TMEMAllocOp>(op))
     return success();
 
   for (const auto [operandIdx, operandLattice] : llvm::enumerate(operands)) {
@@ -677,7 +677,8 @@ LogicalResult LayoutForwardPropagation::visitOperation(
                 op->getContext(), op->getLoc(), srcTyWithLayout,
                 dstTy.getShape(), inferredResultType)))
           return failure();
-        operandLayoutEncoding = LayoutEncoding(inferredResultType.getEncoding());
+        operandLayoutEncoding =
+            LayoutEncoding(inferredResultType.getEncoding());
       }
     }
 
