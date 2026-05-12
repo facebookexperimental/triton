@@ -3,6 +3,8 @@
 
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
+// CHECK: module attributes {
+// CHECK-SAME: tlx.cluster_sync_kernel_init = true
 module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
   // CHECK-LABEL: @tlx_bar_init
   tt.func public @tlx_bar_init() attributes {noinline = false} {
