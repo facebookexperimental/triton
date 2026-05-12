@@ -7,6 +7,8 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
 #include "nvidia/lib/TritonNVIDIAGPUToLLVM/Utility.h"
 #include "tlx/dialect/include/IR/Dialect.h"
@@ -14,6 +16,7 @@
 #include "llvm/Support/ErrorHandling.h"
 
 namespace ttn = mlir::triton::nvgpu;
+namespace ttg = mlir::triton::gpu;
 using ttn::Constraints;
 using ttn::OperandsAndConstraints;
 
@@ -526,11 +529,17 @@ public:
 };
 
 static Value createTMAlloc(IRRewriter &rewriter, LLVM::LLVMFuncOp func,
-                           size_t size, Value pred, bool twoCTAs) {
+                           size_t size, Value pred, bool twoCTAs,
+                           int smemOffset = 0) {
   PTXBuilder ptxBuilder;
   Location loc = func.getLoc();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   Value sharedMem = mlir::LLVM::getStackPointer(rewriter, func);
+  if (smemOffset > 0) {
+    auto ptrTy = sharedMem.getType();
+    sharedMem = LLVM::GEPOp::create(rewriter, loc, ptrTy, i8_ty, sharedMem,
+                                    b.i32_val(smemOffset));
+  }
   std::string ptxString =
       "@$0 tcgen05.alloc.cta_group::" + std::to_string(twoCTAs ? 2 : 1) +
       ".sync.aligned.shared::cta.b32 [$1], " + std::to_string(size) + ";";
@@ -541,6 +550,11 @@ static Value createTMAlloc(IRRewriter &rewriter, LLVM::LLVMFuncOp func,
       /*onlyAttachMLIRArgs=*/true);
   auto voidTy = void_ty(func->getContext());
   ptxBuilder.launch(rewriter, loc, void_ty(func->getContext()));
+  NVVM::FenceProxyOp::create(
+      rewriter, loc, NVVM::ProxyKind::async_shared,
+      NVVM::SharedSpaceAttr::get(func->getContext(),
+                                 twoCTAs ? NVVM::SharedSpace::shared_cluster
+                                         : NVVM::SharedSpace::shared_cta));
   NVVM::Barrier0Op::create(rewriter, loc);
   Value address = b.load(i32_ty, sharedMem);
   NVVM::Barrier0Op::create(rewriter, loc);
@@ -585,7 +599,9 @@ void freeTMAlloc(LLVM::LLVMFuncOp func, Value alloc, size_t size, Value pred,
   });
 }
 
-static Value initTensorMemory(LLVM::LLVMFuncOp func) {
+static Value initTensorMemory(LLVM::LLVMFuncOp func,
+                              Operation *insertionPoint = nullptr,
+                              int smemOffset = 0) {
   auto mod = func->getParentOfType<ModuleOp>();
   assert(mod->hasAttr("ttg.tensor_memory_size"));
   size_t size = cast<IntegerAttr>(mod->getAttr("ttg.tensor_memory_size"))
@@ -594,7 +610,10 @@ static Value initTensorMemory(LLVM::LLVMFuncOp func) {
   if (size == 0)
     return Value();
   IRRewriter rewriter(func.getContext());
-  rewriter.setInsertionPointToStart(&func.front());
+  if (insertionPoint)
+    rewriter.setInsertionPoint(insertionPoint);
+  else
+    rewriter.setInsertionPointToStart(&func.front());
   auto ctx = mod.getContext();
   auto loc = func.getLoc();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -608,10 +627,12 @@ static Value initTensorMemory(LLVM::LLVMFuncOp func) {
   bool isTlxPairedMMA = tlx::tlxEnablePairedMMA(mod);
   bool useTwoCTAs =
       mlir::triton::nvidia_gpu::getModuleTwoCTAs(mod) || isTlxPairedMMA;
+
   // This code is only executed by the default warp group.
   Value threadId = NVVM::ThreadIdXOp::create(rewriter, loc, i32_ty);
   Value pred = b.icmp_ult(threadId, b.i32_val(32));
-  Value alloc = createTMAlloc(rewriter, func, size, pred, useTwoCTAs);
+  Value alloc =
+      createTMAlloc(rewriter, func, size, pred, useTwoCTAs, smemOffset);
   createRelinquishAlloc(rewriter, loc, pred, useTwoCTAs);
   // TODO: pred will have a long liverange, we need to check if this is a
   // problem and how it can be fixed.
@@ -629,11 +650,31 @@ static void lowerTensorMemoryAlloc(ModuleOp mod) {
     assert(kernel == baseOp->getParentOfType<LLVM::LLVMFuncOp>() &&
            "TODO: add support for function calls using tmem.");
   });
-  if (baseOps.empty())
+  // Find TCGen5GlobalAllocOp — it marks where tcgen05.alloc should be inserted.
+  triton::nvidia_gpu::TCGen5GlobalAllocOp tcgen5Alloc;
+  mod.walk([&](triton::nvidia_gpu::TCGen5GlobalAllocOp op) {
+    tcgen5Alloc = op;
+    if (!kernel)
+      kernel = op->getParentOfType<LLVM::LLVMFuncOp>();
+    return WalkResult::interrupt();
+  });
+  if (baseOps.empty() && !tcgen5Alloc)
     return;
   // TODO: Handle cases of matmul used in noinline functions.
   assert(triton::isKernel(kernel));
-  Value newBase = initTensorMemory(kernel);
+
+  Operation *insertionPoint =
+      tcgen5Alloc ? tcgen5Alloc.getOperation() : nullptr;
+  int smemOffset = 0;
+  if (tcgen5Alloc) {
+    if (auto offsetAttr =
+            tcgen5Alloc->getAttrOfType<IntegerAttr>("allocation.offset"))
+      smemOffset = offsetAttr.getInt();
+  }
+  Value newBase = initTensorMemory(kernel, insertionPoint, smemOffset);
+  if (tcgen5Alloc)
+    tcgen5Alloc->erase();
+
   if (!newBase)
     return;
   for (auto baseOp : baseOps) {
