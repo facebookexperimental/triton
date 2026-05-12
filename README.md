@@ -204,6 +204,17 @@ qk_storage_alias.set_buffer_overlap(
                               eviction_policy="evict_first", store_reduce="add")
    ```
 
+- `tlx.fence_mbarrier_init_cluster(scope)` issues a memory fence to make mbarrier init visible to cluster.
+
+  Example:
+  ```python
+  bars = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+  tlx.fence_mbarrier_init_cluster()
+  tlx.cluster_barrier()
+
+  # now bars is ready for cross CTA use
+  tlx.barrier_arrive(bar=bars[0], remote_cta_rank=1)
+  ```
 
 - `tlx.async_remote_shmem_store(dst, src, remote_cta_rank, barrier)`
 
