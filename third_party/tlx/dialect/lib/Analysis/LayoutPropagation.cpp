@@ -477,29 +477,6 @@ static bool isDotLocalAllocFallback(Operation *op, unsigned operandIndex) {
   return true;
 }
 
-// Later layout cleanup may express a dot-operand conversion as
-// tensor -> local_alloc -> local_load(dot). Treat that fallback as another dot
-// layout constraint on the source tensor so propagation can retag the original
-// value instead of preserving the redundant LDS round trip.
-static bool isDotLocalAllocFallback(Operation *op, unsigned operandIndex) {
-  auto allocOp = dyn_cast<ttg::LocalAllocOp>(op);
-  if (!allocOp || operandIndex != 0 || !allocOp.getSrc())
-    return false;
-  if (allocOp->use_empty())
-    return false;
-
-  for (Operation *user : allocOp->getUsers()) {
-    auto localLoadOp = dyn_cast<ttg::LocalLoadOp>(user);
-    if (!localLoadOp)
-      return false;
-    auto resultType = dyn_cast<RankedTensorType>(localLoadOp.getType());
-    if (!resultType ||
-        !isSupportedDotConstraintEncoding(resultType.getEncoding()))
-      return false;
-  }
-  return true;
-}
-
 static bool canRewriteTensorResult(Operation *op) {
   return isa<ttg::LocalLoadOp, RegionBranchOpInterface>(op);
 }
