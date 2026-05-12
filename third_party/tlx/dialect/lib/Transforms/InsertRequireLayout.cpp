@@ -6,7 +6,6 @@
 #include "mlir/Analysis/DataFlow/SparseAnalysis.h"
 #include "mlir/Analysis/DataFlow/Utils.h"
 #include "mlir/Analysis/DataFlowFramework.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "tlx/dialect/include/Analysis/LayoutPropagation.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -271,7 +270,11 @@ static Value findMemDescRoot(Value memdesc) {
     Operation *def = root.getDefiningOp();
     if (!def)
       break;
-    if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp>(def)) {
+    // Treat memdesc views as aliases of the same allocation. This lets TDM
+    // anchors and dot-consumer discovery meet on the full buffer even when
+    // WMMA consumes a sliced or transposed view.
+    if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
+            ttg::MemDescSubsliceOp, ttg::MemDescTransOp>(def)) {
       root = def->getOperand(0);
       continue;
     }
@@ -296,7 +299,10 @@ static bool isFedByTDM(Value memdesc) {
       if (isa<amdgpu::AsyncTDMCopyGlobalToLocalOp,
               amdgpu::AsyncTDMCopyLocalToGlobalOp>(u))
         return true;
-      if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp>(u))
+      // Follow sibling views from the root allocation so local_load(subslice)
+      // and local_load(transpose(subslice)) are recognized as TDM-fed too.
+      if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
+              ttg::MemDescSubsliceOp, ttg::MemDescTransOp>(u))
         worklist.insert(u->getResult(0));
     }
   }
@@ -337,7 +343,7 @@ static void applyRequireLayout(ttg::SwizzledSharedEncodingAttr encoding,
   if (auto type = dyn_cast<ttg::MemDescType>(loadMemDesc.getType())) {
     auto newType = ttg::MemDescType::get(
         type.getShape(), type.getElementType(), mlir::cast<Attribute>(encoding),
-        type.getMemorySpace(), type.getMutableMemory());
+        type.getMemorySpace(), type.getMutableMemory(), type.getAllocShape());
     auto requireOp = tlx::RequireLayoutOp::create(
         builder, localLoadOp->getLoc(), newType, loadMemDesc);
     localLoadOp->setOperand(0, requireOp.getResult());
@@ -516,7 +522,8 @@ public:
     // source memdesc, which lets the alloc converge to the meet of
     // every sibling subview's dot-consumer state.
     if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
-            tlx::RequireLayoutOp>(op)) {
+            ttg::MemDescSubsliceOp, ttg::MemDescTransOp, tlx::RequireLayoutOp>(
+            op)) {
       for (const auto resultLattice : results) {
         for (auto [i, operandLattice] : llvm::enumerate(operands)) {
           if (!isa<ttg::MemDescType>(op->getOpOperand(i).get().getType()))
@@ -630,7 +637,8 @@ static void anchorTDMRequireLayout(TDMOp tdmOp, Value buf,
   builder.setInsertionPoint(tdmOp);
   auto newType = ttg::MemDescType::get(
       bufType.getShape(), bufType.getElementType(), encoding,
-      bufType.getMemorySpace(), bufType.getMutableMemory());
+      bufType.getMemorySpace(), bufType.getMutableMemory(),
+      bufType.getAllocShape());
   auto requireOp =
       tlx::RequireLayoutOp::create(builder, tdmOp.getLoc(), newType, buf);
   operandToRewire.assign(requireOp.getResult());
