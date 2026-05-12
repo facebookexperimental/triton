@@ -352,15 +352,9 @@ private:
   }
 
   // If the kernel is clustered, insert cluster sync properly to
-  // bootstrap remote bars
+  // bootstrap remote bars or tmem
   LogicalResult maybeInsertClusterSync(ModuleOp &mod) {
     if (!tlx::tlxIsClustered(mod)) {
-      return success();
-    }
-
-    // If the kernel is in explicit(manual) cluster sync mode, users will be
-    // responsible for inserting cluster sync correctly from front end.
-    if (tlx::tlxExplicitClusterSync(mod)) {
       return success();
     }
 
@@ -375,8 +369,11 @@ private:
       }
       return WalkResult::advance();
     });
-    // If there's no remote barrier, skipping
-    if (!hasRemoteBar) {
+
+    // If we have remote mbar/SMEM access, or if we have 2cta TMEM allocation,
+    // we need a cluster sync after mbar init and before TMEM alloc
+    bool shouldInsert = hasRemoteBar || tlx::tlxEnablePairedMMA(mod);
+    if (!shouldInsert) {
       return success();
     }
 
@@ -386,8 +383,12 @@ private:
       remoteOrLocalBarInitOps.insert(barInitOp);
     });
 
+    // It's almost impossible for a clustered kernel to not have any mbar but
+    // have 2cta TMEM allocation. We enforce that such that we know it's safe
+    // to insert a cluster sync after the last bar init op, as long as we can
+    // enforce tmem alloc happens after all such mbar init.
     assert(!remoteOrLocalBarInitOps.empty() &&
-           "Failed to find bar init op when we know there's remote bar");
+           "Failed to find bar init op in a clustered kernel");
 
     // Enforcing front end for 2cta kernels:
     // All remote barrier init ops need to happen at the first block of
@@ -426,7 +427,8 @@ private:
     ttng::ClusterArriveOp::create(builder, lastBarInitOp.getLoc(),
                                   /*relaxed*/ false);
     ttng::ClusterWaitOp::create(builder, lastBarInitOp.getLoc());
-
+    // mark mod attr so that WS lowering is aware of this cluster sync point
+    tlx::setClusterSyncKernelInitOnMod(mod, true);
     return success();
   }
 };
