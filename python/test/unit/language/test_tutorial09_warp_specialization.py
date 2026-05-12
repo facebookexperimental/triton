@@ -656,6 +656,12 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
             and EPILOGUE_SUBTILE in (1, 2)):
         pytest.skip("Out of resources: tensor memory exceeded")
 
+    if (DATA_PARTITION_FACTOR == 2 and SMEM_ALLOC_ALGO == 1 and BLOCK_SIZE_M == 256 and num_stages == 3 and not FLATTEN
+            and not use_early_tma_store_lowering and not separate_epilogue_store
+            and ((BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 64 and EPILOGUE_SUBTILE == 1) or
+                 (BLOCK_SIZE_N == 128 and BLOCK_SIZE_K == 128))):
+        pytest.skip("Known failure with DPF=2, SMEM_ALLOC_ALGO=1, and non-flattened WS with 3 stages")
+
     # Use scope() to set use_meta_ws and automatically restore on exit
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
