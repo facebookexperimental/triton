@@ -189,6 +189,57 @@ LogicalResult InvalBarrierOp::verify() {
   return success();
 }
 
+// -- FenceMBarrierInitReleaseClusterOp --
+LogicalResult FenceMBarrierInitReleaseClusterOp::verify() {
+  auto mod = getOperation()->getParentOfType<ModuleOp>();
+  int numCTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);
+  if (numCTAs <= 1){
+    // upstream numCTA is 1, check TLX cluster size
+    const SmallVector<int> tlxClusterDims =
+      triton::gpu::TritonGPUDialect::getClusterDims(getOperation()->getParentOfType<ModuleOp>());
+    int tlxClusterSize = 1;
+    for (int d : tlxClusterDims)
+      tlxClusterSize *= d;
+      if(tlxClusterSize <= 1)
+        return emitOpError("requires ttg.num-ctas > 1 or TLX cluster size > 1");
+  }
+  return success();
+}
+
+// -- ClusterArriveOp --
+LogicalResult ClusterArriveOp::verify() {
+  auto mod = getOperation()->getParentOfType<ModuleOp>();
+  int numCTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);
+  if (numCTAs <= 1){
+    // upstream numCTA is 1, check TLX cluster size
+    const SmallVector<int> tlxClusterDims =
+      triton::gpu::TritonGPUDialect::getClusterDims(getOperation()->getParentOfType<ModuleOp>());
+    int tlxClusterSize = 1;
+    for (int d : tlxClusterDims)
+      tlxClusterSize *= d;
+      if(tlxClusterSize <= 1)
+        return emitOpError("requires ttg.num-ctas > 1 or TLX cluster size > 1");
+  }
+  return success();
+}
+
+// -- ClusterWaitOp --
+LogicalResult ClusterWaitOp::verify() {
+  auto mod = getOperation()->getParentOfType<ModuleOp>();
+  int numCTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);
+  if (numCTAs <= 1){
+    // upstream numCTA is 1, check TLX cluster size
+    const SmallVector<int> tlxClusterDims =
+      triton::gpu::TritonGPUDialect::getClusterDims(getOperation()->getParentOfType<ModuleOp>());
+    int tlxClusterSize = 1;
+    for (int d : tlxClusterDims)
+      tlxClusterSize *= d;
+      if(tlxClusterSize <= 1)
+        return emitOpError("requires ttg.num-ctas > 1 or TLX cluster size > 1");
+  }
+  return success();
+}
+
 // -- BarrierExpectOp --
 LogicalResult BarrierExpectOp::verify() {
   if (failed(verifyBarrierType(*this, getAlloc().getType())))
