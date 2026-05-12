@@ -60,12 +60,12 @@ static void insertSyncBeforeMMA(ttng::TCGen5MMAOp mma, Value barrierAlloc) {
   Value barrierView = triton::createSingleBufferView(builder, barrierAlloc, 0);
 
   // Get CTA rank within the cluster.
-  Value ctaRank = builder.create<nvgpu::ClusterCTAIdOp>(loc, i32Ty);
+  Value ctaRank = nvgpu::ClusterCTAIdOp::create(builder, loc, i32Ty);
 
   // Compute leader CTA rank: leader = ctaRank & ~1 (even-ranked CTA in the
   // pair). For a cluster with dims [2,1,1], CTA 0 is leader for CTAs {0,1}.
-  Value negTwo = builder.create<arith::ConstantIntOp>(loc, -2, 32);
-  Value leaderRank = builder.create<arith::AndIOp>(loc, ctaRank, negTwo);
+  Value negTwo = arith::ConstantIntOp::create(builder, loc, -2, 32);
+  Value leaderRank = arith::AndIOp::create(builder, loc, ctaRank, negTwo);
 
   // Map barrier to leader CTA's shared memory via mapa instruction.
   // The result type uses SharedClusterMemorySpace to indicate it refers
@@ -76,11 +76,11 @@ static void insertSyncBeforeMMA(ttng::TCGen5MMAOp mma, Value barrierAlloc) {
       barrierDescType.getEncoding(),
       ttng::SharedClusterMemorySpaceAttr::get(ctx),
       barrierDescType.getMutableMemory(), barrierDescType.getAllocShape());
-  Value remoteBar = builder.create<ttng::MapToRemoteBufferOp>(
-      loc, remoteBarType, barrierView, leaderRank);
+  Value remoteBar = ttng::MapToRemoteBufferOp::create(
+      builder, loc, remoteBarType, barrierView, leaderRank);
 
   // Both CTAs arrive on leader's barrier (count=1 each, total=2).
-  builder.create<ttng::ArriveBarrierOp>(loc, remoteBar, /*count=*/1u);
+  ttng::ArriveBarrierOp::create(builder, loc, remoteBar, /*count=*/1u);
 
   // Compute phase from loop induction variable.
   // WaitBarrierOp expects I32 for the phase parameter.
@@ -90,35 +90,35 @@ static void insertSyncBeforeMMA(ttng::TCGen5MMAOp mma, Value barrierAlloc) {
     // Division by step ensures correct alternation for non-unit steps.
     Value iv = forOp.getInductionVar();
     Value lb = forOp.getLowerBound();
-    Value offset = builder.create<arith::SubIOp>(loc, iv, lb);
+    Value offset = arith::SubIOp::create(builder, loc, iv, lb);
     Value step = forOp.getStep();
-    Value iterIdx = builder.create<arith::DivUIOp>(loc, offset, step);
+    Value iterIdx = arith::DivUIOp::create(builder, loc, offset, step);
 
     if (iv.getType().isIndex()) {
-      Value twoIV = builder.create<arith::ConstantIndexOp>(loc, 2);
-      Value rem = builder.create<arith::RemUIOp>(loc, iterIdx, twoIV);
-      phase = builder.create<arith::IndexCastOp>(loc, i32Ty, rem);
+      Value twoIV = arith::ConstantIndexOp::create(builder, loc, 2);
+      Value rem = arith::RemUIOp::create(builder, loc, iterIdx, twoIV);
+      phase = arith::IndexCastOp::create(builder, loc, i32Ty, rem);
     } else {
-      Value twoIV = builder.create<arith::ConstantIntOp>(
-          loc, 2, cast<IntegerType>(iv.getType()).getWidth());
-      phase = builder.create<arith::RemUIOp>(loc, iterIdx, twoIV);
+      Value twoIV = arith::ConstantIntOp::create(
+          builder, loc, 2, cast<IntegerType>(iv.getType()).getWidth());
+      phase = arith::RemUIOp::create(builder, loc, iterIdx, twoIV);
     }
   } else {
-    phase = builder.create<arith::ConstantIntOp>(loc, 0, 32);
+    phase = arith::ConstantIntOp::create(builder, loc, 0, 32);
   }
 
   // Only leader CTA waits: pred = (ctaRank % 2 == 0).
-  Value two = builder.create<arith::ConstantIntOp>(loc, 2, 32);
-  Value zero = builder.create<arith::ConstantIntOp>(loc, 0, 32);
-  Value ctaMod2 = builder.create<arith::RemUIOp>(loc, ctaRank, two);
-  Value isLeader = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
-                                                 ctaMod2, zero);
+  Value two = arith::ConstantIntOp::create(builder, loc, 2, 32);
+  Value zero = arith::ConstantIntOp::create(builder, loc, 0, 32);
+  Value ctaMod2 = arith::RemUIOp::create(builder, loc, ctaRank, two);
+  Value isLeader = arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::eq,
+                                         ctaMod2, zero);
 
   // Leader waits on LOCAL barrier (not the remote-mapped one).
   // PTX mbarrier.try_wait only supports .shared (local), not .shared::cluster.
   // The local barrier IS the leader's barrier — both CTAs arrived on it via
   // the remote mapping, so the leader can wait on it locally.
-  builder.create<ttng::WaitBarrierOp>(loc, barrierView, phase, isLeader);
+  ttng::WaitBarrierOp::create(builder, loc, barrierView, phase, isLeader);
 
   LDBG("Inserted cross-CTA sync before MMA at " << loc);
 }

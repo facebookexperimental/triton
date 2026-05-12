@@ -180,16 +180,16 @@ struct Transform2CTALoads
     Location loc = descLoad.getLoc();
     auto i32Ty = builder.getI32Type();
 
-    Value ctaRank = builder.create<nvgpu::ClusterCTAIdOp>(loc, i32Ty);
-    Value two = builder.create<arith::ConstantIntOp>(loc, 2, 32);
-    Value ctaMod2 = builder.create<arith::RemSIOp>(loc, ctaRank, two);
-    Value halfNVal = builder.create<arith::ConstantIntOp>(loc, halfN, 32);
-    Value offset = builder.create<arith::MulIOp>(loc, ctaMod2, halfNVal);
+    Value ctaRank = nvgpu::ClusterCTAIdOp::create(builder, loc, i32Ty);
+    Value two = arith::ConstantIntOp::create(builder, loc, 2, 32);
+    Value ctaMod2 = arith::RemSIOp::create(builder, loc, ctaRank, two);
+    Value halfNVal = arith::ConstantIntOp::create(builder, loc, halfN, 32);
+    Value offset = arith::MulIOp::create(builder, loc, ctaMod2, halfNVal);
 
     // New N-dimension index = original + CTA offset.
     SmallVector<Value> newIndices(descLoad.getIndices());
     newIndices.back() =
-        builder.create<arith::AddIOp>(loc, newIndices.back(), offset);
+        arith::AddIOp::create(builder, loc, newIndices.back(), offset);
 
     // --- Step 3: Create new DescriptorLoadOp with half-width result ---
     auto origResultType =
@@ -200,8 +200,8 @@ struct Transform2CTALoads
     auto halfResultType =
         RankedTensorType::get({blockK, halfN}, elemType, newEncoding);
 
-    auto newDescLoad = builder.create<tt::DescriptorLoadOp>(
-        loc, halfResultType, newMakeDesc.getResult(), newIndices);
+    auto newDescLoad = tt::DescriptorLoadOp::create(
+        builder, loc, halfResultType, newMakeDesc.getResult(), newIndices);
     // Mark as a 2-CTA B-operand load so WS passes can identify it
     // without complex value tracing through pipeline buffers.
     newDescLoad->setAttr("two_cta_b", builder.getUnitAttr());
@@ -215,8 +215,8 @@ struct Transform2CTALoads
         origMemDescType.getMemorySpace(), origMemDescType.getMutableMemory());
 
     builder.setInsertionPoint(localAlloc);
-    auto newLocalAlloc = builder.create<ttg::LocalAllocOp>(
-        localAlloc.getLoc(), newMemDescType, newDescLoad.getResult());
+    auto newLocalAlloc = ttg::LocalAllocOp::create(
+        builder, localAlloc.getLoc(), newMemDescType, newDescLoad.getResult());
 
     // --- Step 5: Replace uses and clean up ---
     localAlloc.getResult().replaceAllUsesWith(newLocalAlloc.getResult());

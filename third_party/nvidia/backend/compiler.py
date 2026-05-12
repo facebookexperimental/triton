@@ -18,7 +18,6 @@ from triton.runtime.errors import PTXASError
 
 
 def min_dot_size(target: GPUTarget):
-
     def check_dot_compatibility(lhs_type, rhs_type) -> Tuple[int, int, int]:  # [m, n, k]
         lhs_bitwidth = lhs_type.scalar.primitive_bitwidth
         rhs_bitwidth = rhs_type.scalar.primitive_bitwidth
@@ -47,11 +46,11 @@ def get_ptxas_version(arch: int = 80):
 
 @functools.lru_cache()
 def ptx_get_version(cuda_version) -> int:
-    '''
+    """
     Get the highest PTX version supported by the current CUDA driver.
-    '''
+    """
     assert isinstance(cuda_version, str)
-    major, minor = map(int, cuda_version.split('.'))
+    major, minor = map(int, cuda_version.split("."))
     if major == 12:
         if minor < 6:
             return 80 + minor
@@ -87,7 +86,7 @@ def get_features(options, arch: int):
     # and run a test.  If it's not supported, LLVM will print a warning
     # like "+ptx8.4 is not a recognized feature for this target".
     llvm_ptx_version = min(86, ptx_version)
-    features = f'+ptx{llvm_ptx_version}'
+    features = f"+ptx{llvm_ptx_version}"
     return features
 
 
@@ -111,6 +110,7 @@ def _max_shared_mem_for_capability(capability: int) -> int:
     """
     try:
         from triton.runtime.driver import driver as rt_driver
+
         return rt_driver.active.utils.get_device_properties(rt_driver.active.get_current_device())["max_shared_mem"]
     except (RuntimeError, Exception):
         pass
@@ -162,11 +162,11 @@ class CUDAOptions:
     supported_fp8_dtypes: Tuple[str] = ("fp8e5", "fp8e4b15")
     deprecated_fp8_dot_operand_dtypes: Tuple[str] = ()
     default_dot_input_precision: str = "tf32"
-    allowed_dot_input_precisions: Tuple[str] = ("tf32", "tf32x3", "ieee", 'bf16x3', 'bf16x6')
+    allowed_dot_input_precisions: Tuple[str] = ("tf32", "tf32x3", "ieee", "bf16x3", "bf16x6")
     max_num_imprecise_acc_default: bool = None
     extern_libs: dict = None
     debug: bool = False
-    backend_name: str = 'cuda'
+    backend_name: str = "cuda"
     sanitize_overflow: bool = False
     arch: str = None
     instrumentation_mode: str = ""
@@ -174,14 +174,13 @@ class CUDAOptions:
     generate_subtiled_region: bool = False
 
     def __post_init__(self):
-        default_libdir = Path(__file__).parent / 'lib'
+        default_libdir = Path(__file__).parent / "lib"
         extern_libs = {} if self.extern_libs is None else dict(self.extern_libs)
-        if not extern_libs.get('libdevice', None):
-            extern_libs['libdevice'] = knobs.nvidia.libdevice_path or str(default_libdir / 'libdevice.10.bc')
+        if not extern_libs.get("libdevice", None):
+            extern_libs["libdevice"] = knobs.nvidia.libdevice_path or str(default_libdir / "libdevice.10.bc")
 
-        object.__setattr__(self, 'extern_libs', tuple(extern_libs.items()))
-        assert self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0, \
-            "num_warps must be a power of 2"
+        object.__setattr__(self, "extern_libs", tuple(extern_libs.items()))
+        assert self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0, "num_warps must be a power of 2"
 
         # If ctas_per_cga is set, it overrides cluster_dims with CUDA semantics:
         # ctas_per_cga defines the cluster shape for regrouping grid CTAs.
@@ -191,7 +190,8 @@ class CUDAOptions:
             # Ensure cluster_dims is all 1s to prevent conflicting cluster specifications.
             assert self.cluster_dims == (1, 1, 1) or self.cluster_dims == self.ctas_per_cga, (
                 f"When using ctas_per_cga, cluster_dims must be default (1,1,1) or match ctas_per_cga to avoid conflicting "
-                f"cluster specifications. Got cluster_dims={self.cluster_dims}")
+                f"cluster specifications. Got cluster_dims={self.cluster_dims}"
+            )
 
             object.__setattr__(self, "cluster_dims", self.ctas_per_cga)
             object.__setattr__(self, "num_ctas", 1)
@@ -212,7 +212,7 @@ class CUDABackend(BaseBackend):
 
     @staticmethod
     def supports_target(target: GPUTarget):
-        return target.backend == 'cuda'
+        return target.backend == "cuda"
 
     def _parse_arch(self, arch):
         pattern = r"^sm(\d+)$"
@@ -235,18 +235,23 @@ class CUDABackend(BaseBackend):
             opts["debug"] = True
             opts["sanitize_overflow"] = False
 
-        args = {'arch': knobs.runtime.override_arch or f"sm{self.target.arch}"}
+        args = {"arch": knobs.runtime.override_arch or f"sm{self.target.arch}"}
         args.update({k: opts[k] for k in CUDAOptions.__dataclass_fields__.keys() if k in opts if opts[k] is not None})
         capability = int(self._parse_arch(args["arch"]))
 
         if args.get("num_ctas", 1) > 1 and capability < 90:
-            raise ValueError((f"num_ctas > 1 requires NVIDIA SM90+ (Hopper). "
-                              f"Current target is sm_{capability}. This configuration will fail. "
-                              f"Please set num_ctas=1 or target an SM90+ GPU."))
+            raise ValueError(
+                (
+                    f"num_ctas > 1 requires NVIDIA SM90+ (Hopper). "
+                    f"Current target is sm_{capability}. This configuration will fail. "
+                    f"Please set num_ctas=1 or target an SM90+ GPU."
+                )
+            )
 
         if args.get("preferred_ctas_per_cga") is not None and capability < 100:
-            raise ValueError((f"preferred_ctas_per_cga requires NVIDIA SM100+ (Blackwell). "
-                              f"Current target is sm_{capability}."))
+            raise ValueError(
+                (f"preferred_ctas_per_cga requires NVIDIA SM100+ (Blackwell). Current target is sm_{capability}.")
+            )
 
         if "supported_fp8_dtypes" not in args:
             supported_fp8_dtypes = set(CUDAOptions.supported_fp8_dtypes)
@@ -256,7 +261,7 @@ class CUDABackend(BaseBackend):
 
         if "deprecated_fp8_dot_operand_dtypes" not in args:
             if capability >= 90:
-                args["deprecated_fp8_dot_operand_dtypes"] = ("fp8e4b15", )
+                args["deprecated_fp8_dot_operand_dtypes"] = ("fp8e4b15",)
 
         if "enable_fp_fusion" not in args:
             args["enable_fp_fusion"] = knobs.language.default_fp_fusion
@@ -304,13 +309,13 @@ class CUDABackend(BaseBackend):
         for k in constants:
             if isinstance(k, str):
                 if hasattr(src, "fn"):
-                    constant_keys.add((src.fn.arg_names.index(k), ))
+                    constant_keys.add((src.fn.arg_names.index(k),))
                 else:
-                    constant_keys.add((k, ))
+                    constant_keys.add((k,))
             elif isinstance(k, tuple):
                 constant_keys.add(k)
             else:
-                constant_keys.add((k, ))
+                constant_keys.add((k,))
 
         attrs = getattr(src, "attrs", {})
         arg_names = src.fn.arg_names if hasattr(src, "fn") else None
@@ -318,14 +323,14 @@ class CUDABackend(BaseBackend):
         args = []
         for idx, (key, ty) in enumerate(src.signature.items()):
             # Skip compile-time constants — they go in the "constants" dict.
-            if (idx, ) in constant_keys:
+            if (idx,) in constant_keys:
                 continue
 
             name = key if isinstance(key, str) else (arg_names[idx] if arg_names and idx < len(arg_names) else str(idx))
             arg_entry = {"name": name, "type": str(ty), "index": idx}
 
             # Check for tt.divisibility attribute.
-            attr_specs = attrs.get((idx, ), [])
+            attr_specs = attrs.get((idx,), [])
             for attr_name, attr_val in attr_specs:
                 if attr_name == "tt.divisibility":
                     arg_entry["divisible_by"] = attr_val
@@ -423,8 +428,10 @@ class CUDABackend(BaseBackend):
             if c_ty is None:
                 # Unknown type — skip launcher generation so compilation
                 # isn't blocked by types we haven't mapped yet.
-                warnings.warn(f"Unknown Triton type '{triton_ty}' in launcher codegen, "
-                              f"skipping launcher generation. Add it to _TYPE_TO_C in make_launcher_src().")
+                warnings.warn(
+                    f"Unknown Triton type '{triton_ty}' in launcher codegen, "
+                    f"skipping launcher generation. Add it to _TYPE_TO_C in make_launcher_src()."
+                )
                 return None
             return c_ty
 
@@ -464,8 +471,7 @@ class CUDABackend(BaseBackend):
         lines.append(f" * Launch {kernel_name}.")
         lines.append(" *")
         lines.append(" * Compile-time constants baked in:")
-        lines.append(f" *   num_warps={num_warps}, num_ctas={num_ctas}, "
-                     f"shared_mem={shared_mem}")
+        lines.append(f" *   num_warps={num_warps}, num_ctas={num_ctas}, shared_mem={shared_mem}")
         lines.append(f" *   cluster_dims=[{cluster_dims[0]},{cluster_dims[1]},{cluster_dims[2]}]")
         lines.append(f" *   launch_pdl={launch_pdl}, cooperative={launch_coop}")
         if global_scratch_size > 0:
@@ -532,16 +538,19 @@ class CUDABackend(BaseBackend):
 
     def get_codegen_implementation(self, options):
         import triton.language.extra.cuda as cuda
+
         capability = int(self._parse_arch(options.arch))
         codegen_fns = {
-            "convert_custom_types":
-            cuda.convert_custom_float8_sm80 if capability >= 80 else cuda.convert_custom_float8_sm70, "min_dot_size":
-            min_dot_size(self.target)
+            "convert_custom_types": cuda.convert_custom_float8_sm80
+            if capability >= 80
+            else cuda.convert_custom_float8_sm70,
+            "min_dot_size": min_dot_size(self.target),
         }
         return codegen_fns
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         from triton.language.extra.cuda import libdevice
+
         return {"triton.language.extra.libdevice": libdevice}
 
     def load_dialects(self, ctx):
@@ -555,13 +564,15 @@ class CUDABackend(BaseBackend):
         cuda_warnings = mod.get_cuda_warnings(capability)
         for warning_msg in cuda_warnings:
             import warnings
+
             warnings.warn(warning_msg, stacklevel=2)
 
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         # Pass cluster_dims as a list
-        tlx.tlx_passes.add_triton_tlx_fixup(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas,
-                                            list(opt.cluster_dims))
+        tlx.tlx_passes.add_triton_tlx_fixup(
+            pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas, list(opt.cluster_dims)
+        )
         passes.common.add_inliner(pm)
         # Handle storage lowering. In the future this may need
         # dummy layouts
@@ -576,7 +587,7 @@ class CUDABackend(BaseBackend):
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)
-        pm.run(mod, 'make_ttir')
+        pm.run(mod, "make_ttir")
         return mod
 
     @staticmethod
@@ -613,7 +624,7 @@ class CUDABackend(BaseBackend):
             )
         pm = ir.pass_manager(mod.context)
         dump_enabled = pm.enable_debug()
-        emuTF32 = (capability // 10 >= 8)
+        emuTF32 = capability // 10 >= 8
         passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
@@ -631,8 +642,12 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         # 2-CTA: Split B descriptor loads before optimize_descriptor_encoding
         # so the cloned half-width descriptor gets its encoding set properly.
-        if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
-                and opt.ctas_per_cga is not None):
+        if (
+            capability // 10 >= 10
+            and opt.cluster_dims is not None
+            and max(opt.cluster_dims) >= 2
+            and opt.ctas_per_cga is not None
+        ):
             nvidia.passes.hopper.add_2cta_transform_loads(pm)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
         passes.ttir.add_loop_aware_cse(pm)
@@ -652,8 +667,9 @@ class CUDABackend(BaseBackend):
                 nvidia.passes.hopper.add_partition_scheduling_meta(pm)
             smem_budget = _max_shared_mem_for_capability(capability)
             generate_subtiled = opt.generate_subtiled_region or knobs.nvidia.generate_subtiled_region
-            nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled,
-                                                     smem_budget, generate_subtiled)
+            nvidia.passes.hopper.add_hopper_warpspec(
+                pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled, smem_budget, generate_subtiled
+            )
             if not knobs.nvidia.use_meta_ws:
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
                 passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
@@ -685,15 +701,18 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
             passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
             if not knobs.nvidia.use_meta_ws:
-                passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
+                # 2-CTA + upstream WS is not supported
+                if opt.cluster_dims is None or max(opt.cluster_dims) < 2:
+                    passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
             else:
                 # use Meta's WS internally which supports both hopper and blackwell
                 nvidia.passes.hopper.add_tma_store_lowering(pm)
                 nvidia.passes.hopper.add_partition_scheduling_meta(pm)
                 smem_budget = _max_shared_mem_for_capability(capability)
                 generate_subtiled = opt.generate_subtiled_region or knobs.nvidia.generate_subtiled_region
-                nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS,
-                                                         dump_enabled, smem_budget, generate_subtiled)
+                nvidia.passes.hopper.add_hopper_warpspec(
+                    pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled, smem_budget, generate_subtiled
+                )
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_optimize_partition_warps(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
@@ -707,7 +726,7 @@ class CUDABackend(BaseBackend):
             # getThreadId() returns relative IDs inside WarpSpecializeOp
             # partition regions, so InitBarrierOp and ArriveBarrierOp work
             # correctly in the consumer warp group.
-            if (opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and knobs.nvidia.use_meta_ws):
+            if opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and knobs.nvidia.use_meta_ws:
                 nvidia.passes.hopper.add_insert_2cta_sync(pm)
         else:
             passes.ttir.add_triton_licm(pm)
@@ -745,13 +764,14 @@ class CUDABackend(BaseBackend):
         # after all other passes that may introduce layout conversions.
         passes.ttgpuir.add_remove_layout_conversions(pm, smem_budget)
 
-        pm.run(mod, 'make_ttgir')
+        pm.run(mod, "make_ttgir")
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         # Track whether ctas_per_cga was explicitly set to distinguish between
         # Triton's way (num_ctas > 1) and TLX/CUDA way (ctas_per_cga set).
         metadata["ctas_per_cga"] = opt.ctas_per_cga
-        metadata["preferred_ctas_per_cga"] = tuple(
-            opt.preferred_ctas_per_cga) if opt.preferred_ctas_per_cga is not None else None
+        metadata["preferred_ctas_per_cga"] = (
+            tuple(opt.preferred_ctas_per_cga) if opt.preferred_ctas_per_cga is not None else None
+        )
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
 
@@ -770,7 +790,7 @@ class CUDABackend(BaseBackend):
         passes.gluon.add_canonicalizer(pm)
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
 
-        pm.run(mod, 'gluon_to_ttgir')
+        pm.run(mod, "gluon_to_ttgir")
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
 
@@ -800,6 +820,7 @@ class CUDABackend(BaseBackend):
         tlx_capture_file = None
         if knobs.nvidia.dump_tlx_benchmark:
             from triton.tools.tlx_benchmark_gen import setup_tlx_dump
+
             tlx_dump_dir, tlx_saved_fd, tlx_capture_file = setup_tlx_dump(pm, tlx.tlx_passes)
         elif knobs.nvidia.dump_ttgir_to_tlx:
             tlx.tlx_passes.add_tlx_print_ttgir_to_tlx(pm)
@@ -823,11 +844,12 @@ class CUDABackend(BaseBackend):
         if CUDABackend.instrumentation:
             CUDABackend.instrumentation.patch("llvmir_to_llvm", pm, mod.context)
 
-        pm.run(mod, 'make_llir')
+        pm.run(mod, "make_llir")
 
         # After pm.run(), restore stdout and generate TLX benchmark artifacts
         if tlx_dump_dir is not None:
             from triton.tools.tlx_benchmark_gen import finalize_tlx_dump
+
             finalize_tlx_dump(tlx_dump_dir, tlx_saved_fd, tlx_capture_file, metadata)
 
         if knobs.compilation.dump_ir_extract_di_local_variables:
@@ -836,7 +858,7 @@ class CUDABackend(BaseBackend):
                 pm = ir.pass_manager(mod.context)
                 pm.enable_debug()
                 passes.llvmir.add_di_scope(pm)
-                pm.run(mod, 'make_llir.disable_line_info')
+                pm.run(mod, "make_llir.disable_line_info")
 
             # insert dbg intrinsic with several DI Attribute including source
             # var name and type info note: unknown reason for now, but this
@@ -846,18 +868,19 @@ class CUDABackend(BaseBackend):
             pm = ir.pass_manager(mod.context)
             pm.enable_debug()
             passes.llvmir.add_di_local_variable(pm)
-            pm.run(mod, 'make_llir.dump_ir_extract_di_local_variables')
+            pm.run(mod, "make_llir.dump_ir_extract_di_local_variables")
 
         # LLVM-IR (MLIR) -> LLVM-IR (LLVM)
         llvm.init_targets()
         context = llvm.context()
         if knobs.compilation.enable_asan:
             raise RuntimeError(
-                "Address Sanitizer Error: Address sanitizer is currently only supported on the AMD backend")
+                "Address Sanitizer Error: Address sanitizer is currently only supported on the AMD backend"
+            )
         llvm_mod = llvm.to_module(mod, context)
         proc = sm_arch_from_capability(capability)
         features = get_features(options, self.target.arch)
-        triple = 'nvptx64-nvidia-cuda'
+        triple = "nvptx64-nvidia-cuda"
         nvidia.set_short_ptr()
         llvm.attach_datalayout(llvm_mod, triple, proc, features)
         if options.enable_reflect_ftz:
@@ -888,7 +911,7 @@ class CUDABackend(BaseBackend):
     def make_ptx(self, src, metadata, opt, capability):
         ptx_version = get_ptx_version_from_options(opt, self.target.arch)
 
-        triple = 'nvptx64-nvidia-cuda'
+        triple = "nvptx64-nvidia-cuda"
         proc = sm_arch_from_capability(capability)
         features = get_features(opt, self.target.arch)
         flags = ["nvptx-mad-wide-opt"]
@@ -898,9 +921,9 @@ class CUDABackend(BaseBackend):
         assert len(names) == 1
         metadata["name"] = names[0]
         # post-process
-        ptx_version = f'{ptx_version//10}.{ptx_version%10}'
-        ret = re.sub(r'\.version \d+\.\d+', f'.version {ptx_version}', ret, flags=re.MULTILINE)
-        ret = re.sub(r'\.target sm_\d+', f'.target sm_{capability}', ret, flags=re.MULTILINE)
+        ptx_version = f"{ptx_version // 10}.{ptx_version % 10}"
+        ret = re.sub(r"\.version \d+\.\d+", f".version {ptx_version}", ret, flags=re.MULTILINE)
+        ret = re.sub(r"\.target sm_\d+", f".target sm_{capability}", ret, flags=re.MULTILINE)
         if not knobs.compilation.dump_ir_extract_di_local_variables:
             # Remove the debug flag that prevents ptxas from optimizing the code
             # Note: if this flag is removed, the source var name and type info will be lost when ptx was compiled into cubin
@@ -913,11 +936,13 @@ class CUDABackend(BaseBackend):
 
     def make_cubin(self, src, metadata, opt, capability):
         ptxas = get_ptxas(self.target.arch).path
-        with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.ptx') as fsrc, \
-                tempfile.NamedTemporaryFile(delete=False, mode='r', suffix='.log') as flog:
+        with (
+            tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".ptx") as fsrc,
+            tempfile.NamedTemporaryFile(delete=False, mode="r", suffix=".log") as flog,
+        ):
             fsrc.write(src)
             fsrc.flush()
-            fbin = fsrc.name + '.o'
+            fbin = fsrc.name + ".o"
 
             debug_info = []
             if knobs.compilation.disable_line_info:
@@ -934,17 +959,26 @@ class CUDABackend(BaseBackend):
             arch = sm_arch_from_capability(capability)
 
             # Disable ptxas optimizations if requested
-            disable_opt = ['--opt-level', '0'] if knobs.nvidia.disable_ptxas_opt else []
+            disable_opt = ["--opt-level", "0"] if knobs.nvidia.disable_ptxas_opt else []
 
             # Accept more ptxas options if provided
             ptx_extra_options = opt.ptx_options.split(" ") if opt.ptx_options else []
 
             # Add --regAllocOptLevel=2 to work around ptxas 13.x bug
-            reg_alloc = ['--regAllocOptLevel=2']
+            reg_alloc = ["--regAllocOptLevel=2"]
 
             ptxas_cmd = [
-                ptxas, *debug_info, *fmad, '-v', *disable_opt, *reg_alloc, *ptx_extra_options, f'--gpu-name={arch}',
-                fsrc.name, '-o', fbin
+                ptxas,
+                *debug_info,
+                *fmad,
+                "-v",
+                *disable_opt,
+                *reg_alloc,
+                *ptx_extra_options,
+                f"--gpu-name={arch}",
+                fsrc.name,
+                "-o",
+                fbin,
             ]
             try:
                 subprocess.run(ptxas_cmd, check=True, close_fds=False, stderr=flog)
@@ -963,15 +997,13 @@ class CUDABackend(BaseBackend):
                     os.remove(flog.name)
 
                 if e.returncode == 255:
-                    error = 'Internal Triton PTX codegen error'
+                    error = "Internal Triton PTX codegen error"
                 elif e.returncode == 128 + signal.SIGSEGV:
-                    error = '`ptxas` raised SIGSEGV'
+                    error = "`ptxas` raised SIGSEGV"
                 else:
-                    error = f'`ptxas` failed with error code {e.returncode}'
+                    error = f"`ptxas` failed with error code {e.returncode}"
 
-                error = (f"{error}\n"
-                         f"`ptxas` stderr:\n{log}\n"
-                         f'Repro command: {" ".join(ptxas_cmd)}\n')
+                error = f"{error}\n`ptxas` stderr:\n{log}\nRepro command: {' '.join(ptxas_cmd)}\n"
 
                 print(f"""
 
@@ -984,7 +1016,7 @@ please share the reproducer above with Triton project.
 """)
                 raise PTXASError(error)
 
-            with open(fbin, 'rb') as f:
+            with open(fbin, "rb") as f:
                 cubin = f.read()
             if os.path.exists(fbin):
                 os.remove(fbin)
@@ -1006,4 +1038,4 @@ please share the reproducer above with Triton project.
     @functools.lru_cache()
     def hash(self):
         version = get_ptxas_version(self.target.arch)
-        return f'{version}-{self.target.arch}'
+        return f"{version}-{self.target.arch}"
