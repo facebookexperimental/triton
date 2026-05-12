@@ -194,3 +194,35 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
     tt.return
   }
 }
+
+// -----
+
+// Test that Fixup sets tlx.explicit_cluster_sync when ClusterArriveOp is present.
+// At Fixup time, cluster arrive/wait ops can only come from user frontend code.
+// CHECK: module attributes {
+// CHECK-SAME: tlx.explicit_cluster_sync = true
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  tt.func public @explicit_cluster_sync_arrive() attributes {noinline = false} {
+    ttng.cluster_arrive {relaxed = true}
+    ttng.cluster_wait
+    tt.return
+  }
+}
+
+// -----
+
+// Test that Fixup does NOT set tlx.explicit_cluster_sync when no cluster
+// arrive/wait ops are present.
+// CHECK: module attributes {
+// CHECK-NOT: tlx.explicit_cluster_sync
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  tt.func public @no_explicit_cluster_sync() attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return
+  }
+}
