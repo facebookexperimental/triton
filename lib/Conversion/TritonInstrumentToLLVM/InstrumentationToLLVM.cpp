@@ -116,7 +116,8 @@ createIfBlock(ConversionPatternRewriter &b, Location loc, Value cnd) {
 Value createMaxReduce(OpBuilder &b, Location loc, Value tensor, int axis) {
   OpBuilder::InsertionGuard guard(b);
   auto tensorType = cast<RankedTensorType>(tensor.getType());
-  auto reduceOp = b.create<tt::ReduceOp>(loc, std::vector<Value>{tensor}, axis);
+  auto reduceOp = b.create<tt::ReduceOp>(loc, std::vector<Value>{tensor}, axis,
+                                          /*reduction_ordering=*/StringAttr{});
   auto &region = reduceOp.getRegion();
   auto &block = region.emplaceBlock();
   block.addArguments({tensorType.getElementType(), tensorType.getElementType()},
