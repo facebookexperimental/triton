@@ -229,18 +229,6 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
           return failure();
         srcEncoding = *inferred;
       }
-      if (!srcEncoding) {
-        // Generic shared encodings, especially padded TDM layouts, need the
-        // inverse transpose to push a result-side requirement back to the
-        // source memdesc.
-        auto resultType = cast<ttg::MemDescType>(memDescTransOp.getType());
-        auto inverseOrder = invertPermutation(memDescTransOp.getOrder());
-        FailureOr<Attribute> inferred = inferTransEncoding(
-            resultEnc, resultType.getShape(), inverseOrder, op->getLoc());
-        if (failed(inferred))
-          return failure();
-        srcEncoding = *inferred;
-      }
       if (srcEncoding) {
         const auto updatedResultLayoutEncoding = LayoutEncoding(srcEncoding);
         auto operandLattice = operands[0];

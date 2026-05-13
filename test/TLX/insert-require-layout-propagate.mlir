@@ -380,3 +380,35 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     tt.return %dot : tensor<32x32xf32, #mma_8>
   }
 }
+
+// -----
+// Test 10: AMD TDM full-tile load with a memdesc_reshape view feeding dot.
+// The insert+propagate pipeline should:
+//   * discover the dot consumer through memdesc_reshape,
+//   * propagate the WMMA-tuned padded encoding to the full local_alloc,
+//   * retag the reshape result using MemDescReshapeOp inference,
+//   * remove explicit tlx.require_layout ops.
+
+#mma_9 = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 32]}>
+#shared_9 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+// CHECK-DAG: #[[$PADDED_RESHAPE:.*]] = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}>
+#smem_9 = #ttg.shared_memory
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tdm_full_tile_reshape_dot
+  tt.func public @tdm_full_tile_reshape_dot(%desc: !tt.tensordesc<128x32xf16>, %m: i32, %k: i32, %p: i32)
+      -> tensor<32x128xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_9, kWidth = 8}>> {
+    %c0 = arith.constant 0 : i32
+    // CHECK: %[[ALLOC:.*]] = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #[[$PADDED_RESHAPE]], #smem, mutable>
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #shared_9, #smem_9, mutable>
+    // CHECK: %[[BUF:.*]] = ttg.memdesc_index %[[ALLOC]][%{{.*}}] : !ttg.memdesc<2x128x32xf16, #[[$PADDED_RESHAPE]], #smem, mutable> -> !ttg.memdesc<128x32xf16, #[[$PADDED_RESHAPE]], #smem, mutable>
+    %buf = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x128x32xf16, #shared_9, #smem_9, mutable> -> !ttg.memdesc<128x32xf16, #shared_9, #smem_9, mutable>
+    // CHECK: amdg.async_tdm_copy_global_to_local %{{.*}} into %[[BUF]]
+    %tok = amdg.async_tdm_copy_global_to_local %desc[%m, %k] into %buf, pred = %p : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #shared_9, #smem_9, mutable>
+    // CHECK: %[[RESHAPE:.*]] = ttg.memdesc_reshape %[[BUF]] : !ttg.memdesc<128x32xf16, #[[$PADDED_RESHAPE]], #smem, mutable> -> !ttg.memdesc<32x128xf16, #{{.*}}, #smem, mutable>
+    %reshape = ttg.memdesc_reshape %buf : !ttg.memdesc<128x32xf16, #shared_9, #smem_9, mutable> -> !ttg.memdesc<32x128xf16, #shared_9, #smem_9, mutable>
+    // CHECK: ttg.local_load %[[RESHAPE]] : !ttg.memdesc<32x128xf16, #{{.*}}, #smem, mutable> -> tensor<32x128xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>
+    %t_dot = ttg.local_load %reshape : !ttg.memdesc<32x128xf16, #shared_9, #smem_9, mutable> -> tensor<32x128xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_9, kWidth = 8}>>
+    // CHECK-NOT: tlx.require_layout
+    tt.return %t_dot : tensor<32x128xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_9, kWidth = 8}>>
+  }
+}
