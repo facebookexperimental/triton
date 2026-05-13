@@ -27,12 +27,18 @@ constexpr static char AttrHasTLXOpsName[] = "tlx.has_tlx_ops";
 constexpr static char AttrHasWarpSpecOpsName[] = "tlx.has_warp_spec_ops";
 constexpr static char AttrTLXEnablePairedCTAMMAName[] =
     "tlx.enable_paired_cta_mma";
-constexpr static char AttrTLXExplicitClusterSyncName[] =
-    "tlx.explicit_cluster_sync";
+constexpr static char AttrClusterSyncKernelInitName[] =
+    "tlx.cluster_sync_kernel_init";
+constexpr static char AttrClusterSyncKernelCleanupName[] =
+    "tlx.cluster_sync_kernel_cleanup";
 
 bool tlxEnablePairedMMA(Operation *op);
 
-bool tlxExplicitClusterSync(Operation *op);
+bool hasClusterSyncKernelInit(Operation *op);
+void setClusterSyncKernelInitOnMod(Operation *op, bool value);
+
+bool hasClusterSyncKernelCleanup(Operation *op);
+void setClusterSyncKernelCleanupOnMod(Operation *op, bool value);
 
 // Returns true if the kernel uses clusters (clusterDims product > 1).
 // Subsumes tlxEnablePairedMMA: paired CTA MMA always implies clustering.

@@ -5,17 +5,32 @@
 // and TensorMemoryBaseAddress ops from tmem_alloc are replaced with the
 // alloc result.
 
-#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, unpacked = true>
-// ALLOC: ttg.shared = 4 : i32
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#shared_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+// CHECK: module attributes {
+// CHECK-SAME: tlx.cluster_sync_kernel_cleanup = true
+// CHECK-SAME: tlx.cluster_sync_kernel_init = true
+// ALLOC: ttg.shared = 132 : i32
 module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.tensor_memory_size" = 128 : i32} {
   // CHECK-LABEL: @tcgen5_global_alloc_lowering
+  // CHECK: mbarrier.init.shared::cta.b64
+  // CHECK: nvvm.cluster.arrive {aligned}
+  // CHECK: nvvm.cluster.wait {aligned}
   // CHECK: tcgen05.alloc.cta_group::2
   // CHECK: nvvm.barrier0
   // CHECK: tcgen05.relinquish_alloc_permit.cta_group::2
+  // CHECK: nvvm.cluster.arrive {aligned}
+  // CHECK: nvvm.cluster.wait {aligned}
+  // CHECK: tcgen05.dealloc.cta_group::2
   // ALLOC-LABEL: @tcgen5_global_alloc_lowering
   tt.func public @tcgen5_global_alloc_lowering() attributes {noinline = false} {
-    // ALLOC-NEXT: ttng.tcgen5_global_alloc
-    // ALLOC-SAME: allocation.offset = 0 : i32
+    %c0_i32 = arith.constant 0 : i32
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_bar, #smem, mutable>
+    %bar_idx = ttg.memdesc_index %bar[%c0_i32] : !ttg.memdesc<1xi64, #shared_bar, #smem, mutable> -> !ttg.memdesc<1xi64, #shared_bar, #smem, mutable>
+    ttng.init_barrier %bar_idx, 1 : !ttg.memdesc<1xi64, #shared_bar, #smem, mutable>
+    // ALLOC: ttng.tcgen5_global_alloc
+    // ALLOC-SAME: allocation.offset = 128 : i32
     ttng.tcgen5_global_alloc {tensor_memory_size = 128 : i32, two_ctas = true}
     %alloc = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     tt.return
@@ -36,6 +51,10 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
   // must assign a non-zero offset for the scratch buffer (via GEP).
   // CHECK: llvm.getelementptr
   // CHECK: tcgen05.alloc.cta_group::2
+  // CHECK: tcgen05.relinquish_alloc_permit.cta_group::2
+  // CHECK: nvvm.cluster.arrive {aligned}
+  // CHECK: nvvm.cluster.wait {aligned}
+  // CHECK: tcgen05.dealloc.cta_group::2
   // ALLOC-LABEL: @tcgen5_global_alloc_no_smem_overlap
   tt.func public @tcgen5_global_alloc_no_smem_overlap(%bar: !ttg.memdesc<1xi64, #shared, #smem, mutable>) attributes {noinline = false} {
     %buf = ttg.local_alloc : () -> !ttg.memdesc<1x128xf16, #shared, #smem, mutable>

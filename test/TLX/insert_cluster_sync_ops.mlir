@@ -3,6 +3,8 @@
 
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
+// CHECK: module attributes {
+// CHECK-SAME: tlx.cluster_sync_kernel_init = true
 module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
   // CHECK-LABEL: @tlx_bar_init
   tt.func public @tlx_bar_init() attributes {noinline = false} {
@@ -539,37 +541,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 // -----
 
-// Test that explicit_cluster_sync suppresses heuristic cluster sync insertion.
-// Even though there is a remote barrier (map_to_remote_buffer + arrive_barrier),
-// the compiler must not auto-insert cluster arrive/wait because the user is
-// responsible for placing them manually.
+// Test that fence.proxy.async.shared::cluster is inserted after
+// fence.mbarrier_init for all clustered kernels (not just paired MMA).
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
-module attributes {tlx.enable_paired_cta_mma = true, tlx.explicit_cluster_sync = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
-  // CHECK-LABEL: @explicit_cluster_sync_no_auto_insert
-  tt.func public @explicit_cluster_sync_no_auto_insert() attributes {noinline = false} {
-    %c0_i32 = arith.constant 0 : i32
-    %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
-    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
-    // CHECK: mbarrier.init.shared::cta.b64
-    // CHECK-NOT: nvvm.cluster.arrive
-    // CHECK-NOT: nvvm.cluster.wait
-    // CHECK: nvvm.mapa
-    ttng.init_barrier %1, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
-
-    %2 = ttng.map_to_remote_buffer %1, %c0_i32 : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
-    ttng.arrive_barrier %2, 1 : !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
-    tt.return
-  }
-}
-
-// -----
-
-// Test that fence.proxy.async is inserted after fence.mbarrier_init.release.cluster
-// to ensure async shared memory operations complete before cluster sync.
-#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-#smem = #ttg.shared_memory
-module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
   // CHECK-LABEL: @fence_proxy_async_all_clustered
   tt.func public @fence_proxy_async_all_clustered() attributes {noinline = false} {
     %c0_i32 = arith.constant 0 : i32
@@ -577,10 +553,9 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
     %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
     // CHECK: fence.mbarrier_init.release.cluster
-    // CHECK-NEXT: nvvm.fence.proxy
+    // CHECK-NEXT: nvvm.fence.proxy {kind = #nvvm.proxy_kind<async.shared>, space = #nvvm.shared_space<cluster>}
     // CHECK-NEXT: nvvm.cluster.arrive {aligned}
     // CHECK-NEXT: nvvm.cluster.wait {aligned}
-    // CHECK: nvvm.mapa
     ttng.init_barrier %1, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
 
     %2 = ttng.map_to_remote_buffer %1, %c0_i32 : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>

@@ -651,6 +651,7 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
     assert ttgir.count("ttng.map_to_remote_buffer") == 1
 
     ptx = kernel.asm["ptx"]
+    # Verify cluster sync and tmem alloc ordering in PTX:
     assert "fence.mbarrier_init.release.cluster" in ptx
     assert "fence.proxy.async.shared::cluster" in ptx
     assert "barrier.cluster.arrive.aligned" in ptx

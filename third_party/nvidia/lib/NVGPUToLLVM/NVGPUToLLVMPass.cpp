@@ -670,13 +670,22 @@ static void createRelinquishAlloc(IRRewriter &rewriter, Location loc,
 }
 
 void freeTMAlloc(LLVM::LLVMFuncOp func, Value alloc, size_t size, Value pred,
-                 bool twoCTAs) {
+                 bool twoCTAs, bool tlxPairedMMA) {
   func.walk([&](LLVM::ReturnOp ret) {
     OpBuilder b(ret);
     auto ctx = ret->getContext();
     auto loc = ret.getLoc();
     auto voidTy = void_ty(ctx);
-    b.create<NVVM::Barrier0Op>(loc);
+    if (twoCTAs || tlxPairedMMA) {
+      NVVM::ClusterArriveOp::create(b, loc, UnitAttr::get(ctx));
+      NVVM::ClusterWaitOp::create(b, loc, UnitAttr::get(ctx));
+      if (tlxPairedMMA) {
+        // mark mod attr so that WS lowering is aware of this cluster sync point
+        tlx::setClusterSyncKernelCleanupOnMod(func, true);
+      }
+    } else {
+      NVVM::Barrier0Op::create(b, loc);
+    }
     PTXBuilder ptxBuilder;
     // Calculate the predicate in the inline asm to avoid creating long
     // liveranges.
@@ -715,8 +724,9 @@ static Value initTensorMemory(LLVM::LLVMFuncOp func, Operation *insertionPoint,
     return rewriter.create<LLVM::UndefOp>(loc, ptr_ty(ctx, 6));
   }
 
+  bool isTlxPairedMMA = tlx::tlxEnablePairedMMA(mod);
   int numCTAs;
-  if (tlx::tlxEnablePairedMMA(mod)) {
+  if (isTlxPairedMMA) {
     // TLX attr takes precedence
     numCTAs = 2;
   } else {
@@ -733,7 +743,7 @@ static Value initTensorMemory(LLVM::LLVMFuncOp func, Operation *insertionPoint,
   createRelinquishAlloc(rewriter, loc, pred, useTwoCTAs);
   // TODO: pred will have a long liverange, we need to check if this is a
   // problem and how it can be fixed.
-  freeTMAlloc(func, alloc, size, pred, useTwoCTAs);
+  freeTMAlloc(func, alloc, size, pred, useTwoCTAs, isTlxPairedMMA);
   return alloc;
 }
 
