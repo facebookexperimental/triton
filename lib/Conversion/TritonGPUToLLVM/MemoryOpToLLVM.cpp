@@ -13,6 +13,12 @@ using namespace mlir;
 using namespace mlir::triton;
 using namespace mlir::triton::gpu;
 
+inline int getIntOrFloatOrPtrBitWidth(Type type) {
+  if (isa<LLVM::LLVMPointerType, triton::PointerType>(type))
+    return kPtrBitWidth;
+  return type.getIntOrFloatBitWidth();
+}
+
 // Helper for LocalGather/ScatterOpConversion.
 // For gather: storeVals is empty, returns loaded values.
 // For scatter: storeVals contains values to store, returns empty.
