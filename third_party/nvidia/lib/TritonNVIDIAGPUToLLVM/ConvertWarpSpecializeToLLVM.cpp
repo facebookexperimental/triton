@@ -378,10 +378,11 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
     // - The kernel is in clustered mode
     // - There's no user controlled explicit cluster sync
     // - There's a ClusterWaitOp (then it had to be inserted by compiler)
-    bool hasClusterBarWait =
-        func.walk([&](NVVM::ClusterWaitOp) { return WalkResult::interrupt(); })
-            .wasInterrupted();
-    if (hasClusterBarWait) {
+    int numClusterWaits = 0;
+    func.walk([&](NVVM::ClusterWaitOp) { numClusterWaits++; });
+    assert(numClusterWaits <= 1 &&
+           "Expected at most one ClusterWaitOp in the function");
+    if (numClusterWaits > 0) {
       // Non default warps should just do a cluster arrive unconditionally.
       // Note this instruction is at kernel beginning shared by all warps, and
       // we use `isDefault` as predicate here to select only non default warps

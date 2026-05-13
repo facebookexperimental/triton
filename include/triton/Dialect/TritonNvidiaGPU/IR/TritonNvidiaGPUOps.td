@@ -1005,6 +1005,27 @@ def TTNG_AsyncStoreOp : TTNG_Op<"async_store"> {
   }];
 }
 
+def TTNG_TCGen5GlobalAllocOp : TTNG_Op<"tcgen5_global_alloc", []> {
+  let summary = "Global tensor memory allocation for the kernel";
+  let description = [{
+    Represents the single tcgen05.alloc instruction for the entire kernel.
+    Created by TensorMemoryAllocationPass before the first tmem_alloc op.
+    All individual tmem_alloc ops is a slice view from this single allocation,
+    each at a different offset.
+
+    Uses a 4-byte shared memory buffer for address broadcast across warps.
+    Visible to cluster sync insertion passes at TTGIR level
+    in 2-CTA mode.
+  }];
+
+  let arguments = (ins
+    I32Attr:$tensor_memory_size,
+    DefaultValuedAttr<BoolAttr, "false">:$two_ctas
+  );
+
+  let assemblyFormat = "attr-dict";
+}
+
 def TTNG_TensormapFenceproxyAcquireOp: TTNG_Op<
   "tensormap_fenceproxy_acquire",
   [MemoryEffects<[MemWrite<GlobalMemory>]>]

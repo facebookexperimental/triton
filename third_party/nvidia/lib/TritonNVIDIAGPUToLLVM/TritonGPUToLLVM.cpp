@@ -69,6 +69,8 @@ public:
     addLegalOp<triton::gpu::WarpYieldOp>();
     addLegalOp<triton::gpu::WarpSpecializePartitionsOp>();
     addLegalOp<triton::gpu::WarpReturnOp>();
+    // TCGen5GlobalAllocOp is lowered later in NVGPUToLLVM.
+    addLegalOp<triton::nvidia_gpu::TCGen5GlobalAllocOp>();
   }
 };
 
@@ -447,6 +449,10 @@ private:
     // need to insert fence to make mbar init visible to cluster
     ttng::FenceMBarrierInitReleaseClusterOp::create(builder,
                                                     lastBarInitOp.getLoc());
+    // need to insert fence.proxy to ensure async shared memory operations are
+    // visible before the cluster sync
+    ttng::FenceAsyncSharedOp::create(builder, lastBarInitOp.getLoc(),
+                                     /*bCluster=*/true);
     // need to insert cluster arrive and wait to prevent CTA_X from arriving
     // CTA_Y's bar before CTA_Y inits it
     ttng::ClusterArriveOp::create(builder, lastBarInitOp.getLoc(),

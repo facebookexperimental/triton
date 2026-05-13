@@ -1443,8 +1443,15 @@ def run_async_dot_blackwell_2cta_tma(device, A_TMEM, SAMPLE_M):
 
     ptx = kernel.asm["ptx"]
     assert ptx.count("fence.mbarrier_init.release.cluster") == 1
-    assert ptx.count("barrier.cluster.arrive.aligned") == 1  # one for remote bar init
-    assert ptx.count("barrier.cluster.wait.aligned") == 1  # one for remote bar init
+    assert ptx.count("fence.proxy.async.shared::cluster") >= 1
+    # Verify ordering: fences → cluster sync → tmem alloc
+    fence_mbar_pos = ptx.index("fence.mbarrier_init.release.cluster")
+    fence_proxy_pos = ptx.index("fence.proxy.async.shared::cluster")
+    cluster_arrive_pos = ptx.index("barrier.cluster.arrive.aligned")
+    cluster_wait_pos = ptx.index("barrier.cluster.wait.aligned")
+    tmem_alloc_pos = ptx.index("tcgen05.alloc.cta_group::2")
+    tmem_alloc_fence_pos = ptx.index("fence.proxy.async.shared::cluster", tmem_alloc_pos)
+    assert fence_mbar_pos < fence_proxy_pos < cluster_arrive_pos < cluster_wait_pos < tmem_alloc_pos < tmem_alloc_fence_pos
     assert ptx.count("mapa.shared::cluster") == 1  # address mapping for remote_view
     assert ptx.count("tcgen05.mma.cta_group::2") == 8  # BK=128 divided into steps of 16
 
@@ -1791,11 +1798,20 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
     assert ttgir.count("ttng.map_to_remote_buffer") == 1
 
     ptx = kernel.asm["ptx"]
-    assert ptx.count("fence.mbarrier_init.release.cluster") == 1
-    # two for trunk remote bar init: one for default wg, one for non default
+    # Verify cluster sync and tmem alloc ordering in PTX:
+    #   fence.mbarrier_init.release.cluster
+    #   fence.proxy.async.shared::cluster
+    #   barrier.cluster.arrive.aligned  (default side)
+    #   barrier.cluster.wait.aligned
+    #   tcgen05.alloc.cta_group::2      (tmem alloc after cluster sync)
+    fence_mbar_pos = ptx.index("fence.mbarrier_init.release.cluster")
+    fence_proxy_pos = ptx.index("fence.proxy.async.shared::cluster")
+    cluster_arrive_pos = ptx.index("barrier.cluster.arrive.aligned", fence_proxy_pos)
+    cluster_wait_pos = ptx.index("barrier.cluster.wait.aligned")
+    tmem_alloc_pos = ptx.index("tcgen05.alloc.cta_group::2")
+    tmem_alloc_fence_pos = ptx.index("fence.proxy.async.shared::cluster", tmem_alloc_pos)
+    assert fence_mbar_pos < fence_proxy_pos < cluster_arrive_pos < cluster_wait_pos < tmem_alloc_pos < tmem_alloc_fence_pos
     assert ptx.count("barrier.cluster.arrive.aligned") == 2
-    # one for trunk remote bar init: non default WGs just arrive anyway, then it's equivalent to a sync between
-    #   default WGs in all CTAs
     assert ptx.count("barrier.cluster.wait.aligned") == 1
     assert ptx.count("mapa.shared::cluster") == 1  # address mapping for remote_view
     assert ptx.count("tcgen05.mma.cta_group::2") == 8  # BK=128 divided into steps of 16

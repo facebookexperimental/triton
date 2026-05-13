@@ -105,6 +105,7 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
     %2 = ttg.memdesc_index %0[%c1_i32] : !ttg.memdesc<2xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
     // CHECK: fence.mbarrier_init.release.cluster
+    // CHECK-NEXT: nvvm.fence.proxy
     // CHECK-NEXT: nvvm.cluster.arrive {aligned}
     // CHECK-NEXT: nvvm.cluster.wait {aligned}
     // CHECK: nvvm.mapa
@@ -489,6 +490,32 @@ module attributes {tlx.enable_paired_cta_mma = true, tlx.explicit_cluster_sync =
     // CHECK: mbarrier.init.shared::cta.b64
     // CHECK-NOT: nvvm.cluster.arrive
     // CHECK-NOT: nvvm.cluster.wait
+    // CHECK: nvvm.mapa
+    ttng.init_barrier %1, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+
+    %2 = ttng.map_to_remote_buffer %1, %c0_i32 : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+    ttng.arrive_barrier %2, 1 : !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Test that fence.proxy.async is inserted after fence.mbarrier_init.release.cluster
+// to ensure async shared memory operations complete before cluster sync.
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  // CHECK-LABEL: @fence_proxy_async_all_clustered
+  tt.func public @fence_proxy_async_all_clustered() attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // CHECK: mbarrier.init.shared::cta.b64
+    // CHECK: fence.mbarrier_init.release.cluster
+    // CHECK-NEXT: nvvm.fence.proxy
+    // CHECK-NEXT: nvvm.cluster.arrive {aligned}
+    // CHECK-NEXT: nvvm.cluster.wait {aligned}
     // CHECK: nvvm.mapa
     ttng.init_barrier %1, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
 
