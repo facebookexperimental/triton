@@ -208,6 +208,7 @@ class FlashAttention:
             "NUM_MMA_GROUPS": 2,
             "NUM_MMA_SLICES": 2,
             "GROUP_SIZE_N": 1,
+            "USE_WARP_BARRIER": False,
         },
         "blackwell_fa_clc": {
             "BLOCK_M": 256,
