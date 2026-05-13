@@ -439,15 +439,6 @@ public:
              TMemFromSharedMemPattern, TMemToSharedMemPattern>(context);
     if (failed(applyPatternsGreedily(m, std::move(patterns))))
       signalPassFailure();
-
-    // After tmem layout patterns have fired (e.g., split → tmem_subslice +
-    // tmem_load in SubtiledRegionOp setup regions), push the resulting setup
-    // ops into the tile body so that per-tile tmem_loads are interleaved with
-    // compute and shared values are local to each tile iteration.
-    SmallVector<SubtiledRegionOp> subtileOps;
-    m.walk([&](SubtiledRegionOp op) { subtileOps.push_back(op); });
-    for (auto op : subtileOps)
-      pushSubtiledRegionSetupToTile(op);
   }
 };
 

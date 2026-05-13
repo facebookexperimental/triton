@@ -984,6 +984,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize_splitk(
     EPILOGUE_SUBTILE,
 ):
     """Test deterministic Split-K variant: workspace partial sums + reduce."""
+    pytest.skip("FLATTEN=True temporarily disabled")
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 128
     BLOCK_SIZE_K = 64

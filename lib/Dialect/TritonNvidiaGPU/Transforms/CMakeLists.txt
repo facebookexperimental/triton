@@ -3,12 +3,10 @@ add_triton_library(TritonNvidiaGPUTransforms
   FenceInsertion.cpp
   GenerateSubtiledRegion.cpp
   InterleaveTMem.cpp
-  LowerSubtiledRegion.cpp
   MMALowering.cpp
   OptimizeDescriptorEncoding.cpp
   OptimizeTMemLayouts.cpp
   PlanCTA.cpp
-  PushSharedSetupToTile.cpp
   PromoteLHSToTMem.cpp
   PruneUnusedBarriers.cpp
   ProxyFenceInsertion.cpp

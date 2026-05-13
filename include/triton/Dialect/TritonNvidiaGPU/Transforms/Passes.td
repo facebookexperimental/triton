@@ -180,23 +180,6 @@ def TritonNvidiaGPUInterleaveTMemPass : Pass<"triton-nvidia-interleave-tmem", "m
   }];
 }
 
-def TritonNvidiaGPULowerSubtiledRegionPass
-    : Pass<"triton-nvidia-gpu-lower-subtiled-region", "mlir::ModuleOp"> {
-  let summary = "Lower subtiled_region ops into flat IR with barriers";
-
-  let description = [{
-    This pass lowers `ttng.subtiled_region` ops by:
-    1. Inlining the setup region ops before the op
-    2. Replicating the tile region for each tile in the tile mappings
-    3. Inserting barrier operations (wait_barrier / arrive_barrier) at
-       the positions specified by barrier annotations
-  }];
-
-  let dependentDialects = [
-    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
-  ];
-}
-
 def TritonNvidiaGPUTestGenerateSubtiledRegionPass
     : Pass<"triton-nvidia-gpu-test-generate-subtiled-region", "mlir::ModuleOp"> {
   let summary = "Test pass: generate subtiled_region ops from split patterns";
@@ -218,24 +201,7 @@ def TritonNvidiaGPUTestGenerateSubtiledRegionPass
   ];
 }
 
-def TritonNvidiaGPUPushSharedSetupToTilePass
-    : Pass<"triton-nvidia-gpu-push-shared-setup-to-tile", "mlir::ModuleOp"> {
-  let summary = "Push shared setup ops into tile body of subtiled_region";
 
-  let description = [{
-    For each `ttng.subtiled_region` op, identifies tile arguments that are
-    "shared" — all tiles map the argument position to the same setup yield
-    index. The ops producing those shared values are cloned into the tile
-    body and the corresponding tile arguments and yield entries are removed.
-
-    This simplifies the setup region and makes the tile body more
-    self-contained, enabling further optimizations.
-  }];
-
-  let dependentDialects = [
-    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
-  ];
-}
 
 def TritonNvidiaGPURemoveTMEMTokensPass : Pass<"triton-nvidia-gpu-remove-tmem-tokens", "mlir::ModuleOp"> {
   let summary = "remove TMEM tokens";

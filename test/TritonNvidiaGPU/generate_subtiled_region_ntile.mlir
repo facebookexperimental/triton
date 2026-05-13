@@ -18,22 +18,17 @@
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
 
   // CHECK-LABEL: @four_tile_nested_split
+  // Splits happen before the subtiled_region, passed as inputs.
+  // CHECK: tt.split
+  // CHECK: tt.split
+  // CHECK: tt.split
   // CHECK: ttng.subtiled_region
-  // CHECK-SAME: tile_mappings = [array<i32: 0,
-  // CHECK-SAME: array<i32: 1,
-  // CHECK-SAME: array<i32: 2,
-  // CHECK-SAME: array<i32: 3,
-  // CHECK:   setup {
-  // CHECK:     tt.split
-  // CHECK:     tt.split
-  // CHECK:     tt.split
-  // CHECK:     ttng.subtiled_region_yield
-  // CHECK:   } tile{
+  // CHECK-SAME: per_tile(
+  // CHECK:   tile{
   // CHECK:     arith.truncf
   // CHECK:     tt.descriptor_store
   // CHECK:     ttng.subtiled_region_yield
   // CHECK:   }
-  // CHECK-NOT: tt.split
   tt.func @four_tile_nested_split(
       %buf: !ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable>,
       %tok: !ttg.async.token,
@@ -84,24 +79,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
 
   // CHECK-LABEL: @eight_tile_nested_split
-  // CHECK: ttng.subtiled_region
-  // CHECK-SAME: tile_mappings = [array<i32: 0,
-  // CHECK-SAME: array<i32: 1,
-  // CHECK-SAME: array<i32: 2,
-  // CHECK-SAME: array<i32: 3,
-  // CHECK-SAME: array<i32: 4,
-  // CHECK-SAME: array<i32: 5,
-  // CHECK-SAME: array<i32: 6,
-  // CHECK-SAME: array<i32: 7,
-  // CHECK:   setup {
+  // Splits happen before the subtiled_region, passed as inputs.
   // CHECK-COUNT-7: tt.split
-  // CHECK:     ttng.subtiled_region_yield
+  // CHECK: ttng.subtiled_region
+  // CHECK-SAME: per_tile(
   // CHECK:   } tile{
   // CHECK:     arith.truncf
   // CHECK:     tt.descriptor_store
   // CHECK:     ttng.subtiled_region_yield
   // CHECK:   }
-  // CHECK-NOT: tt.split
   tt.func @eight_tile_nested_split(
       %buf: !ttg.memdesc<128x512xf32, #tmem8, #ttng.tensor_memory, mutable>,
       %tok: !ttg.async.token,
@@ -184,17 +170,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK: ttg.local_alloc
   // CHECK: ttg.local_alloc
   // CHECK: ttng.subtiled_region
-  // CHECK-SAME: tile_mappings = [array<i32: 0,
-  // CHECK-SAME: array<i32: 1,
-  // CHECK-SAME: array<i32: 2,
-  // CHECK-SAME: array<i32: 3,
+  // CHECK-SAME: per_tile(
   // CHECK:   } tile{
   // CHECK:     arith.truncf
   // CHECK:     ttg.local_store
   // CHECK:     ttng.subtiled_region_yield
   // CHECK:   }
   // Second: local_load + convert_layout (task 4)
-  // CHECK: ttng.subtiled_region tile_mappings = [array<i32: 0>, array<i32: 1>, array<i32: 2>, array<i32: 3>]
+  // CHECK: ttng.subtiled_region
   // CHECK:   } tile{
   // CHECK:     ttg.local_load
   // CHECK:     ttg.convert_layout
@@ -232,147 +215,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   }
 }
 
-// -----
 
-// Test: 4-tile multi-task with differing address offsets.
-// Each leaf chain: truncf{3} → convert_layout{4} with different column offsets.
-// The addi ops for offsets are NOT in the chains (includeAuxiliary=false) —
-// they become differing operands. Verifies that offset differences don't
-// break multi-task segmentation.
-
-#tmem_mto = #ttng.tensor_memory_encoding<blockM = 128, blockN = 256, colStride = 1>
-#full_mto = #ttg.blocked<{sizePerThread = [1, 256], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
-#r3d_128_mto = #ttg.blocked<{sizePerThread = [1, 2, 128], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 2, 1]}>
-#t3d_128_mto = #ttg.blocked<{sizePerThread = [1, 128, 2], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 1, 2]}>
-#d2_128_mto = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
-#r3d_64_mto = #ttg.blocked<{sizePerThread = [1, 2, 64], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 2, 1]}>
-#t3d_64_mto = #ttg.blocked<{sizePerThread = [1, 64, 2], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 1, 2]}>
-#d2_64_mto = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
-#shared_mto = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
-
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
-
-  // CHECK-LABEL: @four_tile_multi_task_with_offsets
-  // Two SubtiledRegionOps with 4 tile mappings each.
-  // First: truncf (task 3) + local_store
-  // CHECK: ttng.subtiled_region
-  // CHECK-SAME: tile_mappings = [array<i32: 0,
-  // CHECK-SAME: array<i32: 1,
-  // CHECK-SAME: array<i32: 2,
-  // CHECK-SAME: array<i32: 3,
-  // CHECK:   } tile{
-  // CHECK:     arith.truncf
-  // CHECK:     ttg.local_store
-  // CHECK:     ttng.subtiled_region_yield
-  // CHECK:   }
-  // Second: local_load + descriptor_store (task 4) with per-tile offsets
-  // CHECK: ttng.subtiled_region tile_mappings = [array<i32: 0,
-  // CHECK-SAME: array<i32: 1,
-  // CHECK-SAME: array<i32: 2,
-  // CHECK-SAME: array<i32: 3,
-  // CHECK:   } tile{
-  // CHECK:     ttg.local_load
-  // CHECK:     tt.descriptor_store
-  // CHECK:     ttng.subtiled_region_yield
-  // CHECK:   }
-  // CHECK-NOT: tt.split
-  tt.func @four_tile_multi_task_with_offsets(
-      %buf: !ttg.memdesc<128x256xf32, #tmem_mto, #ttng.tensor_memory, mutable>,
-      %tok: !ttg.async.token,
-      %desc: !tt.tensordesc<tensor<128x64xf16, #shared_mto>>,
-      %m: i32, %n: i32, %c64: i32, %c128: i32, %c192: i32) {
-    %l:2 = ttng.tmem_load %buf[%tok] : !ttg.memdesc<128x256xf32, #tmem_mto, #ttng.tensor_memory, mutable> -> tensor<128x256xf32, #full_mto>
-    %r1 = tt.reshape %l#0 : tensor<128x256xf32, #full_mto> -> tensor<128x2x128xf32, #r3d_128_mto>
-    %t1 = tt.trans %r1 {order = array<i32: 0, 2, 1>} : tensor<128x2x128xf32, #r3d_128_mto> -> tensor<128x128x2xf32, #t3d_128_mto>
-    %h0, %h1 = tt.split %t1 : tensor<128x128x2xf32, #t3d_128_mto> -> tensor<128x128xf32, #d2_128_mto>
-    %r2a = tt.reshape %h0 : tensor<128x128xf32, #d2_128_mto> -> tensor<128x2x64xf32, #r3d_64_mto>
-    %t2a = tt.trans %r2a {order = array<i32: 0, 2, 1>} : tensor<128x2x64xf32, #r3d_64_mto> -> tensor<128x64x2xf32, #t3d_64_mto>
-    %a0, %a1 = tt.split %t2a : tensor<128x64x2xf32, #t3d_64_mto> -> tensor<128x64xf32, #d2_64_mto>
-    %r2b = tt.reshape %h1 : tensor<128x128xf32, #d2_128_mto> -> tensor<128x2x64xf32, #r3d_64_mto>
-    %t2b = tt.trans %r2b {order = array<i32: 0, 2, 1>} : tensor<128x2x64xf32, #r3d_64_mto> -> tensor<128x64x2xf32, #t3d_64_mto>
-    %a2, %a3 = tt.split %t2b : tensor<128x64x2xf32, #t3d_64_mto> -> tensor<128x64xf32, #d2_64_mto>
-
-    // Chain 0: truncf{3} → descriptor_store{4} at [m, n]
-    %x0 = arith.truncf %a0 {async_task_id = array<i32: 3>} : tensor<128x64xf32, #d2_64_mto> to tensor<128x64xf16, #d2_64_mto>
-    tt.descriptor_store %desc[%m, %n], %x0 {async_task_id = array<i32: 4>} : !tt.tensordesc<tensor<128x64xf16, #shared_mto>>, tensor<128x64xf16, #d2_64_mto>
-    // Chain 1: truncf{3} → descriptor_store{4} at [m, n+64]
-    %x1 = arith.truncf %a1 {async_task_id = array<i32: 3>} : tensor<128x64xf32, #d2_64_mto> to tensor<128x64xf16, #d2_64_mto>
-    %n1 = arith.addi %n, %c64 {async_task_id = array<i32: 4>} : i32
-    tt.descriptor_store %desc[%m, %n1], %x1 {async_task_id = array<i32: 4>} : !tt.tensordesc<tensor<128x64xf16, #shared_mto>>, tensor<128x64xf16, #d2_64_mto>
-    // Chain 2: truncf{3} → descriptor_store{4} at [m, n+128]
-    %x2 = arith.truncf %a2 {async_task_id = array<i32: 3>} : tensor<128x64xf32, #d2_64_mto> to tensor<128x64xf16, #d2_64_mto>
-    %n2 = arith.addi %n, %c128 {async_task_id = array<i32: 4>} : i32
-    tt.descriptor_store %desc[%m, %n2], %x2 {async_task_id = array<i32: 4>} : !tt.tensordesc<tensor<128x64xf16, #shared_mto>>, tensor<128x64xf16, #d2_64_mto>
-    // Chain 3: truncf{3} → descriptor_store{4} at [m, n+192]
-    %x3 = arith.truncf %a3 {async_task_id = array<i32: 3>} : tensor<128x64xf32, #d2_64_mto> to tensor<128x64xf16, #d2_64_mto>
-    %n3 = arith.addi %n, %c192 {async_task_id = array<i32: 4>} : i32
-    tt.descriptor_store %desc[%m, %n3], %x3 {async_task_id = array<i32: 4>} : !tt.tensordesc<tensor<128x64xf16, #shared_mto>>, tensor<128x64xf16, #d2_64_mto>
-
-    tt.return
-  }
-}
-
-// -----
-
-// Test: 4-tile multi-task with explicit store (local_alloc with data) at the
-// transition. N-tile multi-task only supports implicit buffers (Option 2),
-// so no SubtiledRegionOp should be generated.
-
-#tmem_ex = #ttng.tensor_memory_encoding<blockM = 128, blockN = 256, colStride = 1>
-#full_ex = #ttg.blocked<{sizePerThread = [1, 256], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
-#r3d_128_ex = #ttg.blocked<{sizePerThread = [1, 2, 128], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 2, 1]}>
-#t3d_128_ex = #ttg.blocked<{sizePerThread = [1, 128, 2], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 1, 2]}>
-#d2_128_ex = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
-#r3d_64_ex = #ttg.blocked<{sizePerThread = [1, 2, 64], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 2, 1]}>
-#t3d_64_ex = #ttg.blocked<{sizePerThread = [1, 64, 2], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 1, 2]}>
-#d2_64_ex = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
-#shared_ex = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
-#smem_ex = #ttg.shared_memory
-
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
-
-  // CHECK-LABEL: @four_tile_multi_task_explicit_store_bailout
-  // No SubtiledRegionOp — explicit store transitions not supported for N-tile.
-  // CHECK: tt.split
-  // CHECK: tt.split
-  // CHECK: tt.split
-  // CHECK-NOT: ttng.subtiled_region
-  tt.func @four_tile_multi_task_explicit_store_bailout(
-      %buf: !ttg.memdesc<128x256xf32, #tmem_ex, #ttng.tensor_memory, mutable>,
-      %tok: !ttg.async.token,
-      %desc: !tt.tensordesc<tensor<128x64xf16, #shared_ex>>,
-      %m: i32, %n: i32, %c64: i32, %c128: i32, %c192: i32) {
-    %l:2 = ttng.tmem_load %buf[%tok] : !ttg.memdesc<128x256xf32, #tmem_ex, #ttng.tensor_memory, mutable> -> tensor<128x256xf32, #full_ex>
-    %r1 = tt.reshape %l#0 : tensor<128x256xf32, #full_ex> -> tensor<128x2x128xf32, #r3d_128_ex>
-    %t1 = tt.trans %r1 {order = array<i32: 0, 2, 1>} : tensor<128x2x128xf32, #r3d_128_ex> -> tensor<128x128x2xf32, #t3d_128_ex>
-    %h0, %h1 = tt.split %t1 : tensor<128x128x2xf32, #t3d_128_ex> -> tensor<128x128xf32, #d2_128_ex>
-    %r2a = tt.reshape %h0 : tensor<128x128xf32, #d2_128_ex> -> tensor<128x2x64xf32, #r3d_64_ex>
-    %t2a = tt.trans %r2a {order = array<i32: 0, 2, 1>} : tensor<128x2x64xf32, #r3d_64_ex> -> tensor<128x64x2xf32, #t3d_64_ex>
-    %a0, %a1 = tt.split %t2a : tensor<128x64x2xf32, #t3d_64_ex> -> tensor<128x64xf32, #d2_64_ex>
-    %r2b = tt.reshape %h1 : tensor<128x128xf32, #d2_128_ex> -> tensor<128x2x64xf32, #r3d_64_ex>
-    %t2b = tt.trans %r2b {order = array<i32: 0, 2, 1>} : tensor<128x2x64xf32, #r3d_64_ex> -> tensor<128x64x2xf32, #t3d_64_ex>
-    %a2, %a3 = tt.split %t2b : tensor<128x64x2xf32, #t3d_64_ex> -> tensor<128x64xf32, #d2_64_ex>
-
-    // Chain 0: truncf{3} → local_alloc{3} → tma_copy{4}
-    %x0 = arith.truncf %a0 {async_task_id = array<i32: 3>} : tensor<128x64xf32, #d2_64_ex> to tensor<128x64xf16, #d2_64_ex>
-    %s0 = ttg.local_alloc %x0 {async_task_id = array<i32: 3>} : (tensor<128x64xf16, #d2_64_ex>) -> !ttg.memdesc<128x64xf16, #shared_ex, #smem_ex, mutable>
-    ttng.async_tma_copy_local_to_global %desc[%m, %n] %s0 {async_task_id = array<i32: 4>} : !tt.tensordesc<tensor<128x64xf16, #shared_ex>>, !ttg.memdesc<128x64xf16, #shared_ex, #smem_ex, mutable>
-    // Chain 1
-    %x1 = arith.truncf %a1 {async_task_id = array<i32: 3>} : tensor<128x64xf32, #d2_64_ex> to tensor<128x64xf16, #d2_64_ex>
-    %s1 = ttg.local_alloc %x1 {async_task_id = array<i32: 3>} : (tensor<128x64xf16, #d2_64_ex>) -> !ttg.memdesc<128x64xf16, #shared_ex, #smem_ex, mutable>
-    %n1 = arith.addi %n, %c64 {async_task_id = array<i32: 4>} : i32
-    ttng.async_tma_copy_local_to_global %desc[%m, %n1] %s1 {async_task_id = array<i32: 4>} : !tt.tensordesc<tensor<128x64xf16, #shared_ex>>, !ttg.memdesc<128x64xf16, #shared_ex, #smem_ex, mutable>
-    // Chain 2
-    %x2 = arith.truncf %a2 {async_task_id = array<i32: 3>} : tensor<128x64xf32, #d2_64_ex> to tensor<128x64xf16, #d2_64_ex>
-    %s2 = ttg.local_alloc %x2 {async_task_id = array<i32: 3>} : (tensor<128x64xf16, #d2_64_ex>) -> !ttg.memdesc<128x64xf16, #shared_ex, #smem_ex, mutable>
-    %n2 = arith.addi %n, %c128 {async_task_id = array<i32: 4>} : i32
-    ttng.async_tma_copy_local_to_global %desc[%m, %n2] %s2 {async_task_id = array<i32: 4>} : !tt.tensordesc<tensor<128x64xf16, #shared_ex>>, !ttg.memdesc<128x64xf16, #shared_ex, #smem_ex, mutable>
-    // Chain 3
-    %x3 = arith.truncf %a3 {async_task_id = array<i32: 3>} : tensor<128x64xf32, #d2_64_ex> to tensor<128x64xf16, #d2_64_ex>
-    %s3 = ttg.local_alloc %x3 {async_task_id = array<i32: 3>} : (tensor<128x64xf16, #d2_64_ex>) -> !ttg.memdesc<128x64xf16, #shared_ex, #smem_ex, mutable>
-    %n3 = arith.addi %n, %c192 {async_task_id = array<i32: 4>} : i32
-    ttng.async_tma_copy_local_to_global %desc[%m, %n3] %s3 {async_task_id = array<i32: 4>} : !tt.tensordesc<tensor<128x64xf16, #shared_ex>>, !ttg.memdesc<128x64xf16, #shared_ex, #smem_ex, mutable>
-
-    tt.return
-  }
-}
+// TODO: N-tile multi-task tests with identity ops (four_tile_multi_task_with_offsets,
+// four_tile_multi_task_explicit_store_bailout) are pending support for
+// includeAuxiliary=true with forced identity in buildMultiTaskSubtiledRegionsN.
