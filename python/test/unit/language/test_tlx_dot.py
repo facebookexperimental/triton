@@ -8,7 +8,7 @@ import triton.language.extra.tlx as tlx
 from typing import Optional
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from test.unit.language.conftest import _generate_test_params, _swizzle_scale_to_5d
+from conftest import _generate_test_params, _swizzle_scale_to_5d
 
 
 # Test tl.dot wit tlx smem ops
