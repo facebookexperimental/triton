@@ -48,7 +48,7 @@ def test_cluster_dims(device):
             return
 
     k = kernel = test_kernel[(2, )](ctas_per_cga=(2, 1, 1))
-    assert kernel.metadata.ctas_per_cga == (2, 1, 1)
+    assert list(kernel.metadata.ctas_per_cga) == [2, 1, 1]
     assert ('"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32'
             in k.asm["ttgir"])
 
@@ -279,7 +279,7 @@ def test_ctas_per_cga(device):
     kernel = simple_kernel_clustered[(num_blocks, )](x, 256, ctas_per_cga=(2, 1, 1))
 
     # verify kernel launch cluster
-    assert kernel.metadata.ctas_per_cga == (2, 1, 1), (
+    assert list(kernel.metadata.ctas_per_cga) == [2, 1, 1], (
         f"expecting ctas_per_cga to be (2, 1, 1), got {kernel.metadata.ctas_per_cga}")
     assert kernel.metadata.num_ctas == 1, (
         f"expecting num_ctas (not used in tlx) to be 1 but got {kernel.metadata.num_ctas}")
@@ -319,9 +319,9 @@ def test_preferred_ctas_per_cga(device):
     # tile the 148 SMs (e.g. a GPC could possible has 18 SMs hypothetically), so we will
     # have bubbles of 2 SMs that can be leveraged to fill a 2x1 cluster
     kernel = copy_kernel[(GRID_SIZE, )](x, cluster_size_log, NUM_ELEMENT, **kern_kwargs)
-    assert kernel.metadata.preferred_ctas_per_cga == (4, 1, 1), (
+    assert list(kernel.metadata.preferred_ctas_per_cga) == [4, 1, 1], (
         f"expecting preferred_ctas_per_cga to be (4, 1, 1), got {kernel.metadata.preferred_ctas_per_cga}")
-    assert kernel.metadata.ctas_per_cga == (2, 1, 1), (
+    assert list(kernel.metadata.ctas_per_cga) == [2, 1, 1], (
         f"expecting ctas_per_cga to be (2, 1, 1), got {kernel.metadata.ctas_per_cga}")
 
     sizes, counts = cluster_size_log.unique(return_counts=True)

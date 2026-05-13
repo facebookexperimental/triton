@@ -566,7 +566,7 @@ def test_descriptor_load_multicast(device):
             block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
         )
 
-        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.int16, tl.constexpr(1))
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float16, tl.constexpr(1))
         buffer = tlx.local_view(buffers, 0)
         bars = tlx.alloc_barriers(tl.constexpr(1))
         bar = tlx.local_view(bars, 0)
@@ -659,7 +659,7 @@ def test_descriptor_load_two_cta(device):
         )
 
         # Each CTA has its own SMEM buffer for its portion of the tile
-        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N // NUM_CTAS), tl.int16, tl.constexpr(1))
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N // NUM_CTAS), tl.float16, tl.constexpr(1))
         buffer = tlx.local_view(buffers, 0)
 
         # Leader's barrier tracks BOTH CTAs' TMA loads via cta_group::2

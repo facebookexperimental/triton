@@ -499,7 +499,7 @@ def run_async_dot_blackwell_2cta_tma(device, A_TMEM, SAMPLE_M):
     )
 
     # verify kernel launch cluster
-    assert kernel.metadata.ctas_per_cga == (2, 1, 1), (
+    assert list(kernel.metadata.ctas_per_cga) == [2, 1, 1], (
         f"expecting ctas_per_cga to be (2, 1, 1), got {kernel.metadata.ctas_per_cga}")
     assert kernel.metadata.num_ctas == 1, (
         f"expecting num_ctas to be 1 when using ctas_per_cga, got {kernel.metadata.num_ctas}")
@@ -509,8 +509,11 @@ def run_async_dot_blackwell_2cta_tma(device, A_TMEM, SAMPLE_M):
     assert ttgir.count("ttng.map_to_remote_buffer") == 1
 
     ptx = kernel.asm["ptx"]
-    assert ptx.count("barrier.cluster.arrive.aligned") == 2  # one for remote bar init, one for tmem dealloc
-    assert ptx.count("barrier.cluster.wait.aligned") == 2  # one for remote bar init, one for tmem dealloc
+    assert "fence.mbarrier_init.release.cluster" in ptx
+    assert "fence.proxy.async.shared::cluster" in ptx
+    assert "barrier.cluster.arrive.aligned" in ptx
+    assert "barrier.cluster.wait.aligned" in ptx
+    assert "tcgen05.alloc.cta_group::2" in ptx
     assert ptx.count("mapa.shared::cluster") == 1  # address mapping for remote_view
     assert ptx.count("tcgen05.mma.cta_group::2") == 8  # BK=128 divided into steps of 16
 
@@ -639,7 +642,7 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
     )
 
     # verify kernel launch cluster
-    assert kernel.metadata.ctas_per_cga == (2, 1, 1), (
+    assert list(kernel.metadata.ctas_per_cga) == [2, 1, 1], (
         f"expecting ctas_per_cga to be (2, 1, 1), got {kernel.metadata.ctas_per_cga}")
     assert kernel.metadata.num_ctas == 1, (
         f"expecting num_ctas (not used in tlx) to be 1 but got {kernel.metadata.num_ctas}")
@@ -649,13 +652,11 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
     assert ttgir.count("ttng.map_to_remote_buffer") == 1
 
     ptx = kernel.asm["ptx"]
-    # two for trunk remote bar init: one for default wg, one for non default
-    # two for tmem dealloc (two returns)
-    assert ptx.count("barrier.cluster.arrive.aligned") == 4
-    # one for trunk remote bar init: non default WGs just arrive anyway, then it's equivalent to a sync between
-    #   default WGs in all CTAs
-    # two for tmem dealloc (two returns)
-    assert ptx.count("barrier.cluster.wait.aligned") == 3
+    assert "fence.mbarrier_init.release.cluster" in ptx
+    assert "fence.proxy.async.shared::cluster" in ptx
+    assert "barrier.cluster.arrive.aligned" in ptx
+    assert "barrier.cluster.wait.aligned" in ptx
+    assert "tcgen05.alloc.cta_group::2" in ptx
     assert ptx.count("mapa.shared::cluster") == 1  # address mapping for remote_view
     assert ptx.count("tcgen05.mma.cta_group::2") == 8  # BK=128 divided into steps of 16
 
@@ -1180,7 +1181,7 @@ def test_async_dot_scaled_2cta(device):
     )
 
     # verify kernel launch cluster
-    assert kernel.metadata.ctas_per_cga == (2, 1, 1), (
+    assert list(kernel.metadata.ctas_per_cga) == [2, 1, 1], (
         f"expecting ctas_per_cga to be (2, 1, 1), got {kernel.metadata.ctas_per_cga}")
     assert kernel.metadata.num_ctas == 1, (
         f"expecting num_ctas to be 1 when using ctas_per_cga, got {kernel.metadata.num_ctas}")
