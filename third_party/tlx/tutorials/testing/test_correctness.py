@@ -175,7 +175,6 @@ class FlashAttention:
             "NUM_Q_SCALE_TMEM_BUFFERS": 1,
             "NUM_KV_SCALE_TMEM_BUFFERS": 2,
             "GROUP_SIZE_N": 1,
-            "RESCALE_OPT": True,
         },
         "hopper_fa_ws": {
             "BLOCK_M": 128,
