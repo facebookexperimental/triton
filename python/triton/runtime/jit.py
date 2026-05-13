@@ -802,10 +802,17 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
             if hasattr(kernel, "result"):
                 kernel = kernel.result()
-            # launch kernel
-            launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
-            kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,
-                       knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *bound_args.values())
+            # launch kernel — prefer _TritonDispatcher (C direct cuLaunchKernelEx)
+            # when available and hooks are not needed.
+            _disp = getattr(kernel, '_dispatcher', None)
+            if _disp is not None and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook:
+                _vals = tuple(bound_args.values())
+                _indices = kernel._dispatch_arg_indices
+                _disp(grid_0, grid_1, grid_2, stream, *[_vals[i] for i in _indices])
+            else:
+                launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
+                kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,
+                           knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *bound_args.values())
 
         return kernel
 

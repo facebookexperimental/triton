@@ -423,6 +423,9 @@ class HookChain(Generic[F]):
         if func in self.calls:
             self.calls.remove(func)
 
+    def __bool__(self):
+        return len(self.calls) > 0
+
     def __call__(self, *args, **kwargs):
         for call in self.calls if not self.reversed else reversed(self.calls):
             call(*args, **kwargs)
@@ -516,6 +519,8 @@ class nvidia_knobs(base_knobs):
     dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
     dump_tlx_benchmark: env_bool = env_bool("TRITON_DUMP_TLX_BENCHMARK")
     use_no_compile_launcher: env_bool = env_bool("TRITON_USE_NO_COMPILE_LAUNCHER")
+    use_llvm_launcher: env_bool = env_bool("TRITON_USE_LLVM_LAUNCHER")
+    use_triton_dispatcher: env_bool = env_bool("TRITON_USE_TRITON_DISPATCHER")
     generate_subtiled_region: env_bool = env_bool("TRITON_GENERATE_SUBTILED_REGION")
     enable_tileir: env_bool = env_bool("ENABLE_TILE")
 
