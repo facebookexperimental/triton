@@ -597,9 +597,8 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
                 tlx.barrier_wait(cta_bars[0], phase=0, pred=pred_cta0)
 
                 # difference from 1cta: set two_ctas. Compiler auto generates pred to issue mma only from CTA0
-                tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=False, mBarriers=[], two_ctas=True, out_dtype=OUT_DTYPE)
-
-                tlx.barrier_arrive(tmem_full_bars[0], 1)
+                tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=False, mBarriers=[tmem_full_bars[0]], two_ctas=True,
+                              out_dtype=OUT_DTYPE)
             with tlx.async_task(num_warps=1, num_regs=232):  # producer
                 # difference from 1cta: size
                 tlx.barrier_expect_bytes(smem_full_bars[0],
