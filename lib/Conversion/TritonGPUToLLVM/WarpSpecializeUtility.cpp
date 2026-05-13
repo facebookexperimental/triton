@@ -1,10 +1,12 @@
 #include "triton/Conversion/TritonGPUToLLVM/WarpSpecializeUtility.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/OperationSupport.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 
@@ -196,6 +198,8 @@ static void rewritePartitionRegions(WarpSpecializeOp ws, Block *switchLoop,
     // another barrier here.
     callbacks.createAllBarrier(b, switchLoopBarrierIdx);
 
+    bool hasClusterSyncKernelCleanup = tlx::hasClusterSyncKernelCleanup(ws);
+
     // Rewrite all warp returns.
     partition->walk([&](WarpReturnOp op) {
       TritonLLVMIRRewriter b(op.getLoc(), op);
@@ -203,6 +207,14 @@ static void rewritePartitionRegions(WarpSpecializeOp ws, Block *switchLoop,
       callbacks.reallocRegisters(b, ws,
                                  RegisterReallocPhase::WorkerPartitionEnd,
                                  partition->getRegionNumber());
+      if (hasClusterSyncKernelCleanup) {
+        // If there was a cluster sync point before tmem de-alloc, it would
+        // block default warps. Non default warps should arrive at the end of
+        // its region to unblock.
+        b.setInsertionPoint(op);
+        NVVM::ClusterArriveOp::create(b, b.getLoc(),
+                                      UnitAttr::get(b.getContext()));
+      }
       b.replaceOpWithNewOp<LLVM::BrOp>(op, switchLoop);
     });
   }
