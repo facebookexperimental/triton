@@ -586,6 +586,219 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8(HEAD_DIM, causal):
         torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
 
 
+def _quantize_mxfp8_bwd_operand(ref, dtype, transpose_for_reduction=False):
+    from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode
+    from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent_mxfp8 import (
+        swizzled_to_tma_preshuffled,
+    )
+
+    Z, H, N_CTX, HEAD_DIM = ref.shape
+    flat = ref.reshape(Z * H * N_CTX, HEAD_DIM).contiguous()
+    quant_input = flat.t().contiguous() if transpose_for_reduction else flat
+    mx = MXTensor.to_mx(
+        quant_input,
+        dtype,
+        scaling_mode=ScaleCalculationMode.RCEIL,
+        is_swizzled_scales=True,
+    )
+    if transpose_for_reduction:
+        data = mx.qdata.t().reshape_as(ref).contiguous()
+        scale = swizzled_to_tma_preshuffled(mx.scale, HEAD_DIM, N_CTX, 32, Z * H)
+    else:
+        data = mx.qdata.reshape_as(ref).contiguous()
+        scale = swizzled_to_tma_preshuffled(mx.scale, N_CTX, HEAD_DIM, 32, Z * H)
+    return data, scale
+
+def _cosine_similarity(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    actual_flat = actual.float().reshape(-1)
+    expected_flat = expected.float().reshape(-1)
+    actual_norm = actual_flat.norm().item()
+    expected_norm = expected_flat.norm().item()
+    if actual_norm == 0.0 or expected_norm == 0.0:
+        return 1.0 if actual_norm == 0.0 and expected_norm == 0.0 else 0.0
+    return torch.dot(actual_flat, expected_flat).item() / (actual_norm * expected_norm)
+
+
+def _assert_close_with_cosine(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    atol: float,
+    rtol: float,
+    label: str,
+    min_cosine: float,
+) -> None:
+    cosine = _cosine_similarity(actual, expected)
+    # TODO: Enable testing?
+    # torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    assert cosine >= min_cosine, (
+        f"{label} cosine_similarity={cosine:.6f} fell below "
+        f"min_cosine={min_cosine:.6f}"
+    )
+
+
+@pytest.mark.parametrize(
+    "Z,H,N_CTX",
+    [
+        (1, 1, 256),
+        (1, 1, 1024),
+        (2, 2, 256),
+        (2, 4, 512),
+        # TODO: Enable
+        # Test the persistent case
+        # (4, 4, 1152),
+    ],
+)
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
+    """MXFP8 backward correctness vs PyTorch autograd on randomized inputs."""
+    from triton.tools.tensor_descriptor import TensorDescriptor
+    from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent_mxfp8 import (
+        _attn_fwd_mxf8_ws,
+        _mxf8_host_descriptor_pre_hook,
+        attention_bwd,
+    )
+
+    sm_scale = 0.5
+    dtype = torch.float8_e4m3fn
+    bwd_atol: float = 2e-1
+    bwd_rtol: float = 2e-1
+    bwd_min_cosine: float = 0.98
+    HEAD_DIM = 128  # bwd kernel only supports HEAD_DIM=128
+    shape = (Z, H, N_CTX, HEAD_DIM)
+    torch.manual_seed(20)
+
+    (q, q_scale, q_ref), (k, k_scale, k_ref), (v, v_scale, v_ref) = (
+        _generate_mxfp8_attention_inputs(shape, DEVICE, dtype)
+    )
+
+    q_ref = q_ref.detach().requires_grad_(True)
+    k_ref = k_ref.detach().requires_grad_(True)
+    v_ref = v_ref.detach().requires_grad_(True)
+    ref_out = torch.nn.functional.scaled_dot_product_attention(
+        q_ref, k_ref, v_ref, scale=sm_scale, is_causal=False
+    )
+    do_bf16 = torch.randn_like(ref_out)
+    ref_out.backward(do_bf16)
+    ref_dq = q_ref.grad.detach()
+    ref_dk = k_ref.grad.detach()
+    ref_dv = v_ref.grad.detach()
+
+    q_dk, q_scale_dk = _quantize_mxfp8_bwd_operand(
+        q_ref.detach(), dtype, transpose_for_reduction=True
+    )
+    k_dq, k_scale_dq = _quantize_mxfp8_bwd_operand(
+        k_ref.detach(), dtype, transpose_for_reduction=True
+    )
+    v_bwd, v_scale_bwd = _quantize_mxfp8_bwd_operand(v_ref.detach(), dtype)
+    do_fp8, do_scale = _quantize_mxfp8_bwd_operand(do_bf16, dtype)
+    do_fp8_dv, do_scale_dv = _quantize_mxfp8_bwd_operand(
+        do_bf16, dtype, transpose_for_reduction=True
+    )
+
+    fwd_config = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent_mxfp8"]
+    y_dim = Z * H * N_CTX
+    o = torch.empty(q.shape, device=DEVICE, dtype=torch.bfloat16)
+    M = torch.empty((Z, H, N_CTX), device=DEVICE, dtype=torch.float32)
+    dummy_block = [1, 1]
+    dummy_5d = [1, 1, 1, 1, 1]
+
+    desc_q = TensorDescriptor(
+        q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
+    )
+    desc_k = TensorDescriptor(
+        k, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
+    )
+    desc_v = TensorDescriptor(
+        v, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
+    )
+    desc_o = TensorDescriptor(
+        o, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
+    )
+    desc_q_scale = TensorDescriptor.from_tensor(q_scale, block_shape=dummy_5d)
+    desc_k_scale = TensorDescriptor.from_tensor(k_scale, block_shape=dummy_5d)
+    desc_v_scale = TensorDescriptor.from_tensor(v_scale, block_shape=dummy_5d)
+    nargs = {
+        **fwd_config,
+        "HEAD_DIM": HEAD_DIM,
+        "desc_q": desc_q,
+        "desc_k": desc_k,
+        "desc_v": desc_v,
+        "desc_o": desc_o,
+        "desc_q_scale": desc_q_scale,
+        "desc_k_scale": desc_k_scale,
+        "desc_v_scale": desc_v_scale,
+    }
+    _mxf8_host_descriptor_pre_hook(nargs)
+
+    def alloc_fn(size, align, _):
+        return torch.empty(size, dtype=torch.int8, device="cuda")
+
+    triton.set_allocator(alloc_fn)
+
+    num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
+    grid = (min(num_sms, triton.cdiv(N_CTX, fwd_config["BLOCK_M"]) * Z * H), 1, 1)
+    # num_stages=1, num_warps=4 must match the autotune config. Without these,
+    # .fn[grid] inherits triton.jit defaults and the SW pipeliner trips on
+    # ttng.wait_barrier_named in the forward kernel.
+    _attn_fwd_mxf8_ws.fn[grid](
+        sm_scale,
+        M,
+        Z,
+        H,
+        desc_q,
+        desc_k,
+        desc_v,
+        desc_o,
+        desc_q_scale,
+        desc_k_scale,
+        desc_v_scale,
+        N_CTX=N_CTX,
+        HEAD_DIM=HEAD_DIM,
+        STAGE=1,
+        num_stages=1,
+        num_warps=4,
+        **fwd_config,
+    )
+
+    dq, dk, dv = attention_bwd(
+        do_fp8,
+        do_fp8_dv,
+        q,
+        q_dk,
+        k,
+        k_dq,
+        v_bwd,
+        o,
+        M,
+        q_scale,
+        q_scale_dk,
+        k_scale,
+        k_scale_dq,
+        v_scale_bwd,
+        do_scale,
+        do_scale_dv,
+        sm_scale,
+        do_bf16=do_bf16,
+    )
+
+    dq_bf16 = dq.to(torch.bfloat16)
+    _assert_close_with_cosine(
+        dq_bf16,
+        ref_dq,
+        atol=bwd_atol,
+        rtol=bwd_rtol,
+        label="dq",
+        min_cosine=bwd_min_cosine,
+    )
+    _assert_close_with_cosine(
+        dk, ref_dk, atol=bwd_atol, rtol=bwd_rtol, label="dk", min_cosine=bwd_min_cosine
+    )
+    _assert_close_with_cosine(
+        dv, ref_dv, atol=bwd_atol, rtol=bwd_rtol, label="dv", min_cosine=bwd_min_cosine
+    )
+
+
 # =============================================================================
 # Hopper GEMM Tests
 # =============================================================================

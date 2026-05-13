@@ -2049,7 +2049,9 @@ class TestToMxfp8:
             NUM_SCALES: tl.constexpr = BLOCK_K // VEC_SIZE
             data_tile = tlx.local_alloc((BLOCK_M, BLOCK_K), fp8_type, tl.constexpr(1))
             scale_tile = tlx.local_alloc((BLOCK_M, NUM_SCALES), tl.uint8, tl.constexpr(1))
-            tlx._to_mxfp8_block(data, data_tile[0], scale_tile[0], VEC_SIZE, fp8_type)
+            data_fp8, scale_e8m0 = tlx._to_mxfp8_block(data, VEC_SIZE, fp8_type)
+            tlx.local_store(data_tile[0], data_fp8)
+            tlx.local_store(scale_tile[0], scale_e8m0)
             data_fp8 = tlx.local_load(data_tile[0])
             tl.store(data_out_ptr + offs_m[:, None] * BLOCK_K + offs_k[None, :], data_fp8)
             scale_loaded = tlx.local_load(scale_tile[0])
