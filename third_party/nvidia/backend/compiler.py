@@ -142,8 +142,8 @@ class CUDAOptions:
     num_ctas: int = 1
     num_stages: int = 3
     warp_size: int = 32
-    minRegAutoWS: int = 24
-    maxRegAutoWS: int = 152
+    minRegAutoWS: Optional[int] = 24
+    maxRegAutoWS: Optional[int] = None
     pingpongAutoWS: bool = False
     # maxnreg corresponds to the ptx parameter .maxnreg, which controls the
     # maximum number of 32-bit registers used by one thread.
