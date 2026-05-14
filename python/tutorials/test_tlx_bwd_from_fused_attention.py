@@ -51,11 +51,6 @@ def _import_from_file(module_name, filepath):
     return mod
 
 
-fused_attn_mod = _import_from_file(
-    "fused_attention_ws_device_tma",
-    os.path.join(_this_dir, "fused-attention-ws-device-tma.py"),
-)
-
 tlx_tutorial_path = os.path.join(
     _this_dir,
     "..",
@@ -63,6 +58,10 @@ tlx_tutorial_path = os.path.join(
     "third_party",
     "tlx",
     "tutorials",
+)
+fused_attn_mod = _import_from_file(
+    "fused_attention_ws_device_tma",
+    os.path.join(tlx_tutorial_path, "fused_attention_ws_device_tma.py"),
 )
 tlx_mod = _import_from_file(
     "blackwell_fa_ws_pipelined_persistent",

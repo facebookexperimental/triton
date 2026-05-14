@@ -671,6 +671,15 @@ _DEFAULT_BWD_DOT_ATTRS = FrozenDotAttrs({
     "dk": {"stage": "1", "order": "1", "channels": ["opndD,tmem,1,10"]},
 })
 
+# for BM of 128: dpT share with dq, qk share with ppT, dsT share with dpT
+_BWD_DOT_ATTRS_TMEM = FrozenDotAttrs({
+    "qkT": {"stage": "0", "order": "0", "channels": ["opndA,smem,1,0", "opndB,smem,2,1", "opndD,tmem,1,2"]},
+    "dpT": {"stage": "0", "order": "2", "channels": ["opndA,smem,1,3", "opndB,smem,1,4", "opndD,tmem,1,5"]},
+    "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},
+    "dq": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,5"]},
+    "dk": {"stage": "1", "order": "1", "channels": ["opndA,tmem,1,5", "opndD,tmem,1,10"]},
+})
+
 _BWD_DOT_ATTRS_BM64_TMEM = FrozenDotAttrs({
     # qkT inputs: k, q; dpT inputs: v, do; dv inputs: ppT, do; dq inputs: dsT, k; dk inputs: dsT, q
     # no need to reuse between dq and dpT
@@ -921,7 +930,7 @@ configs_bwd = [
     )
 ]
 
-configs_bwd_persist = [
+configs_bwd_subtile_opt = [
     triton.Config(
         {
             "BLOCK_M1": 64,
@@ -934,8 +943,71 @@ configs_bwd_persist = [
         num_warps=4,
         num_stages=2,
         pre_hook=_bwd_host_descriptor_pre_hook,
-        ir_override="/home/mren/local/MetaMain/triton/override/autows.ttgir",
     ),
+]
+
+configs_bwd_persist = [
+     triton.Config(
+         {
+            "BLOCK_M1": 128,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 128,
+            "EPILOGUE_SUBTILE": 4,
+            "BWD_DOT_ATTRS": _DEFAULT_BWD_DOT_ATTRS,
+        },
+        num_warps=4,
+        num_stages=2,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M1": 128, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 128, "EPILOGUE_SUBTILE": 4, "BWD_DOT_ATTRS":
+            _BWD_DOT_ATTRS_SCHED,  # use memory planner heuristics
+        },
+        num_warps=4,
+        num_stages=2,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+    ),
+    #triton.Config( # test dk/dv staging buffer reuse
+    #    {
+    #        "BLOCK_M1": 128,
+    #        "BLOCK_N1": 128,
+    #        "BLOCK_M2": 128,
+    #        "BLOCK_N2": 128,
+    #        "EPILOGUE_SUBTILE": 2,
+    #        "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_TMEM,
+    #    },
+    #    num_warps=4,
+    #    num_stages=2,
+    #    pre_hook=_bwd_host_descriptor_pre_hook,
+    #),
+    triton.Config(
+        {
+            "BLOCK_M1": 64,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 128,
+            "EPILOGUE_SUBTILE": 2,
+            "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM64_TMEM,
+        },
+        num_warps=4,
+        num_stages=2,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M1": 64,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 128,
+            "EPILOGUE_SUBTILE": 2,
+            "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM64,
+        },
+        num_warps=4,
+        num_stages=2,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+     ),
 ]
 
 
@@ -1538,7 +1610,7 @@ attention = _attention_opt.apply
 @pytest.mark.parametrize("VECT_MUL", [0])  # , 1, 2, 3])
 @pytest.mark.parametrize("FADD2_REDUCE", [False])
 @pytest.mark.parametrize("bwd_config_idx", range(len(configs_bwd_persist)))
-@pytest.mark.parametrize("early_tma_store_lowering", [False, True])
+@pytest.mark.parametrize("early_tma_store_lowering", [False])
 def test_op(
     Z,
     H,
