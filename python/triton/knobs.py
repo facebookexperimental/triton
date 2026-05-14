@@ -523,6 +523,7 @@ class nvidia_knobs(base_knobs):
     use_triton_dispatcher: env_bool = env_bool("TRITON_USE_TRITON_DISPATCHER")
     generate_subtiled_region: env_bool = env_bool("TRITON_GENERATE_SUBTILED_REGION")
     enable_tileir: env_bool = env_bool("ENABLE_TILE")
+    disable_budget_aware_layout_conversion: env_bool = env_bool("TRITON_DISABLE_BUDGET_AWARE_LAYOUT_CONVERSION")
 
 
 class amd_knobs(base_knobs):
