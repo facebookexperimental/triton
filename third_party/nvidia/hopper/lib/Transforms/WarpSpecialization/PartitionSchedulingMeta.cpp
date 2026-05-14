@@ -2445,25 +2445,34 @@ void splitDataPartitionedIfOps(scf::ForOp loop, PartitionSet &schedule) {
       auto *origElseYield =
           origElseBlock ? origElseBlock->getTerminator() : nullptr;
 
-      // Collect needed ops for the else block via backward reachability.
-      DenseSet<Operation *> neededElseOps;
-      if (origElseBlock) {
-        for (unsigned idx : resultIndices) {
+      // Collect needed ops via backward reachability from yield operands.
+      auto collectNeededOps = [](Block *block, Operation *yieldOp,
+                                 ArrayRef<unsigned> indices) {
+        DenseSet<Operation *> needed;
+        for (unsigned idx : indices) {
           SmallVector<Operation *> worklist;
-          if (auto *def = origElseYield->getOperand(idx).getDefiningOp())
+          if (auto *def = yieldOp->getOperand(idx).getDefiningOp())
             worklist.push_back(def);
           while (!worklist.empty()) {
             Operation *curr = worklist.pop_back_val();
-            if (!curr || curr->getBlock() != origElseBlock)
+            if (!curr || curr->getBlock() != block)
               continue;
-            if (!neededElseOps.insert(curr).second)
+            if (!needed.insert(curr).second)
               continue;
             for (Value operand : curr->getOperands())
               if (auto *def = operand.getDefiningOp())
                 worklist.push_back(def);
           }
         }
-      }
+        return needed;
+      };
+
+      DenseSet<Operation *> neededThenOps =
+          collectNeededOps(origThenBlock, origThenYield, resultIndices);
+      DenseSet<Operation *> neededElseOps;
+      if (origElseBlock)
+        neededElseOps =
+            collectNeededOps(origElseBlock, origElseYield, resultIndices);
 
       // Build result types for this split.
       SmallVector<Type> splitResultTypes;
@@ -2474,12 +2483,7 @@ void splitDataPartitionedIfOps(scf::ForOp loop, PartitionSet &schedule) {
       auto thenBuilder = [&](OpBuilder &b, Location loc) {
         IRMapping mapping;
         for (Operation &op : origThenBlock->without_terminator()) {
-          bool needed = false;
-          for (unsigned idx : resultIndices) {
-            if (origThenYield->getOperand(idx).getDefiningOp() == &op)
-              needed = true;
-          }
-          if (needed)
+          if (neededThenOps.contains(&op))
             b.clone(op, mapping);
         }
         SmallVector<Value> yieldVals;
@@ -2509,13 +2513,47 @@ void splitDataPartitionedIfOps(scf::ForOp loop, PartitionSet &schedule) {
               : static_cast<function_ref<void(OpBuilder &, Location)>>(
                     nullptr));
 
-      // Assign the new scf.if to this computation partition.
-      setPartition(newIf, schedule.getPartition(partId));
+      // Assign the new scf.if and all ops inside it to this computation
+      // partition. Without this, cloned ops inside the then/else blocks
+      // keep stale partition assignments from the originals, causing the
+      // downstream code partition pass to miss them when building this
+      // partition's code.
+      auto *targetPartition = schedule.getPartition(partId);
+      newIf->walk([&](Operation *op) { setPartition(op, targetPartition); });
+
+      // Copy loop scheduling attributes (loop.stage, loop.cluster) from
+      // the original scf.if to the new one. Without these, the downstream
+      // pipeliner can't schedule ops derived from the split scf.if (e.g.
+      // local_store channel ops created by code partition).
+      if (auto attr = ifOp->getAttr("loop.stage"))
+        newIf->setAttr("loop.stage", attr);
+      if (auto attr = ifOp->getAttr("loop.cluster"))
+        newIf->setAttr("loop.cluster", attr);
 
       // Replace uses of the original results with the new scf.if results.
       for (unsigned i = 0; i < resultIndices.size(); i++) {
         ifOp.getResult(resultIndices[i]).replaceAllUsesWith(newIf.getResult(i));
       }
+    }
+
+    // Remove stale partition assignments from ops outside the scf.if that
+    // were pulled into partition 0 because the original scf.if was shared.
+    // This includes the condition and yield operands defined outside the
+    // scf.if (e.g. convert_layout ops cloned by optimizeSchedule). Leaving
+    // them in partition 0 causes doTaskIdPropagate to expand the split
+    // scf.if's task set, creating cross-partition SMEM channels that
+    // overflow shared memory.
+    auto removeStalePartition = [&](Value v) {
+      if (auto *op = v.getDefiningOp())
+        if (op->getParentOp() == ifOp->getParentOp())
+          op->removeAttr(kPartitionAttrName);
+    };
+    removeStalePartition(ifOp.getCondition());
+    for (auto *block : {ifOp.thenBlock(), ifOp.elseBlock()}) {
+      if (!block)
+        continue;
+      for (Value operand : block->getTerminator()->getOperands())
+        removeStalePartition(operand);
     }
 
     // Erase the original scf.if (all uses should be replaced).

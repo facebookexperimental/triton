@@ -31,11 +31,38 @@ def is_hopper():
 
 
 @triton.jit
+def _mask_scalar(qk, col_limit_right, s, i):
+    col_lim_right_s = col_limit_right - s
+    col_lim_right_cur = max(col_lim_right_s, 0)
+    mask = -1 << col_lim_right_cur
+    mask_i_bit = (mask & (1 << i)) == 0
+    return tl.where(mask_i_bit, qk, -float("inf"))
+
+
+@triton.jit
+def _apply_causal_mask(qk, col_limit_right, BLOCK_N: tl.constexpr):
+    # Apply causal mask via a bitmask calculated for each block of 16 elements.
+    # This allows the efficient R2P (register to predicate) instruction to be used at the SASS level.
+    # Credit to Tri Dao,
+    # https://github.com/Dao-AILab/flash-attention/commit/bac1001e4f6caa09d70537495d6746a685a2fa78
+    #
+    # NOTE: We use map_elementiwse here in order to generate an interleaved sequence of instructions
+    # that processes one element of qk at a time. This improves ptxas's resulting SASS.
+    offs_n = tl.arange(0, BLOCK_N)[None, :]
+    s = offs_n & ~0xF
+    i = offs_n & 0xF
+    return tl.map_elementwise(_mask_scalar, qk, col_limit_right, s, i)
+
+
+@triton.jit
 def _attn_fwd_subtile(
     q,
     k,
     offs_m,
     start_n,
+    start_m,
+    BLOCK_N,
+    BLOCK_M,
     offs_n,
     qk_scale,
     l_i0,
@@ -50,17 +77,18 @@ def _attn_fwd_subtile(
     FADD2_REDUCE: tl.constexpr,
 ):
     qk = tl.dot(q, k)
-    if STAGE == 2:
-        mask = offs_m[:, None] >= (start_n + offs_n[None, :])
-        qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
-        m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        qk -= m_ij[:, None]
+
+    if STAGE == 3 and start_n >= start_m * BLOCK_M:
+        col_limit_right = (offs_m - start_n + 1)[:, None]
+        qk = _apply_causal_mask(qk, col_limit_right, BLOCK_N)
+
+    m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+
+    if VECT_MUL == 2 or VECT_MUL == 3:
+        qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
     else:
-        m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
-        if VECT_MUL == 2 or VECT_MUL == 3:
-            qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
-        else:
-            qk = qk * qk_scale - m_ij[:, None]
+        qk = qk * qk_scale - m_ij[:, None]
+
     p = tl.math.exp2(qk)
     # -- compute correction factor
     alpha = tl.math.exp2(m_i - m_ij)
@@ -131,14 +159,10 @@ def _attn_fwd_inner_oss_dp(
     DP_FACTOR: tl.constexpr,
 ):
     # range of values handled by this stage
-    if STAGE == 1:
-        lo, hi = 0, start_m * BLOCK_M
-    elif STAGE == 2:
-        lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
-        lo = tl.multiple_of(lo, BLOCK_M)
-    # causal = False
-    else:
+    if STAGE == 1:  # causal = False
         lo, hi = 0, N_CTX
+    else:  # causal = True
+        lo, hi = 0, (start_m + 1) * BLOCK_M
     offsetkv_y = offset_y + lo
 
     # loop over k, v and update accumulator
@@ -162,6 +186,9 @@ def _attn_fwd_inner_oss_dp(
             k,
             offs_m0,
             start_n,
+            start_m,
+            BLOCK_N,
+            BLOCK_M,
             offs_n,
             qk_scale,
             l_i0,
@@ -213,7 +240,6 @@ configs = [
         num_stages=s,
         num_warps=w,
         pre_hook=_host_descriptor_pre_hook,
-        # ir_override=f"/home/mren/OpenSource/tritonbench/override/_attn_fwd_persist.ttgir"
     ) for BM in [256] for BN in [128] for s in NUM_STAGES_OPTIONS for w in [4]
 ]
 
@@ -351,58 +377,31 @@ def _attn_fwd_tma_dp(
     else:
         l_i0_1 = 0
 
-    if STAGE & 1:
-        acc0, l_i0_0, l_i0_1, m_i0 = _attn_fwd_inner_oss_dp(
-            acc0,
-            l_i0_0,
-            l_i0_1,
-            m_i0,
-            q0,
-            desc_k,
-            desc_v,  #
-            offset_y,
-            dtype,
-            start_m,
-            qk_scale,  #
-            BLOCK_M,
-            HEAD_DIM,
-            BLOCK_N,  #
-            4 - STAGE,
-            offs_m0,
-            offs_n,
-            N_CTX,  #
-            warp_specialize,
-            SUBTILING,
-            VECT_MUL,
-            FADD2_REDUCE,
-            DP_FACTOR,
-        )
-    if STAGE & 2:
-        acc0, l_i0_0, l_i0_1, m_i0 = _attn_fwd_inner_oss_dp(
-            acc0,
-            l_i0_0,
-            l_i0_1,
-            m_i0,
-            q0,
-            desc_k,
-            desc_v,  #
-            offset_y,
-            dtype,
-            start_m,
-            qk_scale,  #
-            BLOCK_M,
-            HEAD_DIM,
-            BLOCK_N,  #
-            2,
-            offs_m0,
-            offs_n,
-            N_CTX,  #
-            warp_specialize,
-            SUBTILING,
-            VECT_MUL,
-            FADD2_REDUCE,
-            DP_FACTOR,
-        )
+    acc0, l_i0_0, l_i0_1, m_i0 = _attn_fwd_inner_oss_dp(
+        acc0,
+        l_i0_0,
+        l_i0_1,
+        m_i0,
+        q0,
+        desc_k,
+        desc_v,
+        offset_y,
+        dtype,
+        start_m,
+        qk_scale,
+        BLOCK_M,
+        HEAD_DIM,
+        BLOCK_N,
+        STAGE,
+        offs_m0,
+        offs_n,
+        N_CTX,
+        warp_specialize,
+        SUBTILING,
+        VECT_MUL,
+        FADD2_REDUCE,
+        DP_FACTOR,
+    )
 
     if FADD2_REDUCE:
         l_i0 = l_i0_0 + l_i0_1
@@ -947,8 +946,8 @@ configs_bwd_subtile_opt = [
 ]
 
 configs_bwd_persist = [
-     triton.Config(
-         {
+    triton.Config(
+        {
             "BLOCK_M1": 128,
             "BLOCK_N1": 128,
             "BLOCK_M2": 128,
@@ -1007,7 +1006,7 @@ configs_bwd_persist = [
         num_warps=4,
         num_stages=2,
         pre_hook=_bwd_host_descriptor_pre_hook,
-     ),
+    ),
 ]
 
 

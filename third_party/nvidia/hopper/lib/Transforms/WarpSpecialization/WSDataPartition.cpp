@@ -348,7 +348,7 @@ static bool getBackwardSliceToPartition(Value v,
                    TransOp, MemDescTransOp, AtomicRMWOp, triton::AddPtrOp,
                    nvidia_gpu::TMEMAllocOp, nvidia_gpu::TMEMLoadOp,
                    nvidia_gpu::TMEMStoreOp, FpToFpOp, SplitOp, JoinOp,
-                   ReshapeOp>(op)) {
+                   ReshapeOp, MapElementwiseOp>(op)) {
       for (Value operand : op->getOperands())
         if (!getBackwardSliceToPartition(operand, partitionScheme,
                                          currentDim)) {
@@ -608,7 +608,7 @@ static bool getSliceToPartition(Value root,
                                        currentDim))
         return false;
     } else if (op->hasTrait<OpTrait::Elementwise>() ||
-               isa<StoreOp, AtomicRMWOp>(op)) {
+               isa<StoreOp, AtomicRMWOp, MapElementwiseOp>(op)) {
       for (OpOperand &operand : op->getOpOperands()) {
         if (!getBackwardSliceToPartition(operand.get(), partitionScheme,
                                          currentDim))
