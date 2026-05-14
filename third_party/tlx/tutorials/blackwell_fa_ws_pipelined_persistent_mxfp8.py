@@ -1248,7 +1248,6 @@ mxfp8_bwd_configs = [
             "NUM_BUFFERS_DO": 1,
             "NUM_BUFFERS_DS": 1,
             "EPILOGUE_SUBTILE": 4,
-            "EARLY_RELEASE_SUBTILES": 1,
         },
         num_warps=4,
         num_stages=1,
@@ -1296,7 +1295,6 @@ def _attn_bwd_mxf8_ws(
     NUM_BUFFERS_DO: tl.constexpr,
     NUM_BUFFERS_DS: tl.constexpr,
     EPILOGUE_SUBTILE: tl.constexpr,
-    EARLY_RELEASE_SUBTILES: tl.constexpr,
 ) -> None:
     tl.static_assert(HEAD_DIM == 128)
     tl.static_assert(BLOCK_N1 == 128)
@@ -1796,6 +1794,7 @@ def _attn_bwd_mxf8_ws(
                 Di = tl.load(D_off + offs_m)
                 tlx.barrier_wait(dp_fulls[0], tmem_phase)
                 dpT = tlx.local_load(dp_tiles[0])
+                tlx.barrier_arrive(dp_empties[0])
 
                 dsT = pT * (dpT - Di[None, :])
                 # NaN sanitization (boundary tiles)
@@ -2030,6 +2029,10 @@ def _attn_bwd_mxf8_ws(
                 )
                 blk_idx += 1
 
+                # Wait for MMA 4. This avoids needing to thread this into
+                # the body/epilogue with a conditional.
+                tlx.barrier_wait(k_dq_fulls[kv_buf_id], kv_phase)
+
                 # --- Main loop: iters 1 .. num_steps-1 ---
                 for j in range(1, num_steps):
                     q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
@@ -2086,7 +2089,6 @@ def _attn_bwd_mxf8_ws(
                     # Linear order for all deps. For body MMA 2 -> MMA 5.
                     # MMA 2 handled by ds_fulls[ds_buf_id_prev].
                     tlx.barrier_wait(ds_fulls[ds_buf_id_prev], ds_phase_prev)
-                    tlx.barrier_wait(k_dq_fulls[kv_buf_id], kv_phase)
                     # REUSE_GROUP_1: wait for Compute to finish reading qk_tiles
                     # before overwriting with scale tmem_copies.
                     tlx.barrier_wait(qk_empties[0], tmem_phase)
@@ -2110,7 +2112,7 @@ def _attn_bwd_mxf8_ws(
                     # MMA 4: dK += dS^T @ Q (previous M-block, dS from SMEM)
 
                     # REUSE_GROUP_1 SYNCHRONIZATION:
-                    # qk_empties waits for MMA 1 to finish.
+                    # qk_empties waits for MMA 1 to finish above.
 
                     # REUSE_GROUP_3 SYNCHRONIZATION:
                     # Linear order for all deps. For body MMA 5 -> MMA 4.
@@ -2123,7 +2125,6 @@ def _attn_bwd_mxf8_ws(
                     # MMA 1: Handled by QK iter 1 reusing QK
                     # MMA 2: Handled by ds_fulls barrier in MMA 5
                     # MMA 3: Handled by p_empties in MMA 1
-                    tlx.barrier_wait(qk_empties[0], tmem_phase)
                     tlx.barrier_wait(q_dk_fulls[q_buf_id_prev], q_phase_prev)
                     # Copy from SMEM to TMEM
                     # TODO: Blocked on TLX feature
@@ -2157,7 +2158,6 @@ def _attn_bwd_mxf8_ws(
                     # MMA 4 handled by q_dk_empties[q_buf_id_prev]. This is fine
                     # because we just need to reclaim the inputs.
                     tlx.barrier_wait(do_fulls[do_buf_id], do_phase)
-                    tlx.barrier_wait(dq_empties[0], tmem_phase ^ 1)
                     tlx.barrier_wait(q_dk_empties[q_buf_id_prev], q_phase_prev)
                     tlx.tmem_copy(v_scale_smem[kv_buf_id], v_scale_tmem[0])
                     tlx.tmem_copy(do_scale_smem[do_buf_id], do_scale_dp_tmem[0])
@@ -2244,7 +2244,6 @@ def _attn_bwd_mxf8_ws(
                 # MMA 4 handled by q_dk_empties[q_buf_id].
                 tlx.barrier_wait(dq_empties[0], tmem_phase ^ 1)
                 tlx.barrier_wait(q_dk_empties[q_buf_id], q_phase)
-                tlx.barrier_wait(k_dq_fulls[kv_buf_id], kv_phase)
                 # Experiment: for the N_CTX=128 repro, MMA 5 epilogue can reuse
                 # the dQ scales packed into SMEM during dS quantization and
                 # copied into TMEM here.
@@ -2399,7 +2398,7 @@ def _attn_bwd_mxf8_ws(
                 curr_m += BLOCK_M1
                 blk_idx += 1
 
-                # Load subsequent Q / dO tiles
+                # Load subsequent Q / dO tiles.
                 for _j in range(1, num_steps):
                     prev_blk_idx = blk_idx - 1
                     prev_m = curr_m - BLOCK_M1
@@ -2619,8 +2618,9 @@ def attention_bwd(
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
     def grid(meta):
+        total_tiles = triton.cdiv(N_CTX, meta["BLOCK_N1"]) * Z * H
         return (
-            min(NUM_SMS, triton.cdiv(N_CTX, meta["BLOCK_N1"]) * Z * H),
+            min(NUM_SMS, total_tiles),
             1,
             1,
         )

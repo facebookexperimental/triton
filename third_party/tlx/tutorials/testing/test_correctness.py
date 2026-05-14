@@ -3,6 +3,7 @@ import pytest
 import torch
 
 import triton
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 from triton.language.extra.tlx.tutorials.blackwell_gemm_ws import (
     matmul as _blackwell_gemm_ws, )
@@ -22,8 +23,12 @@ from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent im
 from triton.language.extra.tlx.tutorials.blackwell_fa_clc import (
     attention as _blackwell_fa_clc, )
 from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent_mxfp8 import (
+    _attn_fwd_mxf8_ws,
+    _mxf8_host_descriptor_pre_hook,
     attention as _blackwell_fa_ws_pipelined_persistent_mxfp8,
+    attention_bwd,
     generate_attention_inputs as _generate_mxfp8_attention_inputs,
+    swizzled_to_tma_preshuffled,
 )
 from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined import (
     attention as _blackwell_fa_ws_pipelined, )
@@ -431,8 +436,6 @@ def test_blackwell_fa_clc(N_CTX, causal, RESCALE_OPT, USE_WHERE):
 @pytest.mark.parametrize("RESCALE_OPT,USE_WHERE", [(False, False), (True, False), (True, True)])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE):
-    from triton.tools.tensor_descriptor import TensorDescriptor
-
     fwd_config: dict[str,
                      bool | int] = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent_warp_barrier"].copy()
     fwd_config["RESCALE_OPT"] = RESCALE_OPT
@@ -589,10 +592,6 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8(HEAD_DIM, causal):
 
 def _quantize_mxfp8_bwd_operand(ref, dtype, transpose_for_reduction=False):
     from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode
-    from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent_mxfp8 import (
-        swizzled_to_tma_preshuffled,
-    )
-
     Z, H, N_CTX, HEAD_DIM = ref.shape
     flat = ref.reshape(Z * H * N_CTX, HEAD_DIM).contiguous()
     quant_input = flat.t().contiguous() if transpose_for_reduction else flat
@@ -637,7 +636,6 @@ def _assert_close_with_cosine(
         f"min_cosine={min_cosine:.6f}"
     )
 
-
 @pytest.mark.parametrize(
     "Z,H,N_CTX",
     [
@@ -654,26 +652,18 @@ def _assert_close_with_cosine(
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
     """MXFP8 backward correctness vs PyTorch autograd on randomized inputs."""
-    from triton.tools.tensor_descriptor import TensorDescriptor
-    from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent_mxfp8 import (
-        _attn_fwd_mxf8_ws,
-        _mxf8_host_descriptor_pre_hook,
-        attention_bwd,
-    )
-
     sm_scale = 0.5
     dtype = torch.float8_e4m3fn
+    head_dim = 128
+    shape = (Z, H, N_CTX, head_dim)
     bwd_atol: float = 2e-1
     bwd_rtol: float = 2e-1
     bwd_min_cosine: float = 0.98
-    HEAD_DIM = 128  # bwd kernel only supports HEAD_DIM=128
-    shape = (Z, H, N_CTX, HEAD_DIM)
     torch.manual_seed(20)
 
     (q, q_scale, q_ref), (k, k_scale, k_ref), (v, v_scale, v_ref) = (
         _generate_mxfp8_attention_inputs(shape, DEVICE, dtype)
     )
-
     q_ref = q_ref.detach().requires_grad_(True)
     k_ref = k_ref.detach().requires_grad_(True)
     v_ref = v_ref.detach().requires_grad_(True)
@@ -682,9 +672,6 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
     )
     do_bf16 = torch.randn_like(ref_out)
     ref_out.backward(do_bf16)
-    ref_dq = q_ref.grad.detach()
-    ref_dk = k_ref.grad.detach()
-    ref_dv = v_ref.grad.detach()
 
     q_dk, q_scale_dk = _quantize_mxfp8_bwd_operand(
         q_ref.detach(), dtype, transpose_for_reduction=True
@@ -704,25 +691,24 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
     M = torch.empty((Z, H, N_CTX), device=DEVICE, dtype=torch.float32)
     dummy_block = [1, 1]
     dummy_5d = [1, 1, 1, 1, 1]
-
     desc_q = TensorDescriptor(
-        q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
+        q, shape=[y_dim, head_dim], strides=[head_dim, 1], block_shape=dummy_block
     )
     desc_k = TensorDescriptor(
-        k, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
+        k, shape=[y_dim, head_dim], strides=[head_dim, 1], block_shape=dummy_block
     )
     desc_v = TensorDescriptor(
-        v, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
+        v, shape=[y_dim, head_dim], strides=[head_dim, 1], block_shape=dummy_block
     )
     desc_o = TensorDescriptor(
-        o, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
+        o, shape=[y_dim, head_dim], strides=[head_dim, 1], block_shape=dummy_block
     )
     desc_q_scale = TensorDescriptor.from_tensor(q_scale, block_shape=dummy_5d)
     desc_k_scale = TensorDescriptor.from_tensor(k_scale, block_shape=dummy_5d)
     desc_v_scale = TensorDescriptor.from_tensor(v_scale, block_shape=dummy_5d)
     nargs = {
         **fwd_config,
-        "HEAD_DIM": HEAD_DIM,
+        "HEAD_DIM": head_dim,
         "desc_q": desc_q,
         "desc_k": desc_k,
         "desc_v": desc_v,
@@ -739,11 +725,12 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
     triton.set_allocator(alloc_fn)
 
     num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
-    grid = (min(num_sms, triton.cdiv(N_CTX, fwd_config["BLOCK_M"]) * Z * H), 1, 1)
-    # num_stages=1, num_warps=4 must match the autotune config. Without these,
-    # .fn[grid] inherits triton.jit defaults and the SW pipeliner trips on
-    # ttng.wait_barrier_named in the forward kernel.
-    _attn_fwd_mxf8_ws.fn[grid](
+    fwd_grid = (
+        min(num_sms, triton.cdiv(N_CTX, fwd_config["BLOCK_M"]) * Z * H),
+        1,
+        1,
+    )
+    _attn_fwd_mxf8_ws.fn[fwd_grid](
         sm_scale,
         M,
         Z,
@@ -756,7 +743,7 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
         desc_k_scale,
         desc_v_scale,
         N_CTX=N_CTX,
-        HEAD_DIM=HEAD_DIM,
+        HEAD_DIM=head_dim,
         STAGE=1,
         num_stages=1,
         num_warps=4,
@@ -783,6 +770,9 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
         sm_scale,
         do_bf16=do_bf16,
     )
+    ref_dq = q_ref.grad.detach()
+    ref_dk = k_ref.grad.detach()
+    ref_dv = v_ref.grad.detach()
 
     dq_bf16 = dq.to(torch.bfloat16)
     _assert_close_with_cosine(
@@ -794,10 +784,20 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
         min_cosine=bwd_min_cosine,
     )
     _assert_close_with_cosine(
-        dk, ref_dk, atol=bwd_atol, rtol=bwd_rtol, label="dk", min_cosine=bwd_min_cosine
+        dk,
+        ref_dk,
+        atol=bwd_atol,
+        rtol=bwd_rtol,
+        label="dk",
+        min_cosine=bwd_min_cosine,
     )
     _assert_close_with_cosine(
-        dv, ref_dv, atol=bwd_atol, rtol=bwd_rtol, label="dv", min_cosine=bwd_min_cosine
+        dv,
+        ref_dv,
+        atol=bwd_atol,
+        rtol=bwd_rtol,
+        label="dv",
+        min_cosine=bwd_min_cosine,
     )
 
 
