@@ -1177,7 +1177,7 @@ def _attn_bwd_preprocess(
     off_h = off_hz % H
     off_z = off_hz // H
     base = (off_z * H + off_h) * N_CTX
-    o_offsets = ((base + off_m[:, None]) * HEAD_DIM + off_d[None, :])
+    o_offsets = (base + off_m[:, None]) * HEAD_DIM + off_d[None, :]
     o_mask = off_m[:, None] < N_CTX
     o = tl.load(O + o_offsets, mask=o_mask, other=0.0)
     do = tl.load(DO + o_offsets, mask=o_mask, other=0.0).to(tl.float32)
@@ -2118,17 +2118,15 @@ def _attn_bwd_mxf8_ws(
                     # MMA 3: Handled by p_empties in MMA 1
                     tlx.barrier_wait(qk_empties[0], tmem_phase)
                     tlx.barrier_wait(q_dk_fulls[q_buf_id_prev], q_phase_prev)
-                    # Copy from SMEM to TMEM
-                    # TODO: Blocked on TLX feature
-                    # tlx.tmem_copy(ds_tiles_smem[ds_buf_id_prev], ds_tiles_tmem[0])
                     tlx.barrier_wait(dq_empties[0], tmem_phase_prev)
                     # Fence for ds_scale_smem to be visible.
                     tlx.fence("async_shared")
+                    # Copy from SMEM to TMEM
+                    tlx.tmem_copy(ds_tiles_smem[ds_buf_id_prev], ds_tiles_tmem[0])
                     tlx.tmem_copy(ds_scale_smem[0], ds_scale_dk_tmem[0])
                     tlx.tmem_copy(q_dk_scale_smem[q_buf_id_prev], q_scale_dk_tmem[0])
                     tlx.async_dot_scaled(
-                        # TODO: ds_tiles_tmem[0],
-                        ds_tiles_smem[ds_buf_id_prev],
+                        ds_tiles_tmem[0],
                         q_dk_smem[q_buf_id_prev],
                         dk_tiles[0],
                         ds_scale_dk_tmem[0],
@@ -2208,13 +2206,11 @@ def _attn_bwd_mxf8_ws(
                 # Copy from SMEM to TMEM
                 # Fence for ds_scale_smem to be visiible.
                 tlx.fence("async_shared")
-                # TODO: Blocked on TLX feature
-                # tlx.tmem_copy(ds_tiles_smem[ds_buf_id], ds_tiles_tmem[0])
+                tlx.tmem_copy(ds_tiles_smem[ds_buf_id], ds_tiles_tmem[0])
                 tlx.tmem_copy(q_dk_scale_smem[q_buf_id], q_scale_dk_tmem[0])
                 tlx.tmem_copy(ds_scale_smem[0], ds_scale_dk_tmem[0])
                 tlx.async_dot_scaled(
-                    # TODO: ds_tiles_tmem[0],
-                    ds_tiles_smem[ds_buf_id],
+                    ds_tiles_tmem[0],
                     q_dk_smem[q_buf_id],
                     dk_tiles[0],
                     ds_scale_dk_tmem[0],
