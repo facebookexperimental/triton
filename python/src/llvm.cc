@@ -1,7 +1,7 @@
 #include "mlir/IR/BuiltinOps.h" // mlir::ModuleOp
 #include "mlir/Target/LLVMIR/LLVMTranslationInterface.h"
 #include "mlir/Target/LLVMIR/ModuleTranslation.h"
-#include "triton/Tools/Sys/GetEnv.hpp"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/ScopedNoAliasAA.h"
 #include "llvm/CodeGen/MIRParser/MIRParser.h"
@@ -49,6 +49,8 @@ struct BreakStructPhiNodesPass : PassInfoMixin<BreakStructPhiNodesPass> {
 } // namespace llvm
 
 using namespace llvm;
+
+namespace {
 
 // Set an LLVM command-line option using addOccurrence (simulates command-line)
 // and return its original value. Using addOccurrence instead of setValue is
@@ -507,6 +509,8 @@ translateMIRToASM(const std::string &mirPath, const std::string &triple,
 
 using ret = py::return_value_policy;
 
+} // namespace
+
 void init_triton_llvm(py::module &&m) {
 
   py::class_<llvm::LLVMContext>(m, "context", py::module_local())
@@ -643,7 +647,7 @@ void init_triton_llvm(py::module &&m) {
       "optimize_module",
       [](llvm::Module *mod, const llvm::OptimizationLevel &opt,
          std::string arch, std::string features, std::vector<std::string> flags,
-         bool enable_fp_fusion) {
+         bool enable_fp_fusion, bool disable_vector_combine) {
         if (mlir::triton::tools::getBoolEnv("DISABLE_LLVM_OPT"))
           return;
         // Check to see if we are passing a list of flags to disable
@@ -674,11 +678,24 @@ void init_triton_llvm(py::module &&m) {
         PassInstrumentationCallbacks passInstrCb;
         StandardInstrumentations standardInstr(mod->getContext(),
                                                /*DebugLogging*/ true);
+        bool enablePassInstrumentation = false;
+        if (disable_vector_combine) {
+          // VectorCombinePass::name() returns the C++ class name, not the
+          // registry name "vector-combine".
+          const StringRef kVectorCombinePassName = "VectorCombinePass";
+          passInstrCb.registerShouldRunOptionalPassCallback(
+              [kVectorCombinePassName](StringRef passName, Any) {
+                return passName != kVectorCombinePassName;
+              });
+          enablePassInstrumentation = true;
+        }
         if (mlir::triton::tools::getBoolEnv("LLVM_IR_ENABLE_DUMP")) {
           setLLVMOption<bool>("print-after-all", true);
           standardInstr.registerCallbacks(passInstrCb, &mam);
-          instrCbPtr = &passInstrCb;
+          enablePassInstrumentation = true;
         }
+        if (enablePassInstrumentation)
+          instrCbPtr = &passInstrCb;
 
         PipelineTuningOptions tuningOptions;
         tuningOptions.LoopUnrolling = true;
@@ -756,6 +773,7 @@ void init_triton_llvm(py::module &&m) {
       py::arg("arch") = "", py::arg("features") = "",
       py::arg("flags") = std::vector<std::string>{},
       py::arg("enable_fp_fusion") = false,
+      py::arg("disable_vector_combine") = false,
       py::call_guard<py::gil_scoped_release>());
 
   m.def(
@@ -916,7 +934,7 @@ void init_triton_llvm(py::module &&m) {
   });
 }
 
-void triton_stacktrace_signal_handler(void *) {
+static void triton_stacktrace_signal_handler(void *) {
   llvm::sys::PrintStackTrace(llvm::errs());
   raise(SIGABRT);
 }
