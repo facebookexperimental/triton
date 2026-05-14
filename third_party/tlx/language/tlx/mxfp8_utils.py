@@ -147,27 +147,22 @@ def _compute_scale_and_quantize(
 @triton.jit
 def _to_mxfp8_block(
     data_input,
-    data_out_tile,
-    scale_out_tile,
     VEC_SIZE: tl.constexpr,
     dtype: tl.constexpr,
 ):
     """
-    Convert a float32 tensor to MXFP8 format and store results.
+    Convert a float32 tensor to MXFP8 format.
 
     This function converts float32 data to FP8 data with E8M0 per-block scales,
-    suitable for use with Blackwell's scaled MMA operations. All data stays in
-    registers except for the final stores.
+    suitable for use with Blackwell's scaled MMA operations.
 
     Args:
         data_input: Input tensor of shape [BLOCK_M, BLOCK_K] in float32 (in registers)
-        data_out_tile: Preallocated buffer for FP8 data output (SMEM or TMEM)
-        scale_out_tile: Preallocated buffer for int8 (E8M0) scale output (SMEM or TMEM)
         VEC_SIZE: The MX block size (typically 32)
         dtype: Target output dtype, either tl.float8e4nv or tl.float8e5
 
-    Note:
-        Uses tlx.local_store to write data and scales to their respective buffers.
+    Return:
+        The FP8 data and E8M0 scales. Callers are responsible for storing them.
     """
     BLOCK_M: tl.constexpr = data_input.shape[0]
     BLOCK_K: tl.constexpr = data_input.shape[1]
@@ -175,14 +170,9 @@ def _to_mxfp8_block(
     tl.static_assert(BLOCK_K == 128)
     tl.static_assert(VEC_SIZE == 32)
 
-    # Step 1: Compute scales and quantized data (all in registers)
     scale_e8m0, data_fp8 = _compute_scale_and_quantize(data_input, VEC_SIZE, dtype)
 
-    # Step 2: Store FP8 data to SMEM
-    tlx.local_store(data_out_tile, data_fp8)
-
-    # Step 3: Store scales
-    tlx.local_store(scale_out_tile, scale_e8m0)
+    return data_fp8, scale_e8m0
 
 
 @triton.jit
@@ -239,8 +229,6 @@ def _amax_to_e8m0_and_quantize(
 def _to_mxfp8_block_with_block_amax(
     data_input,
     block_amax,
-    data_out_tile,
-    scale_out_tile,
     VEC_SIZE: tl.constexpr,
     dtype: tl.constexpr,
 ):
@@ -254,10 +242,11 @@ def _to_mxfp8_block_with_block_amax(
     Args:
         data_input: Input tensor [BLOCK_M, BLOCK_K] in float32
         block_amax: Pre-computed block amaxes [BLOCK_M, NUM_SCALES]
-        data_out_tile: Preallocated buffer for FP8 data output
-        scale_out_tile: Preallocated buffer for E8M0 scale output
         VEC_SIZE: MX block size (32)
         dtype: tl.float8e4nv or tl.float8e5
+
+    Return:
+        The FP8 data and E8M0 scales. Callers are responsible for storing them.
     """
     BLOCK_M: tl.constexpr = data_input.shape[0]
     BLOCK_K: tl.constexpr = data_input.shape[1]
@@ -267,5 +256,4 @@ def _to_mxfp8_block_with_block_amax(
 
     scale_e8m0, data_fp8 = _amax_to_e8m0_and_quantize(data_input, block_amax, VEC_SIZE, dtype)
 
-    tlx.local_store(data_out_tile, data_fp8)
-    tlx.local_store(scale_out_tile, scale_e8m0)
+    return data_fp8, scale_e8m0
