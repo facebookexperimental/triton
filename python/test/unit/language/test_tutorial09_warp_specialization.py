@@ -1431,3 +1431,58 @@ def test_hopper_matmul_descriptor_persistent_warp_specialize(
 
         ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
         torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
+
+
+# ============================================================================
+# Test: num_warps=8 warp specialization
+# Smoke test to verify WS works with num_warps=8.
+# ============================================================================
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+def test_warp_specialize_num_warps_8():
+    """Test warp specialization with num_warps=8."""
+    M, N, K = 512, 512, 256
+    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 128, 128, 64
+
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.use_meta_partition = True
+
+        dtype = torch.float16
+        GROUP_SIZE_M = 8
+        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+        device = "cuda"
+
+        torch.manual_seed(42)
+        A = torch.randn((M, K), dtype=dtype, device=device)
+        B = torch.randn((N, K), dtype=dtype, device=device)
+        C = torch.empty((M, N), dtype=dtype, device=device)
+
+        def alloc_fn(size, align, stream):
+            return torch.empty(size, dtype=torch.int8, device="cuda")
+
+        triton.set_allocator(alloc_fn)
+
+        grid = lambda META: (min(
+            NUM_SMS,
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        ), )
+
+        kernel = matmul_kernel_descriptor_persistent_ws[grid](
+            A, B, C, M, N, K,
+            BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K, GROUP_SIZE_M=GROUP_SIZE_M,
+            EPILOGUE_SUBTILE=1, NUM_SMS=NUM_SMS, FLATTEN=False,
+            A_COL_MAJOR=False, B_COL_MAJOR=False,
+            DATA_PARTITION_FACTOR=1, SMEM_ALLOC_ALGO=0,
+            SEPARATE_EPILOGUE_STORE=False,
+            num_stages=2, num_warps=8,
+            early_tma_store_lowering=True,
+        )
+
+        ttgir = kernel.asm["ttgir"]
+        assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
+        assert "ttng.tc_gen5_mma" in ttgir, "Expected Blackwell MMA instruction"
+        assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
+
+        ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
+        torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)

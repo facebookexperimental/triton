@@ -136,9 +136,8 @@ public:
       return;
 
     int numWarps = mlir::triton::gpu::lookupNumWarps(funcOp);
-    if (numWarps != 4) {
-      LDBG("Warp specialization requires num_warps=4, but got "
-           << numWarps << ". Skipping.");
+    if (numWarps < 4) {
+      LDBG("Warp specialization requires at least 4 warps. Skipping.");
       removeWarpSpecializeAttr(funcOp);
       return;
     }
