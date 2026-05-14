@@ -410,8 +410,13 @@ void init_triton_tlx_ir(py::module &&m) {
              auto newType = RankedTensorType::get(subViewType.getShape(),
                                                   subViewType.getElementType(),
                                                   layoutEncoding);
-             return self.create<ttng::TMEMLoadOp>(newType, subView,
-                                                  asyncToken.value_or(Value()));
+             if (asyncToken.has_value()) {
+               auto tokType =
+                   self.getBuilder().getType<ttg::AsyncTokenType>();
+               return self.create<ttng::TMEMLoadOp>(newType, tokType, subView,
+                                                    asyncToken.value());
+             }
+             return self.create<ttng::TMEMLoadOp>(newType, subView);
            })
       .def("create_tmem_store",
            [](TritonOpBuilder &self, Value &dst, Value &src) -> void {
