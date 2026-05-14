@@ -93,6 +93,10 @@ class CudaUtils(object):
         self.fill_1d_tma_descriptor_type = mod.fill_1d_tma_descriptor_type
         self.fill_2d_tma_descriptor_type = mod.fill_2d_tma_descriptor_type
         self.TmaDescKernelParam = TmaDescKernelParam
+        self._TritonDispatcher = mod._TritonDispatcher
+        self._TritonJITRunner = mod._TritonJITRunner
+        self._ProxyRunner = mod._ProxyRunner
+        self.create_fast_jit_type = mod.create_fast_jit_type
 
 
 # ------------------------
@@ -123,6 +127,48 @@ def ty_to_cpp(ty):
         "fp64": "double",
         "nvTmaDesc": "CUtensorMap",
     }[ty]
+
+
+def build_kernel_signature_from_schema(schema):
+    """Derive kernel_signature bytes from Level 0 schema args array.
+
+    This makes the Level 0 schema the source of truth for type dispatch in the
+    shared variadic launcher (driver.c).  The schema's ``args`` list contains
+    only non-constant kernel parameters with their types already resolved.
+    """
+    flat_types = []
+    tensordesc_meta = schema.get("tensordesc_meta") or []
+    tensordesc_idx = 0
+
+    for arg in schema["args"]:
+        ty = arg["type"]
+        if ty.startswith("tensordesc"):
+            meta = tensordesc_meta[tensordesc_idx] if tensordesc_idx < len(tensordesc_meta) else None
+            tensordesc_idx += 1
+
+            match = re.match(r"tensordesc<([^[>]*)\[([^]]*)\]", ty)
+            dtype = match.group(1)
+            shape = match.group(2)
+            ndim = shape.count(",") + 1
+
+            if meta is None:
+                # Host TMA path: base pointer + shape + strides + padding flag
+                flat_types.append("*" + dtype)
+                for _ in range(2 * ndim):
+                    flat_types.append("i64")
+                flat_types.append("i1")
+            else:
+                # Device TMA path: nvTmaDesc
+                flat_types.append("nvTmaDesc")
+
+            for _ in range(ndim):
+                flat_types.append("i32")
+            for _ in range(ndim):
+                flat_types.append("i64")
+        else:
+            flat_types.append(ty)
+
+    return triton.runtime.driver.active.utils.build_signature_metadata(flat_types)
 
 
 def expand_signature(signature, tensordesc_meta):
@@ -322,10 +368,21 @@ class CudaLauncher(object):
         signature = {idx: value for idx, value in src.signature.items()}
         tensordesc_meta = getattr(metadata, "tensordesc_meta", None)
 
+        # Compute Level 0 schema — the canonical ABI description for this kernel.
+        from triton.compiler.compiler import make_backend
+        backend = make_backend(metadata.target)
+        schema = backend.make_launch_metadata(metadata._asdict(), src)
+
         launcher = triton.runtime.driver.active.utils.launch
+
+        # kernel_signature: derived from Level 0 schema (single source of truth).
+        self.kernel_signature = build_kernel_signature_from_schema(schema)
+
+        # arg_annotations: still needs structural info from src.signature
+        # (tuple grouping is a Python calling convention, not kernel ABI).
         expanded_signature = expand_signature(signature.values(), tensordesc_meta)
         self.arg_annotations = annotate_arguments(expanded_signature)
-        self.kernel_signature = make_kernel_signature(expanded_signature)
+
         self.launch = wrap_handle_tensordesc(launcher, signature, tensordesc_meta)
         self.global_scratch_size = metadata.global_scratch_size
         self.global_scratch_align = metadata.global_scratch_align

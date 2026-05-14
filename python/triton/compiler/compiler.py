@@ -1,22 +1,30 @@
 from __future__ import annotations
+
+import functools
 import hashlib
 import json
-from .._C.libtriton import get_cache_invalidating_env_vars, ir
-from ..backends import backends
-from ..backends.compiler import Language
-from ..backends.compiler import BaseBackend, GPUTarget
-from .. import __version__, knobs
-from ..runtime.autotuner import OutOfResources
-from ..runtime.cache import get_cache_manager, get_dump_manager, get_override_manager, get_cache_key
-from ..runtime.driver import driver
-from ..tools.disasm import get_sass
-from pathlib import Path
-import re
-import functools
+import logging
 import os
+import re
 import time
 import weakref
+from pathlib import Path
 
+from .. import __version__, knobs
+from .._C.libtriton import get_cache_invalidating_env_vars, ir
+from ..backends import backends
+from ..backends.compiler import BaseBackend, GPUTarget, Language
+from ..runtime.autotuner import OutOfResources
+from ..runtime.cache import (
+    get_cache_key,
+    get_cache_manager,
+    get_dump_manager,
+    get_override_manager,
+)
+from ..runtime.driver import driver
+from ..tools.disasm import get_sass
+
+logger: logging.Logger = logging.getLogger(__name__)
 # - ^\s*tt\.func\s+ : match the start of the string, any leading whitespace, the keyword func,
 #    and any following whitespace
 # - (public\s+)? : optionally match the keyword public and any following whitespace
@@ -567,14 +575,33 @@ class CompiledKernel:
         if knobs.runtime.kernel_load_end_hook is not None:
             knobs.runtime.kernel_load_end_hook(self.module, self.function, self.name, self.metadata_group, self.hash)
 
+        # Create C dispatcher if enabled and schema is available.
+        self._dispatcher = None
+        self._dispatch_arg_indices = None
+        self._num_kernel_args = None
+        if knobs.nvidia.use_triton_dispatcher and "launch_metadata" in self.asm:
+            try:
+                from triton.backends.nvidia.triton_dispatcher_factory import make_triton_dispatcher
+                schema = json.loads(self.asm["launch_metadata"])
+                # Build both values before assigning to self so that a failure
+                # in either step leaves both attributes as None (atomic assignment).
+                dispatcher = make_triton_dispatcher(schema, self.function)
+                if dispatcher is not None:
+                    indices = tuple(a["index"] for a in schema["args"])
+                    self._dispatcher = dispatcher
+                    self._dispatch_arg_indices = indices
+                    self._num_kernel_args = len(schema["args"])
+            except (KeyError, TypeError, ValueError, RuntimeError, json.JSONDecodeError) as e:
+                logger.warning("Triton dispatcher creation failed for %s: %s", self.name, e)
+
     @property
     def run(self):
-        if self._run is None:
+        if self._run is None or self.module is None:
             self._init_handles()
         return self._run
 
     def launch_metadata(self, grid, stream, *args):
-        if knobs.runtime.launch_enter_hook is None:
+        if not knobs.runtime.launch_enter_hook:
             return None
         self._init_handles()
         ret = LazyDict({"name": self.name, "function": self.function, "stream": stream})
@@ -586,6 +613,49 @@ class CompiledKernel:
 
     def __getitem__(self, grid):
         self._init_handles()
+
+        dispatcher = getattr(self, '_dispatcher', None)
+        if dispatcher is not None and not callable(grid):
+            # Try to create a _TritonJITRunner for maximum speed
+            try:
+                from triton.backends.nvidia.triton_dispatcher_factory import _load_module
+                mod = _load_module()
+                grid_tuple = grid if isinstance(grid, tuple) else (grid, )
+                while len(grid_tuple) < 3:
+                    grid_tuple = grid_tuple + (1, )
+
+                num_kernel_args = self._num_kernel_args
+
+                def slow_path(*args, stream=None):
+                    """Fallback: full Python dispatch on cache miss."""
+                    if stream is None:
+                        stream = driver.active.get_current_stream(driver.active.get_current_device())
+                    gx, gy, gz = grid_tuple
+                    dispatcher(gx, gy, gz, stream, *args)
+
+                jit_runner = mod._TritonJITRunner(
+                    dispatcher=dispatcher,
+                    grid=grid_tuple,
+                    get_stream_fn=driver.active.get_current_stream,
+                    get_device_fn=driver.active.get_current_device,
+                    slow_path_fn=slow_path,
+                    num_kernel_args=num_kernel_args,
+                )
+                return jit_runner
+            except (KeyError, TypeError, ValueError, RuntimeError, AttributeError) as e:
+                logging.warning("_TritonJITRunner creation failed for %s, using fallback: %s", self.name, e)
+
+            # Fallback: Python wrapper around dispatcher
+            def runner(*args, stream=None):
+                if stream is None:
+                    device = driver.active.get_current_device()
+                    stream = driver.active.get_current_stream(device)
+                gx = grid[0]
+                gy = grid[1] if len(grid) > 1 else 1
+                gz = grid[2] if len(grid) > 2 else 1
+                dispatcher(gx, gy, gz, stream, *args)
+
+            return runner
 
         def runner(*args, stream=None):
             if stream is None:

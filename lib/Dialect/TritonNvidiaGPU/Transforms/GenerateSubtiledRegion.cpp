@@ -77,8 +77,14 @@ struct EquivalenceResult {
 
   /// The actual operations in the template chain that are identity-inserted
   /// (no counterpart in the other chain). Used by groupByContiguousTaskSet
-  /// to align segments.
+  /// to align segments when chains have different lengths.
   DenseSet<Operation *> identityOpSet;
+
+  /// When forcedIdentityOps is used: for each identity op, the other chain's
+  /// varying operand if the op matched (non-null), or null if the other chain
+  /// lacked the op (use identity constant). Empty when forcedIdentityOps is
+  /// not used.
+  SmallVector<Value> identityMatchedVarying;
 };
 
 /// Return true if `op` is an integer address computation op that can act as
@@ -140,9 +146,15 @@ static bool matchOps(Operation *op0, Operation *op1,
 /// alignment is used: extra ops in the longer chain are accepted if they are
 /// identity-compatible, and their results are mapped to their pass-through
 /// operand in the shorter chain's value space.
-static std::optional<EquivalenceResult>
-checkStructuralEquivalence(ArrayRef<Operation *> chain0,
-                           ArrayRef<Operation *> chain1) {
+///
+/// When `forcedIdentityOps` is provided, those template ops are ALWAYS
+/// treated as identity — even if they match the other chain's op. When a
+/// forced-identity op matches, both pointers advance but the match is
+/// recorded as identity with the other chain's varying operand stored in
+/// `identityMatchedVarying` for per-tile value tracking.
+static std::optional<EquivalenceResult> checkStructuralEquivalence(
+    ArrayRef<Operation *> chain0, ArrayRef<Operation *> chain1,
+    const DenseSet<Operation *> *forcedIdentityOps = nullptr) {
   // Determine which chain is the template (longer or chain0 if same length).
   unsigned tplIdx = (chain1.size() > chain0.size()) ? 1 : 0;
   ArrayRef<Operation *> tplChain = (tplIdx == 0) ? chain0 : chain1;
@@ -155,10 +167,62 @@ checkStructuralEquivalence(ArrayRef<Operation *> chain0,
   llvm::DenseMap<Value, Value> valueMap;
   SmallVector<std::pair<Value, Value>> differingOperands;
 
+  auto handleIdentityOp = [&](Operation *tOp) -> bool {
+    if (!isIdentityCompatibleOp(tOp) || tOp->getNumResults() != 1)
+      return false;
+    bool skipped = false;
+    unsigned numCandidates = isa<arith::SubIOp>(tOp) ? 1 : 2;
+    for (unsigned opIdx = 0; opIdx < numCandidates; ++opIdx) {
+      Value passThrough = tOp->getOperand(opIdx);
+      Value varying = tOp->getOperand(1 - opIdx);
+      Value otherVal = valueMap.lookup(passThrough);
+      if (!otherVal)
+        otherVal = passThrough;
+      valueMap[tOp->getResult(0)] = otherVal;
+      result.identityOps.push_back({varying, getIdentityValue(tOp)});
+      result.identityOpSet.insert(tOp);
+      skipped = true;
+      break;
+    }
+    return skipped;
+  };
+
   unsigned ti = 0, oi = 0;
   while (ti < tplChain.size() && oi < otherChain.size()) {
     Operation *tOp = tplChain[ti];
     Operation *oOp = otherChain[oi];
+
+    // If this template op is forced to be identity, handle it without
+    // calling matchOps (which would mutate valueMap/differingOperands).
+    // Check if the other chain has a corresponding op (same name) — if
+    // yes, it's a "matched identity" and we extract its varying operand.
+    if (forcedIdentityOps && forcedIdentityOps->count(tOp)) {
+      unsigned varIdx = (getIdentityValue(tOp) == 0) ? 1 : 0;
+      unsigned passIdx = 1 - varIdx;
+
+      if (oOp->getName() == tOp->getName()) {
+        // Other chain has the matching op. Map the template's result to
+        // the other chain's result so that downstream matchOps comparisons
+        // resolve correctly (valueMap maps template → other).
+        valueMap[tOp->getResult(0)] = oOp->getResult(0);
+
+        Value otherVarying = oOp->getOperand(varIdx);
+        result.identityOps.push_back(
+            {tOp->getOperand(varIdx), getIdentityValue(tOp)});
+        result.identityOpSet.insert(tOp);
+        result.identityMatchedVarying.push_back(otherVarying);
+        ti++;
+        oi++;
+        continue;
+      }
+      // Other chain lacks the op — pure identity.
+      if (handleIdentityOp(tOp)) {
+        result.identityMatchedVarying.push_back(Value());
+        ti++;
+        continue;
+      }
+      return std::nullopt;
+    }
 
     if (matchOps(tOp, oOp, valueMap, differingOperands)) {
       ti++;
@@ -166,61 +230,25 @@ checkStructuralEquivalence(ArrayRef<Operation *> chain0,
       continue;
     }
 
-    // Ops don't match. Check if the template op is identity-compatible and
-    // can be skipped (i.e., its result can be treated as equal to one of its
-    // operands in the other chain).
-    if (isIdentityCompatibleOp(tOp) && tOp->getNumResults() == 1) {
-      // Try each operand as the pass-through. The pass-through operand's
-      // mapped value (in the other chain) replaces the template op's result.
-      // For subi, only operand 0 can be the pass-through (x - 0 = x, but
-      // 0 - x != x).
-      bool skipped = false;
-      unsigned numCandidates = isa<arith::SubIOp>(tOp) ? 1 : 2;
-      for (unsigned opIdx = 0; opIdx < numCandidates; ++opIdx) {
-        Value passThrough = tOp->getOperand(opIdx);
-        Value varying = tOp->getOperand(1 - opIdx);
-
-        // Resolve the pass-through operand to the other chain's value.
-        Value otherVal = valueMap.lookup(passThrough);
-        if (!otherVal)
-          otherVal = passThrough; // external value, same in both chains
-
-        // Map the template op's result to the other chain's pass-through.
-        valueMap[tOp->getResult(0)] = otherVal;
-
-        int64_t identityVal = getIdentityValue(tOp);
-        result.identityOps.push_back({varying, identityVal});
-        result.identityOpSet.insert(tOp);
-        ti++;
-        skipped = true;
-        break;
-      }
-      if (skipped)
-        continue;
+    // Ops don't match. Try identity insertion.
+    if (handleIdentityOp(tOp)) {
+      ti++;
+      continue;
     }
 
-    // Can't align — not structurally equivalent.
     return std::nullopt;
   }
 
   // Handle remaining ops in the template chain.
   while (ti < tplChain.size()) {
     Operation *tOp = tplChain[ti];
-    if (!isIdentityCompatibleOp(tOp) || tOp->getNumResults() != 1)
+    if (!handleIdentityOp(tOp))
       return std::nullopt;
-
-    Value passThrough = tOp->getOperand(0);
-    Value varying = tOp->getOperand(1);
-    Value otherVal = valueMap.lookup(passThrough);
-    if (!otherVal)
-      otherVal = passThrough;
-    valueMap[tOp->getResult(0)] = otherVal;
-    result.identityOps.push_back({varying, getIdentityValue(tOp)});
-    result.identityOpSet.insert(tOp);
+    if (forcedIdentityOps)
+      result.identityMatchedVarying.push_back(Value());
     ti++;
   }
 
-  // All other-chain ops must be consumed.
   if (oi != otherChain.size())
     return std::nullopt;
 
@@ -228,7 +256,6 @@ checkStructuralEquivalence(ArrayRef<Operation *> chain0,
   if (tplIdx == 0) {
     result.differingOperands = std::move(differingOperands);
   } else {
-    // Template is chain1, so valueMap is chain1→chain0. Swap pairs.
     for (auto &[v0, v1] : differingOperands)
       result.differingOperands.push_back({v1, v0});
   }
@@ -243,12 +270,26 @@ struct NWayEquivalenceResult {
   unsigned templateChainIdx = 0;
   SmallVector<EquivalenceResult::IdentityOp> identityOps;
   DenseSet<Operation *> identityOpSet;
+
+  /// Per-tile varying values for each identity op. identityPerTile[i][t] is
+  /// the varying value for identity op i at tile t. A null Value means the
+  /// tile needs the identity constant (the op was missing from that tile's
+  /// chain). A non-null Value means the tile had a matching op with its own
+  /// varying operand value.
+  SmallVector<SmallVector<Value>> identityPerTile;
 };
 
 /// Check structural equivalence across N chains. Finds the longest chain
 /// as the template and compares all others against it pairwise.
-static std::optional<NWayEquivalenceResult>
-checkStructuralEquivalenceN(ArrayRef<SmallVector<Operation *>> chains) {
+///
+/// Uses a "canonical identity set" approach for identity ops: first compares
+/// the template against the shortest non-template chain to discover all
+/// identity ops (the canonical identity set). Then re-compares all other chains
+/// with the canonical identity set forced, so identity counts are consistent
+/// across all pairs. Per-tile varying values are recorded in `identityPerTile`.
+static std::optional<NWayEquivalenceResult> checkStructuralEquivalenceN(
+    ArrayRef<SmallVector<Operation *>> chains,
+    const DenseSet<Operation *> *outerIdentityOps = nullptr) {
   assert(chains.size() >= 2);
   unsigned numTiles = chains.size();
 
@@ -259,56 +300,89 @@ checkStructuralEquivalenceN(ArrayRef<SmallVector<Operation *>> chains) {
       tplIdx = t;
   }
 
-  // Compare each non-template chain against the template.
-  SmallVector<EquivalenceResult> pairResults(numTiles);
+  // Find the shortest non-template chain — comparing template against this
+  // chain discovers the maximum set of identity ops (the "canonical identity
+  // set").
+  unsigned shortIdx = 0;
+  bool firstNonTpl = true;
   for (unsigned t = 0; t < numTiles; ++t) {
     if (t == tplIdx)
       continue;
-    auto res = checkStructuralEquivalence(chains[tplIdx], chains[t]);
-    if (!res)
-      return std::nullopt;
-    if (res->templateChainIdx != 0)
+    if (firstNonTpl || chains[t].size() < chains[shortIdx].size()) {
+      shortIdx = t;
+      firstNonTpl = false;
+    }
+  }
+
+  // Step 1: Compare template vs shortest chain to build the canonical identity
+  // set. If an outer identity set is provided (from the full-chain
+  // equivalence), use it to force consistent identity detection.
+  auto canonicalRes = checkStructuralEquivalence(
+      chains[tplIdx], chains[shortIdx], outerIdentityOps);
+  if (!canonicalRes || canonicalRes->templateChainIdx != 0)
+    return std::nullopt;
+
+  // Step 2: Re-compare all other chains with forcedIdentityOps so identity
+  // counts are consistent. Use whichever identity set is larger: the one
+  // discovered in step 1 or the outer one.
+  SmallVector<EquivalenceResult> pairResults(numTiles);
+  pairResults[shortIdx] = std::move(*canonicalRes);
+
+  DenseSet<Operation *> &canonicalIdentity =
+      pairResults[shortIdx].identityOpSet;
+  const DenseSet<Operation *> *forcedSet = &canonicalIdentity;
+  if (outerIdentityOps && outerIdentityOps->size() > canonicalIdentity.size())
+    forcedSet = outerIdentityOps;
+
+  for (unsigned t = 0; t < numTiles; ++t) {
+    if (t == tplIdx || t == shortIdx)
+      continue;
+    auto res = checkStructuralEquivalence(chains[tplIdx], chains[t], forcedSet);
+    if (!res || res->templateChainIdx != 0)
       return std::nullopt;
     pairResults[t] = std::move(*res);
   }
 
-  // All pairs must have the same number of differing operands and identity ops.
-  unsigned numDiff = 0;
-  unsigned numIdentity = 0;
-  bool first = true;
+  // Validate consistent counts.
+  unsigned numDiff = pairResults[shortIdx].differingOperands.size();
+  unsigned numIdentity = pairResults[shortIdx].identityOps.size();
   for (unsigned t = 0; t < numTiles; ++t) {
     if (t == tplIdx)
       continue;
-    if (first) {
-      numDiff = pairResults[t].differingOperands.size();
-      numIdentity = pairResults[t].identityOps.size();
-      first = false;
-    } else {
-      if (pairResults[t].differingOperands.size() != numDiff)
-        return std::nullopt;
-      if (pairResults[t].identityOps.size() != numIdentity)
-        return std::nullopt;
-    }
+    if (pairResults[t].differingOperands.size() != numDiff ||
+        pairResults[t].identityOps.size() != numIdentity)
+      return std::nullopt;
   }
-
-  // Find the first non-template index for reference.
-  unsigned refIdx = (tplIdx == 0) ? 1 : 0;
 
   NWayEquivalenceResult result;
   result.templateChainIdx = tplIdx;
-  result.identityOps = pairResults[refIdx].identityOps;
-  result.identityOpSet = pairResults[refIdx].identityOpSet;
+  result.identityOps = pairResults[shortIdx].identityOps;
+  result.identityOpSet = pairResults[shortIdx].identityOpSet;
 
+  // Build differing operands.
   for (unsigned i = 0; i < numDiff; ++i) {
     SmallVector<Value> perTile(numTiles);
-    // The template chain's value is .first from any pair result.
-    perTile[tplIdx] = pairResults[refIdx].differingOperands[i].first;
+    perTile[tplIdx] = pairResults[shortIdx].differingOperands[i].first;
     for (unsigned t = 0; t < numTiles; ++t) {
       if (t == tplIdx)
         continue;
       perTile[t] = pairResults[t].differingOperands[i].second;
     }
     result.differingOperands.push_back(std::move(perTile));
+  }
+
+  // Build per-tile identity varying values.
+  for (unsigned i = 0; i < numIdentity; ++i) {
+    SmallVector<Value> perTile(numTiles);
+    perTile[tplIdx] = result.identityOps[i].varyingOperand;
+    for (unsigned t = 0; t < numTiles; ++t) {
+      if (t == tplIdx)
+        continue;
+      if (!pairResults[t].identityMatchedVarying.empty())
+        perTile[t] = pairResults[t].identityMatchedVarying[i]; // may be null
+      // else: null (identity constant)
+    }
+    result.identityPerTile.push_back(std::move(perTile));
   }
 
   return result;
@@ -370,15 +444,15 @@ collectSplitTreeLeaves(triton::SplitOp rootSplit,
 }
 
 /// Collect the per-tile op chain for a split result: all ops in the block
-/// that transitively depend on `splitResult`.
-/// When `includeAuxiliary` is true, also collects ops that are needed by the
-/// chain but don't depend on the split result (e.g., address offset
-/// computations like arith.addi). This is used for the 2-tile path where
-/// identity insertion handles these ops. For the N-tile path, auxiliary ops
-/// are left out and treated as differing operands.
+/// that transitively depend on `splitResult`, plus auxiliary ops that are
+/// needed by the chain but don't depend on the split result (e.g., address
+/// offset computations like arith.addi).
+///
+/// `excludeOps` allows callers to prevent specific ops (e.g., inner setup
+/// ops from nested split trees) from being captured by the auxiliary walk.
 static SmallVector<Operation *>
 collectPerTileChain(Value splitResult, Operation *splitOp, Block *block,
-                    bool includeAuxiliary = true) {
+                    const DenseSet<Operation *> &excludeOps = {}) {
   SmallVector<Operation *> chain;
   llvm::DenseSet<Operation *> visited;
   SmallVector<Value> worklist;
@@ -392,6 +466,10 @@ collectPerTileChain(Value splitResult, Operation *splitOp, Block *block,
         continue;
       if (user->isBeforeInBlock(splitOp) || user == splitOp)
         continue;
+      if (excludeOps.contains(user))
+        continue;
+      if (isa<SubtiledRegionOp>(user))
+        continue;
       if (!visited.insert(user).second)
         continue;
       chain.push_back(user);
@@ -400,136 +478,55 @@ collectPerTileChain(Value splitResult, Operation *splitOp, Block *block,
     }
   }
 
-  if (includeAuxiliary) {
-    llvm::DenseSet<Operation *> chainSet(chain.begin(), chain.end());
-    SmallVector<Operation *> auxWorklist(chain.begin(), chain.end());
-    while (!auxWorklist.empty()) {
-      Operation *op = auxWorklist.pop_back_val();
-      for (Value operand : op->getOperands()) {
-        auto defOp = operand.getDefiningOp();
-        if (!defOp || defOp->getBlock() != block)
-          continue;
-        if (defOp->isBeforeInBlock(splitOp) || defOp == splitOp)
-          continue;
-        if (!chainSet.contains(defOp) && visited.insert(defOp).second) {
-          chainSet.insert(defOp);
-          auxWorklist.push_back(defOp);
-        }
+  // Auxiliary walk: recursively collect ops that chain ops depend on but
+  // that don't themselves depend on the split result.
+  llvm::DenseSet<Operation *> chainSet(chain.begin(), chain.end());
+  SmallVector<Operation *> auxWorklist(chain.begin(), chain.end());
+  while (!auxWorklist.empty()) {
+    Operation *op = auxWorklist.pop_back_val();
+    for (Value operand : op->getOperands()) {
+      auto defOp = operand.getDefiningOp();
+      if (!defOp || defOp->getBlock() != block)
+        continue;
+      if (defOp->isBeforeInBlock(splitOp) || defOp == splitOp)
+        continue;
+      if (excludeOps.contains(defOp))
+        continue;
+      if (!chainSet.contains(defOp) && visited.insert(defOp).second) {
+        chainSet.insert(defOp);
+        auxWorklist.push_back(defOp);
       }
     }
-    SmallVector<Operation *> fullChain;
-    for (Operation *op : chainSet)
-      fullChain.push_back(op);
-    llvm::sort(fullChain, [](Operation *a, Operation *b) {
-      return a->isBeforeInBlock(b);
-    });
-    return fullChain;
   }
 
-  llvm::sort(chain,
+  SmallVector<Operation *> fullChain;
+  for (Operation *op : chainSet)
+    fullChain.push_back(op);
+  llvm::sort(fullChain,
              [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
-  return chain;
+  return fullChain;
 }
 
-/// Group structurally equivalent chain ops by contiguous async task set.
-/// Ops without task IDs are merged into the current segment.
-/// Returns nullopt if corresponding ops in chain0/chain1 have different task
-/// sets.
+/// Group N chains by contiguous async task set, handling identity-compatible
+/// ops that may make the template chain longer than the others.
+///
+/// Walks the template chain (identified by `equiv.templateChainIdx`) and
+/// pairs each non-identity op with the corresponding op in every other chain.
+/// Identity ops (present only in the template) are placed in all tiles'
+/// opsPerTile. When chains have equal length (no identity ops), this
+/// degenerates to simple positional pairing.
 static std::optional<SmallVector<ChainSegment>>
-groupByContiguousTaskSet(ArrayRef<Operation *> chain0,
-                         ArrayRef<Operation *> chain1) {
-  assert(chain0.size() == chain1.size());
-  if (chain0.empty())
-    return std::nullopt;
-
-  SmallVector<ChainSegment> segments;
-  for (size_t i = 0; i < chain0.size(); ++i) {
-    auto taskIds0 = getOpAsyncTaskIds(chain0[i]);
-    auto taskIds1 = getOpAsyncTaskIds(chain1[i]);
-
-    if (taskIds0 != taskIds1)
-      return std::nullopt;
-
-    if (taskIds0.empty() && !segments.empty()) {
-      segments.back().opsPerTile[0].push_back(chain0[i]);
-      segments.back().opsPerTile[1].push_back(chain1[i]);
-      continue;
-    }
-
-    if (segments.empty() || segments.back().taskIds != taskIds0) {
-      ChainSegment seg;
-      seg.opsPerTile.resize(2);
-      seg.taskIds = taskIds0;
-      segments.push_back(std::move(seg));
-    }
-
-    segments.back().opsPerTile[0].push_back(chain0[i]);
-    segments.back().opsPerTile[1].push_back(chain1[i]);
-  }
-  return segments;
-}
-
-/// Group N chains by contiguous async task set. All chains must have the
-/// same length (no identity-compatible ops — the N-tile path excludes
-/// auxiliary ops so chains are uniform).
-static std::optional<SmallVector<ChainSegment>>
-groupByContiguousTaskSetN(ArrayRef<SmallVector<Operation *>> chains) {
+groupByContiguousTaskSet(ArrayRef<SmallVector<Operation *>> chains,
+                         const NWayEquivalenceResult &equiv) {
   unsigned numTiles = chains.size();
   assert(numTiles >= 2);
-  size_t chainLen = chains[0].size();
-  for (auto &c : chains) {
-    if (c.size() != chainLen)
-      return std::nullopt;
-  }
-  if (chainLen == 0)
-    return std::nullopt;
-
-  SmallVector<ChainSegment> segments;
-  for (size_t i = 0; i < chainLen; ++i) {
-    auto taskIds = getOpAsyncTaskIds(chains[0][i]);
-    for (unsigned t = 1; t < numTiles; ++t) {
-      if (getOpAsyncTaskIds(chains[t][i]) != taskIds)
-        return std::nullopt;
-    }
-
-    if (taskIds.empty() && !segments.empty()) {
-      for (unsigned t = 0; t < numTiles; ++t)
-        segments.back().opsPerTile[t].push_back(chains[t][i]);
-      continue;
-    }
-
-    if (segments.empty() || segments.back().taskIds != taskIds) {
-      ChainSegment seg;
-      seg.opsPerTile.resize(numTiles);
-      seg.taskIds = taskIds;
-      segments.push_back(std::move(seg));
-    }
-
-    for (unsigned t = 0; t < numTiles; ++t)
-      segments.back().opsPerTile[t].push_back(chains[t][i]);
-  }
-  return segments;
-}
-
-/// Group chains by contiguous async task set when the chains have different
-/// lengths (due to identity-compatible ops). Uses the template chain from the
-/// equivalence result for task set boundaries. Identity ops (present only in
-/// the template chain) are placed in both opsPerTile[0] and [1] of their
-/// segment.
-static std::optional<SmallVector<ChainSegment>>
-groupByContiguousTaskSetWithIdentity(ArrayRef<Operation *> chain0,
-                                     ArrayRef<Operation *> chain1,
-                                     const EquivalenceResult &equiv) {
-  ArrayRef<Operation *> tplChain =
-      (equiv.templateChainIdx == 0) ? chain0 : chain1;
-  ArrayRef<Operation *> otherChain =
-      (equiv.templateChainIdx == 0) ? chain1 : chain0;
-
+  unsigned tplIdx = equiv.templateChainIdx;
+  ArrayRef<Operation *> tplChain = chains[tplIdx];
   if (tplChain.empty())
     return std::nullopt;
 
-  // Two-pointer alignment: walk the template chain and pair with the other
-  // chain, skipping identity ops.
+  // All non-template chains have the same length (template length minus
+  // identity ops). Use a single "other" pointer that advances for all.
   SmallVector<ChainSegment> segments;
   unsigned oi = 0;
   for (size_t ti = 0; ti < tplChain.size(); ++ti) {
@@ -539,24 +536,21 @@ groupByContiguousTaskSetWithIdentity(ArrayRef<Operation *> chain0,
       // Ops without task IDs join the current segment.
     } else if (segments.empty() || segments.back().taskIds != taskIds) {
       ChainSegment seg;
-      seg.opsPerTile.resize(2);
+      seg.opsPerTile.resize(numTiles);
       seg.taskIds = taskIds;
       segments.push_back(std::move(seg));
     }
 
-    bool isIdentity = equiv.identityOpSet.count(tplChain[ti]);
-
-    if (isIdentity) {
-      segments.back().opsPerTile[0].push_back(tplChain[ti]);
-      segments.back().opsPerTile[1].push_back(tplChain[ti]);
+    if (equiv.identityOpSet.count(tplChain[ti])) {
+      for (unsigned t = 0; t < numTiles; ++t)
+        segments.back().opsPerTile[t].push_back(tplChain[ti]);
     } else {
-      assert(oi < otherChain.size());
-      Operation *op0 =
-          (equiv.templateChainIdx == 0) ? tplChain[ti] : otherChain[oi];
-      Operation *op1 =
-          (equiv.templateChainIdx == 0) ? otherChain[oi] : tplChain[ti];
-      segments.back().opsPerTile[0].push_back(op0);
-      segments.back().opsPerTile[1].push_back(op1);
+      for (unsigned t = 0; t < numTiles; ++t) {
+        if (t == tplIdx)
+          segments.back().opsPerTile[t].push_back(tplChain[ti]);
+        else
+          segments.back().opsPerTile[t].push_back(chains[t][oi]);
+      }
       ++oi;
     }
   }
@@ -576,94 +570,105 @@ static void buildSingleSubtiledRegionN(
   unsigned numTiles = leafValues.size();
   auto &differing = equiv.differingOperands;
   ArrayRef<Operation *> tplChain = chains[equiv.templateChainIdx];
+  bool hasMixedIdentity = !equiv.identityPerTile.empty();
 
-  // Tile arg types and per-tile mappings.
+  // --- Collect per-tile operands (grouped by position) ---
+  SmallVector<Value> perTileOps;
   SmallVector<Type> tileArgTypes;
-  SmallVector<SmallVector<int32_t>> tileMappings(numTiles);
 
-  // Tile arg 0: the leaf split result (same type for all tiles).
-  tileArgTypes.push_back(leafValues[0].getType());
-  for (unsigned t = 0; t < numTiles; ++t)
-    tileMappings[t].push_back(t); // yield slot t → tile t's leaf value
-
-  // Differing operands: one tile arg per differing position.
-  unsigned yieldIdx = numTiles;
-  for (auto &perTile : differing) {
-    tileArgTypes.push_back(perTile[0].getType());
-    for (unsigned t = 0; t < numTiles; ++t) {
-      tileMappings[t].push_back(yieldIdx + t);
-    }
-    yieldIdx += numTiles;
-  }
-
-  // Identity insertions: one tile arg per identity op.
-  // Yield 2 values per identity op: (varying, identity_const).
-  // Template tile maps to varying; all other tiles map to identity_const.
-  for (auto [i, id] : llvm::enumerate(equiv.identityOps)) {
-    tileArgTypes.push_back(id.varyingOperand.getType());
-    unsigned varyingSlot = yieldIdx;
-    unsigned constSlot = yieldIdx + 1;
-    for (unsigned t = 0; t < numTiles; ++t) {
-      if (t == equiv.templateChainIdx)
-        tileMappings[t].push_back(varyingSlot);
-      else
-        tileMappings[t].push_back(constSlot);
-    }
-    yieldIdx += 2;
-  }
-
-  SmallVector<Attribute> mappingAttrs;
-  for (auto &mapping : tileMappings)
-    mappingAttrs.push_back(DenseI32ArrayAttr::get(ctx, mapping));
-  auto tileMappingsAttr = builder.getArrayAttr(mappingAttrs);
-  auto barrierAnnotationsAttr = builder.getArrayAttr({});
-  auto tokenAnnotationsAttr = builder.getArrayAttr({});
-
-  auto regionOp = SubtiledRegionOp::create(
-      builder, loc, TypeRange{}, ValueRange{}, ValueRange{}, ValueRange{},
-      tileMappingsAttr, barrierAnnotationsAttr, tokenAnnotationsAttr);
-
-  // --- Setup Region ---
-  Block *setupBlock = &regionOp.getSetupRegion().emplaceBlock();
-  OpBuilder setupBuilder = OpBuilder::atBlockEnd(setupBlock);
-  IRMapping setupMapping;
-  for (Operation *op : setupOps)
-    setupBuilder.clone(*op, setupMapping);
-
-  SmallVector<Value> setupYieldValues;
-  // Yield the N leaf values.
+  // Position 0: leaf values.
   for (Value leaf : leafValues)
-    setupYieldValues.push_back(setupMapping.lookupOrDefault(leaf));
-  // Yield N-way differing operands.
+    perTileOps.push_back(leaf);
+  tileArgTypes.push_back(leafValues[0].getType());
+
+  // Differing operands: one per-tile position per differing slot.
   for (auto &perTile : differing) {
     for (Value v : perTile)
-      setupYieldValues.push_back(setupMapping.lookupOrDefault(v));
+      perTileOps.push_back(v);
+    tileArgTypes.push_back(perTile[0].getType());
   }
-  // Yield identity insertion operands.
-  for (auto &id : equiv.identityOps) {
-    Value varying = setupMapping.lookupOrDefault(id.varyingOperand);
-    Value identityConst = arith::ConstantOp::create(
-        setupBuilder, loc,
-        setupBuilder.getIntegerAttr(id.varyingOperand.getType(),
-                                    id.identityVal));
-    setupYieldValues.push_back(varying);
-    setupYieldValues.push_back(identityConst);
+
+  // Identity operands: one per-tile position per identity op.
+  for (auto [i, id] : llvm::enumerate(equiv.identityOps)) {
+    if (hasMixedIdentity) {
+      for (unsigned t = 0; t < numTiles; ++t) {
+        Value v = equiv.identityPerTile[i][t];
+        if (v) {
+          perTileOps.push_back(v);
+        } else {
+          perTileOps.push_back(arith::ConstantOp::create(
+              builder, loc,
+              builder.getIntegerAttr(id.varyingOperand.getType(),
+                                     id.identityVal)));
+        }
+      }
+    } else {
+      Value identityConst = arith::ConstantOp::create(
+          builder, loc,
+          builder.getIntegerAttr(id.varyingOperand.getType(), id.identityVal));
+      for (unsigned t = 0; t < numTiles; ++t) {
+        if (t == equiv.templateChainIdx)
+          perTileOps.push_back(id.varyingOperand);
+        else
+          perTileOps.push_back(identityConst);
+      }
+    }
+    tileArgTypes.push_back(id.varyingOperand.getType());
   }
-  SubtiledRegionYieldOp::create(setupBuilder, loc, setupYieldValues);
+
+  // --- Collect shared operands ---
+  DenseSet<Value> chainResults;
+  for (Operation *op : tplChain)
+    for (Value r : op->getResults())
+      chainResults.insert(r);
+  // Also include leaf values and differing operands as "known mapped".
+  DenseSet<Value> alreadyMapped;
+  alreadyMapped.insert(leafValues[equiv.templateChainIdx]);
+  for (auto &perTile : differing)
+    alreadyMapped.insert(perTile[equiv.templateChainIdx]);
+  for (auto &id : equiv.identityOps)
+    alreadyMapped.insert(id.varyingOperand);
+
+  SmallVector<Value> sharedOps;
+  DenseSet<Value> seenShared;
+  for (Operation *op : tplChain) {
+    for (Value operand : op->getOperands()) {
+      if (chainResults.contains(operand))
+        continue;
+      if (alreadyMapped.contains(operand))
+        continue;
+      if (!seenShared.insert(operand).second)
+        continue;
+      sharedOps.push_back(operand);
+    }
+  }
+
+  // --- Create the op ---
+  auto regionOp =
+      SubtiledRegionOp::create(builder, loc, TypeRange{}, perTileOps, sharedOps,
+                               builder.getI32IntegerAttr(numTiles));
+
+  for (Operation *op : tplChain) {
+    auto taskIds = getOpAsyncTaskIds(op);
+    if (!taskIds.empty()) {
+      regionOp->setAttr("async_task_id", DenseI32ArrayAttr::get(ctx, taskIds));
+      break;
+    }
+  }
 
   // --- Tile Region ---
   Block *tileBlock = &regionOp.getTileRegion().emplaceBlock();
   for (Type ty : tileArgTypes)
     tileBlock->addArgument(ty, loc);
+  for (Value v : sharedOps)
+    tileBlock->addArgument(v.getType(), loc);
   tileBlock->addArgument(builder.getI32Type(), loc); // tile index
 
   OpBuilder tileBuilder = OpBuilder::atBlockEnd(tileBlock);
   IRMapping tileMapping;
-  // Map template chain's leaf value to tile arg 0.
   Value tplLeaf = leafValues[equiv.templateChainIdx];
   tileMapping.map(tplLeaf, tileBlock->getArgument(0));
   unsigned argIdx = 1;
-  // Map differing operands.
   for (auto &perTile : differing) {
     Value tplVal = perTile[equiv.templateChainIdx];
     tileMapping.map(tplVal, tileBlock->getArgument(argIdx++));
@@ -671,130 +676,12 @@ static void buildSingleSubtiledRegionN(
   // Map identity operands.
   for (auto &id : equiv.identityOps)
     tileMapping.map(id.varyingOperand, tileBlock->getArgument(argIdx++));
+  for (Value v : sharedOps)
+    tileMapping.map(v, tileBlock->getArgument(argIdx++));
 
   for (Operation *op : tplChain)
     tileBuilder.clone(*op, tileMapping);
   SubtiledRegionYieldOp::create(tileBuilder, loc, ValueRange{});
-
-  // --- Teardown Region ---
-  Block *teardownBlock = &regionOp.getTeardownRegion().emplaceBlock();
-  OpBuilder teardownBuilder = OpBuilder::atBlockEnd(teardownBlock);
-  SubtiledRegionYieldOp::create(teardownBuilder, loc, ValueRange{});
-}
-
-/// Build a single SubtiledRegionOp (2-tile path).
-static void buildSingleSubtiledRegion(OpBuilder &builder, Location loc,
-                                      ArrayRef<Operation *> setupOps, Value lhs,
-                                      Value rhs, ArrayRef<Operation *> chain0,
-                                      ArrayRef<Operation *> chain1,
-                                      const EquivalenceResult &equiv) {
-  MLIRContext *ctx = builder.getContext();
-  auto &differing = equiv.differingOperands;
-  ArrayRef<Operation *> tplChain =
-      (equiv.templateChainIdx == 0) ? chain0 : chain1;
-
-  // Tile arg types and mappings.
-  SmallVector<Type> tileArgTypes;
-  SmallVector<int32_t> tile0Mapping, tile1Mapping;
-
-  // Tile arg 0: split result.
-  tileArgTypes.push_back(lhs.getType());
-  tile0Mapping.push_back(0);
-  tile1Mapping.push_back(1);
-
-  // Additional tile args from differing operands.
-  for (auto [i, pair] : llvm::enumerate(differing)) {
-    tileArgTypes.push_back(pair.first.getType());
-    tile0Mapping.push_back(2 + 2 * i);
-    tile1Mapping.push_back(2 + 2 * i + 1);
-  }
-
-  // Additional tile args from identity insertions.
-  unsigned identityBase = 2 + 2 * differing.size();
-  for (auto [i, id] : llvm::enumerate(equiv.identityOps)) {
-    tileArgTypes.push_back(id.varyingOperand.getType());
-    // For the template chain's tile, use the varying operand.
-    // For the other tile, use the identity constant.
-    unsigned tplSlot = identityBase + 2 * i;
-    unsigned otherSlot = identityBase + 2 * i + 1;
-    if (equiv.templateChainIdx == 0) {
-      tile0Mapping.push_back(tplSlot);
-      tile1Mapping.push_back(otherSlot);
-    } else {
-      tile0Mapping.push_back(otherSlot);
-      tile1Mapping.push_back(tplSlot);
-    }
-  }
-
-  auto tileMappingsAttr =
-      builder.getArrayAttr({DenseI32ArrayAttr::get(ctx, tile0Mapping),
-                            DenseI32ArrayAttr::get(ctx, tile1Mapping)});
-  auto barrierAnnotationsAttr = builder.getArrayAttr({});
-  auto tokenAnnotationsAttr = builder.getArrayAttr({});
-
-  auto regionOp = SubtiledRegionOp::create(
-      builder, loc, /*resultTypes=*/TypeRange{},
-      /*barriers=*/ValueRange{}, /*accumCnts=*/ValueRange{},
-      /*tokenValues=*/ValueRange{}, tileMappingsAttr, barrierAnnotationsAttr,
-      tokenAnnotationsAttr);
-
-  // --- Setup Region ---
-  Block *setupBlock = &regionOp.getSetupRegion().emplaceBlock();
-  OpBuilder setupBuilder = OpBuilder::atBlockEnd(setupBlock);
-  IRMapping setupMapping;
-  for (Operation *op : setupOps)
-    setupBuilder.clone(*op, setupMapping);
-
-  SmallVector<Value> setupYieldValues;
-  setupYieldValues.push_back(setupMapping.lookupOrDefault(lhs));
-  setupYieldValues.push_back(setupMapping.lookupOrDefault(rhs));
-  for (auto [v0, v1] : differing) {
-    setupYieldValues.push_back(setupMapping.lookupOrDefault(v0));
-    setupYieldValues.push_back(setupMapping.lookupOrDefault(v1));
-  }
-  // Yield identity insertion operands: (varying, identity_const) pairs.
-  for (auto &id : equiv.identityOps) {
-    Value varying = setupMapping.lookupOrDefault(id.varyingOperand);
-    Value identityConst = arith::ConstantOp::create(
-        setupBuilder, loc,
-        setupBuilder.getIntegerAttr(id.varyingOperand.getType(),
-                                    id.identityVal));
-    // Template side gets the varying operand, other side gets the constant.
-    setupYieldValues.push_back(varying);
-    setupYieldValues.push_back(identityConst);
-  }
-  SubtiledRegionYieldOp::create(setupBuilder, loc, setupYieldValues);
-
-  // --- Tile Region ---
-  Block *tileBlock = &regionOp.getTileRegion().emplaceBlock();
-  for (Type ty : tileArgTypes)
-    tileBlock->addArgument(ty, loc);
-  tileBlock->addArgument(builder.getI32Type(), loc);
-
-  OpBuilder tileBuilder = OpBuilder::atBlockEnd(tileBlock);
-  IRMapping tileMapping;
-  Value tplSplitResult = (equiv.templateChainIdx == 0) ? lhs : rhs;
-  tileMapping.map(tplSplitResult, tileBlock->getArgument(0));
-  unsigned argIdx = 1;
-  for (auto [i, pair] : llvm::enumerate(differing)) {
-    Value tplVal = (equiv.templateChainIdx == 0) ? pair.first : pair.second;
-    tileMapping.map(tplVal, tileBlock->getArgument(argIdx++));
-  }
-
-  // Map identity insertion operands: the template chain's op references the
-  // varying operand, which is mapped to the tile arg.
-  for (auto &id : equiv.identityOps)
-    tileMapping.map(id.varyingOperand, tileBlock->getArgument(argIdx++));
-
-  // Clone from the template chain (which has all ops including identity ones).
-  for (Operation *op : tplChain)
-    tileBuilder.clone(*op, tileMapping);
-  SubtiledRegionYieldOp::create(tileBuilder, loc, ValueRange{});
-
-  // --- Teardown Region ---
-  Block *teardownBlock = &regionOp.getTeardownRegion().emplaceBlock();
-  OpBuilder teardownBuilder = OpBuilder::atBlockEnd(teardownBlock);
-  SubtiledRegionYieldOp::create(teardownBuilder, loc, ValueRange{});
 }
 
 /// Create a mutable MemDescType with a trivial shared encoding for buffering
@@ -814,343 +701,13 @@ static gpu::MemDescType createBufferMemDescType(MLIRContext *ctx,
                                sharedMemorySpace, /*mutableMemory=*/true);
 }
 
-/// Build multiple SubtiledRegionOps for a chain that spans multiple contiguous
-/// async task sets.
-///
-/// Two transition types are handled:
-///   Option 1 (explicit store): The last op of a segment is a local_alloc with
-///     data. It is split into an empty outer-scope alloc + local_store.
-///   Option 2 (implicit buffer): No memory op at the boundary. Cross-segment
-///     tensor values are buffered through SMEM via local_store + local_load.
-static void buildMultiTaskSubtiledRegions(OpBuilder &outerBuilder, Location loc,
-                                          ArrayRef<Operation *> setupOps,
-                                          Value lhs, Value rhs,
-                                          ArrayRef<ChainSegment> segments) {
-  MLIRContext *ctx = outerBuilder.getContext();
-
-  // --- Transition analysis ---
-  // For each transition i between segments[i] and segments[i+1], collect
-  // buffer info.  A buffer entry describes one value that needs to be stored
-  // to SMEM in the producing segment and (optionally) loaded in the consuming
-  // segment.
-  struct BufferEntry {
-    Value chain0Val;     // value in chain0 being buffered
-    Value chain1Val;     // corresponding value in chain1
-    Value smem0;         // outer-scope empty alloc for tile 0
-    Value smem1;         // outer-scope empty alloc for tile 1
-    bool needsLocalLoad; // true for option 2 (consuming segment needs load)
-  };
-
-  struct TransitionInfo {
-    // Non-null for option 1 (explicit store at local_alloc).
-    gpu::LocalAllocOp alloc0;
-    gpu::LocalAllocOp alloc1;
-
-    SmallVector<BufferEntry> buffers;
-
-    bool isExplicitStore() const { return alloc0 != nullptr; }
-  };
-
-  SmallVector<TransitionInfo> transitions;
-
-  for (size_t i = 0; i + 1 < segments.size(); ++i) {
-    TransitionInfo tr;
-    Operation *lastOp0 = segments[i].opsPerTile[0].back();
-    auto alloc0 = dyn_cast<gpu::LocalAllocOp>(lastOp0);
-
-    if (alloc0 && alloc0.getSrc()) {
-      // Option 1: explicit memory store at local_alloc.
-      auto alloc1 = cast<gpu::LocalAllocOp>(segments[i].opsPerTile[1].back());
-      tr.alloc0 = alloc0;
-      tr.alloc1 = alloc1;
-
-      auto memDescType = cast<gpu::MemDescType>(alloc0.getType());
-      if (!memDescType.getMutableMemory()) {
-        memDescType = gpu::MemDescType::get(
-            memDescType.getShape(), memDescType.getElementType(),
-            memDescType.getEncoding(), memDescType.getMemorySpace(),
-            /*mutableMemory=*/true, memDescType.getAllocShape());
-      }
-
-      auto e0 =
-          gpu::LocalAllocOp::create(outerBuilder, loc, memDescType, Value{});
-      auto e1 =
-          gpu::LocalAllocOp::create(outerBuilder, loc, memDescType, Value{});
-      // The alloc result (memdesc) is consumed directly by the next segment
-      // (e.g., async_tma_copy), so no local_load is needed.
-      tr.buffers.push_back({alloc0.getResult(), alloc1.getResult(),
-                            e0.getResult(), e1.getResult(),
-                            /*needsLocalLoad=*/false});
-    } else {
-      // Option 2: implicit buffer. Find cross-segment tensor values.
-      DenseSet<Value> seg0Results;
-      for (auto *op : segments[i].opsPerTile[0])
-        for (Value r : op->getResults())
-          seg0Results.insert(r);
-
-      llvm::MapVector<Value, Value> seen; // chain0Val -> chain1Val
-      for (auto [op0, op1] : llvm::zip(segments[i + 1].opsPerTile[0],
-                                       segments[i + 1].opsPerTile[1])) {
-        for (auto [v0, v1] : llvm::zip(op0->getOperands(), op1->getOperands()))
-          if (seg0Results.contains(v0) && !seen.count(v0))
-            seen[v0] = v1;
-      }
-
-      for (auto &[v0, v1] : seen) {
-        auto tensorTy = dyn_cast<RankedTensorType>(v0.getType());
-        if (!tensorTy)
-          continue; // skip tokens, scalars — only buffer tensors
-        auto memDescType = createBufferMemDescType(ctx, tensorTy);
-        auto e0 =
-            gpu::LocalAllocOp::create(outerBuilder, loc, memDescType, Value{});
-        auto e1 =
-            gpu::LocalAllocOp::create(outerBuilder, loc, memDescType, Value{});
-        tr.buffers.push_back({v0, v1, e0.getResult(), e1.getResult(),
-                              /*needsLocalLoad=*/true});
-      }
-    }
-    transitions.push_back(std::move(tr));
-  }
-
-  // --- Generate a SubtiledRegionOp for each segment ---
-  for (size_t segIdx = 0; segIdx < segments.size(); ++segIdx) {
-    const auto &seg = segments[segIdx];
-    bool isFirstSegment = (segIdx == 0);
-    bool hasOutgoingTransition = (segIdx < transitions.size());
-    bool hasIncomingTransition = (segIdx > 0);
-
-    // Build the sub-chain for structural equivalence.
-    // For option 1, exclude the transition local_alloc (replaced by
-    // local_store).
-    SmallVector<Operation *> subOps0(seg.opsPerTile[0]);
-    SmallVector<Operation *> subOps1(seg.opsPerTile[1]);
-    if (hasOutgoingTransition && transitions[segIdx].isExplicitStore()) {
-      subOps0.pop_back(); // remove local_alloc
-      subOps1.pop_back();
-    }
-
-    // Compute per-segment differing operands.
-    auto segEquiv = checkStructuralEquivalence(subOps0, subOps1);
-    if (!segEquiv)
-      return;
-    auto &segDiff = segEquiv->differingOperands;
-    auto &segIdentity = segEquiv->identityOps;
-    ArrayRef<Operation *> tplOps =
-        (segEquiv->templateChainIdx == 0) ? subOps0 : subOps1;
-
-    // Resolve cross-segment operands: replace original values with outer-scope
-    // SMEM values.  Track which entries need a local_load in the tile body.
-    struct DiffEntry {
-      Value chain0Val; // original value in chain0 ops (for tileMapping)
-      Value setupVal0; // value to yield in setup for tile 0
-      Value setupVal1; // value to yield in setup for tile 1
-      bool needsLocalLoad = false;
-    };
-    SmallVector<DiffEntry> resolvedDiff;
-    for (auto &[v0, v1] : segDiff) {
-      Value setupV0 = v0, setupV1 = v1;
-      bool needsLoad = false;
-      for (auto &tr : transitions) {
-        for (auto &buf : tr.buffers) {
-          if (v0 == buf.chain0Val) {
-            setupV0 = buf.smem0;
-            needsLoad = buf.needsLocalLoad;
-          }
-          if (v1 == buf.chain1Val)
-            setupV1 = buf.smem1;
-        }
-      }
-      resolvedDiff.push_back({v0, setupV0, setupV1, needsLoad});
-    }
-
-    // Build tile arg types and mappings.
-    SmallVector<Type> tileArgTypes;
-    SmallVector<int32_t> tile0Map, tile1Map;
-    int32_t yieldIdx = 0;
-
-    if (isFirstSegment) {
-      tileArgTypes.push_back(lhs.getType());
-      tile0Map.push_back(0);
-      tile1Map.push_back(1);
-      yieldIdx = 2;
-    }
-
-    for (auto &entry : resolvedDiff) {
-      // For implicit-buffer entries the tile arg is a memdesc, not the
-      // original tensor type.
-      Type argType = entry.needsLocalLoad ? entry.setupVal0.getType()
-                                          : entry.chain0Val.getType();
-      tileArgTypes.push_back(argType);
-      tile0Map.push_back(yieldIdx);
-      tile1Map.push_back(yieldIdx + 1);
-      yieldIdx += 2;
-    }
-
-    // Identity insertion tile args: (varying, identity_const) pairs.
-    for (auto &id : segIdentity) {
-      tileArgTypes.push_back(id.varyingOperand.getType());
-      int32_t tplSlot = yieldIdx;
-      int32_t otherSlot = yieldIdx + 1;
-      if (segEquiv->templateChainIdx == 0) {
-        tile0Map.push_back(tplSlot);
-        tile1Map.push_back(otherSlot);
-      } else {
-        tile0Map.push_back(otherSlot);
-        tile1Map.push_back(tplSlot);
-      }
-      yieldIdx += 2;
-    }
-
-    // Outgoing SMEM args (for local_store at the end of this segment).
-    // Collect the buffer entries for the outgoing transition so we can add
-    // tile args for the SMEM destinations.
-    SmallVector<BufferEntry *> outgoingBuffers;
-    if (hasOutgoingTransition) {
-      for (auto &buf : transitions[segIdx].buffers) {
-        tileArgTypes.push_back(buf.smem0.getType());
-        tile0Map.push_back(yieldIdx);
-        tile1Map.push_back(yieldIdx + 1);
-        yieldIdx += 2;
-        outgoingBuffers.push_back(&buf);
-      }
-    }
-
-    auto tileMappingsAttr =
-        outerBuilder.getArrayAttr({DenseI32ArrayAttr::get(ctx, tile0Map),
-                                   DenseI32ArrayAttr::get(ctx, tile1Map)});
-    auto barrierAnnotationsAttr = outerBuilder.getArrayAttr({});
-    auto tokenAnnotationsAttr = outerBuilder.getArrayAttr({});
-
-    auto regionOp = SubtiledRegionOp::create(
-        outerBuilder, loc, TypeRange{}, ValueRange{}, ValueRange{},
-        /*tokenValues=*/ValueRange{}, tileMappingsAttr, barrierAnnotationsAttr,
-        tokenAnnotationsAttr);
-
-    // --- Setup Region ---
-    Block *setupBlock = &regionOp.getSetupRegion().emplaceBlock();
-    OpBuilder setupBuilder = OpBuilder::atBlockEnd(setupBlock);
-
-    SmallVector<Value> setupYields;
-    if (isFirstSegment) {
-      IRMapping setupMapping;
-      for (Operation *op : setupOps)
-        setupBuilder.clone(*op, setupMapping);
-      setupYields.push_back(setupMapping.lookupOrDefault(lhs));
-      setupYields.push_back(setupMapping.lookupOrDefault(rhs));
-
-      for (auto &entry : resolvedDiff) {
-        setupYields.push_back(setupMapping.lookupOrDefault(entry.setupVal0));
-        setupYields.push_back(setupMapping.lookupOrDefault(entry.setupVal1));
-      }
-      for (auto &id : segIdentity) {
-        setupYields.push_back(setupMapping.lookupOrDefault(id.varyingOperand));
-        setupYields.push_back(arith::ConstantOp::create(
-            setupBuilder, loc,
-            setupBuilder.getIntegerAttr(id.varyingOperand.getType(),
-                                        id.identityVal)));
-      }
-    } else {
-      for (auto &entry : resolvedDiff) {
-        setupYields.push_back(entry.setupVal0);
-        setupYields.push_back(entry.setupVal1);
-      }
-      for (auto &id : segIdentity) {
-        setupYields.push_back(id.varyingOperand);
-        setupYields.push_back(arith::ConstantOp::create(
-            setupBuilder, loc,
-            setupBuilder.getIntegerAttr(id.varyingOperand.getType(),
-                                        id.identityVal)));
-      }
-    }
-
-    // Yield SMEM values for outgoing stores.
-    for (auto *buf : outgoingBuffers) {
-      setupYields.push_back(buf->smem0);
-      setupYields.push_back(buf->smem1);
-    }
-
-    SubtiledRegionYieldOp::create(setupBuilder, loc, setupYields);
-
-    // --- Tile Region ---
-    Block *tileBlock = &regionOp.getTileRegion().emplaceBlock();
-    for (Type ty : tileArgTypes)
-      tileBlock->addArgument(ty, loc);
-    tileBlock->addArgument(outerBuilder.getI32Type(), loc);
-
-    OpBuilder tileBuilder = OpBuilder::atBlockEnd(tileBlock);
-    IRMapping tileMapping;
-    unsigned argIdx = 0;
-
-    if (isFirstSegment)
-      tileMapping.map(lhs, tileBlock->getArgument(argIdx++));
-
-    for (auto &entry : resolvedDiff) {
-      Value tileArg = tileBlock->getArgument(argIdx++);
-      if (entry.needsLocalLoad) {
-        // Option 2: tile arg is a memdesc — emit local_load to get the tensor.
-        auto loaded = gpu::LocalLoadOp::create(
-            tileBuilder, loc, entry.chain0Val.getType(), tileArg);
-        tileMapping.map(entry.chain0Val, loaded.getResult());
-      } else {
-        tileMapping.map(entry.chain0Val, tileArg);
-      }
-    }
-
-    // Map identity insertion operands: the template chain's identity op
-    // references the varying operand, which is mapped to the tile arg.
-    for (auto &id : segIdentity)
-      tileMapping.map(id.varyingOperand, tileBlock->getArgument(argIdx++));
-
-    // Collect outgoing SMEM tile args.
-    SmallVector<Value> outgoingSmemArgs;
-    for (size_t i = 0; i < outgoingBuffers.size(); ++i)
-      outgoingSmemArgs.push_back(tileBlock->getArgument(argIdx++));
-
-    // Clone segment ops into the tile body (from the template chain which
-    // includes identity ops).
-    for (Operation *op : tplOps)
-      tileBuilder.clone(*op, tileMapping);
-
-    // Emit outgoing stores. Use the template chain's value for lookup since
-    // the tile body was cloned from the template chain.
-    if (hasOutgoingTransition) {
-      auto &tr = transitions[segIdx];
-      bool tplIs1 = (segEquiv->templateChainIdx == 1);
-      if (tr.isExplicitStore()) {
-        // Option 1: store the local_alloc's source data.
-        auto srcAlloc =
-            tplIs1
-                ? cast<gpu::LocalAllocOp>(segments[segIdx].opsPerTile[1].back())
-                : tr.alloc0;
-        Value data = tileMapping.lookupOrDefault(srcAlloc.getSrc());
-        gpu::LocalStoreOp::create(tileBuilder, loc, data, outgoingSmemArgs[0]);
-      } else {
-        // Option 2: store each cross-segment value.
-        for (auto [buf, smemArg] : llvm::zip(tr.buffers, outgoingSmemArgs)) {
-          Value bufVal = tplIs1 ? buf.chain1Val : buf.chain0Val;
-          Value data = tileMapping.lookupOrDefault(bufVal);
-          gpu::LocalStoreOp::create(tileBuilder, loc, data, smemArg);
-        }
-      }
-    }
-
-    SubtiledRegionYieldOp::create(tileBuilder, loc, ValueRange{});
-
-    // --- Teardown Region ---
-    Block *teardownBlock = &regionOp.getTeardownRegion().emplaceBlock();
-    OpBuilder teardownBuilder = OpBuilder::atBlockEnd(teardownBlock);
-    SubtiledRegionYieldOp::create(teardownBuilder, loc, ValueRange{});
-  }
-}
-
 /// Build multiple SubtiledRegionOps for N-tile chains spanning multiple
 /// async task sets. Uses implicit buffering (Option 2) at segment
 /// transitions — cross-segment tensor values are communicated through SMEM.
-static bool buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
-                                           Location loc,
-                                           ArrayRef<Operation *> setupOps,
-                                           ArrayRef<Value> leafValues,
-                                           ArrayRef<ChainSegment> segments) {
+static bool buildMultiTaskSubtiledRegionsN(
+    OpBuilder &outerBuilder, Location loc, ArrayRef<Operation *> setupOps,
+    ArrayRef<Value> leafValues, ArrayRef<ChainSegment> segments,
+    const DenseSet<Operation *> *canonicalIdentityOps = nullptr) {
   MLIRContext *ctx = outerBuilder.getContext();
   unsigned numTiles = leafValues.size();
 
@@ -1163,65 +720,73 @@ static bool buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
     bool needsLocalLoad;
   };
 
-  SmallVector<SmallVector<BufferEntryN>> transitions; // one per transition
+  // --- Validation pass: check all bail conditions and segment equivalence
+  // before creating any IR. This prevents partial modifications that would
+  // change the op count and cause the fixpoint loop to retry indefinitely.
+
+  // Detect cross-segment tensor values for each transition.
+  struct TransitionInfoN {
+    llvm::MapVector<Value, SmallVector<Value>> crossSegVals;
+  };
+  SmallVector<TransitionInfoN> transitionInfos;
 
   for (size_t i = 0; i + 1 < segments.size(); ++i) {
-    Operation *lastOp0 = segments[i].opsPerTile[0].back();
-    auto alloc0 = dyn_cast<gpu::LocalAllocOp>(lastOp0);
-
-    if (alloc0 && alloc0.getSrc()) {
-      // Option 1: explicit memory store at local_alloc.
-      // Not yet supported for N-tile multi-task.
-      return false;
-    }
-
-    // Option 2: implicit buffer.
-    // Find cross-segment values: results of segment i ops used by segment i+1.
     DenseSet<Value> seg0Results;
     for (auto *op : segments[i].opsPerTile[0])
       for (Value r : op->getResults())
         seg0Results.insert(r);
 
-    // Use MapVector for deterministic ordering.
-    llvm::MapVector<Value, SmallVector<Value>> seen;
+    TransitionInfoN info;
     for (size_t opIdx = 0; opIdx < segments[i + 1].opsPerTile[0].size();
          ++opIdx) {
       for (unsigned t = 0; t < numTiles; ++t) {
         for (Value v : segments[i + 1].opsPerTile[t][opIdx]->getOperands()) {
-          if (t == 0 && seg0Results.contains(v) && !seen.count(v)) {
+          if (t == 0 && seg0Results.contains(v) &&
+              !info.crossSegVals.count(v)) {
             SmallVector<Value> perTile(numTiles);
             perTile[0] = v;
-            seen[v] = std::move(perTile);
+            info.crossSegVals[v] = std::move(perTile);
           }
         }
       }
     }
-    // Fill in non-zero tiles by matching operand position.
     for (size_t opIdx = 0; opIdx < segments[i + 1].opsPerTile[0].size();
          ++opIdx) {
       auto *op0 = segments[i + 1].opsPerTile[0][opIdx];
       for (auto [oprIdx, v0] : llvm::enumerate(op0->getOperands())) {
-        auto it = seen.find(v0);
-        if (it == seen.end())
+        auto it = info.crossSegVals.find(v0);
+        if (it == info.crossSegVals.end())
           continue;
-        for (unsigned t = 1; t < numTiles; ++t) {
-          Value vt = segments[i + 1].opsPerTile[t][opIdx]->getOperand(oprIdx);
-          it->second[t] = vt;
-        }
+        for (unsigned t = 1; t < numTiles; ++t)
+          it->second[t] =
+              segments[i + 1].opsPerTile[t][opIdx]->getOperand(oprIdx);
       }
     }
-
-    // Bail if any cross-segment value is not a tensor (e.g., pre-allocated
-    // SMEM memdesc from the memory planner). These need to be passed through
-    // as differing operands without re-buffering, which requires the
-    // per-segment refactor.
-    for (auto &[v0, perTile] : seen) {
+    for (auto &[v0, perTile] : info.crossSegVals) {
       if (!isa<RankedTensorType>(v0.getType()))
         return false;
     }
+    transitionInfos.push_back(std::move(info));
+  }
 
+  SmallVector<NWayEquivalenceResult, 4> segEquivs;
+  for (size_t segIdx = 0; segIdx < segments.size(); ++segIdx) {
+    SmallVector<SmallVector<Operation *>> segChains;
+    for (auto &ops : segments[segIdx].opsPerTile)
+      segChains.push_back(SmallVector<Operation *>(ops));
+    auto segEquiv =
+        checkStructuralEquivalenceN(segChains, canonicalIdentityOps);
+    if (!segEquiv)
+      return false;
+    segEquivs.push_back(std::move(*segEquiv));
+  }
+
+  // --- All checks passed. Now create SMEM allocs and SubtiledRegionOps.
+
+  SmallVector<SmallVector<BufferEntryN>> transitions;
+  for (size_t i = 0; i < transitionInfos.size(); ++i) {
     SmallVector<BufferEntryN> bufs;
-    for (auto &[v0, perTile] : seen) {
+    for (auto &[v0, perTile] : transitionInfos[i].crossSegVals) {
       auto tensorTy = cast<RankedTensorType>(v0.getType());
       auto memDescType = createBufferMemDescType(ctx, tensorTy);
       SmallVector<Value> smems;
@@ -1238,18 +803,11 @@ static bool buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
   // --- Generate a SubtiledRegionOp per segment ---
   for (size_t segIdx = 0; segIdx < segments.size(); ++segIdx) {
     auto &seg = segments[segIdx];
-    bool isFirstSegment = (segIdx == 0);
     bool hasOutgoing = (segIdx < transitions.size());
     bool hasIncoming = (segIdx > 0);
 
-    SmallVector<SmallVector<Operation *>> segChains;
-    for (auto &ops : seg.opsPerTile)
-      segChains.push_back(SmallVector<Operation *>(ops));
-
-    auto segEquiv = checkStructuralEquivalenceN(segChains);
-    if (!segEquiv)
-      return false;
-    auto &segDiff = segEquiv->differingOperands;
+    auto &segEquiv = segEquivs[segIdx];
+    auto &segDiff = segEquiv.differingOperands;
 
     // Resolve cross-segment operands.
     struct DiffEntryN {
@@ -1274,90 +832,91 @@ static bool buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
       resolvedDiff.push_back({perTile, setupVals, needsLoad});
     }
 
-    // Build tile arg types and N-way mappings.
-    SmallVector<Type> tileArgTypes;
-    SmallVector<SmallVector<int32_t>> tileMaps(numTiles);
-    int32_t yieldIdx = 0;
+    // Check if this segment's task IDs match any setup op's task IDs.
+    // If so, this segment "owns" the setup — it clones the setup ops and
+    // gets the leaf values as tile args.
+    bool ownsSetup = false;
+    for (auto *op : setupOps) {
+      auto opTasks = getOpAsyncTaskIds(op);
+      if (!opTasks.empty() && opTasks == seg.taskIds) {
+        ownsSetup = true;
+        break;
+      }
+    }
 
-    if (isFirstSegment) {
+    // --- Collect per-tile operands ---
+    SmallVector<Value> perTileOps;
+    SmallVector<Type> tileArgTypes;
+
+    if (ownsSetup) {
+      for (Value leaf : leafValues)
+        perTileOps.push_back(leaf);
       tileArgTypes.push_back(leafValues[0].getType());
-      for (unsigned t = 0; t < numTiles; ++t)
-        tileMaps[t].push_back(yieldIdx + t);
-      yieldIdx += numTiles;
     }
 
     for (auto &entry : resolvedDiff) {
       Type argType = entry.needsLocalLoad ? entry.setupVals[0].getType()
                                           : entry.chainVals[0].getType();
-      tileArgTypes.push_back(argType);
       for (unsigned t = 0; t < numTiles; ++t)
-        tileMaps[t].push_back(yieldIdx + t);
-      yieldIdx += numTiles;
+        perTileOps.push_back(entry.needsLocalLoad ? entry.setupVals[t]
+                                                  : entry.chainVals[t]);
+      tileArgTypes.push_back(argType);
     }
 
-    // Outgoing SMEM args.
+    // Outgoing SMEM args (per-tile).
     SmallVector<BufferEntryN *> outBufs;
     if (hasOutgoing) {
       for (auto &buf : transitions[segIdx]) {
-        tileArgTypes.push_back(buf.smemVals[0].getType());
         for (unsigned t = 0; t < numTiles; ++t)
-          tileMaps[t].push_back(yieldIdx + t);
-        yieldIdx += numTiles;
+          perTileOps.push_back(buf.smemVals[t]);
+        tileArgTypes.push_back(buf.smemVals[0].getType());
         outBufs.push_back(&buf);
       }
     }
 
-    SmallVector<Attribute> mapAttrs;
-    for (auto &m : tileMaps)
-      mapAttrs.push_back(DenseI32ArrayAttr::get(ctx, m));
-    auto tileMappingsAttr = outerBuilder.getArrayAttr(mapAttrs);
-    auto barrierAnnotationsAttr = outerBuilder.getArrayAttr({});
-    auto tokenAnnotationsAttr = outerBuilder.getArrayAttr({});
+    // --- Collect shared operands ---
+    DenseSet<Value> chainResults;
+    for (auto *op : seg.opsPerTile[0])
+      for (Value r : op->getResults())
+        chainResults.insert(r);
+    DenseSet<Value> alreadyMapped;
+    if (ownsSetup)
+      alreadyMapped.insert(leafValues[0]);
+    for (auto &entry : resolvedDiff)
+      alreadyMapped.insert(entry.chainVals[0]);
 
-    auto regionOp =
-        SubtiledRegionOp::create(outerBuilder, loc, TypeRange{}, ValueRange{},
-                                 ValueRange{}, ValueRange{}, tileMappingsAttr,
-                                 barrierAnnotationsAttr, tokenAnnotationsAttr);
-
-    // --- Setup Region ---
-    Block *setupBlock = &regionOp.getSetupRegion().emplaceBlock();
-    OpBuilder setupBuilder = OpBuilder::atBlockEnd(setupBlock);
-
-    SmallVector<Value> setupYields;
-    if (isFirstSegment) {
-      IRMapping setupMapping;
-      for (Operation *op : setupOps)
-        setupBuilder.clone(*op, setupMapping);
-      for (Value leaf : leafValues)
-        setupYields.push_back(setupMapping.lookupOrDefault(leaf));
-      for (auto &entry : resolvedDiff) {
-        for (unsigned t = 0; t < numTiles; ++t)
-          setupYields.push_back(
-              setupMapping.lookupOrDefault(entry.setupVals[t]));
-      }
-    } else {
-      for (auto &entry : resolvedDiff) {
-        for (unsigned t = 0; t < numTiles; ++t)
-          setupYields.push_back(entry.setupVals[t]);
+    SmallVector<Value> sharedOps;
+    DenseSet<Value> seenShared;
+    for (auto *op : seg.opsPerTile[0]) {
+      for (Value operand : op->getOperands()) {
+        if (chainResults.contains(operand))
+          continue;
+        if (alreadyMapped.contains(operand))
+          continue;
+        if (!seenShared.insert(operand).second)
+          continue;
+        sharedOps.push_back(operand);
       }
     }
-    for (auto *buf : outBufs) {
-      for (unsigned t = 0; t < numTiles; ++t)
-        setupYields.push_back(buf->smemVals[t]);
-    }
-    SubtiledRegionYieldOp::create(setupBuilder, loc, setupYields);
+
+    // --- Create the op ---
+    auto regionOp = SubtiledRegionOp::create(
+        outerBuilder, loc, TypeRange{}, perTileOps, sharedOps,
+        outerBuilder.getI32IntegerAttr(numTiles));
 
     // --- Tile Region ---
     Block *tileBlock = &regionOp.getTileRegion().emplaceBlock();
     for (Type ty : tileArgTypes)
       tileBlock->addArgument(ty, loc);
+    for (Value v : sharedOps)
+      tileBlock->addArgument(v.getType(), loc);
     tileBlock->addArgument(outerBuilder.getI32Type(), loc);
 
     OpBuilder tileBuilder = OpBuilder::atBlockEnd(tileBlock);
     IRMapping tileMapping;
     unsigned argIdx = 0;
 
-    if (isFirstSegment)
+    if (ownsSetup)
       tileMapping.map(leafValues[0], tileBlock->getArgument(argIdx++));
 
     for (auto &entry : resolvedDiff) {
@@ -1375,7 +934,10 @@ static bool buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
     for (size_t i = 0; i < outBufs.size(); ++i)
       outSmemArgs.push_back(tileBlock->getArgument(argIdx++));
 
-    for (Operation *op : segChains[0])
+    for (Value v : sharedOps)
+      tileMapping.map(v, tileBlock->getArgument(argIdx++));
+
+    for (Operation *op : seg.opsPerTile[0])
       tileBuilder.clone(*op, tileMapping);
 
     if (hasOutgoing) {
@@ -1385,13 +947,68 @@ static bool buildMultiTaskSubtiledRegionsN(OpBuilder &outerBuilder,
       }
     }
     SubtiledRegionYieldOp::create(tileBuilder, loc, ValueRange{});
-
-    // --- Teardown Region ---
-    Block *teardownBlock = &regionOp.getTeardownRegion().emplaceBlock();
-    OpBuilder teardownBuilder = OpBuilder::atBlockEnd(teardownBlock);
-    SubtiledRegionYieldOp::create(teardownBuilder, loc, ValueRange{});
   }
   return true;
+}
+
+/// Return true if any op across the N chains has a different async_task_id
+/// than the first task-annotated op.
+static bool isMultiTask(ArrayRef<SmallVector<Operation *>> chains) {
+  SmallVector<int32_t> firstTaskIds;
+  for (auto &chain : chains) {
+    for (auto *op : chain) {
+      auto taskIds = getOpAsyncTaskIds(op);
+      if (taskIds.empty())
+        continue;
+      if (firstTaskIds.empty())
+        firstTaskIds = taskIds;
+      else if (taskIds != firstTaskIds)
+        return true;
+    }
+  }
+  return false;
+}
+
+/// Find the latest op in `block` among all chain ops and differing operand
+/// definitions, then return the op immediately after it (the insertion point
+/// for the SubtiledRegionOp).
+static Operation *
+findInsertionPoint(Block *block, Operation *anchor,
+                   ArrayRef<SmallVector<Operation *>> chains,
+                   ArrayRef<SmallVector<Value>> differingOperands = {},
+                   ArrayRef<EquivalenceResult::IdentityOp> identityOps = {}) {
+  Operation *latest = anchor;
+  auto updateLatest = [&](Operation *op) {
+    if (op && op->getBlock() == block && latest->isBeforeInBlock(op))
+      latest = op;
+  };
+  for (auto &chain : chains)
+    for (auto *op : chain)
+      updateLatest(op);
+  for (auto &perTile : differingOperands)
+    for (Value v : perTile)
+      if (auto defOp = v.getDefiningOp())
+        updateLatest(defOp);
+  for (auto &id : identityOps)
+    if (auto defOp = id.varyingOperand.getDefiningOp())
+      updateLatest(defOp);
+  return latest->getNextNode();
+}
+
+/// Return true if any task ID set appears non-contiguously in the segment
+/// list (e.g., task A → B → A).
+static bool hasNonContiguousTaskIds(ArrayRef<ChainSegment> segments) {
+  SmallVector<SmallVector<int32_t>> seenTaskSets;
+  for (auto &seg : segments) {
+    if (seenTaskSets.empty() || seenTaskSets.back() != seg.taskIds) {
+      for (size_t i = 0; i + 1 < seenTaskSets.size(); ++i) {
+        if (seenTaskSets[i] == seg.taskIds)
+          return true;
+      }
+      seenTaskSets.push_back(seg.taskIds);
+    }
+  }
+  return false;
 }
 
 } // anonymous namespace
@@ -1402,195 +1019,66 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
     return;
 
   Block *block = splitOp->getBlock();
-  Value lhs = splitOp.getOutLHS();
-  Value rhs = splitOp.getOutRHS();
 
   // Check for nested split tree (4-tile, 8-tile, etc.).
   SmallVector<Value> leafValues;
   SmallVector<Operation *> innerSetupOps;
   collectSplitTreeLeaves(splitOp, leafValues, innerSetupOps);
-
-  // If any leaf feeds into yet another split (not caught by the tree walker),
-  // bail out — we only support complete trees.
   unsigned numTiles = leafValues.size();
 
-  if (numTiles > 2) {
-    // --- N-tile path (4, 8, ...) ---
-    // Collect per-tile chains for each leaf value. The "barrier" for chain
-    // collection is the last split in the tree, not the root split.
-    Operation *lastSetupOp = innerSetupOps.empty()
-                                 ? static_cast<Operation *>(splitOp)
-                                 : innerSetupOps.back();
-    SmallVector<SmallVector<Operation *>> chains;
-    for (Value leaf : leafValues) {
-      auto chain = collectPerTileChain(leaf, lastSetupOp, block,
-                                       /*includeAuxiliary=*/false);
-      if (chain.empty())
-        return;
-      chains.push_back(std::move(chain));
-    }
-
-    auto equiv = checkStructuralEquivalenceN(chains);
-    if (!equiv)
+  // Collect per-tile chains. For nested splits, exclude inner setup ops
+  // from auxiliary collection to avoid capturing other branches.
+  Operation *lastSetupOp = innerSetupOps.empty()
+                               ? static_cast<Operation *>(splitOp)
+                               : innerSetupOps.back();
+  DenseSet<Operation *> excludeOps(innerSetupOps.begin(), innerSetupOps.end());
+  SmallVector<SmallVector<Operation *>> chains;
+  for (Value leaf : leafValues) {
+    auto chain = collectPerTileChain(leaf, lastSetupOp, block, excludeOps);
+    if (chain.empty())
       return;
-
-    // Check if chains are multi-task.
-    bool multiTask = false;
-    {
-      SmallVector<int32_t> firstTaskIds;
-      for (auto &chain : chains) {
-        for (auto *op : chain) {
-          auto taskIds = getOpAsyncTaskIds(op);
-          if (taskIds.empty())
-            continue;
-          if (firstTaskIds.empty())
-            firstTaskIds = taskIds;
-          else if (taskIds != firstTaskIds)
-            multiTask = true;
-        }
-      }
-    }
-
-    // Collect setup ops: tmemLoad → root split + inner setup ops.
-    SmallVector<Operation *> setupOps;
-    for (auto it = Block::iterator(tmemLoad); it != Block::iterator(splitOp);
-         ++it)
-      setupOps.push_back(&*it);
-    setupOps.push_back(splitOp);
-    llvm::sort(innerSetupOps, [](Operation *a, Operation *b) {
-      return a->isBeforeInBlock(b);
-    });
-    for (auto *op : innerSetupOps)
-      setupOps.push_back(op);
-
-    // Position the SubtiledRegionOp after all chain ops.
-    Operation *insertBefore = nullptr;
-    {
-      Operation *latest = lastSetupOp;
-      auto updateLatest = [&](Operation *op) {
-        if (op && op->getBlock() == block && latest->isBeforeInBlock(op))
-          latest = op;
-      };
-      for (auto &chain : chains)
-        for (auto *op : chain)
-          updateLatest(op);
-      for (auto &perTile : equiv->differingOperands)
-        for (Value v : perTile)
-          if (auto defOp = v.getDefiningOp())
-            updateLatest(defOp);
-      for (auto &id : equiv->identityOps)
-        if (auto defOp = id.varyingOperand.getDefiningOp())
-          updateLatest(defOp);
-      insertBefore = latest->getNextNode();
-    }
-    OpBuilder builder(insertBefore);
-    Location loc = splitOp.getLoc();
-
-    bool built = false;
-    if (multiTask) {
-      auto segments = groupByContiguousTaskSetN(chains);
-      if (!segments || segments->empty())
-        return;
-      if (segments->size() == 1) {
-        buildSingleSubtiledRegionN(builder, loc, setupOps, leafValues, chains,
-                                   *equiv);
-        built = true;
-      } else {
-        built = buildMultiTaskSubtiledRegionsN(builder, loc, setupOps,
-                                               leafValues, *segments);
-      }
-    } else {
-      buildSingleSubtiledRegionN(builder, loc, setupOps, leafValues, chains,
-                                 *equiv);
-      built = true;
-    }
-    if (!built)
-      return;
-
-    // Erase original ops (reverse program order).
-    // Chains first, then setup (which includes inner setup ops).
-    for (auto &chain : llvm::reverse(chains)) {
-      for (Operation *op : llvm::reverse(chain)) {
-        if (op->use_empty())
-          op->erase();
-      }
-    }
-    for (Operation *op : llvm::reverse(setupOps)) {
-      if (op->use_empty())
-        op->erase();
-    }
-    return;
+    chains.push_back(std::move(chain));
   }
 
-  // --- 2-tile path (existing) ---
-  SmallVector<Operation *> chain0 = collectPerTileChain(lhs, splitOp, block);
-  SmallVector<Operation *> chain1 = collectPerTileChain(rhs, splitOp, block);
-
-  if (chain0.empty() || chain1.empty())
+  auto equiv = checkStructuralEquivalenceN(chains);
+  if (!equiv)
     return;
 
-  auto differing = checkStructuralEquivalence(chain0, chain1);
-  if (!differing)
-    return;
-
-  bool hasIdentityInsertions = !differing->identityOps.empty();
-
+  // Collect setup ops: tmemLoad → root split + inner setup ops.
   SmallVector<Operation *> setupOps;
   for (auto it = Block::iterator(tmemLoad); it != Block::iterator(splitOp);
        ++it)
     setupOps.push_back(&*it);
   setupOps.push_back(splitOp);
+  llvm::sort(innerSetupOps,
+             [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
+  for (auto *op : innerSetupOps)
+    setupOps.push_back(op);
 
-  Operation *insertBefore = nullptr;
-  {
-    Operation *latest = splitOp;
-    auto updateLatest = [&](Operation *op) {
-      if (op && op->getBlock() == block && latest->isBeforeInBlock(op))
-        latest = op;
-    };
-    for (auto *op : chain0)
-      updateLatest(op);
-    for (auto *op : chain1)
-      updateLatest(op);
-    insertBefore = latest->getNextNode();
-  }
+  Operation *insertBefore = findInsertionPoint(
+      block, lastSetupOp, chains, equiv->differingOperands, equiv->identityOps);
   OpBuilder builder(insertBefore);
   Location loc = splitOp.getLoc();
 
-  std::optional<SmallVector<ChainSegment>> segments;
-  if (hasIdentityInsertions)
-    segments = groupByContiguousTaskSetWithIdentity(chain0, chain1, *differing);
-  else
-    segments = groupByContiguousTaskSet(chain0, chain1);
-  if (!segments || segments->empty())
-    return;
+  bool built = false;
+  bool multiTask = isMultiTask(chains);
 
-  if (segments->size() == 1) {
-    buildSingleSubtiledRegion(builder, loc, setupOps, lhs, rhs, chain0, chain1,
-                              *differing);
+  if (!multiTask) {
+    buildSingleSubtiledRegionN(builder, loc, setupOps, leafValues, chains,
+                               *equiv);
+    built = true;
   } else {
-    // Check if task IDs form non-contiguous groups (e.g., task A → B → A).
-    // This happens in addmm where the bias load (task 3) is interleaved
-    // between compute ops (task 2). Merge segments with the same task ID
-    // and reorder by data dependency to produce contiguous task groups.
-    bool hasNonContiguousTasks = false;
-    {
-      SmallVector<SmallVector<int32_t>> seenTaskSets;
-      for (auto &seg : *segments) {
-        if (seenTaskSets.empty() || seenTaskSets.back() != seg.taskIds) {
-          for (size_t i = 0; i + 1 < seenTaskSets.size(); ++i) {
-            if (seenTaskSets[i] == seg.taskIds) {
-              hasNonContiguousTasks = true;
-              break;
-            }
-          }
-          seenTaskSets.push_back(seg.taskIds);
-        }
-      }
-    }
+    auto segments = groupByContiguousTaskSet(chains, *equiv);
+    if (!segments || segments->empty())
+      return;
 
-    if (hasNonContiguousTasks) {
-      // Merge segments with the same task ID.
+    if (segments->size() == 1) {
+      buildSingleSubtiledRegionN(builder, loc, setupOps, leafValues, chains,
+                                 *equiv);
+      built = true;
+    } else if (hasNonContiguousTaskIds(*segments)) {
+      // Merge segments with the same task ID and topologically sort by
+      // data dependency to produce contiguous task groups.
       SmallVector<ChainSegment> merged;
       for (auto &seg : *segments) {
         ChainSegment *target = nullptr;
@@ -1609,8 +1097,6 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
         }
       }
 
-      // Topological sort by data dependency: if segment A produces values
-      // consumed by segment B, A must come before B.
       unsigned n = merged.size();
       SmallVector<DenseSet<Value>> segResults(n);
       for (unsigned i = 0; i < n; ++i)
@@ -1649,48 +1135,127 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
 
       // Strip identity ops from the non-template side so that per-segment
       // checkStructuralEquivalence correctly detects identity insertions.
-      // Without this, both sides have the same Operation* and the identity
-      // op becomes dead code in the tile body.
-      unsigned nonTpl = (differing->templateChainIdx == 0) ? 1 : 0;
       for (auto &seg : reordered) {
-        SmallVector<Operation *> filtered;
-        for (auto *op : seg.opsPerTile[nonTpl]) {
-          if (!differing->identityOpSet.count(op))
-            filtered.push_back(op);
-        }
-        seg.opsPerTile[nonTpl] = std::move(filtered);
-      }
-
-      buildMultiTaskSubtiledRegions(builder, loc, setupOps, lhs, rhs,
-                                    reordered);
-    } else {
-      for (size_t i = 0; i + 1 < segments->size(); ++i) {
-        Operation *lastOp = (*segments)[i].opsPerTile[0].back();
-        auto alloc = dyn_cast<gpu::LocalAllocOp>(lastOp);
-
-        if (alloc && alloc.getSrc()) {
-          for (size_t j = 0; j + 1 < (*segments)[i].opsPerTile[0].size(); ++j) {
-            for (Value operand :
-                 (*segments)[i].opsPerTile[0][j]->getOperands()) {
-              if (operand == alloc.getResult())
-                return;
-            }
+        for (unsigned t = 0; t < seg.opsPerTile.size(); ++t) {
+          if (t == equiv->templateChainIdx)
+            continue;
+          SmallVector<Operation *> filtered;
+          for (auto *op : seg.opsPerTile[t]) {
+            if (!equiv->identityOpSet.count(op))
+              filtered.push_back(op);
           }
+          seg.opsPerTile[t] = std::move(filtered);
         }
       }
 
-      buildMultiTaskSubtiledRegions(builder, loc, setupOps, lhs, rhs,
-                                    *segments);
+      built = buildMultiTaskSubtiledRegionsN(builder, loc, setupOps, leafValues,
+                                             reordered, &equiv->identityOpSet);
+    } else {
+      // Strip identity ops from non-template tiles so per-segment
+      // equivalence detects them correctly (otherwise all tiles have the
+      // same Operation* and identity is invisible).
+      SmallVector<ChainSegment> strippedSegments(segments->begin(),
+                                                 segments->end());
+      for (auto &seg : strippedSegments) {
+        for (unsigned t = 0; t < seg.opsPerTile.size(); ++t) {
+          if (t == equiv->templateChainIdx)
+            continue;
+          SmallVector<Operation *> filtered;
+          for (auto *op : seg.opsPerTile[t]) {
+            if (!equiv->identityOpSet.count(op))
+              filtered.push_back(op);
+          }
+          seg.opsPerTile[t] = std::move(filtered);
+        }
+      }
+      built = buildMultiTaskSubtiledRegionsN(builder, loc, setupOps, leafValues,
+                                             strippedSegments,
+                                             &equiv->identityOpSet);
     }
   }
 
-  for (Operation *op : llvm::reverse(chain1)) {
-    if (op->use_empty())
-      op->erase();
+  if (!built)
+    return;
+
+  // Build a second SubtiledRegionOp for TMA store ops that consume
+  // the same SMEM buffers the per-tile local_store wrote to.
+  // Collect per-tile TMA store chains by following SMEM buffer users.
+  SmallVector<SmallVector<Operation *>> tmaChains(numTiles);
+  for (unsigned t = 0; t < numTiles; ++t) {
+    for (Operation *op : chains[t]) {
+      auto storeOp = dyn_cast<gpu::LocalStoreOp>(op);
+      if (!storeOp)
+        continue;
+      Value smemBuf = storeOp.getDst();
+      for (Operation *user : smemBuf.getUsers()) {
+        if (user == storeOp || user->getBlock() != block)
+          continue;
+        if (user->isBeforeInBlock(splitOp) || user == splitOp)
+          continue;
+        if (isa<SubtiledRegionOp>(user))
+          continue;
+        tmaChains[t].push_back(user);
+        // Also capture token users (e.g., async_tma_store_token_wait).
+        for (Value result : user->getResults())
+          for (Operation *tokenUser : result.getUsers())
+            if (tokenUser->getBlock() == block)
+              tmaChains[t].push_back(tokenUser);
+      }
+    }
+    llvm::sort(tmaChains[t], [](Operation *a, Operation *b) {
+      return a->isBeforeInBlock(b);
+    });
   }
-  for (Operation *op : llvm::reverse(chain0)) {
-    if (op->use_empty())
-      op->erase();
+
+  // Check if TMA chains are non-empty and structurally equivalent.
+  bool hasTmaChains = !tmaChains[0].empty();
+  for (unsigned t = 1; t < numTiles && hasTmaChains; ++t)
+    hasTmaChains = !tmaChains[t].empty();
+
+  if (hasTmaChains) {
+    auto tmaEquiv = checkStructuralEquivalenceN(tmaChains);
+    if (tmaEquiv) {
+      Operation *tmaInsertBefore = findInsertionPoint(
+          block, lastSetupOp, tmaChains, tmaEquiv->differingOperands,
+          tmaEquiv->identityOps);
+      OpBuilder tmaBuilder(tmaInsertBefore);
+
+      // The TMA chains don't come from a split — the "leaf values" are
+      // the SMEM buffers (differing operands from the epilogue chain).
+      // Use the SMEM buffers as the per-tile leaf values. The setup
+      // region just yields them and any other differing operands.
+      SmallVector<Value> smemLeaves(numTiles);
+      for (unsigned t = 0; t < numTiles; ++t) {
+        // Find the SMEM buffer from the first op in the TMA chain
+        // (async_tma_copy_local_to_global's last operand is the SMEM src).
+        auto tmaCopy =
+            dyn_cast<AsyncTMACopyLocalToGlobalOp>(tmaChains[t].front());
+        if (tmaCopy)
+          smemLeaves[t] = tmaCopy.getSrc();
+      }
+
+      if (smemLeaves[0]) {
+        buildSingleSubtiledRegionN(tmaBuilder, loc, /*setupOps=*/{}, smemLeaves,
+                                   tmaChains, *tmaEquiv);
+
+        // Erase original TMA ops.
+        for (auto &tmaChain : llvm::reverse(tmaChains)) {
+          for (Operation *op : llvm::reverse(tmaChain)) {
+            if (op->use_empty())
+              op->erase();
+          }
+        }
+      }
+    }
+  }
+
+  // Erase original ops (reverse program order).
+  for (auto &chain : llvm::reverse(chains)) {
+    for (Operation *op : llvm::reverse(chain)) {
+      if (op->use_empty()) {
+        op->erase();
+      }
+    }
   }
   for (Operation *op : llvm::reverse(setupOps)) {
     if (op->use_empty())
@@ -1718,14 +1283,32 @@ public:
     while (changed) {
       changed = false;
       SmallVector<triton::SplitOp> splitOps;
-      getOperation().walk([&](triton::FuncOp funcOp) {
-        for (auto &block : funcOp.getBody()) {
-          for (auto &op : block) {
-            if (auto splitOp = dyn_cast<triton::SplitOp>(&op))
-              if (!failedSplits.contains(&op))
-                splitOps.push_back(splitOp);
+      auto feedsIntoSubtiledRegion = [](triton::SplitOp splitOp) {
+        SmallVector<Value> worklist;
+        for (Value r : splitOp->getResults())
+          worklist.push_back(r);
+        DenseSet<Value> visited;
+        while (!worklist.empty()) {
+          Value v = worklist.pop_back_val();
+          if (!visited.insert(v).second)
+            continue;
+          for (Operation *user : v.getUsers()) {
+            if (isa<SubtiledRegionOp>(user))
+              return true;
+            for (Value r : user->getResults())
+              worklist.push_back(r);
           }
         }
+        return false;
+      };
+      getOperation().walk([&](triton::SplitOp splitOp) {
+        if (failedSplits.contains(splitOp.getOperation()))
+          return;
+        if (splitOp->getParentOfType<SubtiledRegionOp>())
+          return;
+        if (feedsIntoSubtiledRegion(splitOp))
+          return;
+        splitOps.push_back(splitOp);
       });
       for (auto splitOp : splitOps) {
         auto tmemLoad = traceSetupChain(splitOp);

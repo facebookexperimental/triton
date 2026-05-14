@@ -59,6 +59,12 @@ the expected producer completion order. Groups stores by type
 (`DescriptorStoreOp` vs `StoreOp`) and interleaves them so
 earlier-completed producers are consumed first.
 
+When an epilogue channel feeds a TMA store, the `DescriptorStoreOp` is the
+ordering anchor for the consumer partition. Since `createBuffer` inserts
+`LocalStoreOp` in producer order, this step preserves producer order within
+each descriptor-store group so the producer-side `local_store` sequence
+matches the TMA-store sequence.
+
 ### Step 3: `createBuffer`
 
 The core step. For each channel (grouped by producer), create or hoist

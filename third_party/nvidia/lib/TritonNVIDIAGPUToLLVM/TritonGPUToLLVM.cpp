@@ -28,6 +28,8 @@
 namespace ttg = mlir::triton::gpu;
 namespace ttng = mlir::triton::nvidia_gpu;
 
+namespace ttng = mlir::triton::nvidia_gpu;
+
 namespace mlir {
 namespace triton {
 #define GEN_PASS_DEF_CONVERTTRITONGPUTOLLVM
@@ -68,6 +70,9 @@ public:
     addIllegalDialect<mlir::gpu::GPUDialect>();
     addLegalOp<mlir::UnrealizedConversionCastOp>();
 
+    // TCGen5GlobalAllocOp has no operands/results, survives to NVGPUToLLVM.
+    addLegalOp<triton::nvidia_gpu::TCGen5GlobalAllocOp>();
+
     // Warp specialization is lowered later.
     addLegalOp<triton::gpu::WarpSpecializeOp>();
     addLegalOp<triton::gpu::WarpYieldOp>();
@@ -98,7 +103,7 @@ struct ConvertTritonGPUToLLVM
     ModuleAllocation allocation(
         mod, mlir::triton::nvidia_gpu::getNvidiaAllocationAnalysisScratchSizeFn(
                  targetInfo));
-    ModuleMembarAnalysis membarPass(&allocation);
+    ModuleMembarAnalysis membarPass(&allocation, canSkipBarSync);
     membarPass.run();
     if (failed(maybeInsertClusterSync(mod))) {
       return signalPassFailure();
@@ -347,15 +352,9 @@ private:
   }
 
   // If the kernel is clustered, insert cluster sync properly to
-  // bootstrap remote bars
+  // bootstrap remote bars or tmem
   LogicalResult maybeInsertClusterSync(ModuleOp &mod) {
     if (!tlx::tlxIsClustered(mod)) {
-      return success();
-    }
-
-    // If the kernel is in explicit(manual) cluster sync mode, users will be
-    // responsible for inserting cluster sync correctly from front end.
-    if (tlx::tlxExplicitClusterSync(mod)) {
       return success();
     }
 
@@ -370,8 +369,11 @@ private:
       }
       return WalkResult::advance();
     });
-    // If there's no remote barrier, skipping
-    if (!hasRemoteBar) {
+
+    // If we have remote mbar/SMEM access, or if we have 2cta TMEM allocation,
+    // we need a cluster sync after mbar init and before TMEM alloc
+    bool shouldInsert = hasRemoteBar || tlx::tlxEnablePairedMMA(mod);
+    if (!shouldInsert) {
       return success();
     }
 
@@ -381,8 +383,12 @@ private:
       remoteOrLocalBarInitOps.insert(barInitOp);
     });
 
+    // It's almost impossible for a clustered kernel to not have any mbar but
+    // have 2cta TMEM allocation. We enforce that such that we know it's safe
+    // to insert a cluster sync after the last bar init op, as long as we can
+    // enforce tmem alloc happens after all such mbar init.
     assert(!remoteOrLocalBarInitOps.empty() &&
-           "Failed to find bar init op when we know there's remote bar");
+           "Failed to find bar init op in a clustered kernel");
 
     // Enforcing front end for 2cta kernels:
     // All remote barrier init ops need to happen at the first block of
@@ -413,13 +419,16 @@ private:
     // need to insert fence to make mbar init visible to cluster
     ttng::FenceMBarrierInitReleaseClusterOp::create(builder,
                                                     lastBarInitOp.getLoc());
+    ttng::FenceAsyncSharedOp::create(builder, lastBarInitOp.getLoc(),
+                                     /*bCluster=*/true);
     // need to insert cluster arrive and wait to prevent CTA_X from arriving
     // CTA_Y's bar before CTA_Y inits it, as shown in ptx doc examples:
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-test-wait-try-wait
     ttng::ClusterArriveOp::create(builder, lastBarInitOp.getLoc(),
                                   /*relaxed*/ false);
     ttng::ClusterWaitOp::create(builder, lastBarInitOp.getLoc());
-
+    // mark mod attr so that WS lowering is aware of this cluster sync point
+    tlx::setClusterSyncKernelInitOnMod(mod, true);
     return success();
   }
 };
@@ -443,46 +452,19 @@ createConvertTritonGPUToLLVMPass(int32_t computeCapability,
                                                   ptxVersion);
 }
 
-bool NVIDIA::canSkipBarSync(Operation *before, Operation *after) {
-  // Multiple init barriers on the same allocation would usually not happen but
-  // that allows us to avoid barriers between multiple subslice of an array of
-  // mbarriers. This is still correct even if the inits happen on the same
-  // allocation.
-  if (isa<triton::nvidia_gpu::InitBarrierOp>(before) &&
-      isa<triton::nvidia_gpu::InitBarrierOp>(after))
+bool NVIDIA::canSkipBarSync(Operation *before, Operation *after,
+                            Allocation *allocation) {
+  // These mbarrier ops are single threaded, so are always synchronized wrt.
+  // each other.
+  if (isa<ttng::InitBarrierOp, ttng::InvalBarrierOp, ttng::BarrierExpectOp>(
+          before) &&
+      isa<ttng::InitBarrierOp, ttng::InvalBarrierOp, ttng::BarrierExpectOp>(
+          after))
     return true;
 
-  if (isa<triton::nvidia_gpu::InvalBarrierOp>(before) &&
-      isa<triton::nvidia_gpu::InvalBarrierOp>(after))
-    return true;
-
-  //  We can't have a warp get ahead when we have a chain of mbarrier wait so we
-  //  need a barrier in between two WaitBarrierOp.
-  if (isa<triton::nvidia_gpu::WaitBarrierOp>(before) &&
-      isa<triton::nvidia_gpu::WaitBarrierOp>(after))
-    return false;
-
-  // Even though WaitBarrierOp, AsyncTMACopyGlobalToLocalOp and
-  // AsyncTMACopyGlobalToLocalOp read and write to the mbarrier allocation it is
-  // valid for them to happen in different order on different threads, therefore
-  // we don't need a barrier between those operations.
-  if (isa<triton::nvidia_gpu::WaitBarrierOp,
-          triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp,
-          triton::nvidia_gpu::AsyncTMAGatherOp,
-          triton::nvidia_gpu::BarrierExpectOp>(before) &&
-      isa<triton::nvidia_gpu::WaitBarrierOp,
-          triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp,
-          triton::nvidia_gpu::AsyncTMAGatherOp,
-          triton::nvidia_gpu::BarrierExpectOp>(after))
-    return true;
-
-  // A mbarrier wait is released only when the whole operations is done,
-  // therefore any thread can access the memory after the barrier even if some
-  // threads haven't reached the mbarrier wait.
-  if (isa<triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp,
-          triton::nvidia_gpu::AsyncTMAGatherOp,
-          triton::nvidia_gpu::WaitBarrierOp>(before) &&
-      !isa<triton::nvidia_gpu::InvalBarrierOp>(after))
+  // wait_barrier will never run ahead of the load it's waiting on
+  if (isa<ttng::AsyncTMACopyGlobalToLocalOp, ttng::AsyncTMAGatherOp>(before) &&
+      isa<ttng::WaitBarrierOp>(after))
     return true;
 
   return false;

@@ -312,7 +312,7 @@ class base_knobs:
 class BuildImpl(Protocol):
 
     def __call__(self, name: str, src: str, srcdir: str, library_dirs: list[str], include_dirs: list[str],
-                 libraries: list[str], /) -> str:
+                 libraries: list[str], ccflags: list[str], /) -> str:
         ...
 
 
@@ -423,6 +423,9 @@ class HookChain(Generic[F]):
         if func in self.calls:
             self.calls.remove(func)
 
+    def __bool__(self):
+        return len(self.calls) > 0
+
     def __call__(self, *args, **kwargs):
         for call in self.calls if not self.reversed else reversed(self.calls):
             call(*args, **kwargs)
@@ -516,8 +519,11 @@ class nvidia_knobs(base_knobs):
     dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
     dump_tlx_benchmark: env_bool = env_bool("TRITON_DUMP_TLX_BENCHMARK")
     use_no_compile_launcher: env_bool = env_bool("TRITON_USE_NO_COMPILE_LAUNCHER")
+    use_llvm_launcher: env_bool = env_bool("TRITON_USE_LLVM_LAUNCHER")
+    use_triton_dispatcher: env_bool = env_bool("TRITON_USE_TRITON_DISPATCHER")
     generate_subtiled_region: env_bool = env_bool("TRITON_GENERATE_SUBTILED_REGION")
     enable_tileir: env_bool = env_bool("ENABLE_TILE")
+    disable_budget_aware_layout_conversion: env_bool = env_bool("TRITON_DISABLE_BUDGET_AWARE_LAYOUT_CONVERSION")
 
 
 class amd_knobs(base_knobs):
@@ -536,6 +542,11 @@ class amd_knobs(base_knobs):
 
     scalarize_packed_fops: env_bool = env_bool("AMDGCN_SCALARIZE_PACKED_FOPS")
 
+    # Path to dump MIR files for debugging/analysis
+    dump_mir: env_opt_str = env_opt_str("TRITON_DUMP_MIR")
+    # Path to externally-provided MIR files to use instead of generated ones
+    swap_mir: env_opt_str = env_opt_str("TRITON_SWAP_MIR")
+
 
 class proton_knobs(base_knobs):
     disable: env_bool = env_bool("TRITON_PROTON_DISABLE", False)
@@ -544,6 +555,24 @@ class proton_knobs(base_knobs):
         str(pathlib.Path(__file__).parent.absolute() / "backends" / "nvidia" / "lib" / "cupti"))
     profile_buffer_size: env_int = env_int("TRITON_PROFILE_BUFFER_SIZE", 64 * 1024 * 1024)
     enable_nvtx: env_bool = env_bool("TRITON_ENABLE_NVTX", True)
+    # This knob is effective only on Blackwell+ GPUs.
+    #
+    # When enabled, the profiling session must start after CUDA driver
+    # initialization but before the CUDA context is created.
+    #
+    # You can ensure this in one of the following ways:
+    #
+    # 1) Use the `proton` CLI tool to launch the Python script, e.g.:
+    #    `TRITON_ENABLE_HW_TRACE=1 proton python my_script.py`
+    #
+    # 2) Call `proton.start()` immediately after importing Proton, e.g.:
+    #    ```python
+    #    import triton
+    #    import triton.profiler as proton
+    #    triton.knobs.proton.enable_hw_trace = True
+    #    proton.start(hook="triton")
+    #    ```
+    enable_hw_trace: env_bool = env_bool("TRITON_ENABLE_HW_TRACE", False)
 
 
 build = build_knobs()

@@ -2066,6 +2066,9 @@ public:
       }
     }
 
+    // Build a set of ops being rewritten for fast lookup.
+    DenseSet<Operation *> rewriteSet(opsToRewrite.begin(), opsToRewrite.end());
+
     // For each op we're rewriting, fix up any operands that aren't in srcEnc.
     // When an operand comes through a chain of elementwise ops from a
     // local_load, rewrite the entire chain to srcEnc.
@@ -2081,9 +2084,6 @@ public:
         bool foundLocalLoad = false;
         while (auto defOp = current.getDefiningOp()) {
           if (auto localLoad = dyn_cast<LocalLoadOp>(defOp)) {
-            localLoad.getResult().setType(
-                cast<RankedTensorType>(localLoad.getType())
-                    .cloneWithEncoding(srcEnc));
             foundLocalLoad = true;
             break;
           }
@@ -2098,12 +2098,58 @@ public:
           break;
         }
         if (foundLocalLoad) {
-          // Rewrite all ops in the backward chain to srcEnc.
-          for (Operation *chainOp : backwardChain) {
-            for (Value result : chainOp->getResults()) {
-              if (auto rty = dyn_cast<RankedTensorType>(result.getType()))
-                result.setType(rty.cloneWithEncoding(srcEnc));
+          // Before mutating types in place, verify that every value in the
+          // backward chain (and the local_load) is only used by ops that
+          // are also being rewritten or are in the backward chain itself.
+          // If a value has users outside this set, in-place mutation would
+          // create an encoding mismatch for those external users.
+          bool safeToMutate = true;
+          auto isSafeUser = [&](Operation *user) {
+            return rewriteSet.contains(user) ||
+                   llvm::is_contained(backwardChain, user);
+          };
+          // Check the local_load's result.
+          for (Operation *user : current.getUsers()) {
+            if (!isSafeUser(user)) {
+              safeToMutate = false;
+              break;
             }
+          }
+          // Check each op in the backward chain.
+          if (safeToMutate) {
+            for (Operation *chainOp : backwardChain) {
+              for (Value result : chainOp->getResults()) {
+                for (Operation *user : result.getUsers()) {
+                  if (!isSafeUser(user)) {
+                    safeToMutate = false;
+                    break;
+                  }
+                }
+                if (!safeToMutate)
+                  break;
+              }
+              if (!safeToMutate)
+                break;
+            }
+          }
+          if (safeToMutate) {
+            // Safe: mutate the local_load and chain in place.
+            current.setType(
+                cast<RankedTensorType>(current.getType())
+                    .cloneWithEncoding(srcEnc));
+            for (Operation *chainOp : backwardChain) {
+              for (Value result : chainOp->getResults()) {
+                if (auto rty = dyn_cast<RankedTensorType>(result.getType()))
+                  result.setType(rty.cloneWithEncoding(srcEnc));
+              }
+            }
+          } else {
+            // Unsafe: fall back to inserting a convert on this operand.
+            rewriter.setInsertionPoint(op);
+            auto newTy = ty.cloneWithEncoding(srcEnc);
+            auto newCvt = ConvertLayoutOp::create(rewriter, op->getLoc(),
+                                                  newTy, operand.get());
+            operand.set(newCvt);
           }
         } else {
           // Fallback: insert a convert_layout on this operand.

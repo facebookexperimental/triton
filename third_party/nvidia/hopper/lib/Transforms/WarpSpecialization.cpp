@@ -47,16 +47,40 @@ void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
 void doTMAStoreWaitReorder(triton::FuncOp &funcOp);
 void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp);
 void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp);
+void doLowerSubtiledRegionsWithNVWSOps(triton::FuncOp &funcOp) {
+  namespace ttng = triton::nvidia_gpu;
+  namespace nvws = triton::nvws;
+  SmallVector<ttng::SubtiledRegionOp> toInline;
+  funcOp.walk([&](ttng::SubtiledRegionOp op) {
+    Block &tileBlock = op.getTileRegion().front();
+    for (Operation &tileOp : tileBlock.without_terminator()) {
+      if (isa<nvws::ProducerAcquireOp, nvws::ProducerCommitOp,
+              nvws::ConsumerWaitOp, nvws::ConsumerReleaseOp>(&tileOp)) {
+        toInline.push_back(op);
+        break;
+      }
+    }
+  });
+  for (auto op : toInline)
+    ttng::lowerSubtiledRegion(op);
+}
+
+void doLowerRemainingSubtiledRegions(triton::FuncOp &funcOp) {
+  namespace ttng = triton::nvidia_gpu;
+  SmallVector<ttng::SubtiledRegionOp> remaining;
+  funcOp.walk([&](ttng::SubtiledRegionOp op) { remaining.push_back(op); });
+  for (auto op : remaining)
+    ttng::lowerSubtiledRegion(op);
+}
+
 void doGenerateSubtiledRegion(triton::FuncOp &funcOp) {
   auto moduleOp = funcOp->getParentOfType<ModuleOp>();
   PassManager pm(moduleOp.getContext());
   pm.addPass(triton::nvidia_gpu::
                  createTritonNvidiaGPUTestGenerateSubtiledRegionPass());
-  // OptimizeTMemLayouts and PushSharedSetupToTile are deferred: they run
-  // later via the main add_optimize_tmem_layouts invocation in compiler.py,
-  // followed by add_lower_subtiled_region.  This avoids transforming bare
-  // (non-SubtiledRegionOp) splits into tmem_subslice ops that lack
-  // async_task_id and would crash createChannelPost.
+  // OptimizeTMemLayouts runs later via add_optimize_tmem_layouts in
+  // compiler.py. This avoids transforming bare splits into tmem_subslice
+  // ops that lack async_task_id and would crash createChannelPost.
   (void)pm.run(moduleOp);
 }
 
@@ -251,14 +275,7 @@ public:
       }
     }
 
-    // doTokenLowering converts token annotations on SubtiledRegionOps to
-    // barrier annotations. The SubtiledRegionOps themselves are NOT lowered
-    // here — they survive through to the main add_optimize_tmem_layouts
-    // invocation (which also pushes setup to tile), followed by
-    // add_lower_subtiled_region in compiler.py.
-    //
-    // Multi-task SubtiledRegionOps were already lowered as fallbacks in
-    // doCodePartition/doCodePartitionPost (before specializeRegion).
+    doLowerSubtiledRegionsWithNVWSOps(funcOp);
     doTokenLowering(funcOp, numWarpGroups - 1);
     if (dumpIntermediateSteps) {
       llvm::dbgs()
@@ -282,6 +299,7 @@ public:
       llvm::dbgs() << "\n\n\n";
     }
 
+    doLowerRemainingSubtiledRegions(funcOp);
     doTMAStoreWaitReorder(funcOp);
     if (dumpIntermediateSteps) {
       llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "

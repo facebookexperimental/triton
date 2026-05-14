@@ -142,19 +142,24 @@ getDistributedLayoutForTmemLdSt(gpu::MemDescType memType, TMemAccessAtom atom,
                                 unsigned numWarps,
                                 gpu::CGAEncodingAttr cgaLayout);
 
-/// Attribute name for stable op IDs on tile body ops. Used by barrier
-/// and token annotations to reference ops that survive tile body
-/// transformations (insertions, reorderings).
-inline constexpr const char *kSubtileOpId = "subtile_op_id";
-
-/// Lower a single SubtiledRegionOp into flat IR with barrier insertion.
-/// This is the core logic shared by the LowerSubtiledRegion pass and
-/// the WS code partition pre-lowering for multi-task subtiled regions.
+/// Lower a single SubtiledRegionOp into flat IR by replicating the tile
+/// body for each tile.
 void lowerSubtiledRegion(SubtiledRegionOp op);
 
-/// Push shared setup ops into the tile body of a SubtiledRegionOp.
-/// Called from OptimizeTMemLayouts after tmem layout patterns have fired.
-void pushSubtiledRegionSetupToTile(SubtiledRegionOp op);
+/// Return the minimum number of warps required to execute an operation.
+inline int getMinWarpsForOp(Operation *op) {
+  // TMEM ops require at least 4 warps to be able to read all lanes.
+  // WarpGroupDotOp requires a full warp group (4 warps).
+  if (isa<TMEMLoadOp, TMEMStoreOp, TMEMAllocOp, WarpGroupDotOp>(op))
+    return 4;
+  // Some instructions have critical throughput if they have low register usage.
+  // Make sure there are enough warps for these ops to execute quickly.
+  // TODO: Should we keep a minimum of 2 warps for
+  // AsyncTMACopyGlobalToLocalOp under certain conditions?
+  if (isa<AsyncTMAGatherOp, AsyncTMAScatterOp>(op))
+    return 2;
+  return 1;
+}
 
 } // namespace mlir::triton::nvidia_gpu
 

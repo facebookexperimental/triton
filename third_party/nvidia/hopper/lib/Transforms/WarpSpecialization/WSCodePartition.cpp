@@ -72,55 +72,6 @@ static void injectChannelGraphOnTokenOps(triton::FuncOp &funcOp,
 /// into the tile body. Used for multi-task SubtiledRegionOps that are lowered
 /// before doTokenLowering runs (the inline ops survive into warp partitions
 /// and get converted to mbarriers by doTokenLowering later).
-static void lowerTokenAnnotations(ttng::SubtiledRegionOp op) {
-  ArrayAttr tokenAnnotations = op.getTokenAnnotations();
-  if (tokenAnnotations.empty())
-    return;
-
-  Block &tileBlock = op.getTileRegion().front();
-  ValueRange tokenValues = op.getTokenValues();
-
-  llvm::DenseMap<unsigned, Operation *> idToOp;
-  for (Operation &tileOp : tileBlock.without_terminator()) {
-    if (auto idAttr = tileOp.getAttrOfType<IntegerAttr>(ttng::kSubtileOpId))
-      idToOp[idAttr.getInt()] = &tileOp;
-  }
-
-  OpBuilder builder(op);
-  for (Attribute attr : tokenAnnotations) {
-    auto annotation = cast<ttng::TokenAnnotationAttr>(attr);
-    unsigned targetId = annotation.getTargetOpIdx();
-    auto it = idToOp.find(targetId);
-    assert(it != idToOp.end() && "target op ID not found in tile body");
-    Operation *targetOp = it->second;
-
-    if (annotation.getPlacement() == ttng::BarrierPlacement::BEFORE)
-      builder.setInsertionPoint(targetOp);
-    else
-      builder.setInsertionPointAfter(targetOp);
-
-    Value token = tokenValues[annotation.getTokenIdx()];
-    Value bufferIdx = tokenValues[annotation.getBufferIdxIdx()];
-    StringRef kind = annotation.getTokenOpKind().getValue();
-
-    if (kind == "consumer_wait") {
-      int phaseIdx = annotation.getPhaseIdx();
-      assert(phaseIdx >= 0);
-      Value phase = tokenValues[phaseIdx];
-      ttnvws::ConsumerWaitOp::create(builder, targetOp->getLoc(), token,
-                                     bufferIdx, phase);
-    } else {
-      assert(kind == "consumer_release");
-      ttnvws::ConsumerReleaseOp::create(builder, targetOp->getLoc(), token,
-                                        bufferIdx);
-    }
-  }
-
-  MLIRContext *ctx = op.getContext();
-  op.setTokenAnnotationsAttr(ArrayAttr::get(ctx, {}));
-  op.getTokenValuesMutable().assign(ValueRange{});
-}
-
 /// If `op` is inside a SubtiledRegionOp's tile region, return that op.
 static ttng::SubtiledRegionOp getEnclosingSubtiledRegionTile(Operation *op) {
   for (Operation *parent = op->getParentOp(); parent;
@@ -132,61 +83,6 @@ static ttng::SubtiledRegionOp getEnclosingSubtiledRegionTile(Operation *op) {
     }
   }
   return nullptr;
-}
-
-/// Assign a stable ID to `targetOp` via an integer attribute and return it.
-/// If the op already has an ID, return the existing one. The ID is unique
-/// within the tile body and survives op insertions/removals by other passes,
-/// unlike positional indices.
-static unsigned getOrAssignStableId(ttng::SubtiledRegionOp subtiled,
-                                    Operation *targetOp) {
-  if (auto existing = targetOp->getAttrOfType<IntegerAttr>(ttng::kSubtileOpId))
-    return existing.getInt();
-
-  // Find the next available ID by scanning existing IDs.
-  unsigned nextId = 0;
-  Block &tileBlock = subtiled.getTileRegion().front();
-  for (Operation &op : tileBlock.without_terminator()) {
-    if (auto idAttr = op.getAttrOfType<IntegerAttr>(ttng::kSubtileOpId))
-      nextId = std::max(nextId, static_cast<unsigned>(idAttr.getInt()) + 1);
-  }
-
-  targetOp->setAttr(
-      ttng::kSubtileOpId,
-      IntegerAttr::get(IntegerType::get(targetOp->getContext(), 32), nextId));
-  return nextId;
-}
-
-/// Add a token annotation to a SubtiledRegionOp instead of creating an
-/// inline ConsumerWaitOp or ConsumerReleaseOp.
-static void addTokenAnnotation(ttng::SubtiledRegionOp subtiled, Value token,
-                               Value bufferIdx, Value phase,
-                               ttng::BarrierPlacement placement,
-                               unsigned targetOpIdx, StringRef kind) {
-  MLIRContext *ctx = subtiled.getContext();
-
-  // Add token, bufferIdx, phase to the tokenValues operand list.
-  unsigned tokenIdx = subtiled.getTokenValues().size();
-  unsigned bufferIdxIdx = tokenIdx + 1;
-  int phaseIdx = (phase) ? static_cast<int>(tokenIdx + 2) : -1;
-
-  SmallVector<Value> newTokenValues(subtiled.getTokenValues());
-  newTokenValues.push_back(token);
-  newTokenValues.push_back(bufferIdx);
-  if (phase)
-    newTokenValues.push_back(phase);
-  subtiled.getTokenValuesMutable().assign(newTokenValues);
-
-  // Create the annotation.
-  auto kindAttr = StringAttr::get(ctx, kind);
-  auto annotation = ttng::TokenAnnotationAttr::get(
-      ctx, tokenIdx, bufferIdxIdx, phaseIdx, placement, targetOpIdx, kindAttr,
-      ttng::BarrierRegion::TILE);
-
-  SmallVector<Attribute> annotations(subtiled.getTokenAnnotations().begin(),
-                                     subtiled.getTokenAnnotations().end());
-  annotations.push_back(annotation);
-  subtiled.setTokenAnnotationsAttr(ArrayAttr::get(ctx, annotations));
 }
 
 static unsigned getNumBuffersOrDefault(scf::ForOp forOp, unsigned numBuffers) {
@@ -757,6 +653,75 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
         channelOps[channel->relation.first].push_back(channel->getDstOp());
     }
 
+    // createBuffer inserts local_store ops in producer order, but TMA store
+    // consumers execute in descriptor_store order. Preserve that order for
+    // stores to the same descriptor so buffer reuse and wait rotation see the
+    // same sequence on both sides of the channel.
+    auto restoreDescriptorStoreProducerOrder = [&]() {
+      DenseMap<Operation *, unsigned> opOrder;
+      unsigned order = 0;
+      for (Operation &op : *block)
+        opOrder[&op] = order++;
+
+      auto getDescriptorStore = [](Operation *op) -> tt::DescriptorStoreOp {
+        if (auto store = dyn_cast<tt::DescriptorStoreOp>(op))
+          return store;
+        for (Operation *user : op->getUsers()) {
+          if (auto store = dyn_cast<tt::DescriptorStoreOp>(user))
+            return store;
+        }
+        return nullptr;
+      };
+
+      using StoreChannel = std::pair<tt::DescriptorStoreOp, Channel *>;
+      llvm::MapVector<Value, SmallVector<StoreChannel>> channelsByDesc;
+      for (auto *channel : channels) {
+        Operation *dstOp = channel->getDstOp();
+        if (!epilogOps.contains(dstOp))
+          continue;
+        auto store = getDescriptorStore(dstOp);
+        if (!store || store->getBlock() != block)
+          continue;
+        Operation *srcOp = channel->getSrcOp();
+        if (!srcOp || srcOp->getBlock() != block)
+          continue;
+        channelsByDesc[store.getDesc()].push_back({store, channel});
+      }
+
+      auto canMoveAfter = [](Operation *op, Operation *insertAfter) {
+        if (!op || !insertAfter || op == insertAfter)
+          return false;
+        if (op->getBlock() != insertAfter->getBlock())
+          return false;
+        if (insertAfter->isBeforeInBlock(op))
+          return false;
+        for (Operation *user : op->getUsers()) {
+          if (user->getBlock() != op->getBlock())
+            continue;
+          if (op->isBeforeInBlock(user) && !insertAfter->isBeforeInBlock(user))
+            return false;
+        }
+        return true;
+      };
+
+      for (auto &[desc, storeChannels] : channelsByDesc) {
+        if (storeChannels.size() < 2)
+          continue;
+        llvm::sort(storeChannels,
+                   [&](const StoreChannel &a, const StoreChannel &b) {
+                     return opOrder[a.first] < opOrder[b.first];
+                   });
+
+        Operation *prevSrcOp = nullptr;
+        for (auto &[store, channel] : storeChannels) {
+          Operation *srcOp = channel->getSrcOp();
+          if (canMoveAfter(srcOp, prevSrcOp))
+            srcOp->moveAfter(prevSrcOp);
+          prevSrcOp = srcOp;
+        }
+      }
+    };
+
     // Streamline ops on a channel chain.
     // Starting with producers with smaller task ids, moving forward
     // dependencies of the consumer ops close to the them.
@@ -784,8 +749,10 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
         storeBuckets[1].push_back(op);
     }
 
-    if (storeBuckets[0].size() != storeBuckets[1].size())
+    if (storeBuckets[0].size() != storeBuckets[1].size()) {
+      restoreDescriptorStoreProducerOrder();
       continue;
+    }
 
     // Reorder store operations in the sequence:
     //   bucket[0][N], bucket[1][N],
@@ -838,6 +805,8 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
           depOp->moveBefore(firstUser);
       }
     }
+
+    restoreDescriptorStoreProducerOrder();
 
     LLVM_DEBUG({
       LDBG("\n");
@@ -2655,15 +2624,33 @@ void insertAsyncComm(
     DenseSet<Operation *> &regionsWithChannels, ReuseConfig *config,
     bool isPost) {
 
+  // SubtiledRegionOp is a sequencing marker, not a control flow boundary.
+  // Skip it when walking parent chains so that ops inside it are treated
+  // as being at the same nesting level as the parent block.
+  auto getEffectiveParentOp = [](Operation *op) -> Operation * {
+    Operation *parent = op->getParentOp();
+    while (parent && isa<ttng::SubtiledRegionOp>(parent))
+      parent = parent->getParentOp();
+    return parent;
+  };
+
   // Find the operation that is along producer's parent chain, and its parent
   // is the same op as producer's parent. Here p is producer, and c is consumer.
-  auto getSameLevelOp = [](Operation *p, Operation *c) -> Operation * {
+  auto getSameLevelOp = [&](Operation *p, Operation *c) -> Operation * {
     Operation *op = c;
     // Go along consumer's parent chain until it is in the same scope as
     // producer, return the current scope of consumer.
     while (!isa<triton::FuncOp>(op)) {
-      if (op->getParentOp() == p->getParentOp()) {
-        // consumer is in the nested region.
+      if (getEffectiveParentOp(op) == getEffectiveParentOp(p)) {
+        // When the match is due to SubtiledRegionOp transparency,
+        // return the SubtiledRegionOp itself (the structural ancestor
+        // in the shared parent block), not the op inside it.
+        while (auto subtiled = op->getParentOfType<ttng::SubtiledRegionOp>()) {
+          if (subtiled->getParentOp() == getEffectiveParentOp(p))
+            op = subtiled;
+          else
+            break;
+        }
         return op;
       }
       op = op->getParentOp();
@@ -2672,7 +2659,13 @@ void insertAsyncComm(
     // Go along producer's parent chain until it is in the same scope as
     // consumer, return the current scope of producer.
     while (!isa<triton::FuncOp>(op)) {
-      if (c->getParentOp() == op->getParentOp()) {
+      if (getEffectiveParentOp(c) == getEffectiveParentOp(op)) {
+        while (auto subtiled = c->getParentOfType<ttng::SubtiledRegionOp>()) {
+          if (subtiled->getParentOp() == getEffectiveParentOp(op))
+            c = subtiled.getOperation();
+          else
+            break;
+        }
         return c;
       }
       op = op->getParentOp();
@@ -2681,21 +2674,19 @@ void insertAsyncComm(
   };
 
   // 0: same scope, -1: A in nested scope, 1: B in nested scope
-  auto isAinNestedRegion = [](Operation *A, Operation *B) -> int {
+  auto isAinNestedRegion = [&](Operation *A, Operation *B) -> int {
     if (A->getBlock() == B->getBlock())
       return 0;
     Operation *op = A;
     while (!isa<triton::FuncOp>(op)) {
-      if (op->getParentOp() == B->getParentOp()) {
-        // A is in the nested region.
+      if (getEffectiveParentOp(op) == getEffectiveParentOp(B)) {
         return -1;
       }
       op = op->getParentOp();
     }
     op = B;
     while (!isa<triton::FuncOp>(op)) {
-      if (op->getParentOp() == A->getParentOp()) {
-        // B is in the nested region.
+      if (getEffectiveParentOp(op) == getEffectiveParentOp(A)) {
         return 1;
       }
       op = op->getParentOp();
@@ -3033,8 +3024,9 @@ void insertAsyncComm(
       if (regionCmp < 0) {
         // A/producer in nested region. Lift up headProducer till it is
         // in the same scope as headConsumer.
-        assert(isa<ttng::TCGen5MMAOp>(headProducer) &&
-               "Only TCGen5MMAOp supported");
+        assert((isa<ttng::TCGen5MMAOp>(headProducer) ||
+                headProducer->getParentOfType<ttng::SubtiledRegionOp>()) &&
+               "Only TCGen5MMAOp or SubtiledRegionOp-nested ops supported");
         nestedInsertionTarget = getSameLevelOp(headConsumer, headProducer);
         producerInNestedRegion = true;
       } else if (regionCmp > 0) {
@@ -3166,58 +3158,76 @@ void insertAsyncComm(
           // Verify that consumer order matches producer order. If they
           // disagree, the dependency chain will create a deadlock (e.g.,
           // producer stores c01 before c00 but consumer reads c00 first).
-          for (size_t i = 1; i < ordered.size(); i++) {
-            auto *prevConsumer = ordered[i - 1]->getDstOp();
-            auto *curConsumer = ordered[i]->getDstOp();
-            if (prevConsumer->getBlock() == curConsumer->getBlock() &&
-                !appearsBefore(prevConsumer, curConsumer)) {
-              llvm::report_fatal_error(
-                  "N-buffer reuse group: producer and consumer orderings are "
-                  "inconsistent. Producer order has channel " +
-                  Twine(ordered[i - 1]->uniqID) + " before channel " +
-                  Twine(ordered[i]->uniqID) +
-                  ", but consumer order is reversed. This would cause a "
-                  "deadlock in the intra-iteration reuse dependency chain.");
-            }
-          }
-          // Find masterChannel's position in the ordered list.
-          for (size_t i = 1; i < ordered.size(); i++) {
-            if (ordered[i] == masterChannel) {
-              auto *earlyChannel = ordered[i - 1];
-              if (needExplicitReuseWait(earlyChannel, masterChannel)) {
-                auto *earlyProducer = earlyChannel->getSrcOp();
-                if (earlyProducer->getBlock() == headProducer->getBlock() &&
-                    appearsBefore(earlyProducer, headProducer)) {
-                  auto *lateConsumer = masterChannel->getDstOp();
-                  if (lateConsumer->getBlock() == earlyProducer->getBlock()) {
-                    producerAcquireForChannelLoop = earlyProducer;
-                  }
-                }
-                earlyChannelForReuseSync = earlyChannel;
-                LLVM_DEBUG({
-                  LDBG("N-reuse group: channel "
-                       << masterChannel->uniqID
-                       << " will wait on early channel "
-                       << earlyChannel->uniqID);
-                });
+          //
+          // Skip this check when channels go through SubtiledRegionOps:
+          // getSrcOp/getDstOp return the template ops inside the tile body
+          // which are the same for all subtile channels.  The ordering is
+          // controlled by tile_mappings during lowering, not by program
+          // order of the template ops.
+          bool hasSubtiledSrc = llvm::any_of(ordered, [](Channel *ch) {
+            return ch->getSrcOp() &&
+                   ch->getSrcOp()->getParentOfType<ttng::SubtiledRegionOp>() !=
+                       nullptr;
+          });
+          bool hasSubtiledDst = llvm::any_of(ordered, [](Channel *ch) {
+            return ch->getDstOp() &&
+                   ch->getDstOp()->getParentOfType<ttng::SubtiledRegionOp>() !=
+                       nullptr;
+          });
+          if (!hasSubtiledSrc && !hasSubtiledDst) {
+            for (size_t i = 1; i < ordered.size(); i++) {
+              auto *prevConsumer = ordered[i - 1]->getDstOp();
+              auto *curConsumer = ordered[i]->getDstOp();
+              if (prevConsumer->getBlock() == curConsumer->getBlock() &&
+                  !appearsBefore(prevConsumer, curConsumer)) {
+                llvm::report_fatal_error(
+                    "N-buffer reuse group: producer and consumer orderings are "
+                    "inconsistent. Producer order has channel " +
+                    Twine(ordered[i - 1]->uniqID) + " before channel " +
+                    Twine(ordered[i]->uniqID) +
+                    ", but consumer order is reversed. This would cause a "
+                    "deadlock in the intra-iteration reuse dependency chain.");
               }
-              break;
             }
-          }
-          // Wrap-around dependency: the first channel in program order
-          // must wait for the last channel's consumer from the previous
-          // iteration. Without this, the first channel's producer can
-          // overwrite the shared SMEM buffer while the last channel's
-          // TMA is still reading from the previous iteration.
-          if (ordered[0] == masterChannel) {
-            wrapAroundChannelForReuseSync = ordered.back();
-            LLVM_DEBUG({
-              LDBG("N-reuse group: channel "
-                   << masterChannel->uniqID
-                   << " will wrap-around wait on last channel "
-                   << wrapAroundChannelForReuseSync->uniqID);
-            });
-          }
+            // Find masterChannel's position in the ordered list.
+            for (size_t i = 1; i < ordered.size(); i++) {
+              if (ordered[i] == masterChannel) {
+                auto *earlyChannel = ordered[i - 1];
+                if (needExplicitReuseWait(earlyChannel, masterChannel)) {
+                  auto *earlyProducer = earlyChannel->getSrcOp();
+                  if (earlyProducer->getBlock() == headProducer->getBlock() &&
+                      appearsBefore(earlyProducer, headProducer)) {
+                    auto *lateConsumer = masterChannel->getDstOp();
+                    if (lateConsumer->getBlock() == earlyProducer->getBlock()) {
+                      producerAcquireForChannelLoop = earlyProducer;
+                    }
+                  }
+                  earlyChannelForReuseSync = earlyChannel;
+                  LLVM_DEBUG({
+                    LDBG("N-reuse group: channel "
+                         << masterChannel->uniqID
+                         << " will wait on early channel "
+                         << earlyChannel->uniqID);
+                  });
+                }
+                break;
+              }
+            }
+            // Wrap-around dependency: the first channel in program order
+            // must wait for the last channel's consumer from the previous
+            // iteration. Without this, the first channel's producer can
+            // overwrite the shared SMEM buffer while the last channel's
+            // TMA is still reading from the previous iteration.
+            if (ordered[0] == masterChannel) {
+              wrapAroundChannelForReuseSync = ordered.back();
+              LLVM_DEBUG({
+                LDBG("N-reuse group: channel "
+                     << masterChannel->uniqID
+                     << " will wrap-around wait on last channel "
+                     << wrapAroundChannelForReuseSync->uniqID);
+              });
+            }
+          } // end if (!hasSubtiledSrc && !hasSubtiledDst)
         }
       }
     }
@@ -3549,29 +3559,47 @@ void insertAsyncComm(
       // Use token for producer acquire and consumer release.
       if (commChannel.consumerBarriers.empty()) {
         // Insert ProducerAcquireOp before the producer.
-        // Even when A is nested inside B we still need to place
-        // the acquire right before the head producer to avoid
-        // reordering the barriers incorrectly. This acquire will
-        // be idemponent in the loop because we don't flip the phase.
         auto producerAcquirePoint =
-            getSameLevelOp(headConsumer, tmaHeadProducer); // tmaHeadProducer;
-        builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
-        if (producerAcquireForChannelLoop) {
-          builder.setInsertionPoint(producerAcquireForChannelLoop);
-          builder.setLoopScheduleInfoFromOp(producerAcquireForChannelLoop);
+            getSameLevelOp(headConsumer, tmaHeadProducer);
+        auto producerSubtiled =
+            getEnclosingSubtiledRegionTile(producerAcquirePoint);
+        if (!producerSubtiled)
+          producerSubtiled = getEnclosingSubtiledRegionTile(tmaHeadProducer);
+        if (producerSubtiled) {
+          auto annotTarget = getEnclosingSubtiledRegionTile(tmaHeadProducer)
+                                 ? tmaHeadProducer
+                                 : producerAcquirePoint;
+          auto tileToken = producerSubtiled.addSharedArg(token.second);
+          auto tileBufIdx = producerSubtiled.addSharedArg(bufferIdx);
+          auto tilePhase = producerSubtiled.addSharedArg(phase);
+          OpBuilder tileBuilder(annotTarget);
+          tileBuilder.setInsertionPoint(annotTarget);
+          ttnvws::ProducerAcquireOp::create(
+              tileBuilder, annotTarget->getLoc(), tileToken, tileBufIdx,
+              tilePhase,
+              WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
+                  .build(funcOp.getContext()));
+          LDBG("create inline ProducerAcquire in SubtiledRegionOp "
+               << masterChannel->uniqID << " ");
         } else {
-          builder.setInsertionPoint(producerAcquirePoint);
-          builder.setLoopScheduleInfoFromOp(producerAcquirePoint);
+          builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
+          if (producerAcquireForChannelLoop) {
+            builder.setInsertionPoint(producerAcquireForChannelLoop);
+            builder.setLoopScheduleInfoFromOp(producerAcquireForChannelLoop);
+          } else {
+            builder.setInsertionPoint(producerAcquirePoint);
+            builder.setLoopScheduleInfoFromOp(producerAcquirePoint);
+          }
+          auto acquireOp =
+              builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+                  headProducer->getLoc(), token.second, bufferIdx, phase,
+                  WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
+                      .build(funcOp.getContext()));
+          LLVM_DEBUG({
+            LDBG("Insert ProducerAcquireOp " << masterChannel->uniqID << " ");
+            producerAcquirePoint->dump();
+          });
         }
-        auto acquireOp =
-            builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
-                headProducer->getLoc(), token.second, bufferIdx, phase,
-                WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
-                    .build(funcOp.getContext()));
-        LLVM_DEBUG({
-          LDBG("Insert ProducerAcquireOp " << masterChannel->uniqID << " ");
-          producerAcquirePoint->dump();
-        });
       }
 
       // Intra-iteration reuse sync: when two channels share a single-buffered
@@ -3697,17 +3725,37 @@ void insertAsyncComm(
         } else {
           producerCommitPoint = getSameLevelOp(headConsumer, tailProducer);
         }
-        LLVM_DEBUG({
-          LDBG("Insert ProducerCommitOp " << masterChannel->uniqID << " ");
-          producerCommitPoint->dump();
-        });
-        builder.setInsertionPointAfter(producerCommitPoint);
-        builder.setLoopScheduleInfoFromOp(producerCommitPoint);
-        auto commitOp =
-            builder.createWithAsyncTaskIds<ttnvws::ProducerCommitOp>(
-                tailProducer->getLoc(), token.second, bufferIdx,
-                WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
-                    .build(funcOp.getContext()));
+        auto commitSubtiled =
+            getEnclosingSubtiledRegionTile(producerCommitPoint);
+        if (!commitSubtiled)
+          commitSubtiled = getEnclosingSubtiledRegionTile(tailProducer);
+        if (commitSubtiled) {
+          auto annotTarget = getEnclosingSubtiledRegionTile(tailProducer)
+                                 ? tailProducer
+                                 : producerCommitPoint;
+          auto tileToken = commitSubtiled.addSharedArg(token.second);
+          auto tileBufIdx = commitSubtiled.addSharedArg(bufferIdx);
+          OpBuilder tileBuilder(annotTarget);
+          tileBuilder.setInsertionPointAfter(annotTarget);
+          ttnvws::ProducerCommitOp::create(
+              tileBuilder, annotTarget->getLoc(), tileToken, tileBufIdx,
+              WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
+                  .build(funcOp.getContext()));
+          LDBG("create inline ProducerCommit in SubtiledRegionOp "
+               << masterChannel->uniqID << " ");
+        } else {
+          LLVM_DEBUG({
+            LDBG("Insert ProducerCommitOp " << masterChannel->uniqID << " ");
+            producerCommitPoint->dump();
+          });
+          builder.setInsertionPointAfter(producerCommitPoint);
+          builder.setLoopScheduleInfoFromOp(producerCommitPoint);
+          auto commitOp =
+              builder.createWithAsyncTaskIds<ttnvws::ProducerCommitOp>(
+                  tailProducer->getLoc(), token.second, bufferIdx,
+                  WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
+                      .build(funcOp.getContext()));
+        }
       }
     }
 
@@ -3737,14 +3785,33 @@ void insertAsyncComm(
         }
         auto consumerWaitPoint =
             getSameLevelOp(headProducer, tokenHeadConsumer);
+        // If the consumer IS a SubtiledRegionOp, use it directly
+        // for annotation with the first tile body op as target.
         auto subtiled = getEnclosingSubtiledRegionTile(consumerWaitPoint);
+        if (!subtiled)
+          subtiled = getEnclosingSubtiledRegionTile(tokenHeadConsumer);
+        if (!subtiled) {
+          if (auto sr = dyn_cast<ttng::SubtiledRegionOp>(tokenHeadConsumer))
+            subtiled = sr;
+        }
         if (subtiled) {
-          unsigned targetOpIdx =
-              getOrAssignStableId(subtiled, consumerWaitPoint);
-          addTokenAnnotation(subtiled, token.second, bufferIdx, phase,
-                             ttng::BarrierPlacement::BEFORE, targetOpIdx,
-                             "consumer_wait");
-          LDBG("create ConsumerWait annotation on SubtiledRegionOp "
+          Operation *insertTarget = tokenHeadConsumer;
+          if (isa<ttng::SubtiledRegionOp>(tokenHeadConsumer)) {
+            auto &tileBlock = subtiled.getTileRegion().front();
+            insertTarget = &tileBlock.front();
+          } else if (getEnclosingSubtiledRegionTile(tokenHeadConsumer)) {
+            insertTarget = tokenHeadConsumer;
+          } else {
+            insertTarget = consumerWaitPoint;
+          }
+          auto tileToken = subtiled.addSharedArg(token.second);
+          auto tileBufIdx = subtiled.addSharedArg(bufferIdx);
+          auto tilePhase = subtiled.addSharedArg(phase);
+          OpBuilder tileBuilder(insertTarget);
+          tileBuilder.setInsertionPoint(insertTarget);
+          ttnvws::ConsumerWaitOp::create(tileBuilder, insertTarget->getLoc(),
+                                         tileToken, tileBufIdx, tilePhase);
+          LDBG("create inline ConsumerWait in SubtiledRegionOp "
                << masterChannel->uniqID << " ");
         } else {
           builder.setInsertionPoint(consumerWaitPoint);
@@ -3796,13 +3863,29 @@ void insertAsyncComm(
         auto consumerReleasePoint =
             consumerReleaseHeuristic(tailProducer, tailConsumer, token.first);
         auto subtiled = getEnclosingSubtiledRegionTile(consumerReleasePoint);
+        if (!subtiled)
+          subtiled = getEnclosingSubtiledRegionTile(tailConsumer);
+        if (!subtiled) {
+          if (auto sr = dyn_cast<ttng::SubtiledRegionOp>(tailConsumer))
+            subtiled = sr;
+        }
         if (subtiled) {
-          unsigned targetOpIdx =
-              getOrAssignStableId(subtiled, consumerReleasePoint);
-          addTokenAnnotation(subtiled, token.second, bufferIdx,
-                             /*phase=*/Value(), ttng::BarrierPlacement::AFTER,
-                             targetOpIdx, "consumer_release");
-          LDBG("create ConsumerRelease annotation on SubtiledRegionOp "
+          Operation *insertTarget = tailConsumer;
+          if (isa<ttng::SubtiledRegionOp>(tailConsumer)) {
+            auto &tileBlock = subtiled.getTileRegion().front();
+            insertTarget = &*std::prev(tileBlock.without_terminator().end());
+          } else if (getEnclosingSubtiledRegionTile(tailConsumer)) {
+            insertTarget = tailConsumer;
+          } else {
+            insertTarget = consumerReleasePoint;
+          }
+          auto tileToken = subtiled.addSharedArg(token.second);
+          auto tileBufIdx = subtiled.addSharedArg(bufferIdx);
+          OpBuilder tileBuilder(insertTarget);
+          tileBuilder.setInsertionPointAfter(insertTarget);
+          ttnvws::ConsumerReleaseOp::create(tileBuilder, insertTarget->getLoc(),
+                                            tileToken, tileBufIdx);
+          LDBG("create inline ConsumerRelease in SubtiledRegionOp "
                << masterChannel->uniqID << " ");
         } else {
           builder.setLoopScheduleInfoFromOp(consumerReleasePoint);
@@ -4408,8 +4491,6 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
         multiTaskOps.push_back(op);
     });
     for (auto op : multiTaskOps)
-      lowerTokenAnnotations(op);
-    for (auto op : multiTaskOps)
       ttng::lowerSubtiledRegion(op);
   }
 
@@ -4641,29 +4722,10 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
     funcOp.dump();
   });
 
-  // If loadResult has a single use which is LocalAlloc, we can get rid of
-  // sharedLoad and replace all uses of LocalAlloc with viewLoad.
   foldLocalLoads(funcOp);
-  LLVM_DEBUG({
-    LDBG("\n\nsimplify localLoad + localAlloc");
-    funcOp.dump();
-  });
-
-  // Clean up Tokens for tmem, tokens should be threaded within the partitions.
-  // This should also clean up tokens in the ForOp arguments.
   cleanupTmemTokens(funcOp);
-  LLVM_DEBUG({
-    LDBG("\n\nclean up tmem tokens");
-    funcOp.dump();
-  });
-
-  // Replace buffer reuses
   replaceBufferReuse(funcOp, channelsGroupedByConsumers, orderedChannels,
                      &config);
-  LLVM_DEBUG({
-    LDBG("\n\nreplace buffer reuse");
-    funcOp.dump();
-  });
 
   // Lower SubtiledRegionOps whose tile body spans multiple async tasks.
   // Single-task SubtiledRegionOps are preserved and handled by SpecializeOp.
@@ -4678,8 +4740,6 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
       if (taskIds.size() > 1)
         multiTaskOps.push_back(op);
     });
-    for (auto op : multiTaskOps)
-      lowerTokenAnnotations(op);
     for (auto op : multiTaskOps)
       ttng::lowerSubtiledRegion(op);
   }

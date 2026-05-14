@@ -554,8 +554,18 @@ def test_async_dot_blackwell_2cta_tma(device, A_TMEM, SAMPLE_M):
 
     ptx = kernel.asm["ptx"]
     assert ptx.count("fence.mbarrier_init.release.cluster") == 1
-    assert ptx.count("barrier.cluster.arrive.aligned") == 1  # one for remote bar init
-    assert ptx.count("barrier.cluster.wait.aligned") == 1  # one for remote bar init
+    assert ptx.count("fence.proxy.async.shared::cluster") >= 1
+    # Verify ordering: fences → cluster sync → tmem alloc
+    fence_mbar_pos = ptx.index("fence.mbarrier_init.release.cluster")
+    fence_proxy_pos = ptx.index("fence.proxy.async.shared::cluster")
+    cluster_arrive_pos = ptx.index("barrier.cluster.arrive.aligned")
+    cluster_wait_pos = ptx.index("barrier.cluster.wait.aligned")
+    tmem_alloc_pos = ptx.index("tcgen05.alloc.cta_group::2")
+    assert fence_mbar_pos < fence_proxy_pos < cluster_arrive_pos < cluster_wait_pos < tmem_alloc_pos
+    # 2 cluster syncs: 1 for init (before tmem alloc, after bar init), 1 for cleanup (before tmem dealloc)
+    assert ptx.count("barrier.cluster.arrive.aligned") == 2
+    assert ptx.count("barrier.cluster.wait.aligned") == 2
+    assert ptx.count("tcgen05.dealloc.cta_group::2") == 1
     assert ptx.count("mapa.shared::cluster") == 1  # address mapping for remote_view
     assert ptx.count("tcgen05.mma.cta_group::2") == 8  # BK=128 divided into steps of 16
 
@@ -694,12 +704,24 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
     assert ttgir.count("ttng.map_to_remote_buffer") == 1
 
     ptx = kernel.asm["ptx"]
-    assert ptx.count("fence.mbarrier_init.release.cluster") == 1
-    # two for trunk remote bar init: one for default wg, one for non default
-    assert ptx.count("barrier.cluster.arrive.aligned") == 2
-    # one for trunk remote bar init: non default WGs just arrive anyway, then it's equivalent to a sync between
-    #   default WGs in all CTAs
-    assert ptx.count("barrier.cluster.wait.aligned") == 1
+    # Verify cluster sync and tmem alloc ordering in PTX:
+    #   fence.mbarrier_init.release.cluster
+    #   fence.proxy.async.shared::cluster
+    #   barrier.cluster.arrive.aligned  (default side)
+    #   barrier.cluster.wait.aligned
+    #   tcgen05.alloc.cta_group::2      (tmem alloc after cluster sync)
+    fence_mbar_pos = ptx.index("fence.mbarrier_init.release.cluster")
+    fence_proxy_pos = ptx.index("fence.proxy.async.shared::cluster")
+    cluster_arrive_pos = ptx.index("barrier.cluster.arrive.aligned", fence_proxy_pos)
+    cluster_wait_pos = ptx.index("barrier.cluster.wait.aligned")
+    tmem_alloc_pos = ptx.index("tcgen05.alloc.cta_group::2")
+    assert fence_mbar_pos < fence_proxy_pos < cluster_arrive_pos < cluster_wait_pos < tmem_alloc_pos
+    # 6 cluster arrives: 1 init (default) + 1 init (non-default) +
+    #   1 cleanup (default, before tmem dealloc) + 3 cleanup (non-default warps MMA/producer/idle, per partition end)
+    # 2 cluster waits: 1 init (default) + 1 cleanup (default, before tmem dealloc)
+    assert ptx.count("barrier.cluster.arrive.aligned") == 6
+    assert ptx.count("barrier.cluster.wait.aligned") == 2
+    assert ptx.count("tcgen05.dealloc.cta_group::2") == 1
     assert ptx.count("mapa.shared::cluster") == 1  # address mapping for remote_view
     assert ptx.count("tcgen05.mma.cta_group::2") == 8  # BK=128 divided into steps of 16
 
@@ -2035,7 +2057,9 @@ class TestToMxfp8:
             NUM_SCALES: tl.constexpr = BLOCK_K // VEC_SIZE
             data_tile = tlx.local_alloc((BLOCK_M, BLOCK_K), fp8_type, tl.constexpr(1))
             scale_tile = tlx.local_alloc((BLOCK_M, NUM_SCALES), tl.uint8, tl.constexpr(1))
-            tlx._to_mxfp8_block(data, data_tile[0], scale_tile[0], VEC_SIZE, fp8_type)
+            data_fp8, scale_e8m0 = tlx._to_mxfp8_block(data, VEC_SIZE, fp8_type)
+            tlx.local_store(data_tile[0], data_fp8)
+            tlx.local_store(scale_tile[0], scale_e8m0)
             data_fp8 = tlx.local_load(data_tile[0])
             tl.store(data_out_ptr + offs_m[:, None] * BLOCK_K + offs_k[None, :], data_fp8)
             scale_loaded = tlx.local_load(scale_tile[0])

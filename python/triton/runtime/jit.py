@@ -8,7 +8,7 @@ import os
 import threading
 import re
 import textwrap
-from collections import defaultdict, namedtuple
+from collections import defaultdict
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Callable, Generic, Iterable, Optional, TypeVar, overload, Dict, Any, Tuple
@@ -20,13 +20,14 @@ from .driver import driver
 from . import _async_compile
 from .._utils import find_paths_if, get_iterable_path, type_canonicalisation_dict, is_namedtuple
 from .cache import get_cache_key
-from triton._C.libtriton import get_cache_invalidating_env_vars, native_specialize_impl
+from triton._C.libtriton import get_cache_invalidating_env_vars, native_specialize_impl, native_fast_dispatch, native_fast_dispatch_insert
+try:
+    from triton._C.libtriton import native_create_jit_proxy
+except ImportError:
+    native_create_jit_proxy = None
 
 TRITON_MODULE = "triton.language"
 GLUON_MODULE = "triton.experimental.gluon.language"
-
-# Structured cache entry for the Layer 1 identity-based fast path.
-_LastCall = namedtuple("_LastCall", ["device", "args", "kernel", "bound_vals", "instrumentation_mode"])
 
 T = TypeVar("T")
 
@@ -371,6 +372,26 @@ class KernelInterface(Generic[T]):
         Hence JITFunction.__getitem__ returns a callable proxy that
         memorizes the grid.
         """
+        # Fast C proxy: bypasses Python run() entirely for cache hits.
+        # Only useful when dispatcher is available — without it the proxy
+        # does a redundant C cache lookup then falls back to run() anyway.
+        if native_create_jit_proxy is not None and getattr(self, 'c_cache', False) \
+                and knobs.nvidia.use_triton_dispatcher \
+                and not callable(grid) and hasattr(self, '_fc_options_hash') and hasattr(self, 'params'):
+            cache = getattr(self, '_jit_proxy_cache', None)
+            if cache is None:
+                cache = {}
+                self._jit_proxy_cache = cache
+            grid_key = grid if isinstance(grid, tuple) else (grid, )
+            proxy = cache.get(grid_key)
+            if proxy is None:
+                grid_tuple = grid_key
+                proxy = native_create_jit_proxy(self, grid_tuple, self.params, self._fc_options_hash,
+                                                driver.active.get_current_stream, driver.active.get_current_device)
+                if proxy is not None:
+                    cache[grid_key] = proxy
+            if proxy is not None:
+                return proxy
         return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
         # return cast(T, functools.partial(cast(Callable, self.run), grid=grid))
 
@@ -612,54 +633,6 @@ def convert_to_tuple_if_list(item):
     return tuple(item)
 
 
-class _DeviceCaches(defaultdict):
-    """A defaultdict that also invalidates the fast-path cache
-    (``_last_call``) whenever the in-memory kernel cache is cleared.
-    Without this, ``device_caches.clear()`` would wipe the kernel cache but
-    leave a stale ``_last_call`` entry, causing the fast path to return a
-    kernel that is no longer in the device cache."""
-
-    def __init__(self, jit_function=None, default_factory=None):
-        super().__init__(default_factory)
-        self._jit_function = jit_function
-
-    def clear(self):
-        super().clear()
-        if self._jit_function is not None:
-            self._jit_function.clear_fast_path_caches()
-
-    def __copy__(self):
-        # Explicit shallow copy — Python 3.12 copy.copy() on dict
-        # subclasses calls the constructor, which fails because
-        # _DeviceCaches.__init__ has a different signature than
-        # defaultdict.__init__.
-        result = _DeviceCaches(self._jit_function, self.default_factory)
-        result.update(self)
-        return result
-
-    def __reduce__(self):
-        # Return as a plain defaultdict for pickling.
-        # Drop both _jit_function and default_factory: the back-reference
-        # is not meaningful in a serialized copy, and default_factory is a
-        # bound method (create_binder) whose JITFunction instance may not
-        # be picklable.
-        return (defaultdict, (None, ), None, None, iter(self.items()))
-
-    def __deepcopy__(self, memo):
-        # Deepcopy as a plain defaultdict — the _jit_function
-        # back-reference should not be copied.
-        # Use memo for default_factory so that if the factory is a bound
-        # method of a JITFunction being deepcopied, it resolves to the
-        # *new* JITFunction (via memo) instead of keeping a cross-reference
-        # back to the original.
-        new_factory = copy.deepcopy(self.default_factory, memo)
-        result = defaultdict(new_factory)
-        memo[id(self)] = result
-        for k, v in self.items():
-            result[copy.deepcopy(k, memo)] = copy.deepcopy(v, memo)
-        return result
-
-
 class JITFunction(JITCallable, KernelInterface[T]):
 
     def is_gluon(self):
@@ -781,68 +754,68 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
         return options, signature, constexprs, attrs
 
-    def clear_fast_path_caches(self):
-        """Invalidate the identity-based fast-path cache.
-
-        Call this after mutating any JITCallable that was previously passed as
-        an argument to this kernel (e.g. via ``_unsafe_update_src``).
-        """
-        self._last_call = None
-        self._last_kwargs = {}
-
-    def run(self, *args, grid, warmup, **kwargs):
+    def run(self, *args, grid, warmup, _skip_fc=False, **kwargs):
+        # --- C FAST PATH (replaces Layer 1 identity check + Layer 1.5) ---
+        # Single C function call does: key computation + cache lookup + dispatcher launch.
+        # Guards: no warmup, no hooks, no kwargs, no globals, all args positional, tuple grid.
         device = driver.active.get_current_device()
         stream = driver.active.get_current_stream(device)
 
-        # --- FAST PATH (Layer 1: Identity check) ---
-        # If the exact same Python objects are passed as the previous call
-        # (common in training loops where the same tensors/kwargs are reused),
-        # skip the binder, cache key computation, and most dispatch overhead.
-        # This is just N pointer comparisons with zero attribute access.
-        if not warmup and not self.pre_run_hooks and not knobs.compilation.always_compile:
-            last = self._last_call
-            if last is not None and last.device is device and last.instrumentation_mode == knobs.compilation.instrumentation_mode:
-                last_args = last.args
-                if len(args) == len(last_args):
-                    identical = True
-                    for i in range(len(args)):
-                        if args[i] is not last_args[i]:
-                            identical = False
-                            break
-                    if identical:
-                        last_kw = self._last_kwargs
-                        if len(kwargs) != len(last_kw):
-                            identical = False
-                        else:
-                            for k, v in kwargs.items():
-                                if k not in last_kw or v is not last_kw[k]:
-                                    identical = False
-                                    break
-                    if identical:
-                        kernel = last.kernel
-                        if self.used_global_vals:
-                            not_present = object()
-                            for (name, _), (val, globals_dict) in self.used_global_vals.items():
-                                if globals_dict.get(name, not_present) != val:
-                                    kernel = None
-                                    break
-                        if kernel is not None:
-                            bound_vals = last.bound_vals
-                            assert grid is not None
-                            if callable(grid):
-                                grid = grid(dict(zip(self.arg_names, bound_vals)))
-                            grid_size = len(grid)
-                            grid_0 = grid[0]
-                            grid_1 = grid[1] if grid_size > 1 else 1
-                            grid_2 = grid[2] if grid_size > 2 else 1
-                            launch_metadata = kernel.launch_metadata(grid, stream, *bound_vals)
-                            kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata,
-                                       launch_metadata, knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook,
-                                       *bound_vals)
-                            return kernel
-
+        # --- C FAST PATH (opt-in via @triton.jit(c_cache=True)) ---
+        # NOTE: This assumes knobs.runtime.debug and instrumentation_mode do not
+        # change after the first kernel launch. If they do, the C cache may return
+        # a kernel compiled with stale options. This is acceptable because these
+        # knobs are set at process startup and not changed at runtime in practice.
+        # NOTE: This block is only reached when JITCacheProxy cannot be used
+        # (callable grid, first call, or C extension unavailable).
+        # Static-grid repeat calls go through JITCacheProxy directly.
+        if not _skip_fc and self.c_cache and not warmup and not self.pre_run_hooks and not knobs.compilation.always_compile \
+                and not self.used_global_vals \
+                and knobs.runtime.add_stages_inspection_hook is None \
+                and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook \
+                and not self.launch_metadata:
+            # Merge kwargs into positional args and compute options hash.
+            # NOTE: intermediate positions are filled with None. This is safe
+            # because Triton kernels have no default parameter values — all
+            # args must be supplied by the caller (either positionally or as
+            # kwargs). If any position is truly missing, the kernel will error
+            # on the slow path after a cache miss.
+            if kwargs:
+                _fc_args = list(args)
+                _fc_opts = {}
+                _param_names = self.arg_names
+                _param_set = set(_param_names)
+                for k, v in kwargs.items():
+                    if k in _param_set:
+                        idx = _param_names.index(k)
+                        while len(_fc_args) <= idx:
+                            _fc_args.append(None)
+                        _fc_args[idx] = v
+                    else:
+                        _fc_opts[k] = v
+                _fc_args = tuple(_fc_args)
+                _fc_hash = (hash(tuple(sorted(_fc_opts.items())))
+                            & 0xFFFFFFFFFFFFFFFF) if _fc_opts else self._fc_options_hash
+            else:
+                _fc_args = args
+                _fc_hash = self._fc_options_hash
+            if len(_fc_args) == len(self.params):
+                if callable(grid):
+                    _fc_grid = grid(dict(zip(self.arg_names, _fc_args)))
+                else:
+                    _fc_grid = grid
+                result = native_fast_dispatch(self, _fc_args, self.params, _fc_hash, _fc_grid, stream)
+                if result is not None:
+                    kernel = result
+                    if not getattr(kernel, '_dispatcher', None):
+                        grid_size = len(_fc_grid) if isinstance(_fc_grid, (tuple, list)) else 1
+                        grid_0 = _fc_grid[0] if grid_size > 0 else 1
+                        grid_1 = _fc_grid[1] if grid_size > 1 else 1
+                        grid_2 = _fc_grid[2] if grid_size > 2 else 1
+                        kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, None, None,
+                                   None, *_fc_args)
+                    return kernel
         _user_kwargs = dict(kwargs) if kwargs else {}
-
         kwargs["debug"] = kwargs.get("debug", self.debug) or knobs.runtime.debug
         # Enable sanitize_overflow if explicitly set via kwarg, env var (TRITON_SANITIZE_OVERFLOW), or if debug is enabled
         kwargs["sanitize_overflow"] = kwargs.get("sanitize_overflow",
@@ -911,29 +884,48 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
             if hasattr(kernel, "result"):
                 kernel = kernel.result()
-            # launch kernel
-            launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
-            kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,
-                       knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *bound_args.values())
+            # launch kernel — prefer _TritonDispatcher (C direct cuLaunchKernelEx)
+            # when available and hooks are not needed.
+            _disp = getattr(kernel, '_dispatcher', None)
+            if _disp is not None and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook:
+                _vals = tuple(bound_args.values())
+                _indices = kernel._dispatch_arg_indices
+                _disp(grid_0, grid_1, grid_2, stream, *[_vals[i] for i in _indices])
+            else:
+                launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
+                kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,
+                           knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *bound_args.values())
 
-            # Populate fast-path caches for future calls.
-            # Store both raw args (for identity check) and bound_args values
-            # (for launching — includes default parameter values).
-            # Only populate when the fast path guard would allow reuse —
-            # if pre_run_hooks are active, the compiled kernel may depend on
-            # hook-controlled state that the fast path doesn't check.
-            if not self.pre_run_hooks and not knobs.compilation.always_compile:
-                self._last_call = _LastCall(device, args, kernel, tuple(bound_args.values()),
-                                            knobs.compilation.instrumentation_mode)
-                self._last_kwargs = _user_kwargs
-
+            # Populate C specialization cache for future calls.
+            if self.c_cache:
+                _disp = getattr(kernel, '_dispatcher', None)
+                if _user_kwargs:
+                    _ins_args = list(args)
+                    _ins_opts = {}
+                    _param_names = self.arg_names
+                    _param_set = set(_param_names)
+                    for k, v in _user_kwargs.items():
+                        if k in _param_set:
+                            idx = _param_names.index(k)
+                            while len(_ins_args) <= idx:
+                                _ins_args.append(None)
+                            _ins_args[idx] = v
+                        else:
+                            _ins_opts[k] = v
+                    _ins_args = tuple(_ins_args)
+                    _ins_hash = (hash(tuple(sorted(_ins_opts.items())))
+                                 & 0xFFFFFFFFFFFFFFFF) if _ins_opts else self._fc_options_hash
+                else:
+                    _ins_args = args
+                    _ins_hash = self._fc_options_hash
+                native_fast_dispatch_insert(self, _ins_args, self.params, _ins_hash, kernel, _disp)
         return kernel
 
     def repr(self, _):
         return self._fn_name if self._repr is None else self._repr(_)
 
     def __init__(self, fn, version=None, do_not_specialize=None, do_not_specialize_on_alignment=None, debug=None,
-                 noinline=None, repr=None, launch_metadata=None):
+                 noinline=None, repr=None, launch_metadata=None, c_cache=False):
         do_not_specialize = do_not_specialize if do_not_specialize else []
         do_not_specialize_on_alignment = do_not_specialize_on_alignment if do_not_specialize_on_alignment else []
 
@@ -944,6 +936,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
         self.do_not_specialize_on_alignment = do_not_specialize_on_alignment
         self._repr = repr
         self.launch_metadata = launch_metadata
+        self.c_cache = c_cache
         # Register for simple deserialization of JITFunction constants
         _triton_jit_function_registry[f"{self.module}:{self.fn.__qualname__}"] = self
 
@@ -954,13 +947,14 @@ class JITFunction(JITCallable, KernelInterface[T]):
             self.params.append(KernelParam(i, param, dns, dns_oa))
 
         # cache of just-in-time compiled kernels
-        self.device_caches = _DeviceCaches(self, self.create_binder)
+        self.device_caches = defaultdict(self.create_binder)
 
-        # Last-call cache for identity-based fast path (Layer 1).
-        # Stores a _LastCall namedtuple from the previous successful launch.
-        self._last_call = None
-        self._last_kwargs = {}
-
+        # Options hash for C fast dispatch cache.
+        # Constant 0: kernel options (num_warps, num_stages, etc.) are fixed
+        # at compile time and don't change across calls. Different option
+        # sets produce different CompiledKernel objects in the device_caches,
+        # so the C fast cache only needs to distinguish args, not options.
+        self._fc_options_hash = 0
         # JITFunction can be instantiated as kernel
         # when called with a grid using __getitem__
         self.kernel = None
@@ -1086,6 +1080,7 @@ def jit(
     do_not_specialize_on_alignment: Optional[Iterable[int | str]] = None,
     debug: Optional[bool] = None,
     noinline: Optional[bool] = None,
+    c_cache: bool = False,
 ) -> Callable[[T], JITFunction[T]]:
     ...
 
@@ -1100,6 +1095,7 @@ def jit(
     do_not_specialize_on_alignment: Optional[Iterable[int | str]] = None,
     debug: Optional[bool] = None,
     noinline: Optional[bool] = None,
+    c_cache: bool = False,
 ) -> KernelInterface[T]:
     """
     Decorator for JIT-compiling a function using the Triton compiler.
@@ -1136,6 +1132,7 @@ def jit(
                 noinline=noinline,
                 repr=repr,
                 launch_metadata=launch_metadata,
+                c_cache=c_cache,
             )
 
     if fn is not None:

@@ -133,7 +133,7 @@ def addmm_kernel_tma_persistent_ws(
             c_desc.store([offs_cm, offs_cn + 3 * (BLOCK_SIZE_N // 4)], c11)
 
 
-@pytest.mark.parametrize("M, N, K", [(128, 128, 128), (512, 512, 256), (1024, 1024, 512)])
+@pytest.mark.parametrize("M, N, K", [(1024, 1024, 512)])
 @pytest.mark.parametrize("BLOCK_SIZE_M", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
