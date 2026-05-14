@@ -120,6 +120,8 @@ public:
       auto bufOp = dyn_cast<triton::amdgpu::BufferOpInterface>(op);
       if (!bufOp)
         return;
+      if (isa<triton::amdgpu::BufferLoadToLocalOp>(op))
+        return;
       // Determine the tensor type that represents the data layout.
       // For loads it's the result; for stores find the first tensor operand.
       RankedTensorType tensorTy;
@@ -143,26 +145,19 @@ public:
       int numWarps = ttg::lookupNumWarps(op);
       Value ptr = bufOp.getPtr();
       Value offsets = bufOp.getOffsets();
-      llvm::outs() << "op = " << bufOp << "\n";
       auto newEnc = buildBufferOpEncoding(ctx, ptr, offsets, tensorTy, numWarps,
                                           threadsPerWarp, axisAnalysis);
       // Nothing to do if the encoding is already optimal.
-      llvm::outs() << "loc1\n";
       if (newEnc == tensorTy.getEncoding())
         return;
 
-      llvm::outs() << "loc1\n";
       LDBG("Rewriting " << op->getName() << " with new encoding " << newEnc);
       layoutMap[op] = newEnc;
-      llvm::outs() << "loc2\n";
     });
 
-    llvm::outs() << "loc3\n";
     for (auto &kv : layoutMap) {
-      llvm::outs() << "op = " << *kv.first << "\n";
       convertDistributedOpEncoding(kv.second, kv.first);
     }
-    llvm::outs() << "loc4\n";
   }
 };
 
