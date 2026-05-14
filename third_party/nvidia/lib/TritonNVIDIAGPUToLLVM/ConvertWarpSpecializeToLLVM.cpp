@@ -271,6 +271,9 @@ static void rewritePartitionRegions(WarpSpecializeOp ws, Block *switchLoop,
     // another barrier here.
     createAllBarrier(b, kSwitchLoopBarrierIdx);
 
+    bool hasClusterSyncKernelCleanup =
+        tlx::hasClusterSyncKernelCleanup(ws);
+
     // Rewrite all warp returns.
     partition->walk([&](WarpReturnOp op) {
       TritonLLVMIRRewriter b(op.getLoc(), op);
@@ -278,6 +281,11 @@ static void rewritePartitionRegions(WarpSpecializeOp ws, Block *switchLoop,
       if (auto actRegs = ws.getActualRegisters()) {
         createRegRealloc(b, (*actRegs)[partition->getRegionNumber() + 1],
                          lowRegs);
+      }
+      if (hasClusterSyncKernelCleanup) {
+        b.setInsertionPoint(op);
+        NVVM::ClusterArriveOp::create(b, b.getLoc(),
+                                      UnitAttr::get(b.getContext()));
       }
       b.replaceOpWithNewOp<LLVM::BrOp>(op, switchLoop);
     });

@@ -112,7 +112,7 @@ void mlir::triton::elideTrivialCaptures(LLVM::LLVMFuncOp func,
   // once, we will rely on CSE to clean them up.
   SetVector<Operation *> subgraph;
   for (WarpSpecializeOp wsOp : wsOps) {
-    auto partOp = wsOp.getPartitionOp();
+    auto partOp = cast<WarpSpecializePartitionsOp>(wsOp.getPartitionOpHolder().front().front());
     llvm::BitVector toErase(partOp.getNumOperands());
     for (auto [i, capture] : llvm::enumerate(partOp.getExplicitCaptures())) {
       subgraph.clear();
@@ -328,7 +328,7 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
     }
 
     // Store the captures if there are any.
-    auto partOp = ws.getPartitionOp();
+    auto partOp = cast<WarpSpecializePartitionsOp>(ws.getPartitionOpHolder().front().front());
     if (partOp.getNumOperands()) {
       auto captureType = LLVM::LLVMStructType::getLiteral(
           b.getContext(), llvm::to_vector(partOp.getOperandTypes()),
