@@ -7,6 +7,7 @@
 #include "triton/Conversion/TritonToTritonGPU/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Dialect/Triton/Transforms/FunctionTypeConversion.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -490,54 +491,17 @@ struct TritonMapElementwisePattern
   }
 };
 
-class TritonFuncOpPattern : public OpConversionPattern<triton::FuncOp> {
-public:
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(triton::FuncOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto converter = getTypeConverter();
-    TypeConverter::SignatureConversion result(op.getNumArguments());
-    auto newOp = rewriter.replaceOpWithNewOp<triton::FuncOp>(
-        op, op.getName(), op.getFunctionType());
-    addNamedAttrs(newOp, adaptor.getAttributes());
-    rewriter.inlineRegionBefore(op.getBody(), newOp.getBody(),
-                                newOp.getBody().end());
-    // Convert just the entry block. The remaining unstructured control flow is
-    // converted by br patterns.
-    if (!newOp.getBody().empty())
-      rewriter.applySignatureConversion(&newOp.getBody().front(), result,
-                                        converter);
-    return success();
-  }
-};
-
-class TritonCallOpPattern : public OpConversionPattern<triton::CallOp> {
-public:
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(triton::CallOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto newOp = rewriter.replaceOpWithNewOp<triton::CallOp>(
-        op, op.getCallee(), op.getResultTypes(), adaptor.getOperands());
-    addNamedAttrs(newOp, adaptor.getAttributes());
-    return success();
-  }
-};
-
-class TritonReturnOpPattern : public OpConversionPattern<ReturnOp> {
-public:
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(ReturnOp op, ReturnOp::Adaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<ReturnOp>(op, adaptor.getOperands());
-    return success();
-  }
-};
+// TLX previously carried its own TritonFuncOpPattern / TritonCallOpPattern /
+// TritonReturnOpPattern but they did not convert function result types (only
+// argument types), so a tt.func returning a tensor came out with an
+// unencoded result type and the conversion target rightfully rejected it.
+// Upstream commit 215c162d52 ("Support returning tensors in
+// TritonToTritonGPU") replaced them with `populateFunctionTypeConversions`
+// from `Dialect/Triton/Transforms/FunctionTypeConversion.h`, which is a
+// `tt.func`/`tt.call`/`tt.return`-aware fork of MLIR's signature-conversion
+// helpers that handles inputs, results, one-to-many type conversions and arg
+// attributes. The TLX-specific RequireLayoutOp/ReleaseLayoutOp patterns live
+// in populateTLXPatterns below and are unaffected.
 
 void populateTLXPatterns(TritonGPUTypeConverter &typeConverter,
                          RewritePatternSet &patterns) {
@@ -596,15 +560,12 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::DescriptorReduceOp>,
       // this assumes the right layout will be set later for dot scaled.
       GenericOpPattern<triton::DotScaledOp>,
-      GenericOpPattern<triton::CallOp>,
-      GenericOpPattern<ReturnOp>,
       GenericOpPattern<triton::gpu::AsyncCopyGlobalToLocalOp>,
       GenericOpPattern<triton::gpu::LocalStoreOp>,
       GenericOpPattern<triton::gpu::LocalLoadOp>,
       GenericOpPattern<triton::gpu::LocalGatherOp>,
       GenericOpPattern<triton::gpu::LocalScatterOp>,
-      GenericOpPattern<triton::nvidia_gpu::WarpGroupDotWaitOp>,
-      TritonFuncOpPattern
+      GenericOpPattern<triton::nvidia_gpu::WarpGroupDotWaitOp>
       // clang-format on
       >(typeConverter, context);
 }
@@ -820,6 +781,8 @@ public:
     // add rules
     populateArithPatternsAndLegality(typeConverter, patterns, target);
     populateMathPatternsAndLegality(typeConverter, patterns, target);
+    FuncArgRenamer renamer;
+    populateFunctionTypeConversions(typeConverter, renamer, patterns);
     populateTritonPatterns(typeConverter, patterns, numCTAs);
     populateTLXPatterns(typeConverter, patterns);
     // TODO: can we use
