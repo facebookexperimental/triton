@@ -19,7 +19,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     %c_shape = arith.constant 128 : i32
     %c_stride0 = arith.constant 128 : i64
     %c_stride1 = arith.constant 1 : i64
-    %0 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : <f16>, <64x64xf16, #shared>
+    %0 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : !tt.ptr<f16>, !tt.tensordesc<64x64xf16, #shared>
     %1 = amdg.update_tensor_descriptor %0 add_offsets = [%dx, %dy] : !tt.tensordesc<64x64xf16, #shared>
     tt.return %1 : !tt.tensordesc<64x64xf16, #shared>
   }
@@ -40,7 +40,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     %c_shape = arith.constant 128 : i32
     %c_stride0 = arith.constant 128 : i64
     %c_stride1 = arith.constant 1 : i64
-    %0 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : <f16>, <64x64xf16, #shared>
+    %0 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : !tt.ptr<f16>, !tt.tensordesc<64x64xf16, #shared>
     %1 = amdg.update_tensor_descriptor %0 set_bounds = [%m, %k] : !tt.tensordesc<64x64xf16, #shared>
     tt.return %1 : !tt.tensordesc<64x64xf16, #shared>
   }
@@ -61,7 +61,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     %c_shape = arith.constant 128 : i32
     %c_stride0 = arith.constant 128 : i64
     %c_stride1 = arith.constant 1 : i64
-    %0 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : <f16>, <64x64xf16, #shared>
+    %0 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : !tt.ptr<f16>, !tt.tensordesc<64x64xf16, #shared>
     %lds = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
     %1 = amdg.update_tensor_descriptor %0 dest = %lds : !ttg.memdesc<64x64xf16, #shared, #smem, mutable> : !tt.tensordesc<64x64xf16, #shared>
     tt.return %1 : !tt.tensordesc<64x64xf16, #shared>
@@ -82,7 +82,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     %c_shape = arith.constant 128 : i32
     %c_stride0 = arith.constant 128 : i64
     %c_stride1 = arith.constant 1 : i64
-    %0 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : <f16>, <64x64xf16, #shared>
+    %0 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : !tt.ptr<f16>, !tt.tensordesc<64x64xf16, #shared>
     %1 = amdg.update_tensor_descriptor %0 pred = %p : !tt.tensordesc<64x64xf16, #shared>
     tt.return %1 : !tt.tensordesc<64x64xf16, #shared>
   }
@@ -105,7 +105,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     %c_shape = arith.constant 128 : i32
     %c_stride0 = arith.constant 128 : i64
     %c_stride1 = arith.constant 1 : i64
-    %0 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : <f16>, <64x64xf16, #shared>
+    %0 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : !tt.ptr<f16>, !tt.tensordesc<64x64xf16, #shared>
     %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_bar, #smem, mutable>
     %1 = amdg.update_tensor_descriptor %0 barrier = %bar : !ttg.memdesc<1xi64, #shared_bar, #smem, mutable> : !tt.tensordesc<64x64xf16, #shared>
     tt.return %1 : !tt.tensordesc<64x64xf16, #shared>
@@ -131,7 +131,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     %c_shape = arith.constant 128 : i32
     %c_stride0 = arith.constant 128 : i64
     %c_stride1 = arith.constant 1 : i64
-    %0 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : <f16>, <64x64xf16, #shared>
+    %0 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : !tt.ptr<f16>, !tt.tensordesc<64x64xf16, #shared>
     %lds = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
     %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_bar, #smem, mutable>
     %1 = amdg.update_tensor_descriptor %0

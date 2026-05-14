@@ -256,10 +256,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %c31_i32 = arith.constant 31 : i32
     %cst = arith.constant dense<0.000000e+00> : tensor<16x16xf32, #mma_g>
     %4 = arith.extsi %K : i32 to i64
-    %a_desc = tt.make_tensor_descriptor %a_ptr, [%M, %K], [%4, %c1_i64] : <f16>, <1x32xf16, #padded_ga>
+    %a_desc = tt.make_tensor_descriptor %a_ptr, [%M, %K], [%4, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<1x32xf16, #padded_ga>
     %6 = arith.extsi %N : i32 to i64
-    %b_desc = tt.make_tensor_descriptor %b_ptr, [%K, %N], [%6, %c1_i64] : <f16>, <1x16xf16, #padded_gb>
-    %c_desc = tt.make_tensor_descriptor %c_ptr, [%M, %N], [%6, %c1_i64] : <f16>, <16x16xf16, #padded_gc>
+    %b_desc = tt.make_tensor_descriptor %b_ptr, [%K, %N], [%6, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<1x16xf16, #padded_gb>
+    %c_desc = tt.make_tensor_descriptor %c_ptr, [%M, %N], [%6, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<16x16xf16, #padded_gc>
     %a_indices = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #idx_enc}>>
     %b_indices = tt.make_range {start = 0 : i32, end = 32 : i32} : tensor<32xi32, #ttg.slice<{dim = 0, parent = #idx_enc}>>
     %9 = arith.addi %K, %c31_i32 : i32
@@ -325,11 +325,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %m = arith.muli %pid_m, %c256_i32 : i32
     %n = arith.muli %pid_n, %c64_i32 : i32
     %k_stride = arith.extsi %K : i32 to i64
-    %a_desc = tt.make_tensor_descriptor %a_ptr, [%M, %K], [%k_stride, %c1_i64] : <f32>, <256x16xf32>
+    %a_desc = tt.make_tensor_descriptor %a_ptr, [%M, %K], [%k_stride, %c1_i64] : !tt.ptr<f32>, !tt.tensordesc<256x16xf32>
     %n_stride = arith.extsi %N : i32 to i64
-    %b_desc = tt.make_tensor_descriptor %b_ptr, [%K, %N], [%n_stride, %c1_i64] : <f32>, <16x64xf32>
-    %acc_desc = tt.make_tensor_descriptor %acc_ptr, [%M, %N], [%n_stride, %c1_i64] : <f32>, <256x64xf32>
-    %c_desc = tt.make_tensor_descriptor %c_ptr, [%M, %N], [%n_stride, %c1_i64] : <f32>, <256x64xf32>
+    %b_desc = tt.make_tensor_descriptor %b_ptr, [%K, %N], [%n_stride, %c1_i64] : !tt.ptr<f32>, !tt.tensordesc<16x64xf32>
+    %acc_desc = tt.make_tensor_descriptor %acc_ptr, [%M, %N], [%n_stride, %c1_i64] : !tt.ptr<f32>, !tt.tensordesc<256x64xf32>
+    %c_desc = tt.make_tensor_descriptor %c_ptr, [%M, %N], [%n_stride, %c1_i64] : !tt.ptr<f32>, !tt.tensordesc<256x64xf32>
     %k_plus = arith.addi %K, %c15_i32 : i32
     %num_k = arith.divsi %k_plus, %c16_i32 : i32
     %accumulator:2 = scf.for %iv = %c0_i32 to %num_k step %c1_i32 iter_args(%k_off = %c0_i32, %acc = %zero) -> (i32, tensor<256x64xf32, #mma>)  : i32 {

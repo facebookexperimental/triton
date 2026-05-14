@@ -165,13 +165,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // CHECK-NOT: #ttg.padded_shared<[1024:+
 // CHECK-LABEL: @descriptor_load_dot_operand_large_k
 tt.func public @descriptor_load_dot_operand_large_k(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg2: i32, %arg3: i32, %arg4: i64, %arg5: i64) {
-  // CHECK: tt.make_tensor_descriptor {{.*}} : <f16>, <512x1024xf16, #[[$PADDED_A]]>
-  // CHECK: tt.make_tensor_descriptor {{.*}} : <f16>, <1024x64xf16, #[[$PADDED_B]]>
+  // CHECK: tt.make_tensor_descriptor {{.*}} : !tt.ptr<f16>, !tt.tensordesc<512x1024xf16, #[[$PADDED_A]]>
+  // CHECK: tt.make_tensor_descriptor {{.*}} : !tt.ptr<f16>, !tt.tensordesc<1024x64xf16, #[[$PADDED_B]]>
   %c0_i32 = arith.constant 0 : i32
   %c1_i64 = arith.constant 1 : i64
   %cst = arith.constant dense<0.000000e+00> : tensor<512x64xf32, #mma_large_k>
-  %0 = tt.make_tensor_descriptor %arg0, [%arg2, %arg3], [%arg4, %c1_i64] : <f16>, <512x1024xf16>
-  %1 = tt.make_tensor_descriptor %arg1, [%arg3, %arg2], [%arg5, %c1_i64] : <f16>, <1024x64xf16>
+  %0 = tt.make_tensor_descriptor %arg0, [%arg2, %arg3], [%arg4, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<512x1024xf16>
+  %1 = tt.make_tensor_descriptor %arg1, [%arg3, %arg2], [%arg5, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<1024x64xf16>
   %2 = tt.descriptor_load %0[%c0_i32, %c0_i32] : !tt.tensordesc<512x1024xf16> -> tensor<512x1024xf16, #blocked_large_k>
   %3 = tt.descriptor_load %1[%c0_i32, %c0_i32] : !tt.tensordesc<1024x64xf16> -> tensor<1024x64xf16, #blocked1_large_k>
   %4 = ttg.convert_layout %2 : tensor<512x1024xf16, #blocked_large_k> -> tensor<512x1024xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_large_k, kWidth = 8}>>
