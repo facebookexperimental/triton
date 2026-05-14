@@ -562,6 +562,10 @@ def test_async_dot_blackwell_2cta_tma(device, A_TMEM, SAMPLE_M):
     cluster_wait_pos = ptx.index("barrier.cluster.wait.aligned")
     tmem_alloc_pos = ptx.index("tcgen05.alloc.cta_group::2")
     assert fence_mbar_pos < fence_proxy_pos < cluster_arrive_pos < cluster_wait_pos < tmem_alloc_pos
+    # 2 cluster syncs: 1 for init (before tmem alloc, after bar init), 1 for cleanup (before tmem dealloc)
+    assert ptx.count("barrier.cluster.arrive.aligned") == 2
+    assert ptx.count("barrier.cluster.wait.aligned") == 2
+    assert ptx.count("tcgen05.dealloc.cta_group::2") == 1
     assert ptx.count("mapa.shared::cluster") == 1  # address mapping for remote_view
     assert ptx.count("tcgen05.mma.cta_group::2") == 8  # BK=128 divided into steps of 16
 
@@ -712,8 +716,12 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
     cluster_wait_pos = ptx.index("barrier.cluster.wait.aligned")
     tmem_alloc_pos = ptx.index("tcgen05.alloc.cta_group::2")
     assert fence_mbar_pos < fence_proxy_pos < cluster_arrive_pos < cluster_wait_pos < tmem_alloc_pos
-    assert ptx.count("barrier.cluster.arrive.aligned") == 2
-    assert ptx.count("barrier.cluster.wait.aligned") == 1
+    # 6 cluster arrives: 1 init (default) + 1 init (non-default) +
+    #   1 cleanup (default, before tmem dealloc) + 3 cleanup (non-default warps MMA/producer/idle, per partition end)
+    # 2 cluster waits: 1 init (default) + 1 cleanup (default, before tmem dealloc)
+    assert ptx.count("barrier.cluster.arrive.aligned") == 6
+    assert ptx.count("barrier.cluster.wait.aligned") == 2
+    assert ptx.count("tcgen05.dealloc.cta_group::2") == 1
     assert ptx.count("mapa.shared::cluster") == 1  # address mapping for remote_view
     assert ptx.count("tcgen05.mma.cta_group::2") == 8  # BK=128 divided into steps of 16
 

@@ -728,7 +728,8 @@ class CUDABackend(BaseBackend):
         # Budget-aware layout conversion elimination — runs last to ensure
         # converts whose scratch would exceed SMEM budget are eliminated
         # after all other passes that may introduce layout conversions.
-        passes.ttgpuir.add_remove_layout_conversions(pm, smem_budget)
+        terminal_smem_budget = 0 if knobs.nvidia.disable_budget_aware_layout_conversion else smem_budget
+        passes.ttgpuir.add_remove_layout_conversions(pm, terminal_smem_budget)
 
         pm.run(mod, 'make_ttgir')
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()

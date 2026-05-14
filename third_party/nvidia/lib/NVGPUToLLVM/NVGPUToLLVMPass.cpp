@@ -579,9 +579,13 @@ void freeTMAlloc(LLVM::LLVMFuncOp func, Value alloc, size_t size, Value pred,
     auto ctx = ret->getContext();
     auto loc = ret.getLoc();
     auto voidTy = void_ty(ctx);
-    if (twoCTAs && !tlxPairedMMA) {
+    if (twoCTAs || tlxPairedMMA) {
       NVVM::ClusterArriveOp::create(b, loc, UnitAttr::get(ctx));
       NVVM::ClusterWaitOp::create(b, loc, UnitAttr::get(ctx));
+      if (tlxPairedMMA) {
+        // mark mod attr so that WS lowering is aware of this cluster sync point
+        tlx::setClusterSyncKernelCleanupOnMod(func, true);
+      }
     } else {
       NVVM::Barrier0Op::create(b, loc);
     }

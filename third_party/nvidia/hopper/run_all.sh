@@ -31,8 +31,7 @@ pytest python/test/unit/language/test_autows_flash_attention.py
 
 echo "Run autoWS tutorial kernels"
 echo "Verifying correctness of FA tutorial kernels"
-TRITON_ALWAYS_COMPILE=1 pytest python/tutorials/fused-attention-ws-device-tma.py
-TRITON_ALWAYS_COMPILE=1 python python/tutorials/test_tlx_bwd_from_fused_attention.py
+TRITON_ALWAYS_COMPILE=1 pytest third_party/tlx/tutorials/fused_attention_ws_device_tma.py
 
 echo "run for Hopper"
 TRITON_ALWAYS_COMPILE=1 TRITON_USE_META_WS=1 pytest python/tutorials/fused-attention-ws-device-tma-hopper.py

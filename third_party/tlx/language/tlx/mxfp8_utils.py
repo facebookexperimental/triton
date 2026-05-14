@@ -170,7 +170,6 @@ def _to_mxfp8_block(
     tl.static_assert(BLOCK_K == 128)
     tl.static_assert(VEC_SIZE == 32)
 
-    # Step 1: Compute scales and quantized data (all in registers)
     scale_e8m0, data_fp8 = _compute_scale_and_quantize(data_input, VEC_SIZE, dtype)
 
     return data_fp8, scale_e8m0
