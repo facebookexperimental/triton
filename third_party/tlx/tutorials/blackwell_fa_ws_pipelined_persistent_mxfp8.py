@@ -1330,7 +1330,7 @@ def _softmax_recompute_quantization_iter(
     dpT = tlx.local_load(dp_tiles[0])
     tlx.barrier_arrive(dp_empties[0])
 
-    dsT = pT * (dpT - Di[None, :])
+    dsT = _mul_f32x2(pT, (dpT - Di[None, :]))
     # NaN sanitization (boundary tiles)
     dsT = tl.where(dsT == dsT, dsT, 0.0)
     # Quantize dS twice: dK consumes dS^T, while dQ consumes dS

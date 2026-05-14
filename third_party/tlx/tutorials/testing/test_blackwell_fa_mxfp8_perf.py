@@ -20,7 +20,6 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from triton._internal_testing import is_blackwell
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
-
 """
 Benchmarks for the TLX MXFP8 flash attention forward and backward kernels.
 Run with: third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_blackwell_fa_mxfp8_perf.py --mode fwd
@@ -32,22 +31,14 @@ Facebook: If you are developing in fbsource, use tritonbench instead to collect 
 
 def _setup_bwd_inputs(shape, sm_scale, dtype):
     Z, H, N_CTX, HEAD_DIM = shape
-    (q, q_scale, q_ref), (k, k_scale, k_ref), (v, v_scale, v_ref) = (
-        generate_attention_inputs(shape, DEVICE, dtype)
-    )
+    (q, q_scale, q_ref), (k, k_scale, k_ref), (v, v_scale, v_ref) = generate_attention_inputs(shape, DEVICE, dtype)
 
-    q_dk, q_scale_dk = _quantize_mxfp8_bwd_operand(
-        q_ref, dtype, transpose_for_reduction=True
-    )
-    k_dq, k_scale_dq = _quantize_mxfp8_bwd_operand(
-        k_ref, dtype, transpose_for_reduction=True
-    )
+    q_dk, q_scale_dk = _quantize_mxfp8_bwd_operand(q_ref, dtype, transpose_for_reduction=True)
+    k_dq, k_scale_dq = _quantize_mxfp8_bwd_operand(k_ref, dtype, transpose_for_reduction=True)
     v_bwd, v_scale_bwd = _quantize_mxfp8_bwd_operand(v_ref, dtype)
     do_bf16 = torch.randn(shape, device=DEVICE, dtype=torch.bfloat16)
     do_fp8, do_scale = _quantize_mxfp8_bwd_operand(do_bf16, dtype)
-    do_fp8_dv, do_scale_dv = _quantize_mxfp8_bwd_operand(
-        do_bf16, dtype, transpose_for_reduction=True
-    )
+    do_fp8_dv, do_scale_dv = _quantize_mxfp8_bwd_operand(do_bf16, dtype, transpose_for_reduction=True)
 
     fwd_config = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent_mxfp8"]
     y_dim = Z * H * N_CTX
@@ -56,18 +47,10 @@ def _setup_bwd_inputs(shape, sm_scale, dtype):
     dummy_block = [1, 1]
     dummy_5d = [1, 1, 1, 1, 1]
 
-    desc_q = TensorDescriptor(
-        q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
-    )
-    desc_k = TensorDescriptor(
-        k, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
-    )
-    desc_v = TensorDescriptor(
-        v, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
-    )
-    desc_o = TensorDescriptor(
-        o, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
-    )
+    desc_q = TensorDescriptor(q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+    desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+    desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+    desc_o = TensorDescriptor(o, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
     desc_q_scale = TensorDescriptor.from_tensor(q_scale, block_shape=dummy_5d)
     desc_k_scale = TensorDescriptor.from_tensor(k_scale, block_shape=dummy_5d)
     desc_v_scale = TensorDescriptor.from_tensor(v_scale, block_shape=dummy_5d)
@@ -112,13 +95,23 @@ def _setup_bwd_inputs(shape, sm_scale, dtype):
     )
 
     return {
-        "do_fp8": do_fp8, "do_fp8_dv": do_fp8_dv, "do_bf16": do_bf16,
-        "q": q, "q_dk": q_dk, "k": k, "k_dq": k_dq,
-        "v_bwd": v_bwd, "o": o, "M": M,
-        "q_scale": q_scale, "q_scale_dk": q_scale_dk,
-        "k_scale": k_scale, "k_scale_dq": k_scale_dq,
+        "do_fp8": do_fp8,
+        "do_fp8_dv": do_fp8_dv,
+        "do_bf16": do_bf16,
+        "q": q,
+        "q_dk": q_dk,
+        "k": k,
+        "k_dq": k_dq,
+        "v_bwd": v_bwd,
+        "o": o,
+        "M": M,
+        "q_scale": q_scale,
+        "q_scale_dk": q_scale_dk,
+        "k_scale": k_scale,
+        "k_scale_dq": k_scale_dq,
         "v_scale_bwd": v_scale_bwd,
-        "do_scale": do_scale, "do_scale_dv": do_scale_dv,
+        "do_scale": do_scale,
+        "do_scale_dv": do_scale_dv,
     }
 
 
@@ -144,26 +137,34 @@ def create_benchmark(mode="fwd"):
         if mode == "bwd":
             bwd = _setup_bwd_inputs(shape, sm_scale, dtype)
             fn = lambda: _attention_bwd_mxfp8(
-                bwd["do_fp8"], bwd["do_fp8_dv"],
-                bwd["q"], bwd["q_dk"], bwd["k"], bwd["k_dq"],
-                bwd["v_bwd"], bwd["o"], bwd["M"],
-                bwd["q_scale"], bwd["q_scale_dk"],
-                bwd["k_scale"], bwd["k_scale_dq"],
+                bwd["do_fp8"],
+                bwd["do_fp8_dv"],
+                bwd["q"],
+                bwd["q_dk"],
+                bwd["k"],
+                bwd["k_dq"],
+                bwd["v_bwd"],
+                bwd["o"],
+                bwd["M"],
+                bwd["q_scale"],
+                bwd["q_scale_dk"],
+                bwd["k_scale"],
+                bwd["k_scale_dq"],
                 bwd["v_scale_bwd"],
-                bwd["do_scale"], bwd["do_scale_dv"],
+                bwd["do_scale"],
+                bwd["do_scale_dv"],
                 sm_scale,
                 do_bf16=bwd["do_bf16"],
             )
         else:
-            (q, q_scale, _), (k, k_scale, _), (v, v_scale, _) = (
-                generate_attention_inputs(shape, DEVICE, dtype)
-            )
-            fn = lambda: _attention_ws_pipelined_persistent_mxfp8(
-                q, k, v, q_scale, k_scale, v_scale, sm_scale, causal
-            )
+            (q, q_scale, _), (k, k_scale, _), (v, v_scale, _) = generate_attention_inputs(shape, DEVICE, dtype)
+            fn = lambda: _attention_ws_pipelined_persistent_mxfp8(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal)
 
         ms, min_ms, max_ms = triton.testing.do_bench(
-            fn, quantiles=quantiles, warmup=500, rep=500,
+            fn,
+            quantiles=quantiles,
+            warmup=500,
+            rep=500,
         )
 
         flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
@@ -176,9 +177,7 @@ def create_benchmark(mode="fwd"):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Benchmark TLX Blackwell MXFP8 Flash Attention"
-    )
+    parser = argparse.ArgumentParser(description="Benchmark TLX Blackwell MXFP8 Flash Attention")
     parser.add_argument(
         "--mode",
         type=str,
