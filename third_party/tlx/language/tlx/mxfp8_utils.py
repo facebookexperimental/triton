@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import triton
 import triton.language as tl
-import triton.language.extra.tlx as tlx
 
 
 @triton.jit
@@ -164,11 +163,9 @@ def _to_mxfp8_block(
     Return:
         The FP8 data and E8M0 scales. Callers are responsible for storing them.
     """
-    BLOCK_M: tl.constexpr = data_input.shape[0]
     BLOCK_K: tl.constexpr = data_input.shape[1]
-    tl.static_assert(BLOCK_M == 128)
-    tl.static_assert(BLOCK_K == 128)
     tl.static_assert(VEC_SIZE == 32)
+    tl.static_assert(BLOCK_K % VEC_SIZE == 0)
 
     scale_e8m0, data_fp8 = _compute_scale_and_quantize(data_input, VEC_SIZE, dtype)
 
