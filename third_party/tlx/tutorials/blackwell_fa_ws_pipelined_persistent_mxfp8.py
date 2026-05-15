@@ -1251,10 +1251,10 @@ mxfp8_bwd_configs = [
             "BLOCK_M1": 128,
             "BLOCK_N1": 128,
             "NUM_BUFFERS_KV": 1,
-            "NUM_BUFFERS_Q": 2,
+            "NUM_BUFFERS_Q": 1,
             "NUM_BUFFERS_DO": 1,
             "NUM_BUFFERS_DS": 1,
-            "EPILOGUE_SUBTILE": 4,
+            "EPILOGUE_SUBTILE": 2,
         },
         num_warps=4,
         num_stages=1,
@@ -1693,8 +1693,6 @@ def _attn_bwd_mxf8_ws(
     #   do_scale_dp_tmem_prol cols 396..399   MMA 2 scale (prologue only)
     #   do_scale_dv_tmem_prol cols 400..403   MMA 3 scale (prologue only)
     #   p_scale_tmem_prologue cols 404..407   MMA 3 scale (prologue only)
-    # TODO: Extend this API to move formally support "aliasing" a buffer
-    # with a subtiled version.
     tmem_storage_alias.set_buffer_overlap(
         tlx.reuse_group(
             # RG1: qk_tiles shared with MMA 2/3/5 scale buffers.
@@ -1803,7 +1801,7 @@ def _attn_bwd_mxf8_ws(
     do_scale_dv_smem = tlx.local_alloc((1, REP_HEAD, REP_M, 2, 256), tl.uint8, NUM_BUFFERS_DO)
 
     slice_size_alloc: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
-    # TODO: Actually expose.
+    # TODO: Expose. This is set to 1 because its not on the critical path.
     NUM_DKV_STORE_BUFFERS: tl.constexpr = 1
     dkv_store_buf = tlx.local_alloc((BLOCK_N1, slice_size_alloc), tl.bfloat16, NUM_DKV_STORE_BUFFERS)
     DQ_REDUCE_NCOL: tl.constexpr = HEAD_DIM // (EPILOGUE_SUBTILE * 2)
