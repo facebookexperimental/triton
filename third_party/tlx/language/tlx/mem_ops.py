@@ -798,6 +798,29 @@ def local_trans(input: tlx.buffered_tensor, dims: Tuple[int] = (1, 0), _semantic
 
 
 @tl.builtin
+def local_reshape(
+    src: tlx.buffered_tensor,
+    shape: list[tl.constexpr],
+    _semantic=None,
+) -> tlx.buffered_tensor:
+    """
+    Reshape a shared-memory descriptor without moving data.
+    """
+    assert isinstance(src, tlx.buffered_tensor) and src.type.storage == tlx.storage_kind.smem, (
+        "TLX local_reshape only supports SMEM")
+    reshape_handle = _semantic.builder.create_memdesc_reshape(src.handle, shape)
+    layout = tlx.swizzled_shared_layout_encoding.make_default(rank=len(shape))
+    return tlx.buffered_tensor(
+        reshape_handle,
+        src.type.scalar,
+        shape,
+        src.type.num,
+        src.type.storage,
+        layout,
+    )
+
+
+@tl.builtin
 def local_reinterpret(
     src: tlx.buffered_tensor,
     dtype: tl.dtype,
