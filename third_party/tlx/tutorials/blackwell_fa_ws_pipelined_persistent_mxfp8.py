@@ -1831,10 +1831,7 @@ def _attn_bwd_mxf8_ws(
     dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_REDUCE_NCOL), tlx.dtype_of(desc_dq), DQ_REDUCE_STAGES)
 
     # ===== SMEM barriers =====
-    k_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     k_dq_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
-    v_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
-    k_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     q_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)
     q_dk_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)
     q_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)
@@ -2053,7 +2050,6 @@ def _attn_bwd_mxf8_ws(
                 _, persistent_tmem_phase = _get_bufidx_phase(_i, NUM_BUFFERS_TMEM)
 
                 # MMA 1: qkT = K @ Q^T
-                tlx.barrier_wait(k_fulls[kv_buf_id], kv_phase)
                 tlx.barrier_wait(q_fulls[q_buf_id], q_phase)
                 # REUSE_GROUP_1 SYNCHRONIZATION:
                 # MMA 3: p_empties
@@ -2086,7 +2082,6 @@ def _attn_bwd_mxf8_ws(
                 # REUSE_GROUP_3 SYNCHRONIZATION:
                 # Linear order for all deps. For epilogue MMA 5 -> MMA 2.
                 # MMA 5 handled by dq_empties[0] above.
-                tlx.barrier_wait(v_fulls[kv_buf_id], kv_phase)
                 tlx.barrier_wait(do_fulls[do_buf_id], do_phase)
                 tlx.barrier_wait(dq_empties[0], tmem_phase_prev)
                 tlx.tmem_copy(v_scale_smem[kv_buf_id], v_scale_tmem_prologue[0])
@@ -2286,8 +2281,6 @@ def _attn_bwd_mxf8_ws(
                     blk_idx += 1
 
                 tlx.tcgen05_commit(dv_fulls[0])
-                # Signal once MMA 1 is done.
-                tlx.tcgen05_commit(k_empties[kv_buf_id])
 
                 # --- Epilog: last dK / dQ ---
                 prev_blk_idx = blk_idx - 1
@@ -2364,28 +2357,31 @@ def _attn_bwd_mxf8_ws(
                 sf_off_seq_h = off_seq_h.to(tl.int32)
                 kv_scale_n = pid * REP_N
 
-                # Load K data + scale
+                # Load K data + scale and first Q + scale
+                # Share 1 barrier.
+                curr_m = 0
+                q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
+                q_scale_m = (curr_m // 128) * REP_M
+                # Share this barrier to signify K empty
+                tlx.barrier_wait(q_empties[q_buf_id], q_phase ^ 1)
                 kv_buf_id, kv_phase = _get_bufidx_phase(_i, NUM_BUFFERS_KV)
-                tlx.barrier_wait(k_empties[kv_buf_id], kv_phase ^ 1)
-                tlx.barrier_expect_bytes(k_fulls[kv_buf_id], (K_BYTES * BLOCK_N1 * HEAD_DIM) + SCALE_BYTES)
+                tlx.barrier_expect_bytes(
+                    q_fulls[kv_buf_id],
+                    (K_BYTES * BLOCK_N1 * HEAD_DIM) + SCALE_BYTES + (Q_BYTES * BLOCK_M1 * HEAD_DIM) + SCALE_BYTES,
+                )
                 tlx.async_descriptor_load(
                     desc_k,
                     k_smem[kv_buf_id],
                     [(base_kv + start_n).to(tl.int32), 0],
-                    k_fulls[kv_buf_id],
+                    q_fulls[kv_buf_id],
                 )
                 tlx.async_descriptor_load(
                     desc_k_scale,
                     k_scale_smem[kv_buf_id],
                     [sf_off_seq_h, kv_scale_n.to(tl.int32), 0, 0, 0],
-                    k_fulls[kv_buf_id],
+                    q_fulls[kv_buf_id],
                 )
                 # Load first Q + scale
-                curr_m = 0
-                q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
-                q_scale_m = (curr_m // 128) * REP_M
-                tlx.barrier_wait(q_empties[q_buf_id], q_phase ^ 1)
-                tlx.barrier_expect_bytes(q_fulls[q_buf_id], (Q_BYTES * BLOCK_M1 * HEAD_DIM) + SCALE_BYTES)
                 tlx.async_descriptor_load(
                     desc_q,
                     q_smem[q_buf_id],
@@ -2399,30 +2395,27 @@ def _attn_bwd_mxf8_ws(
                     q_fulls[q_buf_id],
                 )
 
-                # Load V data + scale
+                # Load V data + scale and do data + scale.
                 # Share 1 barrier
-                tlx.barrier_expect_bytes(v_fulls[kv_buf_id], K_BYTES * BLOCK_N1 * HEAD_DIM + SCALE_BYTES)
+                tlx.barrier_expect_bytes(
+                    do_fulls[kv_buf_id],
+                    K_BYTES * BLOCK_N1 * HEAD_DIM + SCALE_BYTES + (DO_BYTES * BLOCK_M1 * HEAD_DIM) + SCALE_BYTES,
+                )
                 tlx.async_descriptor_load(
                     desc_v,
                     v_smem[kv_buf_id],
                     [(base_kv + start_n).to(tl.int32), 0],
-                    v_fulls[kv_buf_id],
+                    do_fulls[kv_buf_id],
                 )
                 tlx.async_descriptor_load(
                     desc_v_scale,
                     v_scale_smem[kv_buf_id],
                     [sf_off_seq_h, kv_scale_n.to(tl.int32), 0, 0, 0],
-                    v_fulls[kv_buf_id],
+                    do_fulls[kv_buf_id],
                 )
-
-                # Load first dO + scale
                 do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
                 do_scale_m = (curr_m // 128) * REP_M
                 tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
-                tlx.barrier_expect_bytes(
-                    do_fulls[do_buf_id],
-                    (DO_BYTES * BLOCK_M1 * HEAD_DIM) + SCALE_BYTES,
-                )
                 tlx.async_descriptor_load(
                     desc_do,
                     do_smem[do_buf_id],
