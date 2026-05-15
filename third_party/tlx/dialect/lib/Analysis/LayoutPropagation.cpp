@@ -151,16 +151,24 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
     auto resultLattice = results[0];
     LayoutEncoding resultLayoutEncoding = resultLattice->getValue();
     if (!resultLayoutEncoding.isUninitialized()) {
-      if (auto tmemEncoding = dyn_cast<ttng::TensorMemoryEncodingAttr>(
-              resultLattice->getValue().getLayoutEncoding())) {
+      Attribute resultEncoding = resultLayoutEncoding.getLayoutEncoding();
+      if (auto tmemEncoding =
+              dyn_cast<ttng::TensorMemoryEncodingAttr>(resultEncoding)) {
         auto srcTy = cast<ttg::MemDescType>(tmemSliceOp.getSrc().getType());
         auto srcEncoding =
             dyn_cast<ttng::TensorMemoryEncodingAttr>(srcTy.getEncoding());
+        unsigned blockM =
+            srcEncoding ? srcEncoding.getBlockM() : tmemEncoding.getBlockM();
+        unsigned blockN =
+            srcEncoding ? srcEncoding.getBlockN()
+                        : std::min<unsigned>(
+                              tmemEncoding.getBlockN(),
+                              static_cast<unsigned>(srcTy.getShape().back()));
         auto newTmemEncoding = ttng::TensorMemoryEncodingAttr::get(
-            tmemEncoding.getContext(), srcEncoding.getBlockM(),
-            srcEncoding.getBlockN(), tmemEncoding.getColStride(),
-            tmemEncoding.getCTASplitM(), tmemEncoding.getCTASplitN(),
-            tmemEncoding.getTwoCTAs(), tmemEncoding.getCtaMode());
+            tmemEncoding.getContext(), blockM, blockN,
+            tmemEncoding.getColStride(), tmemEncoding.getCTASplitM(),
+            tmemEncoding.getCTASplitN(), tmemEncoding.getTwoCTAs(),
+            tmemEncoding.getCtaMode());
         const auto updatedResultLayoutEncoding =
             LayoutEncoding(newTmemEncoding);
         auto operandLattice = operands[0];
@@ -169,6 +177,12 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
         propagateIfChanged(operandLattice, changed);
         visitWarpSpecRegionArgs(op, tmemSliceOp.getSrc(),
                                 updatedResultLayoutEncoding);
+      } else if (isa<ttng::TensorMemoryScalesEncodingAttr,
+                     triton::tlx::DummyTMEMLayoutAttr>(resultEncoding)) {
+        auto operandLattice = operands[0];
+        ChangeResult changed = operandLattice->meet(resultLayoutEncoding);
+        propagateIfChanged(operandLattice, changed);
+        visitWarpSpecRegionArgs(op, tmemSliceOp.getSrc(), resultLayoutEncoding);
       }
     }
     return success();
@@ -284,17 +298,28 @@ LogicalResult LayoutForwardPropagation::visitOperation(
     // Slice operandLayoutEncoding
     if (auto sliceOp = dyn_cast<ttng::TMEMSubSliceOp>(op)) {
       if (!operandLayoutEncoding.isUninitialized()) {
-        auto dstTy = cast<ttg::MemDescType>(sliceOp.getType());
-        auto dstEncoding =
-            dyn_cast<ttng::TensorMemoryEncodingAttr>(dstTy.getEncoding());
-        auto encoding = dyn_cast<ttng::TensorMemoryEncodingAttr>(
-            operandLayoutEncoding.getLayoutEncoding());
-        auto newEncoding = ttng::TensorMemoryEncodingAttr::get(
-            op->getContext(), dstEncoding.getBlockM(), dstEncoding.getBlockN(),
-            encoding.getColStride(), encoding.getCTASplitM(),
-            encoding.getCTASplitN(), encoding.getTwoCTAs(),
-            encoding.getCtaMode());
-        operandLayoutEncoding = LayoutEncoding(newEncoding);
+        Attribute operandEncoding = operandLayoutEncoding.getLayoutEncoding();
+        if (auto encoding =
+                dyn_cast<ttng::TensorMemoryEncodingAttr>(operandEncoding)) {
+          auto dstTy = cast<ttg::MemDescType>(sliceOp.getType());
+          auto dstEncoding =
+              dyn_cast<ttng::TensorMemoryEncodingAttr>(dstTy.getEncoding());
+          unsigned blockM =
+              dstEncoding ? dstEncoding.getBlockM() : encoding.getBlockM();
+          unsigned blockN =
+              dstEncoding ? dstEncoding.getBlockN()
+                          : std::min<unsigned>(
+                                encoding.getBlockN(),
+                                static_cast<unsigned>(dstTy.getShape().back()));
+          auto newEncoding = ttng::TensorMemoryEncodingAttr::get(
+              op->getContext(), blockM, blockN, encoding.getColStride(),
+              encoding.getCTASplitM(), encoding.getCTASplitN(),
+              encoding.getTwoCTAs(), encoding.getCtaMode());
+          operandLayoutEncoding = LayoutEncoding(newEncoding);
+        } else if (isa<ttng::TensorMemoryScalesEncodingAttr,
+                       triton::tlx::DummyTMEMLayoutAttr>(operandEncoding)) {
+          operandLayoutEncoding = LayoutEncoding(operandEncoding);
+        }
       }
     }
 
