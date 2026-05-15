@@ -245,10 +245,8 @@ def _to_mxfp8_block_with_block_amax(
     Return:
         The FP8 data and E8M0 scales. Callers are responsible for storing them.
     """
-    BLOCK_M: tl.constexpr = data_input.shape[0]
     BLOCK_K: tl.constexpr = data_input.shape[1]
-    tl.static_assert(BLOCK_M == 128)
-    tl.static_assert(BLOCK_K == 128)
+    tl.static_assert(BLOCK_K % VEC_SIZE == 0)
     tl.static_assert(VEC_SIZE == 32)
 
     scale_e8m0, data_fp8 = _amax_to_e8m0_and_quantize(data_input, block_amax, VEC_SIZE, dtype)
