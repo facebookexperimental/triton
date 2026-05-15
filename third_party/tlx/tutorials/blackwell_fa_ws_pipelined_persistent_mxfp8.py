@@ -1264,8 +1264,8 @@ def _softmax_recompute_quantization_iter(
     qk_tiles_subtile,
     qk_fulls,
     qk_empties,
-    p_tiles_subtile,
-    p_scale_buf_subtile,
+    p_tiles,
+    p_scale_buf,
     p_fulls,
     p_empties,
     dp_tiles_subtile,
@@ -1288,6 +1288,7 @@ def _softmax_recompute_quantization_iter(
     DS_NUM_SUBS: tl.constexpr,
 ):
     DS_M_SUB: tl.constexpr = BLOCK_M1 // DS_NUM_SUBS
+    DS_SCALE_BLOCK_SIZE: tl.constexpr = (BLOCK_M1 // VEC_SIZE) // DS_NUM_SUBS
     BWD_NUM_BLOCKS: tl.constexpr = DS_M_SUB // VEC_SIZE
     _, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
     ds_buf_id, ds_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
@@ -1327,8 +1328,8 @@ def _softmax_recompute_quantization_iter(
             VEC_SIZE,
             p_dtype,
         )
-        tlx.local_store(tlx.local_view(p_tiles_subtile, subtile_id), p_fp8)
-        tlx.local_store(tlx.local_view(p_scale_buf_subtile, subtile_id), p_scale)
+        tlx.local_store(tlx.subslice(p_tiles[0], DS_M_SUB * subtile_id, DS_M_SUB), p_fp8)
+        tlx.local_store(tlx.subslice(p_scale_buf[0], DS_SCALE_BLOCK_SIZE * subtile_id, DS_SCALE_BLOCK_SIZE), p_scale)
         if subtile_id == DS_NUM_SUBS - 1:
             tlx.barrier_arrive(p_fulls[0])
         # Finish dS for the previous M-block.
@@ -1476,13 +1477,6 @@ def _attn_bwd_mxf8_ws(
         tlx.storage_kind.tmem,
         reuse=tmem_storage_alias,
     )
-    p_tiles_subtile = tlx.local_alloc(
-        (BLOCK_N1, BLOCK_M1 // DS_NUM_SUBS),
-        p_dtype,
-        NUM_BUFFERS_TMEM * DS_NUM_SUBS,
-        tlx.storage_kind.tmem,
-        reuse=tmem_storage_alias,
-    )
     dv_tiles = tlx.local_alloc(
         (BLOCK_N1, HEAD_DIM),
         tl.float32,
@@ -1573,26 +1567,12 @@ def _attn_bwd_mxf8_ws(
         tlx.storage_kind.tmem,
         reuse=tmem_storage_alias,
     )
-    p_scale_tmem_prologue_subtile = tlx.local_alloc(
-        (BLOCK_N1, (BLOCK_M1 // VEC_SIZE) // DS_NUM_SUBS),
-        tl.uint8,
-        NUM_BUFFERS_TMEM * DS_NUM_SUBS,
-        tlx.storage_kind.tmem,
-        reuse=tmem_storage_alias,
-    )
     # Body Scales
     # These are the scales used in the steady state.
     p_scale_tmem = tlx.local_alloc(
         (BLOCK_N1, BLOCK_M1 // VEC_SIZE),
         tl.uint8,
         NUM_BUFFERS_TMEM,
-        tlx.storage_kind.tmem,
-        reuse=tmem_storage_alias,
-    )
-    p_scale_tmem_subtile = tlx.local_alloc(
-        (BLOCK_N1, (BLOCK_M1 // VEC_SIZE) // DS_NUM_SUBS),
-        tl.uint8,
-        NUM_BUFFERS_TMEM * DS_NUM_SUBS,
         tlx.storage_kind.tmem,
         reuse=tmem_storage_alias,
     )
@@ -1710,20 +1690,9 @@ def _attn_bwd_mxf8_ws(
                 ),
                 tlx.reuse_group(
                     p_tiles,
-                    tlx.reuse_group(
-                        p_tiles_subtile,
-                        group_size=DS_NUM_SUBS,
-                    ),
                     v_scale_tmem,
                     do_scale_dp_tmem,
-                    tlx.reuse_group(
-                        p_scale_tmem,
-                        tlx.reuse_group(
-                            p_scale_tmem_subtile,
-                            group_size=DS_NUM_SUBS,
-                        ),
-                        group_type=tlx.reuse_group_type.shared,
-                    ),
+                    p_scale_tmem,
                     do_scale_dv_tmem,
                     ds_scale_dq_tmem,
                     k_scale_dq_tmem,
@@ -1766,10 +1735,6 @@ def _attn_bwd_mxf8_ws(
                     do_scale_dv_tmem_prologue,
                     tlx.reuse_group(
                         p_scale_tmem_prologue,
-                        tlx.reuse_group(
-                            p_scale_tmem_prologue_subtile,
-                            group_size=DS_NUM_SUBS,
-                        ),
                         group_type=tlx.reuse_group_type.shared,
                     ),
                     group_type=tlx.reuse_group_type.distinct,
@@ -1945,8 +1910,8 @@ def _attn_bwd_mxf8_ws(
                     qk_tiles_subtile,
                     qk_fulls,
                     qk_empties,
-                    p_tiles_subtile,
-                    p_scale_tmem_prologue_subtile,
+                    p_tiles,
+                    p_scale_tmem_prologue,
                     p_fulls,
                     p_empties,
                     dp_tiles_subtile,
@@ -1983,8 +1948,8 @@ def _attn_bwd_mxf8_ws(
                         qk_tiles_subtile,
                         qk_fulls,
                         qk_empties,
-                        p_tiles_subtile,
-                        p_scale_tmem_subtile,
+                        p_tiles,
+                        p_scale_tmem,
                         p_fulls,
                         p_empties,
                         dp_tiles_subtile,
