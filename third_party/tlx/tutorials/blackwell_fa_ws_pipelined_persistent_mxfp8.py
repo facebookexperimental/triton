@@ -1345,12 +1345,12 @@ def _softmax_recompute_quantization_iter(
             p_dtype,
         )
         tlx.local_store(tlx.subslice(tlx.local_view(p_tiles, 0), DS_M_SUB * subtile_id, DS_M_SUB), p_fp8)
-        p_scale_packed = p_scale.reshape([REP_M, 4 // DS_NUM_SUBS, 32, REP_N, 4]).permute(0, 3, 2, 1, 4)
+        p_scale_packed = p_scale.reshape([REP_N, 4, 32, REP_M, 4 // DS_NUM_SUBS]).permute(0, 3, 2, 1, 4)
         tlx.local_store(
             tlx.local_slice(
                 tlx.local_view(p_scale_buf_smem, 0),
-                [0, 0, 0, subtile_id * (4 // DS_NUM_SUBS), 0],
-                [REP_M, REP_N, 32, 4 // DS_NUM_SUBS, 4],
+                [0, 0, 0, 0, subtile_id * (4 // DS_NUM_SUBS)],
+                [REP_M, REP_N, 32, 4, 4 // DS_NUM_SUBS],
             ),
             p_scale_packed,
         )
@@ -1495,8 +1495,6 @@ def _attn_bwd_mxf8_ws(
         tiles_per_sm += 1
     tile_idx = prog_id
 
-    # TODO: Support DS_NUM_SUBS = 2 or DS_NUM_SUBS = 4.
-    # Currently there are accuracy issues.
     DS_NUM_SUBS: tl.constexpr = 4
 
     # ===== TMEM allocations =====
