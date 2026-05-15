@@ -1482,7 +1482,7 @@ def _attn_bwd_mxf8_ws(
 
     # TODO: Support DS_NUM_SUBS = 2 or DS_NUM_SUBS = 4.
     # Currently there are accuracy issues.
-    DS_NUM_SUBS: tl.constexpr = 4
+    DS_NUM_SUBS: tl.constexpr = 2
 
     # ===== TMEM allocations =====
     # Single-region accumulator alias (qk/dp/p/dq overlap). Lifetime correctness
@@ -2199,17 +2199,15 @@ def _attn_bwd_mxf8_ws(
                     # MMA 2: Handled by ds_fulls barrier in MMA 5
                     # MMA 3: Handled by p_empties in MMA 1
                     tlx.barrier_wait(q_dk_fulls[q_buf_id_prev], q_phase_prev)
-                    # Copy from SMEM to TMEM
-                    # TODO: Blocked on TLX feature
-                    # tlx.tmem_copy(ds_tiles_smem[ds_buf_id_prev], ds_tiles_tmem[0])
                     tlx.barrier_wait(dq_empties[0], tmem_phase_prev)
                     # Fence for ds_scale_smem to be visible.
                     tlx.fence("async_shared")
+                    # Copy from SMEM to TMEM
+                    tlx.tmem_copy(ds_tiles_smem[ds_buf_id_prev], ds_tiles_tmem[0])
                     tlx.tmem_copy(ds_scale_smem[0], ds_scale_dk_tmem[0])
                     tlx.tmem_copy(q_dk_scale_smem[q_buf_id_prev], q_scale_dk_tmem[0])
                     tlx.async_dot_scaled(
-                        # TODO: ds_tiles_tmem[0],
-                        ds_tiles_smem[ds_buf_id_prev],
+                        ds_tiles_tmem[0],
                         q_dk_smem[q_buf_id_prev],
                         dk_tiles[0],
                         ds_scale_dk_tmem[0],
@@ -2288,13 +2286,11 @@ def _attn_bwd_mxf8_ws(
                 # Copy from SMEM to TMEM
                 # Fence for ds_scale_smem to be visiible.
                 tlx.fence("async_shared")
-                # TODO: Blocked on TLX feature
-                # tlx.tmem_copy(ds_tiles_smem[ds_buf_id], ds_tiles_tmem[0])
+                tlx.tmem_copy(ds_tiles_smem[ds_buf_id], ds_tiles_tmem[0])
                 tlx.tmem_copy(q_dk_scale_smem[q_buf_id], q_scale_dk_tmem[0])
                 tlx.tmem_copy(ds_scale_smem[0], ds_scale_dk_tmem[0])
                 tlx.async_dot_scaled(
-                    # TODO: ds_tiles_tmem[0],
-                    ds_tiles_smem[ds_buf_id],
+                    ds_tiles_tmem[0],
                     q_dk_smem[q_buf_id],
                     dk_tiles[0],
                     ds_scale_dk_tmem[0],
@@ -2813,12 +2809,7 @@ def generate_tensor_with_block_distributions(
     -----------
     reference_tensor : torch.Tensor
         The reference tensor whose shape, dtype, device, and properties to copy.
-    min_max_ranges : list[tuple[float, float]]
         List of [min, max] value ranges. Each block will be assigned a range
-        cyclically from this list.
-    block_size : int
-        The size of each block (default: 32 for MXFP8).
-    num_pregenerated_blocks : int
         Number of random blocks to pre-generate for each range (default: 100).
 
     Returns:

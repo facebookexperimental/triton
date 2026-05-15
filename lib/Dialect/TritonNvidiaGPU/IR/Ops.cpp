@@ -1240,9 +1240,12 @@ LogicalResult TMEMCopyOp::verify() {
     if (nvmmaEnc && nvmmaEnc.getSwizzlingByteWidth() == 0) {
       return emitOpError("Source layout should be swizzled.");
     }
-    // When we lift this, we should make sure we handle unpacked cleanly
-    if (srcTy.getElementType().getIntOrFloatBitWidth() != 32) {
-      return emitOpError("Source element type should be 32-bit.");
+    if (srcTy.getElementType() != dstTy.getElementType()) {
+      return emitOpError("Source and destination element types must match.");
+    }
+    unsigned bitWidth = srcTy.getElementType().getIntOrFloatBitWidth();
+    if (bitWidth != 8 && bitWidth != 32) {
+      return emitOpError("Source element type should be 8-bit or 32-bit.");
     }
   }
   // Given that we want to support flexible input SMEM shapes, kinds of shape

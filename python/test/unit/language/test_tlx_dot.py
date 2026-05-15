@@ -1407,6 +1407,33 @@ def test_async_dot_scaled(A_DATA_TYPE, B_DATA_TYPE, device):
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_tlx_tmem_copy_fp8_data_ttgir(device):
+
+    @triton.jit
+    def tmem_copy_fp8_data_kernel(a, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+        offs_m = tl.arange(0, BLOCK_M)
+        offs_n = tl.arange(0, BLOCK_N)
+        offsets = offs_m[:, None] * BLOCK_N + offs_n[None, :]
+
+        a_smem = tlx.local_alloc((BLOCK_M, BLOCK_N), tlx.dtype_of(a), tl.constexpr(1))
+        a_tmem = tlx.local_alloc((BLOCK_M, BLOCK_N), tlx.dtype_of(a), tl.constexpr(1), tlx.storage_kind.tmem)
+
+        a_reg = tl.load(a + offsets)
+        tlx.local_store(a_smem[0], a_reg)
+        tlx.tmem_copy(a_smem[0], a_tmem[0])
+
+    BLOCK_M, BLOCK_N = 128, 128
+    a = torch.empty((BLOCK_M, BLOCK_N), device=device, dtype=torch.float8_e4m3fn)
+
+    kernel = tmem_copy_fp8_data_kernel[(1, )](a, BLOCK_M, BLOCK_N)
+
+    ttgir = kernel.asm["ttgir"]
+    assert "ttng.tmem_copy" in ttgir
+    assert "tensor_memory_encoding" in ttgir
+    assert "tensor_memory_scales_encoding" not in ttgir
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_async_dot_scaled_tmem_scales(device):
     """
     Test D = (A * A_scale) * (B * B_scale) with mxfp8 format and TMEM scales.
