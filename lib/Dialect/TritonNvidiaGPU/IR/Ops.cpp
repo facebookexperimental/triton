@@ -1240,9 +1240,12 @@ LogicalResult TMEMCopyOp::verify() {
     if (nvmmaEnc && nvmmaEnc.getSwizzlingByteWidth() == 0) {
       return emitOpError("Source layout should be swizzled.");
     }
-    // When we lift this, we should make sure we handle unpacked cleanly
-    if (srcTy.getElementType().getIntOrFloatBitWidth() != 32) {
-      return emitOpError("Source element type should be 32-bit.");
+    if (srcTy.getElementType() != dstTy.getElementType()) {
+      return emitOpError("Source and destination element types must match.");
+    }
+    unsigned bitWidth = srcTy.getElementType().getIntOrFloatBitWidth();
+    if (bitWidth != 8 && bitWidth != 32) {
+      return emitOpError("Source element type should be 8-bit or 32-bit.");
     }
   }
   // Given that we want to support flexible input SMEM shapes, kinds of shape
@@ -1254,26 +1257,66 @@ LogicalResult TMEMCopyOp::verify() {
 // -- TMEMSubSliceOp --
 LogicalResult TMEMSubSliceOp::verify() {
   auto srcTy = cast<triton::gpu::MemDescType>(getSrc().getType());
-  auto encoding = dyn_cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
-      srcTy.getEncoding());
-  if (!encoding)
-    return emitOpError("The source must be a tensor memory buffer.");
-  if (!llvm::is_contained({64, 128}, encoding.getBlockM())) {
-    return emitOpError("The source tensor memory descriptor must have a 128xN "
-                       "or 64xN layout, got block_m=")
-           << encoding.getBlockM();
-  }
   auto dstTy = cast<triton::gpu::MemDescType>(getResult().getType());
-  auto dstEncoding = dyn_cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
-      dstTy.getEncoding());
-  if (!dstEncoding)
+
+  if (!isa<triton::nvidia_gpu::TensorMemorySpaceAttr>(srcTy.getMemorySpace()))
+    return emitOpError("The source must be a tensor memory buffer.");
+  if (srcTy.getRank() != dstTy.getRank())
+    return emitOpError(
+        "The destination must have the same rank as the source.");
+  if (getN() < 0 || getN() + dstTy.getShape().back() > srcTy.getShape().back())
+    return emitOpError("Subslice range exceeds source shape.");
+  for (auto [srcDim, dstDim] :
+       llvm::zip(srcTy.getShape().drop_back(), dstTy.getShape().drop_back())) {
+    if (srcDim != dstDim)
+      return emitOpError(
+          "Only slicing along the innermost dimension is supported.");
+  }
+
+  Attribute srcEncoding = srcTy.getEncoding();
+  Attribute dstEncoding = dstTy.getEncoding();
+  if (!isa<triton::nvidia_gpu::TensorMemoryEncodingAttr,
+           TensorMemoryScalesEncodingAttr, triton::tlx::DummyTMEMLayoutAttr>(
+          srcEncoding))
+    return emitOpError("The source must be a tensor memory buffer.");
+  if (!isa<triton::nvidia_gpu::TensorMemoryEncodingAttr,
+           TensorMemoryScalesEncodingAttr, triton::tlx::DummyTMEMLayoutAttr>(
+          dstEncoding))
     return emitOpError("The destination must be a tensor memory buffer.");
-  if (dstEncoding.getBlockM() != encoding.getBlockM() ||
-      dstEncoding.getCTASplitM() != encoding.getCTASplitM() ||
-      dstEncoding.getCTASplitN() != encoding.getCTASplitN() ||
-      dstEncoding.getColStride() != encoding.getColStride())
-    return emitOpError("The destination must have the same block size and "
-                       "CTASplit size as the source.");
+
+  if (auto encoding =
+          dyn_cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(srcEncoding)) {
+    if (!llvm::is_contained({64, 128}, encoding.getBlockM())) {
+      return emitOpError("The source tensor memory descriptor must have a "
+                         "128xN or 64xN layout, got block_m=")
+             << encoding.getBlockM();
+    }
+    auto dstTmemEncoding =
+        dyn_cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(dstEncoding);
+    if (!dstTmemEncoding)
+      return emitOpError("The destination must use the same TMEM encoding kind "
+                         "as the source.");
+    if (dstTmemEncoding.getBlockM() != encoding.getBlockM() ||
+        dstTmemEncoding.getCTASplitM() != encoding.getCTASplitM() ||
+        dstTmemEncoding.getCTASplitN() != encoding.getCTASplitN() ||
+        dstTmemEncoding.getColStride() != encoding.getColStride())
+      return emitOpError("The destination must have the same block size and "
+                         "CTASplit size as the source.");
+  } else if (auto scaleEncoding =
+                 dyn_cast<TensorMemoryScalesEncodingAttr>(srcEncoding)) {
+    auto dstScaleEncoding =
+        dyn_cast<TensorMemoryScalesEncodingAttr>(dstEncoding);
+    if (!dstScaleEncoding)
+      return emitOpError("The destination must use the same TMEM encoding kind "
+                         "as the source.");
+    if (dstScaleEncoding.getCTASplitM() != scaleEncoding.getCTASplitM() ||
+        dstScaleEncoding.getCTASplitN() != scaleEncoding.getCTASplitN())
+      return emitOpError(
+          "The destination must have the same CTASplit size as the source.");
+  } else if (!isa<triton::tlx::DummyTMEMLayoutAttr>(dstEncoding)) {
+    return emitOpError(
+        "The destination must use the same TMEM encoding kind as the source.");
+  }
   return mlir::success();
 }
 
@@ -1282,13 +1325,15 @@ void TMEMSubSliceOp::build(OpBuilder &builder, OperationState &state,
   auto allocTy = cast<triton::gpu::MemDescType>(alloc.getType());
   SmallVector<int64_t> shape(allocTy.getShape());
   shape.back() = size;
-  auto encoding =
-      cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(allocTy.getEncoding());
-  unsigned newBlockN = std::min<unsigned>(encoding.getBlockN(), size);
-  auto newEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
-      builder.getContext(), encoding.getBlockM(), newBlockN,
-      encoding.getColStride(), encoding.getCTASplitM(), encoding.getCTASplitN(),
-      encoding.getTwoCTAs(), encoding.getCtaMode());
+  Attribute newEncoding = allocTy.getEncoding();
+  if (auto encoding = dyn_cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
+          allocTy.getEncoding())) {
+    unsigned newBlockN = std::min<unsigned>(encoding.getBlockN(), size);
+    newEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
+        builder.getContext(), encoding.getBlockM(), newBlockN,
+        encoding.getColStride(), encoding.getCTASplitM(),
+        encoding.getCTASplitN(), encoding.getTwoCTAs(), encoding.getCtaMode());
+  }
   auto subsliceType = gpu::MemDescType::get(
       shape, allocTy.getElementType(), newEncoding, allocTy.getMemorySpace(),
       allocTy.getMutableMemory(), allocTy.getAllocShape());
