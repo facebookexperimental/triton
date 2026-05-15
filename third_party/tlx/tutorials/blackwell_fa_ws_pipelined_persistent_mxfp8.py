@@ -1299,7 +1299,7 @@ def _softmax_recompute_quantization_iter(
         # Read QK from TMEM, apply sm_scale -> P
         if subtile_id == 0:
             tlx.barrier_wait(qk_fulls[0], tmem_phase)
-        qkT = tlx.local_load(tlx.subslice(qk_tiles[0], DS_M_SUB * subtile_id, DS_M_SUB))
+        qkT = tlx.local_load(tlx.subslice(tlx.local_view(qk_tiles, 0), DS_M_SUB * subtile_id, DS_M_SUB))
         # qk_tiles, dp_tiles, dq_tiles all share the same physical
         # TMEM cols 0-127 (qkdp_alias, single-buffered). Force the
         # TMEM read to drain into registers before signaling the
@@ -1328,15 +1328,17 @@ def _softmax_recompute_quantization_iter(
             VEC_SIZE,
             p_dtype,
         )
-        tlx.local_store(tlx.subslice(p_tiles[0], DS_M_SUB * subtile_id, DS_M_SUB), p_fp8)
-        tlx.local_store(tlx.subslice(p_scale_buf[0], DS_SCALE_BLOCK_SIZE * subtile_id, DS_SCALE_BLOCK_SIZE), p_scale)
+        tlx.local_store(tlx.subslice(tlx.local_view(p_tiles, 0), DS_M_SUB * subtile_id, DS_M_SUB), p_fp8)
+        tlx.local_store(
+            tlx.subslice(tlx.local_view(p_scale_buf, 0), DS_SCALE_BLOCK_SIZE * subtile_id, DS_SCALE_BLOCK_SIZE),
+            p_scale)
         if subtile_id == DS_NUM_SUBS - 1:
             tlx.barrier_arrive(p_fulls[0])
         # Finish dS for the previous M-block.
         Di = tl.load(D_off + offs_m)
         if subtile_id == 0:
             tlx.barrier_wait(dp_fulls[0], tmem_phase)
-        dpT = tlx.local_load(tlx.subslice(dp_tiles[0], DS_M_SUB * subtile_id, DS_M_SUB))
+        dpT = tlx.local_load(tlx.subslice(tlx.local_view(dp_tiles, 0), DS_M_SUB * subtile_id, DS_M_SUB))
         if subtile_id == DS_NUM_SUBS - 1:
             tlx.barrier_arrive(dp_empties[0])
 
@@ -1353,10 +1355,12 @@ def _softmax_recompute_quantization_iter(
             VEC_SIZE,
             p_dtype,
         )
-        tlx.local_store(tlx.local_slice(ds_tiles_smem[ds_buf_id], [0, subtile_id], [BLOCK_N1, DS_M_SUB]), ds_fp8)
+        tlx.local_store(
+            tlx.local_slice(tlx.local_view(ds_tiles_smem, ds_buf_id), [0, subtile_id], [BLOCK_N1, DS_M_SUB]), ds_fp8)
         ds_scale_packed = ds_scale.reshape([REP_N, 4, 32, REP_M, 4 // DS_NUM_SUBS]).permute(0, 3, 2, 1, 4)
         tlx.local_store(
-            tlx.local_slice(ds_scale_smem[0], [0, 0, 0, 0, subtile_id], [REP_N, REP_M, 32, 4, 4 // DS_NUM_SUBS]),
+            tlx.local_slice(tlx.local_view(ds_scale_smem, 0), [0, 0, 0, 0, subtile_id],
+                            [REP_N, REP_M, 32, 4, 4 // DS_NUM_SUBS]),
             ds_scale_packed,
         )
         ds_dq_fp8, ds_scale_dq = _to_mxfp8_block(
@@ -1364,10 +1368,14 @@ def _softmax_recompute_quantization_iter(
             VEC_SIZE,
             p_dtype,
         )
-        tlx.local_store(tlx.local_slice(ds_dq_tiles_smem[ds_buf_id], [subtile_id, 0], [DS_M_SUB, BLOCK_N1]), ds_dq_fp8)
+        tlx.local_store(
+            tlx.local_slice(tlx.local_view(ds_dq_tiles_smem, ds_buf_id), [subtile_id, 0], [DS_M_SUB, BLOCK_N1]),
+            ds_dq_fp8,
+        )
         ds_scale_dq_packed = ds_scale_dq.reshape([REP_M, 4 // DS_NUM_SUBS, 32, REP_N, 4]).permute(0, 3, 2, 1, 4)
         tlx.local_store(
-            tlx.local_slice(ds_scale_dq_smem[0], [0, 0, 0, subtile_id, 0], [REP_N, REP_M, 32, 4 // DS_NUM_SUBS, 4]),
+            tlx.local_slice(tlx.local_view(ds_scale_dq_smem, 0), [0, 0, 0, subtile_id, 0],
+                            [REP_N, REP_M, 32, 4 // DS_NUM_SUBS, 4]),
             ds_scale_dq_packed,
         )
         if subtile_id == DS_NUM_SUBS - 1:
