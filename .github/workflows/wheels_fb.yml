@@ -1,0 +1,105 @@
+name: Wheels (fbtriton)
+# Builds fbtriton manylinux wheels (x86_64 + aarch64) for each supported
+# CPython ABI on GitHub-hosted runners. Smoke-tests each wheel by importing it
+# inside the per-ABI venv that cibuildwheel creates. No publish step — wheel
+# artifacts are uploaded for download via 'gh run download'. Reused by
+# publish_fbtriton.yml via `workflow_call`.
+#
+# This is the Meta-fork-only build. The upstream `wheels.yml` is left
+# untouched so it stays trivially mergeable from triton-lang/triton.
+#
+# Trigger via:
+#   gh workflow run wheels_fb.yml -R facebookexperimental/triton
+# Or by editing this file in a PR.
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  pull_request:
+    paths:
+      - .github/workflows/wheels_fb.yml
+
+permissions: read-all
+
+jobs:
+  build:
+    name: Build wheel ${{ matrix.python }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04' }}
+    timeout-minutes: 90
+
+    strategy:
+      # Don't cancel sibling builds when one fails — we want to see which
+      # ABIs/arches work and which break.
+      fail-fast: false
+      matrix:
+        python: [cp313]
+        arch: [x86_64]
+        # python: [cp310, cp311, cp312, cp313, cp314]
+        # arch: [x86_64, aarch64]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # Tag-triggered builds (via publish.yml) need a clean PEP 440 version
+      # (no +gitHASH suffix) for PyPI. Bypass setup.py's dynamic version
+      # logic (get_git_version_suffix + TRITON_WHEEL_VERSION_SUFFIX) by
+      # hardcoding TRITON_VERSION from the tag — same approach as upstream
+      # triton-lang/triton's create_release.yml.
+      #   v3.6.0          → 3.6.0
+      #   v3.6.0-rc1      → 3.6.0rc1     (PEP 440 drops the dash)
+      #   v3.6.0.dev123   → 3.6.0.dev123
+      - name: Pin TRITON_VERSION from tag for PyPI (tag builds only)
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          base="${GITHUB_REF_NAME#v}"
+          base="${base/-rc/rc}"
+          sed -i "s:^TRITON_VERSION = .*:TRITON_VERSION = '${base}':" setup.py
+          grep '^TRITON_VERSION' setup.py
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Build wheel via cibuildwheel
+        run: |
+          python3 -m pip install --upgrade cibuildwheel
+
+          # This fork always publishes as 'fbtriton' — hard-code it so PR
+          # and cron CI exercise the exact wheel layout the publish flow ships.
+          # LDFLAGS strips debug symbols from libtriton.so at link time, cutting
+          # the wheel size roughly in half (the static LLVM/MLIR blob is the
+          # bulk of it).
+          export CIBW_ENVIRONMENT="\
+            MAX_JOBS=4 \
+            TRITON_BUILD_WITH_CLANG_LLD=1 \
+            TRITON_WHEEL_NAME=fbtriton \
+            LDFLAGS=-Wl,--strip-all"
+          export CIBW_BEFORE_ALL="dnf install clang lld -y"
+
+          if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
+            export CIBW_MANYLINUX_X86_64_IMAGE="quay.io/pypa/manylinux_2_28_x86_64:latest"
+          else
+            export CIBW_MANYLINUX_AARCH64_IMAGE="quay.io/pypa/manylinux_2_28_aarch64:latest"
+          fi
+          export CIBW_BUILD="${{ matrix.python }}-manylinux_${{ matrix.arch }}"
+
+          # Defensive: tell auditwheel not to follow libtriton.so's deps into
+          # triton.libs/. Currently a no-op because TRITON_BUILD_WITH_CLANG_LLD=1
+          # links LLVM/MLIR statically into libtriton.so, so it has no exotic
+          # shared deps to bundle. Kept so a future switch to dynamic LLVM
+          # linking doesn't silently bloat the wheel by 100+ MB.
+          export CIBW_REPAIR_WHEEL_COMMAND_LINUX="auditwheel repair --exclude libtriton.so -w {dest_dir} {wheel}"
+
+          # Smoke-test: import the freshly-built wheel inside the per-ABI venv
+          # cibuildwheel creates. CPU-only — GPU correctness is covered by
+          # h100.yml / mi350.yml, which build from source on real hardware.
+          export CIBW_TEST_COMMAND='python -c "import triton; print(\"OK\", triton.__version__)"'
+
+          python3 -m cibuildwheel . --output-dir wheelhouse
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: wheels-${{ matrix.python }}-manylinux_2_28_${{ matrix.arch }}
+          path: ./wheelhouse/*.whl
+          if-no-files-found: error
