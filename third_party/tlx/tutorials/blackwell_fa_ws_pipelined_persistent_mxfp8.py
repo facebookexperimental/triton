@@ -2380,40 +2380,6 @@ def _attn_bwd_mxf8_ws(
                     [sf_off_seq_h, kv_scale_n.to(tl.int32), 0, 0, 0],
                     k_fulls[kv_buf_id],
                 )
-                tlx.barrier_wait(k_dq_empties[kv_buf_id], kv_phase ^ 1)
-                tlx.barrier_expect_bytes(
-                    k_dq_fulls[kv_buf_id],
-                    (K_BYTES * BLOCK_N1 * HEAD_DIM) + SCALE_BYTES,
-                )
-                tlx.async_descriptor_load(
-                    desc_k_dq,
-                    k_dq_smem[kv_buf_id],
-                    [(base_kv + start_n).to(tl.int32), 0],
-                    k_dq_fulls[kv_buf_id],
-                )
-                tlx.async_descriptor_load(
-                    desc_k_dq_scale,
-                    k_scale_dq_smem[kv_buf_id],
-                    [sf_off_seq_h, 0, kv_scale_n.to(tl.int32), 0, 0],
-                    k_dq_fulls[kv_buf_id],
-                )
-
-                # Load V data + scale
-                # Share 1 barrier
-                tlx.barrier_expect_bytes(v_fulls[kv_buf_id], K_BYTES * BLOCK_N1 * HEAD_DIM + SCALE_BYTES)
-                tlx.async_descriptor_load(
-                    desc_v,
-                    v_smem[kv_buf_id],
-                    [(base_kv + start_n).to(tl.int32), 0],
-                    v_fulls[kv_buf_id],
-                )
-                tlx.async_descriptor_load(
-                    desc_v_scale,
-                    v_scale_smem[kv_buf_id],
-                    [sf_off_seq_h, kv_scale_n.to(tl.int32), 0, 0, 0],
-                    v_fulls[kv_buf_id],
-                )
-
                 # Load first Q + scale
                 curr_m = 0
                 q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
@@ -2431,6 +2397,22 @@ def _attn_bwd_mxf8_ws(
                     q_scale_smem[q_buf_id],
                     [sf_off_seq_h, q_scale_m, 0, 0, 0],
                     q_fulls[q_buf_id],
+                )
+
+                # Load V data + scale
+                # Share 1 barrier
+                tlx.barrier_expect_bytes(v_fulls[kv_buf_id], K_BYTES * BLOCK_N1 * HEAD_DIM + SCALE_BYTES)
+                tlx.async_descriptor_load(
+                    desc_v,
+                    v_smem[kv_buf_id],
+                    [(base_kv + start_n).to(tl.int32), 0],
+                    v_fulls[kv_buf_id],
+                )
+                tlx.async_descriptor_load(
+                    desc_v_scale,
+                    v_scale_smem[kv_buf_id],
+                    [sf_off_seq_h, kv_scale_n.to(tl.int32), 0, 0, 0],
+                    v_fulls[kv_buf_id],
                 )
 
                 # Load first dO + scale
@@ -2469,6 +2451,23 @@ def _attn_bwd_mxf8_ws(
                     do_scale_dv_smem[do_buf_id],
                     [sf_off_seq_h, 0, do_scale_m, 0, 0],
                     do_dv_fulls[do_buf_id],
+                )
+                tlx.barrier_wait(k_dq_empties[kv_buf_id], kv_phase ^ 1)
+                tlx.barrier_expect_bytes(
+                    k_dq_fulls[kv_buf_id],
+                    (K_BYTES * BLOCK_N1 * HEAD_DIM) + SCALE_BYTES,
+                )
+                tlx.async_descriptor_load(
+                    desc_k_dq,
+                    k_dq_smem[kv_buf_id],
+                    [(base_kv + start_n).to(tl.int32), 0],
+                    k_dq_fulls[kv_buf_id],
+                )
+                tlx.async_descriptor_load(
+                    desc_k_dq_scale,
+                    k_scale_dq_smem[kv_buf_id],
+                    [sf_off_seq_h, 0, kv_scale_n.to(tl.int32), 0, 0],
+                    k_dq_fulls[kv_buf_id],
                 )
                 curr_m += BLOCK_M1
                 blk_idx += 1
