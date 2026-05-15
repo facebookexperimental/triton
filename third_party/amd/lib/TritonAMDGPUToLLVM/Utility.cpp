@@ -2,7 +2,6 @@
 #include "AsyncUtility.h"
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "TritonAMDGPUToLLVM/GCNAsmFormat.h"
-#include "TritonAMDGPUToLLVM/TargetUtils.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -13,8 +12,7 @@
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 namespace tt = mlir::triton;
 using mlir::triton::ModuleAxisInfoAnalysis;
-using mlir::triton::AMD::DppCtrl;
-using mlir::triton::AMD::ISAFamily;
+using mlir::triton::amdgpu::ISAFamily;
 using mlir::triton::gpu::appendOrGetExternFuncOp;
 
 namespace mlir::LLVM::AMD {
@@ -142,13 +140,14 @@ Value shuffleCommonImpl(Location loc, RewriterBase &rewriter,
       return static_cast<DppCtrl>(ctrlBits);
     };
 
-    if (isRDNA(isaFamily) || isaFamily == ISAFamily::GFX1250) {
+    if (triton::amdgpu::isRDNA(isaFamily) || isaFamily == ISAFamily::GFX1250) {
       if (mask < 16)
         return emitDpp(loc, rewriter, val, val,
                        makeDppCtrl(DppCtrl::ROW_XMASK0, mask));
       else if (mask < 32)
         return emitPermlaneX16Xor(loc, rewriter, val, mask & 0xf);
-    } else if ((isCDNA(isaFamily) || isaFamily == ISAFamily::GCN5_1) &&
+    } else if ((triton::amdgpu::isCDNA(isaFamily) ||
+                isaFamily == ISAFamily::GCN5_1) &&
                mask < 16) {
       Value result = val;
       uint32_t highBitsDppBasis = 0;
@@ -559,6 +558,92 @@ static int32_t getCtrlBitsForCacheModifierOnRDNA3(triton::CacheModifier cm,
   return aux;
 }
 
+// Create the auxiliary/cache policy value for GFX12 family
+// ROCDL::RawPtrBufferLoad/StoreOp Vector Memory instructions (Flat, Global,
+// Scratch, and Buffer). These instructions have 2 control bits for scope and 3
+// control bits for temporal hint:
+// - SCOPE[1:0] System Cache level:
+//    0 CU  Coherent among all CU/WG threads in L1 cache
+//    1 SE  Coherent among all clients (threads) sharing a SE-cache(L2)
+//    2 DEV Coherent among all threads on the same device
+//    3 SYS Coherent in system
+// - TH[2:0] Temporal Hint for load:
+//    0 RT    regular temporal for both near and far caches
+//    1 NT    non-temporal (re-use not expected) for both near and far caches
+//    2 HT    High-priority temporal for both near and far caches
+//    3 LU    Last-use (non-temporal AND discard dirty if it hits)
+//    4 NT_RT non-temporal for near cache(s) and regular for far caches
+//    5 RT_NT regular for near cache(s) and non-temporal for far caches
+//    6 NT_HT non-temporal for near cache(s) and high-priority for far caches
+//    7       reserved
+// - TH[2:0] Temporal Hint for store:
+//    0 RT    regular temporal for both near and far caches
+//    1 NT    non-temporal (re-use not expected) for both near and far caches
+//    2 HT    High-priority temporal for both near and far caches
+//    3 WB    Same as "HT", but also overrides wr-rinse in far cache
+//    4 NT_RT non-temporal for near cache(s) and regular for far caches
+//    5 RT_NT regular for near cache(s) and non-temporal for far caches
+//    6 NT_HT non-temporal for near cache(s) and HT for far caches
+//    7 NT_WB non-temporal for near cache(s) and WB for far cache
+//
+// See detailed bit mapping of control bits of CPol enum
+// in llvm source code: llvm/lib/Target/AMDGPU/SIDefines.h
+//
+// Mapping between
+// -------+-----+-------+----+-
+// Op     | cm  | SCOPE | TH |
+// -------+-----+-------+----+-
+// Load   | .ca |  CU   | RT |
+//        | .cg |  DEV  | RT |
+//        | .cs |  CU   | NT |
+//        | .cv |  SYS  | LU | on gfx1250, this combination bypasses all caches
+// -------+-----+-------+----+-
+// Store  | .wb |  CU   | RT |
+//        | .cg |  DEV  | RT |
+//        | .cs |  CU   | NT |
+//        | .wt |  SYS  | RT | behavior for gfx12
+//        | .wt |  SYS  | WB | behavior for gfx1250, bypasses all caches
+// -------+-----+-------+----+-
+static int32_t getCtrlBitsForCacheModifierOn_GFX12(triton::CacheModifier cm,
+                                                   bool isLoad,
+                                                   bool cacheBypassAvailable) {
+  const int scopeShift = 3;
+  const int scopeCU = 0 << scopeShift;
+  const int scopeDev = 2 << scopeShift;
+  const int scopeSys = 3 << scopeShift;
+  const int THRegular = 0;
+  const int THNonTemp = 1;
+  const int THLastUse = 3;
+  const int THWriteBack = 3;
+  int aux = -1;
+  switch (cm) {
+  case triton::CacheModifier::CA:
+    aux = scopeCU | THRegular;
+    break;
+  case triton::CacheModifier::CG:
+    aux = scopeDev | THRegular;
+    break;
+  case triton::CacheModifier::CS:
+    aux = scopeCU | THNonTemp;
+    break;
+  case triton::CacheModifier::CV:
+    assert(isLoad);
+    aux = scopeSys | THLastUse;
+    break;
+  case triton::CacheModifier::WB:
+    assert(!isLoad);
+    aux = scopeCU | THRegular;
+    break;
+  case triton::CacheModifier::WT:
+    assert(!isLoad);
+    aux = scopeSys | (cacheBypassAvailable ? THWriteBack : THRegular);
+    break;
+  default:
+    aux = 0;
+  }
+  return aux;
+}
+
 static int32_t getDefaultCtrlBitsForCacheModifier(triton::CacheModifier cm) {
   return 0;
 }
@@ -574,11 +659,15 @@ int32_t getCtrlBitsForCacheModifierOnTarget(
     triton::CacheModifier cm, bool isLoad,
     const mlir::triton::AMD::TargetInfo &targetInfo) {
   switch (targetInfo.getISAFamily()) {
-  case triton::AMD::ISAFamily::CDNA3:
-  case triton::AMD::ISAFamily::CDNA4:
+  case ISAFamily::CDNA3:
+  case ISAFamily::CDNA4:
     return getCtrlBitsForCacheModifierOn_CDNA3_CDNA4(cm, isLoad);
-  case triton::AMD::ISAFamily::RDNA3:
+  case ISAFamily::RDNA3:
     return getCtrlBitsForCacheModifierOnRDNA3(cm, isLoad);
+  case ISAFamily::RDNA4:
+    return getCtrlBitsForCacheModifierOn_GFX12(cm, isLoad, /*$ bypass*/ false);
+  case ISAFamily::GFX1250:
+    return getCtrlBitsForCacheModifierOn_GFX12(cm, isLoad, /*$ bypass*/ true);
   default:
     return getDefaultCtrlBitsForCacheModifier(cm);
   }
@@ -709,7 +798,7 @@ bool canLoadDirectToLDS(const triton::AMD::TargetInfo &targetInfo,
     // Without scattering support, padding can only be inserted at warp
     // boundaries. This means minInterval must be a multiple of (vectorSize *
     // warpSize) which becomes vectorSize <= minInterval / warpSize.
-    if (!targetInfo.supportsDirectToLDSScattering())
+    if (!targetInfo.supportsDirectToLdsScatter())
       maxAllowedVecSize = paddedEnc.getMinInterval() / targetInfo.getWarpSize();
 
     vectorSize = std::min(vectorSize, maxAllowedVecSize);
@@ -723,7 +812,7 @@ bool canLoadDirectToLDS(const triton::AMD::TargetInfo &targetInfo,
   }
 
   // Following checks are specific to architectures not supporting scattering
-  if (targetInfo.supportsDirectToLDSScattering())
+  if (targetInfo.supportsDirectToLdsScatter())
     return true;
 
   // Must support the full vector width; splitting would cause strided writes.

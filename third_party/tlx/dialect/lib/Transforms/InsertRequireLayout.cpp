@@ -601,12 +601,12 @@ static Attribute chooseTDMBufEncoding(Operation *tdmOp, Value buf,
   Attribute encoding;
   if (allowDotAware) {
     if (auto info = findDotConsumer(buf, solver)) {
-      auto archStr = getAMDArch(tdmOp->getParentOfType<ModuleOp>());
-      auto targetInfo = tt::AMD::TargetInfo(archStr.value_or("").str());
+      amdgpu::TargetFeatures targetFeatures(
+          getAMDArch(tdmOp->getParentOfType<ModuleOp>()));
       // bufType (MemDescType) carries the alloc's CGA layout; the descriptor
       // type is still un-encoded at this point.
       encoding =
-          composePaddedLayout(targetInfo, info->opIdx, info->kWidth,
+          composePaddedLayout(targetFeatures, info->opIdx, info->kWidth,
                               cast<ttg::TensorOrMemDesc>(bufType), order);
     }
   }

@@ -133,13 +133,13 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
       });
 
   addDynamicallyLegalOp<triton::FuncOp>([](triton::FuncOp funcOp) -> bool {
-    for (auto arg : funcOp.getArguments()) {
-      if (auto tensor = dyn_cast<RankedTensorType>(arg.getType())) {
-        if (!tensor.getEncoding())
-          return false;
-      }
-    }
-    return true;
+    auto check = [](auto types) {
+      return llvm::all_of(types, [](auto type) {
+        auto tensor = dyn_cast<RankedTensorType>(type);
+        return !tensor || tensor.getEncoding();
+      });
+    };
+    return check(funcOp.getArgumentTypes()) && check(funcOp.getResultTypes());
   });
 }
 
