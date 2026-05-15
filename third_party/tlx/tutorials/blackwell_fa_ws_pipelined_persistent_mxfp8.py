@@ -122,6 +122,15 @@ def _split_n(x, SPLIT_FACTOR: tl.constexpr):
 
 
 @triton.jit
+def _split_n_1d(x, SPLIT_FACTOR: tl.constexpr):
+    if SPLIT_FACTOR == 1:
+        return (x, )
+    else:
+        x0, x1 = x.reshape([2, x.shape[0] // 2]).permute(1, 0).split()
+        return _split_n_1d(x0, SPLIT_FACTOR // 2) + _split_n_1d(x1, SPLIT_FACTOR // 2)
+
+
+@triton.jit
 def _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE: tl.constexpr):
     if STAGE == 1:
         # First part of STAGE == 3 in _get_fused_loop_bounds
@@ -1312,9 +1321,13 @@ def _softmax_recompute_quantization_iter(
     qkT = tlx.local_load(tlx.local_view(qk_tiles, 0))
     tlx.barrier_arrive(qk_empties[0])
     qkT_slices = _split_n(qkT, DS_NUM_SUBS)
+    offs_m = curr_m + tl.arange(0, BLOCK_M1)
+    m = tl.load(M_off + offs_m)
+    Di = tl.load(D_off + offs_m)
+    m_slices = _split_n_1d(m, DS_NUM_SUBS)
+    di_slices = _split_n_1d(Di, DS_NUM_SUBS)
     for subtile_id in tl.static_range(DS_NUM_SUBS):
-        offs_m = curr_m + tl.arange(subtile_id * DS_M_SUB, (subtile_id + 1) * DS_M_SUB)
-        m = tl.load(M_off + offs_m)
+        m = m_slices[subtile_id]
 
         qkT_scaled = qkT_slices[subtile_id] * qk_scale - m[None, :]
         # Clamp to prevent FP32 overflow downstream in P*dP
@@ -1342,7 +1355,7 @@ def _softmax_recompute_quantization_iter(
         if subtile_id == DS_NUM_SUBS - 1:
             tlx.barrier_arrive(p_fulls[0])
         # Finish dS for the previous M-block.
-        Di = tl.load(D_off + offs_m)
+        Di = di_slices[subtile_id]
         if subtile_id == 0:
             tlx.barrier_wait(dp_fulls[0], tmem_phase)
         dpT = tlx.local_load(tlx.subslice(tlx.local_view(dp_tiles, 0), DS_M_SUB * subtile_id, DS_M_SUB))
