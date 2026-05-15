@@ -609,6 +609,7 @@ def _quantize_mxfp8_bwd_operand(ref, dtype, transpose_for_reduction=False):
         scale = swizzled_to_tma_preshuffled(mx.scale, N_CTX, HEAD_DIM, 32, Z * H)
     return data, scale
 
+
 def _cosine_similarity(actual: torch.Tensor, expected: torch.Tensor) -> float:
     actual_flat = actual.float().reshape(-1)
     expected_flat = expected.float().reshape(-1)
@@ -631,10 +632,8 @@ def _assert_close_with_cosine(
     cosine = _cosine_similarity(actual, expected)
     # TODO: Enable testing?
     # torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
-    assert cosine >= min_cosine, (
-        f"{label} cosine_similarity={cosine:.6f} fell below "
-        f"min_cosine={min_cosine:.6f}"
-    )
+    assert cosine >= min_cosine, (f"{label} cosine_similarity={cosine:.6f} fell below "
+                                  f"min_cosine={min_cosine:.6f}")
 
 @pytest.mark.parametrize(
     "Z,H,N_CTX",
@@ -661,29 +660,20 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
     bwd_min_cosine: float = 0.98
     torch.manual_seed(20)
 
-    (q, q_scale, q_ref), (k, k_scale, k_ref), (v, v_scale, v_ref) = (
-        _generate_mxfp8_attention_inputs(shape, DEVICE, dtype)
-    )
+    (q, q_scale, q_ref), (k, k_scale, k_ref), (v, v_scale,
+                                               v_ref) = (_generate_mxfp8_attention_inputs(shape, DEVICE, dtype))
     q_ref = q_ref.detach().requires_grad_(True)
     k_ref = k_ref.detach().requires_grad_(True)
     v_ref = v_ref.detach().requires_grad_(True)
-    ref_out = torch.nn.functional.scaled_dot_product_attention(
-        q_ref, k_ref, v_ref, scale=sm_scale, is_causal=False
-    )
+    ref_out = torch.nn.functional.scaled_dot_product_attention(q_ref, k_ref, v_ref, scale=sm_scale, is_causal=False)
     do_bf16 = torch.randn_like(ref_out)
     ref_out.backward(do_bf16)
 
-    q_dk, q_scale_dk = _quantize_mxfp8_bwd_operand(
-        q_ref.detach(), dtype, transpose_for_reduction=True
-    )
-    k_dq, k_scale_dq = _quantize_mxfp8_bwd_operand(
-        k_ref.detach(), dtype, transpose_for_reduction=True
-    )
+    q_dk, q_scale_dk = _quantize_mxfp8_bwd_operand(q_ref.detach(), dtype, transpose_for_reduction=True)
+    k_dq, k_scale_dq = _quantize_mxfp8_bwd_operand(k_ref.detach(), dtype, transpose_for_reduction=True)
     v_bwd, v_scale_bwd = _quantize_mxfp8_bwd_operand(v_ref.detach(), dtype)
     do_fp8, do_scale = _quantize_mxfp8_bwd_operand(do_bf16, dtype)
-    do_fp8_dv, do_scale_dv = _quantize_mxfp8_bwd_operand(
-        do_bf16, dtype, transpose_for_reduction=True
-    )
+    do_fp8_dv, do_scale_dv = _quantize_mxfp8_bwd_operand(do_bf16, dtype, transpose_for_reduction=True)
 
     fwd_config = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent_mxfp8"]
     y_dim = Z * H * N_CTX
@@ -691,18 +681,10 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
     M = torch.empty((Z, H, N_CTX), device=DEVICE, dtype=torch.float32)
     dummy_block = [1, 1]
     dummy_5d = [1, 1, 1, 1, 1]
-    desc_q = TensorDescriptor(
-        q, shape=[y_dim, head_dim], strides=[head_dim, 1], block_shape=dummy_block
-    )
-    desc_k = TensorDescriptor(
-        k, shape=[y_dim, head_dim], strides=[head_dim, 1], block_shape=dummy_block
-    )
-    desc_v = TensorDescriptor(
-        v, shape=[y_dim, head_dim], strides=[head_dim, 1], block_shape=dummy_block
-    )
-    desc_o = TensorDescriptor(
-        o, shape=[y_dim, head_dim], strides=[head_dim, 1], block_shape=dummy_block
-    )
+    desc_q = TensorDescriptor(q, shape=[y_dim, head_dim], strides=[head_dim, 1], block_shape=dummy_block)
+    desc_k = TensorDescriptor(k, shape=[y_dim, head_dim], strides=[head_dim, 1], block_shape=dummy_block)
+    desc_v = TensorDescriptor(v, shape=[y_dim, head_dim], strides=[head_dim, 1], block_shape=dummy_block)
+    desc_o = TensorDescriptor(o, shape=[y_dim, head_dim], strides=[head_dim, 1], block_shape=dummy_block)
     desc_q_scale = TensorDescriptor.from_tensor(q_scale, block_shape=dummy_5d)
     desc_k_scale = TensorDescriptor.from_tensor(k_scale, block_shape=dummy_5d)
     desc_v_scale = TensorDescriptor.from_tensor(v_scale, block_shape=dummy_5d)

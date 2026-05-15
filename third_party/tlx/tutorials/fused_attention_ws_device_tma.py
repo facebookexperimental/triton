@@ -947,8 +947,8 @@ configs_bwd_subtile_opt = [
 ]
 
 configs_bwd_persist = [
-     triton.Config(
-         {
+    triton.Config(
+        {
             "BLOCK_M1": 128,
             "BLOCK_N1": 128,
             "BLOCK_M2": 128,
@@ -1007,7 +1007,7 @@ configs_bwd_persist = [
         num_warps=4,
         num_stages=2,
         pre_hook=_bwd_host_descriptor_pre_hook,
-     ),
+    ),
 ]
 
 
