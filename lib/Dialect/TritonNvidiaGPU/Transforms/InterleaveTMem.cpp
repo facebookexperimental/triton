@@ -3,8 +3,10 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/AddressRanges.h"
 #include "llvm/Support/Debug.h"
+#include <cstdlib>
 
 #define DEBUG_TYPE "triton-nvidia-interleave-tmem"
 
@@ -13,6 +15,11 @@ namespace ttg = mlir::triton::gpu;
 namespace mlir {
 namespace triton {
 namespace nvidia_gpu {
+
+inline bool isWSBarrierReorderEnabled() {
+  auto disableReorder = triton::tools::getBoolEnv("TRITON_DISABLE_WSBARRIER_REORDER");
+  return !disableReorder;
+}
 
 #define GEN_PASS_DEF_TRITONNVIDIAGPUINTERLEAVETMEMPASS
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h.inc"
@@ -213,8 +220,15 @@ bool sinkOps(Value buffer, ArrayRef<Operation *> useChain,
         break;
       }
     }
-    if (!canAdvanceWSBarrier(opConstraints, next))
-      break;
+    if (isWSBarrierReorderEnabled()) {
+      if (!canAdvanceWSBarrier(opConstraints, next))
+        break;
+    } else {
+      // Legacy safe behavior: don't sink past barrier signals, since they
+      // may guard the liverange of the buffer.
+      if (isa<ArriveBarrierOp>(next))
+        break;
+    }
     if (!isMemoryEffectFree(next)) {
       SmallVector<MemoryEffects::EffectInstance> effects;
       collectEffects(next, effects);
@@ -284,22 +298,26 @@ struct TritonNvidiaGPUInterleaveTMemPass
 
     // Step 1: Record which memory op each WS barrier guards.
     SmallVector<DenseMap<Operation *, Operation *>> barrierMaps;
-    m.walk([&](Block *block) {
-      if (!hasTMEMLoad(block))
-        return;
-      auto map = buildBarrierToMemoryOpMap(*block);
-      if (!map.empty())
-        barrierMaps.push_back(std::move(map));
-    });
+    if (isWSBarrierReorderEnabled()) {
+      m.walk([&](Block *block) {
+        if (!hasTMEMLoad(block))
+          return;
+        auto map = buildBarrierToMemoryOpMap(*block);
+        if (!map.empty())
+          barrierMaps.push_back(std::move(map));
+      });
+    }
 
     // Step 2: Reorder WS barriers. Pushes arrives down and pulls waits up
     // past barriers from independent channels, unblocking tmem_load sinking.
-    m.walk([&](Block *block) {
-      if (!hasTMEMLoad(block))
-        return;
-      sinkWSArrives(*block);
-      raiseWSWaits(*block);
-    });
+    if (isWSBarrierReorderEnabled()) {
+      m.walk([&](Block *block) {
+        if (!hasTMEMLoad(block))
+          return;
+        sinkWSArrives(*block);
+        raiseWSWaits(*block);
+      });
+    }
 
     // Build memOp → channelGraph constraints. For each arrive barrier with
     // constraints, scan backward and assign its constraints to ALL tmem_loads
@@ -307,20 +325,22 @@ struct TritonNvidiaGPUInterleaveTMemPass
     // wait or block start). This ensures all split tmem_loads inherit the
     // channelGraph, not just the one nearest to the arrive.
     DenseMap<Operation *, DictionaryAttr> memOpConstraints;
-    m.walk([&](ArriveBarrierOp arrive) {
-      if (!hasTMEMLoad(arrive->getBlock()))
-        return;
-      auto constraints = arrive.getConstraints();
-      if (!hasWSBarrierConstraints(constraints))
-        return;
-      DictionaryAttr dict = *constraints;
-      for (auto *cur = arrive->getPrevNode(); cur; cur = cur->getPrevNode()) {
-        if (!canAdvanceWSBarrier(constraints, cur))
-          break;
-        if (isa<TMEMLoadOp>(cur))
-          memOpConstraints[cur] = dict;
-      }
-    });
+    if (isWSBarrierReorderEnabled()) {
+      m.walk([&](ArriveBarrierOp arrive) {
+        if (!hasTMEMLoad(arrive->getBlock()))
+          return;
+        auto constraints = arrive.getConstraints();
+        if (!hasWSBarrierConstraints(constraints))
+          return;
+        DictionaryAttr dict = *constraints;
+        for (auto *cur = arrive->getPrevNode(); cur; cur = cur->getPrevNode()) {
+          if (!canAdvanceWSBarrier(constraints, cur))
+            break;
+          if (isa<TMEMLoadOp>(cur))
+            memOpConstraints[cur] = dict;
+        }
+      });
+    }
 
     // Step 3: Sink tmem_loads closer to their uses.
     SmallVector<std::pair<Operation *, Value>> opsToSink;
