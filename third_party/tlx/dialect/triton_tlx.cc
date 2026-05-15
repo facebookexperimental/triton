@@ -581,6 +581,11 @@ void init_triton_tlx_ir(py::module &&m) {
               std::vector<int32_t> order) -> mlir::Value {
              return self.create<ttg::MemDescTransOp>(arg, order);
            })
+      .def("create_memdesc_reshape",
+           [](TritonOpBuilder &self, Value &src,
+              std::vector<int64_t> shape) -> mlir::Value {
+             return self.create<ttg::MemDescReshapeOp>(src, shape);
+           })
       .def("create_memdesc_reinterpret",
            [](TritonOpBuilder &self, Value &src, Type &newElementType,
               std::vector<int64_t> newShape) -> mlir::Value {

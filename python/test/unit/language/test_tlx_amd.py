@@ -1025,6 +1025,53 @@ def test_local_alloc_padded_layout_compiles_gfx1250(device):
     assert "32:+4" in ttgir
 
 
+@triton.jit
+def _local_reshape_kernel(
+    input_ptr,
+    output_ptr,
+    ROWS: tl.constexpr,
+    COLS: tl.constexpr,
+):
+    offsets = tl.arange(0, ROWS * COLS)
+    values = tl.load(input_ptr + offsets)
+
+    flat_buffers = tlx.local_alloc((ROWS * COLS, ), tl.float32, 1)
+    flat = tlx.local_view(flat_buffers, 0)
+    tlx.local_store(flat, values)
+
+    reshaped = tlx.local_reshape(flat, [ROWS, COLS])
+    result = tlx.local_load(reshaped)
+
+    offs_m = tl.arange(0, ROWS)
+    offs_n = tl.arange(0, COLS)
+    output_offsets = offs_m[:, None] * COLS + offs_n[None, :]
+    tl.store(output_ptr + output_offsets, result)
+
+
+def test_local_reshape_compiles_gfx1250(device):
+    """tlx.local_reshape should lower to ttg.memdesc_reshape and compile."""
+    compiled = compile_for_gfx1250(
+        _local_reshape_kernel,
+        signature={"input_ptr": "*fp32", "output_ptr": "*fp32"},
+        constexprs={"ROWS": 8, "COLS": 8},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "ttg.memdesc_reshape" in ttgir, ("expected memdesc_reshape in TTGIR, got:\n" + ttgir)
+    assert "amdgcn" in compiled.asm
+    assert len(compiled.asm["amdgcn"]) > 0
+
+
+def test_local_reshape_correctness_gfx1250(device):
+    """End-to-end: local_reshape reinterprets a flat LDS buffer as a 2D tile."""
+    if not is_gfx1250_available():
+        pytest.skip("Requires gfx1250 hardware")
+    rows, cols = 8, 8
+    inp = torch.arange(rows * cols, dtype=torch.float32, device=device)
+    out = torch.empty((rows, cols), dtype=torch.float32, device=device)
+    _local_reshape_kernel[(1, )](inp, out, ROWS=rows, COLS=cols)
+    torch.testing.assert_close(out, inp.reshape(rows, cols))
+
+
 # ----------------------------------------------------------------------------
 # gfx1250 AMD descriptor store tests
 # ----------------------------------------------------------------------------
