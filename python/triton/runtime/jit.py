@@ -26,6 +26,26 @@ try:
 except ImportError:
     native_create_jit_proxy = None
 
+# Fast tensor access API — lazily registered on first use.
+# Provides ~10x faster dtype/data_ptr extraction via direct C struct access.
+_torch_bridge_loaded = False
+_torch_bridge_init_done = False
+
+
+def _ensure_torch_bridge():
+    global _torch_bridge_loaded, _torch_bridge_init_done
+    if _torch_bridge_init_done:
+        return
+    _torch_bridge_init_done = True
+    try:
+        from triton._C.libtriton import register_tensor_access_api
+        from triton._C._torch_bridge import get_tensor_access_capsule
+        register_tensor_access_api(get_tensor_access_capsule())
+        _torch_bridge_loaded = True
+    except (ImportError, AttributeError):
+        pass
+
+
 TRITON_MODULE = "triton.language"
 GLUON_MODULE = "triton.experimental.gluon.language"
 
@@ -937,6 +957,8 @@ class JITFunction(JITCallable, KernelInterface[T]):
         self._repr = repr
         self.launch_metadata = launch_metadata
         self.c_cache = c_cache
+        if c_cache:
+            _ensure_torch_bridge()
         # Register for simple deserialization of JITFunction constants
         _triton_jit_function_registry[f"{self.module}:{self.fn.__qualname__}"] = self
 
