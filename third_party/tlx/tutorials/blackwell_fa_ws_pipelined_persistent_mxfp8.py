@@ -87,6 +87,26 @@ def _mul_f32x2(a, b):
 
 
 @triton.jit
+def _sub_f32x2(a, b):
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 ra, rb, rc;
+            mov.b64 ra, { $2, $3 };
+            mov.b64 rb, { $4, $5 };
+            sub.f32x2 rc, ra, rb;
+            mov.b64 { $0, $1 }, rc;
+        }
+        """,
+        "=r,=r,r,r,r,r",
+        [a, b],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=2,
+    )
+
+
+@triton.jit
 def _reduce_or(x, y):
     return x | y
 
@@ -1364,7 +1384,7 @@ def _softmax_recompute_quantization_iter(
         if subtile_id == DS_NUM_SUBS - 1:
             tlx.barrier_arrive(dp_empties[0])
 
-        dsT = _mul_f32x2(pT, (dpT - Di[None, :]))
+        dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
         # NaN sanitization (boundary tiles)
         dsT = tl.where(dsT == dsT, dsT, 0.0)
         # Quantize dS twice: dK consumes dS^T, while dQ consumes dS
@@ -1991,7 +2011,7 @@ def _attn_bwd_mxf8_ws(
             tlx.async_descriptor_store_wait(0)
 
         # ----- Reduction warp: TMA atomic-reduce-add of dQ to GMEM -----
-        with tlx.async_task(num_warps=4, registers=88):
+        with tlx.async_task(num_warps=4, registers=112):
             blk_idx = 0
             for _i in range(tiles_per_sm):
                 off_seq_h = tile_idx // n_tile_num
