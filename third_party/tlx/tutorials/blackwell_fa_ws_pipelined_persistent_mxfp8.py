@@ -1271,10 +1271,10 @@ def _softmax_recompute_quantization_iter(
     dp_tiles,
     dp_fulls,
     dp_empties,
-    ds_tiles_smem_subtile,
-    ds_dq_tiles_smem_subtile,
-    ds_scale_smem_subtile,
-    ds_scale_dq_smem_subtile,
+    ds_tiles_smem,
+    ds_dq_tiles_smem,
+    ds_scale_smem,
+    ds_scale_dq_smem,
     ds_fulls,
     ds_empties,
     NUM_BUFFERS_TMEM: tl.constexpr,
@@ -1353,17 +1353,23 @@ def _softmax_recompute_quantization_iter(
             VEC_SIZE,
             p_dtype,
         )
-        tlx.local_store(tlx.local_view(ds_tiles_smem_subtile, ds_buf_id), ds_fp8)
+        tlx.local_store(tlx.local_slice(ds_tiles_smem[ds_buf_id], [0, subtile_id], [BLOCK_N1, DS_M_SUB]), ds_fp8)
         ds_scale_packed = ds_scale.reshape([REP_N, 4, 32, REP_M, 4 // DS_NUM_SUBS]).permute(0, 3, 2, 1, 4)
-        tlx.local_store(tlx.local_view(ds_scale_smem_subtile, 0), ds_scale_packed)
+        tlx.local_store(
+            tlx.local_slice(ds_scale_smem[0], [0, 0, 0, 0, subtile_id], [REP_N, REP_M, 32, 4, 4 // DS_NUM_SUBS]),
+            ds_scale_packed,
+        )
         ds_dq_fp8, ds_scale_dq = _to_mxfp8_block(
             tl.trans(dsT),
             VEC_SIZE,
             p_dtype,
         )
-        tlx.local_store(tlx.local_view(ds_dq_tiles_smem_subtile, ds_buf_id), ds_dq_fp8)
+        tlx.local_store(tlx.local_slice(ds_dq_tiles_smem[ds_buf_id], [subtile_id, 0], [DS_M_SUB, BLOCK_N1]), ds_dq_fp8)
         ds_scale_dq_packed = ds_scale_dq.reshape([REP_M, 4 // DS_NUM_SUBS, 32, REP_N, 4]).permute(0, 3, 2, 1, 4)
-        tlx.local_store(tlx.local_view(ds_scale_dq_smem_subtile, 0), ds_scale_dq_packed)
+        tlx.local_store(
+            tlx.local_slice(ds_scale_dq_smem[0], [0, 0, 0, subtile_id, 0], [REP_N, REP_M, 32, 4 // DS_NUM_SUBS, 4]),
+            ds_scale_dq_packed,
+        )
         if subtile_id == DS_NUM_SUBS - 1:
             tlx.barrier_arrive(ds_fulls[ds_buf_id])
 
@@ -1744,13 +1750,8 @@ def _attn_bwd_mxf8_ws(
     do_dv_smem = tlx.local_alloc((BLOCK_M1, HEAD_DIM), tlx.dtype_of(desc_do_dv), NUM_BUFFERS_DO)
     # dK consumes dS^T while dQ consumes dS. MXFP8 quantization depends on the
     # reduction axis, so we keep separate internal encodings for the two GEMMs.
-    ds_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
-    ds_tiles_smem = tlx.local_alloc((BLOCK_N1, BLOCK_M1), p_dtype, NUM_BUFFERS_DS, reuse=ds_storage_alias)
-    ds_tiles_smem_subtile = tlx.local_alloc((BLOCK_N1, BLOCK_M1 // DS_NUM_SUBS), p_dtype, NUM_BUFFERS_DS * DS_NUM_SUBS,
-                                            reuse=ds_storage_alias)
-    ds_dq_tiles_smem = tlx.local_alloc((BLOCK_M1, BLOCK_N1), p_dtype, NUM_BUFFERS_DS, reuse=ds_storage_alias)
-    ds_dq_tiles_smem_subtile = tlx.local_alloc((BLOCK_M1 // DS_NUM_SUBS, BLOCK_N1), p_dtype,
-                                               NUM_BUFFERS_DS * DS_NUM_SUBS, reuse=ds_storage_alias)
+    ds_tiles_smem = tlx.local_alloc((BLOCK_N1, BLOCK_M1), p_dtype, NUM_BUFFERS_DS)
+    ds_dq_tiles_smem = tlx.local_alloc((BLOCK_M1, BLOCK_N1), p_dtype, NUM_BUFFERS_DS)
     # SMEM storage spots for dS scales to enable
     # async transfers from SMEM to TMEM.
     # (1, REP_M, REP_HEAD, 2, 256)
@@ -1759,65 +1760,13 @@ def _attn_bwd_mxf8_ws(
         tl.uint8,
         NUM_BUFFERS_TMEM,
         tlx.storage_kind.smem,
-        reuse=ds_storage_alias,
-    )
-    ds_scale_smem_subtile = tlx.local_alloc(
-        (REP_N, REP_M, 32, 4, 4 // DS_NUM_SUBS),
-        tl.uint8,
-        NUM_BUFFERS_TMEM * DS_NUM_SUBS,
-        tlx.storage_kind.smem,
-        reuse=ds_storage_alias,
     )
     ds_scale_dq_smem = tlx.local_alloc(
         (REP_M, REP_N, 32, 4, 4),
         tl.uint8,
         NUM_BUFFERS_TMEM * DS_NUM_SUBS,
         tlx.storage_kind.smem,
-        reuse=ds_storage_alias,
     )
-    ds_scale_dq_smem_subtile = tlx.local_alloc(
-        (REP_M, REP_N, 32, 4 // DS_NUM_SUBS, 4),
-        tl.uint8,
-        NUM_BUFFERS_TMEM,
-        tlx.storage_kind.smem,
-        reuse=ds_storage_alias,
-    )
-    ds_storage_alias.set_buffer_overlap(
-        tlx.reuse_group(
-            tlx.reuse_group(
-                ds_tiles_smem,
-                tlx.reuse_group(
-                    ds_tiles_smem_subtile,
-                    group_size=DS_NUM_SUBS,
-                ),
-                group_type=tlx.reuse_group_type.shared,
-            ),
-            tlx.reuse_group(
-                ds_dq_tiles_smem,
-                tlx.reuse_group(
-                    ds_dq_tiles_smem_subtile,
-                    group_size=DS_NUM_SUBS,
-                ),
-                group_type=tlx.reuse_group_type.shared,
-            ),
-            tlx.reuse_group(
-                ds_scale_smem,
-                tlx.reuse_group(
-                    ds_scale_smem_subtile,
-                    group_size=DS_NUM_SUBS,
-                ),
-                group_type=tlx.reuse_group_type.shared,
-            ),
-            tlx.reuse_group(
-                ds_scale_dq_smem,
-                tlx.reuse_group(
-                    ds_scale_dq_smem_subtile,
-                    group_size=DS_NUM_SUBS,
-                ),
-                group_type=tlx.reuse_group_type.shared,
-            ),
-            group_type=tlx.reuse_group_type.distinct,
-        ))
 
     k_scale_smem = tlx.local_alloc((1, REP_N, REP_HEAD, 2, 256), tl.uint8, NUM_BUFFERS_KV)
     k_scale_dq_smem = tlx.local_alloc((1, REP_HEAD, REP_N, 2, 256), tl.uint8, NUM_BUFFERS_KV)
@@ -1895,10 +1844,10 @@ def _attn_bwd_mxf8_ws(
                     dp_tiles,
                     dp_fulls,
                     dp_empties,
-                    ds_tiles_smem_subtile,
-                    ds_dq_tiles_smem_subtile,
-                    ds_scale_smem_subtile,
-                    ds_scale_dq_smem_subtile,
+                    ds_tiles_smem,
+                    ds_dq_tiles_smem,
+                    ds_scale_smem,
+                    ds_scale_dq_smem,
                     ds_fulls,
                     ds_empties,
                     NUM_BUFFERS_TMEM,
@@ -1933,10 +1882,10 @@ def _attn_bwd_mxf8_ws(
                         dp_tiles,
                         dp_fulls,
                         dp_empties,
-                        ds_tiles_smem_subtile,
-                        ds_dq_tiles_smem_subtile,
-                        ds_scale_smem_subtile,
-                        ds_scale_dq_smem_subtile,
+                        ds_tiles_smem,
+                        ds_dq_tiles_smem,
+                        ds_scale_smem,
+                        ds_scale_dq_smem,
                         ds_fulls,
                         ds_empties,
                         NUM_BUFFERS_TMEM,
