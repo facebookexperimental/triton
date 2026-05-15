@@ -1834,7 +1834,6 @@ def _attn_bwd_mxf8_ws(
         # Default task -- its warp count comes from autotune num_warps (= 4).
         with tlx.async_task("default"):
             blk_idx = 0
-            kv_tile_idx = 0
             for _i in range(tiles_per_sm):
                 _, persistent_tmem_phase = _get_bufidx_phase(_i, NUM_BUFFERS_TMEM)
                 off_seq_h = tile_idx // n_tile_num
@@ -1926,7 +1925,7 @@ def _attn_bwd_mxf8_ws(
                     blk_idx += 1
 
                 # Epilogue: dK / dV TMA store
-                kv_buf_id, kv_phase = _get_bufidx_phase(kv_tile_idx, NUM_BUFFERS_KV)
+                kv_buf_id, kv_phase = _get_bufidx_phase(_i, NUM_BUFFERS_KV)
 
                 tlx.barrier_wait(dv_fulls[0], persistent_tmem_phase)
                 slice_size: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
@@ -1974,7 +1973,6 @@ def _attn_bwd_mxf8_ws(
                             slice_id * slice_size,
                         ],
                     )
-                kv_tile_idx += 1
                 tile_idx += num_progs
             tlx.async_descriptor_store_wait(0)
 
@@ -2025,9 +2023,8 @@ def _attn_bwd_mxf8_ws(
         # ----- MMA warp: 5 blockscaled GEMMs per M-block -----
         with tlx.async_task(num_warps=1, registers=100):
             blk_idx = 0
-            kv_tile_idx = 0
             for _i in range(tiles_per_sm):
-                kv_buf_id, kv_phase = _get_bufidx_phase(kv_tile_idx, NUM_BUFFERS_KV)
+                kv_buf_id, kv_phase = _get_bufidx_phase(_i, NUM_BUFFERS_KV)
                 # --- Prolog: first M-block ---
                 q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
                 do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
@@ -2326,13 +2323,11 @@ def _attn_bwd_mxf8_ws(
                     use_acc=False,
                     mBarriers=[dq_fulls[0], ds_empties[ds_buf_id], k_dq_empties[kv_buf_id]],
                 )
-                kv_tile_idx += 1
                 tile_idx += num_progs
 
         # ----- Load warp: TMA loads of FP8 data + scales -----
         with tlx.async_task(num_warps=1, registers=24):
             blk_idx = 0
-            kv_tile_idx = 0
             for _i in range(tiles_per_sm):
                 off_seq_h = tile_idx // n_tile_num
                 off_z = off_seq_h // H
@@ -2348,7 +2343,7 @@ def _attn_bwd_mxf8_ws(
                 kv_scale_n = pid * REP_N
 
                 # Load K data + scale
-                kv_buf_id, kv_phase = _get_bufidx_phase(kv_tile_idx, NUM_BUFFERS_KV)
+                kv_buf_id, kv_phase = _get_bufidx_phase(_i, NUM_BUFFERS_KV)
                 tlx.barrier_wait(k_empties[kv_buf_id], kv_phase ^ 1)
                 tlx.barrier_expect_bytes(k_fulls[kv_buf_id], (K_BYTES * BLOCK_N1 * HEAD_DIM) + SCALE_BYTES)
                 tlx.async_descriptor_load(
@@ -2556,7 +2551,6 @@ def _attn_bwd_mxf8_ws(
                     [sf_off_seq_h.to(tl.int32), 0, (last_m // 128) * REP_M, 0, 0],
                     q_dk_fulls[last_q_buf_id],
                 )
-                kv_tile_idx += 1
                 tile_idx += num_progs
 
 
