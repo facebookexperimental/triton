@@ -1261,7 +1261,7 @@ def _softmax_recompute_quantization_iter(
     curr_m,
     blk_idx,
     qk_scale,
-    qk_tiles_subtile,
+    qk_tiles,
     qk_fulls,
     qk_empties,
     p_tiles,
@@ -1299,7 +1299,7 @@ def _softmax_recompute_quantization_iter(
         # Read QK from TMEM, apply sm_scale -> P
         if subtile_id == 0:
             tlx.barrier_wait(qk_fulls[0], tmem_phase)
-        qkT = tlx.local_load(qk_tiles_subtile[subtile_id])
+        qkT = tlx.local_load(tlx.subslice(qk_tiles[0], DS_M_SUB * subtile_id, DS_M_SUB))
         # qk_tiles, dp_tiles, dq_tiles all share the same physical
         # TMEM cols 0-127 (qkdp_alias, single-buffered). Force the
         # TMEM read to drain into registers before signaling the
@@ -1460,13 +1460,6 @@ def _attn_bwd_mxf8_ws(
         (BLOCK_N1, BLOCK_M1),
         tl.float32,
         NUM_BUFFERS_TMEM,
-        tlx.storage_kind.tmem,
-        reuse=tmem_storage_alias,
-    )
-    qk_tiles_subtile = tlx.local_alloc(
-        (BLOCK_N1, BLOCK_M1 // DS_NUM_SUBS),
-        tl.float32,
-        NUM_BUFFERS_TMEM * DS_NUM_SUBS,
         tlx.storage_kind.tmem,
         reuse=tmem_storage_alias,
     )
@@ -1684,10 +1677,6 @@ def _attn_bwd_mxf8_ws(
             # enforce that Compute has drained qk/dp before scales overwrite.
             tlx.reuse_group(
                 qk_tiles,
-                tlx.reuse_group(
-                    qk_tiles_subtile,
-                    group_size=DS_NUM_SUBS,
-                ),
                 tlx.reuse_group(
                     p_tiles,
                     v_scale_tmem,
@@ -1907,7 +1896,7 @@ def _attn_bwd_mxf8_ws(
                     curr_m,
                     blk_idx,
                     qk_scale,
-                    qk_tiles_subtile,
+                    qk_tiles,
                     qk_fulls,
                     qk_empties,
                     p_tiles,
@@ -1945,7 +1934,7 @@ def _attn_bwd_mxf8_ws(
                         curr_m,
                         blk_idx,
                         qk_scale,
-                        qk_tiles_subtile,
+                        qk_tiles,
                         qk_fulls,
                         qk_empties,
                         p_tiles,
