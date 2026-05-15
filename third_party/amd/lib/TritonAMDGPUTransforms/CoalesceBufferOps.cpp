@@ -80,6 +80,11 @@ buildBufferOpEncoding(MLIRContext *ctx, Value ptr, Value offsets,
   SmallVector<unsigned> order(rank);
   std::iota(order.begin(), order.end(), 0);
   std::reverse(order.begin(), order.end());
+  if (auto *offsetInfo = axisAnalysis.getAxisInfo(offsets)) {
+    auto offsetTy = cast<RankedTensorType>(offsets.getType());
+    auto contiguity = offsetInfo->getContiguity();
+    order = getOrderFromContiguity(contiguity);
+  }
 
   SmallVector<unsigned> sizePerThread(rank, 1);
   sizePerThread[order[0]] = perThread;
