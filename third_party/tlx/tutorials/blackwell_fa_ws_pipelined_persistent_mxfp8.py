@@ -1268,7 +1268,7 @@ def _softmax_recompute_quantization_iter(
     p_scale_buf,
     p_fulls,
     p_empties,
-    dp_tiles_subtile,
+    dp_tiles,
     dp_fulls,
     dp_empties,
     ds_tiles_smem_subtile,
@@ -1336,7 +1336,7 @@ def _softmax_recompute_quantization_iter(
         Di = tl.load(D_off + offs_m)
         if subtile_id == 0:
             tlx.barrier_wait(dp_fulls[0], tmem_phase)
-        dpT = tlx.local_load(dp_tiles_subtile[subtile_id])
+        dpT = tlx.local_load(tlx.subslice(dp_tiles[0], DS_M_SUB * subtile_id, DS_M_SUB))
         if subtile_id == DS_NUM_SUBS - 1:
             tlx.barrier_arrive(dp_empties[0])
 
@@ -1481,13 +1481,6 @@ def _attn_bwd_mxf8_ws(
         (BLOCK_N1, BLOCK_M1),
         tl.float32,
         NUM_BUFFERS_TMEM,
-        tlx.storage_kind.tmem,
-        reuse=tmem_storage_alias,
-    )
-    dp_tiles_subtile = tlx.local_alloc(
-        (BLOCK_N1, BLOCK_M1 // DS_NUM_SUBS),
-        tl.float32,
-        NUM_BUFFERS_TMEM * DS_NUM_SUBS,
         tlx.storage_kind.tmem,
         reuse=tmem_storage_alias,
     )
@@ -1696,10 +1689,6 @@ def _attn_bwd_mxf8_ws(
             # from corrupting dp_tiles before the Compute task reads them.
             tlx.reuse_group(
                 dp_tiles,
-                tlx.reuse_group(
-                    dp_tiles_subtile,
-                    group_size=DS_NUM_SUBS,
-                ),
                 dq_tiles,
                 tlx.reuse_group(
                     ds_tiles_tmem,
@@ -1903,7 +1892,7 @@ def _attn_bwd_mxf8_ws(
                     p_scale_tmem_prologue,
                     p_fulls,
                     p_empties,
-                    dp_tiles_subtile,
+                    dp_tiles,
                     dp_fulls,
                     dp_empties,
                     ds_tiles_smem_subtile,
@@ -1941,7 +1930,7 @@ def _attn_bwd_mxf8_ws(
                         p_scale_tmem,
                         p_fulls,
                         p_empties,
-                        dp_tiles_subtile,
+                        dp_tiles,
                         dp_fulls,
                         dp_empties,
                         ds_tiles_smem_subtile,
