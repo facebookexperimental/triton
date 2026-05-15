@@ -267,6 +267,10 @@ def _softmax_inner_loop(
         # ops per row in the MXFP8 conversion.
         block_amax = tl.math.exp2(block_maxes * qk_scale - m_scaled[:, None])
 
+        # Compute row sum before p_empties wait: if MMA is still doing the
+        # previous PV GEMM, the wait stalls — fill that time with the sum.
+        l_ij = tl.sum(p_i, 1)
+
         tlx.barrier_wait(tlx.local_view(p_empties, cid), qk_phase ^ 1)
         p_fp8, p_scale = _to_mxfp8_block_with_block_amax(
             p_i,
@@ -278,7 +282,6 @@ def _softmax_inner_loop(
         tlx.local_store(tlx.local_view(p_scale_tiles, cid), p_scale)
         tlx.barrier_arrive(tlx.local_view(p_fulls, cid))
 
-        l_ij = tl.sum(p_i, 1)
         l_i = l_i * alpha + l_ij
         m_i = m_ij
         accum_cnt_qk += 1
