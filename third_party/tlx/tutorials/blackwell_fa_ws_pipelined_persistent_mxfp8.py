@@ -1283,7 +1283,7 @@ def _softmax_recompute_quantization_iter(
     qk_fulls,
     qk_empties,
     p_tiles,
-    p_scale_buf,
+    p_scale_buf_smem,
     p_fulls,
     dp_tiles,
     dp_fulls,
@@ -1305,7 +1305,6 @@ def _softmax_recompute_quantization_iter(
     DS_NUM_SUBS: tl.constexpr,
 ):
     DS_M_SUB: tl.constexpr = BLOCK_M1 // DS_NUM_SUBS
-    DS_SCALE_BLOCK_SIZE: tl.constexpr = (BLOCK_M1 // VEC_SIZE) // DS_NUM_SUBS
     BWD_NUM_BLOCKS: tl.constexpr = DS_M_SUB // VEC_SIZE
     _, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
     ds_buf_id, ds_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
@@ -1346,9 +1345,15 @@ def _softmax_recompute_quantization_iter(
             p_dtype,
         )
         tlx.local_store(tlx.subslice(tlx.local_view(p_tiles, 0), DS_M_SUB * subtile_id, DS_M_SUB), p_fp8)
+        p_scale_packed = p_scale.reshape([REP_M, 4 // DS_NUM_SUBS, 32, REP_N, 4]).permute(0, 3, 2, 1, 4)
         tlx.local_store(
-            tlx.subslice(tlx.local_view(p_scale_buf, 0), DS_SCALE_BLOCK_SIZE * subtile_id, DS_SCALE_BLOCK_SIZE),
-            p_scale)
+            tlx.local_slice(
+                tlx.local_view(p_scale_buf_smem, 0),
+                [0, 0, 0, subtile_id * (4 // DS_NUM_SUBS), 0],
+                [REP_M, REP_N, 32, 4 // DS_NUM_SUBS, 4],
+            ),
+            p_scale_packed,
+        )
         if subtile_id == DS_NUM_SUBS - 1:
             tlx.barrier_arrive(p_fulls[0])
         # Finish dS for the previous M-block.
@@ -1492,7 +1497,7 @@ def _attn_bwd_mxf8_ws(
 
     # TODO: Support DS_NUM_SUBS = 2 or DS_NUM_SUBS = 4.
     # Currently there are accuracy issues.
-    DS_NUM_SUBS: tl.constexpr = 4
+    DS_NUM_SUBS: tl.constexpr = 1
 
     # ===== TMEM allocations =====
     # Single-region accumulator alias (qk/dp/p/dq overlap). Lifetime correctness
@@ -1795,6 +1800,12 @@ def _attn_bwd_mxf8_ws(
         NUM_BUFFERS_TMEM,
         tlx.storage_kind.smem,
     )
+    p_scale_smem = tlx.local_alloc(
+        (REP_N, REP_M, 32, 4, 4),
+        tl.uint8,
+        NUM_BUFFERS_TMEM,
+        tlx.storage_kind.smem,
+    )
     ds_scale_dq_smem = tlx.local_alloc(
         (REP_M, REP_N, 32, 4, 4),
         tl.uint8,
@@ -1871,7 +1882,7 @@ def _attn_bwd_mxf8_ws(
                     qk_fulls,
                     qk_empties,
                     p_tiles,
-                    p_scale_tmem_prologue,
+                    p_scale_smem,
                     p_fulls,
                     dp_tiles,
                     dp_fulls,
@@ -1908,7 +1919,7 @@ def _attn_bwd_mxf8_ws(
                         qk_fulls,
                         qk_empties,
                         p_tiles,
-                        p_scale_tmem,
+                        p_scale_smem,
                         p_fulls,
                         dp_tiles,
                         dp_fulls,
@@ -2099,9 +2110,10 @@ def _attn_bwd_mxf8_ws(
                 tlx.barrier_wait(p_fulls[0], tmem_phase)
                 tlx.barrier_wait(dv_empties[0], persistent_tmem_phase ^ 1)
                 tlx.barrier_wait(do_dv_fulls[do_buf_id], do_phase)
+                tlx.fence("async_shared")
+                tlx.tmem_copy(p_scale_smem[0], p_scale_tmem_prologue[0])
                 tlx.tmem_copy(do_scale_dv_smem[do_buf_id], do_scale_dv_tmem_prologue[0])
                 # Fence for the p_scale
-                tlx.fence("async_shared")
                 tlx.async_dot_scaled(
                     p_tiles[0],
                     do_dv_smem[do_buf_id],
@@ -2254,6 +2266,7 @@ def _attn_bwd_mxf8_ws(
                     tlx.barrier_wait(p_fulls[0], tmem_phase)
                     tlx.barrier_wait(do_dv_fulls[do_buf_id], do_phase)
                     tlx.tmem_copy(do_scale_dv_smem[do_buf_id], do_scale_dv_tmem[0])
+                    tlx.tmem_copy(p_scale_smem[0], p_scale_tmem[0])
                     # Fence for the p_scale
                     tlx.fence("async_shared")
                     tlx.async_dot_scaled(
