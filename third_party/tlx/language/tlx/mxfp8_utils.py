@@ -10,6 +10,26 @@ import triton.language as tl
 
 
 @triton.jit
+def _mul_f32x2(a, b):
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 ra, rb, rc;
+            mov.b64 ra, { $2, $3 };
+            mov.b64 rb, { $4, $5 };
+            mul.f32x2 rc, ra, rb;
+            mov.b64 { $0, $1 }, rc;
+        }
+        """,
+        "=r,=r,r,r,r,r",
+        [a, b],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=2,
+    )
+
+
+@triton.jit
 def _fused_amax_to_e8m0(amax, max_norm_rcp):
     """
     Fused amax-to-E8M0 scale conversion in a single PTX asm block.
@@ -132,7 +152,7 @@ def _compute_scale_and_quantize(
     scale_e8m0 = scale_u32.to(tl.uint8)
 
     quant_scale_expanded = tl.reshape(quant_scale, [BLOCK_M, NUM_SCALES, 1])
-    scaled_data = data_reshaped * quant_scale_expanded
+    scaled_data = _mul_f32x2(data_reshaped, quant_scale_expanded)
     data_scaled_flat = tl.reshape(scaled_data, [BLOCK_M, BLOCK_K])
 
     if dtype == tl.float8e4nv:
@@ -211,7 +231,7 @@ def _amax_to_e8m0_and_quantize(
 
     data_reshaped = tl.reshape(data_input, [BLOCK_M, NUM_SCALES, VEC_SIZE])
     quant_scale_expanded = tl.reshape(quant_scale, [BLOCK_M, NUM_SCALES, 1])
-    scaled_data = data_reshaped * quant_scale_expanded
+    scaled_data = _mul_f32x2(data_reshaped, quant_scale_expanded)
     data_scaled_flat = tl.reshape(scaled_data, [BLOCK_M, BLOCK_K])
 
     if dtype == tl.float8e4nv:

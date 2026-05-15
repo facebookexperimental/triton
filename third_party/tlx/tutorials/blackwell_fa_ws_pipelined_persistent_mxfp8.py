@@ -1482,7 +1482,7 @@ def _attn_bwd_mxf8_ws(
 
     # TODO: Support DS_NUM_SUBS = 2 or DS_NUM_SUBS = 4.
     # Currently there are accuracy issues.
-    DS_NUM_SUBS: tl.constexpr = 2
+    DS_NUM_SUBS: tl.constexpr = 4
 
     # ===== TMEM allocations =====
     # Single-region accumulator alias (qk/dp/p/dq overlap). Lifetime correctness
@@ -1981,7 +1981,7 @@ def _attn_bwd_mxf8_ws(
             tlx.async_descriptor_store_wait(0)
 
         # ----- Reduction warp: TMA atomic-reduce-add of dQ to GMEM -----
-        with tlx.async_task(num_warps=4, registers=88):
+        with tlx.async_task(num_warps=4, registers=124):
             blk_idx = 0
             for _i in range(tiles_per_sm):
                 off_seq_h = tile_idx // n_tile_num
@@ -2025,7 +2025,7 @@ def _attn_bwd_mxf8_ws(
             tlx.async_descriptor_store_wait(0)
 
         # ----- MMA warp: 5 blockscaled GEMMs per M-block -----
-        with tlx.async_task(num_warps=1, registers=24):
+        with tlx.async_task(num_warps=1, registers=48):
             blk_idx = 0
             kv_tile_idx = 0
             for _i in range(tiles_per_sm):
@@ -2228,6 +2228,7 @@ def _attn_bwd_mxf8_ws(
                     # Linear order for all deps. For body MMA 4 -> MMA 2.
                     # MMA 4 handled by q_dk_empties[q_buf_id_prev]. This is fine
                     # because we just need to reclaim the inputs.
+
                     tlx.barrier_wait(do_fulls[do_buf_id], do_phase)
                     tlx.barrier_wait(q_dk_empties[q_buf_id_prev], q_phase_prev)
                     tlx.tmem_copy(v_scale_smem[kv_buf_id], v_scale_tmem[0])
