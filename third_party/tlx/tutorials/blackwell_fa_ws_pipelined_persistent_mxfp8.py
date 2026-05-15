@@ -1997,6 +1997,8 @@ def _attn_bwd_mxf8_ws(
                             [BLOCK_M1, DQ_REDUCE_NCOL],
                         )
                         dq = tlx.local_load(dq_slice)
+                        if slice_id == (DQ_REDUCE_ITERS - 1):
+                            tlx.barrier_arrive(dq_empties[0])
                         dq = dq * LN2
                         tlx.async_descriptor_store_wait(DQ_REDUCE_STAGES - 1)
                         tlx.local_store(
@@ -2014,7 +2016,6 @@ def _attn_bwd_mxf8_ws(
                             store_reduce="add",
                         )
 
-                    tlx.barrier_arrive(dq_empties[0])
                     curr_m += BLOCK_M1
                     blk_idx += 1
                 tile_idx += num_progs
