@@ -1356,11 +1356,16 @@ def _softmax_recompute_quantization_iter(
             p_dtype,
         )
         tlx.local_store(
-            tlx.local_slice(tlx.local_view(ds_tiles_smem, ds_buf_id), [0, subtile_id], [BLOCK_N1, DS_M_SUB]), ds_fp8)
+            tlx.local_slice(tlx.local_view(ds_tiles_smem, ds_buf_id), [0, subtile_id * DS_M_SUB], [BLOCK_N1, DS_M_SUB]),
+            ds_fp8,
+        )
         ds_scale_packed = ds_scale.reshape([REP_N, 4, 32, REP_M, 4 // DS_NUM_SUBS]).permute(0, 3, 2, 1, 4)
         tlx.local_store(
-            tlx.local_slice(tlx.local_view(ds_scale_smem, 0), [0, 0, 0, 0, subtile_id],
-                            [REP_N, REP_M, 32, 4, 4 // DS_NUM_SUBS]),
+            tlx.local_slice(
+                tlx.local_view(ds_scale_smem, 0),
+                [0, 0, 0, 0, subtile_id * (4 // DS_NUM_SUBS)],
+                [REP_N, REP_M, 32, 4, 4 // DS_NUM_SUBS],
+            ),
             ds_scale_packed,
         )
         ds_dq_fp8, ds_scale_dq = _to_mxfp8_block(
@@ -1369,13 +1374,17 @@ def _softmax_recompute_quantization_iter(
             p_dtype,
         )
         tlx.local_store(
-            tlx.local_slice(tlx.local_view(ds_dq_tiles_smem, ds_buf_id), [subtile_id, 0], [DS_M_SUB, BLOCK_N1]),
+            tlx.local_slice(tlx.local_view(ds_dq_tiles_smem, ds_buf_id), [subtile_id * DS_M_SUB, 0],
+                            [DS_M_SUB, BLOCK_N1]),
             ds_dq_fp8,
         )
         ds_scale_dq_packed = ds_scale_dq.reshape([REP_M, 4 // DS_NUM_SUBS, 32, REP_N, 4]).permute(0, 3, 2, 1, 4)
         tlx.local_store(
-            tlx.local_slice(tlx.local_view(ds_scale_dq_smem, 0), [0, 0, 0, subtile_id, 0],
-                            [REP_N, REP_M, 32, 4 // DS_NUM_SUBS, 4]),
+            tlx.local_slice(
+                tlx.local_view(ds_scale_dq_smem, 0),
+                [0, 0, 0, subtile_id * 4 // DS_NUM_SUBS, 0],
+                [REP_N, REP_M, 32, 4 // DS_NUM_SUBS, 4],
+            ),
             ds_scale_dq_packed,
         )
         if subtile_id == DS_NUM_SUBS - 1:
