@@ -113,6 +113,15 @@ def _fma_f32x2(a, b, c):
 
 
 @triton.jit
+def _split_n(x, SPLIT_FACTOR: tl.constexpr):
+    if SPLIT_FACTOR == 1:
+        return (x, )
+    else:
+        x0, x1 = x.reshape([x.shape[0], 2, x.shape[1] // 2]).permute(0, 2, 1).split()
+        return _split_n(x0, SPLIT_FACTOR // 2) + _split_n(x1, SPLIT_FACTOR // 2)
+
+
+@triton.jit
 def _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE: tl.constexpr):
     if STAGE == 1:
         # First part of STAGE == 3 in _get_fused_loop_bounds
@@ -1292,24 +1301,22 @@ def _softmax_recompute_quantization_iter(
     BWD_NUM_BLOCKS: tl.constexpr = DS_M_SUB // VEC_SIZE
     _, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
     ds_buf_id, ds_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
+    # Read QK from TMEM, apply sm_scale -> P
+    tlx.barrier_wait(qk_fulls[0], tmem_phase)
+    # qk_tiles, dp_tiles, dq_tiles all share the same physical
+    # TMEM cols 0-127 (qkdp_alias, single-buffered). Force the
+    # TMEM read to drain into registers before signaling the
+    # MMA partition that the region is empty - otherwise MMA 2
+    # (which writes dp_tiles into the same cols) can overwrite
+    # qk while this load is still in flight.
+    qkT = tlx.local_load(tlx.local_view(qk_tiles, 0))
+    tlx.barrier_arrive(qk_empties[0])
+    qkT_slices = _split_n(qkT, DS_NUM_SUBS)
     for subtile_id in tl.static_range(DS_NUM_SUBS):
         offs_m = curr_m + tl.arange(subtile_id * DS_M_SUB, (subtile_id + 1) * DS_M_SUB)
         m = tl.load(M_off + offs_m)
 
-        # Read QK from TMEM, apply sm_scale -> P
-        if subtile_id == 0:
-            tlx.barrier_wait(qk_fulls[0], tmem_phase)
-        qkT = tlx.local_load(tlx.subslice(tlx.local_view(qk_tiles, 0), DS_M_SUB * subtile_id, DS_M_SUB))
-        # qk_tiles, dp_tiles, dq_tiles all share the same physical
-        # TMEM cols 0-127 (qkdp_alias, single-buffered). Force the
-        # TMEM read to drain into registers before signaling the
-        # MMA partition that the region is empty - otherwise MMA 2
-        # (which writes dp_tiles into the same cols) can overwrite
-        # qk while this load is still in flight.
-        if subtile_id == DS_NUM_SUBS - 1:
-            tlx.barrier_arrive(qk_empties[0])
-
-        qkT_scaled = qkT * qk_scale - m[None, :]
+        qkT_scaled = qkT_slices[subtile_id] * qk_scale - m[None, :]
         # Clamp to prevent FP32 overflow downstream in P*dP
         qkT_scaled = tl.minimum(qkT_scaled, 20.0)
         pT = tl.math.exp2(qkT_scaled)
@@ -1473,7 +1480,9 @@ def _attn_bwd_mxf8_ws(
         tiles_per_sm += 1
     tile_idx = prog_id
 
-    DS_NUM_SUBS: tl.constexpr = 2
+    # TODO: Support DS_NUM_SUBS = 2 or DS_NUM_SUBS = 4.
+    # Currently there are accuracy issues.
+    DS_NUM_SUBS: tl.constexpr = 1
 
     # ===== TMEM allocations =====
     # Single-region accumulator alias (qk/dp/p/dq overlap). Lifetime correctness
