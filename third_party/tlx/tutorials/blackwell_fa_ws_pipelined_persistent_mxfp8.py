@@ -578,17 +578,12 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
 
                 _, phase = _get_bufidx_phase(i, 1)
                 for cid in tl.static_range(0, NUM_MMA_GROUPS):
-                    # epilogue
+                    # epilogue — critical path first (produce o_tiles),
+                    # then non-critical M (LSE) store to GMEM
                     tlx.barrier_wait(l_fulls[cid], phase)
                     l = tlx.local_load(l_tiles[cid])
                     m = tlx.local_load(m_tiles[cid])
                     tlx.barrier_arrive(l_empties[cid])
-                    if RESCALE_OPT:
-                        m = m * sm_scale * 1.44269504
-                    m += tl.math.log2(l)
-                    offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
-                    m_ptrs = M + off_hz * N_CTX + offs_m
-                    tl.store(m_ptrs, tl.reshape(m, [BLOCK_M_SPLIT]))
 
                     tlx.barrier_wait(acc_empties[cid], phase)
                     tlx.barrier_wait(o_empties[cid], phase ^ 1)
@@ -598,6 +593,13 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     acc = acc.to(tlx.dtype_of(desc_o))
                     tlx.local_store(o_tiles[cid], acc)
                     tlx.barrier_arrive(o_fulls[cid])
+
+                    if RESCALE_OPT:
+                        m = m * sm_scale * 1.44269504
+                    m += tl.math.log2(l)
+                    offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
+                    m_ptrs = M + off_hz * N_CTX + offs_m
+                    tl.store(m_ptrs, tl.reshape(m, [BLOCK_M_SPLIT]))
 
                 tile_idx += num_progs
 
