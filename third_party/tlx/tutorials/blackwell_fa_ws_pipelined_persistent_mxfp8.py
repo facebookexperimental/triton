@@ -1817,7 +1817,7 @@ def _attn_bwd_mxf8_ws(
     k_scale_dq_smem = tlx.local_alloc((1, REP_HEAD, REP_N, 2, 256), tl.uint8, NUM_BUFFERS_KV)
     v_scale_smem = tlx.local_alloc((1, REP_N, REP_HEAD, 2, 256), tl.uint8, NUM_BUFFERS_KV)
     q_scale_smem = tlx.local_alloc((1, REP_M, REP_HEAD, 2, 256), tl.uint8, NUM_BUFFERS_Q)
-    q_dk_scale_smem = tlx.local_alloc((1, REP_M, REP_HEAD, 2, 256), tl.uint8, NUM_BUFFERS_Q)
+    q_dk_scale_smem = tlx.local_alloc((1, REP_HEAD, REP_M, 2, 256), tl.uint8, NUM_BUFFERS_Q)
     do_scale_smem = tlx.local_alloc((1, REP_M, REP_HEAD, 2, 256), tl.uint8, NUM_BUFFERS_DO)
     do_scale_dv_smem = tlx.local_alloc((1, REP_HEAD, REP_M, 2, 256), tl.uint8, NUM_BUFFERS_DO)
 
