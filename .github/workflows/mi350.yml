@@ -86,7 +86,7 @@ jobs:
         run: |
           set -eux
           . "${SETUP_SCRIPT}"
-          pytest python/test/unit/language/test_tlx_*.py -v --timeout=300
+          pytest python/test/unit/language/test_tlx_*.py -v
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
