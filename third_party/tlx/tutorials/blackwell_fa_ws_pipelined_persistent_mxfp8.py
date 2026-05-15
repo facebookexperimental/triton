@@ -1996,7 +1996,7 @@ def _attn_bwd_mxf8_ws(
             tlx.async_descriptor_store_wait(0)
 
         # ----- Reduction warp: TMA atomic-reduce-add of dQ to GMEM -----
-        with tlx.async_task(num_warps=4, registers=124):
+        with tlx.async_task(num_warps=4, registers=88):
             blk_idx = 0
             for _i in range(tiles_per_sm):
                 off_seq_h = tile_idx // n_tile_num
@@ -2041,7 +2041,7 @@ def _attn_bwd_mxf8_ws(
             tlx.async_descriptor_store_wait(0)
 
         # ----- MMA warp: 5 blockscaled GEMMs per M-block -----
-        with tlx.async_task(num_warps=1, registers=100):
+        with tlx.async_task(num_warps=1, registers=88):
             blk_idx = 0
             for _i in range(tiles_per_sm):
                 kv_buf_id, kv_phase = _get_bufidx_phase(_i, NUM_BUFFERS_KV)
