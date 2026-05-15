@@ -610,6 +610,23 @@ def test_tmem_load_store(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_tmem_scale_subslice_compile():
+
+    @triton.jit
+    def tmem_scale_subslice_compile_kernel():
+        scale_smem = tlx.local_alloc((1, 1, 2, 2, 256), tl.uint8, tl.constexpr(1))
+        scale_tmem = tlx.local_alloc((128, 8), tl.uint8, tl.constexpr(1), tlx.storage_kind.tmem)
+        scale_slice = tlx.subslice(scale_tmem[0], 0, 8)
+        tlx.tmem_copy(scale_smem[0], scale_slice)
+
+    kernel = tmem_scale_subslice_compile_kernel.warmup(grid=(1, ))
+    ttgir = kernel.asm["ttgir"]
+    assert "tensor_memory_scales_encoding" in ttgir
+    assert ttgir.count("ttng.tmem_subslice") == 1
+    assert ttgir.count("ttng.tmem_copy") == 1
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 @pytest.mark.parametrize("BLOCK_SIZE_M, BLOCK_SIZE_N", [(128, 64)])
 def test_tmem_subslice(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
 

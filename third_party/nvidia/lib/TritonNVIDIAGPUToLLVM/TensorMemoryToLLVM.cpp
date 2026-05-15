@@ -1005,38 +1005,46 @@ struct TMEMSubSliceOpConversion
     auto dstTy = op.getResult().getType();
     auto llvmElemTy = getTypeConverter()->convertType(srcTy.getElementType());
 
-    auto encoding = dyn_cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
-        srcTy.getEncoding());
-    auto shapePerCTA = getShapePerCTA(srcTy);
-    int blockN = encoding.getBlockN();
-    int blockM = encoding.getBlockM();
     int offsetCol = 0;
     int offsetRow = 0;
-    assert(llvm::is_contained({64, 128}, blockM) && "checked by the verifier");
-    offsetCol = op.getN();
 
-    if (blockM == 64) {
-      // The layout interleaves blocks along the N dimension with the rows, such
-      // that the odd numbered blocks are in lanes [16, 32), below the previous
-      // even-numbered block.
-      int blockOffset = op.getN() / blockN;
-      if (blockOffset % 2) {
-        // Offset into rows [16, 32).
-        offsetRow = 16;
-        // Normalize column offset to the even block.
-        offsetCol -= blockN;
-      }
-      offsetCol -= blockN * (blockOffset / 2);
-    }
+    if (auto encoding = dyn_cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
+            srcTy.getEncoding())) {
+      int blockN = encoding.getBlockN();
+      int blockM = encoding.getBlockM();
+      assert(llvm::is_contained({64, 128}, blockM) &&
+             "checked by the verifier");
+      offsetCol = op.getN();
 
-    unsigned elementBitWidth = srcTy.getElementTypeBitWidth();
-    if (encoding.getColStride() * elementBitWidth != 32) {
-      // Adjust the column offset based on the element size.
-      int numElementsPer32B = 32 / (encoding.getColStride() * elementBitWidth);
-      if (offsetCol % numElementsPer32B != 0) {
-        return failure();
+      if (blockM == 64) {
+        // The layout interleaves blocks along the N dimension with the rows,
+        // such that the odd numbered blocks are in lanes [16, 32), below the
+        // previous even-numbered block.
+        int blockOffset = op.getN() / blockN;
+        if (blockOffset % 2) {
+          // Offset into rows [16, 32).
+          offsetRow = 16;
+          // Normalize column offset to the even block.
+          offsetCol -= blockN;
+        }
+        offsetCol -= blockN * (blockOffset / 2);
       }
-      offsetCol /= numElementsPer32B;
+
+      unsigned elementBitWidth = srcTy.getElementTypeBitWidth();
+      if (encoding.getColStride() * elementBitWidth != 32) {
+        // Adjust the column offset based on the element size.
+        int numElementsPer32B =
+            32 / (encoding.getColStride() * elementBitWidth);
+        if (offsetCol % numElementsPer32B != 0) {
+          return failure();
+        }
+        offsetCol /= numElementsPer32B;
+      }
+    } else if (isa<triton::nvidia_gpu::TensorMemoryScalesEncodingAttr>(
+                   srcTy.getEncoding())) {
+      offsetCol = op.getN();
+    } else {
+      return failure();
     }
 
     Value tmemBase = adaptor.getSrc();
