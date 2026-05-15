@@ -40,7 +40,7 @@ mxfp8_configs = [
             "BLOCK_M": 256,
             "BLOCK_N": 128,
             "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": 3,
+            "NUM_BUFFERS_KV": 4,
             "NUM_BUFFERS_QK": 1,
             "NUM_MMA_GROUPS": 2,
             "NUM_Q_SCALE_TMEM_BUFFERS": 1,
