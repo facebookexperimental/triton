@@ -2361,7 +2361,7 @@ def _attn_bwd_mxf8_ws(
                 # Scale TMA layout: [Z*H, REP_N (or REP_M), REP_HEAD, 2, 256].
                 # Tile selects (z, h) via off_seq_h, and the M / N index via
                 # the 2nd dim.
-                sf_off_seq_h = off_seq_h
+                sf_off_seq_h = off_seq_h.to(tl.int32)
                 kv_scale_n = pid * REP_N
 
                 # Load K data + scale
@@ -2377,7 +2377,7 @@ def _attn_bwd_mxf8_ws(
                 tlx.async_descriptor_load(
                     desc_k_scale,
                     k_scale_smem[kv_buf_id],
-                    [sf_off_seq_h.to(tl.int32), kv_scale_n.to(tl.int32), 0, 0, 0],
+                    [sf_off_seq_h, kv_scale_n.to(tl.int32), 0, 0, 0],
                     k_fulls[kv_buf_id],
                 )
                 tlx.barrier_wait(k_dq_empties[kv_buf_id], kv_phase ^ 1)
@@ -2394,7 +2394,7 @@ def _attn_bwd_mxf8_ws(
                 tlx.async_descriptor_load(
                     desc_k_dq_scale,
                     k_scale_dq_smem[kv_buf_id],
-                    [sf_off_seq_h.to(tl.int32), 0, kv_scale_n.to(tl.int32), 0, 0],
+                    [sf_off_seq_h, 0, kv_scale_n.to(tl.int32), 0, 0],
                     k_dq_fulls[kv_buf_id],
                 )
 
@@ -2410,7 +2410,7 @@ def _attn_bwd_mxf8_ws(
                 tlx.async_descriptor_load(
                     desc_v_scale,
                     v_scale_smem[kv_buf_id],
-                    [sf_off_seq_h.to(tl.int32), kv_scale_n.to(tl.int32), 0, 0, 0],
+                    [sf_off_seq_h, kv_scale_n.to(tl.int32), 0, 0, 0],
                     v_fulls[kv_buf_id],
                 )
 
@@ -2429,7 +2429,7 @@ def _attn_bwd_mxf8_ws(
                 tlx.async_descriptor_load(
                     desc_q_scale,
                     q_scale_smem[q_buf_id],
-                    [sf_off_seq_h.to(tl.int32), q_scale_m, 0, 0, 0],
+                    [sf_off_seq_h, q_scale_m, 0, 0, 0],
                     q_fulls[q_buf_id],
                 )
 
@@ -2450,7 +2450,7 @@ def _attn_bwd_mxf8_ws(
                 tlx.async_descriptor_load(
                     desc_do_scale,
                     do_scale_smem[do_buf_id],
-                    [sf_off_seq_h.to(tl.int32), do_scale_m, 0, 0, 0],
+                    [sf_off_seq_h, do_scale_m, 0, 0, 0],
                     do_fulls[do_buf_id],
                 )
                 tlx.barrier_wait(do_dv_empties[do_buf_id], do_phase ^ 1)
@@ -2467,7 +2467,7 @@ def _attn_bwd_mxf8_ws(
                 tlx.async_descriptor_load(
                     desc_do_dv_scale,
                     do_scale_dv_smem[do_buf_id],
-                    [sf_off_seq_h.to(tl.int32), 0, do_scale_m, 0, 0],
+                    [sf_off_seq_h, 0, do_scale_m, 0, 0],
                     do_dv_fulls[do_buf_id],
                 )
                 curr_m += BLOCK_M1
@@ -2494,7 +2494,7 @@ def _attn_bwd_mxf8_ws(
                     tlx.async_descriptor_load(
                         desc_q_scale,
                         q_scale_smem[q_buf_id],
-                        [sf_off_seq_h.to(tl.int32), q_scale_m, 0, 0, 0],
+                        [sf_off_seq_h, q_scale_m, 0, 0, 0],
                         q_fulls[q_buf_id],
                     )
                     tlx.barrier_wait(q_dk_empties[prev_q_buf_id], prev_q_phase ^ 1)
@@ -2513,7 +2513,7 @@ def _attn_bwd_mxf8_ws(
                     tlx.async_descriptor_load(
                         desc_q_dk_scale,
                         q_dk_scale_smem[prev_q_buf_id],
-                        [sf_off_seq_h.to(tl.int32), 0, (prev_m // 128) * REP_M, 0, 0],
+                        [sf_off_seq_h, 0, (prev_m // 128) * REP_M, 0, 0],
                         q_dk_fulls[prev_q_buf_id],
                     )
 
@@ -2531,7 +2531,7 @@ def _attn_bwd_mxf8_ws(
                     tlx.async_descriptor_load(
                         desc_do_scale,
                         do_scale_smem[do_buf_id],
-                        [sf_off_seq_h.to(tl.int32), do_scale_m, 0, 0, 0],
+                        [sf_off_seq_h, do_scale_m, 0, 0, 0],
                         do_fulls[do_buf_id],
                     )
                     tlx.barrier_wait(do_dv_empties[do_buf_id], do_phase ^ 1)
@@ -2548,7 +2548,7 @@ def _attn_bwd_mxf8_ws(
                     tlx.async_descriptor_load(
                         desc_do_dv_scale,
                         do_scale_dv_smem[do_buf_id],
-                        [sf_off_seq_h.to(tl.int32), 0, do_scale_m, 0, 0],
+                        [sf_off_seq_h, 0, do_scale_m, 0, 0],
                         do_dv_fulls[do_buf_id],
                     )
                     curr_m += BLOCK_M1
@@ -2570,7 +2570,7 @@ def _attn_bwd_mxf8_ws(
                 tlx.async_descriptor_load(
                     desc_q_dk_scale,
                     q_dk_scale_smem[last_q_buf_id],
-                    [sf_off_seq_h.to(tl.int32), 0, (last_m // 128) * REP_M, 0, 0],
+                    [sf_off_seq_h, 0, (last_m // 128) * REP_M, 0, 0],
                     q_dk_fulls[last_q_buf_id],
                 )
                 tile_idx += num_progs
