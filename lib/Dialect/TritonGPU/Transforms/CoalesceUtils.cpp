@@ -32,6 +32,12 @@ buildCoalescedEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis, Operation *op,
   SmallVector<unsigned> order = getOrderFromContiguity(contiguity);
   LDBG("order=[" << triton::join(order, ", ") << "]");
 
+  llvm::outs() << "orders = {";
+  for (auto o : order) {
+    llvm::outs() << o << ", ";
+  }
+  llvm::outs() << "}\n";
+
   auto matchesShape = [&refTensorType](const Value &val) {
     auto rttType = dyn_cast<RankedTensorType>(val.getType());
     return rttType && rttType.getShape() == refTensorType.getShape();
