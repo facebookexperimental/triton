@@ -2025,7 +2025,7 @@ def _attn_bwd_mxf8_ws(
             tlx.async_descriptor_store_wait(0)
 
         # ----- MMA warp: 5 blockscaled GEMMs per M-block -----
-        with tlx.async_task(num_warps=1, registers=48):
+        with tlx.async_task(num_warps=1, registers=100):
             blk_idx = 0
             kv_tile_idx = 0
             for _i in range(tiles_per_sm):
