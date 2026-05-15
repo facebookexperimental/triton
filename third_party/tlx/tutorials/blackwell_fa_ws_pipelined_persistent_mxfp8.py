@@ -1804,7 +1804,7 @@ def _attn_bwd_mxf8_ws(
     # TODO: Expose. This is set to 1 because its not on the critical path.
     NUM_DKV_STORE_BUFFERS: tl.constexpr = 1
     dkv_store_buf = tlx.local_alloc((BLOCK_N1, slice_size_alloc), tl.bfloat16, NUM_DKV_STORE_BUFFERS)
-    DQ_REDUCE_NCOL: tl.constexpr = HEAD_DIM // (EPILOGUE_SUBTILE * 2)
+    DQ_REDUCE_NCOL: tl.constexpr = 32
     DQ_REDUCE_ITERS: tl.constexpr = HEAD_DIM // DQ_REDUCE_NCOL
     DQ_REDUCE_STAGES: tl.constexpr = 2
     dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_REDUCE_NCOL), tlx.dtype_of(desc_dq), DQ_REDUCE_STAGES)
