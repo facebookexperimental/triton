@@ -672,8 +672,10 @@ LogicalResult MemDescReinterpretOp::verify() {
           "expected shared or tensor memory"));
   auto getViewNumBits = [](MemDescType ty) {
     auto rank = cast<LayoutEncodingTrait>(ty.getEncoding()).getRank();
-    auto layout =
-        toLinearLayout(ty.getAllocShape().take_back(rank), ty.getEncoding());
+    auto shape = ty.getAllocShape().take_back(rank);
+    auto layout = isa<PaddedSharedEncodingAttr>(ty.getEncoding())
+                      ? paddedLinearLayout(shape, ty.getEncoding())
+                      : toLinearLayout(shape, ty.getEncoding());
     int64_t numLayoutCopies = 1;
     for (int64_t dim : ty.getAllocShape().drop_back(rank))
       numLayoutCopies *= dim;
