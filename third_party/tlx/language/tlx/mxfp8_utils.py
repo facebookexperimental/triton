@@ -153,14 +153,15 @@ def _compute_scale_and_quantize(
 
     quant_scale_expanded = tl.reshape(quant_scale, [BLOCK_M, NUM_SCALES, 1])
     scaled_data = _mul_f32x2(data_reshaped, quant_scale_expanded)
-    data_scaled_flat = tl.reshape(scaled_data, [BLOCK_M, BLOCK_K])
 
     if dtype == tl.float8e4nv:
-        data_fp8 = _cvt_e4m3x4_f32(data_scaled_flat)
+        data_fp8 = _cvt_e4m3x4_f32(scaled_data)
     else:
-        data_fp8 = _cvt_e5m2x4_f32(data_scaled_flat)
+        data_fp8 = _cvt_e5m2x4_f32(scaled_data)
 
-    return scale_e8m0, data_fp8
+    data_fp8_flat = tl.reshape(data_fp8, [BLOCK_M, BLOCK_K])
+
+    return scale_e8m0, data_fp8_flat
 
 
 @triton.jit
@@ -232,14 +233,15 @@ def _amax_to_e8m0_and_quantize(
     data_reshaped = tl.reshape(data_input, [BLOCK_M, NUM_SCALES, VEC_SIZE])
     quant_scale_expanded = tl.reshape(quant_scale, [BLOCK_M, NUM_SCALES, 1])
     scaled_data = _mul_f32x2(data_reshaped, quant_scale_expanded)
-    data_scaled_flat = tl.reshape(scaled_data, [BLOCK_M, BLOCK_K])
 
     if dtype == tl.float8e4nv:
-        data_fp8 = _cvt_e4m3x4_f32(data_scaled_flat)
+        data_fp8 = _cvt_e4m3x4_f32(scaled_data)
     else:
-        data_fp8 = _cvt_e5m2x4_f32(data_scaled_flat)
+        data_fp8 = _cvt_e5m2x4_f32(scaled_data)
 
-    return scale_e8m0, data_fp8
+    data_fp8_flat = tl.reshape(data_fp8, [BLOCK_M, BLOCK_K])
+
+    return scale_e8m0, data_fp8_flat
 
 
 @triton.jit
