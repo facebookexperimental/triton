@@ -1091,8 +1091,7 @@ static void ensureCudaContext() {
   }
 }
 
-// File-level handle for cuLaunchKernelEx (shared by _launch and
-// _TritonDispatcher)
+// File-level handle for cuLaunchKernelEx (shared by _launch and _TritonDispatcher)
 static cuLaunchKernelEx_t g_cuLaunchKernelExHandle = NULL;
 static inline cuLaunchKernelEx_t ensureLaunchHandle(void) {
   if (g_cuLaunchKernelExHandle == NULL)
@@ -1184,7 +1183,7 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps,
 }
 
 static PyObject *data_ptr_str = NULL;
-static PyObject *td_get_str = NULL; /* interned "get" for allocator.get() */
+static PyObject *td_get_str = NULL;  /* interned "get" for allocator.get() */
 
 // Extract a CUDA device pointer from a pointer-like PyObject obj, and store
 // it to the memory location pointed by ptr.
@@ -1711,412 +1710,339 @@ cleanup:
  * ========================================================================= */
 
 #define TD_MAX_KERNEL_ARGS 64
-#define TD_FIXED_ARGS 4 /* grid_x, grid_y, grid_z, stream */
+#define TD_FIXED_ARGS 4  /* grid_x, grid_y, grid_z, stream */
 
 typedef union {
-  CUdeviceptr ptr;
-  int8_t i8;
-  int16_t i16;
-  int32_t i32;
-  int64_t i64;
-  uint8_t u8;
-  uint16_t u16;
-  uint32_t u32;
-  uint64_t u64;
-  float f32;
-  double f64;
+    CUdeviceptr ptr;
+    int8_t   i8;
+    int16_t  i16;
+    int32_t  i32;
+    int64_t  i64;
+    uint8_t  u8;
+    uint16_t u16;
+    uint32_t u32;
+    uint64_t u64;
+    float    f32;
+    double   f64;
 } TDArgSlot;
 
 typedef struct {
-  PyObject_HEAD vectorcallfunc vectorcall;
-  CUfunction function;
-  unsigned grid_mult;   /* num_ctas — grid_x multiplied by this */
-  unsigned block_dim_x; /* 32 * num_warps */
-  unsigned shared_mem;
-  CUlaunchAttribute launch_attrs[5];
-  unsigned num_launch_attrs;
-  int arg_types[TD_MAX_KERNEL_ARGS]; /* ExtractorTypeIndex values */
-  int num_args;
-  int total_params;
-  TDArgSlot arg_storage[TD_MAX_KERNEL_ARGS];
-  void *kernel_params[TD_MAX_KERNEL_ARGS];
-  int has_global_scratch;
-  int has_profile_scratch;
-  /* Scratch allocation support */
-  unsigned global_scratch_size;
-  unsigned global_scratch_align;
-  unsigned profile_scratch_size;
-  unsigned profile_scratch_align;
-  PyObject *allocator;         /* _allocation._allocator (ContextVar) */
-  PyObject *profile_allocator; /* _allocation._profile_allocator (wrapper) */
+    PyObject_HEAD
+    vectorcallfunc vectorcall;
+    CUfunction function;
+    unsigned grid_mult;     /* num_ctas — grid_x multiplied by this */
+    unsigned block_dim_x;   /* 32 * num_warps */
+    unsigned shared_mem;
+    CUlaunchAttribute launch_attrs[5];
+    unsigned num_launch_attrs;
+    int arg_types[TD_MAX_KERNEL_ARGS];  /* ExtractorTypeIndex values */
+    int num_args;
+    int total_params;
+    TDArgSlot arg_storage[TD_MAX_KERNEL_ARGS];
+    void *kernel_params[TD_MAX_KERNEL_ARGS];
+    int has_global_scratch;
+    int has_profile_scratch;
+    /* Scratch allocation support */
+    unsigned global_scratch_size;
+    unsigned global_scratch_align;
+    unsigned profile_scratch_size;
+    unsigned profile_scratch_align;
+    PyObject *allocator;          /* _allocation._allocator (ContextVar) */
+    PyObject *profile_allocator;  /* _allocation._profile_allocator (wrapper) */
 } TritonDispatcher;
 
 /* Forward declarations */
-static PyObject *TritonDispatcher_vectorcall(PyObject *self,
-                                             PyObject *const *args,
-                                             size_t nargsf, PyObject *kwnames);
+static PyObject *TritonDispatcher_vectorcall(
+    PyObject *self, PyObject *const *args, size_t nargsf, PyObject *kwnames);
 static void TritonDispatcher_dealloc(PyObject *self);
 
 /* Fast pointer extraction (no cuPointerGetAttribute validation — hot path) */
 static inline CUdeviceptr td_get_ptr(PyObject *obj) {
-  if (PyLong_Check(obj))
-    return (CUdeviceptr)PyLong_AsUnsignedLongLong(obj);
-  if (obj == Py_None)
-    return 0;
-  PyObject *r = PyObject_CallMethodNoArgs(obj, data_ptr_str);
-  if (!r)
-    return 0;
-  CUdeviceptr p = (CUdeviceptr)PyLong_AsUnsignedLongLong(r);
-  Py_DECREF(r);
-  return p;
+    if (PyLong_Check(obj))
+        return (CUdeviceptr)PyLong_AsUnsignedLongLong(obj);
+    if (obj == Py_None)
+        return 0;
+    PyObject *r = PyObject_CallMethodNoArgs(obj, data_ptr_str);
+    if (!r) return 0;
+    CUdeviceptr p = (CUdeviceptr)PyLong_AsUnsignedLongLong(r);
+    Py_DECREF(r);
+    return p;
 }
 
 /* Fast fp16/bf16 packing (equivalent to extractFP16/BF16 but returns value) */
 static inline uint16_t td_pack_fp16(double v) {
-  uint16_t result;
-#if 0x030600B1 <= PY_VERSION_HEX && PY_VERSION_HEX <= 0x030B00A1 &&            \
+    uint16_t result;
+#if 0x030600B1 <= PY_VERSION_HEX && PY_VERSION_HEX <= 0x030B00A1 && \
     !defined(PYPY_VERSION)
-  _PyFloat_Pack2(v, (unsigned char *)&result, 1);
+    _PyFloat_Pack2(v, (unsigned char *)&result, 1);
 #else
-  PyFloat_Pack2(v, (char *)&result, 1);
+    PyFloat_Pack2(v, (char *)&result, 1);
 #endif
-  return result;
+    return result;
 }
 static inline uint16_t td_pack_bf16(double v) {
-  float f = (float)v;
-  uint32_t b;
-  memcpy(&b, &f, 4);
-  return (uint16_t)(b >> 16);
+    float f = (float)v;
+    uint32_t b; memcpy(&b, &f, 4);
+    return (uint16_t)(b >> 16);
 }
 
 /* Arg conversion using ExtractorTypeIndex codes */
-static inline int td_convert_args(TritonDispatcher *self,
-                                  PyObject *const *kargs) {
-  for (int i = 0; i < self->num_args; i++) {
-    PyObject *a = kargs[i];
-    TDArgSlot *s = &self->arg_storage[i];
-    switch (self->arg_types[i]) {
-    case EXTRACTOR_POINTER_INDEX:
-      s->ptr = td_get_ptr(a);
-      break;
-    case EXTRACTOR_INT8_INDEX:
-      s->i8 = (int8_t)PyLong_AsLong(a);
-      break;
-    case EXTRACTOR_INT16_INDEX:
-      s->i16 = (int16_t)PyLong_AsLong(a);
-      break;
-    case EXTRACTOR_INT32_INDEX:
-      s->i32 = (int32_t)PyLong_AsLong(a);
-      break;
-    case EXTRACTOR_INT64_INDEX:
-      s->i64 = (int64_t)PyLong_AsLongLong(a);
-      break;
-    case EXTRACTOR_UINT8_INDEX:
-      s->u8 = (uint8_t)PyLong_AsUnsignedLong(a);
-      break;
-    case EXTRACTOR_UINT16_INDEX:
-      s->u16 = (uint16_t)PyLong_AsUnsignedLong(a);
-      break;
-    case EXTRACTOR_UINT32_INDEX:
-      s->u32 = (uint32_t)PyLong_AsUnsignedLong(a);
-      break;
-    case EXTRACTOR_UINT64_INDEX:
-      s->u64 = (uint64_t)PyLong_AsUnsignedLongLong(a);
-      break;
-    case EXTRACTOR_FP16_INDEX:
-      s->u16 = td_pack_fp16(PyFloat_AsDouble(a));
-      break;
-    case EXTRACTOR_BF16_INDEX:
-      s->u16 = td_pack_bf16(PyFloat_AsDouble(a));
-      break;
-    case EXTRACTOR_FP32_INDEX: {
-      float f = (float)PyFloat_AsDouble(a);
-      memcpy(&s->u32, &f, 4);
-      break;
+static inline int td_convert_args(TritonDispatcher *self, PyObject *const *kargs) {
+    for (int i = 0; i < self->num_args; i++) {
+        PyObject *a = kargs[i];
+        TDArgSlot *s = &self->arg_storage[i];
+        switch (self->arg_types[i]) {
+        case EXTRACTOR_POINTER_INDEX:
+            s->ptr = td_get_ptr(a);
+            break;
+        case EXTRACTOR_INT8_INDEX:  s->i8  = (int8_t)PyLong_AsLong(a); break;
+        case EXTRACTOR_INT16_INDEX: s->i16 = (int16_t)PyLong_AsLong(a); break;
+        case EXTRACTOR_INT32_INDEX: s->i32 = (int32_t)PyLong_AsLong(a); break;
+        case EXTRACTOR_INT64_INDEX: s->i64 = (int64_t)PyLong_AsLongLong(a); break;
+        case EXTRACTOR_UINT8_INDEX:  s->u8  = (uint8_t)PyLong_AsUnsignedLong(a); break;
+        case EXTRACTOR_UINT16_INDEX: s->u16 = (uint16_t)PyLong_AsUnsignedLong(a); break;
+        case EXTRACTOR_UINT32_INDEX: s->u32 = (uint32_t)PyLong_AsUnsignedLong(a); break;
+        case EXTRACTOR_UINT64_INDEX: s->u64 = (uint64_t)PyLong_AsUnsignedLongLong(a); break;
+        case EXTRACTOR_FP16_INDEX: s->u16 = td_pack_fp16(PyFloat_AsDouble(a)); break;
+        case EXTRACTOR_BF16_INDEX: s->u16 = td_pack_bf16(PyFloat_AsDouble(a)); break;
+        case EXTRACTOR_FP32_INDEX: { float f = (float)PyFloat_AsDouble(a); memcpy(&s->u32, &f, 4); break; }
+        case EXTRACTOR_FP64_INDEX: s->f64 = PyFloat_AsDouble(a); break;
+        default:
+            PyErr_Format(PyExc_TypeError, "Unknown type code %d for arg %d", self->arg_types[i], i);
+            return -1;
+        }
     }
-    case EXTRACTOR_FP64_INDEX:
-      s->f64 = PyFloat_AsDouble(a);
-      break;
-    default:
-      PyErr_Format(PyExc_TypeError, "Unknown type code %d for arg %d",
-                   self->arg_types[i], i);
-      return -1;
-    }
-  }
-  if (PyErr_Occurred())
-    return -1;
-  return 0;
+    if (PyErr_Occurred()) return -1;
+    return 0;
 }
 
 /* Relaunch with pre-built attrs (cuLaunchKernelEx wrapper) */
-static inline CUresult td_relaunch(TritonDispatcher *d, unsigned gx,
-                                   unsigned gy, unsigned gz, CUstream stream) {
-  if (gx * gy * gz == 0)
-    return CUDA_SUCCESS;
-  CUlaunchConfig cfg;
-  cfg.gridDimX = gx * d->grid_mult;
-  cfg.gridDimY = gy;
-  cfg.gridDimZ = gz;
-  cfg.blockDimX = d->block_dim_x;
-  cfg.blockDimY = 1;
-  cfg.blockDimZ = 1;
-  cfg.sharedMemBytes = d->shared_mem;
-  cfg.hStream = stream;
-  cfg.attrs = d->num_launch_attrs > 0 ? d->launch_attrs : NULL;
-  cfg.numAttrs = d->num_launch_attrs;
-  return ensureLaunchHandle()(&cfg, d->function, d->kernel_params, NULL);
+static inline CUresult td_relaunch(
+    TritonDispatcher *d, unsigned gx, unsigned gy, unsigned gz, CUstream stream)
+{
+    if (gx * gy * gz == 0) return CUDA_SUCCESS;
+    CUlaunchConfig cfg;
+    cfg.gridDimX = gx * d->grid_mult; cfg.gridDimY = gy; cfg.gridDimZ = gz;
+    cfg.blockDimX = d->block_dim_x; cfg.blockDimY = 1; cfg.blockDimZ = 1;
+    cfg.sharedMemBytes = d->shared_mem; cfg.hStream = stream;
+    cfg.attrs = d->num_launch_attrs > 0 ? d->launch_attrs : NULL;
+    cfg.numAttrs = d->num_launch_attrs;
+    return ensureLaunchHandle()(&cfg, d->function, d->kernel_params, NULL);
 }
 
 /* ---- Constructor ---- */
-static PyObject *TritonDispatcher_new(PyTypeObject *type, PyObject *args,
-                                      PyObject *kwargs) {
-  unsigned long long func_ptr;
-  int num_warps, num_ctas, shared_mem;
-  int launch_pdl, launch_coop, launch_cluster;
-  PyObject *arg_type_codes;
-  int has_global_scratch, has_profile_scratch;
-  unsigned global_scratch_size = 0, global_scratch_align = 1;
-  unsigned profile_scratch_size = 0, profile_scratch_align = 1;
-  PyObject *allocator_obj = NULL, *profile_allocator_obj = NULL;
+static PyObject *TritonDispatcher_new(PyTypeObject *type, PyObject *args, PyObject *kwargs) {
+    unsigned long long func_ptr;
+    int num_warps, num_ctas, shared_mem;
+    int launch_pdl, launch_coop, launch_cluster;
+    PyObject *arg_type_codes;
+    int has_global_scratch, has_profile_scratch;
+    unsigned global_scratch_size = 0, global_scratch_align = 1;
+    unsigned profile_scratch_size = 0, profile_scratch_align = 1;
+    PyObject *allocator_obj = NULL, *profile_allocator_obj = NULL;
 
-  static char *kwlist[] = {"function",
-                           "num_warps",
-                           "num_ctas",
-                           "shared_mem",
-                           "launch_pdl",
-                           "launch_cooperative_grid",
-                           "launch_cluster",
-                           "arg_type_codes",
-                           "has_global_scratch",
-                           "has_profile_scratch",
-                           "global_scratch_size",
-                           "global_scratch_align",
-                           "profile_scratch_size",
-                           "profile_scratch_align",
-                           "allocator",
-                           "profile_allocator",
-                           NULL};
+    static char *kwlist[] = {
+        "function", "num_warps", "num_ctas", "shared_mem",
+        "launch_pdl", "launch_cooperative_grid", "launch_cluster",
+        "arg_type_codes", "has_global_scratch", "has_profile_scratch",
+        "global_scratch_size", "global_scratch_align",
+        "profile_scratch_size", "profile_scratch_align",
+        "allocator", "profile_allocator", NULL
+    };
 
-  if (!PyArg_ParseTupleAndKeywords(
-          args, kwargs, "KiiiiiiOpp|IIIIOO", kwlist, &func_ptr, &num_warps,
-          &num_ctas, &shared_mem, &launch_pdl, &launch_coop, &launch_cluster,
-          &arg_type_codes, &has_global_scratch, &has_profile_scratch,
-          &global_scratch_size, &global_scratch_align, &profile_scratch_size,
-          &profile_scratch_align, &allocator_obj, &profile_allocator_obj))
-    return NULL;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "KiiiiiiOpp|IIIIOO", kwlist,
+            &func_ptr, &num_warps, &num_ctas, &shared_mem,
+            &launch_pdl, &launch_coop, &launch_cluster,
+            &arg_type_codes, &has_global_scratch, &has_profile_scratch,
+            &global_scratch_size, &global_scratch_align,
+            &profile_scratch_size, &profile_scratch_align,
+            &allocator_obj, &profile_allocator_obj))
+        return NULL;
 
-  TritonDispatcher *self = (TritonDispatcher *)type->tp_alloc(type, 0);
-  if (!self)
-    return NULL;
+    TritonDispatcher *self = (TritonDispatcher *)type->tp_alloc(type, 0);
+    if (!self) return NULL;
 
-  self->vectorcall = TritonDispatcher_vectorcall;
-  self->function = (CUfunction)(uintptr_t)func_ptr;
-  self->grid_mult = (unsigned)num_ctas;
-  self->block_dim_x = 32 * (unsigned)num_warps;
-  self->shared_mem = (unsigned)shared_mem;
-  self->has_global_scratch = has_global_scratch;
-  self->has_profile_scratch = has_profile_scratch;
-  self->global_scratch_size = global_scratch_size;
-  self->global_scratch_align = global_scratch_align;
-  self->profile_scratch_size = profile_scratch_size;
-  self->profile_scratch_align = profile_scratch_align;
-  self->allocator = allocator_obj;
-  Py_XINCREF(self->allocator);
-  self->profile_allocator = profile_allocator_obj;
-  Py_XINCREF(self->profile_allocator);
+    self->vectorcall = TritonDispatcher_vectorcall;
+    self->function = (CUfunction)(uintptr_t)func_ptr;
+    self->grid_mult = (unsigned)num_ctas;
+    self->block_dim_x = 32 * (unsigned)num_warps;
+    self->shared_mem = (unsigned)shared_mem;
+    self->has_global_scratch = has_global_scratch;
+    self->has_profile_scratch = has_profile_scratch;
+    self->global_scratch_size = global_scratch_size;
+    self->global_scratch_align = global_scratch_align;
+    self->profile_scratch_size = profile_scratch_size;
+    self->profile_scratch_align = profile_scratch_align;
+    self->allocator = allocator_obj;
+    Py_XINCREF(self->allocator);
+    self->profile_allocator = profile_allocator_obj;
+    Py_XINCREF(self->profile_allocator);
 
-  memset(self->launch_attrs, 0, sizeof(self->launch_attrs));
-  memset(self->arg_storage, 0, sizeof(self->arg_storage));
-  memset(self->kernel_params, 0, sizeof(self->kernel_params));
+    memset(self->launch_attrs, 0, sizeof(self->launch_attrs));
+    memset(self->arg_storage, 0, sizeof(self->arg_storage));
+    memset(self->kernel_params, 0, sizeof(self->kernel_params));
 
-  /* Parse arg types (ExtractorTypeIndex values from buildSignatureMetadata) */
-  Py_ssize_t n = PyTuple_Size(arg_type_codes);
-  if (n > TD_MAX_KERNEL_ARGS - 2) {
-    PyErr_SetString(PyExc_ValueError, "Too many kernel args");
-    Py_DECREF(self);
-    return NULL;
-  }
-  self->num_args = (int)n;
-  for (Py_ssize_t i = 0; i < n; i++)
-    self->arg_types[i] =
-        (int)PyLong_AsLong(PyTuple_GET_ITEM(arg_type_codes, i));
-  if (PyErr_Occurred()) {
-    Py_DECREF(self);
-    return NULL;
-  }
-
-  /* Build kernel_params pointers */
-  int pidx = 0;
-  for (int i = 0; i < self->num_args; i++) {
-    self->kernel_params[pidx] = &self->arg_storage[pidx];
-    pidx++;
-  }
-  self->kernel_params[pidx] = &self->arg_storage[pidx];
-  pidx++; /* global_scratch */
-  self->kernel_params[pidx] = &self->arg_storage[pidx];
-  pidx++; /* profile_scratch */
-  self->total_params = pidx;
-
-  /* Pre-build launch attributes */
-  unsigned na = 0;
-  if (launch_pdl) {
-    self->launch_attrs[na].id =
-        CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
-    self->launch_attrs[na].value.programmaticStreamSerializationAllowed = 1;
-    na++;
-  }
-  if (launch_coop) {
-    self->launch_attrs[na].id = CU_LAUNCH_ATTRIBUTE_COOPERATIVE;
-    self->launch_attrs[na].value.cooperative = 1;
-    na++;
-  }
-  if (launch_cluster || num_ctas > 1) {
-    if (num_ctas > 1) {
-      self->launch_attrs[na].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
-      self->launch_attrs[na].value.clusterDim.x = num_ctas;
-      self->launch_attrs[na].value.clusterDim.y = 1;
-      self->launch_attrs[na].value.clusterDim.z = 1;
-      na++;
+    /* Parse arg types (ExtractorTypeIndex values from buildSignatureMetadata) */
+    Py_ssize_t n = PyTuple_Size(arg_type_codes);
+    if (n > TD_MAX_KERNEL_ARGS - 2) {
+        PyErr_SetString(PyExc_ValueError, "Too many kernel args");
+        Py_DECREF(self);
+        return NULL;
     }
-    self->launch_attrs[na].id =
-        CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE;
-    self->launch_attrs[na].value.clusterSchedulingPolicyPreference =
-        CU_CLUSTER_SCHEDULING_POLICY_SPREAD;
-    na++;
-  }
-  self->num_launch_attrs = na;
+    self->num_args = (int)n;
+    for (Py_ssize_t i = 0; i < n; i++)
+        self->arg_types[i] = (int)PyLong_AsLong(PyTuple_GET_ITEM(arg_type_codes, i));
+    if (PyErr_Occurred()) {
+        Py_DECREF(self);
+        return NULL;
+    }
 
-  return (PyObject *)self;
+    /* Build kernel_params pointers */
+    int pidx = 0;
+    for (int i = 0; i < self->num_args; i++) {
+        self->kernel_params[pidx] = &self->arg_storage[pidx];
+        pidx++;
+    }
+    self->kernel_params[pidx] = &self->arg_storage[pidx]; pidx++;  /* global_scratch */
+    self->kernel_params[pidx] = &self->arg_storage[pidx]; pidx++;  /* profile_scratch */
+    self->total_params = pidx;
+
+    /* Pre-build launch attributes */
+    unsigned na = 0;
+    if (launch_pdl) {
+        self->launch_attrs[na].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+        self->launch_attrs[na].value.programmaticStreamSerializationAllowed = 1;
+        na++;
+    }
+    if (launch_coop) {
+        self->launch_attrs[na].id = CU_LAUNCH_ATTRIBUTE_COOPERATIVE;
+        self->launch_attrs[na].value.cooperative = 1;
+        na++;
+    }
+    if (launch_cluster || num_ctas > 1) {
+        if (num_ctas > 1) {
+            self->launch_attrs[na].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+            self->launch_attrs[na].value.clusterDim.x = num_ctas;
+            self->launch_attrs[na].value.clusterDim.y = 1;
+            self->launch_attrs[na].value.clusterDim.z = 1;
+            na++;
+        }
+        self->launch_attrs[na].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE;
+        self->launch_attrs[na].value.clusterSchedulingPolicyPreference = CU_CLUSTER_SCHEDULING_POLICY_SPREAD;
+        na++;
+    }
+    self->num_launch_attrs = na;
+
+    return (PyObject *)self;
 }
 
 static void TritonDispatcher_dealloc(PyObject *o) {
-  TritonDispatcher *self = (TritonDispatcher *)o;
-  Py_XDECREF(self->allocator);
-  Py_XDECREF(self->profile_allocator);
-  Py_TYPE(o)->tp_free(o);
+    TritonDispatcher *self = (TritonDispatcher *)o;
+    Py_XDECREF(self->allocator);
+    Py_XDECREF(self->profile_allocator);
+    Py_TYPE(o)->tp_free(o);
 }
 
 /* ==== THE HOT PATH ==== */
-static PyObject *TritonDispatcher_vectorcall(PyObject *callable,
-                                             PyObject *const *args,
-                                             size_t nargsf, PyObject *kwnames) {
-  TritonDispatcher *self = (TritonDispatcher *)callable;
-  Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
+static PyObject *TritonDispatcher_vectorcall(
+    PyObject *callable, PyObject *const *args, size_t nargsf, PyObject *kwnames)
+{
+    TritonDispatcher *self = (TritonDispatcher *)callable;
+    Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
 
-  if (nargs < TD_FIXED_ARGS + self->num_args) {
-    PyErr_Format(PyExc_TypeError,
-                 "_TritonDispatcher: expected %d args, got %zd",
-                 TD_FIXED_ARGS + self->num_args, nargs);
-    return NULL;
-  }
+    if (nargs < TD_FIXED_ARGS + self->num_args) {
+        PyErr_Format(PyExc_TypeError,
+            "_TritonDispatcher: expected %d args, got %zd",
+            TD_FIXED_ARGS + self->num_args, nargs);
+        return NULL;
+    }
 
-  long gx_l = PyLong_AsLong(args[0]);
-  long gy_l = PyLong_AsLong(args[1]);
-  long gz_l = PyLong_AsLong(args[2]);
-  if (PyErr_Occurred())
-    return NULL;
+    long gx_l = PyLong_AsLong(args[0]);
+    long gy_l = PyLong_AsLong(args[1]);
+    long gz_l = PyLong_AsLong(args[2]);
+    if (PyErr_Occurred()) return NULL;
 
-  unsigned gx = (unsigned)gx_l;
-  unsigned gy = (unsigned)gy_l;
-  unsigned gz = (unsigned)gz_l;
+    unsigned gx = (unsigned)gx_l;
+    unsigned gy = (unsigned)gy_l;
+    unsigned gz = (unsigned)gz_l;
 
-  if (gx * gy * gz == 0)
+    if (gx * gy * gz == 0)
+        Py_RETURN_NONE;
+
+    CUstream stream = (CUstream)(uintptr_t)PyLong_AsUnsignedLongLong(args[3]);
+
+    /* Convert kernel args.
+     * No cleanup needed on failure: scratch/profile buffers are allocated below,
+     * and no other resources have been acquired at this point. */
+    if (td_convert_args(self, args + TD_FIXED_ARGS) < 0)
+        return NULL;
+
+    /* Scratch allocation: call Python allocator if scratch is needed.
+     * alloc_size = grid_x * grid_y * grid_z * num_ctas * scratch_size */
+    PyObject *scratch_buf = NULL, *profile_buf = NULL;
+    if (self->global_scratch_size > 0 && self->allocator) {
+        unsigned long long alloc_size =
+            (unsigned long long)gx * gy * gz * self->grid_mult * self->global_scratch_size;
+        PyObject *alloc_fn = PyObject_CallMethodNoArgs(self->allocator, td_get_str);
+        if (!alloc_fn) return NULL;
+        scratch_buf = PyObject_CallFunction(alloc_fn, "KIK",
+            alloc_size, (unsigned)self->global_scratch_align, (unsigned long long)(uintptr_t)stream);
+        Py_DECREF(alloc_fn);
+        if (!scratch_buf) return NULL;
+        PyObject *ptr_obj = PyObject_CallMethodNoArgs(scratch_buf, data_ptr_str);
+        if (!ptr_obj) { Py_DECREF(scratch_buf); return NULL; }
+        self->arg_storage[self->num_args].ptr = (CUdeviceptr)PyLong_AsUnsignedLongLong(ptr_obj);
+        Py_DECREF(ptr_obj);
+    } else {
+        self->arg_storage[self->num_args].ptr = 0;
+    }
+
+    if (self->profile_scratch_size > 0 && self->profile_allocator) {
+        unsigned long long alloc_size =
+            (unsigned long long)gx * gy * gz * self->grid_mult * self->profile_scratch_size;
+        PyObject *alloc_fn = PyObject_CallMethodNoArgs(self->profile_allocator, td_get_str);
+        if (!alloc_fn) { Py_XDECREF(scratch_buf); return NULL; }
+        profile_buf = PyObject_CallFunction(alloc_fn, "KIK",
+            alloc_size, (unsigned)self->profile_scratch_align, (unsigned long long)(uintptr_t)stream);
+        Py_DECREF(alloc_fn);
+        if (!profile_buf) { Py_XDECREF(scratch_buf); return NULL; }
+        PyObject *ptr_obj = PyObject_CallMethodNoArgs(profile_buf, data_ptr_str);
+        if (!ptr_obj) { Py_DECREF(profile_buf); Py_XDECREF(scratch_buf); return NULL; }
+        self->arg_storage[self->num_args + 1].ptr = (CUdeviceptr)PyLong_AsUnsignedLongLong(ptr_obj);
+        Py_DECREF(ptr_obj);
+    } else {
+        self->arg_storage[self->num_args + 1].ptr = 0;
+    }
+
+    /* Launch using pre-built attrs.
+     * Thread safety: arg_storage is per-instance and the GIL is held up to
+     * Py_BEGIN_ALLOW_THREADS. cuLaunchKernelEx copies kernel_params at call
+     * entry (documented CUDA driver behavior), so releasing the GIL after
+     * the call begins is safe — another thread cannot corrupt params mid-copy. */
+    CUresult err;
+    Py_BEGIN_ALLOW_THREADS
+    err = td_relaunch(self, gx, gy, gz, stream);
+    Py_END_ALLOW_THREADS
+
+    /* Release scratch buffers after launch (kernel params already copied) */
+    Py_XDECREF(scratch_buf);
+    Py_XDECREF(profile_buf);
+
+    if (err != CUDA_SUCCESS) {
+        const char *s = NULL;
+        cuGetErrorString(err, &s);
+        PyErr_Format(PyExc_RuntimeError,
+            "Triton Error [CUDA]: cuLaunchKernelEx failed: %s (%d)",
+            s ? s : "unknown", (int)err);
+        return NULL;
+    }
+
     Py_RETURN_NONE;
-
-  CUstream stream = (CUstream)(uintptr_t)PyLong_AsUnsignedLongLong(args[3]);
-
-  /* Convert kernel args.
-   * No cleanup needed on failure: scratch/profile buffers are allocated below,
-   * and no other resources have been acquired at this point. */
-  if (td_convert_args(self, args + TD_FIXED_ARGS) < 0)
-    return NULL;
-
-  /* Scratch allocation: call Python allocator if scratch is needed.
-   * alloc_size = grid_x * grid_y * grid_z * num_ctas * scratch_size */
-  PyObject *scratch_buf = NULL, *profile_buf = NULL;
-  if (self->global_scratch_size > 0 && self->allocator) {
-    unsigned long long alloc_size = (unsigned long long)gx * gy * gz *
-                                    self->grid_mult * self->global_scratch_size;
-    PyObject *alloc_fn = PyObject_CallMethodNoArgs(self->allocator, td_get_str);
-    if (!alloc_fn)
-      return NULL;
-    scratch_buf = PyObject_CallFunction(alloc_fn, "KIK", alloc_size,
-                                        (unsigned)self->global_scratch_align,
-                                        (unsigned long long)(uintptr_t)stream);
-    Py_DECREF(alloc_fn);
-    if (!scratch_buf)
-      return NULL;
-    PyObject *ptr_obj = PyObject_CallMethodNoArgs(scratch_buf, data_ptr_str);
-    if (!ptr_obj) {
-      Py_DECREF(scratch_buf);
-      return NULL;
-    }
-    self->arg_storage[self->num_args].ptr =
-        (CUdeviceptr)PyLong_AsUnsignedLongLong(ptr_obj);
-    Py_DECREF(ptr_obj);
-  } else {
-    self->arg_storage[self->num_args].ptr = 0;
-  }
-
-  if (self->profile_scratch_size > 0 && self->profile_allocator) {
-    unsigned long long alloc_size = (unsigned long long)gx * gy * gz *
-                                    self->grid_mult *
-                                    self->profile_scratch_size;
-    PyObject *alloc_fn =
-        PyObject_CallMethodNoArgs(self->profile_allocator, td_get_str);
-    if (!alloc_fn) {
-      Py_XDECREF(scratch_buf);
-      return NULL;
-    }
-    profile_buf = PyObject_CallFunction(alloc_fn, "KIK", alloc_size,
-                                        (unsigned)self->profile_scratch_align,
-                                        (unsigned long long)(uintptr_t)stream);
-    Py_DECREF(alloc_fn);
-    if (!profile_buf) {
-      Py_XDECREF(scratch_buf);
-      return NULL;
-    }
-    PyObject *ptr_obj = PyObject_CallMethodNoArgs(profile_buf, data_ptr_str);
-    if (!ptr_obj) {
-      Py_DECREF(profile_buf);
-      Py_XDECREF(scratch_buf);
-      return NULL;
-    }
-    self->arg_storage[self->num_args + 1].ptr =
-        (CUdeviceptr)PyLong_AsUnsignedLongLong(ptr_obj);
-    Py_DECREF(ptr_obj);
-  } else {
-    self->arg_storage[self->num_args + 1].ptr = 0;
-  }
-
-  /* Launch using pre-built attrs.
-   * Thread safety: arg_storage is per-instance and the GIL is held up to
-   * Py_BEGIN_ALLOW_THREADS. cuLaunchKernelEx copies kernel_params at call
-   * entry (documented CUDA driver behavior), so releasing the GIL after
-   * the call begins is safe — another thread cannot corrupt params mid-copy. */
-  CUresult err;
-  Py_BEGIN_ALLOW_THREADS err = td_relaunch(self, gx, gy, gz, stream);
-  Py_END_ALLOW_THREADS
-
-      /* Release scratch buffers after launch (kernel params already copied) */
-      Py_XDECREF(scratch_buf);
-  Py_XDECREF(profile_buf);
-
-  if (err != CUDA_SUCCESS) {
-    const char *s = NULL;
-    cuGetErrorString(err, &s);
-    PyErr_Format(PyExc_RuntimeError,
-                 "Triton Error [CUDA]: cuLaunchKernelEx failed: %s (%d)",
-                 s ? s : "unknown", (int)err);
-    return NULL;
-  }
-
-  Py_RETURN_NONE;
 }
 
 static PyTypeObject TritonDispatcherType = {
-    PyVarObject_HEAD_INIT(NULL, 0).tp_name =
-        "triton.backends.nvidia._TritonDispatcher",
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "triton.backends.nvidia._TritonDispatcher",
     .tp_basicsize = sizeof(TritonDispatcher),
     .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_VECTORCALL,
     .tp_vectorcall_offset = offsetof(TritonDispatcher, vectorcall),
@@ -2127,133 +2053,109 @@ static PyTypeObject TritonDispatcherType = {
 };
 
 typedef struct {
-  PyObject_HEAD vectorcallfunc vectorcall;
-  TritonDispatcher *dispatcher;
-  unsigned grid[3];
-  PyObject *get_stream_fn;
-  PyObject *get_device_fn;
-  int num_args;
-  PyObject *slow_path_fn;
+    PyObject_HEAD
+    vectorcallfunc vectorcall;
+    TritonDispatcher *dispatcher;
+    unsigned grid[3];
+    PyObject *get_stream_fn;
+    PyObject *get_device_fn;
+    int num_args;
+    PyObject *slow_path_fn;
 } TritonJITRunner;
 
-static PyObject *JITRunner_vectorcall(PyObject *self, PyObject *const *args,
-                                      size_t nargsf, PyObject *kwnames);
+static PyObject *JITRunner_vectorcall(
+    PyObject *self, PyObject *const *args, size_t nargsf, PyObject *kwnames);
 static void JITRunner_dealloc(PyObject *self);
 
-static PyObject *JITRunner_new(PyTypeObject *type, PyObject *args,
-                               PyObject *kwargs) {
-  PyObject *dispatcher_obj, *grid_tuple, *get_stream_fn, *get_device_fn,
-      *slow_path_fn;
-  int num_kernel_args;
+static PyObject *JITRunner_new(PyTypeObject *type, PyObject *args, PyObject *kwargs) {
+    PyObject *dispatcher_obj, *grid_tuple, *get_stream_fn, *get_device_fn, *slow_path_fn;
+    int num_kernel_args;
 
-  static char *kwlist[] = {"dispatcher",
-                           "grid",
-                           "get_stream_fn",
-                           "get_device_fn",
-                           "slow_path_fn",
-                           "num_kernel_args",
-                           NULL};
-  if (!PyArg_ParseTupleAndKeywords(
-          args, kwargs, "OOOOOi", kwlist, &dispatcher_obj, &grid_tuple,
-          &get_stream_fn, &get_device_fn, &slow_path_fn, &num_kernel_args))
-    return NULL;
+    static char *kwlist[] = {
+        "dispatcher", "grid", "get_stream_fn", "get_device_fn", "slow_path_fn", "num_kernel_args", NULL
+    };
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OOOOOi", kwlist,
+            &dispatcher_obj, &grid_tuple, &get_stream_fn, &get_device_fn, &slow_path_fn, &num_kernel_args))
+        return NULL;
 
-  TritonJITRunner *self = (TritonJITRunner *)type->tp_alloc(type, 0);
-  if (!self)
-    return NULL;
+    TritonJITRunner *self = (TritonJITRunner *)type->tp_alloc(type, 0);
+    if (!self) return NULL;
 
-  self->vectorcall = JITRunner_vectorcall;
-  self->dispatcher = (TritonDispatcher *)dispatcher_obj;
-  Py_INCREF(dispatcher_obj);
+    self->vectorcall = JITRunner_vectorcall;
+    self->dispatcher = (TritonDispatcher *)dispatcher_obj;
+    Py_INCREF(dispatcher_obj);
 
-  Py_ssize_t gs = PyTuple_Size(grid_tuple);
-  self->grid[0] =
-      (gs > 0) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 0)) : 1;
-  self->grid[1] =
-      (gs > 1) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 1)) : 1;
-  self->grid[2] =
-      (gs > 2) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 2)) : 1;
+    Py_ssize_t gs = PyTuple_Size(grid_tuple);
+    self->grid[0] = (gs > 0) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 0)) : 1;
+    self->grid[1] = (gs > 1) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 1)) : 1;
+    self->grid[2] = (gs > 2) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 2)) : 1;
 
-  self->get_stream_fn = get_stream_fn;
-  Py_INCREF(get_stream_fn);
-  self->get_device_fn = get_device_fn;
-  Py_INCREF(get_device_fn);
-  self->slow_path_fn = slow_path_fn;
-  Py_INCREF(slow_path_fn);
-  self->num_args = num_kernel_args;
+    self->get_stream_fn = get_stream_fn; Py_INCREF(get_stream_fn);
+    self->get_device_fn = get_device_fn; Py_INCREF(get_device_fn);
+    self->slow_path_fn = slow_path_fn; Py_INCREF(slow_path_fn);
+    self->num_args = num_kernel_args;
 
-  return (PyObject *)self;
+    return (PyObject *)self;
 }
 
 static void JITRunner_dealloc(PyObject *o) {
-  TritonJITRunner *self = (TritonJITRunner *)o;
-  Py_XDECREF((PyObject *)self->dispatcher);
-  Py_XDECREF(self->get_stream_fn);
-  Py_XDECREF(self->get_device_fn);
-  Py_XDECREF(self->slow_path_fn);
-  Py_TYPE(o)->tp_free(o);
+    TritonJITRunner *self = (TritonJITRunner *)o;
+    Py_XDECREF((PyObject *)self->dispatcher);
+    Py_XDECREF(self->get_stream_fn);
+    Py_XDECREF(self->get_device_fn);
+    Py_XDECREF(self->slow_path_fn);
+    Py_TYPE(o)->tp_free(o);
 }
 
-static PyObject *JITRunner_vectorcall(PyObject *callable, PyObject *const *args,
-                                      size_t nargsf, PyObject *kwnames) {
-  TritonJITRunner *self = (TritonJITRunner *)callable;
-  Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
+static PyObject *JITRunner_vectorcall(
+    PyObject *callable, PyObject *const *args, size_t nargsf, PyObject *kwnames)
+{
+    TritonJITRunner *self = (TritonJITRunner *)callable;
+    Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
 
-  if (kwnames != NULL && PyTuple_GET_SIZE(kwnames) > 0) {
-    return PyObject_Vectorcall(self->slow_path_fn, args, nargsf, kwnames);
-  }
-  if (nargs < self->num_args) {
-    PyErr_Format(PyExc_TypeError, "_TritonJITRunner: expected %d args, got %zd",
-                 self->num_args, nargs);
-    return NULL;
-  }
+    if (kwnames != NULL && PyTuple_GET_SIZE(kwnames) > 0) {
+        return PyObject_Vectorcall(self->slow_path_fn, args, nargsf, kwnames);
+    }
+    if (nargs < self->num_args) {
+        PyErr_Format(PyExc_TypeError,
+            "_TritonJITRunner: expected %d args, got %zd", self->num_args, nargs);
+        return NULL;
+    }
 
-  /* The caller (activate_fast_dispatch) ensures the kernel is already
-   * compiled for these arg types. We just extract + launch. */
-  PyObject *device = PyObject_CallNoArgs(self->get_device_fn);
-  if (!device)
-    return NULL;
-  PyObject *stream_obj = PyObject_CallOneArg(self->get_stream_fn, device);
-  Py_DECREF(device);
-  if (!stream_obj)
-    return NULL;
-  uint64_t stream = PyLong_AsUnsignedLongLong(stream_obj);
-  Py_DECREF(stream_obj);
+    /* The caller (activate_fast_dispatch) ensures the kernel is already
+     * compiled for these arg types. We just extract + launch. */
+    PyObject *device = PyObject_CallNoArgs(self->get_device_fn);
+    if (!device) return NULL;
+    PyObject *stream_obj = PyObject_CallOneArg(self->get_stream_fn, device);
+    Py_DECREF(device);
+    if (!stream_obj) return NULL;
+    uint64_t stream = PyLong_AsUnsignedLongLong(stream_obj);
+    Py_DECREF(stream_obj);
 
-  /* Build dispatcher args: [grid_x, grid_y, grid_z, stream, *kernel_args] */
-  Py_ssize_t disp_nargs = TD_FIXED_ARGS + self->num_args;
-  PyObject **disp_args = (PyObject **)alloca(disp_nargs * sizeof(PyObject *));
-  PyObject *gx = PyLong_FromUnsignedLong(self->grid[0]);
-  PyObject *gy = PyLong_FromUnsignedLong(self->grid[1]);
-  PyObject *gz = PyLong_FromUnsignedLong(self->grid[2]);
-  PyObject *st = PyLong_FromUnsignedLongLong(stream);
-  if (!gx || !gy || !gz || !st) {
-    Py_XDECREF(gx);
-    Py_XDECREF(gy);
-    Py_XDECREF(gz);
-    Py_XDECREF(st);
-    return NULL;
-  }
-  disp_args[0] = gx;
-  disp_args[1] = gy;
-  disp_args[2] = gz;
-  disp_args[3] = st;
-  for (int i = 0; i < self->num_args; i++)
-    disp_args[TD_FIXED_ARGS + i] = (PyObject *)args[i];
+    /* Build dispatcher args: [grid_x, grid_y, grid_z, stream, *kernel_args] */
+    Py_ssize_t disp_nargs = TD_FIXED_ARGS + self->num_args;
+    PyObject **disp_args = (PyObject **)alloca(disp_nargs * sizeof(PyObject *));
+    PyObject *gx = PyLong_FromUnsignedLong(self->grid[0]);
+    PyObject *gy = PyLong_FromUnsignedLong(self->grid[1]);
+    PyObject *gz = PyLong_FromUnsignedLong(self->grid[2]);
+    PyObject *st = PyLong_FromUnsignedLongLong(stream);
+    if (!gx || !gy || !gz || !st) {
+        Py_XDECREF(gx); Py_XDECREF(gy); Py_XDECREF(gz); Py_XDECREF(st);
+        return NULL;
+    }
+    disp_args[0] = gx; disp_args[1] = gy; disp_args[2] = gz; disp_args[3] = st;
+    for (int i = 0; i < self->num_args; i++)
+        disp_args[TD_FIXED_ARGS + i] = (PyObject *)args[i];
 
-  PyObject *result = TritonDispatcher_vectorcall((PyObject *)self->dispatcher,
-                                                 (PyObject *const *)disp_args,
-                                                 disp_nargs, NULL);
-  Py_DECREF(gx);
-  Py_DECREF(gy);
-  Py_DECREF(gz);
-  Py_DECREF(st);
-  return result;
+    PyObject *result = TritonDispatcher_vectorcall(
+        (PyObject *)self->dispatcher, (PyObject *const *)disp_args, disp_nargs, NULL);
+    Py_DECREF(gx); Py_DECREF(gy); Py_DECREF(gz); Py_DECREF(st);
+    return result;
 }
 
 static PyTypeObject TritonJITRunnerType = {
-    PyVarObject_HEAD_INIT(NULL, 0).tp_name =
-        "triton.backends.nvidia._TritonJITRunner",
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "triton.backends.nvidia._TritonJITRunner",
     .tp_basicsize = sizeof(TritonJITRunner),
     .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_VECTORCALL,
     .tp_vectorcall_offset = offsetof(TritonJITRunner, vectorcall),
@@ -2267,80 +2169,76 @@ static PyTypeObject TritonJITRunnerType = {
  * Pre-binds grid + stream getter + dispatcher. Always extracts args fresh
  * ========================================================================= */
 typedef struct {
-  PyObject_HEAD vectorcallfunc vectorcall;
-  TritonDispatcher *dispatcher;
-  unsigned grid[3];
-  PyObject *get_stream_fn;
-  PyObject *get_device_fn;
-  PyObject *kernel;
-  int num_args;
+    PyObject_HEAD
+    vectorcallfunc vectorcall;
+    TritonDispatcher *dispatcher;
+    unsigned grid[3];
+    PyObject *get_stream_fn;
+    PyObject *get_device_fn;
+    PyObject *kernel;
+    int num_args;
 } ProxyRunner;
 
-static PyObject *ProxyRunner_vectorcall(PyObject *callable,
-                                        PyObject *const *args, size_t nargsf,
-                                        PyObject *kwnames);
+static PyObject *ProxyRunner_vectorcall(
+    PyObject *callable, PyObject *const *args, size_t nargsf, PyObject *kwnames);
 static void ProxyRunner_dealloc(PyObject *o);
 
-static PyObject *ProxyRunner_vectorcall(PyObject *callable,
-                                        PyObject *const *args, size_t nargsf,
-                                        PyObject *kwnames) {
-  ProxyRunner *self = (ProxyRunner *)callable;
-  TritonDispatcher *d = self->dispatcher;
-  Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
+static PyObject *ProxyRunner_vectorcall(
+    PyObject *callable, PyObject *const *args, size_t nargsf, PyObject *kwnames)
+{
+    ProxyRunner *self = (ProxyRunner *)callable;
+    TritonDispatcher *d = self->dispatcher;
+    Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
 
-  if (nargs < self->num_args) {
-    PyErr_Format(PyExc_TypeError, "_ProxyRunner: expected >= %d args, got %zd",
-                 self->num_args, nargs);
-    return NULL;
-  }
+    if (nargs < self->num_args) {
+        PyErr_Format(PyExc_TypeError,
+            "_ProxyRunner: expected >= %d args, got %zd", self->num_args, nargs);
+        return NULL;
+    }
 
-  /* Always extract args fresh */
-  if (td_convert_args(d, args) < 0)
-    return NULL;
+    /* Always extract args fresh */
+    if (td_convert_args(d, args) < 0) return NULL;
 
-  /* Get current stream */
-  PyObject *dev = PyObject_CallNoArgs(self->get_device_fn);
-  if (!dev)
-    return NULL;
-  PyObject *st = PyObject_CallOneArg(self->get_stream_fn, dev);
-  Py_DECREF(dev);
-  if (!st)
-    return NULL;
-  CUstream stream = (CUstream)(uintptr_t)PyLong_AsUnsignedLongLong(st);
-  Py_DECREF(st);
+    /* Get current stream */
+    PyObject *dev = PyObject_CallNoArgs(self->get_device_fn);
+    if (!dev) return NULL;
+    PyObject *st = PyObject_CallOneArg(self->get_stream_fn, dev);
+    Py_DECREF(dev);
+    if (!st) return NULL;
+    CUstream stream = (CUstream)(uintptr_t)PyLong_AsUnsignedLongLong(st);
+    Py_DECREF(st);
 
-  /* Launch.
-   * Thread safety: arg_storage is per-dispatcher-instance and td_convert_args
-   * runs while holding the GIL. cuLaunchKernelEx copies kernel_params at call
-   * entry (documented CUDA driver behavior), so releasing the GIL after the
-   * call begins is safe. Sharing the same dispatcher across Python threads is
-   * NOT supported — each ProxyRunner holds a dedicated dispatcher reference. */
-  CUresult err;
-  Py_BEGIN_ALLOW_THREADS err =
-      td_relaunch(d, self->grid[0], self->grid[1], self->grid[2], stream);
-  Py_END_ALLOW_THREADS if (err != CUDA_SUCCESS) {
-    const char *s = NULL;
-    cuGetErrorString(err, &s);
-    PyErr_Format(PyExc_RuntimeError, "cuLaunchKernelEx: %s (%d)", s ? s : "?",
-                 (int)err);
-    return NULL;
-  }
-  Py_INCREF(self->kernel);
-  return self->kernel;
+    /* Launch.
+     * Thread safety: arg_storage is per-dispatcher-instance and td_convert_args
+     * runs while holding the GIL. cuLaunchKernelEx copies kernel_params at call
+     * entry (documented CUDA driver behavior), so releasing the GIL after the
+     * call begins is safe. Sharing the same dispatcher across Python threads is
+     * NOT supported — each ProxyRunner holds a dedicated dispatcher reference. */
+    CUresult err;
+    Py_BEGIN_ALLOW_THREADS
+    err = td_relaunch(d, self->grid[0], self->grid[1], self->grid[2], stream);
+    Py_END_ALLOW_THREADS
+    if (err != CUDA_SUCCESS) {
+        const char *s = NULL; cuGetErrorString(err, &s);
+        PyErr_Format(PyExc_RuntimeError, "cuLaunchKernelEx: %s (%d)", s?s:"?", (int)err);
+        return NULL;
+    }
+    Py_INCREF(self->kernel);
+    return self->kernel;
 }
 
 static void ProxyRunner_dealloc(PyObject *o) {
-  ProxyRunner *self = (ProxyRunner *)o;
-  Py_XDECREF((PyObject *)self->dispatcher);
-  Py_XDECREF(self->get_stream_fn);
-  Py_XDECREF(self->get_device_fn);
-  Py_XDECREF(self->kernel);
-  Py_TYPE(o)->tp_free(o);
+    ProxyRunner *self = (ProxyRunner *)o;
+    Py_XDECREF((PyObject *)self->dispatcher);
+    Py_XDECREF(self->get_stream_fn);
+    Py_XDECREF(self->get_device_fn);
+    Py_XDECREF(self->kernel);
+    Py_TYPE(o)->tp_free(o);
 }
 
 static PyTypeObject ProxyRunnerType = {
-    PyVarObject_HEAD_INIT(NULL, 0).tp_name =
-        "triton.backends.nvidia._ProxyRunner",
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "triton.backends.nvidia._ProxyRunner",
     .tp_basicsize = sizeof(ProxyRunner),
     .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_VECTORCALL,
     .tp_vectorcall_offset = offsetof(ProxyRunner, vectorcall),
@@ -2353,182 +2251,128 @@ static PyTypeObject ProxyRunnerType = {
  * Creates _ProxyRunner per grid, caching in _runner_cache dict.
  * ========================================================================= */
 static PyObject *fast_subscript(PyObject *self, PyObject *grid) {
-  static PyObject *_rc_key = NULL;
-  if (!_rc_key)
-    _rc_key = PyUnicode_InternFromString("_runner_cache");
+    static PyObject *_rc_key = NULL;
+    if (!_rc_key) _rc_key = PyUnicode_InternFromString("_runner_cache");
 
-  /* Normalize grid to tuple for consistent cache key */
-  PyObject *grid_tuple;
-  if (!PyTuple_Check(grid)) {
-    grid_tuple = PyTuple_Pack(1, grid);
-    if (!grid_tuple)
-      return NULL;
-  } else {
-    grid_tuple = grid;
-    Py_INCREF(grid_tuple);
-  }
-
-  PyObject **dictptr = _PyObject_GetDictPtr(self);
-  if (!dictptr || !*dictptr) {
-    Py_DECREF(grid_tuple);
-    goto fallback;
-  }
-  PyObject *dict = *dictptr;
-
-  PyObject *cache = PyDict_GetItem(dict, _rc_key);
-  if (!cache) {
-    Py_DECREF(grid_tuple);
-    goto fallback;
-  }
-
-  PyObject *runner = PyDict_GetItem(cache, grid_tuple);
-  if (runner) {
-    Py_DECREF(grid_tuple);
-    Py_INCREF(runner);
-    return runner;
-  }
-
-  /* Create new ProxyRunner */
-  {
-    static PyObject *_disp_key = NULL, *_nka_key = NULL, *_gsf_key = NULL,
-                    *_gdf_key = NULL, *_kern_key = NULL;
-    if (!_disp_key) {
-      _disp_key = PyUnicode_InternFromString("_fast_dispatcher");
-      _nka_key = PyUnicode_InternFromString("_fast_num_args");
-      _gsf_key = PyUnicode_InternFromString("_fast_get_stream");
-      _gdf_key = PyUnicode_InternFromString("_fast_get_device");
-      _kern_key = PyUnicode_InternFromString("_fast_kernel");
+    /* Normalize grid to tuple for consistent cache key */
+    PyObject *grid_tuple;
+    if (!PyTuple_Check(grid)) {
+        grid_tuple = PyTuple_Pack(1, grid);
+        if (!grid_tuple) return NULL;
+    } else {
+        grid_tuple = grid;
+        Py_INCREF(grid_tuple);
     }
 
-    PyObject *disp = PyDict_GetItem(dict, _disp_key);
-    if (!disp) {
-      Py_DECREF(grid_tuple);
-      goto fallback;
-    }
-    PyObject *kern = PyDict_GetItem(dict, _kern_key);
-    if (!kern)
-      kern = Py_None;
+    PyObject **dictptr = _PyObject_GetDictPtr(self);
+    if (!dictptr || !*dictptr) { Py_DECREF(grid_tuple); goto fallback; }
+    PyObject *dict = *dictptr;
 
-    PyObject *nka_obj = PyDict_GetItem(dict, _nka_key);
-    int nka = nka_obj ? (int)PyLong_AsLong(nka_obj) : 0;
-    PyObject *gsf = PyDict_GetItem(dict, _gsf_key);
-    PyObject *gdf = PyDict_GetItem(dict, _gdf_key);
-    if (!gsf || !gdf) {
-      Py_DECREF(grid_tuple);
-      goto fallback;
-    }
+    PyObject *cache = PyDict_GetItem(dict, _rc_key);
+    if (!cache) { Py_DECREF(grid_tuple); goto fallback; }
 
-    ProxyRunner *pr = PyObject_New(ProxyRunner, &ProxyRunnerType);
-    if (!pr) {
-      Py_DECREF(grid_tuple);
-      return NULL;
-    }
-    pr->vectorcall = ProxyRunner_vectorcall;
-    /* Multiple ProxyRunner instances may reference the same TritonDispatcher.
-     * This is safe because: (1) td_convert_args + cuLaunchKernelEx both run
-     * while holding the GIL, and cuLaunchKernelEx copies kernel_params at
-     * call entry before we release the GIL via Py_BEGIN_ALLOW_THREADS.
-     * (2) Each ProxyRunner_vectorcall completes the full sequence
-     * (convert → launch → GIL release) atomically from Python's perspective.
-     * Direct multi-threaded use of kernel._dispatcher without the GIL is
-     * unsupported (same restriction as all CPython C extension objects). */
-    pr->dispatcher = (TritonDispatcher *)disp;
-    Py_INCREF(disp);
-    Py_ssize_t gs = PyTuple_Size(grid_tuple);
-    pr->grid[0] =
-        (gs > 0) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 0)) : 1;
-    pr->grid[1] =
-        (gs > 1) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 1)) : 1;
-    pr->grid[2] =
-        (gs > 2) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 2)) : 1;
+    PyObject *runner = PyDict_GetItem(cache, grid_tuple);
+    if (runner) { Py_DECREF(grid_tuple); Py_INCREF(runner); return runner; }
 
-    pr->get_stream_fn = gsf;
-    Py_INCREF(gsf);
-    pr->get_device_fn = gdf;
-    Py_INCREF(gdf);
-    pr->kernel = kern;
-    Py_INCREF(kern);
-    pr->num_args = nka;
+    /* Create new ProxyRunner */
+    {
+        static PyObject *_disp_key = NULL, *_nka_key = NULL, *_gsf_key = NULL, *_gdf_key = NULL, *_kern_key = NULL;
+        if (!_disp_key) {
+            _disp_key = PyUnicode_InternFromString("_fast_dispatcher");
+            _nka_key = PyUnicode_InternFromString("_fast_num_args");
+            _gsf_key = PyUnicode_InternFromString("_fast_get_stream");
+            _gdf_key = PyUnicode_InternFromString("_fast_get_device");
+            _kern_key = PyUnicode_InternFromString("_fast_kernel");
+        }
 
-    if (PyDict_SetItem(cache, grid_tuple, (PyObject *)pr) < 0) {
-      Py_DECREF(grid_tuple);
-      Py_DECREF(pr);
-      return NULL;
+        PyObject *disp = PyDict_GetItem(dict, _disp_key);
+        if (!disp) { Py_DECREF(grid_tuple); goto fallback; }
+        PyObject *kern = PyDict_GetItem(dict, _kern_key);
+        if (!kern) kern = Py_None;
+
+        PyObject *nka_obj = PyDict_GetItem(dict, _nka_key);
+        int nka = nka_obj ? (int)PyLong_AsLong(nka_obj) : 0;
+        PyObject *gsf = PyDict_GetItem(dict, _gsf_key);
+        PyObject *gdf = PyDict_GetItem(dict, _gdf_key);
+        if (!gsf || !gdf) { Py_DECREF(grid_tuple); goto fallback; }
+
+        ProxyRunner *pr = PyObject_New(ProxyRunner, &ProxyRunnerType);
+        if (!pr) { Py_DECREF(grid_tuple); return NULL; }
+        pr->vectorcall = ProxyRunner_vectorcall;
+        /* Multiple ProxyRunner instances may reference the same TritonDispatcher.
+         * This is safe because: (1) td_convert_args + cuLaunchKernelEx both run
+         * while holding the GIL, and cuLaunchKernelEx copies kernel_params at
+         * call entry before we release the GIL via Py_BEGIN_ALLOW_THREADS.
+         * (2) Each ProxyRunner_vectorcall completes the full sequence
+         * (convert → launch → GIL release) atomically from Python's perspective.
+         * Direct multi-threaded use of kernel._dispatcher without the GIL is
+         * unsupported (same restriction as all CPython C extension objects). */
+        pr->dispatcher = (TritonDispatcher *)disp; Py_INCREF(disp);
+        Py_ssize_t gs = PyTuple_Size(grid_tuple);
+        pr->grid[0] = (gs > 0) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 0)) : 1;
+        pr->grid[1] = (gs > 1) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 1)) : 1;
+        pr->grid[2] = (gs > 2) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 2)) : 1;
+
+        pr->get_stream_fn = gsf; Py_INCREF(gsf);
+        pr->get_device_fn = gdf; Py_INCREF(gdf);
+        pr->kernel = kern; Py_INCREF(kern);
+        pr->num_args = nka;
+
+        if (PyDict_SetItem(cache, grid_tuple, (PyObject *)pr) < 0) {
+            Py_DECREF(grid_tuple);
+            Py_DECREF(pr);
+            return NULL;
+        }
+        Py_DECREF(grid_tuple);
+        return (PyObject *)pr;
     }
-    Py_DECREF(grid_tuple);
-    return (PyObject *)pr;
-  }
 
 fallback:;
-  /* Build functools.partial(self.run, grid=grid, warmup=False) */
-  static PyObject *_run_str = NULL, *_grid_str = NULL, *_warmup_str = NULL;
-  if (!_run_str)
-    _run_str = PyUnicode_InternFromString("run");
-  if (!_grid_str)
-    _grid_str = PyUnicode_InternFromString("grid");
-  if (!_warmup_str)
-    _warmup_str = PyUnicode_InternFromString("warmup");
-  PyObject *run = PyObject_GetAttr(self, _run_str);
-  if (!run)
-    return NULL;
-  PyObject *kw = PyDict_New();
-  if (!kw) {
-    Py_DECREF(run);
-    return NULL;
-  }
-  if (PyDict_SetItem(kw, _grid_str, grid) < 0 ||
-      PyDict_SetItem(kw, _warmup_str, Py_False) < 0) {
-    Py_DECREF(run);
-    Py_DECREF(kw);
-    return NULL;
-  }
-  PyObject *partial_mod = PyImport_ImportModule("functools");
-  if (!partial_mod) {
-    Py_DECREF(run);
-    Py_DECREF(kw);
-    return NULL;
-  }
-  PyObject *partial_fn = PyObject_GetAttrString(partial_mod, "partial");
-  Py_DECREF(partial_mod);
-  PyObject *pack = PyTuple_Pack(1, run);
-  if (!pack) {
-    Py_DECREF(partial_fn);
-    Py_DECREF(run);
-    Py_DECREF(kw);
-    return NULL;
-  }
-  PyObject *result = PyObject_Call(partial_fn, pack, kw);
-  Py_DECREF(pack);
-  Py_DECREF(partial_fn);
-  Py_DECREF(run);
-  Py_DECREF(kw);
-  return result;
+    /* Build functools.partial(self.run, grid=grid, warmup=False) */
+    static PyObject *_run_str = NULL, *_grid_str = NULL, *_warmup_str = NULL;
+    if (!_run_str) _run_str = PyUnicode_InternFromString("run");
+    if (!_grid_str) _grid_str = PyUnicode_InternFromString("grid");
+    if (!_warmup_str) _warmup_str = PyUnicode_InternFromString("warmup");
+    PyObject *run = PyObject_GetAttr(self, _run_str);
+    if (!run) return NULL;
+    PyObject *kw = PyDict_New();
+    if (!kw) { Py_DECREF(run); return NULL; }
+    if (PyDict_SetItem(kw, _grid_str, grid) < 0 ||
+        PyDict_SetItem(kw, _warmup_str, Py_False) < 0) {
+        Py_DECREF(run); Py_DECREF(kw); return NULL;
+    }
+    PyObject *partial_mod = PyImport_ImportModule("functools");
+    if (!partial_mod) { Py_DECREF(run); Py_DECREF(kw); return NULL; }
+    PyObject *partial_fn = PyObject_GetAttrString(partial_mod, "partial");
+    Py_DECREF(partial_mod);
+    PyObject *pack = PyTuple_Pack(1, run);
+    if (!pack) { Py_DECREF(partial_fn); Py_DECREF(run); Py_DECREF(kw); return NULL; }
+    PyObject *result = PyObject_Call(partial_fn, pack, kw);
+    Py_DECREF(pack); Py_DECREF(partial_fn); Py_DECREF(run); Py_DECREF(kw);
+    return result;
 }
 
-/* create_fast_jit_type(base_type) — create heap type with mp_subscript =
- * fast_subscript */
-static PyObject *py_create_fast_jit_type(PyObject *module,
-                                         PyObject *base_type) {
-  if (!PyType_Check(base_type)) {
-    PyErr_SetString(PyExc_TypeError, "Expected a type");
-    return NULL;
-  }
-  static PyType_Slot slots[] = {
-      {Py_mp_subscript, fast_subscript},
-      {0, NULL},
-  };
-  PyType_Spec spec = {
-      .name = "triton.backends.nvidia._FastJITFunction",
-      .basicsize = 0,
-      .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HEAPTYPE,
-      .slots = slots,
-  };
-  PyObject *bases = PyTuple_Pack(1, base_type);
-  if (!bases)
-    return NULL;
-  PyObject *new_type = PyType_FromSpecWithBases(&spec, bases);
-  Py_DECREF(bases);
-  return new_type;
+/* create_fast_jit_type(base_type) — create heap type with mp_subscript = fast_subscript */
+static PyObject *py_create_fast_jit_type(PyObject *module, PyObject *base_type) {
+    if (!PyType_Check(base_type)) {
+        PyErr_SetString(PyExc_TypeError, "Expected a type");
+        return NULL;
+    }
+    static PyType_Slot slots[] = {
+        {Py_mp_subscript, fast_subscript},
+        {0, NULL},
+    };
+    PyType_Spec spec = {
+        .name = "triton.backends.nvidia._FastJITFunction",
+        .basicsize = 0,
+        .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HEAPTYPE,
+        .slots = slots,
+    };
+    PyObject *bases = PyTuple_Pack(1, base_type);
+    if (!bases) return NULL;
+    PyObject *new_type = PyType_FromSpecWithBases(&spec, bases);
+    Py_DECREF(bases);
+    return new_type;
 }
 
 /* ========================================================================= */

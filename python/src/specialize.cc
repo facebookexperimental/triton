@@ -678,8 +678,8 @@ struct ParamMeta {
   uint8_t do_not_specialize : 1;
   uint8_t do_not_specialize_on_alignment : 1;
   uint8_t has_annotation : 1;
-  uint8_t
-      is_ptr : 1; // Set if annotation starts with '*' (pointer/tensor param)
+  uint8_t is_ptr
+      : 1; // Set if annotation starts with '*' (pointer/tensor param)
   uint8_t is_tensordesc : 1; // Set if annotation starts with 'tensordesc'
   uint8_t annotation_type_code;
 };

@@ -17,8 +17,7 @@ namespace triton {
 namespace nvidia_gpu {
 
 inline bool isWSBarrierReorderEnabled() {
-  auto disableReorder =
-      triton::tools::getBoolEnv("TRITON_DISABLE_WSBARRIER_REORDER");
+  auto disableReorder = triton::tools::getBoolEnv("TRITON_DISABLE_WSBARRIER_REORDER");
   return !disableReorder;
 }
 

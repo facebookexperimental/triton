@@ -2134,8 +2134,9 @@ public:
           }
           if (safeToMutate) {
             // Safe: mutate the local_load and chain in place.
-            current.setType(cast<RankedTensorType>(current.getType())
-                                .cloneWithEncoding(srcEnc));
+            current.setType(
+                cast<RankedTensorType>(current.getType())
+                    .cloneWithEncoding(srcEnc));
             for (Operation *chainOp : backwardChain) {
               for (Value result : chainOp->getResults()) {
                 if (auto rty = dyn_cast<RankedTensorType>(result.getType()))
@@ -2146,8 +2147,8 @@ public:
             // Unsafe: fall back to inserting a convert on this operand.
             rewriter.setInsertionPoint(op);
             auto newTy = ty.cloneWithEncoding(srcEnc);
-            auto newCvt = ConvertLayoutOp::create(rewriter, op->getLoc(), newTy,
-                                                  operand.get());
+            auto newCvt = ConvertLayoutOp::create(rewriter, op->getLoc(),
+                                                  newTy, operand.get());
             operand.set(newCvt);
           }
         } else {
