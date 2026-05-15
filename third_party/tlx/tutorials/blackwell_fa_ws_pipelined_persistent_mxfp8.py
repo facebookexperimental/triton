@@ -1389,8 +1389,8 @@ def _softmax_recompute_quantization_iter(
         tlx.local_store(
             tlx.local_slice(
                 tlx.local_view(ds_scale_dq_smem, 0),
-                [0, 0, 0, subtile_id * 4 // DS_NUM_SUBS, 0],
-                [REP_N, REP_M, 32, 4 // DS_NUM_SUBS, 4],
+                [0, 0, 0, subtile_id * (4 // DS_NUM_SUBS), 0],
+                [REP_M, REP_N, 32, 4 // DS_NUM_SUBS, 4],
             ),
             ds_scale_dq_packed,
         )
@@ -1482,7 +1482,7 @@ def _attn_bwd_mxf8_ws(
 
     # TODO: Support DS_NUM_SUBS = 2 or DS_NUM_SUBS = 4.
     # Currently there are accuracy issues.
-    DS_NUM_SUBS: tl.constexpr = 1
+    DS_NUM_SUBS: tl.constexpr = 4
 
     # ===== TMEM allocations =====
     # Single-region accumulator alias (qk/dp/p/dq overlap). Lifetime correctness
