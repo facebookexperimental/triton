@@ -1327,7 +1327,7 @@ def _softmax_recompute_quantization_iter(
     for subtile_id in tl.static_range(DS_NUM_SUBS):
         m = m_slices[subtile_id]
 
-        qkT_scaled = qkT_slices[subtile_id] * qk_scale - m[None, :]
+        qkT_scaled = _fma_f32x2(qkT_slices[subtile_id], qk_scale, -m[None, :])
         # Clamp to prevent FP32 overflow downstream in P*dP
         qkT_scaled = tl.minimum(qkT_scaled, 20.0)
         pT = tl.math.exp2(qkT_scaled)
