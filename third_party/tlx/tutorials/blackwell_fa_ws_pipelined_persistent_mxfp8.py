@@ -1285,7 +1285,6 @@ def _softmax_recompute_quantization_iter(
     p_tiles,
     p_scale_buf,
     p_fulls,
-    p_empties,
     dp_tiles,
     dp_fulls,
     dp_empties,
@@ -1340,8 +1339,6 @@ def _softmax_recompute_quantization_iter(
         block_amax_p = tl.math.exp2(block_maxes_p)
 
         # Quantize P^T -> TMEM (FP8 data + E8M0 scales)
-        if subtile_id == 0:
-            tlx.barrier_wait(p_empties[0], tmem_phase ^ 1)
         p_fp8, p_scale = _to_mxfp8_block_with_block_amax(
             pT,
             block_amax_p,
@@ -1876,7 +1873,6 @@ def _attn_bwd_mxf8_ws(
                     p_tiles,
                     p_scale_tmem_prologue,
                     p_fulls,
-                    p_empties,
                     dp_tiles,
                     dp_fulls,
                     dp_empties,
@@ -1914,7 +1910,6 @@ def _attn_bwd_mxf8_ws(
                         p_tiles,
                         p_scale_tmem,
                         p_fulls,
-                        p_empties,
                         dp_tiles,
                         dp_fulls,
                         dp_empties,
