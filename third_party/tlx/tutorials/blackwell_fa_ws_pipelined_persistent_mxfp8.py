@@ -2044,7 +2044,6 @@ def _attn_bwd_mxf8_ws(
                 # MMA 2: Handled by ds_fulls before MMA 4.
                 # with buffers: v_scale_tmem, do_scale_dp_tmem
                 tlx.barrier_wait(p_empties[0], tmem_phase ^ 1)
-                tlx.barrier_wait(dq_empties[0], tmem_phase_prev)
                 # REUSE_GROUP_4 SYNCHRONIZATION:
                 # ALL PROLOGUES MUST WAIT FOR DK_TILES TO EMPTY
                 tlx.barrier_wait(dk_empties[0], persistent_tmem_phase ^ 1)
@@ -2070,6 +2069,7 @@ def _attn_bwd_mxf8_ws(
                 # MMA 5 handled by dq_empties[0] above.
                 tlx.barrier_wait(v_fulls[kv_buf_id], kv_phase)
                 tlx.barrier_wait(do_fulls[do_buf_id], do_phase)
+                tlx.barrier_wait(dq_empties[0], tmem_phase_prev)
                 tlx.tmem_copy(v_scale_smem[kv_buf_id], v_scale_tmem_prologue[0])
                 tlx.tmem_copy(do_scale_smem[do_buf_id], do_scale_dp_tmem_prologue[0])
                 doT = tlx.local_trans(do_smem[do_buf_id])
