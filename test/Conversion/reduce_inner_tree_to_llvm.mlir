@@ -2,9 +2,9 @@
 
 // Test that the inner_tree reduction ordering produces count-up shuffle order
 // (stride 2, 4, 8, 16) instead of the default count-down order (16, 8, 4, 2).
-// With this layout, register bit 1 maps to the reduction axis (row offset 2),
-// so SRC0+SRC2 and SRC1+SRC3 are first combined within-thread, then each
-// combined value gets a count-up warp reduction.
+// The reduction axis is ordered by row offset, so SRC0+SRC1 and SRC2+SRC3 are
+// first combined within-thread, then each combined value gets a count-up warp
+// reduction.
 
 #linear = #ttg.linear<{register = [[0, 2], [2, 0]], lane = [[0, 8], [8, 0], [1, 0], [4, 0], [16, 0]], warp = [[0, 1], [0, 4]], block = []}>
 
@@ -17,9 +17,9 @@ tt.func private @reduce_inner_tree(%arg0: tensor<32x16xi32, #linear>) -> tensor<
   // CHECK: [[SRC2:%.*]] = extractvalue {{.*}} %0, 2
   // CHECK: [[SRC3:%.*]] = extractvalue {{.*}} %0, 3
 
-  // Within-thread reduction: combine registers that differ in the reduction axis
-  // CHECK: [[C0:%.*]] = add i32 [[SRC0]], [[SRC2]]
-  // CHECK: [[C1:%.*]] = add i32 [[SRC1]], [[SRC3]]
+  // Within-thread reduction: combine adjacent values on the reduction axis.
+  // CHECK: [[C0:%.*]] = add i32 [[SRC0]], [[SRC1]]
+  // CHECK: [[C1:%.*]] = add i32 [[SRC2]], [[SRC3]]
 
   // INNER_TREE count-up warp shuffle for combined0: strides 2, 4, 8, 16
   // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[C0]], i32 2, i32 31)

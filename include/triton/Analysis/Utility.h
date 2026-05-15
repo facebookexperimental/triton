@@ -56,6 +56,13 @@ public:
 
   unsigned getIntraWarpSizeWithUniqueData();
 
+  // Number of non-contiguous register groups along the reduction axis.
+  // When the tile exceeds the layout's single-pass coverage, register
+  // values wrap and each thread holds elements from multiple disjoint
+  // regions (e.g., elements 0 and 128). Each contiguous run forms one
+  // group. Returns 1 when all register values are contiguous (no wrap).
+  unsigned getNumRegGroupsOnAxis();
+
   // The shape of the shared memory space needed for the reduction.
   SmallVector<unsigned> getScratchRepShape();
 
