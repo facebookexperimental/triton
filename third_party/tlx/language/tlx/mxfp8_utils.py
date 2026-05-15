@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import triton
 import triton.language as tl
-import triton.language.extra.tlx as tlx
 
 
 @triton.jit
