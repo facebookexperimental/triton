@@ -223,6 +223,14 @@ def _softmax_inner_loop(
 
     for start_n in tl.range(lo, hi, BLOCK_N):
         _, qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
+        # Hoisted from its original position (between alpha compute and alpha
+        # store) to here. SYNCS.PHASECHK.TRYWAIT acts as a ptxas scheduling
+        # fence — in the original position it splits the softmax compute+store
+        # into two separately-scheduled regions (~680 SASS instructions apart).
+        # Moving both SYNCS waits adjacent here keeps the entire softmax body
+        # as one scheduling region, letting ptxas pipeline more aggressively.
+        # ncu confirms: -1.7% cycles (7.92M vs 8.06M), same instruction count.
+        tlx.barrier_wait(tlx.local_view(alpha_empties, cid), qk_phase ^ 1)
         tlx.barrier_wait(tlx.local_view(qk_fulls, cid), qk_phase)
         qk = tlx.local_load(tlx.local_view(qk_tiles, cid))
         if SHARE_SCALE_BUFFERS:
@@ -251,7 +259,6 @@ def _softmax_inner_loop(
             m_ij = tl.maximum(m_i, row_max * qk_scale)
             alpha = tl.math.exp2(m_i - m_ij)
 
-        tlx.barrier_wait(tlx.local_view(alpha_empties, cid), qk_phase ^ 1)
         tlx.local_store(tlx.local_view(alpha_tiles, cid), alpha[:, None])
         tlx.barrier_arrive(tlx.local_view(alpha_fulls, cid))
 
