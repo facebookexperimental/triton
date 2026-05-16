@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2
 from triton.tools.tensor_descriptor import TensorDescriptor
 from triton.language.extra.tlx.mxfp8_utils import _to_mxfp8_block, _to_mxfp8_block_with_block_amax
 from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode
@@ -65,26 +66,6 @@ def _get_bufidx_phase(accum_cnt, NUM_BUFFERS_KV):
     bufIdx = accum_cnt % NUM_BUFFERS_KV
     phase = (accum_cnt // NUM_BUFFERS_KV) & 1
     return bufIdx, phase
-
-
-@triton.jit
-def _mul_f32x2(a, b):
-    return tl.inline_asm_elementwise(
-        """
-        {
-            .reg .b64 ra, rb, rc;
-            mov.b64 ra, { $2, $3 };
-            mov.b64 rb, { $4, $5 };
-            mul.f32x2 rc, ra, rb;
-            mov.b64 { $0, $1 }, rc;
-        }
-        """,
-        "=r,=r,r,r,r,r",
-        [a, b],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=2,
-    )
 
 
 @triton.jit
