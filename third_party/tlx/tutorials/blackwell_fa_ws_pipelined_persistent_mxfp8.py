@@ -1231,7 +1231,7 @@ def _attn_bwd_preprocess(
     off_h = off_hz % H
     off_z = off_hz // H
     base = (off_z * H + off_h) * N_CTX
-    o_offsets = ((base + off_m[:, None]) * HEAD_DIM + off_d[None, :])
+    o_offsets = (base + off_m[:, None]) * HEAD_DIM + off_d[None, :]
     o_mask = off_m[:, None] < N_CTX
     o = tl.load(O + o_offsets, mask=o_mask, other=0.0)
     do = tl.load(DO + o_offsets, mask=o_mask, other=0.0).to(tl.float32)
@@ -1306,6 +1306,108 @@ mxfp8_bwd_configs = [
         pre_hook=_mxf8_bwd_host_descriptor_pre_hook,
     ),
 ]
+
+
+@triton.jit
+def _softmax_recompute_quantization_iter(
+    M_off,
+    D_off,
+    curr_m,
+    blk_idx,
+    qk_scale,
+    qk_tiles,
+    qk_fulls,
+    qk_empties,
+    p_tiles,
+    p_scale_buf,
+    p_fulls,
+    p_empties,
+    dp_tiles,
+    dp_fulls,
+    dp_empties,
+    ds_tiles_smem,
+    ds_dq_tiles_smem,
+    ds_scale_smem,
+    ds_scale_dq_smem,
+    ds_fulls,
+    ds_empties,
+    NUM_BUFFERS_TMEM: tl.constexpr,
+    NUM_BUFFERS_DS: tl.constexpr,
+    BLOCK_M1: tl.constexpr,
+    BLOCK_N1: tl.constexpr,
+    BWD_NUM_BLOCKS: tl.constexpr,
+    VEC_SIZE: tl.constexpr,
+    p_dtype: tl.constexpr,
+    REP_N: tl.constexpr,
+    REP_M: tl.constexpr,
+):
+    _, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
+    offs_m = curr_m + tl.arange(0, BLOCK_M1)
+    m = tl.load(M_off + offs_m)
+
+    # Read QK from TMEM, apply sm_scale -> P
+    tlx.barrier_wait(qk_fulls[0], tmem_phase)
+    qkT = tlx.local_load(qk_tiles[0])
+    # qk_tiles, dp_tiles, dq_tiles all share the same physical
+    # TMEM cols 0-127 (qkdp_alias, single-buffered). Force the
+    # TMEM read to drain into registers before signaling the
+    # MMA partition that the region is empty - otherwise MMA 2
+    # (which writes dp_tiles into the same cols) can overwrite
+    # qk while this load is still in flight.
+    tlx.barrier_arrive(qk_empties[0])
+
+    qkT_scaled = qkT * qk_scale - m[None, :]
+    # Clamp to prevent FP32 overflow downstream in P*dP
+    qkT_scaled = tl.minimum(qkT_scaled, 20.0)
+    pT = tl.math.exp2(qkT_scaled)
+
+    # Block amax for P via monotonicity of exp2
+    qkT_reshaped = tl.reshape(qkT_scaled, [BLOCK_N1, BWD_NUM_BLOCKS, VEC_SIZE])
+    block_maxes_p = tl.max(qkT_reshaped, 2)
+    block_amax_p = tl.math.exp2(block_maxes_p)
+
+    # Quantize P^T -> TMEM (FP8 data + E8M0 scales)
+    tlx.barrier_wait(p_empties[0], tmem_phase ^ 1)
+    p_fp8, p_scale = _to_mxfp8_block_with_block_amax(
+        pT,
+        block_amax_p,
+        VEC_SIZE,
+        p_dtype,
+    )
+    tlx.local_store(tlx.local_view(p_tiles, 0), p_fp8)
+    tlx.local_store(tlx.local_view(p_scale_buf, 0), p_scale)
+    tlx.barrier_arrive(p_fulls[0])
+    ds_buf_id, ds_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
+    # Finish dS for the previous M-block.
+    Di = tl.load(D_off + offs_m)
+    tlx.barrier_wait(dp_fulls[0], tmem_phase)
+    dpT = tlx.local_load(dp_tiles[0])
+    tlx.barrier_arrive(dp_empties[0])
+
+    dsT = _mul_f32x2(pT, (dpT - Di[None, :]))
+    # NaN sanitization (boundary tiles)
+    dsT = tl.where(dsT == dsT, dsT, 0.0)
+    # Quantize dS twice: dK consumes dS^T, while dQ consumes dS
+    # with the opposite reduction axis and therefore needs a
+    # separate blockscaled encoding.
+    tlx.barrier_wait(ds_empties[ds_buf_id], ds_phase ^ 1)
+    ds_fp8, ds_scale = _to_mxfp8_block(
+        dsT,
+        VEC_SIZE,
+        p_dtype,
+    )
+    tlx.local_store(tlx.local_view(ds_tiles_smem, ds_buf_id), ds_fp8)
+    ds_scale_packed = ds_scale.reshape([REP_N, 4, 32, REP_M, 4]).permute(0, 3, 2, 1, 4)
+    tlx.local_store(tlx.local_view(ds_scale_smem, 0), ds_scale_packed)
+    ds_dq_fp8, ds_scale_dq = _to_mxfp8_block(
+        tl.trans(dsT),
+        VEC_SIZE,
+        p_dtype,
+    )
+    tlx.local_store(tlx.local_view(ds_dq_tiles_smem, ds_buf_id), ds_dq_fp8)
+    ds_scale_dq_packed = ds_scale_dq.reshape([REP_M, 4, 32, REP_N, 4]).permute(0, 3, 2, 1, 4)
+    tlx.local_store(tlx.local_view(ds_scale_dq_smem, 0), ds_scale_dq_packed)
+    tlx.barrier_arrive(ds_fulls[ds_buf_id])
 
 
 @triton.autotune(
@@ -1504,13 +1606,13 @@ def _attn_bwd_mxf8_ws(
     # async transfers from SMEM to TMEM.
     # (1, REP_M, REP_HEAD, 2, 256)
     ds_scale_smem = tlx.local_alloc(
-        (1, REP_N, REP_M, 2, 256),
+        (REP_N, REP_M, 32, 4, 4),
         tl.uint8,
         NUM_BUFFERS_TMEM,
         tlx.storage_kind.smem,
     )
     ds_scale_dq_smem = tlx.local_alloc(
-        (1, REP_M, REP_N, 2, 256),
+        (REP_M, REP_N, 32, 4, 4),
         tl.uint8,
         NUM_BUFFERS_TMEM,
         tlx.storage_kind.smem,
@@ -1754,152 +1856,80 @@ def _attn_bwd_mxf8_ws(
                 BWD_NUM_BLOCKS: tl.constexpr = BLOCK_M1 // VEC_SIZE
 
                 # Prologue: produce P for the first M-block.
-                _, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
-                offs_m = curr_m + tl.arange(0, BLOCK_M1)
-                m = tl.load(M_off + offs_m)
-
-                # Read QK from TMEM, apply sm_scale -> P
-                tlx.barrier_wait(qk_fulls[0], tmem_phase)
-                qkT = tlx.local_load(qk_tiles[0])
-                # qk_tiles, dp_tiles, dq_tiles all share the same physical
-                # TMEM cols 0-127 (qkdp_alias, single-buffered). Force the
-                # TMEM read to drain into registers before signaling the
-                # MMA partition that the region is empty - otherwise MMA 2
-                # (which writes dp_tiles into the same cols) can overwrite
-                # qk while this load is still in flight.
-                tlx.barrier_arrive(qk_empties[0])
-
-                qkT_scaled = qkT * qk_scale - m[None, :]
-                # Clamp to prevent FP32 overflow downstream in P*dP
-                qkT_scaled = tl.minimum(qkT_scaled, 20.0)
-                pT = tl.math.exp2(qkT_scaled)
-
-                # Block amax for P via monotonicity of exp2
-                qkT_reshaped = tl.reshape(qkT_scaled, [BLOCK_N1, BWD_NUM_BLOCKS, VEC_SIZE])
-                block_maxes_p = tl.max(qkT_reshaped, 2)
-                block_amax_p = tl.math.exp2(block_maxes_p)
-
-                # Quantize P^T -> TMEM (FP8 data + E8M0 scales)
-                tlx.barrier_wait(p_empties[0], tmem_phase ^ 1)
-                p_fp8, p_scale = _to_mxfp8_block_with_block_amax(
-                    pT,
-                    block_amax_p,
+                # Call _softmax_recompute_quantization_iter with
+                # p_scale_tmem_prologue
+                _softmax_recompute_quantization_iter(
+                    M_off,
+                    D_off,
+                    curr_m,
+                    blk_idx,
+                    qk_scale,
+                    qk_tiles,
+                    qk_fulls,
+                    qk_empties,
+                    p_tiles,
+                    p_scale_tmem_prologue,
+                    p_fulls,
+                    p_empties,
+                    dp_tiles,
+                    dp_fulls,
+                    dp_empties,
+                    ds_tiles_smem,
+                    ds_dq_tiles_smem,
+                    ds_scale_smem,
+                    ds_scale_dq_smem,
+                    ds_fulls,
+                    ds_empties,
+                    NUM_BUFFERS_TMEM,
+                    NUM_BUFFERS_DS,
+                    BLOCK_M1,
+                    BLOCK_N1,
+                    BWD_NUM_BLOCKS,
                     VEC_SIZE,
                     p_dtype,
+                    REP_N,
+                    REP_M,
                 )
-                tlx.local_store(tlx.local_view(p_tiles, 0), p_fp8)
-                tlx.local_store(tlx.local_view(p_scale_tmem_prologue, 0), p_scale)
-                tlx.barrier_arrive(p_fulls[0])
-
-                for _ in range(1, num_steps):
-                    ds_buf_id, ds_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
-                    # Finish dS for the previous M-block.
-                    Di = tl.load(D_off + offs_m)
-                    tlx.barrier_wait(dp_fulls[0], tmem_phase)
-                    dpT = tlx.local_load(dp_tiles[0])
-                    tlx.barrier_arrive(dp_empties[0])
-
-                    dsT = pT * (dpT - Di[None, :])
-                    # NaN sanitization (boundary tiles)
-                    dsT = tl.where(dsT == dsT, dsT, 0.0)
-                    # Quantize dS twice: dK consumes dS^T, while dQ consumes dS
-                    # with the opposite reduction axis and therefore needs a
-                    # separate blockscaled encoding.
-                    tlx.barrier_wait(ds_empties[ds_buf_id], ds_phase ^ 1)
-                    ds_fp8, ds_scale = _to_mxfp8_block(
-                        dsT,
-                        VEC_SIZE,
-                        p_dtype,
-                    )
-                    tlx.local_store(tlx.local_view(ds_tiles_smem, ds_buf_id), ds_fp8)
-                    ds_scale_packed = (ds_scale.reshape([REP_N, 4, 32, REP_M,
-                                                         4]).permute(0, 3, 2, 1, 4).reshape([1, REP_N, REP_M, 2, 256]))
-                    tlx.local_store(tlx.local_view(ds_scale_smem, 0), ds_scale_packed)
-                    ds_dq_fp8, ds_scale_dq = _to_mxfp8_block(
-                        tl.trans(dsT),
-                        VEC_SIZE,
-                        p_dtype,
-                    )
-                    tlx.local_store(tlx.local_view(ds_dq_tiles_smem, ds_buf_id), ds_dq_fp8)
-                    ds_scale_dq_packed = (ds_scale_dq.reshape([REP_M, 4, 32, REP_N,
-                                                               4]).permute(0, 3, 2, 1,
-                                                                           4).reshape([1, REP_M, REP_N, 2, 256]))
-                    tlx.local_store(tlx.local_view(ds_scale_dq_smem, 0), ds_scale_dq_packed)
-                    tlx.barrier_arrive(ds_fulls[ds_buf_id])
-
-                    curr_m += BLOCK_M1
-                    blk_idx += 1
-
-                    # Start P for the current M-block.
-                    _, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
-                    offs_m = curr_m + tl.arange(0, BLOCK_M1)
-                    m = tl.load(M_off + offs_m)
-
-                    # Read QK from TMEM, apply sm_scale -> P
-                    tlx.barrier_wait(qk_fulls[0], tmem_phase)
-                    qkT = tlx.local_load(qk_tiles[0])
-                    tlx.barrier_arrive(qk_empties[0])
-
-                    qkT_scaled = qkT * qk_scale - m[None, :]
-                    # Clamp to prevent FP32 overflow downstream in P*dP
-                    qkT_scaled = tl.minimum(qkT_scaled, 20.0)
-                    pT = tl.math.exp2(qkT_scaled)
-
-                    # Block amax for P via monotonicity of exp2
-                    qkT_reshaped = tl.reshape(qkT_scaled, [BLOCK_N1, BWD_NUM_BLOCKS, VEC_SIZE])
-                    block_maxes_p = tl.max(qkT_reshaped, 2)
-                    block_amax_p = tl.math.exp2(block_maxes_p)
-
-                    # Quantize P^T -> TMEM (FP8 data + E8M0 scales)
-                    tlx.barrier_wait(p_empties[0], tmem_phase ^ 1)
-                    p_fp8, p_scale = _to_mxfp8_block_with_block_amax(
-                        pT,
-                        block_amax_p,
-                        VEC_SIZE,
-                        p_dtype,
-                    )
-                    tlx.local_store(tlx.local_view(p_tiles, 0), p_fp8)
-                    tlx.local_store(tlx.local_view(p_scale_tmem, 0), p_scale)
-                    tlx.barrier_arrive(p_fulls[0])
-
-                # Epilogue: finish dS for the final M-block.
-                Di = tl.load(D_off + offs_m)
-                tlx.barrier_wait(dp_fulls[0], tmem_phase)
-                dpT = tlx.local_load(dp_tiles[0])
-                tlx.barrier_arrive(dp_empties[0])
-
-                dsT = pT * (dpT - Di[None, :])
-                # NaN sanitization (boundary tiles)
-                dsT = tl.where(dsT == dsT, dsT, 0.0)
-
-                ds_buf_id, ds_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
-                # Quantize dS twice: dK consumes dS^T, while dQ consumes dS
-                # with the opposite reduction axis and therefore needs a
-                # separate blockscaled encoding.
-                tlx.barrier_wait(ds_empties[ds_buf_id], ds_phase ^ 1)
-                ds_fp8, ds_scale = _to_mxfp8_block(
-                    dsT,
-                    VEC_SIZE,
-                    p_dtype,
-                )
-                tlx.local_store(tlx.local_view(ds_tiles_smem, ds_buf_id), ds_fp8)
-                ds_scale_packed = (ds_scale.reshape([REP_N, 4, 32, REP_M,
-                                                     4]).permute(0, 3, 2, 1, 4).reshape([1, REP_N, REP_M, 2, 256]))
-                tlx.local_store(tlx.local_view(ds_scale_smem, 0), ds_scale_packed)
-                ds_dq_fp8, ds_scale_dq = _to_mxfp8_block(
-                    tl.trans(dsT),
-                    VEC_SIZE,
-                    p_dtype,
-                )
-                tlx.local_store(tlx.local_view(ds_dq_tiles_smem, ds_buf_id), ds_dq_fp8)
-                ds_scale_dq_packed = (ds_scale_dq.reshape([REP_M, 4, 32, REP_N,
-                                                           4]).permute(0, 3, 2, 1, 4).reshape([1, REP_M, REP_N, 2,
-                                                                                               256]))
-                tlx.local_store(tlx.local_view(ds_scale_dq_smem, 0), ds_scale_dq_packed)
-                tlx.barrier_arrive(ds_fulls[ds_buf_id])
-
                 curr_m += BLOCK_M1
                 blk_idx += 1
+
+                for _ in range(1, num_steps):
+                    # Call _softmax_recompute_quantization_iter with
+                    # p_scale_tmem
+                    _softmax_recompute_quantization_iter(
+                        M_off,
+                        D_off,
+                        curr_m,
+                        blk_idx,
+                        qk_scale,
+                        qk_tiles,
+                        qk_fulls,
+                        qk_empties,
+                        p_tiles,
+                        p_scale_tmem,
+                        p_fulls,
+                        p_empties,
+                        dp_tiles,
+                        dp_fulls,
+                        dp_empties,
+                        ds_tiles_smem,
+                        ds_dq_tiles_smem,
+                        ds_scale_smem,
+                        ds_scale_dq_smem,
+                        ds_fulls,
+                        ds_empties,
+                        NUM_BUFFERS_TMEM,
+                        NUM_BUFFERS_DS,
+                        BLOCK_M1,
+                        BLOCK_N1,
+                        BWD_NUM_BLOCKS,
+                        VEC_SIZE,
+                        p_dtype,
+                        REP_N,
+                        REP_M,
+                    )
+                    curr_m += BLOCK_M1
+                    blk_idx += 1
 
                 # Epilogue: dK / dV TMA store
                 kv_buf_id, kv_phase = _get_bufidx_phase(kv_tile_idx, NUM_BUFFERS_KV)

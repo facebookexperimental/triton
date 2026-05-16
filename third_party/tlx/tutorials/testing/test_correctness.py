@@ -592,6 +592,7 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8(HEAD_DIM, causal):
 
 def _quantize_mxfp8_bwd_operand(ref, dtype, transpose_for_reduction=False):
     from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode
+
     Z, H, N_CTX, HEAD_DIM = ref.shape
     flat = ref.reshape(Z * H * N_CTX, HEAD_DIM).contiguous()
     quant_input = flat.t().contiguous() if transpose_for_reduction else flat
@@ -632,8 +633,8 @@ def _assert_close_with_cosine(
     cosine = _cosine_similarity(actual, expected)
     # TODO: Enable testing?
     # torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
-    assert cosine >= min_cosine, (f"{label} cosine_similarity={cosine:.6f} fell below "
-                                  f"min_cosine={min_cosine:.6f}")
+    assert cosine >= min_cosine, f"{label} cosine_similarity={cosine:.6f} fell below min_cosine={min_cosine:.6f}"
+
 
 @pytest.mark.parametrize(
     "Z,H,N_CTX",
@@ -661,7 +662,7 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
     torch.manual_seed(20)
 
     (q, q_scale, q_ref), (k, k_scale, k_ref), (v, v_scale,
-                                               v_ref) = (_generate_mxfp8_attention_inputs(shape, DEVICE, dtype))
+                                               v_ref) = _generate_mxfp8_attention_inputs(shape, DEVICE, dtype)
     q_ref = q_ref.detach().requires_grad_(True)
     k_ref = k_ref.detach().requires_grad_(True)
     v_ref = v_ref.detach().requires_grad_(True)
@@ -708,7 +709,8 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
 
     num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
     fwd_grid = (
-        min(num_sms, triton.cdiv(N_CTX, fwd_config["BLOCK_M"]) * Z * H),
+        min(num_sms,
+            triton.cdiv(N_CTX, fwd_config["BLOCK_M"]) * Z * H),
         1,
         1,
     )
