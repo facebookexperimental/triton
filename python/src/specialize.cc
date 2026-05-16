@@ -1087,10 +1087,15 @@ static FastCache *fc_get_or_create(PyObject *jit_fn, PyObject *params_list,
     val = PyObject_GetAttrString(param, "annotation");
     if (val && val != Py_None) {
       const char *s = PyUnicode_AsUTF8(val);
-      if (s && s[0] == '*')
+      if (s && s[0] == '*') {
         cache->param_meta[i].is_ptr = 1;
-      else if (s && strncmp(s, "tensordesc", 10) == 0)
-        cache->param_meta[i].is_tensordesc = 1;
+      } else if (s) {
+        char lower[11] = {};
+        for (int j = 0; j < 10 && s[j]; j++)
+          lower[j] = (s[j] >= 'A' && s[j] <= 'Z') ? s[j] + 32 : s[j];
+        if (strncmp(lower, "tensordesc", 10) == 0)
+          cache->param_meta[i].is_tensordesc = 1;
+      }
     }
     if (val)
       Py_DECREF(val);
@@ -1258,9 +1263,27 @@ static bool fc_build_key(FCCacheKey &key, FastCache *cache,
         } else {
           key.slots[i].align_bit = 255;
         }
+      } else {
+        // fc_get_tensor_type_code failed — try detecting TensorDescriptor.
+        // TensorDescriptor has .base.dtype (not .dtype directly), so the
+        // tensor probe above fails. Detect by checking for .base + .block_shape
+        // and handle like meta.is_tensordesc to avoid false cache hits from
+        // zeroed slots that can't distinguish different TensorDescriptor types.
+        Py_hash_t h = fc_hash_tensordesc(arg);
+        if (h != -1) {
+          // It's a TensorDescriptor — cache this for future calls
+          meta.is_tensordesc = 1;
+          key.slots[i].type_code = TC_TENSORDESC;
+          key.slots[i].constexpr_hash = h;
+        } else {
+          // Not a TensorDescriptor either — truly unknown type.
+          // Return false to force cache miss (falling back to Python slow
+          // path) rather than leaving a zeroed slot that would produce
+          // false cache hits for different arg types at this position.
+          PyErr_Clear();
+          return false;
+        }
       }
-      // else: truly unknown type — slot stays zeroed (safe for fixed
-      // signatures where the same position always receives the same type).
     }
   }
   return true;
