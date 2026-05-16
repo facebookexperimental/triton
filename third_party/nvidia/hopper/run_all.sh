@@ -27,7 +27,7 @@ fi
 echo "Running core Triton python unit tests"
 pytest python/test/unit/language/test_tutorial09_warp_specialization.py
 pytest python/test/unit/language/test_autows_addmm.py
-pytest python/test/unit/language/test_autows_flash_attention.py
+pytest third_party/tlx/tutorials/testing/test_correctness_autows.py
 
 echo "Run autoWS tutorial kernels"
 echo "Verifying correctness of FA tutorial kernels"
