@@ -47,6 +47,24 @@ static PyObject *canonicalize_dtype_fn = nullptr;
 static PyObject *canonicalize_ptr_dtype_fn = nullptr;
 static PyObject *torch_tensor_cls = nullptr;
 
+// Fast tensor access API — registered at runtime by _torch_bridge extension.
+// When available, provides ~10x faster dtype/data_ptr extraction by bypassing
+// Python attribute lookups and accessing THPVariable struct fields directly.
+struct TritonTensorAccessAPI {
+  int8_t (*get_scalar_type)(PyObject *);
+  uint64_t (*get_data_ptr)(PyObject *);
+  // Extract TensorDescriptor fields (base.data_ptr, shape, strides) in one
+  // shot. Returns ndim on success, -1 on failure.
+  int (*extract_tensordesc)(PyObject *td_obj, uint64_t *out_data_ptr,
+                            int64_t *out_shape, int64_t *out_strides,
+                            int max_ndim);
+};
+static TritonTensorAccessAPI *g_tensor_api = nullptr;
+
+// ScalarType → fc type_code mapping (indexed by c10::ScalarType int8_t value)
+static uint8_t scalar_type_to_fc_code[64];
+static bool scalar_type_map_initialized[64] = {};
+
 static PyObject *i32_str = nullptr;
 static PyObject *i64_str = nullptr;
 static PyObject *u64_str = nullptr;
@@ -895,9 +913,55 @@ static std::unordered_map<Py_hash_t, uint8_t> fc_dtype_to_code;
 static uint8_t fc_next_dtype_code = 0;
 
 static uint8_t fc_get_tensor_type_code(PyObject *arg, bool is_const) {
+  // Fast path: use torch_bridge direct struct access (no Python calls)
+  if (g_tensor_api) {
+    int8_t st = g_tensor_api->get_scalar_type(arg);
+    if (st < 0 || st >= 64)
+      goto slow_path;
+    uint8_t code;
+    if (scalar_type_map_initialized[st]) {
+      code = scalar_type_to_fc_code[st];
+    } else {
+      // Check if slow path already assigned a code for this dtype hash.
+      // This can happen when a Tensor subclass (fails THPVariable_CheckExact)
+      // was seen first via the slow path, and now a regular tensor with the
+      // same dtype arrives via the fast path. Reuse the existing code to
+      // avoid orphaning cache entries keyed by the slow-path code.
+      PyObject *dtype_obj = PyObject_GetAttr(arg, dtype_attr);
+      if (!dtype_obj) {
+        PyErr_Clear();
+        return TC_UNSUPPORTED;
+      }
+      Py_hash_t h = PyObject_Hash(dtype_obj);
+      Py_DECREF(dtype_obj);
+      if (h == -1) {
+        PyErr_Clear();
+        return TC_UNSUPPORTED;
+      }
+      auto it = fc_dtype_to_code.find(h);
+      if (it != fc_dtype_to_code.end()) {
+        // Reuse existing code from slow path
+        code = it->second;
+        scalar_type_to_fc_code[st] = code;
+        scalar_type_map_initialized[st] = true;
+        return is_const ? (TC_PTR_CONST_BASE + code) : (TC_PTR_BASE + code);
+      }
+      // No existing mapping — allocate a fresh code
+      code = fc_next_dtype_code++;
+      if (code > 30)
+        return TC_UNSUPPORTED;
+      scalar_type_to_fc_code[st] = code;
+      scalar_type_map_initialized[st] = true;
+      fc_dtype_to_code[h] = code;
+    }
+    return is_const ? (TC_PTR_CONST_BASE + code) : (TC_PTR_BASE + code);
+  }
+slow_path:
   PyObject *dtype_obj = PyObject_GetAttr(arg, dtype_attr);
-  if (!dtype_obj)
+  if (!dtype_obj) {
+    PyErr_Clear();
     return TC_UNSUPPORTED;
+  }
   Py_hash_t h = PyObject_Hash(dtype_obj);
   Py_DECREF(dtype_obj);
   if (h == -1) {
@@ -921,6 +985,13 @@ static uint8_t fc_get_tensor_type_code(PyObject *arg, bool is_const) {
 }
 
 static int fc_get_tensor_alignment(PyObject *arg) {
+  // Fast path: direct struct access via torch_bridge
+  if (g_tensor_api) {
+    uint64_t ptr = g_tensor_api->get_data_ptr(arg);
+    if (ptr != 0)
+      return (ptr & 15) == 0 ? 1 : 0;
+    // ptr==0: either not a torch tensor or zero-size tensor — fall through
+  }
   PyObject *ptr_obj = PyObject_CallMethodNoArgs(arg, data_ptr_attr);
   if (!ptr_obj)
     return -1;
@@ -1164,24 +1235,33 @@ static bool fc_build_key(FCCacheKey &key, FastCache *cache,
         return false;
       }
       key.slots[i].constexpr_hash = h;
+    } else {
+      // No metadata match — try detecting tensor-like objects.
+      // With _torch_bridge loaded, this is ~10x cheaper than Python attr
+      // lookups (direct THPVariable struct access). Without the bridge,
+      // falls back to PyObject_GetAttr which is ~80-150ns per call.
+      uint8_t tc = fc_get_tensor_type_code(arg, false);
+      if (tc != TC_UNSUPPORTED) {
+        meta.is_ptr = 1; // Cache for future calls → direct is_ptr branch
+        key.slots[i].type_code = tc;
+        bool spec = !meta.do_not_specialize;
+        bool align_flag = !meta.do_not_specialize_on_alignment;
+        if (spec && align_flag) {
+          int a = fc_get_tensor_alignment(arg);
+          if (a < 0) {
+            PyErr_Clear();
+            return false;
+          }
+          key.slots[i].align_bit = (uint8_t)a;
+        } else if (spec) {
+          key.slots[i].align_bit = 0;
+        } else {
+          key.slots[i].align_bit = 255;
+        }
+      }
+      // else: truly unknown type — slot stays zeroed (safe for fixed
+      // signatures where the same position always receives the same type).
     }
-    // NOTE: Unrecognized types (e.g. torch.Tensor params without annotation)
-    // leave the slot zeroed (from memset).  This is intentional for
-    // performance: proper detection via fc_get_tensor_type_code requires
-    // Python attr lookups (arg.dtype, arg.data_ptr()) adding ~0.1us per
-    // tensor on the hot path — a ~10-24% regression for typical kernels.
-    //
-    // Assumptions that make zeroed slots safe:
-    //  1. Triton JIT kernels have fixed signatures — the Python type at each
-    //     position never changes across invocations.
-    //  2. PyTorch allocates tensors 16-byte aligned (via cudaMalloc / caching
-    //     allocator), so alignment specialization is stable across calls.
-    //
-    // If assumption (2) is violated (e.g. user passes a tensor sliced into
-    // unaligned storage), the C fast cache may return a kernel specialized
-    // for aligned access.  The Python slow path handles this correctly; add
-    // proper detection here only if this becomes a real-world correctness
-    // issue (see fc_get_tensor_type_code / fc_get_tensor_alignment).
   }
   return true;
 }
@@ -1604,6 +1684,20 @@ static PyMethodDef module_methods[] = {
      METH_FASTCALL, nullptr},
     {"native_create_jit_proxy", (PyCFunction)native_create_jit_proxy,
      METH_FASTCALL, nullptr},
+    {"register_tensor_access_api",
+     (PyCFunction) + [](PyObject *self, PyObject *arg) -> PyObject * {
+       (void)self;
+       if (!PyCapsule_IsValid(arg, "triton_tensor_access_api")) {
+         PyErr_SetString(
+             PyExc_TypeError,
+             "Expected a PyCapsule with name 'triton_tensor_access_api'");
+         return nullptr;
+       }
+       g_tensor_api = (TritonTensorAccessAPI *)PyCapsule_GetPointer(
+           arg, "triton_tensor_access_api");
+       Py_RETURN_NONE;
+     },
+     METH_O, nullptr},
     {nullptr, nullptr, 0, nullptr} // sentinel
 };
 
