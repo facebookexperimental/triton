@@ -3,6 +3,9 @@
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 8}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 8}>
 #shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#shared_scales2d = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, rank = 2}>
+#shared_scales4d = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, rank = 4}>
+#shared_scales5d = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, rank = 5}>
 #tmem_f16 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 256, colStride = 2>
 #tmem_scales = #ttng.tensor_memory_scales_encoding<>
 
@@ -32,6 +35,21 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
        !ttg.memdesc<128x128xf8E5M2, #shared, #ttg.shared_memory>,
        !ttg.memdesc<128x256xf8E5M2, #shared1, #ttg.shared_memory>,
        !ttg.memdesc<128x256xf16, #tmem_f16, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+
+  // CHECK-LABEL: @valid_scale_tmem_copy_shapes
+  // CHECK-COUNT-4: ttng.tmem_copy
+  tt.func @valid_scale_tmem_copy_shapes(
+      %src4d: !ttg.memdesc<1x1x32x16xi8, #shared_scales4d, #ttg.shared_memory>,
+      %src5d_cp: !ttg.memdesc<1x1x32x4x4xi8, #shared_scales5d, #ttg.shared_memory>,
+      %src5d_tma: !ttg.memdesc<1x1x1x2x256xi8, #shared_scales5d, #ttg.shared_memory>,
+      %src2d_flat: !ttg.memdesc<1x512xi8, #shared_scales2d, #ttg.shared_memory>,
+      %dst: !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory, mutable>) {
+    ttng.tmem_copy %src4d, %dst : !ttg.memdesc<1x1x32x16xi8, #shared_scales4d, #ttg.shared_memory>, !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory, mutable>
+    ttng.tmem_copy %src5d_cp, %dst : !ttg.memdesc<1x1x32x4x4xi8, #shared_scales5d, #ttg.shared_memory>, !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory, mutable>
+    ttng.tmem_copy %src5d_tma, %dst : !ttg.memdesc<1x1x1x2x256xi8, #shared_scales5d, #ttg.shared_memory>, !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory, mutable>
+    ttng.tmem_copy %src2d_flat, %dst : !ttg.memdesc<1x512xi8, #shared_scales2d, #ttg.shared_memory>, !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory, mutable>
     tt.return
   }
 

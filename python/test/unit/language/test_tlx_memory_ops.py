@@ -569,6 +569,22 @@ def test_tmem_alloc_index(BLOCK_SIZE, device):
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_tmem_copy_rejects_logical_rank2_scale_smem(device):
+
+    @triton.jit
+    def kernel(dummy):
+        smem = tlx.local_alloc((128, 4), tl.uint8, tl.constexpr(1))
+        tmem = tlx.local_alloc((128, 4), tl.uint8, tl.constexpr(1), tlx.storage_kind.tmem)
+        tlx.tmem_copy(smem[0], tmem[0])
+        tl.store(dummy, tl.full((), 0, tl.int32))
+
+    dummy = torch.empty((), dtype=torch.int32, device=device)
+    with pytest.raises(triton.CompilationError) as exc_info:
+        kernel[(1, )](dummy)
+    assert "scale tmem_copy requires an explicit packed i8 SMEM shape" in str(exc_info.value)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 @pytest.mark.parametrize("BLOCK_SIZE_M, BLOCK_SIZE_N", [(64, 64), (64, 8), (128, 16)])
 def test_tmem_load_store(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
 
@@ -772,7 +788,7 @@ def local_gather_kernel(
 
 
 @pytest.mark.parametrize("N,M", [(32, 32), (64, 64), (128, 128)])
-def test_local_gather(N, M):
+def test_local_gather_1d_native(N, M):
     """Test gathering from 1D reshaped shared memory (diagonal of 2D matrix)."""
     device = torch.device("cuda")
 

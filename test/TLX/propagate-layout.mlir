@@ -256,7 +256,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %a_smem: !ttg.memdesc<128x256xf8E4M3FN, #shared, #smem, mutable>,
       %b_smem: !ttg.memdesc<256x128xf8E4M3FN, #shared, #smem, mutable>,
       %a_scale_smem: !ttg.memdesc<1x1x2x2x256xi8, #shared_scales, #smem, mutable>,
-      %b_scale_smem: !ttg.memdesc<1x1x2x2x256xi8, #shared_scales, #smem, mutable>) {
+      %b_scale_smem: !ttg.memdesc<1x2x1x2x256xi8, #shared_scales, #smem, mutable>) {
     %c0_i32 = arith.constant 0 : i32
     %false = arith.constant false
     %true = arith.constant true
@@ -276,7 +276,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
     // Copy scales from SMEM to TMEM
     ttng.tmem_copy %a_scale_smem, %a_scale_indexed : !ttg.memdesc<1x1x2x2x256xi8, #shared_scales, #smem, mutable>, !ttg.memdesc<128x8xi8, #dummy_tmem_layout, #tmem, mutable>
-    ttng.tmem_copy %b_scale_smem, %b_scale_indexed : !ttg.memdesc<1x1x2x2x256xi8, #shared_scales, #smem, mutable>, !ttg.memdesc<256x4xi8, #dummy_tmem_layout, #tmem, mutable>
+    ttng.tmem_copy %b_scale_smem, %b_scale_indexed : !ttg.memdesc<1x2x1x2x256xi8, #shared_scales, #smem, mutable>, !ttg.memdesc<256x4xi8, #dummy_tmem_layout, #tmem, mutable>
 
     // Require scales layout for the MMA op
     %a_scale_req = tlx.require_layout %a_scale_indexed : !ttg.memdesc<128x8xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<128x8xi8, #scales_encoding, #tmem, mutable>

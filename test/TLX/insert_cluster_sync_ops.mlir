@@ -358,12 +358,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // Test that tmem_copy with barrier in paired CTA MMA mode triggers cluster sync.
 // The barrier on tmem_copy will generate a tcgen05.commit with multicast in 2cta mode.
 #shared_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-#shared_scales = #ttg.shared_linear<{offset = [[0, 1], [0, 2], [32, 0], [64, 0], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 4], [0, 8], [0, 16]]}, alignment = 16>
+#shared_scales = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, rank = 5}>
 #tmem_scales = #ttng.tensor_memory_scales_encoding<>
 module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttng.two-ctas" = true} {
   // CHECK-LABEL: @tmem_copy_barrier_paired_cta
   tt.func public @tmem_copy_barrier_paired_cta(
-      %src: !ttg.memdesc<128x32xi8, #shared_scales, #ttg.shared_memory>,
+      %src: !ttg.memdesc<1x1x8x2x256xi8, #shared_scales, #ttg.shared_memory>,
       %dst: !ttg.memdesc<128x32xi8, #tmem_scales, #ttng.tensor_memory, mutable>) attributes {noinline = false} {
     %c0_i32 = arith.constant 0 : i32
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
@@ -373,7 +373,7 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
     // CHECK: nvvm.cluster.wait {aligned}
     // CHECK: tcgen05.cp
     ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
-    ttng.tmem_copy %src, %dst, %1 : !ttg.memdesc<128x32xi8, #shared_scales, #ttg.shared_memory>, !ttg.memdesc<128x32xi8, #tmem_scales, #ttng.tensor_memory, mutable>, !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+    ttng.tmem_copy %src, %dst, %1 : !ttg.memdesc<1x1x8x2x256xi8, #shared_scales, #ttg.shared_memory>, !ttg.memdesc<128x32xi8, #tmem_scales, #ttng.tensor_memory, mutable>, !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
     tt.return
   }
 }
@@ -383,12 +383,12 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
 // Test that tmem_copy with barrier but WITHOUT paired CTA MMA does NOT trigger
 // cluster sync. The commit stays local without multicast.
 #shared_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-#shared_scales = #ttg.shared_linear<{offset = [[0, 1], [0, 2], [32, 0], [64, 0], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 4], [0, 8], [0, 16]]}, alignment = 16>
+#shared_scales = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, rank = 5}>
 #tmem_scales = #ttng.tensor_memory_scales_encoding<>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
   // CHECK-LABEL: @tmem_copy_barrier_no_paired_cta_no_sync
   tt.func public @tmem_copy_barrier_no_paired_cta_no_sync(
-      %src: !ttg.memdesc<128x32xi8, #shared_scales, #ttg.shared_memory>,
+      %src: !ttg.memdesc<1x1x8x2x256xi8, #shared_scales, #ttg.shared_memory>,
       %dst: !ttg.memdesc<128x32xi8, #tmem_scales, #ttng.tensor_memory, mutable>) attributes {noinline = false} {
     %c0_i32 = arith.constant 0 : i32
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
@@ -396,7 +396,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     // CHECK-NOT: nvvm.cluster.arrive
     // CHECK-NOT: nvvm.cluster.wait
     ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
-    ttng.tmem_copy %src, %dst, %1 : !ttg.memdesc<128x32xi8, #shared_scales, #ttg.shared_memory>, !ttg.memdesc<128x32xi8, #tmem_scales, #ttng.tensor_memory, mutable>, !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+    ttng.tmem_copy %src, %dst, %1 : !ttg.memdesc<1x1x8x2x256xi8, #shared_scales, #ttg.shared_memory>, !ttg.memdesc<128x32xi8, #tmem_scales, #ttng.tensor_memory, mutable>, !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
     tt.return
   }
 }
