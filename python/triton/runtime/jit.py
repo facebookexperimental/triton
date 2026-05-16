@@ -808,11 +808,10 @@ class JITFunction(JITCallable, KernelInterface[T]):
             if kwargs:
                 _fc_args = list(args)
                 _fc_opts = {}
-                _param_names = self.arg_names
-                _param_set = set(_param_names)
+                _name_to_idx = self._param_name_to_idx
                 for k, v in kwargs.items():
-                    if k in _param_set:
-                        idx = _param_names.index(k)
+                    idx = _name_to_idx.get(k)
+                    if idx is not None:
                         while len(_fc_args) <= idx:
                             _fc_args.append(None)
                         _fc_args[idx] = v
@@ -949,11 +948,10 @@ class JITFunction(JITCallable, KernelInterface[T]):
                 if _user_kwargs:
                     _ins_args = list(args)
                     _ins_opts = {}
-                    _param_names = self.arg_names
-                    _param_set = set(_param_names)
+                    _name_to_idx = self._param_name_to_idx
                     for k, v in _user_kwargs.items():
-                        if k in _param_set:
-                            idx = _param_names.index(k)
+                        idx = _name_to_idx.get(k)
+                        if idx is not None:
                             while len(_ins_args) <= idx:
                                 _ins_args.append(None)
                             _ins_args[idx] = v
@@ -1016,6 +1014,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
         # TODO(jlebar): Remove uses of these fields outside this file, then
         # remove the fields here.
         self.arg_names = [p.name for p in self.params]
+        self._param_name_to_idx = {name: i for i, name in enumerate(self.arg_names)}
         self.constexprs = [p.num for p in self.params if p.is_constexpr]
 
         # Hooks that will be called prior to executing "run"
