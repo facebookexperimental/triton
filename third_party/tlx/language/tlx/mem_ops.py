@@ -425,7 +425,7 @@ def async_remote_shmem_copy(
         remote_cta_rank: The rank of the remote CTA within the cluster
         barrier: mbarrier in local shared memory whose address will be mapa'd to the remote CTA
     """
-    assert src.type.storage == tlx.storage_kind.smem, ("async_remote_shmem_copy requires local smem src")
+    assert src.type.storage == tlx.storage_kind.smem, "async_remote_shmem_copy requires local smem src"
     assert dst.type.storage == tlx.storage_kind.smem, (
         "async_remote_shmem_copy requires local smem dst (will be mapa'd to remote CTA)")
     assert remote_cta_rank is not None, "remote_cta_rank is required for async_remote_shmem_copy"
@@ -723,7 +723,6 @@ def local_scatter(
     """
     Scatter elements to shared memory along a specified axis using an indices tensor.
     """
-    block_type = tl.block_type(src.type.element_ty, indices.type.shape)
     storage = dst.type.storage
     assert storage == tlx.storage_kind.smem, "local_scatter only supports shared memory!"
     return tl.tensor(_semantic.builder.create_local_scatter(dst.handle, src.handle, indices.handle, axis), tl.void)
@@ -746,6 +745,43 @@ def local_store(
         return tl.tensor(_semantic.builder.create_tmem_store(dst.handle, src_handle), tl.void)
 
     return tl.tensor(_semantic.builder.create_local_store(dst.handle, src.handle), tl.void)
+
+
+def _shape_as_ints(shape):
+    return [int(tl._unwrap_if_constexpr(dim)) for dim in shape]
+
+
+def _is_scale_tmem_copy_candidate(dst: tlx.buffered_tensor) -> bool:
+    if dst.type.storage != tlx.storage_kind.tmem:
+        return False
+    if dst.type.scalar not in (tl.int8, tl.uint8):
+        return False
+    return isinstance(dst.type.layout, (tlx.DummyTMEMLayoutEncoding, tlx.tensor_memory_scales_layout_encoding))
+
+
+def _verify_scale_tmem_copy_shape(src: tlx.buffered_tensor, dst: tlx.buffered_tensor) -> None:
+    src_shape = _shape_as_ints(src.type.shape)
+    dst_shape = _shape_as_ints(dst.type.shape)
+    error_msg = ("scale tmem_copy requires an explicit packed i8 SMEM shape matching the rank-2 TMEM scale shape; "
+                 "accepted source shapes are [rows / 128, cols / 4, 32, 16], "
+                 "[rows / 128, cols / 4, 32, 4, 4], [1, rows / 128, cols / 4, 2, 256], "
+                 "or [rows / 128, (cols / 4) * 512]")
+
+    assert src.type.scalar in (tl.int8, tl.uint8) and dst.type.scalar in (tl.int8, tl.uint8), error_msg
+    assert len(dst_shape) == 2, error_msg
+
+    rows, cols = dst_shape
+    assert rows % 128 == 0 and cols % 4 == 0, error_msg
+
+    rep_rows = rows // 128
+    rep_cols = cols // 4
+    accepted_shapes = [
+        [rep_rows, rep_cols, 32, 16],
+        [rep_rows, rep_cols, 32, 4, 4],
+        [1, rep_rows, rep_cols, 2, 256],
+        [rep_rows, rep_cols * 512],
+    ]
+    assert src_shape in accepted_shapes, error_msg
 
 
 @tl.builtin
@@ -774,6 +810,8 @@ def tmem_copy(
     assert src.type.storage == tlx.storage_kind.smem, "source must be in shared memory"
     assert dst.type.storage == tlx.storage_kind.tmem, "destination must be in tensor memory"
     _assert_blackwell_for_tmem(_semantic.builder.options.arch)
+    if _is_scale_tmem_copy_candidate(dst):
+        _verify_scale_tmem_copy_shape(src, dst)
     _semantic.builder.create_tmem_copy(src.handle, dst.handle)
 
 
@@ -860,8 +898,8 @@ def async_descriptor_load(
                  TMA loads signal the leader's barrier.
     """
     assert isinstance(desc, tl.tensor_descriptor_base)
-    assert eviction_policy in ("", "evict_first", "evict_last"), \
-        f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'"
+    assert eviction_policy in ("", "evict_first", "evict_last"), (
+        f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'")
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
     # 1D TMA doesn't use swizzling, so request unswizzled NVMMASharedEncoding.
@@ -907,8 +945,8 @@ def async_descriptor_prefetch_tensor(
     Hint the hardware to prefetch a tensor tile from global memory into L2 cache using TMA.
     """
     assert isinstance(desc, tl.tensor_descriptor_base)
-    assert eviction_policy in ("", "evict_first", "evict_last"), \
-        f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'"
+    assert eviction_policy in ("", "evict_first", "evict_last"), (
+        f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'")
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
     offsets = _semantic._convert_to_ir_values(offsets, require_i64=False)

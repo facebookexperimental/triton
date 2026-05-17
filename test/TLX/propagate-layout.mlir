@@ -39,6 +39,36 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// Test that scale layout requirements propagate through TMEM subslices.
+
+#tmem = #ttng.tensor_memory
+#shared_unswizzled = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, rank = 5}>
+#smem = #ttg.shared_memory
+#dummy_tmem_layout = #tlx.dummy_tmem_layout<>
+#scales_encoding = #ttng.tensor_memory_scales_encoding<>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tmem_subslice_propagates_scales_layout
+  tt.func public @tmem_subslice_propagates_scales_layout() {
+    %c0_i32 = arith.constant 0 : i32
+
+    %scale_smem = ttg.local_alloc : () -> !ttg.memdesc<1x1x2x2x256xi8, #shared_unswizzled, #smem, mutable>
+    // CHECK: ttng.tmem_alloc : () -> !ttg.memdesc<1x128x16xi8, #tmem_scales, #ttng.tensor_memory, mutable>
+    %scale_tmem = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x16xi8, #dummy_tmem_layout, #tmem, mutable>
+    %scale_tmem_indexed = ttg.memdesc_index %scale_tmem[%c0_i32] : !ttg.memdesc<1x128x16xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<128x16xi8, #dummy_tmem_layout, #tmem, mutable>
+
+    // CHECK: ttng.tmem_subslice {{.*}} : !ttg.memdesc<128x16xi8, #tmem_scales, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory, mutable{{.*}}>
+    %scale_slice = ttng.tmem_subslice %scale_tmem_indexed {N = 8 : i32} : !ttg.memdesc<128x16xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<128x8xi8, #dummy_tmem_layout, #tmem, mutable, 128x16>
+
+    %scale_req = tlx.require_layout %scale_slice : !ttg.memdesc<128x8xi8, #dummy_tmem_layout, #tmem, mutable, 128x16> -> !ttg.memdesc<128x8xi8, #scales_encoding, #tmem, mutable, 128x16>
+    ttng.tmem_copy %scale_smem, %scale_req : !ttg.memdesc<1x1x2x2x256xi8, #shared_unswizzled, #smem, mutable>, !ttg.memdesc<128x8xi8, #scales_encoding, #tmem, mutable, 128x16>
+
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 8], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 2], order = [1, 0]}>
 #blocked2 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [8, 1], order = [1, 0]}>
@@ -256,7 +286,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %a_smem: !ttg.memdesc<128x256xf8E4M3FN, #shared, #smem, mutable>,
       %b_smem: !ttg.memdesc<256x128xf8E4M3FN, #shared, #smem, mutable>,
       %a_scale_smem: !ttg.memdesc<1x1x2x2x256xi8, #shared_scales, #smem, mutable>,
-      %b_scale_smem: !ttg.memdesc<1x1x2x2x256xi8, #shared_scales, #smem, mutable>) {
+      %b_scale_smem: !ttg.memdesc<1x2x1x2x256xi8, #shared_scales, #smem, mutable>) {
     %c0_i32 = arith.constant 0 : i32
     %false = arith.constant false
     %true = arith.constant true
@@ -276,7 +306,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
     // Copy scales from SMEM to TMEM
     ttng.tmem_copy %a_scale_smem, %a_scale_indexed : !ttg.memdesc<1x1x2x2x256xi8, #shared_scales, #smem, mutable>, !ttg.memdesc<128x8xi8, #dummy_tmem_layout, #tmem, mutable>
-    ttng.tmem_copy %b_scale_smem, %b_scale_indexed : !ttg.memdesc<1x1x2x2x256xi8, #shared_scales, #smem, mutable>, !ttg.memdesc<256x4xi8, #dummy_tmem_layout, #tmem, mutable>
+    ttng.tmem_copy %b_scale_smem, %b_scale_indexed : !ttg.memdesc<1x2x1x2x256xi8, #shared_scales, #smem, mutable>, !ttg.memdesc<256x4xi8, #dummy_tmem_layout, #tmem, mutable>
 
     // Require scales layout for the MMA op
     %a_scale_req = tlx.require_layout %a_scale_indexed : !ttg.memdesc<128x8xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<128x8xi8, #scales_encoding, #tmem, mutable>

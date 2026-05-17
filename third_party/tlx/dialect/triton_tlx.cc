@@ -70,10 +70,13 @@ void init_triton_tlx_ir(py::module &&m) {
              Type newType;
              if (auto type = dyn_cast<ttg::MemDescType>(v.getType())) {
                // consider allocation type for subslice
+               SmallVector<int64_t> allocShape(type.getAllocShape());
+               if (isa<ttng::TensorMemoryScalesEncodingAttr>(encoding))
+                 allocShape.assign(type.getShape().begin(),
+                                   type.getShape().end());
                newType = ttg::MemDescType::get(
                    type.getShape(), type.getElementType(), encoding,
-                   type.getMemorySpace(), type.getMutableMemory(),
-                   type.getAllocShape());
+                   type.getMemorySpace(), type.getMutableMemory(), allocShape);
                return self.create<tlx::RequireLayoutOp>(newType, v);
              } else if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
                newType = RankedTensorType::get(type.getShape(),
@@ -439,11 +442,11 @@ void init_triton_tlx_ir(py::module &&m) {
              // only passes valid inputs to the op
              auto srcTy = dyn_cast<triton::gpu::MemDescType>(src.getType());
              assert(srcTy != nullptr && "Expect MemDescType for src");
-             auto encoding =
-                 dyn_cast<ttng::TensorMemoryEncodingAttr>(srcTy.getEncoding());
-             auto blockN = encoding.getBlockN();
-             assert(offset >= 0 && offset < blockN && "Invalid offset");
-             assert(size > 0 && size <= blockN - offset && "Invalid size");
+             auto shape = srcTy.getShape();
+             assert(!shape.empty() && "Expect non-empty shape for src");
+             auto dimN = shape.back();
+             assert(offset >= 0 && offset < dimN && "Invalid offset");
+             assert(size > 0 && size <= dimN - offset && "Invalid size");
              return self.create<ttng::TMEMSubSliceOp>(src, offset, size);
            })
       .def("create_tcgen5_dot",
