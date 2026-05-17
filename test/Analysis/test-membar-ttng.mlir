@@ -188,14 +188,14 @@ tt.func @no_barrier_between_same_index_init_inval() {
 #smem = #ttg.shared_memory
 #tmem_scales = #ttng.tensor_memory_scales_encoding<>
 module attributes {"ttg.num-warps" = 4 : i32} {
-  tt.func @tmem_copy_after_alloc(%arg0: tensor<128x16xf8E4M3FN, #blocked>) {
+  tt.func @tmem_copy_after_alloc(%arg0: tensor<1x2048xi8, #blocked>) {
     // CHECK: local_alloc
-    %0 = ttg.local_alloc %arg0 {allocation.offset = 53248 : i32} : (tensor<128x16xf8E4M3FN, #blocked>) -> !ttg.memdesc<128x16xf8E4M3FN, #shared, #smem>
+    %0 = ttg.local_alloc %arg0 {allocation.offset = 53248 : i32} : (tensor<1x2048xi8, #blocked>) -> !ttg.memdesc<1x2048xi8, #shared, #smem>
     // CHECK: tmem_alloc
-    %1 = ttng.tmem_alloc  {tensor_memory_col_offset = 256 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<128x16xf8E4M3FN, #tmem_scales, #ttng.tensor_memory, mutable>
+    %1 = ttng.tmem_alloc  {tensor_memory_col_offset = 256 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<128x16xi8, #tmem_scales, #ttng.tensor_memory, mutable>
     // ttg.barrier local
     // CHECK: tmem_copy
-    ttng.tmem_copy %0, %1 : !ttg.memdesc<128x16xf8E4M3FN, #shared, #smem>, !ttg.memdesc<128x16xf8E4M3FN, #tmem_scales, #ttng.tensor_memory, mutable>
+    ttng.tmem_copy %0, %1 : !ttg.memdesc<1x2048xi8, #shared, #smem>, !ttg.memdesc<128x16xi8, #tmem_scales, #ttng.tensor_memory, mutable>
     tt.return
   }
 }

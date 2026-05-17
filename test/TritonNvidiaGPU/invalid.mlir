@@ -55,6 +55,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 
 // -----
 
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#tmem = #ttng.tensor_memory_scales_encoding<>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65536 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @logical_rank2_scale_tmem_copy(%arg: !ttg.memdesc<128x4xi8, #shared, #ttg.shared_memory, mutable>,
+                                                %dst: !ttg.memdesc<128x4xi8, #tmem, #ttng.tensor_memory, mutable>) {
+    // expected-error @+1 {{scale tmem_copy requires an explicit packed i8 SMEM shape}}
+    ttng.tmem_copy %arg, %dst : !ttg.memdesc<128x4xi8, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x4xi8, #tmem, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
 #shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 

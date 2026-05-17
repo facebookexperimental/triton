@@ -11,6 +11,7 @@ import torch
 import triton
 import triton.language as tl
 from triton._internal_testing import is_blackwell
+from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 # =============================================================================
@@ -33,26 +34,6 @@ def _apply_causal_mask(qk, col_limit_right, BLOCK_N: tl.constexpr):
     s = offs_n & ~0xF
     i = offs_n & 0xF
     return tl.map_elementwise(_mask_scalar, qk, col_limit_right, s, i)
-
-
-@triton.jit
-def _mul_f32x2(a, b):
-    return tl.inline_asm_elementwise(
-        """
-        {
-            .reg .b64 ra, rb, rc;
-            mov.b64 ra, { $2, $3 };
-            mov.b64 rb, { $4, $5 };
-            mul.f32x2 rc, ra, rb;
-            mov.b64 { $0, $1 }, rc;
-        }
-        """,
-        "=r,=r,r,r,r,r",
-        [a, b],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=2,
-    )
 
 
 @triton.jit
