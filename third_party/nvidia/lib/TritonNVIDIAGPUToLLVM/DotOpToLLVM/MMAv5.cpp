@@ -400,13 +400,19 @@ LogicalResult convertDotImpl(const LLVMTypeConverter &typeConverter,
   if (twoCTAs) {
     // - In TLX 2cta mode, we'll have explicit remote barrier arrival in kernel,
     // and implicit cluster sync inserted earlier than this.
-    // - In non-TLX 2cta mode (Triton default), we keep the code unchanged. Note
-    // inserting cluster sync here will hang WarpSpec - only MMA warps would
-    // execute ClusterArriveOp but ClusterWaitOp expects all threads in the
-    // cluster
-    if (!tlxPairedMMA) {
+    // - In WarpSpec mode (autoWS), the Insert2CTASync pass provides explicit
+    // cross-CTA mbarrier sync. ClusterArrive/Wait will deadlock because only
+    // the consumer warp group executes it while the cluster barrier expects
+    // all threads.
+    // - In non-TLX non-WS 2cta mode, we keep the cluster sync.
+    bool hasExplicitCTASync =
+        tlxPairedMMA ||
+        rewriter.getInsertionBlock()
+                ->getParentOp()
+                ->getParentOfType<triton::gpu::WarpSpecializeOp>() != nullptr;
+    if (!hasExplicitCTASync) {
       // TODO: we have to sync the two CTAs because we currently don't use
-      // remove barriers for the copies.
+      // remote barriers for the copies.
       ttng::ClusterArriveOp::create(rewriter, loc, false);
     }
     Value leftClusterId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
