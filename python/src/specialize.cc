@@ -1445,8 +1445,9 @@ typedef struct {
   PyObject *params_list; // self.params
   PyObject *run_partial; // functools.partial(self.run, grid=grid, warmup=False)
   PyObject *grid_py[3];  // pre-extracted grid PyLong objects
-  PyObject *stream_getter; // driver.active.get_current_stream
-  PyObject *device_getter; // driver.active.get_current_device
+  PyObject *stream_getter;     // driver.active.get_current_stream
+  PyObject *device_getter;     // driver.active.get_current_device
+  PyObject *param_name_to_idx; // dict: param_name → positional index
   uint64_t options_hash;
   int n_params;
 } JITCacheProxy;
@@ -1461,12 +1462,42 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
                                           PyObject *kwnames) {
   JITCacheProxy *self = (JITCacheProxy *)callable;
   Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
+  PyObject **merged_args = nullptr;
+  PyObject *const *effective_args = args;
+  int effective_nargs = (int)nargs;
 
-  // Fast path: no kwargs, arg count matches
-  if (kwnames && PyTuple_GET_SIZE(kwnames) > 0)
+  // When kwargs are present, merge them into positional args in C.
+  // This mirrors the Python-side logic in jit.py run() c_cache path.
+  if (kwnames && PyTuple_GET_SIZE(kwnames) > 0) {
+    if (!self->param_name_to_idx)
+      goto fallback;
+    Py_ssize_t nkw = PyTuple_GET_SIZE(kwnames);
+    int total = self->n_params;
+    // Allocate merged array on stack (max ~64 params for typical kernels)
+    merged_args = (PyObject **)alloca(total * sizeof(PyObject *));
+    // Copy positional args
+    for (int i = 0; i < total; i++)
+      merged_args[i] = (i < (int)nargs) ? (PyObject *)args[i] : Py_None;
+    // Merge kwargs by name lookup
+    for (Py_ssize_t ki = 0; ki < nkw; ki++) {
+      PyObject *name = PyTuple_GET_ITEM(kwnames, ki);
+      PyObject *idx_obj = PyDict_GetItem(self->param_name_to_idx, name);
+      if (idx_obj) {
+        int idx = (int)PyLong_AsLong(idx_obj);
+        if (idx >= 0 && idx < total)
+          merged_args[idx] = (PyObject *)args[nargs + ki];
+      }
+      // kwargs not in param_name_to_idx are "options" — affect hash only.
+      // For now, treat them as cache-miss (different options_hash) and
+      // fallback.
+      else
+        goto fallback;
+    }
+    effective_args = merged_args;
+    effective_nargs = total;
+  } else if (nargs != self->n_params) {
     goto fallback;
-  if (nargs != self->n_params)
-    goto fallback;
+  }
 
   {
     FastCache *cache =
@@ -1475,10 +1506,11 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
       goto fallback;
 
     FCCacheKey key;
-    if (!fc_build_key(key, cache, args, (int)nargs, self->options_hash))
+    if (!fc_build_key(key, cache, effective_args, effective_nargs,
+                      self->options_hash))
       goto fallback;
 
-    FCEntry *entry = cache->lookup(key, args);
+    FCEntry *entry = cache->lookup(key, effective_args);
     if (!entry)
       goto fallback;
 
@@ -1504,7 +1536,7 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
     // Build dispatcher vectorcall args: grid0, grid1, grid2, stream,
     // *kernel_args
     int n_kernel_args = 0;
-    for (int i = 0; i < (int)nargs && i < cache->n_params; i++) {
+    for (int i = 0; i < effective_nargs && i < cache->n_params; i++) {
       if (!cache->param_meta[i].is_constexpr)
         n_kernel_args++;
     }
@@ -1515,9 +1547,9 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
     vc_args[2] = self->grid_py[2];
     vc_args[3] = stream_obj;
     int ki = 0;
-    for (int i = 0; i < (int)nargs && i < cache->n_params; i++) {
+    for (int i = 0; i < effective_nargs && i < cache->n_params; i++) {
       if (!cache->param_meta[i].is_constexpr)
-        vc_args[4 + ki++] = args[i];
+        vc_args[4 + ki++] = effective_args[i];
     }
     PyObject *result =
         PyObject_Vectorcall(dispatcher, vc_args, vc_nargs, nullptr);
@@ -1549,6 +1581,7 @@ static void JITCacheProxy_dealloc(PyObject *o) {
   Py_XDECREF(self->grid_py[2]);
   Py_XDECREF(self->stream_getter);
   Py_XDECREF(self->device_getter);
+  Py_XDECREF(self->param_name_to_idx);
   Py_TYPE(o)->tp_free(o);
 }
 
@@ -1562,6 +1595,7 @@ static int JITCacheProxy_traverse(PyObject *o, visitproc visit, void *arg) {
   Py_VISIT(self->grid_py[2]);
   Py_VISIT(self->stream_getter);
   Py_VISIT(self->device_getter);
+  Py_VISIT(self->param_name_to_idx);
   return 0;
 }
 
@@ -1570,6 +1604,7 @@ static int JITCacheProxy_clear(PyObject *o) {
   Py_CLEAR(self->jit_fn);
   Py_CLEAR(self->params_list);
   Py_CLEAR(self->run_partial);
+  Py_CLEAR(self->param_name_to_idx);
   Py_CLEAR(self->grid_py[0]);
   Py_CLEAR(self->grid_py[1]);
   Py_CLEAR(self->grid_py[2]);
@@ -1692,6 +1727,14 @@ PyObject *native_create_jit_proxy(PyObject *self_unused, PyObject *const *args,
   Py_INCREF(stream_getter);
   proxy->device_getter = device_getter;
   Py_INCREF(device_getter);
+  // Get _param_name_to_idx from jit_fn for kwargs→positional merging
+  static PyObject *pnti_str = nullptr;
+  if (!pnti_str)
+    pnti_str = PyUnicode_InternFromString("_param_name_to_idx");
+  PyObject *pnti = PyObject_GetAttr(jit_fn, pnti_str);
+  proxy->param_name_to_idx = pnti; // may be NULL if attr missing
+  if (!pnti)
+    PyErr_Clear();
   proxy->options_hash = opts_hash;
   proxy->n_params = n_params;
   PyObject_GC_Track((PyObject *)proxy);
