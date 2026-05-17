@@ -207,44 +207,22 @@ def _attn_fwd_async_prefetch(
 
     Design notes:
       * K and V are both double-buffered (2 LDS slots, ping-pong index
-        i%2).  Reasons:
-          - The K consumer goes through `local_trans(k_buf[slot])` which
-            creates a `memdesc_trans` view.  The AMD scheduler does not
-            track the alias between that view and the original `k_buf`
-            written by `buffer_load_lds`, so single-buffered K races the
-            current iter's transposed `ds_read` against the next iter's
-            `buffer_load_lds` writes — wrong results at D=64 and at any
-            (D=128, nw=8) config.
-          - V single-buffered also races for the same reason: the AMD
-            scheduler reorders the next iter's `buffer_load_lds` ahead of
-            the current iter's `ds_read` since they have no register
-            dependency (the mfma consumes register values, not LDS).
-        Two slots per buffer eliminate the alias entirely: each iter
-        writes to slot (i+1)%2 while reading from slot i%2.
-      * `kt_cur` / `v_cur` are LOCAL SSA values (not loop-carried
-        iter_args) — avoids the AMDGCN register WAR hazard previously
-        observed at D=64 when iter_arg ds_read registers aliased with
-        in-flight mfma operands.
+        i%2).
       * `local_trans` is applied to K so `local_load` lands directly in
         dot-operand layout 1, skipping the per-iter ds_write+barrier+
-        ds_read shuffle that `tl.dot(q, k_cur.T)` would emit (10M+ cycles
-        saved at D=64/N=8192 according to rocprofv3 ATT).
-      * Prefetch is "real": global->LDS load for tile i+1 is issued right
-        after the current tile's LDS reads, so it overlaps with the
-        QK+softmax+PV compute that immediately follows.  The next iter's
-        wait blocks only on whatever portion the compute didn't already
-        hide.
-
+        ds_read shuffle that `tl.dot(q, k_cur.T)` would emit.
     Prologue:
-      t=0:  [GLDS_KV]                                ; issue tile 0 -> slot 0
+    t = 0
+    [GLDS_KV]
 
-    Steady state (i = 0..n_main-1):
-      [wait_t_i] [LR_K_t_i (slot i%2), LR_V_t_i (slot i%2)]
-        [GLDS_K_{i+1} (slot (i+1)%2), GLDS_V_{i+1} (slot (i+1)%2)]
-        [QK SM PV]_i
-
-    Epilogue (last tile = n_main):
-      [wait] [LR_KV (slot n_main%2)] [QK_masked SM PV]
+    Steady State (Hot Loop):
+    t = i               t = i+1
+    [LR_KV]
+    [QK, SM0, SM1, PV]  [GLDS_KV],
+    Epilogue:
+                        t = i+1
+                        [LR_KV]
+                        [QK (masked), SM0, SM1, PV]
     """
     _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
                     stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om, stride_ok)
@@ -288,16 +266,20 @@ def _attn_fwd_async_prefetch(
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-
-    # Prologue: issue async load for tile 0 into K slot 0 and V (only slot).
+    """
+    Prologue:
+    t = 0
+    [GLDS_KV]
+    """
     tok_k0 = tlx.async_load(k_ptrs, tlx.local_view(k_buf, 0), mask=offs_n[:, None] < N_CTX)
     tok_v0 = tlx.async_load(v_ptrs, tlx.local_view(v_buf, 0), mask=offs_n[:, None] < N_CTX)
     tlx.async_load_commit_group([tok_k0, tok_v0])
-
-    # Steady state.  Loop counter `i` indexes the *current* tile.
-    # i%2 selects the K slot being read this iter; (i+1)%2 receives the
-    # next prefetch.  V single-buffered: read then immediately overwrite
-    # (compiler tracks the alias).
+    """
+    Steady State (Hot Loop):
+    t = i               t = i+1
+    [LR_KV]
+    [QK, SM0, SM1, PV]  [GLDS_KV],
+    """
     for block_id in tl.range(0, n_main * BLOCK_N, BLOCK_N, num_stages=0):
         next_off = block_id + BLOCK_N
         kn = block_id + offs_n
@@ -307,12 +289,13 @@ def _attn_fwd_async_prefetch(
         slot_cur = i % 2
         slot_nxt = (i + 1) % 2
 
+        # LR_KV_ti
         wait_tok = tlx.async_load_wait_group(0)
         kt_view = tlx.local_trans(tlx.local_view(k_buf, slot_cur))
         kt_cur = tlx.local_load(kt_view, token=wait_tok, relaxed=True)
         v_cur = tlx.local_load(tlx.local_view(v_buf, slot_cur), token=wait_tok, relaxed=True)
 
-        # Prefetch tile i+1 into the *other* slots.
+        # GLDS_KV_t(i+1), prefetch tile i+1 into the *other* slots.
         tok_k = tlx.async_load(k_ptrs + next_off * stride_kn, tlx.local_view(k_buf, slot_nxt), mask=next_mask)
         tok_v = tlx.async_load(v_ptrs + next_off * stride_vn, tlx.local_view(v_buf, slot_nxt), mask=next_mask)
         tlx.async_load_commit_group([tok_k, tok_v])
@@ -333,30 +316,41 @@ def _attn_fwd_async_prefetch(
 
         # PV_ti
         acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
-
-    # Epilogue: consume tile n_main from slot (n_main % 2).
+    """
+    Epilogue:
+    t = i+1
+    [LR_KV]
+    [QK (masked), SM0, SM1, PV]
+    """
+    # Consume tile n_main from slot (n_main % 2).
     wait_tok = tlx.async_load_wait_group(0)
     slot_last = n_main % 2
     kt_view = tlx.local_trans(tlx.local_view(k_buf, slot_last))
     kt_cur = tlx.local_load(kt_view, token=wait_tok, relaxed=True)
     v_cur = tlx.local_load(tlx.local_view(v_buf, slot_last), token=wait_tok, relaxed=True)
 
+    # QK_t(i+1) — with boundary + causal masking
     kn_last = n_main * BLOCK_N + offs_n
     qk = tl.dot(q, kt_cur)
     qk = tl.where(kn_last[None, :] < N_CTX, qk, float("-inf"))
     if IS_CAUSAL:
         qk = tl.where(offs_m[:, None] >= kn_last[None, :], qk, float("-inf"))
 
+    # SM0_t(i+1)
     m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
     p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
     l_ij = tl.sum(p, 1)
+
+    # SM1_t(i+1)
     alpha = tl.math.exp2(m_i - m_ij)
     acc = acc * alpha[:, None]
     l_i = l_i * alpha + l_ij
     m_i = m_ij
 
+    # PV_t(i+1)
     acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
 
+    # Store output
     acc = acc / l_i[:, None]
     o_ptrs = Out + o_off + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
     tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=(offs_m[:, None] < N_CTX) & (offs_d[None, :] < HEAD_DIM))
@@ -413,12 +407,7 @@ def flash_attn_async_simple(q, k, v, sm_scale, causal=False, **kw):
 
 
 def flash_attn_async_prefetch(q, k, v, sm_scale, causal=False, **kw):
-    """Prefetch FA with modulo-scheduled prologue/hot-loop/epilogue.
-
-    Default block size and warp count are tuned for the common (D=64,
-    D=128) configs; both work correctly across nw=4/8 and BLOCK_N=64/128
-    but the defaults below give the best end-to-end on MI350X.
-    """
+    """Prefetch FA with modulo-scheduled prologue/hot-loop/epilogue."""
     B, H, N_CTX, D = q.shape
     o = torch.empty_like(q)
 
