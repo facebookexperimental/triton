@@ -143,10 +143,14 @@ def _attn_fwd_async_simple(
         tlx.async_load_commit_group([tok_k, tok_v])
 
         wait_tok = tlx.async_load_wait_group(0)
-        k_cur = tlx.local_load(tlx.local_view(k_buf, 0), token=wait_tok, relaxed=True)
+        # Transpose K at the memdesc level (metadata-only) so local_load lands
+        # directly in dot_op(opIdx=1) layout — skips the register-shuffle + LDS
+        # round-trip that `tl.dot(q, k_cur.T)` would otherwise emit.
+        kt_view = tlx.local_trans(tlx.local_view(k_buf, 0))
+        kt_cur = tlx.local_load(kt_view, token=wait_tok, relaxed=True)
         v_cur = tlx.local_load(tlx.local_view(v_buf, 0), token=wait_tok, relaxed=True)
 
-        qk = tl.dot(q, k_cur.T)
+        qk = tl.dot(q, kt_cur)
         if IS_CAUSAL:
             qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
         if start_n + BLOCK_N > N_CTX:
