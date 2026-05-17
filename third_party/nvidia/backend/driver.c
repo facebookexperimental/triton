@@ -542,9 +542,11 @@ static PyObject *fillTMADescriptorTiled(PyObject *self, PyObject *args) {
 
   // Follow the CUTLASS change for the driver version check
   // https://github.com/NVIDIA/cutlass/commit/b7ecaa605dd70326900433695e11ebfec407edd2#diff-1dfcaf77b33258ff3175540718d9caff1cd471215f741ba42943ef00770e6d04
-  int driver_version = 0;
-  CUresult driver_version_result = cuDriverGetVersion(&driver_version);
-  assert(driver_version_result == CUDA_SUCCESS);
+  static int driver_version = -1;
+  if (driver_version < 0) {
+    CUresult driver_version_result = cuDriverGetVersion(&driver_version);
+    assert(driver_version_result == CUDA_SUCCESS);
+  }
 
   if (driver_version <= 13010) {
     int max_byte_index = 0;
@@ -1184,7 +1186,9 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps,
 }
 
 static PyObject *data_ptr_str = NULL;
-static PyObject *td_get_str = NULL; /* interned "get" for allocator.get() */
+static PyObject *td_get_str = NULL;  /* interned "get" for allocator.get() */
+static PyObject *padding_str = NULL; /* interned "padding" for TMA fill mode */
+static PyObject *nan_str = NULL; /* interned "nan" for NaN fill comparison */
 
 // Extract a CUDA device pointer from a pointer-like PyObject obj, and store
 // it to the memory location pointed by ptr.
@@ -1393,7 +1397,15 @@ typedef enum {
   EXTRACTOR_FP32_INDEX = 12,
   EXTRACTOR_FP64_INDEX = 13,
   // custom
-  EXTRACTOR_NVTMADESC_INDEX = 14,
+  EXTRACTOR_NVTMADESC_INDEX =
+      14, /* pre-built TMA desc (PyCUtensorMap or tma_desc_cpu_ptr());
+              used by _experimental_descriptor API and as fallback
+              when Python wrap_handle_tensordesc() pre-encodes */
+  EXTRACTOR_TENSORDESC_INDEX =
+      15, /* raw TensorDescriptor → build TMA desc in C (cached);
+              replaces Python-side make_tensordesc_arg() for the
+              new TensorDescriptor API */
+  EXTRACTOR_SKIP_INDEX = 16, /* shadow arg filled by TMA expansion */
   // last entry to have a count
   EXTRACTOR_TYPE_COUNT
 } ExtractorTypeIndex;
@@ -1710,8 +1722,56 @@ cleanup:
  * Calling convention: dispatcher(grid_x, grid_y, grid_z, stream, *kernel_args)
  * ========================================================================= */
 
+/* ============================================================
+ * Torch bridge API — fast TensorDescriptor field extraction
+ * ============================================================ */
+typedef struct {
+  int8_t (*get_scalar_type)(PyObject *);
+  uint64_t (*get_data_ptr)(PyObject *);
+  int (*extract_tensordesc)(PyObject *td_obj, uint64_t *out_data_ptr,
+                            int64_t *out_shape, int64_t *out_strides,
+                            int max_ndim);
+} TritonTensorAccessAPI;
+
+static TritonTensorAccessAPI *g_td_bridge = NULL;
+
+static PyObject *register_tensor_bridge(PyObject *self, PyObject *arg) {
+  (void)self;
+  if (!PyCapsule_IsValid(arg, "triton_tensor_access_api")) {
+    PyErr_SetString(
+        PyExc_TypeError,
+        "Expected a PyCapsule with name 'triton_tensor_access_api'");
+    return NULL;
+  }
+  g_td_bridge = (TritonTensorAccessAPI *)PyCapsule_GetPointer(
+      arg, "triton_tensor_access_api");
+  Py_RETURN_NONE;
+}
+
 #define TD_MAX_KERNEL_ARGS 64
-#define TD_FIXED_ARGS 4 /* grid_x, grid_y, grid_z, stream */
+#define TD_FIXED_ARGS 4          /* grid_x, grid_y, grid_z, stream */
+#define TD_MAX_TMA_DESCS 8       /* max nvTmaDesc args per kernel */
+#define TD_MAX_TENSORDESC_NDIM 5 /* max dimensionality for TensorDescriptor */
+
+/* Per-TMA-slot metadata for inline expansion of TensorDescriptor objects */
+typedef struct {
+  int swizzle;
+  int elem_size;
+  int elem_type; /* host-remapped CUtensorMapDataType */
+  int ndim;
+  int fp4_padded;
+  uint32_t block_size[TD_MAX_TENSORDESC_NDIM];
+  /* Shadow arg indices: where to write shape[j] and strides[j] in kernel_params
+   */
+  int shape_param_indices[TD_MAX_TENSORDESC_NDIM];
+  int stride_param_indices[TD_MAX_TENSORDESC_NDIM];
+  /* Cache: skip cuTensorMapEncodeTiled if unchanged */
+  uint64_t cached_data_ptr;
+  int64_t cached_shape[TD_MAX_TENSORDESC_NDIM];
+  int64_t cached_strides[TD_MAX_TENSORDESC_NDIM];
+  int cached_fill; /* CUtensorMapFloatOOBfill value (padding mode) */
+  int cache_valid;
+} TMASlotMeta;
 
 typedef union {
   CUdeviceptr ptr;
@@ -1736,7 +1796,8 @@ typedef struct {
   CUlaunchAttribute launch_attrs[5];
   unsigned num_launch_attrs;
   int arg_types[TD_MAX_KERNEL_ARGS]; /* ExtractorTypeIndex values */
-  int num_args;
+  int num_args;      /* total kernel param slots (excluding scratch) */
+  int num_user_args; /* number of Python-visible args passed by caller */
   int total_params;
   TDArgSlot arg_storage[TD_MAX_KERNEL_ARGS];
   void *kernel_params[TD_MAX_KERNEL_ARGS];
@@ -1749,6 +1810,12 @@ typedef struct {
   unsigned profile_scratch_align;
   PyObject *allocator;         /* _allocation._allocator (ContextVar) */
   PyObject *profile_allocator; /* _allocation._profile_allocator (wrapper) */
+  /* TMA descriptor storage (128-byte aligned) */
+  int num_tma_descs;
+  int tma_slot_for_arg[TD_MAX_KERNEL_ARGS]; /* -1 if not TMA, else tma_descs
+                                               index */
+  TMASlotMeta tma_meta[TD_MAX_TMA_DESCS];
+  CUtensorMap tma_descs[TD_MAX_TMA_DESCS] __attribute__((aligned(128)));
 } TritonDispatcher;
 
 /* Forward declarations */
@@ -1790,10 +1857,199 @@ static inline uint16_t td_pack_bf16(double v) {
 }
 
 /* Arg conversion using ExtractorTypeIndex codes */
+
+/* Extract and expand a raw TensorDescriptor into a TMA descriptor.
+ * Handles: field extraction (via bridge or Python fallback), per-slot caching,
+ * cuTensorMapEncodeTiled on cache miss, and filling shadow shape/stride slots.
+ */
+static int td_extract_tensordesc(TritonDispatcher *self, int i, PyObject *a) {
+  int slot = self->tma_slot_for_arg[i];
+  if (slot < 0 || slot >= TD_MAX_TMA_DESCS) {
+    PyErr_Format(PyExc_RuntimeError, "Invalid TMA slot %d for arg %d", slot, i);
+    return -1;
+  }
+  TMASlotMeta *meta = &self->tma_meta[slot];
+  int ndim = meta->ndim;
+
+  uint64_t data_ptr;
+  int64_t cur_shape[TD_MAX_TENSORDESC_NDIM];
+  int64_t cur_strides[TD_MAX_TENSORDESC_NDIM];
+
+  if (g_td_bridge && g_td_bridge->extract_tensordesc) {
+    /* Fast path: use bridge to extract fields directly */
+    int got_ndim = g_td_bridge->extract_tensordesc(
+        a, &data_ptr, cur_shape, cur_strides, TD_MAX_TENSORDESC_NDIM);
+    if (got_ndim < 0) {
+      PyErr_SetString(PyExc_RuntimeError,
+                      "Failed to extract TensorDescriptor via bridge");
+      return -1;
+    }
+    if (got_ndim != ndim) {
+      PyErr_Format(PyExc_ValueError,
+                   "TensorDescriptor ndim mismatch: descriptor has %d dims "
+                   "but kernel expects %d dims",
+                   got_ndim, ndim);
+      return -1;
+    }
+  } else {
+    /* Slow fallback: Python attribute lookups */
+    PyObject *base_obj = PyObject_GetAttrString(a, "base");
+    if (!base_obj)
+      return -1;
+    PyObject *dptr_obj = PyObject_CallMethodNoArgs(base_obj, data_ptr_str);
+    Py_DECREF(base_obj);
+    if (!dptr_obj)
+      return -1;
+    data_ptr = PyLong_AsUnsignedLongLong(dptr_obj);
+    Py_DECREF(dptr_obj);
+
+    PyObject *shape_obj = PyObject_GetAttrString(a, "shape");
+    if (!shape_obj)
+      return -1;
+    PyObject *shape_fast = PySequence_Fast(shape_obj, "shape");
+    Py_DECREF(shape_obj);
+    if (!shape_fast)
+      return -1;
+    for (int j = 0; j < ndim; j++)
+      cur_shape[j] = PyLong_AsLongLong(PySequence_Fast_GET_ITEM(shape_fast, j));
+    Py_DECREF(shape_fast);
+
+    PyObject *strides_obj = PyObject_GetAttrString(a, "strides");
+    if (!strides_obj)
+      return -1;
+    PyObject *strides_fast = PySequence_Fast(strides_obj, "strides");
+    Py_DECREF(strides_obj);
+    if (!strides_fast)
+      return -1;
+    for (int j = 0; j < ndim; j++)
+      cur_strides[j] =
+          PyLong_AsLongLong(PySequence_Fast_GET_ITEM(strides_fast, j));
+    Py_DECREF(strides_fast);
+
+    if (PyErr_Occurred())
+      return -1;
+  }
+
+  /* Resolve padding/fill mode upfront (needed for cache key) */
+  CUtensorMapFloatOOBfill fill = CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE;
+  PyObject *pad_obj = PyObject_GetAttr(a, padding_str);
+  if (pad_obj) {
+    if (PyObject_RichCompareBool(pad_obj, nan_str, Py_EQ) == 1)
+      fill = CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA;
+    Py_DECREF(pad_obj);
+  } else {
+    PyErr_Clear();
+  }
+
+  /* Check cache (data_ptr + shape + strides + padding) */
+  int cache_hit = meta->cache_valid && (meta->cached_data_ptr == data_ptr) &&
+                  (meta->cached_fill == (int)fill);
+  if (cache_hit) {
+    for (int j = 0; j < ndim; j++) {
+      if (meta->cached_shape[j] != cur_shape[j] ||
+          meta->cached_strides[j] != cur_strides[j]) {
+        cache_hit = 0;
+        break;
+      }
+    }
+  }
+
+  if (!cache_hit) {
+    /* Rebuild TMA descriptor in-place */
+    int elem_size = meta->elem_size;
+    int rank = ndim;
+    uint32_t blockSizeInt[TD_MAX_TENSORDESC_NDIM];
+    uint64_t shapeInt[TD_MAX_TENSORDESC_NDIM];
+    uint64_t stridesLL[TD_MAX_TENSORDESC_NDIM];
+
+    int64_t *eshape = cur_shape;
+    int64_t expanded_shape_buf[TD_MAX_TENSORDESC_NDIM];
+    if (meta->fp4_padded) {
+      for (int j = 0; j < rank; j++)
+        expanded_shape_buf[j] = cur_shape[j];
+      expanded_shape_buf[rank - 1] *= 2;
+      eshape = expanded_shape_buf;
+    }
+
+    /* Reverse order for cuTensorMapEncodeTiled (row-major → col-major) */
+    for (int j = 0; j < rank; j++) {
+      blockSizeInt[rank - j - 1] = meta->block_size[j];
+      shapeInt[rank - j - 1] = (uint64_t)eshape[j];
+    }
+    for (int j = 0; j + 1 < rank; j++)
+      stridesLL[rank - j - 2] = (uint64_t)(elem_size * cur_strides[j]);
+    stridesLL[rank - 1] =
+        shapeInt[rank - 1] *
+        (rank == 1 ? (uint64_t)elem_size : stridesLL[rank - 2]);
+
+    uint32_t elementStrides[TD_MAX_TENSORDESC_NDIM] = {1, 1, 1, 1, 1};
+    static cuTensorMapEncodeTiled_t cuTensorMapEncodeTiled_fn = NULL;
+    if (!cuTensorMapEncodeTiled_fn)
+      cuTensorMapEncodeTiled_fn = getCuTensorMapEncodeTiledHandle();
+    if (!cuTensorMapEncodeTiled_fn)
+      return -1;
+
+    CUresult res = cuTensorMapEncodeTiled_fn(
+        &self->tma_descs[slot], meta->elem_type, rank,
+        (void *)(uintptr_t)data_ptr, shapeInt, stridesLL, blockSizeInt,
+        elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE, meta->swizzle,
+        CU_TENSOR_MAP_L2_PROMOTION_L2_128B, fill);
+    if (res != CUDA_SUCCESS) {
+      const char *str;
+      cuGetErrorString(res, &str);
+      PyErr_Format(PyExc_RuntimeError,
+                   "cuTensorMapEncodeTiled failed in TMA expansion: %s",
+                   str ? str : "?");
+      return -1;
+    }
+
+    /* CUTLASS driver workaround */
+    static int driver_version = -1;
+    if (driver_version < 0)
+      cuDriverGetVersion(&driver_version);
+    if (driver_version <= 13010) {
+      int max_byte_index = 0;
+      for (int j = 0; j < rank; j++) {
+        int bytes_stride = j == 0 ? elem_size : (int)stridesLL[j - 1];
+        max_byte_index += ((int)shapeInt[j] - 1) * bytes_stride;
+      }
+      if (max_byte_index + 1 < 128 * 1024) {
+        uint64_t *desc_u64 = (uint64_t *)&self->tma_descs[slot];
+        desc_u64[1] &= ~(1llu << 21);
+      }
+    }
+
+    /* Update cache */
+    meta->cached_data_ptr = data_ptr;
+    meta->cached_fill = (int)fill;
+    for (int j = 0; j < ndim; j++) {
+      meta->cached_shape[j] = cur_shape[j];
+      meta->cached_strides[j] = cur_strides[j];
+    }
+    meta->cache_valid = 1;
+  }
+
+  /* Fill shadow shape/stride kernel_params slots */
+  for (int j = 0; j < ndim; j++) {
+    int si = meta->shape_param_indices[j];
+    if (si >= 0)
+      self->arg_storage[si].i32 = (int32_t)cur_shape[j];
+    int sti = meta->stride_param_indices[j];
+    if (sti >= 0)
+      self->arg_storage[sti].i64 = cur_strides[j];
+  }
+  return 0;
+}
+
 static inline int td_convert_args(TritonDispatcher *self,
                                   PyObject *const *kargs) {
+  int user_idx = 0; /* index into kargs[] (Python-visible args) */
   for (int i = 0; i < self->num_args; i++) {
-    PyObject *a = kargs[i];
+    if (self->arg_types[i] == EXTRACTOR_SKIP_INDEX) {
+      /* Shadow arg: filled by EXTRACTOR_TENSORDESC_INDEX, skip Python arg */
+      continue;
+    }
+    PyObject *a = kargs[user_idx++];
     TDArgSlot *s = &self->arg_storage[i];
     switch (self->arg_types[i]) {
     case EXTRACTOR_POINTER_INDEX:
@@ -1836,6 +2092,25 @@ static inline int td_convert_args(TritonDispatcher *self,
     }
     case EXTRACTOR_FP64_INDEX:
       s->f64 = PyFloat_AsDouble(a);
+      break;
+    case EXTRACTOR_NVTMADESC_INDEX: {
+      int slot = self->tma_slot_for_arg[i];
+      if (slot < 0 || slot >= TD_MAX_TMA_DESCS) {
+        PyErr_Format(PyExc_RuntimeError, "Invalid TMA slot %d for arg %d", slot,
+                     i);
+        return -1;
+      }
+      if (!extractTmaDesc(&self->tma_descs[slot], a))
+        return -1;
+      break;
+    }
+    case EXTRACTOR_TENSORDESC_INDEX: {
+      if (td_extract_tensordesc(self, i, a) < 0)
+        return -1;
+      break;
+    }
+    case EXTRACTOR_SKIP_INDEX:
+      /* Shadow arg: already filled by EXTRACTOR_TENSORDESC_INDEX above */
       break;
     default:
       PyErr_Format(PyExc_TypeError, "Unknown type code %d for arg %d",
@@ -1895,14 +2170,17 @@ static PyObject *TritonDispatcher_new(PyTypeObject *type, PyObject *args,
                            "profile_scratch_align",
                            "allocator",
                            "profile_allocator",
+                           "tma_meta",
                            NULL};
+  PyObject *tma_meta_list = NULL;
 
   if (!PyArg_ParseTupleAndKeywords(
-          args, kwargs, "KiiiiiiOpp|IIIIOO", kwlist, &func_ptr, &num_warps,
+          args, kwargs, "KiiiiiiOpp|IIIIOOO", kwlist, &func_ptr, &num_warps,
           &num_ctas, &shared_mem, &launch_pdl, &launch_coop, &launch_cluster,
           &arg_type_codes, &has_global_scratch, &has_profile_scratch,
           &global_scratch_size, &global_scratch_align, &profile_scratch_size,
-          &profile_scratch_align, &allocator_obj, &profile_allocator_obj))
+          &profile_scratch_align, &allocator_obj, &profile_allocator_obj,
+          &tma_meta_list))
     return NULL;
 
   TritonDispatcher *self = (TritonDispatcher *)type->tp_alloc(type, 0);
@@ -1937,6 +2215,8 @@ static PyObject *TritonDispatcher_new(PyTypeObject *type, PyObject *args,
     return NULL;
   }
   self->num_args = (int)n;
+  self->num_user_args =
+      (int)n; /* default: same as num_args; updated below for SKIP */
   for (Py_ssize_t i = 0; i < n; i++)
     self->arg_types[i] =
         (int)PyLong_AsLong(PyTuple_GET_ITEM(arg_type_codes, i));
@@ -1944,18 +2224,103 @@ static PyObject *TritonDispatcher_new(PyTypeObject *type, PyObject *args,
     Py_DECREF(self);
     return NULL;
   }
+  /* Count user-visible args (exclude SKIP slots) */
+  {
+    int user_count = 0;
+    for (int i = 0; i < self->num_args; i++) {
+      if (self->arg_types[i] != EXTRACTOR_SKIP_INDEX)
+        user_count++;
+    }
+    self->num_user_args = user_count;
+  }
 
   /* Build kernel_params pointers */
   int pidx = 0;
+  int tma_idx = 0;
+  memset(self->tma_slot_for_arg, -1, sizeof(self->tma_slot_for_arg));
+  memset(self->tma_meta, 0, sizeof(self->tma_meta));
   for (int i = 0; i < self->num_args; i++) {
-    self->kernel_params[pidx] = &self->arg_storage[pidx];
+    if (self->arg_types[i] == EXTRACTOR_NVTMADESC_INDEX ||
+        self->arg_types[i] == EXTRACTOR_TENSORDESC_INDEX) {
+      if (tma_idx >= TD_MAX_TMA_DESCS) {
+        PyErr_SetString(PyExc_ValueError, "Too many nvTmaDesc/TensorDesc args");
+        Py_DECREF(self);
+        return NULL;
+      }
+      self->tma_slot_for_arg[i] = tma_idx;
+      self->kernel_params[pidx] = &self->tma_descs[tma_idx];
+      tma_idx++;
+    } else {
+      self->kernel_params[pidx] = &self->arg_storage[pidx];
+    }
     pidx++;
   }
+  self->num_tma_descs = tma_idx;
   self->kernel_params[pidx] = &self->arg_storage[pidx];
   pidx++; /* global_scratch */
   self->kernel_params[pidx] = &self->arg_storage[pidx];
   pidx++; /* profile_scratch */
   self->total_params = pidx;
+
+  /* Parse tma_meta list if provided (for EXTRACTOR_TENSORDESC_INDEX slots) */
+  if (tma_meta_list && tma_meta_list != Py_None &&
+      PyList_Check(tma_meta_list)) {
+    Py_ssize_t nmeta = PyList_Size(tma_meta_list);
+    for (Py_ssize_t mi = 0; mi < nmeta && mi < TD_MAX_TMA_DESCS; mi++) {
+      PyObject *d = PyList_GET_ITEM(tma_meta_list, mi);
+      if (!PyDict_Check(d))
+        continue;
+      TMASlotMeta *m = &self->tma_meta[mi];
+      PyObject *v;
+      v = PyDict_GetItemString(d, "swizzle");
+      if (v)
+        m->swizzle = (int)PyLong_AsLong(v);
+      v = PyDict_GetItemString(d, "elem_size");
+      if (v)
+        m->elem_size = (int)PyLong_AsLong(v);
+      v = PyDict_GetItemString(d, "elem_type");
+      if (v)
+        m->elem_type = (int)PyLong_AsLong(v);
+      v = PyDict_GetItemString(d, "ndim");
+      if (v)
+        m->ndim = (int)PyLong_AsLong(v);
+      v = PyDict_GetItemString(d, "fp4_padded");
+      if (v)
+        m->fp4_padded = PyObject_IsTrue(v);
+      v = PyDict_GetItemString(d, "block_size");
+      if (v && PySequence_Check(v)) {
+        Py_ssize_t blen = PySequence_Size(v);
+        for (Py_ssize_t j = 0; j < blen && j < TD_MAX_TENSORDESC_NDIM; j++) {
+          PyObject *item = PySequence_GetItem(v, j);
+          m->block_size[j] = (uint32_t)PyLong_AsUnsignedLong(item);
+          Py_DECREF(item);
+        }
+      }
+      v = PyDict_GetItemString(d, "shape_param_indices");
+      if (v && PySequence_Check(v)) {
+        Py_ssize_t slen = PySequence_Size(v);
+        for (Py_ssize_t j = 0; j < slen && j < TD_MAX_TENSORDESC_NDIM; j++) {
+          PyObject *item = PySequence_GetItem(v, j);
+          m->shape_param_indices[j] = (int)PyLong_AsLong(item);
+          Py_DECREF(item);
+        }
+      }
+      v = PyDict_GetItemString(d, "stride_param_indices");
+      if (v && PySequence_Check(v)) {
+        Py_ssize_t slen = PySequence_Size(v);
+        for (Py_ssize_t j = 0; j < slen && j < TD_MAX_TENSORDESC_NDIM; j++) {
+          PyObject *item = PySequence_GetItem(v, j);
+          m->stride_param_indices[j] = (int)PyLong_AsLong(item);
+          Py_DECREF(item);
+        }
+      }
+      m->cache_valid = 0;
+    }
+    if (PyErr_Occurred()) {
+      Py_DECREF(self);
+      return NULL;
+    }
+  }
 
   /* Pre-build launch attributes */
   unsigned na = 0;
@@ -2003,10 +2368,10 @@ static PyObject *TritonDispatcher_vectorcall(PyObject *callable,
   TritonDispatcher *self = (TritonDispatcher *)callable;
   Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
 
-  if (nargs < TD_FIXED_ARGS + self->num_args) {
+  if (nargs < TD_FIXED_ARGS + self->num_user_args) {
     PyErr_Format(PyExc_TypeError,
                  "_TritonDispatcher: expected %d args, got %zd",
-                 TD_FIXED_ARGS + self->num_args, nargs);
+                 TD_FIXED_ARGS + self->num_user_args, nargs);
     return NULL;
   }
 
@@ -2563,6 +2928,8 @@ static PyMethodDef ModuleMethods[] = {
      "doc"},
     {"create_fast_jit_type", py_create_fast_jit_type, METH_O,
      "Create a heap type inheriting from JITFunction with C mp_subscript"},
+    {"register_tensor_bridge", register_tensor_bridge, METH_O,
+     "Register PyCapsule from _torch_bridge for fast TensorDescriptor access"},
 
     {NULL, NULL, 0, NULL} // sentinel
 };
@@ -2599,6 +2966,14 @@ PyMODINIT_FUNC PyInit_cuda_utils(void) {
   }
   td_get_str = PyUnicode_InternFromString("get");
   if (td_get_str == NULL) {
+    return NULL;
+  }
+  padding_str = PyUnicode_InternFromString("padding");
+  if (padding_str == NULL) {
+    return NULL;
+  }
+  nan_str = PyUnicode_InternFromString("nan");
+  if (nan_str == NULL) {
     return NULL;
   }
 
