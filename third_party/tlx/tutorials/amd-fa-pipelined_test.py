@@ -153,8 +153,7 @@ def _attn_fwd_async_simple(
         qk = tl.dot(q, kt_cur)
         if IS_CAUSAL:
             qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
-        if start_n + BLOCK_N > N_CTX:
-            qk = tl.where(kn[None, :] < N_CTX, qk, float("-inf"))
+        qk = tl.where(kn[None, :] < N_CTX, qk, float("-inf"))
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
         qk = qk * QK_SCALE - m_ij[:, None]
