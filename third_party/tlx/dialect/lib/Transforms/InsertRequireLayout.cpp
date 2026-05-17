@@ -12,6 +12,7 @@
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "tlx-amd-insert-require-layout"
@@ -249,17 +250,59 @@ private:
 // Rewrite helpers
 // ============================================================================
 
-static ttg::SwizzledSharedEncodingAttr
-computeSharedEncFromDotEnc(ttg::DotOperandEncodingAttr dotEnc,
-                           ttg::LocalLoadOp localLoadOp) {
+static std::optional<SmallVector<unsigned>>
+getUserSharedOrder(ttg::LocalLoadOp localLoadOp) {
+  auto loadMemDesc = localLoadOp->getOperand(0);
+  if (auto srcType = dyn_cast<ttg::MemDescType>(loadMemDesc.getType())) {
+    if (auto srcEnc =
+            dyn_cast_or_null<ttg::SharedEncodingTrait>(srcType.getEncoding())) {
+      return ttg::getOrder(srcEnc, srcType.getShape());
+    }
+  }
+
+  return std::nullopt;
+}
+
+static Attribute computeSharedEncFromDotEnc(ttg::DotOperandEncodingAttr dotEnc,
+                                            ttg::LocalLoadOp localLoadOp,
+                                            bool useAsyncCopy) {
   auto resultType = cast<RankedTensorType>(localLoadOp.getType());
   auto order = ttg::getOrderForMemory(resultType);
+  auto userOrder = getUserSharedOrder(localLoadOp);
+  auto paddedOrder = userOrder.value_or(order);
   auto ctaLayout = ttg::getCGALayout(resultType.getEncoding());
   unsigned bitWidth = resultType.getElementType().getIntOrFloatBitWidth();
-  return ttg::SwizzledSharedEncodingAttr::get(localLoadOp->getContext(), dotEnc,
-                                              resultType.getShape(), order,
-                                              ctaLayout, bitWidth,
-                                              /*needTrans=*/false);
+
+  if (useAsyncCopy) {
+    auto loadMemDesc = localLoadOp->getOperand(0);
+    if (auto type = dyn_cast<ttg::MemDescType>(loadMemDesc.getType())) {
+      auto archStr = getAMDArch(localLoadOp->getParentOfType<ModuleOp>());
+      auto targetInfo = tt::AMD::TargetInfo(archStr.value_or("").str());
+      using tt::AMD::ISAFamily;
+      if (llvm::is_contained({ISAFamily::CDNA4, ISAFamily::GFX1250},
+                             targetInfo.getISAFamily())) {
+        if (auto padded = composePaddedLayout(
+                targetInfo, dotEnc.getOpIdx(), dotEnc.getKWidth(),
+                cast<ttg::TensorOrMemDesc>(type), paddedOrder, dotEnc,
+                /*useAsyncCopy=*/true)) {
+          LDBG("Deduced async-copy padded shared encoding from dot layout: "
+               << padded);
+          return padded;
+        }
+      }
+    }
+  }
+
+  auto swizzled = ttg::SwizzledSharedEncodingAttr::get(
+      localLoadOp->getContext(), dotEnc, resultType.getShape(), order,
+      ctaLayout, bitWidth, /*needTrans=*/false);
+  if (userOrder && *userOrder != order) {
+    LDBG("Respecting user-specified order instead of derived " << swizzled);
+    swizzled = ttg::SwizzledSharedEncodingAttr::get(
+        swizzled.getContext(), swizzled.getVec(), swizzled.getPerPhase(),
+        swizzled.getMaxPhase(), *userOrder, swizzled.getCGALayout());
+  }
+  return swizzled;
 }
 
 // Walk up the memdesc def-chain through subview / reinterpret ops to
@@ -274,8 +317,8 @@ static Value findMemDescRoot(Value memdesc) {
     // anchors and dot-consumer discovery meet on the full buffer even when
     // WMMA consumes a sliced or transposed view.
     if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
-            ttg::MemDescSubsliceOp, ttg::MemDescTransOp, ttg::MemDescReshapeOp>(
-            def)) {
+            ttg::MemDescSubsliceOp, ttg::MemDescTransOp, ttg::MemDescReshapeOp,
+            tlx::RequireLayoutOp>(def)) {
       root = def->getOperand(0);
       continue;
     }
@@ -284,35 +327,45 @@ static Value findMemDescRoot(Value memdesc) {
   return root;
 }
 
-// True if any sibling-subview user of the memdesc value's source alloc is
-// a TDM op (load or store). Used by the dot-path walk to hand off TDM-fed
-// buffers to the TDM anchor — both walks targeting the same alloc with
-// different encodings would otherwise conflict in the propagation lattice.
-// Stores are included so a store-anchored alloc isn't also targeted by the
-// dot-path walk; the store's hardware verifier requires the default
-// padded-shared encoding, which the dot-path swizzled anchor would clobber.
-static bool isFedByTDM(Value memdesc) {
+template <typename... ProducerOps>
+static bool isFedByAnyMemDescUser(Value memdesc) {
   llvm::SetVector<Value> worklist;
   worklist.insert(findMemDescRoot(memdesc));
   while (!worklist.empty()) {
     Value v = worklist.pop_back_val();
     for (Operation *u : v.getUsers()) {
-      if (isa<amdgpu::AsyncTDMCopyGlobalToLocalOp,
-              amdgpu::AsyncTDMCopyLocalToGlobalOp>(u))
+      if (isa<ProducerOps...>(u))
         return true;
-      // Follow sibling views from the root allocation so local_load(subslice)
-      // and local_load(transpose(subslice)) are recognized as TDM-fed too.
+      // Follow sibling views from the root allocation so local_load(subslice),
+      // local_load(transpose(subslice)), and already-constrained aliases are
+      // recognized as users of the same allocation.
       if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
               ttg::MemDescSubsliceOp, ttg::MemDescTransOp,
-              ttg::MemDescReshapeOp>(u))
+              ttg::MemDescReshapeOp, tlx::RequireLayoutOp>(u))
         worklist.insert(u->getResult(0));
     }
   }
   return false;
 }
 
-static void applyRequireLayout(ttg::SwizzledSharedEncodingAttr encoding,
-                               ttg::LocalLoadOp localLoadOp,
+// True if any sibling-subview user of the memdesc value's source alloc is
+// a TDM op (load or store). Used by the dot-path walk to hand off TDM-fed
+// buffers to the TDM anchor — both walks targeting the same alloc with
+// different encodings would otherwise conflict in the propagation lattice.
+// Stores are included so a store-anchored alloc isn't also targeted by the
+// dot-path walk; the store's hardware verifier requires the default
+// padded-shared encoding, which the dot-path anchor would clobber.
+static bool isFedByTDM(Value memdesc) {
+  return isFedByAnyMemDescUser<amdgpu::AsyncTDMCopyGlobalToLocalOp,
+                               amdgpu::AsyncTDMCopyLocalToGlobalOp>(memdesc);
+}
+
+static bool isFedByAsyncLdsProducer(Value memdesc) {
+  return isFedByAnyMemDescUser<ttg::AsyncCopyGlobalToLocalOp,
+                               amdgpu::BufferLoadToLocalOp>(memdesc);
+}
+
+static void applyRequireLayout(Attribute encoding, ttg::LocalLoadOp localLoadOp,
                                OpBuilder &builder) {
   auto loadMemDesc = localLoadOp->getOperand(0);
 
@@ -327,25 +380,11 @@ static void applyRequireLayout(ttg::SwizzledSharedEncodingAttr encoding,
   if (isFedByTDM(loadMemDesc))
     return;
 
-  // Respect user-specified order on the source memdesc.
-  if (auto srcType = dyn_cast<ttg::MemDescType>(loadMemDesc.getType())) {
-    if (auto srcEnc =
-            dyn_cast<ttg::SwizzledSharedEncodingAttr>(srcType.getEncoding())) {
-      if (srcEnc.getOrder() != encoding.getOrder()) {
-        LDBG("Respecting user-specified order "
-             << srcEnc << " instead of derived " << encoding);
-        encoding = ttg::SwizzledSharedEncodingAttr::get(
-            encoding.getContext(), encoding.getVec(), encoding.getPerPhase(),
-            encoding.getMaxPhase(), srcEnc.getOrder(), encoding.getCGALayout());
-      }
-    }
-  }
-
   builder.setInsertionPoint(localLoadOp);
   if (auto type = dyn_cast<ttg::MemDescType>(loadMemDesc.getType())) {
     auto newType = ttg::MemDescType::get(
-        type.getShape(), type.getElementType(), mlir::cast<Attribute>(encoding),
-        type.getMemorySpace(), type.getMutableMemory(), type.getAllocShape());
+        type.getShape(), type.getElementType(), encoding, type.getMemorySpace(),
+        type.getMutableMemory(), type.getAllocShape());
     auto requireOp = tlx::RequireLayoutOp::create(
         builder, localLoadOp->getLoc(), newType, loadMemDesc);
     localLoadOp->setOperand(0, requireOp.getResult());
@@ -712,8 +751,12 @@ LogicalResult insertRequireLayout(ModuleOp m) {
 
     LDBG("local_load needs dot encoding: " << dotEnc);
 
-    // Insert RequireLayoutOp for memdesc swizzling.
-    auto sharedEnc = computeSharedEncFromDotEnc(dotEnc, localLoadOp);
+    // Insert RequireLayoutOp for the memdesc-side dot layout. For explicit
+    // async direct-to-LDS producers, prefer AMD's padded shared layout when it
+    // is applicable and fall back to the dot-derived swizzled layout.
+    bool useAsyncCopy = isFedByAsyncLdsProducer(localLoadOp->getOperand(0));
+    auto sharedEnc =
+        computeSharedEncFromDotEnc(dotEnc, localLoadOp, useAsyncCopy);
     applyRequireLayout(sharedEnc, localLoadOp, builder);
   });
 
