@@ -7,26 +7,7 @@ from __future__ import annotations
 
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def _mul_f32x2(a, b):
-    return tl.inline_asm_elementwise(
-        """
-        {
-            .reg .b64 ra, rb, rc;
-            mov.b64 ra, { $2, $3 };
-            mov.b64 rb, { $4, $5 };
-            mul.f32x2 rc, ra, rb;
-            mov.b64 { $0, $1 }, rc;
-        }
-        """,
-        "=r,=r,r,r,r,r",
-        [a, b],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=2,
-    )
+from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2
 
 
 @triton.jit
@@ -160,7 +141,6 @@ def _compute_scale_and_quantize(
         data_fp8 = _cvt_e5m2x4_f32(scaled_data)
 
     data_fp8_flat = tl.reshape(data_fp8, [BLOCK_M, BLOCK_K])
-
     return scale_e8m0, data_fp8_flat
 
 
@@ -240,7 +220,6 @@ def _amax_to_e8m0_and_quantize(
         data_fp8 = _cvt_e5m2x4_f32(scaled_data)
 
     data_fp8_flat = tl.reshape(data_fp8, [BLOCK_M, BLOCK_K])
-
     return scale_e8m0, data_fp8_flat
 
 

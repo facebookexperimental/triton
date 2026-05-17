@@ -1127,14 +1127,14 @@ def TTNG_TMEMCopyOp : TTNG_Op<"tmem_copy"> {
     Each 32x128b block in SMEM is duplicated over 4 warps and stored into 128 rows
     and 4 columns of TMEM. The primary use case of this op is to copy blocked scales from SMEM to TMEM.
 
-    The shape of the input SMEM can be flexibily chosen depending on use cases. In the simplest case (e.g. unit test),
-    the source SMEM can be of shape (32 x num_blocks, 16), and the destination TMEM should be of shape (128, 16 x num_blocks),
-    for copying 8 bit values. For scaled GEMM, rep_m x rep_k copies of a 32x128b block need to be stored in SMEM, where
+    The shape of the input SMEM must explicitly encode the packed 32x128b blocks consumed by the instruction.
+    For scaled GEMM, rep_m x rep_k copies of a 32x128b block need to be stored in SMEM, where
     rep_m = BLOCK_M / 128, rep_k = BLOCK_K / scale_vec_size / 4, and scale_vec_size = 32 for MXFP.
     Conceptually, the SMEM is organized in a high-dimensional layout, (rep_m, rep_k, 32, 4, 4B).
     Some of axes can be flattened into one, to reduce the rank of the load. For example, the following patterns are supported:
-     * (rep_m, rep_k * 32 x 4 x 4B), 2D scale load with cp.async
+     * (rep_m, rep_k * 32 x 4 x 4B), flattened packed scale load
      * (rep_m, rep_k, 32, 16B), 4D scale load with TMA
+     * (1, rep_m, rep_k, 2, 256B), 5D scale load with TMA
      * (rep_m, rep_k, 32, 4, 4B), 5D scale load with cp.async
     Since rep_m blocks are not contiguous in SMEM, this axis cannot be flattened into inner ones.
 

@@ -1,0 +1,64 @@
+name: Publish fbtriton to PyPI
+# Builds fbtriton wheels (by reusing wheels_fb.yml) and publishes them to
+# PyPI via Trusted Publishing (OIDC) — no API token in repo secrets.
+#
+# Trigger (formal, gated):
+# - push of a tag matching:
+#     v<MAJOR>.<MINOR>.<PATCH>             → release   (e.g. v3.6.0)
+#     v<MAJOR>.<MINOR>.<PATCH>-rc<N>       → release candidate (e.g. v3.6.0-rc1)
+#     v<MAJOR>.<MINOR>.<PATCH>.dev<N>      → dev/nightly (e.g. v3.6.0.dev20260515)
+#
+# No manual workflow_dispatch — publishing is intentionally tag-only so the
+# released artifact is always tied to a specific git tag.
+#
+# PyPI side requires a configured Trusted Publisher for this repo:
+#   project:     fbtriton
+#   owner:       facebookexperimental
+#   repo:        triton
+#   workflow:    publish_fbtriton.yml
+#   environment: pypi
+# See: https://docs.pypi.org/trusted-publishers/
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - v[0-9]+.[0-9]+.[0-9]+
+      - v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+
+      - v[0-9]+.[0-9]+.[0-9]+.dev[0-9]+
+
+permissions: read-all
+
+jobs:
+  build:
+    name: Build wheels
+    uses: ./.github/workflows/wheels_fb.yml
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-22.04
+    environment:
+      name: pypi
+      url: https://pypi.org/p/fbtriton
+    permissions:
+      # Required for Trusted Publishing (OIDC).
+      id-token: write
+
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: dist
+          pattern: wheels-*
+          merge-multiple: true
+
+      - name: List wheels
+        run: ls -la dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          skip-existing: false
+          print-hash: true
