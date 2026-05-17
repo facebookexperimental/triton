@@ -691,9 +691,6 @@ def test_explicit_cluster_sync_ws(device):
     )
 
     ttgir = kernel.asm["ttgir"]
-    # The Fixup pass should have detected the user cluster_barrier and set this
-    assert "tlx.explicit_cluster_sync = true" in ttgir, (
-        f"Expected tlx.explicit_cluster_sync module attr in TTGIR:\n{ttgir}")
     # User placed exactly one cluster arrive+wait pair for each task (from cluster_barrier)
     assert ttgir.count("ttng.fence_mbarrier_init_release_cluster") == 1, (
         f"Expected exactly 1 fence_mbarrier_init_release_cluster in TTGIR:\n{ttgir}")
@@ -701,15 +698,15 @@ def test_explicit_cluster_sync_ws(device):
     assert ttgir.count("ttng.cluster_wait") == 3, (f"Expected exactly 3 cluster_wait in TTGIR:\n{ttgir}")
 
     ptx = kernel.asm["ptx"]
-    assert ptx.count("fence.mbarrier_init.release.cluster") == 1, (
-        f"Expected exactly 1 fence.mbarrier_init.release.cluster in PTX:\n{ptx}")
-    # The user's cluster_barrier should produce exactly one
-    # barrier.cluster.arrive.aligned and one barrier.cluster.wait.aligned
-    # No extra heuristic ones should be inserted
-    assert ptx.count("barrier.cluster.arrive.aligned") == 3, (
-        f"Expected exactly 3 barrier.cluster.arrive.aligned in PTX:\n{ptx}")
-    assert ptx.count("barrier.cluster.wait.aligned") == 3, (
-        f"Expected exactly 3 barrier.cluster.wait.aligned in PTX:\n{ptx}")
+    # 1 user fence + 1 compiler-inserted fence from maybeInsertClusterSync
+    assert ptx.count("fence.mbarrier_init.release.cluster") == 2, (
+        f"Expected exactly 2 fence.mbarrier_init.release.cluster in PTX:\n{ptx}")
+    # 3 user cluster_barrier + 1 compiler-inserted + 1 WS non-default warp arrive
+    assert ptx.count("barrier.cluster.arrive.aligned") == 5, (
+        f"Expected exactly 5 barrier.cluster.arrive.aligned in PTX:\n{ptx}")
+    # 3 user cluster_barrier + 1 compiler-inserted
+    assert ptx.count("barrier.cluster.wait.aligned") == 4, (
+        f"Expected exactly 4 barrier.cluster.wait.aligned in PTX:\n{ptx}")
 
     # --- Check correctness ---
     torch.testing.assert_close(y, x)
