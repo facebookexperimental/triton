@@ -231,14 +231,12 @@ public:
       llvm::dbgs() << "\n\n\n";
     }
 
-    if (generateSubtiledRegion) {
-      doGenerateSubtiledRegion(funcOp);
-      if (dumpIntermediateSteps) {
-        llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                        "doGenerateSubtiledRegion\n";
-        moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-        llvm::dbgs() << "\n\n\n";
-      }
+    doGenerateSubtiledRegion(funcOp);
+    if (dumpIntermediateSteps) {
+      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                      "doGenerateSubtiledRegion\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
     }
 
     doAnnotateTMAStoreWaits(funcOp);
