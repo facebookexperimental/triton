@@ -27,6 +27,11 @@ pytest python/test/unit/language/test_tutorial09_warp_specialization.py
 # Addmm autoWS Python test
 pytest python/test/unit/language/test_autows_addmm.py
 
+# AutoWS FA correctness (replaces test_autows_flash_attention.py).
+# Covers both fused_attention_ws_device_tma (compiler DP) and
+# fused_attention_ws_device_tma_dp (explicit DP) tutorial kernels.
+pytest third_party/tlx/tutorials/testing/test_correctness_autows.py
+
 # FA autoWS tutorial kernels
 TRITON_ALWAYS_COMPILE=1 pytest python/tutorials/fused-attention-ws-device-tma.py
 TRITON_ALWAYS_COMPILE=1 python python/tutorials/test_tlx_bwd_from_fused_attention.py
