@@ -3,6 +3,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _sub_f32x2
+from triton.language.extra.subtile_ops import _join_n_2D, _split_n_2D
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -144,26 +145,6 @@ def _compute_offsets(
 
 
 @triton.jit
-def _split_n(x, SPLIT_FACTOR: tl.constexpr):
-    if SPLIT_FACTOR == 1:
-        return (x, )
-    else:
-        x0, x1 = x.reshape([x.shape[0], 2, x.shape[1] // 2]).permute(0, 2, 1).split()
-        return _split_n(x0, SPLIT_FACTOR // 2) + _split_n(x1, SPLIT_FACTOR // 2)
-
-
-@triton.jit
-def _join_n(xs):
-    if len(xs) == 1:
-        return xs[0]
-    else:
-        x0 = _join_n(xs[:len(xs) // 2])
-        x1 = _join_n(xs[len(xs) // 2:])
-        x = tl.join(x0, x1).permute(0, 2, 1).reshape([x0.shape[0], x0.shape[1] * 2])
-        return x
-
-
-@triton.jit
 def _mask_scalar(qk, col_limit_right, s, i):
     col_lim_right_s = col_limit_right - s
     col_lim_right_cur = max(col_lim_right_s, 0)
@@ -264,7 +245,7 @@ def _softmax_inner_loop(
         # for last fragment, always use SFU, for first 3 fragments, elements 0 to 11 use SFU,
         # elements 12 to 15 use emulation, elements 16 to 27 use SFU, elements 28 to 31 use emulation
         # the loop is unrolled twice likely for vectorization
-        qks = _split_n(qk, NUM_MMA_SLICES)
+        qks = _split_n_2D(qk, NUM_MMA_SLICES)
         ps = ()
         for slice_id in tl.static_range(0, NUM_MMA_SLICES):
             # prepare p for the v dot
@@ -274,7 +255,7 @@ def _softmax_inner_loop(
             tlx.barrier_arrive(tlx.local_view(p_fulls, p_bufIdx))
             ps = ps + (p_i, )
 
-        p = _join_n(ps)
+        p = _join_n_2D(ps)
         l_ij = tl.sum(p, 1)
         l_i = l_i * alpha + l_ij
         m_i = m_ij
