@@ -626,20 +626,31 @@ def test_tmem_load_store(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
-def test_tmem_scale_subslice_compile():
+@pytest.mark.parametrize("SCALE_OFFSET", [0, 8])
+def test_tmem_scale_subslice_compile(SCALE_OFFSET):
+    SCALE_BLOCK_N = 16
+    SCALE_SLICE_N = 8
 
     @triton.jit
-    def tmem_scale_subslice_compile_kernel():
+    def tmem_scale_subslice_compile_kernel(SCALE_OFFSET: tl.constexpr):
         scale_smem = tlx.local_alloc((1, 1, 2, 2, 256), tl.uint8, tl.constexpr(1))
-        scale_tmem = tlx.local_alloc((128, 8), tl.uint8, tl.constexpr(1), tlx.storage_kind.tmem)
-        scale_slice = tlx.subslice(scale_tmem[0], 0, 8)
+        scale_tmem = tlx.local_alloc((128, SCALE_BLOCK_N), tl.uint8, tl.constexpr(1), tlx.storage_kind.tmem)
+        scale_slice = tlx.subslice(scale_tmem[0], SCALE_OFFSET, SCALE_SLICE_N)
         tlx.tmem_copy(scale_smem[0], scale_slice)
 
-    kernel = tmem_scale_subslice_compile_kernel.warmup(grid=(1, ))
+    kernel = tmem_scale_subslice_compile_kernel.warmup(SCALE_OFFSET, grid=(1, ))
     ttgir = kernel.asm["ttgir"]
+    subslice_ops = [line.strip() for line in ttgir.splitlines() if "ttng.tmem_subslice" in line]
+    copy_ops = [line.strip() for line in ttgir.splitlines() if "ttng.tmem_copy" in line]
+
     assert "tensor_memory_scales_encoding" in ttgir
-    assert ttgir.count("ttng.tmem_subslice") == 1
-    assert ttgir.count("ttng.tmem_copy") == 1
+    assert len(subslice_ops) == 1
+    assert len(copy_ops) == 1
+    assert f"N = {SCALE_OFFSET} : i32" in subslice_ops[0]
+    assert f"!ttg.memdesc<128x{SCALE_BLOCK_N}xi8" in subslice_ops[0]
+    assert f"!ttg.memdesc<128x{SCALE_SLICE_N}xi8" in subslice_ops[0]
+    assert f"!ttg.memdesc<128x{SCALE_SLICE_N}xi8" in copy_ops[0]
+    assert "tcgen05.cp" in kernel.asm["ptx"]
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")

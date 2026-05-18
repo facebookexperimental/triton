@@ -27,6 +27,7 @@ except ImportError:
 from triton.language.extra.libdevice import fast_dividef
 
 # @manual=//triton:triton
+from triton.language.extra.cuda.inline_ptx_lib import tanh_approx_fp32
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 
@@ -158,21 +159,6 @@ def _compute_offsets(H, BLOCK_M: tl.constexpr, seq_offsets_q, seq_offsets):
     seq_len_q = (seq_end_q - seq_start_q).to(tl.int32)
 
     return start_m, off_h, seq_start_kv, seq_len_kv, seq_start_q, seq_len_q
-
-
-@triton.jit
-def tanh_approx_fp32(x):
-    output = tl.inline_asm_elementwise(
-        asm="""
-        tanh.approx.f32 $0, $1;
-        """,
-        constraints="=r,r",
-        args=[x],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-    return output
 
 
 @triton.jit
