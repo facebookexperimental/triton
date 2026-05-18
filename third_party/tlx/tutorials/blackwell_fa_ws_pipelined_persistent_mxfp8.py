@@ -2852,7 +2852,11 @@ def generate_tensor_with_block_distributions(
     -----------
     reference_tensor : torch.Tensor
         The reference tensor whose shape, dtype, device, and properties to copy.
+    min_max_ranges : list[tuple[float, float]]
         List of [min, max] value ranges. Each block will be assigned a range
+    block_size : int
+        The size of each block (default: 32 for MXFP8).
+    num_pregenerated_blocks : int
         Number of random blocks to pre-generate for each range (default: 100).
 
     Returns:
