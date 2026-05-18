@@ -1407,7 +1407,9 @@ def _softmax_recompute_quantization_iter(
     ds_fulls,
     ds_empties,
     m_fulls,
+    m_empties,
     d_fulls,
+    d_empties,
     NUM_BUFFERS_TMEM: tl.constexpr,
     NUM_BUFFERS_DS: tl.constexpr,
     M_STAGE: tl.constexpr,
@@ -1534,6 +1536,8 @@ def _softmax_recompute_quantization_iter(
         )
         if subtile_id == DS_NUM_SUBS - 1:
             tlx.barrier_arrive(ds_fulls[ds_buf_id])
+    tlx.barrier_arrive(m_empties[m_buf_id])
+    tlx.barrier_arrive(d_empties[d_buf_id])
 
 
 @triton.autotune(
@@ -1971,7 +1975,9 @@ def _attn_bwd_mxf8_ws(
     p_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     k_dq_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     m_fulls = tlx.alloc_barriers(num_barriers=M_STAGE)
+    m_empties = tlx.alloc_barriers(num_barriers=M_STAGE)
     d_fulls = tlx.alloc_barriers(num_barriers=D_STAGE)
+    d_empties = tlx.alloc_barriers(num_barriers=D_STAGE)
 
     # ===== Warp-specialized async tasks =====
     with tlx.async_tasks():
@@ -2015,7 +2021,9 @@ def _attn_bwd_mxf8_ws(
                     ds_fulls,
                     ds_empties,
                     m_fulls,
+                    m_empties,
                     d_fulls,
+                    d_empties,
                     NUM_BUFFERS_TMEM,
                     NUM_BUFFERS_DS,
                     M_STAGE,
@@ -2056,7 +2064,9 @@ def _attn_bwd_mxf8_ws(
                         ds_fulls,
                         ds_empties,
                         m_fulls,
+                        m_empties,
                         d_fulls,
+                        d_empties,
                         NUM_BUFFERS_TMEM,
                         NUM_BUFFERS_DS,
                         M_STAGE,
@@ -2526,7 +2536,8 @@ def _attn_bwd_mxf8_ws(
                     [sf_off_seq_h, q_scale_m, 0, 0, 0],
                     q_fulls[q_buf_id],
                 )
-                m_buf_id, _ = _get_bufidx_phase(blk_idx, M_STAGE)
+                m_buf_id, m_phase = _get_bufidx_phase(blk_idx, M_STAGE)
+                tlx.barrier_wait(m_empties[m_buf_id], m_phase ^ 1)
                 tlx.barrier_expect_bytes(m_fulls[m_buf_id], 4 * BLOCK_M1)
                 tlx.async_descriptor_load(
                     desc_m,
@@ -2568,7 +2579,8 @@ def _attn_bwd_mxf8_ws(
                     [sf_off_seq_h, do_scale_m, 0, 0, 0],
                     do_fulls[do_buf_id],
                 )
-                d_buf_id, _ = _get_bufidx_phase(blk_idx, D_STAGE)
+                d_buf_id, d_phase = _get_bufidx_phase(blk_idx, D_STAGE)
+                tlx.barrier_wait(d_empties[d_buf_id], d_phase ^ 1)
                 tlx.barrier_expect_bytes(d_fulls[d_buf_id], 4 * BLOCK_M1)
                 tlx.async_descriptor_load(
                     desc_delta,
@@ -2637,7 +2649,8 @@ def _attn_bwd_mxf8_ws(
                         [sf_off_seq_h, q_scale_m, 0, 0, 0],
                         q_fulls[q_buf_id],
                     )
-                    m_buf_id, _ = _get_bufidx_phase(blk_idx, M_STAGE)
+                    m_buf_id, m_phase = _get_bufidx_phase(blk_idx, M_STAGE)
+                    tlx.barrier_wait(m_empties[m_buf_id], m_phase ^ 1)
                     tlx.barrier_expect_bytes(m_fulls[m_buf_id], 4 * BLOCK_M1)
                     tlx.async_descriptor_load(
                         desc_m,
@@ -2682,7 +2695,8 @@ def _attn_bwd_mxf8_ws(
                         [sf_off_seq_h, do_scale_m, 0, 0, 0],
                         do_fulls[do_buf_id],
                     )
-                    d_buf_id, _ = _get_bufidx_phase(blk_idx, D_STAGE)
+                    d_buf_id, d_phase = _get_bufidx_phase(blk_idx, D_STAGE)
+                    tlx.barrier_wait(d_empties[d_buf_id], d_phase ^ 1)
                     tlx.barrier_expect_bytes(d_fulls[d_buf_id], 4 * BLOCK_M1)
                     tlx.async_descriptor_load(
                         desc_delta,
