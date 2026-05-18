@@ -9,7 +9,7 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2
+from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, tanh_approx_fp32
 from triton.tools.tensor_descriptor import TensorDescriptor
 import triton.profiler.language as pl
 import triton.profiler as proton
@@ -202,42 +202,6 @@ def _add_f32x2(a, b):
         is_pure=True,
         pack=2,
     )
-
-
-@triton.jit
-def _fma_f32x2(a, b, c):
-    return tl.inline_asm_elementwise(
-        """
-        {
-            .reg .b64 ra, rb, rc, rd;
-            mov.b64 ra, { $2, $3 };
-            mov.b64 rb, { $4, $5 };
-            mov.b64 rc, { $6, $7 };
-            fma.rn.f32x2 rd, ra, rb, rc;
-            mov.b64 { $0, $1 }, rd;
-        }
-        """,
-        "=r,=r,r,r,r,r,r,r",
-        [a, b, c],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=2,
-    )
-
-
-@triton.jit
-def tanh_approx_fp32(x):
-    output = tl.inline_asm_elementwise(
-        asm="""
-            tanh.approx.f32 $0, $1;
-            """,
-        constraints="=r,r",
-        args=[x],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-    return output
 
 
 # typical configuration is 3/fast_gelu

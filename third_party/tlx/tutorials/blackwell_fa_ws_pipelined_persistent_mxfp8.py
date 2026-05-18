@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2
+from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _sub_f32x2
 from triton.tools.tensor_descriptor import TensorDescriptor
 from triton.language.extra.tlx.mxfp8_utils import (
     _cvt_e4m3x4_f32,
@@ -77,47 +77,6 @@ def _get_bufidx_phase(accum_cnt, NUM_BUFFERS_KV):
 @triton.jit
 def _reduce_or(x, y):
     return x | y
-
-
-@triton.jit
-def _sub_f32x2(a, b):
-    return tl.inline_asm_elementwise(
-        """
-        {
-            .reg .b64 ra, rb, rc;
-            mov.b64 ra, { $2, $3 };
-            mov.b64 rb, { $4, $5 };
-            sub.f32x2 rc, ra, rb;
-            mov.b64 { $0, $1 }, rc;
-        }
-        """,
-        "=r,=r,r,r,r,r",
-        [a, b],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=2,
-    )
-
-
-@triton.jit
-def _fma_f32x2(a, b, c):
-    return tl.inline_asm_elementwise(
-        """
-        {
-            .reg .b64 ra, rb, rc, rd;
-            mov.b64 ra, { $2, $3 };
-            mov.b64 rb, { $4, $5 };
-            mov.b64 rc, { $6, $7 };
-            fma.rn.f32x2 rd, ra, rb, rc;
-            mov.b64 { $0, $1 }, rd;
-        }
-        """,
-        "=r,=r,r,r,r,r,r,r",
-        [a, b, c],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=2,
-    )
 
 
 @triton.jit
@@ -2354,15 +2313,18 @@ def _attn_bwd_mxf8_ws(
                     # MMA 2: Handled by ds_fulls barrier in MMA 5
                     # MMA 3: Handled by p_empties in MMA 1
                     tlx.barrier_wait(q_dk_fulls[q_buf_id_prev], q_phase_prev)
+                    # Copy from SMEM to TMEM
+                    # TODO: Blocked on TLX feature
+                    # tlx.tmem_copy(ds_tiles_smem[ds_buf_id_prev], ds_tiles_tmem[0])
                     tlx.barrier_wait(dq_empties[0], tmem_phase_prev)
                     # Fence for ds_scale_smem to be visible.
                     tlx.fence("async_shared")
                     # Copy from SMEM to TMEM
-                    tlx.tmem_copy(ds_tiles_smem[ds_buf_id_prev], ds_tiles_tmem[0])
                     tlx.tmem_copy(ds_scale_smem[0], ds_scale_dk_tmem[0])
                     tlx.tmem_copy(q_dk_scale_smem[q_buf_id_prev], q_scale_dk_tmem[0])
                     tlx.async_dot_scaled(
-                        ds_tiles_tmem[0],
+                        # TODO: ds_tiles_tmem[0],
+                        ds_tiles_smem[ds_buf_id_prev],
                         q_dk_smem[q_buf_id_prev],
                         dk_tiles[0],
                         ds_scale_dk_tmem[0],
@@ -2441,11 +2403,13 @@ def _attn_bwd_mxf8_ws(
                 # Copy from SMEM to TMEM
                 # Fence for ds_scale_smem to be visiible.
                 tlx.fence("async_shared")
-                tlx.tmem_copy(ds_tiles_smem[ds_buf_id], ds_tiles_tmem[0])
+                # TODO: Blocked on TLX feature
+                # tlx.tmem_copy(ds_tiles_smem[ds_buf_id], ds_tiles_tmem[0])
                 tlx.tmem_copy(q_dk_scale_smem[q_buf_id], q_scale_dk_tmem[0])
                 tlx.tmem_copy(ds_scale_smem[0], ds_scale_dk_tmem[0])
                 tlx.async_dot_scaled(
-                    ds_tiles_tmem[0],
+                    # TODO: ds_tiles_tmem[0],
+                    ds_tiles_smem[ds_buf_id],
                     q_dk_smem[q_buf_id],
                     dk_tiles[0],
                     ds_scale_dk_tmem[0],
@@ -3000,7 +2964,11 @@ def generate_tensor_with_block_distributions(
     -----------
     reference_tensor : torch.Tensor
         The reference tensor whose shape, dtype, device, and properties to copy.
+    min_max_ranges : list[tuple[float, float]]
         List of [min, max] value ranges. Each block will be assigned a range
+    block_size : int
+        The size of each block (default: 32 for MXFP8).
+    num_pregenerated_blocks : int
         Number of random blocks to pre-generate for each range (default: 100).
 
     Returns:

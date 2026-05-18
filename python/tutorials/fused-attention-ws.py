@@ -3,7 +3,7 @@ import torch
 
 import triton
 import triton.language as tl
-from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2
+from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _reduce_fadd2
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -252,47 +252,6 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
         return desc_or_ptr
     else:
         return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
-
-
-@triton.jit
-def _fma_f32x2(a, b, c):
-    return tl.inline_asm_elementwise(
-        """
-        {
-            .reg .b64 ra, rb, rc, rd;
-            mov.b64 ra, { $2, $3 };
-            mov.b64 rb, { $4, $5 };
-            mov.b64 rc, { $6, $7 };
-            fma.rn.f32x2 rd, ra, rb, rc;
-            mov.b64 { $0, $1 }, rd;
-        }
-        """,
-        "=r,=r,r,r,r,r,r,r",
-        [a, b, c],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=2,
-    )
-
-
-@triton.jit
-def _reduce_fadd2(p0a, p1a, p0b, p1b):
-    return tl.inline_asm_elementwise(
-        """
-        {
-            .reg .b64 rc, ra, rb;
-            mov.b64 ra, { $2, $4 };
-            mov.b64 rb, { $3, $5 };
-            add.f32x2 rc, ra, rb;
-            mov.b64 { $0, $1 }, rc;
-        }
-        """,
-        "=r,=r,r,r,r,r",
-        [p0a, p0b, p1a, p1b],
-        dtype=[tl.float32, tl.float32],
-        is_pure=True,
-        pack=1,
-    )
 
 
 @triton.jit
