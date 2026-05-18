@@ -1441,6 +1441,7 @@ def _softmax_recompute_quantization_iter(
     qkT = tlx.local_load(tlx.local_view(qk_tiles, 0))
     tlx.barrier_arrive(qk_empties[0])
     qkT_slices = _split_n(qkT, DS_NUM_SUBS)
+    pT_slices = ()
     for subtile_id in tl.static_range(DS_NUM_SUBS):
         m = tlx.local_load(tlx.local_slice(
             sM_tiles[m_buf_id],
@@ -1452,6 +1453,7 @@ def _softmax_recompute_quantization_iter(
         # Clamp to prevent FP32 overflow downstream in P*dP
         qkT_scaled = tl.minimum(qkT_scaled, 20.0)
         pT = tl.math.exp2(qkT_scaled)
+        pT_slices += (pT, )
 
         # Block amax for P via monotonicity of exp2
         qkT_reshaped = tl.reshape(qkT_scaled, [BLOCK_N1, BWD_NUM_BLOCKS, VEC_SIZE])
@@ -1477,6 +1479,8 @@ def _softmax_recompute_quantization_iter(
         )
         if subtile_id == DS_NUM_SUBS - 1:
             tlx.barrier_arrive(p_fulls[0])
+
+    for subtile_id in tl.static_range(DS_NUM_SUBS):
         # Finish dS for the previous M-block.
         Di = tlx.local_load(tlx.local_slice(
             sD_tiles[d_buf_id],
@@ -1489,7 +1493,7 @@ def _softmax_recompute_quantization_iter(
         if subtile_id == DS_NUM_SUBS - 1:
             tlx.barrier_arrive(dp_empties[0])
 
-        dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
+        dsT = _mul_f32x2(pT_slices[subtile_id], _sub_f32x2(dpT, Di[None, :]))
         # NaN sanitization (boundary tiles)
         dsT = tl.where(dsT == dsT, dsT, 0.0)
         # Quantize dS twice: dK consumes dS^T, while dQ consumes dS
