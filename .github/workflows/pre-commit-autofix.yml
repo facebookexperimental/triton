@@ -1,0 +1,117 @@
+name: Pre-Commit Autofix
+
+on:
+  pull_request:
+    branches-ignore: ['llvm-**']
+
+# GITHUB_TOKEN — no third-party apps, no PATs, no external credentials.
+# Commits pushed with GITHUB_TOKEN do NOT re-trigger workflows (GitHub's
+# built-in loop prevention), so no infinite CI loops.
+permissions:
+  contents: write
+
+jobs:
+  autofix:
+    name: pre-commit autofix
+    # Skip fork PRs — GITHUB_TOKEN can't push to external forks.
+    # Skip bot commits from this workflow (belt-and-suspenders loop guard).
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !contains(github.event.pull_request.title, '[pre-commit autofix]')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Compute pre-commit cache key
+        id: cache-key
+        run: |
+          echo "pre_commit_hash=$(sha256sum .pre-commit-config.yaml | cut -d ' ' -f 1)" >> $GITHUB_OUTPUT
+
+      - name: Cache pre-commit environments
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: ${{ runner.os }}-precommit-${{ steps.cache-key.outputs.pre_commit_hash }}
+
+      - name: Install pre-commit
+        run: python3 -m pip install --upgrade pre-commit
+
+      - name: Get changed files
+        id: changed
+        run: |
+          git diff --name-only --diff-filter=ACMR \
+            origin/${{ github.base_ref }}...HEAD > /tmp/changed_files.txt
+
+          FILE_COUNT=$(wc -l < /tmp/changed_files.txt | tr -d ' ')
+          echo "count=$FILE_COUNT" >> $GITHUB_OUTPUT
+
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "has_files=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_files=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run auto-fixable hooks on changed files
+        if: steps.changed.outputs.has_files == 'true'
+        run: |
+          # Only hooks that modify files in-place. Check-only hooks (mypy,
+          # check-ast, detect-private-key) are left to the main pre-commit
+          # workflow — they report errors but can't auto-fix.
+          FIXABLE_HOOKS=(
+            ruff
+            yapf
+            clang-format
+            trailing-whitespace
+            end-of-file-fixer
+          )
+
+          for hook in "${FIXABLE_HOOKS[@]}"; do
+            echo "::group::Running $hook"
+            python3 -m pre_commit run "$hook" \
+              --files $(cat /tmp/changed_files.txt | tr '\n' ' ') \
+              || true
+            echo "::endgroup::"
+          done
+
+      - name: Check for fixes
+        id: diff
+        run: |
+          if git diff --quiet; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No formatting issues found." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            CHANGED=$(git diff --name-only | wc -l | tr -d ' ')
+            echo "fixed_count=$CHANGED" >> $GITHUB_OUTPUT
+            echo "### Auto-fixed $CHANGED file(s)" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            git diff --stat >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Commit and push fixes
+        if: steps.diff.outputs.has_changes == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "[pre-commit autofix] Fix formatting in ${{ steps.diff.outputs.fixed_count }} file(s)
+
+          Automated fixes applied by pre-commit hooks: ruff, yapf, clang-format,
+          trailing-whitespace, end-of-file-fixer.
+
+          Please pull these changes into your local branch."
+
+          # Push may fail if the PR author pushed while this was running.
+          # That's fine — the next PR event will re-trigger this workflow.
+          git push || echo "::warning::Push failed (likely a concurrent update). Fixes will be retried on next push."
