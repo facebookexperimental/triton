@@ -6,7 +6,13 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2
 from triton.tools.tensor_descriptor import TensorDescriptor
-from triton.language.extra.tlx.mxfp8_utils import _to_mxfp8_block, _to_mxfp8_block_with_block_amax
+from triton.language.extra.tlx.mxfp8_utils import (
+    _cvt_e4m3x4_f32,
+    _cvt_e5m2x4_f32,
+    _fused_amax_to_e8m0,
+    _to_mxfp8_block,
+    _to_mxfp8_block_with_block_amax,
+)
 from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -121,6 +127,43 @@ def _split_n(x, SPLIT_FACTOR: tl.constexpr):
     else:
         x0, x1 = x.reshape([x.shape[0], 2, x.shape[1] // 2]).permute(0, 2, 1).split()
         return _split_n(x0, SPLIT_FACTOR // 2) + _split_n(x1, SPLIT_FACTOR // 2)
+
+
+@triton.jit
+def _to_mxfp8_block_transposed_from_nt(
+    data_nt,
+    VEC_SIZE: tl.constexpr,
+    dtype: tl.constexpr,
+):
+    BLOCK_N: tl.constexpr = data_nt.shape[0]
+    BLOCK_M: tl.constexpr = data_nt.shape[1]
+    NUM_N_BLOCKS: tl.constexpr = BLOCK_N // VEC_SIZE
+
+    tl.static_assert(VEC_SIZE == 32)
+    tl.static_assert(BLOCK_N % VEC_SIZE == 0)
+
+    if dtype == tl.float8e4nv:
+        FLOAT_MAX: tl.constexpr = 448.0
+    else:
+        tl.static_assert(dtype == tl.float8e5)
+        FLOAT_MAX: tl.constexpr = 57344.0
+
+    data_grouped = tl.reshape(data_nt, [NUM_N_BLOCKS, VEC_SIZE, BLOCK_M])
+    max_abs_nm = tl.max(tl.abs(data_grouped), axis=1)
+    scale_u32_nm, quant_scale_nm = _fused_amax_to_e8m0(max_abs_nm, 1.0 / FLOAT_MAX)
+    scale_e8m0_nm = scale_u32_nm.to(tl.uint8)
+
+    quant_scale = tl.reshape(quant_scale_nm, [NUM_N_BLOCKS, 1, BLOCK_M])
+    scaled = _mul_f32x2(data_grouped, quant_scale)
+
+    if dtype == tl.float8e4nv:
+        fp8_nvm = _cvt_e4m3x4_f32(scaled)
+    else:
+        fp8_nvm = _cvt_e5m2x4_f32(scaled)
+
+    fp8_mn = fp8_nvm.permute(2, 0, 1).reshape([BLOCK_M, BLOCK_N])
+    scale_mn = tl.trans(scale_e8m0_nm)
+    return fp8_mn, scale_mn
 
 
 @triton.jit
