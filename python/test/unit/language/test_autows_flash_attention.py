@@ -11,7 +11,7 @@ import torch
 import triton
 import triton.language as tl
 from triton._internal_testing import is_blackwell
-from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2
+from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _reduce_fadd2
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 # =============================================================================
@@ -34,47 +34,6 @@ def _apply_causal_mask(qk, col_limit_right, BLOCK_N: tl.constexpr):
     s = offs_n & ~0xF
     i = offs_n & 0xF
     return tl.map_elementwise(_mask_scalar, qk, col_limit_right, s, i)
-
-
-@triton.jit
-def _fma_f32x2(a, b, c):
-    return tl.inline_asm_elementwise(
-        """
-        {
-            .reg .b64 ra, rb, rc, rd;
-            mov.b64 ra, { $2, $3 };
-            mov.b64 rb, { $4, $5 };
-            mov.b64 rc, { $6, $7 };
-            fma.rn.f32x2 rd, ra, rb, rc;
-            mov.b64 { $0, $1 }, rd;
-        }
-        """,
-        "=r,=r,r,r,r,r,r,r",
-        [a, b, c],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=2,
-    )
-
-
-@triton.jit
-def _reduce_fadd2(p0a, p1a, p0b, p1b):
-    return tl.inline_asm_elementwise(
-        """
-        {
-            .reg .b64 rc, ra, rb;
-            mov.b64 ra, { $2, $4 };
-            mov.b64 rb, { $3, $5 };
-            add.f32x2 rc, ra, rb;
-            mov.b64 { $0, $1 }, rc;
-        }
-        """,
-        "=r,=r,r,r,r,r",
-        [p0a, p0b, p1a, p1b],
-        dtype=[tl.float32, tl.float32],
-        is_pure=True,
-        pack=1,
-    )
 
 
 @triton.jit
