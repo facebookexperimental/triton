@@ -2320,7 +2320,7 @@ def _attn_bwd_mxf8_ws(
                     # Fence for ds_scale_smem to be visible.
                     tlx.fence("async_shared")
                     # Copy from SMEM to TMEM
-                    tlx.tmem_copy(ds_scale_smem[0], ds_scale_dk_tmem[0])
+                    # tlx.tmem_copy(ds_scale_smem[0], ds_scale_dk_tmem[0])
                     tlx.tmem_copy(q_dk_scale_smem[q_buf_id_prev], q_scale_dk_tmem[0])
                     tlx.async_dot_scaled(
                         # TODO: ds_tiles_tmem[0],
