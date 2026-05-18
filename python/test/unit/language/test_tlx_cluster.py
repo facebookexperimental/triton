@@ -637,11 +637,12 @@ def test_cluster_launch_control_multi_cta_delayed_exit(device):
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer for cluster sync")
 def test_explicit_cluster_sync_ws(device):
-    """Test that explicit cluster_barrier() in WS mode sets the
-    tlx.explicit_cluster_sync module attribute and suppresses heuristic
-    cluster sync insertion.  The kernel uses two CTAs in a cluster with
-    warp specialization: the default task does a remote barrier arrive
-    to signal CTA 1, and a partition task waits on the barrier.
+    """Test explicit cluster_barrier() behavior in WS mode.
+
+    The kernel uses two CTAs in a cluster with warp specialization: the
+    default task does a remote barrier arrive to signal CTA 1, and a
+    partition task waits on the barrier. PTX may still contain additional
+    compiler-inserted cluster sync from maybeInsertClusterSync.
     """
 
     @triton.jit
@@ -655,7 +656,7 @@ def test_explicit_cluster_sync_ws(device):
         tlx.fence_mbarrier_init_cluster()
         cta_rank = tlx.cluster_cta_rank()
 
-        # Explicit cluster sync placed by user – compiler must not auto-insert
+        # User places explicit cluster sync via cluster_barrier().
         with tlx.async_tasks():
             with tlx.async_task("default"):
                 # This has to be inside default task, because at WS entry there'd be task syncs
