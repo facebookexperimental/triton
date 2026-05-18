@@ -276,13 +276,13 @@ static Attribute computeSharedEncFromDotEnc(ttg::DotOperandEncodingAttr dotEnc,
   if (useAsyncCopy) {
     auto loadMemDesc = localLoadOp->getOperand(0);
     if (auto type = dyn_cast<ttg::MemDescType>(loadMemDesc.getType())) {
-      auto archStr = getAMDArch(localLoadOp->getParentOfType<ModuleOp>());
-      auto targetInfo = tt::AMD::TargetInfo(archStr.value_or("").str());
-      using tt::AMD::ISAFamily;
+      amdgpu::TargetFeatures targetFeatures(
+          getAMDArch(localLoadOp->getParentOfType<ModuleOp>()));
+      using amdgpu::ISAFamily;
       if (llvm::is_contained({ISAFamily::CDNA4, ISAFamily::GFX1250},
-                             targetInfo.getISAFamily())) {
+                             targetFeatures.getISAFamily())) {
         if (auto padded = composePaddedLayout(
-                targetInfo, dotEnc.getOpIdx(), dotEnc.getKWidth(),
+                targetFeatures, dotEnc.getOpIdx(), dotEnc.getKWidth(),
                 cast<ttg::TensorOrMemDesc>(type), paddedOrder, dotEnc,
                 /*useAsyncCopy=*/true)) {
           LDBG("Deduced async-copy padded shared encoding from dot layout: "
