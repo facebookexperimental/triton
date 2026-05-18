@@ -1429,7 +1429,6 @@ def _softmax_recompute_quantization_iter(
     m_buf_id, m_phase = _get_bufidx_phase(blk_idx, M_STAGE)
     d_buf_id, d_phase = _get_bufidx_phase(blk_idx, D_STAGE)
     tlx.barrier_wait(m_fulls[m_buf_id], m_phase)
-    tlx.barrier_wait(d_fulls[d_buf_id], d_phase)
     # Read QK from TMEM, apply sm_scale -> P
     tlx.barrier_wait(qk_fulls[0], tmem_phase)
     # qk_tiles, dp_tiles, dq_tiles all share the same physical
@@ -1477,9 +1476,9 @@ def _softmax_recompute_quantization_iter(
             ),
             p_scale_packed,
         )
-        if subtile_id == DS_NUM_SUBS - 1:
-            tlx.barrier_arrive(p_fulls[0])
 
+    tlx.barrier_arrive(p_fulls[0])
+    tlx.barrier_wait(d_fulls[d_buf_id], d_phase)
     for subtile_id in tl.static_range(DS_NUM_SUBS):
         # Finish dS for the previous M-block.
         Di = tlx.local_load(tlx.local_slice(
