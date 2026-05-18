@@ -103,3 +103,6 @@ python/triton/tlx
 !.claude/reviewers/
 !.claude/rules/
 !.claude/skills/
+
+# plugins
+python/triton/plugins/

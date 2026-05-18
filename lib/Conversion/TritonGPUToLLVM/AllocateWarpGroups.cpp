@@ -162,7 +162,7 @@ struct AllocateWarpGroups
 
     struct WarpGroupInfo {
       SmallVector<Region *> partitions;
-      int maxRequestedRegs = 0;
+      int maxRequestedRegs = -1;
       unsigned numWarps = 0;
     };
     struct WarpGroupPartition {
@@ -192,47 +192,93 @@ struct AllocateWarpGroups
 
       // Iterate over the partitions and assign them to warp groups. Determine
       // the maximum number of requested registers per warp group.
+      // A requested value of -1 is a sentinel meaning "give me an even share
+      // of leftover registers." When computing the per-warp-group max, -1
+      // values are skipped; a warp group is sentinel only if all its
+      // partitions are -1 (maxRequestedRegs stays at the initial -1).
       SmallVector<WarpGroupInfo> warpGroups;
       for (auto [startId, partition, estRegs, numWarps] : orderedPartitions) {
         if (startId % 4 == 0) {
           warpGroups.push_back(WarpGroupInfo{});
         }
         warpGroups.back().partitions.push_back(partition);
-        // Round up the nearest multiple of 8.
-        int estRegsCeil8 = llvm::divideCeil(estRegs, 8) * 8;
-        warpGroups.back().maxRequestedRegs =
-            std::max<int>(warpGroups.back().maxRequestedRegs, estRegsCeil8);
+        if (estRegs > 0) {
+          int estRegsCeil8 = llvm::divideCeil(estRegs, 8) * 8;
+          warpGroups.back().maxRequestedRegs =
+              std::max<int>(warpGroups.back().maxRequestedRegs, estRegsCeil8);
+        }
         warpGroups.back().numWarps += numWarps;
       }
 
-      // Compute the register deficit over the partition warp groups.
-      int registerBudget = maxnreg * baseNumWarps * threadsPerWarp;
-      for (const WarpGroupInfo &wg : warpGroups) {
-        assert(wg.numWarps % 4 == 0);
-        registerBudget +=
-            (maxnreg - wg.maxRequestedRegs) * wg.numWarps * threadsPerWarp;
-      }
-      if (registerBudget <= 0)
-        return;
+      // Check if any warp groups have the sentinel value (-1).
+      bool hasSentinelGroups =
+          llvm::any_of(warpGroups, [](const WarpGroupInfo &wg) {
+            return wg.maxRequestedRegs < 0;
+          });
 
-      // Determine the number of extra registers that we can distribute to the
-      // default warp group.
-      int leftover = registerBudget / (baseNumWarps * threadsPerWarp);
-      // Round down to the nearest multiple of 8.
-      leftover = leftover / 8 * 8;
-      if (leftover < 24)
-        return; // too few registers
-
-      // Generate setmaxnreg in each partition according to its warp group.
       SmallVector<int32_t> maxnregsPerPartition(1 + arr.size());
-      for (const WarpGroupInfo &wg : warpGroups) {
-        for (Region *region : wg.partitions) {
-          maxnregsPerPartition[1 + region->getRegionNumber()] =
-              wg.maxRequestedRegs;
+
+      if (!hasSentinelGroups) {
+        // All partitions have fixed register requests. Give leftover to
+        // the default partition (original behavior).
+        int registerBudget = maxnreg * baseNumWarps * threadsPerWarp;
+        for (const WarpGroupInfo &wg : warpGroups) {
+          assert(wg.numWarps % 4 == 0);
+          registerBudget +=
+              (maxnreg - wg.maxRequestedRegs) * wg.numWarps * threadsPerWarp;
         }
+        if (registerBudget <= 0)
+          return;
+
+        int leftover = registerBudget / (baseNumWarps * threadsPerWarp);
+        leftover = leftover / 8 * 8;
+        if (leftover < 24)
+          return;
+
+        for (const WarpGroupInfo &wg : warpGroups) {
+          for (Region *region : wg.partitions)
+            maxnregsPerPartition[1 + region->getRegionNumber()] =
+                wg.maxRequestedRegs;
+        }
+        maxnregsPerPartition.front() = leftover;
+      } else {
+        // Some warp groups are sentinel (-1). Fixed groups get their
+        // requested amount; sentinel groups and the default partition
+        // evenly split the remaining registers.
+        int totalWarps = baseNumWarps;
+        for (const WarpGroupInfo &wg : warpGroups)
+          totalWarps += wg.numWarps;
+        int totalRegs = maxnreg * totalWarps * threadsPerWarp;
+
+        int fixedRegs = 0;
+        for (const WarpGroupInfo &wg : warpGroups) {
+          if (wg.maxRequestedRegs > 0)
+            fixedRegs += wg.maxRequestedRegs * wg.numWarps * threadsPerWarp;
+        }
+        int remainingRegs = totalRegs - fixedRegs;
+        if (remainingRegs <= 0)
+          return;
+
+        int leftoverThreads = baseNumWarps * threadsPerWarp;
+        for (const WarpGroupInfo &wg : warpGroups) {
+          if (wg.maxRequestedRegs < 0)
+            leftoverThreads += wg.numWarps * threadsPerWarp;
+        }
+
+        int leftoverRegsPerThread = remainingRegs / leftoverThreads;
+        leftoverRegsPerThread = leftoverRegsPerThread / 8 * 8;
+        if (leftoverRegsPerThread < 24)
+          return;
+
+        for (const WarpGroupInfo &wg : warpGroups) {
+          int regs = wg.maxRequestedRegs > 0 ? wg.maxRequestedRegs
+                                             : leftoverRegsPerThread;
+          for (Region *region : wg.partitions)
+            maxnregsPerPartition[1 + region->getRegionNumber()] = regs;
+        }
+        maxnregsPerPartition.front() = leftoverRegsPerThread;
       }
-      // Set the register usage for the default warp group.
-      maxnregsPerPartition.front() = leftover;
+
       op.setActualRegisters(maxnregsPerPartition);
 
       // Set the initial max number of registers. This is needed for PTXAS to
