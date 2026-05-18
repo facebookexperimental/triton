@@ -1478,6 +1478,7 @@ def _softmax_recompute_quantization_iter(
         )
 
     tlx.barrier_arrive(p_fulls[0])
+    tlx.barrier_arrive(m_empties[m_buf_id])
     tlx.barrier_wait(d_fulls[d_buf_id], d_phase)
     for subtile_id in tl.static_range(DS_NUM_SUBS):
         # Finish dS for the previous M-block.
@@ -1537,9 +1538,7 @@ def _softmax_recompute_quantization_iter(
             ),
             ds_scale_dq_packed,
         )
-        if subtile_id == DS_NUM_SUBS - 1:
-            tlx.barrier_arrive(ds_fulls[ds_buf_id])
-    tlx.barrier_arrive(m_empties[m_buf_id])
+    tlx.barrier_arrive(ds_fulls[ds_buf_id])
     tlx.barrier_arrive(d_empties[d_buf_id])
 
 
