@@ -91,25 +91,6 @@ LayoutEncoding LayoutEncoding::meet(const LayoutEncoding &lhs,
   return LayoutEncoding::getUnknownLayout();
 }
 
-static bool isValidPermutation(ArrayRef<int32_t> order, unsigned rank) {
-  if (order.size() != rank)
-    return false;
-
-  SmallVector<char> seen(rank, 0);
-  for (int32_t dim : order) {
-    if (dim < 0 || static_cast<unsigned>(dim) >= rank || seen[dim])
-      return false;
-    seen[dim] = 1;
-  }
-  return true;
-}
-
-static bool
-isEffectivelyUnswizzledShared(ttg::SwizzledSharedEncodingAttr encoding) {
-  return encoding.getVec() == 1 && encoding.getPerPhase() == 1 &&
-         encoding.getMaxPhase() == 1;
-}
-
 //===----------------------------------------------------------------------===//
 // LayoutBackwardPropagation
 //===----------------------------------------------------------------------===//
@@ -184,41 +165,8 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
             mmaEncoding.getCGALayout(),
             memDescTransOp.getSrc().getType().getElementType(),
             mmaEncoding.getFp4Padded());
-      } else if (auto swizzledEncoding =
-                     dyn_cast<ttg::SwizzledSharedEncodingAttr>(resultEnc)) {
-        auto srcType =
-            cast<ttg::MemDescType>(memDescTransOp.getSrc().getType());
-        unsigned rank = srcType.getRank();
-        auto transOrder = memDescTransOp.getOrder();
-        if (!isValidPermutation(transOrder, rank) ||
-            swizzledEncoding.getOrder().size() != rank) {
-          memDescTransOp.emitOpError(
-              "swizzled_shared backward propagation through memdesc_trans "
-              "requires a valid transpose permutation");
-          return failure();
-        }
-        if (!isEffectivelyUnswizzledShared(swizzledEncoding)) {
-          memDescTransOp.emitOpError(
-              "swizzled_shared backward propagation through memdesc_trans "
-              "only supports effectively unswizzled encodings");
-          return failure();
-        }
-
-        // For effectively unswizzled shared layouts, inverting the transpose
-        // only needs to update the iteration order.
-        SmallVector<unsigned> invOrder(rank);
-        for (unsigned i = 0; i < rank; ++i)
-          invOrder[transOrder[i]] = i;
-        auto encOrder = swizzledEncoding.getOrder();
-        SmallVector<unsigned> permutedOrder(rank);
-        for (unsigned i = 0; i < rank; ++i)
-          permutedOrder[i] = invOrder[encOrder[i]];
-        srcEncoding = ttg::SwizzledSharedEncodingAttr::get(
-            swizzledEncoding.getContext(), swizzledEncoding.getVec(),
-            swizzledEncoding.getPerPhase(), swizzledEncoding.getMaxPhase(),
-            permutedOrder, swizzledEncoding.getCGALayout());
       } else {
-        // Other shared encodings (e.g. PaddedSharedEncodingAttr for TDM tiles)
+        // Other shared encodings (e.g. SwizzledShared, PaddedShared)
         // fall back on the dialect's transpose inference to push a result-side
         // requirement back to the source memdesc via the inverse permutation.
         auto resultType = cast<ttg::MemDescType>(memDescTransOp.getType());
