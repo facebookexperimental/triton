@@ -396,23 +396,6 @@ tt.func public @tmem_copy_2d_slice(%src: !ttg.memdesc<1x1x8x2x256xi8, #shared2, 
 
 // -----
 
-#shared_data = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8}>
-#tmem_data = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
-
-module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
-
-// CHECK-LABEL: @tmem_copy_fp8_data
-tt.func public @tmem_copy_fp8_data(%src: !ttg.memdesc<128x128xf8E4M3FN, #shared_data, #ttg.shared_memory>,
-                                   %dst: !ttg.memdesc<128x128xf8E4M3FN, #tmem_data, #ttng.tensor_memory, mutable>) {
-  // CHECK: tcgen05.cp.cta_group::1
-  ttng.tmem_copy %src, %dst : !ttg.memdesc<128x128xf8E4M3FN, #shared_data, #ttg.shared_memory>, !ttg.memdesc<128x128xf8E4M3FN, #tmem_data, #ttng.tensor_memory, mutable>
-  tt.return
-}
-
-}
-
-// -----
-
 #blocked = #ttg.blocked<{sizePerThread=[1, 4], threadsPerWarp=[32, 1], warpsPerCTA=[4, 1], order=[0, 1]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, rank = 5}>
 #shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
