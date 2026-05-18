@@ -120,7 +120,7 @@ def create_benchmark(mode="fwd"):
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=["N_CTX"],
-            x_vals=[1024, 2048, 4096, 8192],
+            x_vals=[8192],
             line_arg="provider",
             line_vals=["ws_pipelined_persistent_mxfp8"],
             line_names=["ws_pipelined_persistent_mxfp8"],
