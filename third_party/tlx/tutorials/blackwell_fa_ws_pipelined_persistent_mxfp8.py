@@ -351,7 +351,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     # TMEM scale buffers for explicit SMEM->TMEM transfer (2D shape for tcgen05 scales layout)
     Q_SCALE_TMEM_COLS: tl.constexpr = Q_SCALE_BYTES // BLOCK_M_SPLIT
     K_SCALE_TMEM_COLS: tl.constexpr = K_SCALE_BYTES // BLOCK_N
-    V_SCALE_TMEM_COLS: tl.constexpr = V_SCALE_BYTES // HEAD_DIM
+    V_SCALE_TMEM_ROWS: tl.constexpr = REP_HEAD * 128
+    V_SCALE_TMEM_COLS: tl.constexpr = V_SCALE_BYTES // V_SCALE_TMEM_ROWS
     if SHARE_SCALE_BUFFERS:
         # We don't have enough TMEM space to hold the scale transfer. We need to have a creative
         # reuse strategy that so QK[0] can share space with Q_SCALES
@@ -402,7 +403,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
             reuse=qk_storage_alias,
         )
         v_scale_tmem = tlx.local_alloc(
-            (HEAD_DIM, V_SCALE_TMEM_COLS),
+            (V_SCALE_TMEM_ROWS, V_SCALE_TMEM_COLS),
             tl.uint8,
             NUM_KV_SCALE_TMEM_BUFFERS,
             tlx.storage_kind.tmem,
@@ -476,7 +477,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                                        tlx.storage_kind.tmem)
         k_scale_tmem = tlx.local_alloc((BLOCK_N, K_SCALE_TMEM_COLS), tl.uint8, NUM_KV_SCALE_TMEM_BUFFERS,
                                        tlx.storage_kind.tmem)
-        v_scale_tmem = tlx.local_alloc((HEAD_DIM, V_SCALE_TMEM_COLS), tl.uint8, NUM_KV_SCALE_TMEM_BUFFERS,
+        v_scale_tmem = tlx.local_alloc((V_SCALE_TMEM_ROWS, V_SCALE_TMEM_COLS), tl.uint8, NUM_KV_SCALE_TMEM_BUFFERS,
                                        tlx.storage_kind.tmem)
         p_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), tlx.dtype_of(desc_v), NUM_MMA_GROUPS, tlx.storage_kind.tmem)
         p_scale_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N // VEC_SIZE), tl.uint8, NUM_MMA_GROUPS,
