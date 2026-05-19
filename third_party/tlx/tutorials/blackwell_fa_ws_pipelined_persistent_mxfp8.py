@@ -4,7 +4,9 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from triton.language.extra.subtile_ops import _split_n_2D
 from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _sub_f32x2
+from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 from triton.language.extra.tlx.mxfp8_utils import _to_mxfp8_block, _to_mxfp8_block_with_block_amax
 from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode
@@ -62,24 +64,8 @@ def prune_configs_by_hdim_mxfp8(configs, named_args, **kwargs):
 
 
 @triton.jit
-def _get_bufidx_phase(accum_cnt, NUM_BUFFERS_KV):
-    bufIdx = accum_cnt % NUM_BUFFERS_KV
-    phase = (accum_cnt // NUM_BUFFERS_KV) & 1
-    return bufIdx, phase
-
-
-@triton.jit
 def _reduce_or(x, y):
     return x | y
-
-
-@triton.jit
-def _split_n(x, SPLIT_FACTOR: tl.constexpr):
-    if SPLIT_FACTOR == 1:
-        return (x, )
-    else:
-        x0, x1 = x.reshape([x.shape[0], 2, x.shape[1] // 2]).permute(0, 2, 1).split()
-        return _split_n(x0, SPLIT_FACTOR // 2) + _split_n(x1, SPLIT_FACTOR // 2)
 
 
 @triton.jit
@@ -200,7 +186,7 @@ def _softmax_inner_loop(
     lo, hi = _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE)
 
     for start_n in tl.range(lo, hi, BLOCK_N):
-        _, qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
+        _, qk_phase = get_bufidx_phase(accum_cnt_qk, 1)
         # Hoisted from its original position (between alpha compute and alpha
         # store) to here. SYNCS.PHASECHK.TRYWAIT acts as a ptxas scheduling
         # fence — in the original position it splits the softmax compute+store
@@ -538,7 +524,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     GROUP_SIZE_N,
                 )
                 for _ in tl.range(lo, hi, BLOCK_N):
-                    _, phase = _get_bufidx_phase(accum_cnt, 1)
+                    _, phase = get_bufidx_phase(accum_cnt, 1)
                     for cid in tl.static_range(0, NUM_MMA_GROUPS):
                         # -- update output accumulator --
                         tlx.barrier_wait(alpha_fulls[cid], phase)
@@ -561,7 +547,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         tlx.barrier_arrive(acc_fulls[cid])
                     accum_cnt += 1
 
-                _, phase = _get_bufidx_phase(i, 1)
+                _, phase = get_bufidx_phase(i, 1)
                 for cid in tl.static_range(0, NUM_MMA_GROUPS):
                     # epilogue — critical path first (produce o_tiles),
                     # then non-critical M (LSE) store to GMEM
@@ -589,7 +575,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tile_idx += num_progs
 
         # softmax groups
-        with tlx.async_task(num_warps=4, registers=168, replicate=NUM_MMA_GROUPS):
+        with tlx.async_task(num_warps=4, registers=176, replicate=NUM_MMA_GROUPS):
             accum_cnt_qk = 0
             for i in range(0, tiles_per_sm):
                 # initialize offsets
@@ -675,7 +661,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     )
 
                 # prepare l_i for the epilog
-                _, phase = _get_bufidx_phase(i, 1)
+                _, phase = get_bufidx_phase(i, 1)
                 if not SHARE_SCALE_BUFFERS:
                     # Wait for L to be empty if it has its own buffer.
                     tlx.barrier_wait(l_empties[cid], phase ^ 1)
@@ -702,8 +688,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     GROUP_SIZE_N,
                 )
 
-                q_bufIdx, q_phase = _get_bufidx_phase(j, NUM_BUFFERS_Q)
-                _, l_phase = _get_bufidx_phase(j, 1)
+                q_bufIdx, q_phase = get_bufidx_phase(j, NUM_BUFFERS_Q)
+                _, l_phase = get_bufidx_phase(j, 1)
                 if SHARE_SCALE_BUFFERS:
                     # With 2 buffers we always swap index 1/0
                     q0_tmem = 1
@@ -711,10 +697,10 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 else:
                     q0_tmem = (j % NUM_Q_SCALE_TMEM_BUFFERS) * 2
                     q1_tmem = q0_tmem + 1
-                k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
-                v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
+                k_bufIdx, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
+                v_bufIdx, v_phase = get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
 
-                _, qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
+                _, qk_phase = get_bufidx_phase(accum_cnt_qk, 1)
                 NAMED_BAR_QK_EMPTY: tl.constexpr = 9
                 NUM_THREADS_QK_EMPTY: tl.constexpr = 160
                 if SHARE_SCALE_BUFFERS:
@@ -811,8 +797,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
 
                     accum_cnt_qk += 1
                     accum_cnt_kv += 2
-                    k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
-                    v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
+                    k_bufIdx, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
+                    v_bufIdx, v_phase = get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
                     if SHARE_SCALE_BUFFERS:
                         # Indices based on which value of QK must be live/dead.
                         k0_tmem = 1
@@ -832,7 +818,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     # wait for the K buffer to be populated by the producer
                     tlx.barrier_wait(kv_fulls[k_bufIdx], k_phase)
                     k_tile = tlx.local_trans(kv_tiles[k_bufIdx])
-                    _, qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
+                    _, qk_phase = get_bufidx_phase(accum_cnt_qk, 1)
                     if SHARE_SCALE_BUFFERS:
                         tlx.named_barrier_wait(NAMED_BAR_QK_EMPTY + 1, NUM_THREADS_QK_EMPTY)
                         tlx.tmem_copy(q_scale_tiles[0], q_scale_tmem[q0_tmem])
@@ -957,10 +943,10 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 # we issue the first Q0*K and Q1*K of the next tile, hiding the
                 # load latency behind PV compute.
                 if (UNROLL_KV and STAGE == 1) and j < tiles_per_sm - 1:
-                    t_q_bufIdx, t_q_phase = _get_bufidx_phase(j + 1, NUM_BUFFERS_Q)
-                    _, t_l_phase = _get_bufidx_phase(j + 1, 1)
-                    t_k_bufIdx, t_k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
-                    _, t_qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
+                    t_q_bufIdx, t_q_phase = get_bufidx_phase(j + 1, NUM_BUFFERS_Q)
+                    _, t_l_phase = get_bufidx_phase(j + 1, 1)
+                    t_k_bufIdx, t_k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
+                    _, t_qk_phase = get_bufidx_phase(accum_cnt_qk, 1)
                     if SHARE_SCALE_BUFFERS:
                         t_q0_tmem = 1
                         t_q1_tmem = 0
@@ -1052,7 +1038,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 kv_scale_n_offset = (lo // BLOCK_N) * REP_N
 
                 # load q0 + scale
-                q_bufIdx, q_phase = _get_bufidx_phase(i, NUM_BUFFERS_Q)
+                q_bufIdx, q_phase = get_bufidx_phase(i, NUM_BUFFERS_Q)
                 tlx.barrier_wait(q_empties[q_bufIdx], q_phase ^ 1)
                 tlx.barrier_expect_bytes(q_fulls[q_bufIdx],
                                          (Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM) + Q_SCALE_BYTES)
@@ -1068,7 +1054,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 )
 
                 # loop over loading k, v
-                k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
+                k_bufIdx, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
                 # wait for the K buffer to be released by the consumer
                 k_empty = tlx.local_view(kv_empties, k_bufIdx)
                 tlx.barrier_wait(k_empty, k_phase ^ 1)
@@ -1101,7 +1087,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     q_fulls[q_bufIdx],
                 )
 
-                v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
+                v_bufIdx, v_phase = get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
                 # wait for the V buffer to be released by the consumer
                 v_empty = tlx.local_view(kv_empties, v_bufIdx)
                 tlx.barrier_wait(v_empty, v_phase ^ 1)
@@ -1124,7 +1110,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 accum_cnt_kv += 2
 
                 for _ in tl.range(lo + BLOCK_N, hi, BLOCK_N):
-                    k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
+                    k_bufIdx, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
                     # wait for the K buffer to be released by the consumer
                     k_empty = tlx.local_view(kv_empties, k_bufIdx)
                     tlx.barrier_wait(k_empty, k_phase ^ 1)
@@ -1143,7 +1129,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         k_full,
                     )
 
-                    v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
+                    v_bufIdx, v_phase = get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
                     # wait for the V buffer to be released by the consumer
                     v_empty = tlx.local_view(kv_empties, v_bufIdx)
                     tlx.barrier_wait(v_empty, v_phase ^ 1)
@@ -1182,7 +1168,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     STAGE,
                     GROUP_SIZE_N,
                 )
-                _, phase = _get_bufidx_phase(i, 1)
+                _, phase = get_bufidx_phase(i, 1)
                 for cid in tl.static_range(0, NUM_MMA_GROUPS):
                     tlx.barrier_wait(o_fulls[cid], phase)
                     tlx.fence("async_shared")
@@ -1339,8 +1325,8 @@ def _softmax_recompute_quantization_iter(
 ):
     DS_M_SUB: tl.constexpr = BLOCK_M1 // DS_NUM_SUBS
     BWD_NUM_BLOCKS: tl.constexpr = DS_M_SUB // VEC_SIZE
-    _, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
-    ds_buf_id, ds_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
+    _, tmem_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
+    ds_buf_id, ds_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
     # Read QK from TMEM, apply sm_scale -> P
     tlx.barrier_wait(qk_fulls[0], tmem_phase)
     # qk_tiles, dp_tiles, dq_tiles all share the same physical
@@ -1351,7 +1337,7 @@ def _softmax_recompute_quantization_iter(
     # qk while this load is still in flight.
     qkT = tlx.local_load(tlx.local_view(qk_tiles, 0))
     tlx.barrier_arrive(qk_empties[0])
-    qkT_slices = _split_n(qkT, DS_NUM_SUBS)
+    qkT_slices = _split_n_2D(qkT, DS_NUM_SUBS)
     offs_m = curr_m + tl.arange(0, BLOCK_M1)
     m = tl.load(M_off + offs_m)
     Di = tl.load(D_off + offs_m)
@@ -1884,7 +1870,7 @@ def _attn_bwd_mxf8_ws(
         with tlx.async_task("default"):
             blk_idx = 0
             for _i in range(tiles_per_sm):
-                _, persistent_tmem_phase = _get_bufidx_phase(_i, NUM_BUFFERS_TMEM)
+                _, persistent_tmem_phase = get_bufidx_phase(_i, NUM_BUFFERS_TMEM)
                 off_seq_h = tile_idx // n_tile_num
                 off_z = off_seq_h // H
                 off_h = off_seq_h % H
@@ -1972,7 +1958,7 @@ def _attn_bwd_mxf8_ws(
                     blk_idx += 1
 
                 # Epilogue: dK / dV TMA store
-                kv_buf_id, kv_phase = _get_bufidx_phase(_i, NUM_BUFFERS_KV)
+                kv_buf_id, kv_phase = get_bufidx_phase(_i, NUM_BUFFERS_KV)
 
                 tlx.barrier_wait(dv_fulls[0], persistent_tmem_phase)
                 slice_size: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
@@ -2034,7 +2020,7 @@ def _attn_bwd_mxf8_ws(
 
                 curr_m = 0
                 for _ in range(num_steps):
-                    _, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
+                    _, tmem_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
                     tlx.barrier_wait(dq_fulls[0], tmem_phase)
                     for slice_id in tl.static_range(DQ_REDUCE_ITERS):
                         dq_smem_idx = slice_id % DQ_REDUCE_STAGES
@@ -2072,13 +2058,13 @@ def _attn_bwd_mxf8_ws(
         with tlx.async_task(num_warps=1, registers=88):
             blk_idx = 0
             for _i in range(tiles_per_sm):
-                kv_buf_id, kv_phase = _get_bufidx_phase(_i, NUM_BUFFERS_KV)
+                kv_buf_id, kv_phase = get_bufidx_phase(_i, NUM_BUFFERS_KV)
                 # --- Prolog: first M-block ---
-                q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
-                do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
-                _, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
-                _, tmem_phase_prev = _get_bufidx_phase(blk_idx - 1, NUM_BUFFERS_TMEM)
-                _, persistent_tmem_phase = _get_bufidx_phase(_i, NUM_BUFFERS_TMEM)
+                q_buf_id, q_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
+                do_buf_id, do_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
+                _, tmem_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
+                _, tmem_phase_prev = get_bufidx_phase(blk_idx - 1, NUM_BUFFERS_TMEM)
+                _, persistent_tmem_phase = get_bufidx_phase(_i, NUM_BUFFERS_TMEM)
 
                 # MMA 1: qkT = K @ Q^T
                 tlx.barrier_wait(q_fulls[q_buf_id], q_phase)
@@ -2162,12 +2148,12 @@ def _attn_bwd_mxf8_ws(
 
                 # --- Main loop: iters 1 .. num_steps-1 ---
                 for j in range(1, num_steps):
-                    q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
-                    _, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
+                    q_buf_id, q_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
+                    _, tmem_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
                     prev_blk_idx = blk_idx - 1
-                    q_buf_id_prev, q_phase_prev = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_Q)
-                    _, tmem_phase_prev = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_TMEM)
-                    ds_buf_id_prev, ds_phase_prev = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_DS)
+                    q_buf_id_prev, q_phase_prev = get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_Q)
+                    _, tmem_phase_prev = get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_TMEM)
+                    ds_buf_id_prev, ds_phase_prev = get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_DS)
 
                     # MMA 1: qkT = K @ Q^T (current)
                     tlx.barrier_wait(q_fulls[q_buf_id], q_phase)
@@ -2266,7 +2252,7 @@ def _attn_bwd_mxf8_ws(
                         ],
                     )
 
-                    do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
+                    do_buf_id, do_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
 
                     # MMA 2: dpT = V @ dO^T (current)
                     # REUSE_GROUP_3 SYNCHRONIZATION:
@@ -2318,9 +2304,9 @@ def _attn_bwd_mxf8_ws(
 
                 # --- Epilog: last dK / dQ ---
                 prev_blk_idx = blk_idx - 1
-                q_buf_id, q_phase = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_Q)
-                _, tmem_phase = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_TMEM)
-                ds_buf_id, ds_phase = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_DS)
+                q_buf_id, q_phase = get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_Q)
+                _, tmem_phase = get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_TMEM)
+                ds_buf_id, ds_phase = get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_DS)
 
                 # MMA 4: dK += dS^T @ Q (last)
                 # REUSE_GROUP_3 SYNCHRONIZATION:
@@ -2396,11 +2382,11 @@ def _attn_bwd_mxf8_ws(
                 # Load K data + scale and first Q + scale
                 # Share 1 barrier.
                 curr_m = 0
-                q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
+                q_buf_id, q_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
                 q_scale_m = (curr_m // 128) * REP_M
                 # Share this barrier to signify K empty
                 tlx.barrier_wait(q_empties[q_buf_id], q_phase ^ 1)
-                kv_buf_id, kv_phase = _get_bufidx_phase(_i, NUM_BUFFERS_KV)
+                kv_buf_id, kv_phase = get_bufidx_phase(_i, NUM_BUFFERS_KV)
                 tlx.barrier_expect_bytes(
                     q_fulls[kv_buf_id],
                     (K_BYTES * BLOCK_N1 * HEAD_DIM) + SCALE_BYTES + (Q_BYTES * BLOCK_M1 * HEAD_DIM) + SCALE_BYTES,
@@ -2449,7 +2435,7 @@ def _attn_bwd_mxf8_ws(
                     [sf_off_seq_h, kv_scale_n.to(tl.int32), 0, 0, 0],
                     do_fulls[kv_buf_id],
                 )
-                do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
+                do_buf_id, do_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
                 do_scale_m = (curr_m // 128) * REP_M
                 tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
                 tlx.async_descriptor_load(
@@ -2505,9 +2491,9 @@ def _attn_bwd_mxf8_ws(
                 for _j in range(1, num_steps):
                     prev_blk_idx = blk_idx - 1
                     prev_m = curr_m - BLOCK_M1
-                    prev_q_buf_id, prev_q_phase = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_Q)
-                    q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
-                    do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
+                    prev_q_buf_id, prev_q_phase = get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_Q)
+                    q_buf_id, q_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
+                    do_buf_id, do_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
                     q_scale_m = (curr_m // 128) * REP_M
                     do_scale_m = (curr_m // 128) * REP_M
 
@@ -2583,7 +2569,7 @@ def _attn_bwd_mxf8_ws(
                     blk_idx += 1
                 last_blk_idx = blk_idx - 1
                 last_m = curr_m - BLOCK_M1
-                last_q_buf_id, last_q_phase = _get_bufidx_phase(last_blk_idx, NUM_BUFFERS_Q)
+                last_q_buf_id, last_q_phase = get_bufidx_phase(last_blk_idx, NUM_BUFFERS_Q)
                 tlx.barrier_wait(q_dk_empties[last_q_buf_id], last_q_phase ^ 1)
                 tlx.barrier_expect_bytes(
                     q_dk_fulls[last_q_buf_id],

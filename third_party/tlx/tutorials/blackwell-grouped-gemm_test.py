@@ -33,6 +33,7 @@ import pytest
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton._internal_testing import is_blackwell
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -325,13 +326,6 @@ def grouped_matmul_tma_kernel(
         last_problem_end = last_problem_end + num_tiles
 
 
-@triton.jit
-def _get_bufidx_phase(accum_cnt, NUM_BUFFERS_KV):
-    bufIdx = accum_cnt % NUM_BUFFERS_KV
-    phase = (accum_cnt // NUM_BUFFERS_KV) & 1
-    return bufIdx, phase
-
-
 tlx_configs = [
     triton.Config(
         {
@@ -437,7 +431,7 @@ def grouped_matmul_tlx_kernel(
                         tile_m_idx = tile_idx_in_gemm % num_m_tiles
                         tile_n_idx = tile_idx_in_gemm // num_m_tiles
 
-                        tmem_buf, tmem_phase = _get_bufidx_phase(accum_cnt_tmem, NUM_TMEM_BUFFERS)
+                        tmem_buf, tmem_phase = get_bufidx_phase(accum_cnt_tmem, NUM_TMEM_BUFFERS)
                         tlx.barrier_wait(tmem_full_bars[tmem_buf], tmem_phase)
 
                         # load the result from TMEM to registers
@@ -487,13 +481,13 @@ def grouped_matmul_tlx_kernel(
                         k = gk
 
                         # do regular gemm here
-                        tmem_buf, tmem_phase = _get_bufidx_phase(accum_cnt_tmem, NUM_TMEM_BUFFERS)
+                        tmem_buf, tmem_phase = get_bufidx_phase(accum_cnt_tmem, NUM_TMEM_BUFFERS)
 
                         # wait epilogue consumer to be done with the buffer before reusing it
                         tlx.barrier_wait(tmem_empty_bars[tmem_buf], tmem_phase ^ 1)
 
                         for kk in range(0, tl.cdiv(k, BLOCK_SIZE_K)):
-                            smem_buf, smem_phase = _get_bufidx_phase(accum_cnt_smem, NUM_SMEM_BUFFERS)
+                            smem_buf, smem_phase = get_bufidx_phase(accum_cnt_smem, NUM_SMEM_BUFFERS)
                             # wait for current phase(round) of load for this buf
                             tlx.barrier_wait(smem_full_bars[smem_buf], smem_phase)
                             # buffer is now ready with loaded data, tlx.async_dot will signal `mBarrier` when done
@@ -554,7 +548,7 @@ def grouped_matmul_tlx_kernel(
                     a_ptr = tl.load(group_a_ptrs + g).to(tl.pointer_type(dtype))
                     b_ptr = tl.load(group_b_ptrs + g).to(tl.pointer_type(dtype))
 
-                    desc_buf, _ = _get_bufidx_phase(accum_cnt_outer, NUM_SMEM_BUFFERS + 1)
+                    desc_buf, _ = get_bufidx_phase(accum_cnt_outer, NUM_SMEM_BUFFERS + 1)
 
                     # Create tensor descriptors in global scratch (for pipelining across problems)
                     tlx.make_tensor_descriptor(
@@ -600,7 +594,7 @@ def grouped_matmul_tlx_kernel(
                             offs_bn = tile_n_idx * BLOCK_SIZE_N
 
                         for kk in range(0, num_k_tiles):
-                            buf, phase = _get_bufidx_phase(accum_cnt, NUM_SMEM_BUFFERS)
+                            buf, phase = get_bufidx_phase(accum_cnt, NUM_SMEM_BUFFERS)
                             tlx.barrier_wait(smem_empty_bars[buf], phase ^ 1)
                             # todo: we can alternatively check offs_am < gm and omit loading A for the virtual tile
                             tlx.barrier_expect_bytes(
