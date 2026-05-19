@@ -25,6 +25,7 @@ def _mxf8_host_descriptor_pre_hook(nargs):
     nargs["desc_v"].block_shape = [BLOCK_N, HEAD_DIM]
     nargs["desc_k"].block_shape = [BLOCK_N, HEAD_DIM]
     nargs["desc_o"].block_shape = [BLOCK_M_SPLIT, HEAD_DIM]
+    nargs["desc_m"].block_shape = [BLOCK_M_SPLIT]
     VEC_SIZE = 32
     REP_M = math.ceil(BLOCK_M_SPLIT / 128)
     REP_N = math.ceil(math.ceil(BLOCK_N / VEC_SIZE) / 4)
@@ -256,7 +257,7 @@ def _softmax_inner_loop(
     prune_configs_by={"early_config_prune": prune_configs_by_hdim_mxfp8},
 )
 @triton.jit
-def _attn_fwd_mxf8_ws(sm_scale, M,  #
+def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
                       Z, H, desc_q, desc_k, desc_v, desc_o, desc_q_scale, desc_k_scale, desc_v_scale, N_CTX,  #
                       HEAD_DIM: tl.constexpr,  #
                       BLOCK_M: tl.constexpr,  #
@@ -329,6 +330,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     q_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_q), NUM_MMA_GROUPS * NUM_BUFFERS_Q)
     kv_tiles = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
     o_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_o), NUM_MMA_GROUPS)
+    m_out_tiles = tlx.local_alloc((BLOCK_M_SPLIT, ), tl.float32, NUM_MMA_GROUPS)
 
     q_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_Q)
     q_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_Q)
@@ -558,11 +560,13 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     if RESCALE_OPT:
                         m = m * sm_scale * 1.44269504
                     m += tl.math.log2(l)
-                    offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
-                    m_ptrs = M + off_hz * N_CTX + offs_m
-                    tl.store(m_ptrs, tl.reshape(m, [BLOCK_M_SPLIT]))
+                    m_offset = off_hz * N_CTX + start_m * BLOCK_M + cid * BLOCK_M_SPLIT
+                    tlx.async_descriptor_store_wait(0)
+                    tlx.local_store(m_out_tiles[cid], tl.reshape(m, [BLOCK_M_SPLIT]))
+                    tlx.async_descriptor_store(desc_m, m_out_tiles[cid], [m_offset.to(tl.int32)])
 
                 tile_idx += num_progs
+            tlx.async_descriptor_store_wait(0)
 
         # softmax groups
         with tlx.async_task(num_warps=4, registers=176, replicate=NUM_MMA_GROUPS):
@@ -2726,6 +2730,12 @@ class _attention(torch.autograd.Function):
             strides=[HEAD_DIM_K, 1],
             block_shape=dummy_block,
         )
+        desc_m = TensorDescriptor(
+            m_tensor,
+            shape=[y_dim],
+            strides=[1],
+            block_shape=[1],
+        )
         assert k_scale is not None and v_scale is not None and q_scale is not None, (
             "All scales must be provided for MXFP8")
         dummy_block_shape = [1, 1, 1, 1, 1]
@@ -2753,7 +2763,7 @@ class _attention(torch.autograd.Function):
         ctx.grid = grid
         _attn_fwd_mxf8_ws[grid](
             sm_scale,
-            m_tensor,  #
+            desc_m,  #
             q.shape[0],
             q.shape[1],  #
             desc_q,
@@ -2942,6 +2952,7 @@ def attention(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal, config=None)
     desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
     desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
     desc_o = TensorDescriptor(o, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+    desc_m = TensorDescriptor(m_tensor, shape=[y_dim], strides=[1], block_shape=[1])
 
     dummy_block_shape = [1, 1, 1, 1, 1]
     desc_q_scale = TensorDescriptor.from_tensor(q_scale, block_shape=dummy_block_shape)
@@ -2956,6 +2967,7 @@ def attention(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal, config=None)
         "desc_k": desc_k,
         "desc_v": desc_v,
         "desc_o": desc_o,
+        "desc_m": desc_m,
         "desc_q_scale": desc_q_scale,
         "desc_k_scale": desc_k_scale,
         "desc_v_scale": desc_v_scale,
@@ -2971,7 +2983,7 @@ def attention(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal, config=None)
     grid = (min(NUM_SMS, triton.cdiv(q.shape[2], config["BLOCK_M"]) * q.shape[0] * q.shape[1]), 1, 1)
     _attn_fwd_mxf8_ws.fn[grid](
         sm_scale,
-        m_tensor,
+        desc_m,
         q.shape[0],
         q.shape[1],
         desc_q,
