@@ -44,6 +44,7 @@ namespace mlir {
 static void injectChannelGraphOnTokenOps(triton::FuncOp &funcOp,
                                          ArrayRef<Channel *> channels) {
   auto graph = buildChannelGraph(channels);
+  auto regionInfo = buildWSBarrierOrderedRegionRanges(funcOp, graph);
   if (graph.empty())
     return;
   funcOp.walk([&](Operation *op) {
@@ -62,9 +63,21 @@ static void injectChannelGraphOnTokenOps(triton::FuncOp &funcOp,
     int srcTask = taskIds[0];
     int dstTask = wsAttr.dstTask.getInt();
     auto it = graph.find({srcTask, dstTask});
-    if (it != graph.end())
-      op->setAttr("constraints", injectChannelGraph(funcOp.getContext(),
-                                                    constraints, it->second));
+    if (it != graph.end()) {
+      auto regionIt = regionInfo.find(op);
+      std::optional<int> parentId;
+      std::optional<int> minRegionId;
+      std::optional<int> maxRegionId;
+      if (regionIt != regionInfo.end()) {
+        parentId = regionIt->second.parentId;
+        minRegionId = regionIt->second.minRegionId;
+        maxRegionId = regionIt->second.maxRegionId;
+      }
+      op->setAttr("constraints",
+                  injectChannelGraph(funcOp.getContext(), constraints,
+                                     it->second, parentId, minRegionId,
+                                     maxRegionId));
+    }
   });
 }
 
