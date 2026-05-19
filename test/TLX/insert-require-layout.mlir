@@ -44,6 +44,38 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 }
 
 // -----
+// Test 1b: async direct-to-LDS producer feeding local_load -> dot on CDNA4.
+// InsertRequireLayout should prefer AMD's async-copy padded shared layout
+// instead of the dot-derived swizzled fallback.
+
+#blocked_6 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#mma_6 = #ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 1], instrShape = [32, 32, 16], isTransposed = true}>
+#shared_6 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem_6 = #ttg.shared_memory
+// CHECK-DAG: #{{.*}} = #ttg.padded_shared<[512:+32] {{.*}}>
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: @async_copy_local_load_dot_uses_padded
+  tt.func public @async_copy_local_load_dot_uses_padded(
+      %ptrs: tensor<64x64x!tt.ptr<bf16>, #blocked_6>,
+      %lhs: tensor<256x64xbf16, #ttg.dot_op<{opIdx = 0, parent = #mma_6, kWidth = 4}>>,
+      %acc: tensor<256x64xf32, #mma_6>) -> tensor<256x64xf32, #mma_6> {
+    %c0_i32 = arith.constant 0 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<1x64x64xbf16, #shared_6, #smem_6, mutable>
+    // CHECK: %[[BUF:.*]] = ttg.memdesc_index
+    %buf = ttg.memdesc_index %alloc[%c0_i32] : !ttg.memdesc<1x64x64xbf16, #shared_6, #smem_6, mutable> -> !ttg.memdesc<64x64xbf16, #shared_6, #smem_6, mutable>
+    %tok = ttg.async_copy_global_to_local %ptrs, %buf {contiguity = 8 : i32} : tensor<64x64x!tt.ptr<bf16>, #blocked_6> -> <64x64xbf16, #shared_6, #smem_6, mutable>
+    // CHECK: %[[REQ:.*]] = tlx.require_layout %[[BUF]] {{.*}} -> !ttg.memdesc<64x64xbf16, #{{.*}}, #smem, mutable>
+    // CHECK-NEXT: %[[RHS_LOAD:.*]] = ttg.local_load %[[REQ]] : !ttg.memdesc<64x64xbf16, #{{.*}}, #smem, mutable> -> tensor<64x64xbf16, #{{.*}}>
+    %rhs = ttg.local_load %buf : !ttg.memdesc<64x64xbf16, #shared_6, #smem_6, mutable> -> tensor<64x64xbf16, #blocked_6>
+    // CHECK: %[[RHS_REQ:.*]] = tlx.require_layout %[[RHS_LOAD]] : tensor<64x64xbf16, #{{.*}}> -> tensor<64x64xbf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>>
+    %rhs_dot = ttg.convert_layout %rhs : tensor<64x64xbf16, #blocked_6> -> tensor<64x64xbf16, #ttg.dot_op<{opIdx = 1, parent = #mma_6, kWidth = 4}>>
+    // CHECK: tt.dot %{{.*}}, %[[RHS_REQ]], %{{.*}}
+    %dot = tt.dot %lhs, %rhs_dot, %acc : tensor<256x64xbf16, #ttg.dot_op<{opIdx = 0, parent = #mma_6, kWidth = 4}>> * tensor<64x64xbf16, #ttg.dot_op<{opIdx = 1, parent = #mma_6, kWidth = 4}>> -> tensor<256x64xf32, #mma_6>
+    tt.return %dot : tensor<256x64xf32, #mma_6>
+  }
+}
+
+// -----
 // Test 2: local_load feeds scf.for iter_args that eventually reach a dot.
 // InsertRequireLayout keeps the loop-carried values in their original type and
 // materializes tensor constraints at the dot use.
