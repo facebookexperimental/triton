@@ -110,8 +110,12 @@ public:
   void dump();
 
 private:
+  unsigned estimateAnchorConvertCost(Value value, Attribute encoding);
+
   // map from value to layout information.
   llvm::MapVector<Value, LayoutInfo> layouts;
+  // Values that are layout anchors (encoding fixed by hardware/op semantics).
+  DenseSet<Value> anchorValues;
   // map of the values rewrite based on their encoding.
   DenseMap<std::pair<Value, Attribute>, Value> rewriteMapping;
   SetVector<Operation *> opToDelete;
@@ -309,6 +313,7 @@ void LayoutPropagation::initAnchorLayout() {
       }
       // Facebook end
       layouts.insert({v, LayoutInfo(tensorType.getEncoding())});
+      anchorValues.insert(v);
     }
   };
 
@@ -513,6 +518,66 @@ static int64_t getLayoutScore(Attribute encoding) {
   return score;
 }
 
+// Walk backward from `value` through the layouts map to find anchor boundaries
+// where a convert would be needed if `encoding` is chosen. Returns the total
+// SMEM scratch cost in bytes. This accounts for shape differences (e.g., a
+// convert on a 1x256 tensor pre-broadcast is much cheaper than on 128x256).
+unsigned LayoutPropagation::estimateAnchorConvertCost(Value value,
+                                                      Attribute encoding) {
+  unsigned totalCost = 0;
+  DenseSet<Value> visited;
+  SmallVector<Value> worklist = {value};
+  auto encTrait = dyn_cast<LayoutEncodingTrait>(encoding);
+
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    if (!visited.insert(v).second)
+      continue;
+
+    // If this value is an anchor, check if it needs a convert.
+    if (anchorValues.contains(v)) {
+      auto srcTy = dyn_cast<RankedTensorType>(v.getType());
+      if (!srcTy)
+        continue;
+      Attribute srcEnc = srcTy.getEncoding();
+      if (srcEnc == encoding)
+        continue;
+      if (encTrait && srcTy.getRank() != encTrait.getRank())
+        continue;
+      auto dstTy = srcTy.cloneWithEncoding(encoding);
+      if (cvtNeedsSharedMemory(srcTy, dstTy)) {
+        unsigned elems = getNumScratchElemsSwizzledCvt(srcTy, dstTy);
+        totalCost += elems * getElementBitWidth(srcTy) / 8;
+      }
+      continue;
+    }
+
+    // Not an anchor — walk through its defining op's operands.
+    Operation *defOp = v.getDefiningOp();
+    if (!defOp)
+      continue;
+
+    // For scf.for results, also trace through the corresponding yield operand
+    // inside the loop body, since that's where the actual value comes from.
+    if (auto forOp = dyn_cast<scf::ForOp>(defOp)) {
+      unsigned idx = cast<OpResult>(v).getResultNumber();
+      auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+      Value yieldOperand = yield.getOperand(idx);
+      if (isa<RankedTensorType>(yieldOperand.getType()) &&
+          layouts.find(yieldOperand) != layouts.end())
+        worklist.push_back(yieldOperand);
+    }
+
+    for (Value operand : defOp->getOperands()) {
+      if (!isa<RankedTensorType>(operand.getType()))
+        continue;
+      if (layouts.find(operand) != layouts.end())
+        worklist.push_back(operand);
+    }
+  }
+  return totalCost;
+}
+
 void LayoutPropagation::resolveConflicts() {
   for (auto &it : layouts) {
     Operation *op = it.first.getDefiningOp();
@@ -545,6 +610,27 @@ void LayoutPropagation::resolveConflicts() {
             (!isLoadOrStore && isa<MmaEncodingTrait>(e))) {
           encoding = e;
           break;
+        }
+      }
+    }
+    // When layout scores are close (within 2x), use SMEM scratch cost at
+    // anchor boundaries as a tiebreaker. This walks backward through the
+    // dataflow to find where converts would actually be inserted (at anchors
+    // like tmem_load, local_load) and uses the anchor tensor shape for cost
+    // estimation. This naturally prefers converting smaller tensors (e.g.,
+    // a 1x256 bias before broadcast rather than a 128x256 accumulator).
+    {
+      unsigned chosenCost = estimateAnchorConvertCost(it.first, encoding);
+      for (Attribute e : info.encodings) {
+        if (e == encoding)
+          continue;
+        int64_t score = getLayoutScore(e);
+        if (score > 0 && bestScore <= 2 * score) {
+          unsigned cost = estimateAnchorConvertCost(it.first, e);
+          if (cost < chosenCost) {
+            encoding = e;
+            chosenCost = cost;
+          }
         }
       }
     }
