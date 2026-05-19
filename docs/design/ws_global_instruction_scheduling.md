@@ -3284,7 +3284,7 @@ with tlx.async_tasks():
     with tlx.async_task(num_warps=1, num_regs=24):
         while tile_id < num_tiles:
             for k in range(k_tiles):
-                buf, phase = _get_bufidx_phase(smem_cnt, NUM_SMEM_BUFFERS)
+                buf, phase = tlx.get_bufidx_phase(smem_cnt, NUM_SMEM_BUFFERS)
 
                 tlx.barrier_wait(A_full_bars[buf], phase)          # wait for A
                 tlx.barrier_wait(B_full_bars[buf], phase)          # wait for B
@@ -3306,7 +3306,7 @@ with tlx.async_tasks():
     with tlx.async_task(num_warps=1, num_regs=24):
         while tile_id < num_tiles:
             for k in range(k_tiles):
-                buf, phase = _get_bufidx_phase(smem_cnt, NUM_SMEM_BUFFERS)
+                buf, phase = tlx.get_bufidx_phase(smem_cnt, NUM_SMEM_BUFFERS)
 
                 # Load A
                 tlx.barrier_wait(A_empty_bars[buf], phase ^ 1)    # wait for MMA to consume
@@ -3335,7 +3335,7 @@ with tlx.async_tasks():
 | 3 warp groups | 3 nested `tlx.async_task()` blocks |
 | SMEM producer→consumer sync | `barrier_expect_bytes` + `async_descriptor_load` + `barrier_wait` pairs |
 | TMEM MMA→epilogue sync | `tmem_full_bar` / `tmem_empty_bar` pair |
-| Phase cycling | `_get_bufidx_phase()`: `bufIdx = cnt % depth`, `phase = (cnt // depth) & 1` |
+| Phase cycling | `tlx.get_bufidx_phase()`: `buf_idx = cnt % depth`, `phase = (cnt // depth) & 1` |
 | No explicit prologue loop | Producer runs ahead naturally — barrier back-pressure from `A_empty_bars` limits it to `NUM_SMEM_BUFFERS - 1` iterations ahead |
 
 ---
