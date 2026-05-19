@@ -28,6 +28,18 @@ def _scale_shared_layout(block_shape):
     return tlx.padded_shared_layout_encoding.with_identity_for([[256, 8]], block_shape, [1, 0])
 
 
+@triton.constexpr_function
+def _wmma_layout(num_warps, packed):
+    reg_bases = [[0, 1], [1, 0]]
+    tiles_per_warp = 2
+    if num_warps == 4:
+        warp_bases = [[0, tiles_per_warp], [tiles_per_warp, 0]]
+    else:
+        warp_bases = [[0, tiles_per_warp], [0, tiles_per_warp * 2], [tiles_per_warp, 0]]
+    instr_shape = [16, 16, 64] if packed else [16, 16, 128]
+    return tlx.amd_wmma_layout_encoding(3, True, warp_bases, reg_bases, instr_shape)
+
+
 def is_gfx1250_available():
     try:
         target = triton.runtime.driver.active.get_current_target()
@@ -187,6 +199,7 @@ def mxgemm_tdm_pipelined_kernel(
     GROUP_SIZE_M: tl.constexpr,
     TRANSPOSE_B: tl.constexpr,
     NUM_BUFFERS: tl.constexpr,
+    NUM_WARPS: tl.constexpr,
 ):
     DIV_FACTOR_A: tl.constexpr = 2 if DTYPE_A == "e2m1" else 1
     DIV_FACTOR_B: tl.constexpr = 2 if DTYPE_B == "e2m1" else 1
@@ -198,6 +211,7 @@ def mxgemm_tdm_pipelined_kernel(
     BLOCK_N_PRESHUFFLED: tl.constexpr = BLOCK_N // 128
     BLOCK_K_SCALE_PRESHUFFLED: tl.constexpr = BLOCK_K_SCALE * 128
     NUM_LOADS_IN_BATCH: tl.constexpr = 4
+    WMMA_LAYOUT: tl.constexpr = _wmma_layout(NUM_WARPS, False)
 
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -327,7 +341,7 @@ def mxgemm_tdm_pipelined_kernel(
             TRANSPOSE_B,
         )
         wmma_idx += 1
-        acc = tl.dot_scaled(a, scale_a, DTYPE_A, b, scale_b, DTYPE_B, acc)
+        acc = tlx.dot_scaled(a, scale_a, DTYPE_A, b, scale_b, DTYPE_B, acc, wmma_layout=WMMA_LAYOUT)
 
     tl.store(c_ptrs, acc, mask=c_mask)
 
@@ -385,6 +399,7 @@ def mxgemm_tdm_pipelined(
         GROUP_SIZE_M=8,
         TRANSPOSE_B=TRANSPOSE_B,
         NUM_BUFFERS=NUM_BUFFERS,
+        NUM_WARPS=4,
         num_warps=4,
         waves_per_eu=1,
     )
@@ -424,6 +439,7 @@ def test_mxgemm_tdm_pipelined_compiles_gfx1250():
             "GROUP_SIZE_M": 8,
             "TRANSPOSE_B": True,
             "NUM_BUFFERS": 2,
+            "NUM_WARPS": 4,
         },
     )
     compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32))

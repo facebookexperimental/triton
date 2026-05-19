@@ -14,8 +14,11 @@ pybind11::class_<TritonOpBuilder> *getBuilderClass();
 #include "tlx/dialect/include/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Tools/LayoutUtils.h"
+#include "triton/Tools/LinearLayout.h"
 #include "llvm/Support/Casting.h"
 
 namespace py = pybind11;
@@ -43,6 +46,17 @@ static ttg::CGAEncodingAttr makeCGALayout(mlir::MLIRContext *ctx,
   // For multi-CTA, construct LinearLayout
   // This is a simplified version - may need refinement
   return ttg::CGAEncodingAttr::get1CTALayout(ctx, rank);
+}
+
+static ttg::CGAEncodingAttr
+makeCGALayoutFromBases(mlir::MLIRContext *ctx,
+                       const std::vector<std::vector<int32_t>> &layout,
+                       unsigned rank) {
+  auto kBlock = StringAttr::get(ctx, "block");
+  tt::LinearLayout::BasesT bases;
+  bases[kBlock] = layout;
+  return ttg::CGAEncodingAttr::get(
+      ctx, tt::LinearLayout(std::move(bases), tt::standardOutDimNames(ctx, rank)));
 }
 
 void init_triton_tlx_ir(py::module &&m) {
@@ -285,15 +299,56 @@ void init_triton_tlx_ir(py::module &&m) {
                  context, versionMajor, versionMinor, warpsPerCTA, CTALayout,
                  instrShape));
            })
+      .def("make_amd_wmma_encoding_attr",
+           [](TritonOpBuilder &self, unsigned version, bool transposed,
+              std::vector<std::vector<int32_t>> &warpBases,
+              std::vector<std::vector<int32_t>> &regBases,
+              std::vector<std::vector<int32_t>> &cgaBases,
+              std::vector<unsigned> &instrShape, unsigned rank) -> Attribute {
+             auto context = self.getBuilder().getContext();
+             auto kReg = mlir::StringAttr::get(context, "register");
+             auto kWarp = mlir::StringAttr::get(context, "warp");
+             auto ctaLayout =
+                 tt::LinearLayout({{kReg, regBases}, {kWarp, warpBases}},
+                                  tt::standardOutDimNames(context, rank));
+             auto cgaLayout = makeCGALayoutFromBases(context, cgaBases, rank);
+             return mlir::cast<Attribute>(ttg::AMDWmmaEncodingAttr::get(
+                 context, version, ctaLayout, transposed, cgaLayout,
+                 instrShape));
+           })
+      .def("make_amd_wmma_scale_encoding_attr",
+           [](TritonOpBuilder &self, unsigned opIdx,
+              std::vector<int64_t> &shape, Attribute parentEnc,
+              unsigned scaleFactor) -> Attribute {
+             auto context = self.getBuilder().getContext();
+             auto wmmaEnc = cast<ttg::AMDWmmaEncodingAttr>(parentEnc);
+             auto instrShape = wmmaEnc.getInstrShape();
+             auto ll = ttg::chooseScaledWmmaScaleLayout(
+                 context, opIdx, shape, instrShape[0], instrShape[1],
+                 wmmaEnc.getIsTransposed(), scaleFactor, wmmaEnc.getCtaLayout(),
+                 wmmaEnc.getCGALayout());
+             return mlir::cast<Attribute>(
+                 ttg::LinearEncodingAttr::get(context, std::move(ll)));
+           })
+      .def("make_i32_array_attr",
+           [](TritonOpBuilder &self,
+              std::vector<int32_t> &values) -> Attribute {
+             return self.getBuilder().getDenseI32ArrayAttr(values);
+           })
       .def("make_dot_operand_encoding_attr",
            [](TritonOpBuilder &self, Value opnd, unsigned opIdx,
-              Attribute parentEnc) -> Attribute {
+              Attribute parentEnc, unsigned kWidth) -> Attribute {
              auto context = self.getBuilder().getContext();
+             if (kWidth)
+               return ttg::DotOperandEncodingAttr::get(context, opIdx,
+                                                       parentEnc, kWidth);
              auto eltType =
                  cast<RankedTensorType>(opnd.getType()).getElementType();
              return ttg::DotOperandEncodingAttr::get(context, opIdx, parentEnc,
                                                      eltType);
-           })
+           },
+           py::arg("opnd"), py::arg("opIdx"), py::arg("parentEnc"),
+           py::arg("kWidth") = 0)
       .def("make_dummy_register_layout_attr",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
               Type elementType, bool tmemCompatible) -> Attribute {

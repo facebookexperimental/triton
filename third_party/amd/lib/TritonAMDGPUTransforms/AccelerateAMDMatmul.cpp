@@ -32,6 +32,7 @@ using triton::amdgpu::TargetFeatures;
 
 constexpr char AttrDecomposedDotScaledSource[] =
     "amdg.decomposed_dot_scaled_source";
+constexpr char AttrAMDWmmaTilesPerWarp[] = "amdg.wmma_tiles_per_warp";
 
 int getMfmaVersion(ISAFamily isaFamily) {
   switch (isaFamily) {
@@ -1165,11 +1166,31 @@ public:
 
     auto warpsPerTile =
         planWarps(dotOp, oldShapePerCTA, numWarps, {mDim, nDim});
-    // Match Gluon's preshuffled MXFP gfx1250 schedule: each warp covers a 2x2
-    // set of WMMA tiles, represented as register bases in the AMD WMMA layout.
-    // This also gives the scale tensors the same linear layout Gluon uses for
-    // preshuffled scales.
-    SmallVector<unsigned> tilesPerWarp(rank, 2u);
+    SmallVector<unsigned> tilesPerWarp(rank, 1u);
+    if (auto attr =
+            dotOp->getAttrOfType<DenseI32ArrayAttr>(AttrAMDWmmaTilesPerWarp)) {
+      ArrayRef<int32_t> requested = attr.asArrayRef();
+      if (requested.size() != rank)
+        return dotOp.emitOpError()
+               << AttrAMDWmmaTilesPerWarp << " must have " << rank
+               << " entries";
+
+      tilesPerWarp.clear();
+      SmallVector<unsigned> instrPerDim = {mDim, nDim};
+      for (auto [dim, tiles] : llvm::enumerate(requested)) {
+        if (tiles <= 0)
+          return dotOp.emitOpError()
+                 << AttrAMDWmmaTilesPerWarp
+                 << " entries must be positive";
+        unsigned unsignedTiles = static_cast<unsigned>(tiles);
+        if (oldShapePerCTA[dim] <
+            instrPerDim[dim] * warpsPerTile[dim] * unsignedTiles)
+          return dotOp.emitOpError()
+                 << AttrAMDWmmaTilesPerWarp
+                 << " exceeds the result tile shape";
+        tilesPerWarp.push_back(unsignedTiles);
+      }
+    }
 
     auto ctaLayout =
         ttg::chooseWmmaCTALinearLayout(ctx, rank, warpsPerTile, tilesPerWarp);

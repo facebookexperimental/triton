@@ -54,7 +54,7 @@ from .mem_ops import (
     subslice,
     tmem_copy,
 )
-from .mma_ops import async_dot, async_dot_scaled, async_dot_wait, tcgen05_commit
+from .mma_ops import async_dot, async_dot_scaled, async_dot_wait, dot_scaled, tcgen05_commit
 from .types import (
     async_token,
     buffered_tensor,
@@ -63,6 +63,7 @@ from .types import (
     clc_response_type,
     CLCPipelineContext,
     DummyRegisterLayoutEncoding,
+    amd_wmma_layout_encoding,
     layout_encoding,
     mbarrier,
     mbarrier_type,
@@ -107,6 +108,7 @@ __all__ = [
     "padded_shared_layout_encoding",
     "tensor_memory_layout_encoding",
     "nv_mma_shared_layout_encoding",
+    "amd_wmma_layout_encoding",
     "storage_kind",
     "buffered_tensor",
     "buffered_tensor_type",
@@ -166,6 +168,7 @@ __all__ = [
     "named_barrier_wait",
     "named_barrier_arrive",
     # mma_ops
+    "dot_scaled",
     "async_dot",
     "async_dot_scaled",
     "async_dot_wait",

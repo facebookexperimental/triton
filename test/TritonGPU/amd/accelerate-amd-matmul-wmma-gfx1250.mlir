@@ -467,3 +467,27 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked2 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked3 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+// CHECK-DAG: #[[$MMA_TPW:.+]] = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {register = {{\[\[0, 1\], \[1, 0\]\]}}, warp = {{\[\[0, 2\], \[2, 0\]\]}}}, instrShape = [16, 16, 128]}>
+// CHECK-LABEL: wmma_dot_scaled_explicit_tiles_per_warp
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @wmma_dot_scaled_explicit_tiles_per_warp(
+      %arg0: tensor<256x256xf8E4M3FN, #blocked>,
+      %arg1: tensor<256x256xf8E4M3FN, #blocked1>,
+      %arg2: tensor<256x8xi8, #blocked2>,
+      %arg3: tensor<256x8xi8, #blocked2>,
+      %arg4: tensor<256x256x!tt.ptr<f32>, #blocked3>
+      ) {
+    // CHECK: tt.dot_scaled {{.*}} -> tensor<256x256xf32, #[[$MMA_TPW]]>
+    %cst = arith.constant dense<0.000000e+00> : tensor<256x256xf32, #blocked3>
+    %1 = tt.dot_scaled %arg0 scale %arg2, %arg1 scale %arg3, %cst lhs = e4m3 rhs = e4m3 {fastMath = false, amdg.wmma_tiles_per_warp = array<i32: 2, 2>} : tensor<256x256xf8E4M3FN, #blocked>, tensor<256x8xi8, #blocked2> * tensor<256x256xf8E4M3FN, #blocked1>, tensor<256x8xi8, #blocked2> -> tensor<256x256xf32, #blocked3>
+    tt.store %arg4, %1 : tensor<256x256x!tt.ptr<f32>, #blocked3>
+    tt.return
+  }
+}

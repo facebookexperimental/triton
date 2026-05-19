@@ -31,8 +31,8 @@ def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builde
     return _builder.create_require_layout(x.handle, layout_handle)
 
 
-def require_dot_operand_layout(opnd: tl.tensor, opIdx, parent_layout, _builder=None):
-    layout_handle = _builder.make_dot_operand_encoding_attr(opnd.handle, opIdx, parent_layout)
+def require_dot_operand_layout(opnd: tl.tensor, opIdx, parent_layout, _builder=None, k_width: int = 0):
+    layout_handle = _builder.make_dot_operand_encoding_attr(opnd.handle, opIdx, parent_layout, k_width)
     return _builder.create_require_layout(opnd.handle, layout_handle)
 
 
@@ -62,6 +62,35 @@ def require_tmem_scales_layout(src: tlx.buffered_tensor, _builder=None):
     layout = tlx.tensor_memory_scales_layout_encoding.make_default()
     layout_handle = layout.to_ir(_builder)
     return _builder.create_require_layout(src.handle, layout_handle)
+
+
+@tl.builtin
+def dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None, fast_math=False, lhs_k_pack=True,
+               rhs_k_pack=True, out_dtype=tl.float32, wmma_layout: tl.constexpr = None, _semantic=None):
+    if wmma_layout is None:
+        return tl.dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc, fast_math, lhs_k_pack,
+                             rhs_k_pack, out_dtype, _semantic=_semantic)
+
+    wmma_layout = tl._unwrap_if_constexpr(wmma_layout)
+    lhs_format = tl._unwrap_if_constexpr(lhs_format)
+    rhs_format = tl._unwrap_if_constexpr(rhs_format)
+    fast_math = tl._unwrap_if_constexpr(fast_math)
+    lhs_k_pack = tl._unwrap_if_constexpr(lhs_k_pack)
+    rhs_k_pack = tl._unwrap_if_constexpr(rhs_k_pack)
+    out_dtype = tl._unwrap_if_constexpr(out_dtype)
+    acc = tl._unwrap_if_constexpr(acc)
+
+    assert isinstance(wmma_layout, tlx.amd_wmma_layout_encoding), "wmma_layout must be an AMD WMMA layout"
+    result = tl.dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc, fast_math, lhs_k_pack,
+                           rhs_k_pack, out_dtype, _semantic=_semantic)
+
+    # Materialize AMDWmma/DotOperand encodings in AccelerateAMDMatmul, after
+    # TTGPU module attributes such as ttg.num-warps are available.
+    tiles_per_warp = wmma_layout.tiles_per_warp()
+    if any(tile != 1 for tile in tiles_per_warp):
+        result.handle.set_attr("amdg.wmma_tiles_per_warp",
+                               _semantic.builder.make_i32_array_attr([int(tile) for tile in tiles_per_warp]))
+    return result
 
 
 # async dot signature needs to be close to tl.dot as much as possible
