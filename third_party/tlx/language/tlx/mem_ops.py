@@ -966,12 +966,14 @@ def async_amd_descriptor_load(
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
-    # Only warn on user-supplied incompatible layouts. Auto-defaulted
-    # layouts (no `layout=` passed to local_alloc) are silently rewritten
-    # to the descriptor-compatible encoding by TLXInsertRequireLayout +
-    # TlxPropagateLayout in the AMD pipeline.
+    # Auto-defaulted layouts (no `layout=` passed to local_alloc) are silently
+    # rewritten by TLXInsertRequireLayout + TlxPropagateLayout. Explicit
+    # padded layouts are also supported: TLXInsertRequireLayout preserves them
+    # and AMD descriptor layout assignment propagates them back to the
+    # descriptor type. Warn only for other incompatible explicit layouts.
     layout = result.type.layout
-    if not getattr(layout, "_tlx_default", False):
+    if (not getattr(layout, "_tlx_default", False)
+            and not isinstance(layout, tlx.padded_shared_layout_encoding)):
         expected_layout = _amd_tdm_descriptor_layout(desc)
         if not _layouts_match(layout, expected_layout):
             warnings.warn(
@@ -1094,12 +1096,13 @@ def async_amd_descriptor_store(
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
-    # Auto-propagated layouts (no `layout=` passed to local_alloc) are
-    # silently rewritten to the descriptor-compatible encoding by
-    # TLXInsertRequireLayout; warn only when the user supplied an
-    # incompatible layout explicitly.
+    # Auto-propagated layouts (no `layout=` passed to local_alloc) are silently
+    # rewritten by TLXInsertRequireLayout. Explicit padded layouts are preserved
+    # and propagated to the descriptor type. Warn only for other incompatible
+    # explicit layouts.
     layout = source.type.layout
-    if not getattr(layout, "_tlx_default", False):
+    if (not getattr(layout, "_tlx_default", False)
+            and not isinstance(layout, tlx.padded_shared_layout_encoding)):
         expected_layout = _amd_tdm_descriptor_layout(desc)
         if not _layouts_match(layout, expected_layout):
             warnings.warn(

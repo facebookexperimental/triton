@@ -16,6 +16,18 @@ from triton.tools.mxfp import MXScaleTensor
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
+@triton.constexpr_function
+def _operand_shared_layout(block_shape):
+    block_k = block_shape[1]
+    pad_interval = 256 if block_k <= 256 else block_k
+    return tlx.padded_shared_layout_encoding.with_identity_for([[pad_interval, 16]], block_shape, [1, 0])
+
+
+@triton.constexpr_function
+def _scale_shared_layout(block_shape):
+    return tlx.padded_shared_layout_encoding.with_identity_for([[256, 8]], block_shape, [1, 0])
+
+
 def is_gfx1250_available():
     try:
         target = triton.runtime.driver.active.get_current_target()
@@ -210,7 +222,8 @@ def mxgemm_tdm_pipelined_kernel(
             strides=[stride_bn, tl.constexpr(1)],
             block_shape=[BLOCK_N, BLOCK_K_PACKED_B],
         )
-        b_buf = tlx.local_alloc((BLOCK_N, BLOCK_K_PACKED_B), tlx.dtype_of(b_ptr), NUM_BUFFERS)
+        b_layout: tl.constexpr = _operand_shared_layout([BLOCK_N, BLOCK_K_PACKED_B])
+        b_buf = tlx.local_alloc((BLOCK_N, BLOCK_K_PACKED_B), tlx.dtype_of(b_ptr), NUM_BUFFERS, layout=b_layout)
     else:
         b_desc = tl.make_tensor_descriptor(
             b_ptr + pid_n * BLOCK_N * stride_bn,
@@ -218,7 +231,10 @@ def mxgemm_tdm_pipelined_kernel(
             strides=[stride_bk, tl.constexpr(1)],
             block_shape=[BLOCK_K_PACKED_B, BLOCK_N],
         )
-        b_buf = tlx.local_alloc((BLOCK_K_PACKED_B, BLOCK_N), tlx.dtype_of(b_ptr), NUM_BUFFERS)
+        b_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[BLOCK_N, 16]],
+                                                                                     [BLOCK_K_PACKED_B, BLOCK_N],
+                                                                                     [1, 0])
+        b_buf = tlx.local_alloc((BLOCK_K_PACKED_B, BLOCK_N), tlx.dtype_of(b_ptr), NUM_BUFFERS, layout=b_layout)
 
     a_scale_desc = tl.make_tensor_descriptor(
         a_scale + pid_m * BLOCK_M_PRESHUFFLED * stride_scale,
@@ -233,9 +249,14 @@ def mxgemm_tdm_pipelined_kernel(
         block_shape=[BLOCK_N_PRESHUFFLED, BLOCK_K_SCALE_PRESHUFFLED],
     )
 
-    a_buf = tlx.local_alloc((BLOCK_M, BLOCK_K_PACKED_A), tlx.dtype_of(a_ptr), NUM_BUFFERS)
-    a_scale_buf = tlx.local_alloc((BLOCK_M_PRESHUFFLED, BLOCK_K_SCALE_PRESHUFFLED), tlx.dtype_of(a_scale), NUM_BUFFERS)
-    b_scale_buf = tlx.local_alloc((BLOCK_N_PRESHUFFLED, BLOCK_K_SCALE_PRESHUFFLED), tlx.dtype_of(b_scale), NUM_BUFFERS)
+    a_layout: tl.constexpr = _operand_shared_layout([BLOCK_M, BLOCK_K_PACKED_A])
+    a_scale_layout: tl.constexpr = _scale_shared_layout([BLOCK_M_PRESHUFFLED, BLOCK_K_SCALE_PRESHUFFLED])
+    b_scale_layout: tl.constexpr = _scale_shared_layout([BLOCK_N_PRESHUFFLED, BLOCK_K_SCALE_PRESHUFFLED])
+    a_buf = tlx.local_alloc((BLOCK_M, BLOCK_K_PACKED_A), tlx.dtype_of(a_ptr), NUM_BUFFERS, layout=a_layout)
+    a_scale_buf = tlx.local_alloc((BLOCK_M_PRESHUFFLED, BLOCK_K_SCALE_PRESHUFFLED), tlx.dtype_of(a_scale), NUM_BUFFERS,
+                                  layout=a_scale_layout)
+    b_scale_buf = tlx.local_alloc((BLOCK_N_PRESHUFFLED, BLOCK_K_SCALE_PRESHUFFLED), tlx.dtype_of(b_scale), NUM_BUFFERS,
+                                  layout=b_scale_layout)
 
     K_ITERS = tl.cdiv(K, BLOCK_K)
     tl.assume(K_ITERS >= NUM_BUFFERS)

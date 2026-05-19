@@ -652,6 +652,12 @@ static Attribute chooseTDMBufEncoding(Operation *tdmOp, Value buf,
                               cast<ttg::TensorOrMemDesc>(bufType), order);
     }
   }
+  // If the user supplied an explicit padded shared layout on the TDM
+  // destination, preserve it and let the AMD descriptor layout assignment
+  // propagate it back to the descriptor type. This matches Gluon, whose TDM
+  // descriptor builder accepts the shared layout directly.
+  if (!encoding && isa<ttg::PaddedSharedEncodingAttr>(bufType.getEncoding()))
+    encoding = bufType.getEncoding();
   if (!encoding)
     encoding = buildDefaultTDMDescriptorEncoding(buf.getContext(), shape, order,
                                                  cgaLayout, elementType);

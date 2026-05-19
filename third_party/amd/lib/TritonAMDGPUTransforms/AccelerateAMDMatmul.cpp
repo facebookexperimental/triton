@@ -1165,8 +1165,11 @@ public:
 
     auto warpsPerTile =
         planWarps(dotOp, oldShapePerCTA, numWarps, {mDim, nDim});
-    // TODO: Select tilesPerWarp in Triton
-    SmallVector<unsigned> tilesPerWarp(rank, 1u);
+    // Match Gluon's preshuffled MXFP gfx1250 schedule: each warp covers a 2x2
+    // set of WMMA tiles, represented as register bases in the AMD WMMA layout.
+    // This also gives the scale tensors the same linear layout Gluon uses for
+    // preshuffled scales.
+    SmallVector<unsigned> tilesPerWarp(rank, 2u);
 
     auto ctaLayout =
         ttg::chooseWmmaCTALinearLayout(ctx, rank, warpsPerTile, tilesPerWarp);
