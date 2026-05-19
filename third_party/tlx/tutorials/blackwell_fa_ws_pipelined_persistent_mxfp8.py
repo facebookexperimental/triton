@@ -562,7 +562,6 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
 
                     tlx.barrier_wait(acc_empties[cid], phase)
                     tlx.barrier_wait(o_empties[cid], phase ^ 1)
-                    scale = 1 / l
                     for slice_id in tl.static_range(0, NUM_ACC_SLICES):
                         subslice = tlx.subslice(
                             acc_tiles[cid],
