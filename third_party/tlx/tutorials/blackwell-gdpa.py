@@ -763,7 +763,7 @@ def gdpa_kernel_tma_ws_blackwell(
                             pl.exit_scope("dot_wait_p1")
                         # done using v from previous iteration
                         bufIdx_o1, phase_o1 = get_bufidx_phase(accum_cnt_o1, NUM_BUFFERS_O,  # previous iteration
-                                                                   )
+                                                               )
                         o1_view = tlx.local_view(o1_buf, bufIdx_o1)
                         producer_commit_o1_view = tlx.local_view(producer_commit_o1, bufIdx_o1)
                         # release v for previous iteartion, accum_cnt_kv already advanced
