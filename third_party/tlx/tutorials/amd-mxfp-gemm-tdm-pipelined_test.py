@@ -249,6 +249,11 @@ def mxgemm_tdm_pipelined_kernel(
         block_shape=[BLOCK_N_PRESHUFFLED, BLOCK_K_SCALE_PRESHUFFLED],
     )
 
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_ptrs = c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
     a_layout: tl.constexpr = _operand_shared_layout([BLOCK_M, BLOCK_K_PACKED_A])
     a_scale_layout: tl.constexpr = _scale_shared_layout([BLOCK_M_PRESHUFFLED, BLOCK_K_SCALE_PRESHUFFLED])
     b_scale_layout: tl.constexpr = _scale_shared_layout([BLOCK_N_PRESHUFFLED, BLOCK_K_SCALE_PRESHUFFLED])
@@ -324,10 +329,6 @@ def mxgemm_tdm_pipelined_kernel(
         wmma_idx += 1
         acc = tl.dot_scaled(a, scale_a, DTYPE_A, b, scale_b, DTYPE_B, acc)
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    c_ptrs = c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
-    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     tl.store(c_ptrs, acc, mask=c_mask)
 
 
