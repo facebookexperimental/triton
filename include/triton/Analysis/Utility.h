@@ -56,6 +56,10 @@ public:
 
   unsigned getIntraWarpSizeWithUniqueData();
 
+  // Number of register groups along the reduction axis that must be kept
+  // separate after within-thread reduction.
+  unsigned getNumRegGroupsOnAxis();
+
   // The shape of the shared memory space needed for the reduction.
   SmallVector<unsigned> getScratchRepShape();
 

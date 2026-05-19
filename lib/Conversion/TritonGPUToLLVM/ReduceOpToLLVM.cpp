@@ -142,13 +142,9 @@ private:
       ConversionPatternRewriter &rewriter) const {
     triton::ReduceOp op = helper.getOperation();
     RankedTensorType operandType = op.getInputTypes()[0];
-    // Assumes offsets don't actually depend on type
     SmallVector<SmallVector<unsigned>> offsets =
         emitOffsetForLayout(helper.getSrcLayout(), operandType);
 
-    // Thread X might hold the same input value in two registers.  Get the
-    // indices in `offsets` that hold unique values, and only accumulate over
-    // those.
     llvm::MapVector<ArrayRef<unsigned>, int> uniqueOffsets;
     for (int i = 0; i < offsets.size(); ++i) {
       uniqueOffsets.insert({offsets[i], i});
@@ -157,14 +153,100 @@ private:
     auto *combineOp = &op.getCombineOp();
     auto srcIndices = emitIndices(op.getLoc(), rewriter, targetInfo,
                                   helper.getSrcLayout(), operandType, true);
-    // reduce within threads
-    for (const auto &[_, i] : uniqueOffsets) {
-      SmallVector<unsigned> key = offsets[i];
-      key[op.getAxis()] = 0;
-      bool isFirst = accs.find(key) == accs.end();
-      accumulate(op.getLoc(), rewriter, *combineOp, accs[key], srcValues[i]);
-      if (isFirst)
-        indices[key] = srcIndices[i];
+
+    SmallVector<int> iterOrder;
+    for (const auto &[_, i] : uniqueOffsets)
+      iterOrder.push_back(i);
+
+    if (isInnerTree(op)) {
+      reduceWithinThreadsInnerTree(op, offsets, iterOrder, *combineOp,
+                                   srcValues, srcIndices, accs, indices,
+                                   rewriter);
+    } else {
+      for (int i : iterOrder) {
+        SmallVector<unsigned> key = offsets[i];
+        key[op.getAxis()] = 0;
+        bool isFirst = accs.find(key) == accs.end();
+        accumulate(op.getLoc(), rewriter, *combineOp, accs[key], srcValues[i]);
+        if (isFirst)
+          indices[key] = srcIndices[i];
+      }
+    }
+  }
+
+  // INNER_TREE: tree-reduces values in packed register order.  The packed
+  // order is the logical order for a defined reduction tree, so adjacent
+  // register values are combined before the result participates in warp-level
+  // reduction.
+  void reduceWithinThreadsInnerTree(
+      triton::ReduceOp op, SmallVector<SmallVector<unsigned>> &offsets,
+      SmallVector<int> &iterOrder, Region &combineOp,
+      SmallVector<SmallVector<Value>> &srcValues,
+      SmallVector<SmallVector<Value>> &srcIndices,
+      std::map<SmallVector<unsigned>, SmallVector<Value>> &accs,
+      std::map<SmallVector<unsigned>, SmallVector<Value>> &indices,
+      ConversionPatternRewriter &rewriter) const {
+    unsigned axis = op.getAxis();
+
+    auto resultTy = dyn_cast<RankedTensorType>(op.getResult()[0].getType());
+    if (!resultTy) {
+      SmallVector<SmallVector<Value>> level;
+      for (int idx : iterOrder)
+        level.push_back(srcValues[idx]);
+      while (level.size() > 1) {
+        SmallVector<SmallVector<Value>> nextLevel;
+        for (unsigned j = 0; j + 1 < level.size(); j += 2) {
+          SmallVector<Value> merged = level[j];
+          accumulate(op.getLoc(), rewriter, combineOp, merged, level[j + 1]);
+          nextLevel.push_back(std::move(merged));
+        }
+        if (level.size() % 2 == 1)
+          nextLevel.push_back(std::move(level.back()));
+        level = std::move(nextLevel);
+      }
+      SmallVector<unsigned> key = offsets[iterOrder[0]];
+      key[axis] = 0;
+      accs[key] = std::move(level[0]);
+      indices[key] = srcIndices[iterOrder[0]];
+      return;
+    }
+
+    auto resultLayout = cast<SliceEncodingAttr>(resultTy.getEncoding());
+    SmallVector<SmallVector<unsigned>> resultOffsets =
+        emitOffsetForLayout(resultLayout, resultTy);
+    auto resultIndices = emitIndices(op.getLoc(), rewriter, targetInfo,
+                                     resultLayout, resultTy, true);
+    assert(resultOffsets.size() == resultIndices.size());
+    assert(iterOrder.size() % resultOffsets.size() == 0);
+
+    unsigned elemsPerResult = iterOrder.size() / resultOffsets.size();
+    auto b = TritonLLVMOpBuilder(op.getLoc(), rewriter);
+    for (unsigned resultIdx = 0; resultIdx < resultOffsets.size();
+         ++resultIdx) {
+      SmallVector<SmallVector<Value>> level;
+      unsigned begin = resultIdx * elemsPerResult;
+      unsigned end = begin + elemsPerResult;
+      for (unsigned i = begin; i < end; ++i)
+        level.push_back(srcValues[iterOrder[i]]);
+
+      while (level.size() > 1) {
+        SmallVector<SmallVector<Value>> nextLevel;
+        for (unsigned j = 0; j + 1 < level.size(); j += 2) {
+          SmallVector<Value> merged = level[j];
+          accumulate(op.getLoc(), rewriter, combineOp, merged, level[j + 1]);
+          nextLevel.push_back(std::move(merged));
+        }
+        if (level.size() % 2 == 1)
+          nextLevel.push_back(std::move(level.back()));
+        level = std::move(nextLevel);
+      }
+
+      SmallVector<unsigned> key = resultOffsets[resultIdx];
+      key.insert(key.begin() + axis, 0);
+      SmallVector<Value> index = resultIndices[resultIdx];
+      index.insert(index.begin() + axis, b.i32_val(0));
+      accs[key] = std::move(level[0]);
+      indices[key] = std::move(index);
     }
   }
 
@@ -282,13 +364,35 @@ private:
 
     Value warpIdAxis = multiDimWarpId[axis];
 
+    unsigned sizeInterWarps = helper.getInterWarpSizeWithUniqueData();
+    unsigned numRegGroups = helper.getNumRegGroupsOnAxis();
     auto smemOrder = helper.getOrderWithAxisAtBeginning();
+
+    // Build a map from axis offset → sequential group index (0, 1, ...).
+    std::map<unsigned, unsigned> axisOffsetToGroupIdx;
+    if (numRegGroups > 1) {
+      for (const auto &[key, _] : accs) {
+        unsigned axisVal = key[axis];
+        if (axisOffsetToGroupIdx.find(axisVal) == axisOffsetToGroupIdx.end()) {
+          unsigned nextIdx = axisOffsetToGroupIdx.size();
+          axisOffsetToGroupIdx[axisVal] = nextIdx;
+        }
+      }
+    }
+
     for (auto it : accs) {
       const SmallVector<unsigned> &key = it.first;
       SmallVector<Value> &acc = it.second;
 
       SmallVector<Value> writeIdx = indices[key];
-      writeIdx[axis] = warpIdAxis;
+      if (numRegGroups > 1) {
+        unsigned regGroupIdx = axisOffsetToGroupIdx[key[axis]];
+        Value groupOffset =
+            b.add(b.i32_val(regGroupIdx * sizeInterWarps), warpIdAxis);
+        writeIdx[axis] = groupOffset;
+      } else {
+        writeIdx[axis] = warpIdAxis;
+      }
       Value writeOffset =
           linearize(rewriter, loc, writeIdx, smemShape, smemOrder);
       for (unsigned i = 0; i < op.getNumOperands(); ++i) {
@@ -360,6 +464,72 @@ private:
     }
   }
 
+  SmallVector<Value> pairwiseInnerTreeReduceRegGroups(
+      Location loc, triton::ReduceOp op,
+      SmallVector<SmallVector<Value>> groupVals,
+      ConversionPatternRewriter &rewriter) const {
+    while (groupVals.size() > 1) {
+      SmallVector<SmallVector<Value>> next;
+      for (unsigned g = 0; g + 1 < groupVals.size(); g += 2) {
+        SmallVector<Value> acc = groupVals[g];
+        accumulate(loc, rewriter, op.getCombineOp(), acc, groupVals[g + 1]);
+        next.push_back(std::move(acc));
+      }
+      if (groupVals.size() % 2 == 1)
+        next.push_back(std::move(groupVals.back()));
+      groupVals = std::move(next);
+    }
+    return groupVals[0];
+  }
+
+  SmallVector<Value> loadAndReduceRegGroups(
+      Location loc, triton::ReduceOp op, ArrayRef<Value> smemBases,
+      SmallVector<Value> readIdx, ArrayRef<unsigned> smemShape,
+      ArrayRef<unsigned> smemOrder, unsigned axis, unsigned numRegGroups,
+      unsigned sizeInterWarps, ConversionPatternRewriter &rewriter) const {
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    SmallVector<SmallVector<Value>> groupVals;
+    groupVals.reserve(numRegGroups);
+    for (unsigned g = 0; g < numRegGroups; ++g) {
+      SmallVector<Value> vals;
+      vals.reserve(op.getNumOperands());
+      SmallVector<Value> groupReadIdx = readIdx;
+      groupReadIdx[axis] = b.i32_val(g * sizeInterWarps);
+      Value offset =
+          linearize(rewriter, loc, groupReadIdx, smemShape, smemOrder);
+      for (unsigned i = 0; i < op.getNumOperands(); ++i) {
+        auto elemTy = getElementType(op, i);
+        Value ptr = b.gep(smemBases[i].getType(), elemTy, smemBases[i], offset);
+        vals.push_back(b.load(elemTy, ptr));
+      }
+      groupVals.push_back(std::move(vals));
+    }
+    return pairwiseInnerTreeReduceRegGroups(loc, op, std::move(groupVals),
+                                            rewriter);
+  }
+
+  SmallVector<Value> loadAndReduceScalarRegGroups(
+      Location loc, triton::ReduceOp op, ArrayRef<Value> smemBases,
+      unsigned numRegGroups, unsigned sizeInterWarps,
+      ConversionPatternRewriter &rewriter) const {
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    SmallVector<SmallVector<Value>> groupVals;
+    groupVals.reserve(numRegGroups);
+    for (unsigned g = 0; g < numRegGroups; ++g) {
+      SmallVector<Value> vals;
+      vals.reserve(op.getNumOperands());
+      for (unsigned i = 0; i < op.getNumOperands(); ++i) {
+        auto elemTy = getElementType(op, i);
+        Value ptr = b.gep(smemBases[i].getType(), elemTy, smemBases[i],
+                          b.i32_val(g * sizeInterWarps));
+        vals.push_back(b.load(elemTy, ptr));
+      }
+      groupVals.push_back(std::move(vals));
+    }
+    return pairwiseInnerTreeReduceRegGroups(loc, op, std::move(groupVals),
+                                            rewriter);
+  }
+
   // Load the final reduction from shared memory and replace the reduce result
   // with it.
   void loadReductionAndPackResult(ReduceOpHelper &helper,
@@ -369,15 +539,63 @@ private:
     triton::ReduceOp op = helper.getOperation();
     Location loc = op.getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
-    auto srcLayout = helper.getSrcLayout();
     auto axis = op.getAxis();
     auto smemOrder = helper.getOrderWithAxisAtBeginning();
+
+    unsigned numRegGroups = helper.getNumRegGroupsOnAxis();
+    unsigned sizeInterWarps = helper.getInterWarpSizeWithUniqueData();
+
     SmallVector<Value> results(op.getNumOperands());
+    if (numRegGroups > 1) {
+      if (auto firstResultTy =
+              dyn_cast<RankedTensorType>(op.getResult()[0].getType())) {
+        auto resultLayout = cast<SliceEncodingAttr>(firstResultTy.getEncoding());
+        unsigned resultElems = getTotalElemsPerThread(firstResultTy);
+        auto resultIndices = emitIndices(loc, rewriter, targetInfo,
+                                         resultLayout, firstResultTy, true);
+        auto resultShape = firstResultTy.getShape();
+        assert(resultIndices.size() == resultElems);
+
+        SmallVector<SmallVector<Value>> resultVals(
+            op.getNumOperands(), SmallVector<Value>(resultElems));
+        for (size_t j = 0; j < resultElems; ++j) {
+          SmallVector<Value> readIdx = resultIndices[j];
+          readIdx.insert(readIdx.begin() + axis, b.i32_val(0));
+          for (size_t resultIdx = 0, resultDim = resultShape.size();
+               resultIdx < resultDim; ++resultIdx) {
+            auto smemIdx = resultIdx < axis ? resultIdx : resultIdx + 1;
+            if (resultShape[resultIdx] > smemShape[smemIdx]) {
+              readIdx[smemIdx] =
+                  b.urem(readIdx[smemIdx], b.i32_val(smemShape[smemIdx]));
+            }
+          }
+
+          SmallVector<Value> vals = loadAndReduceRegGroups(
+              loc, op, smemBases, readIdx, smemShape, smemOrder, axis,
+              numRegGroups, sizeInterWarps, rewriter);
+          for (unsigned i = 0; i < op.getNumOperands(); ++i)
+            resultVals[i][j] = vals[i];
+        }
+
+        for (unsigned i = 0; i < op.getNumOperands(); ++i) {
+          auto resultTy = cast<RankedTensorType>(op.getResult()[i].getType());
+          results[i] = packLLElements(loc, getTypeConverter(), resultVals[i],
+                                      rewriter, resultTy);
+        }
+      } else {
+        SmallVector<Value> vals = loadAndReduceScalarRegGroups(
+            loc, op, smemBases, numRegGroups, sizeInterWarps, rewriter);
+        for (unsigned i = 0; i < op.getNumOperands(); ++i)
+          results[i] = vals[i];
+      }
+      rewriter.replaceOp(op, results);
+      return;
+    }
+
     for (unsigned i = 0; i < op.getNumOperands(); ++i) {
       auto elemTy = getElementType(op, i);
       if (auto resultTy =
               dyn_cast<RankedTensorType>(op.getResult()[i].getType())) {
-        // nd-tensor where n >= 1
         auto resultLayout = cast<SliceEncodingAttr>(resultTy.getEncoding());
         unsigned resultElems = getTotalElemsPerThread(resultTy);
         auto resultIndices = emitIndices(loc, rewriter, targetInfo,
@@ -393,17 +611,15 @@ private:
                resultIdx < resultDim; ++resultIdx) {
             auto smemIdx = resultIdx < op.getAxis() ? resultIdx : resultIdx + 1;
             if (resultShape[resultIdx] > smemShape[smemIdx]) {
-              // When srcShape smaller than src sizePerThread, only srcShape
-              // elements is accumulated in smem. Modulo smemShape effectively
-              // replicates srcShape elements to src sizePerThread.
               readIdx[smemIdx] =
                   b.urem(readIdx[smemIdx], b.i32_val(smemShape[smemIdx]));
             }
           }
+
           Value readOffset =
               linearize(rewriter, loc, readIdx, smemShape, smemOrder);
-          Value readPtr =
-              b.gep(smemBases[i].getType(), elemTy, smemBases[i], readOffset);
+          Value readPtr = b.gep(smemBases[i].getType(), elemTy, smemBases[i],
+                                readOffset);
           resultVals[j] = b.load(elemTy, readPtr);
         }
 
