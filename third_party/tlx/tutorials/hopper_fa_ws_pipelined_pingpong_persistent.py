@@ -3,6 +3,7 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -40,13 +41,6 @@ configs = [
         pre_hook=_host_descriptor_pre_hook,
     ),
 ]
-
-
-@triton.jit
-def _get_bufidx_phase(accum_cnt, NUM_BUFFERS):
-    bufIdx = accum_cnt % NUM_BUFFERS
-    phase = (accum_cnt // NUM_BUFFERS) & 1
-    return bufIdx, phase
 
 
 @triton.jit
@@ -122,14 +116,14 @@ def _attn_fwd_ws_pipelined_pingpong_persistent(sm_scale, M,  #
                     tile_idx, H, num_pid_n, num_pid_in_group, N_CTX, BLOCK_M)
 
                 # load q0
-                q_bufIdx, q_phase = _get_bufidx_phase(i, NUM_BUFFERS_Q)
+                q_bufIdx, q_phase = get_bufidx_phase(i, NUM_BUFFERS_Q)
                 tlx.barrier_wait(q_empties[q_bufIdx], q_phase ^ 1)
                 tlx.barrier_expect_bytes(q_fulls[q_bufIdx], Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM)
                 qo_offset_y_split = qo_offset_y
                 tlx.async_descriptor_load(desc_q, q_tiles[q_bufIdx], [qo_offset_y_split, 0], q_fulls[q_bufIdx])
 
                 kv_offset = kv_offset_y + lo
-                kv_bufIdx, kv_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
+                kv_bufIdx, kv_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
 
                 # load K
                 tlx.barrier_wait(k_empties[kv_bufIdx], kv_phase ^ 1)
@@ -152,7 +146,7 @@ def _attn_fwd_ws_pipelined_pingpong_persistent(sm_scale, M,  #
                 # loop over K, V tiles
                 for kv_idx in tl.range(lo + BLOCK_N, hi, BLOCK_N):
                     kv_offset = kv_offset_y + kv_idx
-                    kv_bufIdx, kv_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
+                    kv_bufIdx, kv_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
 
                     # load K
                     tlx.barrier_wait(k_empties[kv_bufIdx], kv_phase ^ 1)
@@ -213,10 +207,10 @@ def _attn_fwd_ws_pipelined_pingpong_persistent(sm_scale, M,  #
                 qk_scale *= 1.44269504  # 1/log(2)
 
                 # wait for the Q buffer to be populated by the producer
-                q_bufIdx, q_phase = _get_bufidx_phase(i, NUM_BUFFERS_Q)
+                q_bufIdx, q_phase = get_bufidx_phase(i, NUM_BUFFERS_Q)
                 tlx.barrier_wait(q_fulls[q_bufIdx + cid * NUM_BUFFERS_Q], q_phase)
 
-                k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
+                k_bufIdx, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
 
                 # wait for the K[0] buffer to be populated by the producer
                 tlx.barrier_wait(k_fulls[k_bufIdx], k_phase)
@@ -261,7 +255,7 @@ def _attn_fwd_ws_pipelined_pingpong_persistent(sm_scale, M,  #
 
                 # loop over k, v and update accumulator
                 for _ in tl.range(lo + BLOCK_N, hi, BLOCK_N):
-                    k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
+                    k_bufIdx, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
 
                     # wait for the K buffer to be populated by the producer
                     tlx.barrier_wait(k_fulls[k_bufIdx], k_phase)
@@ -289,7 +283,7 @@ def _attn_fwd_ws_pipelined_pingpong_persistent(sm_scale, M,  #
 
                     # compute pv from the previous iteration
                     # wait for the previous V buffer to be populated by the producer
-                    v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv - 1, NUM_BUFFERS_KV)
+                    v_bufIdx, v_phase = get_bufidx_phase(accum_cnt_kv - 1, NUM_BUFFERS_KV)
                     tlx.barrier_wait(v_fulls[v_bufIdx], v_phase)
                     # prepare p and v for the dot
                     p = p.to(tlx.dtype_of(desc_k))
@@ -321,7 +315,7 @@ def _attn_fwd_ws_pipelined_pingpong_persistent(sm_scale, M,  #
 
                 # compute pv from the last iteration
                 # wait for the V buffer to be populated by the producer
-                v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv - 1, NUM_BUFFERS_KV)
+                v_bufIdx, v_phase = get_bufidx_phase(accum_cnt_kv - 1, NUM_BUFFERS_KV)
                 tlx.barrier_wait(v_fulls[v_bufIdx], v_phase)
                 # prepare p and v for the dot
                 p = p.to(tlx.dtype_of(desc_k))

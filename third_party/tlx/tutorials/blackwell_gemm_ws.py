@@ -7,6 +7,7 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 # Track which (M, N, K) shapes have already printed their heuristic config
@@ -648,13 +649,6 @@ def preprocess_configs(configs, named_args, **kwargs):
 
 
 @triton.jit
-def _get_bufidx_phase(accum_cnt, NUM_BUFFERS_KV):
-    bufIdx = accum_cnt % NUM_BUFFERS_KV
-    phase = (accum_cnt // NUM_BUFFERS_KV) & 1
-    return bufIdx, phase
-
-
-@triton.jit
 def _compute_grid_info(
     M,
     N,
@@ -857,7 +851,7 @@ def _process_tile_mma_inner(
     local_k_tiles = k_tile_end - k_tile_start
 
     # Peeled first K-iteration: wait for data before acquiring TMEM
-    buf, phase = _get_bufidx_phase(smem_accum_cnt, NUM_SMEM_BUFFERS)
+    buf, phase = get_bufidx_phase(smem_accum_cnt, NUM_SMEM_BUFFERS)
 
     # wait for current phase(round) of load for this buf
     tlx.barrier_wait(B_smem_full_bars[buf], phase)
@@ -899,7 +893,7 @@ def _process_tile_mma_inner(
 
     # Remaining K iterations with use_acc=True
     for _ in range(1, local_k_tiles):
-        buf, phase = _get_bufidx_phase(smem_accum_cnt, NUM_SMEM_BUFFERS)
+        buf, phase = get_bufidx_phase(smem_accum_cnt, NUM_SMEM_BUFFERS)
 
         # wait for current phase(round) of load for this buf
         tlx.barrier_wait(B_smem_full_bars[buf], phase)
@@ -936,7 +930,7 @@ def _process_tile_mma_inner(
         smem_accum_cnt += 1
 
     # Wait for last MMA to complete and signal epilogue for all subtiles
-    last_buf, last_phase = _get_bufidx_phase(smem_accum_cnt - 1, NUM_SMEM_BUFFERS)
+    last_buf, last_phase = get_bufidx_phase(smem_accum_cnt - 1, NUM_SMEM_BUFFERS)
     for group_id in tl.static_range(NUM_MMA_GROUPS):
         a_buf = group_id * NUM_SMEM_BUFFERS + last_buf
         tlx.barrier_wait(A_smem_empty_bars[a_buf], last_phase)
@@ -987,7 +981,7 @@ def _process_tile_producer_inner(
     # Iterate along K dimension for this split's range
     for k_idx in range(0, local_k_tiles):
         k = k_tile_start + k_idx
-        buf, phase = _get_bufidx_phase(smem_accum_cnt, NUM_SMEM_BUFFERS)
+        buf, phase = get_bufidx_phase(smem_accum_cnt, NUM_SMEM_BUFFERS)
         offs_k = k * BLOCK_SIZE_K
 
         # Load A for the first group
@@ -1220,7 +1214,7 @@ def matmul_kernel_tma_ws_blackwell(
                 k_tile_start = split_id * k_tiles_per_split
                 k_tile_end = min(k_tile_start + k_tiles_per_split, k_tiles_total)
                 if k_tile_end > k_tile_start:
-                    cur_tmem_buf, tmem_read_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
+                    cur_tmem_buf, tmem_read_phase = get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
                     _process_tile_epilogue_inner(
                         tile_id=tile_id,
                         num_pid_in_group=num_pid_in_group,
@@ -1281,7 +1275,7 @@ def matmul_kernel_tma_ws_blackwell(
 
                 # Skip tiles whose split has zero K-tiles
                 if k_tile_end > k_tile_start:
-                    cur_tmem_buf, tmem_write_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
+                    cur_tmem_buf, tmem_write_phase = get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
                     smem_accum_cnt = _process_tile_mma_inner(
                         k_tiles=k_tiles_total,
                         k_tile_start=k_tile_start,
