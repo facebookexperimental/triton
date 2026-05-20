@@ -652,10 +652,25 @@ static Attribute chooseTDMBufEncoding(Operation *tdmOp, Value buf,
                               cast<ttg::TensorOrMemDesc>(bufType), order);
     }
   }
-  // If the user supplied an explicit padded shared layout on the TDM
-  // destination, preserve it and let the AMD descriptor layout assignment
-  // propagate it back to the descriptor type. This matches Gluon, whose TDM
-  // descriptor builder accepts the shared layout directly.
+  // Preserve an explicit padded shared layout on the TDM destination so
+  // kernels can match a specific preshuffled scheme (matches Gluon, whose TDM
+  // descriptor builder accepts the shared layout directly). AMD descriptor
+  // layout assignment then propagates this encoding back to the descriptor
+  // type.
+  //
+  // The padded-only gate is a hard legality constraint, not a stylistic
+  // choice:
+  //   1. TDM hardware verifiers require padding-shaped encodings (and TDM
+  //      stores additionally require `padInterval == innermost block dim`).
+  //   2. Downstream `OptimizeDescriptorEncoding` unconditionally
+  //      `cast<PaddedSharedEncodingAttr>`s the alloc encoding while walking
+  //      TDM users; a non-padded encoding here would assert there.
+  // Non-padded encodings (typically the TLX auto-default swizzled layout)
+  // fall through to `buildDefaultTDMDescriptorEncoding`. The Python-side
+  // user-facing warning for explicit-but-incompatible layouts lives in
+  // `tlx.async_amd_descriptor_load` / `async_amd_descriptor_store`; the
+  // C++ side cannot distinguish auto-default from user-explicit without
+  // plumbing through extra metadata.
   if (!encoding && isa<ttg::PaddedSharedEncodingAttr>(bufType.getEncoding()))
     encoding = bufType.getEncoding();
   if (!encoding)
