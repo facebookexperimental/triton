@@ -6,6 +6,7 @@ on:
   pull_request:
 
 env:
+  MAX_JOBS: 16
   TORCH_NIGHTLY_URL: https://download-r2.pytorch.org/whl/nightly/rocm7.2/torch-2.13.0.dev20260513%2Brocm7.2-cp312-cp312-manylinux_2_28_x86_64.whl
 
 jobs:
