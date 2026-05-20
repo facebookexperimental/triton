@@ -35,15 +35,7 @@ jobs:
         working-directory: tritonbench
         run: |
           set -eux
-          bash ./.ci/tritonbench/setup-env.sh --hip --no-build --install-torch-wheel "${TORCH_NIGHTLY_URL}"
-      - name: Compile Triton
-        env:
-          MAX_JOBS: 16
-        run: |
-          set -eux
-          . "${SETUP_SCRIPT}"
-          . "${GITHUB_WORKSPACE}/tritonbench/.ci/triton/triton_install_utils.sh"
-          install_triton "${GITHUB_WORKSPACE}"
+          bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --install-torch-wheel "${TORCH_NIGHTLY_URL}"
       - name: Run TritonBench
         working-directory: tritonbench
         run: |
@@ -77,15 +69,7 @@ jobs:
         working-directory: tritonbench
         run: |
           set -eux
-          bash ./.ci/tritonbench/setup-env.sh --hip --no-build --install-torch-wheel "${TORCH_NIGHTLY_URL}"
-      - name: Compile Triton
-        env:
-          MAX_JOBS: 16
-        run: |
-          set -eux
-          . "${SETUP_SCRIPT}"
-          . "${GITHUB_WORKSPACE}/tritonbench/.ci/triton/triton_install_utils.sh"
-          install_triton "${GITHUB_WORKSPACE}"
+          bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --install-torch-wheel "${TORCH_NIGHTLY_URL}"
       - name: Run TLX unit tests
         timeout-minutes: 5
         run: |
