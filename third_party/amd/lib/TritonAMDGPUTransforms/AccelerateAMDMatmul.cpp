@@ -1171,23 +1171,20 @@ public:
             dotOp->getAttrOfType<DenseI32ArrayAttr>(AttrAMDWmmaTilesPerWarp)) {
       ArrayRef<int32_t> requested = attr.asArrayRef();
       if (requested.size() != rank)
-        return dotOp.emitOpError()
-               << AttrAMDWmmaTilesPerWarp << " must have " << rank
-               << " entries";
+        return dotOp.emitOpError() << AttrAMDWmmaTilesPerWarp << " must have "
+                                   << rank << " entries";
 
       tilesPerWarp.clear();
       SmallVector<unsigned> instrPerDim = {mDim, nDim};
       for (auto [dim, tiles] : llvm::enumerate(requested)) {
         if (tiles <= 0)
           return dotOp.emitOpError()
-                 << AttrAMDWmmaTilesPerWarp
-                 << " entries must be positive";
+                 << AttrAMDWmmaTilesPerWarp << " entries must be positive";
         unsigned unsignedTiles = static_cast<unsigned>(tiles);
         if (oldShapePerCTA[dim] <
             instrPerDim[dim] * warpsPerTile[dim] * unsignedTiles)
           return dotOp.emitOpError()
-                 << AttrAMDWmmaTilesPerWarp
-                 << " exceeds the result tile shape";
+                 << AttrAMDWmmaTilesPerWarp << " exceeds the result tile shape";
         tilesPerWarp.push_back(unsignedTiles);
       }
     }
