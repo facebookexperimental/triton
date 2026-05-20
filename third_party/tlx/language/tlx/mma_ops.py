@@ -67,6 +67,13 @@ def require_tmem_scales_layout(src: tlx.buffered_tensor, _builder=None):
 @tl.builtin
 def dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None, fast_math=False, lhs_k_pack=True,
                rhs_k_pack=True, out_dtype=tl.float32, tiles_per_warp: tl.constexpr = None, _semantic=None):
+    """Wrapper around tl.dot_scaled that optionally pins the AMD WMMA tiles-per-warp schedule.
+
+    `tiles_per_warp` is a per-dim sequence of ints attached to the result as
+    the `amdg.wmma_tiles_per_warp` attribute and consumed by AccelerateAMDMatmul
+    to override the default WMMA tile-per-warp count. Passing `None` or all-ones
+    is equivalent to calling `tl.dot_scaled` directly.
+    """
     result = tl.dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc, fast_math, lhs_k_pack,
                            rhs_k_pack, out_dtype, _semantic=_semantic)
     tiles_per_warp = tl._unwrap_if_constexpr(tiles_per_warp)
