@@ -19,48 +19,48 @@ While this approach places more responsibility on the user, it reduces the compi
 
 ### Local buffer operations
 
-- `buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS)`
+- `buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS)` **[Hopper+]**
 
     Allocate `NUM_BUFFERS` buffers in local memory per thread block, each of size size. The memory layout is inferred from its consumers.
 
 
-- `buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS, tlx.storage_kind.tmem)`
+- `buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS, tlx.storage_kind.tmem)` **[Blackwell]**
 
     Allocate `NUM_BUFFERS` of buffers in the tensor memory per thread block, each with size size. The memory layout is inferred from its consumers.
 
 
-- `buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS, reuse=other_buffers)`
+- `buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS, reuse=other_buffers)` **[Hopper+]**
 
     Alias this allocation to an existing `buffered_tensor` so multiple logical buffers reuse the same underlying local storage (SMEM or TMEM) without reallocation.
 
 
-- `buffer = tlx.local_view(buffers, buffer_idx)` or `buffer = buffers[buffer_idx]`
+- `buffer = tlx.local_view(buffers, buffer_idx)` or `buffer = buffers[buffer_idx]` **[Hopper+]**
 
     Return a subview of the buffer indexed by `buffer_idx` from `buffers`. Both the explicit `local_view()` call and the indexing syntax `[]` are supported.
 
 
-- `distributed_tensor = tlx.local_load(buffer, optional_token)`
+- `distributed_tensor = tlx.local_load(buffer, optional_token)` **[Hopper+]**
 
     Loads the buffer from local memory or tensor memory into a distributed tensor.
 
 
-- `tlx.local_store(buffer, distributed_tensor)`
+- `tlx.local_store(buffer, distributed_tensor)` **[Hopper+]**
 
     Store a distributed tensor into a buffer in local memory or tensor memory.
 
-- `distributed_tensor = tlx.local_gather(src, indices, axis, optional_token)`
+- `distributed_tensor = tlx.local_gather(src, indices, axis, optional_token)` **[Hopper+]**
 
     Gather elements from shared memory along a specified axis using an indices tensor. The output shape matches the indices shape, and elements are gathered from `src` at positions specified by `indices` along the given `axis`.
 
-- `tlx.local_scatter(dst, src, indices, axis, optional_token)`
+- `tlx.local_scatter(dst, src, indices, axis, optional_token)` **[Hopper+]**
 
     Scatter elements to shared memory along a specified axis using an indices tensor. Elements from `src` are written to `dst` at positions specified by `indices` along the given `axis`.
 
-- `buffer = tlx.local_trans(buffer, dims)`
+- `buffer = tlx.local_trans(buffer, dims)` **[Hopper+]**
 
     Permutes the dimensions of a tensor.
 
-- `buffer = tlx.local_slice(buffer, offsets=[m, n], shapes=[M, N])`
+- `buffer = tlx.local_slice(buffer, offsets=[m, n], shapes=[M, N])` **[Hopper+]**
 
     Slice a `M x N` tensor at a `m x n` offset.
 
@@ -69,7 +69,7 @@ While this approach places more responsibility on the user, it reduces the compi
 TLX provides you the ability to reuse the same allocated buffer across multiple disjoint steps in your kernel. This is
 useful to allow additional pipelining when you may not have enough isolated SMEM or TMEM.
 
-- `tlx.storage_alias_spec(storage=storage_kind)`
+- `tlx.storage_alias_spec(storage=storage_kind)` **[Hopper+]**
 
     Defines a buffer that you will want to share across multiple aliases. The storage
     can be either SMEM or TMEM. To use this in an allocation you the spec in the `reuse`
@@ -104,7 +104,7 @@ m_tiles = tlx.local_alloc(
 )
 ```
 
-- `tlx.reuse_group(*tensors, group_type=REUSE_TYPE, group_size=SUBTILE_SIZE)`
+- `tlx.reuse_group(*tensors, group_type=REUSE_TYPE, group_size=SUBTILE_SIZE)` **[Hopper+]**
 
     A reuse group expresses how you intend to access the shared buffer.
     There are two types: Shared or Distinct. A shared buffer wants to occupy the same memory
@@ -156,12 +156,12 @@ Binary wheels are available for CPython 3.10-3.14.
 
 ### Remote buffer operations
 
-- `buffer = tlx.remote_view(buffer, remote_cta_rank)`
+- `buffer = tlx.remote_view(buffer, remote_cta_rank)` **[Hopper+]**
 
   Return a remote view of the `buffer` living in another CTA in the same cluster with ID `remote_cta_rank`. NOTE: for
   now we only support barrier as `buffer`, not general SMEM.
 
-- `tlx.remote_shmem_store(dst, src, remote_cta_rank)`
+- `tlx.remote_shmem_store(dst, src, remote_cta_rank)` **[Hopper+]**
 
   Store a distributed tensor into a buffer in the remote shared memory of a cluster (synchronous).
 
@@ -182,7 +182,7 @@ Binary wheels are available for CPython 3.10-3.14.
 ### Async memory access
 
 
-- `tlx.async_descriptor_load(desc, buffer, offsets, barrier, pred=None, cache_modifier="", eviction_policy="", multicast_targets=[])`
+- `tlx.async_descriptor_load(desc, buffer, offsets, barrier, pred=None, cache_modifier="", eviction_policy="", multicast_targets=[])` **[Hopper+]**
 
    Load a chunk of data from global memory into a local memory buffer using TMA. The global address, strides, and buffer size are defined by the tensor descriptor. A barrier object is provided and signaled upon completion of the operation.
 
@@ -196,11 +196,11 @@ Binary wheels are available for CPython 3.10-3.14.
    - `eviction_policy`: L2 cache eviction policy (`""`, `"evict_first"`, `"evict_last"`)
    - `multicast_targets`: Optional list of multicast targets for cluster-wide loads
 
-- `tlx.async_descriptor_prefetch_tensor(memdesc, [offsets], pred, eviction_policy)`
+- `tlx.async_descriptor_prefetch_tensor(memdesc, [offsets], pred, eviction_policy)` **[Hopper+]**
 
    Hint hardware to load a chunk of data from global memory into a L2 cache to prepare for upcoming `async_descriptor_load` operations.
 
-- `tlx.async_descriptor_store(desc, source, offsets, eviction_policy="", store_reduce="")`
+- `tlx.async_descriptor_store(desc, source, offsets, eviction_policy="", store_reduce="")` **[Hopper+]**
 
    Store a chunk of data from shared memory into global memory using TMA. The global address, strides, and buffer size are defined by the tensor descriptor.
 
@@ -224,7 +224,7 @@ Binary wheels are available for CPython 3.10-3.14.
    ```
 
 
-- `tlx.async_remote_shmem_store(dst, src, remote_cta_rank, barrier)`
+- `tlx.async_remote_shmem_store(dst, src, remote_cta_rank, barrier)` **[Hopper+]**
 
    Store a distributed tensor into a buffer in the remote shared memory of a cluster asynchronously. Signals the provided mbarrier when the store completes.
 
@@ -243,7 +243,7 @@ Binary wheels are available for CPython 3.10-3.14.
    # Store to remote CTA's shared memory
    tlx.async_remote_shmem_store(buffer[0], src_tensor, remote_cta_rank=1, barrier=barrier[0])
    ```
-- `tlx.remote_shmem_copy(dst, src, remote_cta_rank)`
+- `tlx.remote_shmem_copy(dst, src, remote_cta_rank)` **[Hopper+]**
 
   Store a local shared memory buffer into a buffer in the remote shared memory of a cluster asynchronously.
 
@@ -264,7 +264,7 @@ Binary wheels are available for CPython 3.10-3.14.
   tlx.remote_shmem_store(buffer0[0], buffer1[0], remote_cta_rank=1, barrier=barrier[0])
   ```
 
-- `desc_ptrs = tlx.allocate_tensor_descriptor(num)`
+- `desc_ptrs = tlx.allocate_tensor_descriptor(num)` **[Hopper+]**
 
    Allocates global memory for tensor descriptor storage with built-in parameters (nbytes=128, alignment=128 per descriptor).
    Returns a `tensor_descriptor_ptr` with 128-byte stride semantics that supports indexing.
@@ -285,7 +285,7 @@ Binary wheels are available for CPython 3.10-3.14.
    desc_ptr_1 = desc_ptrs[1]  # Second descriptor (128 bytes offset)
    ```
 
-- `tlx.make_tensor_descriptor(desc_ptr, base, shape, strides, block_shape, padding_option)`
+- `tlx.make_tensor_descriptor(desc_ptr, base, shape, strides, block_shape, padding_option)` **[Hopper+]**
 
    Create a TMA (Tensor Memory Accelerator) descriptor for efficient asynchronous data movement on Hopper and Blackwell GPUs.
 
@@ -331,7 +331,7 @@ Binary wheels are available for CPython 3.10-3.14.
    tlx.async_descriptor_load(desc, buffer, offsets=[m_offset, n_offset], barrier=mbar)
    ```
 
-- `desc = tlx.reinterpret_tensor_descriptor(desc_ptr, block_shape, dtype)`
+- `desc = tlx.reinterpret_tensor_descriptor(desc_ptr, block_shape, dtype)` **[Hopper+]**
 
    Reinterpret a tensor descriptor pointer as a TMA-backed tensor descriptor object.
 
@@ -351,18 +351,18 @@ Binary wheels are available for CPython 3.10-3.14.
    tlx.async_descriptor_load(a_desc, buffer, offsets=[offs_m, offs_k], barrier=mbar)
    ```
 
-- `tlx.async_load(tensor_ptr, buffer, optional_mask, optional_other, cache_modifier, eviction_policy, is_volatile)`
+- `tlx.async_load(tensor_ptr, buffer, optional_mask, optional_other, cache_modifier, eviction_policy, is_volatile)` **[Hopper+]**
 
    Load a chunk of data from global memory into a local memory buffer asynchronously.
 
    The operation returns a token object which can be used to track the completion of the operation.
 
 
-- `tlx.async_load_commit_group(tokens)`
+- `tlx.async_load_commit_group(tokens)` **[Hopper+]**
 
    Commits all prior initiated but uncommitted async_load ops an async group. Optionally, each token represents a tracked async load operation.
 
-- `tlx.async_load_wait_group(pendings, tokens)`
+- `tlx.async_load_wait_group(pendings, tokens)` **[Hopper+]**
 
    Wait for completion of prior asynchronous copy operations. The `pendings` argument indicates the number of in-flight operations not completed.
    Optionally, each token represents a tracked async commit group operation.
@@ -370,10 +370,10 @@ Binary wheels are available for CPython 3.10-3.14.
 
 ### Async tensor core operations
 
-- `acc = tlx.async_dot(a[i], b[i], acc)`
-- `acc = tlx.async_dot(a_reg, b[i], acc)`
-- `acc[i] = tlx.async_dot(a[i], b[i], acc[i], barrier)`
-- `acc[i] = tlx.async_dot_scaled(a[i], b[i], acc[i], a_scale[i], a_format, b_scale[i], b_format, use_acc, two_ctas, mBarriers)`
+- `acc = tlx.async_dot(a[i], b[i], acc)` **[Hopper+]**
+- `acc = tlx.async_dot(a_reg, b[i], acc)` **[Hopper]**
+- `acc[i] = tlx.async_dot(a[i], b[i], acc[i], barrier)` **[Blackwell]**
+- `acc[i] = tlx.async_dot_scaled(a[i], b[i], acc[i], a_scale[i], a_format, b_scale[i], b_format, use_acc, two_ctas, mBarriers)` **[Blackwell]**
 
     **Parameters:**
     - `a[i]`: A tile in shared memory (FP8 format)
@@ -445,7 +445,7 @@ Binary wheels are available for CPython 3.10-3.14.
 
     *Copying Scales from SMEM to TMEM:*
 
-    Use `tlx.tmem_copy` to efficiently transfer scale data from shared memory to tensor memory:
+    Use `tlx.tmem_copy` **[Blackwell]** to efficiently transfer scale data from shared memory to tensor memory:
 
     ```python
     # Copy scales from SMEM to TMEM (asynchronous, uses tcgen05.cp instruction)
@@ -496,7 +496,7 @@ Binary wheels are available for CPython 3.10-3.14.
 
     **Note:** Multibuffering is automatically cancelled for scale buffers since TMEM scales don't support multibuffering. 3D allocations (1×M×K) are automatically flattened to 2D (M×K).
 
-- `acc = tlx.async_dot_wait(pendings, acc)`
+- `acc = tlx.async_dot_wait(pendings, acc)` **[Hopper+]**
 
     Wait for completion of prior asynchronous dot operations. The pendings argument indicates the number of in-flight operations not completed.
 
@@ -509,7 +509,7 @@ Binary wheels are available for CPython 3.10-3.14.
 
 ### Barrier operations
 
-- `barriers = tlx.alloc_barrier(num_barriers, arrive_count=1)`
+- `barriers = tlx.alloc_barrier(num_barriers, arrive_count=1)` **[Hopper+]**
 
     Allocates buffer in shared memory and initialize mbarriers with arrive_counts.
 
@@ -517,33 +517,33 @@ Binary wheels are available for CPython 3.10-3.14.
     - `num_barriers`: The number of barriers to allocate.
     - `arrive_counts`: The number of threads that need to arrive at the barrier before it can be released.
 
-- `tlx.barrier_wait(bar, phase)`
+- `tlx.barrier_wait(bar, phase)` **[Hopper+]**
 
     Wait until the mbarrier phase completes
 
-- `tlx.barrier_arrive(bar, arrive_count=1)`
+- `tlx.barrier_arrive(bar, arrive_count=1)` **[Hopper+]**
 
     Perform the arrive operation on an mbarrier
 
-- `tlx.named_barrier_wait(bar_id, num_threads)`
+- `tlx.named_barrier_wait(bar_id, num_threads)` **[Hopper+]**
 
     Wait until `num_threads` threads have reached the specified named mbarrier phase.
 
-- `tlx.named_barrier_arrive(bar_id, num_threads)`
+- `tlx.named_barrier_arrive(bar_id, num_threads)` **[Hopper+]**
 
     Signal arrival at a named mbarrier with the given thread count.
 
-- `tlx.barrier_expect_bytes(bar, bytes)`
+- `tlx.barrier_expect_bytes(bar, bytes)` **[Hopper+]**
 
   Signal a barrier of an expected number of bytes to be copied.
 
-- `tlx.barrier_arrive(bar, arrive_count=1, remote_cta_rank=None)`
+- `tlx.barrier_arrive(bar, arrive_count=1, remote_cta_rank=None)` **[Hopper+]**
 
     Perform the arrive operation on an mbarrier. If `remote_cta_rank` is provided, signals the barrier in the specified remote CTA's shared memory (useful for multi-CTA synchronization).
 
 ### Memory Fences
 
-- `tlx.fence(scope)` issues a memory fence. The `scope` argument is required:
+- `tlx.fence(scope)` **[Hopper+]** issues a memory fence. The `scope` argument is required:
 
   | Scope | PTX | Description |
   |-------|-----|-------------|
@@ -558,7 +558,7 @@ Binary wheels are available for CPython 3.10-3.14.
   tlx.async_descriptor_store(desc, smem_buf, offsets)
   ```
 
-- `tlx.fence_mbarrier_init_cluster(scope)` issues a memory fence to make mbarrier init visible to cluster.
+- `tlx.fence_mbarrier_init_cluster(scope)` **[Hopper+]** issues a memory fence to make mbarrier init visible to cluster.
 
   Example:
   ```python
@@ -572,18 +572,18 @@ Binary wheels are available for CPython 3.10-3.14.
 
 ### Cluster Launch Control (CLC)
 
-CLC (Cluster Launch Control) is a Blackwell-specific feature that enables **dynamic persistent kernel** execution with efficient work stealing across thread blocks. It allows CTAs to dynamically acquire tile IDs from a hardware-managed work queue, enabling load balancing without explicit inter-CTA communication.
+CLC (Cluster Launch Control) is a Blackwell-specific feature **[Blackwell]** that enables **dynamic persistent kernel** execution with efficient work stealing across thread blocks. It allows CTAs to dynamically acquire tile IDs from a hardware-managed work queue, enabling load balancing without explicit inter-CTA communication.
 
 #### CLC API
 
-- `context = tlx.clc_create_context(num_consumers=num_consumers)`
+- `context = tlx.clc_create_context(num_consumers=num_consumers)` **[Blackwell]**
 
     Create a CLC pipeline context with the specified number of stages and expected consumer count.
 
     **Parameters:**
     - `num_consumers`: Number of consumers that will signal completion per tile (typically 3 async tasks × num_CTAs)
 
-- `tlx.clc_producer(context, p_producer=phase, multi_ctas=False)`
+- `tlx.clc_producer(context, p_producer=phase, multi_ctas=False)` **[Blackwell]**
 
     Issue a CLC try_cancel request to acquire a new tile ID.
 
@@ -592,7 +592,7 @@ CLC (Cluster Launch Control) is a Blackwell-specific feature that enables **dyna
     - `phase`: Current barrier phase (0 or 1, alternates each iteration)
     - `multi_ctas`: Set to `True` for 2-CTA mode (cluster of 2 CTAs). When enabled, `pred_cta0` is computed internally from `cluster_cta_rank()`.
 
-- `tile_id = tlx.clc_consumer(context, p_consumer=phase, multi_ctas=False)`
+- `tile_id = tlx.clc_consumer(context, p_consumer=phase, multi_ctas=False)` **[Blackwell]**
 
     Decode the tile ID from a CLC response and signal completion.
 
@@ -722,7 +722,7 @@ Examples: how mbarriers are communicated in warp specialization
 
 ### Warp Specialization operations
 
-- `tlx.async_tasks` and `tlx.async_task`
+- `tlx.async_tasks` and `tlx.async_task` **[Hopper+]**
 
 ```
     with tlx.async_tasks
@@ -831,19 +831,19 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
 
 ### Other operations
 
-- `tlx.cluster_cta_rank()`
+- `tlx.cluster_cta_rank()` **[Hopper+]**
 
   Returns the rank (unique ID) of the current CTA within the cluster.
 
-- `tlx.thread_id(axis)`
+- `tlx.thread_id(axis)` **[Hopper+]**
 
     Returns the id of the current thread instance along the given `axis`.
 
-- `tlx.dtype_of(v)`
+- `tlx.dtype_of(v)` **[Hopper+]**
 
     Returns the dtype of a tensor or tensor descriptor.
 
-- `tlx.size_of(dtype)`
+- `tlx.size_of(dtype)` **[Hopper+]**
 
     Returns the size in bytes of a given Triton dtype. This is useful for dynamically computing memory sizes based on dtype, especially in barrier synchronization code.
 
@@ -857,7 +857,7 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
                            tlx.size_of(tlx.dtype_of(desc)) * BLOCK_M * BLOCK_K)
     ```
 
-- `tlx.clock64()`
+- `tlx.clock64()` **[Hopper+]**
 
     Returns the current 64-bit hardware clock value. E.g,
     ```
@@ -867,7 +867,7 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
         elapsed = end - start  # Number of clock cycles elapsed
     ```
 
-- `tlx.stoch_round(src, dst_dtype, rand_bits)`
+- `tlx.stoch_round(src, dst_dtype, rand_bits)` **[Blackwell]**
 
     Performs hardware-accelerated stochastic rounding for FP32→FP8/BF16/F16 conversions on Blackwell GPUs (compute capability ≥ 100). Uses PTX `cvt.rs.satfinite` instructions for probabilistic rounding.
 
@@ -901,7 +901,7 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
         y = tlx.stoch_round(x, tlx.dtype_of(y_ptr), rbits)
     ```
 
-- `tlx.vote_ballot_sync(mask, pred)`
+- `tlx.vote_ballot_sync(mask, pred)` **[Hopper+]**
 
     Collects a predicate from each thread in the warp and returns a 32-bit
     mask where each bit represents the predicate value from the corresponding
@@ -910,7 +910,7 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
         ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
     ```
 
-- `tlx.prefetch(pointer, level="L2", mask=None, tensormap=False)` issues a non-blocking prefetch hint for pointer-based scattered/gather loads. This complements `tlx.async_descriptor_prefetch_tensor` (which works on TMA tensor descriptors) by supporting raw pointer tensors.
+- `tlx.prefetch(pointer, level="L2", mask=None, tensormap=False)` **[Hopper+]** issues a non-blocking prefetch hint for pointer-based scattered/gather loads. This complements `tlx.async_descriptor_prefetch_tensor` (which works on TMA tensor descriptors) by supporting raw pointer tensors.
   Additionally, if `tensormap` is specified to `True`, the API instead does a prefetch of tensor map object (TMA descriptor) and ignores other parameters other than `pointer`.
 
   | Level | PTX | Description |
@@ -1002,3 +1002,5 @@ By default only one autotune config will be used by correctness test.
 [TLX talk in 2025 Triton Developer Conference](third_party/tlx/doc/TLX-triton-conference.pdf)
 
 [TLX talk in 2026 GPU Mode](third_party/tlx/doc/PerformanceOptimizationWithTLX.pdf)
+
+[TLX paper](https://arxiv.org/abs/2605.10905)
