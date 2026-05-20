@@ -932,12 +932,12 @@ tt.func private @subslice_16x32bx2_interleaved_block0_offset(%arg0: !ttg.memdesc
 }
 
 // CHECK-LABEL: @subslice_16x32bx2_interleaved_block4_offset
-tt.func private @subslice_16x32bx2_interleaved_block4_offset(%arg0: !ttg.memdesc<64x128xf32, #bm64_bn32, #tmem>) -> !ttg.memdesc<64x16xf32, #bm64_bn16, #tmem, 64x128> {
+tt.func private @subslice_16x32bx2_interleaved_block4_offset(%arg0: !ttg.memdesc<64x256xf32, #bm64_bn32, #tmem>) -> !ttg.memdesc<64x16xf32, #bm64_bn16, #tmem, 64x256> {
   // CHECK: [[OFFSET:%.*]] = llvm.mlir.constant(80 : i32)
   // CHECK: [[PTR:%.*]] = llvm.ptrtoint
   // CHECK: llvm.add [[PTR]], [[OFFSET]]
-  %0 = ttng.tmem_subslice %arg0 {N = 144 : i32} : !ttg.memdesc<64x128xf32, #bm64_bn32, #tmem> -> !ttg.memdesc<64x16xf32, #bm64_bn16, #tmem, 64x128>
-  tt.return %0 : !ttg.memdesc<64x16xf32, #bm64_bn16, #tmem, 64x128>
+  %0 = ttng.tmem_subslice %arg0 {N = 144 : i32} : !ttg.memdesc<64x256xf32, #bm64_bn32, #tmem> -> !ttg.memdesc<64x16xf32, #bm64_bn16, #tmem, 64x256>
+  tt.return %0 : !ttg.memdesc<64x16xf32, #bm64_bn16, #tmem, 64x256>
 }
 
 }

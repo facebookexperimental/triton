@@ -3,6 +3,7 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -36,13 +37,6 @@ configs = [
         pre_hook=_host_descriptor_pre_hook,
     ),
 ]
-
-
-@triton.jit
-def _get_bufidx_phase(accum_cnt, NUM_BUFFERS_KV):
-    bufIdx = accum_cnt % NUM_BUFFERS_KV
-    phase = (accum_cnt // NUM_BUFFERS_KV) & 1
-    return bufIdx, phase
 
 
 @triton.jit
@@ -137,7 +131,7 @@ def _attn_fwd_ws(sm_scale, M,  #
             phase = 0
 
             for _ in tl.range(lo, hi, BLOCK_N):
-                buf_idx, phase = _get_bufidx_phase(accum_cnt, NUM_BUFFERS_QK)
+                buf_idx, phase = get_bufidx_phase(accum_cnt, NUM_BUFFERS_QK)
                 for cid in tl.range(0, NUM_MMA_GROUPS, loop_unroll_factor=NUM_MMA_GROUPS):
                     buf_idx_2 = buf_idx + cid * NUM_BUFFERS_QK
 
@@ -187,7 +181,7 @@ def _attn_fwd_ws(sm_scale, M,  #
             accum_cnt_qk = 0
             cid = tlx.async_task_replica_id()
             for _ in tl.range(lo, hi, BLOCK_N):
-                qk_bufIdx, qk_phase = _get_bufidx_phase(accum_cnt_qk, NUM_BUFFERS_QK)
+                qk_bufIdx, qk_phase = get_bufidx_phase(accum_cnt_qk, NUM_BUFFERS_QK)
                 qk_bufIdx += cid * NUM_BUFFERS_QK
 
                 tlx.barrier_wait(qk_fulls[qk_bufIdx], qk_phase)
@@ -237,14 +231,14 @@ def _attn_fwd_ws(sm_scale, M,  #
             accum_cnt_kv = 0
             accum_cnt_qk = 0
             for i in tl.range(lo, hi, BLOCK_N):
-                k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
-                v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
+                k_bufIdx, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
+                v_bufIdx, v_phase = get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
 
                 # -- compute q @ k ----
                 # wait for the K buffer to be populated by the producer
                 tlx.barrier_wait(kv_fulls[k_bufIdx], k_phase)
                 k_tile = tlx.local_trans(kv_tiles[k_bufIdx])
-                qk_bufIdx, qk_phase = _get_bufidx_phase(accum_cnt_qk, NUM_BUFFERS_QK)
+                qk_bufIdx, qk_phase = get_bufidx_phase(accum_cnt_qk, NUM_BUFFERS_QK)
                 for cid in tl.range(0, NUM_MMA_GROUPS, loop_unroll_factor=NUM_MMA_GROUPS):
                     qk_bufIdx_2 = qk_bufIdx + cid * NUM_BUFFERS_QK
                     if cid == NUM_MMA_GROUPS - 1:
@@ -307,7 +301,7 @@ def _attn_fwd_ws(sm_scale, M,  #
             # loop over loading k, v
             accum_cnt_kv = 0
             for _ in tl.range(lo, hi, BLOCK_N):
-                k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
+                k_bufIdx, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
                 # wait for the K buffer to be released by the consumer
                 k_empty = tlx.local_view(kv_empties, k_bufIdx)
                 tlx.barrier_wait(k_empty, k_phase ^ 1)
@@ -317,7 +311,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                 tlx.barrier_expect_bytes(k_full, 2 * BLOCK_N * HEAD_DIM)  # float16
                 tlx.async_descriptor_load(desc_k, k_tile, [kv_offset_y, 0], k_full)
 
-                v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
+                v_bufIdx, v_phase = get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
                 # wait for the V buffer to be released by the consumer
                 v_empty = tlx.local_view(kv_empties, v_bufIdx)
                 tlx.barrier_wait(v_empty, v_phase ^ 1)

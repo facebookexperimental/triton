@@ -121,7 +121,7 @@ tt.func @fits_after_shrink(%arg0: i32) {
 
 // CHECK-LABEL: @register_use_heuristic
 tt.func @register_use_heuristic() {
-  // CHECK: requestedRegisters = array<i32: 24, 88>
+  // CHECK: requestedRegisters = array<i32: 24, -1>
   ttg.warp_specialize()
   default {
     ttg.warp_yield

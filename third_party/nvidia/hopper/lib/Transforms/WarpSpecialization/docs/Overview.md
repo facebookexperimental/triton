@@ -63,8 +63,8 @@ an earlier partition scheduling pass (`PartitionSchedulingMeta`).
 | `TaskIdPropagation.h` | `TaskId` lattice, `TaskIdLattice`, `TaskIdBackwardPropagation` analysis |
 | `CodePartitionUtility.h` | `Channel`, `ChannelPost`, `TmemDataChannel`, `TmemDataChannelPost`, `ReuseGroup`, `ReuseConfig`, `CommChannel` |
 | `TMEMUtils.h` | `TMEM1DAllocator`, `sliceAndReinterpretMDTMEM`, `createTMEMDesc` |
-| `WSBarrierAnalysis.h` | `WSBarrierAttr`, `buildChannelGraph`, `injectChannelGraph` — channel graph construction for barrier constraints |
-| `nvidia/hopper/include/Transforms/WSBarrierReorder.h` | `canAdvanceWSBarrier`, `sinkWSArrives`, `raiseWSWaits`, `buildBarrierToMemoryOpMap`, `optimizeWSBarrierLocations` — barrier reordering utilities consumed by `InterleaveTMem` |
+| `WSBarrierAnalysis.h` | `WSBarrierAttr`, `buildChannelGraph`, `buildWSBarrierOrderedRegionRanges`, `injectChannelGraph` — channel graph and ordered-region construction for barrier constraints |
+| `nvidia/hopper/include/Transforms/WSBarrierReorder.h` | `canAdvanceWSBarrier`, `canAdvanceWSBarrierArrivePastWait`, `sinkWSArrives`, `raiseWSWaits`, `buildBarrierToMemoryOpMap`, `optimizeWSBarrierLocations` — barrier reordering utilities consumed by `InterleaveTMem` |
 
 ## Glossary
 
@@ -95,6 +95,8 @@ an earlier partition scheduling pass (`PartitionSchedulingMeta`).
 - [TMEM Allocation Heuristics](TMEMAllocationHeuristics.md) — TMEM memory planning algorithms
 - [SMEM Allocation Design](SmemAllocationDesign.md) — SMEM budget-aware allocation
 - [Barrier Fusion](BarrierFusion.md) — TMA fusion, tcgen05_commit combining
+- [Barrier Constraints](BarrierConstraints.md) — generic barrier constraints and WSBarrier reordering metadata
+- [WS Barrier Ordered Region Tracking](WSBarrierOrderedRegionTracking.md) — V2 ordered-region metadata for overlapping channel graphs
 - [Reuse Groups](ReuseGroups.md) — buffer sharing mechanics
 - [Ping-Pong Scheduling](PingPongScheduling.md) — named barrier insertion for expensive ops
 - [Utilities](Utilities.md) — `OpBuilderWithAsyncTaskIds`, task ID helpers, location utilities

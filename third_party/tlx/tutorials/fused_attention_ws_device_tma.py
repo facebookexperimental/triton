@@ -4,7 +4,8 @@ import torch
 
 import triton
 import triton.language as tl
-from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2
+from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _reduce_fadd2
+from triton.language.extra.subtile_ops import _split_n_2D
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -239,47 +240,6 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
         return desc_or_ptr
     else:
         return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
-
-
-@triton.jit
-def _fma_f32x2(a, b, c):
-    return tl.inline_asm_elementwise(
-        """
-        {
-            .reg .b64 ra, rb, rc, rd;
-            mov.b64 ra, { $2, $3 };
-            mov.b64 rb, { $4, $5 };
-            mov.b64 rc, { $6, $7 };
-            fma.rn.f32x2 rd, ra, rb, rc;
-            mov.b64 { $0, $1 }, rd;
-        }
-        """,
-        "=r,=r,r,r,r,r,r,r",
-        [a, b, c],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=2,
-    )
-
-
-@triton.jit
-def _reduce_fadd2(p0a, p1a, p0b, p1b):
-    return tl.inline_asm_elementwise(
-        """
-        {
-            .reg .b64 rc, ra, rb;
-            mov.b64 ra, { $2, $4 };
-            mov.b64 rb, { $3, $5 };
-            add.f32x2 rc, ra, rb;
-            mov.b64 { $0, $1 }, rc;
-        }
-        """,
-        "=r,=r,r,r,r,r",
-        [p0a, p0b, p1a, p1b],
-        dtype=[tl.float32, tl.float32],
-        is_pure=True,
-        pack=1,
-    )
 
 
 @triton.jit
@@ -589,15 +549,6 @@ def torch_dtype_to_triton(dtype):
 
 
 @triton.jit
-def _split_n(x, SPLIT_FACTOR: tl.constexpr):
-    if SPLIT_FACTOR == 1:
-        return (x, )
-    else:
-        x0, x1 = x.reshape([x.shape[0], 2, x.shape[1] // 2]).permute(0, 2, 1).split()
-        return _split_n(x0, SPLIT_FACTOR // 2) + _split_n(x1, SPLIT_FACTOR // 2)
-
-
-@triton.jit
 def _attn_bwd_preprocess(O, DO,  #
                          Delta,  #
                          Z, H, N_CTX,  #
@@ -756,7 +707,7 @@ def _attn_bwd_dkdv_inner(
     else:
         dk += tl.dot(dsT, tl.trans(qT))
         dq = tl.dot(tl.trans(dsT), k)
-    dqs = _split_n(dq, EPILOGUE_SUBTILE)
+    dqs = _split_n_2D(dq, EPILOGUE_SUBTILE)
     slice_size: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
     for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
         dqN = dqs[slice_id] * LN2
@@ -1063,7 +1014,7 @@ def _attn_bwd_core(
         BWD_DOT_ATTRS=BWD_DOT_ATTRS,
     )
 
-    dvs = _split_n(dv, EPILOGUE_SUBTILE)
+    dvs = _split_n_2D(dv, EPILOGUE_SUBTILE)
     slice_size: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
     for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
         dvN = dvs[slice_id]
@@ -1072,7 +1023,7 @@ def _attn_bwd_core(
             dvN.to(dtype),
         )
 
-    dks = _split_n(dk, EPILOGUE_SUBTILE)
+    dks = _split_n_2D(dk, EPILOGUE_SUBTILE)
     for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
         dkN = dks[slice_id] * sm_scale
         desc_dk.store(

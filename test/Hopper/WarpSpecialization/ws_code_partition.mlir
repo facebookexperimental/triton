@@ -5,14 +5,34 @@
 // CHECK: default
 // CHECK: scf.for
 // CHECK: nvws.producer_acquire
+// CHECK-SAME: channelGraph = array<i32: 1>
+// CHECK-SAME: dstTask = 1 : i32
+// CHECK-SAME: maxRegionId = 2 : i32
+// CHECK-SAME: minRegionId = 2 : i32
+// CHECK-SAME: parentId = [[WS_PARENT:[0-9]+]] : i32
 // CHECK: ttg.async_copy_global_to_local
 // CHECK: ttg.async_copy_global_to_local
 // CHECK: nvws.producer_commit
+// CHECK-SAME: channelGraph = array<i32: 1>
+// CHECK-SAME: dstTask = 1 : i32
+// CHECK-SAME: maxRegionId = 1 : i32
+// CHECK-SAME: minRegionId = 1 : i32
+// CHECK-SAME: parentId = [[WS_PARENT]] : i32
 // CHECK: partition0
 // CHECK: nvws.consumer_wait
+// CHECK-SAME: channelGraph = array<i32: 0>
+// CHECK-SAME: dstTask = 0 : i32
+// CHECK-SAME: maxRegionId = 1 : i32
+// CHECK-SAME: minRegionId = 1 : i32
+// CHECK-SAME: parentId = [[WS_PARENT]] : i32
 // CHECK: ttg.local_load
 // CHECK: ttg.local_load
 // CHECK: nvws.consumer_release
+// CHECK-SAME: channelGraph = array<i32: 0>
+// CHECK-SAME: dstTask = 0 : i32
+// CHECK-SAME: maxRegionId = 2 : i32
+// CHECK-SAME: minRegionId = 2 : i32
+// CHECK-SAME: parentId = [[WS_PARENT]] : i32
 // CHECK: tt.dot
 
 
