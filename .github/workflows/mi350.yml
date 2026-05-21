@@ -49,6 +49,7 @@ jobs:
     runs-on: linux-fb-triton-mi350-1
     env:
       WORKSPACE_DIR: /workspace
+      CONDA_ENV: pytorch
       UV_VENV_DIR: /workspace/uv_venvs
       SETUP_SCRIPT: /workspace/setup_instance.sh
     timeout-minutes: 30
