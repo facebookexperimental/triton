@@ -51,6 +51,7 @@ def _setup_bwd_inputs(shape, sm_scale, dtype):
     desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
     desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
     desc_o = TensorDescriptor(o, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+    desc_m = TensorDescriptor(M, shape=[y_dim], strides=[1], block_shape=[1])
     desc_q_scale = TensorDescriptor.from_tensor(q_scale, block_shape=dummy_5d)
     desc_k_scale = TensorDescriptor.from_tensor(k_scale, block_shape=dummy_5d)
     desc_v_scale = TensorDescriptor.from_tensor(v_scale, block_shape=dummy_5d)
@@ -61,6 +62,7 @@ def _setup_bwd_inputs(shape, sm_scale, dtype):
         "desc_k": desc_k,
         "desc_v": desc_v,
         "desc_o": desc_o,
+        "desc_m": desc_m,
         "desc_q_scale": desc_q_scale,
         "desc_k_scale": desc_k_scale,
         "desc_v_scale": desc_v_scale,
@@ -76,7 +78,7 @@ def _setup_bwd_inputs(shape, sm_scale, dtype):
     grid = (min(num_sms, triton.cdiv(N_CTX, fwd_config["BLOCK_M"]) * Z * H), 1, 1)
     _attn_fwd_mxf8_ws.fn[grid](
         sm_scale,
-        M,
+        desc_m,
         Z,
         H,
         desc_q,
