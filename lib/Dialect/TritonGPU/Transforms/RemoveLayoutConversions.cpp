@@ -1857,6 +1857,78 @@ public:
     });
   }
 
+  // Prune a store-only layout conversion through a non-reordering reshape:
+  //
+  //   local_store(reshape(convert_layout(x)), dst)
+  //
+  // becomes:
+  //
+  //   local_store(reshape(x), dst)
+  //
+  // This is intentionally narrow and runs after layout decisions have already
+  // been made. The rewrite relies on local_store being a layout-flexible sink:
+  // the source register encoding may change, but the destination memdesc still
+  // defines the logical memory layout.
+  bool pruneLocalStoreOfReshapeConvert(ModuleOp m) {
+    SmallVector<LocalStoreOp> stores;
+    m.walk([&](LocalStoreOp store) { stores.push_back(store); });
+
+    bool changed = false;
+    IRRewriter rewriter(m.getContext());
+    for (LocalStoreOp store : stores) {
+      auto reshape = store.getSrc().getDefiningOp<ReshapeOp>();
+      if (!reshape || reshape.getAllowReorder())
+        continue;
+      if (!reshape.getResult().hasOneUse())
+        continue;
+
+      auto convert = reshape.getSrc().getDefiningOp<ConvertLayoutOp>();
+      if (!convert || !convert.getResult().hasOneUse())
+        continue;
+
+      auto srcType = dyn_cast<RankedTensorType>(convert.getSrc().getType());
+      auto storeSrcType = dyn_cast<RankedTensorType>(store.getSrc().getType());
+      if (!srcType || !storeSrcType || !srcType.getEncoding())
+        continue;
+      if (srcType.getElementType() != storeSrcType.getElementType())
+        continue;
+      if (srcType.getNumElements() != storeSrcType.getNumElements())
+        continue;
+
+      Attribute reshapeEncoding;
+      auto *layoutInterface = dyn_cast<DialectInferLayoutInterface>(
+          &srcType.getEncoding().getDialect());
+      if (!layoutInterface)
+        continue;
+      if (failed(layoutInterface->inferReshapeOpEncoding(
+              srcType.getShape(), srcType.getEncoding(),
+              storeSrcType.getShape(), reshapeEncoding, store.getLoc())))
+        continue;
+
+      auto reshapeType =
+          RankedTensorType::get(storeSrcType.getShape(),
+                                storeSrcType.getElementType(), reshapeEncoding);
+      rewriter.setInsertionPoint(store);
+      auto newReshape = ReshapeOp::create(
+          rewriter, reshape.getLoc(), reshapeType, convert.getSrc(),
+          reshape.getAllowReorder(), reshape.getEfficientLayout());
+      LocalStoreOp::create(rewriter, store.getLoc(), newReshape.getResult(),
+                           store.getDst());
+      rewriter.eraseOp(store);
+      rewriter.eraseOp(reshape);
+      rewriter.eraseOp(convert);
+      changed = true;
+    }
+
+    if (changed) {
+      LLVM_DEBUG({
+        DBGS() << "Module after pruning store-only reshape converts:\n";
+        m.dump();
+      });
+    }
+    return changed;
+  }
+
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     ModuleOp m = getOperation();
@@ -1913,6 +1985,8 @@ public:
       DBGS() << "Module after final cleanups:\n";
       m.dump();
     });
+
+    pruneLocalStoreOfReshapeConvert(m);
 
     // 5. Budget-aware convert elimination. If smemBudget is set, find remaining
     // convert_layout ops whose scratch would push SMEM over budget, and try to

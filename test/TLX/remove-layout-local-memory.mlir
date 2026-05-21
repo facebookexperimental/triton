@@ -23,6 +23,39 @@ tt.func @local_load_coalesce(%arg0: !ttg.memdesc<128x64xf16, #shared, #smem>, %a
 
 // -----
 
+// Test that a store-only conversion through a non-reordering reshape is pruned:
+//
+//   local_store(reshape(convert_layout(x)), dst)
+//
+// becomes:
+//
+//   local_store(reshape(x), dst)
+//
+// CHECK-LABEL: @local_store_reshape_convert
+// CHECK-SAME: %[[ARG:.*]]: tensor<32x4x32xf32, #[[$SRC:.*]]>
+// CHECK-NOT: ttg.convert_layout
+// CHECK: %[[RESHAPE:.*]] = tt.reshape %[[ARG]] : tensor<32x4x32xf32, #[[$SRC]]> -> tensor<32x128xf32, #[[$DIRECT:.*]]>
+// CHECK-NEXT: ttg.local_store %[[RESHAPE]], %{{.*}} : tensor<32x128xf32, #[[$DIRECT]]> -> !ttg.memdesc<32x128xf32, #{{.*}}, #{{.*}}, mutable>
+// CHECK-NEXT: tt.return
+
+#linear_src = #ttg.linear<{register = [[1, 0, 0], [0, 0, 8], [8, 0, 0], [16, 0, 0], [0, 0, 16]], lane = [[2, 0, 0], [4, 0, 0], [0, 0, 1], [0, 0, 2], [0, 0, 4]], warp = [[0, 1, 0], [0, 2, 0]], block = []}>
+#linear_cvt = #ttg.linear<{register = [[1, 0, 0], [8, 0, 0], [16, 0, 0], [0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8], [0, 0, 16]], lane = [[2, 0, 0], [4, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]], warp = [[0, 1, 0], [0, 2, 0]], block = []}>
+#linear_cvt_flat = #ttg.linear<{register = [[1, 0], [8, 0], [16, 0], [0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], lane = [[2, 0], [4, 0], [0, 0], [0, 0], [0, 0]], warp = [[0, 32], [0, 64]], block = []}>
+#shared_store = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
+#smem_store = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, ttg.target = "cuda:100"} {
+  tt.func @local_store_reshape_convert(
+      %arg0: tensor<32x4x32xf32, #linear_src>,
+      %arg1: !ttg.memdesc<32x128xf32, #shared_store, #smem_store, mutable>) {
+    %cvt = ttg.convert_layout %arg0 : tensor<32x4x32xf32, #linear_src> -> tensor<32x4x32xf32, #linear_cvt>
+    %reshape = tt.reshape %cvt : tensor<32x4x32xf32, #linear_cvt> -> tensor<32x128xf32, #linear_cvt_flat>
+    ttg.local_store %reshape, %arg1 : tensor<32x128xf32, #linear_cvt_flat> -> !ttg.memdesc<32x128xf32, #shared_store, #smem_store, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 // Test layout conflict resolution when both tmem_load and local_load are in the
 // same kernel with different layouts. The pass should prefer TMEM's layout with
 // larger sizePerThread ([1, 128], score=128) for better memory access efficiency.
