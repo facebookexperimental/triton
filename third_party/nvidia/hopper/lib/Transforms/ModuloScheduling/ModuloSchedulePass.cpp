@@ -1417,6 +1417,67 @@ struct ScheduledLoop {
 };
 
 // ============================================================================
+// Loop discovery
+// ============================================================================
+
+/// A scf::ForOp candidate for modulo scheduling, with its nesting context
+/// and raw direct-body flags. Built once via `collectCandidates` so the rest
+/// of Pass A can iterate without re-walking the module.
+///
+/// This is intentionally a flag bag rather than a tagged enum: a loop may
+/// simultaneously carry direct compute AND wrap inner loops (e.g. an outer
+/// loop that does a few non-tiling ops then enters a K-loop), and the
+/// scheduling decision belongs to the caller, not to this struct. Each call
+/// site filters on whichever combination of flags it cares about.
+struct CandidateLoop {
+  scf::ForOp op;
+  scf::ForOp parent;          // null op if outermost
+  unsigned depth{0};          // 0 = outermost
+  bool hasMMA{false};         // direct body has tcgen5_mma{,Scaled}
+  bool hasTMA{false};         // direct body has descriptor_load / async TMA copy
+  bool hasInnerLoop{false};   // direct body has a nested scf::ForOp
+  bool hasExistingAnnotation{false}; // tt.autows on an MMA — user-tuned, skip
+};
+
+/// Walk `moduleOp` once and collect every `scf::ForOp` with its nesting
+/// context and direct-body flags.
+///
+/// CONTRACT: the result is sorted by `depth` non-increasing (deepest first).
+/// This is a load-bearing guarantee — Pass A iterates the result in that
+/// order and relies on every nested loop being scheduled before its
+/// parent, because the parent's DDG promotes the child to a super-node
+/// whose `innerII` field is the child's just-computed II. Use
+/// `stable_sort` so loops at the same depth keep their source-order
+/// relative position (deterministic across builds).
+static SmallVector<CandidateLoop> collectCandidates(ModuleOp moduleOp) {
+  SmallVector<CandidateLoop> result;
+  moduleOp.walk([&](scf::ForOp loop) {
+    CandidateLoop c;
+    c.op = loop;
+    c.parent = loop->getParentOfType<scf::ForOp>();
+    for (auto p = c.parent; p; p = p->getParentOfType<scf::ForOp>())
+      ++c.depth;
+    for (auto &op : loop.getBody()->without_terminator()) {
+      if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp,
+              ttng::AsyncTMACopyGlobalToLocalOp>(&op))
+        c.hasTMA = true;
+      if (isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp>(&op)) {
+        c.hasMMA = true;
+        if (op.hasAttr("tt.autows"))
+          c.hasExistingAnnotation = true;
+      }
+      if (isa<scf::ForOp>(&op))
+        c.hasInnerLoop = true;
+    }
+    result.push_back(c);
+  });
+  llvm::stable_sort(result, [](const auto &a, const auto &b) {
+    return a.depth > b.depth;
+  });
+  return result;
+}
+
+// ============================================================================
 // Pass A: Modulo Scheduling
 // ============================================================================
 
@@ -1494,34 +1555,34 @@ struct ModuloSchedulePass
       LDBG("=== Iterative scheduling: iteration " << iteration << " ===");
       scheduledLoops.clear();
 
-      SmallVector<std::pair<scf::ForOp, unsigned>> loopsWithDepth;
-      moduleOp.walk([&](scf::ForOp loop) {
-        bool hasSchedulableOps = false;
-        loop->walk([&](Operation *op) {
-          if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp,
-                  ttng::AsyncTMACopyGlobalToLocalOp, ttng::TCGen5MMAOp,
-                  ttng::TCGen5MMAScaledOp>(op))
-            hasSchedulableOps = true;
-        });
-        if (!hasSchedulableOps)
+      // Discover schedulable loops in a single walk and sort by depth
+      // (deepest first), so an inner K-loop is scheduled before the
+      // outer tile loop that promotes it to a super-node.
+      auto candidates = collectCandidates(moduleOp);
+
+      // 2-level nesting cap: the prologue expansion, super-node DDG, and
+      // outer-loop pipelining all assume at most a depth-2 nest. Refuse
+      // anything deeper rather than silently mis-scheduling.
+      for (const auto &c : candidates) {
+        if (c.depth >= 2) {
+          c.op->emitError("modulo schedule: loop nesting depth >= 2 is not "
+                          "supported (this loop is at depth ")
+              << c.depth << ")";
+          signalPassFailure();
           return;
-        unsigned depth = 0;
-        for (auto parent = loop->getParentOfType<scf::ForOp>(); parent;
-             parent = parent->getParentOfType<scf::ForOp>())
-          ++depth;
-        loopsWithDepth.push_back({loop, depth});
-      });
-      llvm::sort(loopsWithDepth, [](const auto &a, const auto &b) {
-        return a.second < b.second;
-      });
+        }
+      }
 
-      LDBG("Found " << loopsWithDepth.size() << " schedulable loop(s)");
+      LDBG("Found " << candidates.size() << " schedulable loop(s)");
 
-      for (auto &[loop, depth] : loopsWithDepth) {
-        auto result = scheduleOneLoop(loop, model, "Loop");
+      for (const auto &c : candidates) {
+        // Skip loops with no schedulable work and no inner loop to promote.
+        if (!c.hasMMA && !c.hasTMA && !c.hasInnerLoop)
+          continue;
+        auto result = scheduleOneLoop(c.op, model, "Loop");
         if (result) {
           scheduledLoops.push_back(
-              {loop, std::move(result->graph), std::move(result->ddg)});
+              {c.op, std::move(result->graph), std::move(result->ddg)});
         }
       }
 
