@@ -1919,6 +1919,8 @@ public:
     // eliminate them by propagating the source encoding through their users.
     if (smemBudget > 0) {
       eliminateOverBudgetConverts(m);
+      hoistConvert(m);
+      cleanupConvertOps();
     }
   }
 
