@@ -495,11 +495,10 @@ static unsigned computeBufferCount(const ttg::ScheduleLoop &loop,
     if (edge.srcId != producerNodeId)
       continue;
     const auto &consumer = loop.getNode(edge.dstId);
-    // Consumer hold time: use selfLatency (pipeline occupancy) when
-    // available, falling back to latency (result-ready time). This
-    // matches computeBufferLifetimes so that count and lifetime are
-    // computed consistently.
-    int hold = consumer.selfLatency ? consumer.selfLatency : consumer.latency;
+    // Consumer hold time: use full latency (time until consumer finishes
+    // reading the buffer). Per design doc: "Last consumer finishes reading
+    // at: schedule[c][0] + latencies[c]".
+    int hold = consumer.latency;
     int consumerEnd = consumer.cycle + hold + edge.distance * II;
     lastConsumerEnd = std::max(lastConsumerEnd, consumerEnd);
   }
@@ -678,7 +677,7 @@ static int computeBufferLifetime(const ttg::ScheduleLoop &loop,
     if (edge.srcId != producerNodeId)
       continue;
     const auto &consumer = loop.getNode(edge.dstId);
-    int holdTime = std::max(consumer.selfLatency, consumer.latency);
+    int holdTime = consumer.latency;
     int end = consumer.cycle + holdTime + edge.distance * loop.II;
     lastConsumerEnd = std::max(lastConsumerEnd, end);
   }
@@ -1047,10 +1046,9 @@ static void computeBufferLifetimes(ttg::ScheduleLoop &loop) {
         if (edge.srcId != node.id)
           continue;
         const auto &consumer = loop.getNode(edge.dstId);
-        // Use selfLatency (occupancy) over latency (result-ready) for
-        // the consumer's hold time on the resource.
-        int hold =
-            consumer.selfLatency ? consumer.selfLatency : consumer.latency;
+        // Use full latency (time until consumer finishes reading).
+        // Matches computeBufferCount so count and lifetime agree.
+        int hold = consumer.latency;
         int end =
             consumer.cycle + hold + static_cast<int>(edge.distance) * loop.II;
         lastEnd = std::max(lastEnd, end);

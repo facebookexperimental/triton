@@ -1,8 +1,10 @@
 // (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
 #include "DataDependenceGraph.h"
+#include "ModuloReservationTable.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -53,11 +55,43 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
   for (auto &op : body) {
     if (op.hasTrait<OpTrait::IsTerminator>())
       continue;
-    // Skip inner scf.for loops — this DDG handles flat loop bodies only.
-    // Inner loop super-node modeling is added in a follow-up diff for
-    // outer loop (persistent kernel) scheduling.
-    if (isa<scf::ForOp>(op))
+    // Inner scf.for loops become super-nodes. The super-node's latency
+    // is the inner loop's total execution time (II × trip_count), and
+    // its pipeline is NONE (handles its own internal pipelining).
+    if (auto innerLoop = dyn_cast<scf::ForOp>(op)) {
+      auto innerDDG = DataDependenceGraph::build(innerLoop, model);
+      auto innerSched = runModuloScheduling(innerDDG);
+
+      DDGNode node;
+      node.op = &op;
+      node.idx = ddg.nodes.size();
+      node.isSuperNode = true;
+
+      if (succeeded(innerSched)) {
+        node.innerII = innerSched->II;
+        int tripCount = 32; // default estimate
+        auto lb = innerLoop.getLowerBound()
+                      .getDefiningOp<arith::ConstantIntOp>();
+        auto ub = innerLoop.getUpperBound()
+                      .getDefiningOp<arith::ConstantIntOp>();
+        auto step = innerLoop.getStep()
+                        .getDefiningOp<arith::ConstantIntOp>();
+        if (lb && ub && step && step.value() > 0)
+          tripCount = (ub.value() - lb.value() + step.value() - 1) /
+                      step.value();
+        node.latency = innerSched->II * tripCount;
+        node.selfLatency = 0;
+        node.pipeline = HWPipeline::NONE;
+      } else {
+        node.selfLatency = 10000;
+        node.latency = 10000;
+        node.pipeline = HWPipeline::TC;
+      }
+
+      ddg.nodes.push_back(node);
+      ddg.opToIdx[&op] = node.idx;
       continue;
+    }
     ddg.addNode(&op, model);
   }
 
@@ -108,15 +142,10 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
       auto userIt = ddg.opToIdx.find(user);
       if (userIt == ddg.opToIdx.end())
         continue;
-      // For async ops (TC, MEM), the loop-carried recurrence latency
-      // is the issue cost (selfLatency), not the full execution time.
-      // The hardware pipelines successive iterations internally — e.g.,
-      // tcgen05.mma with useAcc=true pipelines accumulator updates in
-      // TMEM, so the next MMA can issue after the dispatch cost.
+      // Loop-carried back-edge uses full latency so RecMII reflects
+      // the true recurrence depth. For MMA with accumulator, the next
+      // iteration can't read the result until the current MMA completes.
       int backEdgeLat = ddg.nodes[srcIdx].latency;
-      if (ddg.nodes[srcIdx].pipeline == HWPipeline::TC ||
-          ddg.nodes[srcIdx].pipeline == HWPipeline::MEM)
-        backEdgeLat = ddg.nodes[srcIdx].selfLatency;
       ddg.addEdge(srcIdx, userIt->second, backEdgeLat,
                   /*distance=*/1);
     }
@@ -264,8 +293,16 @@ int DataDependenceGraph::computeRecMII() const {
 int DataDependenceGraph::computeMinII() const {
   int resMII = computeResMII();
   int recMII = computeRecMII();
-  int minII = std::max(resMII, recMII);
+  // Super-node latency is a hard lower bound: one outer iteration can't
+  // finish faster than its inner loop. Without this, II is too small
+  // and the schedule produces hundreds of stages.
+  int superNodeII = 0;
+  for (const auto &node : nodes)
+    if (node.isSuperNode)
+      superNodeII = std::max(superNodeII, node.latency);
+  int minII = std::max({resMII, recMII, superNodeII});
   LLVM_DEBUG(llvm::dbgs() << "[DDG] ResMII=" << resMII << " RecMII=" << recMII
+                          << " SuperNodeII=" << superNodeII
                           << " MinII=" << minII << "\n");
   return minII;
 }
