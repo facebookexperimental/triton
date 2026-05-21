@@ -39,6 +39,34 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CHECK: ttng.tmem_load {{.*}} ttg.partition = array<i32: [[COMP_A:[0-9]+]]>
 // CHECK: ttng.tmem_load {{.*}} ttg.partition = array<i32: [[COMP_B:[0-9]+]]>
 //
+// --- Split scf.if: the condition and else-yield operands defined outside the
+//     scf.if must NOT have a ttg.partition attribute. If they keep partition 0
+//     (from the original shared scf.if), doTaskIdPropagate expands the split
+//     scf.if's task set to include partition 0, creating a cross-partition
+//     SMEM channel that overflows shared memory. ---
+// CHECK: arith.mulf
+// CHECK-NOT: ttg.partition
+// CHECK: arith.mulf
+// CHECK-NOT: ttg.partition
+// CHECK: arith.cmpi
+// CHECK-NOT: ttg.partition
+//
+// --- Split scf.if: ops inside then-block get the parent's computation partition.
+//     The scf.if itself inherits loop scheduling attributes from the original so
+//     the downstream pipeliner can schedule channel ops derived from it. ---
+// CHECK: scf.if
+// CHECK: tt.splat {{.*}} ttg.partition = array<i32: [[COMP_A]]>
+// CHECK: } {
+// CHECK-SAME: loop.cluster
+// CHECK-SAME: loop.stage
+// CHECK-SAME: ttg.partition = array<i32: [[COMP_A]]>
+// CHECK: scf.if
+// CHECK: tt.splat {{.*}} ttg.partition = array<i32: [[COMP_B]]>
+// CHECK: } {
+// CHECK-SAME: loop.cluster
+// CHECK-SAME: loop.stage
+// CHECK-SAME: ttg.partition = array<i32: [[COMP_B]]>
+//
 // --- Correction/rescale ops (acc tmem_load, tmem_store) go to correction (partition 0) ---
 // CHECK: ttng.tmem_load {{.*}} ttg.partition = array<i32: 0>
 // CHECK: ttng.tmem_load {{.*}} ttg.partition = array<i32: 0>
@@ -156,14 +184,20 @@ tt.func public @flex_attention_data_partition_split(
     %scores_1 = arith.mulf %qk_val_1, %cst_scale {loop.cluster = 1 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked>
 
     // scf.if for masking — this is the merge point that causes both data
-    // partitions to collapse into one computation partition without the fix
+    // partitions to collapse into one computation partition without the fix.
+    // The then-block has transitive dependencies (splat → mulf) to test that
+    // splitDataPartitionedIfOps clones the entire backward slice, not just
+    // the immediate defining ops of the yield operands.
     %is_full = arith.cmpi sge, %i, %c1_i32 {loop.cluster = 1 : i32, loop.stage = 1 : i32} : i32
     %masked:2 = scf.if %is_full -> (tensor<128x128xf32, #blocked>, tensor<128x128xf32, #blocked>) {
-      scf.yield %scores_0, %scores_1 : tensor<128x128xf32, #blocked>, tensor<128x128xf32, #blocked>
+      %full_scale = tt.splat %SM_SCALE {loop.cluster = 1 : i32, loop.stage = 1 : i32} : f32 -> tensor<128x128xf32, #blocked>
+      %full_0 = arith.mulf %scores_0, %full_scale {loop.cluster = 1 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked>
+      %full_1 = arith.mulf %scores_1, %full_scale {loop.cluster = 1 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked>
+      scf.yield %full_0, %full_1 : tensor<128x128xf32, #blocked>, tensor<128x128xf32, #blocked>
     } else {
-      %mask_0 = arith.select %false, %scores_0, %cst_neg_inf_2d {loop.cluster = 1 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked>
-      %mask_1 = arith.select %false, %scores_1, %cst_neg_inf_2d {loop.cluster = 1 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked>
-      scf.yield %mask_0, %mask_1 : tensor<128x128xf32, #blocked>, tensor<128x128xf32, #blocked>
+      // Yield values defined OUTSIDE the scf.if — this exercises the fix that
+      // removes stale partition assignments from such ops.
+      scf.yield %scores_0, %scores_1 : tensor<128x128xf32, #blocked>, tensor<128x128xf32, #blocked>
     } {loop.cluster = 1 : i32, loop.stage = 1 : i32}
 
     // Online softmax: m_ij, alpha, p, l_i — per data partition

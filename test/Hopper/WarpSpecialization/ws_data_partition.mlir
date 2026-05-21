@@ -244,3 +244,49 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// Test that tt.map_elementwise and its non-dot operands are correctly
+// backward-sliced during data partitioning. Without the fix, the splat
+// feeding the mask operand would not be added to the partition scheme,
+// leaving it at 128x256 while the dot operand is halved to 64x256.
+// CHECK-LABEL: @test_map_elementwise_partition
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 256, 16]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @test_map_elementwise_partition(%arg0: !tt.ptr<f16>, %arg1: tensor<64x256xf16, #blocked1>, %arg2: !tt.ptr<f16>) {
+    %cst = arith.constant {async_task_id = array<i32: 1, 2>} dense<0.000000e+00> : tensor<128x256xf32, #mma>
+    %c0_i32 = arith.constant {async_task_id = array<i32: 1, 2>} 0 : i32
+    %cst_neg_inf = arith.constant {async_task_id = array<i32: 1, 2>} 0xFF800000 : f32
+    %mask_val = arith.constant {async_task_id = array<i32: 1, 2>} 42 : i32
+    %ptr = tt.splat %arg0 {async_task_id = array<i32: 0>} : !tt.ptr<f16> -> tensor<128x64x!tt.ptr<f16>, #blocked>
+    %ld = tt.load %ptr {async_task_id = array<i32: 0>} : tensor<128x64x!tt.ptr<f16>, #blocked>
+    %a = ttg.local_alloc %ld {async_task_id = array<i32: 1, 2>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
+    %b = ttg.local_alloc %arg1 {async_task_id = array<i32: 1, 2>} : (tensor<64x256xf16, #blocked1>) -> !ttg.memdesc<64x256xf16, #shared, #smem>
+    // CHECK: ttng.warp_group_dot {{.*}} -> tensor<64x256xf32, #mma>
+    // CHECK: ttng.warp_group_dot {{.*}} -> tensor<64x256xf32, #mma>
+    %dot = ttng.warp_group_dot %a, %b, %cst {async_task_id = array<i32: 1, 2>, inputPrecision = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem> * !ttg.memdesc<64x256xf16, #shared, #smem> -> tensor<128x256xf32, #mma>
+    %mask = tt.splat %mask_val {async_task_id = array<i32: 1, 2>} : i32 -> tensor<128x256xi32, #mma>
+    // CHECK: "tt.map_elementwise"
+    // CHECK: : (tensor<64x256xf32, #mma>, tensor<64x256xi32, #mma>) -> tensor<64x256xf32, #mma>
+    // CHECK: "tt.map_elementwise"
+    // CHECK: : (tensor<64x256xf32, #mma>, tensor<64x256xi32, #mma>) -> tensor<64x256xf32, #mma>
+    %result = "tt.map_elementwise"(%dot, %mask) <{pack = 1 : i32}> ({
+    ^bb0(%d: f32, %m: i32):
+      %cmp = arith.cmpi sgt, %m, %c0_i32 : i32
+      %sel = arith.select %cmp, %d, %cst_neg_inf : f32
+      tt.map_elementwise.return %sel : f32
+    }) {async_task_id = array<i32: 1, 2>} : (tensor<128x256xf32, #mma>, tensor<128x256xi32, #mma>) -> tensor<128x256xf32, #mma>
+    %trunc = arith.truncf %result {async_task_id = array<i32: 1, 2>} : tensor<128x256xf32, #mma> to tensor<128x256xf16, #mma>
+    %cvt = ttg.convert_layout %trunc {async_task_id = array<i32: 1, 2>} : tensor<128x256xf16, #mma> -> tensor<128x256xf16, #blocked1>
+    %st_ptr = tt.splat %arg2 {async_task_id = array<i32: 1, 2>} : !tt.ptr<f16> -> tensor<128x256x!tt.ptr<f16>, #blocked1>
+    // CHECK: tt.store {{.*}} : tensor<64x256x!tt.ptr<f16>,
+    // CHECK: tt.store {{.*}} : tensor<64x256x!tt.ptr<f16>,
+    tt.store %st_ptr, %cvt {async_task_id = array<i32: 1, 2>} : tensor<128x256x!tt.ptr<f16>, #blocked1>
+    tt.return
+  }
+}
