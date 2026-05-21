@@ -4068,3 +4068,54 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return %9 : tensor<4x1xi64, #blocked>
   }
 }
+
+// -----
+
+// Regression test for `tritongpu-remove-layout-conversions` crash when an
+// scf.while has a tensor iter-arg positioned AFTER the i1 condition value.
+// scf.while's do-region yield count equals the init count (including the i1),
+// but scf.while results = scf.condition's forwarded list, which can be a
+// reordered/dropped subset (typically drops the i1 cond). So yield operand
+// idx does NOT correspond 1:1 to a result idx for scf.while. Pre-fix:
+// propagateToUsers indexed `parent->getResult(use.getOperandNumber())` for
+// scf.while; here that index is OOB against numResults → SEGV. Post-fix:
+// scf.while's result propagation is delegated to the scf::ConditionOp branch
+// (which uses the correct index translation via scf.condition's forwarded list).
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
+// CHECK-LABEL: whileop_tensor_after_cond
+// Inits: (i32, i1, tensor) — tensor at idx 2, i1 cond at idx 1. Yield has 3
+// operands; WhileOp has 2 results (i32 and tensor). Without the fix, the
+// tensor at yield-idx 2 would index parent->getResult(2) which is OOB.
+//       CHECK: scf.while
+//  CHECK-SAME: (i32, i1, tensor<1024xf32, #blocked>)
+//  CHECK-SAME: -> (i32, tensor<1024xf32, #blocked>)
+//       CHECK: tt.store
+//  CHECK-SAME: tensor<1024x!tt.ptr<f32>, #blocked>
+tt.func @whileop_tensor_after_cond(%ptr: tensor<1024x!tt.ptr<f32>, #blocked>, %init_cond: i1) {
+  %c0 = arith.constant 0 : i32
+  %c5 = arith.constant 5 : i32
+  %c1 = arith.constant 1 : i32
+  %0 = tt.load %ptr : tensor<1024x!tt.ptr<f32>, #blocked>
+  // Anchor with a non-trivial conversion on the loop init to make
+  // propagation meaningful (so without the fix's correct delivery, the
+  // result type would NOT match the optimized layout in the CHECK).
+  %1 = ttg.convert_layout %0 : tensor<1024xf32, #blocked> -> tensor<1024xf32, #blocked1>
+  %2:2 = scf.while (%count = %c0, %cond = %init_cond, %acc = %1)
+      : (i32, i1, tensor<1024xf32, #blocked1>) -> (i32, tensor<1024xf32, #blocked1>) {
+    scf.condition(%cond) %count, %acc : i32, tensor<1024xf32, #blocked1>
+  } do {
+  ^bb0(%count_in: i32, %acc_in: tensor<1024xf32, #blocked1>):
+    %next_count = arith.addi %count_in, %c1 : i32
+    %a = ttg.convert_layout %acc_in : tensor<1024xf32, #blocked1> -> tensor<1024xf32, #blocked>
+    %next_acc_blocked = arith.addf %a, %a : tensor<1024xf32, #blocked>
+    %next_acc = ttg.convert_layout %next_acc_blocked : tensor<1024xf32, #blocked> -> tensor<1024xf32, #blocked1>
+    %still_more = arith.cmpi slt, %next_count, %c5 : i32
+    scf.yield %next_count, %still_more, %next_acc : i32, i1, tensor<1024xf32, #blocked1>
+  }
+  %3 = ttg.convert_layout %2#1 : tensor<1024xf32, #blocked1> -> tensor<1024xf32, #blocked>
+  tt.store %ptr, %3 : tensor<1024x!tt.ptr<f32>, #blocked>
+  tt.return
+}
+}
