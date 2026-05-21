@@ -1912,8 +1912,9 @@ public:
       auto newReshape = ReshapeOp::create(
           rewriter, reshape.getLoc(), reshapeType, convert.getSrc(),
           reshape.getAllowReorder(), reshape.getEfficientLayout());
-      LocalStoreOp::create(rewriter, store.getLoc(), newReshape.getResult(),
-                           store.getDst());
+      auto newStore = LocalStoreOp::create(
+          rewriter, store.getLoc(), newReshape.getResult(), store.getDst());
+      newStore->setAttrs(store->getAttrs());
       rewriter.eraseOp(store);
       rewriter.eraseOp(reshape);
       rewriter.eraseOp(convert);

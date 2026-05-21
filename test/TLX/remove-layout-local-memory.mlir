@@ -35,7 +35,7 @@ tt.func @local_load_coalesce(%arg0: !ttg.memdesc<128x64xf16, #shared, #smem>, %a
 // CHECK-SAME: %[[ARG:.*]]: tensor<32x4x32xf32, #[[$SRC:.*]]>
 // CHECK-NOT: ttg.convert_layout
 // CHECK: %[[RESHAPE:.*]] = tt.reshape %[[ARG]] : tensor<32x4x32xf32, #[[$SRC]]> -> tensor<32x128xf32, #[[$DIRECT:.*]]>
-// CHECK-NEXT: ttg.local_store %[[RESHAPE]], %{{.*}} : tensor<32x128xf32, #[[$DIRECT]]> -> !ttg.memdesc<32x128xf32, #{{.*}}, #{{.*}}, mutable>
+// CHECK-NEXT: ttg.local_store %[[RESHAPE]], %{{.*}} {async_task_id = array<i32: 7>, loop.cluster = 2 : i32, loop.stage = 3 : i32} : tensor<32x128xf32, #[[$DIRECT]]> -> !ttg.memdesc<32x128xf32, #{{.*}}, #{{.*}}, mutable>
 // CHECK-NEXT: tt.return
 
 #linear_src = #ttg.linear<{register = [[1, 0, 0], [0, 0, 8], [8, 0, 0], [16, 0, 0], [0, 0, 16]], lane = [[2, 0, 0], [4, 0, 0], [0, 0, 1], [0, 0, 2], [0, 0, 4]], warp = [[0, 1, 0], [0, 2, 0]], block = []}>
@@ -49,7 +49,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
       %arg1: !ttg.memdesc<32x128xf32, #shared_store, #smem_store, mutable>) {
     %cvt = ttg.convert_layout %arg0 : tensor<32x4x32xf32, #linear_src> -> tensor<32x4x32xf32, #linear_cvt>
     %reshape = tt.reshape %cvt : tensor<32x4x32xf32, #linear_cvt> -> tensor<32x128xf32, #linear_cvt_flat>
-    ttg.local_store %reshape, %arg1 : tensor<32x128xf32, #linear_cvt_flat> -> !ttg.memdesc<32x128xf32, #shared_store, #smem_store, mutable>
+    ttg.local_store %reshape, %arg1 {async_task_id = array<i32: 7>, loop.cluster = 2 : i32, loop.stage = 3 : i32} : tensor<32x128xf32, #linear_cvt_flat> -> !ttg.memdesc<32x128xf32, #shared_store, #smem_store, mutable>
     tt.return
   }
 }
