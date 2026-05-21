@@ -76,6 +76,7 @@ jobs:
         run: |
           set -eux
           . "${SETUP_SCRIPT}"
+          uv pip install pytest
           pytest python/test/unit/language/test_tlx_*.py -v
 
 concurrency:
