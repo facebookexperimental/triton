@@ -234,6 +234,7 @@ struct CanonicalizeConvertFromAlloc
 };
 
 // local_store(cvt) -> local_store
+// local_store(reshape(cvt)) -> local_store(reshape)
 struct CanonicalizeConvertFromLocalStore
     : public mlir::OpRewritePattern<triton::gpu::LocalStoreOp> {
   using OpRewritePattern::OpRewritePattern;
@@ -242,10 +243,41 @@ struct CanonicalizeConvertFromLocalStore
   matchAndRewrite(triton::gpu::LocalStoreOp op,
                   PatternRewriter &rewriter) const override {
     auto convert = op.getSrc().getDefiningOp<ConvertLayoutOp>();
+    if (convert) {
+      rewriter.replaceOpWithNewOp<triton::gpu::LocalStoreOp>(
+          op, convert.getSrc(), op.getDst());
+      return mlir::success();
+    }
+
+    auto reshape = op.getSrc().getDefiningOp<triton::ReshapeOp>();
+    if (!reshape)
+      return failure();
+    convert = reshape.getSrc().getDefiningOp<ConvertLayoutOp>();
     if (!convert)
       return failure();
-    rewriter.replaceOpWithNewOp<triton::gpu::LocalStoreOp>(op, convert.getSrc(),
-                                                           op.getDst());
+
+    auto convertSrcType =
+        dyn_cast<RankedTensorType>(convert.getSrc().getType());
+    auto storeSrcType = dyn_cast<RankedTensorType>(op.getSrc().getType());
+    if (!convertSrcType || !storeSrcType || !convertSrcType.getEncoding())
+      return failure();
+
+    Attribute reshapeEncoding;
+    auto layoutInterface = cast<DialectInferLayoutInterface>(
+        &convertSrcType.getEncoding().getDialect());
+    if (failed(layoutInterface->inferReshapeOpEncoding(
+            convertSrcType.getShape(), convertSrcType.getEncoding(),
+            storeSrcType.getShape(), reshapeEncoding, op.getLoc())))
+      return failure();
+
+    auto reshapeType =
+        RankedTensorType::get(storeSrcType.getShape(),
+                              storeSrcType.getElementType(), reshapeEncoding);
+    auto newReshape = triton::ReshapeOp::create(
+        rewriter, reshape.getLoc(), reshapeType, convert.getSrc(),
+        reshape.getAllowReorder(), reshape.getEfficientLayout());
+    rewriter.replaceOpWithNewOp<triton::gpu::LocalStoreOp>(
+        op, newReshape.getResult(), op.getDst());
     return mlir::success();
   }
 };
