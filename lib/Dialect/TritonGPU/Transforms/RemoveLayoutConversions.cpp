@@ -108,10 +108,11 @@ public:
   Value getRewrittenValue(Value value);
   // Dump the current stage of layout information.
   void dump();
-
-private:
+  // Walk backward to anchor boundaries and estimate the SMEM scratch cost
+  // (in bytes) of converts needed if `encoding` is chosen for `value`.
   unsigned estimateAnchorConvertCost(Value value, Attribute encoding);
 
+private:
   // map from value to layout information.
   llvm::MapVector<Value, LayoutInfo> layouts;
   // Values that are layout anchors (encoding fixed by hardware/op semantics).
@@ -578,33 +579,55 @@ unsigned LayoutPropagation::estimateAnchorConvertCost(Value value,
   return totalCost;
 }
 
+// Estimate the total cost of choosing `encoding` for `value`. Combines:
+// 1. Convert scratch cost at anchor boundaries (SMEM bytes for converts that
+//    would be inserted where the chosen encoding meets a fixed anchor encoding).
+// 2. Transaction cost penalty for lower vectorization (more SMEM bank
+//    transactions when sizePerThread is smaller).
+// Both are in bytes so they're directly comparable.
+static unsigned estimateTotalCost(Value value, Attribute encoding,
+                                  LayoutPropagation &propagation) {
+  unsigned convertCost = propagation.estimateAnchorConvertCost(value, encoding);
+
+  // Transaction cost: totalBytes / sizePerThread gives the number of bytes
+  // each thread must individually load/store from SMEM. Lower sizePerThread
+  // means more transactions for the same data volume.
+  unsigned transactionCost = 0;
+  if (auto tensorTy = dyn_cast<RankedTensorType>(value.getType())) {
+    int64_t numElems = tensorTy.getNumElements();
+    unsigned elemBytes = tensorTy.getElementTypeBitWidth() / 8;
+    int64_t totalBytes = numElems * elemBytes;
+    int64_t score = getLayoutScore(encoding);
+    if (score > 0)
+      transactionCost = totalBytes / score;
+  }
+
+  return convertCost + transactionCost;
+}
+
 void LayoutPropagation::resolveConflicts() {
   for (auto &it : layouts) {
     Operation *op = it.first.getDefiningOp();
     LayoutInfo &info = it.second;
     if (info.encodings.size() <= 1)
       continue;
-    // Hacky resolve, prefer block encoding.
-    // TODO: add a proper heuristic.
     Attribute encoding = *info.encodings.begin();
     bool isLoadOrStore =
         op && isa<LoadOp, StoreOp, AtomicRMWOp, AtomicCASOp>(op);
-    // Pick the layout with maximum score.
-    // This prefers layouts with larger sizePerThread values for better
-    // vectorized memory access. Both blocked and linear encodings are scored,
-    // so e.g. a linear layout from TMEMLoadOp (sizePerThread=[1,32]) beats
-    // a blocked layout from local_load (sizePerThread=[1,8]).
-    int64_t bestScore = getLayoutScore(encoding);
+
+    // Pick the encoding with the lowest total cost, combining convert scratch
+    // cost at anchor boundaries and SMEM transaction cost from vectorization.
+    unsigned bestCost = estimateTotalCost(it.first, encoding, *this);
     for (Attribute e : info.encodings) {
-      int64_t score = getLayoutScore(e);
-      if (score > bestScore) {
-        bestScore = score;
+      unsigned cost = estimateTotalCost(it.first, e, *this);
+      if (cost < bestCost) {
+        bestCost = cost;
         encoding = e;
       }
     }
-    // If no layout with vectorization found, fall back to the original
-    // heuristic (prefer blocked for load/store, MMA for compute).
-    if (bestScore == 0) {
+    // If costs are tied (e.g., all zero), fall back to heuristics:
+    // prefer blocked for load/store, MMA for compute.
+    if (bestCost == 0) {
       for (Attribute e : info.encodings) {
         if ((isLoadOrStore && isa<BlockedEncodingAttr>(e)) ||
             (!isLoadOrStore && isa<MmaEncodingTrait>(e))) {
@@ -613,42 +636,20 @@ void LayoutPropagation::resolveConflicts() {
         }
       }
     }
-    // When layout scores are close (within 2x), use SMEM scratch cost at
-    // anchor boundaries as a tiebreaker. This walks backward through the
-    // dataflow to find where converts would actually be inserted (at anchors
-    // like tmem_load, local_load) and uses the anchor tensor shape for cost
-    // estimation. This naturally prefers converting smaller tensors (e.g.,
-    // a 1x256 bias before broadcast rather than a 128x256 accumulator).
-    {
-      unsigned chosenCost = estimateAnchorConvertCost(it.first, encoding);
-      for (Attribute e : info.encodings) {
-        if (e == encoding)
-          continue;
-        int64_t score = getLayoutScore(e);
-        if (score > 0 && bestScore <= 2 * score) {
-          unsigned cost = estimateAnchorConvertCost(it.first, e);
-          if (cost < chosenCost) {
-            encoding = e;
-            chosenCost = cost;
-          }
-        }
-      }
-    }
     // Budget-aware override: if the chosen encoding would introduce a
     // convert_layout whose scratch buffer pushes SMEM over budget, pick the
     // candidate with the lowest scratch cost instead.
     if (smemBudget > 0) {
       unsigned baseCost = computeBaseSmem(funcOp);
-      unsigned scratchCost = estimateConvertScratchCost(it.first, encoding);
+      unsigned scratchCost = estimateAnchorConvertCost(it.first, encoding);
       if (baseCost + scratchCost > smemBudget) {
         LDBG("Budget override: base=" << baseCost << " scratch=" << scratchCost
                                       << " total=" << (baseCost + scratchCost)
                                       << " budget=" << smemBudget);
-        // Try each candidate and pick the one with lowest scratch cost.
         Attribute bestEncoding = encoding;
         unsigned bestScratchCost = scratchCost;
         for (Attribute e : info.encodings) {
-          unsigned cost = estimateConvertScratchCost(it.first, e);
+          unsigned cost = estimateAnchorConvertCost(it.first, e);
           if (cost < bestScratchCost) {
             bestScratchCost = cost;
             bestEncoding = e;
