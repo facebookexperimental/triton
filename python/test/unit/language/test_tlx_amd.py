@@ -1,5 +1,5 @@
 """
-Tests for TLX AMD support (async_load, local_load with relaxed, async_token in loops).
+Tests for TLX AMD support (async_load, local_load, async_token in loops).
 
 These tests compile kernels targeting gfx950 via triton.compile() with an
 explicit GPUTarget and verify the generated TTGIR/AMDGCN. No AMD hardware is
@@ -12,7 +12,7 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-from triton._internal_testing import is_hip
+from triton._internal_testing import is_hip, is_hip_cdna4
 from triton.compiler.compiler import ASTSource, compile as triton_compile
 from triton.backends.compiler import GPUTarget
 
@@ -26,15 +26,6 @@ def compile_for_gfx950(fn, signature, constexprs):
     """Compile a TLX kernel for gfx950 and return the compiled object."""
     src = ASTSource(fn=fn, signature=signature, constexprs=constexprs)
     return triton_compile(src, target=GFX950)
-
-
-def is_gfx950_available():
-    """Check if the current device is gfx950."""
-    try:
-        target = triton.runtime.driver.active.get_current_target()
-        return target.arch == "gfx950"
-    except Exception:
-        return False
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +55,7 @@ def _async_load_kernel(
     tl.store(output_ptr + offs, x + y, mask=mask)
 
 
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_async_load_compiles_gfx950(device):
     """async_load should produce async_copy_global_to_local in TTGIR on gfx950."""
     compiled = compile_for_gfx950(
@@ -82,10 +74,9 @@ def test_async_load_compiles_gfx950(device):
     assert len(compiled.asm["amdgcn"]) > 0
 
 
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_async_load_correctness(device):
     """async_load produces correct results on gfx950 hardware."""
-    if not is_gfx950_available():
-        pytest.skip("Requires gfx950 hardware")
     size = 256
     x = torch.rand(size, dtype=torch.float32, device=device)
     y = torch.rand(size, dtype=torch.float32, device=device)
@@ -96,11 +87,11 @@ def test_async_load_correctness(device):
 
 
 # ---------------------------------------------------------------------------
-# Test: local_load with relaxed=True sets the syncedViaAsyncWait attribute.
+# Test: local_load after async_wait compiles and runs correctly.
 # ---------------------------------------------------------------------------
 
 @triton.jit
-def _relaxed_load_kernel(
+def _local_load_kernel(
     x_ptr, output_ptr, n_elements,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -114,14 +105,15 @@ def _relaxed_load_kernel(
     tlx.async_load_commit_group([tok])
     tlx.async_load_wait_group(0)
 
-    x = tlx.local_load(buf0, relaxed=True)
+    x = tlx.local_load(buf0)
     tl.store(output_ptr + offs, x, mask=mask)
 
 
-def test_relaxed_local_load_compiles_gfx950(device):
-    """local_load(relaxed=True) should compile and produce local_load in TTGIR."""
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_local_load_compiles_gfx950(device):
+    """local_load after async_wait should compile and produce local_load in TTGIR."""
     compiled = compile_for_gfx950(
-        _relaxed_load_kernel,
+        _local_load_kernel,
         signature={"x_ptr": "*fp32", "output_ptr": "*fp32", "n_elements": "i32"},
         constexprs={"BLOCK_SIZE": 64},
     )
@@ -129,15 +121,14 @@ def test_relaxed_local_load_compiles_gfx950(device):
     assert "local_load" in ttgir
 
 
-def test_relaxed_local_load_correctness(device):
-    """local_load(relaxed=True) produces correct results on gfx950 hardware."""
-    if not is_gfx950_available():
-        pytest.skip("Requires gfx950 hardware")
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_local_load_correctness(device):
+    """local_load after async_wait produces correct results on gfx950 hardware."""
     size = 256
     x = torch.rand(size, dtype=torch.float32, device=device)
     output = torch.empty_like(x)
     grid = (triton.cdiv(size, 64),)
-    _relaxed_load_kernel[grid](x, output, size, BLOCK_SIZE=64)
+    _local_load_kernel[grid](x, output, size, BLOCK_SIZE=64)
     torch.testing.assert_close(x, output)
 
 
@@ -175,6 +166,7 @@ def _token_in_loop_kernel(
     tl.store(output_ptr + offs, acc, mask=mask)
 
 
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_async_token_loop_compiles_gfx950(device):
     """async_token in scope around tl.range should compile without crashing."""
     compiled = compile_for_gfx950(

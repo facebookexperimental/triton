@@ -622,15 +622,8 @@ def async_load(
         # unsupported for now
         raise NotImplementedError("async_load by block pointer is not supported yet")
     else:
-        # Load by a tensor of pointers or a pointer of scalar.
-        if src.type.is_block():
-            if mask is not None:
-                src, mask = _semantic.broadcast_impl_value(src, mask)
-            if other is not None:
-                src, other = _semantic.broadcast_impl_value(src, other)
-        elt_ty = src.type.scalar.element_ty
-        if other is not None:
-            other = _semantic.cast(other, elt_ty)
+        # Load by a tensor of pointers or a pointer of scalar: `block_type<pointer_type<>>` or `pointer_type<>`
+        _, src, mask, other, _ = _semantic._prepare_legacy_load(src, mask, other, None, None)
 
     cache = _semantic._str_to_load_cache_modifier(cache_modifier)
     eviction = _semantic._str_to_eviction_policy(eviction_policy)
@@ -681,16 +674,10 @@ def async_load_wait_group(
 def local_load(
     src: tlx.buffered_tensor,
     token: tlx.async_token = None,
-    relaxed: bool = False,
     _semantic=None,
 ) -> tl.tensor:
     """
     Loads buffer from local or tensor memory into a distributed tensor.
-
-    When relaxed=True, the load is annotated as synchronized via async_wait,
-    telling the AMD backend that no additional vmcnt wait is needed before
-    this LDS read. Use this when the load is preceded by an async_wait +
-    barrier that guarantees the data is ready.
     """
     block_type = tl.block_type(src.type.element_ty, src.type.shape)
     storage = src.type.storage
@@ -704,7 +691,7 @@ def local_load(
     else:
         output = _semantic.builder.create_local_load(src.handle, token.handle if token else None)
         result = tl.tensor(output, block_type)
-        if relaxed:
+        if token is not None and _semantic.builder.options.backend_name == "hip":
             result.handle.set_attr("ttg.amdg.syncedViaAsyncWait",
                                    _semantic.builder.get_bool_attr(True))
         return result
