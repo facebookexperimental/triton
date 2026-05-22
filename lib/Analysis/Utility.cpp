@@ -103,9 +103,7 @@ unsigned ReduceOpHelper::getIntraWarpSizeWithUniqueData() {
   return getThreadsPerWarp(srcEncoding, srcShape)[axis];
 }
 
-unsigned ReduceOpHelper::getNumRegGroupsOnAxis() {
-  return 1;
-}
+unsigned ReduceOpHelper::getNumRegGroupsOnAxis() { return 1; }
 
 bool ReduceOpHelper::isWarpSynchronous() {
   if (srcShape[axis] == 1)

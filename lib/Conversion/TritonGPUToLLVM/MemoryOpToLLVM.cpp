@@ -559,19 +559,19 @@ public:
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     auto typeConverter = getTypeConverter();
 
-    // Get src SMEM base pointer.
+    // Get src SMEM pointer including subslice offset.
     auto srcTy = cast<MemDescType>(op.getSrc().getType());
     auto llvmElemTy = typeConverter->convertType(srcTy.getElementType());
     auto srcSmemObj = LLVM::getSharedMemoryObjectFromStruct(
         loc, adaptor.getSrc(), llvmElemTy, rewriter);
-    Value srcPtr = srcSmemObj.getBase();
+    Value srcPtr = srcSmemObj.getShmemAffineBase(loc, rewriter, srcTy);
 
-    // Get dst SMEM base pointer (will be mapa'd to remote CTA).
+    // Get dst SMEM pointer including subslice offset (will be mapa'd).
     auto dstTy = cast<MemDescType>(op.getDst().getType());
     auto dstLLVMElemTy = typeConverter->convertType(dstTy.getElementType());
     auto dstSmemObj = LLVM::getSharedMemoryObjectFromStruct(
         loc, adaptor.getDst(), dstLLVMElemTy, rewriter);
-    Value dstPtr = dstSmemObj.getBase();
+    Value dstPtr = dstSmemObj.getShmemAffineBase(loc, rewriter, dstTy);
 
     // Get barrier SMEM base pointer (will be mapa'd to remote CTA).
     auto barrierTy = cast<MemDescType>(op.getBarrier().getType());

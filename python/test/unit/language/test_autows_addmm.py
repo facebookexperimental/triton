@@ -282,3 +282,135 @@ def test_autows_addmm_tma_persistent(
         # Verify correctness: bias + A @ B.T
         ref_out = (torch.matmul(A.to(torch.float32), B.T.to(torch.float32)) + bias.to(torch.float32)).to(dtype)
         torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
+
+
+@triton.jit
+def addmm_kernel_1d_bias_ws(
+    a_desc,
+    b_desc,
+    c_desc,
+    bias_desc,
+    M,
+    N,
+    K,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    """Persistent TMA addmm with 1D bias broadcast and warp specialization."""
+    dtype = tl.float16
+    start_pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    num_tiles = num_pid_m * num_pid_n
+
+    tile_id_c = start_pid - NUM_SMS
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    for tile_id in tl.range(
+            start_pid, num_tiles, NUM_SMS,
+            flatten=False, warp_specialize=True,
+            disallow_acc_multi_buffer=True,
+            separate_epilogue_store=True,
+    ):
+        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        offs_am = pid_m * BLOCK_SIZE_M
+        offs_bn = pid_n * BLOCK_SIZE_N
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            offs_k = ki * BLOCK_SIZE_K
+            a = a_desc.load([offs_am, offs_k])
+            b = b_desc.load([offs_bn, offs_k])
+            accumulator = tl.dot(a, b.T, accumulator)
+
+        tile_id_c += NUM_SMS
+        pid_m, pid_n = _compute_pid(tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        offs_cm = pid_m * BLOCK_SIZE_M
+        offs_cn = pid_n * BLOCK_SIZE_N
+
+        # 1D bias: load [1, BLOCK_SIZE_N], broadcast to [BLOCK_SIZE_M, BLOCK_SIZE_N]
+        bias_tile = bias_desc.load([0, offs_cn]).to(tl.float32)
+        bias_tile = tl.broadcast_to(bias_tile, (BLOCK_SIZE_M, BLOCK_SIZE_N))
+        accumulator = accumulator + bias_tile
+        c = accumulator.to(dtype)
+        c_desc.store([offs_cm, offs_cn], c)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+def test_autows_addmm_hoist_convert_before_broadcast():
+    """Test that convert_layout is hoisted before broadcast in the addmm epilogue.
+
+    Config: BLOCK_M=128, BLOCK_N=128, BLOCK_K=128, EPILOGUE_SUBTILE=1,
+    num_warps=4, num_stages=6.
+
+    This config previously OOM'd because the convert_layout on the 128x128
+    accumulator (64KB SMEM scratch) plus the A/B tile buffers (~197KB)
+    exceeded the 232KB B200 SMEM limit. With the hoist fix, the convert happens
+    on the 1x128 bias (512B scratch) instead, and the kernel fits.
+    """
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+
+        M, N, K = 1024, 1024, 512
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 128, 128, 128
+        num_warps = 4
+        num_stages = 6
+        dtype = torch.float16
+        GROUP_SIZE_M = 8
+        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+        device = "cuda"
+
+        torch.manual_seed(42)
+        A = torch.randn((M, K), dtype=dtype, device=device)
+        B = torch.randn((N, K), dtype=dtype, device=device)
+        bias_1d = torch.randn((N,), dtype=dtype, device=device)
+        C = torch.empty((M, N), dtype=dtype, device=device)
+
+        def alloc_fn(size, align, stream):
+            return torch.empty(size, dtype=torch.int8, device="cuda")
+
+        triton.set_allocator(alloc_fn)
+
+        a_desc = TensorDescriptor(A, [M, K], [K, 1], [BLOCK_SIZE_M, BLOCK_SIZE_K])
+        b_desc = TensorDescriptor(B, [N, K], [K, 1], [BLOCK_SIZE_N, BLOCK_SIZE_K])
+        c_desc = TensorDescriptor(C, C.shape, C.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_N])
+        bias_desc = TensorDescriptor(bias_1d, [1, N], [N, 1], [1, BLOCK_SIZE_N])
+
+        grid = lambda META: (min(
+            NUM_SMS,
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        ), )
+
+        kernel = addmm_kernel_1d_bias_ws[grid](
+            a_desc, b_desc, c_desc, bias_desc,
+            M, N, K,
+            BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K, GROUP_SIZE_M=GROUP_SIZE_M,
+            NUM_SMS=NUM_SMS,
+            num_stages=num_stages, num_warps=num_warps,
+            early_tma_store_lowering=True,
+        )
+
+        # Verify the TTGIR has the convert before broadcast pattern
+        ttgir = kernel.asm["ttgir"]
+        assert "partition0" in ttgir or "partition1" in ttgir, \
+            "Expected warp specialization partitions in IR"
+
+        # Check that convert_layout on bias happens before broadcast (on 1xN, not MxN)
+        import re
+        cvt_before_bc = re.search(
+            r'convert_layout.*tensor<1x\d+xf32.*\n.*tt\.broadcast.*tensor<1x\d+xf32',
+            ttgir)
+        bc_before_cvt = re.search(
+            r'tt\.broadcast.*tensor<1x\d+xf32.*tensor<128x\d+xf32.*\n.*convert_layout.*tensor<128x\d+xf32',
+            ttgir)
+        assert cvt_before_bc or not bc_before_cvt, \
+            "Expected convert_layout before broadcast (on small 1xN tensor)"
+
+        # Verify correctness: bias_1d + A @ B.T
+        ref_out = (torch.matmul(A.to(torch.float32), B.T.to(torch.float32)) + bias_1d.to(torch.float32)).to(dtype)
+        torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)

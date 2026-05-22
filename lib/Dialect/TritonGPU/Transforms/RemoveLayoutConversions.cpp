@@ -371,7 +371,18 @@ SmallVector<Value> LayoutPropagation::propagateToUsers(Value value,
     if (auto yieldOp = dyn_cast<scf::YieldOp>(user)) {
       auto parent = yieldOp->getParentOp();
       SmallVector<Value> valuesToPropagate;
-      if (isa<scf::ForOp, scf::IfOp, scf::WhileOp>(parent))
+      // For scf.ForOp / scf.IfOp the yield's operand i corresponds 1:1 to
+      // the parent's result i, so we can propagate directly.
+      // For scf.WhileOp, the do-region yield feeds the before-block args
+      // (handled via `whileOp.getBeforeArguments()[i]` below), NOT the
+      // parent results. The parent result mapping is determined by
+      // scf.condition and is handled correctly via the scf::ConditionOp
+      // branch later in this function. Indexing parent results by the yield
+      // operand number is incorrect for WhileOp: the index can be OOB (init
+      // count > result count when scf.condition drops operands), and even
+      // when in-bounds it may point to the wrong result because scf.condition
+      // can drop/reorder operands relative to the before-arg order.
+      if (isa<scf::ForOp, scf::IfOp>(parent))
         valuesToPropagate.push_back(parent->getResult(use.getOperandNumber()));
       if (auto forOp = dyn_cast<scf::ForOp>(parent))
         valuesToPropagate.push_back(
@@ -1832,6 +1843,69 @@ void hoistConvert(ModuleOp module) {
     layoutRemat.cleanup();
   });
 }
+
+// Prune a store-only layout conversion through a non-reordering reshape:
+//
+//   local_store(reshape(convert_layout(x)), dst)
+//
+// becomes:
+//
+//   local_store(reshape(x), dst)
+//
+// This is intentionally narrow and runs after layout decisions have already
+// been made. The rewrite relies on local_store being a layout-flexible sink:
+// the source register encoding may change, but the destination memdesc still
+// defines the logical memory layout.
+struct PruneLocalStoreOfReshapeConvert : public OpRewritePattern<LocalStoreOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(LocalStoreOp store,
+                                PatternRewriter &rewriter) const override {
+    auto reshape = store.getSrc().getDefiningOp<ReshapeOp>();
+    if (!reshape || reshape.getAllowReorder())
+      return failure();
+    if (!reshape.getResult().hasOneUse())
+      return failure();
+
+    auto convert = reshape.getSrc().getDefiningOp<ConvertLayoutOp>();
+    if (!convert || !convert.getResult().hasOneUse())
+      return failure();
+
+    auto srcType = dyn_cast<RankedTensorType>(convert.getSrc().getType());
+    auto storeSrcType = dyn_cast<RankedTensorType>(store.getSrc().getType());
+    if (!srcType || !storeSrcType || !srcType.getEncoding())
+      return failure();
+    if (srcType.getElementType() != storeSrcType.getElementType())
+      return failure();
+    if (srcType.getNumElements() != storeSrcType.getNumElements())
+      return failure();
+
+    Attribute reshapeEncoding;
+    auto *layoutInterface = dyn_cast<DialectInferLayoutInterface>(
+        &srcType.getEncoding().getDialect());
+    if (!layoutInterface)
+      return failure();
+    if (failed(layoutInterface->inferReshapeOpEncoding(
+            srcType.getShape(), srcType.getEncoding(), storeSrcType.getShape(),
+            reshapeEncoding, store.getLoc())))
+      return failure();
+
+    auto reshapeType =
+        RankedTensorType::get(storeSrcType.getShape(),
+                              storeSrcType.getElementType(), reshapeEncoding);
+    rewriter.setInsertionPoint(store);
+    auto newReshape = ReshapeOp::create(
+        rewriter, reshape.getLoc(), reshapeType, convert.getSrc(),
+        reshape.getAllowReorder(), reshape.getEfficientLayout());
+    auto newStore = LocalStoreOp::create(
+        rewriter, store.getLoc(), newReshape.getResult(), store.getDst());
+    newStore->setAttrs(store->getAttrs());
+    rewriter.eraseOp(store);
+    rewriter.eraseOp(reshape);
+    rewriter.eraseOp(convert);
+    return success();
+  }
+};
 } // namespace
 
 class TritonGPURemoveLayoutConversionsPass
@@ -1906,6 +1980,7 @@ public:
     scf::ForOp::getCanonicalizationPatterns(cleanUpPatterns2, context);
     scf::IfOp::getCanonicalizationPatterns(cleanUpPatterns2, context);
     ConvertLayoutOp::getCanonicalizationPatterns(cleanUpPatterns2, context);
+    cleanUpPatterns2.add<PruneLocalStoreOfReshapeConvert>(context);
     if (applyPatternsGreedily(m, std::move(cleanUpPatterns2)).failed()) {
       signalPassFailure();
     }
@@ -1919,6 +1994,8 @@ public:
     // eliminate them by propagating the source encoding through their users.
     if (smemBudget > 0) {
       eliminateOverBudgetConverts(m);
+      hoistConvert(m);
+      cleanupConvertOps();
     }
   }
 
