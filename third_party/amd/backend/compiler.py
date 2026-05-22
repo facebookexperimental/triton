@@ -253,6 +253,7 @@ class HIPBackend(BaseBackend):
         passes.ttgpuir.add_coalesce(pm)
         if knobs.amd.use_buffer_ops:
             amd.passes.ttgpuir.add_coalesce_buffer_ops(pm)
+            passes.ttgpuir.add_remove_layout_conversions(pm)
 
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
         passes.ttgpuir.add_remove_layout_conversions(pm)
@@ -309,7 +310,6 @@ class HIPBackend(BaseBackend):
                 knobs.amd.buffer_ops_analyze_small_tensor_range,
             )
             amd.passes.ttgpuir.add_optimize_buffer_op_ptr(pm)
-            passes.ttgpuir.add_remove_layout_conversions(pm)
 
         amd.passes.ttgpuir.add_fold_true_cmpi(pm)
         amd.passes.ttgpuir.add_prepare_if_combining(pm)
