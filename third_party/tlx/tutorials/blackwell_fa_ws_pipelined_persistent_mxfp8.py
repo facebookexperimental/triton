@@ -14,8 +14,6 @@ from triton.language.extra.tlx.mxfp8_utils import (
 )
 from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode
 
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
-
 
 def _mxf8_host_descriptor_pre_hook(nargs):
     BLOCK_M = nargs["BLOCK_M"]
@@ -63,22 +61,13 @@ mxfp8_configs = [
 ]
 
 
-def prune_configs_by_hdim_mxfp8(configs, named_args, **kwargs):
+def prune_configs_by_hdim_mxfp8(configs, _named_args, **_kwargs):
     return configs
 
 
 @triton.jit
 def _reduce_or(x, y):
     return x | y
-
-
-@triton.jit
-def _split_n_1d(x, SPLIT_FACTOR: tl.constexpr):
-    if SPLIT_FACTOR == 1:
-        return (x, )
-    else:
-        x0, x1 = x.reshape([2, x.shape[0] // 2]).permute(1, 0).split()
-        return _split_n_1d(x0, SPLIT_FACTOR // 2) + _split_n_1d(x1, SPLIT_FACTOR // 2)
 
 
 @triton.jit
@@ -177,8 +166,6 @@ def _softmax_inner_loop(
     out_dtype,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    NUM_MMA_GROUPS: tl.constexpr,
     VEC_SIZE: tl.constexpr,
     STAGE: tl.constexpr,
     SHARE_SCALE_BUFFERS: tl.constexpr = False,
@@ -629,8 +616,6 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
                         p_dtype,
                         BLOCK_M,
                         BLOCK_N,
-                        HEAD_DIM,
-                        NUM_MMA_GROUPS,
                         VEC_SIZE,
                         STAGE=4 - STAGE,
                         SHARE_SCALE_BUFFERS=SHARE_SCALE_BUFFERS,
@@ -660,8 +645,6 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
                         p_dtype,
                         BLOCK_M,
                         BLOCK_N,
-                        HEAD_DIM,
-                        NUM_MMA_GROUPS,
                         VEC_SIZE,
                         STAGE=2,
                         SHARE_SCALE_BUFFERS=SHARE_SCALE_BUFFERS,
@@ -1128,8 +1111,6 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
                     tlx.barrier_expect_bytes(k_full, (K_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM) + K_SCALE_BYTES)
                     tlx.async_descriptor_load(desc_k, k_tile, [kv_offset_y, 0], k_full)
                     # 5D TMA offset: [batch_head, n_offset, head_offset, 0, 0]
-                    # Compute offset based on relative position within this batch-head's N range
-                    # kv_offset_y is absolute, base_offset_y is the start of this batch-head
                     tlx.async_descriptor_load(
                         desc_k_scale,
                         kv_scale_tiles[k_bufIdx],
@@ -1202,7 +1183,6 @@ def _attn_bwd_preprocess(
     O,
     DO,  #
     Delta,  #
-    Z,
     H,
     N_CTX,  #
     HEAD_DIM: tl.constexpr,
@@ -1305,7 +1285,6 @@ mxfp8_bwd_configs = [
 
 @triton.jit
 def _softmax_recompute_quantization_iter(
-    curr_m,
     blk_idx,
     qk_scale,
     qk_tiles,
@@ -1451,7 +1430,6 @@ def _softmax_recompute_quantization_iter(
 @triton.autotune(
     configs=mxfp8_bwd_configs,
     key=["N_CTX", "HEAD_DIM", "H"],
-    restore_value=["dQ"],
 )
 @triton.jit  # pragma: no cover
 def _attn_bwd_mxf8_ws(
@@ -1465,7 +1443,6 @@ def _attn_bwd_mxf8_ws(
     desc_dq,
     desc_dk,
     desc_dv,
-    dQ,
     sm_scale,
     desc_m,
     desc_delta,
@@ -1902,13 +1879,10 @@ def _attn_bwd_mxf8_ws(
                 start_n = pid * BLOCK_N1
                 base_q = (off_z * H + off_h).to(tl.int64) * N_CTX
 
-                curr_m = 0
-
                 # Prologue: produce P for the first M-block.
                 # Call _softmax_recompute_quantization_iter with
                 # p_scale_tmem_prologue
                 _softmax_recompute_quantization_iter(
-                    curr_m,
                     blk_idx,
                     qk_scale,
                     qk_tiles,
@@ -1944,14 +1918,12 @@ def _attn_bwd_mxf8_ws(
                     REP_M,
                     DS_NUM_SUBS,
                 )
-                curr_m += BLOCK_M1
                 blk_idx += 1
 
                 for _ in range(1, num_steps):
                     # Call _softmax_recompute_quantization_iter with
                     # p_scale_tmem
                     _softmax_recompute_quantization_iter(
-                        curr_m,
                         blk_idx,
                         qk_scale,
                         qk_tiles,
@@ -1987,7 +1959,6 @@ def _attn_bwd_mxf8_ws(
                         REP_M,
                         DS_NUM_SUBS,
                     )
-                    curr_m += BLOCK_M1
                     blk_idx += 1
 
                 # Epilogue: dK / dV TMA store
@@ -2725,7 +2696,6 @@ def attention_bwd(
         o,
         do_preproc,
         delta,
-        Z,
         H,
         N_CTX,
         HEAD_DIM=HEAD_DIM,
@@ -2763,7 +2733,7 @@ def attention_bwd(
     desc_do_scale = TensorDescriptor.from_tensor(do_scale, block_shape=dummy_5d)
     desc_do_dv_scale = TensorDescriptor.from_tensor(do_dv_scale, block_shape=dummy_5d)
 
-    def alloc_fn(size: int, align: int, _):
+    def alloc_fn(size: int, _align: int, _):
         return torch.empty(size, dtype=torch.int8, device="cuda")
 
     triton.set_allocator(alloc_fn)
@@ -2789,7 +2759,6 @@ def attention_bwd(
         desc_dq,
         desc_dk,
         desc_dv,
-        dq,
         sm_scale,
         desc_m,
         desc_delta,
@@ -2865,7 +2834,7 @@ class _attention(torch.autograd.Function):
         desc_k_scale = TensorDescriptor.from_tensor(k_scale, block_shape=dummy_block_shape)
         desc_v_scale = TensorDescriptor.from_tensor(v_scale, block_shape=dummy_block_shape)
 
-        def alloc_fn(size: int, align: int, _):
+        def alloc_fn(size: int, _align: int, _):
             return torch.empty(size, dtype=torch.int8, device="cuda")
 
         triton.set_allocator(alloc_fn)
@@ -3095,7 +3064,7 @@ def attention(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal, config=None)
     }
     _mxf8_host_descriptor_pre_hook(nargs)
 
-    def alloc_fn(size: int, align: int, _):
+    def alloc_fn(size: int, _align: int, _):
         return torch.empty(size, dtype=torch.int8, device="cuda")
 
     triton.set_allocator(alloc_fn)
