@@ -1242,21 +1242,21 @@ def _mxf8_bwd_host_descriptor_pre_hook(nargs):
 
     if not isinstance(nargs["desc_q"], TensorDescriptor):
         return
-    nargs["desc_q"].block_shape = [BLOCK_M1, HEAD_DIM]
+    nargs["desc_q"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM]
     if isinstance(nargs.get("desc_q_dk"), TensorDescriptor):
-        nargs["desc_q_dk"].block_shape = [BLOCK_M1, HEAD_DIM]
-    nargs["desc_k"].block_shape = [BLOCK_N1, HEAD_DIM]
+        nargs["desc_q_dk"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM]
+    nargs["desc_k"].block_shape = [1, 1, BLOCK_N1, HEAD_DIM]
     if isinstance(nargs.get("desc_k_dq"), TensorDescriptor):
-        nargs["desc_k_dq"].block_shape = [BLOCK_N1, HEAD_DIM]
-    nargs["desc_v"].block_shape = [BLOCK_N1, HEAD_DIM]
-    nargs["desc_do"].block_shape = [BLOCK_M1, HEAD_DIM]
+        nargs["desc_k_dq"].block_shape = [1, 1, BLOCK_N1, HEAD_DIM]
+    nargs["desc_v"].block_shape = [1, 1, BLOCK_N1, HEAD_DIM]
+    nargs["desc_do"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM]
     if isinstance(nargs.get("desc_do_dv"), TensorDescriptor):
-        nargs["desc_do_dv"].block_shape = [BLOCK_M1, HEAD_DIM]
-    nargs["desc_dq"].block_shape = [BLOCK_M1, HEAD_DIM // (EPILOGUE_SUBTILE * 2)]
+        nargs["desc_do_dv"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM]
+    nargs["desc_dq"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM // (EPILOGUE_SUBTILE * 2)]
     if isinstance(nargs.get("desc_dk"), TensorDescriptor):
-        nargs["desc_dk"].block_shape = [BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
+        nargs["desc_dk"].block_shape = [1, 1, BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
     if isinstance(nargs.get("desc_dv"), TensorDescriptor):
-        nargs["desc_dv"].block_shape = [BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
+        nargs["desc_dv"].block_shape = [1, 1, BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
     if isinstance(nargs.get("desc_m"), TensorDescriptor):
         nargs["desc_m"].block_shape = [BLOCK_M1]
     if isinstance(nargs.get("desc_delta"), TensorDescriptor):
@@ -1995,7 +1995,6 @@ def _attn_bwd_mxf8_ws(
 
                 tlx.barrier_wait(dv_fulls[0], persistent_tmem_phase)
                 slice_size: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
-                base_kv = base_q
                 for slice_id in tl.static_range(EPILOGUE_SUBTILE):
                     dv_slice = tlx.local_slice(
                         dv_tiles[0],
@@ -2012,7 +2011,9 @@ def _attn_bwd_mxf8_ws(
                         desc_dv,
                         dkv_store_buf[0],
                         [
-                            (base_kv + start_n).to(tl.int32),
+                            off_z,
+                            off_h,
+                            start_n,
                             slice_id * slice_size,
                         ],
                     )
@@ -2035,7 +2036,9 @@ def _attn_bwd_mxf8_ws(
                         desc_dk,
                         dkv_store_buf[0],
                         [
-                            (base_kv + start_n).to(tl.int32),
+                            off_z,
+                            off_h,
+                            start_n,
                             slice_id * slice_size,
                         ],
                     )
@@ -2076,7 +2079,9 @@ def _attn_bwd_mxf8_ws(
                             desc_dq,
                             dq_store_buf[dq_smem_idx],
                             [
-                                (base_q + curr_m).to(tl.int32),
+                                off_z,
+                                off_h,
+                                curr_m,
                                 slice_id * DQ_REDUCE_NCOL,
                             ],
                             store_reduce="add",
@@ -2404,7 +2409,6 @@ def _attn_bwd_mxf8_ws(
                 pid = tile_idx % n_tile_num
                 start_n = pid * BLOCK_N1
                 base_q = (off_z * H + off_h).to(tl.int64) * N_CTX
-                base_kv = base_q
                 # Scale TMA layout: [Z*H, REP_N (or REP_M), REP_HEAD, 2, 256].
                 # Tile selects (z, h) via off_seq_h, and the M / N index via
                 # the 2nd dim.
@@ -2426,7 +2430,7 @@ def _attn_bwd_mxf8_ws(
                 tlx.async_descriptor_load(
                     desc_k,
                     k_smem[kv_buf_id],
-                    [(base_kv + start_n).to(tl.int32), 0],
+                    [off_z, off_h, start_n, 0],
                     q_fulls[kv_buf_id],
                 )
                 tlx.async_descriptor_load(
@@ -2439,7 +2443,7 @@ def _attn_bwd_mxf8_ws(
                 tlx.async_descriptor_load(
                     desc_q,
                     q_smem[q_buf_id],
-                    [(base_q + curr_m).to(tl.int32), 0],
+                    [off_z, off_h, curr_m, 0],
                     q_fulls[q_buf_id],
                 )
                 tlx.async_descriptor_load(
@@ -2467,7 +2471,7 @@ def _attn_bwd_mxf8_ws(
                 tlx.async_descriptor_load(
                     desc_v,
                     v_smem[kv_buf_id],
-                    [(base_kv + start_n).to(tl.int32), 0],
+                    [off_z, off_h, start_n, 0],
                     do_fulls[kv_buf_id],
                 )
                 tlx.async_descriptor_load(
@@ -2482,7 +2486,7 @@ def _attn_bwd_mxf8_ws(
                 tlx.async_descriptor_load(
                     desc_do,
                     do_smem[do_buf_id],
-                    [(base_q + curr_m).to(tl.int32), 0],
+                    [off_z, off_h, curr_m, 0],
                     do_fulls[do_buf_id],
                 )
                 tlx.async_descriptor_load(
@@ -2508,7 +2512,7 @@ def _attn_bwd_mxf8_ws(
                 tlx.async_descriptor_load(
                     desc_do_dv,
                     do_dv_smem[do_buf_id],
-                    [(base_q + curr_m).to(tl.int32), 0],
+                    [off_z, off_h, curr_m, 0],
                     do_dv_fulls[do_buf_id],
                 )
                 tlx.async_descriptor_load(
@@ -2525,7 +2529,7 @@ def _attn_bwd_mxf8_ws(
                 tlx.async_descriptor_load(
                     desc_k_dq,
                     k_dq_smem[kv_buf_id],
-                    [(base_kv + start_n).to(tl.int32), 0],
+                    [off_z, off_h, start_n, 0],
                     k_dq_fulls[kv_buf_id],
                 )
                 tlx.async_descriptor_load(
@@ -2552,7 +2556,7 @@ def _attn_bwd_mxf8_ws(
                     tlx.async_descriptor_load(
                         desc_q,
                         q_smem[q_buf_id],
-                        [(base_q + curr_m).to(tl.int32), 0],
+                        [off_z, off_h, curr_m, 0],
                         q_fulls[q_buf_id],
                     )
                     tlx.async_descriptor_load(
@@ -2580,7 +2584,7 @@ def _attn_bwd_mxf8_ws(
                     tlx.async_descriptor_load(
                         desc_q_dk,
                         q_dk_smem[prev_q_buf_id],
-                        [(base_q + prev_m).to(tl.int32), 0],
+                        [off_z, off_h, prev_m, 0],
                         q_dk_fulls[prev_q_buf_id],
                     )
                     tlx.async_descriptor_load(
@@ -2598,7 +2602,7 @@ def _attn_bwd_mxf8_ws(
                     tlx.async_descriptor_load(
                         desc_do,
                         do_smem[do_buf_id],
-                        [(base_q + curr_m).to(tl.int32), 0],
+                        [off_z, off_h, curr_m, 0],
                         do_fulls[do_buf_id],
                     )
                     tlx.async_descriptor_load(
@@ -2624,7 +2628,7 @@ def _attn_bwd_mxf8_ws(
                     tlx.async_descriptor_load(
                         desc_do_dv,
                         do_dv_smem[do_buf_id],
-                        [(base_q + curr_m).to(tl.int32), 0],
+                        [off_z, off_h, curr_m, 0],
                         do_dv_fulls[do_buf_id],
                     )
                     tlx.async_descriptor_load(
@@ -2646,7 +2650,7 @@ def _attn_bwd_mxf8_ws(
                 tlx.async_descriptor_load(
                     desc_q_dk,
                     q_dk_smem[last_q_buf_id],
-                    [(base_q + last_m).to(tl.int32), 0],
+                    [off_z, off_h, last_m, 0],
                     q_dk_fulls[last_q_buf_id],
                 )
                 tlx.async_descriptor_load(
@@ -2733,19 +2737,21 @@ def attention_bwd(
     dk = torch.zeros(k.shape, device=k.device, dtype=torch.bfloat16)
     dv = torch.zeros(v.shape, device=v.device, dtype=torch.bfloat16)
 
-    dummy_block = [1, 1]
+    dummy_block = [1, 1, 1, 1]
     dummy_5d = [1, 1, 1, 1, 1]
+    desc_shape = [Z, H, N_CTX, HEAD_DIM]
+    desc_strides = [H * N_CTX * HEAD_DIM, N_CTX * HEAD_DIM, HEAD_DIM, 1]
 
-    desc_q = TensorDescriptor(q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-    desc_q_dk = TensorDescriptor(q_dk, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-    desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-    desc_k_dq = TensorDescriptor(k_dq, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-    desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-    desc_do = TensorDescriptor(do, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-    desc_do_dv = TensorDescriptor(do_dv, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-    desc_dq = TensorDescriptor(dq, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-    desc_dk = TensorDescriptor(dk, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-    desc_dv = TensorDescriptor(dv, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+    desc_q = TensorDescriptor(q, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
+    desc_q_dk = TensorDescriptor(q_dk, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
+    desc_k = TensorDescriptor(k, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
+    desc_k_dq = TensorDescriptor(k_dq, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
+    desc_v = TensorDescriptor(v, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
+    desc_do = TensorDescriptor(do, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
+    desc_do_dv = TensorDescriptor(do_dv, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
+    desc_dq = TensorDescriptor(dq, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
+    desc_dk = TensorDescriptor(dk, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
+    desc_dv = TensorDescriptor(dv, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
     desc_m = TensorDescriptor(M, shape=[y_dim], strides=[1], block_shape=[1])
     desc_delta = TensorDescriptor(delta, shape=[y_dim], strides=[1], block_shape=[1])
 
