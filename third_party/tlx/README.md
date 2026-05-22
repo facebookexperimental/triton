@@ -68,6 +68,8 @@ tlx.async_amd_descriptor_wait(0, [a_tok])
 - Use explicit `tlx.async_load_wait_group()` to ensure data is ready before consumption.
 - Handle prologue (prefetch) and epilogue (drain) around the main loop.
 
+See the gfx1250 warp-pipeline GEMM example (`third_party/amd/python/examples/gluon/f16_gemm_warp_pipeline_gfx1250.py`) for the full pattern.
+
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `label` | `str` | Stage name for diagnostics (e.g. `"load"`, `"compute"`) |
