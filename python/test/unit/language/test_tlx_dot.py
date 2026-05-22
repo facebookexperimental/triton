@@ -210,17 +210,18 @@ def test_async_dot_local_store(BLOCK, device):
         a_fulls = tlx.alloc_barriers(num_barriers=1, arrive_count=tl.constexpr(1))
         b_fulls = tlx.alloc_barriers(num_barriers=1, arrive_count=tl.constexpr(1))
 
+        a_view = tlx.local_view(a_tiles, 0)
+        b_view = tlx.local_view(b_tiles, 0)
+
         a_full = tlx.local_view(a_fulls, 0)
         tlx.barrier_expect_bytes(a_full, 2 * BLOCK * BLOCK)
-        tlx.async_descriptor_load(desc_a, a_tiles, [0, 0], a_full)
+        tlx.async_descriptor_load(desc_a, a_view, [0, 0], a_full)
         b_full = tlx.local_view(b_fulls, 0)
         tlx.barrier_expect_bytes(b_full, 2 * BLOCK * BLOCK)
-        tlx.async_descriptor_load(desc_b, b_tiles, [0, 0], b_full)
+        tlx.async_descriptor_load(desc_b, b_view, [0, 0], b_full)
 
         tlx.barrier_wait(a_full, 0)
         tlx.barrier_wait(b_full, 0)
-        a_view = tlx.local_view(a_tiles, 0)
-        b_view = tlx.local_view(b_tiles, 0)
         acc = tlx.async_dot(a_view, b_view)
         acc = tlx.async_dot_wait(0, acc)
 
@@ -238,7 +239,7 @@ def test_async_dot_local_store(BLOCK, device):
     desc_b = TensorDescriptor(b, shape=[BLOCK, BLOCK], strides=[BLOCK, 1], block_shape=[BLOCK, BLOCK])
     desc_c = TensorDescriptor(c, shape=[BLOCK, BLOCK], strides=[BLOCK, 1], block_shape=[BLOCK, BLOCK])
 
-    _kernel[(1, )](desc_a, desc_b, desc_c, BLOCK=BLOCK, num_stages=0, num_warps=4)
+    _kernel[(1, )](desc_a, desc_b, desc_c, BLOCK=BLOCK, num_stages=1, num_warps=4)
     z_ref = torch.matmul(a, b)
     torch.testing.assert_close(c, z_ref)
 
