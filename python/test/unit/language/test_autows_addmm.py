@@ -311,8 +311,11 @@ def addmm_kernel_1d_bias_ws(
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
     for tile_id in tl.range(
-            start_pid, num_tiles, NUM_SMS,
-            flatten=False, warp_specialize=True,
+            start_pid,
+            num_tiles,
+            NUM_SMS,
+            flatten=False,
+            warp_specialize=True,
             disallow_acc_multi_buffer=True,
             separate_epilogue_store=True,
     ):
@@ -367,7 +370,7 @@ def test_autows_addmm_hoist_convert_before_broadcast():
         torch.manual_seed(42)
         A = torch.randn((M, K), dtype=dtype, device=device)
         B = torch.randn((N, K), dtype=dtype, device=device)
-        bias_1d = torch.randn((N,), dtype=dtype, device=device)
+        bias_1d = torch.randn((N, ), dtype=dtype, device=device)
         C = torch.empty((M, N), dtype=dtype, device=device)
 
         def alloc_fn(size, align, stream):
@@ -386,12 +389,20 @@ def test_autows_addmm_hoist_convert_before_broadcast():
         ), )
 
         kernel = addmm_kernel_1d_bias_ws[grid](
-            a_desc, b_desc, c_desc, bias_desc,
-            M, N, K,
-            BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
-            BLOCK_SIZE_K=BLOCK_SIZE_K, GROUP_SIZE_M=GROUP_SIZE_M,
+            a_desc,
+            b_desc,
+            c_desc,
+            bias_desc,
+            M,
+            N,
+            K,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=GROUP_SIZE_M,
             NUM_SMS=NUM_SMS,
-            num_stages=num_stages, num_warps=num_warps,
+            num_stages=num_stages,
+            num_warps=num_warps,
             early_tma_store_lowering=True,
         )
 
@@ -402,12 +413,9 @@ def test_autows_addmm_hoist_convert_before_broadcast():
 
         # Check that convert_layout on bias happens before broadcast (on 1xN, not MxN)
         import re
-        cvt_before_bc = re.search(
-            r'convert_layout.*tensor<1x\d+xf32.*\n.*tt\.broadcast.*tensor<1x\d+xf32',
-            ttgir)
+        cvt_before_bc = re.search(r'convert_layout.*tensor<1x\d+xf32.*\n.*tt\.broadcast.*tensor<1x\d+xf32', ttgir)
         bc_before_cvt = re.search(
-            r'tt\.broadcast.*tensor<1x\d+xf32.*tensor<128x\d+xf32.*\n.*convert_layout.*tensor<128x\d+xf32',
-            ttgir)
+            r'tt\.broadcast.*tensor<1x\d+xf32.*tensor<128x\d+xf32.*\n.*convert_layout.*tensor<128x\d+xf32', ttgir)
         assert cvt_before_bc or not bc_before_cvt, \
             "Expected convert_layout before broadcast (on small 1xN tensor)"
 
