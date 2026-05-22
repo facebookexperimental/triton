@@ -26,6 +26,26 @@ try:
 except ImportError:
     native_create_jit_proxy = None
 
+# Fast tensor access API — lazily registered on first use.
+# Provides ~10x faster dtype/data_ptr extraction via direct C struct access.
+_torch_bridge_loaded = False
+_torch_bridge_init_done = False
+
+
+def _ensure_torch_bridge():
+    global _torch_bridge_loaded, _torch_bridge_init_done
+    if _torch_bridge_init_done:
+        return
+    _torch_bridge_init_done = True
+    try:
+        from triton._C.libtriton import register_tensor_access_api
+        from triton._C._torch_bridge import get_tensor_access_capsule
+        register_tensor_access_api(get_tensor_access_capsule())
+        _torch_bridge_loaded = True
+    except (ImportError, AttributeError):
+        pass
+
+
 TRITON_MODULE = "triton.language"
 GLUON_MODULE = "triton.experimental.gluon.language"
 
@@ -391,6 +411,12 @@ class KernelInterface(Generic[T]):
                 if proxy is not None:
                     cache[grid_key] = proxy
             if proxy is not None:
+                # For pure positional calls, return proxy directly — avoids
+                # the overhead of an intermediate Python *args/**kwargs closure
+                # (~5-10us per dispatch due to tuple reallocation).
+                # Kernels called with kwargs (e.g., mm.py) will hit the proxy
+                # and get TypeError, so those callers should use the autotuner
+                # path which merges kwargs→positional before calling the proxy.
                 return proxy
         return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
         # return cast(T, functools.partial(cast(Callable, self.run), grid=grid))
@@ -770,7 +796,6 @@ class JITFunction(JITCallable, KernelInterface[T]):
         # (callable grid, first call, or C extension unavailable).
         # Static-grid repeat calls go through JITCacheProxy directly.
         if not _skip_fc and self.c_cache and not warmup and not self.pre_run_hooks and not knobs.compilation.always_compile \
-                and not self.used_global_vals \
                 and knobs.runtime.add_stages_inspection_hook is None \
                 and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook \
                 and not self.launch_metadata:
@@ -783,11 +808,10 @@ class JITFunction(JITCallable, KernelInterface[T]):
             if kwargs:
                 _fc_args = list(args)
                 _fc_opts = {}
-                _param_names = self.arg_names
-                _param_set = set(_param_names)
+                _name_to_idx = self._param_name_to_idx
                 for k, v in kwargs.items():
-                    if k in _param_set:
-                        idx = _param_names.index(k)
+                    idx = _name_to_idx.get(k)
+                    if idx is not None:
                         while len(_fc_args) <= idx:
                             _fc_args.append(None)
                         _fc_args[idx] = v
@@ -799,6 +823,11 @@ class JITFunction(JITCallable, KernelInterface[T]):
             else:
                 _fc_args = args
                 _fc_hash = self._fc_options_hash
+            # Pad missing trailing args (default-valued constexpr params not
+            # explicitly passed) with None so the arg count matches n_params.
+            # None slots are hashed as TC_CONSTEXPR(hash(None)) which is stable.
+            if len(_fc_args) < len(self.params):
+                _fc_args = tuple(list(_fc_args) + [None] * (len(self.params) - len(_fc_args)))
             if len(_fc_args) == len(self.params):
                 if callable(grid):
                     _fc_grid = grid(dict(zip(self.arg_names, _fc_args)))
@@ -806,15 +835,29 @@ class JITFunction(JITCallable, KernelInterface[T]):
                     _fc_grid = grid
                 result = native_fast_dispatch(self, _fc_args, self.params, _fc_hash, _fc_grid, stream)
                 if result is not None:
-                    kernel = result
-                    if not getattr(kernel, '_dispatcher', None):
-                        grid_size = len(_fc_grid) if isinstance(_fc_grid, (tuple, list)) else 1
-                        grid_0 = _fc_grid[0] if grid_size > 0 else 1
-                        grid_1 = _fc_grid[1] if grid_size > 1 else 1
-                        grid_2 = _fc_grid[2] if grid_size > 2 else 1
-                        kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, None, None,
-                                   None, *_fc_args)
-                    return kernel
+                    # Verify globals haven't changed (cheap dict lookups).
+                    # used_global_vals tracks Python globals referenced in the kernel
+                    # body (e.g., module-level constants used as tl.constexpr). Their
+                    # values are baked into the compiled kernel at specialization time,
+                    # so if they change, the cached kernel is stale — fall through to
+                    # slow path which detects the mismatch and triggers recompilation.
+                    _globals_ok = True
+                    if self.used_global_vals:
+                        _not_present = object()
+                        for (name, _), (val, globals_dict) in self.used_global_vals.items():
+                            if globals_dict.get(name, _not_present) != val:
+                                _globals_ok = False
+                                break
+                    if _globals_ok:
+                        kernel = result
+                        if not getattr(kernel, '_dispatcher', None):
+                            grid_size = len(_fc_grid) if isinstance(_fc_grid, (tuple, list)) else 1
+                            grid_0 = _fc_grid[0] if grid_size > 0 else 1
+                            grid_1 = _fc_grid[1] if grid_size > 1 else 1
+                            grid_2 = _fc_grid[2] if grid_size > 2 else 1
+                            kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, None,
+                                       None, None, *_fc_args)
+                        return kernel
         _user_kwargs = dict(kwargs) if kwargs else {}
         kwargs["debug"] = kwargs.get("debug", self.debug) or knobs.runtime.debug
         # Enable sanitize_overflow if explicitly set via kwarg, env var (TRITON_SANITIZE_OVERFLOW), or if debug is enabled
@@ -856,6 +899,9 @@ class JITFunction(JITCallable, KernelInterface[T]):
             kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
             if kernel is None:
                 return None
+            _fc_needs_insert = self.c_cache
+        else:
+            _fc_needs_insert = False
 
         # Check that used global values have not changed.
         not_present = object()
@@ -896,17 +942,16 @@ class JITFunction(JITCallable, KernelInterface[T]):
                 kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,
                            knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *bound_args.values())
 
-            # Populate C specialization cache for future calls.
-            if self.c_cache:
+            # Populate C specialization cache for future calls (only on first compile).
+            if _fc_needs_insert:
                 _disp = getattr(kernel, '_dispatcher', None)
                 if _user_kwargs:
                     _ins_args = list(args)
                     _ins_opts = {}
-                    _param_names = self.arg_names
-                    _param_set = set(_param_names)
+                    _name_to_idx = self._param_name_to_idx
                     for k, v in _user_kwargs.items():
-                        if k in _param_set:
-                            idx = _param_names.index(k)
+                        idx = _name_to_idx.get(k)
+                        if idx is not None:
                             while len(_ins_args) <= idx:
                                 _ins_args.append(None)
                             _ins_args[idx] = v
@@ -918,6 +963,9 @@ class JITFunction(JITCallable, KernelInterface[T]):
                 else:
                     _ins_args = args
                     _ins_hash = self._fc_options_hash
+                # Pad missing trailing args (same as lookup path)
+                if len(_ins_args) < len(self.params):
+                    _ins_args = tuple(list(_ins_args) + [None] * (len(self.params) - len(_ins_args)))
                 native_fast_dispatch_insert(self, _ins_args, self.params, _ins_hash, kernel, _disp)
         return kernel
 
@@ -936,7 +984,9 @@ class JITFunction(JITCallable, KernelInterface[T]):
         self.do_not_specialize_on_alignment = do_not_specialize_on_alignment
         self._repr = repr
         self.launch_metadata = launch_metadata
-        self.c_cache = c_cache
+        self.c_cache = c_cache or (os.environ.get("TRITON_ENABLE_C_CACHE", "0") == "1")
+        if self.c_cache:
+            _ensure_torch_bridge()
         # Register for simple deserialization of JITFunction constants
         _triton_jit_function_registry[f"{self.module}:{self.fn.__qualname__}"] = self
 
@@ -964,6 +1014,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
         # TODO(jlebar): Remove uses of these fields outside this file, then
         # remove the fields here.
         self.arg_names = [p.name for p in self.params]
+        self._param_name_to_idx = {name: i for i, name in enumerate(self.arg_names)}
         self.constexprs = [p.num for p in self.params if p.is_constexpr]
 
         # Hooks that will be called prior to executing "run"

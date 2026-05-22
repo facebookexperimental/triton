@@ -5,6 +5,7 @@ import triton.language as tl
 from triton._internal_testing import is_hopper_or_newer, is_blackwell
 import triton.language.extra.tlx as tlx
 import traceback
+import gc
 
 
 def test_thread_id(device):
@@ -669,6 +670,58 @@ def test_fence_gpu(device):
     # Verify correctness
     assert x[0].item() == 1
     assert x[1].item() == 1
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_gpu_memory_not_leaked(device):
+    """
+    Check that Triton's JIT runtime does not retain references to input tensors
+    after a kernel call returns.
+
+    Caveats — this test can be unstable in certain environments:
+    - memory_allocated() is device-wide, not per-stream or per-kernel. If another
+      test or background process allocates/frees tensors between the two
+      measurements, the delta will be nonzero even without a real leak.
+    - If infra runs multiple tests on the same GPU concurrently,
+      it breaks the assumption that allocations are stable between measurements.
+    """
+
+    @triton.autotune(
+        configs=[
+            triton.Config({"BLOCK_SIZE": 512}),
+            triton.Config({"BLOCK_SIZE": 1024}),
+        ],
+        key=["N"],
+    )
+    @triton.jit
+    def copy_kernel(src_ptr, dst_ptr, N: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offs < N
+        x = tl.load(src_ptr + offs, mask=mask)
+        tl.store(dst_ptr + offs, x, mask=mask)
+
+    def run_copy():
+        N = 1024 * 1024
+        src = torch.randn(N, dtype=torch.float32, device=device)
+        dst = torch.empty_like(src)
+        grid = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE"]), )
+        copy_kernel[grid](src, dst, N)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(src, dst)
+
+    gc.collect()
+    torch.cuda.synchronize()
+    allocated_before = torch.cuda.memory_allocated()
+
+    run_copy()
+
+    gc.collect()
+    torch.cuda.synchronize()
+    allocated_after = torch.cuda.memory_allocated()
+
+    leaked = allocated_after - allocated_before
+    assert leaked == 0, (f"GPU memory leaked: {leaked} bytes held by live tensors after run_copy() returned")
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")

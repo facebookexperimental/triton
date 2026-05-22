@@ -219,6 +219,75 @@ class Autotuner(KernelInterface):
             }), file_name, binary=False)
         return False
 
+    def _try_fast_path(self, args, kwargs, config):
+        """Attempt C fast cache dispatch; return kernel or None to fall back.
+
+        Uses JITCacheProxy (hash=0) for subsequent calls after seeding.
+        On the first call per autotuner key, seeds the C cache by calling
+        run() with correct meta-params (kernel_cache HIT, no recompile)
+        and inserting the result under hash=0.
+
+        Returns None when preconditions aren't met (no c_cache, callable
+        grid that can't be evaluated, extra kwargs, etc.).
+        """
+        input_grid = kwargs.get('grid')
+        if input_grid is None or not getattr(self.fn, 'c_cache', False):
+            return None
+
+        # Build full positional args: user positional + config constexprs.
+        config_kwargs = config.all_kwargs()
+        fn_arg_names = self.fn.arg_names
+        _arg_name_set = set(fn_arg_names)
+        # Fall back if kwargs has extra keys (beyond 'grid'/'warmup') not in arg_names,
+        # since those would be silently dropped in the fast path.
+        if any(k not in _arg_name_set for k in kwargs if k not in {'grid', 'warmup'}):
+            return None
+
+        full_args = list(args)
+        for name in fn_arg_names[len(args):]:
+            if name in config_kwargs:
+                full_args.append(config_kwargs[name])
+            elif name in kwargs:
+                full_args.append(kwargs[name])
+            else:
+                return None  # Can't resolve all args.
+
+        # Evaluate callable grid using resolved args.
+        if callable(input_grid):
+            _meta_dict = dict(zip(fn_arg_names, full_args))
+            evaluated_grid = input_grid(_meta_dict)
+        else:
+            evaluated_grid = input_grid
+
+        # Separate meta-params (num_warps, etc.) from kernel args.
+        _meta = {k: v for k, v in config_kwargs.items() if k not in _arg_name_set}
+
+        # Seed C cache with hash=0 for JITCacheProxy.
+        # During autotuning, run() stored the kernel with a non-zero hash.
+        # JITCacheProxy always uses hash=0, so without seeding it would miss
+        # and recompile with wrong default options.
+        if not hasattr(self, '_fc_seeded'):
+            self._fc_seeded = set()
+        # Use autotuner key to distinguish specializations that may select
+        # different winning configs (different meta-params).
+        _seed_key = getattr(self, '_last_key', None)
+        if _seed_key not in self._fc_seeded:
+            try:
+                from triton._C.libtriton import native_fast_dispatch_insert
+            except (ImportError, AttributeError):
+                native_fast_dispatch_insert = None
+            kernel = self.fn.run(*full_args, grid=evaluated_grid, warmup=False, **_meta)
+            if native_fast_dispatch_insert is not None:
+                _disp = getattr(kernel, '_dispatcher', None)
+                if _disp is not None:
+                    _padded = tuple(full_args)
+                    if len(_padded) < len(self.fn.params):
+                        _padded = _padded + (None, ) * (len(self.fn.params) - len(_padded))
+                    native_fast_dispatch_insert(self.fn, _padded, self.fn.params, 0, kernel, _disp)
+            self._fc_seeded.add(_seed_key)
+            return kernel
+        return self.fn[evaluated_grid](*full_args)
+
     def run(self, *args, **kwargs):
         self.nargs = dict(zip(self.arg_names, args))
         used_cached_result = True
@@ -270,6 +339,7 @@ class Autotuner(KernelInterface):
                     benchmark()
 
             config = self.cache[key]
+            self._last_key = key
         else:
             config = self.configs[0]
         self.best_config = config
@@ -293,11 +363,9 @@ class Autotuner(KernelInterface):
                     if isinstance(device_cache, tuple) and len(device_cache) >= 1:
                         device_cache[0].clear()
         try:
-            ret = self.fn.run(
-                *args,
-                **kwargs,
-                **config.all_kwargs(),
-            )
+            ret = None if dump_best else self._try_fast_path(args, kwargs, config)
+            if ret is None:
+                ret = self.fn.run(*args, **kwargs, **config.all_kwargs())
         finally:
             if dump_best:
                 knobs.compilation.dump_ir = original_dump_ir

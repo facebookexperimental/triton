@@ -5,6 +5,7 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from typing import Optional
 from triton.tools.tensor_descriptor import TensorDescriptor
 
@@ -15,13 +16,6 @@ def alloc_fn(size: int, align: int, stream: Optional[int]):
     assert align == 128
     assert stream == 0
     return torch.empty(size, dtype=torch.int8, device=DEVICE)
-
-
-@triton.jit
-def _get_bufidx_phase(accum_cnt, NUM_BUFFERS):
-    bufIdx = accum_cnt % NUM_BUFFERS
-    phase = (accum_cnt // NUM_BUFFERS) & 1
-    return bufIdx, phase
 
 
 def matmul_tma_set_block_size_hook(nargs):
@@ -563,7 +557,7 @@ def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
                 offset_bn = pid_n * BN
 
                 for k in range(0, tl.cdiv(K, BK)):
-                    buf, p = _get_bufidx_phase(smem_accum_cnt, NUM_STAGES)
+                    buf, p = get_bufidx_phase(smem_accum_cnt, NUM_STAGES)
                     offset_k = k * BK
 
                     # Async load to a[buf]
@@ -664,7 +658,7 @@ def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
 
                 acc = tl.zeros([BM // 2, BN], dtype=tl.float32)
                 for k in range(0, tl.cdiv(K, BK)):
-                    buf, p = _get_bufidx_phase(smem_accum_cnt, NUM_STAGES)
+                    buf, p = get_bufidx_phase(smem_accum_cnt, NUM_STAGES)
 
                     # Wait for TMA load
                     full_a = tlx.local_view(bars_full_a, buf + NUM_STAGES * tlx.async_task_replica_id())  # noqa

@@ -80,30 +80,48 @@ intervening waits).
 |-----|------|-------------|
 | `dstTask` | `I32Attr` | Destination task ID — the foreign partition this barrier communicates with. The source task is the partition where the barrier lives (available via `async_task_id`). |
 | `channelGraph` | `DenseI32ArrayAttr` | Set of task IDs reachable from the destination through the channel adjacency graph (excluding the source). Used by `canAdvanceWSBarrier` to check if two barriers can be safely reordered. |
+| `parentId` | `I32Attr` | Local ID for the nearest ordered parent scope (`scf.for`, `scf.while`, or containing `tt.func`). Used only inside the current function for V2 ordered-region checks. |
+| `minRegionId` | `I32Attr` | Earliest ordered region reached by this channel summary. |
+| `maxRegionId` | `I32Attr` | Latest ordered region reached by this channel summary. |
 
 **Lifecycle:**
 1. `dstTask` is set when token ops are created in `insertAsyncComm`
    (before code partitioning).
-2. `channelGraph` is injected after code partitioning via
-   `buildChannelGraph()` + `injectChannelGraph()`.
-3. Both propagate through `doTokenLowering` to the resulting barrier ops.
+2. `channelGraph`, `parentId`, `minRegionId`, and `maxRegionId` are injected
+   after code partitioning via `buildChannelGraph()`,
+   `buildWSBarrierOrderedRegionRanges()`, and `injectChannelGraph()`.
+3. These fields propagate through `doTokenLowering` to the resulting barrier
+   ops.
 
-**Reordering rule:** Two WS barriers can be safely swapped if their
-`channelGraph` sets are disjoint. This is checked by
-`canAdvanceWSBarrier()` (see [Barrier Reordering](#barrier-reordering) below).
+**Reordering rule:** Same-direction WS barriers can be swapped directly. An
+arrive can be delayed past a wait if the graphs are disjoint, or if both
+barriers have valid ordered-region metadata in the same parent and the wait's
+reached regions are strictly earlier than the arrive's reached regions. This is
+checked by `canAdvanceWSBarrier()` and
+`canAdvanceWSBarrierArrivePastWait()` (see
+[Barrier Reordering](#barrier-reordering) below).
 
 Example:
 ```mlir
 // Producer commit to consumer task 2
 nvws.producer_commit %tok, %idx {
-  constraints = {dstTask = 2 : i32}
+  constraints = {WSBarrier = {dstTask = 2 : i32}}
 } : tensor<1x!nvws.token>, i32
 
-// After channelGraph injection
+// After channelGraph and ordered-region injection
 ttng.arrive_barrier %bar, 1 {
-  constraints = {dstTask = 2 : i32, channelGraph = array<i32: 1, 2>}
+  constraints = {WSBarrier = {
+    dstTask = 2 : i32,
+    channelGraph = array<i32: 1, 2>,
+    parentId = 0 : i32,
+    minRegionId = 3 : i32,
+    maxRegionId = 3 : i32
+  }}
 } : !ttg.memdesc<1xi64, #shared, #smem, mutable>
 ```
+
+See [WS Barrier Ordered Region Tracking](WSBarrierOrderedRegionTracking.md)
+for the V2 construction details.
 
 ### Pipeline Scheduling (future)
 
@@ -122,11 +140,11 @@ barrier ops, so any key set on a token op will appear on the lowered
 ```mlir
 // dstTask is set during insertAsyncComm
 nvws.producer_acquire %tok, %idx, %phase {
-  constraints = {dstTask = 2 : i32}
+  constraints = {WSBarrier = {dstTask = 2 : i32}}
 } : tensor<1x!nvws.token>, i32, i1
 
 nvws.consumer_wait %tok, %idx, %phase {
-  constraints = {dstTask = 0 : i32}
+  constraints = {WSBarrier = {dstTask = 0 : i32}}
 } : tensor<1x!nvws.token>, i32, i1
 ```
 
@@ -210,7 +228,7 @@ attribute directly (as currently defined). The two approaches can coexist:
 ## Barrier Reordering
 
 **Files:**
-- `nvidia/hopper/include/Transforms/WSBarrierReorder.h` — `canAdvanceWSBarrier`, `sinkWSArrives`, `raiseWSWaits`, `buildBarrierToMemoryOpMap`, `optimizeWSBarrierLocations`
+- `nvidia/hopper/include/Transforms/WSBarrierReorder.h` — `canAdvanceWSBarrier`, `canAdvanceWSBarrierArrivePastWait`, `sinkWSArrives`, `raiseWSWaits`, `buildBarrierToMemoryOpMap`, `optimizeWSBarrierLocations`
 - `lib/Dialect/TritonNvidiaGPU/Transforms/InterleaveTMem.cpp` — consumer of the above
 
 ### Motivation
@@ -234,17 +252,18 @@ before the existing tmem_load sinking. Four steps:
 2. **`sinkWSArrives` / `raiseWSWaits`** — Push arrive barriers down and
    pull wait barriers up within each basic block. An arrive can move past
    any non-barrier op (delaying the signal is always safe) and past another
-   arrive. It can move past a wait only if `canAdvanceWSBarrier` confirms
-   their `channelGraph` sets are disjoint. Waits follow the mirror rule,
-   with an additional check to not move past definitions of their operands.
+   WS arrive. It can move past a wait only if
+   `canAdvanceWSBarrierArrivePastWait` accepts either the V1 disjoint-graph
+   rule or the V2 ordered-region rule. Waits follow the mirror rule, with an
+   additional check to not move past definitions of their operands.
 
-3. **tmem_load sinking (channelGraph-aware)** — Each `tmem_load` inherits
-   the `channelGraph` from its associated arrive barrier. When the sinking
-   loop encounters a barrier, it calls `canAdvanceWSBarrier` with the
-   tmem_load's channelGraph to decide whether to pass it. All tmem_loads
-   in the same channel region (between the arrive and the preceding
-   same-channel barrier) get the same constraints, so split tmem_loads
-   are treated uniformly.
+3. **tmem_load sinking (WSBarrier-aware)** — Each `tmem_load` inherits the
+   full `WSBarrier` dictionary from its associated arrive barrier, including
+   `channelGraph` and ordered-region metadata. When the sinking loop
+   encounters a barrier, it calls `canAdvanceWSBarrier` with the `tmem_load`'s
+   constraints to decide whether to pass it. All tmem_loads in the same channel
+   region (between the arrive and the preceding same-channel barrier) get the
+   same constraints, so split tmem_loads are treated uniformly.
 
 4. **`optimizeWSBarrierLocations`** — After sinking, relocate each barrier
    back to an optimal position right next to its associated memory op
@@ -257,9 +276,27 @@ bool canAdvanceWSBarrier(optional<DictionaryAttr> constraintsA,
                          optional<DictionaryAttr> constraintsB);
 ```
 
-Returns true when both barriers have a `channelGraph` attribute and the
-two sets are disjoint (no shared task ID). Returns false conservatively
-if either barrier lacks `channelGraph`.
+Returns true when both barriers have `WSBarrier.channelGraph` and the two sets
+are disjoint (no shared task ID). Returns false conservatively if either
+barrier lacks `WSBarrier` or `channelGraph`.
+
+```cpp
+bool canAdvanceWSBarrierArrivePastWait(optional<DictionaryAttr> arrive,
+                                       optional<DictionaryAttr> wait);
+```
+
+This is the stricter opposite-direction check. It first accepts the same V1
+disjoint-graph case. If the graphs overlap, it accepts only when both barriers
+have valid `parentId`, `minRegionId`, and `maxRegionId`, both `parentId`
+values match, and:
+
+```text
+wait.maxRegionId < arrive.minRegionId
+```
+
+Invalid ordered-region metadata, including `parentId = -1` or region IDs of
+`-1`, preserves the conservative V1 behavior. Channels nested under `scf.if`
+currently receive invalid ordered-region metadata for this reason.
 
 ### Barrier Movement Rules
 
@@ -267,7 +304,7 @@ if either barrier lacks `channelGraph`.
 |------|--------|
 | Arrive, Arrive | Always safe |
 | Wait, Wait | Always safe |
-| Arrive, Wait | Safe only if `canAdvanceWSBarrier` returns true |
+| Arrive, Wait | Safe only if `canAdvanceWSBarrierArrivePastWait` returns true |
 | Wait, Arrive | Same check (mirror direction) |
 
 ### IR Example
@@ -277,25 +314,35 @@ Before (barriers block tmem_load sinking):
 ttng.wait_barrier %bar0, %phase : ...                           // tmem_load wait
 ttng.tmem_load %s0 → %v0                                        // stuck here
 ttng.tmem_load %s1 → %v1
-ttng.arrive_barrier %bar0, 1 {channelGraph = [1, 3]} : ...      // ← blocks sinking
-ttng.wait_barrier %bar1, %phase {channelGraph = [2]} : ...      // store wait
+ttng.arrive_barrier %bar0, 1 {constraints = {WSBarrier = {
+  channelGraph = array<i32: 1, 3>}}} : ...
+ttng.wait_barrier %bar1, %phase {constraints = {WSBarrier = {
+  channelGraph = array<i32: 2>}}} : ...
 ttg.local_store %v0, %smem
-ttng.arrive_barrier %bar1, 1 {channelGraph = [2]} : ...
-ttng.wait_barrier %bar2, %phase {channelGraph = [2]} : ...
+ttng.arrive_barrier %bar1, 1 {constraints = {WSBarrier = {
+  channelGraph = array<i32: 2>}}} : ...
+ttng.wait_barrier %bar2, %phase {constraints = {WSBarrier = {
+  channelGraph = array<i32: 2>}}} : ...
 ttg.local_store %v1, %smem
-ttng.arrive_barrier %bar2, 1 {channelGraph = [2]} : ...
+ttng.arrive_barrier %bar2, 1 {constraints = {WSBarrier = {
+  channelGraph = array<i32: 2>}}} : ...
 ```
 
 After (tmem_loads interleaved with store pipeline):
 ```mlir
 ttng.wait_barrier %bar0, %phase : ...                           // tmem_load wait
-ttng.wait_barrier %bar1, %phase {channelGraph = [2]} : ...      // store wait
+ttng.wait_barrier %bar1, %phase {constraints = {WSBarrier = {
+  channelGraph = array<i32: 2>}}} : ...
 ttng.tmem_load %s0 → %v0                                        // sunk past store wait
 ttg.local_store %v0, %smem
-ttng.arrive_barrier %bar1, 1 {channelGraph = [2]} : ...
-ttng.wait_barrier %bar2, %phase {channelGraph = [2]} : ...
+ttng.arrive_barrier %bar1, 1 {constraints = {WSBarrier = {
+  channelGraph = array<i32: 2>}}} : ...
+ttng.wait_barrier %bar2, %phase {constraints = {WSBarrier = {
+  channelGraph = array<i32: 2>}}} : ...
 ttng.tmem_load %s1 → %v1                                        // sunk past store wait
 ttg.local_store %v1, %smem
-ttng.arrive_barrier %bar0, 1 {channelGraph = [1, 3]} : ...      // sunk to end
-ttng.arrive_barrier %bar2, 1 {channelGraph = [2]} : ...
+ttng.arrive_barrier %bar0, 1 {constraints = {WSBarrier = {
+  channelGraph = array<i32: 1, 3>}}} : ...
+ttng.arrive_barrier %bar2, 1 {constraints = {WSBarrier = {
+  channelGraph = array<i32: 2>}}} : ...
 ```

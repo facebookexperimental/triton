@@ -569,6 +569,22 @@ def test_tmem_alloc_index(BLOCK_SIZE, device):
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_tmem_copy_rejects_logical_rank2_scale_smem(device):
+
+    @triton.jit
+    def kernel(dummy):
+        smem = tlx.local_alloc((128, 4), tl.uint8, tl.constexpr(1))
+        tmem = tlx.local_alloc((128, 4), tl.uint8, tl.constexpr(1), tlx.storage_kind.tmem)
+        tlx.tmem_copy(smem[0], tmem[0])
+        tl.store(dummy, tl.full((), 0, tl.int32))
+
+    dummy = torch.empty((), dtype=torch.int32, device=device)
+    with pytest.raises(triton.CompilationError) as exc_info:
+        kernel[(1, )](dummy)
+    assert "scale tmem_copy requires an explicit packed i8 SMEM shape" in str(exc_info.value)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 @pytest.mark.parametrize("BLOCK_SIZE_M, BLOCK_SIZE_N", [(64, 64), (64, 8), (128, 16)])
 def test_tmem_load_store(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
 
@@ -607,6 +623,34 @@ def test_tmem_load_store(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
 
     ref_out = torch.ones_like(x) + 2
     torch.testing.assert_close(x, ref_out)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.parametrize("SCALE_OFFSET", [0, 8])
+def test_tmem_scale_subslice_compile(SCALE_OFFSET):
+    SCALE_BLOCK_N = 16
+    SCALE_SLICE_N = 8
+
+    @triton.jit
+    def tmem_scale_subslice_compile_kernel(SCALE_OFFSET: tl.constexpr):
+        scale_smem = tlx.local_alloc((1, 1, 2, 2, 256), tl.uint8, tl.constexpr(1))
+        scale_tmem = tlx.local_alloc((128, SCALE_BLOCK_N), tl.uint8, tl.constexpr(1), tlx.storage_kind.tmem)
+        scale_slice = tlx.subslice(scale_tmem[0], SCALE_OFFSET, SCALE_SLICE_N)
+        tlx.tmem_copy(scale_smem[0], scale_slice)
+
+    kernel = tmem_scale_subslice_compile_kernel.warmup(SCALE_OFFSET, grid=(1, ))
+    ttgir = kernel.asm["ttgir"]
+    subslice_ops = [line.strip() for line in ttgir.splitlines() if "ttng.tmem_subslice" in line]
+    copy_ops = [line.strip() for line in ttgir.splitlines() if "ttng.tmem_copy" in line]
+
+    assert "tensor_memory_scales_encoding" in ttgir
+    assert len(subslice_ops) == 1
+    assert len(copy_ops) == 1
+    assert f"N = {SCALE_OFFSET} : i32" in subslice_ops[0]
+    assert f"!ttg.memdesc<128x{SCALE_BLOCK_N}xi8" in subslice_ops[0]
+    assert f"!ttg.memdesc<128x{SCALE_SLICE_N}xi8" in subslice_ops[0]
+    assert f"!ttg.memdesc<128x{SCALE_SLICE_N}xi8" in copy_ops[0]
+    assert "tcgen05.cp" in kernel.asm["ptx"]
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
@@ -772,7 +816,7 @@ def local_gather_kernel(
 
 
 @pytest.mark.parametrize("N,M", [(32, 32), (64, 64), (128, 128)])
-def test_local_gather(N, M):
+def test_local_gather_1d_native(N, M):
     """Test gathering from 1D reshaped shared memory (diagonal of 2D matrix)."""
     device = torch.device("cuda")
 

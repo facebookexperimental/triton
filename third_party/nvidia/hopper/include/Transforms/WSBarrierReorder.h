@@ -23,15 +23,8 @@ inline bool hasWSBarrierConstraints(std::optional<DictionaryAttr> constraints) {
   return static_cast<bool>(getWSBarrierConstraints(constraints));
 }
 
-// Check if two WS barriers can be safely swapped by verifying their
-// channelGraph sets are disjoint. Returns false if either barrier lacks
-// a WSBarrier constraint or channelGraph constraint (conservative).
-inline bool canAdvanceWSBarrier(std::optional<DictionaryAttr> constraintsA,
-                                std::optional<DictionaryAttr> constraintsB) {
-  auto wsBarrierA = getWSBarrierConstraints(constraintsA);
-  auto wsBarrierB = getWSBarrierConstraints(constraintsB);
-  if (!wsBarrierA || !wsBarrierB)
-    return false;
+inline bool areChannelGraphsDisjoint(DictionaryAttr wsBarrierA,
+                                     DictionaryAttr wsBarrierB) {
   auto graphA = wsBarrierA.getAs<DenseI32ArrayAttr>("channelGraph");
   auto graphB = wsBarrierB.getAs<DenseI32ArrayAttr>("channelGraph");
   if (!graphA || !graphB)
@@ -41,6 +34,48 @@ inline bool canAdvanceWSBarrier(std::optional<DictionaryAttr> constraintsA,
     if (setA.contains(id))
       return false;
   return true;
+}
+
+inline bool hasOrderedWSBarrierInfo(DictionaryAttr wsBarrier) {
+  auto parentId = wsBarrier.getAs<IntegerAttr>("parentId");
+  auto minRegionId = wsBarrier.getAs<IntegerAttr>("minRegionId");
+  auto maxRegionId = wsBarrier.getAs<IntegerAttr>("maxRegionId");
+  return parentId && parentId.getInt() >= 0 && minRegionId &&
+         minRegionId.getInt() >= 0 && maxRegionId && maxRegionId.getInt() >= 0;
+}
+
+// Check if two WS barriers can be safely swapped by verifying their
+// channelGraph sets are disjoint. Returns false if either barrier lacks
+// a WSBarrier constraint or channelGraph constraint (conservative).
+inline bool canAdvanceWSBarrier(std::optional<DictionaryAttr> constraintsA,
+                                std::optional<DictionaryAttr> constraintsB) {
+  auto wsBarrierA = getWSBarrierConstraints(constraintsA);
+  auto wsBarrierB = getWSBarrierConstraints(constraintsB);
+  if (!wsBarrierA || !wsBarrierB)
+    return false;
+  return areChannelGraphsDisjoint(wsBarrierA, wsBarrierB);
+}
+
+// Check whether an arrive can be delayed past a wait. V1 allows this when the
+// channel graphs are disjoint. V2 also allows overlapping channel graphs when
+// both barriers are in the same parent and the wait's ordered region is before
+// the arrive's ordered region.
+inline bool
+canAdvanceWSBarrierArrivePastWait(std::optional<DictionaryAttr> arrive,
+                                  std::optional<DictionaryAttr> wait) {
+  auto arriveWS = getWSBarrierConstraints(arrive);
+  auto waitWS = getWSBarrierConstraints(wait);
+  if (!arriveWS || !waitWS)
+    return false;
+  if (areChannelGraphsDisjoint(arriveWS, waitWS))
+    return true;
+  if (!hasOrderedWSBarrierInfo(arriveWS) || !hasOrderedWSBarrierInfo(waitWS))
+    return false;
+  if (arriveWS.getAs<IntegerAttr>("parentId").getInt() !=
+      waitWS.getAs<IntegerAttr>("parentId").getInt())
+    return false;
+  return waitWS.getAs<IntegerAttr>("maxRegionId").getInt() <
+         arriveWS.getAs<IntegerAttr>("minRegionId").getInt();
 }
 
 inline bool hasArriveLikeSemantics(Operation *op) {
@@ -57,7 +92,8 @@ inline bool canAdvanceWSBarrier(std::optional<DictionaryAttr> constraints,
   if (auto arrive = dyn_cast<ArriveBarrierOp>(op))
     return canAdvanceWSBarrier(constraints, arrive.getConstraints());
   if (auto wait = dyn_cast<WaitBarrierOp>(op))
-    return canAdvanceWSBarrier(constraints, wait.getConstraints());
+    return canAdvanceWSBarrierArrivePastWait(constraints,
+                                             wait.getConstraints());
   return !hasArriveLikeSemantics(op);
 }
 
@@ -112,6 +148,10 @@ inline bool sinkWSArrives(Block &block) {
       if (auto otherArrive = dyn_cast<ArriveBarrierOp>(cur)) {
         if (!hasWSBarrierConstraints(otherArrive.getConstraints()))
           break;
+      } else if (auto wait = dyn_cast<WaitBarrierOp>(cur)) {
+        if (!canAdvanceWSBarrierArrivePastWait(constraints,
+                                               wait.getConstraints()))
+          break;
       } else if (!canAdvanceWSBarrier(constraints, cur)) {
         break;
       }
@@ -155,6 +195,10 @@ inline bool raiseWSWaits(Block &block) {
         break;
       if (auto otherWait = dyn_cast<WaitBarrierOp>(cur)) {
         if (!hasWSBarrierConstraints(otherWait.getConstraints()))
+          break;
+      } else if (auto arrive = dyn_cast<ArriveBarrierOp>(cur)) {
+        if (!canAdvanceWSBarrierArrivePastWait(arrive.getConstraints(),
+                                               constraints))
           break;
       } else if (!canAdvanceWSBarrier(constraints, cur)) {
         break;

@@ -332,9 +332,8 @@ void TargetInfo::copyBulkSharedToRemoteShared(RewriterBase &rewriter,
                                               Value dstPtr, Value barrierPtr,
                                               Value ctaId, Value size) const {
   auto *ctx = rewriter.getContext();
-  // Elect one thread per warp to issue the bulk copy. This works correctly
-  // under warp specialization where the issuing warp may not be warp 0.
-  Value pred = LLVM::NVIDIA::createElectPredicate(loc, rewriter);
+  // Elect one thread across all warps to issue the bulk copy.
+  Value pred = LLVM::NVIDIA::createElectPredicateWarp0(loc, rewriter);
   // Map dst and barrier to the remote CTA's address space via mapa.
   Value remoteDstPtr = mapa(rewriter, loc, dstPtr, ctaId, pred);
   Value remoteMbarPtr = mapa(rewriter, loc, barrierPtr, ctaId, pred);

@@ -65,7 +65,7 @@ def create_benchmark(versions, mode="fwd"):
             elif provider in ATTENTION_METHODS:
                 attention = ATTENTION_METHODS[provider]
                 if provider == "ws_pipelined_persistent":
-                    o = attention(q, k, v, sm_scale, causal, 64, 1)
+                    o = attention(q, k, v, sm_scale, causal)
                 elif provider == "ws":
                     o = attention(q, k, v, sm_scale)
                 else:
@@ -77,7 +77,7 @@ def create_benchmark(versions, mode="fwd"):
         elif provider in ATTENTION_METHODS:
             attention = ATTENTION_METHODS[provider]
             if provider == "ws_pipelined_persistent":
-                fn = lambda: attention(q, k, v, sm_scale, causal, 64, 1)
+                fn = lambda: attention(q, k, v, sm_scale, causal)
             elif provider == "ws":
                 fn = lambda: attention(q, k, v, sm_scale)
             else:
