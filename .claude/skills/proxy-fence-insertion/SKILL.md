@@ -1,3 +1,12 @@
+---
+name: proxy-fence-insertion
+description: >
+  Use when working on fence-related compiler passes, TMA store lowering, proxy
+  fence insertion, investigating missing or spurious fences, or debugging
+  correctness issues in TLX kernels that use tlx.async_descriptor_store or MMA
+  operations.
+---
+
 # Proxy Fence Insertion
 
 Use when working on fence-related compiler passes, TMA store lowering, proxy
