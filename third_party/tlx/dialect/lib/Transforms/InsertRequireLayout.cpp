@@ -642,29 +642,41 @@ static Attribute chooseTDMBufEncoding(Operation *tdmOp, Value buf,
 
   // Precedence:
   //   1. An explicit padded shared layout already on the alloc wins. This
-  //      lets kernels pin a specific preshuffled scheme (e.g. Gluon's MXFP
-  //      operand/scale layouts) that the compiler's dot-aware heuristic
-  //      would otherwise overwrite. TLX's local_alloc auto-default on AMD
-  //      is swizzled, so a padded encoding at this point is user-supplied
-  //      and not the auto-default. AMD descriptor layout assignment
-  //      propagates this encoding back to the descriptor type.
-  //   2. Else, when `allowDotAware` is set and the buffer reaches a dot
+  //      lets kernels pin a specific preshuffled scheme that the compiler's
+  //      dot-aware heuristic would otherwise overwrite. AMD descriptor layout
+  //      assignment then propagates this encoding back to the descriptor
+  //      type.
+  //   2. A non-padded encoding that the user explicitly supplied (marked by
+  //      the Python `tlx.local_alloc` builder with `tlx.layout_is_explicit`)
+  //      is a hard error: TDM hardware verifiers require padding-shaped
+  //      encodings (stores additionally require `padInterval == innermost
+  //      block dim`), and downstream `OptimizeDescriptorEncoding`
+  //      unconditionally `cast<PaddedSharedEncodingAttr>`s the alloc
+  //      encoding. We fail loud here so the user sees the constraint
+  //      instead of an obscure crash. An alloc without the marker
+  //      (auto-default or any raw-MLIR consumer such as a lit test) falls
+  //      through and gets the descriptor-derived encoding below.
+  //   3. Else, when `allowDotAware` is set and the buffer reaches a dot
   //      consumer, use the WMMA-tuned `composePaddedLayout`.
-  //   3. Else, fall back to the descriptor-shape-only default.
-  //
-  // The padded-only gate in step 1 is a hard legality constraint, not a
-  // stylistic choice:
-  //   - TDM hardware verifiers require padding-shaped encodings (and TDM
-  //     stores additionally require `padInterval == innermost block dim`).
-  //   - Downstream `OptimizeDescriptorEncoding` unconditionally
-  //     `cast<PaddedSharedEncodingAttr>`s the alloc encoding while walking
-  //     TDM users; a non-padded user encoding would assert there.
-  // Non-padded user encodings therefore fall through; the Python-side
-  // user-facing warning for that case lives in
-  // `tlx.async_amd_descriptor_load` / `async_amd_descriptor_store`.
+  //   4. Else, fall back to the descriptor-shape-only default.
   Attribute encoding;
-  if (isa<ttg::PaddedSharedEncodingAttr>(bufType.getEncoding()))
+  if (isa<ttg::PaddedSharedEncodingAttr>(bufType.getEncoding())) {
     encoding = bufType.getEncoding();
+  } else {
+    Value root = findMemDescRoot(buf);
+    Operation *allocOp = root.getDefiningOp();
+    bool isExplicit = allocOp && allocOp->hasAttr("tlx.layout_is_explicit");
+    if (isExplicit) {
+      tdmOp->emitError()
+          << "TDM operand requires a padded shared encoding, but the alloc "
+             "carries "
+          << bufType.getEncoding()
+          << ". Pass `layout=tlx.padded_shared_layout_encoding(...)` to "
+             "`tlx.local_alloc`, or omit `layout=` to let the compiler "
+             "pick a descriptor-compatible encoding.";
+      return Attribute();
+    }
+  }
   if (!encoding && allowDotAware) {
     if (auto info = findDotConsumer(buf, solver)) {
       amdgpu::TargetFeatures targetFeatures(
@@ -685,22 +697,24 @@ static Attribute chooseTDMBufEncoding(Operation *tdmOp, Value buf,
 // Insert `tlx.require_layout` between `buf` and `tdmOp`'s memdesc operand,
 // rewriting it to a descriptor-compatible padded encoding. Idempotent: if
 // the buffer is already produced by a `require_layout`, leave it alone.
+// Returns failure when `chooseTDMBufEncoding` emits a hard error (user-
+// supplied non-padded encoding on a TDM buffer).
 template <typename TDMOp>
-static void anchorTDMRequireLayout(TDMOp tdmOp, Value buf,
-                                   MutableOperandRange operandToRewire,
-                                   bool allowDotAware, OpBuilder &builder,
-                                   DataFlowSolver &solver) {
+static LogicalResult
+anchorTDMRequireLayout(TDMOp tdmOp, Value buf,
+                       MutableOperandRange operandToRewire, bool allowDotAware,
+                       OpBuilder &builder, DataFlowSolver &solver) {
   if (buf.getDefiningOp<tlx::RequireLayoutOp>())
-    return;
+    return success();
   auto bufType = dyn_cast<ttg::MemDescType>(buf.getType());
   if (!bufType)
-    return;
+    return success();
   auto descTy = cast<tt::TensorDescType>(tdmOp.getDesc().getType());
 
   Attribute encoding =
       chooseTDMBufEncoding(tdmOp, buf, bufType, descTy, allowDotAware, solver);
   if (!encoding)
-    return;
+    return failure();
 
   builder.setInsertionPoint(tdmOp);
   auto newType = ttg::MemDescType::get(
@@ -710,16 +724,19 @@ static void anchorTDMRequireLayout(TDMOp tdmOp, Value buf,
   auto requireOp =
       tlx::RequireLayoutOp::create(builder, tdmOp.getLoc(), newType, buf);
   operandToRewire.assign(requireOp.getResult());
+  return success();
 }
 
-static void materializeTDMConstraints(ModuleOp m, OpBuilder &builder,
-                                      DataFlowSolver &solver) {
-  m.walk([&](Operation *op) {
-    if (auto load = dyn_cast<amdgpu::AsyncTDMCopyGlobalToLocalOp>(op))
-      anchorTDMRequireLayout(load, load.getResult(), load.getResultMutable(),
-                             /*allowDotAware=*/true, builder, solver);
-    else if (auto groupLoad =
-                 dyn_cast<amdgpu::AsyncTDMGroupCopyGlobalToLocalOp>(op)) {
+static LogicalResult materializeTDMConstraints(ModuleOp m, OpBuilder &builder,
+                                               DataFlowSolver &solver) {
+  WalkResult walk = m.walk([&](Operation *op) -> WalkResult {
+    if (auto load = dyn_cast<amdgpu::AsyncTDMCopyGlobalToLocalOp>(op)) {
+      if (failed(anchorTDMRequireLayout(
+              load, load.getResult(), load.getResultMutable(),
+              /*allowDotAware=*/true, builder, solver)))
+        return WalkResult::interrupt();
+    } else if (auto groupLoad =
+                   dyn_cast<amdgpu::AsyncTDMGroupCopyGlobalToLocalOp>(op)) {
       for (size_t i = 0; i < groupLoad.getDescs().size(); ++i) {
         Value desc = groupLoad.getDescs()[i];
         Value dst = groupLoad.getDsts()[i];
@@ -732,7 +749,7 @@ static void materializeTDMConstraints(ModuleOp m, OpBuilder &builder,
         Attribute encoding = chooseTDMBufEncoding(
             groupLoad, dst, bufType, descTy, /*allowDotAware=*/true, solver);
         if (!encoding)
-          continue;
+          return WalkResult::interrupt();
         builder.setInsertionPoint(groupLoad);
         auto newType = ttg::MemDescType::get(
             bufType.getShape(), bufType.getElementType(), encoding,
@@ -742,10 +759,15 @@ static void materializeTDMConstraints(ModuleOp m, OpBuilder &builder,
             builder, groupLoad.getLoc(), newType, dst);
         groupLoad.getDstsMutable()[i].assign(requireOp.getResult());
       }
-    } else if (auto store = dyn_cast<amdgpu::AsyncTDMCopyLocalToGlobalOp>(op))
-      anchorTDMRequireLayout(store, store.getSrc(), store.getSrcMutable(),
-                             /*allowDotAware=*/false, builder, solver);
+    } else if (auto store = dyn_cast<amdgpu::AsyncTDMCopyLocalToGlobalOp>(op)) {
+      if (failed(anchorTDMRequireLayout(
+              store, store.getSrc(), store.getSrcMutable(),
+              /*allowDotAware=*/false, builder, solver)))
+        return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
   });
+  return walk.wasInterrupted() ? failure() : success();
 }
 
 } // namespace
@@ -816,7 +838,8 @@ LogicalResult insertRequireLayout(ModuleOp m) {
   // Anchor `tlx.require_layout` on AMD TDM copy buffer operands so
   // tlx-propagate-layout rewrites the source `local_alloc` to a
   // descriptor-compatible encoding.
-  materializeTDMConstraints(m, builder, solver);
+  if (failed(materializeTDMConstraints(m, builder, solver)))
+    return failure();
 
   return success();
 }

@@ -158,6 +158,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
     full_shape = [unwrapped_num] + unwrapped_shape
     dtype = tl._unwrap_if_constexpr(dtype)
     elem_type = dtype.to_ir(_semantic.builder)
+    layout_is_explicit = layout is not None
     if layout is None:
         if storage == tlx.storage_kind.smem:
             if len(shape) == 1:
@@ -243,6 +244,14 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
     else:
         tensor_handle = _semantic.builder.create_tmem_alloc(full_shape, elem_type, layout_handle, alias_handle,
                                                             shared_buffer_handle)
+
+    if layout_is_explicit:
+        # Mark the alloc so downstream MLIR passes (e.g. TLXInsertRequireLayout)
+        # can distinguish a user-supplied encoding from the TLX auto-default
+        # and decide whether silently substituting a different encoding is
+        # legal. Absence of the marker is treated as auto-default (back-compat
+        # with raw-MLIR consumers like lit tests).
+        tensor_handle.set_attr("tlx.layout_is_explicit", _semantic.builder.get_unit_attr())
 
     return tlx.buffered_tensor(tensor_handle, dtype, unwrapped_shape, unwrapped_num, storage, layout)
 
