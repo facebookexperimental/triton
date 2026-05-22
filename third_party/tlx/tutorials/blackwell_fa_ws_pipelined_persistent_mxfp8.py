@@ -1532,7 +1532,7 @@ def _attn_bwd_mxf8_ws(
         tiles_per_sm += 1
     tile_idx = prog_id
 
-    DS_NUM_SUBS: tl.constexpr = 4
+    DS_NUM_SUBS: tl.constexpr = 2
 
     # ===== TMEM allocations =====
     # Single-region accumulator alias (qk/dp/p/dq overlap). Lifetime correctness
