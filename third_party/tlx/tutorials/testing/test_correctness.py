@@ -686,6 +686,7 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
     desc_k = TensorDescriptor(k, shape=[y_dim, head_dim], strides=[head_dim, 1], block_shape=dummy_block)
     desc_v = TensorDescriptor(v, shape=[y_dim, head_dim], strides=[head_dim, 1], block_shape=dummy_block)
     desc_o = TensorDescriptor(o, shape=[y_dim, head_dim], strides=[head_dim, 1], block_shape=dummy_block)
+    desc_m = TensorDescriptor(M, shape=[y_dim], strides=[1], block_shape=[1])
     desc_q_scale = TensorDescriptor.from_tensor(q_scale, block_shape=dummy_5d)
     desc_k_scale = TensorDescriptor.from_tensor(k_scale, block_shape=dummy_5d)
     desc_v_scale = TensorDescriptor.from_tensor(v_scale, block_shape=dummy_5d)
@@ -696,6 +697,7 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
         "desc_k": desc_k,
         "desc_v": desc_v,
         "desc_o": desc_o,
+        "desc_m": desc_m,
         "desc_q_scale": desc_q_scale,
         "desc_k_scale": desc_k_scale,
         "desc_v_scale": desc_v_scale,
@@ -716,7 +718,7 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
     )
     _attn_fwd_mxf8_ws.fn[fwd_grid](
         sm_scale,
-        M,
+        desc_m,
         Z,
         H,
         desc_q,

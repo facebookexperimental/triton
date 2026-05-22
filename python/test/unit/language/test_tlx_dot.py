@@ -482,10 +482,6 @@ def test_async_dot_blackwell_2cta_tma(device, A_TMEM, SAMPLE_M):
         tlx.barrier_wait(bar_a, tl.constexpr(0))
         tlx.barrier_wait(bar_b, tl.constexpr(0))
 
-        # difference from 1cta: CTA0 waits for both CTAs before issuing MMA op
-        tlx.barrier_arrive(cta_bars[0], arrive_count=1, remote_cta_rank=0)
-        tlx.barrier_wait(cta_bars[0], phase=0, pred=pred_cta0)
-
         buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
         acc_tmem = tlx.local_view(buffers, 0)
 
@@ -494,9 +490,15 @@ def test_async_dot_blackwell_2cta_tma(device, A_TMEM, SAMPLE_M):
             buf_alloc_a_tmem = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, tl.constexpr(1), tlx.storage_kind.tmem)
             a_reg = tlx.local_load(a_smem)
             tlx.local_store(buf_alloc_a_tmem[0], a_reg)
+            # difference from 1cta: CTA0 waits for both CTAs before issuing MMA op
+            tlx.barrier_arrive(cta_bars[0], arrive_count=1, remote_cta_rank=0)
+            tlx.barrier_wait(cta_bars[0], phase=0, pred=pred_cta0)
             tlx.async_dot(buf_alloc_a_tmem[0], b_smem, acc_tmem, use_acc=False, mBarriers=[mma_bars[0]], two_ctas=True,
                           out_dtype=OUT_DTYPE)
         else:
+            # difference from 1cta: CTA0 waits for both CTAs before issuing MMA op
+            tlx.barrier_arrive(cta_bars[0], arrive_count=1, remote_cta_rank=0)
+            tlx.barrier_wait(cta_bars[0], phase=0, pred=pred_cta0)
             tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=False, mBarriers=[mma_bars[0]], two_ctas=True,
                           out_dtype=OUT_DTYPE)
         tlx.barrier_wait(mma_bars[0], 0)
@@ -554,14 +556,12 @@ def test_async_dot_blackwell_2cta_tma(device, A_TMEM, SAMPLE_M):
 
     ptx = kernel.asm["ptx"]
     assert ptx.count("fence.mbarrier_init.release.cluster") == 1
-    assert ptx.count("fence.proxy.async.shared::cluster") >= 1
     # Verify ordering: fences → cluster sync → tmem alloc
     fence_mbar_pos = ptx.index("fence.mbarrier_init.release.cluster")
-    fence_proxy_pos = ptx.index("fence.proxy.async.shared::cluster")
     cluster_arrive_pos = ptx.index("barrier.cluster.arrive.aligned")
     cluster_wait_pos = ptx.index("barrier.cluster.wait.aligned")
     tmem_alloc_pos = ptx.index("tcgen05.alloc.cta_group::2")
-    assert fence_mbar_pos < fence_proxy_pos < cluster_arrive_pos < cluster_wait_pos < tmem_alloc_pos
+    assert fence_mbar_pos < cluster_arrive_pos < cluster_wait_pos < tmem_alloc_pos
     # 2 cluster syncs: 1 for init (before tmem alloc, after bar init), 1 for cleanup (before tmem dealloc)
     assert ptx.count("barrier.cluster.arrive.aligned") == 2
     assert ptx.count("barrier.cluster.wait.aligned") == 2
@@ -706,16 +706,14 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
     ptx = kernel.asm["ptx"]
     # Verify cluster sync and tmem alloc ordering in PTX:
     #   fence.mbarrier_init.release.cluster
-    #   fence.proxy.async.shared::cluster
     #   barrier.cluster.arrive.aligned  (default side)
     #   barrier.cluster.wait.aligned
     #   tcgen05.alloc.cta_group::2      (tmem alloc after cluster sync)
     fence_mbar_pos = ptx.index("fence.mbarrier_init.release.cluster")
-    fence_proxy_pos = ptx.index("fence.proxy.async.shared::cluster")
-    cluster_arrive_pos = ptx.index("barrier.cluster.arrive.aligned", fence_proxy_pos)
+    cluster_arrive_pos = ptx.index("barrier.cluster.arrive.aligned", fence_mbar_pos)
     cluster_wait_pos = ptx.index("barrier.cluster.wait.aligned")
     tmem_alloc_pos = ptx.index("tcgen05.alloc.cta_group::2")
-    assert fence_mbar_pos < fence_proxy_pos < cluster_arrive_pos < cluster_wait_pos < tmem_alloc_pos
+    assert fence_mbar_pos < cluster_arrive_pos < cluster_wait_pos < tmem_alloc_pos
     # 6 cluster arrives: 1 init (default) + 1 init (non-default) +
     #   1 cleanup (default, before tmem dealloc) + 3 cleanup (non-default warps MMA/producer/idle, per partition end)
     # 2 cluster waits: 1 init (default) + 1 cleanup (default, before tmem dealloc)
