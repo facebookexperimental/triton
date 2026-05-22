@@ -805,7 +805,7 @@ class _attention_opt(torch.autograd.Function):
 
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
         warp_specialize = baseVariant == "ws" or baseVariant == "ws_persistent"
-        if not FORCE_ON_DEVICE and supports_host_descriptor() and not (is_hopper() and warp_specialize):
+        if (not FORCE_ON_DEVICE and supports_host_descriptor() and not (is_hopper() and warp_specialize)):
             y_dim = q.shape[0] * q.shape[1] * q.shape[2]
 
             dummy_block = [1, 1]
