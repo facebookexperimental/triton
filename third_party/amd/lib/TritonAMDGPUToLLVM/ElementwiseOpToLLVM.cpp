@@ -2226,6 +2226,23 @@ struct FSubOpConversion
   }
 };
 
+// arith::NegFOp carries an arith::FastMathFlagsAttr that is incompatible with
+// LLVM::FastmathFlagsAttr expected by LLVM::FNegOp. The generic
+// ElementwiseOpConversion forwards attributes verbatim, causing a legalization
+// failure. This conversion creates LLVM::FNegOp directly without forwarding the
+// arith fastmath attribute.
+struct FNegOpConversion
+    : ElementwiseOpConversionBase<arith::NegFOp, FNegOpConversion> {
+  using ElementwiseOpConversionBase::ElementwiseOpConversionBase;
+
+  SmallVector<Value> createDestOps(arith::NegFOp op, OpAdaptor adaptor,
+                                   ConversionPatternRewriter &rewriter,
+                                   Type elemTy, MultipleOperandsRange operands,
+                                   Location loc) const {
+    return {LLVM::FNegOp::create(rewriter, loc, elemTy, operands[0][0])};
+  }
+};
+
 static SmallVector<Value> S8_to_Bf16(Location loc,
                                      ConversionPatternRewriter &rewriter,
                                      const SmallVector<Value> &v) {
@@ -2595,6 +2612,7 @@ void populateElementwiseOpToLLVMPatterns(
   patterns.add<FDivOpConversion>(typeConverter, axisInfoAnalysis, benefit);
   patterns.add<FSubOpConversion>(typeConverter, axisInfoAnalysis, benefit);
   patterns.add<FAddOpConversion>(typeConverter, axisInfoAnalysis, benefit);
+  patterns.add<FNegOpConversion>(typeConverter, axisInfoAnalysis, benefit);
   patterns.add<FMulOpConversion>(typeConverter, axisInfoAnalysis,
                                  targetInfo.getISAFamily(), benefit);
 
