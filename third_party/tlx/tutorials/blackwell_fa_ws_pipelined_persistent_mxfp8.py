@@ -2093,7 +2093,7 @@ def _attn_bwd_mxf8_ws(
             tlx.async_descriptor_store_wait(0)
 
         # ----- MMA warp: 5 blockscaled GEMMs per M-block -----
-        with tlx.async_task(num_warps=1, registers=88):
+        with tlx.async_task(num_warps=1, registers=80):
             blk_idx = 0
             for _i in range(tiles_per_sm):
                 kv_buf_id, kv_phase = get_bufidx_phase(_i, NUM_BUFFERS_KV)
