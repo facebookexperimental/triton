@@ -32,7 +32,7 @@ tt.func @local_load_coalesce(%arg0: !ttg.memdesc<128x64xf16, #shared, #smem>, %a
 //   local_store(reshape(x), dst)
 //
 // CHECK-LABEL: @local_store_reshape_convert
-// CHECK-SAME: %[[ARG:.*]]: tensor<32x4x32xf32, #[[$SRC:.*]]>
+// CHECK-SAME: %[[ARG:.*]]: tensor<32x4x32xf32, #[[$SRC:[^>]+]]>
 // CHECK-NOT: ttg.convert_layout
 // CHECK: %[[RESHAPE:.*]] = tt.reshape %[[ARG]] : tensor<32x4x32xf32, #[[$SRC]]> -> tensor<32x128xf32, #[[$DIRECT:.*]]>
 // CHECK-NEXT: ttg.local_store %[[RESHAPE]], %{{.*}} {async_task_id = array<i32: 7>, loop.cluster = 2 : i32, loop.stage = 3 : i32} : tensor<32x128xf32, #[[$DIRECT]]> -> !ttg.memdesc<32x128xf32, #{{.*}}, #{{.*}}, mutable>
