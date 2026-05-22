@@ -6,6 +6,8 @@ explicit GPUTarget and verify the generated TTGIR/AMDGCN. No AMD hardware is
 required for the compilation checks. Correctness checks (actual execution) run
 only when gfx950 hardware is available.
 """
+import re
+
 import pytest
 import torch
 
@@ -119,6 +121,38 @@ def test_local_load_compiles_gfx950(device):
     )
     ttgir = compiled.asm["ttgir"]
     assert "local_load" in ttgir
+
+
+@triton.jit
+def _local_load_with_token_kernel(
+    x_ptr, output_ptr, n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_elements
+
+    buf = tlx.local_alloc((BLOCK_SIZE,), tl.float32, 1)
+    buf0 = tlx.local_view(buf, 0)
+    tok = tlx.async_load(x_ptr + offs, buf0, mask=mask)
+    tlx.async_load_commit_group([tok])
+    wait_tok = tlx.async_load_wait_group(0)
+
+    x = tlx.local_load(buf0, token=wait_tok)
+    tl.store(output_ptr + offs, x, mask=mask)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_local_load_with_token_compiles_gfx950(device):
+    """local_load with a wait token should set syncedViaAsyncWait in TTGIR."""
+    compiled = compile_for_gfx950(
+        _local_load_with_token_kernel,
+        signature={"x_ptr": "*fp32", "output_ptr": "*fp32", "n_elements": "i32"},
+        constexprs={"BLOCK_SIZE": 64},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "local_load" in ttgir
+    assert re.search(r'ttg\.local_load .* \{ttg\.amdg\.syncedViaAsyncWait = true\}', ttgir, re.MULTILINE)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")

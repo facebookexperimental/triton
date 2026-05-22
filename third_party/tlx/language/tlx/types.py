@@ -990,10 +990,10 @@ class async_token(tl.base_value):
         self.type = async_token_type(handle)
 
     def _flatten_ir(self, handles) -> None:
-        # Async tokens are zero-width: they are not carried across loop
-        # iterations. Do not append to handles so _flatten_ir_types (which
-        # also emits nothing) stays consistent.
-        pass
+        handles.append(self.handle)
+
+    def _unflatten_ir(self, handles, cursor):
+        return async_token(handles[cursor]), cursor + 1
 
 
 class async_token_type(tl.base_type):
@@ -1011,7 +1011,7 @@ class async_token_type(tl.base_type):
         return repr(self)
 
     def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
-        return
+        out.append(self.value.get_type())
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int):
         return async_token(handles[cursor]), cursor + 1
