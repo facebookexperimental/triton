@@ -30,6 +30,7 @@ jobs:
         with:
           repository: meta-pytorch/tritonbench
           path: tritonbench
+          ref: xz9/fix-nightly
           submodules: recursive
       - name: Setup Tritonbench environment
         working-directory: tritonbench
@@ -63,6 +64,7 @@ jobs:
         with:
           repository: meta-pytorch/tritonbench
           path: tritonbench
+          ref: xz9/fix-nightly
           submodules: recursive
       - name: Setup Tritonbench environment
         working-directory: tritonbench
