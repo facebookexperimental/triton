@@ -358,17 +358,22 @@ private:
       return success();
     }
 
-    bool hasRemoteBar = false;
-    // Find if we have a remote bar
+    // Collect the actual barrier Values that participate in cross-CTA ops
+    // (not just a boolean "has remote bar"). We need these to identify which
+    // `init_barrier` ops correspond to *cross-CTA* barriers — only those need
+    // to live in the entry block for cluster sync correctness. Pure-local
+    // barriers (e.g., the inline fence barriers `SyncMMALowering` emits
+    // around `tc_gen5_mma`) never participate in cluster sync and can live
+    // anywhere.
+    SetVector<Value> remoteBarValues;
     mod.walk([&](Operation *op) {
-      SetVector<Operation *> ops;
       auto remoteBar = getRemoteBarrier(op);
       if (remoteBar.has_value()) {
-        hasRemoteBar = true;
-        return WalkResult::interrupt();
+        for (Value v : *remoteBar)
+          remoteBarValues.insert(v);
       }
-      return WalkResult::advance();
     });
+    bool hasRemoteBar = !remoteBarValues.empty();
 
     // If we have remote mbar/SMEM access, or if we have 2cta TMEM allocation,
     // we need a cluster sync after mbar init and before TMEM alloc
@@ -377,10 +382,44 @@ private:
       return success();
     }
 
-    // Find all bar init ops
+    // Walk back through single-operand memdesc-view ops (memdesc_index,
+    // memdesc_subview, memdesc_trans, tmem_subslice, ...) to find the
+    // originating `local_alloc` for a barrier-typed Value. Returns nullptr
+    // if the chain reaches a block argument or unknown op.
+    auto findAllocOf = [](Value v) -> Operation * {
+      while (Operation *defOp = v.getDefiningOp()) {
+        if (isa<ttg::LocalAllocOp>(defOp))
+          return defOp;
+        if (defOp->getNumOperands() == 0)
+          return nullptr;
+        v = defOp->getOperand(0);
+      }
+      return nullptr;
+    };
+
+    // The set of `local_alloc` ops backing the cross-CTA barriers.
+    SetVector<Operation *> remoteAllocs;
+    for (Value v : remoteBarValues) {
+      if (auto alloc = findAllocOf(v))
+        remoteAllocs.insert(alloc);
+    }
+
+    // Find init_barrier ops. If we have cross-CTA barriers, only collect the
+    // init_barriers backing those barriers — `SyncMMALowering`'s inline fence
+    // barriers (used only intra-CTA around `tc_gen5_mma`) are excluded so
+    // they don't trigger `ensureEarlyBarInit`. For the rare 2cta-TMEM-only
+    // case (no remote barriers), fall back to collecting all init_barriers to
+    // preserve the existing cluster-sync placement heuristic.
     SetVector<Operation *> remoteOrLocalBarInitOps;
     mod.walk([&](ttng::InitBarrierOp barInitOp) {
-      remoteOrLocalBarInitOps.insert(barInitOp);
+      if (remoteAllocs.empty()) {
+        remoteOrLocalBarInitOps.insert(barInitOp);
+        return;
+      }
+      if (auto alloc = findAllocOf(barInitOp.getAlloc())) {
+        if (remoteAllocs.count(alloc))
+          remoteOrLocalBarInitOps.insert(barInitOp);
+      }
     });
 
     // It's almost impossible for a clustered kernel to not have any mbar but

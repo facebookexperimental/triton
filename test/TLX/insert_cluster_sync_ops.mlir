@@ -163,9 +163,20 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
 
 // -----
 
-// Test that a local-only barrier init in a non-first block triggers an error
-// when remote barriers exist elsewhere in the module. The remote barrier is
-// in the first block, but the local init inside the WS region is not allowed.
+// Test that a *local-only* barrier init in a non-first block is ALLOWED,
+// even when remote barriers exist elsewhere in the module. The local
+// barrier (%4) is only used by init+arrive in the same partition body and
+// never reaches a cross-CTA op, so it does not require entry-block
+// placement for cluster-sync correctness. (The remote barrier %1 in the
+// entry block still anchors the cluster_arrive/cluster_wait insertion.)
+// This pattern is emitted by `SyncMMALowering` around `tc_gen5_mma`, so
+// rejecting it here would break the standard MMA-to-async lowering.
+// CHECK-LABEL: @local_bar_init_non_first_block_with_remote
+//       CHECK: mbarrier.init.shared::cta.b64
+//       CHECK: nvvm.cluster.arrive {aligned}
+//       CHECK: nvvm.cluster.wait {aligned}
+//       CHECK: nvvm.mapa
+//       CHECK: mbarrier.init.shared::cta.b64
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
@@ -176,16 +187,15 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
     %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     ttng.init_barrier %1, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     %2 = ttng.map_to_remote_buffer %1, %c0_i32 : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
-    ttg.warp_specialize(%0)
+    ttg.warp_specialize(%0) attributes {warpGroupStartIds = array<i32: 4>}
     default {
       ttg.warp_yield
     }
     partition0(%arg0: !ttg.memdesc<1xi64, #shared, #smem, mutable>) num_warps(4) {
-      // Local-only barrier init in non-first block should error
+      // Local-only barrier init in non-first block — now allowed.
       %3 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
       %c0 = arith.constant 0 : i32
       %4 = ttg.memdesc_index %3[%c0] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
-      // expected-error @+1 {{Barrier init outside of the first block in function is not supported}}
       ttng.init_barrier %4, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
       ttng.arrive_barrier %4, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
       ttg.warp_return
@@ -536,6 +546,60 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
        !ttg.memdesc<128x2xi8, #tmem_scales, #ttng.tensor_memory>,
        !ttg.memdesc<128x2xi8, #tmem_scales, #ttng.tensor_memory>,
        !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Regression test for the SyncMMALowering pattern: each call lowered from
+// sync `MMAv5OpInterface` op gets wrapped with an inline
+// `local_alloc + init_barrier + setIsAsync + wait_barrier + inval_barrier`
+// fence at the source location. When that source location is inside a
+// `warp_specialize` partition body, the inline `init_barrier` sits in a
+// non-first block. The fence barrier is purely intra-CTA — never reaches a
+// cross-CTA op — so the verifier must NOT reject it just because the
+// surrounding kernel is clustered. (Pre-fix, this errored with "Barrier
+// init outside of the first block in function is not supported for CTA
+// clusters" because the verifier collected every init_barrier regardless of
+// whether it participated in cluster sync.)
+// CHECK-LABEL: @sync_mma_lowering_inline_fence_in_partition
+//       CHECK: mbarrier.init.shared::cta.b64
+//       CHECK: nvvm.cluster.arrive {aligned}
+//       CHECK: nvvm.cluster.wait {aligned}
+//       CHECK: nvvm.mapa
+//       CHECK: mbarrier.init.shared::cta.b64
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  tt.func public @sync_mma_lowering_inline_fence_in_partition() attributes {noinline = false} {
+    // Remote barrier in entry block — keeps cluster_arrive/wait insertion path active.
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %c0_i32 = arith.constant 0 : i32
+    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.init_barrier %1, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %2 = ttng.map_to_remote_buffer %1, %c0_i32 : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+    ttg.warp_specialize() attributes {warpGroupStartIds = array<i32: 4>}
+    default {
+      ttg.warp_yield
+    }
+    partition0() num_warps(4) {
+      // SyncMMALowering's inline fence pattern: alloc + init + arrive + wait
+      // + inval, all in the partition body. Pre-fix: init_barrier here
+      // would fail `ensureEarlyBarInit` since it's not in the function
+      // entry block. Post-fix: allowed because the barrier %fence is purely
+      // intra-CTA (never used by a cross-CTA op).
+      %fence_alloc = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+      %c0 = arith.constant 0 : i32
+      %fence = ttg.memdesc_index %fence_alloc[%c0] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+      ttng.init_barrier %fence, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+      ttng.arrive_barrier %fence, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+      %phase = arith.constant 0 : i32
+      %true = arith.constant true
+      ttng.wait_barrier %fence, %phase, %true : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+      ttng.inval_barrier %fence : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+      ttg.warp_return
+    } : () -> ()
     tt.return
   }
 }
