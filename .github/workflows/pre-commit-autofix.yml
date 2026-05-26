@@ -1,29 +1,229 @@
-name: Pre-Commit Autofix
+name: Pre-Commit Fix
 
 on:
-  pull_request:
-    branches-ignore: ['llvm-**']
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to fix formatting for'
+        required: true
+        type: number
+  workflow_run:
+    workflows: ["Integration Tests"]
+    types: [completed]
 
-# GITHUB_TOKEN — no third-party apps, no PATs, no external credentials.
-# Commits pushed with GITHUB_TOKEN do NOT re-trigger workflows (GitHub's
-# built-in loop prevention), so no infinite CI loops.
 permissions:
   contents: write
+  pull-requests: write
+  actions: read
+
+concurrency:
+  group: pre-commit-fix-${{ github.event.issue.number || inputs.pr_number || github.event.workflow_run.id }}
+  cancel-in-progress: true
 
 jobs:
-  autofix:
-    name: pre-commit autofix
-    # Skip fork PRs — GITHUB_TOKEN can't push to external forks.
-    # Skip bot commits from this workflow (belt-and-suspenders loop guard).
+  # ── Post a bot comment when the pre-commit check fails on a PR ──
+  notify:
+    name: Notify pre-commit failure
     if: >-
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      !contains(github.event.pull_request.title, '[pre-commit autofix]')
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout PR branch
-        uses: actions/checkout@v6
+      - name: Get PR number and check pre-commit status
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUMBER="${{ github.event.workflow_run.pull_requests[0].number }}"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR associated with this workflow run (likely a fork PR)."
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "pr_number=${PR_NUMBER}" >> $GITHUB_OUTPUT
+
+          # Match by job name from pre-commit.yml. If that name changes,
+          # update this selector to match.
+          JOBS=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}/jobs")
+          PRE_COMMIT_CONCLUSION=$(echo "$JOBS" | jq -r '.jobs[] | select(.name == "pre-commit (code formatting)") | .conclusion')
+
+          echo "pre_commit_status=${PRE_COMMIT_CONCLUSION}" >> $GITHUB_OUTPUT
+
+          if [ "$PRE_COMMIT_CONCLUSION" == "failure" ]; then
+            echo "skip=false" >> $GITHUB_OUTPUT
+          else
+            echo "skip=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post or clean up bot comment
+        if: steps.check.outputs.pr_number
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.check.outputs.pr_number }}
+          SKIP: ${{ steps.check.outputs.skip }}
+          PRE_COMMIT_STATUS: ${{ steps.check.outputs.pre_commit_status }}
+        run: |
+          MARKER="<!-- pre-commit-fix-bot -->"
+          EXISTING=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" | head -1)
+
+          # Pre-commit passed or was skipped — clean up old comment
+          if [ "$SKIP" == "true" ]; then
+            if [ -n "$EXISTING" ]; then
+              gh api -X DELETE "repos/${{ github.repository }}/issues/comments/${EXISTING}"
+            fi
+            exit 0
+          fi
+
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}"
+          FIX_URL="${{ github.server_url }}/${{ github.repository }}/actions/workflows/pre-commit-autofix.yml"
+
+          # Check if this is a fork PR
+          PR_DATA=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}")
+          HEAD_REPO=$(echo "$PR_DATA" | jq -r '.head.repo.full_name')
+
+          {
+            echo "${MARKER}"
+            echo "### Pre-commit check failed"
+            echo ""
+            echo "Formatting issues were detected. [View the failed check](${RUN_URL}) for details."
+            echo ""
+            if [ "$HEAD_REPO" != "${{ github.repository }}" ]; then
+              echo "**To fix locally:**"
+              echo '```bash'
+              echo "pre-commit run --all-files"
+              echo "git add -A && git commit -m 'fix formatting' && git push"
+              echo '```'
+            else
+              echo "**To fix automatically**, comment \`/fix-precommit\` below and the bot will push a fix commit."
+              echo ""
+              echo "**To fix locally:**"
+              echo '```bash'
+              echo "pre-commit run --all-files"
+              echo "git add -A && git commit -m 'fix formatting' && git push"
+              echo '```'
+              echo ""
+              echo "Maintainers can also [run the fix workflow manually](${FIX_URL}) with PR #${PR_NUMBER}."
+            fi
+          } > /tmp/comment_body.md
+
+          if [ -n "$EXISTING" ]; then
+            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/${EXISTING}" \
+              -f body="$(cat /tmp/comment_body.md)"
+          else
+            gh pr comment "${PR_NUMBER}" --body-file /tmp/comment_body.md
+          fi
+
+  # ── Fix pre-commit issues on demand ──
+  fix:
+    name: Fix pre-commit
+    if: >-
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       contains(github.event.comment.body, '/fix-precommit')) ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get PR details
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" == "issue_comment" ]; then
+            PR_NUMBER=${{ github.event.issue.number }}
+          else
+            PR_NUMBER=${{ inputs.pr_number }}
+          fi
+          echo "number=${PR_NUMBER}" >> $GITHUB_OUTPUT
+
+          PR_DATA=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}")
+          HEAD_REF=$(echo "$PR_DATA" | jq -r '.head.ref')
+          HEAD_REPO=$(echo "$PR_DATA" | jq -r '.head.repo.full_name')
+          BASE_REF=$(echo "$PR_DATA" | jq -r '.base.ref')
+          PR_STATE=$(echo "$PR_DATA" | jq -r '.state')
+
+          PR_AUTHOR=$(echo "$PR_DATA" | jq -r '.user.login')
+
+          echo "head_ref=${HEAD_REF}" >> $GITHUB_OUTPUT
+          echo "head_repo=${HEAD_REPO}" >> $GITHUB_OUTPUT
+          echo "base_ref=${BASE_REF}" >> $GITHUB_OUTPUT
+          echo "state=${PR_STATE}" >> $GITHUB_OUTPUT
+          echo "author=${PR_AUTHOR}" >> $GITHUB_OUTPUT
+
+          if [ "$HEAD_REPO" != "${{ github.repository }}" ]; then
+            echo "is_fork=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_fork=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate PR is open
+        if: steps.pr.outputs.state != 'open'
+        run: |
+          echo "::error::PR #${{ steps.pr.outputs.number }} is ${{ steps.pr.outputs.state }}, not open."
+          exit 1
+
+      - name: Check permissions
+        if: github.event_name == 'issue_comment'
+        id: perms
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+          PR_AUTHOR: ${{ steps.pr.outputs.author }}
+        run: |
+          if [ "$COMMENTER" == "$PR_AUTHOR" ]; then
+            echo "authorized=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          PERM=$(gh api "repos/${{ github.repository }}/collaborators/${COMMENTER}/permission" \
+            --jq '.permission' 2>/dev/null || echo "none")
+
+          if [ "$PERM" == "admin" ] || [ "$PERM" == "write" ] || [ "$PERM" == "maintain" ]; then
+            echo "authorized=true" >> $GITHUB_OUTPUT
+          else
+            echo "authorized=false" >> $GITHUB_OUTPUT
+            echo "::warning::User ${COMMENTER} does not have write access."
+          fi
+
+      - name: Reject unauthorized users
+        if: >-
+          github.event_name == 'issue_comment' &&
+          steps.perms.outputs.authorized != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment "${{ steps.pr.outputs.number }}" \
+            --body "<!-- pre-commit-fix-bot -->
+          Only the PR author and repo collaborators can trigger \`/fix-precommit\`."
+          exit 1
+
+      - name: Reject fork PRs
+        if: steps.pr.outputs.is_fork == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment "${{ steps.pr.outputs.number }}" \
+            --body "<!-- pre-commit-fix-bot -->
+          Can't push fixes to fork branches. Please apply locally:
+          \`\`\`bash
+          pre-commit run --all-files
+          git add -A && git commit -m 'fix formatting' && git push
+          \`\`\`"
+          exit 1
+
+      - name: React to comment
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content='eyes'
+
+      - uses: actions/checkout@v6
         with:
-          ref: ${{ github.head_ref }}
+          ref: ${{ steps.pr.outputs.head_ref }}
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -50,11 +250,9 @@ jobs:
         id: changed
         run: |
           git diff --name-only --diff-filter=ACMR \
-            origin/${{ github.base_ref }}...HEAD > /tmp/changed_files.txt
+            origin/${{ steps.pr.outputs.base_ref }}...HEAD > /tmp/changed_files.txt
 
           FILE_COUNT=$(wc -l < /tmp/changed_files.txt | tr -d ' ')
-          echo "count=$FILE_COUNT" >> $GITHUB_OUTPUT
-
           if [ "$FILE_COUNT" -eq 0 ]; then
             echo "has_files=false" >> $GITHUB_OUTPUT
           else
@@ -64,9 +262,6 @@ jobs:
       - name: Run auto-fixable hooks on changed files
         if: steps.changed.outputs.has_files == 'true'
         run: |
-          # Only hooks that modify files in-place. Check-only hooks (mypy,
-          # check-ast, detect-private-key) are left to the main pre-commit
-          # workflow — they report errors but can't auto-fix.
           FIXABLE_HOOKS=(
             ruff
             yapf
@@ -83,35 +278,87 @@ jobs:
             echo "::endgroup::"
           done
 
-      - name: Check for fixes
-        id: diff
+      - name: Commit and push fixes
+        id: push
         run: |
           if git diff --quiet; then
-            echo "has_changes=false" >> $GITHUB_OUTPUT
-            echo "No formatting issues found." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "has_changes=true" >> $GITHUB_OUTPUT
-            CHANGED=$(git diff --name-only | wc -l | tr -d ' ')
-            echo "fixed_count=$CHANGED" >> $GITHUB_OUTPUT
-            echo "### Auto-fixed $CHANGED file(s)" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            git diff --stat >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "No formatting issues to fix." >> $GITHUB_STEP_SUMMARY
+            echo "pushed=false" >> $GITHUB_OUTPUT
+            exit 0
           fi
 
-      - name: Commit and push fixes
-        if: steps.diff.outputs.has_changes == 'true'
-        run: |
+          CHANGED=$(git diff --name-only | wc -l | tr -d ' ')
+          echo "fixed_count=$CHANGED" >> $GITHUB_OUTPUT
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "[pre-commit autofix] Fix formatting in ${{ steps.diff.outputs.fixed_count }} file(s)
+          git commit -m "[pre-commit autofix] Fix formatting in ${CHANGED} file(s)
 
           Automated fixes applied by pre-commit hooks: ruff, yapf, clang-format,
           trailing-whitespace, end-of-file-fixer.
 
-          Please pull these changes into your local branch."
+          Triggered by /fix-precommit command. Please pull these changes."
 
-          # Push may fail if the PR author pushed while this was running.
-          # That's fine — the next PR event will re-trigger this workflow.
-          git push || echo "::warning::Push failed (likely a concurrent update). Fixes will be retried on next push."
+          git push
+          echo "pushed=true" >> $GITHUB_OUTPUT
+
+          echo "### Fixed formatting in $CHANGED file(s)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          git diff --stat HEAD~1 >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Post result comment
+        if: always() && steps.pr.outputs.number
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUSHED: ${{ steps.push.outputs.pushed }}
+          FIXED_COUNT: ${{ steps.push.outputs.fixed_count }}
+          PUSH_OUTCOME: ${{ steps.push.outcome }}
+        run: |
+          PR_NUMBER=${{ steps.pr.outputs.number }}
+          MARKER="<!-- pre-commit-fix-bot -->"
+
+          if [ "$PUSHED" == "true" ]; then
+            BODY="${MARKER}
+          Pre-commit fixes pushed — **${FIXED_COUNT} file(s)** formatted.
+
+          Pull the changes and push to re-trigger CI:
+          \`\`\`bash
+          git pull && git push
+          \`\`\`"
+          elif [ "$PUSH_OUTCOME" == "failure" ]; then
+            BODY="${MARKER}
+          Pre-commit fix failed. Check the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.
+
+          You can retry by commenting \`/fix-precommit\` again."
+          else
+            BODY="${MARKER}
+          No formatting issues found — nothing to fix."
+          fi
+
+          # Update existing bot comment or create new one
+          EXISTING=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" | head -1)
+
+          if [ -n "$EXISTING" ]; then
+            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/${EXISTING}" \
+              -f body="${BODY}"
+          else
+            gh pr comment "${PR_NUMBER}" --body "${BODY}"
+          fi
+
+      - name: React with result
+        if: github.event_name == 'issue_comment' && always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ steps.push.outputs.pushed }}" == "true" ]; then
+            REACTION="rocket"
+          elif [ "${{ job.status }}" == "failure" ]; then
+            REACTION="-1"
+          else
+            REACTION="+1"
+          fi
+          gh api "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content="${REACTION}"
