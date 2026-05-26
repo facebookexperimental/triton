@@ -22,7 +22,6 @@ from triton._internal_testing import is_blackwell
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
-
 # =============================================================================
 # Common utilities
 # =============================================================================
@@ -73,8 +72,8 @@ class FlashAttention:
 @pytest.mark.parametrize("maxRegAutoWS", [152, 192])
 @pytest.mark.parametrize("pingpongAutoWS", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
-def test_autows_fa_dp_non_causal(SUBTILING, SUBTILING_P, VECT_MUL, FADD2_REDUCE,
-                                 BLOCK_N, GROUP_SIZE_N, maxRegAutoWS, pingpongAutoWS):
+def test_autows_fa_dp_non_causal(SUBTILING, SUBTILING_P, VECT_MUL, FADD2_REDUCE, BLOCK_N, GROUP_SIZE_N, maxRegAutoWS,
+                                 pingpongAutoWS):
     config = FlashAttention.CONFIGS["autows_fa_dp"].copy()
     config["SUBTILING"] = SUBTILING
     config["SUBTILING_P"] = SUBTILING_P
@@ -109,8 +108,8 @@ def test_autows_fa_dp_non_causal(SUBTILING, SUBTILING_P, VECT_MUL, FADD2_REDUCE,
 @pytest.mark.parametrize("maxRegAutoWS", [152, 192])
 @pytest.mark.parametrize("pingpongAutoWS", [False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
-def test_autows_fa_dp_causal(SUBTILING, SUBTILING_P, VECT_MUL, FADD2_REDUCE,
-                             BLOCK_N, GROUP_SIZE_N, maxRegAutoWS, pingpongAutoWS):
+def test_autows_fa_dp_causal(SUBTILING, SUBTILING_P, VECT_MUL, FADD2_REDUCE, BLOCK_N, GROUP_SIZE_N, maxRegAutoWS,
+                             pingpongAutoWS):
     config = FlashAttention.CONFIGS["autows_fa_dp"].copy()
     config["SUBTILING"] = SUBTILING
     config["SUBTILING_P"] = SUBTILING_P
@@ -145,8 +144,7 @@ def test_autows_fa_non_causal(SUBTILING, VECT_MUL, FADD2_REDUCE, baseVariant):
     for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
         q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
         ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal=False)
-        tri_out = _autows_fa(q, k, v, False, sm_scale, baseVariant,
-                             SUBTILING, VECT_MUL, FADD2_REDUCE)
+        tri_out = _autows_fa(q, k, v, False, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE)
         torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
 
 
@@ -166,6 +164,5 @@ def test_autows_fa_causal(SUBTILING, VECT_MUL, FADD2_REDUCE, baseVariant):
     for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
         q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
         ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal=True)
-        tri_out = _autows_fa(q, k, v, True, sm_scale, baseVariant,
-                             SUBTILING, VECT_MUL, FADD2_REDUCE)
+        tri_out = _autows_fa(q, k, v, True, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE)
         torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)

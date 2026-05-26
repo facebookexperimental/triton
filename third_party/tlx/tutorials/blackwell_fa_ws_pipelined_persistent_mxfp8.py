@@ -1296,7 +1296,7 @@ mxfp8_bwd_configs = [
             "NUM_BUFFERS_DS": 1,
             "EPILOGUE_SUBTILE": 2,
         },
-        num_warps=4,
+        num_warps=8,
         num_stages=1,
         pre_hook=_mxf8_bwd_host_descriptor_pre_hook,
     ),
@@ -1342,7 +1342,7 @@ def _softmax_recompute_quantization_iter(
     DS_NUM_SUBS: tl.constexpr,
 ):
     DS_M_SUB: tl.constexpr = BLOCK_M1 // DS_NUM_SUBS
-    BWD_NUM_BLOCKS: tl.constexpr = DS_M_SUB // VEC_SIZE
+    P_NUM_BLOCKS: tl.constexpr = BLOCK_M1 // VEC_SIZE
     _, tmem_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
     ds_buf_id, ds_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
     m_buf_id, m_phase = get_bufidx_phase(blk_idx, M_STAGE)
@@ -1358,47 +1358,34 @@ def _softmax_recompute_quantization_iter(
     # qk while this load is still in flight.
     qkT = tlx.local_load(tlx.local_view(qk_tiles, 0))
     tlx.barrier_arrive(qk_empties[0])
-    qkT_slices = _split_n_2D(qkT, DS_NUM_SUBS)
-    pT_slices = ()
-    for subtile_id in tl.static_range(DS_NUM_SUBS):
-        m = tlx.local_load(tlx.local_slice(
-            sM_tiles[m_buf_id],
-            [subtile_id * DS_M_SUB],
-            [DS_M_SUB],
-        ))
+    m = tlx.local_load(sM_tiles[m_buf_id])
 
-        qkT_scaled = _fma_f32x2(qkT_slices[subtile_id], qk_scale, -m[None, :])
-        # Clamp to prevent FP32 overflow downstream in P*dP
-        qkT_scaled = tl.minimum(qkT_scaled, 20.0)
-        pT = tl.math.exp2(qkT_scaled)
-        pT_slices += (pT, )
+    qkT_scaled = _fma_f32x2(qkT, qk_scale, -m[None, :])
+    # Clamp to prevent FP32 overflow downstream in P*dP
+    qkT_scaled = tl.minimum(qkT_scaled, 20.0)
+    pT = tl.math.exp2(qkT_scaled)
 
-        # Block amax for P via monotonicity of exp2
-        qkT_reshaped = tl.reshape(qkT_scaled, [BLOCK_N1, BWD_NUM_BLOCKS, VEC_SIZE])
-        block_maxes_p = tl.max(qkT_reshaped, 2)
-        block_amax_p = tl.math.exp2(block_maxes_p)
+    # Block amax for P via monotonicity of exp2
+    qkT_reshaped = tl.reshape(qkT_scaled, [BLOCK_N1, P_NUM_BLOCKS, VEC_SIZE])
+    block_maxes_p = tl.max(qkT_reshaped, 2)
+    block_amax_p = tl.math.exp2(block_maxes_p)
 
-        # Quantize P^T -> TMEM (FP8 data + E8M0 scales)
-        p_fp8, p_scale = _to_mxfp8_block_with_block_amax(
-            pT,
-            block_amax_p,
-            VEC_SIZE,
-            p_dtype,
-        )
-        tlx.local_store(tlx.subslice(tlx.local_view(p_tiles, 0), DS_M_SUB * subtile_id, DS_M_SUB), p_fp8)
-        p_scale_packed = p_scale.reshape([REP_N, 4, 32, REP_M, 4 // DS_NUM_SUBS]).permute(0, 3, 2, 1, 4)
-        tlx.local_store(
-            tlx.local_slice(
-                tlx.local_view(p_scale_buf_smem, 0),
-                [0, 0, 0, 0, subtile_id * (4 // DS_NUM_SUBS)],
-                [REP_M, REP_N, 32, 4, 4 // DS_NUM_SUBS],
-            ),
-            p_scale_packed,
-        )
+    # Quantize P^T -> TMEM (FP8 data + E8M0 scales)
+    p_fp8, p_scale = _to_mxfp8_block_with_block_amax(
+        pT,
+        block_amax_p,
+        VEC_SIZE,
+        p_dtype,
+    )
+    tlx.local_store(tlx.local_view(p_tiles, 0), p_fp8)
+    p_scale_packed = p_scale.reshape([REP_N, 4, 32, REP_M, 4]).permute(0, 3, 2, 1, 4)
+    tlx.local_store(tlx.local_view(p_scale_buf_smem, 0), p_scale_packed)
 
     tlx.barrier_arrive(p_fulls[0])
     tlx.barrier_arrive(m_empties[m_buf_id])
     tlx.barrier_wait(d_fulls[d_buf_id], d_phase)
+    pT_slices = _split_n_2D(pT, DS_NUM_SUBS)
+
     for subtile_id in tl.static_range(DS_NUM_SUBS):
         # Finish dS for the previous M-block.
         Di = tlx.local_load(tlx.local_slice(
