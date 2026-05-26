@@ -1843,6 +1843,69 @@ void hoistConvert(ModuleOp module) {
     layoutRemat.cleanup();
   });
 }
+
+// Prune a store-only layout conversion through a non-reordering reshape:
+//
+//   local_store(reshape(convert_layout(x)), dst)
+//
+// becomes:
+//
+//   local_store(reshape(x), dst)
+//
+// This is intentionally narrow and runs after layout decisions have already
+// been made. The rewrite relies on local_store being a layout-flexible sink:
+// the source register encoding may change, but the destination memdesc still
+// defines the logical memory layout.
+struct PruneLocalStoreOfReshapeConvert : public OpRewritePattern<LocalStoreOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(LocalStoreOp store,
+                                PatternRewriter &rewriter) const override {
+    auto reshape = store.getSrc().getDefiningOp<ReshapeOp>();
+    if (!reshape || reshape.getAllowReorder())
+      return failure();
+    if (!reshape.getResult().hasOneUse())
+      return failure();
+
+    auto convert = reshape.getSrc().getDefiningOp<ConvertLayoutOp>();
+    if (!convert || !convert.getResult().hasOneUse())
+      return failure();
+
+    auto srcType = dyn_cast<RankedTensorType>(convert.getSrc().getType());
+    auto storeSrcType = dyn_cast<RankedTensorType>(store.getSrc().getType());
+    if (!srcType || !storeSrcType || !srcType.getEncoding())
+      return failure();
+    if (srcType.getElementType() != storeSrcType.getElementType())
+      return failure();
+    if (srcType.getNumElements() != storeSrcType.getNumElements())
+      return failure();
+
+    Attribute reshapeEncoding;
+    auto *layoutInterface = dyn_cast<DialectInferLayoutInterface>(
+        &srcType.getEncoding().getDialect());
+    if (!layoutInterface)
+      return failure();
+    if (failed(layoutInterface->inferReshapeOpEncoding(
+            srcType.getShape(), srcType.getEncoding(), storeSrcType.getShape(),
+            reshapeEncoding, store.getLoc())))
+      return failure();
+
+    auto reshapeType =
+        RankedTensorType::get(storeSrcType.getShape(),
+                              storeSrcType.getElementType(), reshapeEncoding);
+    rewriter.setInsertionPoint(store);
+    auto newReshape = ReshapeOp::create(
+        rewriter, reshape.getLoc(), reshapeType, convert.getSrc(),
+        reshape.getAllowReorder(), reshape.getEfficientLayout());
+    auto newStore = LocalStoreOp::create(
+        rewriter, store.getLoc(), newReshape.getResult(), store.getDst());
+    newStore->setAttrs(store->getAttrs());
+    rewriter.eraseOp(store);
+    rewriter.eraseOp(reshape);
+    rewriter.eraseOp(convert);
+    return success();
+  }
+};
 } // namespace
 
 class TritonGPURemoveLayoutConversionsPass
@@ -1917,6 +1980,7 @@ public:
     scf::ForOp::getCanonicalizationPatterns(cleanUpPatterns2, context);
     scf::IfOp::getCanonicalizationPatterns(cleanUpPatterns2, context);
     ConvertLayoutOp::getCanonicalizationPatterns(cleanUpPatterns2, context);
+    cleanUpPatterns2.add<PruneLocalStoreOfReshapeConvert>(context);
     if (applyPatternsGreedily(m, std::move(cleanUpPatterns2)).failed()) {
       signalPassFailure();
     }

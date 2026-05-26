@@ -464,10 +464,10 @@ private:
     }
   }
 
-  SmallVector<Value> pairwiseInnerTreeReduceRegGroups(
-      Location loc, triton::ReduceOp op,
-      SmallVector<SmallVector<Value>> groupVals,
-      ConversionPatternRewriter &rewriter) const {
+  SmallVector<Value>
+  pairwiseInnerTreeReduceRegGroups(Location loc, triton::ReduceOp op,
+                                   SmallVector<SmallVector<Value>> groupVals,
+                                   ConversionPatternRewriter &rewriter) const {
     while (groupVals.size() > 1) {
       SmallVector<SmallVector<Value>> next;
       for (unsigned g = 0; g + 1 < groupVals.size(); g += 2) {
@@ -508,10 +508,11 @@ private:
                                             rewriter);
   }
 
-  SmallVector<Value> loadAndReduceScalarRegGroups(
-      Location loc, triton::ReduceOp op, ArrayRef<Value> smemBases,
-      unsigned numRegGroups, unsigned sizeInterWarps,
-      ConversionPatternRewriter &rewriter) const {
+  SmallVector<Value>
+  loadAndReduceScalarRegGroups(Location loc, triton::ReduceOp op,
+                               ArrayRef<Value> smemBases, unsigned numRegGroups,
+                               unsigned sizeInterWarps,
+                               ConversionPatternRewriter &rewriter) const {
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     SmallVector<SmallVector<Value>> groupVals;
     groupVals.reserve(numRegGroups);
@@ -549,7 +550,8 @@ private:
     if (numRegGroups > 1) {
       if (auto firstResultTy =
               dyn_cast<RankedTensorType>(op.getResult()[0].getType())) {
-        auto resultLayout = cast<SliceEncodingAttr>(firstResultTy.getEncoding());
+        auto resultLayout =
+            cast<SliceEncodingAttr>(firstResultTy.getEncoding());
         unsigned resultElems = getTotalElemsPerThread(firstResultTy);
         auto resultIndices = emitIndices(loc, rewriter, targetInfo,
                                          resultLayout, firstResultTy, true);
@@ -618,8 +620,8 @@ private:
 
           Value readOffset =
               linearize(rewriter, loc, readIdx, smemShape, smemOrder);
-          Value readPtr = b.gep(smemBases[i].getType(), elemTy, smemBases[i],
-                                readOffset);
+          Value readPtr =
+              b.gep(smemBases[i].getType(), elemTy, smemBases[i], readOffset);
           resultVals[j] = b.load(elemTy, readPtr);
         }
 

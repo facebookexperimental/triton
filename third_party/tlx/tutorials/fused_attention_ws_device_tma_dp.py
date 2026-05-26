@@ -6,7 +6,7 @@ This is a Triton implementation of the Flash Attention v2 algorithm with
 explicit (manual) data partitioning. The BLOCK_M dimension is split into two
 halves, each processed with its own q/acc pair while sharing K/V loads.
 
-Credits: 
+Credits:
 - OpenAI kernel team
 - Tri Dao (https://tridao.me/publications/flash2/flash2.pdf)
 
@@ -29,6 +29,7 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 FORCE_ON_DEVICE = os.getenv("FORCE_ON_DEVICE") == "1"
 WITH_MAXNREG = os.getenv("WITH_MAXNREG")
 
+
 def is_tile_enabled():
     return os.getenv("ENABLE_TILE", "0") == "1"
 
@@ -39,7 +40,7 @@ def is_hip():
 
 def is_cuda():
     target = triton.runtime.driver.active.get_current_target()
-    return getattr(target, 'is_cuda_backend', lambda: target.backend == "cuda")()
+    return getattr(target, "is_cuda_backend", lambda: target.backend == "cuda")()
 
 
 def supports_host_descriptor():
@@ -57,7 +58,7 @@ def is_hopper():
 def _supports_reg_auto_ws():
     """Check if the current Triton version supports minRegAutoWS/maxRegAutoWS"""
     try:
-        test_config = triton.Config({}, minRegAutoWS=24, maxRegAutoWS=152)
+        triton.Config({}, minRegAutoWS=24, maxRegAutoWS=152)
         return True
     except (TypeError, AttributeError):
         return False
@@ -69,7 +70,7 @@ HAS_REG_AUTO_WS = _supports_reg_auto_ws()
 def _supports_pingpong_auto_ws():
     """Check if the current Triton version supports pingpongAutoWS"""
     try:
-        test_config = triton.Config({}, pingpongAutoWS=True)
+        triton.Config({}, pingpongAutoWS=True)
         return True
     except (TypeError, AttributeError):
         return False
@@ -238,13 +239,13 @@ def _attn_fwd_inner_oss_dp(
 
     # loop over k, v and update accumulator
     for start_n in tl.range(
-        lo,
-        hi,
-        BLOCK_N,
-        warp_specialize=warp_specialize,
-        merge_epilogue=True,
-        separate_epilogue_store=True,
-        disallow_acc_multi_buffer=True,
+            lo,
+            hi,
+            BLOCK_N,
+            warp_specialize=warp_specialize,
+            merge_epilogue=True,
+            separate_epilogue_store=True,
+            disallow_acc_multi_buffer=True,
     ):
         start_n = tl.multiple_of(start_n, BLOCK_N)
 
@@ -324,6 +325,7 @@ else:
     NUM_STAGES_OPTIONS = [3]
 
 if is_tile_enabled():
+
     def make_tile_config(BM, BN, occ, subtile, subtile_p, vectmul, add2reduce):
         config_kwargs = {
             "BLOCK_M": BM,
@@ -348,6 +350,7 @@ if is_tile_enabled():
         for add2reduce in [False]
     ]
 else:
+
     def make_standard_config(
         BM,
         BN,
@@ -416,12 +419,8 @@ else:
 def keep(conf):
     BLOCK_M = conf.kwargs["BLOCK_M"]
     BLOCK_N = conf.kwargs["BLOCK_N"]
-    return not (
-        is_cuda()
-        and torch.cuda.get_device_capability()[0] == 9
-        and BLOCK_M * BLOCK_N < 128 * 128
-        and conf.num_warps == 8
-    )
+    return not (is_cuda() and torch.cuda.get_device_capability()[0] == 9 and BLOCK_M * BLOCK_N < 128 * 128
+                and conf.num_warps == 8)
 
 
 def prune_invalid_configs(configs, named_args, **kwargs):
@@ -745,11 +744,11 @@ def _attn_fwd_persist(
 
     # inner loop warpspec vs. outer loop warpspec
     for _ in tl.range(
-        0,
-        tiles_per_sm,
-        warp_specialize=warp_specialize and OUTER_LOOP,
-        merge_epilogue=True,
-        separate_epilogue_store=True,
+            0,
+            tiles_per_sm,
+            warp_specialize=warp_specialize and OUTER_LOOP,
+            merge_epilogue=True,
+            separate_epilogue_store=True,
     ):
         group_id = tile_idx // num_pid_in_group
         first_pid_n = group_id * GROUP_SIZE_N
@@ -804,15 +803,9 @@ class _attention_opt(torch.autograd.Function):
         stage = 3 if causal else 1
         extra_kern_args = {}
 
-        M = torch.empty(
-            (q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32
-        )
+        M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
         warp_specialize = baseVariant == "ws" or baseVariant == "ws_persistent"
-        if (
-            not FORCE_ON_DEVICE
-            and supports_host_descriptor()
-            and not (is_hopper() and warp_specialize)
-        ):
+        if (not FORCE_ON_DEVICE and supports_host_descriptor() and not (is_hopper() and warp_specialize)):
             y_dim = q.shape[0] * q.shape[1] * q.shape[2]
 
             dummy_block = [1, 1]
@@ -880,9 +873,7 @@ class _attention_opt(torch.autograd.Function):
         ctx.grid = grid
         persistent = baseVariant == "persistent" or baseVariant == "ws_persistent"
         if WITH_MAXNREG and is_blackwell() and warp_specialize:
-            if HEAD_DIM_K == 128 and (
-                q.dtype == torch.float16 or q.dtype == torch.bfloat16
-            ):
+            if HEAD_DIM_K == 128 and (q.dtype == torch.float16 or q.dtype == torch.bfloat16):
                 extra_kern_args["maxnreg"] = 128
             else:
                 extra_kern_args["maxnreg"] = 80
