@@ -1,20 +1,24 @@
 #!/bin/bash
 
-# Script to kill all GPU processes owned by the current user
+# Script to kill all GPU processes owned by the current user (NVIDIA and AMD)
 
-# Check if nvidia-smi is available
-if ! command -v nvidia-smi &>/dev/null; then
-  echo "nvidia-smi command not found. Are NVIDIA drivers installed?"
-  exit 1
-fi
-
-# Get current username
 CURRENT_USER=$(whoami)
 echo "Current user: $CURRENT_USER"
 
-# Get all process IDs using GPUs
+# Detect GPU vendor
+get_gpu_pids() {
+  if command -v nvidia-smi &>/dev/null; then
+    nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits
+  elif command -v rocm-smi &>/dev/null; then
+    rocm-smi --showpids 2>/dev/null | awk 'NR>1 && /^[0-9]/ {print $1}'
+  else
+    echo "No GPU tools found (nvidia-smi or rocm-smi)." >&2
+    exit 1
+  fi
+}
+
 echo "Fetching GPU processes..."
-GPU_PIDS=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits)
+GPU_PIDS=$(get_gpu_pids)
 
 if [ -z "$GPU_PIDS" ]; then
   echo "No GPU processes found."
@@ -63,7 +67,7 @@ echo "Sleeping for 2 seconds to verify..."
 sleep 2
 
 # Verify all user's processes are gone
-REMAINING=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits)
+REMAINING=$(get_gpu_pids)
 if [ -z "$REMAINING" ]; then
   echo "Verification complete: No GPU processes remaining."
 else
