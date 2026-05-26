@@ -371,7 +371,18 @@ SmallVector<Value> LayoutPropagation::propagateToUsers(Value value,
     if (auto yieldOp = dyn_cast<scf::YieldOp>(user)) {
       auto parent = yieldOp->getParentOp();
       SmallVector<Value> valuesToPropagate;
-      if (isa<scf::ForOp, scf::IfOp, scf::WhileOp>(parent))
+      // For scf.ForOp / scf.IfOp the yield's operand i corresponds 1:1 to
+      // the parent's result i, so we can propagate directly.
+      // For scf.WhileOp, the do-region yield feeds the before-block args
+      // (handled via `whileOp.getBeforeArguments()[i]` below), NOT the
+      // parent results. The parent result mapping is determined by
+      // scf.condition and is handled correctly via the scf::ConditionOp
+      // branch later in this function. Indexing parent results by the yield
+      // operand number is incorrect for WhileOp: the index can be OOB (init
+      // count > result count when scf.condition drops operands), and even
+      // when in-bounds it may point to the wrong result because scf.condition
+      // can drop/reorder operands relative to the before-arg order.
+      if (isa<scf::ForOp, scf::IfOp>(parent))
         valuesToPropagate.push_back(parent->getResult(use.getOperandNumber()));
       if (auto forOp = dyn_cast<scf::ForOp>(parent))
         valuesToPropagate.push_back(
@@ -1983,6 +1994,8 @@ public:
     // eliminate them by propagating the source encoding through their users.
     if (smemBudget > 0) {
       eliminateOverBudgetConverts(m);
+      hoistConvert(m);
+      cleanupConvertOps();
     }
   }
 

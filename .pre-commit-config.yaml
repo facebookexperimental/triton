@@ -76,5 +76,6 @@ exclude: |
     ^third_party/tlx/language/__init__.py|
     ^third_party/f2reduce|
     ^third_party/tileir|
-    ^python/test/gluon/
+    ^python/test/gluon/|
+    ^python/triton/experimental/gluon/
   )
