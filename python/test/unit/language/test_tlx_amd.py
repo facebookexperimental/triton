@@ -73,6 +73,7 @@ def skip_if_insufficient_shared_memory(required_bytes):
 # Test: async_load compiles on gfx950 and produces the expected ops.
 # ---------------------------------------------------------------------------
 
+
 @triton.jit
 def _async_load_kernel(
     x_ptr,
@@ -1184,9 +1185,12 @@ def test_local_reshape_compiles_gfx1250(device):
 # Test: buffer_load compiles on gfx950 and produces the expected ops.
 # ---------------------------------------------------------------------------
 
+
 @triton.jit
 def _buffer_load_kernel(
-    x_ptr, output_ptr, n_elements,
+    x_ptr,
+    output_ptr,
+    n_elements,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -1417,7 +1421,7 @@ def test_buffer_load_correctness(device):
     size = 256
     x = torch.rand(size, dtype=torch.float32, device=device)
     output = torch.empty_like(x)
-    grid = (triton.cdiv(size, 64),)
+    grid = (triton.cdiv(size, 64), )
     _buffer_load_kernel[grid](x, output, size, BLOCK_SIZE=64)
     torch.testing.assert_close(x, output)
 
@@ -1426,9 +1430,12 @@ def test_buffer_load_correctness(device):
 # Test: buffer_store compiles on gfx950 and produces the expected ops.
 # ---------------------------------------------------------------------------
 
+
 @triton.jit
 def _buffer_store_kernel(
-    x_ptr, output_ptr, n_elements,
+    x_ptr,
+    output_ptr,
+    n_elements,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -1458,7 +1465,7 @@ def test_buffer_store_correctness(device):
     size = 256
     x = torch.rand(size, dtype=torch.float32, device=device)
     output = torch.empty_like(x)
-    grid = (triton.cdiv(size, 64),)
+    grid = (triton.cdiv(size, 64), )
     _buffer_store_kernel[grid](x, output, size, BLOCK_SIZE=64)
     torch.testing.assert_close(x, output)
 
@@ -1467,16 +1474,19 @@ def test_buffer_store_correctness(device):
 # Test: buffer_load_to_local compiles on gfx950 and produces the expected ops.
 # ---------------------------------------------------------------------------
 
+
 @triton.jit
 def _buffer_load_to_local_kernel(
-    x_ptr, output_ptr, n_elements,
+    x_ptr,
+    output_ptr,
+    n_elements,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offs = (pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)).to(tl.int32)
     mask = offs < n_elements
 
-    buf = tlx.local_alloc((BLOCK_SIZE,), tl.float32, 1)
+    buf = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, 1)
     buf0 = tlx.local_view(buf, 0)
     tok = tlx.buffer_load_to_local(buf0, x_ptr, offs, mask=mask)
     tlx.async_load_commit_group([tok])
@@ -1509,6 +1519,6 @@ def test_buffer_load_to_local_correctness(device):
     size = 256
     x = torch.rand(size, dtype=torch.float32, device=device)
     output = torch.empty_like(x)
-    grid = (triton.cdiv(size, 64),)
+    grid = (triton.cdiv(size, 64), )
     _buffer_load_to_local_kernel[grid](x, output, size, BLOCK_SIZE=64)
     torch.testing.assert_close(x, output)

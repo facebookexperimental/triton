@@ -1992,8 +1992,7 @@ void TritonAMDGPUCanonicalizePointersPass::runOnOperation() {
     }
     // Buffer ops already use scalar ptr + i32 offsets (BufferOpInterface),
     // so they don't need pointer canonicalization.
-    if (llvm::isa<triton::amdgpu::BufferLoadOp,
-                  triton::amdgpu::BufferStoreOp,
+    if (llvm::isa<triton::amdgpu::BufferLoadOp, triton::amdgpu::BufferStoreOp,
                   triton::amdgpu::BufferLoadToLocalOp>(op))
       return true;
     return !opsToRewrite.contains(op);

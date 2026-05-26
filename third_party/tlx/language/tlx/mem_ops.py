@@ -60,9 +60,7 @@ def buffer_load(ptr, offsets, mask=None, other=None, cache=None, _semantic=None)
     cache_modifier = _semantic._str_to_load_cache_modifier(cache) if cache else ir.CACHE_MODIFIER.NONE
 
     ret_ty = tl.block_type(ptr.type.scalar.element_ty, offsets.type.get_block_shapes())
-    handle = _semantic.builder.create_buffer_load(
-        ptr.handle, offsets.handle,
-        mask_handle, other_handle, cache_modifier)
+    handle = _semantic.builder.create_buffer_load(ptr.handle, offsets.handle, mask_handle, other_handle, cache_modifier)
     return tl.tensor(handle, ret_ty)
 
 
@@ -98,8 +96,7 @@ def buffer_store(stored_value, ptr, offsets, mask=None, cache=None, _semantic=No
     mask_handle = mask.handle if mask is not None else None
     cache_modifier = _semantic._str_to_store_cache_modifier(cache) if cache else ir.CACHE_MODIFIER.NONE
 
-    _semantic.builder.create_buffer_store(
-        stored_value.handle, ptr.handle, offsets.handle, mask_handle, cache_modifier)
+    _semantic.builder.create_buffer_store(stored_value.handle, ptr.handle, offsets.handle, mask_handle, cache_modifier)
 
 
 @tl.builtin
@@ -145,9 +142,8 @@ def buffer_load_to_local(
     other_handle = other.handle if other is not None else None
     cache_mod = _semantic._str_to_load_cache_modifier(cache_modifier) if cache_modifier else ir.CACHE_MODIFIER.NONE
 
-    handle = _semantic.builder.create_buffer_load_to_local(
-        dest.handle, ptr.handle, offsets.handle,
-        mask_handle, other_handle, cache_mod)
+    handle = _semantic.builder.create_buffer_load_to_local(dest.handle, ptr.handle, offsets.handle, mask_handle,
+                                                           other_handle, cache_mod)
     return tlx.async_token(handle)
 
 
@@ -834,8 +830,7 @@ def local_load(
         output = _semantic.builder.create_local_load(src.handle, token.handle if token else None)
         result = tl.tensor(output, block_type)
         if relaxed:
-            result.handle.set_attr("ttg.amdg.syncedViaAsyncWait",
-                                   _semantic.builder.get_bool_attr(True))
+            result.handle.set_attr("ttg.amdg.syncedViaAsyncWait", _semantic.builder.get_bool_attr(True))
         return result
 
 
