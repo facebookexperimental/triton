@@ -1176,6 +1176,8 @@ def test_local_reshape_compiles_gfx1250(device):
     )
     ttgir = compiled.asm["ttgir"]
     assert "ttg.memdesc_reshape" in ttgir, ("expected memdesc_reshape in TTGIR, got:\n" + ttgir)
+
+
 # ---------------------------------------------------------------------------
 # Test: buffer_load compiles on gfx950 and produces the expected ops.
 # ---------------------------------------------------------------------------
@@ -1404,6 +1406,8 @@ def test_async_descriptor_prefetch_tensor_rejected_on_amd():
             constexprs={"BLOCK_M": 16, "BLOCK_N": 32},
         )
     assert "NV-only" in str(exc_info.value) or "amd_descriptor_prefetch_tensor" in str(exc_info.value)
+
+
 def test_buffer_load_correctness(device):
     """buffer_load produces correct results on gfx950 hardware."""
     if not is_gfx950_available():
