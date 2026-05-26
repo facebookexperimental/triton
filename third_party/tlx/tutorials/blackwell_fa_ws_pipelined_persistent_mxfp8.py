@@ -301,6 +301,7 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
     SHARE_SCALE_BUFFERS: tl.constexpr = (HEAD_DIM == 128) and (BLOCK_N == 128)
 
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // 2
+    NUM_ACC_SLICES: tl.constexpr = 4
 
     # Compute p_dtype from V descriptor
     p_dtype = tlx.dtype_of(desc_v)
@@ -543,13 +544,25 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
                             should_rescale_red = tl.reduce(should_rescale, axis=0, combine_fn=_reduce_or)
                             should_rescale_scalar = tl.reshape(should_rescale_red, ())
                             if should_rescale_scalar:
-                                acc = tlx.local_load(acc_tiles[cid])
-                                acc = _mul_f32x2(acc, alpha_1)
-                                tlx.local_store(acc_tiles[cid], acc)
+                                for slice_id in tl.static_range(0, NUM_ACC_SLICES):
+                                    subslice = tlx.subslice(
+                                        acc_tiles[cid],
+                                        HEAD_DIM * slice_id // NUM_ACC_SLICES,
+                                        HEAD_DIM // NUM_ACC_SLICES,
+                                    )
+                                    acc = tlx.local_load(subslice)
+                                    acc = _mul_f32x2(acc, alpha_1)
+                                    tlx.local_store(subslice, acc)
                         else:
-                            acc = tlx.local_load(acc_tiles[cid])
-                            acc = _mul_f32x2(acc, alpha_1)
-                            tlx.local_store(acc_tiles[cid], acc)
+                            for slice_id in tl.static_range(0, NUM_ACC_SLICES):
+                                subslice = tlx.subslice(
+                                    acc_tiles[cid],
+                                    HEAD_DIM * slice_id // NUM_ACC_SLICES,
+                                    HEAD_DIM // NUM_ACC_SLICES,
+                                )
+                                acc = tlx.local_load(subslice)
+                                acc = _mul_f32x2(acc, alpha_1)
+                                tlx.local_store(subslice, acc)
                         tlx.barrier_arrive(acc_fulls[cid])
                     accum_cnt += 1
 
@@ -559,17 +572,29 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
                     # then non-critical M (LSE) store to GMEM
                     tlx.barrier_wait(l_fulls[cid], phase)
                     l = tlx.local_load(l_tiles[cid])
-                    m = tlx.local_load(m_tiles[cid])
-                    tlx.barrier_arrive(l_empties[cid])
+                    scale = 1 / l
 
                     tlx.barrier_wait(acc_empties[cid], phase)
                     tlx.barrier_wait(o_empties[cid], phase ^ 1)
-                    scale = 1 / l
-                    acc = tlx.local_load(acc_tiles[cid])
-                    acc = _mul_f32x2(acc, scale)
-                    acc = acc.to(tlx.dtype_of(desc_o))
-                    tlx.local_store(o_tiles[cid], acc)
+                    for slice_id in tl.static_range(0, NUM_ACC_SLICES):
+                        subslice = tlx.subslice(
+                            acc_tiles[cid],
+                            HEAD_DIM * slice_id // NUM_ACC_SLICES,
+                            HEAD_DIM // NUM_ACC_SLICES,
+                        )
+                        acc = tlx.local_load(subslice)
+                        acc = _mul_f32x2(acc, scale)
+                        acc = acc.to(tlx.dtype_of(desc_o))
+                        subslice_o = tlx.local_slice(
+                            o_tiles[cid],
+                            [0, HEAD_DIM * slice_id // NUM_ACC_SLICES],
+                            [BLOCK_M_SPLIT, HEAD_DIM // NUM_ACC_SLICES],
+                        )
+                        tlx.local_store(subslice_o, acc)
                     tlx.barrier_arrive(o_fulls[cid])
+                    l = tlx.local_load(l_tiles[cid])
+                    m = tlx.local_load(m_tiles[cid])
+                    tlx.barrier_arrive(l_empties[cid])
 
                     if RESCALE_OPT:
                         m = m * sm_scale * 1.44269504
