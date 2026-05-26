@@ -1307,6 +1307,18 @@ void printSimplifiedOp(
     return;
   }
 
+  // tt.get_num_programs: emit tl.num_programs(axis=N)
+  if (opName == "tt.get_num_programs") {
+    if (op->getNumResults() > 0)
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+    int axis = 0;
+    if (auto axisAttr = op->getAttrOfType<IntegerAttr>("axis"))
+      axis = axisAttr.getInt();
+    os << "tl.num_programs(axis=" << axis << ")";
+    printLocComment(op, os);
+    return;
+  }
+
   // tt.make_range: emit tl.arange(start, end)
   if (opName == "tt.make_range") {
     if (op->getNumResults() > 0)
