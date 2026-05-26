@@ -869,7 +869,6 @@ def local_scatter(
     """
     scatter elements to shared memory along a specified axis using an indices tensor.
     """
-    block_type = tl.block_type(src.type.element_ty, indices.type.shape)
     storage = dst.type.storage
     assert storage == tlx.storage_kind.smem, "local_scatter only supports shared memory!"
     return tl.tensor(_semantic.builder.create_local_scatter(dst.handle, src.handle, indices.handle, axis), tl.void)
