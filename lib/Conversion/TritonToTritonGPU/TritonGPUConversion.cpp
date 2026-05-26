@@ -6,8 +6,8 @@
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Support/LLVM.h"
-#include "third_party/tlx/dialect/include/IR/Dialect.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "third_party/tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -113,27 +113,26 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
       triton::nvidia_gpu::VoteBallotSyncOp, triton::tlx::RequireLayoutOp,
       triton::tlx::ReleaseLayoutOp, triton::tlx::LocalAliasOp,
       triton::amdgpu::BufferLoadOp, triton::amdgpu::BufferStoreOp,
-      triton::amdgpu::BufferLoadToLocalOp>(
-      [&](Operation *op) -> bool {
-        // make sure every RankedTensorType operand has encoding
-        for (auto operandType : op->getOperandTypes()) {
-          if (auto rankedTensorType = dyn_cast<RankedTensorType>(operandType)) {
-            if (rankedTensorType.getEncoding() == nullptr) {
-              return false;
-            }
-          }
+      triton::amdgpu::BufferLoadToLocalOp>([&](Operation *op) -> bool {
+    // make sure every RankedTensorType operand has encoding
+    for (auto operandType : op->getOperandTypes()) {
+      if (auto rankedTensorType = dyn_cast<RankedTensorType>(operandType)) {
+        if (rankedTensorType.getEncoding() == nullptr) {
+          return false;
         }
+      }
+    }
 
-        // make sure result type has encoding if it is RankedTensorType
-        for (auto resultType : op->getResultTypes()) {
-          if (auto rankedTensorType = dyn_cast<RankedTensorType>(resultType)) {
-            if (rankedTensorType.getEncoding() == nullptr) {
-              return false;
-            }
-          }
+    // make sure result type has encoding if it is RankedTensorType
+    for (auto resultType : op->getResultTypes()) {
+      if (auto rankedTensorType = dyn_cast<RankedTensorType>(resultType)) {
+        if (rankedTensorType.getEncoding() == nullptr) {
+          return false;
         }
-        return true;
-      });
+      }
+    }
+    return true;
+  });
 
   addDynamicallyLegalOp<triton::FuncOp>([](triton::FuncOp funcOp) -> bool {
     auto check = [](auto types) {
