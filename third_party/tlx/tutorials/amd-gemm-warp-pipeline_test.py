@@ -146,10 +146,9 @@ def gemm_wp(
 # XCD_CHUNK=4 was empirically best for our 256x256 tiles at 4K-8K (per-XCD
 # group of 4 PIDs aligns with the GROUP_M=8 row partitioning).
 NUM_XCDS = 8
-XCD_CHUNK = 4
 
 
-def run(a, b, c, bm, bn, bk, nb, nw, gm):
+def run(a, b, c, bm, bn, bk, nb, nw, gm, wpeu=0, nonk=0, xcd=4):
     M, K = a.shape
     _, N = b.shape
     grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn), )
@@ -172,9 +171,11 @@ def run(a, b, c, bm, bn, bk, nb, nw, gm):
         GROUP_M=gm,
         NUM_BUFFERS=nb,
         NUM_XCDS=NUM_XCDS,
-        XCD_CHUNK=XCD_CHUNK,
+        XCD_CHUNK=xcd,
         num_warps=nw,
         num_stages=1,
+        waves_per_eu=wpeu,
+        matrix_instr_nonkdim=nonk,
     )
     return c
 
@@ -182,13 +183,16 @@ def run(a, b, c, bm, bn, bk, nb, nw, gm):
 if __name__ == "__main__":
     tflops = lambda ms, M, N, K: 2 * M * N * K * 1e-12 / (ms * 1e-3)
 
+    # (label, BM, BN, BK, nb, nw, gm, wpeu, nonk, xcd)
     configs = [
-        ("256x256x32 nw8 gm8", 256, 256, 32, 3, 8, 8),
-        ("256x256x32 nw8 gm16", 256, 256, 32, 3, 8, 16),
-        ("256x128x32 nw8 gm8", 256, 128, 32, 3, 8, 8),
-        ("128x256x32 nw8 gm8", 128, 256, 32, 3, 8, 8),
-        ("256x256x32 nw4 gm8", 256, 256, 32, 3, 4, 8),
-        ("128x128x32 nw8 gm8", 128, 128, 32, 3, 8, 8),
+        ("256x256x32 nb2 gm16 nonk16 xcd4 ", 256, 256, 32, 2, 8, 16, 0, 16, 4),
+        ("256x256x32 nb2 gm16 nonk16 xcd2 ", 256, 256, 32, 2, 8, 16, 0, 16, 2),
+        ("256x256x32 nb2 gm16 nonk16 xcd8 ", 256, 256, 32, 2, 8, 16, 0, 16, 8),
+        ("256x256x32 nb2 gm16 nonk16 xcd1 ", 256, 256, 32, 2, 8, 16, 0, 16, 1),
+        ("256x256x32 nb2 gm8  nonk16 xcd4 ", 256, 256, 32, 2, 8, 8, 0, 16, 4),
+        ("256x256x32 nb2 gm32 nonk16 xcd4 ", 256, 256, 32, 2, 8, 32, 0, 16, 4),
+        ("128x256x32 nb2 gm16 nonk16 xcd4 ", 128, 256, 32, 2, 8, 16, 0, 16, 4),
+        ("256x128x32 nb2 gm16 nonk16 xcd4 ", 256, 128, 32, 2, 8, 16, 0, 16, 4),
     ]
 
     for size in [4096, 8192]:
@@ -205,17 +209,18 @@ if __name__ == "__main__":
         ms = triton.testing.do_bench(lambda: torch.matmul(a, b), rep=200)
         print(f"  {'rocBLAS':<32s} {tflops(ms,M,N,K):7.1f} TFLOPS ({ms:.3f} ms)")
 
-        for name, bm, bn, bk, nb, nw, gm in configs:
+        for name, bm, bn, bk, nb, nw, gm, wpeu, nonk, xcd in configs:
             lds_kb = (bm * bk + bk * bn) * 2 * nb / 1024
             if lds_kb > 160:
-                print(f"  {name:<32s} {'SKIP':>7s} (LDS={lds_kb:.0f}KB)")
+                print(f"  {name:<36s} {'SKIP':>7s} (LDS={lds_kb:.0f}KB)")
                 continue
             try:
-                run(a, b, c, bm, bn, bk, nb, nw, gm)
+                run(a, b, c, bm, bn, bk, nb, nw, gm, wpeu, nonk, xcd)
                 torch.testing.assert_close(c, ref, rtol=1e-2, atol=1e-2)
                 ok = "OK"
             except Exception:
                 ok = "FAIL"
             ms = triton.testing.do_bench(
-                lambda bm=bm, bn=bn, bk=bk, nb=nb, nw=nw, gm=gm: run(a, b, c, bm, bn, bk, nb, nw, gm), rep=200)
-            print(f"  {name:<32s} {tflops(ms,M,N,K):7.1f} TFLOPS ({ms:.3f} ms) [{ok}]")
+                lambda bm=bm, bn=bn, bk=bk, nb=nb, nw=nw, gm=gm, wpeu=wpeu, nonk=nonk, xcd=xcd: run(
+                    a, b, c, bm, bn, bk, nb, nw, gm, wpeu, nonk, xcd), rep=200)
+            print(f"  {name:<36s} {tflops(ms,M,N,K):7.1f} TFLOPS ({ms:.3f} ms) [{ok}]")
