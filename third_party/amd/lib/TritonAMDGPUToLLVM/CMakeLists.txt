@@ -1,11 +1,3 @@
-add_triton_library(TritonAMDTargetUtils
-    TargetUtils.cpp
-
-    LINK_LIBS PUBLIC
-    LLVMCore
-    LLVMSupport
-)
-
 add_triton_library(TritonAMDGPUToLLVM
     AsyncUtility.cpp
     AtomicRMWOpsEmitter.cpp

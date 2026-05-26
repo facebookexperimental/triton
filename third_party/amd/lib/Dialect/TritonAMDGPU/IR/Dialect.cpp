@@ -26,7 +26,6 @@
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 #include "third_party/amd/include/Utils/Utility.h"
-#include "TritonAMDGPUToLLVM/TargetUtils.h"
 #include "Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 #include "triton/Dialect/Triton/IR/Interfaces.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
