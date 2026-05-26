@@ -138,6 +138,7 @@ private:
 
 class DotRewriteLattice : public Lattice<DotRewriteState> {
 public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DotRewriteLattice)
   using Lattice::Lattice;
 };
 
@@ -522,6 +523,7 @@ private:
 
 class DotConsumerLattice : public Lattice<DotConsumerState> {
 public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DotConsumerLattice)
   using Lattice::Lattice;
 };
 
