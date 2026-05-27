@@ -25,16 +25,14 @@ def _fused_amax_to_e8m0(amax, max_norm_rcp):
     return tl.inline_asm_elementwise(
         """
         {
-            .reg .f32 fae_scale;
-            .reg .u32 fae_bits, fae_exp, fae_mantissa, fae_inv_exp, fae_inv_bits;
-            .reg .pred fae_has_mantissa;
+            .reg .f32 fae_scale, fae_zero;
+            .reg .b16 fae_packed;
+            .reg .u32 fae_exp, fae_inv_exp, fae_inv_bits;
             mul.f32 fae_scale, $2, $3;
-            mov.b32 fae_bits, fae_scale;
-            bfe.u32 fae_exp, fae_bits, 23, 8;
-            and.b32 fae_mantissa, fae_bits, 0x7FFFFF;
-            setp.ne.u32 fae_has_mantissa, fae_mantissa, 0;
-            @fae_has_mantissa add.u32 fae_exp, fae_exp, 1;
-            min.u32 fae_exp, fae_exp, 254;
+            mov.b32 fae_zero, 0;
+            cvt.rp.satfinite.ue8m0x2.f32 fae_packed, fae_zero, fae_scale;
+            cvt.u32.u16 fae_exp, fae_packed;
+            and.b32 fae_exp, fae_exp, 0xFF;
             mov.u32 $0, fae_exp;
             sub.u32 fae_inv_exp, 254, fae_exp;
             shl.b32 fae_inv_bits, fae_inv_exp, 23;
