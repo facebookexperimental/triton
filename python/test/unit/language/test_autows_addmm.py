@@ -146,7 +146,6 @@ def addmm_kernel_tma_persistent_ws(
 @pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
-@pytest.mark.parametrize("generate_subtiled_region", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_autows_addmm_tma_persistent(
     M,
@@ -164,7 +163,6 @@ def test_autows_addmm_tma_persistent(
     use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     SMEM_ALLOC_ALGO,
-    generate_subtiled_region,
 ):
     """Test addmm kernel (bias + matmul) with warp_specialize=True."""
     if FLATTEN:
@@ -270,7 +268,6 @@ def test_autows_addmm_tma_persistent(
             num_stages=num_stages,
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
-            generate_subtiled_region=generate_subtiled_region,
         )
 
         # Verify IR contains expected ops

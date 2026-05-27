@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-warp-specialization="generate-subtiled-region=true" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-warp-specialization | FileCheck %s
 
 // Test: token lowering correctly resolves inline NVWS ops inside
 // SubtiledRegionOp tile bodies to hardware barrier ops when the

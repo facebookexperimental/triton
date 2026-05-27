@@ -116,14 +116,11 @@ doTMAStoreWaitReorder
 
 All SubtiledRegionOps are lowered inside the WS pass.
 
-### Compiler Option
+### Compiler Behavior
 
-- Kernel kwarg: `generate_subtiled_region=True`
-- Knob: `triton.knobs.nvidia.generate_subtiled_region = True`
-- Env var: `TRITON_GENERATE_SUBTILED_REGION=1`
-- Autotuning config option: `generate_subtiled_region`
-
-Default: `False`.
+`GenerateSubtiledRegion` is always enabled when the NVIDIA compiler pipeline
+runs Meta WS. There is no kernel kwarg, knob, env var, or autotuning config
+option to disable it.
 
 ### NVWS Sync Ops in Tile Bodies
 
@@ -149,6 +146,6 @@ hardware `WaitBarrierOp`/`ArriveBarrierOp`.
 | `test/TritonNvidiaGPU/invalid.mlir` | Verifier error cases |
 | `test/Hopper/WarpSpecialization/ws_token_lowering_subtiled_region.mlir` | Token lowering with SubtiledRegionOps inside warp_specialize |
 | `test/Hopper/WarpSpecialization/ws_code_partition_subtiled_region.mlir` | Code partition with SMEM channels between SubtiledRegionOps |
-| `python/test/unit/language/test_tutorial09_warp_specialization.py` | Blackwell GEMM e2e (parametrized with `generate_subtiled_region`) |
-| `python/test/unit/language/test_autows_addmm.py` | Addmm e2e (parametrized with `generate_subtiled_region`) |
+| `python/test/unit/language/test_tutorial09_warp_specialization.py` | Blackwell GEMM e2e |
+| `python/test/unit/language/test_autows_addmm.py` | Addmm e2e |
 | `test_subtile_gemm.py` | Standalone addmm + subtile e2e |
