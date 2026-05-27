@@ -1372,7 +1372,6 @@ def _softmax_recompute_quantization_iter(
     ds_buf_id, ds_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
     m_buf_id, m_phase = get_bufidx_phase(blk_idx, M_STAGE)
     d_buf_id, d_phase = get_bufidx_phase(blk_idx, D_STAGE)
-    tlx.barrier_wait(m_fulls[m_buf_id], m_phase)
     # Read QK from TMEM, apply sm_scale -> P
     tlx.barrier_wait(qk_fulls[0], tmem_phase)
     # qk_tiles, dp_tiles, dq_tiles all share the same physical
@@ -1383,6 +1382,7 @@ def _softmax_recompute_quantization_iter(
     # qk while this load is still in flight.
     qkT = tlx.local_load(tlx.local_view(qk_tiles, 0))
     tlx.barrier_arrive(qk_empties[0])
+    tlx.barrier_wait(m_fulls[m_buf_id], m_phase)
     m = tlx.local_load(sM_tiles[m_buf_id])
 
     qkT_scaled = _fma_f32x2(qkT, qk_scale, -m[None, :])
@@ -1557,7 +1557,7 @@ def _attn_bwd_mxf8_ws(
         tiles_per_sm += 1
     tile_idx = prog_id
 
-    DS_NUM_SUBS: tl.constexpr = 4
+    DS_NUM_SUBS: tl.constexpr = 2
 
     # ===== TMEM allocations =====
     # Single-region accumulator alias (qk/dp/p/dq overlap). Lifetime correctness
@@ -2118,7 +2118,7 @@ def _attn_bwd_mxf8_ws(
             tlx.async_descriptor_store_wait(0)
 
         # ----- MMA warp: 5 blockscaled GEMMs per M-block -----
-        with tlx.async_task(num_warps=1, registers=88):
+        with tlx.async_task(num_warps=1, registers=80):
             blk_idx = 0
             for _i in range(tiles_per_sm):
                 kv_buf_id, kv_phase = get_bufidx_phase(_i, NUM_BUFFERS_KV)
