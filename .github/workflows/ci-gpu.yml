@@ -41,8 +41,8 @@ jobs:
           python3 --version
           python3 -m pip install --upgrade pip setuptools wheel
           python3 -m pip install -r python/requirements.txt -r python/test-requirements.txt
-          python3 -m pip install --force-reinstall "${TORCH_NIGHTLY_URL}"
-          python3 -m pip uninstall -y triton pytorch-triton || true
+          python3 -m pip install --force-reinstall --no-deps "${TORCH_NIGHTLY_URL}"
+          python3 -m pip uninstall -y triton triton-rocm pytorch-triton || true
 
       - name: Build Triton
         run: |
