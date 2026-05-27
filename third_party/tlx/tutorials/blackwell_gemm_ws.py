@@ -387,7 +387,7 @@ def get_cuda_autotune_config():
         for BM in [64, 128, 256]
         for BN in [64, 128, 256]
         for BK in [64, 128]
-        for s in [2, 3, 4, 5, 6, 7]
+        for s in [2, 3, 4, 5, 6, 7, 8]
         for t in [1, 2, 3]
         for m in [1, 2]
         for subtile in [1, 2, 4, 8]
@@ -1062,6 +1062,16 @@ def _reduce_k_kernel(
     tl.store(c_ptr + base_offs, acc.to(OUTPUT_DTYPE), mask=mask)
 
 
+_l2_flush_buf = {}
+
+
+def _flush_l2_cache(device):
+    """Evict L2 cache by writing a buffer larger than L2 (64 MB for B200)."""
+    if device not in _l2_flush_buf:
+        _l2_flush_buf[device] = torch.empty(64 * 1024 * 1024, dtype=torch.int8, device=device)
+    _l2_flush_buf[device].zero_()
+
+
 def reduce_post_hook(nargs, exception=None):
     if exception is not None:
         return
@@ -1083,6 +1093,10 @@ def reduce_post_hook(nargs, exception=None):
             OUTPUT_DTYPE=TORCH_DTYPE_TO_TRITON[workspace.dtype],
             num_warps=4,
         )
+        # Flush L2 cache after reduction so do_bench iterations don't
+        # benefit from artificially warm workspace data. In production,
+        # the workspace is cold on each forward pass.
+        _flush_l2_cache(workspace.device)
 
 
 @triton.autotune(
