@@ -204,9 +204,66 @@ bool tmemMayAlias(Value a, Value b) {
   return true;
 }
 
-// Sink tmem_loads as close to their use as possible to reduce register
-// pressure. When opConstraints is provided, uses canAdvanceWSBarrier to
-// decide whether the op can sink past barriers from independent channels.
+bool isPlainTMAStoreTokenWait(Operation *op) {
+  auto wait = dyn_cast<TMAStoreTokenWaitOp>(op);
+  return wait && wait.getBarriers().empty();
+}
+
+// Check whether a movable chain can sink past `next`. When opConstraints is
+// provided, use canAdvanceWSBarrier to decide whether the chain can sink past
+// barriers from independent channels.
+bool canSinkUseChainPast(Value buffer, ArrayRef<Operation *> useChain,
+                         Operation *next,
+                         std::optional<DictionaryAttr> opConstraints) {
+  bool dep = false;
+  for (auto operand : getNestedOperands(next)) {
+    if (llvm::any_of(useChain, [&](Operation *op) {
+          return llvm::is_contained(op->getResults(), operand);
+        })) {
+      dep = true;
+      break;
+    }
+  }
+  if (isWSBarrierReorderEnabled()) {
+    if (!canAdvanceWSBarrier(opConstraints, next))
+      return false;
+  } else {
+    // Legacy safe behavior: don't sink past barrier signals, since they may
+    // guard the liverange of the buffer.
+    if (isa<ArriveBarrierOp>(next))
+      return false;
+  }
+  if (!isMemoryEffectFree(next) && !isPlainTMAStoreTokenWait(next)) {
+    SmallVector<MemoryEffects::EffectInstance> effects;
+    collectEffects(next, effects);
+    for (auto effect : effects) {
+      // Look for potentially aliasing write or free effects.
+      if (!isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()))
+        continue;
+      if (isa<SideEffects::DefaultResource>(effect.getResource())) {
+        dep = true;
+        break;
+      }
+      if (isa<TensorMemory>(effect.getResource()) &&
+          (!effect.getValue() || tmemMayAlias(effect.getValue(), buffer))) {
+        dep = true;
+        break;
+      }
+    }
+  }
+  return !dep;
+}
+
+void moveUseChainAfter(ArrayRef<Operation *> useChain, Operation *op) {
+  Operation *insertBefore = op->getNextNode();
+  assert(insertBefore && "expected op before block terminator");
+  for (Operation *chainOp : useChain)
+    chainOp->moveBefore(insertBefore);
+}
+
+// Sink ops as close to their use as possible to reduce register pressure.
+// When opConstraints is provided, uses canAdvanceWSBarrier to decide whether
+// the op can sink past barriers from independent channels.
 bool sinkOps(Value buffer, ArrayRef<Operation *> useChain,
              std::optional<DictionaryAttr> opConstraints) {
   Operation *insertBefore = nullptr;
@@ -214,41 +271,8 @@ bool sinkOps(Value buffer, ArrayRef<Operation *> useChain,
   while (next && !next->hasTrait<OpTrait::IsTerminator>()) {
     insertBefore = next;
     bool dep = false;
-    for (auto operand : getNestedOperands(next)) {
-      if (llvm::any_of(useChain, [&](Operation *op) {
-            return llvm::is_contained(op->getResults(), operand);
-          })) {
-        dep = true;
-        break;
-      }
-    }
-    if (isWSBarrierReorderEnabled()) {
-      if (!canAdvanceWSBarrier(opConstraints, next))
-        break;
-    } else {
-      // Legacy safe behavior: don't sink past barrier signals, since they
-      // may guard the liverange of the buffer.
-      if (isa<ArriveBarrierOp>(next))
-        break;
-    }
-    if (!isMemoryEffectFree(next)) {
-      SmallVector<MemoryEffects::EffectInstance> effects;
-      collectEffects(next, effects);
-      for (auto effect : effects) {
-        // Look for potentially aliasing write or free effects.
-        if (!isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()))
-          continue;
-        if (isa<SideEffects::DefaultResource>(effect.getResource())) {
-          dep = true;
-          break;
-        }
-        if (isa<TensorMemory>(effect.getResource()) &&
-            (!effect.getValue() || tmemMayAlias(effect.getValue(), buffer))) {
-          dep = true;
-          break;
-        }
-      }
-    }
+    if (!canSinkUseChainPast(buffer, useChain, next, opConstraints))
+      dep = true;
     if (dep)
       break;
     next = next->getNextNode();
@@ -278,6 +302,102 @@ bool trySinkOp(Operation *op, Value buffer,
   return sinkOps(buffer, useChain, opConstraints);
 }
 
+struct TMemLoadGroup {
+  DictionaryAttr constraints;
+  Value alloc;
+  SmallVector<Operation *> loads;
+};
+
+DenseMap<Operation *, unsigned> getBlockOpPositions(Block &block) {
+  DenseMap<Operation *, unsigned> opToPosition;
+  unsigned position = 0;
+  for (Operation &op : block)
+    opToPosition[&op] = position++;
+  return opToPosition;
+}
+
+Operation *
+getTMemLoadLiveRangeEnd(Operation *load,
+                        const DenseMap<Operation *, unsigned> &opToPosition) {
+  SmallVector<Operation *> useChain = getMovableUseChain(load);
+  Operation *tail = useChain.back();
+  Operation *end = tail;
+  unsigned endPos = opToPosition.lookup(tail);
+
+  for (Value result : tail->getResults()) {
+    for (Operation *user : result.getUsers()) {
+      auto userIt = opToPosition.find(user);
+      if (userIt != opToPosition.end() && userIt->second > endPos) {
+        end = user;
+        endPos = userIt->second;
+      }
+    }
+  }
+  return end;
+}
+
+bool isAfter(Operation *op, Operation *boundary,
+             const DenseMap<Operation *, unsigned> &opToPosition) {
+  auto opIt = opToPosition.find(op);
+  auto boundaryIt = opToPosition.find(boundary);
+  if (opIt == opToPosition.end() || boundaryIt == opToPosition.end())
+    return false;
+  return opIt->second > boundaryIt->second;
+}
+
+bool sinkTMemLoadAfter(Operation *load, Operation *boundary, Value buffer,
+                       std::optional<DictionaryAttr> opConstraints) {
+  bool changed = false;
+  while (true) {
+    DenseMap<Operation *, unsigned> opToPosition =
+        getBlockOpPositions(*load->getBlock());
+    if (isAfter(load, boundary, opToPosition))
+      return changed;
+
+    SmallVector<Operation *> useChain = getMovableUseChain(load);
+    std::optional<DictionaryAttr> effectiveConstraints = opConstraints;
+    Operation *next = useChain.back()->getNextNode();
+    auto arrive = dyn_cast_or_null<ArriveBarrierOp>(next);
+    if (arrive && arrive.getConstraints()) {
+      DictionaryAttr arriveConstraints = *arrive.getConstraints();
+      if (!effectiveConstraints || arriveConstraints == *effectiveConstraints) {
+        useChain.push_back(next);
+        effectiveConstraints = arriveConstraints;
+      }
+    }
+    next = useChain.back()->getNextNode();
+    if (!next || next->hasTrait<OpTrait::IsTerminator>())
+      return changed;
+    if (!canSinkUseChainPast(buffer, useChain, next, effectiveConstraints))
+      return changed;
+
+    moveUseChainAfter(useChain, next);
+    changed = true;
+  }
+}
+
+bool sinkTMemLoadsToFreshLiveRanges(
+    const TMemLoadGroup &group,
+    const DenseMap<Operation *, DictionaryAttr> &memOpConstraints) {
+  bool changed = false;
+  Operation *previousLoad = group.loads.front();
+  for (Operation *load : llvm::drop_begin(group.loads)) {
+    DenseMap<Operation *, unsigned> opToPosition =
+        getBlockOpPositions(*load->getBlock());
+    Operation *previousEnd =
+        getTMemLoadLiveRangeEnd(previousLoad, opToPosition);
+    auto loadOp = cast<TMEMLoadOp>(load);
+    auto it = memOpConstraints.find(load);
+    std::optional<DictionaryAttr> constraints =
+        it != memOpConstraints.end() ? std::optional<DictionaryAttr>(it->second)
+                                     : std::nullopt;
+    changed |=
+        sinkTMemLoadAfter(load, previousEnd, loadOp.getSrc(), constraints);
+    previousLoad = load;
+  }
+  return changed;
+}
+
 struct BlockInterleaveInfo {
   Block *block;
   unsigned tmemLoadCount = 0;
@@ -288,12 +408,6 @@ struct BlockInterleaveInfo {
 struct OverlapLiveness {
   SmallVector<unsigned> numLiveTMEMLoads;
   SmallVector<unsigned> overlapProfile;
-};
-
-struct TMemLoadGroup {
-  DictionaryAttr constraints;
-  Value alloc;
-  SmallVector<Operation *> loads;
 };
 
 BlockInterleaveInfo collectBlockInterleaveInfo(Block *block) {
@@ -513,13 +627,16 @@ void processBlock(BlockInterleaveInfo &info) {
     raiseWSWaits(block);
   }
 
-  // Step 3: Sink tmem_loads closer to their uses.
+  // Step 3: Move TMEM allocs close to their uses, then sink tmem_loads only
+  // far enough to start after the previous load's live range.
   DenseMap<Operation *, DictionaryAttr> memOpConstraints;
   if (reorderWSBarriers)
     memOpConstraints = buildTMemLoadConstraints(block);
   SmallVector<TMemLoadGroup> loadGroups =
       buildTMemLoadGroups(info.tmemLoads, memOpConstraints);
   for (auto [op, buffer] : info.opsToSink) {
+    if (isa<TMEMLoadOp>(op))
+      continue;
     auto it = memOpConstraints.find(op);
     std::optional<DictionaryAttr> constraints =
         it != memOpConstraints.end() ? std::optional<DictionaryAttr>(it->second)
@@ -527,6 +644,8 @@ void processBlock(BlockInterleaveInfo &info) {
     while (trySinkOp(op, buffer, constraints)) {
     }
   }
+  for (const TMemLoadGroup &group : loadGroups)
+    sinkTMemLoadsToFreshLiveRanges(group, memOpConstraints);
 
   // Step 4: Restore barriers to optimal positions near their memory ops.
   if (reorderWSBarriers)

@@ -37,10 +37,22 @@ For each candidate load, the pass forms a movable chain starting at the
 chain can sink as a unit as long as the move remains legal for the underlying
 TMEM buffer and for the channel constraints associated with the load.
 
+The load-sinking target is the first legal position where the load starts after
+the previous comparable TMEM load's value live range. The pass does not sink a
+load all the way to its consumer once that fresh-range target has been reached.
+This keeps independent operand-preparation work, such as bias cast/broadcast
+chains feeding the eventual add, close to that consumer when the extra sinking
+is not needed to isolate TMEM values.
+
 Split TMEM loads can inherit the `channelGraph` constraints from the guarding
 arrive barrier. This lets loads from the same TMEM allocation, but different
 subtiles, sink independently around store-channel waits when the channels are
 disjoint.
+
+Plain `ttng.async_tma_store_token_wait` ops do not block TMEM load sinking by
+themselves. They wait for a TMA store to finish reading SMEM, but do not carry
+WS barrier semantics unless they include attached barrier operands. Barrier-
+bearing token waits still block movement like other arrive-like operations.
 
 ## Rollback
 
