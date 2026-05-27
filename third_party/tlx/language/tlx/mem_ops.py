@@ -690,7 +690,11 @@ def local_load(
         return tl.tensor(output, block_type)
     else:
         output = _semantic.builder.create_local_load(src.handle, token.handle if token else None)
-        return tl.tensor(output, block_type)
+        result = tl.tensor(output, block_type)
+        if token is not None and _semantic.builder.options.backend_name == "hip":
+            result.handle.set_attr("ttg.amdg.syncedViaAsyncWait",
+                                   _semantic.builder.get_bool_attr(True))
+        return result
 
 
 @tl.builtin
