@@ -108,6 +108,12 @@ unsigned ReduceOpHelper::getIntraWarpSizeWithUniqueData() {
 }
 
 unsigned ReduceOpHelper::getNumRegGroupsOnAxis() {
+  auto reductionOrderingAttr =
+      op->getAttrOfType<StringAttr>("reduction_ordering");
+  if (!reductionOrderingAttr ||
+      reductionOrderingAttr.getValue() != "inner_tree")
+    return 1;
+
   auto *ctx = srcEncoding.getContext();
   auto linearLayout = toLinearLayout(srcTy);
   auto kRegister = mlir::StringAttr::get(ctx, "register");

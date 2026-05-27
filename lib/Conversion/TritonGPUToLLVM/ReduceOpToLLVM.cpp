@@ -145,8 +145,8 @@ private:
     return acc;
   }
 
-  bool matchesResultOffset(ArrayRef<unsigned> key, ArrayRef<unsigned> resultOffs,
-                           unsigned axis) const {
+  bool matchesResultOffset(ArrayRef<unsigned> key,
+                           ArrayRef<unsigned> resultOffs, unsigned axis) const {
     if (key.size() != resultOffs.size() + 1)
       return false;
     for (unsigned dim = 0; dim < resultOffs.size(); ++dim) {
@@ -209,24 +209,35 @@ private:
 
     std::map<SmallVector<unsigned>, SmallVector<int>> regGroups;
     for (int idx : iterOrder) {
-      regGroups[getRegGroupKey(offsets[idx], axis, contigPerThread)]
-          .push_back(idx);
+      regGroups[getRegGroupKey(offsets[idx], axis, contigPerThread)].push_back(
+          idx);
+    }
+
+    if (!isInnerTree(op)) {
+      for (int idx : iterOrder) {
+        SmallVector<unsigned> key = offsets[idx];
+        key[axis] = 0;
+        bool isFirst = accs.find(key) == accs.end();
+        accumulate(op.getLoc(), rewriter, op.getCombineOp(), accs[key],
+                   srcValues[idx]);
+        if (isFirst)
+          indices[key] = srcIndices[idx];
+      }
+      return;
     }
 
     for (auto &[key, group] : regGroups) {
-      if (isInnerTree(op)) {
-        llvm::sort(group, [&](int lhs, int rhs) {
-          return offsets[lhs][axis] < offsets[rhs][axis];
-        });
-      }
+      llvm::sort(group, [&](int lhs, int rhs) {
+        return offsets[lhs][axis] < offsets[rhs][axis];
+      });
 
       SmallVector<SmallVector<Value>> groupValues;
       groupValues.reserve(group.size());
       for (int idx : group)
         groupValues.push_back(srcValues[idx]);
 
-      accs[key] =
-          reduceValueSequence(op.getLoc(), op, std::move(groupValues), rewriter);
+      accs[key] = reduceValueSequence(op.getLoc(), op, std::move(groupValues),
+                                      rewriter);
       indices[key] = srcIndices[group.front()];
     }
   }
