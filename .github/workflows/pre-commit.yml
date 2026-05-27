@@ -31,7 +31,13 @@ jobs:
         run: |
           python3 -m pip install --upgrade pre-commit
           python3 -m pre_commit run --all-files --verbose
-      - name: Print diff of changes if pre-commit failed
+      - name: Print diff and fix instructions if pre-commit failed
         if: failure()
         run: |
+          echo "### Pre-commit failed — formatting issues detected"
+          echo ""
+          echo "To fix automatically, comment \`/fix-precommit\` on the PR."
+          echo "To fix locally: \`pre-commit run --all-files && git add -A && git commit -m 'fix formatting' && git push\`"
+          echo ""
+          echo "### Diff of required changes:"
           git diff
