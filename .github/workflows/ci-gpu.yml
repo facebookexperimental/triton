@@ -75,7 +75,7 @@ jobs:
         run: |
           set -euxo pipefail
           . "${VENV_DIR}/bin/activate"
-          python3 -m pytest -s --tb=short \
+          python3 -m pytest -vv -s --tb=short \
             python/test/unit/language/test_compile_only.py \
             python/test/unit/language/test_core.py::test_dtype_codegen
 
@@ -83,7 +83,7 @@ jobs:
         run: |
           set -euxo pipefail
           . "${VENV_DIR}/bin/activate"
-          python3 -m pytest -s --tb=short \
+          python3 -m pytest -vv -s --tb=short \
             python/test/unit/language/test_tlx.py \
             python/test/unit/language/test_tlx_amd.py \
             python/test/unit/language/test_warp_pipeline.py
