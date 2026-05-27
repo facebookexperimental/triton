@@ -2612,7 +2612,7 @@ def tlx_square_non_ws(
     # mbarrier ops
 
     bars = tlx.alloc_barriers(num_barriers=1)  # create
-    bar = tlx.local_view(bars, 0)
+    bar = bars[0]
 
     x = tl.load(x_ptr + offsets, mask=mask)  # Do something
 
@@ -2647,8 +2647,8 @@ def tlx_square_ws(
 
     # mbarrier ops
     bars = tlx.alloc_barriers(num_barriers=2)  # create
-    b0 = tlx.local_view(bars, 0)
-    b1 = tlx.local_view(bars, 1)
+    b0 = bars[0]
+    b1 = bars[1]
 
     phase = 0
     with tlx.async_tasks():
@@ -2684,7 +2684,7 @@ def run_tlx_square(func, BLOCK_SIZE, device, expected_arrival_count=1):
 
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
 
-    kernel = func[grid](x, z, n_elements, BLOCK_SIZE)
+    kernel = func[grid](x, z, n_elements, BLOCK_SIZE, expected_arrival_count)
 
     z_ref = x * x
 
@@ -2693,7 +2693,7 @@ def run_tlx_square(func, BLOCK_SIZE, device, expected_arrival_count=1):
 
 
 # Unit test for arrive/wait
-@pytest.mark.skipif(not (is_hip() or is_hopper_or_newer()), reason="Need Hopper or newer or AMD")
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 @pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
 def test_wait_arrive_non_ws(BLOCK_SIZE, device):
     kernel = run_tlx_square(tlx_square_non_ws, BLOCK_SIZE, device)
