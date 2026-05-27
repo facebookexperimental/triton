@@ -24,6 +24,27 @@ namespace ttng = ::mlir::triton::nvidia_gpu;
 
 namespace mlir::triton::tlx {
 
+static FailureOr<Attribute> inferTransEncoding(Attribute encoding,
+                                               ArrayRef<int64_t> shape,
+                                               ArrayRef<int32_t> order,
+                                               Location loc) {
+  Dialect &dialect = encoding.getDialect();
+  auto inferLayoutInterface =
+      cast<::mlir::triton::DialectInferLayoutInterface>(&dialect);
+  Attribute resultEncoding;
+  if (failed(inferLayoutInterface->inferTransOpEncoding(encoding, shape, order,
+                                                        resultEncoding, loc)))
+    return failure();
+  return resultEncoding;
+}
+
+static SmallVector<int32_t> invertPermutation(ArrayRef<int32_t> order) {
+  SmallVector<int32_t> inverse(order.size());
+  for (auto [i, dim] : llvm::enumerate(order))
+    inverse[dim] = i;
+  return inverse;
+}
+
 //===----------------------------------------------------------------------===//
 // LayoutEncoding
 //===----------------------------------------------------------------------===//
@@ -41,12 +62,17 @@ void LayoutEncoding::print(raw_ostream &os) const {
 
 LayoutEncoding LayoutEncoding::join(const LayoutEncoding &lhs,
                                     const LayoutEncoding &rhs) {
+  // Forward merges should stay conservative: distinct concrete layouts widen to
+  // unknown instead of asserting so region joins can fall back cleanly.
+  if (lhs.isUnknown() || rhs.isUnknown())
+    return LayoutEncoding::getUnknownLayout();
   if (lhs.isUninitialized())
     return rhs;
   if (rhs.isUninitialized())
     return lhs;
-  assert(lhs == rhs && "Conflicting layouts");
-  return lhs;
+  if (lhs == rhs)
+    return lhs;
+  return LayoutEncoding::getUnknownLayout();
 }
 
 LayoutEncoding LayoutEncoding::meet(const LayoutEncoding &lhs,
@@ -59,7 +85,9 @@ LayoutEncoding LayoutEncoding::meet(const LayoutEncoding &lhs,
     return lhs;
   if (lhs == rhs)
     return lhs;
-  llvm_unreachable("Conflicting layouts");
+  LDBG("Conflicting memdesc layouts " << lhs << " vs " << rhs
+                                      << "; widening to unknown");
+  return LayoutEncoding::getUnknownLayout();
 }
 
 //===----------------------------------------------------------------------===//
@@ -91,8 +119,9 @@ void LayoutBackwardPropagation::visitWarpSpecRegionArgs(
     if (auto warpSpecializePartitionsOp =
             op->getParentOfType<ttg::WarpSpecializePartitionsOp>()) {
       auto warpSpecializeOp = warpSpecializePartitionsOp.getParentOp();
-      auto blockArgumentLattice = getLatticeElement(
-          warpSpecializePartitionsOp.getExplicitCaptures()[arg.getArgNumber()]);
+      auto blockArgumentLattice =
+          getLatticeElement(warpSpecializeOp.getPartitionOp()
+                                .getExplicitCaptures()[arg.getArgNumber()]);
       ChangeResult changed = blockArgumentLattice->meet(resultEncoding);
       propagateIfChanged(blockArgumentLattice, changed);
       // Propagate to all the partition regions
@@ -122,18 +151,33 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
     auto resultLattice = results[0];
     LayoutEncoding resultLayoutEncoding = resultLattice->getValue();
     if (!resultLayoutEncoding.isUninitialized()) {
-      if (auto mmaEncoding = dyn_cast<ttg::NVMMASharedEncodingAttr>(
-              resultLattice->getValue().getLayoutEncoding())) {
-        SmallVector<unsigned, 4> newOrder;
-        llvm::transform(memDescTransOp.getOrder(), std::back_inserter(newOrder),
-                        [](int32_t x) { return static_cast<unsigned>(x); });
-        auto newMmaEncoding = ttg::NVMMASharedEncodingAttr::get(
+      Attribute resultEnc = resultLattice->getValue().getLayoutEncoding();
+      SmallVector<unsigned, 4> newOrder;
+      llvm::transform(memDescTransOp.getOrder(), std::back_inserter(newOrder),
+                      [](int32_t x) { return static_cast<unsigned>(x); });
+      Attribute srcEncoding;
+      if (auto mmaEncoding =
+              dyn_cast<ttg::NVMMASharedEncodingAttr>(resultEnc)) {
+        srcEncoding = ttg::NVMMASharedEncodingAttr::get(
             mmaEncoding.getContext(),
             memDescTransOp.getSrc().getType().getShape(), newOrder,
             mmaEncoding.getCGALayout(),
             memDescTransOp.getSrc().getType().getElementType(),
             mmaEncoding.getFp4Padded());
-        const auto updatedResultLayoutEncoding = LayoutEncoding(newMmaEncoding);
+      } else {
+        // Other shared encodings (e.g. SwizzledShared, PaddedShared)
+        // fall back on the dialect's transpose inference to push a result-side
+        // requirement back to the source memdesc via the inverse permutation.
+        auto resultType = cast<ttg::MemDescType>(memDescTransOp.getType());
+        auto inverseOrder = invertPermutation(memDescTransOp.getOrder());
+        FailureOr<Attribute> inferred = inferTransEncoding(
+            resultEnc, resultType.getShape(), inverseOrder, op->getLoc());
+        if (failed(inferred))
+          return failure();
+        srcEncoding = *inferred;
+      }
+      if (srcEncoding) {
+        const auto updatedResultLayoutEncoding = LayoutEncoding(srcEncoding);
         auto operandLattice = operands[0];
         ChangeResult changed =
             operandLattice->meet(updatedResultLayoutEncoding);
@@ -145,18 +189,23 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
     return success();
   }
 
-  // Similar to MemDescTransOp, we need to specially handle TMEMSubSliceOp
+  // TMEMSubSliceOp preserves the source tile shape and only refines the
+  // column-stride/CTA-split details on the 2D slice view. The verifier already
+  // guarantees tensor-memory encodings on both source and result.
   if (auto tmemSliceOp = dyn_cast<ttng::TMEMSubSliceOp>(op)) {
-    // Slice resultLayoutEncoding
     auto resultLattice = results[0];
     LayoutEncoding resultLayoutEncoding = resultLattice->getValue();
-    if (!resultLayoutEncoding.isUninitialized()) {
+    if (!resultLayoutEncoding.isUninitialized() && !resultLayoutEncoding.isUnknown()) {
       Attribute resultEncoding = resultLayoutEncoding.getLayoutEncoding();
       if (auto tmemEncoding =
               dyn_cast<ttng::TensorMemoryEncodingAttr>(resultEncoding)) {
         auto srcTy = cast<ttg::MemDescType>(tmemSliceOp.getSrc().getType());
         auto srcEncoding =
             dyn_cast<ttng::TensorMemoryEncodingAttr>(srcTy.getEncoding());
+        if (!srcEncoding)
+          return tmemSliceOp.emitOpError(
+              "expected tensor memory source encoding while propagating "
+              "through tmem_subslice");
         unsigned blockM =
             srcEncoding ? srcEncoding.getBlockM() : tmemEncoding.getBlockM();
         unsigned blockN =
@@ -277,6 +326,169 @@ void LayoutBackwardPropagation::setToExitState(LayoutEncodingLattice *lattice) {
 }
 
 //===----------------------------------------------------------------------===//
+// TensorLayout
+//===----------------------------------------------------------------------===//
+
+void TensorLayout::print(raw_ostream &os) const {
+  if (isUninitialized()) {
+    os << "<UNINITIALIZED>";
+    return;
+  }
+  if (isUnknown()) {
+    os << "<UNKNOWN>";
+    return;
+  }
+  return getLayoutEncoding().print(os);
+}
+
+TensorLayout TensorLayout::join(const TensorLayout &lhs,
+                                const TensorLayout &rhs) {
+  return meet(lhs, rhs);
+}
+
+TensorLayout TensorLayout::meet(const TensorLayout &lhs,
+                                const TensorLayout &rhs) {
+  if (lhs.isUnknown() || rhs.isUnknown())
+    return TensorLayout::getUnknownLayout();
+  if (lhs.isUninitialized())
+    return rhs;
+  if (rhs.isUninitialized())
+    return lhs;
+  if (lhs == rhs)
+    return lhs;
+  return TensorLayout::getUnknownLayout();
+}
+
+static bool isTrackedTensorValue(Value value) {
+  return isa<RankedTensorType>(value.getType());
+}
+
+static bool isAllowedTensorLayoutUser(Operation *op, unsigned operandIndex) {
+  // This mirrors InsertRequireLayout's pre-materialization policy. Before the
+  // insert pass runs, dot operands flow through convert_layout and transparent
+  // region carriers. After convert_layout is rewritten into explicit
+  // tlx.require_layout anchors, tensor propagation treats those anchors plus
+  // the same transparent carriers as the legal local_load-to-dot path.
+  if (auto requireLayoutOp = dyn_cast<RequireLayoutOp>(op)) {
+    if (!isa<RankedTensorType>(requireLayoutOp.getType()) || operandIndex != 0)
+      return false;
+    return isSupportedDotConstraintEncoding(
+        cast<RankedTensorType>(requireLayoutOp.getType()).getEncoding());
+  }
+
+  return isTransparentLayoutCarrierOp(op);
+}
+
+static bool canRewriteTensorResult(Operation *op) {
+  return isa<ttg::LocalLoadOp, RegionBranchOpInterface>(op);
+}
+
+//===----------------------------------------------------------------------===//
+// TensorBackwardPropagation
+//===----------------------------------------------------------------------===//
+
+LogicalResult TensorBackwardPropagation::visitOperation(
+    Operation *op, ArrayRef<TensorLayoutLattice *> operands,
+    ArrayRef<const TensorLayoutLattice *> results) {
+  LDBG("Visiting tensor operation " << *op << "\n");
+
+  if (auto requireLayoutOp = dyn_cast<RequireLayoutOp>(op)) {
+    if (!isa<RankedTensorType>(requireLayoutOp.getType()))
+      return success();
+
+    Attribute layout = requireLayoutOp.getType().getEncoding();
+    if (!isSupportedDotConstraintEncoding(layout))
+      return success();
+
+    const auto layoutLattice = TensorLayout(layout);
+    for (auto [operandLattice, operand] :
+         llvm::zip_equal(operands, requireLayoutOp->getOperands())) {
+      if (!isTrackedTensorValue(operand))
+        continue;
+      ChangeResult changed = operandLattice->meet(layoutLattice);
+      propagateIfChanged(operandLattice, changed);
+    }
+    return success();
+  }
+
+  if (isa<ReleaseLayoutOp>(op))
+    return success();
+
+  // If a tracked tensor value is used by an unsupported operation, rewriting
+  // the producer chain is no longer legal for that entire component.
+  for (auto [index, operand] : llvm::enumerate(op->getOperands())) {
+    if (!isTrackedTensorValue(operand))
+      continue;
+    if (isAllowedTensorLayoutUser(op, index))
+      continue;
+
+    TensorLayout operandState = operands[index]->getValue();
+    if (operandState.isUninitialized())
+      continue;
+
+    LDBG("Marking tensor layout unknown due to unsupported user "
+         << op->getName() << " on operand #" << index);
+    ChangeResult changed =
+        operands[index]->meet(TensorLayout::getUnknownLayout());
+    propagateIfChanged(operands[index], changed);
+  }
+
+  // Only a narrow set of tensor-producing operations can absorb a propagated
+  // layout directly. Everything else falls back to a local convert.
+  if (!canRewriteTensorResult(op)) {
+    for (Value result : op->getResults()) {
+      if (!isTrackedTensorValue(result))
+        continue;
+
+      auto *resultLattice = getLatticeElement(result);
+      TensorLayout resultState = resultLattice->getValue();
+      if (resultState.isUninitialized())
+        continue;
+
+      LDBG("Keeping explicit tensor layout conversion because producer "
+           << op->getName() << " cannot be retagged directly");
+      ChangeResult changed =
+          resultLattice->meet(TensorLayout::getUnknownLayout());
+      propagateIfChanged(resultLattice, changed);
+    }
+  }
+
+  return success();
+}
+
+void TensorBackwardPropagation::visitBranchOperand(OpOperand &operand) {
+  if (!isTrackedTensorValue(operand.get()))
+    return;
+
+  Operation *owner = operand.getOwner();
+  if (isa<RegionBranchOpInterface, RegionBranchTerminatorOpInterface>(owner))
+    return;
+
+  auto *lattice = getLatticeElement(operand.get());
+  TensorLayout state = lattice->getValue();
+  if (state.isUninitialized())
+    return;
+
+  ChangeResult changed = lattice->meet(TensorLayout::getUnknownLayout());
+  propagateIfChanged(lattice, changed);
+}
+
+void TensorBackwardPropagation::visitCallOperand(OpOperand &operand) {
+  if (!isTrackedTensorValue(operand.get()))
+    return;
+
+  auto *lattice = getLatticeElement(operand.get());
+  TensorLayout state = lattice->getValue();
+  if (state.isUninitialized())
+    return;
+
+  ChangeResult changed = lattice->meet(TensorLayout::getUnknownLayout());
+  propagateIfChanged(lattice, changed);
+}
+
+void TensorBackwardPropagation::setToExitState(TensorLayoutLattice *lattice) {}
+
+//===----------------------------------------------------------------------===//
 // LayoutForwardPropagation
 //===----------------------------------------------------------------------===//
 
@@ -295,9 +507,11 @@ LogicalResult LayoutForwardPropagation::visitOperation(
       continue;
     LayoutEncoding operandLayoutEncoding = operandLattice->getValue();
 
-    // Slice operandLayoutEncoding
+    // Unknown layouts do not provide enough information to refine a TMEM slice
+    // result, so only splice concrete tensor-memory encodings through.
     if (auto sliceOp = dyn_cast<ttng::TMEMSubSliceOp>(op)) {
-      if (!operandLayoutEncoding.isUninitialized()) {
+      if (!operandLayoutEncoding.isUninitialized() &&
+          !operandLayoutEncoding.isUnknown()) {
         Attribute operandEncoding = operandLayoutEncoding.getLayoutEncoding();
         if (auto encoding =
                 dyn_cast<ttng::TensorMemoryEncodingAttr>(operandEncoding)) {
@@ -319,6 +533,10 @@ LogicalResult LayoutForwardPropagation::visitOperation(
         } else if (isa<ttng::TensorMemoryScalesEncodingAttr,
                        triton::tlx::DummyTMEMLayoutAttr>(operandEncoding)) {
           operandLayoutEncoding = LayoutEncoding(operandEncoding);
+        } else {
+          return sliceOp.emitOpError(
+              "expected tensor memory layout while propagating through "
+              "tmem_subslice");
         }
       }
     }
