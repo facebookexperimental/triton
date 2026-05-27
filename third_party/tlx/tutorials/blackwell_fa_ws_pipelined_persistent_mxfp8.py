@@ -9,6 +9,7 @@ from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _s
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 from triton.language.extra.tlx.mxfp8_utils import (
+    _amax_to_e8m0_and_quantize,
     _to_mxfp8_block,
     _to_mxfp8_block_with_block_amax,
 )
@@ -1429,10 +1430,11 @@ def _softmax_recompute_quantization_iter(
             ),
             ds_scale_packed,
         )
-        ds_dq_fp8, ds_scale_dq = _to_mxfp8_block(
-            tl.trans(dsT),
-            VEC_SIZE,
-            p_dtype,
+        dsT_t = tl.trans(dsT)
+        dq_amax = tl.max(tl.abs(dsT_t))
+        dq_amax_bcast = tl.full([DS_M_SUB, BLOCK_N1 // VEC_SIZE], 0.0, tl.float32) + dq_amax
+        ds_scale_dq, ds_dq_fp8 = _amax_to_e8m0_and_quantize(
+            dsT_t, dq_amax_bcast, VEC_SIZE, p_dtype,
         )
         tlx.local_store(
             tlx.local_slice(tlx.local_view(ds_dq_tiles_smem, ds_buf_id), [subtile_id * DS_M_SUB, 0],
