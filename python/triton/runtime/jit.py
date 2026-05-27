@@ -966,7 +966,8 @@ class JITFunction(JITCallable, KernelInterface[T]):
                 # Pad missing trailing args (same as lookup path)
                 if len(_ins_args) < len(self.params):
                     _ins_args = tuple(list(_ins_args) + [None] * (len(self.params) - len(_ins_args)))
-                native_fast_dispatch_insert(self, _ins_args, self.params, _ins_hash, kernel, _disp)
+                native_fast_dispatch_insert(self, _ins_args, self.params, _ins_hash, kernel, _disp,
+                                            getattr(kernel, '_dispatch_arg_indices', None))
         return kernel
 
     def repr(self, _):
