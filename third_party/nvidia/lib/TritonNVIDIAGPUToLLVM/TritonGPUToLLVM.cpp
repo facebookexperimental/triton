@@ -217,6 +217,23 @@ struct ConvertTritonGPUToLLVM
         id.replaceAllUsesWith(zero);
       });
     }
+    // Deduplicate elect.sync ops within each basic block. elect.sync with
+    // membermask=-1 always returns the same predicate within a convergence
+    // region, but MLIR's CSE won't touch it because it has side effects.
+    mod.walk([](Block *block) {
+      NVVM::ElectSyncOp first = nullptr;
+      for (auto &op : llvm::make_early_inc_range(*block)) {
+        if (auto elect = dyn_cast<NVVM::ElectSyncOp>(&op)) {
+          if (!first)
+            first = elect;
+          else {
+            elect.replaceAllUsesWith(first.getResult());
+            elect.erase();
+          }
+        }
+      }
+    });
+
     fixUpLoopAnnotation(mod);
 
     // Ensure warp group code is isolated from above.
