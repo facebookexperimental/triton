@@ -14,8 +14,6 @@ from triton.language.extra.tlx.mxfp8_utils import (
 )
 from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode
 
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
-
 
 def _mxf8_host_descriptor_pre_hook(nargs):
     BLOCK_M = nargs["BLOCK_M"]
@@ -63,22 +61,13 @@ mxfp8_configs = [
 ]
 
 
-def prune_configs_by_hdim_mxfp8(configs, named_args, **kwargs):
+def prune_configs_by_hdim_mxfp8(configs, _named_args, **_kwargs):
     return configs
 
 
 @triton.jit
 def _reduce_or(x, y):
     return x | y
-
-
-@triton.jit
-def _split_n_1d(x, SPLIT_FACTOR: tl.constexpr):
-    if SPLIT_FACTOR == 1:
-        return (x, )
-    else:
-        x0, x1 = x.reshape([2, x.shape[0] // 2]).permute(1, 0).split()
-        return _split_n_1d(x0, SPLIT_FACTOR // 2) + _split_n_1d(x1, SPLIT_FACTOR // 2)
 
 
 @triton.jit
@@ -177,8 +166,6 @@ def _softmax_inner_loop(
     out_dtype,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    NUM_MMA_GROUPS: tl.constexpr,
     VEC_SIZE: tl.constexpr,
     STAGE: tl.constexpr,
     SHARE_SCALE_BUFFERS: tl.constexpr = False,
@@ -301,6 +288,7 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
     SHARE_SCALE_BUFFERS: tl.constexpr = (HEAD_DIM == 128) and (BLOCK_N == 128)
 
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // 2
+    NUM_ACC_SLICES: tl.constexpr = 4
 
     # Compute p_dtype from V descriptor
     p_dtype = tlx.dtype_of(desc_v)
@@ -543,13 +531,25 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
                             should_rescale_red = tl.reduce(should_rescale, axis=0, combine_fn=_reduce_or)
                             should_rescale_scalar = tl.reshape(should_rescale_red, ())
                             if should_rescale_scalar:
-                                acc = tlx.local_load(acc_tiles[cid])
-                                acc = _mul_f32x2(acc, alpha_1)
-                                tlx.local_store(acc_tiles[cid], acc)
+                                for slice_id in tl.static_range(0, NUM_ACC_SLICES):
+                                    subslice = tlx.subslice(
+                                        acc_tiles[cid],
+                                        HEAD_DIM * slice_id // NUM_ACC_SLICES,
+                                        HEAD_DIM // NUM_ACC_SLICES,
+                                    )
+                                    acc = tlx.local_load(subslice)
+                                    acc = _mul_f32x2(acc, alpha_1)
+                                    tlx.local_store(subslice, acc)
                         else:
-                            acc = tlx.local_load(acc_tiles[cid])
-                            acc = _mul_f32x2(acc, alpha_1)
-                            tlx.local_store(acc_tiles[cid], acc)
+                            for slice_id in tl.static_range(0, NUM_ACC_SLICES):
+                                subslice = tlx.subslice(
+                                    acc_tiles[cid],
+                                    HEAD_DIM * slice_id // NUM_ACC_SLICES,
+                                    HEAD_DIM // NUM_ACC_SLICES,
+                                )
+                                acc = tlx.local_load(subslice)
+                                acc = _mul_f32x2(acc, alpha_1)
+                                tlx.local_store(subslice, acc)
                         tlx.barrier_arrive(acc_fulls[cid])
                     accum_cnt += 1
 
@@ -559,17 +559,29 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
                     # then non-critical M (LSE) store to GMEM
                     tlx.barrier_wait(l_fulls[cid], phase)
                     l = tlx.local_load(l_tiles[cid])
-                    m = tlx.local_load(m_tiles[cid])
-                    tlx.barrier_arrive(l_empties[cid])
+                    scale = 1 / l
 
                     tlx.barrier_wait(acc_empties[cid], phase)
                     tlx.barrier_wait(o_empties[cid], phase ^ 1)
-                    scale = 1 / l
-                    acc = tlx.local_load(acc_tiles[cid])
-                    acc = _mul_f32x2(acc, scale)
-                    acc = acc.to(tlx.dtype_of(desc_o))
-                    tlx.local_store(o_tiles[cid], acc)
+                    for slice_id in tl.static_range(0, NUM_ACC_SLICES):
+                        subslice = tlx.subslice(
+                            acc_tiles[cid],
+                            HEAD_DIM * slice_id // NUM_ACC_SLICES,
+                            HEAD_DIM // NUM_ACC_SLICES,
+                        )
+                        acc = tlx.local_load(subslice)
+                        acc = _mul_f32x2(acc, scale)
+                        acc = acc.to(tlx.dtype_of(desc_o))
+                        subslice_o = tlx.local_slice(
+                            o_tiles[cid],
+                            [0, HEAD_DIM * slice_id // NUM_ACC_SLICES],
+                            [BLOCK_M_SPLIT, HEAD_DIM // NUM_ACC_SLICES],
+                        )
+                        tlx.local_store(subslice_o, acc)
                     tlx.barrier_arrive(o_fulls[cid])
+                    l = tlx.local_load(l_tiles[cid])
+                    m = tlx.local_load(m_tiles[cid])
+                    tlx.barrier_arrive(l_empties[cid])
 
                     if RESCALE_OPT:
                         m = m * sm_scale * 1.44269504
@@ -629,8 +641,6 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
                         p_dtype,
                         BLOCK_M,
                         BLOCK_N,
-                        HEAD_DIM,
-                        NUM_MMA_GROUPS,
                         VEC_SIZE,
                         STAGE=4 - STAGE,
                         SHARE_SCALE_BUFFERS=SHARE_SCALE_BUFFERS,
@@ -660,8 +670,6 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
                         p_dtype,
                         BLOCK_M,
                         BLOCK_N,
-                        HEAD_DIM,
-                        NUM_MMA_GROUPS,
                         VEC_SIZE,
                         STAGE=2,
                         SHARE_SCALE_BUFFERS=SHARE_SCALE_BUFFERS,
@@ -1128,8 +1136,6 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
                     tlx.barrier_expect_bytes(k_full, (K_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM) + K_SCALE_BYTES)
                     tlx.async_descriptor_load(desc_k, k_tile, [kv_offset_y, 0], k_full)
                     # 5D TMA offset: [batch_head, n_offset, head_offset, 0, 0]
-                    # Compute offset based on relative position within this batch-head's N range
-                    # kv_offset_y is absolute, base_offset_y is the start of this batch-head
                     tlx.async_descriptor_load(
                         desc_k_scale,
                         kv_scale_tiles[k_bufIdx],
@@ -1202,7 +1208,6 @@ def _attn_bwd_preprocess(
     O,
     DO,  #
     Delta,  #
-    Z,
     H,
     N_CTX,  #
     HEAD_DIM: tl.constexpr,
@@ -1242,21 +1247,21 @@ def _mxf8_bwd_host_descriptor_pre_hook(nargs):
 
     if not isinstance(nargs["desc_q"], TensorDescriptor):
         return
-    nargs["desc_q"].block_shape = [BLOCK_M1, HEAD_DIM]
+    nargs["desc_q"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM]
     if isinstance(nargs.get("desc_q_dk"), TensorDescriptor):
-        nargs["desc_q_dk"].block_shape = [BLOCK_M1, HEAD_DIM]
-    nargs["desc_k"].block_shape = [BLOCK_N1, HEAD_DIM]
+        nargs["desc_q_dk"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM]
+    nargs["desc_k"].block_shape = [1, 1, BLOCK_N1, HEAD_DIM]
     if isinstance(nargs.get("desc_k_dq"), TensorDescriptor):
-        nargs["desc_k_dq"].block_shape = [BLOCK_N1, HEAD_DIM]
-    nargs["desc_v"].block_shape = [BLOCK_N1, HEAD_DIM]
-    nargs["desc_do"].block_shape = [BLOCK_M1, HEAD_DIM]
+        nargs["desc_k_dq"].block_shape = [1, 1, BLOCK_N1, HEAD_DIM]
+    nargs["desc_v"].block_shape = [1, 1, BLOCK_N1, HEAD_DIM]
+    nargs["desc_do"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM]
     if isinstance(nargs.get("desc_do_dv"), TensorDescriptor):
-        nargs["desc_do_dv"].block_shape = [BLOCK_M1, HEAD_DIM]
-    nargs["desc_dq"].block_shape = [BLOCK_M1, HEAD_DIM // (EPILOGUE_SUBTILE * 2)]
+        nargs["desc_do_dv"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM]
+    nargs["desc_dq"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM // (EPILOGUE_SUBTILE * 2)]
     if isinstance(nargs.get("desc_dk"), TensorDescriptor):
-        nargs["desc_dk"].block_shape = [BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
+        nargs["desc_dk"].block_shape = [1, 1, BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
     if isinstance(nargs.get("desc_dv"), TensorDescriptor):
-        nargs["desc_dv"].block_shape = [BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
+        nargs["desc_dv"].block_shape = [1, 1, BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
     if isinstance(nargs.get("desc_m"), TensorDescriptor):
         nargs["desc_m"].block_shape = [BLOCK_M1]
     if isinstance(nargs.get("desc_delta"), TensorDescriptor):
@@ -1305,7 +1310,6 @@ mxfp8_bwd_configs = [
 
 @triton.jit
 def _softmax_recompute_quantization_iter(
-    curr_m,
     blk_idx,
     qk_scale,
     qk_tiles,
@@ -1347,7 +1351,6 @@ def _softmax_recompute_quantization_iter(
     ds_buf_id, ds_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
     m_buf_id, m_phase = get_bufidx_phase(blk_idx, M_STAGE)
     d_buf_id, d_phase = get_bufidx_phase(blk_idx, D_STAGE)
-    tlx.barrier_wait(m_fulls[m_buf_id], m_phase)
     # Read QK from TMEM, apply sm_scale -> P
     tlx.barrier_wait(qk_fulls[0], tmem_phase)
     # qk_tiles, dp_tiles, dq_tiles all share the same physical
@@ -1358,6 +1361,7 @@ def _softmax_recompute_quantization_iter(
     # qk while this load is still in flight.
     qkT = tlx.local_load(tlx.local_view(qk_tiles, 0))
     tlx.barrier_arrive(qk_empties[0])
+    tlx.barrier_wait(m_fulls[m_buf_id], m_phase)
     m = tlx.local_load(sM_tiles[m_buf_id])
 
     qkT_scaled = _fma_f32x2(qkT, qk_scale, -m[None, :])
@@ -1451,7 +1455,6 @@ def _softmax_recompute_quantization_iter(
 @triton.autotune(
     configs=mxfp8_bwd_configs,
     key=["N_CTX", "HEAD_DIM", "H"],
-    restore_value=["dQ"],
 )
 @triton.jit  # pragma: no cover
 def _attn_bwd_mxf8_ws(
@@ -1465,7 +1468,6 @@ def _attn_bwd_mxf8_ws(
     desc_dq,
     desc_dk,
     desc_dv,
-    dQ,
     sm_scale,
     desc_m,
     desc_delta,
@@ -1532,7 +1534,7 @@ def _attn_bwd_mxf8_ws(
         tiles_per_sm += 1
     tile_idx = prog_id
 
-    DS_NUM_SUBS: tl.constexpr = 4
+    DS_NUM_SUBS: tl.constexpr = 2
 
     # ===== TMEM allocations =====
     # Single-region accumulator alias (qk/dp/p/dq overlap). Lifetime correctness
@@ -1902,13 +1904,10 @@ def _attn_bwd_mxf8_ws(
                 start_n = pid * BLOCK_N1
                 base_q = (off_z * H + off_h).to(tl.int64) * N_CTX
 
-                curr_m = 0
-
                 # Prologue: produce P for the first M-block.
                 # Call _softmax_recompute_quantization_iter with
                 # p_scale_tmem_prologue
                 _softmax_recompute_quantization_iter(
-                    curr_m,
                     blk_idx,
                     qk_scale,
                     qk_tiles,
@@ -1944,14 +1943,12 @@ def _attn_bwd_mxf8_ws(
                     REP_M,
                     DS_NUM_SUBS,
                 )
-                curr_m += BLOCK_M1
                 blk_idx += 1
 
                 for _ in range(1, num_steps):
                     # Call _softmax_recompute_quantization_iter with
                     # p_scale_tmem
                     _softmax_recompute_quantization_iter(
-                        curr_m,
                         blk_idx,
                         qk_scale,
                         qk_tiles,
@@ -1987,7 +1984,6 @@ def _attn_bwd_mxf8_ws(
                         REP_M,
                         DS_NUM_SUBS,
                     )
-                    curr_m += BLOCK_M1
                     blk_idx += 1
 
                 # Epilogue: dK / dV TMA store
@@ -1995,7 +1991,6 @@ def _attn_bwd_mxf8_ws(
 
                 tlx.barrier_wait(dv_fulls[0], persistent_tmem_phase)
                 slice_size: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
-                base_kv = base_q
                 for slice_id in tl.static_range(EPILOGUE_SUBTILE):
                     dv_slice = tlx.local_slice(
                         dv_tiles[0],
@@ -2012,7 +2007,9 @@ def _attn_bwd_mxf8_ws(
                         desc_dv,
                         dkv_store_buf[0],
                         [
-                            (base_kv + start_n).to(tl.int32),
+                            off_z,
+                            off_h,
+                            start_n,
                             slice_id * slice_size,
                         ],
                     )
@@ -2035,7 +2032,9 @@ def _attn_bwd_mxf8_ws(
                         desc_dk,
                         dkv_store_buf[0],
                         [
-                            (base_kv + start_n).to(tl.int32),
+                            off_z,
+                            off_h,
+                            start_n,
                             slice_id * slice_size,
                         ],
                     )
@@ -2076,7 +2075,9 @@ def _attn_bwd_mxf8_ws(
                             desc_dq,
                             dq_store_buf[dq_smem_idx],
                             [
-                                (base_q + curr_m).to(tl.int32),
+                                off_z,
+                                off_h,
+                                curr_m,
                                 slice_id * DQ_REDUCE_NCOL,
                             ],
                             store_reduce="add",
@@ -2088,7 +2089,7 @@ def _attn_bwd_mxf8_ws(
             tlx.async_descriptor_store_wait(0)
 
         # ----- MMA warp: 5 blockscaled GEMMs per M-block -----
-        with tlx.async_task(num_warps=1, registers=88):
+        with tlx.async_task(num_warps=1, registers=80):
             blk_idx = 0
             for _i in range(tiles_per_sm):
                 kv_buf_id, kv_phase = get_bufidx_phase(_i, NUM_BUFFERS_KV)
@@ -2404,7 +2405,6 @@ def _attn_bwd_mxf8_ws(
                 pid = tile_idx % n_tile_num
                 start_n = pid * BLOCK_N1
                 base_q = (off_z * H + off_h).to(tl.int64) * N_CTX
-                base_kv = base_q
                 # Scale TMA layout: [Z*H, REP_N (or REP_M), REP_HEAD, 2, 256].
                 # Tile selects (z, h) via off_seq_h, and the M / N index via
                 # the 2nd dim.
@@ -2426,7 +2426,7 @@ def _attn_bwd_mxf8_ws(
                 tlx.async_descriptor_load(
                     desc_k,
                     k_smem[kv_buf_id],
-                    [(base_kv + start_n).to(tl.int32), 0],
+                    [off_z, off_h, start_n, 0],
                     q_fulls[kv_buf_id],
                 )
                 tlx.async_descriptor_load(
@@ -2439,7 +2439,7 @@ def _attn_bwd_mxf8_ws(
                 tlx.async_descriptor_load(
                     desc_q,
                     q_smem[q_buf_id],
-                    [(base_q + curr_m).to(tl.int32), 0],
+                    [off_z, off_h, curr_m, 0],
                     q_fulls[q_buf_id],
                 )
                 tlx.async_descriptor_load(
@@ -2467,7 +2467,7 @@ def _attn_bwd_mxf8_ws(
                 tlx.async_descriptor_load(
                     desc_v,
                     v_smem[kv_buf_id],
-                    [(base_kv + start_n).to(tl.int32), 0],
+                    [off_z, off_h, start_n, 0],
                     do_fulls[kv_buf_id],
                 )
                 tlx.async_descriptor_load(
@@ -2482,7 +2482,7 @@ def _attn_bwd_mxf8_ws(
                 tlx.async_descriptor_load(
                     desc_do,
                     do_smem[do_buf_id],
-                    [(base_q + curr_m).to(tl.int32), 0],
+                    [off_z, off_h, curr_m, 0],
                     do_fulls[do_buf_id],
                 )
                 tlx.async_descriptor_load(
@@ -2508,7 +2508,7 @@ def _attn_bwd_mxf8_ws(
                 tlx.async_descriptor_load(
                     desc_do_dv,
                     do_dv_smem[do_buf_id],
-                    [(base_q + curr_m).to(tl.int32), 0],
+                    [off_z, off_h, curr_m, 0],
                     do_dv_fulls[do_buf_id],
                 )
                 tlx.async_descriptor_load(
@@ -2525,7 +2525,7 @@ def _attn_bwd_mxf8_ws(
                 tlx.async_descriptor_load(
                     desc_k_dq,
                     k_dq_smem[kv_buf_id],
-                    [(base_kv + start_n).to(tl.int32), 0],
+                    [off_z, off_h, start_n, 0],
                     k_dq_fulls[kv_buf_id],
                 )
                 tlx.async_descriptor_load(
@@ -2552,7 +2552,7 @@ def _attn_bwd_mxf8_ws(
                     tlx.async_descriptor_load(
                         desc_q,
                         q_smem[q_buf_id],
-                        [(base_q + curr_m).to(tl.int32), 0],
+                        [off_z, off_h, curr_m, 0],
                         q_fulls[q_buf_id],
                     )
                     tlx.async_descriptor_load(
@@ -2580,7 +2580,7 @@ def _attn_bwd_mxf8_ws(
                     tlx.async_descriptor_load(
                         desc_q_dk,
                         q_dk_smem[prev_q_buf_id],
-                        [(base_q + prev_m).to(tl.int32), 0],
+                        [off_z, off_h, prev_m, 0],
                         q_dk_fulls[prev_q_buf_id],
                     )
                     tlx.async_descriptor_load(
@@ -2598,7 +2598,7 @@ def _attn_bwd_mxf8_ws(
                     tlx.async_descriptor_load(
                         desc_do,
                         do_smem[do_buf_id],
-                        [(base_q + curr_m).to(tl.int32), 0],
+                        [off_z, off_h, curr_m, 0],
                         do_fulls[do_buf_id],
                     )
                     tlx.async_descriptor_load(
@@ -2624,7 +2624,7 @@ def _attn_bwd_mxf8_ws(
                     tlx.async_descriptor_load(
                         desc_do_dv,
                         do_dv_smem[do_buf_id],
-                        [(base_q + curr_m).to(tl.int32), 0],
+                        [off_z, off_h, curr_m, 0],
                         do_dv_fulls[do_buf_id],
                     )
                     tlx.async_descriptor_load(
@@ -2646,7 +2646,7 @@ def _attn_bwd_mxf8_ws(
                 tlx.async_descriptor_load(
                     desc_q_dk,
                     q_dk_smem[last_q_buf_id],
-                    [(base_q + last_m).to(tl.int32), 0],
+                    [off_z, off_h, last_m, 0],
                     q_dk_fulls[last_q_buf_id],
                 )
                 tlx.async_descriptor_load(
@@ -2721,7 +2721,6 @@ def attention_bwd(
         o,
         do_preproc,
         delta,
-        Z,
         H,
         N_CTX,
         HEAD_DIM=HEAD_DIM,
@@ -2733,19 +2732,21 @@ def attention_bwd(
     dk = torch.zeros(k.shape, device=k.device, dtype=torch.bfloat16)
     dv = torch.zeros(v.shape, device=v.device, dtype=torch.bfloat16)
 
-    dummy_block = [1, 1]
+    dummy_block = [1, 1, 1, 1]
     dummy_5d = [1, 1, 1, 1, 1]
+    desc_shape = [Z, H, N_CTX, HEAD_DIM]
+    desc_strides = [H * N_CTX * HEAD_DIM, N_CTX * HEAD_DIM, HEAD_DIM, 1]
 
-    desc_q = TensorDescriptor(q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-    desc_q_dk = TensorDescriptor(q_dk, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-    desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-    desc_k_dq = TensorDescriptor(k_dq, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-    desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-    desc_do = TensorDescriptor(do, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-    desc_do_dv = TensorDescriptor(do_dv, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-    desc_dq = TensorDescriptor(dq, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-    desc_dk = TensorDescriptor(dk, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-    desc_dv = TensorDescriptor(dv, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+    desc_q = TensorDescriptor(q, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
+    desc_q_dk = TensorDescriptor(q_dk, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
+    desc_k = TensorDescriptor(k, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
+    desc_k_dq = TensorDescriptor(k_dq, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
+    desc_v = TensorDescriptor(v, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
+    desc_do = TensorDescriptor(do, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
+    desc_do_dv = TensorDescriptor(do_dv, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
+    desc_dq = TensorDescriptor(dq, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
+    desc_dk = TensorDescriptor(dk, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
+    desc_dv = TensorDescriptor(dv, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
     desc_m = TensorDescriptor(M, shape=[y_dim], strides=[1], block_shape=[1])
     desc_delta = TensorDescriptor(delta, shape=[y_dim], strides=[1], block_shape=[1])
 
@@ -2757,7 +2758,7 @@ def attention_bwd(
     desc_do_scale = TensorDescriptor.from_tensor(do_scale, block_shape=dummy_5d)
     desc_do_dv_scale = TensorDescriptor.from_tensor(do_dv_scale, block_shape=dummy_5d)
 
-    def alloc_fn(size: int, align: int, _):
+    def alloc_fn(size: int, _align: int, _):
         return torch.empty(size, dtype=torch.int8, device="cuda")
 
     triton.set_allocator(alloc_fn)
@@ -2783,7 +2784,6 @@ def attention_bwd(
         desc_dq,
         desc_dk,
         desc_dv,
-        dq,
         sm_scale,
         desc_m,
         desc_delta,
@@ -2859,7 +2859,7 @@ class _attention(torch.autograd.Function):
         desc_k_scale = TensorDescriptor.from_tensor(k_scale, block_shape=dummy_block_shape)
         desc_v_scale = TensorDescriptor.from_tensor(v_scale, block_shape=dummy_block_shape)
 
-        def alloc_fn(size: int, align: int, _):
+        def alloc_fn(size: int, _align: int, _):
             return torch.empty(size, dtype=torch.int8, device="cuda")
 
         triton.set_allocator(alloc_fn)
@@ -3089,7 +3089,7 @@ def attention(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal, config=None)
     }
     _mxf8_host_descriptor_pre_hook(nargs)
 
-    def alloc_fn(size: int, align: int, _):
+    def alloc_fn(size: int, _align: int, _):
         return torch.empty(size, dtype=torch.int8, device="cuda")
 
     triton.set_allocator(alloc_fn)
