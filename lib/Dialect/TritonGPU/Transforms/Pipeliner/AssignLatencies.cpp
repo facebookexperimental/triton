@@ -191,7 +191,7 @@ public:
             (pipeHelper.isOperandsStateDetermined &&
              !ttng::hasLoadsAfterMMA(mma, forOp))) {
           // MMA can be overlapped with itself
-          mmaSelfLatency[mma] = 1;
+          mmaSelfLatency[mma] = 0;
           // WS does not have this problem because the MMA is placed in
           // a different partition than the MMA, so we can correctly set the
           // latency.
