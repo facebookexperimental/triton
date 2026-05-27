@@ -262,10 +262,9 @@ class Autotuner(KernelInterface):
         # Separate meta-params (num_warps, etc.) from kernel args.
         _meta = {k: v for k, v in config_kwargs.items() if k not in _arg_name_set}
 
-        # Seed C cache with hash=0 for JITCacheProxy.
+        # Seed C cache with hash=0 for native_fast_dispatch.
         # During autotuning, run() stored the kernel with a non-zero hash.
-        # JITCacheProxy always uses hash=0, so without seeding it would miss
-        # and recompile with wrong default options.
+        # We use hash=0 as the canonical key for autotuned steady-state dispatch.
         if not hasattr(self, '_fc_seeded'):
             self._fc_seeded = set()
         # Use autotuner key to distinguish specializations that may select
@@ -283,9 +282,14 @@ class Autotuner(KernelInterface):
                     _padded = tuple(full_args)
                     if len(_padded) < len(self.fn.params):
                         _padded = _padded + (None, ) * (len(self.fn.params) - len(_padded))
-                    native_fast_dispatch_insert(self.fn, _padded, self.fn.params, 0, kernel, _disp)
+                    native_fast_dispatch_insert(self.fn, _padded, self.fn.params, 0, kernel, _disp,
+                                                getattr(kernel, '_dispatch_arg_indices', None))
             self._fc_seeded.add(_seed_key)
             return kernel
+
+        # Steady-state: dispatch via JITCacheProxy (fastest path).
+        # The C cache stores dispatch_arg_indices per entry so it correctly
+        # selects only the args the dispatcher expects (handles None ptr args).
         return self.fn[evaluated_grid](*full_args)
 
     def run(self, *args, **kwargs):

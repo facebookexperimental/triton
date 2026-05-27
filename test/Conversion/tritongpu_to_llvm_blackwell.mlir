@@ -718,6 +718,21 @@ tt.func @tc_gen5_commit(%arg0: !ttg.memdesc<1xi64, #shared, #smem, mutable>, %pr
   ttng.tc_gen5_commit %arg0, %pred : !ttg.memdesc<1xi64, #shared, #smem, mutable>
   tt.return
 }
+
+// Two commits in the same block should reuse a single elect.sync
+// (createElectPredicate CSE within the same basic block).
+// CHECK-LABEL: @tc_gen5_commit_elect_cse
+tt.func @tc_gen5_commit_elect_cse(%bar0: !ttg.memdesc<1xi64, #shared, #smem, mutable>,
+                                  %bar1: !ttg.memdesc<1xi64, #shared, #smem, mutable>,
+                                  %pred: i1) {
+  // CHECK: nvvm.elect.sync
+  // CHECK-NOT: nvvm.elect.sync
+  // CHECK: tcgen05.commit
+  // CHECK: tcgen05.commit
+  ttng.tc_gen5_commit %bar0, %pred : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+  ttng.tc_gen5_commit %bar1, %pred : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+  tt.return
+}
 }
 
 // -----

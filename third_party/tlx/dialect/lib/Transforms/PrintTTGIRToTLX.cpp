@@ -211,7 +211,7 @@ static const TTGIRToTLXMapping opMappings[] = {
     // Binary arith ops (add, sub, mul, div, rem, xor, and, or) are handled
     // as infix operators (a + b, a * b, etc.) in printSimplifiedOp.
     {"arith.constant", "const", "Constant value"},
-    {"arith.select", "select", "Select operation"},
+    {"arith.select", "tl.where", "Select operation"},
     {"arith.maxf", "tl.maximum", "Float max"},
     {"arith.maxnumf", "tl.maximum", "Float max (NaN-propagating)"},
     {"arith.minf", "tl.minimum", "Float min"},
@@ -238,6 +238,7 @@ static const TTGIRToTLXMapping opMappings[] = {
     {"tt.split", "tl.split", "Split tensor"},
     {"tt.get_program_id", "tl.program_id", "Get program ID"},
     {"tt.get_num_programs", "tl.num_programs", "Get number of programs"},
+    {"tt.map_elementwise", "tl.map_elementwise", "Map elementwise operation"},
     {"tt.return", "return", "Return from function"},
 
     // Math dialect operations
@@ -484,9 +485,17 @@ getValueName(Value v,
               os << intAttr.getValue();
             }
           } else if (auto floatAttr = dyn_cast<FloatAttr>(valueAttr)) {
-            SmallString<16> str;
-            floatAttr.getValue().toString(str);
-            os << str;
+            auto apFloat = floatAttr.getValue();
+            if (apFloat.isInfinity()) {
+              if (apFloat.isNegative())
+                os << "-float(\"inf\")";
+              else
+                os << "float(\"inf\")";
+            } else {
+              SmallString<16> str;
+              apFloat.toString(str);
+              os << str;
+            }
           } else {
             // Fall through to normal name handling for unsupported constant
             // types
@@ -530,14 +539,22 @@ void printConstantValue(Attribute attr, llvm::raw_ostream &os) {
   if (auto intAttr = dyn_cast<IntegerAttr>(attr)) {
     // Special handling for i1 (boolean) type
     if (intAttr.getType().isInteger(1)) {
-      os << (intAttr.getValue().getBoolValue() ? "true" : "false");
+      os << (intAttr.getValue().getBoolValue() ? "True" : "False");
     } else {
       os << intAttr.getValue();
     }
   } else if (auto floatAttr = dyn_cast<FloatAttr>(attr)) {
-    SmallString<16> str;
-    floatAttr.getValue().toString(str);
-    os << str;
+    auto apFloat = floatAttr.getValue();
+    if (apFloat.isInfinity()) {
+      if (apFloat.isNegative())
+        os << "-float('inf')";
+      else
+        os << "float('inf')";
+    } else {
+      SmallString<16> str;
+      apFloat.toString(str);
+      os << str;
+    }
   } else if (auto denseAttr = dyn_cast<DenseElementsAttr>(attr)) {
     // For dense tensors, print as tl.full() for splats
     if (denseAttr.isSplat()) {
@@ -582,7 +599,7 @@ void printConstantValue(Attribute attr, llvm::raw_ostream &os) {
       os << "dense<...>";
     }
   } else if (auto boolAttr = dyn_cast<BoolAttr>(attr)) {
-    os << (boolAttr.getValue() ? "true" : "false");
+    os << (boolAttr.getValue() ? "True" : "False");
   } else {
     // Fallback for other types
     os << "const";
@@ -717,19 +734,33 @@ bool shouldSkipOp(Operation *op,
   // - tt.return: function terminator
   // - tt.reduce.return: internal to reduce operation
   static const llvm::StringSet<> opsToSkip = {
-      "ttng.init_barrier",  "ttg.warp_return",
-      "ttg.warp_yield",     "ttg.warp_specialize.partitions",
-      "gpu.barrier",        "arith.constant",
-      "ttg.convert_layout", "tt.return",
-      "tt.reduce.return",   "arith.extui",
-      "arith.extsi",        "arith.extf",
-      "arith.trunci",       "arith.truncf",
-      "arith.sitofp",       "arith.uitofp",
-      "arith.fptosi",       "arith.fptoui",
-      "arith.bitcast",      "arith.index_cast",
-      "arith.index_castui", "ttng.inval_barrier",
-      "tt.splat",           "tt.broadcast",
+      "ttng.init_barrier",
+      "ttg.warp_return",
+      "ttg.warp_yield",
+      "ttg.warp_specialize.partitions",
+      "gpu.barrier",
+      "arith.constant",
+      "ttg.convert_layout",
+      "tt.return",
+      "tt.reduce.return",
+      "arith.extui",
+      "arith.extsi",
+      "arith.extf",
+      "arith.trunci",
+      "arith.truncf",
+      "arith.sitofp",
+      "arith.uitofp",
+      "arith.fptosi",
+      "arith.fptoui",
+      "arith.bitcast",
+      "arith.index_cast",
+      "arith.index_castui",
+      "ttng.inval_barrier",
+      "tt.splat",
+      "tt.broadcast",
       "ttg.memdesc_index",
+      "tt.map_elementwise.return",
+      "ttng.tcgen5_global_alloc",
   };
   if (opsToSkip.contains(opName)) {
     // Don't skip arith.constant with DenseElementsAttr (tensor splat constants)
@@ -1272,6 +1303,18 @@ void printSimplifiedOp(
     if (auto axisAttr = op->getAttrOfType<IntegerAttr>("axis"))
       axis = axisAttr.getInt();
     os << "tl.program_id(axis=" << axis << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // tt.get_num_programs: emit tl.num_programs(axis=N)
+  if (opName == "tt.get_num_programs") {
+    if (op->getNumResults() > 0)
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+    int axis = 0;
+    if (auto axisAttr = op->getAttrOfType<IntegerAttr>("axis"))
+      axis = axisAttr.getInt();
+    os << "tl.num_programs(axis=" << axis << ")";
     printLocComment(op, os);
     return;
   }
@@ -1836,17 +1879,28 @@ void printBlock(Block &block, llvm::raw_ostream &os,
     if (op.getNumRegions() > 0) {
       printSimplifiedOp(&op, os, opNameMap, allocInfoMap, indent,
                         argSubstitutionMap);
-      // Print indentation and opening brace
-      for (unsigned i = 0; i < indent; ++i)
-        os << "  ";
-      os << "{\n";
+      // Print region body as # comments (valid Python syntax)
       for (Region &region : op.getRegions()) {
-        printRegion(region, os, opNameMap, allocInfoMap, skippedOps, indent + 1,
-                    argSubstitutionMap);
+        for (Block &bodyBlock : region) {
+          for (Operation &bodyOp : bodyBlock) {
+            if (shouldSkipOp(&bodyOp, allocInfoMap, skippedOps))
+              continue;
+            std::string line;
+            llvm::raw_string_ostream lineOs(line);
+            printSimplifiedOp(&bodyOp, lineOs, opNameMap, allocInfoMap, 0,
+                              argSubstitutionMap);
+            lineOs.flush();
+            // Strip trailing newline and print as comment
+            while (!line.empty() && (line.back() == '\n' || line.back() == ' '))
+              line.pop_back();
+            if (!line.empty()) {
+              for (unsigned i = 0; i < indent; ++i)
+                os << "  ";
+              os << "  # " << line << "\n";
+            }
+          }
+        }
       }
-      for (unsigned i = 0; i < indent; ++i)
-        os << "  ";
-      os << "}\n";
     } else {
       printSimplifiedOp(&op, os, opNameMap, allocInfoMap, indent,
                         argSubstitutionMap);
@@ -1973,16 +2027,26 @@ void printBlockOps(Block &block, llvm::raw_ostream &os,
     if (op.getNumRegions() > 0) {
       printSimplifiedOp(&op, os, opNameMap, allocInfoMap, indent,
                         argSubstitutionMap);
-      for (unsigned i = 0; i < indent; ++i)
-        os << "  ";
-      os << "{\n";
       for (Region &region : op.getRegions()) {
-        printRegion(region, os, opNameMap, allocInfoMap, skippedOps, indent + 1,
-                    argSubstitutionMap);
+        for (Block &bodyBlock : region) {
+          for (Operation &bodyOp : bodyBlock) {
+            if (shouldSkipOp(&bodyOp, allocInfoMap, skippedOps))
+              continue;
+            std::string line;
+            llvm::raw_string_ostream lineOs(line);
+            printSimplifiedOp(&bodyOp, lineOs, opNameMap, allocInfoMap, 0,
+                              argSubstitutionMap);
+            lineOs.flush();
+            while (!line.empty() && (line.back() == '\n' || line.back() == ' '))
+              line.pop_back();
+            if (!line.empty()) {
+              for (unsigned i = 0; i < indent; ++i)
+                os << "  ";
+              os << "  # " << line << "\n";
+            }
+          }
+        }
       }
-      for (unsigned i = 0; i < indent; ++i)
-        os << "  ";
-      os << "}\n";
     } else {
       printSimplifiedOp(&op, os, opNameMap, allocInfoMap, indent,
                         argSubstitutionMap);
