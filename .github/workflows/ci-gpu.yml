@@ -41,6 +41,7 @@ jobs:
           python3 --version
           python3 -m pip install --upgrade pip setuptools wheel
           python3 -m pip install -r python/requirements.txt -r python/test-requirements.txt
+          python3 -m pip install filelock fsspec jinja2 networkx sympy typing_extensions
           python3 -m pip install --force-reinstall --no-deps "${TORCH_NIGHTLY_URL}"
           python3 -m pip uninstall -y triton triton-rocm pytorch-triton || true
 
