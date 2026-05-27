@@ -109,6 +109,54 @@ private:
     }
   }
 
+  SmallVector<unsigned> getRegGroupKey(ArrayRef<unsigned> offset, unsigned axis,
+                                       unsigned groupSpan) const {
+    SmallVector<unsigned> key(offset.begin(), offset.end());
+    unsigned axisOffset = key[axis];
+    key[axis] = (axisOffset / groupSpan) * groupSpan;
+    return key;
+  }
+
+  SmallVector<Value>
+  reduceValueSequence(Location loc, triton::ReduceOp op,
+                      SmallVector<SmallVector<Value>> values,
+                      ConversionPatternRewriter &rewriter) const {
+    if (values.empty())
+      return {};
+
+    if (isInnerTree(op)) {
+      while (values.size() > 1) {
+        SmallVector<SmallVector<Value>> next;
+        for (unsigned i = 0; i + 1 < values.size(); i += 2) {
+          SmallVector<Value> merged = values[i];
+          accumulate(loc, rewriter, op.getCombineOp(), merged, values[i + 1]);
+          next.push_back(std::move(merged));
+        }
+        if (values.size() % 2 == 1)
+          next.push_back(std::move(values.back()));
+        values = std::move(next);
+      }
+      return std::move(values[0]);
+    }
+
+    SmallVector<Value> acc;
+    for (auto &cur : values)
+      accumulate(loc, rewriter, op.getCombineOp(), acc, cur);
+    return acc;
+  }
+
+  bool matchesResultOffset(ArrayRef<unsigned> key, ArrayRef<unsigned> resultOffs,
+                           unsigned axis) const {
+    if (key.size() != resultOffs.size() + 1)
+      return false;
+    for (unsigned dim = 0; dim < resultOffs.size(); ++dim) {
+      unsigned keyDim = dim < axis ? dim : dim + 1;
+      if (key[keyDim] != resultOffs[dim])
+        return false;
+    }
+    return true;
+  }
+
   SmallVector<SmallVector<Value>>
   unpackInputs(Location loc, triton::ReduceOp op, OpAdaptor adaptor,
                ConversionPatternRewriter &rewriter) const {
@@ -150,103 +198,36 @@ private:
       uniqueOffsets.insert({offsets[i], i});
     }
 
-    auto *combineOp = &op.getCombineOp();
     auto srcIndices = emitIndices(op.getLoc(), rewriter, targetInfo,
                                   helper.getSrcLayout(), operandType, true);
+    unsigned axis = op.getAxis();
+    unsigned contigPerThread = helper.getContigPerThreadOnReductionAxis();
 
     SmallVector<int> iterOrder;
     for (const auto &[_, i] : uniqueOffsets)
       iterOrder.push_back(i);
 
-    if (isInnerTree(op)) {
-      reduceWithinThreadsInnerTree(op, offsets, iterOrder, *combineOp,
-                                   srcValues, srcIndices, accs, indices,
-                                   rewriter);
-    } else {
-      for (int i : iterOrder) {
-        SmallVector<unsigned> key = offsets[i];
-        key[op.getAxis()] = 0;
-        bool isFirst = accs.find(key) == accs.end();
-        accumulate(op.getLoc(), rewriter, *combineOp, accs[key], srcValues[i]);
-        if (isFirst)
-          indices[key] = srcIndices[i];
-      }
-    }
-  }
-
-  // INNER_TREE: tree-reduces values in packed register order.  The packed
-  // order is the logical order for a defined reduction tree, so adjacent
-  // register values are combined before the result participates in warp-level
-  // reduction.
-  void reduceWithinThreadsInnerTree(
-      triton::ReduceOp op, SmallVector<SmallVector<unsigned>> &offsets,
-      SmallVector<int> &iterOrder, Region &combineOp,
-      SmallVector<SmallVector<Value>> &srcValues,
-      SmallVector<SmallVector<Value>> &srcIndices,
-      std::map<SmallVector<unsigned>, SmallVector<Value>> &accs,
-      std::map<SmallVector<unsigned>, SmallVector<Value>> &indices,
-      ConversionPatternRewriter &rewriter) const {
-    unsigned axis = op.getAxis();
-
-    auto resultTy = dyn_cast<RankedTensorType>(op.getResult()[0].getType());
-    if (!resultTy) {
-      SmallVector<SmallVector<Value>> level;
-      for (int idx : iterOrder)
-        level.push_back(srcValues[idx]);
-      while (level.size() > 1) {
-        SmallVector<SmallVector<Value>> nextLevel;
-        for (unsigned j = 0; j + 1 < level.size(); j += 2) {
-          SmallVector<Value> merged = level[j];
-          accumulate(op.getLoc(), rewriter, combineOp, merged, level[j + 1]);
-          nextLevel.push_back(std::move(merged));
-        }
-        if (level.size() % 2 == 1)
-          nextLevel.push_back(std::move(level.back()));
-        level = std::move(nextLevel);
-      }
-      SmallVector<unsigned> key = offsets[iterOrder[0]];
-      key[axis] = 0;
-      accs[key] = std::move(level[0]);
-      indices[key] = srcIndices[iterOrder[0]];
-      return;
+    std::map<SmallVector<unsigned>, SmallVector<int>> regGroups;
+    for (int idx : iterOrder) {
+      regGroups[getRegGroupKey(offsets[idx], axis, contigPerThread)]
+          .push_back(idx);
     }
 
-    auto resultLayout = cast<SliceEncodingAttr>(resultTy.getEncoding());
-    SmallVector<SmallVector<unsigned>> resultOffsets =
-        emitOffsetForLayout(resultLayout, resultTy);
-    auto resultIndices = emitIndices(op.getLoc(), rewriter, targetInfo,
-                                     resultLayout, resultTy, true);
-    assert(resultOffsets.size() == resultIndices.size());
-    assert(iterOrder.size() % resultOffsets.size() == 0);
-
-    unsigned elemsPerResult = iterOrder.size() / resultOffsets.size();
-    auto b = TritonLLVMOpBuilder(op.getLoc(), rewriter);
-    for (unsigned resultIdx = 0; resultIdx < resultOffsets.size();
-         ++resultIdx) {
-      SmallVector<SmallVector<Value>> level;
-      unsigned begin = resultIdx * elemsPerResult;
-      unsigned end = begin + elemsPerResult;
-      for (unsigned i = begin; i < end; ++i)
-        level.push_back(srcValues[iterOrder[i]]);
-
-      while (level.size() > 1) {
-        SmallVector<SmallVector<Value>> nextLevel;
-        for (unsigned j = 0; j + 1 < level.size(); j += 2) {
-          SmallVector<Value> merged = level[j];
-          accumulate(op.getLoc(), rewriter, combineOp, merged, level[j + 1]);
-          nextLevel.push_back(std::move(merged));
-        }
-        if (level.size() % 2 == 1)
-          nextLevel.push_back(std::move(level.back()));
-        level = std::move(nextLevel);
+    for (auto &[key, group] : regGroups) {
+      if (isInnerTree(op)) {
+        llvm::sort(group, [&](int lhs, int rhs) {
+          return offsets[lhs][axis] < offsets[rhs][axis];
+        });
       }
 
-      SmallVector<unsigned> key = resultOffsets[resultIdx];
-      key.insert(key.begin() + axis, 0);
-      SmallVector<Value> index = resultIndices[resultIdx];
-      index.insert(index.begin() + axis, b.i32_val(0));
-      accs[key] = std::move(level[0]);
-      indices[key] = std::move(index);
+      SmallVector<SmallVector<Value>> groupValues;
+      groupValues.reserve(group.size());
+      for (int idx : group)
+        groupValues.push_back(srcValues[idx]);
+
+      accs[key] =
+          reduceValueSequence(op.getLoc(), op, std::move(groupValues), rewriter);
+      indices[key] = srcIndices[group.front()];
     }
   }
 
@@ -312,23 +293,41 @@ private:
     Location loc = op.getLoc();
     unsigned axis = op.getAxis();
     SmallVector<Value> results(op.getNumOperands());
-    for (unsigned i = 0; i < op.getNumOperands(); ++i) {
-      if (auto resultTy =
-              dyn_cast<RankedTensorType>(op.getResult()[i].getType())) {
-        auto resultLayout = cast<SliceEncodingAttr>(resultTy.getEncoding());
-        unsigned resultElems = getTotalElemsPerThread(resultTy);
-        SmallVector<SmallVector<unsigned>> resultOffset =
-            emitOffsetForLayout(resultLayout, resultTy);
-        SmallVector<Value> resultVals;
-        for (int j = 0; j < resultElems; j++) {
-          auto key = resultOffset[j];
-          key.insert(key.begin() + axis, 0);
-          resultVals.push_back(accs[key][i]);
+    if (auto firstResultTy =
+            dyn_cast<RankedTensorType>(op.getResult()[0].getType())) {
+      auto resultLayout = cast<SliceEncodingAttr>(firstResultTy.getEncoding());
+      unsigned resultElems = getTotalElemsPerThread(firstResultTy);
+      SmallVector<SmallVector<unsigned>> resultOffsets =
+          emitOffsetForLayout(resultLayout, firstResultTy);
+      SmallVector<SmallVector<Value>> resultVals(
+          op.getNumOperands(), SmallVector<Value>(resultElems));
+
+      for (unsigned j = 0; j < resultElems; ++j) {
+        SmallVector<SmallVector<Value>> groupVals;
+        for (const auto &[key, vals] : accs) {
+          if (matchesResultOffset(key, resultOffsets[j], axis))
+            groupVals.push_back(vals);
         }
-        results[i] = packLLElements(loc, getTypeConverter(), resultVals,
+        SmallVector<Value> reduced =
+            reduceValueSequence(loc, op, std::move(groupVals), rewriter);
+        for (unsigned i = 0; i < op.getNumOperands(); ++i)
+          resultVals[i][j] = reduced[i];
+      }
+
+      for (unsigned i = 0; i < op.getNumOperands(); ++i) {
+        auto resultTy = cast<RankedTensorType>(op.getResult()[i].getType());
+        results[i] = packLLElements(loc, getTypeConverter(), resultVals[i],
                                     rewriter, resultTy);
-      } else
-        results[i] = accs.begin()->second[i];
+      }
+    } else {
+      SmallVector<SmallVector<Value>> groupVals;
+      groupVals.reserve(accs.size());
+      for (const auto &[_, vals] : accs)
+        groupVals.push_back(vals);
+      SmallVector<Value> reduced =
+          reduceValueSequence(loc, op, std::move(groupVals), rewriter);
+      for (unsigned i = 0; i < op.getNumOperands(); ++i)
+        results[i] = reduced[i];
     }
     rewriter.replaceOp(op, results);
   }
@@ -368,16 +367,20 @@ private:
     unsigned numRegGroups = helper.getNumRegGroupsOnAxis();
     auto smemOrder = helper.getOrderWithAxisAtBeginning();
 
-    // Build a map from axis offset → sequential group index (0, 1, ...).
     std::map<unsigned, unsigned> axisOffsetToGroupIdx;
     if (numRegGroups > 1) {
-      for (const auto &[key, _] : accs) {
-        unsigned axisVal = key[axis];
-        if (axisOffsetToGroupIdx.find(axisVal) == axisOffsetToGroupIdx.end()) {
-          unsigned nextIdx = axisOffsetToGroupIdx.size();
-          axisOffsetToGroupIdx[axisVal] = nextIdx;
-        }
+      SmallVector<unsigned> axisOffsets;
+      axisOffsets.reserve(accs.size());
+      for (const auto &[key, _] : accs)
+        axisOffsets.push_back(key[axis]);
+      llvm::sort(axisOffsets);
+
+      for (unsigned axisVal : axisOffsets) {
+        if (axisOffsetToGroupIdx.find(axisVal) == axisOffsetToGroupIdx.end())
+          axisOffsetToGroupIdx[axisVal] = axisOffsetToGroupIdx.size();
       }
+      assert(axisOffsetToGroupIdx.size() == numRegGroups &&
+             "unexpected number of register groups");
     }
 
     for (auto it : accs) {
@@ -464,24 +467,6 @@ private:
     }
   }
 
-  SmallVector<Value>
-  pairwiseInnerTreeReduceRegGroups(Location loc, triton::ReduceOp op,
-                                   SmallVector<SmallVector<Value>> groupVals,
-                                   ConversionPatternRewriter &rewriter) const {
-    while (groupVals.size() > 1) {
-      SmallVector<SmallVector<Value>> next;
-      for (unsigned g = 0; g + 1 < groupVals.size(); g += 2) {
-        SmallVector<Value> acc = groupVals[g];
-        accumulate(loc, rewriter, op.getCombineOp(), acc, groupVals[g + 1]);
-        next.push_back(std::move(acc));
-      }
-      if (groupVals.size() % 2 == 1)
-        next.push_back(std::move(groupVals.back()));
-      groupVals = std::move(next);
-    }
-    return groupVals[0];
-  }
-
   SmallVector<Value> loadAndReduceRegGroups(
       Location loc, triton::ReduceOp op, ArrayRef<Value> smemBases,
       SmallVector<Value> readIdx, ArrayRef<unsigned> smemShape,
@@ -504,8 +489,7 @@ private:
       }
       groupVals.push_back(std::move(vals));
     }
-    return pairwiseInnerTreeReduceRegGroups(loc, op, std::move(groupVals),
-                                            rewriter);
+    return reduceValueSequence(loc, op, std::move(groupVals), rewriter);
   }
 
   SmallVector<Value>
@@ -527,8 +511,7 @@ private:
       }
       groupVals.push_back(std::move(vals));
     }
-    return pairwiseInnerTreeReduceRegGroups(loc, op, std::move(groupVals),
-                                            rewriter);
+    return reduceValueSequence(loc, op, std::move(groupVals), rewriter);
   }
 
   // Load the final reduction from shared memory and replace the reduce result

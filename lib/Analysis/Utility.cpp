@@ -33,8 +33,12 @@ SmallVector<unsigned> ReduceOpHelper::getOrderWithAxisAtBeginning() {
   return order;
 }
 
-// Thread offset is the thread index offset of two adjacent threads on the
-// reduction axis within the warp.
+unsigned ReduceOpHelper::getContigPerThreadOnReductionAxis() {
+  return toLinearEncoding(srcTy).getContigPerThread()[axis];
+}
+
+// Thread offset is the lane stride between adjacent threads with unique data on
+// the reduction axis within the warp.
 unsigned ReduceOpHelper::getThreadOffsetOnReductionAxis() {
   auto *ctx = srcEncoding.getContext();
   auto linearLayout = toLinearLayout(srcTy);
@@ -103,7 +107,29 @@ unsigned ReduceOpHelper::getIntraWarpSizeWithUniqueData() {
   return getThreadsPerWarp(srcEncoding, srcShape)[axis];
 }
 
-unsigned ReduceOpHelper::getNumRegGroupsOnAxis() { return 1; }
+unsigned ReduceOpHelper::getNumRegGroupsOnAxis() {
+  auto *ctx = srcEncoding.getContext();
+  auto linearLayout = toLinearLayout(srcTy);
+  auto kRegister = mlir::StringAttr::get(ctx, "register");
+  auto kLane = mlir::StringAttr::get(ctx, "lane");
+  auto kWarp = mlir::StringAttr::get(ctx, "warp");
+  auto kBlock = mlir::StringAttr::get(ctx, "block");
+
+  unsigned contigPerThread = getContigPerThreadOnReductionAxis();
+  assert(contigPerThread > 0 &&
+         "contiguous elements per thread on reduction axis must be > 0");
+
+  llvm::SmallSet<unsigned, 4> groupBases;
+  for (unsigned reg = 0; reg < linearLayout.getInDimSize(kRegister); ++reg) {
+    auto idxs = linearLayout.apply(
+        {{kRegister, reg}, {kLane, 0}, {kWarp, 0}, {kBlock, 0}});
+    assert(idxs.size() == srcShape.size());
+    unsigned axisOffset = idxs[axis].second;
+    groupBases.insert((axisOffset / contigPerThread) * contigPerThread);
+  }
+
+  return groupBases.empty() ? 1 : groupBases.size();
+}
 
 bool ReduceOpHelper::isWarpSynchronous() {
   if (srcShape[axis] == 1)
