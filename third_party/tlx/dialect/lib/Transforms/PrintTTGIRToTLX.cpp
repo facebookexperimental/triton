@@ -485,9 +485,17 @@ getValueName(Value v,
               os << intAttr.getValue();
             }
           } else if (auto floatAttr = dyn_cast<FloatAttr>(valueAttr)) {
-            SmallString<16> str;
-            floatAttr.getValue().toString(str);
-            os << str;
+            auto apFloat = floatAttr.getValue();
+            if (apFloat.isInfinity()) {
+              if (apFloat.isNegative())
+                os << "-float(\"inf\")";
+              else
+                os << "float(\"inf\")";
+            } else {
+              SmallString<16> str;
+              apFloat.toString(str);
+              os << str;
+            }
           } else {
             // Fall through to normal name handling for unsupported constant
             // types
@@ -531,14 +539,22 @@ void printConstantValue(Attribute attr, llvm::raw_ostream &os) {
   if (auto intAttr = dyn_cast<IntegerAttr>(attr)) {
     // Special handling for i1 (boolean) type
     if (intAttr.getType().isInteger(1)) {
-      os << (intAttr.getValue().getBoolValue() ? "true" : "false");
+      os << (intAttr.getValue().getBoolValue() ? "True" : "False");
     } else {
       os << intAttr.getValue();
     }
   } else if (auto floatAttr = dyn_cast<FloatAttr>(attr)) {
-    SmallString<16> str;
-    floatAttr.getValue().toString(str);
-    os << str;
+    auto apFloat = floatAttr.getValue();
+    if (apFloat.isInfinity()) {
+      if (apFloat.isNegative())
+        os << "-float('inf')";
+      else
+        os << "float('inf')";
+    } else {
+      SmallString<16> str;
+      apFloat.toString(str);
+      os << str;
+    }
   } else if (auto denseAttr = dyn_cast<DenseElementsAttr>(attr)) {
     // For dense tensors, print as tl.full() for splats
     if (denseAttr.isSplat()) {
@@ -583,7 +599,7 @@ void printConstantValue(Attribute attr, llvm::raw_ostream &os) {
       os << "dense<...>";
     }
   } else if (auto boolAttr = dyn_cast<BoolAttr>(attr)) {
-    os << (boolAttr.getValue() ? "true" : "false");
+    os << (boolAttr.getValue() ? "True" : "False");
   } else {
     // Fallback for other types
     os << "const";
