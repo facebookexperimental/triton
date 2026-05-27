@@ -362,8 +362,8 @@ void init_triton_tlx_ir(py::module &&m) {
              auto context = self.getBuilder().getContext();
              auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
              auto barriersMemDescType = ttg::MemDescType::get(
-                 {numBarriers}, self.getBuilder().getI64Type(), barrierEncoding,
-                 memorySpace, /*mutableMemory=*/true);
+                 {numBarriers, 1}, self.getBuilder().getI64Type(),
+                 barrierEncoding, memorySpace, /*mutableMemory=*/true);
 
              auto singleBarrierMemDescType = ttg::MemDescType::get(
                  {1}, self.getBuilder().getI64Type(), barrierEncoding,

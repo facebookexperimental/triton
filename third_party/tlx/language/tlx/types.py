@@ -984,7 +984,7 @@ class mbarrier_type(buffered_tensor_type):
 
     def to_ir(self, builder: ir.builder) -> None:
         if self.num >= 1:
-            shape = [self.num]
+            shape = [self.num] + self.shape
         else:
             shape = self.shape
         return builder.get_memdesc_type(

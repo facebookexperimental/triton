@@ -282,7 +282,6 @@ class CUDABackend(BaseBackend):
         tlx.tlx_passes.add_tlx_storage_alias_lowering(pm)
         # Only determine layouts after inlining is finished.
         tlx.tlx_passes.add_tlx_resolve_placeholder_layouts(pm)
-        passes.ttir.add_rewrite_tensor_pointer(pm)
         if capability // 10 < 9:
             passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
         passes.common.add_canonicalizer(pm)
@@ -300,23 +299,20 @@ class CUDABackend(BaseBackend):
         if opt.maxnreg is not None:
             mod.set_attr("ttg.maxnreg", ir.builder(mod.context).get_int32_attr(opt.maxnreg))
 
-        cluster_info = nvidia.ClusterInfo()
+        cluster_dims = tuple(opt.cluster_dims or (1, 1, 1))
         if opt.cluster_dims is not None:
-            cluster_info.clusterDimX = opt.cluster_dims[0]
-            cluster_info.clusterDimY = opt.cluster_dims[1]
-            cluster_info.clusterDimZ = opt.cluster_dims[2]
-            # Set cluster_info attributes on the module
+            # Set cluster dimension attributes on the module.
             mod.set_attr(
                 "ttg.cluster-dim-x",
-                ir.builder(mod.context).get_int32_attr(cluster_info.clusterDimX),
+                ir.builder(mod.context).get_int32_attr(cluster_dims[0]),
             )
             mod.set_attr(
                 "ttg.cluster-dim-y",
-                ir.builder(mod.context).get_int32_attr(cluster_info.clusterDimY),
+                ir.builder(mod.context).get_int32_attr(cluster_dims[1]),
             )
             mod.set_attr(
                 "ttg.cluster-dim-z",
-                ir.builder(mod.context).get_int32_attr(cluster_info.clusterDimZ),
+                ir.builder(mod.context).get_int32_attr(cluster_dims[2]),
             )
         pm = ir.pass_manager(mod.context)
         dump_enabled = pm.enable_debug()
@@ -393,7 +389,7 @@ class CUDABackend(BaseBackend):
 
         pm.run(mod, 'make_ttgir')
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
-        metadata["cluster_dims"] = (cluster_info.clusterDimX, cluster_info.clusterDimY, cluster_info.clusterDimZ)
+        metadata["cluster_dims"] = cluster_dims
         # Track whether ctas_per_cga was explicitly set to distinguish between
         # Triton's way (num_ctas > 1) and TLX/CUDA way (ctas_per_cga set).
         metadata["ctas_per_cga"] = opt.ctas_per_cga
