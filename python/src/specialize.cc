@@ -709,6 +709,8 @@ struct FCEntry {
   PyObject **constexpr_vals;
   int *constexpr_positions;
   int n_constexpr;
+  int *dispatch_arg_indices; // Indices into call_args for dispatcher (or NULL)
+  int n_dispatch_args;       // Length of dispatch_arg_indices (0 = legacy path)
   bool occupied;
 };
 
@@ -735,6 +737,7 @@ struct FastCache {
             free(table[i].constexpr_vals);
           }
           free(table[i].constexpr_positions);
+          free(table[i].dispatch_arg_indices);
         }
       }
       free(table);
@@ -900,8 +903,15 @@ struct FastCache {
     table[idx].constexpr_vals = vals;
     table[idx].constexpr_positions = positions;
     table[idx].n_constexpr = n_ce;
+    table[idx].dispatch_arg_indices = nullptr;
+    table[idx].n_dispatch_args = 0;
     table[idx].occupied = true;
     count++;
+  }
+
+  void set_dispatch_indices(size_t idx, int *indices, int n) {
+    table[idx].dispatch_arg_indices = indices;
+    table[idx].n_dispatch_args = n;
   }
 };
 
@@ -1353,11 +1363,15 @@ PyObject *native_fast_dispatch(PyObject *self, PyObject *const *args,
     if (!PyTuple_Check(grid_tuple))
       Py_RETURN_NONE; // Non-tuple grid (e.g. kernel[1]) — let Python handle it
     Py_ssize_t grid_n = PyTuple_GET_SIZE(grid_tuple);
-    // Count kernel args (skip constexprs)
+    // Determine kernel args count and build vectorcall args
     int n_kernel_args = 0;
-    for (Py_ssize_t i = 0; i < n && i < cache->n_params; i++) {
-      if (!cache->param_meta[i].is_constexpr)
-        n_kernel_args++;
+    if (entry->n_dispatch_args > 0) {
+      n_kernel_args = entry->n_dispatch_args;
+    } else {
+      for (Py_ssize_t i = 0; i < n && i < cache->n_params; i++) {
+        if (!cache->param_meta[i].is_constexpr)
+          n_kernel_args++;
+      }
     }
     Py_ssize_t vc_nargs = 3 + 1 + n_kernel_args;
     PyObject **vc_args = (PyObject **)alloca(vc_nargs * sizeof(PyObject *));
@@ -1366,10 +1380,24 @@ PyObject *native_fast_dispatch(PyObject *self, PyObject *const *args,
     vc_args[1] = grid_n > 1 ? PyTuple_GET_ITEM(grid_tuple, 1) : one;
     vc_args[2] = grid_n > 2 ? PyTuple_GET_ITEM(grid_tuple, 2) : one;
     vc_args[3] = stream_obj;
-    int ki = 0;
-    for (Py_ssize_t i = 0; i < n && i < cache->n_params; i++) {
-      if (!cache->param_meta[i].is_constexpr)
-        vc_args[4 + ki++] = ca[i];
+    if (entry->n_dispatch_args > 0) {
+      // Use stored dispatch_arg_indices to select only the args the dispatcher
+      // expects
+      for (int j = 0; j < entry->n_dispatch_args; j++)
+        vc_args[4 + j] = ca[entry->dispatch_arg_indices[j]];
+    } else {
+      // Legacy path: pass all non-constexpr args
+      int ki = 0;
+      for (Py_ssize_t i = 0; i < n && i < cache->n_params; i++) {
+        if (!cache->param_meta[i].is_constexpr)
+          vc_args[4 + ki++] = ca[i];
+      }
+    }
+    // Guard: clear stale exceptions before calling the dispatcher to prevent
+    // SystemError ("returned a result with an exception set") in td_get_ptr.
+    if (PyErr_Occurred()) {
+      PyErr_Clear();
+      return nullptr;
     }
     PyObject *result =
         PyObject_Vectorcall(dispatcher, vc_args, vc_nargs, nullptr);
@@ -1389,12 +1417,12 @@ PyObject *native_fast_dispatch(PyObject *self, PyObject *const *args,
 }
 
 // native_fast_dispatch_insert(jit_fn, args_tuple, params_list, options_hash,
-// kernel, dispatcher)
+// kernel, dispatcher, dispatch_indices)
 PyObject *native_fast_dispatch_insert(PyObject *self, PyObject *const *args,
                                       Py_ssize_t nargs) {
-  if (nargs != 6) {
+  if (nargs != 7) {
     PyErr_SetString(PyExc_TypeError,
-                    "native_fast_dispatch_insert expects 6 arguments");
+                    "native_fast_dispatch_insert expects 7 arguments");
     return nullptr;
   }
 
@@ -1404,6 +1432,7 @@ PyObject *native_fast_dispatch_insert(PyObject *self, PyObject *const *args,
   PyObject *options_hash_obj = args[3];
   PyObject *kernel = args[4];
   PyObject *dispatcher = args[5];
+  PyObject *dispatch_indices = args[6];
 
   if (!PyTuple_Check(call_args_tuple))
     Py_RETURN_NONE;
@@ -1431,6 +1460,40 @@ PyObject *native_fast_dispatch_insert(PyObject *self, PyObject *const *args,
 
   PyObject *disp = (dispatcher == Py_None) ? nullptr : dispatcher;
   cache->insert(key, kernel, disp, ca, (int)n);
+
+  // Store dispatch_arg_indices if provided
+  if (dispatch_indices != Py_None && PyTuple_Check(dispatch_indices)) {
+    Py_ssize_t n_indices = PyTuple_GET_SIZE(dispatch_indices);
+    if (n_indices > 0) {
+      int *indices = (int *)malloc(n_indices * sizeof(int));
+      if (indices) {
+        for (Py_ssize_t i = 0; i < n_indices; i++) {
+          indices[i] =
+              (int)PyLong_AsLong(PyTuple_GET_ITEM(dispatch_indices, i));
+        }
+        if (!PyErr_Occurred() && cache->table) {
+          // Find the just-inserted entry
+          FCCacheKeyHash hasher;
+          size_t idx = hasher(key) % cache->capacity;
+          bool found = false;
+          while (cache->table[idx].occupied) {
+            if (cache->table[idx].key == key) {
+              cache->set_dispatch_indices(idx, indices, (int)n_indices);
+              found = true;
+              break;
+            }
+            idx = (idx + 1) % cache->capacity;
+          }
+          if (!found)
+            free(indices);
+        } else {
+          PyErr_Clear();
+          free(indices);
+        }
+      }
+    }
+  }
+
   Py_RETURN_NONE;
 }
 
@@ -1536,9 +1599,13 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
     // Build dispatcher vectorcall args: grid0, grid1, grid2, stream,
     // *kernel_args
     int n_kernel_args = 0;
-    for (int i = 0; i < effective_nargs && i < cache->n_params; i++) {
-      if (!cache->param_meta[i].is_constexpr)
-        n_kernel_args++;
+    if (entry->n_dispatch_args > 0) {
+      n_kernel_args = entry->n_dispatch_args;
+    } else {
+      for (int i = 0; i < effective_nargs && i < cache->n_params; i++) {
+        if (!cache->param_meta[i].is_constexpr)
+          n_kernel_args++;
+      }
     }
     Py_ssize_t vc_nargs = 3 + 1 + n_kernel_args;
     PyObject **vc_args = (PyObject **)alloca(vc_nargs * sizeof(PyObject *));
@@ -1546,10 +1613,24 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
     vc_args[1] = self->grid_py[1];
     vc_args[2] = self->grid_py[2];
     vc_args[3] = stream_obj;
-    int ki = 0;
-    for (int i = 0; i < effective_nargs && i < cache->n_params; i++) {
-      if (!cache->param_meta[i].is_constexpr)
-        vc_args[4 + ki++] = effective_args[i];
+    if (entry->n_dispatch_args > 0) {
+      for (int j = 0; j < entry->n_dispatch_args; j++)
+        vc_args[4 + j] = effective_args[entry->dispatch_arg_indices[j]];
+    } else {
+      int ki = 0;
+      for (int i = 0; i < effective_nargs && i < cache->n_params; i++) {
+        if (!cache->param_meta[i].is_constexpr)
+          vc_args[4 + ki++] = effective_args[i];
+      }
+    }
+    // Guard: if any prior C-API call leaked a stale exception (e.g., from
+    // fc_build_key probing arg types), clear it before calling the dispatcher.
+    // Without this, td_get_ptr→data_ptr() may trigger CPython's SystemError:
+    // "returned a result with an exception set".
+    if (PyErr_Occurred()) {
+      PyErr_Clear();
+      Py_DECREF(stream_obj);
+      goto fallback;
     }
     PyObject *result =
         PyObject_Vectorcall(dispatcher, vc_args, vc_nargs, nullptr);
