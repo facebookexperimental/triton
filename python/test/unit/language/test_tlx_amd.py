@@ -59,6 +59,16 @@ def is_gfx1250_available():
         return False
 
 
+def skip_if_insufficient_shared_memory(required_bytes):
+    try:
+        device = triton.runtime.driver.active.get_current_device()
+        max_shared = triton.runtime.driver.active.utils.get_device_properties(device)["max_shared_mem"]
+    except Exception:
+        return
+    if required_bytes >= max_shared:
+        pytest.skip(f"Requires more shared memory than this device exposes ({max_shared} bytes)")
+
+
 # ---------------------------------------------------------------------------
 # Test: async_load compiles on gfx950 and produces the expected ops.
 # ---------------------------------------------------------------------------
@@ -316,6 +326,7 @@ def local_gather_kernel(
 @pytest.mark.parametrize("N,M", [(32, 32), (64, 64), (128, 128)])
 def test_local_gather(N, M):
     """Test gathering from 1D reshaped shared memory (diagonal of 2D matrix)."""
+    skip_if_insufficient_shared_memory(N * M * torch.float32.itemsize)
     device = torch.device("cuda")
 
     # Create a test matrix with known values
@@ -380,6 +391,7 @@ def local_scatter_kernel(
 @pytest.mark.parametrize("N,M", [(32, 32), (64, 64), (128, 128)])
 def test_local_scatter(N, M):
     """Test scattering to 1D reshaped shared memory (diagonal of 2D matrix)."""
+    skip_if_insufficient_shared_memory(N * M * torch.float32.itemsize)
     device = torch.device("cuda")
 
     # Create scatter indices for diagonal elements: 0, M+1, 2*(M+1), ...

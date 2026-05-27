@@ -12,6 +12,10 @@ def is_hip():
     return triton.runtime.driver.active.get_current_target().backend == "hip"
 
 
+def is_gfx950():
+    return triton.runtime.driver.active.get_current_target().arch == "gfx950"
+
+
 # --- Runtime test: simple GEMM with warp pipeline ---
 
 
@@ -229,6 +233,9 @@ def _smem_warp_pipeline_kernel(
 @pytest.mark.skipif(not is_hip(), reason="warp pipeline is AMD-only")
 def test_warp_pipeline_lowering():
     """Verify that shared-memory GEMM with warp pipeline produces barriers in assembly."""
+    if not is_gfx950():
+        pytest.skip("shared-memory warp-pipeline lowering is currently tested on gfx950")
+
     torch.manual_seed(0)
     M = N = K = 192
     a = torch.randn((M, K), dtype=torch.float16, device="cuda")
