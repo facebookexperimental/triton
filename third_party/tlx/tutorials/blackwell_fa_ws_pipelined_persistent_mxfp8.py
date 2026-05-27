@@ -1406,7 +1406,6 @@ def _softmax_recompute_quantization_iter(
 
         dsT = _mul_f32x2(pT_slices[subtile_id], _sub_f32x2(dpT, Di[None, :]))
         # NaN sanitization (boundary tiles)
-        dsT = tl.where(dsT == dsT, dsT, 0.0)
         # Quantize dS twice: dK consumes dS^T, while dQ consumes dS
         # with the opposite reduction axis and therefore needs a
         # separate blockscaled encoding.
