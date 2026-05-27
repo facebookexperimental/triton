@@ -242,6 +242,11 @@ private:
         static_cast<unsigned>(NVVM::NVVMMemorySpace::Shared));
   }
 
+  // This function enforces that all mbar init and
+  // TCGen5GlobalAllocOp/TMEMAllocOp are in the entry block of kernel function.
+  // Then it pushes all mbar init ops to the earliest to ensure mbar init ->
+  // tmem alloc sequence such that we can safely insert a cluster sync in the
+  // middle
   LogicalResult ensureEarlyBarInit(ModuleOp &mod,
                                    SetVector<Operation *> &barInitOps) {
     triton::FuncOp funcOp = nullptr;
@@ -260,6 +265,13 @@ private:
         return failure();
       }
     }
+
+    // ensure all tmem alloc ops are in the entry block too
+
+    // Move all mbar init ops (and their deps) to the beginning of the block
+
+    // Check the block again to make sure all mbar init ops are earlier than
+    // TCGen5GlobalAllocOp
 
     return success();
   }
@@ -391,11 +403,8 @@ private:
            "Failed to find bar init op in a clustered kernel");
 
     // Enforcing front end for 2cta kernels:
-    // All remote barrier init ops need to happen at the first block of
-    // function. This is to make 2cta cluster sync insertion easier for WarpSpec
-    // case. If in the future there's a need to really alloc/init barriers after
-    // a WS op, we can seek to relax this limitation and fix cluster sync
-    // insertions.
+    // All mbarrier init and tmem alloc ops need to happen at the first block of
+    // function. This is to make 2cta cluster sync insertion easier
     if (failed(ensureEarlyBarInit(mod, remoteOrLocalBarInitOps))) {
       return failure();
     }
