@@ -46,7 +46,7 @@ def matmul_get_configs():
                 "NUM_MMA_WARPS": 8,
                 "NUM_MMA_GROUPS": 2,
                 "EPILOGUE_SUBTILE": True, "USE_NAMED_BARRIER": named_barrier},
-                      num_stages=0, num_warps=4, pre_hook=matmul_tma_set_block_size_hook) \
+                      num_stages=1, num_warps=4, pre_hook=matmul_tma_set_block_size_hook) \
         for BM in [128] \
         for BN in [128] \
         for BK in [64] \
