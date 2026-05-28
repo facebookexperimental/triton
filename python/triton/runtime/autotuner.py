@@ -448,6 +448,11 @@ class Config:
     :type preferred_ctas_per_cga: tuple[int, int, int]
     """
 
+    @staticmethod
+    def _check_reg_auto_ws_alignment(name, value):
+        if value is not None and value % 8 != 0:
+            raise ValueError(f"{name} must be divisible by 8, got {value}")
+
     def __init__(
         self,
         kwargs,
@@ -476,6 +481,8 @@ class Config:
         self.maxnreg = maxnreg
         self.pre_hook = pre_hook
         self.ir_override = ir_override
+        self._check_reg_auto_ws_alignment("minRegAutoWS", minRegAutoWS)
+        self._check_reg_auto_ws_alignment("maxRegAutoWS", maxRegAutoWS)
         self.minRegAutoWS = minRegAutoWS
         self.maxRegAutoWS = maxRegAutoWS
         self.pingpongAutoWS = pingpongAutoWS
