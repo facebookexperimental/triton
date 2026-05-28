@@ -426,6 +426,34 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// Simple case with grouped TDM. Each grouped op lowers to one hardware TDM
+// intrinsic even though it carries two descriptor/memdesc arms.
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: grouped_tdm_waitcnt
+  tt.func public @grouped_tdm_waitcnt(
+    %memDescA: !ttg.memdesc<128x16xf16, #shared, #smem, mutable>,
+    %memDescB: !ttg.memdesc<128x16xf16, #shared, #smem, mutable>,
+    %tensorDescA: !tt.tensordesc<128x16xf16>,
+    %tensorDescB: !tt.tensordesc<128x16xf16>,
+    %mask: i32
+  ) {
+    %c0_i32 = arith.constant 0 : i32
+    %1 = "amdg.async_tdm_group_copy_global_to_local"(%tensorDescA, %tensorDescB, %c0_i32, %c0_i32, %c0_i32, %c0_i32, %memDescA, %memDescB, %mask, %mask) <{cache = 1 : i32, operandSegmentSizes = array<i32: 2, 4, 2, 2>, rank = 2 : i32, warp_masks = array<i32: 3, 12>}> : (!tt.tensordesc<128x16xf16>, !tt.tensordesc<128x16xf16>, i32, i32, i32, i32, !ttg.memdesc<128x16xf16, #shared, #smem, mutable>, !ttg.memdesc<128x16xf16, #shared, #smem, mutable>, i32, i32) -> !ttg.async.token
+    %2 = "amdg.async_tdm_group_copy_global_to_local"(%tensorDescA, %tensorDescB, %c0_i32, %c0_i32, %c0_i32, %c0_i32, %memDescA, %memDescB, %mask, %mask) <{cache = 1 : i32, operandSegmentSizes = array<i32: 2, 4, 2, 2>, rank = 2 : i32, warp_masks = array<i32: 3, 12>}> : (!tt.tensordesc<128x16xf16>, !tt.tensordesc<128x16xf16>, i32, i32, i32, i32, !ttg.memdesc<128x16xf16, #shared, #smem, mutable>, !ttg.memdesc<128x16xf16, #shared, #smem, mutable>, i32, i32) -> !ttg.async.token
+
+    // CHECK: amdg.async_tdm_intrinsic_wait {{.*}} {count = 1
+    %w1 = amdg.async_tdm_wait %1 {num = 0 : i32}
+    // CHECK: amdg.async_tdm_intrinsic_wait {{.*}} {count = 0
+    %w2 = amdg.async_tdm_wait %2 {num = 0 : i32}
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 8, perPhase = 8, maxPhase = 2, order = [1, 0]}>
 #smem = #ttg.shared_memory
