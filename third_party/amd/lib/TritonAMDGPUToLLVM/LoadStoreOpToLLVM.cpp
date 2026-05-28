@@ -1300,12 +1300,50 @@ struct AsyncTDMGroupCopyGlobalToLocalOpConversion
     int rank = op.getRank();
     auto ctaId = targetInfo.getClusterCTAId(rewriter, loc);
 
-    SmallVector<Value> selectedGroups;
+    // Lower an N-way grouped TDM load to one hardware TDM instruction.  Each
+    // arm first builds the same descriptor groups a standalone TDM load would
+    // use, including its destination LDS pointer and warp-mask predicate.  The
+    // selected descriptor is then assembled one scalar lane at a time based on
+    // the current warp id.  Doing the mux at descriptor-lane granularity keeps
+    // common fields (for example tensor shape/stride slots) shared in SSA form,
+    // so canonicalization and LLVM do not have to scalarize whole-vector
+    // selects for fields that are identical across arms.
     auto v4i32Ty = VectorType::get(4, rewriter.getI32Type());
     auto v8i32Ty = VectorType::get(8, rewriter.getI32Type());
+    SmallVector<SmallVector<Value>> selectedGroupElems;
+    Value mergedPred = b.i32_val(0);
 
     Value warpId = getLaneAndWarpId(rewriter, loc).second;
     Value one = b.i32_val(1);
+
+    auto getGroupSize = [](int groupIdx) { return groupIdx == 1 ? 8 : 4; };
+    auto extractGroupElems = [&](ArrayRef<Value> groups) {
+      SmallVector<SmallVector<Value>> elems;
+      elems.reserve(4);
+      for (int groupIdx = 0; groupIdx < 4; ++groupIdx) {
+        SmallVector<Value> groupElems;
+        int groupSize = getGroupSize(groupIdx);
+        groupElems.reserve(groupSize);
+        for (int elemIdx = 0; elemIdx < groupSize; ++elemIdx) {
+          groupElems.push_back(
+              b.extract_element(i32_ty, groups[groupIdx], b.i32_val(elemIdx)));
+        }
+        elems.push_back(std::move(groupElems));
+      }
+      return elems;
+    };
+    auto packGroupElems = [&](ArrayRef<SmallVector<Value>> elems) {
+      SmallVector<Value> groups;
+      groups.reserve(4);
+      for (int groupIdx = 0; groupIdx < 4; ++groupIdx) {
+        Type vecTy = groupIdx == 1 ? Type(v8i32Ty) : Type(v4i32Ty);
+        Value group = b.undef(vecTy);
+        for (auto [elemIdx, elem] : llvm::enumerate(elems[groupIdx]))
+          group = b.insert_element(vecTy, group, elem, b.i32_val(elemIdx));
+        groups.push_back(group);
+      }
+      return groups;
+    };
 
     for (auto armIdx : llvm::seq<size_t>(0, op.getDescs().size())) {
       auto tensorDescTy =
@@ -1363,17 +1401,38 @@ struct AsyncTDMGroupCopyGlobalToLocalOpConversion
       while (desc.size() < 4)
         desc.push_back(LLVM::ZeroOp::create(rewriter, loc, v4i32Ty));
 
-      if (selectedGroups.empty()) {
-        selectedGroups.assign(desc.begin(), desc.begin() + 4);
+      auto descElems = extractGroupElems(desc);
+      // For regular TDM loads group0[0] is the predicate.  Grouped arms use
+      // disjoint warp masks, so at most one arm predicate can be live for a
+      // wave.  ORing all arm predicates is equivalent to selecting by arm, and
+      // avoids one descriptor-lane select per grouped instruction.  The
+      // remaining descriptor lanes carry addresses/layout fields and still need
+      // per-wave selection.
+      mergedPred = b.or_(mergedPred, descElems[0][0]);
+      if (selectedGroupElems.empty()) {
+        selectedGroupElems = std::move(descElems);
+        selectedGroupElems[0][0] = mergedPred;
         continue;
       }
 
       Value active = b.icmp_ne(b.and_(b.shl(one, warpId), b.i32_val(warpMask)),
                                b.i32_val(0));
-      for (int i = 0; i < 4; ++i)
-        selectedGroups[i] = b.select(active, desc[i], selectedGroups[i]);
+      for (int groupIdx = 0; groupIdx < 4; ++groupIdx) {
+        for (int elemIdx = 0; elemIdx < getGroupSize(groupIdx); ++elemIdx) {
+          if (groupIdx == 0 && elemIdx == 0) {
+            selectedGroupElems[groupIdx][elemIdx] = mergedPred;
+            continue;
+          }
+          Value armElem = descElems[groupIdx][elemIdx];
+          Value &selectedElem = selectedGroupElems[groupIdx][elemIdx];
+          if (armElem == selectedElem)
+            continue;
+          selectedElem = b.select(active, armElem, selectedElem);
+        }
+      }
     }
 
+    SmallVector<Value> selectedGroups = packGroupElems(selectedGroupElems);
     selectedGroups.push_back(
         LLVM::ZeroOp::create(rewriter, loc, v8i32Ty)); // group4
     auto auxBits = mlir::LLVM::AMD::getCtrlBitsForCacheModifierOnTarget(
