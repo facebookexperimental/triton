@@ -136,6 +136,11 @@ def _max_shared_mem_for_capability(capability: int) -> int:
     return _SMEM_SIZES.get(capability, _SMEM_SIZES.get(capability // 10 * 10, 49152))
 
 
+def _check_reg_auto_ws_alignment(name: str, value: Optional[int]) -> None:
+    if value is not None and value % 8 != 0:
+        raise ValueError(f"{name} must be divisible by 8, got {value}")
+
+
 @dataclass(frozen=True)
 class CUDAOptions:
     num_warps: int = 4
@@ -182,6 +187,8 @@ class CUDAOptions:
         object.__setattr__(self, 'extern_libs', tuple(extern_libs.items()))
         assert self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0, \
             "num_warps must be a power of 2"
+        _check_reg_auto_ws_alignment("minRegAutoWS", self.minRegAutoWS)
+        _check_reg_auto_ws_alignment("maxRegAutoWS", self.maxRegAutoWS)
 
         # If ctas_per_cga is set, it overrides cluster_dims with CUDA semantics:
         # ctas_per_cga defines the cluster shape for regrouping grid CTAs.
@@ -711,7 +718,8 @@ class CUDABackend(BaseBackend):
         nvidia.passes.hopper.add_multi_cta_reduction(pm)
         # TODO: Find the optimal place in the pipeline for this pass.
         nvidia.passes.ttnvgpuir.add_prune_unused_barriers(pm)
-        nvidia.passes.ttnvgpuir.add_interleave_tmem(pm)
+        if knobs.nvidia.enable_interleave_tmem:
+            nvidia.passes.ttnvgpuir.add_interleave_tmem(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
         passes.ttgpuir.add_reorder_instructions(pm)
         passes.ttir.add_loop_aware_cse(pm)
