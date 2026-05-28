@@ -3,6 +3,7 @@
 #include "TritonNVIDIAGPUToLLVM/PTXAsmFormat.h"
 #include "Utility.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -86,11 +87,26 @@ LLVM::LLVMFuncOp getAssertfailDeclaration(RewriterBase &rewriter) {
 
 namespace mlir::triton::NVIDIA {
 
+// Check if the ReduceOp's input is produced by math.absf (or its LLVM
+// lowered form llvm.intr.fabs), indicating we can use the abs modifier
+// on redux.sync (SM100+: redux.sync.max.abs.f32).
+static bool inputIsAbsF(triton::ReduceOp op) {
+  if (op.getNumOperands() != 1)
+    return false;
+  Value input = op.getOperand(0);
+  Operation *defOp = input.getDefiningOp();
+  if (!defOp)
+    return false;
+  return isa<math::AbsFOp>(defOp);
+}
+
 // Check if the reduction can use a redux op and return the kind.
 static std::optional<NVVM::ReduxKind> matchReduxKind(triton::ReduceOp op,
                                                      int computeCapability,
-                                                     bool &useNanQualifier) {
+                                                     bool &useNanQualifier,
+                                                     bool &useAbsModifier) {
   useNanQualifier = false;
+  useAbsModifier = false;
   if (computeCapability < 80)
     return std::nullopt;
   Operation *reduceOp = op.getSingleCombiner();
@@ -99,8 +115,10 @@ static std::optional<NVVM::ReduxKind> matchReduxKind(triton::ReduceOp op,
   if (computeCapability == 100 && reduceOp->getResultTypes()[0].isF32()) {
     if (isa<arith::MinimumFOp, arith::MaximumFOp>(reduceOp))
       useNanQualifier = true;
-    if (isa<arith::MaxNumFOp, arith::MaximumFOp>(reduceOp))
+    if (isa<arith::MaxNumFOp, arith::MaximumFOp>(reduceOp)) {
+      useAbsModifier = inputIsAbsF(op);
       return NVVM::ReduxKind::FMAX;
+    }
     if (isa<arith::MinNumFOp, arith::MinimumFOp>(reduceOp))
       return NVVM::ReduxKind::FMIN;
   }
@@ -514,7 +532,9 @@ bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
                             unsigned interleave) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   bool useNanQualifier = false;
-  if (auto kind = matchReduxKind(op, computeCapability, useNanQualifier)) {
+  bool useAbsModifier = false;
+  if (auto kind = matchReduxKind(op, computeCapability, useNanQualifier,
+                                 useAbsModifier)) {
     // Based on benchmarking on A100 redux op gives a speed up only when doing
     // a single reduction (not partitioned) and when the mask is static.
     // Therefore we currently only enable it to reduce across all the lanes.
@@ -542,7 +562,7 @@ bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
           }
         }
         acc[i] = NVVM::ReduxOp::create(rewriter, loc, acc[i].getType(), acc[0],
-                                       *kind, mask, /*abs=*/false,
+                                       *kind, mask, /*abs=*/useAbsModifier,
                                        /*nan=*/useNanQualifier);
         if (acc[i].getType().isInteger()) {
           if (bitwidth < 32)

@@ -2498,6 +2498,22 @@ def test_reduce1d(op, dtype_str, shape, num_ctas, device):
             np.testing.assert_equal(z_ref, z_tri)
 
 
+@pytest.mark.parametrize("shape", [32, 128, 1024])
+def test_reduce_max_abs(shape, device):
+    """Test tl.max(tl.abs(x)) — should use redux.sync.max.abs.f32 on SM100."""
+
+    @triton.jit
+    def kernel(X, Z, BLOCK: tl.constexpr):
+        x = tl.load(X + tl.arange(0, BLOCK))
+        z = tl.max(tl.abs(x))
+        tl.store(Z, z)
+
+    x = torch.randn(shape, device=device, dtype=torch.float32)
+    z = torch.empty(1, device=device, dtype=torch.float32)
+    kernel[(1, )](x, z, BLOCK=shape)
+    np.testing.assert_allclose(z.cpu().numpy(), np.max(np.abs(x.cpu().numpy())), rtol=1e-5)
+
+
 # TODO: [Qingyi] Fix argmin / argmax
 reduce_configs1 = [(op, dtype, (1, 1024), axis, False)
                    for dtype in dtypes_with_bfloat16

@@ -838,6 +838,30 @@ module attributes {"ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num
 
 // -----
 
+// max(abs(x)) should fuse abs into redux.sync via the abs modifier.
+// CHECK-LABEL: max_abs_reduction
+//       CHECK:  %[[M:.+]] = llvm.mlir.constant(-1 : i32) : i32
+//       CHECK:   nvvm.redux.sync  fmax %{{.*}}, %[[M]] {abs = true, nan = true} : f32 -> f32
+//       CHECK:   nvvm.barrier0
+//       CHECK:   nvvm.shfl.sync bfly
+//       CHECK:   nvvm.shfl.sync bfly
+//       CHECK:   nvvm.barrier0
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @max_abs_reduction(%arg0: tensor<1x1024xf32, #blocked>) {
+    %abs = math.absf %arg0 : tensor<1x1024xf32, #blocked>
+    %11 = "tt.reduce"(%abs) <{axis = 1 : i32}> ({
+    ^bb0(%arg2: f32, %arg3: f32):
+      %15 = arith.maximumf %arg2, %arg3 : f32
+      tt.reduce.return %15 : f32
+    }) {allocation.offset = 0 : i32} : (tensor<1x1024xf32, #blocked>) -> tensor<1xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    tt.return
+  }
+}
+
+// -----
+
 // CHECK-LABEL: maxnum_reduction
 //       CHECK:  %[[M:.+]] = llvm.mlir.constant(-1 : i32) : i32
 //       CHECK:   nvvm.redux.sync  fmax %{{.*}}, %[[M]] : f32 -> f32
