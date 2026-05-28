@@ -69,9 +69,11 @@ jobs:
           nvidia-smi
       - name: Compile Triton
         run: |
+          set -x
           . "${SETUP_SCRIPT}"
           . /workspace/tritonbench/.ci/triton/triton_install_utils.sh
           install_triton $PWD
+          python -c "import triton.language.extra.tlx as tlx"
       - name: Install torchao from source
         run: |
           . "${SETUP_SCRIPT}"
@@ -80,6 +82,7 @@ jobs:
       - name: Run TLX unit tests
         timeout-minutes: 5
         run: |
+          set -x
           . "${SETUP_SCRIPT}"
           pytest python/test/unit/language/test_tlx_*.py -v
       - name: Run TLX tutorial correctness tests
