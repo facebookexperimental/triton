@@ -36,18 +36,11 @@ when AutoWS assigns registers to non-tensor and tensor partitions. If either
 knob is provided from the Python frontend, its value must be divisible by 8 so
 the emitted register allocation matches the backend warp-group granularity.
 
-Before `PartitionSchedulingMeta`, the Meta WS backend runs
-`nvgpu-sink-broadcast` to move `tt.broadcast` producer chains next to their
-elementwise users. This keeps broadcasts and their value materialization, such
-as a descriptor load followed by an extend, associated with their use after
-other operands, such as TMEM loads, have been prepared.
-
 ## File Map
 
 | File | Function / Pass | Description |
 |------|----------------|-------------|
 | `WarpSpecialization.cpp` | `NVGPUWarpSpecialization` | Top-level pipeline orchestration |
-| `SinkBroadcast.cpp` | `nvgpu-sink-broadcast` | Pre-partition peephole that sinks `tt.broadcast` producer chains to elementwise users |
 | `PartitionSchedulingMeta.cpp` | `nvgpu-partition-scheduling-meta` | Partition scheduling for Blackwell (assigns `ttg.partition` attributes) |
 | `WSTaskPartition.cpp` | `doTaskPartition` | Assigns `async_task_id` to anchor ops (loads, dots, stores) — Hopper only |
 | `TaskIdPropagation.cpp` | — | `TaskIdBackwardPropagation` sparse dataflow analysis |

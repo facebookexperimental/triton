@@ -209,19 +209,6 @@ def NVGPUWSTMAStoreLowering : Pass<"nvgpu-ws-tma-store-lowering", "mlir::ModuleO
                            "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
 
-def NVGPUSinkBroadcast : Pass<"nvgpu-sink-broadcast", "mlir::ModuleOp"> {
-  let summary = "Sink broadcast ops to their elementwise users";
-
-  let description = [{
-    This pass moves or clones `tt.broadcast` ops so they are adjacent to their
-    memory-effect-free elementwise users. Running this before Meta warp
-    specialization partition scheduling keeps late broadcasts associated with
-    their use after other operands, such as TMEM loads, have been prepared.
-  }];
-
-  let dependentDialects = ["mlir::triton::TritonDialect"];
-}
-
 def NVGPUTestAnnotateTMAStoreWaits : Pass<"nvgpu-test-annotate-tma-store-waits", "mlir::ModuleOp"> {
   let summary = "Annotate TMA store waits with can_rotate_by_buffer_count";
 
