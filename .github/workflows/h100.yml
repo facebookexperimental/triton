@@ -91,6 +91,7 @@ jobs:
         timeout-minutes: 5
         run: |
           . "${SETUP_SCRIPT}"
+          . ${UV_VENV_DIRS}/${CONDA_ENV}/activate
           pytest third_party/tlx/tutorials/testing/test_correctness.py -v
 
 concurrency:
