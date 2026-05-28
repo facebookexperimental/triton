@@ -743,7 +743,7 @@ Examples: how mbarriers are communicated in warp specialization
 |-----------|-------------|
 | `"default"` | First positional argument to mark this as the default/trunk task |
 | `num_warps` | Number of warps to reserve for this task |
-| `num_regs` | Number of registers per thread (optional, for register allocation tuning) |
+| `num_regs` | Number of registers per thread (optional, for register allocation tuning). When provided, it must be divisible by 8. |
 | `replicate` | Number of replicas for this task (default: 1). Creates multiple copies of the task region |
 | `warp_group_start_id` | Starting warp ID for this task (optional). Allows explicit control over warp assignment |
 
