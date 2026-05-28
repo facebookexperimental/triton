@@ -48,13 +48,15 @@ from triton.language.extra.tlx.tutorials.hopper_fa_ws_pipelined import (
     attention as _hopper_fa_ws_pipelined, )
 from triton.language.extra.tlx.tutorials.hopper_fa_ws import (
     attention as _hopper_fa_ws, )
+from triton.language.extra.tlx.tutorials.amd_fa_pipelined import (
+    attention as _amd_fa_pipelined, )
 
 from triton.language.extra.tlx.tutorials.testing.multi_cta_layer_norm import (
     multi_cta_layernorm as _multi_cta_layernorm,
     multi_cta_layernorm_2d as _multi_cta_layernorm_2d,
 )
 
-from triton._internal_testing import is_blackwell, is_hopper, is_hopper_or_newer
+from triton._internal_testing import is_blackwell, is_hopper, is_hopper_or_newer, is_hip
 from triton.language.extra.tlx.tutorials.testing.gemm_shapes import BLACKWELL_GEMM_WS as _BLACKWELL_GEMM_WS_MORE_SHAPES
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -276,6 +278,17 @@ class FlashAttention:
             "NUM_BUFFERS_KV": 2,
             "NUM_MMA_WARPS": 8,
             "NUM_MMA_GROUPS": 2,
+        },
+        "amd_fa_pipelined": {
+            "BLOCK_M": 256,
+            "BLOCK_N": 64,
+            "num_warps": 4,
+        },
+        "amd_fa_pipelined_prefetch": {
+            "BLOCK_M": 256,
+            "BLOCK_N": 64,
+            "num_warps": 8,
+            "PREFETCH": True,
         },
     }
 
@@ -858,6 +871,24 @@ def test_hopper_fa_ws_pipelined_pingpong_persistent():
         ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
         tri_out = _hopper_fa_ws_pipelined_pingpong_persistent(q, k, v, sm_scale, config=config)
         torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
+
+
+# =============================================================================
+# AMD Flash Attention Tests
+# =============================================================================
+
+
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("config_name", ["amd_fa_pipelined", "amd_fa_pipelined_prefetch"])
+@pytest.mark.skipif(not is_hip(), reason="Requires AMD GPU")
+def test_amd_fa_pipelined(config_name, causal):
+    config = FlashAttention.CONFIGS[config_name]
+    sm_scale = 0.5
+    for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
+        q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
+        ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
+        tri_out = _amd_fa_pipelined(q, k, v, sm_scale, causal, config=config)
+        torch.testing.assert_close(tri_out, ref_out, atol=2e-2, rtol=0)
 
 
 # =============================================================================
