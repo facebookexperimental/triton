@@ -30,6 +30,7 @@ jobs:
         with:
           repository: meta-pytorch/tritonbench
           path: tritonbench
+          ref: xz9/disable-more-amd
           submodules: recursive
       - name: Setup Tritonbench environment
         working-directory: tritonbench
