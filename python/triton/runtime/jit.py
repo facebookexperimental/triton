@@ -406,8 +406,10 @@ class KernelInterface(Generic[T]):
             proxy = cache.get(grid_key)
             if proxy is None:
                 grid_tuple = grid_key
+                extra_kwargs = getattr(self, '_fc_meta_kwargs', None)
                 proxy = native_create_jit_proxy(self, grid_tuple, self.params, self._fc_options_hash,
-                                                driver.active.get_current_stream, driver.active.get_current_device)
+                                                driver.active.get_current_stream, driver.active.get_current_device,
+                                                extra_kwargs)
                 if proxy is not None:
                     cache[grid_key] = proxy
             if proxy is not None:

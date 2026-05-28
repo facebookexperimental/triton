@@ -194,6 +194,8 @@ def make_triton_dispatcher(schema, cu_function: int):
         if not tma_meta_list:
             tma_meta_list = None
 
+    cluster_dims = schema.get("cluster_dims", [1, 1, 1])
+
     c_dispatcher = mod._TritonDispatcher(
         function=cu_function,
         num_warps=schema["num_warps"],
@@ -212,6 +214,9 @@ def make_triton_dispatcher(schema, cu_function: int):
         allocator=_allocation._allocator,
         profile_allocator=_allocation._profile_allocator,
         tma_meta=tma_meta_list,
+        cluster_dim_x=int(cluster_dims[0]) if len(cluster_dims) > 0 else 1,
+        cluster_dim_y=int(cluster_dims[1]) if len(cluster_dims) > 1 else 1,
+        cluster_dim_z=int(cluster_dims[2]) if len(cluster_dims) > 2 else 1,
     )
 
     # If there are host-side tensordescs (no TMA meta) that still need Python expansion,
