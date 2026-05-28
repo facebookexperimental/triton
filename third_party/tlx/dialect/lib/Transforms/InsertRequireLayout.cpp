@@ -227,9 +227,8 @@ public:
     poisonUnhandledCase(operand);
   }
 
-  void
-  visitNonControlFlowArguments(RegionSuccessor &successor,
-                               ArrayRef<BlockArgument> arguments) {}
+  void visitNonControlFlowArguments(RegionSuccessor &successor,
+                                    ArrayRef<BlockArgument> arguments) {}
   void setToExitState(DotRewriteLattice *lattice) override {}
 
 private:
@@ -278,7 +277,9 @@ static Attribute computeSharedEncFromDotEnc(ttg::DotOperandEncodingAttr dotEnc,
     auto loadMemDesc = localLoadOp->getOperand(0);
     if (auto type = dyn_cast<ttg::MemDescType>(loadMemDesc.getType())) {
       triton::AMD::TargetInfo targetInfo(
-          getAMDArch(localLoadOp->getParentOfType<ModuleOp>()).value_or("").str());
+          getAMDArch(localLoadOp->getParentOfType<ModuleOp>())
+              .value_or("")
+              .str());
       using triton::AMD::ISAFamily;
       if (llvm::is_contained({ISAFamily::CDNA4, ISAFamily::GFX1250},
                              targetInfo.getISAFamily())) {
@@ -547,10 +548,9 @@ public:
       if (auto resTy = dyn_cast<RankedTensorType>(load.getResult().getType())) {
         if (auto dotEnc = dyn_cast_or_null<ttg::DotOperandEncodingAttr>(
                 resTy.getEncoding())) {
-          DotConsumerState seed(
-              DotConsumerInfo{static_cast<int>(dotEnc.getOpIdx()),
-                              static_cast<unsigned>(dotEnc.getKWidth()),
-                              dotEnc});
+          DotConsumerState seed(DotConsumerInfo{
+              static_cast<int>(dotEnc.getOpIdx()),
+              static_cast<unsigned>(dotEnc.getKWidth()), dotEnc});
           if (!operands.empty()) {
             ChangeResult changed = operands[0]->meet(seed);
             propagateIfChanged(operands[0], changed);
@@ -645,15 +645,23 @@ static Attribute chooseTDMBufEncoding(Operation *tdmOp, Value buf,
     if (auto info = findDotConsumer(buf, solver)) {
       triton::AMD::TargetInfo targetInfo(
           getAMDArch(tdmOp->getParentOfType<ModuleOp>()).value_or("").str());
-      encoding =
-          composePaddedLayout(targetInfo, info->dotEnc,
-                              cast<ttg::TensorOrMemDesc>(bufType), order,
-                              /*useAsyncCopy=*/false);
+      encoding = composePaddedLayout(targetInfo, info->dotEnc,
+                                     cast<ttg::TensorOrMemDesc>(bufType), order,
+                                     /*useAsyncCopy=*/false);
     }
   }
   if (!encoding) {
-    encoding = ttg::SwizzledSharedEncodingAttr::get(
-        buf.getContext(), 1, 1, 1, order, cgaLayout);
+    // For loads, use the padded descriptor encoding. For stores, the TDM
+    // store verifier rejects padded encoding (it requires the descriptor
+    // and memdesc to agree, and without an alignTDMDescriptorEncodings
+    // pass the descriptor stays with its original encoding). Use a plain
+    // swizzled encoding for stores until that pass is ported.
+    if (allowDotAware)
+      encoding = buildDefaultTDMDescriptorEncoding(
+          buf.getContext(), shape, order, cgaLayout, elementType);
+    else
+      encoding = ttg::SwizzledSharedEncodingAttr::get(buf.getContext(), 1, 1, 1,
+                                                      order, cgaLayout);
   }
   return encoding;
 }
