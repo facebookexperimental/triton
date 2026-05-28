@@ -121,14 +121,14 @@ def _attn_fwd_async_simple(
         tlx.async_load_commit_group([tok_k, tok_v])
 
         wait_tok = tlx.async_load_wait_group(0)
-        k_cur = tlx.local_load(tlx.local_view(k_buf, 0), token=wait_tok)
+        kt_view = tlx.local_trans(tlx.local_view(k_buf, 0))
+        kt_cur = tlx.local_load(kt_view, token=wait_tok)
         v_cur = tlx.local_load(tlx.local_view(v_buf, 0), token=wait_tok)
 
-        qk = tl.dot(q, k_cur.T)
+        qk = tl.dot(q, kt_cur)
         if IS_CAUSAL:
             qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
-        if start_n + BLOCK_N > N_CTX:
-            qk = tl.where(kn[None, :] < N_CTX, qk, float("-inf"))
+        qk = tl.where(kn[None, :] < N_CTX, qk, float("-inf"))
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
         qk = qk * QK_SCALE - m_ij[:, None]
@@ -178,23 +178,25 @@ def _attn_fwd_async_prefetch(
 ):
     """
     Prefetch flash attention with explicit modulo-scheduled prologue,
-    hot loop (steady state), and epilogue
+    hot loop (steady state), and epilogue.
 
-    Single-buffered K/V shared memory.
-    Each commit group bundles K and V for the same tile.
-
+    Design notes:
+      * K and V are both double-buffered (2 LDS slots, ping-pong index
+        i%2).
+      * `local_trans` is applied to K so `local_load` lands directly in
+        dot-operand layout 1, skipping the per-iter ds_write+barrier+
+        ds_read shuffle that `tl.dot(q, k_cur.T)` would emit.
     Prologue:
     t = 0
     [GLDS_KV]
-    [LR_KV]
 
     Steady State (Hot Loop):
     t = i               t = i+1
+    [LR_KV]
     [QK, SM0, SM1, PV]  [GLDS_KV],
-                        [LR_KV]
-
     Epilogue:
                         t = i+1
+                        [LR_KV]
                         [QK (masked), SM0, SM1, PV]
     """
     _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
@@ -224,8 +226,9 @@ def _attn_fwd_async_prefetch(
     else:
         hi = N_CTX
 
-    k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, 1)
-    v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, 1)
+    NUM_BUFFERS: tl.constexpr = 2
+    k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, NUM_BUFFERS)
+    v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, NUM_BUFFERS)
 
     k_ptrs = K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
     v_ptrs = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
@@ -240,44 +243,45 @@ def _attn_fwd_async_prefetch(
     Prologue:
     t = 0
     [GLDS_KV]
-    [LR_KV]
     """
-    # GLDS_KV_t0
-    tok_k = tlx.async_load(k_ptrs, tlx.local_view(k_buf, 0), mask=offs_n[:, None] < N_CTX)
-    tok_v = tlx.async_load(v_ptrs, tlx.local_view(v_buf, 0), mask=offs_n[:, None] < N_CTX)
-    tlx.async_load_commit_group([tok_k, tok_v])
-
-    # LR_KV_t0
-    wait_tok = tlx.async_load_wait_group(0)
-    k_cur = tlx.local_load(tlx.local_view(k_buf, 0), token=wait_tok)
-    v_cur = tlx.local_load(tlx.local_view(v_buf, 0), token=wait_tok)
+    tok_k0 = tlx.async_load(k_ptrs, tlx.local_view(k_buf, 0), mask=offs_n[:, None] < N_CTX)
+    tok_v0 = tlx.async_load(v_ptrs, tlx.local_view(v_buf, 0), mask=offs_n[:, None] < N_CTX)
+    tlx.async_load_commit_group([tok_k0, tok_v0])
     """
     Steady State (Hot Loop):
     t = i               t = i+1
+    [LR_KV]
     [QK, SM0, SM1, PV]  [GLDS_KV],
-                        [LR_KV]
     """
     for block_id in tl.range(0, n_main * BLOCK_N, BLOCK_N, num_stages=0):
         next_off = block_id + BLOCK_N
         kn = block_id + offs_n
         next_mask = (next_off + offs_n[:, None]) < N_CTX
 
+        i = block_id // BLOCK_N
+        slot_cur = i % 2
+        slot_nxt = (i + 1) % 2
+
+        # LR_KV_ti
+        wait_tok = tlx.async_load_wait_group(0)
+        kt_view = tlx.local_trans(tlx.local_view(k_buf, slot_cur))
+        kt_cur = tlx.local_load(kt_view, token=wait_tok)
+        v_cur = tlx.local_load(tlx.local_view(v_buf, slot_cur), token=wait_tok)
+
+        # GLDS_KV_t(i+1)
+        tok_k = tlx.async_load(k_ptrs + next_off * stride_kn, tlx.local_view(k_buf, slot_nxt), mask=next_mask)
+        tok_v = tlx.async_load(v_ptrs + next_off * stride_vn, tlx.local_view(v_buf, slot_nxt), mask=next_mask)
+        tlx.async_load_commit_group([tok_k, tok_v])
+
         # QK_ti
-        qk = tl.dot(q, k_cur.T)
+        qk = tl.dot(q, kt_cur)
         if IS_CAUSAL:
             qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
 
-        # SM0_ti
+        # SM_ti
         m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
         p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
         l_ij = tl.sum(p, 1)
-
-        # GLDS after SM0: overlaps with SM1 + PV
-        tok_k = tlx.async_load(k_ptrs + next_off * stride_kn, tlx.local_view(k_buf, 0), mask=next_mask)
-        tok_v = tlx.async_load(v_ptrs + next_off * stride_vn, tlx.local_view(v_buf, 0), mask=next_mask)
-        tlx.async_load_commit_group([tok_k, tok_v])
-
-        # SM1_ti
         alpha = tl.math.exp2(m_i - m_ij)
         acc = acc * alpha[:, None]
         l_i = l_i * alpha + l_ij
@@ -285,30 +289,29 @@ def _attn_fwd_async_prefetch(
 
         # PV_ti
         acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
-
-        # LR_KV_t(i+1)
-        wait_tok = tlx.async_load_wait_group(0)
-        k_cur = tlx.local_load(tlx.local_view(k_buf, 0), token=wait_tok)
-        v_cur = tlx.local_load(tlx.local_view(v_buf, 0), token=wait_tok)
     """
     Epilogue:
     t = i+1
+    [LR_KV]
     [QK (masked), SM0, SM1, PV]
     """
-    kn_last = n_main * BLOCK_N + offs_n
+    wait_tok = tlx.async_load_wait_group(0)
+    slot_last = n_main % 2
+    kt_view = tlx.local_trans(tlx.local_view(k_buf, slot_last))
+    kt_cur = tlx.local_load(kt_view, token=wait_tok)
+    v_cur = tlx.local_load(tlx.local_view(v_buf, slot_last), token=wait_tok)
 
     # QK_t(i+1) — with boundary + causal masking
-    qk = tl.dot(q, k_cur.T)
+    kn_last = n_main * BLOCK_N + offs_n
+    qk = tl.dot(q, kt_cur)
     qk = tl.where(kn_last[None, :] < N_CTX, qk, float("-inf"))
     if IS_CAUSAL:
         qk = tl.where(offs_m[:, None] >= kn_last[None, :], qk, float("-inf"))
 
-    # SM0_t(i+1)
+    # SM_t(i+1)
     m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
     p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
     l_ij = tl.sum(p, 1)
-
-    # SM1_t(i+1)
     alpha = tl.math.exp2(m_i - m_ij)
     acc = acc * alpha[:, None]
     l_i = l_i * alpha + l_ij
