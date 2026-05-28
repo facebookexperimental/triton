@@ -2148,6 +2148,7 @@ static PyObject *TritonDispatcher_new(PyTypeObject *type, PyObject *args,
   unsigned long long func_ptr;
   int num_warps, num_ctas, shared_mem;
   int launch_pdl, launch_coop, launch_cluster;
+  int cluster_dim_x = 1, cluster_dim_y = 1, cluster_dim_z = 1;
   PyObject *arg_type_codes;
   int has_global_scratch, has_profile_scratch;
   unsigned global_scratch_size = 0, global_scratch_align = 1;
@@ -2171,16 +2172,19 @@ static PyObject *TritonDispatcher_new(PyTypeObject *type, PyObject *args,
                            "allocator",
                            "profile_allocator",
                            "tma_meta",
+                           "cluster_dim_x",
+                           "cluster_dim_y",
+                           "cluster_dim_z",
                            NULL};
   PyObject *tma_meta_list = NULL;
 
   if (!PyArg_ParseTupleAndKeywords(
-          args, kwargs, "KiiiiiiOpp|IIIIOOO", kwlist, &func_ptr, &num_warps,
+          args, kwargs, "KiiiiiiOpp|IIIIOOOiii", kwlist, &func_ptr, &num_warps,
           &num_ctas, &shared_mem, &launch_pdl, &launch_coop, &launch_cluster,
           &arg_type_codes, &has_global_scratch, &has_profile_scratch,
           &global_scratch_size, &global_scratch_align, &profile_scratch_size,
           &profile_scratch_align, &allocator_obj, &profile_allocator_obj,
-          &tma_meta_list))
+          &tma_meta_list, &cluster_dim_x, &cluster_dim_y, &cluster_dim_z))
     return NULL;
 
   TritonDispatcher *self = (TritonDispatcher *)type->tp_alloc(type, 0);
@@ -2335,12 +2339,21 @@ static PyObject *TritonDispatcher_new(PyTypeObject *type, PyObject *args,
     self->launch_attrs[na].value.cooperative = 1;
     na++;
   }
-  if (launch_cluster || num_ctas > 1) {
+  if (launch_cluster || num_ctas > 1 || cluster_dim_x > 1 ||
+      cluster_dim_y > 1 || cluster_dim_z > 1) {
     if (num_ctas > 1) {
+      /* Legacy num_ctas path: 1-D cluster along x */
       self->launch_attrs[na].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
       self->launch_attrs[na].value.clusterDim.x = num_ctas;
       self->launch_attrs[na].value.clusterDim.y = 1;
       self->launch_attrs[na].value.clusterDim.z = 1;
+      na++;
+    } else if (cluster_dim_x > 1 || cluster_dim_y > 1 || cluster_dim_z > 1) {
+      /* ctas_per_cga path: explicit multi-dimensional cluster_dims */
+      self->launch_attrs[na].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+      self->launch_attrs[na].value.clusterDim.x = cluster_dim_x;
+      self->launch_attrs[na].value.clusterDim.y = cluster_dim_y;
+      self->launch_attrs[na].value.clusterDim.z = cluster_dim_z;
       na++;
     }
     self->launch_attrs[na].id =

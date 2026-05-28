@@ -523,6 +523,10 @@ class nvidia_knobs(base_knobs):
     use_llvm_launcher: env_bool = env_bool("TRITON_USE_LLVM_LAUNCHER")
     use_triton_dispatcher: env_bool = env_bool("TRITON_USE_TRITON_DISPATCHER")
     generate_subtiled_region: env_bool = env_bool("TRITON_GENERATE_SUBTILED_REGION")
+    # When True, run the triton-nvidia-interleave-tmem pass on Blackwell.
+    # Default ON; set TRITON_ENABLE_INTERLEAVE_TMEM=0 to opt out for A/B
+    # testing against the operand-D back-edge channel fix.
+    enable_interleave_tmem: env_bool = env_bool("TRITON_ENABLE_INTERLEAVE_TMEM", True)
     enable_tileir: env_bool = env_bool("ENABLE_TILE")
     disable_budget_aware_layout_conversion: env_bool = env_bool("TRITON_DISABLE_BUDGET_AWARE_LAYOUT_CONVERSION")
 

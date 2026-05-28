@@ -140,7 +140,7 @@ def test_async_tasks_constexpr_guard(BLOCK_SIZE, ENABLE_SECOND_TASK, device):
                 output = x + y
                 tl.store(z_ptr + offsets, output, mask=mask)
             if ENABLE_SECOND_TASK:
-                with tlx.async_task(num_warps=1, registers=100):
+                with tlx.async_task(num_warps=1, registers=96):
                     offsets = block_start + tl.arange(0, BLOCK_SIZE)
                     mask = offsets < n_elements
                     a = tl.load(a_ptr + offsets, mask=mask)
@@ -226,7 +226,7 @@ def test_async_tasks_constexpr_select_default(BLOCK_SIZE, USE_LARGE_DEFAULT, dev
                     x = tl.load(x_ptr + offsets, mask=mask)
                     y = tl.load(y_ptr + offsets, mask=mask)
                     tl.store(z_ptr + offsets, x * y, mask=mask)
-            with tlx.async_task(num_warps=1, registers=100):
+            with tlx.async_task(num_warps=1, registers=96):
                 offsets = block_start + tl.arange(0, BLOCK_SIZE)
                 mask = offsets < n_elements
                 a = tl.load(a_ptr + offsets, mask=mask)
@@ -293,6 +293,30 @@ def test_default_task_rejects_registers():
 
     with pytest.raises(AssertionError, match="Cannot specify registers"):
         tlx.async_task("default", num_regs=128)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"num_regs": 25},
+        {"registers": 25},
+    ],
+)
+def test_async_task_rejects_unaligned_registers(kwargs):
+    with pytest.raises(ValueError, match="divisible by 8"):
+        tlx.async_task(num_warps=1, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"minRegAutoWS": 25},
+        {"maxRegAutoWS": 153},
+    ],
+)
+def test_config_rejects_unaligned_reg_auto_ws(kwargs):
+    with pytest.raises(ValueError, match="divisible by 8"):
+        triton.Config({}, **kwargs)
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
