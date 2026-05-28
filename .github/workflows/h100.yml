@@ -85,13 +85,13 @@ jobs:
         run: |
           set -x
           . "${SETUP_SCRIPT}"
-          . ${UV_VENV_DIRS}/${CONDA_ENV}/activate
+          . ${UV_VENV_DIR}/${CONDA_ENV}/activate
           pytest python/test/unit/language/test_tlx_*.py -v
       - name: Run TLX tutorial correctness tests
         timeout-minutes: 5
         run: |
           . "${SETUP_SCRIPT}"
-          . ${UV_VENV_DIRS}/${CONDA_ENV}/activate
+          . ${UV_VENV_DIR}/${CONDA_ENV}/activate
           pytest third_party/tlx/tutorials/testing/test_correctness.py -v
 
 concurrency:
