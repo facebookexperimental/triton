@@ -1280,6 +1280,113 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
   }
 };
 
+struct AsyncTDMGroupCopyGlobalToLocalOpConversion
+    : public ConvertOpToLLVMPattern<
+          triton::amdgpu::AsyncTDMGroupCopyGlobalToLocalOp>,
+      public LoadStoreConversionBase {
+  AsyncTDMGroupCopyGlobalToLocalOpConversion(
+      LLVMTypeConverter &converter, const AMD::TargetInfo &targetInfo,
+      ModuleAxisInfoAnalysis &axisAnalysisPass, PatternBenefit benefit)
+      : ConvertOpToLLVMPattern(converter, benefit),
+        LoadStoreConversionBase(targetInfo, axisAnalysisPass) {}
+
+  LogicalResult
+  matchAndRewrite(triton::amdgpu::AsyncTDMGroupCopyGlobalToLocalOp op,
+                  OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    int numWarps = triton::gpu::lookupNumWarps(op);
+    int rank = op.getRank();
+    auto ctaId = targetInfo.getClusterCTAId(rewriter, loc);
+
+    SmallVector<Value> selectedGroups;
+    auto v4i32Ty = VectorType::get(4, rewriter.getI32Type());
+    auto v8i32Ty = VectorType::get(8, rewriter.getI32Type());
+
+    Value warpId = getLaneAndWarpId(rewriter, loc).second;
+    Value one = b.i32_val(1);
+
+    for (auto armIdx : llvm::seq<size_t>(0, op.getDescs().size())) {
+      auto tensorDescTy =
+          cast<triton::TensorDescType>(op.getDescs()[armIdx].getType());
+      auto encoding = tensorDescTy.getSharedLayout();
+      Type elementType =
+          getTypeConverter()->convertType(tensorDescTy.getElementType());
+
+      triton::LinearLayout sharedLayout =
+          isPaddedEncoding(encoding)
+              ? paddedLinearLayout(tensorDescTy.getShape(), encoding)
+              : toLinearLayout(tensorDescTy.getShape(), encoding);
+
+      unsigned padInterval = 0;
+      unsigned padAmount = 0;
+      if (auto padEnc = getPaddedEncoding(encoding)) {
+        assert(padEnc.getIntervals().size() == 1 &&
+               padEnc.getPaddings().size() == 1);
+        padInterval = padEnc.getIntervals()[0];
+        padAmount = padEnc.getPaddings()[0];
+      }
+
+      SmallVector<Value> desc = mlir::LLVM::AMD::unpackTDMDescriptor(
+          rewriter, loc, adaptor.getDescs()[armIdx]);
+
+      auto dstMemObj = LLVM::getSharedMemoryObjectFromStruct(
+          loc, adaptor.getDsts()[armIdx], elementType, rewriter);
+      SmallVector<Value> dstPtrs = llvm::to_vector(dstMemObj.getBases());
+
+      SmallVector<Value> offset;
+      offset.reserve(rank);
+      auto indices = adaptor.getIndices();
+      for (int i = 0; i < rank; ++i)
+        offset.push_back(indices[armIdx * rank + i]);
+
+      uint32_t warpMask = static_cast<uint32_t>(op.getWarpMasks()[armIdx]);
+      int effectiveWarps = llvm::popcount(warpMask);
+      auto shapePerCTA =
+          triton::gpu::getShapePerCTA(encoding, tensorDescTy.getShape());
+      auto [warpsPerCTA, numTDMInstructions] =
+          mlir::LLVM::AMD::distributeTDMWarpsAlignToPartition(
+              shapePerCTA, effectiveWarps, encoding);
+      if (numTDMInstructions != 1)
+        return rewriter.notifyMatchFailure(
+            op, "grouped TDM arm would lower to multiple intrinsics");
+
+      mlir::LLVM::AMD::fillTDMDescriptor(
+          rewriter, loc, getTypeConverter(), elementType, shapePerCTA, numWarps,
+          padInterval, padAmount, desc, offset, dstPtrs,
+          adaptor.getPreds()[armIdx],
+          /*multicastMask=*/Value(), /*barrierPtr=*/Value(), sharedLayout,
+          ctaId,
+          /*isStore=*/false, warpsPerCTA, warpMask);
+
+      while (desc.size() < 4)
+        desc.push_back(LLVM::ZeroOp::create(rewriter, loc, v4i32Ty));
+
+      if (selectedGroups.empty()) {
+        selectedGroups.assign(desc.begin(), desc.begin() + 4);
+        continue;
+      }
+
+      Value active = b.icmp_ne(b.and_(b.shl(one, warpId), b.i32_val(warpMask)),
+                               b.i32_val(0));
+      for (int i = 0; i < 4; ++i)
+        selectedGroups[i] = b.select(active, desc[i], selectedGroups[i]);
+    }
+
+    selectedGroups.push_back(
+        LLVM::ZeroOp::create(rewriter, loc, v8i32Ty)); // group4
+    auto auxBits = mlir::LLVM::AMD::getCtrlBitsForCacheModifierOnTarget(
+        op.getCache(), /*isLoad=*/true, targetInfo);
+    selectedGroups.push_back(b.i32_val(auxBits));
+    LLVM::createLLVMIntrinsicCallOp(
+        rewriter, loc, "llvm.amdgcn.tensor.load.to.lds", {}, selectedGroups);
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 struct AsyncTDMCopyLocalToGlobalOpConversion
     : public ConvertOpToLLVMPattern<
           triton::amdgpu::AsyncTDMCopyLocalToGlobalOp>,
@@ -2554,6 +2661,7 @@ void populateLoadStoreOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                BufferAtomicRMWOpConversion, AsyncCopyGlobalToLocalOpConversion,
                AsyncCopyLocalToGlobalOpConversion, BufferAtomicCASOpConversion,
                AsyncTDMCopyGlobalToLocalOpConversion,
+               AsyncTDMGroupCopyGlobalToLocalOpConversion,
                AsyncTDMCopyLocalToGlobalOpConversion,
                AsyncTDMScatterOpConversion, AsyncTDMGatherOpConversion>(
       typeConverter, targetInfo, axisInfoAnalysis, benefit);

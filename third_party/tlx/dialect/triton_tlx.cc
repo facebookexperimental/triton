@@ -544,6 +544,28 @@ void init_triton_tlx_ir(py::module &&m) {
              return self.create<amdgpu::AsyncTDMCopyGlobalToLocalOp>(
                  desc, indices, result, pred32, barrier.value_or(Value()));
            })
+      .def("create_async_tdm_group_copy_global_to_local",
+           [](TritonOpBuilder &self, std::vector<Value> descs,
+              std::vector<Value> indices, std::vector<Value> results,
+              std::vector<Value> preds, int32_t rank,
+              std::vector<int32_t> warpMasks) -> mlir::Value {
+             SmallVector<Value> pred32s;
+             pred32s.reserve(preds.size());
+             for (Value pred : preds) {
+               Value pred32 = pred;
+               if (auto intTy = dyn_cast<IntegerType>(pred.getType())) {
+                 if (intTy.getWidth() == 1) {
+                   pred32 = self.create<arith::ExtUIOp>(
+                       self.getBuilder().getI32Type(), pred);
+                 }
+               }
+               pred32s.push_back(pred32);
+             }
+             return self.create<amdgpu::AsyncTDMGroupCopyGlobalToLocalOp>(
+                 self.getBuilder().getType<ttg::AsyncTokenType>(), descs,
+                 indices, results, pred32s, static_cast<uint32_t>(rank),
+                 llvm::ArrayRef<int32_t>(warpMasks), tt::CacheModifier::NONE);
+           })
       .def("create_async_tdm_wait",
            [](TritonOpBuilder &self, std::vector<Value> asyncTokens,
               unsigned pendings) -> mlir::Value {

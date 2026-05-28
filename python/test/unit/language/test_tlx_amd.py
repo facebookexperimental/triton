@@ -937,6 +937,62 @@ def test_async_amd_desc_load_token_threaded_compiles_gfx1250(device):
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
 
 
+@triton.jit
+def _async_amd_desc_load_group_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    a_desc = tl.make_tensor_descriptor(
+        a_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    b_desc = tl.make_tensor_descriptor(
+        b_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    a_buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+    b_buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+    a_smem = tlx.local_view(a_buf, 0)
+    b_smem = tlx.local_view(b_buf, 0)
+
+    tok = tlx.async_amd_descriptor_load_group(
+        [a_desc, b_desc],
+        [a_smem, b_smem],
+        [[0, 0], [0, 0]],
+        [0b0011, 0b1100],
+    )
+    tlx.async_amd_descriptor_wait(0, [tok])
+
+    data = tlx.local_load(a_smem) + tlx.local_load(b_smem)
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    out_ptrs = output_ptr + offs_m[:, None] * N + offs_n[None, :]
+    tl.store(out_ptrs, data)
+
+
+def test_async_amd_desc_load_group_compiles_gfx1250(device):
+    """Grouped AMD descriptor load should lower to one static TDM instruction."""
+    compiled = compile_for_gfx1250(
+        _async_amd_desc_load_group_kernel,
+        signature={"a_ptr": "*fp16", "b_ptr": "*fp16", "output_ptr": "*fp16"},
+        constexprs={"M": 16, "N": 32, "BLOCK_M": 16, "BLOCK_N": 32},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_group_copy_global_to_local" in ttgir, ("expected grouped TDM op in TTGIR, got:\n" + ttgir)
+    amdgcn = compiled.asm["amdgcn"]
+    n_tdm = len(re.findall(r"tensor_load_to_lds|tensor\\.load\\.to\\.lds", amdgcn))
+    assert n_tdm == 1, f"expected one tensor_load_to_lds, got {n_tdm}\n{amdgcn}"
+
+
 def test_async_amd_desc_load_uses_padded_layout_gfx1250(device):
     """Default-layout `local_alloc` should be rewritten to a descriptor-compatible
     padded encoding by `TLXInsertRequireLayout` + `TlxPropagateLayout`."""

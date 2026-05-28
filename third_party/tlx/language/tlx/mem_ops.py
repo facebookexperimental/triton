@@ -998,6 +998,65 @@ def async_amd_descriptor_load(
 
 
 @tl.builtin
+def async_amd_descriptor_load_group(
+    descs: list[tl.tensor_descriptor_base],
+    results: list[tlx.buffered_tensor],
+    offsets: list[list[tl.tensor]],
+    warp_masks: list[tl.constexpr],
+    preds=None,
+    _semantic=None,
+) -> tlx.async_token:
+    """N-way grouped AMD TDM descriptor load.
+
+    Lowers to one ``amdgpu.async_tdm_group_copy_global_to_local`` op and one
+    hardware ``tensor_load_to_lds`` instruction.  ``warp_masks[i]`` selects the
+    waves that use ``descs[i]`` / ``results[i]`` / ``offsets[i]``.  The masks
+    must be disjoint, non-empty, and cover all waves; the verifier enforces the
+    exact axis-aligned mask restrictions required by AMD TDM lowering.
+
+    This is an AMD gfx1250-only primitive intended for cases where a group of
+    independent tiles (for example A, B, A-scale, B-scale in MXFP GEMM) should
+    share one static TDM instruction with per-wave descriptor selection.
+    """
+    arch = _semantic.builder.options.arch
+    assert is_amd_tdm_target(arch), (
+        f"async_amd_descriptor_load_group is only available on AMD TDM-capable targets, got arch={arch}")
+    assert len(descs) > 0, "async_amd_descriptor_load_group requires at least one descriptor"
+    assert len(results) == len(descs), "expected one result buffer per descriptor"
+    assert len(offsets) == len(descs), "expected one offsets list per descriptor"
+    assert len(warp_masks) == len(descs), "expected one warp mask per descriptor"
+
+    rank = len(descs[0].block_shape)
+    desc_handles = []
+    result_handles = []
+    index_handles = []
+    for i, (desc, result, arm_offsets) in enumerate(zip(descs, results, offsets)):
+        assert isinstance(desc, tl.tensor_descriptor_base)
+        assert len(desc.block_shape) == rank, "all grouped descriptors must have the same rank"
+        assert len(arm_offsets) == rank, f"arm {i} expected {rank} offsets, got {len(arm_offsets)}"
+        desc_handles.append(desc.handle)
+        result_handles.append(result.handle)
+        index_handles.extend(_semantic._convert_to_ir_values(arm_offsets, require_i64=False))
+
+    if preds is None:
+        pred_handles = [_semantic.builder.get_int1(True) for _ in descs]
+    else:
+        assert len(preds) == len(descs), "expected one predicate per descriptor"
+        pred_handles = [pred.handle for pred in preds]
+
+    warp_masks = [int(mask) for mask in warp_masks]
+    token_handle = _semantic.builder.create_async_tdm_group_copy_global_to_local(
+        desc_handles,
+        index_handles,
+        result_handles,
+        pred_handles,
+        rank,
+        warp_masks,
+    )
+    return tlx.async_token(token_handle)
+
+
+@tl.builtin
 def async_amd_descriptor_store(
     desc: tl.tensor_descriptor_base,
     source: tlx.buffered_tensor,
