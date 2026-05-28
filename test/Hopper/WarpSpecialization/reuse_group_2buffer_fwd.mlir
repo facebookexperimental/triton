@@ -46,12 +46,16 @@
 // CHECK: ttng.tc_gen5_mma {{.*}}loop.cluster = 2{{.*}}loop.stage = 1
 // CHECK-NOT: nvws.producer_acquire
 // CHECK: nvws.consumer_wait {{.*}}loop.cluster = 4{{.*}}loop.stage = 1
-// CHECK: ttng.tc_gen5_mma {{.*}}loop.cluster = 4{{.*}}loop.stage = 1{{.*}}tmem.start = array<i32: 17, 17>
+// The accumulator MMA now carries 2 distinct channel ids in tmem.start
+// (the gen5 -> tmem_load back-edge channel + the gen5 -> post-loop
+// tmem_load forward channel), in addition to tmem.end for the in-body
+// tmem_store -> gen5 forward channel.
+// CHECK: ttng.tc_gen5_mma {{.*}}loop.cluster = 4{{.*}}loop.stage = 1{{.*}}tmem.end = array<i32: {{.+}}>, tmem.start = array<i32: {{.+}}, {{.+}}>
 //
 // Same check for cluster 1, stage 2:
 // CHECK-NOT: nvws.producer_acquire
 // CHECK: nvws.consumer_wait {{.*}}loop.cluster = 1{{.*}}loop.stage = 2
-// CHECK: ttng.tc_gen5_mma {{.*}}loop.cluster = 1{{.*}}loop.stage = 2{{.*}}tmem.start = array<i32: 15, 15>
+// CHECK: ttng.tc_gen5_mma {{.*}}loop.cluster = 1{{.*}}loop.stage = 2{{.*}}tmem.end = array<i32: {{.+}}>, tmem.start = array<i32: {{.+}}, {{.+}}>
 //
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>

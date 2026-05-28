@@ -1558,8 +1558,19 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
     }
     effective_args = merged_args;
     effective_nargs = total;
-  } else if (nargs != self->n_params) {
+  } else if (nargs > self->n_params) {
     goto fallback;
+  } else if (nargs < self->n_params) {
+    // Pad missing trailing args (constexpr params not passed positionally)
+    // with Py_None to match the FastCache insertion key.
+    int total = self->n_params;
+    merged_args = (PyObject **)alloca(total * sizeof(PyObject *));
+    for (int i = 0; i < (int)nargs; i++)
+      merged_args[i] = (PyObject *)args[i];
+    for (int i = (int)nargs; i < total; i++)
+      merged_args[i] = Py_None;
+    effective_args = merged_args;
+    effective_nargs = total;
   }
 
   {
@@ -1709,12 +1720,12 @@ static void _init_jit_cache_proxy_type() {
 }
 
 // native_create_jit_proxy(jit_fn, grid_tuple, params_list, options_hash,
-// stream_getter, device_getter)
+// stream_getter, device_getter[, extra_kwargs])
 PyObject *native_create_jit_proxy(PyObject *self_unused, PyObject *const *args,
                                   Py_ssize_t nargs) {
-  if (nargs != 6) {
+  if (nargs < 6 || nargs > 7) {
     PyErr_SetString(PyExc_TypeError,
-                    "native_create_jit_proxy expects 6 arguments");
+                    "native_create_jit_proxy expects 6 or 7 arguments");
     return nullptr;
   }
   PyObject *jit_fn = args[0];
@@ -1723,6 +1734,8 @@ PyObject *native_create_jit_proxy(PyObject *self_unused, PyObject *const *args,
   PyObject *options_hash_obj = args[3];
   PyObject *stream_getter = args[4];
   PyObject *device_getter = args[5];
+  PyObject *extra_kwargs =
+      (nargs >= 7 && args[6] != Py_None) ? args[6] : nullptr;
 
   uint64_t opts_hash = PyLong_AsUnsignedLongLong(options_hash_obj);
   if (PyErr_Occurred())
@@ -1767,6 +1780,15 @@ PyObject *native_create_jit_proxy(PyObject *self_unused, PyObject *const *args,
     Py_DECREF(kw);
     Py_DECREF(run_method);
     return nullptr;
+  }
+  // Merge extra_kwargs (e.g., ctas_per_cga) into the partial's kwargs so that
+  // the fallback path passes them to run() for correct compilation options.
+  if (extra_kwargs && PyDict_Check(extra_kwargs)) {
+    if (PyDict_Merge(kw, extra_kwargs, 1) < 0) {
+      Py_DECREF(kw);
+      Py_DECREF(run_method);
+      return nullptr;
+    }
   }
   PyObject *pack = PyTuple_Pack(1, run_method);
   Py_DECREF(run_method);
