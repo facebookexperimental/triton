@@ -276,13 +276,26 @@ class Autotuner(KernelInterface):
             except (ImportError, AttributeError):
                 native_fast_dispatch_insert = None
             kernel = self.fn.run(*full_args, grid=evaluated_grid, warmup=False, **_meta)
+            # Update _fc_options_hash so C proxy and JIT.run fast path lookups
+            # use the same hash that JIT.run's insertion used (includes meta-params
+            # like ctas_per_cga that affect compilation options).
+            if _meta:
+                _meta_opts = {k: v for k, v in _meta.items() if k not in getattr(self.fn, '_param_name_to_idx', {})}
+                if _meta_opts:
+                    self.fn._fc_options_hash = hash(tuple(sorted(_meta_opts.items()))) & 0xFFFFFFFFFFFFFFFF
+                # Store meta kwargs for C proxy fallback forwarding.
+                self.fn._fc_meta_kwargs = _meta
+                # Invalidate proxy cache so next __getitem__ creates a new proxy
+                # with the updated options_hash and meta_kwargs.
+                self.fn._jit_proxy_cache = {}
             if native_fast_dispatch_insert is not None:
                 _disp = getattr(kernel, '_dispatcher', None)
                 if _disp is not None:
                     _padded = tuple(full_args)
                     if len(_padded) < len(self.fn.params):
                         _padded = _padded + (None, ) * (len(self.fn.params) - len(_padded))
-                    native_fast_dispatch_insert(self.fn, _padded, self.fn.params, 0, kernel, _disp,
+                    native_fast_dispatch_insert(self.fn, _padded, self.fn.params, self.fn._fc_options_hash, kernel,
+                                                _disp,
                                                 getattr(kernel, '_dispatch_arg_indices', None))
             self._fc_seeded.add(_seed_key)
             return kernel
@@ -448,6 +461,11 @@ class Config:
     :type preferred_ctas_per_cga: tuple[int, int, int]
     """
 
+    @staticmethod
+    def _check_reg_auto_ws_alignment(name, value):
+        if value is not None and value % 8 != 0:
+            raise ValueError(f"{name} must be divisible by 8, got {value}")
+
     def __init__(
         self,
         kwargs,
@@ -476,6 +494,8 @@ class Config:
         self.maxnreg = maxnreg
         self.pre_hook = pre_hook
         self.ir_override = ir_override
+        self._check_reg_auto_ws_alignment("minRegAutoWS", minRegAutoWS)
+        self._check_reg_auto_ws_alignment("maxRegAutoWS", maxRegAutoWS)
         self.minRegAutoWS = minRegAutoWS
         self.maxRegAutoWS = maxRegAutoWS
         self.pingpongAutoWS = pingpongAutoWS
