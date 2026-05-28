@@ -170,6 +170,17 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
                     layout.numCTASplit,
                     layout.numCTAOrder,
                 )
+            elif _semantic.builder.options.arch.startswith("gfx"):
+                layout = tlx.swizzled_shared_layout_encoding.make_default(rank=len(shape))
+                layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
+                    layout.vectorSize,
+                    layout.perPhase,
+                    layout.maxPhase,
+                    layout.order,
+                    layout.numCTAsPerCGA,
+                    layout.numCTASplit,
+                    layout.numCTAOrder,
+                )
             else:
                 layout = tlx.nv_mma_shared_layout_encoding.make_default(shape, dtype)
                 layout_handle = _semantic.builder.make_nv_mma_shared_encoding_attr(
