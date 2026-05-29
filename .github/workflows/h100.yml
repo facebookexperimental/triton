@@ -78,17 +78,23 @@ jobs:
         run: |
           . "${SETUP_SCRIPT}"
           uv pip install --no-build-isolation --no-deps "git+https://github.com/pytorch/ao.git"
-          uv run --active python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
+          python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
       - name: Run TLX unit tests
         timeout-minutes: 5
         run: |
           . "${SETUP_SCRIPT}"
-          uv run --active pytest python/test/unit/language/test_tlx_*.py -v
+          ls $UV_ENV_DIR/$CONDA_ENV/bin
+          echo $PATH
+          which pytest
+          which python
+          $UV_ENVS/$CONDA_ENV/bin/pytest python/test/unit/language/test_tlx_*.py -v
       - name: Run TLX tutorial correctness tests
         timeout-minutes: 5
         run: |
           . "${SETUP_SCRIPT}"
-          uv run --active pytest third_party/tlx/tutorials/testing/test_correctness.py -v
+          ls $UV_ENV_DIR/$CONDA_ENV/bin
+          echo $PATH
+          $UV_ENVS/$CONDA_ENV/bin/pytest third_party/tlx/tutorials/testing/test_correctness.py -v
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
