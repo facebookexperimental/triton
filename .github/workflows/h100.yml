@@ -83,11 +83,7 @@ jobs:
         timeout-minutes: 5
         run: |
           . "${SETUP_SCRIPT}"
-          ls ${UV_VENV_DIR}/${CONDA_ENV}/bin
-          echo $PATH
-          which pytest
-          which python
-          $UV_ENVS/$CONDA_ENV/bin/pytest python/test/unit/language/test_tlx_*.py -v
+          ${UV_VENV_DIR}/${CONDA_ENV}/bin/pytest python/test/unit/language/test_tlx_*.py -v
       - name: Run TLX tutorial correctness tests
         timeout-minutes: 5
         run: |
