@@ -1933,7 +1933,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 #blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1100", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @scfif_range4(%x: i32 loc("x"), %y: i32 loc("y"), %output_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32} loc("output_ptr"), %n_elements: i32 {tt.divisibility = 16 : i32} loc("n_elements")) attributes {noinline = false} {
+  tt.func public @scfif_range4(%x: i32, %y: i32, %output_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %n_elements: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     %c4_i32 = arith.constant 4 : i32
     %c0_i32 = arith.constant 0 : i32
     %c20_i32 = arith.constant 20 : i32
