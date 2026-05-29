@@ -776,12 +776,11 @@ LogicalResult AsyncTDMGroupCopyGlobalToLocalOp::verify() {
            << " arms and rank " << rank;
 
   std::optional<int> maybeNumWarps = gpu::maybeLookupNumWarps(getOperation());
-  int numWarps = maybeNumWarps.value_or(0);
   if (maybeNumWarps && gpu::lookupNumCTAs(getOperation()) != 1)
     return emitOpError("currently supports one CTA only");
 
   uint32_t seenMask = 0;
-  uint32_t fullMask = maybeNumWarps ? ((uint32_t{1} << numWarps) - 1) : 0;
+  uint32_t fullMask = maybeNumWarps ? ((uint32_t{1} << *maybeNumWarps) - 1) : 0;
   unsigned elementBitWidth = 0;
   for (size_t armIdx = 0; armIdx < numArms; ++armIdx) {
     Value desc = getDescs()[armIdx];
@@ -789,7 +788,7 @@ LogicalResult AsyncTDMGroupCopyGlobalToLocalOp::verify() {
     int32_t maskSigned = getWarpMasks()[armIdx];
     uint32_t mask = static_cast<uint32_t>(maskSigned);
     if (maybeNumWarps &&
-        failed(validateWarpUsedHint(getOperation(), mask, numWarps)))
+        failed(validateWarpUsedHint(getOperation(), mask, *maybeNumWarps)))
       return failure();
     if ((seenMask & mask) != 0)
       return emitOpError("warp masks must be disjoint; arm ")
