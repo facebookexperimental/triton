@@ -204,6 +204,11 @@ bool tmemMayAlias(Value a, Value b) {
   return true;
 }
 
+bool isPlainTMAStoreTokenWait(Operation *op) {
+  auto wait = dyn_cast<TMAStoreTokenWaitOp>(op);
+  return wait && wait.getBarriers().empty();
+}
+
 // Sink tmem_loads as close to their use as possible to reduce register
 // pressure. When opConstraints is provided, uses canAdvanceWSBarrier to
 // decide whether the op can sink past barriers from independent channels.
@@ -231,7 +236,7 @@ bool sinkOps(Value buffer, ArrayRef<Operation *> useChain,
       if (isa<ArriveBarrierOp>(next))
         break;
     }
-    if (!isMemoryEffectFree(next)) {
+    if (!isMemoryEffectFree(next) && !isPlainTMAStoreTokenWait(next)) {
       SmallVector<MemoryEffects::EffectInstance> effects;
       collectEffects(next, effects);
       for (auto effect : effects) {

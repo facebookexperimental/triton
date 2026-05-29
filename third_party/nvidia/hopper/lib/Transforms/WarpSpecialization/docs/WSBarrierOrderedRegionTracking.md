@@ -9,7 +9,7 @@ The design is based on the region-based WSBarrier design doc and the
 implementation in:
 
 - `WSBarrierAnalysis.h`
-- `WSCodePartition.cpp::injectChannelGraphOnTokenOps`
+- `WSCodePartition.cpp::injectChannelGraphOnWSBarrierEndpoints`
 - `nvidia/hopper/include/Transforms/WSBarrierReorder.h`
 - `lib/Dialect/TritonNvidiaGPU/Transforms/InterleaveTMem.cpp`
 
@@ -39,6 +39,7 @@ The nested `constraints.WSBarrier` dictionary can contain:
 |-------|---------|
 | `dstTask` | Destination partition for the channel. The source partition is the op's `async_task_id`. |
 | `channelGraph` | V1 reachable foreign task set, excluding the source task. |
+| `direction` | Direction for direct TTNG barrier endpoints: `"forward"` for data-ready edges and `"backward"` for resource-reuse edges. NVWS token ops derive this from op type. |
 | `parentId` | Function-local ID for the nearest ordered parent scope. |
 | `minRegionId` | Earliest ordered region reached by the channel summary. |
 | `maxRegionId` | Latest ordered region reached by the channel summary. |
@@ -54,14 +55,14 @@ disjoint-graph rule.
 
 ## Ordered Parents
 
-`getNearestWSBarrierParent()` walks from a token op to its enclosing ordered
-parent. The valid parents are:
+`getNearestWSBarrierParent()` walks from a WSBarrier endpoint to its enclosing
+ordered parent. The valid parents are:
 
 - nearest `scf.for`
 - nearest `scf.while`
 - containing `tt.func`
 
-If the walk crosses `scf.if`, the token receives invalid ordered metadata.
+If the walk crosses `scf.if`, the endpoint receives invalid ordered metadata.
 Conditional channels therefore keep the V1 behavior for now.
 
 Barrier movement also stops at region-bearing operations. `canAdvanceWSBarrier`
@@ -78,18 +79,23 @@ next segment.
 
 For a parent with `N` ordered regions:
 
-- Forward tokens use region IDs `1..N`.
-- Backward tokens use region IDs `N+1..2N`.
+- Forward endpoints use region IDs `1..N`.
+- Backward endpoints use region IDs `N+1..2N`.
 
-Forward tokens are:
+Forward token endpoints are:
 
 - `nvws.producer_commit`
 - `nvws.consumer_wait`
 
-Backward resource-reuse tokens are:
+Backward resource-reuse token endpoints are:
 
 - `nvws.producer_acquire`
 - `nvws.consumer_release`
+
+Direct TTNG barrier endpoints are recognized when they carry
+`constraints.WSBarrier.dstTask` and `constraints.WSBarrier.direction`. This is
+used by optimized TMA-to-`tc_gen5_mma` channels, which bypass NVWS tokens and
+create direct `ttng.wait_barrier` ops.
 
 Splitting forward and backward ranges prevents a data-availability edge from
 being confused with a resource-reuse edge in the same program region.
@@ -97,10 +103,10 @@ being confused with a resource-reuse edge in the same program region.
 ## Channel Range Construction
 
 `buildWSBarrierOrderedRegionRanges()` runs after `insertAsyncComm()` has
-created token ops with `WSBarrier.dstTask`. It starts from the V1
-`buildChannelGraph()` result and computes a region summary for every WS token.
+created WSBarrier endpoints with `WSBarrier.dstTask`. It starts from the V1
+`buildChannelGraph()` result and computes a region summary for every endpoint.
 
-For each token node, the initial range is its own ordered region:
+For each endpoint node, the initial range is its own ordered region:
 
 ```text
 minRegionId = regionId
@@ -110,10 +116,10 @@ maxRegionId = regionId
 The range is then extended in two conservative same-iteration cases:
 
 1. Same-region peer channels are grouped when they share the same parent,
-   direction, and ordered region, and are visible through the starting token's
+   direction, and ordered region, and are visible through the starting endpoint's
    V1 graph. This makes the same relationship visible from both participating
    partitions.
-2. For wait tokens, later regions in the same source partition, parent, and
+2. For wait endpoints, later regions in the same source partition, parent, and
    direction are unioned into the range. This evaluates an arrive-past-wait
    move from the delayed arrive's perspective.
 
@@ -122,19 +128,21 @@ summarizes same-iteration ordered regions.
 
 ## Injection
 
-`WSCodePartition.cpp::injectChannelGraphOnTokenOps()` writes the V1 and V2
-metadata back to token constraints:
+`WSCodePartition.cpp::injectChannelGraphOnWSBarrierEndpoints()` writes the V1
+and V2 metadata back to token or direct barrier constraints:
 
 1. Build the V1 partition reachability graph with `buildChannelGraph()`.
 2. Build ordered-region ranges with `buildWSBarrierOrderedRegionRanges()`.
-3. For each WS token with one `async_task_id` and a valid `dstTask`, inject:
+3. For each WSBarrier endpoint with one `async_task_id` and a valid `dstTask`,
+   inject:
    - `channelGraph`
    - `parentId`
    - `minRegionId`
    - `maxRegionId`
 
-`doTokenLowering()` then propagates the token constraints to the lowered
-`ttng.wait_barrier` and `ttng.arrive_barrier` ops.
+`doTokenLowering()` then propagates token constraints to the lowered
+`ttng.wait_barrier` and `ttng.arrive_barrier` ops. Direct TTNG barriers are
+already materialized, so injection updates their constraints in place.
 
 ## Reordering Rule
 
@@ -191,8 +199,8 @@ The implementation intentionally keeps these cases conservative:
 
 Useful checks:
 
-- Before token lowering, inspect `nvws.*` token ops for
-  `constraints = {WSBarrier = {...}}`.
+- Before token lowering, inspect `nvws.*` token ops and direct TTNG barriers
+  for `constraints = {WSBarrier = {...}}`.
 - After token lowering, inspect `ttng.wait_barrier` and
   `ttng.arrive_barrier` for the same nested dictionary.
 - For V1 behavior, check `channelGraph`.

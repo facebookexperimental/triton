@@ -42,6 +42,11 @@ arrive barrier. This lets loads from the same TMEM allocation, but different
 subtiles, sink independently around store-channel waits when the channels are
 disjoint.
 
+Plain `ttng.async_tma_store_token_wait` ops do not block TMEM load sinking by
+themselves. They wait for a TMA store to finish reading SMEM, but do not carry
+WS barrier semantics unless they include attached barrier operands. Barrier-
+bearing token waits still block movement like other arrive-like operations.
+
 ## Rollback
 
 The pass keeps a block transformation only when finalized lowering improves the

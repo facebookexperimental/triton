@@ -8,10 +8,15 @@
 // CHECK: ttg.warp_specialize
 // Default group: MMA operations
 // CHECK: default
+// CHECK: ttng.wait_barrier {{.*}}channelGraph = array<i32: {{.*}}direction = "forward"{{.*}}dstTask = {{[0-9]+}} : i32{{.*}}parentId = {{[0-9]+}} : i32
 // CHECK: ttng.tc_gen5_mma
 // Group 0: Descriptor load operations (producer)
 // CHECK: partition0
+// CHECK: ttng.wait_barrier {{.*}}channelGraph = array<i32: {{.*}}direction = "backward"{{.*}}dstTask = {{[0-9]+}} : i32{{.*}}parentId = {{[0-9]+}} : i32
+// CHECK: ttng.barrier_expect
 // CHECK: ttng.async_tma_copy_global_to_local
+// CHECK: ttng.wait_barrier {{.*}}channelGraph = array<i32: {{.*}}direction = "backward"{{.*}}dstTask = {{[0-9]+}} : i32{{.*}}parentId = {{[0-9]+}} : i32
+// CHECK: ttng.barrier_expect
 // CHECK: ttng.async_tma_copy_global_to_local
 // Group 1: Epilogue operations
 // CHECK: partition1

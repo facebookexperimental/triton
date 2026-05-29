@@ -29,6 +29,8 @@ namespace mlir {
 // by later passes.
 struct WSBarrierAttr {
   static constexpr llvm::StringLiteral kKey = "WSBarrier";
+  static constexpr llvm::StringLiteral kDirectionForward = "forward";
+  static constexpr llvm::StringLiteral kDirectionBackward = "backward";
 
   // Destination task ID — the foreign partition this barrier communicates with.
   // Set during insertAsyncComm.
@@ -38,6 +40,10 @@ struct WSBarrierAttr {
   // graph (excluding the source). Set after code partitioning via
   // buildChannelGraph() + injectChannelGraph().
   DenseI32ArrayAttr channelGraph;
+
+  // Direction is only required for direct non-token TTNG endpoints. NVWS token
+  // ops derive direction from their op type.
+  StringAttr direction;
 
   // V2 ordered-region metadata. These fields are optional and only used to
   // relax overlapping channelGraph checks when both barriers came from the same
@@ -57,6 +63,8 @@ struct WSBarrierAttr {
       entries.emplace_back(StringAttr::get(ctx, "channelGraph"), channelGraph);
     if (dstTask)
       entries.emplace_back(StringAttr::get(ctx, "dstTask"), dstTask);
+    if (direction)
+      entries.emplace_back(StringAttr::get(ctx, "direction"), direction);
     if (parentId)
       entries.emplace_back(StringAttr::get(ctx, "parentId"), parentId);
     if (minRegionId)
@@ -81,6 +89,7 @@ struct WSBarrierAttr {
       return attr;
     attr.dstTask = wsBarrier.getAs<IntegerAttr>("dstTask");
     attr.channelGraph = wsBarrier.getAs<DenseI32ArrayAttr>("channelGraph");
+    attr.direction = wsBarrier.getAs<StringAttr>("direction");
     attr.parentId = wsBarrier.getAs<IntegerAttr>("parentId");
     attr.minRegionId = wsBarrier.getAs<IntegerAttr>("minRegionId");
     attr.maxRegionId = wsBarrier.getAs<IntegerAttr>("maxRegionId");
@@ -91,6 +100,13 @@ struct WSBarrierAttr {
   static WSBarrierAttr forDstTask(MLIRContext *ctx, int taskId) {
     WSBarrierAttr attr;
     attr.dstTask = IntegerAttr::get(IntegerType::get(ctx, 32), taskId);
+    return attr;
+  }
+
+  static WSBarrierAttr forDstTaskAndDirection(MLIRContext *ctx, int taskId,
+                                              llvm::StringRef direction) {
+    WSBarrierAttr attr = forDstTask(ctx, taskId);
+    attr.direction = StringAttr::get(ctx, direction);
     return attr;
   }
 };
@@ -212,6 +228,36 @@ static inline bool isWSBarrierForwardToken(Operation *op) {
   return isa<triton::nvws::ProducerCommitOp, triton::nvws::ConsumerWaitOp>(op);
 }
 
+static inline std::optional<bool> isWSBarrierBackwardEndpoint(Operation *op) {
+  if (isWSBarrierBackwardToken(op))
+    return true;
+  if (isWSBarrierForwardToken(op))
+    return false;
+
+  if (!isa<triton::nvidia_gpu::WaitBarrierOp,
+           triton::nvidia_gpu::ArriveBarrierOp>(op))
+    return std::nullopt;
+
+  auto attr =
+      WSBarrierAttr::parse(op->getAttrOfType<DictionaryAttr>("constraints"));
+  if (!attr.direction)
+    return std::nullopt;
+  if (attr.direction.getValue() == WSBarrierAttr::kDirectionBackward)
+    return true;
+  if (attr.direction.getValue() == WSBarrierAttr::kDirectionForward)
+    return false;
+  return std::nullopt;
+}
+
+static inline bool isWSBarrierEndpoint(Operation *op) {
+  return isWSBarrierBackwardEndpoint(op).has_value();
+}
+
+static inline bool isWSBarrierWaitEndpoint(Operation *op) {
+  return isa<triton::nvws::ProducerAcquireOp, triton::nvws::ConsumerWaitOp,
+             triton::nvidia_gpu::WaitBarrierOp>(op);
+}
+
 static inline Operation *getNearestWSBarrierParent(Operation *op) {
   for (Operation *cur = op->getParentOp(); cur; cur = cur->getParentOp()) {
     if (isa<scf::IfOp>(cur))
@@ -330,10 +376,11 @@ buildWSBarrierOpRegionInfo(Operation *scope) {
   return result;
 }
 
-// Initial ordered-region ID assignment for token ops. The parent is the nearest
-// valid ordered parent op: scf.for, scf.while, or the containing tt.func.
-// Backward resource-reuse tokens are shifted into the second half of the
-// parent's region ID space so forward and backward edges are never confused.
+// Initial ordered-region ID assignment for WSBarrier endpoints. The parent is
+// the nearest valid ordered parent op: scf.for, scf.while, or the containing
+// tt.func. Backward resource-reuse endpoints are shifted into the second half
+// of the parent's region ID space so forward and backward edges are never
+// confused.
 static inline DenseMap<Operation *, WSBarrierRegionInfo>
 buildWSBarrierRegionInfo(Operation *scope) {
   auto opRegionInfo = buildWSBarrierOpRegionInfo(scope);
@@ -341,21 +388,22 @@ buildWSBarrierRegionInfo(Operation *scope) {
   for (auto &it : opRegionInfo) {
     Operation *op = it.first;
     const WSBarrierOpRegionInfo &info = it.second;
-    if (!isWSBarrierForwardToken(op) && !isWSBarrierBackwardToken(op))
+    std::optional<bool> isBackward = isWSBarrierBackwardEndpoint(op);
+    if (!isBackward)
       continue;
     if (!info.isValid()) {
       result[op] = {-1, -1};
       continue;
     }
     int regionId = info.regionId;
-    if (isWSBarrierBackwardToken(op))
+    if (*isBackward)
       regionId += info.numRegions;
     result[op] = {info.parentId, regionId, regionId};
   }
   return result;
 }
 
-// Complete the V2 ordered-region summary for each WS token. The V1
+// Complete the V2 ordered-region summary for each WSBarrier endpoint. The V1
 // channelGraph remains a partition reachability set. V2 only adds ordered
 // parent/range information used when two overlapping V1 graphs are compared.
 //
@@ -387,7 +435,8 @@ buildWSBarrierOrderedRegionRanges(
   auto tokenRegionInfo = buildWSBarrierRegionInfo(scope);
   SmallVector<TokenNode> nodes;
   scope->walk([&](Operation *op) {
-    if (!isWSBarrierForwardToken(op) && !isWSBarrierBackwardToken(op))
+    std::optional<bool> isBackward = isWSBarrierBackwardEndpoint(op);
+    if (!isBackward)
       return;
     auto constraints = op->getAttrOfType<DictionaryAttr>("constraints");
     auto attr = WSBarrierAttr::parse(constraints);
@@ -399,12 +448,9 @@ buildWSBarrierOrderedRegionRanges(
     auto regionIt = tokenRegionInfo.find(op);
     if (regionIt == tokenRegionInfo.end())
       return;
-    nodes.push_back(
-        {op, taskIds[0], static_cast<int>(attr.dstTask.getInt()),
-         regionIt->second.parentId, regionIt->second.minRegionId,
-         isWSBarrierBackwardToken(op),
-         isa<triton::nvws::ProducerAcquireOp, triton::nvws::ConsumerWaitOp>(
-             op)});
+    nodes.push_back({op, taskIds[0], static_cast<int>(attr.dstTask.getInt()),
+                     regionIt->second.parentId, regionIt->second.minRegionId,
+                     *isBackward, isWSBarrierWaitEndpoint(op)});
   });
 
   DenseMap<Operation *, WSBarrierRegionInfo> result;
