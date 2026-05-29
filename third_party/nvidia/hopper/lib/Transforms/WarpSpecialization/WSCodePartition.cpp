@@ -39,17 +39,17 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
-// After insertAsyncComm creates token ops with dstTask, inject the
+// After insertAsyncComm creates WSBarrier endpoints with dstTask, inject the
 // channelGraph computed from the full set of channels.
-static void injectChannelGraphOnTokenOps(triton::FuncOp &funcOp,
-                                         ArrayRef<Channel *> channels) {
+static void
+injectChannelGraphOnWSBarrierEndpoints(triton::FuncOp &funcOp,
+                                       ArrayRef<Channel *> channels) {
   auto graph = buildChannelGraph(channels);
   auto regionInfo = buildWSBarrierOrderedRegionRanges(funcOp, graph);
   if (graph.empty())
     return;
   funcOp.walk([&](Operation *op) {
-    if (!isa<ttnvws::ProducerAcquireOp, ttnvws::ProducerCommitOp,
-             ttnvws::ConsumerWaitOp, ttnvws::ConsumerReleaseOp>(op))
+    if (!isWSBarrierEndpoint(op))
       return;
     auto constraints = op->getAttrOfType<DictionaryAttr>("constraints");
     if (!constraints)
@@ -2362,13 +2362,12 @@ static bool replaceCommitWithBarrierSync(
 // addCompletionBarrier is the logic for deciding if the barrier should be
 // directly set by the MMA operation. If False we should have generated
 // a tcgen05.commit Operation instead.
-ttng::WaitBarrierOp
-desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
-                  Value barrierAlloc, Value bufferIdx, Value inPhase,
-                  unsigned numBuffers, Operation *producerOrConsumer,
-                  DenseSet<Operation *> &regionsWithChannels,
-                  mlir::DominanceInfo &dom, bool asProducerAcquire,
-                  ReuseConfig *config, bool addCompletionBarrier) {
+ttng::WaitBarrierOp desyncTCGen5MMAOp(
+    OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
+    Value barrierAlloc, Value bufferIdx, Value inPhase, unsigned numBuffers,
+    Operation *producerOrConsumer, DenseSet<Operation *> &regionsWithChannels,
+    mlir::DominanceInfo &dom, bool asProducerAcquire, ReuseConfig *config,
+    bool addCompletionBarrier, DictionaryAttr waitConstraints = {}) {
   // Attach the barrier as an operand of the mma op, either as producerCommit
   // or consumerRelease.
   builder.setInsertionPoint(mmaOp);
@@ -2414,7 +2413,8 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
   phase = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
       loc, builder.getI32Type(), phase);
   auto waitOp = builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
-      loc, producerBarrier, phase);
+      loc, producerBarrier, phase, /*pred=*/Value(), /*deps=*/ValueRange{},
+      waitConstraints);
   builder.clearLoopScheduleInfo();
   return waitOp;
 
@@ -3366,11 +3366,16 @@ void insertAsyncComm(
           builder.clearLoopScheduleInfo();
         }
         // Still call desyncTCGen5MMAOp to handle the consumer.
+        auto waitConstraints =
+            WSBarrierAttr::forDstTaskAndDirection(
+                funcOp.getContext(), masterChannel->relation.first,
+                WSBarrierAttr::kDirectionForward)
+                .build(funcOp.getContext());
         desyncTCGen5MMAOp(builder, cast<ttng::TCGen5MMAOp>(mmaOp),
                           *commChannel.producerBarrier, bufferIdx, phase,
                           masterChannel->getNumBuffers(), headConsumer,
                           regionsWithChannels, dom, false, config,
-                          addCompletionBarrier);
+                          addCompletionBarrier, waitConstraints);
       }
     }
     // Channel can have multiple consumers.
@@ -3559,10 +3564,15 @@ void insertAsyncComm(
           }
           mmaOp.setIsAsync(true);
         } else {
+          auto waitConstraints = WSBarrierAttr::forDstTaskAndDirection(
+                                     funcOp.getContext(), consumerTaskId,
+                                     WSBarrierAttr::kDirectionBackward)
+                                     .build(funcOp.getContext());
           auto tmemWaitBarrier = desyncTCGen5MMAOp(
               builder, mmaOp, consumerBarrier, bufferIdx, phase,
               masterChannel->getNumBuffers(), producerAcquirePoint,
-              regionsWithChannels, dom, true, config, addCompletionBarrier);
+              regionsWithChannels, dom, true, config, addCompletionBarrier,
+              waitConstraints);
           tmemWaitBarriers[mmaOp] = tmemWaitBarrier;
         }
       }
@@ -3940,10 +3950,15 @@ void insertAsyncComm(
             primaryTaskIds.end())
           additionalConsumerTaskIds.push_back(taskId);
       }
+      auto waitConstraints =
+          WSBarrierAttr::forDstTaskAndDirection(
+              funcOp.getContext(), masterChannel->relation.first,
+              WSBarrierAttr::kDirectionForward)
+              .build(funcOp.getContext());
       optimizeTMALoads(builder, tmaLoads, buffers, *commChannel.producerBarrier,
                        bufferIdx, bufferIdx, phase, tmaHeadProducer,
                        headConsumer, consumerWaitPoint,
-                       additionalConsumerTaskIds, isPost);
+                       additionalConsumerTaskIds, isPost, waitConstraints);
     }
   }
 
@@ -4481,7 +4496,7 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
     funcOp.dump();
   });
 
-  injectChannelGraphOnTokenOps(funcOp, orderedChannels);
+  injectChannelGraphOnWSBarrierEndpoints(funcOp, orderedChannels);
 
   // If loadResult has a single use which is LocalAlloc, we can get rid of
   // sharedLoad and replace all uses of LocalAlloc with viewLoad.
@@ -4726,7 +4741,7 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
     funcOp.dump();
   });
 
-  injectChannelGraphOnTokenOps(funcOp, orderedChannels);
+  injectChannelGraphOnWSBarrierEndpoints(funcOp, orderedChannels);
 
   // Prune any unnecessary barriers related to tgen05.commit
   fuseTcgen05CommitBarriers(funcOp);
