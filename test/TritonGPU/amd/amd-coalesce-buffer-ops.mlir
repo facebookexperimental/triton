@@ -95,15 +95,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 // ptr divisibility = 16 bytes → ptrAlign = 16 / 4 = 4
 // offset divisibility (innermost dim 1) = 16 bytes → offsetAlign = 16 / 4 = 4
 // maxVec = 4; fair-share cap = (128 * 64) / 256 = 32 → final perThread = 4
-// New: sizePerThread = [1, 4], threadsPerWarp = [64, 1], warpsPerCTA = [4, 1]
+// New: sizePerThread = [1, 4], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1]
+// (BlockedEncodingAttr::get distributes warp threads along order[0]=dim1 first:
+//  64/4=16 threads cover dim1, remaining 64/16=4 threads cover dim0)
 
-// CHECK: #[[$BLOCKED_2D:.*]] = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [64, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+// CHECK: #[[$BLOCKED_2D:.*]] = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 // CHECK-LABEL: buffer_load_2d_inner_contiguous
 #blocked5 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [64, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
   tt.func @buffer_load_2d_inner_contiguous(
       %ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32},
-      %offsets: tensor<128x64xi32, #blocked5> {tt.divisibility = dense<[16, 2]> : tensor<2xi32>}) {
+      %offsets: tensor<128x64xi32, #blocked5> {tt.divisibility = dense<[2, 16]> : tensor<2xi32>}) {
     // CHECK: %{{.*}} = ttg.convert_layout %{{.*}} : tensor<128x64xi32, #blocked{{.*}}> -> tensor<128x64xi32, #[[$BLOCKED_2D]]>
     // CHECK: %{{.*}} = amdg.buffer_load %{{.*}}[%{{.*}}] : tensor<128x64xf32, #[[$BLOCKED_2D]]>
     %result = amdg.buffer_load %ptr[%offsets] : tensor<128x64xf32, #blocked5>
