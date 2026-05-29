@@ -490,6 +490,23 @@ private:
             continue; // Already visited
           for (Value result : user->getResults())
             worklist.push_back(result);
+          // When the forward walk enters an scf.if region and hits
+          // scf.yield, continue from the corresponding scf.if result
+          // so the forward set escapes the region. Only follow the
+          // specific result index matching the yield operand to avoid
+          // merging both data partitions' forward sets through a
+          // shared multi-result scf.if.
+          if (auto yieldOp = dyn_cast<scf::YieldOp>(user)) {
+            if (auto ifOp = dyn_cast<scf::IfOp>(user->getParentOp())) {
+              for (OpOperand &operand : yieldOp->getOpOperands()) {
+                if (operand.get() == val) {
+                  unsigned idx = operand.getOperandNumber();
+                  if (idx < ifOp.getNumResults())
+                    worklist.push_back(ifOp.getResult(idx));
+                }
+              }
+            }
+          }
         }
       }
 
