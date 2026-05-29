@@ -103,7 +103,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
   tt.func @buffer_load_2d_inner_contiguous(
       %ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32},
-      %offsets: tensor<128x64xi32, #blocked5> {tt.divisibility = 16 : i32}) {
+      %offsets: tensor<128x64xi32, #blocked5> {tt.divisibility = dense<[16, 2]> : tensor<2xi32>}) {
     // CHECK: %{{.*}} = ttg.convert_layout %{{.*}} : tensor<128x64xi32, #blocked{{.*}}> -> tensor<128x64xi32, #[[$BLOCKED_2D]]>
     // CHECK: %{{.*}} = amdg.buffer_load %{{.*}}[%{{.*}}] : tensor<128x64xf32, #[[$BLOCKED_2D]]>
     %result = amdg.buffer_load %ptr[%offsets] : tensor<128x64xf32, #blocked5>
