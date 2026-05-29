@@ -5,6 +5,8 @@ Based on test_tutorial09_matmul_tma_persistent_warp_specialize from
 test_tutorial09_warp_specialization.py, with an added bias load in the epilogue.
 """
 
+import re
+
 import pytest
 import torch
 import triton
@@ -343,18 +345,7 @@ def addmm_kernel_1d_bias_ws(
         c_desc.store([offs_cm, offs_cn], c)
 
 
-@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
-def test_autows_addmm_hoist_convert_before_broadcast():
-    """Test that convert_layout is hoisted before broadcast in the addmm epilogue.
-
-    Config: BLOCK_M=128, BLOCK_N=128, BLOCK_K=128, EPILOGUE_SUBTILE=1,
-    num_warps=4, num_stages=6.
-
-    This config previously OOM'd because the convert_layout on the 128x128
-    accumulator (64KB SMEM scratch) plus the A/B tile buffers (~197KB)
-    exceeded the 232KB B200 SMEM limit. With the hoist fix, the convert happens
-    on the 1x128 bias (512B scratch) instead, and the kernel fits.
-    """
+def _run_addmm_1d_bias_ws():
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
 
@@ -406,19 +397,39 @@ def test_autows_addmm_hoist_convert_before_broadcast():
             early_tma_store_lowering=True,
         )
 
-        # Verify the TTGIR has the convert before broadcast pattern
-        ttgir = kernel.asm["ttgir"]
-        assert "partition0" in ttgir or "partition1" in ttgir, \
-            "Expected warp specialization partitions in IR"
-
-        # Check that convert_layout on bias happens before broadcast (on 1xN, not MxN)
-        import re
-        cvt_before_bc = re.search(r'convert_layout.*tensor<1x\d+xf32.*\n.*tt\.broadcast.*tensor<1x\d+xf32', ttgir)
-        bc_before_cvt = re.search(
-            r'tt\.broadcast.*tensor<1x\d+xf32.*tensor<128x\d+xf32.*\n.*convert_layout.*tensor<128x\d+xf32', ttgir)
-        assert cvt_before_bc or not bc_before_cvt, \
-            "Expected convert_layout before broadcast (on small 1xN tensor)"
-
-        # Verify correctness: bias_1d + A @ B.T
         ref_out = (torch.matmul(A.to(torch.float32), B.T.to(torch.float32)) + bias_1d.to(torch.float32)).to(dtype)
-        torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
+        return kernel, C, ref_out
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+def test_autows_addmm_hoist_convert_before_broadcast():
+    """Test that convert_layout is hoisted before broadcast in the addmm epilogue.
+
+    Config: BLOCK_M=128, BLOCK_N=128, BLOCK_K=128, EPILOGUE_SUBTILE=1,
+    num_warps=4, num_stages=6.
+
+    This config previously OOM'd because the convert_layout on the 128x128
+    accumulator (64KB SMEM scratch) plus the A/B tile buffers (~197KB)
+    exceeded the 232KB B200 SMEM limit. With the hoist fix, the convert happens
+    on the 1x128 bias (512B scratch) instead, and the kernel fits.
+    """
+    kernel, C, ref_out = _run_addmm_1d_bias_ws()
+
+    # Verify the TTGIR has the convert before broadcast pattern
+    ttgir = kernel.asm["ttgir"]
+    assert "partition0" in ttgir or "partition1" in ttgir, \
+        "Expected warp specialization partitions in IR"
+    assert "ttng.async_tma_copy_local_to_global" in ttgir, "Expected TMA store copy in IR"
+    assert "ttng.async_tma_store_token_wait" in ttgir, "Expected TMA store token wait in IR"
+    assert "tt.descriptor_store" not in ttgir, "Expected descriptor stores to be lowered"
+    assert "can_rotate_by_buffer_count" not in ttgir, "Expected TMA store wait rotation to be resolved"
+
+    # Check that convert_layout on bias happens before broadcast (on 1xN, not MxN)
+    cvt_before_bc = re.search(r'convert_layout.*tensor<1x\d+xf32.*\n.*tt\.broadcast.*tensor<1x\d+xf32', ttgir)
+    bc_before_cvt = re.search(
+        r'tt\.broadcast.*tensor<1x\d+xf32.*tensor<128x\d+xf32.*\n.*convert_layout.*tensor<128x\d+xf32', ttgir)
+    assert cvt_before_bc or not bc_before_cvt, \
+        "Expected convert_layout before broadcast (on small 1xN tensor)"
+
+    # Verify correctness: bias_1d + A @ B.T
+    torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)

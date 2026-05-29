@@ -1,0 +1,70 @@
+name: Compiler LIT Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches-ignore: ['llvm-**']
+  merge_group:
+    branches: [main, 'dev-**']
+    types: [checks_requested]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions: read-all
+
+jobs:
+  lit-tests:
+    name: LIT Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Get LLVM hash
+        id: llvm-hash
+        run: |
+          HASH=$(cat cmake/llvm-hash.txt)
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+          echo "short=${HASH:0:8}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache LLVM
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: llvm-install
+          key: llvm-ubuntu-x64-${{ steps.llvm-hash.outputs.short }}
+
+      - name: Download LLVM
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        run: |
+          TARBALL="llvm-${{ steps.llvm-hash.outputs.short }}-ubuntu-x64.tar.gz"
+          curl -sLO "https://oaitriton.blob.core.windows.net/public/llvm-builds/${TARBALL}"
+          tar xzf "${TARBALL}"
+          mv "llvm-${{ steps.llvm-hash.outputs.short }}-ubuntu-x64" llvm-install
+          rm "${TARBALL}"
+
+      - name: Build and run LIT tests
+        run: |
+          python3 -m pip install cmake ninja lit
+          LLVM="$GITHUB_WORKSPACE/llvm-install"
+          cmake -G Ninja -B build \
+            -DLLVM_INCLUDE_DIRS="$LLVM/include" \
+            -DLLVM_LIBRARY_DIR="$LLVM/lib" \
+            -DLLVM_SYSPATH="$LLVM" \
+            -DTRITON_CODEGEN_BACKENDS="nvidia;amd" \
+            -DTRITON_BUILD_UT=OFF \
+            -DLLVM_EXTERNAL_LIT="$(which lit)" \
+            .
+          ninja -C build check-triton-lit-tests
