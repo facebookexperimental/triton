@@ -73,22 +73,22 @@ jobs:
           . "${SETUP_SCRIPT}"
           . /workspace/tritonbench/.ci/triton/triton_install_utils.sh
           install_triton $PWD
-          uv pip install pytest
+          uv run --active python -m pip install pytest
       - name: Install torchao from source
         run: |
           . "${SETUP_SCRIPT}"
-          uv pip install --no-build-isolation --no-deps "git+https://github.com/pytorch/ao.git"
-          python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
+          uv run --active python -m pip install --no-build-isolation --no-deps "git+https://github.com/pytorch/ao.git"
+          uv run --active python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
       - name: Run TLX unit tests
         timeout-minutes: 5
         run: |
           . "${SETUP_SCRIPT}"
-          uv run pytest python/test/unit/language/test_tlx_*.py -v
+          uv run --active pytest python/test/unit/language/test_tlx_*.py -v
       - name: Run TLX tutorial correctness tests
         timeout-minutes: 5
         run: |
           . "${SETUP_SCRIPT}"
-          uv run pytest third_party/tlx/tutorials/testing/test_correctness.py -v
+          uv run --active pytest third_party/tlx/tutorials/testing/test_correctness.py -v
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
