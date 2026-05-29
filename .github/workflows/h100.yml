@@ -73,11 +73,11 @@ jobs:
           . "${SETUP_SCRIPT}"
           . /workspace/tritonbench/.ci/triton/triton_install_utils.sh
           install_triton $PWD
-          uv run --active python -m pip install pytest
+          uv pip install pytest
       - name: Install torchao from source
         run: |
           . "${SETUP_SCRIPT}"
-          uv run --active python -m pip install --no-build-isolation --no-deps "git+https://github.com/pytorch/ao.git"
+          uv pip install --no-build-isolation --no-deps "git+https://github.com/pytorch/ao.git"
           uv run --active python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
       - name: Run TLX unit tests
         timeout-minutes: 5
