@@ -83,12 +83,12 @@ jobs:
         timeout-minutes: 5
         run: |
           . "${SETUP_SCRIPT}"
-          ${UV_VENV_DIR}/${CONDA_ENV}/bin/pytest python/test/unit/language/test_tlx_*.py -v
+          python -m pytest python/test/unit/language/test_tlx_*.py -v
       - name: Run TLX tutorial correctness tests
         timeout-minutes: 5
         run: |
           . "${SETUP_SCRIPT}"
-          ${UV_VENV_DIR}/$CONDA_ENV/bin/pytest third_party/tlx/tutorials/testing/test_correctness.py -v
+          python -m pytest third_party/tlx/tutorials/testing/test_correctness.py -v
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
