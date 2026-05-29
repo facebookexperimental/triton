@@ -83,7 +83,7 @@ jobs:
         timeout-minutes: 5
         run: |
           . "${SETUP_SCRIPT}"
-          ls $UV_ENV_DIR/$CONDA_ENV/bin
+          ls ${UV_VENV_DIR}/${CONDA_ENV}/bin
           echo $PATH
           which pytest
           which python
@@ -92,9 +92,7 @@ jobs:
         timeout-minutes: 5
         run: |
           . "${SETUP_SCRIPT}"
-          ls $UV_ENV_DIR/$CONDA_ENV/bin
-          echo $PATH
-          $UV_ENVS/$CONDA_ENV/bin/pytest third_party/tlx/tutorials/testing/test_correctness.py -v
+          ${UV_VENV_DIR}/$CONDA_ENV/bin/pytest third_party/tlx/tutorials/testing/test_correctness.py -v
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
