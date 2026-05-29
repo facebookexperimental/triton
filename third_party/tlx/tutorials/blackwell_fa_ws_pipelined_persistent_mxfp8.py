@@ -1434,7 +1434,10 @@ def _softmax_recompute_quantization_iter(
         dq_amax = tl.max(tl.abs(dsT_t))
         dq_amax_bcast = tl.full([DS_M_SUB, BLOCK_N1 // VEC_SIZE], 0.0, tl.float32) + dq_amax
         ds_scale_dq, ds_dq_fp8 = _amax_to_e8m0_and_quantize(
-            dsT_t, dq_amax_bcast, VEC_SIZE, p_dtype,
+            dsT_t,
+            dq_amax_bcast,
+            VEC_SIZE,
+            p_dtype,
         )
         tlx.local_store(
             tlx.local_slice(tlx.local_view(ds_dq_tiles_smem, ds_buf_id), [subtile_id * DS_M_SUB, 0],
@@ -1501,7 +1504,6 @@ def _attn_bwd_mxf8_ws(
     tl.static_assert(NUM_BUFFERS_TMEM == 1)
 
     VEC_SIZE: tl.constexpr = 32
-    LN2: tl.constexpr = 0.6931471824645996
     REP_M: tl.constexpr = triton.cdiv(BLOCK_M1, 128)
     REP_N: tl.constexpr = triton.cdiv(triton.cdiv(BLOCK_N1, VEC_SIZE), 4)
     REP_HEAD: tl.constexpr = triton.cdiv(triton.cdiv(HEAD_DIM, VEC_SIZE), 4)
@@ -2066,7 +2068,7 @@ def _attn_bwd_mxf8_ws(
                         dq = tlx.local_load(dq_slice)
                         if slice_id == (DQ_REDUCE_ITERS - 1):
                             tlx.barrier_arrive(dq_empties[0])
-                        dq = dq * LN2
+                        dq = dq * sm_scale
                         tlx.async_descriptor_store_wait(DQ_REDUCE_STAGES - 1)
                         tlx.local_store(
                             dq_store_buf[dq_smem_idx],
