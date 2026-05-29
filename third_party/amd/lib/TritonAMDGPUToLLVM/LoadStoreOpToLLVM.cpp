@@ -1216,8 +1216,9 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
     unsigned padInterval = 0;
     unsigned padAmount = 0;
     if (auto padEnc = getPaddedEncoding(encoding)) {
-      assert(padEnc.getIntervals().size() == 1 &&
-             padEnc.getPaddings().size() == 1);
+      if (padEnc.getIntervals().size() != 1 || padEnc.getPaddings().size() != 1)
+        return op.emitOpError(
+            "TDM load only supports single interval-padding pairs");
       padInterval = padEnc.getIntervals()[0];
       padAmount = padEnc.getPaddings()[0];
     }
@@ -1316,11 +1317,26 @@ struct AsyncTDMGroupCopyGlobalToLocalOpConversion
     Value warpId = getLaneAndWarpId(rewriter, loc).second;
     Value one = b.i32_val(1);
 
-    auto getGroupSize = [](int groupIdx) { return groupIdx == 1 ? 8 : 4; };
+    constexpr int kNumTDMDescriptorInputGroups = 4;
+    constexpr int kTDMDescriptorGroup0Size = 4;
+    constexpr int kTDMDescriptorGroup1Size = 8;
+    constexpr int kTDMDescriptorPredicateGroup = 0;
+    constexpr int kTDMDescriptorPredicateElement = 0;
+    // The descriptor builder returns groups 0..3.  The hardware intrinsic
+    // also takes a reserved group 4, which is zero-filled at emission time.
+    auto getGroupSize = [](int groupIdx) {
+      return groupIdx == 1 ? kTDMDescriptorGroup1Size
+                           : kTDMDescriptorGroup0Size;
+    };
+    auto isPredicateLane = [](int groupIdx, int elemIdx) {
+      return groupIdx == kTDMDescriptorPredicateGroup &&
+             elemIdx == kTDMDescriptorPredicateElement;
+    };
     auto extractGroupElems = [&](ArrayRef<Value> groups) {
       SmallVector<SmallVector<Value>> elems;
-      elems.reserve(4);
-      for (int groupIdx = 0; groupIdx < 4; ++groupIdx) {
+      elems.reserve(kNumTDMDescriptorInputGroups);
+      for (int groupIdx = 0; groupIdx < kNumTDMDescriptorInputGroups;
+           ++groupIdx) {
         SmallVector<Value> groupElems;
         int groupSize = getGroupSize(groupIdx);
         groupElems.reserve(groupSize);
@@ -1334,8 +1350,9 @@ struct AsyncTDMGroupCopyGlobalToLocalOpConversion
     };
     auto packGroupElems = [&](ArrayRef<SmallVector<Value>> elems) {
       SmallVector<Value> groups;
-      groups.reserve(4);
-      for (int groupIdx = 0; groupIdx < 4; ++groupIdx) {
+      groups.reserve(kNumTDMDescriptorInputGroups);
+      for (int groupIdx = 0; groupIdx < kNumTDMDescriptorInputGroups;
+           ++groupIdx) {
         Type vecTy = groupIdx == 1 ? Type(v8i32Ty) : Type(v4i32Ty);
         Value group = b.undef(vecTy);
         for (auto [elemIdx, elem] : llvm::enumerate(elems[groupIdx]))
@@ -1360,8 +1377,10 @@ struct AsyncTDMGroupCopyGlobalToLocalOpConversion
       unsigned padInterval = 0;
       unsigned padAmount = 0;
       if (auto padEnc = getPaddedEncoding(encoding)) {
-        assert(padEnc.getIntervals().size() == 1 &&
-               padEnc.getPaddings().size() == 1);
+        if (padEnc.getIntervals().size() != 1 ||
+            padEnc.getPaddings().size() != 1)
+          return op.emitOpError(
+              "grouped TDM only supports single interval-padding pairs");
         padInterval = padEnc.getIntervals()[0];
         padAmount = padEnc.getPaddings()[0];
       }
@@ -1387,8 +1406,8 @@ struct AsyncTDMGroupCopyGlobalToLocalOpConversion
           mlir::LLVM::AMD::distributeTDMWarpsAlignToPartition(
               shapePerCTA, effectiveWarps, encoding);
       if (numTDMInstructions != 1)
-        return rewriter.notifyMatchFailure(
-            op, "grouped TDM arm would lower to multiple intrinsics");
+        return op.emitOpError("grouped TDM arm ")
+               << armIdx << " would lower to multiple intrinsics";
 
       mlir::LLVM::AMD::fillTDMDescriptor(
           rewriter, loc, getTypeConverter(), elementType, shapePerCTA, numWarps,
@@ -1398,31 +1417,37 @@ struct AsyncTDMGroupCopyGlobalToLocalOpConversion
           ctaId,
           /*isStore=*/false, warpsPerCTA, warpMask);
 
-      while (desc.size() < 4)
+      while (desc.size() < kNumTDMDescriptorInputGroups)
         desc.push_back(LLVM::ZeroOp::create(rewriter, loc, v4i32Ty));
 
       auto descElems = extractGroupElems(desc);
-      // For regular TDM loads group0[0] is the predicate.  Grouped arms use
-      // disjoint warp masks, so at most one arm predicate can be live for a
-      // wave.  ORing all arm predicates is equivalent to selecting by arm, and
-      // avoids one descriptor-lane select per grouped instruction.  The
-      // remaining descriptor lanes carry addresses/layout fields and still need
-      // per-wave selection.
-      mergedPred = b.or_(mergedPred, descElems[0][0]);
+      // For regular TDM loads group0[0] is the predicate.  fillTDMDescriptor
+      // already ANDs that predicate with the arm warp mask, and the grouped
+      // verifier requires masks to be disjoint.  Therefore ORing all arm
+      // predicates is equivalent to selecting the predicate for the active arm,
+      // and saves one descriptor-lane select per grouped instruction.
+      mergedPred = b.or_(mergedPred, descElems[kTDMDescriptorPredicateGroup]
+                                              [kTDMDescriptorPredicateElement]);
       if (selectedGroupElems.empty()) {
         selectedGroupElems = std::move(descElems);
-        selectedGroupElems[0][0] = mergedPred;
+        selectedGroupElems[kTDMDescriptorPredicateGroup]
+                          [kTDMDescriptorPredicateElement] = mergedPred;
         continue;
       }
 
       Value active = b.icmp_ne(b.and_(b.shl(one, warpId), b.i32_val(warpMask)),
                                b.i32_val(0));
-      for (int groupIdx = 0; groupIdx < 4; ++groupIdx) {
+      for (int groupIdx = 0; groupIdx < kNumTDMDescriptorInputGroups;
+           ++groupIdx) {
         for (int elemIdx = 0; elemIdx < getGroupSize(groupIdx); ++elemIdx) {
-          if (groupIdx == 0 && elemIdx == 0) {
-            selectedGroupElems[groupIdx][elemIdx] = mergedPred;
+          if (isPredicateLane(groupIdx, elemIdx)) {
+            selectedGroupElems[kTDMDescriptorPredicateGroup]
+                              [kTDMDescriptorPredicateElement] = mergedPred;
             continue;
           }
+          // Non-predicate lanes are descriptor fields: base pointers, offsets,
+          // tensor dimensions, strides, and padding controls.  Select each lane
+          // independently so identical SSA values do not grow scalar setup.
           Value armElem = descElems[groupIdx][elemIdx];
           Value &selectedElem = selectedGroupElems[groupIdx][elemIdx];
           if (armElem == selectedElem)
@@ -1431,6 +1456,9 @@ struct AsyncTDMGroupCopyGlobalToLocalOpConversion
         }
       }
     }
+
+    if (selectedGroupElems.empty())
+      return op.emitOpError("requires at least one TDM load arm");
 
     SmallVector<Value> selectedGroups = packGroupElems(selectedGroupElems);
     selectedGroups.push_back(

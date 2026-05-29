@@ -637,6 +637,19 @@ LogicalResult validateWarpUsedHint(Operation *op, uint32_t hint,
 
   return success();
 }
+
+LogicalResult verifySingleTDMPaddingPair(
+    Operation *op, gpu::PaddedSharedEncodingAttr paddedEnc, StringRef subject) {
+  if (!paddedEnc)
+    return success();
+
+  if (paddedEnc.getIntervals().size() == 1 &&
+      paddedEnc.getPaddings().size() == 1)
+    return success();
+
+  return op->emitOpError() << subject
+                           << " only supports single interval-padding pairs";
+}
 } // namespace
 
 LogicalResult AsyncTDMCopyGlobalToLocalOp::verify() {
@@ -678,6 +691,11 @@ LogicalResult AsyncTDMCopyGlobalToLocalOp::verify() {
   if (!paddedEnc && !swizzledEnc && !partitionedEnc)
     return emitOpError("Invalid shared memory layout for TDM");
 
+  if (failed(verifySingleTDMPaddingPair(
+          getOperation(), gpu::getPaddedEncoding(smemTy.getEncoding()),
+          "TDM load")))
+    return failure();
+
   Type elementType = smemTy.getElementType();
   auto elementBitWidth = elementType.getIntOrFloatBitWidth();
   if (paddedEnc) {
@@ -714,8 +732,9 @@ LogicalResult AsyncTDMCopyGlobalToLocalOp::verify() {
     if (partitionedEnc) {
       unsigned partitionDim = partitionedEnc.getPartitionDim();
       unsigned numLogicalPieces = partitionedEnc.getNumLogicalPieces();
-      assert(numLogicalPieces > 0 &&
-             "PartitionedSharedEncoding must have numLogicalPieces >= 1");
+      if (numLogicalPieces == 0)
+        return emitOpError(
+            "PartitionedSharedEncoding must have numLogicalPieces >= 1");
       unsigned K = llvm::popcount(hint);
       if (K % numLogicalPieces != 0)
         return emitOpError(
@@ -800,15 +819,36 @@ LogicalResult AsyncTDMGroupCopyGlobalToLocalOp::verify() {
     if (swizzledEnc && swizzledEnc.getMaxPhase() != 1)
       return emitOpError("TDM does not support swizzling");
 
-    auto paddedEnc =
+    auto directPaddedEnc =
         llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(dstTy.getEncoding());
     auto partitionedEnc =
         llvm::dyn_cast<gpu::PartitionedSharedEncodingAttr>(dstTy.getEncoding());
-    if (!paddedEnc && !swizzledEnc && !partitionedEnc)
+    if (!directPaddedEnc && !swizzledEnc && !partitionedEnc)
       return emitOpError("Invalid shared memory layout for TDM");
 
+    if (failed(verifySingleTDMPaddingPair(
+            getOperation(), gpu::getPaddedEncoding(dstTy.getEncoding()),
+            "grouped TDM")))
+      return failure();
+
     if (partitionedEnc) {
+      auto partitionLayout = partitionedEnc.getPartitionLayout();
+      auto innerSwizzled =
+          llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(partitionLayout);
+      if (innerSwizzled && innerSwizzled.getMaxPhase() != 1)
+        return emitOpError(
+            "TDM does not support swizzling in partitioned layout");
+
+      auto innerPadded =
+          llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(partitionLayout);
+      if (!innerPadded && !innerSwizzled)
+        return emitOpError(
+            "Invalid inner layout for partitioned shared memory in TDM");
+
       unsigned numLogicalPieces = partitionedEnc.getNumLogicalPieces();
+      if (numLogicalPieces == 0)
+        return emitOpError(
+            "PartitionedSharedEncoding must have numLogicalPieces >= 1");
       unsigned K = llvm::popcount(mask);
       if (maybeNumWarps && K % numLogicalPieces != 0)
         return emitOpError(
