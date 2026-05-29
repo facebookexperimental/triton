@@ -587,31 +587,31 @@ namespace {
 // Validate `warp_used_hint` against the axis-aligned hint rule (see
 // TritonAMDGPUOps.td).  Encoding-specific rules (e.g.
 // PartitionedSharedEncoding) live in verify() since they need the result type.
-LogicalResult validateWarpUsedHint(Operation *op, uint32_t hint,
-                                   int64_t numWarps) {
+template <typename OpT>
+LogicalResult validateWarpUsedHint(OpT op, uint32_t hint, int64_t numWarps) {
   if (!llvm::isPowerOf2_64(numWarps))
-    return op->emitOpError("num_warps must be a power of two when using "
-                           "warp_used_hint, got ")
+    return op.emitOpError("num_warps must be a power of two when using "
+                          "warp_used_hint, got ")
            << numWarps;
 
   if (numWarps >= 32)
-    return op->emitOpError("num_warps must be less than 32 when using "
-                           "warp_used_hint, got ")
+    return op.emitOpError("num_warps must be less than 32 when using "
+                          "warp_used_hint, got ")
            << numWarps;
 
   if (hint == 0)
-    return op->emitOpError("warp_used_hint must have at least one bit set");
+    return op.emitOpError("warp_used_hint must have at least one bit set");
 
   // Bits above num_warps - 1 must be zero (no warp at those positions).
   uint32_t numWarpsMask = (uint32_t{1} << numWarps) - 1;
   if ((hint & ~numWarpsMask) != 0)
-    return op->emitOpError("warp_used_hint = ")
+    return op.emitOpError("warp_used_hint = ")
            << llvm::formatv("{0:x}", hint)
            << " sets bits beyond num_warps = " << numWarps;
 
   unsigned K = llvm::popcount(hint);
   if (!llvm::isPowerOf2_32(K))
-    return op->emitOpError("popcount(warp_used_hint) = ")
+    return op.emitOpError("popcount(warp_used_hint) = ")
            << K << " must be a power of two (got hint "
            << llvm::formatv("{0:x}", hint) << ")";
 
@@ -629,7 +629,7 @@ LogicalResult validateWarpUsedHint(Operation *op, uint32_t hint,
   unsigned logK = llvm::Log2_32(K);
   unsigned spanned = static_cast<unsigned>(llvm::popcount(support));
   if (spanned != logK)
-    return op->emitOpError("warp_used_hint = ")
+    return op.emitOpError("warp_used_hint = ")
            << llvm::formatv("{0:x}", hint) << " is not axis-aligned: K = " << K
            << " active warps span " << spanned
            << " warpId bit positions, but an axis-aligned hint "
@@ -723,7 +723,7 @@ LogicalResult AsyncTDMCopyGlobalToLocalOp::verify() {
   if (auto warpUsedHintAttr = getWarpUsedHintAttr()) {
     int numWarps = gpu::lookupNumWarps(*this);
     uint32_t hint = static_cast<uint32_t>(warpUsedHintAttr.getInt());
-    if (failed(validateWarpUsedHint(getOperation(), hint, numWarps)))
+    if (failed(validateWarpUsedHint(*this, hint, numWarps)))
       return failure();
 
     // PartitionedSharedEncoding: hinted path = single instruction, so
@@ -788,7 +788,7 @@ LogicalResult AsyncTDMGroupCopyGlobalToLocalOp::verify() {
     int32_t maskSigned = getWarpMasks()[armIdx];
     uint32_t mask = static_cast<uint32_t>(maskSigned);
     if (maybeNumWarps &&
-        failed(validateWarpUsedHint(getOperation(), mask, *maybeNumWarps)))
+        failed(validateWarpUsedHint(*this, mask, *maybeNumWarps)))
       return failure();
     if ((seenMask & mask) != 0)
       return emitOpError("warp masks must be disjoint; arm ")
