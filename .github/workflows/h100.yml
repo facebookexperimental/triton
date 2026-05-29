@@ -70,11 +70,9 @@ jobs:
           nvidia-smi
       - name: Compile Triton
         run: |
-          set -x
           . "${SETUP_SCRIPT}"
           . /workspace/tritonbench/.ci/triton/triton_install_utils.sh
           install_triton $PWD
-          python -c "import triton.language.extra.tlx as tlx"
       - name: Install torchao from source
         run: |
           . "${SETUP_SCRIPT}"
@@ -83,18 +81,13 @@ jobs:
       - name: Run TLX unit tests
         timeout-minutes: 5
         run: |
-          set -x
-          . ${UV_VENV_DIR}/${CONDA_ENV}/bin/activate
-          cat ${SETUP_SCRIPT}
           . "${SETUP_SCRIPT}"
-          . ${UV_VENV_DIR}/${CONDA_ENV}/bin/activate
-          pytest python/test/unit/language/test_tlx_*.py -v
+          uv run pytest python/test/unit/language/test_tlx_*.py -v
       - name: Run TLX tutorial correctness tests
         timeout-minutes: 5
         run: |
           . "${SETUP_SCRIPT}"
-          . ${UV_VENV_DIR}/${CONDA_ENV}/bin/activate
-          pytest third_party/tlx/tutorials/testing/test_correctness.py -v
+          uv run pytest third_party/tlx/tutorials/testing/test_correctness.py -v
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
