@@ -1153,10 +1153,11 @@ schedulePostLoopOps(scf::ForOp loop, PartitionSet &schedule,
     Operation *user = use->getOwner();
     if (!visited.insert(user).second)
       continue;
-    // Skip ops inside nested inner loops. Ops directly in the ws-loop
-    // body (post-inner-loop) or outside the ws-loop are processed.
+    // Skip ops inside loops nested deeper than `loop`. Ops directly in
+    // `loop`'s body, in an enclosing loop (persistent tile loop), or at
+    // function level are all valid post-loop epilogue candidates.
     if (auto parentLoop = user->getParentOfType<scf::ForOp>())
-      if (parentLoop != loop)
+      if (loop->isProperAncestor(parentLoop))
         continue;
 
     { // Schedule post-loop op (override earlier phase assignments)
