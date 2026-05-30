@@ -105,7 +105,43 @@ Sample IR after APPLY (excerpt):
 
 3. **Numerical correctness on v8/v10 isn't yet hardware-verified.** Lit tests prove the rewrite produces valid IR. The `replaceAllUsesWith` + `concat` pattern is straight from `WSDataPartition`'s playbook so semantic equivalence is high-confidence, but hardware run is the only definitive test.
 
-## File list
+## e2e validation (added 2026-05-30)
+
+Stand-alone autotuned matmul (`~/AMD/triton/claude/triton_kernels_baseline/_one_run_envcompare.py`),
+K=4096, BM=BN=256, BK=64, num_warps=8 (autotune-picked), on the
+`metamain2` conda env:
+
+| Mode | TFLOPS | Δ vs baseline | PyTorch match |
+|---|---:|---:|---|
+| Baseline (no TTGIR_SCHED)                | 850.24 | — | ✅ |
+| `TTGIR_SCHED=1` (planning only)          | 850.53 | +0.03 % (noise) | ✅ |
+| `TTGIR_SCHED=1 + TTGIR_SCHED_APPLY=1`   | 839.03 | **-1.3 %** (within ±5 % bar) | ✅ |
+
+Headline:
+- **Planning mode is a true no-op** (delta is run-to-run noise).
+- **APPLY mode is numerically correct** (PyTorch reference matched after
+  the 8 × 8 = 64 sub-dots + concat rewrite).
+- **APPLY perf is within the ±5 % success criterion** — the small delta
+  reflects LLVM-side scheduling/RA differences on the rewritten IR;
+  Phase 2 doesn't yet add a beneficial reorder or sched_barrier (that's
+  Phase 3's job).
+
+**v8 from METAMD cannot be tested directly on `metamain2`** because
+`v8_beyond_hotloop` imports `triton.experimental.gluon.language.amd.cdna3.extract_slice`,
+which exists only on the matmul_4waves branch of ROCm/triton (the
+`amd-triton` conda env). MetaMain2/triton's gluon.amd.cdna3 module
+doesn't have it. This is the same `ImportError: cannot import name
+'extract_slice'` we saw earlier when trying v8 on the `oss` env (see
+the `gl_matmul_passes_summary.md` discussion).
+
+Workarounds for the next session if a v8/v10-style validation is wanted:
+  1. Port the `cdna3.extract_slice` op from matmul_4waves to MetaMain2's
+     gluon AMD language (small port), OR
+  2. Use a vanilla autotuned matmul (as done here) as the e2e proxy — it
+     also lowers to MFMA `tt.dot` and exercises the same pass paths, OR
+  3. Build a synthetic Gluon-equivalent v8 kernel using only ops
+     MetaMain2 has natively.
+
 
 ```
 ~/MetaMain2/triton/
