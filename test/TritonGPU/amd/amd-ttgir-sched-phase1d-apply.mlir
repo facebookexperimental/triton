@@ -10,18 +10,16 @@
 // Gated behind a separate env var TRITON_TTGIR_SCHED_APPLY=1 (default off)
 // so the existing TRITON_ENABLE_TTGIR_SCHED=1 keeps planning-only behavior.
 
-// Case A: v8-shaped dot, blockM=256, instrM=16, warpsPerCTA[0]=2,
-// so ctaTileM=32, numPartitions=256/32=8. Expect:
-//   - 8 amdgpu.extract_slice for A (each tensor<32x64>)
-//   - 8 amdgpu.extract_slice for C (each tensor<32x128>)
-//   - 8 tt.dot (each producing tensor<32x128xf32, #mma>)
-//   - 1 amdgpu.concat combining the 8 sub-results back to tensor<256x128xf32>
-//   - The original tt.dot is erased.
+// Case A: v8-shaped dot, blockM=256 blockN=128, instr=[16,16,32],
+// warpsPerCTA=[2,2]. ctaTileM=ctaTileN=32. numPartitionsM=8, numPartitionsN=4.
+// Total: 8 × 4 = 32 sub-dots each producing tensor<32x32xf32, #mma>.
+// Slices: 8 of A, 4 of B, 32 of C → 44 extract_slice.
+// 1 concat reassembles tensor<256x128xf32, #mma>.
 
 // CHECK-LABEL: tt.func @v8_like_dot_applied
 // CHECK:       scf.for
-// CHECK-COUNT-8: amdg.extract_slice {{.*}} : tensor<256x64xf16,{{.*}}> to tensor<32x64xf16
-// CHECK-COUNT-8: tt.dot {{.*}} -> tensor<32x128xf32
+// CHECK-COUNT-44: amdg.extract_slice
+// CHECK-COUNT-32: tt.dot {{.*}} -> tensor<32x32xf32
 // CHECK:       amdg.concat
 // CHECK-NOT:   tt.dot {{.*}} -> tensor<256x128xf32
 // CHECK:       scf.yield

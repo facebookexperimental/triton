@@ -20,18 +20,18 @@
 //    `WSDataPartition::getForwardSliceToPartition`
 //    (third_party/nvidia/hopper/.../WSDataPartition.cpp:441), stripped
 //    of Hopper-only branches. **Still does not mutate IR.**
-//  - Phase 1d (this commit): actual SSA mutation. Gated behind a separate
-//    env var `TRITON_TTGIR_SCHED_APPLY=1` (default off) so the existing
-//    `TRITON_ENABLE_TTGIR_SCHED=1` keeps planning-only behavior. When
-//    applied, each plan's dot is replaced by N small dots sliced along M,
-//    glued back via `amdgpu.concat`. The producer chain is NOT modified
-//    in this sub-step (extract_slice is a no-op at the CTA-tile level, so
-//    the upstream layout is preserved). This is the minimal mutation that
-//    exposes N dots at TTGIR for later scheduling. Plan-level `numPartitions`
-//    is now CTA-tile-aware: `blockM / (instrM * warpsPerCTA[0])` instead
-//    of `blockM / instrM`, to satisfy the extract_slice verifier's
-//    "source/destination must have matching CTA-tile layouts" constraint.
-//  - Phases 2-6: N-split, schedule recipe + sched.barrier lowering, etc.
+//  - Phase 1d (6cc0e7545): actual SSA mutation. Gated behind
+//    `TRITON_TTGIR_SCHED_APPLY=1`. M-only split.
+//  - Phase 2 (this commit): compose N-split on top of M-split. Same
+//    APPLY gate now produces an M × N grid of sub-dots (8 × 4 = 32 for
+//    v8/v10) glued back via a single amdgpu.concat in row-major order.
+//    blockN-aware analog of `planMSplit`: `ctaTileN = instrN * warpsPerCTA[1]`,
+//    `numPartitionsN = blockN / ctaTileN`. For v8/v10 with BN=128 and
+//    warpsPerCTA[1]=2, ctaTileN=32 → numPartitionsN=4. B is now sliced
+//    along its N dim too (where M-split left B untouched). C is sliced
+//    along both M and N.
+//  - Phases 3-6: schedule recipe + sched.barrier lowering, coverage
+//    matrix, default-disable LLIR, docs.
 //
 // Opt-in behind `TRITON_ENABLE_TTGIR_SCHED=1`.
 //
@@ -67,6 +67,13 @@ struct DotPartitionPlan {
   unsigned ctaTileM;        // instrM * warpsPerCTA[0]; e.g. 32 for v8/v10.
   unsigned numPartitions;   // blockM / ctaTileM; e.g. 8 for v8/v10.
   unsigned tileM;           // ctaTileM (i.e. M dim of each sub-dot result).
+  // Phase 2: N-split fields.
+  unsigned blockN;          // BLOCK_N; e.g. 128 for v8/v10's left/right half.
+  unsigned instrN;          // MFMA instr N; e.g. 16 for [16,16,32].
+  unsigned ctaTileN;        // instrN * warpsPerCTA[1]; e.g. 32 for v8/v10.
+  unsigned numPartitionsN;  // blockN / ctaTileN; e.g. 4 for v8/v10. 0 = no
+                            //   N-split (numPartitions < 2 for N).
+  unsigned tileN;           // ctaTileN.
 };
 
 static triton::gpu::AMDMfmaEncodingAttr getMfmaEncoding(triton::DotOp dotOp) {
@@ -87,26 +94,38 @@ static std::optional<DotPartitionPlan> planMSplit(triton::DotOp dotOp) {
   auto instrShape = mfmaEnc.getInstrShape();
   if (instrShape.size() < 2)
     return std::nullopt;
-  // ctaTileM = instrM * warpsPerCTA[0]; required so that `amdgpu.extract_slice`
-  // sees source/destination tensors with matching CTA-tile layouts (the op
-  // verifier rejects sub-CTA-tile slices). For v8/v10 with warpsPerCTA=[2,2]
-  // and instr=16, ctaTileM = 32, so numPartitions = BLOCK_M(256) / 32 = 8.
   auto warpsPerCTA = mfmaEnc.getWarpsPerCTA();
   if (warpsPerCTA.size() < 2)
     return std::nullopt;
   unsigned blockM = static_cast<unsigned>(resultShape[0]);
+  unsigned blockN = static_cast<unsigned>(resultShape[1]);
   unsigned instrM = instrShape[0];
+  unsigned instrN = instrShape[1];
   unsigned warpsM = warpsPerCTA[0];
-  if (instrM == 0 || warpsM == 0)
+  unsigned warpsN = warpsPerCTA[1];
+  if (instrM == 0 || warpsM == 0 || instrN == 0 || warpsN == 0)
     return std::nullopt;
+
+  // M split (required for the plan to be valid).
   unsigned ctaTileM = instrM * warpsM;
   if (blockM % ctaTileM != 0)
     return std::nullopt;
   unsigned numPartitions = blockM / ctaTileM;
   if (numPartitions < 2)
     return std::nullopt;
+
+  // N split (optional — falls back to 1 partition if it can't divide).
+  unsigned ctaTileN = instrN * warpsN;
+  unsigned numPartitionsN = 0;
+  if (blockN % ctaTileN == 0) {
+    unsigned candidate = blockN / ctaTileN;
+    if (candidate >= 2)
+      numPartitionsN = candidate;
+  }
+
   return DotPartitionPlan{dotOp, blockM, instrM, ctaTileM, numPartitions,
-                          ctaTileM};
+                          ctaTileM, blockN, instrN, ctaTileN,
+                          numPartitionsN, ctaTileN};
 }
 
 //===----------------------------------------------------------------------===//
@@ -333,44 +352,75 @@ static Value buildExtractSliceAlongDim(OpBuilder &builder, Location loc,
       builder, loc, sliceType, src, builder.getDenseI64ArrayAttr(offsets));
 }
 
-/// Apply the M-split rewrite for one plan. Replaces
+/// Apply the M-(and optionally N-)split rewrite for one plan. Replaces
 ///   %D = tt.dot %A, %B, %C
-/// with
-///   %A_0  = amdgpu.extract_slice %A [0, 0]
-///   %C_0  = amdgpu.extract_slice %C [0, 0]
-///   %D_0  = tt.dot %A_0, %B, %C_0
-///   %A_1  = amdgpu.extract_slice %A [ctaTileM, 0]
-///   ...
-///   %D = amdgpu.concat %D_0, %D_1, ..., %D_{N-1}
+/// with an M × N grid of small dots, where
+///   %A_i  = amdgpu.extract_slice %A [i*ctaTileM, 0]      (M dim only)
+///   %B_j  = amdgpu.extract_slice %B [0, j*ctaTileN]      (N dim only)
+///   %C_ij = amdgpu.extract_slice %C [i*ctaTileM, j*ctaTileN]
+///   %D_ij = tt.dot %A_i, %B_j, %C_ij
+/// then
+///   %D = amdgpu.concat %D_00, %D_01, ..., %D_{M-1,N-1}
+/// in row-major (M outer, N inner) order.
 ///
-/// `%B` is shared across all partitions (M-split doesn't touch the B/N dim).
-/// Producer ops are NOT modified here — `extract_slice` is a no-op at the
-/// CTA-tile level so the upstream tile layout is preserved. Phase 2 will
-/// also slice along N (composing with this).
+/// If `plan.numPartitionsN < 2`, the N-split is skipped (degenerates to the
+/// pure-M case from Phase 1d). Producer chains are NOT modified — the
+/// extract_slices are CTA-tile no-ops upstream so the existing layouts are
+/// preserved.
 static LogicalResult applyMSplit(const DotPartitionPlan &plan) {
   triton::DotOp dot = plan.dotOp;
   OpBuilder builder(dot);
   Location loc = dot.getLoc();
-  unsigned n = plan.numPartitions;
-  unsigned tile = plan.tileM;
+  unsigned nM = plan.numPartitions;
+  unsigned tileM = plan.tileM;
+  unsigned nN = plan.numPartitionsN >= 2 ? plan.numPartitionsN : 1;
+  unsigned tileN = nN > 1 ? plan.tileN : plan.blockN;
 
   SmallVector<Value> partialResults;
-  partialResults.reserve(n);
-  for (unsigned i = 0; i < n; ++i) {
-    int64_t off = static_cast<int64_t>(i) * tile;
-    Value aSlice = buildExtractSliceAlongDim(builder, loc, dot.getA(),
-                                             /*dim=*/0, off, tile);
-    Value cSlice = buildExtractSliceAlongDim(builder, loc, dot.getC(),
-                                             /*dim=*/0, off, tile);
-    // Result type of the small dot mirrors the sliced C.
-    auto smallResultType = cast<RankedTensorType>(cSlice.getType());
-    auto smallDot = triton::DotOp::create(
-        builder, loc, smallResultType, aSlice, dot.getB(), cSlice,
-        dot.getInputPrecisionAttr(), dot.getMaxNumImpreciseAccAttr());
-    partialResults.push_back(smallDot.getResult());
+  partialResults.reserve(nM * nN);
+
+  // Pre-build B slices (one per N partition), then reuse across all M-i.
+  SmallVector<Value> bSlices;
+  bSlices.reserve(nN);
+  if (nN > 1) {
+    for (unsigned j = 0; j < nN; ++j) {
+      int64_t offN = static_cast<int64_t>(j) * tileN;
+      bSlices.push_back(buildExtractSliceAlongDim(builder, loc, dot.getB(),
+                                                  /*dim=*/1, offN, tileN));
+    }
+  } else {
+    bSlices.push_back(dot.getB());
   }
 
-  // Concat all sub-dot results back into the original tensor shape.
+  // Row-major: M outer, N inner. amdgpu.concat treats its operands as a
+  // row-major n-D grid (see ConcatOp description).
+  for (unsigned i = 0; i < nM; ++i) {
+    int64_t offM = static_cast<int64_t>(i) * tileM;
+    Value aSlice = buildExtractSliceAlongDim(builder, loc, dot.getA(),
+                                             /*dim=*/0, offM, tileM);
+    for (unsigned j = 0; j < nN; ++j) {
+      Value cSlice;
+      if (nN > 1) {
+        // C is 2-D; slice along both M and N.
+        auto cType = cast<RankedTensorType>(dot.getC().getType());
+        auto smallCType = sliceTensorType(
+            sliceTensorType(cType, /*dim=*/0, tileM), /*dim=*/1, tileN);
+        SmallVector<int64_t> offsets = {offM, static_cast<int64_t>(j) * tileN};
+        cSlice = triton::amdgpu::ExtractSliceOp::create(
+            builder, loc, smallCType, dot.getC(),
+            builder.getDenseI64ArrayAttr(offsets));
+      } else {
+        cSlice = buildExtractSliceAlongDim(builder, loc, dot.getC(),
+                                           /*dim=*/0, offM, tileM);
+      }
+      auto smallResultType = cast<RankedTensorType>(cSlice.getType());
+      auto smallDot = triton::DotOp::create(
+          builder, loc, smallResultType, aSlice, bSlices[j], cSlice,
+          dot.getInputPrecisionAttr(), dot.getMaxNumImpreciseAccAttr());
+      partialResults.push_back(smallDot.getResult());
+    }
+  }
+
   auto fullType = cast<RankedTensorType>(dot.getResult().getType());
   auto concat = triton::amdgpu::ConcatOp::create(builder, loc, fullType,
                                                  partialResults);
@@ -408,7 +458,7 @@ struct TritonAMDGPUDotDecomposeAndSchedulePass
     // candidate dot with N sliced sub-dots + concat). Default off so the
     // existing TRITON_ENABLE_TTGIR_SCHED=1 keeps planning-only behavior.
     bool apply = triton::tools::getBoolEnv("TRITON_TTGIR_SCHED_APPLY");
-    const char *modeSuffix = apply ? "phase 1d: applied" : "phase 1d: plan only";
+    const char *modeSuffix = apply ? "phase 2: applied" : "phase 2: plan only";
 
     ModuleOp module = getOperation();
     unsigned numForOps = 0;
@@ -492,7 +542,7 @@ struct TritonAMDGPUDotDecomposeAndSchedulePass
               << plan.numPartitions << " (blockM=" << plan.blockM
               << " / ctaTileM=" << plan.ctaTileM << "), co-partitioning "
               << producerCount << " producer op(s) + " << userCount
-              << " user op(s) (phase 1d: plan only)";
+              << " user op(s) (" << modeSuffix << ")";
           continue;
         }
 
