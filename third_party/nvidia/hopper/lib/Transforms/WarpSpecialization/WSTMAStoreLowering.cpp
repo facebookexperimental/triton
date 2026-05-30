@@ -231,13 +231,10 @@ static Operation *getDefiningTMAStoreOp(ttng::TMAStoreTokenWaitOp waitOp,
   return nullptr;
 }
 
-// Legacy wrapper for callers that only need AsyncTMACopyLocalToGlobalOp.
-static ttng::AsyncTMACopyLocalToGlobalOp
-getDefiningTMAStore(ttng::TMAStoreTokenWaitOp waitOp) {
-  Value buffer;
-  auto *op = getDefiningTMAStoreOp(waitOp, buffer);
-  return dyn_cast_or_null<ttng::AsyncTMACopyLocalToGlobalOp>(op);
-}
+// (Previously a legacy AsyncTMACopyLocalToGlobalOp-only wrapper lived here;
+// it silently dropped AsyncTMAReduceOp-based tokens such as dq's TMA reduce
+// staging, defeating doTMAStoreWaitReorder for those waits. Callers now use
+// getDefiningTMAStoreOp directly so both store flavors are handled.)
 
 void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp) {
   MLIRContext *ctx = funcOp.getContext();
@@ -338,13 +335,14 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
     }
 
     // Collect annotated TMA store waits that are direct children of this
-    // loop and whose defining TMA store is in the same loop.
+    // loop and whose defining TMA store (or reduce) is in the same loop.
     SmallVector<ttng::TMAStoreTokenWaitOp> waits;
     for (auto &op : forOp.getBody()->without_terminator()) {
       auto waitOp = dyn_cast<ttng::TMAStoreTokenWaitOp>(&op);
       if (!waitOp || !waitOp->hasAttr(kCanRotateByBufferCount))
         continue;
-      auto tmaStore = getDefiningTMAStore(waitOp);
+      Value buffer;
+      auto *tmaStore = getDefiningTMAStoreOp(waitOp, buffer);
       if (!tmaStore || tmaStore->getParentOp() != forOp)
         continue;
       waits.push_back(waitOp);
@@ -359,8 +357,9 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
         continue;
       int k = attr.getInt();
 
-      // Find the defining TMA store op.
-      auto tmaStore = getDefiningTMAStore(waitOp);
+      // Find the defining TMA store-like op (copy_local_to_global or reduce).
+      Value buffer;
+      auto *tmaStore = getDefiningTMAStoreOp(waitOp, buffer);
       if (!tmaStore)
         continue;
 
@@ -416,12 +415,29 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
         // Insert a new cluster for our wait between the split halves.
         auto waitCluster = schedule.clusters.newBefore(targetCluster);
         schedule.insert(waitOp, targetStage, waitCluster);
+        // NOTE: we update the SWP schedule only. We do not physically
+        // move the wait op in source order — the LinearizedIterator's
+        // K-th forward TMA store can resolve to an insertion target that
+        // is earlier than the defining store in source (the wrap-around
+        // returns the same body op at a future stage), so a blind
+        // moveBefore would violate SSA dominance. For WS partition loops
+        // where SWP ExpandLoops does not source-reorder the body the net
+        // effect today is that `NVGPUTMAStoreTokenWaitLowering` will see
+        // 0 stores between the defining store and the wait and emit
+        // `pendings = 0`. Realising the rotation in source order is
+        // tracked as future work; until then the planner-side
+        // `buffer.copy > 1` only adds extra slots without overlap.
       } else {
         // Target not found; leave the schedule unchanged for this wait.
         continue;
       }
 
-      waitOp->removeAttr(kCanRotateByBufferCount);
+      // Leave the kCanRotateByBufferCount annotation in place. The lowering
+      // pass (computePendings) consumes it as a "trusted planner" signal when
+      // the source-order TMA store count between the defining store and this
+      // wait is less than K-1 (which happens when no source-level reorder
+      // occurred, e.g., for WS partition loops where SWP ExpandLoops does
+      // not peel based on the cluster/stage schedule update above).
       changed = true;
     }
 
@@ -457,10 +473,33 @@ static int countTMAStoresInRange(Block::iterator from, Block::iterator to) {
 }
 
 // Compute the pendings value for a TMAStoreTokenWaitOp.
-// pendings = number of AsyncTMACopyLocalToGlobalOp ops issued after the token's
-// defining store and before this wait, in program execution order.
+//
+// Primary signal: the number of AsyncTMACopyLocalToGlobalOp / AsyncTMAReduceOp
+// ops issued between the token's defining store and this wait, in program
+// execution order. That count directly maps to the CUDA "tma_store_wait N"
+// semantics ("wait until at most N stores are still in flight") when source
+// order matches execution order, which is the case after SWP ExpandLoops has
+// peeled an outer loop.
+//
+// Fallback (Option C): when the source-order count is less than K-1 but the
+// wait carries the planner's `can_rotate_by_buffer_count = K` annotation with
+// K > 1, return K-1. This trusts the planner's intent: it allocated K rotating
+// slots and verified the launch pattern is round-robin-safe, so K-1 stores
+// from the same group may safely remain in flight when we wait on this token.
+// This is what makes per-iteration dq subtile rotation actually pipeline in
+// WS partition loops, where the cluster/stage schedule update from
+// doTMAStoreWaitReorder does not translate into a source-order rewrite.
+//
+// Option C only fires when we successfully matched a defining store (direct
+// or loop-carried via scf.for block-arg). When neither pattern matches (e.g.,
+// kernel-exit drain whose token is an scf.for / cf.br result), we fall back
+// to the conservative pendings = 0 (full drain) rather than trusting the
+// annotation in a context we don't understand.
 static int computePendings(ttng::TMAStoreTokenWaitOp waitOp) {
   Value token = waitOp.getToken();
+
+  int sourceCount = 0;
+  bool matchedDefiningStore = false;
 
   // Direct case: token defined by a TMA store-like op in same block.
   auto directDef = token.getDefiningOp();
@@ -468,45 +507,48 @@ static int computePendings(ttng::TMAStoreTokenWaitOp waitOp) {
       isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
           directDef)) {
     if (directDef->getBlock() == waitOp->getBlock()) {
-      return countTMAStoresInRange(std::next(directDef->getIterator()),
-                                   waitOp->getIterator());
+      sourceCount = countTMAStoresInRange(std::next(directDef->getIterator()),
+                                          waitOp->getIterator());
+      matchedDefiningStore = true;
     }
-    return 0;
+  } else if (auto blockArg = dyn_cast<BlockArgument>(token)) {
+    // Loop-carried case: token is a block argument of an scf.for body.
+    if (auto forOp = dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp())) {
+      unsigned iterArgIdx = blockArg.getArgNumber() - 1;
+      auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+      Value yieldedVal = yieldOp.getOperand(iterArgIdx);
+      auto defOp = yieldedVal.getDefiningOp();
+      if (defOp &&
+          isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
+              defOp) &&
+          defOp->getBlock() == forOp.getBody()) {
+        Block *body = forOp.getBody();
+        int storesAfterDef = countTMAStoresInRange(
+            std::next(defOp->getIterator()), body->end());
+        int storesBeforeWait =
+            countTMAStoresInRange(body->begin(), waitOp->getIterator());
+        sourceCount = storesAfterDef + storesBeforeWait;
+        matchedDefiningStore = true;
+      }
+    }
   }
 
-  // Loop-carried case: token is a block argument of an scf.for body.
-  if (auto blockArg = dyn_cast<BlockArgument>(token)) {
-    auto forOp = dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp());
-    if (!forOp)
-      return 0;
-
-    unsigned iterArgIdx = blockArg.getArgNumber() - 1;
-    auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-    Value yieldedVal = yieldOp.getOperand(iterArgIdx);
-
-    // Trace the yielded value to its defining TMA store-like op.
-    auto defOp = yieldedVal.getDefiningOp();
-    if (!defOp ||
-        !isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
-            defOp) ||
-        defOp->getBlock() != forOp.getBody())
-      return 0;
-
-    Block *body = forOp.getBody();
-
-    // Stores after the def until end of loop body (excluding yield).
-    int storesAfterDef =
-        countTMAStoresInRange(std::next(defOp->getIterator()), body->end());
-
-    // Stores from start of loop body until the wait.
-    int storesBeforeWait =
-        countTMAStoresInRange(body->begin(), waitOp->getIterator());
-
-    return storesAfterDef + storesBeforeWait;
+  // Option C: if the planner annotated this wait with
+  // can_rotate_by_buffer_count = K and the source-order count is too low to
+  // realize the rotation (because no upstream pass peeled / interleaved the
+  // source order), trust the planner and emit K-1. Only fires when we
+  // matched a defining store — kernel-exit drains whose tokens flow through
+  // an scf.for result or cf.br block-arg keep the conservative pendings = 0.
+  if (matchedDefiningStore) {
+    if (auto attr =
+            waitOp->getAttrOfType<IntegerAttr>(kCanRotateByBufferCount)) {
+      int k = attr.getInt();
+      if (k > 1 && sourceCount < k - 1)
+        return k - 1;
+    }
   }
 
-  // Fallback: unknown pattern, drain all stores.
-  return 0;
+  return sourceCount;
 }
 
 struct NVGPUTMAStoreTokenWaitLoweringPass
