@@ -10,8 +10,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: ttg.local_store {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32}
 // CHECK: ttng.async_tma_copy_local_to_global {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
 // CHECK: ttng.async_tma_store_token_wait
-// CHECK-NOT: can_rotate_by_buffer_count
-// CHECK-SAME: {loop.cluster = 1 : i32, loop.stage = 1 : i32}
+// CHECK-SAME: can_rotate_by_buffer_count = 1 : i32
+// CHECK-SAME: loop.cluster = 1 : i32, loop.stage = 1 : i32
   tt.func public @single_buffer_k1(
       %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
       %src: tensor<128x64xf16>,
@@ -40,8 +40,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: ttg.local_store {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32}
 // CHECK: ttng.async_tma_copy_local_to_global {{.*}} {loop.cluster = 2 : i32, loop.stage = 1 : i32}
 // CHECK: ttng.async_tma_store_token_wait
-// CHECK-NOT: can_rotate_by_buffer_count
-// CHECK-SAME: {loop.cluster = 1 : i32, loop.stage = 3 : i32}
+// CHECK-SAME: can_rotate_by_buffer_count = 2 : i32
+// CHECK-SAME: loop.cluster = 1 : i32, loop.stage = 3 : i32
   tt.func public @double_buffer_k2(
       %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
       %src: tensor<128x64xf16>,
@@ -93,8 +93,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: ttg.local_store {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32}
 // CHECK: ttng.async_tma_copy_local_to_global {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
 // CHECK: ttng.async_tma_store_token_wait
-// CHECK-NOT: can_rotate_by_buffer_count
-// CHECK-SAME: {loop.cluster = 1 : i32, loop.stage = 1 : i32}
+// CHECK-SAME: can_rotate_by_buffer_count = 1 : i32
+// CHECK-SAME: loop.cluster = 1 : i32, loop.stage = 1 : i32
   tt.func public @no_schedule_creates_basic(
       %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
       %src: tensor<128x64xf16>,
@@ -122,8 +122,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: scf.for
 // CHECK: ttng.async_tma_copy_local_to_global {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
 // CHECK: ttng.async_tma_store_token_wait
-// CHECK-NOT: can_rotate_by_buffer_count
-// CHECK-SAME: {loop.cluster = 1 : i32, loop.stage = 1 : i32}
+// CHECK-SAME: can_rotate_by_buffer_count = 1 : i32
+// CHECK-SAME: loop.cluster = 1 : i32, loop.stage = 1 : i32
   tt.func public @cross_partition_memdesc_index(
       %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
       %multibuf: !ttg.memdesc<2x128x64xf16, #shared, #smem, mutable>,
@@ -148,8 +148,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK-LABEL: loop_carried_token_with_dead_iter_arg
 // CHECK: scf.for
 // CHECK: ttng.async_tma_store_token_wait
-// CHECK-NOT: can_rotate_by_buffer_count
-// CHECK-SAME: {loop.cluster = 1 : i32, loop.stage = 1 : i32}
+// CHECK-SAME: can_rotate_by_buffer_count = 1 : i32
+// CHECK-SAME: loop.cluster = 1 : i32, loop.stage = 1 : i32
 // CHECK: ttng.async_tma_copy_local_to_global {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
   tt.func public @loop_carried_token_with_dead_iter_arg(
       %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
