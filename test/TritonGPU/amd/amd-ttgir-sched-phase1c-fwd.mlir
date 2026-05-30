@@ -20,8 +20,8 @@
 // Case A: v8/v10-shaped main loop, dot result feeds only scf.yield.
 // 0 producers + 1 user (the yield).
 
-// CHECK: remark: ttgir-sched: would M-split this dot into 8 (blockM=256 / ctaTileM=32), co-partitioning 0 producer op(s) + 1 user op(s) (phase 2: plan only)
-// CHECK: remark: ttgir-sched: candidate inner loop with 1 MFMA tt.dot op(s); plans 1, skipped 0, bwd-infeasible 0, fwd-infeasible 0, applied 0, co-partition producer-ops 0 + user-ops 1 (phase 2: plan only)
+// CHECK: remark: ttgir-sched: would M-split this dot into 8 (blockM=256 / ctaTileM=32), co-partitioning 0 producer op(s) + 1 user op(s) (phase 3: plan only)
+// CHECK: remark: ttgir-sched: candidate inner loop with 1 MFMA tt.dot op(s); plans 1, skipped 0, bwd-infeasible 0, fwd-infeasible 0, applied 0, co-partition producer-ops 0 + user-ops 1 (phase 3: plan only)
 
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
 #dot0 = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
@@ -49,8 +49,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 // picks up arith.extf on acc (acc was f16, dot needs f32 accumulator).
 // → 1 producer (extf) + 2 users (truncf, yield).
 
-// CHECK: remark: ttgir-sched: would M-split this dot into 8 (blockM=256 / ctaTileM=32), co-partitioning 1 producer op(s) + 2 user op(s) (phase 2: plan only)
-// CHECK: remark: ttgir-sched: candidate inner loop with 1 MFMA tt.dot op(s); plans 1, skipped 0, bwd-infeasible 0, fwd-infeasible 0, applied 0, co-partition producer-ops 1 + user-ops 2 (phase 2: plan only)
+// CHECK: remark: ttgir-sched: would M-split this dot into 8 (blockM=256 / ctaTileM=32), co-partitioning 1 producer op(s) + 2 user op(s) (phase 3: plan only)
+// CHECK: remark: ttgir-sched: candidate inner loop with 1 MFMA tt.dot op(s); plans 1, skipped 0, bwd-infeasible 0, fwd-infeasible 0, applied 0, co-partition producer-ops 1 + user-ops 2 (phase 3: plan only)
 
 #mma_b = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
 #dot0_b = #ttg.dot_op<{opIdx = 0, parent = #mma_b, kWidth = 8}>

@@ -369,7 +369,8 @@ def TritonAMDGPUDotDecomposeAndSchedule : Pass<"tritonamdgpu-dot-decompose-and-s
   let dependentDialects = ["mlir::triton::TritonDialect",
                            "mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::amdgpu::TritonAMDGPUDialect",
-                           "mlir::scf::SCFDialect"];
+                           "mlir::scf::SCFDialect",
+                           "mlir::ROCDL::ROCDLDialect"];
 }
 
 #endif

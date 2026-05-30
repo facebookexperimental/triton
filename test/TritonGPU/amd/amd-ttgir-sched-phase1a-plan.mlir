@@ -14,8 +14,8 @@
 // Case A: a v8/v10-shaped dot. Result tensor<256x128xf32, #mma>, instrShape
 // [16,16,32]. Expected split factor: blockM / instrM = 256 / 16 = 16.
 
-// CHECK: remark: ttgir-sched: would M-split this dot into 8 (blockM=256 / ctaTileM=32), co-partitioning 0 producer op(s) + 1 user op(s) (phase 2: plan only)
-// CHECK: remark: ttgir-sched: candidate inner loop with 1 MFMA tt.dot op(s); plans 1, skipped 0, bwd-infeasible 0, fwd-infeasible 0, applied 0, co-partition producer-ops 0 + user-ops 1 (phase 2: plan only)
+// CHECK: remark: ttgir-sched: would M-split this dot into 8 (blockM=256 / ctaTileM=32), co-partitioning 0 producer op(s) + 1 user op(s) (phase 3: plan only)
+// CHECK: remark: ttgir-sched: candidate inner loop with 1 MFMA tt.dot op(s); plans 1, skipped 0, bwd-infeasible 0, fwd-infeasible 0, applied 0, co-partition producer-ops 0 + user-ops 1 (phase 3: plan only)
 
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
 #dot0 = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
@@ -41,7 +41,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 // Case B: scf.for with no dots is not a candidate.
 
-// CHECK: remark: ttgir-sched: visited 1 scf.for op(s), 0 candidate(s), 0 MFMA tt.dot op(s), 0 planned M-split(s), 0 skipped, 0 bwd-infeasible, 0 fwd-infeasible, 0 applied (phase 2: plan only)
+// CHECK: remark: ttgir-sched: visited 1 scf.for op(s), 0 candidate(s), 0 MFMA tt.dot op(s), 0 planned M-split(s), 0 skipped, 0 bwd-infeasible, 0 fwd-infeasible, 0 applied (phase 3: plan only)
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
   tt.func @inner_loop_no_dot(%lb: index, %ub: index, %step: index) {
@@ -59,8 +59,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 // Here tensor<16x128xf32, #mma>, instrM=16, so 16/16 = 1 < 2 → skip
 // (single-partition split would be a no-op).
 
-// CHECK: remark: ttgir-sched: candidate inner loop with 1 MFMA tt.dot op(s); plans 0, skipped 1, bwd-infeasible 0, fwd-infeasible 0, applied 0, co-partition producer-ops 0 + user-ops 0 (phase 2: plan only)
-// CHECK: remark: ttgir-sched: visited 1 scf.for op(s), 1 candidate(s), 1 MFMA tt.dot op(s), 0 planned M-split(s), 1 skipped, 0 bwd-infeasible, 0 fwd-infeasible, 0 applied (phase 2: plan only)
+// CHECK: remark: ttgir-sched: candidate inner loop with 1 MFMA tt.dot op(s); plans 0, skipped 1, bwd-infeasible 0, fwd-infeasible 0, applied 0, co-partition producer-ops 0 + user-ops 0 (phase 3: plan only)
+// CHECK: remark: ttgir-sched: visited 1 scf.for op(s), 1 candidate(s), 1 MFMA tt.dot op(s), 0 planned M-split(s), 1 skipped, 0 bwd-infeasible, 0 fwd-infeasible, 0 applied (phase 3: plan only)
 
 #mma_c = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
 #dot0_c = #ttg.dot_op<{opIdx = 0, parent = #mma_c, kWidth = 8}>

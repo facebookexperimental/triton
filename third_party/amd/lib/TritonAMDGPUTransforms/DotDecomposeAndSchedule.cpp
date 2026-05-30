@@ -22,16 +22,19 @@
 //    of Hopper-only branches. **Still does not mutate IR.**
 //  - Phase 1d (6cc0e7545): actual SSA mutation. Gated behind
 //    `TRITON_TTGIR_SCHED_APPLY=1`. M-only split.
-//  - Phase 2 (this commit): compose N-split on top of M-split. Same
-//    APPLY gate now produces an M × N grid of sub-dots (8 × 4 = 32 for
-//    v8/v10) glued back via a single amdgpu.concat in row-major order.
-//    blockN-aware analog of `planMSplit`: `ctaTileN = instrN * warpsPerCTA[1]`,
-//    `numPartitionsN = blockN / ctaTileN`. For v8/v10 with BN=128 and
-//    warpsPerCTA[1]=2, ctaTileN=32 → numPartitionsN=4. B is now sliced
-//    along its N dim too (where M-split left B untouched). C is sliced
-//    along both M and N.
-//  - Phases 3-6: schedule recipe + sched.barrier lowering, coverage
-//    matrix, default-disable LLIR, docs.
+//  - Phase 2 (7b7191047): compose N-split on top of M-split. Same APPLY
+//    gate now produces an M × N grid of sub-dots (8 × 4 = 32 for v8/v10)
+//    glued back via a single amdgpu.concat in row-major order.
+//  - Phase 3 (this commit): insert `ROCDL::SchedBarrier(0)` between
+//    M-rows of sub-dots, so LLVM's misched can't reorder dots across
+//    row boundaries. Each row of N sub-dots becomes a scheduling region
+//    that the backend can shuffle internally but not cross. This is the
+//    minimal Phase 3 — a richer pattern (e.g. flank each row with a
+//    barrier *before* and *after*, or insert barriers between every
+//    sub-dot) is parameterized via `TRITON_TTGIR_SCHED_BARRIER_STRIDE`
+//    (default = numPartitionsN, i.e. one barrier per M-row).
+//  - Phases 4-6: coverage matrix (FA, triton_kernels, stand-alone matmul),
+//    default-disable LLIR, docs.
 //
 // Opt-in behind `TRITON_ENABLE_TTGIR_SCHED=1`.
 //
@@ -39,6 +42,7 @@
 
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -46,6 +50,8 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/Support/Debug.h"
+#include <cstdlib>
 
 #define DEBUG_TYPE "tritonamdgpu-dot-decompose-and-schedule"
 
@@ -352,6 +358,17 @@ static Value buildExtractSliceAlongDim(OpBuilder &builder, Location loc,
       builder, loc, sliceType, src, builder.getDenseI64ArrayAttr(offsets));
 }
 
+/// Parse `TRITON_TTGIR_SCHED_BARRIER_STRIDE` env var. Returns:
+///   * 0 → no SchedBarrier insertion (raw rewrite from Phase 2)
+///   * k > 0 → insert ROCDL::SchedBarrier(0) after every k-th sub-dot
+/// Default (env var unset): k = numPartitionsN (one barrier per M-row).
+static int getSchedBarrierStride(unsigned defaultStride) {
+  const char *env = std::getenv("TRITON_TTGIR_SCHED_BARRIER_STRIDE");
+  if (!env || !*env)
+    return static_cast<int>(defaultStride);
+  return std::atoi(env);
+}
+
 /// Apply the M-(and optionally N-)split rewrite for one plan. Replaces
 ///   %D = tt.dot %A, %B, %C
 /// with an M × N grid of small dots, where
@@ -362,6 +379,12 @@ static Value buildExtractSliceAlongDim(OpBuilder &builder, Location loc,
 /// then
 ///   %D = amdgpu.concat %D_00, %D_01, ..., %D_{M-1,N-1}
 /// in row-major (M outer, N inner) order.
+///
+/// Phase 3: after every `stride` sub-dots (default = numPartitionsN, i.e.
+/// one per M-row) insert a `ROCDL::SchedBarrier(0)` so LLVM's misched can
+/// reorder within a region but not across it. `stride=0` disables barriers
+/// entirely (= Phase 2 behavior). Configurable via
+/// `TRITON_TTGIR_SCHED_BARRIER_STRIDE`.
 ///
 /// If `plan.numPartitionsN < 2`, the N-split is skipped (degenerates to the
 /// pure-M case from Phase 1d). Producer chains are NOT modified — the
@@ -375,6 +398,9 @@ static LogicalResult applyMSplit(const DotPartitionPlan &plan) {
   unsigned tileM = plan.tileM;
   unsigned nN = plan.numPartitionsN >= 2 ? plan.numPartitionsN : 1;
   unsigned tileN = nN > 1 ? plan.tileN : plan.blockN;
+
+  // Phase 3: barrier stride; default = one per M-row.
+  int stride = getSchedBarrierStride(/*defaultStride=*/nN);
 
   SmallVector<Value> partialResults;
   partialResults.reserve(nM * nN);
@@ -392,8 +418,7 @@ static LogicalResult applyMSplit(const DotPartitionPlan &plan) {
     bSlices.push_back(dot.getB());
   }
 
-  // Row-major: M outer, N inner. amdgpu.concat treats its operands as a
-  // row-major n-D grid (see ConcatOp description).
+  unsigned dotIdx = 0;
   for (unsigned i = 0; i < nM; ++i) {
     int64_t offM = static_cast<int64_t>(i) * tileM;
     Value aSlice = buildExtractSliceAlongDim(builder, loc, dot.getA(),
@@ -401,7 +426,6 @@ static LogicalResult applyMSplit(const DotPartitionPlan &plan) {
     for (unsigned j = 0; j < nN; ++j) {
       Value cSlice;
       if (nN > 1) {
-        // C is 2-D; slice along both M and N.
         auto cType = cast<RankedTensorType>(dot.getC().getType());
         auto smallCType = sliceTensorType(
             sliceTensorType(cType, /*dim=*/0, tileM), /*dim=*/1, tileN);
@@ -418,6 +442,16 @@ static LogicalResult applyMSplit(const DotPartitionPlan &plan) {
           builder, loc, smallResultType, aSlice, bSlices[j], cSlice,
           dot.getInputPrecisionAttr(), dot.getMaxNumImpreciseAccAttr());
       partialResults.push_back(smallDot.getResult());
+      ++dotIdx;
+
+      // Phase 3: after every `stride` sub-dots, drop a SchedBarrier(0).
+      // Don't emit one after the last sub-dot (the concat itself is an
+      // implicit cap).
+      if (stride > 0 && dotIdx < nM * nN &&
+          (dotIdx % static_cast<unsigned>(stride)) == 0) {
+        ROCDL::SchedBarrier::create(builder, loc,
+                                     /*mask=*/0);
+      }
     }
   }
 
@@ -458,7 +492,7 @@ struct TritonAMDGPUDotDecomposeAndSchedulePass
     // candidate dot with N sliced sub-dots + concat). Default off so the
     // existing TRITON_ENABLE_TTGIR_SCHED=1 keeps planning-only behavior.
     bool apply = triton::tools::getBoolEnv("TRITON_TTGIR_SCHED_APPLY");
-    const char *modeSuffix = apply ? "phase 2: applied" : "phase 2: plan only";
+    const char *modeSuffix = apply ? "phase 3: applied" : "phase 3: plan only";
 
     ModuleOp module = getOperation();
     unsigned numForOps = 0;
