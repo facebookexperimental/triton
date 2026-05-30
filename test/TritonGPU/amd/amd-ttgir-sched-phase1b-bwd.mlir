@@ -24,8 +24,8 @@
 // scf.for iter-arg (block arg → leaf), no additional ops co-partitioned.
 // Expected total: 1 producer op co-partitioned (the local_load).
 
-// CHECK: remark: ttgir-sched: would M-split this dot into 16 (blockM=256 / instrM=16), co-partitioning 1 producer op(s) (phase 1b: plan only)
-// CHECK: remark: ttgir-sched: candidate inner loop with 1 MFMA tt.dot op(s); plans 1, skipped 0, bwd-infeasible 0, co-partition producer-ops total 1 (phase 1b: plan only)
+// CHECK: remark: ttgir-sched: would M-split this dot into 16 (blockM=256 / instrM=16), co-partitioning 1 producer op(s) + 1 user op(s) (phase 1c: plan only)
+// CHECK: remark: ttgir-sched: candidate inner loop with 1 MFMA tt.dot op(s); plans 1, skipped 0, bwd-infeasible 0, fwd-infeasible 0, co-partition producer-ops 1 + user-ops 1 (phase 1c: plan only)
 
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
 #shared = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 8, order = [1, 0]}>
@@ -59,8 +59,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 // visits no producer ops — both A and C are block arguments / leaves.
 // Expected total: 0 producer ops co-partitioned. Plan is still emitted.
 
-// CHECK: remark: ttgir-sched: would M-split this dot into 16 (blockM=256 / instrM=16), co-partitioning 0 producer op(s) (phase 1b: plan only)
-// CHECK: remark: ttgir-sched: candidate inner loop with 1 MFMA tt.dot op(s); plans 1, skipped 0, bwd-infeasible 0, co-partition producer-ops total 0 (phase 1b: plan only)
+// CHECK: remark: ttgir-sched: would M-split this dot into 16 (blockM=256 / instrM=16), co-partitioning 0 producer op(s) + 1 user op(s) (phase 1c: plan only)
+// CHECK: remark: ttgir-sched: candidate inner loop with 1 MFMA tt.dot op(s); plans 1, skipped 0, bwd-infeasible 0, fwd-infeasible 0, co-partition producer-ops 0 + user-ops 1 (phase 1c: plan only)
 
 #mma_b = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
 #dot0_b = #ttg.dot_op<{opIdx = 0, parent = #mma_b, kWidth = 8}>
@@ -89,8 +89,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 // dim-flipping logic is deferred to Phase 1c+). The loop is still a
 // candidate, but the per-dot plan is marked bwd-infeasible.
 
-// CHECK: remark: ttgir-sched: would M-split this dot into 16 (blockM=256 / instrM=16), but backward walker bailed (phase 1b: plan only)
-// CHECK: remark: ttgir-sched: candidate inner loop with 1 MFMA tt.dot op(s); plans 1, skipped 0, bwd-infeasible 1, co-partition producer-ops total 0 (phase 1b: plan only)
+// CHECK: remark: ttgir-sched: would M-split this dot into 16 (blockM=256 / instrM=16), but backward walker bailed (phase 1c: plan only)
+// CHECK: remark: ttgir-sched: candidate inner loop with 1 MFMA tt.dot op(s); plans 1, skipped 0, bwd-infeasible 1, fwd-infeasible 0, co-partition producer-ops 0 + user-ops 0 (phase 1c: plan only)
 
 #mma_c = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
 #dot0_c = #ttg.dot_op<{opIdx = 0, parent = #mma_c, kWidth = 8}>

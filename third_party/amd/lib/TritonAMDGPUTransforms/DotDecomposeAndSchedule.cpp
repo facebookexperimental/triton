@@ -10,16 +10,17 @@
 //  - Phase 0 (cbfbda28f): no-op scaffold; emits remark per candidate inner
 //    loop.
 //  - Phase 1a (280370f92): compute the M-split partition plan per dot.
-//  - Phase 1b (this commit): backward walker — for each plan, walk back
-//    from the dot's M-dim operand (A) and accumulator (C), collect the
-//    producer ops that need co-partitioning with the same dim. Skips the
-//    B operand entirely (N-dim, doesn't get sliced under M-split). Adapted
-//    from `WSDataPartition::getBackwardSliceToPartition`
-//    (third_party/nvidia/hopper/.../WSDataPartition.cpp:291), stripped of
-//    Hopper-only ops (WarpGroupDotOp / TCGen5MMAOp / TMEMAllocOp / async-
-//    task-ID tracking). **Still does not mutate IR.**
-//  - Phase 1c (next): forward walker for user ops.
-//  - Phase 1d: sliceOp — clone + retype.
+//  - Phase 1b (a2c8db5b0): backward walker — collect producer ops to
+//    co-partition along the M dim. Walks from dot.getA() and dot.getC()
+//    with dim=0; deliberately skips dot.getB() (N-dim).
+//  - Phase 1c (this commit): forward walker — collect *user* ops on the
+//    dot's result chain. For v8/v10's in-loop chain this just picks up
+//    `scf.yield`; richer test cases also exercise `arith.truncf` /
+//    `ttg.convert_layout` / `amdgpu.buffer_store`. Adapted from
+//    `WSDataPartition::getForwardSliceToPartition`
+//    (third_party/nvidia/hopper/.../WSDataPartition.cpp:441), stripped
+//    of Hopper-only branches. **Still does not mutate IR.**
+//  - Phase 1d (next): sliceOp — clone + retype the SSA chain.
 //  - Phases 2-6: N-split, schedule recipe + sched.barrier lowering, etc.
 //
 // Opt-in behind `TRITON_ENABLE_TTGIR_SCHED=1`.
@@ -49,10 +50,6 @@ namespace {
 // Partition plan (Phase 1a)
 //===----------------------------------------------------------------------===//
 
-/// Per-dot partition plan derived from the dot's result encoding and tensor
-/// shape. Phase 1a only: just the M dimension. N is added in Phase 2; K is
-/// deferred to a follow-up (would also require decomposing local_load to
-/// per-vector grain — see design doc).
 struct DotPartitionPlan {
   triton::DotOp dotOp;
   unsigned blockM;          // BLOCK_M; e.g. 256 for v8/v10.
@@ -89,29 +86,15 @@ static std::optional<DotPartitionPlan> planMSplit(triton::DotOp dotOp) {
 }
 
 //===----------------------------------------------------------------------===//
-// Backward walker (Phase 1b)
+// Partition scheme + backward walker (Phase 1b)
 //===----------------------------------------------------------------------===//
 
-/// Per-op partition decision: which dim of which Value gets sliced when this
-/// op is co-partitioned with the dot. Phase 1b only records what we *would*
-/// partition; Phase 1d will use this to drive the actual slice/clone.
-///
-/// Stripped subset of `WSDataPartition::DataPartitionScheme` (line 93):
-/// no rematerialization, no opsToSkip, no async-task-ID tracking, no
-/// funcArgPartitionDims, no operand-side index tracking (M-split only
-/// touches dot's A operand, never B — the caller passes the right side in).
 struct DataPartitionScheme {
   unsigned numPartitions = 0;
-  /// Ops that would be cloned per-partition.
   llvm::SetVector<Operation *> ops;
-  /// Which dim of the op's result tensor to partition (0 for M-split).
   llvm::DenseMap<Operation *, unsigned> opPartitionDims;
 };
 
-/// True if a tensor value's `dim` is large enough to actually split into
-/// `numPartitions` pieces. A 1-D scalar broadcast through `numPartitions=1`
-/// wouldn't need partitioning. Mirrors the predicate in
-/// `WSDataPartition::needToSlice` (line 220).
 static bool needToSlice(Value v, unsigned dim, unsigned numPartitions) {
   auto rtt = dyn_cast<RankedTensorType>(v.getType());
   if (!rtt)
@@ -122,71 +105,43 @@ static bool needToSlice(Value v, unsigned dim, unsigned numPartitions) {
   return extent >= static_cast<int64_t>(numPartitions);
 }
 
-/// True if `op` is in the same region as `boundary` — i.e. inside the same
-/// scf.for body we're partitioning. Stops the backward walk from escaping
-/// into the prologue or surrounding function.
 static bool isInsideRegion(Operation *op, Region *boundary) {
   return op->getParentRegion() == boundary;
 }
 
+/// Forward-declared so backward and forward walkers can share the same
+/// scheme + op-classification helpers.
+static bool isAllowedProducerOp(Operation *op) {
+  return op->hasTrait<OpTrait::Elementwise>() ||
+         isa<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp, arith::ExtFOp,
+             triton::SplatOp, triton::AddPtrOp, triton::LoadOp,
+             triton::gpu::ConvertLayoutOp, triton::gpu::LocalAllocOp,
+             triton::gpu::LocalLoadOp,
+             triton::amdgpu::BufferLoadToLocalOp>(op);
+}
+
 /// Adapted from `WSDataPartition::getBackwardSliceToPartition` (line 291).
-/// Recursively walks `v`'s defining-op chain. Each visited op is recorded in
-/// `scheme.ops` with `opPartitionDims = currentDim`. Returns false on
-/// incompatible / unsupported op (the caller should treat this as "skip the
-/// plan").
-///
-/// What's kept from WSDataPartition's allowed-op list:
-///   * `Elementwise` trait (matches arith / math / triton elementwise ops)
-///   * `arith::ConstantOp`, `Ext*Op`, `triton::SplatOp`, `triton::AddPtrOp`
-///   * `ttg::ConvertLayoutOp`, `ttg::LocalAllocOp`, `ttg::LocalLoadOp`
-///   * `triton::LoadOp` (global load, leaf of the chain)
-///   * `triton::amdgpu::BufferLoadToLocalOp` (AMD-specific shmem DMA — leaf)
-///
-/// What's stripped (Hopper-only or not seen in v8/v10 inner loop):
-///   * `WarpGroupDotOp`, `TCGen5MMAOp`, `TMEMAllocOp/LoadOp/StoreOp`
-///   * `DescriptorLoadOp` (TMA — Phase 4+ if needed)
-///   * `BroadcastOp`, `ExpandDimsOp`, `TransOp`, `ReshapeOp` — these need
-///     dim-flipping logic; deferred to Phase 1c+ if the chain demands them.
-///     For v8/v10 the M-chain from dot.A back to local_load → buffer_load is
-///     simple (no transpose / reshape / broadcast), so this works as-is.
-///
-/// Returns false (= unsupported) if the chain hits anything not on the list
-/// while still inside the region. Stops cleanly at the region boundary
-/// (function args / iter-args / values from before the for-loop).
 static bool getBackwardSliceToPartition(Value v, unsigned currentDim,
                                         DataPartitionScheme &scheme,
                                         Region *boundary) {
-  // Don't recurse into a value whose tensor extent is too small to slice.
   if (!needToSlice(v, currentDim, scheme.numPartitions))
     return true;
 
   Operation *defOp = v.getDefiningOp();
   if (!defOp)
-    return true; // block argument — leaf (iter-arg / func arg).
+    return true;
 
-  // Don't escape the loop body boundary.
   if (!isInsideRegion(defOp, boundary))
-    return true; // value was defined outside; leaf.
+    return true;
 
-  // Already visited (compatible dim, since we only have one dim today).
   if (scheme.ops.contains(defOp)) {
     auto it = scheme.opPartitionDims.find(defOp);
-    if (it != scheme.opPartitionDims.end() && it->second != currentDim) {
-      // Cross-dim conflict — would need rematerialize (Phase 2+). Bail.
+    if (it != scheme.opPartitionDims.end() && it->second != currentDim)
       return false;
-    }
     return true;
   }
 
-  // Op-type guard list (stripped of Hopper-only branches).
-  bool isAllowed =
-      defOp->hasTrait<OpTrait::Elementwise>() ||
-      isa<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp, arith::ExtFOp,
-          triton::SplatOp, triton::AddPtrOp, triton::LoadOp,
-          triton::gpu::ConvertLayoutOp, triton::gpu::LocalAllocOp,
-          triton::gpu::LocalLoadOp,
-          triton::amdgpu::BufferLoadToLocalOp>(defOp);
-  if (!isAllowed) {
+  if (!isAllowedProducerOp(defOp)) {
     LLVM_DEBUG(llvm::dbgs() << "ttgir-sched: backward walker bailing on "
                             << defOp->getName() << "\n");
     return false;
@@ -195,9 +150,6 @@ static bool getBackwardSliceToPartition(Value v, unsigned currentDim,
   scheme.ops.insert(defOp);
   scheme.opPartitionDims[defOp] = currentDim;
 
-  // Recurse into each operand of `defOp`. For Phase 1b we propagate the same
-  // `currentDim` to every operand. Dim-flipping through TransOp /
-  // ExpandDimsOp will be added in Phase 1c if any v8/v10 chain needs it.
   for (Value operand : defOp->getOperands()) {
     if (!getBackwardSliceToPartition(operand, currentDim, scheme, boundary))
       return false;
@@ -205,13 +157,6 @@ static bool getBackwardSliceToPartition(Value v, unsigned currentDim,
   return true;
 }
 
-/// Run the backward walker for one plan. Returns the populated scheme on
-/// success, std::nullopt on infeasibility (e.g. unsupported op in chain).
-///
-/// For M-split, the walker is launched on:
-///   * dot's accumulator C (output dim 0)
-///   * dot's operand A    (LHS dim 0 — same M as the result's M)
-/// We deliberately do NOT walk operand B (RHS dim 0 is K, not M).
 static std::optional<DataPartitionScheme>
 backwardSliceForMSplit(const DotPartitionPlan &plan) {
   DataPartitionScheme scheme;
@@ -220,15 +165,120 @@ backwardSliceForMSplit(const DotPartitionPlan &plan) {
   triton::DotOp dot = plan.dotOp;
   Region *boundary = dot->getParentRegion();
 
-  // Walk operand A (LHS, M dim is dim 0 of the operand tensor too).
   if (!getBackwardSliceToPartition(dot.getA(), /*dim=*/0, scheme, boundary))
     return std::nullopt;
-
-  // Walk accumulator C (output, M dim is dim 0).
   if (!getBackwardSliceToPartition(dot.getC(), /*dim=*/0, scheme, boundary))
     return std::nullopt;
-
   return scheme;
+}
+
+//===----------------------------------------------------------------------===//
+// Forward walker (Phase 1c)
+//===----------------------------------------------------------------------===//
+
+/// Op allow-list for forward walker. Producer-side ops are still allowed
+/// (some user-side chains pass through `ConvertLayoutOp` etc.), plus the
+/// extra user-side ops that don't appear as producers: truncating casts,
+/// stores. Mirrors WSDataPartition's forward-side allow-set sans Hopper
+/// branches.
+static bool isAllowedUserOp(Operation *op) {
+  if (isAllowedProducerOp(op))
+    return true;
+  return isa<arith::TruncFOp, arith::TruncIOp, arith::SIToFPOp,
+             arith::UIToFPOp, arith::FPToSIOp, arith::FPToUIOp,
+             triton::StoreOp, triton::gpu::LocalStoreOp,
+             triton::amdgpu::BufferStoreOp,
+             scf::YieldOp>(op);
+}
+
+/// Adapted from `WSDataPartition::getForwardSliceToPartition` (line 441),
+/// stripped of:
+///   * AtomicRMWOp / DescriptorReduceOp `onlyUsedByAtomicStore` special case
+///   * AsyncTaskId tracking
+///   * BroadcastOp / ExpandDimsOp / TransOp dim-flipping (deferred to
+///     Phase 1c-ext if a v8/v10 user chain needs it)
+///   * MultiResult `scf.if` follow-through (not used by v8/v10 main loop)
+///
+/// Walks `v.getUsers()` recursively. Stops at:
+///   * `scf::YieldOp` — recorded in scheme, but no further recursion (the
+///     iter-arg back-edge is already covered by the backward walk on
+///     `dot.getC()` in the next iteration).
+///   * ops outside `boundary`
+///   * `tt.return` / `func.return` terminators (no results to follow)
+///   * unsupported op → bail with false.
+///
+/// `seen` guards against cyclic SSA (multi-use values) — same trick as the
+/// WSDataPartition walker.
+static bool getForwardSliceToPartition(Value v, unsigned currentDim,
+                                       DataPartitionScheme &scheme,
+                                       Region *boundary,
+                                       llvm::DenseSet<Value> &seen) {
+  if (!seen.insert(v).second)
+    return true;
+  if (!needToSlice(v, currentDim, scheme.numPartitions))
+    return true;
+
+  for (Operation *userOp : v.getUsers()) {
+    // Cross-region: don't walk into ops outside the current loop body. This
+    // catches the dot's result being captured by an op in a nested scf.if /
+    // scf.for region — handled in Phase 1c-ext if needed.
+    if (!isInsideRegion(userOp, boundary)) {
+      // It's safe to ignore; the value escapes the loop body, which means
+      // the cross-iteration users will be handled by the backward walk on
+      // the iter-arg / result.
+      continue;
+    }
+
+    // Already classified? Check compatibility.
+    if (scheme.ops.contains(userOp)) {
+      auto it = scheme.opPartitionDims.find(userOp);
+      if (it != scheme.opPartitionDims.end() && it->second != currentDim) {
+        return false;
+      }
+      // scf.yield is recorded but we don't recurse through it (see above).
+      if (isa<scf::YieldOp>(userOp))
+        continue;
+      // Compatible existing classification — recurse into its results.
+      for (Value res : userOp->getResults()) {
+        if (!getForwardSliceToPartition(res, currentDim, scheme, boundary,
+                                        seen))
+          return false;
+      }
+      continue;
+    }
+
+    if (!isAllowedUserOp(userOp)) {
+      LLVM_DEBUG(llvm::dbgs() << "ttgir-sched: forward walker bailing on "
+                              << userOp->getName() << "\n");
+      return false;
+    }
+
+    scheme.ops.insert(userOp);
+    scheme.opPartitionDims[userOp] = currentDim;
+
+    // scf.yield: stop here (the iter-arg cycle is closed by the backward
+    // walker hitting dot.getC() next iteration).
+    if (isa<scf::YieldOp>(userOp))
+      continue;
+
+    // Recurse into each result of the user op.
+    for (Value res : userOp->getResults()) {
+      if (!getForwardSliceToPartition(res, currentDim, scheme, boundary, seen))
+        return false;
+    }
+  }
+  return true;
+}
+
+/// Driver: extend an existing scheme by walking forward from the dot's
+/// result. Returns false on infeasibility (unsupported op or dim conflict).
+static bool extendSliceForwardFromDot(const DotPartitionPlan &plan,
+                                      DataPartitionScheme &scheme) {
+  triton::DotOp dot = plan.dotOp;
+  Region *boundary = dot->getParentRegion();
+  llvm::DenseSet<Value> seen;
+  return getForwardSliceToPartition(dot.getResult(), /*dim=*/0, scheme,
+                                    boundary, seen);
 }
 
 //===----------------------------------------------------------------------===//
@@ -265,6 +315,7 @@ struct TritonAMDGPUDotDecomposeAndSchedulePass
     unsigned totalSkipped = 0;
     unsigned totalPlans = 0;
     unsigned totalBwdInfeasible = 0;
+    unsigned totalFwdInfeasible = 0;
 
     module.walk([&](scf::ForOp forOp) {
       ++numForOps;
@@ -281,12 +332,14 @@ struct TritonAMDGPUDotDecomposeAndSchedulePass
       totalSkipped += mfmaDotsSkipped;
       totalPlans += plans.size();
 
-      // Run the backward walker for each plan.
       unsigned loopBwdInfeasible = 0;
+      unsigned loopFwdInfeasible = 0;
       unsigned loopTotalProducerOps = 0;
+      unsigned loopTotalUserOps = 0;
+
       for (const auto &plan : plans) {
-        auto schemeOpt = backwardSliceForMSplit(plan);
         triton::DotOp dot = plan.dotOp;
+        auto schemeOpt = backwardSliceForMSplit(plan);
         if (!schemeOpt) {
           ++loopBwdInfeasible;
           ++totalBwdInfeasible;
@@ -294,24 +347,44 @@ struct TritonAMDGPUDotDecomposeAndSchedulePass
               << "ttgir-sched: would M-split this dot into "
               << plan.numPartitions << " (blockM=" << plan.blockM
               << " / instrM=" << plan.instrM
-              << "), but backward walker bailed (phase 1b: plan only)";
+              << "), but backward walker bailed (phase 1c: plan only)";
           continue;
         }
-        loopTotalProducerOps += schemeOpt->ops.size();
+        unsigned producerCount = schemeOpt->ops.size();
+        loopTotalProducerOps += producerCount;
+
+        // Phase 1c: extend the scheme forward from the dot's result.
+        if (!extendSliceForwardFromDot(plan, *schemeOpt)) {
+          ++loopFwdInfeasible;
+          ++totalFwdInfeasible;
+          dot.emitRemark()
+              << "ttgir-sched: would M-split this dot into "
+              << plan.numPartitions << " (blockM=" << plan.blockM
+              << " / instrM=" << plan.instrM << "), backward walker found "
+              << producerCount
+              << " producer op(s), forward walker bailed (phase 1c: plan only)";
+          continue;
+        }
+        // Total includes producers + users; user count = total - producer.
+        unsigned totalOps = schemeOpt->ops.size();
+        unsigned userCount = totalOps - producerCount;
+        loopTotalUserOps += userCount;
+
         dot.emitRemark()
             << "ttgir-sched: would M-split this dot into "
             << plan.numPartitions << " (blockM=" << plan.blockM
             << " / instrM=" << plan.instrM << "), co-partitioning "
-            << schemeOpt->ops.size()
-            << " producer op(s) (phase 1b: plan only)";
+            << producerCount << " producer op(s) + " << userCount
+            << " user op(s) (phase 1c: plan only)";
       }
 
       forOp.emitRemark()
           << "ttgir-sched: candidate inner loop with " << mfmaDotsSeen
           << " MFMA tt.dot op(s); plans " << plans.size()
           << ", skipped " << mfmaDotsSkipped << ", bwd-infeasible "
-          << loopBwdInfeasible << ", co-partition producer-ops total "
-          << loopTotalProducerOps << " (phase 1b: plan only)";
+          << loopBwdInfeasible << ", fwd-infeasible " << loopFwdInfeasible
+          << ", co-partition producer-ops " << loopTotalProducerOps
+          << " + user-ops " << loopTotalUserOps << " (phase 1c: plan only)";
     });
 
     module.emitRemark()
@@ -319,7 +392,8 @@ struct TritonAMDGPUDotDecomposeAndSchedulePass
         << numCandidateLoops << " candidate(s), " << totalMfmaDots
         << " MFMA tt.dot op(s), " << totalPlans << " planned M-split(s), "
         << totalSkipped << " skipped, " << totalBwdInfeasible
-        << " bwd-infeasible (phase 1b: plan only)";
+        << " bwd-infeasible, " << totalFwdInfeasible
+        << " fwd-infeasible (phase 1c: plan only)";
   }
 };
 
