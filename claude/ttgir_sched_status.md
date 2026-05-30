@@ -7,11 +7,21 @@
 
 ## TL;DR
 
-**13 commits, 6 lit tests (all green), best e2e win 871.92 TF vs 785.79 TF
-baseline (+11.0 %) at K=8192, FA-fwd runs correctly** (where the
-matmul_4waves LLIR pass crashes). Phases 0, 1a-1d, 2, 3, 4, 6 landed;
-Phase 5 (default-disable LLIR) is the only deferred phase (cross-repo
-coordination, not engineering).
+**14 commits, 6 lit tests (all green). Reproducible Phase 3 perf win
+at K=8192 (pinned config BM=BN=256, BK=64, W=8): 1055.4 → 1104.0 TF
+(+4.6 %, stable to within ±0.3 % across 3 runs each). FA-fwd runs
+correctly** (where the matmul_4waves LLIR pass crashes). Phases 0,
+1a-1d, 2, 3, 4, 6 landed; Phase 5 (default-disable LLIR) is the only
+deferred phase.
+
+> **Caveat on the +11 % figure** that earlier appeared in this doc:
+> that was measured with `_one_run_envcompare.py` which autotunes.
+> Each invocation re-runs the autotuner, and the autotuner sometimes
+> picks BK=32,W=4 (~785 TF) and sometimes BK=64,W=8 (~870 TF) for the
+> *same* mode depending on cache state and run-to-run timing variance.
+> So the +11 % figure (785.79 → 871.92) was apples-to-oranges. The
+> **pinned-config +4.6 %** is the honest reproducible delta — use
+> `_pinned_run.py` (added in commit below) for any benchmarking.
 
 ```
 e37716eb6 [AMD][TTGIR-SCHED] Phase 6: docs cleanup — README + cross-links + status markers
@@ -213,15 +223,21 @@ APPLY=1:        OK 888.70 BLOCK_M: 256, ...    (+4.1 %)
 
 The driver `claude/phase4_coverage.py` runs the stand-alone matmul
 across K = {1024, 2048, 4096, 8192} × 3 TTGIR-SCHED modes and prints a
-markdown summary at the end.
+markdown summary at the end. **NOTE**: this script uses
+`_one_run_envcompare.py` which autotunes per-invocation, so the
+baseline-vs-APPLY comparison is *not* apples-to-apples in general (the
+autotuner may pick different configs for the two modes depending on
+cache state). For a stable apples-to-apples comparison, use
+`_pinned_run.py` (see §4b below).
 
 ```bash
 source ~/miniconda3/etc/profile.d/conda.sh && conda activate metamain2
 HIP_VISIBLE_DEVICES=0 python ~/MetaMain2/triton/claude/phase4_coverage.py
 ```
 
-Takes ~100 s (12 runs × ~8 s each). Sample output from a recent run
-on gfx950 (your numbers will be close to these, ±1-2 % run-to-run noise):
+Takes ~100 s (12 runs × ~8 s each). Sample output from one autotuned
+run on gfx950 (your numbers will vary because of the autotune
+non-determinism — see §4b for the stable variant):
 
 ```
 ## Phase 4 coverage matrix
@@ -249,6 +265,58 @@ If you see substantially different numbers:
   `DotDecomposeAndSchedule.cpp` against the last good commit.
 - **APPLY rows show `FAIL` or `?`**: numerical regression. Bisect by
   STRIDE=0 (Phase 2 IR only) vs default to isolate.
+
+## 4b. e2e performance — stable reproduction (recommended)
+
+Use `claude/_pinned_run.py`, which runs a single hard-coded config
+(BM=BN=256, BK=64, num_warps=8, num_stages=2) with no autotuning. Same
+config used for baseline and APPLY, so the comparison is meaningful.
+
+```bash
+source ~/miniconda3/etc/profile.d/conda.sh && conda activate metamain2
+
+# Baseline — 3 runs to gauge noise
+for i in 1 2 3; do
+  HIP_VISIBLE_DEVICES=0 python ~/MetaMain2/triton/claude/_pinned_run.py 8192
+done
+
+# APPLY=1 — 3 runs
+for i in 1 2 3; do
+  TRITON_ENABLE_TTGIR_SCHED=1 TRITON_TTGIR_SCHED_APPLY=1 \
+    HIP_VISIBLE_DEVICES=0 python ~/MetaMain2/triton/claude/_pinned_run.py 8192
+done
+```
+
+Sample output from gfx950 (numbers are very stable, ±0.3 % across
+runs):
+
+```
+=== K=8192 baseline ===
+OK 1054.24 BM=256 BN=256 BK=64 W=8 S=2
+OK 1058.24 BM=256 BN=256 BK=64 W=8 S=2
+OK 1053.61 BM=256 BN=256 BK=64 W=8 S=2     ← mean 1055.4 TF
+
+=== K=8192 APPLY=1 ===
+OK 1103.72 BM=256 BN=256 BK=64 W=8 S=2
+OK 1104.85 BM=256 BN=256 BK=64 W=8 S=2
+OK 1103.47 BM=256 BN=256 BK=64 W=8 S=2     ← mean 1104.0 TF  →  +4.6 %
+```
+
+What "OK" means: the script's `torch.allclose(c, ref, atol=1e-1,
+rtol=1e-2)` check passed, confirming numerical correctness. The TFLOPS
+is computed from `triton.testing.do_bench` median.
+
+**If your APPLY mean isn't ≥ baseline by ≥ 3 %, something's wrong**:
+- Make sure `libtriton.so` was rebuilt after editing the pass
+  (`ninja triton` in the build dir; see §1).
+- Verify the pass is actually firing: re-run baseline with
+  `TRITON_ENABLE_TTGIR_SCHED=1` (planning only, no APPLY) and confirm
+  you see remarks like
+  `remark: ttgir-sched: would M-split this dot into 8 ...` in stderr.
+- If the remarks appear but APPLY perf doesn't move, the IR rewrite
+  might be getting CSE'd or DCE'd downstream — dump the IR after the
+  pass with `MLIR_ENABLE_DUMP=1` and grep for `amdg.concat` to confirm
+  the sub-dots survived.
 
 ## 5. FA-fwd safety (the kernel that crashes the matmul_4waves LLIR pass)
 
@@ -386,18 +454,42 @@ Workarounds:
 
 ## Headline results
 
-Stand-alone autotuned matmul on gfx950, BM=BN=256, BK=64, num_warps=8
-(autotune-picked, all M=N=K = K_value):
+### Stable, reproducible (pinned config, `_pinned_run.py`)
 
-| Workload | Baseline TF | TTGIR-SCHED Phase 3 default TF | Δ |
+Stand-alone matmul on gfx950, BM=BN=256, BK=64, num_warps=8, num_stages=2,
+M=N=4096, K=8192, mean of 3 runs (run-to-run noise ±0.3 %):
+
+| Mode | TFLOPS | Δ vs baseline |
+|---|---:|---:|
+| Baseline (no TTGIR_SCHED) | 1055.4 | — |
+| TTGIR_SCHED=1 APPLY=1 (Phase 3 default) | **1104.0** | **+4.6 %** |
+
+This is the recommended number to quote: same kernel config in both
+modes, very stable across runs.
+
+### Autotuner-based (`_one_run_envcompare.py`, `phase4_coverage.py`)
+
+Stand-alone matmul on gfx950 with `triton.autotune`, M=N=4096, single
+run each (autotuner picks the config it thinks is best):
+
+| K | Baseline TF | Phase 3 default TF | Δ |
 |---|---:|---:|---:|
-| Stand-alone matmul K=1024 | 773.53 | 762.34 | -1.4 % |
-| Stand-alone matmul K=2048 | 847.69 | 868.14 | +2.4 % |
-| Stand-alone matmul K=4096 | 853.75 | 888.70 | **+4.1 %** |
-| Stand-alone matmul K=8192 | 785.79 | 871.92 | **+11.0 %** |
+| 1024 | 773.53 | 762.34 | -1.4 % |
+| 2048 | 847.69 | 868.14 | +2.4 % |
+| 4096 | 853.75 | 888.70 | **+4.1 %** |
+| 8192 | 785.79 | 871.92 | **+11.0 %** ⚠ |
 
-FA-fwd tutorial (06-fused-attention.py), Triton fp16 TFLOPS, batch=4,
-head=32, d=128, bwd, causal=False:
+⚠ **Caveat:** with the autotuner, the same script can pick BK=32,W=4
+(~785 TF) or BK=64,W=8 (~870 TF) for the *same* mode on different
+invocations. The +11.0 % above is partly artifact — when the
+autotuner picks BK=64,W=8 for both modes (the pinned-config recipe),
+the honest delta at K=8192 is +4.6 %. Prefer §4b for any rigorous
+benchmarking.
+
+### FA-fwd safety (the kernel that crashes the LLIR pass)
+
+Tutorial `06-fused-attention.py` Triton fp16 TFLOPS, batch=4, head=32,
+d=128, bwd, causal=False:
 
 | N_CTX | Baseline TF | TTGIR-SCHED Phase 3 default TF | Δ |
 |---:|---:|---:|---:|
@@ -411,13 +503,12 @@ All numerically correct. The matmul_4waves LLIR pass *crashes* on this
 kernel with `Instruction does not dominate all uses!`; the TTGIR pass
 produces correct + competitive output.
 
+### Comparison summary
+
 | Workload | matmul_4waves LLIR-SCHED | TTGIR-SCHED Phase 3 default |
 |---|---|---|
-| Stand-alone matmul K=1024 | ❌ crash on autotune | ✅ 762.34 TF (correct, -1.4 %) |
-| Stand-alone matmul K=2048 | ❌ crash on autotune | ✅ 868.14 TF (correct, +2.4 %) |
-| Stand-alone matmul K=4096 | ❌ crash on autotune | ✅ 888.70 TF (correct, **+4.1 %**) |
-| Stand-alone matmul K=8192 | ❌ crash on autotune | ✅ 871.92 TF (correct, **+11.0 %**) |
-| FA-fwd tutorial           | ❌ SSA dominance crash | ✅ all configs correct, within ±2 % of baseline |
+| Stand-alone matmul K=8192, pinned BM=BN=256/BK=64/W=8 | ❌ crash on autotune | ✅ **1104.0 TF (+4.6 % vs 1055.4 baseline)** |
+| FA-fwd tutorial            | ❌ SSA dominance crash   | ✅ all configs correct, within ±2 % of baseline |
 
 The big design win: **MLIR's typed SSA verifier rejects ill-formed
 rewrites at construction time**, so the TTGIR pass can't produce the

@@ -11,7 +11,8 @@ LLVM-IR scheduler pass. Lives in
 | [`llir_sched_at_ttgir_design.md`](llir_sched_at_ttgir_design.md) | **Why TTGIR.** Design rationale — what's wrong with the LLIR pass, why TTGIR is structurally safer, why M + N split is the right starting point, K-split deferred caveat. |
 | [`llir_sched_at_ttgir_plan.md`](llir_sched_at_ttgir_plan.md) | **The phased plan.** 7-phase implementation roadmap (Phase 0 scaffold through Phase 6 docs). |
 | [`ttgir_sched_status.md`](ttgir_sched_status.md) | **What's landed + how to use it.** Per-phase commit list, lit-test inventory, env-var contract, worked v8/v10 example, full e2e validation matrix. |
-| [`phase4_coverage.py`](phase4_coverage.py) | **Driver script.** Runs the e2e coverage matrix on stand-alone matmul (K sweep) and produces a markdown summary table. |
+| [`phase4_coverage.py`](phase4_coverage.py) | **Driver script (autotuned).** Runs the e2e coverage matrix on stand-alone matmul (K sweep) and produces a markdown summary table. Numbers depend on autotuner config picks — for rigorous benchmarking use `_pinned_run.py` below. |
+| [`_pinned_run.py`](_pinned_run.py) | **Reproducible single-config benchmark.** Pins BM=BN=256/BK=64/W=8 (no autotuning), so baseline-vs-APPLY is apples-to-apples. Use this to quote numbers. |
 
 ## Quick reference
 
@@ -50,14 +51,27 @@ All pass via FileCheck (`triton-opt -tritonamdgpu-dot-decompose-and-schedule`).
 
 ## Headline results
 
+## Headline results
+
+### Stable, reproducible (pinned config)
+
+Stand-alone matmul on gfx950, BM=BN=256, BK=64, num_warps=8, num_stages=2,
+M=N=4096, K=8192, mean of 3 runs (run-to-run noise ±0.3 %):
+
+| Mode | TFLOPS | Δ vs baseline |
+|---|---:|---:|
+| Baseline (no TTGIR_SCHED) | 1055.4 | — |
+| TTGIR_SCHED=1 APPLY=1 (Phase 3 default) | **1104.0** | **+4.6 %** |
+
+To reproduce: `python claude/_pinned_run.py 8192` (with/without the
+APPLY env vars). See [`ttgir_sched_status.md`](ttgir_sched_status.md) §4b.
+
+### Comparison vs matmul_4waves LLIR-SCHED
+
 | Workload | LLIR-SCHED (matmul_4waves) | TTGIR-SCHED (this work) |
 |---|---|---|
-| v8/v10 main loop                                  | ✅ +17–22 %               | (proxied via stand-alone) |
-| Stand-alone autotuned matmul, K=1024              | ❌ crash on autotune       | ✅ 762.34 TF (-1.4 % vs 773.53 baseline) |
-| Stand-alone autotuned matmul, K=2048              | ❌ crash on autotune       | ✅ 868.14 TF (+2.4 % vs 847.69 baseline) |
-| Stand-alone autotuned matmul, K=4096              | ❌ crash on autotune       | ✅ 888.70 TF (+4.1 % vs 853.75 baseline) |
-| Stand-alone autotuned matmul, K=8192              | ❌ crash on autotune       | ✅ **871.92 TF (+11.0 % vs 785.79 baseline)** |
-| FA-fwd tutorial                                   | ❌ SSA dominance crash     | ✅ correct, all configs within ±2 % of baseline |
+| Stand-alone matmul K=8192, pinned BM=BN=256/BK=64/W=8 | ❌ crash on autotune | ✅ **1104.0 TF (+4.6 % vs 1055.4 baseline)** |
+| FA-fwd tutorial             | ❌ SSA dominance crash     | ✅ all configs correct, within ±2 % of baseline |
 
 The matmul_4waves LLIR pass *crashes* on FA-fwd with `Instruction does
 not dominate all uses!`. The TTGIR pass produces correct + competitive
