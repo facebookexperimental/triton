@@ -227,6 +227,14 @@ class HIPBackend(BaseBackend):
         passes.ttgpuir.add_optimize_thread_locality(pm)
         amd.passes.ttgpuir.add_lower_barrier_ops(pm)
 
+        # Optional algebraic transpose propagation (env-gated, default off).
+        # Inserts the transpose-propagate pass BEFORE accelerate_matmul so
+        # that the MFMA selector sees any flipped operand orientations
+        # produced by the rewrite. See
+        # include/triton/Dialect/TritonGPU/Transforms/TransposePropagate.h.
+        if os.getenv("TRITON_TRANSPOSE_PROPAGATE_ENABLE"):
+            passes.ttgpuir.add_transpose_propagate(pm)
+
         # Maintain the order of the following three passes
         # for graphs with tlx.local_load -> tt.dot,
         # dot op specifics from add_accelerate_matmul are required
