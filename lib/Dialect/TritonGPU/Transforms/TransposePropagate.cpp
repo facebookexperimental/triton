@@ -285,20 +285,111 @@ bool matchDot(Operation *op, unsigned /*opIdx*/) {
   return isa<RankedTensorType>(op->getResult(0).getType());
 }
 
-Value transformDot(OpBuilder & /*builder*/, Operation * /*op*/,
-                   llvm::ArrayRef<Value> /*transposedOperands*/) {
-  // D9: DotFlip commit-time materialisation is non-trivial because the
-  // new dot's accumulator/result encoding must be consistent with
-  // DotOperand parents on A and B, which requires either:
-  //   (a) the closure operand's encoding being a valid #mma/#blocked
-  //       that supports DotOperand-of-it, OR
-  //   (b) careful insertion of convert_layouts after the trans wraps.
+Value transformDot(OpBuilder &builder, Operation *op,
+                   llvm::ArrayRef<Value> transposedOperands) {
+  // Algebraic identity (out_t = out^T):
+  //   out = dot(A, B, C)   out:[M,N], A:[M,K], B:[K,N], C:[M,N]
+  //   out_t = dot(B^T, A^T, C^T)   out_t:[N,M]
+  //                                 newA = B^T : [N,K]  with opIdx=0
+  //                                 newB = A^T : [K,M]  with opIdx=1
+  //                                 newC = C^T : [N,M]
   //
-  // For D9 we deliberately return nullptr -- commit aborts and rolls
-  // back, so plans containing a downstream DotFlip don't mutate IR.
-  // Plans without DotFlip (e.g. dot -> elementwise -> return) still
-  // commit normally. The real DotFlip is a follow-up commit.
-  return nullptr;
+  // For each new-operand position:
+  //   * If the original operand is already in closure (transposed via an
+  //     upstream rule), reuse it.
+  //   * Otherwise wrap the original with tt.trans to swap its shape.
+  //   * Then insert ttg.convert_layout to bring it into the correct
+  //     DotOperand<opIdx, parent=accEnc, kWidth=k> form. kWidth is
+  //     preserved from the original A/B's DotOperand encoding.
+  //
+  // The result encoding (= newC's encoding, since dot's result type must
+  // equal C's type) is determined by transposedOperands[2]: if C was in
+  // closure, take its encoding as-is; otherwise insert tt.trans on C to
+  // derive a swapped-shape encoding.
+  if (transposedOperands.size() != 3)
+    return nullptr;
+  auto dotOp = dyn_cast<triton::DotOp>(op);
+  if (!dotOp)
+    return nullptr;
+
+  Value origA = op->getOperand(0);
+  Value origB = op->getOperand(1);
+  Value origC = op->getOperand(2);
+
+  auto origATy = dyn_cast<RankedTensorType>(origA.getType());
+  auto origBTy = dyn_cast<RankedTensorType>(origB.getType());
+  auto origCTy = dyn_cast<RankedTensorType>(origC.getType());
+  if (!origATy || !origBTy || !origCTy)
+    return nullptr;
+  if (origATy.getRank() != 2 || origBTy.getRank() != 2 ||
+      origCTy.getRank() != 2)
+    return nullptr;
+
+  // Preserve kWidth from the original DotOperand encodings of A and B.
+  unsigned kWidthA = 0;
+  unsigned kWidthB = 0;
+  if (auto enc = dyn_cast<DotOperandEncodingAttr>(origATy.getEncoding()))
+    kWidthA = enc.getKWidth();
+  if (auto enc = dyn_cast<DotOperandEncodingAttr>(origBTy.getEncoding()))
+    kWidthB = enc.getKWidth();
+
+  // newC: either the in-closure value or trans(origC).
+  Value newC = transposedOperands[2];
+  if (newC == origC) {
+    OpBuilder b(op);
+    auto trans = triton::TransOp::create(
+        b, op->getLoc(), origC, b.getDenseI32ArrayAttr({1, 0}));
+    newC = trans.getResult();
+  }
+  auto newCTy = dyn_cast<RankedTensorType>(newC.getType());
+  if (!newCTy)
+    return nullptr;
+  Attribute accEnc = newCTy.getEncoding();
+
+  // Helper: bring `v` into (transposed shape, DotOperand encoding with
+  // opIdx + kWidth + parent=accEnc).
+  auto buildOperand = [&](Value v, Value orig, unsigned opIdx,
+                          unsigned kWidth) -> Value {
+    Value transposed = v;
+    if (v == orig) {
+      auto srcTy = dyn_cast<RankedTensorType>(orig.getType());
+      if (!srcTy || srcTy.getRank() != 2)
+        return nullptr;
+      OpBuilder b(op);
+      auto trans = triton::TransOp::create(
+          b, op->getLoc(), orig, b.getDenseI32ArrayAttr({1, 0}));
+      transposed = trans.getResult();
+    }
+    auto transTy = dyn_cast<RankedTensorType>(transposed.getType());
+    if (!transTy)
+      return nullptr;
+    auto targetEnc = DotOperandEncodingAttr::get(
+        builder.getContext(), opIdx, accEnc, kWidth);
+    if (transTy.getEncoding() == targetEnc)
+      return transposed;
+    auto targetTy = RankedTensorType::get(transTy.getShape(),
+                                           transTy.getElementType(), targetEnc);
+    OpBuilder b(op);
+    return ConvertLayoutOp::create(b, op->getLoc(), targetTy, transposed)
+        .getResult();
+  };
+
+  // newA = (orig B at opIdx=0 in new dot); newB = (orig A at opIdx=1).
+  Value newA = buildOperand(transposedOperands[1], origB, 0, kWidthB);
+  Value newB = buildOperand(transposedOperands[0], origA, 1, kWidthA);
+  if (!newA || !newB)
+    return nullptr;
+
+  // Result type: shape-swapped, encoding = accEnc (matches newC).
+  llvm::SmallVector<int64_t, 2> newShape{origCTy.getDimSize(1),
+                                          origCTy.getDimSize(0)};
+  auto newResTy = RankedTensorType::get(newShape, origCTy.getElementType(),
+                                         accEnc);
+
+  auto newDot = triton::DotOp::create(
+      builder, op->getLoc(), newResTy, newA, newB, newC,
+      dotOp.getInputPrecision(), dotOp.getMaxNumImpreciseAcc());
+  return newDot.getResult();
 }
 
 Value transformConvertLayout(OpBuilder &builder, Operation *op,
