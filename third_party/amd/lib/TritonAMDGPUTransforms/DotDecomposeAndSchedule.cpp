@@ -1,43 +1,53 @@
 //===- DotDecomposeAndSchedule.cpp ----------------------------------------===//
 //
 // TTGIR-level replacement for the LLVM-IR `LLIRSchedule` pass on AMD MFMA
-// matmul kernels (v8 / v10 family). See:
-//   ~/MetaMain2/triton/claude/llir_sched_at_ttgir_design.md
-//   ~/MetaMain2/triton/claude/llir_sched_at_ttgir_plan.md
+// matmul kernels. See `~/MetaMain2/triton/claude/README.md` for the doc
+// index (design, plan, status, e2e coverage matrix).
 //
-// Status
-// ------
-//  - Phase 0 (cbfbda28f): no-op scaffold; emits remark per candidate inner
-//    loop.
-//  - Phase 1a (280370f92): compute the M-split partition plan per dot.
-//  - Phase 1b (a2c8db5b0): backward walker — collect producer ops to
-//    co-partition along the M dim. Walks from dot.getA() and dot.getC()
-//    with dim=0; deliberately skips dot.getB() (N-dim).
-//  - Phase 1c (this commit): forward walker — collect *user* ops on the
-//    dot's result chain. For v8/v10's in-loop chain this just picks up
-//    `scf.yield`; richer test cases also exercise `arith.truncf` /
-//    `ttg.convert_layout` / `amdgpu.buffer_store`. Adapted from
-//    `WSDataPartition::getForwardSliceToPartition`
-//    (third_party/nvidia/hopper/.../WSDataPartition.cpp:441), stripped
-//    of Hopper-only branches. **Still does not mutate IR.**
-//  - Phase 1d (6cc0e7545): actual SSA mutation. Gated behind
-//    `TRITON_TTGIR_SCHED_APPLY=1`. M-only split.
-//  - Phase 2 (7b7191047): compose N-split on top of M-split. Same APPLY
-//    gate now produces an M × N grid of sub-dots (8 × 4 = 32 for v8/v10)
-//    glued back via a single amdgpu.concat in row-major order.
-//  - Phase 3 (this commit): insert `ROCDL::SchedBarrier(0)` between
-//    M-rows of sub-dots, so LLVM's misched can't reorder dots across
-//    row boundaries. Each row of N sub-dots becomes a scheduling region
-//    that the backend can shuffle internally but not cross. This is the
-//    minimal Phase 3 — a richer pattern (e.g. flank each row with a
-//    barrier *before* and *after*, or insert barriers between every
-//    sub-dot) is parameterized via `TRITON_TTGIR_SCHED_BARRIER_STRIDE`
-//    (default = numPartitionsN, i.e. one barrier per M-row).
-//  - Phases 4-6: coverage matrix (FA, triton_kernels, stand-alone matmul),
-//    default-disable LLIR, docs.
+// What this pass does
+// -------------------
+// For each MFMA-typed `tt.dot` in an inner `scf.for`:
+//   1. Compute the M × N partition plan from
+//      `AMDMfmaEncodingAttr::getInstrShape()` and `warpsPerCTA`:
+//        ctaTileM = instrShape[0] * warpsPerCTA[0]    (32 for v8/v10)
+//        ctaTileN = instrShape[1] * warpsPerCTA[1]    (32 for v8/v10)
+//        numPartitionsM = blockM / ctaTileM           (8 for v8/v10)
+//        numPartitionsN = blockN / ctaTileN           (4 for v8/v10)
+//   2. Walk backward from `dot.getA()` and `dot.getC()` to collect
+//      producer ops that would need co-partitioning (adapted from
+//      `WSDataPartition::getBackwardSliceToPartition`,
+//      `third_party/nvidia/hopper/.../WSDataPartition.cpp:291`, stripped
+//      of Hopper-only branches).
+//   3. Walk forward from `dot.getResult()` to collect user ops
+//      (`WSDataPartition::getForwardSliceToPartition`:441, same strip).
+//   4. (APPLY only) Replace the dot with `M × N` sub-dots via
+//      `amdgpu.extract_slice` on each operand, then re-aggregate with a
+//      single `amdgpu.concat` in row-major (M outer, N inner) order.
+//   5. (APPLY only) Insert a `ROCDL::SchedBarrier(0)` after every k-th
+//      sub-dot (default k = numPartitionsN, i.e. one barrier per M-row)
+//      so LLVM's misched can optimize within row-bounded regions
+//      without reordering across boundaries.
 //
-// Opt-in behind `TRITON_ENABLE_TTGIR_SCHED=1`.
+// Producer / user chains are not modified — `extract_slice` is a no-op
+// at the CTA-tile level, so upstream layouts are preserved.
 //
+// Env-var contract
+// ----------------
+//   TRITON_ENABLE_TTGIR_SCHED          : enable the pass (planning-only)
+//   TRITON_TTGIR_SCHED_APPLY           : also mutate IR
+//   TRITON_TTGIR_SCHED_BARRIER_STRIDE  : barrier stride
+//                                          unset → numPartitionsN
+//                                          0     → no barriers
+//                                          1     → between every sub-dot
+//                                          k     → every k-th
+//
+// e2e results (stand-alone autotuned matmul, K sweep on gfx950):
+//   K=1024 → -1.4 %, K=2048 → +2.4 %, K=4096 → +4.1 %, K=8192 → +11.0 %
+// FA-fwd tutorial (the kernel that crashes the matmul_4waves LLIR pass
+// with `Instruction does not dominate all uses!`):
+//   runs correctly under TTGIR-SCHED with output within ±2 % of baseline.
+//
+//===----------------------------------------------------------------------===//
 //===----------------------------------------------------------------------===//
 
 #include "TritonAMDGPUTransforms/Passes.h"

@@ -1,5 +1,13 @@
 # Replacing LLIR SCHED with a TTGIR-level pass — design discussion
 
+> **STATUS (2026-05-30):** This design is **implemented**. See
+> [`README.md`](README.md) for the doc index, [`llir_sched_at_ttgir_plan.md`](llir_sched_at_ttgir_plan.md)
+> for the phased plan (Phases 0-4 + 6 landed; Phase 5 deferred), and
+> [`ttgir_sched_status.md`](ttgir_sched_status.md) for e2e validation
+> data. Headline outcome: stand-alone matmul +4.0 % mean (up to +11 %
+> at K=8192); FA-fwd runs correctly under the new pass (vs the
+> matmul_4waves LLIR pass which crashes on it).
+
 This document summarizes the design discussion around moving the
 `TRITON_ENABLE_LLIR_SCHED` pass (currently in
 `third_party/amd/lib/TritonAMDGPUToLLVM/LLIRSchedule.cpp`) from

@@ -1,12 +1,13 @@
 # TTGIR-SCHED Implementation Status
 
-> Last updated: 2026-05-30. See `llir_sched_at_ttgir_design.md` for the
-> design rationale and `llir_sched_at_ttgir_plan.md` for the original
-> 7-phase plan.
+> Last updated: 2026-05-30. See [`README.md`](README.md) for the doc
+> index, [`llir_sched_at_ttgir_design.md`](llir_sched_at_ttgir_design.md)
+> for design rationale, [`llir_sched_at_ttgir_plan.md`](llir_sched_at_ttgir_plan.md)
+> for the original phased plan (now annotated with per-phase commits).
 
 ## Where we are
 
-**Phases 0, 1a-1d, 2 are landed** (6 atomic commits, all lit-tested):
+**Phases 0, 1a-1d, 2, 3, 4 are landed** (10 atomic commits, 6 lit tests, all green):
 
 | Phase | Commit | Lines | Status |
 |---|---|---:|---|
