@@ -1,38 +1,38 @@
-#  Barrier Support in TLX
+# Barrier Support in TLX
 
 ## Introduction
 
 ### Barriers
 
 Barriers are primitives that allow synchronization between the warps of
-a kernel. There are full synchronous barriers like \_\_syncthreads(),
-which requires a warp to wait at the barrier until all other warps have
+a kernel. There are full synchronous barriers like `__syncthreads()`,
+which require a warp to wait at the barrier until all other warps have
 also reached the barrier. This blocking behavior makes them less
-efficient for implementing patterns like Warp Specialized Producer
-Consumer, where *Producer* warps can fill *buffer0*, notify *Consumers*
-waiting for *buffer0*, then go on to fill *buffer1* without waiting for
-Consumers to finish consuming buffer0.
+efficient for implementing patterns like warp-specialized
+producer-consumer, where *producer* warps can fill *buffer0*, notify
+*consumers* waiting for *buffer0*, then go on to fill *buffer1* without
+waiting for consumers to finish consuming *buffer0*.
 
 ### Asynchronous Barriers
 
-Asynchronous Barriers allow semaphore-like *Arrive()* and *Wait()* based
-coordination between warps. Asynchronous Barriers also provide the
+Asynchronous barriers allow semaphore-like *Arrive()* and *Wait()* based
+coordination between warps. Asynchronous barriers also provide the
 ability to perform synchronization only between a subset of the warps
 (*participating warps*). A warp that does an Arrive() on a barrier does
 not have to wait for other participating warps. The non-participating
 warps can execute independent of the participating warps. The
 participating warps use hardware barrier instructions, over unique
-pre-allocated hardware barrier objects or shared-memory(*shmem*)
+pre-allocated hardware barrier objects or shared-memory (*shmem*)
 allocated barrier objects, to achieve fine-grained synchronization. On
 certain NVIDIA platforms, asynchronous barriers can also be used to
 track the completion of asynchronous transactions, like TMA loads.
 
-**Note:** In the remainder of this doc we will refer to Asynchronous
-Barriers as just Barriers.
+**Note:** In the remainder of this doc we will refer to asynchronous
+barriers as just barriers.
 
-**Note:** AMD h/w does not support Asynchronous Barriers but most of the
-TLX barrier operations are implemented in s/w using shared-memory
-variables
+**Note:** AMD hardware does not support asynchronous barriers, but most
+of the TLX barrier operations are implemented in software using
+shared-memory variables.
 
 <p align="center">
   <img src="/third_party/tlx/media/image2.PNG"
@@ -44,12 +44,10 @@ variables
   instruction is assumed to start at the same time, across both scenarios.
 </p>
 
-#####
-
 ### Barrier Operations
 
-Barrier operations can be classified into three categories a)
-*Alloc/Init* b) *Arrive* c) *Wait*
+Barrier operations can be classified into three categories: a)
+*Alloc/Init*, b) *Arrive*, and c) *Wait*.
 
 *Alloc/Init*
 
@@ -58,7 +56,7 @@ Barrier operations can be classified into three categories a)
 - Initialize barriers with the count of threads that are expected to
   perform an Arrive operation on the barrier.
 
-- **Note:** This allocation and initialization steps are not required
+- **Note:** These allocation and initialization steps are not required
   for hardware pre-allocated barriers.
 
 - Barriers can also be used to track completion of asynchronous memory
@@ -80,33 +78,33 @@ Barrier operations can be classified into three categories a)
   the Arrive happens implicitly when the transaction is completed. Some
   examples include:
 
-  - A TMA op will arrive a barrier when it has transferred an expected
+  - A TMA op will arrive on a barrier when it has transferred an expected
     amount of bytes
 
   - A Blackwell tcgen05 commit op will have a barrier to track all prior
     async tcgen05 ops initiated by the calling thread. When those ops
-    are done, the barrier will be arrived.
+    are done, they will arrive on the barrier.
 
 *Wait*
 
 - A warp performing a Wait is blocked at a barrier until the specified
-  number of Arrive’ing warps reach the barrier or until the expected
+  number of arriving warps reach the barrier or until the expected
   transaction count is reached.
 
 - A warp that performs a Wait on a barrier executes independent of other
   warps waiting at the barrier and such warps can enter and exit the
-  Wait at different times
+  Wait at different times.
 
 ## TLX Barriers
 
-TLX provides two categories of barriers a) Named Barriers and b) Memory
-barriers
+TLX provides two categories of barriers: a) named barriers and b) memory
+barriers.
 
 ### Named Barriers
 
-- **Note:** Named barriers are only supported on NVIDIA
+- **Note:** Named barriers are only supported on NVIDIA.
 
-- Named barriers are h/w pre-allocated barrier objects that are
+- Named barriers are hardware pre-allocated barrier objects that are
   referenced by a number (name of the barrier). The supported range for
   this number is 0-15 per CTA.
 
@@ -116,23 +114,22 @@ barriers
   arrive at the barrier.
 
 - All threads in the warp participate in the arrive operation, so the
-  thread count should be *number of warps \* threads per warp*
+  thread count should be *number of warps \* threads per warp*.
 
-- Suitable for achieving execution patterns like PingPong where a mutual
-  exclusive execution order is desired
+- Suitable for achieving execution patterns like PingPong where a
+  mutually exclusive execution order is desired.
 
 #### APIs
 
 - ***tlx.named_barrier_wait(bar_id, num_threads)***
   Wait until num_threads threads have reached the phase of the *bar_id*
-  named barrier. num_threads has to be a multiple of warp size i.e.
-  multiples of 32.
+  named barrier. num_threads has to be a multiple of warp size, i.e.,
+  a multiple of 32.
 
 - ***tlx.named_barrier_arrive(bar_id, num_threads)***
   Signal arrival at *bar_id* named barrier with an arrival count of
-  *num_threads*. num_threads has to be a multiple of warp size i.e.
-  multiples of 32.
-
+  *num_threads*. num_threads has to be a multiple of warp size, i.e.,
+  a multiple of 32.
 
 | TLX | MLIR | PTX |
 |----|----|----|
@@ -153,22 +150,20 @@ illustrates this idea.
 
 ```python
 if cid == 0:
-  #Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 9.
+  # Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 9.
   tlx.named_barrier_wait(9, 256)
 else:
-  #Consumer 1 signals its arrival at barrier 9.
+  # Consumer 1 signals its arrival at barrier 9.
   tlx.named_barrier_arrive(9, 256)
-  #Then waits at barrier 10 until Consumer 0 finishes issuing its async_dot.
+  # Then waits at barrier 10 until Consumer 0 finishes issuing its async_dot.
   tlx.named_barrier_wait(10, 256)
   qk = tlx.async_dot(q_tile, k_tile)
 if cid == 0:
-  #After issuing async_dot, Consumer0 signals barrier 10 to unblock Consumer 1.
-
+  # After issuing async_dot, Consumer 0 signals barrier 10 to unblock Consumer 1.
   tlx.named_barrier_arrive(10, 256)
-  # wait for the MMA using to complete
+  # Wait for the MMA op to complete.
   qk = tlx.async_dot_wait(0, qk)
 ```
-
 
 The PingPong schedule is achieved using *named barriers* 9 and 10.
 
@@ -183,7 +178,7 @@ each, with 32 threads per warp, so the arrive/wait count is set to
 - The kernel has to allocate the *shmem* barrier object and initialize
   it with an integer *expected* *count* value.
 
-- The barrier object implicitly tracks the *phase* of the barrier*.*
+- The barrier object implicitly tracks the *phase* of the barrier.
   Phase is a 0-initialized boolean value that is toggled every time the
   following conditions are met:
 
@@ -191,16 +186,16 @@ each, with 32 threads per warp, so the arrive/wait count is set to
 
   - The expected transaction count is reached
 
-- A phase flip is an indication to the Wait’ing warps that the
-  Arrive’ing warps have completed the work that the Wait’ing warps are
+- A phase flip is an indication to the waiting warps that the
+  arriving warps have completed the work that the waiting warps are
   blocked on.
 
 - CUDA [<u>documentation on
   phase</u>](https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-mbarrier-phase-completion)
 
-- Wait’ing warps have to maintain the barrier’s phase in a local
+- Waiting warps have to maintain the barrier’s phase in a local
   variable and pass it to the Wait call. The Wait will block until the
-  passed-in phase is not equal to the barrier’s phase i.e. until a
+  passed-in phase is not equal to the barrier’s phase, i.e., until a
   barrier phase flip has occurred.
 
 - Pseudocode for *arrive*
@@ -245,11 +240,10 @@ while !done:
 
 #### Barrier APIs
 
-- ***tlx.alloc_barrier(num_barriers, arrive_count=1)**  *
-  Allocates a buffer in shared memory for *num_barrier* barrier objects
+- ***tlx.alloc_barrier(num_barriers, arrive_count=1)***
+  Allocates a buffer in shared memory for *num_barriers* barrier objects
   and initializes them with *arrive_count*. *arrive_count* should be
-  initialized based on the context in which this barrier’s barrier is
-  executed.
+  initialized based on the context in which this barrier is executed.
 
 | Context of arrive | arrive_count | Notes |
 |:---|:---|:---|
@@ -260,18 +254,18 @@ while !done:
 
 - ***tlx.barrier_expect_bytes(bar, bytes)***
   Specifies that *bytes* amount of data is expected to be copied before
-  a barrier\_*wait* on *bar* can be unblocked. An implicit arrive will
+  a *barrier_wait* on *bar* can be unblocked. An implicit arrive will
   happen on *bar* when the corresponding transaction completes reading
   *bytes* amount of data.
 
 - ***tlx.barrier_wait(bar, phase)***
-  Wait until the *bar*’s phase has moved ahead of the *phase* argument .
+  Wait until the *bar*’s phase has moved ahead of the *phase* argument.
 
 - ***tlx.barrier_arrive(bar, arrive_count=1)***
   Performs an arrive operation on *bar*, by decrementing *arrive_count*
-  from the *bar*’s arrival count*.* The phase of *bar* is flipped if
+  from the *bar*’s arrival count. The phase of *bar* is flipped if
   bar’s arrival count becomes 0. **Note:** It is recommended to use the
-  barrier_arrive() with arrive_count=1. The *arrive_count* of
+  barrier_arrive() with *arrive_count=1*. The *arrive_count* of
   *tlx.alloc_barrier* can be set to achieve the desired phase change
   behavior.
 
@@ -297,11 +291,11 @@ producer warp group (aka async task in TLX) for TMA load and 2 consumer
 warp groups for MMA. The target tile BMxBN (in green) is computed by
 BMxK (in blue) and KxBN (in yellow) and requires 8 MMA of smaller tiles
 with sizes of (BM/2) x BK and BK x BN. (Dividing BM by 2 because we have
-2 consumer groups)
+2 consumer groups.)
 
-TLX mbarriers are used by WS-GEMM for asynchronized communication
+TLX mbarriers are used by WS-GEMM for asynchronous communication
 between warp groups. In the simplest case, when TMA WG issues a TMA load
-bonding barFull, the MMA WG waits for barFull before doing MMA. Once the
+bound to barFull, the MMA WG waits for barFull before doing MMA. Once the
 TMA load finishes, barFull will arrive and MMA op begins. Once MMA is
 completed, a barEmpty will be marked 'arrived' so that the other waiting
 WG can proceed.
@@ -326,7 +320,7 @@ a BMxBN target tile is calculated. Recall we have (1) 8 (BM/2)xBK
 sub-tiles from A and 4 BKxBN sub-tiles from B (2) 1 TMA WG (producer)
 and 2 MMA WGs (consumer) (3) 4 EmptyA bars, 4 FullA bars, 2 EmptyB bars
 and 2 FullB bars because each WGMMA operation needs two 'full' bars for
-both operands and each TMA load need one 'empty' bar to proceed.
+both operands and each TMA load needs one 'empty' bar to proceed.
 
 <p align="center">
 <img src="/third_party/tlx/media/image1.PNG" style="width:6.5in;height:2.5in" />

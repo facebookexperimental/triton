@@ -1,6 +1,6 @@
-import triton.language.core as tl
-
 import re
+
+import triton.language.core as tl
 import triton.runtime.driver as driver
 
 
@@ -68,10 +68,9 @@ def dtype_of(v, _semantic=None) -> tl.dtype:
         if dtype.is_ptr():
             dtype = dtype.element_ty
         return dtype
-    elif isinstance(v, tl.tensor_descriptor_base):
+    if isinstance(v, tl.tensor_descriptor_base):
         return v.dtype
-    else:
-        raise ValueError(f"dtype_of only works on tensors and tensor descriptors, but got {v}")
+    raise ValueError(f"dtype_of only works on tensors and tensor descriptors, but got {v}")
 
 
 @tl.builtin
@@ -104,10 +103,8 @@ def get_fp8_format_name(dtype: tl.dtype, _semantic=None) -> tl.constexpr:
     Example:
         Q_FP8_FORMAT: tl.constexpr = tlx.get_fp8_format_name(tlx.dtype_of(desc_q))
     """
-    # Unwrap constexpr if needed (when dtype is passed as a tl.constexpr kernel parameter)
     dtype = tl._unwrap_if_constexpr(dtype)
     assert isinstance(dtype, tl.dtype), f"get_fp8_format_name expects a dtype, but got {type(dtype)}"
-    # Only support FP8 types that map to "e5m2" or "e4m3" for scaled MMA operations
     if dtype == tl.float8e5:
         return tl.constexpr("e5m2")
     elif dtype == tl.float8e4nv:
@@ -176,12 +173,10 @@ def stoch_round(
                       ], (f"Stochastic rounding only supports fp8/fp16/bf16 destination, got {dst_ty}. "
                           f"Supported types: float8e5 (fp8 E5M2), float8e4nv (fp8 E4M3FN), float16, bfloat16")
 
-    # Verify rbits shape matches src shape
     rbits_ty = rand_bits.type
     if src_ty.is_block() and rbits_ty.is_block():
         assert src_ty.shape == rbits_ty.shape, f"rand_bits shape {rbits_ty.shape} must match src shape {src_ty.shape}"
     elif not src_ty.is_block() and not rbits_ty.is_block():
-        # Both are scalars - OK
         pass
     else:
         raise ValueError(f"src and rand_bits must both be blocks or both be scalars, "
@@ -189,7 +184,6 @@ def stoch_round(
 
     if src_sca_ty == dst_ty:
         return src
-    # Construct the proper result type (block type if source is block)
     if src_ty.is_block():
         result_ty = src_ty.with_element_ty(dst_ty)
         dst_ir_ty = result_ty.to_ir(_semantic.builder)

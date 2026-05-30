@@ -95,7 +95,7 @@ def _apply_causal_mask(qk, col_limit_right, BLOCK_N: tl.constexpr):
     # Credit to Tri Dao,
     # https://github.com/Dao-AILab/flash-attention/commit/bac1001e4f6caa09d70537495d6746a685a2fa78
     #
-    # NOTE: We use map_elementiwse here in order to generate an interleaved sequence of instructions
+    # NOTE: We use map_elementwise here in order to generate an interleaved sequence of instructions
     # that processes one element of qk at a time. This improves ptxas's resulting SASS.
     offs_n = tl.arange(0, BLOCK_N)[None, :]
     s = offs_n & ~0xF
@@ -188,7 +188,7 @@ def _attn_fwd_subtile(
         p_bf16 = p.to(dtype)
     else:
         p_bf16 = tl.join(p0_bf16, p1_bf16).permute(0, 2, 1).reshape([PM, PN])
-    # note that this non transposed v for FP8 is only supported on Blackwell
+    # note that this non-transposed v for FP8 is only supported on Blackwell
     acc = tl.dot(p_bf16, v, acc)
     if not FADD2_REDUCE:
         l_i0 = l_i0 * alpha + l_ij
@@ -441,8 +441,7 @@ def prune_persistent_configs(configs, named_args, **kwargs):
 def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
     if isinstance(desc_or_ptr, triton.language.core.tensor_descriptor_base):
         return desc_or_ptr
-    else:
-        return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
+    return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
 
 
 @triton.jit

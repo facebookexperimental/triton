@@ -13,7 +13,7 @@ class TLX_Attr<string name, list<Trait> traits = [],
 // Dummy Layout Attributes for Deferred Layout Resolution
 //===----------------------------------------------------------------------===//
 
-def TLX_DummyRegisterLayoutAttr : TLX_Attr<"DummyRegisterLayout", []> {
+def TLX_DummyRegisterLayoutAttr : TLX_Attr<"DummyRegisterLayout"> {
   let mnemonic = "dummy_register_layout";
   let summary = "Placeholder layout for register-distributed tensors to be resolved after inlining";
 
@@ -43,7 +43,7 @@ def TLX_DummyRegisterLayoutAttr : TLX_Attr<"DummyRegisterLayout", []> {
   let assemblyFormat = "`<` `[` $shape `]` `,` $elementType `,` $tmemCompatible `>`";
 }
 
-def TLX_DummyTMEMLayoutAttr : TLX_Attr<"DummyTMEMLayout", []> {
+def TLX_DummyTMEMLayoutAttr : TLX_Attr<"DummyTMEMLayout"> {
   let mnemonic = "dummy_tmem_layout";
   let summary = "Placeholder layout for TMEM tensors to be resolved during layout propagation";
 

@@ -74,13 +74,13 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                                        EPILOGUE_SUBTILE: tl.constexpr,  #
                                        USE_WARP_BARRIER: tl.constexpr = False,  #
                                        ):
-    # allocate NUM_SMEM_BUFFERS buffers
+    # Allocate NUM_SMEM_BUFFERS buffers.
     buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tlx.dtype_of(a_desc), NUM_SMEM_BUFFERS)
     buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tlx.dtype_of(b_desc), NUM_SMEM_BUFFERS)
-    # use multiple TMEM buffers to overlap MMA and epilogue
+    # Use multiple TMEM buffers to overlap MMA and epilogue.
     tmem_buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float32, NUM_TMEM_BUFFERS, tlx.storage_kind.tmem)
 
-    # allocate barriers
+    # Allocate barriers.
     smem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
     smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
     if USE_WARP_BARRIER:
@@ -94,13 +94,11 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
 
     with tlx.async_tasks():
         with tlx.async_task("default"):  # epilogue consumer
-            # common code duplicated for each region to avoid SMEM overhead
+            # Common code duplicated for each region to avoid SMEM overhead.
             start_pid = tl.program_id(axis=0)
             num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
             num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
             num_pid_in_group = GROUP_SIZE_M * num_pid_n
-            k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
-            # end of common code
 
             tmem_read_phase = 0
             cur_tmem_buf = 0
@@ -110,9 +108,6 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
             clc_phase_producer = 1
             clc_phase_consumer = 0
             while tile_id != -1:
-                # Debug prints
-                # if tlx.thread_id(axis=0) == 0:
-                # tl.device_print("Default WG Processing CtaID", tile_id)
                 # producer
                 tlx.clc_producer(clc_context, clc_phase_producer)
                 clc_phase_producer ^= 1
@@ -152,18 +147,10 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                 tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                 clc_phase_consumer ^= 1
 
-                # Debug-only: verifying that CLC steals workloads successfully
-                # if tlx.thread_id(axis=0) == 0:
-                # tl.device_print("Extracted CtaID", tile_id)
-
         with tlx.async_task(num_warps=1, num_regs=232):  # MMA consumer
-            # common code duplicated for each region to avoid SMEM overhead
+            # Common code duplicated for each region to avoid SMEM overhead.
             start_pid = tl.program_id(axis=0)
-            num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-            num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-            num_pid_in_group = GROUP_SIZE_M * num_pid_n
             k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
-            # end of common code
 
             dot_phase = 0  # the current phase of dot op
             tmem_write_phase = 1  # sync between epilogue consumer and MMA consumer
@@ -173,10 +160,6 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
             tile_id = start_pid
             clc_phase_consumer = 0
             while tile_id != -1:
-                pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
-                offs_am = pid_m * BLOCK_SIZE_M
-                offs_bn = pid_n * BLOCK_SIZE_N
-
                 # wait epilogue consumer to be done with the buffer before reusing it
                 tlx.barrier_wait(tmem_empty_bars[cur_tmem_buf], tmem_write_phase)
                 # flip phase at the end of a round of using TMEM barriers
@@ -210,17 +193,15 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                 clc_phase_consumer ^= 1
 
         with tlx.async_task(num_warps=1, num_regs=232):  # producer, TMA load
-            # common code duplicated for each region to avoid SMEM overhead
+            # Common code duplicated for each region to avoid SMEM overhead.
             start_pid = tl.program_id(axis=0)
             num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
             num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
             num_pid_in_group = GROUP_SIZE_M * num_pid_n
             k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
-            # end of common code
 
             load_phase = 0  # the current phase of TMA load
-            # we virtually "flatten" the two layer loop as if we're performing tma loads on
-            # one big list of data
+            # Treat TMA loads across tiles as one flattened list of K-block work.
             processed_k_iters = 0
 
             tile_id = start_pid

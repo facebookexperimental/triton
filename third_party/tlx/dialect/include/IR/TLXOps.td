@@ -8,7 +8,6 @@ include "mlir/Interfaces/InferTypeOpInterface.td" // SameOperandsAndResultType
 include "mlir/Interfaces/ControlFlowInterfaces.td" // RegionBranchOpInterface
 include "mlir/Interfaces/DestinationStyleOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td" // Pure
-include "mlir/Interfaces/InferTypeOpInterface.td"  // SameOperandsAndResultType
 include "triton/Dialect/Triton/IR/TritonTypes.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUTypes.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUTypeInterfaces.td"
@@ -285,8 +284,8 @@ def TLX_ReleaseLayoutOp : TLX_Op<"release_layout",
 }
 
 def TLX_LocalAliasOp : TLX_Op<"local_alias",
-                                   [SameOperandAndResultMemorySpace,
-                                    Pure]> {
+                              [SameOperandAndResultMemorySpace,
+                               Pure]> {
   let summary = "Create an alias of a local memory buffer";
 
   let description = [{

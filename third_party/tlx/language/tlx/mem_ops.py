@@ -703,8 +703,7 @@ def local_load(
         output = _semantic.builder.create_local_load(src.handle, token.handle if token else None)
         result = tl.tensor(output, block_type)
         if token is not None and _semantic.builder.options.backend_name == "hip":
-            result.handle.set_attr("ttg.amdg.syncedViaAsyncWait",
-                                   _semantic.builder.get_bool_attr(True))
+            result.handle.set_attr("ttg.amdg.syncedViaAsyncWait", _semantic.builder.get_bool_attr(True))
         return result
 
 
@@ -1035,8 +1034,6 @@ def async_descriptor_store(
         f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'")
     assert store_reduce in ("", "add", "min", "max", "and", "or", "xor"), (
         f"store_reduce must be '', 'add', 'min', 'max', 'and', 'or', or 'xor', got '{store_reduce}'")
-    from triton._C.libtriton import ir
-
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
     source_handle = require_nv_mma_shared_layout(source, True, _semantic.builder)

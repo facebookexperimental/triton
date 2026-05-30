@@ -159,7 +159,7 @@ def _to_mxfp8_block(
         VEC_SIZE: The MX block size (typically 32)
         dtype: Target output dtype, either tl.float8e4nv or tl.float8e5
 
-    Return:
+    Returns:
         The FP8 data and E8M0 scales. Callers are responsible for storing them.
     """
     BLOCK_K: tl.constexpr = data_input.shape[1]
@@ -179,15 +179,15 @@ def _amax_to_e8m0_and_quantize(
     dtype: tl.constexpr,
 ):
     """
-    Compute E8M0 scales from pre-computed block amaxes and quantize data to FP8.
+    Compute E8M0 scales from precomputed block amaxes and quantize data to FP8.
 
     Instead of computing max(abs(data)) per block (128 max ops per row), this
-    function accepts pre-computed block amaxes derived from the raw QK values
+    function accepts precomputed block amaxes derived from the raw QK values
     via monotonicity of exp2: max(exp2(x)) == exp2(max(x)).
 
     Args:
         data_input: Input tensor [BLOCK_M, BLOCK_K] in float32
-        block_amax: Pre-computed block amaxes [BLOCK_M, NUM_SCALES]
+        block_amax: Precomputed block amaxes [BLOCK_M, NUM_SCALES]
         VEC_SIZE: MX block size (32)
         dtype: tl.float8e4nv or tl.float8e5
 
@@ -229,19 +229,19 @@ def _to_mxfp8_block_with_block_amax(
     dtype: tl.constexpr,
 ):
     """
-    Convert float32 data to MXFP8 using pre-computed block amaxes.
+    Convert float32 data to MXFP8 using precomputed block amaxes.
 
     This is the blockscaled variant of _to_mxfp8_block that skips the expensive
-    max(abs(data)) computation per 32-element block by accepting pre-computed
+    max(abs(data)) computation per 32-element block by accepting precomputed
     block amaxes derived from raw QK values.
 
     Args:
         data_input: Input tensor [BLOCK_M, BLOCK_K] in float32
-        block_amax: Pre-computed block amaxes [BLOCK_M, NUM_SCALES]
+        block_amax: Precomputed block amaxes [BLOCK_M, NUM_SCALES]
         VEC_SIZE: MX block size (32)
         dtype: tl.float8e4nv or tl.float8e5
 
-    Return:
+    Returns:
         The FP8 data and E8M0 scales. Callers are responsible for storing them.
     """
     BLOCK_K: tl.constexpr = data_input.shape[1]

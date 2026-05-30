@@ -6,7 +6,7 @@ echo "Hello! (Facebook-only)"
 ask() {
     retval=""
     while true; do
-        read -p "Need to build triton in this script? {y|n}" yn
+        read -p "$1" yn
         case $yn in
             [Yy]* ) retval="yes"; break;;
             [Nn]* ) retval="no"; break;;
@@ -15,24 +15,12 @@ ask() {
     done
     echo "$retval"
 }
-if [ "$(ask)" == "yes" ]; then
+if [ "$(ask "Need to build triton in this script? {y|n}")" == "yes" ]; then
     pip install -e . --no-build-isolation
 fi
 
 # Run LIT
-ask() {
-    retval=""
-    while true; do
-        read -p "Run all LITs? {y|n}" yn
-        case $yn in
-            [Yy]* ) retval="yes"; break;;
-            [Nn]* ) retval="no"; break;;
-            * ) echo "Please answer yes or no.";;
-        esac
-    done
-    echo "$retval"
-}
-if [ "$(ask)" == "yes" ]; then
+if [ "$(ask "Run all LITs? {y|n}")" == "yes" ]; then
     echo "Running LITs"
     pushd build/cmake.linux-x86_64-cpython-3.13/
     lit test -a
@@ -41,19 +29,7 @@ fi
 
 
 # Run core triton unit tests
-ask() {
-    retval=""
-    while true; do
-        read -p "Run core Triton python unit tests? {y|n}" yn
-        case $yn in
-            [Yy]* ) retval="yes"; break;;
-            [Nn]* ) retval="no"; break;;
-            * ) echo "Please answer yes or no.";;
-        esac
-    done
-    echo "$retval"
-}
-if [ "$(ask)" == "yes" ]; then
+if [ "$(ask "Run core Triton python unit tests? {y|n}")" == "yes" ]; then
     echo "Running core Triton python unit tests"
     pytest python/test/unit/language/*.py
     pytest python/test/unit/runtime/*.py
@@ -67,19 +43,7 @@ fi
 
 
 # Run TLX unit tests
-ask() {
-    retval=""
-    while true; do
-        read -p "Run all TLX unit tests? {y|n}" yn
-        case $yn in
-            [Yy]* ) retval="yes"; break;;
-            [Nn]* ) retval="no"; break;;
-            * ) echo "Please answer yes or no.";;
-        esac
-    done
-    echo "$retval"
-}
-if [ "$(ask)" == "yes" ]; then
+if [ "$(ask "Run all TLX unit tests? {y|n}")" == "yes" ]; then
     echo "Running TLX Unit Tests"
     pytest python/test/unit/language/test_tlx_*.py
 fi

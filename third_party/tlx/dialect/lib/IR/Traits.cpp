@@ -1,11 +1,6 @@
 #include "tlx/dialect/include/IR/Traits.h"
 
-#include "mlir/IR/TypeUtilities.h"
-#include "triton/Dialect/Triton/IR/Dialect.h"
-#include "triton/Dialect/Triton/IR/Types.h"
-#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "llvm/Support/ErrorHandling.h"
 
 using namespace mlir;
 namespace ttg = ::mlir::triton::gpu;
