@@ -606,18 +606,37 @@ TransposeScore scoreTransposePlan(const TransposePlan &plan) {
 }
 
 void commitTransposePlan(const TransposePlan &plan) {
-  // D9: real commit engine. Lazy-root variant: insert a tt.trans on each
-  // annotated root's result (no algebraic flip yet), then materialize the
-  // downstream plan via rule transforms; insert boundary back-trans;
-  // replaceAllUsesWith + erase originals. SCFCarryRetype is not yet
-  // commit-implemented (its transform stays nullptr -> commit aborts on
-  // plans that include it). DotFlip and ConvertLayoutAdjust are real.
+  // D9+D10+D11: commit engine.
+  //
+  // Approach:
+  //   1. Lazy-root: insert tt.trans on each annotated root's result.
+  //      seedMap[root.result] = trans.result. The root op itself stays
+  //      in place; its inserted trans is the "in-closure" view of the
+  //      root.
+  //   2. SCFCarryRetype prep: for every scf.yield in plan, identify
+  //      yield operand indices whose def is in plan (will be in closure
+  //      after commit). For each, insert tt.trans on the parent for's
+  //      iter_arg at body top -- seedMap[iter_arg] = trans.result --
+  //      so in-loop rules see the transposed iter_arg.
+  //   3. Topo-sort plan.ops; for each non-root, non-SCFCarryRetype op,
+  //      call rule->transform with operands gathered from seedMap.
+  //      Record the new result.
+  //   4. SCFCarryRetype rewire: for each yield in plan, for each
+  //      operand that's in seedMap, insert tt.trans (+ optional
+  //      convert_layout) to bring the closure value back to the iter
+  //      arg's original type, and update yield's operand.
+  //   5. Boundary back-trans: insert tt.trans on every (consumer,
+  //      opIdx) in plan.boundaryOps.
+  //   6. ReplaceAllUsesWith + erase originals (skipping roots; block
+  //      args have no defining op, so they're naturally skipped too).
+  //   7. Strip kTransposePropagateRootAttrName from roots.
   if (plan.empty() || plan.rejected())
     return;
 
   llvm::DenseMap<Value, Value> seedMap;
   llvm::SmallVector<Operation *> createdOps;
   llvm::DenseSet<Operation *> rootSet(plan.roots.begin(), plan.roots.end());
+  llvm::DenseSet<Operation *> planSet(plan.ops.begin(), plan.ops.end());
 
   auto rollback = [&]() {
     for (Operation *op : llvm::reverse(createdOps)) {
@@ -626,7 +645,7 @@ void commitTransposePlan(const TransposePlan &plan) {
     }
   };
 
-  // Lazy root: tt.trans on each root's result.
+  // Step 1: lazy root.
   for (Operation *root : plan.roots) {
     if (root->getNumResults() != 1) {
       rollback();
@@ -638,19 +657,63 @@ void commitTransposePlan(const TransposePlan &plan) {
       rollback();
       return;
     }
-    // Insert tt.trans just after the root op.
-    OpBuilder builder(root->getBlock(),
-                      std::next(Block::iterator(root)));
+    OpBuilder builder(root->getBlock(), std::next(Block::iterator(root)));
     auto trans = triton::TransOp::create(builder, root->getLoc(), rootRes,
                                           builder.getDenseI32ArrayAttr({1, 0}));
     createdOps.push_back(trans);
     seedMap[rootRes] = trans.getResult();
   }
 
-  // Topo-sort plan.ops, materialize each non-root rule.
+  // Step 2: SCFCarryRetype prep -- insert tt.trans on each retyped
+  // iter_arg at body top, so in-loop rules see the transposed iter_arg.
+  for (Operation *op : plan.ops) {
+    auto ruleIt = plan.ruleFor.find(op);
+    if (ruleIt == plan.ruleFor.end() || !ruleIt->second)
+      continue;
+    if (ruleIt->second->kind != TransposeRuleKind::SCFCarryRetype)
+      continue;
+    auto yield = dyn_cast<scf::YieldOp>(op);
+    if (!yield)
+      continue;
+    auto forOp = dyn_cast<scf::ForOp>(yield->getParentOp());
+    if (!forOp)
+      continue;
+    auto iterArgs = forOp.getRegionIterArgs();
+    for (unsigned k = 0; k < yield->getNumOperands(); ++k) {
+      Value yielded = yield->getOperand(k);
+      Operation *def = yielded.getDefiningOp();
+      // Either an in-plan op produces this yield value, or the yield
+      // value IS itself an iter_arg (passed through). In both cases the
+      // closure invariant pulls iter_arg(k) into transposed orientation.
+      bool inClosure = def && planSet.contains(def);
+      if (!inClosure) {
+        // Also handle pass-through: yielded == iter_arg(k).
+        if (k < iterArgs.size() && yielded == iterArgs[k])
+          inClosure = true;
+      }
+      if (!inClosure)
+        continue;
+      if (k >= iterArgs.size())
+        continue;
+      Value iterArg = iterArgs[k];
+      if (seedMap.count(iterArg))
+        continue;
+      auto iterTy = dyn_cast<RankedTensorType>(iterArg.getType());
+      if (!iterTy || iterTy.getRank() != 2) {
+        rollback();
+        return;
+      }
+      OpBuilder b(&forOp.getBody()->front());
+      auto trans = triton::TransOp::create(
+          b, forOp.getLoc(), iterArg, b.getDenseI32ArrayAttr({1, 0}));
+      createdOps.push_back(trans);
+      seedMap[iterArg] = trans.getResult();
+    }
+  }
+
+  // Step 3: topo-sort and materialize non-root, non-SCFCarryRetype rules.
   llvm::SetVector<Operation *> opSet(plan.ops.begin(), plan.ops.end());
   auto sorted = mlir::topologicalSort(opSet);
-
   for (Operation *op : sorted) {
     if (rootSet.contains(op))
       continue;
@@ -658,9 +721,9 @@ void commitTransposePlan(const TransposePlan &plan) {
     if (ruleIt == plan.ruleFor.end() || !ruleIt->second)
       continue;
     const TransposeRule *rule = ruleIt->second;
+    if (rule->kind == TransposeRuleKind::SCFCarryRetype)
+      continue; // handled in step 4
     if (!rule->transform) {
-      // Rule has no commit-side transform (e.g. SCFCarryRetype, not yet
-      // implemented). Abort the whole plan.
       rollback();
       return;
     }
@@ -668,7 +731,6 @@ void commitTransposePlan(const TransposePlan &plan) {
       rollback();
       return;
     }
-
     llvm::SmallVector<Value, 4> operands;
     for (Value v : op->getOperands()) {
       auto it = seedMap.find(v);
@@ -685,9 +747,53 @@ void commitTransposePlan(const TransposePlan &plan) {
     seedMap[op->getResult(0)] = newResult;
   }
 
-  // Boundary back-trans inserts. For each (user, opIdx), look up the
-  // operand in seedMap; if found (in-closure), insert tt.trans to bring
-  // the value back to original orientation, and rewire.
+  // Step 4: SCFCarryRetype rewire -- for each yield in plan, for each
+  // operand whose source is in seedMap, insert tt.trans (+ optional
+  // convert_layout) to bring it back to the iter_arg's original type.
+  for (Operation *op : plan.ops) {
+    auto ruleIt = plan.ruleFor.find(op);
+    if (ruleIt == plan.ruleFor.end() || !ruleIt->second)
+      continue;
+    if (ruleIt->second->kind != TransposeRuleKind::SCFCarryRetype)
+      continue;
+    auto yield = dyn_cast<scf::YieldOp>(op);
+    if (!yield)
+      continue;
+    auto forOp = dyn_cast<scf::ForOp>(yield->getParentOp());
+    if (!forOp)
+      continue;
+    auto iterArgs = forOp.getRegionIterArgs();
+    for (unsigned k = 0; k < yield->getNumOperands(); ++k) {
+      Value orig = yield->getOperand(k);
+      auto it = seedMap.find(orig);
+      if (it == seedMap.end())
+        continue;
+      if (k >= iterArgs.size())
+        continue;
+      auto iterTy = dyn_cast<RankedTensorType>(iterArgs[k].getType());
+      if (!iterTy) {
+        rollback();
+        return;
+      }
+      OpBuilder b(yield);
+      auto backTrans = triton::TransOp::create(
+          b, yield.getLoc(), it->second, b.getDenseI32ArrayAttr({1, 0}));
+      createdOps.push_back(backTrans);
+      Value back = backTrans.getResult();
+      auto backTy = cast<RankedTensorType>(back.getType());
+      if (backTy.getEncoding() != iterTy.getEncoding()) {
+        auto coercedTy = RankedTensorType::get(
+            backTy.getShape(), backTy.getElementType(), iterTy.getEncoding());
+        Value coerced =
+            ConvertLayoutOp::create(b, yield.getLoc(), coercedTy, back)
+                .getResult();
+        back = coerced;
+      }
+      yield->setOperand(k, back);
+    }
+  }
+
+  // Step 5: boundary back-trans.
   for (auto &boundary : plan.boundaryOps) {
     Operation *user = boundary.first;
     unsigned opIdx = boundary.second;
@@ -708,9 +814,7 @@ void commitTransposePlan(const TransposePlan &plan) {
     user->setOperand(opIdx, backTrans.getResult());
   }
 
-  // ReplaceAllUsesWith for each non-root seedMap entry, then erase the
-  // originals. Roots are left in place (the inserted lazy tt.trans
-  // depends on them).
+  // Step 6: rallu + erase originals (skip roots and block args).
   llvm::SmallVector<Operation *> toErase;
   for (auto &kv : seedMap) {
     Value orig = kv.first;
@@ -721,15 +825,24 @@ void commitTransposePlan(const TransposePlan &plan) {
     orig.replaceAllUsesWith(newV);
     toErase.push_back(defOp);
   }
-  // Erase in reverse-topological order (uses before defs).
   for (Operation *op : llvm::reverse(toErase)) {
     if (op->use_empty())
       op->erase();
   }
 
-  // Strip annotation from roots so the pass is idempotent.
+  // Step 7: strip annotation.
   for (Operation *root : plan.roots)
     root->removeAttr(kTransposePropagateRootAttrName);
+
+  // Step 8: success-path cleanup of dead createdOps. SCFCarryRetype's
+  // prep step (Step 2) sometimes inserts a tt.trans on an iter_arg
+  // that ends up unused if the body's rewritten ops don't consume
+  // the iter_arg (e.g. plans where only the yield operand is in
+  // closure but the iter_arg itself isn't touched by other rules).
+  for (Operation *op : llvm::reverse(createdOps)) {
+    if (op->use_empty())
+      op->erase();
+  }
 }
 
 } // namespace mlir::triton::gpu
