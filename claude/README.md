@@ -53,9 +53,11 @@ All pass via FileCheck (`triton-opt -tritonamdgpu-dot-decompose-and-schedule`).
 | Workload | LLIR-SCHED (matmul_4waves) | TTGIR-SCHED (this work) |
 |---|---|---|
 | v8/v10 main loop                                  | ✅ +17–22 %               | (proxied via stand-alone) |
-| Stand-alone autotuned matmul, K=4096              | ❌ crash on autotune       | ✅ +4.1 % |
-| Stand-alone autotuned matmul, K=8192              | ❌ crash on autotune       | ✅ **+11.0 %** |
-| FA-fwd tutorial                                   | ❌ SSA dominance crash     | ✅ correct, within ±2 % |
+| Stand-alone autotuned matmul, K=1024              | ❌ crash on autotune       | ✅ 762.34 TF (-1.4 % vs 773.53 baseline) |
+| Stand-alone autotuned matmul, K=2048              | ❌ crash on autotune       | ✅ 868.14 TF (+2.4 % vs 847.69 baseline) |
+| Stand-alone autotuned matmul, K=4096              | ❌ crash on autotune       | ✅ 888.70 TF (+4.1 % vs 853.75 baseline) |
+| Stand-alone autotuned matmul, K=8192              | ❌ crash on autotune       | ✅ **871.92 TF (+11.0 % vs 785.79 baseline)** |
+| FA-fwd tutorial                                   | ❌ SSA dominance crash     | ✅ correct, all configs within ±2 % of baseline |
 
 The matmul_4waves LLIR pass *crashes* on FA-fwd with `Instruction does
 not dominate all uses!`. The TTGIR pass produces correct + competitive

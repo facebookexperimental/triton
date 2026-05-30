@@ -7,10 +7,11 @@
 
 ## TL;DR
 
-**13 commits, 6 lit tests (all green), best e2e win +11.0 % at K=8192,
-FA-fwd works correctly** (where the matmul_4waves LLIR pass crashes).
-Phases 0, 1a-1d, 2, 3, 4, 6 landed; Phase 5 (default-disable LLIR) is
-the only deferred phase (cross-repo coordination, not engineering).
+**13 commits, 6 lit tests (all green), best e2e win 871.92 TF vs 785.79 TF
+baseline (+11.0 %) at K=8192, FA-fwd runs correctly** (where the
+matmul_4waves LLIR pass crashes). Phases 0, 1a-1d, 2, 3, 4, 6 landed;
+Phase 5 (default-disable LLIR) is the only deferred phase (cross-repo
+coordination, not engineering).
 
 ```
 e37716eb6 [AMD][TTGIR-SCHED] Phase 6: docs cleanup — README + cross-links + status markers
@@ -219,17 +220,18 @@ source ~/miniconda3/etc/profile.d/conda.sh && conda activate metamain2
 HIP_VISIBLE_DEVICES=0 python ~/MetaMain2/triton/claude/phase4_coverage.py
 ```
 
-Takes ~100 s (12 runs × ~8 s each). Expected output ends with:
+Takes ~100 s (12 runs × ~8 s each). Sample output from a recent run
+on gfx950 (your numbers will be close to these, ±1-2 % run-to-run noise):
 
 ```
 ## Phase 4 coverage matrix
 
 | Workload | Baseline TF | Phase 3 default TF | Phase 2 (no bars) TF | Notes |
 |---|---:|---:|---:|---|
-| stand-alone matmul K=1024 | ~770 | ~770 | ~770 | Phase 3 Δ ~−1 % (small workload, overhead) |
-| stand-alone matmul K=2048 | ~847 | ~868 | ~849 | Phase 3 Δ ~+2 % |
-| stand-alone matmul K=4096 | ~853 | ~888 | ~849 | Phase 3 Δ ~+4 % |
-| stand-alone matmul K=8192 | ~785 | ~870 | ~796 | Phase 3 Δ ~+11 % |
+| stand-alone matmul K=1024 | 773.53 | 762.34 | 763.63 | Phase 3 Δ -1.4% |
+| stand-alone matmul K=2048 | 847.69 | 868.14 | 849.18 | Phase 3 Δ +2.4% |
+| stand-alone matmul K=4096 | 853.75 | 888.70 | 848.64 | Phase 3 Δ +4.1% |
+| stand-alone matmul K=8192 | 785.79 | 871.92 | 796.85 | Phase 3 Δ +11.0% |
 ```
 
 Headline pattern: **Phase 3 perf gain scales with K** (bigger workloads
@@ -237,7 +239,8 @@ give the backend scheduler more headroom). Stable across runs:
 
 - Phase 2 (no bars) ≈ baseline within ±1 % (the rewrite is functionally
   identical when the scheduler doesn't differentiate).
-- Phase 3 default ≥ baseline starting at K=2048; **+11 % at K=8192**.
+- Phase 3 default ≥ baseline starting at K=2048; **+11.0 % at K=8192
+  (871.92 TF vs 785.79 TF)**.
 
 If you see substantially different numbers:
 - **All three modes hugely below sample**: GPU is busy or thermally
@@ -383,13 +386,38 @@ Workarounds:
 
 ## Headline results
 
+Stand-alone autotuned matmul on gfx950, BM=BN=256, BK=64, num_warps=8
+(autotune-picked, all M=N=K = K_value):
+
+| Workload | Baseline TF | TTGIR-SCHED Phase 3 default TF | Δ |
+|---|---:|---:|---:|
+| Stand-alone matmul K=1024 | 773.53 | 762.34 | -1.4 % |
+| Stand-alone matmul K=2048 | 847.69 | 868.14 | +2.4 % |
+| Stand-alone matmul K=4096 | 853.75 | 888.70 | **+4.1 %** |
+| Stand-alone matmul K=8192 | 785.79 | 871.92 | **+11.0 %** |
+
+FA-fwd tutorial (06-fused-attention.py), Triton fp16 TFLOPS, batch=4,
+head=32, d=128, bwd, causal=False:
+
+| N_CTX | Baseline TF | TTGIR-SCHED Phase 3 default TF | Δ |
+|---:|---:|---:|---:|
+| 1024  | 324.44 | 323.46 | -0.3 % |
+| 2048  | 370.22 | 365.54 | -1.3 % |
+| 4096  | 417.20 | 409.02 | -2.0 % |
+| 8192  | 443.26 | 452.37 | +2.1 % |
+| 16384 | 458.38 | 456.78 | -0.3 % |
+
+All numerically correct. The matmul_4waves LLIR pass *crashes* on this
+kernel with `Instruction does not dominate all uses!`; the TTGIR pass
+produces correct + competitive output.
+
 | Workload | matmul_4waves LLIR-SCHED | TTGIR-SCHED Phase 3 default |
 |---|---|---|
-| Stand-alone autotuned matmul K=1024 | ❌ crash on autotune | ✅ correct, -1.4 % |
-| Stand-alone autotuned matmul K=2048 | ❌ crash on autotune | ✅ correct, +2.4 % |
-| Stand-alone autotuned matmul K=4096 | ❌ crash on autotune | ✅ correct, **+4.1 %** |
-| Stand-alone autotuned matmul K=8192 | ❌ crash on autotune | ✅ correct, **+11.0 %** |
-| FA-fwd tutorial                     | ❌ SSA dominance crash | ✅ correct, within ±2 % |
+| Stand-alone matmul K=1024 | ❌ crash on autotune | ✅ 762.34 TF (correct, -1.4 %) |
+| Stand-alone matmul K=2048 | ❌ crash on autotune | ✅ 868.14 TF (correct, +2.4 %) |
+| Stand-alone matmul K=4096 | ❌ crash on autotune | ✅ 888.70 TF (correct, **+4.1 %**) |
+| Stand-alone matmul K=8192 | ❌ crash on autotune | ✅ 871.92 TF (correct, **+11.0 %**) |
+| FA-fwd tutorial           | ❌ SSA dominance crash | ✅ all configs correct, within ±2 % of baseline |
 
 The big design win: **MLIR's typed SSA verifier rejects ill-formed
 rewrites at construction time**, so the TTGIR pass can't produce the
