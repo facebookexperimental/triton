@@ -157,6 +157,16 @@ static LogicalResult alignTDMDescriptorEncodings(mlir::ModuleOp &m) {
       auto memDescTy = cast<ttg::MemDescType>(load.getResult().getType());
       return record(load, load.getDesc(), memDescTy.getEncoding());
     }
+    if (auto groupLoad =
+            dyn_cast<tt::amdgpu::AsyncTDMGroupCopyGlobalToLocalOp>(op)) {
+      for (auto [desc, dst] :
+           llvm::zip_equal(groupLoad.getDescs(), groupLoad.getDsts())) {
+        auto memDescTy = cast<ttg::MemDescType>(dst.getType());
+        if (record(groupLoad, desc, memDescTy.getEncoding()).wasInterrupted())
+          return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    }
     if (auto store = dyn_cast<tt::amdgpu::AsyncTDMCopyLocalToGlobalOp>(op)) {
       auto memDescTy = cast<ttg::MemDescType>(store.getSrc().getType());
       return record(store, store.getDesc(), memDescTy.getEncoding());

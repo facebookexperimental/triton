@@ -227,6 +227,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     amdg.async_tdm_copy_local_to_global %tensorDesc[%c0_i32, %c0_i32] from %memDesc: !ttg.memdesc<128x64xf16, #shared_2_intervals, #smem, mutable> -> !tt.tensordesc<128x64xf16>
     tt.return
   }
+
+  tt.func public @tdm_load_two_padding_intervals(
+    %tensorDesc: !tt.tensordesc<128x64xf16>,
+    %memDesc: !ttg.memdesc<128x64xf16, #shared_2_intervals, #smem, mutable>,
+    %pred: i32
+  ) {
+    %c0_i32 = arith.constant 0 : i32
+    // expected-error @+1 {{TDM load only supports single interval-padding pairs}}
+    %0 = amdg.async_tdm_copy_global_to_local %tensorDesc[%c0_i32, %c0_i32] into %memDesc, pred = %pred : !tt.tensordesc<128x64xf16> -> !ttg.memdesc<128x64xf16, #shared_2_intervals, #smem, mutable>
+    tt.return
+  }
 }
 
 // -----
@@ -385,6 +396,84 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c0 = arith.constant 0 : i32
     // expected-error @+1 {{warp_used_hint with a partitioned shared encoding must select K active warps}}
     %0 = amdg.async_tdm_copy_global_to_local %tensorDesc[%c0, %c0] into %memDesc, pred = %pred {warp_used_hint = 3 : i32} : !tt.tensordesc<128x16xf16> -> !ttg.memdesc<128x16xf16, #partitioned_mi, #smem_mi, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Grouped TDM verifier tests.
+#shared_group = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem_group = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @grouped_tdm_overlapping_masks(
+    %desc_a: !tt.tensordesc<64x64xf16>,
+    %desc_b: !tt.tensordesc<64x64xf16>,
+    %dst_a: !ttg.memdesc<64x64xf16, #shared_group, #smem_group, mutable>,
+    %dst_b: !ttg.memdesc<64x64xf16, #shared_group, #smem_group, mutable>,
+    %pred: i32
+  ) {
+    %c0 = arith.constant 0 : i32
+    // expected-error @+1 {{warp masks must be disjoint}}
+    %0 = "amdg.async_tdm_group_copy_global_to_local"(%desc_a, %desc_b, %c0, %c0, %c0, %c0, %dst_a, %dst_b, %pred, %pred) <{cache = 1 : i32, operandSegmentSizes = array<i32: 2, 4, 2, 2>, rank = 2 : i32, warp_masks = array<i32: 3, 3>}> : (!tt.tensordesc<64x64xf16>, !tt.tensordesc<64x64xf16>, i32, i32, i32, i32, !ttg.memdesc<64x64xf16, #shared_group, #smem_group, mutable>, !ttg.memdesc<64x64xf16, #shared_group, #smem_group, mutable>, i32, i32) -> !ttg.async.token
+    tt.return
+  }
+}
+
+// -----
+
+#shared_group = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem_group = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @grouped_tdm_incomplete_masks(
+    %desc_a: !tt.tensordesc<64x64xf16>,
+    %desc_b: !tt.tensordesc<64x64xf16>,
+    %dst_a: !ttg.memdesc<64x64xf16, #shared_group, #smem_group, mutable>,
+    %dst_b: !ttg.memdesc<64x64xf16, #shared_group, #smem_group, mutable>,
+    %pred: i32
+  ) {
+    %c0 = arith.constant 0 : i32
+    // expected-error @+1 {{warp masks must cover all warps exactly once}}
+    %0 = "amdg.async_tdm_group_copy_global_to_local"(%desc_a, %desc_b, %c0, %c0, %c0, %c0, %dst_a, %dst_b, %pred, %pred) <{cache = 1 : i32, operandSegmentSizes = array<i32: 2, 4, 2, 2>, rank = 2 : i32, warp_masks = array<i32: 1, 2>}> : (!tt.tensordesc<64x64xf16>, !tt.tensordesc<64x64xf16>, i32, i32, i32, i32, !ttg.memdesc<64x64xf16, #shared_group, #smem_group, mutable>, !ttg.memdesc<64x64xf16, #shared_group, #smem_group, mutable>, i32, i32) -> !ttg.async.token
+    tt.return
+  }
+}
+
+// -----
+
+#shared_group = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem_group = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @grouped_tdm_mixed_element_widths(
+    %desc_a: !tt.tensordesc<64x64xf16>,
+    %desc_b: !tt.tensordesc<64x64xf16>,
+    %dst_a: !ttg.memdesc<64x64xf16, #shared_group, #smem_group, mutable>,
+    %dst_b: !ttg.memdesc<64x64xf32, #shared_group, #smem_group, mutable>,
+    %pred: i32
+  ) {
+    %c0 = arith.constant 0 : i32
+    // expected-error @+1 {{all grouped TDM arms must use the same element bitwidth}}
+    %0 = "amdg.async_tdm_group_copy_global_to_local"(%desc_a, %desc_b, %c0, %c0, %c0, %c0, %dst_a, %dst_b, %pred, %pred) <{cache = 1 : i32, operandSegmentSizes = array<i32: 2, 4, 2, 2>, rank = 2 : i32, warp_masks = array<i32: 3, 12>}> : (!tt.tensordesc<64x64xf16>, !tt.tensordesc<64x64xf16>, i32, i32, i32, i32, !ttg.memdesc<64x64xf16, #shared_group, #smem_group, mutable>, !ttg.memdesc<64x64xf32, #shared_group, #smem_group, mutable>, i32, i32) -> !ttg.async.token
+    tt.return
+  }
+}
+
+// -----
+
+#shared_group_multi_pad = #ttg.padded_shared<[32:+4, 64:+4] {order = [1, 0], shape = [64, 64]}>
+#shared_group = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem_group = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @grouped_tdm_multi_padding_pairs(
+    %desc_a: !tt.tensordesc<64x64xf16>,
+    %desc_b: !tt.tensordesc<64x64xf16>,
+    %dst_a: !ttg.memdesc<64x64xf16, #shared_group_multi_pad, #smem_group, mutable>,
+    %dst_b: !ttg.memdesc<64x64xf16, #shared_group, #smem_group, mutable>,
+    %pred: i32
+  ) {
+    %c0 = arith.constant 0 : i32
+    // expected-error @+1 {{grouped TDM only supports single interval-padding pairs}}
+    %0 = "amdg.async_tdm_group_copy_global_to_local"(%desc_a, %desc_b, %c0, %c0, %c0, %c0, %dst_a, %dst_b, %pred, %pred) <{cache = 1 : i32, operandSegmentSizes = array<i32: 2, 4, 2, 2>, rank = 2 : i32, warp_masks = array<i32: 3, 12>}> : (!tt.tensordesc<64x64xf16>, !tt.tensordesc<64x64xf16>, i32, i32, i32, i32, !ttg.memdesc<64x64xf16, #shared_group_multi_pad, #smem_group, mutable>, !ttg.memdesc<64x64xf16, #shared_group, #smem_group, mutable>, i32, i32) -> !ttg.async.token
     tt.return
   }
 }

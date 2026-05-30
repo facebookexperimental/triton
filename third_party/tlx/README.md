@@ -21,6 +21,44 @@ tlx.fence("async_shared")
 tlx.async_descriptor_store(desc, smem_buf, offsets)
 ```
 
+## AMD TDM Descriptor Loads
+
+`tlx.async_amd_descriptor_load(desc, result, offsets, pred=None)` issues an AMD
+TDM descriptor load from global memory to a TLX local buffer. It is available on
+TDM-capable AMD targets (`gfx1250+`) and should be synchronized with
+`tlx.async_amd_descriptor_wait`.
+
+`tlx.async_amd_descriptor_load_group(descs, results, offsets, warp_masks,
+preds=None)` groups multiple AMD TDM descriptor loads behind one static hardware
+TDM instruction. Each list entry is one arm:
+
+| Argument | Description |
+|----------|-------------|
+| `descs[i]` | Tensor descriptor for arm `i`. |
+| `results[i]` | Local buffer or local view receiving arm `i`. |
+| `offsets[i]` | Offset list for arm `i`; all arms must have the same rank. |
+| `warp_masks[i]` | Bitmask selecting the waves that use arm `i`. |
+| `preds[i]` | Optional predicate for arm `i`; defaults to true. |
+
+The warp masks must be non-empty, disjoint, axis-aligned, and cover all waves in
+the CTA exactly once. The grouped operation currently requires one CTA, the same
+rank and element bitwidth for every arm, one shared cache modifier, and shared
+layouts supported by AMD TDM lowering. This is useful for kernels where
+different wave groups load different inputs, such as A/B GEMM tiles or A/B plus
+scale tiles in MXFP GEMM, while keeping the assembly to one TDM instruction per
+load group.
+
+Example:
+```python
+a_tok = tlx.async_amd_descriptor_load_group(
+    [a_desc, b_desc],
+    [tlx.local_view(a_buf, slot), tlx.local_view(b_buf, slot)],
+    [[off_m, k * BLOCK_K], [k * BLOCK_K, off_n]],
+    [0b0011, 0b1100],
+)
+tlx.async_amd_descriptor_wait(0, [a_tok])
+```
+
 ## Warp Pipeline (AMD)
 
 `tlx.warp_pipeline_stage(label, *, priority=None)` is a context manager that marks explicit pipeline stage boundaries inside a loop. The compiler partitions the loop body at these boundaries and inserts conditional barriers so that one warp group executes one stage ahead of the other, overlapping memory latency with compute.

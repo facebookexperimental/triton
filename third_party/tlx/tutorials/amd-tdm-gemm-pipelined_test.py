@@ -89,11 +89,22 @@ def _single_warp_per_simd_issue_loads(
     TRANSPOSE_B: tl.constexpr,
 ):
     slot = producer % NUM_BUFFERS
-    tlx.async_amd_descriptor_load(a_desc, tlx.local_view(a_buf, slot), [off_m, producer * BLOCK_K], pred=pred)
     if not TRANSPOSE_B:
-        tlx.async_amd_descriptor_load(b_desc, tlx.local_view(b_buf, slot), [producer * BLOCK_K, off_n], pred=pred)
+        tlx.async_amd_descriptor_load_group(
+            [a_desc, b_desc],
+            [tlx.local_view(a_buf, slot), tlx.local_view(b_buf, slot)],
+            [[off_m, producer * BLOCK_K], [producer * BLOCK_K, off_n]],
+            [0b0011, 0b1100],
+            preds=[pred, pred],
+        )
     else:
-        tlx.async_amd_descriptor_load(b_desc, tlx.local_view(b_buf, slot), [off_n, producer * BLOCK_K], pred=pred)
+        tlx.async_amd_descriptor_load_group(
+            [a_desc, b_desc],
+            [tlx.local_view(a_buf, slot), tlx.local_view(b_buf, slot)],
+            [[off_m, producer * BLOCK_K], [off_n, producer * BLOCK_K]],
+            [0b0011, 0b1100],
+            preds=[pred, pred],
+        )
     return producer + 1
 
 
@@ -111,11 +122,20 @@ def _single_warp_per_simd_issue_loads_unpredicated(
     TRANSPOSE_B: tl.constexpr,
 ):
     slot = producer % NUM_BUFFERS
-    tlx.async_amd_descriptor_load(a_desc, tlx.local_view(a_buf, slot), [off_m, producer * BLOCK_K])
     if not TRANSPOSE_B:
-        tlx.async_amd_descriptor_load(b_desc, tlx.local_view(b_buf, slot), [producer * BLOCK_K, off_n])
+        tlx.async_amd_descriptor_load_group(
+            [a_desc, b_desc],
+            [tlx.local_view(a_buf, slot), tlx.local_view(b_buf, slot)],
+            [[off_m, producer * BLOCK_K], [producer * BLOCK_K, off_n]],
+            [0b0011, 0b1100],
+        )
     else:
-        tlx.async_amd_descriptor_load(b_desc, tlx.local_view(b_buf, slot), [off_n, producer * BLOCK_K])
+        tlx.async_amd_descriptor_load_group(
+            [a_desc, b_desc],
+            [tlx.local_view(a_buf, slot), tlx.local_view(b_buf, slot)],
+            [[off_m, producer * BLOCK_K], [off_n, producer * BLOCK_K]],
+            [0b0011, 0b1100],
+        )
     return producer + 1
 
 
@@ -358,7 +378,7 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
             TRANSPOSE_B,
         )
 
-    tlx.async_amd_descriptor_wait((NUM_BUFFERS - 2) * 2)
+    tlx.async_amd_descriptor_wait(NUM_BUFFERS - 2)
     a0, b0 = _single_warp_per_simd_load_subtile(
         a_buf,
         b_buf,
@@ -441,7 +461,7 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
         acc = tl.dot(a2, b2, acc)
 
         consumer += 1
-        tlx.async_amd_descriptor_wait((NUM_BUFFERS - 2) * 2)
+        tlx.async_amd_descriptor_wait(NUM_BUFFERS - 2)
         pred = (i + 1) - epilogue_lb
         pred = (pred >> 31) & 1
         producer = _single_warp_per_simd_issue_loads(
@@ -626,7 +646,7 @@ def test_matmul_tdm_pipelined_single_warp_per_simd_schedule_compiles_gfx1250(TRA
     compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32))
 
     ttgir = compiled.asm["ttgir"]
-    assert "amdg.async_tdm_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_group_copy_global_to_local" in ttgir
     assert "amdg.async_tdm_copy_local_to_global" in ttgir
     assert "amdg.tdm_prefetch" in ttgir
     assert ("amdg.async_tdm_wait" in ttgir) or ("amdg.async_tdm_intrinsic_wait" in ttgir)
@@ -635,7 +655,7 @@ def test_matmul_tdm_pipelined_single_warp_per_simd_schedule_compiles_gfx1250(TRA
     amdgcn = compiled.asm["amdgcn"]
     tensor_load_count = amdgcn.count("tensor_load_to_lds") + amdgcn.count("tensor.load.to.lds")
     tensor_store_count = amdgcn.count("tensor_store_from_lds") + amdgcn.count("tensor.store.from.lds")
-    assert tensor_load_count == 6, ("expected full-tile TDM loads with LDS subtile slicing, got:\n" + amdgcn)
+    assert tensor_load_count == 3, ("expected grouped full-tile TDM loads with LDS subtile slicing, got:\n" + amdgcn)
     assert tensor_store_count == 1, ("expected one TDM store of C, got:\n" + amdgcn)
 
 

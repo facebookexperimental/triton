@@ -26,6 +26,30 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 // -----
 
+#shared_a = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [64, 64]}>
+#shared_b = #ttg.padded_shared<[64:+4] {order = [1, 0], shape = [64, 64]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: tdm_group_load
+  tt.func public @tdm_group_load(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f16> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    %c_shape = arith.constant 128 : i32
+    %c_stride0 = arith.constant 128 : i64
+    %c_stride1 = arith.constant 1 : i64
+    %c_offset = arith.constant 0 : i32
+    %c_pred = arith.constant 1 : i32
+    %desc_a = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : !tt.ptr<f16>, !tt.tensordesc<64x64xf16, #shared_a>
+    %desc_b = tt.make_tensor_descriptor %arg1, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : !tt.ptr<f16>, !tt.tensordesc<64x64xf16, #shared_b>
+    %buf_a = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared_a, #smem, mutable>
+    %buf_b = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared_b, #smem, mutable>
+    // CHECK: "llvm.amdgcn.tensor.load.to.lds"({{.+}}) : (vector<4xi32>, vector<8xi32>, vector<4xi32>, vector<4xi32>, vector<8xi32>, i32) -> ()
+    // CHECK-NOT: "llvm.amdgcn.tensor.load.to.lds"
+    %tok = "amdg.async_tdm_group_copy_global_to_local"(%desc_a, %desc_b, %c_offset, %c_offset, %c_offset, %c_offset, %buf_a, %buf_b, %c_pred, %c_pred) <{cache = 1 : i32, operandSegmentSizes = array<i32: 2, 4, 2, 2>, rank = 2 : i32, warp_masks = array<i32: 3, 12>}> : (!tt.tensordesc<64x64xf16, #shared_a>, !tt.tensordesc<64x64xf16, #shared_b>, i32, i32, i32, i32, !ttg.memdesc<64x64xf16, #shared_a, #smem, mutable>, !ttg.memdesc<64x64xf16, #shared_b, #smem, mutable>, i32, i32) -> !ttg.async.token
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
