@@ -213,6 +213,41 @@ Value transformTrans(OpBuilder & /*builder*/, Operation * /*op*/,
   return transposedOperands.front();
 }
 
+//===----------------------------------------------------------------------===//
+// Rule: tt.dot (DotFlip).
+//
+// Algebraic identity for a downstream dot consuming a transposed value:
+//
+//   Original:  out = dot(A, B, C)        out:[M,N], A:[M,K], B:[K,N], C:[M,N]
+//   Target:    out_t = dot(B^T, A^T, C_t)   where out_t = out^T
+//   Proof:     out^T = (A·B + C)^T = B^T · A^T + C^T
+//
+// In the propagation engine: when an in-closure value flows into a dot at
+// some operand index, the entire dot is flipped. Operands NOT in the
+// closure get wrapped with tt.trans (commit-phase responsibility). The
+// dot's result is placed in the closure with swapped shape.
+//
+// D5: rule classification only. Transform factory is stubbed; the actual
+// rewrite lands in a later commit when the commit engine is wired up.
+//===----------------------------------------------------------------------===//
+
+bool matchDot(Operation *op, unsigned /*opIdx*/) {
+  // Recognise both plain tt.dot and tt.dot_scaled. For now both are
+  // structurally similar from the engine's perspective.
+  if (!isa<triton::DotOp, triton::DotScaledOp>(op))
+    return false;
+  if (op->getNumResults() != 1)
+    return false;
+  return isa<RankedTensorType>(op->getResult(0).getType());
+}
+
+Value transformDot(OpBuilder & /*builder*/, Operation * /*op*/,
+                   llvm::ArrayRef<Value> /*transposedOperands*/) {
+  // D5: stub. The real DotFlip materialisation lands in a follow-up
+  // commit alongside the commit engine + boundary trans insertion.
+  return nullptr;
+}
+
 const TransposeRule kDefaultRules[] = {
     {"elementwise", TransposeRuleKind::Rewrite, &matchElementwise,
      &transformElementwise},
@@ -224,6 +259,7 @@ const TransposeRule kDefaultRules[] = {
      &transformBroadcast},
     {"trans-elide", TransposeRuleKind::TransElide, &matchTrans,
      &transformTrans},
+    {"dot-flip", TransposeRuleKind::DotFlip, &matchDot, &transformDot},
 };
 
 } // namespace
