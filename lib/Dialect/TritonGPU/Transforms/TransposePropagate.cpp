@@ -181,6 +181,38 @@ Value transformBroadcast(OpBuilder &builder, Operation *op,
   return newBcast.getResult();
 }
 
+//===----------------------------------------------------------------------===//
+// Rule: tt.trans (TransElide).
+//
+// Original:    Y = tt.trans(X)  (order=[1,0] on rank-2)  =>  Y = X^T
+// Transposed:  X' = X^T  is already in closure.
+//              Then trans(X') = (X^T)^T = X.
+// So the elided result Y is the *original* X (not in transposed
+// closure). transformTrans returns the operand directly; the engine
+// does not recurse on TransElide outputs, so downstream uses of Y are
+// untouched.
+//===----------------------------------------------------------------------===//
+
+bool matchTrans(Operation *op, unsigned /*opIdx*/) {
+  auto transOp = dyn_cast<triton::TransOp>(op);
+  if (!transOp)
+    return false;
+  auto srcTy = dyn_cast<RankedTensorType>(transOp.getSrc().getType());
+  if (!srcTy || srcTy.getRank() != 2)
+    return false;
+  // Only [1,0] (i.e., a true 2-D matrix transpose) cancels with a
+  // closure-transposed value. Other orders aren't 2-D->2-D transposes.
+  auto order = transOp.getOrder();
+  return order.size() == 2 && order[0] == 1 && order[1] == 0;
+}
+
+Value transformTrans(OpBuilder & /*builder*/, Operation * /*op*/,
+                     llvm::ArrayRef<Value> transposedOperands) {
+  // Return the operand verbatim; commit will replaceAllUsesWith on the
+  // trans's result. Downstream consumers receive the un-transposed value.
+  return transposedOperands.front();
+}
+
 const TransposeRule kDefaultRules[] = {
     {"elementwise", TransposeRuleKind::Rewrite, &matchElementwise,
      &transformElementwise},
@@ -190,6 +222,8 @@ const TransposeRule kDefaultRules[] = {
      &transformExpandDims},
     {"broadcast", TransposeRuleKind::BroadcastSwap, &matchBroadcast,
      &transformBroadcast},
+    {"trans-elide", TransposeRuleKind::TransElide, &matchTrans,
+     &transformTrans},
 };
 
 } // namespace
