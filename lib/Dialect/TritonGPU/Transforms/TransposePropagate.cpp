@@ -272,6 +272,23 @@ Value transformConvertLayout(OpBuilder & /*builder*/, Operation * /*op*/,
   return nullptr;
 }
 
+//===----------------------------------------------------------------------===//
+// Rule: shared-mem boundary (ttg.local_alloc / ttg.local_load).
+//
+// Shared-memory ops (MemDescType operands/results) can't carry a
+// "transposed orientation" through their LDS chains in a layout-neutral
+// way; we insert a tt.trans before them and stop the propagation.
+//
+// D7: explicit classification only. Behaviour is identical to the
+// conservative-default BoundaryInsert; the distinction is for cost-
+// model accounting (an LDS-bouncing boundary is more expensive than
+// a tt.return boundary, which a future Score phase can charge for).
+//===----------------------------------------------------------------------===//
+
+bool matchSharedMem(Operation *op, unsigned /*opIdx*/) {
+  return isa<LocalAllocOp, LocalLoadOp>(op);
+}
+
 const TransposeRule kDefaultRules[] = {
     {"elementwise", TransposeRuleKind::Rewrite, &matchElementwise,
      &transformElementwise},
@@ -286,6 +303,8 @@ const TransposeRule kDefaultRules[] = {
     {"dot-flip", TransposeRuleKind::DotFlip, &matchDot, &transformDot},
     {"convert-layout", TransposeRuleKind::ConvertLayoutAdjust,
      &matchConvertLayout, &transformConvertLayout},
+    {"shared-mem", TransposeRuleKind::SharedMemBoundary, &matchSharedMem,
+     /*transform=*/nullptr},
 };
 
 } // namespace
@@ -359,6 +378,14 @@ TransposePlan planTransposePropagation(Operation *root) {
         }
         // Conservative default: BoundaryInsert. Insert tt.trans before
         // this consumer at this operand index, don't recurse.
+        plan.boundaryOps.push_back({user, opIdx});
+        continue;
+      }
+      // SharedMemBoundary explicitly behaves like BoundaryInsert (and
+      // is counted in boundaryOps for cost-model accounting), but it's
+      // distinguished from the conservative-default fallthrough.
+      if (rule->kind == TransposeRuleKind::SharedMemBoundary ||
+          rule->kind == TransposeRuleKind::BoundaryInsert) {
         plan.boundaryOps.push_back({user, opIdx});
         continue;
       }
