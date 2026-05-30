@@ -20,11 +20,13 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Verifier.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/Support/raw_ostream.h"
 
 namespace mlir::triton::gpu {
 
@@ -110,6 +112,10 @@ Value transformElementwise(OpBuilder &builder, Operation *op,
       v = trans.getResult();
       vTy = cast<RankedTensorType>(v.getType());
     }
+    // Coerce EVERY operand (in-closure or not) to targetEnc. If the
+    // closure brought multiple operands with different encodings, only
+    // matching them all to one encoding satisfies mulf/addf's
+    // SameOperandsAndResultEncoding constraint.
     if (vTy.getEncoding() != targetEnc) {
       auto coercedTy = RankedTensorType::get(vTy.getShape(),
                                               vTy.getElementType(), targetEnc);
@@ -161,7 +167,12 @@ Value transformReduce(OpBuilder &builder, Operation *op,
   auto newReduce = triton::ReduceOp::create(builder, op->getLoc(),
                                             ValueRange(transposedOperands),
                                             newAxis, /*ordering=*/StringAttr{});
-  newReduce.getRegion().takeBody(reduceOp.getRegion());
+  // Clone the combine region (don't takeBody -- the original op may
+  // survive a bit longer in IR and the verifier needs to see a valid
+  // body). IRMapping ensures block-arg uses inside the body are
+  // remapped to the new block's args.
+  IRMapping mapping;
+  reduceOp.getRegion().cloneInto(&newReduce.getRegion(), mapping);
   return newReduce.getResult().front();
 }
 
@@ -640,6 +651,22 @@ void commitTransposePlan(const TransposePlan &plan) {
   llvm::DenseSet<Operation *> rootSet(plan.roots.begin(), plan.roots.end());
   llvm::DenseSet<Operation *> planSet(plan.ops.begin(), plan.ops.end());
 
+  // Debug-gated rollback diagnostics: when set, emit a remark on the
+  // culprit op AND write to llvm::errs() (the triton JIT swallows MLIR
+  // remarks, so stderr is the only reliable channel from Python).
+  bool verbose = std::getenv("TRITON_TRANSPOSE_PROPAGATE_DEBUG") != nullptr;
+  auto bail = [&](Operation *culprit, llvm::StringRef reason) {
+    if (verbose && culprit) {
+      culprit->emitRemark()
+          << "transpose-propagate: commit aborted: " << reason;
+      llvm::errs() << "[transpose-propagate] commit aborted: " << reason
+                   << "  at op: " << culprit->getName() << "\n";
+    }
+    for (Operation *op : llvm::reverse(createdOps)) {
+      if (op->use_empty())
+        op->erase();
+    }
+  };
   auto rollback = [&]() {
     for (Operation *op : llvm::reverse(createdOps)) {
       if (op->use_empty())
@@ -650,13 +677,13 @@ void commitTransposePlan(const TransposePlan &plan) {
   // Step 1: lazy root.
   for (Operation *root : plan.roots) {
     if (root->getNumResults() != 1) {
-      rollback();
+      bail(root, "root has non-1 results");
       return;
     }
     Value rootRes = root->getResult(0);
     auto rootTy = dyn_cast<RankedTensorType>(rootRes.getType());
     if (!rootTy || rootTy.getRank() != 2) {
-      rollback();
+      bail(root, "root result is not rank-2 ranked tensor");
       return;
     }
     OpBuilder builder(root->getBlock(), std::next(Block::iterator(root)));
@@ -702,7 +729,7 @@ void commitTransposePlan(const TransposePlan &plan) {
         continue;
       auto iterTy = dyn_cast<RankedTensorType>(iterArg.getType());
       if (!iterTy || iterTy.getRank() != 2) {
-        rollback();
+        bail(forOp, "scf.for iter_arg is not rank-2 ranked tensor");
         return;
       }
       OpBuilder b(&forOp.getBody()->front());
@@ -726,11 +753,13 @@ void commitTransposePlan(const TransposePlan &plan) {
     if (rule->kind == TransposeRuleKind::SCFCarryRetype)
       continue; // handled in step 4
     if (!rule->transform) {
-      rollback();
+      bail(op, llvm::Twine("rule '").concat(rule->name).concat(
+                  "' has no commit-side transform").str());
       return;
     }
     if (op->getNumResults() != 1) {
-      rollback();
+      bail(op, llvm::Twine("rule '").concat(rule->name).concat(
+                  "' op has non-1 results").str());
       return;
     }
     llvm::SmallVector<Value, 4> operands;
@@ -741,7 +770,8 @@ void commitTransposePlan(const TransposePlan &plan) {
     OpBuilder builder(op);
     Value newResult = rule->transform(builder, op, operands);
     if (!newResult) {
-      rollback();
+      bail(op, llvm::Twine("rule '").concat(rule->name).concat(
+                  "' transform returned nullptr").str());
       return;
     }
     if (auto *defOp = newResult.getDefiningOp())
@@ -774,7 +804,7 @@ void commitTransposePlan(const TransposePlan &plan) {
         continue;
       auto iterTy = dyn_cast<RankedTensorType>(iterArgs[k].getType());
       if (!iterTy) {
-        rollback();
+        bail(forOp, "scf.for iter_arg type is not RankedTensorType in rewire");
         return;
       }
       OpBuilder b(yield);
@@ -804,8 +834,32 @@ void commitTransposePlan(const TransposePlan &plan) {
     if (it == seedMap.end())
       continue;
     auto srcTy = dyn_cast<RankedTensorType>(it->second.getType());
-    if (!srcTy || srcTy.getRank() != 2) {
-      rollback();
+    if (!srcTy) {
+      // Closure value is e.g. a non-tensor or scalar -- shouldn't
+      // normally happen, but skip the back-trans rather than aborting.
+      continue;
+    }
+    if (srcTy.getRank() < 2) {
+      // 1-D: shape doesn't transpose, but the encoding may have
+      // shifted (e.g. slice<dim=0,...> vs slice<dim=1,...>). Insert
+      // a convert_layout to bring back to the original encoding so
+      // the boundary consumer's invariants (e.g. mulf
+      // SameOperandsAndResultEncoding) still hold.
+      auto origTy = dyn_cast<RankedTensorType>(orig.getType());
+      Value src = it->second;
+      if (origTy && origTy.getEncoding() != srcTy.getEncoding()) {
+        OpBuilder b(user);
+        auto coercedTy = RankedTensorType::get(
+            srcTy.getShape(), srcTy.getElementType(), origTy.getEncoding());
+        auto cvt = ConvertLayoutOp::create(b, user->getLoc(), coercedTy, src);
+        createdOps.push_back(cvt);
+        src = cvt.getResult();
+      }
+      user->setOperand(opIdx, src);
+      continue;
+    }
+    if (srcTy.getRank() != 2) {
+      bail(user, "boundary consumer's in-closure operand is rank > 2 (unsupported)");
       return;
     }
     OpBuilder builder(user);
@@ -848,26 +902,23 @@ void commitTransposePlan(const TransposePlan &plan) {
 }
 
 bool dryRunCommit(Operation *funcOp) {
-  // D12: dry-run safety net.
+  // D12 + D17: dry-run safety net + diagnostic capture.
   //
   // Clones funcOp into a temporary detached ModuleOp, re-runs plan +
   // commit on the clone, calls mlir::verify on the temporary module
   // (which checks all per-op invariants + cross-op constraints across
   // the cloned func body), then erases the temp.
   //
-  // The temporary module carries over the original module's
-  // discardable attributes (e.g., ttg.num-warps, ttg.threads-per-warp)
-  // so the cloned func's encoding constraints validate the same way
-  // they would in-place.
-  //
-  // Returns true iff the clone verified successfully. The caller
-  // should only invoke commitTransposePlan on the real funcOp when
-  // this returns true.
+  // When TRITON_TRANSPOSE_PROPAGATE_DEBUG is set, also captures all
+  // diagnostics emitted during the cloned commit (rule-rollback remarks)
+  // and the verifier errors, and emits them onto the ORIGINAL funcOp so
+  // the user sees what would have gone wrong.
   if (!funcOp)
     return false;
 
   MLIRContext *ctx = funcOp->getContext();
   OpBuilder builder(ctx);
+  bool verbose = std::getenv("TRITON_TRANSPOSE_PROPAGATE_DEBUG") != nullptr;
 
   // Create a parentless temporary ModuleOp, mirroring the original
   // module's attributes (ttg.num-warps, ttg.threads-per-warp, etc.).
@@ -885,23 +936,60 @@ bool dryRunCommit(Operation *funcOp) {
   // Re-plan on the clone (annotations survive the clone).
   TransposePlan clonePlan = planTransposePropagation(clonedOp);
   if (clonePlan.rejected() || clonePlan.empty()) {
-    // Nothing for the dry-run to verify. Treat empty / rejected as
-    // "nothing to do" -- dry-run trivially passes (the caller's
-    // commit will also be a no-op in this case).
     tempModule.erase();
     return true;
   }
 
-  // Commit on the clone. Any partial-commit failure (rule returns
-  // nullptr) rolls back inside commitTransposePlan, leaving the
-  // clone with at most some leftover trans/convert ops that
-  // verify will catch (or not, in which case the rollback was
-  // clean).
-  commitTransposePlan(clonePlan);
+  // Install a scoped diagnostic handler to capture remarks/errors
+  // emitted by the cloned commit + the subsequent verifier call.
+  llvm::SmallVector<std::string, 8> capturedDiags;
+  {
+    ScopedDiagnosticHandler handler(
+        ctx, [&](Diagnostic &diag) -> LogicalResult {
+          if (verbose) {
+            std::string s;
+            llvm::raw_string_ostream os(s);
+            os << diag;
+            capturedDiags.push_back(os.str());
+          }
+          return success(); // suppress default printing
+        });
+    commitTransposePlan(clonePlan);
+  }
 
-  // Verify the temp module. This catches cross-op constraints like
-  // scf.for body type mismatches, dot operand encoding parents, etc.
-  bool ok = succeeded(mlir::verify(tempModule));
+  // Verify the temp module under a second diagnostic handler so the
+  // verifier errors get captured (not printed to stderr).
+  bool ok = false;
+  {
+    ScopedDiagnosticHandler handler(
+        ctx, [&](Diagnostic &diag) -> LogicalResult {
+          if (verbose) {
+            std::string s;
+            llvm::raw_string_ostream os(s);
+            os << "[verify] " << diag;
+            capturedDiags.push_back(os.str());
+          }
+          return success();
+        });
+    ok = succeeded(mlir::verify(tempModule));
+  }
+
+  // Surface captured diagnostics on the ORIGINAL funcOp AND on stderr.
+  if (verbose) {
+    for (auto &msg : capturedDiags) {
+      funcOp->emitRemark() << "transpose-propagate dry-run: " << msg;
+      llvm::errs() << "[transpose-propagate dry-run] " << msg << "\n";
+    }
+    if (!ok) {
+      funcOp->emitRemark()
+          << "transpose-propagate dry-run: verifier FAILED (see above)";
+      llvm::errs()
+          << "[transpose-propagate dry-run] verifier FAILED (see above)\n";
+    } else {
+      llvm::errs() << "[transpose-propagate dry-run] OK -- "
+                   << capturedDiags.size() << " diagnostics captured\n";
+    }
+  }
 
   tempModule.erase();
   return ok;
