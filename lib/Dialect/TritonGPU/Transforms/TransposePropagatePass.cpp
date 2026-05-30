@@ -30,7 +30,31 @@ struct TransposePropagatePass
   void runOnOperation() override {
     ModuleOp m = getOperation();
     bool verbose = std::getenv("TRITON_TRANSPOSE_PROPAGATE_DEBUG") != nullptr;
+    bool autoAnnotateFirstDot = std::getenv(
+        "TRITON_TRANSPOSE_PROPAGATE_AUTOANNOTATE_FIRST_DOT") != nullptr;
     m.walk([&](mlir::triton::FuncOp funcOp) {
+      // Optional zero-source-change experimentation knob: if no dot in
+      // the func is annotated and the env var is set, annotate the
+      // FIRST tt.dot (in program order) as a propagation root. Useful
+      // for benching the pass on kernels we don't want to modify.
+      if (autoAnnotateFirstDot) {
+        bool anyAnnotated = false;
+        Operation *firstDot = nullptr;
+        funcOp.walk([&](mlir::triton::DotOp dotOp) {
+          if (dotOp->hasAttr(kTransposePropagateRootAttrName))
+            anyAnnotated = true;
+          if (!firstDot)
+            firstDot = dotOp.getOperation();
+        });
+        if (!anyAnnotated && firstDot) {
+          OpBuilder b(firstDot->getContext());
+          firstDot->setAttr(kTransposePropagateRootAttrName, b.getUnitAttr());
+          if (verbose)
+            firstDot->emitRemark()
+                << "transpose-propagate: auto-annotated first dot as root";
+        }
+      }
+
       TransposePlan plan = planTransposePropagation(funcOp);
       if (plan.rejected()) {
         if (verbose && plan.rejectedAt)
