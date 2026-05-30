@@ -137,6 +137,13 @@ TransposeScore scoreTransposePlan(const TransposePlan &plan);
 /// `score.feasible == true`.
 void commitTransposePlan(const TransposePlan &plan);
 
+/// Dry-run safety net: clones `funcOp` into a temporary module, re-runs
+/// plan + commit on the clone, calls the MLIR verifier on the temporary
+/// module, then discards. Returns true iff the post-commit IR verified
+/// cleanly. Use this before invoking `commitTransposePlan` on the real
+/// IR -- if it returns false, the real funcOp should be left untouched.
+bool dryRunCommit(Operation *funcOp);
+
 } // namespace mlir::triton::gpu
 
 #endif // TRITON_DIALECT_TRITONGPU_TRANSFORMS_TRANSPOSEPROPAGATE_H_

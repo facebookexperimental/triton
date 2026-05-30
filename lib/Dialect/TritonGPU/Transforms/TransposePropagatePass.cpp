@@ -48,6 +48,14 @@ struct TransposePropagatePass
       TransposeScore score = scoreTransposePlan(plan);
       if (!score.feasible)
         return;
+      // Dry-run guard: clone funcOp, simulate commit, verify, discard.
+      // Skip the real commit if the simulated IR doesn't verify.
+      if (!dryRunCommit(funcOp)) {
+        if (verbose)
+          funcOp.emitRemark()
+              << "transpose-propagate: dry-run failed, skipping commit";
+        return;
+      }
       commitTransposePlan(plan);
     });
   }

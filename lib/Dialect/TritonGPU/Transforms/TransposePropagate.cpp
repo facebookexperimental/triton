@@ -19,6 +19,8 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Verifier.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseSet.h"
@@ -843,6 +845,66 @@ void commitTransposePlan(const TransposePlan &plan) {
     if (op->use_empty())
       op->erase();
   }
+}
+
+bool dryRunCommit(Operation *funcOp) {
+  // D12: dry-run safety net.
+  //
+  // Clones funcOp into a temporary detached ModuleOp, re-runs plan +
+  // commit on the clone, calls mlir::verify on the temporary module
+  // (which checks all per-op invariants + cross-op constraints across
+  // the cloned func body), then erases the temp.
+  //
+  // The temporary module carries over the original module's
+  // discardable attributes (e.g., ttg.num-warps, ttg.threads-per-warp)
+  // so the cloned func's encoding constraints validate the same way
+  // they would in-place.
+  //
+  // Returns true iff the clone verified successfully. The caller
+  // should only invoke commitTransposePlan on the real funcOp when
+  // this returns true.
+  if (!funcOp)
+    return false;
+
+  MLIRContext *ctx = funcOp->getContext();
+  OpBuilder builder(ctx);
+
+  // Create a parentless temporary ModuleOp, mirroring the original
+  // module's attributes (ttg.num-warps, ttg.threads-per-warp, etc.).
+  auto tempModule = ModuleOp::create(builder.getUnknownLoc());
+  if (auto origModule = funcOp->getParentOfType<ModuleOp>()) {
+    for (NamedAttribute attr : origModule->getAttrs()) {
+      tempModule->setAttr(attr.getName(), attr.getValue());
+    }
+  }
+
+  // Clone the funcOp and parent it under the temp module.
+  Operation *clonedOp = funcOp->clone();
+  tempModule.push_back(clonedOp);
+
+  // Re-plan on the clone (annotations survive the clone).
+  TransposePlan clonePlan = planTransposePropagation(clonedOp);
+  if (clonePlan.rejected() || clonePlan.empty()) {
+    // Nothing for the dry-run to verify. Treat empty / rejected as
+    // "nothing to do" -- dry-run trivially passes (the caller's
+    // commit will also be a no-op in this case).
+    tempModule.erase();
+    return true;
+  }
+
+  // Commit on the clone. Any partial-commit failure (rule returns
+  // nullptr) rolls back inside commitTransposePlan, leaving the
+  // clone with at most some leftover trans/convert ops that
+  // verify will catch (or not, in which case the rollback was
+  // clean).
+  commitTransposePlan(clonePlan);
+
+  // Verify the temp module. This catches cross-op constraints like
+  // scf.for body type mismatches, dot operand encoding parents, etc.
+  bool ok = succeeded(mlir::verify(tempModule));
+
+  tempModule.erase();
+  return ok;
 }
 
 } // namespace mlir::triton::gpu
