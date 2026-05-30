@@ -1181,7 +1181,7 @@ def test_hopper_matmul_tma_warp_specialize(
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
             pingpongAutoWS=enable_pingpong,
-            maxRegAutoWS=208 if DATA_PARTITION_FACTOR > 1 else 252,
+            maxRegAutoWS=208 if DATA_PARTITION_FACTOR > 1 else 248,
         )
 
         ttgir = kernel.asm["ttgir"]
@@ -1308,7 +1308,7 @@ def test_hopper_matmul_tma_persistent_warp_specialize(
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
             pingpongAutoWS=enable_pingpong,
-            maxRegAutoWS=208 if DATA_PARTITION_FACTOR > 1 else 252,
+            maxRegAutoWS=208 if DATA_PARTITION_FACTOR > 1 else 248,
         )
 
         ttgir = kernel.asm["ttgir"]
@@ -1421,7 +1421,7 @@ def test_hopper_matmul_descriptor_persistent_warp_specialize(
             num_warps=num_warps,
             early_tma_store_lowering=use_early_tma_store_lowering,
             pingpongAutoWS=enable_pingpong,
-            maxRegAutoWS=208 if DATA_PARTITION_FACTOR > 1 else 252,
+            maxRegAutoWS=208 if DATA_PARTITION_FACTOR > 1 else 248,
         )
 
         ttgir = kernel.asm["ttgir"]
