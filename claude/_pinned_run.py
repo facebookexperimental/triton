@@ -2,8 +2,8 @@
 
 Identical kernel to `_one_run_envcompare.py` but without `triton.autotune`.
 The config is hard-coded to BM=BN=256, BK=64, num_warps=8, num_stages=2,
-which is the config that delivered the +11 % win at K=8192 in Phase 4's
-coverage matrix.
+which is the config that delivered the +4.6 % pinned win at K=8192 in
+Phase 4's coverage matrix.
 
 Without pinning, the autotuner can pick BK=32,W=4 etc. on different
 runs, which makes baseline vs APPLY non-comparable.
@@ -15,8 +15,29 @@ Prints:
     OK <tflops>
 or:
     FAIL <reason>
+
+⚠ DO NOT pair this with TRITON_ALWAYS_COMPILE=1 — that flag forces a
+fresh JIT compile per kernel launch, so do_bench's measured time
+becomes dominated by ~30 ms of compile time and you'll see ~30 TF
+instead of ~1000 TF. The env-var-gated codegen path is already
+selected correctly because this script runs as a fresh process and
+the JIT cache is keyed on env-var state.
+
+Correct invocation:
+    HIP_VISIBLE_DEVICES=0 python _pinned_run.py 8192
+    # → OK ~1055  (baseline)
+    TRITON_ENABLE_TTGIR_SCHED=1 TRITON_TTGIR_SCHED_APPLY=1 \\
+      HIP_VISIBLE_DEVICES=0 python _pinned_run.py 8192
+    # → OK ~1104  (Phase 3 default, +4.6 %)
 """
-import sys, torch, triton, triton.language as tl
+import sys, os, torch, triton, triton.language as tl
+
+if os.environ.get("TRITON_ALWAYS_COMPILE"):
+    print("FAIL TRITON_ALWAYS_COMPILE=1 is set — that forces a fresh JIT "
+          "compile per kernel launch and turns do_bench into a ~30 ms "
+          "compile-cost benchmark (you'd see ~30 TF instead of ~1000 TF). "
+          "Unset it: `unset TRITON_ALWAYS_COMPILE` and rerun.")
+    sys.exit(1)
 
 K = int(sys.argv[1])
 M = N = 4096
