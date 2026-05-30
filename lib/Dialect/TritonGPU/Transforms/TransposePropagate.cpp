@@ -15,12 +15,14 @@
 
 #include "triton/Dialect/TritonGPU/Transforms/TransposePropagate.h"
 
+#include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SetVector.h"
 
 namespace mlir::triton::gpu {
 
@@ -63,19 +65,60 @@ bool matchElementwise(Operation *op, unsigned /*opIdx*/) {
 
 Value transformElementwise(OpBuilder &builder, Operation *op,
                            llvm::ArrayRef<Value> transposedOperands) {
-  // Result type: same encoding, swapped shape.
-  auto origTy = cast<RankedTensorType>(op->getResult(0).getType());
-  auto origShape = origTy.getShape();
-  if (origShape.size() != 2)
+  // Pick the target encoding from the first in-closure operand. Operands
+  // that aren't in the closure get wrapped with tt.trans (to swap shape)
+  // and then ttg.convert_layout (to match the target encoding).
+  auto origTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+  if (!origTy || origTy.getRank() != 2)
     return nullptr;
-  llvm::SmallVector<int64_t, 2> newShape{origShape[1], origShape[0]};
-  auto newTy = RankedTensorType::get(newShape, origTy.getElementType(),
-                                     origTy.getEncoding());
 
-  // Build the new op by cloning with operands replaced + result type
-  // replaced. cloneWithoutRegions preserves the discardable attrs.
+  Attribute targetEnc;
+  bool anyInClosure = false;
+  for (size_t i = 0; i < transposedOperands.size(); ++i) {
+    if (transposedOperands[i] != op->getOperand(i)) {
+      anyInClosure = true;
+      if (auto t = dyn_cast<RankedTensorType>(transposedOperands[i].getType()))
+        targetEnc = t.getEncoding();
+      break;
+    }
+  }
+  if (!anyInClosure)
+    return nullptr;
+
+  // Result shape (swapped) and type using targetEnc.
+  llvm::SmallVector<int64_t, 2> newShape{origTy.getDimSize(1),
+                                          origTy.getDimSize(0)};
+  auto newTy = RankedTensorType::get(newShape, origTy.getElementType(),
+                                      targetEnc);
+
+  // Bring each operand into (transposed shape, target encoding).
+  llvm::SmallVector<Value, 4> coercedOperands;
+  for (size_t i = 0; i < transposedOperands.size(); ++i) {
+    Value v = transposedOperands[i];
+    auto vTy = dyn_cast<RankedTensorType>(v.getType());
+    if (!vTy)
+      return nullptr;
+    if (v == op->getOperand(i)) {
+      // Out-of-closure: wrap with tt.trans to swap shape.
+      if (vTy.getRank() != 2)
+        return nullptr;
+      OpBuilder b(op);
+      auto trans = triton::TransOp::create(
+          b, op->getLoc(), v, b.getDenseI32ArrayAttr({1, 0}));
+      v = trans.getResult();
+      vTy = cast<RankedTensorType>(v.getType());
+    }
+    if (vTy.getEncoding() != targetEnc) {
+      auto coercedTy = RankedTensorType::get(vTy.getShape(),
+                                              vTy.getElementType(), targetEnc);
+      OpBuilder b(op);
+      v = ConvertLayoutOp::create(b, op->getLoc(), coercedTy, v).getResult();
+    }
+    coercedOperands.push_back(v);
+  }
+
   OperationState state(op->getLoc(), op->getName());
-  state.addOperands(transposedOperands);
+  state.addOperands(coercedOperands);
   state.addTypes({newTy});
   state.attributes = op->getAttrs();
   Operation *cloned = builder.create(state);
@@ -244,9 +287,37 @@ bool matchDot(Operation *op, unsigned /*opIdx*/) {
 
 Value transformDot(OpBuilder & /*builder*/, Operation * /*op*/,
                    llvm::ArrayRef<Value> /*transposedOperands*/) {
-  // D5: stub. The real DotFlip materialisation lands in a follow-up
-  // commit alongside the commit engine + boundary trans insertion.
+  // D9: DotFlip commit-time materialisation is non-trivial because the
+  // new dot's accumulator/result encoding must be consistent with
+  // DotOperand parents on A and B, which requires either:
+  //   (a) the closure operand's encoding being a valid #mma/#blocked
+  //       that supports DotOperand-of-it, OR
+  //   (b) careful insertion of convert_layouts after the trans wraps.
+  //
+  // For D9 we deliberately return nullptr -- commit aborts and rolls
+  // back, so plans containing a downstream DotFlip don't mutate IR.
+  // Plans without DotFlip (e.g. dot -> elementwise -> return) still
+  // commit normally. The real DotFlip is a follow-up commit.
   return nullptr;
+}
+
+Value transformConvertLayout(OpBuilder &builder, Operation *op,
+                             llvm::ArrayRef<Value> transposedOperands) {
+  auto cvt = dyn_cast<ConvertLayoutOp>(op);
+  if (!cvt || transposedOperands.size() != 1)
+    return nullptr;
+  Value newSrc = transposedOperands.front();
+  // New result type: shape-swapped from original cvt result, encoding
+  // preserved (cleanup passes can adjust later).
+  auto origResTy = dyn_cast<RankedTensorType>(cvt.getType());
+  if (!origResTy || origResTy.getRank() != 2)
+    return nullptr;
+  llvm::SmallVector<int64_t, 2> newShape{origResTy.getDimSize(1),
+                                          origResTy.getDimSize(0)};
+  auto newResTy = RankedTensorType::get(newShape, origResTy.getElementType(),
+                                         origResTy.getEncoding());
+  auto newCvt = ConvertLayoutOp::create(builder, op->getLoc(), newResTy, newSrc);
+  return newCvt.getResult();
 }
 
 //===----------------------------------------------------------------------===//
@@ -265,12 +336,6 @@ Value transformDot(OpBuilder & /*builder*/, Operation * /*op*/,
 
 bool matchConvertLayout(Operation *op, unsigned /*opIdx*/) {
   return isa<ConvertLayoutOp>(op);
-}
-
-Value transformConvertLayout(OpBuilder & /*builder*/, Operation * /*op*/,
-                             llvm::ArrayRef<Value> /*transposedOperands*/) {
-  // D6: stub. Real factory lands with the commit engine.
-  return nullptr;
 }
 
 //===----------------------------------------------------------------------===//
@@ -450,8 +515,130 @@ TransposeScore scoreTransposePlan(const TransposePlan &plan) {
 }
 
 void commitTransposePlan(const TransposePlan &plan) {
-  // D1: no-op. D5+ materializes the plan.
-  (void)plan;
+  // D9: real commit engine. Lazy-root variant: insert a tt.trans on each
+  // annotated root's result (no algebraic flip yet), then materialize the
+  // downstream plan via rule transforms; insert boundary back-trans;
+  // replaceAllUsesWith + erase originals. SCFCarryRetype is not yet
+  // commit-implemented (its transform stays nullptr -> commit aborts on
+  // plans that include it). DotFlip and ConvertLayoutAdjust are real.
+  if (plan.empty() || plan.rejected())
+    return;
+
+  llvm::DenseMap<Value, Value> seedMap;
+  llvm::SmallVector<Operation *> createdOps;
+  llvm::DenseSet<Operation *> rootSet(plan.roots.begin(), plan.roots.end());
+
+  auto rollback = [&]() {
+    for (Operation *op : llvm::reverse(createdOps)) {
+      if (op->use_empty())
+        op->erase();
+    }
+  };
+
+  // Lazy root: tt.trans on each root's result.
+  for (Operation *root : plan.roots) {
+    if (root->getNumResults() != 1) {
+      rollback();
+      return;
+    }
+    Value rootRes = root->getResult(0);
+    auto rootTy = dyn_cast<RankedTensorType>(rootRes.getType());
+    if (!rootTy || rootTy.getRank() != 2) {
+      rollback();
+      return;
+    }
+    // Insert tt.trans just after the root op.
+    OpBuilder builder(root->getBlock(),
+                      std::next(Block::iterator(root)));
+    auto trans = triton::TransOp::create(builder, root->getLoc(), rootRes,
+                                          builder.getDenseI32ArrayAttr({1, 0}));
+    createdOps.push_back(trans);
+    seedMap[rootRes] = trans.getResult();
+  }
+
+  // Topo-sort plan.ops, materialize each non-root rule.
+  llvm::SetVector<Operation *> opSet(plan.ops.begin(), plan.ops.end());
+  auto sorted = mlir::topologicalSort(opSet);
+
+  for (Operation *op : sorted) {
+    if (rootSet.contains(op))
+      continue;
+    auto ruleIt = plan.ruleFor.find(op);
+    if (ruleIt == plan.ruleFor.end() || !ruleIt->second)
+      continue;
+    const TransposeRule *rule = ruleIt->second;
+    if (!rule->transform) {
+      // Rule has no commit-side transform (e.g. SCFCarryRetype, not yet
+      // implemented). Abort the whole plan.
+      rollback();
+      return;
+    }
+    if (op->getNumResults() != 1) {
+      rollback();
+      return;
+    }
+
+    llvm::SmallVector<Value, 4> operands;
+    for (Value v : op->getOperands()) {
+      auto it = seedMap.find(v);
+      operands.push_back(it != seedMap.end() ? it->second : v);
+    }
+    OpBuilder builder(op);
+    Value newResult = rule->transform(builder, op, operands);
+    if (!newResult) {
+      rollback();
+      return;
+    }
+    if (auto *defOp = newResult.getDefiningOp())
+      createdOps.push_back(defOp);
+    seedMap[op->getResult(0)] = newResult;
+  }
+
+  // Boundary back-trans inserts. For each (user, opIdx), look up the
+  // operand in seedMap; if found (in-closure), insert tt.trans to bring
+  // the value back to original orientation, and rewire.
+  for (auto &boundary : plan.boundaryOps) {
+    Operation *user = boundary.first;
+    unsigned opIdx = boundary.second;
+    Value orig = user->getOperand(opIdx);
+    auto it = seedMap.find(orig);
+    if (it == seedMap.end())
+      continue;
+    auto srcTy = dyn_cast<RankedTensorType>(it->second.getType());
+    if (!srcTy || srcTy.getRank() != 2) {
+      rollback();
+      return;
+    }
+    OpBuilder builder(user);
+    auto backTrans = triton::TransOp::create(
+        builder, user->getLoc(), it->second,
+        builder.getDenseI32ArrayAttr({1, 0}));
+    createdOps.push_back(backTrans);
+    user->setOperand(opIdx, backTrans.getResult());
+  }
+
+  // ReplaceAllUsesWith for each non-root seedMap entry, then erase the
+  // originals. Roots are left in place (the inserted lazy tt.trans
+  // depends on them).
+  llvm::SmallVector<Operation *> toErase;
+  for (auto &kv : seedMap) {
+    Value orig = kv.first;
+    Value newV = kv.second;
+    Operation *defOp = orig.getDefiningOp();
+    if (!defOp || rootSet.contains(defOp))
+      continue;
+    orig.replaceAllUsesWith(newV);
+    toErase.push_back(defOp);
+  }
+  // Erase in reverse-topological order (uses before defs).
+  for (Operation *op : llvm::reverse(toErase)) {
+    if (op->use_empty())
+      op->erase();
+  }
+
+  // Strip annotation from roots so the pass is idempotent.
+  for (Operation *root : plan.roots)
+    root->removeAttr(kTransposePropagateRootAttrName);
 }
 
 } // namespace mlir::triton::gpu
