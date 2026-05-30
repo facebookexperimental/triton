@@ -15,19 +15,85 @@
 
 #include "triton/Dialect/TritonGPU/Transforms/TransposePropagate.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseSet.h"
 
 namespace mlir::triton::gpu {
 
+namespace {
+
+//===----------------------------------------------------------------------===//
+// Rule: elementwise (arith + math + truncf/extf).
+//
+// Original:    C[i,j] = f(A[i,j], B[i,j], ...)
+// Rewritten:   C'[j,i] = f(A'[j,i], B'[j,i], ...)  where X' = X^T
+// Therefore:   C'[j,i] = f(A[i,j], B[i,j], ...) = C[i,j]
+// i.e.         C' = C^T  ✓
+//
+// The transform clones the op with the same op kind and discardable
+// attrs; result type is the original result type with shape reversed
+// (encoding preserved -- a later cleanup will pick that up via the
+// existing AccelerateAMDMatmul + RemoveLayoutConversions paths).
+//===----------------------------------------------------------------------===//
+
+bool matchElementwise(Operation *op, unsigned /*opIdx*/) {
+  // Recognize commonly-occurring scalar/elementwise ops on tensors. Limit
+  // to single-result, ranked-tensor result, and ops that have the same
+  // operands-and-result shape semantics. Conservative list rather than a
+  // generic trait scan -- avoids accidentally matching SCF ops, ops with
+  // region-side effects, etc.
+  if (!op || op->getNumResults() != 1)
+    return false;
+  auto resTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+  if (!resTy)
+    return false;
+  if (resTy.getRank() != 2)
+    return false;
+  return isa<arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::DivFOp,
+             arith::MaxNumFOp, arith::MinNumFOp, arith::MaximumFOp,
+             arith::MinimumFOp, arith::NegFOp, arith::TruncFOp,
+             arith::ExtFOp, arith::SelectOp, math::ExpOp, math::Exp2Op,
+             math::LogOp, math::Log2Op, math::SqrtOp, math::RsqrtOp,
+             math::FmaOp>(op);
+}
+
+Value transformElementwise(OpBuilder &builder, Operation *op,
+                           llvm::ArrayRef<Value> transposedOperands) {
+  // Result type: same encoding, swapped shape.
+  auto origTy = cast<RankedTensorType>(op->getResult(0).getType());
+  auto origShape = origTy.getShape();
+  if (origShape.size() != 2)
+    return nullptr;
+  llvm::SmallVector<int64_t, 2> newShape{origShape[1], origShape[0]};
+  auto newTy = RankedTensorType::get(newShape, origTy.getElementType(),
+                                     origTy.getEncoding());
+
+  // Build the new op by cloning with operands replaced + result type
+  // replaced. cloneWithoutRegions preserves the discardable attrs.
+  OperationState state(op->getLoc(), op->getName());
+  state.addOperands(transposedOperands);
+  state.addTypes({newTy});
+  state.attributes = op->getAttrs();
+  Operation *cloned = builder.create(state);
+  return cloned->getResult(0);
+}
+
+const TransposeRule kDefaultRules[] = {
+    {"elementwise", TransposeRuleKind::Rewrite, &matchElementwise,
+     &transformElementwise},
+};
+
+} // namespace
+
 llvm::ArrayRef<TransposeRule> getDefaultTransposeRules() {
-  // D1: empty registry. D2+ populates this.
-  return {};
+  return llvm::ArrayRef<TransposeRule>(kDefaultRules);
 }
 
 namespace {
 
-/// Find the rule matching `op` at operand index `opIdx`, or nullptr.
 const TransposeRule *findRule(Operation *op, unsigned opIdx) {
   for (const TransposeRule &rule : getDefaultTransposeRules()) {
     if (rule.match && rule.match(op, opIdx))
