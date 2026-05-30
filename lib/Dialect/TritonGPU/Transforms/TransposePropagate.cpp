@@ -248,6 +248,30 @@ Value transformDot(OpBuilder & /*builder*/, Operation * /*op*/,
   return nullptr;
 }
 
+//===----------------------------------------------------------------------===//
+// Rule: ttg.convert_layout (ConvertLayoutAdjust).
+//
+// A convert_layout consuming an in-closure value: build a new convert
+// from the transposed src type to the transposed dst type.
+//
+// Original:   Y = convert(X : T_src) -> T_dst
+// Transposed: Y' = convert(X' : T_src^T) -> T_dst^T
+//             where T_src^T / T_dst^T have shape swapped, encoding
+//             adjusted via the dialect's layout-inference machinery.
+//
+// D6: rule classification only. Transform factory is stubbed.
+//===----------------------------------------------------------------------===//
+
+bool matchConvertLayout(Operation *op, unsigned /*opIdx*/) {
+  return isa<ConvertLayoutOp>(op);
+}
+
+Value transformConvertLayout(OpBuilder & /*builder*/, Operation * /*op*/,
+                             llvm::ArrayRef<Value> /*transposedOperands*/) {
+  // D6: stub. Real factory lands with the commit engine.
+  return nullptr;
+}
+
 const TransposeRule kDefaultRules[] = {
     {"elementwise", TransposeRuleKind::Rewrite, &matchElementwise,
      &transformElementwise},
@@ -260,6 +284,8 @@ const TransposeRule kDefaultRules[] = {
     {"trans-elide", TransposeRuleKind::TransElide, &matchTrans,
      &transformTrans},
     {"dot-flip", TransposeRuleKind::DotFlip, &matchDot, &transformDot},
+    {"convert-layout", TransposeRuleKind::ConvertLayoutAdjust,
+     &matchConvertLayout, &transformConvertLayout},
 };
 
 } // namespace
