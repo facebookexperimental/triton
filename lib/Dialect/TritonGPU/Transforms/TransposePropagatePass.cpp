@@ -29,17 +29,22 @@ struct TransposePropagatePass
 
   void runOnOperation() override {
     ModuleOp m = getOperation();
-    m.walk([](mlir::triton::FuncOp funcOp) {
-      // D0: skeleton. Later commits will:
-      //   1. Locate every tt.dot with kTransposePropagateRootAttrName.
-      //   2. For each: plan -> score -> commit (with dry-run safety net).
-      //   3. Strip the attribute after a successful commit.
-      // For now, just call planTransposePropagation so the function
-      // is exercised by tests; with no rules registered it returns
-      // an empty plan and we bail.
+    bool verbose = std::getenv("TRITON_TRANSPOSE_PROPAGATE_DEBUG") != nullptr;
+    m.walk([&](mlir::triton::FuncOp funcOp) {
       TransposePlan plan = planTransposePropagation(funcOp);
+      if (plan.rejected()) {
+        if (verbose && plan.rejectedAt)
+          plan.rejectedAt->emitRemark()
+              << "transpose-propagate: rejected: " << plan.rejectReason;
+        return;
+      }
       if (plan.empty())
         return;
+      if (verbose)
+        funcOp.emitRemark()
+            << "transpose-propagate: plan roots=" << plan.roots.size()
+            << " ops=" << plan.ops.size()
+            << " boundary=" << plan.boundaryOps.size();
       TransposeScore score = scoreTransposePlan(plan);
       if (!score.feasible)
         return;
