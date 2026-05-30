@@ -50,6 +50,12 @@ constexpr static char kPartitionAttrName[] = "ttg.partition";
 constexpr static char kPartitionOutputsAttrName[] = "ttg.partition.outputs";
 constexpr static char kPartitionStagesAttrName[] = "ttg.partition.stages";
 constexpr static char kWarpSpecializeTagAttrName[] = "ttg.warp_specialize.tag";
+// D0: per-dot annotation marking it as a root for algebraic transpose
+// propagation (see lib/Dialect/TritonGPU/Transforms/TransposePropagate.h).
+// Presence of this UnitAttr triggers the rewrite; default behaviour
+// (no annotation) is unchanged.
+constexpr static char kTransposePropagateRootAttrName[] =
+    "tt.transpose_propagate_root";
 constexpr static char AttrMinRegAutoWSName[] = "ttg.min_reg_auto_ws";
 constexpr static char AttrMaxRegAutoWSName[] = "ttg.max_reg_auto_ws";
 constexpr static char AttrClusterDimX[] = "ttg.cluster-dim-x";

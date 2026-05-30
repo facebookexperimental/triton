@@ -375,6 +375,27 @@ def TritonGPUOptimizeAccumulatorInit: Pass<"tritongpu-optimize-accumulator-init"
                            "mlir::triton::TritonDialect"];
 }
 
+def TritonGPUTransposePropagate: Pass<"tritongpu-transpose-propagate", "mlir::ModuleOp"> {
+  let summary = "Algebraic transpose propagation rooted at annotated tt.dot ops";
+
+  let description = [{
+    For each `tt.dot` annotated with `tt.transpose_propagate_root`, treat
+    the dot as a candidate for DotFlip (swap A and B with `tt.trans`
+    wrapping) and propagate the resulting mathematical transposition
+    forward through its use chain. Per-op rules decide how each consumer
+    handles a transposed input: Rewrite (elementwise), ReduceAxisSwap,
+    BroadcastSwap, TransElide, DotFlip, ConvertLayoutAdjust, BoundaryInsert,
+    or Reject. The pass is a no-op on FuncOps with no annotated roots.
+
+    Distinct from `tritongpu-remove-layout-conversions`, which propagates
+    layout *encodings* through ops; this pass propagates *mathematical
+    transpose orientation*, changing shapes and reshape/reduce axes.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect"];
+}
+
 def TritonGPUCoalesceAsyncCopy: Pass<"tritongpu-coalesce-async-copy", "mlir::ModuleOp"> {
   let summary = "Improve coalescing for async global to local copies";
 
