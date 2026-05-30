@@ -48,9 +48,14 @@ enum class TransposeRuleKind {
   /// with new (transposed) operand types; result type is the transpose of
   /// the original.
   Rewrite,
-  /// tt.reduce, tt.expand_dims: flip the `axis` attribute.
+  /// tt.reduce: flip the `axis` attribute. Result is 1-D, mathematically
+  /// unchanged. The 1-D output is recursed-on so 1-D consumers can be
+  /// classified.
   ReduceAxisSwap,
-  /// tt.broadcast: build the new (axis-swapped) result type.
+  /// tt.expand_dims: flip the `axis` attribute. Result is 2-D and *is*
+  /// in transposed orientation -- pushes to the closure.
+  ExpandDimsSwap,
+  /// tt.broadcast: swap the result shape (dims swap with operand).
   BroadcastSwap,
   /// tt.trans on a transposed value: emit no new op; the un-transposed
   /// value flows through.

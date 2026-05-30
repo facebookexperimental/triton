@@ -81,9 +81,115 @@ Value transformElementwise(OpBuilder &builder, Operation *op,
   return cloned->getResult(0);
 }
 
+//===----------------------------------------------------------------------===//
+// Rule: tt.reduce (ReduceAxisSwap).
+//
+// Original input:    X : <MxN>             (in non-transposed orientation)
+//                    Y[i] = reduce_j X[i, j]   where axis = 1
+// Transposed input:  X' : <NxM>            (X' = X^T, in closure)
+//                    Y'[i] = reduce_j X'[j, i] where axis = 0
+//                          = reduce_j X[i, j] = Y[i]
+// Output Y' == Y (1-D vector, same elements). Encoding may flip
+// (slice<dim=1> vs slice<dim=0>), but the math is unchanged.
+//===----------------------------------------------------------------------===//
+
+bool matchReduce(Operation *op, unsigned /*opIdx*/) {
+  auto reduceOp = dyn_cast<triton::ReduceOp>(op);
+  if (!reduceOp)
+    return false;
+  // Engine assumes single-input single-result reduces over rank-2 input.
+  if (reduceOp.getNumOperands() != 1 || reduceOp.getNumResults() != 1)
+    return false;
+  auto srcTy = dyn_cast<RankedTensorType>(reduceOp.getOperand(0).getType());
+  if (!srcTy || srcTy.getRank() != 2)
+    return false;
+  // axis must be 0 or 1.
+  unsigned axis = reduceOp.getAxis();
+  return axis == 0 || axis == 1;
+}
+
+Value transformReduce(OpBuilder &builder, Operation *op,
+                      llvm::ArrayRef<Value> transposedOperands) {
+  auto reduceOp = cast<triton::ReduceOp>(op);
+  uint32_t newAxis = reduceOp.getAxis() ^ 1u;
+  auto newReduce = triton::ReduceOp::create(builder, op->getLoc(),
+                                            ValueRange(transposedOperands),
+                                            newAxis, /*ordering=*/StringAttr{});
+  newReduce.getRegion().takeBody(reduceOp.getRegion());
+  return newReduce.getResult().front();
+}
+
+//===----------------------------------------------------------------------===//
+// Rule: tt.expand_dims (ExpandDimsSwap).
+//
+// Original:    X : <M>          (1-D)
+//              Y : <Mx1>        when axis=1   (Y[i,0] = X[i])
+// Transposed:  X' : <M>         (still 1-D, no transpose on 1-D)
+//              Y' : <1xM>       when axis=0   (Y'[0,i] = X'[i] = X[i])
+// Output Y' = Y^T.
+//===----------------------------------------------------------------------===//
+
+bool matchExpandDims(Operation *op, unsigned /*opIdx*/) {
+  auto expandOp = dyn_cast<triton::ExpandDimsOp>(op);
+  if (!expandOp)
+    return false;
+  auto srcTy = dyn_cast<RankedTensorType>(expandOp.getSrc().getType());
+  return srcTy && srcTy.getRank() == 1;
+}
+
+Value transformExpandDims(OpBuilder &builder, Operation *op,
+                          llvm::ArrayRef<Value> transposedOperands) {
+  auto expandOp = cast<triton::ExpandDimsOp>(op);
+  unsigned newAxis = expandOp.getAxis() ^ 1u;
+  auto newExpand = triton::ExpandDimsOp::create(
+      builder, op->getLoc(), transposedOperands.front(), newAxis);
+  return newExpand.getResult();
+}
+
+//===----------------------------------------------------------------------===//
+// Rule: tt.broadcast (BroadcastSwap).
+//
+// Original:    X : <Mx1>, Y : <MxN>          Y[i,j] = X[i,0]
+// Transposed:  X' : <1xM>, Y' : <NxM>        Y'[j,i] = X'[0,i] = X[i,0]
+// So Y'[j,i] = Y[i,j], i.e. Y' = Y^T.
+//===----------------------------------------------------------------------===//
+
+bool matchBroadcast(Operation *op, unsigned /*opIdx*/) {
+  auto bcastOp = dyn_cast<triton::BroadcastOp>(op);
+  if (!bcastOp)
+    return false;
+  auto srcTy = dyn_cast<RankedTensorType>(bcastOp.getSrc().getType());
+  auto resTy = dyn_cast<RankedTensorType>(bcastOp.getType());
+  return srcTy && resTy && srcTy.getRank() == 2 && resTy.getRank() == 2;
+}
+
+Value transformBroadcast(OpBuilder &builder, Operation *op,
+                         llvm::ArrayRef<Value> transposedOperands) {
+  auto bcastOp = cast<triton::BroadcastOp>(op);
+  auto srcTy = cast<RankedTensorType>(transposedOperands.front().getType());
+  auto resTy = cast<RankedTensorType>(bcastOp.getType());
+  // Swap the result shape.
+  auto resShape = resTy.getShape();
+  llvm::SmallVector<int64_t, 2> newShape{resShape[1], resShape[0]};
+  // Encoding for new result: same parent encoding as original output, but
+  // the broadcast op preserves the operand's encoding type. Use the
+  // transposed operand's encoding (it was set by the upstream rule).
+  auto newResTy = RankedTensorType::get(newShape, resTy.getElementType(),
+                                        srcTy.getEncoding());
+  auto newBcast = triton::BroadcastOp::create(
+      builder, op->getLoc(), newResTy, transposedOperands.front());
+  return newBcast.getResult();
+}
+
 const TransposeRule kDefaultRules[] = {
     {"elementwise", TransposeRuleKind::Rewrite, &matchElementwise,
      &transformElementwise},
+    {"reduce", TransposeRuleKind::ReduceAxisSwap, &matchReduce,
+     &transformReduce},
+    {"expand-dims", TransposeRuleKind::ExpandDimsSwap, &matchExpandDims,
+     &transformExpandDims},
+    {"broadcast", TransposeRuleKind::BroadcastSwap, &matchBroadcast,
+     &transformBroadcast},
 };
 
 } // namespace
