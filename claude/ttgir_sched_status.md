@@ -16,6 +16,7 @@
 | 1c Forward walker (collect dot-result user ops)          | `0c16f8e26` | 130 | ✅ landed |
 | 1d Actual SSA mutation (M-split apply via extract_slice + N dots + concat) | `6cc0e7545` | 155 | ✅ landed |
 | 2  Compose N-split on top of M-split (M × N grid)        | `7b7191047` | 123 | ✅ landed |
+| 3  Insert ROCDL::SchedBarrier(0) between M-rows         | `b48a1bc43` | 137 | ✅ landed + **+1.8 % perf win** |
 
 All on the `main` branch of `~/MetaMain2/triton` (Meta TLX fork).
 
@@ -105,7 +106,7 @@ Sample IR after APPLY (excerpt):
 
 3. **Numerical correctness on v8/v10 isn't yet hardware-verified.** Lit tests prove the rewrite produces valid IR. The `replaceAllUsesWith` + `concat` pattern is straight from `WSDataPartition`'s playbook so semantic equivalence is high-confidence, but hardware run is the only definitive test.
 
-## e2e validation (added 2026-05-30)
+## e2e validation (added 2026-05-30; updated for Phase 3)
 
 Stand-alone autotuned matmul (`~/AMD/triton/claude/triton_kernels_baseline/_one_run_envcompare.py`),
 K=4096, BM=BN=256, BK=64, num_warps=8 (autotune-picked), on the
@@ -113,26 +114,33 @@ K=4096, BM=BN=256, BK=64, num_warps=8 (autotune-picked), on the
 
 | Mode | TFLOPS | Δ vs baseline | PyTorch match |
 |---|---:|---:|---|
-| Baseline (no TTGIR_SCHED)                | 850.24 | — | ✅ |
-| `TTGIR_SCHED=1` (planning only)          | 850.53 | +0.03 % (noise) | ✅ |
-| `TTGIR_SCHED=1 + TTGIR_SCHED_APPLY=1`   | 839.03 | **-1.3 %** (within ±5 % bar) | ✅ |
+| Baseline (no TTGIR_SCHED)                                | 843.68 | — | ✅ |
+| `TTGIR_SCHED=1` (planning only, no APPLY)                | 850.53 | +0.8 % (noise) | ✅ |
+| `TTGIR_SCHED=1 APPLY=1` Phase 3 default (per-M-row bars) | **858.79** | **+1.8 %** | ✅ |
+| `TTGIR_SCHED=1 APPLY=1 STRIDE=0` (no bars = Phase 2)     | 841.97 | -0.2 % (noise) | ✅ |
+| `TTGIR_SCHED=1 APPLY=1 STRIDE=1` (per-sub-dot bars)      | 833.47 | -1.2 % (over) | ✅ |
 
 Headline:
 - **Planning mode is a true no-op** (delta is run-to-run noise).
-- **APPLY mode is numerically correct** (PyTorch reference matched after
-  the 8 × 8 = 64 sub-dots + concat rewrite).
-- **APPLY perf is within the ±5 % success criterion** — the small delta
-  reflects LLVM-side scheduling/RA differences on the rewritten IR;
-  Phase 2 doesn't yet add a beneficial reorder or sched_barrier (that's
-  Phase 3's job).
+- **APPLY default (Phase 3) delivers +1.8 % over baseline** — the first
+  sub-step to produce a real perf bump. Per-M-row barriers constrain
+  LLVM's misched to row-bounded scheduling regions, letting it optimize
+  locally without breaking the structured schedule.
+- **STRIDE=0 confirms Phase 2 IR is functionally identical to baseline**
+  (no barriers → -0.2 % is within noise).
+- **STRIDE=1 (over-barriered) hurts -1.2 %** — too many small regions
+  for misched to do anything useful with.
+
+Bigger wins (the ~+24 % the LLIR scheduler delivers on v10/v8) would
+require Phase 4+ on a kernel that actually exposes MFMA/LR interleave
+opportunities — plus the K-split + local_load decomposition cited in
+the design doc.
 
 **v8 from METAMD cannot be tested directly on `metamain2`** because
 `v8_beyond_hotloop` imports `triton.experimental.gluon.language.amd.cdna3.extract_slice`,
 which exists only on the matmul_4waves branch of ROCm/triton (the
 `amd-triton` conda env). MetaMain2/triton's gluon.amd.cdna3 module
-doesn't have it. This is the same `ImportError: cannot import name
-'extract_slice'` we saw earlier when trying v8 on the `oss` env (see
-the `gl_matmul_passes_summary.md` discussion).
+doesn't have it.
 
 Workarounds for the next session if a v8/v10-style validation is wanted:
   1. Port the `cdna3.extract_slice` op from matmul_4waves to MetaMain2's
