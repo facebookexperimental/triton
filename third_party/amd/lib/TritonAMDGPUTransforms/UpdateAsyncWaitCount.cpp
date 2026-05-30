@@ -483,6 +483,8 @@ struct TritonAMDGPUUpdateAsyncWaitCountPass
               mlir::LLVM::AMD::distributeTDMWarpsAlignToPartition(
                   smemTy.getShape(), numWarps, smemTy.getEncoding());
           return numInstr;
+        } else if (isa<AsyncTDMGroupCopyGlobalToLocalOp>(op)) {
+          return 1;
         } else if (auto copyOp = dyn_cast<AsyncTDMCopyLocalToGlobalOp>(op)) {
           auto smemTy = copyOp.getSrc().getType();
           int numWarps = ttg::lookupNumWarps(op);

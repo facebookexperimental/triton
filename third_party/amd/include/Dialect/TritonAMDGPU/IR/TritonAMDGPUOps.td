@@ -803,6 +803,44 @@ def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local",
 }
 
 //===----------------------------------------------------------------------===//
+// AsyncTDMGroupCopyGlobalToLocalOp
+//===----------------------------------------------------------------------===//
+
+def AsyncTDMGroupCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_group_copy_global_to_local", [
+    AttrSizedOperandSegments,
+    MemoryEffects<[MemRead<GlobalMemory>, MemWrite<SharedMemory>]>
+]> {
+  let summary = "N-way grouped TDM copy from global memory to local memory";
+
+  let description = [{
+    This operation represents several descriptor-to-LDS TDM loads fused into one
+    hardware TDM instruction.  Each arm contains one tensor descriptor, one
+    destination memdesc, one predicate, and `rank` offset operands.  The
+    `warp_masks` attribute assigns each warp to exactly one arm; lowering builds
+    the hardware descriptor for each arm and selects descriptor groups by warp id
+    before emitting a single `llvm.amdgcn.tensor.load.to.lds` intrinsic.
+
+    The first implementation intentionally supports a conservative subset:
+    same-rank arms, same element bitwidth, one CTA, no mbarrier operand, and one
+    shared cache modifier for all arms.
+  }];
+
+  let arguments = (ins
+    Variadic<TT_TensorDescType>:$descs,
+    Variadic<I32>:$indices,
+    Variadic<TTG_MemDescType>:$dsts,
+    Variadic<I32>:$preds,
+    I32Attr:$rank,
+    DenseI32ArrayAttr:$warp_masks,
+    DefaultValuedAttr<TT_CacheModifierAttr, "triton::CacheModifier::NONE">:$cache
+  );
+
+  let results = (outs TTG_AsyncToken:$token);
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // AsyncTDMCopyLocalToGlobalOp
 //===----------------------------------------------------------------------===//
 

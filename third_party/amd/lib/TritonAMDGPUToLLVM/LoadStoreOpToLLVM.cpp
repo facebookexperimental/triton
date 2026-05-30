@@ -1257,8 +1257,9 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
     unsigned padInterval = 0;
     unsigned padAmount = 0;
     if (auto padEnc = getPaddedEncoding(encoding)) {
-      assert(padEnc.getIntervals().size() == 1 &&
-             padEnc.getPaddings().size() == 1);
+      if (padEnc.getIntervals().size() != 1 || padEnc.getPaddings().size() != 1)
+        return op.emitOpError(
+            "TDM load only supports single interval-padding pairs");
       padInterval = padEnc.getIntervals()[0];
       padAmount = padEnc.getPaddings()[0];
     }
@@ -1319,6 +1320,199 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
         padInterval, padAmount, offset, dstPtrs, pred, multicastMask,
         elementType, barrierPtr, /*isLoad=*/true, sharedLayout, encoding, ctaId,
         auxBits, warpUsedHint, /*isPureForm=*/true);
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+struct AsyncTDMGroupCopyGlobalToLocalOpConversion
+    : public ConvertOpToLLVMPattern<
+          triton::amdgpu::AsyncTDMGroupCopyGlobalToLocalOp>,
+      public LoadStoreConversionBase {
+  AsyncTDMGroupCopyGlobalToLocalOpConversion(
+      LLVMTypeConverter &converter, const AMD::TargetInfo &targetInfo,
+      ModuleAxisInfoAnalysis &axisAnalysisPass, PatternBenefit benefit)
+      : ConvertOpToLLVMPattern(converter, benefit),
+        LoadStoreConversionBase(targetInfo, axisAnalysisPass) {}
+
+  LogicalResult
+  matchAndRewrite(triton::amdgpu::AsyncTDMGroupCopyGlobalToLocalOp op,
+                  OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    int numWarps = triton::gpu::lookupNumWarps(op);
+    int rank = op.getRank();
+    auto ctaId = targetInfo.getClusterCTAId(rewriter, loc);
+
+    // Lower an N-way grouped TDM load to one hardware TDM instruction.  Each
+    // arm first builds the same descriptor groups a standalone TDM load would
+    // use, including its destination LDS pointer and warp-mask predicate.  The
+    // selected descriptor is then assembled one scalar lane at a time based on
+    // the current warp id.  Doing the mux at descriptor-lane granularity keeps
+    // common fields (for example tensor shape/stride slots) shared in SSA form,
+    // so canonicalization and LLVM do not have to scalarize whole-vector
+    // selects for fields that are identical across arms.
+    auto v4i32Ty = VectorType::get(4, rewriter.getI32Type());
+    auto v8i32Ty = VectorType::get(8, rewriter.getI32Type());
+    SmallVector<SmallVector<Value>> selectedGroupElems;
+    Value mergedPred = b.i32_val(0);
+
+    Value warpId = getLaneAndWarpId(rewriter, loc).second;
+    Value one = b.i32_val(1);
+
+    constexpr int kNumTDMDescriptorInputGroups = 4;
+    constexpr int kTDMDescriptorGroup0Size = 4;
+    constexpr int kTDMDescriptorGroup1Size = 8;
+    constexpr int kTDMDescriptorPredicateGroup = 0;
+    constexpr int kTDMDescriptorPredicateElement = 0;
+    // The descriptor builder returns groups 0..3.  The hardware intrinsic
+    // also takes a reserved group 4, which is zero-filled at emission time.
+    auto getGroupSize = [](int groupIdx) {
+      return groupIdx == 1 ? kTDMDescriptorGroup1Size
+                           : kTDMDescriptorGroup0Size;
+    };
+    auto isPredicateLane = [](int groupIdx, int elemIdx) {
+      return groupIdx == kTDMDescriptorPredicateGroup &&
+             elemIdx == kTDMDescriptorPredicateElement;
+    };
+    auto extractGroupElems = [&](ArrayRef<Value> groups) {
+      SmallVector<SmallVector<Value>> elems;
+      elems.reserve(kNumTDMDescriptorInputGroups);
+      for (int groupIdx = 0; groupIdx < kNumTDMDescriptorInputGroups;
+           ++groupIdx) {
+        SmallVector<Value> groupElems;
+        int groupSize = getGroupSize(groupIdx);
+        groupElems.reserve(groupSize);
+        for (int elemIdx = 0; elemIdx < groupSize; ++elemIdx) {
+          groupElems.push_back(
+              b.extract_element(i32_ty, groups[groupIdx], b.i32_val(elemIdx)));
+        }
+        elems.push_back(std::move(groupElems));
+      }
+      return elems;
+    };
+    auto packGroupElems = [&](ArrayRef<SmallVector<Value>> elems) {
+      SmallVector<Value> groups;
+      groups.reserve(kNumTDMDescriptorInputGroups);
+      for (int groupIdx = 0; groupIdx < kNumTDMDescriptorInputGroups;
+           ++groupIdx) {
+        Type vecTy = groupIdx == 1 ? Type(v8i32Ty) : Type(v4i32Ty);
+        Value group = b.undef(vecTy);
+        for (auto [elemIdx, elem] : llvm::enumerate(elems[groupIdx]))
+          group = b.insert_element(vecTy, group, elem, b.i32_val(elemIdx));
+        groups.push_back(group);
+      }
+      return groups;
+    };
+
+    for (auto armIdx : llvm::seq<size_t>(0, op.getDescs().size())) {
+      auto tensorDescTy =
+          cast<triton::TensorDescType>(op.getDescs()[armIdx].getType());
+      auto encoding = tensorDescTy.getSharedLayout();
+      Type elementType =
+          getTypeConverter()->convertType(tensorDescTy.getElementType());
+
+      triton::LinearLayout sharedLayout =
+          isPaddedEncoding(encoding)
+              ? paddedLinearLayout(tensorDescTy.getShape(), encoding)
+              : toLinearLayout(tensorDescTy.getShape(), encoding);
+
+      unsigned padInterval = 0;
+      unsigned padAmount = 0;
+      if (auto padEnc = getPaddedEncoding(encoding)) {
+        if (padEnc.getIntervals().size() != 1 ||
+            padEnc.getPaddings().size() != 1)
+          return op.emitOpError(
+              "grouped TDM only supports single interval-padding pairs");
+        padInterval = padEnc.getIntervals()[0];
+        padAmount = padEnc.getPaddings()[0];
+      }
+
+      SmallVector<Value> desc = mlir::LLVM::AMD::unpackTDMDescriptor(
+          rewriter, loc, adaptor.getDescs()[armIdx]);
+
+      auto dstMemObj = LLVM::getSharedMemoryObjectFromStruct(
+          loc, adaptor.getDsts()[armIdx], elementType, rewriter);
+      SmallVector<Value> dstPtrs = llvm::to_vector(dstMemObj.getBases());
+
+      SmallVector<Value> offset;
+      offset.reserve(rank);
+      auto indices = adaptor.getIndices();
+      for (int i = 0; i < rank; ++i)
+        offset.push_back(indices[armIdx * rank + i]);
+
+      uint32_t warpMask = static_cast<uint32_t>(op.getWarpMasks()[armIdx]);
+      int effectiveWarps = llvm::popcount(warpMask);
+      auto shapePerCTA =
+          triton::gpu::getShapePerCTA(encoding, tensorDescTy.getShape());
+      auto [warpsPerCTA, numTDMInstructions] =
+          mlir::LLVM::AMD::distributeTDMWarpsAlignToPartition(
+              shapePerCTA, effectiveWarps, encoding);
+      if (numTDMInstructions != 1)
+        return op.emitOpError("grouped TDM arm ")
+               << armIdx << " would lower to multiple intrinsics";
+
+      mlir::LLVM::AMD::fillTDMDescriptor(
+          rewriter, loc, getTypeConverter(), elementType, shapePerCTA, numWarps,
+          padInterval, padAmount, desc, offset, dstPtrs,
+          adaptor.getPreds()[armIdx],
+          /*multicastMask=*/Value(), /*barrierPtr=*/Value(), sharedLayout,
+          ctaId,
+          /*isStore=*/false, warpsPerCTA, warpMask);
+
+      while (desc.size() < kNumTDMDescriptorInputGroups)
+        desc.push_back(LLVM::ZeroOp::create(rewriter, loc, v4i32Ty));
+
+      auto descElems = extractGroupElems(desc);
+      // For regular TDM loads group0[0] is the predicate.  fillTDMDescriptor
+      // already ANDs that predicate with the arm warp mask, and the grouped
+      // verifier requires masks to be disjoint.  Therefore ORing all arm
+      // predicates is equivalent to selecting the predicate for the active arm,
+      // and saves one descriptor-lane select per grouped instruction.
+      mergedPred = b.or_(mergedPred, descElems[kTDMDescriptorPredicateGroup]
+                                              [kTDMDescriptorPredicateElement]);
+      if (selectedGroupElems.empty()) {
+        selectedGroupElems = std::move(descElems);
+        selectedGroupElems[kTDMDescriptorPredicateGroup]
+                          [kTDMDescriptorPredicateElement] = mergedPred;
+        continue;
+      }
+
+      Value active = b.icmp_ne(b.and_(b.shl(one, warpId), b.i32_val(warpMask)),
+                               b.i32_val(0));
+      for (int groupIdx = 0; groupIdx < kNumTDMDescriptorInputGroups;
+           ++groupIdx) {
+        for (int elemIdx = 0; elemIdx < getGroupSize(groupIdx); ++elemIdx) {
+          if (isPredicateLane(groupIdx, elemIdx)) {
+            selectedGroupElems[kTDMDescriptorPredicateGroup]
+                              [kTDMDescriptorPredicateElement] = mergedPred;
+            continue;
+          }
+          // Non-predicate lanes are descriptor fields: base pointers, offsets,
+          // tensor dimensions, strides, and padding controls.  Select each lane
+          // independently so identical SSA values do not grow scalar setup.
+          Value armElem = descElems[groupIdx][elemIdx];
+          Value &selectedElem = selectedGroupElems[groupIdx][elemIdx];
+          if (armElem == selectedElem)
+            continue;
+          selectedElem = b.select(active, armElem, selectedElem);
+        }
+      }
+    }
+
+    if (selectedGroupElems.empty())
+      return op.emitOpError("requires at least one TDM load arm");
+
+    SmallVector<Value> selectedGroups = packGroupElems(selectedGroupElems);
+    selectedGroups.push_back(
+        LLVM::ZeroOp::create(rewriter, loc, v8i32Ty)); // group4
+    auto auxBits = mlir::LLVM::AMD::getCtrlBitsForCacheModifierOnTarget(
+        op.getCache(), /*isLoad=*/true, targetInfo);
+    selectedGroups.push_back(b.i32_val(auxBits));
+    LLVM::createLLVMIntrinsicCallOp(
+        rewriter, loc, "llvm.amdgcn.tensor.load.to.lds", {}, selectedGroups);
 
     rewriter.eraseOp(op);
     return success();
@@ -2600,6 +2794,7 @@ void populateLoadStoreOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                BufferAtomicRMWOpConversion, AsyncCopyGlobalToLocalOpConversion,
                AsyncCopyLocalToGlobalOpConversion, BufferAtomicCASOpConversion,
                AsyncTDMCopyGlobalToLocalOpConversion,
+               AsyncTDMGroupCopyGlobalToLocalOpConversion,
                AsyncTDMCopyLocalToGlobalOpConversion,
                AsyncTDMScatterOpConversion, AsyncTDMGatherOpConversion>(
       typeConverter, targetInfo, axisInfoAnalysis, benefit);
