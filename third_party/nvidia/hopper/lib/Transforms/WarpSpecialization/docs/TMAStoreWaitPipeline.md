@@ -13,70 +13,65 @@ the ordering anchor for channels feeding TMA stores. The producer-side
 descriptor; later wait annotation and rotation reason about the sequence of
 stores to a shared staging buffer.
 
-## Memory Planner: `isTMAStoreStaging` Handling
+## Memory Planner: `buffer.tmaStaging` Handling
 
 **File**: `WSMemoryPlanner.cpp` (within `allocateSmemBuffers`)
 
 When `early_tma_store_lowering` is enabled, the `local_alloc` ops created
-for TMA store staging are visible to the memory planner. These allocs feed
-`AsyncTMACopyLocalToGlobalOp` and are detected by checking users:
+for TMA store staging are visible to the memory planner. Each WSBuffer is
+classified by which TMA op it feeds (Phase 1):
 
 ```cpp
 for (auto user : alloc->getUsers()) {
-    if (isa<ttng::AsyncTMACopyLocalToGlobalOp>(user))
-        buf.isTMAStoreStaging = true;
+    if (isa<ttng::AsyncTMACopyLocalToGlobalOp>(user)) {
+        buf.tmaStaging = 1;   // regular TMA store staging (dk, dv, c, o, ...)
+        break;
+    }
+    if (isa<ttng::AsyncTMAReduceOp>(user)) {
+        buf.tmaStaging = 2;   // TMA atomic-add reduce staging (dq, ...)
+        break;
+    }
 }
 ```
 
-The `isTMAStoreStaging` flag triggers a special path through four phases:
+`buf.tmaStaging` is a classification tag (0 = not TMA staging, 1 = store,
+2 = reduce), not a count. It is propagated to the resulting `local_alloc`
+op as the `buffer.tmaStaging` attribute and consumed by later passes that
+need to distinguish reduce staging from regular store staging.
 
-### Phase 3.5: TMA Store Staging Fusion
+The flag drives a special path through three phases:
 
-All `isTMAStoreStaging` WSBuffers are merged into a single `bufferId`
-(via `fuseEpilogueWSBuffers`). This groups the dk/dv epilogue store
-staging buffers together. The merge uses the first buffer's ID for all.
+### Phase 3.5: TMA Staging Fusion
 
-Note: the shared `bufferId` affects `computeTotalSmem`'s cost model
-(`max(size) × copies` per ID) but does **not** cause physical alloc
-merging downstream — each alloc remains separate through
-`AllocateSharedMemoryNv`.
+All TMA staging WSBuffers that feed the same TMA descriptor are merged
+into a single `bufferId` (via `fuseEpilogueWSBuffers`). For example, the
+4 subtile stagings of `desc_dq` (under `EPILOGUE_SUBTILE=4`) all share
+one `bufferId`, as do the dk and dv subtile stagings (each per their own
+descriptor).
+
+The shared `bufferId` is honored by `doCodePartition` downstream: the
+subtile allocs are physically merged into one `local_alloc` of shape
+`numCopies x original_shape` (e.g., `1x128x32xf32` for `numCopies=1`).
+All subtile stores then index into the same physical SMEM region via
+`memdesc_index`. As a result `computeTotalSmem`'s cost model
+(`max(size) × copies` per `bufferId`) matches the actual post-merge
+physical footprint — there is no per-entry multiplier to add.
 
 ### Phase 4.5: Epilogue Group Copy Increase
 
-The merged TMA store group is treated as a P2_Other epilogue group.
-`increaseFusedEpilogueCopies` iteratively increases copies (up to
-`numBuffers`) while checking `computeTotalSmem ≤ smemBudget`.
+Each fused P2_Other group (including TMA staging groups) is treated as
+an epilogue group. `increaseFusedEpilogueCopies` iteratively bumps
+`numCopies` from the current value up to `numBuffers`, accepting each
+bump as long as `computeTotalSmem ≤ smemBudget`.
 
-Since `computeTotalSmem` excludes `isTMAStoreStaging` buffers from its
-total, the budget check is effectively a no-op — copies always increase
-to `numBuffers`. This is by design: TMA store staging buffers live
-outside the pipelined inner loop and don't compete with channel buffers
-for pipeline depth.
-
-### Phase 4.6: Combined SMEM Budget Validation
-
-After Phase 4.5, the combined SMEM cost is checked:
-
-```
-channelSmem = computeTotalSmem(wsBuffers)           // excludes TMA staging
-tmaStoreSmem = computeTMAStoreStagingSmem(wsBuffers) // per-entry counting
-if (channelSmem + tmaStoreSmem > smemBudget):
-    cap all isTMAStoreStaging copies to 1
-```
-
-`computeTMAStoreStagingSmem` counts `numEntries × size × copies` (not
-`max(size) × copies`) because the allocs are NOT merged into one physical
-alloc downstream.
-
-This prevents SMEM overflow for tight-budget configs where Phase 4.5
-would otherwise increase TMA staging copies unchecked. For example:
-BWD config 1 (BLOCK_M1=64, EPILOGUE_SUBTILE=2) has 4 TMA store staging
-allocs of 16KB each — at 2 copies this is 128KB, exceeding the budget.
-Phase 4.6 caps copies to 1 (64KB), fitting within hardware limits.
+For TMA staging groups specifically the same SMEM cost model applies:
+adding a copy adds `max(size_in_group)` bytes (not `sum(sizes)`),
+because the group merges into a single rotating slot pool. Pinned
+buffers and non-`P2_Other` buffers are skipped.
 
 ### Phase 6: Hoist Before Outermost Loop
 
-All `isTMAStoreStaging` allocs are moved before the outermost enclosing
+All TMA staging allocs are moved before the outermost enclosing
 `scf.for` loop. This is required for the rotation mechanism
 (`doAnnotateTMAStoreWaits`) which reads `buffer.copy` and only annotates
 allocs that are outside all loops.

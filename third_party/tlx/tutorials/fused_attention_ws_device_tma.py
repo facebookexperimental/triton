@@ -763,7 +763,7 @@ def _attn_bwd_dkdv(
                 merge_epilogue_to_computation=True,
                 tmem_alloc_algo=2,
                 smem_alloc_algo=1,
-                smem_budget=200000,
+                smem_budget=220000,
         ):
             dk, dv, curr_m = _attn_bwd_dkdv_inner(
                 dk,
