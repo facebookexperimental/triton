@@ -17,6 +17,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseSet.h"
@@ -273,6 +274,22 @@ Value transformConvertLayout(OpBuilder & /*builder*/, Operation * /*op*/,
 }
 
 //===----------------------------------------------------------------------===//
+// Rule: scf.yield (SCFCarryRetype).
+//
+// When scf.yield's value at position k is in the closure, the parent
+// scf.for's iter_arg at position k carries a transposed value across
+// iterations. Commit phase will:
+//   * retype iterArg(k) to the transposed type;
+//   * insert tt.trans on the init_arg at position k (loop entry);
+//   * the iter_arg's downstream uses are already classified by the
+//     engine (extended DFS at SCFCarryRetype).
+//===----------------------------------------------------------------------===//
+
+bool matchSCFYield(Operation *op, unsigned /*opIdx*/) {
+  return isa<scf::YieldOp>(op) && isa_and_nonnull<scf::ForOp>(op->getParentOp());
+}
+
+//===----------------------------------------------------------------------===//
 // Rule: shared-mem boundary (ttg.local_alloc / ttg.local_load).
 //
 // Shared-memory ops (MemDescType operands/results) can't carry a
@@ -304,6 +321,8 @@ const TransposeRule kDefaultRules[] = {
     {"convert-layout", TransposeRuleKind::ConvertLayoutAdjust,
      &matchConvertLayout, &transformConvertLayout},
     {"shared-mem", TransposeRuleKind::SharedMemBoundary, &matchSharedMem,
+     /*transform=*/nullptr},
+    {"scf-yield", TransposeRuleKind::SCFCarryRetype, &matchSCFYield,
      /*transform=*/nullptr},
 };
 
@@ -391,6 +410,21 @@ TransposePlan planTransposePropagation(Operation *root) {
       }
       plan.ops.push_back(user);
       plan.ruleFor[user] = rule;
+
+      // SCFCarryRetype: also walk the parent scf.for's iter_arg at the
+      // corresponding position so its in-loop uses get classified. The
+      // commit phase will retype both the iter_arg and the initial
+      // value (with a tt.trans inserted on the init).
+      if (rule->kind == TransposeRuleKind::SCFCarryRetype) {
+        auto yieldOp = cast<scf::YieldOp>(user);
+        if (auto forOp = dyn_cast<scf::ForOp>(yieldOp->getParentOp())) {
+          if (opIdx < forOp.getRegionIterArgs().size()) {
+            Value iterArg = forOp.getRegionIterArgs()[opIdx];
+            worklist.push_back(iterArg);
+          }
+        }
+        continue;
+      }
 
       // Recurse on the user's transposed-output value(s). For most rule
       // kinds this is user.getResult(0). TransElide rules are recorded
