@@ -1,6 +1,7 @@
 add_triton_library(NVHopperTransforms
   MultiCTAReduction.cpp
   WarpSpecialization.cpp
+  WarpSpecialization/BarrierBufferAssoc.cpp
   WarpSpecialization/CodePartitionUtility.cpp
   WarpSpecialization/PingPong.cpp
   WarpSpecialization/TaskIdPropagation.cpp

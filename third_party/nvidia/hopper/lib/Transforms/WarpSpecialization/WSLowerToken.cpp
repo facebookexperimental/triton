@@ -1,4 +1,5 @@
 #include "Utility.h"
+#include "BarrierBufferAssoc.h"
 #include "mlir/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 
@@ -48,7 +49,7 @@ Value getMBarrierPhaseBit(OpBuilder &builder, Operation *op,
 }
 
 void processProducerAcquireOp(OpBuilder &builder, ttnvws::ProducerAcquireOp op,
-                              Value bufferEmpty) {
+                              Value bufferEmpty, Operation *guardSrc) {
   auto loc = op.getLoc();
   Value phase = getMBarrierPhaseBit(builder, op, true);
   auto i32Ty = builder.getIntegerType(32);
@@ -59,11 +60,14 @@ void processProducerAcquireOp(OpBuilder &builder, ttnvws::ProducerAcquireOp op,
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(waitOp, getAsyncTaskIds(op.getOperation()));
   copyLoopScheduleInfo(waitOp, op);
+  // M1 (barrier_analysis.md): forward barrier.guards onto the lowered HW
+  // barrier, mirroring how getConstraintsAttr() is forwarded above.
+  forwardBarrierGuards(guardSrc, waitOp.getOperation());
 }
 
 void processProducerCommitOp(OpBuilder &builder, ttnvws::ProducerCommitOp op,
                              Value bufferFull, ttnvws::TokenLoadType loadType,
-                             unsigned fullCnt) {
+                             unsigned fullCnt, Operation *guardSrc) {
   auto loc = op.getLoc();
   ttng::ArriveBarrierOp arriveOp;
 
@@ -75,10 +79,11 @@ void processProducerCommitOp(OpBuilder &builder, ttnvws::ProducerCommitOp op,
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(arriveOp, getAsyncTaskIds(op.getOperation()));
   copyLoopScheduleInfo(arriveOp, op);
+  forwardBarrierGuards(guardSrc, arriveOp.getOperation());
 }
 
 void processConsumerWaitOp(OpBuilder &builder, ttnvws::ConsumerWaitOp op,
-                           Value bufferFull) {
+                           Value bufferFull, Operation *guardSrc) {
   auto loc = op.getLoc();
   Value phase = getMBarrierPhaseBit(builder, op, false);
   auto i32Ty = builder.getIntegerType(32);
@@ -89,11 +94,12 @@ void processConsumerWaitOp(OpBuilder &builder, ttnvws::ConsumerWaitOp op,
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(waitOp, getAsyncTaskIds(op.getOperation()));
   copyLoopScheduleInfo(waitOp, op);
+  forwardBarrierGuards(guardSrc, waitOp.getOperation());
 }
 
 void processConsumerReleaseOp(OpBuilder &builder, ttnvws::ConsumerReleaseOp op,
                               Value bufferEmpty, int numCTAs,
-                              unsigned emptyCnt) {
+                              unsigned emptyCnt, Operation *guardSrc) {
   auto loc = op.getLoc();
   auto arriveOp = ttng::ArriveBarrierOp::create(
       builder, loc, bufferEmpty, 1, /*pred=*/Value(), /*perThread=*/false,
@@ -101,6 +107,7 @@ void processConsumerReleaseOp(OpBuilder &builder, ttnvws::ConsumerReleaseOp op,
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(arriveOp, getAsyncTaskIds(op.getOperation()));
   copyLoopScheduleInfo(arriveOp, op);
+  forwardBarrierGuards(guardSrc, arriveOp.getOperation());
 }
 
 void lowerTokenOperations(Operation *parentOp, int numCTAs,
@@ -253,7 +260,8 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         Value bufferEmpty = extractBufferEmpty(loc, op.getIdx());
         assert(user->hasAttr("async_task_id"));
         setAsyncTaskIds(bufferEmpty.getDefiningOp(), getAsyncTaskIds(user));
-        processProducerAcquireOp(builder, op, bufferEmpty);
+        processProducerAcquireOp(builder, op, bufferEmpty,
+                                 createTokenOp.getOperation());
         deprecatedOps.push_back(user);
         return true;
       } else if (auto op = dyn_cast<ttnvws::ProducerCommitOp>(user)) {
@@ -261,14 +269,15 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         assert(user->hasAttr("async_task_id"));
         setAsyncTaskIds(bufferFull.getDefiningOp(), getAsyncTaskIds(user));
         processProducerCommitOp(builder, op, bufferFull, loadType,
-                                bufferFullCount);
+                                bufferFullCount, createTokenOp.getOperation());
         deprecatedOps.push_back(user);
         return true;
       } else if (auto op = dyn_cast<ttnvws::ConsumerWaitOp>(user)) {
         Value bufferFull = extractBufferFull(loc, op.getIdx());
         assert(user->hasAttr("async_task_id"));
         setAsyncTaskIds(bufferFull.getDefiningOp(), getAsyncTaskIds(user));
-        processConsumerWaitOp(builder, op, bufferFull);
+        processConsumerWaitOp(builder, op, bufferFull,
+                              createTokenOp.getOperation());
         deprecatedOps.push_back(user);
         return true;
       } else if (auto op = dyn_cast<ttnvws::ConsumerReleaseOp>(user)) {
@@ -276,7 +285,7 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         assert(user->hasAttr("async_task_id"));
         setAsyncTaskIds(bufferEmpty.getDefiningOp(), getAsyncTaskIds(user));
         processConsumerReleaseOp(builder, op, bufferEmpty, numCTAs,
-                                 bufferEmptyCount);
+                                 bufferEmptyCount, createTokenOp.getOperation());
         deprecatedOps.push_back(user);
         return true;
       } else if (auto op = dyn_cast<ttng::TMAStoreTokenWaitOp>(user)) {

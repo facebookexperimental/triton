@@ -50,6 +50,8 @@ void doHoistLoopInvariantTMEMStore(triton::FuncOp &funcOp);
 void removeRedundantTmemZeroStores(triton::FuncOp &funcOp);
 void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers);
 void doTokenLowering(triton::FuncOp &funcOp, unsigned numConsumerGroups);
+// M1 (barrier_analysis.md): gated barrier->buffer map dump after lowering.
+void dumpBarrierGuardsIfEnabled(triton::FuncOp funcOp);
 void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
                     int capability, int defaultNumStages);
 void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
@@ -286,6 +288,7 @@ public:
 
     doLowerSubtiledRegionsWithNVWSOps(funcOp);
     doTokenLowering(funcOp, numWarpGroups - 1);
+    dumpBarrierGuardsIfEnabled(funcOp);
     if (dumpIntermediateSteps) {
       llvm::dbgs()
           << "// -----// WarpSpec internal IR Dump After: doTokenLowering\n";
