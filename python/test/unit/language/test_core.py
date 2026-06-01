@@ -3308,6 +3308,37 @@ def test_reduction_ordering_sum_multi_group(num_warps, device):
                                    f"num_warps={num_warps}")
 
 
+@pytest.mark.parametrize("N, BLOCK_N", [(1296, 2048), (7776, 8192)])
+@pytest.mark.parametrize("num_warps", [4, 8])
+def test_reduction_ordering_sum_masked_multi_reg_group(num_warps, N, BLOCK_N, device):
+    """Regression: INNER_TREE must preserve logical-axis order when each thread
+    owns multiple register groups on the reduced axis, including large masked
+    tiles where each group contains several contiguous values."""
+    TOTAL_ROWS = 32
+
+    @triton.jit
+    def sum_kernel_masked(X, Z, stride_row, stride_col, N, BLOCK_N: tl.constexpr, ORDERING: tl.constexpr):
+        pid = tl.program_id(0)
+        offs_n = tl.arange(0, BLOCK_N)
+        x = tl.load(X + pid * stride_row + offs_n * stride_col, mask=offs_n < N, other=0.0)
+        z = tl.sum(x, axis=0, reduction_ordering=ORDERING)
+        tl.store(Z + pid, z)
+
+    torch.manual_seed(42)
+    x = torch.randn((TOTAL_ROWS, N), device=device, dtype=torch.float16)
+    grid = (TOTAL_ROWS, )
+
+    ref = torch.empty(TOTAL_ROWS, device=device, dtype=torch.float32)
+    sum_kernel_masked[grid](x, ref, x.stride(0), x.stride(1), N, BLOCK_N=BLOCK_N,
+                            ORDERING=tl.ReductionOrdering.INNER_TREE, num_warps=1)
+
+    out = torch.empty(TOTAL_ROWS, device=device, dtype=torch.float32)
+    sum_kernel_masked[grid](x, out, x.stride(0), x.stride(1), N, BLOCK_N=BLOCK_N,
+                            ORDERING=tl.ReductionOrdering.INNER_TREE, num_warps=num_warps)
+    assert torch.equal(out, ref), (f"INNER_TREE masked multi-group sum not bitwise equal to reference: "
+                                   f"num_warps={num_warps}")
+
+
 # ---------------
 # test permute
 # ---------------
