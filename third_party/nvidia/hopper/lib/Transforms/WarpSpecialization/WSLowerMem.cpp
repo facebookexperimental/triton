@@ -322,15 +322,13 @@ Value getBufferForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
   return desc;
 }
 
-Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
-                            SmallVector<tt::DescriptorLoadOp> &tmaLoads,
-                            SmallVector<Value> &buffers, Value barrierAlloc,
-                            Value bufferIdx, Value bufferIdxExtract,
-                            Value phase, Operation *headProducer,
-                            Operation *headConsumer,
-                            Operation *headConsumerSameLevel,
-                            ArrayRef<int> additionalConsumerTaskIds,
-                            bool isPost) {
+Operation *optimizeTMALoads(
+    OpBuilderWithAsyncTaskIds &builder,
+    SmallVector<tt::DescriptorLoadOp> &tmaLoads, SmallVector<Value> &buffers,
+    Value barrierAlloc, Value bufferIdx, Value bufferIdxExtract, Value phase,
+    Operation *headProducer, Operation *headConsumer,
+    Operation *headConsumerSameLevel, ArrayRef<int> additionalConsumerTaskIds,
+    bool isPost, DictionaryAttr consumerWaitConstraints) {
   auto loc = barrierAlloc.getLoc();
 
   // Compute the total size of the loads.
@@ -386,11 +384,13 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   // Create one WaitBarrierOp per consumer task ID.
   builder.setAsyncTaskIdsFromOp(headConsumer);
   auto wait = builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
-      loc, consBarrier, phase, waitPred);
+      loc, consBarrier, phase, waitPred, /*deps=*/ValueRange{},
+      consumerWaitConstraints);
   for (int extraTaskId : additionalConsumerTaskIds) {
     builder.setAsynTaskIdsFromArray({extraTaskId});
-    builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(loc, consBarrier, phase,
-                                                        waitPred);
+    builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+        loc, consBarrier, phase, waitPred,
+        /*deps=*/ValueRange{}, consumerWaitConstraints);
   }
 
   // Convert all the consumers to local_load
