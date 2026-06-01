@@ -98,6 +98,7 @@ For a given priority level with a set of candidate WSBuffers:
 
 ```
 candidates = WSBuffers at this priority
+sort candidates by logical producer order
 
 # ── Step 0: Decide grouping upfront ──────────────────────────────
 #
@@ -189,6 +190,13 @@ if reuseGroup AND reuseGroup.numCopies is EVEN:
 if not foundValidSolution:
     report error: cannot fit SMEM allocation within budget
 ```
+
+The candidate order is only a tie-breaker among equal-priority buffers. It
+follows logical producer order when available: for post-channel SMEM buffers
+created from tensor values, the planner looks through the inserted
+`local_store` to the original producer such as a `descriptor_load`; otherwise
+it uses the channel source op. If the source cannot be found, the planner falls
+back to the `local_alloc` order.
 
 #### Initial value of `currentGroupCopies`
 

@@ -80,18 +80,21 @@ intervening waits).
 |-----|------|-------------|
 | `dstTask` | `I32Attr` | Destination task ID — the foreign partition this barrier communicates with. The source task is the partition where the barrier lives (available via `async_task_id`). |
 | `channelGraph` | `DenseI32ArrayAttr` | Set of task IDs reachable from the destination through the channel adjacency graph (excluding the source). Used by `canAdvanceWSBarrier` to check if two barriers can be safely reordered. |
+| `direction` | `StringAttr` | Direction for direct non-token TTNG barrier endpoints. `"forward"` means data-ready synchronization; `"backward"` means resource-reuse synchronization. NVWS token ops derive this from the token op type and do not need this field. |
 | `parentId` | `I32Attr` | Local ID for the nearest ordered parent scope (`scf.for`, `scf.while`, or containing `tt.func`). Used only inside the current function for V2 ordered-region checks. |
 | `minRegionId` | `I32Attr` | Earliest ordered region reached by this channel summary. |
 | `maxRegionId` | `I32Attr` | Latest ordered region reached by this channel summary. |
 
 **Lifecycle:**
 1. `dstTask` is set when token ops are created in `insertAsyncComm`
-   (before code partitioning).
+   (before code partitioning). Direct TTNG barrier endpoints that bypass tokens
+   also set `dstTask` and `direction` when they are created.
 2. `channelGraph`, `parentId`, `minRegionId`, and `maxRegionId` are injected
    after code partitioning via `buildChannelGraph()`,
    `buildWSBarrierOrderedRegionRanges()`, and `injectChannelGraph()`.
-3. These fields propagate through `doTokenLowering` to the resulting barrier
-   ops.
+3. Token fields propagate through `doTokenLowering` to the resulting barrier
+   ops. Direct TTNG barrier endpoints are already real barriers, so injection
+   updates them in place.
 
 **Reordering rule:** Same-direction WS barriers can be swapped directly. An
 arrive can be delayed past a wait if the graphs are disjoint, or if both
@@ -146,6 +149,18 @@ nvws.producer_acquire %tok, %idx, %phase {
 nvws.consumer_wait %tok, %idx, %phase {
   constraints = {WSBarrier = {dstTask = 0 : i32}}
 } : tensor<1x!nvws.token>, i32, i1
+```
+
+Direct barrier endpoints use the same dictionary but must include `direction`:
+
+```mlir
+// Producer acquire before reusing a TMA buffer for the next load.
+ttng.wait_barrier %empty, %phase {
+  constraints = {WSBarrier = {
+    dstTask = 1 : i32,
+    direction = "backward"
+  }}
+} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
 ```
 
 Token-specific constraint keys can signal to `doTokenLowering` how to

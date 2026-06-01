@@ -319,6 +319,8 @@ def compile(src, target=None, options=None, _env_vars=None):
         config_parts.append(f"stages{options.num_stages}")
         config_parts.append(f"ctas{options.num_ctas}")
         config_name = "_".join(config_parts)
+        if len(config_name) > 240:
+            config_name = config_name[:200] + "_" + hashlib.sha256(config_name.encode()).hexdigest()[:16]
         config_dump_dir = os.path.join(fn_dump_manager.cache_dir, config_name)
         os.makedirs(config_dump_dir, exist_ok=True)
         fn_dump_manager.cache_dir = config_dump_dir

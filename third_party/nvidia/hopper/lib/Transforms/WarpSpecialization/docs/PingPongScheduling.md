@@ -29,7 +29,10 @@ Identification is architecture-dependent (`CriticalRegionManager::isExpensiveOp`
 
 Expensive ops are further classified as:
 - **NonReorderable** (e.g., `WarpGroupDotOp`): has memory effects, so the
-  critical region boundary is the op itself.
+  critical region boundary is the op itself. This self-effect (e.g. a wgmma's
+  SMEM-operand read) marks the op's own boundary; it must **not** be treated as
+  an intervening memory effect when deciding whether two expensive ops can be
+  grouped (see Step 1), otherwise consecutive WGMMAs never group.
 - **PureArithmetic** (e.g., `math::ExpOp`): memory-effect-free, so the
   boundary extends forward to the next op with memory effects.
 
@@ -52,7 +55,14 @@ Walk the function and group expensive ops. An op joins an existing group if:
 1. **Same operation type** as all ops in the group.
 2. **Same control flow context**: same block, no intervening `scf::ForOp` /
    `scf::IfOp` / `scf::WhileOp`.
-3. **No intervening memory effects** between ops in the same partition.
+3. **No intervening memory effects** between ops in the same partition. This is
+   evaluated *strictly between* the two ops: the **endpoint ops are excluded**,
+   and any **peer expensive ops in between are skipped** (they belong to the
+   same ping-pong region, so they do not split it). Only a non-expensive op
+   with memory side effects rejects grouping. Implemented by
+   `hasInterveningMemEffect`, which is distinct from `findEndOp` (the latter
+   finds a region's *end* boundary and, for NonReorderable ops, returns the op
+   itself).
 
 If no group matches, a new group is created.
 

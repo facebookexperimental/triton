@@ -355,22 +355,17 @@ OpLatencyInfo LatencyModel::getLatency(Operation *op) const {
       }
     } else
       occupancy = getTMALoadLatency(op);
-    // selfLatency = 1: GPU TMA unit is deeply pipelined and can accept
-    // new requests every cycle. The occupancy value reflects data transfer
-    // time, not issue blocking. Using occupancy as selfLatency inflates
-    // ResMII and causes modulo scheduling to fail on kernels with many
-    // loads (e.g., FA backward with 6 MEM ops would need ResMII=3400+).
-    selfLatency = 1;
+    // selfLatency = issue cost (SM dispatch pipeline occupancy).
+    // Design doc: 30 cycles for TMA ops.
+    selfLatency = kTMAIssueLatency;
     latency = occupancy + kTMAAsyncOverhead;
     return OpLatencyInfo{pipeline, latency, selfLatency, occupancy};
   }
   case HWPipeline::TC:
     latency = getMMALatency(op);
-    // selfLatency = 1: GPU tensor core pipeline is deeply pipelined —
-    // a new MMA can be issued every ~1-32 cycles while the previous one
-    // is still computing. Using latency (900 cycles) as selfLatency
-    // inflates ResMII to 4500 for 5 MMAs, causing SMS to fail.
-    selfLatency = 1;
+    // selfLatency = issue cost (SM dispatch pipeline occupancy).
+    // Design doc: 30 cycles for tcgen05.mma.
+    selfLatency = kMMAIssueLatency;
     break;
   case HWPipeline::CUDA:
     latency = getCUDALatency(op);

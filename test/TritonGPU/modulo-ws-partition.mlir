@@ -8,17 +8,16 @@
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
-// Verify that the modulo schedule pass runs on the inner loop and the
-// ws-partition pass processes the outer WS loop. With selfLatency=1, the
-// single-MMA GEMM inner loop gets tt.num_stages=2 and no tt.autows
-// (all MMAs in same stage). The outer loop gets tt.warp_specialize.
+// Verify that the modulo schedule pass annotates the inner loop and the
+// ws-partition pass preserves the outer WS loop's tt.warp_specialize. The
+// inner loop gets tt.modulo_ii / tt.scheduled_max_stage from modulo (exact
+// values depend on the latency model, so we only check presence).
 //
 // CHECK-LABEL: @persistent_gemm_ws_partition
 // CHECK: scf.for
-// Inner loop has tt.num_stages from modulo schedule
 // CHECK: scf.for
-// CHECK: tt.num_stages = 3 : i32
-// Outer loop has tt.warp_specialize
+// CHECK: tt.modulo_ii = {{[0-9]+}} : i32
+// CHECK-SAME: tt.scheduled_max_stage = {{[0-9]+}} : i32
 // CHECK: tt.warp_specialize
 tt.func @persistent_gemm_ws_partition(
   %a_desc: !tt.tensordesc<tensor<128x64xf16>>,

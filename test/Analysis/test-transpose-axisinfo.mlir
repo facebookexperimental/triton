@@ -1,13 +1,10 @@
 // RUN: triton-opt %s -test-print-alignment -split-input-file -verify-diagnostics=only-expected -o /dev/null
 //
 // -----// IR Dump Before TritonRewriteTensorPointer (triton-rewrite-tensor-pointer) ('builtin.module' operation) //----- //
-#loc = loc("/tmp/transpose.py":8:0)
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
-#loc13 = loc("X_ptr"(#loc))
-#loc14 = loc("stride_xa"(#loc))
 module {
-  tt.func public @transpose_read_kernel(%X_ptr: !tt.ptr<f16> {tt.divisibility = 16 : i32} loc("X_ptr"(#loc)), %stride_xa: i32 {tt.divisibility = 16 : i32} loc("stride_xa"(#loc))) attributes {noinline = false} {
+  tt.func public @transpose_read_kernel(%X_ptr: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %stride_xa: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     // expected-remark @below {{contiguity = [1], divisibility = [4611686018427387904], constancy = [1], constant_value = 0}}
     %buffer = arith.constant 0 : i32
     %buffers = ttg.local_alloc : () -> !ttg.memdesc<1x64x64xf16, #shared, #smem, mutable>

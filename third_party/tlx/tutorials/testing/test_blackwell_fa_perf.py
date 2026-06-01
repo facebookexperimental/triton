@@ -50,7 +50,8 @@ def create_benchmark(versions, mode="fwd"):
             ylabel="TFLOPS",
             plot_name=f"flash-attention-{mode}-performance-fp16",
             args={"BATCH": 4, "H": 32, "HEAD_DIM": 128, "causal": True},
-        ))
+        )
+    )
     def benchmark(BATCH, H, N_CTX, HEAD_DIM, causal, provider):
         q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=torch.float16).requires_grad_()
         k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=torch.float16).requires_grad_()
@@ -59,19 +60,35 @@ def create_benchmark(versions, mode="fwd"):
         quantiles = [0.5, 0.2, 0.8]
 
         if mode == "bwd":
-            # Pre-run forward to get output for backward
+            # Run full fwd+bwd each iteration to avoid state issues with retain_graph
             if provider == ref_lib.lower():
-                o = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=sm_scale, is_causal=causal)
+
+                def fn():
+                    q.grad, k.grad, v.grad = None, None, None
+                    o = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=sm_scale, is_causal=causal)
+                    o.backward(do)
             elif provider in ATTENTION_METHODS:
                 attention = ATTENTION_METHODS[provider]
                 if provider == "ws_pipelined_persistent":
-                    o = attention(q, k, v, sm_scale, causal)
+
+                    def fn():
+                        q.grad, k.grad, v.grad = None, None, None
+                        o = attention(q, k, v, sm_scale, causal)
+                        o.backward(do)
                 elif provider == "ws":
-                    o = attention(q, k, v, sm_scale)
+
+                    def fn():
+                        q.grad, k.grad, v.grad = None, None, None
+                        o = attention(q, k, v, sm_scale)
+                        o.backward(do)
                 else:
-                    o = attention(q, k, v, sm_scale, causal)
-            do = torch.randn_like(o)
-            fn = lambda: o.backward(do, retain_graph=True)
+
+                    def fn():
+                        q.grad, k.grad, v.grad = None, None, None
+                        o = attention(q, k, v, sm_scale, causal)
+                        o.backward(do)
+
+            do = torch.randn((BATCH, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=torch.float16)
         elif provider == ref_lib.lower():
             fn = lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=sm_scale, is_causal=causal)
         elif provider in ATTENTION_METHODS:
@@ -115,7 +132,23 @@ if __name__ == "__main__":
         choices=["fwd", "bwd"],
         help="Benchmark forward or backward pass (default: fwd)",
     )
+    parser.add_argument(
+        "--num-ctas",
+        type=int,
+        default=0,
+        choices=[1, 2],
+        help="Filter BWD configs: 0=all (default), 1=1-CTA only, 2=2-CTA only",
+    )
     args = parser.parse_args()
+
+    if args.num_ctas and args.mode == "bwd":
+        from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent import (
+            _attn_bwd_ws,
+            configs_bwd_1cta,
+            configs_bwd_2cta,
+        )
+        _attn_bwd_ws.configs = configs_bwd_1cta if args.num_ctas == 1 else configs_bwd_2cta
+        print(f"Filtering BWD configs to {args.num_ctas}-CTA only")
 
     if is_blackwell():
         versions = args.version if args.version else list(ATTENTION_METHODS.keys())

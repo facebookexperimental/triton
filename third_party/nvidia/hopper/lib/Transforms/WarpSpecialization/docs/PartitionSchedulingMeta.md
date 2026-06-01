@@ -127,6 +127,15 @@ rescaling) are not stolen by the data partition categorizer.
    data partition.
 2. **Groups dependent MMAs** via union-find. MMA B depends on MMA A if A's
    forward user set overlaps B's backward slice (e.g., QK MMA feeds PV MMA).
+   The forward user set walk **escapes `scf.if` regions** by following
+   `scf.yield` → the parent `scf.if`'s corresponding result (matched by yield
+   operand index), mirroring how the backward slice selectively enters
+   `scf.if`. Without this, a forward set that enters a causal-mask `scf.if`
+   would dead-end at `scf.yield` (a terminator with no SSA results), fail to
+   overlap the dependent MMA's backward slice, and leave QK/PV MMAs unmerged
+   in separate computation partitions. Following the specific operand index
+   (rather than the whole `scf.if`) keeps distinct data partitions separate
+   for cases like flex attention.
 3. **Builds `opToDpId` map** for ALL reachable ops:
    - **Inner-loop ops**: From backward slices, using normalized group IDs.
      Ops appearing in multiple groups get `SHARED_DPID` sentinel.
