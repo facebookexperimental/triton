@@ -101,7 +101,17 @@ struct ScheduleNode {
   int stage{0};       // cycle / II
   int cluster{0};     // dense rank of cycle within stage (Step 2.5)
   int latency{0};     // cycles until result available
-  int selfLatency{0}; // cycles this op occupies its pipeline
+  int selfLatency{0}; // cycles this op occupies its pipeline (at minWarps)
+  int minWarps{1};    // warp count assumed by selfLatency; effective scales
+                      // up by minWarps/actualWarps when WG has fewer warps
+
+  // Frequency this op fires per outer-loop iteration. Outer-loop ops have
+  // frequencyMultiplier = 1; inner K-loop ops have frequencyMultiplier =
+  // K_TRIPS so the flat-view warp-makespan and barrier costs reflect that
+  // an inner op runs K times per outer iteration. Set by buildFlatView
+  // based on each ScheduledLoop's nesting depth. Default 1 (single-loop
+  // kernels and non-flat callers don't need it).
+  int frequencyMultiplier{1};
 
   // Super-node: if this node represents a child pipeline (inner loop)
   unsigned childPipelineId{UINT_MAX}; // index into ScheduleGraph::pipelines
@@ -189,6 +199,28 @@ struct ScheduleLoop {
   // epilogue (all in cycles).
   int64_t regionStart{0};
   int64_t regionEnd{0};
+
+  // Cross-group synchronization (from Pass B Step 2)
+  enum class BarrierKind { MBARRIER, NAMED };
+  struct CrossGroupBarrier {
+    unsigned producerNodeId{};
+    unsigned consumerNodeId{};
+    int producerWarpGroup{};
+    int consumerWarpGroup{};
+    BarrierKind kind{BarrierKind::MBARRIER};
+    unsigned depth{1};                 // number of barrier phases
+    unsigned pairedBufferId{UINT_MAX}; // data buffer this barrier guards
+
+    // Arrive/wait placement: explicit node IDs for Phase 3 lowering.
+    // arriveAfterNodeId: emit mbarrier.arrive AFTER this node completes.
+    // waitBeforeNodeId: emit mbarrier.wait BEFORE this node starts.
+    unsigned arriveAfterNodeId{UINT_MAX};
+    unsigned waitBeforeNodeId{UINT_MAX};
+
+    // For mbarrier: expected bytes the producer writes (for expect_tx).
+    int64_t expectBytes{0};
+  };
+  llvm::SmallVector<CrossGroupBarrier, 4> crossGroupBarriers;
 
   // Lookup
   llvm::DenseMap<Operation *, unsigned> opToNodeId;

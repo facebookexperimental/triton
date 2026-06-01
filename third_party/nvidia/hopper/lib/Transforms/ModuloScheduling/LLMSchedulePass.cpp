@@ -106,8 +106,8 @@ static std::string formatDDG(const ttg::DataDependenceGraph &ddg,
        << "  pipe=" << ttg::getPipelineName(node.pipeline)
        << "  lat=" << node.latency
        << "  selfLat=" << node.selfLatency;
-    if (node.transferLatency != node.selfLatency)
-      os << "  transferLat=" << node.transferLatency;
+    if (node.minWarps > 1)
+      os << "  minWarps=" << node.minWarps;
     if (node.isSuperNode)
       os << "  [super: innerII=" << node.innerII
          << " prologueLat=" << node.prologueLatency << "]";
