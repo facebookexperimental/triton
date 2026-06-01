@@ -54,6 +54,12 @@
 - **Fix**: Added guard `defaultPartition != reductionPartition` to the load-user scheduling condition. When `defaultPartition` is just a fallback to reduction (BWD case), the load-user walk is skipped. Phase 5's MMA forward walk correctly assigns the softmax ops to computation instead.
 - **Key insight**: The `loops` array in `getInitialSchedule` is ordered `[inner, outer]` (not `[outer, inner]`). Phase 5's `loops[0]` check matches inner-loop MMAs, so `scheduleUsers` DOES run on them. The issue was purely in Phase 4's load-user scheduling being too aggressive.
 
+### 6. Forward set dead-ends at scf.yield inside causal-mask scf.if (2026-05-28, fixed)
+- **Symptom**: TMEM exhaustion (`640 vs 512` limit) in causal FA w/ manual dp. The pass produces 8 partitions / 4 computation instead of the expected 6 / 2.
+- **Root cause**: In `collectMMABackwardSlices`, the QK MMA's forward user set walk dead-ends at `scf.yield` (a terminator with no SSA results) when it enters the causal-mask `scf.if` region. The forward set is trapped inside the region and never reaches the softmax chain that the PV MMA's backward slice contains. As a result, union-find fails to merge the QK and PV MMAs, so they land in separate computation partitions.
+- **Fix**: Make the forward walk follow `scf.yield` → the parent `scf.if`'s corresponding result, using the specific yield operand index so multiple data partitions (e.g., flex attention) are not merged. For multi-result `scf.if`, the walk follows one value at a time from the worklist. With the enlarged forward set, the QK MMA's forward set overlaps the PV MMA's backward slice and they share a compute partition.
+- **Lit test**: `partition-scheduling-meta-causal-attention.mlir` (new) checks exactly 6 partitions / 2 computation (fails with 8 / 4 without the fix). Also removed a stale `CHECK-NOT` on `arith.mulf` scores ops in `partition-scheduling-meta-flex-attention.mlir`, which now correctly get computation partitions through the enlarged forward set.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)

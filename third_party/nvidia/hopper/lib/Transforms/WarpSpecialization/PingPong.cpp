@@ -288,6 +288,44 @@ Operation *findEndOp(CriticalRegionManager &crManager, Operation *keyOp,
   return nullptr;
 }
 
+/// Returns true if there is a region-splitting memory side effect strictly
+/// between two same-partition expensive ops.
+///
+/// This is the grouping-time question: can two expensive ops live in the same
+/// ping-pong region? It differs from findEndOp (which finds a region's *end*
+/// boundary and, for NonReorderable ops, returns the op itself) in two ways:
+///   - The two endpoint ops are excluded. An expensive op such as WarpGroupDotOp
+///     is NonReorderable: its own SMEM-operand read is the op itself, not an
+///     intervening effect, so it must not reject grouping (B-4 / T273470439).
+///   - Other expensive ops between the endpoints are skipped. They are peers in
+///     the same ping-pong region (managed by their own barriers), so they do not
+///     split the region either; skipping them lets a run of N expensive ops
+///     union into a single region.
+///
+/// Callers must ensure the two ops are control-flow equivalent
+/// (areControlFlowEquivalent), which guarantees they share a block with no
+/// intervening control flow, so a simple forward scan terminates at `b`.
+bool hasInterveningMemEffect(CriticalRegionManager &crManager, Operation *a,
+                             Operation *b, int capability) {
+  Operation *earlier = a;
+  Operation *later = b;
+  if (later->isBeforeInBlock(earlier))
+    std::swap(earlier, later);
+
+  for (Operation *curOp = earlier->getNextNode(); curOp && curOp != later;
+       curOp = curOp->getNextNode()) {
+    // Peer expensive ops are part of the same ping-pong region, not a barrier.
+    if (crManager.isExpensiveOp(curOp, capability))
+      continue;
+    if (!isMemoryEffectFree(curOp)) {
+      LDBG("Found intervening op with memory effects: " << curOp->getName());
+      dumpMemoryEffects(curOp);
+      return true;
+    }
+  }
+  return false;
+}
+
 /// Returns the operation from startOps that is closest to the entry
 /// (executed earliest). All ops must be in the same block.
 Operation *firstOpInBlock(llvm::ArrayRef<Operation *> startOps) {
@@ -684,9 +722,12 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
           continue;
         }
         if (opTaskId == refTaskId) {
-          // If findEndOp returns nullptr when stopOp is provided,
-          // there's no memory effect between keyOp and stopOp
-          bool hasMemEffects = (findEndOp(crManager, op, refOp) != nullptr);
+          // Reject grouping only if a real (non-expensive) memory side effect
+          // sits strictly between the two ops. The endpoints themselves and any
+          // peer expensive ops in between are part of the same ping-pong region
+          // and must not split it (B-4 / T273470439).
+          bool hasMemEffects =
+              hasInterveningMemEffect(crManager, op, refOp, capability);
           LDBG("op in partition " << opTaskId
                                   << " has memory effects: " << hasMemEffects);
           if (hasMemEffects)

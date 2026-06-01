@@ -1,31 +1,25 @@
 // RUN: triton-opt %s -split-input-file -tritongpu-remove-layout-conversions="smem-budget=1" | FileCheck %s
 
-// Test that the budget-aware convert elimination does not mutate a local_load
-// backward chain in place when a value in the chain has users outside the
-// rewrite set. Instead, the pass should fall back to inserting a convert_layout
-// for the affected operand, keeping the external user's encoding intact.
+// Test that the budget-aware convert elimination correctly handles a local_load
+// chain where a value has users with different encoding requirements.
 //
-// Setup: a function argument anchored at #blocked_a (low-score layout) feeds
-// through a convert_layout to #blocked_b (high-score layout). A local_load
-// in #blocked_b feeds through arith.extf into arith.subf (which also consumes
-// the convert result). The extf result also feeds arith.negf (an external
-// user not in the rewrite set). The main pass (steps 1-4) cannot eliminate the
-// convert because the function argument's encoding is immutable. The
-// budget-aware step 5 then tries to eliminate this over-budget convert by
-// propagating #blocked_a forward. The backward chain from arith.subf
-// operand 1 reaches the local_load through arith.extf, but arith.extf's
-// result also feeds arith.negf (external user). Mutating arith.extf's type
-// in place would create an encoding mismatch on arith.negf.
+// Setup: a function argument anchored at #blocked_a feeds through a
+// convert_layout to #blocked_b. A local_load in #blocked_b feeds through
+// arith.extf into arith.subf (which also consumes the convert result) and
+// arith.negf. The pass should eliminate the convert without creating encoding
+// mismatches. The expected behavior is that backward rematerialization clones
+// the local_load chain so each user gets its preferred layout, avoiding any
+// convert_layout entirely.
 
 // CHECK-DAG: #[[$BLOCKED_A:.*]] = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 // CHECK-DAG: #[[$BLOCKED_B:.*]] = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 // CHECK-LABEL: @local_load_chain_external_user
-// The local_load and extf must keep #blocked_b (not mutated to #blocked_a)
+// The local_load chain is cloned: one in #blocked_a for subf, one in #blocked_b for negf
+// CHECK: ttg.local_load %{{.*}} -> tensor<128x64xbf16, #[[$BLOCKED_A]]>
 // CHECK: ttg.local_load %{{.*}} -> tensor<128x64xbf16, #[[$BLOCKED_B]]>
+// CHECK: arith.extf {{.*}} : tensor<128x64xbf16, #[[$BLOCKED_A]]> to tensor<128x64xf32, #[[$BLOCKED_A]]>
 // CHECK: arith.extf {{.*}} : tensor<128x64xbf16, #[[$BLOCKED_B]]> to tensor<128x64xf32, #[[$BLOCKED_B]]>
-// A convert_layout is inserted as a fallback for the subf operand
-// CHECK: ttg.convert_layout {{.*}} : tensor<128x64xf32, #[[$BLOCKED_B]]> -> tensor<128x64xf32, #[[$BLOCKED_A]]>
-// The subf operates in #blocked_a (the propagated source encoding)
+// The subf operates in #blocked_a (matching its function argument operand)
 // CHECK: arith.subf {{.*}} : tensor<128x64xf32, #[[$BLOCKED_A]]>
 // The external user (negf) keeps #blocked_b — no encoding mismatch
 // CHECK: arith.negf {{.*}} : tensor<128x64xf32, #[[$BLOCKED_B]]>

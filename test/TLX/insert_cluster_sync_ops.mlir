@@ -539,3 +539,33 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     tt.return
   }
 }
+
+
+// -----
+
+// Test that ensureEarlyBarInit moves all init_barriers before tcgen5_global_alloc,
+// even when some are on each side of it. The second init_barrier and its dep
+// (memdesc_index) are after tcgen5_global_alloc and must be reordered.
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  // CHECK-LABEL: @reorder_multiple_bar_inits_before_tcgen5_alloc
+  // CHECK: mbarrier.init.shared::cta.b64
+  // CHECK: mbarrier.init.shared::cta.b64
+  // CHECK: nvvm.cluster.arrive {aligned}
+  // CHECK: nvvm.cluster.wait {aligned}
+  // CHECK: ttng.tcgen5_global_alloc
+  tt.func public @reorder_multiple_bar_inits_before_tcgen5_alloc() attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #shared, #smem, mutable>
+    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<2xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.tcgen5_global_alloc {tensor_memory_size = 128 : i32, two_ctas = true}
+    %2 = ttg.memdesc_index %0[%c1_i32] : !ttg.memdesc<2xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.init_barrier %2, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %3 = ttng.map_to_remote_buffer %1, %c0_i32 : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+    ttng.arrive_barrier %3, 1 : !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+    tt.return
+  }
+}

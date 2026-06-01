@@ -15,7 +15,7 @@ jobs:
     runs-on: linux-fb-triton-mi350-1
     env:
       WORKSPACE_DIR: /workspace
-      CONDA_ENV: pytorch
+      CONDA_ENV: meta-triton
       UV_VENV_DIR: /workspace/uv_venvs
       SETUP_SCRIPT: /workspace/setup_instance.sh
     timeout-minutes: 240
@@ -30,6 +30,7 @@ jobs:
         with:
           repository: meta-pytorch/tritonbench
           path: tritonbench
+          ref: xz9/disable-more-amd
           submodules: recursive
       - name: Setup Tritonbench environment
         working-directory: tritonbench

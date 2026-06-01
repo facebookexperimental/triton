@@ -286,6 +286,35 @@ tt.func @no_reorder_across_arrive_like_op(
   tt.return
 }
 
+// A plain TMA store token wait has no associated barrier and should not block
+// TMEM load sinking.
+// CHECK-LABEL: @plain_tma_store_token_wait_does_not_block_tmem_load
+tt.func @plain_tma_store_token_wait_does_not_block_tmem_load(
+    %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
+    %smem_buf: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>) {
+  %c0 = arith.constant 0 : i32
+  %alloc = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  %s0 = ttng.tmem_subslice %alloc {N = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable>
+  %v0 = ttng.tmem_load %s0 : !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x64xf32, #linear64>
+  %s1 = ttng.tmem_subslice %alloc {N = 64 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable>
+  %v1 = ttng.tmem_load %s1 : !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x64xf32, #linear64>
+  // CHECK:      ttng.async_tma_copy_local_to_global
+  // CHECK-NEXT: ttng.async_tma_store_token_wait
+  // CHECK-NEXT: ttng.tmem_load
+  // CHECK-NEXT: arith.truncf
+  // CHECK-NEXT: ttg.local_store
+  // CHECK-NEXT: ttng.tmem_load
+  // CHECK-NEXT: arith.truncf
+  // CHECK-NEXT: ttg.local_store
+  %tok = ttng.async_tma_copy_local_to_global %desc[%c0, %c0] %smem_buf : !tt.tensordesc<tensor<128x64xf16, #shared>>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+  ttng.async_tma_store_token_wait %tok : !ttg.async.token
+  %u0 = arith.truncf %v0 : tensor<128x64xf32, #linear64> to tensor<128x64xf16, #linear64>
+  ttg.local_store %u0, %smem_buf : tensor<128x64xf16, #linear64> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+  %u1 = arith.truncf %v1 : tensor<128x64xf32, #linear64> to tensor<128x64xf16, #linear64>
+  ttg.local_store %u1, %smem_buf : tensor<128x64xf16, #linear64> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+  tt.return
+}
+
 // WS barriers cannot move past tcgen05 commits.
 // CHECK-LABEL: @no_reorder_across_tcgen5_commit
 tt.func @no_reorder_across_tcgen5_commit(

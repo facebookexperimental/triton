@@ -93,6 +93,7 @@ doMemoryPlanner
   → doCodePartitionPost
   → ...
   → scheduleLoops                 ← SWP assigns pipeline stages
+  → cleanupWarpSpecializedLoops   ← prune dead loop-carried values
   → doTMAStoreWaitReorder         ← move waits using the SWP schedule
 ```
 

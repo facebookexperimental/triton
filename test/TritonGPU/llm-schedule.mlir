@@ -1,4 +1,12 @@
-// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -nvgpu-modulo-schedule | FileCheck %s
+// UNSUPPORTED: true
+// Disabled: requires local claude CLI which is not available on all servers.
+// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -nvgpu-llm-schedule | FileCheck %s
+
+//===----------------------------------------------------------------------===//
+// Test: LLM-based scheduling sets tt.num_stages on inner GEMM loop.
+// The LLM receives the DDG (nodes + edges + latencies) and produces
+// a modulo.schedule that the pass parses to set IR attributes.
+//===----------------------------------------------------------------------===//
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #acc_layout = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
@@ -8,19 +16,12 @@
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
-// Verify that the modulo schedule pass annotates the inner loop with its
-// scheduling decision. For a single-MMA GEMM, all MMAs are in the same stage
-// so tt.autows is skipped. The pass marks the loop with tt.modulo_ii (the
-// initiation interval it picked) and tt.scheduled_max_stage (the deepest
-// stage in the schedule); the actual values depend on the latency model, so
-// we only check that the attrs are present, not their specific values.
+// The LLM should produce a schedule with at least 2 stages for this GEMM,
+// resulting in tt.num_stages >= 2 on the loop.
 //
-// CHECK-LABEL: @gemm_inner_loop
-// CHECK: scf.for
-// CHECK-NOT: tt.autows
-// CHECK: tt.modulo_ii = {{[0-9]+}} : i32
-// CHECK-SAME: tt.scheduled_max_stage = {{[0-9]+}} : i32
-tt.func @gemm_inner_loop(
+// CHECK-LABEL: @llm_gemm_inner_loop
+// CHECK: tt.num_stages = {{[0-9]+}} : i32
+tt.func @llm_gemm_inner_loop(
   %a_desc: !tt.tensordesc<tensor<128x64xf16>>,
   %b_desc: !tt.tensordesc<tensor<64x128xf16>>
 ) {

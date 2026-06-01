@@ -38,29 +38,40 @@ namespace ttng = triton::nvidia_gpu;
 namespace {
 
 // ============================================================================
-// Emit loop.stage / loop.cluster attributes from modulo schedule
+// Emit all schedule annotations from the ScheduleGraph
 // ============================================================================
-
-static void emitScheduleAttributes(scf::ForOp loop,
-                                   const ttg::DataDependenceGraph &ddg,
-                                   const ttg::ModuloScheduleResult &schedule) {
-  const int II = schedule.II;
-  const int maxStage = schedule.getMaxStage();
+//
+// Single consolidated function that emits ALL modulo schedule annotations
+// onto the IR. Everything is derived from the ScheduleGraph (which contains
+// the DDG schedule + buffer allocations + budget adjustments).
+//
+// Per-op attrs:
+//   loop.stage   — pipeline stage (cycle / II)
+//   loop.cluster — within-stage ordering (dense cluster ID from cycle order)
+//
+// Per-loop attrs:
+//   tt.modulo_ii            — initiation interval
+//   tt.scheduled_max_stage  — maximum stage across all ops
+//
+// Per-buffer attrs (on producing local_alloc / tmem_alloc ops):
+//   tt.num_buffers — buffer depth (copies needed for lifetime coverage)
+//   buffer.id      — unique buffer index within the ScheduleGraph
+//
+static void emitScheduleFromGraph(scf::ForOp loop,
+                                  const ttg::ScheduleGraph &graph,
+                                  const ttg::DataDependenceGraph &ddg) {
+  const auto &schedLoop = graph.getLoop(0);
+  const int II = schedLoop.II;
   auto ctx = loop.getContext();
 
-  // Step 2.5: Compute per-stage cluster IDs from modulo cycles.
-  // Ops in the same stage are ordered by cycle: lower cycle → lower cluster ID.
-  // This preserves the modulo schedule's within-stage ordering for downstream
-  // pipelining, instead of relying on IR program order.
+  // ── 1. Per-op: loop.stage / loop.cluster ──
+  // Derive stage from cycle/II. Derive cluster from cycle ordering within
+  // each stage (lower cycle → lower cluster ID).
   llvm::DenseMap<int, SmallVector<int>> stageToCycles;
-  for (const auto &node : ddg.getNodes()) {
-    auto it = schedule.nodeToCycle.find(node.idx);
-    if (it == schedule.nodeToCycle.end())
-      continue;
-    int stage = it->second / II;
-    stageToCycles[stage].push_back(it->second);
+  for (const auto &node : schedLoop.nodes) {
+    int stage = node.cycle / II;
+    stageToCycles[stage].push_back(node.cycle);
   }
-  // Deduplicate and sort cycles per stage to assign dense cluster IDs.
   llvm::DenseMap<int, llvm::DenseMap<int, int>> stageAndCycleToCluster;
   for (auto &[stage, cycles] : stageToCycles) {
     llvm::sort(cycles);
@@ -69,30 +80,25 @@ static void emitScheduleAttributes(scf::ForOp loop,
       stageAndCycleToCluster[stage][cycles[i]] = i;
   }
 
-  for (const auto &node : ddg.getNodes()) {
-    auto it = schedule.nodeToCycle.find(node.idx);
-    if (it == schedule.nodeToCycle.end())
+  int maxStage = 0;
+  for (const auto &node : schedLoop.nodes) {
+    if (!node.op)
       continue;
-    // For multi-stage super-nodes (prologue/kloop/epilogue sharing the same
-    // Operation*), only write attrs from the node registered in opToIdx
-    // (the epilogue) to avoid overwrites.
+    // For multi-stage super-nodes sharing the same Operation*, only
+    // write attrs from the canonical node (registered in opToIdx).
     auto opIt = ddg.getOpToIdx().find(node.op);
-    if (opIt != ddg.getOpToIdx().end() && opIt->second != node.idx)
+    if (opIt != ddg.getOpToIdx().end() && opIt->second != node.id)
       continue;
-    int stage = it->second / II;
-    int cycle = it->second;
-    int clusterId = stageAndCycleToCluster[stage][cycle];
+    int stage = node.cycle / II;
+    int clusterId = stageAndCycleToCluster[stage][node.cycle];
+    maxStage = std::max(maxStage, stage);
     node.op->setAttr(tt::kLoopStageAttrName,
                      IntegerAttr::get(IntegerType::get(ctx, 32), stage));
     node.op->setAttr(tt::kLoopClusterAttrName,
                      IntegerAttr::get(IntegerType::get(ctx, 32), clusterId));
-    // Emit raw cycle for downstream buffer depth computation (Step 3).
-    node.op->setAttr("tt.modulo_cycle",
-                     IntegerAttr::get(IntegerType::get(ctx, 32), cycle));
   }
 
-  // Ensure ALL ops in the loop body have loop.stage/loop.cluster attrs.
-  // Downstream passes assert every op is in the schedule.
+  // Ensure ALL ops in the loop body have loop.stage/loop.cluster.
   for (auto &op : loop.getBody()->without_terminator()) {
     if (!op.hasAttr(tt::kLoopStageAttrName))
       op.setAttr(tt::kLoopStageAttrName,
@@ -102,12 +108,40 @@ static void emitScheduleAttributes(scf::ForOp loop,
                  IntegerAttr::get(IntegerType::get(ctx, 32), 0));
   }
 
-  LDBG("Emitted schedule: II=" << II << " maxStage=" << maxStage);
-
+  // ── 2. Per-loop: tt.modulo_ii, tt.scheduled_max_stage ──
+  // Do not set tt.num_stages — it is redundant with tt.scheduled_max_stage
+  // and causes conflicts when WS partitions the loop.
   loop->setAttr("tt.modulo_ii",
                 IntegerAttr::get(IntegerType::get(ctx, 32), II));
   loop->setAttr(tt::kScheduledMaxStageAttrName,
                 IntegerAttr::get(IntegerType::get(ctx, 32), maxStage));
+
+  // ── 3. Per-buffer: tt.num_buffers, buffer.id ──
+  for (const auto &buf : schedLoop.buffers) {
+    if (!buf.defOp || buf.kind == ttg::MemoryKind::BARRIER)
+      continue;
+    buf.defOp->setAttr("tt.num_buffers",
+                       IntegerAttr::get(IntegerType::get(ctx, 32), buf.count));
+    buf.defOp->setAttr("buffer.id",
+                       IntegerAttr::get(IntegerType::get(ctx, 32), buf.id));
+  }
+
+  // ── 4. Clean up internal attrs ──
+  for (auto &op : loop.getBody()->without_terminator())
+    op.removeAttr("tt.modulo_cycle");
+
+  llvm::errs() << "[MODULO] Emitted schedule: II=" << II
+               << " maxStage=" << maxStage
+               << " num_stages=" << (maxStage + 1)
+               << " buffers=" << schedLoop.buffers.size() << "\n";
+  for (const auto &buf : schedLoop.buffers) {
+    if (!buf.defOp || buf.kind == ttg::MemoryKind::BARRIER)
+      continue;
+    llvm::errs() << "[MODULO]   buf" << buf.id
+                 << " count=" << buf.count
+                 << " kind=" << (int)buf.kind
+                 << " op=" << buf.defOp->getName().getStringRef() << "\n";
+  }
 }
 
 /// Emit tt.autows annotations on MMA ops from the modulo schedule.
@@ -495,11 +529,10 @@ static unsigned computeBufferCount(const ttg::ScheduleLoop &loop,
     if (edge.srcId != producerNodeId)
       continue;
     const auto &consumer = loop.getNode(edge.dstId);
-    // Consumer hold time: use selfLatency (pipeline occupancy) when
-    // available, falling back to latency (result-ready time). This
-    // matches computeBufferLifetimes so that count and lifetime are
-    // computed consistently.
-    int hold = consumer.selfLatency ? consumer.selfLatency : consumer.latency;
+    // Consumer hold time: use full latency (time until consumer finishes
+    // reading the buffer). Per design doc: "Last consumer finishes reading
+    // at: schedule[c][0] + latencies[c]".
+    int hold = consumer.latency;
     int consumerEnd = consumer.cycle + hold + edge.distance * II;
     lastConsumerEnd = std::max(lastConsumerEnd, consumerEnd);
   }
@@ -678,7 +711,7 @@ static int computeBufferLifetime(const ttg::ScheduleLoop &loop,
     if (edge.srcId != producerNodeId)
       continue;
     const auto &consumer = loop.getNode(edge.dstId);
-    int holdTime = std::max(consumer.selfLatency, consumer.latency);
+    int holdTime = consumer.latency;
     int end = consumer.cycle + holdTime + edge.distance * loop.II;
     lastConsumerEnd = std::max(lastConsumerEnd, end);
   }
@@ -1047,10 +1080,9 @@ static void computeBufferLifetimes(ttg::ScheduleLoop &loop) {
         if (edge.srcId != node.id)
           continue;
         const auto &consumer = loop.getNode(edge.dstId);
-        // Use selfLatency (occupancy) over latency (result-ready) for
-        // the consumer's hold time on the resource.
-        int hold =
-            consumer.selfLatency ? consumer.selfLatency : consumer.latency;
+        // Use full latency (time until consumer finishes reading).
+        // Matches computeBufferCount so count and lifetime agree.
+        int hold = consumer.latency;
         int end =
             consumer.cycle + hold + static_cast<int>(edge.distance) * loop.II;
         lastEnd = std::max(lastEnd, end);
@@ -1323,7 +1355,12 @@ buildScheduleGraph(scf::ForOp loop, const ttg::DataDependenceGraph &ddg,
 // Schedule a single loop
 // ============================================================================
 
-static std::optional<ttg::ScheduleGraph>
+struct ScheduleResult {
+  ttg::ScheduleGraph graph;
+  ttg::DataDependenceGraph ddg;
+};
+
+static std::optional<ScheduleResult>
 scheduleOneLoop(scf::ForOp loop, const ttg::LatencyModel &model,
                 StringRef label) {
   auto ddg = ttg::DataDependenceGraph::build(loop, model);
@@ -1364,41 +1401,80 @@ scheduleOneLoop(scf::ForOp loop, const ttg::LatencyModel &model,
 
   auto graph = buildScheduleGraph(loop, ddg, *schedResult, model);
 
-  auto &schedLoop = graph.getLoop(0);
-
-  bool hasInnerLoop = false;
-  loop.getBody()->walk([&](scf::ForOp) { hasInnerLoop = true; });
-
-  if (hasInnerLoop) {
-    if (schedLoop.II != schedResult->II) {
-      LDBG(label << " budget adjusted II: " << schedResult->II << " → "
-                 << schedLoop.II << ", maxStage=" << schedLoop.maxStage);
-      auto adjustedResult = *schedResult;
-      adjustedResult.II = schedLoop.II;
-      emitScheduleAttributes(loop, ddg, adjustedResult);
-    } else {
-      emitScheduleAttributes(loop, ddg, *schedResult);
-    }
-  } else {
-    emitMMAAnnotations(loop, ddg, *schedResult);
-
-    if (!loop->hasAttr(tt::kNumStagesAttrName)) {
-      int numStages = schedResult->getMaxStage() + 1;
-      auto ctx = loop.getContext();
-      loop->setAttr(tt::kNumStagesAttrName,
-                    IntegerAttr::get(IntegerType::get(ctx, 32), numStages));
-    }
-  }
-
   LLVM_DEBUG({
     llvm::dbgs() << "[PASS-A] === " << label << " ScheduleGraph ===\n";
     graph.dump();
   });
 
-  for (auto &op : loop.getBody()->without_terminator())
-    op.removeAttr("tt.modulo_cycle");
+  return ScheduleResult{std::move(graph), std::move(ddg)};
+}
 
-  return graph;
+// Keeps graph + DDG + loop together for deferred emission.
+struct ScheduledLoop {
+  scf::ForOp loop;
+  ttg::ScheduleGraph graph;
+  ttg::DataDependenceGraph ddg;
+};
+
+// ============================================================================
+// Loop discovery
+// ============================================================================
+
+/// A scf::ForOp candidate for modulo scheduling, with its nesting context
+/// and raw direct-body flags. Built once via `collectCandidates` so the rest
+/// of Pass A can iterate without re-walking the module.
+///
+/// This is intentionally a flag bag rather than a tagged enum: a loop may
+/// simultaneously carry direct compute AND wrap inner loops (e.g. an outer
+/// loop that does a few non-tiling ops then enters a K-loop), and the
+/// scheduling decision belongs to the caller, not to this struct. Each call
+/// site filters on whichever combination of flags it cares about.
+struct CandidateLoop {
+  scf::ForOp op;
+  scf::ForOp parent;          // null op if outermost
+  unsigned depth{0};          // 0 = outermost
+  bool hasMMA{false};         // direct body has tcgen5_mma{,Scaled}
+  bool hasTMA{false};         // direct body has descriptor_load / async TMA copy
+  bool hasInnerLoop{false};   // direct body has a nested scf::ForOp
+  bool hasExistingAnnotation{false}; // tt.autows on an MMA — user-tuned, skip
+};
+
+/// Walk `moduleOp` once and collect every `scf::ForOp` with its nesting
+/// context and direct-body flags.
+///
+/// CONTRACT: the result is sorted by `depth` non-increasing (deepest first).
+/// This is a load-bearing guarantee — Pass A iterates the result in that
+/// order and relies on every nested loop being scheduled before its
+/// parent, because the parent's DDG promotes the child to a super-node
+/// whose `innerII` field is the child's just-computed II. Use
+/// `stable_sort` so loops at the same depth keep their source-order
+/// relative position (deterministic across builds).
+static SmallVector<CandidateLoop> collectCandidates(ModuleOp moduleOp) {
+  SmallVector<CandidateLoop> result;
+  moduleOp.walk([&](scf::ForOp loop) {
+    CandidateLoop c;
+    c.op = loop;
+    c.parent = loop->getParentOfType<scf::ForOp>();
+    for (auto p = c.parent; p; p = p->getParentOfType<scf::ForOp>())
+      ++c.depth;
+    for (auto &op : loop.getBody()->without_terminator()) {
+      if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp,
+              ttng::AsyncTMACopyGlobalToLocalOp>(&op))
+        c.hasTMA = true;
+      if (isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp>(&op)) {
+        c.hasMMA = true;
+        if (op.hasAttr("tt.autows"))
+          c.hasExistingAnnotation = true;
+      }
+      if (isa<scf::ForOp>(&op))
+        c.hasInnerLoop = true;
+    }
+    result.push_back(c);
+  });
+  llvm::stable_sort(result, [](const auto &a, const auto &b) {
+    return a.depth > b.depth;
+  });
+  return result;
 }
 
 // ============================================================================
@@ -1469,35 +1545,46 @@ struct ModuloSchedulePass
     // apply DDG transformations → re-run if any DDG changed.
     // Converges in 1-2 iterations.
     // ================================================================
+    // Collect scheduling results across iterations. Only the LAST
+    // iteration's results are emitted — earlier iterations are discarded
+    // when DDG transformations trigger re-scheduling.
+    SmallVector<ScheduledLoop, 2> scheduledLoops;
+
     constexpr int kMaxIterations = 3;
     for (int iteration = 0; iteration < kMaxIterations; ++iteration) {
       LDBG("=== Iterative scheduling: iteration " << iteration << " ===");
+      scheduledLoops.clear();
 
-      SmallVector<std::pair<scf::ForOp, unsigned>> loopsWithDepth;
-      moduleOp.walk([&](scf::ForOp loop) {
-        bool hasSchedulableOps = false;
-        loop->walk([&](Operation *op) {
-          if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp,
-                  ttng::AsyncTMACopyGlobalToLocalOp, ttng::TCGen5MMAOp,
-                  ttng::TCGen5MMAScaledOp>(op))
-            hasSchedulableOps = true;
-        });
-        if (!hasSchedulableOps)
+      // Discover schedulable loops in a single walk and sort by depth
+      // (deepest first), so an inner K-loop is scheduled before the
+      // outer tile loop that promotes it to a super-node.
+      auto candidates = collectCandidates(moduleOp);
+
+      // 2-level nesting cap: the prologue expansion, super-node DDG, and
+      // outer-loop pipelining all assume at most a depth-2 nest. Refuse
+      // anything deeper rather than silently mis-scheduling.
+      for (const auto &c : candidates) {
+        if (c.depth >= 2) {
+          c.op->emitError("modulo schedule: loop nesting depth >= 2 is not "
+                          "supported (this loop is at depth ")
+              << c.depth << ")";
+          signalPassFailure();
           return;
-        unsigned depth = 0;
-        for (auto parent = loop->getParentOfType<scf::ForOp>(); parent;
-             parent = parent->getParentOfType<scf::ForOp>())
-          ++depth;
-        loopsWithDepth.push_back({loop, depth});
-      });
-      llvm::sort(loopsWithDepth, [](const auto &a, const auto &b) {
-        return a.second < b.second;
-      });
+        }
+      }
 
-      LDBG("Found " << loopsWithDepth.size() << " schedulable loop(s)");
+      LDBG("Found " << candidates.size() << " schedulable loop(s)");
 
-      for (auto &[loop, depth] : loopsWithDepth)
-        scheduleOneLoop(loop, model, "Loop");
+      for (const auto &c : candidates) {
+        // Skip loops with no schedulable work and no inner loop to promote.
+        if (!c.hasMMA && !c.hasTMA && !c.hasInnerLoop)
+          continue;
+        auto result = scheduleOneLoop(c.op, model, "Loop");
+        if (result) {
+          scheduledLoops.push_back(
+              {c.op, std::move(result->graph), std::move(result->ddg)});
+        }
+      }
 
       // ================================================================
       // Iterative refinement: apply DDG transformations and check if
@@ -1512,9 +1599,6 @@ struct ModuloSchedulePass
         break;
       }
 
-      // Don't strip attrs on the last iteration — preserve the valid
-      // schedule from this iteration rather than leaving the loop
-      // unscheduled.
       if (iteration + 1 >= kMaxIterations) {
         LDBG("Hit iteration limit (" << kMaxIterations
                                      << ") — keeping last valid schedule");
@@ -1522,19 +1606,14 @@ struct ModuloSchedulePass
       }
 
       LDBG("DDG changed by transformation — re-scheduling");
-
-      // Strip OUTPUT schedule attrs before re-running. Do NOT strip
-      // INPUT attrs like tt.num_stages (user-provided pipeline depth).
-      moduleOp.walk([](Operation *op) {
-        op->removeAttr("loop.stage");
-        op->removeAttr("loop.cluster");
-        op->removeAttr("tt.modulo_cycle");
-        op->removeAttr("tt.modulo_ii");
-        op->removeAttr("tt.num_buffers");
-        op->removeAttr("tt.self_latency");
-        op->removeAttr("tt.scheduled_max_stage");
-      });
     } // end iterative loop
+
+    // ================================================================
+    // Emit phase: write all annotations from the final ScheduleGraphs.
+    // This runs ONCE after convergence, not per-iteration.
+    // ================================================================
+    for (auto &sl : scheduledLoops)
+      emitScheduleFromGraph(sl.loop, sl.graph, sl.ddg);
   }
 };
 

@@ -2,9 +2,9 @@
 
 // Test that the inner_tree reduction ordering produces count-up shuffle order
 // (stride 2, 4, 8, 16) instead of the default count-down order (16, 8, 4, 2).
-// The reduction axis is ordered by row offset, so SRC0+SRC1 and SRC2+SRC3 are
-// first combined within-thread, then each combined value gets a count-up warp
-// reduction.
+// For this layout, each register value belongs to a distinct contiguous group
+// along the reduction axis. INNER_TREE keeps those groups separate through the
+// warp reduction and combines the groups later when packing the result.
 
 #linear = #ttg.linear<{register = [[0, 2], [2, 0]], lane = [[0, 8], [8, 0], [1, 0], [4, 0], [16, 0]], warp = [[0, 1], [0, 4]], block = []}>
 
@@ -17,21 +17,41 @@ tt.func private @reduce_inner_tree(%arg0: tensor<32x16xi32, #linear>) -> tensor<
   // CHECK: [[SRC2:%.*]] = extractvalue {{.*}} %0, 2
   // CHECK: [[SRC3:%.*]] = extractvalue {{.*}} %0, 3
 
-  // Within-thread reduction: combine adjacent values on the reduction axis.
-  // CHECK: [[C0:%.*]] = add i32 [[SRC0]], [[SRC1]]
-  // CHECK: [[C1:%.*]] = add i32 [[SRC2]], [[SRC3]]
+  // INNER_TREE count-up warp shuffle for each register group.
+  // CHECK: [[S0_W0:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[SRC0]], i32 2, i32 31)
+  // CHECK: [[S0_A0:%.*]] = add i32 [[S0_W0]], [[SRC0]]
+  // CHECK: [[S0_W1:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S0_A0]], i32 4, i32 31)
+  // CHECK: [[S0_A1:%.*]] = add i32 [[S0_A0]], [[S0_W1]]
+  // CHECK: [[S0_W2:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S0_A1]], i32 8, i32 31)
+  // CHECK: [[S0_A2:%.*]] = add i32 [[S0_A1]], [[S0_W2]]
+  // CHECK: [[S0_W3:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S0_A2]], i32 16, i32 31)
 
-  // INNER_TREE count-up warp shuffle for combined0: strides 2, 4, 8, 16
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[C0]], i32 2, i32 31)
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 4, i32 31)
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 8, i32 31)
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 16, i32 31)
+  // CHECK: [[S1_W0:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[SRC1]], i32 2, i32 31)
+  // CHECK: [[S1_A0:%.*]] = add i32 [[S1_W0]], [[SRC1]]
+  // CHECK: [[S1_W1:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S1_A0]], i32 4, i32 31)
+  // CHECK: [[S1_A1:%.*]] = add i32 [[S1_A0]], [[S1_W1]]
+  // CHECK: [[S1_W2:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S1_A1]], i32 8, i32 31)
+  // CHECK: [[S1_A2:%.*]] = add i32 [[S1_A1]], [[S1_W2]]
+  // CHECK: [[S1_W3:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S1_A2]], i32 16, i32 31)
 
-  // INNER_TREE count-up warp shuffle for combined1: strides 2, 4, 8, 16
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[C1]], i32 2, i32 31)
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 4, i32 31)
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 8, i32 31)
-  // CHECK: tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 %{{.*}}, i32 16, i32 31)
+  // CHECK: [[S2_W0:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[SRC2]], i32 2, i32 31)
+  // CHECK: [[S2_A0:%.*]] = add i32 [[S2_W0]], [[SRC2]]
+  // CHECK: [[S2_W1:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S2_A0]], i32 4, i32 31)
+  // CHECK: [[S2_A1:%.*]] = add i32 [[S2_A0]], [[S2_W1]]
+  // CHECK: [[S2_W2:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S2_A1]], i32 8, i32 31)
+  // CHECK: [[S2_A2:%.*]] = add i32 [[S2_A1]], [[S2_W2]]
+  // CHECK: [[S2_W3:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S2_A2]], i32 16, i32 31)
+
+  // CHECK: [[S3_W0:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[SRC3]], i32 2, i32 31)
+  // CHECK: [[S3_A0:%.*]] = add i32 [[S3_W0]], [[SRC3]]
+  // CHECK: [[S3_W1:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S3_A0]], i32 4, i32 31)
+  // CHECK: [[S3_A1:%.*]] = add i32 [[S3_A0]], [[S3_W1]]
+  // CHECK: [[S3_W2:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S3_A1]], i32 8, i32 31)
+  // CHECK: [[S3_A2:%.*]] = add i32 [[S3_A1]], [[S3_W2]]
+  // CHECK: [[S3_W3:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S3_A2]], i32 16, i32 31)
+
+  // CHECK: add i32 [[S0_A2]], [[S0_W3]]
+  // CHECK: add i32 [[S1_A2]], [[S1_W3]]
 
   %0 = "tt.reduce"(%arg0) ({
   ^bb0(%arg1: i32, %arg2: i32):

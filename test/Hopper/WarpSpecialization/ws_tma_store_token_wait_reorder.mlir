@@ -143,6 +143,33 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+// Loop-carried token after an unrelated loop-carried value. The token wait
+// should still trace to the yielded TMA store token and get rescheduled.
+// CHECK-LABEL: loop_carried_token_with_dead_iter_arg
+// CHECK: scf.for
+// CHECK: ttng.async_tma_store_token_wait
+// CHECK-NOT: can_rotate_by_buffer_count
+// CHECK-SAME: {loop.cluster = 1 : i32, loop.stage = 1 : i32}
+// CHECK: ttng.async_tma_copy_local_to_global {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
+  tt.func public @loop_carried_token_with_dead_iter_arg(
+      %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
+      %src: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+      %lb: index, %ub: index, %step: index, %i: i32) {
+    %init_tok = ttng.async_tma_copy_local_to_global %desc[%i, %i] %src : !tt.tensordesc<tensor<128x64xf16, #shared>>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+    %result:2 = scf.for %iv = %lb to %ub step %step iter_args(%dead = %i, %carried = %init_tok) -> (i32, !ttg.async.token) {
+      ttng.async_tma_store_token_wait %carried {"can_rotate_by_buffer_count" = 1 : i32, "loop.stage" = 0 : i32, "loop.cluster" = 0 : i32} : !ttg.async.token
+      %tok = ttng.async_tma_copy_local_to_global %desc[%i, %i] %src {"loop.stage" = 0 : i32, "loop.cluster" = 1 : i32} : !tt.tensordesc<tensor<128x64xf16, #shared>>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+      scf.yield %dead, %tok : i32, !ttg.async.token
+    } {"tt.scheduled_max_stage" = 1 : i32}
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
 // Outside a loop → pass doesn't touch it, attribute preserved.
 // CHECK-LABEL: outside_loop_no_op
 // CHECK: can_rotate_by_buffer_count
