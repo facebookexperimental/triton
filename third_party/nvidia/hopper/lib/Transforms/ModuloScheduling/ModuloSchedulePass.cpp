@@ -3336,6 +3336,571 @@ static SmallVector<CandidateLoop> collectCandidates(ModuleOp moduleOp) {
 }
 
 // ============================================================================
+// JSON Schedule Graph Dumper
+// ============================================================================
+//
+// Serializes the ScheduleGraph for consumption by external tools (e.g. the
+// TLX emitter at users/wl/wlei/autows/modulo_schedule/tlx_emitter/).
+//
+// Schema is documented in tlx_emitter/SCHEMA.md (version 0.1):
+//   - kernel: function signature
+//   - ops: flat table of every op (function-scope + in-loop) with structured
+//     operand refs (op / arg / iv / iter_arg / const)
+//   - loops: per-loop graph with first-class nodes + edges from the
+//     ScheduleGraph (nodes carry warpGroup directly).
+//
+// Triggered by env var TRITON_MODULO_DUMP_SCHEDULE=<path>.
+
+namespace {
+
+std::string jsonEscape(StringRef s) {
+  std::string out;
+  out.reserve(s.size() + 2);
+  for (char c : s) {
+    switch (c) {
+    case '"':  out += "\\\""; break;
+    case '\\': out += "\\\\"; break;
+    case '\n': out += "\\n"; break;
+    case '\r': out += "\\r"; break;
+    case '\t': out += "\\t"; break;
+    default:
+      if (static_cast<unsigned char>(c) < 0x20) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "\\u%04x", c);
+        out += buf;
+      } else {
+        out += c;
+      }
+    }
+  }
+  return out;
+}
+
+std::string jsonOpId(Operation *op) {
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  os << "op_" << reinterpret_cast<uintptr_t>(op);
+  return s;
+}
+
+std::string jsonTypeStr(Type t) {
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  t.print(os);
+  return s;
+}
+
+std::string jsonSigTypeStr(Type t) {
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  if (auto ptr = dyn_cast<tt::PointerType>(t)) {
+    os << "*";
+    ptr.getPointeeType().print(os);
+  } else {
+    t.print(os);
+  }
+  return s;
+}
+
+void jsonDumpShape(llvm::raw_ostream &os, ArrayRef<int64_t> shape) {
+  os << "[";
+  for (size_t i = 0; i < shape.size(); ++i) {
+    if (i) os << ", ";
+    os << shape[i];
+  }
+  os << "]";
+}
+
+struct JsonDumpContext {
+  SmallVector<std::string> funcArgNames;
+  llvm::DenseMap<scf::ForOp, int> loopIds; // forOp → loop_id
+};
+
+void jsonDumpOperandRef(llvm::raw_ostream &os, Value v,
+                        const JsonDumpContext &dc) {
+  if (auto *defOp = v.getDefiningOp()) {
+    if (auto cst = dyn_cast<arith::ConstantOp>(defOp)) {
+      Attribute val = cst.getValue();
+      // JSON has no non-finite literal — emit ±inf / nan as quoted strings.
+      auto emitFloat = [&](double d) {
+        if (std::isfinite(d))
+          os << llvm::format("%g", d);
+        else if (std::isnan(d))
+          os << "\"nan\"";
+        else
+          os << (d > 0 ? "\"inf\"" : "\"-inf\"");
+      };
+      os << "{\"const\": ";
+      if (auto i = dyn_cast<IntegerAttr>(val))
+        os << i.getInt();
+      else if (auto f = dyn_cast<FloatAttr>(val))
+        emitFloat(f.getValueAsDouble());
+      else if (auto d = dyn_cast<DenseElementsAttr>(val); d && d.isSplat()) {
+        // Splat tensor literal (e.g. dense<-inf>, dense<1.0>) — record the
+        // splat scalar so iter_arg inits like `tl.zeros() - inf` survive.
+        Attribute splat = d.getSplatValue<Attribute>();
+        if (auto i = dyn_cast<IntegerAttr>(splat))
+          os << i.getInt();
+        else if (auto f = dyn_cast<FloatAttr>(splat))
+          emitFloat(f.getValueAsDouble());
+        else
+          os << "null";
+      } else
+        os << "null";
+      os << ", \"type\": \"" << jsonEscape(jsonTypeStr(cst.getType())) << "\"}";
+      return;
+    }
+    os << "{\"op\": \"" << jsonOpId(defOp) << "\"";
+    // Multi-result ops (scf.for, tt.split, ...) need a result index so the
+    // emitter can disambiguate which value is being referenced.
+    if (defOp->getNumResults() > 1) {
+      auto opRes = cast<OpResult>(v);
+      os << ", \"result\": " << opRes.getResultNumber();
+    }
+    os << "}";
+    return;
+  }
+  auto blockArg = cast<BlockArgument>(v);
+  Block *block = blockArg.getOwner();
+  Operation *parent = block->getParentOp();
+  if (auto fn = dyn_cast<tt::FuncOp>(parent)) {
+    unsigned i = blockArg.getArgNumber();
+    StringRef name = i < dc.funcArgNames.size()
+                         ? StringRef(dc.funcArgNames[i])
+                         : StringRef("");
+    os << "{\"arg\": \"" << jsonEscape(name) << "\"}";
+    return;
+  }
+  if (auto forOp = dyn_cast<scf::ForOp>(parent)) {
+    auto it = dc.loopIds.find(forOp);
+    int lid = it != dc.loopIds.end() ? it->second : -1;
+    if (blockArg.getArgNumber() == 0)
+      os << "{\"iv\": " << lid << "}";
+    else
+      os << "{\"iter_arg\": {\"loop\": " << lid
+         << ", \"idx\": " << (blockArg.getArgNumber() - 1) << "}}";
+    return;
+  }
+  os << "{\"unknown_block_arg\": true}";
+}
+
+void jsonDumpAttrValue(llvm::raw_ostream &os, Attribute attr) {
+  if (auto i = dyn_cast<IntegerAttr>(attr)) {
+    os << i.getInt();
+    return;
+  }
+  if (auto s = dyn_cast<StringAttr>(attr)) {
+    os << "\"" << jsonEscape(s.getValue()) << "\"";
+    return;
+  }
+  if (auto a = dyn_cast<DenseI32ArrayAttr>(attr)) {
+    os << "[";
+    auto vals = a.asArrayRef();
+    for (size_t i = 0; i < vals.size(); ++i) {
+      if (i) os << ", ";
+      os << vals[i];
+    }
+    os << "]";
+    return;
+  }
+  if (auto a = dyn_cast<ArrayAttr>(attr)) {
+    os << "[";
+    for (size_t i = 0; i < a.size(); ++i) {
+      if (i) os << ", ";
+      jsonDumpAttrValue(os, a[i]);
+    }
+    os << "]";
+    return;
+  }
+  std::string s;
+  llvm::raw_string_ostream ss(s);
+  attr.print(ss);
+  os << "\"" << jsonEscape(s) << "\"";
+}
+
+std::string jsonScopeOf(Operation *op, const JsonDumpContext &dc) {
+  Operation *cur = op->getParentOp();
+  while (cur) {
+    if (auto forOp = dyn_cast<scf::ForOp>(cur)) {
+      auto it = dc.loopIds.find(forOp);
+      if (it != dc.loopIds.end()) {
+        std::string s;
+        llvm::raw_string_ostream ss(s);
+        ss << "loop:" << it->second;
+        return s;
+      }
+    }
+    cur = cur->getParentOp();
+  }
+  return "function";
+}
+
+void jsonDumpOpEntry(llvm::raw_ostream &os, Operation *op,
+                     const JsonDumpContext &dc, bool isLast) {
+  os << "    \"" << jsonOpId(op) << "\": {\n";
+  os << "      \"kind\": \"" << jsonEscape(op->getName().getStringRef())
+     << "\",\n";
+  os << "      \"scope\": \"" << jsonEscape(jsonScopeOf(op, dc)) << "\",\n";
+
+  os << "      \"operands\": [";
+  bool first = true;
+  for (Value v : op->getOperands()) {
+    if (!first) os << ", ";
+    jsonDumpOperandRef(os, v, dc);
+    first = false;
+  }
+  os << "],\n";
+
+  os << "      \"result_types\": [";
+  first = true;
+  for (Type t : op->getResultTypes()) {
+    if (!first) os << ", ";
+    os << "\"" << jsonEscape(jsonTypeStr(t)) << "\"";
+    first = false;
+  }
+  os << "],\n";
+
+  os << "      \"attributes\": {";
+  first = true;
+  for (NamedAttribute na : op->getAttrs()) {
+    if (!first) os << ", ";
+    os << "\"" << jsonEscape(na.getName().strref()) << "\": ";
+    jsonDumpAttrValue(os, na.getValue());
+    first = false;
+  }
+  os << "}";
+
+  // For scf.if: emit the yielded values from then/else regions so the
+  // emitter can render the result as `then if cond else else`.
+  if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+    auto dumpYield = [&](const char *key, Block *blk) {
+      os << ",\n      \"" << key << "\": [";
+      bool yfirst = true;
+      if (blk && blk->mightHaveTerminator()) {
+        if (auto y = dyn_cast<scf::YieldOp>(blk->getTerminator())) {
+          for (Value v : y.getOperands()) {
+            if (!yfirst) os << ", ";
+            jsonDumpOperandRef(os, v, dc);
+            yfirst = false;
+          }
+        }
+      }
+      os << "]";
+    };
+    dumpYield("then_yields", ifOp.thenBlock());
+    if (!ifOp.getElseRegion().empty())
+      dumpYield("else_yields", ifOp.elseBlock());
+  }
+
+  os << "\n    }" << (isLast ? "" : ",") << "\n";
+}
+
+const char *jsonMemKindName(ttg::MemoryKind k) {
+  switch (k) {
+  case ttg::MemoryKind::SMEM:    return "smem";
+  case ttg::MemoryKind::TMEM:    return "tmem";
+  case ttg::MemoryKind::Register:return "register";
+  case ttg::MemoryKind::BARRIER: return "barrier";
+  }
+  return "unknown";
+}
+
+void jsonDumpScheduleLoop(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl,
+                          int loopId, const JsonDumpContext &dc, bool isLast) {
+  os << "    {\n";
+  os << "      \"id\": " << loopId << ",\n";
+  os << "      \"II\": " << sl.II << ",\n";
+  os << "      \"max_stage\": " << sl.maxStage << ",\n";
+  os << "      \"prologue_latency\": " << sl.prologueLatency << ",\n";
+  os << "      \"trip_count\": " << sl.tripCount << ",\n";
+  os << "      \"trip_count_estimated\": "
+     << (sl.tripCountIsEstimated ? "true" : "false") << ",\n";
+
+  // Loop bounds + IV (from MLIR scf.for). MLIR getters aren't const, so
+  // copy the ForOp wrapper (it's just a pointer underneath).
+  scf::ForOp forOp = sl.forOp;
+  os << "      \"induction_var\": {\"name\": \"";
+  if (auto loc = dyn_cast<NameLoc>(forOp.getInductionVar().getLoc()))
+    os << jsonEscape(loc.getName());
+  else
+    os << "iv";
+  os << "\", \"type\": \""
+     << jsonEscape(jsonTypeStr(forOp.getInductionVar().getType()))
+     << "\"},\n";
+  os << "      \"lower_bound\": ";
+  jsonDumpOperandRef(os, forOp.getLowerBound(), dc);
+  os << ",\n      \"upper_bound\": ";
+  jsonDumpOperandRef(os, forOp.getUpperBound(), dc);
+  os << ",\n      \"step\": ";
+  jsonDumpOperandRef(os, forOp.getStep(), dc);
+  os << ",\n";
+
+  // Buffers (first-class — already on the ScheduleLoop).
+  os << "      \"buffers\": [\n";
+  for (size_t i = 0; i < sl.buffers.size(); ++i) {
+    const auto &b = sl.buffers[i];
+    os << "        {\"id\": " << b.id
+       << ", \"kind\": \"" << jsonMemKindName(b.kind) << "\""
+       << ", \"shape\": ";
+    jsonDumpShape(os, b.shape);
+    os << ", \"element_bits\": " << b.elementBitWidth
+       << ", \"count\": " << b.count
+       << ", \"size_bytes\": " << b.sizeBytes()
+       << ", \"total_bytes\": " << b.totalBytes()
+       << ", \"merge_group_id\": "
+       << (b.mergeGroupId == UINT_MAX
+               ? std::string("null")
+               : std::to_string(b.mergeGroupId))
+       << ", \"paired_buffer_id\": "
+       << (b.pairedBufferId == UINT_MAX
+               ? std::string("null")
+               : std::to_string(b.pairedBufferId))
+       << ", \"live_start\": " << b.liveStart
+       << ", \"live_end\": " << b.liveEnd
+       << ", \"def_op\": "
+       << (b.defOp ? std::string("\"") + jsonOpId(b.defOp) + "\""
+                   : std::string("null"));
+    // A.5 partition fields on ScheduleBuffer added by follow-up diff.
+    os << "}" << (i + 1 == sl.buffers.size() ? "" : ",") << "\n";
+  }
+  os << "      ],\n";
+
+  // Graph: nodes + edges (first-class, from ScheduleGraph).
+  os << "      \"graph\": {\n";
+
+  os << "        \"nodes\": [\n";
+  for (size_t i = 0; i < sl.nodes.size(); ++i) {
+    const auto &n = sl.nodes[i];
+    os << "          {\"id\": " << n.id
+       << ", \"op_ref\": "
+       << (n.op ? std::string("\"") + jsonOpId(n.op) + "\""
+                : std::string("null"))
+       << ", \"op_kind\": \""
+       << (n.op ? jsonEscape(n.op->getName().getStringRef()) : std::string(""))
+       << "\""
+       << ", \"pipeline\": \"" << jsonEscape(ttg::getPipelineName(n.pipeline))
+       << "\""
+       << ", \"warp_group\": " << n.warpGroup
+       << ", \"latency\": " << n.latency
+       << ", \"self_latency\": " << n.selfLatency
+       << ", \"min_warps\": " << n.minWarps
+       << ", \"frequency_multiplier\": " << n.frequencyMultiplier
+       << ", \"schedule\": {\"cycle\": " << n.cycle
+       << ", \"stage\": " << n.stage
+       << ", \"cluster\": " << n.cluster << "}"
+       << ", \"produces_buffer\": "
+       << (n.producesBuffer == UINT_MAX
+               ? std::string("null")
+               : std::to_string(n.producesBuffer))
+       << ", \"consumes_buffers\": [";
+    for (size_t j = 0; j < n.consumesBuffers.size(); ++j) {
+      if (j) os << ", ";
+      os << n.consumesBuffers[j];
+    }
+    os << "]";
+    if (n.isSuperNode())
+      os << ", \"child_pipeline_id\": " << n.childPipelineId
+         << ", \"prologue_latency\": " << n.prologueLatency;
+    // Pass A.5 / A.7 partition + subtile JSON fields are emitted by the
+    // follow-up diffs that add the ScheduleNode partition/subtile fields.
+    os << "}" << (i + 1 == sl.nodes.size() ? "" : ",") << "\n";
+  }
+  os << "        ],\n";
+
+  os << "        \"edges\": [\n";
+  for (size_t i = 0; i < sl.edges.size(); ++i) {
+    const auto &e = sl.edges[i];
+    os << "          {\"src\": " << e.srcId
+       << ", \"dst\": " << e.dstId
+       << ", \"kind\": \"data\""
+       << ", \"distance\": " << e.distance
+       << ", \"latency\": " << e.latency << "}"
+       << (i + 1 == sl.edges.size() ? "" : ",") << "\n";
+  }
+  os << "        ],\n";
+
+  // Cross-warp-group barriers (from Pass B Step 2). Each entry pairs a
+  // producer node with a consumer node and the SMEM/TMEM buffer used to
+  // ferry the value (paired_buffer_id indexes into this loop's `buffers`).
+  os << "        \"cross_wg_barriers\": [";
+  for (size_t i = 0; i < sl.crossGroupBarriers.size(); ++i) {
+    const auto &b = sl.crossGroupBarriers[i];
+    if (i) os << ",";
+    os << "\n          {\"producer_node\": " << b.producerNodeId
+       << ", \"consumer_node\": " << b.consumerNodeId
+       << ", \"producer_wg\": " << b.producerWarpGroup
+       << ", \"consumer_wg\": " << b.consumerWarpGroup
+       << ", \"kind\": \""
+       << (b.kind == ttg::ScheduleLoop::BarrierKind::MBARRIER
+               ? "mbarrier" : "named")
+       << "\""
+       << ", \"depth\": " << b.depth
+       << ", \"paired_buffer_id\": "
+       << (b.pairedBufferId == UINT_MAX
+               ? std::string("null")
+               : std::to_string(b.pairedBufferId))
+       << ", \"expect_bytes\": " << b.expectBytes << "}";
+  }
+  os << (sl.crossGroupBarriers.empty() ? "" : "\n        ") << "]\n";
+  os << "      }\n";
+  os << "    }" << (isLast ? "" : ",") << "\n";
+}
+
+// Aggregate Phase 4 / WS plan from per-node warp groups: build a stable list
+// of unique warp_group ids in ascending order. Each loop reports the distinct
+// pipelines present in each group plus the WG's chosen `num_warps` (= max
+// minWarps over its ops, snapped to {1,2,4,8}). The emitter consumes
+// num_warps directly instead of inferring it from a binary tmem-presence
+// rule.
+void jsonDumpWarpGroups(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl) {
+  // Collect (warpGroup -> {pipelines, max minWarps}) deterministically.
+  std::map<int, std::set<std::string>> pipes;
+  std::map<int, int> wgMaxMinWarps;
+  for (const auto &n : sl.nodes) {
+    // Skip unassigned (`-1`) and replicated (`-2`) nodes. These are infra
+    // ops that the emitter replicates per-task via
+    // `_collect_infra_deps_recursive` — they are NOT separate warp groups.
+    // Emitting an async_task for them produces a body without `smem_accum`
+    // initialization (NameError) and a phantom WG in the kernel header.
+    if (n.warpGroup < 0)
+      continue;
+    pipes[n.warpGroup].insert(ttg::getPipelineName(n.pipeline).str());
+    int &m = wgMaxMinWarps[n.warpGroup];
+    m = std::max(m, std::max(n.minWarps, 1));
+  }
+  auto snapWarps = [](int m) {
+    if (m <= 1) return 1;
+    if (m <= 2) return 2;
+    if (m <= 4) return 4;
+    return 8;
+  };
+  os << "      \"warp_groups\": [";
+  bool first = true;
+  for (const auto &[wg, pipeSet] : pipes) {
+    if (!first) os << ", ";
+    int numWarps = snapWarps(wgMaxMinWarps[wg]);
+    os << "{\"id\": " << wg << ", \"num_warps\": " << numWarps
+       << ", \"pipelines\": [";
+    bool fp = true;
+    for (const auto &p : pipeSet) {
+      if (!fp) os << ", ";
+      os << "\"" << jsonEscape(p) << "\"";
+      fp = false;
+    }
+    os << "]}";
+    first = false;
+  }
+  os << "],\n";
+}
+
+void dumpScheduleGraphAsJSON(
+    ModuleOp moduleOp, StringRef path,
+    ArrayRef<ScheduledLoop> scheduledLoops) {
+  // Locate the kernel function.
+  tt::FuncOp kernelFn;
+  moduleOp.walk([&](tt::FuncOp fn) {
+    if (!kernelFn) kernelFn = fn;
+  });
+
+  // Build dump context: function arg names + loop ids.
+  // Triton's TensorDescriptor flattens to 5 args (ptr, 2x shape, 2x stride)
+  // that all share the same loc name (e.g. "a_desc"). Mirror MLIR's auto-
+  // rename behavior: first occurrence keeps the bare name; subsequent ones
+  // get _0, _1, ... so each emitted Python identifier is unique.
+  JsonDumpContext dc;
+  if (kernelFn) {
+    llvm::StringMap<unsigned> nameUseCount;
+    for (size_t i = 0; i < kernelFn.getNumArguments(); ++i) {
+      std::string base;
+      if (auto loc = dyn_cast<NameLoc>(kernelFn.getArgument(i).getLoc()))
+        base = loc.getName().str();
+      if (base.empty())
+        base = "arg" + std::to_string(i);
+      unsigned &cnt = nameUseCount[base];
+      std::string name = cnt == 0 ? base : (base + "_" + std::to_string(cnt - 1));
+      ++cnt;
+      dc.funcArgNames.push_back(name);
+    }
+  }
+  for (size_t i = 0; i < scheduledLoops.size(); ++i)
+    dc.loopIds[scheduledLoops[i].loop] = static_cast<int>(i);
+
+  std::error_code ec;
+  llvm::raw_fd_ostream os(path, ec);
+  if (ec) {
+    llvm::errs() << "[modulo-schedule] Failed to open dump file '" << path
+                 << "': " << ec.message() << "\n";
+    return;
+  }
+
+  os << "{\n";
+  os << "  \"schema_version\": \"0.1\",\n";
+
+  // kernel section.
+  os << "  \"kernel\": {\n";
+  os << "    \"name\": \""
+     << jsonEscape(kernelFn ? kernelFn.getName() : StringRef("")) << "\",\n";
+  os << "    \"args\": [\n";
+  if (kernelFn) {
+    auto args = kernelFn.getArguments();
+    for (size_t i = 0; i < args.size(); ++i) {
+      os << "      {\"name\": \"" << jsonEscape(dc.funcArgNames[i])
+         << "\", \"type\": \"" << jsonEscape(jsonSigTypeStr(args[i].getType()))
+         << "\"}" << (i + 1 == args.size() ? "" : ",") << "\n";
+    }
+  }
+  os << "    ]\n";
+  os << "  },\n";
+
+  // ops table — every op in the kernel function.
+  os << "  \"ops\": {\n";
+  if (kernelFn) {
+    SmallVector<Operation *> all;
+    kernelFn.walk([&](Operation *op) {
+      if (op == kernelFn.getOperation()) return;
+      all.push_back(op);
+    });
+    for (size_t i = 0; i < all.size(); ++i)
+      jsonDumpOpEntry(os, all[i], dc, /*isLast=*/i + 1 == all.size());
+  }
+  os << "  },\n";
+
+  // loops section — drive off scheduledLoops, each contains a ScheduleGraph
+  // (which itself may contain nested loops, but in fbsource beta each
+  // ScheduledLoop wraps one scf.for; ScheduleGraph.loops typically has size 1).
+  os << "  \"loops\": [\n";
+  for (size_t i = 0; i < scheduledLoops.size(); ++i) {
+    const auto &sl = scheduledLoops[i];
+    if (sl.graph.loops.empty()) {
+      // Should not happen for a fully scheduled loop.
+      continue;
+    }
+    // One ScheduleLoop per ScheduledLoop in the common case.
+    const auto &schedLoop = sl.graph.loops.front();
+    int loopId = static_cast<int>(i);
+    os << "    {\n";
+    os << "      \"loop_id\": " << loopId << ",\n";
+    os << "      \"is_outer\": " << (sl.isOuter ? "true" : "false") << ",\n";
+    jsonDumpWarpGroups(os, schedLoop);
+    // Inline the schedule loop body inside this entry for ergonomics —
+    // jsonDumpScheduleLoop emits its own "{ ... }" so we inline its inner
+    // body fields by buffering. Simpler: just emit it as a sub-object.
+    os << "      \"schedule_loop\": ";
+    jsonDumpScheduleLoop(os, schedLoop, loopId, dc, /*isLast=*/true);
+    os << "    }" << (i + 1 == scheduledLoops.size() ? "" : ",") << "\n";
+  }
+  os << "  ]\n";
+  os << "}\n";
+
+  llvm::errs() << "[modulo-schedule] Dumped schedule graph (v0.1) to " << path
+               << " (" << scheduledLoops.size() << " loop(s))\n";
+}
+
+} // namespace
+
+// ============================================================================
+// ============================================================================
+// ============================================================================
 // Pass A: Modulo Scheduling
 // ============================================================================
 
@@ -3544,6 +4109,10 @@ struct ModuloSchedulePass
     // carry loop.stage/loop.cluster from the OUTER schedule — keep
     // them so the outer pipeliner knows where the K-loop sits.
 
+    // Optional: dump the ScheduleGraph as JSON for the TLX emitter.
+    if (const char *path = std::getenv("TRITON_MODULO_DUMP_SCHEDULE")) {
+      dumpScheduleGraphAsJSON(moduleOp, path, scheduledLoops);
+    }
   }
 };
 
