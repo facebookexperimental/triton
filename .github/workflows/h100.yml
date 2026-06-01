@@ -72,6 +72,7 @@ jobs:
           . "${SETUP_SCRIPT}"
           . /workspace/tritonbench/.ci/triton/triton_install_utils.sh
           install_triton $PWD
+          uv pip install pytest
       - name: Install torchao from source
         run: |
           . "${SETUP_SCRIPT}"
@@ -81,12 +82,12 @@ jobs:
         timeout-minutes: 5
         run: |
           . "${SETUP_SCRIPT}"
-          pytest python/test/unit/language/test_tlx_*.py -v
+          python -m pytest python/test/unit/language/test_tlx_*.py -v
       - name: Run TLX tutorial correctness tests
         timeout-minutes: 5
         run: |
           . "${SETUP_SCRIPT}"
-          pytest third_party/tlx/tutorials/testing/test_correctness.py -v
+          python -m pytest third_party/tlx/tutorials/testing/test_correctness.py -v
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}

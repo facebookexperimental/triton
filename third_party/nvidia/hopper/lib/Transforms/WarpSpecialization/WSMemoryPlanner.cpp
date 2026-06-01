@@ -227,6 +227,25 @@ static Channel *findChannelForOp(Operation *op,
   return TheCh;
 }
 
+/// Return the logical producer for a channel. For SMEM post channels created
+/// from a tensor value, the channel source is a local_store; use the value
+/// stored into SMEM so tie-breaking follows the original load/program order.
+static Operation *getLogicalProducerOp(Channel *ch) {
+  if (!ch)
+    return nullptr;
+
+  Operation *srcOp = ch->getSrcOp();
+  if (!srcOp)
+    return nullptr;
+
+  if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(srcOp)) {
+    if (Operation *defOp = storeOp.getSrc().getDefiningOp())
+      return defOp;
+  }
+
+  return srcOp;
+}
+
 /// Find the channel associated with a value's defining allocation operation.
 /// Convenience wrapper around findChannelForOp.
 /// @param value The value whose defining operation to find a channel for
@@ -798,6 +817,24 @@ struct WSBuffer {
   bool isAllocated =
       false; // Has dedicated SMEM; false = reuses another buffer.
 };
+
+static unsigned
+getWSBufferUsageOrder(const WSBuffer &buf, SmallVector<Channel *> &channels,
+                      const DenseMap<Operation *, unsigned> &opOrder) {
+  if (Channel *ch = findChannelForOp(buf.allocOp, channels)) {
+    if (Operation *producer = getLogicalProducerOp(ch)) {
+      auto it = opOrder.find(producer);
+      if (it != opOrder.end())
+        return it->second;
+    }
+  }
+
+  auto it = opOrder.find(buf.allocOp);
+  if (it != opOrder.end())
+    return it->second;
+
+  return std::numeric_limits<unsigned>::max();
+}
 
 /// Parsed channel annotation from tt.autows JSON on an MMA op.
 /// Format: "opndA,smem,2,0" → operand=opndA, memType=smem, numCopies=2,
@@ -1560,6 +1597,11 @@ static unsigned allocateSmemBuffers(
   if (wsBuffers.empty())
     return nextBufferId;
 
+  DenseMap<Operation *, unsigned> opOrder;
+  unsigned nextOpOrder = 0;
+  funcOp->walk<WalkOrder::PreOrder>(
+      [&](Operation *op) { opOrder[op] = nextOpOrder++; });
+
   // Ensure nextBufferId is past all pinned SMEM IDs too.
   for (auto &buf : wsBuffers)
     if (buf.isPinned)
@@ -1701,6 +1743,14 @@ static unsigned allocateSmemBuffers(
     }
     if (candidateIndices.empty())
       continue;
+
+    llvm::stable_sort(candidateIndices, [&](unsigned a, unsigned b) {
+      unsigned orderA = getWSBufferUsageOrder(wsBuffers[a], channels, opOrder);
+      unsigned orderB = getWSBufferUsageOrder(wsBuffers[b], channels, opOrder);
+      if (orderA != orderB)
+        return orderA < orderB;
+      return a < b;
+    });
 
     LDBG("Phase 4: processing priority=" << static_cast<int>(priority)
                                          << " with " << candidateIndices.size()

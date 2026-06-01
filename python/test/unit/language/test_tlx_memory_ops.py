@@ -630,15 +630,27 @@ def test_tmem_load_store(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
 def test_tmem_scale_subslice_compile(SCALE_OFFSET):
     SCALE_BLOCK_N = 16
     SCALE_SLICE_N = 8
+    BLOCK_M = 128
+    BLOCK_K = SCALE_BLOCK_N * 32
+    BLOCK_N = 64
 
     @triton.jit
-    def tmem_scale_subslice_compile_kernel(SCALE_OFFSET: tl.constexpr):
+    def tmem_scale_subslice_compile_kernel(BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_N: tl.constexpr,
+                                           SCALE_BLOCK_N: tl.constexpr, SCALE_SLICE_N: tl.constexpr,
+                                           SCALE_OFFSET: tl.constexpr):
+        a_smem = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float8e4nv, tl.constexpr(1))
+        b_smem = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float8e4nv, tl.constexpr(1))
+        acc_tmem = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        a_scale_tmem = tlx.local_alloc((BLOCK_M, SCALE_BLOCK_N), tl.uint8, tl.constexpr(1), tlx.storage_kind.tmem)
+        b_scale_tmem = tlx.local_alloc((BLOCK_N, SCALE_BLOCK_N), tl.uint8, tl.constexpr(1), tlx.storage_kind.tmem)
         scale_smem = tlx.local_alloc((1, 1, 2, 2, 256), tl.uint8, tl.constexpr(1))
-        scale_tmem = tlx.local_alloc((128, SCALE_BLOCK_N), tl.uint8, tl.constexpr(1), tlx.storage_kind.tmem)
-        scale_slice = tlx.subslice(scale_tmem[0], SCALE_OFFSET, SCALE_SLICE_N)
+        scale_slice = tlx.subslice(a_scale_tmem[0], SCALE_OFFSET, SCALE_SLICE_N)
         tlx.tmem_copy(scale_smem[0], scale_slice)
+        tlx.async_dot_scaled(a_smem[0], b_smem[0], acc_tmem[0], a_scale_tmem[0], "e4m3", b_scale_tmem[0], "e4m3",
+                             use_acc=tl.constexpr(False))
 
-    kernel = tmem_scale_subslice_compile_kernel.warmup(SCALE_OFFSET, grid=(1, ))
+    kernel = tmem_scale_subslice_compile_kernel.warmup(BLOCK_M, BLOCK_K, BLOCK_N, SCALE_BLOCK_N, SCALE_SLICE_N,
+                                                       SCALE_OFFSET, grid=(1, ))
     ttgir = kernel.asm["ttgir"]
     subslice_ops = [line.strip() for line in ttgir.splitlines() if "ttng.tmem_subslice" in line]
     copy_ops = [line.strip() for line in ttgir.splitlines() if "ttng.tmem_copy" in line]

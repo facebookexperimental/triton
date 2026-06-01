@@ -27,6 +27,8 @@ std::unique_ptr<Pass> createNVGPUModuloLower();
 void registerNVGPUModuloLower();
 std::unique_ptr<Pass> createNVGPUListSchedule();
 void registerNVGPUListSchedule();
+std::unique_ptr<Pass> createNVGPULLMSchedule();
+void registerNVGPULLMSchedule();
 
 } // namespace mlir
 #endif // DIALECT_NV_TRANSFORMS_PASSES_H_
