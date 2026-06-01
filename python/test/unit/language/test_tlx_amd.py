@@ -1112,8 +1112,8 @@ def test_async_amd_desc_load_preserves_explicit_padded_layout_gfx1250(device, fr
         constexprs={"BLOCK_M": 16, "BLOCK_N": 32},
     )
     ttgir = compiled.asm["ttgir"]
-    assert "ttg.padded_shared<[32:+4]" in ttgir, (
-        "expected explicit padded layout to be preserved in TTGIR, got:\n" + ttgir)
+    assert "ttg.padded_shared<[32:+4]" in ttgir, ("expected explicit padded layout to be preserved in TTGIR, got:\n" +
+                                                  ttgir)
 
 
 @triton.jit
