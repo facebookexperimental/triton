@@ -251,6 +251,10 @@ class HIPBackend(BaseBackend):
         pm.enable_debug()
         emuTF32 = False
         passes.ttgpuir.add_coalesce(pm)
+        if knobs.amd.use_buffer_ops:
+            amd.passes.ttgpuir.add_coalesce_buffer_ops(pm)
+            passes.ttgpuir.add_remove_layout_conversions(pm)
+
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_thread_locality(pm)

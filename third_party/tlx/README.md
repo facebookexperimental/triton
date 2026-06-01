@@ -4,6 +4,90 @@
 
 TLX (Triton Low-level Language Extensions) is a low-level, warp-aware, hardware-near extension of the Triton DSL. It provides intrinsics and warp-specialized operations for fine-grained GPU control, hardware-oriented primitives for advanced kernel development, and explicit constructs for GPU memory, compute, and asynchronous control flow, designed for power users pushing Triton to the metal.
 
+## Buffer Operations (AMD)
+
+Buffer operations access global memory via a scalar base pointer and a tensor of i32 element offsets, rather than a tensor of pointers. This maps directly to AMD's hardware buffer instructions, which use a resource descriptor and byte offsets, enabling the hardware to do out-of-bounds checking and cache optimization.
+
+### `tlx.buffer_load`
+
+Load a tensor of values from global memory.
+
+```python
+result = tlx.buffer_load(ptr, offsets, mask=None, other=None, cache=None)
+```
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `ptr` | scalar pointer | Base address in global memory. |
+| `offsets` | i32 tensor | Per-element byte offsets from `ptr`. |
+| `mask` | bool tensor, optional | When `mask[i]` is `False`, the element is not loaded. |
+| `other` | tensor or scalar, optional | Value used for masked-out elements (where `mask[i]` is `False`). |
+| `cache` | str, optional | Cache modifier (e.g. `".ca"`, `".cg"`). |
+
+**Returns**: A tensor with the same shape as `offsets` and element type matching the pointee type of `ptr`.
+
+Lowers to `amdg.buffer_load`, which is eventually lowered to `rocdl.raw.ptr.buffer.load`.
+
+### `tlx.buffer_store`
+
+Store a tensor of values to global memory.
+
+```python
+tlx.buffer_store(stored_value, ptr, offsets, mask=None, cache=None)
+```
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `stored_value` | tensor | Values to write. |
+| `ptr` | scalar pointer | Base address in global memory. |
+| `offsets` | i32 tensor | Per-element byte offsets from `ptr`. |
+| `mask` | bool tensor, optional | When `mask[i]` is `False`, the element is not written. |
+| `cache` | str, optional | Cache modifier. |
+
+**Returns**: Nothing.
+
+Lowers to `amdg.buffer_store`, which is eventually lowered to `rocdl.raw.ptr.buffer.store`.
+
+### `tlx.buffer_load_to_local`
+
+Async load from global memory directly into shared (local) memory, bypassing registers. This is useful for producer warps that prefetch data into shared memory for other warps to consume.
+
+```python
+token = tlx.buffer_load_to_local(dest, ptr, offsets, mask=None, other=None, cache_modifier="")
+```
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `dest` | `tlx.buffered_tensor` | Destination slice in shared memory. |
+| `ptr` | scalar pointer | Base address in global memory. |
+| `offsets` | i32 tensor | Per-element byte offsets from `ptr`. |
+| `mask` | bool tensor, optional | When `mask[i]` is `False`, the element is not loaded. |
+| `other` | tensor or scalar, optional | Value used for masked-out elements. |
+| `cache_modifier` | str, optional | Cache modifier string (default `""`). |
+
+**Returns**: A `tlx.async_token` that can be used with `tlx.async_load_wait_group()` to synchronize on the completion of the transfer.
+
+Lowers to `amdg.buffer_load_to_local`, which is eventually lowered to `rocdl.raw.ptr.buffer.load.async.lds` — a single hardware instruction that moves data from global memory to LDS without going through VGPRs.
+
+### Example
+
+```python
+import triton.language.extra.tlx as tlx
+
+@triton.jit
+def kernel(src_ptr, dst_ptr, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.arange(0, BLOCK_SIZE).to(tl.int32)
+    mask = offsets < BLOCK_SIZE
+
+    # Load from global memory using buffer semantics
+    data = tlx.buffer_load(src_ptr, offsets, mask=mask, other=0.0)
+
+    # Store to global memory using buffer semantics
+    tlx.buffer_store(data, dst_ptr, offsets, mask=mask)
+```
+
+For the async global-to-shared variant, see the warp-pipeline GEMM example (`third_party/amd/python/examples/gluon/f16_gemm_warp_pipeline_gfx1250.py`).
+
 ## Memory Fences
 
 `tlx.fence(scope)` issues a memory fence. The `scope` argument is required:
