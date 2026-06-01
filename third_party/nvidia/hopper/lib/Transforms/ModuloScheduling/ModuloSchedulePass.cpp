@@ -325,6 +325,7 @@ convertDDGNode(const ttg::DDGNode &ddgNode, unsigned nodeId,
   sn.pipeline = ddgNode.pipeline;
   sn.latency = ddgNode.latency;
   sn.selfLatency = ddgNode.selfLatency;
+  sn.minWarps = ddgNode.minWarps;
 
   auto cycleIt = sched.nodeToCycle.find(ddgNode.idx);
   if (cycleIt != sched.nodeToCycle.end()) {
