@@ -27,7 +27,6 @@ POWER_CAP=$(awk -v d="$DESIRED_POWER" -v m="$MAX_POWER" 'BEGIN {print (d < m ? d
 echo "Locking GPU $CUDA_VISIBLE_DEVICES power cap to $POWER_CAP W"
 echo "Locking GPU $CUDA_VISIBLE_DEVICES frequency cap to $MAX_SM_CLOCK Hz"
 
-# 1335, 1980
 # Lock GPU clocks
 (
     sudo nvidia-smi -i "$CUDA_VISIBLE_DEVICES" -pm 1                # persistent mode
@@ -35,8 +34,8 @@ echo "Locking GPU $CUDA_VISIBLE_DEVICES frequency cap to $MAX_SM_CLOCK Hz"
     sudo nvidia-smi -lgc $MAX_SM_CLOCK -i "$CUDA_VISIBLE_DEVICES"
 ) >/dev/null
 
-# TODO: On my devgpu, device 6 is apparently attached to NUMA node 3.  How did
-# I discover this?
+# TODO: Automate NUMA node detection. On one devgpu, device 6 is attached to
+# NUMA node 3. This is how to discover that mapping:
 #
 # `nvidia-smi -i 6 -pm 1` prints the PCI bus ID (00000000:C6:00.0)
 #

@@ -34,10 +34,9 @@ StorageAliasSpecType::verify(function_ref<InFlightDiagnostic()> emitError,
 
 //-- ReuseGroupType --
 
-LogicalResult
-ReuseGroupType::verify(function_ref<InFlightDiagnostic()> emitError,
-                       ReuseGroupKind groupKind) {
-  // No additional verification needed - groupKind is validated by the enum
+LogicalResult ReuseGroupType::verify(function_ref<InFlightDiagnostic()>,
+                                     ReuseGroupKind) {
+  // No additional verification needed; the enum validates groupKind.
   return success();
 }
 

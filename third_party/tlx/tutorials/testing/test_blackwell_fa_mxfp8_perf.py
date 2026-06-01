@@ -20,13 +20,13 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from triton._internal_testing import is_blackwell
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
-"""
-Benchmarks for the TLX MXFP8 flash attention forward and backward kernels.
-Run with: third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_blackwell_fa_mxfp8_perf.py --mode fwd
-          third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_blackwell_fa_mxfp8_perf.py --mode bwd
 
-Facebook: If you are developing in fbsource, use tritonbench instead to collect perf numbers.
-"""
+# Benchmarks for the TLX MXFP8 flash attention forward and backward kernels.
+# Run with:
+#   third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_blackwell_fa_mxfp8_perf.py --mode fwd
+#   third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_blackwell_fa_mxfp8_perf.py --mode bwd
+#
+# Facebook: If you are developing in fbsource, use tritonbench instead to collect perf numbers.
 
 
 def _setup_bwd_inputs(shape, sm_scale, dtype):
@@ -172,7 +172,10 @@ def create_benchmark(mode="fwd"):
         flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
         # fwd: 2 matmuls (QK, PV). bwd: 5 matmuls (QK^T, V·dO^T, P^T·dO, dS^T·Q, dS_trans·K)
         total_flops = 2 * flops_per_matmul if mode == "fwd" else 5 * flops_per_matmul
-        perf = lambda ms: total_flops * 1e-12 / (ms * 1e-3)
+
+        def perf(ms):
+            return total_flops * 1e-12 / (ms * 1e-3)
+
         return perf(ms), perf(max_ms), perf(min_ms)
 
     return benchmark

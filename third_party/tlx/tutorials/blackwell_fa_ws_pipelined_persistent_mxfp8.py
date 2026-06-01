@@ -136,7 +136,7 @@ def _apply_causal_mask(qk, col_limit_right, BLOCK_N: tl.constexpr):
     # Credit to Tri Dao,
     # https://github.com/Dao-AILab/flash-attention/commit/bac1001e4f6caa09d70537495d6746a685a2fa78
     #
-    # NOTE: We use map_elementiwse here in order to generate an interleaved sequence of instructions
+    # NOTE: We use map_elementwise here in order to generate an interleaved sequence of instructions
     # that processes one element of qk at a time. This improves ptxas's resulting SASS.
     offs_n = tl.arange(0, BLOCK_N)[None, :]
     s = offs_n & ~0xF

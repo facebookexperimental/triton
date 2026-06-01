@@ -254,13 +254,13 @@ def _attn_fwd_clc(
     V_BYTES_PER_ELEM: tl.constexpr = tlx.size_of(tlx.dtype_of(desc_v))
     qk_dtype = tl.float32
 
-    # CLC replaces static tile distribution
+    # CLC replaces static tile distribution.
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(N_CTX, BLOCK_M)
     num_pid_n = Z * H
     num_pid_in_group = num_pid_m * GROUP_SIZE_N
 
-    # allocate SMEM buffers and barriers
+    # Allocate SMEM buffers and barriers.
     q_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_q), NUM_MMA_GROUPS * NUM_BUFFERS_Q)
     kv_tiles = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
     o_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_o), NUM_MMA_GROUPS)
@@ -271,7 +271,7 @@ def _attn_fwd_clc(
     kv_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     o_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
 
-    # TMEM storage aliasing for QK/P/alpha/l/m
+    # TMEM storage aliasing for QK/P/alpha/l/m.
     qk_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
     qk_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), qk_dtype, NUM_MMA_GROUPS, tlx.storage_kind.tmem,
                                reuse=qk_storage_alias)
@@ -356,7 +356,7 @@ def _attn_fwd_clc(
                 tlx.clc_producer(clc_context, clc_phase_producer)
                 clc_phase_producer ^= 1
 
-                # initialize offsets
+                # Initialize offsets.
                 start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
                     tile_id,
                     H,
@@ -455,7 +455,7 @@ def _attn_fwd_clc(
             tile_id = start_pid
             clc_phase_consumer = 0
             while tile_id != -1:
-                # initialize offsets
+                # Initialize offsets.
                 start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
                     tile_id,
                     H,
@@ -466,7 +466,7 @@ def _attn_fwd_clc(
                     STAGE,
                     GROUP_SIZE_N,
                 )
-                # initialize pointer to m and l
+                # Initialize m and l.
                 m_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32) - float("inf")
                 l_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32) + 1.0
                 acc = tl.zeros([BLOCK_M_SPLIT, HEAD_DIM], dtype=tl.float32)
@@ -526,7 +526,7 @@ def _attn_fwd_clc(
                         RESCALE_OPT=RESCALE_OPT,
                     )
 
-                # prepare l_i for the epilog
+                # Prepare l_i for the epilog.
                 tlx.local_store(l_tiles[cid], l_i[:, None])
                 tlx.local_store(m_tiles[cid], m_i[:, None])
                 tlx.barrier_arrive(l_fulls[cid])
@@ -542,7 +542,7 @@ def _attn_fwd_clc(
             tile_id = start_pid
             clc_phase_consumer = 0
             while tile_id != -1:
-                # initialize offsets
+                # Initialize offsets.
                 _, _, lo, hi, _, _ = _compute_offsets(
                     tile_id,
                     H,
@@ -723,7 +723,7 @@ def _attn_fwd_clc(
             tile_id = start_pid
             clc_phase_consumer = 0
             while tile_id != -1:
-                # initialize offsets
+                # Initialize offsets.
                 _, _, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
                     tile_id,
                     H,
@@ -809,7 +809,7 @@ def _attn_fwd_clc(
             tile_id = start_pid
             clc_phase_consumer = 0
             while tile_id != -1:
-                # initialize offsets
+                # Initialize offsets.
                 _, _, _, _, qo_offset_y, _ = _compute_offsets(
                     tile_id,
                     H,

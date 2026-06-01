@@ -718,9 +718,10 @@ LocalAllocInfo analyzeLocalAlloc(Operation *localAllocOp) {
 
 // Check if an operation should be skipped because it's folded into
 // a barrier alloc or not meaningful in TLX output
-bool shouldSkipOp(Operation *op,
-                  const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
-                  llvm::DenseSet<Operation *> &skippedOps) {
+bool shouldSkipOp(
+    Operation *op,
+    const DenseMap<Operation *, LocalAllocInfo> & /*allocInfoMap*/,
+    llvm::DenseSet<Operation *> &skippedOps) {
   StringRef opName = op->getName().getStringRef();
 
   // Operations to skip in TLX output:
@@ -772,36 +773,6 @@ bool shouldSkipOp(Operation *op,
       }
     }
     return true;
-  }
-
-  // Skip memdesc_index that are only used by init_barrier for barrier allocs
-  if (opName == "ttg.memdesc_index") {
-    // Check if operand comes from a barrier alloc
-    if (op->getNumOperands() > 0) {
-      Value src = op->getOperand(0);
-      if (Operation *srcOp = src.getDefiningOp()) {
-        if (srcOp->getName().getStringRef() == "ttg.local_alloc") {
-          auto it = allocInfoMap.find(srcOp);
-          if (it != allocInfoMap.end() && it->second.isBarrierAlloc) {
-            // Check if all uses of this memdesc_index are init_barrier
-            bool allUsesAreInitBarrier = true;
-            for (Value result : op->getResults()) {
-              for (Operation *user : result.getUsers()) {
-                if (user->getName().getStringRef() != "ttng.init_barrier") {
-                  allUsesAreInitBarrier = false;
-                  break;
-                }
-              }
-              if (!allUsesAreInitBarrier)
-                break;
-            }
-            if (allUsesAreInitBarrier) {
-              return true;
-            }
-          }
-        }
-      }
-    }
   }
 
   return skippedOps.count(op) > 0;

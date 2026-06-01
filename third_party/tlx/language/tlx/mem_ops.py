@@ -1034,8 +1034,6 @@ def async_descriptor_store(
         f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'")
     assert store_reduce in ("", "add", "min", "max", "and", "or", "xor"), (
         f"store_reduce must be '', 'add', 'min', 'max', 'and', 'or', or 'xor', got '{store_reduce}'")
-    from triton._C.libtriton import ir
-
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
     source_handle = require_nv_mma_shared_layout(source, True, _semantic.builder)

@@ -11,13 +11,13 @@ A critical issue arises when TLX functions are defined separately from their cal
 2. **Inlined context**: After function inlining, the same code may execute in a different context (e.g., inside a `tlx.async_task` region) where the **effective `num_warps` is different** from the global value.
 
 This mismatch causes incorrect or inconsistent layouts. For example:
-- A function lowered with `num_warps=4` at the global level
-- Gets inlined into an `async_task` that executes with `num_warps=2`
-- The pre-computed layout is now wrong for the actual execution context
+- A function is lowered with `num_warps=4` at the global level.
+- The function is inlined into an `async_task` that executes with `num_warps=2`.
+- The precomputed layout is now wrong for the actual execution context.
 
 **Solution**: We use **placeholder (dummy) layouts** during initial lowering that defer the actual layout computation until after function inlining. A dedicated pass (`TLXResolvePlaceholderLayouts`) then resolves these placeholders to concrete layouts when the correct `num_warps` and other context information is available.
 
-Right now we have only implemented the placeholder layouts for TMEM dependent layouts, which is the requirement for Flash Attention Backwards.
+Currently, placeholder layouts are implemented only for TMEM-dependent layouts, which Flash Attention Backward requires.
 
 ---
 
@@ -33,12 +33,11 @@ The placeholder layout system consists of three components:
 
 ## Placeholder Layout Types
 
-We define one placeholder layout types, organized by memory space and use case:
+We define one placeholder layout type, organized by memory space and use case:
 
 | Placeholder Type | Memory Space | Resolves To |
 |------------------|--------------|-------------|
 | `DummyRegisterLayoutAttr` | Registers | `BlockedEncodingAttr` |
-
 
 ### IR Examples
 
@@ -101,7 +100,7 @@ The placeholder layout attributes are defined in `TLXAttrDefs.td`:
 
 ```tablegen
 def TLX_DummyRegisterLayoutAttr : TLX_Attr<"DummyRegisterLayout", []> {
-  llet parameters = (ins
+  let parameters = (ins
     ArrayRefParameter<"int64_t">:$shape,
     "Type":$elementType,
     "bool":$tmemCompatible

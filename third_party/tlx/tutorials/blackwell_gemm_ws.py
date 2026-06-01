@@ -824,7 +824,6 @@ def _process_tile_epilogue_inner(
 
 @triton.jit
 def _process_tile_mma_inner(
-    k_tiles,
     k_tile_start,
     k_tile_end,
     NUM_SMEM_BUFFERS,
@@ -1291,7 +1290,6 @@ def matmul_kernel_tma_ws_blackwell(
                 if k_tile_end > k_tile_start:
                     cur_tmem_buf, tmem_write_phase = get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
                     smem_accum_cnt = _process_tile_mma_inner(
-                        k_tiles=k_tiles_total,
                         k_tile_start=k_tile_start,
                         k_tile_end=k_tile_end,
                         NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS,

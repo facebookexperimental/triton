@@ -1,7 +1,4 @@
 #include "IR/Dialect.h"
-#include "mlir/Analysis/SliceAnalysis.h"
-#include "mlir/Transforms/DialectConversion.h"
-#include "mlir/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
@@ -153,8 +150,7 @@ LogicalResult rewriteLocalAlias(ModuleOp m) {
   for (auto &kv : aliasClasses) {
     // Replace the base alloc op with the new one if it exists.
     Operation *baseAllocOp = kv.first;
-    if (allocToNewAlloc.count(baseAllocOp)) {
-      auto newAllocOp = allocToNewAlloc[baseAllocOp];
+    if (Operation *newAllocOp = allocToNewAlloc.lookup(baseAllocOp)) {
       // Create a memdesc reinterpret op to convert the new alloc to the base
       // alloc
       LLVM_DEBUG({
@@ -166,8 +162,6 @@ LogicalResult rewriteLocalAlias(ModuleOp m) {
       });
 
       builder.setInsertionPoint(baseAllocOp);
-      auto newAllocType =
-          dyn_cast<ttg::MemDescType>(newAllocOp->getResult(0).getType());
       auto baseAllocType =
           dyn_cast<ttg::MemDescType>(baseAllocOp->getResult(0).getType());
       auto newAllocToBaseAllocOp = ttg::MemDescReinterpretOp::create(
