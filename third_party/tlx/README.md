@@ -143,6 +143,13 @@ contiguous accumulator state (better register reuse for preshuffled
 MXFP scales, fewer warp-level reductions), at the cost of more registers
 per warp.
 
+Together, `instrShape`, `warpsPerCTA`, and `tiles_per_warp` define the M/N
+extent of one CTA-level WMMA layout period:
+`period[d] = instrShape[d] * warpsPerCTA[d] * tiles_per_warp[d]`. If the result
+tile is larger than this period, the period repeats. The K entry of
+`instrShape` is the per-instruction reduction depth and is handled separately
+from this M/N tiling.
+
 `tiles_per_warp` is validated by `AccelerateAMDMatmul`: it must have one
 entry per result-tile dim, each entry must be positive, and
 `instrShape[d] * warpsPerCTA[d] * tiles_per_warp[d]` must fit in the result
