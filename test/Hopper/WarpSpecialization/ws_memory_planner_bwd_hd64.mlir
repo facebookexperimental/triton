@@ -7,12 +7,12 @@
 // 128x128 tmem buffers (buffer ID and offset may vary).
 //
 // CHECK-LABEL: tt.func public @_attn_bwd
-// CHECK: %dq, %dq_0 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = {{[0-9]+}} : i32, buffer.offset = {{[0-9]+}} : i32}
-// CHECK: %dpT, %dpT_1 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 8 : i32}
-// CHECK: %dv = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 0 : i32}
-// CHECK: %qkT, %qkT_2 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 7 : i32}
-// CHECK: %dv_3, %dv_4 = ttng.tmem_alloc {{{.*}}buffer.copy = 2 : i32, buffer.id = 6 : i32}
-// CHECK: %dk, %dk_5 = ttng.tmem_alloc {{{.*}}buffer.copy = 2 : i32, buffer.id = 5 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = {{[0-9]+}} : i32, buffer.offset = {{[0-9]+}} : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 8 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 0 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 7 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {{{.*}}buffer.copy = 2 : i32, buffer.id = 6 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {{{.*}}buffer.copy = 2 : i32, buffer.id = 5 : i32}
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>

@@ -30,52 +30,52 @@
 // CHECK-LABEL: tt.func public @_attn_fwd_persist
 //
 // SMEM allocations
-// CHECK: %_1 = ttg.local_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 0 : i32}
-// CHECK: %_0 = ttg.local_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 1 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 0 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 1 : i32}
 //
 // TMEM allocations: acc_1 (f16) reuses qk_1's buffer at offset 0
-// CHECK: %acc_1 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 0 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 0 : i32}
 //
 // TMEM allocations: acc_0 (f16) reuses qk_0's buffer at offset 0
-// CHECK: %acc_0 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 0 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 0 : i32}
 //
 // TMEM allocations: alpha_1 packed in buffer 8 at offset 64
-// CHECK: %alpha_1, %alpha_1_0 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 64 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 64 : i32}
 //
 // TMEM allocations: alpha_0 packed in buffer 7 at offset 64
-// CHECK: %alpha_0, %alpha_0_1 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 64 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 64 : i32}
 //
 // TMEM allocations: qk_1 owns buffer 8
-// CHECK: %qk_1, %qk_1_2 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32}
 //
 // TMEM allocations: qk_0 owns buffer 7
-// CHECK: %qk_0, %qk_0_3 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32}
 //
 // SMEM allocations: v and k get copy=3 with num-buffers=3, sharing buffer.id=2
-// CHECK: %v = ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 2 : i32}
-// CHECK: %k = ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 2 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 2 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 2 : i32}
 //
 // TMEM allocations: m_ij_1 packed in buffer 8 at offset 65
-// CHECK: %m_ij_1, %m_ij_1_4 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 65 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 65 : i32}
 //
 // TMEM allocations: l_i0_0 packed in buffer 8 at offset 66
-// CHECK: %l_i0_0, %l_i0_0_5 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 66 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 66 : i32}
 //
 // TMEM allocations: m_ij_0 packed in buffer 7 at offset 65
-// CHECK: %m_ij_0, %m_ij_0_6 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 65 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 65 : i32}
 //
 // TMEM allocations: l_i0_1 packed in buffer 7 at offset 66
-// CHECK: %l_i0_1, %l_i0_1_7 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 66 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 66 : i32}
 //
 // TMEM allocations: acc_1_8 (f32 accumulator) owns buffer 6
-// CHECK: %acc_1_8, %acc_1_9 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 6 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 6 : i32}
 //
 // TMEM allocations: acc_0_10 (f32 accumulator) owns buffer 5
-// CHECK: %acc_0_10, %acc_0_11 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 5 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 5 : i32}
 //
 // SMEM allocations: query buffers
-// CHECK: %q0_1 = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 3 : i32}
-// CHECK: %q0_0 = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 3 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32}
 
 // -----// WarpSpec internal IR Dump After: doBufferAllocation
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>

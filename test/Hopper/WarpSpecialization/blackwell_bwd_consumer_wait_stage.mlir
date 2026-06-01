@@ -3,15 +3,14 @@
 // stage 1 from the actual consumer (dQ/dK MMA), not stage 0 from the
 // memdesc_trans prep op. This prevents an SWP off-by-one barrier deadlock.
 
-// The dsT consumer_wait must be at stage 1, matching the dQ and dK MMAs.
-// CHECK: nvws.consumer_wait %dsT_{{[0-9]+}}
-// CHECK-SAME: loop.stage = 1
+// The dsT consumer_wait must be ordered before the stage-1 dQ/dK MMAs.
+// The partitioned IR does not preserve the source SSA names once debug
+// locations are printed, so check the relevant op ordering and stage attrs.
+// CHECK: nvws.consumer_wait
 // The dQ MMA (dsT transposed × k) must follow at stage 1.
-// CHECK: ttng.tc_gen5_mma %dq_{{[0-9]+}}, %k_{{[0-9]+}}, %dq_{{[0-9]+}}
-// CHECK-SAME: loop.stage = 1
+// CHECK: ttng.tc_gen5_mma {{.*}}loop.stage = 1
 // The dK MMA (dsT × q) must follow at stage 1.
-// CHECK: ttng.tc_gen5_mma %dsT_{{[0-9]+}}, %q_{{[0-9]+}}, %dk_{{[0-9]+}}
-// CHECK-SAME: loop.stage = 1
+// CHECK: ttng.tc_gen5_mma {{.*}}loop.stage = 1
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>

@@ -16,35 +16,35 @@
 // CHECK-LABEL: tt.func public @_attn_bwd_persist
 //
 // TMEM allocation: dq reuses dpT (buffer.id=8, buffer.offset=0)
-// CHECK: %dq, %dq_0 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 0 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 0 : i32}
 //
 // SMEM allocation: dsT (non-TMA, non-cross-stage)
-// CHECK: %dsT = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 0 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 0 : i32}
 //
 // TMEM allocation: dpT owns buffer 8
-// CHECK: %dpT, %dpT_1 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32}
 //
 // TMEM allocation: dv (f16) reuses qkT (buffer.id=7, buffer.offset=0)
-// CHECK: %dv = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 0 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 0 : i32}
 //
 // SMEM allocation: do is cross-stage TMA, gets copy=2
-// CHECK: %do = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 1 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 1 : i32}
 //
 // TMEM allocation: qkT owns buffer 7
-// CHECK: %qkT, %qkT_2 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32}
 //
 // SMEM allocation: q stays at copy=1 (budget limit)
-// CHECK: %q = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 2 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 2 : i32}
 //
 // TMEM allocation: dv_3 (f32 accumulator) owns buffer 6
-// CHECK: %dv_3, %dv_4 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 6 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 6 : i32}
 //
 // TMEM allocation: dk owns buffer 5
-// CHECK: %dk, %dk_5 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 5 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 5 : i32}
 //
 // SMEM: v and k are not innermost, copy=1
-// CHECK: %v = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 3 : i32}
-// CHECK: %k = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 3 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32}
 
 // Regression test: Code partition must emit tc_gen5_commit ops with raw
 // barrier allocs (1x1xi64), NOT indexed barriers via memdesc_index or

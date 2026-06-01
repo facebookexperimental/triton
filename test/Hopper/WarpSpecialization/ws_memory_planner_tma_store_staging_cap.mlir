@@ -16,10 +16,10 @@
 // CHECK-LABEL: tt.func public @_attn_bwd_persist
 
 // Inner-loop channel allocs — unchanged by the fix:
-// CHECK: %dsT = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32}
-// CHECK: %q = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 1 : i32}
-// CHECK: %v = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 3 : i32}
-// CHECK: %k = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 0 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 1 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 3 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 0 : i32}
 
 // TMA store staging allocs: emit current attributes (cap-to-1 not currently
 // enforced; see PSM-related design discussion).

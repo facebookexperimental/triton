@@ -13,9 +13,9 @@
 // shared token prevents dq's old data from being overwritten before it
 // is consumed.
 //
-// CHECK: nvws.producer_acquire {{.*}}%dq_{{[0-9]+}}, %dq_{{[0-9]+}}
-// CHECK: nvws.producer_acquire {{.*}}%dpT_{{[0-9]+}}, %dpT_{{[0-9]+}}
-// CHECK: %dpT_{{[0-9]+}} = ttng.tc_gen5_mma
+// CHECK: nvws.producer_acquire {{.*}}dstTask = 0 : i32{{.*}}loop.cluster = 2 : i32, loop.stage = 0 : i32
+// CHECK: nvws.producer_acquire {{.*}}dstTask = 3 : i32{{.*}}loop.cluster = 2 : i32, loop.stage = 0 : i32
+// CHECK: {{%[A-Za-z0-9_]+}} = ttng.tc_gen5_mma {{.*}}loop.cluster = 2 : i32, loop.stage = 0 : i32
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>

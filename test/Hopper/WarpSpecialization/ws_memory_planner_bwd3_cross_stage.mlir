@@ -26,19 +26,19 @@
 // CHECK-LABEL: tt.func public @_attn_bwd_persist
 //
 // SMEM allocation: dsT - actual consumers both at stage 1, NOT cross-stage
-// CHECK: %dsT = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 0 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 0 : i32}
 //
 // SMEM allocation: do (TMA buffer)
-// CHECK: %do = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 1 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 1 : i32}
 //
 // SMEM allocation: q has actual consumers at stages 0 and 1, IS cross-stage
-// CHECK: %q = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 2 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 2 : i32}
 //
 // SMEM: v is not innermost, copy=1
-// CHECK: %v = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 3 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 3 : i32}
 //
 // SMEM: k store is outside innermost loop (no loop.stage), NOT cross-stage
-// CHECK: %k = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32}
 
 // -----// WarpSpec internal IR Dump After: doBufferAllocation
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>

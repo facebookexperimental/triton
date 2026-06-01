@@ -33,37 +33,37 @@
 // CHECK-LABEL: tt.func public @_attn_bwd_persist
 //
 // TMEM: dq pre-assigned by annotation (opndD) → buffer.id=5, reuses dpT
-// CHECK: %dq, %dq_{{[0-9]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 5 : i32, buffer.offset = 0 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 5 : i32, buffer.offset = 0 : i32}
 //
 // SMEM: dsT pinned by annotation (dq opndA) → buffer.id=8, buffer.copy=1
-// CHECK: %dsT = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32}
 //
 // TMEM: dpT pre-assigned by annotation (opndD) → buffer.id=5 (owner)
-// CHECK: %dpT, %dpT_{{[0-9]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 5 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 5 : i32}
 //
 // TMEM: ppT pre-assigned by annotation (dv opndA) → buffer.id=2, reuses qkT
-// CHECK: %ppT = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 2 : i32, buffer.offset = 0 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 2 : i32, buffer.offset = 0 : i32}
 //
 // SMEM: do pinned by annotation (dpT opndB) → buffer.id=4, buffer.copy=1
-// CHECK: %do = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32}
 //
 // TMEM: qkT pre-assigned by annotation (opndD) → buffer.id=2 (owner)
-// CHECK: %qkT, %qkT_{{[0-9]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 2 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 2 : i32}
 //
 // SMEM: q pinned by annotation (qkT opndB) → buffer.id=1, buffer.copy=2
-// CHECK: %q = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 1 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 1 : i32}
 //
 // TMEM: dv pre-assigned by annotation (opndD) → buffer.id=7
-// CHECK: %dv, %dv_{{[0-9]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32}
 //
 // TMEM: dk pre-assigned by annotation (opndD) → buffer.id=10
-// CHECK: %dk, %dk_{{[0-9]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 10 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}}, {{%[A-Za-z0-9_]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 10 : i32}
 //
 // SMEM: v pinned by annotation (dpT opndA) → buffer.id=3, buffer.copy=1
-// CHECK: %v = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 3 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 3 : i32}
 //
 // SMEM: k pinned by annotation (qkT opndA) → buffer.id=0, buffer.copy=1
-// CHECK: %k = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 0 : i32}
+// CHECK: {{%[A-Za-z0-9_]+}} = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 0 : i32}
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
