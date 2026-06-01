@@ -253,8 +253,11 @@ buildBarrierToMemoryOpMap(Block &block) {
 
 // After tmem_load sinking, relocate WS barriers back to optimal positions
 // relative to their associated memory ops. Arrives go right after their memory
-// op, or after later same-block operand definitions required by SSA. Waits go
-// right before their memory op. Skips moves that would break SSA dominance.
+// op, or after later same-block operand definitions required by SSA. Waits may
+// move earlier to guard their memory op, but must not be sunk later: one wait
+// can guard multiple later memory ops, and sinking it to a single recorded op
+// can let another guarded op execute before the wait. Skips moves that would
+// break SSA dominance.
 inline void optimizeWSBarrierLocations(
     const DenseMap<Operation *, Operation *> &barrierToMemOp) {
   for (auto [barrier, memOp] : barrierToMemOp) {
@@ -268,7 +271,7 @@ inline void optimizeWSBarrierLocations(
           barrier->moveAfter(anchor);
       }
     } else {
-      if (barrier->getNextNode() != memOp) {
+      if (memOp->isBeforeInBlock(barrier)) {
         if (!wouldBreakOperandDominance(barrier, memOp))
           barrier->moveBefore(memOp);
       }

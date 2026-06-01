@@ -426,7 +426,8 @@ tt.func @tmem_load_does_not_sink_with_later_wait_region(
 }
 
 // All split tmem_loads should inherit the channelGraph from their arrive
-// barrier and sink past store-channel barriers independently.
+// barrier and sink past store-channel barriers independently, without sinking
+// their shared wait below either guarded load.
 // CHECK-LABEL: @split_tmem_loads_all_sink
 tt.func @split_tmem_loads_all_sink(
     %tmem_wait_bar: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
@@ -459,19 +460,20 @@ tt.func @split_tmem_loads_all_sink(
   ttg.local_store %t1, %smem_buf : tensor<128x64xf16, #linear64> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
   ttng.arrive_barrier %store_bar1, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 2>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
 
-  // Expected: both tmem_loads sink past the store waits, interleaved with
-  // the store pipeline.
+  // Expected: both tmem_loads are interleaved with the store pipeline, but the
+  // tmem_load wait remains before both guarded loads. A single wait can guard
+  // multiple split loads, so it cannot be restored to just one recorded load.
   //
   // CHECK:      ttng.wait_barrier %{{.*}}, %{{.*}} :
+  // CHECK-NEXT: ttng.wait_barrier {{.*}}channelGraph = array<i32: 2>
   // CHECK-NEXT: ttng.tmem_load
   // CHECK-NEXT: arith.truncf
-  // CHECK-NEXT: ttng.wait_barrier {{.*}}channelGraph = array<i32: 2>
   // CHECK-NEXT: ttg.local_store
   // CHECK-NEXT: ttng.arrive_barrier {{.*}}channelGraph = array<i32: 2>
+  // CHECK-NEXT: ttng.wait_barrier {{.*}}channelGraph = array<i32: 2>
   // CHECK-NEXT: ttng.tmem_load
   // CHECK-NEXT: ttng.arrive_barrier {{.*}}channelGraph = array<i32: 1, 3>
   // CHECK-NEXT: arith.truncf
-  // CHECK-NEXT: ttng.wait_barrier {{.*}}channelGraph = array<i32: 2>
   // CHECK-NEXT: ttg.local_store
   // CHECK-NEXT: ttng.arrive_barrier {{.*}}channelGraph = array<i32: 2>
   tt.return
