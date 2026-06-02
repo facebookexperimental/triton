@@ -10,6 +10,8 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/Debug.h"
 
+#include <tuple>
+
 #define DEBUG_TYPE "tlx-storage-alias-lowering"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
@@ -24,16 +26,17 @@ namespace tlx {
 
 #include "tlx/dialect/include/Transforms/Passes.h.inc"
 
+using StorageAliasOffsetMap =
+    DenseMap<Value, std::tuple<int64_t, int64_t, int64_t>>;
+
 // Forward declarations of functions from the individual passes
 LogicalResult computeOrValidateStorageAliasSizes(ModuleOp m);
-LogicalResult processBufferOverlapOps(
-    ModuleOp m,
-    DenseMap<Value, std::tuple<int64_t, int64_t, int64_t>> &offsetMap);
-LogicalResult materializeStorageAliasAllocations(
-    ModuleOp m,
-    const DenseMap<Value, std::tuple<int64_t, int64_t, int64_t>> &offsetMap,
-    DenseMap<Value, std::tuple<int64_t, int64_t, int64_t>>
-        &localAliasOffsetMap);
+LogicalResult processBufferOverlapOps(ModuleOp m,
+                                      StorageAliasOffsetMap &offsetMap);
+LogicalResult
+materializeStorageAliasAllocations(ModuleOp m,
+                                   const StorageAliasOffsetMap &offsetMap,
+                                   StorageAliasOffsetMap &localAliasOffsetMap);
 
 struct TLXStorageAliasLoweringPass
     : public impl::TLXStorageAliasLoweringBase<TLXStorageAliasLoweringPass> {
@@ -60,26 +63,21 @@ public:
     // The computed offsets are returned in a map to be applied during
     // materialization.
     LDBG("Step 2: Processing buffer overlap operations");
-    DenseMap<Value, std::tuple<int64_t, int64_t, int64_t>> offsetMap;
-    if (failed(processBufferOverlapOps(m, offsetMap))) {
+    StorageAliasOffsetMap bufferOverlapOffsets;
+    if (failed(processBufferOverlapOps(m, bufferOverlapOffsets))) {
       signalPassFailure();
       return;
     }
 
     // Step 3: Materialize storage alias allocations
     // This creates LocalAllocOp/TMEMAllocOp and LocalAliasOp.
-    // The computed offsets are stored in localAliasOffsetMap for later use.
     LDBG("Step 3: Materializing storage alias allocations");
-    DenseMap<Value, std::tuple<int64_t, int64_t, int64_t>> localAliasOffsetMap;
-    if (failed(materializeStorageAliasAllocations(m, offsetMap,
+    StorageAliasOffsetMap localAliasOffsetMap;
+    if (failed(materializeStorageAliasAllocations(m, bufferOverlapOffsets,
                                                   localAliasOffsetMap))) {
       signalPassFailure();
       return;
     }
-
-    // Note: localAliasOffsetMap contains the buffer layout information for
-    // LocalAliasOps that have custom offsets (from set_buffer_overlap).
-    // This can be used in a future Step 4 for Phase 6 implementation.
 
     LDBG("TLXStorageAliasLowering completed successfully");
   }

@@ -41,7 +41,7 @@ def compute_multi_cta_sum(
     local_partial_sum = tl.sum(x, axis=1, keep_dims=True)
     # store local sum to shmem and read it back in cluster_rank order
     # in the second (final_sum) loop. This is required to preserve
-    # preserve the order of the reduction, without using a branch in
+    # the order of the reduction, without using a branch in
     # the final_sum loop.
     tlx.local_store(local_buff[cta_cluster_rank], local_partial_sum)
 
@@ -325,7 +325,7 @@ def test_op(M, N, dtype):
     output_torch = torch_layernorm(x, weight, bias, eps)
 
     # TLX implementation
-    output_triton, mean_triton, rstd_triton = multi_cta_layernorm(x, weight, bias, eps)
+    output_triton, _, _ = multi_cta_layernorm(x, weight, bias, eps)
 
     # Check output
     rtol = 1e-2 if dtype == torch.float16 else 1e-3

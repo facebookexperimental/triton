@@ -295,8 +295,7 @@ class Autotuner(KernelInterface):
                     if len(_padded) < len(self.fn.params):
                         _padded = _padded + (None, ) * (len(self.fn.params) - len(_padded))
                     native_fast_dispatch_insert(self.fn, _padded, self.fn.params, self.fn._fc_options_hash, kernel,
-                                                _disp,
-                                                getattr(kernel, '_dispatch_arg_indices', None))
+                                                _disp, getattr(kernel, '_dispatch_arg_indices', None))
             self._fc_seeded.add(_seed_key)
             return kernel
 

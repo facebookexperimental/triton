@@ -11,7 +11,6 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 def _host_descriptor_pre_hook(nargs):
     BLOCK_M = nargs["BLOCK_M"]
     BLOCK_N = nargs["BLOCK_N"]
-    HEAD_DIM = nargs["HEAD_DIM"]
     if not isinstance(nargs["desc_q"], TensorDescriptor):
         return
     HEAD_DIM = nargs["HEAD_DIM"]
@@ -146,7 +145,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 # Consumer 1 signals barrier 9 to unblock Consumer 0.
                 tlx.named_barrier_arrive(9, 256)
 
-            # wait for the MMA using to complete
+            # wait for the MMA to complete
             qk = tlx.async_dot_wait(0, qk)
             # release the K buffer
             tlx.barrier_arrive(k_empties[k_buf_id], 1)
@@ -233,7 +232,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
             # prepare p and v for the dot
             p = p.to(tlx.dtype_of(desc_k))
             acc = tlx.async_dot(p, v_tiles[v_buf_id], acc)
-            # wait for the MMA using to complete
+            # wait for the MMA to complete
             acc = tlx.async_dot_wait(0, acc)
             # release the V buffer
             tlx.barrier_arrive(v_empties[v_buf_id], 1)

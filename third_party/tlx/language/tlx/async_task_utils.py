@@ -13,7 +13,7 @@ class async_task:
 
     def __init__(self, *args, _builder=None, **kwargs):
         self.builder = _builder
-        # Handle the optional positional argument like [0]
+        # Handle either an explicit default task or a task id list.
         self.is_default = False
         self.is_explict = False
         self.task_ids = None
@@ -48,9 +48,6 @@ class async_task:
 
 
 class async_tasks:
-
-    def __init__(self):
-        pass
 
     def __enter__(self):
         return self

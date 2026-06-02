@@ -1,15 +1,15 @@
+from typing import Optional
+
 import torch
 
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
-from typing import Optional
-
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
-def alloc_fn(size: int, align: int, stream: Optional[int]):
+def alloc_fn(size: int, align: int, stream: Optional[int]) -> torch.Tensor:
     assert align == 128
     assert stream == 0
     return torch.empty(size, dtype=torch.int8, device="cuda")

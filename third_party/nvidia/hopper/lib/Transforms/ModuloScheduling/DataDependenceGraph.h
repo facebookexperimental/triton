@@ -23,13 +23,36 @@ struct DDGNode {
   HWPipeline pipeline{HWPipeline::NONE};
   int latency{};
   int selfLatency{};
-  int transferLatency{};
+  // Min warps assumed by the modeled `selfLatency`. If the containing WG has
+  // fewer warps, effective selfLat scales up by minWarps/actualWarps. See
+  // `notes/latency_vs_selflatency.md` and `LatencyModel::getMinWarps`.
+  int minWarps{1};
   bool isSuperNode{false}; // True if this node represents an inner loop
   int innerII{0};          // If super-node, the inner loop's II
   int prologueLatency{0};  // If super-node, cycles before TC starts (MEM busy)
   llvm::SmallVector<unsigned> succs;
   llvm::SmallVector<unsigned> preds;
 };
+
+/// How many cycles this op holds its pipeline resource. Used by ResMII and the
+/// modulo reservation table when placing ops.
+///
+/// MEM (TMA engine) and TC (tcgen05.mma) are **async** hardware: the SM
+/// dispatches the op in `selfLatency` cycles and is then free, but the
+/// underlying engine keeps working for the full `latency` cycles. From the
+/// resource's perspective it is busy that whole time and cannot accept
+/// another op until done — so for ResMII / placement we must reserve the
+/// full `latency`.
+///
+/// CUDA and SFU are pipelined synchronous units that accept a new op every
+/// cycle, so `selfLatency` (= 1 for these) is the correct slot count.
+inline int pipelineOccupancy(const DDGNode &node) {
+  if (node.pipeline == HWPipeline::NONE)
+    return 1;
+  if (node.pipeline == HWPipeline::MEM || node.pipeline == HWPipeline::TC)
+    return std::max(node.latency, 1);
+  return std::max(node.selfLatency, 1);
+}
 
 /// Data Dependence Graph for one scf.for loop body.
 /// Captures both intra-iteration and loop-carried (distance-1) edges.

@@ -195,7 +195,8 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
   if (auto tmemSliceOp = dyn_cast<ttng::TMEMSubSliceOp>(op)) {
     auto resultLattice = results[0];
     LayoutEncoding resultLayoutEncoding = resultLattice->getValue();
-    if (!resultLayoutEncoding.isUninitialized() && !resultLayoutEncoding.isUnknown()) {
+    if (!resultLayoutEncoding.isUninitialized() &&
+        !resultLayoutEncoding.isUnknown()) {
       Attribute resultEncoding = resultLayoutEncoding.getLayoutEncoding();
       if (auto tmemEncoding =
               dyn_cast<ttng::TensorMemoryEncodingAttr>(resultEncoding)) {
@@ -206,13 +207,8 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
           return tmemSliceOp.emitOpError(
               "expected tensor memory source encoding while propagating "
               "through tmem_subslice");
-        unsigned blockM =
-            srcEncoding ? srcEncoding.getBlockM() : tmemEncoding.getBlockM();
-        unsigned blockN =
-            srcEncoding ? srcEncoding.getBlockN()
-                        : std::min<unsigned>(
-                              tmemEncoding.getBlockN(),
-                              static_cast<unsigned>(srcTy.getShape().back()));
+        unsigned blockM = srcEncoding.getBlockM();
+        unsigned blockN = srcEncoding.getBlockN();
         auto newTmemEncoding = ttng::TensorMemoryEncodingAttr::get(
             tmemEncoding.getContext(), blockM, blockN,
             tmemEncoding.getColStride(), tmemEncoding.getCTASplitM(),

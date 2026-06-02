@@ -18,8 +18,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // 3. Makespan is computed
 //
 // CHECK-LABEL: @gemm_iterative_list
-// CHECK: tt.descriptor_load {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32}
 // CHECK: tt.descriptor_load {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+// CHECK: tt.descriptor_load {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
 // CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32}
 // CHECK: tt.list_schedule_makespan
 tt.func @gemm_iterative_list(

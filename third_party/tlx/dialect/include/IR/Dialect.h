@@ -1,6 +1,10 @@
 #ifndef TRITON_DIALECT_TLX_IR_DIALECT_H_
 #define TRITON_DIALECT_TLX_IR_DIALECT_H_
 
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
+
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dialect.h"

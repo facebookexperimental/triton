@@ -28,7 +28,6 @@ void init_triton_tlx_ir(py::module &&m) {
              Value bufferIdx) -> mlir::Value {
             auto localAllocType = cast<ttg::MemDescType>(localAlloc.getType());
             auto localAllocShape = localAllocType.getShape();
-            auto context = self.getBuilder().getContext();
             Type memDescType;
             if (localAllocShape.size() == 1) {
               memDescType = ttg::MemDescType::get(
@@ -54,7 +53,6 @@ void init_triton_tlx_ir(py::module &&m) {
                     "shape mismatch");
              assert(localAllocShape.size() == newShape.size() &&
                     "shape mismatch");
-             auto context = self.getBuilder().getContext();
              Type memDescType;
              memDescType = ttg::MemDescType::get(
                  newShape, localAllocType.getElementType(),
@@ -139,16 +137,14 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_remote_store",
            [](TritonOpBuilder &self, Value &dst, Value &regValues,
               Value remoteCTARank) -> void {
-             auto bufferType = cast<ttg::MemDescType>(dst.getType());
-             auto remote_store = self.create<ttg::RemoteShmemStoreOp>(
-                 regValues, dst, remoteCTARank);
+             self.create<ttg::RemoteShmemStoreOp>(regValues, dst,
+                                                  remoteCTARank);
            })
       .def("create_async_remote_store",
            [](TritonOpBuilder &self, Value &dst, Value &regValues,
               Value remoteCTARank, Value barrier) -> void {
-             auto bufferType = cast<ttg::MemDescType>(dst.getType());
-             auto remote_store = self.create<ttg::AsyncRemoteShmemStoreOp>(
-                 regValues, dst, remoteCTARank, barrier);
+             self.create<ttg::AsyncRemoteShmemStoreOp>(regValues, dst,
+                                                       remoteCTARank, barrier);
            })
       .def("create_async_remote_copy",
            [](TritonOpBuilder &self, Value &src, Value &dst,
@@ -436,10 +432,8 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_tmem_subslice",
            [](TritonOpBuilder &self, Value &src, int offset,
               int size) -> mlir::Value {
-             // There're already checks for src and dst layouts in verifer
-             // TMEMSubSliceOp::verify()
-             // We do some reasonable extra checks here to make sure front end
-             // only passes valid inputs to the op
+             // TMEMSubSliceOp::verify() already checks src/dst layouts. Keep
+             // these lightweight frontend shape checks close to construction.
              auto srcTy = dyn_cast<triton::gpu::MemDescType>(src.getType());
              assert(srcTy != nullptr && "Expect MemDescType for src");
              auto shape = srcTy.getShape();
@@ -787,12 +781,10 @@ void init_triton_tlx_ir(py::module &&m) {
            })
       .def("create_warp_yield_op",
            [](TritonOpBuilder &self) -> void {
-             ArrayRef<Type> dummyTypes;
              self.create<ttg::WarpYieldOp>(ValueRange{});
            })
       .def("create_warp_return_op",
            [](TritonOpBuilder &self) -> void {
-             ArrayRef<Type> dummyTypes;
              self.create<ttg::WarpReturnOp>();
            })
       .def("create_async_load",
@@ -862,7 +854,6 @@ void init_triton_tlx_ir(py::module &&m) {
            })
       .def("create_global_scratch_alloc",
            [](TritonOpBuilder &self, int nbytes, int alignment) -> Value {
-             auto context = self.getBuilder().getContext();
              auto ptrType = triton::PointerType::get(
                  self.getBuilder().getI8Type(), /*addressSpace=*/1);
              return self.create<ttg::GlobalScratchAllocOp>(ptrType, nbytes,

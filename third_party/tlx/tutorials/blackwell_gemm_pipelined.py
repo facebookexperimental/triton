@@ -11,11 +11,13 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 def get_cuda_autotune_config():
     return [
-        triton.Config({'BLOCK_SIZE_M': BM, 'BLOCK_SIZE_N': BN, "BLOCK_SIZE_K" : BK, "GROUP_SIZE_M" : 8, "NUM_STAGES" : s}) \
-        for BM in [128] \
-        for BN in [128, 256] \
-        for BK in [64,128] \
-        for s in ([2,4])
+        triton.Config({
+            "BLOCK_SIZE_M": BM,
+            "BLOCK_SIZE_N": BN,
+            "BLOCK_SIZE_K": BK,
+            "GROUP_SIZE_M": 8,
+            "NUM_STAGES": s,
+        }) for BM in [128] for BN in [128, 256] for BK in [64, 128] for s in ([2, 4])
     ]
 
 
@@ -157,7 +159,7 @@ def matmul(a, b, config=None):
     # Allocates output.
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
-    # Initialize TMA descriptor storgae allocator
+    # Initialize TMA descriptor storage allocator
     triton.set_allocator(alloc_fn)
 
     if config is not None:
