@@ -9,9 +9,9 @@
 
 In Blackwell kernels there is often a need to share buffer memory between multiple allocations to allow sufficiently large block sizes for performance. Previously, this was done through the `local_alloc` API via the `reuse` parameter, which accepted an existing `buffered_tensor`. This approach required manual memory management — users had to calculate buffer counts, padding, and offsets themselves — which led to several problems:
 
-1. **Error-prone indexing**: Users must specify an exact number of buffers to get sufficient isolation. When anything changes (e.g. datatype, blocksize) the number of buffers and their overlap relationships change. Users must manually update all index calculations, which is a source of subtle bugs.
+1. **Error-prone indexing**: Users had to specify an exact number of buffers to get sufficient isolation. When anything changed (e.g. data type, block size), the number of buffers and their overlap relationships changed. Users had to manually update all index calculations, which was a source of subtle bugs.
 2. **Implicit primary ownership**: The original `reuse` API made one allocation the "primary owner" of the buffer. All other allocations had to be smaller, creating asymmetry and requiring careful ordering.
-3. **Autotuning limitations**: Due to issue 1 it can be difficult to exhaustively autotune, likely leaving performance on the table.
+3. **Autotuning limitations**: Due to issue 1, it can be difficult to exhaustively autotune, likely leaving performance on the table.
 
 ### Motivating Example
 
@@ -86,8 +86,7 @@ class reuse_group:
 **Parameters:**
 - `*args`: One or more `buffered_tensor` or nested `reuse_group` objects.
 - `group_type`: `shared` or `distinct`.
-- `group_size`: Multiplier for buffer grouping (subtiling). When `group_size > 1`, K consecutive buffers are treated as a single logical group for offset calculation. For example, with `group_size=2` on a tensor with 4 buffers, buffers `[0,1]` form logical group 0 and `[2,3]` form logical group 1. This is
-used when we want to create an unequal number of buffers (for example subtiling P in FA).
+- `group_size`: Multiplier for buffer grouping (subtiling). When `group_size > 1`, K consecutive buffers are treated as a single logical group for offset calculation. For example, with `group_size=2` on a tensor with 4 buffers, buffers `[0,1]` form logical group 0 and `[2,3]` form logical group 1. This is used when we want to create an unequal number of buffers (for example, subtiling P in FA).
 
 **Defined in:** `language/tlx/types.py`
 
@@ -343,14 +342,14 @@ TMEM.
 
 ### BufferedTensor Reuse Deprecation
 
-We should deprecate the old user of `reuse` in `local_alloc` and require `storage_alias_spec` for clearer ownership
+We should deprecate the old use of `reuse` in `local_alloc` and require `storage_alias_spec` for clearer ownership
 semantics as sizes change. This will require ensuring the `storage_alias_spec` implementation is well tested across
 many kernels.
 
 ### Explicit Buffer Lowering (no reindexing)
 
-Right now we don't lower directly to LLVM with an update base pointer/stride due to potential implications on linear layouts.
-However, this fundamentally makes some reuses impossible to represent and may cause cuda core utilization that can be otherwise
+Right now we don't lower directly to LLVM with an updated base pointer/stride due to potential implications on linear layouts.
+However, this fundamentally makes some reuses impossible to represent and may cause CUDA core utilization that could otherwise be
 avoided during the reindexing.
 
 If we encounter cases where we cannot represent the reuse we should consider the explicit lowering approach and investigate if
@@ -358,30 +357,30 @@ there is actually a real linear layout concern with multi-buffering.
 
 #### Moving Layout Alignment
 
-With an explicit buffer offset additional alignment becomes available. For example, its possible that one
-layout which would be optimal for Buffer A is requires 256 byte alignment and its shared with Buffer B that
+With an explicit buffer offset, additional alignment becomes available. For example, it's possible that one
+layout which would be optimal for Buffer A requires 256 byte alignment and is shared with Buffer B that
 desires a 128 byte alignment. Currently the only way this could be achieved is if the single allocation is
 256 byte aligned, which may not always be possible. However, in theory you could just have A start 128 later
 than the original offset. Additionally if there is an external requirement (e.g. TMA requires 128 byte alignment)
 and the buffer size is less than the alignment, explicit padding in the lowering would be needed to maintain the
 128 byte alignment.
 
-It is unclear how critical this is at this time, but this is an avenue of analysis the becomes available once
+It is unclear how critical this is at this time, but this is an avenue of analysis that becomes available once
 we have the lowering capability.
 
-### Reuse groups for kernel for Kernel Fusion
+### Reuse Groups for Kernel Fusion
 
-In the abstract Kernel Fusion case its likely that greater buffer reuse will be necessary, potentially in the extreme
-requiring allocating a single buffer and then aliasing it entirely. In that situation its possible a kernel
+In the abstract kernel fusion case, it's likely that greater buffer reuse will be necessary, potentially in the extreme
+requiring allocation of a single buffer and then aliasing it entirely. In that situation, it's possible a kernel
 will have buffers with differing liveness (e.g. live in for-loop 1 but not for-loop 2).
 
-While in theory this is may be expressable as a very complicated reuse group, we may want to explore allowing
+While in theory this may be expressible as a very complicated reuse group, we may want to explore allowing
 `reuse_group` to be applied multiple times and then require that they either have distinct liveness ranges
 or that any buffers used in both have their conditions fixed across both groups (e.g. anchors).
 
 ### Synchronization Analysis
 
-This is very difficult and most likely not sufficent to capture all bugs, but it may
+This is very difficult and most likely not sufficient to capture all bugs, but it may
 be possible to perform static analysis across many more synchronization issues with
 the implicit "metadata" information from reuse groups. Here is the high-level logic
 with a simple example: Imagine we have a reuse group that marks A and B as shared.
@@ -390,6 +389,5 @@ without a guarantee B[i] is no longer live.
 
 Now this is still very difficult because the code is warp specialized, making it more
 challenging to determine the dependency graph, and the boundaries are barriers, which
-may be possible to fuse together. However, the reuse groups could
-could act as the first of many "metadata infusing operations" which collectively
+may be possible to fuse together. However, the reuse groups could act as the first of many "metadata infusing operations" which collectively
 may make this possible.

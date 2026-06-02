@@ -654,14 +654,11 @@ def _assert_close_with_cosine(
     actual: torch.Tensor,
     expected: torch.Tensor,
     *,
-    atol: float,
-    rtol: float,
     label: str,
     min_cosine: float,
 ) -> None:
     cosine = _cosine_similarity(actual, expected)
-    # TODO: Enable testing?
-    # torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    # TODO: Enable value-based checking once MXFP8 backward tolerances settle.
     assert cosine >= min_cosine, f"{label} cosine_similarity={cosine:.6f} fell below min_cosine={min_cosine:.6f}"
 
 
@@ -685,8 +682,6 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
     dtype = torch.float8_e4m3fn
     head_dim = 128
     shape = (Z, H, N_CTX, head_dim)
-    bwd_atol: float = 2e-1
-    bwd_rtol: float = 2e-1
     bwd_min_cosine: float = 0.98
     torch.manual_seed(20)
 
@@ -793,24 +788,18 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
     _assert_close_with_cosine(
         dq_bf16,
         ref_dq,
-        atol=bwd_atol,
-        rtol=bwd_rtol,
         label="dq",
         min_cosine=bwd_min_cosine,
     )
     _assert_close_with_cosine(
         dk,
         ref_dk,
-        atol=bwd_atol,
-        rtol=bwd_rtol,
         label="dk",
         min_cosine=bwd_min_cosine,
     )
     _assert_close_with_cosine(
         dv,
         ref_dv,
-        atol=bwd_atol,
-        rtol=bwd_rtol,
         label="dv",
         min_cosine=bwd_min_cosine,
     )

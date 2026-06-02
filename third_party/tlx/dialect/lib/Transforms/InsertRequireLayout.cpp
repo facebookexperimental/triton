@@ -216,9 +216,8 @@ public:
     poisonUnhandledCase(operand);
   }
 
-  void
-  visitNonControlFlowArguments(RegionSuccessor &successor,
-                               ArrayRef<BlockArgument> arguments) {}
+  void visitNonControlFlowArguments(RegionSuccessor &successor,
+                                    ArrayRef<BlockArgument> arguments) {}
   void setToExitState(DotRewriteLattice *lattice) override {}
 
 private:
@@ -344,11 +343,15 @@ LogicalResult insertRequireLayout(ModuleOp m) {
   m.walk([&](ttg::LocalLoadOp localLoadOp) {
     auto *lattice =
         solver.lookupState<DotRewriteLattice>(localLoadOp.getResult());
-    if (!lattice || lattice->getValue().isUninitialized())
+    if (!lattice)
       return;
 
-    if (lattice->getValue().isIllegal() || lattice->getValue().isConflict()) {
-      LDBG("Skipping local_load rewrite due to state: " << lattice->getValue());
+    const DotRewriteState &state = lattice->getValue();
+    if (state.isUninitialized())
+      return;
+
+    if (state.isIllegal() || state.isConflict()) {
+      LDBG("Skipping local_load rewrite due to state: " << state);
       localLoadOp->emitRemark()
           << "dot operand layout constraint cannot be folded into local_load "
              "because the value has incompatible users or conflicting dot "
@@ -356,8 +359,7 @@ LogicalResult insertRequireLayout(ModuleOp m) {
       return;
     }
 
-    auto dotEnc = dyn_cast<ttg::DotOperandEncodingAttr>(
-        lattice->getValue().getEncoding());
+    auto dotEnc = dyn_cast<ttg::DotOperandEncodingAttr>(state.getEncoding());
     if (!dotEnc)
       return;
 

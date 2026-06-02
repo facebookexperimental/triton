@@ -1,8 +1,6 @@
 #include "IR/Dialect.h"
 #include "mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h"
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
-#include "mlir/Analysis/SliceAnalysis.h"
-#include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "tlx/dialect/include/Analysis/LayoutPropagation.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -22,7 +20,6 @@
 
 using namespace mlir;
 using namespace mlir::dataflow;
-namespace tt = ::mlir::triton;
 namespace ttg = ::mlir::triton::gpu;
 namespace ttng = ::mlir::triton::nvidia_gpu;
 
@@ -361,7 +358,7 @@ public:
         return WalkResult::advance();
       }
 
-      for (auto [i, result] : llvm::enumerate(op->getResults())) {
+      for (Value result : op->getResults()) {
         if (!isa<ttg::MemDescType>(result.getType())) {
           rewriteTensorValueFromLattice(result, solver, blockedTensorValues);
           continue;
@@ -377,7 +374,7 @@ public:
 
     updateTensorRegionBranchTypes(funcOp, solver, blockedTensorValues);
 
-    // Verify that no DummyTMEMLayoutAttr remains after layout propagation
+    // Verify that no DummyTMEMLayoutAttr remains after layout propagation.
     bool hasDummyLayout = false;
     funcOp.walk([&](ttng::TMEMAllocOp allocOp) {
       auto encoding = allocOp.getType().getEncoding();
@@ -390,8 +387,6 @@ public:
     });
     if (hasDummyLayout)
       return signalPassFailure();
-
-    return;
   }
 
   void runOnOperation() override {

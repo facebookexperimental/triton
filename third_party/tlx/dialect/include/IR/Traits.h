@@ -1,12 +1,8 @@
 #ifndef TRITON_DIALECT_TLX_IR_TRAITS_H_
-
 #define TRITON_DIALECT_TLX_IR_TRAITS_H_
 
-#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/OpDefinition.h"
-#include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "mlir/Support/LogicalResult.h"
-#include "triton/Dialect/Triton/IR/Types.h"
 
 namespace mlir {
 namespace OpTrait {

@@ -12,7 +12,6 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 def _host_descriptor_pre_hook(nargs):
     BLOCK_M = nargs["BLOCK_M"]
     BLOCK_N = nargs["BLOCK_N"]
-    HEAD_DIM = nargs["HEAD_DIM"]
     if not isinstance(nargs["desc_q"], TensorDescriptor):
         return
     HEAD_DIM = nargs["HEAD_DIM"]
@@ -151,7 +150,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                 # epilogue
                 tlx.barrier_wait(l_fulls[cid], 0)
                 # Use l[1]/l[1+HEAD_DIM * NUM_BUFFERS_QK] and m[2][2 + HEAD_DIM * NUM_BUFFERS_QK]
-                # to disambigulate from alpha[0]/alpha[HEAD_DIM * NUM_BUFFERS_QK]
+                # to disambiguate from alpha[0]/alpha[HEAD_DIM * NUM_BUFFERS_QK]
                 l = tlx.local_load(l_tiles[cid * HEAD_DIM * NUM_BUFFERS_QK + 1])
                 m = tlx.local_load(m_tiles[cid * HEAD_DIM * NUM_BUFFERS_QK + 2])
                 m += tl.math.log2(l)
@@ -214,7 +213,7 @@ def _attn_fwd_ws(sm_scale, M,  #
 
             # prepare l_i for the epilog
             # Use l[1]/l[1+HEAD_DIM * NUM_BUFFERS_QK] and m[2][2 + HEAD_DIM * NUM_BUFFERS_QK]
-            # to disambigulate from alpha[0]/alpha[HEAD_DIM * NUM_BUFFERS_QK]
+            # to disambiguate from alpha[0]/alpha[HEAD_DIM * NUM_BUFFERS_QK]
             tlx.local_store(l_tiles[cid * HEAD_DIM * NUM_BUFFERS_QK + 1], l_i[:, None])
             tlx.local_store(m_tiles[cid * HEAD_DIM * NUM_BUFFERS_QK + 2], m_i[:, None])
             tlx.barrier_arrive(l_fulls[cid])

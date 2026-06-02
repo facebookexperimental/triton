@@ -1,13 +1,11 @@
 #include "IR/Dialect.h"
-#include "mlir/IR/Builders.h"
-#include "mlir/IR/BuiltinTypes.h"
-#include "triton/Dialect/Triton/IR/Dialect.h"
-#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
-#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Debug.h"
+
+#include <functional>
+#include <tuple>
 
 #define DEBUG_TYPE "tlx-buffer-offset-calculation"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -15,7 +13,6 @@
 
 using namespace mlir;
 namespace ttg = ::mlir::triton::gpu;
-namespace ttng = ::mlir::triton::nvidia_gpu;
 
 namespace mlir {
 namespace triton {

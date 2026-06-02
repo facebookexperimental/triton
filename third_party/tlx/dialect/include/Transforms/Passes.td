@@ -6,8 +6,9 @@ include "mlir/Pass/PassBase.td"
 def TritonTLXFixup : Pass</*cli-arg*/"triton-tlx-fixup", /*Op*/"mlir::ModuleOp"> {
   let summary = "Fixup the IR for TritonTLX";
   let description = [{
-    The pass did some fixup to the TritonDialect module to help make TritonGPU or TritonNvidiaGPU integrate
-    better into frontend DSL and TritonDialect, such as attaching metadata to the module.
+    This pass applies fixups to the TritonDialect module to help TritonGPU
+    or TritonNvidiaGPU integrate with the frontend DSL and TritonDialect,
+    such as attaching metadata to the module.
   }];
 
   let options = [
@@ -60,32 +61,31 @@ def TLXInsertRequireLayout : Pass<"tlx-insert-require-layout", "mlir::ModuleOp">
   let summary = "Insert explicit TLX layout constraints for local_load-to-dot paths";
 
   let description = [{
-    This pass discovers dot-fed ttg.local_load operations and inserts the
-    missing tlx.require_layout constraints needed for the AMD local_load-to-dot
+    This pass discovers dot-fed `ttg.local_load` operations and inserts the
+    missing `tlx.require_layout` constraints needed for the AMD local_load-to-dot
     path.
 
     The pass only synthesizes explicit TLX layout constraints:
-    - memdesc-side tlx.require_layout constraints for shared-memory swizzling
-    - tensor-side tlx.require_layout constraints in place of dot-path
-      ttg.convert_layout operations
+    - memdesc-side `tlx.require_layout` constraints for shared-memory swizzling
+    - tensor-side `tlx.require_layout` constraints in place of dot-path
+      `ttg.convert_layout` operations
 
     It does not own tensor/register propagation or convert cleanup; those are
-    handled by tlx-propagate-layout and downstream cleanup passes.
+    handled by `tlx-propagate-layout` and downstream cleanup passes.
   }];
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
-
 }
 
 def TLXRewriteLocalAlias : Pass<"tlx-rewrite-local-alias", "mlir::ModuleOp"> {
   let summary = "Replace tlx::LocalAliasOp with the aliased local mem_desc";
 
   let description = [{
-    This pass replaces a tlx::LocalAliasOp op with the original aliased mem_desc.
+    This pass replaces each `tlx::LocalAliasOp` with the original aliased
+    mem_desc.
   }];
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
-
 }
 
 def TLXResolvePlaceholderLayouts : Pass<"tlx-resolve-placeholder-layouts", "mlir::ModuleOp"> {

@@ -39,6 +39,10 @@ from triton._internal_testing import is_blackwell
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
+def _alloc_tma_descriptor_buffer(size: int, _alignment: int, _stream: Optional[int]):
+    return torch.empty(size, device="cuda", dtype=torch.int8)
+
+
 def is_cuda():
     return triton.runtime.driver.active.get_current_target().is_cuda_backend()
 
@@ -649,10 +653,7 @@ def group_gemm_tma_fn(group_A, group_B):
     # we use a fixed number of CTA, and it's auto-tunable
 
     # TMA descriptors require a global memory allocation
-    def alloc_fn(size: int, alignment: int, stream: Optional[int]):
-        return torch.empty(size, device="cuda", dtype=torch.int8)
-
-    triton.set_allocator(alloc_fn)
+    triton.set_allocator(_alloc_tma_descriptor_buffer)
 
     grid = lambda META: (META["NUM_SM"], )
     grouped_matmul_tma_kernel[grid](
@@ -703,10 +704,7 @@ def group_gemm_tlx_fn(group_A, group_B):
     # we use a fixed number of CTA, and it's auto-tunable
 
     # TMA descriptors require a global memory allocation
-    def alloc_fn(size: int, alignment: int, stream: Optional[int]):
-        return torch.empty(size, device="cuda", dtype=torch.int8)
-
-    triton.set_allocator(alloc_fn)
+    triton.set_allocator(_alloc_tma_descriptor_buffer)
 
     grid = lambda META: (META["NUM_SM"], )
     grouped_matmul_tlx_kernel[grid](
@@ -732,7 +730,6 @@ def test_op():
     group_k = [1024, 512, 256, 128]
     group_A = []
     group_B = []
-    group_B_T = []
     assert len(group_m) == len(group_n)
     assert len(group_n) == len(group_k)
     group_size = len(group_m)
@@ -742,10 +739,8 @@ def test_op():
         K = group_k[i]
         A = torch.rand((M, K), device=DEVICE, dtype=torch.float16)
         B = torch.rand((K, N), device=DEVICE, dtype=torch.float16)
-        B_T = B.T.contiguous()
         group_A.append(A)
         group_B.append(B)
-        group_B_T.append(B_T)
 
     tri_out = group_gemm_tlx_fn(group_A, group_B)
     ref_out = [torch.matmul(a, b) for a, b in zip(group_A, group_B)]
@@ -768,10 +763,7 @@ def triton_perf_fn(a_ptrs, b_ptrs, c_ptrs, sizes, lds, group_size):
 
 def triton_tma_perf_fn(a_ptrs, b_ptrs, c_ptrs, sizes, lds, group_size, dtype):
     # TMA descriptors require a global memory allocation
-    def alloc_fn(size: int, alignment: int, stream: Optional[int]):
-        return torch.empty(size, device="cuda", dtype=torch.int8)
-
-    triton.set_allocator(alloc_fn)
+    triton.set_allocator(_alloc_tma_descriptor_buffer)
     grid = lambda META: (META["NUM_SM"], )
     grouped_matmul_tma_kernel[grid](a_ptrs, b_ptrs, c_ptrs, sizes, lds, group_size, FP8=torch.float8_e4m3fn == dtype,
                                     NUM_SM=num_sms())
@@ -779,10 +771,7 @@ def triton_tma_perf_fn(a_ptrs, b_ptrs, c_ptrs, sizes, lds, group_size, dtype):
 
 def triton_tlx_perf_fn(a_ptrs, b_ptrs, c_ptrs, sizes, lds, group_size, dtype):
     # TMA descriptors require a global memory allocation
-    def alloc_fn(size: int, alignment: int, stream: Optional[int]):
-        return torch.empty(size, device="cuda", dtype=torch.int8)
-
-    triton.set_allocator(alloc_fn)
+    triton.set_allocator(_alloc_tma_descriptor_buffer)
     grid = lambda META: (META["NUM_SM"], )
     grouped_matmul_tlx_kernel[grid](a_ptrs, b_ptrs, c_ptrs, sizes, lds, group_size, FP8=torch.float8_e4m3fn == dtype,
                                     NUM_SM=num_sms())

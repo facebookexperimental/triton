@@ -5,9 +5,9 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Support/LLVM.h"
-#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include <optional>
+#include <utility>
 
 using namespace mlir::dataflow;
 
@@ -114,9 +114,8 @@ public:
 
   void setToExitState(LayoutEncodingLattice *lattice) override;
 
-  void
-  visitNonControlFlowArguments(RegionSuccessor &successor,
-                               ArrayRef<BlockArgument> arguments) {
+  void visitNonControlFlowArguments(RegionSuccessor &successor,
+                                    ArrayRef<BlockArgument> arguments) {
     // Default: do nothing
   }
   LogicalResult visitRegionInReverse(Operation *op);
@@ -233,9 +232,8 @@ public:
 
   void setToExitState(TensorLayoutLattice *lattice) override;
 
-  void
-  visitNonControlFlowArguments(RegionSuccessor &successor,
-                               ArrayRef<BlockArgument> arguments) {
+  void visitNonControlFlowArguments(RegionSuccessor &successor,
+                                    ArrayRef<BlockArgument> arguments) {
     // Default: do nothing
   }
 };

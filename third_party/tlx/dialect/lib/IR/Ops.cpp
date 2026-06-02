@@ -21,7 +21,7 @@ namespace tlx {
 
 //-- RequireLayoutOp --
 
-OpFoldResult RequireLayoutOp::fold(FoldAdaptor adaptor) {
+OpFoldResult RequireLayoutOp::fold(FoldAdaptor) {
   if (getType() == getSrc().getType()) {
     // no-op
     return getSrc();
@@ -31,7 +31,7 @@ OpFoldResult RequireLayoutOp::fold(FoldAdaptor adaptor) {
 
 //-- ReleaseLayoutOp --
 
-OpFoldResult ReleaseLayoutOp::fold(FoldAdaptor adaptor) {
+OpFoldResult ReleaseLayoutOp::fold(FoldAdaptor) {
   if (getType() == getSrc().getType()) {
     // no-op
     return getSrc();
@@ -75,18 +75,17 @@ LogicalResult StorageAliasLocalAllocOp::verify() {
   auto resultMemorySpace = resultType.getMemorySpace();
 
   // Check consistency between storage alias storage and result memory space
-  if (storageAliasStorage == StorageKind::smem) {
-    if (!isa<triton::gpu::SharedMemorySpaceAttr>(resultMemorySpace)) {
-      return emitOpError(
-          "storage_alias_spec has smem storage but result is not in shared "
-          "memory");
-    }
-  } else if (storageAliasStorage == StorageKind::tmem) {
-    if (!isa<triton::nvidia_gpu::TensorMemorySpaceAttr>(resultMemorySpace)) {
-      return emitOpError(
-          "storage_alias_spec has tmem storage but result is not in tensor "
-          "memory");
-    }
+  if (storageAliasStorage == StorageKind::smem &&
+      !isa<triton::gpu::SharedMemorySpaceAttr>(resultMemorySpace)) {
+    return emitOpError(
+        "storage_alias_spec has smem storage but result is not in shared "
+        "memory");
+  }
+  if (storageAliasStorage == StorageKind::tmem &&
+      !isa<triton::nvidia_gpu::TensorMemorySpaceAttr>(resultMemorySpace)) {
+    return emitOpError(
+        "storage_alias_spec has tmem storage but result is not in tensor "
+        "memory");
   }
 
   return success();

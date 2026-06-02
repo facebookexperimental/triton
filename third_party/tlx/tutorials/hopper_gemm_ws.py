@@ -1,4 +1,5 @@
 import math
+from typing import Optional
 
 import torch
 
@@ -6,7 +7,6 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
-from typing import Optional
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -532,7 +532,7 @@ def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
     if NUM_CTAS == 2:
         cta_bars = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=2)
 
-    # Warp specilization
+    # Warp specialization
     with tlx.async_tasks():
         # Producer (async load)
         with tlx.async_task("default"):
@@ -709,11 +709,9 @@ def matmul(a, b, config=None):
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Illegal dimensions of input operands"
     M, K = a.shape
-    K, N = b.shape
+    _, N = b.shape
 
     triton.set_allocator(alloc_fn)
-
-    (M, N, K) = (a.shape[0], b.shape[1], a.shape[1])
 
     if config is None and min(M, N) <= 256:
         NUM_SMS = torch.cuda.get_device_properties(DEVICE).multi_processor_count

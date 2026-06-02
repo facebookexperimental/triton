@@ -70,6 +70,21 @@ collectMemDescIndexOps(Value memDesc,
   }
 }
 
+static int64_t getBufferUnitSize(ttg::MemDescType memDescType) {
+  if (isa<triton::nvidia_gpu::TensorMemorySpaceAttr>(
+          memDescType.getMemorySpace())) {
+    return getAllocationColumnsPerBuffer(memDescType);
+  }
+
+  int64_t elemBits = memDescType.getElementTypeBitWidth();
+  int64_t bufferElements = 1;
+  auto shape = memDescType.getShape();
+  for (size_t i = 1; i < shape.size(); ++i) {
+    bufferElements *= shape[i];
+  }
+  return (bufferElements * elemBits) / 8;
+}
+
 LogicalResult materializeStorageAliasAllocations(
     ModuleOp m,
     const DenseMap<Value, std::tuple<int64_t, int64_t, int64_t>> &offsetMap,
@@ -192,8 +207,6 @@ LogicalResult materializeStorageAliasAllocations(
     // Determine the result type - may be expanded based on
     // bytes_between_buffer_groups
     ttg::MemDescType resultType = originalResultType;
-    bool isTmem = isa<triton::nvidia_gpu::TensorMemorySpaceAttr>(
-        originalResultType.getMemorySpace());
     if (offsetIt != offsetMap.end()) {
       int64_t bufferOffset = std::get<0>(offsetIt->second);
       int64_t bytesBetweenBufferGroups = std::get<1>(offsetIt->second);
@@ -204,17 +217,7 @@ LogicalResult materializeStorageAliasAllocations(
       // by numCols and different TMEM buffer types have different
       // bytes-per-column ratios. For SMEM, use bytes.
       auto shape = originalResultType.getShape();
-      int64_t originalBufferSize;
-      if (isTmem) {
-        originalBufferSize = getAllocationColumnsPerBuffer(originalResultType);
-      } else {
-        int64_t elemBits = originalResultType.getElementTypeBitWidth();
-        int64_t bufferElements = 1;
-        for (size_t i = 1; i < shape.size(); ++i) {
-          bufferElements *= shape[i];
-        }
-        originalBufferSize = (bufferElements * elemBits) / 8;
-      }
+      int64_t originalBufferSize = getBufferUnitSize(originalResultType);
 
       // Check if units_between_buffer_groups divides evenly by original
       // buffer size
@@ -298,20 +301,9 @@ LogicalResult materializeStorageAliasAllocations(
 
       // Recompute scale factor and offset slots (in column units for TMEM,
       // bytes for SMEM)
-      int64_t originalBufferSize2;
-      if (isTmem) {
-        originalBufferSize2 = getAllocationColumnsPerBuffer(originalResultType);
-      } else {
-        auto shape = originalResultType.getShape();
-        int64_t elemBits = originalResultType.getElementTypeBitWidth();
-        int64_t bufferElements = 1;
-        for (size_t i = 1; i < shape.size(); ++i) {
-          bufferElements *= shape[i];
-        }
-        originalBufferSize2 = (bufferElements * elemBits) / 8;
-      }
-      int64_t scaleFactor = bytesBetweenBufferGroups / originalBufferSize2;
-      int64_t offsetSlots = bufferOffset / originalBufferSize2;
+      int64_t originalBufferSize = getBufferUnitSize(originalResultType);
+      int64_t scaleFactor = bytesBetweenBufferGroups / originalBufferSize;
+      int64_t offsetSlots = bufferOffset / originalBufferSize;
 
       // Only rewrite if there's actual scaling or offset
       if (scaleFactor > 1 || offsetSlots > 0) {
