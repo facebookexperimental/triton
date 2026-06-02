@@ -12,10 +12,16 @@ from triton._internal_testing import is_hip
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 ATTENTION_METHODS = {
-    "simple": lambda q, k, v, sm_scale, causal: _amd_fa_pipelined(q, k, v, sm_scale, causal),
-    "prefetch": lambda q, k, v, sm_scale, causal: _amd_fa_pipelined(q, k, v, sm_scale, causal, config={
-        "BLOCK_M": 256, "BLOCK_N": 64, "num_warps": 8, "PREFETCH": True,
-    }),
+    "simple":
+    lambda q, k, v, sm_scale, causal: _amd_fa_pipelined(q, k, v, sm_scale, causal),
+    "prefetch":
+    lambda q, k, v, sm_scale, causal: _amd_fa_pipelined(
+        q, k, v, sm_scale, causal, config={
+            "BLOCK_M": 256,
+            "BLOCK_N": 64,
+            "num_warps": 8,
+            "PREFETCH": True,
+        }),
 }
 
 ref_lib = "SDPA"
@@ -28,8 +34,7 @@ def create_benchmark(versions):
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=["N_CTX", "HEAD_DIM"],
-            x_vals=[(1024, 64), (4096, 64), (8192, 64),
-                    (1024, 128), (4096, 128), (8192, 128)],
+            x_vals=[(1024, 64), (4096, 64), (8192, 64), (1024, 128), (4096, 128), (8192, 128)],
             line_arg="provider",
             line_vals=line_vals,
             line_names=line_names,

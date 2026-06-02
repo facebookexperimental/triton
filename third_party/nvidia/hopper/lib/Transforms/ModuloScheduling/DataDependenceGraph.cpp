@@ -34,7 +34,7 @@ unsigned DataDependenceGraph::addNode(Operation *op,
   node.pipeline = info.pipeline;
   node.latency = info.latency;
   node.selfLatency = info.selfLatency;
-  node.transferLatency = info.transferLatency;
+  node.minWarps = info.minWarps;
   nodes.push_back(node);
   opToIdx[op] = idx;
   return idx;
@@ -94,11 +94,25 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
               "modulo schedule: inner-loop bounds are not compile-time "
               "constants; using a default trip count of 32 — schedule "
               "decisions may be suboptimal");
+
         }
         node.latency = static_cast<int>(
             std::min<int64_t>(INT_MAX, innerSched->II * tripCount));
         node.selfLatency = 0;
         node.pipeline = HWPipeline::NONE;
+
+        // Prologue latency: cycles before the first TC op fires inside the
+        // inner loop. The outer scheduler uses this to overlap outer-loop
+        // MEM ops with the inner loop's pre-MMA setup.
+        int tcStart = innerSched->II;
+        for (const auto &n : innerDDG.getNodes()) {
+          if (n.pipeline == HWPipeline::TC) {
+            auto it = innerSched->nodeToCycle.find(n.idx);
+            if (it != innerSched->nodeToCycle.end())
+              tcStart = std::min(tcStart, it->second);
+          }
+        }
+        node.prologueLatency = tcStart;
       } else {
         // Inner-loop scheduling failed. Emit a diagnostic and propagate
         // a clearly-infeasible latency so the outer schedule fails too
@@ -129,18 +143,50 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
       if (it == ddg.opToIdx.end())
         continue;
       unsigned srcIdx = it->second;
-      // Edge latency = producer's latency (time until result available).
-      // Exception: for MEM → local_alloc edges, use transferLatency (the TMA
-      // transfer time) instead of the full async latency. local_alloc is a
-      // bookkeeping op that represents data arrival — it must wait for the
-      // transfer to complete, but not for the async DRAM overhead that only
-      // applies to the MMA consumer.
+      // Edge latency = producer's full latency (time until consumer can read
+      // the result). Uniform rule with no per-pair exceptions: each op carries
+      // a single `latency` that captures full delivery, and edges just
+      // propagate it.
       int edgeLatency = ddg.nodes[srcIdx].latency;
-      if (ddg.nodes[srcIdx].pipeline == HWPipeline::MEM &&
-          isa<triton::gpu::LocalAllocOp>(node.op)) {
-        edgeLatency = ddg.nodes[srcIdx].transferLatency;
-      }
       ddg.addEdge(srcIdx, node.idx, edgeLatency, /*distance=*/0);
+    }
+  }
+
+  // Phase 2.5: Memory-based edges for super-nodes.
+  // The DDG only captures SSA def-use edges. But super-nodes (inner
+  // loops) can write to memory (TMEM via MMA) that later ops read
+  // (tmem_load). Without an explicit edge, the scheduler places
+  // tmem_load BEFORE the K-loop finishes, breaking the store overlap.
+  //
+  // Detect: if a super-node's inner loop contains MMA writing to a
+  // TMEM memdesc, and a tmem_load outside the loop reads the same
+  // memdesc, add an edge super-node → tmem_load.
+  for (auto &node : ddg.nodes) {
+    if (!node.isSuperNode)
+      continue;
+    auto innerLoop = dyn_cast<scf::ForOp>(node.op);
+    if (!innerLoop)
+      continue;
+    // Find TMEM memdescs written by MMA inside the inner loop.
+    llvm::DenseSet<Value> tmemWritten;
+    innerLoop.walk([&](Operation *op) {
+      if (isa<triton::nvidia_gpu::TCGen5MMAOp,
+              triton::nvidia_gpu::TCGen5MMAScaledOp>(op)) {
+        // MMA operand 2 is the accumulator (TMEM memdesc).
+        if (op->getNumOperands() > 2)
+          tmemWritten.insert(op->getOperand(2));
+      }
+    });
+    // Find tmem_load ops outside the inner loop that read the same TMEM.
+    for (auto &other : ddg.nodes) {
+      if (other.idx == node.idx)
+        continue;
+      if (!isa<triton::nvidia_gpu::TMEMLoadOp>(other.op))
+        continue;
+      Value tmemSrc = other.op->getOperand(0);
+      if (tmemWritten.count(tmemSrc)) {
+        ddg.addEdge(node.idx, other.idx, node.latency, /*distance=*/0);
+      }
     }
   }
 
@@ -233,11 +279,13 @@ DataDependenceGraph::computeCriticalPathHeights() const {
 }
 
 int DataDependenceGraph::computeResMII() const {
+  // Per-pipeline busy time (cycles) bounds II from below: II ≥ pipeLoad / N
+  // where N is the number of identical units on the pipeline (assumed 1).
   llvm::DenseMap<HWPipeline, int> pipeLoad;
   for (const auto &node : nodes) {
     if (node.pipeline == HWPipeline::NONE)
       continue;
-    pipeLoad[node.pipeline] += node.selfLatency;
+    pipeLoad[node.pipeline] += pipelineOccupancy(node);
   }
   int maxLoad = 0;
   for (auto &[pipe, load] : pipeLoad) {

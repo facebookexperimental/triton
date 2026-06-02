@@ -14,7 +14,6 @@ def _host_descriptor_pre_hook(nargs):
     HEAD_DIM = nargs["HEAD_DIM"]
     if not isinstance(nargs["desc_q"], TensorDescriptor):
         return
-    HEAD_DIM = nargs["HEAD_DIM"]
     NUM_MMA_GROUPS = nargs["NUM_MMA_GROUPS"]
     BLOCK_M_SPLIT = BLOCK_M // NUM_MMA_GROUPS
     nargs["desc_q"].block_shape = [BLOCK_M_SPLIT, HEAD_DIM]
@@ -142,7 +141,7 @@ def _attn_fwd_ws_pipelined(sm_scale, M,  #
             # -- compute qk[0] ----
             k_tile = tlx.local_trans(k_tile)
             qk = tlx.async_dot(q_tile, k_tile)
-            # wait for the MMA using to complete
+            # wait for the MMA to complete
             qk = tlx.async_dot_wait(0, qk)
             # release the K buffer
             k_empty = tlx.local_view(k_empties, k_buf_id)
@@ -223,7 +222,7 @@ def _attn_fwd_ws_pipelined(sm_scale, M,  #
             # prepare p and v for the dot
             p = p.to(tlx.dtype_of(desc_k))
             acc = tlx.async_dot(p, v_tile, acc)
-            # wait for the MMA using to complete
+            # wait for the MMA to complete
             acc = tlx.async_dot_wait(0, acc)
             # release the V buffer
             v_empty = tlx.local_view(v_empties, v_buf_id)

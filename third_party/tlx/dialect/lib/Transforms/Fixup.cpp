@@ -8,7 +8,6 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
-#include "llvm/Support/Debug.h"
 #include "llvm/Support/LogicalResult.h"
 
 namespace ttg = mlir::triton::gpu;
@@ -18,10 +17,6 @@ namespace mlir::triton::tlx {
 
 #define GEN_PASS_DEF_TRITONTLXFIXUP
 #include "tlx/dialect/include/Transforms/Passes.h.inc"
-
-#define DEBUG_TYPE "tlx-fixup"
-#define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
-#define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 class TritonTLXFixupPass : public impl::TritonTLXFixupBase<TritonTLXFixupPass> {
   using impl::TritonTLXFixupBase<TritonTLXFixupPass>::TritonTLXFixupBase;
@@ -68,7 +63,6 @@ public:
       bool isClustered = false;
       if (!clusterDims.empty()) {
         // Ensure we have exactly 3 dimensions (X, Y, Z)
-        SmallVector<int32_t, 3> dims;
         if (clusterDims.size() != 3) {
           return mod.emitError()
                  << "Expected 3 cluster dimensions, got " << clusterDims.size();

@@ -1,4 +1,4 @@
-from .code_generator import (visit_withAsyncTask, visit_withAsyncTasks)
+from .code_generator import visit_withAsyncTask, visit_withAsyncTasks
 
 __all__ = [
     "visit_withAsyncTask",

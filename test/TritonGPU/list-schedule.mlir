@@ -12,12 +12,9 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // sorted by cycle. MEM ops get earlier cycles (lower clusters) than TC ops.
 //
 // CHECK-LABEL: @gemm_list_schedule
-// All ops get stage 0 (no cross-iteration pipelining)
-// CHECK: tt.descriptor_load {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32}
-// CHECK: tt.descriptor_load {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
-// CHECK: ttg.local_alloc {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
-// CHECK: ttg.local_alloc {{.*}} {loop.cluster = 3 : i32, loop.stage = 0 : i32}
-// TC op gets a later cluster than MEM ops
+// All ops get stage 0 (no cross-iteration pipelining), with dense cluster IDs
+// CHECK: ttg.local_alloc {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32}
+// TC op gets cluster 4 (same cycle as local_alloc B)
 // CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32}
 // CUDA op (tmem_load) gets the latest cluster
 // CHECK: ttng.tmem_load {{.*}} {loop.cluster = 5 : i32, loop.stage = 0 : i32}

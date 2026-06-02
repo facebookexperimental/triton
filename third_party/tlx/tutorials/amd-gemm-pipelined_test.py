@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-from triton._internal_testing import is_cuda, is_hip_cdna2, is_hip
+from triton._internal_testing import is_cuda, is_hip, is_hip_cdna2
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -28,13 +28,13 @@ def get_hip_autotune_config_full():
     return configs
 
 
-def is_invalid_config(config, N, M, K, mfma):
+def is_invalid_config(config, N, M, mfma):
     """
     Contains all of the configuration checks for prune_configs
-    that will result in an invalid result if select as the config.
+    that will result in an invalid result if selected as the config.
 
     This is done to ensure that if no config is "optimal" for a given
-    shape we don't accidentally select
+    shape we don't accidentally select an invalid config.
     """
     BLOCK_SIZE_M = config.kwargs.get("BLOCK_SIZE_M")
     BLOCK_SIZE_N = config.kwargs.get("BLOCK_SIZE_N")
@@ -76,9 +76,9 @@ def prune_configs(configs, named_args, **kwargs):
         BLOCK_SIZE_N = config.kwargs.get("BLOCK_SIZE_N")
         BLOCK_SIZE_K = config.kwargs.get("BLOCK_SIZE_K")
         GROUP_SIZE_M = config.kwargs.get("GROUP_SIZE_M")
-        if is_invalid_config(config, N, M, K, mfma):
+        if is_invalid_config(config, N, M, mfma):
             continue
-        # Skip BLOCK_SIZE that is too large compare to M/N
+        # Skip BLOCK_SIZE that is too large compared to M/N,
         # unless BLOCK_SIZE is already small enough
         if BLOCK_SIZE_M > M * 2 and BLOCK_SIZE_M != 16:
             continue
@@ -162,8 +162,8 @@ def matmul_kernel_pipelined_mi300(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, strid
     # In general, when using tl.load + local_store
     # num buffers = pipeline-stage(local-store) - pipeline-stage(local-load)
     NUM_BUFFERS = NUM_STAGES - 1
-    buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tlx.dtype_of(a_ptr), NUM_STAGES - 1)
-    buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tlx.dtype_of(b_ptr), NUM_STAGES - 1)
+    buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tlx.dtype_of(a_ptr), NUM_BUFFERS)
+    buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tlx.dtype_of(b_ptr), NUM_BUFFERS)
 
     # Pipeline Prologue. (NUM_STAGES - 1) iterations
     for i in tl.range(0, NUM_STAGES - 1, loop_unroll_factor=NUM_STAGES - 1):
@@ -270,11 +270,11 @@ TORCH_HAS_FP8 = False
 
 ref_lib = 'cuBLAS' if is_cuda() else 'rocBLAS'
 
-configs = []
+benchmark_configs = []
 for fp8_inputs in [False, True]:
     if fp8_inputs and (not TORCH_HAS_FP8 or not is_cuda()):
         continue
-    configs.append(
+    benchmark_configs.append(
         triton.testing.Benchmark(
             x_names=["M", "N", "K"],  # Argument names to use as an x-axis for the plot
             x_vals=[256, 512, 1024, 2048, 4096],  # Different possible values for `x_name`
@@ -291,7 +291,7 @@ for fp8_inputs in [False, True]:
         ))
 
 
-@triton.testing.perf_report(configs)
+@triton.testing.perf_report(benchmark_configs)
 def benchmark(M, N, K, provider, fp8_inputs):
     a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
     b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)

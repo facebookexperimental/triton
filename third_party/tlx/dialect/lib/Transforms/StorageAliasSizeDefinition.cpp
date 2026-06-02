@@ -1,10 +1,11 @@
+#include <algorithm>
+
 #include "IR/Dialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
-#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/Debug.h"
 
@@ -14,7 +15,6 @@
 
 using namespace mlir;
 namespace ttg = ::mlir::triton::gpu;
-namespace ttng = ::mlir::triton::nvidia_gpu;
 
 namespace mlir {
 namespace triton {

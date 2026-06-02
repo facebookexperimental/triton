@@ -154,7 +154,7 @@ def _apply_causal_mask(qk, col_limit_right, BLOCK_N: tl.constexpr):
     # Credit to Tri Dao,
     # https://github.com/Dao-AILab/flash-attention/commit/bac1001e4f6caa09d70537495d6746a685a2fa78
     #
-    # NOTE: We use map_elementiwse here in order to generate an interleaved sequence of instructions
+    # NOTE: We use map_elementwise here in order to generate an interleaved sequence of instructions
     # that processes one element of qk at a time. This improves ptxas's resulting SASS.
     offs_n = tl.arange(0, BLOCK_N)[None, :]
     s = offs_n & ~0xF
@@ -235,7 +235,7 @@ def _softmax_inner_loop(
         else:
             qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
         # apply_epx2_convert in FA4:
-        # 128 elements per row is divided into 4 fragments, first fragement covers [0] to [31]
+        # 128 elements per row is divided into 4 fragments, first fragment covers [0] to [31]
         # for last fragment, always use SFU, for first 3 fragments, elements 0 to 11 use SFU,
         # elements 12 to 15 use emulation, elements 16 to 27 use SFU, elements 28 to 31 use emulation
         # the loop is unrolled twice likely for vectorization
@@ -2927,7 +2927,6 @@ class _attention(torch.autograd.Function):
         RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
         arg_k = k
         arg_k = arg_k * (ctx.sm_scale * RCP_LN2)
-        PRE_BLOCK = 128
         assert N_CTX % PRE_BLOCK == 0
         pre_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
         delta = torch.empty_like(M)

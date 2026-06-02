@@ -4,6 +4,20 @@ from .mem_ops import remote_view
 from .utility import is_hip
 
 
+def _make_mbarrier_layout_handle(_semantic):
+    layout = tlx.swizzled_shared_layout_encoding.make_default(rank=1)
+    layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
+        layout.vectorSize,
+        layout.perPhase,
+        layout.maxPhase,
+        layout.order,
+        layout.numCTAsPerCGA,
+        layout.numCTASplit,
+        layout.numCTAOrder,
+    )
+    return layout, layout_handle
+
+
 @tl.builtin
 def cluster_barrier(_semantic=None):
     _semantic.builder.create_cluster_barrier()
@@ -28,23 +42,14 @@ def alloc_barriers(
         _semantic=None,
 ) -> tlx.mbarrier:
     """
-    Allocates buffer in shared memory and initialize mbarriers with arrive_counts.
+    Allocates a buffer in shared memory and initializes mbarriers with arrive counts.
 
     Input:
     - `num_barriers`: The number of barriers to allocate.
-    - `arrive_counts`: The number of threads that need to arrive at the barrier before it can be released.
+    - `arrive_count`: The number of threads that need to arrive at the barrier before it can be released.
     """
 
-    layout = tlx.swizzled_shared_layout_encoding.make_default(rank=1)
-    layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
-        layout.vectorSize,
-        layout.perPhase,
-        layout.maxPhase,
-        layout.order,
-        layout.numCTAsPerCGA,
-        layout.numCTASplit,
-        layout.numCTAOrder,
-    )
+    layout, layout_handle = _make_mbarrier_layout_handle(_semantic)
     return tlx.mbarrier(
         _semantic.builder.create_alloc_barriers(num_barriers.value, arrive_count.value, layout_handle),
         num_barriers,
@@ -75,16 +80,7 @@ def alloc_warp_barrier(
     """
 
     arrive_count = num_warps.value * 32 * num_arrivals.value
-    layout = tlx.swizzled_shared_layout_encoding.make_default(rank=1)
-    layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
-        layout.vectorSize,
-        layout.perPhase,
-        layout.maxPhase,
-        layout.order,
-        layout.numCTAsPerCGA,
-        layout.numCTASplit,
-        layout.numCTAOrder,
-    )
+    layout, layout_handle = _make_mbarrier_layout_handle(_semantic)
     return tlx.mbarrier(
         _semantic.builder.create_alloc_barriers(num_barriers.value, arrive_count, layout_handle),
         num_barriers,
@@ -101,10 +97,9 @@ def barrier_expect_bytes(
     _semantic=None,
 ) -> None:
     """
-    Signal a barrier of an expected number of bytes to be copied
+    Signal the expected number of bytes to be copied for a barrier.
     """
 
-    # TODO. add validator logics
     if pred is None:
         pred_handle = _semantic.builder.get_int1(True)
     else:
@@ -188,11 +183,11 @@ def named_barrier_wait(
     _semantic=None,
 ) -> None:
     """
-    Wait until `arrive_count` threads have reached the specified named mbarrier phase.
+    Wait until `arrive_count` threads have reached the specified named barrier.
 
     Arguments:
         bar (tl.constexpr): Identifier for the named barrier (e.g. from a buffer view).
-        count (tl.constexpr): Number of threads arriving at the barrier.
+        arrive_count (tl.constexpr): Number of threads arriving at the barrier.
     """
 
     bar_handle = _semantic._convert_elem_to_ir_value(bar, require_i64=False)
@@ -211,7 +206,7 @@ def named_barrier_arrive(
 
     Arguments:
         bar (tl.constexpr): Identifier for the named barrier (e.g. from a buffer view).
-        count (tl.constexpr): Number of threads arriving at the barrier.
+        arrive_count (tl.constexpr): Number of threads arriving at the barrier.
     """
     bar_handle = _semantic._convert_elem_to_ir_value(bar, require_i64=False)
     arrive_count_handle = _semantic._convert_elem_to_ir_value(arrive_count, require_i64=False)

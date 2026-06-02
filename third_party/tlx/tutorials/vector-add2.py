@@ -159,9 +159,9 @@ def benchmark(size, provider):
     quantiles = [0.5, 0.2, 0.8]
     if provider == "torch":
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: dual_add(x, y, a, b), quantiles=quantiles)
-    if provider == "triton":
+    elif provider == "triton":
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: add2(x, y, a, b), quantiles=quantiles)
-    if provider == "triton_ws":
+    elif provider == "triton_ws":
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: add2_warp_specialized(x, y, a, b), quantiles=quantiles)
     gbps = lambda ms: 3 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
     return gbps(ms), gbps(max_ms), gbps(min_ms)

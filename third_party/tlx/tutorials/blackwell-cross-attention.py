@@ -1,11 +1,11 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
+import os
 from typing import List
 from typing import Optional
 
 import pytest
 import torch
-import os
 
 # @manual=//triton:triton
 import triton
@@ -48,7 +48,6 @@ def _host_descriptor_pre_hook(nargs):
     HEAD_DIM = nargs["HEAD_DIM"]
     if not isinstance(nargs["desc_q"], TensorDescriptor):
         return
-    HEAD_DIM = nargs["HEAD_DIM"]
     DimV = nargs["BLOCK_D_V"]
     NUM_MMA_GROUPS = nargs["NUM_MMA_GROUPS"]
     BLOCK_M_SPLIT = BLOCK_M // NUM_MMA_GROUPS
@@ -63,7 +62,6 @@ def _host_descriptor_pre_hook_ws(nargs):
     HEAD_DIM = nargs["HEAD_DIM"]
     if not isinstance(nargs["desc_q"], TensorDescriptor):
         return
-    HEAD_DIM = nargs["HEAD_DIM"]
     DimV = nargs["BLOCK_D_V"]
     nargs["desc_q"].block_shape = [BLOCK_M, HEAD_DIM]
     nargs["desc_k"].block_shape = [BLOCK_N, HEAD_DIM]
@@ -78,7 +76,6 @@ def _host_descriptor_pre_hook_spec(nargs):
     HEAD_DIM = nargs["HEAD_DIM"]
     if not isinstance(nargs["desc_q"], TensorDescriptor):
         return
-    HEAD_DIM = nargs["HEAD_DIM"]
     DimV = nargs["BLOCK_D_V"]
     NUM_MMA_GROUPS = nargs["NUM_MMA_GROUPS"]
     BLOCK_M_SPLIT = BLOCK_M // NUM_MMA_GROUPS
@@ -769,7 +766,7 @@ def _attn_fwd_single_q(alpha, Z, H, desc_q, desc_k, desc_v, Out, seq_offsets_q, 
     )
     # p_tiles is in bf16/fp6, when reusing qk_tiles which is fp32,
     # we need to create 2xNUM_MMA_GROUPS of p_tiles and use the
-    # lower half for p1 so that  so that
+    # lower half for p1 so that
     # q0k won't overwrite p1.
     p_tiles = tlx.local_alloc(
         (BLOCK_M, BLOCK_N),
@@ -1014,7 +1011,7 @@ def _attn_fwd_pipeline(alpha, Z, H, desc_q, desc_k, desc_v, Out, seq_offsets_q, 
     )
     # p_tiles is in bf16/fp6, when reusing qk_tiles which is fp32,
     # we need to create 2xNUM_MMA_GROUPS of p_tiles and use the
-    # lower half for p1 so that  so that
+    # lower half for p1 so that
     # q0k won't overwrite p1.
     p_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, BLOCK_N),

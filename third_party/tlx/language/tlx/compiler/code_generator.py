@@ -2,9 +2,10 @@
 
 import ast
 import threading
-from typing import List
-import triton.language.extra.tlx as tlx  # Make sure async_task(s) are exposed via tlx.__init__.py
 from contextlib import contextmanager
+from typing import List
+
+import triton.language.extra.tlx as tlx  # Make sure async_task(s) are exposed via tlx.__init__.py
 
 # TLX allows users to specify the replicate number when defining
 # a non-default partition region. We use a stack to keep track of
@@ -54,8 +55,8 @@ def _is_async_task(self, node) -> bool:
     if isinstance(node, ast.With):
         context = node.items[0].context_expr
         if isinstance(context, ast.Call):
-            withitemClass = self.visit(context.func)
-            if withitemClass == tlx.async_task:
+            withitem_class = self.visit(context.func)
+            if withitem_class == tlx.async_task:
                 return True
     return False
 
@@ -202,15 +203,15 @@ def visit_withAsyncTasks(self, node):
         with tlx_enter_sub_region():
             block = self.builder.create_block()
             self.builder.set_insertion_point_to_start(block)
-            taskNumWarps = []
-            taskNumRegs = []
-            taskReplica = []
-            taskWarpGroupStartIds = []
+            task_num_warps = []
+            task_num_regs = []
+            task_replicas = []
+            task_warp_group_start_ids = []
 
             # Per-task data for validation (before replica expansion)
-            perTaskNumWarps = []
-            perTaskStartIds = []
-            perTaskReplicates = []
+            per_task_num_warps = []
+            per_task_start_ids = []
+            per_task_replicates = []
 
             region_replica_id_stack.append(-1)  # dummy placeholder
 
@@ -222,53 +223,53 @@ def visit_withAsyncTasks(self, node):
                 if task.is_default:
                     num_default += 1
                     if task.replicate > 1:
-                        taskReplica.append(task.replicate - 1)
-                        taskNumWarps.extend([self.builder.options.num_warps] * (task.replicate - 1))
+                        task_replicas.append(task.replicate - 1)
+                        task_num_warps.extend([self.builder.options.num_warps] * (task.replicate - 1))
                         if task.num_regs:
-                            taskNumRegs.extend([task.num_regs] * (task.replicate - 1))
+                            task_num_regs.extend([task.num_regs] * (task.replicate - 1))
                         if task.warp_group_start_id is not None:
-                            taskWarpGroupStartIds.extend([task.warp_group_start_id] * (task.replicate - 1))
+                            task_warp_group_start_ids.extend([task.warp_group_start_id] * (task.replicate - 1))
                 else:
-                    taskReplica.append(task.replicate)
-                    taskNumWarps.extend([task.num_warps] * task.replicate)
+                    task_replicas.append(task.replicate)
+                    task_num_warps.extend([task.num_warps] * task.replicate)
                     if task.num_regs:
-                        taskNumRegs.extend([task.num_regs] * task.replicate)
+                        task_num_regs.extend([task.num_regs] * task.replicate)
                     if task.warp_group_start_id is not None:
                         # Each replica gets its own start ID, incrementing by num_warps
                         for r in range(task.replicate):
-                            taskWarpGroupStartIds.append(task.warp_group_start_id + r * task.num_warps)
+                            task_warp_group_start_ids.append(task.warp_group_start_id + r * task.num_warps)
                         # Collect per-task data for validation
-                        perTaskNumWarps.append(task.num_warps)
-                        perTaskStartIds.append(task.warp_group_start_id)
-                        perTaskReplicates.append(task.replicate)
+                        per_task_num_warps.append(task.num_warps)
+                        per_task_start_ids.append(task.warp_group_start_id)
+                        per_task_replicates.append(task.replicate)
 
             region_replica_id_stack.pop()  # revert adding dummy placeholder
 
         assert num_default == 1, "Default task must be one and only one"
         block.erase()
 
-        assert len(taskNumRegs) in [0, len(taskNumWarps)
-                                    ], ("Registers are set for either ALL or NONE of non-default tasks")
-        assert len(taskWarpGroupStartIds) in [
-            0, len(taskNumWarps)
+        assert len(task_num_regs) in [0, len(task_num_warps)
+                                      ], ("Registers are set for either ALL or NONE of non-default tasks")
+        assert len(task_warp_group_start_ids) in [
+            0, len(task_num_warps)
         ], ("warp_group_start_id must be set for either ALL or NONE of non-default tasks")
 
         # Validate warp_group_start_ids
-        if len(perTaskStartIds) > 0:
+        if per_task_start_ids:
             _validate_warp_group_start_ids(
-                perTaskStartIds,
-                perTaskNumWarps,
-                perTaskReplicates,
+                per_task_start_ids,
+                per_task_num_warps,
+                per_task_replicates,
                 self.builder.options.num_warps,
             )
 
         # Create tasks body block
         self._set_insertion_point_and_loc(ip, last_loc)
         ws_op = self.builder.create_warp_specialize_op(
-            taskNumWarps,
-            taskNumRegs if len(taskNumRegs) > 0 else None,
-            sum(taskReplica),
-            taskWarpGroupStartIds if len(taskWarpGroupStartIds) > 0 else None,
+            task_num_warps,
+            task_num_regs if task_num_regs else None,
+            sum(task_replicas),
+            task_warp_group_start_ids if task_warp_group_start_ids else None,
         )
 
         # dry visit async task body to calculate captures
