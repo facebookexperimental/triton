@@ -2,7 +2,7 @@
 
 ## Problem
 
-Triton's default reduction (`tl.sum`, `tl.reduce`) uses a layout-dependent
+Triton's default reduction (`tl.sum`, `tl.reduce`) uses layout-dependent
 accumulation order. The compiler maps tensor elements to threads based on the
 chosen encoding (number of warps, block size, etc.) and reduces in whatever
 order falls out of that mapping. This means changing `num_warps` or
@@ -17,9 +17,9 @@ is necessary.
 
 The `reduction_ordering` parameter on `tl.sum` and `tl.reduce` lets the user
 request a specific, deterministic accumulation order that is independent of
-the thread layout. The system guarantees that, given the same logical input
+thread layout. Triton guarantees that, given the same logical input
 data and reduction ordering, the result is bitwise identical regardless of
-`num_warps`, memory layout (row-major vs column-major), or other compilation
+`num_warps`, memory layout (row-major versus column-major), or other compilation
 parameters.
 
 ### Usage
@@ -131,6 +131,7 @@ Passes `reduction_ordering.name` (a string like `"inner_tree"`) to
 **File: `python/src/ir.cc`, `create_reduce` binding (~line 1776)**
 
 Sets `StringAttr` on the MLIR `ReduceOp`:
+
 ```cpp
 reduceOp->setAttr("reduction_ordering",
     StringAttr::get(reduceOp->getContext(), reductionOrdering));
@@ -158,9 +159,9 @@ unsigned ReduceOpHelper::getNumContiguousGroupsOnAxis() {
 ```
 
 **K** (the return value) is the number of contiguous groups each thread holds
-along the reduction axis. For the default ordering, K=1 (everything is treated
-as one group). For inner tree, K = `elemsPerThread / contigPerThread` — each
-contiguous run of elements forms its own group, and groups are reduced
+along the reduction axis. For the default ordering, `K = 1` (everything is
+treated as one group). For inner tree, `K = elemsPerThread / contigPerThread`
+— each contiguous run of elements forms its own group, and groups are reduced
 independently through the warp/inter-warp phases before being combined at the
 end.
 
@@ -205,7 +206,7 @@ elements at axis positions {0,1,2,5,6}, it forms two groups: {0,1,2} and
 - **Inner tree (`countUp=true`)**: Shuffle strides go 1, 2, 4, ..., N/2
   (count-up tree)
 
-Count-up order means the smallest (most local) strides are combined first,
+The count-up order means the smallest (most local) strides are combined first,
 matching the inner-tree convention of reducing neighbors before distant
 elements.
 
@@ -245,6 +246,7 @@ where no shared memory is needed (reduction within a single warp).
 Consider 8 values: `a b c d e f g h`
 
 **Count-down** (default, stride 4→2→1):
+
 ```
 Step 1 (stride 4): (a+e) (b+f) (c+g) (d+h)
 Step 2 (stride 2): ((a+e)+(c+g)) ((b+f)+(d+h))
@@ -252,6 +254,7 @@ Step 3 (stride 1): (((a+e)+(c+g))+((b+f)+(d+h)))
 ```
 
 **Count-up / inner tree** (stride 1→2→4):
+
 ```
 Step 1 (stride 1): (a+b) (c+d) (e+f) (g+h)
 Step 2 (stride 2): ((a+b)+(c+d)) ((e+f)+(g+h))
@@ -291,6 +294,7 @@ python python/test/unit/language/generate_reduction_ordering_refs.py
 ```
 
 Produces files in `python/test/unit/language/test_data/`:
+
 - `reduction_ordering_input_{N_ROWS}.pt` — input data (seeded `torch.manual_seed(42)`)
 - `reduction_ordering_sum_ref_{N_ROWS}.pt` — expected sum output
 - `reduction_ordering_mul_input_{N_ROWS}.pt` — input for multiply (uniform 0.99–1.01)
@@ -301,7 +305,7 @@ Produces files in `python/test/unit/language/test_data/`:
 - `test_reduction_ordering_sum` — `tl.sum` with additive reduction
 - `test_reduction_ordering_reduce_mul` — `tl.reduce` with multiplicative combine
 
-Both parametrize over:
+Both are parametrized over:
 - `N_ROWS` ∈ {1, 4, 16, 32} (non-reduction dimension)
 - `row_major` ∈ {True, False} (memory layout)
 
@@ -327,7 +331,7 @@ To add a new ordering strategy (e.g., `OUTER_TREE`):
    `lib/Analysis/Utility.cpp` if the new strategy changes how shared memory
    is sized.
 
-3. **C++ lowering**: Add the new strategy's logic to each phase in
+3. **C++ lowering**: Add logic for the new strategy to each phase in
    `lib/Conversion/TritonGPUToLLVM/ReduceOpToLLVM.cpp`. The `isInnerTree()`
    pattern can be extended to a switch/enum on the attribute value.
 

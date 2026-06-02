@@ -73,7 +73,7 @@ def _attn_fwd_ws_pipelined_pingpong_persistent(sm_scale, M,  #
                                                ):
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
 
-    # Compute bytes per element for each tensor type
+    # Byte sizes used for TMA barrier expectations.
     Q_BYTES_PER_ELEM: tl.constexpr = tlx.size_of(tlx.dtype_of(desc_q))
     K_BYTES_PER_ELEM: tl.constexpr = tlx.size_of(tlx.dtype_of(desc_k))
     V_BYTES_PER_ELEM: tl.constexpr = tlx.size_of(tlx.dtype_of(desc_v))
@@ -197,7 +197,7 @@ def _attn_fwd_ws_pipelined_pingpong_persistent(sm_scale, M,  #
                 start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
                     tile_idx, H, num_pid_n, num_pid_in_group, N_CTX, BLOCK_M)
 
-                # initialize pointer to m and l
+                # Initialize running softmax statistics.
                 m_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32) - float("inf")
                 l_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32) + 1.0
                 acc = tl.zeros([BLOCK_M_SPLIT, HEAD_DIM], dtype=tl.float32)
@@ -321,11 +321,11 @@ def _attn_fwd_ws_pipelined_pingpong_persistent(sm_scale, M,  #
                 p = p.to(tlx.dtype_of(desc_k))
                 acc = tlx.async_dot(p, v_tiles[v_bufIdx], acc)
 
-                # signal Q empty
+                # Signal that the Q buffer is empty after the PV MMA is issued.
                 acc = tlx.async_dot_wait(1, acc)
                 tlx.barrier_arrive(q_empties[q_bufIdx + cid * NUM_BUFFERS_Q], 1)
 
-                # wait for the MMA using to complete
+                # Wait for the final PV MMA to complete.
                 acc = tlx.async_dot_wait(0, acc)
                 # release the V buffer
                 tlx.barrier_arrive(v_empties[v_bufIdx], 1)

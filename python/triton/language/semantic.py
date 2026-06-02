@@ -1748,9 +1748,15 @@ class TritonSemantic(Generic[TensorTy]):
         max_num_imprecise_acc: int,
         out_dtype: tl.dtype,
         attrs: Optional[dict] = None,
+        two_ctas: bool = False,
     ) -> tl.tensor:
+        # For standard tl.dot, don't use tlx_paired_ctas logic - the
+        # Transform2CTALoads pass will handle B splitting at the IR level.
+        # tlx_paired_ctas=True assumes B is already half-width (TLX approach),
+        # but pure Triton passes full-width B.
         (lhs, rhs, acc_handle, input_precision, max_num_imprecise_acc,
-         ret_ty) = self.dot_precheck(lhs, rhs, acc, input_precision, allow_tf32, max_num_imprecise_acc, out_dtype)
+         ret_ty) = self.dot_precheck(lhs, rhs, acc, input_precision, allow_tf32, max_num_imprecise_acc, out_dtype,
+                                     tlx_paired_ctas=False)
 
         result = tl.tensor(
             self.builder.create_dot(
@@ -1759,6 +1765,7 @@ class TritonSemantic(Generic[TensorTy]):
                 acc_handle,
                 input_precision,
                 max_num_imprecise_acc,
+                two_ctas,
             ),
             ret_ty,
         )

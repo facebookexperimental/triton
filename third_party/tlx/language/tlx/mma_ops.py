@@ -66,6 +66,16 @@ def require_tmem_scales_layout(src: tlx.buffered_tensor, _builder=None):
     return _builder.create_require_layout(src.handle, layout_handle)
 
 
+def _get_use_acc_handle(use_acc: tl.constexpr | tl.tensor | None, _builder):
+    if use_acc is None:
+        return None
+    assert isinstance(use_acc, tl.tensor) or isinstance(
+        use_acc, tl.constexpr), (f"use_acc must be a tensor or constexpr, but got {type(use_acc)}")
+    if isinstance(use_acc, tl.tensor):
+        return use_acc.handle
+    return _builder.get_int1(use_acc.value)
+
+
 # async dot signature needs to be close to tl.dot as much as possible
 @tl.builtin
 def async_dot(
@@ -141,14 +151,7 @@ def async_dot(
         acc_handle = require_tmem_layout(acc, 1, acc_cta_mode, _semantic.builder)
         handles = [t.handle for t in mBarriers]
         is_async = force_async or len(handles) > 0
-        use_acc_handle = None
-        if use_acc is not None:
-            assert isinstance(use_acc, tl.tensor) or isinstance(
-                use_acc, tl.constexpr), (f"use_acc must be a tensor or constexpr, but got {type(use_acc)}")
-            if isinstance(use_acc, tl.tensor):
-                use_acc_handle = use_acc.handle
-            else:
-                use_acc_handle = _semantic.builder.get_int1(use_acc.value)
+        use_acc_handle = _get_use_acc_handle(use_acc, _semantic.builder)
         output = _semantic.builder.create_tcgen5_dot(A_handle, B_handle, acc_handle, use_acc_handle, pred, two_ctas,
                                                      handles, is_async)
         return tl.tensor(output, tl.void)
@@ -309,14 +312,7 @@ def async_dot_scaled(
     acc_handle = require_tmem_layout(acc, 1, acc_cta_mode, _semantic.builder)
     bar_handles = [t.handle for t in mBarriers]
     is_async = force_async or len(bar_handles) > 0
-    use_acc_handle = None
-    if use_acc is not None:
-        assert isinstance(use_acc, tl.tensor) or isinstance(
-            use_acc, tl.constexpr), (f"use_acc must be a tensor or constexpr, but got {type(use_acc)}")
-        if isinstance(use_acc, tl.tensor):
-            use_acc_handle = use_acc.handle
-        else:
-            use_acc_handle = _semantic.builder.get_int1(use_acc.value)
+    use_acc_handle = _get_use_acc_handle(use_acc, _semantic.builder)
     output = _semantic.builder.create_tcgen5_dot_scaled(
         A_handle,
         B_handle,

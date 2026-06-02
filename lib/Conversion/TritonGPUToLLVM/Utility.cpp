@@ -316,7 +316,8 @@ std::optional<int> getWarpGroupStartWarpId(Block *block) {
   unsigned idx = block->getParent()->getRegionNumber();
   WarpSpecializeOp ws = partitions.getParentOp();
   std::optional<ArrayRef<int32_t>> startIds = ws.getWarpGroupStartIds();
-  assert(startIds && "cannot get warp group ID before warp group allocation");
+  if (!startIds)
+    return {};
   int32_t warpStartId = (*startIds)[idx];
   return warpStartId;
 }

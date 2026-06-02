@@ -99,14 +99,9 @@ static Attribute resolveRegisterLayout(DummyRegisterLayoutAttr dummyLayout,
                                        threadsPerWarp, numCTAs);
 }
 
-/// Resolve a dummy layout attribute to a concrete layout
-/// For TMEM layouts and TMEM-compatible register layouts, allocShape is used
-/// to determine the block dimensions.
-/// For register layouts from TMEMLoadOp, definingOp is used to get the source
-/// memdesc's allocation shape.
+/// Resolve a dummy layout attribute to a concrete layout.
 static Attribute
-resolveDummyLayout(Attribute dummyLayout, ArrayRef<int64_t> allocShape,
-                   Value value, ModuleOp moduleOp,
+resolveDummyLayout(Attribute dummyLayout, Value value, ModuleOp moduleOp,
                    const DenseMap<Value, Attribute> &valuesToRefTMEMLayoutMap) {
   // Get the context operation for lookupNumWarps - this allows finding
   // partition-specific num_warps for warp specialized regions
@@ -192,13 +187,8 @@ LogicalResult resolvePlaceholderLayouts(ModuleOp moduleOp) {
 
   // Resolve each dummy layout
   for (auto &[value, dummyLayout] : valuesToResolve) {
-    // Get allocation shape for TMEM layouts
-    ArrayRef<int64_t> allocShape;
-    if (auto memDescType = dyn_cast<ttg::MemDescType>(value.getType())) {
-      allocShape = memDescType.getAllocShape();
-    }
-    Attribute resolvedLayout = resolveDummyLayout(
-        dummyLayout, allocShape, value, moduleOp, valuesToRefTMEMLayoutMap);
+    Attribute resolvedLayout = resolveDummyLayout(dummyLayout, value, moduleOp,
+                                                  valuesToRefTMEMLayoutMap);
     LLVM_DEBUG({
       DBGS() << "Resolving dummy layout: ";
       dummyLayout.dump();

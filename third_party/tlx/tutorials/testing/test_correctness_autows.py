@@ -8,9 +8,7 @@ Run:
 """
 
 import pytest
-
 import torch
-
 import triton
 
 from triton.language.extra.tlx.tutorials.fused_attention_ws_device_tma import (

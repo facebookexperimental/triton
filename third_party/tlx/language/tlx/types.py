@@ -24,12 +24,8 @@ class shared_layout_encoding(layout_encoding):
 
     def __init__(self):
         super().__init__()
-        pass
 
-    """
-    Create a new layout object that is a permutation of the current layout.
-    """
-
+    # Create a new layout object that is a permutation of the current layout.
     @abstractmethod
     def make_permute(self, dims):
         raise NotImplementedError(f"{self.__class__.__name__}.make_permute() must be overridden in subclasses")
@@ -61,10 +57,7 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
         self.numCTASplit = numCTASplit
         self.numCTAOrder = numCTAOrder
 
-    """
-    Make a default non-swizzled shared layout encoding.
-    """
-
+    # Make a default non-swizzled shared layout encoding.
     @classmethod
     def make_default(cls, rank):
         return cls(
@@ -78,10 +71,7 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
             numCTAOrder=list(reversed(range(rank))),
         )
 
-    """
-    Create a new layout that is a permutation of the given layout.
-    """
-
+    # Create a new layout that is a permutation of the given layout.
     def make_permute(self, dims):
         permuted_order = tuple(self.order[d] for d in dims)
         return swizzled_shared_layout_encoding(
@@ -256,10 +246,7 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
         self.fp4Padded = fp4Padded
         self.swizzled = swizzled
 
-    """
-    Make a default NVMMA shared layout encoding.
-    """
-
+    # Make a default NVMMA shared layout encoding.
     @classmethod
     def make_default(cls, shape, elemType, fp4Padded=False):
         rank = len(shape)
@@ -274,10 +261,7 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
             swizzled=True,
         )
 
-    """
-    Create a new layout that is a permutation of the given layout.
-    """
-
+    # Create a new layout that is a permutation of the given layout.
     def make_permute(self, dims):
         permuted_order = tuple(self.order[d] for d in dims)
         return nv_mma_shared_layout_encoding(

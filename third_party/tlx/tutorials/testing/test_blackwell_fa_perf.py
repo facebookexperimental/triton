@@ -110,8 +110,11 @@ def create_benchmark(versions, mode="fwd"):
         flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
         # fwd: 2 matmuls (QK, PV). bwd: 5 matmuls (dQK, dPV, dV, dK, dQ) = 2.5x fwd
         total_flops = 2 * flops_per_matmul if mode == "fwd" else 5 * flops_per_matmul
-        perf = lambda ms: total_flops * 1e-12 / (ms * 1e-3)
-        return perf(ms), perf(max_ms), perf(min_ms)
+
+        def tflops(ms):
+            return total_flops * 1e-12 / (ms * 1e-3)
+
+        return tflops(ms), tflops(max_ms), tflops(min_ms)
 
     return benchmark
 

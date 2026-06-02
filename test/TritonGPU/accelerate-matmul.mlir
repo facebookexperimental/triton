@@ -1,5 +1,5 @@
 // RUN: triton-opt %s -split-input-file --tritongpu-accelerate-matmul -verify-diagnostics=only-expected | FileCheck %s
-// RUN: env TRITON_PREFER_TMEM_16x256_LAYOUT=1 triton-opt %s -split-input-file --tritongpu-accelerate-matmul | FileCheck %s --check-prefix=LAYOUT_16x256
+// RUN: env TRITON_PREFER_TMEM_16x256_LAYOUT=1 triton-opt %s -split-input-file --tritongpu-accelerate-matmul -verify-diagnostics=only-expected | FileCheck %s --check-prefix=LAYOUT_16x256
 
 // CHECK: #[[MMA:.+]] = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 16, 16]}>
 // CHECK: #[[MMA1:.+]] = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 64, 16]}>
@@ -722,4 +722,42 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %d = tt.dot %ad, %bd, %c, inputPrecision = tf32 : tensor<1024x16xf32, #ttg.dot_op<{opIdx = 0, parent = #blocked}>> * tensor<16x128xf32, #ttg.dot_op<{opIdx = 1, parent = #blocked}>> -> tensor<1024x128xf32, #blocked>
       tt.return %d : tensor<1024x128xf32, #blocked>
     }
+}
+
+// -----
+
+#blocked_fallback = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+module attributes {"ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: two_ctas_without_cluster_falls_back
+  tt.func public @two_ctas_without_cluster_falls_back(
+    %a: tensor<128x64xf16, #blocked_fallback>,
+    %b: tensor<64x128xf16, #blocked_fallback>,
+    %c: tensor<128x128xf32, #blocked_fallback>) -> tensor<128x128xf32, #blocked_fallback> {
+    %ad = ttg.convert_layout %a : tensor<128x64xf16, #blocked_fallback> -> tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked_fallback}>>
+    %bd = ttg.convert_layout %b : tensor<64x128xf16, #blocked_fallback> -> tensor<64x128xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked_fallback}>>
+    // expected-warning @+1 {{two_ctas=True requires ctas_per_cga=(2,1,1) or larger; cluster-dim-x is 1. Falling back to 1-CTA MMA.}}
+    %d = tt.dot %ad, %bd, %c {two_ctas} : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked_fallback}>> * tensor<64x128xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked_fallback}>> -> tensor<128x128xf32, #blocked_fallback>
+    // CHECK: ttng.tc_gen5_mma
+    // CHECK-NOT: two_ctas
+    tt.return %d : tensor<128x128xf32, #blocked_fallback>
+  }
+}
+
+// -----
+
+#blocked_fallback_m64 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: two_ctas_m64_falls_back
+  tt.func public @two_ctas_m64_falls_back(
+    %a: tensor<64x64xf16, #blocked_fallback_m64>,
+    %b: tensor<64x128xf16, #blocked_fallback_m64>,
+    %c: tensor<64x128xf32, #blocked_fallback_m64>) -> tensor<64x128xf32, #blocked_fallback_m64> {
+    %ad = ttg.convert_layout %a : tensor<64x64xf16, #blocked_fallback_m64> -> tensor<64x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked_fallback_m64}>>
+    %bd = ttg.convert_layout %b : tensor<64x128xf16, #blocked_fallback_m64> -> tensor<64x128xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked_fallback_m64}>>
+    // expected-warning @+1 {{two_ctas=True with BLOCK_M < 128 is not yet supported; m=64 2-CTA requires TensorMemoryCTAMode TwoCTA_LHS/RHS. Falling back to 1-CTA MMA.}}
+    %d = tt.dot %ad, %bd, %c {two_ctas} : tensor<64x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked_fallback_m64}>> * tensor<64x128xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked_fallback_m64}>> -> tensor<64x128xf32, #blocked_fallback_m64>
+    // CHECK: ttng.tc_gen5_mma
+    // CHECK-NOT: two_ctas
+    tt.return %d : tensor<64x128xf32, #blocked_fallback_m64>
+  }
 }

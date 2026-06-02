@@ -21,19 +21,41 @@ enum class HWPipeline {
 llvm::StringRef getPipelineName(HWPipeline pipeline);
 
 /// Latency info for a single operation.
+///
+/// The two fields play DISTINCT roles in modulo scheduling. Always use the
+/// definitions below — confusing them inflates II and breaks scheduling.
+///
+/// `latency` = dependency edge weight. Cycles from this op's ISSUE to when
+///   a *dependent consumer* can issue. (Equivalently: result-available
+///   delay.) Drives RecMII = max over SCCs of Σ(latency)/Σ(distance).
+///
+/// `selfLatency` = resource reservation. Cycles this op OCCUPIES its pipe —
+///   how soon another *unrelated* op on the same pipe can issue. Drives
+///   ResMII = for each pipe, Σ(selfLat × freq).
+///
+/// Invariant: 0 ≤ selfLatency ≤ latency.
+///   - selfLat == latency: op fully serializes its pipe (no overlap).
+///   - selfLat == 1: "fire-and-forget" — next pipe op issues 1 cyc later
+///     even if this op's result isn't ready.
+///
+/// Examples on Blackwell (FA fwd inner loop):
+///   tcgen05.mma 128×128×128 : selfLat=30,  latency=900,  min_warps=1
+///   descriptor_load 128×64  : selfLat=30,  latency=530,  min_warps=1
+///   math.exp2 128×64 (SFU)  : selfLat=64,  latency=570,  min_warps=4
+///   arith.mulf 128×64 (FMA) : selfLat=64,  latency=67,   min_warps=4
+///
+/// `min_warps` = the warp count assumed by the modeled `selfLat`. If the
+/// containing WG actually has fewer warps, `selfLat` scales up roughly
+/// linearly: `effective = selfLat × min_warps / actual_warps`. Async ops
+/// (TMA, MMA) only need 1 warp to issue, so `min_warps=1`. Tile-parallel
+/// CUDA/SFU ops use all 4 subpartitions, so `min_warps=4`. Used by the
+/// partitioner to size each WG's warp count and avoid mis-charging the
+/// pipe-occupancy cost.
 struct OpLatencyInfo {
   HWPipeline pipeline{HWPipeline::NONE};
-  int latency{0}; // Total latency: cycles from op start to result available.
-                  // Used for dependency analysis (RecMII — how long a
-                  // consumer must wait for the result).
-  int selfLatency{0}; // Pipeline occupancy: cycles this op blocks its pipeline.
-                      // Used for resource conflict analysis (ResMII — how much
-                      // pipeline bandwidth is consumed).
-  int transferLatency{0}; // For async MEM ops: the full TMA transfer time
-                          // (pipeline occupancy from the TMA engine's
-                          // perspective). Used as edge weight from load to
-                          // local_alloc so the alloc stays at the right stage.
-                          // For non-async ops, equals selfLatency.
+  int latency{0};
+  int selfLatency{0};
+  int minWarps{1};
 };
 
 /// Hardware latency model for Blackwell SM100.
@@ -59,7 +81,10 @@ private:
   int getTMAStoreLatency(Operation *op) const;
   int getMMALatency(Operation *op) const;
   int getCUDALatency(Operation *op) const;
+  int getCUDASelfLat(Operation *op) const;
   int getSFULatency(Operation *op) const;
+  int getSFUSelfLat(Operation *op) const;
+  int getMinWarps(Operation *op) const;
 
   /// Estimate tensor size in elements from an op's result type.
   int64_t getTensorElements(Operation *op) const;

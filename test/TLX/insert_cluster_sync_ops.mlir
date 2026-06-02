@@ -163,9 +163,10 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
 
 // -----
 
-// Test that a local-only barrier init in a non-first block triggers an error
-// when remote barriers exist elsewhere in the module. The remote barrier is
-// in the first block, but the local init inside the WS region is not allowed.
+// Test that a local-only barrier init in a non-entry block is allowed when
+// remote barriers exist elsewhere in the module. The remote barrier is in the
+// entry block, but the local init inside the WS region does not participate in
+// kernel-entry cluster synchronization.
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
@@ -181,11 +182,10 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
       ttg.warp_yield
     }
     partition0(%arg0: !ttg.memdesc<1xi64, #shared, #smem, mutable>) num_warps(4) {
-      // Local-only barrier init in non-first block should error
+      // Local-only barrier init in a WS partition should be allowed.
       %3 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
       %c0 = arith.constant 0 : i32
       %4 = ttg.memdesc_index %3[%c0] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
-      // expected-error @+1 {{Barrier init outside of the first block in function is not supported}}
       ttng.init_barrier %4, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
       ttng.arrive_barrier %4, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
       ttg.warp_return
@@ -205,7 +205,6 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
       %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
       %c0_i32 = arith.constant 0 : i32
       %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
-      // expected-error @+1 {{Barrier init outside of the first block in function is not supported}}
       ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
       %9 = ttng.map_to_remote_buffer %1, %c0_i32 : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
       ttg.warp_yield
