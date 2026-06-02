@@ -7,7 +7,6 @@
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
-#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 
 #undef DEBUG_TYPE
 #define DEBUG_TYPE "tritonamdgpu-coalesce-async-copy"
@@ -235,12 +234,12 @@ private:
 
 struct CoalesceBufferLoadToLocal
     : public OpRewritePattern<triton::amdgpu::BufferLoadToLocalOp> {
-  CoalesceAsyncCopyWrites(const triton::AMD::TargetInfo &targetInfo,
+  CoalesceBufferLoadToLocal(const triton::AMD::TargetInfo &targetInfo,
                           const DenseMap<triton::amdgpu::BufferLoadToLocalOp,
-                                         unsigned> &asyncCopyContiguity,
+                                         unsigned> &bufferLoadToLocalContiguity,
                           MLIRContext *ctx)
       : OpRewritePattern(ctx), targetInfo{targetInfo},
-        asyncCopyContiguity{std::move(asyncCopyContiguity)} {}
+        bufferLoadToLocalContiguity{std::move(bufferLoadToLocalContiguity)} {}
 
   LogicalResult matchAndRewrite(triton::amdgpu::BufferLoadToLocalOp bufOp,
                                 PatternRewriter &rewriter) const override {
@@ -269,8 +268,8 @@ struct CoalesceBufferLoadToLocal
 
     // We start from the precomputed contiguity we got from AxisAnalysis.
     unsigned loadContig = 0;
-    if (auto it = asyncCopyContiguity.find(bufOp);
-        it != asyncCopyContiguity.end())
+    if (auto it = bufferLoadToLocalContiguity.find(bufOp);
+        it != bufferLoadToLocalContiguity.end())
       loadContig = it->second;
     else
       return bufOp->emitError()
@@ -441,7 +440,7 @@ struct CoalesceBufferLoadToLocal
 
 private:
   const triton::AMD::TargetInfo &targetInfo;
-  const DenseMap<ttg::AsyncCopyGlobalToLocalOp, unsigned> &asyncCopyContiguity;
+  const DenseMap<triton::amdgpu::BufferLoadToLocalOp, unsigned> &bufferLoadToLocalContiguity;
 };
 
 } // anonymous namespace
@@ -486,18 +485,16 @@ public:
     m->walk([&](triton::amdgpu::BufferLoadToLocalOp bufOp) {
       Value ptr = bufOp.getPtr();
       Value offsets = bufOp.getOffsets();
+
       unsigned contiguity =
-          mlir::LLVM::AMD::getContiguity(copyOp.getPtr(), axisAnalysis);
-      if (auto *offsetInfo = axisAnalysis.getAxisInfo(offsets)) {
-        auto offsetTy = cast<RankedTensorType>(offsets.getType());
-        contiguity = std::min<unsigned>(contiguity, offsetInfo->getContiguity());
-      }
-      if (auto mask = copyOp.getMask()) {
+             mlir::LLVM::AMD::getContiguity(offsets, axisAnalysis);
+
+      if (auto mask = bufOp.getMask()) {
         contiguity =
             std::min<unsigned>(contiguity, axisAnalysis.getMaskAlignment(mask));
       }
 
-      bufferOpsToLocalContiguity.insert({copyOp, contiguity});
+      bufferOpsToLocalContiguity.insert({bufOp, contiguity});
     });
 
     patterns.add<CoalesceAsyncCopyWrites>(targetInfo, asyncCopyContiguity,
