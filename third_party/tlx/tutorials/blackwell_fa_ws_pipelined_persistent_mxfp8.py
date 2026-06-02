@@ -10,6 +10,7 @@ from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 from triton.language.extra.tlx.mxfp8_utils import (
     _amax_to_e8m0_and_quantize,
+    _cvt_e4m3x4_f32,
     _to_mxfp8_block,
     _to_mxfp8_block_with_block_amax,
 )
@@ -1370,21 +1371,13 @@ def _softmax_recompute_quantization_iter(
     qkT_scaled = tl.minimum(qkT_scaled, 20.0)
     pT = tl.math.exp2(qkT_scaled)
 
-    # Block amax for P via monotonicity of exp2
-    qkT_reshaped = tl.reshape(qkT_scaled, [BLOCK_N1, P_NUM_BLOCKS, VEC_SIZE])
-    block_maxes_p = tl.max(qkT_reshaped, 2)
-    block_amax_p = tl.math.exp2(block_maxes_p)
-
-    # Quantize P^T -> TMEM (FP8 data + E8M0 scales)
-    p_fp8, p_scale = _to_mxfp8_block_with_block_amax(
-        pT,
-        block_amax_p,
-        VEC_SIZE,
-        p_dtype,
-    )
+    # Quantize P^T -> TMEM with fixed pow2 scale.
+    # P = exp2(QK·scale - m) ∈ [0, 1], so a fixed E8M0 scale works for all
+    # blocks. E8M0=119 → scale=2^(-8), inv_scale=256. This eliminates the
+    # per-block amax reshape, avoiding the convert_layout before tmem_store.
+    P_FIXED_INV_SCALE: tl.constexpr = 256.0
+    p_fp8 = _cvt_e4m3x4_f32(_mul_f32x2(pT, P_FIXED_INV_SCALE))
     tlx.local_store(tlx.local_view(p_tiles, 0), p_fp8)
-    p_scale_packed = p_scale.reshape([REP_N, 4, 32, REP_M, 4]).permute(0, 3, 2, 1, 4)
-    tlx.local_store(tlx.local_view(p_scale_buf_smem, 0), p_scale_packed)
 
     tlx.barrier_arrive(p_fulls[0])
     tlx.barrier_arrive(m_empties[m_buf_id])
@@ -1898,6 +1891,12 @@ def _attn_bwd_mxf8_ws(
         # ----- Compute warp: softmax recompute + P/dS quantization -----
         # Default task -- its warp count comes from autotune num_warps (= 4).
         with tlx.async_task("default"):
+            # Pre-fill P scale SMEM once (constant E8M0=119 for all tiles).
+            P_FIXED_E8M0: tl.constexpr = 119
+            p_scale_const = tl.full(
+                [REP_N, REP_M, 32, 4, 4], P_FIXED_E8M0, dtype=tl.uint8)
+            tlx.local_store(p_scale_smem[0], p_scale_const)
+
             blk_idx = 0
             for _i in range(tiles_per_sm):
                 _, persistent_tmem_phase = get_bufidx_phase(_i, NUM_BUFFERS_TMEM)
