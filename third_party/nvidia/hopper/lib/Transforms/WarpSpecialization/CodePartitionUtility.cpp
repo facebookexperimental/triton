@@ -2860,20 +2860,25 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
     }
   }
 
-  // When a producer has multiple task IDs (e.g., a shared local_alloc
-  // consumed by data-partitioned computation groups), no channel is needed
-  // for any producer that is co-located with a consumer. It is unclear if
-  // is sufficient when there are multiple consumers.
+  // When a producer has multiple task IDs (e.g., a shared local_alloc whose
+  // task ids include both the value producer and the consumers), select the
+  // single producer task that is not co-located with a consumer. This can
+  // happen with data-partitioned computation groups where one producer feeds
+  // multiple consumer partitions. If all producer tasks are co-located with
+  // consumers, no cross-partition channel is needed.
   AsyncTaskId producerTaskId = -1;
-  if (producerTaskIds.size() > 1 && consumerTaskIds.size() == 1) {
-    auto consumerTaskId = consumerTaskIds.front();
+  if (producerTaskIds.size() > 1) {
+    DenseSet<int> consumerTaskIdSet(consumerTaskIds.begin(),
+                                    consumerTaskIds.end());
     for (auto id : producerTaskIds) {
-      if (id != consumerTaskId) {
+      if (!consumerTaskIdSet.contains(id)) {
         assert(producerTaskId == -1 &&
-               "Multiple producers encountered for 1 consumer");
+               "Multiple cross-partition producers encountered");
         producerTaskId = id;
       }
     }
+    if (producerTaskId == -1)
+      return;
   } else {
     assert(producerTaskIds.size() == 1);
     producerTaskId = producerTaskIds.front();
@@ -2891,8 +2896,11 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
       channels.back()->srcName = getOutermostNameFromLoc(allocOp->getLoc());
     }
   } else {
+    // Keep SMEM post-channel records even when producer and consumer are
+    // co-located. The memory planner uses these channels for bookkeeping such
+    // as epilogue buffer fusion, independent of whether a sync is needed.
     channels.push_back(std::make_unique<ChannelPost>(
-        producerTaskIds.front(), consumerTaskIds, allocOp, channels.size()));
+        producerTaskId, consumerTaskIds, allocOp, channels.size()));
     channels.back()->srcName = getOutermostNameFromLoc(allocOp->getLoc());
   }
 }
