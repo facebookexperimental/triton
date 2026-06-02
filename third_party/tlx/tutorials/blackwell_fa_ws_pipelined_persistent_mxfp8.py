@@ -1893,8 +1893,7 @@ def _attn_bwd_mxf8_ws(
         with tlx.async_task("default"):
             # Pre-fill P scale SMEM once (constant E8M0=119 for all tiles).
             P_FIXED_E8M0: tl.constexpr = 119
-            p_scale_const = tl.full(
-                [REP_N, REP_M, 32, 4, 4], P_FIXED_E8M0, dtype=tl.uint8)
+            p_scale_const = tl.full([REP_N, REP_M, 32, 4, 4], P_FIXED_E8M0, dtype=tl.uint8)
             tlx.local_store(p_scale_smem[0], p_scale_const)
 
             blk_idx = 0
