@@ -77,24 +77,21 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
         // latency and silently break the `superNodeII` floor in
         // `computeMinII`.
         int64_t tripCount = 32; // fallback for dynamic bounds
-        auto lb = innerLoop.getLowerBound()
-                      .getDefiningOp<arith::ConstantIntOp>();
-        auto ub = innerLoop.getUpperBound()
-                      .getDefiningOp<arith::ConstantIntOp>();
-        auto step = innerLoop.getStep()
-                        .getDefiningOp<arith::ConstantIntOp>();
+        auto lb =
+            innerLoop.getLowerBound().getDefiningOp<arith::ConstantIntOp>();
+        auto ub =
+            innerLoop.getUpperBound().getDefiningOp<arith::ConstantIntOp>();
+        auto step = innerLoop.getStep().getDefiningOp<arith::ConstantIntOp>();
         if (lb && ub && step && step.value() > 0) {
           int64_t lbV = lb.value();
           int64_t ubV = ub.value();
           int64_t stepV = step.value();
-          tripCount = std::max<int64_t>(
-              1, (ubV - lbV + stepV - 1) / stepV);
+          tripCount = std::max<int64_t>(1, (ubV - lbV + stepV - 1) / stepV);
         } else {
           innerLoop.emitWarning(
               "modulo schedule: inner-loop bounds are not compile-time "
               "constants; using a default trip count of 32 — schedule "
               "decisions may be suboptimal");
-
         }
         node.latency = static_cast<int>(
             std::min<int64_t>(INT_MAX, innerSched->II * tripCount));

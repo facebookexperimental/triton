@@ -131,14 +131,12 @@ static void emitScheduleFromGraph(scf::ForOp loop,
     op.removeAttr("tt.modulo_cycle");
 
   llvm::errs() << "[MODULO] Emitted schedule: II=" << II
-               << " maxStage=" << maxStage
-               << " num_stages=" << (maxStage + 1)
+               << " maxStage=" << maxStage << " num_stages=" << (maxStage + 1)
                << " buffers=" << schedLoop.buffers.size() << "\n";
   for (const auto &buf : schedLoop.buffers) {
     if (!buf.defOp || buf.kind == ttg::MemoryKind::BARRIER)
       continue;
-    llvm::errs() << "[MODULO]   buf" << buf.id
-                 << " count=" << buf.count
+    llvm::errs() << "[MODULO]   buf" << buf.id << " count=" << buf.count
                  << " kind=" << (int)buf.kind
                  << " op=" << buf.defOp->getName().getStringRef() << "\n";
   }
@@ -1432,11 +1430,11 @@ struct ScheduledLoop {
 /// site filters on whichever combination of flags it cares about.
 struct CandidateLoop {
   scf::ForOp op;
-  scf::ForOp parent;          // null op if outermost
-  unsigned depth{0};          // 0 = outermost
-  bool hasMMA{false};         // direct body has tcgen5_mma{,Scaled}
-  bool hasTMA{false};         // direct body has descriptor_load / async TMA copy
-  bool hasInnerLoop{false};   // direct body has a nested scf::ForOp
+  scf::ForOp parent;        // null op if outermost
+  unsigned depth{0};        // 0 = outermost
+  bool hasMMA{false};       // direct body has tcgen5_mma{,Scaled}
+  bool hasTMA{false};       // direct body has descriptor_load / async TMA copy
+  bool hasInnerLoop{false}; // direct body has a nested scf::ForOp
   bool hasExistingAnnotation{false}; // tt.autows on an MMA — user-tuned, skip
 };
 
@@ -1472,9 +1470,8 @@ static SmallVector<CandidateLoop> collectCandidates(ModuleOp moduleOp) {
     }
     result.push_back(c);
   });
-  llvm::stable_sort(result, [](const auto &a, const auto &b) {
-    return a.depth > b.depth;
-  });
+  llvm::stable_sort(
+      result, [](const auto &a, const auto &b) { return a.depth > b.depth; });
   return result;
 }
 

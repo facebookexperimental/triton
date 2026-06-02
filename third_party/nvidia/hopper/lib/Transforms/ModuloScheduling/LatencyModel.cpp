@@ -172,8 +172,8 @@ static int scaleByElements(int baseCycles, int64_t elements) {
   if (elements <= 0)
     return baseCycles;
   // Linear scaling from the 128x128 baseline. Rounded.
-  return static_cast<int>(
-      static_cast<int64_t>(baseCycles) * elements / kBaseElems);
+  return static_cast<int>(static_cast<int64_t>(baseCycles) * elements /
+                          kBaseElems);
 }
 
 int LatencyModel::getCUDALatency(Operation *op) const {
@@ -461,16 +461,16 @@ HWPipeline LatencyModel::classifyPipeline(Operation *op) const {
 //  - Scalar ops, NONE pipeline: 1 warp suffices.
 int LatencyModel::getMinWarps(Operation *op) const {
   // Async producers — 1 warp issues, hardware does the rest.
-  if (isa<tt::DescriptorLoadOp, tt::DescriptorStoreOp,
-          tt::DescriptorGatherOp, ttng::AsyncTMACopyGlobalToLocalOp,
-          ttng::AsyncTMACopyLocalToGlobalOp>(op))
+  if (isa<tt::DescriptorLoadOp, tt::DescriptorStoreOp, tt::DescriptorGatherOp,
+          ttng::AsyncTMACopyGlobalToLocalOp, ttng::AsyncTMACopyLocalToGlobalOp>(
+          op))
     return 1;
-  if (isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp,
-          ttng::WarpGroupDotOp, tt::DotOp>(op))
+  if (isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp, ttng::WarpGroupDotOp,
+          tt::DotOp>(op))
     return 1;
   // Synchronization primitives.
-  if (isa<ttng::WaitBarrierOp, ttng::ArriveBarrierOp,
-          ttng::BarrierExpectOp>(op))
+  if (isa<ttng::WaitBarrierOp, ttng::ArriveBarrierOp, ttng::BarrierExpectOp>(
+          op))
     return 1;
   // TMEM ops — TLX/Blackwell hardware constraint requires 4 or 8 warps.
   if (isa<ttng::TMEMLoadOp, ttng::TMEMStoreOp>(op))

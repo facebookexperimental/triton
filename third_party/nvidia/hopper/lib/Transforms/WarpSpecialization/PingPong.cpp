@@ -294,12 +294,13 @@ Operation *findEndOp(CriticalRegionManager &crManager, Operation *keyOp,
 /// This is the grouping-time question: can two expensive ops live in the same
 /// ping-pong region? It differs from findEndOp (which finds a region's *end*
 /// boundary and, for NonReorderable ops, returns the op itself) in two ways:
-///   - The two endpoint ops are excluded. An expensive op such as WarpGroupDotOp
+///   - The two endpoint ops are excluded. An expensive op such as
+///   WarpGroupDotOp
 ///     is NonReorderable: its own SMEM-operand read is the op itself, not an
 ///     intervening effect, so it must not reject grouping (B-4 / T273470439).
 ///   - Other expensive ops between the endpoints are skipped. They are peers in
-///     the same ping-pong region (managed by their own barriers), so they do not
-///     split the region either; skipping them lets a run of N expensive ops
+///     the same ping-pong region (managed by their own barriers), so they do
+///     not split the region either; skipping them lets a run of N expensive ops
 ///     union into a single region.
 ///
 /// Callers must ensure the two ops are control-flow equivalent

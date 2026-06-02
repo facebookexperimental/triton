@@ -10,11 +10,9 @@ extracted from FileCheck lines.
 """
 
 import argparse
-import json
 import os
 import re
 import subprocess
-import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -77,16 +75,14 @@ def extract_expected(test_path: Path) -> ExpectedSchedule:
     if trip_match:
         expected.trip_count = int(trip_match.group(1))
 
-    for m in re.finditer(
-        r"CHECK.*?modulo\.stage @s(\d+)", text
-    ):
+    for m in re.finditer(r"CHECK.*?modulo\.stage @s(\d+)", text):
         stage_id = int(m.group(1))
         expected.stages[stage_id] = []
 
     for m in re.finditer(
-        r"CHECK.*?(tt\.\w+|ttg\.\w+|ttng\.\w+)\s+\{pipe: (\w+), cycle: (\d+), "
-        r"cluster: (\d+), latency: (\d+), selfLatency: (\d+)",
-        text,
+            r"CHECK.*?(tt\.\w+|ttg\.\w+|ttng\.\w+)\s+\{pipe: (\w+), cycle: (\d+), "
+            r"cluster: (\d+), latency: (\d+), selfLatency: (\d+)",
+            text,
     ):
         op_name, pipe, cycle, cluster, latency, self_lat = m.groups()
         stage = int(cycle) // expected.ii if expected.ii else 0
@@ -101,9 +97,7 @@ def extract_expected(test_path: Path) -> ExpectedSchedule:
         if stage in expected.stages:
             expected.stages[stage].append(entry)
 
-    for m in re.finditer(
-        r"CHECK.*?N(\d+) -> N(\d+)\s+lat=(\d+)\s+dist=(\d+)", text
-    ):
+    for m in re.finditer(r"CHECK.*?N(\d+) -> N(\d+)\s+lat=(\d+)\s+dist=(\d+)", text):
         expected.edges.append({
             "src": int(m.group(1)),
             "dst": int(m.group(2)),
@@ -111,9 +105,7 @@ def extract_expected(test_path: Path) -> ExpectedSchedule:
             "dist": int(m.group(4)),
         })
 
-    for m in re.finditer(
-        r"CHECK.*?%buf(\d+) = modulo\.alloc (\w+) \[(\d+) x", text
-    ):
+    for m in re.finditer(r"CHECK.*?%buf(\d+) = modulo\.alloc (\w+) \[(\d+) x", text):
         expected.buffers.append({
             "id": int(m.group(1)),
             "kind": m.group(2),
@@ -135,9 +127,7 @@ def parse_llm_schedule(output: str) -> dict:
         "buffers": [],
     }
 
-    schedule_match = re.search(
-        r"modulo\.schedule @\w+ \{(.+?)\n\s*\}", output, re.DOTALL
-    )
+    schedule_match = re.search(r"modulo\.schedule @\w+ \{(.+?)\n\s*\}", output, re.DOTALL)
     if not schedule_match:
         return result
 
@@ -161,9 +151,9 @@ def parse_llm_schedule(output: str) -> dict:
         result["stages"][int(m.group(1))] = []
 
     for m in re.finditer(
-        r"(tt\.\w+|ttg\.\w+|ttng\.\w+)\s+\{pipe: (\w+), cycle: (\d+), "
-        r"cluster: (\d+), latency: (\d+), selfLatency: (\d+)",
-        body,
+            r"(tt\.\w+|ttg\.\w+|ttng\.\w+)\s+\{pipe: (\w+), cycle: (\d+), "
+            r"cluster: (\d+), latency: (\d+), selfLatency: (\d+)",
+            body,
     ):
         op_name, pipe, cycle, cluster, latency, self_lat = m.groups()
         ii = result["ii"] or 1
@@ -179,9 +169,7 @@ def parse_llm_schedule(output: str) -> dict:
         if stage in result["stages"]:
             result["stages"][stage].append(entry)
 
-    for m in re.finditer(
-        r"N(\d+) -> N(\d+)\s+lat=(\d+)\s+dist=(\d+)", body
-    ):
+    for m in re.finditer(r"N(\d+) -> N(\d+)\s+lat=(\d+)\s+dist=(\d+)", body):
         result["edges"].append({
             "src": int(m.group(1)),
             "dst": int(m.group(2)),
@@ -189,9 +177,7 @@ def parse_llm_schedule(output: str) -> dict:
             "dist": int(m.group(4)),
         })
 
-    for m in re.finditer(
-        r"%buf(\d+) = modulo\.alloc (\w+) \[(\d+) x", body
-    ):
+    for m in re.finditer(r"%buf(\d+) = modulo\.alloc (\w+) \[(\d+) x", body):
         result["buffers"].append({
             "id": int(m.group(1)),
             "kind": m.group(2),
@@ -209,55 +195,34 @@ def validate(expected: ExpectedSchedule, actual: dict) -> list[str]:
         failures.append(f"II: expected {expected.ii}, got {actual['ii']}")
 
     if expected.max_stage is not None and actual["max_stage"] != expected.max_stage:
-        failures.append(
-            f"max_stage: expected {expected.max_stage}, got {actual['max_stage']}"
-        )
+        failures.append(f"max_stage: expected {expected.max_stage}, got {actual['max_stage']}")
 
-    if (
-        expected.prologue_latency is not None
-        and actual["prologue_latency"] != expected.prologue_latency
-    ):
-        failures.append(
-            f"prologue_latency: expected {expected.prologue_latency}, "
-            f"got {actual['prologue_latency']}"
-        )
+    if (expected.prologue_latency is not None and actual["prologue_latency"] != expected.prologue_latency):
+        failures.append(f"prologue_latency: expected {expected.prologue_latency}, "
+                        f"got {actual['prologue_latency']}")
 
     if expected.trip_count is not None and actual["trip_count"] != expected.trip_count:
-        failures.append(
-            f"trip_count: expected {expected.trip_count}, got {actual['trip_count']}"
-        )
+        failures.append(f"trip_count: expected {expected.trip_count}, got {actual['trip_count']}")
 
     for stage_id, expected_nodes in expected.stages.items():
         actual_nodes = actual["stages"].get(stage_id, [])
         for enode in expected_nodes:
             found = False
             for anode in actual_nodes:
-                if (
-                    anode["op"] == enode["op"]
-                    and anode["pipe"] == enode["pipe"]
-                    and anode["cycle"] == enode["cycle"]
-                    and anode["cluster"] == enode["cluster"]
-                ):
+                if (anode["op"] == enode["op"] and anode["pipe"] == enode["pipe"] and anode["cycle"] == enode["cycle"]
+                        and anode["cluster"] == enode["cluster"]):
                     found = True
                     if anode["latency"] != enode["latency"]:
-                        failures.append(
-                            f"Stage {stage_id} {enode['op']}: "
-                            f"latency expected {enode['latency']}, "
-                            f"got {anode['latency']}"
-                        )
+                        failures.append(f"Stage {stage_id} {enode['op']}: "
+                                        f"latency expected {enode['latency']}, "
+                                        f"got {anode['latency']}")
                     break
             if not found:
-                failures.append(
-                    f"Stage {stage_id}: missing node {enode['op']} "
-                    f"at cycle {enode['cycle']}"
-                )
+                failures.append(f"Stage {stage_id}: missing node {enode['op']} "
+                                f"at cycle {enode['cycle']}")
 
-    expected_edge_set = {
-        (e["src"], e["dst"], e["lat"], e["dist"]) for e in expected.edges
-    }
-    actual_edge_set = {
-        (e["src"], e["dst"], e["lat"], e["dist"]) for e in actual["edges"]
-    }
+    expected_edge_set = {(e["src"], e["dst"], e["lat"], e["dist"]) for e in expected.edges}
+    actual_edge_set = {(e["src"], e["dst"], e["lat"], e["dist"]) for e in actual["edges"]}
     for edge in expected_edge_set - actual_edge_set:
         failures.append(f"Missing edge: N{edge[0]} -> N{edge[1]} lat={edge[2]} dist={edge[3]}")
 
@@ -266,29 +231,30 @@ def validate(expected: ExpectedSchedule, actual: dict) -> list[str]:
 
 def call_claude(mlir_input: str, system_prompt: str, model: str = "sonnet") -> str:
     """Call Claude CLI with the scheduling prompt and MLIR input."""
-    user_prompt = (
-        "Given the following TTGIR loop body, produce the modulo.schedule "
-        "graph by following the steps in your instructions.\n\n"
-        "IMPORTANT: Output ONLY the raw modulo.schedule block. Do NOT wrap "
-        "it in markdown code fences. Do NOT include any explanation.\n\n"
-        "The TTGIR input:\n\n"
-        f"{mlir_input}"
-    )
+    user_prompt = ("Given the following TTGIR loop body, produce the modulo.schedule "
+                   "graph by following the steps in your instructions.\n\n"
+                   "IMPORTANT: Output ONLY the raw modulo.schedule block. Do NOT wrap "
+                   "it in markdown code fences. Do NOT include any explanation.\n\n"
+                   "The TTGIR input:\n\n"
+                   f"{mlir_input}")
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".txt", delete=False
-    ) as sp_file:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as sp_file:
         sp_file.write(system_prompt)
         sp_path = sp_file.name
 
     try:
         cmd = [
             "claude",
-            "--system-prompt", sp_path,
-            "-p", user_prompt,
-            "--output-format", "text",
-            "--model", model,
-            "--allowedTools", "",
+            "--system-prompt",
+            sp_path,
+            "-p",
+            user_prompt,
+            "--output-format",
+            "text",
+            "--model",
+            model,
+            "--allowedTools",
+            "",
         ]
         result = subprocess.run(
             cmd,
