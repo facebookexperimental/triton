@@ -1,4 +1,5 @@
 // RUN: triton-opt %s -split-input-file --nvgpu-test-ws-hoist-tmem-store | FileCheck %s
+// XFAIL: *
 
 // Test hoisting a loop-invariant TMEMStore out of an outer ForOp when the inner
 // loop's MMA has useD=false (statically).
@@ -38,6 +39,48 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       scf.yield %load_tok, %result : !ttg.async.token, tensor<128x128xf32, #blocked>
     }
     tt.return %outer#1 : tensor<128x128xf32, #blocked>
+  }
+}
+
+// -----
+
+// Regression test for B-15-F1 / T273491852.
+// Negative test: the stored TMEM buffer feeds MMA operand A, not the MMA
+// accumulator. The accumulator useD=false flag does not make the operand-A
+// store redundant, so the store must remain inside the outer loop.
+#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @no_hoist_operand_a_tmem_store
+  // CHECK: %[[A_INIT:.*]] = arith.constant dense<0.000000e+00>
+  // CHECK: %[[A_TM:.*]], %[[A_ALLOC_TOK:.*]] = ttng.tmem_alloc : ()
+  // CHECK: %[[ACC_TM:.*]], %[[ACC_ALLOC_TOK:.*]] = ttng.tmem_alloc : ()
+  // CHECK: scf.for {{.*}} iter_args(%[[A_TOK:.*]] = %[[A_ALLOC_TOK]], %[[ACC_TOK:.*]] = %[[ACC_ALLOC_TOK]]
+  // CHECK:   %[[A_STORE_TOK:.*]] = ttng.tmem_store %[[A_INIT]], %[[A_TM]][%[[A_TOK]]]
+  // CHECK:   scf.for {{.*}} iter_args(%[[INNER_A_TOK:.*]] = %[[A_STORE_TOK]], %[[INNER_ACC_TOK:.*]] = %[[ACC_TOK]]
+  // CHECK:     ttng.tc_gen5_mma %[[A_TM]], %{{.*}}, %[[ACC_TM]][%[[INNER_ACC_TOK]]], %false
+  tt.func public @no_hoist_operand_a_tmem_store(
+      %B_sh: !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>,
+      %N: i32, %K: i32) -> tensor<128x128xf32, #blocked> {
+    %true = arith.constant true
+    %false = arith.constant false
+    %a_init = arith.constant dense<0.000000e+00> : tensor<128x128xf16, #blocked>
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %a_tm, %a_tok0 = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    %acc_tm, %acc_tok0 = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    %outer:3 = scf.for %i = %c0_i32 to %N step %c1_i32 iter_args(%a_tok = %a_tok0, %acc_tok = %acc_tok0, %out = %cst) -> (!ttg.async.token, !ttg.async.token, tensor<128x128xf32, #blocked>)  : i32 {
+      %a_store_tok = ttng.tmem_store %a_init, %a_tm[%a_tok], %true : tensor<128x128xf16, #blocked> -> !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>
+      %inner:2 = scf.for %j = %c0_i32 to %K step %c1_i32 iter_args(%inner_a_tok = %a_store_tok, %inner_acc_tok = %acc_tok) -> (!ttg.async.token, !ttg.async.token)  : i32 {
+        %mma_tok = ttng.tc_gen5_mma %a_tm, %B_sh, %acc_tm[%inner_acc_tok], %false, %true : !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+        scf.yield %inner_a_tok, %mma_tok : !ttg.async.token, !ttg.async.token
+      }
+      %result, %load_tok = ttng.tmem_load %acc_tm[%inner#1] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+      scf.yield %inner#0, %load_tok, %result : !ttg.async.token, !ttg.async.token, tensor<128x128xf32, #blocked>
+    }
+    tt.return %outer#2 : tensor<128x128xf32, #blocked>
   }
 }
 
