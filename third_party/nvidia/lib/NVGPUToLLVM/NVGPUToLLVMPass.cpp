@@ -12,6 +12,7 @@
 
 #include "nvidia/lib/TritonNVIDIAGPUToLLVM/Utility.h"
 #include "tlx/dialect/include/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 
 #include "llvm/Support/ErrorHandling.h"
 
@@ -574,7 +575,15 @@ void freeTMAlloc(LLVM::LLVMFuncOp func, Value alloc, size_t size, Value pred,
     auto ctx = ret->getContext();
     auto loc = ret.getLoc();
     auto voidTy = void_ty(ctx);
-    if (twoCTAs || tlxPairedMMA) {
+    // In WS mode, this code runs only in the default warp group's exit
+    // path. Workers are in the switch loop and cannot participate in a
+    // cluster-wide barrier. Use a CTA-level barrier instead (same as TLX).
+    bool hasWarpSpecialize = false;
+    func.walk([&](Operation *op) {
+      if (isa<triton::gpu::WarpSpecializeOp>(op))
+        hasWarpSpecialize = true;
+    });
+    if ((twoCTAs || tlxPairedMMA) && !hasWarpSpecialize) {
       NVVM::ClusterArriveOp::create(b, loc, UnitAttr::get(ctx));
       NVVM::ClusterWaitOp::create(b, loc, UnitAttr::get(ctx));
       if (tlxPairedMMA) {

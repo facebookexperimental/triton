@@ -259,13 +259,12 @@ private:
         static_cast<unsigned>(NVVM::NVVMMemorySpace::Shared));
   }
 
-  // This function enforces that all mbar init and
-  // TCGen5GlobalAllocOp/TMEMAllocOp are in the entry block of kernel function.
-  // Then it pushes all mbar init ops to the earliest to ensure mbar init ->
-  // tmem alloc sequence such that we can safely insert a cluster sync in the
-  // middle
-  LogicalResult ensureEarlyBarInit(ModuleOp &mod,
-                                   SetVector<Operation *> &barInitOps) {
+  // Push entry-block mbarrier init ops early enough to preserve the
+  // mbarrier-init -> cluster-sync -> TMEM-alloc sequence. Barrier init ops in
+  // WS partition bodies are local pipeline barriers; they do not participate in
+  // this kernel-entry cluster synchronization point.
+  LogicalResult ensureEarlyEntryBarInit(ModuleOp &mod,
+                                        SetVector<Operation *> &barInitOps) {
     triton::FuncOp funcOp = nullptr;
     mod.walk([&](triton::FuncOp op) {
       if (triton::isKernel(op)) {
@@ -276,27 +275,6 @@ private:
     });
     assert(funcOp && "Expecting to find a kernel func but got none.");
     Block *entryBlock = &funcOp.front();
-    for (auto op : barInitOps) {
-      if (op->getBlock() != entryBlock) {
-        op->emitError() << "Barrier init outside of the first block in "
-                           "function is not supported for CTA clusters";
-        return failure();
-      }
-    }
-
-    // ensure all tmem alloc ops are in the entry block too
-    SmallVector<Operation *> tmemOps;
-    funcOp.walk([&](Operation *op) {
-      if (isa<ttng::TCGen5GlobalAllocOp, ttng::TMEMAllocOp>(op))
-        tmemOps.push_back(op);
-    });
-    for (auto *op : tmemOps) {
-      if (op->getBlock() != entryBlock) {
-        op->emitError() << "TMEM allocation outside of the first block in "
-                           "function is not supported for CTA clusters";
-        return failure();
-      }
-    }
 
     // Move all mbar init ops (and their deps) to the beginning of the block
     SetVector<Operation *> opsToMove;
@@ -326,18 +304,18 @@ private:
       insertPt = op;
     }
 
-    // Check the block again to make sure all mbar init ops are earlier than
-    // TCGen5GlobalAllocOp
-    Operation *firstTCGen5GlobalAlloc = nullptr;
+    // Check the block again to make sure all entry-block mbar init ops are
+    // earlier than the first entry-block TMEM allocation op.
+    Operation *firstTMEMAlloc = nullptr;
     for (auto &op : *entryBlock) {
-      if (isa<ttng::TCGen5GlobalAllocOp>(&op)) {
-        firstTCGen5GlobalAlloc = &op;
+      if (isa<ttng::TCGen5GlobalAllocOp, ttng::TMEMAllocOp>(&op)) {
+        firstTMEMAlloc = &op;
         break;
       }
     }
-    if (firstTCGen5GlobalAlloc) {
+    if (firstTMEMAlloc) {
       for (auto *op : barInitOps) {
-        if (!op->isBeforeInBlock(firstTCGen5GlobalAlloc)) {
+        if (!op->isBeforeInBlock(firstTMEMAlloc)) {
           op->emitError() << "Barrier init is not before TMEM allocation. "
                              "Cannot insert cluster sync between them.";
           return failure();
@@ -461,35 +439,37 @@ private:
       return success();
     }
 
-    // Find all bar init ops
-    SetVector<Operation *> remoteOrLocalBarInitOps;
-    mod.walk([&](ttng::InitBarrierOp barInitOp) {
-      remoteOrLocalBarInitOps.insert(barInitOp);
+    // Find the kernel entry block and collect entry-block barrier inits.
+    // Only entry-block barriers need the cluster fence+sync for cross-CTA
+    // visibility. Barriers inside WS partition bodies are local pipeline
+    // barriers that don't participate in cross-CTA communication.
+    triton::FuncOp funcOp = nullptr;
+    mod.walk([&](triton::FuncOp op) {
+      if (triton::isKernel(op)) {
+        funcOp = op;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
     });
+    assert(funcOp && "Expecting to find a kernel func.");
+    Block *entryBlock = &funcOp.front();
 
-    // It's almost impossible for a clustered kernel to not have any mbar but
-    // have 2cta TMEM allocation. We enforce that such that we know it's safe
-    // to insert a cluster sync after the last bar init op, as long as we can
-    // enforce tmem alloc happens after all such mbar init.
-    assert(!remoteOrLocalBarInitOps.empty() &&
-           "Failed to find bar init op in a clustered kernel");
-
-    // Enforcing front end for 2cta kernels:
-    // All mbarrier init and tmem alloc ops need to happen at the first block of
-    // function. This is to make 2cta cluster sync insertion easier
-    if (failed(ensureEarlyBarInit(mod, remoteOrLocalBarInitOps))) {
-      return failure();
+    SetVector<Operation *> entryBarInitOps;
+    for (auto &op : *entryBlock) {
+      if (isa<ttng::InitBarrierOp>(op))
+        entryBarInitOps.insert(&op);
     }
 
-    // Follow the program order and identify the last bar init op.
-    // This is based on the assumption that all bar init happens at the first
-    // block of the kernel func op, as we currently enforce earlier in this
-    // pass. If that assumption changes, we should revisit this heuristic here.
+    if (entryBarInitOps.empty())
+      return success();
+
+    if (failed(ensureEarlyEntryBarInit(mod, entryBarInitOps)))
+      return failure();
+
     ttng::InitBarrierOp lastBarInitOp;
-    auto firstBlock = remoteOrLocalBarInitOps.front()->getBlock();
-    for (auto it = firstBlock->rbegin(), e = firstBlock->rend(); it != e;
+    for (auto it = entryBlock->rbegin(), e = entryBlock->rend(); it != e;
          ++it) {
-      if (remoteOrLocalBarInitOps.contains(&*it)) {
+      if (entryBarInitOps.contains(&*it)) {
         lastBarInitOp = cast<ttng::InitBarrierOp>(*it);
         break;
       }
