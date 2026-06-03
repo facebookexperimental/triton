@@ -222,6 +222,9 @@ static const TTGIRToTLXMapping opMappings[] = {
     {"arith.maxui", "tl.maximum", "Unsigned integer max"},
     {"arith.minsi", "tl.minimum", "Signed integer min"},
     {"arith.minui", "tl.minimum", "Unsigned integer min"},
+    // Ceiling division: tl.cdiv(a, b) == (a + b - 1) // b.
+    {"arith.ceildivsi", "tl.cdiv", "Signed integer ceil-division"},
+    {"arith.ceildivui", "tl.cdiv", "Unsigned integer ceil-division"},
 
     // Triton operations
     {"tt.splat", "tl.splat", "Splat scalar to tensor"},
