@@ -216,10 +216,12 @@ static const TTGIRToTLXMapping opMappings[] = {
     {"arith.maxnumf", "tl.maximum", "Float max (NaN-propagating)"},
     {"arith.minf", "tl.minimum", "Float min"},
     {"arith.minnumf", "tl.minimum", "Float min (NaN-propagating)"},
-    {"arith.maxsi", "tl.max", "Signed integer max"},
-    {"arith.maxui", "tl.max", "Unsigned integer max"},
-    {"arith.minsi", "tl.min", "Signed integer min"},
-    {"arith.minui", "tl.min", "Unsigned integer min"},
+    // Elementwise binary min/max. NOTE: tl.min/tl.max are reductions, so
+    // they are not used here. Use tl.minimum/maximum similar to float above.
+    {"arith.maxsi", "tl.maximum", "Signed integer max"},
+    {"arith.maxui", "tl.maximum", "Unsigned integer max"},
+    {"arith.minsi", "tl.minimum", "Signed integer min"},
+    {"arith.minui", "tl.minimum", "Unsigned integer min"},
 
     // Triton operations
     {"tt.splat", "tl.splat", "Splat scalar to tensor"},
