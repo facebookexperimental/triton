@@ -1071,7 +1071,7 @@ def test_async_amd_desc_load_uses_padded_layout_gfx1250(device):
 
 
 @triton.jit
-def _async_amd_desc_load_incompatible_layout_kernel(
+def _async_amd_desc_load_explicit_padded_layout_kernel(
     a_ptr,
     output_ptr,
     M: tl.constexpr,
@@ -1099,19 +1099,21 @@ def _async_amd_desc_load_incompatible_layout_kernel(
     tl.store(out_ptrs, data)
 
 
-def test_async_amd_desc_load_warns_on_incompatible_layout_gfx1250(device, fresh_triton_cache):
-    """Warn when the TDM destination layout does not match descriptor encoding.
+def test_async_amd_desc_load_preserves_explicit_padded_layout_gfx1250(device, fresh_triton_cache):
+    """An explicit padded TDM destination layout is a user override.
 
-    Uses the ``fresh_triton_cache`` fixture so the warning fires from a
-    cold AST visit; without it Triton's on-disk cache returns a previously
-    compiled binary and the warning never re-emits.
+    Even when it differs from the descriptor-default ``[32:+8]`` encoding,
+    TLXInsertRequireLayout preserves the explicit padded layout and AMD
+    descriptor layout assignment propagates it back to the tensor descriptor.
     """
-    with pytest.warns(UserWarning, match="destination layout may be incompatible"):
-        compile_for_gfx1250(
-            _async_amd_desc_load_incompatible_layout_kernel,
-            signature={"a_ptr": "*fp16", "output_ptr": "*fp16", "M": "i32", "N": "i32"},
-            constexprs={"BLOCK_M": 16, "BLOCK_N": 32},
-        )
+    compiled = compile_for_gfx1250(
+        _async_amd_desc_load_explicit_padded_layout_kernel,
+        signature={"a_ptr": "*fp16", "output_ptr": "*fp16", "M": "i32", "N": "i32"},
+        constexprs={"BLOCK_M": 16, "BLOCK_N": 32},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "ttg.padded_shared<[32:+4]" in ttgir, ("expected explicit padded layout to be preserved in TTGIR, got:\n" +
+                                                  ttgir)
 
 
 @triton.jit
