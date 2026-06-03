@@ -2,6 +2,7 @@ include_directories(
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_BINARY_DIR}/include
   ${PROJECT_SOURCE_DIR}/python/src
+  ${PROJECT_SOURCE_DIR}/third_party/amd/include
 )
 add_subdirectory(include)
 add_subdirectory(lib)
