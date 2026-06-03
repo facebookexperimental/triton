@@ -1,11 +1,15 @@
 // RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=3 post-channel-creation=1" | FileCheck %s
+// XFAIL: *
 
+// Regression test for B-13-F1 / T273488617.
+//
 // Test: data-partitioned D-channel commits for a persistent GEMM with
 // tt.data_partition_factor = 2, producing two tc_gen5_mma ops in the inner
 // k-loop.
 //
-// With multiple MMAs in the loop, each MMA gets a plain tc_gen5_commit
-// with raw barrier allocs for D-channel completion tracking.
+// With multiple MMAs in the loop, D-channel completion tracking should avoid
+// global tc_gen5_commit ops. Each MMA should wait on its A/B inline barrier
+// and arrive on the corresponding D barrier.
 
 // CHECK-LABEL: @matmul_kernel_tma_persistent
 // CHECK: ttg.warp_specialize
@@ -20,12 +24,18 @@
 // The k-loop ends:
 // CHECK: scf.yield
 //
-// After the inner k-loop: each MMA gets a plain tc_gen5_commit with raw
-// barrier allocs for D-channel completion tracking.
+// After the inner k-loop: D-channel completion must use per-MMA wait/arrive
+// pairs, with no raw global tc_gen5_commit fallback before the outer yield.
 //
-// CHECK: ttng.tc_gen5_commit {{%[a-z0-9_]+}} {async_task_id = array<i32: 1>} : !ttg.memdesc<1xi64
-// CHECK: ttng.tc_gen5_commit {{%[a-z0-9_]+}} {async_task_id = array<i32: 1>} : !ttg.memdesc<1xi64
-// CHECK: ttng.tc_gen5_commit {{%[a-z0-9_]+}} {async_task_id = array<i32: 1>} : !ttg.memdesc<1xi64
+// CHECK-NOT: ttng.tc_gen5_commit
+// CHECK: ttng.wait_barrier
+// CHECK-NOT: ttng.tc_gen5_commit
+// CHECK: ttng.arrive_barrier
+// CHECK-NOT: ttng.tc_gen5_commit
+// CHECK: ttng.wait_barrier
+// CHECK-NOT: ttng.tc_gen5_commit
+// CHECK: ttng.arrive_barrier
+// CHECK-NOT: ttng.tc_gen5_commit
 //
 // Outer loop yield:
 // CHECK: scf.yield

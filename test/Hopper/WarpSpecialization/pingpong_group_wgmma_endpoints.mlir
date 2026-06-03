@@ -1,5 +1,5 @@
 // RUN: triton-opt %s --nvgpu-test-ping-pong-prep="capability=90 num-stages=3" | FileCheck %s
-
+// Regression test for B-4-F1 / T273470439.
 // WGMMA has memory effects because it reads SMEM operands, but those endpoint
 // effects are not intervening effects between two WGMMA ops in the same
 // partition. All ten dots below should therefore be one ping-pong group.
