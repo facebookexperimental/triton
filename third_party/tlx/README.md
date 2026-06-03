@@ -195,3 +195,71 @@ def gemm_kernel(..., BLOCK_K: tl.constexpr, NUM_BUFFERS: tl.constexpr):
     # Epilogue: drain remaining buffers
     ...
 ```
+
+## Scaled Dot (AMD)
+
+`tlx.dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None, *, fast_math=False, lhs_k_pack=True, rhs_k_pack=True, out_dtype=tl.float32, tiles_per_warp=None)`
+is a thin wrapper around `tl.dot_scaled`. Without `tiles_per_warp` it is exactly
+equivalent to `tl.dot_scaled` — pass it only when you need the AMD-specific
+WMMA scheduling hint described below.
+
+### `tiles_per_warp` — what it controls
+
+| Concept | Controlled by | What it means |
+|---------|---------------|---------------|
+| **Warp distribution** | `warpsPerCTA` (chosen automatically by `AccelerateAMDMatmul::planWarps`) | How the total result tile is split *across* warps along M/N. |
+| **Per-warp tiling** | `tiles_per_warp` (this hint) | How many `instrShape`-sized WMMA tiles *each warp* covers contiguously before the layout repeats. |
+
+So `tiles_per_warp=[2, 2]` does **not** mean "distribute 4 tiles across 4
+warps." It means *each* warp emits a 2×2 block of WMMA instruction tiles,
+holding the corresponding 2×2 accumulator registers. Concretely, for a
+`tt.dot_scaled` lowered to gfx1250 WMMA (`instrShape = [16, 16, K]`),
+4 warps, `warpsPerCTA = [2, 2]`:
+
+| `tiles_per_warp` | Per-warp coverage (M × N) | Per-CTA coverage before repeat (M × N) |
+|------------------|---------------------------|----------------------------------------|
+| `[1, 1]` (default) | `16 × 16` | `32 × 32` |
+| `[2, 2]`           | `32 × 32` | `64 × 64` |
+
+For a `256 × 256` result, `[1, 1]` repeats the layout `8 × 8` times,
+`[2, 2]` repeats it `4 × 4`. Larger `tiles_per_warp` gives each warp more
+contiguous accumulator state (better register reuse for preshuffled
+MXFP scales, fewer warp-level reductions), at the cost of more registers
+per warp.
+
+Together, `instrShape`, `warpsPerCTA`, and `tiles_per_warp` define the M/N
+extent of one CTA-level WMMA layout period:
+`period[d] = instrShape[d] * warpsPerCTA[d] * tiles_per_warp[d]`. If the result
+tile is larger than this period, the period repeats. The K entry of
+`instrShape` is the per-instruction reduction depth and is handled separately
+from this M/N tiling.
+
+`tiles_per_warp` is validated by `AccelerateAMDMatmul`: it must have one
+entry per result-tile dim, each entry must be positive, and
+`instrShape[d] * warpsPerCTA[d] * tiles_per_warp[d]` must fit in the result
+tile shape.
+
+### Example
+
+```python
+import triton.language.extra.tlx as tlx
+
+acc = tlx.dot_scaled(
+    a, a_scale, "e5m2",
+    b, b_scale, "e5m2",
+    acc,
+    tiles_per_warp=[2, 2],   # pack 2x2 WMMA tiles per warp for preshuffled MXFP
+)
+```
+
+### Mechanism (for IR-level users)
+
+The wrapper attaches `amdg.wmma_tiles_per_warp = array<i32: m, n>` on the
+resulting `tt.dot_scaled` op. `ScaledBlockedToScaledWMMAF8F6F4` reads the
+attribute and substitutes `m, n` for the default `1, 1` when building the
+WMMA encoding. Setting the attribute directly on a `tt.dot[_scaled]` op
+in MLIR has the same effect; the wrapper just spares Python kernels from
+hand-poking attributes.
+
+Currently consumed only by the scaled-WMMA pattern (gfx1250). Regular
+`tt.dot` WMMA and the MFMA patterns do not read it.

@@ -287,6 +287,11 @@ void init_triton_tlx_ir(py::module &&m) {
                  context, versionMajor, versionMinor, warpsPerCTA, CTALayout,
                  instrShape));
            })
+      .def(
+          "make_i32_array_attr",
+          [](TritonOpBuilder &self, std::vector<int32_t> &values) -> Attribute {
+            return self.getBuilder().getDenseI32ArrayAttr(values);
+          })
       .def("make_dot_operand_encoding_attr",
            [](TritonOpBuilder &self, Value opnd, unsigned opIdx,
               Attribute parentEnc) -> Attribute {

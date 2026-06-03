@@ -290,6 +290,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
     full_shape = [unwrapped_num] + unwrapped_shape
     dtype = tl._unwrap_if_constexpr(dtype)
     elem_type = dtype.to_ir(_semantic.builder)
+    layout_is_explicit = layout is not None
     if layout is None:
         if storage == tlx.storage_kind.smem:
             if len(shape) == 1:
@@ -375,6 +376,14 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
     else:
         tensor_handle = _semantic.builder.create_tmem_alloc(full_shape, elem_type, layout_handle, alias_handle,
                                                             shared_buffer_handle)
+
+    if layout_is_explicit:
+        # Mark the alloc so downstream MLIR passes (e.g. TLXInsertRequireLayout)
+        # can distinguish a user-supplied encoding from the TLX auto-default
+        # and decide whether silently substituting a different encoding is
+        # legal. Absence of the marker is treated as auto-default (back-compat
+        # with raw-MLIR consumers like lit tests).
+        tensor_handle.set_attr("tlx.layout_is_explicit", _semantic.builder.get_unit_attr())
 
     return tlx.buffered_tensor(tensor_handle, dtype, unwrapped_shape, unwrapped_num, storage, layout)
 
@@ -1098,18 +1107,21 @@ def async_amd_descriptor_load(
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
-    # Only warn on user-supplied incompatible layouts. Auto-defaulted
-    # layouts (no `layout=` passed to local_alloc) are silently rewritten
-    # to the descriptor-compatible encoding by TLXInsertRequireLayout +
-    # TlxPropagateLayout in the AMD pipeline.
+    # Auto-defaulted layouts (no `layout=` passed to local_alloc) are silently
+    # rewritten by TLXInsertRequireLayout + TlxPropagateLayout. Explicit
+    # padded layouts are also supported: TLXInsertRequireLayout preserves them
+    # and AMD descriptor layout assignment propagates them back to the
+    # descriptor type. Warn only for other incompatible explicit layouts.
     layout = result.type.layout
-    if not getattr(layout, "_tlx_default", False):
+    if (not getattr(layout, "_tlx_default", False) and not isinstance(layout, tlx.padded_shared_layout_encoding)):
         expected_layout = _amd_tdm_descriptor_layout(desc)
         if not _layouts_match(layout, expected_layout):
             warnings.warn(
-                "tlx.async_amd_descriptor_load destination layout may be incompatible with AMD descriptor layout; "
-                f"expected {expected_layout}, got {layout}. Omit `layout=` from `tlx.local_alloc` "
-                "to let TLXInsertRequireLayout auto-propagate a descriptor-compatible encoding.",
+                "tlx.async_amd_descriptor_load destination requires a padded shared encoding (TDM ops are "
+                f"verified against padded layouts only); got {layout}, will be overridden to {expected_layout}. "
+                "Pass `layout=tlx.padded_shared_layout_encoding(...)` to control the padding, or omit `layout=` "
+                "from `tlx.local_alloc` to let TLXInsertRequireLayout auto-propagate a descriptor-compatible "
+                "encoding.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -1226,18 +1238,20 @@ def async_amd_descriptor_store(
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
-    # Auto-propagated layouts (no `layout=` passed to local_alloc) are
-    # silently rewritten to the descriptor-compatible encoding by
-    # TLXInsertRequireLayout; warn only when the user supplied an
-    # incompatible layout explicitly.
+    # Auto-propagated layouts (no `layout=` passed to local_alloc) are silently
+    # rewritten by TLXInsertRequireLayout. Explicit padded layouts are preserved
+    # and propagated to the descriptor type. Warn only for other incompatible
+    # explicit layouts.
     layout = source.type.layout
-    if not getattr(layout, "_tlx_default", False):
+    if (not getattr(layout, "_tlx_default", False) and not isinstance(layout, tlx.padded_shared_layout_encoding)):
         expected_layout = _amd_tdm_descriptor_layout(desc)
         if not _layouts_match(layout, expected_layout):
             warnings.warn(
-                "tlx.async_amd_descriptor_store source layout may be incompatible with AMD descriptor layout; "
-                f"expected {expected_layout}, got {layout}. Omit `layout=` from `tlx.local_alloc` "
-                "to let TLXInsertRequireLayout auto-propagate a descriptor-compatible encoding.",
+                "tlx.async_amd_descriptor_store source requires a padded shared encoding (TDM ops are "
+                f"verified against padded layouts only); got {layout}, will be overridden to {expected_layout}. "
+                "Pass `layout=tlx.padded_shared_layout_encoding(...)` to control the padding, or omit `layout=` "
+                "from `tlx.local_alloc` to let TLXInsertRequireLayout auto-propagate a descriptor-compatible "
+                "encoding.",
                 UserWarning,
                 stacklevel=2,
             )
