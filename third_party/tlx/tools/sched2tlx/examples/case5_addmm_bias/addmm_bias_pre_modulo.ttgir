@@ -1,0 +1,130 @@
+// REQUIRES: asserts
+// RUN: triton-opt %s -allow-unregistered-dialect -nvgpu-modulo-schedule -debug-only=nvgpu-modulo-schedule 2>&1 | FileCheck %s
+
+//===----------------------------------------------------------------------===//
+// Test: Persistent GEMM + 2D bias (addmm_repeated_2d_bias)
+//
+// PyTorch reference:
+//   out = x @ w
+//   out = out.reshape(B, repeat_size, N) + bias.unsqueeze(0)
+//
+// Per-output-tile structure:
+//   - Inner K-loop:  load A, load B, MMA   (the GEMM)
+//   - Epilogue:      load bias, tmem_load(acc), add bias, store
+//
+// The bias load is INDEPENDENT of the GEMM critical path (LdA/LdB → MMA).
+// Putting it in the same warp group as LdA/LdB would push extra issue cost in
+// front of MMA dispatch. The partition algorithm should put the bias load in
+// its OWN warp group so the WG that owns LdA/LdB/MMA has the shortest possible
+// instruction stream.
+//
+// This is the global-schedule property the design doc calls out: do not
+// pattern-match "all MEM ops together"; let the per-WG chain wall in
+// computeMultiPipelineMakespan + Phase4 cost ranking decide.
+//===----------------------------------------------------------------------===//
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+
+// CHECK-LABEL: @addmm_persistent_2d_bias
+
+// Inner K-loop scheduled first (modulo schedule).
+// CHECK: [PASS-A] Inner Schedule: II=
+// CHECK: [PASS-A]   {{N[0-9]+}}  cycle={{[0-9]+}}{{.*}}  MEM  {{.*}}  tt.descriptor_load
+// CHECK: [PASS-A]   {{N[0-9]+}}  cycle={{[0-9]+}}{{.*}}  MEM  {{.*}}  tt.descriptor_load
+// CHECK: [PASS-A]   {{N[0-9]+}}  cycle={{[0-9]+}}{{.*}}  TC   {{.*}}  ttng.tc_gen5_mma
+
+// Phase4 partitions the FLAT view (outer + inner ops). The bias descriptor_load
+// (in the outer-loop epilogue) should NOT share a warp group with the K-loop
+// loads — putting them together would lengthen wg0's instruction stream and
+// delay MMA dispatch.
+// CHECK: [Phase4] picked:
+
+// Verify wg assignment: K-loop loads stay together on wg0 (TC also on wg0),
+// the bias load lands on a different wg (>= 1).
+// CHECK-DAG: [PassB.1]   {{N[0-9]+}} tt.descriptor_load → wg0 (MEM)
+// CHECK-DAG: [PassB.1]   {{N[0-9]+}} tt.descriptor_load → wg0 (MEM)
+// CHECK-DAG: [PassB.1]   {{N[0-9]+}} ttng.tc_gen5_mma → wg0 (TC)
+// CHECK-DAG: [PassB.1]   {{N[0-9]+}} tt.descriptor_load → wg{{[1-9]}} (MEM)
+
+  tt.func public @addmm_persistent_2d_bias(
+      %a_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
+      %b_desc: !tt.tensordesc<tensor<64x128xf16, #shared>>,
+      %bias_desc: !tt.tensordesc<tensor<128x128xf16, #shared>>,
+      %c_desc: !tt.tensordesc<tensor<128x128xf16, #shared>>,
+      %M: i32 {tt.divisibility = 16 : i32},
+      %N: i32 {tt.divisibility = 16 : i32},
+      %K: i32 {tt.divisibility = 16 : i32}
+  ) {
+    %false = arith.constant false
+    %true = arith.constant true
+    %c148_i32 = arith.constant 148 : i32
+    %c128_i32 = arith.constant 128 : i32
+    %c64_i32 = arith.constant 64 : i32
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %c127_i32 = arith.constant 127 : i32
+    %k_tiles = arith.constant 63 : i32
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #linear>
+    %start_pid = tt.get_program_id x : i32
+    %num_pid_m_tmp = arith.addi %M, %c127_i32 : i32
+    %num_pid_m = arith.divsi %num_pid_m_tmp, %c128_i32 : i32
+    %num_pid_n_tmp = arith.addi %N, %c127_i32 : i32
+    %num_pid_n = arith.divsi %num_pid_n_tmp, %c128_i32 : i32
+    %k_tiles_a = arith.addi %K, %k_tiles : i32
+    %k_tiles_n = arith.divsi %k_tiles_a, %c64_i32 : i32
+    %num_tiles = arith.muli %num_pid_m, %num_pid_n : i32
+    %tile_id_init = arith.subi %start_pid, %c148_i32 : i32
+
+    %final_tid = scf.for %tile_id = %start_pid to %num_tiles step %c148_i32
+        iter_args(%tile_id_carry = %tile_id_init) -> (i32) : i32 {
+      %pid_m = arith.divsi %tile_id, %num_pid_n : i32
+      %pid_n = arith.remsi %tile_id, %num_pid_n : i32
+      %offs_am = arith.muli %pid_m, %c128_i32 : i32
+      %offs_bn = arith.muli %pid_n, %c128_i32 : i32
+
+      %acc, %acc_tok0 = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+      %acc_init_tok = ttng.tmem_store %cst, %acc[%acc_tok0], %true : tensor<128x128xf32, #linear> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+
+      // ── Inner K-loop: pure GEMM ────────────────────────────────────────────
+      %k_done:2 = scf.for %k = %c0_i32 to %k_tiles_n step %c1_i32
+          iter_args(%use_acc = %false, %acc_tok_iter = %acc_init_tok)
+          -> (i1, !ttg.async.token) : i32 {
+        %offs_k = arith.muli %k, %c64_i32 : i32
+        %a = tt.descriptor_load %a_desc[%offs_am, %offs_k] : !tt.tensordesc<tensor<128x64xf16, #shared>> -> tensor<128x64xf16, #blocked>
+        %a_smem = ttg.local_alloc %a : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
+        %b = tt.descriptor_load %b_desc[%offs_k, %offs_bn] : !tt.tensordesc<tensor<64x128xf16, #shared>> -> tensor<64x128xf16, #blocked>
+        %b_smem = ttg.local_alloc %b : (tensor<64x128xf16, #blocked>) -> !ttg.memdesc<64x128xf16, #shared, #smem>
+        %new_tok = ttng.tc_gen5_mma %a_smem, %b_smem, %acc[%acc_tok_iter], %use_acc, %true : !ttg.memdesc<128x64xf16, #shared, #smem>, !ttg.memdesc<64x128xf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+        scf.yield %true, %new_tok : i1, !ttg.async.token
+      }
+
+      // ── Epilogue: bias load + add + store ──────────────────────────────────
+      // The bias load is independent of the K-loop chain.
+      %tile_id_next = arith.addi %tile_id_carry, %c148_i32 : i32
+      %pid_m_e = arith.divsi %tile_id_next, %num_pid_n : i32
+      %pid_n_e = arith.remsi %tile_id_next, %num_pid_n : i32
+      %offs_om = arith.muli %pid_m_e, %c128_i32 : i32
+      %offs_on = arith.muli %pid_n_e, %c128_i32 : i32
+
+      %bias = tt.descriptor_load %bias_desc[%offs_om, %offs_on] : !tt.tensordesc<tensor<128x128xf16, #shared>> -> tensor<128x128xf16, #blocked1>
+      %bias_f32 = arith.extf %bias : tensor<128x128xf16, #blocked1> to tensor<128x128xf32, #blocked1>
+      %bias_lin = ttg.convert_layout %bias_f32 : tensor<128x128xf32, #blocked1> -> tensor<128x128xf32, #linear>
+
+      %out, %out_tok = ttng.tmem_load %acc[%k_done#1] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear>
+      %out_with_bias = arith.addf %out, %bias_lin : tensor<128x128xf32, #linear>
+      %out_f16 = arith.truncf %out_with_bias : tensor<128x128xf32, #linear> to tensor<128x128xf16, #linear>
+      %out_blk = ttg.convert_layout %out_f16 : tensor<128x128xf16, #linear> -> tensor<128x128xf16, #blocked1>
+      tt.descriptor_store %c_desc[%offs_om, %offs_on], %out_blk : !tt.tensordesc<tensor<128x128xf16, #shared>>, tensor<128x128xf16, #blocked1>
+
+      scf.yield %tile_id_next : i32
+    } {tt.warp_specialize}
+    tt.return
+  }
+}
