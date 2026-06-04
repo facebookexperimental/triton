@@ -6,6 +6,8 @@ import triton.language.extra.tlx as tlx
 import torch
 import torch.nn.functional as F
 import pytest
+import sys
+import argparse
 
 try:
     from triton.language.extra.libdevice import (
@@ -32,6 +34,13 @@ def prev_power_of_2(x: int) -> int:
 def get_arch():
     return triton.runtime.driver.active.get_current_target().arch
 
+str_to_torch_dtype = {
+    "fp32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+    "float16": torch.float16,
+    "fp16": torch.float16,
+}
 
 #----------------------------------------------------------------------
 # ref implementation 
@@ -663,7 +672,7 @@ def triton_hstu_attention_fwd(
     num_targets: Optional[torch.Tensor],
     max_attn_len: int,
     contextual_seq_len: int,
-    sort_by_length_indices: Optional[torch.Tensor],
+    sort_by_length: bool = False,
     config: Optional[dict] = None,
 ) -> torch.Tensor:
     """
@@ -689,24 +698,25 @@ def triton_hstu_attention_fwd(
         torch.Tensor: Output jagged tensor with shape (total_tokens, num_heads, head_dim).
     """
     Z = seq_offsets.numel() - 1
-    AUTOTUNE_Z = prev_power_of_2(Z)
     L, H, DimQ = q.shape
     _, _, DimV = v.shape
     out = torch.empty_like(v)
     has_multiple_targets = num_targets is not None
     has_contextual_seq_len = contextual_seq_len > 0
     has_max_attn_len = max_attn_len > 0
-    has_sort_by_length_indices = sort_by_length_indices is not None
+
+    if sort_by_length:
+        seq_lengths = seq_offsets[1:] - seq_offsets[:-1]
+        _, sort_by_length_indices = torch.sort(
+            seq_lengths, descending=True, stable=False
+        )
+
+    has_sort_by_length_indices = sort_by_length
     if L == 0:
         return out
 
     DeltaSize = 0
     IS_DELTA_Q = False
-
-    # if config is None:
-    #     config = _get_fwd_config(
-    #         AUTOTUNE_Z,
-    #     )
 
     grid = lambda meta: (  # noqa E731
         triton.cdiv(N, meta["BLOCK_M"]) *
@@ -884,20 +894,36 @@ def get_bytes(
     return total_bytes
 
 
+#shape info
+def get_inputs():
+    input_info = [
+        (32, 1024, 0.5, 4, 128, 128),
+        (32, 2048, 0.5, 4, 128, 128),
+        (32, 4096, 0.5, 4, 128, 128),
+        (32, 8192, 0.5, 4, 128, 128),
+        (32, 16384, 0.5, 4, 128, 128),
+        (512, 512, 0.97, 4, 128, 128),
+        (512, 3072, 0.366, 4, 128, 128),
+        (1024, 1024, 0.768, 4, 128, 128),
+    ]
+
+    return input_info
+
+
 @pytest.mark.parametrize(
-    "batch_size, max_seq_len, sparsity", [(512, 3072, 0.366), (512, 512, 0.97)]
+    "batch_size, max_seq_len, sparsity, heads, attn_dim, hidden_dim", get_inputs()
 )
 def test_hstu_attention(
     batch_size: int,
     max_seq_len: int,  # for repro
     sparsity: float,  # for repro
+    heads: int,
+    attn_dim: int,
+    hidden_dim: int,
 ):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     dropout_pr = 0.0
-    heads: int = 4
-    attn_dim: int = 128
-    hidden_dim: int = 128
     target_size: int = 20
     sl_alpha: float = 2.0
 
@@ -955,11 +981,6 @@ def test_hstu_attention(
 
     def triton_attn():
         sort_by_length = True
-        if sort_by_length:
-            seq_lengths = seq_offsets[1:] - seq_offsets[:-1]
-            _, sort_by_length_indices = torch.sort(
-                seq_lengths, descending=True, stable=False
-            )
         return triton_hstu_attention_fwd(
             max_seq_len,
             alpha,
@@ -971,7 +992,6 @@ def test_hstu_attention(
             num_targets,
             0,  # max_attn_len,
             0,  # contextual_seq_len
-            sort_by_length_indices,
             True,  # sort_by_length,
         )
 
@@ -995,3 +1015,254 @@ def test_hstu_attention(
     out = triton_attn() * max_seq_len
     out_ref = torch_attn() * max_seq_len
     torch.testing.assert_close(out, out_ref, atol=1e-3, rtol=0)
+
+
+# benchmark
+def run_benchmark(args):
+
+    x_names = [
+        "batch_size",
+        "max_seq_len",
+        "sparsity",
+        "heads",
+        "attn_dim",
+        "hidden_dim",
+    ]
+    if args.user_input:
+        x_val_list = [
+            (
+                args.b,
+                args.max_seq_len,
+                args.sparsity,
+                args.heads,
+                args.head_dim,
+                args.hidden_dim,
+            )
+        ]
+    else:
+        x_val_list = get_inputs()
+
+    if args.metric == "time":
+        ylabel = "Time (ms)"
+    elif args.metric == "throughput":
+        ylabel = "Throughput (TFLOPS)"
+    elif args.metric == "bandwidth":
+        ylabel = "Bandwidth (GBs)"
+    else:
+        raise NotImplementedError(f"{args.metric} is not supported")
+
+    evaluation_metric_to_unit = {
+        "throughput": "TFLOPS",
+        "time": "Time_(ms)",
+        "bandwidth": "Bandwidth_(GB/s)",  # spaces break prettytable parsing
+    }
+    line_names = [evaluation_metric_to_unit[args.metric]]
+    line_vals = line_names
+
+    configs = []
+    metric = args.metric
+    configs.append(
+        triton.testing.Benchmark(
+            x_names=x_names,
+            x_vals=x_val_list,
+            line_arg="unit",
+            line_vals=line_vals,
+            line_names=line_names,
+            styles=[("green", "-")],
+            ylabel=ylabel,
+            plot_name='hstu_attention perf numbers',
+            args={"metric": metric, "mode": 'fwd'},
+        )
+    )
+
+    @triton.testing.perf_report(configs)
+    def bench_hstu_attn(
+        batch_size,
+        max_seq_len,
+        sparsity,
+        heads,
+        attn_dim,
+        hidden_dim,
+        metric,
+        mode,
+        **kwargs,
+    ):
+        type_str = args.dtype
+        assert type_str in [
+            "fp16",
+            "bf16",
+        ], "only fp16 or bf16 data types are supported!"
+        dropout_pr = 0.0
+        target_size: int = 20
+        sl_alpha: float = 2.0
+        dtype = str_to_torch_dtype[type_str]
+
+        invalid_attn_mask_type = "lower_triangular"
+        causal = True
+        alpha = 1.0 / attn_dim * 10000
+
+        # generate inputs
+        torch.manual_seed(1001)  # for reproducibility
+        lengths = generate_sparse_seq_len(
+            size=batch_size,
+            max_seq_len=max_seq_len,
+            sparsity=sparsity,
+            device=torch.device("cuda"),
+        )
+        lengths = apply_SL(lengths, sl_alpha, max_seq_len=max_seq_len)
+        num_targets = torch.randint(
+            1,
+            target_size + 1,
+            (batch_size,),
+            device=lengths.device,
+            dtype=lengths.dtype,
+        )
+        num_targets = torch.where(num_targets > lengths, lengths, num_targets)
+        seq_offsets = torch.zeros(
+            (batch_size + 1,), dtype=torch.int64, device=torch.device("cuda")
+        )
+        seq_offsets[1:] = torch.cumsum(lengths, dim=0)
+        L = int(seq_offsets[-1].item())
+        x = torch.empty(
+            (L, heads, attn_dim * 2 + hidden_dim),
+            dtype=dtype,
+            device=torch.device("cuda"),
+        ).uniform_(-0.01, 0.01)
+        q, k, v = torch.split(x, [attn_dim, attn_dim, hidden_dim], dim=-1)
+
+        q = switch_to_contiguous_if_needed(q)
+        k = switch_to_contiguous_if_needed(k)
+        v = switch_to_contiguous_if_needed(v)
+
+        sanity_check_attention(
+            max_seq_len=max_seq_len,
+            q=q,
+            k=k,
+            v=v,
+            seq_offsets=seq_offsets,
+            invalid_attn_mask_type=invalid_attn_mask_type,
+            dropout_pr=dropout_pr,
+            attn_bias=None,
+            max_attn_len=None,
+            contextual_seq_len=0,
+        )
+
+        def attn_fwd():
+            return triton_hstu_attention_fwd(
+                max_seq_len,
+                alpha,
+                q,
+                k,
+                v,
+                seq_offsets,
+                causal,
+                num_targets,
+                0,  # max_attn_len,
+                0,  # contextual_seq_len
+                True,  # sort_by_length,
+            )
+        ms = triton.testing.do_bench(
+            attn_fwd,
+            warmup=25,
+            rep=100,
+        )
+
+        # Return exactly one scalar depending on which metric is active
+        if metric == "time":
+            return ms
+        elif metric == "throughput":
+            flops = get_flops(seq_offsets.cpu().numpy(), heads, attn_dim, hidden_dim)
+            tflops = flops / ms * 1e-9
+            return tflops
+        elif metric == "bandwidth":
+            elem_size = q.element_size()
+            bytes = get_bytes(
+                seq_offsets.cpu().numpy(), heads, attn_dim, hidden_dim, elem_size
+            )
+            bandwidth = bytes / (ms * 1e-3) * 1e-9  # GB/s
+            return bandwidth
+        else:
+            raise ValueError("Unknown metric: " + metric)
+
+    bench_hstu_attn.run(save_path="." if args.o else None, print_data=True)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        prog="Benchmark HSTU Attention",
+        allow_abbrev=False,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--b",
+        type=int,
+        default=512,
+        help="Batch dim of input sequences",
+    )
+    parser.add_argument(
+        "--max_seq_len",
+        type=int,
+        default=1024,
+        help="max sequence length",
+    )
+    parser.add_argument(
+        "--sparsity",
+        type=float,
+        default=0.5,
+        help="sparsity of input sequence lengths",
+    )
+    parser.add_argument(
+        "--heads",
+        type=int,
+        default=4,
+        help="number of heads",
+    )
+    parser.add_argument(
+        "--head_dim",
+        type=int,
+        default=128,
+        help="head dimension",
+    )
+    parser.add_argument(
+        "--hidden_dim",
+        type=int,
+        default=128,
+        help="hidden dimension",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="bf16",
+        help="data type, default (bfloat16)",
+    )
+
+    parser.add_argument(
+        "--metric",
+        type=str,
+        choices=["time", "throughput", "bandwidth"],
+        default="throughput",
+        help="metric to plot",
+    )
+
+    parser.add_argument(
+        "--user_input",
+        action="store_true",
+        default=False,
+        help="Run user input info",
+    )
+
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
+    )
+
+    args = parser.parse_args()
+    return args
+
+
+def main():
+    args = parse_args()
+    run_benchmark(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
