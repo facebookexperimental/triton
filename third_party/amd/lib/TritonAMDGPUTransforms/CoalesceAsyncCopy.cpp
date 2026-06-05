@@ -6,6 +6,8 @@
 #include "third_party/amd/include/Analysis/AxisInfoExt.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
 
 #undef DEBUG_TYPE
@@ -243,9 +245,10 @@ struct CoalesceBufferLoadToLocal
 
   LogicalResult matchAndRewrite(triton::amdgpu::BufferLoadToLocalOp bufOp,
                                 PatternRewriter &rewriter) const override {
+    llvm::outs() << "matchAndRewrite op=" << (void*)bufOp.getOperation() << "\n";
 
     auto ptr = bufOp.getPtr();
-    // for buffer ops, ptr input is a scalar pointer, offsets have the same layout 
+    // for buffer ops, ptr input is a scalar pointer, offsets have the same layout
     // as the result
     auto offsets = bufOp.getOffsets();
     auto dst = bufOp.getDest();
@@ -268,11 +271,17 @@ struct CoalesceBufferLoadToLocal
     // We start from the precomputed contiguity we got from AxisAnalysis.
     unsigned loadContig = 0;
     if (auto it = bufferLoadToLocalContiguity.find(bufOp);
-        it != bufferLoadToLocalContiguity.end())
+        it != bufferLoadToLocalContiguity.end()) {
       loadContig = it->second;
-    else
+      llvm::outs() << "map_lookup OK, val=" << loadContig << "\n";
+    } else {
+      llvm::outs() << "MISS: bufOp ptr=" << (void*)const_cast<triton::amdgpu::BufferLoadToLocalOp&>(bufOp).getOperation()
+                   << " map_size=" << bufferLoadToLocalContiguity.size() << "\n";
+      for (auto &kv : bufferLoadToLocalContiguity)
+        llvm::outs() << "  map key ptr=" << (void*)const_cast<triton::amdgpu::BufferLoadToLocalOp&>(kv.first).getOperation() << "\n";
       return bufOp->emitError()
              << "No contiguity information about the copy op";
+    }
     assert(loadContig > 0);
 
 llvm::outs() << "loc4, loadContig = " << loadContig << "\n";
@@ -293,8 +302,17 @@ llvm::outs() << "loc4.2\n";
     }
 llvm::outs() << "loc4.3\n";
     auto regToSharedLayout = regLayout.invertAndCompose(sharedLayout);
-    loadContig = std::min<unsigned>(loadContig,
-                                    regToSharedLayout.getNumConsecutiveInOut());
+    // For buffer_load_to_local, we do NOT cap loadContig by
+    // regToSharedLayout.getNumConsecutiveInOut() (which uses the CURRENT src
+    // encoding). Unlike AsyncCopyGlobalToLocalOp (where the tensor-pointer
+    // encoding bounds the real global-memory contiguity), buffer_load_to_local
+    // uses a scalar ptr + offset tensor; the true contiguity comes from
+    // ptr/offset DIVISIBILITY, already computed above. Capping by the current
+    // encoding's consecutive-in-out would reduce loadContig to 1 (when
+    // sizePerThread=[1,1]), preventing the rewrite. The new encoding built
+    // below sets contigPerThread = loadContig, satisfying the property.
+    //
+    // regToSharedLayout is still used in the padded-encoding branch below.
 llvm::outs() << "regToSharedLayout = " << regToSharedLayout.getNumConsecutiveInOut() << "\n";
 llvm::outs() << "loc4.4, loadContig = " << loadContig << "\n";
     // Select the largest supported load width equal or smaller than loadContig
@@ -317,24 +335,44 @@ llvm::outs() << "loc5\n";
     ttg::DistributedEncodingTrait newDistEnc;
 llvm::outs() << "loc6\n";
 
-    if (LLVM::AMD::canLoadDirectToLDS(targetInfo, srcTy, dstTy.getEncoding(),
-                                      dstTy.getAllocShape(), loadContig)) {
-      return rewriter.notifyMatchFailure(bufOp, "already writes coalesced");
+    {
+      llvm::outs().flush();
+      unsigned tmpVec = loadContig;
+      // canLoadDirectToLDS calls getPointeeBitWidth(srcTy), which requires
+      // srcTy to be a tensor-of-pointers. For buffer_load_to_local, srcTy is
+      // the offset tensor (tensor<...xi32>), NOT a pointer tensor. We must
+      // reconstruct the effective pointer type (tensor<...x!tt.ptr<elem>>) the
+      // same way BufferLoadToLocalOpConversion does in LoadStoreOpToLLVM.cpp:730.
+      auto effectivePtrTy = cast<RankedTensorType>(
+          LLVM::AMD::getPointerTypeWithShape(bufOp.getPtr(), offsets));
+      bool already = LLVM::AMD::canLoadDirectToLDS(targetInfo, effectivePtrTy, dstTy.getEncoding(),
+                                                   dstTy.getAllocShape(), tmpVec);
+      llvm::outs() << "canLoadDirectToLDS=" << already << " tmpVec=" << tmpVec << "\n";
+      llvm::outs().flush();
+      if (already) {
+        return rewriter.notifyMatchFailure(bufOp, "already writes coalesced");
+      }
     }
     // Check if we support load contig because canLoadDirectToLds can change it
-    if (!targetInfo.supportsDirectToLdsLoadBitWidth(loadContig * elemBitWidth))
+    if (!targetInfo.supportsDirectToLdsLoadBitWidth(loadContig * elemBitWidth)) {
+      llvm::outs() << "unsupported bitwidth: " << loadContig * elemBitWidth << "\n";
       return rewriter.notifyMatchFailure(bufOp,
                                          "unable to find supported vector size "
                                          "based on src and dst encodings");
+    }
 
 llvm::outs() << "loc7\n";
     if (isa<ttg::SwizzledSharedEncodingAttr>(dstTy.getEncoding())) {
       // For swizzled layouts we apply the swizzling during lowering so we only
       // adjust the sizePerThread of the blocked encoding to avoid strided
-      // writes into LDS
+      // writes into LDS.
+      // For buffer_load_to_local, the offsets tensor sizePerThread may be
+      // smaller than loadContig (since the scalar ptr + offsets pattern can
+      // address contiguous elements even when sizePerThread=1). Unlike
+      // CoalesceAsyncCopyWrites, we do NOT assert srcElemContig >= loadContig
+      // and instead let BlockedEncodingAttr::get compute a fresh valid layout
+      // with the widened sizePerThread.
       auto contigPerThread = ttg::getContigPerThread(srcTy);
-      auto srcElemContig = contigPerThread[blockedEnc.getOrder()[0]];
-      assert(srcElemContig >= loadContig);
       contigPerThread[blockedEnc.getOrder()[0]] = loadContig;
       newDistEnc = BlockedEncodingAttr::get(
           bufOp.getContext(), srcTy.getShape(), contigPerThread,
@@ -429,7 +467,8 @@ llvm::outs() << "loc11\n";
     };
 
     auto loc = bufOp->getLoc();
-    Value cvtPtr = convertLayout(loc, ptr, newDistEnc);
+    // ptr is a scalar pointer (!tt.ptr<elem>), not a tensor — do NOT convert it.
+    // Only offsets (and optionally mask/other) are tensors that need layout change.
     Value cvtOffs = convertLayout(loc, offsets, newDistEnc);
 
     if (mask)
@@ -439,7 +478,6 @@ llvm::outs() << "loc11\n";
 llvm::outs() << "loc12\n";
 
     rewriter.modifyOpInPlace(bufOp, [&]() {
-      bufOp.getPtrMutable().assign(cvtPtr);
       bufOp.getOffsetsMutable().assign(cvtOffs);
       if (mask)
         bufOp.getMaskMutable().assign(mask);
@@ -494,21 +532,60 @@ public:
 
     // Precompute the contiguity of all BufferLoadToLocal ops based on the ptr, offset, and
     // mask contiguity/alignment to avoid rebuilding ModuleAxisInfoAnalysis
-    // after every IR change.    
+    // after every IR change.
+    //
+    // For buffer_load_to_local, we use ptr+offset DIVISIBILITY (not the current
+    // encoding's sizePerThread) to derive contiguity, because the offsets
+    // tensor may have sizePerThread=1 while still being hardware-contiguous
+    // across multiple elements (the scalar ptr + offset pattern).  This mirrors
+    // the logic in CoalesceBufferOps::computePerThread.
     DenseMap<triton::amdgpu::BufferLoadToLocalOp, unsigned> bufferOpsToLocalContiguity;
     m->walk([&](triton::amdgpu::BufferLoadToLocalOp bufOp) {
       Value ptr = bufOp.getPtr();
       Value offsets = bufOp.getOffsets();
-      unsigned contiguity =
-             mlir::LLVM::AMD::getContiguity(ptr, axisAnalysis);
-      llvm::outs() << "offset_cont = " << contiguity << "\n";
 
-      if (auto mask = bufOp.getMask()) {
-        contiguity =
-            std::min<unsigned>(contiguity, axisAnalysis.getMaskAlignment(mask));
-      llvm::outs() << "mask_cont = " << axisAnalysis.getMaskAlignment(mask) << "\n";
+      auto offsetTy = cast<RankedTensorType>(offsets.getType());
+      unsigned elemBitWidth = triton::getPointeeBitWidth(ptr.getType());
+      unsigned elemNumBytes = std::max(elemBitWidth / 8, 1u);
+
+      // Alignment from the scalar base pointer divisibility.
+      unsigned ptrAlign = 1;
+      auto *ptrInfo = axisAnalysis.getAxisInfo(ptr);
+      llvm::outs() << "ptrInfo=" << (void*)ptrInfo << "\n";
+      if (ptrInfo) {
+        unsigned ptrDivisibility = ptrInfo->getDivisibility(0);
+        ptrAlign = std::max(ptrDivisibility / elemNumBytes, 1u);
+        llvm::outs() << "ptrDiv=" << ptrDivisibility << " ptrAlign=" << ptrAlign << "\n";
       }
 
+      // Alignment from the offset tensor's innermost (fast-varying) dimension,
+      // derived from axis-info divisibility — NOT capped by sizePerThread.
+      unsigned offsetAlign = 1;
+      auto *offsetInfo = axisAnalysis.getAxisInfo(offsets);
+      llvm::outs() << "offsetInfo=" << (void*)offsetInfo << "\n";
+      if (offsetInfo) {
+        auto contiguityVec = offsetInfo->getContiguity();
+        SmallVector<unsigned> offsetOrder = getOrderFromContiguity(contiguityVec);
+        unsigned innerDim = offsetOrder[0];
+        unsigned divisibility = offsetInfo->getDivisibility(innerDim);
+        offsetAlign = std::max(divisibility / elemNumBytes, 1u);
+        llvm::outs() << "innerDim=" << innerDim << " div=" << divisibility << " offsetAlign=" << offsetAlign << "\n";
+      }
+
+      // Cap to the widest vectorized load (128 bits).
+      unsigned maxVec = 128 / elemBitWidth;
+      unsigned contiguity = std::min({ptrAlign, offsetAlign, maxVec});
+      llvm::outs() << "offset_cont = " << contiguity << " (ptrAlign=" << ptrAlign << " offsetAlign=" << offsetAlign << " maxVec=" << maxVec << ")\n";
+
+      // NOTE: For buffer_load_to_local, we intentionally do NOT cap by
+      // getMaskAlignment(mask). The mask for these ops may have a different
+      // (smaller) shape than the offsets tensor (e.g., mask_n[:, None] is
+      // [BLOCK_N, 1] while offsets is [BLOCK_N, BLOCK_D_Q]). getMaskAlignment
+      // would return 1 for such a 1-wide mask, incorrectly capping contiguity.
+      // The mask is applied per-row (one bit covers all BLOCK_D_Q elements),
+      // so it does not limit vectorization along the column (fast) dimension.
+
+      llvm::outs() << "inserting op=" << (void*)bufOp.getOperation() << " cont=" << contiguity << "\n";
       bufferOpsToLocalContiguity.insert({bufOp, contiguity});
     });
 

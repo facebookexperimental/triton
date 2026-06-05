@@ -176,8 +176,8 @@ public:
       if (!bufOp)
         return;
 
-      // if (isa<triton::amdgpu::BufferLoadToLocalOp>(op))
-      //   return;
+      if (isa<triton::amdgpu::BufferLoadToLocalOp>(op))
+        return;
 
       // Determine the tensor type that represents the data layout.
       // For loads it's the offset input; for stores find the first tensor operand.
