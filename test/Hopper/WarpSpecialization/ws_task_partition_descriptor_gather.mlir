@@ -1,5 +1,4 @@
 // RUN: triton-opt %s -split-input-file --nvgpu-test-ws-task-partition=num-warp-groups=3 | FileCheck %s
-// XFAIL: *
 
 // Regression test for B-21-F1 / T273503312.
 // CHECK-LABEL: @matmul_ws_gather_and_descriptor_load

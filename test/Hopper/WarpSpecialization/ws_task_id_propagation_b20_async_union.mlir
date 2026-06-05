@@ -1,5 +1,4 @@
 // RUN: triton-opt %s -split-input-file --nvgpu-test-taskid-propagate=num-warp-groups=2 | FileCheck %s
-// XFAIL: *
 
 // Regression tests for B-20-F1 / T273501459.
 //
@@ -12,7 +11,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK:       %[[C0:.*]] = arith.constant {async_task_id = array<i32: 0, 1, 2>} 0 : i32
   // CHECK-NEXT:  %[[C1:.*]] = arith.constant {async_task_id = array<i32: 0, 1, 2>} 1 : i32
   // CHECK-NEXT:  %[[C16:.*]] = arith.constant {async_task_id = array<i32: 0, 1, 2>} 16 : i32
-  // CHECK:       llvm.intr.assume {{.*}} {async_task_id = array<i32: 0, 1, 2>} : i1
+  // CHECK:       llvm.intr.assume {{.*}} : i1 {async_task_id = array<i32: 0, 1, 2>}
   // CHECK:       scf.for %{{.*}} = %[[C0]] to %[[C16]] step %[[C1]]  : i32 {
   // CHECK:       } {async_task_id = array<i32: 0, 1, 2>}
   tt.func public @async_anchors_mark_assume_loop_and_bounds() {
@@ -38,7 +37,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK:       %[[C0:.*]] = arith.constant {async_task_id = array<i32: 0, 1, 2>} 0 : i32
   // CHECK-NEXT:  %[[C1:.*]] = arith.constant {async_task_id = array<i32: 0, 1, 2>} 1 : i32
   // CHECK-NEXT:  %[[C16:.*]] = arith.constant {async_task_id = array<i32: 0, 1, 2>} 16 : i32
-  // CHECK:       llvm.intr.assume {{.*}} {async_task_id = array<i32: 0, 1, 2>} : i1
+  // CHECK:       llvm.intr.assume {{.*}} : i1 {async_task_id = array<i32: 0, 1, 2>}
   // CHECK:       scf.for %{{.*}} = %[[C0]] to %[[C16]] step %[[C1]]  : i32 {
   // CHECK:       } {async_task_id = array<i32: 0, 1, 2>}
   tt.func public @partition_anchors_mark_assume_loop_and_bounds() {

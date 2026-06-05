@@ -142,6 +142,10 @@ struct NVGPUWSTMAStoreLoweringPass
 static constexpr const char *kCanRotateByBufferCount =
     "can_rotate_by_buffer_count";
 
+static bool isTMAStoreLikeOp(Operation *op) {
+  return isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(op);
+}
+
 // Trace the token back to the defining TMA store-like op
 // (AsyncTMACopyLocalToGlobalOp or AsyncTMAReduceOp), handling both direct
 // definitions and loop-carried block arguments. Returns the SMEM source
@@ -182,14 +186,6 @@ static Operation *getDefiningTMAStoreOp(ttng::TMAStoreTokenWaitOp waitOp,
   }
 
   return nullptr;
-}
-
-// Legacy wrapper for callers that only need AsyncTMACopyLocalToGlobalOp.
-static ttng::AsyncTMACopyLocalToGlobalOp
-getDefiningTMAStore(ttng::TMAStoreTokenWaitOp waitOp) {
-  Value buffer;
-  auto *op = getDefiningTMAStoreOp(waitOp, buffer);
-  return dyn_cast_or_null<ttng::AsyncTMACopyLocalToGlobalOp>(op);
 }
 
 void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp) {
@@ -264,6 +260,24 @@ void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp) {
 #define GEN_PASS_DEF_NVGPUTESTTMASTORETOKENWAITREORDER
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
 
+static Operation *
+findScheduledWaitBarrierBetween(Operation *producer, Operation *insertionTarget,
+                                const tt::CoarseSchedule &schedule) {
+  if (!producer->isBeforeInBlock(insertionTarget))
+    return nullptr;
+
+  for (auto revIt = Block::reverse_iterator(insertionTarget->getIterator());
+       revIt != insertionTarget->getBlock()->rend(); ++revIt) {
+    Operation *candidate = &*revIt;
+    if (candidate == producer)
+      return nullptr;
+    if (isa<ttng::WaitBarrierOp>(candidate) && schedule.count(candidate))
+      return candidate;
+  }
+
+  return nullptr;
+}
+
 void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
   funcOp.walk([&](scf::ForOp forOp) {
     bool hasNestedFor = false;
@@ -297,7 +311,8 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
       auto waitOp = dyn_cast<ttng::TMAStoreTokenWaitOp>(&op);
       if (!waitOp || !waitOp->hasAttr(kCanRotateByBufferCount))
         continue;
-      auto tmaStore = getDefiningTMAStore(waitOp);
+      Value buffer;
+      auto *tmaStore = getDefiningTMAStoreOp(waitOp, buffer);
       if (!tmaStore || tmaStore->getParentOp() != forOp)
         continue;
       waits.push_back(waitOp);
@@ -313,7 +328,8 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
       int k = attr.getInt();
 
       // Find the defining TMA store op.
-      auto tmaStore = getDefiningTMAStore(waitOp);
+      Value buffer;
+      auto *tmaStore = getDefiningTMAStoreOp(waitOp, buffer);
       if (!tmaStore)
         continue;
 
@@ -322,8 +338,8 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
         continue;
 
       // Walk the linearized schedule from the TMA store, counting K
-      // AsyncTMACopyLocalToGlobalOp ops. The wait must be placed before
-      // the K-th copy to ensure the buffer slot is not overwritten.
+      // TMA store-like ops. The wait must be placed before the K-th op to
+      // ensure the buffer slot is not overwritten.
       auto it = schedule.linearized(forOp, tmaStore);
       it.setMaxStages(schedule.getNumStages() + k);
 
@@ -332,16 +348,15 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
 
       Operation *insertionTarget = nullptr;
       int targetStage = 0;
-      int copyCount = 0;
+      int storeCount = 0;
 
       while (!it.isEnd()) {
         Operation *op = *it;
         int stageAtOp = it.currStage();
         ++it;
-        if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
-                op)) {
-          ++copyCount;
-          if (copyCount == k) {
+        if (isTMAStoreLikeOp(op)) {
+          ++storeCount;
+          if (storeCount == k) {
             insertionTarget = op;
             targetStage = stageAtOp;
             break;
@@ -350,16 +365,12 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
       }
 
       if (insertionTarget) {
-        // Look for a WaitBarrierOp before the insertion target in the same
-        // block. If found, insert before the barrier wait instead.
-        for (auto revIt =
-                 Block::reverse_iterator(insertionTarget->getIterator());
-             revIt != insertionTarget->getBlock()->rend(); ++revIt) {
-          if (isa<ttng::WaitBarrierOp>(&*revIt) && schedule.count(&*revIt)) {
-            insertionTarget = &*revIt;
-            break;
-          }
-        }
+        // Look for a WaitBarrierOp between the defining store and the
+        // insertion target. Do not scan before the producer: unrelated earlier
+        // barriers must not pull the token wait before its defining TMA store.
+        if (Operation *waitBarrier = findScheduledWaitBarrierBetween(
+                tmaStore, insertionTarget, schedule))
+          insertionTarget = waitBarrier;
 
         // Split the cluster at the insertion target: ops before it remain
         // in the original cluster, the target and subsequent ops stay in
@@ -403,23 +414,21 @@ struct NVGPUTestTMAStoreTokenWaitReorderPass
 static int countTMAStoresInRange(Block::iterator from, Block::iterator to) {
   int count = 0;
   for (auto it = from; it != to; ++it) {
-    if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(&*it))
+    if (isTMAStoreLikeOp(&*it))
       ++count;
   }
   return count;
 }
 
 // Compute the pendings value for a TMAStoreTokenWaitOp.
-// pendings = number of AsyncTMACopyLocalToGlobalOp ops issued after the token's
-// defining store and before this wait, in program execution order.
+// pendings = number of TMA store-like ops issued after the token's defining
+// store and before this wait, in program execution order.
 static int computePendings(ttng::TMAStoreTokenWaitOp waitOp) {
   Value token = waitOp.getToken();
 
   // Direct case: token defined by a TMA store-like op in same block.
   auto directDef = token.getDefiningOp();
-  if (directDef &&
-      isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
-          directDef)) {
+  if (directDef && isTMAStoreLikeOp(directDef)) {
     if (directDef->getBlock() == waitOp->getBlock()) {
       return countTMAStoresInRange(std::next(directDef->getIterator()),
                                    waitOp->getIterator());
@@ -439,9 +448,7 @@ static int computePendings(ttng::TMAStoreTokenWaitOp waitOp) {
 
     // Trace the yielded value to its defining TMA store-like op.
     auto defOp = yieldedVal.getDefiningOp();
-    if (!defOp ||
-        !isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
-            defOp) ||
+    if (!defOp || !isTMAStoreLikeOp(defOp) ||
         defOp->getBlock() != forOp.getBody())
       return 0;
 

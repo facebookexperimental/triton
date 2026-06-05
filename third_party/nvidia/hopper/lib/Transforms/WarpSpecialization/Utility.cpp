@@ -4,9 +4,16 @@
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "llvm/ADT/SetVector.h"
+#include <algorithm>
 
 namespace tt = mlir::triton;
 namespace mlir {
+
+static void normalizeAsyncTaskIds(SmallVectorImpl<AsyncTaskId> &asyncTaskIds) {
+  llvm::sort(asyncTaskIds);
+  asyncTaskIds.erase(std::unique(asyncTaskIds.begin(), asyncTaskIds.end()),
+                     asyncTaskIds.end());
+}
 
 //===----------------------------------------------------------------------===//
 // Helper functions for async task
@@ -16,11 +23,7 @@ SmallVector<AsyncTaskId> getAsyncTaskIds(Operation *op) {
   SmallVector<AsyncTaskId> asyncTaskIds;
   if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>("async_task_id")) {
     for (AsyncTaskId asyncTaskId : attr.asArrayRef()) {
-      // TODO(Arda): Remove this check once we figure out why we have duplicate
-      // async task ids
-      if (asyncTaskIds.empty() ||
-          asyncTaskIds[asyncTaskIds.size() - 1] != asyncTaskId)
-        asyncTaskIds.push_back(asyncTaskId);
+      asyncTaskIds.push_back(asyncTaskId);
     }
   } else if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(
                  tt::gpu::kPartitionAttrName)) {
@@ -28,6 +31,7 @@ SmallVector<AsyncTaskId> getAsyncTaskIds(Operation *op) {
       asyncTaskIds.push_back(asyncTaskId);
     }
   }
+  normalizeAsyncTaskIds(asyncTaskIds);
   return asyncTaskIds;
 }
 
@@ -40,10 +44,7 @@ void setAsyncTaskIds(Operation *op, ArrayRef<AsyncTaskId> asyncTaskIds) {
     return;
   SmallVector<AsyncTaskId> sortedAsyncTaskIds(asyncTaskIds.begin(),
                                               asyncTaskIds.end());
-  sort(sortedAsyncTaskIds);
-  auto i32Ty = IntegerType::get(op->getContext(), 32);
-  auto size = static_cast<int64_t>(sortedAsyncTaskIds.size());
-  auto vecTy = VectorType::get(size, i32Ty);
+  normalizeAsyncTaskIds(sortedAsyncTaskIds);
   op->setAttr("async_task_id",
               DenseI32ArrayAttr::get(op->getContext(), sortedAsyncTaskIds));
 }

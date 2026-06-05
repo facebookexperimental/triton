@@ -1,5 +1,4 @@
-// XFAIL: *
-// RUN: not triton-opt %s -split-input-file --nvgpu-test-1D-tmem-alloc 2>&1 | FileCheck %s --check-prefix=ERR
+// RUN: ! triton-opt %s -split-input-file --nvgpu-test-1D-tmem-alloc 2>&1 | FileCheck %s --check-prefix=ERR
 
 // Regression test for B-8-F1 / T273479230.
 // ERR: expected `tmem.start` producer to have rank 1

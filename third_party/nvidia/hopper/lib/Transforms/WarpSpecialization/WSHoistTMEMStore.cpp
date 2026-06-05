@@ -60,6 +60,8 @@ public:
         continue;
 
       if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(user)) {
+        if (mma.getAccumulator() != tmemBuf)
+          return failure(); // store does not initialize operand D
         if (mmaOp)
           return failure(); // multiple MMAs
         mmaOp = mma;

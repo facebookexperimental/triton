@@ -1,5 +1,4 @@
 // RUN: triton-opt %s --nvgpu-ws-data-partition=num-warp-groups=3 | FileCheck %s
-// XFAIL: *
 
 // Regression test for B-14-F1 / T273489733.
 // Data partitioning is driven by dots with multiple consumer task ids. An

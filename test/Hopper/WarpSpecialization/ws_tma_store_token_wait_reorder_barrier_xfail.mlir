@@ -1,5 +1,4 @@
 // RUN: triton-opt %s -split-input-file --nvgpu-test-tma-store-token-wait-reorder | FileCheck %s
-// XFAIL: *
 
 // Regression test for B-22-F1 / T273504812.
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>

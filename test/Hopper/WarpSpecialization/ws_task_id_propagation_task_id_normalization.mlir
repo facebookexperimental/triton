@@ -1,5 +1,4 @@
 // RUN: triton-opt %s --nvgpu-test-taskid-propagate=num-warp-groups=2 | FileCheck %s
-// XFAIL: *
 
 // Regression test for B-9-F1 / T273481168.
 //
