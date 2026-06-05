@@ -20,6 +20,55 @@ namespace mlir {
 
 namespace {
 
+static Type getNewType(Type type, Attribute encoding) {
+  RankedTensorType tensorType = cast<RankedTensorType>(type);
+  return RankedTensorType::get(tensorType.getShape(),
+                               tensorType.getElementType(), encoding);
+}
+
+static Operation *convertDistributedOpEncoding1(Attribute encoding, Operation *op) {
+  llvm::outs() << "op_encoding1 = " << *op << "\n";
+  llvm::outs() << "encoding = " << encoding << "\n";
+  OpBuilder builder(op);
+  // Convert operands
+  SmallVector<Value, 4> newArgs;
+  for (auto &opOperand : op->getOpOperands()) {
+    Value operand = opOperand.get();
+    auto tensorType = dyn_cast<RankedTensorType>(operand.getType());
+    if (tensorType) {
+      Type newType = getNewType(tensorType, encoding);
+      newArgs.push_back(triton::gpu::ConvertLayoutOp::create(
+          builder, op->getLoc(), newType, operand));
+    } else {
+      newArgs.push_back(operand);
+    }
+  }
+
+  // Convert output types
+  SmallVector<Type, 4> newTypes;
+  for (auto t : op->getResultTypes()) {
+    bool isAsync = isa<triton::amdgpu::BufferLoadToLocalOp>(op);
+    newTypes.push_back(isAsync ? t : getNewType(t, encoding));
+  }
+
+  // Construct new op with the new encoding
+  Operation *newOp = builder.create(op->getLoc(), op->getName().getIdentifier(),
+                                    newArgs, newTypes, op->getAttrs());
+  llvm::outs() << "new_op = " << *newOp << "\n\n";
+  // Cast the results back to the original layout
+  for (size_t i = 0; i < op->getNumResults(); i++) {
+    Value newResult = newOp->getResult(i);
+    if (newTypes[i] != op->getResultTypes()[i]) {
+      newResult = triton::gpu::ConvertLayoutOp::create(
+          builder, op->getLoc(), op->getResult(i).getType(), newResult);
+    }
+    op->getResult(i).replaceAllUsesWith(newResult);
+  }
+  op->erase();
+  return newOp;
+}
+
+
 // Compute the ideal number of elements per thread for a buffer op.
 //
 // Buffer ops use a scalar base ptr + i32 offset tensor.  The generic
@@ -57,7 +106,7 @@ static unsigned computePerThread(Value ptr, Value offsets,
     unsigned divisibility = offsetInfo->getDivisibility(innerDim);
     offsetAlign = std::max(divisibility / elemNumBytes, 1u);
   }
-
+  llvm::outs() << "ptrAlign = " << ptrAlign << ", offsetAlign = " << offsetAlign << "\n";
   unsigned alignment = std::min(ptrAlign, offsetAlign);
   // Cap to the widest vectorized load/store (128 bits).
   unsigned maxVec = 128 / elemBitWidth;
@@ -99,6 +148,7 @@ buildBufferOpEncoding(MLIRContext *ctx, Value ptr, Value offsets,
   sizePerThread[order[0]] = std::min<unsigned>(
       sizePerThread[order[0]], std::max<unsigned>(numElems / numThreads, 1u));
 
+  llvm::outs() << "size_perf_0 = " << sizePerThread[order[0]] << "\n";
   auto cgaLayout = ttg::getCGALayout(tensorTy.getEncoding());
   return ttg::BlockedEncodingAttr::get(ctx, tensorTy.getShape(), sizePerThread,
                                        order, numWarps, threadsPerWarp,
@@ -125,10 +175,12 @@ public:
       auto bufOp = dyn_cast<triton::amdgpu::BufferOpInterface>(op);
       if (!bufOp)
         return;
-      if (isa<triton::amdgpu::BufferLoadToLocalOp>(op))
-        return;
+
+      // if (isa<triton::amdgpu::BufferLoadToLocalOp>(op))
+      //   return;
+
       // Determine the tensor type that represents the data layout.
-      // For loads it's the result; for stores find the first tensor operand.
+      // For loads it's the offset input; for stores find the first tensor operand.
       RankedTensorType tensorTy;
       if (op->getNumResults() == 1)
         tensorTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
@@ -142,6 +194,7 @@ public:
       if (!tensorTy)
         return;
 
+      llvm::outs() << "buffer_ops = " << *op << "\n";
       // Only rewrite BlockedEncoding — other encodings (dot_op, etc.) are
       // managed by later passes.
       if (!isa<ttg::BlockedEncodingAttr>(tensorTy.getEncoding()))
@@ -160,9 +213,11 @@ public:
       layoutMap[op] = newEnc;
     });
 
+    llvm::outs() << "before_convert1!\n";
     for (auto &kv : layoutMap) {
-      convertDistributedOpEncoding(kv.second, kv.first);
+      convertDistributedOpEncoding1(kv.second, kv.first);
     }
+    llvm::outs() << "before_convert2!\n";
   }
 };
 
