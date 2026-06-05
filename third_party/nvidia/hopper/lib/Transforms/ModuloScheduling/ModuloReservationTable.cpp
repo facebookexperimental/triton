@@ -19,7 +19,7 @@ namespace mlir::triton::gpu {
 
 ModuloReservationTable::ModuloReservationTable(int II) : II{II} {
   for (auto pipe :
-       {HWPipeline::MEM, HWPipeline::TC, HWPipeline::CUDA, HWPipeline::SFU}) {
+       {HWPipeline::TMA, HWPipeline::TC, HWPipeline::CUDA, HWPipeline::SFU}) {
     table[pipe].assign(II, -1);
   }
 }

@@ -42,7 +42,7 @@ static constexpr llvm::StringLiteral kSystemPrompt = R"(You are a GPU kernel sch
 
 The input provides:
 - MinII (already computed from ResMII and RecMII)
-- Nodes with op name, pipeline (MEM/TC/CUDA/SFU/NONE), latency, and selfLatency
+- Nodes with op name, pipeline (TMA/TC/CUDA/SFU/NONE), latency, and selfLatency
 - Edges with source, destination, latency, and loop-carried distance
 
 Your task: assign each non-NONE node a cycle, then derive stages and clusters.

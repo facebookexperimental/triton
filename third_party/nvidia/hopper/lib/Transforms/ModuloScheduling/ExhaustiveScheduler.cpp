@@ -393,7 +393,7 @@ static void searchRecursive(SearchState &state, unsigned depth) {
   // tractable. This reduces branching from 3^N (all ops) to 3^K (key ops
   // only, K << N).
   bool isKeyOp =
-      (node.pipeline == HWPipeline::MEM || node.pipeline == HWPipeline::TC);
+      (node.pipeline == HWPipeline::TMA || node.pipeline == HWPipeline::TC);
   // NONE ops are pinned to stage 0 (not pipelineable).
   bool isNone = (node.pipeline == HWPipeline::NONE);
   int maxStageForOp = isNone ? 0 : state.maxStages;
@@ -538,7 +538,7 @@ FailureOr<ModuloScheduleResult> runRandomSearch(const DataDependenceGraph &ddg,
   llvm::SmallVector<unsigned> keyOpIndices; // indices into topoOrder
   for (unsigned i = 0; i < topoOrder.size(); ++i) {
     const auto &node = ddg.getNode(topoOrder[i]);
-    if (node.pipeline == HWPipeline::MEM || node.pipeline == HWPipeline::TC)
+    if (node.pipeline == HWPipeline::TMA || node.pipeline == HWPipeline::TC)
       keyOpIndices.push_back(i);
   }
 

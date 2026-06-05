@@ -751,7 +751,7 @@ static void allocateBuffersForLoop(ttg::ScheduleLoop &loop) {
           continue;
         const auto &pred = loop.nodes[edge.srcId];
         if (pred.pipeline != ttg::HWPipeline::NONE &&
-            pred.pipeline != ttg::HWPipeline::MEM)
+            pred.pipeline != ttg::HWPipeline::TMA)
           continue;
         if (visited.insert(edge.srcId).second)
           worklist.push_back(edge.srcId);
@@ -917,7 +917,7 @@ buildCoConsumedGroups(const ttg::ScheduleLoop &loop) {
           continue;
         const auto &pred = loop.nodes[edge.srcId];
         if (pred.pipeline != ttg::HWPipeline::NONE &&
-            pred.pipeline != ttg::HWPipeline::MEM)
+            pred.pipeline != ttg::HWPipeline::TMA)
           continue;
         if (visited.insert(edge.srcId).second)
           worklist.push_back(edge.srcId);
@@ -1635,7 +1635,7 @@ static int computeWGBarrierCost(
   for (unsigned nid : nodeIds) {
     const auto &n = loop.nodes[nid];
     int freq = std::max(n.frequencyMultiplier, 1);
-    if (n.pipeline == ttg::HWPipeline::MEM) {
+    if (n.pipeline == ttg::HWPipeline::TMA) {
       barriers += 2 * freq; // wait_empty + expect_bytes
     } else if (n.pipeline == ttg::HWPipeline::TC) {
       barriers += 2 * freq; // operand wait_full × ~2
@@ -1814,7 +1814,7 @@ static void partitionIntoWarpGroups(ttg::ScheduleLoop &loop) {
 
   // Initialize: one candidate group per active pipeline.
   SmallVector<WarpGroupCandidate> groups;
-  for (auto pipe : {ttg::HWPipeline::MEM, ttg::HWPipeline::TC,
+  for (auto pipe : {ttg::HWPipeline::TMA, ttg::HWPipeline::TC,
                     ttg::HWPipeline::CUDA, ttg::HWPipeline::SFU}) {
     double util = pipeUtil.lookup(pipe);
     if (util <= 0.0)
@@ -2179,7 +2179,7 @@ buildClusters(const ttg::ScheduleLoop &loop) {
     int sum = 0;
     for (unsigned nid : c.nodeIds) {
       const auto &n = loop.nodes[nid];
-      int occ = (n.pipeline == ttg::HWPipeline::MEM ||
+      int occ = (n.pipeline == ttg::HWPipeline::TMA ||
                  n.pipeline == ttg::HWPipeline::TC)
                     ? std::max(n.latency, 1)
                     : std::max(n.selfLatency, 1);
@@ -2387,7 +2387,7 @@ static ScoredCandidate scoreCandidate(const ClusterAssignment &assn,
         if (n.pipeline == ttg::HWPipeline::CUDA) {
           syncWork += std::max(n.selfLatency, 0);
         } else if (n.pipeline == ttg::HWPipeline::TC ||
-                   n.pipeline == ttg::HWPipeline::MEM) {
+                   n.pipeline == ttg::HWPipeline::TMA) {
           asyncWork += std::max(n.latency, 0);
         }
       }
@@ -2840,7 +2840,7 @@ static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
 
     // Determine barrier kind from the producer/consumer pipeline.
     ttg::ScheduleLoop::BarrierKind kind;
-    if (src.pipeline == ttg::HWPipeline::MEM) {
+    if (src.pipeline == ttg::HWPipeline::TMA) {
       // MEM → TC/CUDA: data flows through SMEM → use mbarrier.
       kind = ttg::ScheduleLoop::BarrierKind::MBARRIER;
     } else if (src.pipeline == ttg::HWPipeline::TC) {
@@ -2857,7 +2857,7 @@ static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
     if (src.producesBuffer != UINT_MAX) {
       pairedBuf = src.producesBuffer;
       depth = loop.buffers[pairedBuf].count;
-    } else if (src.pipeline == ttg::HWPipeline::MEM && src.op) {
+    } else if (src.pipeline == ttg::HWPipeline::TMA && src.op) {
       // TMA load → memdesc-rebind chain (local_alloc, memdesc_trans,
       // memdesc_subview) → ... lowering step: the load's data lands in the
       // SMEM region the downstream `local_alloc` defines. There's no
@@ -3081,14 +3081,14 @@ scheduleOneLoop(scf::ForOp loop, const ttg::LatencyModel &model,
     int nMEM = 0, nTC = 0, nCUDA = 0, nSFU = 0, nNONE = 0;
     for (const auto &node : ddg.getNodes()) {
       switch (node.pipeline) {
-      case ttg::HWPipeline::MEM:  ++nMEM;  break;
+      case ttg::HWPipeline::TMA:  ++nMEM;  break;
       case ttg::HWPipeline::TC:   ++nTC;   break;
       case ttg::HWPipeline::CUDA: ++nCUDA; break;
       case ttg::HWPipeline::SFU:  ++nSFU;  break;
       case ttg::HWPipeline::NONE: ++nNONE; break;
       }
     }
-    llvm::dbgs() << "[" << label << "] Pipeline counts: MEM=" << nMEM
+    llvm::dbgs() << "[" << label << "] Pipeline counts: TMA=" << nMEM
                  << " TC=" << nTC << " CUDA=" << nCUDA << " SFU=" << nSFU
                  << " NONE=" << nNONE << " (total=" << ddg.getNumNodes()
                  << ")\n";

@@ -38,8 +38,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CHECK-SAME: live=[
 //
 // --- Producers: local_alloc → ->buf ---
-// CHECK: ttg.local_alloc  {pipe: MEM, {{.*}}->buf0}
-// CHECK: ttg.local_alloc  {pipe: MEM, {{.*}}->buf1}
+// CHECK: ttg.local_alloc  {pipe: TMA, {{.*}}->buf0}
+// CHECK: ttg.local_alloc  {pipe: TMA, {{.*}}->buf1}
 //
 // --- Consumer: MMA consumes all three buffers ---
 // CHECK: ttng.tc_gen5_mma  {pipe: TC, {{.*}}<-buf0, <-buf1, <-buf2}

@@ -112,7 +112,7 @@ coloring); the emitter uses these to emit one `tlx.local_alloc` per `buffer_id`.
   "id": 0,
   "II": 1038,
   "max_stage": 2,
-  "warp_groups": ["MEM", "TC"],
+  "warp_groups": ["TMA", "TC"],
   "induction_var": {"name": "k", "type": "i32"},
   "lower_bound": {"const": 0, "type": "i32"},
   "upper_bound": {"arg": "K"},
@@ -132,7 +132,7 @@ coloring); the emitter uses these to emit one `tlx.local_alloc` per `buffer_id`.
 {
   "id": 0,                       // = DDG node idx, stable within this loop
   "op_ref": "op_181362800",      // key into top-level ops table
-  "pipeline": "MEM",             // "MEM" | "TC" | "CUDA" | "SFU" | "NONE"
+  "pipeline": "TMA",             // "TMA" | "TC" | "CUDA" | "SFU" | "NONE"
   "partition": 0,                // index into loops[i].warp_groups
   "latency": 518,
   "self_latency": 518,
@@ -144,7 +144,7 @@ coloring); the emitter uses these to emit one `tlx.local_alloc` per `buffer_id`.
 }
 ```
 
-- `pipeline` is the HW classification (MEM / TC / CUDA / SFU / NONE).
+- `pipeline` is the HW classification (TMA / TC / CUDA / SFU / NONE).
 - `partition` is the warp-group assignment (Phase 4 plan); resolves to
   `loops[i].warp_groups[partition]`. For pipelines merged into the default
   group, this is the default group's index. Used by the emitter to route

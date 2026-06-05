@@ -125,7 +125,7 @@ class Node:
     id: int  # stable within this loop
     op_ref: str | None  # key into top-level ops table
     op_kind: str  # MLIR op name (also reachable via op_ref → ops table)
-    pipeline: str  # "MEM" | "TC" | "CUDA" | "SFU" | "NONE"
+    pipeline: str  # "TMA" | "TC" | "CUDA" | "SFU" | "NONE"
     warp_group: int  # index into loop.warp_groups
     latency: int
     self_latency: int

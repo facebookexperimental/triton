@@ -20,8 +20,8 @@ namespace mlir::triton::gpu {
 
 llvm::StringRef getPipelineName(HWPipeline pipeline) {
   switch (pipeline) {
-  case HWPipeline::MEM:
-    return "MEM";
+  case HWPipeline::TMA:
+    return "TMA";
   case HWPipeline::TC:
     return "TC";
   case HWPipeline::CUDA:
@@ -336,22 +336,22 @@ int LatencyModel::getSFUSelfLat(Operation *op) const {
 HWPipeline LatencyModel::classifyPipeline(Operation *op) const {
   // MEM: TMA loads, regular loads, and stores
   if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op))
-    return HWPipeline::MEM;
+    return HWPipeline::TMA;
   // MEM: Lowered TMA loads (TLX kernels use async_tma_copy instead of
   // descriptor_load)
   if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(op))
-    return HWPipeline::MEM;
+    return HWPipeline::TMA;
   if (isa<tt::LoadOp>(op)) {
     // Regular tt.load (before TMA lowering) — classify as MEM if tensor
     if (op->getNumResults() > 0 &&
         isa<RankedTensorType>(op->getResult(0).getType()))
-      return HWPipeline::MEM;
+      return HWPipeline::TMA;
   }
   if (isa<tt::DescriptorStoreOp>(op))
-    return HWPipeline::MEM;
+    return HWPipeline::TMA;
   // MEM: Lowered TMA stores (TLX path)
   if (isa<ttng::AsyncTMACopyLocalToGlobalOp>(op))
-    return HWPipeline::MEM;
+    return HWPipeline::TMA;
 
   // TC: Tensor Core MMA operations
   if (isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp>(op))
@@ -386,7 +386,7 @@ HWPipeline LatencyModel::classifyPipeline(Operation *op) const {
     if (op->getNumOperands() > 1) {
       auto valOperand = op->getOperand(1);
       if (isa<RankedTensorType>(valOperand.getType()))
-        return HWPipeline::MEM;
+        return HWPipeline::TMA;
     }
   }
 
@@ -496,7 +496,7 @@ OpLatencyInfo LatencyModel::getLatency(Operation *op) const {
   int latency = 0;
   int selfLatency = 0;
   switch (pipeline) {
-  case HWPipeline::MEM: {
+  case HWPipeline::TMA: {
     // selfLatency = issue cost: cycles the SM is blocked dispatching the op.
     // latency     = full delivery time: cycles from issue until a downstream
     //               consumer can read the data. Single number per op — no
