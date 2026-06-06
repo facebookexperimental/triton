@@ -84,8 +84,6 @@ Value getBarrierOperand(Operation *op, int idx) {
     return o.getAlloc();
   if (auto o = dyn_cast<triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp>(op))
     return o.getBarrier();
-  // Covers both TCGen5MMAOp and TCGen5MMAScaledOp (mxfp8) via the shared
-  // MMAv5 interface; the completion barriers are the MMA's "done" mbarriers.
   if (auto o = dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(op)) {
     auto b = o.getCompletionBarriers();
     return (idx >= 0 && idx < (int)b.size()) ? b[idx]
