@@ -603,3 +603,89 @@ module attributes {"ttg.num-warps" = 8 : i32} {
     tt.return
   }
 }
+
+// -----
+
+// Test 11: Multi-barrier tc_gen5_mma_scaled (mxfp8) with nested circular_store
+// patterns. Mirrors Test 9 but uses the scaled MMA variant, which is matched via
+// the shared MMAv5OpInterface (getCompletionBarriers) rather than TCGen5MMAOp.
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#shared2 = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8}>
+#shared3 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 8}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#tmem_scales = #ttng.tensor_memory_scales_encoding<>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-warps" = 8 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @test_tc_gen5_mma_scaled_multi_barrier_nested_stores
+  tt.func @test_tc_gen5_mma_scaled_multi_barrier_nested_stores() {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %true = arith.constant true
+    %false = arith.constant false
+    %cond = arith.constant true
+
+    %barrier_array_59 = ttg.local_alloc {mpp.op.id = 59 : i64} : () -> !ttg.memdesc<2xi64, #shared, #smem, mutable>
+    %barrier_array_84 = ttg.local_alloc {mpp.op.id = 84 : i64} : () -> !ttg.memdesc<2xi64, #shared, #smem, mutable>
+
+    %barrier_59_0 = ttg.memdesc_index %barrier_array_59[%c0_i32] : !ttg.memdesc<2xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %barrier_84_0 = ttg.memdesc_index %barrier_array_84[%c0_i32] : !ttg.memdesc<2xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.init_barrier %barrier_59_0, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.init_barrier %barrier_84_0, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+
+    %a_smem = ttg.local_alloc : () -> !ttg.memdesc<128x64xf8E4M3FN, #shared2, #smem, mutable>
+    %b_smem = ttg.local_alloc : () -> !ttg.memdesc<32x128xi8, #shared3, #smem, mutable>
+    %acc_tmem = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %scale_a = ttng.tmem_alloc : () -> !ttg.memdesc<128x2xi8, #tmem_scales, #ttng.tensor_memory, mutable>
+    %scale_b = ttng.tmem_alloc : () -> !ttg.memdesc<128x2xi8, #tmem_scales, #ttng.tensor_memory, mutable>
+
+    %scratch = ttg.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
+    proton_gpu.initialize %scratch : !tt.ptr<i32>
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<256xi32, #shared, #smem, mutable>
+    %segment = proton_gpu.segment_alloc %buf : !ttg.memdesc<256xi32, #shared, #smem, mutable> -> <1024, #smem, warp>
+
+    cf.br ^bb20
+
+  ^bb20:
+    // CHECK: %[[ALLOC_59:.*]] = arith.constant 59 : i32
+    // CHECK-NEXT: proton_gpu.circular_store start %{{.*}}, %[[ALLOC_59]] {scopeId = 21 : i32}
+    %start_21 = proton_gpu.read_counter : i32
+    proton_gpu.circular_store start %segment, %start_21 {scopeId = 21 : i32} : !proton_gpu.segment<1024, #smem, warp>, i32
+    cf.br ^bb21
+
+  ^bb21:
+    cf.cond_br %cond, ^bb22, ^bb23
+
+  ^bb22:
+    // CHECK: %[[ALLOC_84:.*]] = arith.constant 84 : i32
+    // CHECK: proton_gpu.circular_store start %{{.*}}, %[[ALLOC_84]] {scopeId = 22 : i32}
+    %start_22 = proton_gpu.read_counter : i32
+    proton_gpu.circular_store start %segment, %start_22 {scopeId = 22 : i32} : !proton_gpu.segment<1024, #smem, warp>, i32
+    cf.br ^bb23
+
+  ^bb23:
+    ttng.tc_gen5_mma_scaled %a_smem, %b_smem, %acc_tmem, %scale_a, %scale_b, %false, %true lhs = e4m3 rhs = e2m1, %barrier_59_0[%true], %barrier_84_0[%true] {is_async, mpp.op.id = 302 : i64} : !ttg.memdesc<128x64xf8E4M3FN, #shared2, #smem, mutable>, !ttg.memdesc<32x128xi8, #shared3, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x2xi8, #tmem_scales, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x2xi8, #tmem_scales, #ttng.tensor_memory, mutable>, !ttg.memdesc<1xi64, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    cf.cond_br %cond, ^bb24, ^bb25
+
+  ^bb24:
+    // CHECK: proton_gpu.circular_store end %{{.*}}, %c0_i32{{.*}} {scopeId = 22 : i32}
+    %end_22 = proton_gpu.read_counter : i32
+    proton_gpu.circular_store end %segment, %end_22 {scopeId = 22 : i32} : !proton_gpu.segment<1024, #smem, warp>, i32
+    cf.br ^bb25
+
+  ^bb25:
+    cf.cond_br %cond, ^bb26, ^bb27
+
+  ^bb26:
+    // CHECK: proton_gpu.circular_store end %{{.*}}, %c0_i32{{.*}} {scopeId = 21 : i32}
+    %end_21 = proton_gpu.read_counter : i32
+    proton_gpu.circular_store end %segment, %end_21 {scopeId = 21 : i32} : !proton_gpu.segment<1024, #smem, warp>, i32
+    cf.br ^bb27
+
+  ^bb27:
+    gpu.barrier
+    proton_gpu.finalize %segment, %scratch : !proton_gpu.segment<1024, #smem, warp>, !tt.ptr<i32>
+    tt.return
+  }
+}

@@ -84,8 +84,10 @@ Value getBarrierOperand(Operation *op, int idx) {
     return o.getAlloc();
   if (auto o = dyn_cast<triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp>(op))
     return o.getBarrier();
-  if (auto o = dyn_cast<triton::nvidia_gpu::TCGen5MMAOp>(op)) {
-    auto b = o.getBarriers();
+  // Covers both TCGen5MMAOp and TCGen5MMAScaledOp (mxfp8) via the shared
+  // MMAv5 interface; the completion barriers are the MMA's "done" mbarriers.
+  if (auto o = dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(op)) {
+    auto b = o.getCompletionBarriers();
     return (idx >= 0 && idx < (int)b.size()) ? b[idx]
            : b.empty()                       ? nullptr
                                              : b[0];
@@ -673,11 +675,11 @@ private:
   //===--------------------------------------------------------------------===//
 
   static bool isBarrierOp(Operation *op) {
-    return isa<
-        triton::nvidia_gpu::WaitBarrierOp, triton::nvidia_gpu::ArriveBarrierOp,
-        triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp,
-        triton::nvidia_gpu::TCGen5MMAOp, triton::nvidia_gpu::TCGen5CommitOp>(
-        op);
+    return isa<triton::nvidia_gpu::WaitBarrierOp,
+               triton::nvidia_gpu::ArriveBarrierOp,
+               triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp,
+               triton::nvidia_gpu::TCGen5CommitOp>(op) ||
+           isa<triton::nvidia_gpu::MMAv5OpInterface>(op);
   }
 
   struct StoreWithBarrierInfo {
@@ -699,9 +701,9 @@ private:
       }
 
       if (isBarrierOp(&op)) {
-        int numBarriers = isa<triton::nvidia_gpu::TCGen5MMAOp>(&op)
-                              ? cast<triton::nvidia_gpu::TCGen5MMAOp>(&op)
-                                    .getBarriers()
+        int numBarriers = isa<triton::nvidia_gpu::MMAv5OpInterface>(&op)
+                              ? cast<triton::nvidia_gpu::MMAv5OpInterface>(&op)
+                                    .getCompletionBarriers()
                                     .size()
                               : 1;
         SmallVector<std::pair<CircularStoreOp, int>> pending;
