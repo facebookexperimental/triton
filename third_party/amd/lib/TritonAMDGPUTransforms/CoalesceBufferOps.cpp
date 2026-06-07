@@ -27,8 +27,6 @@ static Type getNewType(Type type, Attribute encoding) {
 }
 
 static Operation *convertDistributedOpEncoding1(Attribute encoding, Operation *op) {
-  llvm::outs() << "op_encoding1 = " << *op << "\n";
-  llvm::outs() << "encoding = " << encoding << "\n";
   OpBuilder builder(op);
   // Convert operands
   SmallVector<Value, 4> newArgs;
@@ -54,7 +52,6 @@ static Operation *convertDistributedOpEncoding1(Attribute encoding, Operation *o
   // Construct new op with the new encoding
   Operation *newOp = builder.create(op->getLoc(), op->getName().getIdentifier(),
                                     newArgs, newTypes, op->getAttrs());
-  llvm::outs() << "new_op = " << *newOp << "\n\n";
   // Cast the results back to the original layout
   for (size_t i = 0; i < op->getNumResults(); i++) {
     Value newResult = newOp->getResult(i);
@@ -106,7 +103,6 @@ static unsigned computePerThread(Value ptr, Value offsets,
     unsigned divisibility = offsetInfo->getDivisibility(innerDim);
     offsetAlign = std::max(divisibility / elemNumBytes, 1u);
   }
-  llvm::outs() << "ptrAlign = " << ptrAlign << ", offsetAlign = " << offsetAlign << "\n";
   unsigned alignment = std::min(ptrAlign, offsetAlign);
   // Cap to the widest vectorized load/store (128 bits).
   unsigned maxVec = 128 / elemBitWidth;
@@ -148,7 +144,6 @@ buildBufferOpEncoding(MLIRContext *ctx, Value ptr, Value offsets,
   sizePerThread[order[0]] = std::min<unsigned>(
       sizePerThread[order[0]], std::max<unsigned>(numElems / numThreads, 1u));
 
-  llvm::outs() << "size_perf_0 = " << sizePerThread[order[0]] << "\n";
   auto cgaLayout = ttg::getCGALayout(tensorTy.getEncoding());
   return ttg::BlockedEncodingAttr::get(ctx, tensorTy.getShape(), sizePerThread,
                                        order, numWarps, threadsPerWarp,
@@ -194,7 +189,6 @@ public:
       if (!tensorTy)
         return;
 
-      llvm::outs() << "buffer_ops = " << *op << "\n";
       // Only rewrite BlockedEncoding — other encodings (dot_op, etc.) are
       // managed by later passes.
       if (!isa<ttg::BlockedEncodingAttr>(tensorTy.getEncoding()))
@@ -213,11 +207,9 @@ public:
       layoutMap[op] = newEnc;
     });
 
-    llvm::outs() << "before_convert1!\n";
     for (auto &kv : layoutMap) {
       convertDistributedOpEncoding1(kv.second, kv.first);
     }
-    llvm::outs() << "before_convert2!\n";
   }
 };
 
