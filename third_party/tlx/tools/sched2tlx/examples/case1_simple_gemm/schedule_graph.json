@@ -272,9 +272,9 @@
       ],
       "graph": {
         "nodes": [
-          {"id": 0, "op_ref": "op_89129161553552", "op_kind": "tt.descriptor_load", "pipeline": "MEM", "warp_group": 0, "latency": 530, "self_latency": 30, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 0, "stage": 0, "cluster": 0}, "produces_buffer": null, "consumes_buffers": []},
+          {"id": 0, "op_ref": "op_89129161553552", "op_kind": "tt.descriptor_load", "pipeline": "TMA", "warp_group": 0, "latency": 530, "self_latency": 30, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 0, "stage": 0, "cluster": 0}, "produces_buffer": null, "consumes_buffers": []},
           {"id": 1, "op_ref": "op_88854283421808", "op_kind": "ttg.local_alloc", "pipeline": "NONE", "warp_group": 2, "latency": 0, "self_latency": 0, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 530, "stage": 0, "cluster": 2}, "produces_buffer": 0, "consumes_buffers": []},
-          {"id": 2, "op_ref": "op_89129161553872", "op_kind": "tt.descriptor_load", "pipeline": "MEM", "warp_group": 1, "latency": 530, "self_latency": 30, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 30, "stage": 0, "cluster": 1}, "produces_buffer": null, "consumes_buffers": []},
+          {"id": 2, "op_ref": "op_89129161553872", "op_kind": "tt.descriptor_load", "pipeline": "TMA", "warp_group": 1, "latency": 530, "self_latency": 30, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 30, "stage": 0, "cluster": 1}, "produces_buffer": null, "consumes_buffers": []},
           {"id": 3, "op_ref": "op_88854283422016", "op_kind": "ttg.local_alloc", "pipeline": "NONE", "warp_group": 2, "latency": 0, "self_latency": 0, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 560, "stage": 0, "cluster": 3}, "produces_buffer": 1, "consumes_buffers": []},
           {"id": 4, "op_ref": "op_89266600410512", "op_kind": "ttng.tc_gen5_mma", "pipeline": "TC", "warp_group": 2, "latency": 559, "self_latency": 30, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 560, "stage": 0, "cluster": 3}, "produces_buffer": null, "consumes_buffers": [0, 1]}
         ],

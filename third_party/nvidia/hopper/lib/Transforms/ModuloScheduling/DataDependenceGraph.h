@@ -49,7 +49,7 @@ struct DDGNode {
 inline int pipelineOccupancy(const DDGNode &node) {
   if (node.pipeline == HWPipeline::NONE)
     return 1;
-  if (node.pipeline == HWPipeline::MEM || node.pipeline == HWPipeline::TC)
+  if (node.pipeline == HWPipeline::TMA || node.pipeline == HWPipeline::TC)
     return std::max(node.latency, 1);
   return std::max(node.selfLatency, 1);
 }

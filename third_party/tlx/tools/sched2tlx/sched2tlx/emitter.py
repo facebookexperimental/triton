@@ -2965,7 +2965,7 @@ class UnifiedWG:
     """
 
     name: str
-    role: str  # "default" | "MEM" | "TC" | other
+    role: str  # "default" | "TMA" | "TC" | other
     outer_wg: int | None
     inner_wg: int | None
     num_warps: int = 4
@@ -3004,7 +3004,7 @@ def _unified_warp_groups(
             primary = (
                 "TC"
                 if "TC" in wg.pipelines
-                else ("MEM" if "MEM" in wg.pipelines else roles)
+                else ("TMA" if "TMA" in wg.pipelines else roles)
             )
             # Layer B: trust the schedule pass's per-WG num_warps decision
             # (= max minWarps over the WG's ops, snapped to {1,2,4,8}).
@@ -3056,7 +3056,7 @@ def _unified_warp_groups(
         primary = (
             "TC"
             if "TC" in wg.pipelines
-            else ("MEM" if "MEM" in wg.pipelines else roles)
+            else ("TMA" if "TMA" in wg.pipelines else roles)
         )
         num_warps = wg.num_warps
         num_regs = 152 if num_warps >= 4 else 24
