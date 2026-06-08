@@ -272,20 +272,12 @@ def get_llvm_package_info(helper_args: BuildHelperArgs):
             f"LLVM pre-compiled image is not available for {system}-{arch}. Proceeding with user-configured LLVM from source build."
         )
         return Package("llvm", "LLVM-C.lib", "", "LLVM_INCLUDE_DIRS", "LLVM_LIBRARY_DIR", "LLVM_SYSPATH")
-    llvm_hash_path = os.path.join(get_base_dir(), "cmake", "llvm-hash.txt")
-    with open(llvm_hash_path, "r") as llvm_hash_file:
-        rev = llvm_hash_file.read(8)
-    build_number = None
     llvm_info_path = os.path.join(get_base_dir(), "cmake", "llvm-info.json")
-    if os.path.exists(llvm_info_path):
-        import json
-        with open(llvm_info_path, "r") as llvm_info_file:
-            llvm_info = json.load(llvm_info_file)
-        build_number = llvm_info.get("build_number")
-    if build_number is not None:
-        name = f"llvm-{rev}-{system_suffix}-{build_number}"
-    else:
-        name = f"llvm-{rev}-{system_suffix}"
+    with open(llvm_info_path, "r") as llvm_info_file:
+        llvm_info = json.load(llvm_info_file)
+    rev = llvm_info["llvm_hash"][:8]
+    build_number = llvm_info.get("build_number")
+    name = f"llvm-{rev}-{system_suffix}-{build_number}"
     # Create a stable symlink that doesn't include revision
     sym_name = f"llvm-{system_suffix}"
     url = f"https://oaitriton.blob.core.windows.net/public/llvm-builds/{name}.tar.gz"
