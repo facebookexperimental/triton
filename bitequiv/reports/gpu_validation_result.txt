@@ -1,0 +1,34 @@
+=== GPU validation started Fri Jun  5 05:28:42 PM PDT 2026 ===
+cuda_available=True at Fri Jun  5 05:28:46 PM PDT 2026
+
+=== T3/T4 constraint-prune tests (CPU logic + GPU e2e) ===
+...........                                                              [100%]
+11 passed in 3.56s
+
+=== Regression: existing autotuner tests ===
+..........s.....                                                         [100%]
+15 passed, 1 skipped in 6.80s
+
+=== Examples ===
+[T3] correctness gating
+     BLOCK_SIZE=  512  correct=False
+     BLOCK_SIZE= 1024  correct=False
+     BLOCK_SIZE= 2048  correct=False
+     BLOCK_SIZE= 4096  correct=True
+     BLOCK_SIZE= 8192  correct=True
+     winner BLOCK_SIZE=8192 (must be >= N=4096)
+
+[T4-A] vectorization (PTX ld/st.global.v*) feature selection
+     dropped (non-vectorized): [64, 128]
+     winner BLOCK_SIZE=4096
+
+[T4-B] AutoWS (TTGIR warp_specialize) feature selection
+     dropped (non-WS): [True] (FLATTEN values)
+     winner (warp-specialized): FLATTEN=False
+
+[T4-C] TMEM_LOAD (TTGIR ttng.tmem_load) correctness prune
+     dropped (emits tmem_load): ['tf32']
+     winner (no tmem_load): PREC=ieee
+
+
+=== GPU validation finished Fri Jun  5 05:29:13 PM PDT 2026 ===

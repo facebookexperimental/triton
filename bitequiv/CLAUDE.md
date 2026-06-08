@@ -5,6 +5,11 @@
 > architecture, build/test/format commands, path-scoped rules). Don't duplicate
 > that here — this file is about *this project's goals, conventions, and state*.
 
+> **SESSION BOOTSTRAP:** at the start of any session working on this project,
+> read `bitequiv/PROGRESS.md` first — it holds current state (phase, milestone
+> status, recent activity, key facts, open questions) and lists the docs to load.
+> Update it at session end per its UPDATE PROTOCOL.
+
 ## 1. What this project is
 
 Teach the Triton/TLX **autotuner to become constraint-aware** so it can both
