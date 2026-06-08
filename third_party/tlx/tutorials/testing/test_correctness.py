@@ -52,13 +52,15 @@ from triton.language.extra.tlx.tutorials.hopper_fa_ws import (
     attention as _hopper_fa_ws, )
 from triton.language.extra.tlx.tutorials.amd_fa_pipelined import (
     attention as _amd_fa_pipelined, )
+from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
+    matmul as _amd_tdm_gemm_pipelined, )
 
 from triton.language.extra.tlx.tutorials.testing.multi_cta_layer_norm import (
     multi_cta_layernorm as _multi_cta_layernorm,
     multi_cta_layernorm_2d as _multi_cta_layernorm_2d,
 )
 
-from triton._internal_testing import is_blackwell, is_hopper, is_hopper_or_newer, is_hip
+from triton._internal_testing import is_blackwell, is_hopper, is_hopper_or_newer, is_hip, is_hip_gfx1250
 from triton.language.extra.tlx.tutorials.testing.gemm_shapes import BLACKWELL_GEMM_WS as _BLACKWELL_GEMM_WS_MORE_SHAPES
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -157,6 +159,11 @@ class Gemm:
             "EPILOGUE_SUBTILE": False,
             "USE_WARP_BARRIER": True,
             "NUM_CTAS": 1,
+        },
+        "amd_tdm_gemm_pipelined": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 32,
         },
     }
 
@@ -894,6 +901,17 @@ def test_amd_fa_pipelined(config_name, causal):
         ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
         tri_out = _amd_fa_pipelined(q, k, v, sm_scale, causal, config=config)
         torch.testing.assert_close(tri_out, ref_out, atol=2e-2, rtol=0)
+
+
+# =============================================================================
+# AMD TDM GEMM Tests (gfx1250)
+# =============================================================================
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_amd_tdm_gemm_pipelined(dtype):
+    Gemm.run_test(_amd_tdm_gemm_pipelined, Gemm.CONFIGS["amd_tdm_gemm_pipelined"], dtype=dtype)
 
 
 # =============================================================================

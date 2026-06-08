@@ -26,4 +26,11 @@ composePaddedLayout(const triton::AMD::TargetInfo &targetInfo,
                     triton::gpu::TensorOrMemDesc srcTy,
                     ArrayRef<unsigned> sharedOrder, bool useAsyncCopy);
 
+/// Build the default shared encoding that AMD's TDM descriptor pipeline
+/// would assign to a descriptor of the given shape and element type when
+/// no upstream user (e.g., dot-operand consumer) constrains it further.
+Attribute buildDefaultTDMDescriptorEncoding(
+    MLIRContext *ctx, ArrayRef<int64_t> shape, ArrayRef<unsigned> order,
+    triton::gpu::CGAEncodingAttr cgaLayout, Type elementType);
+
 #endif
