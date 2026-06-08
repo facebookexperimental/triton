@@ -38,7 +38,13 @@ def is_gfx1250_available():
 
 def pack_scale(x: torch.Tensor, preshuffle_factor: int = 128) -> torch.Tensor:
     non_k, k_scale = x.shape
+    if non_k % preshuffle_factor != 0:
+        raise ValueError(f"scale non-K dimension must be divisible by {preshuffle_factor}, got {non_k}")
+    if k_scale <= 0:
+        raise ValueError(f"scale K dimension must be positive, got {k_scale}")
     scale_kwidth = 4 if k_scale >= 4 else k_scale
+    if k_scale % scale_kwidth != 0:
+        raise ValueError(f"scale K dimension must be divisible by {scale_kwidth}, got {k_scale}")
     num_chunk_m = non_k // preshuffle_factor
     num_chunk_k = k_scale // scale_kwidth
     x = x.view(num_chunk_m, 4, preshuffle_factor // 4, num_chunk_k, scale_kwidth)
@@ -69,6 +75,7 @@ def _mxgemm_issue_tdm_loads(
     a_scale_buf,
     b_scale_buf,
     load_idx,
+    phase,
     pred,
     BLOCK_K_PACKED_A: tl.constexpr,
     BLOCK_K_PACKED_B: tl.constexpr,
@@ -76,7 +83,7 @@ def _mxgemm_issue_tdm_loads(
     NUM_BUFFERS: tl.constexpr,
     TRANSPOSE_B: tl.constexpr,
 ):
-    slot = load_idx % NUM_BUFFERS
+    slot = phase % NUM_BUFFERS
     tlx.async_amd_descriptor_load(a_desc, tlx.local_view(a_buf, slot), [0, load_idx * BLOCK_K_PACKED_A], pred=pred)
     if TRANSPOSE_B:
         tlx.async_amd_descriptor_load(b_desc, tlx.local_view(b_buf, slot), [0, load_idx * BLOCK_K_PACKED_B], pred=pred)
@@ -100,13 +107,14 @@ def _mxgemm_issue_tdm_loads_unpredicated(
     a_scale_buf,
     b_scale_buf,
     load_idx,
+    phase,
     BLOCK_K_PACKED_A: tl.constexpr,
     BLOCK_K_PACKED_B: tl.constexpr,
     BLOCK_K_SCALE_PRESHUFFLED: tl.constexpr,
     NUM_BUFFERS: tl.constexpr,
     TRANSPOSE_B: tl.constexpr,
 ):
-    slot = load_idx % NUM_BUFFERS
+    slot = phase % NUM_BUFFERS
     tlx.async_amd_descriptor_load(a_desc, tlx.local_view(a_buf, slot), [0, load_idx * BLOCK_K_PACKED_A])
     if TRANSPOSE_B:
         tlx.async_amd_descriptor_load(b_desc, tlx.local_view(b_buf, slot), [0, load_idx * BLOCK_K_PACKED_B])
@@ -188,6 +196,10 @@ def mxgemm_tdm_pipelined_kernel(
     TRANSPOSE_B: tl.constexpr,
     NUM_BUFFERS: tl.constexpr,
 ):
+    tl.static_assert(NUM_BUFFERS >= 1, "NUM_BUFFERS must be at least 1")
+    tl.static_assert(BLOCK_M % 128 == 0, "BLOCK_M must be divisible by the MXFP scale preshuffle factor")
+    tl.static_assert(BLOCK_N % 128 == 0, "BLOCK_N must be divisible by the MXFP scale preshuffle factor")
+    tl.static_assert(BLOCK_K % SCALE_BLOCK == 0, "BLOCK_K must be divisible by SCALE_BLOCK")
     DIV_FACTOR_A: tl.constexpr = 2 if DTYPE_A == "e2m1" else 1
     DIV_FACTOR_B: tl.constexpr = 2 if DTYPE_B == "e2m1" else 1
     BLOCK_K_PACKED_A: tl.constexpr = BLOCK_K // DIV_FACTOR_A
@@ -264,70 +276,113 @@ def mxgemm_tdm_pipelined_kernel(
                                   layout=b_scale_layout)
 
     K_ITERS = tl.cdiv(K, BLOCK_K)
-    tl.assume(K_ITERS >= NUM_BUFFERS)
-    epilogue_lb = K_ITERS - (NUM_BUFFERS - 1)
     load_idx = 0
     wmma_idx = 0
 
-    for _ in tl.static_range(NUM_BUFFERS - 1):
-        load_idx = _mxgemm_issue_tdm_loads_unpredicated(
-            a_desc,
-            b_desc,
-            a_scale_desc,
-            b_scale_desc,
-            a_buf,
-            b_buf,
-            a_scale_buf,
-            b_scale_buf,
-            load_idx,
-            BLOCK_K_PACKED_A,
-            BLOCK_K_PACKED_B,
-            BLOCK_K_SCALE_PRESHUFFLED,
-            NUM_BUFFERS,
-            TRANSPOSE_B,
-        )
-
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     tl.assume(K_ITERS > 0)
-    for i in tl.range(0, K_ITERS):
-        pred = i - epilogue_lb
-        pred = (pred >> 31) & 1
-        load_idx = _mxgemm_issue_tdm_loads(
-            a_desc,
-            b_desc,
-            a_scale_desc,
-            b_scale_desc,
-            a_buf,
-            b_buf,
-            a_scale_buf,
-            b_scale_buf,
-            load_idx,
-            pred,
-            BLOCK_K_PACKED_A,
-            BLOCK_K_PACKED_B,
-            BLOCK_K_SCALE_PRESHUFFLED,
-            NUM_BUFFERS,
-            TRANSPOSE_B,
-        )
-        tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * NUM_LOADS_IN_BATCH)
-        a, b, scale_a, scale_b = _mxgemm_load_operands(
-            a_buf,
-            b_buf,
-            a_scale_buf,
-            b_scale_buf,
-            wmma_idx,
-            BLOCK_M,
-            BLOCK_N,
-            BLOCK_K_SCALE,
-            BLOCK_M_PRESHUFFLED,
-            BLOCK_N_PRESHUFFLED,
-            BLOCK_K_SCALE_PRESHUFFLED,
-            SCALE_KWIDTH,
-            NUM_BUFFERS,
-            TRANSPOSE_B,
-        )
-        wmma_idx += 1
-        acc = tlx.dot_scaled(a, scale_a, DTYPE_A, b, scale_b, DTYPE_B, acc, tiles_per_warp=[2, 2])
+
+    if K_ITERS < NUM_BUFFERS:
+        for _ in tl.range(0, K_ITERS):
+            load_idx = _mxgemm_issue_tdm_loads_unpredicated(
+                a_desc,
+                b_desc,
+                a_scale_desc,
+                b_scale_desc,
+                a_buf,
+                b_buf,
+                a_scale_buf,
+                b_scale_buf,
+                load_idx,
+                load_idx,
+                BLOCK_K_PACKED_A,
+                BLOCK_K_PACKED_B,
+                BLOCK_K_SCALE_PRESHUFFLED,
+                NUM_BUFFERS,
+                TRANSPOSE_B,
+            )
+            tlx.async_amd_descriptor_wait(0)
+            a, b, scale_a, scale_b = _mxgemm_load_operands(
+                a_buf,
+                b_buf,
+                a_scale_buf,
+                b_scale_buf,
+                wmma_idx,
+                BLOCK_M,
+                BLOCK_N,
+                BLOCK_K_SCALE,
+                BLOCK_M_PRESHUFFLED,
+                BLOCK_N_PRESHUFFLED,
+                BLOCK_K_SCALE_PRESHUFFLED,
+                SCALE_KWIDTH,
+                NUM_BUFFERS,
+                TRANSPOSE_B,
+            )
+            wmma_idx += 1
+            acc = tlx.dot_scaled(a, scale_a, DTYPE_A, b, scale_b, DTYPE_B, acc, tiles_per_warp=[2, 2])
+    else:
+        tl.assume(K_ITERS >= NUM_BUFFERS)
+        epilogue_lb = K_ITERS - (NUM_BUFFERS - 1)
+
+        for _ in tl.static_range(NUM_BUFFERS - 1):
+            load_idx = _mxgemm_issue_tdm_loads_unpredicated(
+                a_desc,
+                b_desc,
+                a_scale_desc,
+                b_scale_desc,
+                a_buf,
+                b_buf,
+                a_scale_buf,
+                b_scale_buf,
+                load_idx,
+                load_idx,
+                BLOCK_K_PACKED_A,
+                BLOCK_K_PACKED_B,
+                BLOCK_K_SCALE_PRESHUFFLED,
+                NUM_BUFFERS,
+                TRANSPOSE_B,
+            )
+
+        for i in tl.range(0, K_ITERS):
+            pred = i - epilogue_lb
+            pred = (pred >> 31) & 1
+            load_idx = _mxgemm_issue_tdm_loads(
+                a_desc,
+                b_desc,
+                a_scale_desc,
+                b_scale_desc,
+                a_buf,
+                b_buf,
+                a_scale_buf,
+                b_scale_buf,
+                load_idx,
+                wmma_idx + NUM_BUFFERS - 1,
+                pred,
+                BLOCK_K_PACKED_A,
+                BLOCK_K_PACKED_B,
+                BLOCK_K_SCALE_PRESHUFFLED,
+                NUM_BUFFERS,
+                TRANSPOSE_B,
+            )
+            tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * NUM_LOADS_IN_BATCH)
+            a, b, scale_a, scale_b = _mxgemm_load_operands(
+                a_buf,
+                b_buf,
+                a_scale_buf,
+                b_scale_buf,
+                wmma_idx,
+                BLOCK_M,
+                BLOCK_N,
+                BLOCK_K_SCALE,
+                BLOCK_M_PRESHUFFLED,
+                BLOCK_N_PRESHUFFLED,
+                BLOCK_K_SCALE_PRESHUFFLED,
+                SCALE_KWIDTH,
+                NUM_BUFFERS,
+                TRANSPOSE_B,
+            )
+            wmma_idx += 1
+            acc = tlx.dot_scaled(a, scale_a, DTYPE_A, b, scale_b, DTYPE_B, acc, tiles_per_warp=[2, 2])
 
     tl.store(c_ptrs, acc, mask=c_mask)
 
@@ -338,6 +393,72 @@ def _init_fp8(dtype: str, rows: int, cols: int):
     if dtype == "float8_e4m3":
         return torch.randint(20, 40, (rows, cols), dtype=torch.uint8).view(torch.float8_e4m3fn)
     raise ValueError(f"unsupported dtype: {dtype}")
+
+
+def _check_scale_kwidth(k_scale: int, label: str):
+    if k_scale <= 0:
+        raise ValueError(f"{label} scale K dimension must be positive, got {k_scale}")
+    scale_kwidth = 4 if k_scale >= 4 else k_scale
+    if k_scale % scale_kwidth != 0:
+        raise ValueError(f"{label} scale K dimension must be divisible by {scale_kwidth}, got {k_scale}")
+
+
+def _validate_mxgemm_inputs(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    M: int,
+    N: int,
+    K: int,
+    BLOCK_M: int,
+    BLOCK_N: int,
+    BLOCK_K: int,
+    TRANSPOSE_B: bool,
+    NUM_BUFFERS: int,
+):
+    if a.device != b.device or a.device != a_scale.device or a.device != b_scale.device:
+        raise ValueError("a, b, a_scale, and b_scale must be on the same device")
+    if a.device.type != "cuda":
+        raise ValueError(f"mxgemm_tdm_pipelined requires a CUDA/HIP tensor device, got {a.device}")
+    if a.dtype != torch.float8_e5m2 or b.dtype != torch.float8_e5m2:
+        raise TypeError("mxgemm_tdm_pipelined currently supports only torch.float8_e5m2 operands")
+    if a_scale.dtype != torch.uint8 or b_scale.dtype != torch.uint8:
+        raise TypeError("MXFP scales must be packed E8M0 data stored as torch.uint8")
+    if K <= 0:
+        raise ValueError("K must be positive")
+    if NUM_BUFFERS < 1:
+        raise ValueError(f"NUM_BUFFERS must be at least 1, got {NUM_BUFFERS}")
+    if BLOCK_M <= 0 or BLOCK_N <= 0 or BLOCK_K <= 0:
+        raise ValueError("BLOCK_M, BLOCK_N, and BLOCK_K must be positive")
+    if M % 128 != 0 or N % 128 != 0:
+        raise ValueError(f"M and N must be divisible by 128 for pre-shuffled scales, got M={M}, N={N}")
+    if BLOCK_M % 128 != 0 or BLOCK_N % 128 != 0:
+        raise ValueError(
+            f"BLOCK_M and BLOCK_N must be divisible by 128 for pre-shuffled scales, got {BLOCK_M}, {BLOCK_N}")
+    if K % 32 != 0 or BLOCK_K % 32 != 0:
+        raise ValueError(f"K and BLOCK_K must be divisible by SCALE_BLOCK=32, got K={K}, BLOCK_K={BLOCK_K}")
+    _check_scale_kwidth(K // 32, "total")
+    _check_scale_kwidth(BLOCK_K // 32, "block")
+    if a.stride(1) != 1:
+        raise ValueError(f"A must be contiguous along K for tensor descriptors, got stride_ak={a.stride(1)}")
+    b_inner_stride = b.stride(1)
+    if b_inner_stride != 1:
+        layout = "[N, K]" if TRANSPOSE_B else "[K, N]"
+        raise ValueError(f"B must use {layout} with a contiguous inner dimension, got inner stride {b_inner_stride}")
+
+    scale_k = K // 32
+    expected_a_scale = (M // 128, scale_k * 128)
+    expected_b_scale = (N // 128, scale_k * 128)
+    if tuple(a_scale.shape) != expected_a_scale:
+        raise ValueError(f"a_scale must be pre-shuffled with shape {expected_a_scale}, got {tuple(a_scale.shape)}")
+    if tuple(b_scale.shape) != expected_b_scale:
+        raise ValueError(f"b_scale must be pre-shuffled with shape {expected_b_scale}, got {tuple(b_scale.shape)}")
+    if a_scale.stride(1) != 1 or b_scale.stride(1) != 1:
+        raise ValueError("pre-shuffled scale tensors must be contiguous along their inner dimension")
+    if a_scale.stride(0) != b_scale.stride(0):
+        raise ValueError(
+            f"a_scale and b_scale must have the same row stride, got {a_scale.stride(0)} and {b_scale.stride(0)}")
 
 
 def mxgemm_tdm_pipelined(
@@ -356,7 +477,9 @@ def mxgemm_tdm_pipelined(
         N, Kb = b.shape
     else:
         Kb, N = b.shape
-    assert K == Kb
+    if K != Kb:
+        raise ValueError(f"A and B K dimensions must match, got {K} and {Kb}")
+    _validate_mxgemm_inputs(a, b, a_scale, b_scale, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, TRANSPOSE_B, NUM_BUFFERS)
     c = torch.empty((M, N), device=a.device, dtype=torch.float32)
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
     grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), )
@@ -437,10 +560,10 @@ def test_mxgemm_tdm_pipelined_compiles_gfx1250():
 
 @pytest.mark.skipif(not is_gfx1250_available(), reason="Requires gfx1250 hardware")
 @pytest.mark.parametrize("TRANSPOSE_B", [False, True])
-def test_mxgemm_tdm_pipelined_gfx1250(TRANSPOSE_B):
+@pytest.mark.parametrize("K, NUM_BUFFERS", [(512, 2), (128, 2)])
+def test_mxgemm_tdm_pipelined_gfx1250(TRANSPOSE_B, K, NUM_BUFFERS):
     torch.manual_seed(0)
     M = N = 256
-    K = 512
     a = _init_fp8("float8_e5m2", M, K)
     b = _init_fp8("float8_e5m2", K, N)
     a_scale = MXScaleTensor(size=(M, triton.cdiv(K, 32))).random(high=32.0).data
@@ -451,5 +574,6 @@ def test_mxgemm_tdm_pipelined_gfx1250(TRANSPOSE_B):
     b_scale = pack_scale(b_scale)
     a_d = a.contiguous().cuda()
     b_d = (b.T.contiguous() if TRANSPOSE_B else b.contiguous()).cuda()
-    out = mxgemm_tdm_pipelined(a_d, b_d, a_scale.cuda(), b_scale.cuda(), TRANSPOSE_B=TRANSPOSE_B)
+    out = mxgemm_tdm_pipelined(a_d, b_d, a_scale.cuda(), b_scale.cuda(), TRANSPOSE_B=TRANSPOSE_B,
+                               NUM_BUFFERS=NUM_BUFFERS)
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-5, atol=2e-2)
