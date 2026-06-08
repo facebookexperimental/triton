@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import builtins
+import math
 import time
 import inspect
 import hashlib
 import json
+import statistics
+from collections import deque
 from functools import cached_property
 from typing import Dict, Tuple, List, Optional
 
@@ -14,6 +17,220 @@ from .errors import OutOfResources, PTXASError, AutotunerError
 from .driver import driver
 from .cache import get_cache_manager, triton_key
 from triton._C.libtriton import get_cache_invalidating_env_vars
+
+
+class _OnlineLinearRegression:
+
+    def __init__(self, window_size: int = 299) -> None:
+        self.window_size = window_size
+        self._values: deque[float] = deque(maxlen=window_size)
+        self._sum_x: float = 0.0
+        self._sum_y: float = 0.0
+        self._sum_xy: float = 0.0
+        self._sum_x2: float = 0.0
+        self._sum_y2: float = 0.0
+        self._count: int = 0
+
+    def reset(self) -> None:
+        self._values.clear()
+        self._sum_x = 0.0
+        self._sum_y = 0.0
+        self._sum_xy = 0.0
+        self._sum_x2 = 0.0
+        self._sum_y2 = 0.0
+        self._count = 0
+
+    def add_value(self, y: float) -> None:
+        if len(self._values) == self.window_size:
+            y_out = self._values[0]
+            self._sum_y += y - y_out
+            self._sum_y2 += y * y - y_out * y_out
+            sum_remaining_ys = self._sum_y - y
+            self._sum_xy -= sum_remaining_ys
+            self._sum_xy += (float(self._count) - 1.0) * y
+        else:
+            x = float(self._count)
+            self._sum_x += x
+            self._sum_y += y
+            self._sum_xy += x * y
+            self._sum_x2 += x * x
+            self._sum_y2 += y * y
+            self._count += 1
+        self._values.append(y)
+
+    def get_slope_degrees(self) -> float:
+        if self._count < 2:
+            return float("nan")
+        n = float(self._count)
+        mean_x = self._sum_x / n
+        mean_y = self._sum_y / n
+        denom = (self._sum_x2 / n) - mean_x * mean_x
+        if abs(denom) < 1e-12:
+            return float("nan")
+        slope = ((self._sum_xy / n) - mean_x * mean_y) / denom
+        if not math.isfinite(slope):
+            return float("nan")
+        return math.degrees(math.atan(slope))
+
+    def r_squared(self) -> float:
+        if self._count < 2:
+            return float("nan")
+        n = float(self._count)
+        mean_x = self._sum_x / n
+        mean_y = self._sum_y / n
+        ss_tot = (self._sum_y2 / n) - mean_y * mean_y
+        if ss_tot < 1e-12:
+            return 1.0
+        denom = (self._sum_x2 / n) - mean_x * mean_x
+        if abs(denom) < 1e-12:
+            return float("nan")
+        slope = ((self._sum_xy / n) - mean_x * mean_y) / denom
+        intercept = mean_y - slope * mean_x
+        if not math.isfinite(slope) or not math.isfinite(intercept):
+            return float("nan")
+        mean_xy = self._sum_xy / n
+        mean_xx = self._sum_x2 / n
+        ss_tot_m_res = (slope * ((mean_xy - slope * mean_xx) + (mean_xy - intercept * mean_x)) + intercept *
+                        (mean_y - slope * mean_x - intercept) + mean_y * (intercept - mean_y))
+        return min(max(ss_tot_m_res / ss_tot, 0.0), 1.0)
+
+    def __len__(self) -> int:
+        return self._count
+
+
+class _EntropyCriterion:
+
+    def __init__(
+        self,
+        max_angle: float = 0.048,
+        min_r2: float = 0.36,
+        window_size: int = 299,
+        min_warmup_samples: int = 20,
+        entropy_window_size: int = 500,
+    ) -> None:
+        self.max_angle = max_angle
+        self.min_r2 = min_r2
+        self.min_warmup_samples = min_warmup_samples
+        self.entropy_window_size = entropy_window_size
+        self.total_samples = 0
+        self.measurement_window: deque[float] = deque(maxlen=entropy_window_size)
+        self.freq_tracker: Dict[float, int] = {}
+        self._sum_count_log_count = 0.0
+        self._regression = _OnlineLinearRegression(window_size=window_size)
+
+    def reset(self) -> None:
+        self.total_samples = 0
+        self.measurement_window.clear()
+        self.freq_tracker.clear()
+        self._sum_count_log_count = 0.0
+        self._regression.reset()
+
+    def add_measurement(self, measurement: float) -> None:
+        self.total_samples += 1
+        if len(self.measurement_window) == self.entropy_window_size:
+            old_value = self.measurement_window[0]
+            old_count = self.freq_tracker[old_value]
+            self._update_entropy_sum(old_count, old_count - 1)
+            self.freq_tracker[old_value] -= 1
+            if self.freq_tracker[old_value] == 0:
+                del self.freq_tracker[old_value]
+        old_count = self.freq_tracker.get(measurement, 0)
+        self._update_entropy_sum(old_count, old_count + 1)
+        self.freq_tracker[measurement] = old_count + 1
+        self.measurement_window.append(measurement)
+        n = len(self.measurement_window)
+        entropy = max(0.0, math.log2(n) - (self._sum_count_log_count / n)) if n > 0 else 0.0
+        self._regression.add_value(entropy)
+
+    def is_finished(self) -> bool:
+        if self.total_samples < self.min_warmup_samples:
+            return False
+        if len(self._regression) < 2:
+            return False
+        if self.total_samples % 2 != 0:
+            return False
+        slope_deg = self._regression.get_slope_degrees()
+        r2 = self._regression.r_squared()
+        if not math.isfinite(slope_deg) or not math.isfinite(r2):
+            return False
+        return slope_deg <= self.max_angle and r2 >= self.min_r2
+
+    def unique_measurements(self) -> int:
+        return len(self.freq_tracker)
+
+    def _update_entropy_sum(self, old_count: int, new_count: int) -> None:
+        if old_count > 0 and new_count > 0:
+            delta = new_count - old_count
+            self._sum_count_log_count += new_count * math.log2(1 + delta / old_count) + delta * math.log2(old_count)
+        else:
+            if old_count > 0:
+                self._sum_count_log_count -= old_count * math.log2(old_count)
+            if new_count > 0:
+                self._sum_count_log_count += new_count * math.log2(new_count)
+
+
+def _entropy_warmup(kernel_call, clear_cache, torch, entropy_window_size=500, regr_window_size=299, max_samples=10000):
+    """Adaptive warmup using entropy convergence. Returns (n_samples, avg_ms)."""
+    crit = _EntropyCriterion(
+        max_angle=0.048,
+        min_r2=0.36,
+        window_size=regr_window_size,
+        min_warmup_samples=20,
+        entropy_window_size=entropy_window_size,
+    )
+    rounding_factor = 3
+    BATCH_SIZE = 50
+    last_batch = [0.0] * BATCH_SIZE
+    n_written = 0
+    counter = 0
+    converged = False
+    precision_increase = False
+
+    while True:
+        batch_size = min(BATCH_SIZE, max_samples - counter)
+        start_ev = [torch.cuda.Event(enable_timing=True) for _ in range(batch_size)]
+        end_ev = [torch.cuda.Event(enable_timing=True) for _ in range(batch_size)]
+        for i in range(batch_size):
+            clear_cache()
+            start_ev[i].record()
+            kernel_call()
+            end_ev[i].record()
+        n_written = 0
+        for i in range(batch_size):
+            end_ev[i].synchronize()
+            v = round(start_ev[i].elapsed_time(end_ev[i]), rounding_factor)
+            last_batch[i] = v
+            n_written = i + 1
+            crit.add_measurement(v)
+            if crit.is_finished():
+                converged = True
+                break
+        counter += n_written
+        if converged or counter >= max_samples:
+            break
+        if counter >= 200 and not precision_increase:
+            if crit.unique_measurements() < 20:
+                rounding_factor = 4
+                crit.entropy_window_size = min(1000, entropy_window_size * 2)
+                crit.measurement_window = deque(maxlen=crit.entropy_window_size)
+                crit.reset()
+                precision_increase = True
+
+    avg_ms = statistics.fmean(last_batch[:n_written]) if n_written > 0 else 0.0
+    return counter, avg_ms
+
+
+def _timed_measurement(kernel_call, clear_cache, n_repeat, torch):
+    """Run n_repeat timed iterations and return a float tensor of times in ms."""
+    start_ev = [torch.cuda.Event(enable_timing=True) for _ in range(n_repeat)]
+    end_ev = [torch.cuda.Event(enable_timing=True) for _ in range(n_repeat)]
+    for i in range(n_repeat):
+        clear_cache()
+        start_ev[i].record()
+        kernel_call()
+        end_ev[i].record()
+    torch.cuda.synchronize()
+    return torch.tensor([s.elapsed_time(e) for s, e in zip(start_ev, end_ev)], dtype=torch.float)
 
 
 class Autotuner(KernelInterface):
@@ -122,6 +339,10 @@ class Autotuner(KernelInterface):
     @cached_property
     def do_bench(self):
         if self._do_bench is None:
+            if knobs.autotuning.use_entropy:
+                entropy_bench = self._make_entropy_benchmarker()
+                if entropy_bench is not None:
+                    return entropy_bench
             benchmarker = driver.active.get_benchmarker()
             warmup = knobs.autotuning.warmup
             rep = knobs.autotuning.rep
@@ -134,6 +355,57 @@ class Autotuner(KernelInterface):
                 quantiles=quantiles,
             )
         return self._do_bench
+
+    def _make_entropy_benchmarker(self):
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+
+        rep = knobs.autotuning.rep
+        _WARMUP_BUDGET_MS = 250
+
+        def entropy_benchmarker(kernel_call, quantiles):
+            cache = driver.active.get_empty_cache_for_benchmark()
+            clear = lambda: driver.active.clear_cache(cache)
+
+            # Probe kernel time to scale window sizes
+            kernel_call()
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            clear()
+            start.record()
+            kernel_call()
+            end.record()
+            end.synchronize()
+            probe_ms = start.elapsed_time(end)
+
+            # Scale windows so wall-clock warmup stays within budget
+            probe_ms = max(probe_ms, 0.001)
+            entropy_window = min(500, max(50, int(_WARMUP_BUDGET_MS / probe_ms)))
+            regr_window = max(20, int(entropy_window * 0.6))
+
+            n_warmup = _entropy_warmup(
+                kernel_call,
+                clear,
+                torch,
+                entropy_window_size=entropy_window,
+                regr_window_size=regr_window,
+            )
+            avg_ms = n_warmup[1]
+            n_repeat = max(10, int(rep / avg_ms)) if avg_ms > 0 else 100
+            times = _timed_measurement(kernel_call, clear, n_repeat, torch)
+
+            if quantiles is not None:
+                q = quantiles if isinstance(quantiles, (list, tuple)) else [quantiles]
+                ret = torch.quantile(times, torch.tensor(q, dtype=torch.float)).tolist()
+                if len(ret) == 1:
+                    ret = ret[0]
+                return ret
+            return times.median().item()
+
+        return entropy_benchmarker
 
     def _bench(self, *args, config, **meta):
         from ..compiler.errors import CompileTimeAssertionFailure
