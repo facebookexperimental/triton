@@ -34,6 +34,7 @@ def prev_power_of_2(x: int) -> int:
 def get_arch():
     return triton.runtime.driver.active.get_current_target().arch
 
+
 str_to_torch_dtype = {
     "fp32": torch.float32,
     "bfloat16": torch.bfloat16,
@@ -42,8 +43,9 @@ str_to_torch_dtype = {
     "fp16": torch.float16,
 }
 
+
 #----------------------------------------------------------------------
-# ref implementation 
+# ref implementation
 # create attention mask
 def _get_valid_attn_mask(
     device: torch.device,
@@ -89,20 +91,14 @@ def _get_valid_attn_mask(
                 ),
             )
         else:
-            valid_attn_mask = torch.logical_and(
-                valid_attn_mask, row_col_dist <= max_attn_len
-            )
+            valid_attn_mask = torch.logical_and(valid_attn_mask, row_col_dist <= max_attn_len)
     if contextual_seq_len > 0:
-        valid_attn_mask = torch.logical_or(
-            valid_attn_mask, torch.logical_and(row_ids == 0, col_ids < max_ids)
-        )
+        valid_attn_mask = torch.logical_or(valid_attn_mask, torch.logical_and(row_ids == 0, col_ids < max_ids))
     return valid_attn_mask
 
 
 # convert sequence input from jagged format to padded dense format
-def jagged_to_padded_dense(
-    q: torch.Tensor, offsets: torch.Tensor, max_seq_len: int, padding_value
-):
+def jagged_to_padded_dense(q: torch.Tensor, offsets: torch.Tensor, max_seq_len: int, padding_value):
     assert len(q.shape) == 2, "q needs to be 2-dim tensor"
     L, D = q.shape
     B = offsets.shape[0] - 1
@@ -111,7 +107,7 @@ def jagged_to_padded_dense(
     for i in range(B):
         s = offsets[i]
         e = offsets[i + 1]
-        padded_q[i][0 : e - s] = q[s:e]
+        padded_q[i][0:e - s] = q[s:e]
 
     return padded_q
 
@@ -119,9 +115,7 @@ def jagged_to_padded_dense(
 # pad sequence according to max sequence len
 def pad_sequence(q: torch.Tensor, seq_offsets: torch.Tensor, N: int, padding_value):
     L, D = q.shape
-    padded_q = jagged_to_padded_dense(
-        q.reshape(L, D), offsets=seq_offsets, max_seq_len=N, padding_value=0.0
-    )
+    padded_q = jagged_to_padded_dense(q.reshape(L, D), offsets=seq_offsets, max_seq_len=N, padding_value=0.0)
 
     return padded_q
 
@@ -134,21 +128,9 @@ def qkv_to_padded_dense(
     N: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     L, H, D = q.shape
-    padded_q = (
-        pad_sequence(q.reshape(L, H * D), seq_offsets, N, 0.0)
-        .view(-1, N, H, D)
-        .transpose(1, 2)
-    )
-    padded_k = (
-        pad_sequence(k.reshape(L, H * D), seq_offsets, N, 0.0)
-        .view(-1, N, H, D)
-        .transpose(1, 2)
-    )
-    padded_v = (
-        pad_sequence(v.reshape(L, H * D), seq_offsets, N, 0.0)
-        .view(-1, N, H, D)
-        .transpose(1, 2)
-    )
+    padded_q = (pad_sequence(q.reshape(L, H * D), seq_offsets, N, 0.0).view(-1, N, H, D).transpose(1, 2))
+    padded_k = (pad_sequence(k.reshape(L, H * D), seq_offsets, N, 0.0).view(-1, N, H, D).transpose(1, 2))
+    padded_v = (pad_sequence(v.reshape(L, H * D), seq_offsets, N, 0.0).view(-1, N, H, D).transpose(1, 2))
 
     return padded_q, padded_k, padded_v
 
@@ -162,7 +144,7 @@ def dense_to_jagged(seq: torch.Tensor, offsets: torch.Tensor, L: int):
     for i in range(B):
         s = offsets[i]
         e = offsets[i + 1]
-        out[s:e] = seq[i][0 : e - s]
+        out[s:e] = seq[i][0:e - s]
 
     return out
 
@@ -185,9 +167,7 @@ def torch_hstu_attention(
 ) -> torch.Tensor:
     L, H, _ = q.shape
     V = v.shape[2]
-    q, k, v = qkv_to_padded_dense(
-        q, k, v, seq_offsets, max_seq_len
-    )  # [B, H, N, D) and [B, H, N, V]
+    q, k, v = qkv_to_padded_dense(q, k, v, seq_offsets, max_seq_len)  # [B, H, N, D) and [B, H, N, V]
     qk_attn = torch.einsum("bhxa,bhya->bhxy", q, k) * alpha
     qk_attn = F.silu(qk_attn) / max_seq_len
     valid_attn_mask = _get_valid_attn_mask(
@@ -210,6 +190,8 @@ def torch_hstu_attention(
         seq_offsets,
         L,
     ).view(L, H, V)
+
+
 #----------------------------------------------------------------------
 
 
@@ -234,15 +216,13 @@ def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr = 8):
     if xcd < tall_xcds:
         pid = xcd * pids_per_xcd + local_pid
     else:
-        pid = (
-            tall_xcds * pids_per_xcd
-            + (xcd - tall_xcds) * (pids_per_xcd - 1)
-            + local_pid
-        )
+        pid = (tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid)
 
     return pid
 
-FULL_TUNING=False
+
+FULL_TUNING = False
+
 
 def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
     configs = []
@@ -263,8 +243,7 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
                                     },
                                     num_stages=num_stages,
                                     num_warps=num_warps,
-                                )
-                            )
+                                ))
     else:
         configs = [
             triton.Config(
@@ -281,6 +260,7 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
         ]
 
     return configs
+
 
 @triton.jit
 def _hstu_attn_fwd_one_block(  # noqa: C901
@@ -312,7 +292,6 @@ def _hstu_attn_fwd_one_block(  # noqa: C901
     start_n = tl.multiple_of(start_n, BLOCK_N)
     offs_d_q = tl.arange(0, BLOCK_D_Q)
     offs_d_v = tl.arange(0, BLOCK_D_V)
-
 
     k_ptrs = K_base + offs_d_q[None, :] + offs_n[:, None] * stride_kn
     v_ptrs = V_base + offs_n[:, None] * stride_vn + offs_d_v[None, :]
@@ -363,9 +342,7 @@ def _hstu_attn_fwd_one_block(  # noqa: C901
     if HAS_MAX_ATTN_LEN:
         invalid_mask = invalid_mask and offs_m_minus_n <= max_attn_len
     if HAS_CONTEXTUAL_SEQ_LEN:
-        invalid_mask = invalid_mask or (
-            offs_m[:, None] == 0 and offs_n[None, :] < max_ids
-        )
+        invalid_mask = invalid_mask or (offs_m[:, None] == 0 and offs_n[None, :] < max_ids)
     # pyre-fixme[16]: Module `math` has no attribute `fast_dividef`.
     silu = fast_dividef(qk, 1.0 + fast_expf(-1.0 * qk)) * (1.0 / MAX_SEQ_LEN)
     silu = tl.where(invalid_mask, silu, 0)
@@ -514,9 +491,7 @@ def _hstu_attn_fwd_compute(  # noqa C901
             if uih_end < start_m:
                 low_delta = start_m
                 high_delta = start_m + BLOCK_M
-                for start_delta in tl.range(
-                    low_delta, high_delta, BLOCK_N, num_stages=0
-                ):
+                for start_delta in tl.range(low_delta, high_delta, BLOCK_N, num_stages=0):
                     acc += _hstu_attn_fwd_one_block(
                         start_n=start_delta,
                         seq_len=seq_len,
@@ -559,7 +534,6 @@ def _hstu_attn_fwd_compute(  # noqa C901
             off_o = Out + seq_start * stride_om + off_h * stride_oh
             out_ptrs = off_o + offs_m[:, None] * stride_om + offs_v_d[None, :]
             tl.store(out_ptrs, acc, mask=(offs_m < seq_len)[:, None])
-
 
 
 @triton.autotune(
@@ -707,9 +681,7 @@ def triton_hstu_attention_fwd(
 
     if sort_by_length:
         seq_lengths = seq_offsets[1:] - seq_offsets[:-1]
-        _, sort_by_length_indices = torch.sort(
-            seq_lengths, descending=True, stable=False
-        )
+        _, sort_by_length_indices = torch.sort(seq_lengths, descending=True, stable=False)
 
     has_sort_by_length_indices = sort_by_length
     if L == 0:
@@ -719,9 +691,7 @@ def triton_hstu_attention_fwd(
     IS_DELTA_Q = False
 
     grid = lambda meta: (  # noqa E731
-        triton.cdiv(N, meta["BLOCK_M"]) *
-        Z * H,
-    )
+        triton.cdiv(N, meta["BLOCK_M"]) * Z * H, )
 
     _ragged_hstu_attn_fwd[grid](
         Q=q,
@@ -761,7 +731,6 @@ def triton_hstu_attention_fwd(
     return out
 
 
-
 def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
     if not torch.jit.is_scripting() and torch.compiler.is_compiling():
         # Tell Dynamo this data-dependent value is in the range (0, 10**9)
@@ -782,9 +751,9 @@ def generate_sparse_seq_len(
     torch.manual_seed(1)  # for reproducibility
 
     if sparsity == 0.0:
-        return torch.zeros(size=(size,), device=device, dtype=torch.int)
+        return torch.zeros(size=(size, ), device=device, dtype=torch.int)
     elif sparsity == 1.0:
-        return torch.ones(size=(size,), device=device, dtype=torch.int) * max_seq_len
+        return torch.ones(size=(size, ), device=device, dtype=torch.int) * max_seq_len
     elif sparsity >= 0.5:
         min_seq_len: int = int((2 * sparsity - 1.0) * max_seq_len)
         max_seq_len: int = max_seq_len
@@ -795,7 +764,7 @@ def generate_sparse_seq_len(
     return torch.randint(
         low=min_seq_len,
         high=max_seq_len,
-        size=(size,),
+        size=(size, ),
         device=device,
         dtype=torch.int,
     )
@@ -806,7 +775,7 @@ def apply_SL(
     alpha: float,
     max_seq_len: int,
 ) -> torch.Tensor:
-    threshold = int(max_seq_len ** (alpha / 2.0))
+    threshold = int(max_seq_len**(alpha / 2.0))
     no_sample_prob = (max_seq_len**alpha) / torch.pow(lengths, 2)
     users_to_sample = torch.logical_and(
         lengths > threshold,
@@ -910,9 +879,7 @@ def get_inputs():
     return input_info
 
 
-@pytest.mark.parametrize(
-    "batch_size, max_seq_len, sparsity, heads, attn_dim, hidden_dim", get_inputs()
-)
+@pytest.mark.parametrize("batch_size, max_seq_len, sparsity, heads, attn_dim, hidden_dim", get_inputs())
 def test_hstu_attention(
     batch_size: int,
     max_seq_len: int,  # for repro
@@ -945,14 +912,12 @@ def test_hstu_attention(
     num_targets = torch.randint(
         1,
         target_size + 1,
-        (batch_size,),
+        (batch_size, ),
         device=lengths.device,
         dtype=lengths.dtype,
     )
     num_targets = torch.where(num_targets > lengths, lengths, num_targets)
-    seq_offsets = torch.zeros(
-        (batch_size + 1,), dtype=torch.int64, device=torch.device("cuda")
-    )
+    seq_offsets = torch.zeros((batch_size + 1, ), dtype=torch.int64, device=torch.device("cuda"))
     seq_offsets[1:] = torch.cumsum(lengths, dim=0)
     L = int(seq_offsets[-1].item())
     x = torch.empty(
@@ -981,19 +946,11 @@ def test_hstu_attention(
 
     def triton_attn():
         sort_by_length = True
-        return triton_hstu_attention_fwd(
-            max_seq_len,
-            alpha,
-            q,
-            k,
-            v,
-            seq_offsets,
-            causal,
-            num_targets,
-            0,  # max_attn_len,
-            0,  # contextual_seq_len
-            True,  # sort_by_length,
-        )
+        return triton_hstu_attention_fwd(max_seq_len, alpha, q, k, v, seq_offsets, causal, num_targets,
+                                         0,  # max_attn_len,
+                                         0,  # contextual_seq_len
+                                         True,  # sort_by_length,
+                                         )
 
     def torch_attn():
         return torch_hstu_attention(
@@ -1029,16 +986,14 @@ def run_benchmark(args):
         "hidden_dim",
     ]
     if args.user_input:
-        x_val_list = [
-            (
-                args.b,
-                args.max_seq_len,
-                args.sparsity,
-                args.heads,
-                args.head_dim,
-                args.hidden_dim,
-            )
-        ]
+        x_val_list = [(
+            args.b,
+            args.max_seq_len,
+            args.sparsity,
+            args.heads,
+            args.head_dim,
+            args.hidden_dim,
+        )]
     else:
         x_val_list = get_inputs()
 
@@ -1052,9 +1007,8 @@ def run_benchmark(args):
         raise NotImplementedError(f"{args.metric} is not supported")
 
     evaluation_metric_to_unit = {
-        "throughput": "TFLOPS",
-        "time": "Time_(ms)",
-        "bandwidth": "Bandwidth_(GB/s)",  # spaces break prettytable parsing
+        "throughput": "TFLOPS", "time": "Time_(ms)", "bandwidth":
+        "Bandwidth_(GB/s)",  # spaces break prettytable parsing
     }
     line_names = [evaluation_metric_to_unit[args.metric]]
     line_vals = line_names
@@ -1072,8 +1026,7 @@ def run_benchmark(args):
             ylabel=ylabel,
             plot_name='hstu_attention perf numbers',
             args={"metric": metric, "mode": 'fwd'},
-        )
-    )
+        ))
 
     @triton.testing.perf_report(configs)
     def bench_hstu_attn(
@@ -1113,14 +1066,12 @@ def run_benchmark(args):
         num_targets = torch.randint(
             1,
             target_size + 1,
-            (batch_size,),
+            (batch_size, ),
             device=lengths.device,
             dtype=lengths.dtype,
         )
         num_targets = torch.where(num_targets > lengths, lengths, num_targets)
-        seq_offsets = torch.zeros(
-            (batch_size + 1,), dtype=torch.int64, device=torch.device("cuda")
-        )
+        seq_offsets = torch.zeros((batch_size + 1, ), dtype=torch.int64, device=torch.device("cuda"))
         seq_offsets[1:] = torch.cumsum(lengths, dim=0)
         L = int(seq_offsets[-1].item())
         x = torch.empty(
@@ -1148,19 +1099,12 @@ def run_benchmark(args):
         )
 
         def attn_fwd():
-            return triton_hstu_attention_fwd(
-                max_seq_len,
-                alpha,
-                q,
-                k,
-                v,
-                seq_offsets,
-                causal,
-                num_targets,
-                0,  # max_attn_len,
-                0,  # contextual_seq_len
-                True,  # sort_by_length,
-            )
+            return triton_hstu_attention_fwd(max_seq_len, alpha, q, k, v, seq_offsets, causal, num_targets,
+                                             0,  # max_attn_len,
+                                             0,  # contextual_seq_len
+                                             True,  # sort_by_length,
+                                             )
+
         ms = triton.testing.do_bench(
             attn_fwd,
             warmup=25,
@@ -1176,9 +1120,7 @@ def run_benchmark(args):
             return tflops
         elif metric == "bandwidth":
             elem_size = q.element_size()
-            bytes = get_bytes(
-                seq_offsets.cpu().numpy(), heads, attn_dim, hidden_dim, elem_size
-            )
+            bytes = get_bytes(seq_offsets.cpu().numpy(), heads, attn_dim, hidden_dim, elem_size)
             bandwidth = bytes / (ms * 1e-3) * 1e-9  # GB/s
             return bandwidth
         else:
@@ -1251,9 +1193,7 @@ def parse_args():
         help="Run user input info",
     )
 
-    parser.add_argument(
-        "-o", action="store_true", help="Write performance results to CSV file"
-    )
+    parser.add_argument("-o", action="store_true", help="Write performance results to CSV file")
 
     args = parser.parse_args()
     return args
