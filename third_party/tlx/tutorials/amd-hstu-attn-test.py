@@ -945,7 +945,6 @@ def test_hstu_attention(
     )
 
     def triton_attn():
-        sort_by_length = True
         return triton_hstu_attention_fwd(max_seq_len, alpha, q, k, v, seq_offsets, causal, num_targets,
                                          0,  # max_attn_len,
                                          0,  # contextual_seq_len
