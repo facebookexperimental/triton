@@ -358,6 +358,15 @@ class layout(layout_encoding):
         return (f"layout<shape=({self.thread_shape}, {self.value_shape}), "
                 f"stride=({self.thread_stride}, {self.value_stride})>")
 
+    def __eq__(self, other):
+        return (isinstance(other, layout) and self.thread_shape == other.thread_shape
+                and self.value_shape == other.value_shape and self.thread_stride == other.thread_stride
+                and self.value_stride == other.value_stride)
+
+    def __hash__(self):
+        return hash((tuple(self.thread_shape), tuple(self.value_shape), tuple(self.thread_stride),
+                     tuple(self.value_stride)))
+
 
 class storage_kind(enum.Enum):
     smem = "smem"

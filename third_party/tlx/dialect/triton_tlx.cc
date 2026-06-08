@@ -432,21 +432,33 @@ void init_triton_tlx_ir(py::module &&m) {
            })
       .def("create_tmem_load",
            [](TritonOpBuilder &self, Value subView, Attribute &layoutEncoding,
-              std::optional<Value> asyncToken) -> mlir::Value {
+              std::optional<Value> asyncToken,
+              bool userLayout) -> mlir::Value {
              auto subViewType = cast<ttg::MemDescType>(subView.getType());
 
              // layoutEncoding must be TMEM compatible
              auto newType = RankedTensorType::get(subViewType.getShape(),
                                                   subViewType.getElementType(),
                                                   layoutEncoding);
-             if (asyncToken.has_value()) {
-               return ttng::TMEMLoadOp::create(
-                   self.getBuilder(), self.getLastLoc(), newType, Type(),
-                   subView, asyncToken.value());
-             }
-             return ttng::TMEMLoadOp::create(
-                 self.getBuilder(), self.getLastLoc(), newType, subView);
-           })
+             ttng::TMEMLoadOp loadOp =
+                 asyncToken.has_value()
+                     ? ttng::TMEMLoadOp::create(self.getBuilder(),
+                                                self.getLastLoc(), newType,
+                                                Type(), subView,
+                                                asyncToken.value())
+                     : ttng::TMEMLoadOp::create(self.getBuilder(),
+                                                self.getLastLoc(), newType,
+                                                subView);
+             // Mark the result layout as user-specified so layout passes treat
+             // it as a hard anchor and do not rewrite it to a "preferred" TMEM
+             // layout (see TMemLoadReducePattern in OptimizeTMemLayouts).
+             if (userLayout)
+               loadOp->setAttr("tlx.user_layout",
+                               self.getBuilder().getUnitAttr());
+             return loadOp;
+           },
+           py::arg("subView"), py::arg("layoutEncoding"),
+           py::arg("asyncToken"), py::arg("userLayout") = false)
       .def("create_tmem_store",
            [](TritonOpBuilder &self, Value &dst, Value &src) -> void {
              Value pred = self.create<arith::ConstantIntOp>(1, 1);

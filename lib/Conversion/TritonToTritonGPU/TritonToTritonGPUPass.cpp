@@ -50,6 +50,49 @@ template <class Op> struct GenericOpPattern : public OpConversionPattern<Op> {
   }
 };
 
+// ElementwiseInlineAsmOp carries SameOperandsAndResultEncoding, so every operand
+// and result must share one layout. The generic pattern keeps each operand's
+// encoding as-is, which breaks verification when a producer pins a non-default
+// register layout (e.g. a `tlx.layout` on a `tmem_load`) onto only some
+// operands. Convert any operand whose encoding differs from the unified result
+// encoding; the redundant converts are folded away later by layout propagation
+// (the pinned layout is an anchor and forward-propagates).
+struct ElementwiseInlineAsmPattern
+    : public OpConversionPattern<triton::ElementwiseInlineAsmOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::ElementwiseInlineAsmOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    SmallVector<Type> retTypes;
+    if (failed(
+            getTypeConverter()->convertTypes(op->getResultTypes(), retTypes)))
+      return failure();
+    // All tensor results of an inline-asm op share one encoding; use it as the
+    // unified target for the operands.
+    Attribute enc;
+    for (Type t : retTypes)
+      if (auto rtt = dyn_cast<RankedTensorType>(t)) {
+        enc = rtt.getEncoding();
+        break;
+      }
+    SmallVector<Value> operands(adaptor.getOperands());
+    if (enc) {
+      for (Value &v : operands) {
+        auto vTy = dyn_cast<RankedTensorType>(v.getType());
+        if (vTy && vTy.getEncoding() && vTy.getEncoding() != enc) {
+          auto dstTy = vTy.cloneWithEncoding(enc);
+          v = triton::gpu::ConvertLayoutOp::create(rewriter, v.getLoc(), dstTy,
+                                                   v);
+        }
+      }
+    }
+    rewriter.replaceOpWithNewOp<triton::ElementwiseInlineAsmOp>(
+        op, retTypes, operands, op->getAttrs());
+    return success();
+  }
+};
+
 class ArithConstantPattern : public OpConversionPattern<arith::ConstantOp> {
 public:
   using OpConversionPattern::OpConversionPattern;
@@ -637,7 +680,7 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::PreciseSqrtOp>,
       GenericOpPattern<triton::PreciseDivFOp>,
       GenericOpPattern<triton::MulhiUIOp>,
-      GenericOpPattern<triton::ElementwiseInlineAsmOp>,
+      ElementwiseInlineAsmPattern,
       TritonReducePattern,
       GenericOpPattern<triton::ReduceReturnOp>,
       TritonScanPattern,
