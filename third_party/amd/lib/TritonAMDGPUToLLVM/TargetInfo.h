@@ -3,6 +3,7 @@
 
 #include "Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 #include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
+#include "llvm/TargetParser/AMDGPUTargetParser.h"
 #include "llvm/TargetParser/TargetParser.h"
 #include <optional>
 
