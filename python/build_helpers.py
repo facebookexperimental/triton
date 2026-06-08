@@ -14,6 +14,7 @@ import time
 import urllib.request
 import zipfile
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import Optional
 
@@ -36,7 +37,7 @@ def get_cmake_dir():
     return cmake_dir
 
 
-@dataclass
+@dataclass(frozen=True)
 class BuildHelperArgs:
     cache_path: str
     offline_build: bool
@@ -52,6 +53,10 @@ class BuildHelperArgs:
     cupti_include_path: Optional[str]
     cupti_lib_path: Optional[str]
     cupti_lib_blackwell_path: Optional[str]
+
+    @cached_property
+    def archives_path(self):
+        return os.path.join(self.cache_path, "archives")
 
 
 def _normalize_optional(value: str) -> Optional[str]:
@@ -161,34 +166,96 @@ class DownloadProgressReader:
         return getattr(self.response, name)
 
 
-def _download_file(url: str, label: str):
-    file_bytes = io.BytesIO()
-    with open_url(url) as response:
-        progress_reader = DownloadProgressReader(response, label)
-        shutil.copyfileobj(progress_reader, file_bytes)
-    file_bytes.seek(0)
-    return file_bytes
+def _download_file_with_curl(curl: str, url: str, path: str, label: str):
+    print(f"{label}:", file=sys.stdout, flush=True)
+    command = [
+        curl,
+        "--fail",
+        "--location",
+        "--show-error",
+        "--continue-at",
+        "-",
+        "--output",
+        path,
+        "--url",
+        url,
+    ]
+    hostname = urllib.parse.urlparse(url).hostname
+    if hostname is not None and hostname.endswith(".blob.core.windows.net"):
+        # Anonymous Azure Blob requests default to 2009-09-19, which ignores Range requests.
+        command.extend(["--header", "x-ms-version: 2011-08-18"])
+    subprocess.run(
+        command,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+        check=True,
+    )
 
 
-def _download_and_extract(url, download_dir, label):
-    label = f"downloading {label}"
-    os.makedirs(download_dir, exist_ok=True)
+def _download_file_with_urllib(url: str, path: str, label: str):
+    with open(path, "wb") as file:
+        with open_url(url) as response:
+            progress_reader = DownloadProgressReader(response, label)
+            shutil.copyfileobj(progress_reader, file)
+
+
+def _download_file(url: str, path: str, label: str):
+    curl = shutil.which("curl")
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    if curl is not None:
+        _download_file_with_curl(curl, url, path, label)
+    else:
+        _download_file_with_urllib(url, path, label)
+
+
+def _get_archive_path(download_dir: str, url: str):
+    archive_name = os.path.basename(urllib.parse.urlparse(url).path)
+    return os.path.join(download_dir, archive_name)
+
+
+def _extract_archive(archive_path, download_dir):
     with contextlib.ExitStack() as stack:
-        if url.endswith(".zip"):
-            # unzip requires random access, so download the entire file
-            file_bytes = stack.enter_context(_download_file(url, label))
-            file = stack.enter_context(zipfile.ZipFile(file_bytes, "r"))
+        if archive_path.endswith(".zip"):
+            file = stack.enter_context(zipfile.ZipFile(archive_path, "r"))
             file.extractall(path=download_dir)
         else:
-            # tar files can be streamed directly into untar
-            response = stack.enter_context(open_url(url))
-            progress_reader = DownloadProgressReader(response, label)
-            file = stack.enter_context(tarfile.open(fileobj=progress_reader, mode="r|*"))
+            file = stack.enter_context(tarfile.open(archive_path, mode="r:*"))
             # Use extractall without filter for Python version < 3.12 compatibility
             if hasattr(tarfile, "data_filter"):
                 file.extractall(path=download_dir, filter="data")
             else:
                 file.extractall(path=download_dir)
+
+
+def _validate_sha256(archive_path, url, expected_sha256):
+    if expected_sha256 is None:
+        return
+    digest = hashlib.sha256()
+    with open(archive_path, "rb") as file:
+        while chunk := file.read(io.DEFAULT_BUFFER_SIZE):
+            digest.update(chunk)
+    actual_sha256 = digest.hexdigest()
+    if actual_sha256 == expected_sha256:
+        return
+    message = (f"LLVM download from {url} failed checksum validation. "
+               f"Expected SHA256 {expected_sha256}, got {actual_sha256}.")
+    if check_env_flag("TRITON_UNSAFE_DISABLE_SHA_CHECK"):
+        print(f"WARNING: {message}", file=sys.stderr)
+        return
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(archive_path)
+    raise RuntimeError(message)
+
+
+def _download_and_extract(url, download_dir, label, archives_path, expected_sha256=None):
+    archive_path = _get_archive_path(archives_path, url)
+    _download_file(url, archive_path, f"downloading {label}")
+    _validate_sha256(archive_path, url, expected_sha256)
+    with contextlib.suppress(Exception):
+        shutil.rmtree(download_dir)
+    os.makedirs(download_dir, exist_ok=True)
+    _extract_archive(archive_path, download_dir)
+    os.remove(archive_path)
 
 
 def update_symlink(link_path, source_path):
@@ -217,6 +284,7 @@ class Package:
     lib_flag: str
     syspath_var_name: str
     sym_name: Optional[str] = None
+    sha256sum: Optional[str] = None
 
 
 def get_json_package_info():
@@ -308,9 +376,9 @@ def _get_thirdparty_package_cmake_vars(package: Package, helper_args: BuildHelpe
     if helper_args.offline_build and not input_defined:
         raise RuntimeError(f"Requested an offline build but {package.syspath_var_name} is not set")
     if not helper_args.offline_build and not input_defined and not input_compatible:
-        with contextlib.suppress(Exception):
-            shutil.rmtree(package_root_dir)
-        _download_and_extract(package.url, package_root_dir, package.name)
+        # with contextlib.suppress(Exception):
+        #     shutil.rmtree(package_root_dir)
+        _download_and_extract(package.url, package_root_dir, package.name, helper_args.archives_path, package.sha256sum)
         # write version url to package_dir
         with open(os.path.join(package_dir, "version.txt"), "w") as file:
             file.write(package.url)
