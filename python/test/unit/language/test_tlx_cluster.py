@@ -442,6 +442,67 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.parametrize("GRID_DIMS", [1, 2, 3])
+def test_cluster_launch_control_3d(GRID_DIMS, device):
+    """Test CLC with 1D, 2D, and 3D grids using return_3d=True."""
+
+    @triton.jit
+    def clc_3d_kernel(
+        output_ptr,
+        TILES_X: tl.constexpr,
+        TILES_Y: tl.constexpr,
+        TILES_Z: tl.constexpr,
+    ):
+        tile_x = tl.program_id(0)
+        tile_y = tl.program_id(1)
+        tile_z = tl.program_id(2)
+
+        clc_phase_producer = 1
+        clc_phase_consumer = 0
+        clc_context = tlx.clc_create_context(1)
+
+        while tile_x != -1:
+            tlx.clc_producer(clc_context, clc_phase_producer)
+            clc_phase_producer ^= 1
+
+            linear_idx = tile_z * (TILES_X * TILES_Y) + tile_y * TILES_X + tile_x
+
+            if tlx.thread_id(axis=0) == 0:
+                tl.store(output_ptr + linear_idx, linear_idx)
+
+            tile_x, tile_y, tile_z = tlx.clc_consumer(
+                clc_context, clc_phase_consumer, return_3d=True)
+            clc_phase_consumer ^= 1
+
+    if GRID_DIMS == 1:
+        TILES_X, TILES_Y, TILES_Z = 64, 1, 1
+    elif GRID_DIMS == 2:
+        TILES_X, TILES_Y, TILES_Z = 4, 3, 1
+    else:
+        TILES_X, TILES_Y, TILES_Z = 3, 2, 2
+
+    total_tiles = TILES_X * TILES_Y * TILES_Z
+    output = torch.full((total_tiles,), -1, dtype=torch.int32, device=device)
+    expected = torch.arange(total_tiles, dtype=torch.int32, device=device)
+
+    grid = (TILES_X, TILES_Y, TILES_Z)
+    kernel = clc_3d_kernel[grid](
+        output,
+        TILES_X=TILES_X,
+        TILES_Y=TILES_Y,
+        TILES_Z=TILES_Z,
+        launch_cluster=True,
+    )
+
+    ptx = kernel.asm["ptx"]
+    assert re.search(r"clusterlaunchcontrol.try_cancel", ptx)
+    assert re.search(r"clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128", ptx)
+
+    sorted_output, _ = torch.sort(output)
+    torch.testing.assert_close(sorted_output, expected)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 @pytest.mark.parametrize("CLUSTER_SIZE", [2, 4])
 def test_cluster_launch_control_multi_cta(CLUSTER_SIZE, device):
     """
