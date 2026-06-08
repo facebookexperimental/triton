@@ -8,6 +8,17 @@ from triton.language.core import _aggregate as aggregate
 
 
 class layout_encoding:
+    """Base class for every TLX layout that lowers to an MLIR layout attribute.
+
+    Two families live under this base:
+      - **memory** encodings (`shared_layout_encoding`, `tensor_memory_*`): how a
+        buffer is laid out in smem/tmem. Self-describing; `to_ir` needs only the
+        builder.
+      - **distributed/register** encodings (`layout`, `DummyRegisterLayoutEncoding`):
+        how a loaded value is spread across threads/registers. These may need the
+        consuming tensor's `shape`/`element_type` to materialize, hence the
+        optional args on `to_ir`.
+    """
 
     def __init__(self):
         pass
@@ -15,7 +26,7 @@ class layout_encoding:
     def __repr__(self):
         return self.__class__.__name__
 
-    def to_ir(self, builder: ir.builder) -> None:
+    def to_ir(self, builder: ir.builder, shape=None, element_type=None) -> None:
         raise NotImplementedError(f"{self.__class__.__name__}.to_ir() must be overridden in subclasses")
 
 
@@ -262,6 +273,90 @@ class DummyRegisterLayoutEncoding(layout_encoding):
 
     def __hash__(self):
         return hash((tuple(self.shape), self.element_type, self.tmem_compatible))
+
+
+def _modes_to_flat_strides(shape, stride):
+    """Expand a Shape:Stride list of modes into per-bit flat strides.
+
+    `shape` is a tuple of power-of-two mode extents, `stride` the matching tuple
+    of (scalar) flat offsets. A mode `(2^k, s)` contributes the `k` bit-strides
+    `s, 2s, 4s, ..., 2^(k-1) s` (GF(2) decomposition).
+    """
+    assert len(shape) == len(stride), "layout: shape and stride must have the same number of modes"
+    flat = []
+    for extent, s in zip(shape, stride):
+        extent = int(extent)
+        s = int(s)
+        assert extent & (extent - 1) == 0, f"layout mode extent {extent} must be a power of two"
+        b = 1
+        while b < extent:
+            flat.append(s * b)
+            b <<= 1
+    return flat
+
+
+def _flat_to_coord(flat, tensor_shape):
+    """Decode a flat (row-major) offset into a per-dimension coordinate vector."""
+    coord = []
+    for d in range(len(tensor_shape)):
+        dim_stride = 1
+        for later in tensor_shape[d + 1:]:
+            dim_stride *= int(later)
+        coord.append((flat // dim_stride) % int(tensor_shape[d]))
+    return coord
+
+
+class layout(layout_encoding):
+    """
+    A user-specified distributed (register) layout — one of the two families of
+    `layout_encoding` (see that base class). Written purely as **shape** and
+    **stride** (a CuTe-style thread-value layout), for
+    `tlx.local_alloc(load_layout=...)` / `tlx.local_load(buf, layout=...)`.
+
+    The layout has two top-level modes — `(thread, value)`:
+      - ``shape``  = ``(thread_shape, value_shape)``
+      - ``stride`` = ``(thread_stride, value_stride)``
+    Each `*_shape` is a tuple of power-of-two extents and each `*_stride` the
+    matching tuple of **flat, row-major offsets** into the tile. The author only
+    speaks shape/stride; the compiler decomposes each mode `(2^k, s)` into bits
+    `s, 2s, ..., 2^(k-1)s`, splits the thread bits into lane (the low
+    `log2(threads_per_warp)`) and warp (the rest), maps the value bits to
+    registers, and builds the corresponding `#linear` encoding to propagate.
+
+    Example (separable QK layout, tile [N=128, M=128], row-major flat offset
+    = ``n * 128 + m``):
+        tlx.layout(
+            shape =((32, 4, 2), (32, 2)),          # (thread, value)
+            stride=((128, 4096, 32), (1, 64)),
+        )
+    """
+
+    def __init__(self, shape, stride):
+        super().__init__()
+        assert len(shape) == 2 and len(stride) == 2, \
+            "layout: shape and stride must each be (thread, value)"
+        self.thread_shape, self.value_shape = shape
+        self.thread_stride, self.value_stride = stride
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type: tl.dtype = None):
+        assert shape is not None, "layout.to_ir requires the consuming tensor shape"
+        tensor_shape = [int(s) for s in shape]
+        warp_size = int(builder.options.warp_size)
+        lane_bits = warp_size.bit_length() - 1  # log2(threads_per_warp)
+
+        value_flat = _modes_to_flat_strides(self.value_shape, self.value_stride)
+        thread_flat = _modes_to_flat_strides(self.thread_shape, self.thread_stride)
+        lane_flat = thread_flat[:lane_bits]
+        warp_flat = thread_flat[lane_bits:]
+
+        reg_bases = [_flat_to_coord(f, tensor_shape) for f in value_flat]
+        lane_bases = [_flat_to_coord(f, tensor_shape) for f in lane_flat]
+        warp_bases = [_flat_to_coord(f, tensor_shape) for f in warp_flat]
+        return builder.make_linear_encoding_attr(reg_bases, lane_bases, warp_bases, tensor_shape)
+
+    def __repr__(self):
+        return (f"layout<shape=({self.thread_shape}, {self.value_shape}), "
+                f"stride=({self.thread_stride}, {self.value_stride})>")
 
 
 class storage_kind(enum.Enum):
@@ -754,6 +849,7 @@ class buffered_tensor(tl.base_value):
         num: int,
         storage: storage_kind,
         layout: Optional[shared_layout_encoding] = None,
+        load_layout=None,
     ):
         """Not called by user code."""
         super().__init__()
@@ -764,6 +860,9 @@ class buffered_tensor(tl.base_value):
         self.type = buffered_tensor_type(element_ty, shape, num, storage, layout)
         # Following the practice in pytorch, dtype is scalar type
         self.dtype = element_ty
+        # Optional canonical register layout (a `tlx.layout`) that `local_load`
+        # inherits unless overridden. Carried through views (`local_view`).
+        self.load_layout = load_layout
 
     def _flatten_ir(self, handles) -> None:
         handles.append(self.handle)
