@@ -653,13 +653,21 @@ static bool computePartitionScheme(triton::FuncOp &funcOp,
                                    DataPartitionScheme &partitionScheme) {
   // Use dot to drive the partition
   SetVector<Operation *> dots;
+  SetVector<Operation *> fallbackDots;
 
-  // check all dot ops that have more than one async task id
+  // Prefer dots that span multiple async task IDs, but preserve explicit data
+  // partitioning for IR that does not have multi-task dot annotations.
   funcOp.walk([&](Operation *op) {
-    if (isa<nvidia_gpu::WarpGroupDotOp, nvidia_gpu::TCGen5MMAOp>(op)) {
+    if (!isa<nvidia_gpu::WarpGroupDotOp, nvidia_gpu::TCGen5MMAOp>(op))
+      return;
+    if (getAsyncTaskIds(op).size() > 1)
       dots.insert(op);
-    }
+    else
+      fallbackDots.insert(op);
   });
+
+  if (dots.empty())
+    dots = fallbackDots;
 
   if (dots.empty())
     return true;

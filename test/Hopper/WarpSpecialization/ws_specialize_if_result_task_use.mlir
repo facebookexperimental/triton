@@ -1,5 +1,4 @@
 // RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1 post-channel-creation=1" | FileCheck %s
-// XFAIL: *
 
 // Regression test for B-19-F1 / T273499456.
 //

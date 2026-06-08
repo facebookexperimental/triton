@@ -106,8 +106,8 @@ the monolithic pipeline.
 
 This pass walks `scf.for` loops and inspects every `TMAStoreTokenWaitOp`.
 For each wait, it traces the token back to the defining
-`AsyncTMACopyLocalToGlobalOp`, then looks at the SMEM buffer used by that
-store:
+TMA store-like op (`AsyncTMACopyLocalToGlobalOp` or `AsyncTMAReduceOp`),
+then looks at the SMEM buffer used by that store:
 
 1. Get the `LocalAllocOp` that produces the buffer.
 2. Read the `buffer.copy` attribute (set earlier by the memory planner),
@@ -122,12 +122,12 @@ have finished reading."
 
 ### Token Tracing
 
-`getDefiningTMAStore` handles two cases:
+`getDefiningTMAStoreOp` handles two cases:
 
 | Case | Pattern |
 |------|---------|
-| **Direct** | Token is the direct SSA result of `AsyncTMACopyLocalToGlobalOp` |
-| **Loop-carried** | Token is a block argument of the `scf.for` body; the function follows the corresponding yield operand back to its `AsyncTMACopyLocalToGlobalOp` |
+| **Direct** | Token is the direct SSA result of `AsyncTMACopyLocalToGlobalOp` or `AsyncTMAReduceOp` |
+| **Loop-carried** | Token is a block argument of the `scf.for` body; the function follows the corresponding yield operand back to its `AsyncTMACopyLocalToGlobalOp` or `AsyncTMAReduceOp` |
 
 ## Step 2: `doValidateTMAStoreAnnotations`
 
@@ -159,9 +159,9 @@ For each annotated `TMAStoreTokenWaitOp` with `can_rotate_by_buffer_count = K`:
    `numStages + K`). Note: That we may only increase by 1 stage (we move
    by K TMA stores, not necessarily K pipeline stages).
 
-3. **Count K copies**: walk the linearized schedule, counting
-   `AsyncTMACopyLocalToGlobalOp` ops. Stop at the K-th copy — this is the
-   point where the buffer slot would be reused.
+3. **Count K stores**: walk the linearized schedule, counting
+   `AsyncTMACopyLocalToGlobalOp` and `AsyncTMAReduceOp` ops. Stop at the K-th
+   store-like op — this is the point where the buffer slot would be reused.
 
 4. **Adjust for barriers**: scan backwards from the insertion target to
    find a preceding `WaitBarrierOp`. If one exists, insert before it
@@ -206,8 +206,9 @@ store instead of stalling.
 After reordering, a separate pass lowers each `TMAStoreTokenWaitOp` into
 concrete hardware operations:
 
-1. **Compute pendings**: count `AsyncTMACopyLocalToGlobalOp` ops between
-   the defining store and the wait (in program order). For loop-carried
+1. **Compute pendings**: count TMA store-like ops
+   (`AsyncTMACopyLocalToGlobalOp` or `AsyncTMAReduceOp`) between the
+   defining store and the wait (in program order). For loop-carried
    tokens, this wraps around the loop body boundary.
 2. **Emit `TMAStoreWaitOp`**: waits until at most `pendings` TMA stores
    remain in flight.

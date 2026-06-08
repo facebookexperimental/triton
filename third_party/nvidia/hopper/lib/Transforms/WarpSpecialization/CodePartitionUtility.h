@@ -138,19 +138,19 @@ struct TmemDataChannel : Channel {
 
   TmemDataChannel(int producer, SmallVector<int> &consumers,
                   ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp tmemMmaOp,
-                  Operation *tmemLoadOp, unsigned operandIdx,
-                  unsigned numBuffers, unsigned uniqID)
-      : Channel(producer, consumers, tmemLoadOp, operandIdx, numBuffers,
+                  Operation *tmemConsumerOp, unsigned operandIdx,
+                  unsigned numBuffers, unsigned uniqID,
+                  Operation *tmemProducerOp = nullptr)
+      : Channel(producer, consumers, tmemConsumerOp, operandIdx, numBuffers,
                 uniqID),
-        tmemAllocOp(tmemAllocOp), tmemProducerOp(tmemAllocOp),
-        tmemMmaOp(tmemMmaOp) {
-    assert(consumers.size() == 1 &&
-           "TmemDataChannel must have a single consumer");
+        tmemAllocOp(tmemAllocOp), tmemMmaOp(tmemMmaOp),
+        tmemProducerOp(tmemProducerOp ? tmemProducerOp
+                                      : tmemAllocOp.getOperation()) {
     channelKind = DataChannelKind::TMEM;
   }
 
   ttng::TMEMAllocOp getTmemAllocOp() { return tmemAllocOp; }
-  virtual Operation *getAllocOp() { return nullptr; }
+  virtual Operation *getAllocOp() { return tmemAllocOp.getOperation(); }
   ttng::TCGen5MMAOp getMmaOp() { return tmemMmaOp; }
   virtual Operation *getSrcOp() { return tmemProducerOp; }
 };
@@ -269,8 +269,11 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters);
 Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
                        Value idx);
+// Same-task SMEM records are useful for memory-planner bookkeeping, but code
+// partitioning should only consume cross-partition communication channels.
 void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
-                         triton::FuncOp &funcOp);
+                         triton::FuncOp &funcOp,
+                         bool includeSameTaskSmemChannels = true);
 
 /// Generate a combined DOT graph showing key ops and channels side by side.
 /// Left subgraph: Key operations with control flow structure.

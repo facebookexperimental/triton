@@ -41,27 +41,72 @@ Operation *SpecializeOp(Operation *op, IRMapping &mapping,
                         OpBuilderWithAsyncTaskIds &builder,
                         AsyncTaskId asyncTaskId);
 
+/// Check if `value` is transitively needed by an operation with the given
+/// asyncTaskId.
+static bool isValueNeededByTask(Value value, AsyncTaskId asyncTaskId) {
+  SmallVector<Value> worklist;
+  DenseSet<Value> visited;
+  worklist.push_back(value);
+  visited.insert(value);
+  while (!worklist.empty()) {
+    Value curr = worklist.pop_back_val();
+    for (Operation *user : curr.getUsers()) {
+      if (hasAsyncTaskId(user, asyncTaskId))
+        return true;
+      for (Value result : user->getResults()) {
+        if (visited.insert(result).second)
+          worklist.push_back(result);
+      }
+    }
+  }
+  return false;
+}
+
 /// Check if any result of `op` is transitively needed by an operation
 /// with the given asyncTaskId. This handles the case where an op doesn't
 /// have the target asyncTaskId but produces values consumed (directly or
 /// through a chain of ops) by ops that do.
 static bool isNeededByTask(Operation *op, AsyncTaskId asyncTaskId) {
-  SmallVector<Operation *> worklist;
-  DenseSet<Operation *> visited;
-  worklist.push_back(op);
-  visited.insert(op);
-  while (!worklist.empty()) {
-    Operation *curr = worklist.pop_back_val();
-    for (auto result : curr->getResults()) {
-      for (Operation *user : result.getUsers()) {
-        if (hasAsyncTaskId(user, asyncTaskId))
-          return true;
-        if (visited.insert(user).second)
-          worklist.push_back(user);
-      }
-    }
+  for (Value result : op->getResults()) {
+    if (isValueNeededByTask(result, asyncTaskId))
+      return true;
   }
   return false;
+}
+
+static bool isYieldedValueAvailableForTask(Value value,
+                                           AsyncTaskId asyncTaskId) {
+  if (Operation *def = value.getDefiningOp())
+    return hasAsyncTaskId(def, asyncTaskId);
+
+  auto blockArg = dyn_cast<BlockArgument>(value);
+  if (!blockArg)
+    return false;
+
+  Operation *owner = blockArg.getOwner()->getParentOp();
+  if (auto forOp = dyn_cast<scf::ForOp>(owner)) {
+    unsigned argNumber = blockArg.getArgNumber();
+    if (argNumber < forOp.getNumInductionVars())
+      return false;
+    Value initArg = forOp.getInitArgs()[argNumber - forOp.getNumInductionVars()];
+    if (Operation *def = initArg.getDefiningOp())
+      return hasAsyncTaskId(def, asyncTaskId);
+  }
+
+  return false;
+}
+
+static bool shouldKeepIfResultForTask(scf::IfOp ifOp, unsigned resultIdx,
+                                      Value result,
+                                      AsyncTaskId asyncTaskId) {
+  if (isValueNeededByTask(result, asyncTaskId))
+    return true;
+  if (isYieldedValueAvailableForTask(ifOp.thenYield().getOperand(resultIdx),
+                                     asyncTaskId))
+    return true;
+  return ifOp.elseBlock() &&
+         isYieldedValueAvailableForTask(ifOp.elseYield().getOperand(resultIdx),
+                                        asyncTaskId);
 }
 
 unsigned scanRegUsage(Block *block, AsyncTaskId asyncTaskId,
@@ -86,6 +131,19 @@ static SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
             continue;
 
           if (isa<scf::YieldOp>(user)) {
+            if (auto parentForOp = dyn_cast<scf::ForOp>(user->getParentOp())) {
+              if (parentForOp == nestedForOp) {
+                for (auto [yieldIdx, operand] :
+                     llvm::enumerate(user->getOperands())) {
+                  if (operand == arg &&
+                      isValueNeededByTask(parentForOp.getResult(yieldIdx),
+                                          asyncTaskId)) {
+                    argIndices.insert(argIdx);
+                    return;
+                  }
+                }
+              }
+            }
             if (auto ifOp = dyn_cast<scf::IfOp>(user->getParentOp())) {
               // For block arguments, we need to check the initial value as
               // well.
@@ -109,6 +167,19 @@ static SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
 
           // If use is the initial value of ForOp argument.
           if (auto userFor = dyn_cast<scf::ForOp>(user)) {
+            for (auto [initArgIdx, initArg] :
+                 llvm::enumerate(userFor.getInitArgs())) {
+              if (initArg != arg)
+                continue;
+              dfs(userFor, userFor.getRegionIterArg(initArgIdx), argIdx);
+              if (argIndices.count(argIdx))
+                return;
+              if (isValueNeededByTask(userFor.getResult(initArgIdx),
+                                      asyncTaskId)) {
+                argIndices.insert(argIdx);
+                return;
+              }
+            }
             // For block arguments, we need to check the initial value as well.
             if (auto blockArg = dyn_cast<BlockArgument>(arg)) {
               auto initArg =
@@ -162,6 +233,8 @@ static SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
   }
   for (unsigned i = 0; i < forOp.getNumResults(); ++i) {
     auto result = forOp->getResult(i);
+    if (isValueNeededByTask(result, asyncTaskId))
+      argIndices.insert(i);
     dfs(forOp, result, i);
   }
 
@@ -178,40 +251,15 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
     ifOp.dump();
   });
 
-  // It is possible that we need to reduce the results. One example
-  // is that the defining op for the yield operation is not for this
-  // taskId and the defining op is not specialized, thus we should
-  // remove the result.
+  // It is possible that we need to reduce the results. Keep results that are
+  // needed by this task's users, plus branch-local state values produced by
+  // this task such as synthetic accumulator counters.
   // We need to update the result types correctly here.
-  unsigned resultIdx = 0;
   SmallVector<unsigned> keptResultVec;
   if (!ifOp->getResultTypes().empty()) {
-    for (Value yieldV : ifOp.thenYield().getOperands()) {
-      // Check the defining op for the corresponding result.
-      if (Operation *def = yieldV.getDefiningOp()) {
-        bool hasTaskId = hasAsyncTaskId(def, asyncTaskId);
-        if (hasTaskId) {
-          keptResultVec.push_back(resultIdx);
-        }
-      } else {
-        assert(isa<BlockArgument>(yieldV) && "Unexpected yield value");
-        auto bbArg = cast<BlockArgument>(yieldV);
-        // Find transitive defining op for the block arg
-        Operation *bbAargOwner = bbArg.getOwner()->getParentOp();
-        if (auto forOp = dyn_cast<scf::ForOp>(bbAargOwner)) {
-          // track initial value
-          auto initArg = forOp.getInitArgs()[bbArg.getArgNumber() - 1];
-          if (Operation *def = initArg.getDefiningOp()) {
-            if (hasAsyncTaskId(def, asyncTaskId))
-              keptResultVec.push_back(resultIdx);
-          } else {
-            llvm_unreachable("Initial value should have a defining op");
-          }
-        } else {
-          llvm_unreachable("Unexpected block argument owner");
-        }
-      }
-      ++resultIdx;
+    for (auto [resultIdx, result] : llvm::enumerate(ifOp->getResults())) {
+      if (shouldKeepIfResultForTask(ifOp, resultIdx, result, asyncTaskId))
+        keptResultVec.push_back(resultIdx);
     }
   }
 
