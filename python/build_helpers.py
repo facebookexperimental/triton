@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import io
@@ -78,6 +79,11 @@ def _normalize_required_path(value: str, name: str) -> str:
     if normalized is None:
         raise RuntimeError(f"{name} must be provided to build_helpers.py")
     return normalized
+
+
+# Taken from https://github.com/pytorch/pytorch/blob/master/tools/setup_helpers/env.py
+def check_env_flag(name: str, default: str = "") -> bool:
+    return os.getenv(name, default).upper() in ["ON", "1", "YES", "TRUE", "Y"]
 
 
 def open_url(url):
@@ -376,8 +382,6 @@ def _get_thirdparty_package_cmake_vars(package: Package, helper_args: BuildHelpe
     if helper_args.offline_build and not input_defined:
         raise RuntimeError(f"Requested an offline build but {package.syspath_var_name} is not set")
     if not helper_args.offline_build and not input_defined and not input_compatible:
-        # with contextlib.suppress(Exception):
-        #     shutil.rmtree(package_root_dir)
         _download_and_extract(package.url, package_root_dir, package.name, helper_args.archives_path, package.sha256sum)
         # write version url to package_dir
         with open(os.path.join(package_dir, "version.txt"), "w") as file:
