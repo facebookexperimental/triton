@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import io
@@ -78,6 +79,11 @@ def _normalize_required_path(value: str, name: str) -> str:
     if normalized is None:
         raise RuntimeError(f"{name} must be provided to build_helpers.py")
     return normalized
+
+
+# Taken from https://github.com/pytorch/pytorch/blob/master/tools/setup_helpers/env.py
+def check_env_flag(name: str, default: str = "") -> bool:
+    return os.getenv(name, default).upper() in ["ON", "1", "YES", "TRUE", "Y"]
 
 
 def open_url(url):

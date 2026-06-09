@@ -96,7 +96,8 @@ LLVM::DITypeAttr LLVMDIUtils::convertStructType(MLIRContext *context,
       mlir::StringAttr::get(context, "struct"), fileAttr, /*line=*/line,
       /*scope=*/fileAttr, /*baseType=*/nullptr, mlir::LLVM::DIFlags::Zero,
       sizeInBits, /*alignInBits=*/0, /*dataLocation=*/nullptr, /*rank=*/nullptr,
-      /*allocated=*/nullptr, /*associated=*/nullptr, /*identifier=*/mlir::StringAttr{},
+      /*allocated=*/nullptr, /*associated=*/nullptr,
+      /*identifier=*/mlir::StringAttr{},
       /*discriminator=*/nullptr, elTypes);
 }
 
@@ -117,7 +118,8 @@ LLVM::DITypeAttr LLVMDIUtils::convertArrayType(MLIRContext *context,
       mlir::StringAttr::get(context, "array"), fileAttr, /*line=*/line,
       /*scope=*/fileAttr, /*baseType=*/baseType, mlir::LLVM::DIFlags::Zero,
       sizeInBits, /*alignInBits=*/0, /*dataLocation=*/nullptr, /*rank=*/nullptr,
-      /*allocated=*/nullptr, /*associated=*/nullptr, /*identifier=*/mlir::StringAttr{},
+      /*allocated=*/nullptr, /*associated=*/nullptr,
+      /*identifier=*/mlir::StringAttr{},
       /*discriminator=*/nullptr, elTypes);
 }
 
