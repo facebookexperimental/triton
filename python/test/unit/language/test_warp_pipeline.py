@@ -274,6 +274,40 @@ def test_warp_pipeline_lowering():
     assert "s_setprio" in asm, "Expected s_setprio from warp pipeline priority hints"
 
 
+@pytest.mark.skipif(not is_hip(), reason="warp pipeline is AMD-only")
+def test_warp_pipeline_preserves_user_wait_count():
+    """User-set async_load_wait_group(n) counts must survive the pipeliner.
+
+    A manual warp-pipeline emits a token-less ttg.async_wait whose `num` is set
+    deliberately. minNumInterleavedCommitOps must respect that count instead of
+    recomputing it to 0 (a full drain), which would silently serialize the
+    pipeline. Regression: the prologue async_load_wait_group(NUM_BUFFERS - 2)
+    below was being clobbered from 1 to 0.
+    """
+    import re
+
+    if not is_gfx950():
+        pytest.skip("shared-memory warp-pipeline lowering is currently tested on gfx950")
+
+    torch.manual_seed(0)
+    M = N = K = 192
+    a = torch.randn((M, K), dtype=torch.float16, device="cuda")
+    b = torch.randn((K, N), dtype=torch.float16, device="cuda")
+    c = torch.zeros((M, N), dtype=torch.float32, device="cuda")
+    BM, BN, BK = 64, 64, 32
+    grid = (triton.cdiv(M, BM) * triton.cdiv(N, BN), )
+
+    kernel = _smem_warp_pipeline_kernel[grid](a, b, c, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1),
+                                              c.stride(0), c.stride(1), BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK,
+                                              NUM_BUFFERS=3, num_warps=8)
+
+    # The prologue wait is async_load_wait_group(NUM_BUFFERS - 2) == 1; it must
+    # still be num = 1 after the pipeliner's wait-count recompute.
+    ttgir = kernel.asm["ttgir"]
+    nums = [int(n) for n in re.findall(r"async_wait \{num = (\d+)", ttgir)]
+    assert 1 in nums, f"user async_wait count was clobbered (expected a num=1 wait, got {nums}):\n{ttgir}"
+
+
 # --- Validation tests ---
 
 
