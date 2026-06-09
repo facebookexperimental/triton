@@ -48,6 +48,8 @@ public:
 
   triton::ReduceOp getOperation() { return op; }
 
+  unsigned getContigPerThreadOnReductionAxis();
+
   unsigned getThreadOffsetOnReductionAxis();
 
   bool isWarpSynchronous();

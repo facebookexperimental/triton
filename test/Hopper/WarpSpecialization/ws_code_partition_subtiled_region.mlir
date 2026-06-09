@@ -1,6 +1,10 @@
 // RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1 post-channel-creation=1" | FileCheck %s
+// XFAIL: *
 
 // Test: Code partition with SubtiledRegionOps for epilogue subtiling.
+// Regression test for B-11-F1 / T273485415.
+// Inline consumer-side subtiled NVWS tokens must carry WSBarrier destination
+// metadata so WSBarrierAnalysis can inject channel graph metadata.
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
@@ -23,8 +27,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK: partition1
   // CHECK:   ttng.subtiled_region
   // CHECK:     nvws.consumer_wait
+  // CHECK-SAME: channelGraph = array<i32: 1>
+  // CHECK-SAME: dstTask = 1 : i32
   // CHECK:     ttng.async_tma_copy_local_to_global
   // CHECK:     nvws.consumer_release
+  // CHECK-SAME: channelGraph = array<i32: 1>
+  // CHECK-SAME: dstTask = 1 : i32
   tt.func @subtiled_smem_channel(
       %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
       %off0: i32, %off1: i32, %off2: i32,

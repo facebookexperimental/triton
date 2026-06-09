@@ -3,7 +3,9 @@
 
 #include "Utility.h"
 #include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Support/LogicalResult.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -67,18 +69,21 @@ private:
     return _allocOp;
   }
 
-  RankedTensorType getResultTensorType(Value result, size_t expectedSize) {
+  FailureOr<RankedTensorType> getResultTensorType(Value result,
+                                                  size_t expectedRank) {
     auto outputType = dyn_cast<RankedTensorType>(result.getType());
-    if (!outputType || outputType.getShape().size() != 2) {
-      assert("Invalid tensor input");
+    if (!outputType || outputType.getRank() != expectedRank) {
+      emitError(result.getLoc())
+          << "expected `tmem.start` producer to have rank " << expectedRank;
+      return failure();
     }
     return outputType;
   }
 
-  ttng::TMEMAllocOp alloc1DTMEMBuffer();
+  FailureOr<ttng::TMEMAllocOp> alloc1DTMEMBuffer();
 
-  void TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
-                   Operation *allocOpBuffer);
+  LogicalResult TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
+                            Operation *allocOpBuffer);
 
   // Returns the new loaded value as the new producer.
   Value TMEMLoad1D(OpResult producer, Operation *consumer);
@@ -89,7 +94,8 @@ public:
                           Operation *allocOpBuffer = nullptr) {
     this->numWarps = ttg::lookupNumWarps(producer.getDefiningOp());
     assert((numWarps == 4 || numWarps == 8) && "Only support 4 or 8 warps");
-    TMEMStore1D(producer, producerTaskId, allocOpBuffer);
+    if (failed(TMEMStore1D(producer, producerTaskId, allocOpBuffer)))
+      return Value();
     return TMEMLoad1D(producer, consumer);
   }
 };

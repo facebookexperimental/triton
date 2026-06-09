@@ -19,6 +19,8 @@ from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent im
     _attn_bwd_ws as _blackwell_fa_bwd_ws,
     _attn_fwd_ws as _blackwell_fa_fwd_ws,
     _host_descriptor_pre_hook as _blackwell_fa_fwd_pre_hook,
+    configs_bwd_1cta as _configs_bwd_1cta,
+    configs_bwd_2cta as _configs_bwd_2cta,
 )
 from triton.language.extra.tlx.tutorials.blackwell_fa_clc import (
     attention as _blackwell_fa_clc, )
@@ -48,13 +50,17 @@ from triton.language.extra.tlx.tutorials.hopper_fa_ws_pipelined import (
     attention as _hopper_fa_ws_pipelined, )
 from triton.language.extra.tlx.tutorials.hopper_fa_ws import (
     attention as _hopper_fa_ws, )
+from triton.language.extra.tlx.tutorials.amd_fa_pipelined import (
+    attention as _amd_fa_pipelined, )
+from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
+    matmul as _amd_tdm_gemm_pipelined, )
 
 from triton.language.extra.tlx.tutorials.testing.multi_cta_layer_norm import (
     multi_cta_layernorm as _multi_cta_layernorm,
     multi_cta_layernorm_2d as _multi_cta_layernorm_2d,
 )
 
-from triton._internal_testing import is_blackwell, is_hopper, is_hopper_or_newer
+from triton._internal_testing import is_blackwell, is_hopper, is_hopper_or_newer, is_hip, is_hip_gfx1250
 from triton.language.extra.tlx.tutorials.testing.gemm_shapes import BLACKWELL_GEMM_WS as _BLACKWELL_GEMM_WS_MORE_SHAPES
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -153,6 +159,11 @@ class Gemm:
             "EPILOGUE_SUBTILE": False,
             "USE_WARP_BARRIER": True,
             "NUM_CTAS": 1,
+        },
+        "amd_tdm_gemm_pipelined": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 32,
         },
     }
 
@@ -276,6 +287,17 @@ class FlashAttention:
             "NUM_BUFFERS_KV": 2,
             "NUM_MMA_WARPS": 8,
             "NUM_MMA_GROUPS": 2,
+        },
+        "amd_fa_pipelined": {
+            "BLOCK_M": 256,
+            "BLOCK_N": 64,
+            "num_warps": 4,
+        },
+        "amd_fa_pipelined_prefetch": {
+            "BLOCK_M": 256,
+            "BLOCK_N": 64,
+            "num_warps": 8,
+            "PREFETCH": True,
         },
     }
 
@@ -432,10 +454,11 @@ def test_blackwell_fa_clc(N_CTX, causal, RESCALE_OPT, USE_WHERE):
     torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
 
 
+@pytest.mark.parametrize("NUM_CTAS", [1, 2])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("RESCALE_OPT,USE_WHERE", [(False, False), (True, False), (True, True)])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
-def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE):
+def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE, NUM_CTAS):
     fwd_config: dict[str,
                      bool | int] = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent_warp_barrier"].copy()
     fwd_config["RESCALE_OPT"] = RESCALE_OPT
@@ -477,8 +500,7 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
             return torch.empty(size, dtype=torch.int8, device="cuda")
 
         triton.set_allocator(alloc_fn)
-        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-        grid = (min(NUM_SMS, triton.cdiv(N_CTX, fwd_config["BLOCK_M"]) * Z * H), 1, 1)
+        grid = (triton.cdiv(N_CTX, fwd_config["BLOCK_M"]) * Z * H, 1, 1)
         _blackwell_fa_fwd_ws.fn[grid](
             sm_scale,
             M,
@@ -508,23 +530,37 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
 
-        desc_bk = TensorDescriptor(arg_k, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                   block_shape=dummy_block)
-        desc_bv = TensorDescriptor(v, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-        desc_bq = TensorDescriptor(q, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-        desc_do = TensorDescriptor(do, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-        desc_dq = TensorDescriptor(dq, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-        desc_dk = TensorDescriptor(dk, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
-        desc_dv = TensorDescriptor(dv, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+        dummy_block_4d = [1, 1, 1, 1]
+        desc_shape = [Z, H, N_CTX, HEAD_DIM]
+        desc_strides = [H * N_CTX * HEAD_DIM, N_CTX * HEAD_DIM, HEAD_DIM, 1]
+        desc_bk = TensorDescriptor(arg_k, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
+        desc_bv = TensorDescriptor(v, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
+        desc_bq = TensorDescriptor(q, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
+        desc_do = TensorDescriptor(do, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
+        desc_dq = TensorDescriptor(dq, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
+        desc_dk = TensorDescriptor(dk, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
+        desc_dv = TensorDescriptor(dv, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
         desc_m = TensorDescriptor(M, shape=[Z * H * N_CTX], strides=[1], block_shape=[1])
         desc_delta = TensorDescriptor(delta, shape=[Z * H * N_CTX], strides=[1], block_shape=[1])
 
+        # Descriptors for 2-CTA B-operand transposed views.
+        # In 1-CTA mode these are passed but unused by the kernel.
+        desc_kt = TensorDescriptor(arg_k, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
+        desc_qt = TensorDescriptor(q, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
+        desc_dot = TensorDescriptor(do, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
+
         BLK_SLICE_FACTOR = 2
 
-        def grid_persistent(meta):
-            return (triton.cdiv(N_CTX, meta["BLOCK_N1"]) * Z * H, 1, 1)
+        bwd_configs = _configs_bwd_1cta if NUM_CTAS == 1 else _configs_bwd_2cta
+        bwd_kernel = triton.autotune(configs=bwd_configs, key=["N_CTX", "HEAD_DIM"])(_blackwell_fa_bwd_ws.fn)
 
-        _blackwell_fa_bwd_ws[grid_persistent](
+        def grid_persistent(meta):
+            n_tiles = triton.cdiv(N_CTX, meta["BLOCK_N1"])
+            num_ctas = meta.get("NUM_CTAS", 1)
+            n_tiles = triton.cdiv(n_tiles, num_ctas) * num_ctas
+            return (n_tiles, H, Z)
+
+        bwd_kernel[grid_persistent](
             desc_bq,
             desc_bk,
             desc_bv,
@@ -535,22 +571,22 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
             desc_dv,
             desc_m,
             desc_delta,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),
+            M,
+            delta,
             H,
             Z,
             N_CTX,
+            desc_kt,
+            desc_qt,
+            desc_dot,
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
             HEAD_DIM=HEAD_DIM,
             STAGE=stage,
         )
 
-        tri_dq = dq.to(q.dtype)
-        torch.testing.assert_close(tri_dq, ref_dq, atol=1e-2, rtol=0)
-        torch.testing.assert_close(dk, ref_dk, atol=1e-2, rtol=0)
         torch.testing.assert_close(dv, ref_dv, atol=1e-2, rtol=0)
+        torch.testing.assert_close(dk, ref_dk, atol=1e-2, rtol=0)
+        torch.testing.assert_close(dq.to(ref_dq.dtype), ref_dq, atol=1e-2, rtol=0)
 
 
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])
@@ -625,14 +661,11 @@ def _assert_close_with_cosine(
     actual: torch.Tensor,
     expected: torch.Tensor,
     *,
-    atol: float,
-    rtol: float,
     label: str,
     min_cosine: float,
 ) -> None:
     cosine = _cosine_similarity(actual, expected)
-    # TODO: Enable testing?
-    # torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    # TODO: Enable value-based checking once MXFP8 backward tolerances settle.
     assert cosine >= min_cosine, f"{label} cosine_similarity={cosine:.6f} fell below min_cosine={min_cosine:.6f}"
 
 
@@ -656,8 +689,6 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
     dtype = torch.float8_e4m3fn
     head_dim = 128
     shape = (Z, H, N_CTX, head_dim)
-    bwd_atol: float = 2e-1
-    bwd_rtol: float = 2e-1
     bwd_min_cosine: float = 0.98
     torch.manual_seed(20)
 
@@ -764,24 +795,18 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
     _assert_close_with_cosine(
         dq_bf16,
         ref_dq,
-        atol=bwd_atol,
-        rtol=bwd_rtol,
         label="dq",
         min_cosine=bwd_min_cosine,
     )
     _assert_close_with_cosine(
         dk,
         ref_dk,
-        atol=bwd_atol,
-        rtol=bwd_rtol,
         label="dk",
         min_cosine=bwd_min_cosine,
     )
     _assert_close_with_cosine(
         dv,
         ref_dv,
-        atol=bwd_atol,
-        rtol=bwd_rtol,
         label="dv",
         min_cosine=bwd_min_cosine,
     )
@@ -858,6 +883,35 @@ def test_hopper_fa_ws_pipelined_pingpong_persistent():
         ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
         tri_out = _hopper_fa_ws_pipelined_pingpong_persistent(q, k, v, sm_scale, config=config)
         torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
+
+
+# =============================================================================
+# AMD Flash Attention Tests
+# =============================================================================
+
+
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("config_name", ["amd_fa_pipelined", "amd_fa_pipelined_prefetch"])
+@pytest.mark.skipif(not is_hip(), reason="Requires AMD GPU")
+def test_amd_fa_pipelined(config_name, causal):
+    config = FlashAttention.CONFIGS[config_name]
+    sm_scale = 0.5
+    for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
+        q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
+        ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
+        tri_out = _amd_fa_pipelined(q, k, v, sm_scale, causal, config=config)
+        torch.testing.assert_close(tri_out, ref_out, atol=2e-2, rtol=0)
+
+
+# =============================================================================
+# AMD TDM GEMM Tests (gfx1250)
+# =============================================================================
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_amd_tdm_gemm_pipelined(dtype):
+    Gemm.run_test(_amd_tdm_gemm_pipelined, Gemm.CONFIGS["amd_tdm_gemm_pipelined"], dtype=dtype)
 
 
 # =============================================================================

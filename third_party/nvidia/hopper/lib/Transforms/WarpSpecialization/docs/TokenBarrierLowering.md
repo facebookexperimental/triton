@@ -96,10 +96,11 @@ rather than being sprinkled across every site that inserts synchronization.
 
 Each `CreateTokenOp` carries a `TokenLoadType` enum (`TMALoadOp`,
 `AsyncLoadOp`, `LocalStoreOp`, `TmemLoadOp`, `None`). During lowering, TMA
-loads get an arrive count of 1 (hardware auto-arrive), while non-TMA loads
-get `THREADS_PER_WARP * numWarps` (software arrive from every thread). This
-decision is made once in `WSLowerToken.cpp` rather than at every barrier
-insertion site.
+loads get an arrive count of 1 (hardware auto-arrive), async global-to-local
+loads use `ttng.async_copy_mbarrier_arrive` so the ready barrier is signaled
+after the previously issued async copies complete, and other non-TMA loads
+use a software arrive. This decision is made once in `WSLowerToken.cpp`
+rather than at every barrier insertion site.
 
 ## Abstract Token Operations
 
@@ -129,8 +130,11 @@ Each barrier is initialized with `InitBarrierOp` with arrive count 1. The
 arrive count depends on the `TokenLoadType`:
 
 - **TMA loads**: `bufferFullCount = 1` (hardware auto-arrives)
-- **Non-TMA loads**: `bufferFullCount = THREADS_PER_WARP * producerWarps`
-  (software arrives from every thread)
+- **Async loads**: the ready barrier is signaled by
+  `AsyncCopyMbarrierArriveOp` once previously issued async copies complete
+- **Other non-TMA loads**:
+  `bufferFullCount = THREADS_PER_WARP * producerWarps` (software arrives from
+  every thread)
 - **Empty barriers**: `bufferEmptyCount = THREADS_PER_WARP * consumerWarps`
   (always software arrive)
 
@@ -149,7 +153,7 @@ barrier operation:
 | Abstract Op | Lowered To | Barrier Array | Description |
 |-------------|-----------|---------------|-------------|
 | `ProducerAcquireOp` | `WaitBarrierOp` | `bufferEmpty[i]` | Wait for consumer to release buffer slot |
-| `ProducerCommitOp` | `ArriveBarrierOp` | `bufferFull[i]` | Signal data is ready for consumer |
+| `ProducerCommitOp` | `AsyncCopyMbarrierArriveOp` for async loads; otherwise `ArriveBarrierOp` | `bufferFull[i]` | Signal data is ready for consumer |
 | `ConsumerWaitOp` | `WaitBarrierOp` | `bufferFull[i]` | Wait for producer to fill buffer slot |
 | `ConsumerReleaseOp` | `ArriveBarrierOp` | `bufferEmpty[i]` | Signal buffer slot is free for producer |
 

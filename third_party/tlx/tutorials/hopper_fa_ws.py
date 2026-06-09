@@ -14,7 +14,6 @@ def _host_descriptor_pre_hook(nargs):
     HEAD_DIM = nargs["HEAD_DIM"]
     if not isinstance(nargs["desc_q"], TensorDescriptor):
         return
-    HEAD_DIM = nargs["HEAD_DIM"]
     NUM_MMA_GROUPS = nargs["NUM_MMA_GROUPS"]
     BLOCK_M_SPLIT = BLOCK_M // NUM_MMA_GROUPS
     nargs["desc_q"].block_shape = [BLOCK_M_SPLIT, HEAD_DIM]
@@ -87,7 +86,7 @@ def _attn_fwd_ws(sm_scale, M,  #
             acc_cnt = 0
             for _ in tl.range(lo, hi, BLOCK_N):
                 buf_id = acc_cnt % NUM_BUFFERS
-                # buffers in a row share the same phase
+                # consecutive buffers share the same phase
                 kv_phase = kv_phase ^ (buf_id == 0)
 
                 # wait for the K buffer to be released by the consumer
@@ -135,7 +134,7 @@ def _attn_fwd_ws(sm_scale, M,  #
             # loop over k, v and update accumulator
             for _ in tl.range(lo, hi, BLOCK_N):
                 buf_id = acc_cnt % NUM_BUFFERS
-                # buffers in a row share the same phase
+                # consecutive buffers share the same phase
                 kv_phase = kv_phase ^ (buf_id == 0)
 
                 # wait for the K buffer to be populated by the producer
@@ -146,7 +145,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                 # -- compute qk ----
                 k_tile = tlx.local_trans(k_tile)
                 qk = tlx.async_dot(q_tile, k_tile)
-                # wait for the MMA using to complete
+                # wait for the MMA operation to complete
                 qk = tlx.async_dot_wait(0, qk)
                 # release the K buffer
                 k_empty = tlx.local_view(k_empties, buf_id)
@@ -168,7 +167,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                 tlx.barrier_wait(v_full, kv_phase)
                 v_tile = tlx.local_view(v_tiles, buf_id)
                 acc = tlx.async_dot(p, v_tile, acc)
-                # wait for the MMA using to complete
+                # wait for the MMA operation to complete
                 acc = tlx.async_dot_wait(0, acc)
                 # release the V buffer
                 v_empty = tlx.local_view(v_empties, buf_id)

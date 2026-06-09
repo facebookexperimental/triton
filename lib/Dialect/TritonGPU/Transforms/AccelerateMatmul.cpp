@@ -555,12 +555,34 @@ public:
       return failure();
     auto oldAType = dotOp.getA().getType();
     auto oldBType = dotOp.getB().getType();
-    // NYI: PTX 13+ requires all tcgen instructions in a kernel to have a
-    // consistent CTA mode, disabling 2CTA mode for now. To re-enable,
-    // change the line below to: bool useTwoCTAs = canUseTwoCTAs(dotOp);
-    bool useTwoCTAs = false;
-    if (useTwoCTAs) {
-      b = splitBOperand(b, rewriter);
+    bool useTwoCTAs;
+    if (dotOp.getTwoCtas()) {
+      auto mod = dotOp->getParentOfType<ModuleOp>();
+      auto clusterDims = triton::gpu::TritonGPUDialect::getClusterDims(mod);
+      if (clusterDims[0] < 2) {
+        dotOp.emitWarning()
+            << "two_ctas=True requires ctas_per_cga=(2,1,1) or larger; "
+               "cluster-dim-x is "
+            << clusterDims[0] << ". Falling back to 1-CTA MMA.";
+        useTwoCTAs = false;
+      } else if (oldRetType.getShape()[0] < 128) {
+        dotOp.emitWarning()
+            << "two_ctas=True with BLOCK_M < 128 is not yet supported; "
+               "m=64 2-CTA requires TensorMemoryCTAMode TwoCTA_LHS/RHS. "
+               "Falling back to 1-CTA MMA.";
+        useTwoCTAs = false;
+      } else {
+        useTwoCTAs = true;
+      }
+    } else {
+      // NYI: PTX 13+ requires all tcgen instructions in a kernel to have a
+      // consistent CTA mode, disabling compiler-driven 2CTA mode for now.
+      // To re-enable, change the line below to:
+      //   useTwoCTAs = canUseTwoCTAs(dotOp);
+      useTwoCTAs = false;
+      if (useTwoCTAs) {
+        b = splitBOperand(b, rewriter);
+      }
     }
     // TF32 transpose is only supported with 128 swizzle mode with 32B
     // atomicity. As we currently don't support this layout we disallow

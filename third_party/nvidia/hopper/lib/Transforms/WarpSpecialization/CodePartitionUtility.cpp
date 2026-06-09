@@ -2336,6 +2336,23 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
   for (auto user : tmemAllocOp.getResult().getUsers()) {
     users.insert(user);
   }
+  // Strip stale tmem.start / tmem.end attributes on this alloc's users.
+  // Lit test fixtures (e.g. blackwell_fa_fwd_persist_code_partition.mlir,
+  // reuse_group_2buffer_fwd.mlir) carry these attributes from a previous
+  // WS pipeline run. setTmemChannelAttr only ever appends, so re-running
+  // doCodePartitionPost on already-annotated IR can leave a single op
+  // marked with multiple channel ids that refer to channels which no
+  // longer exist in the current run. findTmemStartEnd then returns the
+  // wrong op for a channel id (whichever is first in user-iteration
+  // order), confusing isBackwardOfChannelLoop / isForwardOfChannelLoop in
+  // insertAsyncComm. Clearing here makes handleOperandD idempotent and
+  // safe to re-run on already-annotated IR.
+  for (auto *user : users) {
+    if (user->hasAttr("tmem.start"))
+      user->removeAttr("tmem.start");
+    if (user->hasAttr("tmem.end"))
+      user->removeAttr("tmem.end");
+  }
   auto forOp = mmaOp->getParentOfType<scf::ForOp>();
   if (!forOp) {
     return mmaOp.emitError(
@@ -2353,17 +2370,72 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
   Operation *lastConsumer = nullptr;
   unsigned numChannelsCreated = 0;
 
-  // Check for producers outside the loop body (e.g., tmem_store before the
-  // loop that initializes the accumulator). These producers dominate the loop.
-  for (auto user : tmemAllocOp.getResult().getUsers()) {
-    if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user)) {
-      // Check if this store is outside the loop (not nested under forOp)
-      if (!forOp->isProperAncestor(storeOp)) {
-        currentProds.clear();
-        currentProds.push_back(storeOp);
-        handledUsers.insert(storeOp);
+  // Detect the operand-D channel-loop pattern: an in-body TMEMLoadOp on this
+  // alloc that appears (in program order) BEFORE any in-body TMEMStoreOp /
+  // mmaOp. In that case the in-body load reads the previous iteration's MMA
+  // output and must become the destination of a back-edge channel
+  // (gen5 -> in-body tmem_load) created via the deferred-channel path
+  // below. If we let the pre-loop scan seed currentProds with an out-of-loop
+  // init store, the load would instead become the destination of a forward
+  // channel (init_store -> load) — which silently drops the back-edge and
+  // leaves the in-body load unsynchronized with the previous iteration's
+  // MMA commit. See OperandDChannelLoopFix.md for the full analysis.
+  bool hasBodyChannelLoop = false;
+  {
+    Operation *firstInBodyLoad = nullptr;
+    Operation *firstInBodyStoreOrMma = nullptr;
+    for (Operation &op : forOp.getBody()->without_terminator()) {
+      if (!users.count(&op))
+        continue;
+      if (isa<ttng::TMEMLoadOp>(&op)) {
+        if (!firstInBodyLoad)
+          firstInBodyLoad = &op;
+      } else if (isa<ttng::TMEMStoreOp>(&op) ||
+                 (isa<ttng::TCGen5MMAOp>(&op) && &op == mmaOp.getOperation())) {
+        if (!firstInBodyStoreOrMma)
+          firstInBodyStoreOrMma = &op;
       }
     }
+    if (firstInBodyLoad && firstInBodyStoreOrMma &&
+        firstInBodyLoad->isBeforeInBlock(firstInBodyStoreOrMma)) {
+      hasBodyChannelLoop = true;
+    }
+  }
+
+  // Check for producers outside the loop body (e.g., tmem_store before the
+  // loop that initializes the accumulator). These producers dominate the
+  // loop. Skip this seeding when the body has the channel-loop pattern;
+  // otherwise the in-body tmem_load would consume the init store as a
+  // forward producer instead of getting paired with the gen5 MMA via a
+  // back-edge channel.
+  if (!hasBodyChannelLoop) {
+    for (auto user : tmemAllocOp.getResult().getUsers()) {
+      if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user)) {
+        // Check if this store is outside the loop (not nested under forOp)
+        if (!forOp->isProperAncestor(storeOp)) {
+          currentProds.clear();
+          currentProds.push_back(storeOp);
+          handledUsers.insert(storeOp);
+        }
+      }
+    }
+  } else {
+    // Channel-loop pattern: still mark the out-of-loop init store as
+    // handled so it doesn't get re-processed by the post-body
+    // "consumers outside ForOp" loop. Its synchronization (first-iter
+    // init) is handled by the pre-existing barrier infrastructure that
+    // gates the gen5's first iteration.
+    for (auto user : tmemAllocOp.getResult().getUsers()) {
+      if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user)) {
+        if (!forOp->isProperAncestor(storeOp))
+          handledUsers.insert(storeOp);
+      }
+    }
+    LLVM_DEBUG({
+      DBGS() << "handleOperandD: detected channel-loop pattern; skipping "
+                "pre-loop init-store seed of currentProds for alloc ";
+      tmemAllocOp.dump();
+    });
   }
 
   for (Operation &op : forOp.getBody()->without_terminator()) {
@@ -2528,6 +2600,17 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
     auto *lastProd = currentProds.back();
     channels[idx]->relation.first = getAsyncTaskIds(lastProd).front();
     setTmemChannelAttr(lastProd, channels[idx]->uniqID, "tmem.start");
+    // Track this channel for the wrap-around / guard logic below. Without
+    // this, deferred (back-edge) channels are invisible to the
+    // wrap-around block, even though they are real cross-partition
+    // channels with src/dst ops.
+    if (!firstProducer)
+      firstProducer = lastProd;
+    // The deferred channel's dst op (the in-body tmem_load) is the
+    // last consumer in program order for the back-edge case.
+    if (Channel *ch = channels[idx].get())
+      lastConsumer = ch->getDstOp();
+    numChannelsCreated++;
   }
   // For consumers outside of ForOp.
   for (auto *user : users) {
@@ -2633,7 +2716,8 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
 }
 
 static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
-                              SmallVector<std::unique_ptr<Channel>> &channels) {
+                              SmallVector<std::unique_ptr<Channel>> &channels,
+                              bool includeSameTaskSmemChannels) {
   // source can be local_store, consumer can be gen5, ttg.memdesc_trans,
   // local_load Can be produced by tmem_store or gen5, consumed by tmem_load or
   // gen5
@@ -2777,20 +2861,25 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
     }
   }
 
-  // When a producer has multiple task IDs (e.g., a shared local_alloc
-  // consumed by data-partitioned computation groups), no channel is needed
-  // for any producer that is co-located with a consumer. It is unclear if
-  // is sufficient when there are multiple consumers.
+  // When a producer has multiple task IDs (e.g., a shared local_alloc whose
+  // task ids include both the value producer and the consumers), select the
+  // single producer task that is not co-located with a consumer. This can
+  // happen with data-partitioned computation groups where one producer feeds
+  // multiple consumer partitions. If all producer tasks are co-located with
+  // consumers, no cross-partition channel is needed.
   AsyncTaskId producerTaskId = -1;
-  if (producerTaskIds.size() > 1 && consumerTaskIds.size() == 1) {
-    auto consumerTaskId = consumerTaskIds.front();
+  if (producerTaskIds.size() > 1) {
+    DenseSet<int> consumerTaskIdSet(consumerTaskIds.begin(),
+                                    consumerTaskIds.end());
     for (auto id : producerTaskIds) {
-      if (id != consumerTaskId) {
+      if (!consumerTaskIdSet.contains(id)) {
         assert(producerTaskId == -1 &&
-               "Multiple producers encountered for 1 consumer");
+               "Multiple cross-partition producers encountered");
         producerTaskId = id;
       }
     }
+    if (producerTaskId == -1)
+      return;
   } else {
     assert(producerTaskIds.size() == 1);
     producerTaskId = producerTaskIds.front();
@@ -2808,24 +2897,28 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
       channels.back()->srcName = getOutermostNameFromLoc(allocOp->getLoc());
     }
   } else {
-    channels.push_back(std::make_unique<ChannelPost>(
-        producerTaskIds.front(), consumerTaskIds, allocOp, channels.size()));
-    channels.back()->srcName = getOutermostNameFromLoc(allocOp->getLoc());
+    bool shouldCreateSmemChannel =
+        includeSameTaskSmemChannels ||
+        needsChannel(producerTaskId, consumerTaskIds);
+    if (shouldCreateSmemChannel) {
+      channels.push_back(std::make_unique<ChannelPost>(
+          producerTaskId, consumerTaskIds, allocOp, channels.size()));
+      channels.back()->srcName = getOutermostNameFromLoc(allocOp->getLoc());
+    }
   }
 }
 
 void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
-                         triton::FuncOp &funcOp) {
+                         triton::FuncOp &funcOp,
+                         bool includeSameTaskSmemChannels) {
   mlir::DominanceInfo dom(funcOp);
   funcOp.walk([&](Operation *op) {
     // FIXME: It is possible that a local_alloc can start a channel, when a
     // gemm's operand is in smem and comes from local_alloc.
     // All buffers have been allocated, a channel will be created based on
     // the alloc.
-    if (dyn_cast<ttng::TMEMAllocOp>(op)) {
-      createChannelPost(op, dom, channels);
-    } else if (dyn_cast<ttg::LocalAllocOp>(op)) {
-      createChannelPost(op, dom, channels);
+    if (isa<ttng::TMEMAllocOp>(op) || isa<ttg::LocalAllocOp>(op)) {
+      createChannelPost(op, dom, channels, includeSameTaskSmemChannels);
     }
   });
   LLVM_DEBUG({

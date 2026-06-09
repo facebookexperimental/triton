@@ -87,8 +87,8 @@ A simpler approach using backward slicing from dot/MMA ops. Used on Hopper.
 
 1. Collect all `scf::ForOp` loops, `WarpGroupDotOp`, load ops, and store ops.
 2. For each dot, compute the backward slice of operands A and B.
-3. Any `DescriptorLoadOp` (or expensive `LoadOp`) in the backward slice is a
-   **producer** (task ID 0).
+3. Any `DescriptorLoadOp`, `DescriptorGatherOp`, or expensive `LoadOp` in the
+   backward slice is a **producer** (task ID 0).
 4. All dots are **consumers** (task IDs 1 through `numWarpGroups - 1`).
 5. All stores get consumer task IDs.
 

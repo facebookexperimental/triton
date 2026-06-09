@@ -12,6 +12,16 @@
 using namespace mlir;
 using namespace mlir::triton::tlx;
 
+namespace {
+ModuleOp getModuleOp(Operation *op) {
+  auto module = dyn_cast<ModuleOp>(op);
+  if (!module) {
+    module = op->getParentOfType<ModuleOp>();
+  }
+  return module;
+}
+} // namespace
+
 void mlir::triton::tlx::TLXDialect::initialize() {
   addAttributes<
 #define GET_ATTRDEF_LIST
@@ -32,37 +42,28 @@ void mlir::triton::tlx::TLXDialect::initialize() {
 
 bool mlir::triton::tlx::tlxEnablePairedMMA(Operation *op) {
   assert(op != nullptr && "expecting nonnull op for checking TLX 2cta mode");
-  auto module = op;
-  if (!isa<ModuleOp>(module)) {
-    module = op->getParentOfType<ModuleOp>();
-  }
+  auto module = getModuleOp(op);
   assert(module != nullptr &&
          "expecting op nested in a module for checking TLX 2cta mode");
   auto attr = module->getAttrOfType<BoolAttr>(AttrTLXEnablePairedCTAMMAName);
-  return attr != nullptr && attr.getValue() == true;
+  return attr != nullptr && attr.getValue();
 }
 
 bool mlir::triton::tlx::hasClusterSyncKernelInit(Operation *op) {
   assert(op != nullptr &&
          "expecting nonnull op for checking cluster sync kernel init");
-  auto module = op;
-  if (!isa<ModuleOp>(module)) {
-    module = op->getParentOfType<ModuleOp>();
-  }
+  auto module = getModuleOp(op);
   assert(module != nullptr && "expecting op nested in a module for checking "
                               "cluster sync kernel init marker");
   auto attr = module->getAttrOfType<BoolAttr>(AttrClusterSyncKernelInitName);
-  return attr != nullptr && attr.getValue() == true;
+  return attr != nullptr && attr.getValue();
 }
 
 void mlir::triton::tlx::setClusterSyncKernelInitOnMod(Operation *op,
                                                       bool value) {
   assert(op != nullptr &&
          "expecting nonnull op for setting cluster sync kernel init");
-  auto module = op;
-  if (!isa<ModuleOp>(module)) {
-    module = op->getParentOfType<ModuleOp>();
-  }
+  auto module = getModuleOp(op);
   assert(module != nullptr && "expecting op nested in a module for setting "
                               "cluster sync kernel init marker");
   module->setAttr(AttrClusterSyncKernelInitName,
@@ -72,24 +73,18 @@ void mlir::triton::tlx::setClusterSyncKernelInitOnMod(Operation *op,
 bool mlir::triton::tlx::hasClusterSyncKernelCleanup(Operation *op) {
   assert(op != nullptr &&
          "expecting nonnull op for checking cluster sync kernel cleanup");
-  auto module = op;
-  if (!isa<ModuleOp>(module)) {
-    module = op->getParentOfType<ModuleOp>();
-  }
+  auto module = getModuleOp(op);
   assert(module != nullptr && "expecting op nested in a module for checking "
                               "cluster sync kernel cleanup marker");
   auto attr = module->getAttrOfType<BoolAttr>(AttrClusterSyncKernelCleanupName);
-  return attr != nullptr && attr.getValue() == true;
+  return attr != nullptr && attr.getValue();
 }
 
 void mlir::triton::tlx::setClusterSyncKernelCleanupOnMod(Operation *op,
                                                          bool value) {
   assert(op != nullptr &&
          "expecting nonnull op for setting cluster sync kernel cleanup");
-  auto module = op;
-  if (!isa<ModuleOp>(module)) {
-    module = op->getParentOfType<ModuleOp>();
-  }
+  auto module = getModuleOp(op);
   assert(module != nullptr && "expecting op nested in a module for setting "
                               "cluster sync kernel cleanup marker");
   module->setAttr(AttrClusterSyncKernelCleanupName,
@@ -98,15 +93,11 @@ void mlir::triton::tlx::setClusterSyncKernelCleanupOnMod(Operation *op,
 
 bool mlir::triton::tlx::tlxIsClustered(Operation *op) {
   assert(op != nullptr && "expecting nonnull op for checking cluster dims");
-  auto moduleOp = op;
-  if (!isa<ModuleOp>(moduleOp)) {
-    moduleOp = op->getParentOfType<ModuleOp>();
-  }
+  auto moduleOp = getModuleOp(op);
   assert(moduleOp != nullptr &&
          "expecting op nested in a module for checking cluster dims");
-  auto mod = cast<ModuleOp>(moduleOp);
   const SmallVector<int> clusterDims =
-      triton::gpu::TritonGPUDialect::getClusterDims(mod);
+      triton::gpu::TritonGPUDialect::getClusterDims(moduleOp);
   int clusterSize = 1;
   for (int d : clusterDims)
     clusterSize *= d;

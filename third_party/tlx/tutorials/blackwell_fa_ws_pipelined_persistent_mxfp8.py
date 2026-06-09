@@ -9,6 +9,8 @@ from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _s
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 from triton.language.extra.tlx.mxfp8_utils import (
+    _amax_to_e8m0_and_quantize,
+    _cvt_e4m3x4_f32,
     _to_mxfp8_block,
     _to_mxfp8_block_with_block_amax,
 )
@@ -135,7 +137,7 @@ def _apply_causal_mask(qk, col_limit_right, BLOCK_N: tl.constexpr):
     # Credit to Tri Dao,
     # https://github.com/Dao-AILab/flash-attention/commit/bac1001e4f6caa09d70537495d6746a685a2fa78
     #
-    # NOTE: We use map_elementiwse here in order to generate an interleaved sequence of instructions
+    # NOTE: We use map_elementwise here in order to generate an interleaved sequence of instructions
     # that processes one element of qk at a time. This improves ptxas's resulting SASS.
     offs_n = tl.arange(0, BLOCK_N)[None, :]
     s = offs_n & ~0xF
@@ -1369,21 +1371,13 @@ def _softmax_recompute_quantization_iter(
     qkT_scaled = tl.minimum(qkT_scaled, 20.0)
     pT = tl.math.exp2(qkT_scaled)
 
-    # Block amax for P via monotonicity of exp2
-    qkT_reshaped = tl.reshape(qkT_scaled, [BLOCK_N1, P_NUM_BLOCKS, VEC_SIZE])
-    block_maxes_p = tl.max(qkT_reshaped, 2)
-    block_amax_p = tl.math.exp2(block_maxes_p)
-
-    # Quantize P^T -> TMEM (FP8 data + E8M0 scales)
-    p_fp8, p_scale = _to_mxfp8_block_with_block_amax(
-        pT,
-        block_amax_p,
-        VEC_SIZE,
-        p_dtype,
-    )
+    # Quantize P^T -> TMEM with fixed pow2 scale.
+    # P = exp2(QK·scale - m) ∈ [0, 1], so a fixed E8M0 scale works for all
+    # blocks. E8M0=119 → scale=2^(-8), inv_scale=256. This eliminates the
+    # per-block amax reshape, avoiding the convert_layout before tmem_store.
+    P_FIXED_INV_SCALE: tl.constexpr = 256.0
+    p_fp8 = _cvt_e4m3x4_f32(_mul_f32x2(pT, P_FIXED_INV_SCALE))
     tlx.local_store(tlx.local_view(p_tiles, 0), p_fp8)
-    p_scale_packed = p_scale.reshape([REP_N, 4, 32, REP_M, 4]).permute(0, 3, 2, 1, 4)
-    tlx.local_store(tlx.local_view(p_scale_buf_smem, 0), p_scale_packed)
 
     tlx.barrier_arrive(p_fulls[0])
     tlx.barrier_arrive(m_empties[m_buf_id])
@@ -1429,8 +1423,12 @@ def _softmax_recompute_quantization_iter(
             ),
             ds_scale_packed,
         )
-        ds_dq_fp8, ds_scale_dq = _to_mxfp8_block(
-            tl.trans(dsT),
+        dsT_t = tl.trans(dsT)
+        dq_amax = tl.max(tl.abs(dsT_t))
+        dq_amax_bcast = tl.full([DS_M_SUB, BLOCK_N1 // VEC_SIZE], 0.0, tl.float32) + dq_amax
+        ds_scale_dq, ds_dq_fp8 = _amax_to_e8m0_and_quantize(
+            dsT_t,
+            dq_amax_bcast,
             VEC_SIZE,
             p_dtype,
         )
@@ -1499,7 +1497,6 @@ def _attn_bwd_mxf8_ws(
     tl.static_assert(NUM_BUFFERS_TMEM == 1)
 
     VEC_SIZE: tl.constexpr = 32
-    LN2: tl.constexpr = 0.6931471824645996
     REP_M: tl.constexpr = triton.cdiv(BLOCK_M1, 128)
     REP_N: tl.constexpr = triton.cdiv(triton.cdiv(BLOCK_N1, VEC_SIZE), 4)
     REP_HEAD: tl.constexpr = triton.cdiv(triton.cdiv(HEAD_DIM, VEC_SIZE), 4)
@@ -1894,6 +1891,12 @@ def _attn_bwd_mxf8_ws(
         # ----- Compute warp: softmax recompute + P/dS quantization -----
         # Default task -- its warp count comes from autotune num_warps (= 4).
         with tlx.async_task("default"):
+            # Pre-fill P scale SMEM once (constant E8M0=119 for all tiles).
+            P_FIXED_E8M0: tl.constexpr = 119
+            p_scale_const = tl.full(
+                [REP_N, REP_M, 32, 4, 4], P_FIXED_E8M0, dtype=tl.uint8)
+            tlx.local_store(p_scale_smem[0], p_scale_const)
+
             blk_idx = 0
             for _i in range(tiles_per_sm):
                 _, persistent_tmem_phase = get_bufidx_phase(_i, NUM_BUFFERS_TMEM)
@@ -2064,7 +2067,7 @@ def _attn_bwd_mxf8_ws(
                         dq = tlx.local_load(dq_slice)
                         if slice_id == (DQ_REDUCE_ITERS - 1):
                             tlx.barrier_arrive(dq_empties[0])
-                        dq = dq * LN2
+                        dq = dq * sm_scale
                         tlx.async_descriptor_store_wait(DQ_REDUCE_STAGES - 1)
                         tlx.local_store(
                             dq_store_buf[dq_smem_idx],

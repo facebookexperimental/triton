@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 import triton.language.core as tl
 from triton._C.libtriton import ir
 from triton.language.core import _aggregate as aggregate
+from triton.runtime.jit import constexpr_function
 
 
 class layout_encoding:
@@ -23,12 +24,8 @@ class shared_layout_encoding(layout_encoding):
 
     def __init__(self):
         super().__init__()
-        pass
 
-    """
-    Create a new layout object that is a permutation of the current layout.
-    """
-
+    # Create a new layout object that is a permutation of the current layout.
     @abstractmethod
     def make_permute(self, dims):
         raise NotImplementedError(f"{self.__class__.__name__}.make_permute() must be overridden in subclasses")
@@ -60,10 +57,7 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
         self.numCTASplit = numCTASplit
         self.numCTAOrder = numCTAOrder
 
-    """
-    Make a default non-swizzled shared layout encoding.
-    """
-
+    # Make a default non-swizzled shared layout encoding.
     @classmethod
     def make_default(cls, rank):
         return cls(
@@ -77,10 +71,7 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
             numCTAOrder=list(reversed(range(rank))),
         )
 
-    """
-    Create a new layout that is a permutation of the given layout.
-    """
-
+    # Create a new layout that is a permutation of the given layout.
     def make_permute(self, dims):
         permuted_order = tuple(self.order[d] for d in dims)
         return swizzled_shared_layout_encoding(
@@ -100,6 +91,68 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
             self.perPhase,
             self.maxPhase,
             self.order,
+            self.numCTAsPerCGA,
+            self.numCTASplit,
+            self.numCTAOrder,
+        )
+
+
+class padded_shared_layout_encoding(shared_layout_encoding):
+    """Padded shared encoding with an identity offset map.
+
+    Mirrors ``ttg.padded_shared`` in the identity form:
+    ``padded_shared<[interval_0:+pad_0, ...] {order = ..., shape = ...}>``.
+    """
+
+    def __init__(self, intervals, paddings, order, shape, numCTAsPerCGA, numCTASplit, numCTAOrder):
+        super().__init__()
+        assert len(intervals) == len(paddings), \
+            "intervals and paddings must have the same length"
+        self.intervals = list(intervals)
+        self.paddings = list(paddings)
+        self.order = list(order)
+        self.shape = list(shape)
+        self.numCTAsPerCGA = list(numCTAsPerCGA)
+        self.numCTASplit = list(numCTASplit)
+        self.numCTAOrder = list(numCTAOrder)
+
+    @staticmethod
+    @constexpr_function
+    def with_identity_for(interval_padding_pairs, shape, order=None):
+        rank = len(shape)
+        if order is None:
+            order = list(reversed(range(rank)))
+        intervals = [int(p[0]) for p in interval_padding_pairs]
+        paddings = [int(p[1]) for p in interval_padding_pairs]
+        return padded_shared_layout_encoding(
+            intervals=intervals,
+            paddings=paddings,
+            order=list(order),
+            shape=list(shape),
+            numCTAsPerCGA=[1] * rank,
+            numCTASplit=[1] * rank,
+            numCTAOrder=list(range(rank)),
+        )
+
+    def make_permute(self, dims):
+        permuted_order = [self.order[d] for d in dims]
+        permuted_shape = [self.shape[d] for d in dims]
+        return padded_shared_layout_encoding(
+            intervals=self.intervals,
+            paddings=self.paddings,
+            order=permuted_order,
+            shape=permuted_shape,
+            numCTAsPerCGA=self.numCTAsPerCGA,
+            numCTASplit=self.numCTASplit,
+            numCTAOrder=self.numCTAOrder,
+        )
+
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_padded_shared_encoding_attr(
+            self.intervals,
+            self.paddings,
+            self.order,
+            [int(s) for s in self.shape],
             self.numCTAsPerCGA,
             self.numCTASplit,
             self.numCTAOrder,
@@ -193,10 +246,7 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
         self.fp4Padded = fp4Padded
         self.swizzled = swizzled
 
-    """
-    Make a default NVMMA shared layout encoding.
-    """
-
+    # Make a default NVMMA shared layout encoding.
     @classmethod
     def make_default(cls, shape, elemType, fp4Padded=False):
         rank = len(shape)
@@ -211,10 +261,7 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
             swizzled=True,
         )
 
-    """
-    Create a new layout that is a permutation of the given layout.
-    """
-
+    # Create a new layout that is a permutation of the given layout.
     def make_permute(self, dims):
         permuted_order = tuple(self.order[d] for d in dims)
         return nv_mma_shared_layout_encoding(

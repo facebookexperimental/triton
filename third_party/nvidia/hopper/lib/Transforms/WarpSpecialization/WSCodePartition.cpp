@@ -884,7 +884,8 @@ getTaskTopRegion(triton::FuncOp funcOp,
 
 // Create an allocation to hold the mbarriers.
 static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance,
-                                StringRef srcName = "") {
+                                StringRef srcName = "",
+                                unsigned arriveCount = 1) {
   OpBuilder builder(funcOp);
   builder.setInsertionPointToStart(&(funcOp.getBody().front()));
   Attribute sharedMemorySpace =
@@ -910,7 +911,8 @@ static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance,
     Value idx = arith::ConstantIntOp::create(builder, loc, i, 32);
     Value barrierView = ttg::MemDescIndexOp::create(
         builder, loc, singleBarrierMemDescType, barrierAlloc, idx);
-    ttng::InitBarrierOp::create(builder, funcOp->getLoc(), barrierView, 1);
+    ttng::InitBarrierOp::create(builder, funcOp->getLoc(), barrierView,
+                                arriveCount);
   }
   return barrierAlloc;
 }
@@ -3362,8 +3364,13 @@ void insertAsyncComm(
             builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
                 mmaOp->getLoc(), indexedBarrier, /*pred=*/Value(),
                 /*descs=*/ValueRange{});
+            // Clear loop schedule info after commit creation so subsequent
+            // ops don't inherit stale scheduling metadata from the commit.
+            // Note: intentionally inside if(!replaced) — when replaced=true,
+            // the commit was handled by the reuse-group path which manages
+            // its own schedule info. (From D97387127.)
+            builder.clearLoopScheduleInfo();
           }
-          builder.clearLoopScheduleInfo();
         }
         // Still call desyncTCGen5MMAOp to handle the consumer.
         auto waitConstraints =

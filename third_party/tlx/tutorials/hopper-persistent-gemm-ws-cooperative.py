@@ -1,10 +1,11 @@
+from typing import Optional
+
 import pytest
 import torch
 
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-from typing import Optional
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -21,7 +22,7 @@ def is_hip_cdna2():
     return target.backend == 'hip' and target.arch == 'gfx90a'
 
 
-def alloc_fn(size: int, align: int, stream: Optional[int]):
+def alloc_fn(size: int, align: int, stream: Optional[int]) -> torch.Tensor:
     assert align == 128
     assert stream == 0
     return torch.empty(size, dtype=torch.int8, device=DEVICE)
@@ -35,8 +36,7 @@ def matmul_tma_set_block_size_hook(nargs):
     BLOCK_M_SPLIT = BLOCK_M // NUM_MMA_GROUPS
     nargs["a_desc"].block_shape = [BLOCK_M_SPLIT, BLOCK_K]
     nargs["b_desc"].block_shape = [BLOCK_K, BLOCK_N]
-    EPILOGUE_SUBTILE = nargs.get("EPILOGUE_SUBTILE", False)
-    if EPILOGUE_SUBTILE:
+    if nargs.get("EPILOGUE_SUBTILE", False):
         nargs["c_desc"].block_shape = [BLOCK_M_SPLIT, BLOCK_N // 2]
     else:
         nargs["c_desc"].block_shape = [BLOCK_M_SPLIT, BLOCK_N]
@@ -44,13 +44,19 @@ def matmul_tma_set_block_size_hook(nargs):
 
 def matmul_get_configs():
     return [
-        triton.Config({'BM': BM, 'BN': BN, "BK": BK, "GROUP_SIZE_M": 8, "NUM_STAGES": num_stage,
+        triton.Config(
+            {
+                "BM": BM,
+                "BN": BN,
+                "BK": BK,
+                "GROUP_SIZE_M": 8,
+                "NUM_STAGES": num_stage,
                 "NUM_MMA_WARPS": 8,
                 "NUM_MMA_GROUPS": 2,
-                "EPILOGUE_SUBTILE": True,},
-                      num_stages=1, num_warps=4, pre_hook=matmul_tma_set_block_size_hook) \
-        for BM, BN in [(128, 256), (256, 128)] \
-        for BK in [64] \
+                "EPILOGUE_SUBTILE": True,
+            }, num_stages=1, num_warps=4, pre_hook=matmul_tma_set_block_size_hook)
+        for BM, BN in [(128, 256), (256, 128)]
+        for BK in [64]
         for num_stage in [3, 4]
     ]
 

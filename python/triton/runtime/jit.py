@@ -406,8 +406,10 @@ class KernelInterface(Generic[T]):
             proxy = cache.get(grid_key)
             if proxy is None:
                 grid_tuple = grid_key
+                extra_kwargs = getattr(self, '_fc_meta_kwargs', None)
                 proxy = native_create_jit_proxy(self, grid_tuple, self.params, self._fc_options_hash,
-                                                driver.active.get_current_stream, driver.active.get_current_device)
+                                                driver.active.get_current_stream, driver.active.get_current_device,
+                                                extra_kwargs)
                 if proxy is not None:
                     cache[grid_key] = proxy
             if proxy is not None:
@@ -966,7 +968,8 @@ class JITFunction(JITCallable, KernelInterface[T]):
                 # Pad missing trailing args (same as lookup path)
                 if len(_ins_args) < len(self.params):
                     _ins_args = tuple(list(_ins_args) + [None] * (len(self.params) - len(_ins_args)))
-                native_fast_dispatch_insert(self, _ins_args, self.params, _ins_hash, kernel, _disp)
+                native_fast_dispatch_insert(self, _ins_args, self.params, _ins_hash, kernel, _disp,
+                                            getattr(kernel, '_dispatch_arg_indices', None))
         return kernel
 
     def repr(self, _):

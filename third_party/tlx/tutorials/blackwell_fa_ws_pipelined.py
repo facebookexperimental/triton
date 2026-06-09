@@ -15,7 +15,6 @@ def _host_descriptor_pre_hook(nargs):
     HEAD_DIM = nargs["HEAD_DIM"]
     if not isinstance(nargs["desc_q"], TensorDescriptor):
         return
-    HEAD_DIM = nargs["HEAD_DIM"]
     NUM_MMA_GROUPS = nargs["NUM_MMA_GROUPS"]
     BLOCK_M_SPLIT = BLOCK_M // NUM_MMA_GROUPS
     nargs["desc_q"].block_shape = [BLOCK_M_SPLIT, HEAD_DIM]
@@ -98,7 +97,7 @@ def _apply_causal_mask(qk, col_limit_right, HEAD_DIM: tl.constexpr):
     # Credit to Tri Dao,
     # https://github.com/Dao-AILab/flash-attention/commit/bac1001e4f6caa09d70537495d6746a685a2fa78
     #
-    # NOTE: We use map_elementiwse here in order to generate an interleaved sequence of instructions
+    # NOTE: We use map_elementwise here in order to generate an interleaved sequence of instructions
     # that processes one element of qk at a time. This improves ptxas's resulting SASS.
     offs_n = tl.arange(0, HEAD_DIM)[None, :]
     s = offs_n & ~0xF
@@ -283,7 +282,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                 # epilogue
                 tlx.barrier_wait(l_fulls[cid], 0)
                 # Use l[1]/l[1+HEAD_DIM * NUM_BUFFERS_QK] and m[2][2 + HEAD_DIM * NUM_BUFFERS_QK]
-                # to disambigulate from alpha[0]/alpha[HEAD_DIM * NUM_BUFFERS_QK]
+                # to disambiguate from alpha[0]/alpha[HEAD_DIM * NUM_BUFFERS_QK]
                 l = tlx.local_load(l_tiles[cid * HEAD_DIM * NUM_BUFFERS_QK + 1])
                 m = tlx.local_load(m_tiles[cid * HEAD_DIM * NUM_BUFFERS_QK + 2])
                 m += tl.math.log2(l)
@@ -367,7 +366,7 @@ def _attn_fwd_ws(sm_scale, M,  #
 
             # prepare l_i for the epilog
             # Use l[1]/l[1+HEAD_DIM * NUM_BUFFERS_QK] and m[2][2 + HEAD_DIM * NUM_BUFFERS_QK]
-            # to disambigulate from alpha[0]/alpha[HEAD_DIM * NUM_BUFFERS_QK]
+            # to disambiguate from alpha[0]/alpha[HEAD_DIM * NUM_BUFFERS_QK]
             tlx.local_store(l_tiles[cid * HEAD_DIM * NUM_BUFFERS_QK + 1], l_i[:, None])
             tlx.local_store(m_tiles[cid * HEAD_DIM * NUM_BUFFERS_QK + 2], m_i[:, None])
             tlx.barrier_arrive(l_fulls[cid])

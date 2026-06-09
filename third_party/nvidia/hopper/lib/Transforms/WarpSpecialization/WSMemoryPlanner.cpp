@@ -227,6 +227,25 @@ static Channel *findChannelForOp(Operation *op,
   return TheCh;
 }
 
+/// Return the logical producer for a channel. For SMEM post channels created
+/// from a tensor value, the channel source is a local_store; use the value
+/// stored into SMEM so tie-breaking follows the original load/program order.
+static Operation *getLogicalProducerOp(Channel *ch) {
+  if (!ch)
+    return nullptr;
+
+  Operation *srcOp = ch->getSrcOp();
+  if (!srcOp)
+    return nullptr;
+
+  if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(srcOp)) {
+    if (Operation *defOp = storeOp.getSrc().getDefiningOp())
+      return defOp;
+  }
+
+  return srcOp;
+}
+
 /// Find the channel associated with a value's defining allocation operation.
 /// Convenience wrapper around findChannelForOp.
 /// @param value The value whose defining operation to find a channel for
@@ -799,6 +818,24 @@ struct WSBuffer {
       false; // Has dedicated SMEM; false = reuses another buffer.
 };
 
+static unsigned
+getWSBufferUsageOrder(const WSBuffer &buf, SmallVector<Channel *> &channels,
+                      const DenseMap<Operation *, unsigned> &opOrder) {
+  if (Channel *ch = findChannelForOp(buf.allocOp, channels)) {
+    if (Operation *producer = getLogicalProducerOp(ch)) {
+      auto it = opOrder.find(producer);
+      if (it != opOrder.end())
+        return it->second;
+    }
+  }
+
+  auto it = opOrder.find(buf.allocOp);
+  if (it != opOrder.end())
+    return it->second;
+
+  return std::numeric_limits<unsigned>::max();
+}
+
 /// Parsed channel annotation from tt.autows JSON on an MMA op.
 /// Format: "opndA,smem,2,0" → operand=opndA, memType=smem, numCopies=2,
 /// bufferId=0.
@@ -808,6 +845,14 @@ struct ChannelAnnotation {
   unsigned numCopies;
   unsigned bufferId;
 };
+
+static std::optional<unsigned> parseUnsignedAnnotationField(StringRef field) {
+  unsigned value = 0;
+  field = field.trim();
+  if (field.empty() || field.getAsInteger(10, value))
+    return std::nullopt;
+  return value;
+}
 
 /// Parse tt.autows channel annotations from all MMA ops in parentOp.
 /// Returns a map from (mmaOp, operandIdx) → ChannelAnnotation, where
@@ -847,8 +892,17 @@ parseChannelAnnotations(Operation *parentOp) {
       ChannelAnnotation ann;
       ann.operand = parts[0].str();
       ann.memType = parts[1].str();
-      ann.numCopies = std::stoi(parts[2].str());
-      ann.bufferId = std::stoi(parts[3].str());
+      std::optional<unsigned> numCopies =
+          parseUnsignedAnnotationField(parts[2]);
+      std::optional<unsigned> bufferId =
+          parseUnsignedAnnotationField(parts[3]);
+      if (!numCopies || !bufferId) {
+        LDBG("WARNING: invalid numeric field in channel annotation '" << *str
+                                                                      << "'");
+        continue;
+      }
+      ann.numCopies = *numCopies;
+      ann.bufferId = *bufferId;
 
       // Validate operand name.
       if (ann.operand != "opndA" && ann.operand != "opndB" &&
@@ -1430,6 +1484,11 @@ findReuseCandidate(WSBuffer &candidate, SmallVector<WSBuffer> &wsBuffers,
   bestOrder.linearOrder = INT_MAX;
 
   for (auto &buf : wsBuffers) {
+    if (&buf == &candidate) {
+      LDBG("  findReuseCandidate: target bufferId="
+           << buf.bufferId << " is the candidate itself — skip");
+      continue;
+    }
     if (!buf.isAllocated) {
       LDBG("  findReuseCandidate: target bufferId=" << buf.bufferId
                                                     << " not allocated — skip");
@@ -1559,6 +1618,11 @@ static unsigned allocateSmemBuffers(
 
   if (wsBuffers.empty())
     return nextBufferId;
+
+  DenseMap<Operation *, unsigned> opOrder;
+  unsigned nextOpOrder = 0;
+  funcOp->walk<WalkOrder::PreOrder>(
+      [&](Operation *op) { opOrder[op] = nextOpOrder++; });
 
   // Ensure nextBufferId is past all pinned SMEM IDs too.
   for (auto &buf : wsBuffers)
@@ -1701,6 +1765,14 @@ static unsigned allocateSmemBuffers(
     }
     if (candidateIndices.empty())
       continue;
+
+    llvm::stable_sort(candidateIndices, [&](unsigned a, unsigned b) {
+      unsigned orderA = getWSBufferUsageOrder(wsBuffers[a], channels, opOrder);
+      unsigned orderB = getWSBufferUsageOrder(wsBuffers[b], channels, opOrder);
+      if (orderA != orderB)
+        return orderA < orderB;
+      return a < b;
+    });
 
     LDBG("Phase 4: processing priority=" << static_cast<int>(priority)
                                          << " with " << candidateIndices.size()
@@ -3323,10 +3395,13 @@ struct BufferDecision {
   unsigned bufferId;
   unsigned bufferCopy;
   unsigned bufferOffset;
+  bool hasBufferOffset;
 
   bool operator==(const BufferDecision &other) const {
     return channelId == other.channelId && bufferId == other.bufferId &&
-           bufferCopy == other.bufferCopy && bufferOffset == other.bufferOffset;
+           bufferCopy == other.bufferCopy &&
+           bufferOffset == other.bufferOffset &&
+           hasBufferOffset == other.hasBufferOffset;
   }
 
   bool operator!=(const BufferDecision &other) const {
@@ -3369,6 +3444,7 @@ static BufferDecision extractBufferDecision(Channel *ch) {
   decision.bufferId = 0;
   decision.bufferCopy = 1;
   decision.bufferOffset = 0;
+  decision.hasBufferOffset = false;
 
   Operation *allocOp = ch->getAllocOp();
   if (!allocOp)
@@ -3378,8 +3454,10 @@ static BufferDecision extractBufferDecision(Channel *ch) {
     decision.bufferId = attr.getInt();
   if (auto attr = allocOp->getAttrOfType<IntegerAttr>("buffer.copy"))
     decision.bufferCopy = attr.getInt();
-  if (auto attr = allocOp->getAttrOfType<IntegerAttr>("buffer.offset"))
+  if (auto attr = allocOp->getAttrOfType<IntegerAttr>("buffer.offset")) {
     decision.bufferOffset = attr.getInt();
+    decision.hasBufferOffset = true;
+  }
 
   return decision;
 }
@@ -3395,8 +3473,12 @@ static void applyBufferDecision(Channel *ch, const BufferDecision &decision) {
   allocOp->setAttr("buffer.id", IntegerAttr::get(i32Type, decision.bufferId));
   allocOp->setAttr("buffer.copy",
                    IntegerAttr::get(i32Type, decision.bufferCopy));
-  allocOp->setAttr("buffer.offset",
-                   IntegerAttr::get(i32Type, decision.bufferOffset));
+  if (decision.hasBufferOffset) {
+    allocOp->setAttr("buffer.offset",
+                     IntegerAttr::get(i32Type, decision.bufferOffset));
+  } else {
+    allocOp->removeAttr("buffer.offset");
+  }
 }
 
 BufferDecisionList serializeBufferDecisions(SmallVector<Channel *> &channels) {
@@ -3445,11 +3527,12 @@ std::string serializeBufferDecisionsToString(const BufferDecisionList &list) {
     obj["bufferId"] = static_cast<int64_t>(decision.bufferId);
     obj["bufferCopy"] = static_cast<int64_t>(decision.bufferCopy);
     obj["bufferOffset"] = static_cast<int64_t>(decision.bufferOffset);
+    obj["hasBufferOffset"] = decision.hasBufferOffset;
     decisionsArray.push_back(std::move(obj));
   }
 
   llvm::json::Object root;
-  root["version"] = 1;
+  root["version"] = 2;
   root["decisions"] = std::move(decisionsArray);
 
   std::string result;
@@ -3473,7 +3556,7 @@ deserializeBufferDecisionsFromString(StringRef jsonStr) {
   }
 
   auto version = root->getInteger("version");
-  if (!version || *version != 1) {
+  if (!version || (*version != 1 && *version != 2)) {
     LDBG("Unsupported version: " << (version ? *version : -1));
     return std::nullopt;
   }
@@ -3503,10 +3586,21 @@ deserializeBufferDecisionsFromString(StringRef jsonStr) {
       return std::nullopt;
     }
 
+    bool hasRecordedBufferOffset = true;
+    if (*version == 2) {
+      auto hasBufferOffset = obj->getBoolean("hasBufferOffset");
+      if (!hasBufferOffset) {
+        LDBG("Missing required field in decision");
+        return std::nullopt;
+      }
+      hasRecordedBufferOffset = *hasBufferOffset;
+    }
+
     decision.channelId = static_cast<unsigned>(*channelId);
     decision.bufferId = static_cast<unsigned>(*bufferId);
     decision.bufferCopy = static_cast<unsigned>(*bufferCopy);
     decision.bufferOffset = static_cast<unsigned>(*bufferOffset);
+    decision.hasBufferOffset = hasRecordedBufferOffset;
     result.decisions.push_back(decision);
   }
 

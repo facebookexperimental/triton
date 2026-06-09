@@ -211,15 +211,20 @@ static const TTGIRToTLXMapping opMappings[] = {
     // Binary arith ops (add, sub, mul, div, rem, xor, and, or) are handled
     // as infix operators (a + b, a * b, etc.) in printSimplifiedOp.
     {"arith.constant", "const", "Constant value"},
-    {"arith.select", "select", "Select operation"},
+    {"arith.select", "tl.where", "Select operation"},
     {"arith.maxf", "tl.maximum", "Float max"},
     {"arith.maxnumf", "tl.maximum", "Float max (NaN-propagating)"},
     {"arith.minf", "tl.minimum", "Float min"},
     {"arith.minnumf", "tl.minimum", "Float min (NaN-propagating)"},
-    {"arith.maxsi", "tl.max", "Signed integer max"},
-    {"arith.maxui", "tl.max", "Unsigned integer max"},
-    {"arith.minsi", "tl.min", "Signed integer min"},
-    {"arith.minui", "tl.min", "Unsigned integer min"},
+    // Elementwise binary min/max. NOTE: tl.min/tl.max are reductions, so
+    // they are not used here. Use tl.minimum/maximum similar to float above.
+    {"arith.maxsi", "tl.maximum", "Signed integer max"},
+    {"arith.maxui", "tl.maximum", "Unsigned integer max"},
+    {"arith.minsi", "tl.minimum", "Signed integer min"},
+    {"arith.minui", "tl.minimum", "Unsigned integer min"},
+    // Ceiling division: tl.cdiv(a, b) == (a + b - 1) // b.
+    {"arith.ceildivsi", "tl.cdiv", "Signed integer ceil-division"},
+    {"arith.ceildivui", "tl.cdiv", "Unsigned integer ceil-division"},
 
     // Triton operations
     {"tt.splat", "tl.splat", "Splat scalar to tensor"},
@@ -238,6 +243,7 @@ static const TTGIRToTLXMapping opMappings[] = {
     {"tt.split", "tl.split", "Split tensor"},
     {"tt.get_program_id", "tl.program_id", "Get program ID"},
     {"tt.get_num_programs", "tl.num_programs", "Get number of programs"},
+    {"tt.map_elementwise", "tl.map_elementwise", "Map elementwise operation"},
     {"tt.return", "return", "Return from function"},
 
     // Math dialect operations
@@ -484,9 +490,17 @@ getValueName(Value v,
               os << intAttr.getValue();
             }
           } else if (auto floatAttr = dyn_cast<FloatAttr>(valueAttr)) {
-            SmallString<16> str;
-            floatAttr.getValue().toString(str);
-            os << str;
+            auto apFloat = floatAttr.getValue();
+            if (apFloat.isInfinity()) {
+              if (apFloat.isNegative())
+                os << "-float(\"inf\")";
+              else
+                os << "float(\"inf\")";
+            } else {
+              SmallString<16> str;
+              apFloat.toString(str);
+              os << str;
+            }
           } else {
             // Fall through to normal name handling for unsupported constant
             // types
@@ -530,14 +544,22 @@ void printConstantValue(Attribute attr, llvm::raw_ostream &os) {
   if (auto intAttr = dyn_cast<IntegerAttr>(attr)) {
     // Special handling for i1 (boolean) type
     if (intAttr.getType().isInteger(1)) {
-      os << (intAttr.getValue().getBoolValue() ? "true" : "false");
+      os << (intAttr.getValue().getBoolValue() ? "True" : "False");
     } else {
       os << intAttr.getValue();
     }
   } else if (auto floatAttr = dyn_cast<FloatAttr>(attr)) {
-    SmallString<16> str;
-    floatAttr.getValue().toString(str);
-    os << str;
+    auto apFloat = floatAttr.getValue();
+    if (apFloat.isInfinity()) {
+      if (apFloat.isNegative())
+        os << "-float('inf')";
+      else
+        os << "float('inf')";
+    } else {
+      SmallString<16> str;
+      apFloat.toString(str);
+      os << str;
+    }
   } else if (auto denseAttr = dyn_cast<DenseElementsAttr>(attr)) {
     // For dense tensors, print as tl.full() for splats
     if (denseAttr.isSplat()) {
@@ -582,7 +604,7 @@ void printConstantValue(Attribute attr, llvm::raw_ostream &os) {
       os << "dense<...>";
     }
   } else if (auto boolAttr = dyn_cast<BoolAttr>(attr)) {
-    os << (boolAttr.getValue() ? "true" : "false");
+    os << (boolAttr.getValue() ? "True" : "False");
   } else {
     // Fallback for other types
     os << "const";
@@ -701,9 +723,10 @@ LocalAllocInfo analyzeLocalAlloc(Operation *localAllocOp) {
 
 // Check if an operation should be skipped because it's folded into
 // a barrier alloc or not meaningful in TLX output
-bool shouldSkipOp(Operation *op,
-                  const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
-                  llvm::DenseSet<Operation *> &skippedOps) {
+bool shouldSkipOp(
+    Operation *op,
+    const DenseMap<Operation *, LocalAllocInfo> & /*allocInfoMap*/,
+    llvm::DenseSet<Operation *> &skippedOps) {
   StringRef opName = op->getName().getStringRef();
 
   // Operations to skip in TLX output:
@@ -717,19 +740,35 @@ bool shouldSkipOp(Operation *op,
   // - tt.return: function terminator
   // - tt.reduce.return: internal to reduce operation
   static const llvm::StringSet<> opsToSkip = {
-      "ttng.init_barrier",  "ttg.warp_return",
-      "ttg.warp_yield",     "ttg.warp_specialize.partitions",
-      "gpu.barrier",        "arith.constant",
-      "ttg.convert_layout", "tt.return",
-      "tt.reduce.return",   "arith.extui",
-      "arith.extsi",        "arith.extf",
-      "arith.trunci",       "arith.truncf",
-      "arith.sitofp",       "arith.uitofp",
-      "arith.fptosi",       "arith.fptoui",
-      "arith.bitcast",      "arith.index_cast",
-      "arith.index_castui", "ttng.inval_barrier",
-      "tt.splat",           "tt.broadcast",
+      "ttng.init_barrier",
+      "ttg.warp_return",
+      "ttg.warp_yield",
+      "ttg.warp_specialize.partitions",
+      "gpu.barrier",
+      // SMEM/TMEM lifetime-scoped in TLX, so explicit ttg.local_dealloc
+      "ttg.local_dealloc",
+      "arith.constant",
+      "ttg.convert_layout",
+      "tt.return",
+      "tt.reduce.return",
+      "arith.extui",
+      "arith.extsi",
+      "arith.extf",
+      "arith.trunci",
+      "arith.truncf",
+      "arith.sitofp",
+      "arith.uitofp",
+      "arith.fptosi",
+      "arith.fptoui",
+      "arith.bitcast",
+      "arith.index_cast",
+      "arith.index_castui",
+      "ttng.inval_barrier",
+      "tt.splat",
+      "tt.broadcast",
       "ttg.memdesc_index",
+      "tt.map_elementwise.return",
+      "ttng.tcgen5_global_alloc",
   };
   if (opsToSkip.contains(opName)) {
     // Don't skip arith.constant with DenseElementsAttr (tensor splat constants)
@@ -741,36 +780,6 @@ bool shouldSkipOp(Operation *op,
       }
     }
     return true;
-  }
-
-  // Skip memdesc_index that are only used by init_barrier for barrier allocs
-  if (opName == "ttg.memdesc_index") {
-    // Check if operand comes from a barrier alloc
-    if (op->getNumOperands() > 0) {
-      Value src = op->getOperand(0);
-      if (Operation *srcOp = src.getDefiningOp()) {
-        if (srcOp->getName().getStringRef() == "ttg.local_alloc") {
-          auto it = allocInfoMap.find(srcOp);
-          if (it != allocInfoMap.end() && it->second.isBarrierAlloc) {
-            // Check if all uses of this memdesc_index are init_barrier
-            bool allUsesAreInitBarrier = true;
-            for (Value result : op->getResults()) {
-              for (Operation *user : result.getUsers()) {
-                if (user->getName().getStringRef() != "ttng.init_barrier") {
-                  allUsesAreInitBarrier = false;
-                  break;
-                }
-              }
-              if (!allUsesAreInitBarrier)
-                break;
-            }
-            if (allUsesAreInitBarrier) {
-              return true;
-            }
-          }
-        }
-      }
-    }
   }
 
   return skippedOps.count(op) > 0;
@@ -937,8 +946,18 @@ void printForOp(Operation *op, llvm::raw_ostream &os,
   SmallVector<Value> yieldTargets;
   for (unsigned i = 0; i < numIterArgs; ++i)
     yieldTargets.push_back(entryBlock.getArgument(1 + i));
-  printRegion(bodyRegion, os, opNameMap, allocInfoMap, skippedOps, indent + 1,
-              argSubstitutionMap, yieldTargets);
+  std::string bodyStr;
+  llvm::raw_string_ostream bodyOs(bodyStr);
+  printRegion(bodyRegion, bodyOs, opNameMap, allocInfoMap, skippedOps,
+              indent + 1, argSubstitutionMap, yieldTargets);
+  bodyOs.flush();
+  if (bodyStr.empty()) {
+    for (unsigned i = 0; i < indent + 1; ++i)
+      os << "  ";
+    os << "pass\n";
+  } else {
+    os << bodyStr;
+  }
 }
 
 // Print scf.if with yield-to-assignment conversion
@@ -965,19 +984,34 @@ void printIfOp(Operation *op, llvm::raw_ostream &os,
     os << "  ";
   os << "if " << getValueName(condition, argSubstitutionMap) << ":\n";
 
-  // Print then region with yield targets
+  std::string thenStr;
+  llvm::raw_string_ostream thenOs(thenStr);
   if (op->getNumRegions() > 0) {
-    printRegion(op->getRegion(0), os, opNameMap, allocInfoMap, skippedOps,
+    printRegion(op->getRegion(0), thenOs, opNameMap, allocInfoMap, skippedOps,
                 indent + 1, argSubstitutionMap, ifResults);
+  }
+  thenOs.flush();
+  if (thenStr.empty()) {
+    for (unsigned i = 0; i < indent + 1; ++i)
+      os << "  ";
+    os << "pass\n";
+  } else {
+    os << thenStr;
   }
 
   // Print else region if it exists and is non-empty
   if (op->getNumRegions() > 1 && !op->getRegion(1).empty()) {
-    for (unsigned i = 0; i < indent; ++i)
-      os << "  ";
-    os << "else:\n";
-    printRegion(op->getRegion(1), os, opNameMap, allocInfoMap, skippedOps,
+    std::string elseStr;
+    llvm::raw_string_ostream elseOs(elseStr);
+    printRegion(op->getRegion(1), elseOs, opNameMap, allocInfoMap, skippedOps,
                 indent + 1, argSubstitutionMap, ifResults);
+    elseOs.flush();
+    if (!elseStr.empty()) {
+      for (unsigned i = 0; i < indent; ++i)
+        os << "  ";
+      os << "else:\n";
+      os << elseStr;
+    }
   }
 }
 
@@ -1272,6 +1306,18 @@ void printSimplifiedOp(
     if (auto axisAttr = op->getAttrOfType<IntegerAttr>("axis"))
       axis = axisAttr.getInt();
     os << "tl.program_id(axis=" << axis << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // tt.get_num_programs: emit tl.num_programs(axis=N)
+  if (opName == "tt.get_num_programs") {
+    if (op->getNumResults() > 0)
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+    int axis = 0;
+    if (auto axisAttr = op->getAttrOfType<IntegerAttr>("axis"))
+      axis = axisAttr.getInt();
+    os << "tl.num_programs(axis=" << axis << ")";
     printLocComment(op, os);
     return;
   }
@@ -1836,17 +1882,28 @@ void printBlock(Block &block, llvm::raw_ostream &os,
     if (op.getNumRegions() > 0) {
       printSimplifiedOp(&op, os, opNameMap, allocInfoMap, indent,
                         argSubstitutionMap);
-      // Print indentation and opening brace
-      for (unsigned i = 0; i < indent; ++i)
-        os << "  ";
-      os << "{\n";
+      // Print region body as # comments (valid Python syntax)
       for (Region &region : op.getRegions()) {
-        printRegion(region, os, opNameMap, allocInfoMap, skippedOps, indent + 1,
-                    argSubstitutionMap);
+        for (Block &bodyBlock : region) {
+          for (Operation &bodyOp : bodyBlock) {
+            if (shouldSkipOp(&bodyOp, allocInfoMap, skippedOps))
+              continue;
+            std::string line;
+            llvm::raw_string_ostream lineOs(line);
+            printSimplifiedOp(&bodyOp, lineOs, opNameMap, allocInfoMap, 0,
+                              argSubstitutionMap);
+            lineOs.flush();
+            // Strip trailing newline and print as comment
+            while (!line.empty() && (line.back() == '\n' || line.back() == ' '))
+              line.pop_back();
+            if (!line.empty()) {
+              for (unsigned i = 0; i < indent; ++i)
+                os << "  ";
+              os << "  # " << line << "\n";
+            }
+          }
+        }
       }
-      for (unsigned i = 0; i < indent; ++i)
-        os << "  ";
-      os << "}\n";
     } else {
       printSimplifiedOp(&op, os, opNameMap, allocInfoMap, indent,
                         argSubstitutionMap);
@@ -1973,16 +2030,26 @@ void printBlockOps(Block &block, llvm::raw_ostream &os,
     if (op.getNumRegions() > 0) {
       printSimplifiedOp(&op, os, opNameMap, allocInfoMap, indent,
                         argSubstitutionMap);
-      for (unsigned i = 0; i < indent; ++i)
-        os << "  ";
-      os << "{\n";
       for (Region &region : op.getRegions()) {
-        printRegion(region, os, opNameMap, allocInfoMap, skippedOps, indent + 1,
-                    argSubstitutionMap);
+        for (Block &bodyBlock : region) {
+          for (Operation &bodyOp : bodyBlock) {
+            if (shouldSkipOp(&bodyOp, allocInfoMap, skippedOps))
+              continue;
+            std::string line;
+            llvm::raw_string_ostream lineOs(line);
+            printSimplifiedOp(&bodyOp, lineOs, opNameMap, allocInfoMap, 0,
+                              argSubstitutionMap);
+            lineOs.flush();
+            while (!line.empty() && (line.back() == '\n' || line.back() == ' '))
+              line.pop_back();
+            if (!line.empty()) {
+              for (unsigned i = 0; i < indent; ++i)
+                os << "  ";
+              os << "  # " << line << "\n";
+            }
+          }
+        }
       }
-      for (unsigned i = 0; i < indent; ++i)
-        os << "  ";
-      os << "}\n";
     } else {
       printSimplifiedOp(&op, os, opNameMap, allocInfoMap, indent,
                         argSubstitutionMap);
@@ -2340,27 +2407,47 @@ void printCFBlocks(Block *startBlock, Block *stopBlock, llvm::raw_ostream &os,
         os << "  ";
       os << "if " << condExpr << ":\n";
 
-      // Print true-dest arg assignments
-      printBlockArgAssignments(trueDest, condBr.getTrueDestOperands(), os,
-                               indent + 1, argSubstitutionMap);
+      auto isBlank = [](StringRef s) {
+        return s.find_first_not_of(" \t\r\n") == StringRef::npos;
+      };
 
-      if (trueDest != mergeBlock) {
-        printCFBlocks(trueDest, mergeBlock, os, opNameMap, allocInfoMap,
-                      skippedOps, indent + 1, argSubstitutionMap, visitedBlocks,
-                      forLoopHeaders);
-      }
-
-      // Print else branch if it's not the merge block or has operands
-      if (falseDest != mergeBlock || condBr.getFalseDestOperands().size() > 0) {
-        for (unsigned i = 0; i < indent; ++i)
-          os << "  ";
-        os << "else:\n";
-        printBlockArgAssignments(falseDest, condBr.getFalseDestOperands(), os,
+      std::string trueStr;
+      {
+        llvm::raw_string_ostream trueOs(trueStr);
+        printBlockArgAssignments(trueDest, condBr.getTrueDestOperands(), trueOs,
                                  indent + 1, argSubstitutionMap);
-        if (falseDest != mergeBlock) {
-          printCFBlocks(falseDest, mergeBlock, os, opNameMap, allocInfoMap,
+        if (trueDest != mergeBlock) {
+          printCFBlocks(trueDest, mergeBlock, trueOs, opNameMap, allocInfoMap,
                         skippedOps, indent + 1, argSubstitutionMap,
                         visitedBlocks, forLoopHeaders);
+        }
+      }
+      if (isBlank(trueStr)) {
+        for (unsigned i = 0; i < indent + 1; ++i)
+          os << "  ";
+        os << "pass\n";
+      } else {
+        os << trueStr;
+      }
+
+      // Print else branch only if it has real content.
+      if (falseDest != mergeBlock || condBr.getFalseDestOperands().size() > 0) {
+        std::string elseStr;
+        {
+          llvm::raw_string_ostream elseOs(elseStr);
+          printBlockArgAssignments(falseDest, condBr.getFalseDestOperands(),
+                                   elseOs, indent + 1, argSubstitutionMap);
+          if (falseDest != mergeBlock) {
+            printCFBlocks(falseDest, mergeBlock, elseOs, opNameMap,
+                          allocInfoMap, skippedOps, indent + 1,
+                          argSubstitutionMap, visitedBlocks, forLoopHeaders);
+          }
+        }
+        if (!isBlank(elseStr)) {
+          for (unsigned i = 0; i < indent; ++i)
+            os << "  ";
+          os << "else:\n";
+          os << elseStr;
         }
       }
 

@@ -68,6 +68,21 @@ inline bool getModuleTwoCTAs(Operation *op) {
   return getModuleTwoCTAs(op->getParentOfType<ModuleOp>());
 }
 
+/// Check if any cluster dimension >= 2 (2-CTA mode).
+inline bool is2CTA(ModuleOp mod) {
+  for (auto name :
+       {"ttg.cluster-dim-x", "ttg.cluster-dim-y", "ttg.cluster-dim-z"}) {
+    if (auto attr = mod->getAttrOfType<IntegerAttr>(name))
+      if (attr.getInt() >= 2)
+        return true;
+  }
+  return false;
+}
+
+inline bool is2CTA(Operation *op) {
+  return is2CTA(op->getParentOfType<ModuleOp>());
+}
+
 struct TensorMemory : public SideEffects::Resource::Base<TensorMemory> {
   StringRef getName() final { return "<TensorMemory>"; }
 };

@@ -35,6 +35,13 @@ elementwise users. This keeps broadcasts and their value materialization, such
 as a descriptor load followed by an extend, associated with their use after
 other operands, such as TMEM loads, have been prepared.
 
+## Register Budgets
+
+`minRegAutoWS` and `maxRegAutoWS` control the per-thread register budgets used
+when AutoWS assigns registers to non-tensor and tensor partitions. If either
+knob is provided from the Python frontend, its value must be divisible by 8 so
+the emitted register allocation matches the backend warp-group granularity.
+
 ## File Map
 
 | File | Function / Pass | Description |

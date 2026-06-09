@@ -15,6 +15,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Conversion/TritonGPUToLLVM/WarpSpecializeUtility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
 namespace mlir::triton {
 #define GEN_PASS_DEF_CONVERTWARPSPECIALIZETOLLVM
@@ -67,6 +68,9 @@ static void createRegRealloc(TritonLLVMIRRewriter &b, int curRegs,
                              int adjRegs) {
   curRegs = std::min(256, curRegs);
   adjRegs = std::min(256, adjRegs);
+  // Round to a multiple of 8 (hardware requirement).
+  adjRegs = adjRegs / 8 * 8;
+  curRegs = curRegs / 8 * 8;
   // Skip if no change is needed - generating inc/dec with same value is wrong
   if (curRegs == adjRegs)
     return;

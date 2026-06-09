@@ -592,7 +592,7 @@ CLC (Cluster Launch Control) is a Blackwell-specific feature **[Blackwell]** tha
     - `phase`: Current barrier phase (0 or 1, alternates each iteration)
     - `multi_ctas`: Set to `True` for 2-CTA mode (cluster of 2 CTAs). When enabled, `pred_cta0` is computed internally from `cluster_cta_rank()`.
 
-- `tile_id = tlx.clc_consumer(context, p_consumer=phase, multi_ctas=False)` **[Blackwell]**
+- `tile_id = tlx.clc_consumer(context, p_consumer=phase, multi_ctas=False, k=0, return_3d=False)` **[Blackwell]**
 
     Decode the tile ID from a CLC response and signal completion.
 
@@ -600,8 +600,9 @@ CLC (Cluster Launch Control) is a Blackwell-specific feature **[Blackwell]** tha
     - `context`: CLC pipeline context from `clc_create_context`
     - `phase`: Current barrier phase
     - `multi_ctas`: Set to `True` for 2-CTA mode. When enabled, `pred_cta0` is computed internally.
+    - `return_3d`: Set to `True` to return `(ctaIdX, ctaIdY, ctaIdZ)` tuple instead of scalar tile_id.
 
-    **Returns:** The tile ID (already offset by `cluster_cta_rank()` for unique tile assignments), or -1 if no work available.
+    **Returns:** The tile ID (already offset by `cluster_cta_rank()` for unique tile assignments), or -1 if no work available. With `return_3d=True`, returns `(ctaIdX, ctaIdY, ctaIdZ)` tuple.
 
 #### How CLC Works
 
@@ -743,7 +744,7 @@ Examples: how mbarriers are communicated in warp specialization
 |-----------|-------------|
 | `"default"` | First positional argument to mark this as the default/trunk task |
 | `num_warps` | Number of warps to reserve for this task |
-| `num_regs` | Number of registers per thread (optional, for register allocation tuning) |
+| `num_regs` | Number of registers per thread (optional, for register allocation tuning). When provided, it must be divisible by 8. |
 | `replicate` | Number of replicas for this task (default: 1). Creates multiple copies of the task region |
 | `warp_group_start_id` | Starting warp ID for this task (optional). Allows explicit control over warp assignment |
 

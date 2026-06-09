@@ -57,18 +57,18 @@ def matmul_kernel_pipelined_hopper(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stri
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    # offset computation
+    # Compute tile offsets.
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
-    # allocate NUM_STAGES buffers
+    # Allocate NUM_STAGES buffers.
     buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tlx.dtype_of(a_ptr), NUM_STAGES)
     buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tlx.dtype_of(b_ptr), NUM_STAGES)
 
-    # prefetch (pipelining) for NUM_STAGES - 1 buffers
+    # Prefetch NUM_STAGES - 1 buffers for the pipeline.
     for i in tl.range(0, NUM_STAGES - 1, loop_unroll_factor=NUM_STAGES - 1):
         a = tlx.local_view(buffers_A, i)
         b = tlx.local_view(buffers_B, i)
@@ -82,24 +82,24 @@ def matmul_kernel_pipelined_hopper(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stri
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     # Disable auto-pipelining with num_stages=0
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=0):
-        # identify the buffer index for the current iteration
+        # Select the buffer for the current iteration.
         buf = k % NUM_STAGES
         a_k = tlx.local_view(buffers_A, buf)
         b_k = tlx.local_view(buffers_B, buf)
 
-        # wait for buffers to be ready
+        # Wait for buffers to be ready.
         tlx.async_load_wait_group(NUM_STAGES - 2)
 
-        # do the mma
+        # Run MMA.
         acc = tlx.async_dot(a_k, b_k, acc)
 
-        # prefetch for i-th iteration, i.e, NUM_STAGES - 1 ahead
+        # Prefetch the iteration NUM_STAGES - 1 blocks ahead.
         i = k + NUM_STAGES - 1
         a_next = tlx.local_view(buffers_A, i % NUM_STAGES)
         b_next = tlx.local_view(buffers_B, i % NUM_STAGES)
-        # wait for the previous MMA using this buffer to complete
+        # Wait for the previous MMA using this buffer to complete.
         acc = tlx.async_dot_wait(1, acc)
-        # prefetch
+        # Prefetch.
         token_a = tlx.async_load(a_ptrs, a_next, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K)
         token_b = tlx.async_load(b_ptrs, b_next, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K)
         tlx.async_load_commit_group([token_a, token_b])
@@ -107,7 +107,7 @@ def matmul_kernel_pipelined_hopper(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stri
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
-    # wait for last mma to complete
+    # Wait for the last MMA to complete.
     acc = tlx.async_dot_wait(0, acc)
     c = acc.to(tlx.dtype_of(c_ptr))
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -124,7 +124,7 @@ def matmul(a, b, config=None):
     assert a.is_contiguous(), "Matrix A must be contiguous"
     M, K = a.shape
     K, N = b.shape
-    # Allocates output.
+    # Allocate output.
     c = torch.empty((M, N), device=a.device, dtype=torch.float16)
 
     if config is not None:

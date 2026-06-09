@@ -1,6 +1,11 @@
 from triton.language import core
 
 
+def _validate_num_regs(num_regs):
+    if num_regs is not None and num_regs % 8 != 0:
+        raise ValueError(f"num_regs must be divisible by 8, got {num_regs}")
+
+
 class async_task:
     """
     Context manager to run code fragments asynchronously.
@@ -8,7 +13,7 @@ class async_task:
 
     def __init__(self, *args, _builder=None, **kwargs):
         self.builder = _builder
-        # Handle the optional positional argument like [0]
+        # Handle either an explicit default task or a task id list.
         self.is_default = False
         self.is_explict = False
         self.task_ids = None
@@ -31,6 +36,7 @@ class async_task:
             self.is_explict = True
             self.num_warps = core._unwrap_if_constexpr(kwargs.get("num_warps", None))
             self.num_regs = core._unwrap_if_constexpr(kwargs.get("num_regs", kwargs.get("registers", None)))
+            _validate_num_regs(self.num_regs)
             self.replicate = core._unwrap_if_constexpr(kwargs.get("replicate", 1))
             self.warp_group_start_id = core._unwrap_if_constexpr(kwargs.get("warp_group_start_id", None))
 
@@ -42,9 +48,6 @@ class async_task:
 
 
 class async_tasks:
-
-    def __init__(self):
-        pass
 
     def __enter__(self):
         return self

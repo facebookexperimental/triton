@@ -48,7 +48,7 @@ def _apply_causal_mask(qk, col_limit_right, BLOCK_N: tl.constexpr):
     # Credit to Tri Dao,
     # https://github.com/Dao-AILab/flash-attention/commit/bac1001e4f6caa09d70537495d6746a685a2fa78
     #
-    # NOTE: We use map_elementiwse here in order to generate an interleaved sequence of instructions
+    # NOTE: We use map_elementwise here in order to generate an interleaved sequence of instructions
     # that processes one element of qk at a time. This improves ptxas's resulting SASS.
     offs_n = tl.arange(0, BLOCK_N)[None, :]
     s = offs_n & ~0xF
@@ -264,8 +264,7 @@ def prune_invalid_configs(configs, named_args, **kwargs):
 def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
     if isinstance(desc_or_ptr, tl.tensor_descriptor):
         return desc_or_ptr
-    else:
-        return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
+    return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
 
 
 @triton.jit
@@ -602,7 +601,7 @@ _DEFAULT_BWD_DOT_ATTRS = FrozenDotAttrs({
     "dk": {"stage": "1", "order": "1", "channels": ["opndD,tmem,1,10"]},
 })
 
-# for BM of 128: dpT share with dq, qk share with ppT, dsT share with dpT
+# For BM of 128: dpT share with dq, qk share with ppT, dsT share with dpT.
 _BWD_DOT_ATTRS_TMEM = FrozenDotAttrs({
     "qkT": {"stage": "0", "order": "0", "channels": ["opndA,smem,1,0", "opndB,smem,2,1", "opndD,tmem,1,2"]},
     "dpT": {"stage": "0", "order": "2", "channels": ["opndA,smem,1,3", "opndB,smem,1,4", "opndD,tmem,1,5"]},
@@ -1282,13 +1281,6 @@ class _attention_opt(torch.autograd.Function):
                 1,
             )
 
-        def grid_debug(META):
-            return (
-                1,
-                1,
-                1,
-            )
-
         ctx.grid = grid
         persistent = baseVariant == "persistent" or baseVariant == "ws_persistent"
         if is_blackwell() and warp_specialize:
@@ -1364,7 +1356,6 @@ class _attention_opt(torch.autograd.Function):
         RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
         arg_k = k
         arg_k = arg_k * (ctx.sm_scale * RCP_LN2)
-        PRE_BLOCK = 128
         assert N_CTX % PRE_BLOCK == 0
         pre_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
         delta = torch.empty_like(M)

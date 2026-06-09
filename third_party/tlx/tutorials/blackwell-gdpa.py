@@ -97,23 +97,21 @@ def get_cuda_autotune_config():
         ]
 
 
-## Iterative tuning with intra-kernel profiler
-## 1. identify critical resource
-## 2. assuming it is gemm, make sure there is no bubble in gemm partition
-
-## Potential issues
-## -- bubbles in gemm partition due to _compute_qlen
-## ---- if that is the case via intra-kernel profiler, try pre-compute _compute_qlen
-## -- load imbalance
-## ---- use dynamic scheduler
-## ---- grab the next tile one iteration ahead (i.e SWP of the outer loop)
-## -- if descriptor setup is an issue, try SWP the setup for inner loop (i.e desc_k,v)
+# Iterative tuning with the intra-kernel profiler:
+# 1. Identify the critical resource.
+# 2. If it is GEMM, verify that the GEMM partition has no bubbles.
+#
+# Potential follow-ups:
+# - Pre-compute `_compute_qlen` if profiling shows GEMM bubbles there.
+# - Use a dynamic scheduler if load imbalance dominates.
+# - Grab the next tile one iteration ahead, software-pipelining the outer loop.
+# - Software-pipeline descriptor setup for the inner loop if descriptors dominate.
 
 
-## Overall warpspec configuration
-## default + 3 partitions:
-##   default is activation0 with 4 warps, partition0 is activatation1 with 4 warps
-##   partition1 is gemm, partition 2 is load
+# Overall warp-specialization configuration:
+# default + 3 partitions:
+#   default is activation0 with 4 warps, partition0 is activation1 with 4 warps
+#   partition1 is GEMM, partition2 is load
 @triton.jit
 def _compute_qlen(
     tile_idx,
@@ -427,12 +425,7 @@ def gdpa_kernel_tma_ws_blackwell(
                         # wait for o0, o1 per iteration
                         bufIdx = accum_cnt % NUM_BUFFERS_O
                         phase = (accum_cnt // NUM_BUFFERS_O) & 1
-                        # consumer wait of o0: producer_commit
-                        #consumer_o0_view = tlx.local_view(producer_commit_o0, bufIdx)
-                        # tl.device_print("default producer_commit_o0", accum_cnt)
-                        # tl.device_print("default producer_commit_o0_phase", phase)
                         # there is no need to wait for o0 at each iteration
-                        #tlx.barrier_wait(consumer_o0_view, phase)
                         accum_cnt += 1
 
                     # epilogue here, load from tmem
@@ -493,16 +486,12 @@ def gdpa_kernel_tma_ws_blackwell(
                     lo, hi = 0, klen
                     for start_n in range(lo, hi, BLOCK_N):
                         start_n = tl.multiple_of(start_n, BLOCK_N)
-                        ## communication channel for qk1, p1
+                        # Communication channel for qk1, p1.
                         bufIdx = accum_cnt % NUM_BUFFERS_QK
                         phase = (accum_cnt // NUM_BUFFERS_QK) & 1
                         qk_view = tlx.local_view(qk1_buf, bufIdx)
                         consumer_qk_view = tlx.local_view(producer_commit_qk1, bufIdx)
-                        #if ENABLE_PROTON and idx == PROTON_TILE:
-                        #    pl.enter_scope("consumer_qk0_view")
                         tlx.barrier_wait(consumer_qk_view, phase)
-                        #if ENABLE_PROTON and idx == PROTON_TILE:
-                        #    pl.exit_scope("consumer_qk0_view")
                         # qk_view: BLOCK_M // 2, HEAD_DIM
                         qk_view_1st = tlx.subslice(qk_view, 0, HEAD_DIM // 2)
                         qk0 = tlx.local_load(qk_view_1st)
@@ -537,13 +526,10 @@ def gdpa_kernel_tma_ws_blackwell(
                         if PINGPONG:
                             tlx.named_barrier_arrive(9, 256)
 
-                        # wait for o0, o1 per iteration
+                        # Wait for o0, o1 per iteration.
                         bufIdx = accum_cnt % NUM_BUFFERS_O
                         phase = (accum_cnt // NUM_BUFFERS_O) & 1
-                        # consumer wait of o1
-                        # consumer_o1_view = tlx.local_view(producer_commit_o1, bufIdx)
                         # there is no need to wait for o1 at each iteration
-                        # tlx.barrier_wait(consumer_o1_view, phase)
                         accum_cnt += 1
                     # epilogue here, load from tmem
                     # FIXME: wait till o1 is done for the inner loop
@@ -766,7 +752,7 @@ def gdpa_kernel_tma_ws_blackwell(
                                                                )
                         o1_view = tlx.local_view(o1_buf, bufIdx_o1)
                         producer_commit_o1_view = tlx.local_view(producer_commit_o1, bufIdx_o1)
-                        # release v for previous iteartion, accum_cnt_kv already advanced
+                        # release v for previous iteration, accum_cnt_kv already advanced
                         bufIdx_v, phase_v = get_bufidx_phase(accum_cnt_kv - 1, NUM_BUFFERS_KV)
                         consumer_release_v_view = tlx.local_view(consumer_release_kv, bufIdx_v)
                         # reinterpret as p1

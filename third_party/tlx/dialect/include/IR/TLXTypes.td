@@ -53,7 +53,7 @@ class TLXTypeDef<string name, string _mnemonic, list<Trait> traits = []>
 // Storage Alias Spec Type
 //===----------------------------------------------------------------------===//
 
-def TLX_StorageAliasSpecType : TLXTypeDef<"StorageAliasSpec", "storage_alias_spec", []> {
+def TLX_StorageAliasSpecType : TLXTypeDef<"StorageAliasSpec", "storage_alias_spec"> {
   let summary = "A storage alias specification type";
 
   let description = [{
@@ -95,7 +95,7 @@ def TLX_StorageAliasSpecType : TLXTypeDef<"StorageAliasSpec", "storage_alias_spe
 // Reuse Group Type
 //===----------------------------------------------------------------------===//
 
-def TLX_ReuseGroupType : TLXTypeDef<"ReuseGroup", "reuse_group", []> {
+def TLX_ReuseGroupType : TLXTypeDef<"ReuseGroup", "reuse_group"> {
   let summary = "A reuse group type for buffer overlap definitions";
 
   let description = [{

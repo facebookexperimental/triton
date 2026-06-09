@@ -1,8 +1,10 @@
 // (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
 #include "DataDependenceGraph.h"
+#include "ModuloReservationTable.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -11,6 +13,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <queue>
 
@@ -31,7 +34,7 @@ unsigned DataDependenceGraph::addNode(Operation *op,
   node.pipeline = info.pipeline;
   node.latency = info.latency;
   node.selfLatency = info.selfLatency;
-  node.transferLatency = info.transferLatency;
+  node.minWarps = info.minWarps;
   nodes.push_back(node);
   opToIdx[op] = idx;
   return idx;
@@ -53,11 +56,80 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
   for (auto &op : body) {
     if (op.hasTrait<OpTrait::IsTerminator>())
       continue;
-    // Skip inner scf.for loops — this DDG handles flat loop bodies only.
-    // Inner loop super-node modeling is added in a follow-up diff for
-    // outer loop (persistent kernel) scheduling.
-    if (isa<scf::ForOp>(op))
+    // Inner scf.for loops become super-nodes. The super-node's latency
+    // is the inner loop's total execution time (II × trip_count), and
+    // its pipeline is NONE (handles its own internal pipelining).
+    if (auto innerLoop = dyn_cast<scf::ForOp>(op)) {
+      auto innerDDG = DataDependenceGraph::build(innerLoop, model);
+      auto innerSched = runModuloScheduling(innerDDG);
+
+      DDGNode node;
+      node.op = &op;
+      node.idx = ddg.nodes.size();
+      node.isSuperNode = true;
+
+      if (succeeded(innerSched)) {
+        node.innerII = innerSched->II;
+        // Use int64_t through the computation so a large or reversed
+        // iteration space can't silently overflow `int`. Clamp the
+        // final value to >=1 — an empty or reversed range (`ub <= lb`
+        // with positive step) would otherwise produce a non-positive
+        // latency and silently break the `superNodeII` floor in
+        // `computeMinII`.
+        int64_t tripCount = 32; // fallback for dynamic bounds
+        auto lb = innerLoop.getLowerBound()
+                      .getDefiningOp<arith::ConstantIntOp>();
+        auto ub = innerLoop.getUpperBound()
+                      .getDefiningOp<arith::ConstantIntOp>();
+        auto step = innerLoop.getStep()
+                        .getDefiningOp<arith::ConstantIntOp>();
+        if (lb && ub && step && step.value() > 0) {
+          int64_t lbV = lb.value();
+          int64_t ubV = ub.value();
+          int64_t stepV = step.value();
+          tripCount = std::max<int64_t>(
+              1, (ubV - lbV + stepV - 1) / stepV);
+        } else {
+          innerLoop.emitWarning(
+              "modulo schedule: inner-loop bounds are not compile-time "
+              "constants; using a default trip count of 32 — schedule "
+              "decisions may be suboptimal");
+
+        }
+        node.latency = static_cast<int>(
+            std::min<int64_t>(INT_MAX, innerSched->II * tripCount));
+        node.selfLatency = 0;
+        node.pipeline = HWPipeline::NONE;
+
+        // Prologue latency: cycles before the first TC op fires inside the
+        // inner loop. The outer scheduler uses this to overlap outer-loop
+        // MEM ops with the inner loop's pre-MMA setup.
+        int tcStart = innerSched->II;
+        for (const auto &n : innerDDG.getNodes()) {
+          if (n.pipeline == HWPipeline::TC) {
+            auto it = innerSched->nodeToCycle.find(n.idx);
+            if (it != innerSched->nodeToCycle.end())
+              tcStart = std::min(tcStart, it->second);
+          }
+        }
+        node.prologueLatency = tcStart;
+      } else {
+        // Inner-loop scheduling failed. Emit a diagnostic and propagate
+        // a clearly-infeasible latency so the outer schedule fails too
+        // instead of silently producing garbage off a fabricated
+        // ~10k-cycle synthetic node.
+        innerLoop.emitWarning(
+            "modulo schedule: failed to schedule inner loop — outer "
+            "schedule will be marked infeasible");
+        node.selfLatency = INT_MAX / 2;
+        node.latency = INT_MAX / 2;
+        node.pipeline = HWPipeline::NONE;
+      }
+
+      ddg.nodes.push_back(node);
+      ddg.opToIdx[&op] = node.idx;
       continue;
+    }
     ddg.addNode(&op, model);
   }
 
@@ -71,18 +143,50 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
       if (it == ddg.opToIdx.end())
         continue;
       unsigned srcIdx = it->second;
-      // Edge latency = producer's latency (time until result available).
-      // Exception: for MEM → local_alloc edges, use transferLatency (the TMA
-      // transfer time) instead of the full async latency. local_alloc is a
-      // bookkeeping op that represents data arrival — it must wait for the
-      // transfer to complete, but not for the async DRAM overhead that only
-      // applies to the MMA consumer.
+      // Edge latency = producer's full latency (time until consumer can read
+      // the result). Uniform rule with no per-pair exceptions: each op carries
+      // a single `latency` that captures full delivery, and edges just
+      // propagate it.
       int edgeLatency = ddg.nodes[srcIdx].latency;
-      if (ddg.nodes[srcIdx].pipeline == HWPipeline::MEM &&
-          isa<triton::gpu::LocalAllocOp>(node.op)) {
-        edgeLatency = ddg.nodes[srcIdx].transferLatency;
-      }
       ddg.addEdge(srcIdx, node.idx, edgeLatency, /*distance=*/0);
+    }
+  }
+
+  // Phase 2.5: Memory-based edges for super-nodes.
+  // The DDG only captures SSA def-use edges. But super-nodes (inner
+  // loops) can write to memory (TMEM via MMA) that later ops read
+  // (tmem_load). Without an explicit edge, the scheduler places
+  // tmem_load BEFORE the K-loop finishes, breaking the store overlap.
+  //
+  // Detect: if a super-node's inner loop contains MMA writing to a
+  // TMEM memdesc, and a tmem_load outside the loop reads the same
+  // memdesc, add an edge super-node → tmem_load.
+  for (auto &node : ddg.nodes) {
+    if (!node.isSuperNode)
+      continue;
+    auto innerLoop = dyn_cast<scf::ForOp>(node.op);
+    if (!innerLoop)
+      continue;
+    // Find TMEM memdescs written by MMA inside the inner loop.
+    llvm::DenseSet<Value> tmemWritten;
+    innerLoop.walk([&](Operation *op) {
+      if (isa<triton::nvidia_gpu::TCGen5MMAOp,
+              triton::nvidia_gpu::TCGen5MMAScaledOp>(op)) {
+        // MMA operand 2 is the accumulator (TMEM memdesc).
+        if (op->getNumOperands() > 2)
+          tmemWritten.insert(op->getOperand(2));
+      }
+    });
+    // Find tmem_load ops outside the inner loop that read the same TMEM.
+    for (auto &other : ddg.nodes) {
+      if (other.idx == node.idx)
+        continue;
+      if (!isa<triton::nvidia_gpu::TMEMLoadOp>(other.op))
+        continue;
+      Value tmemSrc = other.op->getOperand(0);
+      if (tmemWritten.count(tmemSrc)) {
+        ddg.addEdge(node.idx, other.idx, node.latency, /*distance=*/0);
+      }
     }
   }
 
@@ -108,15 +212,10 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
       auto userIt = ddg.opToIdx.find(user);
       if (userIt == ddg.opToIdx.end())
         continue;
-      // For async ops (TC, MEM), the loop-carried recurrence latency
-      // is the issue cost (selfLatency), not the full execution time.
-      // The hardware pipelines successive iterations internally — e.g.,
-      // tcgen05.mma with useAcc=true pipelines accumulator updates in
-      // TMEM, so the next MMA can issue after the dispatch cost.
+      // Loop-carried back-edge uses full latency so RecMII reflects
+      // the true recurrence depth. For MMA with accumulator, the next
+      // iteration can't read the result until the current MMA completes.
       int backEdgeLat = ddg.nodes[srcIdx].latency;
-      if (ddg.nodes[srcIdx].pipeline == HWPipeline::TC ||
-          ddg.nodes[srcIdx].pipeline == HWPipeline::MEM)
-        backEdgeLat = ddg.nodes[srcIdx].selfLatency;
       ddg.addEdge(srcIdx, userIt->second, backEdgeLat,
                   /*distance=*/1);
     }
@@ -180,11 +279,13 @@ DataDependenceGraph::computeCriticalPathHeights() const {
 }
 
 int DataDependenceGraph::computeResMII() const {
+  // Per-pipeline busy time (cycles) bounds II from below: II ≥ pipeLoad / N
+  // where N is the number of identical units on the pipeline (assumed 1).
   llvm::DenseMap<HWPipeline, int> pipeLoad;
   for (const auto &node : nodes) {
     if (node.pipeline == HWPipeline::NONE)
       continue;
-    pipeLoad[node.pipeline] += node.selfLatency;
+    pipeLoad[node.pipeline] += pipelineOccupancy(node);
   }
   int maxLoad = 0;
   for (auto &[pipe, load] : pipeLoad) {
@@ -264,8 +365,16 @@ int DataDependenceGraph::computeRecMII() const {
 int DataDependenceGraph::computeMinII() const {
   int resMII = computeResMII();
   int recMII = computeRecMII();
-  int minII = std::max(resMII, recMII);
+  // Super-node latency is a hard lower bound: one outer iteration can't
+  // finish faster than its inner loop. Without this, II is too small
+  // and the schedule produces hundreds of stages.
+  int superNodeII = 0;
+  for (const auto &node : nodes)
+    if (node.isSuperNode)
+      superNodeII = std::max(superNodeII, node.latency);
+  int minII = std::max({resMII, recMII, superNodeII});
   LLVM_DEBUG(llvm::dbgs() << "[DDG] ResMII=" << resMII << " RecMII=" << recMII
+                          << " SuperNodeII=" << superNodeII
                           << " MinII=" << minII << "\n");
   return minII;
 }

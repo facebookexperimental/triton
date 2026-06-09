@@ -50,7 +50,7 @@ for PID in $GPU_PIDS; do
   if [ "$PROCESS_USER" = "$CURRENT_USER" ]; then
     PROCESS_NAME=$(ps -p $PID -o comm= 2>/dev/null)
     echo "Killing process $PID ($PROCESS_NAME) owned by $PROCESS_USER..."
-    # let's not use -9 to avoid killing the process forcefully
+    # Avoid -9 so processes can shut down cleanly.
     kill $PID
     if [ $? -eq 0 ]; then
       echo "Process $PID terminated successfully."

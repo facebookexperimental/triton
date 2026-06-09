@@ -512,23 +512,33 @@ struct CLCQueryCancelOpConversion
       .reg .b128 clc_result;
       .reg .pred p1;
       mov.s32 $0, -1;
-      ld.shared.b128 clc_result, [$1];
+      mov.s32 $1, -1;
+      mov.s32 $2, -1;
+      ld.shared.b128 clc_result, [$3];
       clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_result;
-      @p1 clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {$0, _, _, _}, clc_result;
+      @p1 clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {$0, $1, $2, _}, clc_result;
     }
     )";
 
     PTXBuilder builder;
     auto queryOp = *builder.create<>(ptx);
 
-    SmallVector<PTXBuilder::Operand *, 2> operands = {
+    SmallVector<PTXBuilder::Operand *, 4> operands = {
+        builder.newOperand("=r", true), builder.newOperand("=r", true),
         builder.newOperand("=r", true),
         builder.newOperand(adaptor.getClcResAlloc(), "r")};
     queryOp(operands, /*onlyAttachMLIRArgs=*/true);
 
-    Value ctaId = builder.launch(rewriter, op.getLoc(), i32_ty, false);
+    auto i32Ty = rewriter.getI32Type();
+    auto structTy =
+        LLVM::LLVMStructType::getLiteral(getContext(), {i32Ty, i32Ty, i32Ty});
+    Value result = builder.launch(rewriter, op.getLoc(), structTy, false);
 
-    rewriter.replaceOp(op, ctaId);
+    Value ctaIdX = LLVM::ExtractValueOp::create(rewriter, loc, result, 0);
+    Value ctaIdY = LLVM::ExtractValueOp::create(rewriter, loc, result, 1);
+    Value ctaIdZ = LLVM::ExtractValueOp::create(rewriter, loc, result, 2);
+
+    rewriter.replaceOp(op, {ctaIdX, ctaIdY, ctaIdZ});
 
     return success();
   }

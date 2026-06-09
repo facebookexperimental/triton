@@ -36,9 +36,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # pull_requests[] is empty for fork PRs (GitHub security limitation),
+          # so fall back to searching by head SHA which works for all PRs.
           PR_NUMBER="${{ github.event.workflow_run.pull_requests[0].number }}"
           if [ -z "$PR_NUMBER" ]; then
-            echo "No PR associated with this workflow run (likely a fork PR)."
+            PR_NUMBER=$(gh pr list --repo "${{ github.repository }}" --state open \
+              --json number,headRefOid \
+              --jq ".[] | select(.headRefOid == \"${{ github.event.workflow_run.head_sha }}\") | .number")
+          fi
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR found for this workflow run."
             echo "skip=true" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -58,10 +65,17 @@ jobs:
             echo "skip=true" >> $GITHUB_OUTPUT
           fi
 
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
       - name: Post or clean up bot comment
         if: steps.check.outputs.pr_number
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PR_NUMBER: ${{ steps.check.outputs.pr_number }}
           SKIP: ${{ steps.check.outputs.skip }}
           PRE_COMMIT_STATUS: ${{ steps.check.outputs.pre_commit_status }}
@@ -159,6 +173,13 @@ jobs:
             echo "is_fork=false" >> $GITHUB_OUTPUT
           fi
 
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
       - name: Validate PR is open
         if: steps.pr.outputs.state != 'open'
         run: |
@@ -193,7 +214,7 @@ jobs:
           github.event_name == 'issue_comment' &&
           steps.perms.outputs.authorized != 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           gh api "repos/${{ github.repository }}/issues/${{ steps.pr.outputs.number }}/comments" \
             -f body="<!-- pre-commit-fix-bot -->
@@ -203,7 +224,7 @@ jobs:
       - name: Reject fork PRs
         if: steps.pr.outputs.is_fork == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           gh api "repos/${{ github.repository }}/issues/${{ steps.pr.outputs.number }}/comments" \
             -f body="<!-- pre-commit-fix-bot -->
@@ -217,7 +238,7 @@ jobs:
       - name: React to comment
         if: github.event_name == 'issue_comment'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           gh api "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
             -f content='eyes'
@@ -226,7 +247,7 @@ jobs:
         with:
           ref: ${{ steps.pr.outputs.head_ref }}
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ steps.app-token.outputs.token }}
 
       - uses: actions/setup-python@v6
         with:
@@ -291,8 +312,8 @@ jobs:
           CHANGED=$(git diff --name-only | wc -l | tr -d ' ')
           echo "fixed_count=$CHANGED" >> $GITHUB_OUTPUT
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "facebookexperimental-triton[bot]"
+          git config user.email "facebookexperimental-triton[bot]@users.noreply.github.com"
           git add -A
           git commit -m "[pre-commit autofix] Fix formatting in ${CHANGED} file(s)
 
@@ -312,7 +333,7 @@ jobs:
       - name: Post result comment
         if: always() && steps.push.outcome != 'skipped'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PUSHED: ${{ steps.push.outputs.pushed }}
           FIXED_COUNT: ${{ steps.push.outputs.fixed_count }}
           PUSH_OUTCOME: ${{ steps.push.outcome }}
@@ -352,7 +373,7 @@ jobs:
       - name: React with result
         if: github.event_name == 'issue_comment' && always()
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           if [ "${{ steps.push.outputs.pushed }}" == "true" ]; then
             REACTION="rocket"

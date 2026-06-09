@@ -8,17 +8,18 @@
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
-// Verify that the modulo schedule pass sets tt.num_stages on the inner loop.
-// For a single-MMA GEMM, all MMAs are in the same stage so tt.autows is
-// skipped, and inner loops no longer emit loop.stage/loop.cluster attrs
-// (those are only emitted on outer loops via emitScheduleAttributes).
+// Verify that the modulo schedule pass annotates the inner loop with its
+// scheduling decision. For a single-MMA GEMM, all MMAs are in the same stage
+// so tt.autows is skipped. The pass marks the loop with tt.modulo_ii (the
+// initiation interval it picked) and tt.scheduled_max_stage (the deepest
+// stage in the schedule); the actual values depend on the latency model, so
+// we only check that the attrs are present, not their specific values.
 //
 // CHECK-LABEL: @gemm_inner_loop
 // CHECK: scf.for
-// CHECK-NOT: loop.stage
-// CHECK-NOT: loop.cluster
 // CHECK-NOT: tt.autows
-// CHECK: tt.num_stages = 3 : i32
+// CHECK: tt.modulo_ii = {{[0-9]+}} : i32
+// CHECK-SAME: tt.scheduled_max_stage = {{[0-9]+}} : i32
 tt.func @gemm_inner_loop(
   %a_desc: !tt.tensordesc<tensor<128x64xf16>>,
   %b_desc: !tt.tensordesc<tensor<64x128xf16>>

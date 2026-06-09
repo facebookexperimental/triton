@@ -12,6 +12,17 @@ import torch
 import triton
 import triton.language as tl
 
+
+def _get_block_size_and_warps(n, element_size, num_ctas):
+    max_fused_size = 65536 // element_size
+    block_size = min(max_fused_size, triton.next_power_of_2(n))
+    chunk = n // num_ctas
+    while block_size > chunk or chunk % block_size != 0:
+        block_size //= 2
+    num_warps = min(max(block_size // 256, 1), 8)
+    return block_size, num_warps
+
+
 # =============================================================================
 # 1D variant: one row per CTA, BLOCK_SIZE columns per iteration
 # =============================================================================
@@ -70,12 +81,7 @@ def multi_cta_layernorm(x, weight, bias, eps=1e-5, NUM_CTAS=2):
     y = torch.empty_like(x)
     mean = torch.empty((M, ), dtype=torch.float32, device=x.device)
     rstd = torch.empty((M, ), dtype=torch.float32, device=x.device)
-    MAX_FUSED_SIZE = 65536 // x.element_size()
-    BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
-    chunk = N // NUM_CTAS
-    while BLOCK_SIZE > chunk or chunk % BLOCK_SIZE != 0:
-        BLOCK_SIZE //= 2
-    num_warps = min(max(BLOCK_SIZE // 256, 1), 8)
+    BLOCK_SIZE, num_warps = _get_block_size_and_warps(N, x.element_size(), NUM_CTAS)
     _layer_norm_fwd_multi_cta[(M, NUM_CTAS)](
         x_arg,
         y,
@@ -157,12 +163,7 @@ def multi_cta_layernorm_2d(x, weight, bias, eps=1e-5, NUM_CTAS=2, BLOCK_SIZE_M=4
     y = torch.empty_like(x)
     mean = torch.empty((M, ), dtype=torch.float32, device=x.device)
     rstd = torch.empty((M, ), dtype=torch.float32, device=x.device)
-    MAX_FUSED_SIZE = 65536 // x.element_size()
-    BLOCK_SIZE_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
-    chunk = N // NUM_CTAS
-    while BLOCK_SIZE_N > chunk or chunk % BLOCK_SIZE_N != 0:
-        BLOCK_SIZE_N //= 2
-    num_warps = min(max(BLOCK_SIZE_N // 256, 1), 8)
+    BLOCK_SIZE_N, num_warps = _get_block_size_and_warps(N, x.element_size(), NUM_CTAS)
     grid = (triton.cdiv(M, BLOCK_SIZE_M), NUM_CTAS)
     _layer_norm_fwd_multi_cta_2d[grid](
         x_arg,

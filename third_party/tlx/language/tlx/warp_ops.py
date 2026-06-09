@@ -48,26 +48,15 @@ def vote_ballot_sync(
         - All threads in mask must execute the instruction with identical mask
         - The sync variant ensures warp convergence before the vote
     """
-    # Ensure pred is i1/bool type
     if pred.dtype != tl.int1:
         pred = pred != 0
 
-    # Get mask as i32 value
-    if isinstance(mask, tl.constexpr):
-        mask_val = mask.value
-    else:
-        mask_val = mask
-
+    mask_val = mask.value if isinstance(mask, tl.constexpr) else mask
     mask_handle = _semantic.builder.get_int32(mask_val)
     result = _semantic.builder.vote_ballot_sync(mask_handle, pred.handle)
 
-    # Determine result type based on predicate type
-    # If pred is a tensor, result will be tensor of i32 with same shape
     if pred.type.is_block():
-        # Tensor case - create block_type with same shape but i32 element type
         shape = [s.value if hasattr(s, "value") else s for s in pred.shape]
         ret_ty = tl.block_type(tl.int32, shape)
         return _semantic.tensor(result, ret_ty)
-    else:
-        # Scalar case
-        return _semantic.tensor(result, tl.int32)
+    return _semantic.tensor(result, tl.int32)
