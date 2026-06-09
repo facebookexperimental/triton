@@ -109,6 +109,37 @@ def reduction_equivalence_key(config, asm, metadata):
     return reduction_signature(asm.get("ttgir", ""))
 
 
+def ptx_reduction_signature(ptx):
+    """STUB — static reduction-order signature reconstructed from **PTX** (the
+    FMA / below-TTGIR backstop). Not implemented yet.
+
+    This is the slot for the future lane-parametric PTX reconstruction (parse the
+    ``shfl.sync.bfly`` + ``add``/``fma`` tree; see
+    knowledge-base/equivalence-check-level-ttgir-vs-ptx.md §2/§4b). Filling this in
+    is the *only* change needed to enable ``equivalence_level="ptx"`` end to end —
+    no autotuner or call-site changes.
+    """
+    raise NotImplementedError("PTX-level reduction equivalence is not implemented yet; only TTGIR-level is "
+                              "available. See knowledge-base/equivalence-check-level-ttgir-vs-ptx.md.")
+
+
+def _ptx_equivalence_key(config, asm, metadata):
+    return ptx_reduction_signature(asm.get("ptx", ""))
+
+
+# Registry of equivalence checkers by IR level, for the autotuner's
+# ``equivalence_level`` option:
+#   prune_configs_by={"equivalence_level": "ttgir"|"ptx"|"both",
+#                     "equivalence_checkers": CHECKERS}
+# Each value is an equivalence_fn ``(config, asm, metadata) -> Hashable``; configs
+# with equal keys are bitwise-equivalent at that level. ``"both"`` runs ttgir then
+# ptx as a two-stage prune (cheap pre-filter -> ground-truth backstop).
+CHECKERS = {
+    "ttgir": reduction_equivalence_key,
+    "ptx": _ptx_equivalence_key,
+}
+
+
 def classify(named_ttgirs):
     """Group ``{label: ttgir}`` into equivalence classes by reduction signature.
 

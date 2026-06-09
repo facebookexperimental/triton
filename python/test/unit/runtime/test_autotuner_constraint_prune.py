@@ -235,7 +235,8 @@ def test_equivalence_prune_keeps_reference_class():
 
     assert tuner.best_config.num_warps == 4  # winner is in the reference (num_warps=4) class
     assert {c.num_warps for c in tuner.pruned_by_equivalence} == {2, 8}  # non-equivalent dropped
-    assert len(tuner.equivalence_classes) == 3  # keys seen: 4, 2, 8
+    # equivalence_classes is {level: {key: [Config]}}; the equivalence_fn path uses the "custom" level.
+    assert len(tuner.equivalence_classes["custom"]) == 3  # keys seen: 4, 2, 8
 
 
 def test_equivalence_prune_all_same_key_keeps_all():
@@ -247,8 +248,89 @@ def test_equivalence_prune_all_same_key_keeps_all():
     tuner.run(dst, src, N=N, grid=(1, ))
 
     assert tuner.pruned_by_equivalence == {}  # all share the reference order -> nothing pruned
-    assert len(tuner.equivalence_classes) == 1
+    assert len(tuner.equivalence_classes["custom"]) == 1
     assert _bs(tuner) == 256  # fastest of the (entirely-kept) class
+
+
+# ---------------------------------------------------------------------------
+# Level-selectable equivalence: prune_configs_by={"equivalence_level": ...,
+# "equivalence_checkers": <registry>}. Choose ttgir / ptx / both (or a list);
+# multiple levels run as a two-stage pipeline. (Mock checkers stand in for the
+# real per-level signatures.)
+# ---------------------------------------------------------------------------
+def test_equivalence_level_ttgir_keeps_reference():
+    N = 1024
+    src = torch.arange(N, dtype=torch.float32)
+    dst = torch.empty(N, dtype=torch.float32)
+    configs = [
+        Config({"BLOCK_SIZE": 256}, num_warps=4),
+        Config({"BLOCK_SIZE": 512}, num_warps=4),
+        Config({"BLOCK_SIZE": 256}, num_warps=2),
+        Config({"BLOCK_SIZE": 256}, num_warps=8),
+    ]
+    registry = {"ttgir": lambda config, asm, md: md.num_warps}
+    tuner, _ = _make_tuner(configs, prune_configs_by={"equivalence_level": "ttgir", "equivalence_checkers": registry})
+    tuner.run(dst, src, N=N, grid=(1, ))
+
+    assert tuner.best_config.num_warps == 4
+    assert {c.num_warps for c in tuner.pruned_by_equivalence} == {2, 8}
+    assert len(tuner.equivalence_classes["ttgir"]) == 3
+
+
+def test_equivalence_level_two_stage_pipeline():
+    N = 1024
+    src = torch.arange(N, dtype=torch.float32)
+    dst = torch.empty(N, dtype=torch.float32)
+    # Stage l1 keys on num_warps; stage l2 keys on BLOCK_SIZE. Reference = first config (warps=4, bs=256).
+    configs = [
+        Config({"BLOCK_SIZE": 256}, num_warps=4, num_stages=2),  # reference (l1=4, l2=256)
+        Config({"BLOCK_SIZE": 256}, num_warps=4, num_stages=3),  # matches both -> kept
+        Config({"BLOCK_SIZE": 512}, num_warps=4, num_stages=2),  # l1 matches, l2 differs -> pruned at l2
+        Config({"BLOCK_SIZE": 256}, num_warps=2, num_stages=2),  # l1 differs -> pruned at l1
+    ]
+    registry = {
+        "l1": lambda config, asm, md: md.num_warps,
+        "l2": lambda config, asm, md: config.kwargs["BLOCK_SIZE"],
+    }
+    tuner, _ = _make_tuner(configs,
+                           prune_configs_by={"equivalence_level": ["l1", "l2"], "equivalence_checkers": registry})
+    tuner.run(dst, src, N=N, grid=(1, ))
+
+    assert tuner.best_config.num_warps == 4 and tuner.best_config.kwargs["BLOCK_SIZE"] == 256
+    # l1 pruned the num_warps=2 config; l2 pruned the BLOCK_SIZE=512 one.
+    reasons = {(c.num_warps, c.kwargs["BLOCK_SIZE"]): r for c, r in tuner.pruned_by_equivalence.items()}
+    assert reasons[(2, 256)].startswith("l1:")
+    assert reasons[(4, 512)].startswith("l2:")
+    assert set(tuner.equivalence_classes) == {"l1", "l2"}
+    assert len(tuner.equivalence_classes["l1"]) == 2  # num_warps 4 vs 2
+    assert len(tuner.equivalence_classes["l2"]) == 2  # among l1-survivors: bs 256 vs 512
+
+
+def test_equivalence_level_missing_in_registry_raises():
+    N = 1024
+    src = torch.arange(N, dtype=torch.float32)
+    dst = torch.empty(N, dtype=torch.float32)
+    # >1 config so the autotuner actually enters pruning (it skips tuning for a single config).
+    configs = [Config({"BLOCK_SIZE": 256}, num_warps=4), Config({"BLOCK_SIZE": 512}, num_warps=4)]
+    tuner, _ = _make_tuner(
+        configs, prune_configs_by={"equivalence_level": "ptx", "equivalence_checkers": {"ttgir": lambda c, a, m: 0}})
+    with pytest.raises(AutotunerError, match="not provided"):
+        tuner.run(dst, src, N=N, grid=(1, ))
+
+
+def test_equivalence_level_not_implemented_raises():
+    N = 1024
+    src = torch.arange(N, dtype=torch.float32)
+    dst = torch.empty(N, dtype=torch.float32)
+
+    def not_built(config, asm, metadata):
+        raise NotImplementedError("PTX-level not implemented yet")
+
+    configs = [Config({"BLOCK_SIZE": 256}, num_warps=4), Config({"BLOCK_SIZE": 512}, num_warps=4)]
+    tuner, _ = _make_tuner(configs,
+                           prune_configs_by={"equivalence_level": "ptx", "equivalence_checkers": {"ptx": not_built}})
+    with pytest.raises(AutotunerError, match="not available"):
+        tuner.run(dst, src, N=N, grid=(1, ))
 
 
 # ---------------------------------------------------------------------------

@@ -3,9 +3,11 @@
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 from bitequiv.equivalence import (  # noqa: E402
-    reduction_signature, same_reduction_order, classify, reduction_equivalence_key)
+    reduction_signature, same_reduction_order, classify, reduction_equivalence_key, ptx_reduction_signature, CHECKERS)
 
 
 def _ttgir(warps_on_axis, ordering="unordered", combine="arith.addf"):
@@ -68,3 +70,21 @@ def test_equivalence_key_adapter_reads_ttgir():
     key_b = reduction_equivalence_key(None, {"ttgir": _ttgir(8)}, None)
     assert key_a == reduction_signature(_ttgir(4))
     assert key_a != key_b
+
+
+# --- level registry (for the autotuner's equivalence_level option) ---
+def test_registry_has_ttgir_and_ptx():
+    assert set(CHECKERS) == {"ttgir", "ptx"}
+
+
+def test_registry_ttgir_checker_matches_signature():
+    key = CHECKERS["ttgir"](None, {"ttgir": _ttgir(4)}, None)
+    assert key == reduction_signature(_ttgir(4))
+
+
+def test_ptx_checker_is_a_stub_that_raises():
+    # PTX-level equivalence is not implemented yet; the registry entry must signal that clearly.
+    with pytest.raises(NotImplementedError):
+        ptx_reduction_signature("// some ptx")
+    with pytest.raises(NotImplementedError):
+        CHECKERS["ptx"](None, {"ptx": "// some ptx"}, None)
