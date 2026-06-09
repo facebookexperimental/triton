@@ -594,7 +594,16 @@ void init_triton_ir(py::module &&m) {
       .def("erase", [](Block &self) { self.erase(); })
       .def("id", [](Block &self) { return (uint64_t)&self; });
 
-  py::class_<Attribute>(m, "attribute", py::module_local());
+  py::class_<Attribute>(m, "attribute", py::module_local())
+      .def("__str__",
+           [](Attribute &self) {
+             std::string str;
+             llvm::raw_string_ostream os(str);
+             self.print(os);
+             return os.str();
+           })
+      .def("__eq__",
+           [](Attribute &self, Attribute &other) { return self == other; });
   py::class_<IntegerAttr, Attribute>(m, "integer_attr", py::module_local());
   py::class_<BoolAttr, Attribute>(m, "bool_attr", py::module_local());
   py::class_<UnitAttr, Attribute>(m, "unit_attr", py::module_local());
