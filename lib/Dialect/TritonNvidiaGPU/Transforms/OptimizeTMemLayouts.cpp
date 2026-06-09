@@ -215,6 +215,11 @@ public:
 
   LogicalResult matchAndRewrite(TMEMLoadOp tmemLoadOp,
                                 PatternRewriter &rewriter) const override {
+    // Respect a user-pinned register layout (tlx.layout): the author chose this
+    // load layout deliberately, so do not rewrite it to a reduction-friendly
+    // one.
+    if (tmemLoadOp->hasAttr("tlx.user_layout"))
+      return failure();
     int numWarps = ttg::lookupNumWarps(tmemLoadOp);
     // If there is only 1 warpgroup there is nothing to optimize as the layout
     // is already reduction friendly.
@@ -337,6 +342,9 @@ public:
 
   LogicalResult matchAndRewrite(TMEMLoadOp tmemLoadOp,
                                 PatternRewriter &rewriter) const override {
+    // Respect a user-pinned register layout (tlx.layout).
+    if (tmemLoadOp->hasAttr("tlx.user_layout"))
+      return failure();
     auto tmemEnc = dyn_cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
         tmemLoadOp.getSrc().getType().getEncoding());
     if (!tmemEnc)
