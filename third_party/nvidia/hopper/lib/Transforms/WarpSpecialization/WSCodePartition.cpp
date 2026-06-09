@@ -1826,6 +1826,19 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
   });
 
   OpBuilderWithAsyncTaskIds builder(funcOp->getContext());
+  Operation *lastHoistedAlloc = nullptr;
+  auto setHoistInsertionPoint = [&]() {
+    if (lastHoistedAlloc)
+      builder.setInsertionPointAfter(lastHoistedAlloc);
+    else
+      builder.setInsertionPointToStart(&(funcOp.getBody().front()));
+  };
+  auto updateHoistInsertionPoint = [&](Value buffer) {
+    Operation *defOp = buffer.getDefiningOp();
+    if (defOp && defOp->getBlock() == &funcOp.getBody().front() &&
+        (!lastHoistedAlloc || lastHoistedAlloc->isBeforeInBlock(defOp)))
+      lastHoistedAlloc = defOp;
+  };
   llvm::MapVector<Channel *, SmallVector<Channel *>> channelsGroupedByProducers;
 
   // Group channels by source values
@@ -1925,7 +1938,7 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
       DBGS() << *dstOp << "\n";
     });
 
-    builder.setInsertionPointToStart(&(funcOp.getBody().front()));
+    setHoistInsertionPoint();
 
     Value newProducer;
 
@@ -1971,6 +1984,7 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
     } else {
       llvm_unreachable("Unexpected result type");
     }
+    updateHoistInsertionPoint(buffer);
 
     LLVM_DEBUG({
       LDBG("resulting buffer:");
