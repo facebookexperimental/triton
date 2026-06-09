@@ -266,7 +266,8 @@ getUserSharedOrder(ttg::LocalLoadOp localLoadOp) {
 
 static Attribute computeSharedEncFromDotEnc(ttg::DotOperandEncodingAttr dotEnc,
                                             ttg::LocalLoadOp localLoadOp,
-                                            bool useAsyncCopy) {
+                                            bool useAsyncCopy,
+                                            bool isBufferLoad) {
   auto resultType = cast<RankedTensorType>(localLoadOp.getType());
   auto order = ttg::getOrderForMemory(resultType);
   auto userOrder = getUserSharedOrder(localLoadOp);
@@ -286,6 +287,51 @@ static Attribute computeSharedEncFromDotEnc(ttg::DotOperandEncodingAttr dotEnc,
                 targetFeatures, dotEnc.getOpIdx(), dotEnc.getKWidth(),
                 cast<ttg::TensorOrMemDesc>(type), paddedOrder, dotEnc,
                 /*useAsyncCopy=*/true)) {
+          // `composePaddedLayout` returns a *permuted* padded layout (its
+          // linear component reorders elements to dodge ds_read bank
+          // conflicts).  The async-copy coalescer can follow that permutation,
+          // but the `buffer_load_to_local` direct-to-LDS lowering cannot: it
+          // writes the load source straight to LDS, so a permuted layout would
+          // produce uncoalesced direct-to-LDS writes (and fail to legalize).
+          // Rebuild the same pad intervals with an *identity* offset map
+          // (K-contiguous `paddedOrder`) for buffer-load allocs.
+          if (isBufferLoad) {
+            // K is dim 1 for opIdx0 (A) and dim 0 for opIdx1 (B); the offset
+            // map must be K-contiguous so the direct-to-LDS writes coalesce.
+            unsigned kDimIndex = dotEnc.getOpIdx() == 0 ? 1 : 0;
+            SmallVector<unsigned> kContigOrder = {kDimIndex, 1 - kDimIndex};
+            // Build the padded encoding for the ALLOCATION shape, not the
+            // (possibly sliced) view shape. When a K-slice of a padded buffer
+            // feeds the dot (fine per-MFMA ds_read interleave), the slice
+            // memdesc has shape=[M,sliceK] but allocShape=[M,fullK]; the padded
+            // encoding's linear component must match allocShape (MemDescType
+            // verify checks ll.outDims == allocShape). Using the parent's
+            // full-shape padded layout on the sliced view both verifies AND
+            // addresses the correct sub-region (the slice reads logical
+            // (m, k<sliceK) through the full layout). This keeps padded's fast
+            // conflict-free ds_read while being K-sliceable.
+            auto allocShape = type.getAllocShape();
+            auto fullType = ttg::MemDescType::get(
+                allocShape, type.getElementType(), type.getEncoding(),
+                type.getMemorySpace(), type.getMutableMemory(), allocShape);
+            auto paddedFull = composePaddedLayout(
+                targetFeatures, dotEnc.getOpIdx(), dotEnc.getKWidth(),
+                cast<ttg::TensorOrMemDesc>(fullType), paddedOrder, dotEnc,
+                /*useAsyncCopy=*/true);
+            auto paddedEnc = cast<ttg::PaddedSharedEncodingAttr>(
+                paddedFull ? paddedFull : padded);
+            SmallVector<std::pair<unsigned, unsigned>> intervalPads;
+            for (auto [iv, pd] :
+                 llvm::zip(paddedEnc.getIntervals(), paddedEnc.getPaddings()))
+              intervalPads.emplace_back(iv, pd);
+            auto identity = ttg::PaddedSharedEncodingAttr::get(
+                localLoadOp->getContext(), intervalPads, kContigOrder,
+                allocShape, ctaLayout);
+            LDBG("Rebuilt identity padded encoding (allocShape) for "
+                 "buffer_load_to_local: "
+                 << identity);
+            return identity;
+          }
           LDBG("Deduced async-copy padded shared encoding from dot layout: "
                << padded);
           return padded;
@@ -365,6 +411,15 @@ static bool isFedByTDM(Value memdesc) {
 static bool isFedByAsyncLdsProducer(Value memdesc) {
   return isFedByAnyMemDescUser<ttg::AsyncCopyGlobalToLocalOp,
                                amdgpu::BufferLoadToLocalOp>(memdesc);
+}
+
+// True if the alloc feeding this memdesc is written by a `buffer_load_to_local`
+// (AMD direct-to-LDS buffer load).  Unlike the async-copy path, the
+// direct-to-LDS lowering cannot reorder the load source to follow a *permuted*
+// padded layout, so such allocs must use an identity padded layout
+// (see computeSharedEncFromDotEnc).
+static bool isFedByBufferLoadToLocal(Value memdesc) {
+  return isFedByAnyMemDescUser<amdgpu::BufferLoadToLocalOp>(memdesc);
 }
 
 static void applyRequireLayout(Attribute encoding, ttg::LocalLoadOp localLoadOp,
@@ -828,8 +883,9 @@ LogicalResult insertRequireLayout(ModuleOp m) {
     // async direct-to-LDS producers, prefer AMD's padded shared layout when it
     // is applicable and fall back to the dot-derived swizzled layout.
     bool useAsyncCopy = isFedByAsyncLdsProducer(localLoadOp->getOperand(0));
-    auto sharedEnc =
-        computeSharedEncFromDotEnc(dotEnc, localLoadOp, useAsyncCopy);
+    bool isBufferLoad = isFedByBufferLoadToLocal(localLoadOp->getOperand(0));
+    auto sharedEnc = computeSharedEncFromDotEnc(dotEnc, localLoadOp,
+                                                useAsyncCopy, isBufferLoad);
     applyRequireLayout(sharedEnc, localLoadOp, builder);
   });
 

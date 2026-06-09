@@ -125,12 +125,17 @@ public:
       auto bufOp = dyn_cast<triton::amdgpu::BufferOpInterface>(op);
       if (!bufOp)
         return;
-      if (isa<triton::amdgpu::BufferLoadToLocalOp>(op))
-        return;
-      // Determine the tensor type that represents the data layout.
-      // For loads it's the result; for stores find the first tensor operand.
+      // Determine the tensor type whose distributed layout drives coalescing.
+      //  - buffer_load / buffer_store: the register data tensor (result for
+      //    loads, first tensor operand for stores).
+      //  - buffer_load_to_local: the result is a shared-memory memdesc, so we
+      //    coalesce the i32 offset tensor instead (it drives the global-load
+      //    addressing). convertDistributedOpEncoding leaves the shared result
+      //    untouched because BufferLoadToLocalOp is treated as async there.
       RankedTensorType tensorTy;
-      if (op->getNumResults() == 1)
+      if (isa<triton::amdgpu::BufferLoadToLocalOp>(op))
+        tensorTy = dyn_cast<RankedTensorType>(bufOp.getOffsets().getType());
+      else if (op->getNumResults() == 1)
         tensorTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
       if (!tensorTy) {
         for (Value operand : op->getOperands()) {
