@@ -216,10 +216,15 @@ static const TTGIRToTLXMapping opMappings[] = {
     {"arith.maxnumf", "tl.maximum", "Float max (NaN-propagating)"},
     {"arith.minf", "tl.minimum", "Float min"},
     {"arith.minnumf", "tl.minimum", "Float min (NaN-propagating)"},
-    {"arith.maxsi", "tl.max", "Signed integer max"},
-    {"arith.maxui", "tl.max", "Unsigned integer max"},
-    {"arith.minsi", "tl.min", "Signed integer min"},
-    {"arith.minui", "tl.min", "Unsigned integer min"},
+    // Elementwise binary min/max. NOTE: tl.min/tl.max are reductions, so
+    // they are not used here. Use tl.minimum/maximum similar to float above.
+    {"arith.maxsi", "tl.maximum", "Signed integer max"},
+    {"arith.maxui", "tl.maximum", "Unsigned integer max"},
+    {"arith.minsi", "tl.minimum", "Signed integer min"},
+    {"arith.minui", "tl.minimum", "Unsigned integer min"},
+    // Ceiling division: tl.cdiv(a, b) == (a + b - 1) // b.
+    {"arith.ceildivsi", "tl.cdiv", "Signed integer ceil-division"},
+    {"arith.ceildivui", "tl.cdiv", "Unsigned integer ceil-division"},
 
     // Triton operations
     {"tt.splat", "tl.splat", "Splat scalar to tensor"},
@@ -740,6 +745,8 @@ bool shouldSkipOp(
       "ttg.warp_yield",
       "ttg.warp_specialize.partitions",
       "gpu.barrier",
+      // SMEM/TMEM lifetime-scoped in TLX, so explicit ttg.local_dealloc
+      "ttg.local_dealloc",
       "arith.constant",
       "ttg.convert_layout",
       "tt.return",
@@ -939,8 +946,18 @@ void printForOp(Operation *op, llvm::raw_ostream &os,
   SmallVector<Value> yieldTargets;
   for (unsigned i = 0; i < numIterArgs; ++i)
     yieldTargets.push_back(entryBlock.getArgument(1 + i));
-  printRegion(bodyRegion, os, opNameMap, allocInfoMap, skippedOps, indent + 1,
-              argSubstitutionMap, yieldTargets);
+  std::string bodyStr;
+  llvm::raw_string_ostream bodyOs(bodyStr);
+  printRegion(bodyRegion, bodyOs, opNameMap, allocInfoMap, skippedOps,
+              indent + 1, argSubstitutionMap, yieldTargets);
+  bodyOs.flush();
+  if (bodyStr.empty()) {
+    for (unsigned i = 0; i < indent + 1; ++i)
+      os << "  ";
+    os << "pass\n";
+  } else {
+    os << bodyStr;
+  }
 }
 
 // Print scf.if with yield-to-assignment conversion
@@ -967,19 +984,34 @@ void printIfOp(Operation *op, llvm::raw_ostream &os,
     os << "  ";
   os << "if " << getValueName(condition, argSubstitutionMap) << ":\n";
 
-  // Print then region with yield targets
+  std::string thenStr;
+  llvm::raw_string_ostream thenOs(thenStr);
   if (op->getNumRegions() > 0) {
-    printRegion(op->getRegion(0), os, opNameMap, allocInfoMap, skippedOps,
+    printRegion(op->getRegion(0), thenOs, opNameMap, allocInfoMap, skippedOps,
                 indent + 1, argSubstitutionMap, ifResults);
+  }
+  thenOs.flush();
+  if (thenStr.empty()) {
+    for (unsigned i = 0; i < indent + 1; ++i)
+      os << "  ";
+    os << "pass\n";
+  } else {
+    os << thenStr;
   }
 
   // Print else region if it exists and is non-empty
   if (op->getNumRegions() > 1 && !op->getRegion(1).empty()) {
-    for (unsigned i = 0; i < indent; ++i)
-      os << "  ";
-    os << "else:\n";
-    printRegion(op->getRegion(1), os, opNameMap, allocInfoMap, skippedOps,
+    std::string elseStr;
+    llvm::raw_string_ostream elseOs(elseStr);
+    printRegion(op->getRegion(1), elseOs, opNameMap, allocInfoMap, skippedOps,
                 indent + 1, argSubstitutionMap, ifResults);
+    elseOs.flush();
+    if (!elseStr.empty()) {
+      for (unsigned i = 0; i < indent; ++i)
+        os << "  ";
+      os << "else:\n";
+      os << elseStr;
+    }
   }
 }
 
@@ -2375,27 +2407,47 @@ void printCFBlocks(Block *startBlock, Block *stopBlock, llvm::raw_ostream &os,
         os << "  ";
       os << "if " << condExpr << ":\n";
 
-      // Print true-dest arg assignments
-      printBlockArgAssignments(trueDest, condBr.getTrueDestOperands(), os,
-                               indent + 1, argSubstitutionMap);
+      auto isBlank = [](StringRef s) {
+        return s.find_first_not_of(" \t\r\n") == StringRef::npos;
+      };
 
-      if (trueDest != mergeBlock) {
-        printCFBlocks(trueDest, mergeBlock, os, opNameMap, allocInfoMap,
-                      skippedOps, indent + 1, argSubstitutionMap, visitedBlocks,
-                      forLoopHeaders);
-      }
-
-      // Print else branch if it's not the merge block or has operands
-      if (falseDest != mergeBlock || condBr.getFalseDestOperands().size() > 0) {
-        for (unsigned i = 0; i < indent; ++i)
-          os << "  ";
-        os << "else:\n";
-        printBlockArgAssignments(falseDest, condBr.getFalseDestOperands(), os,
+      std::string trueStr;
+      {
+        llvm::raw_string_ostream trueOs(trueStr);
+        printBlockArgAssignments(trueDest, condBr.getTrueDestOperands(), trueOs,
                                  indent + 1, argSubstitutionMap);
-        if (falseDest != mergeBlock) {
-          printCFBlocks(falseDest, mergeBlock, os, opNameMap, allocInfoMap,
+        if (trueDest != mergeBlock) {
+          printCFBlocks(trueDest, mergeBlock, trueOs, opNameMap, allocInfoMap,
                         skippedOps, indent + 1, argSubstitutionMap,
                         visitedBlocks, forLoopHeaders);
+        }
+      }
+      if (isBlank(trueStr)) {
+        for (unsigned i = 0; i < indent + 1; ++i)
+          os << "  ";
+        os << "pass\n";
+      } else {
+        os << trueStr;
+      }
+
+      // Print else branch only if it has real content.
+      if (falseDest != mergeBlock || condBr.getFalseDestOperands().size() > 0) {
+        std::string elseStr;
+        {
+          llvm::raw_string_ostream elseOs(elseStr);
+          printBlockArgAssignments(falseDest, condBr.getFalseDestOperands(),
+                                   elseOs, indent + 1, argSubstitutionMap);
+          if (falseDest != mergeBlock) {
+            printCFBlocks(falseDest, mergeBlock, elseOs, opNameMap,
+                          allocInfoMap, skippedOps, indent + 1,
+                          argSubstitutionMap, visitedBlocks, forLoopHeaders);
+          }
+        }
+        if (!isBlank(elseStr)) {
+          for (unsigned i = 0; i < indent; ++i)
+            os << "  ";
+          os << "else:\n";
+          os << elseStr;
         }
       }
 

@@ -61,6 +61,47 @@ findAsyncIdFromTMEMStoreSource(ttng::TMEMStoreOp storeOp) {
   return {};
 }
 
+static ttng::TMEMAllocOp findBaseTMEMAlloc(Value desc) {
+  SmallVector<Value> workList;
+  DenseSet<Value> visited;
+  workList.push_back(desc);
+
+  while (!workList.empty()) {
+    Value current = workList.pop_back_val();
+    if (visited.contains(current))
+      continue;
+    visited.insert(current);
+
+    Operation *defOp = current.getDefiningOp();
+    if (!defOp)
+      continue;
+
+    if (auto allocOp = dyn_cast<ttng::TMEMAllocOp>(defOp))
+      return allocOp;
+
+    if (auto subSliceOp = dyn_cast<ttng::TMEMSubSliceOp>(defOp)) {
+      workList.push_back(subSliceOp.getSrc());
+      continue;
+    }
+
+    if (auto indexOp = dyn_cast<ttg::MemDescIndexOp>(defOp)) {
+      workList.push_back(indexOp.getSrc());
+      continue;
+    }
+
+    if (auto reinterpretOp = dyn_cast<ttg::MemDescReinterpretOp>(defOp)) {
+      workList.push_back(reinterpretOp.getSrc());
+      continue;
+    }
+
+    if (auto subSliceOp = dyn_cast<ttg::MemDescSubsliceOp>(defOp)) {
+      workList.push_back(subSliceOp.getSrc());
+      continue;
+    }
+  }
+  return nullptr;
+}
+
 /// Handle operand D for MMA ops with task_id set.
 /// This function finds TMEMStoreOp (initialization) before the loop
 /// containing the MMA and assigns async_task_id to it if not already set.
@@ -75,15 +116,9 @@ static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
 
     // Step 2: Traverse operand D to find the TMEM alloc.
     Value dOperand = mmaOp.getD();
-    auto *allocOp = dOperand.getDefiningOp();
-    if (!allocOp)
+    auto tmemAllocOp = findBaseTMEMAlloc(dOperand);
+    if (!tmemAllocOp)
       return;
-
-    auto tmemAllocOp = dyn_cast<ttng::TMEMAllocOp>(allocOp);
-    if (!tmemAllocOp) {
-      // Try to trace through subview or similar
-      return;
-    }
 
     // Find the for loop containing the MMA
     auto forOp = mmaOp->getParentOfType<scf::ForOp>();
@@ -93,7 +128,7 @@ static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
     }
 
     // Step 3: Find the TMEMStoreOp before the loop
-    for (auto user : tmemAllocOp.getResult().getUsers()) {
+    for (auto user : dOperand.getUsers()) {
       auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user);
       if (!storeOp)
         continue;
@@ -104,7 +139,7 @@ static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
 
       // Find the earliest user with an async task ID to use as the source.
       Operation *taskIdSource = mmaOp;
-      for (auto otherUser : tmemAllocOp.getResult().getUsers()) {
+      for (auto otherUser : dOperand.getUsers()) {
         if (otherUser == storeOp || otherUser == taskIdSource)
           continue;
         auto otherTaskIds = getAsyncTaskIds(otherUser);
@@ -171,6 +206,14 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
   // Handle operand D for MMA ops - propagate task_id to initialization
   // TMEMStoreOps before loops.
   handleOperandDTaskIdPropagation(funcOp);
+
+  // Existing async_task_id anchors also contribute to the global task union.
+  // In async-only inputs there may be no ttg.partition attrs to normalize, but
+  // loops, assumes, and loop bounds still need to be visible to all tasks.
+  funcOp.walk([&](mlir::Operation *op) {
+    for (AsyncTaskId taskId : getAsyncTaskIds(op))
+      totalTaskIds.insert(taskId);
+  });
 
   std::vector<int> allTasksVec(totalTaskIds.begin(), totalTaskIds.end());
   ArrayRef<AsyncTaskId> allTasks(allTasksVec);

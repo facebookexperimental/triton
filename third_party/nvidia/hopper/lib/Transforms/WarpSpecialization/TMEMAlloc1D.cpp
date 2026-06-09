@@ -15,9 +15,13 @@ namespace ttg = mlir::triton::gpu;
 namespace ttng = ::mlir::triton::nvidia_gpu;
 namespace mlir {
 
-ttng::TMEMAllocOp TMEM1DAllocator::alloc1DTMEMBuffer() {
+FailureOr<ttng::TMEMAllocOp> TMEM1DAllocator::alloc1DTMEMBuffer() {
   auto expandedInput = getExpandedInput();
-  auto oldRetType = getResultTensorType(expandedInput->getResult(0), 2);
+  FailureOr<RankedTensorType> oldRetTypeOr =
+      getResultTensorType(expandedInput->getResult(0), 2);
+  if (failed(oldRetTypeOr))
+    return failure();
+  RankedTensorType oldRetType = *oldRetTypeOr;
   auto shape = oldRetType.getShape();
   auto tmemDesc = createTMEMDesc(builder, oldRetType, shape[0], shape[1]);
   auto allocCall =
@@ -27,11 +31,15 @@ ttng::TMEMAllocOp TMEM1DAllocator::alloc1DTMEMBuffer() {
   return allocCall;
 }
 
-void TMEM1DAllocator::TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
-                                  Operation *allocOpBuffer) {
+LogicalResult TMEM1DAllocator::TMEMStore1D(OpResult producer,
+                                           AsyncTaskId producerTaskId,
+                                           Operation *allocOpBuffer) {
   // Expand from 1D -> 2D
   auto producerOp = producer.getDefiningOp();
-  auto oldRetType = getResultTensorType(producer, 1);
+  FailureOr<RankedTensorType> oldRetTypeOr = getResultTensorType(producer, 1);
+  if (failed(oldRetTypeOr))
+    return failure();
+  RankedTensorType oldRetType = *oldRetTypeOr;
   builder.setInsertionPointAfter(producerOp);
   auto originTaskIds = builder.getAsyncTaskIds();
   builder.setAsynTaskIdsFromArray(producerTaskId);
@@ -76,7 +84,10 @@ void TMEM1DAllocator::TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
   if (allocOpBuffer) {
     allocOp = allocOpBuffer;
   } else {
-    allocOp = alloc1DTMEMBuffer();
+    FailureOr<ttng::TMEMAllocOp> allocOpOr = alloc1DTMEMBuffer();
+    if (failed(allocOpOr))
+      return failure();
+    allocOp = *allocOpOr;
   }
   setAllocOp(allocOp);
 
@@ -109,6 +120,7 @@ void TMEM1DAllocator::TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
       src->getLoc(), allocOp->getResult(0), src->getResult(0), trueVal);
   builder.setAsynTaskIdsFromArray(originTaskIds);
   builder.setLoopScheduleInfoFromInfo(originLoopScheduleInfo);
+  return success();
 }
 
 Value TMEM1DAllocator::TMEMLoad1D(OpResult producer, Operation *consumer) {
@@ -146,9 +158,9 @@ Value TMEM1DAllocator::TMEMLoad1D(OpResult producer, Operation *consumer) {
   return newInput.getResult();
 }
 
-void generate1DAllocations(OpBuilderWithAsyncTaskIds &builder,
-                           Operation *producer,
-                           llvm::SmallVector<Operation *> &allocOps) {
+LogicalResult generate1DAllocations(OpBuilderWithAsyncTaskIds &builder,
+                                    Operation *producer,
+                                    llvm::SmallVector<Operation *> &allocOps) {
   assert(producer->hasAttr("tmem.start") && "Expected tmem.start");
   Operation *allocOpBuffer = nullptr;
   auto producerTMEMStart =
@@ -172,13 +184,17 @@ void generate1DAllocations(OpBuilderWithAsyncTaskIds &builder,
   for (auto consumer : producer->getUsers()) {
     auto consumerParition = getAsyncTaskIds(consumer);
     if (producerPartition != consumerParition) {
-      TMEM1DAllocator(builder).replaceWith1DTMEM(producer->getOpResult(0),
-                                                 producerPartition.front(),
-                                                 consumer, allocOpBuffer);
+      Value newProducer = TMEM1DAllocator(builder).replaceWith1DTMEM(
+          producer->getOpResult(0), producerPartition.front(), consumer,
+          allocOpBuffer);
+      if (!newProducer) {
+        return failure();
+      }
     }
   }
   // Delete tmem.start
   producer->removeAttr("tmem.start");
+  return success();
 }
 
 ttg::MemDescReinterpretOp
@@ -352,11 +368,15 @@ public:
         allocOps.push_back(allocOp);
       }
     });
-    moduleOp->walk([&](mlir::Operation *irOp) {
+    WalkResult result = moduleOp->walk([&](mlir::Operation *irOp) {
       if (irOp->hasAttr("tmem.start")) {
-        generate1DAllocations(builder, irOp, allocOps);
+        if (failed(generate1DAllocations(builder, irOp, allocOps)))
+          return WalkResult::interrupt();
       }
+      return WalkResult::advance();
     });
+    if (result.wasInterrupted())
+      signalPassFailure();
   }
 };
 

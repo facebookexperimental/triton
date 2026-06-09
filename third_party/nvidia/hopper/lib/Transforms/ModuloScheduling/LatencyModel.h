@@ -9,8 +9,9 @@ namespace mlir::triton::gpu {
 /// Hardware pipeline classification for Blackwell SM100.
 /// Each op executes on exactly one pipeline; distinct pipelines overlap.
 enum class HWPipeline {
-  MEM,  // TMA loads/stores (descriptor_load, descriptor_store,
-        // descriptor_gather)
+  TMA,  // Async TMA engine: descriptor_load/store/gather. Named TMA (not
+        // MEM) because a regular ld.global has CUDA-core-like self latency;
+        // this pipeline specifically models the async TMA unit.
   TC,   // Tensor Core (tc_gen05_mma, warp_group_dot)
   CUDA, // General CUDA cores (arith.*, tt.reduce, type conversions)
   SFU,  // Special Function Unit (math.exp2, math.log2, math.rsqrt)
