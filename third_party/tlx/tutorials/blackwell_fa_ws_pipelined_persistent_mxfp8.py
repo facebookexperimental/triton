@@ -9,8 +9,8 @@ from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _s
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 from triton.language.extra.tlx.mxfp8_utils import (
-    _amax_to_e8m0_and_quantize,
     _cvt_e4m3x4_f32,
+    _to_mxfp8_32x32_block,
     _to_mxfp8_block,
     _to_mxfp8_block_with_block_amax,
 )
@@ -1406,7 +1406,7 @@ def _softmax_recompute_quantization_iter(
         # separate blockscaled encoding.
         if subtile_id == 0:
             tlx.barrier_wait(ds_empties[ds_buf_id], ds_phase ^ 1)
-        ds_fp8, ds_scale = _to_mxfp8_block(
+        ds_fp8, ds_scale = _to_mxfp8_32x32_block(
             dsT,
             VEC_SIZE,
             p_dtype,
@@ -1424,20 +1424,12 @@ def _softmax_recompute_quantization_iter(
             ),
             ds_scale_packed,
         )
-        dq_amax = tl.max(tl.abs(dsT))
-        dq_amax_bcast = tl.full([BLOCK_N1, DS_M_SUB // VEC_SIZE], 0.0, tl.float32) + dq_amax
-        ds_scale_dq, ds_dq_fp8 = _amax_to_e8m0_and_quantize(
-            dsT,
-            dq_amax_bcast,
-            VEC_SIZE,
-            p_dtype,
-        )
         tlx.local_store(
             tlx.local_slice(tlx.local_view(ds_dq_tiles_smem, ds_buf_id), [0, subtile_id * DS_M_SUB],
                             [BLOCK_N1, DS_M_SUB]),
-            ds_dq_fp8,
+            ds_fp8,
         )
-        ds_scale_dq_packed = ds_scale_dq.reshape([REP_N, 4, 32, REP_M, 4 // DS_NUM_SUBS]).permute(3, 0, 2, 4, 1)
+        ds_scale_dq_packed = ds_scale.reshape([REP_N, 4, 32, REP_M, 4 // DS_NUM_SUBS]).permute(3, 0, 2, 4, 1)
         tlx.local_store(
             tlx.local_slice(
                 tlx.local_view(ds_scale_dq_smem, 0),
