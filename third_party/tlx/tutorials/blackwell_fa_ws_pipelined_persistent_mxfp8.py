@@ -478,15 +478,36 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
             NUM_MMA_GROUPS * NUM_BUFFERS_QK,
             tlx.storage_kind.tmem,
         )
-        q_scale_tmem = tlx.local_alloc((BLOCK_M_SPLIT, Q_SCALE_TMEM_COLS), tl.uint8, 2 * NUM_Q_SCALE_TMEM_BUFFERS,
-                                       tlx.storage_kind.tmem)
-        k_scale_tmem = tlx.local_alloc((BLOCK_N, K_SCALE_TMEM_COLS), tl.uint8, NUM_KV_SCALE_TMEM_BUFFERS,
-                                       tlx.storage_kind.tmem)
-        v_scale_tmem = tlx.local_alloc((V_SCALE_TMEM_ROWS, V_SCALE_TMEM_COLS), tl.uint8, NUM_KV_SCALE_TMEM_BUFFERS,
-                                       tlx.storage_kind.tmem)
-        p_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), tlx.dtype_of(desc_v), NUM_MMA_GROUPS, tlx.storage_kind.tmem)
-        p_scale_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N // VEC_SIZE), tl.uint8, NUM_MMA_GROUPS,
-                                        tlx.storage_kind.tmem)
+        q_scale_tmem = tlx.local_alloc(
+            (BLOCK_M_SPLIT, Q_SCALE_TMEM_COLS),
+            tl.uint8,
+            2 * NUM_Q_SCALE_TMEM_BUFFERS,
+            tlx.storage_kind.tmem,
+        )
+        k_scale_tmem = tlx.local_alloc(
+            (BLOCK_N, K_SCALE_TMEM_COLS),
+            tl.uint8,
+            NUM_KV_SCALE_TMEM_BUFFERS,
+            tlx.storage_kind.tmem,
+        )
+        v_scale_tmem = tlx.local_alloc(
+            (V_SCALE_TMEM_ROWS, V_SCALE_TMEM_COLS),
+            tl.uint8,
+            NUM_KV_SCALE_TMEM_BUFFERS,
+            tlx.storage_kind.tmem,
+        )
+        p_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, BLOCK_N),
+            tlx.dtype_of(desc_v),
+            NUM_MMA_GROUPS,
+            tlx.storage_kind.tmem,
+        )
+        p_scale_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, BLOCK_N // VEC_SIZE),
+            tl.uint8,
+            NUM_MMA_GROUPS,
+            tlx.storage_kind.tmem,
+        )
 
     acc_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tl.float32, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
 
@@ -1058,8 +1079,10 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
                 # load q0 + scale
                 q_bufIdx, q_phase = get_bufidx_phase(i, NUM_BUFFERS_Q)
                 tlx.barrier_wait(q_empties[q_bufIdx], q_phase ^ 1)
-                tlx.barrier_expect_bytes(q_fulls[q_bufIdx],
-                                         (Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM) + Q_SCALE_BYTES)
+                tlx.barrier_expect_bytes(
+                    q_fulls[q_bufIdx],
+                    (Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM) + Q_SCALE_BYTES,
+                )
                 qo_offset_y_split = qo_offset_y
                 tlx.async_descriptor_load(desc_q, q_tiles[q_bufIdx], [qo_offset_y_split, 0], q_fulls[q_bufIdx])
                 # 5D TMA offset: [batch_head, m_offset, head_offset, 0, 0]
@@ -1093,8 +1116,10 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
                 # load q1 + scale
                 q_bufIdx += NUM_BUFFERS_Q
                 tlx.barrier_wait(q_empties[q_bufIdx], q_phase ^ 1)
-                tlx.barrier_expect_bytes(q_fulls[q_bufIdx],
-                                         (Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM) + Q_SCALE_BYTES)
+                tlx.barrier_expect_bytes(
+                    q_fulls[q_bufIdx],
+                    (Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM) + Q_SCALE_BYTES,
+                )
                 qo_offset_y_split = qo_offset_y + BLOCK_M_SPLIT
                 tlx.async_descriptor_load(desc_q, q_tiles[q_bufIdx], [qo_offset_y_split, 0], q_fulls[q_bufIdx])
 
@@ -1348,7 +1373,6 @@ def _softmax_recompute_quantization_iter(
     DS_NUM_SUBS: tl.constexpr,
 ):
     DS_M_SUB: tl.constexpr = BLOCK_M1 // DS_NUM_SUBS
-    P_NUM_BLOCKS: tl.constexpr = BLOCK_M1 // VEC_SIZE  # noqa: F841
     _, tmem_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
     ds_buf_id, ds_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
     m_buf_id, m_phase = get_bufidx_phase(blk_idx, M_STAGE)
@@ -1411,7 +1435,11 @@ def _softmax_recompute_quantization_iter(
             p_dtype,
         )
         tlx.local_store(
-            tlx.local_slice(tlx.local_view(ds_tiles_smem, ds_buf_id), [0, subtile_id * DS_M_SUB], [BLOCK_N1, DS_M_SUB]),
+            tlx.local_slice(
+                tlx.local_view(ds_tiles_smem, ds_buf_id),
+                [0, subtile_id * DS_M_SUB],
+                [BLOCK_N1, DS_M_SUB],
+            ),
             ds_fp8,
         )
         ds_scale_packed = ds_scale.reshape([REP_N, 4, 32, REP_M, 4 // DS_NUM_SUBS]).permute(0, 3, 2, 1, 4)
@@ -1425,7 +1453,7 @@ def _softmax_recompute_quantization_iter(
         )
         dsT_t = tl.trans(dsT)
         dq_amax = tl.max(tl.abs(dsT_t))
-        dq_amax_bcast = tl.full([DS_M_SUB, BLOCK_N1 // VEC_SIZE], 0.0, tl.float32) + dq_amax
+        dq_amax_bcast = (tl.full([DS_M_SUB, BLOCK_N1 // VEC_SIZE], 0.0, tl.float32) + dq_amax)
         ds_scale_dq, ds_dq_fp8 = _amax_to_e8m0_and_quantize(
             dsT_t,
             dq_amax_bcast,
@@ -1433,8 +1461,11 @@ def _softmax_recompute_quantization_iter(
             p_dtype,
         )
         tlx.local_store(
-            tlx.local_slice(tlx.local_view(ds_dq_tiles_smem, ds_buf_id), [subtile_id * DS_M_SUB, 0],
-                            [DS_M_SUB, BLOCK_N1]),
+            tlx.local_slice(
+                tlx.local_view(ds_dq_tiles_smem, ds_buf_id),
+                [subtile_id * DS_M_SUB, 0],
+                [DS_M_SUB, BLOCK_N1],
+            ),
             ds_dq_fp8,
         )
         ds_scale_dq_packed = ds_scale_dq.reshape([REP_M, 4 // DS_NUM_SUBS, 32, REP_N, 4]).permute(0, 3, 2, 1, 4)
@@ -2393,7 +2424,11 @@ def _attn_bwd_mxf8_ws(
                     k_scale_dq_tmem[0],
                     K_FP8_FORMAT,
                     use_acc=False,
-                    mBarriers=[dq_fulls[0], ds_empties[ds_buf_id], k_dq_empties[kv_buf_id]],
+                    mBarriers=[
+                        dq_fulls[0],
+                        ds_empties[ds_buf_id],
+                        k_dq_empties[kv_buf_id],
+                    ],
                 )
                 tile_idx += num_progs
 
@@ -2705,8 +2740,8 @@ def attention_bwd(
 
     Non-causal only. Assumes N_CTX is a multiple of 128.
     """
-    assert q.shape == q_dk.shape == k.shape == k_dq.shape == v.shape == do.shape, (
-        "Q, Q_dK, K, K_dQ, V, dO must have the same shape")
+    assert (q.shape == q_dk.shape == k.shape == k_dq.shape == v.shape ==
+            do.shape), "Q, Q_dK, K, K_dQ, V, dO must have the same shape"
     Z, H, N_CTX, HEAD_DIM = q.shape
     assert HEAD_DIM == 128, "this kernel only supports HEAD_DIM = 128"
     assert N_CTX % 128 == 0, "N_CTX must be a multiple of 128 (BLOCK_M1)"
@@ -2854,8 +2889,8 @@ class _attention(torch.autograd.Function):
             strides=[1],
             block_shape=[1],
         )
-        assert k_scale is not None and v_scale is not None and q_scale is not None, (
-            "All scales must be provided for MXFP8")
+        assert (k_scale is not None and v_scale is not None
+                and q_scale is not None), "All scales must be provided for MXFP8"
         dummy_block_shape = [1, 1, 1, 1, 1]
         desc_q_scale = TensorDescriptor.from_tensor(q_scale, block_shape=dummy_block_shape)
         desc_k_scale = TensorDescriptor.from_tensor(k_scale, block_shape=dummy_block_shape)
@@ -3016,9 +3051,9 @@ def generate_attention_inputs(shape, device, dtype):
     """
     # Generate bf16 reference tensors first
     orig_dtype = torch.bfloat16
-    q_ref = torch.empty(shape, device=device, dtype=orig_dtype).normal_(mean=0.0, std=0.5).contiguous()
-    k_ref = torch.empty(shape, device=device, dtype=orig_dtype).normal_(mean=0.0, std=0.5).contiguous()
-    v_ref = torch.empty(shape, device=device, dtype=orig_dtype).normal_(mean=0.0, std=0.5).contiguous()
+    q_ref = (torch.empty(shape, device=device, dtype=orig_dtype).normal_(mean=0.0, std=0.5).contiguous())
+    k_ref = (torch.empty(shape, device=device, dtype=orig_dtype).normal_(mean=0.0, std=0.5).contiguous())
+    v_ref = (torch.empty(shape, device=device, dtype=orig_dtype).normal_(mean=0.0, std=0.5).contiguous())
     # Convert to 2D for MXFP8
     q_2d = q_ref.reshape(shape[0] * shape[1] * shape[2], shape[3]).contiguous()
     k_2d = k_ref.reshape(shape[0] * shape[1] * shape[2], shape[3]).contiguous()
@@ -3097,7 +3132,14 @@ def attention(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal, config=None)
     triton.set_allocator(alloc_fn)
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-    grid = (min(NUM_SMS, triton.cdiv(q.shape[2], config["BLOCK_M"]) * q.shape[0] * q.shape[1]), 1, 1)
+    grid = (
+        min(
+            NUM_SMS,
+            triton.cdiv(q.shape[2], config["BLOCK_M"]) * q.shape[0] * q.shape[1],
+        ),
+        1,
+        1,
+    )
     _attn_fwd_mxf8_ws.fn[grid](
         sm_scale,
         desc_m,
