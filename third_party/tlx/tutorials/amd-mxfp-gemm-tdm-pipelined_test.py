@@ -84,15 +84,27 @@ def _mxgemm_issue_tdm_loads(
     TRANSPOSE_B: tl.constexpr,
 ):
     slot = phase % NUM_BUFFERS
-    tlx.async_amd_descriptor_load(a_desc, tlx.local_view(a_buf, slot), [0, load_idx * BLOCK_K_PACKED_A], pred=pred)
     if TRANSPOSE_B:
-        tlx.async_amd_descriptor_load(b_desc, tlx.local_view(b_buf, slot), [0, load_idx * BLOCK_K_PACKED_B], pred=pred)
+        b_offsets = [0, load_idx * BLOCK_K_PACKED_B]
     else:
-        tlx.async_amd_descriptor_load(b_desc, tlx.local_view(b_buf, slot), [load_idx * BLOCK_K_PACKED_B, 0], pred=pred)
-    tlx.async_amd_descriptor_load(a_scale_desc, tlx.local_view(a_scale_buf, slot),
-                                  [0, load_idx * BLOCK_K_SCALE_PRESHUFFLED], pred=pred)
-    tlx.async_amd_descriptor_load(b_scale_desc, tlx.local_view(b_scale_buf, slot),
-                                  [0, load_idx * BLOCK_K_SCALE_PRESHUFFLED], pred=pred)
+        b_offsets = [load_idx * BLOCK_K_PACKED_B, 0]
+    tlx.async_amd_descriptor_load_group(
+        [a_desc, b_desc, a_scale_desc, b_scale_desc],
+        [
+            tlx.local_view(a_buf, slot),
+            tlx.local_view(b_buf, slot),
+            tlx.local_view(a_scale_buf, slot),
+            tlx.local_view(b_scale_buf, slot),
+        ],
+        [
+            [0, load_idx * BLOCK_K_PACKED_A],
+            b_offsets,
+            [0, load_idx * BLOCK_K_SCALE_PRESHUFFLED],
+            [0, load_idx * BLOCK_K_SCALE_PRESHUFFLED],
+        ],
+        [0b0001, 0b0010, 0b0100, 0b1000],
+        preds=[pred, pred, pred, pred],
+    )
     return load_idx + 1
 
 
@@ -115,15 +127,26 @@ def _mxgemm_issue_tdm_loads_unpredicated(
     TRANSPOSE_B: tl.constexpr,
 ):
     slot = phase % NUM_BUFFERS
-    tlx.async_amd_descriptor_load(a_desc, tlx.local_view(a_buf, slot), [0, load_idx * BLOCK_K_PACKED_A])
     if TRANSPOSE_B:
-        tlx.async_amd_descriptor_load(b_desc, tlx.local_view(b_buf, slot), [0, load_idx * BLOCK_K_PACKED_B])
+        b_offsets = [0, load_idx * BLOCK_K_PACKED_B]
     else:
-        tlx.async_amd_descriptor_load(b_desc, tlx.local_view(b_buf, slot), [load_idx * BLOCK_K_PACKED_B, 0])
-    tlx.async_amd_descriptor_load(a_scale_desc, tlx.local_view(a_scale_buf, slot),
-                                  [0, load_idx * BLOCK_K_SCALE_PRESHUFFLED])
-    tlx.async_amd_descriptor_load(b_scale_desc, tlx.local_view(b_scale_buf, slot),
-                                  [0, load_idx * BLOCK_K_SCALE_PRESHUFFLED])
+        b_offsets = [load_idx * BLOCK_K_PACKED_B, 0]
+    tlx.async_amd_descriptor_load_group(
+        [a_desc, b_desc, a_scale_desc, b_scale_desc],
+        [
+            tlx.local_view(a_buf, slot),
+            tlx.local_view(b_buf, slot),
+            tlx.local_view(a_scale_buf, slot),
+            tlx.local_view(b_scale_buf, slot),
+        ],
+        [
+            [0, load_idx * BLOCK_K_PACKED_A],
+            b_offsets,
+            [0, load_idx * BLOCK_K_SCALE_PRESHUFFLED],
+            [0, load_idx * BLOCK_K_SCALE_PRESHUFFLED],
+        ],
+        [0b0001, 0b0010, 0b0100, 0b1000],
+    )
     return load_idx + 1
 
 
@@ -209,7 +232,7 @@ def mxgemm_tdm_pipelined_kernel(
     BLOCK_M_PRESHUFFLED: tl.constexpr = BLOCK_M // 128
     BLOCK_N_PRESHUFFLED: tl.constexpr = BLOCK_N // 128
     BLOCK_K_SCALE_PRESHUFFLED: tl.constexpr = BLOCK_K_SCALE * 128
-    NUM_LOADS_IN_BATCH: tl.constexpr = 4
+    NUM_LOADS_IN_BATCH: tl.constexpr = 1
 
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -552,7 +575,8 @@ def test_mxgemm_tdm_pipelined_compiles_gfx1250():
     compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32))
     ttgir = compiled.asm["ttgir"]
     amdgcn = compiled.asm["amdgcn"]
-    assert "amdg.async_tdm_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_group_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_copy_global_to_local" not in ttgir
     assert "tt.dot_scaled" in ttgir
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
     assert "wmma" in amdgcn
