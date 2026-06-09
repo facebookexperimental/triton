@@ -77,5 +77,6 @@ exclude: |
     ^third_party/f2reduce|
     ^third_party/tileir|
     ^python/test/gluon/|
-    ^python/triton/experimental/gluon/
+    ^python/triton/experimental/gluon/|
+    ^third_party/tlx/tools/sched2tlx/
   )
