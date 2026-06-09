@@ -129,7 +129,7 @@ def local_alloc(
         reuse: Optional buffer reuse specification:
             - buffered_tensor: Reuse an existing buffer's memory (legacy).
             - storage_alias_spec: Reference a storage alias specification.
-        layout: Optional memory layout encoding.
+        layout: Optional memory (storage) layout encoding.
 
     Returns:
         A buffered_tensor representing the allocated buffers.
@@ -693,15 +693,27 @@ def async_load_wait_group(
 def local_load(
     src: tlx.buffered_tensor,
     token: tlx.async_token = None,
+    layout=None,
     _semantic=None,
 ) -> tl.tensor:
     """
     Loads buffer from local or tensor memory into a distributed tensor.
+
+    ``layout`` (optional) pins the register layout of the loaded value, written
+    as a ``tlx.layout(...)`` (Shape:Stride). It is mapped to a ``#linear``
+    encoding so the compiler propagates it back and avoids ``convert_layout``.
     """
     block_type = tl.block_type(src.type.element_ty, src.type.shape)
     storage = src.type.storage
+    layout = tl._unwrap_if_constexpr(layout)
     if storage == tlx.storage_kind.tmem:
         _assert_blackwell_for_tmem(_semantic.builder.options.arch)
+        if layout is not None:
+            # Pin the load result to the requested register layout directly.
+            enc = layout.to_ir(_semantic.builder, src.type.shape, src.type.element_ty)
+            load_handle = _semantic.builder.create_tmem_load(src.handle, enc,
+                                                             token.handle if token else None)
+            return tl.tensor(load_handle, block_type)
         tmem_compatible_layout_encoding = _create_tmem_compatible_tensor_layout_encoding(_semantic.builder, src)
         load_handle = _semantic.builder.create_tmem_load(src.handle, tmem_compatible_layout_encoding,
                                                          token.handle if token else None)
@@ -709,6 +721,9 @@ def local_load(
         return tl.tensor(output, block_type)
     else:
         output = _semantic.builder.create_local_load(src.handle, token.handle if token else None)
+        if layout is not None:
+            enc = layout.to_ir(_semantic.builder, src.type.shape, src.type.element_ty)
+            output = _semantic.builder.create_require_layout(output, enc)
         result = tl.tensor(output, block_type)
         if token is not None and _semantic.builder.options.backend_name == "hip":
             result.handle.set_attr("ttg.amdg.syncedViaAsyncWait", _semantic.builder.get_bool_attr(True))
