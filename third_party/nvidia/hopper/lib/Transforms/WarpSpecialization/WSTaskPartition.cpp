@@ -25,9 +25,8 @@ void doTaskPartition(triton::FuncOp &funcOp, unsigned numWarpGroups) {
 
   // Bail out in the presence of user annotations.
   DenseSet<int> allAsyncTasks;
-  funcOp->walk([&](Operation *op) {
-    allAsyncTasks.insert_range(getAsyncTaskIds(op));
-  });
+  funcOp->walk(
+      [&](Operation *op) { allAsyncTasks.insert_range(getAsyncTaskIds(op)); });
 
   if (!allAsyncTasks.empty())
     return;

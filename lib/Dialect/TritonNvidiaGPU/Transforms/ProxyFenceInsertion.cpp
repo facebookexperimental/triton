@@ -49,14 +49,13 @@ Value getSmemDest(Operation *op) {
 }
 
 bool isAsyncProxyRead(Operation *op) {
-  return isa<triton::nvidia_gpu::WarpGroupDotOp,
-             triton::nvidia_gpu::TCGen5MMAOp,
-             triton::nvidia_gpu::TCGen5MMAScaledOp,
-             triton::nvidia_gpu::TMEMCopyOp,
-             triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp,
-             triton::nvidia_gpu::AsyncTMAScatterOp,
-             triton::nvidia_gpu::AsyncTMAReduceOp,
-             triton::nvidia_gpu::AsyncTMACopyLocalToGlobalOp>(op);
+  return isa<
+      triton::nvidia_gpu::WarpGroupDotOp, triton::nvidia_gpu::TCGen5MMAOp,
+      triton::nvidia_gpu::TCGen5MMAScaledOp, triton::nvidia_gpu::TMEMCopyOp,
+      triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp,
+      triton::nvidia_gpu::AsyncTMAScatterOp,
+      triton::nvidia_gpu::AsyncTMAReduceOp,
+      triton::nvidia_gpu::AsyncTMACopyLocalToGlobalOp>(op);
 }
 
 bool isAsyncProxyReadSource(Operation *op, Value value) {

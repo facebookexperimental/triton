@@ -894,8 +894,7 @@ parseChannelAnnotations(Operation *parentOp) {
       ann.memType = parts[1].str();
       std::optional<unsigned> numCopies =
           parseUnsignedAnnotationField(parts[2]);
-      std::optional<unsigned> bufferId =
-          parseUnsignedAnnotationField(parts[3]);
+      std::optional<unsigned> bufferId = parseUnsignedAnnotationField(parts[3]);
       if (!numCopies || !bufferId) {
         LDBG("WARNING: invalid numeric field in channel annotation '" << *str
                                                                       << "'");

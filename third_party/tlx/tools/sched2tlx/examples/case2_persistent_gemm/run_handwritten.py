@@ -9,7 +9,6 @@ import torch
 import triton
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-
 NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
 
 
@@ -48,7 +47,7 @@ def main() -> int:
         b_desc = TensorDescriptor.from_tensor(b_t, [BLOCK_N, BLOCK_K])
         c_desc = TensorDescriptor.from_tensor(c, [BLOCK_M, BLOCK_N])
 
-        grid = (NUM_SMS,)
+        grid = (NUM_SMS, )
         handwritten.matmul_kernel[grid](
             a_desc,
             b_desc,

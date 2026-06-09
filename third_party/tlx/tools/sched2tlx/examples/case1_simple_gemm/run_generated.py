@@ -17,16 +17,13 @@ def main() -> int:
     triton.set_allocator(alloc_fn)
 
     torch.manual_seed(0)
-    BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
+    BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64  # noqa: F841
 
-    shapes = [
-        (1024, 1024, 1024),
-        (2048, 2048, 2048),
-        (4096, 4096, 4096),
-        # K not a multiple of 64 — exercises modulo schedule on non-clean trip count.
-        (1024, 1024, 1024 - 64),  # K=960
-        (1024, 1024, 1024 + 128),  # K=1152
-    ]
+    shapes = [(1024, 1024, 1024), (2048, 2048, 2048), (4096, 4096, 4096),
+              # K not a multiple of 64 — exercises modulo schedule on non-clean trip count.
+              (1024, 1024, 1024 - 64),  # K=960
+              (1024, 1024, 1024 + 128),  # K=1152
+              ]
     failed = 0
     for M, N, K in shapes:
         a = torch.randn(M, K, device="cuda", dtype=torch.float16)
@@ -60,10 +57,8 @@ def main() -> int:
         rel = err_vs_fp32 / ref_fp32.abs().max().item()
         ok = nan == 0 and rel < 5e-3
         marker = "PASS" if ok else "FAIL"
-        print(
-            f"[{marker}] M={M} N={N} K={K}  nan={nan}  "
-            f"vs_torch_fp16={err_vs_torch:.3e}  vs_fp32={err_vs_fp32:.3e} (rel={rel:.3e})"
-        )
+        print(f"[{marker}] M={M} N={N} K={K}  nan={nan}  "
+              f"vs_torch_fp16={err_vs_torch:.3e}  vs_fp32={err_vs_fp32:.3e} (rel={rel:.3e})")
         if not ok:
             failed += 1
 
