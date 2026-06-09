@@ -268,19 +268,20 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32}
 // CHECK:               %[[VAL_20:.*]] = tt.addptr %[[VAL_17]], %[[VAL_8]] : !tt.ptr<f32>, i32
 // CHECK:               %[[VAL_21:.*]] = arith.extsi %[[VAL_9]] : tensor<1024xi32, #blocked> to tensor<1024xi64, #blocked>
 // CHECK:               %[[VAL_22:.*]] = arith.addi %[[VAL_21]], %[[VAL_18]] : tensor<1024xi64, #blocked>
-// CHECK:               %[[VAL_23:.*]] = arith.trunci %[[VAL_22]] : tensor<1024xi64, #blocked> to tensor<1024xi32, #blocked>
-// CHECK:               %[[VAL_24:.*]] = amdg.buffer_load %[[VAL_20]][%[[VAL_23]]] : tensor<1024xf32, #blocked>
-// CHECK:               %[[VAL_25:.*]] = arith.addf %[[VAL_24]], %[[VAL_19]] : tensor<1024xf32, #blocked>
-// CHECK:               scf.yield %[[VAL_20]], %[[VAL_22]], %[[VAL_25]] : !tt.ptr<f32>, tensor<1024xi64, #blocked>, tensor<1024xf32, #blocked>
+// CHECK:               %[[VAL_23:.*]] = tt.splat %[[VAL_20]] : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked>
+// CHECK:               %[[VAL_24:.*]] = tt.addptr %[[VAL_23]], %[[VAL_22]] : tensor<1024x!tt.ptr<f32>, #blocked>, tensor<1024xi64, #blocked>
+// CHECK:               %[[VAL_25:.*]] = tt.load %[[VAL_24]] : tensor<1024x!tt.ptr<f32>, #blocked>
+// CHECK:               %[[VAL_26:.*]] = arith.addf %[[VAL_25]], %[[VAL_19]] : tensor<1024xf32, #blocked>
+// CHECK:               scf.yield %[[VAL_20]], %[[VAL_22]], %[[VAL_26]] : !tt.ptr<f32>, tensor<1024xi64, #blocked>, tensor<1024xf32, #blocked>
 // CHECK:             }
-// CHECK:             scf.yield %[[VAL_26:.*]]#0, %[[VAL_26]]#1, %[[VAL_26]]#2 : !tt.ptr<f32>, tensor<1024xi64, #blocked>, tensor<1024xf32, #blocked>
+// CHECK:             scf.yield %[[VAL_27:.*]]#0, %[[VAL_27]]#1, %[[VAL_27]]#2 : !tt.ptr<f32>, tensor<1024xi64, #blocked>, tensor<1024xf32, #blocked>
 // CHECK:           }
-// CHECK:           %[[VAL_27:.*]] = tt.addptr %[[VAL_28:.*]]#0, %[[VAL_8]] : !tt.ptr<f32>, i32
-// CHECK:           %[[VAL_29:.*]] = arith.extsi %[[VAL_9]] : tensor<1024xi32, #blocked> to tensor<1024xi64, #blocked>
-// CHECK:           %[[VAL_30:.*]] = arith.addi %[[VAL_29]], %[[VAL_28]]#1 : tensor<1024xi64, #blocked>
-// CHECK:           %[[VAL_31:.*]] = arith.trunci %[[VAL_30]] : tensor<1024xi64, #blocked> to tensor<1024xi32, #blocked>
-// CHECK:           %[[VAL_32:.*]] = amdg.buffer_load %[[VAL_27]][%[[VAL_31]]] : tensor<1024xf32, #blocked>
-// CHECK:           tt.return %[[VAL_32]] : tensor<1024xf32, #blocked>
+// CHECK:           %[[VAL_28:.*]] = tt.addptr %[[VAL_29:.*]]#0, %[[VAL_8]] : !tt.ptr<f32>, i32
+// CHECK:           %[[VAL_30:.*]] = arith.extsi %[[VAL_9]] : tensor<1024xi32, #blocked> to tensor<1024xi64, #blocked>
+// CHECK:           %[[VAL_31:.*]] = arith.addi %[[VAL_30]], %[[VAL_29]]#1 : tensor<1024xi64, #blocked>
+// CHECK:           %[[VAL_32:.*]] = arith.trunci %[[VAL_31]] : tensor<1024xi64, #blocked> to tensor<1024xi32, #blocked>
+// CHECK:           %[[VAL_33:.*]] = amdg.buffer_load %[[VAL_28]][%[[VAL_32]]] : tensor<1024xf32, #blocked>
+// CHECK:           tt.return %[[VAL_33]] : tensor<1024xf32, #blocked>
 // CHECK:         }
 
 #blocked0 = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
