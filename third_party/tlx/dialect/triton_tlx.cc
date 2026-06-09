@@ -10,6 +10,8 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Tools/LayoutUtils.h"
+#include "triton/Tools/LinearLayout.h"
 #include "llvm/Support/Casting.h"
 
 namespace py = pybind11;
@@ -267,6 +269,27 @@ void init_triton_tlx_ir(py::module &&m) {
                  cast<RankedTensorType>(opnd.getType()).getElementType();
              return ttg::DotOperandEncodingAttr::get(context, opIdx, parentEnc,
                                                      eltType);
+           })
+      .def("make_linear_encoding_attr",
+           [](TritonOpBuilder &self, std::vector<std::vector<int>> regBases,
+              std::vector<std::vector<int>> laneBases,
+              std::vector<std::vector<int>> warpBases,
+              std::vector<int64_t> shape) -> Attribute {
+             auto context = self.getBuilder().getContext();
+             auto kReg = mlir::StringAttr::get(context, "register");
+             auto kLane = mlir::StringAttr::get(context, "lane");
+             auto kWarp = mlir::StringAttr::get(context, "warp");
+             auto kBlock = mlir::StringAttr::get(context, "block");
+             auto outDims = tt::standardOutDimPairs(context, shape);
+             auto ll = tt::LinearLayout(
+                 {{kReg, regBases},
+                  {kLane, laneBases},
+                  {kWarp, warpBases},
+                  {kBlock, std::vector<std::vector<int>>{}}},
+                 outDims,
+                 /*requiresSurjective=*/true);
+             return mlir::cast<Attribute>(
+                 ttg::LinearEncodingAttr::get(context, std::move(ll)));
            })
       .def("make_dummy_register_layout_attr",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
