@@ -135,7 +135,8 @@ def tlx_addmm_glu_kernel(
         tok_b = tlx.async_load(b_ptr + b_offs, tlx.local_view(smemB, i), mask=offs_k[:, None] < K - k_start)
         tlx.async_load_commit_group([tok_b])
 
-    # Wait for all buffers to be filled before we start the hotloop
+    # Wait for earliest 2 buffers to be filled before starting hot loop
+    # The rest (NUM_BUFFERS - 1) * 2 buffers can be in flight
     tlx.async_load_wait_group((NUM_BUFFERS - 1) * 2)
 
     # Transfer to registers
@@ -161,8 +162,9 @@ def tlx_addmm_glu_kernel(
         with tlx.warp_pipeline_stage("mfma", priority=0):
             acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
 
-        # Want it to be larger (how many of oldest needed)
-        tlx.async_load_wait_group(2) # Don't hardcode this
+        # We need the oldest two buffers to be ready to locally load
+        # The rest (NUM_BUFFERS - 1) * 2 buffers can be in flight
+        tlx.async_load_wait_group((NUM_BUFFERS - 1) * 2)
 
         with tlx.warp_pipeline_stage("mem", priority=1):
             # Perform global prefetching
@@ -185,7 +187,7 @@ def tlx_addmm_glu_kernel(
     # Epilogue: drain the remaining in-flight tiles
     acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
 
-    # Increase if num_buffers is bigger
+    # Wait for all buffers to be loaded before draining in epilogue loop
     tlx.async_load_wait_group(0)
 
     # Use static range here
