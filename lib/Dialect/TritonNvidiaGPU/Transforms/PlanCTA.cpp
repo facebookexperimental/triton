@@ -353,7 +353,13 @@ void CTAPlanner::processStoreLikeOps(triton::FuncOp &funcOp) {
                   triton::DescriptorStoreLikeOpInterface, AsyncStoreOp>(op))
       stores.push_back(op);
   });
-  assert(stores.size() > 0 && "Cannot find store-like ops");
+  // A kernel with no store-like ops (e.g. a nop kernel) has no tensor result to
+  // anchor CTA tiling on. There is nothing to split across CTAs, so just mark
+  // tiling as determined and return.
+  if (stores.empty()) {
+    markTiled();
+    return;
+  }
 
   ttg::CGAEncodingAttr CGALayout;
   for (Operation *store : stores) {
