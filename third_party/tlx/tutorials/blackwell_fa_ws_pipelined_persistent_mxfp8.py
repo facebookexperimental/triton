@@ -1424,21 +1424,20 @@ def _softmax_recompute_quantization_iter(
             ),
             ds_scale_packed,
         )
-        dsT_t = tl.trans(dsT)
-        dq_amax = tl.max(tl.abs(dsT_t))
-        dq_amax_bcast = tl.full([DS_M_SUB, BLOCK_N1 // VEC_SIZE], 0.0, tl.float32) + dq_amax
+        dq_amax = tl.max(tl.abs(dsT))
+        dq_amax_bcast = tl.full([BLOCK_N1, DS_M_SUB // VEC_SIZE], 0.0, tl.float32) + dq_amax
         ds_scale_dq, ds_dq_fp8 = _amax_to_e8m0_and_quantize(
-            dsT_t,
+            dsT,
             dq_amax_bcast,
             VEC_SIZE,
             p_dtype,
         )
         tlx.local_store(
-            tlx.local_slice(tlx.local_view(ds_dq_tiles_smem, ds_buf_id), [subtile_id * DS_M_SUB, 0],
-                            [DS_M_SUB, BLOCK_N1]),
+            tlx.local_slice(tlx.local_view(ds_dq_tiles_smem, ds_buf_id), [0, subtile_id * DS_M_SUB],
+                            [BLOCK_N1, DS_M_SUB]),
             ds_dq_fp8,
         )
-        ds_scale_dq_packed = ds_scale_dq.reshape([REP_M, 4 // DS_NUM_SUBS, 32, REP_N, 4]).permute(0, 3, 2, 1, 4)
+        ds_scale_dq_packed = ds_scale_dq.reshape([REP_N, 4, 32, REP_M, 4 // DS_NUM_SUBS]).permute(3, 0, 2, 4, 1)
         tlx.local_store(
             tlx.local_slice(
                 tlx.local_view(ds_scale_dq_smem, 0),
@@ -1848,7 +1847,7 @@ def _attn_bwd_mxf8_ws(
     # dK consumes dS^T while dQ consumes dS. MXFP8 quantization depends on the
     # reduction axis, so we keep separate internal encodings for the two GEMMs.
     ds_tiles_smem = tlx.local_alloc((BLOCK_N1, BLOCK_M1), p_dtype, NUM_BUFFERS_DS)
-    ds_dq_tiles_smem = tlx.local_alloc((BLOCK_M1, BLOCK_N1), p_dtype, NUM_BUFFERS_DS)
+    ds_dq_tiles_smem = tlx.local_alloc((BLOCK_N1, BLOCK_M1), p_dtype, NUM_BUFFERS_DS)
     # SMEM storage spots for dS scales to enable
     # async transfers from SMEM to TMEM.
     # (1, REP_M, REP_HEAD, 2, 256)
@@ -2259,7 +2258,7 @@ def _attn_bwd_mxf8_ws(
                     tlx.tmem_copy(ds_scale_dq_smem[0], ds_scale_dq_tmem[0])
                     tlx.tmem_copy(k_scale_dq_smem[kv_buf_id], k_scale_dq_tmem[0])
                     tlx.async_dot_scaled(
-                        ds_dq_tiles_smem[ds_buf_id_prev],
+                        tlx.local_trans(ds_dq_tiles_smem[ds_buf_id_prev]),
                         k_dq_smem[kv_buf_id],
                         dq_tiles[0],
                         ds_scale_dq_tmem[0],
@@ -2409,7 +2408,7 @@ def _attn_bwd_mxf8_ws(
                 tlx.tmem_copy(ds_scale_dq_smem[0], ds_scale_dq_tmem[0])
                 tlx.tmem_copy(k_scale_dq_smem[kv_buf_id], k_scale_dq_tmem[0])
                 tlx.async_dot_scaled(
-                    ds_dq_tiles_smem[ds_buf_id],
+                    tlx.local_trans(ds_dq_tiles_smem[ds_buf_id]),
                     k_dq_smem[kv_buf_id],
                     dq_tiles[0],
                     ds_scale_dq_tmem[0],
