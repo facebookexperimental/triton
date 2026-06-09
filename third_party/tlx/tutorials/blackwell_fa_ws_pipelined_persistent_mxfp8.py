@@ -1361,7 +1361,7 @@ def _softmax_recompute_quantization_iter(
     # MMA partition that the region is empty - otherwise MMA 2
     # (which writes dp_tiles into the same cols) can overwrite
     # qk while this load is still in flight.
-    qkT = tlx.local_load(tlx.local_view(qk_tiles, 0))
+    qkT = tlx.local_load(tlx.local_view(qk_tiles, 0), layout=_QK_SEPARABLE_LAYOUT)
     tlx.barrier_arrive(qk_empties[0])
     tlx.barrier_wait(m_fulls[m_buf_id], m_phase)
     m = tlx.local_load(sM_tiles[m_buf_id])
@@ -1393,7 +1393,8 @@ def _softmax_recompute_quantization_iter(
         ))
         if subtile_id == 0:
             tlx.barrier_wait(dp_fulls[0], tmem_phase)
-        dpT = tlx.local_load(tlx.subslice(tlx.local_view(dp_tiles, 0), DS_M_SUB * subtile_id, DS_M_SUB))
+        dpT = tlx.local_load(tlx.subslice(tlx.local_view(dp_tiles, 0), DS_M_SUB * subtile_id, DS_M_SUB),
+                             layout=_DPT_SEPARABLE_LAYOUT)
         if subtile_id == DS_NUM_SUBS - 1:
             tlx.barrier_arrive(dp_empties[0])
 
@@ -1448,6 +1449,29 @@ def _softmax_recompute_quantization_iter(
         )
     tlx.barrier_arrive(ds_fulls[ds_buf_id])
     tlx.barrier_arrive(d_empties[d_buf_id])
+
+
+# "Separable" thread-value layout for the 128x128 QK^T accumulator read out
+# of TMEM, written purely as shape/stride (flat row-major offset = n*128 + m):
+# value -> M, thread -> N. Pinning this on the qkT load makes P / dP / dS share
+# one register layout, so the pT split is a free register relabel and the P f8
+# store is convert-free (the separable unification, now expressed in source
+# instead of hand-edited TTGIR). Specialized for the BLOCK_N1=BLOCK_M1=128,
+# num_warps=8 bwd config.
+_QK_SEPARABLE_LAYOUT = tlx.layout(
+    shape=((32, 4, 2), (32, 2)),  # (thread, value)
+    stride=((128, 4096, 32), (1, 64)),
+)
+
+# The matching separable layout for the 128x64 dP^T sub-tile loads (flat
+# row-major offset = n * 64 + m). This is _QK_SEPARABLE_LAYOUT minus the stage
+# register bit (the sub-tile is one of the two M halves), so dS = pT * (dP - Di)
+# unifies on one layout and the dS path stays convert-free. Specialized for the
+# DS_NUM_SUBS=2 (DS_M_SUB=64), num_warps=8 bwd config.
+_DPT_SEPARABLE_LAYOUT = tlx.layout(
+    shape=((32, 4, 2), (32, )),  # (thread, value)
+    stride=((64, 2048, 32), (1, )),
+)
 
 
 @triton.autotune(
