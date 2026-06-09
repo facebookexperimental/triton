@@ -94,9 +94,7 @@ def main():
         (2, 16, 4096),
         (1, 32, 8192),
     ]
-    print(
-        f"{'Shape':<18} {'HW ms':<10} {'HW TF':<8} {'GEN ms':<10} {'GEN TF':<8} {'GEN/HW':<8}"
-    )
+    print(f"{'Shape':<18} {'HW ms':<10} {'HW TF':<8} {'GEN ms':<10} {'GEN TF':<8} {'GEN/HW':<8}")
     print("-" * 70)
     for Z, H, N_CTX in shapes:
         q = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cuda", dtype=torch.bfloat16)

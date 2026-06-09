@@ -1348,7 +1348,7 @@ def _softmax_recompute_quantization_iter(
     DS_NUM_SUBS: tl.constexpr,
 ):
     DS_M_SUB: tl.constexpr = BLOCK_M1 // DS_NUM_SUBS
-    P_NUM_BLOCKS: tl.constexpr = BLOCK_M1 // VEC_SIZE
+    P_NUM_BLOCKS: tl.constexpr = BLOCK_M1 // VEC_SIZE  # noqa: F841
     _, tmem_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
     ds_buf_id, ds_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
     m_buf_id, m_phase = get_bufidx_phase(blk_idx, M_STAGE)
@@ -1893,8 +1893,7 @@ def _attn_bwd_mxf8_ws(
         with tlx.async_task("default"):
             # Pre-fill P scale SMEM once (constant E8M0=119 for all tiles).
             P_FIXED_E8M0: tl.constexpr = 119
-            p_scale_const = tl.full(
-                [REP_N, REP_M, 32, 4, 4], P_FIXED_E8M0, dtype=tl.uint8)
+            p_scale_const = tl.full([REP_N, REP_M, 32, 4, 4], P_FIXED_E8M0, dtype=tl.uint8)
             tlx.local_store(p_scale_smem[0], p_scale_const)
 
             blk_idx = 0

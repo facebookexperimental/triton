@@ -117,7 +117,14 @@ def matmul(a: torch.Tensor, b: torch.Tensor, config=None) -> torch.Tensor:
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     matmul_tdm_pipelined_kernel[grid](
-        a, b, c, M, N, K,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        a,
+        b,
+        c,
+        M,
+        N,
+        K,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
     )
     return c

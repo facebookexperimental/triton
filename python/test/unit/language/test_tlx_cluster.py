@@ -470,8 +470,7 @@ def test_cluster_launch_control_3d(GRID_DIMS, device):
             if tlx.thread_id(axis=0) == 0:
                 tl.store(output_ptr + linear_idx, linear_idx)
 
-            tile_x, tile_y, tile_z = tlx.clc_consumer(
-                clc_context, clc_phase_consumer, return_3d=True)
+            tile_x, tile_y, tile_z = tlx.clc_consumer(clc_context, clc_phase_consumer, return_3d=True)
             clc_phase_consumer ^= 1
 
     if GRID_DIMS == 1:
@@ -482,7 +481,7 @@ def test_cluster_launch_control_3d(GRID_DIMS, device):
         TILES_X, TILES_Y, TILES_Z = 3, 2, 2
 
     total_tiles = TILES_X * TILES_Y * TILES_Z
-    output = torch.full((total_tiles,), -1, dtype=torch.int32, device=device)
+    output = torch.full((total_tiles, ), -1, dtype=torch.int32, device=device)
     expected = torch.arange(total_tiles, dtype=torch.int32, device=device)
 
     grid = (TILES_X, TILES_Y, TILES_Z)

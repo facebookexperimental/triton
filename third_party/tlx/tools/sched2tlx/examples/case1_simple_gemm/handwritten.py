@@ -20,32 +20,17 @@ import triton.language.extra.tlx as tlx
 
 
 @triton.jit
-def gemm_kernel(
-    a_desc,
-    b_desc,
-    c_desc,
-    M,
-    N,
-    K,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    NUM_SMEM_BUFFERS: tl.constexpr,  # = 2 from modulo
-    NUM_TMEM_BUFFERS: tl.constexpr,  # = 1 from modulo
-):
+def gemm_kernel(a_desc, b_desc, c_desc, M, N, K, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                NUM_SMEM_BUFFERS: tl.constexpr,  # = 2 from modulo
+                NUM_TMEM_BUFFERS: tl.constexpr,  # = 1 from modulo
+                ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
     # ── Allocs (one per modulo BufferInfo, count = N) ──
-    buffers_A = tlx.local_alloc(
-        (BLOCK_M, BLOCK_K), tlx.dtype_of(a_desc), NUM_SMEM_BUFFERS
-    )
-    buffers_B = tlx.local_alloc(
-        (BLOCK_K, BLOCK_N), tlx.dtype_of(b_desc), NUM_SMEM_BUFFERS
-    )
-    acc_tmem = tlx.local_alloc(
-        (BLOCK_M, BLOCK_N), tl.float32, NUM_TMEM_BUFFERS, tlx.storage_kind.tmem
-    )
+    buffers_A = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_desc), NUM_SMEM_BUFFERS)
+    buffers_B = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(b_desc), NUM_SMEM_BUFFERS)
+    acc_tmem = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, NUM_TMEM_BUFFERS, tlx.storage_kind.tmem)
     # SMEM staging for epilogue TMA store (depth=1 — single store per tile).
     c_smem = tlx.local_alloc((BLOCK_M, BLOCK_N), tlx.dtype_of(c_desc), 1)
 
@@ -68,9 +53,7 @@ def gemm_kernel(
             c = acc_full.to(tlx.dtype_of(c_desc))
             tlx.local_store(c_smem[0], c)
             tlx.fence_async_shared()
-            tlx.async_descriptor_store(
-                c_desc, c_smem[0], [pid_m * BLOCK_M, pid_n * BLOCK_N]
-            )
+            tlx.async_descriptor_store(c_desc, c_smem[0], [pid_m * BLOCK_M, pid_n * BLOCK_N])
             tlx.async_descriptor_store_wait(0)
 
         # ── Partition: TC (MMA consumer) ──
@@ -124,15 +107,9 @@ def gemm(a, b):
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
 
-    a_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
-        a, [BLOCK_M, BLOCK_K]
-    )
-    b_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
-        b, [BLOCK_K, BLOCK_N]
-    )
-    c_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
-        c, [BLOCK_M, BLOCK_N]
-    )
+    a_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(a, [BLOCK_M, BLOCK_K])
+    b_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(b, [BLOCK_K, BLOCK_N])
+    c_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(c, [BLOCK_M, BLOCK_N])
 
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     gemm_kernel[grid](

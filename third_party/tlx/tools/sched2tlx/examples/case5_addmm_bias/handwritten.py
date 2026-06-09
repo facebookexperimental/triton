@@ -40,9 +40,7 @@ def addmm_persistent_2d_bias(
     a_smem = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, NUM_BUFFERS_AB)
     b_smem = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, NUM_BUFFERS_AB)
     bias_smem = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
-    acc_tmem = tlx.local_alloc(
-        (BLOCK_M, BLOCK_N), tl.float32, NUM_BUFFERS_ACC, tlx.storage_kind.tmem
-    )
+    acc_tmem = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, NUM_BUFFERS_ACC, tlx.storage_kind.tmem)
     c_smem = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
 
     a_full = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_AB, arrive_count=1)
@@ -74,9 +72,7 @@ def addmm_persistent_2d_bias(
 
                 tlx.barrier_wait(bias_empty[0], (it & 1) ^ 1)
                 tlx.barrier_expect_bytes(bias_full[0], BLOCK_M * BLOCK_N * 2)
-                tlx.async_descriptor_load(
-                    bias_desc, bias_smem[0], [offs_m, offs_n], bias_full[0]
-                )
+                tlx.async_descriptor_load(bias_desc, bias_smem[0], [offs_m, offs_n], bias_full[0])
                 tlx.barrier_wait(bias_full[0], it & 1)
                 bias = tlx.local_load(bias_smem[0])
                 tlx.barrier_arrive(bias_empty[0], 1)
@@ -131,12 +127,8 @@ def addmm_persistent_2d_bias(
                     offs_k = k * BLOCK_K
                     tlx.barrier_wait(a_empty[buf], phase ^ 1)
                     tlx.barrier_expect_bytes(a_full[buf], BLOCK_M * BLOCK_K * 2)
-                    tlx.async_descriptor_load(
-                        a_desc, a_smem[buf], [offs_am, offs_k], a_full[buf]
-                    )
+                    tlx.async_descriptor_load(a_desc, a_smem[buf], [offs_am, offs_k], a_full[buf])
                     tlx.barrier_wait(b_empty[buf], phase ^ 1)
                     tlx.barrier_expect_bytes(b_full[buf], BLOCK_K * BLOCK_N * 2)
-                    tlx.async_descriptor_load(
-                        b_desc, b_smem[buf], [offs_k, offs_bn], b_full[buf]
-                    )
+                    tlx.async_descriptor_load(b_desc, b_smem[buf], [offs_k, offs_bn], b_full[buf])
                     smem_accum += 1

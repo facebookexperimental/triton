@@ -718,10 +718,8 @@ void init_triton_tlx_ir(py::module &&m) {
       // Note: For single-CTA clusters, cluster_cta_rank() returns 0, so the
       // offset is a no-op. This allows the same code path for both cases.
       .def("clc_query",
-           [](TritonOpBuilder &self,
-              Value responseAddr) -> std::vector<Value> {
-             auto queryOp =
-                 self.create<ttng::CLCQueryCancelOp>(responseAddr);
+           [](TritonOpBuilder &self, Value responseAddr) -> std::vector<Value> {
+             auto queryOp = self.create<ttng::CLCQueryCancelOp>(responseAddr);
              Value ctaIdX = queryOp.getCtaIdX();
              Value ctaIdY = queryOp.getCtaIdY();
              Value ctaIdZ = queryOp.getCtaIdZ();
@@ -731,8 +729,7 @@ void init_triton_tlx_ir(py::module &&m) {
              Value negOne = self.create<mlir::arith::ConstantIntOp>(-1, 32);
              Value isNegOne = self.create<mlir::arith::CmpIOp>(
                  mlir::arith::CmpIPredicate::eq, ctaIdX, negOne);
-             Value offset =
-                 self.create<mlir::arith::AddIOp>(ctaIdX, ctaRank);
+             Value offset = self.create<mlir::arith::AddIOp>(ctaIdX, ctaRank);
              ctaIdX =
                  self.create<mlir::arith::SelectOp>(isNegOne, ctaIdX, offset);
              return std::vector<Value>{ctaIdX, ctaIdY, ctaIdZ};

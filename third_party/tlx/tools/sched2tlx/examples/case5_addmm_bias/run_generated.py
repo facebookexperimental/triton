@@ -19,7 +19,6 @@ import torch
 import triton
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-
 NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
 
 
@@ -52,7 +51,7 @@ def main() -> int:
         bias_desc = TensorDescriptor.from_tensor(bias, [BLOCK_M, BLOCK_N])
         c_desc = TensorDescriptor.from_tensor(c, [BLOCK_M, BLOCK_N])
 
-        grid = (NUM_SMS,)
+        grid = (NUM_SMS, )
         try:
             generated.addmm_persistent_2d_bias[grid](
                 a_desc,
@@ -67,9 +66,7 @@ def main() -> int:
                 num_stages=2,
             )
         except Exception as e:
-            print(
-                f"[FAIL-COMPILE] M={M} N={N} K={K}: {type(e).__name__}: {str(e)[:200]}"
-            )
+            print(f"[FAIL-COMPILE] M={M} N={N} K={K}: {type(e).__name__}: {str(e)[:200]}")
             failed += 1
             continue
 
@@ -79,9 +76,7 @@ def main() -> int:
         rel = err / max(ref.float().abs().max().item(), 1e-9)
         ok = nan == 0 and rel < 5e-3
         marker = "PASS" if ok else "FAIL"
-        print(
-            f"[{marker}] M={M} N={N} K={K}  nan={nan}  max abs={err:.3e}  rel={rel:.3e}"
-        )
+        print(f"[{marker}] M={M} N={N} K={K}  nan={nan}  max abs={err:.3e}  rel={rel:.3e}")
         if not ok:
             failed += 1
     return 1 if failed else 0

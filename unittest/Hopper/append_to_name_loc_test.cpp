@@ -13,10 +13,8 @@ TEST(HopperWarpSpecializationUtilityTest,
      DISABLED_AppendToNameLocUsesInnermostName) {
   MLIRContext context;
   auto fileLoc = FileLineColLoc::get(&context, "kernel.mlir", 3, 5);
-  auto innerLoc =
-      NameLoc::get(StringAttr::get(&context, "inner"), fileLoc);
-  auto outerLoc =
-      NameLoc::get(StringAttr::get(&context, "outer"), innerLoc);
+  auto innerLoc = NameLoc::get(StringAttr::get(&context, "inner"), fileLoc);
+  auto outerLoc = NameLoc::get(StringAttr::get(&context, "outer"), innerLoc);
 
   Location result = appendToNameLoc(outerLoc, "_suffix", &context);
 

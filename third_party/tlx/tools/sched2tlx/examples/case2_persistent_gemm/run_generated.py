@@ -9,7 +9,6 @@ import torch
 import triton
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-
 NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
 
 
@@ -50,7 +49,7 @@ def main() -> int:
         b_desc = TensorDescriptor.from_tensor(b_t, [BLOCK_N, BLOCK_K])
         c_desc = TensorDescriptor.from_tensor(c, [BLOCK_M, BLOCK_N])
 
-        grid = (NUM_SMS,)
+        grid = (NUM_SMS, )
         # The kernel signature has 18 args from the deduped TensorDescriptor
         # flattening. We pass each TensorDescriptor as a single object — Triton
         # reflattens automatically into the 5 underlying fields per descriptor.
@@ -72,9 +71,7 @@ def main() -> int:
         rel = err / max(ref.float().abs().max().item(), 1e-9)
         ok = nan == 0 and rel < 5e-3
         marker = "PASS" if ok else "FAIL"
-        print(
-            f"[{marker}] M={M} N={N} K={K}  nan={nan}  max abs={err:.3e}  rel={rel:.3e}"
-        )
+        print(f"[{marker}] M={M} N={N} K={K}  nan={nan}  max abs={err:.3e}  rel={rel:.3e}")
         if not ok:
             failed += 1
     return 1 if failed else 0
