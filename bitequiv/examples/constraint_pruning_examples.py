@@ -38,7 +38,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 # Make `bitequiv` importable whether this file is run as a script or imported.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
-from bitequiv.equivalence import reduction_equivalence_key  # noqa: E402
+from bitequiv.equivalence import CHECKERS as EQUIVALENCE_CHECKERS  # noqa: E402
 
 
 def _is_blackwell():
@@ -290,7 +290,11 @@ def example_static_reduction_equivalence():
         triton.Config({"BLOCK_SIZE": 4096}, num_warps=8, num_stages=2),
     ]
 
-    @triton.autotune(configs=configs, key=["N"], prune_configs_by={"equivalence_fn": reduction_equivalence_key})
+    # Choose the level via `equivalence_level` ("ttgir" | "ptx" | "both"); the per-level checkers are
+    # injected via `equivalence_checkers` (here bitequiv's registry). "ptx" raises until that engine
+    # is built — TTGIR works today.
+    @triton.autotune(configs=configs, key=["N"],
+                     prune_configs_by={"equivalence_level": "ttgir", "equivalence_checkers": EQUIVALENCE_CHECKERS})
     @triton.jit
     def sum_kernel(src, dst, N, BLOCK_SIZE: tl.constexpr):
         offs = tl.arange(0, BLOCK_SIZE)
@@ -298,8 +302,8 @@ def example_static_reduction_equivalence():
         tl.store(dst, tl.sum(x, axis=0))
 
     sum_kernel[(1, )](src, out, N)
-    print("[M1] static reduction-order equivalence prune (TTGIR, no launch, no reference output)")
-    print(f"     equivalence classes seen: {len(sum_kernel.equivalence_classes)}")
+    print("[M1] static reduction-order equivalence prune (level=ttgir, no launch, no reference output)")
+    print(f"     equivalence classes seen: {len(sum_kernel.equivalence_classes['ttgir'])}")
     print(f"     pruned (different reduction order): "
           f"{sorted(c.num_warps for c in sum_kernel.pruned_by_equivalence)} (num_warps)")
     print(f"     winner (matches reference order): num_warps={sum_kernel.best_config.num_warps}\n")

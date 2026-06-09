@@ -261,6 +261,15 @@ class Autotuner(KernelInterface):
                 bitwise-equivalent by construction — no kernel launch and no reference output needed.
                 Signature: `equivalence_fn(config: triton.Config, asm: Dict[str, str], metadata) -> Hashable`.
                 Results are exposed on `self.equivalence_classes` and `self.pruned_by_equivalence`.
+            'equivalence_level' + 'equivalence_checkers': the level-selectable form of the above. Set
+                'equivalence_level' to "ttgir", "ptx", "both" (or an ordered list of level names) to
+                choose the IR level(s) the equivalence check runs at, and pass 'equivalence_checkers'
+                as a {level_name: equivalence_fn} registry (e.g. `bitequiv.equivalence.CHECKERS`).
+                Triton core stays decoupled — the checkers are injected, not imported. Multiple levels
+                run as a two-stage pipeline (e.g. "both" = TTGIR pre-filter, then PTX backstop on the
+                survivors). A requested level missing from the registry, or whose checker raises
+                NotImplementedError, raises a clear AutotunerError (a requested level is never silently
+                skipped). `equivalence_classes` becomes {level: {key: [Config, ...]}}.
         :param correctness_fn: an optional callable used to validate each config's output before it
             is benchmarked. It has the signature `correctness_fn(named_args: Dict[str, Any]) -> bool`
             where `named_args` is the full set of (kernel args + meta-params) AFTER running the config
@@ -324,12 +333,16 @@ class Autotuner(KernelInterface):
         self.early_config_prune = None
         self.artifact_config_prune = None
         self.equivalence_fn = None
+        self.equivalence_level = None
+        self.equivalence_checkers = None
         if prune_configs_by:
             self.perf_model = prune_configs_by.get("perf_model", self.perf_model)
             self.configs_top_k = prune_configs_by.get("top_k", self.configs_top_k)
             self.early_config_prune = prune_configs_by.get("early_config_prune", self.early_config_prune)
             self.artifact_config_prune = prune_configs_by.get("artifact_config_prune", self.artifact_config_prune)
             self.equivalence_fn = prune_configs_by.get("equivalence_fn", self.equivalence_fn)
+            self.equivalence_level = prune_configs_by.get("equivalence_level", self.equivalence_level)
+            self.equivalence_checkers = prune_configs_by.get("equivalence_checkers", self.equivalence_checkers)
 
         # Correctness checking (T3): optional per-config output validation vs a user reference.
         self.correctness_fn = correctness_fn
@@ -793,20 +806,45 @@ class Autotuner(KernelInterface):
                   flush=True)
         return kept
 
-    def _equivalence_prune_configs(self, configs: List[Config], kwargs: Dict) -> List[Config]:
-        """Keep only configs whose compiled TTGIR is bitwise-equivalent to the FIRST config's.
+    def _resolve_equivalence_pipeline(self):
+        """Resolve (equivalence_level, equivalence_checkers, equivalence_fn) into an ordered list of
+        (level_name, checker_fn) stages. ``equivalence_level`` may be "ttgir"/"ptx"/"both" or an
+        ordered list of level names, looked up in the injected ``equivalence_checkers`` registry; a
+        plain ``equivalence_fn`` is appended as a final "custom" stage. Raises AutotunerError if a
+        requested level is not in the registry."""
+        pipeline = []
+        if self.equivalence_level is not None:
+            registry = self.equivalence_checkers or {}
+            level = self.equivalence_level
+            names = ["ttgir", "ptx"] if level == "both" else ([level] if isinstance(level, str) else list(level))
+            for name in names:
+                if name not in registry:
+                    raise AutotunerError(f"equivalence_level {name!r} requested but not provided in "
+                                         f"prune_configs_by['equivalence_checkers'] (available: {sorted(registry)}). "
+                                         f"Pass a {{level: fn}} registry, e.g. bitequiv.equivalence.CHECKERS.")
+                pipeline.append((name, registry[name]))
+        if self.equivalence_fn is not None:
+            pipeline.append(("custom", self.equivalence_fn))
+        return pipeline
 
-        Static, no launch: each config is compiled via ``run(warmup=True)`` and ``equivalence_fn``
-        maps its artifact to a hashable equivalence key (e.g. a reduction-order signature read from
-        the TTGIR layout). The first config that compiles defines the *reference* order; configs whose
-        key matches are kept, the rest pruned. The surviving set is bitwise-equivalent by construction
-        — without running the kernel or comparing any output. Populates ``self.equivalence_classes``
-        ({key: [Config, ...]}) and ``self.pruned_by_equivalence`` ({Config: reason}).
+    def _equivalence_prune_configs(self, configs: List[Config], kwargs: Dict) -> List[Config]:
+        """Keep only configs bitwise-equivalent to the reference (first) config, statically.
+
+        No launch: each config is compiled ONCE (``run(warmup=True)``), then the equivalence pipeline
+        (``_resolve_equivalence_pipeline`` -> ordered [(level, checker)] stages, e.g. TTGIR then PTX)
+        filters the survivors at each level. A checker maps a config's artifact to a hashable key; at
+        each stage only configs whose key matches the first survivor's (the reference order) are kept,
+        so a later stage (PTX) checks only configs that already passed the earlier one (TTGIR). The
+        surviving set is bitwise-equivalent by construction — without running the kernel or comparing
+        any output. Populates ``self.equivalence_classes`` ({level: {key: [Config, ...]}}) and
+        ``self.pruned_by_equivalence`` ({Config: "level: reason"}).
         """
         self.pruned_by_equivalence = {}
         self.equivalence_classes = {}
+        pipeline = self._resolve_equivalence_pipeline()
         pos_args = list(self.nargs.values())
-        keys: Dict[Config, object] = {}
+        # Compile each config once (cached for the later benchmark); collect artifacts.
+        compiled: Dict[Config, tuple] = {}  # config -> (asm, metadata)
         for config in configs:
             run_kwargs = dict(kwargs)
             run_kwargs.update(config.all_kwargs())
@@ -816,27 +854,37 @@ class Autotuner(KernelInterface):
             except Exception as e:  # noqa: BLE001 - a config that cannot compile cannot win
                 self.pruned_by_equivalence[config] = f"compile-error: {type(e).__name__}: {e}"
                 continue
-            asm = getattr(kernel, "asm", {}) or {}
-            metadata = getattr(kernel, "metadata", None)
-            try:
-                key = self.equivalence_fn(config, asm, metadata)
-            except Exception as e:
-                raise AutotunerError(f"`equivalence_fn` raised on config {config}: {type(e).__name__}: {e}") from e
-            keys[config] = key
-            self.equivalence_classes.setdefault(key, []).append(config)
-        if not keys:
-            return []
-        # Reference = the first config that compiled; its key is the canonical reduction order.
-        reference_key = next(keys[c] for c in configs if c in keys)
-        kept = [c for c in configs if c in keys and keys[c] == reference_key]
-        for config in configs:
-            if config not in kept and config not in self.pruned_by_equivalence:
-                self.pruned_by_equivalence[config] = "not-equivalent-to-reference"
-        if knobs.autotuning.print:
-            print(
-                f"[autotune] equivalence_fn kept {len(kept)}/{len(configs)} configs "
-                f"({len(self.equivalence_classes)} equivalence class(es))", flush=True)
-        return kept
+            compiled[config] = (getattr(kernel, "asm", {}) or {}, getattr(kernel, "metadata", None))
+        survivors = [c for c in configs if c in compiled]
+        # Apply each level's checker in order; keep configs matching the reference (first survivor).
+        for level, checker in pipeline:
+            if not survivors:
+                break
+            keys: Dict[Config, object] = {}
+            for config in survivors:
+                asm, metadata = compiled[config]
+                try:
+                    keys[config] = checker(config, asm, metadata)
+                except NotImplementedError as e:
+                    raise AutotunerError(f"equivalence_level {level!r} is not available: {e}") from e
+                except Exception as e:
+                    raise AutotunerError(f"equivalence checker for level {level!r} raised on config "
+                                         f"{config}: {type(e).__name__}: {e}") from e
+            by_key: Dict[object, List[Config]] = {}
+            for config in survivors:
+                by_key.setdefault(keys[config], []).append(config)
+            self.equivalence_classes[level] = by_key
+            reference_key = keys[survivors[0]]
+            kept = [c for c in survivors if keys[c] == reference_key]
+            for config in survivors:
+                if config not in kept:
+                    self.pruned_by_equivalence[config] = f"{level}: not-equivalent-to-reference"
+            if knobs.autotuning.print:
+                print(
+                    f"[autotune] equivalence[{level}] kept {len(kept)}/{len(survivors)} configs "
+                    f"({len(by_key)} class(es))", flush=True)
+            survivors = kept
+        return survivors
 
     def prune_configs(self, kwargs: Dict) -> List[Config]:
         pruned_configs = self.configs
@@ -852,13 +900,13 @@ class Autotuner(KernelInterface):
             if not pruned_configs:
                 raise AutotunerError("No valid autotuner configs after artifact pruning. "
                                      "`artifact_config_prune` should keep at least one config.")
-        # Static bitwise-equivalence pruning (M1): keep only configs whose compiled TTGIR matches the
-        # reference (first) config's reduction-order signature. No kernel launch, no reference output.
-        if self.equivalence_fn:
+        # Static bitwise-equivalence pruning (M1): keep only configs whose compiled IR matches the
+        # reference (first) config at the chosen level(s) (TTGIR / PTX). No launch, no reference output.
+        if self.equivalence_level is not None or self.equivalence_fn is not None:
             pruned_configs = self._equivalence_prune_configs(pruned_configs, kwargs)
             if not pruned_configs:
                 raise AutotunerError("No valid autotuner configs after equivalence pruning. "
-                                     "`equivalence_fn` should keep at least the reference config.")
+                                     "The equivalence check should keep at least the reference config.")
         if self.perf_model:
             top_k = self.configs_top_k
             if isinstance(top_k, float) and top_k <= 1.0:
