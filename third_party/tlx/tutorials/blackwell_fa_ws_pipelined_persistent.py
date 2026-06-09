@@ -899,7 +899,6 @@ def _attn_fwd_ws(sm_scale, M,  #
                 _, phase = get_bufidx_phase(tile_count, 1)
                 for cid in tl.static_range(0, NUM_MMA_GROUPS):
                     tlx.barrier_wait(o_fulls[cid], phase)
-                    tlx.fence("async_shared")
                     qo_offset_y_split = qo_offset_y + cid * BLOCK_M_SPLIT
                     tlx.async_descriptor_store(desc_o, o_tiles[cid], [qo_offset_y_split, 0])
                     tlx.async_descriptor_store_wait(0)
@@ -2496,7 +2495,6 @@ def _attn_bwd_ws(
                 dv = tlx.local_load(dv_slice)
                 tlx.async_descriptor_store_wait(0)
                 tlx.local_store(sdv_store_buf[kv_buf_id], dv.to(tlx.dtype_of(desc_dv)))
-                tlx.fence("async_shared")
                 tlx.async_descriptor_store(
                     desc_dv,
                     sdv_store_buf[kv_buf_id],
@@ -2520,7 +2518,6 @@ def _attn_bwd_ws(
                 dk *= sm_scale
                 tlx.async_descriptor_store_wait(0)
                 tlx.local_store(sdk_store_buf[kv_buf_id], dk.to(tlx.dtype_of(desc_dk)))
-                tlx.fence("async_shared")
                 tlx.async_descriptor_store(
                     desc_dk,
                     sdk_store_buf[kv_buf_id],
@@ -2557,7 +2554,6 @@ def _attn_bwd_ws(
                         dq_smem = dq_store_buf[slice_id % 2]
                         tlx.async_descriptor_store_wait(1)
                         tlx.local_store(dq_smem, dq_slices[slice_id].to(tlx.dtype_of(desc_dq)))
-                        tlx.fence("async_shared")
                         tlx.async_descriptor_store(
                             desc_dq,
                             dq_smem,
@@ -2584,7 +2580,6 @@ def _attn_bwd_ws(
                             dq_store_buf[dq_smem_idx],
                             dq.to(tlx.dtype_of(desc_dq)),
                         )
-                        tlx.fence("async_shared")
                         tlx.async_descriptor_store(
                             desc_dq,
                             dq_store_buf[dq_smem_idx],

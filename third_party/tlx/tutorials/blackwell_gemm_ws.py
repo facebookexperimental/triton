@@ -731,7 +731,6 @@ def _process_tile_epilogue_inner(
         c = result.to(tlx.dtype_of(out_desc))
         c_smem = c_smem_buffers[0]
         tlx.local_store(c_smem, c)
-        tlx.fence_async_shared()
         tlx.async_descriptor_store(
             out_desc,
             c_smem,
@@ -747,7 +746,6 @@ def _process_tile_epilogue_inner(
         c = result.to(tlx.dtype_of(out_desc))
         c_smem = c_smem_buffers[1]
         tlx.local_store(c_smem, c)
-        tlx.fence_async_shared()
         tlx.async_descriptor_store(
             out_desc,
             c_smem,
@@ -765,7 +763,6 @@ def _process_tile_epilogue_inner(
             c_smem = c_smem_buffers[0]
             tlx.async_descriptor_store_wait(1)
             tlx.local_store(c_smem, c)
-            tlx.fence("async_shared")
             tlx.async_descriptor_store(
                 out_desc,
                 c_smem,
@@ -781,7 +778,6 @@ def _process_tile_epilogue_inner(
             c_smem = c_smem_buffers[1]
             tlx.async_descriptor_store_wait(1)
             tlx.local_store(c_smem, c)
-            tlx.fence("async_shared")
             tlx.async_descriptor_store(
                 out_desc,
                 c_smem,
@@ -810,7 +806,6 @@ def _process_tile_epilogue_inner(
                 c_smem = c_smem_buffers[(group_id * EPILOGUE_SUBTILE + slice_id) % 2]
                 tlx.async_descriptor_store_wait(1)
                 tlx.local_store(c_smem, c)
-                tlx.fence_async_shared()
                 tlx.async_descriptor_store(
                     out_desc,
                     c_smem,
