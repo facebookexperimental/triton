@@ -1187,7 +1187,6 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
                 _, phase = get_bufidx_phase(i, 1)
                 for cid in tl.static_range(0, NUM_MMA_GROUPS):
                     tlx.barrier_wait(o_fulls[cid], phase)
-                    tlx.fence("async_shared")
                     qo_offset_y_split = qo_offset_y + cid * BLOCK_M_SPLIT
                     tlx.async_descriptor_store(desc_o, o_tiles[cid], [qo_offset_y_split, 0])
                     tlx.async_descriptor_store_wait(0)
@@ -2019,7 +2018,6 @@ def _attn_bwd_mxf8_ws(
                         tlx.barrier_arrive(dv_empties[0])
                     tlx.async_descriptor_store_wait(0)
                     tlx.local_store(dkv_store_buf[0], dv.to(tl.bfloat16))
-                    tlx.fence("async_shared")
                     tlx.async_descriptor_store(
                         desc_dv,
                         dkv_store_buf[0],
@@ -2044,7 +2042,6 @@ def _attn_bwd_mxf8_ws(
                     dk *= sm_scale
                     tlx.async_descriptor_store_wait(0)
                     tlx.local_store(dkv_store_buf[0], dk.to(tl.bfloat16))
-                    tlx.fence("async_shared")
                     tlx.async_descriptor_store(
                         desc_dk,
                         dkv_store_buf[0],
@@ -2087,7 +2084,6 @@ def _attn_bwd_mxf8_ws(
                             dq_store_buf[dq_smem_idx],
                             dq.to(tlx.dtype_of(desc_dq)),
                         )
-                        tlx.fence("async_shared")
                         tlx.async_descriptor_store(
                             desc_dq,
                             dq_store_buf[dq_smem_idx],
