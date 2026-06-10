@@ -165,6 +165,10 @@ struct ConvertLayoutOpConversion
 
     // At this point we have a type that's at least 8-bit
     // and we don't have broadcasting in the registers
+
+    // At this point, srcLayout/dstLayout are pow2 for NPOT cases
+    // (the caller replaces them with toLinearLayout(pow2Shape, encoding)).
+    // For pow2 cases, they're the original layouts unchanged.
     auto bitwidth = llvmElemTy.getIntOrFloatBitWidth();
     auto smem = optimalSwizzlingLdSt(srcLayout, dstLayout, bitwidth);
 
@@ -202,6 +206,10 @@ struct ConvertLayoutOpConversion
         loadCvt = loadCvt.reshapeOuts(
             {{kOffset,
               static_cast<int32_t>(loadCvt.getTotalOutDimSizeProduct())}});
+
+        // NPOT kernel equivalence: fold redundant SMEM offsets
+        storeCvt = triton::applyNpotKernelFix(storeCvt, smem);
+        loadCvt = triton::applyNpotKernelFix(loadCvt, smem);
 
         auto tileSize = storeCvt.getInDimSize(kReg);
 
@@ -267,10 +275,43 @@ struct ConvertLayoutOpConversion
     dstLayout = dstLayout.sublayout({kReg, kLane, kWarp},
                                     to_vector(dstLayout.getOutDimNames()));
 
+    // Compute the dead register fixup map BEFORE unfolding. For NPOT src
+    // layouts, some register positions hold garbage from dead hardware
+    // positions (e.g., TMEM columns beyond N). We need to replace those
+    // with the values from their canonical (wrapped) counterparts.
+    auto deadRegMap =
+        triton::computeDeadPositionMap(srcLayout, kReg, kLane, kWarp);
+
+    // For NPOT dims, unfold modular output dims to pow2 — but ONLY when
+    // we can compute a valid dead-position fixup map for BOTH src and dst.
+    // When lane/warp bases contribute to the NPOT dim (e.g. MMAv2 NPOT
+    // M/N), dead positions can't be fixed per-register because the
+    // canonical register may live in a different thread. In that case,
+    // skip the unfold and let the modular layout flow through the SMEM
+    // transfer directly — the modular arithmetic naturally wraps dead
+    // positions to their canonical offsets.
+    bool canFixup = triton::canFixupDeadPositions(srcLayout, kLane, kWarp) &&
+                    triton::canFixupDeadPositions(dstLayout, kLane, kWarp);
+    if (canFixup) {
+      srcLayout = triton::unfoldModularDimsForAlloc(srcLayout);
+      dstLayout = triton::unfoldModularDimsForAlloc(dstLayout);
+    }
+
     auto llvmElemTy = getTypeConverter()->convertType(srcTy.getElementType());
     auto smemBase =
         LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op.getOperation());
     auto inVals = unpackLLElements(loc, src, rewriter);
+
+    // Apply dead register fixup: replace garbage values with their canonical
+    // counterparts. This ensures that when the unfolded layout writes to SMEM,
+    // positions beyond N contain correct (wrapped) data instead of garbage.
+    for (auto &[deadReg, canonReg] : deadRegMap) {
+      if (deadReg < static_cast<int>(inVals.size()) &&
+          canonReg < static_cast<int>(inVals.size())) {
+        inVals[deadReg] = inVals[canonReg];
+      }
+    }
+
     auto outVals = transferWithinBlockSwizzlingImpl(
         loc, rewriter, srcLayout, dstLayout, inVals, llvmElemTy, smemBase);
 
