@@ -19,13 +19,13 @@ same reduction order => same bits. This is the opposite of a runtime output
 check: no kernel launch, no input tensors, no reference output — and it is
 input-independent (the op *order* is the same for every input).
 
-Caveat (see knowledge-base/equivalence-check-level-ttgir-vs-ptx.md): TTGIR fixes
-the *association order* but is blind to **FMA contraction**, which is decided
-below TTGIR. For pure add/min/max reductions that costs nothing; once a multiply
-feeds the reduction (Welford, dot-product, GEMM/M3) a PTX/``--fmad`` backstop is
-also needed. Signatures are conservative — they never call non-equivalent configs
-equivalent (a textual layout difference yields a different signature), so the kept
-set is always a safe subset.
+Caveat on IR level: TTGIR fixes the *association order* but is blind to **FMA
+contraction**, which is decided below TTGIR. For pure add/min/max reductions that
+costs nothing; once a multiply feeds the reduction (Welford, dot-product, GEMM/M3)
+a PTX/``--fmad`` backstop is also needed (the ``ptx`` checker below is the slot for
+it). Signatures are conservative — they never call non-equivalent configs equivalent
+(a textual layout difference yields a different signature), so the kept set is always
+a safe subset.
 """
 import re
 from collections import OrderedDict
@@ -99,12 +99,12 @@ def same_reduction_order(ttgir_a, ttgir_b):
 
 
 def reduction_equivalence_key(config, asm, metadata):
-    """Adapter for the autotuner ``equivalence_fn`` hook
-    (``prune_configs_by={"equivalence_fn": reduction_equivalence_key}``).
+    """Equivalence *key function* for the TTGIR level: maps a config's compiled
+    artifact to its static reduction-order signature.
 
-    Maps a config's compiled artifact to its static reduction-order signature, so
-    the autotuner keeps only configs bitwise-equivalent to the reference (first)
-    config — no kernel launch, no reference output.
+    Used by :func:`reduction_equivalence_prune` / :func:`ir_based_prune_configs` to
+    keep only configs bitwise-equivalent to the reference (first) config — no kernel
+    launch, no reference output.
     """
     return reduction_signature(asm.get("ttgir", ""))
 
@@ -114,30 +114,101 @@ def ptx_reduction_signature(ptx):
     FMA / below-TTGIR backstop). Not implemented yet.
 
     This is the slot for the future lane-parametric PTX reconstruction (parse the
-    ``shfl.sync.bfly`` + ``add``/``fma`` tree; see
-    knowledge-base/equivalence-check-level-ttgir-vs-ptx.md §2/§4b). Filling this in
-    is the *only* change needed to enable ``equivalence_level="ptx"`` end to end —
-    no autotuner or call-site changes.
+    ``shfl.sync.bfly`` + ``add``/``fma`` tree). Filling this in is the *only* change
+    needed to enable PTX-level equivalence (``reduction_equivalence_prune("ptx")``)
+    end to end — no autotuner or call-site changes.
     """
-    raise NotImplementedError("PTX-level reduction equivalence is not implemented yet; only TTGIR-level is "
-                              "available. See knowledge-base/equivalence-check-level-ttgir-vs-ptx.md.")
+    raise NotImplementedError("PTX-level reduction equivalence is not implemented yet; only TTGIR-level "
+                              "(reduction_equivalence_prune(\"ttgir\")) is available.")
 
 
 def _ptx_equivalence_key(config, asm, metadata):
     return ptx_reduction_signature(asm.get("ptx", ""))
 
 
-# Registry of equivalence checkers by IR level, for the autotuner's
-# ``equivalence_level`` option:
-#   prune_configs_by={"equivalence_level": "ttgir"|"ptx"|"both",
-#                     "equivalence_checkers": CHECKERS}
-# Each value is an equivalence_fn ``(config, asm, metadata) -> Hashable``; configs
-# with equal keys are bitwise-equivalent at that level. ``"both"`` runs ttgir then
-# ptx as a two-stage prune (cheap pre-filter -> ground-truth backstop).
+# Registry of equivalence *key functions* by IR level, consumed by
+# ``reduction_equivalence_prune(level)``. Each value is a
+# ``(config, asm, metadata) -> Hashable`` key fn; configs with equal keys are
+# bitwise-equivalent at that level. ``"both"`` combines ttgir + ptx into one key
+# (cheap TTGIR signature + the below-TTGIR ground-truth backstop).
 CHECKERS = {
     "ttgir": reduction_equivalence_key,
     "ptx": _ptx_equivalence_key,
 }
+
+_UNSET = object()  # sentinel: a config's key may legitimately be None/falsy
+
+
+class _IRBasedPrune:
+    """Stateful ``ir_config_prune`` predicate built from an equivalence *key
+    function*.
+
+    Usable directly as ``prune_configs_by={"ir_config_prune": <this>}``: the
+    autotuner compiles each config once (``run(warmup=True)``, no launch) and calls
+    this for each, in config order, with ``(config, asm, metadata)``. We map the
+    config to a hashable key via ``key_fn`` and KEEP it iff the key matches the
+    **first-seen (reference) config's** key — so the surviving set is bitwise-
+    equivalent to ``configs[0]`` by construction, with no kernel launch and no
+    reference output.
+
+    Introspection (replaces the autotuner's old ``equivalence_classes`` /
+    ``pruned_by_equivalence``):
+      * ``.classes`` — ``{key: [Config, ...]}`` equivalence classes seen.
+      * ``.pruned``  — ``{Config: reason}`` for configs dropped as non-equivalent.
+    """
+
+    def __init__(self, key_fn):
+        self.key_fn = key_fn
+        self.reference = _UNSET
+        self.classes = OrderedDict()
+        self.pruned = OrderedDict()
+
+    def __call__(self, config, asm, metadata):
+        key = self.key_fn(config, asm, metadata)
+        self.classes.setdefault(key, []).append(config)
+        if self.reference is _UNSET:
+            self.reference = key  # first config defines the reference order
+        keep = key == self.reference
+        if not keep:
+            self.pruned[config] = "not-equivalent-to-reference"
+        return keep
+
+
+def ir_based_prune_configs(key_fn):
+    """Turn an equivalence *key function* into an ``ir_config_prune`` predicate.
+
+    ``key_fn(config, asm, metadata) -> Hashable`` returns a config's equivalence key
+    from its compiled artifact (e.g. a reduction-order signature). The returned
+    callable keeps only configs whose key matches the reference (first) config; pass
+    it as ``prune_configs_by={"ir_config_prune": ir_based_prune_configs(key_fn)}``.
+    Keep a handle to it to read ``.classes`` / ``.pruned`` after autotuning.
+    """
+    return _IRBasedPrune(key_fn)
+
+
+def reduction_equivalence_prune(level="ttgir"):
+    """Static reduction-order equivalence prune at the given IR ``level``.
+
+    ``level`` is ``"ttgir"`` (default), ``"ptx"`` (stub — raises until implemented),
+    ``"both"``, or an ordered list of level names. Multiple levels are combined into a
+    single key (the per-level signatures as a tuple), so a config is kept iff it
+    matches the reference at *every* level. Built on :func:`ir_based_prune_configs`;
+    returns an ``ir_config_prune`` predicate exposing ``.classes`` / ``.pruned``.
+    """
+    names = ["ttgir", "ptx"] if level == "both" else ([level] if isinstance(level, str) else list(level))
+    checkers = []
+    for name in names:
+        if name not in CHECKERS:
+            raise ValueError(f"unknown equivalence level {name!r}; available: {sorted(CHECKERS)}")
+        checkers.append(CHECKERS[name])
+    if len(checkers) == 1:
+        key_fn = checkers[0]
+    else:
+
+        def key_fn(config, asm, metadata):
+            return tuple(checker(config, asm, metadata) for checker in checkers)
+
+    return ir_based_prune_configs(key_fn)
 
 
 def classify(named_ttgirs):
