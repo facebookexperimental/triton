@@ -800,6 +800,8 @@ def _attn_bwd_dkdv(
                 num_steps,
                 warp_specialize=True,
                 merge_epilogue_to_computation=True,
+                merge_reduction=True,
+                data_partition_factor=2,
         ):
             dk, dv, curr_m = _attn_bwd_dkdv_inner(
                 dk,
@@ -1180,6 +1182,8 @@ def _attn_bwd_persist(
             tiles_per_sm,
             warp_specialize=True,
             merge_epilogue_to_computation=True,
+            merge_reduction=True,
+            data_partition_factor=2,
     ):
         pid = tile_idx % n_tile_num
         bhid = tile_idx // n_tile_num
@@ -1592,7 +1596,7 @@ BATCH, N_HEADS = 2, 4  #8
 configs = []
 for HEAD_DIM in [128]:  # 64, 128]:
     for baseVariant in ["ws_persistent"]:
-        for mode in ["fwd"]:  # , "bwd"]:
+        for mode in ["fwd", "bwd"]:
             configs.append(
                 triton.testing.Benchmark(
                     x_names=["N_CTX"],
@@ -1615,7 +1619,7 @@ for HEAD_DIM in [128]:  # 64, 128]:
 
 @triton.testing.perf_report(configs)
 def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, baseVariant, provider, device=DEVICE):
-    assert mode in ["fwd"]  #, "bwd"]
+    assert mode in ["fwd", "bwd"]
     dtype = torch.float16
     if "triton" in provider:
         q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)

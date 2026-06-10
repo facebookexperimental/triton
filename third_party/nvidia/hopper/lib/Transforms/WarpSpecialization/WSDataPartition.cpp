@@ -493,20 +493,22 @@ static bool getForwardSliceToPartition(Value v,
     auto onlyUsedByAtomicStore = [](Value v) {
       SetVector<Operation *> forwardSlice;
       getForwardSlice(v, &forwardSlice);
-      Operation *atomicStore;
+      // Collect ALL atomic stores in the forward slice
+      SmallVector<Operation *> atomicStores;
       for (auto op : forwardSlice) {
         if (isa<AtomicRMWOp, DescriptorReduceOp>(op)) {
-          atomicStore = op;
-          break;
+          atomicStores.push_back(op);
         }
       }
 
-      if (!atomicStore)
+      if (atomicStores.empty())
         return false;
 
-      // Check all ops in fowardSlice are only connected to atomicStore
-      SmallVector<Operation *> queue = {atomicStore};
-      forwardSlice.remove(atomicStore);
+      // Check all ops in forwardSlice are connected to some atomic store.
+      // Walk backward from ALL atomic stores simultaneously.
+      SmallVector<Operation *> queue(atomicStores);
+      for (auto op : atomicStores)
+        forwardSlice.remove(op);
       while (!queue.empty()) {
         auto op = queue.back();
         queue.pop_back();
