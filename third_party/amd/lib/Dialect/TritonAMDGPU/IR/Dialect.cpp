@@ -881,7 +881,8 @@ void AsyncTDMGroupCopyGlobalToLocalOp::getEffects(
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
         &effects) {
   for (OpOperand &desc : getDescsMutable())
-    effects.emplace_back(MemoryEffects::Read::get(), &desc, GlobalMemory::get());
+    effects.emplace_back(MemoryEffects::Read::get(), &desc,
+                         GlobalMemory::get());
   for (OpOperand &dst : getDstsMutable())
     effects.emplace_back(MemoryEffects::Write::get(), &dst,
                          gpu::SharedMemory::get());
