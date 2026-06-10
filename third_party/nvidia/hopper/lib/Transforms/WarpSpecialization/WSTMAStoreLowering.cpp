@@ -389,13 +389,22 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
       }
 
       if (insertionTarget) {
+        int numPrevTMAStores = 0;
+        for (auto &op : forOp.getBody()->without_terminator()) {
+          if (&op == tmaStore)
+            break;
+          if (isTMAStoreLikeOp(&op))
+            ++numPrevTMAStores;
+        }
+
         // Look for a WaitBarrierOp between the defining store and the
         // insertion target. If the rotation spans the whole loop's set of TMA
         // stores, also consider the nearest wait_barrier before the producer:
         // it is logically between the current store and the next rotated store
         // in the following iteration.
         if (Operation *waitBarrier = findScheduledWaitBarrierBetween(
-                tmaStore, insertionTarget, schedule, k >= numTMAStores))
+                tmaStore, insertionTarget, schedule,
+                k >= (numTMAStores - numPrevTMAStores)))
           insertionTarget = waitBarrier;
 
         // Split the cluster at the insertion target: ops before it remain
