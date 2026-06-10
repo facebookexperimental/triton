@@ -32,6 +32,7 @@ using namespace mlir::triton::NVIDIA;
 
 using ::mlir::LLVM::getSharedMemoryObjectFromStruct;
 using ::mlir::triton::gpu::getShapePerCTA;
+using ::mlir::triton::gpu::getTotalElemsPerThread;
 using ::mlir::triton::gpu::MemDescType;
 using ::mlir::triton::gpu::NvidiaMmaEncodingAttr;
 using ::mlir::triton::gpu::SharedEncodingTrait;
@@ -261,12 +262,21 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
 
   auto func = op->getParentOfType<LLVM::LLVMFuncOp>();
   Operation *startSequence = NVVM::WgmmaFenceAlignedOp::create(rewriter, loc);
+  // For NPOT N the result LinearLayout's register dim is pow2-padded, so the
+  // accumulator struct (`fc`) carried across loop iterations holds
+  // `expectedElems / totalReps` values per rep rather than `accSize`. The input
+  // read must use that padded stride to land on the correct rep, while still
+  // reading only the `accSize` real values from the front of each padded rep.
+  unsigned totalReps = static_cast<unsigned>(numRepM * numRepN);
+  unsigned inAccRepStride = accSize;
+  if (!fc.empty() && totalReps > 0 && fc.size() % totalReps == 0)
+    inAccRepStride = fc.size() / totalReps;
   SmallVector<Value> mmaResults;
   for (int m = 0; m < numRepM; ++m) {
     for (int n = 0; n < numRepN; ++n) {
       llvm::SmallVector<Value> mmaOut =
-          loadReg(rewriter, loc, fc, (m * numRepN + n) * accSize, accSize,
-                  startSequence);
+          loadReg(rewriter, loc, fc, (m * numRepN + n) * inAccRepStride,
+                  accSize, startSequence);
       llvm::SmallVector<Type> elemTypes;
       for (Value accEl : mmaOut)
         elemTypes.push_back(accEl.getType());
@@ -338,6 +348,29 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
 
   SmallVector<Value> results =
       unpackAccumulator(rewriter, loc, mmaResults, dTensorTy);
+
+  // For NPOT N (e.g., instrShape [16,192,16]), WGMMA produces accSize =
+  // 2*(N/4) real values per rep but the LinearLayout's register dim is
+  // pow2-padded. Pad with SSA aliases of modular-wrapped canonical values.
+  unsigned expectedElems = getTotalElemsPerThread(dTensorTy);
+  // SILENT-FAILURE HARDENING: only run the NPOT-N padding when expectedElems
+  // divides evenly across the reps. Mirrors the `fc.size() % totalReps == 0`
+  // guard on the input-stride sibling above; without it `paddedPerRep =
+  // expectedElems / totalReps` would truncate and emit a wrong-sized result
+  // struct. (`totalReps` is computed once at the top of this function.)
+  if (results.size() < expectedElems && totalReps > 0 &&
+      expectedElems % totalReps == 0) {
+    unsigned realPerRep = accSize;
+    unsigned paddedPerRep = expectedElems / totalReps;
+    SmallVector<Value> padded;
+    padded.reserve(expectedElems);
+    for (unsigned rep = 0; rep < totalReps; ++rep) {
+      unsigned base = rep * realPerRep;
+      for (unsigned r = 0; r < paddedPerRep; ++r)
+        padded.push_back(results[base + r % realPerRep]);
+    }
+    results = std::move(padded);
+  }
 
   // replace with new packed result
   Type structTy = LLVM::LLVMStructType::getLiteral(

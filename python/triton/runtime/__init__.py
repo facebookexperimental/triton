@@ -1,4 +1,5 @@
-from .autotuner import (Autotuner, Config, Heuristics, autotune, heuristics)
+from .autotuner import (Autotuner, Config, Heuristics, autotune, heuristics, npot_block_sizes, expand_configs_npot,
+                        generate_npot_candidates)
 from .cache import RedisRemoteCacheBackend, RemoteCacheBackend
 from .driver import driver
 from .jit import JITFunction, KernelInterface, MockTensor, TensorWrapper, reinterpret
@@ -8,6 +9,8 @@ __all__ = [
     "autotune",
     "Autotuner",
     "Config",
+    "expand_configs_npot",
+    "generate_npot_candidates",
     "driver",
     "Heuristics",
     "heuristics",
@@ -15,6 +18,7 @@ __all__ = [
     "JITFunction",
     "KernelInterface",
     "MockTensor",
+    "npot_block_sizes",
     "OutOfResources",
     "RedisRemoteCacheBackend",
     "reinterpret",

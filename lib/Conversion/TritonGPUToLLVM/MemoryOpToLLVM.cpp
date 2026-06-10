@@ -149,6 +149,16 @@ LogicalResult lowerLocalStore(Location loc, MLIRContext *ctx, Value regVal,
     cvt = regLayout.invertAndCompose(sharedLL);
   } else {
     auto sharedLayout = toLinearLayout(memDescTy);
+    // Try the split-dim path for NPOT swizzled SMEM. When it applies it returns
+    // both layouts reshaped to use split output dims; when it does not apply
+    // (pow2 shape / no swizzle / non-NVMMAShared) it returns nullopt and we
+    // keep the original layouts. Either way the same invertAndCompose below is
+    // correct.
+    if (auto split =
+            splitNpotContiguousDim(memDescTy, sharedLayout, regLayout)) {
+      sharedLayout = split->smem;
+      regLayout = split->other;
+    }
     cvt = regLayout.invertAndCompose(sharedLayout);
   }
   auto kBlock = str_attr("block");
@@ -203,6 +213,74 @@ struct LocalAllocOpConversion
       : ConvertOpToLLVMPattern<triton::gpu::LocalAllocOp>(converter, benefit),
         targetInfo(targetInfo) {}
 
+  // Check if this NVMMASharedEncoding allocation has NPOT contiguous dim with
+  // swizzle=0, which means the physical allocation is pow2-rounded and the
+  // padding elements must be zero-filled to avoid WGMMA reading garbage.
+  static bool needsZeroFillForNpotPadding(MemDescType memDescTy) {
+    auto encoding = dyn_cast<NVMMASharedEncodingAttr>(memDescTy.getEncoding());
+    if (!encoding || encoding.getSwizzlingByteWidth() != 0)
+      return false;
+
+    auto shape = memDescTy.getAllocShape().take_back(memDescTy.getRank());
+    bool isTransposed = encoding.getTransposed();
+    int rank = shape.size();
+    int contigDim = isTransposed ? 0 : rank - 1;
+
+    // Check if the contiguous dim is NPOT.
+    if (llvm::isPowerOf2_64(shape[contigDim]))
+      return false;
+
+    // The allocation rounds NPOT dims to pow2 (getAllocationShapePerCTA),
+    // creating padding that WGMMA may read. Zero-fill needed.
+    return true;
+  }
+
+  // Emit a cooperative zero-fill of the SMEM allocation using all threads
+  // in the CTA. Each thread writes i32 zeros to its portion of the buffer.
+  // The zero-fill is compile-time unrolled for efficiency.
+  void emitSmemZeroFill(Location loc, Value smemBase, MemDescType memDescTy,
+                        Operation *op,
+                        ConversionPatternRewriter &rewriter) const {
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+
+    // Compute allocation size in bytes using the rounded shape.
+    auto allocShape = getAllocationShapePerCTA(memDescTy);
+    int64_t numElems = 1;
+    for (auto s : allocShape)
+      numElems *= s;
+    int elemBitWidth = cast<NVMMASharedEncodingAttr>(memDescTy.getEncoding())
+                           .getElementBitWidth();
+    int64_t allocBytes = numElems * elemBitWidth / 8;
+
+    // Use i32 stores for efficiency: allocBytes / 4 words to write.
+    int64_t numWords = allocBytes / 4;
+
+    // Get thread ID and total threads from the module.
+    Value tid = getThreadId(rewriter, loc);
+    int numWarps = lookupNumWarps(op);
+    int threadsPerWarp = 32; // NVIDIA warp size
+    int numThreads = numWarps * threadsPerWarp;
+
+    auto i32PtrTy = LLVM::LLVMPointerType::get(rewriter.getContext(), 3);
+    Value smemI32 = b.bitcast(smemBase, i32PtrTy);
+    Value zero32 = b.i32_val(0);
+
+    for (int64_t w = 0; w * numThreads < numWords; w++) {
+      // idx = tid + w * numThreads
+      Value idx = (w == 0) ? tid : b.add(tid, b.i32_val(w * numThreads));
+      // For threads past numWords, clamp to 0 so they harmlessly
+      // write to the first word (which will be overwritten by the
+      // actual data store).
+      Value safeIdx = idx;
+      if ((w + 1) * numThreads > numWords) {
+        Value cond = b.icmp_slt(idx, b.i32_val(numWords));
+        safeIdx = b.select(cond, idx, b.i32_val(0));
+      }
+      Value ptr = b.gep(i32PtrTy, i32_ty, smemI32, safeIdx);
+      b.store(zero32, ptr);
+    }
+  }
+
   LogicalResult
   matchAndRewrite(triton::gpu::LocalAllocOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
@@ -217,6 +295,19 @@ struct LocalAllocOpConversion
     auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
     auto smemObj = SharedMemoryObject(smemBase, llvmElemTy, memDescTy.getRank(),
                                       loc, rewriter);
+
+    // For NVMMASharedEncoding with swizzle=0 and NPOT contiguous dim,
+    // zero-fill the allocation before storing data. The allocation is
+    // pow2-rounded, and WGMMA may read padding elements beyond the
+    // logical shape when K doesn't divide evenly into the MMA K-tile
+    // size. Without zero-fill, these padding elements contain garbage
+    // and corrupt the dot product result.
+    if (op.getSrc() && needsZeroFillForNpotPadding(memDescTy)) {
+      emitSmemZeroFill(loc, smemBase, memDescTy, op.getOperation(), rewriter);
+      // Barrier to ensure zero-fill is complete before stores.
+      rewriter.create<mlir::gpu::BarrierOp>(loc);
+    }
+
     // If there is an initial tensor, store it into the shared memory.
     if (op.getSrc()) {
       auto *ctx = op.getContext();
@@ -287,6 +378,16 @@ public:
       cvt = regLayout.invertAndCompose(sharedLL);
     } else {
       auto sharedLayout = toLinearLayout(memDescTy);
+      // Try the split-dim path for NPOT swizzled SMEM. When it applies it
+      // returns both layouts reshaped to use split output dims; when it does
+      // not apply (pow2 shape / no swizzle / non-NVMMAShared) it returns
+      // nullopt and we keep the original layouts. Either way the same
+      // invertAndCompose below is correct.
+      if (auto split =
+              splitNpotContiguousDim(memDescTy, sharedLayout, regLayout)) {
+        sharedLayout = split->smem;
+        regLayout = split->other;
+      }
       cvt = regLayout.invertAndCompose(sharedLayout);
     }
     auto kBlock = str_attr("block");

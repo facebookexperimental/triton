@@ -96,10 +96,13 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
   if (shape.empty()) {
     return emitError() << "rank 0 memdesc is not allowed";
   }
-  // Every dimension but the first (to allow for pipelining) must be a power of
-  // 2
-  if (!llvm::all_of(shape.drop_front(1), [](int64_t dim) {
-        return llvm::isPowerOf2_64(dim) && dim > 0;
+  bool allowNpot = isa<gpu::NVMMASharedEncodingAttr>(encoding) ||
+                   isa<gpu::SwizzledSharedEncodingAttr>(encoding) ||
+                   isa<nvidia_gpu::TensorMemoryEncodingAttr>(encoding) ||
+                   isa<nvidia_gpu::TensorMemoryScalesEncodingAttr>(encoding) ||
+                   isa<gpu::LinearEncodingAttr>(encoding);
+  if (!llvm::all_of(shape.drop_front(1), [&](int64_t dim) {
+        return dim > 0 && (allowNpot || llvm::isPowerOf2_64(dim));
       }))
     return emitError()
            << "shape must have power-of-2 and non-zero dimensions; got "
@@ -131,8 +134,14 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     }
     shape = shape.take_back(2);
     allocShape = allocShape.take_back(2);
-    if (allocShape[0] < enc.getBlockM() * enc.getCTASplitM() ||
-        allocShape[1] < enc.getBlockN() * enc.getCTASplitN()) {
+    // TMEM encodings clamp blockN up to HW minimum 8 in make_default
+    // (third_party/tlx/language/tlx/types.py:tensor_memory_layout_encoding.make_default);
+    // allocShape may be smaller logically (e.g., (128, 1) for FA alpha/l/m).
+    // Downstream LL conversion (tensorMemoryToLinearLayout) clips back down via
+    // std::min(encoding.getBlockN(), shape[1]), so the encoding's blockN is a
+    // physical-block upper bound, not a strict lower bound on allocShape.
+    // Skip the blockN bound here for TMEM; only enforce blockM.
+    if (allocShape[0] < enc.getBlockM() * enc.getCTASplitM()) {
       return emitError() << "the allocation shape must be at least "
                          << enc.getBlockM() * enc.getCTASplitM() << "x"
                          << enc.getBlockN() * enc.getCTASplitN() << ". Got "
