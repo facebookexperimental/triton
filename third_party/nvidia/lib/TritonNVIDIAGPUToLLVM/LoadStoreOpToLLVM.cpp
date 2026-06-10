@@ -159,10 +159,12 @@ struct LoadStoreConversionBase {
       return 1;
     auto contiguity = getContiguity(ptr);
     auto pointeeBitWidth = triton::getPointeeBitWidth(tensorTy);
-    LDBG("getVectorSize contiguity = " << contiguity << " pointeeBitWidth = "
-                                       << pointeeBitWidth);
     // The maximum vector size is 128 bits on NVIDIA GPUs.
-    return std::min<unsigned>(128 / pointeeBitWidth, contiguity);
+    auto vec = std::min<unsigned>(128 / pointeeBitWidth, contiguity);
+    vec = clampVecSizeForNpot(vec, tensorTy);
+    LDBG("getVectorSize contiguity = " << contiguity << " pointeeBitWidth = "
+                                       << pointeeBitWidth << " vec = " << vec);
+    return vec;
   }
 
   unsigned getMaskAlignment(Value mask) const {
@@ -1303,6 +1305,73 @@ struct AsyncCopyGlobalToLocalOpConversion
     auto smemObj =
         getSharedMemoryObjectFromStruct(loc, llDst, resElemTy, rewriter);
     auto smemLayout = ttg::toLinearLayout(dstTy);
+
+    // Handle dim-size mismatches between srcLayout and smemLayout for
+    // NVMMASharedEncodingAttr.
+    //
+    // The SMEM layout may round non-contiguous NPOT dims to pow2 internally.
+    // This must be resolved BEFORE splitNpotContiguousDim: that helper rebuilds
+    // BOTH layouts via reshapeOuts using smemLayout's (pow2-rounded) out-dim
+    // sizes. If srcLayout still carries the original NPOT (smaller) sizes on a
+    // non-contiguous dim, the reshape re-encodes its bases into the larger
+    // pow2 out space, dropping surjectivity ("Layout is expected to be
+    // surjective"). Rebuilding srcLayout to the pow2-rounded shape here keeps
+    // the subsequent split consistent and surjective.
+    //
+    // Two cases:
+    //   CONTIGUOUS NPOT that will be split (e.g. B operand [K, N=96] where the
+    //   contiguous dim is split into contig_intra/contig_phase) — rebuild
+    //   srcLayout so every dim matches smemLayout before the split.
+    //   PURE NON-CONTIGUOUS NPOT, no split (e.g. B operand [K=48, N=128]) — do
+    //   NOT rebuild. The pow2 rebuild changes basis vectors via
+    //   buildWithNpotReduction (mod-48 reduction → identity), producing wrong
+    //   SMEM offsets. invertAndCompose handles the size mismatch natively
+    //   (A.outDimSize >= B.outDimSize is satisfied). The unpipelined st.shared
+    //   path (lowerLocalLdSt) works WITHOUT rebuilding — this path must match.
+    //
+    // We only rebuild when splitNpotContiguousDim will actually split the
+    // contiguous dim, which is exactly the configuration where leaving the
+    // non-contiguous mismatch in place would break the split's reshape.
+    if (dyn_cast<ttg::NVMMASharedEncodingAttr>(dstTy.getEncoding())) {
+      auto outDimNames = standardOutDimNames(ctx, srcTy.getRank());
+
+      // Will splitNpotContiguousDim split the contiguous dim? It does so only
+      // for a rank-2, swizzled, NPOT, swizzle-compatible contiguous dim. Probe
+      // it on smemLayout for BOTH args (NOT srcLayout): srcLayout may carry a
+      // smaller NPOT non-contiguous dim whose reshape into smem's pow2-rounded
+      // space is non-surjective and would crash the probe itself. smemLayout is
+      // self-consistent, so reshaping it twice is safe. The function takes its
+      // layouts by value, so only .has_value() matters here — no throwaway
+      // copies needed.
+      bool willSplit =
+          splitNpotContiguousDim(dstTy, smemLayout, smemLayout).has_value();
+
+      bool anyMismatch = false;
+      for (auto dim : outDimNames) {
+        if (srcLayout.hasOutDim(dim) &&
+            srcLayout.getOutDimSize(dim) < smemLayout.getOutDimSize(dim)) {
+          anyMismatch = true;
+          break;
+        }
+      }
+
+      if (willSplit && anyMismatch) {
+        SmallVector<int64_t> pow2Shape;
+        for (auto dim : outDimNames) {
+          pow2Shape.push_back(smemLayout.getOutDimSize(dim));
+        }
+        srcLayout = ttg::toLinearLayout(pow2Shape, srcTy.getEncoding());
+      }
+    }
+
+    // For NPOT swizzled SMEM, reshape both layouts to split the contiguous
+    // dim into (contig_intra, contig_phase) so invertAndCompose sees each
+    // output dim with a single algebra (XOR or ADD+mod).
+    if (auto split = splitNpotContiguousDim(dstTy, smemLayout, srcLayout)) {
+      smemLayout = split->smem;
+      srcLayout = split->other;
+    }
+
     auto cvt = srcLayout.invertAndCompose(smemLayout);
     if (!cvt.isTrivialOver({str_attr("block")})) {
       return emitError(loc,

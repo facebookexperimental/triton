@@ -14,6 +14,8 @@
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/StrUtil.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/MathExtras.h"
+#include <optional>
 
 #define DEBUG_TYPE "ttgpu_to_llvm"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -602,6 +604,88 @@ std::optional<LLVM::AtomicOrdering> getMemoryOrdering(MemSemantic memOrdering);
 llvm::MapVector<StringAttr, int32_t> getAllFreeVarMasks(MLIRContext *ctx);
 
 llvm::MapVector<StringAttr, int32_t> getFreeVariableMasks(Type type);
+
+// Single-rep store/load fallback used by both the core and NVIDIA
+// `transferWithinBlockSwizzling` lowerings when the optimal-swizzling
+// rep-divide fails (typically NPOT layouts).
+//
+// Reshapes `totalStoreCvt` / `totalLoadCvt` to a single `kOffset` output dim,
+// applies the NPOT kernel-equivalence fold (so kernel-equivalent
+// register/lane/warp combos collapse to the same SMEM offset), then emits a
+// store, barrier, load triple via `lowerLdStShared`.
+//
+// `srcLayout` / `dstLayout` are used to choose between `warpSync` and a full
+// `barrier` between store and load. `smem` is the optimal-swizzling SMEM
+// layout — used as the reference when folding modular bases.
+SmallVector<Value> runNpotFallback(
+    Location loc, RewriterBase &rewriter, const TargetInfoBase &targetInfo,
+    const triton::LinearLayout &srcLayout,
+    const triton::LinearLayout &dstLayout, triton::LinearLayout totalStoreCvt,
+    triton::LinearLayout totalLoadCvt, const triton::LinearLayout &smem,
+    ArrayRef<Value> inVals, Type llvmElemTy, Value smemBase);
+
+// For NPOT layouts where the conversion output dim size (a power of 2) is
+// larger than the actual SMEM buffer size N, fold a urem-wrap into the
+// conversion layout itself by reducing each register-basis modulo N.
+// This makes degenerate offsets (>= N) collide with their canonical
+// counterparts naturally during ld/st emission, removing the need for the
+// caller to wrap offsets via an external `urem(offset, N)` callable.
+//
+// Returns the cvt unchanged when:
+//   - cvt has != 1 output dim, or
+//   - cvt's output dim size is already <= effectiveSize, or
+//   - the reduced bases would not satisfy the XOR ≡ ADD soundness
+//     conditions (every reduced basis pow2-or-zero, distinct bases share
+//     no bits, XOR-sum stays < N). See tryReduceBasesModN in Utility.cpp.
+//
+// `cvt` must be a register/lane/warp -> "offset" layout (the standard
+// shape produced by `srcLayout.invertAndCompose(smemLayout)`).
+LinearLayout applyNpotUremFold(const LinearLayout &cvt, int64_t effectiveSize);
+
+// For NPOT swizzled SMEM layouts, reshape both layouts to use split output
+// dims (dim0, contig_intra, contig_phase) so that invertAndCompose sees each
+// output dim using a single algebra (XOR for pow2 dims, ADD+mod for NPOT
+// dims).  Without the split, lstsqModular treats the XOR-coupled swizzle
+// bases as modular ADD, producing incorrect results.
+//
+// |smemLayout| is the shared memory layout and |otherLayout| is the
+// register or source layout.  Both are reshaped identically.
+//
+// Returns the two reshaped layouts (smem, other) when the split was applied.
+// Returns std::nullopt when no split was needed (pow2 shape, non-NVMMAShared
+// encoding, or no swizzle); callers should keep their original layouts in that
+// case.
+
+// Result of a successful NPOT contiguous-dim split: the two layouts with the
+// NPOT contiguous dim decomposed into (intra, phase).
+struct SplitNpotLayouts {
+  LinearLayout smem;
+  LinearLayout other;
+};
+
+std::optional<SplitNpotLayouts>
+splitNpotContiguousDim(triton::gpu::MemDescType memDescTy,
+                       LinearLayout smemLayout, LinearLayout otherLayout);
+
+/// Clamp vec size for NPOT tensor dimensions.
+/// (a) Round down to pow2 for valid vector load/store widths.
+/// (b) Clamp to alignment implied by non-pow2 sizePerThread.
+inline unsigned clampVecSizeForNpot(unsigned vec, RankedTensorType tensorTy) {
+  if (!llvm::isPowerOf2_32(vec))
+    vec = 1u << llvm::Log2_32(vec);
+  if (!tensorTy)
+    return vec;
+  if (auto blocked =
+          dyn_cast<triton::gpu::BlockedEncodingAttr>(tensorTy.getEncoding())) {
+    auto contOrder = triton::gpu::getOrder(tensorTy);
+    unsigned spt = blocked.getSizePerThread()[contOrder[0]];
+    if (spt > 0 && !llvm::isPowerOf2_32(spt)) {
+      unsigned maxAligned = spt & (0u - spt);
+      vec = std::min(vec, maxAligned);
+    }
+  }
+  return vec;
+}
 
 inline bool isCanonicalIndex(unsigned index, unsigned freeVarMask) {
   return (index & freeVarMask) == 0;

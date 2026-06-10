@@ -185,6 +185,9 @@ std::optional<LinearLayout> getReps(const LinearLayout &cvt,
 // Given a layout mapping onto dim0..dimn, remove a dimension `dim`
 // and rename the rest as dim0..dimn-1
 LinearLayout removeStandardDim(const LinearLayout &layout, int dim);
+
+bool splitContiguousDim(int64_t tileCols, int64_t numPhases, int contigDim,
+                        LinearLayout &smemLayout, LinearLayout &otherLayout);
 } // namespace mlir::triton
 
 #endif // TRITON_TOOLS_LAYOUTUTILS_H

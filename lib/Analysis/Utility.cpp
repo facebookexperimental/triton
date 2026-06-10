@@ -17,6 +17,7 @@
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/Support/MathExtras.h"
 
 namespace mlir {
 
@@ -159,6 +160,10 @@ SmallVector<unsigned> ReduceOpHelper::getScratchRepShape() {
 
 unsigned ReduceOpHelper::getScratchSizeInBytes() {
   auto smemShape = getScratchRepShape();
+  // Pad reduction axis to pow2 for NPOT inter-warp reads.
+  if (!smemShape.empty() && smemShape[axis] > 0 &&
+      !llvm::isPowerOf2_32(smemShape[axis]))
+    smemShape[axis] = llvm::NextPowerOf2(smemShape[axis]);
   auto elems = product<unsigned>(smemShape);
 
   unsigned bytesPerElem = 0;
@@ -957,7 +962,7 @@ bool supportMMA(triton::DotOp op, int version) {
     if (k < 256 / aElemTy.getIntOrFloatBitWidth())
       return false;
     if (!(retShapePerCTA[rank - 2] % 64 == 0 &&
-          retShapePerCTA[rank - 1] % 16 == 0))
+          retShapePerCTA[rank - 1] % 8 == 0))
       return false;
     return true;
   }

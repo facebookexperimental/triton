@@ -102,6 +102,26 @@ struct DotOpMFMAConversionHelper {
     return 1;
   }
 
+  // Defensive: current AMD MFMA atoms all require K to divide the instruction
+  // K (K = 2/4/8/16/32, all power-of-2), so this guard is a no-op on today's
+  // hardware. It converts any future "NPOT K MFMA atom" miscompile (which
+  // would assertion-fail downstream) into a clean emitError at instruction
+  // selection. AMD-untested; flagged for re-validation if MFMA atoms gain
+  // NPOT-K support.
+  /// Check that a non-pow2 K dimension evenly divides the instruction K size.
+  template <typename OpTy>
+  LogicalResult checkNpotKDim(OpTy op, int64_t kDimInstrSize,
+                              int64_t kDimOperandSize) const {
+    if (kDimInstrSize > kDimOperandSize &&
+        kDimInstrSize % kDimOperandSize != 0) {
+      return op.emitError("NPOT K dimension ")
+             << kDimOperandSize << " does not evenly divide instruction K size "
+             << kDimInstrSize
+             << "; non-uniform duplication correction not supported";
+    }
+    return success();
+  }
+
   Value processSubBlocks(int numSubBlocks, Value acc, bool reduceSubBlocks,
                          bool zeroSubBlocks) const {
     auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -188,9 +208,9 @@ struct DotOpMFMAConversionHelper {
   /// C' = (1*3+2*4) + (1*3+2*4) = 22
   ///
   /// Following code adjusts accumulator values in such cases.
-  /// If accumulator is integer, shift accumulator right by
-  /// log2(duplicationRate). If accumulator is float, multiply accum
-  /// with 1/duplicationRate constant.
+  /// If accumulator is integer, divide by duplicationRate (using ashr
+  /// for pow2 rates, sdiv otherwise). If accumulator is float,
+  /// multiply accum with 1/duplicationRate constant.
   void adjustAccForSmallKDim(SmallVector<Value> &fc, Value &acc, Type dstElemTy,
                              int b, int m, int n, int64_t numRepM,
                              int64_t numRepN, int64_t kDimInstrSize,
@@ -200,14 +220,16 @@ struct DotOpMFMAConversionHelper {
     for (unsigned v = 0; v < elemsPerVec; ++v) {
       Value accElem = tb.extract_element(dstElemTy, acc, tb.i32_val(v));
       if (kDimInstrSize > kDimOperandSize) {
-        assert(kDimInstrSize % kDimOperandSize == 0);
         int duplicationRate = kDimInstrSize / kDimOperandSize;
-        assert(llvm::isPowerOf2_32(duplicationRate));
         if (dstElemTy.isInteger()) {
-          auto shiftSize = llvm::Log2_32(duplicationRate);
           assert(!accElem.getType().isUnsignedInteger() &&
                  "MFMA uses signed accumulator");
-          accElem = tb.ashr(accElem, tb.i32_val(shiftSize));
+          if (llvm::isPowerOf2_32(duplicationRate)) {
+            accElem =
+                tb.ashr(accElem, tb.i32_val(llvm::Log2_32(duplicationRate)));
+          } else {
+            accElem = tb.sdiv(accElem, tb.i32_val(duplicationRate));
+          }
         } else {
           auto multiplierAttr =
               rewriter.getFloatAttr(dstElemTy, 1.0 / duplicationRate);
@@ -286,6 +308,9 @@ struct DotOpMFMAConversionHelper {
       kWidth *= 2;
 
     const auto kDimInstrSize = mfmaLayout.getInstrShapeForOperand(kWidth, 0)[1];
+
+    if (failed(checkNpotKDim(op, kDimInstrSize, kDimOperandSize)))
+      return failure();
 
     auto repA = mfmaLayout.getRepForOperand(aTensorTy.getShape(), kWidth, 0);
     auto repB = mfmaLayout.getRepForOperand(bTensorTy.getShape(), kWidth, 1);
@@ -637,6 +662,9 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     int bKWidth = bKBase;
 
     const auto kDimInstrSize = mfmaLayout.getInstrShapeForOperand(aKBase, 0)[1];
+
+    if (failed(checkNpotKDim(op, kDimInstrSize, kDimOperandSize)))
+      return failure();
 
     auto repA = mfmaLayout.getRepForOperand(aTensorTy.getShape(), aKWidth, 0);
     auto repB = mfmaLayout.getRepForOperand(bTensorTy.getShape(), bKWidth, 1);

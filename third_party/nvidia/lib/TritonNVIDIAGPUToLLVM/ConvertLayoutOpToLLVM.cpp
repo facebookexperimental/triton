@@ -149,80 +149,105 @@ struct ConvertLayoutOpSwizzlingConversion
     auto totalLoadCvt = dstLayout.invertAndCompose(smem);
 
     // The permutation exists by construction of the reps dimension in
-    // optimalSwizzling
-    auto permStore =
-        regPermForDivide(totalStoreCvt, reps, /*left=*/false).value();
-    totalStoreCvt = permStore.apply(totalStoreCvt);
-    auto permutedInVals = permStore.apply(inVals);
-    auto permLoad =
-        regPermForDivide(totalLoadCvt, reps, /*left=*/false).value();
-    totalLoadCvt = permLoad.apply(totalLoadCvt);
+    // optimalSwizzling for pow2 layouts. For NPOT (modular) layouts the
+    // reps division may fail; fall back to a single-rep path.
+    auto maybePermStore = regPermForDivide(totalStoreCvt, reps, /*left=*/false);
+    auto maybePermLoad = regPermForDivide(totalLoadCvt, reps, /*left=*/false);
+    if (maybePermStore.has_value() && maybePermLoad.has_value()) {
+      auto permStore = *maybePermStore;
+      auto permLoad = *maybePermLoad;
+      auto permStoreCvt = permStore.apply(totalStoreCvt);
+      auto permLoadCvt = permLoad.apply(totalLoadCvt);
+      auto maybeSCvt = divideRight(permStoreCvt, reps);
+      auto maybeLCvt = divideRight(permLoadCvt, reps);
+      if (maybeSCvt.has_value() && maybeLCvt.has_value()) {
+        auto permutedInVals = permStore.apply(inVals);
+        auto storeCvt = *maybeSCvt;
+        auto loadCvt = *maybeLCvt;
+        auto kOffset = str_attr("offset");
+        storeCvt = storeCvt.reshapeOuts(
+            {{kOffset,
+              static_cast<int32_t>(storeCvt.getTotalOutDimSizeProduct())}});
+        loadCvt = loadCvt.reshapeOuts(
+            {{kOffset,
+              static_cast<int32_t>(loadCvt.getTotalOutDimSizeProduct())}});
 
-    // Remove the reps and flatten into offset
-    auto storeCvt = *divideRight(totalStoreCvt, reps);
-    auto loadCvt = *divideRight(totalLoadCvt, reps);
-    auto kOffset = str_attr("offset");
-    storeCvt = storeCvt.reshapeOuts({{kOffset, storeCvt.getTotalOutDimSize()}});
-    loadCvt = loadCvt.reshapeOuts({{kOffset, loadCvt.getTotalOutDimSize()}});
+        auto tileSize = storeCvt.getInDimSize(kReg);
 
-    auto tileSize = storeCvt.getInDimSize(kReg);
+        assert(permutedInVals.size() == tileSize * nReps);
+        SmallVector<Value> outVals;
+        auto affineOffset = b.i32_val(0);
+        auto maskSpanAffineOffset = 0;
+        bool isWarpSync = mlir::isCvtWarpSync(srcLayout, dstLayout);
+        auto syncBarrier = [&]() {
+          if (isWarpSync)
+            targetInfo.warpSync(loc, rewriter);
+          else
+            targetInfo.barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
+        };
+        for (int i = 0; i < nReps; ++i) {
+          if (i > 0)
+            syncBarrier();
 
-    assert(permutedInVals.size() == tileSize * nReps);
-    SmallVector<Value> outVals;
-    auto affineOffset = b.i32_val(0);
-    auto maskSpanAffineOffset = 0;
-    bool isWarpSync = mlir::isCvtWarpSync(srcLayout, dstLayout);
-    for (int i = 0; i < nReps; ++i) {
-      if (i > 0) {
-        if (isWarpSync) {
-          targetInfo.warpSync(loc, rewriter);
-        } else {
-          targetInfo.barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
+          auto tileInVals =
+              to_vector(ArrayRef(permutedInVals).slice(i * tileSize, tileSize));
+          // Store
+          // idxSrc 0: st.shared, idxSrc 1: stmatrix, idxSrc 2: stmatrix.trans
+          if (idxSrc == 0) {
+            lowerLdStShared(loc, ctx, storeCvt, tileInVals, llvmElemTy,
+                            smemBase, /*paddingShifts=*/{}, affineOffset,
+                            maskSpanAffineOffset, rewriter, targetInfo);
+          } else {
+            bool transpose = idxSrc == 2;
+            auto result = lowerLdStMatrix(
+                loc, storeCvt, transpose, tileInVals, smemBase, affineOffset,
+                maskSpanAffineOffset, llvmElemTy, rewriter, targetInfo);
+            if (failed(result)) {
+              auto fallbackVals = to_vector(
+                  ArrayRef(permutedInVals).slice(i * tileSize, tileSize));
+              lowerLdStShared(loc, ctx, storeCvt, fallbackVals, llvmElemTy,
+                              smemBase, /*paddingShifts=*/{}, affineOffset,
+                              maskSpanAffineOffset, rewriter, targetInfo);
+            }
+          }
+          syncBarrier();
+          // Load
+          SmallVector<Value> tileOutVals;
+          if (idxDst == 0) {
+            tileOutVals =
+                lowerLdStShared(loc, ctx, loadCvt, {}, llvmElemTy, smemBase,
+                                /*paddingShifts=*/{}, affineOffset,
+                                maskSpanAffineOffset, rewriter, targetInfo);
+          } else {
+            bool transpose = idxDst == 2;
+            auto result = lowerLdStMatrix(
+                loc, loadCvt, transpose, tileOutVals, smemBase, affineOffset,
+                maskSpanAffineOffset, llvmElemTy, rewriter, targetInfo);
+            if (failed(result)) {
+              tileOutVals =
+                  lowerLdStShared(loc, ctx, loadCvt, {}, llvmElemTy, smemBase,
+                                  /*paddingShifts=*/{}, affineOffset,
+                                  maskSpanAffineOffset, rewriter, targetInfo);
+            }
+          }
+          llvm::append_range(outVals, tileOutVals);
         }
-      }
 
-      auto tileInVals =
-          to_vector(ArrayRef(permutedInVals).slice(i * tileSize, tileSize));
-      // Store
-      // idxSrc 0: st.shared, idxSrc 1: stmatrix, idxSrc 2: stmatrix.trans
-      if (idxSrc == 0) {
-        lowerLdStShared(loc, ctx, storeCvt, tileInVals, llvmElemTy, smemBase,
-                        /*paddingShifts=*/{}, affineOffset,
-                        maskSpanAffineOffset, rewriter, targetInfo);
-      } else {
-        assert(idxSrc == 1 || idxSrc == 2);
-        bool transpose = idxSrc == 2;
-        auto result = lowerLdStMatrix(
-            loc, storeCvt, transpose, tileInVals, smemBase, affineOffset,
-            maskSpanAffineOffset, llvmElemTy, rewriter, targetInfo);
-        assert(succeeded(result));
+        // Undo the permLoad used to divideRight
+        outVals = permLoad.inverse().apply(outVals);
+        return outVals;
       }
-      if (isWarpSync) {
-        targetInfo.warpSync(loc, rewriter);
-      } else {
-        targetInfo.barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
-      }
-      // Load
-      SmallVector<Value> tileOutVals;
-      // idxDst 0: ld.shared, idxDst 1: ldmatrix, idxDst 2: ldmatrix.trans
-      if (idxDst == 0) {
-        tileOutVals = lowerLdStShared(
-            loc, ctx, loadCvt, {}, llvmElemTy, smemBase, /*paddingShifts=*/{},
-            affineOffset, maskSpanAffineOffset, rewriter, targetInfo);
-      } else {
-        assert(idxDst == 1 || idxDst == 2);
-        bool transpose = idxDst == 2;
-        auto result = lowerLdStMatrix(
-            loc, loadCvt, transpose, tileOutVals, smemBase, affineOffset,
-            maskSpanAffineOffset, llvmElemTy, rewriter, targetInfo);
-        assert(succeeded(result));
-      }
-      llvm::append_range(outVals, tileOutVals);
     }
-
-    // Undo the permLoad used to divideRight
-    outVals = permLoad.inverse().apply(outVals);
-    return outVals;
+    // Fallback for NPOT layouts: treat entire conversion as a single rep.
+    // The dest originally had a multi-rep loop with idxSrc/idxDst dispatch
+    // for stmatrix/ldmatrix. Upstream's pow2 path above already covers
+    // stmatrix/ldmatrix when the rep split succeeds; this fallback only
+    // fires for NPOT layouts where the divide failed, where stmatrix isn't
+    // usable anyway, so plain st.shared/ld.shared via runNpotFallback is
+    // safe. Shared with the core lowering.
+    return runNpotFallback(loc, rewriter, targetInfo, srcLayout, dstLayout,
+                           totalStoreCvt, totalLoadCvt, smem, inVals,
+                           llvmElemTy, smemBase);
   }
 
   LogicalResult

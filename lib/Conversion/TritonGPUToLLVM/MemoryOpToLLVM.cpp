@@ -149,6 +149,16 @@ LogicalResult lowerLocalStore(Location loc, MLIRContext *ctx, Value regVal,
     cvt = regLayout.invertAndCompose(sharedLL);
   } else {
     auto sharedLayout = toLinearLayout(memDescTy);
+    // Try the split-dim path for NPOT swizzled SMEM. When it applies it returns
+    // both layouts reshaped to use split output dims; when it does not apply
+    // (pow2 shape / no swizzle / non-NVMMAShared) it returns nullopt and we
+    // keep the original layouts. Either way the same invertAndCompose below is
+    // correct.
+    if (auto split =
+            splitNpotContiguousDim(memDescTy, sharedLayout, regLayout)) {
+      sharedLayout = split->smem;
+      regLayout = split->other;
+    }
     cvt = regLayout.invertAndCompose(sharedLayout);
   }
   auto kBlock = str_attr("block");
@@ -287,6 +297,16 @@ public:
       cvt = regLayout.invertAndCompose(sharedLL);
     } else {
       auto sharedLayout = toLinearLayout(memDescTy);
+      // Try the split-dim path for NPOT swizzled SMEM. When it applies it
+      // returns both layouts reshaped to use split output dims; when it does
+      // not apply (pow2 shape / no swizzle / non-NVMMAShared) it returns
+      // nullopt and we keep the original layouts. Either way the same
+      // invertAndCompose below is correct.
+      if (auto split =
+              splitNpotContiguousDim(memDescTy, sharedLayout, regLayout)) {
+        sharedLayout = split->smem;
+        regLayout = split->other;
+      }
       cvt = regLayout.invertAndCompose(sharedLayout);
     }
     auto kBlock = str_attr("block");
