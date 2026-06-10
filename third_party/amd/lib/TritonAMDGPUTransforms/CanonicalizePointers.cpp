@@ -1538,7 +1538,13 @@ public:
           reconciledTypes.push_back(
               thenYield.getOperand(thenIdx + 1).getType());
         } else {
-          reconciledTypes.push_back(thenYield.getOperand(thenIdx).getType());
+          // Exactly one branch is fat at this position. The reconciled value is
+          // the materialized full pointer, whose type matches the non-fat
+          // branch's operand (a single, possibly-tensor, pointer) — not the fat
+          // branch's scalar base.
+          reconciledTypes.push_back(
+              tIsFat ? elseYield.getOperand(elseIdx).getType()
+                     : thenYield.getOperand(thenIdx).getType());
         }
         thenIdx += tIsFat ? 2 : 1;
         elseIdx += eIsFat ? 2 : 1;
@@ -1576,8 +1582,13 @@ public:
             Value base = oldYield.getOperand(start);
             Value offset = oldYield.getOperand(start + 1);
             rewriter.setInsertionPoint(oldYield);
-            Value combined = tt::AddPtrOp::create(rewriter, ifOp.getLoc(),
-                                                  base.getType(), base, offset);
+            // The offset may be a tensor (e.g. concat/split kernels yield a
+            // tensor of pointers). createTensorPointer splats the scalar base
+            // before the addptr, avoiding an invalid scalar-result addptr with
+            // a non-scalar (tensor) offset operand.
+            Value combined =
+                createTensorPointer(rewriter, base, offset, ifOp.getLoc(),
+                                    fatPtrs.at({base, offset}));
             newOps.push_back(combined);
           } else {
             newOps.push_back(oldYield.getOperand(start));
