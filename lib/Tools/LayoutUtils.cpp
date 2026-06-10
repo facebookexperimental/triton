@@ -149,14 +149,11 @@ LinearLayout ensureLayoutNotSmallerThan(
       // assertion below for NPOT dimensions where desiredSize == actualSize.
       continue;
     }
-    if (desiredSize % actualSize != 0) {
-      // NPOT fallback: round up ratio to next pow2 so identity1D is valid.
-      int32_t ratio = llvm::divideCeil(desiredSize, actualSize);
-      ratio = llvm::isPowerOf2_32(ratio) ? ratio : llvm::NextPowerOf2(ratio);
+    int32_t ratio = llvm::divideCeil(desiredSize, actualSize);
+    if (llvm::isPowerOf2_32(ratio)) {
       ret *= LinearLayout::identity1D(ratio, kDim, outDimName);
     } else {
-      ret *=
-          LinearLayout::identity1D(desiredSize / actualSize, kDim, outDimName);
+      ret *= LinearLayout::modularIdentity1D(ratio, kDim, outDimName);
     }
     assert(ret.getOutDimSize(outDimName) >= desiredSize);
   }
@@ -545,12 +542,41 @@ std::optional<LinearLayout> getReps(const LinearLayout &cvt,
     std::vector<std::vector<int32_t>> basesForDim;
     basesForDim.reserve(inA);
 
-    // 1) Validate the starting bases match exactly.
-    for (int i = 0; i < inB; ++i) {
+    // 1) Validate cvt and tile define the same function on [0, 2^inB).
+    //    We use functional evaluation rather than exact basis comparison
+    //    because layouts computed via lstsqModular (used when the forward
+    //    layout has NPOT output dims) may produce different basis vectors
+    //    than GF(2) lstsq, even when the functions they define are
+    //    identical. Functional evaluation handles both cases correctly.
+    //    Per-dim dispatch: NPOT dims use ADD+mod, pow2 dims use XOR.
+    for (int x = 0; x < (1 << inB); ++x) {
       for (StringAttr od : cvt.getOutDimNames()) {
-        int a = cvt.getBasis(id, i, od);
-        int b = tile.getBasis(id, i, od);
-        if (a != b) {
+        // Compute cvt's output for input x on dimension id.
+        int32_t cvtOut = 0;
+        bool odIsModular = cvt.isOutDimModular(od);
+        for (int bit = 0; bit < inB; ++bit) {
+          if (x & (1 << bit)) {
+            if (odIsModular) {
+              cvtOut =
+                  (cvtOut + cvt.getBasis(id, bit, od)) % cvt.getOutDimSize(od);
+            } else {
+              cvtOut ^= cvt.getBasis(id, bit, od);
+            }
+          }
+        }
+        // Compute tile's output for input x on dimension id.
+        // The tile is always GF(2) (it's the core swizzle tile), so
+        // we always use XOR. If tile doesn't have this out-dim,
+        // the expected output is 0.
+        int32_t tileOut = 0;
+        if (tile.hasOutDim(od)) {
+          for (int bit = 0; bit < inB; ++bit) {
+            if (x & (1 << bit)) {
+              tileOut ^= tile.getBasis(id, bit, od);
+            }
+          }
+        }
+        if (cvtOut != tileOut) {
           return std::nullopt;
         }
       }
@@ -627,6 +653,218 @@ bool splitContiguousDim(int64_t tileCols, int64_t numPhases, int contigDim,
 
   smemLayout = smemLayout.reshapeOuts(newOutDims);
   otherLayout = otherLayout.reshapeOuts(newOutDims);
+  return true;
+}
+
+LinearLayout unfoldModularDimsForAlloc(const LinearLayout &layout) {
+  if (!layout.isModular())
+    return layout;
+  SmallVector<std::pair<StringAttr, int32_t>> newOutDims;
+  bool changed = false;
+  for (auto [dim, size] : layout.getOutDims()) {
+    if (!llvm::isPowerOf2_32(size)) {
+      newOutDims.push_back({dim, llvm::NextPowerOf2(size - 1)});
+      changed = true;
+    } else {
+      newOutDims.push_back({dim, size});
+    }
+  }
+  if (!changed)
+    return layout;
+  return LinearLayout(layout.getBases(), newOutDims,
+                      /*requireSurjective=*/false);
+}
+
+// Reduce each basis of `cvt` modulo N. Returns the reduced bases iff folding
+// is sound for emission as a pow2-rounded layout where outputs combine via
+// XOR. Soundness requires three things:
+//   1. Every reduced basis is a power of 2 or zero (so XOR acts on disjoint
+//      single-bit values).
+//   2. Distinct non-zero reduced bases share no bits -- without this XOR
+//      diverges from ADD, e.g. XOR(16, 16) = 0 vs ADD(16, 16) = 32.
+//   3. The XOR-sum of all bases stays strictly below N.
+// Returns std::nullopt when any condition fails.
+static std::optional<LinearLayout::BasesT>
+tryReduceBasesModN(const LinearLayout &cvt, int32_t N) {
+  LinearLayout::BasesT reducedBases;
+  int32_t xorSeen = 0;
+  for (auto &[inDim, inDimBases] : cvt.getBases()) {
+    auto &newBases = reducedBases[inDim];
+    for (auto &basis : inDimBases) {
+      assert(basis.size() == 1);
+      int32_t val = basis[0] % N;
+      newBases.push_back({val});
+      if (val == 0)
+        continue;
+      if (!llvm::isPowerOf2_32(val) || (val & xorSeen) != 0)
+        return std::nullopt;
+      xorSeen |= val;
+    }
+  }
+  if (xorSeen >= N)
+    return std::nullopt;
+  return reducedBases;
+}
+
+LinearLayout applyNpotKernelFix(const LinearLayout &cvt,
+                                const LinearLayout &smem) {
+  if (!smem.isModular() || cvt.getNumOutDims() != 1)
+    return cvt;
+  int64_t effectiveSize = smem.getTotalOutDimSizeProduct();
+  int64_t currentSize = cvt.getOutDimSize(*cvt.getOutDimNames().begin());
+  if (effectiveSize >= currentSize)
+    return cvt;
+
+  StringAttr outDim = *cvt.getOutDimNames().begin();
+  int32_t N = static_cast<int32_t>(effectiveSize);
+
+  auto reducedOpt = tryReduceBasesModN(cvt, N);
+  if (!reducedOpt)
+    return cvt;
+
+  // Verify A(x) = A(x mod N) for all x. The fold is unsound otherwise.
+  auto smemFlat = smem.flattenIns();
+  StringAttr smemIn = *smemFlat.getInDimNames().begin();
+  for (int x = N; x < smemFlat.getTotalInDimSize(); x++) {
+    auto orig = smemFlat.apply({{smemIn, x}});
+    auto reduced = smemFlat.apply({{smemIn, x % N}});
+    if (orig != reduced)
+      return cvt;
+  }
+
+  return LinearLayout(std::move(*reducedOpt), {{outDim, N}},
+                      /*requireSurjective=*/false);
+}
+
+llvm::DenseMap<int, int> computeDeadPositionMap(const LinearLayout &srcLayout,
+                                                StringAttr kPosition,
+                                                StringAttr kLane,
+                                                StringAttr kWarp) {
+  DenseMap<int, int> deadToCanonical;
+  if (!srcLayout.isModular())
+    return deadToCanonical;
+
+  // Collect NPOT output dims and their indices within the output vector.
+  SmallVector<std::pair<int, int32_t>> npotDimIndices; // (outDimIdx, origSize)
+  int outIdx = 0;
+  for (auto [dim, size] : srcLayout.getOutDims()) {
+    if (!llvm::isPowerOf2_32(size))
+      npotDimIndices.push_back({outIdx, size});
+    outIdx++;
+  }
+  if (npotDimIndices.empty())
+    return deadToCanonical;
+
+  // We fix up "phantom" register positions: register combinations whose
+  // register-only NPOT coordinate R lands in the pow2 padding [N, P). These
+  // arise when the register-rep count along an NPOT output dim is itself NPOT
+  // (the register dimension is padded to the next pow2). The canonical
+  // counterpart is the register combination, at the SAME {lane, warp},
+  // producing R mod N.
+  //
+  // This per-register fixup is sound even when lane/warp ALSO contribute to
+  // the NPOT dim, because the dim is modular: for any (lane, warp)
+  // contribution L,
+  //   (R + L) mod N == ((R mod N) + L) mod N,
+  // so the dead and canonical register positions denote the same logical
+  // element for EVERY thread. We therefore do NOT bail when lane/warp touch
+  // the NPOT dim. We only emit a fixup entry when a register-only canonical
+  // actually exists at the same {lane, warp} (checked below via
+  // canonicalOutputToPos). When it does not, no entry is added and the dead
+  // value flows through unchanged -- callers that need cross-thread correctness
+  // must handle that case separately.
+
+  int numPositions = srcLayout.getInDimSize(kPosition);
+  int numOutDims = srcLayout.getNumOutDims();
+  int numPositionBits = srcLayout.getInDimSizeLog2(kPosition);
+
+  // Determine which output dim indices are NPOT (for per-dim arithmetic).
+  SmallVector<bool> dimIsNpot(numOutDims, false);
+  {
+    int d = 0;
+    for (auto [dim, size] : srcLayout.getOutDims()) {
+      dimIsNpot[d] = !llvm::isPowerOf2_32(size);
+      d++;
+    }
+  }
+
+  // Compute the raw output vector for each position. Uses integer addition
+  // for NPOT dims (matching the hardware's linear TMEM column addressing)
+  // and XOR for pow2 dims (matching GF(2) register-to-row addressing).
+  auto computeRawOutput = [&](int r) -> SmallVector<int32_t> {
+    SmallVector<int32_t> out(numOutDims, 0);
+    for (int bit = 0; bit < numPositionBits; bit++) {
+      if (r & (1 << bit)) {
+        auto basis = srcLayout.getBasis(kPosition, bit);
+        for (int d = 0; d < numOutDims; d++) {
+          if (dimIsNpot[d])
+            out[d] += basis[d]; // Integer addition for NPOT.
+          else
+            out[d] ^= basis[d]; // XOR for pow2.
+        }
+      }
+    }
+    return out;
+  };
+
+  // Phase 1: Build index from canonical output -> position index.
+  // A "canonical" position is one where all NPOT raw dim values are within
+  // the original bounds.
+  // Use 1<<20 as multiplier: max TMEM dim is 512, so dim values fit
+  // comfortably. 65536 could collide for dim values >= 65536.
+  auto outKey = [&](const SmallVector<int32_t> &out) -> int64_t {
+    int64_t key = 0;
+    for (int d = 0; d < numOutDims; d++)
+      key = key * (1 << 20) + out[d];
+    return key;
+  };
+
+  DenseMap<int64_t, int> canonicalOutputToPos;
+  for (int r = 0; r < numPositions; r++) {
+    auto out = computeRawOutput(r);
+    bool isDead = false;
+    for (auto [dimIdx, origSize] : npotDimIndices) {
+      if (out[dimIdx] >= origSize) {
+        isDead = true;
+        break;
+      }
+    }
+    if (!isDead)
+      canonicalOutputToPos[outKey(out)] = r;
+  }
+
+  // Phase 2: For each dead position, find its canonical counterpart.
+  for (int r = 0; r < numPositions; r++) {
+    auto out = computeRawOutput(r);
+    bool isDead = false;
+    for (auto [dimIdx, origSize] : npotDimIndices) {
+      if (out[dimIdx] >= origSize) {
+        out[dimIdx] = out[dimIdx] % origSize; // Wrap to canonical.
+        isDead = true;
+      }
+    }
+    if (isDead) {
+      auto it = canonicalOutputToPos.find(outKey(out));
+      if (it != canonicalOutputToPos.end())
+        deadToCanonical[r] = it->second;
+    }
+  }
+
+  return deadToCanonical;
+}
+
+bool canFixupDeadPositions(const LinearLayout &layout, StringAttr kLane,
+                           StringAttr kWarp) {
+  if (!layout.isModular())
+    return true; // No NPOT dims, nothing to fix.
+  // Check that lane and warp bases don't contribute to any NPOT dim.
+  // When they do, dead positions depend on the thread's lane/warp index,
+  // and within-thread register remapping can't always find a canonical.
+  for (auto [dim, origSize] : layout.getOutDims()) {
+    if (!llvm::isPowerOf2_32(origSize) &&
+        !layout.sublayoutIsZero({kLane, kWarp}, {dim}))
+      return false;
+  }
   return true;
 }
 

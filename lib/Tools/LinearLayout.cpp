@@ -299,12 +299,15 @@ LinearLayout::LinearLayout(
   if (size == 0)
     return LinearLayout::empty();
 
-  assert(llvm::isPowerOf2_32(size));
   std::vector<std::vector<int32_t>> bases;
   for (int32_t i = 1; i < size; i *= 2) {
     bases.emplace_back(std::vector<int32_t>{i * stride});
   }
-  bool requireSurjective = (stride == 1);
+  // For pow2 sizes, the layout is surjective when stride==1.
+  // For NPOT sizes, the input dim is rounded to pow2 (ceil(log2(size)) basis
+  // vectors), creating phantom entries beyond size that wrap modulo
+  // (size*stride). The layout is never surjective for NPOT.
+  bool requireSurjective = llvm::isPowerOf2_32(size) && (stride == 1);
   return LinearLayout({{inDimName, std::move(bases)}},
                       {{outDimName, stride * size}}, requireSurjective);
 }
@@ -316,7 +319,6 @@ LinearLayout::LinearLayout(
   if (size == 0)
     return LinearLayout::empty();
 
-  assert(llvm::isPowerOf2_32(size));
   std::vector<std::vector<int32_t>> zeros;
   for (int i = 1; i < size; i *= 2) {
     zeros.emplace_back(std::vector<int32_t>{0});

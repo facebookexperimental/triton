@@ -121,13 +121,16 @@ Value matrixVectorProd(TritonLLVMOpBuilder &b, const LinearLayout &A, Value x) {
   SmallVector<int32_t> matrix = flatten(A.getBases().begin()->second);
   assert(matrix.size() == nCol);
 
-  // Dual-path codegen: for NPOT dimensions, use ADD instead of XOR.
+  // Per-dim dispatch: NPOT dims use ADD+mod, pow2 dims use XOR.
+  // With the split-dim layout, each sublayout extracted here has a single
+  // out dim that is either pow2 (XOR) or NPOT (ADD+mod). This matches
+  // the solver: GF(2) RREF for pow2 groups, modSolveLinearCRT for NPOT.
   // We accumulate without intermediate UREM; applyNpotModulo applies it once
   // at the end. This is equivalent to per-step modulo because for non-negative
   // integers: (a1+...+ak) mod N = (...((a1+a2) mod N)+a3) mod N...+ak) mod N.
   // No i32 overflow: nCol <= ~20 (register+lane+warp+block bits) and each
   // basisValue < 2*outDimSize, so max sum < 2^25 for any practical dim.
-  if (A.isModular()) {
+  if (A.isOutDimModular(*A.getOutDimNames().begin())) {
     // Fast-path: identity bases [1, 2, 4, ...] → single AND mask.
     // Stride-1 modular layouts always have identity bases, so this eliminates
     // the select+add loop (28 ops for N=127 → 1 AND).
@@ -353,6 +356,7 @@ applyNpotModulo(TritonLLVMOpBuilder &b, const LinearLayout &layout,
   for (auto &[outDimName, outIdx] : indices) {
     int32_t outDimSize = layout.getOutDimSize(outDimName);
     if (!llvm::isPowerOf2_32(outDimSize)) {
+      // NPOT dim: use Barrett or smallModulo for non-power-of-2 modulus.
       // Compute max possible value: sum of all basis entries for this dim
       // (from matrixVectorProd) + outDimSize - 1 (max constant part).
       int32_t outDimIdx = layout.getOutDimIndex(outDimName);
@@ -366,6 +370,11 @@ applyNpotModulo(TritonLLVMOpBuilder &b, const LinearLayout &layout,
         outIdx = smallModulo(b, outIdx, outDimSize);
       else
         outIdx = barrettModulo(b, outIdx, outDimSize);
+    } else {
+      // Pow2 dim in a modular layout: use AND mask for pow2 modulus.
+      // Modular layouts use ADD instead of XOR for NPOT dims and AND for
+      // pow2 dims, so pow2 dims need (a + b) & (2^k - 1) to match.
+      outIdx = b.and_(outIdx, b.i32_val(outDimSize - 1));
     }
   }
 }
@@ -700,6 +709,7 @@ uint32_t applyPadding(uint32_t baseOffset,
 static std::optional<LinearLayout::BasesT>
 tryReduceBasesModN(const LinearLayout &cvt, int32_t N) {
   LinearLayout::BasesT reducedBases;
+  bool npotN = !llvm::isPowerOf2_32(N);
   int32_t xorSeen = 0;
   for (auto &[inDim, inDimBases] : cvt.getBases()) {
     auto &newBases = reducedBases[inDim];
@@ -709,46 +719,18 @@ tryReduceBasesModN(const LinearLayout &cvt, int32_t N) {
       newBases.push_back({val});
       if (val == 0)
         continue;
-      if (!llvm::isPowerOf2_32(val) || (val & xorSeen) != 0)
-        return std::nullopt;
-      xorSeen |= val;
+      // For NPOT N, codegen uses ADD+mod (not XOR), so all reduced values
+      // in [0, N) are valid — skip XOR-soundness checks.
+      if (!npotN) {
+        if (!llvm::isPowerOf2_32(val) || (val & xorSeen) != 0)
+          return std::nullopt;
+        xorSeen |= val;
+      }
     }
   }
-  if (xorSeen >= N)
+  if (!npotN && xorSeen >= N)
     return std::nullopt;
   return reducedBases;
-}
-
-// `cvt` is a register/lane/warp -> kOffset layout. `smem` is the optimal
-// SMEM layout — its total output dim product is the effective size N.
-static LinearLayout applyNpotKernelFix(const LinearLayout &cvt,
-                                       const LinearLayout &smem) {
-  if (!smem.isModular() || cvt.getNumOutDims() != 1)
-    return cvt;
-  int64_t effectiveSize = smem.getTotalOutDimSizeProduct();
-  int64_t currentSize = cvt.getOutDimSize(*cvt.getOutDimNames().begin());
-  if (effectiveSize >= currentSize)
-    return cvt;
-
-  StringAttr outDim = *cvt.getOutDimNames().begin();
-  int32_t N = static_cast<int32_t>(effectiveSize);
-
-  auto reducedOpt = tryReduceBasesModN(cvt, N);
-  if (!reducedOpt)
-    return cvt;
-
-  // Verify A(x) = A(x mod N) for all x. The fold is unsound otherwise.
-  auto smemFlat = smem.flattenIns();
-  StringAttr smemIn = *smemFlat.getInDimNames().begin();
-  for (int x = N; x < smemFlat.getTotalInDimSize(); x++) {
-    auto orig = smemFlat.apply({{smemIn, x}});
-    auto reduced = smemFlat.apply({{smemIn, x % N}});
-    if (orig != reduced)
-      return cvt;
-  }
-
-  return LinearLayout(std::move(*reducedOpt), {{outDim, N}},
-                      /*requireSurjective=*/false);
 }
 
 SmallVector<Value> runNpotFallback(
@@ -771,8 +753,8 @@ SmallVector<Value> runNpotFallback(
   // NPOT kernel equivalence: fold redundant SMEM offsets so that
   // kernel-equivalent register/lane/warp combos that map to the same
   // logical element collapse to the same SMEM offset.
-  storeCvt = applyNpotKernelFix(storeCvt, smem);
-  loadCvt = applyNpotKernelFix(loadCvt, smem);
+  storeCvt = triton::applyNpotKernelFix(storeCvt, smem);
+  loadCvt = triton::applyNpotKernelFix(loadCvt, smem);
 
   Value affineOffset = b.i32_val(0);
   uint64_t maskSpanAffineOffset = 0;
@@ -906,6 +888,24 @@ SmallVector<Value> lowerLdSt(
   auto kWarp = str_attr("warp");
   auto kOffset = str_attr("offset");
   auto bitwidth = getIntOrFloatOrPtrBitWidth(llvmElemTy);
+
+  // Unfold modular (NPOT) output dims to pow2 so divideLeft (used by
+  // largestVectorisation and below) can proceed.  NPOT dims (e.g.
+  // offset=3072 for a 64x48 tensor) arise from buildWithNpotReduction in
+  // combineCtaCgaWithShape.  Rounding up preserves the bases and gives each
+  // register position a unique offset; the calcPaddedOffset / urem wrapping
+  // in the caller handles the real NPOT size.
+  if (cvt.isModular()) {
+    SmallVector<std::pair<StringAttr, int32_t>> newOutDims;
+    for (auto [dim, size] : cvt.getOutDims()) {
+      newOutDims.push_back(
+          {dim, llvm::isPowerOf2_32(size)
+                    ? size
+                    : static_cast<int32_t>(llvm::NextPowerOf2(size))});
+    }
+    cvt = LinearLayout(cvt.getBases(), newOutDims,
+                       /*requireSurjective=*/false);
+  }
 
   auto [elemsPerVec, permutation] =
       largestVectorisation(ctx, cvt, bitwidth, maybeMaxVecElems);
