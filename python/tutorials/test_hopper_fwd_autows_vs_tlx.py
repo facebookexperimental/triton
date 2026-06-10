@@ -47,7 +47,10 @@ tlx_pp_persist = _import(
 def load_autows(swp=True):
     os.environ["TRITON_HOPPER_SWP"] = "1" if swp else "0"
     os.environ["TRITON_ALWAYS_COMPILE"] = "1"
-    return _import(f"autows_swp{int(swp)}", os.path.join(_this_dir, "fused-attention-ws-device-tma-hopper.py"))
+    return _import(
+        f"autows_swp{int(swp)}",
+        os.path.join(_this_dir, "fused-attention-ws-device-tma-hopper-or-blackwell.py"),
+    )
 
 
 def pytorch_ref(q, k, v, sm_scale):
