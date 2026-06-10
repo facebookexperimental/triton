@@ -190,9 +190,15 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
 
     @classmethod
     def make_default(cls, shape):
+        # TMEM hardware requires blockN >= 8 and blockN % 8 == 0.
+        # For 1D-column tensors (e.g., shape=(128, 1) for FA alpha/l/m),
+        # clamp blockN up to 8 and round up to the next multiple of 8.
+        blockN = shape[1]
+        blockN = max(blockN, 8)
+        blockN = ((blockN + 7) // 8) * 8
         return cls(
             blockM=shape[0],
-            blockN=shape[1],
+            blockN=blockN,
             colStride=1,
             CTASplitM=1,
             CTASplitN=1,

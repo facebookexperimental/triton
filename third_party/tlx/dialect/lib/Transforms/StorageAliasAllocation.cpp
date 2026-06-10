@@ -156,7 +156,9 @@ LogicalResult materializeStorageAliasAllocations(
       }
 
       int64_t blockM = bufferShape[0];
-      int64_t blockN = bufferShape[1];
+      // TMEM hardware requires blockN >= 8 and a multiple of 8.
+      int64_t blockN = std::max<int64_t>(bufferShape[1], 8);
+      blockN = llvm::alignTo(blockN, 8);
       LDBG("Creating TMEM allocation with shape [" << blockM << ", " << blockN
                                                    << "]");
 

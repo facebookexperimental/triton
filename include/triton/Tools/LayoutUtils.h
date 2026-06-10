@@ -2,6 +2,7 @@
 #define TRITON_TOOLS_LAYOUTUTILS_H
 
 #include "triton/Tools/LinearLayout.h"
+#include "llvm/ADT/DenseMap.h"
 
 namespace mlir::triton {
 // Is the sublayout defined from dimNames to dimNames the identity?
@@ -185,6 +186,28 @@ std::optional<LinearLayout> getReps(const LinearLayout &cvt,
 // Given a layout mapping onto dim0..dimn, remove a dimension `dim`
 // and rename the rest as dim0..dimn-1
 LinearLayout removeStandardDim(const LinearLayout &layout, int dim);
+
+bool splitContiguousDim(int64_t tileCols, int64_t numPhases, int contigDim,
+                        LinearLayout &smemLayout, LinearLayout &otherLayout);
+
+LinearLayout unfoldModularDimsForAlloc(const LinearLayout &layout);
+
+LinearLayout applyNpotKernelFix(const LinearLayout &cvt,
+                                const LinearLayout &smem);
+
+llvm::DenseMap<int, int> computeDeadPositionMap(const LinearLayout &layout,
+                                                StringAttr kPosition,
+                                                StringAttr kLane,
+                                                StringAttr kWarp);
+
+// Returns true if computeDeadPositionMap can produce a valid fixup map for
+// this layout. When false, lane/warp bases contribute to NPOT dims, so
+// dead-position fixup requires cross-thread communication and cannot be
+// done with a per-position register map. Callers should avoid unfolding
+// modular dims (unfoldModularDimsForAlloc) and instead let the modular
+// layout flow through the SMEM transfer directly.
+bool canFixupDeadPositions(const LinearLayout &layout, StringAttr kLane,
+                           StringAttr kWarp);
 } // namespace mlir::triton
 
 #endif // TRITON_TOOLS_LAYOUTUTILS_H

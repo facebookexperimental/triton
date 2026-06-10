@@ -114,8 +114,14 @@ LogicalResult WarpGroupDotOp::verify() {
   int rank = retShapePerCTA.size();
   if (rank != 2)
     return emitOpError("WGMMA result shape must be 2D");
-  if (retShapePerCTA[0] % 64 != 0)
-    return emitOpError("WGMMA result M dimension must be divisible by 64");
+  // POW2 M must satisfy M%64; only genuinely-NPOT M uses the M%16 relaxation
+  // (a blanket M%16 regressed pow2 tf32 tl.dot).
+  bool mOkWgmma = llvm::isPowerOf2_64(retShapePerCTA[0])
+                      ? (retShapePerCTA[0] % 64 == 0)
+                      : (retShapePerCTA[0] % 16 == 0);
+  if (!mOkWgmma)
+    return emitOpError(
+        "WGMMA result M dimension must be divisible by 64 (pow2) or 16 (NPOT)");
   if (retShapePerCTA[1] % 8 != 0)
     return emitOpError("WGMMA result N dimension must be divisible by 8");
 
@@ -1370,6 +1376,8 @@ void TMEMSubSliceOp::build(OpBuilder &builder, OperationState &state,
   if (auto encoding = dyn_cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
           allocTy.getEncoding())) {
     unsigned newBlockN = std::min<unsigned>(encoding.getBlockN(), size);
+    newBlockN = std::max<unsigned>(newBlockN, 8);
+    newBlockN = llvm::alignTo(newBlockN, 8);
     newEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
         builder.getContext(), encoding.getBlockM(), newBlockN,
         encoding.getColStride(), encoding.getCTASplitM(),

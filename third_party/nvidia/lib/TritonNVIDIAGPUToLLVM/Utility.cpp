@@ -170,7 +170,7 @@ LogicalResult lowerLdStMatrix(
     SmallVector<Value> &vals, // Input for stmatrix, output for ldmatrix
     Value smemBase, Value affineOffset, uint64_t maskSpanAffineOffset,
     Type llvmElemTy, ConversionPatternRewriter &rewriter,
-    const ::triton::NVIDIA::TargetInfo &targetInfo) {
+    const ::triton::NVIDIA::TargetInfo &targetInfo, int64_t npotBufferBytes) {
   // Lower load via ldmatrix, store via stmatrix
 
   bool isStore = !vals.empty();
@@ -308,9 +308,12 @@ LogicalResult lowerLdStMatrix(
   assert(regsPerCoreTile * bitwidth ==
          ((!isStore && bitwidth == 8 && transpose) ? 64 : 32));
 
+  // ldmatrix/stmatrix requires pow2 tile offset dimension
+  if (!llvm::isPowerOf2_32(tile.getOutDimSize(kOffset)))
+    return failure();
   // If we are lowering a subslice, the subslice offsets shall not touch the
   // contiguous part of the tile
-  if (maskSpanAffineOffset & (tile.getOutDimSizeLog2(kOffset) - 1)) {
+  if (maskSpanAffineOffset & (tile.getOutDimSize(kOffset) - 1)) {
     return failure();
   }
 
@@ -397,6 +400,11 @@ LogicalResult lowerLdStMatrix(
           reps.apply({{kReg, i2}, {kLane, 0}, {kWarp, 0}})[0].second;
       auto regIdxAddI8 = regIdxAdd * (bitwidth / 8);
       Value innerOffset = b.add(offset, b.i32_val(regIdxAddI8));
+      // For NPOT split-dim layouts, the offset space is pow2 but the
+      // allocation is NPOT. Wrap degenerate offsets to stay in bounds.
+      if (npotBufferBytes > 0) {
+        innerOffset = b.urem(innerOffset, b.i32_val(npotBufferBytes));
+      }
       auto vecAddr = b.gep(smemPtrTy, i8_ty, smemBase, innerOffset,
                            LLVM::GEPNoWrapFlags::inbounds);
       if (isStore) {

@@ -3,6 +3,7 @@
 #include "mlir/IR/Attributes.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "triton/Analysis/Allocation.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
@@ -115,10 +116,80 @@ Value matrixVectorProd(TritonLLVMOpBuilder &b, const LinearLayout &A, Value x) {
     return ret;
   };
   auto nCol = A.getTotalInDimSizeLog2();
-  auto nRow = A.getTotalOutDimSizeLog2();
+  // For NPOT dimensions, use ceil(log2) to avoid truncating high-order bits
+  auto nRow = A.getTotalOutDimSizeBits();
   SmallVector<int32_t> matrix = flatten(A.getBases().begin()->second);
   assert(matrix.size() == nCol);
 
+  // Per-dim dispatch: NPOT dims use ADD+mod, pow2 dims use XOR.
+  // With the split-dim layout, each sublayout extracted here has a single
+  // out dim that is either pow2 (XOR) or NPOT (ADD+mod). This matches
+  // the solver: GF(2) RREF for pow2 groups, modSolveLinearCRT for NPOT.
+  // We accumulate without intermediate UREM; applyNpotModulo applies it once
+  // at the end. This is equivalent to per-step modulo because for non-negative
+  // integers: (a1+...+ak) mod N = (...((a1+a2) mod N)+a3) mod N...+ak) mod N.
+  // No i32 overflow: nCol <= ~20 (register+lane+warp+block bits) and each
+  // basisValue < 2*outDimSize, so max sum < 2^25 for any practical dim.
+  if (A.isOutDimModular(*A.getOutDimNames().begin())) {
+    // Fast-path: identity bases [1, 2, 4, ...] → single AND mask.
+    // Stride-1 modular layouts always have identity bases, so this eliminates
+    // the select+add loop (28 ops for N=127 → 1 AND).
+    // A stride-1 contiguous modular dim (the only kind the split-dim path
+    // produces here) has DENSE identity bases [1,2,4,...,2^(highBit-1)] with no
+    // gaps. The AND-mask fast path (x & ((1<<highBit)-1)) keeps exactly the low
+    // `highBit` bits of x, so it is correct ONLY when every input column in
+    // [0, highBit) is the identity basis 1<<col -- i.e. there is no zero column
+    // anywhere below the highest set bit. A zero column there means input bit
+    // `col` is unused (contributes 0) while a higher input bit is used; the
+    // mask would then wrongly pass bit `col` of x through and miscompute.
+    //
+    // (NOTE re sashko's "continue here? we skip not just first but all?": the
+    // `continue` is correct -- it advances to the next column, it does not skip
+    // all iterations. We only `continue` over a *trailing* run of zero columns
+    // that sits ABOVE the set bits, which is harmless. Any zero column that is
+    // followed by a non-zero column (leading or sandwiched) breaks the dense
+    // assumption, so we set isIdentity=false and fall through to the safe
+    // general select+add path below.)
+    bool isIdentity = true;
+    int highBit = 0;
+    int firstZeroCol = -1;
+    for (int col = 0; col < nCol; ++col) {
+      int32_t bv = matrix[col];
+      if (bv == 0) {
+        if (firstZeroCol < 0)
+          firstZeroCol = col;
+        continue;
+      }
+      // A non-zero column above an earlier zero column => the zero was a gap
+      // below the set bits, not a harmless trailing zero. Bail.
+      if (firstZeroCol >= 0) {
+        isIdentity = false;
+        break;
+      }
+      if (bv != (1 << col)) {
+        isIdentity = false;
+        break;
+      }
+      highBit = col + 1;
+    }
+    if (isIdentity && highBit > 0)
+      return b.and_(x, b.i32_val((1 << highBit) - 1));
+
+    // General modular path: select+add per basis vector.
+    Value sum = b.i32_val(0);
+    for (int col = 0; col < nCol; ++col) {
+      int32_t basisValue = matrix[col];
+      if (basisValue == 0)
+        continue;
+      Value bit = b.and_(x, b.i32_val(1 << col));
+      Value bitIsZero = b.icmp_eq(bit, b.i32_val(0));
+      Value term = b.select(bitIsZero, b.i32_val(0), b.i32_val(basisValue));
+      sum = b.add(sum, term);
+    }
+    return sum;
+  }
+
+  // Power-of-2 path: XOR-based optimization (unchanged)
   // Row-wise popcount to detect rows that appear exactly once across columns.
   uint32_t rowsUnique = 0;
   {
@@ -235,6 +306,79 @@ Value matrixVectorProd(TritonLLVMOpBuilder &b, const LinearLayout &A, Value x) {
 
 } // namespace triton::gpu
 
+// Cheap modulo for inputs provably < 2N: just compare-and-subtract.
+// 2 ops (icmp + select) vs Barrett's 6 ops (zext + mul64 + lshr + trunc +
+// mul + sub). Especially beneficial on AMD gfx950 where i64 multiply is slow.
+static Value smallModulo(TritonLLVMOpBuilder &b, Value x, int32_t N) {
+  Value cmp = b.icmp_uge(x, b.i32_val(N));
+  return b.select(cmp, b.sub(x, b.i32_val(N)), x);
+}
+
+// Barrett reduction: replace urem with multiply-shift for compile-time moduli.
+// For x mod N where N is known at compile time: q = (x * M) >> k; x - q * N
+// where M = ceil(2^k / N). Uses i64 intermediate to avoid overflow.
+// Correct for all x in [0, 2^25) with k = 32 + ceil(log2(N)).
+static Value barrettModulo(TritonLLVMOpBuilder &b, Value x, int32_t N) {
+  assert(N > 0 && !llvm::isPowerOf2_32(N));
+  int k = 32 + llvm::Log2_32_Ceil(N);
+  // NB: M is uint64_t but i64_val() takes int64_t. This is safe because
+  // k = 32 + ceil(log2(N)) <= 63 for any int32_t N, so M < 2^63.
+  uint64_t M = (uint64_t{1} << k) / N + 1; // ceil(2^k / N)
+  auto i64Ty = b.builder->getIntegerType(64);
+  auto i32Ty = b.builder->getIntegerType(32);
+  Value x64 = b.zext(i64Ty, x);
+  Value prod = b.mul(x64, b.i64_val(M));
+  Value q64 = b.lshr(prod, b.i64_val(k));
+  Value q = b.trunc(i32Ty, q64);
+  return b.sub(x, b.mul(q, b.i32_val(N)));
+}
+
+// Combine two values along an output dim of `layout`. NPOT (modular) dims use
+// integer ADD; pow2 dims use XOR. Centralizes the per-dim dispatch shared by
+// `applyLinearLayout` and `applyLinearLayoutVec` so future NPOT changes only
+// need to touch one site.
+static Value combineModularOrXor(TritonLLVMOpBuilder &b,
+                                 const LinearLayout &layout, StringAttr outDim,
+                                 Value lhs, Value rhs) {
+  if (layout.isOutDimModular(outDim))
+    return b.add(lhs, rhs);
+  return b.xor_(lhs, rhs);
+}
+
+// Apply modular reduction for non-power-of-2 output dimensions.
+// Uses smallModulo (compare+subtract) when the accumulated value is provably
+// < 2N, otherwise falls back to Barrett reduction.
+static void
+applyNpotModulo(TritonLLVMOpBuilder &b, const LinearLayout &layout,
+                MutableArrayRef<std::pair<StringAttr, Value>> indices) {
+  if (!layout.isModular())
+    return;
+  for (auto &[outDimName, outIdx] : indices) {
+    int32_t outDimSize = layout.getOutDimSize(outDimName);
+    if (!llvm::isPowerOf2_32(outDimSize)) {
+      // NPOT dim: use Barrett or smallModulo for non-power-of-2 modulus.
+      // Compute max possible value: sum of all basis entries for this dim
+      // (from matrixVectorProd) + outDimSize - 1 (max constant part).
+      int32_t outDimIdx = layout.getOutDimIndex(outDimName);
+      int32_t maxBasisSum = 0;
+      for (auto &[inDimName, bases] : layout.getBases()) {
+        for (auto &basisVec : bases)
+          maxBasisSum += basisVec[outDimIdx];
+      }
+      int32_t maxValue = maxBasisSum + outDimSize - 1;
+      if (maxValue < 2 * outDimSize)
+        outIdx = smallModulo(b, outIdx, outDimSize);
+      else
+        outIdx = barrettModulo(b, outIdx, outDimSize);
+    } else {
+      // Pow2 dim in a modular layout: use AND mask for pow2 modulus.
+      // Modular layouts use ADD instead of XOR for NPOT dims and AND for
+      // pow2 dims, so pow2 dims need (a + b) & (2^k - 1) to match.
+      outIdx = b.and_(outIdx, b.i32_val(outDimSize - 1));
+    }
+  }
+}
+
 SmallVector<std::pair<StringAttr, Value>>
 applyLinearLayout(Location loc, RewriterBase &rewriter,
                   const LinearLayout &layout,
@@ -293,11 +437,13 @@ applyLinearLayout(Location loc, RewriterBase &rewriter,
   }
 
   for (auto &[outDimName, outIdx] : outIndices) {
-    // Apply flattened sublayout for this output
+    // Apply flattened sublayout for this output dimension
     auto matrix = layout.sublayout(inDimNames, outDimName).flattenIns();
     auto out = triton::gpu::matrixVectorProd(b, matrix, x);
-    outIdx = b.xor_(outIdx, out);
+    outIdx = combineModularOrXor(b, layout, outDimName, outIdx, out);
   }
+
+  applyNpotModulo(b, layout, outIndices);
 
   return outIndices;
 }
@@ -426,7 +572,6 @@ applyLinearLayoutVec(Location loc, RewriterBase &rewriter,
 
   SmallVector<SmallVector<std::pair<StringAttr, Value>>> ret;
 
-  // Iterate over registers, applying XOR trick
   for (auto reg : registers) {
     SmallVector<std::pair<StringAttr, int32_t>> constRegIndices;
     for (const auto &[attr, val] : indices) {
@@ -437,11 +582,17 @@ applyLinearLayoutVec(Location loc, RewriterBase &rewriter,
     SmallVector<std::pair<StringAttr, Value>> combinedIndices;
     for (auto [base, regIdx] : llvm::zip(baseIndices, regIndices)) {
       assert(base.first == regIdx.first);
-      Value combined = b.xor_(base.second, b.i32_val(regIdx.second));
+      Value regVal = b.i32_val(regIdx.second);
+      Value combined =
+          combineModularOrXor(b, layout, base.first, base.second, regVal);
       combinedIndices.emplace_back(base.first, combined);
     }
 
     ret.push_back(combinedIndices);
+  }
+
+  for (auto &indices : ret) {
+    applyNpotModulo(b, layout, indices);
   }
 
   return ret;
@@ -537,6 +688,122 @@ uint32_t applyPadding(uint32_t baseOffset,
   return static_cast<uint32_t>(out);
 }
 
+// Apply the NPOT kernel-equivalence fold: reduce each register-basis modulo
+// the effective SMEM size N, so kernel-equivalent register/lane/warp combos
+// (which already represent the same logical element) collapse to the same
+// SMEM offset. Used by `runNpotFallback`; also re-used as the building
+// block for `applyNpotUremFold`.
+//
+// Reduce each basis of `cvt` modulo N. Returns the reduced bases iff folding
+// is sound for emission as a pow2-rounded layout where outputs combine via
+// XOR. Soundness requires three things:
+//   1. Every reduced basis is a power of 2 or zero (so XOR acts on disjoint
+//      single-bit values).
+//   2. Distinct non-zero reduced bases share no bits — without this XOR
+//      diverges from ADD, e.g. XOR(16, 16) = 0 vs ADD(16, 16) = 32.
+//   3. The XOR-sum of all bases stays strictly below N. lowerLdStShared
+//      rounds the outDim back up to nextPow2(N), so without this check a
+//      valid XOR could land in [N, nextPow2(N)) — an inbounds GEP onto an
+//      address past the actual SMEM buffer (LLVM UB).
+// Returns std::nullopt when any condition fails.
+static std::optional<LinearLayout::BasesT>
+tryReduceBasesModN(const LinearLayout &cvt, int32_t N) {
+  LinearLayout::BasesT reducedBases;
+  bool npotN = !llvm::isPowerOf2_32(N);
+  int32_t xorSeen = 0;
+  for (auto &[inDim, inDimBases] : cvt.getBases()) {
+    auto &newBases = reducedBases[inDim];
+    for (auto &basis : inDimBases) {
+      assert(basis.size() == 1);
+      int32_t val = basis[0] % N;
+      newBases.push_back({val});
+      if (val == 0)
+        continue;
+      // For NPOT N, codegen uses ADD+mod (not XOR), so all reduced values
+      // in [0, N) are valid — skip XOR-soundness checks.
+      if (!npotN) {
+        if (!llvm::isPowerOf2_32(val) || (val & xorSeen) != 0)
+          return std::nullopt;
+        xorSeen |= val;
+      }
+    }
+  }
+  if (!npotN && xorSeen >= N)
+    return std::nullopt;
+  return reducedBases;
+}
+
+SmallVector<Value> runNpotFallback(
+    Location loc, RewriterBase &rewriter, const TargetInfoBase &targetInfo,
+    const triton::LinearLayout &srcLayout,
+    const triton::LinearLayout &dstLayout, triton::LinearLayout totalStoreCvt,
+    triton::LinearLayout totalLoadCvt, const triton::LinearLayout &smem,
+    ArrayRef<Value> inVals, Type llvmElemTy, Value smemBase) {
+  auto *ctx = rewriter.getContext();
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  auto kOffset = str_attr("offset");
+
+  auto storeCvt = totalStoreCvt.reshapeOuts(
+      {{kOffset,
+        static_cast<int32_t>(totalStoreCvt.getTotalOutDimSizeProduct())}});
+  auto loadCvt = totalLoadCvt.reshapeOuts(
+      {{kOffset,
+        static_cast<int32_t>(totalLoadCvt.getTotalOutDimSizeProduct())}});
+
+  // NPOT kernel equivalence: fold redundant SMEM offsets so that
+  // kernel-equivalent register/lane/warp combos that map to the same
+  // logical element collapse to the same SMEM offset.
+  storeCvt = triton::applyNpotKernelFix(storeCvt, smem);
+  loadCvt = triton::applyNpotKernelFix(loadCvt, smem);
+
+  Value affineOffset = b.i32_val(0);
+  uint64_t maskSpanAffineOffset = 0;
+  bool isWarpSync = mlir::isCvtWarpSync(srcLayout, dstLayout);
+  auto syncBarrier = [&]() {
+    if (isWarpSync)
+      targetInfo.warpSync(loc, rewriter);
+    else
+      targetInfo.barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
+  };
+  // Store
+  auto inValsVec = llvm::to_vector(inVals);
+  lowerLdStShared(loc, ctx, storeCvt, inValsVec, llvmElemTy, smemBase,
+                  /*paddingShifts=*/{}, affineOffset, maskSpanAffineOffset,
+                  rewriter, targetInfo);
+  syncBarrier();
+  // Load
+  return lowerLdStShared(loc, ctx, loadCvt, {}, llvmElemTy, smemBase,
+                         /*paddingShifts=*/{}, affineOffset,
+                         maskSpanAffineOffset, rewriter, targetInfo);
+}
+
+// See header doc. Folds an external `urem(offset, effectiveSize)` wrap into
+// the conversion layout itself by reducing each register/lane/warp basis
+// modulo `effectiveSize`. The reduced layout uses ADD+mod (modular) algebra
+// in `lowerLdSt`/`applyLinearLayout` instead of XOR, so degenerate offsets
+// >= effectiveSize wrap to their canonical counterparts naturally.
+LinearLayout applyNpotUremFold(const LinearLayout &cvt, int64_t effectiveSize) {
+  if (cvt.getNumOutDims() != 1 || effectiveSize <= 0)
+    return cvt;
+  StringAttr outDim = *cvt.getOutDimNames().begin();
+  int64_t currentSize = cvt.getOutDimSize(outDim);
+  if (effectiveSize >= currentSize)
+    return cvt;
+  if (effectiveSize > std::numeric_limits<int32_t>::max())
+    return cvt;
+  int32_t N = static_cast<int32_t>(effectiveSize);
+
+  // See tryReduceBasesModN for the soundness conditions. Stride-1 NPOT
+  // split-dim layouts produced by splitNpotContiguousDim satisfy them
+  // trivially.
+  auto reducedOpt = tryReduceBasesModN(cvt, N);
+  if (!reducedOpt)
+    return cvt;
+
+  return LinearLayout(std::move(*reducedOpt), {{outDim, N}},
+                      /*requireSurjective=*/false);
+}
+
 SmallVector<Value>
 lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
                 ArrayRef<Value> valsArray, // Input for store, output for load
@@ -545,7 +812,8 @@ lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
                 Value affineOffset, uint64_t maskSpanAffineOffset,
                 RewriterBase &rewriter, const TargetInfoBase &targetInfo,
                 std::optional<int> maybeMaxVecElems, Operation *localLoadOp,
-                std::optional<Value> ctaRank, std::optional<Value> barrierPtr) {
+                std::optional<Value> ctaRank, std::optional<Value> barrierPtr,
+                int64_t npotBufBytes) {
 
   bool isStore = !valsArray.empty();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -597,7 +865,7 @@ lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
   return lowerLdSt(loc, ctx, cvt, valsArray, llvmElemTy, smemBase,
                    paddingShifts, affineOffset, maskSpanAffineOffset, laneId,
                    warpId, rewriter, targetInfo, maybeMaxVecElems, emitLdSt,
-                   barrierPtr);
+                   barrierPtr, npotBufBytes);
 }
 
 SmallVector<Value> lowerLdSt(
@@ -611,7 +879,7 @@ SmallVector<Value> lowerLdSt(
     std::function<SmallVector<Value>(RewriterBase &, Location, ArrayRef<Value>,
                                      Value, int, VectorType)>
         lowerInst,
-    std::optional<Value> barrierPtr) {
+    std::optional<Value> barrierPtr, int64_t npotBufBytes) {
   auto vals = to_vector(valsArray);
   bool isStore = !vals.empty();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -621,6 +889,24 @@ SmallVector<Value> lowerLdSt(
   auto kWarp = str_attr("warp");
   auto kOffset = str_attr("offset");
   auto bitwidth = getIntOrFloatOrPtrBitWidth(llvmElemTy);
+
+  // Unfold modular (NPOT) output dims to pow2 so divideLeft (used by
+  // largestVectorisation and below) can proceed.  NPOT dims (e.g.
+  // offset=3072 for a 64x48 tensor) arise from buildWithNpotReduction in
+  // combineCtaCgaWithShape.  Rounding up preserves the bases and gives each
+  // register position a unique offset; the calcPaddedOffset / urem wrapping
+  // in the caller handles the real NPOT size.
+  if (cvt.isModular()) {
+    SmallVector<std::pair<StringAttr, int32_t>> newOutDims;
+    for (auto [dim, size] : cvt.getOutDims()) {
+      newOutDims.push_back(
+          {dim, llvm::isPowerOf2_32(size)
+                    ? size
+                    : static_cast<int32_t>(llvm::NextPowerOf2(size))});
+    }
+    cvt = LinearLayout(cvt.getBases(), newOutDims,
+                       /*requireSurjective=*/false);
+  }
 
   auto [elemsPerVec, permutation] =
       largestVectorisation(ctx, cvt, bitwidth, maybeMaxVecElems);
@@ -680,6 +966,15 @@ SmallVector<Value> lowerLdSt(
       // disjoint, so we can calculate their padding contributions separately.
       regIdxAddI8 = applyPadding(regIdxAddI8, paddingShifts);
       Value innerOffset = b.add(offset, b.i32_val(regIdxAddI8));
+      // For NPOT split-dim layouts, the offset space is pow2 but the
+      // SMEM allocation is NPOT. Wrap degenerate offsets to stay in bounds.
+      // Use smallModulo (compare+subtract, 2 ops) instead of urem (hardware
+      // integer divider) — innerOffset < nextPow2(N) + vectorBytes < 2*N
+      // for all practical NPOT buffer sizes.
+      if (npotBufBytes > 0) {
+        innerOffset =
+            smallModulo(b, innerOffset, static_cast<int32_t>(npotBufBytes));
+      }
       auto vecAddr = b.gep(smemPtrTy, i8_ty, smemBase, innerOffset,
                            LLVM::GEPNoWrapFlags::inbounds);
       llvm::append_range(outVals,
@@ -707,6 +1002,50 @@ lowerLocalLdSt(Location loc, MLIRContext *ctx,
                std::optional<Value> ctaRank, std::optional<Value> barrierPtr) {
   assert(cvt.getNumOutDims() == 1);
   assert(*cvt.getOutDimNames().begin() == str_attr("offset"));
+
+  // For NVMMA NPOT contiguous-dim layouts the conversion layout (register ->
+  // offset) is built with a pow2-rounded contiguous dim while the SMEM
+  // buffer holds only the actual N elements per tile. Fold a urem-wrap into
+  // the conversion layout itself so degenerate offsets >= N collide with
+  // their canonical counterparts in `lowerLdStShared`. This replaces the
+  // external `calcPaddedOffset` callable that the upstream `paddingShifts`
+  // API no longer accommodates.
+  //
+  // When the fold fails (bases mod N are not XOR-compatible), fall back to
+  // runtime urem wrapping in lowerLdSt to prevent out-of-bounds SMEM access.
+  int64_t npotBufBytes = 0;
+  if (auto nvmmaEnc =
+          dyn_cast<triton::gpu::NVMMASharedEncodingAttr>(srcTy.getEncoding())) {
+    auto shape = srcTy.getAllocShape().take_back(srcTy.getRank());
+    auto shapePerCTA = triton::gpu::getShapePerCTA(nvmmaEnc, shape);
+    bool isTransposed = nvmmaEnc.getTransposed();
+    int contigDim = isTransposed ? 0 : (int)shapePerCTA.size() - 1;
+    int elemBytes = nvmmaEnc.getElementBitWidth() / 8;
+    int swizzleBytes = nvmmaEnc.getSwizzlingByteWidth();
+    if (swizzleBytes > 0 && elemBytes > 0 &&
+        !llvm::isPowerOf2_64(shapePerCTA[contigDim]) &&
+        (shapePerCTA[contigDim] * elemBytes) % swizzleBytes == 0) {
+      auto allocShapePerCTA =
+          triton::gpu::getAllocationShapePerCTA(srcTy.getEncoding(), shape);
+      // Buffer size in elements (cvt's output is in element units here, in
+      // contrast to the cp.async path which works in bytes).
+      int64_t npotBufElems = 1;
+      for (auto s : allocShapePerCTA)
+        npotBufElems *= s;
+      // Always set npotBufBytes for runtime wrapping in lowerLdSt.
+      // Even when applyNpotUremFold succeeds (bases reduced mod N), the
+      // pow2 unfold in lowerLdSt (line ~872) converts the modular layout
+      // to a non-modular one with pow2 output dim. XOR-based offset
+      // computation on the unfolded layout can then produce values >= N,
+      // causing out-of-bounds SMEM access. The runtime wrapping via
+      // smallModulo catches these cases.
+      npotBufBytes = npotBufElems * elemBytes;
+      auto foldedCvt = applyNpotUremFold(cvt, npotBufElems);
+      if (foldedCvt != cvt) {
+        cvt = foldedCvt;
+      }
+    }
+  }
 
   auto isStore = !valsArray.empty();
   // Remove broadcasting in the registers
@@ -738,10 +1077,10 @@ lowerLocalLdSt(Location loc, MLIRContext *ctx,
                                           /*offsetInBytes=*/true);
   }
 
-  return lowerLdStShared(loc, ctx, cvt, valsArray, llvmElemTy,
-                         smemObj.getBase(), paddingShifts, affineOffset,
-                         maskSpanAffineOffset, rewriter, targetInfo,
-                         maybeMaxVecElems, localLoadOp, ctaRank, barrierPtr);
+  return lowerLdStShared(
+      loc, ctx, cvt, valsArray, llvmElemTy, smemObj.getBase(), paddingShifts,
+      affineOffset, maskSpanAffineOffset, rewriter, targetInfo,
+      maybeMaxVecElems, localLoadOp, ctaRank, barrierPtr, npotBufBytes);
 }
 
 SmallVector<Value> unpackLLElements(Location loc, Value llvmStruct,
@@ -1081,7 +1420,8 @@ SharedMemoryObject::getMaskSpanOffsets(triton::gpu::MemDescType srcTy) {
   auto ret = 0;
   for (auto [dim, shapes] : llvm::enumerate(llvm::zip(shape, allocShape))) {
     auto [shape, allocShape] = shapes;
-    for (int j = llvm::Log2_32(shape); j < llvm::Log2_32(allocShape); ++j) {
+    for (int j = llvm::Log2_32_Ceil(shape); j < llvm::Log2_32_Ceil(allocShape);
+         ++j) {
       logicalOffsets[dim].second = 1 << j;
       ret |= invLl.apply(logicalOffsets)[0].second;
     }
@@ -1646,7 +1986,8 @@ void finalizeTensorAtomicResults(Operation *op, RankedTensorType tensorTy,
   dstLayout = dstLayout.sublayout({kReg, kLane, kWarp},
                                   llvm::to_vector(dstLayout.getOutDimNames()));
   dstLayout = dstLayout.reshapeOuts(
-      {{str_attr("offset"), dstLayout.getTotalOutDimSize()}});
+      {{str_attr("offset"),
+        static_cast<int32_t>(dstLayout.getTotalOutDimSizeProduct())}});
   auto smemBase = LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op);
 
   auto emitSt = [&](RewriterBase &rewriter, Location loc, ArrayRef<Value> vals,
@@ -1776,6 +2117,49 @@ void handleArgPtrDatatype(triton::FuncOp funcOp, LLVM::LLVMFuncOp &llvmFuncOp) {
                             mlir::TypeAttr::get(argDType));
     }
   }
+}
+
+std::optional<SplitNpotLayouts>
+splitNpotContiguousDim(triton::gpu::MemDescType memDescTy,
+                       LinearLayout smemLayout, LinearLayout otherLayout) {
+  auto encoding =
+      dyn_cast<triton::gpu::NVMMASharedEncodingAttr>(memDescTy.getEncoding());
+  if (!encoding)
+    return std::nullopt;
+
+  auto shape = memDescTy.getAllocShape().take_back(memDescTy.getRank());
+  int rank = shape.size();
+  if (rank != 2)
+    return std::nullopt;
+
+  int swizzleBytes = encoding.getSwizzlingByteWidth();
+  if (swizzleBytes == 0)
+    return std::nullopt;
+
+  auto shapePerCTA = triton::gpu::getShapePerCTA(encoding, shape);
+  int elemBytes = encoding.getElementBitWidth() / 8;
+  bool isTransposed = encoding.getTransposed();
+  int contigDim = isTransposed ? 0 : rank - 1;
+
+  if (llvm::isPowerOf2_64(shapePerCTA[contigDim]))
+    return std::nullopt; // pow2 contiguous dim — no split needed
+
+  int64_t contigBytes = shapePerCTA[contigDim] * elemBytes;
+  if (contigBytes % swizzleBytes != 0)
+    return std::nullopt; // not swizzle-compatible
+
+  // Compute phaseSize (core tile columns, pow2) and numPhases (NPOT).
+  int64_t tileCols = swizzleBytes / elemBytes;
+  int64_t contigSize = shapePerCTA[contigDim];
+  int64_t numPhases = contigSize / tileCols;
+  assert(numPhases > 1 && !llvm::isPowerOf2_64(contigSize));
+
+  // splitContiguousDim mutates the by-value local copies in place; return them
+  // only when it actually applied the split.
+  if (triton::splitContiguousDim(tileCols, numPhases, contigDim, smemLayout,
+                                 otherLayout))
+    return SplitNpotLayouts{std::move(smemLayout), std::move(otherLayout)};
+  return std::nullopt;
 }
 
 } // namespace mlir

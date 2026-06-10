@@ -39,9 +39,14 @@ SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
     return ret;
   } else if (version == 3) {
     unsigned k = 256 / eltType.getIntOrFloatBitWidth();
-    if (shape[0] % 64 != 0 || shape[1] % 8 != 0) {
-      assert(false && "type not supported");
-      return {0, 0, 0};
+    // POW2 M must satisfy M%64 (strict); only genuinely-NPOT M uses the M%16
+    // relaxation. A blanket M%16 pulled pow2 M=32 into WGMMA and regressed
+    // pow2 tf32 tl.dot.
+    bool mOkV3 = llvm::isPowerOf2_64(shape[0]) ? (shape[0] % 64 == 0)
+                                               : (shape[0] % 16 == 0);
+    if (!mOkV3 || shape[1] % 8 != 0) {
+      llvm::report_fatal_error("MMAv3 instrShape: M must be divisible by 64 "
+                               "(pow2) or 16 (NPOT), and N by 8");
     }
     SmallVector<unsigned> validN;
 
@@ -60,7 +65,13 @@ SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
     }
 
     unsigned m = 16;
-    unsigned mWarps = std::max<unsigned>(shape[0] / m, 1);
+    // The min(..., numWarps) cap (added alongside the NPOT-M relaxation)
+    // re-tiles pow2 M=64/128 and miscomputes them. Keep the original uncapped
+    // tiling for pow2 M; apply the cap only for NPOT M.
+    unsigned mWarps =
+        llvm::isPowerOf2_64(shape[0])
+            ? std::max<unsigned>(shape[0] / m, 1)
+            : std::min<unsigned>(std::max<unsigned>(shape[0] / m, 1), numWarps);
     unsigned nWarps = std::max<unsigned>(numWarps / mWarps, 1);
     unsigned maxN = std::max<unsigned>(shape[1] / nWarps, 8);
     for (auto n : validN) {
@@ -69,17 +80,40 @@ SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
       }
     }
 
-    assert(false && "type not supported");
-    return {0, 0, 0};
+    llvm::report_fatal_error(
+        "MMAv3 instrShape: no valid N found for the given shape/warps");
   } else if (version == 5) {
-    unsigned m = shape[0] >= 128 ? 128 : 64;
-    // Right now default to distributing along N. TODO: For cases where we have
-    // dot followed by reduction we need to be able to distribute along M.
-    //    if (numWarps > 4)
-    //      m = 64;
-    unsigned n = shape[1] >= 256 ? 256 : shape[1];
+    // MMAv5 instructions are m64 or m128. For NPOT M (e.g. 96, 144, 160, 176,
+    // 192) round the *block* M up to the next power of 2 before selecting the
+    // instruction M so the TMEM tiling stays clean: M in (64,128] -> m128, and
+    // the NPOT accumulator rows beyond M are unused. M<=64 -> m64. This avoids
+    // the blockM=64 distributed-TMEM layout being asked to cover >64 rows for
+    // NPOT M (which is non-surjective with 4 warps).
+    unsigned mRounded =
+        llvm::isPowerOf2_64(shape[0])
+            ? static_cast<unsigned>(shape[0])
+            : static_cast<unsigned>(llvm::NextPowerOf2(shape[0]));
+    unsigned m = mRounded >= 128 ? 128 : 64;
     unsigned k = 256 / eltType.getIntOrFloatBitWidth();
-    return {m, n, k};
+
+    // MMAv5 instrN must be a multiple of 8, in [8, 256], and must divide
+    // BLOCK_N evenly. Prefer the largest valid instrN (fewest MMA reps).
+    // All multiples of 8 from 256 down to 8, in decreasing order.
+    SmallVector<unsigned> validN;
+    for (unsigned n = 256; n >= 8; n -= 8)
+      validN.push_back(n);
+    for (auto n : validN) {
+      if (shape[1] % n == 0) {
+        return {m, n, k};
+      }
+    }
+
+    // SILENT-FAILURE HARDENING: an opt build would skip the assert and return
+    // {0,0,0}, producing silent garbage downstream. Fail loudly instead,
+    // mirroring the v3 branch's report_fatal_error above.
+    llvm::report_fatal_error(
+        "MMAv5 instrShape: no valid instrN found (BLOCK_N must be a multiple "
+        "of 8)");
   } else {
     assert(false && "version not supported");
     return {0, 0};
@@ -134,11 +168,14 @@ unsigned getNumElementsPerThread(Operation *op, SmallVector<unsigned> order,
   unsigned maxMultiple = std::max(maxMultipleBytes / elemNumBytes, 1u);
   unsigned maxContig =
       std::min(valInfo.getContiguity(order[0]), shapePerCTA[order[0]]);
-  unsigned alignment = std::min(maxMultiple, maxContig);
+  // For NPOT contiguity, use the largest pow2 factor for sizePerThread.
+  unsigned pow2Contig = highestPowOf2Divisor(maxContig);
+  unsigned alignment = std::min(maxMultiple, pow2Contig);
   unsigned currPerThread = std::min(alignment, 128 / elemNumBits);
   LDBG("elemNumBytes: " << elemNumBytes
                         << ", divisibility: " << maxMultipleBytes
                         << ", contig: " << valInfo.getContiguity(order[0])
+                        << ", pow2Contig: " << pow2Contig
                         << ", alignment: " << alignment);
   return currPerThread;
 }
@@ -147,13 +184,28 @@ bool isView(Operation *op) {
   return isa<ExpandDimsOp, ReshapeOp, TransOp, JoinOp, SplitOp>(op);
 }
 
+static bool hasNpotMmaEncoding(RankedTensorType ty) {
+  auto enc = ty.getEncoding();
+  if (isa<ttg::NvidiaMmaEncodingAttr>(enc))
+    return true;
+  if (auto dot = dyn_cast<ttg::DotOperandEncodingAttr>(enc))
+    return isa<ttg::NvidiaMmaEncodingAttr>(dot.getParent());
+  return false;
+}
+
 bool isNoop(Operation *op) {
   if (isa<ReshapeOp, TransOp>(op))
     return true;
   if (auto cvt = dyn_cast<ttg::ConvertLayoutOp>(op)) {
+    auto srcTy = cvt.getSrc().getType();
+    auto dstTy = cvt.getResult().getType();
+    // NPOT + MMA: minimalCvtLayout calls invertAndCompose which can hang
+    // in the modular solver. Conservatively say not a noop.
+    if ((hasNpotShape(srcTy) || hasNpotShape(dstTy)) &&
+        (hasNpotMmaEncoding(srcTy) || hasNpotMmaEncoding(dstTy)))
+      return false;
     // The conversion op is a noop if the conversion layout is trivial
-    return minimalCvtLayout(cvt.getSrc().getType(),
-                            cvt.getResult().getType()) == LinearLayout::empty();
+    return minimalCvtLayout(srcTy, dstTy) == LinearLayout::empty();
   }
   return false;
 }
@@ -425,7 +477,8 @@ static Attribute inferDstEncoding(triton::gpu::Fp4ToFpOp op, Attribute srcEnc) {
           .getRegisteredInterface<triton::DialectInferLayoutInterface>()
           ->inferFp4ToFpOpEncoding(shape, op.getAxis(), srcEnc, dstEnc,
                                    /*fwdInference*/ true, std::nullopt);
-  assert(succeeded(result));
+  if (failed(result))
+    return {};
   return dstEnc;
 }
 
@@ -477,7 +530,8 @@ static Attribute inferReshapeOpDstEncoding(ArrayRef<int64_t> srcShape,
           .getRegisteredInterface<triton::DialectInferLayoutInterface>()
           ->inferReshapeOpEncoding(srcShape, srcEnc, dstShape, dstEnc,
                                    /*loc=*/std::nullopt);
-  assert(succeeded(result));
+  if (failed(result))
+    return {};
   return dstEnc;
 }
 
@@ -869,8 +923,17 @@ static bool isFreeConvert(Operation *op) {
   auto convertOp = dyn_cast<triton::gpu::ConvertLayoutOp>(op);
   if (!convertOp)
     return false;
-  return cvtReordersRegisters(convertOp.getSrc().getType(),
-                              convertOp.getType());
+  // Guard NPOT shapes: cvtReordersRegisters calls toLinearLayout which may
+  // crash on encodings that don't support modular NPOT layouts.
+  // Conservatively return false (not free) for unsafe NPOT encodings.
+  auto srcTy = convertOp.getSrc().getType();
+  auto dstTy = convertOp.getType();
+  if (hasNpotShape(srcTy) || hasNpotShape(dstTy)) {
+    if (!npotSafeForLinearLayout(srcTy.getEncoding()) ||
+        !npotSafeForLinearLayout(dstTy.getEncoding()))
+      return false;
+  }
+  return cvtReordersRegisters(srcTy, dstTy);
 }
 
 LogicalResult getConvertBackwardSlice(
@@ -1133,7 +1196,11 @@ swizzleDotOperandLike(RankedTensorType type, ttg::CGAEncodingAttr cgaLayout) {
   // 2, ...]
   auto repOrder = to_vector(llvm::seq<unsigned>(rank));
   auto tile = ttg::nvidiaMmaTile(ctx, microtileShape, kWidth, order, repOrder);
-  if (!divideLeft(layout.getLinearLayout(), tile).has_value()) {
+  // divideLeft does not support modular (NPOT) layouts.  If the encoding
+  // already carries NPOT dims (e.g. from an NPOT tensor shape), the swizzle
+  // probe is not applicable.
+  if (layout.getLinearLayout().isModular() ||
+      !divideLeft(layout.getLinearLayout(), tile).has_value()) {
     return {};
   }
   return ttg::SwizzledSharedEncodingAttr::get(
@@ -1178,6 +1245,11 @@ getSharedEncIfAllUsersAreDotEnc(Value val, bool &incompatible) {
 
       if (auto dot =
               dyn_cast<ttg::DotOperandEncodingAttr>(dstTy.getEncoding())) {
+        bool isNpot = llvm::any_of(srcTy.getShape(), [](int64_t d) {
+          return d > 0 && !llvm::isPowerOf2_64(d);
+        });
+        if (isNpot && !npotSafeForLinearLayout(dot.getParent()))
+          return std::nullopt;
         auto order = getOrderForMemory(srcTy);
         unsigned bitWidth = srcTy.getElementTypeBitWidth();
         tempAttr = ttg::SwizzledSharedEncodingAttr::get(

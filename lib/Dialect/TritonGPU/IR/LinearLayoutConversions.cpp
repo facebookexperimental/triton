@@ -218,23 +218,63 @@ LinearLayout nvmmaSharedToLinearLayout(ArrayRef<int64_t> shape,
     cgaLayout = CGAEncodingAttr::get(
         ctx, LinearLayout(bases, standardOutDimNames(ctx, rank)));
   }
+
+  // [NPOT rounding for NPOT M/K dims]
+  // Internal layout construction (identity1D, ensureLayoutNotSmallerThan)
+  // requires pow2 dimensions. Round NPOT dims to next pow2 for layout building;
+  // combineCtaCgaWithShape applies modular reduction for the real NPOT shape.
+  //
+  // Exception: the contiguous dim keeps its actual NPOT size when swizzle is
+  // compatible (contigBytes % swizzleBytes == 0). In that case the swizzle
+  // phases tile evenly into the contiguous dim and we use modular extension
+  // instead of pow2 identity for the phase tiling.
+  auto roundToPow2 = [](int64_t v) -> int64_t {
+    return llvm::isPowerOf2_64(v) ? v : llvm::NextPowerOf2(v);
+  };
+
+  int swizzleBytes = shared.getSwizzlingByteWidth();
+  int elemBytes = shared.getElementBitWidth() / 8;
+  bool isTransposed = shared.getTransposed();
+  // contigDim is the fastest-varying dimension in the N-D shape.
+  int contigDim = isTransposed ? 0 : rank - 1;
+
+  // Check if the contiguous dim is NPOT but swizzle-compatible.
+  bool contigNpotSwizzleOk = false;
+  if (swizzleBytes > 0 && !llvm::isPowerOf2_64(shapePerCTA[contigDim])) {
+    int64_t contigBytes = shapePerCTA[contigDim] * elemBytes;
+    contigNpotSwizzleOk = (contigBytes % swizzleBytes == 0);
+  }
+
+  SmallVector<int64_t> pow2ShapePerCTA(shapePerCTA.size());
+  for (size_t i = 0; i < shapePerCTA.size(); i++) {
+    if (contigNpotSwizzleOk && (int)i == contigDim) {
+      pow2ShapePerCTA[i] = shapePerCTA[i];
+    } else {
+      pow2ShapePerCTA[i] = roundToPow2(shapePerCTA[i]);
+    }
+  }
+  SmallVector<int64_t> pow2TmaShape(tmaShape.size());
+  for (size_t i = 0; i < tmaShape.size(); i++)
+    pow2TmaShape[i] = roundToPow2(tmaShape[i]);
+
   if (shared.getSwizzlingByteWidth() == 0) {
     auto outDimNames = standardOutDimNames(ctx, rank);
-    LinearLayout layout = LinearLayout::identity1D(tmaShape[rank - 1], kOffset,
-                                                   outDimNames[rank - 1]);
+    LinearLayout layout = LinearLayout::identity1D(
+        pow2TmaShape[rank - 1], kOffset, outDimNames[rank - 1]);
     for (int i = rank - 2; i >= 0; --i) {
-      layout *= LinearLayout::identity1D(tmaShape[i], kOffset, outDimNames[i]);
+      layout *=
+          LinearLayout::identity1D(pow2TmaShape[i], kOffset, outDimNames[i]);
     }
-    layout = ensureLayoutNotSmallerThan(layout, outDimNames, shapePerCTA);
+    layout = ensureLayoutNotSmallerThan(layout, outDimNames, pow2ShapePerCTA);
     return combineCtaCgaWithShape(layout, cgaLayout, shape);
   }
   assert(rank >= 2);
 
   // Collapse all the outer dim into one. We will then create a layout for this
   // shape and reshape it to the original shape.
-  std::array<int64_t, 2> collapsedTmaShape{1, tmaShape.back()};
+  std::array<int64_t, 2> collapsedTmaShape{1, pow2TmaShape.back()};
   for (int i = 0; i + 1 < rank; i++)
-    collapsedTmaShape[0] *= tmaShape[i];
+    collapsedTmaShape[0] *= pow2TmaShape[i];
   if (shared.getTransposed()) {
     std::swap(collapsedTmaShape[0], collapsedTmaShape[1]);
   }
@@ -262,7 +302,7 @@ LinearLayout nvmmaSharedToLinearLayout(ArrayRef<int64_t> shape,
       ensureLayoutNotSmallerThan(tileLayout, outDimNames, collapsedTmaShape);
 
   // Reshape the layout to the N-D pre-transposed shape per CTA.
-  SmallVector<int64_t> maybeTransposedTmaShape = tmaShape;
+  SmallVector<int64_t> maybeTransposedTmaShape(pow2TmaShape);
   if (shared.getTransposed()) {
     // Move the outer dim to the inner position.
     // TODO: we should move back to using `order` instead of transposed to make
@@ -281,10 +321,128 @@ LinearLayout nvmmaSharedToLinearLayout(ArrayRef<int64_t> shape,
     reshapedLayout = transposeLinearLayout(reshapedLayout, order);
   }
 
-  reshapedLayout = ensureLayoutNotSmallerThan(
-      reshapedLayout, standardOutDimNames(ctx, shapePerCTA.size()),
-      shapePerCTA);
-  return combineCtaCgaWithShape(reshapedLayout, cgaLayout, shape);
+  if (contigNpotSwizzleOk) {
+    auto ndOutDimNames = standardOutDimNames(ctx, pow2ShapePerCTA.size());
+    int64_t contigSize = pow2ShapePerCTA[contigDim];
+    int64_t currentContigSize =
+        reshapedLayout.getOutDimSize(ndOutDimNames[contigDim]);
+    if (currentContigSize < contigSize) {
+      assert(contigSize % currentContigSize == 0 &&
+             "NPOT contig dim must be a multiple of the tile size");
+      int32_t numPhases = contigSize / currentContigSize;
+      reshapedLayout *= LinearLayout::modularIdentity1D(
+          numPhases, kOffset, ndOutDimNames[contigDim]);
+    }
+    SmallVector<int64_t> remainingShape(pow2ShapePerCTA);
+    remainingShape[contigDim] =
+        reshapedLayout.getOutDimSize(ndOutDimNames[contigDim]);
+    reshapedLayout = ensureLayoutNotSmallerThan(reshapedLayout, ndOutDimNames,
+                                                remainingShape);
+  } else {
+    reshapedLayout = ensureLayoutNotSmallerThan(
+        reshapedLayout, standardOutDimNames(ctx, pow2ShapePerCTA.size()),
+        pow2ShapePerCTA);
+  }
+  SmallVector<int64_t> effectiveShape(shape.begin(), shape.end());
+  for (int i = 0; i < rank; i++) {
+    if (!llvm::isPowerOf2_64(effectiveShape[i])) {
+      // The contiguous dim keeps its NPOT size only in the swizzle-compatible
+      // modular split-dim case (contigNpotSwizzleOk). Otherwise the layout was
+      // built with the contig dim rounded to pow2 (pow2ShapePerCTA), so the
+      // effective shape must match the pow2 size; passing the logical NPOT size
+      // makes combineCtaCgaWithShape reduce the swizzled contig offset modulo
+      // the NPOT value, aliasing columns. The allocation already pads the
+      // contig dim to pow2 (getAllocationShapePerCTA), and padded columns are
+      // masked at the epilogue store.
+      if (i == contigDim && contigNpotSwizzleOk)
+        continue;
+      effectiveShape[i] = llvm::NextPowerOf2(effectiveShape[i]);
+    }
+  }
+  return combineCtaCgaWithShape(reshapedLayout, cgaLayout, effectiveShape);
+}
+
+std::optional<LinearLayout>
+nvmmaSharedToSplitLinearLayout(ArrayRef<int64_t> shape,
+                               NVMMASharedEncodingAttr shared) {
+  MLIRContext *ctx = shared.getContext();
+  int rank = shape.size();
+  if (rank != 2)
+    return std::nullopt;
+
+  int swizzleBytes = shared.getSwizzlingByteWidth();
+  if (swizzleBytes == 0)
+    return std::nullopt;
+
+  auto shapePerCTA = getShapePerCTA(shared, shape);
+  int elemBitWidth = shared.getElementBitWidth();
+  int elemBytes = elemBitWidth / 8;
+  bool isTransposed = shared.getTransposed();
+  int contigDim = isTransposed ? 0 : rank - 1;
+
+  // Only applies when the contiguous dim is NPOT and swizzle-compatible.
+  if (llvm::isPowerOf2_64(shapePerCTA[contigDim]))
+    return std::nullopt;
+  int64_t contigBytes = shapePerCTA[contigDim] * elemBytes;
+  if (contigBytes % swizzleBytes != 0)
+    return std::nullopt;
+
+  // Build the core tile in the 2D collapsed space.
+  // getCoreMatrixLinearLayout always produces dim0=rows(8), dim1=tileCols.
+  auto coreTile = getCoreMatrixLinearLayout(shared, /*disableSwizzle=*/false);
+  auto kOffset = S("offset");
+  auto coreOutDims = standardOutDimNames(ctx, 2);
+  auto kRow2D = coreOutDims[0]; // "dim0"
+  auto kCol2D = coreOutDims[1]; // "dim1"
+  int tileRows = coreTile.getOutDimSize(kRow2D);
+  int tileCols = coreTile.getOutDimSize(kCol2D);
+
+  // Rename dim1 -> contig_intra to separate from phase dim.
+  auto kIntra = S("contig_intra");
+  auto kPhase = S("contig_phase");
+  {
+    auto bases = coreTile.getBases();
+    SmallVector<std::pair<StringAttr, int32_t>> newOutDims;
+    for (auto [name, size] : coreTile.getOutDims()) {
+      newOutDims.push_back({name == kCol2D ? kIntra : name, size});
+    }
+    coreTile = LinearLayout(std::move(bases), newOutDims,
+                            /*requireSurjective=*/false);
+  }
+
+  // Compute collapsed 2D shape following the same logic as
+  // nvmmaSharedToLinearLayout.
+  auto tmaShape = triton::nvidia_gpu::getTMABlockShape(
+      shared, shapePerCTA, /*packedSize=*/true, gpu::TMAMode::Tiled);
+  auto roundToPow2 = [](int64_t v) -> int64_t {
+    return llvm::isPowerOf2_64(v) ? v : llvm::NextPowerOf2(v);
+  };
+  SmallVector<int64_t> pow2TmaShape(tmaShape.size());
+  for (size_t i = 0; i < tmaShape.size(); i++)
+    pow2TmaShape[i] = roundToPow2(tmaShape[i]);
+
+  std::array<int64_t, 2> collapsedTmaShape{1, pow2TmaShape.back()};
+  for (int i = 0; i + 1 < rank; i++)
+    collapsedTmaShape[0] *= pow2TmaShape[i];
+  if (isTransposed) {
+    std::swap(collapsedTmaShape[0], collapsedTmaShape[1]);
+  }
+
+  // Extend rows (dim0) to match collapsedTmaShape[0].
+  if (collapsedTmaShape[0] > tileRows) {
+    int64_t ratio = collapsedTmaShape[0] / tileRows;
+    assert(llvm::isPowerOf2_64(ratio));
+    coreTile *= LinearLayout::identity1D(ratio, kOffset, kRow2D);
+  }
+
+  // Add NPOT phase dim instead of extending the contiguous dim.
+  int64_t contigSize = shapePerCTA[contigDim];
+  int32_t numPhases = contigSize / tileCols;
+  assert(numPhases > 1 && "Should have been caught by isPowerOf2 check");
+  coreTile *= LinearLayout::modularIdentity1D(numPhases, kOffset, kPhase);
+
+  // Result has output dims: (dim0, contig_intra, contig_phase)
+  return coreTile;
 }
 
 /// Function to generate lane and warp layout for dot operands.
@@ -429,11 +587,13 @@ AMDMfmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   // tile. Instead of switching to the M dimension now, we continue extending
   // the layout along the remaining N dimension, and only then proceed along M,
   // following the tilesPerWarp configuration.
-  // If the N dimension is not large enough to span multiple CTA tiles (i.e.,
-  // the first argument is 0), an empty layout is created, so this identity
-  // layout will not introduce any new registers.
-  tileLayout *= LinearLayout::identity1D(
-      shape[nIndex] / (nDim * warpsPerCTAN * tilesPerWarpN), kRegister, dimN);
+  // Extend along N for remaining CTA tiles. Use divideCeil + NextPowerOf2
+  // so NPOT N dimensions don't truncate; combineCtaCgaWithShape reduces.
+  int64_t nTileDenom = nDim * warpsPerCTAN * tilesPerWarpN;
+  int64_t nExtra = llvm::divideCeil(shape[nIndex], nTileDenom);
+  int64_t nExtraPow2 =
+      llvm::isPowerOf2_64(nExtra) ? nExtra : llvm::NextPowerOf2(nExtra);
+  tileLayout *= LinearLayout::identity1D(nExtraPow2, kRegister, dimN);
   tileLayout *= LinearLayout::identity1D(tilesPerWarpM, kRegister, dimM);
 
   // Finally, extend the layout across warps in the M dimension.
@@ -634,7 +794,10 @@ LinearLayout mfmaDotToLinearLayout(DotOperandEncodingAttr dotMfmaLayout,
   auto warpOrder = getDefaultMmaOrder(mfmaLayout);
 
   // Each lane holds kWidth elements along the K dimension
-  LinearLayout regs = LinearLayout::identity1D(kWidth, kRegister, dimK);
+  LinearLayout regs =
+      llvm::isPowerOf2_32(kWidth)
+          ? LinearLayout::identity1D(kWidth, kRegister, dimK)
+          : LinearLayout::modularIdentity1D(kWidth, kRegister, dimK);
   // First distribute nonKDim elements along the non-K dimension,
   // then distribute remaining elements along the K dimension
   LinearLayout lanes =
@@ -652,9 +815,14 @@ LinearLayout mfmaDotToLinearLayout(DotOperandEncodingAttr dotMfmaLayout,
   }
 
   // If shape K is larger than the tile size, repeat the tile
-  // along the K dimension.
+  // along the K dimension. Round up to next pow2 for identity1D;
+  // combineCtaCgaWithShape will reduce to the actual NPOT shape.
   if (kSize > kTileSize) {
-    tileLayout *= LinearLayout::identity1D(kSize / kTileSize, kRegister, dimK);
+    int numKTiles = llvm::divideCeil(kSize, kTileSize);
+    int numKTilesPow2 = llvm::isPowerOf2_32(numKTiles)
+                            ? numKTiles
+                            : llvm::NextPowerOf2(numKTiles);
+    tileLayout *= LinearLayout::identity1D(numKTilesPow2, kRegister, dimK);
   }
 
   // Follow the tiles per warp property, repeat the tile layout
@@ -819,8 +987,11 @@ LinearLayout wmmaDotOperandToLinearLayout(DotOperandEncodingAttr dotWmmaLayout,
   // - k dim: repeat kDim / (kWidth * depth) times to fit k dim
   LinearLayout tileLayout;
   int depth = warpSize / nonKDim;
-  tileLayout = LinearLayout::identity1D(kWidth, kRegister, dimK) *
-               LinearLayout::identity1D(nonKDim, kLane, dimNonK);
+  tileLayout =
+      (llvm::isPowerOf2_32(kWidth)
+           ? LinearLayout::identity1D(kWidth, kRegister, dimK)
+           : LinearLayout::modularIdentity1D(kWidth, kRegister, dimK)) *
+      LinearLayout::identity1D(nonKDim, kLane, dimNonK);
   tileLayout *= version == 1 ? LinearLayout::zeros1D(depth, kLane, dimK)
                              : LinearLayout::identity1D(depth, kLane, dimK);
 
@@ -884,7 +1055,16 @@ LinearLayout fmaDotToLinearLayout(DotOperandEncodingAttr operandLayout,
   SmallVector<StringAttr> repDimNames =
       permuteDimNames(standardOutDimNames(ctx, rank), repOrder);
 
-  auto registersLayout = identityStandardND(kReg, threadSize, regOrder);
+  // Build register layout dimension-by-dimension.  The K dimension may be
+  // NPOT (e.g. 48) so we round it up to the next power of 2 here;
+  // combineCtaCgaWithShape will apply modular reduction for the real NPOT
+  // shape.
+  SmallVector<unsigned> pow2ThreadSize(threadSize.begin(), threadSize.end());
+  for (auto &s : pow2ThreadSize) {
+    if (!llvm::isPowerOf2_32(s))
+      s = llvm::NextPowerOf2(s);
+  }
+  auto registersLayout = identityStandardND(kReg, pow2ThreadSize, regOrder);
   auto lanesLayout = broadcastedDotOperandLayout(ctx, threadShape, threadOrder,
                                                  kDimIdx, kLane);
   auto warpsLayout =
@@ -928,13 +1108,20 @@ LinearLayout nvidiaMmaTile(MLIRContext *ctx, ArrayRef<unsigned> tileShape,
   // FIXME. We should implement operator* in terms of operator*=
   // and chain *= instead of using *
   auto outDimNames = llvm::to_vector(ctaLayout.getOutDimNames());
-  ctaLayout = ctaLayout *
-              LinearLayout::identity1D(kWidth, S("register"), dimNames[inner]) *
-              LinearLayout::identity1D(4, S("lane"), dimNames[inner]) *
-              LinearLayout::identity1D(8, S("lane"), dimNames[outer]) *
-              LinearLayout::identity1D(m / 8, S("register"), dimNames[outer]) *
-              LinearLayout::identity1D(n / (kWidth * 4), S("register"),
-                                       dimNames[inner]);
+  ctaLayout =
+      ctaLayout *
+      (llvm::isPowerOf2_32(kWidth)
+           ? LinearLayout::identity1D(kWidth, S("register"), dimNames[inner])
+           : LinearLayout::modularIdentity1D(kWidth, S("register"),
+                                             dimNames[inner])) *
+      LinearLayout::identity1D(4, S("lane"), dimNames[inner]) *
+      LinearLayout::identity1D(8, S("lane"), dimNames[outer]) *
+      LinearLayout::identity1D(m / 8, S("register"), dimNames[outer]) *
+      (llvm::isPowerOf2_32(n / (kWidth * 4))
+           ? LinearLayout::identity1D(n / (kWidth * 4), S("register"),
+                                      dimNames[inner])
+           : LinearLayout::modularIdentity1D(n / (kWidth * 4), S("register"),
+                                             dimNames[inner]));
   return ctaLayout;
 }
 
@@ -1010,6 +1197,34 @@ DotOperandEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   }
 }
 
+// Apply NPOT modular reduction to bases. For dims where shape[i] is
+// non-power-of-2, reduces basis[i] values mod shape[i].
+static LinearLayout buildWithNpotReduction(LinearLayout::BasesT bases,
+                                           ArrayRef<StringAttr> outDimNames,
+                                           ArrayRef<int64_t> shape) {
+  assert(outDimNames.size() == shape.size());
+  bool hasNpot = llvm::any_of(
+      shape, [](int64_t s) { return s > 0 && !llvm::isPowerOf2_64(s); });
+  if (!hasNpot)
+    return LinearLayout(std::move(bases), llvm::to_vector(outDimNames));
+
+  for (size_t i = 0; i < shape.size(); i++) {
+    if (!llvm::isPowerOf2_64(shape[i])) {
+      int32_t npotSize = static_cast<int32_t>(shape[i]);
+      for (auto &[inDimName, inDimBases] : bases) {
+        for (auto &basis : inDimBases) {
+          basis[i] = basis[i] % npotSize;
+        }
+      }
+    }
+  }
+  SmallVector<std::pair<StringAttr, int32_t>> outDims;
+  for (size_t i = 0; i < shape.size(); i++) {
+    outDims.push_back({outDimNames[i], static_cast<int32_t>(shape[i])});
+  }
+  return LinearLayout(std::move(bases), outDims, /*requireSurjective=*/false);
+}
+
 LinearLayout SliceEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   MLIRContext *ctx = getContext();
 
@@ -1018,7 +1233,31 @@ LinearLayout SliceEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   parentShape.insert(parentShape.begin() + getDim(), 1);
   LinearLayout parentLL = triton::gpu::toLinearLayout(parentShape, getParent());
 
-  auto sliceLL = removeStandardDim(parentLL, getDim());
+  // Remove dimension getDim() from the parent layout.
+  //
+  //  1. Construct a layout `transform` from parent-out-dims to slice-out-dims
+  //     that removes the relevant out-dim.
+  //  2. Compute linearSlice = parent.compose(transform).  Now linearSlice maps
+  //     from parent in-dims to slice out-dims.
+  //  3. Fix up duplicate registers introduced by slicing.
+  auto outDimNames = standardOutDimNames(ctx, shape.size() + 1);
+  LinearLayout transform = LinearLayout::empty();
+  for (auto [idx, outDim] : llvm::enumerate(parentLL.getOutDimNames())) {
+    if (idx == getDim()) {
+      // Because we're multiplying by all zeros, we could replace outDimNames[0]
+      // with any other valid out-dim; the layout will be the same.
+      transform *= LinearLayout::zeros1D(parentLL.getOutDimSize(outDim), outDim,
+                                         outDimNames[0]);
+    } else {
+      int32_t dimSize = parentLL.getOutDimSize(outDim);
+      StringAttr mappedDim = outDimNames[idx - (idx < getDim() ? 0 : 1)];
+      // Use pow2-rounded size for the transform; NPOT reduction applied below
+      int32_t pow2Size =
+          llvm::isPowerOf2_32(dimSize) ? dimSize : llvm::NextPowerOf2(dimSize);
+      transform *= LinearLayout::identity1D(pow2Size, outDim, mappedDim);
+    }
+  }
+  LinearLayout sliceLL = parentLL.compose(transform);
 
   // Step 3: Along the "register" dim, remove any all-zero bases.
   auto bases = sliceLL.getBases();
@@ -1030,8 +1269,8 @@ LinearLayout SliceEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   }
   bases[S("register")] = newRegBases;
 
-  return LinearLayout(std::move(bases),
-                      llvm::to_vector(sliceLL.getOutDimNames()));
+  auto sliceOutNames = llvm::to_vector(sliceLL.getOutDimNames());
+  return buildWithNpotReduction(std::move(bases), sliceOutNames, shape);
 }
 
 LinearLayout tensorMemoryToLinearLayout(ArrayRef<int64_t> shape,
@@ -1096,53 +1335,101 @@ LinearLayout tensorMemoryToLinearLayout(ArrayRef<int64_t> shape,
   auto blockM = encoding.getBlockM();
   auto blockN = std::min<int32_t>(encoding.getBlockN(), shape[1]);
   assert(blockM == 64 || blockM == 128);
+
+  // For NPOT blockN (e.g. 96), use modularIdentity1D which creates
+  // the correct basis vectors for non-power-of-2 sizes.  The resulting
+  // layout has getInDimSize(kCol) = NextPowerOf2(blockN) (for correct
+  // TMEM allocation) but getOutDimSize(dim1) = blockN.
+  bool npotN = blockN > 0 && !llvm::isPowerOf2_32(blockN);
+  auto colIdentity = [&](int32_t n, StringAttr inDim, StringAttr outDim) {
+    return npotN ? LinearLayout::modularIdentity1D(n, inDim, outDim)
+                 : LinearLayout::identity1D(n, inDim, outDim);
+  };
+
   LinearLayout tile =
       LinearLayout::zeros1D(encoding.getColStride(), kCol, dims[1]);
   if (blockM == 64) {
-    // BlockM=64(per CTA) in 2cta mode has special layouts for both LHS (A) and
-    // RHS (D)
-    // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-data-path-layout-b
     if (encoding.getCtaMode() ==
         triton::nvidia_gpu::TensorMemoryCTAMode::TwoCTA_LHS) {
-      // This applies to all TMEM encoding in 2cta_m64 except accumulator of MMA
       tile *= LinearLayout::identity1D(blockM, kRow, dims[0]) *
               LinearLayout::identity1D(blockN, kCol, dims[1]);
       tile *= LinearLayout::zeros1D(2, kRow, dims[0]);
-
     } else if (encoding.getCtaMode() ==
                triton::nvidia_gpu::TensorMemoryCTAMode::TwoCTA_RHS) {
-      // This applies to TMEM encoding in 2cta_m64 accumulator of MMA
       tile = LinearLayout::identity1D(blockM, kRow, dims[0]) *
              LinearLayout::identity1D(blockN / 2, kCol, dims[1]);
-      // row 64~127 stores the right half of the logical tensor (D[0:64, N/2:N])
       tile *= LinearLayout::identity1D(2, kRow, dims[1]);
     } else {
-      // non 2cta_m64 cases
       tile *= LinearLayout::identity1D(16, kRow, dims[0]) *
-              LinearLayout::identity1D(blockN, kCol, dims[1]);
+              colIdentity(blockN, kCol, dims[1]);
       auto bases = tile.getBases();
       if (shape[0] > blockM) {
         bases[kRow].push_back({64, 0});
       } else if (shape[1] > blockN) {
-        bases[kRow].push_back({0, blockN});
+        bases[kRow].push_back({0, static_cast<int32_t>(blockN)});
       } else {
-        // Empty, meaning the element is not defined
         bases[kRow].push_back({0, 0});
       }
       bases[kRow].push_back({16, 0});
       bases[kRow].push_back({32, 0});
-      tile = LinearLayout(std::move(bases), dims);
+      if (npotN) {
+        SmallVector<std::pair<StringAttr, int32_t>> outDims;
+        for (auto dim : dims) {
+          outDims.push_back(
+              {dim, static_cast<int32_t>(dim == dims[1]
+                                             ? blockN
+                                             : tile.getOutDimSize(dims[0]))});
+        }
+        int32_t maxDim0 = 0;
+        for (auto &basis : bases[kRow]) {
+          maxDim0 = std::max(maxDim0, basis[0]);
+        }
+        outDims[0].second = llvm::NextPowerOf2(maxDim0);
+        tile = LinearLayout(std::move(bases), outDims,
+                            /*requireSurjective=*/false);
+      } else {
+        tile = LinearLayout(std::move(bases), dims);
+      }
     }
   } else {
     tile *= LinearLayout::identity1D(blockM, kRow, dims[0]) *
-            LinearLayout::identity1D(blockN, kCol, dims[1]);
+            colIdentity(blockN, kCol, dims[1]);
   }
-  auto repsM = shape[0] / tile.getOutDimSize(dims[0]);
+  // NPOT M: the row tile covers tile.getOutDimSize(dims[0]) rows (the MMAv5
+  // instruction M, 64 or 128, possibly extended to 128 via the extra base
+  // above). When the actual shape[0] is NPOT (e.g. 96, 144, 160, 176, 192) it
+  // is not a multiple of the tile M size, so we round the rep count up to the
+  // next power of 2 (so the broadcast identity1D is well-formed) and then apply
+  // a modular reduction on the row dim so the resulting TMEM LinearLayout has
+  // out-dim M equal to the real NPOT shape (mirroring the NPOT N treatment via
+  // modularIdentity1D). This keeps the encoding<->shape invariant in
+  // MemDescType::verify and lets the distributed-layout builders round back up
+  // to pow2 internally.
+  auto pow2Ceil = [](int64_t v) -> int64_t {
+    return llvm::isPowerOf2_64(v) ? v : llvm::NextPowerOf2(v);
+  };
+  bool npotM = shape[0] > 0 && !llvm::isPowerOf2_64(shape[0]);
+  auto tileM = tile.getOutDimSize(dims[0]);
+  auto repsM =
+      npotM ? pow2Ceil(llvm::divideCeil(shape[0], tileM)) : shape[0] / tileM;
   auto repsN = shape[1] / tile.getOutDimSize(dims[1]);
   assert(repsM >= 1 && repsN >= 1);
   // Broadcast the remaining dimensions in order [0, 1]
   tile = tile * LinearLayout::identity1D(repsM, kCol, dims[0]) *
          LinearLayout::identity1D(repsN, kCol, dims[1]);
+  if (npotM) {
+    int32_t npotSize = static_cast<int32_t>(shape[0]);
+    auto bases = tile.getBases();
+    for (auto &[inDimName, inDimBases] : bases) {
+      for (auto &basis : inDimBases) {
+        basis[0] = basis[0] % npotSize;
+      }
+    }
+    SmallVector<std::pair<StringAttr, int32_t>> outDims = {
+        {dims[0], npotSize},
+        {dims[1], static_cast<int32_t>(tile.getOutDimSize(dims[1]))}};
+    tile = LinearLayout(std::move(bases), outDims, /*requireSurjective=*/false);
+  }
   return tile;
 }
 
@@ -1184,12 +1471,17 @@ tensorMemoryScalesToLinearLayout(ArrayRef<int64_t> shape,
               LinearLayout::identity1D(4, kCol, dims[1]) *
               LinearLayout::identity1D(2, kCol, dims[0]);
   // We choose repOrder = [0, 1]
+  // Round rep counts to pow2 for identity1D; ensureLayoutNotLargerThan will
+  // apply modular reduction for NPOT shapes (e.g. M=144, K=96 scales).
+  auto pow2Ceil = [](int64_t v) -> int64_t {
+    return llvm::isPowerOf2_64(v) ? v : llvm::NextPowerOf2(v);
+  };
   tile *= LinearLayout::identity1D(
-              llvm::divideCeil(shape[0], tile.getOutDimSize(dims[0])), kCol,
-              dims[0]) *
+              pow2Ceil(llvm::divideCeil(shape[0], tile.getOutDimSize(dims[0]))),
+              kCol, dims[0]) *
           LinearLayout::identity1D(
-              llvm::divideCeil(shape[1], tile.getOutDimSize(dims[1])), kCol,
-              dims[1]);
+              pow2Ceil(llvm::divideCeil(shape[1], tile.getOutDimSize(dims[1]))),
+              kCol, dims[1]);
   // See [Zeros in TMEM LinearLayouts]
   // Set some rows/cols to 0 if shape is smaller than 64 x 4
   llvm::SmallDenseMap<StringAttr, int64_t> shapeMap;
@@ -1212,11 +1504,22 @@ LinearLayout TritonGPUDialect::toLinearLayout(ArrayRef<int64_t> shape,
   if (auto distributed = dyn_cast<DistributedEncodingTrait>(layout)) {
     result = distributed.toLinearLayout(shape);
   } else {
-    assert(llvm::all_of(shape,
-                        [](int64_t dim) {
-                          return llvm::isPowerOf2_32(dim) && dim >= 1;
-                        }) &&
-           "shape must be a postive power of 2");
+    // NVMMASharedEncodingAttr, TensorMemoryScalesEncodingAttr, and
+    // TensorMemoryEncodingAttr may have NPOT shapes (e.g. M=144, K=96,
+    // blockN=96). The layout construction rounds to pow2 internally
+    // (modularIdentity1D for TMEM, ensureLayoutNotLargerThan for SMEM)
+    // and combineCtaCgaWithShape / applyNpotReductionForTmem applies
+    // modular reduction.
+    if (!isa<TensorMemoryScalesEncodingAttr>(layout) &&
+        !isa<NVMMASharedEncodingAttr>(layout) &&
+        !isa<SwizzledSharedEncodingAttr>(layout) &&
+        !isa<TensorMemoryEncodingAttr>(layout)) {
+      assert(llvm::all_of(shape,
+                          [](int64_t dim) {
+                            return llvm::isPowerOf2_32(dim) && dim >= 1;
+                          }) &&
+             "shape must be a postive power of 2");
+    }
     if (auto shared = dyn_cast<SwizzledSharedEncodingAttr>(layout)) {
       result = swizzledSharedToLinearLayout(shape, shared);
     } else if (auto shared = dyn_cast<SharedLinearEncodingAttr>(layout)) {
@@ -1314,10 +1617,30 @@ LinearLayout combineCtaCgaWithShape(LinearLayout ctaLayout,
         std::max(int64_t{1}, labeledShape[dim] / cgaLayout.getOutDimSize(dim));
   }
 
-  ctaLayout = ensureLayoutNotSmallerThan(ctaLayout, ctaShape);
-  ctaLayout = ensureLayoutNotLargerThan(ctaLayout, ctaShape);
+  // For NPOT shapes, round ctaShape up to pow2 so that
+  // ensureLayoutNot{Smaller,Larger}Than's divisibility assumptions hold.
+  // Exception: if the ctaLayout already has the correct NPOT outDimSize for
+  // a dim (e.g., from modular phase extension in nvmmaSharedToLinearLayout),
+  // keep it as-is to avoid incorrect pow2 extension + mod reduction.
+  llvm::SmallDenseMap<StringAttr, int64_t> pow2CtaShape;
+  for (auto [dim, size] : ctaShape) {
+    if (!llvm::isPowerOf2_64(size) && ctaLayout.hasOutDim(dim) &&
+        ctaLayout.getOutDimSize(dim) == size) {
+      // Layout already matches the NPOT target — don't round to pow2.
+      pow2CtaShape[dim] = size;
+    } else {
+      pow2CtaShape[dim] =
+          llvm::isPowerOf2_64(size) ? size : llvm::NextPowerOf2(size);
+    }
+  }
+
+  ctaLayout = ensureLayoutNotSmallerThan(ctaLayout, pow2CtaShape);
+  ctaLayout = ensureLayoutNotLargerThan(ctaLayout, pow2CtaShape);
 
   LinearLayout ret = (ctaLayout * cgaLayout).transposeOuts(outDimNames);
+
+  ret = buildWithNpotReduction(ret.getBases(), outDimNames, shape);
+
   for (auto dim : ret.getOutDimNames()) {
     assert(ret.getOutDimSize(dim) == labeledShape[dim]);
   }
@@ -1339,14 +1662,28 @@ LinearLayout chooseShemLayoutForRegToRegConversion(
     StringAttr kOffset = S("offset" + std::to_string(dim));
     kRepDims.push_back(kIteration);
     kOffsetDims.push_back(kOffset);
-    assert(llvm::isPowerOf2_32(repShape[dim]));
-    assert(llvm::isPowerOf2_32(tensorShape[dim]));
     auto numIters = tensorShape[dim] / repShape[dim];
-    layout *=
-        LinearLayout::identity1D(repShape[dim], kOffset, outDimNames[dim]);
-    layout *= LinearLayout::identity1D(numIters, kIteration, outDimNames[dim]);
-    totalIters *= numIters;
-    totalOffsets *= repShape[dim];
+    if (llvm::isPowerOf2_32(repShape[dim])) {
+      layout *=
+          LinearLayout::identity1D(repShape[dim], kOffset, outDimNames[dim]);
+    } else {
+      layout *= LinearLayout::modularIdentity1D(repShape[dim], kOffset,
+                                                outDimNames[dim]);
+    }
+    if (llvm::isPowerOf2_32(numIters)) {
+      layout *=
+          LinearLayout::identity1D(numIters, kIteration, outDimNames[dim]);
+    } else {
+      layout *= LinearLayout::modularIdentity1D(numIters, kIteration,
+                                                outDimNames[dim]);
+    }
+    // Track actual input dim sizes (pow2) for reshapeIns.
+    totalIters *= llvm::isPowerOf2_32(numIters)
+                      ? numIters
+                      : (int)llvm::NextPowerOf2(numIters);
+    totalOffsets *= llvm::isPowerOf2_32(repShape[dim])
+                        ? repShape[dim]
+                        : (int)llvm::NextPowerOf2(repShape[dim]);
   }
   StringAttr kOffset = S("offset");
   StringAttr kIteration = S("iteration");

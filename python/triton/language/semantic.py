@@ -593,7 +593,7 @@ class TritonSemantic(Generic[TensorTy]):
         if end <= start:
             raise ValueError("arange's end argument must be greater than the start argument")
         range = end - start
-        if (range & (range - 1)) != 0:
+        if not knobs.language.allow_npot and (range & (range - 1)) != 0:
             raise ValueError("arange's range must be a power of 2")
         shape = [range]
         if ret_ty is None:
@@ -1926,7 +1926,16 @@ class TritonSemantic(Generic[TensorTy]):
     def reduction(self, inputs: Sequence[TensorTy], axis: int, region_builder_fn,
                   reduction_ordering=None) -> Tuple[TensorTy, ...]:
         if axis is None:
-            inputs = tuple(self.reshape(t, [t.numel.value], can_reorder=True) for t in inputs)
+            # Flatten to 1D so the reduction has a single axis. For an input that
+            # is already 1D this reshape is a no-op in shape, but it still forces
+            # a layout conversion (a `tt.reshape ... allow_reorder`). For NPOT
+            # (modular) layouts that conversion is lowered as a cheap per-register
+            # identity copy whose src/dst register<->position maps differ, which
+            # silently scrambles elements and miscomputes the reduction. Skip the
+            # reshape for already-1D inputs so the reduction consumes the source
+            # layout directly (which the reduction lowering masks correctly).
+            inputs = tuple(t if len(t.shape) == 1 else self.reshape(t, [t.numel.value], can_reorder=True)
+                           for t in inputs)
             axis = 0
         # get result shape
         shape = inputs[0].type.shape
