@@ -139,15 +139,6 @@ static int minNumInterleavedCommitOps(Operation *waitOp) {
 void mlir::triton::updateWaits(ModuleOp module) {
   llvm::SmallSetVector<Operation *, 8> waitOps;
   module.walk([&](ttg::AsyncWaitOp waitOp) {
-    // Token-less async_wait ops are authored by hand (e.g. TLX
-    // async_load_wait_group) and already carry the author's intended
-    // commit-group count. The token-chain analysis would replace them
-    // with a conservative 0, discarding that intent. Only recompute
-    // counts for token-carrying waits.
-    // if (waitOp.getNumOperands() == 0) {
-    //   waitOps.insert(waitOp);
-    //   return;
-    // }
     int minNumCommits = minNumInterleavedCommitOps(waitOp);
     waitOp.setNum(minNumCommits);
     waitOps.insert(waitOp);
