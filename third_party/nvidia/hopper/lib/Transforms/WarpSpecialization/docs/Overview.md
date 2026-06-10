@@ -34,6 +34,7 @@ Before `PartitionSchedulingMeta`, the Meta WS backend runs
 elementwise users. This keeps broadcasts and their value materialization, such
 as a descriptor load followed by an extend, associated with their use after
 other operands, such as TMEM loads, have been prepared.
+
 ## Register Budgets
 
 `minRegAutoWS` and `maxRegAutoWS` control the per-thread register budgets used
