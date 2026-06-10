@@ -1087,10 +1087,6 @@ def reduce_post_hook(nargs, exception=None):
             OUTPUT_DTYPE=TORCH_DTYPE_TO_TRITON[workspace.dtype],
             num_warps=4,
         )
-        # Flush L2 cache after reduction so do_bench iterations don't
-        # benefit from artificially warm workspace data. In production,
-        # the workspace is cold on each forward pass.
-        _flush_l2_cache(workspace.device)
 
 
 @triton.autotune(
