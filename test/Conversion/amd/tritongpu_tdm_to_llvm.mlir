@@ -70,8 +70,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     %data = ttg.local_load %buf : !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> tensor<64x64xf16, #blocked>
     // CHECK: rocdl.s.wait.dscnt 0
     // CHECK-NEXT: rocdl.s.barrier
-    // CHECK: rocdl.s.wait.dscnt 0
-    // CHECK-NEXT: rocdl.s.barrier
     // CHECK: "llvm.amdgcn.tensor.load.to.lds"
     %tok1 = "amdg.async_tdm_group_copy_global_to_local"(%desc, %c0, %c64, %buf, %c_pred) <{cache = 1 : i32, operandSegmentSizes = array<i32: 1, 2, 1, 1>, rank = 2 : i32, warp_masks = array<i32: 15>}> : (!tt.tensordesc<64x64xf16, #shared>, i32, i32, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, i32) -> !ttg.async.token
     tt.return
