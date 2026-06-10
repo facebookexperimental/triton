@@ -1265,6 +1265,7 @@ def _mxf8_bwd_host_descriptor_pre_hook(nargs):
     BLOCK_N1 = nargs["BLOCK_N1"]
     HEAD_DIM = nargs["HEAD_DIM"]
     EPILOGUE_SUBTILE = nargs["EPILOGUE_SUBTILE"]
+    DQ_REDUCE_NCOL = nargs["DQ_REDUCE_NCOL"]
     VEC_SIZE = 32
     REP_M = math.ceil(BLOCK_M1 / 128)
     REP_N = math.ceil(math.ceil(BLOCK_N1 / VEC_SIZE) / 4)
@@ -1282,7 +1283,9 @@ def _mxf8_bwd_host_descriptor_pre_hook(nargs):
     nargs["desc_do"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM]
     if isinstance(nargs.get("desc_do_dv"), TensorDescriptor):
         nargs["desc_do_dv"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM]
-    nargs["desc_dq"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM // (EPILOGUE_SUBTILE * 2)]
+    # dQ is reduced to GMEM in fixed-width column chunks. Keep this descriptor
+    # independent of the dK/dV epilogue subtile factor.
+    nargs["desc_dq"].block_shape = [1, 1, BLOCK_M1, DQ_REDUCE_NCOL]
     if isinstance(nargs.get("desc_dk"), TensorDescriptor):
         nargs["desc_dk"].block_shape = [1, 1, BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
     if isinstance(nargs.get("desc_dv"), TensorDescriptor):
@@ -1325,6 +1328,7 @@ mxfp8_bwd_configs = [
             "NUM_BUFFERS_DO": 1,
             "NUM_BUFFERS_DS": 1,
             "EPILOGUE_SUBTILE": 2,
+            "DQ_REDUCE_NCOL": 64,
         },
         num_warps=8,
         num_stages=1,
@@ -1347,7 +1351,6 @@ def _softmax_recompute_quantization_iter(
     dp_fulls,
     dp_empties,
     ds_tiles_smem,
-    ds_dq_tiles_smem,
     ds_scale_smem,
     ds_scale_dq_smem,
     sM_tiles,
@@ -1452,14 +1455,6 @@ def _softmax_recompute_quantization_iter(
             ),
             ds_scale_packed,
         )
-        tlx.local_store(
-            tlx.local_slice(
-                tlx.local_view(ds_dq_tiles_smem, ds_buf_id),
-                [0, subtile_id * DS_M_SUB],
-                [BLOCK_N1, DS_M_SUB],
-            ),
-            ds_fp8,
-        )
         ds_scale_dq_packed = ds_scale.reshape([REP_N, 4, 32, REP_M, 4 // DS_NUM_SUBS]).permute(3, 0, 2, 4, 1)
         tlx.local_store(
             tlx.local_slice(
@@ -1533,12 +1528,14 @@ def _attn_bwd_mxf8_ws(
     NUM_BUFFERS_DO: tl.constexpr,
     NUM_BUFFERS_DS: tl.constexpr,
     EPILOGUE_SUBTILE: tl.constexpr,
+    DQ_REDUCE_NCOL: tl.constexpr,
     M_STAGE: tl.constexpr,
     D_STAGE: tl.constexpr,
 ) -> None:
     tl.static_assert(HEAD_DIM == 128)
     tl.static_assert(BLOCK_N1 == 128)
     tl.static_assert(BLOCK_M1 == 128)
+    tl.static_assert(HEAD_DIM % DQ_REDUCE_NCOL == 0)
     NUM_BUFFERS_TMEM: tl.constexpr = 1
     tl.static_assert(NUM_BUFFERS_TMEM == 1)
 
@@ -1870,7 +1867,6 @@ def _attn_bwd_mxf8_ws(
     # dK consumes dS^T while dQ consumes dS. MXFP8 quantization depends on the
     # reduction axis, so we keep separate internal encodings for the two GEMMs.
     ds_tiles_smem = tlx.local_alloc((BLOCK_N1, BLOCK_M1), p_dtype, NUM_BUFFERS_DS)
-    ds_dq_tiles_smem = tlx.local_alloc((BLOCK_N1, BLOCK_M1), p_dtype, NUM_BUFFERS_DS)
     # SMEM storage spots for dS scales to enable
     # async transfers from SMEM to TMEM.
     # (1, REP_M, REP_HEAD, 2, 256)
@@ -1905,7 +1901,6 @@ def _attn_bwd_mxf8_ws(
     # TODO: Expose. This is set to 1 because its not on the critical path.
     NUM_DKV_STORE_BUFFERS: tl.constexpr = 1
     dkv_store_buf = tlx.local_alloc((BLOCK_N1, slice_size_alloc), tl.bfloat16, NUM_DKV_STORE_BUFFERS)
-    DQ_REDUCE_NCOL: tl.constexpr = 32
     DQ_REDUCE_ITERS: tl.constexpr = HEAD_DIM // DQ_REDUCE_NCOL
     DQ_REDUCE_STAGES: tl.constexpr = 2
     dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_REDUCE_NCOL), tlx.dtype_of(desc_dq), DQ_REDUCE_STAGES)
@@ -1967,7 +1962,6 @@ def _attn_bwd_mxf8_ws(
                     dp_fulls,
                     dp_empties,
                     ds_tiles_smem,
-                    ds_dq_tiles_smem,
                     ds_scale_smem,
                     ds_scale_dq_smem,
                     sM_tiles,
@@ -2008,7 +2002,6 @@ def _attn_bwd_mxf8_ws(
                         dp_fulls,
                         dp_empties,
                         ds_tiles_smem,
-                        ds_dq_tiles_smem,
                         ds_scale_smem,
                         ds_scale_dq_smem,
                         sM_tiles,
@@ -2270,7 +2263,7 @@ def _attn_bwd_mxf8_ws(
                     tlx.tmem_copy(ds_scale_dq_smem[0], ds_scale_dq_tmem[0])
                     tlx.tmem_copy(k_scale_dq_smem[kv_buf_id], k_scale_dq_tmem[0])
                     tlx.async_dot_scaled(
-                        tlx.local_trans(ds_dq_tiles_smem[ds_buf_id_prev]),
+                        tlx.local_trans(ds_tiles_smem[ds_buf_id_prev]),
                         k_dq_smem[kv_buf_id],
                         dq_tiles[0],
                         ds_scale_dq_tmem[0],
@@ -2414,7 +2407,7 @@ def _attn_bwd_mxf8_ws(
                 tlx.tmem_copy(ds_scale_dq_smem[0], ds_scale_dq_tmem[0])
                 tlx.tmem_copy(k_scale_dq_smem[kv_buf_id], k_scale_dq_tmem[0])
                 tlx.async_dot_scaled(
-                    tlx.local_trans(ds_dq_tiles_smem[ds_buf_id]),
+                    tlx.local_trans(ds_tiles_smem[ds_buf_id]),
                     k_dq_smem[kv_buf_id],
                     dq_tiles[0],
                     ds_scale_dq_tmem[0],
