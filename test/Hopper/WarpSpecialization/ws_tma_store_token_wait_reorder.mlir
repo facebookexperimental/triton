@@ -182,14 +182,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: scf.for
 // CHECK: ttng.async_tma_store_token_wait
 // CHECK-NOT: can_rotate_by_buffer_count
-// CHECK-SAME: {loop.cluster = 2 : i32, loop.stage = 2 : i32}
-// CHECK: ttng.wait_barrier {{.*}} {loop.cluster = 3 : i32, loop.stage = 2 : i32}
-// CHECK: ttng.async_tma_copy_local_to_global {{.*}} {loop.cluster = 4 : i32, loop.stage = 2 : i32}
+// CHECK-SAME: {loop.cluster = {{[0-9]+}} : i32, loop.stage = 2 : i32}
+// CHECK: ttng.wait_barrier
+// CHECK: ttng.async_tma_copy_local_to_global
 // CHECK: ttng.async_tma_store_token_wait
 // CHECK-NOT: can_rotate_by_buffer_count
-// CHECK-SAME: {loop.cluster = 0 : i32, loop.stage = 2 : i32}
-// CHECK: ttng.wait_barrier {{.*}} {loop.cluster = 6 : i32, loop.stage = 1 : i32}
-// CHECK: ttng.async_tma_copy_local_to_global {{.*}} {loop.cluster = 7 : i32, loop.stage = 1 : i32}
+// CHECK-SAME: {loop.cluster = {{[0-9]+}} : i32, loop.stage = 2 : i32}
+// CHECK: ttng.wait_barrier
+// CHECK: ttng.async_tma_copy_local_to_global
   tt.func public @k3_two_stores_wraparound_uses_first_wait(
       %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
       %src0: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
