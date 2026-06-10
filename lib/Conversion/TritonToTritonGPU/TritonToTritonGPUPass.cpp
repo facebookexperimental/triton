@@ -33,6 +33,37 @@ static void addNamedAttrs(Operation *op, DictionaryAttr dictAttrs) {
       op->setAttr(attr.getName(), attr.getValue());
 }
 
+// Ops carrying SameOperandsAndResultEncoding require every operand and result
+// to share one layout. The default lowering preserves each operand's encoding
+// as-is, which breaks verification when a producer pins a non-default register
+// layout (e.g. a `tlx.layout` on a `tmem_load`) onto only some operands. For
+// such ops, convert any operand whose encoding differs from the unified result
+// encoding; the redundant converts fold away later via layout propagation (a
+// pinned layout is an anchor and forward-propagates). No-op for ops without the
+// trait, or when the encodings already match (the common case). Kept as a free
+// helper so any conversion pattern can reuse it, not just GenericOpPattern.
+static void unifyOperandEncodingsForSameEncoding(
+    Operation *op, TypeRange resultTypes, SmallVectorImpl<Value> &operands,
+    ConversionPatternRewriter &rewriter) {
+  if (!op->hasTrait<mlir::OpTrait::SameOperandsAndResultEncoding>())
+    return;
+  Attribute enc;
+  for (Type t : resultTypes)
+    if (auto rtt = dyn_cast<RankedTensorType>(t)) {
+      enc = rtt.getEncoding();
+      break;
+    }
+  if (!enc)
+    return;
+  for (Value &v : operands) {
+    auto vTy = dyn_cast<RankedTensorType>(v.getType());
+    if (vTy && vTy.getEncoding() && vTy.getEncoding() != enc) {
+      auto dstTy = vTy.cloneWithEncoding(enc);
+      v = triton::gpu::ConvertLayoutOp::create(rewriter, v.getLoc(), dstTy, v);
+    }
+  }
+}
+
 template <class Op> struct GenericOpPattern : public OpConversionPattern<Op> {
   using OpConversionPattern<Op>::OpConversionPattern;
 
@@ -43,8 +74,9 @@ template <class Op> struct GenericOpPattern : public OpConversionPattern<Op> {
     if (failed(this->getTypeConverter()->convertTypes(op->getResultTypes(),
                                                       retTypes)))
       return failure();
-    rewriter.replaceOpWithNewOp<Op>(op, retTypes, adaptor.getOperands(),
-                                    op->getAttrs());
+    SmallVector<Value> operands(adaptor.getOperands());
+    unifyOperandEncodingsForSameEncoding(op, retTypes, operands, rewriter);
+    rewriter.replaceOpWithNewOp<Op>(op, retTypes, operands, op->getAttrs());
 
     return success();
   }

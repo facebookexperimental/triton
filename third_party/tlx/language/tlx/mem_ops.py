@@ -709,10 +709,12 @@ def local_load(
     if storage == tlx.storage_kind.tmem:
         _assert_blackwell_for_tmem(_semantic.builder.options.arch)
         if layout is not None:
-            # Pin the load result to the requested register layout directly.
+            # Pin the load result to the requested register layout directly, and
+            # mark it as a user layout so later TMEM-layout optimization treats
+            # it as a hard anchor instead of rewriting it to a preferred layout.
             enc = layout.to_ir(_semantic.builder, src.type.shape, src.type.element_ty)
             load_handle = _semantic.builder.create_tmem_load(src.handle, enc,
-                                                             token.handle if token else None)
+                                                             token.handle if token else None, userLayout=True)
             return tl.tensor(load_handle, block_type)
         tmem_compatible_layout_encoding = _create_tmem_compatible_tensor_layout_encoding(_semantic.builder, src)
         load_handle = _semantic.builder.create_tmem_load(src.handle, tmem_compatible_layout_encoding,
