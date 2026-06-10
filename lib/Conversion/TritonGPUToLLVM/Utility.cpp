@@ -812,7 +812,8 @@ lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
                 Value affineOffset, uint64_t maskSpanAffineOffset,
                 RewriterBase &rewriter, const TargetInfoBase &targetInfo,
                 std::optional<int> maybeMaxVecElems, Operation *localLoadOp,
-                std::optional<Value> ctaRank, std::optional<Value> barrierPtr) {
+                std::optional<Value> ctaRank, std::optional<Value> barrierPtr,
+                int64_t npotBufBytes) {
 
   bool isStore = !valsArray.empty();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -864,7 +865,7 @@ lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
   return lowerLdSt(loc, ctx, cvt, valsArray, llvmElemTy, smemBase,
                    paddingShifts, affineOffset, maskSpanAffineOffset, laneId,
                    warpId, rewriter, targetInfo, maybeMaxVecElems, emitLdSt,
-                   barrierPtr);
+                   barrierPtr, npotBufBytes);
 }
 
 SmallVector<Value> lowerLdSt(
@@ -878,7 +879,7 @@ SmallVector<Value> lowerLdSt(
     std::function<SmallVector<Value>(RewriterBase &, Location, ArrayRef<Value>,
                                      Value, int, VectorType)>
         lowerInst,
-    std::optional<Value> barrierPtr) {
+    std::optional<Value> barrierPtr, int64_t npotBufBytes) {
   auto vals = to_vector(valsArray);
   bool isStore = !vals.empty();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -965,6 +966,15 @@ SmallVector<Value> lowerLdSt(
       // disjoint, so we can calculate their padding contributions separately.
       regIdxAddI8 = applyPadding(regIdxAddI8, paddingShifts);
       Value innerOffset = b.add(offset, b.i32_val(regIdxAddI8));
+      // For NPOT split-dim layouts, the offset space is pow2 but the
+      // SMEM allocation is NPOT. Wrap degenerate offsets to stay in bounds.
+      // Use smallModulo (compare+subtract, 2 ops) instead of urem (hardware
+      // integer divider) — innerOffset < nextPow2(N) + vectorBytes < 2*N
+      // for all practical NPOT buffer sizes.
+      if (npotBufBytes > 0) {
+        innerOffset =
+            smallModulo(b, innerOffset, static_cast<int32_t>(npotBufBytes));
+      }
       auto vecAddr = b.gep(smemPtrTy, i8_ty, smemBase, innerOffset,
                            LLVM::GEPNoWrapFlags::inbounds);
       llvm::append_range(outVals,
@@ -992,6 +1002,50 @@ lowerLocalLdSt(Location loc, MLIRContext *ctx,
                std::optional<Value> ctaRank, std::optional<Value> barrierPtr) {
   assert(cvt.getNumOutDims() == 1);
   assert(*cvt.getOutDimNames().begin() == str_attr("offset"));
+
+  // For NVMMA NPOT contiguous-dim layouts the conversion layout (register ->
+  // offset) is built with a pow2-rounded contiguous dim while the SMEM
+  // buffer holds only the actual N elements per tile. Fold a urem-wrap into
+  // the conversion layout itself so degenerate offsets >= N collide with
+  // their canonical counterparts in `lowerLdStShared`. This replaces the
+  // external `calcPaddedOffset` callable that the upstream `paddingShifts`
+  // API no longer accommodates.
+  //
+  // When the fold fails (bases mod N are not XOR-compatible), fall back to
+  // runtime urem wrapping in lowerLdSt to prevent out-of-bounds SMEM access.
+  int64_t npotBufBytes = 0;
+  if (auto nvmmaEnc =
+          dyn_cast<triton::gpu::NVMMASharedEncodingAttr>(srcTy.getEncoding())) {
+    auto shape = srcTy.getAllocShape().take_back(srcTy.getRank());
+    auto shapePerCTA = triton::gpu::getShapePerCTA(nvmmaEnc, shape);
+    bool isTransposed = nvmmaEnc.getTransposed();
+    int contigDim = isTransposed ? 0 : (int)shapePerCTA.size() - 1;
+    int elemBytes = nvmmaEnc.getElementBitWidth() / 8;
+    int swizzleBytes = nvmmaEnc.getSwizzlingByteWidth();
+    if (swizzleBytes > 0 && elemBytes > 0 &&
+        !llvm::isPowerOf2_64(shapePerCTA[contigDim]) &&
+        (shapePerCTA[contigDim] * elemBytes) % swizzleBytes == 0) {
+      auto allocShapePerCTA =
+          triton::gpu::getAllocationShapePerCTA(srcTy.getEncoding(), shape);
+      // Buffer size in elements (cvt's output is in element units here, in
+      // contrast to the cp.async path which works in bytes).
+      int64_t npotBufElems = 1;
+      for (auto s : allocShapePerCTA)
+        npotBufElems *= s;
+      // Always set npotBufBytes for runtime wrapping in lowerLdSt.
+      // Even when applyNpotUremFold succeeds (bases reduced mod N), the
+      // pow2 unfold in lowerLdSt (line ~872) converts the modular layout
+      // to a non-modular one with pow2 output dim. XOR-based offset
+      // computation on the unfolded layout can then produce values >= N,
+      // causing out-of-bounds SMEM access. The runtime wrapping via
+      // smallModulo catches these cases.
+      npotBufBytes = npotBufElems * elemBytes;
+      auto foldedCvt = applyNpotUremFold(cvt, npotBufElems);
+      if (foldedCvt != cvt) {
+        cvt = foldedCvt;
+      }
+    }
+  }
 
   auto isStore = !valsArray.empty();
   // Remove broadcasting in the registers
@@ -1023,10 +1077,10 @@ lowerLocalLdSt(Location loc, MLIRContext *ctx,
                                           /*offsetInBytes=*/true);
   }
 
-  return lowerLdStShared(loc, ctx, cvt, valsArray, llvmElemTy,
-                         smemObj.getBase(), paddingShifts, affineOffset,
-                         maskSpanAffineOffset, rewriter, targetInfo,
-                         maybeMaxVecElems, localLoadOp, ctaRank, barrierPtr);
+  return lowerLdStShared(
+      loc, ctx, cvt, valsArray, llvmElemTy, smemObj.getBase(), paddingShifts,
+      affineOffset, maskSpanAffineOffset, rewriter, targetInfo,
+      maybeMaxVecElems, localLoadOp, ctaRank, barrierPtr, npotBufBytes);
 }
 
 SmallVector<Value> unpackLLElements(Location loc, Value llvmStruct,

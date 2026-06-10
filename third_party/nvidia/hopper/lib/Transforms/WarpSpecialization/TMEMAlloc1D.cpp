@@ -317,6 +317,10 @@ ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
   assert((elemBitWidth == 16 || elemBitWidth == 32) &&
          "TMEM Layout don't support fp8");
   unsigned colStride = 32 / elemBitWidth;
+  // TMEM hardware requires blockN >= 8 and a multiple of 8.
+  // For 1D tensors promoted to TMEM, blockN may be 1.
+  blockN = std::max<int64_t>(blockN, 8);
+  blockN = llvm::alignTo(blockN, 8);
   // TODO(njriasan): Do we need to handle the ScaleDotElemType::E2M1 && transA
   // case at all from TCGen5MMAScaledOp::getBlockM?
   size_t CTASplitM;

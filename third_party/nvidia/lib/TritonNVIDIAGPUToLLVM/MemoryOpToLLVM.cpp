@@ -61,10 +61,33 @@ LogicalResult lowerLdStMatrix(
   auto affineOffset = smemObj.getShmemOffset(loc, rewriter, memDescType);
   auto maskSpanAffineOffset = smemObj.getMaskSpanOffsets(memDescType);
   auto llvmElemTy = typeConverter->convertType(memDescType.getElementType());
+
+  // For NPOT contiguous dim with split-dim layout, the conversion layout's
+  // offset dimension is pow2 (larger than the NPOT allocation). Compute
+  // the NPOT buffer size so lowerLdStMatrix can wrap degenerate offsets.
+  int64_t npotBufferBytes = 0;
+  if (auto nvmmaEnc =
+          dyn_cast<NVMMASharedEncodingAttr>(memDescType.getEncoding())) {
+    auto shape = memDescType.getAllocShape().take_back(memDescType.getRank());
+    auto shapePerCTA = getShapePerCTA(nvmmaEnc, shape);
+    bool isTransposed = nvmmaEnc.getTransposed();
+    int contigDim = isTransposed ? 0 : (int)shapePerCTA.size() - 1;
+    int elemBytes = nvmmaEnc.getElementBitWidth() / 8;
+    int swizzleBytes = nvmmaEnc.getSwizzlingByteWidth();
+    if (swizzleBytes > 0 && !llvm::isPowerOf2_64(shapePerCTA[contigDim]) &&
+        (shapePerCTA[contigDim] * elemBytes) % swizzleBytes == 0) {
+      auto allocShapePerCTA =
+          getAllocationShapePerCTA(memDescType.getEncoding(), shape);
+      npotBufferBytes = elemBytes;
+      for (auto s : allocShapePerCTA)
+        npotBufferBytes *= s;
+    }
+  }
+
   for (bool transpose : {false, true}) {
     auto result = LLVM::NVIDIA::lowerLdStMatrix(
         loc, cvt, transpose, vals, smemBase, affineOffset, maskSpanAffineOffset,
-        llvmElemTy, rewriter, targetInfo);
+        llvmElemTy, rewriter, targetInfo, npotBufferBytes);
     if (succeeded(result)) {
       return result;
     }

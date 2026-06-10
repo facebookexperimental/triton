@@ -3284,6 +3284,11 @@ struct TritonGPUInferLayoutInterface
         tryJoinOnAxis(ctx, ll, newLl, /*fwdInference=*/true, axis, loc);
 
     assert(result.succeeded());
+    auto noopEmitJ = []() { return InFlightDiagnostic(); };
+    if (failed(LinearEncodingAttr::verify(noopEmitJ, newLl))) {
+      return emitOptionalError(loc,
+                               "Join layout is not a valid LinearEncodingAttr");
+    }
     dstEnc = LinearEncodingAttr::get(ctx, std::move(newLl));
     return success();
   }
@@ -3339,6 +3344,11 @@ struct TritonGPUInferLayoutInterface
     SmallVector<int64_t> dstShape(shape.begin(), shape.end());
     dstShape.pop_back();
     newLl = newLl.reshapeOuts(standardOutDimPairs(ctx, dstShape));
+    auto noopEmitS = []() { return InFlightDiagnostic(); };
+    if (failed(LinearEncodingAttr::verify(noopEmitS, newLl))) {
+      return emitOptionalError(
+          loc, "Split layout is not a valid LinearEncodingAttr");
+    }
     dstEnc = LinearEncodingAttr::get(ctx, std::move(newLl));
     return success();
   }
@@ -3402,6 +3412,11 @@ struct TritonGPUInferLayoutInterface
     auto result = tryJoinOnAxis(ctx, ll, newLl, fwdInference, axis, loc);
     if (!result.succeeded())
       return result;
+    auto noopEmitF = []() { return InFlightDiagnostic(); };
+    if (failed(LinearEncodingAttr::verify(noopEmitF, newLl))) {
+      return emitOptionalError(
+          loc, "Fp4ToFp layout is not a valid LinearEncodingAttr");
+    }
     outEnc = LinearEncodingAttr::get(ctx, std::move(newLl));
     return success();
   }
@@ -4266,7 +4281,17 @@ getTMABlockShapeTiled(ArrayRef<int64_t> shapePerCTA, int elementBitWidth,
   // Last dim must equal the swizzle byte size
   if (swizzleBytes != 0) {
     auto contigDimSize = (8 * swizzleBytes) / elementBitWidth;
-    if (blockShape[contigDim] < contigDimSize) {
+    // NPOT contiguous dims are padded up to a pow2 in the SMEM allocation
+    // (getAllocationShapePerCTA) and the NVMMAShared builder picks the swizzle
+    // from that padded size. Compare against the padded size here so the
+    // memdesc verifier accepts a logical NPOT contig dim (e.g. N=24 padded to
+    // 32 for swizzle=64). The returned box size is overridden to contigDimSize
+    // below, so this only relaxes the rejection check; it does not enlarge any
+    // real TMA box (the test B-operand path uses cp.async, not TMA).
+    int64_t checkContig = llvm::isPowerOf2_64(blockShape[contigDim])
+                              ? blockShape[contigDim]
+                              : llvm::NextPowerOf2(blockShape[contigDim]);
+    if (checkContig < contigDimSize) {
       return emitError() << "block shape along the contiguous dimension "
                          << contigDim
                          << " is too small for the swizzle byte size "

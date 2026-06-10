@@ -446,6 +446,20 @@ def NVMMASharedEncodingAttr : TritonGPU_Attr<"NVMMASharedEncoding", "nvmma_share
         } else {
           swizzlingByteWidth = 0;
         }
+        // NPOT contiguous dims that aren't swizzle-compatible would get
+        // swizzle=0, but tcgen05/wgmma swizzle=none can't stride a contiguous
+        // dim > 8 elements (HW limit). Pad the contiguous dim to pow2 and pick
+        // a swizzle from the padded size; the padded columns are masked out at
+        // the epilogue store.
+        if (swizzlingByteWidth == 0 &&
+            shapePerCTA.size() >= 2 &&
+            !llvm::isPowerOf2_64(shapePerCTA[order[0]])) {
+          int64_t padContig = llvm::NextPowerOf2(shapePerCTA[order[0]]);
+          int64_t padBytes = padContig * packingFactor * eleBitWidth / 8;
+          if (padBytes >= 128 && padBytes % 128 == 0)      swizzlingByteWidth = 128;
+          else if (padBytes >= 64 && padBytes % 64 == 0)   swizzlingByteWidth = 64;
+          else if (padBytes >= 32 && padBytes % 32 == 0)   swizzlingByteWidth = 32;
+        }
         int flattenOutterDim = 1;
         for (int i = 1; i < shapePerCTA.size(); i++) {
           flattenOutterDim *= shapePerCTA[order[i]];

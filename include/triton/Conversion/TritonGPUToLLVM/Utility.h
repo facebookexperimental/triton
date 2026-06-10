@@ -558,7 +558,7 @@ SmallVector<Value> lowerLdStShared(
     uint64_t maskSpanAffineOffset, RewriterBase &rewriter,
     const TargetInfoBase &targetInfo, std::optional<int> maybeMaxVecElems = {},
     Operation *localLoadOp = nullptr, std::optional<Value> ctaRank = {},
-    std::optional<Value> barrierPtr = {});
+    std::optional<Value> barrierPtr = {}, int64_t npotBufBytes = 0);
 
 // Lower an ld/st-like operation given a layout and a callback that creates the
 // PTX instruction Lowers to st when valArrays is empty, and to ld when it is
@@ -577,7 +577,7 @@ SmallVector<Value> lowerLdSt(
     std::function<SmallVector<Value>(RewriterBase &, Location, ArrayRef<Value>,
                                      Value, int, VectorType)>
         lowerInst,
-    std::optional<Value> barrierPtr = {});
+    std::optional<Value> barrierPtr = {}, int64_t npotBufBytes = 0);
 
 // Lower local_load/local_store via ld.shared/st.shared.
 SmallVector<Value> lowerLocalLdSt(
