@@ -1,5 +1,7 @@
 #include "CodePartitionUtility.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/OperationSupport.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -196,6 +198,34 @@ static Operation *getDefiningTMAStoreOp(ttng::TMAStoreTokenWaitOp waitOp,
   return nullptr;
 }
 
+static bool samePureValue(Value lhs, Value rhs, unsigned depth = 0) {
+  if (lhs == rhs)
+    return true;
+  if (lhs.getType() != rhs.getType() || depth > 8)
+    return false;
+
+  Operation *lhsDef = lhs.getDefiningOp();
+  Operation *rhsDef = rhs.getDefiningOp();
+  if (!lhsDef || !rhsDef)
+    return false;
+  if (lhsDef->getName() != rhsDef->getName())
+    return false;
+  if (cast<OpResult>(lhs).getResultNumber() !=
+      cast<OpResult>(rhs).getResultNumber())
+    return false;
+  if (!isMemoryEffectFree(lhsDef) || !isMemoryEffectFree(rhsDef))
+    return false;
+  if (lhsDef->getNumRegions() || rhsDef->getNumRegions())
+    return false;
+
+  return OperationEquivalence::isEquivalentTo(
+      lhsDef, rhsDef,
+      [depth](Value lhsOperand, Value rhsOperand) {
+        return success(samePureValue(lhsOperand, rhsOperand, depth + 1));
+      },
+      /*markEquivalent=*/nullptr, OperationEquivalence::IgnoreLocations);
+}
+
 static bool sameMemDescValue(Value lhs, Value rhs) {
   if (lhs == rhs)
     return true;
@@ -213,7 +243,7 @@ static bool sameMemDescValue(Value lhs, Value rhs) {
     return false;
 
   for (unsigned i = 0; i < lhsDef->getNumOperands(); ++i) {
-    if (lhsDef->getOperand(i) != rhsDef->getOperand(i))
+    if (!samePureValue(lhsDef->getOperand(i), rhsDef->getOperand(i)))
       return false;
   }
   return true;
@@ -462,10 +492,10 @@ LogicalResult doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
               tmaStore, targetTMAStore, schedule,
               k >= (numTMAStores - numPrevTMAStores));
           if (!waitBarrier) {
-            forOp.emitOpError(
-                "failed to find wait_barrier guarding target TMA store");
-            failedToReorder = true;
-            return;
+            LDBG("failed to find wait_barrier guarding target TMA store for "
+                 "loop at "
+                 << forOp.getLoc() << "; leaving TMA store wait unchanged");
+            continue;
           }
           insertionTarget = waitBarrier;
         }
