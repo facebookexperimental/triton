@@ -162,25 +162,24 @@ def tlx_addmm_glu_kernel(
         with tlx.warp_pipeline_stage("mfma", priority=0):
             acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
 
-        # We need the oldest two buffers to be ready to locally load
-        # The rest (NUM_BUFFERS - 1) * 2 buffers can be in flight
-        tlx.async_load_wait_group((NUM_BUFFERS - 1) * 2)
-
         with tlx.warp_pipeline_stage("mem", priority=1):
             # Perform global prefetching
             a_offs = a_base_off + (k_prefetch + offs_k[None, :]) * sa1
             b_offs = (k_prefetch + offs_k[:, None]) * sb0 + b_base_off
             tok_a = tlx.async_load(a_ptr + a_offs, tlx.local_view(smemA, prefetch_buf),
                                    mask=offs_k[None, :] < K - k_prefetch)
-            tlx.async_load_commit_group([tok_a])
             tok_b = tlx.async_load(b_ptr + b_offs, tlx.local_view(smemB, prefetch_buf),
                                    mask=offs_k[:, None] < K - k_prefetch)
             
-            tlx.async_load_commit_group([tok_b])
+            tlx.async_load_commit_group([tok_a, tok_b])
 
             # Perform local prefetching
             a_tile = tlx.local_load(tlx.local_view(smemA, next_buf))
             b_tile = tlx.local_load(tlx.local_view(smemB, next_buf))
+
+        # We need the oldest two buffers to be ready to locally load
+        # The rest (NUM_BUFFERS - 1) * 2 buffers can be in flight
+        tlx.async_load_wait_group((NUM_BUFFERS - 1) * 2)
 
     # Async load the y and bias
 
@@ -255,6 +254,10 @@ def run_kernel(a, b, bias, y, out, cfg):
         waves_per_eu=cfg.get("waves_per_eu", 0),
     )
 
+def pytorch_baseline(bias, a, b, y):
+    # Reference: addmm (x = bias + a@b) then GLU (out = x + x*y)
+    x = torch.addmm(bias, a, b).to(torch.float32)
+    return (x + x * y.to(torch.float32)).to(torch.float16)
 
 def main():
     p = argparse.ArgumentParser()
@@ -273,23 +276,25 @@ def main():
     y = torch.randn(M, N, device="cuda", dtype=torch.float16)
     out = torch.empty((M, N), device="cuda", dtype=torch.float16)
 
-    print(f"[profile] M={M} N={N} K={K}  tile {cfg['BLOCK_SIZE_M']}x{cfg['BLOCK_SIZE_N']}x{cfg['BLOCK_SIZE_K']} "
+    print(f"[ADDMM+GLU] M={M} N={N} K={K}  tile {cfg['BLOCK_SIZE_M']}x{cfg['BLOCK_SIZE_N']}x{cfg['BLOCK_SIZE_K']} "
           f"nw{cfg['num_warps']} nb{cfg['NUM_BUFFERS']} gm{cfg['GROUP_SIZE_M']}", flush=True)
-    print(f"[profile] kernel name to filter on: '{tlx_addmm_glu_kernel.__name__}' "
-          f"(dispatched name may carry a hash suffix)", flush=True)
 
-    # Warmup
-    compiled = None
-    for _ in range(args.warmup):
-        compiled = run_kernel(a, b, bias, y, out, cfg)
+    # Correctness check against PyTorch
+    run_kernel(a, b, bias, y, out, cfg)
     torch.cuda.synchronize()
+    ref = pytorch_baseline(bias, a, b, y)
+    max_err = (out.float() - ref.float()).abs().max().item()
 
-    # Actual profiling window
-    for _ in range(args.reps):
-        run_kernel(a, b, bias, y, out, cfg)
-        torch.cuda.synchronize()
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
-    print(f"{args.reps} profiling launch(es) in the window", flush=True)
+    print(f"Correctness       : OK (max abs err {max_err} vs PyTorch)")
+    ms = triton.testing.do_bench(lambda: run_kernel(a, b, bias, y, out, cfg), warmup=25, rep=200)
+
+    flops = 2 * M * N * K
+
+    print(
+        f"FLOPS             : {ms*1000:.2f} us  ({flops/(ms*1e-3)/1e12:.1f} TFLOPS)"
+    )
 
 if __name__ == "__main__":
     main()
