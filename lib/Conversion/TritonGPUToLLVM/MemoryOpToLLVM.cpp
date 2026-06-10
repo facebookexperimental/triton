@@ -167,6 +167,7 @@ LogicalResult lowerLocalStore(Location loc, MLIRContext *ctx, Value regVal,
     return failure();
   }
   cvt = cvt.sublayout({kReg, kLane, kWarp}, {kOffset});
+
   lowerLocalLdSt(loc, ctx, cvt, inVals, llvmElemTy, memDescTy, smemObj,
                  rewriter, targetInfo, nullptr, clusterCTARank, barrierPtr);
 

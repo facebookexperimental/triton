@@ -141,7 +141,16 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     // std::min(encoding.getBlockN(), shape[1]), so the encoding's blockN is a
     // physical-block upper bound, not a strict lower bound on allocShape.
     // Skip the blockN bound here for TMEM; only enforce blockM.
-    if (allocShape[0] < enc.getBlockM() * enc.getCTASplitM()) {
+    // NPOT M: for a non-power-of-2 M (e.g. 96) the accumulator is logically
+    // smaller than the MMAv5 instruction blockM (128) but is physically
+    // allocated in a blockM-sized TMEM row block, with the trailing rows
+    // unused. Compare against the pow2-ceil of allocShape[0] so an NPOT M
+    // that rounds up to blockM is accepted (same spirit as the blockN skip).
+    auto allocM0 = static_cast<int64_t>(allocShape[0]);
+    auto allocM0Pow2 = llvm::isPowerOf2_64(allocM0)
+                           ? allocM0
+                           : static_cast<int64_t>(llvm::NextPowerOf2(allocM0));
+    if (allocM0Pow2 < enc.getBlockM() * enc.getCTASplitM()) {
       return emitError() << "the allocation shape must be at least "
                          << enc.getBlockM() * enc.getCTASplitM() << "x"
                          << enc.getBlockN() * enc.getCTASplitN() << ". Got "

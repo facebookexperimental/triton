@@ -62,15 +62,15 @@ static unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
   // discard such bases, producing a smaller SMEM allocation than the
   // lowering actually uses, causing SMEM OOB.
   if (srcLayout.isModular()) {
-    srcLayout = unfoldModularDimsForAlloc(srcLayout);
-    dstLayout = unfoldModularDimsForAlloc(dstLayout);
-    srcLayout = actionRemoveBroadcastedRegs(srcLayout).apply(srcLayout);
-    dstLayout = actionRemoveBroadcastedRegs(dstLayout).apply(dstLayout);
-    auto bitwidth = getBitwidth(srcTy);
-    auto smem =
-        triton::gpu::optimalSwizzlingLdSt(srcLayout, dstLayout, bitwidth);
-    auto reps = smem.getInDimSize(StringAttr::get(ctx, "reps"));
-    return smem.getTotalOutDimSizeProduct() / reps;
+    // ConvertLayoutOpSwizzlingConversion::matchAndRewrite checks isModular() on
+    // the FULL src layout and returns failure() for modular src, so the base
+    // class lowering (transferWithinBlockSwizzlingImpl) handles this cvt. Size
+    // it via the base-class (default) computation so the allocation matches the
+    // base lowering exactly. The nvidia-specific optimalSwizzlingLdSt path here
+    // omitted the {register, lane, warp} sublayout the base lowering applies,
+    // producing a smaller SMEM allocation than the lowering actually writes
+    // (the store then runs off the end of shared memory -> SMEM OOB).
+    return mlir::triton::getNumScratchElemsSwizzledCvt(srcTy, dstTy);
   }
   auto bitwidth = getBitwidth(srcTy);
   auto [srcTiles, dstTiles] = gpu::getSrcDstTiles(targetInfo, bitwidth);

@@ -1260,6 +1260,34 @@ struct AsyncCopyGlobalToLocalOpConversion
     Value threadPred = emitRedundantThreadPredicate(freeVarMasks, rewriter, loc,
                                                     targetInfo, op);
 
+    // Detect NPOT layout. The conversion layout's offset output is in element
+    // units; we fold a urem-wrap into the cvt below so phantom register
+    // elements collide with their canonical SMEM positions instead of
+    // producing out-of-bounds offsets or stale-data reads.
+    // Detect NPOT contiguous-dim layout for phantom offset folding.
+    // Only the CONTIGUOUS dim needs wrapping — nvmmaSharedToLinearLayout
+    // keeps non-contiguous NPOT dims at pow2 size (no modular reduction),
+    // so their SMEM offsets are already in-bounds. The st.shared path
+    // (Utility.cpp lowerLocalLdSt) follows the same contiguous-only rule.
+    int64_t npotBufElems = 0;
+    if (auto nvmmaEnc =
+            dyn_cast<ttg::NVMMASharedEncodingAttr>(dstTy.getEncoding())) {
+      auto shape = dstTy.getAllocShape().take_back(dstTy.getRank());
+      auto shapePerCTA = ttg::getShapePerCTA(nvmmaEnc, shape);
+      bool isTransposed = nvmmaEnc.getTransposed();
+      int contigDim = isTransposed ? 0 : (int)shapePerCTA.size() - 1;
+      int elemBytes = nvmmaEnc.getElementBitWidth() / 8;
+      int swizzleBytes = nvmmaEnc.getSwizzlingByteWidth();
+      if (swizzleBytes > 0 && elemBytes > 0 &&
+          !llvm::isPowerOf2_64(shapePerCTA[contigDim]) &&
+          (shapePerCTA[contigDim] * elemBytes) % swizzleBytes == 0) {
+        auto allocShapePerCTA =
+            ttg::getAllocationShapePerCTA(dstTy.getEncoding(), shape);
+        npotBufElems = 1;
+        for (auto s : allocShapePerCTA)
+          npotBufElems *= s;
+      }
+    }
     auto emitCpAsync = [&b, threadPred, ptrTy, hasMask = bool(llMask)](
                            RewriterBase &rewriter, Location loc,
                            ArrayRef<Value> vals, Value shmemAddr, int startIdx,
@@ -1269,7 +1297,6 @@ struct AsyncCopyGlobalToLocalOpConversion
       auto elemTy = vecTy.getElementType();
       auto nBytes = vecTy.getNumElements() * elemTy.getIntOrFloatBitWidth() / 8;
       assert(nBytes == 16 || nBytes == 8 || nBytes == 4);
-      // Tune CG and CA.
       CacheModifier srcCacheModifier =
           nBytes == 16 ? CacheModifier::CG : CacheModifier::CA;
 
@@ -1285,13 +1312,10 @@ struct AsyncCopyGlobalToLocalOpConversion
       auto *copySize = ptxBuilder.newConstantOperand(nBytes);
       auto *srcSize = copySize;
       if (hasMask) {
-        // We don't use predicate in this case, setting src-size to 0
-        // if there's any mask. cp.async will automatically fill the
-        // remaining slots with 0 if cp-size > src-size.
-        // XXX(Keren): Always assume other = 0 for now.
-        // When 'other != 0' is supported, we will need to fold the
-        // op.getMask() and redundantDataMask() into the same predicate, the
-        // way it is done for LoadOp.
+        // Standard path: set src-size to 0 for masked elements.
+        // For NPOT layouts, phantom register elements that fold to canonical
+        // offsets simply re-issue cp.async to the same SMEM location with the
+        // same source — harmless duplication, no special predication needed.
         auto selectOp = b.select(maskElem, b.i32_val(nBytes), b.i32_val(0));
         srcSize = ptxBuilder.newOperand(selectOp, "r");
       }
@@ -1380,12 +1404,23 @@ struct AsyncCopyGlobalToLocalOpConversion
     cvt = cvt.sublayout(
         {str_attr("register"), str_attr("lane"), str_attr("warp")},
         {str_attr("offset")});
+
+    // For NPOT NVMMA contiguous-dim layouts, fold a urem-wrap into the cvt
+    // so phantom register elements collide with canonical SMEM positions.
+    cvt = applyNpotUremFold(cvt, npotBufElems);
+    int64_t npotBufBytes = 0;
+    if (npotBufElems > 0) {
+      int elemBytes = resElemTy.getIntOrFloatBitWidth() / 8;
+      npotBufBytes = npotBufElems * std::max(1, elemBytes);
+    }
+
     auto affineOffset = smemObj.getShmemOffset(loc, rewriter, dstTy);
     auto maskSpanAffineOffset = SharedMemoryObject::getMaskSpanOffsets(dstTy);
     auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
     lowerLdSt(loc, ctx, cvt, vals, resElemTy, smemObj.getBase(),
               /*paddingShifts=*/{}, affineOffset, maskSpanAffineOffset, laneId,
-              warpId, rewriter, targetInfo, maxVec, emitCpAsync);
+              warpId, rewriter, targetInfo, maxVec, emitCpAsync,
+              /*barrierPtr=*/std::nullopt, npotBufBytes);
 
     // Drop the result token.
     Value zero = LLVM::ConstantOp::create(rewriter, op.getLoc(),
@@ -1395,6 +1430,27 @@ struct AsyncCopyGlobalToLocalOpConversion
     return success();
   }
 };
+
+// Compute the actual (non-rounded) number of TMA messages needed for
+// a memdesc type.  This is the product of ceil(shapePerCTA[dim] /
+// blockShape[dim]) for all dimensions, before any pow2 rounding.
+static int getActualNumTMACopies(ttg::MemDescType ty) {
+  auto shapePerCTA = ttg::getShapePerCTA(ty);
+  // Tiled mode here: this is only used for actual-message counting, which is
+  // identical regardless of TMA mode (im2col uses the same per-dim tile shape).
+  auto blockShape =
+      ttng::getTMABlockShape(ty, /*packedSize=*/true, ttg::TMAMode::Tiled);
+  int copies = 1;
+  for (size_t dim = 0; dim < shapePerCTA.size(); ++dim) {
+    // SILENT-FAILURE HARDENING: use ceil division to match the documented
+    // intent ("ceil(shapePerCTA[dim] / blockShape[dim])"). Floor division
+    // under-counts the messages when a dim is not an exact multiple of the
+    // block shape (reachable for an NPOT non-contiguous dim > 256), dropping
+    // the partial last tile.
+    copies *= llvm::divideCeil(shapePerCTA[dim], blockShape[dim]);
+  }
+  return copies;
+}
 
 static LinearLayout getMsgToPackedOffsetLayout(ttg::MemDescType ty,
                                                ttg::TMAMode mode) {
@@ -1447,6 +1503,48 @@ getMsgToUnpackedOffsetLayout(const LinearLayout &packedLayout,
   // Multiply to offset by 2 in the last dimension
   auto unpackLayout = LinearLayout::zeros1D(1, kMsg, kLastDim, 2);
   return unpackLayout * packedLayout;
+}
+
+// Compute the msg-to-shared layout for TMA load/store operations.
+// For NPOT split-dim layouts, invertAndCompose through the modular
+// smemLayout produces wrong SMEM offsets (ambiguous inverse). This helper
+// computes msgToShared analytically: each TMA message copies one swizzle
+// phase, and the SMEM offset for phase i = i * phaseStride elements.
+// For pow2 layouts, falls back to msgToPackedOffset.invertAndCompose().
+static LinearLayout
+computeMsgToSharedLayout(ttg::MemDescType memTy, int rank,
+                         const LinearLayout &msgToPackedOffset,
+                         const LinearLayout &smemLayout) {
+  auto mmaEnc = dyn_cast<NVMMASharedEncodingAttr>(memTy.getEncoding());
+  if (!smemLayout.isModular() || !mmaEnc)
+    return msgToPackedOffset.invertAndCompose(smemLayout);
+
+  auto allocShape = ttg::getAllocationShapePerCTA(
+      memTy.getEncoding(), memTy.getAllocShape().take_back(rank));
+  int elemBytes = mmaEnc.getElementBitWidth() / 8;
+  int swizzleBytes = mmaEnc.getSwizzlingByteWidth();
+  bool isTransposed = mmaEnc.getTransposed();
+  int contigDim = isTransposed ? 0 : rank - 1;
+  int nonContigDim = isTransposed ? rank - 1 : 0;
+  int tileCols = swizzleBytes / elemBytes;
+  int64_t phaseStrideElems = allocShape[nonContigDim] * tileCols;
+  int64_t totalElems = 1;
+  for (auto s : allocShape)
+    totalElems *= s;
+  int numPhases = allocShape[contigDim] / tileCols;
+  int numBits = llvm::Log2_32_Ceil(std::max(numPhases, 1));
+  auto ctx = memTy.getContext();
+  auto kOffset = str_attr("offset");
+  auto kMsg = str_attr("msg");
+  auto kBlock = str_attr("block");
+  LinearLayout::BasesT bases;
+  bases[kMsg] = {};
+  for (int i = 0; i < numBits; i++)
+    bases[kMsg].push_back({static_cast<int32_t>((1 << i) * phaseStrideElems)});
+  bases[kBlock] = {{0}};
+  return LinearLayout(std::move(bases),
+                      {{kOffset, static_cast<int32_t>(totalElems)}},
+                      /*requireSurjective=*/false);
 }
 
 struct AsyncTMACopyGlobalToLocalOpConversion
@@ -1506,15 +1604,21 @@ struct AsyncTMACopyGlobalToLocalOpConversion
 
     int rank = op.getCoord().size();
 
-    auto msgToPackedOffset = getMsgToPackedOffsetLayout(smemTy, tmaMode);
-    auto smemLayout = ttg::toLinearLayout(smemTy);
-    auto msgToShared = msgToPackedOffset.invertAndCompose(smemLayout);
-    auto msgToOffset = getMsgToUnpackedOffsetLayout(msgToPackedOffset, smemTy);
-
     auto ctx = op.getContext();
     auto kMsg = str_attr("msg");
     auto kBlock = str_attr("block");
-    const auto numCopies = msgToOffset.getInDimSize(kMsg);
+
+    auto msgToPackedOffset = getMsgToPackedOffsetLayout(smemTy, tmaMode);
+    auto smemLayout = ttg::toLinearLayout(smemTy);
+    auto msgToShared =
+        computeMsgToSharedLayout(smemTy, rank, msgToPackedOffset, smemLayout);
+    auto msgToOffset = getMsgToUnpackedOffsetLayout(msgToPackedOffset, smemTy);
+    // For NPOT dimensions, the LinearLayout input size is rounded up to
+    // the next pow2, creating "phantom" messages. Use the actual message
+    // count to limit the loop and predicate out phantoms.
+    const auto llNumCopies = msgToOffset.getInDimSize(kMsg);
+    const auto actualNumCopies = getActualNumTMACopies(smemTy);
+    const auto numCopies = std::min(llNumCopies, actualNumCopies);
     auto zero = b.i32_val(0);
     auto ctaId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
     // We multicast if the flag is on and the block layout has broadcasting
@@ -1787,16 +1891,21 @@ convertTMAStoreLikeOp(Operation *op, const TypeConverter *typeConverter,
 
   auto rank = coords.size();
 
-  auto msgToPackedOffset =
-      getMsgToPackedOffsetLayout(srcTy, ttg::TMAMode::Tiled);
-  auto smemLayout = ttg::toLinearLayout(srcTy);
-  auto msgToShared = msgToPackedOffset.invertAndCompose(smemLayout);
-  auto msgToOffset = getMsgToUnpackedOffsetLayout(msgToPackedOffset, srcTy);
-
   auto ctx = op->getContext();
   auto kMsg = str_attr("msg");
   auto kBlock = str_attr("block");
-  auto numCopies = msgToOffset.getInDimSize(kMsg);
+
+  auto msgToPackedOffset =
+      getMsgToPackedOffsetLayout(srcTy, ttg::TMAMode::Tiled);
+  auto smemLayout = ttg::toLinearLayout(srcTy);
+  auto msgToShared =
+      computeMsgToSharedLayout(srcTy, rank, msgToPackedOffset, smemLayout);
+  auto msgToOffset = getMsgToUnpackedOffsetLayout(msgToPackedOffset, srcTy);
+
+  // For NPOT dimensions, cap at actual message count (see TMA load path).
+  auto llNumCopies = msgToOffset.getInDimSize(kMsg);
+  auto actualNumCopies = getActualNumTMACopies(srcTy);
+  auto numCopies = std::min(llNumCopies, actualNumCopies);
   auto zero = b.i32_val(0);
   auto ctaId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
 

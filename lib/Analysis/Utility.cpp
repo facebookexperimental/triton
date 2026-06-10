@@ -962,7 +962,64 @@ bool supportMMA(triton::DotOp op, int version) {
     // If k size is smaller than the native mma size, we cannot use MMA.
     if (k < 256 / aElemTy.getIntOrFloatBitWidth())
       return false;
-    if (!(retShapePerCTA[rank - 2] % 64 == 0 &&
+    // NPOT K with swizzle=0: same issue as MMAv3. When K*elemBytes doesn't
+    // divide any swizzle size (32/64/128), the NVMMASharedEncoding gets
+    // swizzle=0 and the SMEM allocation rounds K to pow2. The tc_gen5_mma
+    // reads past the valid K range into uninitialized padding. Fall back to
+    // a non-MMA path (getMMAVersionSafe falls through {5, 2} to version 2).
+    if (!llvm::isPowerOf2_64(k)) {
+      int elemBytes = aElemTy.getIntOrFloatBitWidth() / 8;
+      int64_t contigBytes = (int64_t)k * elemBytes;
+      if (contigBytes % 32 != 0) {
+        return false;
+      }
+    }
+    // NPOT M: MMAv5 instructions are m64/m128. The accumulator lives in TMEM
+    // and the distributed TMEM layout (getDefaultLayoutForTmemLdSt +
+    // applyNpotReductionForTmem) handles NPOT M (row) dims modularly, the same
+    // way NPOT N is handled. So we only need M to tile the m16 granularity of
+    // the MMAv5 instruction shape selection (mmaVersionToInstrShape rounds M up
+    // to the next valid m64/m128). Relax M % 64 -> M % 16 (mirrors the SM90
+    // WGMMA relaxation in D105735350).
+    //
+    // The (rounded) block M must be at least 64 (the smallest MMAv5 row-block).
+    // M < 64 (e.g. 16/32/48) cannot fill a row-block; before the M%64->M%16
+    // relaxation these were rejected by the old %64 check, so keep rejecting
+    // them here to preserve that behaviour (they fall back to a non-MMA path).
+    // This must come before the relaxed %16 check below.
+    int64_t mDim = retShapePerCTA[rank - 2];
+    if (mDim < 64)
+      return false;
+    // Single-row-block only: NPOT M that fits in one MMAv5 row-block (M <= 128,
+    // i.e. rounds up to 64 or 128) is supported. NPOT M spanning multiple
+    // row-blocks (128 < M < 256) makes the TMEM-load distributed layout
+    // over-span to the pow2-rounded row footprint, producing misaligned SMEM
+    // staging in the convert_layout->store; reject those for now (they fall
+    // back to a non-MMA path). Pow2 M (incl. M >= 256, e.g. 256) is unaffected.
+    if (!llvm::isPowerOf2_64(mDim) && mDim > 128)
+      return false;
+    // NPOT M + NPOT N on MMAv5 is not yet supported (the combined NPOT
+    // distributed-layout lowering hits a LinearLayout reshape mismatch in
+    // ConvertTritonGPUToLLVM). Only enable NPOT M when N is a power of 2.
+    int64_t nDim = retShapePerCTA[rank - 1];
+    if (!llvm::isPowerOf2_64(mDim) && !llvm::isPowerOf2_64(nDim))
+      return false;
+    // NPOT N with a blockM==64 accumulator is incorrect on MMAv5 and falls back
+    // to a non-MMA path (getMMAVersionSafe drops {5,2} to v2/FMA), which is
+    // numerically correct. mmaVersionToInstrShape selects instr M=64 when the
+    // (pow2-rounded) tile M is <=64, giving a blockM==64 TMEM accumulator whose
+    // 16x32bx2 "lane-split" tcgen05 ld/st places the dead pow2-padded N columns
+    // on a *lane* basis; applyNpotReductionForTmem then folds them onto live
+    // columns as an unremovable lane broadcast (actionRemoveBroadcastedRegs
+    // only dedups register bases), so those lanes read uninitialized TMEM ->
+    // wrong results. blockM==128 covers all columns in registers (removable
+    // broadcast) so NPOT N is correct there. Pow2 N and NPOT-N with M>=128 are
+    // unaffected.
+    // TODO(T275205780): real tcgen05-preserving fix = cross-lane dead-position
+    // fixup in lowerTMemLdSt; remove this guard then.
+    if (!llvm::isPowerOf2_64(nDim) && mDim <= 64)
+      return false;
+    if (!(retShapePerCTA[rank - 2] % 16 == 0 &&
           retShapePerCTA[rank - 1] % 8 == 0))
       return false;
     return true;

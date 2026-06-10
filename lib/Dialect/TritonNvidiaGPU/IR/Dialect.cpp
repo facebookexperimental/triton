@@ -272,15 +272,25 @@ static std::optional<LinearLayout> getDistributedLayoutForTmemLdSt(
   // In less fancy words, we look for the `comp` layout not to have any zero
   // basis as that would disallow the resulting layout to be left-divisible by
   // the tile
-  auto comp =
-      tile.compose(ll).sublayout({kReg, kLane}, to_vector(ll.getOutDimNames()));
-  if (instr32Rows) {
-    // We will use 16x32bx2 instruction for lane=16 so we remove the last lane
-    // basis
-    comp = comp.resizeInDim(kLane, comp.getInDimSize(kLane) / 2);
+  //
+  // For NPOT TMEM blockN (e.g. 96), the layout uses modularIdentity1D which
+  // makes getInDimSize(kCol) = pow2 but getOutDimSize(dim1) = NPOT.
+  // The modular wrapping makes ll non-injective at "dead" TMEM columns
+  // (blockN..pow2BlockN-1), so we skip the injectivity check.
+  bool hasNpotOutDim = llvm::any_of(ll.getOutDimSizes(), [](int32_t s) {
+    return s > 0 && !llvm::isPowerOf2_32(s);
+  });
+  if (!hasNpotOutDim) {
+    auto comp = tile.compose(ll).sublayout({kReg, kLane},
+                                           to_vector(ll.getOutDimNames()));
+    if (instr32Rows) {
+      // We will use 16x32bx2 instruction for lane=16 so we remove the last
+      // lane basis
+      comp = comp.resizeInDim(kLane, comp.getInDimSize(kLane) / 2);
+    }
+    if (!comp.isInjective())
+      return std::nullopt;
   }
-  if (!comp.isInjective())
-    return std::nullopt;
 
   // Fit the warp bases either tiling on the RHS or in row=16
   StringAttr row16;
@@ -348,28 +358,78 @@ getDistributedLayoutForTmemLdSt(gpu::MemDescType memType, TMemAccessAtom atom,
   assert(atom != TMemAccessAtom::I16x32bx2 &&
          "This layout is inferred sometimes for the 32x32b atom");
   auto ll = toLinearLayout(memType.getShape(), memType.getEncoding());
+  // Round NPOT out-dim sizes to pow2 for the sub-32-bit packing logic in the
+  // inner overload.  The caller (getDefaultLayoutForTmemLdSt) applies
+  // applyNpotReductionForTmem afterward to reduce back to the actual shape.
+  auto outDimNames = llvm::to_vector(ll.getOutDimNames());
+  bool hasNpot = llvm::any_of(outDimNames, [&](StringAttr name) {
+    return !llvm::isPowerOf2_64(ll.getOutDimSize(name));
+  });
+  if (hasNpot) {
+    auto bases = ll.getBases();
+    SmallVector<std::pair<StringAttr, int32_t>> outDims;
+    for (auto name : outDimNames) {
+      auto size = ll.getOutDimSize(name);
+      auto pow2 = llvm::isPowerOf2_64(size) ? size : llvm::NextPowerOf2(size);
+      outDims.push_back({name, static_cast<int32_t>(pow2)});
+    }
+    ll = LinearLayout(std::move(bases), outDims, /*requireSurjective=*/false);
+  }
   auto bitwidth = memType.getElementTypeBitWidth();
   return getDistributedLayoutForTmemLdSt(ll, atom, numWarps, bitwidth,
                                          cgaLayout);
+}
+
+// Apply NPOT modular reduction to a distributed layout.  For NPOT TMEM
+// blockN, the internal layout uses pow2 column counts so the composed
+// distributed layout may have pow2 output dim sizes that exceed the actual
+// tensor shape.  Reduce basis values modulo the NPOT shape dim.
+static LinearLayout applyNpotReductionForTmem(LinearLayout ll,
+                                              ArrayRef<int64_t> shape) {
+  bool hasNpot = llvm::any_of(
+      shape, [](int64_t s) { return s > 0 && !llvm::isPowerOf2_64(s); });
+  if (!hasNpot)
+    return ll;
+
+  auto outDimNames = llvm::to_vector(ll.getOutDimNames());
+  auto bases = ll.getBases();
+  SmallVector<std::pair<StringAttr, int32_t>> outDims;
+  for (size_t i = 0; i < outDimNames.size(); i++) {
+    int32_t dimSize = ll.getOutDimSize(outDimNames[i]);
+    if (i < shape.size() && !llvm::isPowerOf2_64(shape[i])) {
+      int32_t npotSize = static_cast<int32_t>(shape[i]);
+      for (auto &[inDimName, inDimBases] : bases) {
+        for (auto &basis : inDimBases) {
+          basis[i] = basis[i] % npotSize;
+        }
+      }
+      dimSize = npotSize;
+    }
+    outDims.push_back({outDimNames[i], dimSize});
+  }
+  return LinearLayout(std::move(bases), outDims, /*requireSurjective=*/false);
 }
 
 DistributedEncodingTrait
 getDefaultLayoutForTmemLdSt(gpu::MemDescType memType, unsigned numWarps,
                             gpu::CGAEncodingAttr cgaLayout) {
   auto *ctx = memType.getContext();
+  auto shape = memType.getShape().take_back(2);
   bool prefer16x256 =
       triton::tools::getBoolEnv("TRITON_PREFER_TMEM_16x256_LAYOUT");
   if (prefer16x256) {
     auto layout = getDistributedLayoutForTmemLdSt(
         memType, TMemAccessAtom::I16x256b, numWarps, cgaLayout);
     if (layout) {
-      return LinearEncodingAttr::get(ctx, std::move(*layout));
+      auto reduced = applyNpotReductionForTmem(std::move(*layout), shape);
+      return LinearEncodingAttr::get(ctx, std::move(reduced));
     }
   }
   auto layout = getDistributedLayoutForTmemLdSt(
       memType, TMemAccessAtom::I32x32b, numWarps, cgaLayout);
   assert(layout);
-  return LinearEncodingAttr::get(ctx, std::move(*layout));
+  auto reduced = applyNpotReductionForTmem(std::move(*layout), shape);
+  return LinearEncodingAttr::get(ctx, std::move(reduced));
 }
 
 std::optional<DistributedEncodingTrait>
@@ -422,14 +482,16 @@ getTmemCompatibleLayouts(Operation *op, RankedTensorType tensorType,
   int numWarps = lookupNumWarps(op);
   assert(numWarps % 4 == 0);
   auto cgaLayout = getCGALayout(tensorType.getEncoding());
+  auto shape = memType.getShape().take_back(2);
   SmallVector<DistributedEncodingTrait> layouts;
   for (auto atom : {TMemAccessAtom::I32x32b, TMemAccessAtom::I16x256b,
                     TMemAccessAtom::I16x128b, TMemAccessAtom::I16x64b}) {
     auto ll =
         getDistributedLayoutForTmemLdSt(memType, atom, numWarps, cgaLayout);
     if (ll) {
-      layouts.push_back(LinearEncodingAttr::get(tensorType.getContext(),
-                                                std::move(ll.value())));
+      auto reduced = applyNpotReductionForTmem(std::move(ll.value()), shape);
+      layouts.push_back(
+          LinearEncodingAttr::get(tensorType.getContext(), std::move(reduced)));
     }
   }
   // Small hack until we generalise isDistributedLayoutTMemCompatible
@@ -460,8 +522,14 @@ LogicalResult TensorMemoryEncodingAttr::verify(
   if (blockM != 64 && blockM != 128) {
     return emitError() << "blockM must be 64 or 128 but got " << blockM;
   }
-  if (!llvm::isPowerOf2_32(blockN)) {
-    return emitError() << "blockN must be a power of 2 but got " << blockN;
+  // blockN must be a power of 2 (small packed/unpacked subslices use
+  // blockN = 1/2/4, e.g. @subslice_unpacked) OR a multiple of 8 (NPOT N
+  // values such as 24/48/96, which the layout pads/tiles in 8-wide units).
+  // The earlier `blockN % 8 == 0`-only check regressed the pow2-small cases.
+  if (blockN < 1 || !(llvm::isPowerOf2_32(blockN) || blockN % 8 == 0)) {
+    return emitError() << "blockN must be a power of 2 or a positive multiple "
+                          "of 8 but got "
+                       << blockN;
   }
   if (blockN > 512) {
     return emitError() << "blockN must be less than or equal to 512 but got "
