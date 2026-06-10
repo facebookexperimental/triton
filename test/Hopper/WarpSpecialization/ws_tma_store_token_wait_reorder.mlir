@@ -172,6 +172,48 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // -----
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#barrier_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+// Triple-buffered store staging with two TMA stores in the loop. For the
+// second store, counting K=3 stores forward wraps to the first store, so its
+// wait must be scheduled before the first store's wait_barrier.
+// CHECK-LABEL: k3_two_stores_wraparound_uses_first_wait
+// CHECK: scf.for
+// CHECK: ttng.async_tma_store_token_wait
+// CHECK-NOT: can_rotate_by_buffer_count
+// CHECK-SAME: {loop.cluster = 2 : i32, loop.stage = 2 : i32}
+// CHECK: ttng.wait_barrier {{.*}} {loop.cluster = 3 : i32, loop.stage = 2 : i32}
+// CHECK: ttng.async_tma_copy_local_to_global {{.*}} {loop.cluster = 4 : i32, loop.stage = 2 : i32}
+// CHECK: ttng.async_tma_store_token_wait
+// CHECK-NOT: can_rotate_by_buffer_count
+// CHECK-SAME: {loop.cluster = 0 : i32, loop.stage = 2 : i32}
+// CHECK: ttng.wait_barrier {{.*}} {loop.cluster = 6 : i32, loop.stage = 1 : i32}
+// CHECK: ttng.async_tma_copy_local_to_global {{.*}} {loop.cluster = 7 : i32, loop.stage = 1 : i32}
+  tt.func public @k3_two_stores_wraparound_uses_first_wait(
+      %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
+      %src0: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+      %src1: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+      %bar0: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+      %bar1: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+      %lb: index, %ub: index, %step: index) {
+    %c0 = arith.constant 0 : i32
+    %c64 = arith.constant 64 : i32
+    scf.for %iv = %lb to %ub step %step {
+      ttng.wait_barrier %bar0, %c0 {"loop.stage" = 0 : i32, "loop.cluster" = 0 : i32} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+      %tok0 = ttng.async_tma_copy_local_to_global %desc[%c0, %c0] %src0 {"loop.stage" = 0 : i32, "loop.cluster" = 1 : i32} : !tt.tensordesc<tensor<128x64xf16, #shared>>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+      ttng.async_tma_store_token_wait %tok0 {"can_rotate_by_buffer_count" = 3 : i32, "loop.stage" = 0 : i32, "loop.cluster" = 2 : i32} : !ttg.async.token
+      ttng.wait_barrier %bar1, %c0 {"loop.stage" = 1 : i32, "loop.cluster" = 3 : i32} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+      %tok1 = ttng.async_tma_copy_local_to_global %desc[%c0, %c64] %src1 {"loop.stage" = 1 : i32, "loop.cluster" = 4 : i32} : !tt.tensordesc<tensor<128x64xf16, #shared>>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+      ttng.async_tma_store_token_wait %tok1 {"can_rotate_by_buffer_count" = 3 : i32, "loop.stage" = 1 : i32, "loop.cluster" = 5 : i32} : !ttg.async.token
+    } {"tt.scheduled_max_stage" = 1 : i32}
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
 // Loop-carried token after an unrelated loop-carried value. The token wait

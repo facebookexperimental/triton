@@ -282,7 +282,9 @@ findScheduledWaitBarrierBetween(Operation *producer, Operation *insertionTarget,
   if (!includeBarrierBeforeProducer)
     return nullptr;
 
-  for (auto revIt = Block::reverse_iterator(producer->getIterator());
+  Operation *wraparoundTarget =
+      insertionTarget->isBeforeInBlock(producer) ? insertionTarget : producer;
+  for (auto revIt = Block::reverse_iterator(wraparoundTarget->getIterator());
        revIt != producer->getBlock()->rend(); ++revIt) {
     Operation *candidate = &*revIt;
     if (isTMAStoreLikeOp(candidate))
