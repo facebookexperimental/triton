@@ -677,7 +677,7 @@ def _assert_close_with_cosine(
         (2, 2, 256),
         (2, 4, 512),
         # Test the persistent case
-        # (8, 16, 2048),
+        (8, 16, 2048),
         # Failing N_CTX/N_BLOCK odd case. Seems likely to be a quantization bug.
         # (2, 1, 1152),
     ],
