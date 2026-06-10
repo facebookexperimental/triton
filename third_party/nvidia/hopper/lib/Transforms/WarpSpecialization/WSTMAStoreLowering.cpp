@@ -262,14 +262,30 @@ void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp) {
 
 static Operation *
 findScheduledWaitBarrierBetween(Operation *producer, Operation *insertionTarget,
-                                const tt::CoarseSchedule &schedule) {
-  if (!producer->isBeforeInBlock(insertionTarget))
+                                const tt::CoarseSchedule &schedule,
+                                bool includeBarrierBeforeProducer) {
+  auto findBefore = [&](Operation *op, Operation *stopOp) -> Operation * {
+    for (auto revIt = Block::reverse_iterator(op->getIterator());
+         revIt != op->getBlock()->rend(); ++revIt) {
+      Operation *candidate = &*revIt;
+      if (candidate == stopOp)
+        return nullptr;
+      if (isa<ttng::WaitBarrierOp>(candidate) && schedule.count(candidate))
+        return candidate;
+    }
+    return nullptr;
+  };
+
+  if (producer->isBeforeInBlock(insertionTarget))
+    return findBefore(insertionTarget, producer);
+
+  if (!includeBarrierBeforeProducer)
     return nullptr;
 
-  for (auto revIt = Block::reverse_iterator(insertionTarget->getIterator());
-       revIt != insertionTarget->getBlock()->rend(); ++revIt) {
+  for (auto revIt = Block::reverse_iterator(producer->getIterator());
+       revIt != producer->getBlock()->rend(); ++revIt) {
     Operation *candidate = &*revIt;
-    if (candidate == producer)
+    if (isTMAStoreLikeOp(candidate))
       return nullptr;
     if (isa<ttng::WaitBarrierOp>(candidate) && schedule.count(candidate))
       return candidate;
@@ -320,6 +336,12 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
     if (waits.empty())
       return;
 
+    int numTMAStores = 0;
+    for (auto &op : forOp.getBody()->without_terminator()) {
+      if (isTMAStoreLikeOp(&op))
+        ++numTMAStores;
+    }
+
     bool changed = false;
     for (auto waitOp : waits) {
       auto attr = waitOp->getAttrOfType<IntegerAttr>(kCanRotateByBufferCount);
@@ -366,10 +388,12 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
 
       if (insertionTarget) {
         // Look for a WaitBarrierOp between the defining store and the
-        // insertion target. Do not scan before the producer: unrelated earlier
-        // barriers must not pull the token wait before its defining TMA store.
+        // insertion target. If the rotation spans the whole loop's set of TMA
+        // stores, also consider the nearest wait_barrier before the producer:
+        // it is logically between the current store and the next rotated store
+        // in the following iteration.
         if (Operation *waitBarrier = findScheduledWaitBarrierBetween(
-                tmaStore, insertionTarget, schedule))
+                tmaStore, insertionTarget, schedule, k >= numTMAStores))
           insertionTarget = waitBarrier;
 
         // Split the cluster at the insertion target: ops before it remain
