@@ -47,7 +47,7 @@ jobs:
       - name: Run TritonBench tests on H100 GPU
         working-directory: /workspace/tritonbench
         env:
-          TRITONBENCH_SKIP_TEST: ${{ github.workspace }}/.ci/tritonbench/fbtriton_skip_tests.yaml
+          TRITONBENCH_TEST_SKIP_FILE: ${{ github.workspace }}/.ci/tritonbench/fbtriton_skip_tests.yaml
         run: |
           bash ./.ci/tritonbench/test-gpu.sh
 

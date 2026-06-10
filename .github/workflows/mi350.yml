@@ -39,6 +39,8 @@ jobs:
           bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --install-torch-wheel "${TORCH_NIGHTLY_URL}"
       - name: Run TritonBench
         working-directory: tritonbench
+        env:
+          TRITONBENCH_TEST_SKIP_FILE: ${{ github.workspace }}/.ci/tritonbench/fbtriton_skip_tests.yaml
         run: |
           set -eux
           . "${SETUP_SCRIPT}"
