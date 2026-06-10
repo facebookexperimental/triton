@@ -1,19 +1,18 @@
-"""Examples for constraint-aware autotuning (Starter Task T3 + T4).
+"""Examples for constraint-aware autotuning: static IR-based pruning.
 
-These demonstrate the two new ``triton.autotune`` capabilities added in this
-branch:
-
-* **T3 — correctness gating** via ``correctness_fn`` / ``correctness_prune``:
-  the autotuner runs each config once, compares its output against a
-  user-supplied reference, records a success rate, and (by default) drops
-  configs that produce the wrong answer before picking the fastest.
+These demonstrate the ``triton.autotune`` IR-pruning capability added in this
+branch — all **static** (compile only, no kernel launch, no reference output):
 
 * **T4 — artifact (IR/PTX) pruning** via
-  ``prune_configs_by={"artifact_config_prune": ...}``: each config is compiled
+  ``prune_configs_by={"ir_config_prune": ...}``: each config is compiled
   (``run(warmup=True)`` — no launch) and its TTGIR/PTX is inspected, so configs
   can be kept/dropped by a feature present in the generated code.
 
-The four filters cover the three required T4 targets at the two IR levels:
+* **M1 — static bitwise-equivalence pruning**: layered on the same hook via
+  ``bitequiv.equivalence.reduction_equivalence_prune(level)`` — keep only configs
+  whose compiled IR reduces in the same order as the reference (first) config.
+
+The T4 filters cover the three required targets at the two IR levels:
 
 * T4-A vectorization  — **PTX** feature selection (keep wide vector mem ops)
 * T4-B AutoWS         — **TTGIR** feature selection (keep warp-specialized configs)
@@ -38,7 +37,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 # Make `bitequiv` importable whether this file is run as a script or imported.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
-from bitequiv.equivalence import CHECKERS as EQUIVALENCE_CHECKERS  # noqa: E402
+from bitequiv.equivalence import reduction_equivalence_prune  # noqa: E402
 
 
 def _is_blackwell():
@@ -48,40 +47,6 @@ def _is_blackwell():
         return False
     major, _ = torch.cuda.get_device_capability()
     return major in (10, 11)
-
-
-# ---------------------------------------------------------------------------
-# T3: correctness gating on a reduction that is only correct for some configs
-# ---------------------------------------------------------------------------
-def example_correctness_gating():
-    """A single-block sum reduction. The kernel only sums ``BLOCK_SIZE`` elements,
-    so configs with ``BLOCK_SIZE < N`` silently produce a WRONG (truncated) sum.
-    ``correctness_fn`` catches them; the winner is the fastest *correct* config.
-    """
-    N = 4096
-    src = torch.randn(N, device="cuda", dtype=torch.float32)
-    out = torch.empty(1, device="cuda", dtype=torch.float32)
-    ref = src.sum()
-
-    def correctness_fn(named):
-        return torch.allclose(named["dst"], ref, atol=1e-3, rtol=1e-3)
-
-    configs = [triton.Config({"BLOCK_SIZE": bs}) for bs in (512, 1024, 2048, 4096, 8192)]
-
-    @triton.autotune(configs=configs, key=["N"], restore_value=["dst"], correctness_fn=correctness_fn,
-                     correctness_prune=True)
-    @triton.jit
-    def sum_kernel(src, dst, N, BLOCK_SIZE: tl.constexpr):
-        offs = tl.arange(0, BLOCK_SIZE)
-        x = tl.load(src + offs, mask=offs < N, other=0.0)
-        tl.store(dst, tl.sum(x, axis=0))
-
-    sum_kernel[(1, )](src, out, N)
-    print("[T3] correctness gating")
-    for c, ok in sum_kernel.correctness_results.items():
-        print(f"     BLOCK_SIZE={c.kwargs['BLOCK_SIZE']:>5}  correct={ok}")
-    print(f"     winner BLOCK_SIZE={sum_kernel.best_config.kwargs['BLOCK_SIZE']} "
-          f"(must be >= N={N})\n")
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +65,7 @@ def example_vectorization_filter():
 
     configs = [triton.Config({"BLOCK_SIZE": bs}) for bs in (64, 128, 256, 1024, 4096)]
 
-    @triton.autotune(configs=configs, key=["N"], prune_configs_by={"artifact_config_prune": keep_vectorized})
+    @triton.autotune(configs=configs, key=["N"], prune_configs_by={"ir_config_prune": keep_vectorized})
     @triton.jit
     def copy_kernel(src, dst, N, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
@@ -112,7 +77,7 @@ def example_vectorization_filter():
     copy_kernel[grid](src, dst, N)
     print("[T4-A] vectorization (PTX ld/st.global.v*) feature selection")
     print(f"     dropped (non-vectorized): "
-          f"{sorted(c.kwargs['BLOCK_SIZE'] for c in copy_kernel.pruned_by_artifact)}")
+          f"{sorted(c.kwargs['BLOCK_SIZE'] for c in copy_kernel.pruned_by_ir)}")
     print(f"     winner BLOCK_SIZE={copy_kernel.best_config.kwargs['BLOCK_SIZE']}\n")
 
 
@@ -193,8 +158,7 @@ def example_autows_filter():
     # FLATTEN=False -> warp-specializes (kept); FLATTEN=True -> does not (dropped).
     configs = [triton.Config({"FLATTEN": flat}, num_warps=4, num_stages=2) for flat in (False, True)]
 
-    @triton.autotune(configs=configs, key=["M", "N", "K"],
-                     prune_configs_by={"artifact_config_prune": keep_warp_specialized})
+    @triton.autotune(configs=configs, key=["M", "N", "K"], prune_configs_by={"ir_config_prune": keep_warp_specialized})
     @triton.jit
     def matmul(a_desc, b_desc, c_desc, M, N, K, FLATTEN: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr, NUM_SMS: tl.constexpr):
@@ -207,7 +171,7 @@ def example_autows_filter():
                      NUM_SMS=NUM_SMS)
     kept = matmul.best_config
     print("[T4-B] AutoWS (TTGIR warp_specialize) feature selection")
-    print(f"     dropped (non-WS): {[c.kwargs['FLATTEN'] for c in matmul.pruned_by_artifact]} (FLATTEN values)")
+    print(f"     dropped (non-WS): {[c.kwargs['FLATTEN'] for c in matmul.pruned_by_ir]} (FLATTEN values)")
     print(f"     winner (warp-specialized): FLATTEN={kept.kwargs['FLATTEN']}\n")
 
 
@@ -245,7 +209,7 @@ def example_tmem_load_filter():
     configs = [triton.Config({"PREC": p}) for p in ("ieee", "tf32")]
 
     @triton.autotune(configs=configs, key=["M", "N", "K"],
-                     prune_configs_by={"artifact_config_prune": tmem_load_correctness_filter})
+                     prune_configs_by={"ir_config_prune": tmem_load_correctness_filter})
     @triton.jit
     def matmul(a_ptr, b_ptr, c_ptr, M, N, K, PREC: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                BLOCK_K: tl.constexpr):
@@ -264,7 +228,7 @@ def example_tmem_load_filter():
     grid = lambda meta: (triton.cdiv(M, BM), triton.cdiv(N, BN))
     matmul[grid](a, b, c, M, N, K, BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK)
     print("[T4-C] TMEM_LOAD (TTGIR ttng.tmem_load) correctness prune")
-    print(f"     dropped (emits tmem_load): {[c.kwargs['PREC'] for c in matmul.pruned_by_artifact]}")
+    print(f"     dropped (emits tmem_load): {[c.kwargs['PREC'] for c in matmul.pruned_by_ir]}")
     print(f"     winner (no tmem_load): PREC={matmul.best_config.kwargs['PREC']}\n")
 
 
@@ -290,11 +254,12 @@ def example_static_reduction_equivalence():
         triton.Config({"BLOCK_SIZE": 4096}, num_warps=8, num_stages=2),
     ]
 
-    # Choose the level via `equivalence_level` ("ttgir" | "ptx" | "both"); the per-level checkers are
-    # injected via `equivalence_checkers` (here bitequiv's registry). "ptx" raises until that engine
-    # is built — TTGIR works today.
-    @triton.autotune(configs=configs, key=["N"],
-                     prune_configs_by={"equivalence_level": "ttgir", "equivalence_checkers": EQUIVALENCE_CHECKERS})
+    # Choose the IR level via `reduction_equivalence_prune("ttgir" | "ptx" | "both")`; it returns an
+    # `ir_config_prune` predicate (compile-only, no launch). "ptx" raises until that engine is
+    # built — TTGIR works today. Keep a handle to read `.classes` / `.pruned` afterwards.
+    prune = reduction_equivalence_prune("ttgir")
+
+    @triton.autotune(configs=configs, key=["N"], prune_configs_by={"ir_config_prune": prune})
     @triton.jit
     def sum_kernel(src, dst, N, BLOCK_SIZE: tl.constexpr):
         offs = tl.arange(0, BLOCK_SIZE)
@@ -303,9 +268,9 @@ def example_static_reduction_equivalence():
 
     sum_kernel[(1, )](src, out, N)
     print("[M1] static reduction-order equivalence prune (level=ttgir, no launch, no reference output)")
-    print(f"     equivalence classes seen: {len(sum_kernel.equivalence_classes['ttgir'])}")
+    print(f"     equivalence classes seen: {len(prune.classes)}")
     print(f"     pruned (different reduction order): "
-          f"{sorted(c.num_warps for c in sum_kernel.pruned_by_equivalence)} (num_warps)")
+          f"{sorted(c.num_warps for c in prune.pruned)} (num_warps)")
     print(f"     winner (matches reference order): num_warps={sum_kernel.best_config.num_warps}\n")
 
 
@@ -313,7 +278,6 @@ if __name__ == "__main__":
     if not torch.cuda.is_available():
         raise SystemExit("These examples require a CUDA GPU.")
     example_static_reduction_equivalence()
-    example_correctness_gating()
     example_vectorization_filter()
     example_autows_filter()
     example_tmem_load_filter()

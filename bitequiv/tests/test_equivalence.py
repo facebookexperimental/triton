@@ -7,7 +7,8 @@ import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 from bitequiv.equivalence import (  # noqa: E402
-    reduction_signature, same_reduction_order, classify, reduction_equivalence_key, ptx_reduction_signature, CHECKERS)
+    reduction_signature, same_reduction_order, classify, reduction_equivalence_key, ptx_reduction_signature, CHECKERS,
+    ir_based_prune_configs, reduction_equivalence_prune)
 
 
 def _ttgir(warps_on_axis, ordering="unordered", combine="arith.addf"):
@@ -72,7 +73,7 @@ def test_equivalence_key_adapter_reads_ttgir():
     assert key_a != key_b
 
 
-# --- level registry (for the autotuner's equivalence_level option) ---
+# --- level registry (consumed by reduction_equivalence_prune) ---
 def test_registry_has_ttgir_and_ptx():
     assert set(CHECKERS) == {"ttgir", "ptx"}
 
@@ -88,3 +89,73 @@ def test_ptx_checker_is_a_stub_that_raises():
         ptx_reduction_signature("// some ptx")
     with pytest.raises(NotImplementedError):
         CHECKERS["ptx"](None, {"ptx": "// some ptx"}, None)
+
+
+# ---------------------------------------------------------------------------
+# ir_based_prune_configs / reduction_equivalence_prune: the ir_config_prune
+# predicate that keeps only configs matching the reference (first) config's key.
+# Tested directly as predicates (no autotuner); the autotuner wiring is covered by
+# the ir_config_prune tests in test_autotuner_constraint_prune.py.
+# ---------------------------------------------------------------------------
+def test_ir_based_prune_keeps_reference_class():
+    # key = the metadata stand-in; configs fed in order, first defines the reference.
+    prune = ir_based_prune_configs(lambda config, asm, md: md)
+    assert prune("c0", {}, "A")  # reference
+    assert prune("c1", {}, "A")  # matches -> kept
+    assert not prune("c2", {}, "B")  # differs -> pruned
+    assert list(prune.classes) == ["A", "B"]
+    assert prune.classes["A"] == ["c0", "c1"]
+    assert prune.pruned == {"c2": "not-equivalent-to-reference"}
+
+
+def test_ir_based_prune_all_same_key_keeps_all():
+    prune = ir_based_prune_configs(lambda c, a, m: 0)
+    assert all(prune(f"c{i}", {}, None) for i in range(3))
+    assert prune.pruned == {}
+    assert len(prune.classes) == 1
+
+
+def test_ir_based_prune_handles_falsy_reference_key():
+    # A key may legitimately be None/falsy; the first None is the reference and later Nones match it.
+    prune = ir_based_prune_configs(lambda c, a, m: None)
+    assert prune("c0", {}, None)
+    assert prune("c1", {}, None)
+    assert prune.pruned == {}
+
+
+def test_ir_based_prune_tuple_key_multilevel_semantics():
+    # A combined (l1, l2) key keeps a config iff it matches the reference at BOTH levels.
+    prune = ir_based_prune_configs(lambda c, a, m: m)  # m is the (l1, l2) tuple
+    assert prune("ref", {}, (4, 256))  # reference
+    assert prune("both_match", {}, (4, 256))
+    assert not prune("l2_differs", {}, (4, 512))
+    assert not prune("l1_differs", {}, (2, 256))
+    assert set(prune.pruned) == {"l2_differs", "l1_differs"}
+
+
+def test_reduction_equivalence_prune_ttgir_uses_signature():
+    prune = reduction_equivalence_prune("ttgir")
+    # reference = first config's TTGIR reduction order (warps=4); warps 2/8 reduce differently.
+    assert prune("nw4", {"ttgir": _ttgir(4)}, None)
+    assert not prune("nw2", {"ttgir": _ttgir(2)}, None)
+    assert not prune("nw8", {"ttgir": _ttgir(8)}, None)
+    assert set(prune.pruned) == {"nw2", "nw8"}
+    assert len(prune.classes) == 3
+
+
+def test_reduction_equivalence_prune_unknown_level_raises():
+    with pytest.raises(ValueError):
+        reduction_equivalence_prune("nope")
+
+
+def test_reduction_equivalence_prune_ptx_stub_raises_on_use():
+    prune = reduction_equivalence_prune("ptx")
+    with pytest.raises(NotImplementedError):
+        prune("c0", {"ptx": "// ptx"}, None)
+
+
+def test_reduction_equivalence_prune_both_evaluates_all_levels():
+    # "both" combines (ttgir, ptx) into one key; evaluating it hits the ptx stub.
+    prune = reduction_equivalence_prune("both")
+    with pytest.raises(NotImplementedError):
+        prune("c0", {"ttgir": _ttgir(4), "ptx": "// ptx"}, None)

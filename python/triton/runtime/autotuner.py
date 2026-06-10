@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import logging
 import math
 import time
 import inspect
@@ -17,6 +18,8 @@ from .errors import OutOfResources, PTXASError, AutotunerError
 from .driver import driver
 from .cache import get_cache_manager, triton_key
 from triton._C.libtriton import get_cache_invalidating_env_vars
+
+logger = logging.getLogger(__name__)
 
 
 class _OnlineLinearRegression:
@@ -237,7 +240,7 @@ class Autotuner(KernelInterface):
 
     def __init__(self, fn, arg_names, configs, key, reset_to_zero, restore_value, pre_hook=None, post_hook=None,
                  prune_configs_by: Optional[Dict] = None, warmup=None, rep=None, use_cuda_graph=False, do_bench=None,
-                 cache_results=False, correctness_fn=None, correctness_prune=True):
+                 cache_results=False):
         """
         :param prune_configs_by: a dict of functions that are used to prune configs, fields:
             'perf_model': performance model used to predicate running time with different configs, returns running time
@@ -245,41 +248,20 @@ class Autotuner(KernelInterface):
             'early_config_prune': a function used to prune configs. It should have the signature
                 `prune_configs_by( configs: List[triton.Config], named_args: Dict[str, Any], **kwargs: Dict[str, Any]) -> List[triton.Config]:`
                 and return pruned configs. It should return at least one config.
-            'artifact_config_prune': a function used to prune configs by inspecting each config's
+            'ir_config_prune': a function used to prune configs by inspecting each config's
                 *compiled artifact* (TTGIR/PTX). Unlike 'early_config_prune', which runs before any
                 compilation, this hook runs after compiling each config (via run(warmup=True), no
                 kernel launch) so it can filter on the generated IR. It should have the signature
-                `artifact_config_prune(config: triton.Config, asm: Dict[str, str], metadata) -> bool`
+                `ir_config_prune(config: triton.Config, asm: Dict[str, str], metadata) -> bool`
                 and return True to KEEP the config. `asm` is the CompiledKernel.asm dict (keys such
                 as 'ttir', 'ttgir', 'llir', 'ptx'); `metadata` is CompiledKernel.metadata.
-            'equivalence_fn': a function for STATIC bitwise-equivalence pruning. Like
-                'artifact_config_prune' it runs after each config is compiled (via run(warmup=True),
-                no launch) and inspects the generated TTGIR, but instead of a per-config bool it
-                returns a hashable *equivalence key* (e.g. a reduction-order signature derived from
-                the reduce op's data layout). The autotuner keeps only configs whose key matches the
-                FIRST config's key (the reference order) and prunes the rest, so the surviving set is
-                bitwise-equivalent by construction — no kernel launch and no reference output needed.
-                Signature: `equivalence_fn(config: triton.Config, asm: Dict[str, str], metadata) -> Hashable`.
-                Results are exposed on `self.equivalence_classes` and `self.pruned_by_equivalence`.
-            'equivalence_level' + 'equivalence_checkers': the level-selectable form of the above. Set
-                'equivalence_level' to "ttgir", "ptx", "both" (or an ordered list of level names) to
-                choose the IR level(s) the equivalence check runs at, and pass 'equivalence_checkers'
-                as a {level_name: equivalence_fn} registry (e.g. `bitequiv.equivalence.CHECKERS`).
-                Triton core stays decoupled — the checkers are injected, not imported. Multiple levels
-                run as a two-stage pipeline (e.g. "both" = TTGIR pre-filter, then PTX backstop on the
-                survivors). A requested level missing from the registry, or whose checker raises
-                NotImplementedError, raises a clear AutotunerError (a requested level is never silently
-                skipped). `equivalence_classes` becomes {level: {key: [Config, ...]}}.
-        :param correctness_fn: an optional callable used to validate each config's output before it
-            is benchmarked. It has the signature `correctness_fn(named_args: Dict[str, Any]) -> bool`
-            where `named_args` is the full set of (kernel args + meta-params) AFTER running the config
-            once; it should return True if the output is acceptable. Output buffers are
-            snapshotted/restored around the check using the same restore_value/reset_to_zero plumbing
-            used for benchmarking, and the check runs separately from `do_bench` so its cost never
-            affects timing.
-        :param correctness_prune: if True (default), configs that fail `correctness_fn` are excluded
-            from selection; if False, results are recorded (see `self.correctness_results`) but all
-            configs are still benchmarked.
+
+                This is the single IR-based pruning hook. Static bitwise-equivalence pruning (keep
+                only configs whose compiled IR matches a reference order, at TTGIR and/or PTX level)
+                is built on top of it: see `bitequiv.equivalence.ir_based_prune_configs` and
+                `reduction_equivalence_prune`, which adapt a per-config equivalence *key* into an
+                `ir_config_prune` predicate. Triton core stays decoupled — those checkers live
+                in `bitequiv`, not here.
         """
         if not configs:
             self.configs = [Config({}, num_warps=4, num_stages=3, num_ctas=1)]
@@ -331,30 +313,16 @@ class Autotuner(KernelInterface):
         self.perf_model = None
         self.configs_top_k = 1.0
         self.early_config_prune = None
-        self.artifact_config_prune = None
-        self.equivalence_fn = None
-        self.equivalence_level = None
-        self.equivalence_checkers = None
+        self.ir_config_prune = None
         if prune_configs_by:
             self.perf_model = prune_configs_by.get("perf_model", self.perf_model)
             self.configs_top_k = prune_configs_by.get("top_k", self.configs_top_k)
             self.early_config_prune = prune_configs_by.get("early_config_prune", self.early_config_prune)
-            self.artifact_config_prune = prune_configs_by.get("artifact_config_prune", self.artifact_config_prune)
-            self.equivalence_fn = prune_configs_by.get("equivalence_fn", self.equivalence_fn)
-            self.equivalence_level = prune_configs_by.get("equivalence_level", self.equivalence_level)
-            self.equivalence_checkers = prune_configs_by.get("equivalence_checkers", self.equivalence_checkers)
+            self.ir_config_prune = prune_configs_by.get("ir_config_prune", self.ir_config_prune)
 
-        # Correctness checking (T3): optional per-config output validation vs a user reference.
-        self.correctness_fn = correctness_fn
-        self.correctness_prune = correctness_prune
-        # {Config: bool} populated each tuning run when correctness_fn is set (success-rate inspection).
-        self.correctness_results: Dict[Config, bool] = {}
-        # {Config: reason} for configs dropped by artifact_config_prune (T4).
-        self.pruned_by_artifact: Dict[Config, str] = {}
-        # Static TTGIR bitwise-equivalence pruning (M1): configs dropped for not matching the
-        # reference reduction order, and the {equivalence-key: [Config, ...]} classes seen.
-        self.pruned_by_equivalence: Dict[Config, str] = {}
-        self.equivalence_classes: Dict = {}
+        # {Config: reason} for configs dropped by ir_config_prune (IR-based pruning, incl.
+        # static bitwise-equivalence pruning built on top of it in bitequiv).
+        self.pruned_by_ir: Dict[Config, str] = {}
 
         self.fn = fn
         self.base_fn = fn
@@ -503,37 +471,6 @@ class Autotuner(KernelInterface):
             if verbose:
                 print(f"Autotuning failed with {e}")
             return [float("inf"), float("inf"), float("inf")]
-
-    def _check_correctness(self, *args, config, **meta):
-        """Run one config once (untimed) and validate its output via ``correctness_fn``.
-
-        Returns True if the config's output passes (or if no ``correctness_fn`` is set). The kernel
-        is launched a single time; output buffers are snapshotted/restored using the same
-        ``pre_hook``/``post_hook`` (``restore_value``/``reset_to_zero``) plumbing used for
-        benchmarking, so neither the timing runs nor the final winner launch observe mutated tensors.
-        This is intentionally separate from ``do_bench`` so the comparison cost never affects timing.
-        """
-        from ..compiler.errors import CompileTimeAssertionFailure
-
-        if self.correctness_fn is None:
-            return True
-        current = dict(meta, **config.all_kwargs())
-        full_nargs = {**self.nargs, **current}
-        if config.pre_hook:
-            config.pre_hook(full_nargs)
-        self.pre_hook(full_nargs)
-        passed = False
-        try:
-            self.fn.run(*args, **current)
-            passed = bool(self.correctness_fn(full_nargs))
-        except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as e:
-            # A config that cannot even compile/run is treated as failing the check.
-            if knobs.autotuning.print:
-                print(f"[autotune] correctness check could not run config {config}: {e}", flush=True)
-            passed = False
-        finally:
-            self.post_hook(full_nargs, exception=None)
-        return passed
 
     def check_disk_cache(self, tuning_key, configs, bench_fn):
         # We can't serialize prehooks, so just give up and run the benchmarks.
@@ -687,29 +624,7 @@ class Autotuner(KernelInterface):
 
                     # facebook end
                     bench_start = time.time()
-                    # Correctness gating (T3): validate each config's output before timing it.
-                    configs_to_bench = pruned_configs
-                    if self.correctness_fn is not None:
-                        self.correctness_results = {}
-                        valid_configs = []
-                        for config in pruned_configs:
-                            ok = self._check_correctness(*args, config=config, **kwargs)
-                            self.correctness_results[config] = ok
-                            if ok or not self.correctness_prune:
-                                valid_configs.append(config)
-                        if knobs.autotuning.print:
-                            n_pass = sum(1 for v in self.correctness_results.values() if v)
-                            n_tot = len(self.correctness_results)
-                            rate = (n_pass / n_tot) if n_tot else 0.0
-                            print(
-                                f"[autotune] correctness: {n_pass}/{n_tot} configs passed "
-                                f"(success rate {rate:.1%})", flush=True)
-                        if self.correctness_prune:
-                            if not valid_configs:
-                                raise AutotunerError("No autotuner configs passed the correctness check. "
-                                                     "Relax `correctness_fn` or pass correctness_prune=False.")
-                            configs_to_bench = valid_configs
-                    timings = {config: self._bench(*args, config=config, **kwargs) for config in configs_to_bench}
+                    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
                     bench_end = time.time()
                     self.bench_time = bench_end - bench_start
                     # facebook begin T203283446
@@ -769,16 +684,16 @@ class Autotuner(KernelInterface):
         self.nargs = None
         return ret
 
-    def _artifact_prune_configs(self, configs: List[Config], kwargs: Dict) -> List[Config]:
-        """Keep only configs whose compiled artifact satisfies ``artifact_config_prune``.
+    def _ir_prune_configs(self, configs: List[Config], kwargs: Dict) -> List[Config]:
+        """Keep only configs whose compiled artifact satisfies ``ir_config_prune``.
 
         Each config is compiled via ``run(warmup=True)`` (real-arg specialization, so the inspected
         TTGIR/PTX matches what the benchmarked/launched kernel will use; no kernel is launched). The
         compiled kernel is cached, so the subsequent benchmark reuses it rather than recompiling.
-        The predicate ``artifact_config_prune(config, asm, metadata) -> bool`` returns True to KEEP.
+        The predicate ``ir_config_prune(config, asm, metadata) -> bool`` returns True to KEEP.
         Configs that fail to compile are dropped (they could not win anyway) and recorded.
         """
-        self.pruned_by_artifact = {}
+        self.pruned_by_ir = {}
         pos_args = list(self.nargs.values())
         kept: List[Config] = []
         for config in configs:
@@ -788,103 +703,21 @@ class Autotuner(KernelInterface):
             try:
                 kernel = self.fn.run(*pos_args, **run_kwargs)
             except Exception as e:  # noqa: BLE001 - a config that cannot compile cannot win
-                self.pruned_by_artifact[config] = f"compile-error: {type(e).__name__}: {e}"
+                self.pruned_by_ir[config] = f"compile-error: {type(e).__name__}: {e}"
                 continue
             asm = getattr(kernel, "asm", {}) or {}
             metadata = getattr(kernel, "metadata", None)
             try:
-                keep = bool(self.artifact_config_prune(config, asm, metadata))
+                keep = bool(self.ir_config_prune(config, asm, metadata))
             except Exception as e:
-                raise AutotunerError(
-                    f"`artifact_config_prune` raised on config {config}: {type(e).__name__}: {e}") from e
+                raise AutotunerError(f"`ir_config_prune` raised on config {config}: {type(e).__name__}: {e}") from e
             if keep:
                 kept.append(config)
             else:
-                self.pruned_by_artifact[config] = "artifact-prune"
-        if knobs.autotuning.print and self.pruned_by_artifact:
-            print(f"[autotune] artifact_config_prune dropped {len(self.pruned_by_artifact)}/{len(configs)} configs",
-                  flush=True)
+                self.pruned_by_ir[config] = "ir-prune"
+        if self.pruned_by_ir:
+            logger.info("ir_config_prune dropped %d/%d configs", len(self.pruned_by_ir), len(configs))
         return kept
-
-    def _resolve_equivalence_pipeline(self):
-        """Resolve (equivalence_level, equivalence_checkers, equivalence_fn) into an ordered list of
-        (level_name, checker_fn) stages. ``equivalence_level`` may be "ttgir"/"ptx"/"both" or an
-        ordered list of level names, looked up in the injected ``equivalence_checkers`` registry; a
-        plain ``equivalence_fn`` is appended as a final "custom" stage. Raises AutotunerError if a
-        requested level is not in the registry."""
-        pipeline = []
-        if self.equivalence_level is not None:
-            registry = self.equivalence_checkers or {}
-            level = self.equivalence_level
-            names = ["ttgir", "ptx"] if level == "both" else ([level] if isinstance(level, str) else list(level))
-            for name in names:
-                if name not in registry:
-                    raise AutotunerError(f"equivalence_level {name!r} requested but not provided in "
-                                         f"prune_configs_by['equivalence_checkers'] (available: {sorted(registry)}). "
-                                         f"Pass a {{level: fn}} registry, e.g. bitequiv.equivalence.CHECKERS.")
-                pipeline.append((name, registry[name]))
-        if self.equivalence_fn is not None:
-            pipeline.append(("custom", self.equivalence_fn))
-        return pipeline
-
-    def _equivalence_prune_configs(self, configs: List[Config], kwargs: Dict) -> List[Config]:
-        """Keep only configs bitwise-equivalent to the reference (first) config, statically.
-
-        No launch: each config is compiled ONCE (``run(warmup=True)``), then the equivalence pipeline
-        (``_resolve_equivalence_pipeline`` -> ordered [(level, checker)] stages, e.g. TTGIR then PTX)
-        filters the survivors at each level. A checker maps a config's artifact to a hashable key; at
-        each stage only configs whose key matches the first survivor's (the reference order) are kept,
-        so a later stage (PTX) checks only configs that already passed the earlier one (TTGIR). The
-        surviving set is bitwise-equivalent by construction — without running the kernel or comparing
-        any output. Populates ``self.equivalence_classes`` ({level: {key: [Config, ...]}}) and
-        ``self.pruned_by_equivalence`` ({Config: "level: reason"}).
-        """
-        self.pruned_by_equivalence = {}
-        self.equivalence_classes = {}
-        pipeline = self._resolve_equivalence_pipeline()
-        pos_args = list(self.nargs.values())
-        # Compile each config once (cached for the later benchmark); collect artifacts.
-        compiled: Dict[Config, tuple] = {}  # config -> (asm, metadata)
-        for config in configs:
-            run_kwargs = dict(kwargs)
-            run_kwargs.update(config.all_kwargs())
-            run_kwargs["warmup"] = True  # compile only; do not launch
-            try:
-                kernel = self.fn.run(*pos_args, **run_kwargs)
-            except Exception as e:  # noqa: BLE001 - a config that cannot compile cannot win
-                self.pruned_by_equivalence[config] = f"compile-error: {type(e).__name__}: {e}"
-                continue
-            compiled[config] = (getattr(kernel, "asm", {}) or {}, getattr(kernel, "metadata", None))
-        survivors = [c for c in configs if c in compiled]
-        # Apply each level's checker in order; keep configs matching the reference (first survivor).
-        for level, checker in pipeline:
-            if not survivors:
-                break
-            keys: Dict[Config, object] = {}
-            for config in survivors:
-                asm, metadata = compiled[config]
-                try:
-                    keys[config] = checker(config, asm, metadata)
-                except NotImplementedError as e:
-                    raise AutotunerError(f"equivalence_level {level!r} is not available: {e}") from e
-                except Exception as e:
-                    raise AutotunerError(f"equivalence checker for level {level!r} raised on config "
-                                         f"{config}: {type(e).__name__}: {e}") from e
-            by_key: Dict[object, List[Config]] = {}
-            for config in survivors:
-                by_key.setdefault(keys[config], []).append(config)
-            self.equivalence_classes[level] = by_key
-            reference_key = keys[survivors[0]]
-            kept = [c for c in survivors if keys[c] == reference_key]
-            for config in survivors:
-                if config not in kept:
-                    self.pruned_by_equivalence[config] = f"{level}: not-equivalent-to-reference"
-            if knobs.autotuning.print:
-                print(
-                    f"[autotune] equivalence[{level}] kept {len(kept)}/{len(survivors)} configs "
-                    f"({len(by_key)} class(es))", flush=True)
-            survivors = kept
-        return survivors
 
     def prune_configs(self, kwargs: Dict) -> List[Config]:
         pruned_configs = self.configs
@@ -893,20 +726,14 @@ class Autotuner(KernelInterface):
             if not pruned_configs:
                 raise AutotunerError(
                     "No valid autotuner configs after pruning. `early_config_prune` should return at least one config.")
-        # Artifact-based pruning (T4): inspect each config's compiled TTGIR/PTX. This must run after
-        # compilation (early_config_prune runs before it), so we compile each config here.
-        if self.artifact_config_prune:
-            pruned_configs = self._artifact_prune_configs(pruned_configs, kwargs)
+        # IR-based pruning: inspect each config's compiled TTGIR/PTX. This must run after compilation
+        # (early_config_prune runs before it), so we compile each config here (run(warmup=True), no
+        # launch). Static bitwise-equivalence pruning is layered on this hook in bitequiv.
+        if self.ir_config_prune:
+            pruned_configs = self._ir_prune_configs(pruned_configs, kwargs)
             if not pruned_configs:
-                raise AutotunerError("No valid autotuner configs after artifact pruning. "
-                                     "`artifact_config_prune` should keep at least one config.")
-        # Static bitwise-equivalence pruning (M1): keep only configs whose compiled IR matches the
-        # reference (first) config at the chosen level(s) (TTGIR / PTX). No launch, no reference output.
-        if self.equivalence_level is not None or self.equivalence_fn is not None:
-            pruned_configs = self._equivalence_prune_configs(pruned_configs, kwargs)
-            if not pruned_configs:
-                raise AutotunerError("No valid autotuner configs after equivalence pruning. "
-                                     "The equivalence check should keep at least the reference config.")
+                raise AutotunerError("No valid autotuner configs after IR pruning. "
+                                     "`ir_config_prune` should keep at least one config.")
         if self.perf_model:
             top_k = self.configs_top_k
             if isinstance(top_k, float) and top_k <= 1.0:
@@ -1085,8 +912,7 @@ class Config:
 
 
 def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_value=None, pre_hook=None, post_hook=None,
-             warmup=None, rep=None, use_cuda_graph=False, do_bench=None, cache_results=False, correctness_fn=None,
-             correctness_prune=True):
+             warmup=None, rep=None, use_cuda_graph=False, do_bench=None, cache_results=False):
     """
     Decorator for auto-tuning a :code:`triton.jit`'d function.
 
@@ -1144,20 +970,12 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
     :type do_bench: lambda fn, quantiles
     :param cache_results: whether to cache autotune timings to disk.  Defaults to False.
     "type cache_results: bool
-    :param correctness_fn: optional callable `correctness_fn(named_args) -> bool` validating each
-        config's output (after one untimed run) against a user-defined reference. See
-        :class:`Autotuner` for details.
-    :type correctness_fn: Optional[Callable[[dict], bool]]
-    :param correctness_prune: if True (default), configs failing `correctness_fn` are excluded from
-        selection; if False, results are only recorded.
-    :type correctness_prune: bool
     """
 
     def decorator(fn):
         return Autotuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
                          post_hook=post_hook, prune_configs_by=prune_configs_by, warmup=warmup, rep=rep,
-                         use_cuda_graph=use_cuda_graph, do_bench=do_bench, cache_results=cache_results,
-                         correctness_fn=correctness_fn, correctness_prune=correctness_prune)
+                         use_cuda_graph=use_cuda_graph, do_bench=do_bench, cache_results=cache_results)
 
     return decorator
 

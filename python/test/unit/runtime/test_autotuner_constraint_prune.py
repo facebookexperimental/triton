@@ -1,14 +1,19 @@
-"""Tests for constraint-aware autotuning: correctness checking (T3) and
-artifact/IR-PTX-based pruning (T4).
+"""Tests for constraint-aware autotuning: static artifact/IR-PTX-based pruning.
+
+The autotuner exposes a single IR-based pruning hook,
+``prune_configs_by={"ir_config_prune": ...}``: each config is compiled once
+(``run(warmup=True)`` — no kernel launch) and its TTGIR/PTX is inspected, so configs
+can be kept/dropped by a feature present in the generated code. Static bitwise-
+equivalence pruning is layered on this hook in ``bitequiv`` and is unit-tested there
+(``bitequiv/tests/test_equivalence.py``).
 
 This file has two layers:
 
-* **CPU logic tests** (no GPU) drive ``Autotuner.run`` end-to-end with a *mock*
-  JIT function so the new control flow (correctness gating, success-rate
-  recording, artifact pruning, compile-error handling) is validated
-  deterministically without a GPU.
-* **GPU end-to-end tests** (skipped without CUDA) exercise the same hooks through
-  real Triton compilation + launch, modeled on ``test_autotuner.py``.
+* **CPU logic tests** (no GPU) drive ``Autotuner.run`` end-to-end with a *mock* JIT
+  function so the prune control flow (compile-only inspection, keep/drop, compile-
+  error handling) is validated deterministically without a GPU.
+* **GPU end-to-end tests** (skipped without CUDA) exercise the same hook through real
+  Triton compilation, modeled on ``test_autotuner.py``.
 """
 import pytest
 import torch
@@ -56,11 +61,10 @@ class _FakeKernel:
 class _FakeJIT:
     """Minimal object that satisfies the bits of JITFunction that Autotuner uses.
 
-    ``run`` emulates a copy kernel: it copies the first ``min(BLOCK_SIZE, N)``
-    elements of ``src`` into ``dst``. Configs with ``BLOCK_SIZE < N`` therefore
-    produce a WRONG (truncated) result, which is exactly what the correctness
-    check should catch. With ``warmup=True`` it returns a ``_FakeKernel`` instead
-    of running, mirroring ``run(warmup=True)``.
+    With ``warmup=True`` it returns a ``_FakeKernel`` (mirroring ``run(warmup=True)``,
+    the compile-only path the artifact hook uses). Otherwise it records the block size
+    so the mock ``do_bench`` can derive a deterministic "time" (smaller block ==
+    faster), and returns None.
     """
 
     def __init__(self, arg_names):
@@ -78,16 +82,10 @@ class _FakeJIT:
         self.last_block_size = block_size
         if kwargs.get("warmup", False):
             return _FakeKernel(block_size, num_warps)
-        named = dict(zip(self.arg_names, args))
-        named.update({k: v for k, v in kwargs.items() if k in self.arg_names})
-        dst, src, n = named["dst"], named["src"], named["N"]
-        k = min(block_size, n)
-        dst.zero_()
-        dst[:k] = src[:k]
         return None
 
 
-def _make_tuner(configs, *, correctness_fn=None, correctness_prune=True, prune_configs_by=None):
+def _make_tuner(configs, *, prune_configs_by=None):
     fake = _FakeJIT(["dst", "src", "N", "BLOCK_SIZE"])
 
     # do_bench gets only kernel_call; recover a deterministic "time" from the
@@ -99,8 +97,7 @@ def _make_tuner(configs, *, correctness_fn=None, correctness_prune=True, prune_c
         return [t, t, t]
 
     tuner = Autotuner(fake, fake.arg_names, configs, key=["N"], reset_to_zero=None, restore_value=["dst"],
-                      prune_configs_by=prune_configs_by, do_bench=do_bench, correctness_fn=correctness_fn,
-                      correctness_prune=correctness_prune)
+                      prune_configs_by=prune_configs_by, do_bench=do_bench)
     return tuner, fake
 
 
@@ -112,275 +109,69 @@ def _configs():
     return [Config({"BLOCK_SIZE": bs}) for bs in (256, 512, 1024, 2048)]
 
 
-def test_correctness_prune_excludes_wrong_configs():
-    N = 1024
-    src = torch.arange(N, dtype=torch.float32)
-    dst = torch.empty(N, dtype=torch.float32)
-    ref = src.clone()
-
-    def correctness_fn(named):
-        return torch.equal(named["dst"], ref)
-
-    tuner, _ = _make_tuner(_configs(), correctness_fn=correctness_fn, correctness_prune=True)
-    tuner.run(dst, src, N=N, grid=(1, ))
-
-    # Only BLOCK_SIZE >= N produce a full (correct) copy.
-    results = {c.kwargs["BLOCK_SIZE"]: ok for c, ok in tuner.correctness_results.items()}
-    assert results == {256: False, 512: False, 1024: True, 2048: True}
-    # Fastest *correct* config wins (1024 < 2048), not the globally-fastest 256.
-    assert _bs(tuner) == 1024
-
-
-def test_correctness_record_only_does_not_prune():
-    N = 1024
-    src = torch.arange(N, dtype=torch.float32)
-    dst = torch.empty(N, dtype=torch.float32)
-    ref = src.clone()
-
-    tuner, _ = _make_tuner(_configs(), correctness_fn=lambda named: torch.equal(named["dst"], ref),
-                           correctness_prune=False)
-    tuner.run(dst, src, N=N, grid=(1, ))
-
-    # Results still recorded...
-    results = {c.kwargs["BLOCK_SIZE"]: ok for c, ok in tuner.correctness_results.items()}
-    assert results[256] is False and results[1024] is True
-    # ...but nothing is pruned, so the globally-fastest (wrong) config wins.
-    assert _bs(tuner) == 256
-
-
-def test_correctness_prune_all_fail_raises():
-    N = 4096  # larger than every BLOCK_SIZE -> every config is wrong
-    src = torch.arange(N, dtype=torch.float32)
-    dst = torch.empty(N, dtype=torch.float32)
-    ref = src.clone()
-    tuner, _ = _make_tuner(_configs(), correctness_fn=lambda named: torch.equal(named["dst"], ref),
-                           correctness_prune=True)
-    with pytest.raises(AutotunerError, match="correctness check"):
-        tuner.run(dst, src, N=N, grid=(1, ))
-
-
-def test_artifact_prune_filters_on_ttgir():
+def test_ir_prune_filters_on_ttgir():
     N = 1024
     src = torch.arange(N, dtype=torch.float32)
     dst = torch.empty(N, dtype=torch.float32)
 
     # Keep only configs whose TTGIR contains the 1024-wide tile (BLOCK_SIZE=1024).
-    def artifact_prune(config, asm, metadata):
+    def ir_prune(config, asm, metadata):
         assert set(asm) >= {"ttir", "ttgir", "ptx"}  # real artifact dict is available
         return "tensor<1024xf32>" in asm["ttgir"]
 
-    tuner, _ = _make_tuner(_configs(), prune_configs_by={"artifact_config_prune": artifact_prune})
+    tuner, _ = _make_tuner(_configs(), prune_configs_by={"ir_config_prune": ir_prune})
     tuner.run(dst, src, N=N, grid=(1, ))
 
-    dropped = {c.kwargs["BLOCK_SIZE"] for c in tuner.pruned_by_artifact}
+    dropped = {c.kwargs["BLOCK_SIZE"] for c in tuner.pruned_by_ir}
     assert dropped == {256, 512, 2048}
     assert _bs(tuner) == 1024
 
 
-def test_artifact_prune_on_metadata():
+def test_ir_prune_on_metadata():
     N = 1024
     src = torch.arange(N, dtype=torch.float32)
     dst = torch.empty(N, dtype=torch.float32)
     configs = [Config({"BLOCK_SIZE": 256}, num_warps=nw) for nw in (1, 2, 4, 8)]
 
-    tuner, _ = _make_tuner(configs, prune_configs_by={"artifact_config_prune": lambda c, asm, md: md.num_warps <= 2})
+    tuner, _ = _make_tuner(configs, prune_configs_by={"ir_config_prune": lambda c, asm, md: md.num_warps <= 2})
     tuner.run(dst, src, N=N, grid=(1, ))
 
     kept_warps = tuner.best_config.num_warps
     assert kept_warps <= 2
 
 
-def test_artifact_prune_all_pruned_raises():
+def test_ir_prune_all_pruned_raises():
     N = 1024
     src = torch.arange(N, dtype=torch.float32)
     dst = torch.empty(N, dtype=torch.float32)
-    tuner, _ = _make_tuner(_configs(), prune_configs_by={"artifact_config_prune": lambda c, asm, md: False})
-    with pytest.raises(AutotunerError, match="artifact pruning"):
+    tuner, _ = _make_tuner(_configs(), prune_configs_by={"ir_config_prune": lambda c, asm, md: False})
+    with pytest.raises(AutotunerError, match="IR pruning"):
         tuner.run(dst, src, N=N, grid=(1, ))
 
 
 def test_no_hooks_is_unchanged_behavior():
-    """When neither hook is set, the fastest config wins (baseline behavior)."""
+    """When no hook is set, the fastest config wins (baseline behavior)."""
     N = 1024
     src = torch.arange(N, dtype=torch.float32)
     dst = torch.empty(N, dtype=torch.float32)
     tuner, _ = _make_tuner(_configs())
     tuner.run(dst, src, N=N, grid=(1, ))
     assert _bs(tuner) == 256  # globally fastest, nothing pruned
-    assert tuner.correctness_results == {}
-    assert tuner.pruned_by_artifact == {}
+    assert tuner.pruned_by_ir == {}
 
 
 # ---------------------------------------------------------------------------
-# Static equivalence pruning (M1): keep only configs whose compiled artifact has
-# the SAME equivalence key as the reference (first) config. No kernel launch.
-# (The mock's equivalence key stands in for a real TTGIR reduction-order
-# signature; here we key on metadata.num_warps.)
+# GPU end-to-end tests (real Triton compile)
 # ---------------------------------------------------------------------------
-def test_equivalence_prune_keeps_reference_class():
-    N = 1024
-    src = torch.arange(N, dtype=torch.float32)
-    dst = torch.empty(N, dtype=torch.float32)
-    # First config (num_warps=4) is the reference order; a second num_warps=4 config is equivalent;
-    # num_warps 2 and 8 are different orders and must be pruned.
-    configs = [
-        Config({"BLOCK_SIZE": 256}, num_warps=4),
-        Config({"BLOCK_SIZE": 512}, num_warps=4),
-        Config({"BLOCK_SIZE": 256}, num_warps=2),
-        Config({"BLOCK_SIZE": 256}, num_warps=8),
-    ]
-    eq = lambda config, asm, md: md.num_warps  # stand-in equivalence key (real: reduction signature)
-    tuner, _ = _make_tuner(configs, prune_configs_by={"equivalence_fn": eq})
-    tuner.run(dst, src, N=N, grid=(1, ))
-
-    assert tuner.best_config.num_warps == 4  # winner is in the reference (num_warps=4) class
-    assert {c.num_warps for c in tuner.pruned_by_equivalence} == {2, 8}  # non-equivalent dropped
-    # equivalence_classes is {level: {key: [Config]}}; the equivalence_fn path uses the "custom" level.
-    assert len(tuner.equivalence_classes["custom"]) == 3  # keys seen: 4, 2, 8
-
-
-def test_equivalence_prune_all_same_key_keeps_all():
-    N = 1024
-    src = torch.arange(N, dtype=torch.float32)
-    dst = torch.empty(N, dtype=torch.float32)
-    configs = [Config({"BLOCK_SIZE": bs}, num_warps=4) for bs in (256, 512, 1024)]
-    tuner, _ = _make_tuner(configs, prune_configs_by={"equivalence_fn": lambda c, asm, md: md.num_warps})
-    tuner.run(dst, src, N=N, grid=(1, ))
-
-    assert tuner.pruned_by_equivalence == {}  # all share the reference order -> nothing pruned
-    assert len(tuner.equivalence_classes["custom"]) == 1
-    assert _bs(tuner) == 256  # fastest of the (entirely-kept) class
-
-
-# ---------------------------------------------------------------------------
-# Level-selectable equivalence: prune_configs_by={"equivalence_level": ...,
-# "equivalence_checkers": <registry>}. Choose ttgir / ptx / both (or a list);
-# multiple levels run as a two-stage pipeline. (Mock checkers stand in for the
-# real per-level signatures.)
-# ---------------------------------------------------------------------------
-def test_equivalence_level_ttgir_keeps_reference():
-    N = 1024
-    src = torch.arange(N, dtype=torch.float32)
-    dst = torch.empty(N, dtype=torch.float32)
-    configs = [
-        Config({"BLOCK_SIZE": 256}, num_warps=4),
-        Config({"BLOCK_SIZE": 512}, num_warps=4),
-        Config({"BLOCK_SIZE": 256}, num_warps=2),
-        Config({"BLOCK_SIZE": 256}, num_warps=8),
-    ]
-    registry = {"ttgir": lambda config, asm, md: md.num_warps}
-    tuner, _ = _make_tuner(configs, prune_configs_by={"equivalence_level": "ttgir", "equivalence_checkers": registry})
-    tuner.run(dst, src, N=N, grid=(1, ))
-
-    assert tuner.best_config.num_warps == 4
-    assert {c.num_warps for c in tuner.pruned_by_equivalence} == {2, 8}
-    assert len(tuner.equivalence_classes["ttgir"]) == 3
-
-
-def test_equivalence_level_two_stage_pipeline():
-    N = 1024
-    src = torch.arange(N, dtype=torch.float32)
-    dst = torch.empty(N, dtype=torch.float32)
-    # Stage l1 keys on num_warps; stage l2 keys on BLOCK_SIZE. Reference = first config (warps=4, bs=256).
-    configs = [
-        Config({"BLOCK_SIZE": 256}, num_warps=4, num_stages=2),  # reference (l1=4, l2=256)
-        Config({"BLOCK_SIZE": 256}, num_warps=4, num_stages=3),  # matches both -> kept
-        Config({"BLOCK_SIZE": 512}, num_warps=4, num_stages=2),  # l1 matches, l2 differs -> pruned at l2
-        Config({"BLOCK_SIZE": 256}, num_warps=2, num_stages=2),  # l1 differs -> pruned at l1
-    ]
-    registry = {
-        "l1": lambda config, asm, md: md.num_warps,
-        "l2": lambda config, asm, md: config.kwargs["BLOCK_SIZE"],
-    }
-    tuner, _ = _make_tuner(configs,
-                           prune_configs_by={"equivalence_level": ["l1", "l2"], "equivalence_checkers": registry})
-    tuner.run(dst, src, N=N, grid=(1, ))
-
-    assert tuner.best_config.num_warps == 4 and tuner.best_config.kwargs["BLOCK_SIZE"] == 256
-    # l1 pruned the num_warps=2 config; l2 pruned the BLOCK_SIZE=512 one.
-    reasons = {(c.num_warps, c.kwargs["BLOCK_SIZE"]): r for c, r in tuner.pruned_by_equivalence.items()}
-    assert reasons[(2, 256)].startswith("l1:")
-    assert reasons[(4, 512)].startswith("l2:")
-    assert set(tuner.equivalence_classes) == {"l1", "l2"}
-    assert len(tuner.equivalence_classes["l1"]) == 2  # num_warps 4 vs 2
-    assert len(tuner.equivalence_classes["l2"]) == 2  # among l1-survivors: bs 256 vs 512
-
-
-def test_equivalence_level_missing_in_registry_raises():
-    N = 1024
-    src = torch.arange(N, dtype=torch.float32)
-    dst = torch.empty(N, dtype=torch.float32)
-    # >1 config so the autotuner actually enters pruning (it skips tuning for a single config).
-    configs = [Config({"BLOCK_SIZE": 256}, num_warps=4), Config({"BLOCK_SIZE": 512}, num_warps=4)]
-    tuner, _ = _make_tuner(
-        configs, prune_configs_by={"equivalence_level": "ptx", "equivalence_checkers": {"ttgir": lambda c, a, m: 0}})
-    with pytest.raises(AutotunerError, match="not provided"):
-        tuner.run(dst, src, N=N, grid=(1, ))
-
-
-def test_equivalence_level_not_implemented_raises():
-    N = 1024
-    src = torch.arange(N, dtype=torch.float32)
-    dst = torch.empty(N, dtype=torch.float32)
-
-    def not_built(config, asm, metadata):
-        raise NotImplementedError("PTX-level not implemented yet")
-
-    configs = [Config({"BLOCK_SIZE": 256}, num_warps=4), Config({"BLOCK_SIZE": 512}, num_warps=4)]
-    tuner, _ = _make_tuner(configs,
-                           prune_configs_by={"equivalence_level": "ptx", "equivalence_checkers": {"ptx": not_built}})
-    with pytest.raises(AutotunerError, match="not available"):
-        tuner.run(dst, src, N=N, grid=(1, ))
-
-
-# ---------------------------------------------------------------------------
-# GPU end-to-end tests (real Triton compile + launch)
-# ---------------------------------------------------------------------------
-@triton.jit
-def _sum_kernel(src, dst, N, BLOCK_SIZE: tl.constexpr):
-    # Single-block partial sum: only correct when BLOCK_SIZE >= N.
-    offs = tl.arange(0, BLOCK_SIZE)
-    x = tl.load(src + offs, mask=offs < N, other=0.0)
-    tl.store(dst, tl.sum(x, axis=0))
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA GPU")
-def test_gpu_correctness_prune_partial_sum(device="cuda"):
-    N = 1024
-    src = torch.randn(N, device=device, dtype=torch.float32)
-    out = torch.empty(1, device=device, dtype=torch.float32)
-    ref = src.sum()
-
-    def correctness_fn(named):
-        # named["dst"] holds this config's output after one run.
-        return torch.allclose(named["dst"], ref, atol=1e-3, rtol=1e-3)
-
-    configs = [triton.Config({"BLOCK_SIZE": bs}) for bs in (256, 512, 1024, 2048)]
-
-    @triton.autotune(configs=configs, key=["N"], restore_value=["dst"], correctness_fn=correctness_fn,
-                     correctness_prune=True)
-    @triton.jit
-    def kernel(src, dst, N, BLOCK_SIZE: tl.constexpr):
-        offs = tl.arange(0, BLOCK_SIZE)
-        x = tl.load(src + offs, mask=offs < N, other=0.0)
-        tl.store(dst, tl.sum(x, axis=0))
-
-    kernel[(1, )](src, out, N)
-    # Winner must be a config that actually sums all N elements.
-    assert kernel.best_config.kwargs["BLOCK_SIZE"] >= N
-    results = {c.kwargs["BLOCK_SIZE"]: ok for c, ok in kernel.correctness_results.items()}
-    assert results[256] is False and results[1024] is True
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA GPU")
-def test_gpu_artifact_prune_on_real_ir(device="cuda"):
+def test_gpu_ir_prune_on_real_ir(device="cuda"):
     N = 1024
     src = torch.randn(N, device=device, dtype=torch.float32)
     out = torch.empty(1, device=device, dtype=torch.float32)
 
     seen = {}
 
-    def artifact_prune(config, asm, metadata):
+    def ir_prune(config, asm, metadata):
         # Real compiled artifacts must be present and inspectable.
         assert "ttgir" in asm and "ptx" in asm
         assert isinstance(asm["ttgir"], str) and len(asm["ttgir"]) > 0
@@ -389,7 +180,7 @@ def test_gpu_artifact_prune_on_real_ir(device="cuda"):
 
     configs = [triton.Config({"BLOCK_SIZE": 1024}, num_warps=nw) for nw in (1, 2, 4, 8)]
 
-    @triton.autotune(configs=configs, key=["N"], prune_configs_by={"artifact_config_prune": artifact_prune})
+    @triton.autotune(configs=configs, key=["N"], prune_configs_by={"ir_config_prune": ir_prune})
     @triton.jit
     def kernel(src, dst, N, BLOCK_SIZE: tl.constexpr):
         offs = tl.arange(0, BLOCK_SIZE)
@@ -398,14 +189,14 @@ def test_gpu_artifact_prune_on_real_ir(device="cuda"):
 
     kernel[(1, )](src, out, N)
     assert kernel.best_config.num_warps <= 4
-    dropped = {c.num_warps for c in kernel.pruned_by_artifact}
+    dropped = {c.num_warps for c in kernel.pruned_by_ir}
     assert 8 in dropped
     assert all(seen.values())  # every inspected TTGIR really contained IR text
 
 
 # ---------------------------------------------------------------------------
-# Blackwell-only T4 filters: AutoWS (TTGIR feature selection) and TMEM_LOAD
-# (TTGIR correctness prune). Both fire a real keep AND drop on one kernel.
+# Blackwell-only artifact filters: AutoWS (TTGIR feature selection) and TMEM_LOAD
+# (TTGIR op drop). Both fire a real keep AND drop on one kernel.
 # ---------------------------------------------------------------------------
 @triton.jit
 def _matmul_tma_ws(a_desc, b_desc, c_desc, M, N, K, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
@@ -455,7 +246,7 @@ def test_gpu_autows_keeps_warp_specialized(device="cuda"):
     # FLATTEN=False warp-specializes (kept); FLATTEN=True does not (dropped).
     configs = [triton.Config({"FLATTEN": flat}, num_warps=4, num_stages=2) for flat in (False, True)]
 
-    @triton.autotune(configs=configs, key=["M", "N", "K"], prune_configs_by={"artifact_config_prune": keep_ws})
+    @triton.autotune(configs=configs, key=["M", "N", "K"], prune_configs_by={"ir_config_prune": keep_ws})
     @triton.jit
     def kernel(a_desc, b_desc, c_desc, M, N, K, FLATTEN: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr, NUM_SMS: tl.constexpr):
@@ -468,11 +259,11 @@ def test_gpu_autows_keeps_warp_specialized(device="cuda"):
                      NUM_SMS=NUM_SMS)
 
     assert kernel.best_config.kwargs["FLATTEN"] is False  # the warp-specialized config won
-    assert {c.kwargs["FLATTEN"] for c in kernel.pruned_by_artifact} == {True}  # non-WS dropped
+    assert {c.kwargs["FLATTEN"] for c in kernel.pruned_by_ir} == {True}  # non-WS dropped
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="requires Blackwell (MMAv5/TMEM)")
-def test_gpu_tmem_load_correctness_prune(device="cuda"):
+def test_gpu_tmem_load_ir_prune(device="cuda"):
     M = N = K = 256
     BM = BN = 128
     BK = 64
@@ -487,7 +278,7 @@ def test_gpu_tmem_load_correctness_prune(device="cuda"):
     # PREC="ieee" -> FMA path -> no tmem_load (kept).
     configs = [triton.Config({"PREC": p}) for p in ("ieee", "tf32")]
 
-    @triton.autotune(configs=configs, key=["M", "N", "K"], prune_configs_by={"artifact_config_prune": drop_tmem_load})
+    @triton.autotune(configs=configs, key=["M", "N", "K"], prune_configs_by={"ir_config_prune": drop_tmem_load})
     @triton.jit
     def kernel(a_ptr, b_ptr, c_ptr, M, N, K, PREC: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                BLOCK_K: tl.constexpr):
@@ -507,4 +298,4 @@ def test_gpu_tmem_load_correctness_prune(device="cuda"):
     kernel[grid](a, b, c, M, N, K, BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK)
 
     assert kernel.best_config.kwargs["PREC"] == "ieee"  # no-tmem_load config won
-    assert {c.kwargs["PREC"] for c in kernel.pruned_by_artifact} == {"tf32"}  # tmem_load config dropped
+    assert {c.kwargs["PREC"] for c in kernel.pruned_by_ir} == {"tf32"}  # tmem_load config dropped

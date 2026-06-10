@@ -33,11 +33,11 @@ to `layout_numerics/`.
 ```bash
 # one example
 python bitequiv/examples/layout_numerics/b01_reduction_tree_from_layout.py
-# everything (both groups), one command
-bash bitequiv/reports/run_t2_examples.sh
+# the layout/numerics + pipeline examples (smoke-tested)
+pytest bitequiv/tests/
 ```
 
 Blackwell-only examples (`b03`, `b04`, and `compilation-pipeline/06`) self-skip on
-other hardware. The autotuner constraint-pruning examples (`correctness_fn` /
-artifact / equivalence pruning) are part of the separate T3/T4 work
-(`constraint_pruning_examples.py`).
+other hardware. The autotuner constraint-pruning examples (static artifact / IR
+equivalence pruning) live in `constraint_pruning_examples.py` and are registered as
+tests in `../tests/test_constraint_pruning.py`.
