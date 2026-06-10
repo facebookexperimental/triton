@@ -163,6 +163,7 @@ isTransparentDotUserBeforeConstraintMaterialization(Operation *op,
 class DotRewriteBackward
     : public SparseBackwardDataFlowAnalysis<DotRewriteLattice> {
 public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DotRewriteBackward)
   using SparseBackwardDataFlowAnalysis::SparseBackwardDataFlowAnalysis;
 
   void initializeEquivalentLatticeAnchor(Operation *top) override {
@@ -537,6 +538,7 @@ public:
 class DotConsumerBackward
     : public SparseBackwardDataFlowAnalysis<DotConsumerLattice> {
 public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DotConsumerBackward)
   using SparseBackwardDataFlowAnalysis::SparseBackwardDataFlowAnalysis;
 
   LogicalResult
