@@ -728,10 +728,9 @@ void TritonIntegerRangeAnalysis::visitRegionSuccessors(
         visitNonControlFlowArguments(branch, RegionSuccessor::parent(),
                                      nonSuccessorInputs,
                                      nonSuccessorInputLattices);
-      }
-      else {
+      } else {
         if (!inputs.empty())
-          firstIndex = cast<OpResult>(inputs.front()).getResultNumber();
+          firstIndex = cast<BlockArgument>(inputs.front()).getArgNumber();
         Region *region = point->getBlock()->getParent();
         SmallVector<Value> nonSuccessorInputs =
             branch.getNonSuccessorInputs(RegionSuccessor(region));
