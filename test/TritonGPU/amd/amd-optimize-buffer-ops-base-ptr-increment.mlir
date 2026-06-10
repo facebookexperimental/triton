@@ -119,10 +119,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 // CHECK-LABEL: isolated_pattern_nested_loop1
 // CHECK: [[X_OFFSET_CST:%.*]] = arith.constant dense<123>
 // CHECK: scf.for
-// CHECK:   scf.for {{.*}} iter_args([[X_OFFSET:%.*]] = [[X_OFFSET_CST]])
-// CHECK:     amdg.buffer_load {{.*}}{{\[}}[[X_OFFSET]]{{\]}}
+// CHECK:   scf.for {{.*}} iter_args([[X_OFFSET:%.*]] = [[X_OFFSET_CST]], [[BASE_PTR:%.*]] = {{.*}})
+// CHECK:     amdg.buffer_load [[BASE_PTR]]{{\[}}[[X_OFFSET_CST]]{{\]}}
 // CHECK:     [[NEXT_X_OFFSET:%.*]] = arith.addi [[X_OFFSET]]
-// CHECK:     scf.yield [[NEXT_X_OFFSET]]
+// CHECK:     [[NEXT_BASE_PTR:%.*]] = tt.addptr [[BASE_PTR]]
+// CHECK:     scf.yield [[NEXT_X_OFFSET]], [[NEXT_BASE_PTR]]
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
