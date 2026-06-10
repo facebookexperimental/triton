@@ -342,7 +342,10 @@ LLVM::LLVMFuncOp appendOrGetExternFuncOp(RewriterBase &rewriter, Operation *op,
                                          StringRef libname = "",
                                          StringRef libpath = "");
 
-// Multiply a square layout with 1 input and output dimension with a vector
+// Multiply a square layout with 1 input and output dimension with a vector.
+// Uses per-dim dispatch: NPOT dims use ADD-based accumulation, pow2 dims use
+// XOR. The caller extracts a sublayout per output dim, so isOutDimModular()
+// on the single out dim determines the algebra.
 Value matrixVectorProd(TritonLLVMOpBuilder &b, const LinearLayout &A, Value x);
 } // namespace gpu
 
@@ -576,7 +579,7 @@ SmallVector<Value> lowerLdSt(
         lowerInst,
     std::optional<Value> barrierPtr = {});
 
-// Lower local_load/local_store via ld.shared/st.shared
+// Lower local_load/local_store via ld.shared/st.shared.
 SmallVector<Value> lowerLocalLdSt(
     Location loc, MLIRContext *ctx,
     LinearLayout cvt,          // Map from registers to offset

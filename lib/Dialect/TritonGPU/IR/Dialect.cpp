@@ -319,12 +319,46 @@ SmallVector<int64_t> getAllocationShapePerCTA(Attribute layout,
       auto packedAxis = getOrder(sharedMMALayout, shapeLogical)[0];
       shape[packedAxis] *= 2;
     }
-    // For NPOT dims (e.g. M=144), nvmmaSharedToLinearLayout rounds to pow2
-    // internally. The allocation must cover the pow2-rounded size so MMA reps
-    // don't read past the buffer.
-    for (auto &d : shape) {
-      if (!llvm::isPowerOf2_64(d))
-        d = llvm::NextPowerOf2(d);
+    // Round NPOT dims to pow2 for allocation. The SMEM layout
+    // (nvmmaSharedToLinearLayout) uses pow2 internally for non-contiguous dims,
+    // and the allocation must match to prevent out-of-bounds accesses.
+    //
+    // Exception: the contiguous dim keeps its NPOT size when its byte size is
+    // a multiple of the swizzle width. In that case, nvmmaSharedToLinearLayout
+    // uses modular split-dim phases (modularIdentity1D) for the contiguous dim,
+    // so the layout's contiguous output dim size equals the NPOT value. The
+    // allocation must match to avoid wasting SMEM.
+    int rank = shape.size();
+    bool isTransposed = sharedMMALayout.getTransposed();
+    int contigDim = isTransposed ? 0 : rank - 1;
+    int elemBytes = sharedMMALayout.getElementBitWidth() / 8;
+    int swizzleBytes = sharedMMALayout.getSwizzlingByteWidth();
+    int64_t contigBytes = shape[contigDim] * elemBytes;
+    bool contigHasSplitDim = !llvm::isPowerOf2_64(shape[contigDim]) &&
+                             swizzleBytes > 0 &&
+                             contigBytes % swizzleBytes == 0;
+
+    for (size_t i = 0; i < shape.size(); i++) {
+      if (!llvm::isPowerOf2_64(shape[i])) {
+        if ((int)i == contigDim && contigHasSplitDim) {
+          // Contiguous dim with split-dim: allocation matches the modular
+          // layout size. No pow2 rounding needed.
+        } else {
+          shape[i] = llvm::NextPowerOf2(shape[i]);
+        }
+      }
+    }
+  }
+  // SwizzledSharedEncodingAttr: the XOR-based swizzle in toLinearLayout creates
+  // basis vectors for each row power-of-2 below the row count. The XOR
+  // composition of these bases spans a pow2-rounded offset space. For NPOT row
+  // dims, the offset space exceeds the NPOT allocation, causing OOB writes.
+  // Round NPOT dims to pow2 to match the swizzle's address range.
+  if (isa<SwizzledSharedEncodingAttr>(layout)) {
+    for (size_t i = 0; i < shape.size(); i++) {
+      if (!llvm::isPowerOf2_64(shape[i])) {
+        shape[i] = llvm::NextPowerOf2(shape[i]);
+      }
     }
   }
   return getShapePerCTA(layout, shape);
@@ -1246,11 +1280,6 @@ LinearLayout LinearEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
 
 SmallVector<unsigned>
 LinearEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape) const {
-  // When broadcasting the layout the shape changes, otherwise the shape is
-  // the same as the shape of the tensor
-  // We can either have BroadcastOp with SameOperandsAndResultEncoding, or keep
-  // the invariant that the shape of the LL is that of the tensor
-  // We choose the former for BC
   auto scaledLayout = get(getContext(), toLinearLayout(shape));
   auto kRegister = StringAttr::get(getContext(), "register");
   return scaledLayout.basesPerDim(kRegister, /*skipBroadcast=*/false);

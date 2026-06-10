@@ -7,6 +7,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/AllocateSharedMemoryUtility.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LayoutUtils.h"
@@ -52,8 +53,25 @@ static unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
   auto *ctx = srcTy.getContext();
   auto srcLayout = triton::gpu::toLinearLayout(srcTy);
   auto dstLayout = triton::gpu::toLinearLayout(dstTy);
-  srcLayout = actionRemoveBroadcastedRegs(srcLayout).apply(srcLayout);
-  dstLayout = actionRemoveBroadcastedRegs(dstLayout).apply(dstLayout);
+  // For NPOT layouts, the nvidia-specific swizzling path returns failure()
+  // and the base class ConvertLayoutOpConversion handles it. The base class
+  // uses unfoldModularDims + optimalSwizzlingLdSt. Unfold BEFORE removing
+  // broadcasts to match the lowering order: a register basis like [0, N]
+  // is all-zero in the modular layout (N % N == 0) but non-zero after
+  // unfolding (N != 0 in pow2 space). Removing broadcasts first would
+  // discard such bases, producing a smaller SMEM allocation than the
+  // lowering actually uses, causing SMEM OOB.
+  if (srcLayout.isModular()) {
+    srcLayout = unfoldModularDimsForAlloc(srcLayout);
+    dstLayout = unfoldModularDimsForAlloc(dstLayout);
+    srcLayout = actionRemoveBroadcastedRegs(srcLayout).apply(srcLayout);
+    dstLayout = actionRemoveBroadcastedRegs(dstLayout).apply(dstLayout);
+    auto bitwidth = getBitwidth(srcTy);
+    auto smem =
+        triton::gpu::optimalSwizzlingLdSt(srcLayout, dstLayout, bitwidth);
+    auto reps = smem.getInDimSize(StringAttr::get(ctx, "reps"));
+    return smem.getTotalOutDimSizeProduct() / reps;
+  }
   auto bitwidth = getBitwidth(srcTy);
   auto [srcTiles, dstTiles] = gpu::getSrcDstTiles(targetInfo, bitwidth);
   auto [smem, _] = triton::gpu::optimalSwizzling(srcLayout, dstLayout, srcTiles,
@@ -68,6 +86,16 @@ getNvidiaAllocationAnalysisScratchSizeFn(TargetInfoBase &targetInfo) {
     if (auto cvtOp = dyn_cast<triton::gpu::ConvertLayoutOp>(op)) {
       auto srcTy = cvtOp.getSrc().getType();
       auto dstTy = cvtOp.getType();
+      if (hasNpotShape(srcTy) || hasNpotShape(dstTy)) {
+        // For NPOT shapes, compute the allocation consistently with the
+        // lowering path. If both encodings are NPOT-safe, we can use the
+        // standard swizzled path. Otherwise, unfold modular dims to pow2,
+        // then compute the swizzled SMEM layout size.
+        if (!cvtNeedsSharedMemory(srcTy, dstTy))
+          return 0;
+        auto elems = getNumScratchElemsSwizzledCvt(srcTy, dstTy, targetInfo);
+        return elems * getBitwidth(srcTy) / 8;
+      }
       if (!cvtNeedsSharedMemory(srcTy, dstTy))
         return 0;
       // In cuda we always swizzle
