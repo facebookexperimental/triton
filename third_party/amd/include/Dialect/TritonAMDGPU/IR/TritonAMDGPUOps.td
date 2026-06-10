@@ -808,7 +808,7 @@ def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local",
 
 def AsyncTDMGroupCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_group_copy_global_to_local", [
     AttrSizedOperandSegments,
-    MemoryEffects<[MemRead<GlobalMemory>, MemWrite<SharedMemory>]>
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
 ]> {
   let summary = "N-way grouped TDM copy from global memory to local memory";
 

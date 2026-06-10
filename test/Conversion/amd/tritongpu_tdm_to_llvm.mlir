@@ -57,6 +57,34 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 // -----
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [64, 64]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: tdm_group_reuse_membar
+  tt.func public @tdm_group_reuse_membar(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    %c_shape = arith.constant 128 : i32
+    %c_stride0 = arith.constant 128 : i64
+    %c_stride1 = arith.constant 1 : i64
+    %c0 = arith.constant 0 : i32
+    %c64 = arith.constant 64 : i32
+    %c_pred = arith.constant 1 : i32
+    %desc = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : !tt.ptr<f16>, !tt.tensordesc<64x64xf16, #shared>
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    // CHECK: "llvm.amdgcn.tensor.load.to.lds"
+    %tok0 = "amdg.async_tdm_group_copy_global_to_local"(%desc, %c0, %c0, %buf, %c_pred) <{cache = 1 : i32, operandSegmentSizes = array<i32: 1, 2, 1, 1>, rank = 2 : i32, warp_masks = array<i32: 15>}> : (!tt.tensordesc<64x64xf16, #shared>, i32, i32, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, i32) -> !ttg.async.token
+    %wait0 = amdg.async_tdm_wait %tok0 {num = 0 : i32}
+    %data = ttg.local_load %buf : !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> tensor<64x64xf16, #blocked>
+    // CHECK: rocdl.s.wait.dscnt 0
+    // CHECK-NEXT: rocdl.s.barrier
+    // CHECK: "llvm.amdgcn.tensor.load.to.lds"
+    %tok1 = "amdg.async_tdm_group_copy_global_to_local"(%desc, %c0, %c64, %buf, %c_pred) <{cache = 1 : i32, operandSegmentSizes = array<i32: 1, 2, 1, 1>, rank = 2 : i32, warp_masks = array<i32: 15>}> : (!tt.tensordesc<64x64xf16, #shared>, i32, i32, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, i32) -> !ttg.async.token
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
