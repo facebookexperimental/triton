@@ -282,107 +282,67 @@ def mxgemm_tdm_pipelined_kernel(
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     tl.assume(K_ITERS > 0)
 
-    if K_ITERS < NUM_BUFFERS:
-        for _ in tl.range(0, K_ITERS):
-            load_idx = _mxgemm_issue_tdm_loads_unpredicated(
-                a_desc,
-                b_desc,
-                a_scale_desc,
-                b_scale_desc,
-                a_buf,
-                b_buf,
-                a_scale_buf,
-                b_scale_buf,
-                load_idx,
-                load_idx,
-                BLOCK_K_PACKED_A,
-                BLOCK_K_PACKED_B,
-                BLOCK_K_SCALE_PRESHUFFLED,
-                NUM_BUFFERS,
-                TRANSPOSE_B,
-            )
-            tlx.async_amd_descriptor_wait(0)
-            a, b, scale_a, scale_b = _mxgemm_load_operands(
-                a_buf,
-                b_buf,
-                a_scale_buf,
-                b_scale_buf,
-                wmma_idx,
-                BLOCK_M,
-                BLOCK_N,
-                BLOCK_K_SCALE,
-                BLOCK_M_PRESHUFFLED,
-                BLOCK_N_PRESHUFFLED,
-                BLOCK_K_SCALE_PRESHUFFLED,
-                SCALE_KWIDTH,
-                NUM_BUFFERS,
-                TRANSPOSE_B,
-            )
-            wmma_idx += 1
-            acc = tlx.dot_scaled(a, scale_a, DTYPE_A, b, scale_b, DTYPE_B, acc, tiles_per_warp=[2, 2])
-    else:
-        tl.assume(K_ITERS >= NUM_BUFFERS)
-        epilogue_lb = K_ITERS - (NUM_BUFFERS - 1)
+    epilogue_lb = K_ITERS - (NUM_BUFFERS - 1)
 
-        for _ in tl.static_range(NUM_BUFFERS - 1):
-            load_idx = _mxgemm_issue_tdm_loads_unpredicated(
-                a_desc,
-                b_desc,
-                a_scale_desc,
-                b_scale_desc,
-                a_buf,
-                b_buf,
-                a_scale_buf,
-                b_scale_buf,
-                load_idx,
-                load_idx,
-                BLOCK_K_PACKED_A,
-                BLOCK_K_PACKED_B,
-                BLOCK_K_SCALE_PRESHUFFLED,
-                NUM_BUFFERS,
-                TRANSPOSE_B,
-            )
+    for _ in tl.static_range(NUM_BUFFERS - 1):
+        load_idx = _mxgemm_issue_tdm_loads_unpredicated(
+            a_desc,
+            b_desc,
+            a_scale_desc,
+            b_scale_desc,
+            a_buf,
+            b_buf,
+            a_scale_buf,
+            b_scale_buf,
+            load_idx,
+            load_idx,
+            BLOCK_K_PACKED_A,
+            BLOCK_K_PACKED_B,
+            BLOCK_K_SCALE_PRESHUFFLED,
+            NUM_BUFFERS,
+            TRANSPOSE_B,
+        )
 
-        for i in tl.range(0, K_ITERS):
-            pred = i - epilogue_lb
-            pred = (pred >> 31) & 1
-            load_idx = _mxgemm_issue_tdm_loads(
-                a_desc,
-                b_desc,
-                a_scale_desc,
-                b_scale_desc,
-                a_buf,
-                b_buf,
-                a_scale_buf,
-                b_scale_buf,
-                load_idx,
-                wmma_idx + NUM_BUFFERS - 1,
-                pred,
-                BLOCK_K_PACKED_A,
-                BLOCK_K_PACKED_B,
-                BLOCK_K_SCALE_PRESHUFFLED,
-                NUM_BUFFERS,
-                TRANSPOSE_B,
-            )
-            tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * NUM_LOADS_IN_BATCH)
-            a, b, scale_a, scale_b = _mxgemm_load_operands(
-                a_buf,
-                b_buf,
-                a_scale_buf,
-                b_scale_buf,
-                wmma_idx,
-                BLOCK_M,
-                BLOCK_N,
-                BLOCK_K_SCALE,
-                BLOCK_M_PRESHUFFLED,
-                BLOCK_N_PRESHUFFLED,
-                BLOCK_K_SCALE_PRESHUFFLED,
-                SCALE_KWIDTH,
-                NUM_BUFFERS,
-                TRANSPOSE_B,
-            )
-            wmma_idx += 1
-            acc = tlx.dot_scaled(a, scale_a, DTYPE_A, b, scale_b, DTYPE_B, acc, tiles_per_warp=[2, 2])
+    for i in tl.range(0, K_ITERS):
+        pred = i - epilogue_lb
+        pred = (pred >> 31) & 1
+        load_idx = _mxgemm_issue_tdm_loads(
+            a_desc,
+            b_desc,
+            a_scale_desc,
+            b_scale_desc,
+            a_buf,
+            b_buf,
+            a_scale_buf,
+            b_scale_buf,
+            load_idx,
+            wmma_idx + NUM_BUFFERS - 1,
+            pred,
+            BLOCK_K_PACKED_A,
+            BLOCK_K_PACKED_B,
+            BLOCK_K_SCALE_PRESHUFFLED,
+            NUM_BUFFERS,
+            TRANSPOSE_B,
+        )
+        tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * NUM_LOADS_IN_BATCH)
+        a, b, scale_a, scale_b = _mxgemm_load_operands(
+            a_buf,
+            b_buf,
+            a_scale_buf,
+            b_scale_buf,
+            wmma_idx,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K_SCALE,
+            BLOCK_M_PRESHUFFLED,
+            BLOCK_N_PRESHUFFLED,
+            BLOCK_K_SCALE_PRESHUFFLED,
+            SCALE_KWIDTH,
+            NUM_BUFFERS,
+            TRANSPOSE_B,
+        )
+        wmma_idx += 1
+        acc = tlx.dot_scaled(a, scale_a, DTYPE_A, b, scale_b, DTYPE_B, acc, tiles_per_warp=[2, 2])
 
     tl.store(c_ptrs, acc, mask=c_mask)
 
