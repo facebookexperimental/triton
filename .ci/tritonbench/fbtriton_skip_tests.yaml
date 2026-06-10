@@ -45,8 +45,6 @@ decoding_attention:
 # TypeError: failed to specialize argument of type: KernelParamWrapper
 fp8_gemm_rowwise:
   report: true
-  channels:
-    - triton-main
 # TODO: embedding, flash_attention will segfault on hip
 embedding:
   report: true
