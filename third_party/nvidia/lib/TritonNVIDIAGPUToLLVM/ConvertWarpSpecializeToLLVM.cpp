@@ -76,8 +76,7 @@ public:
     if (numThreads == 32) {
       LLVM::NVIDIA::createSyncWarp(b.getLoc(), b);
     } else {
-      NVVM::BarrierOp::create(b, b.getLoc(), TypeRange{}, handle,
-                              b.i32_val(numThreads));
+      NVVM::BarrierOp::create(b, b.getLoc(), handle, b.i32_val(numThreads));
     }
   }
 
