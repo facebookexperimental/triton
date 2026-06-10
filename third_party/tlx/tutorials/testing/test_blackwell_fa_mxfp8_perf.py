@@ -29,9 +29,9 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 # Facebook: If you are developing in fbsource, use tritonbench instead to collect perf numbers.
 
 
-def _setup_bwd_inputs(shape, sm_scale, dtype):
+def _setup_bwd_inputs(shape, sm_scale, dtype, causal=False):
     Z, H, N_CTX, HEAD_DIM = shape
-    (q, q_scale, q_ref), (k, k_scale, k_ref), (v, v_scale, v_ref) = generate_attention_inputs(shape, DEVICE, dtype)
+    (q, q_scale, q_ref), (k, k_scale, k_ref), (v, v_scale, v_ref) = (generate_attention_inputs(shape, DEVICE, dtype))
 
     q_dk, q_scale_dk = _quantize_mxfp8_bwd_operand(q_ref, dtype, transpose_for_reduction=True)
     k_dq, k_scale_dq = _quantize_mxfp8_bwd_operand(k_ref, dtype, transpose_for_reduction=True)
@@ -90,7 +90,7 @@ def _setup_bwd_inputs(shape, sm_scale, dtype):
         desc_v_scale,
         N_CTX=N_CTX,
         HEAD_DIM=HEAD_DIM,
-        STAGE=1,
+        STAGE=3 if causal else 1,
         num_stages=1,
         num_warps=4,
         **fwd_config,
@@ -117,7 +117,7 @@ def _setup_bwd_inputs(shape, sm_scale, dtype):
     }
 
 
-def create_benchmark(mode="fwd"):
+def create_benchmark(mode="fwd", causal=False):
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
@@ -127,8 +127,8 @@ def create_benchmark(mode="fwd"):
             line_vals=["ws_pipelined_persistent_mxfp8"],
             line_names=["ws_pipelined_persistent_mxfp8"],
             ylabel="TFLOPS",
-            plot_name=f"flash-attention-{mode}-performance-mxfp8-d128",
-            args={"BATCH": 4, "H": 32, "HEAD_DIM": 128, "causal": False},
+            plot_name=f"flash-attention-{mode}-performance-mxfp8-d128-{'causal' if causal else 'noncausal'}",
+            args={"BATCH": 4, "H": 32, "HEAD_DIM": 128, "causal": causal},
         ))
     def benchmark(BATCH, H, N_CTX, HEAD_DIM, causal, provider):
         shape = (BATCH, H, N_CTX, HEAD_DIM)
@@ -137,7 +137,7 @@ def create_benchmark(mode="fwd"):
         dtype = torch.float8_e4m3fn
 
         if mode == "bwd":
-            bwd = _setup_bwd_inputs(shape, sm_scale, dtype)
+            bwd = _setup_bwd_inputs(shape, sm_scale, dtype, causal=causal)
             fn = lambda: _attention_bwd_mxfp8(
                 bwd["do_fp8"],
                 bwd["do_fp8_dv"],
@@ -157,9 +157,10 @@ def create_benchmark(mode="fwd"):
                 bwd["do_scale_dv"],
                 sm_scale,
                 do_bf16=bwd["do_bf16"],
+                causal=causal,
             )
         else:
-            (q, q_scale, _), (k, k_scale, _), (v, v_scale, _) = generate_attention_inputs(shape, DEVICE, dtype)
+            (q, q_scale, _), (k, k_scale, _), (v, v_scale, _) = (generate_attention_inputs(shape, DEVICE, dtype))
             fn = lambda: _attention_ws_pipelined_persistent_mxfp8(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal)
 
         ms, min_ms, max_ms = triton.testing.do_bench(
@@ -190,11 +191,17 @@ if __name__ == "__main__":
         choices=["fwd", "bwd"],
         help="Benchmark forward or backward pass (default: fwd)",
     )
+    parser.add_argument(
+        "--causal",
+        action="store_true",
+        help="Benchmark the causal variant (default: non-causal)",
+    )
     args = parser.parse_args()
 
     if is_blackwell():
-        print(f"Running MXFP8 flash attention {args.mode} benchmark")
-        benchmark = create_benchmark(mode=args.mode)
+        kind = "causal" if args.causal else "non-causal"
+        print(f"Running MXFP8 flash attention {args.mode} {kind} benchmark")
+        benchmark = create_benchmark(mode=args.mode, causal=args.causal)
         benchmark.run(print_data=True)
     else:
         print("Skipping benchmarks, no Blackwell GPU found.")

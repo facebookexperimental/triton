@@ -1338,6 +1338,19 @@ mxfp8_bwd_configs = [
 
 
 @triton.jit
+def _get_bwd_start_m(pid, BLOCK_N1, STAGE: tl.constexpr):
+    # Backward sweeps query (M) blocks for a fixed key/value (N) tile.
+    # Causal (STAGE == 3): a key block at position start_n = pid * BLOCK_N1 only
+    # receives gradient from query blocks at m >= start_n, so the sweep starts at
+    # the diagonal (start_m == start_n). Non-causal (STAGE == 1): full sweep.
+    if STAGE == 3:
+        return pid * BLOCK_N1
+    else:
+        tl.static_assert(STAGE == 1)
+        return 0
+
+
+@triton.jit
 def _softmax_recompute_quantization_iter(
     blk_idx,
     qk_scale,
@@ -1372,6 +1385,9 @@ def _softmax_recompute_quantization_iter(
     REP_N: tl.constexpr,
     REP_M: tl.constexpr,
     DS_NUM_SUBS: tl.constexpr,
+    curr_m,
+    start_n,
+    MASK: tl.constexpr,
 ):
     DS_M_SUB: tl.constexpr = BLOCK_M1 // DS_NUM_SUBS
     _, tmem_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
@@ -1395,6 +1411,14 @@ def _softmax_recompute_quantization_iter(
     # Clamp to prevent FP32 overflow downstream in P*dP
     qkT_scaled = tl.minimum(qkT_scaled, 20.0)
     pT = tl.math.exp2(qkT_scaled)
+
+    # Causal mask for the diagonal block: pT is [N, M] (transposed), so zero out
+    # entries where the query position is before the key position (m < n).
+    if MASK:
+        offs_m = curr_m + tl.arange(0, BLOCK_M1)
+        offs_n = start_n + tl.arange(0, BLOCK_N1)
+        causal_mask = offs_m[None, :] >= offs_n[:, None]
+        pT = tl.where(causal_mask, pT, 0.0)
 
     # Quantize P^T -> TMEM with fixed pow2 scale.
     # P = exp2(QK·scale - m) ∈ [0, 1], so a fixed E8M0 scale works for all
@@ -1531,6 +1555,7 @@ def _attn_bwd_mxf8_ws(
     DQ_REDUCE_NCOL: tl.constexpr,
     M_STAGE: tl.constexpr,
     D_STAGE: tl.constexpr,
+    STAGE: tl.constexpr = 1,
 ) -> None:
     tl.static_assert(HEAD_DIM == 128)
     tl.static_assert(BLOCK_N1 == 128)
@@ -1560,11 +1585,14 @@ def _attn_bwd_mxf8_ws(
 
     qk_scale = sm_scale * 1.44269504  # sm_scale / ln(2) for exp2
 
-    # Tile decomposition (dense, non-causal):
+    # Tile decomposition:
     #   tile_idx -> (off_z, off_h, pid)
     #   pid = N-block index within (z, h)
+    # Each N-tile sweeps query (M) blocks from start_m to N_CTX. For non-causal
+    # (STAGE == 1) start_m is 0 (full sweep); for causal (STAGE == 3) start_m is
+    # the diagonal (pid * BLOCK_N1). num_steps is therefore computed per-tile
+    # inside each partition once pid is known.
     n_tile_num = N_CTX // BLOCK_N1
-    num_steps = N_CTX // BLOCK_M1  # full M sweep per N-tile
     prog_id = tl.program_id(0)
     num_progs = tl.num_programs(0)
     total_tiles = n_tile_num * Z * H
@@ -1946,6 +1974,12 @@ def _attn_bwd_mxf8_ws(
                 start_n = pid * BLOCK_N1
                 base_q = (off_z * H + off_h).to(tl.int64) * N_CTX
 
+                # Causal: sweep query blocks from the diagonal. The first
+                # (diagonal) block is masked; the rest are fully below it.
+                start_m = _get_bwd_start_m(pid, BLOCK_N1, STAGE)
+                num_steps = (N_CTX - start_m) // BLOCK_M1
+                curr_m = start_m
+
                 # Prologue: produce P for the first M-block.
                 # Call _softmax_recompute_quantization_iter with
                 # p_scale_tmem_prologue
@@ -1983,8 +2017,12 @@ def _attn_bwd_mxf8_ws(
                     REP_N,
                     REP_M,
                     DS_NUM_SUBS,
+                    curr_m,
+                    start_n,
+                    STAGE == 3,
                 )
                 blk_idx += 1
+                curr_m += BLOCK_M1
 
                 for _ in range(1, num_steps):
                     # Call _softmax_recompute_quantization_iter with
@@ -2023,8 +2061,12 @@ def _attn_bwd_mxf8_ws(
                         REP_N,
                         REP_M,
                         DS_NUM_SUBS,
+                        curr_m,
+                        start_n,
+                        False,
                     )
                     blk_idx += 1
+                    curr_m += BLOCK_M1
 
                 # Epilogue: dK / dV TMA store
                 kv_buf_id, kv_phase = get_bufidx_phase(_i, NUM_BUFFERS_KV)
@@ -2086,9 +2128,13 @@ def _attn_bwd_mxf8_ws(
                 off_seq_h = tile_idx // n_tile_num
                 off_z = off_seq_h // H
                 off_h = off_seq_h % H
+                pid = tile_idx % n_tile_num
                 base_q = (off_z * H + off_h).to(tl.int64) * N_CTX
 
-                curr_m = 0
+                # Causal: dQ is only produced for query blocks at m >= start_n.
+                start_m = _get_bwd_start_m(pid, BLOCK_N1, STAGE)
+                num_steps = (N_CTX - start_m) // BLOCK_M1
+                curr_m = start_m
                 for _ in range(num_steps):
                     _, tmem_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
                     tlx.barrier_wait(dq_fulls[0], tmem_phase)
@@ -2130,6 +2176,10 @@ def _attn_bwd_mxf8_ws(
             blk_idx = 0
             for _i in range(tiles_per_sm):
                 kv_buf_id, kv_phase = get_bufidx_phase(_i, NUM_BUFFERS_KV)
+                # Causal: fewer query (M) blocks per N-tile (diagonal onward).
+                pid = tile_idx % n_tile_num
+                start_m = _get_bwd_start_m(pid, BLOCK_N1, STAGE)
+                num_steps = (N_CTX - start_m) // BLOCK_M1
                 # --- Prolog: first M-block ---
                 q_buf_id, q_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
                 do_buf_id, do_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
@@ -2439,9 +2489,13 @@ def _attn_bwd_mxf8_ws(
                 sf_off_seq_h = off_seq_h.to(tl.int32)
                 kv_scale_n = pid * REP_N
 
+                # Causal: load query (M) tiles from the diagonal block onward.
+                start_m = _get_bwd_start_m(pid, BLOCK_N1, STAGE)
+                num_steps = (N_CTX - start_m) // BLOCK_M1
+
                 # Load K data + scale and first Q + scale
                 # Share 1 barrier.
-                curr_m = 0
+                curr_m = start_m
                 q_buf_id, q_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
                 q_scale_m = (curr_m // 128) * REP_M
                 # Share this barrier to signify K empty
@@ -2710,6 +2764,7 @@ def attention_bwd(
     do_dv_scale,
     sm_scale,
     do_bf16=None,
+    causal=False,
 ):
     """MXFP8 attention backward.
 
@@ -2729,10 +2784,12 @@ def attention_bwd(
 
     Returns (dQ, dK, dV) with dQ in FP32, dK / dV in BF16.
 
-    Non-causal only. Assumes N_CTX is a multiple of 128.
+    Supports causal masking via `causal` (each key block only receives gradient
+    from query blocks at or below the diagonal). Assumes N_CTX is a multiple of
+    128.
     """
-    assert q.shape == q_dk.shape == k.shape == k_dq.shape == v.shape == do.shape, (
-        "Q, Q_dK, K, K_dQ, V, dO must have the same shape")
+    assert (q.shape == q_dk.shape == k.shape == k_dq.shape == v.shape ==
+            do.shape), "Q, Q_dK, K, K_dQ, V, dO must have the same shape"
     Z, H, N_CTX, HEAD_DIM = q.shape
     assert HEAD_DIM == 128, "this kernel only supports HEAD_DIM = 128"
     assert N_CTX % 128 == 0, "N_CTX must be a multiple of 128 (BLOCK_M1)"
@@ -2795,8 +2852,17 @@ def attention_bwd(
 
     def grid(meta):
         total_tiles = triton.cdiv(N_CTX, meta["BLOCK_N1"]) * Z * H
+        # The persistent pipeline (single-buffered, blk_idx-keyed ring buffers)
+        # assumes a constant per-tile M-block count. Causal makes num_steps vary
+        # per N-tile (and reach 1), which desyncs the cross-tile barrier phases
+        # of a persistent program. Run causal non-persistently (one N-tile per
+        # program, tiles_per_sm == 1) so there is no cross-tile continuation —
+        # matching the non-persistent backward grid of the base BF16 kernel.
+        # TODO: support persistent causal by keying the per-tile barriers off a
+        # running block counter instead of the tile index.
+        n_progs = total_tiles if causal else min(NUM_SMS, total_tiles)
         return (
-            min(NUM_SMS, total_tiles),
+            n_progs,
             1,
             1,
         )
@@ -2828,6 +2894,7 @@ def attention_bwd(
         HEAD_DIM=HEAD_DIM,
         M_STAGE=2,
         D_STAGE=2,
+        STAGE=3 if causal else 1,
     )
     return dq, dk, dv
 
@@ -2880,8 +2947,8 @@ class _attention(torch.autograd.Function):
             strides=[1],
             block_shape=[1],
         )
-        assert k_scale is not None and v_scale is not None and q_scale is not None, (
-            "All scales must be provided for MXFP8")
+        assert (k_scale is not None and v_scale is not None
+                and q_scale is not None), "All scales must be provided for MXFP8"
         dummy_block_shape = [1, 1, 1, 1, 1]
         desc_q_scale = TensorDescriptor.from_tensor(q_scale, block_shape=dummy_block_shape)
         desc_k_scale = TensorDescriptor.from_tensor(k_scale, block_shape=dummy_block_shape)
