@@ -714,7 +714,7 @@ void TritonIntegerRangeAnalysis::visitRegionSuccessors(
     assert(inputs.size() == operands->size() &&
            "expected the same number of successor inputs as operands");
 
-    auto valueToLattices = [&](Value v) { return getLatticeElement(v); };           
+    auto valueToLattices = [&](Value v) { return getLatticeElement(v); };
     unsigned firstIndex = 0;
     if (inputs.size() != lattices.size()) {
       if (!point->isBlockStart()) {

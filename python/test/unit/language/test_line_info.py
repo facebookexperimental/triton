@@ -3,9 +3,6 @@ import subprocess
 import tempfile
 
 import pytest
-from python.test.unit.instrumentation.test_gpuhello import func
-from python.test.unit.instrumentation.test_gpuhello import func
-from python.test.unit.runtime.test_cache import kernel
 import torch
 
 import triton

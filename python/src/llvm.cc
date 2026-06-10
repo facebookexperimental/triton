@@ -646,7 +646,8 @@ void init_triton_llvm(py::module &&m) {
       "optimize_module",
       [](llvm::Module *mod, const llvm::OptimizationLevel &opt,
          std::string arch, std::string features, std::vector<std::string> flags,
-         bool enable_fp_fusion, bool disable_vector_combine, bool disable_slp_vectorizer) {
+         bool enable_fp_fusion, bool disable_vector_combine,
+         bool disable_slp_vectorizer) {
         if (mlir::triton::tools::getBoolEnv("DISABLE_LLVM_OPT"))
           return;
         // Check to see if we are passing a list of flags to disable
