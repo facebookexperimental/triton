@@ -610,8 +610,7 @@ void init_triton_llvm(py::module &&m) {
   m.attr("OPTIMIZE_O1") = llvm::OptimizationLevel::O1;
   m.attr("OPTIMIZE_O2") = llvm::OptimizationLevel::O2;
   m.attr("OPTIMIZE_O3") = llvm::OptimizationLevel::O3;
-  m.attr("OPTIMIZE_Os") = llvm::OptimizationLevel::Os;
-  m.attr("OPTIMIZE_Oz") = llvm::OptimizationLevel::Oz;
+  // Os and Oz were removed from llvm::OptimizationLevel in LLVM 20+
 
   m.def(
       "to_module",
@@ -647,7 +646,8 @@ void init_triton_llvm(py::module &&m) {
       "optimize_module",
       [](llvm::Module *mod, const llvm::OptimizationLevel &opt,
          std::string arch, std::string features, std::vector<std::string> flags,
-         bool enable_fp_fusion, bool disable_vector_combine) {
+         bool enable_fp_fusion, bool disable_vector_combine,
+         bool disable_slp_vectorizer) {
         if (mlir::triton::tools::getBoolEnv("DISABLE_LLVM_OPT"))
           return;
         // Check to see if we are passing a list of flags to disable
@@ -707,7 +707,7 @@ void init_triton_llvm(py::module &&m) {
         // applies some scheduling that helps performance in some cases. We
         // should work on using NVPTX target instead and address the performance
         // regressions with some scheduling solution.
-        tuningOptions.SLPVectorization = true;
+        tuningOptions.SLPVectorization = !disable_slp_vectorizer;
 
         std::string pluginFile =
             mlir::triton::tools::getStrEnv("LLVM_PASS_PLUGIN_PATH");
@@ -774,6 +774,7 @@ void init_triton_llvm(py::module &&m) {
       py::arg("flags") = std::vector<std::string>{},
       py::arg("enable_fp_fusion") = false,
       py::arg("disable_vector_combine") = false,
+      py::arg("disable_slp_vectorizer") = false,
       py::call_guard<py::gil_scoped_release>());
 
   m.def(
