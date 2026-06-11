@@ -379,20 +379,21 @@ def _attn_tile(
     stride_ok,
     N_CTX_Q,
     N_CTX_K,
+    DIAG_OFFSET,
     QK_SCALE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
-    DIAG_OFFSET: tl.constexpr,
     EVEN_N: tl.constexpr,
 ):
     """Compute one output m-tile — causal (peeled mask) or non-causal (full).
 
     Supports `q_len != kv_len` (cross-attention / decode). Query row `qpos`
     attends key `kpos` iff `kpos <= qpos + DIAG_OFFSET`, where
-    `DIAG_OFFSET = kv_len - q_len` (PyTorch SDPA bottom-right alignment).
-    `DIAG_OFFSET == 0` is the square self-attention case.
+    `DIAG_OFFSET = kv_len - q_len` (bottom-right alignment). `DIAG_OFFSET == 0`
+    is the square self-attention case. It is a *runtime* scalar (not constexpr)
+    so changing sequence lengths does not trigger a recompile.
 
     Causal: K blocks fully below the diagonal need *no* mask; only the diagonal
     band does. We run an unmasked steady-state loop (FMA-friendly softmax, no
@@ -533,12 +534,12 @@ def _attn_fwd_persistent(
     H,
     N_CTX_Q,
     N_CTX_K,
+    DIAG_OFFSET,
     sm_scale: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
-    DIAG_OFFSET: tl.constexpr,
     NUM_M_BLOCKS: tl.constexpr,
     TILES_PER_UNIT: tl.constexpr,
     NUM_SMS: tl.constexpr,
@@ -605,8 +606,8 @@ def _attn_fwd_persistent(
                     pid_m = tl.where(idx % 2 == 0, half, NUM_M_BLOCKS - 1 - half)
                     _attn_tile(pid_m, q_off, k_off, v_off, o_off, Q, K, V, Out, k_buf, v_buf, stride_qm, stride_qk,
                                stride_kn, stride_kk, stride_vn, stride_vk, stride_om, stride_ok, N_CTX_Q, N_CTX_K,
-                               QK_SCALE=QK_SCALE, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM,
-                               IS_CAUSAL=IS_CAUSAL, DIAG_OFFSET=DIAG_OFFSET, EVEN_N=EVEN_N)
+                               DIAG_OFFSET, QK_SCALE=QK_SCALE, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM,
+                               IS_CAUSAL=IS_CAUSAL, EVEN_N=EVEN_N)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -780,12 +781,12 @@ def flash_attn_persistent(q, k, v, sm_scale, causal=False, **kw):
         H,
         N_CTX_Q,
         N_CTX_K,
+        diag_offset,
         sm_scale,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         HEAD_DIM=D,
         IS_CAUSAL=causal,
-        DIAG_OFFSET=diag_offset,
         NUM_M_BLOCKS=num_m_blocks,
         TILES_PER_UNIT=tiles_per_unit,
         NUM_SMS=num_sms,
