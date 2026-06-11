@@ -50,32 +50,33 @@ if [[ "$GPU_VENDOR" == "nvidia" ]]; then
 elif [[ "$GPU_VENDOR" == "amd" ]]; then
     export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:=4}"
 
-    # Get GPU device ID (DID) from rocm-smi - this is more reliable than product name
-    # MI300X = 0x74a0, 0x74a1  |  MI350X = 0x75a0
-    GPU_DID=$(rocm-smi -d "$HIP_VISIBLE_DEVICES" --showbus --csv 2>/dev/null | tail -1 | cut -d',' -f1)
-    if [[ -z "$GPU_DID" ]]; then
-        # Fallback: parse from main rocm-smi output
-        GPU_DID=$(rocm-smi 2>/dev/null | grep "^$HIP_VISIBLE_DEVICES" | grep -oE '0x[0-9a-fA-F]+' | head -1)
+    # Detect GPU model via rocm-smi or amd-smi
+    GPU_MODEL=$(rocm-smi -d "$HIP_VISIBLE_DEVICES" --showproductname 2>/dev/null \
+        | grep "Card Model" | head -1 | awk -F: '{print $2}' | xargs)
+    if [[ -z "$GPU_MODEL" ]]; then
+        GPU_MODEL=$(amd-smi static --asic -g "$HIP_VISIBLE_DEVICES" 2>/dev/null \
+            | grep -i "market_name\|model" | head -1 | awk -F: '{print $2}' | xargs)
     fi
 
-    # Detect based on device ID
-    # MI350X uses DID 0x75a0, MI300X uses 0x74a0/0x74a1
-    if [[ "$GPU_DID" == "0x75a0"* ]] || [[ "$GPU_DID" == "0x75a1"* ]]; then
-        GPU_NAME="MI350X"
-        if [[ -z "${DESIRED_POWER:-}" ]]; then
-            DESIRED_POWER=1000
-        fi
-    elif [[ "$GPU_DID" == "0x74a0"* ]] || [[ "$GPU_DID" == "0x74a1"* ]]; then
-        GPU_NAME="MI300X"
-        if [[ -z "${DESIRED_POWER:-}" ]]; then
-            DESIRED_POWER=750
-        fi
-    else
-        GPU_NAME="Unknown AMD GPU (DID: $GPU_DID)"
-        if [[ -z "${DESIRED_POWER:-}" ]]; then
-            DESIRED_POWER=500
-        fi
-    fi
+    # Map model to GPU name and default power
+    case "$GPU_MODEL" in
+        *MI300*|0x74a0|0x74a1)
+            GPU_NAME="MI300X"
+            [[ -z "${DESIRED_POWER:-}" ]] && DESIRED_POWER=750
+            ;;
+        *MI350*|0x75a0)
+            GPU_NAME="MI350X"
+            [[ -z "${DESIRED_POWER:-}" ]] && DESIRED_POWER=1000
+            ;;
+        *MI355*|0x75a1)
+            GPU_NAME="MI355X"
+            [[ -z "${DESIRED_POWER:-}" ]] && DESIRED_POWER=1400
+            ;;
+        *)
+            GPU_NAME="AMD GPU ($GPU_MODEL)"
+            [[ -z "${DESIRED_POWER:-}" ]] && DESIRED_POWER=500
+            ;;
+    esac
 
     echo "Detected $GPU_NAME"
     echo "Locking GPU $HIP_VISIBLE_DEVICES power cap to ${DESIRED_POWER} W"
