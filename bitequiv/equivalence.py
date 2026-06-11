@@ -26,76 +26,34 @@ a PTX/``--fmad`` backstop is also needed (the ``ptx`` checker below is the slot 
 it). Signatures are conservative — they never call non-equivalent configs equivalent
 (a textual layout difference yields a different signature), so the kept set is always
 a safe subset.
+
+The reduction-order engine now lives in :mod:`bitequiv.reduction_tree` (a logical
+mixed-radix / GF(2) thread<->data descriptor + a canonical-tree test oracle); this
+module keeps the autotuner-facing API (signature/prune/registry). The human-readable
+design is in ``bitequiv/design-doc.md``.
 """
-import re
 from collections import OrderedDict
 
-# `#name = #ttg.blocked<{...}>` (also #ttg.slice / #ttg.nvidia_mma / #ttg.linear ...)
-_ENC_DEF = re.compile(r"^#(\w+)\s*=\s*(#ttg\.\w+<.*>)\s*$", re.M)
-
-# A tt.reduce op: capture (attrs, region-body, operand-encoding-name).
-#   "tt.reduce"(%v) <{axis = 1 : i32, reduction_ordering = "unordered"}> ({ ...region... })
-#       : (tensor<64x1024xf32, #blocked>) -> tensor<64xf32, #ttg.slice<...>>
-_REDUCE = re.compile(r'"tt\.reduce"\([^)]*\)\s*<\{([^}]*)\}>\s*\(\{(.*?)\}\)\s*:\s*'
-                     r"\(tensor<[^,>]*,\s*(#\w+)>\)", re.S)
-
-_ARRAY = lambda key, body: (lambda m: tuple(int(v) for v in m.group(1).replace(" ", "").split(",") if v != "")
-                            if m else None)(re.search(key + r"\s*=\s*\[([0-9, ]*)\]", body))
-
-
-def _encoding_defs(ttgir):
-    return {name: body for name, body in _ENC_DEF.findall(ttgir)}
-
-
-def _layout_along_axis(enc_body, axis):
-    """The layout facts that determine the reduction tree along ``axis`` for a
-    blocked encoding. Returns a hashable tuple; falls back to the raw encoding
-    body for non-blocked encodings (#mma/#linear — conservative: exact-match)."""
-    spt = _ARRAY("sizePerThread", enc_body)
-    tpw = _ARRAY("threadsPerWarp", enc_body)
-    wpc = _ARRAY("warpsPerCTA", enc_body)
-    order = _ARRAY("order", enc_body)
-    if spt is None or tpw is None or wpc is None or axis is None or axis >= len(spt):
-        # Not a plain blocked layout we can project (e.g. #mma) — compare verbatim.
-        return ("raw", " ".join(enc_body.split()))
-    return (
-        ("sizePerThread@axis", spt[axis]),
-        ("threadsPerWarp@axis", tpw[axis]),
-        ("warpsPerCTA@axis", wpc[axis]),
-        ("order", order),
-    )
+from .reduction_tree import reduction_descriptor, reductions_equivalent
 
 
 def reduction_signature(ttgir):
-    """Static reduction-order signature of a TTGIR module.
+    """Static reduction-order signature of a TTGIR module (one entry per
+    ``tt.reduce``).
 
-    Returns a tuple with one entry per ``tt.reduce`` op:
-    ``(axis, reduction_ordering, combine_ops, layout_along_axis)``.
-    Two TTGIRs with equal signatures perform identical reduction trees.
-    Returns ``()`` when there is no reduction (caller decides what that means).
+    Thin alias for :func:`bitequiv.reduction_tree.reduction_descriptor` — the
+    conservative, shape-aware logical-relation descriptor. Two TTGIRs with equal
+    signatures perform identical reduction trees (sound); ``()`` when there is no
+    reduction. See ``bitequiv/design-doc.md``
+    for how the descriptor encodes the thread<->data map and how equality is decided.
     """
-    defs = _encoding_defs(ttgir)
-    sigs = []
-    for attrs, region, enc_name in _REDUCE.findall(ttgir):
-        am = re.search(r"axis\s*=\s*(\d+)", attrs)
-        om = re.search(r'reduction_ordering\s*=\s*"(\w+)"', attrs)
-        axis = int(am.group(1)) if am else None
-        ordering = om.group(1) if om else None
-        combine = tuple(sorted(set(re.findall(r"(?:arith|math)\.\w+", region))))
-        if ordering == "inner_tree":
-            # inner_tree enforces one canonical order over original element indices,
-            # independent of layout -> all such configs are equivalent regardless of
-            # warpsPerCTA/sizePerThread. Exclude layout from the signature.
-            layout = ("layout-invariant(inner_tree)", )
-        else:
-            layout = _layout_along_axis(defs.get(enc_name.lstrip("#"), enc_name), axis)
-        sigs.append((axis, ordering, combine, layout))
-    return tuple(sigs)
+    return reduction_descriptor(ttgir)
 
 
 def same_reduction_order(ttgir_a, ttgir_b):
-    """True iff the two TTGIRs reduce in the same (bitwise-equivalent) order."""
-    return reduction_signature(ttgir_a) == reduction_signature(ttgir_b)
+    """True iff the two TTGIRs reduce in the same (bitwise-equivalent) order.
+    Thin alias for :func:`bitequiv.reduction_tree.reductions_equivalent`."""
+    return reductions_equivalent(ttgir_a, ttgir_b)
 
 
 def reduction_equivalence_key(config, asm, metadata):
