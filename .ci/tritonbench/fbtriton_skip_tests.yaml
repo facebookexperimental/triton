@@ -24,6 +24,9 @@ test_op:
 fp8_fused_quant_gemm_rowwise:
 flash_attention:
   extra_bwd_args: --causal
+  report: true
+  disabled_devices:
+    - hip
 # Device specific tests
 blackwell_attentions:
   devices:
@@ -81,11 +84,6 @@ welford:
   disabled_devices:
     - hip
 jsd:
-  report: true
-  disabled_devices:
-    - hip
-# flash_attention will segfault on hip+triton beta
-flash_attention:
   report: true
   disabled_devices:
     - hip
