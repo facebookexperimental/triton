@@ -38,6 +38,6 @@ pytest bitequiv/tests/
 ```
 
 Blackwell-only examples (`b03`, `b04`, and `compilation-pipeline/06`) self-skip on
-other hardware. The autotuner constraint-pruning examples (static artifact / IR
-equivalence pruning) live in `constraint_pruning_examples.py` and are registered as
-tests in `../tests/test_constraint_pruning.py`.
+other hardware. The autotuner constraint-pruning scenarios (static IR/PTX feature
+filters + reduction-order equivalence pruning) are assertion-based tests in
+`../tests/test_constraint_pruning.py`.
