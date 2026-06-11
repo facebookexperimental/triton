@@ -143,8 +143,11 @@ lowerTMemLdSt(const LinearLayout &cvt, int maxnreg, int bitwidth, bool isScales,
     LinearLayout quot;
     int bestContig = 1;
     for (int contig = 1; bitwidth * contig <= 32; contig *= 2) {
-      auto maybeQuot =
-          divideLeft(cvt, LinearLayout::identity1D(contig, kReg, kCol));
+      // cvt may be modular for NPOT scale tensors (e.g. FP4 dot_scaled with
+      // NPOT K such as the K=96 (M, 6) scale tensor). Use the modular-aware
+      // wrapper so divideLeft handles the NPOT out-dim structure.
+      auto maybeQuot = divideLeftAllowingModular(
+          cvt, LinearLayout::identity1D(contig, kReg, kCol));
       if (!maybeQuot)
         break;
       quot = *maybeQuot;
@@ -157,7 +160,7 @@ lowerTMemLdSt(const LinearLayout &cvt, int maxnreg, int bitwidth, bool isScales,
       // larger dtype
       unpacked = false;
       newBitwidth = bitwidth * bestContig;
-    } else if (auto maybeQuot = divideLeft(
+    } else if (auto maybeQuot = divideLeftAllowingModular(
                    cvt, LinearLayout::zeros1D(1, kReg, kCol, 32 / bitwidth) *
                             LinearLayout::identity1D(2, kReg, kCol));
                bitwidth == 16 && maybeQuot) {
@@ -165,7 +168,7 @@ lowerTMemLdSt(const LinearLayout &cvt, int maxnreg, int bitwidth, bool isScales,
       unpacked = true;
       quot = *maybeQuot;
       newBitwidth = 32;
-    } else if (auto maybeQuot = divideLeft(
+    } else if (auto maybeQuot = divideLeftAllowingModular(
                    cvt, LinearLayout::zeros1D(1, kReg, kCol, 32 / bitwidth))) {
       // We software-pad the elements when we either do not have enough elements
       // to fill a full 32b register, e.g., colN = 1 and colStride != 1 or when
@@ -237,13 +240,34 @@ lowerTMemLdSt(const LinearLayout &cvt, int maxnreg, int bitwidth, bool isScales,
       auto col = reps.getBasis(kLane, 4, kCol);
       secondHalfOffset = (row << 16) | col;
       if (*secondHalfOffset == 0) {
-        // Workaround for ptxas bug, we cannot use secondHalfOffset = 0 to write
-        // only 16 elements. We use secondHalfOffset = 1 instead and we pad the
-        // allocation.
-        if (!isScales) {
+        // Workaround for ptxas bug: secondHalfOffset=0 doesn't work for
+        // writing only 16 elements. Use secondHalfOffset=1 instead.
+        // This requires the TMEM allocation to have at least 1 extra column.
+        // For scale tensors, explicit padding is added. For general data
+        // tensors with NPOT blockN (e.g., 192), the pow2 TMEM allocation
+        // (e.g., 256) already provides the extra column.
+        //
+        // INVARIANT: this only holds when there IS an extra column, i.e. on
+        // the scale path (isScales -> explicit padding) or the NPOT path (a
+        // modular cvt -> the source blockN is non-pow2 and the allocation is
+        // rounded up to the next pow2, leaving slack). For a plain pow2 blockN
+        // data tensor (non-scale, non-modular) the allocation has no slack, so
+        // writing at column+1 could spill past the TMEM allocation.
+        //
+        // SILENT-FAILURE HARDENING: the previous `assert` was a no-op in opt
+        // builds, so a caller reaching here with a tight pow2 alloc would
+        // silently corrupt TMEM. Return a hard failure through this function's
+        // FailureOr channel instead (matching the emitError/return failure()
+        // pattern used elsewhere here) so the invariant is enforced in opt too.
+        // (Empirically this branch is only reached on the scale / NPOT paths
+        // today, so valid cases are unaffected.)
+        if (!(isScales || cvt.isModular())) {
           if (emitError) {
             emitError()
-                << "Only supported for scales as we pad the allocation.";
+                << "Failed to lower TMEM load/store: secondHalfOffset=1 "
+                   "workaround requires an extra TMEM column, only guaranteed "
+                   "on the scale (padded) or NPOT (pow2-rounded) path; a tight "
+                   "pow2 blockN data tensor has no slack";
           }
           return failure();
         }

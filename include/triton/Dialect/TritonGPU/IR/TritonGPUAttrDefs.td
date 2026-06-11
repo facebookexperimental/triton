@@ -446,6 +446,20 @@ def NVMMASharedEncodingAttr : TritonGPU_Attr<"NVMMASharedEncoding", "nvmma_share
         } else {
           swizzlingByteWidth = 0;
         }
+        // NPOT contiguous dims that aren't swizzle-compatible would get
+        // swizzle=0, but tcgen05/wgmma swizzle=none can't stride a contiguous
+        // dim > 8 elements (HW limit). Pad the contiguous dim to pow2 and pick
+        // a swizzle from the padded size; the padded columns are masked out at
+        // the epilogue store.
+        if (swizzlingByteWidth == 0 &&
+            shapePerCTA.size() >= 2 &&
+            !llvm::isPowerOf2_64(shapePerCTA[order[0]])) {
+          int64_t padContig = llvm::NextPowerOf2(shapePerCTA[order[0]]);
+          int64_t padBytes = padContig * packingFactor * eleBitWidth / 8;
+          if (padBytes >= 128 && padBytes % 128 == 0)      swizzlingByteWidth = 128;
+          else if (padBytes >= 64 && padBytes % 64 == 0)   swizzlingByteWidth = 64;
+          else if (padBytes >= 32 && padBytes % 32 == 0)   swizzlingByteWidth = 32;
+        }
         int flattenOutterDim = 1;
         for (int i = 1; i < shapePerCTA.size(); i++) {
           flattenOutterDim *= shapePerCTA[order[i]];
@@ -840,7 +854,12 @@ for
       // starting from the contiguous dimension
       for (unsigned d = 0; d < rank - 1; ++d) {
         unsigned i = order[d];
-        unsigned threadsPerCTA = std::clamp<unsigned>(remainingThreads, 1, std::max<unsigned>(1, shapePerCTA[i] / sizePerThread[i]));
+        unsigned dimSize = std::max<unsigned>(1, shapePerCTA[i] / sizePerThread[i]);
+        // Round down to power of 2 to ensure threadsPerWarp and warpsPerCTA
+        // elements are always powers of 2, as required by the verifier.
+        // NPOT shape dimensions (e.g. 144) would otherwise produce NPOT factors.
+        unsigned dimSizePow2 = 1u << llvm::Log2_32(dimSize);
+        unsigned threadsPerCTA = std::clamp<unsigned>(remainingThreads, 1, dimSizePow2);
         threadsPerWarp[i] = std::clamp<unsigned>(threadsPerCTA, 1, remainingLanes);
         warpsPerCTA[i] = std::clamp<unsigned>(threadsPerCTA / threadsPerWarp[i], 1, remainingWarps);
         remainingWarps /= warpsPerCTA[i];
@@ -873,7 +892,9 @@ for
       // starting from the most strided dimension
       for (int d = rank - 1; d >= 0; --d) {
         unsigned i = order[d];
-        CTAsPerCGA[i] = std::clamp<unsigned>(remainingCTAs, 1, std::max<unsigned>(1, shape[i] / sizePerThread[i]));
+        unsigned ctaDimSize = std::max<unsigned>(1, shape[i] / sizePerThread[i]);
+        unsigned ctaDimSizePow2 = 1u << llvm::Log2_32(ctaDimSize);
+        CTAsPerCGA[i] = std::clamp<unsigned>(remainingCTAs, 1, ctaDimSizePow2);
         CTASplitNum[i] = CTAsPerCGA[i];
         remainingCTAs /= CTAsPerCGA[i];
       }

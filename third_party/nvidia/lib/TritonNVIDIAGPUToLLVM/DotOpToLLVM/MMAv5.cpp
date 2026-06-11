@@ -137,12 +137,10 @@ static Value createInstDescriptor(ConversionPatternRewriter &rewriter,
   return b.int_val(32, desc.descriptor);
 }
 
-static Value createScaleInstDescriptor(ConversionPatternRewriter &rewriter,
-                                       ttng::TCGen5MMAScaledOp op, int M, int N,
-                                       bool transposeA, bool transposeB,
-                                       int scaleFactorsubIdxA,
-                                       int scaleFactorsubIdxB,
-                                       mxfpKind mxfpInstKind) {
+static Value createScaleInstDescriptor(
+    ConversionPatternRewriter &rewriter, ttng::TCGen5MMAScaledOp op, int M,
+    int N, bool transposeA, bool transposeB, int scaleFactorsubIdxA,
+    int scaleFactorsubIdxB, mxfpKind mxfpInstKind, bool kSize96 = false) {
   Location loc = op.getLoc();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   union TCGen5InstructionDescriptor {
@@ -163,7 +161,10 @@ static Value createScaleInstDescriptor(ConversionPatternRewriter &rewriter,
       uint32_t scaleType : 1;
       uint32_t M : 5;
       uint32_t AScaleFactor : 2;
-      uint32_t : 1;
+      // Bit 31: K dimension selector. 0 = K=64, 1 = K=96. Only meaningful for
+      // mxf4nvf4 .block16 on sm_103a; reserved otherwise. PTX ISA 9.2
+      // §9.7.16.4.2 (instruction descriptor format).
+      uint32_t kDim96 : 1;
     };
   };
   auto getTypeEncoding = [](ScaleDotElemType type, bool isMXF4) {
@@ -222,6 +223,16 @@ static Value createScaleInstDescriptor(ConversionPatternRewriter &rewriter,
              "MMAv5 with kind=mxf4nvf4 currently only supports SFA_ID 0");
       assert(desc.BScaleFactor == 0 &&
              "MMAv5 with kind=mxf4nvf4 currently only supports SFB_ID 0");
+      if (kSize96) {
+        // K=96 mxf4nvf4 .block16 requires sm_103a. Set bit 31 to switch the
+        // K dimension from 64 to 96. Per PTX ISA 9.2 §9.7.16.3.1.3, transpose
+        // must be 0 and (by the lowering) M must be 128 in this mode (already
+        // required by the asserts above and by ScaledBlockedToMMAv5).
+        assert(desc.M == (128 >> 4) && "K=96 mxf4nvf4 requires M=128 atom");
+        assert(desc.transposeA == 0 && desc.transposeB == 0 &&
+               "K=96 mxf4nvf4 does not support transpose");
+        desc.kDim96 = 1;
+      }
     }
   }
 
@@ -266,7 +277,7 @@ static void createScaledGen5MMA(ConversionPatternRewriter &rewriter,
                                 Value scaleA, Value scaleB, Value pred,
                                 Value instDescriptor, Value useInitAcc,
                                 bool aInTmem, mxfpKind mxfpInstKind,
-                                bool twoCTAs) {
+                                bool twoCTAs, bool kSize96 = false) {
   PTXBuilder ptxBuilder;
   std::string opcode =
       "tcgen05.mma.cta_group::" + std::to_string(twoCTAs ? 2 : 1) + ".kind::";
@@ -275,7 +286,16 @@ static void createScaledGen5MMA(ConversionPatternRewriter &rewriter,
   } else if (mxfpInstKind == mxfpKind::mxf4) {
     opcode += "mxf4.block_scale.scale_vec::2X";
   } else if (mxfpInstKind == mxfpKind::mxf4nvf4) {
-    opcode += "mxf4nvf4.block_scale.scale_vec::4X";
+    if (kSize96) {
+      // K=96 mxf4nvf4 uses .block16 directly (semantically scale_vec::6X per
+      // PTX ISA 9.2 §9.7.16.10.7.13). The K dimension is encoded in
+      // instruction-descriptor bit 31 (set in createScaleInstDescriptor).
+      // Requires sm_103a (gated upstream in the verifier /
+      // ScaledBlockedToMMAv5).
+      opcode += "mxf4nvf4.block_scale.block16";
+    } else {
+      opcode += "mxf4nvf4.block_scale.scale_vec::4X";
+    }
   } else {
     assert(0 && "Unsupported mxfp kind.");
   }
@@ -615,14 +635,18 @@ int64_t getFormatBitSize(ScaleDotElemType type) {
   }
 }
 
-int getScaleFactorColsPerSet(mxfpKind kind) {
+int getScaleFactorColsPerSet(mxfpKind kind, bool kSize96Mxf4nvf4 = false) {
   switch (kind) {
   case mxfpKind::mxf8f6f4:
     return 1;
   case mxfpKind::mxf4:
     return 2;
   case mxfpKind::mxf4nvf4:
-    return 4;
+    // K=96 mxf4nvf4 .block16 packs all 6 scale columns (one per 16-element K
+    // block, total K=96) into a single MMA (scale_vec::6X semantics per PTX
+    // ISA 9.2 §9.7.16.10.7.13). The K=64 / K=128 path uses 4 (scale_vec::4X
+    // covers K=64 per MMA).
+    return kSize96Mxf4nvf4 ? 6 : 4;
   default:
     llvm_unreachable("Unsupported mxfp kind.");
   }
@@ -642,13 +666,24 @@ LogicalResult convertScaledDot(const LLVMTypeConverter &typeConverter,
       isTransposed(op.getA()) || !isTransposed(op.getB()));
   bool opKindIsMXFP4 = mxfpInstKind != mxfpKind::mxf8f6f4;
 
+  // K=96 mxf4nvf4 (.block16) is a sm_103a-only atom that consumes 96 K
+  // elements in a single MMA (vs the standard K=64 atom). Detected here via
+  // BlockK so the scale-column / opcode / descriptor logic routes to the
+  // native atom. The verifier in TCGen5MMAScaledOp::verify rejects K=96
+  // mxf4nvf4 on cc != 103, and ScaledBlockedToMMAv5 bails on non-sm_103a, so
+  // by the time we reach emission this flag can only be true on sm_103a.
+  bool kSize96Mxf4nvf4 =
+      (mxfpInstKind == mxfpKind::mxf4nvf4) && (op.getBlockK() == 96);
+
   DotConversion dot;
 
   SmallVector<int64_t> dstPerCTA = triton::gpu::getShapePerCTA(dTensorTy);
   dot.shape.M = dstPerCTA[0];
   dot.shape.N = dstPerCTA[1];
   dot.shape.K = op.getBlockK();
-  dot.mmaSizeK = !opKindIsMXFP4 ? 32 : 64;
+  // K=96 mxf4nvf4 emits one MMA per 96 K elements; the standard mxf4nvf4 path
+  // uses 64 (scale_vec::4X over K=64).
+  dot.mmaSizeK = !opKindIsMXFP4 ? 32 : (kSize96Mxf4nvf4 ? 96 : 64);
 
   dot.shapeA = triton::gpu::getAllocationShapePerCTA(aTensorTy);
   dot.shapeB = triton::gpu::getAllocationShapePerCTA(bTensorTy);
@@ -683,18 +718,25 @@ LogicalResult convertScaledDot(const LLVMTypeConverter &typeConverter,
                           const DotConversion::InstDesc &desc, int m, int n,
                           int k) {
     auto [numRepM, numRepN, numRepK] = desc.repShape;
-    int scaleFactorColsPerSet = getScaleFactorColsPerSet(mxfpInstKind);
+    int scaleFactorColsPerSet =
+        getScaleFactorColsPerSet(mxfpInstKind, kSize96Mxf4nvf4);
+    // For mxf4nvf4 .block16 (K=96), all 6 scale columns are consumed by a
+    // single MMA, so each K rep maps to exactly one wordIdx and there is no
+    // sub-word split. The K=64/128 path packs 4/scaleFactorColsPerSet reps per
+    // 32-bit scale word. Guard against the literal 4/6 = 0 division.
+    int kRepsPerWord =
+        scaleFactorColsPerSet >= 4 ? 1 : (4 / scaleFactorColsPerSet);
     int numColPerScaleBlockA = ceil<int>(
         ttng::getTmemAllocSizes(cast<MemDescType>(op.getAScale().getType()))
             .numCols,
-        numRepM * (ceil<int>(numRepK, 4 / scaleFactorColsPerSet)));
+        numRepM * (ceil<int>(numRepK, kRepsPerWord)));
     int numColPerScaleBlockB = ceil<int>(
         ttng::getTmemAllocSizes(cast<MemDescType>(op.getBScale().getType()))
             .numCols,
-        numRepN * (ceil<int>(numRepK, 4 / scaleFactorColsPerSet)));
+        numRepN * (ceil<int>(numRepK, kRepsPerWord)));
     numColPerScaleBlockB = std::max(numColPerScaleBlockB, 2);
-    int subWordIdx = k % (4 / scaleFactorColsPerSet);
-    int wordIdx = k / (4 / scaleFactorColsPerSet);
+    int subWordIdx = k % kRepsPerWord;
+    int wordIdx = k / kRepsPerWord;
     Value scaleA = tb.add(
         baseScaleA, tb.i32_val((m + wordIdx * numRepM) * numColPerScaleBlockA));
     Value scaleB = tb.add(
@@ -702,10 +744,10 @@ LogicalResult convertScaledDot(const LLVMTypeConverter &typeConverter,
     Value instDescriptor = createScaleInstDescriptor(
         rewriter, op, op.getTwoCtas() ? desc.mmaSizeM * 2 : desc.mmaSizeM,
         desc.mmaSizeN, desc.transA, desc.transB, subWordIdx, subWordIdx,
-        mxfpInstKind);
+        mxfpInstKind, kSize96Mxf4nvf4);
     createScaledGen5MMA(rewriter, loc, op, a, b, accAddress, scaleA, scaleB,
                         pred, instDescriptor, useInitAcc, desc.aInTmem,
-                        mxfpInstKind, twoCTAs);
+                        mxfpInstKind, twoCTAs, kSize96Mxf4nvf4);
   };
 
   return convertDotImpl(

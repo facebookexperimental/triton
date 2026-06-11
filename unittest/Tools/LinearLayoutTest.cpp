@@ -5,6 +5,7 @@
 #include "llvm/Support/Signals.h"
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <set>
 
 namespace mlir {
 std::ostream &operator<<(std::ostream &os, StringAttr str) {
@@ -186,7 +187,6 @@ TEST_F(LinearLayoutTest, TransposeIns) {
 }
 
 TEST_F(LinearLayoutTest, EmptyToString) {
-  // Mostly I just want to make sure it doesn't crash.
   EXPECT_EQ(LinearLayout::empty().toString(), "\n(empty layout)");
 }
 
@@ -603,6 +603,32 @@ TEST_F(LinearLayoutTest, InvertAndCompose_IdentityInDim) {
   EXPECT_EQ(dst.apply(k), src.apply(cvt.apply(k)));
 }
 
+// Test invertAndCompose with non-power-of-2 dimensions
+// Exercises the modular CRT-based least-squares solver path
+TEST_F(LinearLayoutTest, InvertAndCompose_NonPow2) {
+  // Create a simple layout with dimension 3 (non-pow2)
+  // Layout A: maps in1 -> out (dimension 3)
+  // Bases: 1, 1 (mod 3: 0->0, 1->1, 2->1, 3->2)
+  LinearLayout A({{S("in1"), {{1}, {1}}}}, {{S("out"), 3}},
+                 /*requireSurjective=*/false);
+
+  // Layout B: maps in2 -> out (dimension 3)
+  // Bases: 2, 1 (mod 3: 0->0, 1->2, 2->1, 3->0)
+  LinearLayout B({{S("in2"), {{2}, {1}}}}, {{S("out"), 3}},
+                 /*requireSurjective=*/false);
+
+  // Compute X = A.invertAndCompose(B)
+  // X should map in1's inputs to in2's inputs such that X ∘ B = A
+  LinearLayout X = A.invertAndCompose(B);
+
+  // Verify the composition property: X ∘ B = A
+  EXPECT_EQ(X.compose(B), A);
+
+  // The result should have in1 as inputs and in2 as outputs
+  EXPECT_THAT(to_vector(X.getInDimNames()), ElementsAre(S("in1")));
+  EXPECT_THAT(to_vector(X.getOutDimNames()), ElementsAre(S("in2")));
+}
+
 TEST_F(LinearLayoutTest, NumConsecutiveInOut) {
   EXPECT_EQ(
       1,
@@ -631,6 +657,24 @@ TEST_F(LinearLayoutTest, NumConsecutiveInOut) {
                        {S("in2"), {{8}, {18}}},
                    },
                    {S("out")})
+                   .getNumConsecutiveInOut());
+
+  // NPOT modular layouts: clamp to largest pow2 dividing N.
+  EXPECT_EQ(2, LinearLayout::modularIdentity1D(6, S("in"), S("out"))
+                   .getNumConsecutiveInOut());
+  EXPECT_EQ(1, LinearLayout::modularIdentity1D(5, S("in"), S("out"))
+                   .getNumConsecutiveInOut());
+  EXPECT_EQ(4, LinearLayout::modularIdentity1D(12, S("in"), S("out"))
+                   .getNumConsecutiveInOut());
+  EXPECT_EQ(1, LinearLayout::modularIdentity1D(15, S("in"), S("out"))
+                   .getNumConsecutiveInOut());
+  // Multi-dim: NPOT first out-dim gets clamped.
+  EXPECT_EQ(2, (LinearLayout::modularIdentity1D(6, S("in1"), S("out1")) *
+                LinearLayout::identity1D(8, S("in2"), S("out2")))
+                   .getNumConsecutiveInOut());
+  // Mixed: pow2 first out-dim, NPOT second — no clamp on pow2.
+  EXPECT_EQ(4, (LinearLayout::identity1D(4, S("in1"), S("out1")) *
+                LinearLayout::modularIdentity1D(6, S("in2"), S("out2")))
                    .getNumConsecutiveInOut());
 }
 
@@ -713,6 +757,16 @@ TEST_F(LinearLayoutTest, FreeVariableMasks) {
                                       {S("out1"), S("out2")})
                              .getFreeVariableMasks())),
             AR({{S("in1"), 0b100}, {S("in2"), 0b10}}));
+
+  // Modular layout: no zero bases → no free variables.
+  EXPECT_EQ(AR(to_vector(LinearLayout::modularIdentity1D(6, S("in"), S("out"))
+                             .getFreeVariableMasks())),
+            AR({{S("in"), 0}}));
+
+  // Modular layout: stride=3, size=6 → bases [3, 0, 0] → bits 1,2 are free.
+  EXPECT_EQ(AR(to_vector(LinearLayout::modularStrided1D(6, 3, S("in"), S("out"))
+                             .getFreeVariableMasks())),
+            AR({{S("in"), 0b110}}));
 }
 
 TEST_F(LinearLayoutTest, QuotientOneDimension) {
@@ -1054,6 +1108,90 @@ TEST_F(LinearLayoutTest, Divide_EliminateInDim) {
   EXPECT_EQ(divideRight(l7, l8).value(), l9);
 }
 
+// Modular-aware divide wrappers reduce to the raw divide when the layout is
+// pow2 (non-modular). Sanity-check this equivalence first.
+TEST_F(LinearLayoutTest, DivideAllowingModular_Pow2MatchesRaw) {
+  auto A = LinearLayout::identity1D(8, S("in"), S("out"));
+  auto B = LinearLayout::identity1D(4, S("in"), S("out"));
+  ASSERT_FALSE(A.isModular());
+  EXPECT_EQ(divideLeftAllowingModular(A, B), divideLeft(A, B));
+  EXPECT_EQ(divideRightAllowingModular(A, B), divideRight(A, B));
+}
+
+// Core regression test for the K=96 NVFP4 (.block16) scale tensor TMEM path.
+//
+// The K=96 mxf4nvf4 scale tensor has shape (M, 6): one E4M3 scale per
+// 16-element K block, total K=96 => 6 scale columns. The "6" out-dim is NPOT,
+// so the layout is modular. getDistributedLayoutForTmemLdSt() divides this
+// layout by a pow2 contiguous/identity factor along the column ("K") dim
+// (Dialect.cpp / TensorMemoryUtils.cpp). The raw divideLeft/divideRight cannot
+// handle the modular structure; divideLeftAllowingModular must.
+//
+// Here we build A = factorK * modPart, where factorK is a pow2 identity along
+// the K (col) out-dim and modPart carries the modular K=6 structure. We then
+// verify that divideLeftAllowingModular(A, factorK) recovers modPart, that the
+// quotient keeps the NPOT out-dim size (6, not pow2-rounded to 8), and that
+// the recomposition factorK * quotient == A.
+TEST_F(LinearLayoutTest, DivideAllowingModular_K96NvFp4ScaleTensor) {
+  // modPart: maps the K-block input dim onto the modular K out-dim of size 6.
+  // "kBlock" has 8 input positions (log2 ceil of 6 rounded up via bases) but
+  // the out-dim "col" is declared size 6 (NPOT => modular). Bases enumerate
+  // the 6 reachable scale columns 0..5 along col, with the M ("row") dim pow2.
+  LinearLayout modPart(
+      {
+          {S("kBlock"), {{0, 1}, {0, 2}, {0, 4}}}, // -> col, modular size 6
+          {S("row"), {{1, 0}, {2, 0}}},            // -> row (M), pow2 size 4
+      },
+      {{S("row"), 4}, {S("col"), 6}},
+      /*requireSurjective=*/false);
+  ASSERT_TRUE(modPart.isModular())
+      << "scale tensor with NPOT K=6 must be modular";
+
+  // factorK: a pow2 identity factor along the row dim that we will divide out
+  // on the left (mirrors dividing by an identity1D contiguous factor in the
+  // TMEM lowering). It only touches the pow2 "row" out-dim, leaving the
+  // modular "col" dim entirely in the quotient.
+  LinearLayout factorK = LinearLayout::identity1D(2, S("row"), S("row")) *
+                         LinearLayout::identity1D(1, S("kBlock"), S("col"));
+
+  auto A = factorK * modPart;
+  ASSERT_TRUE(A.isModular()) << "product with NPOT col dim must stay modular";
+
+  // Raw divideLeft would mis-handle the modular product; the wrapper must
+  // succeed and recover modPart exactly.
+  auto quot = divideLeftAllowingModular(A, factorK);
+  ASSERT_TRUE(quot.has_value())
+      << "modular-aware divide must succeed for the K=96 scale tensor";
+
+  // The quotient must preserve the NPOT col out-dim size (6), not round it to
+  // the next power of two (8). This is the exact bug the wrapper guards
+  // against.
+  EXPECT_EQ(quot->getOutDimSize(S("col")), 6)
+      << "quotient must keep NPOT K out-dim size 6, not pow2-rounded 8";
+  EXPECT_TRUE(quot->isModular());
+
+  // Recomposition round-trips: factorK * quotient == A. (We compare the
+  // recomposition rather than the quotient directly because operator* may
+  // reorder input dims, which is irrelevant to the layout's semantics.)
+  EXPECT_EQ(factorK * quot.value(), A);
+}
+
+// Divisibility pre-flight: if A's out-dim size is not divisible by B's, the
+// modular-aware divide must return nullopt rather than inventing a quotient.
+TEST_F(LinearLayoutTest, DivideAllowingModular_NonDivisibleReturnsNullopt) {
+  // A has modular col dim of size 6; B asks to divide col by 4 (6 % 4 != 0).
+  LinearLayout A(
+      {
+          {S("kBlock"), {{0, 1}, {0, 2}, {0, 4}}},
+          {S("row"), {{1, 0}}},
+      },
+      {{S("row"), 2}, {S("col"), 6}},
+      /*requireSurjective=*/false);
+  ASSERT_TRUE(A.isModular());
+  auto B = LinearLayout::identity1D(4, S("kBlock"), S("col"));
+  EXPECT_FALSE(divideLeftAllowingModular(A, B).has_value());
+}
+
 TEST_F(LinearLayoutTest, Divide_EliminateOutDim) {
   LinearLayout l1(
       {
@@ -1091,6 +1229,38 @@ TEST_F(LinearLayoutTest, Divide_EliminateOutDim) {
   ASSERT_EQ(l5 * l6, l4);
   EXPECT_EQ(divideLeft(l4, l5).value(), l6);
   EXPECT_EQ(divideRight(l4, l5).value(), l6);
+}
+
+TEST_F(LinearLayoutTest, Divide_Modular) {
+  // Case 1: modular(6) * modular(4), both left and right
+  {
+    auto B = LinearLayout::modularStrided1D(6, 1, S("in"), S("out"));
+    auto C = LinearLayout::modularStrided1D(4, 1, S("in"), S("out"));
+    auto A = B * C;
+    ASSERT_TRUE(divideLeft(A, B).has_value());
+    EXPECT_EQ(divideLeft(A, B).value(), C);
+    ASSERT_TRUE(divideRight(A, C).has_value());
+    EXPECT_EQ(divideRight(A, C).value(), B);
+  }
+
+  // Case 2: mixed NPOT * pow2 (size 96 = 6 * 16)
+  {
+    auto B = LinearLayout::modularStrided1D(6, 1, S("in"), S("out"));
+    auto C = LinearLayout::identity1D(16, S("in"), S("out"));
+    auto A = B * C;
+    EXPECT_EQ(divideLeft(A, B).value(), C);
+    EXPECT_EQ(divideRight(A, C).value(), B);
+  }
+}
+
+TEST_F(LinearLayoutTest, Divide_Modular_2D_Mixed) {
+  auto B = LinearLayout::identity1D(4, S("in"), S("out1")) *
+           LinearLayout::modularStrided1D(3, 1, S("in2"), S("out2"));
+  auto C = LinearLayout::identity1D(2, S("in"), S("out1")) *
+           LinearLayout::modularStrided1D(5, 1, S("in2"), S("out2"));
+  auto A = B * C;
+  EXPECT_EQ(divideLeft(A, B).value(), C);
+  EXPECT_EQ(divideRight(A, C).value(), B);
 }
 
 TEST_F(LinearLayoutTest, ColumnActionApplyLayout) {
@@ -1160,6 +1330,990 @@ TEST_F(LinearLayoutTest, ColumnActionApplyValues) {
 
   expected = std::vector<intptr_t>{1, 5, 3, 7};
   EXPECT_EQ(result, expected);
+}
+
+//===----------------------------------------------------------------------===//
+// Modular (Non-Power-of-2) Layout Tests
+//===----------------------------------------------------------------------===//
+
+TEST_F(LinearLayoutTest, ModularStrided1D_Size3) {
+  // Test modularStrided1D with size=3 (smallest non-pow2)
+  LinearLayout layout = LinearLayout::modularStrided1D(3, 1, S("in"), S("out"));
+
+  // Should be marked as modular
+  EXPECT_TRUE(layout.isModular());
+
+  // Should have ceil(log2(3)) = 2 bases
+  EXPECT_EQ(layout.getInDimSizeLog2(S("in")), 2);
+
+  // Bases should be: (1*1) % 3 = 1, (1*2) % 3 = 2
+  EXPECT_EQ(layout.getBasis(S("in"), 0, S("out")), 1);
+  EXPECT_EQ(layout.getBasis(S("in"), 1, S("out")), 2);
+
+  // Output dimension should be size 3
+  EXPECT_EQ(layout.getOutDimSize(S("out")), 3);
+
+  // Check surjectivity: should cover all values 0, 1, 2
+  EXPECT_TRUE(layout.isModularSurjective());
+}
+
+TEST_F(LinearLayoutTest, ModularStrided1D_WithStride) {
+  // Test modularStrided1D with stride != 1
+  LinearLayout layout = LinearLayout::modularStrided1D(6, 2, S("in"), S("out"));
+
+  EXPECT_TRUE(layout.isModular());
+  EXPECT_EQ(layout.getInDimSizeLog2(S("in")), 3); // ceil(log2(6))
+
+  // Bases should be: (2*1) % 6 = 2, (2*2) % 6 = 4, (2*4) % 6 = 2
+  EXPECT_EQ(layout.getBasis(S("in"), 0, S("out")), 2);
+  EXPECT_EQ(layout.getBasis(S("in"), 1, S("out")), 4);
+  EXPECT_EQ(layout.getBasis(S("in"), 2, S("out")), 2);
+  EXPECT_EQ(layout.getOutDimSize(S("out")), 6);
+
+  // Test stride 5, size 6: L(x) = 5x mod 6 (gcd(5,6) = 1, surjective)
+  LinearLayout stride5_6 =
+      LinearLayout::modularStrided1D(6, 5, S("in"), S("out"));
+  EXPECT_TRUE(stride5_6.isModular());
+  EXPECT_TRUE(stride5_6.isSurjective());
+  EXPECT_THAT(to_vector(stride5_6.getInDimNames()), ElementsAre(S("in")));
+  EXPECT_THAT(to_vector(stride5_6.getOutDimNames()), ElementsAre(S("out")));
+}
+
+// ============================================================================
+// CRT-based invertAndCompose tests (for non-power-of-2 dimensions)
+// These tests exercise the CRT least-squares solver path.
+// ============================================================================
+
+TEST_F(LinearLayoutTest, InvertAndCompose_Modular_MultiDim_LCM) {
+  // Test that lstsqModular uses LCM instead of max for multiple NPOT output
+  // dims This is a regression test for NPOT-I1: lstsqModular was using
+  // max(outDimSizes) as working modulus, which is incorrect for
+  // multi-output-dim layouts where dims have different NPOT sizes. The correct
+  // modulus is LCM(outDimSizes).
+
+  // Create layout A with 2 output dimensions: size 6 and size 10
+  // LCM(6, 10) = 30, max(6, 10) = 10
+  LinearLayout::BasesT basesA;
+  auto &bsA = basesA[S("in")];
+  bsA.push_back({1, 0}); // bit 0: +1 to out0
+  bsA.push_back({2, 0}); // bit 1: +2 to out0
+  bsA.push_back({4, 0}); // bit 2: +4 to out0
+  bsA.push_back({0, 1}); // bit 3: +1 to out1
+  bsA.push_back({0, 2}); // bit 4: +2 to out1
+  bsA.push_back({0, 4}); // bit 5: +4 to out1
+  bsA.push_back({0, 8}); // bit 6: +8 to out1
+
+  llvm::SmallVector<std::pair<StringAttr, int32_t>> outDims;
+  outDims.push_back({S("out0"), 6});
+  outDims.push_back({S("out1"), 10});
+
+  LinearLayout A(std::move(basesA), outDims, false);
+
+  // Create layout B: subset of A
+  LinearLayout::BasesT basesB;
+  auto &bsB = basesB[S("in")];
+  bsB.push_back({1, 0});
+  bsB.push_back({2, 0});
+  bsB.push_back({4, 0});
+  bsB.push_back({0, 1});
+  bsB.push_back({0, 2});
+
+  LinearLayout B(std::move(basesB), outDims, false);
+
+  // Invert and compose - should use LCM(6, 10) = 30 as working modulus
+  LinearLayout result = A.invertAndCompose(B);
+
+  // Verify correctness: result should map B's inputs to A's inputs such that
+  // A(result(i)) = B(i) for all inputs i in B's domain
+  for (int i = 0; i < (1 << B.getTotalInDimSizeLog2()); ++i) {
+    auto b_out = B.apply({{S("in"), i}});
+    auto result_in = result.apply({{S("in"), i}});
+    auto actual = A.apply({{S("in"), result_in[0].second}});
+
+    EXPECT_EQ(actual, b_out)
+        << "Mismatch at i=" << i << ": B gives (" << b_out[0].second << ","
+        << b_out[1].second << "), A(result(i)) gives (" << actual[0].second
+        << "," << actual[1].second << ")";
+  }
+}
+
+// Test multi-dimensional NPOT layouts
+TEST_F(LinearLayoutTest, IsModularSurjectiveMultiDim) {
+  // Create a 2D layout with NPOT dimensions: 3x6
+  // out0: dim=3, out1: dim=6
+  LinearLayout::BasesT bases2D;
+  auto &inBases = bases2D[S("in")];
+
+  // Create bases for a surjective 2D layout
+  // For out0 (dim=3): bases [1, 2] mod 3 -> can reach {0, 1, 2}
+  // For out1 (dim=6): bases [1, 2, 4] mod 6 -> can reach all 6 values
+  inBases.push_back({1, 1}); // contributes 1 to out0, 1 to out1
+  inBases.push_back({2, 2}); // contributes 2 to out0, 2 to out1
+  inBases.push_back({0, 4}); // contributes 0 to out0, 4 to out1
+
+  LinearLayout layout2D(std::move(bases2D), {{S("out0"), 3}, {S("out1"), 6}},
+                        false);
+
+  EXPECT_TRUE(layout2D.isModular())
+      << "2D layout with dims 3x6 should be modular";
+  EXPECT_EQ(layout2D.getNumOutDims(), 2) << "Should have 2 output dimensions";
+  EXPECT_TRUE(layout2D.isModularSurjective())
+      << "2D modular layout should be surjective when both dimensions are "
+         "surjective";
+  EXPECT_TRUE(layout2D.isSurjective())
+      << "isSurjective() should dispatch to isModularSurjective() for "
+         "multi-dim NPOT";
+
+  // Test a non-surjective multi-dimensional layout
+  LinearLayout::BasesT basesNonSurj2D;
+  auto &inBases2 = basesNonSurj2D[S("in")];
+  // For out0 (dim=3): only basis [2] mod 3 -> can only reach {0, 2}, missing
+  // {1} For out1 (dim=6): bases [2, 4] mod 6 -> can only reach {0, 2, 4},
+  // missing odd values
+  inBases2.push_back({2, 2});
+  inBases2.push_back({0, 4});
+
+  LinearLayout layoutNonSurj2D(std::move(basesNonSurj2D),
+                               {{S("out0"), 3}, {S("out1"), 6}}, false);
+
+  EXPECT_TRUE(layoutNonSurj2D.isModular())
+      << "Non-surjective 2D layout should be modular";
+  EXPECT_FALSE(layoutNonSurj2D.isModularSurjective())
+      << "Non-surjective multi-dim layout should return false";
+}
+
+TEST_F(LinearLayoutTest, Pow2AdditiveSurjectivityRegression) {
+  // CORRECTNESS regression (T274241798 #1): apply() composes modular out-dims
+  // with ADD+mod, but checkPow2Surjectivity previously used a GF(2)/XOR-rank
+  // check. Bases {1,3,4,8} over out-dim size 12 are NON-surjective under
+  // ADD+mod — their subset sums reach only 9 of 12 values
+  // ({0,1,3,4,5,7,8,9,11}, missing {2,6,10}) — yet the XOR-rank check wrongly
+  // reported surjective.
+  LinearLayout layout({{S("in"), {{1}, {3}, {4}, {8}}}}, {{S("out"), 12}},
+                      /*requireSurjective=*/false);
+  EXPECT_TRUE(layout.isModular());
+
+  // Brute-force the actual reachable set under apply()'s ADD+mod semantics and
+  // confirm value 2 (among others) is unreachable.
+  std::set<int32_t> reachable;
+  for (int i = 0; i < (1 << layout.getInDimSizeLog2(S("in"))); ++i) {
+    reachable.insert(layout.apply({{S("in"), i}})[0].second);
+  }
+  EXPECT_EQ(reachable.size(), 9u);
+  EXPECT_EQ(reachable.count(2), 0u);
+
+  // The fix: surjectivity must agree with apply() and report NON-surjective.
+  EXPECT_FALSE(layout.isModularSurjective());
+  EXPECT_FALSE(layout.isSurjective());
+
+  // Sanity: a genuinely surjective modular layout still passes.
+  auto surj = LinearLayout::modularStrided1D(12, 1, S("in"), S("out"));
+  EXPECT_TRUE(surj.isModularSurjective());
+}
+
+TEST_F(LinearLayoutTest, SurjectivityTruncationRegression) {
+  // operator* with same inDim+outDim produces 6 non-zero bases for modulus 27,
+  // exceeding ceil(log2(27))=5. Old truncation gave false negative.
+  auto inner = LinearLayout::modularStrided1D(3, 1, S("A"), S("out"));
+  auto outer = LinearLayout::modularStrided1D(9, 1, S("A"), S("out"));
+  auto product = inner * outer;
+  EXPECT_EQ(product.getOutDimSize(S("out")), 27);
+  EXPECT_TRUE(product.isModularSurjective());
+}
+
+//===----------------------------------------------------------------------===//
+// Mixed-Shape Tests (pow2 + NPOT dims in the same layout)
+// Verifies that per-layout isModular is correct for mixed shapes.
+//===----------------------------------------------------------------------===//
+
+TEST_F(LinearLayoutTest, MixedShape_OperatorStar_SharedDim) {
+  // When inner and outer share an output dim, sizes multiply (not shift).
+  // inner: 4 -> dim0=4; outer: 6 -> dim0=6. Product should be 24, not 64.
+  auto inner = LinearLayout::identity1D(4, S("register"), S("dim0"));
+  auto outer = LinearLayout::modularStrided1D(6, 1, S("lane"), S("dim0"));
+  auto product = inner * outer;
+
+  EXPECT_EQ(product.getOutDimSize(S("dim0")), 24);
+  EXPECT_TRUE(product.isModular());
+
+  // Outer bases should be multiplied by inner size (4), not shifted.
+  // outer basis[0] = 1 -> product basis[2] = 1*4 = 4
+  // outer basis[1] = 2 -> product basis[3] = 2*4 = 8
+  // outer basis[2] = 4 -> product basis[4] = 4*4 = 16
+  EXPECT_EQ(product.getBasis(S("lane"), 0, S("dim0")), 4);
+  EXPECT_EQ(product.getBasis(S("lane"), 1, S("dim0")), 8);
+  EXPECT_EQ(product.getBasis(S("lane"), 2, S("dim0")), 16);
+}
+
+TEST_F(LinearLayoutTest, MixedShape_ReshapeOuts) {
+  // Flatten/unflatten roundtrip for mixed layout.
+  auto mixed = LinearLayout::identity1D(4, S("in"), S("dim0")) *
+               LinearLayout::modularStrided1D(6, 1, S("in2"), S("dim1"));
+
+  auto flat = mixed.flattenOuts();
+  EXPECT_EQ(flat.getOutDimSize(S("dim0")), 24);
+
+  // Verify that apply on the flattened layout matches mixed-radix encoding.
+  for (int r = 0; r < 4; ++r) {
+    for (int l = 0; l < 6; ++l) {
+      auto mixedResult = mixed.apply({{S("in"), r}, {S("in2"), l}});
+      auto flatResult = flat.apply({{S("in"), r}, {S("in2"), l}});
+      int expected = mixedResult[0].second + mixedResult[1].second * 4;
+      EXPECT_EQ(flatResult[0].second, expected) << "r=" << r << " l=" << l;
+    }
+  }
+}
+
+// invertAndCompose with mixed pow2 + NPOT output dims.
+// Exercises lstsqModular dispatch when only some dims are NPOT.
+TEST_F(LinearLayoutTest, InvertAndCompose_Mixed_Pow2AndNPOT) {
+  // Layout A: in(32) -> dim0(4, pow2) x dim1(6, NPOT)
+  LinearLayout::BasesT basesA;
+  auto &bsA = basesA[S("in")];
+  bsA.push_back({1, 0}); // bit 0: +1 to dim0
+  bsA.push_back({2, 0}); // bit 1: +2 to dim0
+  bsA.push_back({0, 1}); // bit 2: +1 to dim1
+  bsA.push_back({0, 2}); // bit 3: +2 to dim1
+  bsA.push_back({0, 4}); // bit 4: +4 to dim1
+
+  llvm::SmallVector<std::pair<StringAttr, int32_t>> outDims;
+  outDims.push_back({S("dim0"), 4});
+  outDims.push_back({S("dim1"), 6});
+  LinearLayout A(std::move(basesA), outDims, false);
+
+  // Layout B: in(16) -> dim0(4, pow2) x dim1(6, NPOT)
+  LinearLayout::BasesT basesB;
+  auto &bsB = basesB[S("in")];
+  bsB.push_back({1, 0}); // bit 0: +1 to dim0
+  bsB.push_back({2, 0}); // bit 1: +2 to dim0
+  bsB.push_back({0, 1}); // bit 2: +1 to dim1
+  bsB.push_back({0, 2}); // bit 3: +2 to dim1
+
+  LinearLayout B(std::move(basesB), outDims, false);
+
+  EXPECT_FALSE(A.isOutDimModular(S("dim0"))) << "dim0=4 is pow2";
+  EXPECT_TRUE(A.isOutDimModular(S("dim1"))) << "dim1=6 is NPOT";
+  EXPECT_TRUE(A.isModular()) << "mixed layout has NPOT dim";
+
+  LinearLayout result = A.invertAndCompose(B);
+
+  // Verify: A(result(i)) == B(i) for all i in B's domain
+  for (int i = 0; i < (1 << B.getTotalInDimSizeLog2()); ++i) {
+    auto b_out = B.apply({{S("in"), i}});
+    auto result_in = result.apply({{S("in"), i}});
+    auto actual = A.apply({{S("in"), result_in[0].second}});
+
+    EXPECT_EQ(actual, b_out)
+        << "Mismatch at i=" << i << ": B=(" << b_out[0].second << ","
+        << b_out[1].second << "), A(result(i))=(" << actual[0].second << ","
+        << actual[1].second << ")";
+  }
+}
+
+// Prove XOR and ADD diverge for NPOT dim, and layout picks the right algebra.
+// Per-dim dispatch: pow2 dims use XOR, NPOT dims use ADD+mod.
+TEST_F(LinearLayoutTest, MixedShape_XorVsAdd_Divergence) {
+  // dim0=8 (pow2, XOR), dim1=6 (NPOT, ADD+mod)
+  auto pow2Part = LinearLayout::identity1D(8, S("in"), S("dim0"));
+  auto npotPart = LinearLayout::modularStrided1D(6, 1, S("in2"), S("dim1"));
+  auto mixed = pow2Part * npotPart;
+
+  EXPECT_FALSE(mixed.isOutDimModular(S("dim0")));
+  EXPECT_TRUE(mixed.isOutDimModular(S("dim1")));
+  EXPECT_TRUE(mixed.isModular());
+
+  // input=7 for dim1 (bits 0+1+2): XOR(1,2,4)=7, ADD(1+2+4)%6=1
+  // The NPOT dim must use ADD+UREM, giving 1 (not 7).
+  auto result = mixed.apply({{S("in"), 0}, {S("in2"), 7}});
+  int dim1val = result[1].second;
+  EXPECT_EQ(dim1val, 1)
+      << "NPOT dim should use ADD+UREM: (1+2+4)%6=1, not XOR=7";
+  EXPECT_LT(dim1val, 6) << "NPOT result must be in range [0, 6)";
+
+  // For pow2 dim with identity bases, input=7: XOR(1,2,4)=7
+  auto result2 = mixed.apply({{S("in"), 7}, {S("in2"), 0}});
+  EXPECT_EQ(result2[0].second, 7) << "pow2 dim: XOR(1,2,4) = 7";
+}
+
+// Verify isOutDimModular is preserved through compose and invertAndCompose.
+TEST_F(LinearLayoutTest, MixedShape_Compose_PreservesPerDimModular) {
+  // Build a mixed layout: dim0=4 (pow2), dim1=6 (NPOT)
+  auto mixed = LinearLayout::identity1D(4, S("in"), S("dim0")) *
+               LinearLayout::modularStrided1D(6, 1, S("in2"), S("dim1"));
+
+  EXPECT_FALSE(mixed.isOutDimModular(S("dim0")));
+  EXPECT_TRUE(mixed.isOutDimModular(S("dim1")));
+
+  // Compose with identity-like transform preserves per-dim sizes.
+  auto transform = LinearLayout::identity1D(4, S("dim0"), S("out0")) *
+                   LinearLayout::modularStrided1D(6, 1, S("dim1"), S("out1"));
+  auto composed = mixed.compose(transform);
+
+  EXPECT_FALSE(composed.isOutDimModular(S("out0")))
+      << "pow2 dim stays pow2 after compose";
+  EXPECT_TRUE(composed.isOutDimModular(S("out1")))
+      << "NPOT dim stays NPOT after compose";
+
+  // Verify compose matches sequential apply.
+  for (int r = 0; r < 4; ++r) {
+    for (int l = 0; l < 6; ++l) {
+      auto mixedResult = mixed.apply({{S("in"), r}, {S("in2"), l}});
+      auto transformResult = transform.apply(mixedResult);
+      auto composedResult = composed.apply({{S("in"), r}, {S("in2"), l}});
+      EXPECT_EQ(composedResult[0].second, transformResult[0].second);
+      EXPECT_EQ(composedResult[1].second, transformResult[1].second);
+    }
+  }
+
+  // invertAndCompose with mixed dims preserves per-dim modular status.
+  // Uses same layout structure as InvertAndCompose_Mixed_Pow2AndNPOT.
+  LinearLayout::BasesT basesA;
+  auto &bsA = basesA[S("in")];
+  bsA.push_back({1, 0});
+  bsA.push_back({2, 0});
+  bsA.push_back({0, 1});
+  bsA.push_back({0, 2});
+  bsA.push_back({0, 4});
+
+  llvm::SmallVector<std::pair<StringAttr, int32_t>> outDims;
+  outDims.push_back({S("d0"), 4});
+  outDims.push_back({S("d1"), 6});
+  LinearLayout A(std::move(basesA), outDims, false);
+
+  LinearLayout::BasesT basesB;
+  auto &bsB = basesB[S("in")];
+  bsB.push_back({1, 0});
+  bsB.push_back({2, 0});
+  bsB.push_back({0, 1});
+  bsB.push_back({0, 2});
+  LinearLayout B(std::move(basesB), outDims, false);
+
+  EXPECT_FALSE(A.isOutDimModular(S("d0")));
+  EXPECT_TRUE(A.isOutDimModular(S("d1")));
+
+  LinearLayout iac = A.invertAndCompose(B);
+  // Result maps B's input dim "in" -> A's input dim "in" (both pow2).
+  // Verify correctness: A(iac(i)) == B(i) for all i.
+  for (int i = 0; i < (1 << B.getTotalInDimSizeLog2()); ++i) {
+    auto b_out = B.apply({{S("in"), i}});
+    auto r_in = iac.apply({{S("in"), i}});
+    auto a_out = A.apply({{S("in"), r_in[0].second}});
+    EXPECT_EQ(a_out, b_out) << "invertAndCompose mismatch at i=" << i;
+  }
+}
+
+// Verify that per-dim dispatch works correctly for mixed layouts:
+// pow2 dims use XOR, NPOT dims use ADD+mod. For non-overlapping identity
+// bases on pow2 dims, XOR and ADD+mod give identical results.
+TEST_F(LinearLayoutTest, ModularLayout_PerDimDispatch_Pow2DimInModularLayout) {
+  // Build a mixed layout: dim0=8 (pow2, XOR), dim1=6 (NPOT, ADD+mod)
+  auto pow2Part = LinearLayout::identity1D(8, S("in"), S("dim0"));
+  auto npotPart = LinearLayout::modularStrided1D(6, 1, S("in2"), S("dim1"));
+  auto mixed = pow2Part * npotPart;
+
+  EXPECT_TRUE(mixed.isModular());
+  EXPECT_FALSE(mixed.isOutDimModular(S("dim0")));
+  EXPECT_TRUE(mixed.isOutDimModular(S("dim1")));
+
+  // Exhaustive check: apply() on the mixed layout should produce valid
+  // results for all inputs. dim0 (pow2) uses XOR, dim1 (NPOT) uses ADD+mod.
+  for (int i = 0; i < 8; ++i) {
+    for (int j = 0; j < 8; ++j) { // NPOT dim has ceil(log2(6))=3 input bits
+      auto result = mixed.apply({{S("in"), i}, {S("in2"), j}});
+      EXPECT_GE(result[0].second, 0);
+      EXPECT_LT(result[0].second, 8) << "dim0 result out of range";
+      EXPECT_GE(result[1].second, 0);
+      EXPECT_LT(result[1].second, 6) << "dim1 result out of range";
+    }
+  }
+
+  // Verify compose consistency: compose(identity) == original
+  auto transform = LinearLayout::identity1D(8, S("dim0"), S("out0")) *
+                   LinearLayout::modularStrided1D(6, 1, S("dim1"), S("out1"));
+  auto composed = mixed.compose(transform);
+  for (int i = 0; i < 8; ++i) {
+    for (int j = 0; j < 8; ++j) {
+      auto direct = mixed.apply({{S("in"), i}, {S("in2"), j}});
+      auto viaCompose = composed.apply({{S("in"), i}, {S("in2"), j}});
+      EXPECT_EQ(direct[0].second, viaCompose[0].second)
+          << "compose mismatch dim0 at (" << i << "," << j << ")";
+      EXPECT_EQ(direct[1].second, viaCompose[1].second)
+          << "compose mismatch dim1 at (" << i << "," << j << ")";
+    }
+  }
+}
+
+// Verify that per-dim dispatch uses XOR for pow2 dims even in a mixed layout.
+// Overlapping bases on a pow2 dim produce XOR results, not ADD+mod.
+TEST_F(LinearLayoutTest, MixedLayout_OverlappingPow2Bases_UsesXor) {
+  // dim0=8 (pow2) with overlapping bases {3, 5}, dim1=6 (NPOT)
+  // For input 3 (bits 0+1): XOR(3,5)=6 (per-dim dispatch uses XOR for pow2)
+  LinearLayout::BasesT bases;
+  bases[S("in")] = {{3, 0}, {5, 0}, {0, 1}, {0, 2}};
+
+  llvm::SmallVector<std::pair<StringAttr, int32_t>> outDims;
+  outDims.push_back({S("dim0"), 8});
+  outDims.push_back({S("dim1"), 6});
+  LinearLayout layout(std::move(bases), outDims, /*requireSurjective=*/false);
+
+  EXPECT_TRUE(layout.isModular());
+
+  // input=3 (bits 0+1): bases[0]={3,0}, bases[1]={5,0}
+  // dim0 (pow2): XOR(3,5) = 6
+  auto result = layout.apply({{S("in"), 3}});
+  EXPECT_EQ(result[0].second, 6)
+      << "Pow2 dim uses XOR even in mixed layout: XOR(3,5)=6";
+}
+
+// Verify that final-UREM produces the same result as per-step UREM for all
+// inputs, confirming the codegen optimization is algebraically equivalent.
+TEST_F(LinearLayoutTest, CarryFreeEquivalence_FinalUremEqualsPerStep) {
+  for (int size : {3, 6, 48}) {
+    auto layout = LinearLayout::modularStrided1D(size, 1, S("in"), S("out"));
+    int nBits = layout.getInDimSizeLog2(S("in"));
+    int nInputs = 1 << nBits;
+
+    for (int input = 0; input < nInputs; ++input) {
+      // Per-step UREM (what apply() does)
+      auto perStep = layout.apply({{S("in"), input}});
+
+      // Final-UREM only: accumulate bases without intermediate modulo
+      int32_t finalSum = 0;
+      for (int bit = 0; bit < nBits; ++bit) {
+        if (input & (1 << bit))
+          finalSum += layout.getBasis(S("in"), bit, S("out"));
+      }
+      int32_t finalResult = finalSum % size;
+
+      EXPECT_EQ(perStep[0].second, finalResult)
+          << "size=" << size << " input=" << input;
+    }
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// NPOT x NPOT Apply Tests (both dims non-power-of-2)
+// Validates modularStrided1D apply() for shapes from the 2D NPOT benchmarks.
+//===----------------------------------------------------------------------===//
+
+TEST_F(LinearLayoutTest, MixedShape_Apply_NpotXNpot) {
+  // Jagged tensor shapes: (33, 48), (3, 768)
+  // Grouped operation shapes: (12, 48), (6, 96)
+  struct Shape {
+    int32_t m, n;
+  };
+  Shape shapes[] = {{33, 48}, {3, 768}, {12, 48}, {6, 96}};
+
+  for (auto [m, n] : shapes) {
+    auto layoutM = LinearLayout::modularStrided1D(m, 1, S("dim0"), S("out0"));
+    auto layoutN = LinearLayout::modularStrided1D(n, 1, S("dim1"), S("out1"));
+    auto product = layoutM * layoutN;
+
+    EXPECT_TRUE(product.isModular())
+        << m << "x" << n << " product should be modular";
+    EXPECT_EQ(product.getOutDimSize(S("out0")), m);
+    EXPECT_EQ(product.getOutDimSize(S("out1")), n);
+
+    // Verify apply() produces values in range [0, m) x [0, n)
+    int nBits0 = product.getInDimSizeLog2(S("dim0"));
+    int nBits1 = product.getInDimSizeLog2(S("dim1"));
+    for (int i = 0; i < (1 << nBits0); ++i) {
+      for (int j = 0; j < (1 << nBits1); ++j) {
+        auto result = product.apply({{S("dim0"), i}, {S("dim1"), j}});
+        EXPECT_GE(result[0].second, 0) << m << "x" << n << " i=" << i;
+        EXPECT_LT(result[0].second, m) << m << "x" << n << " i=" << i;
+        EXPECT_GE(result[1].second, 0) << m << "x" << n << " j=" << j;
+        EXPECT_LT(result[1].second, n) << m << "x" << n << " j=" << j;
+      }
+    }
+
+    // Verify surjectivity: all (m*n) output values are reachable
+    EXPECT_TRUE(product.isModularSurjective())
+        << m << "x" << n << " product should be surjective";
+  }
+}
+
+TEST_F(LinearLayoutTest, PseudoinvertNPOT) {
+  // pseudoinvert must not crash on NPOT output dimensions.
+  for (int size : {3, 5, 6, 7, 9, 10, 12}) {
+    auto layout = LinearLayout::modularIdentity1D(size, S("in"), S("out"));
+    auto inv = layout.pseudoinvert();
+
+    // pseudoinvert(A) composed with A should act as identity on reachable
+    // outputs: for each input i, apply(pseudoinvert(apply(i))) == i.
+    for (int i = 0; i < size; ++i) {
+      auto fwd = layout.apply({{S("in"), i}});
+      auto back = inv.apply({{S("out"), fwd[0].second}});
+      EXPECT_EQ(back[0].second, i) << "size=" << size << " i=" << i;
+    }
+  }
+}
+
+TEST_F(LinearLayoutTest, ModularIdentity1D_ExhaustiveApply) {
+  // Brute-force verify apply() covers every value in [0, dim).
+  for (int dim : {3, 5, 6, 7, 9, 10, 12, 15}) {
+    auto layout = LinearLayout::modularIdentity1D(dim, S("in"), S("out"));
+    int nBits = layout.getInDimSizeLog2(S("in"));
+    int nInputs = 1 << nBits;
+
+    std::set<int32_t> outputs;
+    for (int i = 0; i < nInputs; ++i) {
+      auto result = layout.apply({{S("in"), i}});
+      EXPECT_GE(result[0].second, 0) << "dim=" << dim << " i=" << i;
+      EXPECT_LT(result[0].second, dim) << "dim=" << dim << " i=" << i;
+      outputs.insert(result[0].second);
+    }
+
+    EXPECT_EQ(static_cast<int>(outputs.size()), dim)
+        << "dim=" << dim << ": apply() must cover all values in [0, " << dim
+        << ")";
+  }
+}
+
+// Compose two modular layouts sharing an output dimension.
+TEST_F(LinearLayoutTest, ComposeModularSharedOutDim) {
+  // 1D: inner maps in->dim0(6), outer maps dim0->out(6) with stride 2.
+  auto inner = LinearLayout::modularStrided1D(6, 1, S("in"), S("dim0"));
+  auto outer = LinearLayout::modularStrided1D(6, 2, S("dim0"), S("out"));
+  auto composed = inner.compose(outer);
+
+  for (int x = 0; x < (1 << inner.getInDimSizeLog2(S("in"))); ++x) {
+    auto inner_out = inner.apply({{S("in"), x}});
+    auto outer_out = outer.apply(inner_out);
+    EXPECT_EQ(composed.apply({{S("in"), x}}), outer_out) << "x=" << x;
+  }
+
+  // 2D: compose modular layouts over Z/3 x Z/5.
+  auto inner2D = LinearLayout::modularStrided1D(3, 1, S("in"), S("d0")) *
+                 LinearLayout::modularStrided1D(5, 1, S("in2"), S("d1"));
+  auto outer2D = LinearLayout::modularStrided1D(3, 2, S("d0"), S("out0")) *
+                 LinearLayout::modularStrided1D(5, 3, S("d1"), S("out1"));
+  auto composed2D = inner2D.compose(outer2D);
+
+  for (int i = 0; i < (1 << inner2D.getInDimSizeLog2(S("in"))); ++i) {
+    for (int j = 0; j < (1 << inner2D.getInDimSizeLog2(S("in2"))); ++j) {
+      auto in_out = inner2D.apply({{S("in"), i}, {S("in2"), j}});
+      auto out_out = outer2D.apply(in_out);
+      EXPECT_EQ(composed2D.apply({{S("in"), i}, {S("in2"), j}}), out_out)
+          << "i=" << i << " j=" << j;
+    }
+  }
+}
+
+// Flatten a 2D NPOT layout to 1D then unflatten back; verify round-trip.
+TEST_F(LinearLayoutTest, ReshapeOutsNPOT_FlattenUnflattenRoundtrip) {
+  // [3, 5] -> [15] -> [3, 5]
+  auto original = LinearLayout::modularStrided1D(3, 1, S("in1"), S("out0")) *
+                  LinearLayout::modularStrided1D(5, 1, S("in2"), S("out1"));
+
+  auto flat = original.flattenOuts();
+  EXPECT_EQ(flat.getOutDimSize(S("out0")), 15);
+
+  auto unflat = flat.reshapeOuts({{S("out0"), 3}, {S("out1"), 5}});
+
+  for (int i = 0; i < (1 << original.getInDimSizeLog2(S("in1"))); ++i) {
+    for (int j = 0; j < (1 << original.getInDimSizeLog2(S("in2"))); ++j) {
+      EXPECT_EQ(unflat.apply({{S("in1"), i}, {S("in2"), j}}),
+                original.apply({{S("in1"), i}, {S("in2"), j}}))
+          << "i=" << i << " j=" << j;
+    }
+  }
+
+  // Reversed dim order: [5, 3] -> [15] -> [5, 3]
+  auto origR = LinearLayout::modularStrided1D(5, 1, S("in1"), S("out0")) *
+               LinearLayout::modularStrided1D(3, 1, S("in2"), S("out1"));
+  auto flatR = origR.flattenOuts();
+  auto unflatR = flatR.reshapeOuts({{S("out0"), 5}, {S("out1"), 3}});
+
+  for (int i = 0; i < (1 << origR.getInDimSizeLog2(S("in1"))); ++i) {
+    for (int j = 0; j < (1 << origR.getInDimSizeLog2(S("in2"))); ++j) {
+      EXPECT_EQ(unflatR.apply({{S("in1"), i}, {S("in2"), j}}),
+                origR.apply({{S("in1"), i}, {S("in2"), j}}))
+          << "i=" << i << " j=" << j;
+    }
+  }
+}
+
+// Verify round-trip: A.invertAndCompose(B).compose(B) == A for modular layouts.
+TEST_F(LinearLayoutTest, InvertAndCompose_ModularRoundTrip) {
+  // 1D round-trips with various NPOT dim sizes and coprime strides.
+  struct Case {
+    int size, strideA, strideB;
+  };
+  Case cases[] = {{6, 1, 5}, {10, 3, 7}, {15, 4, 11}};
+  for (auto [size, sA, sB] : cases) {
+    auto A = LinearLayout::modularStrided1D(size, sA, S("in1"), S("out"));
+    auto B = LinearLayout::modularStrided1D(size, sB, S("in2"), S("out"));
+    auto X = A.invertAndCompose(B);
+    EXPECT_EQ(X.compose(B), A)
+        << "size=" << size << " sA=" << sA << " sB=" << sB;
+  }
+
+  // Multi-dim: both dims same prime size avoids LCM modulus aliasing.
+  auto Am = LinearLayout::modularStrided1D(3, 1, S("in1"), S("d0")) *
+            LinearLayout::modularStrided1D(3, 1, S("in1b"), S("d1"));
+  auto Bm = LinearLayout::modularStrided1D(3, 2, S("in2"), S("d0")) *
+            LinearLayout::modularStrided1D(3, 2, S("in2b"), S("d1"));
+  auto Xm = Am.invertAndCompose(Bm);
+  EXPECT_EQ(Xm.compose(Bm),
+            Am.transposeOuts(llvm::to_vector(Bm.getOutDimNames())));
+}
+
+// Multi-rep NPOT invertAndCompose: simulates a multi-rep shared memory
+// conversion with NPOT dimensions (e.g. size 12). Verifies that all output
+// values remain in bounds and the solution is correct.
+TEST_F(LinearLayoutTest, InvertAndCompose_MultiRepNPOT) {
+  // A: 2 input dims (register, lane), output dim with NPOT size 12.
+  // Simulates a layout where multiple reps tile an NPOT dimension.
+  auto A = LinearLayout::modularIdentity1D(12, S("register"), S("dim0")) *
+           LinearLayout::zeros1D(4, S("lane"), S("dim0"));
+
+  // B: different input structure mapping to same output space.
+  auto B = LinearLayout::modularIdentity1D(12, S("register"), S("dim0")) *
+           LinearLayout::zeros1D(4, S("lane"), S("dim0"));
+
+  EXPECT_TRUE(A.isOutDimModular(S("dim0")));
+
+  auto iac = A.invertAndCompose(B);
+
+  // Verify all output values are in bounds.
+  int regSize = iac.getInDimSize(S("register"));
+  int laneSize = iac.getInDimSize(S("lane"));
+  for (int reg = 0; reg < regSize; reg++) {
+    for (int lane = 0; lane < laneSize; lane++) {
+      auto result = iac.apply({{S("register"), reg}, {S("lane"), lane}});
+      for (auto &[dim, val] : result) {
+        EXPECT_GE(val, 0) << "Negative output at reg=" << reg
+                          << " lane=" << lane;
+        EXPECT_LT(val, iac.getOutDimSize(dim))
+            << "Out of bounds at reg=" << reg << " lane=" << lane
+            << " dim=" << dim.str();
+      }
+    }
+  }
+
+  // Verify correctness: A(iac(input)) == B(input) for all inputs.
+  for (int reg = 0; reg < regSize; reg++) {
+    for (int lane = 0; lane < laneSize; lane++) {
+      auto b_out = B.apply({{S("register"), reg}, {S("lane"), lane}});
+      auto r_vals = iac.apply({{S("register"), reg}, {S("lane"), lane}});
+      auto a_out = A.apply(r_vals);
+      EXPECT_EQ(a_out, b_out)
+          << "invertAndCompose mismatch at reg=" << reg << " lane=" << lane;
+    }
+  }
+}
+
+// Multi-rep NPOT invertAndCompose with mixed pow2 and NPOT output dims.
+// Simulates shared memory conversion for a tensor with shape like [32, 12].
+TEST_F(LinearLayoutTest, InvertAndCompose_MultiRepMixedNPOT) {
+  // A: maps register -> (dim0=8, dim1=12)
+  // Shear family: some bases touch only pow2 dim, others touch NPOT dim.
+  LinearLayout::BasesT basesA;
+  auto &bsA = basesA[S("register")];
+  // Group-0 bases (touch pow2 dim0)
+  bsA.push_back({1, 0}); // bit 0 -> dim0 += 1
+  bsA.push_back({2, 0}); // bit 1 -> dim0 += 2
+  bsA.push_back({4, 0}); // bit 2 -> dim0 += 4
+  // Group-1 bases (touch only NPOT dim1)
+  bsA.push_back({0, 1}); // bit 3 -> dim1 += 1
+  bsA.push_back({0, 2}); // bit 4 -> dim1 += 2
+  bsA.push_back({0, 4}); // bit 5 -> dim1 += 4
+  bsA.push_back({0, 8}); // bit 6 -> dim1 += 8
+
+  llvm::SmallVector<std::pair<StringAttr, int32_t>> outDims;
+  outDims.push_back({S("dim0"), 8});
+  outDims.push_back({S("dim1"), 12});
+  LinearLayout A(std::move(basesA), outDims, false);
+
+  // B: subset mapping
+  LinearLayout::BasesT basesB;
+  auto &bsB = basesB[S("register")];
+  bsB.push_back({1, 0});
+  bsB.push_back({2, 0});
+  bsB.push_back({4, 0});
+  bsB.push_back({0, 1});
+  bsB.push_back({0, 2});
+  bsB.push_back({0, 4});
+  LinearLayout B(std::move(basesB), outDims, false);
+
+  EXPECT_FALSE(A.isOutDimModular(S("dim0")));
+  EXPECT_TRUE(A.isOutDimModular(S("dim1")));
+
+  auto iac = A.invertAndCompose(B);
+
+  // Verify correctness.
+  int inSize = 1 << B.getTotalInDimSizeLog2();
+  for (int i = 0; i < inSize; i++) {
+    auto b_out = B.apply({{S("register"), i}});
+    auto r_vals = iac.apply({{S("register"), i}});
+    auto a_out = A.apply(r_vals);
+    EXPECT_EQ(a_out, b_out) << "invertAndCompose mismatch at i=" << i;
+  }
+}
+
+// Test the per-dim factored solve in lstsq for mixed pow2/NPOT layouts.
+// This exercises the code path where lstsq splits output dims into pow2
+// (solved via GF(2) RREF) and NPOT (solved via lstsqModular), then combines.
+TEST_F(LinearLayoutTest, Lstsq_PerDimFactoredSolve_MixedPow2NPOT) {
+  // A: maps input(128) -> dim0(8, pow2) x dim1(12, NPOT)
+  // Simulates the split-dim layout: dim0 uses XOR, dim1 uses ADD+mod.
+  // Bases are decoupled: pow2 bases have S=0 in dim1, NPOT bases have S=0 in
+  // dim0.
+  LinearLayout::BasesT basesA;
+  auto &bsA = basesA[S("in")];
+  // Pow2 dim0 bases (XOR algebra)
+  bsA.push_back({1, 0}); // bit 0 -> dim0 XOR 1
+  bsA.push_back({2, 0}); // bit 1 -> dim0 XOR 2
+  bsA.push_back({4, 0}); // bit 2 -> dim0 XOR 4
+  // NPOT dim1 bases (ADD+mod algebra)
+  bsA.push_back({0, 1}); // bit 3 -> dim1 ADD 1
+  bsA.push_back({0, 2}); // bit 4 -> dim1 ADD 2
+  bsA.push_back({0, 4}); // bit 5 -> dim1 ADD 4
+  bsA.push_back({0, 8}); // bit 6 -> dim1 ADD 8
+
+  llvm::SmallVector<std::pair<StringAttr, int32_t>> outDims;
+  outDims.push_back({S("dim0"), 8});
+  outDims.push_back({S("dim1"), 12});
+  LinearLayout A(std::move(basesA), outDims, false);
+
+  // B: maps input(64) -> dim0(8) x dim1(12), subset of A's image
+  LinearLayout::BasesT basesB;
+  auto &bsB = basesB[S("in")];
+  bsB.push_back({1, 0}); // bit 0 -> dim0 += 1
+  bsB.push_back({2, 0}); // bit 1 -> dim0 += 2
+  bsB.push_back({4, 0}); // bit 2 -> dim0 += 4
+  bsB.push_back({0, 1}); // bit 3 -> dim1 += 1
+  bsB.push_back({0, 2}); // bit 4 -> dim1 += 2
+  bsB.push_back({0, 4}); // bit 5 -> dim1 += 4
+  LinearLayout B(std::move(basesB), outDims, false);
+
+  EXPECT_TRUE(A.isModular());
+  EXPECT_FALSE(A.isOutDimModular(S("dim0")));
+  EXPECT_TRUE(A.isOutDimModular(S("dim1")));
+
+  // invertAndCompose calls lstsq internally.
+  auto result = A.invertAndCompose(B);
+
+  // Verify: A(result(i)) == B(i) for all i in B's domain.
+  int inSize = 1 << B.getTotalInDimSizeLog2();
+  for (int i = 0; i < inSize; i++) {
+    auto b_out = B.apply({{S("in"), i}});
+    auto r_in = result.apply({{S("in"), i}});
+    auto a_out = A.apply(r_in);
+    EXPECT_EQ(a_out, b_out) << "Per-dim factored solve mismatch at i=" << i;
+  }
+}
+
+// Test per-dim factored solve with multi-input-dim layout (register + lane).
+TEST_F(LinearLayoutTest, Lstsq_PerDimFactoredSolve_MultiInputDim) {
+  // A: maps (register x lane) -> dim0(4, pow2) x dim1(6, NPOT)
+  auto A_pow2 = LinearLayout::identity1D(4, S("register"), S("dim0"));
+  auto A_npot = LinearLayout::modularStrided1D(6, 1, S("lane"), S("dim1"));
+  auto A = A_pow2 * A_npot;
+
+  // B: maps (register x lane) -> dim0(4) x dim1(6), same structure
+  auto B_pow2 = LinearLayout::identity1D(4, S("register"), S("dim0"));
+  auto B_npot = LinearLayout::modularStrided1D(6, 1, S("lane"), S("dim1"));
+  auto B_layout = B_pow2 * B_npot;
+
+  EXPECT_TRUE(A.isModular());
+
+  auto result = A.invertAndCompose(B_layout);
+
+  // Verify: A(result(input)) == B(input) for all inputs.
+  int regSize = B_layout.getInDimSize(S("register"));
+  int laneSize = B_layout.getInDimSize(S("lane"));
+  for (int reg = 0; reg < regSize; reg++) {
+    for (int lane = 0; lane < laneSize; lane++) {
+      auto b_out = B_layout.apply({{S("register"), reg}, {S("lane"), lane}});
+      auto r_vals = result.apply({{S("register"), reg}, {S("lane"), lane}});
+      auto a_out = A.apply(r_vals);
+      EXPECT_EQ(a_out, b_out)
+          << "Multi-input-dim mismatch at reg=" << reg << " lane=" << lane;
+    }
+  }
+}
+
+// Verify modularIdentity1D(6, ...) composes correctly with other layouts,
+// simulating NPOT kWidth=6 for NVFp4 K=96.
+TEST_F(LinearLayoutTest, ModularIdentity1D_KWidth6_Compose) {
+  // kWidth=6 register layout along K dimension
+  auto regs = LinearLayout::modularIdentity1D(6, S("register"), S("dimK"));
+
+  // 4 lanes along non-K dimension (pow2)
+  auto lanes = LinearLayout::identity1D(4, S("lane"), S("dimNonK"));
+
+  // Compose: regs * lanes
+  auto tileLayout = regs * lanes;
+
+  EXPECT_EQ(tileLayout.getOutDimSize(S("dimK")), 6);
+  EXPECT_EQ(tileLayout.getOutDimSize(S("dimNonK")), 4);
+
+  // Verify all output values are in bounds.
+  int regSize = tileLayout.getInDimSize(S("register"));
+  int laneSize = tileLayout.getInDimSize(S("lane"));
+  for (int reg = 0; reg < regSize; reg++) {
+    for (int lane = 0; lane < laneSize; lane++) {
+      auto result = tileLayout.apply({{S("register"), reg}, {S("lane"), lane}});
+      for (auto &[dim, val] : result) {
+        EXPECT_GE(val, 0);
+        EXPECT_LT(val, tileLayout.getOutDimSize(dim))
+            << "Out of bounds: reg=" << reg << " lane=" << lane
+            << " dim=" << dim.str() << " val=" << val;
+      }
+    }
+  }
+
+  // Verify invertAndCompose with itself produces identity-like mapping.
+  auto iac = tileLayout.invertAndCompose(tileLayout);
+  for (int reg = 0; reg < regSize; reg++) {
+    for (int lane = 0; lane < laneSize; lane++) {
+      auto orig = tileLayout.apply({{S("register"), reg}, {S("lane"), lane}});
+      auto mapped = iac.apply({{S("register"), reg}, {S("lane"), lane}});
+      auto roundTrip = tileLayout.apply(mapped);
+      EXPECT_EQ(orig, roundTrip)
+          << "Round-trip mismatch at reg=" << reg << " lane=" << lane;
+    }
+  }
+}
+
+// Diagnostic test: verify that the pseudoinverse of a modular layout
+// correctly maps kernel elements (collisions) to the same output.
+// For modularIdentity1D(N), inputs x and x' with x != x' but
+// fwd(x) == fwd(x') must satisfy inv(x) == inv(x') (mod something
+// that makes the store go to the same SMEM slot).
+TEST_F(LinearLayoutTest, PseudoinvertModular_KernelEquivalence) {
+  // Test with small NPOT sizes to understand the behavior
+  for (int N : {3, 5, 6, 7, 9, 10, 12, 48}) {
+    SCOPED_TRACE("N=" + std::to_string(N));
+    auto fwd = LinearLayout::modularIdentity1D(N, S("in"), S("out"));
+    auto inv = fwd.pseudoinvert();
+
+    int inputSize = fwd.getInDimSize(S("in")); // 2^ceil(log2(N))
+
+    // For each pair of inputs that collide under fwd, check that
+    // inv gives them the same output.
+    for (int x1 = 0; x1 < inputSize; x1++) {
+      auto fwd_x1 = fwd.apply({{S("in"), x1}});
+      int fwd_val1 = fwd_x1[0].second;
+      auto inv_x1 = inv.apply({{S("out"), x1}});
+
+      for (int x2 = x1 + 1; x2 < inputSize; x2++) {
+        auto fwd_x2 = fwd.apply({{S("in"), x2}});
+        int fwd_val2 = fwd_x2[0].second;
+
+        if (fwd_val1 == fwd_val2) {
+          // x1 and x2 collide under fwd. Check inv.
+          auto inv_x2 = inv.apply({{S("out"), x2}});
+          // The forward values at inv(x1) and inv(x2) should be equal
+          auto rt1 = fwd.apply(inv_x1);
+          auto rt2 = fwd.apply(inv_x2);
+          EXPECT_EQ(rt1[0].second, rt2[0].second)
+              << "Round-trip mismatch for colliding inputs " << x1 << " and "
+              << x2 << " (both map to fwd=" << fwd_val1 << ")"
+              << " inv(" << x1 << ")=" << inv_x1[0].second << " inv(" << x2
+              << ")=" << inv_x2[0].second;
+
+          // Stronger check: inv(x1) and inv(x2) should be the same
+          // (otherwise we write to two different SMEM offsets for the same
+          // logical element)
+          EXPECT_EQ(inv_x1[0].second, inv_x2[0].second)
+              << "Kernel equivalence violation: inputs " << x1 << " and " << x2
+              << " both map to fwd=" << fwd_val1 << " but inv(" << x1
+              << ")=" << inv_x1[0].second << " and inv(" << x2
+              << ")=" << inv_x2[0].second;
+        }
+      }
+    }
+
+    // Also check coverage: each output of inv should be hit at most once
+    // by non-colliding inputs.
+    std::vector<int> hitCount(inputSize, 0);
+    for (int x = 0; x < inputSize; x++) {
+      auto inv_x = inv.apply({{S("out"), x}});
+      int offset = inv_x[0].second;
+      EXPECT_GE(offset, 0) << "inv(" << x << ") is negative";
+      EXPECT_LT(offset, inputSize) << "inv(" << x << ") out of bounds";
+      hitCount[offset]++;
+    }
+
+    // Check: group inputs by fwd value, verify all in same group get same inv
+    std::map<int, std::vector<int>> fwdGroups;
+    for (int x = 0; x < inputSize; x++) {
+      auto fwd_x = fwd.apply({{S("in"), x}});
+      fwdGroups[fwd_x[0].second].push_back(x);
+    }
+
+    for (auto &[fwdVal, inputs] : fwdGroups) {
+      if (inputs.size() > 1) {
+        int firstInv = inv.apply({{S("out"), inputs[0]}})[0].second;
+        for (size_t i = 1; i < inputs.size(); i++) {
+          int thisInv = inv.apply({{S("out"), inputs[i]}})[0].second;
+          EXPECT_EQ(firstInv, thisInv)
+              << "N=" << N << ": inputs " << inputs[0] << " and " << inputs[i]
+              << " both map to fwd=" << fwdVal
+              << " but get different inv values " << firstInv << " and "
+              << thisInv;
+        }
+      }
+    }
+  }
+}
+
+// Verify invertAndCompose kernel equivalence for the actual store conversion
+// pattern: shared.invertAndCompose(blocked) should map colliding blocked
+// inputs to the same SMEM offset.
+TEST_F(LinearLayoutTest, InvertAndCompose_KernelEquivalence_Store) {
+  for (int N : {3, 5, 6, 7, 48}) {
+    SCOPED_TRACE("N=" + std::to_string(N));
+
+    // Blocked layout: identity mapping (reg, lane, warp) -> dim1
+    auto blocked = LinearLayout::modularIdentity1D(N, S("in"), S("dim1"));
+    // Shared layout: identity mapping offset -> dim1
+    auto shared = LinearLayout::modularIdentity1D(N, S("offset"), S("dim1"));
+
+    // Store conversion: for each (reg,lane,warp), which SMEM offset to write
+    auto storeConv = blocked.invertAndCompose(shared);
+
+    int inputSize = blocked.getInDimSize(S("in"));
+
+    // Group inputs by their blocked output value
+    std::map<int, std::vector<int>> blockedGroups;
+    for (int x = 0; x < inputSize; x++) {
+      auto bx = blocked.apply({{S("in"), x}});
+      blockedGroups[bx[0].second].push_back(x);
+    }
+
+    // All inputs in the same group should get the same SMEM offset
+    for (auto &[blockedVal, inputs] : blockedGroups) {
+      if (inputs.size() <= 1)
+        continue;
+
+      int firstOffset = storeConv.apply({{S("in"), inputs[0]}})[0].second;
+      for (size_t i = 1; i < inputs.size(); i++) {
+        int thisOffset = storeConv.apply({{S("in"), inputs[i]}})[0].second;
+        EXPECT_EQ(firstOffset, thisOffset)
+            << "N=" << N << ": inputs " << inputs[0] << " and " << inputs[i]
+            << " both map to blocked dim1=" << blockedVal
+            << " but get SMEM offsets " << firstOffset << " and " << thisOffset;
+      }
+    }
+
+    // Verify coverage: each SMEM offset in [0, N) should be written exactly
+    // once (counting unique blocked values, not unique inputs)
+    std::vector<int> coverage(inputSize, 0);
+    for (int x = 0; x < inputSize; x++) {
+      int offset = storeConv.apply({{S("in"), x}})[0].second;
+      coverage[offset]++;
+    }
+
+    // For each valid offset in [0, N), check it was hit
+    for (int o = 0; o < N; o++) {
+      EXPECT_GE(coverage[o], 1)
+          << "N=" << N << ": SMEM offset " << o << " never written";
+    }
+  }
 }
 
 } // anonymous namespace

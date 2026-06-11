@@ -96,10 +96,13 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
   if (shape.empty()) {
     return emitError() << "rank 0 memdesc is not allowed";
   }
-  // Every dimension but the first (to allow for pipelining) must be a power of
-  // 2
-  if (!llvm::all_of(shape.drop_front(1), [](int64_t dim) {
-        return llvm::isPowerOf2_64(dim) && dim > 0;
+  bool allowNpot = isa<gpu::NVMMASharedEncodingAttr>(encoding) ||
+                   isa<gpu::SwizzledSharedEncodingAttr>(encoding) ||
+                   isa<nvidia_gpu::TensorMemoryEncodingAttr>(encoding) ||
+                   isa<nvidia_gpu::TensorMemoryScalesEncodingAttr>(encoding) ||
+                   isa<gpu::LinearEncodingAttr>(encoding);
+  if (!llvm::all_of(shape.drop_front(1), [&](int64_t dim) {
+        return dim > 0 && (allowNpot || llvm::isPowerOf2_64(dim));
       }))
     return emitError()
            << "shape must have power-of-2 and non-zero dimensions; got "
@@ -131,8 +134,23 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     }
     shape = shape.take_back(2);
     allocShape = allocShape.take_back(2);
-    if (allocShape[0] < enc.getBlockM() * enc.getCTASplitM() ||
-        allocShape[1] < enc.getBlockN() * enc.getCTASplitN()) {
+    // TMEM encodings clamp blockN up to HW minimum 8 in make_default
+    // (third_party/tlx/language/tlx/types.py:tensor_memory_layout_encoding.make_default);
+    // allocShape may be smaller logically (e.g., (128, 1) for FA alpha/l/m).
+    // Downstream LL conversion (tensorMemoryToLinearLayout) clips back down via
+    // std::min(encoding.getBlockN(), shape[1]), so the encoding's blockN is a
+    // physical-block upper bound, not a strict lower bound on allocShape.
+    // Skip the blockN bound here for TMEM; only enforce blockM.
+    // NPOT M: for a non-power-of-2 M (e.g. 96) the accumulator is logically
+    // smaller than the MMAv5 instruction blockM (128) but is physically
+    // allocated in a blockM-sized TMEM row block, with the trailing rows
+    // unused. Compare against the pow2-ceil of allocShape[0] so an NPOT M
+    // that rounds up to blockM is accepted (same spirit as the blockN skip).
+    auto allocM0 = static_cast<int64_t>(allocShape[0]);
+    auto allocM0Pow2 = llvm::isPowerOf2_64(allocM0)
+                           ? allocM0
+                           : static_cast<int64_t>(llvm::NextPowerOf2(allocM0));
+    if (allocM0Pow2 < enc.getBlockM() * enc.getCTASplitM()) {
       return emitError() << "the allocation shape must be at least "
                          << enc.getBlockM() * enc.getCTASplitM() << "x"
                          << enc.getBlockN() * enc.getCTASplitN() << ". Got "

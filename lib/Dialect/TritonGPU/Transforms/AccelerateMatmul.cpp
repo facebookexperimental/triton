@@ -23,6 +23,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/MathExtras.h"
 
 namespace mlir {
 namespace triton {
@@ -167,7 +168,8 @@ static Value
 getSharedMemoryMMAOperand(Value v, mlir::PatternRewriter &rewriter, int opIdx,
                           bool allowTranspose, bool isMMAv5Fp4Padded = false,
                           bool forceTranspose = false,
-                          Operation *op = nullptr /*only for diagnostic*/) {
+                          Operation *op = nullptr /*only for diagnostic*/,
+                          int forceSwizzleBytes = 0) {
   OpBuilder::InsertionGuard g(rewriter);
   Value arg = v;
   while (auto cvtOp = arg.getDefiningOp<ConvertLayoutOp>())
@@ -203,9 +205,24 @@ getSharedMemoryMMAOperand(Value v, mlir::PatternRewriter &rewriter, int opIdx,
   Attribute SharedMemorySpace =
       SharedMemorySpaceAttr::get(argType.getContext());
   auto CGALayout = getCGALayout(argType.getEncoding());
-  auto newLayout = NVMMASharedEncodingAttr::get(
-      argType.getContext(), argType.getShape(), newOrder, CGALayout,
-      argType.getElementType(), isMMAv5Fp4Padded);
+  // K=96 mxf4nvf4 (.block16, sm_103a) needs the operand in 128B swizzle so the
+  // absolute-LBO descriptor mode is legal (PTX ISA 9.2 §9.7.16.3.1.3
+  // restriction 1: only 128B swizzle / 16B atomicity is supported in that
+  // mode). The auto swizzle picker would choose 32B for the 48-byte packed-K
+  // row (48 % 32 == 0), which silently miscomputes because
+  // computeSMEMDescriptor emits absolute-LBO with a 32B swizzle field. When
+  // forceSwizzleBytes is set, build the encoding with that swizzle explicitly
+  // instead.
+  auto newLayout =
+      forceSwizzleBytes > 0
+          ? NVMMASharedEncodingAttr::get(
+                argType.getContext(), forceSwizzleBytes,
+                /*transposed=*/(newOrder.size() > 1 && newOrder[0] == 0),
+                argType.getElementType().getIntOrFloatBitWidth(),
+                isMMAv5Fp4Padded, CGALayout)
+          : NVMMASharedEncodingAttr::get(
+                argType.getContext(), argType.getShape(), newOrder, CGALayout,
+                argType.getElementType(), isMMAv5Fp4Padded);
   auto newType = MemDescType::get(argType.getShape(), argType.getElementType(),
                                   newLayout, SharedMemorySpace);
   rewriter.setInsertionPointAfterValue(arg);
@@ -824,6 +841,63 @@ public:
     bool IsBMixedPrecFp4 = false;
     bool isAFP4 = dotOp.getAElemType() == ScaleDotElemType::E2M1;
     bool isBFP4 = dotOp.getBElemType() == ScaleDotElemType::E2M1;
+    // Hoisted out of the K-tile guard block below so it is in scope at the
+    // getSharedMemoryMMAOperand calls (K=96 forces 128B operand swizzle).
+    bool kSize96Mxf4nvf4 = false;
+
+    // K=96 NVFP4 (mxf4nvf4 .block16) is sm_103a-only. Detect it from the
+    // operand A/B element type (both E2M1) + scale element type (both E4M3) +
+    // K dim. If K=96 is requested on a non-sm_103a target, fail this pattern
+    // so an explicit verifier error in TCGen5MMAScaledOp::verify is reached
+    // rather than silently lowering to broken PTX. On sm_103a it falls through
+    // to the native atom (MMAv5.cpp emits .block16 for BlockK==96).
+    {
+      auto kDim = dotOp.getA().getType().getShape().back();
+      Type aScaleTy = dotOp.getAScale().getType().getElementType();
+      Type bScaleTy = dotOp.getBScale().getType().getElementType();
+      bool isMxf4nvf4 = isAFP4 && isBFP4 &&
+                        llvm::isa<Float8E4M3FNType>(aScaleTy) &&
+                        llvm::isa<Float8E4M3FNType>(bScaleTy);
+      // For E2M1 the K dim in the type is the *packed* K (each i8 holds two
+      // fp4), so K=48 in the type corresponds to logical K=96.
+      int64_t logicalK = isAFP4 ? kDim * 2 : kDim;
+      kSize96Mxf4nvf4 = isMxf4nvf4 && logicalK == 96;
+      if (kSize96Mxf4nvf4 && computeCapability != 103) {
+        // K=96 mxf4nvf4 is only legal on sm_103a. Bail so the verifier
+        // rejection in TCGen5MMAScaledOp handles it cleanly.
+        return failure();
+      }
+
+      // K-tile validity guard (mirrors the M/N guard above). The scaled MMAv5
+      // atom processes a *native* K of 64 per instruction (the only legal
+      // single-shot K, besides the K=96 mxf4nvf4 .block16 atom on sm_103a).
+      // A per-MMA BLOCK_K is lowered as numRepK = ceil(BLOCK_K, 64) chained
+      // atoms in MMAv5.cpp. That chaining is only correct when BLOCK_K is an
+      // exact multiple of 64 (no partial last rep) AND numRepK is a power of
+      // two (the scale-word packing in createMMAInst assumes power-of-two K
+      // reps; an odd rep count, e.g. BLOCK_K=192 -> 3 reps, mis-packs the TMEM
+      // scale columns and SILENTLY MISCOMPUTES). Empirically BLOCK_K in
+      // {64,128,256} (= 64 * 2^n) is correct; {32,96,192} silently miscompute.
+      // Reject anything else here so it surfaces as a clean error / decompose
+      // fallback rather than wrong numerics. (K=96 mxf4nvf4 on sm_103a is the
+      // explicit native-atom exception handled above and below.)
+      if (!kSize96Mxf4nvf4) {
+        // The native single-shot K depends on dtype: mxfp4 (both operands
+        // E2M1) processes 64 logical K per atom, while mxf8f6f4 (fp8/fp6/fp4-
+        // mixed) processes 32 (see MMAv5.cpp `dot.mmaSizeK`:
+        //   !opKindIsMXFP4 ? 32 : ... 64). The previous guard hard-coded 64,
+        // which wrongly rejected valid fp8 scaled dots with BLOCK_K=32 and
+        // forced a software decompose. Use the dtype-dependent native K so
+        // mxfp4 still requires multiples of 64 (the 64 * 2^n rule) while
+        // fp8/mxf8f6f4 accepts 32.
+        bool isMxfp4 = isAFP4 && isBFP4;
+        int64_t nativeK = isMxfp4 ? 64 : 32;
+        bool kTileValid = (logicalK % nativeK == 0) &&
+                          llvm::isPowerOf2_64(logicalK / nativeK);
+        if (!kTileValid)
+          return failure();
+      }
+    }
 
     if (dotOp.getAElemType() != dotOp.getBElemType()) {
       if (isAFP4)
@@ -837,16 +911,18 @@ public:
     bool isMMAv5Fp4PaddedRhs = IsBMixedPrecFp4 || !dotOp.getRhsKPack();
     // For mixed-precision fp4 operands, set allowTranspose = false, to force
     // the packed axis, K, to be contiguous in SMEM
-    a = getSharedMemoryMMAOperand(a, rewriter, 0,
-                                  /*allowTranspose=*/!isAFP4,
-                                  /*isMMAv5Fp4Padded=*/isMMAv5Fp4PaddedLhs,
-                                  /*forceTranspose=*/!dotOp.getLhsKPack(),
-                                  dotOp);
-    b = getSharedMemoryMMAOperand(b, rewriter, 1,
-                                  /*allowTranspose=*/!isBFP4,
-                                  /*isMMAv5Fp4Padded=*/isMMAv5Fp4PaddedRhs,
-                                  /*forceTranspose=*/!dotOp.getRhsKPack(),
-                                  dotOp);
+    a = getSharedMemoryMMAOperand(
+        a, rewriter, 0,
+        /*allowTranspose=*/!isAFP4,
+        /*isMMAv5Fp4Padded=*/isMMAv5Fp4PaddedLhs,
+        /*forceTranspose=*/!dotOp.getLhsKPack(), dotOp,
+        /*forceSwizzleBytes=*/kSize96Mxf4nvf4 ? 128 : 0);
+    b = getSharedMemoryMMAOperand(
+        b, rewriter, 1,
+        /*allowTranspose=*/!isBFP4,
+        /*isMMAv5Fp4Padded=*/isMMAv5Fp4PaddedRhs,
+        /*forceTranspose=*/!dotOp.getRhsKPack(), dotOp,
+        /*forceSwizzleBytes=*/kSize96Mxf4nvf4 ? 128 : 0);
 
     MLIRContext *context = dotOp->getContext();
     unsigned m = 128;

@@ -1646,8 +1646,12 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
     auto elemType = tensorType.getElementType();
     unsigned elemBitWidth = elemType.getIntOrFloatBitWidth();
     unsigned colStride = 32 / elemBitWidth;
+    // TMEM hardware requires blockN >= 8 and a multiple of 8.
+    // For 1D tensors promoted to TMEM, bufferShape[1] may be 1.
+    unsigned blockN = std::max<unsigned>(bufferShape[1], 8);
+    blockN = llvm::alignTo(blockN, 8);
     auto encoding = ttng::TensorMemoryEncodingAttr::get(
-        context, blockM, bufferShape[1], colStride, /*CTASplitM=*/1,
+        context, blockM, blockN, colStride, /*CTASplitM=*/1,
         /*CTASplitN=*/1, /*twoCTAs=*/false, ttng::TensorMemoryCTAMode::DEFAULT);
     Type memdescType =
         ttg::MemDescType::get(bufferShape, elemType, encoding,
