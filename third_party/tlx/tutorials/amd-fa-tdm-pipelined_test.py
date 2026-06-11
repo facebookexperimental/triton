@@ -1,25 +1,22 @@
 """
 TDM-pipelined Flash-Attention forward for AMD gfx1250 (TLX).
 
-This is a TLX port of the Gluon golden kernel
-``attn_fwd_pipelined_kernel`` in
-``third_party/amd/python/examples/gluon/f16_fa_gfx1250.py``.
+Uses the gfx1250 TDM (tensor-descriptor) async-copy engine to stream K/V
+tiles from global memory into double-buffered LDS, with WMMA matmuls via
+``tl.dot`` and an online-softmax accumulator.
 
-Goal: match the golden's instruction mix and software-pipeline schedule
-to achieve comparable steady-state WMMA efficiency on gfx1250.
+Key TLX primitives:
+  tl.make_tensor_descriptor                       -> TDM tensor descriptor
+  tlx.local_alloc(blk, dt, n)                     -> n-buffered LDS allocation
+  tlx.async_amd_descriptor_load(desc, view, off)  -> TDM async copy g->LDS
+  tlx.async_amd_descriptor_wait(n)                -> wait until <= n TDM ops in flight
+  tlx.local_load(tlx.local_trans(view))           -> LDS read w/ memdesc transpose (K)
+  tlx.local_load(view)                            -> LDS read (V)
+  tl.dot(a, b, c)                                  -> WMMA matmul-accumulate
 
-Mapping (Gluon golden -> TLX):
-  gl.amd.gfx1250.tdm.make_tensor_descriptor -> tl.make_tensor_descriptor
-  gl.allocate_shared_memory([2]+blk)         -> tlx.local_alloc(blk, dt, 2)
-  tdm.async_load(desc, off, buf.index(i))    -> tlx.async_amd_descriptor_load(desc, local_view(buf,i), off)
-  tdm.async_wait(n)                          -> tlx.async_amd_descriptor_wait(n)
-  buf.index(i).permute([1,0]).load(k_layout) -> tlx.local_load(tlx.local_trans(tlx.local_view(buf,i)))
-  buf.index(i).load(v_layout)                -> tlx.local_load(tlx.local_view(buf,i))
-  gl.amd.gfx1250.wmma(a, b, c)               -> tl.dot(a, b, c)
-
-The pipeline is hand-written (no auto-pipeliner), exactly like the
-golden: 3 iters peeled across prologue+epilogue, a steady-state hot
-loop in between, double-buffered K/V in LDS via TDM async copies.
+The software pipeline is hand-written (no auto-pipeliner): 3 iters are
+peeled across the prologue+epilogue with a steady-state hot loop in
+between, and K/V are double-buffered in LDS via TDM async copies.
 """
 import pytest
 import torch
@@ -174,7 +171,9 @@ def attn_fwd_tdm_pipelined_kernel(q_ptr, k_ptr, v_ptr, o_ptr,  #
 
     iter_id = 0
     # ---------------- Steady state (hot loop, no masking) ----------------
-    for block_id in range(block_min, block_max, BLOCK_N):
+    # Unroll by 2 so the scheduler can hoist softmax VALU/TRANS work across
+    # the back-edge into adjacent WMMA shadows (better co-execution packing).
+    for block_id in tl.range(block_min, block_max, BLOCK_N, loop_unroll_factor=2):
         t_2 = block_id + 2 * BLOCK_N
         t_3 = block_id + 3 * BLOCK_N
 
@@ -232,9 +231,9 @@ def attn_fwd_tdm_pipelined_kernel(q_ptr, k_ptr, v_ptr, o_ptr,  #
     # ---------------- Output ----------------
     l_recip = 1.0 / l_i[:, None]
     acc = acc * l_recip
-    # TDM store via LDS (mirrors the golden TDM-GEMM C-store): acc -> LDS
-    # (native ds_write from the WMMA layout) -> global via TDM. Avoids the
-    # 128-way global_store fan-out of tl.store on the WMMA accumulator.
+    # TDM store via LDS: acc -> LDS (native ds_write from the WMMA layout)
+    # -> global via TDM. Avoids the 128-way global_store fan-out of tl.store
+    # on the WMMA accumulator.
     o_view = tlx.local_view(o_buf, 0)
     tlx.local_store(o_view, acc.to(o_ptr.dtype.element_ty))
     tlx.async_amd_descriptor_store(o_desc, o_view, [off_m, 0])
@@ -311,7 +310,7 @@ def test_attn_fwd_tdm_pipelined_compiles_gfx1250():
 @pytest.mark.skipif(not is_gfx1250_available(), reason="Requires gfx1250")
 @pytest.mark.parametrize("BATCH,H,SEQLEN", [(1, 8, 1024),  # multi-head
                                             (2, 4, 1024),  # multi-batch + multi-head
-                                            (1, 16, 2048),  # golden head count, longer seqlen
+                                            (1, 16, 2048),  # many heads, longer seqlen
                                             (1, 2, 896),  # non-128-multiple -> masked remainder path
                                             (1, 1, 640),  # small -> remainder peel path
                                             ])
@@ -329,7 +328,7 @@ def test_attn_fwd_tdm_pipelined_gfx1250(BATCH, H, SEQLEN):
 
 if __name__ == "__main__":
     if not is_gfx1250_available():
-        raise SystemExit("Requires gfx1250 hardware/emulator")
+        raise SystemExit("Requires gfx1250")
     torch.manual_seed(0)
     q = torch.randn((1, 8, 1024, 128), device=DEVICE, dtype=torch.bfloat16)
     k = torch.randn((1, 8, 1024, 128), device=DEVICE, dtype=torch.bfloat16)
