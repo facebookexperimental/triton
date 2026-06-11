@@ -16,6 +16,13 @@ from .jit import KernelInterface, JITFunction
 from .errors import OutOfResources, PTXASError, AutotunerError
 from .driver import driver
 from .cache import get_cache_manager, triton_key
+
+try:
+    from triton._C.libtriton import native_create_autotune_proxy, native_autotune_proxy_insert, native_autotune_proxy_set_grid
+except ImportError:
+    native_create_autotune_proxy = None
+    native_autotune_proxy_insert = None
+    native_autotune_proxy_set_grid = None
 from triton._C.libtriton import get_cache_invalidating_env_vars
 
 
@@ -491,6 +498,104 @@ class Autotuner(KernelInterface):
             }), file_name, binary=False)
         return False
 
+    def __getitem__(self, grid):
+        """Return C-level AutotuneCacheProxy for fast dispatch if available."""
+        # Check if we can use the C-level autotune proxy
+        if (native_create_autotune_proxy is not None and getattr(self.fn, 'c_cache', False)
+                and knobs.nvidia.use_autotune_c_cache and knobs.nvidia.use_triton_dispatcher and len(self.configs) > 1):
+            proxy = getattr(self, '_autotune_proxy', None)
+            if proxy is None:
+                # Compute key_indices: positions in arg_names for autotuner key fields
+                key_indices = []
+                for k in self.keys:
+                    if k in self.arg_names:
+                        key_indices.append(self.arg_names.index(k))
+                # Compute dtype_indices: positions of non-constexpr args that could be tensors
+                dtype_indices = [i for i, p in enumerate(self.fn.params) if not p.is_constexpr]
+
+                # fallback_run uses self._proxy_grid (set below) so grid is
+                # always current when the C proxy falls back to Python.
+                proxy = native_create_autotune_proxy(
+                    self.fn,
+                    key_indices,
+                    dtype_indices,
+                    self.fn.params,
+                    len(self.fn.params),
+                    driver.active.get_current_stream,
+                    driver.active.get_current_device,
+                    self._proxy_fallback,
+                )
+                if proxy is not None:
+                    self._autotune_proxy = proxy
+            if proxy is not None:
+                self._proxy_grid = grid
+                native_autotune_proxy_set_grid(proxy, grid)
+                return proxy
+
+        # Fallback: Python dispatch
+        return lambda *args, **kwargs: self.run(*args, grid=grid, warmup=False, **kwargs)
+
+    def _proxy_fallback(self, *a, **kw):
+        """Fallback called from C proxy when autotune table misses."""
+        return self.run(*a, grid=self._proxy_grid, warmup=False, **kw)
+
+    def _seed_autotune_proxy(self, key, config):
+        """Insert a key→config mapping into the C autotune proxy table."""
+        proxy = getattr(self, '_autotune_proxy', None)
+        if proxy is None or native_autotune_proxy_insert is None:
+            return
+
+        # Build constexpr mapping: config values that fill into full_args
+        config_kwargs = config.all_kwargs()
+        fn_arg_names = self.fn.arg_names
+        constexpr_vals = []
+        constexpr_positions = []
+        for i, param in enumerate(self.fn.params):
+            if param.is_constexpr and param.name in config_kwargs:
+                constexpr_vals.append(config_kwargs[param.name])
+                constexpr_positions.append(i)
+
+        # Compute options_hash matching _try_fast_path's logic exactly
+        fn_arg_name_set = set(fn_arg_names)
+        _meta = {k: v for k, v in config_kwargs.items() if k not in fn_arg_name_set}
+        _meta_opts = {k: v for k, v in _meta.items() if k not in getattr(self.fn, '_param_name_to_idx', {})}
+        if _meta_opts:
+            options_hash = hash(tuple(sorted(_meta_opts.items()))) & 0xFFFFFFFFFFFFFFFF
+        else:
+            options_hash = getattr(self.fn, '_fc_options_hash', 0)
+
+        # Build key values matching what C vectorcall extracts:
+        # - key field values (actual arg values at key_indices)
+        # - dtype objects (not strings!) from tensor args
+        full_nargs = getattr(self, '_full_nargs', self.nargs)
+        full_args_list = []
+        for name in fn_arg_names:
+            if name in full_nargs:
+                full_args_list.append(full_nargs[name])
+            elif name in config_kwargs:
+                full_args_list.append(config_kwargs[name])
+            else:
+                full_args_list.append(None)
+
+        # Build key values matching what C vectorcall extracts:
+        # 1. key field values at key_indices positions
+        key_vals = []
+        for k in self.keys:
+            if k in self.arg_names:
+                idx = self.arg_names.index(k)
+                if idx < len(full_args_list):
+                    key_vals.append(full_args_list[idx])
+
+        # 2. dtype from args at dtype_indices positions (all non-constexpr params)
+        for i, param in enumerate(self.fn.params):
+            if not param.is_constexpr:
+                arg = full_args_list[i] if i < len(full_args_list) else None
+                if arg is not None and hasattr(arg, 'dtype'):
+                    key_vals.append(arg.dtype)
+
+        native_autotune_proxy_insert(proxy, key_vals, constexpr_vals, constexpr_positions, options_hash,
+                                     config.pre_hook)
+
     def _try_fast_path(self, args, kwargs, config):
         """Attempt C fast cache dispatch; return kernel or None to fall back.
 
@@ -512,7 +617,8 @@ class Autotuner(KernelInterface):
         _arg_name_set = set(fn_arg_names)
         # Fall back if kwargs has extra keys (beyond 'grid'/'warmup') not in arg_names,
         # since those would be silently dropped in the fast path.
-        if any(k not in _arg_name_set for k in kwargs if k not in {'grid', 'warmup'}):
+        _extra_keys = [k for k in kwargs if k not in {'grid', 'warmup'} and k not in _arg_name_set]
+        if _extra_keys:
             return None
 
         full_args = list(args)
@@ -582,6 +688,12 @@ class Autotuner(KernelInterface):
         if len(self.configs) > 1:
             all_args = {**self.nargs, **kwargs}
             _args = {k: v for (k, v) in all_args.items() if k in self.arg_names}
+            # Keep self.nargs as positional-only named args (the contract
+            # relied on by prune_configs/early_config_prune/perf_model). Expose
+            # the full merged arg set (including kwargs like key fields) via a
+            # separate attribute for _seed_autotune_proxy, which must match what
+            # the C proxy extracts after merging kwargs into positional.
+            self._full_nargs = _args
             key = [_args[key] for key in self.keys if key in _args]
             for _, arg in _args.items():
                 if hasattr(arg, "dtype"):
@@ -628,6 +740,14 @@ class Autotuner(KernelInterface):
 
             config = self.cache[key]
             self._last_key = key
+            # Seed the C-level autotune proxy with this key→config mapping
+            if not used_cached_result or not hasattr(self, '_at_proxy_seeded'):
+                self._at_proxy_seeded = getattr(self, '_at_proxy_seeded', set())
+            if key not in getattr(self, '_at_proxy_seeded', set()):
+                self._seed_autotune_proxy(key, config)
+                if not hasattr(self, '_at_proxy_seeded'):
+                    self._at_proxy_seeded = set()
+                self._at_proxy_seeded.add(key)
         else:
             config = self.configs[0]
         self.best_config = config
@@ -659,6 +779,7 @@ class Autotuner(KernelInterface):
                 knobs.compilation.dump_ir = original_dump_ir
                 knobs.compilation.always_compile = original_always_compile
         self.nargs = None
+        self._full_nargs = None
         return ret
 
     def prune_configs(self, kwargs: Dict) -> List[Config]:
