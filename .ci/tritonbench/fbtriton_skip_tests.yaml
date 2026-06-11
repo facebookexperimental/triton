@@ -38,6 +38,10 @@ mx4_to_fp32:
   devices:
     - cuda
 # ============ TODO: errors in CI ============
+launch_latency:
+  backends: nop_triton_kernel_autotuned,nop_triton_kernel_autotuned_nocache
+  disabled_devices:
+    - cuda
 ## torch.AcceleratorError: CUDA error: unspecified launch failure
 decoding_attention:
   report: true
