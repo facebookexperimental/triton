@@ -3,37 +3,90 @@
 # There's a whole presentation about stable benchmarking here:
 # https://developer.download.nvidia.com/video/gputechconf/gtc/2019/presentation/s9956-best-practices-when-benchmarking-cuda-applications_V2.pdf
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:=4}"
-
-CURRENT_POWER=$(nvidia-smi --query-gpu=power.limit --format=csv,noheader,nounits -i $CUDA_VISIBLE_DEVICES)
-MAX_POWER=$(nvidia-smi --query-gpu=power.max_limit  --format=csv,noheader,nounits -i $CUDA_VISIBLE_DEVICES)
-MAX_SM_CLOCK=$(nvidia-smi --query-gpu=clocks.max.graphics --format=csv,noheader,nounits  -i $CUDA_VISIBLE_DEVICES)
-
-GPU_MODEL=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1 | awk '{print $2}')
-
-if [[ "$GPU_MODEL" == "H100" ]]; then
-    DESIRED_POWER=500
-elif [[ "$GPU_MODEL" == "GB200" ]]; then
-    DESIRED_POWER=1200
-elif [[ "$GPU_MODEL" == "B200" ]]; then
-    DESIRED_POWER=750
+# Detect GPU vendor
+if command -v nvidia-smi &> /dev/null && nvidia-smi &> /dev/null; then
+    GPU_VENDOR="nvidia"
+elif command -v rocm-smi &> /dev/null && rocm-smi &> /dev/null; then
+    GPU_VENDOR="amd"
 else
-    DESIRED_POWER=500
+    echo "Error: No supported GPU found (neither nvidia-smi nor rocm-smi available)"
+    exit 1
 fi
 
-# Compute the minimum of desired and max power
-POWER_CAP=$(awk -v d="$DESIRED_POWER" -v m="$MAX_POWER" 'BEGIN {print (d < m ? d : m)}')
+if [[ "$GPU_VENDOR" == "nvidia" ]]; then
+    export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:=4}"
 
-echo "Locking GPU $CUDA_VISIBLE_DEVICES power cap to $POWER_CAP W"
-echo "Locking GPU $CUDA_VISIBLE_DEVICES frequency cap to $MAX_SM_CLOCK Hz"
+    CURRENT_POWER=$(nvidia-smi --query-gpu=power.limit --format=csv,noheader,nounits -i "$CUDA_VISIBLE_DEVICES")
+    MAX_POWER=$(nvidia-smi --query-gpu=power.max_limit  --format=csv,noheader,nounits -i "$CUDA_VISIBLE_DEVICES")
+    MAX_SM_CLOCK=$(nvidia-smi --query-gpu=clocks.max.graphics --format=csv,noheader,nounits  -i "$CUDA_VISIBLE_DEVICES")
 
-# 1335, 1980
-# Lock GPU clocks
-(
-    sudo nvidia-smi -i "$CUDA_VISIBLE_DEVICES" -pm 1                # persistent mode
-    sudo nvidia-smi --power-limit=$POWER_CAP -i "$CUDA_VISIBLE_DEVICES"
-    sudo nvidia-smi -lgc $MAX_SM_CLOCK -i "$CUDA_VISIBLE_DEVICES"
-) >/dev/null
+    GPU_MODEL=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1 | awk '{print $2}')
+
+    if [[ -z "${DESIRED_POWER:-}" ]]; then
+        if [[ "$GPU_MODEL" == "H100" ]]; then
+            DESIRED_POWER=700
+        elif [[ "$GPU_MODEL" == "GB200" ]]; then
+            DESIRED_POWER=1200
+        elif [[ "$GPU_MODEL" == "B200" ]]; then
+            DESIRED_POWER=750
+        else
+            DESIRED_POWER=500
+        fi
+    fi
+
+    # Compute the minimum of desired and max power
+    POWER_CAP=$(awk -v d="$DESIRED_POWER" -v m="$MAX_POWER" 'BEGIN {print (d < m ? d : m)}')
+
+    echo "Locking GPU $CUDA_VISIBLE_DEVICES power cap to $POWER_CAP W"
+    echo "Locking GPU $CUDA_VISIBLE_DEVICES frequency cap to $MAX_SM_CLOCK Hz"
+
+    # Lock GPU clocks
+    (
+        sudo nvidia-smi -i "$CUDA_VISIBLE_DEVICES" -pm 1                # persistent mode
+        sudo nvidia-smi --power-limit="$POWER_CAP" -i "$CUDA_VISIBLE_DEVICES"
+        sudo nvidia-smi -lgc "$MAX_SM_CLOCK" -i "$CUDA_VISIBLE_DEVICES"
+    ) >/dev/null
+
+elif [[ "$GPU_VENDOR" == "amd" ]]; then
+    export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:=4}"
+
+    # Get GPU device ID (DID) from rocm-smi - this is more reliable than product name
+    # MI300X = 0x74a0, 0x74a1  |  MI350X = 0x75a0
+    GPU_DID=$(rocm-smi -d "$HIP_VISIBLE_DEVICES" --showbus --csv 2>/dev/null | tail -1 | cut -d',' -f1)
+    if [[ -z "$GPU_DID" ]]; then
+        # Fallback: parse from main rocm-smi output
+        GPU_DID=$(rocm-smi 2>/dev/null | grep "^$HIP_VISIBLE_DEVICES" | grep -oE '0x[0-9a-fA-F]+' | head -1)
+    fi
+
+    # Detect based on device ID
+    # MI350X uses DID 0x75a0, MI300X uses 0x74a0/0x74a1
+    if [[ "$GPU_DID" == "0x75a0"* ]] || [[ "$GPU_DID" == "0x75a1"* ]]; then
+        GPU_NAME="MI350X"
+        if [[ -z "${DESIRED_POWER:-}" ]]; then
+            DESIRED_POWER=1000
+        fi
+    elif [[ "$GPU_DID" == "0x74a0"* ]] || [[ "$GPU_DID" == "0x74a1"* ]]; then
+        GPU_NAME="MI300X"
+        if [[ -z "${DESIRED_POWER:-}" ]]; then
+            DESIRED_POWER=750
+        fi
+    else
+        GPU_NAME="Unknown AMD GPU (DID: $GPU_DID)"
+        if [[ -z "${DESIRED_POWER:-}" ]]; then
+            DESIRED_POWER=500
+        fi
+    fi
+
+    echo "Detected $GPU_NAME"
+    echo "Locking GPU $HIP_VISIBLE_DEVICES power cap to ${DESIRED_POWER} W"
+    echo "Setting GPU $HIP_VISIBLE_DEVICES to high performance mode"
+
+    # Lock GPU clocks by setting performance level to high and applying power overdrive
+    (
+        sudo rocm-smi -d "$HIP_VISIBLE_DEVICES" --setperflevel high
+        sudo rocm-smi -d "$HIP_VISIBLE_DEVICES" --setpoweroverdrive "$DESIRED_POWER"
+    ) >/dev/null
+fi
 
 # TODO: On my devgpu, device 6 is apparently attached to NUMA node 3.  How did
 # I discover this?
@@ -58,7 +111,14 @@ echo "Locking GPU $CUDA_VISIBLE_DEVICES frequency cap to $MAX_SM_CLOCK Hz"
 numactl -m 0 -c 0 "$@"
 
 # Unlock GPU clock
-(
-    sudo nvidia-smi -rgc -i "$CUDA_VISIBLE_DEVICES"
-    sudo nvidia-smi --power-limit=$CURRENT_POWER -i "$CUDA_VISIBLE_DEVICES"
-) >/dev/null
+if [[ "$GPU_VENDOR" == "nvidia" ]]; then
+    (
+        sudo nvidia-smi -rgc -i "$CUDA_VISIBLE_DEVICES"
+        sudo nvidia-smi --power-limit="$CURRENT_POWER" -i "$CUDA_VISIBLE_DEVICES"
+    ) >/dev/null
+elif [[ "$GPU_VENDOR" == "amd" ]]; then
+    (
+        sudo rocm-smi -d "$HIP_VISIBLE_DEVICES" --resetclocks
+        sudo rocm-smi -d "$HIP_VISIBLE_DEVICES" --resetpoweroverdrive
+    ) >/dev/null
+fi
