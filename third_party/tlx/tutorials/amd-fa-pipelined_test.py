@@ -536,16 +536,13 @@ def _attn_fwd_persistent(
 ):
     """Unified persistent FA — one kernel for causal **and** non-causal.
 
-    Generalizes the static-mirror "exactly 2 tiles per workgroup" into a
-    persistent, constant-cost **fold-bundling** scheduler:
-
-    - **Ping-pong (fold) tile order.** A head's m-tiles are walked as
-      `0, N-1, 1, N-2, …` (`_pingpong`) — interleaving the lightest and heaviest
+    - **Zig-zag (fold) tile order.** A head's m-tiles are walked as
+      `0, N-1, 1, N-2, …` — interleaving the lightest and heaviest
       remaining causal tile. Because adjacent tiles in this order sum to a
       constant cost (`≈ N_M+1` K-blocks), *any* contiguous run of them is
       balanced — so the bundle size is a free knob, not hardcoded to 2.
     - **TILES_PER_UNIT bundle.** Each scheduling unit is `TILES_PER_UNIT`
-      consecutive ping-pong tiles, run back-to-back in one loop iteration, so
+      consecutive zig-zag tiles, run back-to-back in one loop iteration, so
       every iteration costs the same and per-tile prologue/epilogue overhead
       stays amortized (no overhead-bound "all-light" tail — the lesson from the
       snake/no-mirror experiments). Causal default = 2 (the minimal constant-cost
@@ -559,7 +556,7 @@ def _attn_fwd_persistent(
       (`units/NUM_LOCAL × TILES_PER_UNIT`), not a fixed 2.
 
     Non-causal degrades cleanly: `_attn_tile(IS_CAUSAL=False)` runs the full
-    unmasked range and ping-pong is just a (cost-neutral) permutation.
+    unmasked range and zig-zag is just a (cost-neutral) permutation.
     """
     _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
                     stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om, stride_ok)
@@ -590,7 +587,7 @@ def _attn_fwd_persistent(
             v_off = off_z * stride_vz + off_h * stride_vh
             o_off = off_z * stride_oz + off_h * stride_oh
 
-            # Run the bundle's TILES_PER_UNIT consecutive ping-pong tiles.
+            # Run the bundle's TILES_PER_UNIT consecutive zig-zag tiles.
             for j in tl.static_range(TILES_PER_UNIT):
                 idx = bundle * TILES_PER_UNIT + j
                 if idx < NUM_M_BLOCKS:
@@ -709,7 +706,7 @@ def flash_attn_persistent(q, k, v, sm_scale, causal=False, **kw):
     """Unified persistent FA — one kernel for causal *and* non-causal.
 
     Generalizes static mirror's "exactly 2 tiles per workgroup" into a
-    persistent, XCD-grouped, constant-cost fold-bundling scheduler (ping-pong
+    persistent, XCD-grouped, constant-cost fold-bundling scheduler (zig-zag
     tile order + `TILES_PER_UNIT` bundle). Causal uses 2-tile fold bundles
     (≡ mirror pairing, the minimal constant-cost bundle); non-causal uses 1-tile
     units (tiles are already equal-cost). A program runs a *variable* number of

@@ -65,7 +65,7 @@ non-causal edge.)
 
 2. **Constant-cost fold bundling (the load balancer).** A causal tile `pid_m`
    costs `pid_m+1` K-blocks, so the last wave of a naive schedule is all-heavy
-   tiles. We walk a head's m-tiles in **ping-pong (fold) order**
+   tiles. We walk a head's m-tiles in **zig-zag (fold) order**
    `0, N-1, 1, N-2, …`, interleaving the lightest and heaviest remaining tile.
    Because adjacent tiles in this order sum to a constant cost (`≈ N_M+1`
    K-blocks), *every* scheduling unit does equal work — eliminating the causal
@@ -73,7 +73,7 @@ non-causal edge.)
    stated generally.
 
 3. **`TILES_PER_UNIT` knob (not hardcoded to 2).** Each unit is `TILES_PER_UNIT`
-   consecutive ping-pong tiles, run back-to-back so cost-per-iteration stays
+   consecutive zig-zag tiles, run back-to-back so cost-per-iteration stays
    constant (fixed prologue/epilogue overhead stays amortized — no overhead-bound
    "all-light" tail). Causal default = **2** (the minimal constant-cost bundle ⟺
    mirror pairing); non-causal default = **1** (tiles are already equal-cost).
