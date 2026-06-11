@@ -41,7 +41,6 @@ jobs:
           TRITONBENCH_TEST_SKIP_FILE: ${{ github.workspace }}/.ci/tritonbench/fbtriton_skip_tests.yaml
           TRITONBENCH_ROOT: ${{ github.workspace }}/tritonbench
         run: |
-          set -eux
           . "${SETUP_SCRIPT}"
           bash ./.ci/tritonbench/test-gpu.sh
 
