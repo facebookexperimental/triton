@@ -1,7 +1,27 @@
+"""
+AMD TLX fused addmm + GLU (out = x + x*y, x = A@B + bias).
+
+Benchmarks the naive and optimized TLX kernels against a PyTorch reference
+(naive matmul + add, then GLU) and ROCBLAS (pure matmul, no add/GLU).
+
+Usage:
+  # Sweep all K, both kernels (default)
+  python amd-addmm-glu-opt_test.py
+
+  # Single K, optimized kernel only
+  python amd-addmm-glu-opt_test.py -K 1024 --kernel optimized
+
+  # A couple of sizes, both kernels
+  python amd-addmm-glu-opt_test.py -K 256 512 --kernel naive optimized
+"""
+import argparse
+
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+
+DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 M, N = 1024, 21568
 
@@ -9,19 +29,33 @@ M, N = 1024, 21568
 NUM_XCDS = 8
 XCD_CHUNK = 4
 
-# Autotuning winning configurations
+# Autotuning winning configurations for K=256, K=512, and K=1024
 BEST_CONFIG = {
-      256:  dict(BLOCK_SIZE_M=128, BLOCK_SIZE_N=128, BLOCK_SIZE_K=32, GROUP_SIZE_M=4, num_warps=4, matrix_instr_nonkdim=16,
-  waves_per_eu=0),
-      512:  dict(BLOCK_SIZE_M=128, BLOCK_SIZE_N=128, BLOCK_SIZE_K=32, GROUP_SIZE_M=8, num_warps=4, matrix_instr_nonkdim=16,
-  waves_per_eu=0),
-      1024: dict(BLOCK_SIZE_M=128, BLOCK_SIZE_N=256, BLOCK_SIZE_K=64, GROUP_SIZE_M=8, num_warps=8, matrix_instr_nonkdim=16,
-  waves_per_eu=0),
-  }
+      256:  dict(BLOCK_SIZE_M=128, BLOCK_SIZE_N=128, BLOCK_SIZE_K=32, GROUP_SIZE_M=4, 
+                 num_warps=4, matrix_instr_nonkdim=16, waves_per_eu=0),
+      512:  dict(BLOCK_SIZE_M=128, BLOCK_SIZE_N=128, BLOCK_SIZE_K=32, GROUP_SIZE_M=8, 
+                 num_warps=4, matrix_instr_nonkdim=16, waves_per_eu=0),
+      1024: dict(BLOCK_SIZE_M=128, BLOCK_SIZE_N=256, BLOCK_SIZE_K=64, GROUP_SIZE_M=8,
+                 num_warps=8, matrix_instr_nonkdim=16, waves_per_eu=0),
+}
+
+# Autotuning winning configurations for the naive kernel (K=256, K=512, K=1024)
+NAIVE_BEST_CONFIG = {
+      256:  dict(BLOCK_SIZE_M=128, BLOCK_SIZE_N=128, BLOCK_SIZE_K=64, GROUP_SIZE_M=1,
+                 NUM_STAGES=2, num_warps=4, matrix_instr_nonkdim=16, waves_per_eu=2, kpack=1),
+      512:  dict(BLOCK_SIZE_M=128, BLOCK_SIZE_N=128, BLOCK_SIZE_K=64, GROUP_SIZE_M=1,
+                 NUM_STAGES=2, num_warps=4, matrix_instr_nonkdim=16, waves_per_eu=2, kpack=1),
+      1024: dict(BLOCK_SIZE_M=128, BLOCK_SIZE_N=128, BLOCK_SIZE_K=64, GROUP_SIZE_M=1,
+                 NUM_STAGES=2, num_warps=4, matrix_instr_nonkdim=16, waves_per_eu=2, kpack=1),
+}
 
 # L2 swizzling
 @triton.jit
 def chiplet_transform_chunked(pid, num_workgroups, num_xcds: tl.constexpr, chunk_size: tl.constexpr):
+    """Group adjacent PIDs onto the same XCD in chunks of chunk_size for L2 reuse.
+
+    PIDs in the trailing remainder (not a multiple of num_xcds*chunk_size) pass through.
+    """
     aligned = (num_workgroups // (num_xcds * chunk_size)) * (num_xcds * chunk_size)
     if pid >= aligned:
         return pid
@@ -30,9 +64,9 @@ def chiplet_transform_chunked(pid, num_workgroups, num_xcds: tl.constexpr, chunk
     return ((local_pid // chunk_size) * num_xcds * chunk_size + xcd * chunk_size + (local_pid % chunk_size))
 
 
-# Warp-pipelined async direct-to-LDS fused addmm + GLU kernel
+# Warp-pipelined async direct-to-LDS fused addmm + GLU optimized kernel
 @triton.jit
-def tlx_addmm_glu_kernel(
+def tlx_addmm_glu_kernel_optimized(
     a_ptr,
     b_ptr,
     bias_ptr,
@@ -112,29 +146,20 @@ def tlx_addmm_glu_kernel(
     # Base pointers for B along n dim
     b_base_off = offs_n[None, :] * sb1
 
+    # The number of buffers for this kernel is fixed to be 3 which allows
+    # for the async_load_wait_group in the hotloop to not wait on the directly
+    # previous global read (GR) to finish because the GR that it actually 
+    # needs was fetched much earlier (possibly in the prologue)
+    NUM_BUFFERS: tl.constexpr = 3
+
+    # How many times we need to iterate through blocks of size BLOCK_SIZE_K
     k_iters = tl.cdiv(K, BLOCK_SIZE_K)
 
     # Create multibuffered shared memory arrays
-    smemA = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tlx.dtype_of(a_ptr), 3)
-    smemB = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tlx.dtype_of(b_ptr), 3)
+    smemA = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tlx.dtype_of(a_ptr), NUM_BUFFERS)
+    smemB = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tlx.dtype_of(b_ptr), NUM_BUFFERS)
 
-    # Prologue: async direct-to-LDS prefetch of NUM_BUFFERS tiles
-    # Use static range
-    # for i in tl.static_range(0, NUM_BUFFERS):
-    #     k_start = i * BLOCK_SIZE_K
-
-    #     # Get A tile for the iteration k that we are on
-    #     a_offs = a_base_off + (k_start + offs_k[None, :]) * sa1
-
-    #     # Get B tile for the iteration k that we are on
-    #     b_offs = (k_start + offs_k[:, None]) * sb0 + b_base_off
-
-    #     # Fetch tiles asynchronously
-    #     tok_a = tlx.async_load(a_ptr + a_offs, tlx.local_view(smemA, i), mask=offs_k[None, :] < K - k_start)
-    #     tok_b = tlx.async_load(b_ptr + b_offs, tlx.local_view(smemB, i), mask=offs_k[:, None] < K - k_start)
-    #     tlx.async_load_commit_group([tok_a, tok_b])
-
-    # GR 0
+    # GR (Global Read) 0
     k_start = 0
     a_offs = a_base_off + (k_start + offs_k[None, :]) * sa1
     b_offs = (k_start + offs_k[:, None]) * sb0 + b_base_off
@@ -164,7 +189,7 @@ def tlx_addmm_glu_kernel(
     # Make GR0 and GR1 finish
     tlx.async_load_wait_group(1)
 
-    # Transfer to registers
+    # LR (Local Read) 0 where we transfer GR0 to registers
     a_tile = tlx.local_load(tlx.local_view(smemA, 0))
     b_tile = tlx.local_load(tlx.local_view(smemB, 0))
 
@@ -172,22 +197,22 @@ def tlx_addmm_glu_kernel(
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     # Hot loop: warp-pipelined MFMA / async-prefetch
-    for tile_id in tl.range(0, k_iters - 3, loop_unroll_factor=0):
+    for i in tl.range(0, k_iters - NUM_BUFFERS, loop_unroll_factor=0):
         # Index within the multibuffered circular SMEM where we are storing the global prefetch
-        prefetch_buf = tile_id % 3
+        prefetch_buf = i % NUM_BUFFERS
 
-        # Index of local prefetch buffer that we need to transfer into registers
-        next_buf = (tile_id + 1) % 3
+        # Index within the multibuffered circular SMEM where we will load from to transfer into regs
+        next_buf = (i + 1) % NUM_BUFFERS
 
         # Which tile we need to prefetch globally along the k dim
-        k_prefetch = (tile_id + 3) * BLOCK_SIZE_K
+        k_prefetch = (i + NUM_BUFFERS) * BLOCK_SIZE_K
 
         # Execute MFMA with the data we already have loaded into registers
         with tlx.warp_pipeline_stage("mfma", priority=0):
             acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
 
         with tlx.warp_pipeline_stage("mem", priority=1):
-            # Perform global prefetching
+            # Perform global prefetching (GR i + NUM_BUFFERS)
             a_offs = a_base_off + (k_prefetch + offs_k[None, :]) * sa1
             b_offs = (k_prefetch + offs_k[:, None]) * sb0 + b_base_off
 
@@ -198,14 +223,14 @@ def tlx_addmm_glu_kernel(
             
             tlx.async_load_commit_group([tok_a, tok_b])
 
-            # Perform local prefetching
+            # Perform local prefetching (LR i + 1)
             a_tile = tlx.local_load(tlx.local_view(smemA, next_buf))
             b_tile = tlx.local_load(tlx.local_view(smemB, next_buf))
 
-        # Most recently committed buffers can be in flight
+        # Most recently committed buffers (GR i + NUM_BUFFERS) can be in flight
         tlx.async_load_wait_group(1)
 
-    # Async load the y and bias
+    # Can potentially async load the y and bias here
 
     # Epilogue: drain the remaining in-flight tiles
     acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
@@ -213,21 +238,19 @@ def tlx_addmm_glu_kernel(
     # Wait for all buffers to be loaded before draining in epilogue loop
     tlx.async_load_wait_group(0)
 
-    # Use static range here
-    for i in tl.static_range(0, 2):
-        buf = (k_iters - 2 + i) % 3
+    # Finish final set of LRs and MFMAs
+    for i in tl.static_range(0, NUM_BUFFERS - 1):
+        buf = (k_iters - (NUM_BUFFERS - 1) + i) % NUM_BUFFERS
 
         a_tile = tlx.local_load(tlx.local_view(smemA, buf))
         b_tile = tlx.local_load(tlx.local_view(smemB, buf))
 
         acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
 
-    # Fused epilogue: addmm + GLU ===
+    # Fused epilogue: addmm + GLU
     # Add bias (broadcast over M), then GLU: X = X + X*Y
     # Streaming cache hints (.cs) on Y and C: both are touched once and never
     # reused, so we avoid polluting L2 with this 44MB+44MB epilogue traffic
-
-    # y and bias load into registers here
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -244,11 +267,11 @@ def tlx_addmm_glu_kernel(
     tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), mask=c_mask, cache_modifier=".cs")
 
 
-def run_kernel(a, b, bias, y, out, cfg):
+def run_kernel_optimized(a, b, bias, y, out, cfg):
     M, K = a.shape
     _, N = b.shape
     grid = (triton.cdiv(M, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"]),)
-    return tlx_addmm_glu_kernel[grid](
+    return tlx_addmm_glu_kernel_optimized[grid](
         a,
         b,
         bias,
@@ -278,22 +301,14 @@ def run_kernel(a, b, bias, y, out, cfg):
     )
 
 def pytorch_baseline(bias, a, b, y):
-    # Reference: addmm (x = bias + a@b) then GLU (out = x + x*y)
-    x = torch.addmm(bias, a, b).to(torch.float32)
+    # Reference: matmul (a@b) and bias add done separately, then GLU (out = x + x*y)
+    x = torch.matmul(a, b).to(torch.float32)
+    x = x + bias.to(torch.float32)[None, :]
     return (x + x * y.to(torch.float32)).to(torch.float16)
 
-# Old Addmm kernel
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1, "NUM_STAGES": 2, "kpack": 1, "matrix_instr_nonkdim": 16, "waves_per_eu": 0}, num_warps=4),
-        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1, "NUM_STAGES": 2, "kpack": 1, "matrix_instr_nonkdim": 16, "waves_per_eu": 2}, num_warps=4),
-        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1, "NUM_STAGES": 2, "kpack": 1, "matrix_instr_nonkdim": 16, "waves_per_eu": 2}, num_warps=4),
-        triton.Config({"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1, "NUM_STAGES": 2, "kpack": 1, "matrix_instr_nonkdim": 16, "waves_per_eu": 0}, num_warps=2),
-    ],
-    key=["M", "N", "K"],
-)
+# Naive Addmm kernel
 @triton.jit
-def tlx_addmm_glu_kernel_old(
+def tlx_addmm_glu_kernel_naive(
     a_ptr,
     b_ptr,
     bias_ptr,
@@ -407,14 +422,12 @@ def tlx_addmm_glu_kernel_old(
     tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), mask=cmask)
 
 
-def tlx_fused_addmm_glu_old(bias, a, b, y):
+def run_kernel_naive(bias, a, b, y, cfg):
     M, K = a.shape
     K2, N = b.shape
     out = torch.empty((M, N), device=a.device, dtype=torch.float16)
-    grid = lambda meta: (
-        triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(N, meta["BLOCK_SIZE_N"]),
-    )
-    tlx_addmm_glu_kernel_old[grid](
+    grid = (triton.cdiv(M, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"]),)
+    tlx_addmm_glu_kernel_naive[grid](
         a,
         b,
         bias,
@@ -431,46 +444,131 @@ def tlx_fused_addmm_glu_old(bias, a, b, y):
         y.stride(1),
         out.stride(0),
         out.stride(1),
+        BLOCK_SIZE_M=cfg["BLOCK_SIZE_M"],
+        BLOCK_SIZE_N=cfg["BLOCK_SIZE_N"],
+        BLOCK_SIZE_K=cfg["BLOCK_SIZE_K"],
+        GROUP_SIZE_M=cfg["GROUP_SIZE_M"],
+        NUM_STAGES=cfg["NUM_STAGES"],
+        num_warps=cfg["num_warps"],
+        matrix_instr_nonkdim=cfg.get("matrix_instr_nonkdim", 0),
+        waves_per_eu=cfg.get("waves_per_eu", 0),
+        kpack=cfg.get("kpack", 1),
     )
     return out
 
 
-def main():
-    tflops = lambda ms, K: 2 * M * N * K * 1e-12 / (ms * 1e-3)
-    K_VALUES = [256, 512, 1024]
-    results = []
+def run_naive(a, b, bias, y):
+    K = b.shape[0]
+    return run_kernel_naive(bias, a, b, y, NAIVE_BEST_CONFIG[K])
 
-    for K in K_VALUES:
-        cfg = BEST_CONFIG[K]
-        torch.manual_seed(0)
-        a = torch.randn(M, K, device="cuda", dtype=torch.float16)
-        b = torch.randn(K, N, device="cuda", dtype=torch.float16)
-        bias = torch.randn(N, device="cuda", dtype=torch.float16)
-        y = torch.randn(M, N, device="cuda", dtype=torch.float16)
-        out = torch.empty((M, N), device="cuda", dtype=torch.float16)
 
-        # Correctness check against PyTorch
-        run_kernel(a, b, bias, y, out, cfg)
-        torch.cuda.synchronize()
-        ref = pytorch_baseline(bias, a, b, y)
-        max_err = (out.float() - ref.float()).abs().max().item()
-        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+def run_optimized(a, b, bias, y):
+    K = b.shape[0]
+    out = torch.empty((a.shape[0], b.shape[1]), device=a.device, dtype=torch.float16)
+    run_kernel_optimized(a, b, bias, y, out, BEST_CONFIG[K])
+    return out
 
-        ms_rocblas = triton.testing.do_bench(lambda: torch.matmul(a, b), warmup=25, rep=200)
-        ms_old = triton.testing.do_bench(lambda: tlx_fused_addmm_glu_old(bias, a, b, y), warmup=25, rep=200)
-        ms_opt = triton.testing.do_bench(lambda: run_kernel(a, b, bias, y, out, cfg), warmup=25, rep=200)
-        results.append((K, max_err, ms_rocblas, ms_old, ms_opt))
 
-    print(f"\nM={M} N={N}  fp16   (TFLOPS = 2*M*N*K / time)\n")
-    hdr = (f"{'K':>6} {'ROCBLAS':>9} {'original':>9} {'new':>9} "
-           f"{'speedup':>8} {'max_err':>9}")
+KERNEL_REGISTRY = {
+    "tlx_naive": run_naive,
+    "tlx_optimized": run_optimized,
+}
+
+
+def get_kernel(name):
+    if name not in KERNEL_REGISTRY:
+        raise ValueError(f"Unknown kernel: {name!r}. "
+                         f"Available: {list(KERNEL_REGISTRY.keys())}")
+    return KERNEL_REGISTRY[name]
+
+
+def verify(name, got, ref, atol=2e-2, rtol=2e-2, log=True):
+    diff = (got.float() - ref.float()).abs()
+    ok = torch.allclose(ref, got, atol=atol, rtol=rtol)
+    max_err = diff.max().item()
+    mean_err = diff.mean().item()
+    status = "PASS" if ok else "FAIL"
+    if log:
+        print(f"  {name:<28} {status}  max={max_err:.6f}  mean={mean_err:.6f}")
+    return ok
+
+
+def print_summary_table(results, providers):
+    """Print a markdown-style summary table of benchmark results."""
+    rows = [(f"K={key}", results[key]) for key in sorted(results.keys())]
+
+    cfg_w = max(len("Config"), *(len(lbl) for lbl, _ in rows)) if rows else len("Config")
+    col_w = max(14, *(len(p) for p in providers))
+
+    hdr = f"| {'Config':<{cfg_w}} |" + "".join(f" {p:>{col_w}} |" for p in providers)
+    sep = f"|{'-' * (cfg_w + 2)}|" + "".join(f"{'-' * (col_w + 2)}|" for _ in providers)
+
+    print(f"\n{'=' * len(sep)}")
+    print(f"Summary (TFLOPS)   M={M} N={N}  fp16")
+    print(f"{'=' * len(sep)}")
     print(hdr)
-    print("-" * len(hdr))
-    for K, err, ms_r, ms_o, ms_p in results:
-        print(f"{K:>6} {tflops(ms_r, K):>9.1f} {tflops(ms_o, K):>9.1f} {tflops(ms_p, K):>9.1f} "
-              f"{ms_o/ms_p:>7.2f}x {err:>9.2e}")
-    print("\nROCBLAS = torch.matmul A@B only; original/new = fused addmm+GLU. speedup = original/new.")
+    print(sep)
+
+    for label, prov in rows:
+        vals = (f"{prov[p]['tflops']:>{col_w}.1f}" if p in prov else f"{'—':>{col_w}}" for p in providers)
+        print(f"| {label:<{cfg_w}} |" + "".join(f" {v} |" for v in vals))
+
+    print(f"{'=' * len(sep)}\n")
+
+
+def run_benchmark(args):
+    results = {}
+
+    for K in args.K:
+        torch.manual_seed(0)
+        a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
+        b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
+        bias = torch.randn(N, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(M, N, device=DEVICE, dtype=torch.float16)
+
+        total_flops = 2.0 * M * N * K
+        ref = pytorch_baseline(bias, a, b, y)
+
+        results[K] = {}
+
+        # PyTorch reference: naive matmul + add, then GLU
+        pt_lambda = lambda: pytorch_baseline(bias, a, b, y)
+        ms = triton.testing.do_bench(pt_lambda, warmup=25, rep=100)
+        results[K]["PyTorch_naive"] = {"ms": ms, "tflops": total_flops / ms * 1e-9}
+
+        # Selected TLX kernels (verified against PyTorch reference)
+        for kernel_name in args.kernel:
+            kernel_fn = get_kernel(kernel_name)
+            try:
+                k_lambda = lambda fn=kernel_fn: fn(a, b, bias, y)
+                out = k_lambda()
+                assert verify("", out, ref, log=False)
+            except Exception as e:
+                print(f"  {kernel_name:20s} K={K:5d} -> SKIPPED ({e})")
+                continue
+            ms = triton.testing.do_bench(k_lambda, warmup=25, rep=100)
+            results[K][kernel_name] = {"ms": ms, "tflops": total_flops / ms * 1e-9}
+
+        # ROCBLAS reference: pure matmul (no add/GLU)
+        rb_lambda = lambda: torch.matmul(a, b)
+        ms = triton.testing.do_bench(rb_lambda, warmup=25, rep=100)
+        results[K]["ROCBLAS (matmul only)"] = {"ms": ms, "tflops": total_flops / ms * 1e-9}
+
+    providers = ["PyTorch_naive"] + list(args.kernel) + ["ROCBLAS (matmul only)"]
+    print_summary_table(results, providers)
+
+
+def parse_args():
+    k_choices = sorted(BEST_CONFIG)
+    kernel_choices = list(KERNEL_REGISTRY)
+    p = argparse.ArgumentParser(prog="AMD TLX Addmm+GLU")
+    p.add_argument("-K", type=int, nargs="+", default=k_choices, choices=k_choices,
+                   help="K (contraction) sizes to benchmark; only stored-config sizes are supported")
+    p.add_argument("--kernel", type=str, nargs="+", default=kernel_choices,
+                   choices=kernel_choices,
+                   help="Kernel variants to benchmark")
+    return p.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    run_benchmark(parse_args())
