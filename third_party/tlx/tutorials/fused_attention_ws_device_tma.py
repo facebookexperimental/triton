@@ -17,7 +17,7 @@ def is_hip():
 
 def is_cuda():
     target = triton.runtime.driver.active.get_current_target()
-    return getattr(target, 'is_cuda_backend', lambda: target.backend == "cuda")()
+    return getattr(target, "is_cuda_backend", lambda: target.backend == "cuda")()
 
 
 def supports_host_descriptor():
@@ -264,7 +264,8 @@ def prune_invalid_configs(configs, named_args, **kwargs):
 def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
     if isinstance(desc_or_ptr, tl.tensor_descriptor):
         return desc_or_ptr
-    return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
+    else:
+        return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
 
 
 @triton.jit
@@ -899,7 +900,7 @@ configs_bwd_persist = [
         num_stages=2,
         pre_hook=_bwd_host_descriptor_pre_hook,
     ),
-    #triton.Config( # test dk/dv staging buffer reuse
+    # triton.Config( # test dk/dv staging buffer reuse
     #    {
     #        "BLOCK_M1": 128,
     #        "BLOCK_N1": 128,
@@ -911,7 +912,7 @@ configs_bwd_persist = [
     #    num_warps=4,
     #    num_stages=2,
     #    pre_hook=_bwd_host_descriptor_pre_hook,
-    #),
+    # ),
     triton.Config(
         {
             "BLOCK_M1": 64,

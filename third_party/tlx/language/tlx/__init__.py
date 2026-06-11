@@ -21,6 +21,10 @@ from .dynamic_launch import (
 )
 from .mem_ops import (
     allocate_tensor_descriptor,
+    amd_descriptor_prefetch_tensor,
+    async_amd_descriptor_load,
+    async_amd_descriptor_store,
+    async_amd_descriptor_wait,
     async_store,
     async_descriptor_load,
     async_descriptor_prefetch_tensor,
@@ -64,12 +68,14 @@ from .types import (
     mbarrier,
     mbarrier_type,
     nv_mma_shared_layout_encoding,
+    padded_shared_layout_encoding,
     reuse_group,
     reuse_group_ir_type,
     reuse_group_type,
     storage_alias_spec as storage_alias_spec_type_class,
     storage_alias_spec_type,
     shared_layout_encoding,
+    layout,
     storage_kind,
     swizzled_shared_layout_encoding,
     tensor_descriptor_ptr,
@@ -89,7 +95,7 @@ from .utility import (
     thread_id,
 )
 from .mxfp8_utils import _to_mxfp8_block
-from .warp_ops import vote_ballot_sync
+from .warp_ops import vote_ballot_sync, warp_redux
 
 __all__ = [
     # async_tasks
@@ -99,10 +105,12 @@ __all__ = [
     "layout_encoding",
     "shared_layout_encoding",
     "swizzled_shared_layout_encoding",
+    "padded_shared_layout_encoding",
     "tensor_memory_layout_encoding",
     "TMemCTAMode",
     "nv_mma_shared_layout_encoding",
     "storage_kind",
+    "layout",
     "buffered_tensor",
     "buffered_tensor_type",
     "storage_alias_spec",
@@ -135,6 +143,10 @@ __all__ = [
     "local_trans",
     "local_reinterpret",
     "allocate_tensor_descriptor",
+    "async_amd_descriptor_load",
+    "async_amd_descriptor_store",
+    "async_amd_descriptor_wait",
+    "amd_descriptor_prefetch_tensor",
     "async_descriptor_load",
     "async_descriptor_prefetch_tensor",
     "async_descriptor_store",

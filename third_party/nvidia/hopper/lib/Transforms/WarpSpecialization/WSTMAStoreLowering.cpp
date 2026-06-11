@@ -1,5 +1,7 @@
 #include "CodePartitionUtility.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/OperationSupport.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -146,6 +148,14 @@ static bool isTMAStoreLikeOp(Operation *op) {
   return isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(op);
 }
 
+static Value getTMAStoreSource(Operation *op) {
+  if (auto copyOp = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(op))
+    return copyOp.getSrc();
+  if (auto reduceOp = dyn_cast<ttng::AsyncTMAReduceOp>(op))
+    return reduceOp.getSrc();
+  return {};
+}
+
 // Trace the token back to the defining TMA store-like op
 // (AsyncTMACopyLocalToGlobalOp or AsyncTMAReduceOp), handling both direct
 // definitions and loop-carried block arguments. Returns the SMEM source
@@ -185,6 +195,70 @@ static Operation *getDefiningTMAStoreOp(ttng::TMAStoreTokenWaitOp waitOp,
     }
   }
 
+  return nullptr;
+}
+
+static bool samePureValue(Value lhs, Value rhs, unsigned depth = 0) {
+  if (lhs == rhs)
+    return true;
+  if (lhs.getType() != rhs.getType() || depth > 8)
+    return false;
+
+  Operation *lhsDef = lhs.getDefiningOp();
+  Operation *rhsDef = rhs.getDefiningOp();
+  if (!lhsDef || !rhsDef)
+    return false;
+  if (lhsDef->getName() != rhsDef->getName())
+    return false;
+  if (cast<OpResult>(lhs).getResultNumber() !=
+      cast<OpResult>(rhs).getResultNumber())
+    return false;
+  if (!isMemoryEffectFree(lhsDef) || !isMemoryEffectFree(rhsDef))
+    return false;
+  if (lhsDef->getNumRegions() || rhsDef->getNumRegions())
+    return false;
+
+  return OperationEquivalence::isEquivalentTo(
+      lhsDef, rhsDef,
+      [depth](Value lhsOperand, Value rhsOperand) {
+        return success(samePureValue(lhsOperand, rhsOperand, depth + 1));
+      },
+      /*markEquivalent=*/nullptr, OperationEquivalence::IgnoreLocations);
+}
+
+static bool sameMemDescValue(Value lhs, Value rhs) {
+  if (lhs == rhs)
+    return true;
+
+  Operation *lhsDef = lhs.getDefiningOp();
+  Operation *rhsDef = rhs.getDefiningOp();
+  if (!lhsDef || !rhsDef)
+    return false;
+  if (lhsDef->getName() != rhsDef->getName())
+    return false;
+  if (!isa<ttg::MemDescIndexOp, ttg::MemDescSubsliceOp,
+           ttg::MemDescReinterpretOp>(lhsDef))
+    return false;
+  if (lhsDef->getNumOperands() != rhsDef->getNumOperands())
+    return false;
+
+  for (unsigned i = 0; i < lhsDef->getNumOperands(); ++i) {
+    if (!samePureValue(lhsDef->getOperand(i), rhsDef->getOperand(i)))
+      return false;
+  }
+  return true;
+}
+
+static Operation *
+findLocalStoreWritingBuffer(scf::ForOp forOp, Value buffer,
+                            const tt::CoarseSchedule &schedule) {
+  for (auto &op : forOp.getBody()->without_terminator()) {
+    auto localStore = dyn_cast<ttg::LocalStoreOp>(&op);
+    if (!localStore || !schedule.count(&op))
+      continue;
+    if (sameMemDescValue(localStore.getDst(), buffer))
+      return &op;
+  }
   return nullptr;
 }
 
@@ -262,14 +336,32 @@ void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp) {
 
 static Operation *
 findScheduledWaitBarrierBetween(Operation *producer, Operation *insertionTarget,
-                                const tt::CoarseSchedule &schedule) {
-  if (!producer->isBeforeInBlock(insertionTarget))
+                                const tt::CoarseSchedule &schedule,
+                                bool includeBarrierBeforeProducer) {
+  auto findBefore = [&](Operation *op, Operation *stopOp) -> Operation * {
+    for (auto revIt = Block::reverse_iterator(op->getIterator());
+         revIt != op->getBlock()->rend(); ++revIt) {
+      Operation *candidate = &*revIt;
+      if (candidate == stopOp)
+        return nullptr;
+      if (isa<ttng::WaitBarrierOp>(candidate) && schedule.count(candidate))
+        return candidate;
+    }
+    return nullptr;
+  };
+
+  if (producer->isBeforeInBlock(insertionTarget))
+    return findBefore(insertionTarget, producer);
+
+  if (!includeBarrierBeforeProducer)
     return nullptr;
 
-  for (auto revIt = Block::reverse_iterator(insertionTarget->getIterator());
-       revIt != insertionTarget->getBlock()->rend(); ++revIt) {
+  Operation *wraparoundTarget =
+      insertionTarget->isBeforeInBlock(producer) ? insertionTarget : producer;
+  for (auto revIt = Block::reverse_iterator(wraparoundTarget->getIterator());
+       revIt != producer->getBlock()->rend(); ++revIt) {
     Operation *candidate = &*revIt;
-    if (candidate == producer)
+    if (isTMAStoreLikeOp(candidate))
       return nullptr;
     if (isa<ttng::WaitBarrierOp>(candidate) && schedule.count(candidate))
       return candidate;
@@ -278,8 +370,12 @@ findScheduledWaitBarrierBetween(Operation *producer, Operation *insertionTarget,
   return nullptr;
 }
 
-void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
+LogicalResult doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
+  bool failedToReorder = false;
   funcOp.walk([&](scf::ForOp forOp) {
+    if (failedToReorder)
+      return;
+
     bool hasNestedFor = false;
     forOp.getBody()->walk([&](scf::ForOp) { hasNestedFor = true; });
     if (hasNestedFor)
@@ -319,6 +415,12 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
     }
     if (waits.empty())
       return;
+
+    int numTMAStores = 0;
+    for (auto &op : forOp.getBody()->without_terminator()) {
+      if (isTMAStoreLikeOp(&op))
+        ++numTMAStores;
+    }
 
     bool changed = false;
     for (auto waitOp : waits) {
@@ -365,12 +467,38 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
       }
 
       if (insertionTarget) {
-        // Look for a WaitBarrierOp between the defining store and the
-        // insertion target. Do not scan before the producer: unrelated earlier
-        // barriers must not pull the token wait before its defining TMA store.
-        if (Operation *waitBarrier = findScheduledWaitBarrierBetween(
-                tmaStore, insertionTarget, schedule))
+        Operation *targetTMAStore = insertionTarget;
+        int numPrevTMAStores = 0;
+        for (auto &op : forOp.getBody()->without_terminator()) {
+          if (&op == tmaStore)
+            break;
+          if (isTMAStoreLikeOp(&op))
+            ++numPrevTMAStores;
+        }
+
+        Value targetBuffer = getTMAStoreSource(targetTMAStore);
+        Operation *targetWriter =
+            targetBuffer
+                ? findLocalStoreWritingBuffer(forOp, targetBuffer, schedule)
+                : nullptr;
+        if (targetWriter) {
+          insertionTarget = targetWriter;
+        } else {
+          // If the buffer is updated by a different partition, the TMA store
+          // must be guarded by that partition's wait_barrier. Reorder before
+          // the barrier so the token wait completes before the target buffer
+          // can be updated.
+          Operation *waitBarrier = findScheduledWaitBarrierBetween(
+              tmaStore, targetTMAStore, schedule,
+              k >= (numTMAStores - numPrevTMAStores));
+          if (!waitBarrier) {
+            LDBG("failed to find wait_barrier guarding target TMA store for "
+                 "loop at "
+                 << forOp.getLoc() << "; leaving TMA store wait unchanged");
+            continue;
+          }
           insertionTarget = waitBarrier;
+        }
 
         // Split the cluster at the insertion target: ops before it remain
         // in the original cluster, the target and subsequent ops stay in
@@ -392,14 +520,20 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
     if (changed)
       schedule.serialize(forOp);
   });
+  return failure(failedToReorder);
 }
 
 struct NVGPUTestTMAStoreTokenWaitReorderPass
     : public impl::NVGPUTestTMAStoreTokenWaitReorderBase<
           NVGPUTestTMAStoreTokenWaitReorderPass> {
   void runOnOperation() override {
-    getOperation()->walk(
-        [&](triton::FuncOp funcOp) { doTMAStoreWaitReorder(funcOp); });
+    bool passFailed = false;
+    getOperation()->walk([&](triton::FuncOp funcOp) {
+      if (failed(doTMAStoreWaitReorder(funcOp)))
+        passFailed = true;
+    });
+    if (passFailed)
+      signalPassFailure();
   }
 };
 

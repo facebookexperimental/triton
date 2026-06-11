@@ -50,8 +50,7 @@ def create_benchmark(versions, mode="fwd"):
             ylabel="TFLOPS",
             plot_name=f"flash-attention-{mode}-performance-fp16",
             args={"BATCH": 4, "H": 32, "HEAD_DIM": 128, "causal": True},
-        )
-    )
+        ))
     def benchmark(BATCH, H, N_CTX, HEAD_DIM, causal, provider):
         q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=torch.float16).requires_grad_()
         k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=torch.float16).requires_grad_()

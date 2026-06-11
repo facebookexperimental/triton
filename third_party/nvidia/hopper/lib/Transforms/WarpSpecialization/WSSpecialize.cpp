@@ -88,7 +88,8 @@ static bool isYieldedValueAvailableForTask(Value value,
     unsigned argNumber = blockArg.getArgNumber();
     if (argNumber < forOp.getNumInductionVars())
       return false;
-    Value initArg = forOp.getInitArgs()[argNumber - forOp.getNumInductionVars()];
+    Value initArg =
+        forOp.getInitArgs()[argNumber - forOp.getNumInductionVars()];
     if (Operation *def = initArg.getDefiningOp())
       return hasAsyncTaskId(def, asyncTaskId);
   }
@@ -97,8 +98,7 @@ static bool isYieldedValueAvailableForTask(Value value,
 }
 
 static bool shouldKeepIfResultForTask(scf::IfOp ifOp, unsigned resultIdx,
-                                      Value result,
-                                      AsyncTaskId asyncTaskId) {
+                                      Value result, AsyncTaskId asyncTaskId) {
   if (isValueNeededByTask(result, asyncTaskId))
     return true;
   if (isYieldedValueAvailableForTask(ifOp.thenYield().getOperand(resultIdx),

@@ -439,9 +439,10 @@ def prune_persistent_configs(configs, named_args, **kwargs):
 
 @triton.jit
 def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
-    if isinstance(desc_or_ptr, triton.language.core.tensor_descriptor_base):
+    if isinstance(desc_or_ptr, tl.tensor_descriptor):
         return desc_or_ptr
-    return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
+    else:
+        return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
 
 
 @triton.jit
@@ -804,7 +805,7 @@ class _attention_opt(torch.autograd.Function):
 
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
         warp_specialize = baseVariant == "ws" or baseVariant == "ws_persistent"
-        if (not FORCE_ON_DEVICE and supports_host_descriptor() and not (is_hopper() and warp_specialize)):
+        if not FORCE_ON_DEVICE and supports_host_descriptor() and not (is_hopper() and warp_specialize):
             y_dim = q.shape[0] * q.shape[1] * q.shape[2]
 
             dummy_block = [1, 1]

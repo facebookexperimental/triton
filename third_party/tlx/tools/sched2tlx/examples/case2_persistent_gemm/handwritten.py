@@ -15,7 +15,6 @@ Structure modeled after blackwell_gemm_ws.py: smem_accum_cnt persists across
 tiles so the SMEM ring buffer doesn't need to drain between tiles.
 """
 
-import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
@@ -71,9 +70,7 @@ def matmul_kernel(
                 c = acc.to(tlx.dtype_of(c_desc))
                 tlx.local_store(c_smem[0], c)
                 tlx.fence_async_shared()
-                tlx.async_descriptor_store(
-                    c_desc, c_smem[0], [pid_m * BLOCK_M, pid_n * BLOCK_N]
-                )
+                tlx.async_descriptor_store(c_desc, c_smem[0], [pid_m * BLOCK_M, pid_n * BLOCK_N])
                 tlx.async_descriptor_store_wait(0)
                 tile_id += NUM_SMS
                 tmem_phase ^= 1
@@ -120,14 +117,10 @@ def matmul_kernel(
                     # Load A
                     tlx.barrier_wait(a_empty[buf], phase ^ 1)
                     tlx.barrier_expect_bytes(a_full[buf], BLOCK_M * BLOCK_K * 2)
-                    tlx.async_descriptor_load(
-                        a_desc, smem_a[buf], [offs_am, offs_k], a_full[buf]
-                    )
+                    tlx.async_descriptor_load(a_desc, smem_a[buf], [offs_am, offs_k], a_full[buf])
                     # Load B (as [BN, BK])
                     tlx.barrier_wait(b_empty[buf], phase ^ 1)
                     tlx.barrier_expect_bytes(b_full[buf], BLOCK_N * BLOCK_K * 2)
-                    tlx.async_descriptor_load(
-                        b_desc, smem_b[buf], [offs_bn, offs_k], b_full[buf]
-                    )
+                    tlx.async_descriptor_load(b_desc, smem_b[buf], [offs_bn, offs_k], b_full[buf])
                     smem_accum += 1
                 tile_id += NUM_SMS

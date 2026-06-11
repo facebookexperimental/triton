@@ -84,5 +84,3 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 #loc39 = loc("a"(#loc10))
 #loc40 = loc("b"(#loc11))
 #loc41 = loc("c_desc"(#loc13))
-
-

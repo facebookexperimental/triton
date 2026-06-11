@@ -21,7 +21,7 @@ def alloc_fn(size, alignment, stream):
 def main() -> int:
     triton.set_allocator(alloc_fn)
     torch.manual_seed(0)
-    BLOCK_M, BLOCK_N, HEAD_DIM = 128, 64, 128
+    BLOCK_M, BLOCK_N, HEAD_DIM = 128, 64, 128  # noqa: F841
 
     failed = 0
     for Z, H, N_CTX in [
@@ -54,9 +54,7 @@ def main() -> int:
                 num_stages=2,
             )
         except Exception as e:
-            print(
-                f"[FAIL-COMPILE] Z={Z} H={H} N_CTX={N_CTX}: {type(e).__name__}: {str(e)[:200]}"
-            )
+            print(f"[FAIL-COMPILE] Z={Z} H={H} N_CTX={N_CTX}: {type(e).__name__}: {str(e)[:200]}")
             failed += 1
             continue
         ref = F.scaled_dot_product_attention(q, k, v, scale=sm_scale)

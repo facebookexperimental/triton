@@ -19,7 +19,6 @@ Layout:
   MEM     — TMA loads (Q once, K+V every iter)
 """
 
-import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
@@ -42,32 +41,22 @@ def fa_fwd_kernel(
     NUM_BUFFERS_KV: tl.constexpr,
 ):
     # Tensor descriptors.
-    desc_q = tl.make_tensor_descriptor(
-        Q, [Z * H * N_CTX, HEAD_DIM], [HEAD_DIM, 1], [BLOCK_M, HEAD_DIM]
-    )
-    desc_k = tl.make_tensor_descriptor(
-        K, [Z * H * N_CTX, HEAD_DIM], [HEAD_DIM, 1], [BLOCK_N, HEAD_DIM]
-    )
-    desc_v = tl.make_tensor_descriptor(
-        V, [Z * H * N_CTX, HEAD_DIM], [HEAD_DIM, 1], [BLOCK_N, HEAD_DIM]
-    )
-    desc_o = tl.make_tensor_descriptor(
-        Out, [Z * H * N_CTX, HEAD_DIM], [HEAD_DIM, 1], [BLOCK_M, HEAD_DIM]
-    )
+    desc_q = tl.make_tensor_descriptor(Q, [Z * H * N_CTX, HEAD_DIM], [HEAD_DIM, 1], [BLOCK_M, HEAD_DIM])
+    desc_k = tl.make_tensor_descriptor(K, [Z * H * N_CTX, HEAD_DIM], [HEAD_DIM, 1], [BLOCK_N, HEAD_DIM])
+    desc_v = tl.make_tensor_descriptor(V, [Z * H * N_CTX, HEAD_DIM], [HEAD_DIM, 1], [BLOCK_N, HEAD_DIM])
+    desc_o = tl.make_tensor_descriptor(Out, [Z * H * N_CTX, HEAD_DIM], [HEAD_DIM, 1], [BLOCK_M, HEAD_DIM])
 
     # SMEM buffers.
     q_tile = tlx.local_alloc((BLOCK_M, HEAD_DIM), tl.bfloat16, 1)
     kv_tiles = tlx.local_alloc((BLOCK_N, HEAD_DIM), tl.bfloat16, NUM_BUFFERS_KV)
-    alpha_smem = tlx.local_alloc((BLOCK_M,), tl.float32, 1)
-    l_smem = tlx.local_alloc((BLOCK_M,), tl.float32, 1)
-    m_smem = tlx.local_alloc((BLOCK_M,), tl.float32, 1)
+    alpha_smem = tlx.local_alloc((BLOCK_M, ), tl.float32, 1)
+    l_smem = tlx.local_alloc((BLOCK_M, ), tl.float32, 1)
+    m_smem = tlx.local_alloc((BLOCK_M, ), tl.float32, 1)
 
     # TMEM buffers.
     qk_tmem = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, 1, tlx.storage_kind.tmem)
     p_tmem = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.bfloat16, 1, tlx.storage_kind.tmem)
-    acc_tmem = tlx.local_alloc(
-        (BLOCK_M, HEAD_DIM), tl.float32, 1, tlx.storage_kind.tmem
-    )
+    acc_tmem = tlx.local_alloc((BLOCK_M, HEAD_DIM), tl.float32, 1, tlx.storage_kind.tmem)
 
     # Mbarriers (mirrors tutorial's barrier set, single-buffered).
     q_full = tlx.alloc_barriers(num_barriers=1, arrive_count=1)

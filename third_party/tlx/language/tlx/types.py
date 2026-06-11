@@ -5,9 +5,21 @@ from typing import List, Optional, Tuple
 import triton.language.core as tl
 from triton._C.libtriton import ir
 from triton.language.core import _aggregate as aggregate
+from triton.runtime.jit import constexpr_function
 
 
 class layout_encoding:
+    """Base class for every TLX layout that lowers to an MLIR layout attribute.
+
+    Two families live under this base:
+      - **memory** encodings (`shared_layout_encoding`, `tensor_memory_*`): how a
+        buffer is laid out in smem/tmem. Self-describing; `to_ir` needs only the
+        builder.
+      - **distributed/register** encodings (`layout`, `DummyRegisterLayoutEncoding`):
+        how a loaded value is spread across threads/registers. These may need the
+        consuming tensor's `shape`/`element_type` to materialize, hence the
+        optional args on `to_ir`.
+    """
 
     def __init__(self):
         pass
@@ -15,7 +27,7 @@ class layout_encoding:
     def __repr__(self):
         return self.__class__.__name__
 
-    def to_ir(self, builder: ir.builder) -> None:
+    def to_ir(self, builder: ir.builder, shape=None, element_type=None) -> None:
         raise NotImplementedError(f"{self.__class__.__name__}.to_ir() must be overridden in subclasses")
 
 
@@ -90,6 +102,68 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
             self.perPhase,
             self.maxPhase,
             self.order,
+            self.numCTAsPerCGA,
+            self.numCTASplit,
+            self.numCTAOrder,
+        )
+
+
+class padded_shared_layout_encoding(shared_layout_encoding):
+    """Padded shared encoding with an identity offset map.
+
+    Mirrors ``ttg.padded_shared`` in the identity form:
+    ``padded_shared<[interval_0:+pad_0, ...] {order = ..., shape = ...}>``.
+    """
+
+    def __init__(self, intervals, paddings, order, shape, numCTAsPerCGA, numCTASplit, numCTAOrder):
+        super().__init__()
+        assert len(intervals) == len(paddings), \
+            "intervals and paddings must have the same length"
+        self.intervals = list(intervals)
+        self.paddings = list(paddings)
+        self.order = list(order)
+        self.shape = list(shape)
+        self.numCTAsPerCGA = list(numCTAsPerCGA)
+        self.numCTASplit = list(numCTASplit)
+        self.numCTAOrder = list(numCTAOrder)
+
+    @staticmethod
+    @constexpr_function
+    def with_identity_for(interval_padding_pairs, shape, order=None):
+        rank = len(shape)
+        if order is None:
+            order = list(reversed(range(rank)))
+        intervals = [int(p[0]) for p in interval_padding_pairs]
+        paddings = [int(p[1]) for p in interval_padding_pairs]
+        return padded_shared_layout_encoding(
+            intervals=intervals,
+            paddings=paddings,
+            order=list(order),
+            shape=list(shape),
+            numCTAsPerCGA=[1] * rank,
+            numCTASplit=[1] * rank,
+            numCTAOrder=list(range(rank)),
+        )
+
+    def make_permute(self, dims):
+        permuted_order = [self.order[d] for d in dims]
+        permuted_shape = [self.shape[d] for d in dims]
+        return padded_shared_layout_encoding(
+            intervals=self.intervals,
+            paddings=self.paddings,
+            order=permuted_order,
+            shape=permuted_shape,
+            numCTAsPerCGA=self.numCTAsPerCGA,
+            numCTASplit=self.numCTASplit,
+            numCTAOrder=self.numCTAOrder,
+        )
+
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_padded_shared_encoding_attr(
+            self.intervals,
+            self.paddings,
+            self.order,
+            [int(s) for s in self.shape],
             self.numCTAsPerCGA,
             self.numCTASplit,
             self.numCTAOrder,
@@ -262,6 +336,99 @@ class DummyRegisterLayoutEncoding(layout_encoding):
 
     def __hash__(self):
         return hash((tuple(self.shape), self.element_type, self.tmem_compatible))
+
+
+def _modes_to_flat_strides(shape, stride):
+    """Expand a Shape:Stride list of modes into per-bit flat strides.
+
+    `shape` is a tuple of power-of-two mode extents, `stride` the matching tuple
+    of (scalar) flat offsets. A mode `(2^k, s)` contributes the `k` bit-strides
+    `s, 2s, 4s, ..., 2^(k-1) s` (GF(2) decomposition).
+    """
+    assert len(shape) == len(stride), "layout: shape and stride must have the same number of modes"
+    flat = []
+    for extent, s in zip(shape, stride):
+        extent = int(extent)
+        s = int(s)
+        assert extent & (extent - 1) == 0, f"layout mode extent {extent} must be a power of two"
+        b = 1
+        while b < extent:
+            flat.append(s * b)
+            b <<= 1
+    return flat
+
+
+def _flat_to_coord(flat, tensor_shape):
+    """Decode a flat (row-major) offset into a per-dimension coordinate vector."""
+    coord = []
+    for d in range(len(tensor_shape)):
+        dim_stride = 1
+        for later in tensor_shape[d + 1:]:
+            dim_stride *= int(later)
+        coord.append((flat // dim_stride) % int(tensor_shape[d]))
+    return coord
+
+
+class layout(layout_encoding):
+    """
+    A user-specified distributed (register) layout — one of the two families of
+    `layout_encoding` (see that base class). Written purely as **shape** and
+    **stride** (a CuTe-style thread-value layout), for
+    `tlx.local_load(buf, layout=...)`.
+
+    The layout has two top-level modes — `(thread, value)`:
+      - ``shape``  = ``(thread_shape, value_shape)``
+      - ``stride`` = ``(thread_stride, value_stride)``
+    Each `*_shape` is a tuple of power-of-two extents and each `*_stride` the
+    matching tuple of **flat, row-major offsets** into the tile. The author only
+    speaks shape/stride; the compiler decomposes each mode `(2^k, s)` into bits
+    `s, 2s, ..., 2^(k-1)s`, splits the thread bits into lane (the low
+    `log2(threads_per_warp)`) and warp (the rest), maps the value bits to
+    registers, and builds the corresponding `#linear` encoding to propagate.
+
+    Example (separable QK layout, tile [N=128, M=128], row-major flat offset
+    = ``n * 128 + m``):
+        tlx.layout(
+            shape =((32, 4, 2), (32, 2)),          # (thread, value)
+            stride=((128, 4096, 32), (1, 64)),
+        )
+    """
+
+    def __init__(self, shape, stride):
+        super().__init__()
+        assert len(shape) == 2 and len(stride) == 2, \
+            "layout: shape and stride must each be (thread, value)"
+        self.thread_shape, self.value_shape = shape
+        self.thread_stride, self.value_stride = stride
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type: tl.dtype = None):
+        assert shape is not None, "layout.to_ir requires the consuming tensor shape"
+        tensor_shape = [int(s) for s in shape]
+        warp_size = int(builder.options.warp_size)
+        lane_bits = warp_size.bit_length() - 1  # log2(threads_per_warp)
+
+        value_flat = _modes_to_flat_strides(self.value_shape, self.value_stride)
+        thread_flat = _modes_to_flat_strides(self.thread_shape, self.thread_stride)
+        lane_flat = thread_flat[:lane_bits]
+        warp_flat = thread_flat[lane_bits:]
+
+        reg_bases = [_flat_to_coord(f, tensor_shape) for f in value_flat]
+        lane_bases = [_flat_to_coord(f, tensor_shape) for f in lane_flat]
+        warp_bases = [_flat_to_coord(f, tensor_shape) for f in warp_flat]
+        return builder.make_linear_encoding_attr(reg_bases, lane_bases, warp_bases, tensor_shape)
+
+    def __repr__(self):
+        return (f"layout<shape=({self.thread_shape}, {self.value_shape}), "
+                f"stride=({self.thread_stride}, {self.value_stride})>")
+
+    def __eq__(self, other):
+        return (isinstance(other, layout) and self.thread_shape == other.thread_shape
+                and self.value_shape == other.value_shape and self.thread_stride == other.thread_stride
+                and self.value_stride == other.value_stride)
+
+    def __hash__(self):
+        return hash((tuple(self.thread_shape), tuple(self.value_shape), tuple(self.thread_stride),
+                     tuple(self.value_stride)))
 
 
 class storage_kind(enum.Enum):

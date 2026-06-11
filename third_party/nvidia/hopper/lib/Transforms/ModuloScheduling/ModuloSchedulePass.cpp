@@ -154,8 +154,7 @@ static void emitScheduleFromGraph(scf::ForOp loop,
   // See issue 001_annotation_smem_overflow.
   unsigned moduloNumStages = 1;
   for (const auto &buf : schedLoop.buffers) {
-    if (buf.kind == ttg::MemoryKind::SMEM ||
-        buf.kind == ttg::MemoryKind::TMEM)
+    if (buf.kind == ttg::MemoryKind::SMEM || buf.kind == ttg::MemoryKind::TMEM)
       moduloNumStages = std::max(moduloNumStages, buf.count);
   }
   loop->setAttr(mlir::triton::kNumStagesAttrName,
@@ -178,14 +177,12 @@ static void emitScheduleFromGraph(scf::ForOp loop,
 
   LLVM_DEBUG({
     llvm::dbgs() << "[MODULO] Emitted schedule: II=" << II
-                 << " maxStage=" << maxStage
-                 << " num_stages=" << (maxStage + 1)
+                 << " maxStage=" << maxStage << " num_stages=" << (maxStage + 1)
                  << " buffers=" << schedLoop.buffers.size() << "\n";
     for (const auto &buf : schedLoop.buffers) {
       if (!buf.defOp || buf.kind == ttg::MemoryKind::BARRIER)
         continue;
-      llvm::dbgs() << "[MODULO]   buf" << buf.id
-                   << " count=" << buf.count
+      llvm::dbgs() << "[MODULO]   buf" << buf.id << " count=" << buf.count
                    << " kind=" << (int)buf.kind
                    << " op=" << buf.defOp->getName().getStringRef() << "\n";
     }
@@ -558,8 +555,10 @@ static int getEpilogueSubtileForOp(Operation *op) {
   int BN = srcTy.getShape()[1];
   auto env = triton::tools::getStrEnv("TRITON_MODULO_EPILOGUE_SUBTILE");
   int S = 0;
-  if (env == "2") S = 2;
-  else if (env == "4") S = 4;
+  if (env == "2")
+    S = 2;
+  else if (env == "4")
+    S = 4;
   // Min sub-tile width: 32 elements = 64 bytes for fp16, which is the
   // TMA descriptor alignment minimum on Blackwell. The design doc gate
   // is 64 (better TMA throughput); loosened here so the demo can use
@@ -617,9 +616,9 @@ static void extractBufferShape(Operation *op, ttg::ScheduleBuffer &buf) {
 /// consume the buffer — they just rebind the underlying memory descriptor —
 /// so we walk through them to the real consumer (the MMA / load / store
 /// that actually reads the bytes).
-static int walkLastConsumerEnd(const ttg::ScheduleLoop &loop,
-                               unsigned startId, int prodCycle, int II,
-                               int distAcc, llvm::DenseSet<unsigned> &seen) {
+static int walkLastConsumerEnd(const ttg::ScheduleLoop &loop, unsigned startId,
+                               int prodCycle, int II, int distAcc,
+                               llvm::DenseSet<unsigned> &seen) {
   int lastEnd = prodCycle;
   for (const auto &edge : loop.edges) {
     if (edge.srcId != startId)
@@ -631,9 +630,9 @@ static int walkLastConsumerEnd(const ttg::ScheduleLoop &loop,
     bool transparent =
         consumer.pipeline == ttg::HWPipeline::NONE && consumer.latency == 0;
     if (transparent) {
-      lastEnd = std::max(lastEnd,
-                         walkLastConsumerEnd(loop, consumer.id, prodCycle,
-                                             II, totalDist, seen));
+      lastEnd =
+          std::max(lastEnd, walkLastConsumerEnd(loop, consumer.id, prodCycle,
+                                                II, totalDist, seen));
       continue;
     }
     int end = consumer.cycle + consumer.latency + totalDist * II;
@@ -1023,9 +1022,9 @@ static bool reduceBuffersForBudget(ttg::ScheduleLoop &loop,
                  << " budget=" << effectiveSmemBudget << "\n";
     for (unsigned i = 0; i < loop.buffers.size(); ++i) {
       const auto &buf = loop.buffers[i];
-      llvm::dbgs() << "[Step4.6]   buf" << i << " kind="
-                   << (int)buf.kind << " count=" << buf.count
-                   << " size=" << buf.sizeBytes() << "B\n";
+      llvm::dbgs() << "[Step4.6]   buf" << i << " kind=" << (int)buf.kind
+                   << " count=" << buf.count << " size=" << buf.sizeBytes()
+                   << "B\n";
     }
   });
   while (computeTotalSmem(loop) > effectiveSmemBudget) {
@@ -1128,8 +1127,9 @@ static bool reduceBuffersForBudget(ttg::ScheduleLoop &loop,
   bool smemOk = smemUsed <= kSmemBudgetBytes();
   bool tmemOk = tmemUsed <= kTmemBudgetBytes;
   LLVM_DEBUG(llvm::dbgs() << "[Step4.6] Budget: SMEM " << smemUsed << "/"
-                          << kSmemBudgetBytes() << (smemOk ? " OK" : " EXCEEDED")
-                          << ", TMEM " << tmemUsed << "/" << kTmemBudgetBytes
+                          << kSmemBudgetBytes()
+                          << (smemOk ? " OK" : " EXCEEDED") << ", TMEM "
+                          << tmemUsed << "/" << kTmemBudgetBytes
                           << (tmemOk ? " OK" : " EXCEEDED") << "\n");
   if (!smemOk || !tmemOk) {
     LLVM_DEBUG(llvm::dbgs()
@@ -1216,11 +1216,10 @@ static void reduceBuffersForGlobalBudget(ttg::ScheduleGraph &graph) {
     buf.count = newDepth;
     if (buf.pairedBufferId != UINT_MAX)
       loop.buffers[buf.pairedBufferId].count = newDepth;
-    LLVM_DEBUG(llvm::dbgs()
-               << "[Step4.6-Global] Reduced loop" << bestLoopIdx << "/buf"
-               << bestBufIdx << " to count=" << newDepth
-               << " (cost=" << bestCost << ", new total=" << totalSmem()
-               << ")\n");
+    LLVM_DEBUG(llvm::dbgs() << "[Step4.6-Global] Reduced loop" << bestLoopIdx
+                            << "/buf" << bestBufIdx << " to count=" << newDepth
+                            << " (cost=" << bestCost
+                            << ", new total=" << totalSmem() << ")\n");
     // Refresh PhysicalBuffers after a depth change so computeTotalSmem
     // reflects the reduction.
     buildPhysicalBuffers(loop);
@@ -1248,10 +1247,9 @@ static void reduceBuffersForGlobalBudget(ttg::ScheduleGraph &graph) {
       newII = std::max(newII, requiredII);
     }
     if (newII != originalII) {
-      LLVM_DEBUG(llvm::dbgs()
-                 << "[Step4.6-Global] Loop " << loop.id << ": raising II from "
-                 << originalII << " to " << newII
-                 << " due to global buffer reduction\n");
+      LLVM_DEBUG(llvm::dbgs() << "[Step4.6-Global] Loop " << loop.id
+                              << ": raising II from " << originalII << " to "
+                              << newII << " due to global buffer reduction\n");
       loop.II = newII;
       loop.maxStage = 0;
       for (auto &node : loop.nodes) {
@@ -1264,8 +1262,9 @@ static void reduceBuffersForGlobalBudget(ttg::ScheduleGraph &graph) {
   int64_t finalTotal = totalSmem();
   LLVM_DEBUG(llvm::dbgs() << "[Step4.6-Global] Final SMEM=" << finalTotal << "/"
                           << kSmemBudgetBytes()
-                          << (finalTotal <= kSmemBudgetBytes() ? " OK"
-                                                              : " STILL EXCEEDED")
+                          << (finalTotal <= kSmemBudgetBytes()
+                                  ? " OK"
+                                  : " STILL EXCEEDED")
                           << "\n");
 }
 
@@ -1640,7 +1639,7 @@ static int computeWGBarrierCost(
     } else if (n.pipeline == ttg::HWPipeline::TC) {
       barriers += 2 * freq; // operand wait_full × ~2
     } else if (n.op && llvm::StringRef(n.op->getName().getStringRef())
-                            .contains("tmem_store")) {
+                           .contains("tmem_store")) {
       barriers += 1 * freq; // tcgen05_commit
     }
   }
@@ -1678,8 +1677,7 @@ computeSeparationCost(const ttg::ScheduleLoop &loop) {
     int cycleGap = loop.nodes[edge.dstId].cycle - loop.nodes[edge.srcId].cycle;
     if (cycleGap <= 0)
       cycleGap = 1;
-    coupling[{pSrc, pDst}] +=
-        static_cast<double>(kBarrierOverhead) / cycleGap;
+    coupling[{pSrc, pDst}] += static_cast<double>(kBarrierOverhead) / cycleGap;
   }
   return coupling;
 }
@@ -1714,9 +1712,12 @@ static int wgRequiredWarps(const SmallVector<unsigned> &nodeIds,
   for (unsigned nid : nodeIds)
     m = std::max(m, loop.nodes[nid].minWarps);
   // Snap to TLX-allowed values.
-  if (m <= 1) return 1;
-  if (m <= 2) return 2;
-  if (m <= 4) return 4;
+  if (m <= 1)
+    return 1;
+  if (m <= 2)
+    return 2;
+  if (m <= 4)
+    return 4;
   return 8;
 }
 
@@ -1726,9 +1727,9 @@ static int wgRequiredWarps(const SmallVector<unsigned> &nodeIds,
 ///
 /// `wgWarps` is the WG's chosen warp count; per-op `selfLat` scales when
 /// the WG has fewer warps than the op's `minWarps` requirement.
-static int computeMultiPipelineMakespan(
-    const SmallVector<unsigned> &nodeIds, const ttg::ScheduleLoop &loop,
-    int wgWarps = 4) {
+static int computeMultiPipelineMakespan(const SmallVector<unsigned> &nodeIds,
+                                        const ttg::ScheduleLoop &loop,
+                                        int wgWarps = 4) {
   llvm::DenseMap<ttg::HWPipeline, int> pipeAvail;
   llvm::DenseMap<unsigned, int> opStart;
   // The warp inside this WG can only issue one instruction at a time. So
@@ -1780,9 +1781,9 @@ static int computeMultiPipelineMakespan(
   int makespan = 0;
   for (unsigned nid : sorted) {
     const auto &node = loop.nodes[nid];
-    makespan = std::max(makespan,
-                        opStart[nid] + effectiveSelfLat(node, wgWarps) *
-                                           node.frequencyMultiplier);
+    makespan =
+        std::max(makespan, opStart[nid] + effectiveSelfLat(node, wgWarps) *
+                                              node.frequencyMultiplier);
   }
   return makespan;
 }
@@ -1830,8 +1831,7 @@ static void partitionIntoWarpGroups(ttg::ScheduleLoop &loop) {
   }
 
   if (groups.size() < 2) {
-    LLVM_DEBUG(llvm::dbgs()
-               << "[Step4.7] < 2 active pipelines, skipping WS\n");
+    LLVM_DEBUG(llvm::dbgs() << "[Step4.7] < 2 active pipelines, skipping WS\n");
     return;
   }
 
@@ -1869,8 +1869,8 @@ static void partitionIntoWarpGroups(ttg::ScheduleLoop &loop) {
         mergedNodes.append(groups[i].nodeIds);
         mergedNodes.append(groups[j].nodeIds);
         int mergedWarps = wgRequiredWarps(mergedNodes, loop);
-        int makespan = computeMultiPipelineMakespan(mergedNodes, loop,
-                                                    mergedWarps);
+        int makespan =
+            computeMultiPipelineMakespan(mergedNodes, loop, mergedWarps);
         if (makespan > loop.II)
           continue;
 
@@ -1985,17 +1985,18 @@ static void partitionIntoWarpGroups(ttg::ScheduleLoop &loop) {
 //      (nothing in PTX shows st.local; values get re-derived instead).
 //
 // EMPIRICAL CALIBRATION (perf_sweep.py on B200, FA fwd inner loop):
-//   V0  4+4+1+1   total 50,688  deficit  0     residual  0      → 1.0× (baseline)
-//   V1  4+4+4+1   total 69,376  deficit  3,840 residual  0      → 1.0× (free)
-//   V2  4+4+1+4   total 69,376  deficit  3,840 residual  0      → 1.0× (free)
-//   V3  4+4+4+4   total 88,064  deficit 22,528 residual  3,072  → 3.5× slower
-//   V4  4+8+1+1   total 90,624  deficit 25,088 residual  5,632  → 9× slower
+//   V0  4+4+1+1   total 50,688  deficit  0     residual  0      → 1.0×
+//   (baseline) V1  4+4+4+1   total 69,376  deficit  3,840 residual  0 → 1.0×
+//   (free) V2  4+4+1+4   total 69,376  deficit  3,840 residual  0      → 1.0×
+//   (free) V3  4+4+4+4   total 88,064  deficit 22,528 residual  3,072  → 3.5×
+//   slower V4  4+8+1+1   total 90,624  deficit 25,088 residual  5,632  → 9×
+//   slower
 // Linear penalty `kDeficitPenalty × residual` ≈ 0.5 fits V3; V4's 9× has
 // non-linear amplification we approximate but don't capture exactly. Goal
 // here is just to push the partitioner away from over-budget plans, not to
 // predict perf to ±10%.
 constexpr int kBlackwellSMRegs = 65536;
-constexpr int kDefaultWGFootprint = 4 * 32 * 232;  // 29,696
+constexpr int kDefaultWGFootprint = 4 * 32 * 232; // 29,696
 // How many regs the default WG can give up before perf hurts.
 // = 4 warps × 32 threads × (232 - 80) regs/thread = 19,456.
 constexpr int kDefaultSlack = 4 * 32 * (232 - 80);
@@ -2010,8 +2011,10 @@ constexpr double kDeficitPenalty = 0.5;
 constexpr double kPerWGTieBreak = -0.001;
 
 static int regsForWarpCount(int numWarps) {
-  if (numWarps >= 8) return 232;
-  if (numWarps >= 4) return 152;
+  if (numWarps >= 8)
+    return 232;
+  if (numWarps >= 4)
+    return 152;
   return 24;
 }
 static int wgFootprint(int numWarps) {
@@ -2048,9 +2051,9 @@ struct ScoredCandidate {
   ClusterAssignment assignment;
   int bottleneckChainWall{0};
   int crossWgEdges{0};
-  int totalRegs{0};   // Σ over WGs of num_warps × 32 × regs (incl. default).
+  int totalRegs{0};    // Σ over WGs of num_warps × 32 × regs (incl. default).
   bool feasible{true}; // false = busts SM register budget.
-  double cost{0.0};   // +infinity when !feasible (excluded by min-cost pick).
+  double cost{0.0};    // +infinity when !feasible (excluded by min-cost pick).
 };
 
 /// Greedy agglomerative clustering. For each non-NONE op, BFS through the
@@ -2087,8 +2090,7 @@ static bool isHeavyOp(const ttg::ScheduleNode &node, int II) {
   return occ * 5 >= II; // occ / II >= 0.2
 }
 
-static SmallVector<OpCluster>
-buildClusters(const ttg::ScheduleLoop &loop) {
+static SmallVector<OpCluster> buildClusters(const ttg::ScheduleLoop &loop) {
   unsigned n = loop.nodes.size();
   SmallVector<SmallVector<unsigned>> adj(n);
   for (const auto &e : loop.edges) {
@@ -2114,9 +2116,11 @@ buildClusters(const ttg::ScheduleLoop &loop) {
   // for the register-typed acc value that would otherwise cross WGs.
   SmallVector<unsigned> startOrder;
   for (unsigned i = 0; i < n; ++i)
-    if (heavy[i]) startOrder.push_back(i);
+    if (heavy[i])
+      startOrder.push_back(i);
   for (unsigned i = 0; i < n; ++i)
-    if (!heavy[i]) startOrder.push_back(i);
+    if (!heavy[i])
+      startOrder.push_back(i);
   for (unsigned start : startOrder) {
     if (nodeToCluster.count(start))
       continue;
@@ -2154,9 +2158,9 @@ buildClusters(const ttg::ScheduleLoop &loop) {
         //   Heavy start: expand only through NONE or same-pipeline ops.
         //   Light start: expand through any non-heavy op (NONE/light).
         //                Heavy ops on any pipeline block the traversal.
-        bool expand = startIsHeavy
-                          ? (vpipe == ttg::HWPipeline::NONE || vpipe == startPipe)
-                          : !heavy[v];
+        bool expand = startIsHeavy ? (vpipe == ttg::HWPipeline::NONE ||
+                                      vpipe == startPipe)
+                                   : !heavy[v];
         if (expand) {
           visited[v] = true;
           stack.push_back(v);
@@ -2242,7 +2246,7 @@ buildClusters(const ttg::ScheduleLoop &loop) {
   // Dump for diagnostics: each cluster's ops with their per-op cost so we can
   // reason about which clustering decisions are reasonable.
   LLVM_DEBUG({
-    int heavyThr = std::max(1, loop.II / 5);  // 0.2*II — same as isHeavyOp
+    int heavyThr = std::max(1, loop.II / 5); // 0.2*II — same as isHeavyOp
     for (const auto &c : compact) {
       int totalSelf = 0, totalLat = 0;
       for (unsigned nid : c.nodeIds) {
@@ -2251,18 +2255,16 @@ buildClusters(const ttg::ScheduleLoop &loop) {
       }
       llvm::dbgs() << "[buildClusters] C" << c.id << " ("
                    << ttg::getPipelineName(c.pipeline)
-                   << ") totalSelfLat=" << totalSelf
-                   << " totalLat=" << totalLat << " (heavyThr=" << heavyThr
-                   << ")\n";
+                   << ") totalSelfLat=" << totalSelf << " totalLat=" << totalLat
+                   << " (heavyThr=" << heavyThr << ")\n";
       for (unsigned nid : c.nodeIds) {
         const auto &n = loop.nodes[nid];
         bool isHeavy = isHeavyOp(n, loop.II);
-        llvm::StringRef opName = n.op ? n.op->getName().getStringRef()
-                                      : llvm::StringRef("?");
+        llvm::StringRef opName =
+            n.op ? n.op->getName().getStringRef() : llvm::StringRef("?");
         llvm::dbgs() << "  N" << nid << "  " << opName
                      << "  pipe=" << ttg::getPipelineName(n.pipeline)
-                     << "  selfLat=" << n.selfLatency
-                     << "  lat=" << n.latency
+                     << "  selfLat=" << n.selfLatency << "  lat=" << n.latency
                      << (isHeavy ? "  [HEAVY]" : "  [light]")
                      << "  cyc=" << n.cycle << " stage=" << n.stage << "\n";
       }
@@ -2314,7 +2316,7 @@ static ScoredCandidate scoreCandidate(const ClusterAssignment &assn,
   // minWarps=4 (SFU/CUDA tile) cost more if the WG only gets 1 warp.
   // Layer C: also accumulate per-WG register footprint.
   int bottleneck = 0;
-  int totalRegs = kDefaultWGFootprint;  // include implicit "default" WG
+  int totalRegs = kDefaultWGFootprint; // include implicit "default" WG
   for (auto &[wgId, nodes] : wgToNodes) {
     int wgWarps = wgRequiredWarps(nodes, loop);
     int ms = computeMultiPipelineMakespan(nodes, loop, wgWarps);
@@ -2415,10 +2417,8 @@ static ScoredCandidate scoreCandidate(const ClusterAssignment &assn,
   // `computeWGBarrierCost`, so the legacy `crossEdges * kBarrierOverhead`
   // global term is dropped — keeping it would double-charge the same
   // barriers.
-  sc.cost = static_cast<double>(bottleneck) +
-            residual * kDeficitPenalty +
-            assn.numWgs * kPerWGTieBreak +
-            stageMixPenalty;
+  sc.cost = static_cast<double>(bottleneck) + residual * kDeficitPenalty +
+            assn.numWgs * kPerWGTieBreak + stageMixPenalty;
   return sc;
 }
 
@@ -2459,7 +2459,7 @@ static void printAssignment(llvm::raw_ostream &os,
 /// One candidate warp group during greedy partitioning.
 struct GreedyWG {
   SmallVector<unsigned, 4> clusterIds; // member cluster ids
-  SmallVector<unsigned> nodeIds;       // flattened nodeIds (cached for makespan)
+  SmallVector<unsigned> nodeIds; // flattened nodeIds (cached for makespan)
 };
 
 /// Compute the cost of a partition. Mirrors `scoreCandidate`'s formula.
@@ -2468,7 +2468,7 @@ static double evalGreedyCost(const SmallVector<GreedyWG> &wgs,
                              const ttg::ScheduleLoop &loop) {
   // Bottleneck = max per-WG makespan, computed at each WG's required warps.
   // Also accumulate per-WG register footprint (Layer C).
-  int totalRegs = kDefaultWGFootprint;  // include implicit "default" WG
+  int totalRegs = kDefaultWGFootprint; // include implicit "default" WG
   llvm::SmallDenseMap<unsigned, int> nodeToWg;
   for (unsigned wgi = 0; wgi < wgs.size(); ++wgi) {
     for (unsigned nid : wgs[wgi].nodeIds)
@@ -2479,7 +2479,7 @@ static double evalGreedyCost(const SmallVector<GreedyWG> &wgs,
     int wgWarps = wgRequiredWarps(wgs[wgi].nodeIds, loop);
     int ms = computeMultiPipelineMakespan(wgs[wgi].nodeIds, loop, wgWarps);
     int barCost = computeWGBarrierCost(wgs[wgi].nodeIds, loop, nodeToWg,
-                                        static_cast<int>(wgi));
+                                       static_cast<int>(wgi));
     bottleneck = std::max(bottleneck, ms + barCost);
     totalRegs += wgFootprint(wgWarps);
   }
@@ -2488,8 +2488,7 @@ static double evalGreedyCost(const SmallVector<GreedyWG> &wgs,
   // Cross-WG barrier-issue cost is folded into per-WG bottleneck via
   // `computeWGBarrierCost`; the legacy global `crossEdges * kBarrierOverhead`
   // term has been dropped to avoid double-charging.
-  return static_cast<double>(bottleneck) +
-         residual * kDeficitPenalty +
+  return static_cast<double>(bottleneck) + residual * kDeficitPenalty +
          wgs.size() * kPerWGTieBreak;
 }
 
@@ -2501,8 +2500,7 @@ static void partitionClusterGreedy(ttg::ScheduleLoop &loop) {
   auto clusters = buildClusters(loop);
   if (clusters.size() < 2) {
     for (auto &node : loop.nodes)
-      node.warpGroup =
-          (node.pipeline == ttg::HWPipeline::NONE) ? -1 : 0;
+      node.warpGroup = (node.pipeline == ttg::HWPipeline::NONE) ? -1 : 0;
     return;
   }
 
@@ -2554,9 +2552,9 @@ static void partitionClusterGreedy(ttg::ScheduleLoop &loop) {
     if (bestI < 0)
       break; // no merge reduces cost — local optimum reached
 
-    LLVM_DEBUG(llvm::dbgs() << "[Greedy] iter " << iter << ": merge wg"
-                            << bestI << " ⊕ wg" << bestJ << ", cost "
-                            << currentCost << " → " << bestCost << "\n");
+    LLVM_DEBUG(llvm::dbgs() << "[Greedy] iter " << iter << ": merge wg" << bestI
+                            << " ⊕ wg" << bestJ << ", cost " << currentCost
+                            << " → " << bestCost << "\n");
     wgs[bestI].clusterIds.append(wgs[bestJ].clusterIds.begin(),
                                  wgs[bestJ].clusterIds.end());
     wgs[bestI].nodeIds.append(wgs[bestJ].nodeIds.begin(),
@@ -2567,8 +2565,8 @@ static void partitionClusterGreedy(ttg::ScheduleLoop &loop) {
   }
 
   LLVM_DEBUG({
-    llvm::dbgs() << "[Greedy] Final: " << wgs.size() << " WGs, cost="
-                 << currentCost << "\n";
+    llvm::dbgs() << "[Greedy] Final: " << wgs.size()
+                 << " WGs, cost=" << currentCost << "\n";
     for (unsigned wi = 0; wi < wgs.size(); ++wi) {
       llvm::dbgs() << "[Greedy]   wg" << wi << " clusters=[";
       for (size_t k = 0; k < wgs[wi].clusterIds.size(); ++k) {
@@ -2612,8 +2610,7 @@ static void partitionExhaustive(ttg::ScheduleLoop &loop) {
     LLVM_DEBUG(llvm::dbgs() << "[Phase4] < 2 clusters, skipping\n");
     // Single cluster (or none): one WG, set everything to wg0.
     for (auto &node : loop.nodes)
-      node.warpGroup =
-          (node.pipeline == ttg::HWPipeline::NONE) ? -1 : 0;
+      node.warpGroup = (node.pipeline == ttg::HWPipeline::NONE) ? -1 : 0;
     return;
   }
 
@@ -2624,8 +2621,7 @@ static void partitionExhaustive(ttg::ScheduleLoop &loop) {
   // partitioner past the cap (same scoring, O(N^3) vs Bell(N) growth).
   // TRITON_MODULO_CLUSTER_GREEDY=1 forces greedy at any cluster count.
   constexpr unsigned kMaxClustersForExhaustive = 10;
-  bool forceGreedy =
-      triton::tools::getBoolEnv("TRITON_MODULO_CLUSTER_GREEDY");
+  bool forceGreedy = triton::tools::getBoolEnv("TRITON_MODULO_CLUSTER_GREEDY");
   if (forceGreedy || clusters.size() > kMaxClustersForExhaustive) {
     LLVM_DEBUG(llvm::dbgs() << "[Phase4] " << clusters.size() << " clusters"
                             << (forceGreedy ? " (forced)" : " > 10")
@@ -2912,11 +2908,14 @@ static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
       if (prodOp && prodOp->getNumResults() > 0) {
         Type resTy = prodOp->getResult(0).getType();
         auto setFromShaped = [&](llvm::ArrayRef<int64_t> shape, Type elemTy) {
-          if (!elemTy.isIntOrFloat()) return;
+          if (!elemTy.isIntOrFloat())
+            return;
           for (auto d : shape) {
-            if (d <= 0 || ShapedType::isDynamic(d)) return;
+            if (d <= 0 || ShapedType::isDynamic(d))
+              return;
           }
-          for (auto d : shape) chan.shape.push_back(d);
+          for (auto d : shape)
+            chan.shape.push_back(d);
           chan.elementBitWidth = elemTy.getIntOrFloatBitWidth();
         };
         if (auto memDesc = dyn_cast_or_null<ttg::MemDescType>(resTy))
@@ -3081,11 +3080,21 @@ scheduleOneLoop(scf::ForOp loop, const ttg::LatencyModel &model,
     int nMEM = 0, nTC = 0, nCUDA = 0, nSFU = 0, nNONE = 0;
     for (const auto &node : ddg.getNodes()) {
       switch (node.pipeline) {
-      case ttg::HWPipeline::TMA:  ++nMEM;  break;
-      case ttg::HWPipeline::TC:   ++nTC;   break;
-      case ttg::HWPipeline::CUDA: ++nCUDA; break;
-      case ttg::HWPipeline::SFU:  ++nSFU;  break;
-      case ttg::HWPipeline::NONE: ++nNONE; break;
+      case ttg::HWPipeline::TMA:
+        ++nMEM;
+        break;
+      case ttg::HWPipeline::TC:
+        ++nTC;
+        break;
+      case ttg::HWPipeline::CUDA:
+        ++nCUDA;
+        break;
+      case ttg::HWPipeline::SFU:
+        ++nSFU;
+        break;
+      case ttg::HWPipeline::NONE:
+        ++nNONE;
+        break;
       }
     }
     llvm::dbgs() << "[" << label << "] Pipeline counts: TMA=" << nMEM
@@ -3103,8 +3112,8 @@ scheduleOneLoop(scf::ForOp loop, const ttg::LatencyModel &model,
       llvm::dbgs() << "[" << label << " DDG] Super-node N" << node.idx << " ("
                    << node.op->getName().getStringRef() << ")"
                    << " pipe=" << ttg::getPipelineName(node.pipeline)
-                   << " lat=" << node.latency
-                   << " innerII=" << node.innerII << "\n";
+                   << " lat=" << node.latency << " innerII=" << node.innerII
+                   << "\n";
     }
   });
 
@@ -3116,11 +3125,10 @@ scheduleOneLoop(scf::ForOp loop, const ttg::LatencyModel &model,
   LDBG(label << " scheduling SUCCESS: II=" << schedResult->II);
 
   LLVM_DEBUG({
-    llvm::dbgs() << "[PASS-A] " << label
-                 << " Schedule: II=" << schedResult->II
+    llvm::dbgs() << "[PASS-A] " << label << " Schedule: II=" << schedResult->II
                  << " ResMII=" << ddg.computeResMII()
-                 << " RecMII=" << ddg.computeRecMII() << " maxStage="
-                 << schedResult->getMaxStage() << "\n";
+                 << " RecMII=" << ddg.computeRecMII()
+                 << " maxStage=" << schedResult->getMaxStage() << "\n";
 
     for (const auto &node : ddg.getNodes()) {
       auto it = schedResult->nodeToCycle.find(node.idx);
@@ -3289,11 +3297,11 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
 /// site filters on whichever combination of flags it cares about.
 struct CandidateLoop {
   scf::ForOp op;
-  scf::ForOp parent;          // null op if outermost
-  unsigned depth{0};          // 0 = outermost
-  bool hasMMA{false};         // direct body has tcgen5_mma{,Scaled}
-  bool hasTMA{false};         // direct body has descriptor_load / async TMA copy
-  bool hasInnerLoop{false};   // direct body has a nested scf::ForOp
+  scf::ForOp parent;        // null op if outermost
+  unsigned depth{0};        // 0 = outermost
+  bool hasMMA{false};       // direct body has tcgen5_mma{,Scaled}
+  bool hasTMA{false};       // direct body has descriptor_load / async TMA copy
+  bool hasInnerLoop{false}; // direct body has a nested scf::ForOp
   bool hasExistingAnnotation{false}; // tt.autows on an MMA — user-tuned, skip
 };
 
@@ -3329,9 +3337,8 @@ static SmallVector<CandidateLoop> collectCandidates(ModuleOp moduleOp) {
     }
     result.push_back(c);
   });
-  llvm::stable_sort(result, [](const auto &a, const auto &b) {
-    return a.depth > b.depth;
-  });
+  llvm::stable_sort(
+      result, [](const auto &a, const auto &b) { return a.depth > b.depth; });
   return result;
 }
 
@@ -3358,11 +3365,21 @@ std::string jsonEscape(StringRef s) {
   out.reserve(s.size() + 2);
   for (char c : s) {
     switch (c) {
-    case '"':  out += "\\\""; break;
-    case '\\': out += "\\\\"; break;
-    case '\n': out += "\\n"; break;
-    case '\r': out += "\\r"; break;
-    case '\t': out += "\\t"; break;
+    case '"':
+      out += "\\\"";
+      break;
+    case '\\':
+      out += "\\\\";
+      break;
+    case '\n':
+      out += "\\n";
+      break;
+    case '\r':
+      out += "\\r";
+      break;
+    case '\t':
+      out += "\\t";
+      break;
     default:
       if (static_cast<unsigned char>(c) < 0x20) {
         char buf[8];
@@ -3405,7 +3422,8 @@ std::string jsonSigTypeStr(Type t) {
 void jsonDumpShape(llvm::raw_ostream &os, ArrayRef<int64_t> shape) {
   os << "[";
   for (size_t i = 0; i < shape.size(); ++i) {
-    if (i) os << ", ";
+    if (i)
+      os << ", ";
     os << shape[i];
   }
   os << "]";
@@ -3465,9 +3483,8 @@ void jsonDumpOperandRef(llvm::raw_ostream &os, Value v,
   Operation *parent = block->getParentOp();
   if (auto fn = dyn_cast<tt::FuncOp>(parent)) {
     unsigned i = blockArg.getArgNumber();
-    StringRef name = i < dc.funcArgNames.size()
-                         ? StringRef(dc.funcArgNames[i])
-                         : StringRef("");
+    StringRef name = i < dc.funcArgNames.size() ? StringRef(dc.funcArgNames[i])
+                                                : StringRef("");
     os << "{\"arg\": \"" << jsonEscape(name) << "\"}";
     return;
   }
@@ -3497,7 +3514,8 @@ void jsonDumpAttrValue(llvm::raw_ostream &os, Attribute attr) {
     os << "[";
     auto vals = a.asArrayRef();
     for (size_t i = 0; i < vals.size(); ++i) {
-      if (i) os << ", ";
+      if (i)
+        os << ", ";
       os << vals[i];
     }
     os << "]";
@@ -3506,7 +3524,8 @@ void jsonDumpAttrValue(llvm::raw_ostream &os, Attribute attr) {
   if (auto a = dyn_cast<ArrayAttr>(attr)) {
     os << "[";
     for (size_t i = 0; i < a.size(); ++i) {
-      if (i) os << ", ";
+      if (i)
+        os << ", ";
       jsonDumpAttrValue(os, a[i]);
     }
     os << "]";
@@ -3545,7 +3564,8 @@ void jsonDumpOpEntry(llvm::raw_ostream &os, Operation *op,
   os << "      \"operands\": [";
   bool first = true;
   for (Value v : op->getOperands()) {
-    if (!first) os << ", ";
+    if (!first)
+      os << ", ";
     jsonDumpOperandRef(os, v, dc);
     first = false;
   }
@@ -3554,7 +3574,8 @@ void jsonDumpOpEntry(llvm::raw_ostream &os, Operation *op,
   os << "      \"result_types\": [";
   first = true;
   for (Type t : op->getResultTypes()) {
-    if (!first) os << ", ";
+    if (!first)
+      os << ", ";
     os << "\"" << jsonEscape(jsonTypeStr(t)) << "\"";
     first = false;
   }
@@ -3563,7 +3584,8 @@ void jsonDumpOpEntry(llvm::raw_ostream &os, Operation *op,
   os << "      \"attributes\": {";
   first = true;
   for (NamedAttribute na : op->getAttrs()) {
-    if (!first) os << ", ";
+    if (!first)
+      os << ", ";
     os << "\"" << jsonEscape(na.getName().strref()) << "\": ";
     jsonDumpAttrValue(os, na.getValue());
     first = false;
@@ -3579,7 +3601,8 @@ void jsonDumpOpEntry(llvm::raw_ostream &os, Operation *op,
       if (blk && blk->mightHaveTerminator()) {
         if (auto y = dyn_cast<scf::YieldOp>(blk->getTerminator())) {
           for (Value v : y.getOperands()) {
-            if (!yfirst) os << ", ";
+            if (!yfirst)
+              os << ", ";
             jsonDumpOperandRef(os, v, dc);
             yfirst = false;
           }
@@ -3597,10 +3620,14 @@ void jsonDumpOpEntry(llvm::raw_ostream &os, Operation *op,
 
 const char *jsonMemKindName(ttg::MemoryKind k) {
   switch (k) {
-  case ttg::MemoryKind::SMEM:    return "smem";
-  case ttg::MemoryKind::TMEM:    return "tmem";
-  case ttg::MemoryKind::Register:return "register";
-  case ttg::MemoryKind::BARRIER: return "barrier";
+  case ttg::MemoryKind::SMEM:
+    return "smem";
+  case ttg::MemoryKind::TMEM:
+    return "tmem";
+  case ttg::MemoryKind::Register:
+    return "register";
+  case ttg::MemoryKind::BARRIER:
+    return "barrier";
   }
   return "unknown";
 }
@@ -3625,8 +3652,7 @@ void jsonDumpScheduleLoop(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl,
   else
     os << "iv";
   os << "\", \"type\": \""
-     << jsonEscape(jsonTypeStr(forOp.getInductionVar().getType()))
-     << "\"},\n";
+     << jsonEscape(jsonTypeStr(forOp.getInductionVar().getType())) << "\"},\n";
   os << "      \"lower_bound\": ";
   jsonDumpOperandRef(os, forOp.getLowerBound(), dc);
   os << ",\n      \"upper_bound\": ";
@@ -3639,24 +3665,19 @@ void jsonDumpScheduleLoop(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl,
   os << "      \"buffers\": [\n";
   for (size_t i = 0; i < sl.buffers.size(); ++i) {
     const auto &b = sl.buffers[i];
-    os << "        {\"id\": " << b.id
-       << ", \"kind\": \"" << jsonMemKindName(b.kind) << "\""
+    os << "        {\"id\": " << b.id << ", \"kind\": \""
+       << jsonMemKindName(b.kind) << "\""
        << ", \"shape\": ";
     jsonDumpShape(os, b.shape);
     os << ", \"element_bits\": " << b.elementBitWidth
-       << ", \"count\": " << b.count
-       << ", \"size_bytes\": " << b.sizeBytes()
-       << ", \"total_bytes\": " << b.totalBytes()
-       << ", \"merge_group_id\": "
-       << (b.mergeGroupId == UINT_MAX
-               ? std::string("null")
-               : std::to_string(b.mergeGroupId))
+       << ", \"count\": " << b.count << ", \"size_bytes\": " << b.sizeBytes()
+       << ", \"total_bytes\": " << b.totalBytes() << ", \"merge_group_id\": "
+       << (b.mergeGroupId == UINT_MAX ? std::string("null")
+                                      : std::to_string(b.mergeGroupId))
        << ", \"paired_buffer_id\": "
-       << (b.pairedBufferId == UINT_MAX
-               ? std::string("null")
-               : std::to_string(b.pairedBufferId))
-       << ", \"live_start\": " << b.liveStart
-       << ", \"live_end\": " << b.liveEnd
+       << (b.pairedBufferId == UINT_MAX ? std::string("null")
+                                        : std::to_string(b.pairedBufferId))
+       << ", \"live_start\": " << b.liveStart << ", \"live_end\": " << b.liveEnd
        << ", \"def_op\": "
        << (b.defOp ? std::string("\"") + jsonOpId(b.defOp) + "\""
                    : std::string("null"));
@@ -3671,8 +3692,7 @@ void jsonDumpScheduleLoop(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl,
   os << "        \"nodes\": [\n";
   for (size_t i = 0; i < sl.nodes.size(); ++i) {
     const auto &n = sl.nodes[i];
-    os << "          {\"id\": " << n.id
-       << ", \"op_ref\": "
+    os << "          {\"id\": " << n.id << ", \"op_ref\": "
        << (n.op ? std::string("\"") + jsonOpId(n.op) + "\""
                 : std::string("null"))
        << ", \"op_kind\": \""
@@ -3680,21 +3700,19 @@ void jsonDumpScheduleLoop(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl,
        << "\""
        << ", \"pipeline\": \"" << jsonEscape(ttg::getPipelineName(n.pipeline))
        << "\""
-       << ", \"warp_group\": " << n.warpGroup
-       << ", \"latency\": " << n.latency
+       << ", \"warp_group\": " << n.warpGroup << ", \"latency\": " << n.latency
        << ", \"self_latency\": " << n.selfLatency
        << ", \"min_warps\": " << n.minWarps
        << ", \"frequency_multiplier\": " << n.frequencyMultiplier
        << ", \"schedule\": {\"cycle\": " << n.cycle
-       << ", \"stage\": " << n.stage
-       << ", \"cluster\": " << n.cluster << "}"
+       << ", \"stage\": " << n.stage << ", \"cluster\": " << n.cluster << "}"
        << ", \"produces_buffer\": "
-       << (n.producesBuffer == UINT_MAX
-               ? std::string("null")
-               : std::to_string(n.producesBuffer))
+       << (n.producesBuffer == UINT_MAX ? std::string("null")
+                                        : std::to_string(n.producesBuffer))
        << ", \"consumes_buffers\": [";
     for (size_t j = 0; j < n.consumesBuffers.size(); ++j) {
-      if (j) os << ", ";
+      if (j)
+        os << ", ";
       os << n.consumesBuffers[j];
     }
     os << "]";
@@ -3710,12 +3728,10 @@ void jsonDumpScheduleLoop(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl,
   os << "        \"edges\": [\n";
   for (size_t i = 0; i < sl.edges.size(); ++i) {
     const auto &e = sl.edges[i];
-    os << "          {\"src\": " << e.srcId
-       << ", \"dst\": " << e.dstId
+    os << "          {\"src\": " << e.srcId << ", \"dst\": " << e.dstId
        << ", \"kind\": \"data\""
-       << ", \"distance\": " << e.distance
-       << ", \"latency\": " << e.latency << "}"
-       << (i + 1 == sl.edges.size() ? "" : ",") << "\n";
+       << ", \"distance\": " << e.distance << ", \"latency\": " << e.latency
+       << "}" << (i + 1 == sl.edges.size() ? "" : ",") << "\n";
   }
   os << "        ],\n";
 
@@ -3725,20 +3741,18 @@ void jsonDumpScheduleLoop(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl,
   os << "        \"cross_wg_barriers\": [";
   for (size_t i = 0; i < sl.crossGroupBarriers.size(); ++i) {
     const auto &b = sl.crossGroupBarriers[i];
-    if (i) os << ",";
+    if (i)
+      os << ",";
     os << "\n          {\"producer_node\": " << b.producerNodeId
        << ", \"consumer_node\": " << b.consumerNodeId
        << ", \"producer_wg\": " << b.producerWarpGroup
-       << ", \"consumer_wg\": " << b.consumerWarpGroup
-       << ", \"kind\": \""
-       << (b.kind == ttg::ScheduleLoop::BarrierKind::MBARRIER
-               ? "mbarrier" : "named")
+       << ", \"consumer_wg\": " << b.consumerWarpGroup << ", \"kind\": \""
+       << (b.kind == ttg::ScheduleLoop::BarrierKind::MBARRIER ? "mbarrier"
+                                                              : "named")
        << "\""
-       << ", \"depth\": " << b.depth
-       << ", \"paired_buffer_id\": "
-       << (b.pairedBufferId == UINT_MAX
-               ? std::string("null")
-               : std::to_string(b.pairedBufferId))
+       << ", \"depth\": " << b.depth << ", \"paired_buffer_id\": "
+       << (b.pairedBufferId == UINT_MAX ? std::string("null")
+                                        : std::to_string(b.pairedBufferId))
        << ", \"expect_bytes\": " << b.expectBytes << "}";
   }
   os << (sl.crossGroupBarriers.empty() ? "" : "\n        ") << "]\n";
@@ -3769,21 +3783,26 @@ void jsonDumpWarpGroups(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl) {
     m = std::max(m, std::max(n.minWarps, 1));
   }
   auto snapWarps = [](int m) {
-    if (m <= 1) return 1;
-    if (m <= 2) return 2;
-    if (m <= 4) return 4;
+    if (m <= 1)
+      return 1;
+    if (m <= 2)
+      return 2;
+    if (m <= 4)
+      return 4;
     return 8;
   };
   os << "      \"warp_groups\": [";
   bool first = true;
   for (const auto &[wg, pipeSet] : pipes) {
-    if (!first) os << ", ";
+    if (!first)
+      os << ", ";
     int numWarps = snapWarps(wgMaxMinWarps[wg]);
     os << "{\"id\": " << wg << ", \"num_warps\": " << numWarps
        << ", \"pipelines\": [";
     bool fp = true;
     for (const auto &p : pipeSet) {
-      if (!fp) os << ", ";
+      if (!fp)
+        os << ", ";
       os << "\"" << jsonEscape(p) << "\"";
       fp = false;
     }
@@ -3793,13 +3812,13 @@ void jsonDumpWarpGroups(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl) {
   os << "],\n";
 }
 
-void dumpScheduleGraphAsJSON(
-    ModuleOp moduleOp, StringRef path,
-    ArrayRef<ScheduledLoop> scheduledLoops) {
+void dumpScheduleGraphAsJSON(ModuleOp moduleOp, StringRef path,
+                             ArrayRef<ScheduledLoop> scheduledLoops) {
   // Locate the kernel function.
   tt::FuncOp kernelFn;
   moduleOp.walk([&](tt::FuncOp fn) {
-    if (!kernelFn) kernelFn = fn;
+    if (!kernelFn)
+      kernelFn = fn;
   });
 
   // Build dump context: function arg names + loop ids.
@@ -3817,7 +3836,8 @@ void dumpScheduleGraphAsJSON(
       if (base.empty())
         base = "arg" + std::to_string(i);
       unsigned &cnt = nameUseCount[base];
-      std::string name = cnt == 0 ? base : (base + "_" + std::to_string(cnt - 1));
+      std::string name =
+          cnt == 0 ? base : (base + "_" + std::to_string(cnt - 1));
       ++cnt;
       dc.funcArgNames.push_back(name);
     }
@@ -3857,7 +3877,8 @@ void dumpScheduleGraphAsJSON(
   if (kernelFn) {
     SmallVector<Operation *> all;
     kernelFn.walk([&](Operation *op) {
-      if (op == kernelFn.getOperation()) return;
+      if (op == kernelFn.getOperation())
+        return;
       all.push_back(op);
     });
     for (size_t i = 0; i < all.size(); ++i)
@@ -3934,8 +3955,7 @@ struct ModuloSchedulePass
   /// Pass A.5: Data partitioning — split MMA + companion loads into N
   /// parallel sub-chains so the MMA queue can issue concurrent partials
   /// (NUM_MMA_GROUPS-style on Blackwell). M1: detect candidates only.
-  bool applyDataPartitioning(ModuleOp moduleOp,
-                             const ttg::LatencyModel &model,
+  bool applyDataPartitioning(ModuleOp moduleOp, const ttg::LatencyModel &model,
                              MutableArrayRef<ScheduledLoop> scheduledLoops) {
     // A.5 (TRITON_DATA_PARTITION_N) deferred to follow-up diff.
     return false;
@@ -3957,8 +3977,7 @@ struct ModuloSchedulePass
   /// reducer runs BEFORE A.7's mutation — so re-running the loop with a
   /// memoized decision doesn't recover K-loop depth. The buffer-recovery
   /// feedback path is deferred to M4.
-  bool applyEpilogueSubtiling(ModuleOp moduleOp,
-                              const ttg::LatencyModel &model,
+  bool applyEpilogueSubtiling(ModuleOp moduleOp, const ttg::LatencyModel &model,
                               MutableArrayRef<ScheduledLoop> scheduledLoops) {
     // A.7 (TRITON_MODULO_EPILOGUE_SUBTILE) deferred to follow-up diff.
     return false;

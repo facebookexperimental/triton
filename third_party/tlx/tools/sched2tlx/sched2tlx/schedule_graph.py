@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-
 # ---------------------------------------------------------------------------
 # Operand refs
 # ---------------------------------------------------------------------------
@@ -331,8 +330,7 @@ def _to_schedule_loop(d: dict[str, Any]) -> ScheduleLoop:
                 kind=e["kind"],
                 distance=e["distance"],
                 latency=e["latency"],
-            )
-            for e in g.get("edges", [])
+            ) for e in g.get("edges", [])
         ],
         cross_wg_barriers=[
             CrossWGBarrier(
@@ -344,8 +342,7 @@ def _to_schedule_loop(d: dict[str, Any]) -> ScheduleLoop:
                 depth=b["depth"],
                 paired_buffer_id=b.get("paired_buffer_id"),
                 expect_bytes=b["expect_bytes"],
-            )
-            for b in g.get("cross_wg_barriers", [])
+            ) for b in g.get("cross_wg_barriers", [])
         ],
     )
 
@@ -359,17 +356,14 @@ def load_graph(path: str | Path) -> ScheduleGraph:
             name=data["kernel"]["name"],
             args=[KernelArg(**a) for a in data["kernel"]["args"]],
         ),
-        ops={
-            op_id: _to_op(op_id, op_data)
-            for op_id, op_data in data.get("ops", {}).items()
-        },
+        ops={op_id: _to_op(op_id, op_data)
+             for op_id, op_data in data.get("ops", {}).items()},
         loops=[
             Loop(
                 loop_id=L["loop_id"],
                 is_outer=L.get("is_outer", False),
                 warp_groups=[WarpGroup(**w) for w in L.get("warp_groups", [])],
                 schedule=_to_schedule_loop(L["schedule_loop"]),
-            )
-            for L in data.get("loops", [])
+            ) for L in data.get("loops", [])
         ],
     )
