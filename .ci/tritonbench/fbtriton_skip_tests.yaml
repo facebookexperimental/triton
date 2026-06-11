@@ -46,6 +46,18 @@ decoding_attention:
 fp8_gemm_rowwise:
   report: true
 # TODO: jagged_mean, jagged_sum will segfault on hip
+fp8_attention:
+  report: true
+  disabled_devices:
+    - hip
+gather_gemv:
+  report: true
+  disabled_devices:
+    - hip
+jagged_softmax:
+  report: true
+  disabled_devices:
+    - hip
 jagged_mean:
   report: true
   disabled_devices:
