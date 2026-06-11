@@ -39,8 +39,8 @@ high and is not sustained — steady-state under load is the number reported her
 | v5_local_prefetch | 868 | 836 | 72% | Manual 3-stage pipeline + inferred padded layout |
 | v6_loop_unroll | 833 | 859 | 74% | Step-2 loop unrolling, alternating register sets |
 | v7_slice | 958 | 913 | 79% | N-sliced B + inferred padded layout, manual 4-region pipeline |
-| v8_warp_pipeline | — | **1007** | **87%** | v7 + `warp_pipeline_stage` for `s_setprio` mem/MFMA interleave (8 warps) |
-| v9_beyond_hotloop | —¹ | **1038** | **89%** | v8 + PID remap (8 XCDs) + workgroup swizzle (GROUP_SIZE_M=4) |
+| v8_warp_pipeline | — | **1005** | **86%** | v7 + `warp_pipeline_stage` for `s_setprio` mem/MFMA interleave (8 warps) |
+| v9_beyond_hotloop | —¹ | **1026** | **89%** | v8 + PID remap (8 XCDs) + workgroup swizzle (GROUP_SIZE_M=4) |
 
 The v8/v9 numbers include the post-misched flag, which is **baked into their kernel
 source** (see below) — no env var needed.
@@ -99,17 +99,17 @@ All versions use `num_stages=1` with manual pipeline management (matching Gluon'
   is LLVM-backend instruction scheduling — Gluon's published best uses custom
   `llirSched` / `amdgcnSched` passes that the default backend scheduler doesn't match.
 - **v8**: `warp_pipeline_stage` (`s_setprio` mem/compute interleaving) is the big
-  hot-loop win — 1007T / 87% of rocBLAS, ahead of Gluon v7 (958T) measured here.
+  hot-loop win — 1005T / 86% of rocBLAS, ahead of Gluon v7 (958T) measured here.
   TLX-only (Gluon has no warp-pipeline step).
 - **v9**: PID remapping (8 XCDs) + workgroup swizzle adds grid-level L2 reuse on top of
-  v8 (→ 1038T / 89%) — the final step, matching Gluon's `beyond_hotloop` concept. TLX's
+  v8 (→ 1026T / 89%) — the final step, matching Gluon's `beyond_hotloop` concept. TLX's
   best on this build.
 
 ## Running
 
 ```bash
 cd third_party/tlx/tutorials/gfx9_gemm/a16w16
-HIP_VISIBLE_DEVICES=1 python bench.py --version 9 --K 8192   # v9 best (~1040T / 89%); post-misched baked into source
+HIP_VISIBLE_DEVICES=1 python bench.py --version 9 --K 8192   # v9 best (~1025T / 89%); post-misched baked into source
 HIP_VISIBLE_DEVICES=1 TRITON_DISABLE_POST_MISCHED=0 python bench.py --version 9 --K 8192  # disable it to see the difference
 for v in 0 1 2 3 4 5 6 7 8 9; do python bench.py --version $v --K 8192; done  # All
 ```
