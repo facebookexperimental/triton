@@ -112,14 +112,16 @@ static Value computeLinearizedLoopPhase(OpBuilder &builder, Location loc,
 // Insert the "arrive remote, wait local" cross-CTA sync ops before a 2-CTA
 // MMA. The barrier must be allocated externally (before the containing loop
 // if the MMA is in a loop).
-static void insertSyncBeforeMMA(ttng::TCGen5MMAOp mma, Value barrierAlloc) {
+static void insertSyncBeforeMMA(ttng::TCGen5MMAOp mma, Value barrierAlloc,
+                                unsigned barrierIdx = 0) {
   MLIRContext *ctx = mma.getContext();
   Location loc = mma.getLoc();
   OpBuilder builder(mma);
   auto i32Ty = builder.getI32Type();
 
-  // Get barrier view (index 0 of the single-buffered allocation).
-  Value barrierView = triton::createSingleBufferView(builder, barrierAlloc, 0);
+  // Get this MMA's barrier view from the per-loop barrier allocation.
+  Value barrierView =
+      triton::createSingleBufferView(builder, barrierAlloc, barrierIdx);
 
   // Get CTA rank within the cluster.
   Value ctaRank = nvgpu::ClusterCTAIdOp::create(builder, loc, i32Ty);
@@ -219,24 +221,17 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
     for (auto &[loopOp, mmas] : loopToMMAs) {
       auto forOp = cast<scf::ForOp>(loopOp);
 
-      // Currently only a single 2-CTA MMA per loop is supported. Multiple
-      // MMAs would require separate barriers (one per MMA) to avoid phase
-      // conflicts on the shared barrier.
-      assert(mmas.size() == 1 &&
-             "Multiple 2-CTA MMAs in the same loop not yet supported. "
-             "Each MMA needs its own cross-CTA barrier to avoid phase "
-             "deadlock.");
-
       // Allocate cross-CTA barrier. In the post-WS path (Meta WS),
       // the loop is nested inside a WarpSpecializeOp. The barrier
       // alloc+init must be placed BEFORE the WarpSpecializeOp (so thread 0
       // from the producer warp group initializes it).
       Value barrierAlloc;
+      unsigned numBarriers = mmas.size();
       auto wsOp = forOp->getParentOfType<ttg::WarpSpecializeOp>();
       if (!wsOp) {
         // Pre-WS path: standard alloc before the for loop.
-        barrierAlloc = triton::createBarrierAlloc(forOp, /*numBarriers=*/1,
-                                                  /*arriveCount=*/2);
+        barrierAlloc =
+            triton::createBarrierAlloc(forOp, numBarriers, /*arriveCount=*/2);
       } else if (isInDefaultRegion(mmas[0], wsOp)) {
         // Post-WS path, MMA in default region: The default region can
         // implicitly capture values defined before the WarpSpecializeOp,
@@ -244,34 +239,42 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
         // and inval+dealloc after.
         Location loc = wsOp->getLoc();
         ImplicitLocOpBuilder rewriter(loc, wsOp);
-        barrierAlloc =
-            triton::createScalarAlloc(rewriter, rewriter.getI64Type(), 1);
-        Value initView =
-            triton::createSingleBufferView(rewriter, barrierAlloc, 0);
-        rewriter.create<ttng::InitBarrierOp>(initView, /*arriveCount=*/2);
+        barrierAlloc = triton::createScalarAlloc(
+            rewriter, rewriter.getI64Type(), numBarriers);
+        for (unsigned i = 0; i < numBarriers; ++i) {
+          Value initView =
+              triton::createSingleBufferView(rewriter, barrierAlloc, i);
+          rewriter.create<ttng::InitBarrierOp>(initView, /*arriveCount=*/2);
+        }
 
         // Inval and dealloc AFTER the WarpSpecializeOp.
         rewriter.setInsertionPointAfter(wsOp);
-        Value invalView =
-            triton::createSingleBufferView(rewriter, barrierAlloc, 0);
-        rewriter.create<ttng::InvalBarrierOp>(invalView);
+        for (unsigned i = 0; i < numBarriers; ++i) {
+          Value invalView =
+              triton::createSingleBufferView(rewriter, barrierAlloc, i);
+          rewriter.create<ttng::InvalBarrierOp>(invalView);
+        }
         rewriter.create<ttg::LocalDeallocOp>(barrierAlloc);
       } else {
         // Post-WS path, MMA in a partition region (IsolatedFromAbove):
         // Must capture the barrier explicitly into the partition.
         Location loc = wsOp->getLoc();
         ImplicitLocOpBuilder rewriter(loc, wsOp);
-        barrierAlloc =
-            triton::createScalarAlloc(rewriter, rewriter.getI64Type(), 1);
-        Value initView =
-            triton::createSingleBufferView(rewriter, barrierAlloc, 0);
-        rewriter.create<ttng::InitBarrierOp>(initView, /*arriveCount=*/2);
+        barrierAlloc = triton::createScalarAlloc(
+            rewriter, rewriter.getI64Type(), numBarriers);
+        for (unsigned i = 0; i < numBarriers; ++i) {
+          Value initView =
+              triton::createSingleBufferView(rewriter, barrierAlloc, i);
+          rewriter.create<ttng::InitBarrierOp>(initView, /*arriveCount=*/2);
+        }
 
         // Inval and dealloc AFTER the WarpSpecializeOp.
         rewriter.setInsertionPointAfter(wsOp);
-        Value invalView =
-            triton::createSingleBufferView(rewriter, barrierAlloc, 0);
-        rewriter.create<ttng::InvalBarrierOp>(invalView);
+        for (unsigned i = 0; i < numBarriers; ++i) {
+          Value invalView =
+              triton::createSingleBufferView(rewriter, barrierAlloc, i);
+          rewriter.create<ttng::InvalBarrierOp>(invalView);
+        }
         rewriter.create<ttg::LocalDeallocOp>(barrierAlloc);
 
         // Capture barrier into WarpSpecializeOp partition regions.
@@ -287,7 +290,8 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
         barrierAlloc = capturedBarrier;
       }
 
-      insertSyncBeforeMMA(mmas[0], barrierAlloc);
+      for (unsigned i = 0; i < numBarriers; ++i)
+        insertSyncBeforeMMA(mmas[i], barrierAlloc, i);
     }
 
     // Process standalone MMAs (rare: single-iteration epilogue).
