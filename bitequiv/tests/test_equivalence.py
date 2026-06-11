@@ -159,3 +159,59 @@ def test_reduction_equivalence_prune_both_evaluates_all_levels():
     prune = reduction_equivalence_prune("both")
     with pytest.raises(NotImplementedError):
         prune("c0", {"ttgir": _ttgir(4), "ptx": "// ptx"}, None)
+
+
+# --- the optional `reference` parameter (4th arg the autotuner passes) ---
+def test_reference_arg_overrides_call_order():
+    # The autotuner passes the reference (config, asm, metadata) as the 4th arg. Here the
+    # reference is the warps=8 config even though warps=4 is processed first -> warps=8 is kept.
+    prune = ir_based_prune_configs(lambda config, asm, md: md)
+    items = [("nw4", {}, "K4"), ("nw8", {}, "K8")]
+    reference = items[1]  # (nw8, ...) -> reference order is K8
+    kept = [c for (c, asm, md) in items if prune(c, asm, md, reference)]
+    assert kept == ["nw8"]
+    assert prune.pruned == {"nw4": "not-equivalent-to-reference"}
+
+
+def test_reduction_equivalence_prune_external_anchor_ir_text():
+    # External anchor (NOT in the tuning set) given as raw TTGIR text fixes the reference order.
+    prune = reduction_equivalence_prune("ttgir", reference=_ttgir(8))
+    # The autotuner would still pass a first-config reference; the explicit anchor must win.
+    items = [("nw4", {"ttgir": _ttgir(4)}, None), ("nw8", {"ttgir": _ttgir(8)}, None)]
+    kept = [c for (c, asm, md) in items if prune(c, asm, md, items[0])]
+    assert kept == ["nw8"]  # only the warps=8 candidate matches the anchor
+
+
+def test_reduction_equivalence_prune_external_anchor_asm_dict():
+    prune = reduction_equivalence_prune("ttgir", reference={"ttgir": _ttgir(2)})
+    items = [("nw4", {"ttgir": _ttgir(4)}, None), ("nw2", {"ttgir": _ttgir(2)}, None)]
+    kept = [c for (c, asm, md) in items if prune(c, asm, md, items[0])]
+    assert kept == ["nw2"]
+
+
+def test_reduction_equivalence_prune_external_anchor_compiled_kernel():
+    # External anchor as a CompiledKernel-like object (has .asm / .metadata).
+    class _Anchor:
+        asm = {"ttgir": _ttgir(2)}
+        metadata = None
+
+    prune = reduction_equivalence_prune("ttgir", reference=_Anchor())
+    items = [("nw4", {"ttgir": _ttgir(4)}, None), ("nw2", {"ttgir": _ttgir(2)}, None)]
+    kept = [c for (c, asm, md) in items if prune(c, asm, md, items[0])]
+    assert kept == ["nw2"]
+
+
+def test_reference_resets_introspection_per_run():
+    # A new prune run passes a fresh `reference` object; that resets .classes/.pruned
+    # instead of accumulating across autotuning keys. Use opaque objects (identity).
+    prune = ir_based_prune_configs(lambda config, asm, md: md)
+    a, b, c = object(), object(), object()
+    run1 = [(a, {}, "K1"), (b, {}, "K2")]  # reference = run1[0]
+    for cfg, asm, md in run1:
+        prune(cfg, asm, md, run1[0])
+    assert set(prune.pruned) == {b}
+    run2 = [(a, {}, "K1"), (c, {}, "K1")]  # fresh reference object -> resets state
+    for cfg, asm, md in run2:
+        prune(cfg, asm, md, run2[0])
+    assert prune.pruned == {}  # not polluted by run1
+    assert len(prune.classes) == 1

@@ -258,10 +258,15 @@ class Autotuner(KernelInterface):
             'ir_config_prune': a function used to prune configs by inspecting each config's
                 *compiled artifact* (TTGIR/PTX). Unlike 'early_config_prune', which runs before any
                 compilation, this hook runs after compiling each config (via run(warmup=True), no
-                kernel launch) so it can filter on the generated IR. It should have the signature
+                kernel launch) so it can filter on the generated IR. Signature:
                 `ir_config_prune(config: triton.Config, asm: Dict[str, str], metadata) -> bool`
-                and return True to KEEP the config. `asm` is the CompiledKernel.asm dict (keys such
-                as 'ttir', 'ttgir', 'llir', 'ptx'); `metadata` is CompiledKernel.metadata.
+                returning True to KEEP the config. `asm` is the CompiledKernel.asm dict (keys such
+                as 'ttir', 'ttgir', 'llir', 'ptx'); `metadata` is CompiledKernel.metadata. The
+                predicate MAY take an optional 4th argument
+                `ir_config_prune(config, asm, metadata, reference)` where `reference` is the
+                `(config, asm, metadata)` of the reference config (by default the first compiled
+                config); equivalence-style checks compare each config against it instead of relying
+                on call order.
 
                 This is the single IR-based pruning hook. Static bitwise-equivalence pruning (keep
                 only configs whose compiled IR matches a reference order, at TTGIR and/or PTX level)
@@ -811,12 +816,18 @@ class Autotuner(KernelInterface):
         Each config is compiled via ``run(warmup=True)`` (real-arg specialization, so the inspected
         TTGIR/PTX matches what the benchmarked/launched kernel will use; no kernel is launched). The
         compiled kernel is cached, so the subsequent benchmark reuses it rather than recompiling.
-        The predicate ``ir_config_prune(config, asm, metadata) -> bool`` returns True to KEEP.
         Configs that fail to compile are dropped (they could not win anyway) and recorded.
+
+        The predicate is ``ir_config_prune(config, asm, metadata) -> bool`` (True KEEPs). It may
+        also take an optional 4th argument ``reference`` — the ``(config, asm, metadata)`` of the
+        reference config (by default the first compiled config) — so equivalence-style checks can
+        compare each config against a fixed reference instead of relying on call order.
         """
         self.pruned_by_ir = {}
         pos_args = list(self.nargs.values())
-        kept: List[Config] = []
+        # Compile every config once (cached for the later benchmark), collecting artifacts, so the
+        # reference config's artifact is available before any keep/drop decision.
+        items = []  # (config, asm, metadata) for configs that compiled
         for config in configs:
             run_kwargs = dict(kwargs)
             run_kwargs.update(config.all_kwargs())
@@ -826,10 +837,20 @@ class Autotuner(KernelInterface):
             except Exception as e:  # noqa: BLE001 - a config that cannot compile cannot win
                 self.pruned_by_ir[config] = f"compile-error: {type(e).__name__}: {e}"
                 continue
-            asm = getattr(kernel, "asm", {}) or {}
-            metadata = getattr(kernel, "metadata", None)
+            items.append((config, getattr(kernel, "asm", {}) or {}, getattr(kernel, "metadata", None)))
+
+        prune = self.ir_config_prune
+        reference = items[0] if items else None  # default reference = first compiled config
+        try:
+            accepts_reference = len(inspect.signature(prune).parameters) >= 4
+        except (TypeError, ValueError):
+            accepts_reference = False
+
+        kept: List[Config] = []
+        for config, asm, metadata in items:
             try:
-                keep = bool(self.ir_config_prune(config, asm, metadata))
+                keep = bool(
+                    prune(config, asm, metadata, reference) if accepts_reference else prune(config, asm, metadata))
             except Exception as e:
                 raise AutotunerError(f"`ir_config_prune` raised on config {config}: {type(e).__name__}: {e}") from e
             if keep:
