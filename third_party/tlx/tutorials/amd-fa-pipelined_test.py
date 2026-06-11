@@ -357,22 +357,6 @@ def _attn_fwd_async_prefetch(
 
 
 @triton.jit
-def _remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr):
-    """Remap a flat program id so contiguous pids land on the same XCD,
-    improving L2 reuse for tiles that share K/V (same head)."""
-    pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
-    tall_xcds = GRID_MN % NUM_XCDS
-    tall_xcds = tl.where(tall_xcds == 0, NUM_XCDS, tall_xcds)
-    xcd = pid % NUM_XCDS
-    local_pid = pid // NUM_XCDS
-    return tl.where(
-        xcd < tall_xcds,
-        xcd * pids_per_xcd + local_pid,
-        tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid,
-    )
-
-
-@triton.jit
 def _attn_tile(
     pid_m,
     q_off,

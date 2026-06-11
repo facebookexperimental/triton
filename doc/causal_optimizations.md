@@ -79,11 +79,13 @@ non-causal edge.)
    mirror pairing); non-causal default = **1** (tiles are already equal-cost).
    The knob is a true generalization — see the sweep below.
 
-4. **Persistent + XCD L2 remap (occupancy + locality).** Launches `NUM_SMS`
+4. **Persistent + XCD head pinning (occupancy + locality).** Launches `NUM_SMS`
    resident programs. gfx950 has 8 XCDs and the HW pins program `pid` to XCD
-   `pid % NUM_XCDS`, so heads are pinned to XCDs (`hz % NUM_XCDS`) — each XCD's
-   K/V stays L2-resident. Units are flattened `(head_on_xcd, bundle)` and
-   round-robin strided across the XCD's `NUM_LOCAL = NUM_SMS/NUM_XCDS` programs;
+   `pid % NUM_XCDS`, so we pin head `hz` to XCD `hz % NUM_XCDS`
+   (`pid_hz = xcd + local_head*NUM_XCDS`) — each XCD's K/V stays L2-resident. No
+   separate flat-grid remap is needed; the head→XCD assignment *is* the L2
+   grouping. Units are flattened `(head_on_xcd, bundle)` and round-robin strided
+   across the XCD's `NUM_LOCAL = NUM_SMS/NUM_XCDS` programs;
    constant-cost units make plain striding balance. A program runs a *variable*
    number of tiles (`units/NUM_LOCAL × TILES_PER_UNIT`), not a fixed 2 — which is
    why this is "persistent general", not static mirror.
