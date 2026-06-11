@@ -21,7 +21,7 @@ import torch
 import triton
 import triton.language as tl
 
-from _ir_utils import banner, compile_only, count, is_cuda, show
+from _ir_utils import banner, compile_only, count, dump_passes, is_cuda, pass_diff, show
 
 
 @triton.jit
@@ -54,6 +54,12 @@ def main():
         print(f"    {label}:  async-copy ops = {count(ck, 'ttgir', 'async_copy'):>2}   "
               f"smem buffers (!ttg.memdesc) = {count(ck, 'ttgir', '!ttg.memdesc'):>2}")
     show(ck3, "ttgir", grep="async_copy", limit=3, label="\nsample async copies (num_stages=3):")
+
+    # The pass that does it: `tritongpu-pipeline`. pass_diff shows the K-loop's
+    # synchronous loads becoming multi-buffered async copies into shared memory.
+    banner("05 — the pass responsible: tritongpu-pipeline")
+    dumps = dump_passes(matmul_kernel, *args, num_stages=3, grid=(1, ))
+    pass_diff(dumps, "tritongpu-pipeline", grep=["async_copy", "memdesc_index", "local_alloc"], limit=20)
 
     # Bit-neutral: pipelining preserves the k-accumulation order exactly.
     c1 = torch.empty(M, N, device="cuda")

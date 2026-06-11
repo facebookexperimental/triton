@@ -19,7 +19,7 @@ import torch
 import triton
 import triton.language as tl
 
-from _ir_utils import banner, compile_only, is_cuda, show
+from _ir_utils import banner, compile_only, dump_passes, is_cuda, pass_diff, show
 
 
 @triton.jit
@@ -45,6 +45,25 @@ def main():
     show(ck, "ttir", grep=["tt.", "arith."], limit=40)
     print("\nNote: tensor types are plain `tensor<256xf32>` — NO #blocked encoding."
           "\n      The thread/warp mapping is added in the next stage (see 02).")
+
+    # Close the loop: don't just read the *stage* output — look at an individual
+    # PASS. dump_passes turns on Triton's MLIR_ENABLE_DUMP (the pass manager
+    # prints the IR around every pass) and captures it; pass_diff shows what one
+    # named pass rewrote. Equivalent on the CLI to:
+    #   MLIR_ENABLE_DUMP=add_kernel TRITON_ALWAYS_COMPILE=1 python 01_read_ttir.py
+    banner("01 — a specific TTIR pass (canonicalize), not just the stage output")
+    dumps = dump_passes(add_kernel, x, y, o, n, BLOCK=BLOCK, grid=(1, ))
+    ttir_passes = []
+    for r in dumps:
+        if "convert-triton-to-tritongpu" in r["pass"].lower():
+            break  # everything after this is TTGIR, not TTIR
+        if r["event"] == "Before":
+            ttir_passes.append(r["pass"])
+    print("    TTIR-stage passes that ran (in order):")
+    for p in ttir_passes:
+        print("      - " + p)
+    print("\n    What `canonicalize` did to the TTIR (folds the duplicate 256 constant):")
+    pass_diff(dumps, "canonicalize", grep=["tt.", "arith.", "scf."], limit=24)
 
     # Correctness check (real launch): vector add is exact in fp32.
     grid = lambda meta: (triton.cdiv(n, meta["BLOCK"]), )

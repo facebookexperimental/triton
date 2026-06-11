@@ -23,7 +23,7 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from _ir_utils import banner, compile_only, count, is_blackwell, is_cuda, show
+from _ir_utils import banner, compile_only, count, dump_passes, is_blackwell, is_cuda, pass_diff, show
 
 
 @triton.jit
@@ -85,6 +85,14 @@ def main():
         print(f"    ttg.warp_specialize ops = {count(ck, 'ttgir', 'warp_specialize')}")
         print(f"    async_task_id tags      = {count(ck, 'ttgir', 'async_task_id')}")
         show(ck, "ttgir", grep="warp_specialize", limit=3, label="\nwarp_specialize region(s):")
+
+        # The pass responsible: `nvgpu-warp-specialization`. pass_diff shows it
+        # wrapping the loop body in a ttg.warp_specialize region and tagging ops
+        # with async_task_id (producer vs consumer).
+        banner("06 — the pass responsible: nvgpu-warp-specialization")
+        dumps = dump_passes(matmul, a_desc, b_desc, c_desc, M, N, K, False, BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK,
+                            GROUP_M=GROUP, NUM_SMS=NUM_SMS, grid=grid)
+        pass_diff(dumps, "warp-specialization", grep=["warp_specialize", "async_task_id"], limit=20)
 
         matmul[grid](a_desc, b_desc, c_desc, M, N, K, False, BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, GROUP_M=GROUP,
                      NUM_SMS=NUM_SMS)

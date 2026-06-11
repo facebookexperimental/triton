@@ -22,7 +22,7 @@ import torch
 import triton
 import triton.language as tl
 
-from _ir_utils import banner, compile_only, diff, is_cuda, show
+from _ir_utils import banner, compile_only, diff, dump_passes, is_cuda, pass_diff, show
 
 
 @triton.jit
@@ -52,6 +52,12 @@ def main():
 
     banner("02 — num_warps flows into warpsPerCTA (the thread mapping)")
     diff(ck4, ck8, "ttgir", grep="#blocked =", label_a="num_warps=4", label_b="num_warps=8")
+
+    # The pass that does it: `convert-triton-to-tritongpu`. pass_diff shows the
+    # exact rewrite — a `#blocked` layout appears and every tensor type gains it.
+    banner("02 — the pass responsible: convert-triton-to-tritongpu")
+    dumps = dump_passes(add_kernel, x, y, o, n, BLOCK=BLOCK, num_warps=4, grid=(1, ))
+    pass_diff(dumps, "convert-triton-to-tritongpu", grep=["#blocked =", "tensor<", "tt.func"], limit=24)
 
     # Bit-neutral for elementwise add: both layouts give the exact same result.
     grid = lambda meta: (triton.cdiv(n, meta["BLOCK"]), )

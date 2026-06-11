@@ -26,7 +26,7 @@ import torch
 import triton
 import triton.language as tl
 
-from _ir_utils import banner, compile_only, count, is_cuda, show
+from _ir_utils import banner, compile_only, count, dump_passes, is_cuda, pass_diff, show
 
 
 @triton.jit
@@ -64,6 +64,12 @@ def main():
     show(ck_trans, "ttgir", grep="#blocked", limit=2,
          label="layout encodings (note the transposed order [1,0] vs [0,1]):")
     show(ck_trans, "ttgir", grep="convert_layout", limit=4, label="the convert_layout op:")
+
+    # The pass at work: `tritongpu-remove-layout-conversions` (it runs several
+    # times). pass_diff shows the first run deleting the redundant conversions.
+    banner("04 — the pass responsible: tritongpu-remove-layout-conversions")
+    dumps = dump_passes(transpose_kernel, x2, o2, M, N, grid=(1, ))
+    pass_diff(dumps, "remove-layout-conversions", grep="convert_layout", limit=16)
 
     # Bit-neutral: the transpose moves elements but preserves their values exactly.
     transpose_kernel[(1, )](x2, o2, M, N)
