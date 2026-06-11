@@ -206,7 +206,7 @@ def _attn_fwd_async_prefetch(
     hot loop (steady state), and epilogue.
 
     Design notes:
-      * K and V are both double-buffered (2 LDS slots, ping-pong index
+      * K and V are both double-buffered (2 LDS slots, alternating index
         i%2).
       * `local_trans` is applied to K so `local_load` lands directly in
         dot-operand layout 1, skipping the per-iter ds_write+barrier+
@@ -251,8 +251,8 @@ def _attn_fwd_async_prefetch(
     else:
         hi = N_CTX
 
-    # K and V: 2 LDS slots each (ping-pong) -- avoids both the memdesc_trans
-    # alias race for K and any single-buf RAW hazards.
+    # K and V: 2 LDS slots each (double-buffered) -- avoids both the
+    # memdesc_trans alias race for K and any single-buf RAW hazards.
     NUM_BUFFERS: tl.constexpr = 2
     k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, NUM_BUFFERS)
     v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, NUM_BUFFERS)
