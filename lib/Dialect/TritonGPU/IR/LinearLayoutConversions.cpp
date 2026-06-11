@@ -245,10 +245,28 @@ LinearLayout nvmmaSharedToLinearLayout(ArrayRef<int64_t> shape,
     contigNpotSwizzleOk = (contigBytes % swizzleBytes == 0);
   }
 
+  // K=96 mxf4nvf4 absolute-LBO operand: swizzle is force-set to 128B even
+  // though the packed-K contig dim (48 bytes) does not fill the 128B SW128
+  // atom, so contigNpotSwizzleOk is false (48 % 128 != 0). The operand SMEM is
+  // a FULL 128B atom (getAllocationShapePerCTA pads it; getTMABlockShape
+  // returns the full atom) with K=96 in the first bytes, read by the
+  // absolute-LBO descriptor as two 64B chunks. The layout's contiguous out-dim
+  // must be sized to the full atom (128 elems for 128B/i8), not
+  // roundToPow2(48)=64, or the 128-wide swizzle's basis (64) exceeds the
+  // out-dim size. Uniquely identified: swizzle == 128 yet the auto picker would
+  // never choose 128 here.
+  int64_t swizzleAtomElems =
+      swizzleBytes > 0 ? (8 * swizzleBytes) / shared.getElementBitWidth() : 0;
+  bool isFp4K96AbsLbo =
+      swizzleBytes == 128 &&
+      llvm::NextPowerOf2((uint64_t)(shapePerCTA[contigDim] * elemBytes)) < 128;
+
   SmallVector<int64_t> pow2ShapePerCTA(shapePerCTA.size());
   for (size_t i = 0; i < shapePerCTA.size(); i++) {
     if (contigNpotSwizzleOk && (int)i == contigDim) {
       pow2ShapePerCTA[i] = shapePerCTA[i];
+    } else if (isFp4K96AbsLbo && (int)i == contigDim) {
+      pow2ShapePerCTA[i] = swizzleAtomElems;
     } else {
       pow2ShapePerCTA[i] = roundToPow2(shapePerCTA[i]);
     }
@@ -356,6 +374,14 @@ LinearLayout nvmmaSharedToLinearLayout(ArrayRef<int64_t> shape,
       // masked at the epilogue store.
       if (i == contigDim && contigNpotSwizzleOk)
         continue;
+      // K=96 absolute-LBO: size the contig dim to the full padded 128B atom
+      // (matches getAllocationShapePerCTA) so combineCtaCgaWithShape does not
+      // modular-reduce the swizzled contig offset (which would alias columns
+      // and reject the 128-wide swizzle basis).
+      if (i == contigDim && isFp4K96AbsLbo) {
+        effectiveShape[i] = swizzleAtomElems;
+        continue;
+      }
       effectiveShape[i] = llvm::NextPowerOf2(effectiveShape[i]);
     }
   }
@@ -1584,8 +1610,13 @@ LinearLayout getLayoutWithinBlock(const LinearLayout &layout) {
   assert(layout.hasInDim(kBlock));
   auto bases = layout.getBases();
   bases[kBlock] = {};
-  return LinearLayout(std::move(bases),
-                      llvm::to_vector<4>(layout.getOutDimNames()));
+  // Use getOutDims() (with sizes) rather than getOutDimNames() to preserve
+  // NPOT output dimension sizes. The name-only constructor infers sizes as
+  // NextPowerOf2(max_basis), which rounds NPOT dims (e.g. 48) up to pow2 (64),
+  // corrupting NPOT shared/TMEM layouts (K=48/96 FP4). requireSurjective is
+  // false because zeroing the block bases may drop surjectivity.
+  return LinearLayout(std::move(bases), layout.getOutDims(),
+                      /*requireSurjective=*/false);
 }
 
 LinearLayout combineCtaCgaWithShape(LinearLayout ctaLayout,

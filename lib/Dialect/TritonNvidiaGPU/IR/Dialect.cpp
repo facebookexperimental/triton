@@ -149,7 +149,11 @@ static std::optional<LinearLayout> getDistributedLayoutForTmemLdSt(
     auto ctaCol =
         LinearLayout::identity1D(cgaShape[0], rowColDims[1], dims[0]) *
         LinearLayout::identity1D(cgaShape[1], rowColDims[1], dims[1]);
-    auto quot = divideRight(ll, ctaCol);
+    // ll may be modular for NPOT shapes (e.g. FP4 dot_scaled scale tensors
+    // with K/16 scale groups, such as the K=96 (M, 6) scale tensor). Use the
+    // modular-aware wrapper so divideRight handles the NPOT out-dim structure
+    // instead of misapplying GF(2) algebra to a modular layout.
+    auto quot = divideRightAllowingModular(ll, ctaCol);
     bool isM64TwoCTA = !quot.has_value();
     if (isM64TwoCTA) {
       auto bases = ll.getBases();
@@ -200,7 +204,8 @@ static std::optional<LinearLayout> getDistributedLayoutForTmemLdSt(
     LinearLayout quot;
     int bestContig = 1;
     for (int contig = 1; bitwidth * contig <= 32; contig *= 2) {
-      auto maybeQuot = divideLeft(
+      // ll may be modular for NPOT shapes; use the modular-aware wrapper.
+      auto maybeQuot = divideLeftAllowingModular(
           ll, LinearLayout::identity1D(contig, rowColDims[1], dims[1]));
       if (!maybeQuot)
         break;
@@ -218,7 +223,7 @@ static std::optional<LinearLayout> getDistributedLayoutForTmemLdSt(
       auto castbbitwidth = LinearLayout::identity1D(bestContig, kReg, dims[1]);
       return castbbitwidth * ret.value();
     }
-    if (auto maybeQuot = divideLeft(
+    if (auto maybeQuot = divideLeftAllowingModular(
             ll, LinearLayout::zeros1D(32 / bitwidth, rowColDims[1], dims[1]) *
                     LinearLayout::identity1D(2, rowColDims[1], dims[1]));
         bitwidth == 16 && maybeQuot) {
@@ -229,9 +234,9 @@ static std::optional<LinearLayout> getDistributedLayoutForTmemLdSt(
         return ret;
       auto castbbitwidth = LinearLayout::identity1D(2, kReg, dims[1]);
       return castbbitwidth * ret.value();
-    } else if (auto maybeQuot =
-                   divideLeft(ll, LinearLayout::zeros1D(
-                                      32 / bitwidth, rowColDims[1], dims[1]))) {
+    } else if (auto maybeQuot = divideLeftAllowingModular(
+                   ll, LinearLayout::zeros1D(32 / bitwidth, rowColDims[1],
+                                             dims[1]))) {
       // Software padding
       assert(maybeQuot);
       return getDistributedLayoutForTmemLdSt(*maybeQuot, atom, numWarps, 32);

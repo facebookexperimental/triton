@@ -143,8 +143,11 @@ lowerTMemLdSt(const LinearLayout &cvt, int maxnreg, int bitwidth, bool isScales,
     LinearLayout quot;
     int bestContig = 1;
     for (int contig = 1; bitwidth * contig <= 32; contig *= 2) {
-      auto maybeQuot =
-          divideLeft(cvt, LinearLayout::identity1D(contig, kReg, kCol));
+      // cvt may be modular for NPOT scale tensors (e.g. FP4 dot_scaled with
+      // NPOT K such as the K=96 (M, 6) scale tensor). Use the modular-aware
+      // wrapper so divideLeft handles the NPOT out-dim structure.
+      auto maybeQuot = divideLeftAllowingModular(
+          cvt, LinearLayout::identity1D(contig, kReg, kCol));
       if (!maybeQuot)
         break;
       quot = *maybeQuot;
@@ -157,7 +160,7 @@ lowerTMemLdSt(const LinearLayout &cvt, int maxnreg, int bitwidth, bool isScales,
       // larger dtype
       unpacked = false;
       newBitwidth = bitwidth * bestContig;
-    } else if (auto maybeQuot = divideLeft(
+    } else if (auto maybeQuot = divideLeftAllowingModular(
                    cvt, LinearLayout::zeros1D(1, kReg, kCol, 32 / bitwidth) *
                             LinearLayout::identity1D(2, kReg, kCol));
                bitwidth == 16 && maybeQuot) {
@@ -165,7 +168,7 @@ lowerTMemLdSt(const LinearLayout &cvt, int maxnreg, int bitwidth, bool isScales,
       unpacked = true;
       quot = *maybeQuot;
       newBitwidth = 32;
-    } else if (auto maybeQuot = divideLeft(
+    } else if (auto maybeQuot = divideLeftAllowingModular(
                    cvt, LinearLayout::zeros1D(1, kReg, kCol, 32 / bitwidth))) {
       // We software-pad the elements when we either do not have enough elements
       // to fill a full 32b register, e.g., colN = 1 and colStride != 1 or when
