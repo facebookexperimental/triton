@@ -49,6 +49,20 @@ and uses a plain 2-D grid; `persistent` peels the mask, balances the causal
 triangle, and groups heads per XCD — hence the large causal gap and the +2–3.5%
 non-causal edge.)
 
+## Shape support
+
+- **Self-attention** (`q_len == kv_len`): causal + non-causal, any `N`
+  (`N % BLOCK_N == 0`; partial-block falls back to the baseline).
+- **Cross-attention / decode** (`q_len != kv_len`): supported via the causal
+  diagonal offset `DIAG_OFFSET = kv_len - q_len` — query row `i` attends key `j`
+  iff `j <= i + DIAG_OFFSET` (bottom-right / FlashAttention / KV-cache
+  convention; reduces to PyTorch `is_causal` when square). Requires
+  `kv_len % BLOCK_N == 0` for the non-square case. Decode (`q_len=1`) is
+  *correct* but perf-poor (1 tile/head → grid starves; a K-split/StreamK kernel
+  is the right tool there).
+- **Not yet:** GQA/MQA (Q and KV head counts must match) and ragged/varlen
+  batches (uniform `N` assumed).
+
 ## Design
 
 `_attn_fwd_persistent` synthesizes four ideas into one clean scheduler.
@@ -118,9 +132,13 @@ optimum; `≥4` over-coarsens (fewer schedulable units than programs → idle CU
 
 ## Future work
 
-- Extend to GQA, ragged batch, and single-token decode (`BLOCK_M=1`); for that
-  low-parallelism regime a StreamK-style K-block split + partial-softmax
-  reduction beats whole-tile bundling.
+- GQA/MQA: map a query head to its shared KV head (`kv_head = q_head * H_kv //
+  H_q`) when indexing K/V — small, local change.
+- Decode / low-parallelism *performance*: a StreamK-style K-block split +
+  partial-softmax reduction beats whole-tile bundling there (correctness already
+  works via `DIAG_OFFSET`).
+- Ragged/varlen batches via `cu_seqlens` + a host-built tile schedule (separate
+  entry point).
 - Greedy-bundle (accumulate tiles to a target cost) for non-linear cost profiles
   (e.g. sliding-window) — the `TILES_PER_UNIT` bundle generalizes to that.
 - Fix the `iota_range` modulo-decode crash upstream so partial-N needs no fallback.

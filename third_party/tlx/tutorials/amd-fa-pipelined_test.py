@@ -377,45 +377,54 @@ def _attn_tile(
     stride_vk,
     stride_om,
     stride_ok,
-    N_CTX,
+    N_CTX_Q,
+    N_CTX_K,
     QK_SCALE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    DIAG_OFFSET: tl.constexpr,
     EVEN_N: tl.constexpr,
 ):
     """Compute one output m-tile — causal (peeled mask) or non-causal (full).
 
-    Causal: K blocks fully below the diagonal
-    (`start_n + BLOCK_N <= pid_m*BLOCK_M`) need *no* mask; only the
-    `BLOCK_M//BLOCK_N` diagonal blocks do. We run an unmasked steady-state loop
-    (FMA-friendly softmax, no `tl.where`) then a short masked diagonal tail.
-    Non-causal: every block is unmasked (`hi = N_CTX`), so the steady-state loop
-    covers them all and the masked tail handles only the ragged boundary block
-    (`N % BLOCK_N != 0`). The async double-buffered prefetch chain is continuous
-    across both loops (slot = global_block_idx % 2), so there is no bubble.
+    Supports `q_len != kv_len` (cross-attention / decode). Query row `qpos`
+    attends key `kpos` iff `kpos <= qpos + DIAG_OFFSET`, where
+    `DIAG_OFFSET = kv_len - q_len` (PyTorch SDPA bottom-right alignment).
+    `DIAG_OFFSET == 0` is the square self-attention case.
+
+    Causal: K blocks fully below the diagonal need *no* mask; only the diagonal
+    band does. We run an unmasked steady-state loop (FMA-friendly softmax, no
+    `tl.where`) then a short masked diagonal tail. Non-causal: every block is
+    unmasked (`hi = kv_len`), so the steady-state loop covers them all and the
+    masked tail handles only the ragged boundary block (`kv_len % BLOCK_N != 0`).
+    The async double-buffered prefetch chain is continuous across both loops
+    (slot = global_block_idx % 2), so there is no bubble.
     """
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM)
 
-    q = tl.load(Q + q_off + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk, mask=offs_m[:, None] < N_CTX,
+    q = tl.load(Q + q_off + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk, mask=offs_m[:, None] < N_CTX_Q,
                 other=0.0)
 
     if IS_CAUSAL:
-        hi = min(N_CTX, (pid_m + 1) * BLOCK_M)
+        # Largest key any query in this tile may attend, +1 (exclusive bound).
+        hi = min(N_CTX_K, (pid_m + 1) * BLOCK_M + DIAG_OFFSET)
     else:
-        hi = N_CTX
+        hi = N_CTX_K
 
     k_ptrs = K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
     v_ptrs = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
 
     n_blocks = (hi + BLOCK_N - 1) // BLOCK_N
     if IS_CAUSAL:
-        # diag_start = pid_m*BLOCK_M is a multiple of BLOCK_N -> exact split.
-        n_unmasked = (pid_m * BLOCK_M) // BLOCK_N
-        n_unmasked = tl.minimum(n_unmasked, n_blocks)
+        # Blocks fully below the diagonal for the *smallest* query row in the
+        # tile (conservative: any block we skip masking on is unmasked for every
+        # row). Reduces to (pid_m*BLOCK_M)//BLOCK_N when DIAG_OFFSET == 0.
+        n_unmasked = (pid_m * BLOCK_M + DIAG_OFFSET) // BLOCK_N
+        n_unmasked = tl.maximum(tl.minimum(n_unmasked, n_blocks), 0)
     elif EVEN_N:
         # No mask anywhere -> the whole range is the steady-state loop.
         n_unmasked = n_blocks
@@ -428,8 +437,8 @@ def _attn_tile(
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
     # Prologue: prefetch block 0.
-    tok_k0 = tlx.async_load(k_ptrs, tlx.local_view(k_buf, 0), mask=offs_n[:, None] < N_CTX)
-    tok_v0 = tlx.async_load(v_ptrs, tlx.local_view(v_buf, 0), mask=offs_n[:, None] < N_CTX)
+    tok_k0 = tlx.async_load(k_ptrs, tlx.local_view(k_buf, 0), mask=offs_n[:, None] < N_CTX_K)
+    tok_v0 = tlx.async_load(v_ptrs, tlx.local_view(v_buf, 0), mask=offs_n[:, None] < N_CTX_K)
     tlx.async_load_commit_group([tok_k0, tok_v0])
 
     # ── Unmasked steady-state loop (below-diagonal blocks) ──────────────────
@@ -444,7 +453,7 @@ def _attn_tile(
         kt_cur = tlx.local_load(kt_view, token=wait_tok, relaxed=True)
         v_cur = tlx.local_load(tlx.local_view(v_buf, slot_cur), token=wait_tok, relaxed=True)
 
-        next_mask = (next_off + offs_n[:, None]) < N_CTX
+        next_mask = (next_off + offs_n[:, None]) < N_CTX_K
         tok_k = tlx.async_load(k_ptrs + next_off * stride_kn, tlx.local_view(k_buf, slot_nxt), mask=next_mask)
         tok_v = tlx.async_load(v_ptrs + next_off * stride_vn, tlx.local_view(v_buf, slot_nxt), mask=next_mask)
         tlx.async_load_commit_group([tok_k, tok_v])
@@ -473,16 +482,16 @@ def _attn_tile(
         v_cur = tlx.local_load(tlx.local_view(v_buf, slot_cur), token=wait_tok, relaxed=True)
 
         if next_off < hi:
-            next_mask = (next_off + offs_n[:, None]) < N_CTX
+            next_mask = (next_off + offs_n[:, None]) < N_CTX_K
             tok_k = tlx.async_load(k_ptrs + next_off * stride_kn, tlx.local_view(k_buf, slot_nxt), mask=next_mask)
             tok_v = tlx.async_load(v_ptrs + next_off * stride_vn, tlx.local_view(v_buf, slot_nxt), mask=next_mask)
             tlx.async_load_commit_group([tok_k, tok_v])
 
         qk = tl.dot(q, kt_cur)
         if IS_CAUSAL:
-            qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+            qk = tl.where(offs_m[:, None] + DIAG_OFFSET >= kn[None, :], qk, float("-inf"))
         if not EVEN_N:
-            qk = tl.where(kn[None, :] < N_CTX, qk, float("-inf"))
+            qk = tl.where(kn[None, :] < N_CTX_K, qk, float("-inf"))
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
         p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
@@ -495,7 +504,7 @@ def _attn_tile(
 
     acc = acc / l_i[:, None]
     o_ptrs = Out + o_off + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
-    tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=(offs_m[:, None] < N_CTX) & (offs_d[None, :] < HEAD_DIM))
+    tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=(offs_m[:, None] < N_CTX_Q) & (offs_d[None, :] < HEAD_DIM))
 
 
 @triton.jit
@@ -522,19 +531,22 @@ def _attn_fwd_persistent(
     stride_ok,
     Z,
     H,
-    N_CTX,
+    N_CTX_Q,
+    N_CTX_K,
     sm_scale: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    DIAG_OFFSET: tl.constexpr,
     NUM_M_BLOCKS: tl.constexpr,
     TILES_PER_UNIT: tl.constexpr,
     NUM_SMS: tl.constexpr,
     NUM_XCDS: tl.constexpr,
     EVEN_N: tl.constexpr,
 ):
-    """Unified persistent FA — one kernel for causal **and** non-causal.
+    """Unified persistent FA — one kernel for causal **and** non-causal,
+    including `q_len != kv_len` (cross-attention / decode) via `DIAG_OFFSET`.
 
     - **Zig-zag (fold) tile order.** A head's m-tiles are walked as
       `0, N-1, 1, N-2, …` — interleaving the lightest and heaviest
@@ -551,9 +563,7 @@ def _attn_fwd_persistent(
     - **Persistent + XCD-grouped.** Launches `NUM_SMS` resident programs; heads
       are pinned to XCDs (`hz % NUM_XCDS`) for K/V L2 locality, and units are
       flattened `(head_on_xcd, bundle)` and round-robin strided across the XCD's
-      `NUM_LOCAL` programs. Constant-cost units make plain striding balance — no
-      snake/averaging needed. A program handles a *variable* number of tiles
-      (`units/NUM_LOCAL × TILES_PER_UNIT`), not a fixed 2.
+      `NUM_LOCAL` programs.
 
     Non-causal degrades cleanly: `_attn_tile(IS_CAUSAL=False)` runs the full
     unmasked range and zig-zag is just a (cost-neutral) permutation.
@@ -594,9 +604,9 @@ def _attn_fwd_persistent(
                     half = idx // 2
                     pid_m = tl.where(idx % 2 == 0, half, NUM_M_BLOCKS - 1 - half)
                     _attn_tile(pid_m, q_off, k_off, v_off, o_off, Q, K, V, Out, k_buf, v_buf, stride_qm, stride_qk,
-                               stride_kn, stride_kk, stride_vn, stride_vk, stride_om, stride_ok, N_CTX,
+                               stride_kn, stride_kk, stride_vn, stride_vk, stride_om, stride_ok, N_CTX_Q, N_CTX_K,
                                QK_SCALE=QK_SCALE, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM,
-                               IS_CAUSAL=IS_CAUSAL, EVEN_N=EVEN_N)
+                               IS_CAUSAL=IS_CAUSAL, DIAG_OFFSET=DIAG_OFFSET, EVEN_N=EVEN_N)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -712,10 +722,16 @@ def flash_attn_persistent(q, k, v, sm_scale, causal=False, **kw):
     units (tiles are already equal-cost). A program runs a *variable* number of
     tiles, not a fixed 2.
 
-    Falls back to the matching baseline for partial-block N (`N % BLOCK_N != 0`)
-    to dodge the modulo-decode `iota_range` compiler crash (not perf-critical).
+    Supports `q_len != kv_len` (cross-attention / decode): the causal diagonal is
+    anchored bottom-right via `DIAG_OFFSET = kv_len - q_len` (matching PyTorch
+    SDPA). Q heads and K/V heads must match (no GQA yet).
+
+    Falls back to the square baseline for partial-block N (`N % BLOCK_N != 0`) to
+    dodge the modulo-decode `iota_range` compiler crash (not perf-critical).
     """
-    B, H, N_CTX, D = q.shape
+    B, H, N_CTX_Q, D = q.shape
+    N_CTX_K = k.shape[2]
+    diag_offset = N_CTX_K - N_CTX_Q
 
     BLOCK_M = kw.pop("BLOCK_M", 256)
     # Peeled causal + non-causal both prefer BLOCK_N=128 at D<=64 (more compute
@@ -724,14 +740,17 @@ def flash_attn_persistent(q, k, v, sm_scale, causal=False, **kw):
     num_warps = kw.pop("num_warps", 4)
     tiles_per_unit = kw.pop("TILES_PER_UNIT", 2 if causal else 1)
 
-    if N_CTX % BLOCK_N != 0:
-        # Partial-block N hits the modulo-decode iota_range compiler crash;
-        # fall back to the (correct, non-perf-critical) baseline prefetch kernel.
+    if N_CTX_K % BLOCK_N != 0:
+        # Partial-block kv hits the modulo-decode iota_range compiler crash.
+        # The square baseline only handles q_len == kv_len, so require that here.
+        assert N_CTX_Q == N_CTX_K, ("persistent: partial-block kv_len with "
+                                    "q_len != kv_len is not supported "
+                                    f"(q_len={N_CTX_Q}, kv_len={N_CTX_K}, BLOCK_N={BLOCK_N})")
         return flash_attn_async_prefetch(q, k, v, sm_scale, causal=causal, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
                                          num_warps=num_warps, **kw)
 
     o = torch.empty_like(q)
-    num_m_blocks = triton.cdiv(N_CTX, BLOCK_M)
+    num_m_blocks = triton.cdiv(N_CTX_Q, BLOCK_M)
     num_xcds = kw.pop("NUM_XCDS", 8)
     cu_count = torch.cuda.get_device_properties(q.device).multi_processor_count
     num_sms = kw.pop("NUM_SMS", (cu_count // num_xcds) * num_xcds)
@@ -759,17 +778,19 @@ def flash_attn_persistent(q, k, v, sm_scale, causal=False, **kw):
         o.stride(3),
         B,
         H,
-        N_CTX,
+        N_CTX_Q,
+        N_CTX_K,
         sm_scale,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         HEAD_DIM=D,
         IS_CAUSAL=causal,
+        DIAG_OFFSET=diag_offset,
         NUM_M_BLOCKS=num_m_blocks,
         TILES_PER_UNIT=tiles_per_unit,
         NUM_SMS=num_sms,
         NUM_XCDS=num_xcds,
-        EVEN_N=(N_CTX % BLOCK_N == 0),
+        EVEN_N=(N_CTX_K % BLOCK_N == 0),
         num_warps=num_warps,
         **kw,
     )
@@ -857,6 +878,37 @@ def test_fa_correctness(kernel_name, causal, n_test, dtype=torch.bfloat16, D=128
     kernel_fn = get_kernel(kernel_name)
     ok = run_correctness_check(kernel_fn, dtype, causal, B=1, H=4, N=n_test, D=D)
     assert ok, f"Correctness failed: kernel={kernel_name} causal={causal} N={n_test}"
+
+
+def _ref_bottomright(q, k, v, sm, causal):
+    """Reference for q_len != kv_len: bottom-right causal alignment
+    (key j attends iff j <= i + (kv_len - q_len)) — the decode/KV-cache and
+    FlashAttention convention. Reduces to is_causal when q_len == kv_len."""
+    Lq, Lk = q.shape[2], k.shape[2]
+    if not causal:
+        return F.scaled_dot_product_attention(q, k, v, scale=sm)
+    i = torch.arange(Lq, device=q.device)[:, None]
+    j = torch.arange(Lk, device=q.device)[None, :]
+    bias = torch.zeros(Lq, Lk, device=q.device, dtype=q.dtype).masked_fill(~(j <= i + (Lk - Lq)), float("-inf"))
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=bias, scale=sm)
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["nocausal", "causal"])
+@pytest.mark.parametrize("q_len,kv_len", [(256, 1024), (1024, 256), (1, 1024), (1024, 1024)],
+                         ids=["cross_qlt", "cross_qgt", "decode", "square"])
+def test_fa_persistent_cross_attention(q_len, kv_len, causal, dtype=torch.bfloat16, D=128):
+    """persistent kernel with q_len != kv_len (cross-attention / decode)."""
+    torch.manual_seed(42)
+    B, H = 1, 8
+    q = torch.randn(B, H, q_len, D, device=DEVICE, dtype=dtype)
+    k = torch.randn(B, H, kv_len, D, device=DEVICE, dtype=dtype)
+    v = torch.randn(B, H, kv_len, D, device=DEVICE, dtype=dtype)
+    sm = 1.0 / math.sqrt(D)
+    ref = _ref_bottomright(q, k, v, sm, causal)
+    out = flash_attn_persistent(q, k, v, sm, causal)
+    valid = ~torch.isnan(ref.float())  # fully-masked rows (q_len > kv_len) are undefined
+    ok = torch.allclose(out.float()[valid], ref.float()[valid], atol=2e-2, rtol=2e-2)
+    assert ok, f"cross-attn failed: q_len={q_len} kv_len={kv_len} causal={causal}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
