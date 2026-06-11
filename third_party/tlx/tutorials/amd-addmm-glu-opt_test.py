@@ -1,7 +1,7 @@
 """
 AMD TLX fused addmm + GLU (out = x + x*y, x = A@B + bias).
 
-Benchmarks the naive and optimized TLX kernels against a PyTorch reference
+Benchmarks the baseline and optimized TLX kernels against a PyTorch reference
 (naive matmul + add, then GLU) and ROCBLAS (pure matmul, no add/GLU).
 
 Usage:
@@ -12,7 +12,7 @@ Usage:
   python amd-addmm-glu-opt_test.py -K 1024 --kernel optimized
 
   # A couple of sizes, both kernels
-  python amd-addmm-glu-opt_test.py -K 256 512 --kernel naive optimized
+  python amd-addmm-glu-opt_test.py -K 256 512 --kernel baseline optimized
 """
 import argparse
 
@@ -39,8 +39,8 @@ BEST_CONFIG = {
                  num_warps=8, matrix_instr_nonkdim=16, waves_per_eu=0),
 }
 
-# Autotuning winning configurations for the naive kernel (K=256, K=512, K=1024)
-NAIVE_BEST_CONFIG = {
+# Autotuning winning configurations for the baseline kernel (K=256, K=512, K=1024)
+BASELINE_BEST_CONFIG = {
       256:  dict(BLOCK_SIZE_M=128, BLOCK_SIZE_N=128, BLOCK_SIZE_K=64, GROUP_SIZE_M=1,
                  NUM_STAGES=2, num_warps=4, matrix_instr_nonkdim=16, waves_per_eu=2, kpack=1),
       512:  dict(BLOCK_SIZE_M=128, BLOCK_SIZE_N=128, BLOCK_SIZE_K=64, GROUP_SIZE_M=1,
@@ -306,9 +306,9 @@ def pytorch_baseline(bias, a, b, y):
     x = x + bias.to(torch.float32)[None, :]
     return (x + x * y.to(torch.float32)).to(torch.float16)
 
-# Naive Addmm kernel
+# Baseline Addmm kernel
 @triton.jit
-def tlx_addmm_glu_kernel_naive(
+def tlx_addmm_glu_kernel_baseline(
     a_ptr,
     b_ptr,
     bias_ptr,
@@ -388,7 +388,7 @@ def tlx_addmm_glu_kernel_naive(
         a_reg = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
         b_reg = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
-        prev = (k - NUM_STAGES - 1) % (NUM_STAGES - 1)
+        prev = (k % (NUM_STAGES - 1))
         a_prev = tlx.local_load(tlx.local_view(buffers_a, prev))
         b_prev = tlx.local_load(tlx.local_view(buffers_b, prev))
         acc = tl.dot(a_prev, b_prev, acc)
@@ -422,12 +422,12 @@ def tlx_addmm_glu_kernel_naive(
     tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), mask=cmask)
 
 
-def run_kernel_naive(bias, a, b, y, cfg):
+def run_kernel_baseline(bias, a, b, y, cfg):
     M, K = a.shape
     K2, N = b.shape
     out = torch.empty((M, N), device=a.device, dtype=torch.float16)
     grid = (triton.cdiv(M, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"]),)
-    tlx_addmm_glu_kernel_naive[grid](
+    tlx_addmm_glu_kernel_baseline[grid](
         a,
         b,
         bias,
@@ -457,9 +457,9 @@ def run_kernel_naive(bias, a, b, y, cfg):
     return out
 
 
-def run_naive(a, b, bias, y):
+def run_baseline(a, b, bias, y):
     K = b.shape[0]
-    return run_kernel_naive(bias, a, b, y, NAIVE_BEST_CONFIG[K])
+    return run_kernel_baseline(bias, a, b, y, BASELINE_BEST_CONFIG[K])
 
 
 def run_optimized(a, b, bias, y):
@@ -470,7 +470,7 @@ def run_optimized(a, b, bias, y):
 
 
 KERNEL_REGISTRY = {
-    "tlx_naive": run_naive,
+    "tlx_baseline": run_baseline,
     "tlx_optimized": run_optimized,
 }
 
@@ -495,7 +495,7 @@ def verify(name, got, ref, atol=2e-2, rtol=2e-2, log=True):
 
 def print_summary_table(results, providers):
     """Print a markdown-style summary table of benchmark results."""
-    rows = [(f"K={key}", results[key]) for key in sorted(results.keys())]
+    rows = [(f"M={m} N={n} K={k}", results[(m, n, k)]) for (m, n, k) in sorted(results.keys())]
 
     cfg_w = max(len("Config"), *(len(lbl) for lbl, _ in rows)) if rows else len("Config")
     col_w = max(14, *(len(p) for p in providers))
@@ -504,7 +504,7 @@ def print_summary_table(results, providers):
     sep = f"|{'-' * (cfg_w + 2)}|" + "".join(f"{'-' * (col_w + 2)}|" for _ in providers)
 
     print(f"\n{'=' * len(sep)}")
-    print(f"Summary (TFLOPS)   M={M} N={N}  fp16")
+    print(f"Summary (TFLOPS)   fp16")
     print(f"{'=' * len(sep)}")
     print(hdr)
     print(sep)
@@ -519,40 +519,43 @@ def print_summary_table(results, providers):
 def run_benchmark(args):
     results = {}
 
-    for K in args.K:
-        torch.manual_seed(0)
-        a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
-        b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
-        bias = torch.randn(N, device=DEVICE, dtype=torch.float16)
-        y = torch.randn(M, N, device=DEVICE, dtype=torch.float16)
+    for M in args.M:
+        for N in args.N:
+            for K in args.K:
+                torch.manual_seed(0)
+                a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
+                b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
+                bias = torch.randn(N, device=DEVICE, dtype=torch.float16)
+                y = torch.randn(M, N, device=DEVICE, dtype=torch.float16)
 
-        total_flops = 2.0 * M * N * K
-        ref = pytorch_baseline(bias, a, b, y)
+                total_flops = 2.0 * M * N * K
+                ref = pytorch_baseline(bias, a, b, y)
 
-        results[K] = {}
+                key = (M, N, K)
+                results[key] = {}
 
-        # PyTorch reference: naive matmul + add, then GLU
-        pt_lambda = lambda: pytorch_baseline(bias, a, b, y)
-        ms = triton.testing.do_bench(pt_lambda, warmup=25, rep=100)
-        results[K]["PyTorch_naive"] = {"ms": ms, "tflops": total_flops / ms * 1e-9}
+                # PyTorch reference: naive matmul + add, then GLU
+                pt_lambda = lambda: pytorch_baseline(bias, a, b, y)
+                ms = triton.testing.do_bench(pt_lambda, warmup=25, rep=100)
+                results[key]["PyTorch_naive"] = {"ms": ms, "tflops": total_flops / ms * 1e-9}
 
-        # Selected TLX kernels (verified against PyTorch reference)
-        for kernel_name in args.kernel:
-            kernel_fn = get_kernel(kernel_name)
-            try:
-                k_lambda = lambda fn=kernel_fn: fn(a, b, bias, y)
-                out = k_lambda()
-                assert verify("", out, ref, log=False)
-            except Exception as e:
-                print(f"  {kernel_name:20s} K={K:5d} -> SKIPPED ({e})")
-                continue
-            ms = triton.testing.do_bench(k_lambda, warmup=25, rep=100)
-            results[K][kernel_name] = {"ms": ms, "tflops": total_flops / ms * 1e-9}
+                # Selected TLX kernels (verified against PyTorch reference)
+                for kernel_name in args.kernel:
+                    kernel_fn = get_kernel(kernel_name)
+                    try:
+                        k_lambda = lambda fn=kernel_fn: fn(a, b, bias, y)
+                        out = k_lambda()
+                        assert verify("", out, ref, log=False)
+                    except Exception as e:
+                        print(f"  {kernel_name:20s} M={M:5d} N={N:5d} K={K:5d} -> SKIPPED ({e})")
+                        continue
+                    ms = triton.testing.do_bench(k_lambda, warmup=25, rep=100)
+                    results[key][kernel_name] = {"ms": ms, "tflops": total_flops / ms * 1e-9}
 
-        # ROCBLAS reference: pure matmul (no add/GLU)
-        rb_lambda = lambda: torch.matmul(a, b)
-        ms = triton.testing.do_bench(rb_lambda, warmup=25, rep=100)
-        results[K]["ROCBLAS (matmul only)"] = {"ms": ms, "tflops": total_flops / ms * 1e-9}
+                # ROCBLAS reference: pure matmul (no add/GLU)
+                rb_lambda = lambda: torch.matmul(a, b)
+                ms = triton.testing.do_bench(rb_lambda, warmup=25, rep=100)
+                results[key]["ROCBLAS (matmul only)"] = {"ms": ms, "tflops": total_flops / ms * 1e-9}
 
     providers = ["PyTorch_naive"] + list(args.kernel) + ["ROCBLAS (matmul only)"]
     print_summary_table(results, providers)
@@ -562,6 +565,10 @@ def parse_args():
     k_choices = sorted(BEST_CONFIG)
     kernel_choices = list(KERNEL_REGISTRY)
     p = argparse.ArgumentParser(prog="AMD TLX Addmm+GLU")
+    p.add_argument("-M", type=int, nargs="+", default=[M],
+                   help="M (rows of A / output) sizes to benchmark")
+    p.add_argument("-N", type=int, nargs="+", default=[N],
+                   help="N (cols of B / output) sizes to benchmark")
     p.add_argument("-K", type=int, nargs="+", default=k_choices, choices=k_choices,
                    help="K (contraction) sizes to benchmark; only stored-config sizes are supported")
     p.add_argument("--kernel", type=str, nargs="+", default=kernel_choices,
