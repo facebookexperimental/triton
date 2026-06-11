@@ -951,7 +951,7 @@ def parse_args():
     p.add_argument("-causal", type=str, nargs="+", default=["false"],
                    help="Causal modes to benchmark (e.g. -causal true false)")
     p.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16"])
-    p.add_argument("--kernel", type=str, nargs="+", default=["async_simple", "async_prefetch"],
+    p.add_argument("--kernel", type=str, nargs="+", default=["async_simple", "async_prefetch", "persistent"],
                    help="Kernel variants to benchmark")
     return p.parse_args()
 
