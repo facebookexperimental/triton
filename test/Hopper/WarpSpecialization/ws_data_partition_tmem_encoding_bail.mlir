@@ -3,9 +3,9 @@
 // CHECK: warning: skipping M-dimension data partitioning because slicing TMEM result from 128 to 64 rows would require updating tensor memory encoding blockM=128
 // CHECK-LABEL: @tmem_m_slice_requires_encoding_update
 // CHECK: scf.for
-// CHECK-NOT: tt.warp_specialize
 // CHECK: ttng.tc_gen5_mma
 // CHECK-SAME: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+// CHECK: } {tt.data_partition_factor = 2 : i32, tt.warp_specialize}
 // CHECK-NOT: !ttg.memdesc<64x128xf32, #tmem, #ttng.tensor_memory, mutable>
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>

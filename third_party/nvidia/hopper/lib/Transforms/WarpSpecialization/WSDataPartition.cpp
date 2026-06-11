@@ -1739,10 +1739,7 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
   }
   if (partitionScheme.ops.empty()) {
     if (partitionScheme.skipPartitioning) {
-      LDBG("skipping warp specialization");
-      funcOp->walk([](scf::ForOp forOp) {
-        forOp->removeAttr(triton::kWarpSpecializeAttrName);
-      });
+      LDBG("skipping data partitioning due to incompatible TMEM encoding");
     } else {
       LDBG("skipping data partitioning");
     }

@@ -70,8 +70,8 @@ Drives partitioning from dot/MMA ops:
    when partitioning along M. For example, splitting a `128x128` TMEM
    allocation with `blockM=128` into two `64x128` slices is rejected before any
    data partitioning rewrite; splitting `256x128` into `128x128` slices remains
-   valid. When this guard fires, warp specialization is disabled for the
-   function so later scheduling passes do not try to consume an unsliced loop.
+   valid. When this guard fires, data partitioning is skipped and the function
+   is otherwise left unchanged.
 
 ### Step 3: Slice Propagation (`getSliceToPartition`)
 
