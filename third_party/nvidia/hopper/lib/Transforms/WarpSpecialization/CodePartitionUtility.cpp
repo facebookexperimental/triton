@@ -2880,12 +2880,6 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
     }
     if (producerTaskId == -1)
       return;
-  } else if (producerTaskIds.empty()) {
-    // The producer op was never assigned to a partition, so there is no task to
-    // anchor a cross-partition channel on. Skip creating a channel for this
-    // allocation (consistent with the !producerOp / producerTaskId == -1 cases
-    // above).
-    return;
   } else {
     assert(producerTaskIds.size() == 1);
     producerTaskId = producerTaskIds.front();

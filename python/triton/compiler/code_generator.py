@@ -1241,23 +1241,11 @@ class CodeGenerator(ast.NodeVisitor):
         return [self.visit(dim) for dim in node.dims]
 
     def visit_For(self, node):
-        if isinstance(node.iter, ast.Call):
-            IteratorClass = self.visit(node.iter.func)
-            iter_args = [self.visit(arg) for arg in node.iter.args]
-            iter_kwargs = dict(self.visit(keyword) for keyword in node.iter.keywords)
-            iterator = None
-        else:
-            # The loop iterable is not a direct call but an expression that
-            # evaluates to an iterator object, e.g. a variable bound to a
-            # `tl.range(...)` created earlier (such as a range selected inside an
-            # `if`/`else`). Evaluate it and recover the iterator class.
-            iterator = self.visit(node.iter)
-            IteratorClass = type(iterator)
-            iter_args = None
-            iter_kwargs = None
+        IteratorClass = self.visit(node.iter.func)
+        iter_args = [self.visit(arg) for arg in node.iter.args]
+        iter_kwargs = dict(self.visit(keyword) for keyword in node.iter.keywords)
         if IteratorClass == language.static_range:
-            if iterator is None:
-                iterator = IteratorClass(*iter_args, **iter_kwargs)
+            iterator = IteratorClass(*iter_args, **iter_kwargs)
             static_range = range(iterator.start.value, iterator.end.value, iterator.step.value)
             for i in static_range:
                 self.lscope[node.target.id] = constexpr(i)
@@ -1282,8 +1270,7 @@ class CodeGenerator(ast.NodeVisitor):
         multi_cta = False
         disable_licm = False
         if IteratorClass is language.range:
-            if iterator is None:
-                iterator = IteratorClass(*iter_args, **iter_kwargs)
+            iterator = IteratorClass(*iter_args, **iter_kwargs)
             # visit iterator arguments
             # note: only `range` iterator is supported now
             # collect lower bound (lb), upper bound (ub), and step
@@ -1310,15 +1297,9 @@ class CodeGenerator(ast.NodeVisitor):
             # visit iterator arguments
             # note: only `range` iterator is supported now
             # collect lower bound (lb), upper bound (ub), and step
-            if iter_args is not None:
-                lb = iter_args[0] if len(iter_args) > 1 else self.visit(ast.Constant(0))
-                ub = iter_args[1] if len(iter_args) > 1 else self.visit(node.iter.args[0])
-                step = iter_args[2] if len(iter_args) > 2 else self.visit(ast.Constant(1))
-            else:
-                # builtin `range` object bound to a variable
-                lb = self.visit(ast.Constant(iterator.start))
-                ub = self.visit(ast.Constant(iterator.stop))
-                step = self.visit(ast.Constant(iterator.step))
+            lb = iter_args[0] if len(iter_args) > 1 else self.visit(ast.Constant(0))
+            ub = iter_args[1] if len(iter_args) > 1 else self.visit(node.iter.args[0])
+            step = iter_args[2] if len(iter_args) > 2 else self.visit(ast.Constant(1))
         else:
             raise RuntimeError("Only `range` and `static_range` iterators are currently supported")
         # handle negative constant step (not supported by scf.for in MLIR)
