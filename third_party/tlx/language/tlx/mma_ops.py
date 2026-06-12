@@ -65,6 +65,21 @@ def require_tmem_scales_layout(src: tlx.buffered_tensor, _builder=None):
 
 
 @tl.builtin
+def require_amd_wmma_layout(src, version: tl.constexpr = 3, transposed: tl.constexpr = True,
+                            warp_bases: tl.constexpr = ((0, 2), (2, 0)), reg_bases: tl.constexpr = ((0, 1), (1, 0)),
+                            instr_shape: tl.constexpr = (16, 16, 128), _semantic=None):
+    """Require an AMD WMMA register layout for a tensor value."""
+    warp_bases = [list(row) for row in tl._unwrap_if_constexpr(warp_bases)]
+    reg_bases = [list(row) for row in tl._unwrap_if_constexpr(reg_bases)]
+    instr_shape = list(tl._unwrap_if_constexpr(instr_shape))
+    rank = len(src.shape)
+    layout_handle = _semantic.builder.make_amd_wmma_encoding_attr(version, transposed, warp_bases, reg_bases,
+                                                                  instr_shape, rank)
+    handle = _semantic.builder.create_require_layout(src.handle, layout_handle)
+    return tl.tensor(handle, src.type)
+
+
+@tl.builtin
 def dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None, fast_math=False, lhs_k_pack=True,
                rhs_k_pack=True, out_dtype=tl.float32, tiles_per_warp: tl.constexpr = None, _semantic=None):
     """Wrapper around tl.dot_scaled that optionally pins the AMD WMMA tiles-per-warp schedule.
