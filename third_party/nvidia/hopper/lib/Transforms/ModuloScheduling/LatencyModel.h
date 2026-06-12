@@ -57,6 +57,13 @@ struct OpLatencyInfo {
   int latency{0};
   int selfLatency{0};
   int minWarps{1};
+  // Cycles this op holds its hardware pipeline (for ResMII / reservation table).
+  // Distinct from `latency` for async TMA *loads*: the TMA engine is
+  // multi-outstanding, so a load occupies the engine only ~bytes/bandwidth, not
+  // its full round-trip latency (validated on B200, see latency_model study).
+  // TMA stores are bandwidth-bound (occupancy ≈ latency); TC = latency;
+  // CUDA/SFU = selfLatency. 0 means "unset" (fall back to the old rule).
+  int occupancy{0};
 };
 
 /// Hardware latency model for Blackwell SM100.
