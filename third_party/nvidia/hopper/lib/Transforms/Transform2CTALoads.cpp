@@ -145,6 +145,7 @@ static FailureOr<BLoadTrace> traceToDescriptorLoad(Value bMemDesc) {
 
 struct Transform2CTALoads
     : public impl::NVGPU2CTATransformLoadsBase<Transform2CTALoads> {
+  DenseMap<Value, tt::TensorDescType> originalDescTypes;
 
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
@@ -155,6 +156,12 @@ struct Transform2CTALoads
     // TLX kernels manage their own 2-CTA load splitting and synchronization.
     if (moduleOp->hasAttr("tlx.has_tlx_ops"))
       return;
+
+    originalDescTypes.clear();
+    moduleOp.walk([&](tt::DescriptorLoadOp descLoad) {
+      auto descType = cast<tt::TensorDescType>(descLoad.getDesc().getType());
+      originalDescTypes.try_emplace(descLoad.getDesc(), descType);
+    });
 
     // Collect 2-CTA MMA ops.
     SmallVector<ttng::TCGen5MMAOp> twoCTAMMAOps;
@@ -187,7 +194,9 @@ struct Transform2CTALoads
     unsigned splitDim = trace->splitDim;
 
     // Get block shape from the descriptor's type.
-    auto descType = cast<tt::TensorDescType>(descLoad.getDesc().getType());
+    auto descType = originalDescTypes.lookup(descLoad.getDesc());
+    if (!descType)
+      descType = cast<tt::TensorDescType>(descLoad.getDesc().getType());
     auto blockShape = descType.getBlockType().getShape();
     assert(blockShape.size() == 2 && "Expected 2D block shape");
     SmallVector<int64_t> newBlockShape(blockShape.begin(), blockShape.end());

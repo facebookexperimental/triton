@@ -471,14 +471,23 @@ buck2 run @fbcode//mode/opt -m ovr_config//triton:beta \
    instructions in a kernel to use the same `cta_group`. FA with selective 2-CTA
    on only some dots is impossible; a kernel must use 2-CTA on all dots or none.
 
-6. **Host-side TMA descriptor shape is updated through IR type metadata**:
+6. **Dependent 2-CTA MMA chains are rejected**: The current implementation
+   supports multiple independent 2-CTA MMAs in one loop, including Auto-WS data
+   partitioning. It does not yet support FA-style chains where one 2-CTA MMA
+   consumes a TMEM value derived from an earlier 2-CTA MMA result. The async
+   `tcgen05.mma` producer needs an explicit ordering contract before the
+   dependent consumer MMA can safely read that value. `CheckMatmulTwoCTAs`
+   rejects this pattern in the legality pass. `Transform2CTALoads` remains a
+   mechanical B-load split for already-legal 2-CTA MMAs.
+
+7. **Host-side TMA descriptor shape is updated through IR type metadata**:
    `Transform2CTALoads` supports host-side TMA by updating the function argument's
    `TensorDescType` to half-width block shape. The runtime reads that final IR
    type via `getTensorDescMetadata()` and creates the `CuTensorMap` accordingly.
    The `cta_group::2` mode is carried by the PTX instruction qualifier, not a
    separate descriptor-side flag.
 
-7. **Pointer-store epilogues are not recognized by Meta WS partitioning**:
+8. **Pointer-store epilogues are not recognized by Meta WS partitioning**:
    WS + 2-CTA test kernels must use descriptor/TMA stores for the output. Pointer
    stores do not currently create the expected epilogue partition.
 
