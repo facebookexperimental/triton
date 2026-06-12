@@ -591,3 +591,227 @@ def test_dump_best_config_ir(device, tmp_path):
         knobs.autotuning.dump_best_config_ir = original_dump_best
         knobs.compilation.dump_ir = original_dump_ir
         knobs.cache.dump_dir = original_dump_dir
+
+
+def test_runtime_error_during_bench(device):
+    """Autotuner skips configs that raise RuntimeError (e.g. cudaErrorMisalignedAddress)."""
+    N = 1024
+    src = torch.randn(N, device=device)
+    dst = torch.empty(N, device=device)
+
+    configs = [triton.Config(kwargs={'BLOCK_SIZE': 32}), triton.Config(kwargs={'BLOCK_SIZE': 64})]
+
+    bench_calls = {"n": 0}
+
+    def failing_do_bench(kernel_call, quantiles):
+        bench_calls["n"] += 1
+        if bench_calls["n"] == 1:
+            raise RuntimeError("CUDA error: misaligned address")
+        return triton.testing.do_bench(kernel_call, quantiles=quantiles, warmup=1, rep=1)
+
+    @triton.autotune(configs=configs, key=['N'], do_bench=failing_do_bench)
+    @triton.jit
+    def _kernel(dst, src, N, BLOCK_SIZE: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        x = tl.load(src + offsets, mask=offsets < N)
+        tl.store(dst + offsets, x, mask=offsets < N)
+
+    grid = lambda META: (triton.cdiv(N, META['BLOCK_SIZE']), )
+    _kernel[grid](dst, src, N=N)
+
+    # Both configs were attempted; first failed, second succeeded
+    assert bench_calls["n"] == 2
+
+
+class TestNpotBlockSizes:
+
+    def test_returns_empty_when_npot_disabled(self, monkeypatch):
+        from triton import knobs
+        monkeypatch.setattr(knobs.language, "allow_npot", False)
+        assert triton.npot_block_sizes(32, 256) == []
+
+    def test_returns_npot_multiples(self, monkeypatch):
+        from triton import knobs
+        monkeypatch.setattr(knobs.language, "allow_npot", True)
+        result = triton.npot_block_sizes(32, 256)
+        # Should include multiples of 32 that are NOT powers of 2
+        assert 96 in result
+        assert 160 in result
+        assert 192 in result
+        assert 224 in result
+        # Should NOT include powers of 2
+        assert 32 not in result
+        assert 64 not in result
+        assert 128 not in result
+        assert 256 not in result
+
+    def test_custom_base_multiple(self, monkeypatch):
+        from triton import knobs
+        monkeypatch.setattr(knobs.language, "allow_npot", True)
+        result = triton.npot_block_sizes(64, 256, base_multiple=64)
+        assert 192 in result
+        assert 64 not in result
+        assert 128 not in result
+        assert 256 not in result
+
+    def test_sorted_output(self, monkeypatch):
+        from triton import knobs
+        monkeypatch.setattr(knobs.language, "allow_npot", True)
+        result = triton.npot_block_sizes(32, 512)
+        assert result == sorted(result)
+
+
+class TestExpandConfigsNpot:
+
+    def test_returns_original_when_npot_disabled(self, monkeypatch):
+        from triton import knobs
+        monkeypatch.setattr(knobs.language, "allow_npot", False)
+        configs = [triton.Config(kwargs={'BLOCK_SIZE': 128})]
+        assert triton.expand_configs_npot(configs) is configs
+
+    def test_expands_npot_with_pow2_variant(self, monkeypatch):
+        from triton import knobs
+        monkeypatch.setattr(knobs.language, "allow_npot", True)
+        configs = [triton.Config(kwargs={'BLOCK_SIZE': 96})]
+        expanded = triton.expand_configs_npot(configs)
+        assert len(expanded) == 2
+        sizes = [c.kwargs['BLOCK_SIZE'] for c in expanded]
+        assert 96 in sizes  # original preserved
+        assert 128 in sizes  # next_power_of_2(96)
+
+    def test_no_expansion_for_pow2_configs(self, monkeypatch):
+        from triton import knobs
+        monkeypatch.setattr(knobs.language, "allow_npot", True)
+        configs = [triton.Config(kwargs={'BLOCK_SIZE': 128})]
+        expanded = triton.expand_configs_npot(configs)
+        assert len(expanded) == 1
+
+    def test_deduplication(self, monkeypatch):
+        from triton import knobs
+        monkeypatch.setattr(knobs.language, "allow_npot", True)
+        configs = [
+            triton.Config(kwargs={'BLOCK_SIZE': 96}),
+            triton.Config(kwargs={'BLOCK_SIZE': 96}),
+        ]
+        expanded = triton.expand_configs_npot(configs)
+        count_128 = sum(1 for c in expanded if c.kwargs['BLOCK_SIZE'] == 128)
+        assert count_128 == 1
+
+    def test_skips_non_integer_values(self, monkeypatch):
+        from triton import knobs
+        monkeypatch.setattr(knobs.language, "allow_npot", True)
+        configs = [triton.Config(kwargs={'BLOCK_MODE': 'auto'})]
+        expanded = triton.expand_configs_npot(configs)
+        assert len(expanded) == 1
+
+    def test_expands_one_key_at_a_time(self, monkeypatch):
+        from triton import knobs
+        monkeypatch.setattr(knobs.language, "allow_npot", True)
+        configs = [triton.Config(kwargs={'BLOCK_M': 96, 'BLOCK_N': 160})]
+        expanded = triton.expand_configs_npot(configs)
+        # Each expanded config should differ in only one key from original
+        for c in expanded[1:]:
+            diffs = sum(1 for k in ['BLOCK_M', 'BLOCK_N'] if c.kwargs[k] != configs[0].kwargs[k])
+            assert diffs == 1
+
+
+class TestGenerateNpotCandidates:
+
+    def test_returns_original_when_npot_disabled(self, monkeypatch):
+        from triton import knobs
+        monkeypatch.setattr(knobs.language, "allow_npot", False)
+        configs = [triton.Config(kwargs={'BLOCK_M': 128, 'BLOCK_N': 128})]
+        assert triton.generate_npot_candidates(configs) is configs
+
+    def test_generates_npot_block_m_candidates(self, monkeypatch):
+        from triton import knobs
+        monkeypatch.setattr(knobs.language, "allow_npot", True)
+        configs = [triton.Config(kwargs={'BLOCK_M': 128, 'BLOCK_N': 128})]
+        expanded = triton.generate_npot_candidates(configs)
+        block_m_values = {c.kwargs['BLOCK_M'] for c in expanded}
+        # Should include NPOT neighbours of 128 in [64, 256]
+        assert 96 in block_m_values
+        assert 160 in block_m_values
+        assert 192 in block_m_values
+        # Original preserved
+        assert 128 in block_m_values
+
+    def test_generates_npot_block_n_candidates(self, monkeypatch):
+        from triton import knobs
+        monkeypatch.setattr(knobs.language, "allow_npot", True)
+        configs = [triton.Config(kwargs={'BLOCK_M': 128, 'BLOCK_N': 128})]
+        expanded = triton.generate_npot_candidates(configs)
+        block_n_values = {c.kwargs['BLOCK_N'] for c in expanded}
+        # Should include NPOT neighbours of 128 in [64, 256]
+        assert 96 in block_n_values
+        assert 160 in block_n_values
+        assert 192 in block_n_values
+        # Original preserved
+        assert 128 in block_n_values
+
+    def test_no_candidates_outside_range(self, monkeypatch):
+        from triton import knobs
+        monkeypatch.setattr(knobs.language, "allow_npot", True)
+        # BLOCK_M=64 -> range [32, 128], should not include 144, 160, etc.
+        configs = [triton.Config(kwargs={'BLOCK_M': 64, 'BLOCK_N': 64})]
+        expanded = triton.generate_npot_candidates(configs)
+        block_m_values = {c.kwargs['BLOCK_M'] for c in expanded}
+        assert 48 in block_m_values  # 48 is in [32, 128]
+        assert 80 in block_m_values  # 80 is in [32, 128]
+        assert 96 in block_m_values  # 96 is in [32, 128]
+        assert 112 in block_m_values  # 112 is in [32, 128]
+        assert 144 not in block_m_values  # 144 > 128, out of range
+
+    def test_preserves_original_configs(self, monkeypatch):
+        from triton import knobs
+        monkeypatch.setattr(knobs.language, "allow_npot", True)
+        configs = [triton.Config(kwargs={'BLOCK_M': 128, 'BLOCK_N': 256})]
+        expanded = triton.generate_npot_candidates(configs)
+        # Original config is always first
+        assert expanded[0].kwargs['BLOCK_M'] == 128
+        assert expanded[0].kwargs['BLOCK_N'] == 256
+
+    def test_deduplication(self, monkeypatch):
+        from triton import knobs
+        monkeypatch.setattr(knobs.language, "allow_npot", True)
+        # Two identical configs should not produce duplicate NPOT variants
+        configs = [
+            triton.Config(kwargs={'BLOCK_M': 128, 'BLOCK_N': 128}),
+            triton.Config(kwargs={'BLOCK_M': 128, 'BLOCK_N': 128}),
+        ]
+        expanded = triton.generate_npot_candidates(configs)
+        # Count configs with BLOCK_M=96, BLOCK_N=128
+        count = sum(1 for c in expanded if c.kwargs['BLOCK_M'] == 96 and c.kwargs['BLOCK_N'] == 128)
+        assert count == 1
+
+    def test_varies_one_dim_at_a_time(self, monkeypatch):
+        from triton import knobs
+        monkeypatch.setattr(knobs.language, "allow_npot", True)
+        configs = [triton.Config(kwargs={'BLOCK_M': 128, 'BLOCK_N': 128})]
+        expanded = triton.generate_npot_candidates(configs)
+        # Each generated config should differ from the original in exactly one key
+        for c in expanded[1:]:
+            diffs = sum(1 for k in ['BLOCK_M', 'BLOCK_N'] if c.kwargs[k] != configs[0].kwargs[k])
+            assert diffs == 1
+
+    def test_ignores_non_block_mn_keys(self, monkeypatch):
+        from triton import knobs
+        monkeypatch.setattr(knobs.language, "allow_npot", True)
+        configs = [triton.Config(kwargs={'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64})]
+        expanded = triton.generate_npot_candidates(configs)
+        # BLOCK_K should not be varied by generate_npot_candidates (it only does M and N)
+        block_k_values = {c.kwargs['BLOCK_K'] for c in expanded}
+        assert block_k_values == {64}
+
+    def test_custom_dim_candidates(self, monkeypatch):
+        from triton import knobs
+        monkeypatch.setattr(knobs.language, "allow_npot", True)
+        custom = {'BLOCK_M': [48, 96], 'BLOCK_N': [80, 160]}
+        configs = [triton.Config(kwargs={'BLOCK_M': 64, 'BLOCK_N': 128})]
+        expanded = triton.generate_npot_candidates(configs, dim_candidates=custom)
+        block_m_values = {c.kwargs['BLOCK_M'] for c in expanded}
+        block_n_values = {c.kwargs['BLOCK_N'] for c in expanded}
+        assert 48 in block_m_values  # 48 in [32, 128]
+        assert 96 in block_m_values  # 96 in [32, 128]
+        assert 80 in block_n_values  # 80 in [64, 256]
+        assert 160 in block_n_values  # 160 in [64, 256]

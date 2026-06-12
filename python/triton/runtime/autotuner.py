@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import copy
 import math
 import time
 import inspect
@@ -455,6 +456,12 @@ class Autotuner(KernelInterface):
             if verbose:
                 print(f"Autotuning failed with {e}")
             return [float("inf"), float("inf"), float("inf")]
+        except RuntimeError as e:
+            if "CUDA" in str(e) or "misaligned" in str(e) or "out of memory" in str(e):
+                if verbose:
+                    print(f"Autotuning failed with CUDA error: {e}")
+                return [float("inf"), float("inf"), float("inf")]
+            raise
 
     def check_disk_cache(self, tuning_key, configs, bench_fn):
         # We can't serialize prehooks, so just give up and run the benchmarks.
@@ -895,6 +902,10 @@ class Config:
         self.early_tma_store_lowering = early_tma_store_lowering
         self.generate_subtiled_region = generate_subtiled_region
         self.preferred_ctas_per_cga = preferred_ctas_per_cga
+        self.num_buffers_warp_spec = num_buffers_warp_spec
+        self.num_consumer_groups = num_consumer_groups
+        self.reg_dec_producer = reg_dec_producer
+        self.reg_inc_consumer = reg_inc_consumer
 
     def __setstate__(self, state):
         self.kwargs = state.get("kwargs", {})
@@ -911,6 +922,10 @@ class Config:
         self.early_tma_store_lowering = state.get("early_tma_store_lowering", None)
         self.generate_subtiled_region = state.get("generate_subtiled_region", None)
         self.preferred_ctas_per_cga = state.get("preferred_ctas_per_cga", None)
+        self.num_buffers_warp_spec = state.get("num_buffers_warp_spec", 0)
+        self.num_consumer_groups = state.get("num_consumer_groups", 0)
+        self.reg_dec_producer = state.get("reg_dec_producer", 0)
+        self.reg_inc_consumer = state.get("reg_inc_consumer", 0)
 
     def all_kwargs(self):
         return {
@@ -967,7 +982,7 @@ class Config:
 
 
 def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_value=None, pre_hook=None, post_hook=None,
-             warmup=None, rep=None, use_cuda_graph=False, do_bench=None, cache_results=False):
+             warmup=None, rep=None, use_cuda_graph=False, do_bench=None, cache_results=False, include_npot=False):
     """
     Decorator for auto-tuning a :code:`triton.jit`'d function.
 
@@ -1025,14 +1040,142 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
     :type do_bench: lambda fn, quantiles
     :param cache_results: whether to cache autotune timings to disk.  Defaults to False.
     "type cache_results: bool
+    :param include_npot: when True and TRITON_ALLOW_NPOT=1, (a) for configs with NPOT block sizes, auto-add pow2-padded variants for A/B comparison, and (b) generate NPOT BLOCK_M/BLOCK_N candidates from existing pow2 configs.
+    :type include_npot: bool
     """
 
     def decorator(fn):
-        return Autotuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
+        effective_configs = configs
+        if include_npot and knobs.language.allow_npot:
+            effective_configs = expand_configs_npot(configs)
+            effective_configs = generate_npot_candidates(effective_configs)
+        return Autotuner(fn, fn.arg_names, effective_configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
                          post_hook=post_hook, prune_configs_by=prune_configs_by, warmup=warmup, rep=rep,
                          use_cuda_graph=use_cuda_graph, do_bench=do_bench, cache_results=cache_results)
 
     return decorator
+
+
+def _is_pow2(x):
+    return x > 0 and (x & (x - 1)) == 0
+
+
+def _next_pow2(n):
+    if n <= 1:
+        return 1
+    n -= 1
+    n |= n >> 1
+    n |= n >> 2
+    n |= n >> 4
+    n |= n >> 8
+    n |= n >> 16
+    n |= n >> 32
+    n += 1
+    return n
+
+
+def npot_block_sizes(min_val, max_val, base_multiple=32):
+    """Return non-power-of-2 block sizes that are multiples of base_multiple."""
+    if not knobs.language.allow_npot:
+        return []
+
+    sizes = []
+    v = ((min_val + base_multiple - 1) // base_multiple) * base_multiple
+    while v <= max_val:
+        if not _is_pow2(v):
+            sizes.append(v)
+        v += base_multiple
+    return sizes
+
+
+def _clone_config(config, **kwargs_override):
+    """Clone a Config, optionally overriding kwargs entries.
+
+    Uses ``copy.copy`` so every Config field is carried over automatically and
+    this stays correct if Config gains new fields (a hand-listed copy would
+    silently drop them). ``kwargs`` is reassigned to a fresh merged dict so the
+    source config's kwargs dict is never shared or mutated.
+    """
+    new_config = copy.copy(config)
+    new_config.kwargs = {**config.kwargs, **kwargs_override}
+    return new_config
+
+
+def expand_configs_npot(configs, block_size_keys=None):
+    """For configs with NPOT block sizes, add pow2-padded variants for A/B comparison."""
+    if not knobs.language.allow_npot:
+        return configs
+
+    expanded = list(configs)
+    seen = set(id(c) for c in expanded)
+    for config in configs:
+        keys = block_size_keys or [k for k in config.kwargs if 'BLOCK' in k.upper()]
+        for key in keys:
+            val = config.kwargs.get(key)
+            if val is None or not isinstance(val, int):
+                continue
+            if _is_pow2(val):
+                continue
+            pow2_val = _next_pow2(val)
+            new_config = _clone_config(config, **{key: pow2_val})
+            if new_config not in expanded:
+                expanded.append(new_config)
+    return expanded
+
+
+# NPOT tile candidates for BLOCK_M and BLOCK_N.
+# BLOCK_M: multiples of 16 (MMA M tile granularity).
+# BLOCK_N: multiples of 16 (the candidate list below is all multiples of 16;
+#   WGMMA's N tile is finer-grained (8) but we only enumerate 16-aligned NPOT
+#   tiles here to keep the autotune search space small).
+# Only non-power-of-2 values in the useful range for matmul tiles.
+_NPOT_BLOCK_M_CANDIDATES = [48, 80, 96, 112, 144, 160, 176, 192, 208, 224, 240]
+_NPOT_BLOCK_N_CANDIDATES = [48, 80, 96, 112, 144, 160, 176, 192, 208, 224, 240]
+
+# Map from key-name pattern to the NPOT candidate set for that dimension.
+_NPOT_DIM_CANDIDATES = {
+    'BLOCK_M': _NPOT_BLOCK_M_CANDIDATES,
+    'BLOCK_N': _NPOT_BLOCK_N_CANDIDATES,
+}
+
+
+def generate_npot_candidates(configs, dim_candidates=None):
+    """Generate NPOT BLOCK_M/BLOCK_N variants from existing pow2 configs.
+
+    For each input config, for each BLOCK_M / BLOCK_N key whose value is a
+    power of 2, generate new configs that substitute nearby NPOT candidates
+    (one dimension at a time).  The original configs are always preserved.
+
+    :param configs: list of Config objects (typically pow2-only).
+    :param dim_candidates: optional dict mapping kwarg name to list of NPOT
+        candidate sizes.  Defaults to ``_NPOT_DIM_CANDIDATES``.
+    :return: list of configs (originals + generated NPOT variants).
+    """
+    if not knobs.language.allow_npot:
+        return configs
+
+    candidates = dim_candidates if dim_candidates is not None else _NPOT_DIM_CANDIDATES
+    expanded = list(configs)
+
+    for config in configs:
+        for key, npot_sizes in candidates.items():
+            val = config.kwargs.get(key)
+            if val is None or not isinstance(val, int):
+                continue
+            # Only emit NPOT candidates that are near neighbours of the tuned
+            # pow2 value (within [val//2, val*2]). This keeps the autotune search
+            # space bounded: a config tuned to BLOCK=128 explores 96/192 but not
+            # distant sizes like 48 or 240 that a different pow2 base would cover.
+            lo = val // 2
+            hi = val * 2
+            for npot_val in npot_sizes:
+                if npot_val < lo or npot_val > hi:
+                    continue
+                new_config = _clone_config(config, **{key: npot_val})
+                if new_config not in expanded:
+                    expanded.append(new_config)
+
+    return expanded
 
 
 class Heuristics(KernelInterface):
