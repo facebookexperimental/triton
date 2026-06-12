@@ -79,7 +79,10 @@ kernel_configs_multi_cta = [
         },
         num_warps=nw,
         ctas_per_cga=(1, ctas, 1),
-    ) for m in [1, 2] for nw in [4, 8, 16, 32] for ctas in [2, 4, 8]
+    )
+    for m in [1, 2]
+    for nw in [4, 8, 16, 32]
+    for ctas in [2, 4, 8]
 ]
 
 
@@ -149,8 +152,9 @@ def kernel_layernorm_multi_cta(
 
     # alloc barriers for synchronizing remote stores
     barriers = tlx.alloc_barriers(num_barriers=2)
-    cross_cta_reduction_expected_bytes: tl.constexpr = (BLOCK_SIZE_M * tlx.size_of(COMPUTE_DTYPE) *
-                                                        (num_reduction_ctas - 1))
+    cross_cta_reduction_expected_bytes: tl.constexpr = (
+        BLOCK_SIZE_M * tlx.size_of(COMPUTE_DTYPE) * (num_reduction_ctas - 1)
+    )
     tlx.barrier_expect_bytes(
         barriers[0],
         size=cross_cta_reduction_expected_bytes,
@@ -226,10 +230,10 @@ def kernel_layernorm_multi_cta(
     )
     var = multi_cta_sum_x_minus_mean_sq / N
     rstd = libdevice.rsqrt(var + eps)
-    mean_1d = tl.reshape(mean, (BLOCK_SIZE_M, ))
+    mean_1d = tl.reshape(mean, (BLOCK_SIZE_M,))
     tl.store(Mean_out + row_offsets, mean_1d, mask=mask_row)
 
-    rstd_1d = tl.reshape(rstd, (BLOCK_SIZE_M, ))
+    rstd_1d = tl.reshape(rstd, (BLOCK_SIZE_M,))
 
     w = tl.load(w_ptrs, mask=mask_col).to(COMPUTE_DTYPE)
     b = tl.load(b_ptrs, mask=mask_col).to(COMPUTE_DTYPE)
@@ -243,6 +247,33 @@ def kernel_layernorm_multi_cta(
     tl.store(y_ptrs, y, mask=read_write_mask)
 
 
+# Below this feature width (N), the kernel is latency/overhead-bound and the
+# persistent + warp-specialized (2-WG) variant in
+# `blackwell-multi-cta-layernorm-ws_test.py` is faster: ~1.18-1.26x on B200
+# (fp16) at large M (>= 4096 rows), and ~parity at small M (the persistent loop
+# is too short to overlap there) -- so routing on N alone never regresses. At
+# larger N the problem becomes bandwidth-bound and persistence's reduced
+# concurrency makes WS slower, so we stay on this kernel.
+_WS_NARROW_N_THRESHOLD = 16384
+_ws_module = None
+
+
+def _get_ws_module():
+    """Lazily import the WS fast-path module (filename has hyphens)."""
+    global _ws_module
+    if _ws_module is None:
+        import importlib.util
+        import os
+
+        path = os.path.join(
+            os.path.dirname(__file__), "blackwell-multi-cta-layernorm-ws_test.py"
+        )
+        spec = importlib.util.spec_from_file_location("mcta_layernorm_ws", path)
+        _ws_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_ws_module)
+    return _ws_module
+
+
 def multi_cta_layernorm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -251,6 +282,10 @@ def multi_cta_layernorm(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     TLX Multi-CTA Layer Normalization Forward Pass.
+
+    For narrow feature dimensions (N <= _WS_NARROW_N_THRESHOLD) this dispatches
+    to the persistent + warp-specialized (2-WG) fast path; otherwise it uses the
+    one-cluster-per-row-block kernel below. See _WS_NARROW_N_THRESHOLD.
 
     Args:
         x: Input tensor of shape [*, N] where * is any number of leading dimensions
@@ -263,6 +298,10 @@ def multi_cta_layernorm(
         mean: Mean tensor of shape [M] where M is the product of leading dimensions
         rstd: Reciprocal standard deviation of shape [M]
     """
+    # Narrow-N fast path: persistent + warp-specialized 2-WG kernel.
+    if x.shape[-1] <= _WS_NARROW_N_THRESHOLD:
+        return _get_ws_module().multi_cta_layernorm_ws(x, weight, bias, eps)
+
     original_shape = x.shape
     x = x.reshape(-1, x.shape[-1])
     m, n = x.size()
@@ -297,9 +336,11 @@ def multi_cta_layernorm(
     return out, mean, rstd
 
 
-def _torch_layernorm_impl(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float = 1e-5):
+def _torch_layernorm_impl(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float = 1e-5
+):
     """Reference PyTorch implementation of layer normalization."""
-    return torch.nn.functional.layer_norm(x, (x.shape[-1], ), weight, bias, eps)
+    return torch.nn.functional.layer_norm(x, (x.shape[-1],), weight, bias, eps)
 
 
 torch_layernorm = torch.compile(_torch_layernorm_impl)
@@ -334,8 +375,9 @@ def test_op(M, N, dtype):
     max_diff = torch.max(torch.abs(output_torch - output_triton)).item()
     print(f"[M={M}, N={N}, dtype={dtype}] Max difference: {max_diff}")
 
-    assert torch.allclose(output_torch, output_triton, rtol=rtol,
-                          atol=atol), (f"Output mismatch: max diff = {max_diff}")
+    assert torch.allclose(
+        output_torch, output_triton, rtol=rtol, atol=atol
+    ), f"Output mismatch: max diff = {max_diff}"
 
 
 # %%
@@ -358,7 +400,8 @@ def test_op(M, N, dtype):
         ylabel="GB/s",  # Label name for the y-axis.
         plot_name="multi-cta-layernorm-performance",  # Name for the plot.
         args={"M": 1024},  # Fixed arguments.
-    ))
+    )
+)
 def benchmark(M, N, provider):
     x = torch.randn(M, N, device=DEVICE, dtype=torch.float16)
     weight = torch.randn(N, device=DEVICE, dtype=torch.float16)
@@ -367,10 +410,13 @@ def benchmark(M, N, provider):
 
     quantiles = [0.5, 0.2, 0.8]
     if provider == "torch":
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch_layernorm(x, weight, bias, eps), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            lambda: torch_layernorm(x, weight, bias, eps), quantiles=quantiles
+        )
     elif provider == "triton":
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: multi_cta_layernorm(x, weight, bias, eps),
-                                                     quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            lambda: multi_cta_layernorm(x, weight, bias, eps), quantiles=quantiles
+        )
 
     # Calculate bandwidth: read x, weight, bias; write output, mean, rstd
     total_bytes = (
