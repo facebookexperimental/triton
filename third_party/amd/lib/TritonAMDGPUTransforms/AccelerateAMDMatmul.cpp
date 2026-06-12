@@ -14,6 +14,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/LayoutPropagationUtility.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/TypeSwitch.h"
 
 namespace tt = mlir::triton;
@@ -81,6 +82,7 @@ bool isF16F8F4(ScaleDotElemType elemType) {
 SmallVector<unsigned, 3>
 warpsPerTile(Operation *dotOp, ArrayRef<int64_t> shape, int numWarps,
              std::pair<int64_t, int64_t> shapePerWarp) {
+  static const bool allowNpot = triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
   auto rank = shape.size();
   // Case 1: Early exit for batched matmul
   if (rank == 3)
@@ -112,6 +114,8 @@ warpsPerTile(Operation *dotOp, ArrayRef<int64_t> shape, int numWarps,
     ret[0] = static_cast<unsigned>(std::min(
         static_cast<int64_t>(numWarps),
         static_cast<int64_t>(llvm::divideCeil(shape[0], shapePerWarp.first))));
+    if (allowNpot && (numWarps % ret[0] != 0))
+      ret[0] = 1u << llvm::Log2_64(ret[0]);
     ret[1] = numWarps / ret[0];
     return ret;
   }
@@ -122,9 +126,14 @@ warpsPerTile(Operation *dotOp, ArrayRef<int64_t> shape, int numWarps,
   do {
     if (ret[0] * ret[1] >= numWarps)
       break;
-    if (tensorShape[0] / (shapePerWarp.first * 2) / ret[0] >=
-        tensorShape[1] / shapePerWarp.second / ret[1]) {
-      if (ret[0] < tensorShape[0] / shapePerWarp.first) {
+    auto tilesM = allowNpot
+                      ? llvm::divideCeil(tensorShape[0], shapePerWarp.first)
+                      : tensorShape[0] / shapePerWarp.first;
+    auto tilesN = allowNpot
+                      ? llvm::divideCeil(tensorShape[1], shapePerWarp.second)
+                      : tensorShape[1] / shapePerWarp.second;
+    if (tilesM / 2 / ret[0] >= tilesN / ret[1]) {
+      if (ret[0] < static_cast<unsigned>(tilesM)) {
         ret[0] *= 2;
       } else {
         ret[1] *= 2;
@@ -218,7 +227,8 @@ chooseMfmaInstruction(Location loc, int mfmaVersion, RankedTensorType cType,
 
   kDim = maybeMfmaIntrinsic->kDim;
   assert(kDim != 0);
-  assert(enforcedNonKDim != 0 || (M % mDim == 0 && N % nDim == 0));
+  if (enforcedNonKDim == 0 && (M % mDim != 0 || N % nDim != 0))
+    return failure();
   // If inputKSize % kDim != 0 (including the case where inputKSize < kDim),
   // this layout will introduce data duplication.
   if (inputKSize % kDim != 0) {
@@ -1498,7 +1508,33 @@ FailureOr<WmmaIntrinsic> chooseWmmaInstruction(Location loc, int wmmaVersion,
 
   kDim = maybeWmmaIntrinsic->kDim;
   assert(kDim != 0);
-  assert(M % mDim == 0 && N % nDim == 0);
+  // NPOT-friendly fallback. Upstream had
+  //   assert(M % mDim == 0 && N % nDim == 0);
+  // We replace it with a soft failure so AMD WMMA gracefully falls back to
+  // FMA when the requested shape doesn't tile cleanly.
+  if (M % mDim != 0 || N % nDim != 0) {
+    mlir::emitRemark(loc) << "WMMA intrinsic '" << maybeWmmaIntrinsic->name
+                          << "' requires M (" << M << ") and N (" << N
+                          << ") divisible by tile dims (" << mDim << "x" << nDim
+                          << "); falling back to FMA.";
+    return failure();
+  }
+  // K-divisibility gate. Upstream's `chooseWmmaInstruction` overload no
+  // longer carries an `enforcedNonKDim` parameter, so the original
+  // NPOT-aware fallback (which only fired when `enforcedNonKDim == 0`)
+  // can't be expressed at the original callsite. K is in scope here, so
+  // gate WMMA selection on K-divisibility unconditionally instead — this
+  // matches upstream's implicit assumption (`WmmaIntrinsic::selectFor`
+  // returns instructions whose `kDim` divides `inputKSize` for pow2 K) and
+  // forces an FMA fallback for NPOT K shapes that the WMMA instruction
+  // cannot represent.
+  if (inputKSize % kDim != 0) {
+    mlir::emitRemark(loc) << "WMMA intrinsic '" << maybeWmmaIntrinsic->name
+                          << "' requires inputKSize (" << inputKSize
+                          << ") divisible by kDim (" << kDim
+                          << "); falling back to FMA.";
+    return failure();
+  }
   return maybeWmmaIntrinsic;
 }
 

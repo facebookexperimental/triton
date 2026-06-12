@@ -594,9 +594,13 @@ mlir::triton::getMultiBufferedType(ttg::MemDescType memDescType,
   auto shape = memDescType.getShape();
   SmallVector<int64_t> bufferShape(shape.begin(), shape.end());
   bufferShape.insert(bufferShape.begin(), depth);
+  // Propagate allocShape (may differ from shape for NPOT M-dim tiles).
+  auto allocShape = memDescType.getAllocShape();
+  SmallVector<int64_t> bufferAllocShape(allocShape.begin(), allocShape.end());
+  bufferAllocShape.insert(bufferAllocShape.begin(), depth);
   return ttg::MemDescType::get(
       bufferShape, memDescType.getElementType(), memDescType.getEncoding(),
-      memDescType.getMemorySpace(), /*mutableMemory*/ true);
+      memDescType.getMemorySpace(), /*mutableMemory*/ true, bufferAllocShape);
 }
 
 ttg::SharedEncodingTrait mlir::triton::getSharedEncoding(RankedTensorType ty) {

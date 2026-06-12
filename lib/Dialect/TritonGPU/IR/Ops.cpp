@@ -800,8 +800,8 @@ LogicalResult verifyMemoryOpTypes(Operation *op, ShapedType srcTy,
 }
 
 LogicalResult verifyAllocOp(Operation *op, Value src, MemDescType dstTy) {
-  if (dstTy.getShape() != dstTy.getAllocShape())
-    return op->emitOpError("result shape and its alloc shape must match");
+  // MemDescType::verify already checks shape[i] <= allocShape[i].
+  // For NPOT dims, getAllocationShapePerCTA handles pow2 rounding.
 
   if (!src) {
     if (!dstTy.getMutableMemory()) {

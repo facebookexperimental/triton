@@ -291,7 +291,7 @@ MfmaIntrinsic::selectFor(Location loc, int version, unsigned mDim,
 
   // If We have more than one instrinsics, prefer those with a larger K.
   for (const auto [symbol, k, kBase] : llvm::drop_end(values)) {
-    if (inputKDim >= k)
+    if (inputKDim >= k && inputKDim % k == 0)
       return MfmaIntrinsic(symbol, mDim, nDim, k, kBase, aElemType, bElemType);
   }
 

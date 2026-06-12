@@ -73,13 +73,26 @@ SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
     return {0, 0, 0};
   } else if (version == 5) {
     unsigned m = shape[0] >= 128 ? 128 : 64;
-    // Right now default to distributing along N. TODO: For cases where we have
-    // dot followed by reduction we need to be able to distribute along M.
-    //    if (numWarps > 4)
-    //      m = 64;
-    unsigned n = shape[1] >= 256 ? 256 : shape[1];
     unsigned k = 256 / eltType.getIntOrFloatBitWidth();
-    return {m, n, k};
+
+    // MMAv5 instrN must be a multiple of 8, in [8, 256], and must divide
+    // BLOCK_N evenly. Prefer the largest valid instrN (fewest MMA reps).
+    // All multiples of 8 from 256 down to 8, in decreasing order.
+    SmallVector<unsigned> validN;
+    for (unsigned n = 256; n >= 8; n -= 8)
+      validN.push_back(n);
+    for (auto n : validN) {
+      if (shape[1] % n == 0) {
+        return {m, n, k};
+      }
+    }
+
+    // SILENT-FAILURE HARDENING: an opt build would skip the assert and return
+    // {0,0,0}, producing silent garbage downstream. Fail loudly instead,
+    // mirroring the v3 branch's report_fatal_error above.
+    llvm::report_fatal_error(
+        "MMAv5 instrShape: no valid instrN found (BLOCK_N must be a multiple "
+        "of 8)");
   } else {
     assert(false && "version not supported");
     return {0, 0};
@@ -134,11 +147,14 @@ unsigned getNumElementsPerThread(Operation *op, SmallVector<unsigned> order,
   unsigned maxMultiple = std::max(maxMultipleBytes / elemNumBytes, 1u);
   unsigned maxContig =
       std::min(valInfo.getContiguity(order[0]), shapePerCTA[order[0]]);
-  unsigned alignment = std::min(maxMultiple, maxContig);
+  // For NPOT contiguity, use the largest pow2 factor for sizePerThread.
+  unsigned pow2Contig = highestPowOf2Divisor(maxContig);
+  unsigned alignment = std::min(maxMultiple, pow2Contig);
   unsigned currPerThread = std::min(alignment, 128 / elemNumBits);
   LDBG("elemNumBytes: " << elemNumBytes
                         << ", divisibility: " << maxMultipleBytes
                         << ", contig: " << valInfo.getContiguity(order[0])
+                        << ", pow2Contig: " << pow2Contig
                         << ", alignment: " << alignment);
   return currPerThread;
 }
