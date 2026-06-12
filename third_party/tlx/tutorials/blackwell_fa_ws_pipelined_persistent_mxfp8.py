@@ -1351,6 +1351,27 @@ def _get_bwd_start_m(pid, BLOCK_N1, STAGE: tl.constexpr):
 
 
 @triton.jit
+def _get_bwd_tile_info(
+    tile_idx,
+    n_tile_num,
+    H,
+    N_CTX,
+    BLOCK_M1: tl.constexpr,
+    BLOCK_N1: tl.constexpr,
+    STAGE: tl.constexpr,
+):
+    off_seq_h = tile_idx // n_tile_num
+    off_z = off_seq_h // H
+    off_h = off_seq_h % H
+    pid = tile_idx % n_tile_num
+    start_n = pid * BLOCK_N1
+    base_q = (off_z * H + off_h).to(tl.int64) * N_CTX
+    start_m = _get_bwd_start_m(pid, BLOCK_N1, STAGE)
+    num_steps = (N_CTX - start_m) // BLOCK_M1
+    return off_seq_h, off_z, off_h, pid, start_n, base_q, start_m, num_steps
+
+
+@triton.jit
 def _softmax_recompute_quantization_iter(
     blk_idx,
     qk_scale,
@@ -1598,9 +1619,16 @@ def _attn_bwd_mxf8_ws(
     total_tiles = n_tile_num * Z * H
 
     tiles_per_sm = total_tiles // num_progs
-    if prog_id < total_tiles % num_progs:
+    extra_tiles = total_tiles % num_progs
+    if prog_id < extra_tiles:
         tiles_per_sm += 1
-    tile_idx = prog_id
+    if STAGE == 3:
+        tile_idx_start = prog_id * (total_tiles // num_progs) + min(prog_id, extra_tiles)
+        tile_idx_step = 1
+    else:
+        tl.static_assert(STAGE == 1)
+        tile_idx_start = prog_id
+        tile_idx_step = num_progs
 
     DS_NUM_SUBS: tl.constexpr = 2
 
@@ -1964,20 +1992,19 @@ def _attn_bwd_mxf8_ws(
             p_scale_const = tl.full([REP_N, REP_M, 32, 4, 4], P_FIXED_E8M0, dtype=tl.uint8)
             tlx.local_store(p_scale_smem[0], p_scale_const)
 
+            tile_idx = tile_idx_start
             blk_idx = 0
             for _i in range(tiles_per_sm):
                 _, persistent_tmem_phase = get_bufidx_phase(_i, NUM_BUFFERS_TMEM)
-                off_seq_h = tile_idx // n_tile_num
-                off_z = off_seq_h // H
-                off_h = off_seq_h % H
-                pid = tile_idx % n_tile_num
-                start_n = pid * BLOCK_N1
-                base_q = (off_z * H + off_h).to(tl.int64) * N_CTX
-
-                # Causal: sweep query blocks from the diagonal. The first
-                # (diagonal) block is masked; the rest are fully below it.
-                start_m = _get_bwd_start_m(pid, BLOCK_N1, STAGE)
-                num_steps = (N_CTX - start_m) // BLOCK_M1
+                off_seq_h, off_z, off_h, pid, start_n, base_q, start_m, num_steps = _get_bwd_tile_info(
+                    tile_idx,
+                    n_tile_num,
+                    H,
+                    N_CTX,
+                    BLOCK_M1,
+                    BLOCK_N1,
+                    STAGE,
+                )
                 curr_m = start_m
 
                 # Prologue: produce P for the first M-block.
@@ -2118,22 +2145,23 @@ def _attn_bwd_mxf8_ws(
                             slice_id * slice_size,
                         ],
                     )
-                tile_idx += num_progs
+                tile_idx += tile_idx_step
             tlx.async_descriptor_store_wait(0)
 
         # ----- Reduction warp: TMA atomic-reduce-add of dQ to GMEM -----
         with tlx.async_task(num_warps=4, registers=112):
+            tile_idx = tile_idx_start
             blk_idx = 0
             for _i in range(tiles_per_sm):
-                off_seq_h = tile_idx // n_tile_num
-                off_z = off_seq_h // H
-                off_h = off_seq_h % H
-                pid = tile_idx % n_tile_num
-                base_q = (off_z * H + off_h).to(tl.int64) * N_CTX
-
-                # Causal: dQ is only produced for query blocks at m >= start_n.
-                start_m = _get_bwd_start_m(pid, BLOCK_N1, STAGE)
-                num_steps = (N_CTX - start_m) // BLOCK_M1
+                off_seq_h, off_z, off_h, pid, start_n, base_q, start_m, num_steps = _get_bwd_tile_info(
+                    tile_idx,
+                    n_tile_num,
+                    H,
+                    N_CTX,
+                    BLOCK_M1,
+                    BLOCK_N1,
+                    STAGE,
+                )
                 curr_m = start_m
                 for _ in range(num_steps):
                     _, tmem_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
@@ -2168,18 +2196,24 @@ def _attn_bwd_mxf8_ws(
 
                     curr_m += BLOCK_M1
                     blk_idx += 1
-                tile_idx += num_progs
+                tile_idx += tile_idx_step
             tlx.async_descriptor_store_wait(0)
 
         # ----- MMA warp: 5 blockscaled GEMMs per M-block -----
         with tlx.async_task(num_warps=1, registers=80):
+            tile_idx = tile_idx_start
             blk_idx = 0
             for _i in range(tiles_per_sm):
                 kv_buf_id, kv_phase = get_bufidx_phase(_i, NUM_BUFFERS_KV)
-                # Causal: fewer query (M) blocks per N-tile (diagonal onward).
-                pid = tile_idx % n_tile_num
-                start_m = _get_bwd_start_m(pid, BLOCK_N1, STAGE)
-                num_steps = (N_CTX - start_m) // BLOCK_M1
+                off_seq_h, off_z, off_h, pid, start_n, base_q, start_m, num_steps = _get_bwd_tile_info(
+                    tile_idx,
+                    n_tile_num,
+                    H,
+                    N_CTX,
+                    BLOCK_M1,
+                    BLOCK_N1,
+                    STAGE,
+                )
                 # --- Prolog: first M-block ---
                 q_buf_id, q_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
                 do_buf_id, do_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
@@ -2471,27 +2505,27 @@ def _attn_bwd_mxf8_ws(
                         k_dq_empties[kv_buf_id],
                     ],
                 )
-                tile_idx += num_progs
+                tile_idx += tile_idx_step
 
         # ----- Load warp: TMA loads of FP8 data + scales -----
         with tlx.async_task(num_warps=1, registers=24):
+            tile_idx = tile_idx_start
             blk_idx = 0
             for _i in range(tiles_per_sm):
-                off_seq_h = tile_idx // n_tile_num
-                off_z = off_seq_h // H
-                off_h = off_seq_h % H
-                pid = tile_idx % n_tile_num
-                start_n = pid * BLOCK_N1
-                base_q = (off_z * H + off_h).to(tl.int64) * N_CTX
+                off_seq_h, off_z, off_h, pid, start_n, base_q, start_m, num_steps = _get_bwd_tile_info(
+                    tile_idx,
+                    n_tile_num,
+                    H,
+                    N_CTX,
+                    BLOCK_M1,
+                    BLOCK_N1,
+                    STAGE,
+                )
                 # Scale TMA layout: [Z*H, REP_N (or REP_M), REP_HEAD, 2, 256].
                 # Tile selects (z, h) via off_seq_h, and the M / N index via
                 # the 2nd dim.
                 sf_off_seq_h = off_seq_h.to(tl.int32)
                 kv_scale_n = pid * REP_N
-
-                # Causal: load query (M) tiles from the diagonal block onward.
-                start_m = _get_bwd_start_m(pid, BLOCK_N1, STAGE)
-                num_steps = (N_CTX - start_m) // BLOCK_M1
 
                 # Load K data + scale and first Q + scale
                 # Share 1 barrier.
@@ -2737,7 +2771,7 @@ def _attn_bwd_mxf8_ws(
                     [sf_off_seq_h, 0, (last_m // 128) * REP_M, 0, 0],
                     q_dk_fulls[last_q_buf_id],
                 )
-                tile_idx += num_progs
+                tile_idx += tile_idx_step
 
 
 # ---------------------------------------------------------------------------
@@ -2852,15 +2886,9 @@ def attention_bwd(
 
     def grid(meta):
         total_tiles = triton.cdiv(N_CTX, meta["BLOCK_N1"]) * Z * H
-        # The persistent pipeline (single-buffered, blk_idx-keyed ring buffers)
-        # assumes a constant per-tile M-block count. Causal makes num_steps vary
-        # per N-tile (and reach 1), which desyncs the cross-tile barrier phases
-        # of a persistent program. Run causal non-persistently (one N-tile per
-        # program, tiles_per_sm == 1) so there is no cross-tile continuation —
-        # matching the non-persistent backward grid of the base BF16 kernel.
-        # TODO: support persistent causal by keying the per-tile barriers off a
-        # running block counter instead of the tile index.
-        n_progs = total_tiles if causal else min(NUM_SMS, total_tiles)
+        n_progs = min(NUM_SMS, total_tiles)
+        if causal:
+            n_progs = max(n_progs, triton.cdiv(total_tiles, 2))
         return (
             n_progs,
             1,

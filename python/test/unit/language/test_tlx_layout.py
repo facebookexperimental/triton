@@ -19,10 +19,9 @@ def _separable_qk_layout():
     )
 
 
-_SEPARABLE_QK_LINEAR = (
-    "#ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 64]], "
-    "lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], "
-    "warp = [[32, 0], [64, 0], [0, 32]], block = []}>")
+_SEPARABLE_QK_LINEAR = ("#ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 64]], "
+                        "lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], "
+                        "warp = [[32, 0], [64, 0], [0, 32]], block = []}>")
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
