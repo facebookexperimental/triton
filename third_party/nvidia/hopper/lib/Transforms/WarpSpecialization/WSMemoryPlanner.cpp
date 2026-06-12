@@ -3709,6 +3709,7 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
   int effectiveSmemAllocAlgo = smemAllocAlgo;
   unsigned effectiveSmemBudget = smemBudget;
   bool effectiveSmemCircularReuse = smemCircularReuse;
+  bool hasSmemAllocAlgoAttr = false;
   funcOp->walk([&](scf::ForOp forOp) {
     if (!forOp->hasAttr("tt.warp_specialize"))
       return;
@@ -3723,8 +3724,10 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
     // Apply from outermost to innermost (innermost wins).
     for (auto it = loopChain.rbegin(); it != loopChain.rend(); ++it) {
       auto loop = *it;
-      if (auto attr = loop->getAttrOfType<IntegerAttr>("tt.smem_alloc_algo"))
+      if (auto attr = loop->getAttrOfType<IntegerAttr>("tt.smem_alloc_algo")) {
         effectiveSmemAllocAlgo = attr.getInt();
+        hasSmemAllocAlgoAttr = true;
+      }
       if (auto attr = loop->getAttrOfType<IntegerAttr>("tt.smem_budget"))
         effectiveSmemBudget = static_cast<unsigned>(attr.getInt());
       if (auto attr = loop->getAttrOfType<BoolAttr>("tt.smem_circular_reuse"))
@@ -3736,6 +3739,7 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
   if (effectiveSmemAllocAlgo == 1) {
     // New WSBuffer-based SMEM allocation (Phases 1-5).
     LDBG("using SMEM allocation algorithm 1 (WSBuffer-based)"
+         << (hasSmemAllocAlgoAttr ? "" : "; default when not specified")
          << " smemBudget=" << effectiveSmemBudget
          << " smemCircularReuse=" << effectiveSmemCircularReuse);
     assert(effectiveSmemBudget != 0 && "smem budget is not set");

@@ -229,7 +229,7 @@ public:
 
     if (failed(doMemoryPlanner(funcOp, numStages, /*readDecisionFile=*/"",
                                /*writeDecisionFile=*/"",
-                               /*smemAllocAlgo=*/0, smemBudget))) {
+                               /*smemAllocAlgo=*/1, smemBudget))) {
       signalPassFailure();
       return;
     }
