@@ -88,20 +88,28 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c4 = arith.constant 4 : index
-    // CHECK: ttg.local_alloc : () -> !ttg.memdesc<2x1xi64
-    // CHECK: ttng.init_barrier
-    // CHECK: ttng.init_barrier
+    // CHECK: %[[BARS:.*]] = ttg.local_alloc : () -> !ttg.memdesc<2x1xi64
+    // CHECK: %[[INIT_C0:.*]] = arith.constant 0 : i32
+    // CHECK: %[[INIT_BAR0:.*]] = ttg.memdesc_index %[[BARS]][%[[INIT_C0]]]
+    // CHECK: ttng.init_barrier %[[INIT_BAR0]], 2
+    // CHECK: %[[INIT_C1:.*]] = arith.constant 1 : i32
+    // CHECK: %[[INIT_BAR1:.*]] = ttg.memdesc_index %[[BARS]][%[[INIT_C1]]]
+    // CHECK: ttng.init_barrier %[[INIT_BAR1]], 2
     // CHECK: scf.for
-    // CHECK:   ttng.map_to_remote_buffer
+    // CHECK:   %[[C0:.*]] = arith.constant 0 : i32
+    // CHECK:   %[[BAR0:.*]] = ttg.memdesc_index %[[BARS]][%[[C0]]]
+    // CHECK:   ttng.map_to_remote_buffer %[[BAR0]]
     // CHECK:   ttng.arrive_barrier
-    // CHECK:   ttng.wait_barrier
+    // CHECK:   ttng.wait_barrier %[[BAR0]]
     // CHECK:   ttng.tc_gen5_mma
-    // CHECK:   ttng.map_to_remote_buffer
+    // CHECK:   %[[C1:.*]] = arith.constant 1 : i32
+    // CHECK:   %[[BAR1:.*]] = ttg.memdesc_index %[[BARS]][%[[C1]]]
+    // CHECK:   ttng.map_to_remote_buffer %[[BAR1]]
     // CHECK:   ttng.arrive_barrier
-    // CHECK:   ttng.wait_barrier
+    // CHECK:   ttng.wait_barrier %[[BAR1]]
     // CHECK:   ttng.tc_gen5_mma
-    // CHECK: ttng.inval_barrier
-    // CHECK: ttng.inval_barrier
+    // CHECK: ttng.inval_barrier %{{.*}}
+    // CHECK: ttng.inval_barrier %{{.*}}
     scf.for %iv = %c0 to %c4 step %c1 {
       %tok0 = ttng.tc_gen5_mma %a0, %b, %acc0[%acc_tok0], %true, %true {two_ctas} :
         !ttg.memdesc<128x64xf16, #shared, #smem>,

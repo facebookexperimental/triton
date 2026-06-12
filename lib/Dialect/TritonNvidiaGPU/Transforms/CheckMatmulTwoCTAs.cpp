@@ -20,7 +20,7 @@ namespace mlir::triton::nvidia_gpu {
 
 namespace {
 
-static Value getBaseMemDesc(Value value) {
+Value getBaseMemDesc(Value value) {
   while (auto *def = value.getDefiningOp()) {
     if (auto indexOp = dyn_cast<ttg::MemDescIndexOp>(def)) {
       value = indexOp.getSrc();
@@ -51,33 +51,54 @@ static Value getBaseMemDesc(Value value) {
   return value;
 }
 
-static bool isViewOf(Value value, Value base) {
-  return getBaseMemDesc(value) == base;
+bool isViewOf(Value value, Value base) { return getBaseMemDesc(value) == base; }
+
+tt::DotOp getDependentDotProducerImpl(Value value, DenseSet<Value> &visited) {
+  if (!value || !visited.insert(value).second)
+    return nullptr;
+
+  Operation *def = value.getDefiningOp();
+  if (!def)
+    return nullptr;
+
+  if (auto dotOp = dyn_cast<tt::DotOp>(def))
+    return dotOp;
+
+  for (Value operand : def->getOperands()) {
+    if (auto producer = getDependentDotProducerImpl(operand, visited))
+      return producer;
+  }
+  return nullptr;
 }
 
-static TCGen5MMAOp getTwoCTAMMAWriting(Value base) {
+tt::DotOp getDependentDotProducer(Value value) {
+  DenseSet<Value> visited;
+  return getDependentDotProducerImpl(value, visited);
+}
+
+ttng::TCGen5MMAOp getMMAWriting(Value base) {
   for (Operation *user : base.getUsers()) {
-    if (auto mmaOp = dyn_cast<TCGen5MMAOp>(user)) {
-      if (mmaOp.getTwoCtas() && isViewOf(mmaOp.getD(), base))
+    if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
+      if (isViewOf(mmaOp.getD(), base))
         return mmaOp;
     }
   }
   return nullptr;
 }
 
-static TCGen5MMAOp getTwoCTAMMAResultDependency(Value value,
-                                                DenseSet<Value> &visited) {
+ttng::TCGen5MMAOp getMMAResultDependency(Value value,
+                                         DenseSet<Value> &visited) {
   if (!value || !visited.insert(value).second)
     return nullptr;
 
-  if (auto loadOp = value.getDefiningOp<TMEMLoadOp>()) {
+  if (auto loadOp = value.getDefiningOp<ttng::TMEMLoadOp>()) {
     Value loadBase = getBaseMemDesc(loadOp.getSrc());
-    if (auto producer = getTwoCTAMMAWriting(loadBase))
+    if (auto producer = getMMAWriting(loadBase))
       return producer;
   }
 
   if (auto base = getBaseMemDesc(value); base != value) {
-    if (auto producer = getTwoCTAMMAWriting(base))
+    if (auto producer = getMMAWriting(base))
       return producer;
   }
 
@@ -85,51 +106,31 @@ static TCGen5MMAOp getTwoCTAMMAResultDependency(Value value,
   if (!def)
     return nullptr;
   for (Value operand : def->getOperands()) {
-    if (auto producer = getTwoCTAMMAResultDependency(operand, visited))
+    if (auto producer = getMMAResultDependency(operand, visited))
       return producer;
   }
   return nullptr;
 }
 
-static TCGen5MMAOp getDependentTwoCTAMMAProducer(Value operand) {
+ttng::TCGen5MMAOp getDependentMMAProducer(Value operand) {
   Value base = getBaseMemDesc(operand);
-  if (auto producer = getTwoCTAMMAWriting(base))
+  if (auto producer = getMMAWriting(base))
     return producer;
 
-  if (auto allocOp = base.getDefiningOp<TMEMAllocOp>()) {
+  if (auto allocOp = base.getDefiningOp<ttng::TMEMAllocOp>()) {
     if (Value src = allocOp.getSrc()) {
       DenseSet<Value> visited;
-      if (auto producer = getTwoCTAMMAResultDependency(src, visited))
+      if (auto producer = getMMAResultDependency(src, visited))
         return producer;
     }
   }
 
   for (Operation *user : base.getUsers()) {
-    auto storeOp = dyn_cast<TMEMStoreOp>(user);
+    auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user);
     if (!storeOp || !isViewOf(storeOp.getDst(), base))
       continue;
     DenseSet<Value> visited;
-    if (auto producer = getTwoCTAMMAResultDependency(storeOp.getSrc(), visited))
-      return producer;
-  }
-  return nullptr;
-}
-
-static tt::DotOp getTwoCTADotDependency(Value value, DenseSet<Value> &visited) {
-  if (!value || !visited.insert(value).second)
-    return nullptr;
-
-  Operation *def = value.getDefiningOp();
-  if (!def)
-    return nullptr;
-
-  if (auto dotOp = dyn_cast<tt::DotOp>(def)) {
-    if (dotOp.getTwoCtas())
-      return dotOp;
-  }
-
-  for (Value operand : def->getOperands()) {
-    if (auto producer = getTwoCTADotDependency(operand, visited))
+    if (auto producer = getMMAResultDependency(storeOp.getSrc(), visited))
       return producer;
   }
   return nullptr;
@@ -171,8 +172,8 @@ public:
       if (!op.getTwoCtas())
         return WalkResult::advance();
       for (Value operand : {op.getA(), op.getB()}) {
-        auto producer = getDependentTwoCTAMMAProducer(operand);
-        if (!producer || producer == op)
+        auto producer = getDependentMMAProducer(operand);
+        if (!producer || producer == op || !producer.getTwoCtas())
           continue;
         auto diag = op->emitError()
                     << "two_ctas=True does not currently support dependent "
@@ -189,9 +190,8 @@ public:
       if (!op.getTwoCtas())
         return WalkResult::advance();
       for (Value operand : {op.getA(), op.getB()}) {
-        DenseSet<Value> visited;
-        auto producer = getTwoCTADotDependency(operand, visited);
-        if (!producer || producer == op)
+        auto producer = getDependentDotProducer(operand);
+        if (!producer || producer == op || !producer.getTwoCtas())
           continue;
         auto diag = op->emitError()
                     << "two_ctas=True does not currently support dependent "
