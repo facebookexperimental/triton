@@ -42,6 +42,10 @@ launch_latency:
   backends: nop_triton_kernel_autotuned,nop_triton_kernel_autotuned_nocache
   disabled_devices:
     - cuda
+ragged_attention:
+  report: true
+  disabled_devices:
+    - hip
 ## torch.AcceleratorError: CUDA error: unspecified launch failure
 decoding_attention:
   report: true
