@@ -176,7 +176,7 @@ class CUDAOptions:
     sanitize_overflow: bool = False
     arch: str = None
     instrumentation_mode: str = ""
-    early_tma_store_lowering: bool = False
+    early_tma_store_lowering: Optional[None] = None
     generate_subtiled_region: bool = False
 
     def __post_init__(self):
@@ -602,8 +602,8 @@ class CUDABackend(BaseBackend):
         if opt.maxRegAutoWS is not None:
             mod.set_attr("ttg.max_reg_auto_ws", ir.builder(mod.context).get_int32_attr(opt.maxRegAutoWS))
 
-        # Add early TMA store lowering attribute
-        if opt.early_tma_store_lowering:
+        # Add early TMA store lowering attribute. Default value is True.
+        if opt.early_tma_store_lowering or opt.early_tma_store_lowering is None:
             mod.set_attr("ttg.early_tma_store_lowering", ir.builder(mod.context).get_bool_attr(True))
 
         if opt.cluster_dims is not None:

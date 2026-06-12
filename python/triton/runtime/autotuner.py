@@ -18,7 +18,11 @@ from .driver import driver
 from .cache import get_cache_manager, triton_key
 
 try:
-    from triton._C.libtriton import native_create_autotune_proxy, native_autotune_proxy_insert, native_autotune_proxy_set_grid
+    from triton._C.libtriton import (
+        native_create_autotune_proxy,
+        native_autotune_proxy_insert,
+        native_autotune_proxy_set_grid,
+    )
 except ImportError:
     native_create_autotune_proxy = None
     native_autotune_proxy_insert = None
@@ -242,9 +246,23 @@ def _timed_measurement(kernel_call, clear_cache, n_repeat, torch):
 
 class Autotuner(KernelInterface):
 
-    def __init__(self, fn, arg_names, configs, key, reset_to_zero, restore_value, pre_hook=None, post_hook=None,
-                 prune_configs_by: Optional[Dict] = None, warmup=None, rep=None, use_cuda_graph=False, do_bench=None,
-                 cache_results=False):
+    def __init__(
+        self,
+        fn,
+        arg_names,
+        configs,
+        key,
+        reset_to_zero,
+        restore_value,
+        pre_hook=None,
+        post_hook=None,
+        prune_configs_by: Optional[Dict] = None,
+        warmup=None,
+        rep=None,
+        use_cuda_graph=False,
+        do_bench=None,
+        cache_results=False,
+    ):
         """
         :param prune_configs_by: a dict of functions that are used to prune configs, fields:
             'perf_model': performance model used to predicate running time with different configs, returns running time
@@ -278,7 +296,7 @@ class Autotuner(KernelInterface):
         if pre_hook:
             self.pre_hook = pre_hook
             self.user_defined_pre_hook = True
-        elif (len(self.reset_to_zero) > 0 or len(self.restore_value) > 0):
+        elif len(self.reset_to_zero) > 0 or len(self.restore_value) > 0:
 
             def _pre_hook(kwargs, reset_only=False):
                 for name in self.reset_to_zero:
@@ -322,11 +340,16 @@ class Autotuner(KernelInterface):
         # and proceed with the old behavior.
         if warmup is not None or rep is not None or use_cuda_graph:
             import warnings
-            warnings.warn(("warmup, rep, and use_cuda_graph parameters are deprecated. See "
-                           "https://github.com/triton-lang/triton/pull/4496 for details."), DeprecationWarning,
-                          stacklevel=1)
+
+            warnings.warn(
+                ("warmup, rep, and use_cuda_graph parameters are deprecated. See "
+                 "https://github.com/triton-lang/triton/pull/4496 for details."),
+                DeprecationWarning,
+                stacklevel=1,
+            )
             if use_cuda_graph:
                 from ..testing import do_bench_cudagraph
+
                 self._do_bench = lambda kernel_call, quantiles: do_bench_cudagraph(
                     kernel_call,
                     rep=rep if rep is not None else knobs.autotuning.rep,
@@ -335,6 +358,7 @@ class Autotuner(KernelInterface):
                 return
 
             import triton.testing
+
             self._do_bench = lambda kernel_call, quantiles: triton.testing.do_bench(
                 kernel_call,
                 warmup=warmup if warmup is not None else knobs.autotuning.warmup,
@@ -495,15 +519,18 @@ class Autotuner(KernelInterface):
                 tuning_key,
                 "configs_timings":
                 [(config.__dict__, timings) for config, timings in self.configs_timings.items() if not config.pre_hook],
-            }), file_name, binary=False)
+            }),
+            file_name,
+            binary=False,
+        )
         return False
 
     def __getitem__(self, grid):
         """Return C-level AutotuneCacheProxy for fast dispatch if available."""
         # Check if we can use the C-level autotune proxy
-        if (native_create_autotune_proxy is not None and getattr(self.fn, 'c_cache', False)
+        if (native_create_autotune_proxy is not None and getattr(self.fn, "c_cache", False)
                 and knobs.nvidia.use_autotune_c_cache and knobs.nvidia.use_triton_dispatcher and len(self.configs) > 1):
-            proxy = getattr(self, '_autotune_proxy', None)
+            proxy = getattr(self, "_autotune_proxy", None)
             if proxy is None:
                 # Compute key_indices: positions in arg_names for autotuner key fields
                 key_indices = []
@@ -541,7 +568,7 @@ class Autotuner(KernelInterface):
 
     def _seed_autotune_proxy(self, key, config):
         """Insert a key→config mapping into the C autotune proxy table."""
-        proxy = getattr(self, '_autotune_proxy', None)
+        proxy = getattr(self, "_autotune_proxy", None)
         if proxy is None or native_autotune_proxy_insert is None:
             return
 
@@ -558,16 +585,16 @@ class Autotuner(KernelInterface):
         # Compute options_hash matching _try_fast_path's logic exactly
         fn_arg_name_set = set(fn_arg_names)
         _meta = {k: v for k, v in config_kwargs.items() if k not in fn_arg_name_set}
-        _meta_opts = {k: v for k, v in _meta.items() if k not in getattr(self.fn, '_param_name_to_idx', {})}
+        _meta_opts = {k: v for k, v in _meta.items() if k not in getattr(self.fn, "_param_name_to_idx", {})}
         if _meta_opts:
             options_hash = hash(tuple(sorted(_meta_opts.items()))) & 0xFFFFFFFFFFFFFFFF
         else:
-            options_hash = getattr(self.fn, '_fc_options_hash', 0)
+            options_hash = getattr(self.fn, "_fc_options_hash", 0)
 
         # Build key values matching what C vectorcall extracts:
         # - key field values (actual arg values at key_indices)
         # - dtype objects (not strings!) from tensor args
-        full_nargs = getattr(self, '_full_nargs', self.nargs)
+        full_nargs = getattr(self, "_full_nargs", self.nargs)
         full_args_list = []
         for name in fn_arg_names:
             if name in full_nargs:
@@ -590,7 +617,7 @@ class Autotuner(KernelInterface):
         for i, param in enumerate(self.fn.params):
             if not param.is_constexpr:
                 arg = full_args_list[i] if i < len(full_args_list) else None
-                if arg is not None and hasattr(arg, 'dtype'):
+                if arg is not None and hasattr(arg, "dtype"):
                     key_vals.append(arg.dtype)
 
         native_autotune_proxy_insert(proxy, key_vals, constexpr_vals, constexpr_positions, options_hash,
@@ -607,8 +634,8 @@ class Autotuner(KernelInterface):
         Returns None when preconditions aren't met (no c_cache, callable
         grid that can't be evaluated, extra kwargs, etc.).
         """
-        input_grid = kwargs.get('grid')
-        if input_grid is None or not getattr(self.fn, 'c_cache', False):
+        input_grid = kwargs.get("grid")
+        if input_grid is None or not getattr(self.fn, "c_cache", False):
             return None
 
         # Build full positional args: user positional + config constexprs.
@@ -617,7 +644,7 @@ class Autotuner(KernelInterface):
         _arg_name_set = set(fn_arg_names)
         # Fall back if kwargs has extra keys (beyond 'grid'/'warmup') not in arg_names,
         # since those would be silently dropped in the fast path.
-        _extra_keys = [k for k in kwargs if k not in {'grid', 'warmup'} and k not in _arg_name_set]
+        _extra_keys = [k for k in kwargs if k not in {"grid", "warmup"} and k not in _arg_name_set]
         if _extra_keys:
             return None
 
@@ -643,11 +670,11 @@ class Autotuner(KernelInterface):
         # Seed C cache with hash=0 for native_fast_dispatch.
         # During autotuning, run() stored the kernel with a non-zero hash.
         # We use hash=0 as the canonical key for autotuned steady-state dispatch.
-        if not hasattr(self, '_fc_seeded'):
+        if not hasattr(self, "_fc_seeded"):
             self._fc_seeded = set()
         # Use autotuner key to distinguish specializations that may select
         # different winning configs (different meta-params).
-        _seed_key = getattr(self, '_last_key', None)
+        _seed_key = getattr(self, "_last_key", None)
         if _seed_key not in self._fc_seeded:
             try:
                 from triton._C.libtriton import native_fast_dispatch_insert
@@ -658,7 +685,7 @@ class Autotuner(KernelInterface):
             # use the same hash that JIT.run's insertion used (includes meta-params
             # like ctas_per_cga that affect compilation options).
             if _meta:
-                _meta_opts = {k: v for k, v in _meta.items() if k not in getattr(self.fn, '_param_name_to_idx', {})}
+                _meta_opts = {k: v for k, v in _meta.items() if k not in getattr(self.fn, "_param_name_to_idx", {})}
                 if _meta_opts:
                     self.fn._fc_options_hash = hash(tuple(sorted(_meta_opts.items()))) & 0xFFFFFFFFFFFFFFFF
                 # Store meta kwargs for C proxy fallback forwarding.
@@ -667,13 +694,20 @@ class Autotuner(KernelInterface):
                 # with the updated options_hash and meta_kwargs.
                 self.fn._jit_proxy_cache = {}
             if native_fast_dispatch_insert is not None:
-                _disp = getattr(kernel, '_dispatcher', None)
+                _disp = getattr(kernel, "_dispatcher", None)
                 if _disp is not None:
                     _padded = tuple(full_args)
                     if len(_padded) < len(self.fn.params):
                         _padded = _padded + (None, ) * (len(self.fn.params) - len(_padded))
-                    native_fast_dispatch_insert(self.fn, _padded, self.fn.params, self.fn._fc_options_hash, kernel,
-                                                _disp, getattr(kernel, '_dispatch_arg_indices', None))
+                    native_fast_dispatch_insert(
+                        self.fn,
+                        _padded,
+                        self.fn.params,
+                        self.fn._fc_options_hash,
+                        kernel,
+                        _disp,
+                        getattr(kernel, "_dispatch_arg_indices", None),
+                    )
             self._fc_seeded.add(_seed_key)
             return kernel
 
@@ -706,8 +740,10 @@ class Autotuner(KernelInterface):
                 def benchmark():
                     # facebook begin
                     import importlib
+
                     if importlib.util.find_spec("torch.monitor") is not None:
                         from torch.monitor import _WaitCounter
+
                         waitcounter = _WaitCounter("pytorch.triton.benchmark").guard()
                         waitcounter.__enter__()
 
@@ -721,12 +757,15 @@ class Autotuner(KernelInterface):
                         waitcounter.__exit__()
                     if knobs.autotuning.print:
                         print(
-                            f'\nPrinting ALL Multiple Triton autotuning Configs with timings in sorted order for kernel {self.fn}:',
-                            flush=True)
+                            f"\nPrinting ALL Multiple Triton autotuning Configs with timings in sorted order for kernel {self.fn}:",
+                            flush=True,
+                        )
                         sorted_configs = builtins.sorted(timings, key=timings.get)
                         for config in sorted_configs:
-                            print(f'Triton autotune config: [{config}]; Triton autotune timing: {timings[config]}',
-                                  flush=True)
+                            print(
+                                f"Triton autotune config: [{config}]; Triton autotune timing: {timings[config]}",
+                                flush=True,
+                            )
                     # facebook end T203283446
                     self.cache[key] = builtins.min(timings, key=timings.get)
                     full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
@@ -741,11 +780,11 @@ class Autotuner(KernelInterface):
             config = self.cache[key]
             self._last_key = key
             # Seed the C-level autotune proxy with this key→config mapping
-            if not used_cached_result or not hasattr(self, '_at_proxy_seeded'):
-                self._at_proxy_seeded = getattr(self, '_at_proxy_seeded', set())
-            if key not in getattr(self, '_at_proxy_seeded', set()):
+            if not used_cached_result or not hasattr(self, "_at_proxy_seeded"):
+                self._at_proxy_seeded = getattr(self, "_at_proxy_seeded", set())
+            if key not in getattr(self, "_at_proxy_seeded", set()):
                 self._seed_autotune_proxy(key, config)
-                if not hasattr(self, '_at_proxy_seeded'):
+                if not hasattr(self, "_at_proxy_seeded"):
                     self._at_proxy_seeded = set()
                 self._at_proxy_seeded.add(key)
         else:
@@ -766,7 +805,7 @@ class Autotuner(KernelInterface):
             knobs.compilation.always_compile = True
             # Clear the JIT cache for this kernel to force recompilation
             # so IR can be dumped
-            if hasattr(self.fn, 'device_caches'):
+            if hasattr(self.fn, "device_caches"):
                 for device_cache in self.fn.device_caches.values():
                     if isinstance(device_cache, tuple) and len(device_cache) >= 1:
                         device_cache[0].clear()
@@ -875,7 +914,7 @@ class Config:
         reg_dec_producer=0,
         reg_inc_consumer=0,
         ctas_per_cga=None,
-        early_tma_store_lowering=None,
+        early_tma_store_lowering=True,
         generate_subtiled_region=None,
         preferred_ctas_per_cga=None,
     ):
@@ -966,8 +1005,20 @@ class Config:
         return self_tuple == other_tuple
 
 
-def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_value=None, pre_hook=None, post_hook=None,
-             warmup=None, rep=None, use_cuda_graph=False, do_bench=None, cache_results=False):
+def autotune(
+    configs,
+    key,
+    prune_configs_by=None,
+    reset_to_zero=None,
+    restore_value=None,
+    pre_hook=None,
+    post_hook=None,
+    warmup=None,
+    rep=None,
+    use_cuda_graph=False,
+    do_bench=None,
+    cache_results=False,
+):
     """
     Decorator for auto-tuning a :code:`triton.jit`'d function.
 
@@ -1028,9 +1079,22 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
     """
 
     def decorator(fn):
-        return Autotuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
-                         post_hook=post_hook, prune_configs_by=prune_configs_by, warmup=warmup, rep=rep,
-                         use_cuda_graph=use_cuda_graph, do_bench=do_bench, cache_results=cache_results)
+        return Autotuner(
+            fn,
+            fn.arg_names,
+            configs,
+            key,
+            reset_to_zero,
+            restore_value,
+            pre_hook=pre_hook,
+            post_hook=post_hook,
+            prune_configs_by=prune_configs_by,
+            warmup=warmup,
+            rep=rep,
+            use_cuda_graph=use_cuda_graph,
+            do_bench=do_bench,
+            cache_results=cache_results,
+        )
 
     return decorator
 
