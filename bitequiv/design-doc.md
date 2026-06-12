@@ -172,6 +172,18 @@ configs get different descriptors:
 These misses cost tuning freedom, never correctness. They are acceptable for the first
 cut and **measured, not assumed**, by the oracle.
 
+**Soundness guard for unanalyzed ops (added 2026-06-11, from the GPU evaluation).** A
+reduce-like op the parser cannot structurally analyze — a multi-operand `tt.reduce`
+(argmax/argmin/Welford) or a tensor-core/MMA accumulation (`tt.dot`) — must **not** be
+dropped. If it were, the descriptor would be empty `()`, and `() == ()` would *unsoundly*
+declare such configs equivalent (the evaluation caught exactly this as welford/gemm
+false-positives). Instead `reduction_descriptor` appends a conservative
+`("unanalyzed", kinds, fingerprint)` entry whose fingerprint includes every
+layout-encoding body and every reduce/dot op line — so two such configs are called
+equivalent **only when their IR is byte-identical**, never on an empty signature. `()` now
+means "no reduction-like op at all." This keeps the relation sound even where it cannot yet
+reason precisely (it conservatively *detects or splits* instead of merging).
+
 ### 5.3 Canonical-tree oracle (tests, ground truth)
 
 To know what the conservative relation misses, tests build the **actual
@@ -264,13 +276,17 @@ New levels are added to `CHECKERS = {"ttgir": ..., "ptx": ...}`.
 
 ## 7. Scope, limitations & roadmap
 
-**In scope (first cut):** single-operand `tt.reduce` (sum/prod/max/min) over a
-`#blocked` operand, any axis (1-D / 2-D).
+**In scope (first cut), validated sound on the GPU:** single-operand `tt.reduce`
+(sum/prod/max/min) over a `#blocked` operand, any axis (1-D / 2-D), including
+looped/large-N and bf16/fp16 — see `bitequiv/evaluation/`.
 
-**Out of scope / conservative today, in roadmap order:**
-- **Multi-operand reduces** (argmax/argmin/Welford): the parser matches a single
-  operand; multi-operand ops `(tensor<…>, tensor<…>)` with a `2N`-arg region don't
-  match yet (no false merge). *Next.*
+**Conservatively handled today (sound, not yet precise), in roadmap order:**
+- **Multi-operand reduces** (argmax/argmin/Welford): the parser matches a single operand;
+  multi-operand ops `(tensor<…>, tensor<…>)` with a `2N`-arg region are caught by the
+  §5.2 unanalyzed guard (conservatively *not* merged unless IR-identical — they are
+  detected/split, never falsely equated). *Full structural analysis is next.*
+- **MMA / `tl.dot`** (the K-axis accumulation): no `tt.reduce` to parse; also caught by
+  the unanalyzed guard (sound). Precise analysis is the M3 GEMM milestone.
 - **Non-contiguous reduce axis**: descriptor stays sound (includes `order`); the oracle
   assumes a contiguous axis — generalize the leaf map for exact modeling.
 - **`#mma` / `#linear`**: compared verbatim today. Upgrade the leaf map to the real

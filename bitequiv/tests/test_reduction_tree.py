@@ -199,3 +199,67 @@ def test_oracle_unordered_butterfly_pairs_by_xor_not_adjacency():
     leaves_of = lambda node: ({node} if isinstance(node, int) else leaves_of(node[0]) | leaves_of(node[1]))
     subtree_leaves = sorted(sorted(leaves_of(child)) for child in tree)
     assert subtree_leaves == [[0, 2], [1, 3]]
+
+
+# --------------------------------------------------------------------------- #
+# soundness guard: a reduce-like op the parser can't analyze (multi-operand
+# tt.reduce, or an MMA accumulation) must NOT collapse to an empty descriptor —
+# an empty descriptor compares equal to everything (the welford/gemm FP bug).
+# --------------------------------------------------------------------------- #
+def _ttgir_multi_operand(s, wpc):
+    blocked = _blocked([1], [32], [wpc], [0])
+    return f"""
+#blocked = {blocked}
+module {{
+  tt.func @k() {{
+    %v, %i = "tt.reduce"(%val, %idx) <{{axis = 0 : i32}}> ({{
+    ^bb0(%a: f32, %b: i32, %c: f32, %d: i32):
+      %lt = arith.cmpf olt, %a, %c : f32
+      %rv = arith.select %lt, %a, %c : f32
+      %ri = arith.select %lt, %b, %d : i32
+      tt.reduce.return %rv, %ri : f32, i32
+    }}) : (tensor<{s}xf32, #blocked>, tensor<{s}xi32, #blocked>) -> (f32, i32)
+    tt.return
+  }}
+}}
+"""
+
+
+def _ttgir_mma(prec, wpc):
+    return f"""
+#mma = #ttg.nvidia_mma<{{versionMajor = 3, warpsPerCTA = [{wpc}, 1]}}>
+module {{
+  tt.func @k() {{
+    %c = tt.dot %a, %b, %acc, inputPrecision = {prec} : tensor<128x128xf32, #mma>
+    tt.return
+  }}
+}}
+"""
+
+
+def test_multi_operand_reduce_not_empty_descriptor():
+    # a multi-operand reduce must NOT yield () (which would equal everything).
+    d = reduction_descriptor(_ttgir_multi_operand(8192, 4))
+    assert d != () and any(e[0] == "unanalyzed" for e in d)
+
+
+def test_multi_operand_reduce_is_sound_across_layouts():
+    # different warpsPerCTA -> NOT declared equivalent (the welford soundness fix)...
+    assert not reductions_equivalent(_ttgir_multi_operand(8192, 2), _ttgir_multi_operand(8192, 4))
+    # ...but identical IR is still reflexively equivalent.
+    assert reductions_equivalent(_ttgir_multi_operand(8192, 4), _ttgir_multi_operand(8192, 4))
+
+
+def test_mma_accumulation_is_sound():
+    d = reduction_descriptor(_ttgir_mma("tf32", 4))
+    assert d != () and any(e[0] == "unanalyzed" for e in d)
+    # different precision -> NOT equivalent (the gemm precision case)...
+    assert not reductions_equivalent(_ttgir_mma("ieee", 4), _ttgir_mma("tf32", 4))
+    # ...identical -> equivalent.
+    assert reductions_equivalent(_ttgir_mma("tf32", 4), _ttgir_mma("tf32", 4))
+
+
+def test_no_reduction_still_empty_and_vacuously_equivalent():
+    # a kernel with NO reduction-like op at all still yields () and is equivalent.
+    assert reduction_descriptor(_NO_REDUCTION) == ()
+    assert reductions_equivalent(_NO_REDUCTION, _NO_REDUCTION)

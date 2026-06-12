@@ -47,11 +47,19 @@ _ENC_DEF = re.compile(r"^#(\w+)\s*=\s*(#ttg\.\w+<.*>)\s*$", re.M)
 # operand-encoding-name):
 #   "tt.reduce"(%v) <{axis = 1 : i32, reduction_ordering = "unordered"}> ({ ...region... })
 #       : (tensor<64x1024xf32, #blocked>) -> tensor<64xf32, #ttg.slice<...>>
-# NOTE: the leading `\(tensor<...>\)` with a single operand type is intentional —
-# multi-operand reduces (argmax/argmin/Welford) have `(tensor<...>, tensor<...>)`
-# and are *not* matched here (a named follow-up).
+# NOTE: the trailing `\(tensor<...>\)` matches a SINGLE operand type on purpose.
+# Multi-operand reduces (argmax/argmin/Welford) have `(tensor<...>, tensor<...>)`
+# and deliberately do NOT match here — they are caught as "unanalyzed" below
+# (see reduction_descriptor) so they are never silently dropped.
 _REDUCE = re.compile(r'"tt\.reduce"\([^)]*\)\s*<\{([^}]*)\}>\s*\(\{(.*?)\}\)\s*:\s*'
                      r"\(tensor<([^,>]*),\s*(#\w+)>\)", re.S)
+
+# Every tt.reduce op, single OR multi operand — to detect reduces the single-operand
+# parser did not structurally handle (a count mismatch means something was unparsed).
+_ANY_REDUCE = re.compile(r'"tt\.reduce"\(')
+# Tensor-core / matmul accumulation: a numerically-relevant reduction (the K-axis
+# accumulation) that is NOT a tt.reduce and that this checker does not model.
+_MMA_OP = re.compile(r"tt\.dot|warp_group_dot|tc_gen5_mma|tcgen05|nvidia_mma")
 
 
 def _array(key, body):
@@ -122,15 +130,46 @@ def _layout_term(info):
     return ("raw", " ".join(info.enc_body.split()), info.s_axis)
 
 
+def _unanalyzed_fingerprint(ttgir):
+    """A conservative, hashable fingerprint for reduce-like ops we cannot
+    structurally analyze. It includes every layout-encoding body and every
+    reduce/dot op line, so it **differs whenever the numerics could differ**
+    (a different layout or precision changes it) yet is identical for a
+    byte-identical compilation. Using it as the descriptor component for an
+    unanalyzed op means two such configs are called equivalent only when their
+    relevant IR is identical — never merged on an empty signature."""
+    enc = tuple(sorted(" ".join(b.split()) for _, b in _ENC_DEF.findall(ttgir)))
+    ops = tuple(sorted(" ".join(ln.split())
+                       for ln in ttgir.splitlines()
+                       if ('"tt.reduce"' in ln) or _MMA_OP.search(ln)))
+    return (enc, ops)
+
+
 def reduction_descriptor(ttgir):
     """Conservative, hashable reduction-order descriptor of a TTGIR module.
 
-    Returns one entry per ``tt.reduce`` (in textual order):
-    ``(axis, ordering, combine, layout_term)``. Two TTGIRs with equal descriptors
-    perform identical reduction trees (sound); equal trees may occasionally yield
-    different descriptors (conservative). ``()`` when there is no reduction.
+    One entry per structurally-analyzed (single-operand) ``tt.reduce``:
+    ``(axis, ordering, combine, layout_term)`` — equal descriptors ⇒ identical
+    reduction trees (sound); equal trees may occasionally differ (conservative).
+
+    **Soundness guard.** Any reduce-like op we could NOT analyze — a multi-operand
+    ``tt.reduce`` (argmax/argmin/Welford) or a tensor-core/MMA accumulation (the
+    K-axis reduction of ``tt.dot``) — must not be silently dropped: otherwise two
+    such configs would share an *empty* descriptor and be unsoundly declared
+    equivalent. We append a conservative ``("unanalyzed", kinds, fingerprint)``
+    entry so those configs match only when their IR is identical. ``()`` (truly
+    equivalent-to-any) is returned ONLY when the module has no reduction-like op at all.
     """
-    return tuple((info.axis, info.ordering, info.combine, _layout_term(info)) for info in parse_reductions(ttgir))
+    parsed = parse_reductions(ttgir)
+    entries = [(info.axis, info.ordering, info.combine, _layout_term(info)) for info in parsed]
+    unanalyzed = []
+    if len(_ANY_REDUCE.findall(ttgir)) > len(parsed):
+        unanalyzed.append("multi-operand-reduce")
+    if _MMA_OP.search(ttgir):
+        unanalyzed.append("mma-accumulation")
+    if unanalyzed:
+        entries.append(("unanalyzed", tuple(sorted(unanalyzed)), _unanalyzed_fingerprint(ttgir)))
+    return tuple(entries)
 
 
 def reductions_equivalent(ttgir_a, ttgir_b):
