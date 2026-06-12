@@ -57,10 +57,16 @@ export FBTRITON_COMPILE_IQ_APPLY=1           # default OFF; needs ptxas>=13.3 (v
       correct output from the task alone (rel-err 0 vs torch). ✅
 - [x] **CP3 — factory → store**: `python -m triton.compile_iq.factory <task_dir>`
       runs the search and writes `$COMPILE_IQ_STORE/<arch>/<sha>.acf` + `.acf.json`. ✅
-- [ ] **CP4 — autotuned kernel (ws)**: collection fires per compiled config; capture/
-      select the *winning*-config task; replay needs `TensorDescriptor` (TMA) + cluster
-      launch support in `replay.build_args`/`run_once`. (no-autotune vs autotune is the
-      only axis that matters; kernel complexity is otherwise equivalent.)
+- [~] **CP4 — autotuned/TMA kernel (ws)**:
+      - [x] **Generic replay** of TMA + cluster kernels: `build_args` reconstructs
+        `TensorDescriptor`s (`empty_strided` base + captured `block_shape`); `run_once`
+        installs a TMA allocator and launches the raw `JITFunction` with `ctas_per_cga`
+        (cluster) — bypassing autotune. Verified on blackwell_gemm_ws: output rel-err 0
+        vs a@b. ✅
+      - [ ] **Winning-config selection**: autotune compiles ~hundreds of configs →
+        collection dumps a task per config (267 for one 2048³ ws run). Need to mark the
+        autotune winner so the factory tunes one task, not hundreds (and to avoid disk
+        bloat). Small autotuner-side hook. ⬜
 - [x] **CP5 — consumption (in-Triton `make_cubin` hook)**: a gated hook in
       `nvidia/backend/compiler.py::make_cubin` (env `FBTRITON_COMPILE_IQ_APPLY`, default
       OFF) hashes the PTX, looks up `store.read_acf(sha, arch)`, and appends

@@ -23,20 +23,6 @@ DEFAULT_SS_BIN = os.environ.get("COMPILE_IQ_SEARCH_SPACE_BIN")
 REL_TOL = 1e-2
 
 
-def _snapshot(args, tensor_idx):
-    return [args[i].detach().clone() for i in tensor_idx]
-
-
-def _matches(ref, args, tensor_idx):
-    for r, i in zip(ref, tensor_idx):
-        cur = args[i].float()
-        denom = r.float().abs().max()
-        rel = (cur - r.float()).abs().max() / (denom if denom > 0 else 1.0)
-        if not torch.isfinite(rel) or rel.item() > REL_TOL:
-            return False
-    return True
-
-
 def run_factory(task_dir, generations=2, pool_size=8, ss_bin=DEFAULT_SS_BIN):
     # The CompileIQ engine is proprietary and not vendored; fail fast with how to get it.
     try:
@@ -69,12 +55,22 @@ def run_factory(task_dir, generations=2, pool_size=8, ss_bin=DEFAULT_SS_BIN):
     print(f"[factory] ptxas: {ptxas}")
 
     kernel = replay.load_kernel(task_dir, task)
-    args, tensor_idx = replay.build_args(task)
 
-    # reference (no ACF) output + baseline
-    replay.run_once(kernel, task, args, None)
-    ref = _snapshot(args, tensor_idx)
-    base_ms = replay.benchmark(kernel, task, args, None)
+    def _bench(acf_path):
+        # Self-contained so it works whether run in the main process (baseline) or a
+        # CompileIQ worker subprocess (candidates): build the args — incl. TMA descriptors
+        # — in THIS process so they live in the current CUDA context (else TMA descriptor
+        # creation fails with "invalid device context"). Returns runtime ms, or None if the
+        # output is numerically wrong (an ACF must not change results). GEMM: out == args[0]@args[1].
+        args, tensors = replay.build_args(task)
+        replay.run_once(kernel, task, args, acf_path)
+        ref = torch.matmul(tensors[0].float(), tensors[1].float())
+        denom = max(ref.abs().max().item(), 1e-9)
+        ok = any(t.shape == ref.shape and (t.float() - ref).abs().max().item() / denom <= REL_TOL
+                 for t in tensors)
+        return replay.benchmark(kernel, task, args, acf_path) if ok else None
+
+    base_ms = _bench(None)
     print(f"[factory] task={os.path.basename(task_dir)} arch={task['arch']} "
           f"ptx_sha={task['ptx_sha256'][:16]} baseline={base_ms:.4f} ms")
 
@@ -82,10 +78,8 @@ def run_factory(task_dir, generations=2, pool_size=8, ss_bin=DEFAULT_SS_BIN):
         with tempfile.NamedTemporaryFile(suffix=".acf", delete=True) as f:
             save_compiler_config(f.name, acf)
             try:
-                replay.run_once(kernel, task, args, f.name)
-                if not _matches(ref, args, tensor_idx):
-                    return INVALID_SCORE
-                return replay.benchmark(kernel, task, args, f.name)
+                ms = _bench(f.name)
+                return ms if ms is not None else INVALID_SCORE
             except Exception as e:
                 print(f"[factory] candidate failed: {type(e).__name__}: {e}")
                 return INVALID_SCORE
@@ -94,6 +88,14 @@ def run_factory(task_dir, generations=2, pool_size=8, ss_bin=DEFAULT_SS_BIN):
     tuner = Search(objective_function=objective, search_space=LocalSearchSpaceBin(ss_bin), search_config=cfg)
     with gpu_benchmark_mode(clock_mhz=1965, raise_on_failure=False):
         results = tuner.start()
+
+    try:
+        df = results.get_results()
+        print(f"[factory] search radius (candidate ACFs assessed) = {len(df)}")
+        df.to_csv(os.path.join(os.path.dirname(store.acf_path(task['ptx_sha256'], task['arch'])),
+                               f"{task['ptx_sha256']}.results.csv"), index=False)
+    except Exception as e:
+        print(f"[factory] (radius/results dump skipped: {e})")
 
     best = results.get_best_result()
     best_ms = best.get("score_1", best.get("score"))
@@ -114,8 +116,13 @@ def run_factory(task_dir, generations=2, pool_size=8, ss_bin=DEFAULT_SS_BIN):
         "pool_size": pool_size,
         "task_dir": task_dir,
     }
-    p = store.write_acf(task["ptx_sha256"], task["arch"], acf_bytes, meta)
     print(f"[factory] best={best_ms:.4f} ms (baseline {base_ms:.4f}, {meta['speedup_pct']:+.2f}%)")
+    # Only publish an ACF that actually beats the no-ACF baseline — never store a regression
+    # (on a miss the consume hook falls back to plain compile, which is faster here).
+    if base_ms is None or best_ms is None or best_ms >= base_ms:
+        print(f"[factory] best did not beat baseline ({meta['speedup_pct']:+.2f}%) — NOT storing.")
+        return None
+    p = store.write_acf(task["ptx_sha256"], task["arch"], acf_bytes, meta)
     print(f"[factory] wrote ACF -> {p}")
     return p
 

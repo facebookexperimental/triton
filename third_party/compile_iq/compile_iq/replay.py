@@ -36,25 +36,35 @@ _DT = {
 }
 
 
+def _make_tensor(shape, strides, dt, device):
+    t = torch.empty_strided(shape, strides, dtype=dt, device=device)
+    t.normal_() if dt.is_floating_point else t.zero_()
+    return t
+
+
 def build_args(task: dict, device="cuda"):
-    """Reconstruct positional args in bound order. Returns (args, tensor_indices)."""
+    """Reconstruct positional args in bound order. Returns (args, tensors) where
+    `tensors` is the list of underlying torch.Tensors (plain tensors + the base of each
+    TensorDescriptor) used for correctness comparison. Handles TMA descriptors so
+    autotuned/warp-specialized kernels (e.g. blackwell_gemm_ws) replay generically."""
     torch.manual_seed(0)
-    args, tensor_idx = [], []
-    for i, a in enumerate(task["args"]):
+    args, tensors = [], []
+    for a in task["args"]:
         kind = a["kind"]
         if kind == "tensor":
-            dt = _DT[a["dtype"]]
-            if dt.is_floating_point:
-                t = torch.randn(a["shape"], device=device, dtype=dt)
-            else:
-                t = torch.zeros(a["shape"], device=device, dtype=dt)
+            t = _make_tensor(a["shape"], a["strides"], _DT[a["dtype"]], device)
             args.append(t)
-            tensor_idx.append(i)
+            tensors.append(t)
+        elif kind == "tensor_descriptor":
+            from triton.tools.tensor_descriptor import TensorDescriptor
+            base = _make_tensor(a["base_shape"], a["base_strides"], _DT[a["base_dtype"]], device)
+            args.append(TensorDescriptor(base, a["base_shape"], a["base_strides"], a["block_shape"]))
+            tensors.append(base)
         elif kind in ("scalar", "constexpr"):
             args.append(a["value"])
         else:
-            raise NotImplementedError(f"arg kind {kind} (tensor_descriptor replay TODO)")
-    return args, tensor_idx
+            raise NotImplementedError(f"arg kind {kind}")
+    return args, tensors
 
 
 def _ptxas_ge_133(p: str) -> bool:
@@ -97,25 +107,59 @@ def _set_ptxas(task):
     os.environ["TRITON_ALWAYS_COMPILE"] = "1"
 
 
+def _alloc_fn(size, align, stream):  # TMA descriptor scratch allocator
+    return torch.empty(size, dtype=torch.int8, device="cuda")
+
+
+def _raw_jit(kernel):
+    """The launchable JITFunction. If the loaded symbol is an Autotuner, use its `.fn`
+    so the captured config (already in the args) is launched directly (no re-autotuning)."""
+    return kernel.fn if hasattr(kernel, "configs") else kernel
+
+
+def _launch_kwargs(task):
+    """Triton launch options (distinct from the kernel's constexprs) needed when bypassing
+    the autotuner. Clusters use `ctas_per_cga` (CUDA semantics; == cluster_dims), NOT
+    `num_ctas` — TLX/cluster kernels reject num_ctas and require ctas_per_cga."""
+    kw = {}
+    if task.get("num_warps"):
+        kw["num_warps"] = task["num_warps"]
+    cd = tuple(task.get("cluster_dims") or ())
+    if cd and any(d > 1 for d in cd):
+        kw["ctas_per_cga"] = cd
+    return kw
+
+
 def run_once(kernel, task, args, acf_path: str | None):
     """Launch the kernel once with the captured grid; ACF applied via PTX_OPTIONS."""
     grid = tuple(task["grid"])
+    kfn = _raw_jit(kernel)
+    try:
+        triton.set_allocator(_alloc_fn)
+    except Exception:
+        pass
     if acf_path:
         os.environ["PTX_OPTIONS"] = f"--apply-controls={acf_path}"
     else:
         os.environ.pop("PTX_OPTIONS", None)
     try:
-        kernel[grid](*args)
+        kfn[grid](*args, **_launch_kwargs(task))
         torch.cuda.synchronize()
     finally:
         os.environ.pop("PTX_OPTIONS", None)
 
 
 def benchmark(kernel, task, args, acf_path, warmup=25, rep=100):
+    kfn = _raw_jit(kernel)
+    try:
+        triton.set_allocator(_alloc_fn)
+    except Exception:
+        pass
     if acf_path:
         os.environ["PTX_OPTIONS"] = f"--apply-controls={acf_path}"
+    kw = _launch_kwargs(task)
     try:
-        return triton.testing.do_bench(lambda: kernel[tuple(task["grid"])](*args), warmup=warmup, rep=rep,
+        return triton.testing.do_bench(lambda: kfn[tuple(task["grid"])](*args, **kw), warmup=warmup, rep=rep,
                                        return_mode="mean")
     finally:
         os.environ.pop("PTX_OPTIONS", None)
