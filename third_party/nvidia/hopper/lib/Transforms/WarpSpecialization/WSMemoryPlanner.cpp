@@ -3654,7 +3654,7 @@ LogicalResult readDecisionsFromFile(SmallVector<Channel *> &channels,
 LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
                               StringRef readDecisionFile = "",
                               StringRef writeDecisionFile = "",
-                              int smemAllocAlgo = 0, unsigned smemBudget = 0,
+                              int smemAllocAlgo = 1, unsigned smemBudget = 0,
                               bool smemCircularReuse = false) {
 
   // Step 1: collect all communications between producers and consumers.
