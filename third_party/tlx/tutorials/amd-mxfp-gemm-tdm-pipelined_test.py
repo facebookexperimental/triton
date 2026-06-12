@@ -202,8 +202,24 @@ def _mxgemm_issue_loads(
         else:
             _mxgemm_issue_load_b_scale(b_scale_desc, b_scale_buf, load_idx, pred, BLOCK_K_SCALE_PRESHUFFLED,
                                        NUM_BUFFERS, SCALE_PRESHUFFLE)
+    elif TDM_FUSION == "partial":
+        tl.static_assert(WITH_A_SCALE, "partial TDM fusion requires WITH_A_SCALE")
+        tlx.async_amd_descriptor_load_group(
+            [a_desc, b_desc],
+            [tlx.local_view(a_buf, slot), tlx.local_view(b_buf, slot)],
+            [[0, load_idx * BLOCK_K_PACKED_A], b_offsets],
+            [0b0101, 0b1010],
+            preds=[pred, pred],
+        )
+        tlx.async_amd_descriptor_load_group(
+            [a_scale_desc, b_scale_desc],
+            [tlx.local_view(a_scale_buf, slot), tlx.local_view(b_scale_buf, slot)],
+            [scale_offsets, scale_offsets],
+            [0b0101, 0b1010],
+            preds=[pred, pred],
+        )
     else:
-        tl.static_assert(TDM_FUSION == "none", "TDM_FUSION must be one of: none, 2way, 4way")
+        tl.static_assert(TDM_FUSION == "none", "TDM_FUSION must be one of: none, 2way, 4way, partial")
         _mxgemm_issue_load_a_scale(a_scale_desc, a_scale_buf, load_idx, pred, BLOCK_K_SCALE_PRESHUFFLED, NUM_BUFFERS,
                                    SCALE_PRESHUFFLE, WITH_A_SCALE)
         _mxgemm_issue_load_b_scale(b_scale_desc, b_scale_buf, load_idx, pred, BLOCK_K_SCALE_PRESHUFFLED, NUM_BUFFERS,
@@ -438,8 +454,11 @@ def mxgemm_tdm_pipelined_kernel(
         NUM_LOADS_IN_BATCH: tl.constexpr = 1
     elif TDM_FUSION == "2way":
         NUM_LOADS_IN_BATCH: tl.constexpr = 2
+    elif TDM_FUSION == "partial":
+        tl.static_assert(WITH_A_SCALE, "partial TDM fusion requires WITH_A_SCALE")
+        NUM_LOADS_IN_BATCH: tl.constexpr = 2
     else:
-        tl.static_assert(TDM_FUSION == "none", "TDM_FUSION must be one of: none, 2way, 4way")
+        tl.static_assert(TDM_FUSION == "none", "TDM_FUSION must be one of: none, 2way, 4way, partial")
         NUM_LOADS_IN_BATCH: tl.constexpr = 4 if WITH_A_SCALE else 3
     if SCHEDULE == "sliceMNK":
         NUM_SUBTILES_M: tl.constexpr = 2
@@ -838,7 +857,7 @@ def mxgemm_tdm_pipelined(
     return c
 
 
-@pytest.mark.parametrize("TDM_FUSION", ["none", "2way", "4way"])
+@pytest.mark.parametrize("TDM_FUSION", ["none", "2way", "4way", "partial"])
 def test_mxgemm_tdm_pipelined_compiles_gfx1250(TDM_FUSION):
     from triton.backends.compiler import GPUTarget
     from triton.compiler.compiler import ASTSource, compile as triton_compile
@@ -888,6 +907,12 @@ def test_mxgemm_tdm_pipelined_compiles_gfx1250(TDM_FUSION):
     else:
         assert "amdg.async_tdm_group_copy_global_to_local" in ttgir
         assert "amdg.async_tdm_copy_global_to_local" not in ttgir
+    if TDM_FUSION == "2way":
+        assert "warp_masks = array<i32: 3, 12>" in ttgir
+    elif TDM_FUSION == "4way":
+        assert "warp_masks = array<i32: 1, 2, 4, 8>" in ttgir
+    elif TDM_FUSION == "partial":
+        assert "warp_masks = array<i32: 5, 10>" in ttgir
     assert "amdg.tdm_prefetch" in ttgir
     assert "tt.dot_scaled" in ttgir
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
@@ -907,6 +932,7 @@ def test_mxgemm_tdm_pipelined_compiles_gfx1250(TDM_FUSION):
         (256, 256, 512, "sliceMNK", "float8_e4m3", "float8_e4m3", 256, 256, 256, 2, True, True, "none", 2),
         (256, 256, 512, "sliceMNK", "float8_e4m3", "float8_e4m3", 256, 256, 256, 2, True, True, "2way", 2),
         (256, 256, 512, "sliceMNK", "float8_e4m3", "float8_e4m3", 256, 256, 256, 2, True, True, "4way", 2),
+        (256, 256, 512, "sliceMNK", "float8_e4m3", "float8_e4m3", 256, 256, 256, 2, True, True, "partial", 2),
         (256, 512, 512, "sliceMNK", "float8_e4m3", "float8_e5m2", 128, 256, 256, 2, True, True, "4way", 2),
         (256, 256, 512, "baseline", "float4", "float4", 128, 128, 128, 2, True, True, "4way", 2),
         (384, 384, 512, "sliceMNK", "float8_e4m3", "float8_e4m3", 256, 256, 256, 2, True, True, "4way", 2),
