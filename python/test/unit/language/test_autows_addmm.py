@@ -105,7 +105,6 @@ def addmm_kernel_tma_persistent_ws(
 @pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
-@pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
 @pytest.mark.parametrize("generate_subtiled_region", [True, False])
@@ -123,7 +122,6 @@ def test_autows_addmm_tma_persistent(
     EPILOGUE_SUBTILE,
     A_col_major,
     B_col_major,
-    use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     SMEM_ALLOC_ALGO,
     generate_subtiled_region,
@@ -215,7 +213,6 @@ def test_autows_addmm_tma_persistent(
             SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
             num_stages=num_stages,
             num_warps=num_warps,
-            early_tma_store_lowering=use_early_tma_store_lowering,
             generate_subtiled_region=generate_subtiled_region,
         )
 
@@ -332,7 +329,6 @@ def _run_addmm_1d_bias_ws():
             NUM_SMS=NUM_SMS,
             num_stages=num_stages,
             num_warps=num_warps,
-            early_tma_store_lowering=True,
         )
 
         ref_out = (torch.matmul(A.to(torch.float32), B.T.to(torch.float32)) + bias_1d.to(torch.float32)).to(dtype)
