@@ -540,6 +540,18 @@ struct HoistTMEMAlloc
   void runOnOperation() override {
     ModuleOp m = getOperation();
     if (!hoistOutOfIf) {
+      // Coalesce chained MMA accumulator buffers before hoisting. When two
+      // MMA ops chain (tmem_alloc → MMA1 → tmem_load → tmem_alloc → MMA2),
+      // forward the first buffer into the second alloc to reuse the same TMEM.
+      {
+        mlir::RewritePatternSet coalescePatterns(&getContext());
+        coalescePatterns.add<TMEMLoadForwarding, RemoveUnusedTMEMLoad>(
+            &getContext());
+        if (failed(applyPatternsGreedily(m, std::move(coalescePatterns)))) {
+          llvm_unreachable("Failed to coalesce chained TMEM allocs");
+        }
+      }
+
       SmallVector<ttng::MMAv5OpInterface> mmaOps;
       m.walk([&](ttng::MMAv5OpInterface mmaOp) { mmaOps.push_back(mmaOp); });
       for (auto mmaOp : mmaOps) {
