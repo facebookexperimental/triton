@@ -427,8 +427,8 @@ class layout(layout_encoding):
                 and self.value_stride == other.value_stride)
 
     def __hash__(self):
-        return hash((tuple(self.thread_shape), tuple(self.value_shape), tuple(self.thread_stride),
-                     tuple(self.value_stride)))
+        return hash(
+            (tuple(self.thread_shape), tuple(self.value_shape), tuple(self.thread_stride), tuple(self.value_stride)))
 
 
 class storage_kind(enum.Enum):
