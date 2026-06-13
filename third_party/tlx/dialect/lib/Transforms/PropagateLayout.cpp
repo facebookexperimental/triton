@@ -221,7 +221,7 @@ computeBlockedTensorValues(triton::FuncOp funcOp, DataFlowSolver &solver) {
       collectRegionBranchSuccessors(branchOp, successors);
 
       for (RegionSuccessor successor : successors) {
-        ValueRange successorInputs = successor.getSuccessorInputs();
+        ValueRange successorInputs = branchOp.getSuccessorInputs(successor);
         for (auto [index, successorInput] : llvm::enumerate(successorInputs)) {
           if (!isa<RankedTensorType>(successorInput.getType()))
             continue;
@@ -265,7 +265,7 @@ updateTensorRegionBranchTypes(triton::FuncOp funcOp, DataFlowSolver &solver,
     while (changed) {
       changed = false;
       for (RegionSuccessor successor : successors) {
-        ValueRange successorInputs = successor.getSuccessorInputs();
+        ValueRange successorInputs = branchOp.getSuccessorInputs(successor);
         for (auto [index, successorInput] : llvm::enumerate(successorInputs)) {
           if (!isa<RankedTensorType>(successorInput.getType()))
             continue;
