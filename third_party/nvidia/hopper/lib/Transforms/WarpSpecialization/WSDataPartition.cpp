@@ -92,6 +92,7 @@ static void fixTaskId(triton::FuncOp &funcOp) {
 
 struct DataPartitionScheme {
   unsigned numPartitions = 0;
+  bool skipPartitioning = false;
   // ops to be partitioned.
   SetVector<Operation *> ops;
   // Which dimension to partition. For dot, dim 0 means along M dimension, 1
@@ -112,6 +113,7 @@ struct DataPartitionScheme {
   static const unsigned noOpPartitionDim = ~0U - 2;
 
   void append(DataPartitionScheme &other) {
+    skipPartitioning |= other.skipPartitioning;
     for (auto op : other.ops)
       ops.insert(op);
     for (auto op : other.opPartitionDims)
@@ -130,7 +132,45 @@ struct DataPartitionScheme {
     }
   }
 
-  bool partitionIsCompatible() { return true; }
+  bool partitionIsCompatible() {
+    for (Operation *op : ops) {
+      auto it = opPartitionDims.find(op);
+      assert(it != opPartitionDims.end() && "missing partition dim");
+      unsigned dim = it->second;
+      if (dim != 0)
+        continue;
+
+      for (Value result : op->getResults()) {
+        auto type = dyn_cast<MemDescType>(result.getType());
+        if (!type)
+          continue;
+
+        auto tmem =
+            dyn_cast<ttng::TensorMemoryEncodingAttr>(type.getEncoding());
+        if (!tmem)
+          continue;
+
+        ArrayRef<int64_t> shape = type.getShape().take_back(2);
+        int64_t slicedM = shape[0] / numPartitions;
+        int64_t minM = tmem.getBlockM() * tmem.getCTASplitM();
+        if (slicedM >= minM)
+          continue;
+
+        op->emitWarning()
+            << "skipping M-dimension data partitioning because slicing "
+               "TMEM result from "
+            << shape[0] << " to " << slicedM
+            << " rows would require updating tensor memory encoding blockM="
+            << tmem.getBlockM();
+        LDBG("skipping M-dimension data partitioning for TMEM result: slicedM "
+             << slicedM << " < minimum encoded M " << minM);
+        skipPartitioning = true;
+        return false;
+      }
+    }
+
+    return true;
+  }
 
   bool isValidPartitionDim(unsigned dim) const {
     return dim < numPartitions || dim == DataPartitionScheme::noOpPartitionDim;
@@ -735,8 +775,17 @@ static bool computePartitionScheme(triton::FuncOp &funcOp,
       LLVM_DEBUG(
           { LDBG("Trying partition along " << partitionDim[i] << " \n"); });
 
-      if (getSliceToPartition(accumulator, trialPartitionScheme,
-                              partitionDim[i])) {
+      bool compatible = getSliceToPartition(accumulator, trialPartitionScheme,
+                                            partitionDim[i]) &&
+                        trialPartitionScheme.partitionIsCompatible();
+      if (trialPartitionScheme.skipPartitioning) {
+        unsigned numPartitions = partitionScheme.numPartitions;
+        partitionScheme = DataPartitionScheme();
+        partitionScheme.numPartitions = numPartitions;
+        partitionScheme.skipPartitioning = true;
+        return true;
+      }
+      if (compatible) {
         success = true;
         partitionScheme = trialPartitionScheme;
       }
@@ -1685,6 +1734,14 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
     if (numConsumerGroups > 1) {
       LDBG("computePartitionScheme failed when requested");
       return false;
+    }
+    return true;
+  }
+  if (partitionScheme.ops.empty()) {
+    if (partitionScheme.skipPartitioning) {
+      LDBG("skipping data partitioning due to incompatible TMEM encoding");
+    } else {
+      LDBG("skipping data partitioning");
     }
     return true;
   }
