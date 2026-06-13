@@ -100,6 +100,8 @@ void init_triton_passes_ttgpuir(py::module &&m) {
                      createTritonGPUOptimizePartitionWarps);
   ADD_PASS_WRAPPER_0("add_partition_scheduling",
                      createTritonGPUPartitionScheduling);
+  ADD_PASS_OPTION_WRAPPER_1("add_pipelining_analysis",
+                            createTritonGPUPipeliningAnalysis, int);
 }
 
 void init_plugin_passes(py::module &&m) {

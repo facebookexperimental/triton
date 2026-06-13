@@ -17,6 +17,7 @@ add_triton_library(TritonGPUTransforms
   Pipeliner/WGMMAPipeline.cpp
   Pipeliner/PipelineExpander.cpp
   Pipeliner/TestPipelineLowerLoop.cpp
+  Pipeliner/PipeliningAnalysis.cpp
   Pipeliner/SoftwarePipeliner.cpp
   Pipeliner/TMAStoresPipeline.cpp
   Pipeliner/MMAv5PipelineUtility.cpp
