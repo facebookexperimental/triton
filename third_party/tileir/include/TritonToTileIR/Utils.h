@@ -165,6 +165,12 @@ public:
             return CudaTileOp::create(builder, loc, operands[0], rounding,
                                       ftzModifier);
           } else if constexpr (std::is_same_v<TritonOp,
+                                              triton::TanhApproxOp>) {
+            bool isF32 = getElementTypeOrSelf(op.getResult().getType()).isF32();
+            auto rounding = isF32 ? cuda_tile::RoundingMode::APPROX
+                                  : cuda_tile::RoundingMode::FULL;
+            return CudaTileOp::create(builder, loc, operands[0], rounding);
+          } else if constexpr (std::is_same_v<TritonOp,
                                               triton::PreciseSqrtOp>) {
             // Lower a precise sqrt operation. The ftz flag will not
             // have any effect.
