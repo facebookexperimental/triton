@@ -1,8 +1,15 @@
 // RUN: triton-opt %s -split-input-file --nvgpu-warp-specialization="num-stages=3 capability=100" | FileCheck %s
+// RUN: triton-opt %s -split-input-file --nvgpu-warp-specialization="num-stages=3 capability=100" | FileCheck %s --check-prefix=GUARDS
 
 // Test case: Basic Blackwell matrix multiplication with TMA and warp specialization.
 // This IR represents a GEMM kernel that uses tensor memory for accumulator
 // and has partition annotations on key operations.
+
+// Barrier<->buffer association (Milestone 1, barrier_analysis.md): the
+// barrier.guards / barrier.offsets stamped on the NVWS tokens at code-partition
+// time survive token lowering and land on the lowered HW barriers.
+// GUARDS-DAG: ttng.wait_barrier {{.*}}barrier.guards = array<i32: {{[0-9]+}}>{{.*}}barrier.offsets = array<i32: 0>
+// GUARDS-DAG: ttng.arrive_barrier {{.*}}barrier.guards = array<i32: {{[0-9]+}}>{{.*}}barrier.offsets = array<i32: 0>
 
 // CHECK-LABEL: @matmul_kernel_tma_ws
 // CHECK: ttg.warp_specialize

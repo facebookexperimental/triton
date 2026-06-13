@@ -1,4 +1,5 @@
 #include "CodePartitionUtility.h"
+#include "BarrierBufferAssoc.h"
 #include "TMEMUtils.h"
 #include "WSBarrierAnalysis.h"
 #include "mlir/Analysis/SliceAnalysis.h"
@@ -1066,6 +1067,11 @@ void createToken(
           v = ttnvws::CreateTokenOp::create(builder, tokenLoc, 1,
                                             tokenLoadType);
         commChannel.tokens[consumerAsyncTaskId] = v;
+        // M1 (barrier_analysis.md): associate this WSBarrier token with the
+        // physical buffer(s) it guards, so the relationship survives token
+        // lowering (mbarrier-only $alloc cannot recover the guarded buffer).
+        stampBarrierGuards(v.getDefiningOp(),
+                           computeChannelGuards(channel, config));
       }
 
       if (useGen5Barrier) {
@@ -1497,6 +1503,11 @@ void createTokenPost(
         v = ttnvws::CreateTokenOp::create(
             builder, tokenLoc, channel->getNumBuffers(), tokenLoadType);
         commChannel.tokens[consumerAsyncTaskId] = v;
+        // M1 (barrier_analysis.md): associate this WSBarrier token with the
+        // physical buffer(s) it guards, so the relationship survives token
+        // lowering (mbarrier-only $alloc cannot recover the guarded buffer).
+        stampBarrierGuards(v.getDefiningOp(),
+                           computeChannelGuards(channel, config));
       }
 
       if (useGen5Barrier) {
