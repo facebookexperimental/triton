@@ -926,6 +926,114 @@ def test_fa_persistent_cross_attention(q_len, kv_len, causal, dtype=torch.bfloat
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Performance regression guard
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Baseline TFLOPS measured on gfx950/MI350 (bf16, B=1, H=64). A kernel must stay
+# within PERF_TOL below its baseline or the perf test fails (catches regressions).
+# Regenerate the numbers with:
+#   python amd-fa-pipelined_test.py -b 1 -hq 64 -sq 4096 8192 16384 -d 64 128 \
+#       -causal true false --kernel async_simple async_prefetch persistent
+# then copy the printed Summary table values here.
+PERF_TOL = 0.15  # allow 15% slack below baseline (run-to-run noise + minor drift)
+
+# key: (kernel, D, N, causal) -> TFLOPS
+PERF_BASELINE_TFLOPS = {
+    ("async_simple", 64, 4096, False): 614,
+    ("async_simple", 64, 4096, True): 344,
+    ("async_simple", 64, 8192, False): 644,
+    ("async_simple", 64, 8192, True): 371,
+    ("async_simple", 64, 16384, False): 668,
+    ("async_simple", 64, 16384, True): 432,
+    ("async_simple", 128, 4096, False): 646,
+    ("async_simple", 128, 4096, True): 341,
+    ("async_simple", 128, 8192, False): 697,
+    ("async_simple", 128, 8192, True): 366,
+    ("async_simple", 128, 16384, False): 724,
+    ("async_simple", 128, 16384, True): 475,
+    ("async_prefetch", 64, 4096, False): 677,
+    ("async_prefetch", 64, 4096, True): 334,
+    ("async_prefetch", 64, 8192, False): 710,
+    ("async_prefetch", 64, 8192, True): 348,
+    ("async_prefetch", 64, 16384, False): 732,
+    ("async_prefetch", 64, 16384, True): 439,
+    ("async_prefetch", 128, 4096, False): 782,
+    ("async_prefetch", 128, 4096, True): 447,
+    ("async_prefetch", 128, 8192, False): 832,
+    ("async_prefetch", 128, 8192, True): 475,
+    ("async_prefetch", 128, 16384, False): 861,
+    ("async_prefetch", 128, 16384, True): 544,
+    ("persistent", 64, 4096, False): 695,
+    ("persistent", 64, 4096, True): 620,
+    ("persistent", 64, 8192, False): 724,
+    ("persistent", 64, 8192, True): 693,
+    ("persistent", 64, 16384, False): 744,
+    ("persistent", 64, 16384, True): 741,
+    ("persistent", 128, 4096, False): 828,
+    ("persistent", 128, 4096, True): 697,
+    ("persistent", 128, 8192, False): 876,
+    ("persistent", 128, 8192, True): 796,
+    ("persistent", 128, 16384, False): 894,
+    ("persistent", 128, 16384, True): 837,
+}
+
+
+def measure_tflops(kernel_fn, B, H, N, D, causal, dtype=torch.bfloat16):
+    """Verify correctness then return achieved TFLOPS for one config."""
+    torch.manual_seed(42)
+    q = torch.randn(B, H, N, D, device=DEVICE, dtype=dtype)
+    k = torch.randn(B, H, N, D, device=DEVICE, dtype=dtype)
+    v = torch.randn(B, H, N, D, device=DEVICE, dtype=dtype)
+    sm = 1.0 / math.sqrt(D)
+    fn = lambda: kernel_fn(q, k, v, sm, causal)
+    assert verify("", fn(), ref_sdpa(q, k, v, sm, causal), log=False), "correctness check failed"
+    ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+    valid_el = N * (N + 1) // 2 if causal else N * N
+    total_flops = 2 * 2.0 * B * H * valid_el * D
+    return total_flops / ms * 1e-9
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["nocausal", "causal"])
+@pytest.mark.parametrize("N", [4096, 8192, 16384])
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("kernel_name", ["async_simple", "async_prefetch", "persistent"])
+def test_fa_performance(kernel_name, D, N, causal):
+    """Guard against perf regressions: achieved TFLOPS must stay within PERF_TOL
+    of the recorded gfx950 baseline (B=1, H=64, bf16)."""
+    baseline = PERF_BASELINE_TFLOPS[(kernel_name, D, N, causal)]
+    floor = baseline * (1 - PERF_TOL)
+    got = measure_tflops(get_kernel(kernel_name), 1, 64, N, D, causal)
+    print(f"  {kernel_name:14s} D={D:3d} N={N:5d} {'causal' if causal else 'nc':6s} "
+          f"{got:7.1f} TFLOPS (baseline {baseline}, floor {floor:.1f})")
+    assert got >= floor, (f"perf regression: {kernel_name} D={D} N={N} causal={causal} -> "
+                          f"{got:.1f} TFLOPS < floor {floor:.1f} (baseline {baseline}, tol {PERF_TOL:.0%})")
+
+
+def run_perf_test(args):
+    """CLI entry: run the perf guard over all baseline configs, print a report,
+    and return True iff every kernel is within PERF_TOL of its baseline."""
+    tol = args.perf_tol
+    all_ok = True
+    print(f"\nPerformance regression test (floor = baseline * (1 - {tol:.0%}))")
+    print("-" * 78)
+    for (kernel_name, D, N, causal), baseline in sorted(PERF_BASELINE_TFLOPS.items()):
+        floor = baseline * (1 - tol)
+        try:
+            got = measure_tflops(get_kernel(kernel_name), 1, 64, N, D, causal)
+        except Exception as e:
+            all_ok = False
+            print(f"  [FAIL] {kernel_name:14s} D={D:3d} N={N:5d} {'causal' if causal else 'nc':6s} -> ERROR ({e})")
+            continue
+        ok = got >= floor
+        all_ok &= ok
+        print(f"  [{'PASS' if ok else 'FAIL'}] {kernel_name:14s} D={D:3d} N={N:5d} "
+              f"{'causal' if causal else 'nc':6s} {got:7.1f} TFLOPS (baseline {baseline}, floor {floor:.1f})")
+    print("-" * 78)
+    print("RESULT:", "PASS" if all_ok else "FAIL")
+    assert all_ok
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Benchmark
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1000,8 +1108,16 @@ def parse_args():
     p.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16"])
     p.add_argument("--kernel", type=str, nargs="+", default=["async_simple", "async_prefetch", "persistent"],
                    help="Kernel variants to benchmark")
+    p.add_argument("--mode", choices=["benchmark", "perf_test"], default="benchmark",
+                   help="benchmark: print TFLOPS table; perf_test: assert TFLOPS within PERF_TOL of baseline")
+    p.add_argument("--perf-tol", dest="perf_tol", type=float, default=PERF_TOL,
+                   help="perf_test slack below baseline (e.g. 0.15 = allow 15%% regression)")
     return p.parse_args()
 
 
 if __name__ == "__main__":
-    run_benchmark(parse_args())
+    args = parse_args()
+    if args.mode == "perf_test":
+        run_perf_test(args)
+    else:
+        run_benchmark(args)
