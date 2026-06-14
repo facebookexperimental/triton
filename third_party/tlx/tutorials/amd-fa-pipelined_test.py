@@ -929,52 +929,59 @@ def test_fa_persistent_cross_attention(q_len, kv_len, causal, dtype=torch.bfloat
 # Performance regression guard
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Baseline TFLOPS measured on gfx950/MI350 (bf16, B=1, H=64). A kernel must stay
+# Baseline TFLOPS measured on gfx950/MI350 (bf16, H=64). A kernel must stay
 # within PERF_TOL below its baseline or the perf test fails (catches regressions).
-# Regenerate the numbers with:
-#   python amd-fa-pipelined_test.py -b 1 -hq 64 -sq 4096 8192 16384 -d 64 128 \
-#       -causal true false --kernel async_simple async_prefetch persistent
+# Regenerate the numbers with (one run per (B, N) shape, so clocks stay warm):
+#   python amd-fa-pipelined_test.py -b 1 -hq 64 -sq 4096  -d 64 128 -causal true false --kernel async_simple async_prefetch persistent
+#   python amd-fa-pipelined_test.py -b 2 -hq 64 -sq 8192  -d 64 128 -causal true false --kernel async_simple async_prefetch persistent
+#   python amd-fa-pipelined_test.py -b 1 -hq 64 -sq 16384 -d 64 128 -causal true false --kernel async_simple async_prefetch persistent
 # then copy the printed Summary table values here.
 PERF_TOL = 0.15  # allow 15% slack below baseline (run-to-run noise + minor drift)
 
-# key: (kernel, D, N, causal) -> TFLOPS
+# (B, N) shapes benchmarked (H=64). N=8192 uses B=2 to exercise a multi-batch shape.
+PERF_CONFIGS = [(1, 4096), (2, 8192), (1, 16384)]
+
+# key: (kernel, B, D, N, causal) -> TFLOPS
 PERF_BASELINE_TFLOPS = {
-    ("async_simple", 64, 4096, False): 614,
-    ("async_simple", 64, 4096, True): 344,
-    ("async_simple", 64, 8192, False): 644,
-    ("async_simple", 64, 8192, True): 371,
-    ("async_simple", 64, 16384, False): 668,
-    ("async_simple", 64, 16384, True): 432,
-    ("async_simple", 128, 4096, False): 646,
-    ("async_simple", 128, 4096, True): 341,
-    ("async_simple", 128, 8192, False): 697,
-    ("async_simple", 128, 8192, True): 366,
-    ("async_simple", 128, 16384, False): 724,
-    ("async_simple", 128, 16384, True): 475,
-    ("async_prefetch", 64, 4096, False): 677,
-    ("async_prefetch", 64, 4096, True): 334,
-    ("async_prefetch", 64, 8192, False): 710,
-    ("async_prefetch", 64, 8192, True): 348,
-    ("async_prefetch", 64, 16384, False): 732,
-    ("async_prefetch", 64, 16384, True): 439,
-    ("async_prefetch", 128, 4096, False): 782,
-    ("async_prefetch", 128, 4096, True): 447,
-    ("async_prefetch", 128, 8192, False): 832,
-    ("async_prefetch", 128, 8192, True): 475,
-    ("async_prefetch", 128, 16384, False): 861,
-    ("async_prefetch", 128, 16384, True): 544,
-    ("persistent", 64, 4096, False): 695,
-    ("persistent", 64, 4096, True): 620,
-    ("persistent", 64, 8192, False): 724,
-    ("persistent", 64, 8192, True): 693,
-    ("persistent", 64, 16384, False): 744,
-    ("persistent", 64, 16384, True): 741,
-    ("persistent", 128, 4096, False): 828,
-    ("persistent", 128, 4096, True): 697,
-    ("persistent", 128, 8192, False): 876,
-    ("persistent", 128, 8192, True): 796,
-    ("persistent", 128, 16384, False): 894,
-    ("persistent", 128, 16384, True): 837,
+    # B=1, N=4096
+    ("async_simple", 1, 64, 4096, False): 614,
+    ("async_simple", 1, 64, 4096, True): 344,
+    ("async_simple", 1, 128, 4096, False): 646,
+    ("async_simple", 1, 128, 4096, True): 341,
+    ("async_prefetch", 1, 64, 4096, False): 677,
+    ("async_prefetch", 1, 64, 4096, True): 334,
+    ("async_prefetch", 1, 128, 4096, False): 782,
+    ("async_prefetch", 1, 128, 4096, True): 447,
+    ("persistent", 1, 64, 4096, False): 695,
+    ("persistent", 1, 64, 4096, True): 620,
+    ("persistent", 1, 128, 4096, False): 828,
+    ("persistent", 1, 128, 4096, True): 697,
+    # B=2, N=8192
+    ("async_simple", 2, 64, 8192, False): 668,
+    ("async_simple", 2, 64, 8192, True): 380,
+    ("async_simple", 2, 128, 8192, False): 704,
+    ("async_simple", 2, 128, 8192, True): 372,
+    ("async_prefetch", 2, 64, 8192, False): 713,
+    ("async_prefetch", 2, 64, 8192, True): 358,
+    ("async_prefetch", 2, 128, 8192, False): 833,
+    ("async_prefetch", 2, 128, 8192, True): 472,
+    ("persistent", 2, 64, 8192, False): 726,
+    ("persistent", 2, 64, 8192, True): 694,
+    ("persistent", 2, 128, 8192, False): 879,
+    ("persistent", 2, 128, 8192, True): 794,
+    # B=1, N=16384
+    ("async_simple", 1, 64, 16384, False): 668,
+    ("async_simple", 1, 64, 16384, True): 432,
+    ("async_simple", 1, 128, 16384, False): 724,
+    ("async_simple", 1, 128, 16384, True): 475,
+    ("async_prefetch", 1, 64, 16384, False): 732,
+    ("async_prefetch", 1, 64, 16384, True): 439,
+    ("async_prefetch", 1, 128, 16384, False): 861,
+    ("async_prefetch", 1, 128, 16384, True): 544,
+    ("persistent", 1, 64, 16384, False): 744,
+    ("persistent", 1, 64, 16384, True): 741,
+    ("persistent", 1, 128, 16384, False): 894,
+    ("persistent", 1, 128, 16384, True): 837,
 }
 
 
@@ -994,39 +1001,40 @@ def measure_tflops(kernel_fn, B, H, N, D, causal, dtype=torch.bfloat16):
 
 
 @pytest.mark.parametrize("causal", [False, True], ids=["nocausal", "causal"])
-@pytest.mark.parametrize("N", [4096, 8192, 16384])
+@pytest.mark.parametrize("B,N", PERF_CONFIGS, ids=[f"b{b}_n{n}" for b, n in PERF_CONFIGS])
 @pytest.mark.parametrize("D", [64, 128])
 @pytest.mark.parametrize("kernel_name", ["async_simple", "async_prefetch", "persistent"])
-def test_fa_performance(kernel_name, D, N, causal):
+def test_fa_performance(kernel_name, D, B, N, causal):
     """Guard against perf regressions: achieved TFLOPS must stay within PERF_TOL
-    of the recorded gfx950 baseline (B=1, H=64, bf16)."""
-    baseline = PERF_BASELINE_TFLOPS[(kernel_name, D, N, causal)]
+    of the recorded gfx950 baseline (H=64, bf16)."""
+    baseline = PERF_BASELINE_TFLOPS[(kernel_name, B, D, N, causal)]
     floor = baseline * (1 - PERF_TOL)
-    got = measure_tflops(get_kernel(kernel_name), 1, 64, N, D, causal)
-    print(f"  {kernel_name:14s} D={D:3d} N={N:5d} {'causal' if causal else 'nc':6s} "
+    got = measure_tflops(get_kernel(kernel_name), B, 64, N, D, causal)
+    print(f"  {kernel_name:14s} B={B} D={D:3d} N={N:5d} {'causal' if causal else 'nc':6s} "
           f"{got:7.1f} TFLOPS (baseline {baseline}, floor {floor:.1f})")
-    assert got >= floor, (f"perf regression: {kernel_name} D={D} N={N} causal={causal} -> "
+    assert got >= floor, (f"perf regression: {kernel_name} B={B} D={D} N={N} causal={causal} -> "
                           f"{got:.1f} TFLOPS < floor {floor:.1f} (baseline {baseline}, tol {PERF_TOL:.0%})")
 
 
 def run_perf_test(args):
     """CLI entry: run the perf guard over all baseline configs, print a report,
-    and return True iff every kernel is within PERF_TOL of its baseline."""
+    and assert every kernel is within PERF_TOL of its baseline."""
     tol = args.perf_tol
     all_ok = True
     print(f"\nPerformance regression test (floor = baseline * (1 - {tol:.0%}))")
     print("-" * 78)
-    for (kernel_name, D, N, causal), baseline in sorted(PERF_BASELINE_TFLOPS.items()):
+    for (kernel_name, B, D, N, causal), baseline in sorted(PERF_BASELINE_TFLOPS.items()):
         floor = baseline * (1 - tol)
         try:
-            got = measure_tflops(get_kernel(kernel_name), 1, 64, N, D, causal)
+            got = measure_tflops(get_kernel(kernel_name), B, 64, N, D, causal)
         except Exception as e:
             all_ok = False
-            print(f"  [FAIL] {kernel_name:14s} D={D:3d} N={N:5d} {'causal' if causal else 'nc':6s} -> ERROR ({e})")
+            print(f"  [FAIL] {kernel_name:14s} B={B} D={D:3d} N={N:5d} "
+                  f"{'causal' if causal else 'nc':6s} -> ERROR ({e})")
             continue
         ok = got >= floor
         all_ok &= ok
-        print(f"  [{'PASS' if ok else 'FAIL'}] {kernel_name:14s} D={D:3d} N={N:5d} "
+        print(f"  [{'PASS' if ok else 'FAIL'}] {kernel_name:14s} B={B} D={D:3d} N={N:5d} "
               f"{'causal' if causal else 'nc':6s} {got:7.1f} TFLOPS (baseline {baseline}, floor {floor:.1f})")
     print("-" * 78)
     print("RESULT:", "PASS" if all_ok else "FAIL")
