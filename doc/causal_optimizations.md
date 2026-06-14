@@ -119,6 +119,125 @@ confirms it (D=128, N=16384, causal):
 `=1` is the no-bundle regime (imbalanced + overhead-bound tail); `=2` is the
 optimum; `≥4` over-coarsens (fewer schedulable units than programs → idle CUs).
 
+## Worked example: scheduling at N=8192
+
+Concrete walkthrough for `N=8192`, default params (`B=1, H=64, D=128` →
+`BLOCK_M=256, BLOCK_N=64`) on gfx950 (256 CUs / 8 XCDs).
+
+```
+Sequence:  8192 / BLOCK_M(256)  = 32 query tiles per head  (m0..m31)
+Heads:     B*H = 1*64           = 64 heads (hz = 0..63)
+Hardware:  256 programs, 8 XCDs = 32 resident programs per XCD (NUM_LOCAL)
+Grid map:  pid -> xcd = pid % 8,  local = pid // 8
+```
+
+### Step 1 — head pinning to XCDs (L2 locality)
+
+Heads are pinned by `head % NUM_XCDS`, so each XCD permanently owns 8 heads and
+all their K/V traffic stays in that XCD's L2 slice (no separate remap pass):
+
+```
+XCD0: heads  0, 8,16,24,32,40,48,56
+XCD1: heads  1, 9,17,25,33,41,49,57
+ ...
+XCD7: heads  7,15,23,31,39,47,55,63
+```
+
+### Step 2 — causal: zig-zag fold bundling (`TILES_PER_UNIT=2`)
+
+A causal tile `m` costs `(m+1)` K-blocks (m0 cheap, m31 full). The zig-zag fold
+pairs a light tile with a heavy one so every unit costs the same:
+
+```
+fold pairs (bundles), each = constant 33 K-block-units of work:
+  bundle0 = {m0 , m31}   bundle1 = {m1 , m30}  ...  bundle15 = {m15, m16}
+  cost:    1 + 32 = 33        2 + 31 = 33               16 + 17 = 33
+```
+
+The 32 programs of an XCD round-robin over its 128 units (8 heads × 16 bundles),
+stride `NUM_LOCAL=32`:
+
+```
+XCD0 — each program gets exactly 8 tiles = 528 K-blocks (perfectly uniform):
+
+ WG0  -> h0{m0,m31}  h16{m0,m31}  h32{m0,m31}  h48{m0,m31}   ← bundle0 × 4 heads
+ WG1  -> h0{m1,m30}  h16{m1,m30}  h32{m1,m30}  h48{m1,m30}   ← bundle1
+  ...
+ WG15 -> h0{m15,m16} h16{m15,m16} h32{m15,m16} h48{m15,m16}  ← bundle15
+ WG16 -> h8{m0,m31}  h24{m0,m31}  h40{m0,m31}  h56{m0,m31}
+  ...
+ WG31 -> h8{m15,m16} h24{m15,m16} h40{m15,m16} h56{m15,m16}
+```
+
+Every program processes 8 tiles = 528 K-blocks — zero imbalance, even though raw
+causal tiles individually range from 4 to 128 K-blocks.
+
+### Step 3 — non-causal: plain striping (`TILES_PER_UNIT=1`)
+
+Every tile already costs the full 32 K-blocks, so units are single tiles and the
+zig-zag order is just a harmless permutation:
+
+```
+XCD0 — each program gets 8 tiles = 1024 K-blocks (uniform):
+
+ WG0  -> m0  of h0,h8,h16,h24,h32,h40,h48,h56
+ WG1  -> m31 of h0,h8,h16,h24,h32,h40,h48,h56
+ WG2  -> m1  of all 8 heads
+  ...
+ WG31 -> m16 of all 8 heads
+```
+
+### Balance summary
+
+| | causal | non-causal |
+|---|---|---|
+| tiles / program | 8 (4 fold pairs) | 8 |
+| K-blocks / program | **528 (uniform)** | **1024 (uniform)** |
+| heads touched / program | 4 | 8 |
+| L2 locality | head pinned to XCD | head pinned to XCD |
+
+Without folding, causal programs handling `m31` would do ~8× the work of those
+handling `m0` (long tail wave); the zig-zag fold cancels the heavy/light halves
+of the triangle so causal reaches the same flat-load profile non-causal gets for
+free — which is what closes the causal-vs-non-causal gap.
+
+### Same scheme at smaller N (1024, 4096)
+
+Same defaults (`B=1, H=64`, `BLOCK_M=256`, 8 XCDs, 32 programs/XCD). Only the
+tile count per head changes (`NUM_M = N/256`), which scales how many units land
+on each program. K-blocks are in units of `BLOCK_N`; fold cost is constant within
+a mode.
+
+**N=4096** (`NUM_M=16`) — both modes fully subscribe all 32 programs/XCD:
+
+```
+CAUSAL  (TPU=2): 8 bundles/head → 64 units/XCD → 4 tiles/program, 136 K-blocks (uniform)
+  folds: {m0,m15} {m1,m14} {m2,m13} ... {m7,m8}   (each pair = 17 tile-units)
+  WG0 -> h0{m0,m15}  h32{m0,m15}      WG7 -> h0{m7,m8}  h32{m7,m8}
+
+NON-C.  (TPU=1): 16 tiles/head → 128 units/XCD → 4 tiles/program, 256 K-blocks (uniform)
+  WG0 -> m0  of h0,h16,h32,h48        WG1 -> m15 of h0,h16,h32,h48  ...
+```
+
+**N=1024** (`NUM_M=4`) — small N; causal *undersubscribes* the XCD:
+
+```
+CAUSAL  (TPU=2): 2 bundles/head → 16 units/XCD → only 16 of 32 programs active!
+  folds: {m0,m3} {m1,m2}             active programs do 2 tiles = 20 K-blocks
+  WG0 -> h0{m0,m3}   WG1 -> h0{m1,m2}   WG2 -> h8{m0,m3}   WG3 -> h8{m1,m2} ...
+  → half the CUs idle: at small N the grid runs out of bundles before programs.
+
+NON-C.  (TPU=1): 4 tiles/head → 32 units/XCD → all 32 active, 1 tile, 16 K-blocks
+  WG0 -> h0:m0   WG1 -> h0:m3   WG2 -> h0:m1   WG3 -> h0:m2   WG4 -> h8:m0 ...
+```
+
+The N=1024 causal case shows the design's edge condition: fold bundling halves
+the unit count (`TILES_PER_UNIT=2`), so when `heads_per_xcd × ceil(NUM_M/2)`
+drops below `NUM_LOCAL=32`, some resident programs get no work. With 64 heads it
+still scales by heads (8/XCD), so the floor is `N` small *and* few heads; the fix
+when it bites is to drop to `TILES_PER_UNIT=1` (or a K-split kernel) to recover
+parallelism. At N≥4096 with default heads it is a non-issue.
+
 ## Notes
 
 - **Block sizes**: `BLOCK_M=256`; `BLOCK_N=128` for `D<=64` (more compute per LDS

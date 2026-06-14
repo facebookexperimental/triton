@@ -357,7 +357,7 @@ def _attn_fwd_async_prefetch(
 
 
 @triton.jit
-def _attn_tile(
+def _async_prefetch_attn_tile(
     pid_m,
     q_off,
     k_off,
@@ -387,21 +387,15 @@ def _attn_tile(
     IS_CAUSAL: tl.constexpr,
     EVEN_N: tl.constexpr,
 ):
-    """Compute one output m-tile — causal (peeled mask) or non-causal (full).
+    """
+    Function to compute Compute one output m-tile — causal (peeled mask) or non-causal (full).
+    Using similar algorithm/optimizations to previous async_prefetch, but with additions of:
 
-    Supports `q_len != kv_len` (cross-attention / decode). Query row `qpos`
-    attends key `kpos` iff `kpos <= qpos + DIAG_OFFSET`, where
-    `DIAG_OFFSET = kv_len - q_len` (bottom-right alignment). `DIAG_OFFSET == 0`
-    is the square self-attention case. It is a *runtime* scalar (not constexpr)
-    so changing sequence lengths does not trigger a recompile.
+    - Peeled last iteration of loop to have steady state not need masking or OOB check.
+    - Supports `q_len != kv_len` (cross-attention / decode). Query row `qpos`
+      attends key `kpos` iff `kpos <= qpos + DIAG_OFFSET`, where
+      `DIAG_OFFSET = kv_len - q_len` (bottom-right alignment).
 
-    Causal: K blocks fully below the diagonal need *no* mask; only the diagonal
-    band does. We run an unmasked steady-state loop (FMA-friendly softmax, no
-    `tl.where`) then a short masked diagonal tail. Non-causal: every block is
-    unmasked (`hi = kv_len`), so the steady-state loop covers them all and the
-    masked tail handles only the ragged boundary block (`kv_len % BLOCK_N != 0`).
-    The async double-buffered prefetch chain is continuous across both loops
-    (slot = global_block_idx % 2), so there is no bubble.
     """
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
@@ -441,8 +435,9 @@ def _attn_tile(
     tok_k0 = tlx.async_load(k_ptrs, tlx.local_view(k_buf, 0), mask=offs_n[:, None] < N_CTX_K)
     tok_v0 = tlx.async_load(v_ptrs, tlx.local_view(v_buf, 0), mask=offs_n[:, None] < N_CTX_K)
     tlx.async_load_commit_group([tok_k0, tok_v0])
-
-    # ── Unmasked steady-state loop (below-diagonal blocks) ──────────────────
+    """
+    Unmasked steady-state loop
+    """
     for block_id in tl.range(0, n_unmasked * BLOCK_N, BLOCK_N, num_stages=0):
         next_off = block_id + BLOCK_N
         i = block_id // BLOCK_N
@@ -468,8 +463,9 @@ def _attn_tile(
         l_i = l_i * alpha + l_ij
         m_i = m_ij
         acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
-
-    # ── Masked diagonal loop ────────────────────────────────────────────────
+    """
+    Masked peeled epilogue
+    """
     for block_id in tl.range(n_unmasked * BLOCK_N, n_blocks * BLOCK_N, BLOCK_N, num_stages=0):
         next_off = block_id + BLOCK_N
         kn = block_id + offs_n
@@ -541,37 +537,47 @@ def _attn_fwd_persistent(
     HEAD_DIM: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     NUM_M_BLOCKS: tl.constexpr,
-    TILES_PER_UNIT: tl.constexpr,
     NUM_SMS: tl.constexpr,
     NUM_XCDS: tl.constexpr,
     EVEN_N: tl.constexpr,
 ):
-    """Unified persistent FA — one kernel for causal **and** non-causal,
-    including `q_len != kv_len` (cross-attention / decode) via `DIAG_OFFSET`.
+    """
+    Persistent FA with these key features:
+    1. Aysnc prefetch work tile
+    2. XCD-pinned head-batch dim for improved L2 locality
+    3. zig-zag ordering of output/work tile for each workunit wihtin a WG,
+       for equal work distribution per WG and improved causal performance.
 
-    - **Zig-zag (fold) tile order.** A head's m-tiles are walked as
-      `0, N-1, 1, N-2, …` — interleaving the lightest and heaviest
-      remaining causal tile. Because adjacent tiles in this order sum to a
-      constant cost (`≈ N_M+1` K-blocks), *any* contiguous run of them is
-      balanced — so the bundle size is a free knob, not hardcoded to 2.
-    - **TILES_PER_UNIT bundle.** Each scheduling unit is `TILES_PER_UNIT`
-      consecutive zig-zag tiles, run back-to-back in one loop iteration, so
-      every iteration costs the same and per-tile prologue/epilogue overhead
-      stays amortized (no overhead-bound "all-light" tail — the lesson from the
-      snake/no-mirror experiments). Causal default = 2 (the minimal constant-cost
-      bundle ⟺ mirror pairing); non-causal default = 1 (tiles are already
-      equal-cost, so no bundling is needed).
-    - **Persistent + XCD-grouped.** Launches `NUM_SMS` resident programs; heads
-      are pinned to XCDs (`hz % NUM_XCDS`) for K/V L2 locality, and units are
-      flattened `(head_on_xcd, bundle)` and round-robin strided across the XCD's
-      `NUM_LOCAL` programs.
+    Ownership hierarchy (coarse -> fine), all derived from one flat `unit` index.
+    Examples use N=1024 causal defaults (BLOCK_M=256 -> 4 tiles/head, 64 heads,
+    8 XCDs, 32 programs/XCD, TILES_PER_UNIT=2 -> units_per_head=2, 16 units/XCD):
 
-    Non-causal degrades cleanly: `_attn_tile(IS_CAUSAL=False)` runs the full
-    unmasked range and zig-zag is just a (cost-neutral) permutation.
+    - XCD owns `heads_per_xcd` batch-heads (those with `hz % NUM_XCDS == xcd`),
+      i.e. a flat pile of `units = heads_per_xcd * units_per_head` work-units.
+        e.g. XCD 0 owns heads {0,8,16,...,56} -> 16 units.
+
+    - Local (one of the XCD's `NUM_LOCAL` workgroups) owns
+      a round-robin slice of that pile: units `local, local+NUM_LOCAL, ...`.
+        e.g. WG local=2 owns unit 2 (here 16 units < 32 programs, so local>=16 idle).
+
+    - Unit -> global work-unit id within the whole XCD; `bundle` = which work-unit within a head): `local_head = unit //
+      units_per_head` picks the head (global `pid_hz = xcd + local_head *
+      NUM_XCDS`), and `bundle = unit % units_per_head` picks the tile-group
+      within that head.
+        e.g. unit 2 -> local_head=1 -> head 8, bundle=0.
+
+    - Bundle owns `TILES_PER_UNIT` zig-zag tiles (causal: a {light, heavy} fold
+      pair of constant cost; non-causal: a single tile).
+        e.g. bundle 0 -> zig-zag {0,1} -> tiles {m0, m3} of head 8.
+
+    - Tile = `BLOCK_M` query rows of that head, streamed over its `BLOCK_N`
+      K-blocks (the inner `_async_prefetch_attn_tile` loop) to produce one output tile.
+        e.g. m0 -> rows 0..255, 4 K-blocks; m3 -> rows 768..1023, 16 (sum=20, flat).
     """
     _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
                     stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om, stride_ok)
 
+    # Note since it is persistent, we only launch 1-dim of PIDs (NUM_SMs,).
     pid = tl.program_id(0)
     xcd = pid % NUM_XCDS
     local = pid // NUM_XCDS
@@ -583,13 +589,19 @@ def _attn_fwd_persistent(
 
     QK_SCALE: tl.constexpr = sm_scale * 1.44269504089
 
-    units_per_head: tl.constexpr = (NUM_M_BLOCKS + TILES_PER_UNIT - 1) // TILES_PER_UNIT
-    heads_per_xcd = (Z * H + NUM_XCDS - 1) // NUM_XCDS
-    units = heads_per_xcd * units_per_head
+    # Causal: 2-tile {light, heavy} fold bundles (constant cost). Non-causal:
+    # 1-tile units (tiles are already equal-cost, so no bundling is needed).
+    TILES_PER_UNIT: tl.constexpr = 2 if IS_CAUSAL else 1
+
+    # We flattened head and batch dim into a single flat HZ work dim.
+    # Then, we pin specific HZ ids to a XCD for K/V L2 locality.
+    units_per_hz: tl.constexpr = (NUM_M_BLOCKS + TILES_PER_UNIT - 1) // TILES_PER_UNIT
+    hz_per_xcd = (Z * H + NUM_XCDS - 1) // NUM_XCDS
+    units = hz_per_xcd * units_per_hz
     for unit in tl.range(local, units, NUM_LOCAL, num_stages=0):
-        local_head = unit // units_per_head
-        bundle = unit - local_head * units_per_head
-        pid_hz = xcd + local_head * NUM_XCDS
+        local_hz = unit // units_per_hz  # which head-batch id (quotient)
+        bundle = unit % units_per_hz  # quer_seq/m tiles within head-batch id (remainder)
+        pid_hz = xcd + local_hz * NUM_XCDS  # global head-batch id.
         if pid_hz < Z * H:
             off_z = pid_hz // H
             off_h = pid_hz % H
@@ -599,15 +611,19 @@ def _attn_fwd_persistent(
             o_off = off_z * stride_oz + off_h * stride_oh
 
             # Run the bundle's TILES_PER_UNIT consecutive zig-zag tiles.
+            # If causal and TILES_PER_UNIT=2, then head's m-tiles are walked
+            # as `0, N-1, 1, N-2, …`. This interleaves the lightest and heaviest
+            # causal tiles, making each WG do ~same amount of work.
             for j in tl.static_range(TILES_PER_UNIT):
                 idx = bundle * TILES_PER_UNIT + j
                 if idx < NUM_M_BLOCKS:
                     half = idx // 2
                     pid_m = tl.where(idx % 2 == 0, half, NUM_M_BLOCKS - 1 - half)
-                    _attn_tile(pid_m, q_off, k_off, v_off, o_off, Q, K, V, Out, k_buf, v_buf, stride_qm, stride_qk,
-                               stride_kn, stride_kk, stride_vn, stride_vk, stride_om, stride_ok, N_CTX_Q, N_CTX_K,
-                               DIAG_OFFSET, QK_SCALE=QK_SCALE, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM,
-                               IS_CAUSAL=IS_CAUSAL, EVEN_N=EVEN_N)
+                    _async_prefetch_attn_tile(pid_m, q_off, k_off, v_off, o_off, Q, K, V, Out, k_buf, v_buf, stride_qm,
+                                              stride_qk, stride_kn, stride_kk, stride_vn, stride_vk, stride_om,
+                                              stride_ok, N_CTX_Q, N_CTX_K, DIAG_OFFSET, QK_SCALE=QK_SCALE,
+                                              BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM, IS_CAUSAL=IS_CAUSAL,
+                                              EVEN_N=EVEN_N)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -714,12 +730,11 @@ def flash_attn_async_prefetch(q, k, v, sm_scale, causal=False, **kw):
 
 
 def flash_attn_persistent(q, k, v, sm_scale, causal=False, **kw):
-    """Unified persistent FA — one kernel for causal *and* non-causal.
+    """persistent FA with workgroup scheduler who is persistent and have a zig-zag tile order.
 
-    Generalizes static mirror's "exactly 2 tiles per workgroup" into a
-    persistent, XCD-grouped, constant-cost fold-bundling scheduler (zig-zag
-    tile order + `TILES_PER_UNIT` bundle). Causal uses 2-tile fold bundles
-    (≡ mirror pairing, the minimal constant-cost bundle); non-causal uses 1-tile
+    FA with a workgroup scheduler who is persistent, XCD-grouped,
+    with constant-cost fold-bundling scheduler (zig-zag tile order + `TILES_PER_UNIT` bundle).
+    Causal uses 2-tile fold bundles non-causal uses 1-tile
     units (tiles are already equal-cost). A program runs a *variable* number of
     tiles, not a fixed 2.
 
@@ -739,7 +754,6 @@ def flash_attn_persistent(q, k, v, sm_scale, causal=False, **kw):
     # per LDS barrier); D=128 must stay 64 for the double-buffered K+V LDS budget.
     BLOCK_N = kw.pop("BLOCK_N", 128 if D <= 64 else 64)
     num_warps = kw.pop("num_warps", 4)
-    tiles_per_unit = kw.pop("TILES_PER_UNIT", 2 if causal else 1)
 
     if N_CTX_K % BLOCK_N != 0:
         # Partial-block kv hits the modulo-decode iota_range compiler crash.
@@ -788,7 +802,6 @@ def flash_attn_persistent(q, k, v, sm_scale, causal=False, **kw):
         HEAD_DIM=D,
         IS_CAUSAL=causal,
         NUM_M_BLOCKS=num_m_blocks,
-        TILES_PER_UNIT=tiles_per_unit,
         NUM_SMS=num_sms,
         NUM_XCDS=num_xcds,
         EVEN_N=(N_CTX_K % BLOCK_N == 0),
