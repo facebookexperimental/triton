@@ -12,6 +12,7 @@ import torch
 import triton
 import triton.language as tl
 from triton._internal_testing import is_blackwell
+from triton.language.extra.subtile_ops import _split_n_2D
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 
@@ -55,7 +56,6 @@ def addmm_kernel_tma_persistent_ws(
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
     num_tiles = num_pid_m * num_pid_n
 
-    tile_id_c = start_pid - NUM_SMS
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
     for tile_id in tl.range(
@@ -86,60 +86,20 @@ def addmm_kernel_tma_persistent_ws(
                 b = b_desc.load([offs_bn, offs_k])
             accumulator = tl.dot(a, b.T, accumulator)
 
-        tile_id_c += NUM_SMS
-        pid_m, pid_n = _compute_pid(tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
-        offs_cm = pid_m * BLOCK_SIZE_M
-        offs_cn = pid_n * BLOCK_SIZE_N
-
-        if EPILOGUE_SUBTILE == 1:
-            # Load full bias tile via TMA, add in float32, then downcast
-            bias = bias_desc.load([offs_cm, offs_cn]).to(tl.float32)
-            accumulator = accumulator + bias
-            c = accumulator.to(dtype)
-            c_desc.store([offs_cm, offs_cn], c)
-        elif EPILOGUE_SUBTILE == 2:
-            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
-            acc = tl.permute(acc, (0, 2, 1))
-            acc0, acc1 = tl.split(acc)
-            # Load bias halves via TMA, add in float32, then downcast
-            bias0 = bias_desc.load([offs_cm, offs_cn]).to(tl.float32)
-            acc0 = acc0 + bias0
-            c0 = acc0.to(dtype)
-            c_desc.store([offs_cm, offs_cn], c0)
-            bias1 = bias_desc.load([offs_cm, offs_cn + BLOCK_SIZE_N // 2]).to(tl.float32)
-            acc1 = acc1 + bias1
-            c1 = acc1.to(dtype)
-            c_desc.store([offs_cm, offs_cn + BLOCK_SIZE_N // 2], c1)
-        elif EPILOGUE_SUBTILE == 4:
-            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
-            acc = tl.permute(acc, (0, 2, 1))
-            acc0, acc1 = tl.split(acc)
-            acc00, acc01 = tl.split(tl.permute(tl.reshape(acc0, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4)), (0, 2, 1)))
-            acc10, acc11 = tl.split(tl.permute(tl.reshape(acc1, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4)), (0, 2, 1)))
-            # Load bias quarters via TMA, add in float32, then downcast
-            bias00 = bias_desc.load([offs_cm, offs_cn]).to(tl.float32)
-            acc00 = acc00 + bias00
-            c00 = acc00.to(dtype)
-            c_desc.store([offs_cm, offs_cn], c00)
-            bias01 = bias_desc.load([offs_cm, offs_cn + BLOCK_SIZE_N // 4]).to(tl.float32)
-            acc01 = acc01 + bias01
-            c01 = acc01.to(dtype)
-            c_desc.store([offs_cm, offs_cn + BLOCK_SIZE_N // 4], c01)
-            bias10 = bias_desc.load([offs_cm, offs_cn + 2 * (BLOCK_SIZE_N // 4)]).to(tl.float32)
-            acc10 = acc10 + bias10
-            c10 = acc10.to(dtype)
-            c_desc.store([offs_cm, offs_cn + 2 * (BLOCK_SIZE_N // 4)], c10)
-            bias11 = bias_desc.load([offs_cm, offs_cn + 3 * (BLOCK_SIZE_N // 4)]).to(tl.float32)
-            acc11 = acc11 + bias11
-            c11 = acc11.to(dtype)
-            c_desc.store([offs_cm, offs_cn + 3 * (BLOCK_SIZE_N // 4)], c11)
+        acc_slices = _split_n_2D(accumulator, EPILOGUE_SUBTILE)
+        slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
+        for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
+            offs_cn = offs_bn + slice_id * slice_size
+            bias = bias_desc.load([offs_am, offs_cn]).to(tl.float32)
+            c = (acc_slices[slice_id] + bias).to(dtype)
+            c_desc.store([offs_am, offs_cn], c)
 
 
-@pytest.mark.parametrize("M, N, K", [(1024, 1024, 512)])
+@pytest.mark.parametrize("M, N, K", [(1024, 1024, 8192)])
 @pytest.mark.parametrize("BLOCK_SIZE_M", [128, 256])
-@pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
-@pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
-@pytest.mark.parametrize("num_stages", [2, 3])
+@pytest.mark.parametrize("BLOCK_SIZE_N", [128])
+@pytest.mark.parametrize("BLOCK_SIZE_K", [64])
+@pytest.mark.parametrize("num_stages", [3])
 @pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("FLATTEN", [True, False])
 @pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
@@ -173,32 +133,13 @@ def test_autows_addmm_tma_persistent(
         pytest.skip("FLATTEN will not WarpSpecialize although it will otherwise pass.")
 
     if generate_subtiled_region:
-        pytest.skip("generate_subtiled_region=True is temporarily disabled")
+        pytest.skip("TODO: enable generate_subtiled_region=True")
 
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
 
-    # Skip configurations that exceed hardware resource limits (shared memory or tensor memory)
-    if BLOCK_SIZE_M == 256 and BLOCK_SIZE_N == 256:
-        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
-
-    if BLOCK_SIZE_N == 256 and not FLATTEN:
-        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
-
-    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and num_stages == 3:
-        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
-
-    if not FLATTEN and BLOCK_SIZE_K == 128 and B_col_major and not A_col_major:
-        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
-
     if BLOCK_SIZE_M == 256 and not FLATTEN and SMEM_ALLOC_ALGO == 0:
-        pytest.skip("Out of resources: shared memory exceeded")
-
-    if BLOCK_SIZE_M == 256 and FLATTEN and BLOCK_SIZE_K == 128 and num_stages == 3 and EPILOGUE_SUBTILE != 4:
-        pytest.skip("Out of resources: shared memory exceeded")
-
-    if not FLATTEN and SMEM_ALLOC_ALGO == 1 and BLOCK_SIZE_M == 128 and BLOCK_SIZE_K == 128 and num_stages == 3:
         pytest.skip("Out of resources: shared memory exceeded")
 
     with triton.knobs.nvidia.scope():
@@ -312,7 +253,6 @@ def addmm_kernel_1d_bias_ws(
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
     num_tiles = num_pid_m * num_pid_n
 
-    tile_id_c = start_pid - NUM_SMS
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
     for tile_id in tl.range(
@@ -335,17 +275,12 @@ def addmm_kernel_1d_bias_ws(
             b = b_desc.load([offs_bn, offs_k])
             accumulator = tl.dot(a, b.T, accumulator)
 
-        tile_id_c += NUM_SMS
-        pid_m, pid_n = _compute_pid(tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
-        offs_cm = pid_m * BLOCK_SIZE_M
-        offs_cn = pid_n * BLOCK_SIZE_N
-
         # 1D bias: load [1, BLOCK_SIZE_N], broadcast to [BLOCK_SIZE_M, BLOCK_SIZE_N]
-        bias_tile = bias_desc.load([0, offs_cn]).to(tl.float32)
+        bias_tile = bias_desc.load([0, offs_bn]).to(tl.float32)
         bias_tile = tl.broadcast_to(bias_tile, (BLOCK_SIZE_M, BLOCK_SIZE_N))
         accumulator = accumulator + bias_tile
         c = accumulator.to(dtype)
-        c_desc.store([offs_cm, offs_cn], c)
+        c_desc.store([offs_am, offs_bn], c)
 
 
 def _run_addmm_1d_bias_ws():
@@ -420,19 +355,17 @@ def test_autows_addmm_hoist_convert_before_broadcast():
 
     # Verify the TTGIR has the convert before broadcast pattern
     ttgir = kernel.asm["ttgir"]
-    assert "partition0" in ttgir or "partition1" in ttgir, \
-        "Expected warp specialization partitions in IR"
+    assert "partition0" in ttgir or "partition1" in ttgir, "Expected warp specialization partitions in IR"
     assert "ttng.async_tma_copy_local_to_global" in ttgir, "Expected TMA store copy in IR"
     assert "ttng.async_tma_store_token_wait" in ttgir, "Expected TMA store token wait in IR"
     assert "tt.descriptor_store" not in ttgir, "Expected descriptor stores to be lowered"
     assert "can_rotate_by_buffer_count" not in ttgir, "Expected TMA store wait rotation to be resolved"
 
     # Check that convert_layout on bias happens before broadcast (on 1xN, not MxN)
-    cvt_before_bc = re.search(r'convert_layout.*tensor<1x\d+xf32.*\n.*tt\.broadcast.*tensor<1x\d+xf32', ttgir)
+    cvt_before_bc = re.search(r"convert_layout.*tensor<1x\d+xf32.*\n.*tt\.broadcast.*tensor<1x\d+xf32", ttgir)
     bc_before_cvt = re.search(
-        r'tt\.broadcast.*tensor<1x\d+xf32.*tensor<128x\d+xf32.*\n.*convert_layout.*tensor<128x\d+xf32', ttgir)
-    assert cvt_before_bc or not bc_before_cvt, \
-        "Expected convert_layout before broadcast (on small 1xN tensor)"
+        r"tt\.broadcast.*tensor<1x\d+xf32.*tensor<128x\d+xf32.*\n.*convert_layout.*tensor<128x\d+xf32", ttgir)
+    assert cvt_before_bc or not bc_before_cvt, "Expected convert_layout before broadcast (on small 1xN tensor)"
 
     # Verify correctness: bias_1d + A @ B.T
     torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)

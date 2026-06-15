@@ -9,6 +9,46 @@ class TLX_Attr<string name, list<Trait> traits = [],
   : AttrDef<TLX_Dialect, name, traits, baseCppClass> {
 }
 
+def TLX_LayoutEncodingTrait : AttrInterface<"LayoutEncodingTrait"> {
+  let cppNamespace = "::mlir::triton::gpu";
+  let methods = [
+    InterfaceMethod<"Get the CGA layout backing this encoding.",
+                    "::mlir::triton::gpu::CGAEncodingAttr", "getCGALayout">,
+    InterfaceMethod<"Get the rank of the layout.", "unsigned", "getRank",
+                    (ins), [{}], [{
+      return $_attr.getCGALayout().getRank();
+    }]>
+  ];
+}
+
+def TLX_DeclareLayoutEncodingMethods : DeclareAttrInterfaceMethods<
+  TLX_LayoutEncodingTrait, ["getCGALayout"]>;
+
+def TLX_DistributedEncodingTrait : AttrInterface<"DistributedEncodingTrait"> {
+  let cppNamespace = "::mlir::triton::gpu";
+  let methods = [
+    InterfaceMethod<"Get the order of reps.",
+                    "SmallVector<unsigned>", "getRepOrder">,
+    InterfaceMethod<"Return total element size per thread.",
+                    "unsigned", "getTotalElemsPerThread",
+                    (ins "ArrayRef<int64_t>":$shape),
+                    /*defaultImplementation=*/[{
+      return ::mlir::triton::gpu::toLinearEncoding($_self, shape)
+          .getTotalElemsPerThread(shape);
+    }]>,
+    InterfaceMethod<"Return element size per thread in each dimension.",
+                    "SmallVector<unsigned>", "getElemsPerThread",
+                    (ins "ArrayRef<int64_t>":$shape),
+                    /*defaultImplementation=*/[{
+      return ::mlir::triton::gpu::toLinearEncoding($_self, shape)
+          .getElemsPerThread(shape);
+    }]>,
+    InterfaceMethod<"Convert to LinearLayout.",
+                    "::mlir::triton::LinearLayout", "toLinearLayout",
+                    (ins "ArrayRef<int64_t>":$shape)>,
+  ];
+}
+
 //===----------------------------------------------------------------------===//
 // Dummy Layout Attributes for Deferred Layout Resolution
 //===----------------------------------------------------------------------===//
@@ -61,6 +101,38 @@ def TLX_DummyTMEMLayoutAttr : TLX_Attr<"DummyTMEMLayout"> {
   let parameters = (ins);
 
   let assemblyFormat = "";
+}
+
+//===----------------------------------------------------------------------===//
+// No-verify Layout Attribute
+//===----------------------------------------------------------------------===//
+
+def TLX_NoVerifyLayoutAttr
+    : TLX_Attr<"NoVerifyLayout",
+               [TLX_DistributedEncodingTrait, TLX_LayoutEncodingTrait,
+                TLX_DeclareLayoutEncodingMethods]> {
+  let mnemonic = "no_verify_layout";
+  let summary = "TLX-owned wrapper for distributed layouts that defer layout verification";
+
+  let description = [{
+    This attribute wraps a concrete distributed layout while TLX-generated IR
+    still needs to pass through function inlining. It implements the same
+    distributed layout interfaces by delegating to the wrapped layout, but its
+    TLX dialect ownership avoids the normal TritonGPU tensor-layout verifier.
+
+    The post-inline TLX placeholder-resolution pass unwraps this attribute and
+    verifies that none remain.
+  }];
+
+  let parameters = (ins "Attribute":$layout);
+
+  let extraClassDeclaration = [{
+    SmallVector<unsigned> getRepOrder() const;
+    ::mlir::triton::LinearLayout toLinearLayout(ArrayRef<int64_t> shape) const;
+  }];
+
+  let genVerifyDecl = 1;
+  let assemblyFormat = "`<` $layout `>`";
 }
 
 #endif // TLX_ATTRDEFS

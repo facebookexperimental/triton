@@ -39,4 +39,5 @@ def test_layout_shape_stride_maps_to_linear():
     # 3 warp bases -> 2**3 = 8 warps; the layout requires num_warps == 8.
     compiled = kernel.warmup(_separable_qk_layout(), grid=(1, ), num_warps=8)
     ttir = compiled.asm["ttir"]
+    assert "no_verify_layout" not in ttir
     assert _SEPARABLE_QK_LINEAR in ttir
