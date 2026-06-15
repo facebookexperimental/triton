@@ -122,6 +122,7 @@ def _compute_offsets(
 
 @triton.jit
 def _mask_scalar(qk, col_limit_right, s, i):
+    # Forward orientation: keep columns c < col_limit_right, mask c >= it to -inf.
     col_lim_right_s = col_limit_right - s
     col_lim_right_cur = max(col_lim_right_s, 0)
     mask = -1 << col_lim_right_cur
@@ -130,7 +131,18 @@ def _mask_scalar(qk, col_limit_right, s, i):
 
 
 @triton.jit
-def _apply_causal_mask(qk, col_limit_right, BLOCK_N: tl.constexpr):
+def _mask_scalar_transposed(qk, col_limit_left, s, i):
+    # Transposed orientation (backward qkT[N, M]): keep columns c >= col_limit_left
+    # (i.e. keep keys where m >= n), mask c < it to -inf. Mirror of _mask_scalar:
+    # same per-16-block bitmask, but the kept side is flipped.
+    col_lim_left_cur = max(col_limit_left - s, 0)
+    mask = -1 << col_lim_left_cur
+    keep_i_bit = (mask & (1 << i)) != 0
+    return tl.where(keep_i_bit, qk, -float("inf"))
+
+
+@triton.jit
+def _apply_causal_mask(qk, col_limit, BLOCK_N: tl.constexpr, TRANSPOSED: tl.constexpr = False):
     # Apply causal mask via a bitmask calculated for each block of 16 elements.
     # This allows the efficient R2P (register to predicate) instruction to be used at the SASS level.
     # Credit to Tri Dao,
@@ -138,10 +150,17 @@ def _apply_causal_mask(qk, col_limit_right, BLOCK_N: tl.constexpr):
     #
     # NOTE: We use map_elementwise here in order to generate an interleaved sequence of instructions
     # that processes one element of qk at a time. This improves ptxas's resulting SASS.
-    offs_n = tl.arange(0, BLOCK_N)[None, :]
-    s = offs_n & ~0xF
-    i = offs_n & 0xF
-    return tl.map_elementwise(_mask_scalar, qk, col_limit_right, s, i)
+    #
+    # Forward (TRANSPOSED=False): qk is [M, N], col_limit is the per-query right
+    # bound on keys (offs_m - start_n + 1). Backward (TRANSPOSED=True): qk is the
+    # transposed qkT [N, M], col_limit is the per-key left bound on queries
+    # (offs_n - curr_m); masks columns m < n so only m >= n survive.
+    offs = tl.arange(0, BLOCK_N)[None, :]
+    s = offs & ~0xF
+    i = offs & 0xF
+    if TRANSPOSED:
+        return tl.map_elementwise(_mask_scalar_transposed, qk, col_limit, s, i)
+    return tl.map_elementwise(_mask_scalar, qk, col_limit, s, i)
 
 
 @triton.jit
@@ -1431,15 +1450,11 @@ def _softmax_recompute_quantization_iter(
     qkT_scaled = _fma_f32x2(qkT, qk_scale, -m[None, :])
     # Clamp to prevent FP32 overflow downstream in P*dP
     qkT_scaled = tl.minimum(qkT_scaled, 20.0)
-    pT = tl.math.exp2(qkT_scaled)
-
-    # Causal mask for the diagonal block: pT is [N, M] (transposed), so zero out
-    # entries where the query position is before the key position (m < n).
     if MASK:
-        offs_m = curr_m + tl.arange(0, BLOCK_M1)
         offs_n = start_n + tl.arange(0, BLOCK_N1)
-        causal_mask = offs_m[None, :] >= offs_n[:, None]
-        pT = tl.where(causal_mask, pT, 0.0)
+        col_limit_left = (offs_n - curr_m)[:, None]
+        qkT_scaled = _apply_causal_mask(qkT_scaled, col_limit_left, BLOCK_M1, TRANSPOSED=True)
+    pT = tl.math.exp2(qkT_scaled)
 
     # Quantize P^T -> TMEM with fixed pow2 scale.
     # P = exp2(QK·scale - m) ∈ [0, 1], so a fixed E8M0 scale works for all
