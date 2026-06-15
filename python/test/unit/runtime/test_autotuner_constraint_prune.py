@@ -7,13 +7,23 @@ compilation), inspects its TTGIR/PTX, and prunes a rejected config by marking it
 timing invalid. Static bitwise-equivalence pruning is layered on this hook in
 ``bitequiv`` and is unit-tested there (``bitequiv/tests/test_equivalence.py``).
 
-This file has two layers:
+The hook is a **general IR filter** — it prunes by any spec in the compiled IR, not just
+bitwise equivalence. This file has two layers:
 
 * **CPU logic tests** (no GPU) drive ``Autotuner.run`` end-to-end with a *mock* JIT
   function so the prune control flow (artifact inspection, keep/drop, compile-error
   handling) is validated deterministically without a GPU.
 * **GPU end-to-end tests** (skipped without CUDA) exercise the same hook through real
-  Triton compilation, modeled on ``test_autotuner.py``.
+  Triton compilation, with three general (non-equivalence) showcases:
+  - ``test_gpu_vectorization_filter`` — PTX feature selection (wide vector mem ops),
+  - ``test_gpu_autows_kloop_warp_specialize`` — TTGIR feature selection (warp
+    specialization on a K-loop matmul; Hopper+),
+  - ``test_gpu_autows_keeps_warp_specialized`` — same idea on a persistent matmul (Blackwell),
+  - ``test_gpu_tmem_load_ir_prune`` — TTGIR op drop (Blackwell).
+
+The equivalence *use* of the same hook is tested in ``bitequiv`` (it lives on
+``bitequiv.equivalence``): ``bitequiv/tests/test_constraint_pruning.py`` (end-to-end) and
+``bitequiv/tests/test_equivalence.py`` (unit).
 """
 import pytest
 import torch
@@ -31,8 +41,14 @@ def is_cuda():
     return torch.cuda.is_available() and triton.runtime.driver.active.get_current_target().backend == "cuda"
 
 
+def is_hopper():
+    # Hopper (sm90, e.g. H100) or newer: has TMA + wgmma and supports warp specialization.
+    # CUDA compute capability is (major, minor); major 9 = Hopper, 10/11 = Blackwell.
+    return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
+
+
 def is_blackwell():
-    # Datacenter Blackwell (sm100/sm103): has MMAv5/tcgen05 (TMEM accumulator) and AutoWS.
+    # Datacenter Blackwell (sm100/sm103): adds MMAv5/tcgen05 with a TMEM accumulator (tmem_load).
     return is_cuda() and torch.cuda.get_device_capability()[0] in (10, 11)
 
 
@@ -194,8 +210,140 @@ def test_gpu_ir_prune_on_real_ir(device="cuda"):
 
 
 # ---------------------------------------------------------------------------
-# Blackwell-only artifact filters: AutoWS (TTGIR feature selection) and TMEM_LOAD
-# (TTGIR op drop). Both fire a real keep AND drop on one kernel.
+# Showcase 1: vectorization (PTX) — keep only configs that emit wide vector mem ops.
+#
+# When a thread loads several *contiguous* elements, the backend fuses them into one wide
+# vector instruction (e.g. ``ld.global.v4.b32`` = 4 contiguous 32-bit loads in one
+# transaction). Width = min(128/dtype_bits, contiguity, mask_alignment, sizePerThread), and
+# sizePerThread is bounded by BLOCK_SIZE/(num_warps*32); for fp32/num_warps=4,
+# BLOCK_SIZE>=512 -> v4, 256 -> v2, 128 -> scalar. Arch-independent (H100 fine). We record
+# the predicate's per-config verdict and assert the prune outcome matches it exactly.
+# ---------------------------------------------------------------------------
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA GPU")
+def test_gpu_vectorization_filter(device="cuda"):
+    N = 1 << 20
+    src = torch.randn(N, device=device, dtype=torch.float32)
+    dst = torch.empty_like(src)
+
+    seen = {}
+
+    def keep_vectorized(config, asm, metadata):
+        ptx = asm.get("ptx", "")
+        ok = ("ld.global.v4" in ptx) or ("st.global.v4" in ptx) or ("ld.global.v2" in ptx)
+        seen[config] = ok
+        return ok
+
+    configs = [triton.Config({"BLOCK_SIZE": bs}) for bs in (64, 128, 256, 1024, 4096)]
+
+    @triton.autotune(configs=configs, key=["N"], prune_configs_by={"ir_config_prune": keep_vectorized})
+    @triton.jit
+    def copy_kernel(src, dst, N, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        m = offs < N
+        tl.store(dst + offs, tl.load(src + offs, mask=m), mask=m)
+
+    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE"]), )
+    copy_kernel[grid](src, dst, N)
+
+    pruned = set(copy_kernel.pruned_by_ir)
+    rejected = {c for c, ok in seen.items() if not ok}
+    assert pruned == rejected  # pruned set == configs the predicate rejected
+    assert copy_kernel.best_config not in pruned  # winner survived
+    assert seen[copy_kernel.best_config] is True  # ...and it is vectorized
+
+
+# ---------------------------------------------------------------------------
+# Showcase 2: AutoWS (TTGIR) — keep only configs that warp-specialize. A TMA matmul whose
+# K-loop is tl.range(..., warp_specialize=True) splits warps into a TMA-load producer and an
+# MMA consumer that overlap; the TTGIR then has a ``ttg.warp_specialize`` op. Hopper+ (H100
+# and newer) via Meta's WS path (knobs.nvidia.use_meta_ws). Kernel mirrors
+# test_warp_specialization.py::matmul_tma_ws_kernel. Whether a given config warp-specializes
+# can vary by shape/GPU, so we assert the prune outcome matches the predicate's verdict.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _ws_compute_pid(tile_id, num_pid_n, num_pid_m, GROUP_SIZE_M):
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = tile_id // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (tile_id % group_size_m)
+    pid_n = (tile_id % num_pid_in_group) // group_size_m
+    return pid_m, pid_n
+
+
+@triton.jit
+def _matmul_tma_ws_kernel(a_ptr, b_ptr, c_ptr, a_s0, a_s1, b_s0, b_s1, c_s0, c_s1, M, N, K, KSTAGES: tl.constexpr,
+                          BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+                          GROUP_SIZE_M: tl.constexpr):
+    a_desc = tl.make_tensor_descriptor(a_ptr, shape=[M, K], strides=[a_s0, a_s1],
+                                       block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K])
+    b_desc = tl.make_tensor_descriptor(b_ptr, shape=[N, K], strides=[b_s0, b_s1],
+                                       block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K])
+    c_desc = tl.make_tensor_descriptor(c_ptr, shape=[M, N], strides=[c_s0, c_s1],
+                                       block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N])
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    pid_m, pid_n = _ws_compute_pid(pid, num_pid_n, num_pid_m, GROUP_SIZE_M)
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    off_am = pid_m * BLOCK_SIZE_M
+    off_bn = pid_n * BLOCK_SIZE_N
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    # warp_specialize=True on the K-loop -> AutoWS partitions warps into TMA-load + MMA roles.
+    for k in tl.range(k_tiles, warp_specialize=True, num_stages=KSTAGES):
+        off_k = k * BLOCK_SIZE_K
+        a = a_desc.load((off_am, off_k))
+        b = b_desc.load((off_bn, off_k))
+        accumulator = tl.dot(a, b.T, accumulator)
+    c_desc.store((off_am, off_bn), accumulator.to(tl.float16))
+
+
+@pytest.mark.skipif(not is_hopper(), reason="requires Hopper+ (sm90 / H100 or newer)")
+def test_gpu_autows_kloop_warp_specialize(device="cuda"):
+    M = N = K = 512
+    BM = BN = 128
+    BK = 64
+    GROUP = 8
+    KSTAGES = 2
+    a = torch.randn((M, K), device=device, dtype=torch.float16)
+    b = torch.randn((N, K), device=device, dtype=torch.float16)
+    c = torch.empty((M, N), device=device, dtype=torch.float16)
+    triton.set_allocator(lambda size, align, stream: torch.empty(size, dtype=torch.int8, device=device))
+
+    seen = {}
+
+    def keep_warp_specialized(config, asm, metadata):
+        ws = "ttg.warp_specialize" in asm.get("ttgir", "")
+        seen[config] = ws
+        return ws
+
+    configs = [triton.Config({}, num_warps=nw, num_stages=2) for nw in (4, 8)]
+
+    @triton.autotune(configs=configs, key=["M", "N", "K"], prune_configs_by={"ir_config_prune": keep_warp_specialized})
+    @triton.jit
+    def matmul(a_ptr, b_ptr, c_ptr, a_s0, a_s1, b_s0, b_s1, c_s0, c_s1, M, N, K, KSTAGES: tl.constexpr,
+               BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+               GROUP_SIZE_M: tl.constexpr):
+        _matmul_tma_ws_kernel(a_ptr, b_ptr, c_ptr, a_s0, a_s1, b_s0, b_s1, c_s0, c_s1, M, N, K, KSTAGES, BLOCK_SIZE_M,
+                              BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M)
+
+    grid = lambda meta: (triton.cdiv(M, BM) * triton.cdiv(N, BN), )
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True  # == TRITON_USE_META_WS=1
+        matmul[grid](a, b, c, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1), M, N, K,
+                     KSTAGES=KSTAGES, BLOCK_SIZE_M=BM, BLOCK_SIZE_N=BN, BLOCK_SIZE_K=BK, GROUP_SIZE_M=GROUP)
+
+    pruned = set(matmul.pruned_by_ir)
+    rejected = {cfg for cfg, ws in seen.items() if not ws}
+    assert pruned == rejected  # pruned set == configs that did NOT warp-specialize
+    assert matmul.best_config not in pruned  # winner survived
+    assert seen[matmul.best_config] is True  # ...and it warp-specializes (ttg.warp_specialize in TTGIR)
+
+
+# ---------------------------------------------------------------------------
+# Pre-existing Blackwell AutoWS test (kept): a persistent TMA matmul where FLATTEN=False
+# warp-specializes (kept) and FLATTEN=True does not (dropped).
 # ---------------------------------------------------------------------------
 @triton.jit
 def _matmul_tma_ws(a_desc, b_desc, c_desc, M, N, K, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
