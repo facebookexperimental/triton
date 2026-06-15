@@ -1373,14 +1373,18 @@ def _bwd_mma_dots_2cta(
     # Order: S → dK → dP → dQ → dV
     # -----------------------------------------------------------
     tlx.barrier_wait(dk_empties[kv_buf_id], kv_phase ^ 1)
+    # kt is loaded once per n-block and reused across the whole m-loop, so wait
+    # on it once here (like k_fulls/v_fulls) instead of every iteration.
+    tlx.barrier_wait(kt_fulls[kv_buf_id], kv_phase)
     for j in range(1, num_steps):
         q_buf_id, q_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
         tmem_buf_id, tmem_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
 
         tlx.barrier_wait(qt_fulls[q_buf_id], q_phase)
         tlx.barrier_wait(qk_empties[tmem_buf_id], tmem_phase ^ 1)
-        prev_tmem_buf_id, prev_tmem_phase = get_bufidx_phase(blk_idx - 1, NUM_BUFFERS_TMEM)
-        tlx.barrier_wait(dq_empties[prev_tmem_buf_id], prev_tmem_phase ^ 1)
+        prev_blk_idx = blk_idx - 1
+        tmem_buf_id_prev, tmem_phase_prev = get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_TMEM)
+        tlx.barrier_wait(dq_empties[tmem_buf_id_prev], tmem_phase_prev ^ 1)
         qT = tlx.local_trans(qt_tiles[q_buf_id])
         tlx.async_dot(
             k_tiles[kv_buf_id],
@@ -1391,9 +1395,7 @@ def _bwd_mma_dots_2cta(
             two_ctas=True,
         )
 
-        prev_blk_idx = blk_idx - 1
         q_buf_id_prev, q_phase_prev = get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_Q)
-        tmem_buf_id_prev, tmem_phase_prev = get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_TMEM)
         ds_buf_id_prev, ds_phase_prev = get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_DS)
 
         tlx.barrier_wait(q_fulls[q_buf_id_prev], q_phase_prev)
@@ -1420,10 +1422,11 @@ def _bwd_mma_dots_2cta(
             two_ctas=True,
         )
         # Dot 5: dq = tl.dot(tl.trans(dsT), k)
+        # dq_empties[prev] was already waited before Dot 1 (qk aliases the dq
+        # TMEM region), and kt_fulls is now waited once before the loop, so
+        # neither needs re-waiting here.
         tlx.barrier_wait(ds_fulls[ds_buf_id_prev], ds_phase_prev)
-        tlx.barrier_wait(dq_empties[tmem_buf_id_prev], tmem_phase_prev ^ 1)
         dsT_view = tlx.local_trans(ds_tiles[ds_buf_id_prev])
-        tlx.barrier_wait(kt_fulls[kv_buf_id], kv_phase)
         tlx.async_dot(
             dsT_view,
             kt_tiles[kv_buf_id],
