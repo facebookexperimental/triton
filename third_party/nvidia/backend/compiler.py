@@ -676,7 +676,6 @@ class CUDABackend(BaseBackend):
             nvidia.passes.hopper.add_2cta_transform_loads(pm)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
         passes.ttir.add_loop_aware_cse(pm)
-        use_meta_swp_schedule = knobs.nvidia.use_meta_ws
         if capability // 10 in [8, 9]:
             passes.ttgpuir.add_fuse_nested_loops(pm)
             passes.common.add_canonicalizer(pm)
@@ -685,8 +684,8 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             if knobs.nvidia.use_meta_ws:
                 nvidia.passes.hopper.add_data_partitioning(pm, 1)
-                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
-                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
+                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
+                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
             nvidia.passes.hopper.add_tma_store_lowering(pm)
             if knobs.nvidia.use_meta_ws:
                 nvidia.passes.hopper.add_sink_broadcast(pm)
@@ -703,8 +702,8 @@ class CUDABackend(BaseBackend):
                 generate_subtiled,
             )
             if not knobs.nvidia.use_meta_ws:
-                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
-                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
+                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
+                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
         elif capability // 10 >= 10:
             if not knobs.nvidia.use_modulo_schedule:
@@ -732,8 +731,8 @@ class CUDABackend(BaseBackend):
             # latency-based heuristic. Without assign_latencies, the WS
             # pass's internal scheduleLoops has no latencies and can't
             # enter the code path that reads tt.autows annotations.
-            passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
-            passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
+            passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
+            passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
             if not knobs.nvidia.use_meta_ws:
                 # 2-CTA + upstream WS is not supported
                 if opt.cluster_dims is None or max(opt.cluster_dims) < 2:
