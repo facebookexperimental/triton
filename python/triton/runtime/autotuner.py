@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import builtins
-import logging
 import math
 import time
 import inspect
@@ -25,8 +24,6 @@ except ImportError:
     native_autotune_proxy_insert = None
     native_autotune_proxy_set_grid = None
 from triton._C.libtriton import get_cache_invalidating_env_vars
-
-logger = logging.getLogger(__name__)
 
 
 class _OnlineLinearRegression:
@@ -337,6 +334,10 @@ class Autotuner(KernelInterface):
         # {Config: reason} for configs dropped by ir_config_prune (IR-based pruning, incl.
         # static bitwise-equivalence pruning built on top of it in bitequiv).
         self.pruned_by_ir: Dict[Config, str] = {}
+        # Fraction of evaluated configs that passed `ir_config_prune` on the last tuning run
+        # (kept / evaluated). None when the hook is unused or no config was evaluable. Inspect
+        # after run() as `<autotuned_kernel>.ir_prune_success_rate`.
+        self.ir_prune_success_rate: Optional[float] = None
         # The CompiledKernel produced by the most recent `_bench` launch, captured so the
         # post-bench IR prune can inspect each config's artifact without recompiling.
         self._last_compiled_kernel = None
@@ -851,8 +852,12 @@ class Autotuner(KernelInterface):
         also take an optional 4th argument ``reference`` — the ``(config, asm, metadata)`` of the
         reference config (by default the first surviving config) — so equivalence-style checks can
         compare each config against a fixed reference instead of relying on call order.
+
+        Records ``self.ir_prune_success_rate`` = kept / evaluated (the fraction of evaluated
+        configs that passed the IR check), inspectable on the autotuned kernel after run().
         """
         self.pruned_by_ir = {}
+        self.ir_prune_success_rate = None
         prune = self.ir_config_prune
         inf = float("inf")
         # Only configs that compiled and timed finitely have an artifact worth checking.
@@ -876,8 +881,8 @@ class Autotuner(KernelInterface):
             if not keep:
                 timings[config] = [inf, inf, inf]  # mark invalid so it can't be selected
                 self.pruned_by_ir[config] = "ir-prune"
-        if self.pruned_by_ir:
-            logger.info("ir_config_prune dropped %d/%d configs", len(self.pruned_by_ir), len(configs))
+        # Success rate: fraction of evaluated configs that passed the IR check (kept / evaluated).
+        self.ir_prune_success_rate = (len(items) - len(self.pruned_by_ir)) / len(items)
         if all(t[0] == inf for t in timings.values()):
             raise AutotunerError("No valid autotuner configs after IR pruning. "
                                  "`ir_config_prune` should keep at least one config.")

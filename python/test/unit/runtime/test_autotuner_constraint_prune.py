@@ -173,6 +173,25 @@ def test_no_hooks_is_unchanged_behavior():
     tuner.run(dst, src, N=N, grid=(1, ))
     assert _bs(tuner) == 256  # globally fastest, nothing pruned
     assert tuner.pruned_by_ir == {}
+    assert tuner.ir_prune_success_rate is None  # hook unused -> never set
+
+
+def test_ir_prune_success_rate():
+    """After IR pruning, the kept fraction is stored on `ir_prune_success_rate`."""
+    N = 1024
+    src = torch.arange(N, dtype=torch.float32)
+    dst = torch.empty(N, dtype=torch.float32)
+
+    # Keep only BLOCK_SIZE=1024 -> 1 of 4 configs survive -> 25%.
+    tuner, _ = _make_tuner(_configs(),
+                           prune_configs_by={"ir_config_prune": lambda c, asm, md: "tensor<1024xf32>" in asm["ttgir"]})
+    tuner.run(dst, src, N=N, grid=(1, ))
+    assert tuner.ir_prune_success_rate == 0.25
+
+    # Keep everything -> 100%.
+    tuner2, _ = _make_tuner(_configs(), prune_configs_by={"ir_config_prune": lambda c, asm, md: True})
+    tuner2.run(dst, src, N=N, grid=(1, ))
+    assert tuner2.ir_prune_success_rate == 1.0
 
 
 # ---------------------------------------------------------------------------
