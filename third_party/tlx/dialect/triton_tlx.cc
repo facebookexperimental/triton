@@ -281,13 +281,13 @@ void init_triton_tlx_ir(py::module &&m) {
              auto kWarp = mlir::StringAttr::get(context, "warp");
              auto kBlock = mlir::StringAttr::get(context, "block");
              auto outDims = tt::standardOutDimPairs(context, shape);
-             auto ll = tt::LinearLayout(
-                 {{kReg, regBases},
-                  {kLane, laneBases},
-                  {kWarp, warpBases},
-                  {kBlock, std::vector<std::vector<int>>{}}},
-                 outDims,
-                 /*requiresSurjective=*/true);
+             auto ll =
+                 tt::LinearLayout({{kReg, regBases},
+                                   {kLane, laneBases},
+                                   {kWarp, warpBases},
+                                   {kBlock, std::vector<std::vector<int>>{}}},
+                                  outDims,
+                                  /*requiresSurjective=*/true);
              return mlir::cast<Attribute>(
                  ttg::LinearEncodingAttr::get(context, std::move(ll)));
            })
@@ -452,35 +452,34 @@ void init_triton_tlx_ir(py::module &&m) {
              else
                return self.create<ttng::TMEMAllocOp>(memDesc, nullptr);
            })
-      .def("create_tmem_load",
-           [](TritonOpBuilder &self, Value subView, Attribute &layoutEncoding,
-              std::optional<Value> asyncToken,
-              bool userLayout) -> mlir::Value {
-             auto subViewType = cast<ttg::MemDescType>(subView.getType());
+      .def(
+          "create_tmem_load",
+          [](TritonOpBuilder &self, Value subView, Attribute &layoutEncoding,
+             std::optional<Value> asyncToken, bool userLayout) -> mlir::Value {
+            auto subViewType = cast<ttg::MemDescType>(subView.getType());
 
-             // layoutEncoding must be TMEM compatible
-             auto newType = RankedTensorType::get(subViewType.getShape(),
-                                                  subViewType.getElementType(),
-                                                  layoutEncoding);
-             ttng::TMEMLoadOp loadOp =
-                 asyncToken.has_value()
-                     ? ttng::TMEMLoadOp::create(self.getBuilder(),
-                                                self.getLastLoc(), newType,
-                                                Type(), subView,
-                                                asyncToken.value())
-                     : ttng::TMEMLoadOp::create(self.getBuilder(),
-                                                self.getLastLoc(), newType,
-                                                subView);
-             // Mark the result layout as user-specified so layout passes treat
-             // it as a hard anchor and do not rewrite it to a "preferred" TMEM
-             // layout (see TMemLoadReducePattern in OptimizeTMemLayouts).
-             if (userLayout)
-               loadOp->setAttr("tlx.user_layout",
-                               self.getBuilder().getUnitAttr());
-             return loadOp;
-           },
-           py::arg("subView"), py::arg("layoutEncoding"),
-           py::arg("asyncToken"), py::arg("userLayout") = false)
+            // layoutEncoding must be TMEM compatible
+            auto newType = RankedTensorType::get(subViewType.getShape(),
+                                                 subViewType.getElementType(),
+                                                 layoutEncoding);
+            ttng::TMEMLoadOp loadOp =
+                asyncToken.has_value()
+                    ? ttng::TMEMLoadOp::create(
+                          self.getBuilder(), self.getLastLoc(), newType, Type(),
+                          subView, asyncToken.value())
+                    : ttng::TMEMLoadOp::create(self.getBuilder(),
+                                               self.getLastLoc(), newType,
+                                               subView);
+            // Mark the result layout as user-specified so layout passes treat
+            // it as a hard anchor and do not rewrite it to a "preferred" TMEM
+            // layout (see TMemLoadReducePattern in OptimizeTMemLayouts).
+            if (userLayout)
+              loadOp->setAttr("tlx.user_layout",
+                              self.getBuilder().getUnitAttr());
+            return loadOp;
+          },
+          py::arg("subView"), py::arg("layoutEncoding"), py::arg("asyncToken"),
+          py::arg("userLayout") = false)
       .def("create_tmem_store",
            [](TritonOpBuilder &self, Value &dst, Value &src) -> void {
              Value pred = self.create<arith::ConstantIntOp>(1, 1);
@@ -593,6 +592,11 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value &arg,
               std::vector<int32_t> order) -> mlir::Value {
              return self.create<ttg::MemDescTransOp>(arg, order);
+           })
+      .def("create_memdesc_reshape",
+           [](TritonOpBuilder &self, Value &src,
+              std::vector<int64_t> shape) -> mlir::Value {
+             return self.create<ttg::MemDescReshapeOp>(src, shape);
            })
       .def("create_memdesc_reinterpret",
            [](TritonOpBuilder &self, Value &src, Type &newElementType,

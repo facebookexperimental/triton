@@ -713,8 +713,8 @@ def local_load(
             # mark it as a user layout so later TMEM-layout optimization treats
             # it as a hard anchor instead of rewriting it to a preferred layout.
             enc = layout.to_ir(_semantic.builder, src.type.shape, src.type.element_ty)
-            load_handle = _semantic.builder.create_tmem_load(src.handle, enc,
-                                                             token.handle if token else None, userLayout=True)
+            load_handle = _semantic.builder.create_tmem_load(src.handle, enc, token.handle if token else None,
+                                                             userLayout=True)
             return tl.tensor(load_handle, block_type)
         tmem_compatible_layout_encoding = _create_tmem_compatible_tensor_layout_encoding(_semantic.builder, src)
         load_handle = _semantic.builder.create_tmem_load(src.handle, tmem_compatible_layout_encoding,
@@ -873,6 +873,29 @@ def local_trans(input: tlx.buffered_tensor, dims: Tuple[int] = (1, 0), _semantic
 
     permuted_handle = _semantic.builder.create_memdesc_trans(input.handle, dims)
     return input.make_permute(permuted_handle, dims)
+
+
+@tl.builtin
+def local_reshape(
+    src: tlx.buffered_tensor,
+    shape: list[tl.constexpr],
+    _semantic=None,
+) -> tlx.buffered_tensor:
+    """
+    Reshape a shared-memory descriptor without moving data.
+    """
+    assert isinstance(src, tlx.buffered_tensor) and src.type.storage == tlx.storage_kind.smem, (
+        "TLX local_reshape only supports SMEM")
+    reshape_handle = _semantic.builder.create_memdesc_reshape(src.handle, shape)
+    layout = tlx.swizzled_shared_layout_encoding.make_default(rank=len(shape))
+    return tlx.buffered_tensor(
+        reshape_handle,
+        src.type.scalar,
+        shape,
+        src.type.num,
+        src.type.storage,
+        layout,
+    )
 
 
 @tl.builtin
