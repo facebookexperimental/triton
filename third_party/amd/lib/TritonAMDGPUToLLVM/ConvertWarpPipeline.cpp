@@ -89,6 +89,37 @@ static void emitClusterBarrier(PatternRewriter &r, Location loc,
   ROCDL::SchedBarrier::create(r, loc, 0);
 }
 
+// Emit an s_setprio for a cluster's hardware scheduling priority.  When the
+// cluster carries an explicit triton.warp_pipeline.priority attribute we set
+// that value; when it doesn't but some *other* stage in the pipeline does, we
+// reset to the default priority so the hint does not leak across stages.
+// Clusters with no priority in a pipeline where nobody uses priority (e.g.
+// gluon borders) emit nothing.
+static void emitClusterPriority(PatternRewriter &r, Location loc,
+                                Operation *clusterOp, bool anyHasPriority) {
+  if (auto intAttr = clusterOp->getAttrOfType<IntegerAttr>(
+          "triton.warp_pipeline.priority")) {
+    ROCDL::SetPrioOp::create(r, loc, intAttr.getInt());
+  } else if (anyHasPriority) {
+    ROCDL::SetPrioOp::create(r, loc, 0);
+  }
+}
+
+// Wrap a pre-existing barrier op (e.g. async_wait) with sched_barriers so the
+// backend scheduler cannot move ops across it, and emit the cluster's priority
+// just before the barrier.  Used in place of inserting a fresh cluster barrier
+// when one already exists at the cluster boundary.
+static void wrapExistingBarrier(PatternRewriter &b, Location loc,
+                                Operation *clusterOp,
+                                Operation *existingBarrier,
+                                bool anyHasPriority) {
+  b.setInsertionPoint(existingBarrier);
+  emitClusterPriority(b, loc, clusterOp, anyHasPriority);
+  ROCDL::SchedBarrier::create(b, loc, 0);
+  b.setInsertionPointAfter(existingBarrier);
+  ROCDL::SchedBarrier::create(b, loc, 0);
+}
+
 class ConvertPipelinedForPattern : public OpRewritePattern<scf::ForOp> {
 public:
   ConvertPipelinedForPattern(MLIRContext *ctx, ModuleAllocation &moduleAlloc)
@@ -142,7 +173,8 @@ private:
 
     // Insert condbarrier::first_half after the end of the loop
     b.setInsertionPointAfter(forOp);
-    mlir::triton::amdgpu::CondBarrierOp::create(b, loc, warpLow);
+    auto warpLowBarrier =
+        mlir::triton::amdgpu::CondBarrierOp::create(b, loc, warpLow);
 
     // 2. Collect existing barrier information.
     // Scanning the loop body and classifying each consecutive block of
@@ -166,7 +198,8 @@ private:
         clusterBlocks.push_back(&exeOp->getRegion(0).front());
         bars.push_back(false);
       } else if (isa<ROCDL::BarrierOp, gpu::BarrierOp, triton::gpu::AsyncWaitOp,
-                     triton::amdgpu::AsyncTDMWait>(op)) {
+                     triton::amdgpu::AsyncWaitOp, triton::amdgpu::AsyncTDMWait>(
+                     op)) {
         int currCluster = clusterBlocks.size();
         // Reject if multiple barriers appear without an intervening cluster.
         // This is functionally valid but may cause unpredictable timing. Users
@@ -190,6 +223,11 @@ private:
       clusterInfo.push_back(buildBlockInfoFromBlock(cb, allocation));
     int numClusters = clusterInfo.size();
     LDBG("total clusters : " << numClusters);
+
+    // Check if any cluster has explicit priority (gluon borders never do).
+    bool anyHasPriority = llvm::any_of(clusterOps, [](Operation *op) {
+      return op->hasAttr("triton.warp_pipeline.priority");
+    });
 
     // Normally, we don't expect a pipelined loop begins with a barrier
     // but sometimes required by memory prefetching pattern.
@@ -256,21 +294,34 @@ private:
     //    the first cluster barrier must be inserted just before the loop’s
     //    terminator, forming the wrap-around dependency.
     for (int i = 0; i < numClusters; i++) {
+      if (i == 0 && topBar == existingBarrierMap.end()) {
+        // Prime the first iteration's priority.  The loop-carried cluster-0
+        // barrier sits at the bottom of the loop body, so it only controls
+        // the next iteration.
+        b.setInsertionPoint(forOp);
+        emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
+      }
+
       if (auto exBar = existingBarrierMap.find(i);
           exBar != existingBarrierMap.end()) {
-        auto exBarOp = exBar->second;
-        b.setInsertionPoint(exBarOp);
-        ROCDL::SchedBarrier::create(b, loc, 0);
-        b.setInsertionPointAfter(exBarOp);
-        ROCDL::SchedBarrier::create(b, loc, 0);
+        wrapExistingBarrier(b, loc, clusterOps[i], exBar->second,
+                            anyHasPriority);
       } else {
         b.setInsertionPoint(clusterOps[i]);
         // The first one wraps back to the last of the loop
         if (i == 0 && topBar == existingBarrierMap.end())
           // inserts just before yield (=End of the loop).
           b.setInsertionPoint(terminatorOp);
+        emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
         emitClusterBarrier(b, loc, /*needLocal=*/bars[i]);
       }
+    }
+
+    // Post-loop priority reset: drop back to default priority before the warps
+    // reconverge, so the hint does not leak past the pipelined loop.
+    if (anyHasPriority) {
+      b.setInsertionPoint(warpLowBarrier);
+      ROCDL::SetPrioOp::create(b, loc, 0);
     }
     return success();
   }
