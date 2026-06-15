@@ -38,6 +38,10 @@ constexpr static char AttrClusterSyncKernelCleanupName[] =
 
 bool tlxEnablePairedMMA(Operation *op);
 
+Attribute wrapNoVerifyLayout(Attribute layout);
+Attribute unwrapNoVerifyLayout(Attribute layout);
+bool hasNoVerifyLayout(Attribute layout);
+
 bool hasClusterSyncKernelInit(Operation *op);
 void setClusterSyncKernelInitOnMod(Operation *op, bool value);
 

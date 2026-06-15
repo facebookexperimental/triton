@@ -81,8 +81,9 @@ void init_triton_tlx_ir(py::module &&m) {
                    type.getMemorySpace(), type.getMutableMemory(), allocShape);
                return self.create<tlx::RequireLayoutOp>(newType, v);
              } else if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
-               newType = RankedTensorType::get(type.getShape(),
-                                               type.getElementType(), encoding);
+               Attribute tensorEncoding = tlx::wrapNoVerifyLayout(encoding);
+               newType = RankedTensorType::get(
+                   type.getShape(), type.getElementType(), tensorEncoding);
                return self.create<tlx::RequireLayoutOp>(newType, v);
              } else {
                throw std::runtime_error("Unsupported type");
@@ -257,9 +258,10 @@ void init_triton_tlx_ir(py::module &&m) {
              SmallVector<unsigned, 2> CTAOrder = {1, 0};
              auto CTALayout = ttg::CGAEncodingAttr::fromSplitParams(
                  context, CTAsPerCGA, CTASplitNum, CTAOrder);
-             return mlir::cast<Attribute>(ttg::NvidiaMmaEncodingAttr::get(
-                 context, versionMajor, versionMinor, warpsPerCTA, CTALayout,
-                 instrShape));
+             return tlx::wrapNoVerifyLayout(mlir::cast<Attribute>(
+                 ttg::NvidiaMmaEncodingAttr::get(context, versionMajor,
+                                                 versionMinor, warpsPerCTA,
+                                                 CTALayout, instrShape)));
            })
       .def("make_dot_operand_encoding_attr",
            [](TritonOpBuilder &self, Value opnd, unsigned opIdx,
@@ -267,8 +269,11 @@ void init_triton_tlx_ir(py::module &&m) {
              auto context = self.getBuilder().getContext();
              auto eltType =
                  cast<RankedTensorType>(opnd.getType()).getElementType();
-             return ttg::DotOperandEncodingAttr::get(context, opIdx, parentEnc,
-                                                     eltType);
+             auto parent = tlx::unwrapNoVerifyLayout(parentEnc);
+             assert(isa<ttg::DistributedEncodingTrait>(parent) &&
+                    "dot operand parent must be a distributed layout");
+             return tlx::wrapNoVerifyLayout(ttg::DotOperandEncodingAttr::get(
+                 context, opIdx, parent, eltType));
            })
       .def("make_linear_encoding_attr",
            [](TritonOpBuilder &self, std::vector<std::vector<int>> regBases,
@@ -281,15 +286,15 @@ void init_triton_tlx_ir(py::module &&m) {
              auto kWarp = mlir::StringAttr::get(context, "warp");
              auto kBlock = mlir::StringAttr::get(context, "block");
              auto outDims = tt::standardOutDimPairs(context, shape);
-             auto ll = tt::LinearLayout(
-                 {{kReg, regBases},
-                  {kLane, laneBases},
-                  {kWarp, warpBases},
-                  {kBlock, std::vector<std::vector<int>>{}}},
-                 outDims,
-                 /*requiresSurjective=*/true);
-             return mlir::cast<Attribute>(
-                 ttg::LinearEncodingAttr::get(context, std::move(ll)));
+             auto ll =
+                 tt::LinearLayout({{kReg, regBases},
+                                   {kLane, laneBases},
+                                   {kWarp, warpBases},
+                                   {kBlock, std::vector<std::vector<int>>{}}},
+                                  outDims,
+                                  /*requiresSurjective=*/true);
+             return tlx::wrapNoVerifyLayout(mlir::cast<Attribute>(
+                 ttg::LinearEncodingAttr::get(context, std::move(ll))));
            })
       .def("make_dummy_register_layout_attr",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
@@ -452,35 +457,35 @@ void init_triton_tlx_ir(py::module &&m) {
              else
                return self.create<ttng::TMEMAllocOp>(memDesc, nullptr);
            })
-      .def("create_tmem_load",
-           [](TritonOpBuilder &self, Value subView, Attribute &layoutEncoding,
-              std::optional<Value> asyncToken,
-              bool userLayout) -> mlir::Value {
-             auto subViewType = cast<ttg::MemDescType>(subView.getType());
+      .def(
+          "create_tmem_load",
+          [](TritonOpBuilder &self, Value subView, Attribute &layoutEncoding,
+             std::optional<Value> asyncToken, bool userLayout) -> mlir::Value {
+            auto subViewType = cast<ttg::MemDescType>(subView.getType());
 
-             // layoutEncoding must be TMEM compatible
-             auto newType = RankedTensorType::get(subViewType.getShape(),
-                                                  subViewType.getElementType(),
-                                                  layoutEncoding);
-             ttng::TMEMLoadOp loadOp =
-                 asyncToken.has_value()
-                     ? ttng::TMEMLoadOp::create(self.getBuilder(),
-                                                self.getLastLoc(), newType,
-                                                Type(), subView,
-                                                asyncToken.value())
-                     : ttng::TMEMLoadOp::create(self.getBuilder(),
-                                                self.getLastLoc(), newType,
-                                                subView);
-             // Mark the result layout as user-specified so layout passes treat
-             // it as a hard anchor and do not rewrite it to a "preferred" TMEM
-             // layout (see TMemLoadReducePattern in OptimizeTMemLayouts).
-             if (userLayout)
-               loadOp->setAttr("tlx.user_layout",
-                               self.getBuilder().getUnitAttr());
-             return loadOp;
-           },
-           py::arg("subView"), py::arg("layoutEncoding"),
-           py::arg("asyncToken"), py::arg("userLayout") = false)
+            // layoutEncoding must be TMEM compatible
+            Attribute tensorEncoding = tlx::wrapNoVerifyLayout(layoutEncoding);
+            auto newType = RankedTensorType::get(subViewType.getShape(),
+                                                 subViewType.getElementType(),
+                                                 tensorEncoding);
+            ttng::TMEMLoadOp loadOp =
+                asyncToken.has_value()
+                    ? ttng::TMEMLoadOp::create(
+                          self.getBuilder(), self.getLastLoc(), newType, Type(),
+                          subView, asyncToken.value())
+                    : ttng::TMEMLoadOp::create(self.getBuilder(),
+                                               self.getLastLoc(), newType,
+                                               subView);
+            // Mark the result layout as user-specified so layout passes treat
+            // it as a hard anchor and do not rewrite it to a "preferred" TMEM
+            // layout (see TMemLoadReducePattern in OptimizeTMemLayouts).
+            if (userLayout)
+              loadOp->setAttr("tlx.user_layout",
+                              self.getBuilder().getUnitAttr());
+            return loadOp;
+          },
+          py::arg("subView"), py::arg("layoutEncoding"), py::arg("asyncToken"),
+          py::arg("userLayout") = false)
       .def("create_tmem_store",
            [](TritonOpBuilder &self, Value &dst, Value &src) -> void {
              Value pred = self.create<arith::ConstantIntOp>(1, 1);
