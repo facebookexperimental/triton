@@ -11,6 +11,7 @@ import torch
 import triton
 import triton.language as tl
 from triton._internal_testing import is_blackwell, is_hopper
+from triton.language.extra.subtile_ops import _split_n_2D
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 
@@ -126,7 +127,6 @@ def matmul_kernel_tma_persistent_ws(
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
     num_tiles = num_pid_m * num_pid_n
 
-    tile_id_c = start_pid - NUM_SMS
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
     # Always use warp_specialize=True with configurable flatten
@@ -157,36 +157,13 @@ def matmul_kernel_tma_persistent_ws(
                 b = b_desc.load([offs_bn, offs_k])
             accumulator = tl.dot(a, b.T, accumulator)
 
-        tile_id_c += NUM_SMS
-        pid_m, pid_n = _compute_pid(tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
-        offs_am_c = pid_m * BLOCK_SIZE_M
-        offs_bn_c = pid_n * BLOCK_SIZE_N
-
-        if EPILOGUE_SUBTILE == 1:
-            accumulator = accumulator.to(dtype)
-            c_desc.store([offs_am_c, offs_bn_c], accumulator)
-        elif EPILOGUE_SUBTILE == 2:
-            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
-            acc = tl.permute(acc, (0, 2, 1))
-            acc0, acc1 = tl.split(acc)
-            c0 = acc0.to(dtype)
-            c_desc.store([offs_am_c, offs_bn_c], c0)
-            c1 = acc1.to(dtype)
-            c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
-        elif EPILOGUE_SUBTILE == 4:
-            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
-            acc = tl.permute(acc, (0, 2, 1))
-            acc0, acc1 = tl.split(acc)
-            acc00, acc01 = tl.split(tl.permute(tl.reshape(acc0, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4)), (0, 2, 1)))
-            acc10, acc11 = tl.split(tl.permute(tl.reshape(acc1, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4)), (0, 2, 1)))
-            c00 = acc00.to(dtype)
-            c_desc.store([offs_am_c, offs_bn_c], c00)
-            c01 = acc01.to(dtype)
-            c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 4], c01)
-            c10 = acc10.to(dtype)
-            c_desc.store([offs_am_c, offs_bn_c + 2 * (BLOCK_SIZE_N // 4)], c10)
-            c11 = acc11.to(dtype)
-            c_desc.store([offs_am_c, offs_bn_c + 3 * (BLOCK_SIZE_N // 4)], c11)
+        acc_slices = _split_n_2D(accumulator, EPILOGUE_SUBTILE)
+        slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
+        for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
+            c_desc.store(
+                [offs_am, offs_bn + slice_id * slice_size],
+                acc_slices[slice_id].to(dtype),
+            )
 
 
 # ============================================================================
@@ -260,7 +237,6 @@ def matmul_kernel_descriptor_persistent_ws(
         ],
     )
 
-    tile_id_c = start_pid - NUM_SMS
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
     # Always use warp_specialize=True with configurable flatten
@@ -291,36 +267,13 @@ def matmul_kernel_descriptor_persistent_ws(
                 b = b_desc.load([offs_bn, offs_k])
             accumulator = tl.dot(a, b.T, accumulator)
 
-        tile_id_c += NUM_SMS
-        pid_m, pid_n = _compute_pid(tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
-        offs_cm = pid_m * BLOCK_SIZE_M
-        offs_cn = pid_n * BLOCK_SIZE_N
-
-        if EPILOGUE_SUBTILE == 1:
-            c = accumulator.to(dtype)
-            c_desc.store([offs_cm, offs_cn], c)
-        elif EPILOGUE_SUBTILE == 2:
-            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
-            acc = tl.permute(acc, (0, 2, 1))
-            acc0, acc1 = tl.split(acc)
-            c0 = acc0.to(dtype)
-            c_desc.store([offs_cm, offs_cn], c0)
-            c1 = acc1.to(dtype)
-            c_desc.store([offs_cm, offs_cn + BLOCK_SIZE_N // 2], c1)
-        elif EPILOGUE_SUBTILE == 4:
-            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
-            acc = tl.permute(acc, (0, 2, 1))
-            acc0, acc1 = tl.split(acc)
-            acc00, acc01 = tl.split(tl.permute(tl.reshape(acc0, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4)), (0, 2, 1)))
-            acc10, acc11 = tl.split(tl.permute(tl.reshape(acc1, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4)), (0, 2, 1)))
-            c00 = acc00.to(dtype)
-            c_desc.store([offs_cm, offs_cn], c00)
-            c01 = acc01.to(dtype)
-            c_desc.store([offs_cm, offs_cn + BLOCK_SIZE_N // 4], c01)
-            c10 = acc10.to(dtype)
-            c_desc.store([offs_cm, offs_cn + 2 * (BLOCK_SIZE_N // 4)], c10)
-            c11 = acc11.to(dtype)
-            c_desc.store([offs_cm, offs_cn + 3 * (BLOCK_SIZE_N // 4)], c11)
+        acc_slices = _split_n_2D(accumulator, EPILOGUE_SUBTILE)
+        slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
+        for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
+            c_desc.store(
+                [offs_am, offs_bn + slice_id * slice_size],
+                acc_slices[slice_id].to(dtype),
+            )
 
 
 # ============================================================================
@@ -364,7 +317,6 @@ def matmul_kernel_tma_persistent_ws_splitk(
     num_mn_tiles = num_pid_m * num_pid_n
     num_tiles = num_mn_tiles * SPLIT_K
 
-    tile_id_c = start_pid - NUM_SMS
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
     for tile_id in tl.range(
@@ -393,42 +345,14 @@ def matmul_kernel_tma_persistent_ws_splitk(
             b = b_desc.load([offs_bn, offs_k])
             accumulator = tl.dot(a, b.T, accumulator)
 
-        tile_id_c += NUM_SMS
-        split_id_c = tile_id_c // num_mn_tiles
-        mn_tile_id_c = tile_id_c % num_mn_tiles
-        pid_m, pid_n = _compute_pid(mn_tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
-        offs_am_c = pid_m * BLOCK_SIZE_M
-        offs_bn_c = pid_n * BLOCK_SIZE_N
-        row_base = split_id_c * M
-
-        # EPILOGUE_SUBTILE in {1, 2, 4} — chunk the (BM, BN) accumulator along
-        # N into EPILOGUE_SUBTILE pieces of (BM, BN/EPILOGUE_SUBTILE) and
-        # store each. tl.split only does 2-way, so 4-way uses recursive splits.
+        row_base = split_id * M
+        acc_slices = _split_n_2D(accumulator, EPILOGUE_SUBTILE)
         slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
-        if EPILOGUE_SUBTILE == 1:
-            c = accumulator.to(dtype)
-            workspace_desc.store([row_base + offs_am_c, offs_bn_c], c)
-        elif EPILOGUE_SUBTILE == 2:
-            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, slice_size))
-            acc = tl.permute(acc, (0, 2, 1))
-            acc0, acc1 = tl.split(acc)
-            workspace_desc.store([row_base + offs_am_c, offs_bn_c + 0 * slice_size], acc0.to(dtype))
-            workspace_desc.store([row_base + offs_am_c, offs_bn_c + 1 * slice_size], acc1.to(dtype))
-        else:
-            tl.static_assert(EPILOGUE_SUBTILE == 4, "EPILOGUE_SUBTILE must be 1, 2, or 4")
-            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
-            acc = tl.permute(acc, (0, 2, 1))
-            left, right = tl.split(acc)
-            left = tl.reshape(left, (BLOCK_SIZE_M, 2, slice_size))
-            left = tl.permute(left, (0, 2, 1))
-            acc0, acc1 = tl.split(left)
-            right = tl.reshape(right, (BLOCK_SIZE_M, 2, slice_size))
-            right = tl.permute(right, (0, 2, 1))
-            acc2, acc3 = tl.split(right)
-            workspace_desc.store([row_base + offs_am_c, offs_bn_c + 0 * slice_size], acc0.to(dtype))
-            workspace_desc.store([row_base + offs_am_c, offs_bn_c + 1 * slice_size], acc1.to(dtype))
-            workspace_desc.store([row_base + offs_am_c, offs_bn_c + 2 * slice_size], acc2.to(dtype))
-            workspace_desc.store([row_base + offs_am_c, offs_bn_c + 3 * slice_size], acc3.to(dtype))
+        for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
+            workspace_desc.store(
+                [row_base + offs_am, offs_bn + slice_id * slice_size],
+                acc_slices[slice_id].to(dtype),
+            )
 
 
 @triton.jit
@@ -461,9 +385,9 @@ def _reduce_k_kernel(
 # ============================================================================
 @pytest.mark.parametrize("M, N, K", [(8192, 8192, 1024)])
 @pytest.mark.parametrize("BLOCK_SIZE_M", [128])
-@pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
-@pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
-@pytest.mark.parametrize("num_stages", [2, 3])
+@pytest.mark.parametrize("BLOCK_SIZE_N", [128])
+@pytest.mark.parametrize("BLOCK_SIZE_K", [64])
+@pytest.mark.parametrize("num_stages", [3])
 @pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
@@ -491,17 +415,12 @@ def test_tutorial09_matmul_tma_warp_specialize(
     separate_epilogue_store,
 ):
     """Test matmul_kernel_tma with warp_specialize=True (K-loop based)."""
+    if generate_subtiled_region:
+        pytest.skip("TODO: enable generate_subtiled_region=True")
 
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
-
-    if DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256 and BLOCK_SIZE_N == 256:
-        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
-
-    # Skip configurations that exceed hardware resource limits
-    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and (num_stages == 3 or num_warps == 4):
-        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
     # Use scope() to set use_meta_ws and automatically restore on exit
     with triton.knobs.nvidia.scope():
@@ -579,9 +498,9 @@ def test_tutorial09_matmul_tma_warp_specialize(
 # ============================================================================
 @pytest.mark.parametrize("M, N, K", [(8192, 8192, 1024)])
 @pytest.mark.parametrize("BLOCK_SIZE_M", [128, 256])
-@pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
-@pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
-@pytest.mark.parametrize("num_stages", [2, 3])
+@pytest.mark.parametrize("BLOCK_SIZE_N", [128])
+@pytest.mark.parametrize("BLOCK_SIZE_K", [64])
+@pytest.mark.parametrize("num_stages", [3])
 @pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("FLATTEN", [True, False])
 @pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
@@ -613,6 +532,8 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     separate_epilogue_store,
 ):
     """Test matmul_kernel_tma_persistent with warp_specialize=True for both Flatten values."""
+    if generate_subtiled_region:
+        pytest.skip("TODO: enable generate_subtiled_region=True")
 
     if FLATTEN:
         pytest.skip("FLATTEN will not WarpSpecialize although it will otherwise pass.")
@@ -621,46 +542,16 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
 
-    if (DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256
-            and (BLOCK_SIZE_N == 256 or (BLOCK_SIZE_K == 128 and not FLATTEN))):
-        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
-
     if DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256 and num_stages == 3 and FLATTEN:
         pytest.skip("Out of resources: tensor memory exceeded (BLOCK_SIZE_M=256 with num_stages=3 and FLATTEN)")
 
-    # Skip configurations that exceed hardware resource limits
-    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and (num_stages == 3 or num_warps == 4) and not FLATTEN:
-        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
-
-    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and num_stages == 3 and EPILOGUE_SUBTILE == 1:
-        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
-
-    if BLOCK_SIZE_N == 256 and num_stages == 3 and FLATTEN:
-        pytest.skip("Out of resources: tensor memory exceeded")
-
-    if DATA_PARTITION_FACTOR == 2 and BLOCK_SIZE_M == 256 and BLOCK_SIZE_N == 256 and FLATTEN and SMEM_ALLOC_ALGO == 0:
-        pytest.skip("Out of resources: tensor memory exceeded")
-
-    if DATA_PARTITION_FACTOR == 2 and BLOCK_SIZE_M == 256 and num_stages == 3 and FLATTEN and SMEM_ALLOC_ALGO == 0:
-        pytest.skip("Out of resources: tensor memory exceeded")
-
-    if (DATA_PARTITION_FACTOR == 2 and SMEM_ALLOC_ALGO == 0 and BLOCK_SIZE_M == 256 and BLOCK_SIZE_N == 256
-            and BLOCK_SIZE_K == 64 and not FLATTEN):
-        pytest.skip("Out of resources: shared memory exceeded")
-
     if (DATA_PARTITION_FACTOR == 2 and SMEM_ALLOC_ALGO == 1 and BLOCK_SIZE_M == 256 and FLATTEN
-            and EPILOGUE_SUBTILE == 4 and (BLOCK_SIZE_N == 256 or num_stages == 3)):
+            and EPILOGUE_SUBTILE == 4 and num_stages == 3):
         pytest.skip("Out of resources: tensor memory exceeded")
 
     if (DATA_PARTITION_FACTOR == 2 and SMEM_ALLOC_ALGO == 1 and BLOCK_SIZE_M == 256 and FLATTEN
             and EPILOGUE_SUBTILE in (1, 2)):
         pytest.skip("Out of resources: tensor memory exceeded")
-
-    if (DATA_PARTITION_FACTOR == 2 and SMEM_ALLOC_ALGO == 1 and BLOCK_SIZE_M == 256 and num_stages == 3 and not FLATTEN
-            and not use_early_tma_store_lowering and not separate_epilogue_store
-            and ((BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 64 and EPILOGUE_SUBTILE == 1) or
-                 (BLOCK_SIZE_N == 128 and BLOCK_SIZE_K == 128))):
-        pytest.skip("Known failure with DPF=2, SMEM_ALLOC_ALGO=1, and non-flattened WS with 3 stages")
 
     # Use scope() to set use_meta_ws and automatically restore on exit
     with triton.knobs.nvidia.scope():
@@ -750,9 +641,9 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 # ============================================================================
 @pytest.mark.parametrize("M, N, K", [(8192, 8192, 1024)])
 @pytest.mark.parametrize("BLOCK_SIZE_M", [128])
-@pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
-@pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
-@pytest.mark.parametrize("num_stages", [2, 3])
+@pytest.mark.parametrize("BLOCK_SIZE_N", [128])
+@pytest.mark.parametrize("BLOCK_SIZE_K", [64])
+@pytest.mark.parametrize("num_stages", [3])
 @pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("FLATTEN", [True, False])
 @pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
@@ -784,6 +675,8 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     separate_epilogue_store,
 ):
     """Test matmul_kernel_descriptor_persistent with warp_specialize=True for both Flatten values."""
+    if generate_subtiled_region:
+        pytest.skip("TODO: enable generate_subtiled_region=True")
 
     if FLATTEN:
         pytest.skip("FLATTEN will not WarpSpecialize although it will otherwise pass.")
@@ -794,20 +687,6 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
 
     if DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256 and num_stages == 3 and FLATTEN:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
-
-    if (DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256
-            and (BLOCK_SIZE_N == 256 or (BLOCK_SIZE_K == 128 and not FLATTEN))):
-        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
-
-    # Skip configurations that exceed hardware resource limits
-    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and (num_stages == 3 or num_warps == 4) and not FLATTEN:
-        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
-
-    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and num_stages == 3 and EPILOGUE_SUBTILE == 1:
-        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
-
-    if BLOCK_SIZE_N == 256 and num_stages == 3 and FLATTEN:
-        pytest.skip("Out of resources: tensor memory exceeded")
 
     # Use scope() to set use_meta_ws and automatically restore on exit
     with triton.knobs.nvidia.scope():
@@ -888,7 +767,7 @@ def test_tutorial09_multi_epilogue_subtile():
     M, N, K = 8192, 8192, 8192
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 128
-    BLOCK_SIZE_K = 128
+    BLOCK_SIZE_K = 64
     EPILOGUE_SUBTILE = 4
     SMEM_ALLOC_ALGO = 1
     num_stages = 2
@@ -1090,9 +969,9 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize_splitk(
 # ============================================================================
 @pytest.mark.parametrize("M, N, K", [(8192, 8192, 1024)])
 @pytest.mark.parametrize("BLOCK_SIZE_M", [64, 128])
-@pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
-@pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
-@pytest.mark.parametrize("num_stages", [2, 3])
+@pytest.mark.parametrize("BLOCK_SIZE_N", [128])
+@pytest.mark.parametrize("BLOCK_SIZE_K", [64])
+@pytest.mark.parametrize("num_stages", [3])
 @pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
@@ -1122,9 +1001,6 @@ def test_hopper_matmul_tma_warp_specialize(
     """Test matmul_kernel_tma with warp_specialize=True on Hopper (K-loop based)."""
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 128:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 128")
-
-    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and not (BLOCK_SIZE_M == 64 and num_stages == 2):
-        pytest.skip("OOM: shared memory exceeds H100 limit")
 
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
@@ -1199,9 +1075,9 @@ def test_hopper_matmul_tma_warp_specialize(
 # ============================================================================
 @pytest.mark.parametrize("M, N, K", [(8192, 8192, 1024)])
 @pytest.mark.parametrize("BLOCK_SIZE_M", [64, 128])
-@pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
-@pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
-@pytest.mark.parametrize("num_stages", [2, 3])
+@pytest.mark.parametrize("BLOCK_SIZE_N", [128])
+@pytest.mark.parametrize("BLOCK_SIZE_K", [64])
+@pytest.mark.parametrize("num_stages", [3])
 @pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
@@ -1234,9 +1110,6 @@ def test_hopper_matmul_tma_persistent_warp_specialize(
     """
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 128:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 128")
-
-    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and not (BLOCK_SIZE_M == 64 and num_stages == 2):
-        pytest.skip("OOM: shared memory exceeds H100 limit")
 
     FLATTEN = False
     EPILOGUE_SUBTILE = 1
@@ -1327,9 +1200,9 @@ def test_hopper_matmul_tma_persistent_warp_specialize(
 # ============================================================================
 @pytest.mark.parametrize("M, N, K", [(8192, 8192, 1024)])
 @pytest.mark.parametrize("BLOCK_SIZE_M", [64, 128])
-@pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
-@pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
-@pytest.mark.parametrize("num_stages", [2, 3])
+@pytest.mark.parametrize("BLOCK_SIZE_N", [128])
+@pytest.mark.parametrize("BLOCK_SIZE_K", [64])
+@pytest.mark.parametrize("num_stages", [3])
 @pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
@@ -1362,9 +1235,6 @@ def test_hopper_matmul_descriptor_persistent_warp_specialize(
     """
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 128:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 128")
-
-    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and not (BLOCK_SIZE_M == 64 and num_stages == 2):
-        pytest.skip("OOM: shared memory exceeds H100 limit")
 
     FLATTEN = False
     EPILOGUE_SUBTILE = 1

@@ -9,8 +9,9 @@ namespace mlir::triton::gpu {
 /// Hardware pipeline classification for Blackwell SM100.
 /// Each op executes on exactly one pipeline; distinct pipelines overlap.
 enum class HWPipeline {
-  MEM,  // TMA loads/stores (descriptor_load, descriptor_store,
-        // descriptor_gather)
+  TMA,  // Async TMA engine: descriptor_load/store/gather. Named TMA (not
+        // MEM) because a regular ld.global has CUDA-core-like self latency;
+        // this pipeline specifically models the async TMA unit.
   TC,   // Tensor Core (tc_gen05_mma, warp_group_dot)
   CUDA, // General CUDA cores (arith.*, tt.reduce, type conversions)
   SFU,  // Special Function Unit (math.exp2, math.log2, math.rsqrt)
@@ -56,6 +57,13 @@ struct OpLatencyInfo {
   int latency{0};
   int selfLatency{0};
   int minWarps{1};
+  // Cycles this op holds its hardware pipeline (for ResMII / reservation
+  // table). Distinct from `latency` for async TMA *loads*: the TMA engine is
+  // multi-outstanding, so a load occupies the engine only ~bytes/bandwidth, not
+  // its full round-trip latency (validated on B200, see latency_model study).
+  // TMA stores are bandwidth-bound (occupancy ≈ latency); TC = latency;
+  // CUDA/SFU = selfLatency. 0 means "unset" (fall back to the old rule).
+  int occupancy{0};
 };
 
 /// Hardware latency model for Blackwell SM100.

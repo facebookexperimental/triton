@@ -131,31 +131,32 @@ LogicalResult TaskIdBackwardPropagation::visitOperation(
                     [](Type t) { return isa<RankedTensorType>(t); });
   bool isAnchor = taskIdAttr && !isScalarArithOrMath;
 
-  if (isAnchor) {
-    const auto annotated = TaskId(taskIdAttr);
+  auto propagateTaskToOperandsAndParent = [&](const TaskId &taskId) {
     for (auto operandLattice : operands) {
-      ChangeResult changed = operandLattice->meet(annotated);
+      ChangeResult changed = operandLattice->meet(taskId);
       propagateIfChanged(operandLattice, changed);
     }
-    propagateToParent(op, annotated);
+    propagateToParent(op, taskId);
+  };
+
+  if (isAnchor) {
+    const auto annotated = TaskId(taskIdAttr);
+    auto propagateAnchorTaskToTerminator = [&](Operation *terminator) {
+      for (auto terminatorOperand : terminator->getOperands()) {
+        auto terminatorLattice = getLatticeElement(terminatorOperand);
+        ChangeResult changed = terminatorLattice->meet(annotated);
+        propagateIfChanged(terminatorLattice, changed);
+      }
+    };
+    propagateTaskToOperandsAndParent(annotated);
 
     if (op->getNumRegions() == 1) {
       if (auto reduceOp = dyn_cast<triton::ReduceOp>(op)) {
-        propagateToTerminator(reduceOp.getCombineOp().front().getTerminator(),
-                              results);
+        propagateAnchorTaskToTerminator(
+            reduceOp.getCombineOp().front().getTerminator());
       } else if (auto mapOp = dyn_cast<triton::MapElementwiseOp>(op)) {
-        // MapElementwiseOp's region terminator may have pack * num_results
-        // operands, so propagate all result task IDs to every terminator
-        // operand.
-        auto *terminator = mapOp.getScalarOp().front().getTerminator();
-        for (auto terminatorOperand : terminator->getOperands()) {
-          auto terminatorLattice = getLatticeElement(terminatorOperand);
-          for (auto resultLattice : results) {
-            ChangeResult changed =
-                terminatorLattice->meet(resultLattice->getValue());
-            propagateIfChanged(terminatorLattice, changed);
-          }
-        }
+        propagateAnchorTaskToTerminator(
+            mapOp.getScalarOp().front().getTerminator());
       }
     }
 
@@ -177,11 +178,7 @@ LogicalResult TaskIdBackwardPropagation::visitOperation(
   // annotation backward so it contributes to operand lattices.
   if (taskIdAttr) {
     const auto annotated = TaskId(taskIdAttr);
-    for (auto operandLattice : operands) {
-      ChangeResult changed = operandLattice->meet(annotated);
-      propagateIfChanged(operandLattice, changed);
-    }
-    propagateToParent(op, annotated);
+    propagateTaskToOperandsAndParent(annotated);
   }
 
   if (op->getNumRegions() == 1) {
@@ -239,6 +236,9 @@ void TaskIdBackwardPropagation::visitCallOperand(OpOperand &operand) {
   llvm_unreachable(
       "Should not have any call operands in the IR after inlining.");
 }
+
+void TaskIdBackwardPropagation::visitNonControlFlowArguments(
+    RegionSuccessor &successor, ArrayRef<BlockArgument> arguments) {}
 
 void TaskIdBackwardPropagation::setToExitState(TaskIdLattice *lattice) {}
 

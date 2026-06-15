@@ -38,11 +38,12 @@ namespace {
 // System prompt (embedded)
 // ============================================================================
 
-static constexpr llvm::StringLiteral kSystemPrompt = R"(You are a GPU kernel scheduling expert. Given a Data Dependence Graph (DDG) with latency information, produce a modulo schedule.
+static constexpr llvm::StringLiteral kSystemPrompt =
+    R"(You are a GPU kernel scheduling expert. Given a Data Dependence Graph (DDG) with latency information, produce a modulo schedule.
 
 The input provides:
 - MinII (already computed from ResMII and RecMII)
-- Nodes with op name, pipeline (MEM/TC/CUDA/SFU/NONE), latency, and selfLatency
+- Nodes with op name, pipeline (TMA/TC/CUDA/SFU/NONE), latency, and selfLatency
 - Edges with source, destination, latency, and loop-carried distance
 
 Your task: assign each non-NONE node a cycle, then derive stages and clusters.
@@ -96,16 +97,14 @@ static std::string formatDDG(const ttg::DataDependenceGraph &ddg,
   }
 
   os << "DDG for loop (trip_count=" << tripCount << "):\n";
-  os << "  ResMII=" << ddg.computeResMII()
-     << ", RecMII=" << ddg.computeRecMII()
+  os << "  ResMII=" << ddg.computeResMII() << ", RecMII=" << ddg.computeRecMII()
      << ", MinII=" << ddg.computeMinII() << "\n\n";
 
   os << "Nodes:\n";
   for (const auto &node : ddg.getNodes()) {
     os << "  N" << node.idx << ": " << getOpShortName(node.op)
        << "  pipe=" << ttg::getPipelineName(node.pipeline)
-       << "  lat=" << node.latency
-       << "  selfLat=" << node.selfLatency;
+       << "  lat=" << node.latency << "  selfLat=" << node.selfLatency;
     if (node.minWarps > 1)
       os << "  minWarps=" << node.minWarps;
     if (node.isSuperNode)
@@ -136,10 +135,9 @@ static std::string callClaude(const std::string &ddgText) {
   {
     std::error_code ec;
     llvm::raw_fd_ostream os(sysPath, ec);
-    if (ec) return "";
-    os << kSystemPrompt
-       << "\n\n--- DDG INPUT ---\n\n"
-       << ddgText;
+    if (ec)
+      return "";
+    os << kSystemPrompt << "\n\n--- DDG INPUT ---\n\n" << ddgText;
   }
 
   SmallString<128> outPath;
@@ -156,15 +154,16 @@ static std::string callClaude(const std::string &ddgText) {
 
   // Pass system prompt + DDG via --system-prompt-file.
   // Use a short -p argument as the user prompt.
-  std::string cmd =
-      "claude --bare"
-      " --system-prompt-file " + sysPathStr +
-      " -p 'Produce the modulo.schedule for the DDG above.'"
-      " --output-format text"
-      " --model " + model +
-      " --max-turns 1"
-      " > " + outPathStr +
-      " 2>/dev/null";
+  std::string cmd = "claude --bare"
+                    " --system-prompt-file " +
+                    sysPathStr +
+                    " -p 'Produce the modulo.schedule for the DDG above.'"
+                    " --output-format text"
+                    " --model " +
+                    model +
+                    " --max-turns 1"
+                    " > " +
+                    outPathStr + " 2>/dev/null";
 
   LDBG("Calling local claude CLI (model=" << model << ")...");
   LDBG("Command: " << cmd);
@@ -214,8 +213,7 @@ static ParsedSchedule parseSchedule(const std::string &output) {
   }
 
   // Parse MMA node cycle/cluster from modulo.schedule format.
-  std::regex mmaRe(
-      R"(tc_gen5_mma[^\}]*cycle:\s*(\d+),\s*cluster:\s*(\d+))");
+  std::regex mmaRe(R"(tc_gen5_mma[^\}]*cycle:\s*(\d+),\s*cluster:\s*(\d+))");
   auto end = std::sregex_iterator();
   for (auto it = std::sregex_iterator(output.begin(), output.end(), mmaRe);
        it != end; ++it) {
@@ -273,9 +271,8 @@ static void applySchedule(scf::ForOp loop, const ParsedSchedule &schedule) {
   });
 
   if (schedule.numStages > 0) {
-    loop->setAttr("tt.num_stages",
-                  IntegerAttr::get(IntegerType::get(ctx, 32),
-                                   schedule.numStages));
+    loop->setAttr("tt.num_stages", IntegerAttr::get(IntegerType::get(ctx, 32),
+                                                    schedule.numStages));
   }
 }
 
@@ -325,8 +322,8 @@ struct LLMSchedulePass
         continue;
 
       LDBG("Built DDG: " << ddg.getNumNodes() << " nodes, "
-                          << ddg.getEdges().size() << " edges, "
-                          << "MinII=" << ddg.computeMinII());
+                         << ddg.getEdges().size() << " edges, "
+                         << "MinII=" << ddg.computeMinII());
 
       std::string ddgText = formatDDG(ddg, loop);
       std::string output = callClaude(ddgText);
@@ -345,8 +342,7 @@ struct LLMSchedulePass
         continue;
       }
 
-      LDBG("Parsed: II=" << schedule.ii
-                         << " maxStage=" << schedule.maxStage
+      LDBG("Parsed: II=" << schedule.ii << " maxStage=" << schedule.maxStage
                          << " numStages=" << schedule.numStages
                          << " MMAs=" << schedule.mmaAnnotations.size());
 

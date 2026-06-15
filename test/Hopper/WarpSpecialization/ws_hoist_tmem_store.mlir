@@ -1,5 +1,4 @@
 // RUN: triton-opt %s -split-input-file --nvgpu-test-ws-hoist-tmem-store | FileCheck %s
-// XFAIL: *
 
 // Test hoisting a loop-invariant TMEMStore out of an outer ForOp when the inner
 // loop's MMA has useD=false (statically).

@@ -21,7 +21,7 @@ While this approach places more responsibility on the user, it reduces the compi
 
 - `buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS)` **[Hopper+]**
 
-    Allocate `NUM_BUFFERS` buffers in local memory per thread block, each of size size. The memory layout is inferred from its consumers.
+    Allocate `NUM_BUFFERS` buffers in local memory per thread block, each of the specified size. The memory layout is inferred from its consumers.
 
 
 - `buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS, tlx.storage_kind.tmem)` **[Blackwell]**
@@ -72,7 +72,7 @@ useful to allow additional pipelining when you may not have enough isolated SMEM
 - `tlx.storage_alias_spec(storage=storage_kind)` **[Hopper+]**
 
     Defines a buffer that you will want to share across multiple aliases. The storage
-    can be either SMEM or TMEM. To use this in an allocation you the spec in the `reuse`
+    can be either SMEM or TMEM. To use this in an allocation you should provide the spec in the `reuse`
     argument for `local_alloc`. Here is the example from the FA kernel.
 
 ```
@@ -113,7 +113,7 @@ m_tiles = tlx.local_alloc(
     expand the buffer allocation to enforce this guarantee, which is helpful with buffers of unequal
     sizes.
 
-    The group_size is used to enable subtiling a buffer. This creates ensures that for every 1 index
+    The group_size is used to enable subtiling a buffer. This ensures that for every 1 index
     of a buffer that SUBTILE_SIZE indices of this other buffer/group can be accessed.  Reuse groups
     can be nested to allow expressing more complex relationships. Currently a reuse group
     is not applied unless you assign it to a buffer with `spec.set_buffer_overlap`.
@@ -592,7 +592,7 @@ CLC (Cluster Launch Control) is a Blackwell-specific feature **[Blackwell]** tha
     - `phase`: Current barrier phase (0 or 1, alternates each iteration)
     - `multi_ctas`: Set to `True` for 2-CTA mode (cluster of 2 CTAs). When enabled, `pred_cta0` is computed internally from `cluster_cta_rank()`.
 
-- `tile_id = tlx.clc_consumer(context, p_consumer=phase, multi_ctas=False)` **[Blackwell]**
+- `tile_id = tlx.clc_consumer(context, p_consumer=phase, multi_ctas=False, k=0, return_3d=False)` **[Blackwell]**
 
     Decode the tile ID from a CLC response and signal completion.
 
@@ -600,8 +600,9 @@ CLC (Cluster Launch Control) is a Blackwell-specific feature **[Blackwell]** tha
     - `context`: CLC pipeline context from `clc_create_context`
     - `phase`: Current barrier phase
     - `multi_ctas`: Set to `True` for 2-CTA mode. When enabled, `pred_cta0` is computed internally.
+    - `return_3d`: Set to `True` to return `(ctaIdX, ctaIdY, ctaIdZ)` tuple instead of scalar tile_id.
 
-    **Returns:** The tile ID (already offset by `cluster_cta_rank()` for unique tile assignments), or -1 if no work available.
+    **Returns:** The tile ID (already offset by `cluster_cta_rank()` for unique tile assignments), or -1 if no work available. With `return_3d=True`, returns `(ctaIdX, ctaIdY, ctaIdZ)` tuple.
 
 #### How CLC Works
 

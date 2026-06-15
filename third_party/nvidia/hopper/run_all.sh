@@ -2,6 +2,29 @@
 
 echo "Hello! (Facebook-only)"
 
+get_cmake_build_dir() {
+    local dirs=()
+    local dir
+
+    while IFS= read -r dir; do
+        dirs+=("$dir")
+    done < <(find build -mindepth 1 -maxdepth 1 -type d -name 'cmake.*' \
+        -exec test -f '{}/CMakeCache.txt' ';' -print | sort)
+
+    if [ "${#dirs[@]}" -eq 0 ]; then
+        echo "No configured CMake build directory found under build/" >&2
+        return 1
+    fi
+
+    if [ "${#dirs[@]}" -gt 1 ]; then
+        echo "Warning: multiple configured CMake build directories found under build/:" >&2
+        printf '  %s\n' "${dirs[@]}" >&2
+        echo "Using ${dirs[0]}" >&2
+    fi
+
+    echo "${dirs[0]}"
+}
+
 # Run LIT
 ask() {
     retval=""
@@ -17,7 +40,8 @@ ask() {
 }
 if [ "$(ask)" == "yes" ]; then
     echo "Running LITs"
-    pushd build/cmake.linux-x86_64-cpython-3.13/
+    cmake_build_dir="$(get_cmake_build_dir)" || exit 1
+    pushd "$cmake_build_dir"
     lit test -a
     popd
 fi
@@ -33,5 +57,5 @@ echo "Run autoWS tutorial kernels"
 echo "Verifying correctness of FA tutorial kernels"
 TRITON_ALWAYS_COMPILE=1 pytest third_party/tlx/tutorials/fused_attention_ws_device_tma.py
 
-echo "run for Hopper"
-TRITON_ALWAYS_COMPILE=1 TRITON_USE_META_WS=1 pytest python/tutorials/fused-attention-ws-device-tma-hopper.py
+echo "run for Hopper or Blackwell"
+TRITON_ALWAYS_COMPILE=1 TRITON_USE_META_WS=1 pytest python/tutorials/fused-attention-ws-device-tma-hopper-or-blackwell.py

@@ -324,8 +324,11 @@ private:
                   /*size=getInDimSizeLog2(inDim)*/>
       bases;
 
+  // Dim sizes are assumed to fit in int32_t, i.e. less than 2^31.
+  // This is a pre-existing upstream type decision.
   llvm::MapVector<StringAttr, int32_t /*size*/> outDims;
   int32_t rank = 0;
+  bool cachedIsModular = false;
 
 public:
   using BasesT = decltype(bases);
@@ -350,6 +353,18 @@ public:
   static LinearLayout identity1D(int32_t size, StringAttr inDim,
                                  StringAttr outDim) {
     return strided1D(size, /*stride=*/1, inDim, outDim);
+  }
+
+  // Creates a 1D -> 1D layout computing L(x) = (stride * x) % size
+  // for x in [0, 2^ceil(log2(size))).
+  static LinearLayout modularStrided1D(int32_t size, int32_t stride,
+                                       StringAttr inDim, StringAttr outDim);
+
+  // Creates a modular identity layout for non-power-of-2 dimensions.
+  // Computes L(x) = x % size for x in [0, 2^ceil(log2(size))).
+  static LinearLayout modularIdentity1D(int32_t size, StringAttr inDim,
+                                        StringAttr outDim) {
+    return modularStrided1D(size, /*stride=*/1, inDim, outDim);
   }
 
   // Creates a 1D -> 1D layout that maps every input value to 0, i.e. L(x) = 0
@@ -425,11 +440,36 @@ public:
       ArrayRef<std::pair<StringAttr, std::vector<std::vector<int32_t>>>> bases,
       ArrayRef<std::pair<StringAttr, int32_t>> outDims, bool requireSurjective);
 
-  bool isSurjective() const { return rank == getTotalOutDimSizeLog2(); }
-  bool isInjective() const { return rank == getTotalInDimSizeLog2(); }
+  // For modular (non-power-of-2) layouts, dispatch to modular surjectivity
+  // check
+  bool isSurjective() const {
+    if (isModular()) {
+      return isModularSurjective();
+    }
+    return rank == getTotalOutDimSizeLog2();
+  }
+  bool isInjective() const {
+    assert(!isModular() && "isInjective not implemented for modular layouts");
+    return rank == getTotalInDimSizeLog2();
+  }
 
   bool isInvertible() const {
-    return isSurjective() && getTotalInDimSize() == getTotalOutDimSize();
+    return isSurjective() && getTotalInDimSize() == getTotalOutDimSizeProduct();
+  }
+
+  // Check surjectivity for modular (non-power-of-2) layouts.
+  // Uses CRT factorization for efficient per-dimension surjectivity checking.
+  bool isModularSurjective() const;
+
+  // Returns true if this layout contains any non-power-of-2 output dimensions.
+  // Modular layouts use ADD+UREM instructions instead of XOR for composition.
+  bool isModular() const { return cachedIsModular; }
+
+  // Returns true if a specific output dimension is non-power-of-2 (modular).
+  // For mixed layouts (e.g. [32, 48]), pow2 dims use XOR while NPOT dims use
+  // ADD+UREM independently (product semimodule GF(2) x Z/N).
+  bool isOutDimModular(StringAttr outDim) const {
+    return !llvm::isPowerOf2_32(getOutDimSize(outDim));
   }
 
   // Remove a dimension of size 1 from the layout.
@@ -508,11 +548,31 @@ public:
   // Asserts if the dimension is not present.
   int32_t getOutDimSizeLog2(StringAttr outDim) const;
   int32_t getOutDimSize(StringAttr outDim) const {
-    return 1 << getOutDimSizeLog2(outDim);
+    // Return the actual stored size (may be non-power-of-2)
+    auto it = outDims.find(outDim);
+    assert(it != outDims.end() && "outDim not found in layout");
+    return it->second;
   }
 
   int32_t getTotalOutDimSizeLog2() const;
   int32_t getTotalOutDimSize() const { return 1 << getTotalOutDimSizeLog2(); }
+
+  // Returns the product of all output dimension sizes (works for both pow2
+  // and NPOT dims). Use this instead of getTotalOutDimSize() for mixed layouts.
+  int64_t getTotalOutDimSizeProduct() const {
+    return std::accumulate(getOutDimNames().begin(), getOutDimNames().end(),
+                           int64_t{1}, [&](int64_t acc, StringAttr outDim) {
+                             return acc * getOutDimSize(outDim);
+                           });
+  }
+
+  // Returns the total number of bits needed across all output dimensions.
+  int32_t getTotalOutDimSizeBits() const {
+    return std::accumulate(getOutDimNames().begin(), getOutDimNames().end(), 0,
+                           [&](int32_t acc, StringAttr outDim) {
+                             return acc + getOutDimSizeBits(outDim);
+                           });
+  }
 
   // Finds the number of consecutive input elements in the first input dimension
   // that map to consecutive output elements in the first output dimension.
@@ -564,7 +624,12 @@ public:
     if (getNumOutDims() == 0) {
       return reshapeOuts({});
     }
-    return reshapeOuts({{*getOutDimNames().begin(), getTotalOutDimSize()}});
+    // NB: int64_t -> int32_t truncation. Safe for layout sizes < 2^31.
+    auto totalSize = getTotalOutDimSizeProduct();
+    assert(totalSize <= INT32_MAX &&
+           "flattenOuts: total out dim size overflows int32_t");
+    return reshapeOuts(
+        {{*getOutDimNames().begin(), static_cast<int32_t>(totalSize)}});
   }
 
   // Resizes the dimension to one that is smallre or equal to the given size.
@@ -788,12 +853,23 @@ public:
 
   std::string toString() const;
 
+  // Build the GF(2) matrix for this layout (public convenience wrapper).
+  std::unique_ptr<uint64_t[]> getGF2Matrix() const { return getMatrix(*this); }
+
   friend bool operator==(const LinearLayout &lhs, const LinearLayout &rhs);
   friend bool operator!=(const LinearLayout &lhs, const LinearLayout &rhs) {
     return !(lhs == rhs);
   }
   bool equalIgnoringOutDimSizes(const LinearLayout &other) const;
   friend size_t hash_value(const LinearLayout &layout);
+
+  // Returns the number of bits needed to represent this output dimension.
+  // For power-of-2: floor(log2(size)). For NPOT: ceil(log2(size)).
+  int32_t getOutDimSizeBits(StringAttr outDim) const {
+    int32_t size = getOutDimSize(outDim);
+    return llvm::isPowerOf2_32(size) ? llvm::Log2_32(size)
+                                     : llvm::Log2_32(size - 1) + 1;
+  }
 
 private:
   // Factory function that gracefully fails rather than asserts if the layout is
@@ -809,6 +885,23 @@ private:
 
   [[nodiscard]] std::optional<std::string>
   checkInvariants(bool requireSurjective);
+
+  // Build a matrix of size sum(outDimSizeBits) x sum(inDimSizeLog2)
+  // representing the bases of the given layout.  This can then be used by
+  // f2reduce.
+  static std::unique_ptr<uint64_t[]> getMatrix(const LinearLayout &layout);
+
+  // Concatenate the GF(2) matrices of two layouts side-by-side for RREF
+  // solving.
+  static std::unique_ptr<uint64_t[]> concatMatrices(const LinearLayout &A,
+                                                    const LinearLayout &B);
+
+  // Modular lstsq: solve AX = B over Z/nZ using CRT factorization.
+  static LinearLayout lstsqModular(const LinearLayout &A,
+                                   const LinearLayout &B);
+
+  // Solve AX = B (least-squares over GF(2) or modular).
+  static LinearLayout lstsq(const LinearLayout &A, const LinearLayout &B);
 };
 
 inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
@@ -848,6 +941,7 @@ public:
     auto it = llvm::max_element(action);
     // Assert in the constructor... ugh
     assert(it == action.end() || *it < inSizeLog2);
+    (void)it; // Suppress unused variable warning in opt builds
     // In many cases the action will be the identity, so we save that as an
     // early return
     m_isIdentity = action.size() == inSizeLog2 &&
@@ -896,8 +990,6 @@ inline std::ostream &operator<<(std::ostream &os, const ColumnAction &action) {
   os << action.toString();
   return os;
 }
-
-std::unique_ptr<uint64_t[]> getMatrix(const LinearLayout &layout);
 
 } // namespace mlir::triton
 

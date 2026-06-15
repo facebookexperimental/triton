@@ -2716,7 +2716,8 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
 }
 
 static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
-                              SmallVector<std::unique_ptr<Channel>> &channels) {
+                              SmallVector<std::unique_ptr<Channel>> &channels,
+                              bool includeSameTaskSmemChannels) {
   // source can be local_store, consumer can be gen5, ttg.memdesc_trans,
   // local_load Can be produced by tmem_store or gen5, consumed by tmem_load or
   // gen5
@@ -2896,27 +2897,28 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
       channels.back()->srcName = getOutermostNameFromLoc(allocOp->getLoc());
     }
   } else {
-    // Keep SMEM post-channel records even when producer and consumer are
-    // co-located. The memory planner uses these channels for bookkeeping such
-    // as epilogue buffer fusion, independent of whether a sync is needed.
-    channels.push_back(std::make_unique<ChannelPost>(
-        producerTaskId, consumerTaskIds, allocOp, channels.size()));
-    channels.back()->srcName = getOutermostNameFromLoc(allocOp->getLoc());
+    bool shouldCreateSmemChannel =
+        includeSameTaskSmemChannels ||
+        needsChannel(producerTaskId, consumerTaskIds);
+    if (shouldCreateSmemChannel) {
+      channels.push_back(std::make_unique<ChannelPost>(
+          producerTaskId, consumerTaskIds, allocOp, channels.size()));
+      channels.back()->srcName = getOutermostNameFromLoc(allocOp->getLoc());
+    }
   }
 }
 
 void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
-                         triton::FuncOp &funcOp) {
+                         triton::FuncOp &funcOp,
+                         bool includeSameTaskSmemChannels) {
   mlir::DominanceInfo dom(funcOp);
   funcOp.walk([&](Operation *op) {
     // FIXME: It is possible that a local_alloc can start a channel, when a
     // gemm's operand is in smem and comes from local_alloc.
     // All buffers have been allocated, a channel will be created based on
     // the alloc.
-    if (dyn_cast<ttng::TMEMAllocOp>(op)) {
-      createChannelPost(op, dom, channels);
-    } else if (dyn_cast<ttg::LocalAllocOp>(op)) {
-      createChannelPost(op, dom, channels);
+    if (isa<ttng::TMEMAllocOp>(op) || isa<ttg::LocalAllocOp>(op)) {
+      createChannelPost(op, dom, channels, includeSameTaskSmemChannels);
     }
   });
   LLVM_DEBUG({

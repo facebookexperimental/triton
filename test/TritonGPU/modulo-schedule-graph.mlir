@@ -22,10 +22,10 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 //
 // --- Nodes: loads+allocs+MMA@s0, tmem_load@s1 ---
 // CHECK: modulo.stage @s0 {
-// CHECK:   tt.descriptor_load  {pipe: MEM, cycle: 0, cluster: 0, latency: 1218, selfLatency: 1}
-// CHECK:   tt.descriptor_load  {pipe: MEM, cycle: 1, cluster: 1, latency: 1218, selfLatency: 1}
-// CHECK:   ttg.local_alloc  {pipe: MEM, cycle: 2, cluster: 2, latency: 700
-// CHECK:   ttg.local_alloc  {pipe: MEM, cycle: 3, cluster: 3, latency: 700
+// CHECK:   tt.descriptor_load  {pipe: TMA, cycle: 0, cluster: 0, latency: 1218, selfLatency: 1}
+// CHECK:   tt.descriptor_load  {pipe: TMA, cycle: 1, cluster: 1, latency: 1218, selfLatency: 1}
+// CHECK:   ttg.local_alloc  {pipe: TMA, cycle: 2, cluster: 2, latency: 700
+// CHECK:   ttg.local_alloc  {pipe: TMA, cycle: 3, cluster: 3, latency: 700
 // CHECK:   ttng.tc_gen5_mma  {pipe: TC, cycle: 703, cluster: 4, latency: 900, selfLatency: 1
 // CHECK: }
 // CHECK: modulo.stage @s1 {

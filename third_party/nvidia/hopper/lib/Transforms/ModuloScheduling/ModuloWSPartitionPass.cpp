@@ -79,7 +79,7 @@ static int partitionLoopByUtilization(scf::ForOp loop,
   // Determine which pipelines get their own warp group.
   SmallVector<ttg::HWPipeline> ownGroup;
   SmallVector<ttg::HWPipeline> mergeGroup;
-  for (auto pipe : {ttg::HWPipeline::MEM, ttg::HWPipeline::TC,
+  for (auto pipe : {ttg::HWPipeline::TMA, ttg::HWPipeline::TC,
                     ttg::HWPipeline::CUDA, ttg::HWPipeline::SFU}) {
     int load = pipeLoad.lookup(pipe);
     if (load == 0)
@@ -93,10 +93,10 @@ static int partitionLoopByUtilization(scf::ForOp loop,
 
   // MEM always gets its own group (TMA producer needs dedicated warp).
   // Remove from mergeGroup if it was placed there by the threshold check.
-  if (!llvm::is_contained(ownGroup, ttg::HWPipeline::MEM) &&
-      pipeLoad.lookup(ttg::HWPipeline::MEM) > 0) {
-    ownGroup.insert(ownGroup.begin(), ttg::HWPipeline::MEM);
-    llvm::erase(mergeGroup, ttg::HWPipeline::MEM);
+  if (!llvm::is_contained(ownGroup, ttg::HWPipeline::TMA) &&
+      pipeLoad.lookup(ttg::HWPipeline::TMA) > 0) {
+    ownGroup.insert(ownGroup.begin(), ttg::HWPipeline::TMA);
+    llvm::erase(mergeGroup, ttg::HWPipeline::TMA);
   }
 
   if (ownGroup.size() < 2)

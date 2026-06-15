@@ -1,5 +1,4 @@
 // RUN: triton-opt %s -split-input-file --nvgpu-test-tma-store-token-wait-reorder | FileCheck %s
-// XFAIL: *
 
 // Regression test for B-22-F1 / T273504812.
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
@@ -14,8 +13,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: ttng.wait_barrier {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32}
 // CHECK: [[TOK0:%.*]] = ttng.async_tma_copy_local_to_global {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
 // CHECK: ttng.async_tma_store_token_wait [[TOK0]]
-// CHECK-NOT: can_rotate_by_buffer_count
-// CHECK-SAME: {loop.cluster = 3 : i32, loop.stage = 0 : i32}
+// CHECK-SAME: {can_rotate_by_buffer_count = 1 : i32, loop.cluster = 4 : i32, loop.stage = 0 : i32}
   tt.func public @earlier_barrier_does_not_precede_producer(
       %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
       %src0: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,

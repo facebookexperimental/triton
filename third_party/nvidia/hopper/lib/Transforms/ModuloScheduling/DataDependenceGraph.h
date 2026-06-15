@@ -23,6 +23,16 @@ struct DDGNode {
   HWPipeline pipeline{HWPipeline::NONE};
   int latency{};
   int selfLatency{};
+  // How long this op ties up its hardware engine — i.e. when the NEXT op of the
+  // same kind can start. Different from `latency`, which is how long until this
+  // op's RESULT is ready for a consumer to use.
+  // They're equal for most ops, but differ for an async TMA load: the load
+  // engine is free again after ~bytes/bandwidth and can start the next load,
+  // while the loaded data isn't ready for ~700 more cycles — so occupancy is
+  // much smaller than latency. (TMA store: occupancy ≈ latency; TC = latency;
+  // CUDA/SFU = selfLatency.)
+  // See OpLatencyInfo::occupancy. 0 = unset → pipelineOccupancy() falls back.
+  int occupancy{};
   // Min warps assumed by the modeled `selfLatency`. If the containing WG has
   // fewer warps, effective selfLat scales up by minWarps/actualWarps. See
   // `notes/latency_vs_selflatency.md` and `LatencyModel::getMinWarps`.
@@ -37,19 +47,20 @@ struct DDGNode {
 /// How many cycles this op holds its pipeline resource. Used by ResMII and the
 /// modulo reservation table when placing ops.
 ///
-/// MEM (TMA engine) and TC (tcgen05.mma) are **async** hardware: the SM
-/// dispatches the op in `selfLatency` cycles and is then free, but the
-/// underlying engine keeps working for the full `latency` cycles. From the
-/// resource's perspective it is busy that whole time and cannot accept
-/// another op until done — so for ResMII / placement we must reserve the
-/// full `latency`.
+/// Prefer the per-op `occupancy` computed by the LatencyModel (validated on
+/// B200): TMA *store* and TC are bandwidth/serial-bound (occupancy ≈ latency),
+/// but a TMA *load* is multi-outstanding — it occupies the engine only
+/// ~bytes/bandwidth, far less than its round-trip latency. CUDA/SFU use the
+/// per-op pipe slot count (selfLatency).
 ///
-/// CUDA and SFU are pipelined synchronous units that accept a new op every
-/// cycle, so `selfLatency` (= 1 for these) is the correct slot count.
+/// Fallback (occupancy unset, e.g. manually-built super-nodes): the old rule —
+/// full `latency` for async TMA/TC, `selfLatency` otherwise.
 inline int pipelineOccupancy(const DDGNode &node) {
+  if (node.occupancy > 0)
+    return node.occupancy;
   if (node.pipeline == HWPipeline::NONE)
     return 1;
-  if (node.pipeline == HWPipeline::MEM || node.pipeline == HWPipeline::TC)
+  if (node.pipeline == HWPipeline::TMA || node.pipeline == HWPipeline::TC)
     return std::max(node.latency, 1);
   return std::max(node.selfLatency, 1);
 }

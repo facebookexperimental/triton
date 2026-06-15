@@ -34,6 +34,54 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
+static bool hasAnyAsyncTaskId(Operation *op, ArrayRef<int> taskIds) {
+  auto opTaskIds = getAsyncTaskIds(op);
+  return llvm::any_of(opTaskIds, [&](int opTaskId) {
+    return llvm::is_contained(taskIds, opTaskId);
+  });
+}
+
+static unsigned replaceUsesInOp(Value oldValue, Value newValue,
+                                Operation *userOp) {
+  unsigned replacements = 0;
+  for (OpOperand &operand : userOp->getOpOperands()) {
+    if (operand.get() == oldValue) {
+      operand.set(newValue);
+      ++replacements;
+    }
+  }
+  return replacements;
+}
+
+static unsigned replaceUsesForChannel(Value oldValue, Value newValue,
+                                      Channel *channel) {
+  SmallVector<OpOperand *> channelUses;
+  for (OpOperand &use : oldValue.getUses()) {
+    if (hasAnyAsyncTaskId(use.getOwner(), channel->relation.second))
+      channelUses.push_back(&use);
+  }
+
+  for (OpOperand *use : channelUses)
+    use->set(newValue);
+
+  if (!channelUses.empty())
+    return channelUses.size();
+
+  return replaceUsesInOp(oldValue, newValue, channel->getDstOp());
+}
+
+static void replaceUsesInTasks(Value oldValue, Value newValue,
+                               ArrayRef<int> taskIds) {
+  SmallVector<OpOperand *> matchingUses;
+  for (OpOperand &use : oldValue.getUses()) {
+    if (hasAnyAsyncTaskId(use.getOwner(), taskIds))
+      matchingUses.push_back(&use);
+  }
+
+  for (OpOperand *use : matchingUses)
+    use->set(newValue);
+}
+
 static std::pair<Operation *, Operation *>
 createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *c,
                 Operation *op, SmallVector<AsyncTaskId> &asyncTasksPC,
@@ -86,9 +134,9 @@ createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *c,
       loadOp.getLoc(), subviewTy, buffer, bufferIdxExtract);
   auto sharedLoad = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
       loadOp.getLoc(), loadOp.getType(), viewLoad /*,wait->getResult(0)*/);
-  // Replace all uses of loadResult
-  loadResult.replaceAllUsesWith(sharedLoad.getResult());
-  loadOp.erase();
+  replaceUsesForChannel(loadResult, sharedLoad.getResult(), c);
+  if (loadResult.use_empty())
+    loadOp.erase();
   return {copy, sharedLoad};
 }
 
@@ -136,7 +184,7 @@ createLocalCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
       dstOp->getLoc(), subviewTy, buffer, dstBufferIdx);
   auto sharedLoad = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
       dstOp->getLoc(), srcValue.getType(), dstView);
-  srcValue.replaceAllUsesWith(sharedLoad.getResult());
+  replaceUsesForChannel(srcValue, sharedLoad.getResult(), channel);
 
   // Producer part. Create local_store for new producers.
   builder.setAsynTaskIdsFromArray(channel->relation.first);
@@ -367,12 +415,12 @@ Operation *optimizeTMALoads(
   // For data-partitioned channels, shared ops (consBarrier, phase, pred)
   // need ALL consumer task IDs so they survive specializeRegion.
   builder.setInsertionPoint(headConsumerSameLevel);
-  SmallVector<int> allConsumerTaskIds;
+  SmallVector<int> consumerTaskIds;
   for (int id : getAsyncTaskIds(headConsumer))
-    allConsumerTaskIds.push_back(id);
+    consumerTaskIds.push_back(id);
   for (int id : additionalConsumerTaskIds)
-    allConsumerTaskIds.push_back(id);
-  builder.setAsynTaskIdsFromArray(allConsumerTaskIds);
+    consumerTaskIds.push_back(id);
+  builder.setAsynTaskIdsFromArray(consumerTaskIds);
   builder.setLoopScheduleInfoFromOp(headConsumerSameLevel);
   auto consBarrier =
       getBarrierForPipelineStage(builder, barrierAlloc, bufferIdxExtract);
@@ -383,7 +431,7 @@ Operation *optimizeTMALoads(
 
   // Create one WaitBarrierOp per consumer task ID.
   builder.setAsyncTaskIdsFromOp(headConsumer);
-  auto wait = builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+  builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
       loc, consBarrier, phase, waitPred, /*deps=*/ValueRange{},
       consumerWaitConstraints);
   for (int extraTaskId : additionalConsumerTaskIds) {
@@ -411,6 +459,7 @@ Operation *optimizeTMALoads(
       tmaLoad.erase();
       continue;
     }
+    builder.setAsynTaskIdsFromArray(consumerTaskIds);
     builder.setLoopScheduleInfoFromOp(tmaLoad);
     auto pipelineBuffer = getBufferForPipelineStage(
         builder, tmaLoad.getType(), buffer, bufferIdxExtract, false);
@@ -418,8 +467,9 @@ Operation *optimizeTMALoads(
         loc, tmaLoad.getType(), pipelineBuffer);
 
     Value loadResult = tmaLoad.getResult();
-    tmaLoad.getResult().replaceAllUsesWith(sharedLoad.getResult());
-    tmaLoad.erase();
+    replaceUsesInTasks(loadResult, sharedLoad.getResult(), consumerTaskIds);
+    if (loadResult.use_empty() && additionalConsumerTaskIds.empty())
+      tmaLoad.erase();
   }
   builder.clearLoopScheduleInfo();
   return copy;

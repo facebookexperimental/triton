@@ -378,6 +378,7 @@ class autotuning_knobs(base_knobs):
     dump_best_config_ir: env_bool = env_bool("TRITON_KERNEL_DUMP_BEST_CONFIG")
     warmup: env_int = env_int("TRITON_AUTOTUNE_WARMUP_MS", 25)
     rep: env_int = env_int("TRITON_AUTOTUNE_REP_MS", 100)
+    use_entropy: env_bool = env_bool("TRITON_AUTOTUNE_USE_ENTROPY", True)
 
 
 class LaunchHook(Protocol):
@@ -523,6 +524,7 @@ class nvidia_knobs(base_knobs):
     use_no_compile_launcher: env_bool = env_bool("TRITON_USE_NO_COMPILE_LAUNCHER")
     use_llvm_launcher: env_bool = env_bool("TRITON_USE_LLVM_LAUNCHER")
     use_triton_dispatcher: env_bool = env_bool("TRITON_USE_TRITON_DISPATCHER")
+    use_autotune_c_cache: env_bool = env_bool("TRITON_AUTOTUNE_USE_C_CACHE")
     generate_subtiled_region: env_bool = env_bool("TRITON_GENERATE_SUBTILED_REGION")
     # When True, run the triton-nvidia-interleave-tmem pass on Blackwell.
     # Default ON; set TRITON_ENABLE_INTERLEAVE_TMEM=0 to opt out for A/B

@@ -20,8 +20,8 @@ namespace mlir::triton::gpu {
 
 llvm::StringRef getPipelineName(HWPipeline pipeline) {
   switch (pipeline) {
-  case HWPipeline::MEM:
-    return "MEM";
+  case HWPipeline::TMA:
+    return "TMA";
   case HWPipeline::TC:
     return "TC";
   case HWPipeline::CUDA:
@@ -105,23 +105,91 @@ static int lookupTMALoadOccupancy(int64_t totalBytes) {
                           kBaseBytes);
 }
 
-int LatencyModel::getTMALoadLatency(Operation *op) const {
-  if (op->getNumResults() == 0)
-    return lookupTMALoadOccupancy(128 * 64 * 2); // default: 128x64
-  auto resultType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
-  if (!resultType)
-    return lookupTMALoadOccupancy(128 * 64 * 2);
-
-  int64_t elements = 1;
-  for (auto dim : resultType.getShape())
-    elements *= dim;
-  int64_t bytesPerElement = resultType.getElementTypeBitWidth() / 8;
-  return lookupTMALoadOccupancy(elements * bytesPerElement);
+// Tile geometry of a TMA op: total bytes and inner (contiguous, last-dim)
+// bytes. Reads the result tensor/memdesc first; for store-style ops (memdesc
+// result) falls back to the largest tensor/memdesc operand. innerBytes drives
+// the hardware instruction count (see getTMANumInsts).
+static void getTMATile(Operation *op, int64_t &totalBytes,
+                       int64_t &innerBytes) {
+  totalBytes = 0;
+  innerBytes = 0;
+  auto fromShape = [&](ArrayRef<int64_t> shape, int64_t esize) {
+    if (shape.empty())
+      return;
+    int64_t elems = 1;
+    for (auto d : shape)
+      elems *= d;
+    totalBytes = elems * esize;
+    innerBytes = shape.back() * esize;
+  };
+  for (auto r : op->getResults()) {
+    if (auto tt = dyn_cast<RankedTensorType>(r.getType()))
+      return fromShape(tt.getShape(), tt.getElementTypeBitWidth() / 8);
+    if (auto md = dyn_cast<triton::gpu::MemDescType>(r.getType()))
+      return fromShape(md.getShape(),
+                       md.getElementType().getIntOrFloatBitWidth() / 8);
+  }
+  int64_t best = 0;
+  for (auto v : op->getOperands()) {
+    if (auto tt = dyn_cast<RankedTensorType>(v.getType())) {
+      int64_t e = 1;
+      for (auto d : tt.getShape())
+        e *= d;
+      if (e * (tt.getElementTypeBitWidth() / 8) > best) {
+        best = e * (tt.getElementTypeBitWidth() / 8);
+        fromShape(tt.getShape(), tt.getElementTypeBitWidth() / 8);
+      }
+    } else if (auto md = dyn_cast<triton::gpu::MemDescType>(v.getType())) {
+      int64_t e = 1;
+      for (auto d : md.getShape())
+        e *= d;
+      int64_t es = md.getElementType().getIntOrFloatBitWidth() / 8;
+      if (e * es > best) {
+        best = e * es;
+        fromShape(md.getShape(), es);
+      }
+    }
+  }
 }
 
+// A source TMA op lowers to ceil(innerBytes/512) hardware cp.async.bulk.tensor
+// instructions (the box inner dim caps at 512 bytes); the outer (M) dim is not
+// split. Verified by PTX instruction counting on B200 (latency_model study).
+static int getTMANumInsts(Operation *op) {
+  int64_t totalBytes, innerBytes;
+  getTMATile(op, totalBytes, innerBytes);
+  if (innerBytes <= 0)
+    return 1;
+  return static_cast<int>((innerBytes + 511) / 512);
+}
+
+// TMA LOAD round-trip latency (cycles), B200-calibrated to the num_insts law:
+//   lat = base + perKB·KB + perInst·min(num_insts−1, cap)
+// Latency is driven by the instruction count (inner dim), ~independent of M,
+// and saturates by ~num_insts=3 (per-load instructions' DRAM drains overlap).
+// Fits the measured grid within ~10% (e.g. [8,512] N=2 ≈ 748, [128,64] N=1 ≈
+// 556).
+int LatencyModel::getTMALoadLatency(Operation *op) const {
+  constexpr int kBase = 460, kPerKB = 6, kPerInst = 240, kInstCap = 2;
+  int64_t totalBytes, innerBytes;
+  getTMATile(op, totalBytes, innerBytes);
+  if (totalBytes <= 0)
+    return lookupTMALoadOccupancy(128 * 64 * 2);
+  int nInsts = getTMANumInsts(op);
+  int kb = static_cast<int>(totalBytes / 1024);
+  return kBase + kPerKB * kb + kPerInst * std::min(nInsts - 1, kInstCap);
+}
+
+// TMA STORE latency (cycles): bandwidth-bound, ~linear in bytes (B200: 52
+// cyc/KB
+// + ~130 fixed). The store engine does not pipeline (occupancy ≈ latency).
 int LatencyModel::getTMAStoreLatency(Operation *op) const {
-  // TMA stores have similar latency profile to loads
-  return getTMALoadLatency(op);
+  constexpr int kBase = 130, kPerKB = 52;
+  int64_t totalBytes, innerBytes;
+  getTMATile(op, totalBytes, innerBytes);
+  if (totalBytes <= 0)
+    return lookupTMALoadOccupancy(128 * 64 * 2);
+  return kBase + kPerKB * static_cast<int>(totalBytes / 1024);
 }
 
 // MMA latencies from design doc microbenchmarks (Blackwell tcgen05.mma).
@@ -172,8 +240,8 @@ static int scaleByElements(int baseCycles, int64_t elements) {
   if (elements <= 0)
     return baseCycles;
   // Linear scaling from the 128x128 baseline. Rounded.
-  return static_cast<int>(
-      static_cast<int64_t>(baseCycles) * elements / kBaseElems);
+  return static_cast<int>(static_cast<int64_t>(baseCycles) * elements /
+                          kBaseElems);
 }
 
 int LatencyModel::getCUDALatency(Operation *op) const {
@@ -336,22 +404,22 @@ int LatencyModel::getSFUSelfLat(Operation *op) const {
 HWPipeline LatencyModel::classifyPipeline(Operation *op) const {
   // MEM: TMA loads, regular loads, and stores
   if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op))
-    return HWPipeline::MEM;
+    return HWPipeline::TMA;
   // MEM: Lowered TMA loads (TLX kernels use async_tma_copy instead of
   // descriptor_load)
   if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(op))
-    return HWPipeline::MEM;
+    return HWPipeline::TMA;
   if (isa<tt::LoadOp>(op)) {
     // Regular tt.load (before TMA lowering) — classify as MEM if tensor
     if (op->getNumResults() > 0 &&
         isa<RankedTensorType>(op->getResult(0).getType()))
-      return HWPipeline::MEM;
+      return HWPipeline::TMA;
   }
   if (isa<tt::DescriptorStoreOp>(op))
-    return HWPipeline::MEM;
+    return HWPipeline::TMA;
   // MEM: Lowered TMA stores (TLX path)
   if (isa<ttng::AsyncTMACopyLocalToGlobalOp>(op))
-    return HWPipeline::MEM;
+    return HWPipeline::TMA;
 
   // TC: Tensor Core MMA operations
   if (isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp>(op))
@@ -386,7 +454,7 @@ HWPipeline LatencyModel::classifyPipeline(Operation *op) const {
     if (op->getNumOperands() > 1) {
       auto valOperand = op->getOperand(1);
       if (isa<RankedTensorType>(valOperand.getType()))
-        return HWPipeline::MEM;
+        return HWPipeline::TMA;
     }
   }
 
@@ -461,16 +529,16 @@ HWPipeline LatencyModel::classifyPipeline(Operation *op) const {
 //  - Scalar ops, NONE pipeline: 1 warp suffices.
 int LatencyModel::getMinWarps(Operation *op) const {
   // Async producers — 1 warp issues, hardware does the rest.
-  if (isa<tt::DescriptorLoadOp, tt::DescriptorStoreOp,
-          tt::DescriptorGatherOp, ttng::AsyncTMACopyGlobalToLocalOp,
-          ttng::AsyncTMACopyLocalToGlobalOp>(op))
+  if (isa<tt::DescriptorLoadOp, tt::DescriptorStoreOp, tt::DescriptorGatherOp,
+          ttng::AsyncTMACopyGlobalToLocalOp, ttng::AsyncTMACopyLocalToGlobalOp>(
+          op))
     return 1;
-  if (isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp,
-          ttng::WarpGroupDotOp, tt::DotOp>(op))
+  if (isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp, ttng::WarpGroupDotOp,
+          tt::DotOp>(op))
     return 1;
   // Synchronization primitives.
-  if (isa<ttng::WaitBarrierOp, ttng::ArriveBarrierOp,
-          ttng::BarrierExpectOp>(op))
+  if (isa<ttng::WaitBarrierOp, ttng::ArriveBarrierOp, ttng::BarrierExpectOp>(
+          op))
     return 1;
   // TMEM ops — TLX/Blackwell hardware constraint requires 4 or 8 warps.
   if (isa<ttng::TMEMLoadOp, ttng::TMEMStoreOp>(op))
@@ -496,49 +564,41 @@ OpLatencyInfo LatencyModel::getLatency(Operation *op) const {
   int latency = 0;
   int selfLatency = 0;
   switch (pipeline) {
-  case HWPipeline::MEM: {
-    // selfLatency = issue cost: cycles the SM is blocked dispatching the op.
-    // latency     = full delivery time: cycles from issue until a downstream
-    //               consumer can read the data. Single number per op — no
-    //               separate "occupancy" vs "DRAM overhead" split.
-    int fullLatency;
-    if (isa<tt::DescriptorStoreOp>(op))
-      fullLatency = getTMAStoreLatency(op);
-    else if (isa<ttng::AsyncTMACopyLocalToGlobalOp>(op)) {
-      fullLatency = lookupTMALoadOccupancy(128 * 64 * 2);
-    } else if (isa<triton::gpu::LocalAllocOp>(op)) {
-      // local_alloc fed by a TMA load is a pure IR-level rename: the TMA has
-      // already delivered the bytes to SMEM, this op just wraps the buffer in
-      // a memdesc. No pipeline occupancy, no extra wait.
-      selfLatency = 0;
-      latency = 0;
-      return OpLatencyInfo{pipeline, latency, selfLatency, /*minWarps=*/1};
-    } else if (auto tmaCopy = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
-      // Lowered TMA load (TLX path). Get size from the SMEM result type.
-      auto resultMemDesc =
-          dyn_cast<triton::gpu::MemDescType>(tmaCopy.getResult().getType());
-      if (resultMemDesc) {
-        int64_t elements = 1;
-        for (auto dim : resultMemDesc.getShape())
-          elements *= dim;
-        int64_t bytesPerElement =
-            resultMemDesc.getElementType().getIntOrFloatBitWidth() / 8;
-        fullLatency = lookupTMALoadOccupancy(elements * bytesPerElement);
-      } else {
-        fullLatency = lookupTMALoadOccupancy(128 * 64 * 2);
-      }
-    } else
-      fullLatency = getTMALoadLatency(op);
+  case HWPipeline::TMA: {
+    // local_alloc fed by a TMA load is a pure IR-level rename: the TMA already
+    // delivered the bytes to SMEM. No pipeline occupancy, no extra wait.
+    if (isa<triton::gpu::LocalAllocOp>(op))
+      return OpLatencyInfo{pipeline, /*latency=*/0, /*selfLatency=*/0,
+                           /*minWarps=*/1, /*occupancy=*/0};
+    // selfLatency = issue cost (SM blocked dispatching). latency = round-trip.
+    // occupancy = cycles the TMA engine is held for ResMII: a store is
+    // bandwidth-bound (occ ≈ latency), but a load is multi-outstanding so it
+    // occupies the engine only ~bytes/bandwidth (≈ 6 cyc/KB), NOT its latency.
+    bool isStore =
+        isa<tt::DescriptorStoreOp, ttng::AsyncTMACopyLocalToGlobalOp>(op);
+    int64_t totalBytes, innerBytes;
+    getTMATile(op, totalBytes, innerBytes);
     selfLatency = kTMAIssueLatency;
-    latency = fullLatency;
-    return OpLatencyInfo{pipeline, latency, selfLatency, /*minWarps=*/1};
+    int occupancy;
+    if (isStore) {
+      latency = getTMAStoreLatency(op);
+      occupancy = latency; // bandwidth-bound: engine held for the full transfer
+    } else {
+      latency = getTMALoadLatency(op);
+      occupancy =
+          std::max(kTMAIssueLatency, static_cast<int>(6 * (totalBytes / 1024)));
+    }
+    return OpLatencyInfo{pipeline, latency, selfLatency, /*minWarps=*/1,
+                         occupancy};
   }
   case HWPipeline::TC:
     latency = getMMALatency(op);
     // selfLatency = issue cost (SM dispatch pipeline occupancy).
-    // Design doc: 30 cycles for tcgen05.mma.
+    // Design doc: 30 cycles for tcgen05.mma. occupancy = latency: the tensor
+    // core genuinely serializes one MMA at a time (keeps GEMM/FA ResMII right).
     selfLatency = kMMAIssueLatency;
-    break;
+    return OpLatencyInfo{pipeline, latency, selfLatency, getMinWarps(op),
+                         /*occupancy=*/latency};
   case HWPipeline::CUDA:
     // latency  = full RAW-dep cost per op (clock64-chained microbench).
     //            Used by RecMII to size dependency recurrences.
@@ -565,7 +625,10 @@ OpLatencyInfo LatencyModel::getLatency(Operation *op) const {
     break;
   }
 
-  return OpLatencyInfo{pipeline, latency, selfLatency, getMinWarps(op)};
+  // CUDA/SFU are pipelined synchronous units: occupancy = selfLatency (the
+  // per-op pipe slot count). NONE → 0 (no resource).
+  return OpLatencyInfo{pipeline, latency, selfLatency, getMinWarps(op),
+                       /*occupancy=*/selfLatency};
 }
 
 } // namespace mlir::triton::gpu

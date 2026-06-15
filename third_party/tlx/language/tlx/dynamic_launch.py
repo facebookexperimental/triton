@@ -48,14 +48,19 @@ def _clc_query(
     _semantic=None,
 ):
     """
-    Extract tile ID from CLC response.
+    Extract CTA ID (3D) from CLC response.
 
-    Returns the tile ID decoded from the CLC response buffer, or -1 if no work
-    is available.
+    Returns a tuple (ctaIdX, ctaIdY, ctaIdZ) decoded from the CLC response
+    buffer. The X dimension is automatically offset by cluster_cta_rank() so
+    each CTA gets a unique tile assignment (CTA 0 gets tile N, CTA 1 gets
+    tile N+1, etc.). Returns (-1, -1, -1) if no work available.
+
+    Note: For single-CTA clusters, cluster_cta_rank() returns 0, so the offset
+    is a no-op. This allows the same code path for both single and multi-CTA modes.
     """
     assert isinstance(clc_response_addr, tlx.clc_response)
-    x = _semantic.builder.clc_query(clc_response_addr.handle)
-    return _semantic.tensor(x, tl.int32)
+    results = _semantic.builder.clc_query(clc_response_addr.handle)
+    return tuple(_semantic.tensor(r, tl.int32) for r in results)
 
 
 @tl.builtin
@@ -125,7 +130,7 @@ def clc_producer(context, p_producer=None, multi_ctas: bool = False, k=0, _seman
 
 
 @tl.builtin
-def clc_consumer(context, p_consumer=None, multi_ctas: bool = False, k=0, _semantic=None):
+def clc_consumer(context, p_consumer=None, multi_ctas: bool = False, k=0, return_3d: bool = False, _semantic=None):
     """
     Decode the tile ID from a CLC response and signal completion.
 
@@ -144,8 +149,10 @@ def clc_consumer(context, p_consumer=None, multi_ctas: bool = False, k=0, _seman
         k: Stage index
         p_consumer: Phase for consumer
         multi_ctas: If True, compute pred_cta0 internally and use remote signaling
+        return_3d: If True, return (ctaIdX, ctaIdY, ctaIdZ) tuple instead of scalar tile_id
 
     Returns the tile ID if successful, otherwise -1.
+    If return_3d=True, returns (ctaIdX, ctaIdY, ctaIdZ) tuple.
 
     PTX instructions generated:
         clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_response;
@@ -162,7 +169,8 @@ def clc_consumer(context, p_consumer=None, multi_ctas: bool = False, k=0, _seman
     barrier_wait(bar_full, p_consumer, _semantic=_semantic)
 
     # Extract tile_id from the CLC response.
-    stolen_tile_id = _clc_query(response, _semantic=_semantic)
+    stolen_tile_ids = _clc_query(response, _semantic=_semantic)
+    stolen_tile_id = stolen_tile_ids[0]
 
     # Signal completion: all CTAs signal CTA 0's bar_empty
     # NOTE: if stolen_tile_id is -1, it means no more tile is available. We shouldn't expect
@@ -177,4 +185,6 @@ def clc_consumer(context, p_consumer=None, multi_ctas: bool = False, k=0, _seman
     else:
         barrier_arrive(bar_empty, pred=pred_has_tile, _semantic=_semantic)
 
+    if return_3d:
+        return stolen_tile_ids
     return stolen_tile_id

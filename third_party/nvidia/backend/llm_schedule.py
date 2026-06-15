@@ -38,12 +38,10 @@ def _call_llm(ttgir_text: str, system_prompt: str) -> str:
     """Call the LLM with the TTGIR input and return the schedule graph."""
     model = os.environ.get("TRITON_LLM_MODEL", "sonnet")
 
-    user_prompt = (
-        "Given the following TTGIR, produce the modulo.schedule graph "
-        "by following the steps in your instructions.\n\n"
-        "Output ONLY the raw modulo.schedule block. No explanation.\n\n"
-        f"{ttgir_text}"
-    )
+    user_prompt = ("Given the following TTGIR, produce the modulo.schedule graph "
+                   "by following the steps in your instructions.\n\n"
+                   "Output ONLY the raw modulo.schedule block. No explanation.\n\n"
+                   f"{ttgir_text}")
 
     # Try Anthropic Python SDK first, fall back to claude CLI
     try:
@@ -77,20 +75,23 @@ def _call_anthropic_sdk(user_prompt: str, system_prompt: str, model: str) -> str
 
 def _call_claude_cli(user_prompt: str, system_prompt: str, model: str) -> str:
     """Fall back to calling the claude CLI."""
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".txt", delete=False
-    ) as sp_file:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as sp_file:
         sp_file.write(system_prompt)
         sp_path = sp_file.name
 
     try:
         cmd = [
             "claude",
-            "--system-prompt", sp_path,
-            "-p", user_prompt,
-            "--output-format", "text",
-            "--model", model,
-            "--allowedTools", "",
+            "--system-prompt",
+            sp_path,
+            "-p",
+            user_prompt,
+            "--output-format",
+            "text",
+            "--model",
+            model,
+            "--allowedTools",
+            "",
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         return result.stdout
@@ -103,18 +104,14 @@ def _parse_schedule(output: str) -> dict | None:
 
     Returns a dict with schedule info, or None if parsing fails.
     """
-    schedule_match = re.search(
-        r"modulo\.schedule @\w+ \{(.+)\n\}", output, re.DOTALL
-    )
+    schedule_match = re.search(r"modulo\.schedule @\w+ \{(.+)\n\}", output, re.DOTALL)
     if not schedule_match:
         return None
 
     body = schedule_match.group(1)
     result = {"ii": None, "max_stage": None, "nodes": []}
 
-    header = re.search(
-        r"ii = (\d+), max_stage = (\d+)", body
-    )
+    header = re.search(r"ii = (\d+), max_stage = (\d+)", body)
     if header:
         result["ii"] = int(header.group(1))
         result["max_stage"] = int(header.group(2))
@@ -124,9 +121,9 @@ def _parse_schedule(output: str) -> dict | None:
 
     # Parse stage/order annotations for MMA ops
     for m in re.finditer(
-        r"(ttng\.tc_gen5_mma|ttng\.tc_gen5_mma_scaled|ttng\.warp_group_dot|tt\.dot)"
-        r"\s+\{[^}]*cycle: (\d+), cluster: (\d+)",
-        body,
+            r"(ttng\.tc_gen5_mma|ttng\.tc_gen5_mma_scaled|ttng\.warp_group_dot|tt\.dot)"
+            r"\s+\{[^}]*cycle: (\d+), cluster: (\d+)",
+            body,
     ):
         op_name = m.group(1)
         cycle = int(m.group(2))
@@ -167,10 +164,10 @@ def _apply_schedule_to_ir(mod, schedule: dict) -> None:
 
         # Set tt.autows on MMA ops
         if op_name in (
-            "ttng.tc_gen5_mma",
-            "ttng.tc_gen5_mma_scaled",
-            "ttng.warp_group_dot",
-            "tt.dot",
+                "ttng.tc_gen5_mma",
+                "ttng.tc_gen5_mma_scaled",
+                "ttng.warp_group_dot",
+                "tt.dot",
         ):
             if mma_idx < len(schedule["nodes"]):
                 node = schedule["nodes"][mma_idx]

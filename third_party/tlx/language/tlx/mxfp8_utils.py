@@ -8,6 +8,7 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2
+from triton.language.extra.tlx.warp_ops import warp_redux
 
 
 @triton.jit
@@ -140,6 +141,54 @@ def _compute_scale_and_quantize(
 
     data_fp8_flat = tl.reshape(data_fp8, [BLOCK_M, BLOCK_K])
     return scale_e8m0, data_fp8_flat
+
+
+@triton.jit
+def _to_mxfp8_32x32_block(
+    data_input,
+    VEC_SIZE: tl.constexpr,
+    dtype: tl.constexpr,
+):
+    """
+    Convert float32 to MXFP8 with one scale factor per 32x32 block.
+
+    Matches FA4's redux_sync_max_abs_f32 granularity: per-thread max over 32
+    k-values (axis=1), then warp-level redux across 32 m-values (axis=0).
+    One SF per (32m x 32k) block, implicitly replicated to all lanes.
+    """
+    BLOCK_M: tl.constexpr = data_input.shape[0]
+    BLOCK_K: tl.constexpr = data_input.shape[1]
+    NUM_SCALES: tl.constexpr = BLOCK_K // VEC_SIZE
+    tl.static_assert(VEC_SIZE == 32)
+    tl.static_assert(BLOCK_M % VEC_SIZE == 0)
+
+    if dtype == tl.float8e4nv:
+        FLOAT_MAX: tl.constexpr = 448.0
+    else:
+        tl.static_assert(dtype == tl.float8e5)
+        FLOAT_MAX: tl.constexpr = 57344.0
+
+    data_reshaped = tl.reshape(data_input, [BLOCK_M, NUM_SCALES, VEC_SIZE])
+
+    # Per-row amax: register-local max over 32 k-values
+    per_row_amax = tl.max(tl.abs(data_reshaped), axis=2)  # [BLOCK_M, NUM_SCALES]
+
+    # Warp-level redux: max across 32 lanes (= 32 m-rows), result replicated
+    block_amax = warp_redux(per_row_amax, "max")  # [BLOCK_M, NUM_SCALES], same shape
+
+    scale_u32, quant_scale = _fused_amax_to_e8m0(block_amax, 1.0 / FLOAT_MAX)
+    scale_e8m0 = scale_u32.to(tl.uint8)
+
+    quant_scale_expanded = tl.reshape(quant_scale, [BLOCK_M, NUM_SCALES, 1])
+    scaled_data = _mul_f32x2(data_reshaped, quant_scale_expanded)
+
+    if dtype == tl.float8e4nv:
+        data_fp8 = _cvt_e4m3x4_f32(scaled_data)
+    else:
+        data_fp8 = _cvt_e5m2x4_f32(scaled_data)
+
+    data_fp8_flat = tl.reshape(data_fp8, [BLOCK_M, BLOCK_K])
+    return data_fp8_flat, scale_e8m0
 
 
 @triton.jit

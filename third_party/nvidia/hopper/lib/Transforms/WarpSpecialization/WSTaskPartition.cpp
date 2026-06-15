@@ -25,16 +25,14 @@ void doTaskPartition(triton::FuncOp &funcOp, unsigned numWarpGroups) {
 
   // Bail out in the presence of user annotations.
   DenseSet<int> allAsyncTasks;
-  funcOp->walk([&](Operation *op) {
-    auto asyncTasks = getAsyncTaskIds(op);
-    allAsyncTasks.insert_range(getAsyncTaskIds(op));
-  });
+  funcOp->walk(
+      [&](Operation *op) { allAsyncTasks.insert_range(getAsyncTaskIds(op)); });
 
   if (!allAsyncTasks.empty())
     return;
 
   SmallVector<scf::ForOp> loops;
-  SmallVector<Operation *> loads;
+  bool hasLoad = false;
   SmallVector<Operation *> stores;
   SmallVector<Operation *> dots;
 
@@ -43,27 +41,14 @@ void doTaskPartition(triton::FuncOp &funcOp, unsigned numWarpGroups) {
       loops.push_back(forOp);
     else if (isa<ttng::WarpGroupDotOp>(op))
       dots.push_back(op);
-    else if (isa<tt::LoadOp, tt::DescriptorLoadOp>(op))
-      loads.push_back(op);
+    else if (isa<tt::LoadOp, tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op))
+      hasLoad = true;
     else if (isa<tt::StoreOp, tt::DescriptorStoreOp>(op))
       stores.push_back(op);
   });
 
-  if (loops.empty() || loads.empty() || dots.empty())
+  if (loops.empty() || !hasLoad || dots.empty())
     return;
-
-  auto getLoopLevel = [&](Operation *op) {
-    // Compute loop depth
-    unsigned depth = 0;
-    Operation *parent = op->getParentOp();
-    while (parent) {
-      if (isa<scf::ForOp>(parent)) {
-        ++depth;
-      }
-      parent = parent->getParentOp();
-    }
-    return depth;
-  };
 
   // Step 1. Select loads into the first task, which is the producer task by
   // default. Place dots into the second task, which is the consumer.
@@ -83,7 +68,7 @@ void doTaskPartition(triton::FuncOp &funcOp, unsigned numWarpGroups) {
     (void)getBackwardSlice(dotOp.getA(), &backwardSlice, opt);
     (void)getBackwardSlice(dotOp.getB(), &backwardSlice, opt);
     for (auto depOp : backwardSlice) {
-      if (isa<tt::DescriptorLoadOp>(depOp)) {
+      if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(depOp)) {
         producerOps.insert(depOp);
       } else if (isa<tt::LoadOp>(depOp) && isExpensiveLoadOrStore(depOp)) {
         producerOps.insert(depOp);
@@ -109,7 +94,7 @@ void doTaskPartition(triton::FuncOp &funcOp, unsigned numWarpGroups) {
   if (consumerOps.empty() || producerOps.empty())
     return;
 
-  // Annoate the program with task ids
+  // Annotate the program with task ids
   SmallVector<AsyncTaskId, 1> producerTaskIds{0};
   SmallVector<AsyncTaskId, 2> consumerTaskIds;
   for (unsigned i = 0; i < numWarpGroups - 1; ++i) {
