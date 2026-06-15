@@ -1,17 +1,17 @@
 """Tests for constraint-aware autotuning: static artifact/IR-PTX-based pruning.
 
 The autotuner exposes a single IR-based pruning hook,
-``prune_configs_by={"ir_config_prune": ...}``: each config is compiled once
-(``run(warmup=True)`` — no kernel launch) and its TTGIR/PTX is inspected, so configs
-can be kept/dropped by a feature present in the generated code. Static bitwise-
-equivalence pruning is layered on this hook in ``bitequiv`` and is unit-tested there
-(``bitequiv/tests/test_equivalence.py``).
+``prune_configs_by={"ir_config_prune": ...}``: it runs *after* each config is
+benchmarked, reusing the CompiledKernel the benchmark already produced (no extra
+compilation), inspects its TTGIR/PTX, and prunes a rejected config by marking its
+timing invalid. Static bitwise-equivalence pruning is layered on this hook in
+``bitequiv`` and is unit-tested there (``bitequiv/tests/test_equivalence.py``).
 
 This file has two layers:
 
 * **CPU logic tests** (no GPU) drive ``Autotuner.run`` end-to-end with a *mock* JIT
-  function so the prune control flow (compile-only inspection, keep/drop, compile-
-  error handling) is validated deterministically without a GPU.
+  function so the prune control flow (artifact inspection, keep/drop, compile-error
+  handling) is validated deterministically without a GPU.
 * **GPU end-to-end tests** (skipped without CUDA) exercise the same hook through real
   Triton compilation, modeled on ``test_autotuner.py``.
 """
@@ -61,10 +61,11 @@ class _FakeKernel:
 class _FakeJIT:
     """Minimal object that satisfies the bits of JITFunction that Autotuner uses.
 
-    With ``warmup=True`` it returns a ``_FakeKernel`` (mirroring ``run(warmup=True)``,
-    the compile-only path the artifact hook uses). Otherwise it records the block size
-    so the mock ``do_bench`` can derive a deterministic "time" (smaller block ==
-    faster), and returns None.
+    ``run`` always returns a ``_FakeKernel`` (mirroring ``JITFunction.run``, which returns
+    the CompiledKernel on a normal launch too) and records the block size so the mock
+    ``do_bench`` can derive a deterministic "time" (smaller block == faster). The autotuner
+    captures that returned kernel during benchmarking and reads its ``.asm`` for the
+    post-bench IR prune.
     """
 
     def __init__(self, arg_names):
@@ -80,9 +81,7 @@ class _FakeJIT:
         block_size = kwargs["BLOCK_SIZE"]
         num_warps = kwargs.get("num_warps", 4)
         self.last_block_size = block_size
-        if kwargs.get("warmup", False):
-            return _FakeKernel(block_size, num_warps)
-        return None
+        return _FakeKernel(block_size, num_warps)
 
 
 def _make_tuner(configs, *, prune_configs_by=None):
