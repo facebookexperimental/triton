@@ -288,6 +288,10 @@ class HIPBackend(BaseBackend):
         # Facebook end
         amd.passes.ttgpuir.add_prepare_if_combining(pm)
         passes.common.add_canonicalizer(pm)
+        # Late AMD passes can reintroduce dot-operand layout conversions as
+        # tensor local_alloc/local_load pairs. Run TLX propagation after
+        # canonicalization so the final cleanup sees and folds those fallbacks.
+        tlx.tlx_passes.add_tlx_propagate_layout(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         # Consume tlx.warp_pipeline_stage border markers (rocdl.sched.barrier with
