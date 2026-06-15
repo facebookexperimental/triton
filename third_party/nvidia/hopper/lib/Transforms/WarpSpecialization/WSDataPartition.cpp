@@ -30,7 +30,8 @@ static bool containsAll(const SmallVector<AsyncTaskId> &superset,
 }
 
 static bool isControlFlowOp(Operation *op) {
-  return isa<ReturnOp, FuncOp, scf::YieldOp, scf::ForOp, scf::IfOp>(op);
+  return isa<ReturnOp, FuncOp, scf::YieldOp, scf::ConditionOp, scf::ForOp,
+             scf::IfOp, scf::WhileOp>(op);
 }
 
 // Ensure all ops in the def-use chain carry the correct async task IDs.
@@ -407,16 +408,36 @@ static bool getBackwardSliceToPartition(Value v,
     assert(isa<BlockArgument>(v) && "value is not an operation or block ");
     auto bbArg = cast<BlockArgument>(v);
     Operation *bbAargOwner = bbArg.getOwner()->getParentOp();
-    if (auto forOp = dyn_cast<scf::ForOp>(bbAargOwner)) {
-      // track initial value
-      auto initArg = forOp.getInitArgs()[bbArg.getArgNumber() - 1];
-      if (!getBackwardSliceToPartition(initArg, partitionScheme, currentDim)) {
-        return false;
-      }
-      // track yield value
-      auto yieldArg = forOp.getYieldedValues()[bbArg.getArgNumber() - 1];
-      if (!getBackwardSliceToPartition(yieldArg, partitionScheme, currentDim)) {
-        return false;
+    if (auto loop = dyn_cast<LoopLikeOpInterface>(bbAargOwner)) {
+      if (auto whileOp = dyn_cast<scf::WhileOp>(bbAargOwner);
+          whileOp && bbArg.getOwner() == whileOp.getAfterBody()) {
+        // scf.while "after" arg j is fed from the scf.condition forwarded
+        // operand j (which also feeds result j).
+        Value fwd = whileOp.getConditionOp().getArgs()[bbArg.getArgNumber()];
+        if (!getBackwardSliceToPartition(fwd, partitionScheme, currentDim)) {
+          return false;
+        }
+      } else {
+        // scf.for body iter arg, or scf.while "before" arg: track the init
+        // value and the value yielded back for the next iteration. The slot
+        // abstraction hides the induction-variable offset (scf.for) and the
+        // two-region structure (scf.while). A scf.for induction variable is not
+        // in getRegionIterArgs() and is skipped.
+        auto iterArgs = loop.getRegionIterArgs();
+        auto it = llvm::find(iterArgs, bbArg);
+        if (it != iterArgs.end()) {
+          auto slot =
+              getLoopCarriedSlot(loop, std::distance(iterArgs.begin(), it));
+          if (slot.init && !getBackwardSliceToPartition(
+                               slot.init->get(), partitionScheme, currentDim)) {
+            return false;
+          }
+          if (slot.yielded &&
+              !getBackwardSliceToPartition(slot.yielded->get(), partitionScheme,
+                                           currentDim)) {
+            return false;
+          }
+        }
       }
     } else if (isa<triton::FuncOp>(bbAargOwner)) {
       if (isa<TensorDescType>(bbArg.getType())) {
@@ -557,11 +578,34 @@ static bool getForwardSliceToPartition(Value v,
       for (OpOperand &operand : yieldOp->getOpOperands()) {
         if (operand.get() == v) {
           partitionScheme.ops.insert(parentOp);
-          if (!getForwardSliceToPartition(
-                  parentOp->getResult(operand.getOperandNumber()),
-                  partitionScheme, currentDim, seen))
+          unsigned idx = operand.getOperandNumber();
+          // For scf.for / scf.if, yield operand k feeds result k. For an
+          // scf.while "after" yield, operand k instead feeds "before" arg k
+          // (the loop-carry back edge); results come from scf.condition.
+          Value fwd;
+          if (auto whileOp = dyn_cast<scf::WhileOp>(parentOp))
+            fwd = whileOp.getBeforeArguments()[idx];
+          else
+            fwd = parentOp->getResult(idx);
+          if (!getForwardSliceToPartition(fwd, partitionScheme, currentDim,
+                                          seen))
             return false;
-          ;
+        }
+      }
+    } else if (auto condOp = dyn_cast<scf::ConditionOp>(depOp)) {
+      // scf.while "before" terminator: a forwarded operand feeds both the
+      // matching result and the matching "after" arg.
+      auto whileOp = cast<scf::WhileOp>(condOp->getParentOp());
+      partitionScheme.ops.insert(whileOp);
+      for (OpOperand &operand : condOp.getArgsMutable()) {
+        if (operand.get() == v) {
+          unsigned argIdx = operand.getOperandNumber() - 1;
+          if (!getForwardSliceToPartition(whileOp->getResult(argIdx),
+                                          partitionScheme, currentDim, seen))
+            return false;
+          if (!getForwardSliceToPartition(whileOp.getAfterArguments()[argIdx],
+                                          partitionScheme, currentDim, seen))
+            return false;
         }
       }
     }

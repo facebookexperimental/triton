@@ -819,6 +819,124 @@ void appendToForOpYield(scf::ForOp forOp, ArrayRef<Value> newOperands) {
   yieldOp->erase();
 }
 
+//===----------------------------------------------------------------------===//
+// Loop-kind-agnostic helpers (scf.for / scf.while)
+//===----------------------------------------------------------------------===//
+
+LoopLikeOpInterface getEnclosingLoop(Operation *op) {
+  return op->getParentOfType<LoopLikeOpInterface>();
+}
+
+LoopLikeOpInterface getEnclosingLoop(Value v) {
+  if (Operation *def = v.getDefiningOp())
+    return getEnclosingLoop(def);
+  auto arg = cast<BlockArgument>(v);
+  Operation *parent = arg.getOwner()->getParentOp();
+  if (!parent)
+    return nullptr;
+  // A loop's own region arg belongs to that loop's scope.
+  if (auto loop = dyn_cast<LoopLikeOpInterface>(parent))
+    return loop;
+  return getEnclosingLoop(parent);
+}
+
+unsigned getNumLoopCarried(LoopLikeOpInterface loop) {
+  return loop.getRegionIterArgs().size();
+}
+
+LoopCarriedSlot getLoopCarriedSlot(LoopLikeOpInterface loop, unsigned k) {
+  LoopCarriedSlot slot;
+  Operation *op = loop.getOperation();
+  // iterArg and yielded are 1:1 with the slot index for both loop kinds and are
+  // safe to query through the interface (both kinds expose getRegionIterArgs
+  // and getYieldedValuesMutable).
+  slot.iterArg = loop.getRegionIterArgs()[k];
+  if (auto yielded = loop.getYieldedValuesMutable())
+    slot.yielded = &(*yielded)[k];
+
+  // The init OpOperand must be fetched from the concrete op: the
+  // LoopLikeOpInterface default getInitsMutable() returns {} for scf.while.
+  if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+    slot.init = &forOp.getInitArgsMutable()[k];
+    slot.result = forOp->getOpResult(k);
+    return slot;
+  }
+
+  auto whileOp = cast<scf::WhileOp>(op);
+  slot.init = &whileOp.getInitsMutable()[k];
+  // results / after-args align with scf.condition forwarded operands, not with
+  // the iter-arg index. Find the forwarded position carrying this "before" arg
+  // (the case for appended counters and pass-through carried values).
+  auto condOp = whileOp.getConditionOp();
+  for (auto [j, fwd] : llvm::enumerate(condOp.getArgs())) {
+    if (fwd == slot.iterArg) {
+      slot.result = whileOp->getOpResult(j);
+      slot.afterArg = whileOp.getAfterArguments()[j];
+      break;
+    }
+  }
+  return slot;
+}
+
+std::optional<unsigned> getSlotForResult(LoopLikeOpInterface loop,
+                                         OpResult result) {
+  Operation *op = loop.getOperation();
+  if (isa<scf::ForOp>(op))
+    return result.getResultNumber();
+  auto whileOp = cast<scf::WhileOp>(op);
+  unsigned j = result.getResultNumber();
+  Value fwd = whileOp.getConditionOp().getArgs()[j];
+  if (auto arg = dyn_cast<BlockArgument>(fwd))
+    if (arg.getOwner() == whileOp.getBeforeBody())
+      return arg.getArgNumber();
+  return std::nullopt;
+}
+
+AppendedLoop appendLoopCarriedValues(OpBuilder &builder,
+                                     LoopLikeOpInterface loop,
+                                     ValueRange inits) {
+  AppendedLoop result;
+  unsigned n = inits.size();
+  Operation *op = loop.getOperation();
+
+  if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+    // addIterArgsToLoop rebuilds the loop with the extra inits and erases the
+    // old one; the yield is left untouched (caller appends via backEdgeYield).
+    scf::ForOp newFor = addIterArgsToLoop(builder, forOp, inits);
+    result.loop = cast<LoopLikeOpInterface>(newFor.getOperation());
+    for (auto a : newFor.getRegionIterArgs().take_back(n))
+      result.newIterArgs.push_back(a);
+    for (auto r : newFor.getResults().take_back(n))
+      result.newResults.push_back(r);
+    result.backEdgeYield =
+        cast<scf::YieldOp>(newFor.getBody()->getTerminator());
+    return result;
+  }
+
+  auto whileOp = cast<scf::WhileOp>(op);
+  SmallVector<Type> newResultTypes;
+  for (Value v : inits)
+    newResultTypes.push_back(v.getType());
+  scf::WhileOp newWhile =
+      replaceWhileOpWithNewSignature(builder, whileOp, inits, newResultTypes);
+  // replaceWhileOpWithNewSignature creates the new "before"/"after" args and
+  // results but leaves the spliced scf.condition / scf.yield with the old
+  // operand counts. Extend scf.condition to forward the new "before" args so
+  // they reach the new "after" args and results. (The caller appends the
+  // next-iteration values to the "after" scf.yield via backEdgeYield.)
+  auto beforeTail = newWhile.getBeforeArguments().take_back(n);
+  newWhile.getConditionOp().getArgsMutable().append(ValueRange(beforeTail));
+  for (auto a : beforeTail)
+    result.newIterArgs.push_back(a);
+  for (auto a : newWhile.getAfterArguments().take_back(n))
+    result.newAfterArgs.push_back(a);
+  for (auto r : newWhile.getResults().take_back(n))
+    result.newResults.push_back(r);
+  result.loop = cast<LoopLikeOpInterface>(newWhile.getOperation());
+  result.backEdgeYield = newWhile.getYieldOp();
+  return result;
+}
+
 scf::IfOp replaceIfOpWithNewSignature(OpBuilder &rewriter, scf::IfOp ifOp,
                                       TypeRange newResultTypes) {
   SmallVector<std::tuple<Value, Value>> replacements;
