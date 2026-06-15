@@ -193,10 +193,12 @@ struct Transform2CTALoads
     auto trans = trace->trans;
     unsigned splitDim = trace->splitDim;
 
-    // Get block shape from the descriptor's type.
+    // Use the descriptor's original type. Host-side TMA descriptor arguments
+    // are mutated in-place below, so reused descriptors must not read the
+    // already-halved type on later MMA users.
     auto descType = originalDescTypes.lookup(descLoad.getDesc());
-    if (!descType)
-      descType = cast<tt::TensorDescType>(descLoad.getDesc().getType());
+    assert(descType && "expected descriptor load type to be captured before "
+                       "2-CTA load transformation");
     auto blockShape = descType.getBlockType().getShape();
     assert(blockShape.size() == 2 && "Expected 2D block shape");
     SmallVector<int64_t> newBlockShape(blockShape.begin(), blockShape.end());

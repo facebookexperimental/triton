@@ -623,13 +623,12 @@ class CUDABackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         dump_enabled = pm.enable_debug()
         emuTF32 = capability // 10 >= 8
+        passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
         # Check user-visible tt.dot 2-CTA legality before lowering rewrites
-        # dot dependencies into TMEM alloc/load/store chains. Later checks still
-        # verify the lowered TCGen5MMA form.
+        # dot dependencies into TMEM alloc/load/store chains.
         if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
                 and opt.ctas_per_cga is not None):
             nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm)
-        passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
@@ -652,7 +651,6 @@ class CUDABackend(BaseBackend):
         # MMAv5.cpp's inline ClusterArriveOp for non-WS.
         if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
                 and opt.ctas_per_cga is not None):
-            nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm)
             nvidia.passes.hopper.add_2cta_transform_loads(pm)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
         passes.ttir.add_loop_aware_cse(pm)

@@ -167,7 +167,7 @@ The PTX ISA mandates:
 This means a kernel cannot selectively enable 2-CTA on some dots but not others
 (e.g., FA with 2-CTA on the main GEMM but 1-CTA on softmax). It must be all or
 nothing. This is enforced at compile time by `CheckMatmulTwoCTAs`, which emits an
-error if any MMA ops disagree on `two_ctas`.
+error if any matmul ops disagree on `two_ctas`.
 
 The `two_ctas` attribute flows through:
 
@@ -471,14 +471,14 @@ buck2 run @fbcode//mode/opt -m ovr_config//triton:beta \
    instructions in a kernel to use the same `cta_group`. FA with selective 2-CTA
    on only some dots is impossible; a kernel must use 2-CTA on all dots or none.
 
-6. **Dependent 2-CTA MMA chains are rejected**: The current implementation
-   supports multiple independent 2-CTA MMAs in one loop, including Auto-WS data
-   partitioning. It does not yet support FA-style chains where one 2-CTA MMA
-   consumes a TMEM value derived from an earlier 2-CTA MMA result. The async
-   `tcgen05.mma` producer needs an explicit ordering contract before the
-   dependent consumer MMA can safely read that value. `CheckMatmulTwoCTAs`
-   rejects this pattern in the legality pass. `Transform2CTALoads` remains a
-   mechanical B-load split for already-legal 2-CTA MMAs.
+6. **Dependent 2-CTA dot chains are rejected before lowering**: The current
+   implementation supports multiple independent 2-CTA MMAs in one loop,
+   including Auto-WS data partitioning. It does not yet support FA-style chains
+   where one 2-CTA `tt.dot` consumes a value derived from an earlier 2-CTA
+   `tt.dot` result. `CheckMatmulTwoCTAs` rejects this true data dependency while
+   it is still explicit in TTGIR, before dot lowering rewrites the computation
+   into TMEM alloc/load/store chains. `Transform2CTALoads` remains a mechanical
+   B-load split for already-legal 2-CTA MMAs.
 
 7. **Host-side TMA descriptor shape is updated through IR type metadata**:
    `Transform2CTALoads` supports host-side TMA by updating the function argument's
