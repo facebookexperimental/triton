@@ -197,7 +197,7 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
     LDBG("Found " << twoCTAMMAOps.size() << " 2-CTA MMA ops");
 
     // Group MMAs by their containing scf.for loop. Allocate one cross-CTA
-    // barrier per loop, shared by all MMAs in that loop.
+    // barrier slot per MMA in each loop.
     DenseMap<Operation *, SmallVector<ttng::TCGen5MMAOp>> loopToMMAs;
     SmallVector<ttng::TCGen5MMAOp> nonLoopMMAs;
 
