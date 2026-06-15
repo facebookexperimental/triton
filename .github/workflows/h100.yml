@@ -4,6 +4,9 @@ on:
     branches:
       - main
   pull_request:
+  schedule:
+    # Nightly run at 07:30 UTC.
+    - cron: '30 7 * * *'
 
 jobs:
   h100-meta-triton-test:
@@ -16,6 +19,8 @@ jobs:
     permissions:
       id-token: write
       contents: read
+    outputs:
+      failures: ${{ steps.collect.outputs.failures }}
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -45,12 +50,23 @@ jobs:
           fi
           EOF
       - name: Run TritonBench tests on H100 GPU
+        id: tritonbench
         env:
           TRITONBENCH_TEST_SKIP_FILE: ${{ github.workspace }}/.ci/tritonbench/fbtriton_skip_tests.yaml
           TRITONBENCH_ROOT: /workspace/tritonbench
         run: |
           . "${SETUP_SCRIPT}"
           bash ./.ci/tritonbench/test-gpu.sh
+      - name: Collect nightly failure (TritonBench)
+        id: collect
+        if: always() && github.event_name == 'schedule' && steps.tritonbench.outcome == 'failure'
+        run: |
+          # TritonBench output is not a stable per-test format, so fall back to a
+          # stable logical bucket identity for this job.
+          BUCKET="h100-tritonbench"
+          TITLE="[nightly] ${GITHUB_WORKFLOW} / h100-meta-triton-test / ${BUCKET}"
+          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"h100-meta-triton-test","summary":"TritonBench tests failed on H100 (see run log)."}]'
+          echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
 
   h100-tlx-test:
     if: github.repository_owner == 'facebookexperimental'
@@ -62,6 +78,8 @@ jobs:
     permissions:
       id-token: write
       contents: read
+    outputs:
+      failures: ${{ steps.parse.outputs.failures }}
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -85,12 +103,70 @@ jobs:
         timeout-minutes: 5
         run: |
           . "${SETUP_SCRIPT}"
-          python -m pytest python/test/unit/language/test_tlx_*.py -v
+          python -m pytest python/test/unit/language/test_tlx_*.py -v --junitxml=/tmp/tlx-unit.xml
       - name: Run TLX tutorial correctness tests
         timeout-minutes: 5
         run: |
           . "${SETUP_SCRIPT}"
-          python -m pytest third_party/tlx/tutorials/testing/test_correctness.py -v
+          python -m pytest third_party/tlx/tutorials/testing/test_correctness.py -v --junitxml=/tmp/tlx-correctness.xml
+      - name: Collect nightly failures (TLX)
+        id: parse
+        if: always() && github.event_name == 'schedule'
+        run: |
+          . "${SETUP_SCRIPT}"
+          python3 .github/scripts/parse_junit_failures.py \
+            --junit /tmp/tlx-unit.xml /tmp/tlx-correctness.xml \
+            --workflow "${GITHUB_WORKFLOW}" \
+            --job "h100-tlx-test"
+
+  # ----- Nightly issue filing (schedule only) -----
+  report-h100-tritonbench:
+    needs: h100-meta-triton-test
+    if: always() && github.event_name == 'schedule' && needs.h100-meta-triton-test.outputs.failures != '' && needs.h100-meta-triton-test.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.h100-meta-triton-test.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: ${{ github.workflow }}
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ github.sha }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+
+  report-h100-tlx:
+    needs: h100-tlx-test
+    if: always() && github.event_name == 'schedule' && needs.h100-tlx-test.outputs.failures != '' && needs.h100-tlx-test.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.h100-tlx-test.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: ${{ github.workflow }}
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ github.sha }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
