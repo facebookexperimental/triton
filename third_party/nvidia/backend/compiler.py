@@ -1006,6 +1006,19 @@ class CUDABackend(BaseBackend):
             # Add --regAllocOptLevel=2 to work around ptxas 13.x bug
             reg_alloc = ["--regAllocOptLevel=2"]
 
+            # compile_iq Stage-3 consumption (gated, default off; fail-open): if the PTX
+            # hash hits the ACF store, append --apply-controls (reusing ptx_extra_options).
+            # Only when the ptxas in use supports it (>=13.3), so it stays fail-open
+            # otherwise. Fires per ptxas call, i.e. for each config compiled during autotuning.
+            if os.environ.get("FBTRITON_COMPILE_IQ_APPLY"):
+                try:
+                    from packaging.version import Version
+                    if Version(get_ptxas(self.target.arch).version) >= Version("13.3"):
+                        from triton.compile_iq.consume import acf_args_for
+                        ptx_extra_options += acf_args_for(src, arch)
+                except Exception:
+                    pass
+
             ptxas_cmd = [
                 ptxas,
                 *debug_info,
