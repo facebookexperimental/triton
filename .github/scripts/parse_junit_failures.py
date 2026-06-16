@@ -3,9 +3,11 @@
 
 Used by nightly CI to file fine-grained GitHub issues per failing test.
 
-Failing/errored testcases are collected from one or more JUnit XML files. Each
-testcase's identity is normalized by stripping the trailing parametrization
-suffix so that parameterized variants collapse into a single issue, e.g.
+Failing/errored testcases are collected from one or more JUnit XML files. If no
+testcase failures can be parsed because expected XML was not produced, a stable
+job-level fallback item is emitted. Each testcase's identity is normalized by
+stripping the trailing parametrization suffix so that parameterized variants
+collapse into a single issue, e.g.
 
     foo/test_tlx.py::test_bar[param_a]
     foo/test_tlx.py::test_bar[param_b]
@@ -41,13 +43,14 @@ def raw_id(classname: str, name: str) -> str:
 
 
 def collect_failures(paths):
-    """Return ordered list of (raw_id, message) for failed/errored testcases."""
+    """Return parsed testcase failures and expected XML files that are missing."""
     failures = []
+    missing_paths = []
     for path in paths:
         if not os.path.exists(path):
-            # A missing XML usually means the step never produced output (e.g.
-            # crashed before writing). Skip silently; bucket fallbacks elsewhere
-            # cover hard crashes.
+            # A missing XML usually means pytest failed before it could write
+            # output, such as a timeout, import crash, or setup failure.
+            missing_paths.append(path)
             continue
         try:
             tree = ET.parse(path)
@@ -62,7 +65,7 @@ def collect_failures(paths):
             rid = raw_id(tc.get("classname", ""), tc.get("name", ""))
             msg = (failure_nodes[0].get("message") or "").strip()
             failures.append((rid, msg))
-    return failures
+    return failures, missing_paths
 
 
 def build_items(failures, workflow, job):
@@ -94,6 +97,19 @@ def build_items(failures, workflow, job):
     return items
 
 
+def build_missing_junit_item(missing_paths, workflow, job):
+    """Build a stable job-level item for pytest failures without JUnit XML."""
+    norm = "pytest-junit-missing"
+    missing = "\n".join(missing_paths)
+    return {
+        "normalized_failure_id": norm,
+        "raw_failure_ids": missing,
+        "issue_title": f"[nightly] {workflow} / {job} / {norm}",
+        "job_name": job,
+        "summary": f"Pytest failed before producing JUnit XML: {', '.join(missing_paths)}",
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--junit", nargs="+", required=True, help="JUnit XML file(s)")
@@ -104,8 +120,10 @@ def main():
     )
     args = parser.parse_args()
 
-    failures = collect_failures(args.junit)
+    failures, missing_paths = collect_failures(args.junit)
     items = build_items(failures, args.workflow, args.job)
+    if not items and missing_paths:
+        items.append(build_missing_junit_item(missing_paths, args.workflow, args.job))
     payload = json.dumps(items)
 
     # TODO(scuba): in a follow-up, also emit a metrics row per failure

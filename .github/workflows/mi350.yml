@@ -51,7 +51,7 @@ jobs:
           bash ./.ci/tritonbench/test-gpu.sh
       - name: Collect nightly failure (TritonBench)
         id: collect
-        if: always() && github.event_name == 'schedule' && steps.tritonbench.outcome == 'failure'
+        if: always() && github.event_name == 'schedule' && failure()
         run: |
           # TritonBench output is not a stable per-test format, so fall back to a
           # stable logical bucket identity for this job.
