@@ -120,14 +120,16 @@ jobs:
             ].join("\n");
 
             // Find an existing OPEN issue with the exact same title + labels.
-            const found = await github.paginate(github.rest.issues.listForRepo, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: "open",
-              labels: labels.join(","),
-              per_page: 100,
-            });
-            const existing = found.find(i => i.title === title && !i.pull_request);
+            const escapedTitle = title.replace(/"/g, '\\"');
+            const q = [
+              `repo:${context.repo.owner}/${context.repo.repo}`,
+              "is:issue",
+              "is:open",
+              ...labels.map(l => `label:"${l}"`),
+              `in:title "${escapedTitle}"`,
+            ].join(" ");
+            const search = await github.rest.search.issuesAndPullRequests({ q, per_page: 10 });
+            const existing = search.data.items.find(i => i.title === title && !i.pull_request);
 
             if (existing) {
               await github.rest.issues.update({
