@@ -139,28 +139,28 @@ def _compute_offsets(
 
 
 @triton.jit
-def _mask_scalar(qk, col_limit_right, s, i):
-    # Forward orientation: keep columns c < col_limit_right, mask c >= it to -inf.
-    col_lim_right_s = col_limit_right - s
-    col_lim_right_cur = max(col_lim_right_s, 0)
-    mask = -1 << col_lim_right_cur
-    mask_i_bit = (mask & (1 << i)) == 0
-    return tl.where(mask_i_bit, qk, -float("inf"))
+def _mask_scalar(qk, col_limit, s, i, keep_ge: tl.constexpr):
+    # Bitmask for a block of 16 elements: bit i is set iff column (s + i) >= col_limit.
+    cur = max(col_limit - s, 0)
+    bit = (-1 << cur) & (1 << i)
+    # keep_ge=True keeps columns >= col_limit (left limit); keep_ge=False keeps
+    # columns < col_limit (right limit).
+    keep = (bit != 0) if keep_ge else (bit == 0)
+    return tl.where(keep, qk, -float("inf"))
 
 
 @triton.jit
-def _mask_scalar_transposed(qk, col_limit_left, s, i):
-    # Transposed orientation (backward qkT[N, M]): keep columns c >= col_limit_left
-    # (i.e. keep keys where m >= n), mask c < it to -inf. Mirror of _mask_scalar:
-    # same per-16-block bitmask, but the kept side is flipped.
-    col_lim_left_cur = max(col_limit_left - s, 0)
-    mask = -1 << col_lim_left_cur
-    keep_i_bit = (mask & (1 << i)) != 0
-    return tl.where(keep_i_bit, qk, -float("inf"))
+def _mask_scalar_right(qk, col_limit, s, i):
+    return _mask_scalar(qk, col_limit, s, i, False)
 
 
 @triton.jit
-def _apply_causal_mask(qk, col_limit, BLOCK_N: tl.constexpr, TRANSPOSED: tl.constexpr = False):
+def _mask_scalar_left(qk, col_limit, s, i):
+    return _mask_scalar(qk, col_limit, s, i, True)
+
+
+@triton.jit
+def _apply_causal_mask(qk, col_limit, BLOCK: tl.constexpr, keep_ge: tl.constexpr = False):
     # Apply causal mask via a bitmask calculated for each block of 16 elements.
     # This allows the efficient R2P (register to predicate) instruction to be used at the SASS level.
     # Credit to Tri Dao,
@@ -169,16 +169,15 @@ def _apply_causal_mask(qk, col_limit, BLOCK_N: tl.constexpr, TRANSPOSED: tl.cons
     # NOTE: We use map_elementwise here in order to generate an interleaved sequence of instructions
     # that processes one element of qk at a time. This improves ptxas's resulting SASS.
     #
-    # Forward (TRANSPOSED=False): qk is [M, N], col_limit is the per-query right
-    # bound on keys (offs_m - start_n + 1). Backward (TRANSPOSED=True): qk is the
-    # transposed qkT [N, M], col_limit is the per-key left bound on queries
-    # (offs_n - curr_m); masks columns m < n so only m >= n survive.
-    offs = tl.arange(0, BLOCK_N)[None, :]
+    # keep_ge=False: qk is [..., N], keep keys < col_limit (forward, right limit).
+    # keep_ge=True: qk is transposed [..., M], keep queries >= col_limit
+    # (backward, left limit).
+    offs = tl.arange(0, BLOCK)[None, :]
     s = offs & ~0xF
     i = offs & 0xF
-    if TRANSPOSED:
-        return tl.map_elementwise(_mask_scalar_transposed, qk, col_limit, s, i)
-    return tl.map_elementwise(_mask_scalar, qk, col_limit, s, i)
+    if keep_ge:
+        return tl.map_elementwise(_mask_scalar_left, qk, col_limit, s, i)
+    return tl.map_elementwise(_mask_scalar_right, qk, col_limit, s, i)
 
 
 @triton.jit
@@ -1405,14 +1404,18 @@ def _bwd_mma_dots_2cta(
     # Order: S → dK → dP → dQ → dV
     # -----------------------------------------------------------
     tlx.barrier_wait(dk_empties[kv_buf_id], kv_phase ^ 1)
+    # kt is loaded once per n-block and reused across the whole m-loop, so wait
+    # on it once here (like k_fulls/v_fulls) instead of every iteration.
+    tlx.barrier_wait(kt_fulls[kv_buf_id], kv_phase)
     for j in range(1, num_steps):
         q_buf_id, q_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
         tmem_buf_id, tmem_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
 
         tlx.barrier_wait(qt_fulls[q_buf_id], q_phase)
         tlx.barrier_wait(qk_empties[tmem_buf_id], tmem_phase ^ 1)
-        prev_tmem_buf_id, prev_tmem_phase = get_bufidx_phase(blk_idx - 1, NUM_BUFFERS_TMEM)
-        tlx.barrier_wait(dq_empties[prev_tmem_buf_id], prev_tmem_phase ^ 1)
+        prev_blk_idx = blk_idx - 1
+        tmem_buf_id_prev, tmem_phase_prev = get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_TMEM)
+        tlx.barrier_wait(dq_empties[tmem_buf_id_prev], tmem_phase_prev ^ 1)
         qT = tlx.local_trans(qt_tiles[q_buf_id])
         tlx.async_dot(
             k_tiles[kv_buf_id],
@@ -1423,9 +1426,7 @@ def _bwd_mma_dots_2cta(
             two_ctas=True,
         )
 
-        prev_blk_idx = blk_idx - 1
         q_buf_id_prev, q_phase_prev = get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_Q)
-        tmem_buf_id_prev, tmem_phase_prev = get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_TMEM)
         ds_buf_id_prev, ds_phase_prev = get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_DS)
 
         tlx.barrier_wait(q_fulls[q_buf_id_prev], q_phase_prev)
@@ -1452,10 +1453,11 @@ def _bwd_mma_dots_2cta(
             two_ctas=True,
         )
         # Dot 5: dq = tl.dot(tl.trans(dsT), k)
+        # dq_empties[prev] was already waited before Dot 1 (qk aliases the dq
+        # TMEM region), and kt_fulls is now waited once before the loop, so
+        # neither needs re-waiting here.
         tlx.barrier_wait(ds_fulls[ds_buf_id_prev], ds_phase_prev)
-        tlx.barrier_wait(dq_empties[tmem_buf_id_prev], tmem_phase_prev ^ 1)
         dsT_view = tlx.local_trans(ds_tiles[ds_buf_id_prev])
-        tlx.barrier_wait(kt_fulls[kv_buf_id], kv_phase)
         tlx.async_dot(
             dsT_view,
             kt_tiles[kv_buf_id],
@@ -2023,36 +2025,29 @@ def _bwd_compute_inner_loop(
 
         qkT = tlx.local_load(qk_tiles[tmem_buf_id])
         m = tlx.local_load(sM_tiles[m_buf_id])
-        if USE_2CTA:
-            tlx.barrier_arrive(qk_empties[tmem_buf_id], 1, remote_cta_rank=0)
-        else:
-            tlx.barrier_arrive(qk_empties[tmem_buf_id])
-
+        # qkT/pT are transposed: [BLOCK_N1 (keys), BLOCK_M1 (queries)]. Apply the
+        # causal mask to the logits via the R2P bitmask helper (keep query-cols
+        # m >= key-row n), then exp2 (exp2(-inf) = 0), avoiding the per-element
+        # ISETP arithmetic of `offs_m >= offs_n`.
+        sT = _sub_f32x2(qkT, m[None, :])
         if STAGE == 1:
-            # Diagonal block: reuse the forward's R2P bitmask helper directly on
-            # the transposed qkT [N, M] (no transpose needed). For each key row n
-            # keep query columns m >= n by masking m < n to -inf; the per-key
-            # left bound is offs_n - curr_m. exp2(-inf) == 0, matching the
-            # previous tl.where(offs_m >= offs_n, pT, 0).
             offs_n = start_block_n + tl.arange(0, BLOCK_N1)
             col_limit_left = (offs_n - curr_m)[:, None]
-            qkT = _apply_causal_mask(qkT, col_limit_left, BLOCK_M1, TRANSPOSED=True)
-        pT = tl.math.exp2(_sub_f32x2(qkT, m[None, :]))
+            sT = _apply_causal_mask(sT, col_limit_left, BLOCK_M1, keep_ge=True)
+        pT = tl.math.exp2(sT)
 
         # Store P to TMEM.
         ppT = pT.to(do_out_dtype)
         tlx.local_store(p_tiles[tmem_buf_id + P_BUF_OFFSET], ppT)
-        tl.inline_asm_elementwise(
-            "tcgen05.wait::st.sync.aligned;",
-            "=r",
-            [],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
-        )
+        # P aliases the QK TMEM region, so qk_empties (which frees that region for
+        # reuse) must be signaled after P is stored, not before. The
+        # local_store->TMEM lowering auto-emits tcgen05.wait::st, so p_fulls
+        # already observes the completed P store; no manual wait.
         if USE_2CTA:
+            tlx.barrier_arrive(qk_empties[tmem_buf_id], 1, remote_cta_rank=0)
             tlx.barrier_arrive(p_fulls[tmem_buf_id], 1, remote_cta_rank=0)
         else:
+            tlx.barrier_arrive(qk_empties[tmem_buf_id])
             tlx.barrier_arrive(p_fulls[tmem_buf_id])
 
         # --- Phase 3: Compute dS = pT * (dpT - Di). ---
@@ -2062,19 +2057,16 @@ def _bwd_compute_inner_loop(
         Di = tlx.local_load(sD_tiles[d_buf_id])
         tlx.barrier_arrive(m_empties[m_buf_id])
         tlx.barrier_arrive(d_empties[d_buf_id])
-        if not REUSE_DP_FOR_DQ and not USE_2CTA:
-            tlx.barrier_arrive(dp_empties[tmem_buf_id])
         dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
         dsT = dsT.to(q_out_dtype)
         tlx.local_store(dsT_tmem_tiles[ds_buf_id], dsT)
-        tl.inline_asm_elementwise(
-            "tcgen05.wait::st.sync.aligned;",
-            "=r",
-            [],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
-        )
+        # dsT aliases the dP TMEM region, so dp_empties (which frees that region
+        # for reuse) must be signaled after dsT is stored, not before. The
+        # local_store->TMEM lowering auto-emits tcgen05.wait::st (+barrier), so the
+        # dsT_tmem_fulls arrive and the 2-CTA TMEM read-back below both observe the
+        # completed store; no manual wait.
+        if not REUSE_DP_FOR_DQ and not USE_2CTA:
+            tlx.barrier_arrive(dp_empties[tmem_buf_id])
         # 2-CTA: exchange half of dS with peer via DSMEM, then
         # overwrite ds_tiles so it contains mixed dS from both CTAs.
         if USE_2CTA:

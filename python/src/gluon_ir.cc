@@ -1013,6 +1013,12 @@ void init_gluon_ir(py::module &&m) {
              self.create<ttag::AsyncTDMScatterOp>(descPtr, dstRowIndices,
                                                   dstColOffset, src, barrier);
            })
+      .def("create_async_tdm_gather",
+           [](GluonOpBuilder &self, Value descPtr, Value srcRowIndices,
+              Value srcColOffset, Value dst, Value barrier) {
+             self.create<ttag::AsyncTDMGatherOp>(descPtr, srcRowIndices,
+                                                 srcColOffset, dst, barrier);
+           })
       .def("create_tdm_prefetch",
            [](GluonOpBuilder &self, Value descPtr, std::vector<Value> &indices,
               Value pred, bool speculative, bool returnOffsets) -> Value {
@@ -1052,11 +1058,16 @@ void init_gluon_ir(py::module &&m) {
              self.create<ttag::ClusterBarrierWaitOp>();
            })
       .def("create_warp_pipeline_border",
-           [](GluonOpBuilder &self, const std::string &marker) {
+           [](GluonOpBuilder &self, const std::string &marker, int priority) {
              auto border = self.create<ROCDL::SchedBarrier>(0);
              auto ctx = self.getContext();
              border->setAttr("triton.warp_pipeline.border",
                              StringAttr::get(ctx, marker));
+             if (priority > -1) {
+               auto i32Ty = IntegerType::get(ctx, 32);
+               border->setAttr("triton.warp_pipeline.priority",
+                               IntegerAttr::get(i32Ty, priority));
+             }
            });
 
   m.def(
@@ -1150,7 +1161,8 @@ void init_gluon_ir(py::module &&m) {
   m.def("get_amd_wmma_scale_layout",
         [](unsigned opIdx, std::vector<int64_t> &shape, unsigned wmmaMDim,
            std::vector<std::vector<int32_t>> &regBases,
-           std::vector<std::vector<int32_t>> &warpBases) -> py::object {
+           std::vector<std::vector<int32_t>> &warpBases,
+           std::vector<std::vector<int32_t>> &cgaBases) -> py::object {
           DialectRegistry registry;
           registry.insert<triton::TritonDialect, ttg::TritonGPUDialect,
                           ttng::TritonNvidiaGPUDialect, gluon::GluonDialect>();
@@ -1164,8 +1176,9 @@ void init_gluon_ir(py::module &&m) {
           auto ctaLayout =
               tt::LinearLayout({{kReg, regBases}, {kWarp, warpBases}},
                                tt::standardOutDimNames(&ctx, rank));
-          auto ll = ttg::chooseScaledWmmaScaleLayout(&ctx, opIdx, shape,
-                                                     wmmaMDim, ctaLayout);
+          auto cgaLayout = buildCgaLayoutAttr(&ctx, cgaBases, rank);
+          auto ll = ttg::chooseScaledWmmaScaleLayout(
+              &ctx, opIdx, shape, wmmaMDim, ctaLayout, cgaLayout);
           auto attr = ttg::LinearEncodingAttr::get(&ctx, ll);
           return layoutToGluon(attr);
         });
