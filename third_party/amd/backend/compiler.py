@@ -290,6 +290,13 @@ class HIPBackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
+        # Consume tlx.warp_pipeline_stage border markers (rocdl.sched.barrier with
+        # triton.warp_pipeline.border / .priority attrs) for the TLX / triton.jit
+        # path. The gluon path runs this in gluon_to_ttgir; make_llir runs the
+        # conversion. Placed at the TTGIR stage (so it does not double-run for gluon
+        # kernels) and as the last pass before pm.run so the cleanup passes above do
+        # not strip the priority markers before the pipeliner consumes them.
+        amd.passes.ttgpuir.add_warp_pipeline(pm)
         pm.run(mod, 'make_ttgir')
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
