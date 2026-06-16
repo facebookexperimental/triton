@@ -99,6 +99,11 @@ void TaskIdBackwardPropagation::propagateToParent(Operation *op,
         ChangeResult changed = controlLattice->meet(taskId);
         propagateIfChanged(controlLattice, changed);
       }
+    } else if (auto whileOp = dyn_cast<scf::WhileOp>(parentOp)) {
+      auto condOp = whileOp.getConditionOp();
+      auto condLattice = getLatticeElement(condOp.getCondition());
+      ChangeResult changed = condLattice->meet(taskId);
+      propagateIfChanged(condLattice, changed);
     } else if (auto ifOp = dyn_cast<scf::IfOp>(parentOp)) {
       auto cond = ifOp.getCondition();
       auto condLattice = getLatticeElement(cond);
@@ -203,7 +208,22 @@ LogicalResult TaskIdBackwardPropagation::visitOperation(
 
 void TaskIdBackwardPropagation::visitBranchOperand(OpOperand &operand) {
   auto defOp = operand.getOwner();
-  assert(isa<scf::IfOp>(defOp) || isa<scf::ForOp>(defOp));
+  if (auto condOp = dyn_cast<scf::ConditionOp>(defOp)) {
+    auto whileOp = cast<scf::WhileOp>(condOp->getParentOp());
+    for (auto [idx, forwarded] : llvm::enumerate(condOp.getArgs())) {
+      if (forwarded != operand.get())
+        continue;
+      auto resultLattice = getLatticeElement(whileOp.getResult(idx));
+      if (resultLattice->getValue().isUninitialized())
+        return;
+      auto forwardedLattice = getLatticeElement(forwarded);
+      ChangeResult changed = forwardedLattice->meet(resultLattice->getValue());
+      propagateIfChanged(forwardedLattice, changed);
+      return;
+    }
+    return;
+  }
+  assert((isa<scf::IfOp, scf::ForOp, scf::WhileOp>(defOp)));
 
   SmallVector<TaskId> lattices(defOp->getNumResults(),
                                TaskId::getUninitialized());
@@ -224,6 +244,14 @@ void TaskIdBackwardPropagation::visitBranchOperand(OpOperand &operand) {
     propagateToYield(ifOp.thenYield(), lattices);
     if (!ifOp.getElseRegion().empty())
       propagateToYield(ifOp.elseYield(), lattices);
+  } else if (auto whileOp = dyn_cast<scf::WhileOp>(defOp)) {
+    auto condOp = whileOp.getConditionOp();
+    for (auto [lattice, forwarded] :
+         llvm::zip_equal(lattices, condOp.getArgs())) {
+      auto forwardedLattice = getLatticeElement(forwarded);
+      ChangeResult changed = forwardedLattice->meet(lattice);
+      propagateIfChanged(forwardedLattice, changed);
+    }
   } else {
     llvm_unreachable("Unknown branch operation");
   }

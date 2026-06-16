@@ -125,6 +125,16 @@ getOutOfScopeBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
   Operation *bbAargOwner = bbArg.getOwner()->getParentOp();
   if (auto forOp = dyn_cast<scf::ForOp>(bbAargOwner)) {
     accumCnt = forOp.getResult(bbArg.getArgNumber() - 1);
+  } else if (auto whileOp = dyn_cast<scf::WhileOp>(bbAargOwner)) {
+    if (bbArg.getOwner() == whileOp.getBeforeBody()) {
+      auto slot =
+          getLoopCarriedSlot(cast<LoopLikeOpInterface>(whileOp.getOperation()),
+                             bbArg.getArgNumber());
+      assert(slot.result && "expected accumCnt while arg to have a result");
+      accumCnt = slot.result;
+    } else {
+      accumCnt = whileOp.getResult(bbArg.getArgNumber());
+    }
   } else {
     llvm_unreachable("Unexpected block argument owner");
   }
@@ -146,9 +156,24 @@ void getTransitiveUsers(Value root,
     if (auto yieldOp = dyn_cast<scf::YieldOp>(userOp)) {
       for (OpOperand &operand : yieldOp->getOpOperands()) {
         if (operand.get() == root) {
-          auto result =
-              yieldOp->getParentOp()->getResult(operand.getOperandNumber());
-          getTransitiveUsers(result, users);
+          Operation *parentOp = yieldOp->getParentOp();
+          if (auto whileOp = dyn_cast<scf::WhileOp>(parentOp)) {
+            getTransitiveUsers(
+                whileOp.getBeforeArguments()[operand.getOperandNumber()],
+                users);
+          } else {
+            auto result = parentOp->getResult(operand.getOperandNumber());
+            getTransitiveUsers(result, users);
+          }
+        }
+      }
+    } else if (auto condOp = dyn_cast<scf::ConditionOp>(userOp)) {
+      auto whileOp = cast<scf::WhileOp>(condOp->getParentOp());
+      for (OpOperand &operand : condOp.getArgsMutable()) {
+        if (operand.get() == root) {
+          unsigned resultIdx = operand.getOperandNumber() - 1;
+          getTransitiveUsers(whileOp.getResult(resultIdx), users);
+          getTransitiveUsers(whileOp.getAfterArguments()[resultIdx], users);
         }
       }
     } else {
@@ -1175,7 +1200,7 @@ static std::pair<Value, Value> getBufferIdxAndPhaseForOutsideLoopOps(
       }
     }
 
-    auto parentLoop = opInsideLoop->getParentOfType<scf::ForOp>();
+    auto parentLoop = opInsideLoop->getParentOfType<LoopLikeOpInterface>();
     if (isPrologue) {
       // For prologue operations (initialization), use initial values
       // and place before the loop
@@ -1218,8 +1243,8 @@ static bool checkConsumersInLoops(Channel *channel) {
 
   // Special case when srcOp or dstOp is scf.for;
   // we need to check if operations inside the loop need sync
-  bool srcIsLoop = isa<scf::ForOp>(srcOp);
-  bool dstIsLoop = isa<scf::ForOp>(dstOp);
+  bool srcIsLoop = isa<LoopLikeOpInterface>(srcOp);
+  bool dstIsLoop = isa<LoopLikeOpInterface>(dstOp);
 
   if (srcIsLoop || dstIsLoop) {
     // When the channel endpoints are loop operations themselves,
@@ -1233,8 +1258,10 @@ static bool checkConsumersInLoops(Channel *channel) {
   }
 
   // Normal case: check if ops are outside loops
-  bool producerOutsideLoop = srcOp && !srcOp->getParentOfType<scf::ForOp>();
-  bool consumerOutsideLoop = dstOp && !dstOp->getParentOfType<scf::ForOp>();
+  bool producerOutsideLoop =
+      srcOp && !srcOp->getParentOfType<LoopLikeOpInterface>();
+  bool consumerOutsideLoop =
+      dstOp && !dstOp->getParentOfType<LoopLikeOpInterface>();
 
   // If both producer and consumer ops are outside loops, check if actual
   // consumers are inside loops. This handles both cases:
@@ -1266,7 +1293,7 @@ static bool checkConsumersInLoops(Channel *channel) {
           if (std::find(consumerTasks.begin(), consumerTasks.end(),
                         consumerTaskId) != consumerTasks.end()) {
             // Check if this consumer is inside a loop
-            if (consumer->getParentOfType<scf::ForOp>()) {
+            if (consumer->getParentOfType<LoopLikeOpInterface>()) {
               hasConsumersInLoops = true;
               LDBG("createToken: found consumer with task "
                    << consumerTaskId << " inside loop for channel "
@@ -4806,15 +4833,18 @@ public:
     // Set NameLoc("accum_cnt") on ForOp block arguments whose corresponding
     // yield operand already has an "accum_cnt" NameLoc. This must be done at
     // the end because earlier steps may replace ForOps and lose block arg locs.
-    funcOp.walk([&](scf::ForOp forOp) {
-      auto yieldOp = llvm::cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-      unsigned numIterArgs = forOp.getNumRegionIterArgs();
+    funcOp.walk([&](LoopLikeOpInterface loop) {
+      auto yieldOp = llvm::cast<scf::YieldOp>(
+          loop.getOperation()
+              ->getRegion(loop.getOperation()->getNumRegions() - 1)
+              .front()
+              .getTerminator());
+      unsigned numIterArgs = loop.getRegionIterArgs().size();
       for (unsigned i = 0; i < numIterArgs; ++i) {
         Value yieldVal = yieldOp.getOperand(i);
         if (auto nameLoc = llvm::dyn_cast<NameLoc>(yieldVal.getLoc())) {
           if (nameLoc.getName().getValue() == "accum_cnt") {
-            // The iter arg is block arg at index i+1 (skip induction var).
-            auto arg = forOp.getRegionIterArg(i);
+            auto arg = loop.getRegionIterArgs()[i];
             arg.setLoc(NameLoc::get(
                 StringAttr::get(funcOp.getContext(), "accum_cnt")));
           }

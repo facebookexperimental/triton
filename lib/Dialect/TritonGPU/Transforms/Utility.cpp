@@ -919,6 +919,10 @@ AppendedLoop appendLoopCarriedValues(OpBuilder &builder,
     newResultTypes.push_back(v.getType());
   scf::WhileOp newWhile =
       replaceWhileOpWithNewSignature(builder, whileOp, inits, newResultTypes);
+  // Save the caller from insertion point invalidation and match the scf.for
+  // helper's ownership contract: the returned loop replaces the original.
+  if (builder.getInsertionPoint() == whileOp->getIterator())
+    builder.setInsertionPoint(newWhile);
   // replaceWhileOpWithNewSignature creates the new "before"/"after" args and
   // results but leaves the spliced scf.condition / scf.yield with the old
   // operand counts. Extend scf.condition to forward the new "before" args so
@@ -934,6 +938,7 @@ AppendedLoop appendLoopCarriedValues(OpBuilder &builder,
     result.newResults.push_back(r);
   result.loop = cast<LoopLikeOpInterface>(newWhile.getOperation());
   result.backEdgeYield = newWhile.getYieldOp();
+  whileOp.erase();
   return result;
 }
 

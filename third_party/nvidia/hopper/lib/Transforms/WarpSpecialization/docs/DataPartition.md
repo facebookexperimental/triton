@@ -49,8 +49,8 @@ Before partitioning, ensures all ops in def-use chains carry correct
 
 - **Backward**: If an op uses a value defined by an `arith` op that lacks the
   consumer's task ID, propagate backward.
-- **Forward**: If a `YieldOp` or `IfOp` has a single-use operand whose
-  defining op has extra task IDs, propagate forward.
+- **Forward**: If a `YieldOp`, `ConditionOp`, `IfOp`, or `WhileOp` has a
+  single-use operand whose defining op has extra task IDs, propagate forward.
 
 Runs to a fixed point.
 
@@ -78,9 +78,10 @@ Traces the partition dimension backward and forward from the accumulator:
   produce scalar types.
 
 - **`getForwardSliceToPartition`**: From the accumulator, walks forward
-  through result users. Handles `YieldOp` (follow to loop result users),
-  `IfOp` (follow to if result), and tracks dimension remapping through
-  layout-changing ops.
+  through result users. Handles `YieldOp` (follow to `scf.for` / `scf.if`
+  results, or to the `scf.while` before-region backedge), `ConditionOp`
+  (follow to `scf.while` results and after-region arguments), and tracks
+  dimension remapping through layout-changing ops.
 
 ### Step 4: Rematerialization (`rewriteRematerializedOps`)
 
@@ -100,6 +101,11 @@ For each partition offset (0 to `numPartitions - 1`):
    `[1]` and one with `[2]`.
 3. Function arguments with `TensorDescType` have their block type sliced to
    match the partition factor.
+
+For `scf.while`, slicing may append extra loop-carried values. The new
+before-region argument is forwarded through `scf.condition` to create the
+matching while result and after-region argument, and the after-region
+`scf.yield` appends the sliced next-iteration value.
 
 ### Step 6: Cleanup (`doDeepCleanup`)
 
