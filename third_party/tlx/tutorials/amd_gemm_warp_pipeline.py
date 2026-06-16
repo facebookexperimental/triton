@@ -3,7 +3,7 @@ TLX warp-pipelined GEMM tutorial for AMD gfx950.
 
 Uses async_load with 3-buffer pipelining and computes offsets from tile_id
 (3 iter_args: acc, a_tile, b_tile). The main loop is split into "mfma" and
-"mem" warp-pipeline stages.
+"mem" warp-pipeline stages via ``tlx.warp_pipeline_stage``.
 
 Includes an XCD-aware PID remap (chunked) for L2 reuse across the 8 XCDs
 of MI300X-class chips.
@@ -13,7 +13,11 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
+# gfx950 has 8 XCDs per chip; chunked remap improves L2 reuse.
+# XCD_CHUNK=4 was empirically best for our 256x256 tiles at 4K-8K (per-XCD
+# group of 4 PIDs aligns with the GROUP_M=8 row partitioning).
+NUM_XCDS = 8
+XCD_CHUNK = 4
 
 
 @triton.jit
@@ -31,7 +35,7 @@ def chiplet_transform_chunked(pid, num_workgroups, num_xcds: tl.constexpr, chunk
 
 
 @triton.jit
-def gemm_wp(
+def matmul_kernel_warp_pipeline(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -52,6 +56,7 @@ def gemm_wp(
     NUM_XCDS: tl.constexpr,
     XCD_CHUNK: tl.constexpr,
 ):
+    """C = A @ B with async-loaded LDS buffers and explicit warp-pipeline stages."""
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
     tl.assume(stride_bn > 0)
@@ -142,18 +147,35 @@ def gemm_wp(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-# gfx950 has 8 XCDs per chip; chunked remap improves L2 reuse.
-# XCD_CHUNK=4 was empirically best for our 256x256 tiles at 4K-8K (per-XCD
-# group of 4 PIDs aligns with the GROUP_M=8 row partitioning).
-NUM_XCDS = 8
-XCD_CHUNK = 4
-
-
-def run(a, b, c, bm, bn, bk, nb, nw, gm):
+def matmul(a: torch.Tensor, b: torch.Tensor, config=None) -> torch.Tensor:
+    """C = A @ B using a warp-pipelined kernel on AMD gfx950."""
+    if config is None:
+        config = {
+            "BLOCK_M": 256,
+            "BLOCK_N": 256,
+            "BLOCK_K": 32,
+            "GROUP_M": 8,
+            "NUM_BUFFERS": 3,
+            "num_warps": 8,
+        }
+    assert a.is_contiguous() and b.is_contiguous(), "A and B must be contiguous"
+    assert a.dtype == b.dtype, "A and B must have the same dtype"
     M, K = a.shape
-    _, N = b.shape
-    grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn), )
-    gemm_wp[grid](
+    Kb, N = b.shape
+    assert K == Kb, f"K mismatch: A={a.shape}, B={b.shape}"
+
+    BLOCK_M = config["BLOCK_M"]
+    BLOCK_N = config["BLOCK_N"]
+    BLOCK_K = config["BLOCK_K"]
+    GROUP_M = config.get("GROUP_M", 8)
+    NUM_BUFFERS = config.get("NUM_BUFFERS", 3)
+    num_warps = config.get("num_warps", 8)
+    assert M % BLOCK_M == 0 and N % BLOCK_N == 0 and K % BLOCK_K == 0, \
+        "M, N, K must be multiples of their block sizes"
+
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), )
+    matmul_kernel_warp_pipeline[grid](
         a,
         b,
         c,
@@ -166,56 +188,16 @@ def run(a, b, c, bm, bn, bk, nb, nw, gm):
         b.stride(1),
         c.stride(0),
         c.stride(1),
-        BLOCK_M=bm,
-        BLOCK_N=bn,
-        BLOCK_K=bk,
-        GROUP_M=gm,
-        NUM_BUFFERS=nb,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        GROUP_M=GROUP_M,
+        NUM_BUFFERS=NUM_BUFFERS,
         NUM_XCDS=NUM_XCDS,
         XCD_CHUNK=XCD_CHUNK,
-        num_warps=nw,
+        # Warp pipelining requires the auto software pipeliner to bail, which it
+        # does for num_stages <= 1 (the explicit stages do the pipelining).
+        num_warps=num_warps,
         num_stages=1,
     )
     return c
-
-
-if __name__ == "__main__":
-    tflops = lambda ms, M, N, K: 2 * M * N * K * 1e-12 / (ms * 1e-3)
-
-    configs = [
-        ("256x256x32 nw8 gm8", 256, 256, 32, 3, 8, 8),
-        ("256x256x32 nw8 gm16", 256, 256, 32, 3, 8, 16),
-        ("256x128x32 nw8 gm8", 256, 128, 32, 3, 8, 8),
-        ("128x256x32 nw8 gm8", 128, 256, 32, 3, 8, 8),
-        ("256x256x32 nw4 gm8", 256, 256, 32, 3, 4, 8),
-        ("128x128x32 nw8 gm8", 128, 128, 32, 3, 8, 8),
-    ]
-
-    for size in [4096, 8192]:
-        M = N = K = size
-        torch.manual_seed(42)
-        a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
-        b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
-        ref = torch.matmul(a, b)
-        c = torch.empty((M, N), device=DEVICE, dtype=torch.float16)
-
-        print(f"\n{'='*70}")
-        print(f"  M=N=K={size}")
-        print(f"{'='*70}")
-        ms = triton.testing.do_bench(lambda: torch.matmul(a, b), rep=200)
-        print(f"  {'rocBLAS':<32s} {tflops(ms,M,N,K):7.1f} TFLOPS ({ms:.3f} ms)")
-
-        for name, bm, bn, bk, nb, nw, gm in configs:
-            lds_kb = (bm * bk + bk * bn) * 2 * nb / 1024
-            if lds_kb > 160:
-                print(f"  {name:<32s} {'SKIP':>7s} (LDS={lds_kb:.0f}KB)")
-                continue
-            try:
-                run(a, b, c, bm, bn, bk, nb, nw, gm)
-                torch.testing.assert_close(c, ref, rtol=1e-2, atol=1e-2)
-                ok = "OK"
-            except Exception:
-                ok = "FAIL"
-            ms = triton.testing.do_bench(
-                lambda bm=bm, bn=bn, bk=bk, nb=nb, nw=nw, gm=gm: run(a, b, c, bm, bn, bk, nb, nw, gm), rep=200)
-            print(f"  {name:<32s} {tflops(ms,M,N,K):7.1f} TFLOPS ({ms:.3f} ms) [{ok}]")
