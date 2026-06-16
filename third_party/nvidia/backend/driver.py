@@ -1,3 +1,4 @@
+import ast
 import functools
 import os
 import subprocess
@@ -129,6 +130,37 @@ def ty_to_cpp(ty):
     }[ty]
 
 
+def _flatten_schema_arg_type(ty, out):
+    """Flatten a schema arg ``type`` into the launcher-ABI scalar leaves.
+
+    A tuple-typed kernel argument is serialized in the Level 0 schema as a
+    stringified Python tuple, e.g. ``"('i32', 'constexpr')"``, ``"()"`` or
+    ``"(('constexpr',), ('i32',))"``. The variadic launcher
+    (``build_signature_metadata``) consumes only the flattened, non-constexpr
+    scalar leaves, mirroring ``make_kernel_signature``'s ``_flatten_signature``
+    plus the ``constexpr`` drop. Non-tuple types pass through unchanged; a type
+    that looks like a tuple but doesn't parse is left as-is so the launcher's
+    existing "Unknown data type" error still surfaces it.
+    """
+    if not ty.startswith("("):
+        out.append(ty)
+        return
+    try:
+        parsed = ast.literal_eval(ty)
+    except (ValueError, SyntaxError):
+        out.append(ty)
+        return
+
+    def _walk(node):
+        if isinstance(node, tuple):
+            for x in node:
+                _walk(x)
+        elif node != "constexpr":
+            out.append(node)
+
+    _walk(parsed)
+
+
 def build_kernel_signature_from_schema(schema):
     """Derive kernel_signature bytes from Level 0 schema args array.
 
@@ -143,7 +175,7 @@ def build_kernel_signature_from_schema(schema):
     for arg in schema["args"]:
         ty = arg["type"]
         if ty.startswith("tensordesc"):
-            meta = tensordesc_meta[tensordesc_idx] if tensordesc_idx < len(tensordesc_meta) else None
+            meta = (tensordesc_meta[tensordesc_idx] if tensordesc_idx < len(tensordesc_meta) else None)
             tensordesc_idx += 1
 
             match = re.match(r"tensordesc<([^[>]*)\[([^]]*)\]", ty)
@@ -153,9 +185,13 @@ def build_kernel_signature_from_schema(schema):
 
             if meta is None:
                 # Host TMA path: base pointer + shape + strides + padding flag
+                # + round_f32_to_tf32 flag. Must mirror expand_signature()'s host
+                # TMA path (two i1 flags) and make_tensordesc_arg()'s arg layout
+                # (arg.padding == "nan", arg.round_f32_to_tf32); see PR #9295.
                 flat_types.append("*" + dtype)
                 for _ in range(2 * ndim):
                     flat_types.append("i64")
+                flat_types.append("i1")
                 flat_types.append("i1")
             else:
                 # Device TMA path: nvTmaDesc
@@ -166,7 +202,7 @@ def build_kernel_signature_from_schema(schema):
             for _ in range(ndim):
                 flat_types.append("i64")
         else:
-            flat_types.append(ty)
+            _flatten_schema_arg_type(ty, flat_types)
 
     return triton.runtime.driver.active.utils.build_signature_metadata(flat_types)
 
@@ -196,6 +232,7 @@ def expand_signature(signature, tensordesc_meta):
                 # we have to pass the shape and strides twice.
                 for _ in range(2 * ndim):
                     output.append("i64")
+                output.append("i1")
                 output.append("i1")
             else:
                 output.append("nvTmaDesc")
@@ -254,6 +291,7 @@ TMA_DTYPE_DEVICE_TO_HOST = dict((i, i) for i in range(16))
 TMA_DTYPE_DEVICE_TO_HOST[8] = 10
 TMA_DTYPE_DEVICE_TO_HOST[9] = 8
 TMA_DTYPE_DEVICE_TO_HOST[10] = 9
+TMA_TF32 = 11
 
 
 class TmaDescKernelParam:
@@ -277,7 +315,15 @@ def make_tensordesc_arg(arg, metadata):
         # descriptors which is why we provide our own decomposition
         # above. Sadly this means we have to pass the shape and strides
         # twice.
-        return [arg.base, *arg.shape, *arg.strides, arg.padding == "nan", *arg.shape, *arg.strides]
+        return [
+            arg.base,
+            *arg.shape,
+            *arg.strides,
+            arg.padding == "nan",
+            arg.round_f32_to_tf32,
+            *arg.shape,
+            *arg.strides,
+        ]
 
     swizzle = metadata["swizzle"]
     elem_size = metadata["elem_size"]
@@ -297,10 +343,13 @@ def make_tensordesc_arg(arg, metadata):
     else:
         expanded_shape = shape
 
+    if arg.round_f32_to_tf32:
+        elem_type = TMA_TF32
+
     if is_im2col:
         # Im2col mode - use im2col descriptor fill function
         # block_size from metadata is [pixelsPerColumn, channelsPerPixel] (possibly clamped)
-        element_strides = arg.element_strides if arg.element_strides is not None else [1] * len(shape)
+        element_strides = (arg.element_strides if arg.element_strides is not None else [1] * len(shape))
         cu_tensor_map = triton.runtime.driver.active.utils.fill_tma_descriptor_im2col(
             arg.base.data_ptr(),
             swizzle,
@@ -370,6 +419,7 @@ class CudaLauncher(object):
 
         # Compute Level 0 schema — the canonical ABI description for this kernel.
         from triton.compiler.compiler import make_backend
+
         backend = make_backend(metadata.target)
         schema = backend.make_launch_metadata(metadata._asdict(), src)
 
@@ -402,8 +452,19 @@ class CudaLauncher(object):
         else:
             self.num_ctas = metadata.num_ctas
 
-    def __call__(self, gridX, gridY, gridZ, stream, function, kernel_metadata, launch_metadata, launch_enter_hook,
-                 launch_exit_hook, *args):
+    def __call__(
+        self,
+        gridX,
+        gridY,
+        gridZ,
+        stream,
+        function,
+        kernel_metadata,
+        launch_metadata,
+        launch_enter_hook,
+        launch_exit_hook,
+        *args,
+    ):
 
         def allocate_scratch(size, align, allocator):
             if size > 0:
@@ -414,12 +475,30 @@ class CudaLauncher(object):
             return None
 
         global_scratch = allocate_scratch(self.global_scratch_size, self.global_scratch_align, _allocation._allocator)
-        profile_scratch = allocate_scratch(self.profile_scratch_size, self.profile_scratch_align,
-                                           _allocation._profile_allocator)
+        profile_scratch = allocate_scratch(
+            self.profile_scratch_size,
+            self.profile_scratch_align,
+            _allocation._profile_allocator,
+        )
 
-        self.launch(gridX, gridY, gridZ, stream, function, self.launch_cooperative_grid, self.launch_pdl,
-                    kernel_metadata, launch_metadata, launch_enter_hook, launch_exit_hook, global_scratch,
-                    profile_scratch, self.arg_annotations, self.kernel_signature, args)
+        self.launch(
+            gridX,
+            gridY,
+            gridZ,
+            stream,
+            function,
+            self.launch_cooperative_grid,
+            self.launch_pdl,
+            kernel_metadata,
+            launch_metadata,
+            launch_enter_hook,
+            launch_exit_hook,
+            global_scratch,
+            profile_scratch,
+            self.arg_annotations,
+            self.kernel_signature,
+            args,
+        )
 
 
 class CudaDriver(GPUDriver):

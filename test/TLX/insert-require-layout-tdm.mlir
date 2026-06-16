@@ -11,14 +11,14 @@
 // For block_shape [128, 32] fp16: pad_interval=32, pad_amount=128/16=8.
 // =============================================================================
 
-// CHECK-DAG: #[[PADDED32:.*]] = #ttg.padded_shared<[32:+8] {order = [1, 0], shape = [128, 32]}>
+// CHECK-DAG: #[[$PADDED32:.*]] = #ttg.padded_shared<[32:+8] {order = [1, 0], shape = [128, 32]}>
 
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
 
 module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @tdm_no_consumer
-  // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<128x32xf16, #[[PADDED32]], #smem, mutable>
+  // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<128x32xf16, #[[$PADDED32]], #smem, mutable>
   // CHECK-NEXT: amdg.async_tdm_copy_global_to_local
   tt.func public @tdm_no_consumer(%desc: !tt.tensordesc<tensor<128x32xf16, #shared>>, %m: i32, %k: i32, %p: i32) {
     %c0 = arith.constant 0 : i32
@@ -34,7 +34,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 // 2. TDM copy + plain local_load (no dot consumer). Default fallback fires.
 // =============================================================================
 
-// CHECK-DAG: #[[PADDED32:.*]] = #ttg.padded_shared<[32:+8] {order = [1, 0], shape = [128, 32]}>
+// CHECK-DAG: #[[$PADDED32:.*]] = #ttg.padded_shared<[32:+8] {order = [1, 0], shape = [128, 32]}>
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
@@ -42,7 +42,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 
 module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @tdm_local_load_no_dot
-  // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<128x32xf16, #[[PADDED32]], #smem, mutable>
+  // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<128x32xf16, #[[$PADDED32]], #smem, mutable>
   // CHECK-NEXT: amdg.async_tdm_copy_global_to_local
   tt.func public @tdm_local_load_no_dot(%desc: !tt.tensordesc<tensor<128x32xf16, #shared>>, %m: i32, %k: i32, %p: i32) {
     %c0 = arith.constant 0 : i32
@@ -108,14 +108,14 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 // 5. bf16 default fallback: pad_amount = 128 / 16 = 8.
 // =============================================================================
 
-// CHECK-DAG: #[[PADDED32BF16:.*]] = #ttg.padded_shared<[32:+8] {order = [1, 0], shape = [128, 32]}>
+// CHECK-DAG: #[[$PADDED32BF16:.*]] = #ttg.padded_shared<[32:+8] {order = [1, 0], shape = [128, 32]}>
 
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
 
 module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @tdm_bf16_default
-  // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<128x32xbf16, #[[PADDED32BF16]], #smem, mutable>
+  // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<128x32xbf16, #[[$PADDED32BF16]], #smem, mutable>
   tt.func public @tdm_bf16_default(%desc: !tt.tensordesc<tensor<128x32xbf16, #shared>>, %m: i32, %k: i32, %p: i32) {
     %c0 = arith.constant 0 : i32
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xbf16, #shared, #smem, mutable>
@@ -130,14 +130,14 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 // 6. fp32 default fallback: pad_amount = 128 / 32 = 4.
 // =============================================================================
 
-// CHECK-DAG: #[[PADDED32FP32:.*]] = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [128, 32]}>
+// CHECK-DAG: #[[$PADDED32FP32:.*]] = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [128, 32]}>
 
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
 
 module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @tdm_fp32_default
-  // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<128x32xf32, #[[PADDED32FP32]], #smem, mutable>
+  // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<128x32xf32, #[[$PADDED32FP32]], #smem, mutable>
   tt.func public @tdm_fp32_default(%desc: !tt.tensordesc<tensor<128x32xf32, #shared>>, %m: i32, %k: i32, %p: i32) {
     %c0 = arith.constant 0 : i32
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf32, #shared, #smem, mutable>

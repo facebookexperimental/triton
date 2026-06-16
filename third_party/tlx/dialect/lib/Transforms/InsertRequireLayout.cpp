@@ -227,8 +227,9 @@ public:
     poisonUnhandledCase(operand);
   }
 
-  void visitNonControlFlowArguments(RegionSuccessor &successor,
-                                    ArrayRef<BlockArgument> arguments) {}
+  void
+  visitNonControlFlowArguments(RegionSuccessor &successor,
+                               ArrayRef<BlockArgument> arguments) override {}
   void setToExitState(DotRewriteLattice *lattice) override {}
 
 private:
@@ -594,7 +595,7 @@ public:
   void visitCallOperand(OpOperand &) override {}
   void setToExitState(DotConsumerLattice *) override {}
   void visitNonControlFlowArguments(RegionSuccessor &,
-                                    ArrayRef<BlockArgument>) {}
+                                    ArrayRef<BlockArgument>) override {}
 };
 
 } // namespace
