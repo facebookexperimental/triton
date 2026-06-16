@@ -110,6 +110,17 @@ def build_missing_junit_item(missing_paths, workflow, job):
     }
 
 
+def build_bucket_item(bucket, workflow, job):
+    """Build a stable job-level fallback item when the job failed but no test failures can be parsed."""
+    return {
+        "normalized_failure_id": bucket,
+        "raw_failure_ids": "",
+        "issue_title": f"[nightly] {workflow} / {job} / {bucket}",
+        "job_name": job,
+        "summary": "Job failed but no test failures could be parsed (see run log).",
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--junit", nargs="+", required=True, help="JUnit XML file(s)")
@@ -118,12 +129,27 @@ def main():
     parser.add_argument(
         "--output-name", default="failures", help="GITHUB_OUTPUT key to write"
     )
+    parser.add_argument(
+        "--failed",
+        action="store_true",
+        help=(
+            "Explicitly signal that the job/step failed; emit a fallback item "
+            "if no test failures can be parsed from JUnit XML."
+        ),
+    )
+    parser.add_argument(
+        "--bucket",
+        default="job-failed-no-parseable-failures",
+        help="Stable bucket id for the fallback item emitted when --failed is set.",
+    )
     args = parser.parse_args()
 
     failures, missing_paths = collect_failures(args.junit)
     items = build_items(failures, args.workflow, args.job)
     if not items and missing_paths:
         items.append(build_missing_junit_item(missing_paths, args.workflow, args.job))
+    if not items and args.failed:
+        items.append(build_bucket_item(args.bucket, args.workflow, args.job))
     payload = json.dumps(items)
 
     # TODO(scuba): in a follow-up, also emit a metrics row per failure

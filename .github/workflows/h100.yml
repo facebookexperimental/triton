@@ -100,11 +100,13 @@ jobs:
           uv pip install --no-build-isolation --no-deps "git+https://github.com/pytorch/ao.git"
           python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
       - name: Run TLX unit tests
+        id: run_unit_tests
         timeout-minutes: 5
         run: |
           . "${SETUP_SCRIPT}"
           python -m pytest python/test/unit/language/test_tlx_*.py -v --junitxml=/tmp/tlx-unit.xml
       - name: Run TLX tutorial correctness tests
+        id: run_correctness_tests
         timeout-minutes: 5
         run: |
           . "${SETUP_SCRIPT}"
@@ -114,10 +116,15 @@ jobs:
         if: always() && github.event_name == 'schedule'
         run: |
           . "${SETUP_SCRIPT}"
+          FAILED_FLAG=""
+          if [[ "${{ steps.run_unit_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" ]]; then
+            FAILED_FLAG="--failed --bucket h100-tlx-job-failed"
+          fi
           python3 .github/scripts/parse_junit_failures.py \
             --junit /tmp/tlx-unit.xml /tmp/tlx-correctness.xml \
             --workflow "${GITHUB_WORKFLOW}" \
-            --job "h100-tlx-test"
+            --job "h100-tlx-test" \
+            ${FAILED_FLAG}
 
   # ----- Nightly issue filing (schedule only) -----
   report-h100-tritonbench:
