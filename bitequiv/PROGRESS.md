@@ -14,15 +14,10 @@ meta:
 
 ## READ-FIRST (load these before working)
 - bitequiv/CLAUDE.md — project guide (goals, milestones, guardrails, conventions)
-- bitequiv/knowledge-base/starter-task-overview.md — current milestone: goal + T1-T4 + code anchors
-- bitequiv/knowledge-base/starter-task-codebase-map.md — every file to understand for T1-T4, tiered
-- bitequiv/knowledge-base/bitwise-equivalence-autotuning-foundations.md — why+architecture
-- bitequiv/knowledge-base/bitwise-equivalence-workplace-posts.md — 4 foundational internal posts (Nick/Paul/Jason/Lazos)
-- bitequiv/knowledge-base/tree-reduction-in-ptx-and-triton.md — the FP/tree mechanism
-- bitequiv/knowledge-base/ttgir-level-optimizations.md — ramp: what TTGIR optimizes (layout assignment + convert_layout elimination; matmul/pipelining/WS); annotated make_ttgir pass order
-- bitequiv/knowledge-base/equivalence-check-level-ttgir-vs-ptx.md — DECISION: check at TTGIR (primary) vs PTX (backstop); PTX difficulty; NVIDIA tooling; M1 codebase anchors
-- bitequiv/knowledge-base/ai-workflow.md — how to maintain docs + git
-- latest file in bitequiv/knowledge-base/claude-chatting/ — most recent session
+- NOTE: the knowledge-base/ teaching docs (foundations, tree-reduction, ttgir-level
+  optimizations, equivalence-check-level decision, starter-task overview + codebase-map,
+  ai-workflow, claude-chatting summaries) and the M1 design doc are not checked into this
+  starter branch — they live on the `youngzt/bitequiv-m1` branch.
 
 ## MILESTONE STATUS
 - [WIP]  Starter (Wk1-2): autotune IR/PTX pruning + 10-15 example kernels (runtime correctness hook DROPPED in review refactor — equivalence is proven statically from IR, not by output comparison)

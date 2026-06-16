@@ -269,10 +269,9 @@ class Autotuner(KernelInterface):
 
                 This is the single IR-based pruning hook. Static bitwise-equivalence pruning (keep
                 only configs whose compiled IR matches a reference order, at TTGIR and/or PTX level)
-                is built on top of it: see `bitequiv.equivalence.ir_based_prune_configs` and
-                `reduction_equivalence_prune`, which adapt a per-config equivalence *key* into an
-                `ir_config_prune` predicate. Triton core stays decoupled — those checkers live
-                in `bitequiv`, not here.
+                can be layered on top of it by adapting a per-config equivalence *key* into an
+                `ir_config_prune` predicate. Triton core stays decoupled — such equivalence
+                checkers live outside core, not here.
         """
         if not configs:
             self.configs = [Config({}, num_warps=4, num_stages=3, num_ctas=1)]
@@ -332,12 +331,9 @@ class Autotuner(KernelInterface):
             self.ir_config_prune = prune_configs_by.get("ir_config_prune", self.ir_config_prune)
 
         # {Config: reason} for configs dropped by ir_config_prune (IR-based pruning, incl.
-        # static bitwise-equivalence pruning built on top of it in bitequiv).
+        # static bitwise-equivalence pruning built on top of it in bitequiv). The number of
+        # configs pruned on the last tuning run is `len(<autotuned_kernel>.pruned_by_ir)`.
         self.pruned_by_ir: Dict[Config, str] = {}
-        # Fraction of evaluated configs that passed `ir_config_prune` on the last tuning run
-        # (kept / evaluated). None when the hook is unused or no config was evaluable. Inspect
-        # after run() as `<autotuned_kernel>.ir_prune_success_rate`.
-        self.ir_prune_success_rate: Optional[float] = None
         # The CompiledKernel produced by the most recent `_bench` launch, captured so the
         # post-bench IR prune can inspect each config's artifact without recompiling.
         self._last_compiled_kernel = None
@@ -853,11 +849,10 @@ class Autotuner(KernelInterface):
         reference config (by default the first surviving config) — so equivalence-style checks can
         compare each config against a fixed reference instead of relying on call order.
 
-        Records ``self.ir_prune_success_rate`` = kept / evaluated (the fraction of evaluated
-        configs that passed the IR check), inspectable on the autotuned kernel after run().
+        The pruned configs are recorded in ``self.pruned_by_ir``; the prune count for the run is
+        ``len(self.pruned_by_ir)``.
         """
         self.pruned_by_ir = {}
-        self.ir_prune_success_rate = None
         prune = self.ir_config_prune
         inf = float("inf")
         # Only configs that compiled and timed finitely have an artifact worth checking.
@@ -881,8 +876,6 @@ class Autotuner(KernelInterface):
             if not keep:
                 timings[config] = [inf, inf, inf]  # mark invalid so it can't be selected
                 self.pruned_by_ir[config] = "ir-prune"
-        # Success rate: fraction of evaluated configs that passed the IR check (kept / evaluated).
-        self.ir_prune_success_rate = (len(items) - len(self.pruned_by_ir)) / len(items)
         if all(t[0] == inf for t in timings.values()):
             raise AutotunerError("No valid autotuner configs after IR pruning. "
                                  "`ir_config_prune` should keep at least one config.")
@@ -894,10 +887,6 @@ class Autotuner(KernelInterface):
             if not pruned_configs:
                 raise AutotunerError(
                     "No valid autotuner configs after pruning. `early_config_prune` should return at least one config.")
-        # IR-based pruning (ir_config_prune) is NOT done here: it runs after benchmarking in
-        # `_ir_prune_after_bench`, reusing each config's already-compiled artifact (no extra
-        # compile) and pruning by marking the timing invalid. Static bitwise-equivalence pruning
-        # is layered on that hook in bitequiv.
         if self.perf_model:
             top_k = self.configs_top_k
             if isinstance(top_k, float) and top_k <= 1.0:

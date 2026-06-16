@@ -4,8 +4,8 @@ The autotuner exposes a single IR-based pruning hook,
 ``prune_configs_by={"ir_config_prune": ...}``: it runs *after* each config is
 benchmarked, reusing the CompiledKernel the benchmark already produced (no extra
 compilation), inspects its TTGIR/PTX, and prunes a rejected config by marking its
-timing invalid. Static bitwise-equivalence pruning is layered on this hook in
-``bitequiv`` and is unit-tested there (``bitequiv/tests/test_equivalence.py``).
+timing invalid. Static bitwise-equivalence pruning is layered on this hook in the
+``bitequiv`` project and is unit-tested there.
 
 The hook is a **general IR filter** — it prunes by any spec in the compiled IR, not just
 bitwise equivalence. This file has two layers:
@@ -21,9 +21,7 @@ bitwise equivalence. This file has two layers:
   - ``test_gpu_autows_keeps_warp_specialized`` — same idea on a persistent matmul (Blackwell),
   - ``test_gpu_tmem_load_ir_prune`` — TTGIR op drop (Blackwell).
 
-The equivalence *use* of the same hook is tested in ``bitequiv`` (it lives on
-``bitequiv.equivalence``): ``bitequiv/tests/test_constraint_pruning.py`` (end-to-end) and
-``bitequiv/tests/test_equivalence.py`` (unit).
+The equivalence *use* of the same hook is tested in the ``bitequiv`` project, not here.
 """
 import pytest
 import torch
@@ -172,26 +170,25 @@ def test_no_hooks_is_unchanged_behavior():
     tuner, _ = _make_tuner(_configs())
     tuner.run(dst, src, N=N, grid=(1, ))
     assert _bs(tuner) == 256  # globally fastest, nothing pruned
-    assert tuner.pruned_by_ir == {}
-    assert tuner.ir_prune_success_rate is None  # hook unused -> never set
+    assert tuner.pruned_by_ir == {}  # hook unused -> nothing pruned
 
 
-def test_ir_prune_success_rate():
-    """After IR pruning, the kept fraction is stored on `ir_prune_success_rate`."""
+def test_ir_prune_count():
+    """After IR pruning, the number of dropped configs is reflected in `pruned_by_ir`."""
     N = 1024
     src = torch.arange(N, dtype=torch.float32)
     dst = torch.empty(N, dtype=torch.float32)
 
-    # Keep only BLOCK_SIZE=1024 -> 1 of 4 configs survive -> 25%.
+    # Keep only BLOCK_SIZE=1024 -> 1 of 4 configs survive -> 3 pruned.
     tuner, _ = _make_tuner(_configs(),
                            prune_configs_by={"ir_config_prune": lambda c, asm, md: "tensor<1024xf32>" in asm["ttgir"]})
     tuner.run(dst, src, N=N, grid=(1, ))
-    assert tuner.ir_prune_success_rate == 0.25
+    assert len(tuner.pruned_by_ir) == 3
 
-    # Keep everything -> 100%.
+    # Keep everything -> 0 pruned.
     tuner2, _ = _make_tuner(_configs(), prune_configs_by={"ir_config_prune": lambda c, asm, md: True})
     tuner2.run(dst, src, N=N, grid=(1, ))
-    assert tuner2.ir_prune_success_rate == 1.0
+    assert len(tuner2.pruned_by_ir) == 0
 
 
 # ---------------------------------------------------------------------------
