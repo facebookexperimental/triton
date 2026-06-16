@@ -85,7 +85,8 @@ A simpler approach using backward slicing from dot/MMA ops. Used on Hopper.
 
 ### Algorithm
 
-1. Collect all `scf::ForOp` loops, `WarpGroupDotOp`, load ops, and store ops.
+1. Collect all loop-like ops (`scf::ForOp`, `scf::WhileOp`), `WarpGroupDotOp`,
+   load ops, and store ops.
 2. For each dot, compute the backward slice of operands A and B.
 3. Any `DescriptorLoadOp`, `DescriptorGatherOp`, or expensive `LoadOp` in the
    backward slice is a **producer** (task ID 0).

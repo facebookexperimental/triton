@@ -129,6 +129,10 @@ When a `TensorDescType` function argument feeds a partitioned op, its block
 type is sliced. The `funcArgPartitionDims` map tracks which arguments need
 slicing and along which dimension.
 
+If a `TensorDescType` function argument is also used as a loop init value, the
+pass currently bails out. Updating both the function signature and the loop
+carried argument/result types consistently requires additional handling.
+
 ### Interaction with Task IDs
 
 Data partitioning operates **after** task ID assignment. The offset parameter
