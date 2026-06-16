@@ -139,16 +139,28 @@ def _compute_offsets(
 
 
 @triton.jit
-def _mask_scalar(qk, col_limit_right, s, i):
-    col_lim_right_s = col_limit_right - s
-    col_lim_right_cur = max(col_lim_right_s, 0)
-    mask = -1 << col_lim_right_cur
-    mask_i_bit = (mask & (1 << i)) == 0
-    return tl.where(mask_i_bit, qk, -float("inf"))
+def _mask_scalar(qk, col_limit, s, i, keep_ge: tl.constexpr):
+    # Bitmask for a block of 16 elements: bit i is set iff column (s + i) >= col_limit.
+    cur = max(col_limit - s, 0)
+    bit = (-1 << cur) & (1 << i)
+    # keep_ge=True keeps columns >= col_limit (left limit); keep_ge=False keeps
+    # columns < col_limit (right limit).
+    keep = (bit != 0) if keep_ge else (bit == 0)
+    return tl.where(keep, qk, -float("inf"))
 
 
 @triton.jit
-def _apply_causal_mask(qk, col_limit_right, BLOCK_N: tl.constexpr):
+def _mask_scalar_right(qk, col_limit, s, i):
+    return _mask_scalar(qk, col_limit, s, i, False)
+
+
+@triton.jit
+def _mask_scalar_left(qk, col_limit, s, i):
+    return _mask_scalar(qk, col_limit, s, i, True)
+
+
+@triton.jit
+def _apply_causal_mask(qk, col_limit, BLOCK: tl.constexpr, keep_ge: tl.constexpr = False):
     # Apply causal mask via a bitmask calculated for each block of 16 elements.
     # This allows the efficient R2P (register to predicate) instruction to be used at the SASS level.
     # Credit to Tri Dao,
@@ -156,10 +168,16 @@ def _apply_causal_mask(qk, col_limit_right, BLOCK_N: tl.constexpr):
     #
     # NOTE: We use map_elementwise here in order to generate an interleaved sequence of instructions
     # that processes one element of qk at a time. This improves ptxas's resulting SASS.
-    offs_n = tl.arange(0, BLOCK_N)[None, :]
-    s = offs_n & ~0xF
-    i = offs_n & 0xF
-    return tl.map_elementwise(_mask_scalar, qk, col_limit_right, s, i)
+    #
+    # keep_ge=False: qk is [..., N], keep keys < col_limit (forward, right limit).
+    # keep_ge=True: qk is transposed [..., M], keep queries >= col_limit
+    # (backward, left limit).
+    offs = tl.arange(0, BLOCK)[None, :]
+    s = offs & ~0xF
+    i = offs & 0xF
+    if keep_ge:
+        return tl.map_elementwise(_mask_scalar_left, qk, col_limit, s, i)
+    return tl.map_elementwise(_mask_scalar_right, qk, col_limit, s, i)
 
 
 @triton.jit
@@ -1951,13 +1969,17 @@ def _bwd_compute_inner_loop(
         tlx.barrier_wait(qk_fulls[tmem_buf_id], tmem_phase)
         tlx.barrier_wait(m_fulls[m_buf_id], m_phase)
 
-        offs_m = curr_m + tl.arange(0, BLOCK_M1)
         qkT = tlx.local_load(qk_tiles[tmem_buf_id])
         m = tlx.local_load(sM_tiles[m_buf_id])
-        pT = tl.math.exp2(_sub_f32x2(qkT, m[None, :]))
+        # qkT/pT are transposed: [BLOCK_N1 (keys), BLOCK_M1 (queries)]. Apply the
+        # causal mask to the logits via the R2P bitmask helper (keep query-cols
+        # m >= key-row n), then exp2 (exp2(-inf) = 0), avoiding the per-element
+        # ISETP arithmetic of `offs_m >= offs_n`.
+        sT = _sub_f32x2(qkT, m[None, :])
         if STAGE == 1:
-            mask = offs_m[None, :] >= offs_n[:, None]
-            pT = tl.where(mask, pT, 0.0)
+            col_limit_left = (offs_n - curr_m)[:, None]
+            sT = _apply_causal_mask(sT, col_limit_left, BLOCK_M1, keep_ge=True)
+        pT = tl.math.exp2(sT)
 
         # Store P to TMEM.
         ppT = pT.to(do_out_dtype)
