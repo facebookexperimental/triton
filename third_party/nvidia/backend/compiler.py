@@ -156,10 +156,14 @@ class CUDAOptions:
     maxnreg: Optional[int] = None
     cluster_dims: tuple = (1, 1, 1)
     ctas_per_cga: Optional[tuple] = None  # Alias for cluster_dims with CUDA semantics
-    preferred_ctas_per_cga: Optional[tuple] = None  # Hint for preferred cluster size (CUDA 12.8+)
+    preferred_ctas_per_cga: Optional[tuple] = (
+        None  # Hint for preferred cluster size (CUDA 12.8+)
+    )
     ptx_version: int = None
     ptx_options: Optional[str] = knobs.nvidia.ptxas_options
-    ir_override: Optional[str] = None  # filename of a user-defined IR (*.{ttir|ttgir|llir|ptx})
+    ir_override: Optional[str] = (
+        None  # filename of a user-defined IR (*.{ttir|ttgir|llir|ptx})
+    )
     enable_fp_fusion: bool = True
     enable_reflect_ftz: bool = True  # ftz in libdevice
     launch_cooperative_grid: bool = False
@@ -168,7 +172,13 @@ class CUDAOptions:
     supported_fp8_dtypes: Tuple[str] = ("fp8e5", "fp8e4b15")
     deprecated_fp8_dot_operand_dtypes: Tuple[str] = ()
     default_dot_input_precision: str = "tf32"
-    allowed_dot_input_precisions: Tuple[str] = ("tf32", "tf32x3", "ieee", "bf16x3", "bf16x6")
+    allowed_dot_input_precisions: Tuple[str] = (
+        "tf32",
+        "tf32x3",
+        "ieee",
+        "bf16x3",
+        "bf16x6",
+    )
     max_num_imprecise_acc_default: bool = None
     extern_libs: dict = None
     debug: bool = False
@@ -186,7 +196,7 @@ class CUDAOptions:
             extern_libs["libdevice"] = knobs.nvidia.libdevice_path or str(default_libdir / "libdevice.10.bc")
 
         object.__setattr__(self, "extern_libs", tuple(extern_libs.items()))
-        assert self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0, "num_warps must be a power of 2"
+        assert (self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0), "num_warps must be a power of 2"
         _check_reg_auto_ws_alignment("minRegAutoWS", self.minRegAutoWS)
         _check_reg_auto_ws_alignment("maxRegAutoWS", self.maxRegAutoWS)
 
@@ -196,7 +206,7 @@ class CUDAOptions:
         # the multiplicative semantics of num_ctas.
         if self.ctas_per_cga is not None:
             # Ensure cluster_dims is all 1s to prevent conflicting cluster specifications.
-            assert self.cluster_dims == (1, 1, 1) or self.cluster_dims == self.ctas_per_cga, (
+            assert (self.cluster_dims == (1, 1, 1) or self.cluster_dims == self.ctas_per_cga), (
                 f"When using ctas_per_cga, cluster_dims must be default (1,1,1) or match ctas_per_cga to avoid conflicting "
                 f"cluster specifications. Got cluster_dims={self.cluster_dims}")
 
@@ -328,7 +338,8 @@ class CUDABackend(BaseBackend):
             if (idx, ) in constant_keys:
                 continue
 
-            name = key if isinstance(key, str) else (arg_names[idx] if arg_names and idx < len(arg_names) else str(idx))
+            name = (key if isinstance(key, str) else
+                    (arg_names[idx] if arg_names and idx < len(arg_names) else str(idx)))
             arg_entry = {"name": name, "type": str(ty), "index": idx}
 
             # Check for tt.divisibility attribute.
@@ -542,8 +553,9 @@ class CUDABackend(BaseBackend):
         capability = int(self._parse_arch(options.arch))
         codegen_fns = {
             "convert_custom_types":
-            cuda.convert_custom_float8_sm80 if capability >= 80 else cuda.convert_custom_float8_sm70,
-            "min_dot_size": min_dot_size(self.target),
+            (cuda.convert_custom_float8_sm80 if capability >= 80 else cuda.convert_custom_float8_sm70),
+            "min_dot_size":
+            min_dot_size(self.target),
         }
         return codegen_fns
 
@@ -569,8 +581,14 @@ class CUDABackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         # Pass cluster_dims as a list
-        tlx.tlx_passes.add_triton_tlx_fixup(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas,
-                                            list(opt.cluster_dims))
+        tlx.tlx_passes.add_triton_tlx_fixup(
+            pm,
+            f"cuda:{capability}",
+            opt.num_warps,
+            32,
+            opt.num_ctas,
+            list(opt.cluster_dims),
+        )
         passes.common.add_inliner(pm)
         # Handle storage lowering. In the future this may need
         # dummy layouts
@@ -596,15 +614,24 @@ class CUDABackend(BaseBackend):
 
         # Add minRegAutoWS attribute
         if opt.minRegAutoWS is not None:
-            mod.set_attr("ttg.min_reg_auto_ws", ir.builder(mod.context).get_int32_attr(opt.minRegAutoWS))
+            mod.set_attr(
+                "ttg.min_reg_auto_ws",
+                ir.builder(mod.context).get_int32_attr(opt.minRegAutoWS),
+            )
 
         # Add maxRegAutoWS attribute
         if opt.maxRegAutoWS is not None:
-            mod.set_attr("ttg.max_reg_auto_ws", ir.builder(mod.context).get_int32_attr(opt.maxRegAutoWS))
+            mod.set_attr(
+                "ttg.max_reg_auto_ws",
+                ir.builder(mod.context).get_int32_attr(opt.maxRegAutoWS),
+            )
 
         # Add early TMA store lowering attribute
         if opt.early_tma_store_lowering:
-            mod.set_attr("ttg.early_tma_store_lowering", ir.builder(mod.context).get_bool_attr(True))
+            mod.set_attr(
+                "ttg.early_tma_store_lowering",
+                ir.builder(mod.context).get_bool_attr(True),
+            )
 
         if opt.cluster_dims is not None:
             # Set cluster_info attributes on the module
@@ -649,7 +676,6 @@ class CUDABackend(BaseBackend):
             nvidia.passes.hopper.add_2cta_transform_loads(pm)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
         passes.ttir.add_loop_aware_cse(pm)
-        use_meta_swp_schedule = knobs.nvidia.use_meta_ws and not knobs.nvidia.force_trunk_swp_schedule
         if capability // 10 in [8, 9]:
             passes.ttgpuir.add_fuse_nested_loops(pm)
             passes.common.add_canonicalizer(pm)
@@ -658,19 +684,26 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             if knobs.nvidia.use_meta_ws:
                 nvidia.passes.hopper.add_data_partitioning(pm, 1)
-                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
-                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
+                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
+                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
             nvidia.passes.hopper.add_tma_store_lowering(pm)
             if knobs.nvidia.use_meta_ws:
                 nvidia.passes.hopper.add_sink_broadcast(pm)
                 nvidia.passes.hopper.add_partition_scheduling_meta(pm)
             smem_budget = _max_shared_mem_for_capability(capability)
-            generate_subtiled = opt.generate_subtiled_region or knobs.nvidia.generate_subtiled_region
-            nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled,
-                                                     smem_budget, generate_subtiled)
+            generate_subtiled = (opt.generate_subtiled_region or knobs.nvidia.generate_subtiled_region)
+            nvidia.passes.hopper.add_hopper_warpspec(
+                pm,
+                opt.num_stages,
+                capability,
+                opt.pingpongAutoWS,
+                dump_enabled,
+                smem_budget,
+                generate_subtiled,
+            )
             if not knobs.nvidia.use_meta_ws:
-                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
-                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
+                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
+                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
         elif capability // 10 >= 10:
             if not knobs.nvidia.use_modulo_schedule:
@@ -698,8 +731,8 @@ class CUDABackend(BaseBackend):
             # latency-based heuristic. Without assign_latencies, the WS
             # pass's internal scheduleLoops has no latencies and can't
             # enter the code path that reads tt.autows annotations.
-            passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
-            passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
+            passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
+            passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
             if not knobs.nvidia.use_meta_ws:
                 # 2-CTA + upstream WS is not supported
                 if opt.cluster_dims is None or max(opt.cluster_dims) < 2:
@@ -710,9 +743,16 @@ class CUDABackend(BaseBackend):
                 nvidia.passes.hopper.add_sink_broadcast(pm)
                 nvidia.passes.hopper.add_partition_scheduling_meta(pm)
                 smem_budget = _max_shared_mem_for_capability(capability)
-                generate_subtiled = opt.generate_subtiled_region or knobs.nvidia.generate_subtiled_region
-                nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS,
-                                                         dump_enabled, smem_budget, generate_subtiled)
+                generate_subtiled = (opt.generate_subtiled_region or knobs.nvidia.generate_subtiled_region)
+                nvidia.passes.hopper.add_hopper_warpspec(
+                    pm,
+                    opt.num_stages,
+                    capability,
+                    opt.pingpongAutoWS,
+                    dump_enabled,
+                    smem_budget,
+                    generate_subtiled,
+                )
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_optimize_partition_warps(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
@@ -722,7 +762,7 @@ class CUDABackend(BaseBackend):
             # 2-CTA: Insert cross-CTA sync AFTER all WS passes.
             # Only for Meta WS path — non-WS 2-CTA sync is handled by
             # MMAv5.cpp's inline ClusterArriveOp.
-            if opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and knobs.nvidia.use_meta_ws:
+            if (opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and knobs.nvidia.use_meta_ws):
                 nvidia.passes.hopper.add_insert_2cta_sync(pm)
         else:
             passes.ttir.add_triton_licm(pm)
@@ -758,7 +798,7 @@ class CUDABackend(BaseBackend):
         # Budget-aware layout conversion elimination — runs last to ensure
         # converts whose scratch would exceed SMEM budget are eliminated
         # after all other passes that may introduce layout conversions.
-        terminal_smem_budget = 0 if knobs.nvidia.disable_budget_aware_layout_conversion else smem_budget
+        terminal_smem_budget = (0 if knobs.nvidia.disable_budget_aware_layout_conversion else smem_budget)
         passes.ttgpuir.add_remove_layout_conversions(pm, terminal_smem_budget)
 
         pm.run(mod, "make_ttgir")
@@ -834,7 +874,7 @@ class CUDABackend(BaseBackend):
         passes.common.add_symbol_dce(pm)
 
         passes.convert.add_nvvm_to_llvm(pm)
-        if not knobs.compilation.disable_line_info and not knobs.compilation.dump_ir_extract_di_local_variables:
+        if (not knobs.compilation.disable_line_info and not knobs.compilation.dump_ir_extract_di_local_variables):
             passes.llvmir.add_di_scope(pm)
 
         if CUDABackend.instrumentation:
@@ -896,8 +936,8 @@ class CUDABackend(BaseBackend):
         metadata["tmem_size"] = src.get_int_attr("ttg.tensor_memory_size")
         metadata["global_scratch_size"] = src.get_int_attr("ttg.global_scratch_memory_size")
         metadata["global_scratch_align"] = src.get_int_attr("ttg.global_scratch_memory_alignment")
-        metadata["profile_scratch_size"] = src.get_int_attr("ttg.profile_scratch_memory_size") or 0
-        metadata["profile_scratch_align"] = src.get_int_attr("ttg.profile_scratch_memory_alignment") or 1
+        metadata["profile_scratch_size"] = (src.get_int_attr("ttg.profile_scratch_memory_size") or 0)
+        metadata["profile_scratch_align"] = (src.get_int_attr("ttg.profile_scratch_memory_alignment") or 1)
         ret = str(llvm_mod)
         del llvm_mod
         del context
