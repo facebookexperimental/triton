@@ -292,7 +292,7 @@ TDMDescriptor createTDMDescriptor(RewriterBase &rewriter, Location loc,
     group1[0] = b.or_(group1[0], b.i32_val((log2PadInterval - 1) << 22));
     group1[0] = b.or_(group1[0], b.i32_val((padAmountInDwords - 1) << 25));
   }
-  // Encode tensor shapes using 48-bit encoding
+  // Encode 32-bit tensor shapes
   group1[1] = b.shl(tensorShape[numDims - 1], v16);
   group1[2] = b.lshr(tensorShape[numDims - 1], v16);
 
@@ -304,7 +304,7 @@ TDMDescriptor createTDMDescriptor(RewriterBase &rewriter, Location loc,
   // Block shapes
   group1[3] = b.or_(group1[3], b.i32_val(blockShape[numDims - 1] << 16));
   if (numDims >= 2) {
-    group1[4] = b.i32_val(blockShape[numDims - 2]);
+    group1[4] = b.i32_val(blockShape[numDims - 2] & 0xFFFF);
   }
   // tile_dim2 (upper 16 bits of group1[4])
   if (numDims >= 3) {
@@ -544,9 +544,10 @@ void fillTDMDescriptor(
   }
   dstPtr = b.gep(sharedPtrTy, elementType, dstPtr, dstOffset);
 
-  // Update tensor shapes based on offset
+  // Update tensor shapes based on offset and cgaOffset
   for (size_t i = 0; i < numDims; ++i) {
-    tensorShape[i] = b.smax(b.i32_val(0), b.sub(tensorShape[i], offset[i]));
+    auto fullOffset = b.add(offset[i], cgaOffsets[i].second);
+    tensorShape[i] = b.smax(b.i32_val(0), b.sub(tensorShape[i], fullOffset));
   }
 
   // Update group0 with addresses
@@ -604,18 +605,19 @@ void fillTDMDescriptor(
   }
 }
 
-// Fill TDM descriptor for scatter operation (2D only).
-// Scatter writes data from LDS to non-contiguous rows in global memory.
-void fillTDMDescriptorForScatter(
+// Fill TDM descriptor for gather/scatter operations (2D only).
+// Gather reads from non-contiguous rows in global memory to LDS.
+// Scatter writes from LDS to non-contiguous rows in global memory.
+void fillTDMDescriptorForGatherScatter(
     RewriterBase &rewriter, Location loc,
     const LLVMTypeConverter *typeConverter, Type elementType,
-    SmallVector<int64_t> blockShape, SmallVector<Value> &group0,
-    SmallVector<Value> &group1, SmallVector<Value> &group2,
-    SmallVector<Value> &group3, Value ldsRowOffset, Value globalColOffset,
-    Value ldsPtr, Value pred, Value barrierPtr,
+    SmallVector<int64_t> blockShape, unsigned padInterval, unsigned padAmount,
+    SmallVector<Value> &group0, SmallVector<Value> &group1,
+    SmallVector<Value> &group2, SmallVector<Value> &group3, Value ldsRowOffset,
+    Value globalColOffset, Value ldsPtr, Value pred, Value barrierPtr,
     const triton::LinearLayout &cgaLayout, Value ctaId,
     ArrayRef<Value> rowIndices, bool use32BitIndices) {
-  assert(!rowIndices.empty() && "Scatter requires row indices.");
+  assert(!rowIndices.empty() && "Gather/scatter requires row indices.");
 
   auto ctx = rewriter.getContext();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -628,16 +630,13 @@ void fillTDMDescriptorForScatter(
       decodeTDMDescriptorFull(rewriter, loc, group0, group1, group2, group3,
                               /*numDims=*/2);
 
-  // Apply CTA offsets to the base pointer
+  // Apply CTA column offset to the base pointer.
+  // Row positions are specified by rowIndices, so only column offset applies.
   auto kBlock = str_attr("block");
   auto cgaOffsets =
       applyLinearLayout(loc, rewriter, cgaLayout, {{kBlock, ctaId}});
-  Value cgaBaseOffset = b.i32_val(0);
-  for (size_t i = 0; i < 2; ++i) {
-    Value dimOffset = b.mul(cgaOffsets[i].second, tensorStride[i]);
-    cgaBaseOffset = b.add(cgaBaseOffset, dimOffset);
-  }
-  globalPtr = b.gep(globalPtrTy, elementType, globalPtr, cgaBaseOffset);
+  Value cgaColOffset = b.mul(cgaOffsets[1].second, tensorStride[1]);
+  globalPtr = b.gep(globalPtrTy, elementType, globalPtr, cgaColOffset);
 
   // For scatter, only apply column offset to global address
   // Row positions are specified by rowIndices
@@ -646,19 +645,31 @@ void fillTDMDescriptorForScatter(
 
   // Calculate LDS offset based on row offset only (column always starts at 0)
   Value ldsOffset = b.mul(ldsRowOffset, b.i32_val(blockShape[1]));
+
+  // Apply padding if needed
+  if (padInterval > 0 && padAmount > 0) {
+    Value iVal = b.i32_val(log2(padInterval));
+    Value pVal = b.i32_val(log2(padAmount));
+    Value padOffset = b.shl(i32_ty, b.ashr(ldsOffset, iVal), pVal);
+    ldsOffset = b.add(ldsOffset, padOffset);
+  }
   ldsPtr = b.gep(sharedPtrTy, elementType, ldsPtr, ldsOffset);
 
-  // Update group0 with addresses and enable scatter
+  // Adjust column tensor shape for OOB handling - subtract column offset to
+  // get remaining elements.
+  tensorShape[1] = b.smax(b.i32_val(0), b.sub(tensorShape[1], globalColOffset));
+
+  // Update group0 with addresses and enable gather/scatter mode
   Value globalAddr = b.ptrtoint(i64_ty, globalPtr);
   Value ldsAddr = b.ptrtoint(i32_ty, ldsPtr);
 
-  // Set scatter bits: bit 31 = enable, bit 30 = 32-bit indices
-  Value predWithScatter = b.or_(pred, b.i32_val(1 << 31));
+  // Set gather/scatter bits: bit 31 = enable, bit 30 = 32-bit indices
+  Value predWithGatherScatter = b.or_(pred, b.i32_val(1 << 31));
   if (use32BitIndices) {
-    predWithScatter = b.or_(predWithScatter, b.i32_val(1 << 30));
+    predWithGatherScatter = b.or_(predWithGatherScatter, b.i32_val(1 << 30));
   }
 
-  group0[0] = predWithScatter;
+  group0[0] = predWithGatherScatter;
   group0[1] = ldsAddr;
   group0[2] = b.trunc(i32_ty, globalAddr);
 
@@ -668,7 +679,7 @@ void fillTDMDescriptorForScatter(
   Value typeBits = b.and_(group0[3], b.i32_val(0xC0000000));
   group0[3] = b.or_(typeBits, globalAddrHigh);
 
-  // Update group1 with tensor shapes (keep original for stride calculation)
+  // Update group1 with adjusted tensor shapes for proper OOB handling
   group1[1] = b.shl(tensorShape[1], b.i32_val(16));
   group1[2] = b.lshr(tensorShape[1], b.i32_val(16));
   group1[2] = b.or_(group1[2], b.shl(tensorShape[0], b.i32_val(16)));
@@ -783,34 +794,50 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
   }
 }
 
-// Emit a TDM scatter operation to write non-contiguous rows from LDS to global.
-void emitTDMScatter(RewriterBase &rewriter, Location loc,
-                    const LLVMTypeConverter *typeConverter,
-                    ArrayRef<Value> desc, ArrayRef<int64_t> blockShape,
-                    Value srcPtr, Value pred, Type elementType,
-                    Value barrierPtr, const triton::LinearLayout &cgaLayout,
-                    Value ctaId, ArrayRef<Value> rowIndices, Value colOffset,
-                    bool use32BitIndices) {
-  auto b = TritonLLVMOpBuilder(loc, rewriter);
-
-  assert(!rowIndices.empty() && "Scatter requires row indices");
-  assert(colOffset && "Scatter requires column offset");
+// Emit a TDM gather or scatter operation for non-contiguous row access.
+size_t getTDMGatherScatterInstrinsicCount(size_t numIndices,
+                                          bool use32BitIndices) {
+  if (numIndices == 0)
+    return 0;
 
   // Determine max indices per instruction based on index size
   size_t maxIndicesPerInstr = use32BitIndices ? 8 : 16;
-  size_t numIndices = rowIndices.size();
 
-  // Get the descriptor groups (scatter uses 2D format: 12 dwords)
+  return llvm::divideCeil(numIndices, maxIndicesPerInstr);
+}
+
+void emitTDMGatherScatter(RewriterBase &rewriter, Location loc,
+                          const LLVMTypeConverter *typeConverter,
+                          ArrayRef<Value> desc, ArrayRef<int64_t> blockShape,
+                          unsigned padInterval, unsigned padAmount,
+                          Value ldsPtr, Value pred, Type elementType,
+                          Value barrierPtr,
+                          const triton::LinearLayout &cgaLayout, Value ctaId,
+                          ArrayRef<Value> rowIndices, Value colOffset,
+                          bool use32BitIndices, bool isGather) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+
+  assert(!rowIndices.empty() && "Gather/scatter requires row indices");
+  assert(colOffset && "Gather/scatter requires column offset");
+
+  size_t numIndices = rowIndices.size();
+  size_t maxIndicesPerInstr = use32BitIndices ? 8 : 16;
+
+  // Calculate the number of TDM instructions we'll emit
+  size_t numInstructions =
+      getTDMGatherScatterInstrinsicCount(numIndices, use32BitIndices);
+
+  // Get the descriptor groups (gather/scatter uses 2D format: 12 dwords)
   auto group0Vec = SmallVector<Value>(desc.begin(), desc.begin() + 4);
   auto group1Vec = SmallVector<Value>(desc.begin() + 4, desc.end());
 
-  // For TDM scatter, we need group2 and group3 for indices
+  // For TDM gather/scatter, we need group2 and group3 for indices
   SmallVector<Value> group2Vec(4, b.i32_val(0));
   SmallVector<Value> group3Vec(4, b.i32_val(0));
 
   // Issue multiple TDM instructions if needed
-  for (size_t startIdx = 0; startIdx < numIndices;
-       startIdx += maxIndicesPerInstr) {
+  for (size_t instrIdx = 0; instrIdx < numInstructions; ++instrIdx) {
+    size_t startIdx = instrIdx * maxIndicesPerInstr;
     size_t endIdx = std::min(startIdx + maxIndicesPerInstr, numIndices);
 
     // Get the subset of indices for this batch
@@ -823,13 +850,14 @@ void emitTDMScatter(RewriterBase &rewriter, Location loc,
     auto g2 = group2Vec;
     auto g3 = group3Vec;
 
-    // Fill the descriptor for scatter:
+    // Fill the descriptor for gather/scatter:
     // - ldsRowOffset: row offset within shared memory for this batch
     // - colOffset: starting column in global memory
-    fillTDMDescriptorForScatter(
-        rewriter, loc, typeConverter, elementType, to_vector(blockShape), g0,
-        g1, g2, g3, b.i32_val(startIdx), colOffset, srcPtr, pred, barrierPtr,
-        cgaLayout, ctaId, batchIndices, use32BitIndices);
+    fillTDMDescriptorForGatherScatter(
+        rewriter, loc, typeConverter, elementType, to_vector(blockShape),
+        padInterval, padAmount, g0, g1, g2, g3, b.i32_val(startIdx), colOffset,
+        ldsPtr, pred, barrierPtr, cgaLayout, ctaId, batchIndices,
+        use32BitIndices);
 
     // Pack and emit the instruction
     auto group0 = packLLVector(loc, g0, rewriter);
@@ -837,10 +865,13 @@ void emitTDMScatter(RewriterBase &rewriter, Location loc,
     auto group2 = packLLVector(loc, g2, rewriter);
     auto group3 = packLLVector(loc, g3, rewriter);
 
-    // Scatter uses tensor.store.from.lds (not the d2 variant) because it
-    // needs group2/group3 for indices
+    // Gather/scatter uses full 4-group format (not the d2 variant) for indices
+    // Gather: tensor.load.to.lds (global -> LDS)
+    // Scatter: tensor.store.from.lds (LDS -> global)
+    const char *intrinsicName = isGather ? "llvm.amdgcn.tensor.load.to.lds"
+                                         : "llvm.amdgcn.tensor.store.from.lds";
     LLVM::createLLVMIntrinsicCallOp(
-        rewriter, loc, "llvm.amdgcn.tensor.store.from.lds", {},
+        rewriter, loc, intrinsicName, {},
         {group0, group1, group2, group3, b.i32_val(0)});
   }
 }

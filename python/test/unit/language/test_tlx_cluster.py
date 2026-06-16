@@ -438,6 +438,10 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
     assert re.search((r"clusterlaunchcontrol.query_cancel.is_canceled.pred.b128"), ptx, flags=re.DOTALL)
     assert re.search((r"clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128"), ptx, flags=re.DOTALL)
 
+    query_instr = ptx.index("clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128")
+    fence_instr = ptx.index("fence.proxy.async.shared::cta")
+    assert 0 < query_instr < fence_instr
+
     assert torch.count_nonzero(output) == size
 
 
