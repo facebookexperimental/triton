@@ -2277,9 +2277,16 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
   }
 }
 
-/// Walk over \p loop and clone Broadcast/ExpandDims ops into each
-/// partition that they have users in. This reduces the amount of data that
-/// needs to be transferred through memory.
+/// Walk over \p loop and clone cheap ops into each partition that uses them,
+/// rematerializing metadata-only or layout-only values instead of routing
+/// them through a cross-partition memory channel.
+///
+/// Cloneable: MemDescTransOp (metadata-only SMEM-layout reinterpretation),
+/// ConvertLayoutOp, BroadcastOp, ExpandDimsOp (cheap element rearrangement).
+/// LocalAllocOp is NOT cloned: a shared SMEM buffer (e.g. K/V in FA) is one
+/// producer feeding N consumer partitions, so cloning would duplicate the
+/// buffer. separateLocalAllocWithSrc instead tags the local_store with the
+/// source op's single task ID, letting createChannelPost build a 1→N channel.
 ///
 /// When a ConvertLayoutOp sits between an ExpandDimsOp/BroadcastOp and its
 /// consumer (e.g., due to upstream layout choices producing different
@@ -2297,12 +2304,13 @@ void optimizeSchedule(scf::ForOp loop, PartitionSet &schedule) {
     return schedule.getPartition(static_cast<unsigned>(ids[0]));
   };
 
-  // After cloning a BroadcastOp/ExpandDimsOp into a user partition, walk
-  // backward through the cloned op's operand chain and also clone any
-  // ConvertLayoutOp/BroadcastOp/ExpandDimsOp that feeds it from a different
-  // partition. This handles the pattern where upstream layout passes insert
-  // a ConvertLayoutOp between ExpandDimsOp and BroadcastOp, which would
-  // otherwise break the cloning chain and create a cross-partition boundary.
+  // After cloning a BroadcastOp/ExpandDimsOp/MemDescTransOp into a user
+  // partition, walk backward through the cloned op's operand chain and also
+  // clone any ConvertLayoutOp/BroadcastOp/ExpandDimsOp that feeds it from
+  // a different partition. This handles the pattern where upstream layout
+  // passes insert a ConvertLayoutOp between ExpandDimsOp and BroadcastOp,
+  // which would otherwise break the cloning chain and create a
+  // cross-partition boundary.
   auto cloneOperandChain = [&](Operation *clonedOp, Partition *userPartition) {
     Operation *current = clonedOp;
     while (true) {
@@ -2701,14 +2709,16 @@ void PartitionSchedulingMeta::runOnOperation() {
       loop->setAttr(
           kWarpSpecializeTagAttrName,
           IntegerAttr::get(IntegerType::get(loop.getContext(), 32), idx));
-      // Clean Broadcast/ExpandDims that were left with no users
-      // after optimizeSchedule. We wait until after the schedule is
-      // serialized to avoid invalidating pointers stored in the schedule.
+      // Clean ops left with no users after optimizeSchedule, waiting until
+      // after serialize() so we don't invalidate pointers held by the
+      // schedule. LocalAllocOp is impure but a use-empty alloc is dead, so
+      // it is erased explicitly alongside the pure ops.
       loop.walk<WalkOrder::PostOrder, ReverseIterator>([](Operation *op) {
         // By default, the walk is in postorder so it is safe to delete ops
         // while we walk.
-        if (op->use_empty() && isPure(op) && op->getNumResults() == 1 &&
-            !isa<scf::YieldOp, scf::ForOp, scf::IfOp>(op))
+        if (op->use_empty() && op->getNumResults() == 1 &&
+            !isa<scf::YieldOp, scf::ForOp, scf::IfOp>(op) &&
+            (isPure(op) || isa<LocalAllocOp>(op)))
           op->erase();
       });
     }
