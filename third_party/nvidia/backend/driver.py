@@ -1,3 +1,4 @@
+import ast
 import functools
 import os
 import subprocess
@@ -129,6 +130,37 @@ def ty_to_cpp(ty):
     }[ty]
 
 
+def _flatten_schema_arg_type(ty, out):
+    """Flatten a schema arg ``type`` into the launcher-ABI scalar leaves.
+
+    A tuple-typed kernel argument is serialized in the Level 0 schema as a
+    stringified Python tuple, e.g. ``"('i32', 'constexpr')"``, ``"()"`` or
+    ``"(('constexpr',), ('i32',))"``. The variadic launcher
+    (``build_signature_metadata``) consumes only the flattened, non-constexpr
+    scalar leaves, mirroring ``make_kernel_signature``'s ``_flatten_signature``
+    plus the ``constexpr`` drop. Non-tuple types pass through unchanged; a type
+    that looks like a tuple but doesn't parse is left as-is so the launcher's
+    existing "Unknown data type" error still surfaces it.
+    """
+    if not ty.startswith("("):
+        out.append(ty)
+        return
+    try:
+        parsed = ast.literal_eval(ty)
+    except (ValueError, SyntaxError):
+        out.append(ty)
+        return
+
+    def _walk(node):
+        if isinstance(node, tuple):
+            for x in node:
+                _walk(x)
+        elif node != "constexpr":
+            out.append(node)
+
+    _walk(parsed)
+
+
 def build_kernel_signature_from_schema(schema):
     """Derive kernel_signature bytes from Level 0 schema args array.
 
@@ -170,7 +202,7 @@ def build_kernel_signature_from_schema(schema):
             for _ in range(ndim):
                 flat_types.append("i64")
         else:
-            flat_types.append(ty)
+            _flatten_schema_arg_type(ty, flat_types)
 
     return triton.runtime.driver.active.utils.build_signature_metadata(flat_types)
 
