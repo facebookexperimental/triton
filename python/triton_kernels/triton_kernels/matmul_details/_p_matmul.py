@@ -120,7 +120,7 @@ def _p_matmul(
     is_w_microscaled: tl.constexpr = WMxScale is not None
     is_x_microscaled: tl.constexpr = XMxScale is not None
     is_w_mxfp4: tl.constexpr = w_type == tl.uint8 and is_w_microscaled
-    tl.static_assert(not is_w_microscaled or W_TRANSPOSE, "NYI. Non-transposed mxfp4 weights")
+    tl.static_assert(not is_w_mxfp4 or W_TRANSPOSE, "NYI. Non-transposed mxfp4 weights")
     MX_PACK_DIVISOR: tl.constexpr = MXFP_BLOCK_SIZE
     if is_w_microscaled:
         tl.static_assert(w_type == tl.uint8 or (w_type == tl.float8e4nv or w_type == tl.float8e5),
@@ -212,7 +212,8 @@ def _p_matmul(
         tl.program_id(0), num_blocks, NUM_SMS,
         flatten=FLATTEN_LOOPS,
         disallow_acc_multi_buffer=DISALLOW_ACC_MULTI_BUFFER,
-        warp_specialize=True,
+        # Workaround for compile error in hopper warp specialization
+        warp_specialize=FLATTEN_LOOPS,
     ):
 
         pid_z, pid_m, pid_n, pid_k = compute_pids(block_id, useful_grid_m, grid_n, num_blocks, XCD_SWIZZLE, GROUP_M, SPLIT_K)

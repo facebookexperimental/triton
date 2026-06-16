@@ -353,7 +353,8 @@ void CTAPlanner::processStoreLikeOps(triton::FuncOp &funcOp) {
                   triton::DescriptorStoreLikeOpInterface, AsyncStoreOp>(op))
       stores.push_back(op);
   });
-  assert(stores.size() > 0 && "Cannot find store-like ops");
+  if (stores.empty())
+    return;
 
   ttg::CGAEncodingAttr CGALayout;
   for (Operation *store : stores) {

@@ -321,9 +321,22 @@ Cluster assignment rules:
 
 ### `optimizeSchedule`
 
-Clones `BroadcastOp` and `ExpandDimsOp` into each partition that has users.
-This allows cheap element-rearranging ops to be rematerialized in consumer
-partitions rather than creating cross-partition channels.
+Clones cheap ops into each partition that has users. This rematerializes
+metadata-only or layout-only ops in consumer partitions rather than creating
+cross-partition channels.
+
+**Cloneable ops**:
+- `MemDescTransOp`: metadata-only reinterpretation of shared memory layout
+- `ConvertLayoutOp`, `BroadcastOp`, `ExpandDimsOp`: cheap element rearrangement
+
+**Not cloned**: `LocalAllocOp`. When a shared SMEM buffer (e.g., K/V in
+Flash Attention) is consumed by ops in multiple partitions, the correct
+model is a 1-producer to N-consumer channel: one TMA load writes the buffer,
+all consumer partitions read from it. The downstream
+`separateLocalAllocWithSrc` assigns the `local_store` the source op's
+single task ID (the TMA load partition), and `createChannelPost` creates a
+proper 1-to-N channel. This avoids buffer duplication and the SMEM it costs
+(per-consumer copies pushed FA3 forward over H100's 228KB SMEM limit).
 
 The cloning walks in reverse post-order so that an `ExpandDimsOp` feeding a
 `BroadcastOp` is visited after the broadcast has already been cloned. When
@@ -336,10 +349,19 @@ The cloning walks in reverse post-order so that an `ExpandDimsOp` feeding a
 also clones any `ConvertLayoutOp`, `BroadcastOp`, or `ExpandDimsOp` that
 feeds it from a different partition. This handles the case where upstream
 layout passes insert a `ConvertLayoutOp` between `ExpandDimsOp` and
-`BroadcastOp` (e.g., `expand_dims → convert_layout → broadcast`). Without
-this backward walk, the `ConvertLayoutOp` would break the cloning chain
-and create an unintended cross-partition boundary, forcing the value
-through an smem channel instead of keeping it within the partition.
+`BroadcastOp` (e.g., `expand_dims -> convert_layout -> broadcast`).
+
+When a `MemDescTransOp` clone references a `LocalAllocOp` from a different
+partition (e.g., `local_alloc -> memdesc_trans -> dot`), the backward walk
+stops at the `LocalAllocOp` boundary. The `MemDescTransOp` clone keeps a
+reference to the original shared alloc, which is correct because the alloc
+is shared across partitions. The `separateLocalAllocWithSrc` pass later
+assigns the producer task ID from the source op, creating a 1-to-N channel.
+
+Without the backward walk, the cloned op would reference an operand in a
+different partition, creating an unintended cross-partition boundary and
+forcing the value through an smem channel instead of keeping it within the
+partition.
 
 ### `splitDataPartitionedIfOps`
 
