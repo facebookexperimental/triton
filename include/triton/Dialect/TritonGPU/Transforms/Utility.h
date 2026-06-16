@@ -186,16 +186,6 @@ void appendToForOpYield(scf::ForOp forOp, ArrayRef<Value> newOperands);
 // helpers hide those differences so call sites can treat both uniformly.
 //===----------------------------------------------------------------------===//
 
-// Return the nearest enclosing loop (scf.for or scf.while) of `op` / `v`, or a
-// null interface if there is none.
-LoopLikeOpInterface getEnclosingLoop(Operation *op);
-LoopLikeOpInterface getEnclosingLoop(Value v);
-
-// Number of loop-carried values, i.e. getRegionIterArgs().size(). For scf.for
-// this excludes the induction variable; for scf.while it is the number of
-// "before" region arguments.
-unsigned getNumLoopCarried(LoopLikeOpInterface loop);
-
 // One loop-carried value, identified by its iter-arg slot index `k` (0-based
 // index into getRegionIterArgs(), which is 1:1 with inits and yielded values
 // for both scf.for and scf.while). This hides the induction-variable offset and
@@ -217,42 +207,9 @@ struct LoopCarriedSlot {
   BlockArgument afterArg;
 };
 
-// Build the slot descriptor for iter-arg index `k` (k < getNumLoopCarried).
+// Build the slot descriptor for iter-arg index `k`
+// (k < loop.getRegionIterArgs().size()).
 LoopCarriedSlot getLoopCarriedSlot(LoopLikeOpInterface loop, unsigned k);
-
-// Inverse mapping: given a loop result, return the iter-arg slot index it ties
-// to, if any. For scf.for this is result.getResultNumber(). For scf.while it is
-// the "before" arg number when the corresponding scf.condition forwarded
-// operand is that "before" arg, else nullopt.
-std::optional<unsigned> getSlotForResult(LoopLikeOpInterface loop,
-                                         OpResult result);
-
-// Result of appendLoopCarriedValues.
-struct AppendedLoop {
-  // The new loop op (the original has been erased).
-  LoopLikeOpInterface loop;
-  // The newly-added region iter args (scf.for body args; scf.while "before"
-  // args). Read these inside the loop body to compute the next-iteration value.
-  SmallVector<BlockArgument> newIterArgs;
-  // scf.while only: the newly-added "after" region args (the forwarded copies).
-  // Empty for scf.for.
-  SmallVector<BlockArgument> newAfterArgs;
-  // The newly-added loop results (final values of the carried slots).
-  SmallVector<Value> newResults;
-  // The back-edge terminator the caller must extend with the next-iteration
-  // values (one per appended slot): scf.for body scf.yield, or scf.while
-  // "after" scf.yield. Append via `backEdgeYield->insertOperands(...)`.
-  scf::YieldOp backEdgeYield;
-};
-
-// Append `inits.size()` new loop-carried values (initialized to `inits`) to
-// `loop`, returning the new loop and accessors. The old loop is erased. For
-// scf.while, the scf.condition (forwarding) terminator is extended so the new
-// carried values reach the "after" region args and the loop results; the caller
-// is responsible for appending the next-iteration values to `backEdgeYield`.
-AppendedLoop appendLoopCarriedValues(OpBuilder &builder,
-                                     LoopLikeOpInterface loop,
-                                     ValueRange inits);
 
 Operation *cloneWithInferType(mlir::OpBuilder &rewriter, Operation *op,
                               IRMapping &mapping);

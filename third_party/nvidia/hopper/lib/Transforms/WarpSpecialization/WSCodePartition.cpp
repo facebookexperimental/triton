@@ -4834,11 +4834,16 @@ public:
     // yield operand already has an "accum_cnt" NameLoc. This must be done at
     // the end because earlier steps may replace ForOps and lose block arg locs.
     funcOp.walk([&](LoopLikeOpInterface loop) {
-      auto yieldOp = llvm::cast<scf::YieldOp>(
+      // The back-edge terminator is the last region's terminator: the body
+      // scf.yield for scf.for, the "after" scf.yield for scf.while. Skip any
+      // other loop-like op whose terminator is not an scf.yield.
+      auto yieldOp = llvm::dyn_cast<scf::YieldOp>(
           loop.getOperation()
               ->getRegion(loop.getOperation()->getNumRegions() - 1)
               .front()
               .getTerminator());
+      if (!yieldOp)
+        return;
       unsigned numIterArgs = loop.getRegionIterArgs().size();
       for (unsigned i = 0; i < numIterArgs; ++i) {
         Value yieldVal = yieldOp.getOperand(i);

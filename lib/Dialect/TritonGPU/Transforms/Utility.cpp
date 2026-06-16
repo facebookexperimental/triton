@@ -823,27 +823,6 @@ void appendToForOpYield(scf::ForOp forOp, ArrayRef<Value> newOperands) {
 // Loop-kind-agnostic helpers (scf.for / scf.while)
 //===----------------------------------------------------------------------===//
 
-LoopLikeOpInterface getEnclosingLoop(Operation *op) {
-  return op->getParentOfType<LoopLikeOpInterface>();
-}
-
-LoopLikeOpInterface getEnclosingLoop(Value v) {
-  if (Operation *def = v.getDefiningOp())
-    return getEnclosingLoop(def);
-  auto arg = cast<BlockArgument>(v);
-  Operation *parent = arg.getOwner()->getParentOp();
-  if (!parent)
-    return nullptr;
-  // A loop's own region arg belongs to that loop's scope.
-  if (auto loop = dyn_cast<LoopLikeOpInterface>(parent))
-    return loop;
-  return getEnclosingLoop(parent);
-}
-
-unsigned getNumLoopCarried(LoopLikeOpInterface loop) {
-  return loop.getRegionIterArgs().size();
-}
-
 LoopCarriedSlot getLoopCarriedSlot(LoopLikeOpInterface loop, unsigned k) {
   LoopCarriedSlot slot;
   Operation *op = loop.getOperation();
@@ -876,70 +855,6 @@ LoopCarriedSlot getLoopCarriedSlot(LoopLikeOpInterface loop, unsigned k) {
     }
   }
   return slot;
-}
-
-std::optional<unsigned> getSlotForResult(LoopLikeOpInterface loop,
-                                         OpResult result) {
-  Operation *op = loop.getOperation();
-  if (isa<scf::ForOp>(op))
-    return result.getResultNumber();
-  auto whileOp = cast<scf::WhileOp>(op);
-  unsigned j = result.getResultNumber();
-  Value fwd = whileOp.getConditionOp().getArgs()[j];
-  if (auto arg = dyn_cast<BlockArgument>(fwd))
-    if (arg.getOwner() == whileOp.getBeforeBody())
-      return arg.getArgNumber();
-  return std::nullopt;
-}
-
-AppendedLoop appendLoopCarriedValues(OpBuilder &builder,
-                                     LoopLikeOpInterface loop,
-                                     ValueRange inits) {
-  AppendedLoop result;
-  unsigned n = inits.size();
-  Operation *op = loop.getOperation();
-
-  if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-    // addIterArgsToLoop rebuilds the loop with the extra inits and erases the
-    // old one; the yield is left untouched (caller appends via backEdgeYield).
-    scf::ForOp newFor = addIterArgsToLoop(builder, forOp, inits);
-    result.loop = cast<LoopLikeOpInterface>(newFor.getOperation());
-    for (auto a : newFor.getRegionIterArgs().take_back(n))
-      result.newIterArgs.push_back(a);
-    for (auto r : newFor.getResults().take_back(n))
-      result.newResults.push_back(r);
-    result.backEdgeYield =
-        cast<scf::YieldOp>(newFor.getBody()->getTerminator());
-    return result;
-  }
-
-  auto whileOp = cast<scf::WhileOp>(op);
-  SmallVector<Type> newResultTypes;
-  for (Value v : inits)
-    newResultTypes.push_back(v.getType());
-  scf::WhileOp newWhile =
-      replaceWhileOpWithNewSignature(builder, whileOp, inits, newResultTypes);
-  // Save the caller from insertion point invalidation and match the scf.for
-  // helper's ownership contract: the returned loop replaces the original.
-  if (builder.getInsertionPoint() == whileOp->getIterator())
-    builder.setInsertionPoint(newWhile);
-  // replaceWhileOpWithNewSignature creates the new "before"/"after" args and
-  // results but leaves the spliced scf.condition / scf.yield with the old
-  // operand counts. Extend scf.condition to forward the new "before" args so
-  // they reach the new "after" args and results. (The caller appends the
-  // next-iteration values to the "after" scf.yield via backEdgeYield.)
-  auto beforeTail = newWhile.getBeforeArguments().take_back(n);
-  newWhile.getConditionOp().getArgsMutable().append(ValueRange(beforeTail));
-  for (auto a : beforeTail)
-    result.newIterArgs.push_back(a);
-  for (auto a : newWhile.getAfterArguments().take_back(n))
-    result.newAfterArgs.push_back(a);
-  for (auto r : newWhile.getResults().take_back(n))
-    result.newResults.push_back(r);
-  result.loop = cast<LoopLikeOpInterface>(newWhile.getOperation());
-  result.backEdgeYield = newWhile.getYieldOp();
-  whileOp.erase();
-  return result;
 }
 
 scf::IfOp replaceIfOpWithNewSignature(OpBuilder &rewriter, scf::IfOp ifOp,
