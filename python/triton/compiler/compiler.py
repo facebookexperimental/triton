@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import time
+import warnings
 import weakref
 from pathlib import Path
 
@@ -667,4 +668,10 @@ class CompiledKernel:
             self.run(grid[0], grid[1], grid[2], stream, self.function, self.packed_metadata, launch_metadata,
                      knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *args)
 
+        if knobs.nvidia.use_triton_dispatcher and dispatcher is None:
+            warnings.warn(
+                f"[Triton] TRITON_USE_TRITON_DISPATCHER=1 but CompiledKernel '{self.name}' has no C dispatcher, "
+                f"falling back to Python runner",
+                stacklevel=2,
+            )
         return runner
