@@ -2,9 +2,9 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-from triton.language.extra.tlx.warp_spec import get_bufidx_phase
-from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _sub_f32x2
+from triton.language.extra.cuda.inline_ptx_lib import _fma_f32x2, _mul_f32x2, _sub_f32x2
 from triton.language.extra.subtile_ops import _join_n_2D, _split_n_2D
+from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -2007,6 +2007,7 @@ def _bwd_compute_inner_loop(
     num_steps_override=0,
 ):
     start_block_n = start_n * BLOCK_N1
+    offs_n = start_block_n + tl.arange(0, BLOCK_N1)
     if num_steps_override > 0:
         num_steps = num_steps_override
     else:
@@ -2031,7 +2032,6 @@ def _bwd_compute_inner_loop(
         # ISETP arithmetic of `offs_m >= offs_n`.
         sT = _sub_f32x2(qkT, m[None, :])
         if STAGE == 1:
-            offs_n = start_block_n + tl.arange(0, BLOCK_N1)
             col_limit_left = (offs_n - curr_m)[:, None]
             sT = _apply_causal_mask(sT, col_limit_left, BLOCK_M1, keep_ge=True)
         pT = tl.math.exp2(sT)
