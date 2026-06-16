@@ -1028,19 +1028,39 @@ struct AsyncCopyGlobalToLocalOpConversion
       if (cacheMod != triton::CacheModifier::NONE) {
         emitRemark(loc) << "cache modifiers not yet implemented on gfx1250";
       }
-      if (multicastMask) {
-        std::string intrinsic =
-            "llvm.amdgcn.cluster.load.async.to.lds.b" + std::to_string(vecBits);
-        auto globalLoadLdsOp = LLVM::createLLVMIntrinsicCallOp(
-            rewriter, loc, intrinsic, {},
-            {srcPtr, shmemAddr, b.i32_val(0), b.i32_val(cacheModifiers),
-             multicastMask});
-      } else {
-        std::string intrinsic =
-            "llvm.amdgcn.global.load.async.to.lds.b" + std::to_string(vecBits);
-        auto globalLoadLdsOp = LLVM::createLLVMIntrinsicCallOp(
-            rewriter, loc, intrinsic, {},
-            {srcPtr, shmemAddr, b.i32_val(0), b.i32_val(cacheModifiers)});
+      switch (vecBits) {
+      case 32:
+        if (multicastMask)
+          ROCDL::ClusterLoadAsyncToLDSB32Op::create(
+              rewriter, loc, srcPtr, shmemAddr, 0, cacheModifiers,
+              multicastMask, nullptr, nullptr, nullptr);
+        else
+          ROCDL::GlobalLoadAsyncToLDSB32Op::create(rewriter, loc, srcPtr,
+                                                   shmemAddr, 0, cacheModifiers,
+                                                   nullptr, nullptr, nullptr);
+        break;
+      case 64:
+        if (multicastMask)
+          ROCDL::ClusterLoadAsyncToLDSB64Op::create(
+              rewriter, loc, srcPtr, shmemAddr, 0, cacheModifiers,
+              multicastMask, nullptr, nullptr, nullptr);
+        else
+          ROCDL::GlobalLoadAsyncToLDSB64Op::create(rewriter, loc, srcPtr,
+                                                   shmemAddr, 0, cacheModifiers,
+                                                   nullptr, nullptr, nullptr);
+        break;
+      case 128:
+        if (multicastMask)
+          ROCDL::ClusterLoadAsyncToLDSB128Op::create(
+              rewriter, loc, srcPtr, shmemAddr, 0, cacheModifiers,
+              multicastMask, nullptr, nullptr, nullptr);
+        else
+          ROCDL::GlobalLoadAsyncToLDSB128Op::create(
+              rewriter, loc, srcPtr, shmemAddr, 0, cacheModifiers, nullptr,
+              nullptr, nullptr);
+        break;
+      default:
+        llvm_unreachable("Unsupported vec size for async load");
       }
     }
   }
@@ -1331,6 +1351,11 @@ struct AsyncTDMScatterOpConversion
     auto loc = op.getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
 
+    // Multi-CTA not supported for scatter
+    if (lookupNumCTAs(op) > 1) {
+      return op.emitError("TDM scatter does not support multi-CTA");
+    }
+
     auto tensorDescTy = op.getDesc().getType();
     auto smemTy = op.getSrc().getType();
     Type elementType = getTypeConverter()->convertType(smemTy.getElementType());
@@ -1384,10 +1409,109 @@ struct AsyncTDMScatterOpConversion
 
     // Predicate must be i32 (not i1) to match other elements in group0
     Value pred = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
-    mlir::LLVM::AMD::emitTDMScatter(rewriter, loc, getTypeConverter(), desc,
-                                    shapePerCTA, srcPtr, pred, elementType,
-                                    barrierPtr, cgaLayout, ctaId, dstRowIndices,
-                                    dstColOffset, use32BitIndices);
+    mlir::LLVM::AMD::emitTDMGatherScatter(
+        rewriter, loc, getTypeConverter(), desc, shapePerCTA, /*padInterval=*/0,
+        /*padAmount=*/0, srcPtr, pred, elementType, barrierPtr, cgaLayout,
+        ctaId, dstRowIndices, dstColOffset, use32BitIndices,
+        /*isGather=*/false);
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+struct AsyncTDMGatherOpConversion
+    : public ConvertOpToLLVMPattern<triton::amdgpu::AsyncTDMGatherOp>,
+      public LoadStoreConversionBase {
+  AsyncTDMGatherOpConversion(LLVMTypeConverter &converter,
+                             const AMD::TargetInfo &targetInfo,
+                             ModuleAxisInfoAnalysis &axisAnalysisPass,
+                             PatternBenefit benefit)
+      : ConvertOpToLLVMPattern(converter, benefit),
+        LoadStoreConversionBase(targetInfo, axisAnalysisPass) {}
+
+  LogicalResult
+  matchAndRewrite(triton::amdgpu::AsyncTDMGatherOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+
+    // Multi-CTA not supported for gather
+    if (lookupNumCTAs(op) > 1) {
+      return op.emitError("TDM gather does not support multi-CTA");
+    }
+
+    auto tensorDescTy = op.getDesc().getType();
+    auto smemTy = op.getDst().getType();
+    auto paddedEnc =
+        llvm::dyn_cast<PaddedSharedEncodingAttr>(smemTy.getEncoding());
+    Type elementType = getTypeConverter()->convertType(smemTy.getElementType());
+
+    SmallVector<Value> desc =
+        unpackLLElements(loc, adaptor.getDesc(), rewriter);
+
+    SmallVector<int64_t> blockShape =
+        llvm::to_vector(tensorDescTy.getBlockType().getShape());
+
+    // Gather only supports 2D tensors
+    assert(blockShape.size() == 2 &&
+           "TDM gather mode only supports 2D tensors");
+
+    auto dstMemObj = LLVM::getSharedMemoryObjectFromStruct(
+        loc, adaptor.getDst(), elementType, rewriter);
+    Value dstPtr = dstMemObj.getBase();
+    int numWarps = triton::gpu::lookupNumWarps(op);
+
+    Value barrierPtr = nullptr;
+    if (op.getBarrier()) {
+      auto smemObj = LLVM::getSharedMemoryObjectFromStruct(
+          loc, adaptor.getBarrier(),
+          typeConverter->convertType(
+              op.getBarrier().getType().getElementType()),
+          rewriter);
+      barrierPtr = smemObj.getBase();
+    }
+
+    // Get the source row indices for gather
+    SmallVector<Value> srcRowIndices =
+        unpackLLElements(loc, adaptor.getSrcRowIndices(), rewriter);
+
+    auto shapePerCTA = triton::gpu::getShapePerCTA(smemTy);
+
+    // Get the source column offset
+    Value srcColOffset = adaptor.getSrcColOffset();
+
+    // Determine index size from the element type of src_row_indices
+    auto srcRowIndicesType =
+        cast<RankedTensorType>(op.getSrcRowIndices().getType());
+    bool use32BitIndices =
+        srcRowIndicesType.getElementType().getIntOrFloatBitWidth() == 32;
+
+    // Create the CGA layout
+    triton::LinearLayout sharedLayout;
+    unsigned padInterval = 0;
+    unsigned padAmount = 0;
+    if (paddedEnc) {
+      assert(paddedEnc.getIntervals().size() == 1 &&
+             paddedEnc.getPaddings().size() == 1);
+      sharedLayout = paddedEnc.getLinearComponent();
+      padInterval = paddedEnc.getIntervals()[0];
+      padAmount = paddedEnc.getPaddings()[0];
+    } else {
+      sharedLayout = triton::gpu::toLinearLayout(smemTy);
+    }
+
+    auto kBlock = rewriter.getStringAttr("block");
+    auto cgaLayout = sharedLayout.sublayout(
+        {kBlock}, to_vector(sharedLayout.getOutDimNames()));
+    auto ctaId = targetInfo.getClusterCTAId(rewriter, loc);
+
+    // Predicate must be i32 (not i1) to match other elements in group0
+    Value pred = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
+    mlir::LLVM::AMD::emitTDMGatherScatter(
+        rewriter, loc, getTypeConverter(), desc, shapePerCTA, padInterval,
+        padAmount, dstPtr, pred, elementType, barrierPtr, cgaLayout, ctaId,
+        srcRowIndices, srcColOffset, use32BitIndices, /*isGather=*/true);
 
     rewriter.eraseOp(op);
     return success();
@@ -2207,19 +2331,20 @@ private:
   const AMD::TargetInfo &targetInfo;
 };
 
-struct AsyncTDMWaitConversion
-    : public ConvertOpToLLVMPattern<triton::amdgpu::AsyncTDMWait> {
-  AsyncTDMWaitConversion(LLVMTypeConverter &converter, PatternBenefit benefit)
+struct AsyncTDMIntrinsicWaitConversion
+    : public ConvertOpToLLVMPattern<triton::amdgpu::AsyncTDMIntrinsicWait> {
+  AsyncTDMIntrinsicWaitConversion(LLVMTypeConverter &converter,
+                                  PatternBenefit benefit)
       : ConvertOpToLLVMPattern(converter, benefit) {}
 
   LogicalResult
-  matchAndRewrite(triton::amdgpu::AsyncTDMWait op, OpAdaptor adaptor,
+  matchAndRewrite(triton::amdgpu::AsyncTDMIntrinsicWait op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     LLVM::createLLVMIntrinsicCallOp(rewriter, loc,
                                     "llvm.amdgcn.s.wait.tensorcnt", {},
-                                    {b.i16_val(op.getNum())});
+                                    {b.i16_val(op.getCount())});
     rewriter.eraseOp(op);
     return success();
   }
@@ -2325,17 +2450,18 @@ void populateLoadStoreOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                        RewritePatternSet &patterns,
                                        ModuleAxisInfoAnalysis &axisInfoAnalysis,
                                        PatternBenefit benefit) {
-  patterns.add<
-      AtomicCASOpConversion, AtomicRMWOpConversion, LoadOpConversion,
-      StoreOpConversion, BufferLoadOpConversion, BufferLoadToLocalOpConversion,
-      BufferStoreOpConversion, BufferAtomicRMWOpConversion,
-      AsyncCopyGlobalToLocalOpConversion, AsyncCopyLocalToGlobalOpConversion,
-      BufferAtomicCASOpConversion, AsyncTDMCopyGlobalToLocalOpConversion,
-      AsyncTDMCopyLocalToGlobalOpConversion, AsyncTDMScatterOpConversion>(
+  patterns.add<AtomicCASOpConversion, AtomicRMWOpConversion, LoadOpConversion,
+               StoreOpConversion, BufferLoadOpConversion,
+               BufferLoadToLocalOpConversion, BufferStoreOpConversion,
+               BufferAtomicRMWOpConversion, AsyncCopyGlobalToLocalOpConversion,
+               AsyncCopyLocalToGlobalOpConversion, BufferAtomicCASOpConversion,
+               AsyncTDMCopyGlobalToLocalOpConversion,
+               AsyncTDMCopyLocalToGlobalOpConversion,
+               AsyncTDMScatterOpConversion, AsyncTDMGatherOpConversion>(
       typeConverter, targetInfo, axisInfoAnalysis, benefit);
   patterns.add<AsyncWaitOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<TDMPrefetchConversion>(typeConverter, targetInfo, benefit);
-  patterns.add<AsyncTDMWaitConversion>(typeConverter, benefit);
+  patterns.add<AsyncTDMIntrinsicWaitConversion>(typeConverter, benefit);
   patterns.add<AsyncCommitGroupOpConversion>(typeConverter, benefit);
   patterns.add<AsyncCopyMbarrierArriveOpConversion>(typeConverter, benefit);
 }

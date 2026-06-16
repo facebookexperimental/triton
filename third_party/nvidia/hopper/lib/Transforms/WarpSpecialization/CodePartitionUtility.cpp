@@ -2867,6 +2867,12 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
   // happen with data-partitioned computation groups where one producer feeds
   // multiple consumer partitions. If all producer tasks are co-located with
   // consumers, no cross-partition channel is needed.
+  // If producer has no task ID (e.g., an alloc that was hoisted above
+  // all partitions or never assigned), skip channel creation — there is
+  // no producer partition to synchronize with.
+  if (producerTaskIds.empty())
+    return;
+
   AsyncTaskId producerTaskId = -1;
   if (producerTaskIds.size() > 1) {
     DenseSet<int> consumerTaskIdSet(consumerTaskIds.begin(),

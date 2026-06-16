@@ -70,7 +70,7 @@ static BlockInfo buildBlockInfoFromBlock(Block *block, Allocation *allocation) {
             if (isa<MemoryEffects::Write>(eff.getEffect()))
               info.syncWriteSlices[slice].insert(op);
             else if (isa<MemoryEffects::Read>(eff.getEffect()))
-              info.syncWriteSlices[slice].insert(op);
+              info.syncReadSlices[slice].insert(op);
           }
         }
       }
@@ -89,42 +89,24 @@ static void emitClusterBarrier(PatternRewriter &r, Location loc,
   ROCDL::SchedBarrier::create(r, loc, 0);
 }
 
-// Emit an s_setprio for a cluster's hardware scheduling priority.  When the
-// cluster carries an explicit triton.warp_pipeline.priority attribute we set
-// that value; when it doesn't but some *other* stage in the pipeline does, we
-// reset to the default priority so the hint does not leak across stages.
-// Clusters with no priority in a pipeline where nobody uses priority (e.g.
-// gluon borders) emit nothing.
 static void emitClusterPriority(PatternRewriter &r, Location loc,
                                 Operation *clusterOp, bool anyHasPriority) {
   if (auto intAttr = clusterOp->getAttrOfType<IntegerAttr>(
           "triton.warp_pipeline.priority")) {
     ROCDL::SetPrioOp::create(r, loc, intAttr.getInt());
   } else if (anyHasPriority) {
+    // Reset to default when other stages use priority.
     ROCDL::SetPrioOp::create(r, loc, 0);
   }
 }
 
-// Wrap a pre-existing barrier op (e.g. async_wait) with sched_barriers so the
-// backend scheduler cannot move ops across it, and emit the cluster's priority
-// just before the barrier.  Used in place of inserting a fresh cluster barrier
-// when one already exists at the cluster boundary.
-static void wrapExistingBarrier(PatternRewriter &b, Location loc,
-                                Operation *clusterOp,
-                                Operation *existingBarrier,
-                                bool anyHasPriority) {
-  b.setInsertionPoint(existingBarrier);
-  emitClusterPriority(b, loc, clusterOp, anyHasPriority);
-  ROCDL::SchedBarrier::create(b, loc, 0);
-  b.setInsertionPointAfter(existingBarrier);
-  ROCDL::SchedBarrier::create(b, loc, 0);
-}
-
 class ConvertPipelinedForPattern : public OpRewritePattern<scf::ForOp> {
 public:
-  ConvertPipelinedForPattern(MLIRContext *ctx, ModuleAllocation &moduleAlloc)
+  ConvertPipelinedForPattern(MLIRContext *ctx, ModuleAllocation &moduleAlloc,
+                             int threadsPerPipelineGroup)
       : OpRewritePattern<scf::ForOp>(ctx, /*benefit=*/2),
-        moduleAllocation(moduleAlloc) {}
+        moduleAllocation(moduleAlloc),
+        threadsPerPipelineGroup(threadsPerPipelineGroup) {}
 
   LogicalResult matchAndRewrite(scf::ForOp forOp,
                                 PatternRewriter &rewriter) const override {
@@ -139,7 +121,8 @@ public:
     if (!allocation)
       return rewriter.notifyMatchFailure(forOp, "no Allocation for function");
 
-    if (failed(emitPipelinedFor(rewriter, forOp.getLoc(), forOp, allocation)))
+    if (failed(emitPipelinedFor(rewriter, forOp.getLoc(), forOp, allocation,
+                                threadsPerPipelineGroup)))
       return failure();
 
     return success();
@@ -147,8 +130,8 @@ public:
 
 private:
   LogicalResult emitPipelinedFor(PatternRewriter &b, Location loc,
-                                 scf::ForOp forOp,
-                                 Allocation *allocation) const {
+                                 scf::ForOp forOp, Allocation *allocation,
+                                 int threadsPerPipelineGroup) const {
     // 1. Insert conditional branch first,
     b.setInsertionPoint(forOp);
     // Set barrier before starting the loop. This resolves any outstanding
@@ -162,7 +145,8 @@ private:
     auto i32ty = b.getIntegerType(32);
     auto workIDX = ROCDL::ThreadIdXOp::create(b, loc, i32ty);
     auto constZero = arith::ConstantIntOp::create(b, loc, 0, 32);
-    auto constWarpSize = arith::ConstantIntOp::create(b, loc, 256, 32);
+    auto constWarpSize =
+        arith::ConstantIntOp::create(b, loc, threadsPerPipelineGroup, 32);
     auto warpIDX = arith::DivSIOp::create(b, loc, workIDX, constWarpSize);
     auto warpLow = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq,
                                          warpIDX, constZero);
@@ -170,11 +154,6 @@ private:
                                           warpIDX, constZero);
 
     mlir::triton::amdgpu::CondBarrierOp::create(b, loc, warpHigh);
-
-    // Insert condbarrier::first_half after the end of the loop
-    b.setInsertionPointAfter(forOp);
-    auto warpLowBarrier =
-        mlir::triton::amdgpu::CondBarrierOp::create(b, loc, warpLow);
 
     // 2. Collect existing barrier information.
     // Scanning the loop body and classifying each consecutive block of
@@ -198,8 +177,8 @@ private:
         clusterBlocks.push_back(&exeOp->getRegion(0).front());
         bars.push_back(false);
       } else if (isa<ROCDL::BarrierOp, gpu::BarrierOp, triton::gpu::AsyncWaitOp,
-                     triton::amdgpu::AsyncWaitOp, triton::amdgpu::AsyncTDMWait>(
-                     op)) {
+                     triton::amdgpu::AsyncWaitOp, triton::amdgpu::AsyncTDMWait,
+                     triton::amdgpu::AsyncTDMIntrinsicWait>(op)) {
         int currCluster = clusterBlocks.size();
         // Reject if multiple barriers appear without an intervening cluster.
         // This is functionally valid but may cause unpredictable timing. Users
@@ -222,12 +201,12 @@ private:
     for (auto cb : clusterBlocks)
       clusterInfo.push_back(buildBlockInfoFromBlock(cb, allocation));
     int numClusters = clusterInfo.size();
-    LDBG("total clusters : " << numClusters);
 
-    // Check if any cluster has explicit priority (gluon borders never do).
+    // Check if any cluster has explicit priority.
     bool anyHasPriority = llvm::any_of(clusterOps, [](Operation *op) {
       return op->hasAttr("triton.warp_pipeline.priority");
     });
+    LDBG("total clusters : " << numClusters);
 
     // Normally, we don't expect a pipelined loop begins with a barrier
     // but sometimes required by memory prefetching pattern.
@@ -294,39 +273,39 @@ private:
     //    the first cluster barrier must be inserted just before the loop’s
     //    terminator, forming the wrap-around dependency.
     for (int i = 0; i < numClusters; i++) {
-      if (i == 0 && topBar == existingBarrierMap.end()) {
-        // Prime the first iteration's priority.  The loop-carried cluster-0
-        // barrier sits at the bottom of the loop body, so it only controls
-        // the next iteration.
-        b.setInsertionPoint(forOp);
-        emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
-      }
-
       if (auto exBar = existingBarrierMap.find(i);
           exBar != existingBarrierMap.end()) {
-        wrapExistingBarrier(b, loc, clusterOps[i], exBar->second,
-                            anyHasPriority);
+        auto exBarOp = exBar->second;
+        b.setInsertionPoint(exBarOp);
+        emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
+        ROCDL::SchedBarrier::create(b, loc, 0);
+        b.setInsertionPointAfter(exBarOp);
+        ROCDL::SchedBarrier::create(b, loc, 0);
       } else {
         b.setInsertionPoint(clusterOps[i]);
         // The first one wraps back to the last of the loop
-        if (i == 0 && topBar == existingBarrierMap.end())
+        if (i == 0 && topBar == existingBarrierMap.end()) {
+          // Extra setprio needed before the loop for the first cluster
+          b.setInsertionPoint(forOp);
+          emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
           // inserts just before yield (=End of the loop).
           b.setInsertionPoint(terminatorOp);
+        }
         emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
         emitClusterBarrier(b, loc, /*needLocal=*/bars[i]);
       }
     }
 
-    // Post-loop priority reset: drop back to default priority before the warps
-    // reconverge, so the hint does not leak past the pipelined loop.
-    if (anyHasPriority) {
-      b.setInsertionPoint(warpLowBarrier);
+    // Insert condbarrier and priority reset after the loop.
+    b.setInsertionPointAfter(forOp);
+    if (anyHasPriority)
       ROCDL::SetPrioOp::create(b, loc, 0);
-    }
+    mlir::triton::amdgpu::CondBarrierOp::create(b, loc, warpLow);
     return success();
   }
 
   ModuleAllocation &moduleAllocation;
+  int threadsPerPipelineGroup;
 };
 
 class InlineWarpPipelineExecuteRegionPattern
@@ -370,13 +349,30 @@ public:
 struct ConvertWarpPipeline
     : public mlir::triton::impl::ConvertWarpPipelineBase<ConvertWarpPipeline> {
 
+public:
+  ConvertWarpPipeline(StringRef arch)
+      : ConvertWarpPipelineBase<ConvertWarpPipeline>() {
+    this->arch = arch.str();
+  }
+
   void runOnOperation() override {
     ModuleOp m = getOperation();
     ModuleAllocation moduleAllocation(m);
+    mlir::triton::AMD::TargetInfo targetInfo(arch.getValue());
+    if (targetInfo.getISAFamily() == mlir::triton::AMD::ISAFamily::Unknown) {
+      m.emitError("unsupported target: '") << arch.getValue() << "'";
+      return signalPassFailure();
+    }
+    // Thread count of one warp-pipeline group.
+    // A block runs on 4 SIMDs with 2 warps per SIMD. Warp-pipelining splits
+    // these warps into two groups (one warp per SIMD) that execute different
+    // stages at different times.
+    int threadsPerPipelineGroup = targetInfo.getWarpSize() * 4;
 
     RewritePatternSet patternFor(&getContext());
     RewritePatternSet patternInline(&getContext());
-    patternFor.add<ConvertPipelinedForPattern>(&getContext(), moduleAllocation);
+    patternFor.add<ConvertPipelinedForPattern>(&getContext(), moduleAllocation,
+                                               threadsPerPipelineGroup);
     patternInline.add<InlineWarpPipelineExecuteRegionPattern>(&getContext());
 
     if (failed(applyPatternsGreedily(m, std::move(patternFor))))
@@ -389,7 +385,8 @@ struct ConvertWarpPipeline
 } // namespace
 
 namespace mlir::triton::AMD {
-std::unique_ptr<OperationPass<ModuleOp>> createConvertWarpPipelinePass() {
-  return std::make_unique<ConvertWarpPipeline>();
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertWarpPipelinePass(StringRef arch) {
+  return std::make_unique<ConvertWarpPipeline>(arch);
 }
 } // namespace mlir::triton::AMD
