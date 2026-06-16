@@ -4064,6 +4064,8 @@ static void cleanupTmemTokens(triton::FuncOp funcOp) {
 // Split local_alloc ops that have a tensor source into a separate
 // empty local_alloc + local_store. This ensures doCodePartitionPost
 // can detect cross-task SMEM channels via the LocalStoreOp producer.
+// The local_store's task ID (assigned below) determines the producer
+// partition for that channel.
 static void separateLocalAllocWithSrc(triton::FuncOp &funcOp) {
   SmallVector<ttg::LocalAllocOp> toSplit;
   funcOp.walk([&](ttg::LocalAllocOp allocOp) {
@@ -4085,7 +4087,26 @@ static void separateLocalAllocWithSrc(triton::FuncOp &funcOp) {
 
     auto originTaskIds = builder.getAsyncTaskIds();
     auto originLoopScheduleInfo = builder.getLoopScheduleInfo();
-    builder.setAsyncTaskIdsFromOp(allocOp);
+
+    // Determine the producer task IDs for the local_store. Prefer the
+    // source value's defining op's task IDs (the actual data producer)
+    // over the alloc's task IDs (which include all consumers from
+    // backward propagation). This enables 1->N channels where a single
+    // TMA load produces data consumed by multiple warp groups.
+    Value src = allocOp.getSrc();
+    Operation *srcOp = src.getDefiningOp();
+    SmallVector<AsyncTaskId> srcTaskIds;
+    if (srcOp)
+      srcTaskIds = getAsyncTaskIds(srcOp);
+
+    if (srcOp && srcTaskIds.size() == 1) {
+      // Source has a single task ID -- use it as the producer.
+      builder.setAsynTaskIdsFromArray(srcTaskIds);
+    } else {
+      // Fallback: source has no defining op, no task IDs, or multiple
+      // task IDs. Use the alloc's task IDs (original behavior).
+      builder.setAsyncTaskIdsFromOp(allocOp);
+    }
     builder.setLoopScheduleInfoFromOp(allocOp);
     auto storeOp = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
         allocOp.getLoc(), allocOp.getSrc(), newAlloc);

@@ -10,6 +10,8 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "llvm/Support/Debug.h"
+#include <algorithm>
+#include <optional>
 
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
@@ -544,37 +546,180 @@ struct NVGPUTestTMAStoreTokenWaitReorderPass
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
 
 // Count TMA store-like ops (AsyncTMACopyLocalToGlobalOp and AsyncTMAReduceOp)
-// in [from, to) within a block.
-static int countTMAStoresInRange(Block::iterator from, Block::iterator to) {
+// in [from, to) within a block. An scf.if contributes the minimum store count
+// across its branches; if there is no else region, the else contribution is 0.
+struct ConditionBranch {
+  Value condition;
+  bool takeThen;
+};
+
+using ConditionContext = SmallVector<ConditionBranch, 4>;
+
+static bool isInRegion(Operation *op, Region &region) {
+  return region.findAncestorOpInRegion(*op) != nullptr;
+}
+
+static ConditionContext getConditionContext(Operation *op) {
+  ConditionContext context;
+  for (Operation *parent = op->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    auto ifOp = dyn_cast<scf::IfOp>(parent);
+    if (!ifOp)
+      continue;
+
+    if (isInRegion(op, ifOp.getThenRegion())) {
+      context.push_back({ifOp.getCondition(), /*takeThen=*/true});
+    } else if (isInRegion(op, ifOp.getElseRegion())) {
+      context.push_back({ifOp.getCondition(), /*takeThen=*/false});
+    }
+  }
+  return context;
+}
+
+static std::optional<bool>
+getConsistentBranch(scf::IfOp ifOp, const ConditionContext &context) {
+  for (const ConditionBranch &branch : context) {
+    if (samePureValue(ifOp.getCondition(), branch.condition))
+      return branch.takeThen;
+  }
+  return std::nullopt;
+}
+
+static int countTMAStoresInRange(Block::iterator from, Block::iterator to,
+                                 const ConditionContext &context);
+
+static int countTMAStoresInRegion(Region &region,
+                                  const ConditionContext &context) {
+  if (region.empty())
+    return 0;
+
+  Block &block = region.front();
+  return countTMAStoresInRange(block.begin(), block.end(), context);
+}
+
+static int countTMAStoreContribution(Operation *op,
+                                     const ConditionContext &context) {
+  if (isTMAStoreLikeOp(op))
+    return 1;
+
+  if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+    if (std::optional<bool> branch = getConsistentBranch(ifOp, context)) {
+      Region &selectedRegion =
+          *branch ? ifOp.getThenRegion() : ifOp.getElseRegion();
+      return countTMAStoresInRegion(selectedRegion, context);
+    }
+
+    int thenCount = countTMAStoresInRegion(ifOp.getThenRegion(), context);
+    int elseCount = ifOp.getElseRegion().empty()
+                        ? 0
+                        : countTMAStoresInRegion(ifOp.getElseRegion(), context);
+    return std::min(thenCount, elseCount);
+  }
+
+  return 0;
+}
+
+static int countTMAStoresInRange(Block::iterator from, Block::iterator to,
+                                 const ConditionContext &context) {
   int count = 0;
   for (auto it = from; it != to; ++it) {
-    if (isTMAStoreLikeOp(&*it))
-      ++count;
+    count += countTMAStoreContribution(&*it, context);
   }
   return count;
 }
 
-// Compute the pendings value for a TMAStoreTokenWaitOp.
-// pendings = number of TMA store-like ops issued after the token's defining
-// store and before this wait, in program execution order.
-static int computePendings(ttng::TMAStoreTokenWaitOp waitOp) {
-  Value token = waitOp.getToken();
+static std::optional<int>
+countTMAStoresUntilWait(Block *block, Block::iterator from,
+                        ttng::TMAStoreTokenWaitOp waitOp,
+                        const ConditionContext &context) {
+  if (waitOp->getBlock() == block)
+    return countTMAStoresInRange(from, waitOp->getIterator(), context);
+
+  int count = 0;
+  for (auto it = from; it != block->end(); ++it) {
+    Operation *op = &*it;
+    if (!op->isProperAncestor(waitOp)) {
+      count += countTMAStoreContribution(op, context);
+      continue;
+    }
+
+    for (Region &region : op->getRegions()) {
+      if (!isInRegion(waitOp, region))
+        continue;
+      if (region.empty())
+        return count;
+      if (std::optional<int> inner = countTMAStoresUntilWait(
+              &region.front(), region.front().begin(), waitOp, context))
+        return count + *inner;
+      return std::nullopt;
+    }
+    return std::nullopt;
+  }
+
+  return std::nullopt;
+}
+
+static std::optional<int>
+computePendingsFromToken(Value token, ttng::TMAStoreTokenWaitOp waitOp,
+                         const ConditionContext &context, unsigned depth = 0) {
+  if (depth > 8)
+    return std::nullopt;
 
   // Direct case: token defined by a TMA store-like op in same block.
   auto directDef = token.getDefiningOp();
   if (directDef && isTMAStoreLikeOp(directDef)) {
-    if (directDef->getBlock() == waitOp->getBlock()) {
-      return countTMAStoresInRange(std::next(directDef->getIterator()),
-                                   waitOp->getIterator());
-    }
-    return 0;
+    return countTMAStoresUntilWait(directDef->getBlock(),
+                                   std::next(directDef->getIterator()), waitOp,
+                                   context);
+  }
+
+  // If-result case: count after the defining if, excluding the defining if
+  // itself to match direct-token semantics.
+  if (auto ifOp = token.getDefiningOp<scf::IfOp>()) {
+    return countTMAStoresUntilWait(
+        ifOp->getBlock(), std::next(ifOp->getIterator()), waitOp, context);
+  }
+
+  // Loop result case: the result may come from the loop body yield, or from the
+  // initial iter_arg if the loop executes zero times. Use the conservative
+  // minimum across both paths.
+  if (auto forOp = token.getDefiningOp<scf::ForOp>()) {
+    auto result = cast<OpResult>(token);
+    unsigned iterArgIdx = result.getResultNumber();
+    auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+    if (iterArgIdx >= yieldOp.getNumOperands() ||
+        iterArgIdx >= forOp.getInitArgs().size())
+      return std::nullopt;
+
+    Value yieldedVal = yieldOp.getOperand(iterArgIdx);
+    auto yieldDef = yieldedVal.getDefiningOp();
+    if (!yieldDef || !isTMAStoreLikeOp(yieldDef) ||
+        yieldDef->getBlock() != forOp.getBody())
+      return std::nullopt;
+
+    Block *body = forOp.getBody();
+    std::optional<int> afterLoop = countTMAStoresUntilWait(
+        forOp->getBlock(), std::next(forOp->getIterator()), waitOp, context);
+    if (!afterLoop)
+      return std::nullopt;
+
+    int loopPath = countTMAStoresInRange(std::next(yieldDef->getIterator()),
+                                         body->end(), context) +
+                   *afterLoop;
+
+    std::optional<int> initPath = computePendingsFromToken(
+        forOp.getInitArgs()[iterArgIdx], waitOp, context, depth + 1);
+    if (!initPath)
+      return std::nullopt;
+
+    return std::min(loopPath, *initPath);
   }
 
   // Loop-carried case: token is a block argument of an scf.for body.
   if (auto blockArg = dyn_cast<BlockArgument>(token)) {
     auto forOp = dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp());
     if (!forOp)
-      return 0;
+      return std::nullopt;
 
     unsigned iterArgIdx = blockArg.getArgNumber() - 1;
     auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
@@ -584,20 +729,32 @@ static int computePendings(ttng::TMAStoreTokenWaitOp waitOp) {
     auto defOp = yieldedVal.getDefiningOp();
     if (!defOp || !isTMAStoreLikeOp(defOp) ||
         defOp->getBlock() != forOp.getBody())
-      return 0;
+      return std::nullopt;
 
     Block *body = forOp.getBody();
 
     // Stores after the def until end of loop body (excluding yield).
-    int storesAfterDef =
-        countTMAStoresInRange(std::next(defOp->getIterator()), body->end());
+    int storesAfterDef = countTMAStoresInRange(std::next(defOp->getIterator()),
+                                               body->end(), context);
 
     // Stores from start of loop body until the wait.
     int storesBeforeWait =
-        countTMAStoresInRange(body->begin(), waitOp->getIterator());
+        countTMAStoresInRange(body->begin(), waitOp->getIterator(), context);
 
     return storesAfterDef + storesBeforeWait;
   }
+
+  return std::nullopt;
+}
+
+// Compute the pendings value for a TMAStoreTokenWaitOp.
+// pendings = number of TMA store-like ops issued after the token's defining
+// store and before this wait, in program execution order.
+static int computePendings(ttng::TMAStoreTokenWaitOp waitOp) {
+  ConditionContext context = getConditionContext(waitOp);
+  if (std::optional<int> count =
+          computePendingsFromToken(waitOp.getToken(), waitOp, context))
+    return *count;
 
   // Fallback: unknown pattern, drain all stores.
   return 0;

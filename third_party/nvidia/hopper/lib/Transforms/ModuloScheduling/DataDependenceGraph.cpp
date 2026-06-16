@@ -35,6 +35,7 @@ unsigned DataDependenceGraph::addNode(Operation *op,
   node.latency = info.latency;
   node.selfLatency = info.selfLatency;
   node.minWarps = info.minWarps;
+  node.occupancy = info.occupancy;
   nodes.push_back(node);
   opToIdx[op] = idx;
   return idx;

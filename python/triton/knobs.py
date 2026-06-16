@@ -10,7 +10,20 @@ import pathlib
 
 from dataclasses import dataclass
 from contextlib import contextmanager
-from typing import cast, Any, Callable, Generator, Generic, Optional, Protocol, Type, TypeVar, TypedDict, TYPE_CHECKING, Union
+from typing import (
+    cast,
+    Any,
+    Callable,
+    Generator,
+    Generic,
+    Optional,
+    Protocol,
+    Type,
+    TypeVar,
+    TypedDict,
+    TYPE_CHECKING,
+    Union,
+)
 
 from triton._C.libtriton import getenv, getenv_bool  # type: ignore
 
@@ -259,12 +272,19 @@ class CompileTimes:
 
 class CompilationListener(Protocol):
 
-    def __call__(self, *, src: Union[ASTSource, IRSource], metadata: dict[str, Any], metadata_group: dict[str, str],
-                 times: CompileTimes, cache_hit: bool) -> None:
+    def __call__(
+        self,
+        *,
+        src: Union[ASTSource, IRSource],
+        metadata: dict[str, Any],
+        metadata_group: dict[str, str],
+        times: CompileTimes,
+        cache_hit: bool,
+    ) -> None:
         ...
 
 
-knobs_type = TypeVar("knobs_type", bound='base_knobs')
+knobs_type = TypeVar("knobs_type", bound="base_knobs")
 
 
 class base_knobs:
@@ -311,13 +331,23 @@ class base_knobs:
 
 class BuildImpl(Protocol):
 
-    def __call__(self, name: str, src: str, srcdir: str, library_dirs: list[str], include_dirs: list[str],
-                 libraries: list[str], ccflags: list[str], /) -> str:
+    def __call__(
+        self,
+        name: str,
+        src: str,
+        srcdir: str,
+        library_dirs: list[str],
+        include_dirs: list[str],
+        libraries: list[str],
+        ccflags: list[str],
+        /,
+    ) -> str:
         ...
 
 
 class build_knobs(base_knobs):
     """Configuration controlling how the native compiler is invoked"""
+
     cc: env_opt_str = env_opt_str("CC")
 
     cudacrt_path: env_opt_str = env_opt_str("TRITON_CUDACRT_PATH")
@@ -382,8 +412,7 @@ class autotuning_knobs(base_knobs):
 
 
 class LaunchHook(Protocol):
-    """Hook invoked before and after kernel launching
-    """
+    """Hook invoked before and after kernel launching"""
 
     def __call__(self, metadata: LazyDict) -> None:
         ...
@@ -409,8 +438,7 @@ F = TypeVar("F", bound=Callable)
 
 
 class HookChain(Generic[F]):
-    """A chain of hooks of the same type F to be called in order.
-    """
+    """A chain of hooks of the same type F to be called in order."""
 
     def __init__(self, reversed: bool = False):
         self.calls: list[F] = []
@@ -458,8 +486,16 @@ class JITHookCompileInfo(TypedDict):
 
 class JITHook(Protocol):
 
-    def __call__(self, *, key: str, repr: str, fn: JitFunctionInfo, compile: JITHookCompileInfo, is_manual_warmup: bool,
-                 already_compiled: bool) -> Optional[bool]:
+    def __call__(
+        self,
+        *,
+        key: str,
+        repr: str,
+        fn: JitFunctionInfo,
+        compile: JITHookCompileInfo,
+        is_manual_warmup: bool,
+        already_compiled: bool,
+    ) -> Optional[bool]:
         ...
 
 
@@ -517,13 +553,12 @@ class nvidia_knobs(base_knobs):
     use_modulo_schedule: env_opt_str = env_opt_str("TRITON_USE_MODULO_SCHEDULE")
     use_llm_schedule: env_bool = env_bool("TRITON_USE_LLM_SCHEDULE")
     disable_wsbarrier_reorder: env_bool = env_bool("TRITON_DISABLE_WSBARRIER_REORDER")
-    # Force OAI SWP schedule even when using Meta's WS implementation.
-    force_trunk_swp_schedule: env_bool = env_bool("TRITON_FORCE_TRUNK_SWP_SCHEDULE")
     dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
     dump_tlx_benchmark: env_bool = env_bool("TRITON_DUMP_TLX_BENCHMARK")
     use_no_compile_launcher: env_bool = env_bool("TRITON_USE_NO_COMPILE_LAUNCHER")
     use_llvm_launcher: env_bool = env_bool("TRITON_USE_LLVM_LAUNCHER")
     use_triton_dispatcher: env_bool = env_bool("TRITON_USE_TRITON_DISPATCHER")
+    use_autotune_c_cache: env_bool = env_bool("TRITON_AUTOTUNE_USE_C_CACHE")
     generate_subtiled_region: env_bool = env_bool("TRITON_GENERATE_SUBTILED_REGION")
     # When True, run the triton-nvidia-interleave-tmem pass on Blackwell.
     # Default ON; set TRITON_ENABLE_INTERLEAVE_TMEM=0 to opt out for A/B
@@ -559,7 +594,8 @@ class proton_knobs(base_knobs):
     disable: env_bool = env_bool("TRITON_PROTON_DISABLE", False)
     cupti_lib_dir: env_str = env_str(
         "TRITON_CUPTI_LIB_PATH",
-        str(pathlib.Path(__file__).parent.absolute() / "backends" / "nvidia" / "lib" / "cupti"))
+        str(pathlib.Path(__file__).parent.absolute() / "backends" / "nvidia" / "lib" / "cupti"),
+    )
     profile_buffer_size: env_int = env_int("TRITON_PROFILE_BUFFER_SIZE", 64 * 1024 * 1024)
     enable_nvtx: env_bool = env_bool("TRITON_ENABLE_NVTX", True)
     # This knob is effective only on Blackwell+ GPUs.
