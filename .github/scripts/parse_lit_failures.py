@@ -21,9 +21,7 @@ import os
 import re
 
 # e.g. "FAIL: TRITON :: Conversion/foo.mlir (12 of 345)"
-LIT_LINE = re.compile(
-    r"^(?:FAIL|UNRESOLVED|TIMEOUT|XPASS):\s+(.*?)\s*(?:\(\d+ of \d+\))?\s*$"
-)
+LIT_LINE = re.compile(r"^(?:FAIL|UNRESOLVED|TIMEOUT|XPASS):\s+(.*?)\s*(?:\(\d+ of \d+\))?\s*$")
 
 
 def parse_log(path):
@@ -49,15 +47,13 @@ def build_items(ids, workflow, job, bucket):
         ids = [bucket]
     items = []
     for ident in ids:
-        items.append(
-            {
-                "normalized_failure_id": ident,
-                "raw_failure_ids": ident,
-                "issue_title": f"[nightly] {workflow} / {job} / {ident}",
-                "job_name": job,
-                "summary": f"LIT test failed: {ident}",
-            }
-        )
+        items.append({
+            "normalized_failure_id": ident,
+            "raw_failure_ids": ident,
+            "issue_title": f"[nightly] {workflow} / {job} / {ident}",
+            "job_name": job,
+            "summary": f"LIT test failed: {ident}",
+        })
     return items
 
 

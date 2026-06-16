@@ -85,15 +85,13 @@ def build_items(failures, workflow, job):
     items = []
     for norm in order:
         info = grouped[norm]
-        items.append(
-            {
-                "normalized_failure_id": norm,
-                "raw_failure_ids": "\n".join(info["raw"]),
-                "issue_title": f"[nightly] {workflow} / {job} / {norm}",
-                "job_name": job,
-                "summary": info["summary"],
-            }
-        )
+        items.append({
+            "normalized_failure_id": norm,
+            "raw_failure_ids": "\n".join(info["raw"]),
+            "issue_title": f"[nightly] {workflow} / {job} / {norm}",
+            "job_name": job,
+            "summary": info["summary"],
+        })
     return items
 
 
@@ -126,16 +124,12 @@ def main():
     parser.add_argument("--junit", nargs="+", required=True, help="JUnit XML file(s)")
     parser.add_argument("--workflow", required=True, help="Workflow name (for title)")
     parser.add_argument("--job", required=True, help="Job name (for title)")
-    parser.add_argument(
-        "--output-name", default="failures", help="GITHUB_OUTPUT key to write"
-    )
+    parser.add_argument("--output-name", default="failures", help="GITHUB_OUTPUT key to write")
     parser.add_argument(
         "--failed",
         action="store_true",
-        help=(
-            "Explicitly signal that the job/step failed; emit a fallback item "
-            "if no test failures can be parsed from JUnit XML."
-        ),
+        help=("Explicitly signal that the job/step failed; emit a fallback item "
+              "if no test failures can be parsed from JUnit XML."),
     )
     parser.add_argument(
         "--bucket",
