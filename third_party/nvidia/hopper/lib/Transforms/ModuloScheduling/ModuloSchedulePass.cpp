@@ -387,6 +387,7 @@ convertDDGNode(const ttg::DDGNode &ddgNode, unsigned nodeId,
   sn.pipeline = ddgNode.pipeline;
   sn.latency = ddgNode.latency;
   sn.selfLatency = ddgNode.selfLatency;
+  sn.occupancy = ddgNode.occupancy;
   sn.minWarps = ddgNode.minWarps;
 
   auto cycleIt = sched.nodeToCycle.find(ddgNode.idx);
@@ -1631,6 +1632,11 @@ static int computeWGBarrierCost(
   llvm::SmallDenseSet<unsigned, 8> nodeSet;
   for (unsigned nid : nodeIds)
     nodeSet.insert(nid);
+  // Intrinsic per-op async-handshake barriers, counted for every loop (TC and
+  // TC-free alike). Each TMA op needs its expect_bytes + wait mbarriers, each
+  // MMA its operand waits, each tmem_store its tcgen05_commit — regardless of
+  // partition. These are part of every candidate's steady-state warp-issue
+  // stream, so they belong in the barrier cost on whichever WG owns the op.
   for (unsigned nid : nodeIds) {
     const auto &n = loop.nodes[nid];
     int freq = std::max(n.frequencyMultiplier, 1);
@@ -1754,25 +1760,13 @@ static int computeMultiPipelineMakespan(const SmallVector<unsigned> &nodeIds,
       auto it = opStart.find(edge.srcId);
       if (it == opStart.end())
         continue;
-      // Use EDGE latency, not source-node latency. The modulo scheduler
-      // already uses edge.latency for its placement constraints
-      // (consumer.cycle ≥ producer.cycle + edge.latency). Node latency
-      // can be a worst-case "result fully available" number (e.g., TMA
-      // load's full latency including async overhead) while edge latency
-      // captures the actual producer→consumer wait — e.g., edge
-      // (descriptor_load → local_alloc).latency = TMA hardware time only,
-      // because local_alloc is metadata that sits inline with the SMEM
-      // commit. Using node latency here double-counts the async overhead.
+      // Use EDGE latency, not source-node latency (the modulo scheduler's
+      // placement constraint already uses edge.latency).
       dataReady = std::max(dataReady, it->second + edge.latency);
     }
     int pipeReady = pipeAvail.lookup(node.pipeline);
     int start = std::max({dataReady, pipeReady, warpAvail});
     opStart[nid] = start;
-    // Inner-loop ops fire frequencyMultiplier times per outer iter; weight
-    // their pipeline occupancy accordingly. For non-flat callers (per-loop
-    // makespan in computeResMII) frequencyMultiplier defaults to 1.
-    // selfLat scales with the WG's warp count: an op tagged minWarps=4
-    // costs ~4× more on a 1-warp WG. See effectiveSelfLat doc comment.
     int dur = effectiveSelfLat(node, wgWarps) * node.frequencyMultiplier;
     pipeAvail[node.pipeline] = start + dur;
     warpAvail = start + dur;
@@ -2824,6 +2818,14 @@ static void propagateWarpGroupToInfraOps(ttg::ScheduleLoop &loop) {
 /// TMEM transfers (TC→CUDA) → named barrier.
 static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
   llvm::DenseSet<std::pair<unsigned, unsigned>> seenBarrierPairs;
+  // A TC-free, memory-bound loop (e.g. LayerNorm) pipelines load→compute→store
+  // across warp groups. Giving the TMA-load→compute channel depth-2 lets the
+  // load warp run a full iteration ahead of compute (prefetch), which is what
+  // turns the 3-WG split from "matches 1-WG" into "beats it ~1.2x". TC loops
+  // (GEMM/FA) keep their tuned depth-1 register channels untouched.
+  bool loopHasTC = llvm::any_of(loop.nodes, [](const ttg::ScheduleNode &n) {
+    return n.pipeline == ttg::HWPipeline::TC;
+  });
   for (const auto &edge : loop.edges) {
     const auto &src = loop.nodes[edge.srcId];
     const auto &dst = loop.nodes[edge.dstId];
@@ -2900,7 +2902,21 @@ static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
       ttg::ScheduleBuffer chan;
       chan.id = loop.buffers.size();
       chan.kind = ttg::MemoryKind::SMEM;
-      chan.count = 1; // single-buffered hand-off (depth>1 needs ring logic)
+      // Depth-2 for the TMA-load→compute channel of a TC-free pipelined loop
+      // so the load warp prefetches one iteration ahead; depth-1 elsewhere
+      // (SW-produced channels and all TC-loop channels keep the simple
+      // single-buffered hand-off).
+      //
+      // Depth>1 is safe to emit here: ring indexing for count>1 cross-WG
+      // channels already exists and is exercised today (e.g. case3 FA has a
+      // depth-2 cross-WG channel), and the channel's SMEM cost scales with
+      // count via ScheduleBuffer::totalBytes() (= sizeBytes() * count), which
+      // the Step-4 budget, the JSON `total_bytes`, and the emitter's
+      // local_alloc(..., count) all consume. The sched2tlx no-MMA lowering that
+      // makes a TC-free loop emit at all is stacked on top of this diff, so a
+      // depth-2 channel is only ever produced once that consumer is present.
+      chan.count = (!loopHasTC && src.pipeline == ttg::HWPipeline::TMA) ? 2 : 1;
+      depth = chan.count;
       chan.liveStart = src.cycle;
       chan.liveEnd = dst.cycle + std::max(dst.latency, 0);
       // Derive shape + element width from the producer's result type.
@@ -3248,10 +3264,20 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
     for (auto &schedLoop : sl.graph.loops) {
       if (schedLoop.II <= 0)
         continue;
-      if (useGreedy)
+      // All loops go through the same cost-model partitioner — no TC vs TC-free
+      // special-casing. The makespan (single-iteration latency chain over each
+      // WG's pipeAvail) plus barrier cost decides the split uniformly. This
+      // rewards warp specialization wherever it overlaps independent pipelines
+      // across groups: GEMM/FA (MEM/TC/softmax) AND memory-bound loops like
+      // LayerNorm, where putting TMA-load, compute, and TMA-store on separate
+      // warp groups frees the compute warps and removes the in-stream store
+      // drain (measured ~1.2x over 1-WG software pipelining). No env flag, no
+      // hard override.
+      if (useGreedy) {
         partitionIntoWarpGroups(schedLoop);
-      else
+      } else {
         partitionExhaustive(schedLoop);
+      }
       demoteScalarArithToInfra(schedLoop);
       propagateWarpGroupToInfraOps(schedLoop);
     }
@@ -4268,6 +4294,7 @@ buildListScheduleGraph(scf::ForOp loop, const ttg::DataDependenceGraph &ddg,
     sn.pipeline = ddgNode.pipeline;
     sn.latency = ddgNode.latency;
     sn.selfLatency = ddgNode.selfLatency;
+    sn.occupancy = ddgNode.occupancy;
     sn.minWarps = ddgNode.minWarps;
     sn.stage = 0;
 

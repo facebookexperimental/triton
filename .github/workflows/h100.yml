@@ -45,8 +45,11 @@ jobs:
           fi
           EOF
       - name: Run TritonBench tests on H100 GPU
-        working-directory: /workspace/tritonbench
+        env:
+          TRITONBENCH_TEST_SKIP_FILE: ${{ github.workspace }}/.ci/tritonbench/fbtriton_skip_tests.yaml
+          TRITONBENCH_ROOT: /workspace/tritonbench
         run: |
+          . "${SETUP_SCRIPT}"
           bash ./.ci/tritonbench/test-gpu.sh
 
   h100-tlx-test:
