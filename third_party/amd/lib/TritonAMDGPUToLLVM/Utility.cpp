@@ -561,14 +561,20 @@ unsigned getVectorSize(Value ptr, ModuleAxisInfoAnalysis &axisAnalysisPass) {
     return 1;
   auto contiguity = getContiguity(ptr, axisAnalysisPass);
   auto pointeeBitWidth = triton::getPointeeBitWidth(tensorTy);
-  return std::min<unsigned>(128 / pointeeBitWidth, contiguity);
+  auto vec = std::min<unsigned>(128 / pointeeBitWidth, contiguity);
+  vec = clampVecSizeForNpot(vec, tensorTy);
+  return vec;
 }
 
 unsigned getVectorSize(Value ptr, Value offset,
                        ModuleAxisInfoAnalysis &axisAnalysisPass) {
   auto contiguity = getContiguity(ptr, offset, axisAnalysisPass);
   auto pointeeBitWidth = triton::getPointeeBitWidth(ptr.getType());
-  return std::min<unsigned>(128 / pointeeBitWidth, contiguity);
+  auto vec = std::min<unsigned>(128 / pointeeBitWidth, contiguity);
+  auto tensorTy =
+      dyn_cast<RankedTensorType>(getPointerTypeWithShape(ptr, offset));
+  vec = clampVecSizeForNpot(vec, tensorTy);
+  return vec;
 }
 
 Type scaleDotElemTypeToMLIRType(MLIRContext *ctx, triton::ScaleDotElemType t) {

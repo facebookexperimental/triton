@@ -1,5 +1,6 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/GenericSwizzling.h"
+#include "llvm/Support/MathExtras.h"
 
 namespace mlir::triton {
 
@@ -55,6 +56,22 @@ ensureLayoutNotLargerThan(const LinearLayout &layout,
     int32_t actualSize = layout.getOutDimSize(outDimName);
     int32_t desiredSize = shape.lookup(outDimName);
     if (actualSize <= desiredSize) {
+      continue;
+    }
+    if (!llvm::isPowerOf2_64(actualSize) || !llvm::isPowerOf2_64(desiredSize)) {
+      // NPOT path: zero out bases >= desiredSize.
+      for (auto &[inDimName, basis] : bases) {
+        for (size_t basisIdx = 0; basisIdx < basis.size(); basisIdx++) {
+          auto &outValue = basis[basisIdx][outDim.index()];
+          if (outValue >= desiredSize) {
+            if (!broadcastRegisters && inDimName == kRegister) {
+              broadcastedDims.insert(basisIdx);
+            } else {
+              outValue = 0;
+            }
+          }
+        }
+      }
       continue;
     }
     assert(actualSize % desiredSize == 0);
@@ -127,8 +144,16 @@ LinearLayout ensureLayoutNotSmallerThan(
   for (StringAttr outDimName : layout.getOutDimNames()) {
     int32_t actualSize = layout.getOutDimSize(outDimName);
     int32_t desiredSize = shape.lookup(outDimName);
-    assert(actualSize > desiredSize || desiredSize % actualSize == 0);
-    ret *= LinearLayout::identity1D(desiredSize / actualSize, kDim, outDimName);
+    if (actualSize >= desiredSize) {
+      // Already large enough; skip.
+      continue;
+    }
+    int32_t ratio = llvm::divideCeil(desiredSize, actualSize);
+    if (llvm::isPowerOf2_32(ratio)) {
+      ret *= LinearLayout::identity1D(ratio, kDim, outDimName);
+    } else {
+      ret *= LinearLayout::modularIdentity1D(ratio, kDim, outDimName);
+    }
     assert(ret.getOutDimSize(outDimName) >= desiredSize);
   }
   return ret;
@@ -219,7 +244,7 @@ std::optional<ColumnAction> regPermForDivide(const LinearLayout &A,
   llvm::DenseMap<StringAttr, unsigned> log2QuotSize;
   for (StringAttr out : A.getOutDimNames()) {
     log2QuotSize[out] =
-        A.getOutDimSizeLog2(out) - BBroadcast.getOutDimSizeLog2(out);
+        A.getOutDimSizeBits(out) - BBroadcast.getOutDimSizeBits(out);
     if (log2QuotSize[out] < 0)
       return std::nullopt;
   }
@@ -487,7 +512,7 @@ std::optional<LinearLayout> getReps(const LinearLayout &cvt,
   // Precompute tile out-dim bit-widths.
   llvm::SmallDenseMap<StringAttr, int> outBLog2;
   for (StringAttr od : cvt.getOutDimNames())
-    outBLog2[od] = tile.hasOutDim(od) ? tile.getOutDimSizeLog2(od) : 0;
+    outBLog2[od] = tile.hasOutDim(od) ? tile.getOutDimSizeBits(od) : 0;
 
   // Build a per-out-dimension mask by OR-ing all tile bases that touch it.
   llvm::SmallDenseMap<StringAttr, int32_t> tileMaskPerOutDim;
@@ -577,6 +602,28 @@ LinearLayout removeStandardDim(const LinearLayout &layout, int dim) {
     dimSizes[i].first = newDim;
   }
   return LinearLayout(newLayout.getBases(), dimSizes, /*isSurjective*/ false);
+}
+
+bool splitContiguousDim(int64_t tileCols, int64_t numPhases, int contigDim,
+                        LinearLayout &smemLayout, LinearLayout &otherLayout) {
+  auto *ctx = smemLayout.getOutDimNames().begin()->getContext();
+  auto kContig = StringAttr::get(ctx, "dim" + std::to_string(contigDim));
+  auto kIntra = StringAttr::get(ctx, "contig_intra");
+  auto kPhase = StringAttr::get(ctx, "contig_phase");
+
+  SmallVector<std::pair<StringAttr, int32_t>> newOutDims;
+  for (auto [name, size] : smemLayout.getOutDims()) {
+    if (name == kContig) {
+      newOutDims.push_back({kIntra, static_cast<int32_t>(tileCols)});
+      newOutDims.push_back({kPhase, static_cast<int32_t>(numPhases)});
+    } else {
+      newOutDims.push_back({name, size});
+    }
+  }
+
+  smemLayout = smemLayout.reshapeOuts(newOutDims);
+  otherLayout = otherLayout.reshapeOuts(newOutDims);
+  return true;
 }
 
 } // namespace mlir::triton
