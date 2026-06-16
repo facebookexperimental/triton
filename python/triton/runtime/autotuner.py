@@ -448,7 +448,10 @@ class Autotuner(KernelInterface):
         """Benchmark one config and return its timing ``[median, p20, p80]`` (``inf`` on
         failure). As a side effect, records the config's ``CompiledKernel`` on
         ``self._last_compiled_kernel`` (``None`` if it could not be compiled/launched) so the
-        post-bench IR prune can read its artifacts without recompiling. Return value unchanged.
+        post-bench IR prune can read its artifacts without recompiling. That kernel is the return
+        value of ``self.fn.run`` (jit.py fuses compile + launch), the only point a config's
+        compiled artifact surfaces — see the DESIGN NOTE in ``run``'s ``benchmark`` closure.
+        Return value unchanged.
         """
         from ..compiler.errors import CompileTimeAssertionFailure
 
@@ -765,6 +768,21 @@ class Autotuner(KernelInterface):
                     # IR-based pruning runs here, AFTER benchmarking, reusing each config's
                     # already-compiled artifact (no extra compile); a rejected config is pruned
                     # by marking its timing invalid (inf) so it cannot win.
+                    #
+                    # DESIGN NOTE — why this is a post-bench pass and not an inline per-config
+                    # prune (raised in review D107928110): compilation is not a discrete step the
+                    # autotuner controls. A config's compiled artifact (CompiledKernel.asm) only
+                    # becomes available as the return value of `self.fn.run(...)` in jit.py, which
+                    # *fuses* compile + launch (JITFunction.run: compile on cache miss, then
+                    # launch, then return the kernel). `_bench` captures it as a side effect on
+                    # `self._last_compiled_kernel`. So a config's IR exists only once it has been
+                    # compiled AND benchmarked; pruning it *before* timing would require a separate
+                    # compile pass that re-implements jit.py's run pipeline (deliberately avoided).
+                    # Folding this pass into the loop above (per-config inline) is a pure code-org
+                    # change and is doable, but must still thread the captured kernel + reference
+                    # config through the loop and preserve the "first finite-time config =
+                    # reference" and "at least one survivor" semantics — left as a separate pass on
+                    # purpose; touch with care.
                     if self.ir_config_prune is not None:
                         self._ir_prune_after_bench(pruned_configs, timings, compiled)
                     bench_end = time.time()
