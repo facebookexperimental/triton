@@ -60,6 +60,13 @@
 - **Fix**: Make the forward walk follow `scf.yield` → the parent `scf.if`'s corresponding result, using the specific yield operand index so multiple data partitions (e.g., flex attention) are not merged. For multi-result `scf.if`, the walk follows one value at a time from the worklist. With the enlarged forward set, the QK MMA's forward set overlaps the PV MMA's backward slice and they share a compute partition.
 - **Lit test**: `partition-scheduling-meta-causal-attention.mlir` (new) checks exactly 6 partitions / 2 computation (fails with 8 / 4 without the fix). Also removed a stale `CHECK-NOT` on `arith.mulf` scores ops in `partition-scheduling-meta-flex-attention.mlir`, which now correctly get computation partitions through the enlarged forward set.
 
+### 7. Empty-producer assertion from partition-less shared `local_alloc` (2026-06-10, fixed)
+- **Symptom**: `producerTaskIds.size() == 1` assertion in `CodePartitionUtility.cpp` `createChannelPost` (NDEBUG: `handleOperandD: expected exactly one producer task ID, got 0` + segfault).
+- **Manifestation**: FA3 backward (`_attn_bwd_persist`, `cuda:100`, `data_partition_factor=2`). `separateLocalAllocWithSrc` splits a shared `local_alloc` that carries no `async_task_id` (hoisted above all partitions) into `local_alloc + local_store`; the store inherits the empty task-id set, so `producerTaskIds` is empty in `createChannelPost`.
+- **Root cause**: `createChannelPost`'s `else` branch assumes exactly one producer task. An *empty* set (size 0) — not a multi-producer — is what trips the assert; the `size() > 1` branch already handles multiple producers.
+- **Fix**: Guard `if (producerTaskIds.empty()) return;` — an alloc that belongs to no partition needs no cross-partition channel. Companion: `separateLocalAllocWithSrc` now tags the split `local_store` with the source op's single task ID (e.g. the TMA load) so a single-source shared buffer forms a clean 1-producer→N-consumer channel instead of one buffer per consumer.
+- **Lit test**: `ws_code_partition_empty_producer_guard.mlir` runs `_attn_bwd_persist` through `--nvgpu-warp-specialization`; aborts without the guard, passes with it.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)
