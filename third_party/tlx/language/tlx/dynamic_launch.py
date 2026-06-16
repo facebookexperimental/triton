@@ -1,7 +1,7 @@
 import triton.language.core as tl
 
 from . import types as tlx
-from .mem_ops import local_view
+from .mem_ops import local_view, fence
 from .barrier import alloc_barriers, barrier_expect_bytes, barrier_wait, barrier_arrive
 from .utility import cluster_cta_rank
 
@@ -171,6 +171,8 @@ def clc_consumer(context, p_consumer=None, multi_ctas: bool = False, k=0, return
     # Extract tile_id from the CLC response.
     stolen_tile_ids = _clc_query(response, _semantic=_semantic)
     stolen_tile_id = stolen_tile_ids[0]
+
+    fence(tl.constexpr("async_shared"), _semantic=_semantic)
 
     # Signal completion: all CTAs signal CTA 0's bar_empty
     # NOTE: if stolen_tile_id is -1, it means no more tile is available. We shouldn't expect

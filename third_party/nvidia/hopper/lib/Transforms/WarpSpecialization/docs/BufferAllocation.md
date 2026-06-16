@@ -92,6 +92,14 @@ cross-partition SMEM dependencies as separate store ops, enabling
 downstream `doCodePartition`/`doCodePartitionPost` to detect them
 as channels.
 
+The `local_store`'s task ID determines the producer partition for the
+channel. When the source is produced by a single-partition op (e.g. a TMA
+`DescriptorLoadOp`), the store takes the source op's task ID rather than the
+alloc's, which also carries consumer partitions from backward propagation.
+This models a 1-producer to N-consumer channel — one TMA load writes the
+shared buffer and every consumer partition reads it — instead of duplicating
+the buffer per consumer.
+
 ## Key Distinction
 
 `doBufferAllocation` does **not** insert:

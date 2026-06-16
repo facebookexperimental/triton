@@ -18,7 +18,6 @@ load" pattern the emitter must support (distinct from GEMM/FA's
 load → SMEM buffer → MMA). It is one loop, so it fits the single-loop emitter.
 """
 
-import torch
 import triton
 import triton.language as tl
 
