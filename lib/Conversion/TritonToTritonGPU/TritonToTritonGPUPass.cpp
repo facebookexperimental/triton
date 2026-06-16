@@ -42,9 +42,10 @@ static void addNamedAttrs(Operation *op, DictionaryAttr dictAttrs) {
 // pinned layout is an anchor and forward-propagates). No-op for ops without the
 // trait, or when the encodings already match (the common case). Kept as a free
 // helper so any conversion pattern can reuse it, not just GenericOpPattern.
-static void unifyOperandEncodingsForSameEncoding(
-    Operation *op, TypeRange resultTypes, SmallVectorImpl<Value> &operands,
-    ConversionPatternRewriter &rewriter) {
+static void
+unifyOperandEncodingsForSameEncoding(Operation *op, TypeRange resultTypes,
+                                     SmallVectorImpl<Value> &operands,
+                                     ConversionPatternRewriter &rewriter) {
   if (!op->hasTrait<mlir::OpTrait::SameOperandsAndResultEncoding>())
     return;
   Attribute enc;

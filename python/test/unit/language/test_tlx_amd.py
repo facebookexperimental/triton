@@ -279,6 +279,7 @@ def _loop_carried_dot_layout_kernel(
     tl.store(c_ptrs, acc)
 
 
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_loop_carried_dot_layout_cleanup_compiles_gfx950(device):
     """Full AMD pipeline should remove late dot operand local_alloc fallbacks."""
     compiled = compile_for_gfx950(

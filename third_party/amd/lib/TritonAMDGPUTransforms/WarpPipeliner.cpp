@@ -25,19 +25,6 @@ namespace mlir {
 #define GEN_PASS_DEF_TRITONAMDGPUWARPPIPELINE
 #include "TritonAMDGPUTransforms/Passes.h.inc"
 
-// Read (cluster-name, priority) from a border marker op.  Priority defaults
-// to -1 when the marker doesn't carry the optional priority attribute (e.g.
-// gluon borders, which never set a priority).
-static std::pair<StringAttr, int> readBorderMarker(Operation *op) {
-  StringAttr clusterStr =
-      op->getAttrOfType<StringAttr>("triton.warp_pipeline.border");
-  int priority = -1;
-  if (auto intAttr =
-          op->getAttrOfType<IntegerAttr>("triton.warp_pipeline.priority"))
-    priority = intAttr.getInt();
-  return {clusterStr, priority};
-}
-
 // Create a scf.execute_region op representing a pipeline cluster.
 static void createClusterOp(OpBuilder &b, Location loc,
                             SmallVector<Operation *> &ops,
@@ -146,7 +133,14 @@ static LogicalResult createPipeline(OpBuilder &b, Location loc,
   for (Operation &opRef : llvm::make_early_inc_range(blk)) {
     Operation *op = &opRef;
     if (isBorder(op)) { // Wrap-up one cluster at a border.
-      clusterMarkers.push_back(readBorderMarker(op));
+      StringAttr clusterStr =
+          op->getAttrOfType<StringAttr>("triton.warp_pipeline.border");
+      int priority = -1;
+      if (auto intAttr =
+              op->getAttrOfType<IntegerAttr>("triton.warp_pipeline.priority")) {
+        priority = intAttr.getInt();
+      }
+      clusterMarkers.push_back({clusterStr, priority});
       if (cluster.empty()) {
         // This allows user to deliberately insert a pipeline bubble with a
         // cluster only contains a dummy operation.

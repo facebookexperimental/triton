@@ -97,13 +97,18 @@ struct ScheduleNode {
 
   // Schedule assignment (from Phase 0 + Step 2.5)
   HWPipeline pipeline{HWPipeline::NONE};
-  int cycle{0};       // absolute cycle within the II
-  int stage{0};       // cycle / II
-  int cluster{0};     // dense rank of cycle within stage (Step 2.5)
-  int latency{0};     // cycles until result available
-  int selfLatency{0}; // cycles this op occupies its pipeline (at minWarps)
-  int minWarps{1};    // warp count assumed by selfLatency; effective scales
-                      // up by minWarps/actualWarps when WG has fewer warps
+  int cycle{0};   // absolute cycle within the II
+  int stage{0};   // cycle / II
+  int cluster{0}; // dense rank of cycle within stage (Step 2.5)
+  int latency{0}; // cycles until result available
+  int selfLatency{
+      0};           // warp-issue cost (cycles the warp is blocked dispatching)
+  int occupancy{0}; // cycles this op holds its hardware pipeline (for ResMII
+                    // / makespan). For TMA: bytes/bandwidth (≫ selfLatency for
+                    // BW-bound stores); for TC: latency; CUDA/SFU: selfLatency.
+                    // See OpLatencyInfo::occupancy. 0 = unset (fall back).
+  int minWarps{1};  // warp count assumed by selfLatency; effective scales
+                    // up by minWarps/actualWarps when WG has fewer warps
 
   // Frequency this op fires per outer-loop iteration. Outer-loop ops have
   // frequencyMultiplier = 1; inner K-loop ops have frequencyMultiplier =
