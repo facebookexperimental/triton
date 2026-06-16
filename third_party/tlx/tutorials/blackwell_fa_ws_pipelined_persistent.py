@@ -1951,11 +1951,6 @@ def _bwd_compute_inner_loop(
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
         qkT = tlx.local_load(qk_tiles[tmem_buf_id])
         m = tlx.local_load(sM_tiles[m_buf_id])
-        if USE_2CTA:
-            tlx.barrier_arrive(qk_empties[tmem_buf_id], 1, remote_cta_rank=0)
-        else:
-            tlx.barrier_arrive(qk_empties[tmem_buf_id])
-
         pT = tl.math.exp2(_sub_f32x2(qkT, m[None, :]))
         if STAGE == 1:
             mask = offs_m[None, :] >= offs_n[:, None]
@@ -1964,10 +1959,15 @@ def _bwd_compute_inner_loop(
         # Store P to TMEM.
         ppT = pT.to(do_out_dtype)
         tlx.local_store(p_tiles[tmem_buf_id + P_BUF_OFFSET], ppT)
-        tl.inline_asm_elementwise("tcgen05.wait::st.sync.aligned;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
+        # P aliases the QK TMEM region, so qk_empties (which frees that region for
+        # reuse) must be signaled after P is stored, not before. The
+        # local_store->TMEM lowering auto-emits tcgen05.wait::st, so p_fulls
+        # already observes the completed P store; no manual wait.
         if USE_2CTA:
+            tlx.barrier_arrive(qk_empties[tmem_buf_id], 1, remote_cta_rank=0)
             tlx.barrier_arrive(p_fulls[tmem_buf_id], 1, remote_cta_rank=0)
         else:
+            tlx.barrier_arrive(qk_empties[tmem_buf_id])
             tlx.barrier_arrive(p_fulls[tmem_buf_id])
 
         # --- Phase 3: Compute dS = pT * (dpT - Di). ---
@@ -1977,12 +1977,16 @@ def _bwd_compute_inner_loop(
         Di = tlx.local_load(sD_tiles[d_buf_id])
         tlx.barrier_arrive(m_empties[m_buf_id])
         tlx.barrier_arrive(d_empties[d_buf_id])
-        if not REUSE_DP_FOR_DQ and not USE_2CTA:
-            tlx.barrier_arrive(dp_empties[tmem_buf_id])
         dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
         dsT = dsT.to(q_out_dtype)
         tlx.local_store(dsT_tmem_tiles[ds_buf_id], dsT)
-        tl.inline_asm_elementwise("tcgen05.wait::st.sync.aligned;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
+        # dsT aliases the dP TMEM region, so dp_empties (which frees that region
+        # for reuse) must be signaled after dsT is stored, not before. The
+        # local_store->TMEM lowering auto-emits tcgen05.wait::st (+barrier), so the
+        # dsT_tmem_fulls arrive and the 2-CTA TMEM read-back below both observe the
+        # completed store; no manual wait.
+        if not REUSE_DP_FOR_DQ and not USE_2CTA:
+            tlx.barrier_arrive(dp_empties[tmem_buf_id])
         # 2-CTA: exchange half of dS with peer via DSMEM, then
         # overwrite ds_tiles so it contains mixed dS from both CTAs.
         if USE_2CTA:
