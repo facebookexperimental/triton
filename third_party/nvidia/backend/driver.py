@@ -33,11 +33,7 @@ def libcuda_dirs():
     dirs = [os.path.dirname(loc) for loc in locs]
     env_ld_library_path = os.getenv("LD_LIBRARY_PATH")
     if env_ld_library_path and not dirs:
-        dirs = [
-            dir
-            for dir in env_ld_library_path.split(":")
-            if os.path.exists(os.path.join(dir, "libcuda.so.1"))
-        ]
+        dirs = [dir for dir in env_ld_library_path.split(":") if os.path.exists(os.path.join(dir, "libcuda.so.1"))]
     msg = "libcuda.so cannot found!\n"
     if locs:
         msg += "Possible files are located at %s." % str(locs)
@@ -147,11 +143,7 @@ def build_kernel_signature_from_schema(schema):
     for arg in schema["args"]:
         ty = arg["type"]
         if ty.startswith("tensordesc"):
-            meta = (
-                tensordesc_meta[tensordesc_idx]
-                if tensordesc_idx < len(tensordesc_meta)
-                else None
-            )
+            meta = (tensordesc_meta[tensordesc_idx] if tensordesc_idx < len(tensordesc_meta) else None)
             tensordesc_idx += 1
 
             match = re.match(r"tensordesc<([^[>]*)\[([^]]*)\]", ty)
@@ -254,15 +246,11 @@ def annotate_arguments(signature):
     annotated_arguments = []
     for sig in signature:
         if isinstance(sig, tuple):
-            annotated_arguments.append(
-                (PyKernelArg(nested_tuple=annotate_arguments(sig), type=ARG_TUPLE))
-            )
+            annotated_arguments.append((PyKernelArg(nested_tuple=annotate_arguments(sig), type=ARG_TUPLE)))
         elif sig != "constexpr":
             annotated_arguments.append(PyKernelArg(nested_tuple=None, type=ARG_KERNEL))
         else:
-            annotated_arguments.append(
-                PyKernelArg(nested_tuple=None, type=ARG_CONSTEXPR)
-            )
+            annotated_arguments.append(PyKernelArg(nested_tuple=None, type=ARG_CONSTEXPR))
     return annotated_arguments
 
 
@@ -329,9 +317,7 @@ def make_tensordesc_arg(arg, metadata):
     if is_im2col:
         # Im2col mode - use im2col descriptor fill function
         # block_size from metadata is [pixelsPerColumn, channelsPerPixel] (possibly clamped)
-        element_strides = (
-            arg.element_strides if arg.element_strides is not None else [1] * len(shape)
-        )
+        element_strides = (arg.element_strides if arg.element_strides is not None else [1] * len(shape))
         cu_tensor_map = triton.runtime.driver.active.utils.fill_tma_descriptor_im2col(
             arg.base.data_ptr(),
             swizzle,
@@ -362,20 +348,12 @@ def make_tensordesc_arg(arg, metadata):
 
 
 def wrap_handle_tensordesc(launcher, signature, tensordesc_meta):
-    has_tensor_desc_arg = any(
-        isinstance(sig, str) and sig.startswith("tensordesc")
-        for sig in signature.values()
-    )
+    has_tensor_desc_arg = any(isinstance(sig, str) and sig.startswith("tensordesc") for sig in signature.values())
     if not has_tensor_desc_arg:
         return launcher
 
     tensordesc_indices = set(
-        [
-            i
-            for i, sig in enumerate(signature.values())
-            if isinstance(sig, str) and sig.startswith("tensordesc")
-        ]
-    )
+        [i for i, sig in enumerate(signature.values()) if isinstance(sig, str) and sig.startswith("tensordesc")])
     assert not tensordesc_meta or len(tensordesc_meta) == len(tensordesc_indices)
     if not tensordesc_meta:
         tensordesc_meta = [None] * len(tensordesc_indices)
@@ -388,9 +366,7 @@ def wrap_handle_tensordesc(launcher, signature, tensordesc_meta):
         tensordesc_idx = 0
         for i, arg in enumerate(kernel_args):
             if i in tensordesc_indices:
-                final_kernel_args.extend(
-                    make_tensordesc_arg(arg, tensordesc_meta[tensordesc_idx])
-                )
+                final_kernel_args.extend(make_tensordesc_arg(arg, tensordesc_meta[tensordesc_idx]))
                 tensordesc_idx += 1
             else:
                 final_kernel_args.append(arg)
@@ -404,7 +380,7 @@ class CudaLauncher(object):
 
     def __init__(self, src, metadata):
         constants = src.constants if hasattr(src, "constants") else dict()
-        arg_idx = lambda x: (src.fn.arg_names.index(x),) if isinstance(x, str) else x
+        arg_idx = lambda x: (src.fn.arg_names.index(x), ) if isinstance(x, str) else x
         constants = {arg_idx(idx): value for idx, value in constants.items()}
         signature = {idx: value for idx, value in src.signature.items()}
         tensordesc_meta = getattr(metadata, "tensordesc_meta", None)
@@ -466,9 +442,7 @@ class CudaLauncher(object):
                 return alloc_fn(alloc_size, align, stream)
             return None
 
-        global_scratch = allocate_scratch(
-            self.global_scratch_size, self.global_scratch_align, _allocation._allocator
-        )
+        global_scratch = allocate_scratch(self.global_scratch_size, self.global_scratch_align, _allocation._allocator)
         profile_scratch = allocate_scratch(
             self.profile_scratch_size,
             self.profile_scratch_align,
