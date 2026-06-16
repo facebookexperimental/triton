@@ -305,10 +305,6 @@ class HIPBackend(BaseBackend):
         # tensor local_alloc/local_load pairs. Run TLX propagation after
         # canonicalization so the final cleanup sees and folds those fallbacks.
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
-        # `tlx.local_alloc(..., reuse=...)` lowers through tlx.local_alias.
-        # Rewrite aliases back to memdesc views before LLVM lowering so the
-        # aliased buffers share one physical LDS allocation.
-        tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         # Consume tlx.warp_pipeline_stage border markers (rocdl.sched.barrier with
