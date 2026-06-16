@@ -79,8 +79,6 @@ def test_autows_fa_dp_non_causal(SUBTILING, SUBTILING_P, VECT_MUL, FADD2_REDUCE,
     config["FADD2_REDUCE"] = FADD2_REDUCE
     config["BLOCK_N"] = BLOCK_N
     config["GROUP_SIZE_N"] = GROUP_SIZE_N
-    if maxRegAutoWS == 152:
-        pytest.skip("maxRegAutoWS=152 fails accuracy after compiler upgrade, fix pending")
     config["maxRegAutoWS"] = maxRegAutoWS
     config["pingpongAutoWS"] = pingpongAutoWS
     sm_scale = 0.5
@@ -136,8 +134,6 @@ def test_autows_fa_dp_causal(SUBTILING, SUBTILING_P, VECT_MUL, FADD2_REDUCE, BLO
 @pytest.mark.parametrize("baseVariant", ["ws_persistent", "ws"])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_autows_fa_non_causal(SUBTILING, VECT_MUL, FADD2_REDUCE, baseVariant):
-    if SUBTILING:
-        pytest.skip("SUBTILING=True leads to accuracy mismatch, fix pending")
     sm_scale = 0.5
     for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
         q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
