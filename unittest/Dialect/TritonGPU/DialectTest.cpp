@@ -3,7 +3,10 @@
 #include <gtest/gtest.h>
 
 #include "mlir/AsmParser/AsmParser.h"
+#include "mlir/IR/Builders.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/StrUtil.h"
 #include "llvm/Support/Signals.h"
@@ -705,6 +708,76 @@ TEST_F(LinearEncodingTest, NpotBasesPerDimLaneCounts) {
     ASSERT_EQ(tpw[0], 3u) << "Expected 3 threads in dim 0, got " << tpw[0];
     ASSERT_EQ(tpw[1], 5u) << "Expected 5 threads in dim 1, got " << tpw[1];
   }
+}
+
+// Exercises the failure path of inferReshapeOpDstEncoding in
+// lib/Dialect/TritonGPU/Transforms/Utility.cpp, which D105735350 changed from
+// `assert(succeeded(result))` to `if (failed(result)) return {};`. The
+// reshape inference fails when the candidate encoding is not a
+// DistributedEncodingTrait (the legacy path bails and the LinearLayout
+// fallback is gated on DistributedEncodingTrait). Before the change this
+// asserted (debug abort / release UB); now inferDstEncoding/inferSrcEncoding
+// must return a null Attribute so callers (e.g. RemoveLayoutConversions'
+// setEncoding) skip propagation and leave the op in place.
+class InferReshapeFailurePathTest : public ::testing::Test {
+public:
+  InferReshapeFailurePathTest() {
+    ctx.getOrLoadDialect<triton::TritonDialect>();
+    ctx.getOrLoadDialect<TritonGPUDialect>();
+  }
+
+protected:
+  MLIRContext ctx;
+};
+
+TEST_F(InferReshapeFailurePathTest, NonDistributedEncodingReturnsNull) {
+  OpBuilder builder(&ctx);
+  Location loc = builder.getUnknownLoc();
+
+  // Build a real tt.reshape: src 2D blocked tensor -> 1D result. The op itself
+  // is well-formed; we then drive inference with a NON-distributed candidate
+  // encoding to force inferReshapeOpEncoding to fail.
+  SmallVector<int64_t> srcShape = {8, 4};
+  SmallVector<int64_t> dstShape = {32};
+  auto elemTy = builder.getF16Type();
+
+  auto blocked = triton::gpu::BlockedEncodingAttr::get(
+      &ctx, /*sizePerThread=*/{1, 1}, /*threadsPerWarp=*/{8, 4},
+      /*warpsPerCTA=*/{1, 1}, /*order=*/{1, 0},
+      triton::gpu::CGAEncodingAttr::get1CTALayout(&ctx, /*rank=*/2));
+  auto srcTy = RankedTensorType::get(srcShape, elemTy, blocked);
+
+  // Materialize a source Value of srcTy without needing a full module.
+  auto srcVal =
+      builder.create<UnrealizedConversionCastOp>(loc, srcTy, ValueRange{})
+          .getResult(0);
+  auto reshape = builder.create<triton::ReshapeOp>(loc, dstShape, srcVal,
+                                                   /*allowReorder=*/false);
+
+  // A shared encoding is NOT a DistributedEncodingTrait, so the reshape
+  // inference fails for it. Both directions must return a null Attribute, not
+  // assert/crash.
+  Attribute sharedEnc = triton::gpu::SwizzledSharedEncodingAttr::get(
+      &ctx, /*vec=*/1, /*perPhase=*/1, /*maxPhase=*/1, /*order=*/{1, 0},
+      triton::gpu::CGAEncodingAttr::get1CTALayout(&ctx, /*rank=*/2));
+
+  Attribute dstEnc = inferDstEncoding(reshape.getOperation(), sharedEnc);
+  EXPECT_FALSE(dstEnc)
+      << "inferDstEncoding should return null when reshape inference fails";
+
+  Attribute srcEnc = inferSrcEncoding(reshape.getOperation(), sharedEnc);
+  EXPECT_FALSE(srcEnc)
+      << "inferSrcEncoding should return null when reshape inference fails";
+
+  // Sanity: a valid distributed candidate still infers successfully (the LL
+  // fallback path), confirming the failure above is specific to the
+  // non-distributed encoding and not a broken op.
+  Attribute okEnc = inferDstEncoding(reshape.getOperation(), blocked);
+  EXPECT_TRUE(okEnc)
+      << "inferDstEncoding should succeed for a distributed candidate encoding";
+
+  reshape.erase();
+  srcVal.getDefiningOp()->erase();
 }
 
 } // namespace

@@ -35,6 +35,27 @@ unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
   auto *ctx = srcTy.getContext();
   auto srcLayout = gpu::toLinearLayout(srcTy);
   auto dstLayout = gpu::toLinearLayout(dstTy);
+
+  // Match the lowering: remove the block dimension (identity in the cvt).
+  auto kReg = StringAttr::get(ctx, "register");
+  auto kLane = StringAttr::get(ctx, "lane");
+  auto kWarp = StringAttr::get(ctx, "warp");
+  auto outDimNames = llvm::to_vector(srcLayout.getOutDimNames());
+  srcLayout = srcLayout.sublayout({kReg, kLane, kWarp}, outDimNames);
+  dstLayout = dstLayout.sublayout({kReg, kLane, kWarp}, outDimNames);
+
+  // Unfold NPOT dims before removing broadcasts: a [0,N] reg basis is 0 mod N
+  // but nonzero in pow2 space; dropping it would under-size SMEM (OOB).
+  //
+  // However, when lane/warp contribute to an NPOT dim (e.g. MMAv2 NPOT M/N),
+  // the lowering skips the unfold and uses the modular layout directly. We
+  // must match that decision here to avoid over-allocating or mis-sizing SMEM.
+  bool canFixup = triton::canFixupDeadPositions(srcLayout, kLane, kWarp) &&
+                  triton::canFixupDeadPositions(dstLayout, kLane, kWarp);
+  if (canFixup) {
+    srcLayout = unfoldModularDimsForAlloc(srcLayout);
+    dstLayout = unfoldModularDimsForAlloc(dstLayout);
+  }
   srcLayout = actionRemoveBroadcastedRegs(srcLayout).apply(srcLayout);
   dstLayout = actionRemoveBroadcastedRegs(dstLayout).apply(dstLayout);
   auto bitwidth = getBitwidth(srcTy);

@@ -114,8 +114,14 @@ LogicalResult WarpGroupDotOp::verify() {
   int rank = retShapePerCTA.size();
   if (rank != 2)
     return emitOpError("WGMMA result shape must be 2D");
-  if (retShapePerCTA[0] % 64 != 0)
-    return emitOpError("WGMMA result M dimension must be divisible by 64");
+  // Pow2 M requires M%64; NPOT M only requires M%16.
+  bool mOkWgmma = llvm::isPowerOf2_64(retShapePerCTA[0])
+                      ? (retShapePerCTA[0] % 64 == 0)
+                      : (retShapePerCTA[0] % 16 == 0);
+  if (!mOkWgmma) {
+    return emitOpError(
+        "WGMMA result M dimension must be divisible by 64 (pow2) or 16 (NPOT)");
+  }
   if (retShapePerCTA[1] % 8 != 0)
     return emitOpError("WGMMA result N dimension must be divisible by 8");
 
