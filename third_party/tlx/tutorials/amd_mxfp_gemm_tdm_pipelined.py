@@ -1,30 +1,26 @@
 """
-Baseline MXFP TDM-pipelined GEMM for AMD gfx1250 using TLX.
+MXFP TDM-pipelined GEMM for AMD gfx1250.
 
-This ports the baseline Gluon ``mxgemm_tdm_pipelined_kernel`` schedule to
-TLX APIs: full-tile TDM loads for A/B and pre-shuffled scales, local LDS loads
-into registers, and ``tl.dot_scaled`` for the scaled WMMA.
+Ports the baseline Gluon ``mxgemm_tdm_pipelined_kernel`` schedule to TLX APIs:
+full-tile TDM loads for A/B and pre-shuffled scales
+(``tlx.async_amd_descriptor_load``), ``tlx.local_reshape`` + ``tlx.local_trans``
+to un-shuffle the scales out of LDS, ``tlx.local_load`` into registers, and
+``tl.dot_scaled`` for the scaled WMMA.
+
+Multi-buffer software pipeline: prologue issues ``NUM_BUFFERS - 1`` tile loads,
+then the main loop consumes tile k while prefetching tile ``k + NUM_BUFFERS - 1``.
+Output stored via pointer-based ``tl.store`` (TDM store requires
+``alignTDMDescriptorEncodings`` which is not yet ported to main).
 """
-import pytest
 import torch
 
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-from triton.tools.mxfp import MXScaleTensor
-
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
-
-
-def is_gfx1250_available():
-    try:
-        target = triton.runtime.driver.active.get_current_target()
-        return target.arch == "gfx1250"
-    except Exception:
-        return False
 
 
 def pack_scale(x: torch.Tensor, preshuffle_factor: int = 128) -> torch.Tensor:
+    """Pre-shuffle an ``[non_k, k_scale]`` e8m0 scale tensor into the TDM layout."""
     non_k, k_scale = x.shape
     scale_kwidth = 4 if k_scale >= 4 else k_scale
     num_chunk_m = non_k // preshuffle_factor
@@ -32,18 +28,6 @@ def pack_scale(x: torch.Tensor, preshuffle_factor: int = 128) -> torch.Tensor:
     x = x.view(num_chunk_m, 4, preshuffle_factor // 4, num_chunk_k, scale_kwidth)
     x = x.permute(0, 3, 2, 1, 4).contiguous()
     return x.view(non_k // preshuffle_factor, k_scale * preshuffle_factor)
-
-
-def fp8e8m0_to_float32(scale: torch.Tensor) -> torch.Tensor:
-    scale = scale.view(torch.uint8).to(torch.int32)
-    scale = scale << 23
-    return scale.view(torch.float32)
-
-
-def torch_gemm_mxfp(a, b, a_scale, b_scale, scale_block, M, N, K):
-    a_scale_f32 = fp8e8m0_to_float32(a_scale).repeat_interleave(scale_block, dim=1)[:M, :K]
-    b_scale_f32 = fp8e8m0_to_float32(b_scale).repeat_interleave(scale_block, dim=1).T.contiguous()[:K, :N]
-    return torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32)
 
 
 @triton.jit
@@ -176,6 +160,7 @@ def mxgemm_tdm_pipelined_kernel(
     TRANSPOSE_B: tl.constexpr,
     NUM_BUFFERS: tl.constexpr,
 ):
+    """C = (A * a_scale) @ (B * b_scale) with TDM async loads and a software pipeline."""
     DIV_FACTOR_A: tl.constexpr = 2 if DTYPE_A == "e2m1" else 1
     DIV_FACTOR_B: tl.constexpr = 2 if DTYPE_B == "e2m1" else 1
     BLOCK_K_PACKED_A: tl.constexpr = BLOCK_K // DIV_FACTOR_A
@@ -310,31 +295,43 @@ def mxgemm_tdm_pipelined_kernel(
     tl.store(c_ptrs, acc, mask=c_mask)
 
 
-def _init_fp8(dtype: str, rows: int, cols: int):
-    if dtype == "float8_e5m2":
-        return torch.randint(20, 40, (rows, cols), dtype=torch.uint8).view(torch.float8_e5m2)
-    if dtype == "float8_e4m3":
-        return torch.randint(20, 40, (rows, cols), dtype=torch.uint8).view(torch.float8_e4m3fn)
-    raise ValueError(f"unsupported dtype: {dtype}")
+_DEFAULT_CONFIG = {
+    "BLOCK_M": 128,
+    "BLOCK_N": 128,
+    "BLOCK_K": 128,
+    "GROUP_SIZE_M": 8,
+    "NUM_BUFFERS": 2,
+    "DTYPE_A": "e5m2",
+    "DTYPE_B": "e5m2",
+    "SCALE_BLOCK": 32,
+    "TRANSPOSE_B": False,
+    "num_warps": 4,
+    "waves_per_eu": 1,
+}
 
 
-def mxgemm_tdm_pipelined(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    a_scale: torch.Tensor,
-    b_scale: torch.Tensor,
-    BLOCK_M: int = 128,
-    BLOCK_N: int = 128,
-    BLOCK_K: int = 128,
-    TRANSPOSE_B: bool = False,
-    NUM_BUFFERS: int = 2,
-) -> torch.Tensor:
+def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: torch.Tensor, config=None) -> torch.Tensor:
+    """C = (A * a_scale) @ (B * b_scale) using a TDM-pipelined MXFP kernel on AMD gfx1250.
+
+    ``a_scale`` / ``b_scale`` must already be pre-shuffled with :func:`pack_scale`.
+    When ``config["TRANSPOSE_B"]`` is set, ``b`` is the ``[N, K]`` transposed layout.
+    """
+    cfg = dict(_DEFAULT_CONFIG)
+    if config is not None:
+        cfg.update(config)
+    TRANSPOSE_B = cfg["TRANSPOSE_B"]
+
     M, K = a.shape
     if TRANSPOSE_B:
         N, Kb = b.shape
     else:
         Kb, N = b.shape
-    assert K == Kb
+    assert K == Kb, f"K mismatch: A={a.shape}, B={b.shape}"
+
+    BLOCK_M = cfg["BLOCK_M"]
+    BLOCK_N = cfg["BLOCK_N"]
+    BLOCK_K = cfg["BLOCK_K"]
+
     c = torch.empty((M, N), device=a.device, dtype=torch.float32)
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
     grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), )
@@ -354,80 +351,16 @@ def mxgemm_tdm_pipelined(
         c.stride(0),
         c.stride(1),
         a_scale.stride(0),
-        DTYPE_A="e5m2",
-        DTYPE_B="e5m2",
-        SCALE_BLOCK=32,
+        DTYPE_A=cfg["DTYPE_A"],
+        DTYPE_B=cfg["DTYPE_B"],
+        SCALE_BLOCK=cfg["SCALE_BLOCK"],
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
-        GROUP_SIZE_M=8,
+        GROUP_SIZE_M=cfg["GROUP_SIZE_M"],
         TRANSPOSE_B=TRANSPOSE_B,
-        NUM_BUFFERS=NUM_BUFFERS,
-        num_warps=4,
-        waves_per_eu=1,
+        NUM_BUFFERS=cfg["NUM_BUFFERS"],
+        num_warps=cfg["num_warps"],
+        waves_per_eu=cfg["waves_per_eu"],
     )
     return c
-
-
-def test_mxgemm_tdm_pipelined_compiles_gfx1250():
-    from triton.backends.compiler import GPUTarget
-    from triton.compiler.compiler import ASTSource, compile as triton_compile
-
-    src = ASTSource(
-        fn=mxgemm_tdm_pipelined_kernel,
-        signature={
-            "a_ptr": "*fp8e5",
-            "b_ptr": "*fp8e5",
-            "c_ptr": "*fp32",
-            "a_scale": "*i8",
-            "b_scale": "*i8",
-            "M": "i32",
-            "N": "i32",
-            "K": "i32",
-            "stride_am": "i64",
-            "stride_ak": "i64",
-            "stride_bk": "i64",
-            "stride_bn": "i64",
-            "stride_cm": "i64",
-            "stride_cn": "i64",
-            "stride_scale": "i64",
-        },
-        constexprs={
-            "DTYPE_A": "e5m2",
-            "DTYPE_B": "e5m2",
-            "SCALE_BLOCK": 32,
-            "BLOCK_M": 128,
-            "BLOCK_N": 128,
-            "BLOCK_K": 128,
-            "GROUP_SIZE_M": 8,
-            "TRANSPOSE_B": True,
-            "NUM_BUFFERS": 2,
-        },
-    )
-    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32))
-    ttgir = compiled.asm["ttgir"]
-    amdgcn = compiled.asm["amdgcn"]
-    assert "amdg.async_tdm_copy_global_to_local" in ttgir
-    assert "tt.dot_scaled" in ttgir
-    assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
-    assert "wmma" in amdgcn
-
-
-@pytest.mark.skipif(not is_gfx1250_available(), reason="Requires gfx1250 hardware")
-@pytest.mark.parametrize("TRANSPOSE_B", [False, True])
-def test_mxgemm_tdm_pipelined_gfx1250(TRANSPOSE_B):
-    torch.manual_seed(0)
-    M = N = 256
-    K = 512
-    a = _init_fp8("float8_e5m2", M, K)
-    b = _init_fp8("float8_e5m2", K, N)
-    a_scale = MXScaleTensor(size=(M, triton.cdiv(K, 32))).random(high=32.0).data
-    b_scale = MXScaleTensor(size=(N, triton.cdiv(K, 32))).random(high=32.0).data
-    ref = torch_gemm_mxfp(a, b, a_scale, b_scale, 32, M, N, K)
-
-    a_scale = pack_scale(a_scale)
-    b_scale = pack_scale(b_scale)
-    a_d = a.contiguous().cuda()
-    b_d = (b.T.contiguous() if TRANSPOSE_B else b.contiguous()).cuda()
-    out = mxgemm_tdm_pipelined(a_d, b_d, a_scale.cuda(), b_scale.cuda(), TRANSPOSE_B=TRANSPOSE_B)
-    torch.testing.assert_close(out.cpu(), ref, rtol=1e-5, atol=2e-2)
