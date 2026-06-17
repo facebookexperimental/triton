@@ -173,7 +173,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 // =============================================================================
 
 // Store path uses swizzled (not padded) until alignTDMDescriptorEncodings is ported.
-// CHECK-DAG: #[[SWIZZLED:.*]] = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+// CHECK-DAG: #[[$SWIZZLED_STORE:.*]] = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory

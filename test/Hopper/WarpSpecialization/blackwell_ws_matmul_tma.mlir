@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file --nvgpu-warp-specialization="num-stages=3 capability=100" | FileCheck %s
+// RUN: triton-opt %s -split-input-file --nvgpu-warp-specialization="num-stages=3 capability=100 smem-budget=200000" | FileCheck %s
 
 // Test case: Basic Blackwell matrix multiplication with TMA and warp specialization.
 // This IR represents a GEMM kernel that uses tensor memory for accumulator

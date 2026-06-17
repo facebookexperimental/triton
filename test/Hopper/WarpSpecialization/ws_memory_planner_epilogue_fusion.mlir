@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file --nvgpu-test-ws-memory-planner=num-buffers=3 | FileCheck %s
+// RUN: triton-opt %s -split-input-file --nvgpu-test-ws-memory-planner="num-buffers=3 smem-alloc-algo=0" | FileCheck %s
 
 // Test: Two SMEM buffers in the outer persistent loop (not the innermost loop)
 // both originate from the same tmem_load via split → truncf → convert_layout →
