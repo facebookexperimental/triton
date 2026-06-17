@@ -2590,7 +2590,15 @@ def _attn_bwd_mxf8_ws(
                 )
 
                 # Load V data + scale and do data + scale.
-                # Share 1 barrier
+                # Share 1 barrier. V / V_scale are per-tile KV buffers freed by the
+                # same do_empties barrier as dO (MMA 2 reads both V and dO and
+                # arrives do_empties), so this wait MUST precede the V load. Issuing
+                # the V TMA before the wait lets the next tile's V clobber v_smem
+                # while the current tile's MMA 2 is still reading it - a cross-tile
+                # WAR race that only surfaces in causal (variable num_steps) runs.
+                do_buf_id, do_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
+                do_scale_m = (curr_m // 128) * REP_M
+                tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
                 tlx.barrier_expect_bytes(
                     do_fulls[kv_buf_id],
                     K_BYTES * BLOCK_N1 * HEAD_DIM + SCALE_BYTES + (DO_BYTES * BLOCK_M1 * HEAD_DIM) + SCALE_BYTES,
@@ -2607,9 +2615,6 @@ def _attn_bwd_mxf8_ws(
                     [sf_off_seq_h, kv_scale_n.to(tl.int32), 0, 0, 0],
                     do_fulls[kv_buf_id],
                 )
-                do_buf_id, do_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
-                do_scale_m = (curr_m // 128) * REP_M
-                tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
                 tlx.async_descriptor_load(
                     desc_do,
                     do_smem[do_buf_id],
