@@ -1376,6 +1376,8 @@ void TMEMSubSliceOp::build(OpBuilder &builder, OperationState &state,
   if (auto encoding = dyn_cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
           allocTy.getEncoding())) {
     unsigned newBlockN = std::min<unsigned>(encoding.getBlockN(), size);
+    newBlockN = std::max<unsigned>(newBlockN, 8);
+    newBlockN = llvm::alignTo(newBlockN, 8);
     newEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
         builder.getContext(), encoding.getBlockM(), newBlockN,
         encoding.getColStride(), encoding.getCTASplitM(),

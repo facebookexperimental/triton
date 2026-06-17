@@ -80,7 +80,17 @@ SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
     llvm::report_fatal_error(
         "MMAv3 instrShape: no valid N found for the given shape/warps");
   } else if (version == 5) {
-    unsigned m = shape[0] >= 128 ? 128 : 64;
+    // MMAv5 instructions are m64 or m128. For NPOT M (e.g. 96, 144, 160, 176,
+    // 192) round the *block* M up to the next power of 2 before selecting the
+    // instruction M so the TMEM tiling stays clean: M in (64,128] -> m128, and
+    // the NPOT accumulator rows beyond M are unused. M<=64 -> m64. This avoids
+    // the blockM=64 distributed-TMEM layout being asked to cover >64 rows for
+    // NPOT M (which is non-surjective with 4 warps).
+    unsigned mRounded =
+        llvm::isPowerOf2_64(shape[0])
+            ? static_cast<unsigned>(shape[0])
+            : static_cast<unsigned>(llvm::NextPowerOf2(shape[0]));
+    unsigned m = mRounded >= 128 ? 128 : 64;
     unsigned k = 256 / eltType.getIntOrFloatBitWidth();
 
     // Pow2: largest instrN <= 256 (legacy path, unchanged). NPOT: largest
