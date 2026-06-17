@@ -149,7 +149,7 @@ bool ReduceOpHelper::isWarpSynchronous() {
 SmallVector<unsigned> ReduceOpHelper::getScratchRepShape() {
   SmallVector<unsigned> smemShape;
   if (isWarpSynchronous())
-    return {0, 0};
+    return SmallVector<unsigned>(srcShape.size(), 0);
 
   smemShape = convertType<unsigned>(srcShape);
   unsigned numRegGroups = getNumRegGroupsOnAxis();
