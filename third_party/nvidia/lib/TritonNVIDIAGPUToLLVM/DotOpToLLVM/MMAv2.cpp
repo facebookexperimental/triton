@@ -4,13 +4,15 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
+#include "triton/Tools/LinearLayout.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
 using namespace mlir::triton;
 
 using ::mlir::triton::gpu::DotOperandEncodingAttr;
-using ::mlir::triton::gpu::getOrderForDotOperand;
 using ::mlir::triton::gpu::NvidiaMmaEncodingAttr;
 
 namespace {
@@ -83,187 +85,149 @@ struct BaseOffset {
 
 ValueTableV2 getValuesFromDotOperandLayoutStruct(
     const LLVMTypeConverter *typeConverter, Location loc,
-    ConversionPatternRewriter &rewriter, Value value, int batch, int repOuter,
-    int repK, RankedTensorType type, const NumRegisters &numRegisters) {
+    ConversionPatternRewriter &rewriter, Value value, RankedTensorType type,
+    const NumRegisters &numRegisters, int repBatch, int repOuter, int repK) {
+  // Use the LinearLayout to map register indices to element coordinates,
+  // then derive value table keys from coordinates. This naturally handles
+  // NPOT rep counts (via modularIdentity1D in the layout) and largeK
+  // (by computing the correct sub-MMA index from K coordinates), without
+  // any pow2 rounding or manual permutation.
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   auto elems = unpackLLElements(loc, value, rewriter);
   auto eltTy = typeConverter->convertType(type.getElementType());
-  int offset{};
   ValueTableV2 vals;
   auto bitwidth = eltTy.getIntOrFloatBitWidth();
   auto numElemsPerVec = std::max(32 / bitwidth, 1u);
   auto vecTy = vec_ty(eltTy, numElemsPerVec);
 
-  auto packVec = [&](std::array<int, 3> dstIdx) {
+  auto dot = cast<DotOperandEncodingAttr>(type.getEncoding());
+  auto kWidth = dot.getKWidth();
+  bool isA = (dot.getOpIdx() == 0);
+  auto rank = type.getRank();
+
+  // Get the LinearLayout for this dot operand encoding.
+  auto layout = triton::gpu::toLinearLayout(type);
+  auto *ctx = type.getContext();
+  auto kRegister = StringAttr::get(ctx, "register");
+  auto kLane = StringAttr::get(ctx, "lane");
+  auto kWarp = StringAttr::get(ctx, "warp");
+  auto kBlock = StringAttr::get(ctx, "block");
+
+  // Dimension indices in the layout output.
+  int kDimIdx = isA ? rank - 1 : rank - 2;
+  int outerDimIdx = isA ? rank - 2 : rank - 1;
+  int kDimSize = triton::gpu::getShapePerCTA(type)[kDimIdx];
+
+  // Get warp tiling info to compute coordinate-to-rep-index mapping.
+  auto mma = cast<NvidiaMmaEncodingAttr>(dot.getParent());
+  auto warpsPerCTA = mma.getWarpsPerCTA();
+  // For dot operands, the K dimension warps are broadcast (set to 1).
+  // The outer dimension (M for A, N for B) uses the remaining warps.
+  int warpsOuter = warpsPerCTA[outerDimIdx];
+
+  // The batch dimension (3D dots) is also tiled across warps.  Each MMA
+  // handles a single batch element (tile size 1), so consecutive batch reps
+  // for one warp are strided by the number of warps tiling the batch dim.
+  int warpsBatch = (rank == 3) ? warpsPerCTA[0] : 1;
+  int batchRepStride = 1 * warpsBatch;
+
+  // MMA tile sizes per warp in element coordinates.
+  int mmaTileOuter = isA ? 16 : 8; // M=16 for A, N=8 for B
+
+  // Stride between consecutive outer reps for one warp: the MMA tile
+  // times the number of warps tiling that dimension, since warps
+  // interleave across the outer dimension.
+  int outerRepStride = mmaTileOuter * warpsOuter;
+
+  // Number of outer registers per MMA tile (within-tile register groups).
+  int numRegOuter = isA ? numRegisters.m : numRegisters.n;
+  // Stride between consecutive within-tile register positions.
+  int innerOuterStride = mmaTileOuter / numRegOuter; // always 8
+
+  // K tile sizes and sub-MMA splitting parameters.
+  int dotTileK = kWidth * 8;
+  int numSubMmaPerDotTile = kWidth / numElemsPerVec;
+
+  auto numVecs = static_cast<int>(elems.size()) / numElemsPerVec;
+  for (int vecIdx = 0; vecIdx < numVecs; ++vecIdx) {
+    int regIdx = vecIdx * numElemsPerVec;
+
+    // Query the layout for this register's element coordinates.
+    auto coords = layout.apply(
+        {{kRegister, regIdx}, {kLane, 0}, {kWarp, 0}, {kBlock, 0}});
+
+    int outerCoord = coords[outerDimIdx].second;
+    int kCoord = coords[kDimIdx].second;
+    // Map the absolute batch coordinate to a per-thread batch rep index
+    // (consumers index the value table by rep index, not absolute coord).
+    int batchCoord = (rank == 3) ? coords[0].second / batchRepStride : 0;
+
+    // Outer register index (M or N direction).
+    // outerRep = which rep of the MMA tile this coordinate belongs to.
+    // innerOuter = which register within the MMA tile.
+    int outerRep = outerCoord / outerRepStride;
+    int innerOuter = (outerCoord % mmaTileOuter) / innerOuterStride;
+    int outerReg = outerRep * numRegOuter + innerOuter;
+
+    // K register index.
+    int kReg;
+    if (bitwidth == 64) {
+      // fp64 is never largeK: K-registers are uniformly K-strided, so the
+      // emitter indexes them contiguously. Map kCoord back to its linear index.
+      int numKRegs = std::max(repK, 1) * numRegisters.k;
+      int kStep = std::max<int>(kDimSize / numKRegs, 1);
+      kReg = kCoord / kStep;
+    } else {
+      // Packed/largeK: account for sub-MMA splitting.
+      int dotTileIdx = kCoord / dotTileK;
+      int kInDotTile = kCoord % dotTileK;
+      int kWidthGroupIdx = kInDotTile / (kWidth * 4); // 0 or 1
+      int kInGroup = kInDotTile % kWidth;
+      int subMmaIdx = kInGroup / numElemsPerVec;
+      int kRepInTile = subMmaIdx * numRegisters.k + kWidthGroupIdx;
+      kReg = dotTileIdx * numSubMmaPerDotTile * numRegisters.k + kRepInTile;
+    }
+
+    // Pack numElemsPerVec elements into one i32 (or keep as-is for fp64).
     Value vec = b.undef(vecTy);
-    for (auto i = 0; i < numElemsPerVec; ++i) {
-      vec = b.insert_element(vec, b.bitcast(elems[offset + i], eltTy),
+    for (unsigned i = 0; i < numElemsPerVec; ++i) {
+      vec = b.insert_element(vec, b.bitcast(elems[regIdx + i], eltTy),
                              b.i32_val(i));
     }
     if (bitwidth == 64) {
-      vals[dstIdx] = vec;
+      vals[{batchCoord, outerReg, kReg}] = vec;
     } else {
-      vals[dstIdx] = b.bitcast(vec, i32_ty);
-    }
-    offset += numElemsPerVec;
-  };
-
-  auto dot = cast<DotOperandEncodingAttr>(type.getEncoding());
-  auto kWidth = dot.getKWidth();
-  auto largeK = bitwidth * kWidth > std::max(32u, bitwidth);
-
-  assert((bitwidth != 64 || largeK == false) &&
-         "Currently fp64 don't support largeK MMA");
-
-  if (largeK) {
-    // For layouts with a large K dimension, the original register layout needs
-    // to be divided into multiple MMAs, where each MMA has contiguous 32 bits
-    // along the K dimension per thread.
-    // Using kWidth = 8 and bitwidth = 2 as an example,
-    // we split the MMA into 4 sub-MMAs, each with a stride 4 x 32-bit along the
-    // K dimension.
-    llvm::SmallVector<unsigned> si;
-    auto kIters = kWidth / (std::max(32 / bitwidth, 1u));
-
-    if (dot.getOpIdx() == 0) {
-      // Original register layout:
-      //
-      //   [0, 1, 2, 3, 4, 5, 6, 7], [16, 17, 18, 19, 20, 21, 22, 23, 23]
-      //   [8, 9, 10, 11, 12, 13, 14, 15], [24, 25, 26, 27, 28, 29, 30, 31]
-      //
-      // Each element in the layout is a single bf16.
-      //
-      // To derive four independent MMA operations, a stride of 4 is applied to
-      // the original register layout:
-      //
-      //  1st MMA: [[0, 1], [8, 9], [16, 17], [24, 25]]
-      //  2nd MMA: [[2, 3], [10, 11], [18, 19], [26, 27]]
-      //  3rd MMA: [[4, 5], [12, 13], [20, 21], [28, 29]]
-      //  4th MMA: [[6, 7], [14, 15], [22, 23], [30, 31]]
-      if (kIters <= repK) {
-        for (size_t kRep = 0; kRep < kWidth / numElemsPerVec; ++kRep)
-          for (size_t tile = 0; tile < 4; ++tile)
-            for (size_t e = 0; e < numElemsPerVec; ++e) {
-              si.push_back(kRep * numElemsPerVec + tile * kWidth + e);
-            }
-      } else {
-        // Suppose kWidth=4 and type=fp32, so numElemsPerVec=1.
-        // Each tile of the dot operand layout has a size of 16x32.
-        // However, if the triton tensor size is 16x16, elements along the k
-        // dimension are duplicated. Within each tile, each register
-        // contains 2x8 elements arranged as follows:
-        //
-        //       tile0/0           tile0/1
-        //   |<--kWidth=4-->|   |<--kWidth-->|
-        //   |<-mmaWidth=2->|
-        //   [0,  1,  2,  3]    [0,  1,  2,  3]
-        //   [4,  5,  6,  7]    [4,  5,  6,  7]
-        //
-        // tile0/1 replicates the elements in tile0/0 along the k dimension.
-        // For a tensor size of 32x32, the next tile on the m dimension is as
-        // follows:
-        //
-        //       tile1/0              tile1/1
-        //   |<--kWidth-->|       |<--kWidth-->|
-        //   [8,  9, 10, 11],     [8,  9, 10, 11]
-        //   [12, 13, 14, 15],    [12, 13, 14, 15]
-        //
-        // Within a single tile, we can perform two MMAs, and the
-        // resulting register layout for each MMA is as follows:
-        //
-        //   1st MMA: [0, 4, 1, 5]
-        //   2nd MMA: [2, 6, 3, 7]
-        //   3rd MMA: [8, 12, 9, 13]
-        //   4th MMA: [10, 14, 11, 15]
-        //
-        // Additionally, we should reorder the elements by moving the duplicated
-        // elements to the end.  In the example above, we convert the order from
-        // tile0/0, tile0/1, tile1/0, tile1/1 to tile0/0, tile1/0, tile0/1,
-        // tile1/1, so that only the first two tiles will be used in the
-        // computation.
-        size_t elemsPerTile = 2 * 2 * kWidth;
-        size_t elemsPerMma = 2 * 2 * numElemsPerVec;
-        size_t mmaWidth = kWidth / numElemsPerVec / 2;
-        size_t repMma = elemsPerTile / (mmaWidth * elemsPerMma);
-        for (size_t rep = 0; rep < repMma; ++rep)
-          for (size_t tile = 0; tile < elems.size() / elemsPerTile; ++tile)
-            for (size_t mmaKWidth = 0; mmaKWidth < mmaWidth; ++mmaKWidth)
-              for (size_t kTile = 0; kTile < 2; ++kTile)
-                for (size_t mTile = 0; mTile < 2; ++mTile)
-                  for (size_t e = 0; e < numElemsPerVec; ++e) {
-                    si.push_back(rep * mmaWidth * elemsPerMma +
-                                 mmaKWidth * 2 * numElemsPerVec +
-                                 tile * elemsPerTile + mTile * kWidth +
-                                 kTile * numElemsPerVec + e);
-                  }
-      }
-    } else {
-      // Original register layout:
-      //
-      //   [0, 1, 2, 3, 4, 5, 6, 7]^T, [8, 9, 10, 11, 12, 13, 14, 15]^T
-      //
-      // A stride of 4 is applied to derive four independent MMA operations:
-      //
-      //  1st MMA: [[0, 1], [8, 9]]
-      //  2nd MMA: [[2, 3], [10, 11]]
-      //  3rd MMA: [[4, 5], [12, 13]]
-      //  4th MMA: [[6, 7], [14, 15]]
-      if (kIters <= repK) {
-        for (size_t kRep = 0; kRep < kWidth / numElemsPerVec; ++kRep)
-          for (size_t tile = 0; tile < 2; ++tile)
-            for (size_t e = 0; e < numElemsPerVec; ++e) {
-              si.push_back(kRep * numElemsPerVec + tile * kWidth + e);
-            }
-      } else {
-        // Suppose kWidth=4 and type=fp32.
-        // Original register layout:
-        //
-        //       tile0/0        tile0/1
-        //   [0, 1, 2, 3]^T, [0, 1, 2, 3]^T
-        //
-        // Similar to the opIdx=0 situation, we should reorder the elements by
-        // moving the duplicated elements to the end.
-        size_t elemsPerTile = 2 * kWidth;
-        size_t elemsPerMma = 2 * numElemsPerVec;
-        size_t mmaWidth = kWidth / numElemsPerVec / 2;
-        size_t repMma = elemsPerTile / (mmaWidth * elemsPerMma);
-        for (size_t rep = 0; rep < repMma; ++rep)
-          for (size_t tile = 0; tile < elems.size() / elemsPerTile; ++tile)
-            for (size_t mmaKWidth = 0; mmaKWidth < mmaWidth; ++mmaKWidth)
-              for (size_t kTile = 0; kTile < 2; ++kTile)
-                for (size_t e = 0; e < numElemsPerVec; ++e) {
-                  si.push_back(rep * mmaWidth * elemsPerMma +
-                               mmaKWidth * 2 * numElemsPerVec +
-                               tile * elemsPerTile + kTile * numElemsPerVec +
-                               e);
-                }
-      }
-    }
-
-    auto step = si.size();
-    SmallVector<Value> perm(step);
-    for (auto i = 0; i < elems.size() / step; ++i) {
-      for (auto j = 0; j < step; ++j) {
-        perm[j] = elems[i * step + si[j]];
-      }
-      std::copy(perm.begin(), perm.end(), elems.begin() + i * step);
+      vals[{batchCoord, outerReg, kReg}] = b.bitcast(vec, i32_ty);
     }
   }
 
-  if (dot.getOpIdx() == 0) {
-    for (auto b = 0; b < batch; ++b)
-      for (auto m = 0; m < repOuter; ++m)
-        for (auto k = 0; k < repK; ++k)
-          for (auto vk = 0; vk < numRegisters.k; ++vk)
-            for (auto vm = 0; vm < numRegisters.m; ++vm)
-              packVec({b, m * numRegisters.m + vm, k * numRegisters.k + vk});
-  } else {
-    for (auto b = 0; b < batch; ++b)
-      for (auto n = 0; n < repOuter; ++n)
-        for (auto k = 0; k < repK; ++k)
-          for (auto vk = 0; vk < numRegisters.k; ++vk)
-            for (auto vn = 0; vn < numRegisters.n; ++vn)
-              packVec({b, n * numRegisters.n + vn, k * numRegisters.k + vk});
+  // Fill broadcast slots. When the outer dim is smaller than the MMA fragment
+  // extent (e.g. M=1<16, N=2<8) the layout collapses broadcast registers, but
+  // the MMA emitter indexes every fragment slot. Alias each missing slot to a
+  // populated one (mod #present); otherwise the inline asm has fewer params
+  // than constraints (cantFail abort).
+  int numOuterRegs = repOuter * numRegOuter;
+  for (int bIdx = 0; bIdx < std::max(repBatch, 1); ++bIdx) {
+    for (int kReg = 0; kReg < std::max(repK, 1) * numRegisters.k; ++kReg) {
+      // Collect the outer-register slots that were actually produced for this
+      // (b, kReg).  Broadcast collapses to the low coordinates, so these form a
+      // contiguous prefix, but we don't rely on that here.
+      SmallVector<int> present;
+      for (int oReg = 0; oReg < numOuterRegs; ++oReg) {
+        if (vals.count({bIdx, oReg, kReg})) {
+          present.push_back(oReg);
+        }
+      }
+      if (present.empty()) {
+        continue; // nothing to broadcast from (handled elsewhere)
+      }
+      for (int oReg = 0; oReg < numOuterRegs; ++oReg) {
+        if (!vals.count({bIdx, oReg, kReg})) {
+          vals[{bIdx, oReg, kReg}] =
+              vals[{bIdx, present[oReg % present.size()], kReg}];
+        }
+      }
+    }
   }
   return vals;
 }
@@ -762,21 +726,13 @@ convertMMAImpl(DotOpInterface op, Value llvmA, Value llvmB, Value llvmC,
   int repM = repA[1], repN = repB[2], repK = repA[2];
   int repBatch = repA[0];
 
-  // We can reuse the same iteration order in
-  // getValuesFromDotOperandLayoutStruct as both a and b are K-major
-  assert(dotOpA.getRepOrder() == getOrderForDotOperand(dotOpA.getOpIdx(),
-                                                       aShapePerCTA.size(),
-                                                       /*kContig=*/true));
   auto ha = getValuesFromDotOperandLayoutStruct(typeConverter, loc, rewriter,
-                                                llvmA, repBatch, repM, repK,
-                                                aTensorTy, numRegisters);
+                                                llvmA, aTensorTy, numRegisters,
+                                                repBatch, repM, repK);
 
-  assert(dotOpB.getRepOrder() == getOrderForDotOperand(dotOpB.getOpIdx(),
-                                                       bShapePerCTA.size(),
-                                                       /*kContig=*/true));
   auto hb = getValuesFromDotOperandLayoutStruct(typeConverter, loc, rewriter,
-                                                llvmB, repBatch, repN, repK,
-                                                bTensorTy, numRegisters);
+                                                llvmB, bTensorTy, numRegisters,
+                                                repBatch, repN, repK);
 
   auto fc = unpackLLElements(loc, loadedC, rewriter);
 
@@ -791,11 +747,12 @@ convertMMAImpl(DotOpInterface op, Value llvmA, Value llvmB, Value llvmC,
   auto elemsPerThread = triton::gpu::getElemsPerThread(dTensorTy);
   auto batchOffset =
       elemsPerThread[rank - 2] * elemsPerThread[rank - 1] / numCPackedElem;
+  // The register layout uses a nextPow2(repN) stride per N-rep set; match it
+  // here so colsPerThread lines up with the LinearLayout register ordering.
+  unsigned colsPerThread = (1u << llvm::Log2_64_Ceil(std::max(repN, 1))) * 2;
   auto callMma = [&](unsigned b, unsigned m, unsigned n, unsigned k) {
     PTXBuilder builder;
     auto &mma = *builder.create(mmaInstructions.at(mmaType));
-    // using =r for float32 works but leads to less readable ptx.
-    unsigned colsPerThread = repN * 2;
     emitMma(builder, b, static_cast<int>(m), static_cast<int>(n),
             static_cast<int>(k), mma, numMmaRets, colsPerThread, batchOffset,
             ha, hb, fc, dTensorTy, repK);

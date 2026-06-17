@@ -54,6 +54,48 @@ getNumElementsPerThread(Operation *op, SmallVector<unsigned> order,
                         triton::ModuleAxisInfoAnalysis &axisInfoAnalysis,
                         ArrayRef<int64_t> shape);
 
+// Returns true if any tensor dim is non-power-of-2. Pow2-assuming passes
+// should skip such tensors to avoid crashes in the layout algebra.
+inline bool hasNpotShape(RankedTensorType ty) {
+  return llvm::any_of(ty.getShape(), [](int64_t d) {
+    return d > 0 && !llvm::isPowerOf2_64(d);
+  });
+}
+
+// Returns true if the encoding's toLinearLayout can handle NPOT shapes
+// correctly.  Encodings that produce valid modular LinearLayouts for NPOT
+// include: blocked, slice (inherits from parent), linear, MMAv2 (Ampere),
+// MMAv3+ (Hopper/Blackwell), and dot_op whose parent is safe.
+// Encodings NOT safe: MMAv1 (Turing).
+inline bool npotSafeForLinearLayout(Attribute encoding) {
+  if (!encoding) {
+    return false;
+  }
+  // Blocked and linear encodings handle NPOT via combineCtaCgaWithShape.
+  if (isa<triton::gpu::BlockedEncodingAttr, triton::gpu::LinearEncodingAttr>(
+          encoding)) {
+    return true;
+  }
+  // NvidiaMma: v2 (Ampere) and v3+ (Hopper/Blackwell) are safe.
+  // nvidiaMmaTile uses modularIdentity1D for NPOT rep counts.
+  if (auto mma = dyn_cast<triton::gpu::NvidiaMmaEncodingAttr>(encoding)) {
+    return mma.getVersionMajor() >= 2;
+  }
+  // Dot operand encoding: safe if its parent encoding is safe.
+  if (auto dotOp = dyn_cast<triton::gpu::DotOperandEncodingAttr>(encoding)) {
+    return npotSafeForLinearLayout(dotOp.getParent());
+  }
+  // Slice encoding: inherits safety from parent.
+  if (auto slice = dyn_cast<triton::gpu::SliceEncodingAttr>(encoding)) {
+    return npotSafeForLinearLayout(slice.getParent());
+  }
+  // Shared encodings are safe (they don't use the distributed layout).
+  if (isa<triton::gpu::SharedEncodingTrait>(encoding)) {
+    return true;
+  }
+  return false;
+}
+
 // Returns whether the op is a "view op", i.e. doesn't move any data
 bool isView(Operation *op);
 
@@ -223,6 +265,11 @@ bool isPureUnaryInlineAsm(Operation *op);
 
 // read the compute capability from the module attributes
 int getNVIDIAComputeCapability(Operation *module);
+
+// Returns true if the module targets sm_103a (Blackwell B300). sm_103a-only
+// features include K=96 mxf4nvf4 tcgen05.mma. This is a strict equality check;
+// sm_100a (GB200) does not satisfy it.
+bool isSM103a(Operation *module);
 
 // Read the amd target from the module attributes
 std::optional<StringRef> getAMDArch(Operation *module);

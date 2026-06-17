@@ -740,6 +740,32 @@ public:
   friend std::optional<LinearLayout> divideRight(const LinearLayout &A,
                                                  const LinearLayout &B);
 
+  // Modular-aware variants of divideLeft / divideRight.
+  //
+  // The raw divideLeft / divideRight assert !isModular() on their inputs
+  // (their GF(2) algebra is only valid for pow2 out-dim sizes). NPOT (modular)
+  // layouts arise for FP4 dot_scaled scale tensors -- notably the K=96
+  // mxf4nvf4 scale tensor of shape (M, 6), whose K out-dim size 6 is NPOT.
+  //
+  // These wrappers handle the divide by:
+  //   1. a divisibility pre-flight: every out-dim size of A must be divisible
+  //      by the corresponding out-dim size of B (otherwise no quotient exists
+  //      and we must not silently invent one), and B itself must be pow2 so
+  //      the quotient carries A's modular structure;
+  //   2. expanding A to a pow2 layout (same bases, out-dim sizes rounded up to
+  //      NextPowerOf2) so the raw divide's GF(2) algebra applies;
+  //   3. running the raw divide on the expanded layout;
+  //   4. refolding the quotient back to the NPOT out-dim sizes (A's size / B's
+  //      size per out-dim) so callers see the true modular quotient.
+  //
+  // If A is already pow2 these reduce to the raw divide. Returns std::nullopt
+  // on the same conditions as the raw divide (plus the divisibility
+  // pre-flight).
+  friend std::optional<LinearLayout>
+  divideLeftAllowingModular(const LinearLayout &A, const LinearLayout &B);
+  friend std::optional<LinearLayout>
+  divideRightAllowingModular(const LinearLayout &A, const LinearLayout &B);
+
   // Returns true if this layout acts trivially (as the identity) on the given
   // dimensions. This means that it's the identity on those dimensions, and it
   // does not map other dimensions onto those or these onto other dimensions.

@@ -1,5 +1,6 @@
 #include "triton/Conversion/TritonGPUToLLVM/FMADotUtility.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 
 using namespace mlir;
 
@@ -55,6 +56,75 @@ ValueTableFMA getValueTableFromStructFMA(
   assert(kDim == 1 || kDim == 2);
   assert(nonKDim == 1 || nonKDim == 2);
   const unsigned bDim = 0;
+
+  // Any NPOT dim: register order is modular, not row-major.
+  bool hasNpotDim = llvm::any_of(
+      perRepShape, [](unsigned s) { return s > 0 && !llvm::isPowerOf2_32(s); });
+
+  if (hasNpotDim) {
+    // NPOT K register order follows the layout's modular arithmetic (ADD+mod),
+    // not delinearize's row-major. The register space is pow2-rounded, so index
+    // bits over pow2 sizes, then mod-reduce to the NPOT coordinate.
+
+    // Round perRepShape to pow2 for register bit counting.
+    SmallVector<unsigned> pow2PerRepShape(3);
+    for (int i = 0; i < 3; i++) {
+      unsigned s = perRepShape[i];
+      pow2PerRepShape[i] = (s <= 1)                 ? s
+                           : llvm::isPowerOf2_32(s) ? s
+                                                    : llvm::NextPowerOf2(s);
+    }
+    unsigned pow2NumElemsRep = product(pow2PerRepShape);
+
+    // Count register bits per dimension (in inRepOrder).
+    SmallVector<unsigned> bitsPerDim(3);
+    for (int i = 0; i < 3; i++) {
+      unsigned s = pow2PerRepShape[i];
+      bitsPerDim[i] = (s <= 1) ? 0 : llvm::Log2_32(s);
+    }
+
+    for (unsigned idx = 0; idx < elems.size(); ++idx) {
+      auto inRepLinearIdx = idx % pow2NumElemsRep;
+      auto repLinearIdx = idx / pow2NumElemsRep;
+
+      // Compute in-rep coordinates from register bits using basis
+      // accumulation. Bits are assigned to dims in inRepOrder
+      // (fastest-changing dim first).
+      SmallVector<unsigned> inRepCoords(3, 0);
+      unsigned bitOffset = 0;
+      for (auto d : inRepOrder) {
+        unsigned nBits = bitsPerDim[d];
+        unsigned dimSize = perRepShape[d];
+        if (nBits == 0) {
+          continue;
+        }
+        unsigned coord = 0;
+        for (unsigned bit = 0; bit < nBits; ++bit) {
+          if (inRepLinearIdx & (1u << (bitOffset + bit))) {
+            unsigned basisVal = (1u << bit);
+            coord += basisVal;
+          }
+        }
+        // Modular reduction: ADD+mod for NPOT, AND for pow2.
+        if (llvm::isPowerOf2_32(dimSize)) {
+          inRepCoords[d] = coord & (dimSize - 1);
+        } else {
+          inRepCoords[d] = coord % dimSize;
+        }
+        bitOffset += nBits;
+      }
+
+      // Rep coordinates: all dims in repetitions are pow2.
+      auto repSpatialIdx =
+          mlir::LLVM::delinearize(repLinearIdx, repetitions, repOrder);
+
+      OperandValueKey key{repSpatialIdx[0], repSpatialIdx[nonKDim],
+                          inRepCoords[0], inRepCoords[nonKDim],
+                          inRepCoords[kDim]};
+      res[key] = elems[idx];
+    }
+    return res;
+  }
 
   for (unsigned idx = 0; idx < elems.size(); ++idx) {
     auto inRepLinearIdx = idx % numElemsRep;
@@ -115,28 +185,42 @@ LogicalResult parametricConvertFMADot(DotOp op, DotOp::Adaptor adaptor,
   sizePerThread = expandMatrixShapeWithBatch(ArrayRef(sizePerThread));
 
   unsigned K = aShapePerCTA[2];
+  // NPOT K: the struct holds pow2-many K elements/thread (with wrap-around
+  // duplicates), so iterate over Kpow2; the dot loop sums only the real K.
+  unsigned Kpow2 = llvm::isPowerOf2_32(K) ? K : (unsigned)llvm::NextPowerOf2(K);
 
-  unsigned threadTileShape[3];
-  unsigned repetitions[3];
+  // NPOT non-K dims (M/N/batch): the dot_op layout rounds the register dim to
+  // pow2, so reps = NextPow2(shapePerCTA)/CTATile (may exceed the ceil count,
+  // e.g. M=96 -> 128). Tables and accumulator indexing must use this padded
+  // count; see the dot-loop comment for why the extra reps are correct.
+  unsigned repetitionsPadded[3];
   for (int i = 0; i < 3; ++i) {
-    repetitions[i] =
-        ceil(dShapePerCTA[i], static_cast<int64_t>(shapePerCTATile[i]));
+    int64_t shape = dShapePerCTA[i];
+    int64_t pow2Shape = llvm::isPowerOf2_64(shape)
+                            ? shape
+                            : (int64_t)llvm::NextPowerOf2((uint64_t)shape);
+    repetitionsPadded[i] =
+        ceil(pow2Shape, static_cast<int64_t>(shapePerCTATile[i]));
   }
 
   auto has = getValueTableFromStructFMA(
-      llA, {sizePerThread[0], sizePerThread[1], K},
-      {repetitions[0], repetitions[1], 1},
+      llA, {sizePerThread[0], sizePerThread[1], Kpow2},
+      {repetitionsPadded[0], repetitionsPadded[1], 1},
       /*kDim*/ 2, /*nonKDim*/ 1, rewriter, loc, inRepOrder, repOrder);
   auto hbs = getValueTableFromStructFMA(
-      llB, {sizePerThread[0], K, sizePerThread[2]},
-      {repetitions[0], 1, repetitions[2]},
+      llB, {sizePerThread[0], Kpow2, sizePerThread[2]},
+      {repetitionsPadded[0], 1, repetitionsPadded[2]},
       /*kDim*/ 1, /*nonKDim*/ 2, rewriter, loc, inRepOrder, repOrder);
 
   SmallVector<Value> acc = cc;
 
-  for (unsigned bRep = 0; bRep < repetitions[0]; ++bRep)
-    for (unsigned mRep = 0; mRep < repetitions[1]; ++mRep)
-      for (unsigned nRep = 0; nRep < repetitions[2]; ++nRep)
+  // Iterate the pow2-padded rep count. Padding reps cover dead rows
+  // [shapePerCTA, NextPow2); the layout's % origSize wraps them onto valid
+  // rows, so each padding rep recomputes its canonical row's value (harmless,
+  // not a clobber). linearAccumIdx uses the padded count to match the C struct.
+  for (unsigned bRep = 0; bRep < repetitionsPadded[0]; ++bRep)
+    for (unsigned mRep = 0; mRep < repetitionsPadded[1]; ++mRep)
+      for (unsigned nRep = 0; nRep < repetitionsPadded[2]; ++nRep)
         for (unsigned b = 0; b < sizePerThread[0]; ++b)
           for (unsigned m = 0; m < sizePerThread[1]; ++m)
             for (unsigned n = 0; n < sizePerThread[2]; ++n) {
@@ -145,7 +229,7 @@ LogicalResult parametricConvertFMADot(DotOp op, DotOp::Adaptor adaptor,
                   LLVM::linearize(multiDimAccumIdx, sizePerThread, inRepOrder);
               SmallVector<unsigned> multiDimRepIdx = {bRep, mRep, nRep};
               unsigned linearRepIdx =
-                  LLVM::linearize(multiDimRepIdx, repetitions, repOrder);
+                  LLVM::linearize(multiDimRepIdx, repetitionsPadded, repOrder);
               unsigned linearAccumIdx =
                   linearInRepIdx + linearRepIdx * numElemsPerThread;
 

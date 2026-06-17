@@ -16,6 +16,7 @@ namespace {
 using namespace mlir;
 using namespace mlir::triton;
 using namespace mlir::triton::gpu;
+
 using mlir::LLVM::NVIDIA::lowerLdStMatrix;
 
 constexpr int kPtrBitWidth = 64;
@@ -52,6 +53,12 @@ struct ConvertLayoutOpSwizzlingConversion
     auto dims = conversion.getInDimNames();
     if (!llvm::is_contained(dims, kBlock) &&
         cvtNeedsSharedMemory(srcTy, dstTy)) {
+      // For NPOT N accumulator (src has modular dims from TMEM), defer to
+      // base class which has unfoldModularDims + dead register fixup.
+      // WS NPOT K is fine here since the accumulator (src) is pow2.
+      if (srcLayout.isModular())
+        return failure();
+
       auto loc = op.getLoc();
       // Remove the kBlock dimension from the layout as it's the identity in the
       // cvt
@@ -81,6 +88,7 @@ struct ConvertLayoutOpSwizzlingConversion
       ArrayRef<Value> inVals, Type llvmElemTy, Value smemBase) const {
     auto *ctx = rewriter.getContext();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
+
     // We handle transformations recursively as they all need a preprocessing
     // and a postprocessing step.
 
@@ -151,6 +159,7 @@ struct ConvertLayoutOpSwizzlingConversion
     // The permutation exists by construction of the reps dimension in
     // optimalSwizzling for pow2 layouts. For NPOT (modular) layouts the
     // reps division may fail; fall back to a single-rep path.
+    //
     auto maybePermStore = regPermForDivide(totalStoreCvt, reps, /*left=*/false);
     auto maybePermLoad = regPermForDivide(totalLoadCvt, reps, /*left=*/false);
     if (maybePermStore.has_value() && maybePermLoad.has_value()) {

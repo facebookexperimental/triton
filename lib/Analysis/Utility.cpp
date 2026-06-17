@@ -13,6 +13,7 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
@@ -961,13 +962,65 @@ bool supportMMA(triton::DotOp op, int version) {
     // If k size is smaller than the native mma size, we cannot use MMA.
     if (k < 256 / aElemTy.getIntOrFloatBitWidth())
       return false;
-    // NPOT: MMAv5 instrN allows any multiple of 8; pow2 keeps %16 so baseline
-    // N==8 dots don't flip MMAv2->MMAv5. NPOT N=24/40/... need %8.
-    static const bool allowNpot =
-        triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
-    unsigned nDiv = allowNpot ? 8 : 16;
-    if (!(retShapePerCTA[rank - 2] % 64 == 0 &&
-          retShapePerCTA[rank - 1] % nDiv == 0))
+    // NPOT K with swizzle=0: same issue as MMAv3. When K*elemBytes doesn't
+    // divide any swizzle size (32/64/128), the NVMMASharedEncoding gets
+    // swizzle=0 and the SMEM allocation rounds K to pow2. The tc_gen5_mma
+    // reads past the valid K range into uninitialized padding. Fall back to
+    // a non-MMA path (getMMAVersionSafe falls through {5, 2} to version 2).
+    if (!llvm::isPowerOf2_64(k)) {
+      int elemBytes = aElemTy.getIntOrFloatBitWidth() / 8;
+      int64_t contigBytes = (int64_t)k * elemBytes;
+      if (contigBytes % 32 != 0) {
+        return false;
+      }
+    }
+    // NPOT M: MMAv5 instructions are m64/m128. The accumulator lives in TMEM
+    // and the distributed TMEM layout (getDefaultLayoutForTmemLdSt +
+    // applyNpotReductionForTmem) handles NPOT M (row) dims modularly, the same
+    // way NPOT N is handled. So we only need M to tile the m16 granularity of
+    // the MMAv5 instruction shape selection (mmaVersionToInstrShape rounds M up
+    // to the next valid m64/m128). Relax M % 64 -> M % 16 (mirrors the SM90
+    // WGMMA relaxation in D105735350).
+    //
+    // The (rounded) block M must be at least 64 (the smallest MMAv5 row-block).
+    // M < 64 (e.g. 16/32/48) cannot fill a row-block; before the M%64->M%16
+    // relaxation these were rejected by the old %64 check, so keep rejecting
+    // them here to preserve that behaviour (they fall back to a non-MMA path).
+    // This must come before the relaxed %16 check below.
+    int64_t mDim = retShapePerCTA[rank - 2];
+    if (mDim < 64)
+      return false;
+    // Single-row-block only: NPOT M that fits in one MMAv5 row-block (M <= 128,
+    // i.e. rounds up to 64 or 128) is supported. NPOT M spanning multiple
+    // row-blocks (128 < M < 256) makes the TMEM-load distributed layout
+    // over-span to the pow2-rounded row footprint, producing misaligned SMEM
+    // staging in the convert_layout->store; reject those for now (they fall
+    // back to a non-MMA path). Pow2 M (incl. M >= 256, e.g. 256) is unaffected.
+    if (!llvm::isPowerOf2_64(mDim) && mDim > 128)
+      return false;
+    // NPOT M + NPOT N on MMAv5 is not yet supported (the combined NPOT
+    // distributed-layout lowering hits a LinearLayout reshape mismatch in
+    // ConvertTritonGPUToLLVM). Only enable NPOT M when N is a power of 2.
+    int64_t nDim = retShapePerCTA[rank - 1];
+    if (!llvm::isPowerOf2_64(mDim) && !llvm::isPowerOf2_64(nDim))
+      return false;
+    // NPOT N with a blockM==64 accumulator is incorrect on MMAv5 and falls back
+    // to a non-MMA path (getMMAVersionSafe drops {5,2} to v2/FMA), which is
+    // numerically correct. mmaVersionToInstrShape selects instr M=64 when the
+    // (pow2-rounded) tile M is <=64, giving a blockM==64 TMEM accumulator whose
+    // 16x32bx2 "lane-split" tcgen05 ld/st places the dead pow2-padded N columns
+    // on a *lane* basis; applyNpotReductionForTmem then folds them onto live
+    // columns as an unremovable lane broadcast (actionRemoveBroadcastedRegs
+    // only dedups register bases), so those lanes read uninitialized TMEM ->
+    // wrong results. blockM==128 covers all columns in registers (removable
+    // broadcast) so NPOT N is correct there. Pow2 N and NPOT-N with M>=128 are
+    // unaffected.
+    // TODO(T275205780): real tcgen05-preserving fix = cross-lane dead-position
+    // fixup in lowerTMemLdSt; remove this guard then.
+    if (!llvm::isPowerOf2_64(nDim) && mDim <= 64)
+      return false;
+    if (!(retShapePerCTA[rank - 2] % 16 == 0 &&
+          retShapePerCTA[rank - 1] % 8 == 0))
       return false;
     return true;
   }
@@ -980,14 +1033,27 @@ bool supportMMA(triton::DotOp op, int version) {
     // If k size is smaller than the native mma size, we cannot use MMA.
     if (k < 256 / aElemTy.getIntOrFloatBitWidth())
       return false;
+    // NPOT K with swizzle=0 (K*elemBytes not a multiple of 32/64/128):
+    // the SMEM alloc rounds K to pow2 and WGMMA would read uninitialized
+    // padding, so fall back to a non-MMA path.
+    if (!llvm::isPowerOf2_64(k)) {
+      int elemBytes = aElemTy.getIntOrFloatBitWidth() / 8;
+      int64_t contigBytes = (int64_t)k * elemBytes;
+      if (contigBytes % 32 != 0) {
+        return false;
+      }
+    }
     auto retShapePerCTA = getShapePerCTA(retType);
     auto rank = retShapePerCTA.size();
     int numWarps = lookupNumWarps(op);
     // TODO(Keren): for now, fallback to MMAv2 if handling batch matmul.
     if (rank == 3)
       return false;
-    if (!(numWarps % 4 == 0 && retShapePerCTA[rank - 2] % 64 == 0 &&
-          retShapePerCTA[rank - 1] % 16 == 0 &&
+    // Pow2 M requires M%64 (routes pow2 GEMMs to MMAv2); NPOT M only M%16.
+    int64_t mDimV3 = retShapePerCTA[rank - 2];
+    bool mOkV3 =
+        llvm::isPowerOf2_64(mDimV3) ? (mDimV3 % 64 == 0) : (mDimV3 % 16 == 0);
+    if (!(numWarps % 4 == 0 && mOkV3 && retShapePerCTA[rank - 1] % 16 == 0 &&
           (llvm::isa<Float8E5M2Type, Float8E4M3FNType>(aElemTy) ||
            aElemTy.isInteger(8) || aElemTy.isF16() || aElemTy.isBF16() ||
            aElemTy.isF32()))) {
@@ -998,6 +1064,26 @@ bool supportMMA(triton::DotOp op, int version) {
         (llvm::isa<Float8E5M2Type, Float8E4M3FNType>(aElemTy)) &&
         cast<RankedTensorType>(op.getType()).getElementType().isF32()) {
       return false;
+    }
+  }
+  // MMAv2 (reachable as a fallback on modern archs + Ampere) supports NPOT K
+  // (multiple of instrK); NPOT M/N are rejected and fall to FMA.
+  if (version == 2) {
+    RankedTensorType typeA2 = op.getA().getType();
+    int k2 = typeA2.getShape().back();
+    // Only NPOT K is constrained (must be a multiple of instrK); pow2 K
+    // (incl. K < instrK, e.g. f8 K=16) keeps upstream MMAv2 behaviour.
+    if (!llvm::isPowerOf2_64(k2)) {
+      int instrK = 256 / aElemTy.getIntOrFloatBitWidth();
+      if (k2 % instrK != 0) {
+        return false;
+      }
+    }
+    auto retShapePerCTA = getShapePerCTA(op.getType());
+    for (auto d : retShapePerCTA) {
+      if (d > 0 && !llvm::isPowerOf2_64(d)) {
+        return false;
+      }
     }
   }
   if (aElemTy.isF32() && bElemTy.isF32()) {
@@ -1058,7 +1144,31 @@ LinearLayout minimalCvtLayout(Type srcTy_, Type dstTy_) {
   return comp;
 }
 
+// Helper: returns true when NPOT shapes interact with MMA-family encodings,
+// making invertAndCompose (via minimalCvtLayout) potentially hang in the
+// modular solver.  Callers should bail out conservatively.
+static bool npotMmaConversion(RankedTensorType srcTy, RankedTensorType dstTy) {
+  if (!hasNpotShape(srcTy) && !hasNpotShape(dstTy)) {
+    return false;
+  }
+  auto hasMmaFamily = [](Attribute enc) {
+    if (isa<triton::gpu::NvidiaMmaEncodingAttr>(enc)) {
+      return true;
+    }
+    if (auto dot = dyn_cast<triton::gpu::DotOperandEncodingAttr>(enc)) {
+      return isa<triton::gpu::NvidiaMmaEncodingAttr>(dot.getParent());
+    }
+    return false;
+  };
+  return hasMmaFamily(srcTy.getEncoding()) || hasMmaFamily(dstTy.getEncoding());
+}
+
 bool cvtReordersRegisters(RankedTensorType srcTy, RankedTensorType dstTy) {
+  // NPOT + MMA: modular solver in invertAndCompose can hang.
+  // Conservatively say "no" (can't reorder registers).
+  if (npotMmaConversion(srcTy, dstTy)) {
+    return false;
+  }
   auto layout = minimalCvtLayout(srcTy, dstTy);
   MLIRContext *ctx = srcTy.getContext();
   auto kRegister = StringAttr::get(ctx, "register");
@@ -1067,6 +1177,11 @@ bool cvtReordersRegisters(RankedTensorType srcTy, RankedTensorType dstTy) {
 }
 
 bool cvtNeedsWarpShuffle(RankedTensorType srcTy, RankedTensorType dstTy) {
+  // getWarpLayoutConvertDecomposition is a pow2-only GF(2) bit-permutation
+  // algorithm that never terminates on modular/NPOT layouts.
+  if (hasNpotShape(srcTy) || hasNpotShape(dstTy)) {
+    return false;
+  }
   auto layout = minimalCvtLayout(srcTy, dstTy);
   MLIRContext *ctx = srcTy.getContext();
   auto kRegister = StringAttr::get(ctx, "register");
@@ -1080,6 +1195,18 @@ bool cvtNeedsWarpShuffle(RankedTensorType srcTy, RankedTensorType dstTy) {
 }
 
 bool cvtNeedsSharedMemory(RankedTensorType srcTy, RankedTensorType dstTy) {
+  // For NPOT shapes, toLinearLayout may crash if the encoding doesn't support
+  // modular layouts. Conservatively assume shared memory is needed for unsafe
+  // encodings.
+  if (hasNpotShape(srcTy) || hasNpotShape(dstTy)) {
+    bool srcSafe = npotSafeForLinearLayout(srcTy.getEncoding());
+    bool dstSafe = npotSafeForLinearLayout(dstTy.getEncoding());
+    if (!srcSafe || !dstSafe) {
+      return true;
+    }
+  }
+  // NPOT+MMA: the two guards above both return false, so this returns true
+  // without calling invertAndCompose.
   return !cvtReordersRegisters(srcTy, dstTy) &&
          !cvtNeedsWarpShuffle(srcTy, dstTy);
 }

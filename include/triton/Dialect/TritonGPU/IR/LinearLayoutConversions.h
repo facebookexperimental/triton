@@ -65,6 +65,25 @@ LinearLayout nvmmaSharedToLinearLayout(ArrayRef<int64_t> shape,
                                        TMAMode mode,
                                        bool disableSwizzle = false);
 
+// Build a split-dim SMEM layout for NPOT swizzled shared memory.
+//
+// When the contiguous dim is NPOT and swizzle > 0, the standard
+// nvmmaSharedToLinearLayout merges swizzle-coupled (XOR) and phase (ADD+mod)
+// bases into a single NPOT output dim.  pseudoinvert() cannot handle this
+// mixed algebra correctly.
+//
+// This function builds the layout with 3 output dims for rank-2 tensors:
+//   dim0 (rows, pow2), dim1 (intra-phase columns, pow2), contig_phase (NPOT).
+// The pseudoinverse of this split layout is correct because each output dim
+// uses a single algebra (XOR or ADD+mod).
+//
+// Returns std::nullopt if the layout is pow2 or unswizzled (no split needed).
+// The returned layout does NOT include CGA/block dims -- it's the CTA-local
+// layout only, suitable for pseudoinversion in the MMA descriptor path.
+std::optional<LinearLayout>
+nvmmaSharedToSplitLinearLayout(ArrayRef<int64_t> shape,
+                               NVMMASharedEncodingAttr shared);
+
 // Given a linear layout where the input dimensions contain a "block" dimension,
 // this method sets the "block" dimension to 0 and removes the corresponding
 // output dimensions.

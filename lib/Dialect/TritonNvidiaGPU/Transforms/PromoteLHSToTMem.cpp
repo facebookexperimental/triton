@@ -125,10 +125,17 @@ public:
     if (elemBitWidth != 16 && elemBitWidth != 32) {
       return failure();
     }
+    // The A operand's K dimension (shape[1]) becomes blockN in the TMEM
+    // encoding. TMEM load/store lowering currently only supports pow2 blockN,
+    // so bail out if K is NPOT.
+    auto lhsK = lhs.getType().getShape()[1];
+    if (!llvm::isPowerOf2_64(lhsK)) {
+      return failure();
+    }
     const unsigned colStride = 1;
     auto aTMemEncoding = TensorMemoryEncodingAttr::get(
-        context, accTMemEncoding.getBlockM(), lhs.getType().getShape()[1],
-        colStride, CTASplitNum[0], CTASplitNum[1], accTMemEncoding.getTwoCTAs(),
+        context, accTMemEncoding.getBlockM(), lhsK, colStride, CTASplitNum[0],
+        CTASplitNum[1], accTMemEncoding.getTwoCTAs(),
         accTMemEncoding.getCtaMode() == TensorMemoryCTAMode::TwoCTA_RHS
             ? TensorMemoryCTAMode::TwoCTA_LHS
             : accTMemEncoding.getCtaMode());

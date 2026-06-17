@@ -32,6 +32,7 @@ using namespace mlir::triton::NVIDIA;
 
 using ::mlir::LLVM::getSharedMemoryObjectFromStruct;
 using ::mlir::triton::gpu::getShapePerCTA;
+using ::mlir::triton::gpu::getTotalElemsPerThread;
 using ::mlir::triton::gpu::MemDescType;
 using ::mlir::triton::gpu::NvidiaMmaEncodingAttr;
 using ::mlir::triton::gpu::SharedEncodingTrait;
@@ -261,12 +262,20 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
 
   auto func = op->getParentOfType<LLVM::LLVMFuncOp>();
   Operation *startSequence = NVVM::WgmmaFenceAlignedOp::create(rewriter, loc);
+  // Per-rep stride into the accumulator. Pow2 N: not padded, so
+  // fc.size()/totalReps == accSize (no-op). NPOT N: fc is pow2-padded, so index
+  // with that stride but read only the accSize real values per rep.
+  unsigned totalReps = static_cast<unsigned>(numRepM * numRepN);
+  unsigned inAccRepStride = accSize;
+  if (!fc.empty() && totalReps > 0 && fc.size() % totalReps == 0) {
+    inAccRepStride = fc.size() / totalReps;
+  }
   SmallVector<Value> mmaResults;
   for (int m = 0; m < numRepM; ++m) {
     for (int n = 0; n < numRepN; ++n) {
       llvm::SmallVector<Value> mmaOut =
-          loadReg(rewriter, loc, fc, (m * numRepN + n) * accSize, accSize,
-                  startSequence);
+          loadReg(rewriter, loc, fc, (m * numRepN + n) * inAccRepStride,
+                  accSize, startSequence);
       llvm::SmallVector<Type> elemTypes;
       for (Value accEl : mmaOut)
         elemTypes.push_back(accEl.getType());
@@ -338,6 +347,26 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
 
   SmallVector<Value> results =
       unpackAccumulator(rewriter, loc, mmaResults, dTensorTy);
+
+  // NPOT N: WGMMA produces accSize real values/rep but the register dim is
+  // pow2-padded, so pad with aliases of the modular-wrapped canonical values.
+  // Guard on expectedElems % totalReps == 0 (else paddedPerRep would truncate
+  // to a wrong-sized struct).
+  unsigned expectedElems = getTotalElemsPerThread(dTensorTy);
+  if (results.size() < expectedElems && totalReps > 0 &&
+      expectedElems % totalReps == 0) {
+    unsigned realPerRep = accSize;
+    unsigned paddedPerRep = expectedElems / totalReps;
+    SmallVector<Value> padded;
+    padded.reserve(expectedElems);
+    for (unsigned rep = 0; rep < totalReps; ++rep) {
+      unsigned base = rep * realPerRep;
+      for (unsigned r = 0; r < paddedPerRep; ++r) {
+        padded.push_back(results[base + r % realPerRep]);
+      }
+    }
+    results = std::move(padded);
+  }
 
   // replace with new packed result
   Type structTy = LLVM::LLVMStructType::getLiteral(

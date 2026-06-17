@@ -58,11 +58,24 @@ public:
     auto newLl =
         transposeLinearLayout(oldCGALayout.getLinearLayout(), trans.getOrder());
     auto newCGALayout = CGAEncodingAttr::get(ctx, std::move(newLl));
-    auto newInnerCvtEnc =
-        SwizzledSharedEncodingAttr::get(ctx, cvtEncoding, srcTy.getShape(),
-                                        /*order=*/getOrderForMemory(srcTy),
-                                        newCGALayout, srcTy.getElementType(),
-                                        /*needTrans=*/true);
+    // NPOT on SM90+: use NVMMAShared (SwizzledShared's XOR-coupled bases are
+    // incompatible with the modular solver).
+    Attribute newInnerCvtEnc;
+    auto mod = cvtOp->getParentOfType<ModuleOp>();
+    int cc = getNVIDIAComputeCapability(mod);
+    bool isNpot = hasNpotShape(srcTy);
+    if (isNpot && !npotSafeForLinearLayout(cvtEncoding.getParent())) {
+      return failure();
+    }
+    if (cc >= 90 && isNpot) {
+      newInnerCvtEnc = NVMMASharedEncodingAttr::get(
+          ctx, srcTy.getShape(), getOrderForMemory(srcTy), newCGALayout,
+          srcTy.getElementType(), /*fp4Padded=*/false);
+    } else {
+      newInnerCvtEnc = SwizzledSharedEncodingAttr::get(
+          ctx, cvtEncoding, srcTy.getShape(), getOrderForMemory(srcTy),
+          newCGALayout, srcTy.getElementType(), /*needTrans=*/true);
+    }
     if (newInnerCvtEnc == cvtEncoding)
       return failure();
     rewriter.setInsertionPoint(trans);

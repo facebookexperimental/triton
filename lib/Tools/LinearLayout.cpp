@@ -299,7 +299,9 @@ LinearLayout::LinearLayout(
   if (size == 0)
     return LinearLayout::empty();
 
-  assert(llvm::isPowerOf2_32(size));
+  // strided1D/identity1D are pow2-only; NPOT callers must use modularStrided1D.
+  assert(llvm::isPowerOf2_32(size) &&
+         "strided1D/identity1D require a power-of-2 size");
   std::vector<std::vector<int32_t>> bases;
   for (int32_t i = 1; i < size; i *= 2) {
     bases.emplace_back(std::vector<int32_t>{i * stride});
@@ -316,7 +318,7 @@ LinearLayout::LinearLayout(
   if (size == 0)
     return LinearLayout::empty();
 
-  assert(llvm::isPowerOf2_32(size));
+  assert(llvm::isPowerOf2_32(size) && "zeros1D requires a power-of-2 size");
   std::vector<std::vector<int32_t>> zeros;
   for (int i = 1; i < size; i *= 2) {
     zeros.emplace_back(std::vector<int32_t>{0});
@@ -953,6 +955,95 @@ std::optional<LinearLayout> divideRight(const LinearLayout &A,
                  /*requireSurjective=*/A.isSurjective() && B.isSurjective());
   assert(C * B == A);
   return C;
+}
+
+namespace {
+
+// Returns a copy of `ll` with the same bases but each out-dim size rounded up
+// to the next power of two. This converts a modular (NPOT) layout into a
+// non-modular one whose bases are unchanged. Bases of a reduced modular layout
+// are always < the NPOT size and therefore also < the rounded-up pow2 size, so
+// the resulting layout satisfies the per-dim "basis < size" invariant and is
+// no longer flagged as modular by checkInvariants.
+LinearLayout expandModularToPow2(const LinearLayout &ll) {
+  SmallVector<std::pair<StringAttr, int32_t>> pow2OutDims;
+  for (auto [outDim, size] : ll.getOutDims())
+    pow2OutDims.push_back({outDim, (int32_t)llvm::PowerOf2Ceil(size)});
+  // Copy the bases (the BasesT map) verbatim.
+  return LinearLayout(ll.getBases(), pow2OutDims,
+                      /*requireSurjective=*/false);
+}
+
+// Refolds `quot` so that each out-dim size becomes `targetSizes[outDim]` (the
+// NPOT quotient size) instead of the pow2-rounded size produced by dividing the
+// expanded layout. Bases are preserved verbatim; only the declared out-dim
+// sizes change, which restores the modular structure.
+LinearLayout refoldToSizes(const LinearLayout &quot,
+                           const llvm::MapVector<StringAttr, int32_t> &sizes) {
+  SmallVector<std::pair<StringAttr, int32_t>> outDims;
+  for (auto outDim : quot.getOutDimNames()) {
+    auto it = sizes.find(outDim);
+    assert(it != sizes.end() && "missing refold target size for out-dim");
+    outDims.push_back({outDim, it->second});
+  }
+  return LinearLayout(quot.getBases(), outDims,
+                      /*requireSurjective=*/false);
+}
+
+// Pre-flight common to both modular-aware wrappers: for every out-dim of A, the
+// size must be divisible by the corresponding out-dim size of B (else no
+// quotient exists), and B must be entirely pow2 (modular B is not supported --
+// the quotient would have ambiguous modular structure). Fills `quotSizes` with
+// the per-out-dim NPOT quotient size A_size / B_size. Returns false if the
+// divide is impossible by this pre-flight.
+bool computeModularQuotSizes(const LinearLayout &A, const LinearLayout &B,
+                             llvm::MapVector<StringAttr, int32_t> &quotSizes) {
+  if (B.isModular())
+    return false;
+  for (StringAttr outDim : A.getOutDimNames()) {
+    int sizeA = A.getOutDimSize(outDim);
+    int sizeB = B.hasOutDim(outDim) ? B.getOutDimSize(outDim) : 1;
+    if (sizeB == 0 || sizeA % sizeB != 0)
+      return false;
+    quotSizes[outDim] = sizeA / sizeB;
+  }
+  return true;
+}
+
+} // namespace
+
+std::optional<LinearLayout> divideLeftAllowingModular(const LinearLayout &A,
+                                                      const LinearLayout &B) {
+  // Fast path: A is already pow2 -> identical to the raw divide.
+  if (!A.isModular())
+    return divideLeft(A, B);
+
+  llvm::MapVector<StringAttr, int32_t> quotSizes;
+  if (!computeModularQuotSizes(A, B, quotSizes))
+    return std::nullopt;
+
+  // Expand A to pow2, divide, then refold the quotient back to NPOT sizes.
+  auto quot = divideLeft(expandModularToPow2(A), B);
+  if (!quot)
+    return std::nullopt;
+  return refoldToSizes(*quot, quotSizes);
+}
+
+std::optional<LinearLayout> divideRightAllowingModular(const LinearLayout &A,
+                                                       const LinearLayout &B) {
+  // Fast path: A is already pow2 -> identical to the raw divide.
+  if (!A.isModular())
+    return divideRight(A, B);
+
+  llvm::MapVector<StringAttr, int32_t> quotSizes;
+  if (!computeModularQuotSizes(A, B, quotSizes))
+    return std::nullopt;
+
+  // Expand A to pow2, divide, then refold the quotient back to NPOT sizes.
+  auto quot = divideRight(expandModularToPow2(A), B);
+  if (!quot)
+    return std::nullopt;
+  return refoldToSizes(*quot, quotSizes);
 }
 
 LinearLayout operator*(LinearLayout inner, LinearLayout outer) {

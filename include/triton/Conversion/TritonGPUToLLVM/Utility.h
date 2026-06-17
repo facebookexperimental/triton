@@ -342,7 +342,8 @@ LLVM::LLVMFuncOp appendOrGetExternFuncOp(RewriterBase &rewriter, Operation *op,
                                          StringRef libname = "",
                                          StringRef libpath = "");
 
-// Multiply a square layout with 1 input and output dimension with a vector
+// Multiply a square 1-in/1-out layout with a vector. NPOT out dim uses
+// ADD+mod, pow2 uses XOR (per isOutDimModular on the single out dim).
 Value matrixVectorProd(TritonLLVMOpBuilder &b, const LinearLayout &A, Value x);
 } // namespace gpu
 
@@ -555,7 +556,7 @@ SmallVector<Value> lowerLdStShared(
     uint64_t maskSpanAffineOffset, RewriterBase &rewriter,
     const TargetInfoBase &targetInfo, std::optional<int> maybeMaxVecElems = {},
     Operation *localLoadOp = nullptr, std::optional<Value> ctaRank = {},
-    std::optional<Value> barrierPtr = {});
+    std::optional<Value> barrierPtr = {}, int64_t npotBufBytes = 0);
 
 // Lower an ld/st-like operation given a layout and a callback that creates the
 // PTX instruction Lowers to st when valArrays is empty, and to ld when it is
@@ -574,9 +575,9 @@ SmallVector<Value> lowerLdSt(
     std::function<SmallVector<Value>(RewriterBase &, Location, ArrayRef<Value>,
                                      Value, int, VectorType)>
         lowerInst,
-    std::optional<Value> barrierPtr = {});
+    std::optional<Value> barrierPtr = {}, int64_t npotBufBytes = 0);
 
-// Lower local_load/local_store via ld.shared/st.shared
+// Lower local_load/local_store via ld.shared/st.shared.
 SmallVector<Value> lowerLocalLdSt(
     Location loc, MLIRContext *ctx,
     LinearLayout cvt,          // Map from registers to offset
