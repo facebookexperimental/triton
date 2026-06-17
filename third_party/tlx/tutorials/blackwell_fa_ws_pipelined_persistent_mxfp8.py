@@ -142,7 +142,7 @@ def _mask_scalar_transposed(qk, col_limit_left, s, i):
 
 
 @triton.jit
-def _apply_causal_mask(qk, col_limit, BLOCK_N: tl.constexpr, TRANSPOSED: tl.constexpr = False):
+def _apply_causal_mask(qk, col_limit, BLOCK_N: tl.constexpr, TRANSPOSED: tl.constexpr):
     # Apply causal mask via a bitmask calculated for each block of 16 elements.
     # This allows the efficient R2P (register to predicate) instruction to be used at the SASS level.
     # Credit to Tri Dao,
@@ -217,7 +217,7 @@ def _softmax_inner_loop(
 
         if STAGE == 2:
             col_limit_right = (offs_m - start_n + 1)[:, None]
-            qk = _apply_causal_mask(qk, col_limit_right, BLOCK_N)
+            qk = _apply_causal_mask(qk, col_limit_right, BLOCK_N, TRANSPOSED=False)
 
         qk_reshaped = tl.reshape(qk, [BLOCK_M_SPLIT, NUM_BLOCKS, VEC_SIZE])
         block_maxes = tl.max(qk_reshaped, 2)
