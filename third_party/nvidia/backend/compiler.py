@@ -651,6 +651,11 @@ class CUDABackend(BaseBackend):
         dump_enabled = pm.enable_debug()
         emuTF32 = capability // 10 >= 8
         passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
+        # Check user-visible tt.dot 2-CTA legality before lowering rewrites
+        # dot dependencies into TMEM alloc/load/store chains.
+        if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
+                and opt.ctas_per_cga is not None):
+            nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm)
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
