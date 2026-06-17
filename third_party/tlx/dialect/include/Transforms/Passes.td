@@ -105,6 +105,7 @@ def TLXResolvePlaceholderLayouts : Pass<"tlx-resolve-placeholder-layouts", "mlir
     the correct layouts for TMEM loads/stores and other TLX operations.
 
     The pass replaces:
+    - NoVerifyLayoutAttr -> wrapped concrete distributed layout
     - DummyRegisterLayoutAttr -> BlockedEncodingAttr
 
     Each resolved layout uses the same default values as the corresponding
@@ -112,6 +113,7 @@ def TLXResolvePlaceholderLayouts : Pass<"tlx-resolve-placeholder-layouts", "mlir
   }];
 
   let dependentDialects = [
+    "mlir::triton::tlx::TLXDialect",
     "mlir::triton::gpu::TritonGPUDialect",
     "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
   ];
