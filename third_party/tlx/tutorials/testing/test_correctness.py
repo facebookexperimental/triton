@@ -54,6 +54,8 @@ from triton.language.extra.tlx.tutorials.amd_fa_pipelined import (
     attention as _amd_fa_pipelined, )
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul as _amd_tdm_gemm_pipelined, )
+from triton.language.extra.tlx.tutorials.amd_gemm_warp_pipeline import (
+    matmul as _amd_gemm_warp_pipeline, )
 
 from triton.language.extra.tlx.tutorials.testing.multi_cta_layer_norm import (
     multi_cta_layernorm as _multi_cta_layernorm,
@@ -65,6 +67,7 @@ from triton._internal_testing import (
     is_hopper,
     is_hopper_or_newer,
     is_hip,
+    is_hip_cdna4,
     is_hip_gfx1250,
 )
 from triton.language.extra.tlx.tutorials.testing.gemm_shapes import (
@@ -171,6 +174,14 @@ class Gemm:
             "BLOCK_M": 128,
             "BLOCK_N": 128,
             "BLOCK_K": 32,
+        },
+        "amd_gemm_warp_pipeline": {
+            "BLOCK_M": 256,
+            "BLOCK_N": 256,
+            "BLOCK_K": 32,
+            "GROUP_M": 8,
+            "NUM_BUFFERS": 3,
+            "num_warps": 8,
         },
     }
 
@@ -933,6 +944,12 @@ def test_amd_fa_pipelined(config_name, causal):
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
 def test_amd_tdm_gemm_pipelined(dtype):
     Gemm.run_test(_amd_tdm_gemm_pipelined, Gemm.CONFIGS["amd_tdm_gemm_pipelined"], dtype=dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_gemm_warp_pipeline(dtype):
+    Gemm.run_test(_amd_gemm_warp_pipeline, Gemm.CONFIGS["amd_gemm_warp_pipeline"], dtype=dtype)
 
 
 # =============================================================================

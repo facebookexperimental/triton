@@ -43,7 +43,7 @@ int doTaskIdPropagate(triton::FuncOp &funcOp);
 LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
                               StringRef readDecisionFile = "",
                               StringRef writeDecisionFile = "",
-                              int smemAllocAlgo = 0, unsigned smemBudget = 0,
+                              int smemAllocAlgo = 1, unsigned smemBudget = 0,
                               bool smemCircularReuse = false);
 void doBufferAllocation(triton::FuncOp &funcOp);
 void doHoistLoopInvariantTMEMStore(triton::FuncOp &funcOp);
@@ -229,7 +229,7 @@ public:
 
     if (failed(doMemoryPlanner(funcOp, numStages, /*readDecisionFile=*/"",
                                /*writeDecisionFile=*/"",
-                               /*smemAllocAlgo=*/0, smemBudget))) {
+                               /*smemAllocAlgo=*/1, smemBudget))) {
       signalPassFailure();
       return;
     }
