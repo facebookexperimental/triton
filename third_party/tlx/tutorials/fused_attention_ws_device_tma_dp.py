@@ -228,6 +228,7 @@ def _attn_fwd_inner_oss_dp(
     SUBTILING_P: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    IS_HOPPER: tl.constexpr,
 ):
     # range of values handled by this stage
     if STAGE == 1:
@@ -246,6 +247,7 @@ def _attn_fwd_inner_oss_dp(
             merge_epilogue=True,
             separate_epilogue_store=True,
             disallow_acc_multi_buffer=True,
+            smem_alloc_algo=0 if (IS_HOPPER and BLOCK_N == 64) else 1,
     ):
         start_n = tl.multiple_of(start_n, BLOCK_N)
 
@@ -530,6 +532,7 @@ def _attn_fwd_tma_dp(
     SUBTILING_P: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    IS_HOPPER: tl.constexpr,
 ):
     # tl.static_assert(BLOCK_N <= HEAD_DIM)
     start_m = pid  # tl.program_id(0)
@@ -596,6 +599,7 @@ def _attn_fwd_tma_dp(
         SUBTILING_P,
         VECT_MUL,
         FADD2_REDUCE,
+        IS_HOPPER,
     )
 
     if FADD2_REDUCE:
@@ -645,6 +649,7 @@ def _attn_fwd(
     SUBTILING_P: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    IS_HOPPER: tl.constexpr,
 ):
     pid = tl.program_id(0)
     off_hz = tl.program_id(1)
@@ -671,6 +676,7 @@ def _attn_fwd(
         SUBTILING_P,
         VECT_MUL,
         FADD2_REDUCE,
+        IS_HOPPER,
     )
 
 
@@ -703,6 +709,7 @@ def _attn_fwd_persist(
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
     GROUP_SIZE_N: tl.constexpr,
+    IS_HOPPER: tl.constexpr,
 ):
     prog_id = tl.program_id(0)
     num_progs = tl.num_programs(0)
@@ -749,6 +756,7 @@ def _attn_fwd_persist(
             warp_specialize=warp_specialize and OUTER_LOOP,
             merge_epilogue=True,
             separate_epilogue_store=True,
+            smem_alloc_algo=0 if (IS_HOPPER and BLOCK_N == 64) else 1,
     ):
         group_id = tile_idx // num_pid_in_group
         first_pid_n = group_id * GROUP_SIZE_N
@@ -779,6 +787,7 @@ def _attn_fwd_persist(
             SUBTILING_P,
             VECT_MUL,
             FADD2_REDUCE,
+            IS_HOPPER,
         )
         tile_idx += num_progs
 
@@ -897,6 +906,7 @@ class _attention_opt(torch.autograd.Function):
                     warp_specialize=warp_specialize,
                     OUTER_LOOP=True,
                     dtype=torch_dtype_to_triton(q.dtype),
+                    IS_HOPPER=is_hopper(),
                     **extra_kern_args,
                 )
             else:
@@ -915,6 +925,7 @@ class _attention_opt(torch.autograd.Function):
                     STAGE=stage,  #
                     warp_specialize=warp_specialize,
                     dtype=torch_dtype_to_triton(q.dtype),
+                    IS_HOPPER=is_hopper(),
                     **extra_kern_args,
                 )
 
