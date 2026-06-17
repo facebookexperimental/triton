@@ -1553,7 +1553,7 @@ _DPT_SEPARABLE_LAYOUT = tlx.layout(
 
 @triton.autotune(
     configs=mxfp8_bwd_configs,
-    key=["N_CTX", "HEAD_DIM", "H"],
+    key=["N_CTX", "HEAD_DIM", "H", "STAGE"],
 )
 @triton.jit  # pragma: no cover
 def _attn_bwd_mxf8_ws(
@@ -1591,7 +1591,7 @@ def _attn_bwd_mxf8_ws(
     DQ_REDUCE_NCOL: tl.constexpr,
     M_STAGE: tl.constexpr,
     D_STAGE: tl.constexpr,
-    STAGE: tl.constexpr = 1,
+    STAGE: tl.constexpr,
 ) -> None:
     tl.static_assert(HEAD_DIM == 128)
     tl.static_assert(BLOCK_N1 == 128)
@@ -2011,7 +2011,7 @@ def _attn_bwd_mxf8_ws(
             blk_idx = 0
             for _i in range(tiles_per_sm):
                 _, persistent_tmem_phase = get_bufidx_phase(_i, NUM_BUFFERS_TMEM)
-                off_seq_h, off_z, off_h, pid, start_n, base_q, start_m, num_steps = _get_bwd_tile_info(
+                off_seq_h, off_z, off_h, pid, start_n, base_q, start_m, num_steps = (_get_bwd_tile_info(
                     tile_idx,
                     n_tile_num,
                     H,
@@ -2019,7 +2019,7 @@ def _attn_bwd_mxf8_ws(
                     BLOCK_M1,
                     BLOCK_N1,
                     STAGE,
-                )
+                ))
                 curr_m = start_m
 
                 # Prologue: produce P for the first M-block.
@@ -2168,7 +2168,7 @@ def _attn_bwd_mxf8_ws(
             tile_idx = tile_idx_start
             blk_idx = 0
             for _i in range(tiles_per_sm):
-                off_seq_h, off_z, off_h, pid, start_n, base_q, start_m, num_steps = _get_bwd_tile_info(
+                off_seq_h, off_z, off_h, pid, start_n, base_q, start_m, num_steps = (_get_bwd_tile_info(
                     tile_idx,
                     n_tile_num,
                     H,
@@ -2176,7 +2176,7 @@ def _attn_bwd_mxf8_ws(
                     BLOCK_M1,
                     BLOCK_N1,
                     STAGE,
-                )
+                ))
                 curr_m = start_m
                 for _ in range(num_steps):
                     _, tmem_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
@@ -2220,7 +2220,7 @@ def _attn_bwd_mxf8_ws(
             blk_idx = 0
             for _i in range(tiles_per_sm):
                 kv_buf_id, kv_phase = get_bufidx_phase(_i, NUM_BUFFERS_KV)
-                off_seq_h, off_z, off_h, pid, start_n, base_q, start_m, num_steps = _get_bwd_tile_info(
+                off_seq_h, off_z, off_h, pid, start_n, base_q, start_m, num_steps = (_get_bwd_tile_info(
                     tile_idx,
                     n_tile_num,
                     H,
@@ -2228,7 +2228,7 @@ def _attn_bwd_mxf8_ws(
                     BLOCK_M1,
                     BLOCK_N1,
                     STAGE,
-                )
+                ))
                 # --- Prolog: first M-block ---
                 q_buf_id, q_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
                 do_buf_id, do_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
@@ -2527,7 +2527,7 @@ def _attn_bwd_mxf8_ws(
             tile_idx = tile_idx_start
             blk_idx = 0
             for _i in range(tiles_per_sm):
-                off_seq_h, off_z, off_h, pid, start_n, base_q, start_m, num_steps = _get_bwd_tile_info(
+                off_seq_h, off_z, off_h, pid, start_n, base_q, start_m, num_steps = (_get_bwd_tile_info(
                     tile_idx,
                     n_tile_num,
                     H,
@@ -2535,7 +2535,7 @@ def _attn_bwd_mxf8_ws(
                     BLOCK_M1,
                     BLOCK_N1,
                     STAGE,
-                )
+                ))
                 # Scale TMA layout: [Z*H, REP_N (or REP_M), REP_HEAD, 2, 256].
                 # Tile selects (z, h) via off_seq_h, and the M / N index via
                 # the 2nd dim.
