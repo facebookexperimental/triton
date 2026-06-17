@@ -345,4 +345,40 @@ def TritonAMDGPUWarpPipeline: Pass<"tritonamdgpu-warp-pipeline", "mlir::ModuleOp
   let dependentDialects = ["mlir::ROCDL::ROCDLDialect, mlir::triton::amdgpu::TritonAMDGPUDialect"];
 }
 
+def TritonAMDGPUDotDecomposeAndSchedule : Pass<"tritonamdgpu-dot-decompose-and-schedule", "mlir::ModuleOp"> {
+  let summary = "Decompose tt.dot into MFMA-tile-sized sub-dots and schedule them";
+
+  let description = [{
+    TTGIR-level replacement for the LLVM-IR `LLIRSchedule` pass on AMD MFMA
+    matmul kernels. For each MFMA-typed `tt.dot` in an inner `scf.for`:
+
+    Planning phase (TRITON_ENABLE_TTGIR_SCHED=1, default off):
+      * Compute an M x N partition plan from AMDMfmaEncodingAttr's
+        instrShape * warpsPerCTA (the CTA tile, required for
+        amdgpu.extract_slice's verifier).
+      * Walk backward from dot.getA() / dot.getC() and forward from
+        dot.getResult() to verify the producer/user chain is supported.
+      * Emit MLIR remarks reporting the plan; no IR mutation.
+
+    Apply phase (TRITON_TTGIR_SCHED_APPLY=1, default off):
+      * Replace each candidate dot with M x N small dots, each operating
+        on a CTA-tile slice (extract_slice on operands, smaller tt.dot,
+        amdgpu.concat to reassemble).
+      * Insert `rocdl.sched.barrier 0` after every k-th sub-dot
+        (default k = numPartitionsN, i.e. one barrier per M-row) so
+        LLVM's misched can optimize within row-bounded regions without
+        crossing them. Stride configurable via
+        TRITON_TTGIR_SCHED_BARRIER_STRIDE.
+
+    Producer / user chains are not modified; extract_slice is a CTA-tile
+    no-op upstream so the existing layouts are preserved.
+  }];
+
+  let dependentDialects = ["mlir::triton::TritonDialect",
+                           "mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::amdgpu::TritonAMDGPUDialect",
+                           "mlir::scf::SCFDialect",
+                           "mlir::ROCDL::ROCDLDialect"];
+}
+
 #endif
