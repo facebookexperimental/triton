@@ -36,6 +36,12 @@ Facebook: If you are developing in fbsource, use tritonbench instead to collect 
 """
 
 
+def _attention_matmul_flops(batch, h, n_ctx, head_dim, causal):
+    # Causal self-attention uses lower-triangular score positions, including the diagonal.
+    score_elements = n_ctx * (n_ctx + 1) // 2 if causal else n_ctx * n_ctx
+    return 2.0 * batch * h * score_elements * head_dim
+
+
 def create_benchmark(versions, mode="fwd", causal=False):
     line_vals = [ref_lib.lower()] + versions
     line_names = [ref_lib] + versions
@@ -109,7 +115,7 @@ def create_benchmark(versions, mode="fwd", causal=False):
             rep=500,
         )
 
-        flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
+        flops_per_matmul = _attention_matmul_flops(BATCH, H, N_CTX, HEAD_DIM, causal)
         # fwd: 2 matmuls (QK, PV). bwd: 5 matmuls (dQK, dPV, dV, dK, dQ) = 2.5x fwd
         total_flops = 2 * flops_per_matmul if mode == "fwd" else 5 * flops_per_matmul
 
