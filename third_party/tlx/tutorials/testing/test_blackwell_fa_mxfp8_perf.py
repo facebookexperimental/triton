@@ -1,23 +1,20 @@
 import argparse
 
 import torch
-
 import triton
-
+from triton._internal_testing import is_blackwell
 from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent_mxfp8 import (
+    _attn_fwd_mxf8_ws,
+    _mxf8_host_descriptor_pre_hook,
     attention as _attention_ws_pipelined_persistent_mxfp8,
     attention_bwd as _attention_bwd_mxfp8,
     generate_attention_inputs,
-    _attn_fwd_mxf8_ws,
-    _mxf8_host_descriptor_pre_hook,
 )
 from triton.language.extra.tlx.tutorials.testing.test_correctness import (
     _quantize_mxfp8_bwd_operand,
     FlashAttention,
 )
 from triton.tools.tensor_descriptor import TensorDescriptor
-
-from triton._internal_testing import is_blackwell
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -31,7 +28,7 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 def _setup_bwd_inputs(shape, sm_scale, dtype, causal=False):
     Z, H, N_CTX, HEAD_DIM = shape
-    (q, q_scale, q_ref), (k, k_scale, k_ref), (v, v_scale, v_ref) = generate_attention_inputs(shape, DEVICE, dtype)
+    (q, q_scale, q_ref), (k, k_scale, k_ref), (v, v_scale, v_ref) = (generate_attention_inputs(shape, DEVICE, dtype))
 
     q_dk, q_scale_dk = _quantize_mxfp8_bwd_operand(q_ref, dtype, transpose_for_reduction=True)
     k_dq, k_scale_dq = _quantize_mxfp8_bwd_operand(k_ref, dtype, transpose_for_reduction=True)
@@ -160,7 +157,7 @@ def create_benchmark(mode="fwd", causal=False):
                 causal=causal,
             )
         else:
-            (q, q_scale, _), (k, k_scale, _), (v, v_scale, _) = generate_attention_inputs(shape, DEVICE, dtype)
+            (q, q_scale, _), (k, k_scale, _), (v, v_scale, _) = (generate_attention_inputs(shape, DEVICE, dtype))
             fn = lambda: _attention_ws_pipelined_persistent_mxfp8(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal)
 
         ms, min_ms, max_ms = triton.testing.do_bench(
