@@ -511,12 +511,14 @@ private:
       function_ref<Interval<size_t>(Value value)> getLiveness) {
     for (auto valueBufferIter : allocation->valueBuffer) {
       auto value = valueBufferIter.first;
-      auto *buffer = valueBufferIter.second;
-      bufferRange[buffer] = getLiveness(value);
-      LLVM_DEBUG({
-        llvm::dbgs() << "-- buffer " << buffer->id << "; value: ";
-        value.dump();
-      });
+      // After #9314 a value can map to multiple buffers (partitioned tensors).
+      for (auto *buffer : valueBufferIter.second) {
+        bufferRange[buffer] = getLiveness(value);
+        LLVM_DEBUG({
+          llvm::dbgs() << "-- buffer " << buffer->id << "; value: ";
+          value.dump();
+        });
+      }
     }
   }
 
@@ -2277,7 +2279,9 @@ public:
     for (auto alloc : allocs) {
       // size is 0, alignment is default, offset is default
       allocation.addBuffer<BufferT::BufferKind::Explicit>(alloc, 0);
-      BufferT *tBuf = allocation.valueBuffer[alloc];
+      // addBuffer maps the value to a single explicit buffer; take it. (After
+      // #9314 valueBuffer maps to a SmallVector<BufferT *>.)
+      BufferT *tBuf = allocation.valueBuffer[alloc].back();
       auto iter1 = allocToSize.find(alloc.getOperation());
       tBuf->rowSize = iter1->second.numRows;
       tBuf->colSize = iter1->second.numCols;
@@ -2310,11 +2314,13 @@ public:
     }
 
     for (auto valueBufferIter : allocation.valueBuffer) {
-      auto *buffer = valueBufferIter.second;
-      // valueBuffer maps value to BufferT
+      // valueBuffer maps a value to its BufferT(s). After #9314 a value can map
+      // to multiple buffers (partitioned tensors), so iterate over all of them.
       Operation *alloc = valueBufferIter.first.getDefiningOp();
       // bufferRange maps BufferT to interval
-      bufferRange[buffer] = allocToIntervals[alloc];
+      for (auto *buffer : valueBufferIter.second) {
+        bufferRange[buffer] = allocToIntervals[alloc];
+      }
     }
     // For each innermost loop according to program order (via
     // getIntervalForCtrlOp)
