@@ -17,14 +17,11 @@ to the candidate-to-user ratio.
 Reference diffs: D96879328 (TLX), D89392529 / D105270628 (Triton)
 """
 
-import random
-
 import torch
 import triton
 import triton.language as tl
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
-
 
 # =============================================================================
 # PyTorch reference
@@ -49,9 +46,7 @@ def lce_reference(
 # =============================================================================
 
 
-def create_inputs(
-    B, M, N, K_USER, K_CAND, cand_to_user_ratio, dtype=torch.float16, device=DEVICE
-):
+def create_inputs(B, M, N, K_USER, K_CAND, cand_to_user_ratio, dtype=torch.float16, device=DEVICE):
     """Create test inputs with a fixed candidate-to-user ratio.
 
     Args:
@@ -69,9 +64,7 @@ def create_inputs(
          embeddings_user, cand_to_user_index)
     """
     num_users = (B + cand_to_user_ratio - 1) // cand_to_user_ratio
-    cand_to_user_index = (torch.arange(B, device=device) // cand_to_user_ratio).to(
-        torch.int32
-    )
+    cand_to_user_index = (torch.arange(B, device=device) // cand_to_user_ratio).to(torch.int32)
 
     compression_w_cand = torch.randn((M, K_CAND), device=device, dtype=dtype)
     compression_w_user = torch.randn((M, K_USER), device=device, dtype=dtype)
@@ -118,12 +111,7 @@ def _autotune_configs():
             {"BM": bm, "BN": bn, "BK": bk, "GROUP_SIZE_M": 8},
             num_stages=ns,
             num_warps=nw,
-        )
-        for bm in [64, 128]
-        for bn in [64, 128]
-        for bk in [64, 128]
-        for ns in [3, 4, 5]
-        for nw in [4, 8]
+        ) for bm in [64, 128] for bn in [64, 128] for bk in [64, 128] for ns in [3, 4, 5] for nw in [4, 8]
     ]
 
 
@@ -178,12 +166,7 @@ def _ikbo_lce_kernel(
     rk = tl.arange(0, BK)
 
     a_ptrs = a_ptr + (ram[:, None] * a_stride_m + rk[None, :] * a_stride_k)
-    b_ptrs = (
-        b_ptr
-        + pid_batch * b_stride_batch
-        + rk[:, None] * b_stride_k
-        + rbn[None, :] * b_stride_n
-    )
+    b_ptrs = (b_ptr + pid_batch * b_stride_batch + rk[:, None] * b_stride_k + rbn[None, :] * b_stride_n)
 
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in range(K, 0, -BK):
@@ -239,7 +222,7 @@ def ikbo_lce(
         dtype=embeddings_cand.dtype,
     )
 
-    grid = lambda META: (B * triton.cdiv(M, META["BM"]) * triton.cdiv(N, META["BN"]),)
+    grid = lambda META: (B * triton.cdiv(M, META["BM"]) * triton.cdiv(N, META["BN"]), )
 
     _ikbo_lce_kernel[grid](
         compression_w_cand,

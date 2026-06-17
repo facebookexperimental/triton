@@ -35,8 +35,7 @@ def create_benchmark(versions):
             ylabel="TFLOPS",
             plot_name="ikbo-fa-performance-fp16",
             args={"B": 512, "n_seed": 64, "num_heads": 1, "d_head": 128},
-        )
-    )
+        ))
     def benchmark(B, n_seed, num_heads, d_head, max_seq_len, provider):
         random.seed(0)
         torch.manual_seed(0)
@@ -105,9 +104,7 @@ def create_benchmark(versions):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Benchmark IKBO Flash Attention on AMD"
-    )
+    parser = argparse.ArgumentParser(description="Benchmark IKBO Flash Attention on AMD")
     parser.add_argument(
         "--version",
         type=str,

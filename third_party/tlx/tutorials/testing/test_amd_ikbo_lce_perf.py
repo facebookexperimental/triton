@@ -38,8 +38,7 @@ def create_benchmark(versions):
             ylabel="Latency (ms)",
             plot_name="ikbo-lce-performance-fp16",
             args={},
-        )
-    )
+        ))
     def benchmark(B, provider):
         torch.manual_seed(0)
         cw_c, cw_u, e_c, e_u, idx = _create_inputs(
