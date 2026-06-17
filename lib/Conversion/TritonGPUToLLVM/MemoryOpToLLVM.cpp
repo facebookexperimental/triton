@@ -149,6 +149,13 @@ LogicalResult lowerLocalStore(Location loc, MLIRContext *ctx, Value regVal,
     cvt = regLayout.invertAndCompose(sharedLL);
   } else {
     auto sharedLayout = toLinearLayout(memDescTy);
+    // NPOT swizzled SMEM: split contiguous dim into pow2 intra-tile + NPOT
+    // phase. No-op (returns nullopt) for pow2 / no swizzle / non-NVMMAShared.
+    if (auto split =
+            splitNpotContiguousDim(memDescTy, sharedLayout, regLayout)) {
+      sharedLayout = split->smem;
+      regLayout = split->other;
+    }
     cvt = regLayout.invertAndCompose(sharedLayout);
   }
   auto kBlock = str_attr("block");
@@ -287,6 +294,13 @@ public:
       cvt = regLayout.invertAndCompose(sharedLL);
     } else {
       auto sharedLayout = toLinearLayout(memDescTy);
+      // NPOT swizzled SMEM: split contiguous dim into pow2 intra-tile + NPOT
+      // phase. No-op (returns nullopt) for pow2 / no swizzle / non-NVMMAShared.
+      if (auto split =
+              splitNpotContiguousDim(memDescTy, sharedLayout, regLayout)) {
+        sharedLayout = split->smem;
+        regLayout = split->other;
+      }
       cvt = regLayout.invertAndCompose(sharedLayout);
     }
     auto kBlock = str_attr("block");

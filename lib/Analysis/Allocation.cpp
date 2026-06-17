@@ -40,7 +40,7 @@ unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
   auto bitwidth = getBitwidth(srcTy);
   auto smem = gpu::optimalSwizzlingLdSt(srcLayout, dstLayout, bitwidth);
   auto reps = smem.getInDimSize(StringAttr::get(ctx, "reps"));
-  return smem.getTotalOutDimSize() / reps;
+  return smem.getTotalOutDimSizeProduct() / reps;
 }
 
 // Both `atomic_cas` and `atomic_rmw` may need scratch memory to store values
