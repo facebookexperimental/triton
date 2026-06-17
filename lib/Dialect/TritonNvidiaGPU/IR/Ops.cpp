@@ -860,6 +860,31 @@ LogicalResult TCGen5MMAScaledOp::verify() {
   }
   if (enc.getBlockM() != 128)
     return emitOpError("only supports instruction shape blockM=128");
+
+  // K=96 NVFP4 (mxf4nvf4 .block16) is only supported on sm_103a (B300).
+  // Reject early if the IR survives this far on a non-sm_103a target so we
+  // never silently lower into broken PTX. Detect it from A/B being FP4 (E2M1)
+  // with f8E4M3 scales (the nvf4 combination) and logical K == 96.
+  if (getAType() == ScaleDotElemType::E2M1 &&
+      getBType() == ScaleDotElemType::E2M1 &&
+      llvm::isa<Float8E4M3FNType>(getAScale().getType().getElementType()) &&
+      llvm::isa<Float8E4M3FNType>(getBScale().getType().getElementType())) {
+    auto aShape = getA().getType().getShape();
+    // FP4 packs 2 elements per i8, so the K dim in the type is half the
+    // logical K. K=96 mxf4nvf4 requires transpose=0, so the packed K is
+    // always the last dim here.
+    int64_t logicalK = aShape.back() * 2;
+    if (logicalK == 96) {
+      auto cc = ::mlir::getNVIDIAComputeCapability(
+          (*this)->getParentOfType<ModuleOp>());
+      if (cc != 103) {
+        return emitOpError(
+                   "K=96 mxf4nvf4 (NVFP4 with .block16) requires sm_103a; got "
+                   "compute capability ")
+               << cc;
+      }
+    }
+  }
   return success();
 }
 

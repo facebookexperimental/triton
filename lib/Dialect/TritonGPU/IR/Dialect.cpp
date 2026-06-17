@@ -331,10 +331,30 @@ SmallVector<int64_t> getAllocationShapePerCTA(Attribute layout,
     bool contigHasSplitDim = !llvm::isPowerOf2_64(shape[contigDim]) &&
                              swizzleBytes > 0 &&
                              contigBytes % swizzleBytes == 0;
+    // K=96 mxf4nvf4 absolute-LBO operand: the swizzle is force-set to 128B
+    // (AccelerateMatmul getSharedMemoryMMAOperand) even though the packed-K
+    // contiguous dim (48 bytes) does not fill the 128B SW128 atom. Match
+    // CUTLASS (sm103 block-scaled): allocate the FULL 128B atom and place the K
+    // data in its first bytes; the absolute-LBO descriptor reads it as two 64B
+    // chunks (chunk1 at base + 64B), which REQUIRES the full 128B allocation to
+    // exist or chunk1 reads out of bounds. Uniquely identified: swizzle == 128
+    // yet the auto swizzle picker would never choose 128 here
+    // (NextPow2(contigBytes) < 128), so 128 must have been force-set for the
+    // absolute-LBO path. This excludes NPOT-N (64B swizzle) and genuine
+    // auto-128 operands.
+    bool isFp4K96AbsLbo =
+        swizzleBytes == 128 && llvm::NextPowerOf2((uint64_t)contigBytes) < 128;
+    int64_t swizzleAtomElems =
+        swizzleBytes > 0
+            ? (8 * swizzleBytes) / sharedMMALayout.getElementBitWidth()
+            : 0;
 
     for (size_t i = 0; i < shape.size(); i++) {
       if (!llvm::isPowerOf2_64(shape[i])) {
-        if ((int)i == contigDim && contigHasSplitDim) {
+        if ((int)i == contigDim && isFp4K96AbsLbo) {
+          // Pad the K contiguous dim up to the full 128B swizzle atom.
+          shape[i] = swizzleAtomElems;
+        } else if ((int)i == contigDim && contigHasSplitDim) {
         } else {
           shape[i] = llvm::NextPowerOf2(shape[i]);
         }
@@ -4336,7 +4356,18 @@ getTMABlockShapeTiled(ArrayRef<int64_t> shapePerCTA, int elementBitWidth,
     int64_t checkContig = llvm::isPowerOf2_64(blockShape[contigDim])
                               ? blockShape[contigDim]
                               : llvm::NextPowerOf2(blockShape[contigDim]);
-    if (checkContig < contigDimSize) {
+    // K=96 mxf4nvf4 absolute-LBO operand: swizzle is force-set to 128B even
+    // though the packed-K contig dim (48 bytes) does not fill the 128B atom.
+    // CUTLASS (sm103 block-scaled) lays this out as a full 128B SW128 atom with
+    // K=96 in the first bytes, read as two 64B chunks (absolute-LBO). Pad the
+    // box to the full atom (set below to contigDimSize). Uniquely identified:
+    // swizzle == 128 yet the auto picker would never choose 128 here
+    // (NextPow2(contigBytes) < 128); excludes NPOT-N (64B) and genuine
+    // auto-128.
+    int64_t contigBytes = (int64_t)blockShape[contigDim] * elementBitWidth / 8;
+    bool isFp4K96AbsLbo =
+        swizzleBytes == 128 && llvm::NextPowerOf2((uint64_t)contigBytes) < 128;
+    if (checkContig < contigDimSize && !isFp4K96AbsLbo) {
       return emitError() << "block shape along the contiguous dimension "
                          << contigDim
                          << " is too small for the swizzle byte size "

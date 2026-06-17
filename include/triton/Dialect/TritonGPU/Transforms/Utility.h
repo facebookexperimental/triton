@@ -266,6 +266,11 @@ bool isPureUnaryInlineAsm(Operation *op);
 // read the compute capability from the module attributes
 int getNVIDIAComputeCapability(Operation *module);
 
+// Returns true if the module targets sm_103a (Blackwell B300). sm_103a-only
+// features include K=96 mxf4nvf4 tcgen05.mma. This is a strict equality check;
+// sm_100a (GB200) does not satisfy it.
+bool isSM103a(Operation *module);
+
 // Read the amd target from the module attributes
 std::optional<StringRef> getAMDArch(Operation *module);
 

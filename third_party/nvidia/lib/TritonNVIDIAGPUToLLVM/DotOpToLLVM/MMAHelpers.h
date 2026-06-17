@@ -9,7 +9,12 @@ namespace NVIDIA {
 
 // The descriptor format is described in the spec:
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-shared-memory-layout-matrix-descriptor
-// Unnamed fields are not used
+// Unnamed fields are not used.
+// Bit 52 is the leading-dimension stride mode: 0 = byte-offset relative
+// (default), 1 = byte-address absolute (sm_103a only, used by K=96 mxf4nvf4
+// where the packed K row is 48 bytes and would overflow the 128B boundary).
+// PTX ISA 9.2 Table 42 (§9.7.16.4.1); absolute mode introduced for sm_103a
+// per §9.7.16.4.1.1.
 union SMEMDescriptor {
   uint64_t descriptor;
   struct {
@@ -20,10 +25,13 @@ union SMEMDescriptor {
     uint64_t strideDimensionBaseOffset : 14;
     uint64_t : 3;
     uint64_t matrixBaseOffset : 3;
-    uint64_t : 10;
+    uint64_t lboAbsoluteMode : 1; // bit 52
+    uint64_t : 9;                 // bits 53-61 (fixed 0 per Table 42)
     uint64_t swizzlingMode : 2;
   };
 };
+static_assert(sizeof(SMEMDescriptor) == 8,
+              "SMEMDescriptor must be exactly 64 bits wide");
 
 struct MMASMEMDescriptor {
   SMEMDescriptor descriptor;
@@ -31,6 +39,11 @@ struct MMASMEMDescriptor {
   int32_t bitwidth;
   bool transposed;
   bool fp4Padded;
+  // True when the descriptor uses absolute-address leading-dimension mode
+  // (bit 52 = 1), which is required for K=96 mxf4nvf4 on sm_103a. In this
+  // mode the LBO field encodes the absolute SMEM address of the second
+  // chunk; smemLoad has to OR in the runtime base address contribution.
+  bool lboAbsoluteMode = false;
 };
 
 struct MemDescOperand {
@@ -267,6 +280,18 @@ public:
       // matrixBaseOffset phase field is 0.
       currDesc.matrixBaseOffset = 0;
     }
+    // PTX ISA 9.2 §9.7.16.3.1.3: K=96 absolute-LBO mode requires matrix base
+    // offset == 0 (restriction 3). SMEM allocation must place the K=96 region
+    // on the 128B swizzle pattern boundary; if not, the descriptor would be
+    // silently wrong on B300 silicon.
+    // Hard error (not assert): compiled out under NDEBUG (mode/opt), so a
+    // misaligned K=96 SMEM region would otherwise silently miscompute on B300.
+    if (desc.lboAbsoluteMode && currDesc.matrixBaseOffset != 0)
+      llvm::report_fatal_error(
+          "K=96 fp4 SMEM region must start on the 128B swizzle pattern "
+          "boundary "
+          "(matrix base offset must be 0; PTX ISA 9.2 §9.7.16.3.1.3 "
+          "restriction 3)");
     currDesc.baseAddress = 0;
     int32_t smemByteOffsetb128 = smemByteOffsetb8 >> 4;
     // Compute the base address at runtime to prevent LLVM from folding the
@@ -276,6 +301,44 @@ public:
     Value addrMasked = tb.and_(fullAddrb128, tb.i32_val(0x3FFF));
     Value addr64 = tb.zext(i64_ty, addrMasked);
     Value descVal = tb.add(tb.int_val(64, currDesc.descriptor), addr64);
+    if (desc.lboAbsoluteMode) {
+      // K=96 mxf4nvf4: the LBO field (bits 16-29) holds the absolute SMEM
+      // address of the "second chunk" of the 48-byte packed K=96 run, which the
+      // hardware reads as two chunks to stay within the aligned 128B boundary
+      // (PTX ISA 9.2 §9.7.16.3.1.2). The chunk1 address is NOT a fixed
+      // base + 64B: per CUTLASS 4.4.2
+      // (cute/atom/mma_traits_sm100.hpp:4609-4621, `desc_a.leading_byte_offset_
+      // = desc_next_a.start_address_`) the absolute LBO is the *layout-derived*
+      // start address of the K-block run where the operand's K data continues,
+      // computed by the SAME smem layout that placed chunk0 -- i.e. the
+      // start_address_ of the "next" K-block descriptor, in 16B units, exactly
+      // like chunk0's own start_address_ (Table 42 / CUTLASS SmemDescriptor:
+      // start_address_ = smem_addr >> 4).
+      //
+      // Triton emits a SINGLE MMA per K=96 tile (mmaSizeK=96, numRepK=1) over a
+      // freshly padded 128B SW128 atom that holds K=96 (= 3 contiguous 16B
+      // blocks, bytes [0,48)) in the front of the atom. That run starts on the
+      // 128B pattern boundary (matrixBaseOffset==0, enforced above) and ends at
+      // byte 48, so it does NOT straddle the 128B boundary. This is exactly
+      // CUTLASS's non-straddling case (mainloop MMA0:
+      // sm103_blockscaled_mma_warpspecialized.hpp:1155-1156), where the "next"
+      // K-block descriptor is block 0 of the SAME buffer -> its start_address_
+      // equals chunk0's own start address. Hence chunk1's absolute address is
+      // chunk0's base address (`addrMasked`), NOT `addrMasked + 64B`.
+      //
+      // The previous code synthesized `addrMasked + 4` (b128 units = +64
+      // bytes), which modeled a straddling second 64B half that does not exist
+      // for the packed 48B run: with only 48 real bytes, base+64 reads entirely
+      // into the 128B atom's padding, producing byte-identical garbage on GB300
+      // (T264996227). Deriving the LBO from the layout (chunk0 base) instead of
+      // a constant offset is what every working NVMMAShared descriptor path
+      // does (the start/LBO addresses are one function of the encoding + smem
+      // base).
+      Value secondChunkAddrb128 = addrMasked;
+      Value lboField = tb.and_(secondChunkAddrb128, tb.i32_val(0x3FFF));
+      Value lboShifted = tb.shl(tb.zext(i64_ty, lboField), tb.int_val(64, 16));
+      descVal = tb.or_(descVal, lboShifted);
+    }
     return descVal;
   }
   MemDescOperand memLoad(int a, int b, ConversionPatternRewriter &rewriter,
@@ -552,7 +615,8 @@ private:
                                      /* .swizzlingByteWidth = */ swizzling,
                                      /* .bitwidth = */ bitwidth,
                                      /* .transposed = */ transposed,
-                                     /* .fp4Padded = */ fp4Padded};
+                                     /* .fp4Padded = */ fp4Padded,
+                                     /* .lboAbsoluteMode = */ false};
           }
         }
       }
@@ -666,11 +730,48 @@ private:
       sboDescriptor = (swapLboSbo ? lboStrideBytes : sboStrideBytes) >> 4;
     }
 
+    // K=96 mxf4nvf4 .block16 (sm_103a only): the packed K=96 row is 48 bytes
+    // and would overflow the 128B SMEM boundary if packed contiguously, so the
+    // descriptor must use the absolute-address LBO mode (bit 52 = 1). In that
+    // mode the LBO field encodes the absolute SMEM address of the second 64B
+    // chunk; the compile-time descriptor sets bit 52 and zeros the LBO field,
+    // and smemLoad ORs in the runtime address (base + 64B). Per PTX ISA 9.2
+    // §9.7.16.3.1.3, absolute mode requires 128B swizzle and K-major
+    // (transpose = 0). instrShape leading dim is the contiguous (K) extent.
+    bool isFp4K96 = isFp4 && (int)instrShape[transposed ? 0 : 1] == 96;
+    bool useAbsoluteLbo = isFp4K96;
+    if (useAbsoluteLbo) {
+      // Hard error (not assert): the operand allocation must hand us a 128B
+      // encoding for absolute-LBO mode (forced in AccelerateMatmul's
+      // getSharedMemoryMMAOperand). The assert was compiled out under NDEBUG
+      // (mode/opt), which previously let a non-128B-swizzle operand silently
+      // emit a self-contradictory descriptor and miscompute on B300. Trap at
+      // compile time instead. PTX ISA 9.2 §9.7.16.3.1.3 restriction 1.
+      if (swizzling != 128)
+        llvm::report_fatal_error(
+            "K=96 mxf4nvf4 absolute-LBO mode requires 128B swizzle "
+            "(PTX ISA 9.2 §9.7.16.3.1.3 restriction 1)");
+      // K-major (ISA restriction 2) is already guaranteed here: useAbsoluteLbo
+      // is set via isFp4K96, which tests the CONTIGUOUS dim
+      // (instrShape[transposed ? 0 : 1] == 96), so K==96 is the contiguous axis
+      // for both A (transposed = false, K at dim1) and B (transposed = true, K
+      // at dim0). The encoding's `transposed` flag indicates which axis is
+      // contiguous, NOT the MMA instruction's transpose bit (enforced at
+      // instruction-descriptor emission), so it is expected to be true for the
+      // B operand and must NOT be rejected. LBO field is filled at runtime (see
+      // smemLoad), so zero it here so the compile-time bit pattern doesn't
+      // collide with the runtime add.
+      lboDescriptor = 0;
+    }
+
     // Construct the descriptor
     SMEMDescriptor desc;
     desc.descriptor = mmaVersion == 5 ? 1ULL << 46 : 0ULL;
     desc.leadDimensionBaseOffset = lboDescriptor;
     desc.strideDimensionBaseOffset = sboDescriptor;
+    if (useAbsoluteLbo) {
+      desc.lboAbsoluteMode = 1;
+    }
     switch (swizzling) {
     case 0:
       desc.swizzlingMode = 0;
@@ -691,7 +792,8 @@ private:
                              /* .swizzlingByteWidth = */ swizzling,
                              /* .bitwidth = */ bitwidth,
                              /* .transposed = */ transposed,
-                             /* .fp4Padded = */ fp4Padded};
+                             /* .fp4Padded = */ fp4Padded,
+                             /* .lboAbsoluteMode = */ useAbsoluteLbo};
   }
 };
 

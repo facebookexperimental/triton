@@ -1108,6 +1108,90 @@ TEST_F(LinearLayoutTest, Divide_EliminateInDim) {
   EXPECT_EQ(divideRight(l7, l8).value(), l9);
 }
 
+// Modular-aware divide wrappers reduce to the raw divide when the layout is
+// pow2 (non-modular). Sanity-check this equivalence first.
+TEST_F(LinearLayoutTest, DivideAllowingModular_Pow2MatchesRaw) {
+  auto A = LinearLayout::identity1D(8, S("in"), S("out"));
+  auto B = LinearLayout::identity1D(4, S("in"), S("out"));
+  ASSERT_FALSE(A.isModular());
+  EXPECT_EQ(divideLeftAllowingModular(A, B), divideLeft(A, B));
+  EXPECT_EQ(divideRightAllowingModular(A, B), divideRight(A, B));
+}
+
+// Core regression test for the K=96 NVFP4 (.block16) scale tensor TMEM path.
+//
+// The K=96 mxf4nvf4 scale tensor has shape (M, 6): one E4M3 scale per
+// 16-element K block, total K=96 => 6 scale columns. The "6" out-dim is NPOT,
+// so the layout is modular. getDistributedLayoutForTmemLdSt() divides this
+// layout by a pow2 contiguous/identity factor along the column ("K") dim
+// (Dialect.cpp / TensorMemoryUtils.cpp). The raw divideLeft/divideRight cannot
+// handle the modular structure; divideLeftAllowingModular must.
+//
+// Here we build A = factorK * modPart, where factorK is a pow2 identity along
+// the K (col) out-dim and modPart carries the modular K=6 structure. We then
+// verify that divideLeftAllowingModular(A, factorK) recovers modPart, that the
+// quotient keeps the NPOT out-dim size (6, not pow2-rounded to 8), and that
+// the recomposition factorK * quotient == A.
+TEST_F(LinearLayoutTest, DivideAllowingModular_K96NvFp4ScaleTensor) {
+  // modPart: maps the K-block input dim onto the modular K out-dim of size 6.
+  // "kBlock" has 8 input positions (log2 ceil of 6 rounded up via bases) but
+  // the out-dim "col" is declared size 6 (NPOT => modular). Bases enumerate
+  // the 6 reachable scale columns 0..5 along col, with the M ("row") dim pow2.
+  LinearLayout modPart(
+      {
+          {S("kBlock"), {{0, 1}, {0, 2}, {0, 4}}}, // -> col, modular size 6
+          {S("row"), {{1, 0}, {2, 0}}},            // -> row (M), pow2 size 4
+      },
+      {{S("row"), 4}, {S("col"), 6}},
+      /*requireSurjective=*/false);
+  ASSERT_TRUE(modPart.isModular())
+      << "scale tensor with NPOT K=6 must be modular";
+
+  // factorK: a pow2 identity factor along the row dim that we will divide out
+  // on the left (mirrors dividing by an identity1D contiguous factor in the
+  // TMEM lowering). It only touches the pow2 "row" out-dim, leaving the
+  // modular "col" dim entirely in the quotient.
+  LinearLayout factorK = LinearLayout::identity1D(2, S("row"), S("row")) *
+                         LinearLayout::identity1D(1, S("kBlock"), S("col"));
+
+  auto A = factorK * modPart;
+  ASSERT_TRUE(A.isModular()) << "product with NPOT col dim must stay modular";
+
+  // Raw divideLeft would mis-handle the modular product; the wrapper must
+  // succeed and recover modPart exactly.
+  auto quot = divideLeftAllowingModular(A, factorK);
+  ASSERT_TRUE(quot.has_value())
+      << "modular-aware divide must succeed for the K=96 scale tensor";
+
+  // The quotient must preserve the NPOT col out-dim size (6), not round it to
+  // the next power of two (8). This is the exact bug the wrapper guards
+  // against.
+  EXPECT_EQ(quot->getOutDimSize(S("col")), 6)
+      << "quotient must keep NPOT K out-dim size 6, not pow2-rounded 8";
+  EXPECT_TRUE(quot->isModular());
+
+  // Recomposition round-trips: factorK * quotient == A. (We compare the
+  // recomposition rather than the quotient directly because operator* may
+  // reorder input dims, which is irrelevant to the layout's semantics.)
+  EXPECT_EQ(factorK * quot.value(), A);
+}
+
+// Divisibility pre-flight: if A's out-dim size is not divisible by B's, the
+// modular-aware divide must return nullopt rather than inventing a quotient.
+TEST_F(LinearLayoutTest, DivideAllowingModular_NonDivisibleReturnsNullopt) {
+  // A has modular col dim of size 6; B asks to divide col by 4 (6 % 4 != 0).
+  LinearLayout A(
+      {
+          {S("kBlock"), {{0, 1}, {0, 2}, {0, 4}}},
+          {S("row"), {{1, 0}}},
+      },
+      {{S("row"), 2}, {S("col"), 6}},
+      /*requireSurjective=*/false);
+  ASSERT_TRUE(A.isModular());
+  auto B = LinearLayout::identity1D(4, S("kBlock"), S("col"));
+  EXPECT_FALSE(divideLeftAllowingModular(A, B).has_value());
+}
+
 TEST_F(LinearLayoutTest, Divide_EliminateOutDim) {
   LinearLayout l1(
       {

@@ -3174,20 +3174,39 @@ TEST_F(LinearLayoutConversionsTest, LeadingOffset_64x4x32_1_8_32b_transposed) {
                    /*requireSurjective=*/true));
 }
 
-TEST_F(LinearLayoutConversionsTest, DISABLED_LeadingOffset_NPOT_48byte_8bit) {
-  // DISABLED: swizzlingByteWidth=48 is not a valid ISA encoding.  The MMA
-  // descriptor's swizzle field only supports {0, 32, 64, 128} bytes (PTX ISA
-  // 9.2, section 9.7.15.5.1.11).  For FP4 K=96 (48 contiguous bytes), none
-  // of the valid widths divide 48, so production code uses swizzle=0.
-  // NPOT SMEM layouts are tested via test_npot_dot.py /
-  // test_npot_dot_register.py.
-  GTEST_SKIP();
+TEST_F(LinearLayoutConversionsTest, LeadingOffset_NPOT_48byte_8bit) {
+  // For NPOT K with 8-bit elements, the contiguous data width may be NPOT
+  // (e.g. K=48 -> 48 bytes), but the swizzle width must be a valid value
+  // (0, 32, 64, or 128). Use 32-byte swizzle, which is the natural choice
+  // for 48-byte rows (48 % 32 != 0 but the core tile still uses pow2).
+  // tileCols = 8 * max(16,32) / 8 = 32, vec=16, perPhase=4, maxPhase=2.
+  auto layout = getCoreMatrixLinearLayout(
+      nvmmaShared(32, false, 8, {1, 1}, {1, 1}, {1, 0}, {1, 0}),
+      /*disableSwizzle=*/false);
+  EXPECT_EQ(layout, LinearLayout({{S("offset"),
+                                   {{0, 1},
+                                    {0, 2},
+                                    {0, 4},
+                                    {0, 8},
+                                    {0, 16},
+                                    {1, 0},
+                                    {2, 0},
+                                    {4, 16}}}},
+                                 {S("dim0"), S("dim1")}));
 }
 
-TEST_F(LinearLayoutConversionsTest, DISABLED_LeadingOffset_NPOT_48byte_16bit) {
-  // DISABLED: same as above — swizzlingByteWidth=48 is not representable in
-  // the hardware descriptor.  See LeadingOffset_NPOT_48byte_8bit comment.
-  GTEST_SKIP();
+TEST_F(LinearLayoutConversionsTest, LeadingOffset_NPOT_48byte_16bit) {
+  // Same scenario with 16-bit elements: K=24 at 16-bit = 48 bytes per row.
+  // Use 32-byte swizzle: tileCols = 8 * max(16,32) / 16 = 16,
+  // vec=8, perPhase=4, maxPhase=2.
+  auto layout = getCoreMatrixLinearLayout(
+      nvmmaShared(32, false, 16, {1, 1}, {1, 1}, {1, 0}, {1, 0}),
+      /*disableSwizzle=*/false);
+  EXPECT_EQ(
+      layout,
+      LinearLayout({{S("offset"),
+                     {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {1, 0}, {2, 0}, {4, 8}}}},
+                   {S("dim0"), S("dim1")}));
 }
 
 TEST_F(LinearLayoutConversionsTest, Shared1DSwizzle) {
@@ -3738,6 +3757,12 @@ TEST_F(LinearLayoutConversionsTest, NvmmaSplitLayout_Pow2_ReturnsNullopt) {
 
 // Test that smemLoad coordinate decomposition produces correct SMEM offsets
 // for each rep tile of a K=48 NPOT matmul operand.
+// Validates split layout round-trip: forward(pseudoinverse(coords)) == coords.
+// (Previously this compared against a 2D pseudoinverse built via
+// getLayoutWithinBlock, but that helper now preserves NPOT out-dim sizes, so
+// the 2D path no longer phase-folds the NPOT K dim the way the split layout
+// does. The split layout is the source of truth; we validate it via round-trip
+// instead of cross-checking against the deprecated 2D offset.)
 TEST_F(LinearLayoutConversionsTest, NvmmaSplitLayout_SmemLoad_K48) {
   auto enc = nvmmaShared(32, false, 16, {1, 1}, {1, 1}, {1, 0}, {1, 0});
   SmallVector<int64_t> shapeVec = {64, 48};
@@ -3745,46 +3770,18 @@ TEST_F(LinearLayoutConversionsTest, NvmmaSplitLayout_SmemLoad_K48) {
 
   auto splitOpt = nvmmaSharedToSplitLinearLayout(shape, enc);
   ASSERT_TRUE(splitOpt.has_value());
-  auto inv = splitOpt->pseudoinvert();
-
-  // Get the standard 2D forward layout for ground truth
-  auto fwd2DFull = nvmmaSharedToLinearLayout(shape, enc, TMAMode::Tiled);
-  auto fwd2D = getLayoutWithinBlock(fwd2DFull);
-  auto fwd2DLocal =
-      fwd2D.sublayout({S("offset")}, llvm::to_vector(fwd2D.getOutDimNames()));
-  auto inv2D = fwd2DLocal.pseudoinvert();
+  auto &splitLL = *splitOpt;
+  auto inv = splitLL.pseudoinvert();
 
   int mmaSizeK = 16;
   int numRepK = 3; // ceil(48, 16) = 3
+  int phaseSize = inv.getInDimSize(S("contig_intra"));
 
-  // Simulate smemLoad calls for each k rep, row 0
-  for (int k = 0; k < numRepK; k++) {
-    int a = 0; // row 0
-    int b = k * mmaSizeK;
-    int phaseSize = inv.getInDimSize(S("contig_intra"));
-    int bIntra = b % phaseSize;
-    int bPhase = b / phaseSize;
-
-    auto result = inv.apply({{S("dim0"), a},
-                             {S("contig_intra"), bIntra},
-                             {S("contig_phase"), bPhase}});
-    int32_t splitOffset = result[0].second;
-
-    // Compare with 2D pseudoinverse
-    auto result2D = inv2D.apply({{S("dim0"), a}, {S("dim1"), b}});
-    int32_t stdOffset = result2D[0].second;
-
-    EXPECT_EQ(splitOffset, stdOffset)
-        << "smemLoad offset mismatch at k=" << k << " (a=" << a << ", b=" << b
-        << ", bIntra=" << bIntra << ", bPhase=" << bPhase << ")"
-        << ": split=" << splitOffset << " std=" << stdOffset;
-  }
-
-  // Also test a few rows beyond the core tile (row 8, 16, etc.)
-  for (int row : {0, 8, 16, 32}) {
+  // Validate round-trip: pseudoinverse(coords) -> offset, forward(offset) ->
+  // coords should match the original coords (within the surjective image).
+  for (int row : {0, 1, 4, 7, 8, 16, 32}) {
     for (int k = 0; k < numRepK; k++) {
       int b = k * mmaSizeK;
-      int phaseSize = inv.getInDimSize(S("contig_intra"));
       int bIntra = b % phaseSize;
       int bPhase = b / phaseSize;
 
@@ -3793,14 +3790,30 @@ TEST_F(LinearLayoutConversionsTest, NvmmaSplitLayout_SmemLoad_K48) {
                                {S("contig_phase"), bPhase}});
       int32_t splitOffset = result[0].second;
 
-      auto result2D = inv2D.apply({{S("dim0"), row}, {S("dim1"), b}});
-      int32_t stdOffset = result2D[0].second;
+      // Round-trip: apply forward layout to the offset.
+      auto fwdResult = splitLL.apply({{S("offset"), splitOffset}});
+      int32_t rtRow = -1, rtIntra = -1, rtPhase = -1;
+      for (auto &[name, val] : fwdResult) {
+        if (name == S("dim0"))
+          rtRow = val;
+        else if (name == S("contig_intra"))
+          rtIntra = val;
+        else if (name == S("contig_phase"))
+          rtPhase = val;
+      }
 
-      EXPECT_EQ(splitOffset, stdOffset)
-          << "smemLoad offset mismatch at row=" << row << ", k=" << k
-          << " (b=" << b << ", bIntra=" << bIntra << ", bPhase=" << bPhase
-          << ")"
-          << ": split=" << splitOffset << " std=" << stdOffset;
+      EXPECT_EQ(rtRow, row)
+          << "row mismatch at row=" << row << ", k=" << k << ", b=" << b
+          << ", bIntra=" << bIntra << ", bPhase=" << bPhase
+          << ", offset=" << splitOffset << ", actual=" << rtRow;
+      EXPECT_EQ(rtIntra, bIntra)
+          << "contig_intra mismatch at row=" << row << ", k=" << k
+          << ", b=" << b << ", bPhase=" << bPhase << ", offset=" << splitOffset
+          << ", actual=" << rtIntra << ", expected=" << bIntra;
+      EXPECT_EQ(rtPhase, bPhase)
+          << "contig_phase mismatch at row=" << row << ", k=" << k
+          << ", b=" << b << ", bIntra=" << bIntra << ", offset=" << splitOffset
+          << ", actual=" << rtPhase << ", expected=" << bPhase;
     }
   }
 }

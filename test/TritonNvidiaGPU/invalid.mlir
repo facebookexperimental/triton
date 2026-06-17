@@ -414,3 +414,37 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
     tt.return
   }
 }
+
+// -----
+
+// Verify: K=96 mxf4nvf4 (NVFP4 with .block16) is rejected on non-sm_103a
+// targets. Here the module declares cuda:100 (SM100a / GB200), so the
+// verifier in TCGen5MMAScaledOp::verify must emit an error rather than
+// silently lower to broken PTX. The A operand is 128x48xi8 (= packed K=96
+// fp4), and the (M, 6) scale tensors are the NVFP4 .block16 scale shape.
+#shared_k96 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 8}>
+#shared_k96_t = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 8}>
+#shared_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#tmem_acc = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#tmem_scales_k96 = #ttng.tensor_memory_scales_encoding<>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func @nvfp4_k96_rejected_on_sm100(
+      %a: !ttg.memdesc<128x48xi8, #shared_k96, #ttg.shared_memory>,
+      %b: !ttg.memdesc<48x128xi8, #shared_k96_t, #ttg.shared_memory>,
+      %c: !ttg.memdesc<128x128xf32, #tmem_acc, #ttng.tensor_memory, mutable>,
+      %scale_a: !ttg.memdesc<128x6xf8E4M3FN, #tmem_scales_k96, #ttng.tensor_memory>,
+      %scale_b: !ttg.memdesc<128x6xf8E4M3FN, #tmem_scales_k96, #ttng.tensor_memory>,
+      %useAcc: i1, %pred: i1,
+      %barrier: !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory>,
+      %barrierPred: i1) {
+    // expected-error @+1 {{K=96 mxf4nvf4 (NVFP4 with .block16) requires sm_103a}}
+    ttng.tc_gen5_mma_scaled %a, %b, %c, %scale_a, %scale_b, %useAcc, %pred lhs = e2m1 rhs = e2m1, %barrier[%barrierPred] {is_async} :
+      !ttg.memdesc<128x48xi8, #shared_k96, #ttg.shared_memory>,
+      !ttg.memdesc<48x128xi8, #shared_k96_t, #ttg.shared_memory>,
+      !ttg.memdesc<128x128xf32, #tmem_acc, #ttng.tensor_memory, mutable>,
+      !ttg.memdesc<128x6xf8E4M3FN, #tmem_scales_k96, #ttng.tensor_memory>,
+      !ttg.memdesc<128x6xf8E4M3FN, #tmem_scales_k96, #ttng.tensor_memory>,
+      !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory>
+    tt.return
+  }
+}

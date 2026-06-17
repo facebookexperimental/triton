@@ -1146,6 +1146,14 @@ int getNVIDIAComputeCapability(Operation *module) {
   return computeCapability;
 }
 
+bool isSM103a(Operation *module) {
+  // The compute-capability integer encodes "sm_<cc>a" for Triton purposes.
+  // 103 == sm_103a (Blackwell B300). Strict equality: sm_100a (GB200) / sm_120
+  // etc. do not qualify, even though they are also "sm 10x". K=96 mxf4nvf4
+  // requires sm_103a.
+  return getNVIDIAComputeCapability(module) == 103;
+}
+
 std::optional<StringRef> getAMDArch(Operation *module) {
   StringAttr targetAttr =
       module->getAttrOfType<StringAttr>(triton::gpu::AttrTargetName);
