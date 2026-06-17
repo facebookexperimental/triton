@@ -9,8 +9,8 @@ the real-launch + parity + consume-faithful machinery added in the next diff.
 
 Correctness is checked by SELF-CONSISTENCY (an ACF must not change results vs the no-ACF run),
 so it is op-agnostic. Each candidate is applied via the ptx_options launch kwarg and benchmarked
-IN AN ISOLATED SPAWN SUBPROCESS: some ACFs wedge the GPU (e.g. on a driver older than the ptxas
-that assembled them), and the only reliable way to reclaim a wedged context is to kill the process
+IN AN ISOLATED SPAWN SUBPROCESS: a bad ACF can wedge or crash the GPU (e.g. an illegal access or
+divergent scheduling), and the only reliable way to reclaim a wedged context is to kill the process
 holding it. A candidate that wedges (timeout), crashes (IMA), or diverges scores INVALID and the
 search keeps moving -- it never hangs the factory. Only an ACF that beats the no-ACF baseline is
 stored -- on a miss the consume hook falls back to plain compile.
@@ -107,14 +107,6 @@ def run_factory(task_dir, generations=2, pool_size=8, ss_bin=DEFAULT_SS_BIN):
             f"PTXAS search-space bin not set/found: {ss_bin}. Set COMPILE_IQ_SEARCH_SPACE_BIN "
             "(or --search-space-bin) to the ptxas13.3 search-space .bin (a separate NVIDIA artifact).")
     print(f"[factory] ptxas: {ptxas}")
-    # ptxas >= 13.3 *assembles* ACF cubins, but a GPU driver older than CUDA 13.3 cannot *run* them
-    # -- such candidates wedge at launch. We don't block on this (the per-candidate isolation reaps
-    # them as INVALID and the search still completes), but warn so an all-INVALID result is expected.
-    drv = replay.driver_cuda_version()
-    if drv is not None and not replay.driver_supports_acf():
-        print(f"[factory] WARNING: GPU driver supports only CUDA {replay.fmt_cuda_version(drv)} (< 13.3, which is "
-              "required to RUN --apply-controls cubins). ACF candidates will likely wedge and be reaped as "
-              "INVALID; the search will complete but probably store nothing. Use a >= 13.3 driver for a real HIT.")
 
     base_ms = _isolated_bench(task_dir, None, max(GENERIC_TIMEOUT, 180))
     if base_ms is None:
@@ -129,9 +121,9 @@ def run_factory(task_dir, generations=2, pool_size=8, ss_bin=DEFAULT_SS_BIN):
             return ms if ms is not None else INVALID_SCORE
 
     cfg = SearchConfiguration(problem_type="min", generations=generations, pool_size=pool_size)
-    # exit_on_failure=False: if every candidate scores INVALID (e.g. no ACF is safe on this driver),
-    # return an all-INVALID result instead of raising -- we then report "no valid candidate" and
-    # store nothing, rather than crashing the factory.
+    # exit_on_failure=False: if every candidate scores INVALID (e.g. no ACF beats / is safe for this
+    # kernel), return an all-INVALID result instead of raising -- we then report "no valid candidate"
+    # and store nothing, rather than crashing the factory.
     tuner = Search(objective_function=objective, search_space=LocalSearchSpaceBin(ss_bin), search_config=cfg,
                    exit_on_failure=False)
     with gpu_benchmark_mode(clock_mhz=1965, raise_on_failure=False):
@@ -148,7 +140,7 @@ def run_factory(task_dir, generations=2, pool_size=8, ss_bin=DEFAULT_SS_BIN):
     except Exception:
         best, best_ms = None, None
     if not isinstance(best_ms, (int, float)):
-        print(f"[factory] no valid candidate: all {n} candidate(s) unsafe/failed on this driver -- not storing.")
+        print(f"[factory] no valid candidate: all {n} candidate(s) failed self-consistency / bench -- not storing.")
         return None
     speedup = (base_ms / best_ms - 1) * 100 if base_ms and best_ms else None
     print(f"[factory] radius={n} best={best_ms} ms "

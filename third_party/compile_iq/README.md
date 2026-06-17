@@ -5,32 +5,30 @@
 gets faster SASS without importing or referencing anything from this package. The whole
 system is decoupled into three stages that communicate only through disk:
 
-| Stage | What | Trigger | Where it can run |
-|-------|------|---------|------------------|
-| **1. collect** | a gated hook in `jit.py` dumps a *compileIQ task* (source + args + grid + PTX) per kernel | `FBTRITON_COMPILE_IQ_COLLECT=1` | any box |
-| **2. factory** | offline search over ACFs (replay each candidate, keep the best) → ACF store | `python -m triton.compile_iq.factory <task_dir>` | **≥ 13.3 driver box** for a real HIT |
-| **3. consume** | a gated `make_cubin` hook re-assembles with the stored ACF (`--apply-controls`) | `FBTRITON_COMPILE_IQ_APPLY=1` | **≥ 13.3 driver box** to actually apply |
+| Stage | What | Trigger | Requirements |
+|-------|------|---------|--------------|
+| **1. collect** | a gated hook in `jit.py` dumps a *compileIQ task* (source + args + grid + PTX) per kernel | `FBTRITON_COMPILE_IQ_COLLECT=1` | none — stdlib only, any box |
+| **2. factory** | offline search over ACFs (replay each candidate, keep the best) → ACF store | `python -m triton.compile_iq.factory <task_dir>` | CompileIQ engine + ptxas ≥ 13.3 + search-space bin |
+| **3. consume** | a gated `make_cubin` hook re-assembles with the stored ACF (`--apply-controls`) | `FBTRITON_COMPILE_IQ_APPLY=1` | ptxas ≥ 13.3 |
 
 Content-addressed: the store key is `sha256(normalized PTX) × arch`, so one ACF transfers
 across runtime shapes (M,N,K) of the same kernel.
 
-## The hard requirement: CUDA ≥ 13.3 driver
+## The requirement: ptxas ≥ 13.3
 
-ptxas 13.3 *assembles* `--apply-controls` cubins, but a **GPU driver older than CUDA 13.3
-cannot run them** — such launches wedge the GPU. Consequences:
+`--apply-controls` (the ACF flag) is only understood by **ptxas 13.3+**, so both the factory
+and the consume hook need a 13.3+ ptxas (auto-discovered from the `nvidia-cuda-nvcc` wheel, or
+set `TRITON_PTXAS_BLACKWELL_PATH`). The consume hook is version-guarded and fail-open: with an
+older ptxas it silently skips the ACF and compiles unchanged, so nothing breaks.
 
-- **factory** on a `< 13.3` driver completes cleanly but every candidate is reaped as
-  INVALID (per-candidate subprocess isolation + timeout), so it **stores nothing**. You'll
-  see a `WARNING: GPU driver supports only CUDA <ver> (< 13.3 …)` line — expected.
-- **consume** is version-guarded and fail-open: with an older ptxas/driver it silently
-  skips the ACF (plain compile), so no HIT is applied.
-- **collect** works on any box.
-
-> devgpu006 is CUDA 13.0 → collect works, but a **real HIT needs a ≥ 13.3 driver box**.
+There is **no GPU-driver requirement** beyond what the kernel itself needs — by CUDA
+minor-version compatibility, a 13.3-assembled cubin runs on any driver of the same major
+(e.g. CUDA 13.0). The per-candidate subprocess isolation exists to survive a genuinely bad ACF
+(illegal access / divergent scheduling), not a driver mismatch. **collect** has no deps at all.
 
 ## Factory environment (uv)
 
-On a capable (≥ 13.3 driver) box:
+On a box with ptxas ≥ 13.3 (or use the `nvidia-cuda-nvcc` wheel below):
 
 ```bash
 uv venv --python 3.13 .venv-ciq
@@ -70,7 +68,7 @@ FBTRITON_COMPILE_IQ_COLLECT=1 COMPILE_IQ_TASK_DIR=/tmp/ciq_tasks FBTRITON_COMPIL
   $PY third_party/compile_iq/examples/user_kernel.py
 # -> /tmp/ciq_tasks/<sha16>/{kernel.ptx,task.json,source.py}
 
-# 2. factory  (real HIT needs a >= 13.3 driver box; on a 13.0 box: graceful no-store)
+# 2. factory  (needs the CompileIQ engine + ptxas 13.3 + search-space bin)
 COMPILE_IQ_SEARCH_SPACE_BIN=/path/to/ptxas13.3.bin TRITON_PTXAS_BLACKWELL_PATH=$PTXAS \
   $PY -m triton.compile_iq.factory /tmp/ciq_tasks/<sha16>
 # -> "[factory] wrote ACF (+X%)" -> ~/.compile_iq/store/<arch>/<sha>.acf
@@ -83,9 +81,9 @@ FBTRITON_COMPILE_IQ_APPLY=1 FBTRITON_COMPILE_IQ_DEBUG=1 TRITON_ALWAYS_COMPILE=1 
 # -> "[compile_iq.consume] HIT <sha16> <arch>" and runtime <= baseline
 ```
 
-**Definition of done:** collect produces a task; factory stores an ACF on a ≥ 13.3 driver;
-consume logs a HIT with a speedup. (On a 13.0 box alone: factory runs cleanly and stores
-nothing; the HIT is shown on the capable box.)
+**Definition of done:** collect produces a task; factory stores an ACF (when one beats the
+no-ACF baseline); consume logs a HIT with a speedup. An empty store is a clean no-op — consume
+MISSes and compiles the unchanged baseline.
 
 ## How it works (mechanics)
 

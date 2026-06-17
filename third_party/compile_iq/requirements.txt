@@ -1,7 +1,7 @@
 # compile_iq factory environment (Stage 2).
 #
 # These are the *external* deps the factory needs to search + assemble ptxas ACFs.
-# Provision a capable box (>= CUDA 13.3 GPU driver) with:
+# Provision a box that has ptxas >= 13.3 (the nvidia-cuda-nvcc wheel below supplies it) with:
 #
 #     uv venv --python 3.13 .venv-ciq
 #     uv pip install -r third_party/compile_iq/requirements.txt
