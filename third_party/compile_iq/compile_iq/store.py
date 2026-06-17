@@ -12,6 +12,7 @@ If per-shape ACFs are wanted later, extend the key with shape/identity.
 import hashlib
 import json
 import os
+import re
 import sys
 
 # Single debug knob for all of compile_iq, default OFF. Set FBTRITON_COMPILE_IQ_DEBUG=1
@@ -29,8 +30,38 @@ def dlog(component: str, msg: str) -> None:
         sys.stderr.write(f"[compile_iq.{component}] {msg}\n")
 
 
+_SECTION_RE = re.compile(r"^\s*\.section\s+(\S+)")
+_LOC_FILE_RE = re.compile(r"^\s*\.(loc|file)(\s|$)")
+
+
+def normalize_ptx(ptx: str) -> str:
+    """Strip volatile debug / source-path info so the content hash reflects only the
+    actual code -- not where the kernel source happened to live. Triton bakes the
+    source file path into PTX debug info (`.file`, the `// path:line` tail of every
+    `.loc`, and the `.debug_*` DWARF sections), so the SAME kernel hashes differently
+    depending on whether it was compiled from the user's real file, from replay's
+    `source.py` copy, or served from the Triton cache. Dropping these makes the key
+    location-independent; the executable instructions are byte-identical without them,
+    so collect / factory / consume all agree on one key.
+    """
+    out = []
+    in_debug = False
+    for line in ptx.splitlines():
+        m = _SECTION_RE.match(line)
+        if m:
+            in_debug = m.group(1).startswith(".debug")
+            if in_debug:
+                continue
+        if in_debug:
+            continue
+        if _LOC_FILE_RE.match(line):
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
 def ptx_sha256(ptx: str) -> str:
-    return hashlib.sha256(ptx.encode("utf-8")).hexdigest()
+    return hashlib.sha256(normalize_ptx(ptx).encode("utf-8")).hexdigest()
 
 
 def store_root() -> str:

@@ -78,6 +78,33 @@ def _ptxas_ge_133(p: str) -> bool:
         return False
 
 
+def driver_cuda_version() -> int | None:
+    """Max CUDA version the installed GPU driver supports, encoded as 1000*major + 10*minor
+    (e.g. 13030 == CUDA 13.3), or None if undetectable. This is the RUNTIME gate for
+    --apply-controls: ptxas >= 13.3 *assembles* an ACF cubin, but a driver older than CUDA
+    13.3 cannot *run* it -- the launch wedges the GPU and hangs the search with no error."""
+    import ctypes
+    for name in ("libcudart.so", "libcudart.so.13", "libcudart.so.12"):
+        try:
+            rt = ctypes.CDLL(name)
+        except OSError:
+            continue
+        v = ctypes.c_int()
+        if rt.cudaDriverGetVersion(ctypes.byref(v)) == 0 and v.value > 0:
+            return v.value
+    return None
+
+
+def fmt_cuda_version(v: int) -> str:
+    return f"{v // 1000}.{(v % 1000) // 10}"
+
+
+def driver_supports_acf(min_version: int = 13030) -> bool:
+    """True if the driver supports CUDA >= 13.3 (so --apply-controls cubins can run)."""
+    v = driver_cuda_version()
+    return v is not None and v >= min_version
+
+
 def find_ptxas() -> str | None:
     """Locate a ptxas >= 13.3 (needed for --apply-controls). Resolution order:
     explicit env (trusted) > the pip `nvidia-cuda-nvcc` wheel > PATH; candidates
