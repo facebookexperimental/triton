@@ -81,8 +81,6 @@ jobs:
             export CIBW_MANYLINUX_AARCH64_IMAGE="quay.io/pypa/manylinux_2_28_aarch64:latest"
           fi
           export CIBW_BUILD="${{ matrix.python }}-manylinux_${{ matrix.arch }}"
-          # cp313t/cp314t are free-threaded ABIs; cibuildwheel skips them unless opted in.
-          export CIBW_ENABLE=cpython-freethreading
 
           # Defensive: tell auditwheel not to follow libtriton.so's deps into
           # triton.libs/. Currently a no-op because TRITON_BUILD_WITH_CLANG_LLD=1
