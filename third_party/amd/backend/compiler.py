@@ -162,6 +162,9 @@ class HIPBackend(BaseBackend):
 
     def load_dialects(self, ctx):
         amd.load_dialects(ctx)
+        # TLX frontends can emit tlx.* view/alias ops while still targeting the
+        # AMD backend, so register TLX IR before parsing user kernels.
+        tlx.load_dialects(ctx)
         if HIPBackend.instrumentation:
             HIPBackend.instrumentation.load_dialects(ctx)
 
