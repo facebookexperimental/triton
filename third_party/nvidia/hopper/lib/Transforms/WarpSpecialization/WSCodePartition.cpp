@@ -1405,104 +1405,125 @@ void createTokenPost(
           funcOp, channel->getNumBuffers(), channel->srcName);
       hasProdBar = true;
     }
-    // Check if this channel needs token-based synchronization.
-    // When srcOp and dstOp are both outside loops, we need to check if the
-    // actual consumers are inside loops. This can happen with both single and
-    // multiple consumer task IDs.
-    checkConsumersInLoops(channel);
-    for (auto consumerAsyncTaskId : channel->relation.second) {
-      // It is possible that this channel has two consumer taskIds.
-      // We can have multiple consumer ops for ChannelPost, or one consumer op
-      // has multiple actual consumers. Here we collect all consumer ops.
-      DenseSet<Operation *> actualConsumers;
-      SmallVector<Operation *> dstOps;
-      if (channel->channelKind == DataChannelKind::SMEMPost) {
-        auto *cPost = static_cast<ChannelPost *>(channel);
-        cPost->getDstOps(dstOps);
-      } else {
-        dstOps.push_back(dstOp);
-      }
-      // If it is used by gen5, we can create a gen5 barrier for consumer
-      // release.
-      bool useGen5Barrier = true;
-      for (auto *dst : dstOps) {
-        auto consumers = getActualConsumers(dst);
-        for (auto *t : consumers) {
-          SmallVector<AsyncTaskId> asyncTasks = getAsyncTaskIds(t);
+    SmallVector<Channel *> channelsForComm;
+    if (reuseGrp >= 0) {
+      auto *group = config->getGroup(reuseGrp);
+      channelsForComm.append(group->channels.begin(), group->channels.end());
+    } else {
+      channelsForComm.push_back(channel);
+    }
 
-          // Handle operations that belong to multiple tasks (e.g., boundary
-          // ops) Only include if this consumer belongs to the task we're
-          // processing
-          if (asyncTasks.empty()) {
-            LLVM_DEBUG({
-              LDBG("Skipping operation with no async tasks");
-              t->dump();
-            });
-            continue;
-          }
+    // Check if the channel group needs token-based synchronization.
+    // Reuse groups share one CommChannel, so this must consider every channel
+    // in the group. Otherwise the representative channel can drop consumer task
+    // IDs that only appear on another logical buffer sharing the same SMEM
+    // circular pool.
+    for (auto *commSourceChannel : channelsForComm) {
+      checkConsumersInLoops(commSourceChannel);
+      auto sourceDstOp = commSourceChannel->getDstOp();
+      for (auto consumerAsyncTaskId : commSourceChannel->relation.second) {
+        if (commChannel.tokens.count(consumerAsyncTaskId) &&
+            commChannel.consumerBarriers.count(consumerAsyncTaskId))
+          continue;
 
-          if (std::find(asyncTasks.begin(), asyncTasks.end(),
-                        consumerAsyncTaskId) != asyncTasks.end()) {
-            actualConsumers.insert(t);
-            // XXX: Op can have multiple async tasks
-
-            // If consumer and producer are not in the same block, but
-            // as long as all consumers are gen5, we can use a gen5 related
-            // barrier such as gen5.commit. Remove producerOp->getBlock() !=
-            // t->getBlock()
-            if (!isa<ttng::TCGen5MMAOp>(t))
-              useGen5Barrier = false;
-          }
-        }
-      }
-      assert(!actualConsumers.empty());
-      Operation *consumerOp =
-          *actualConsumers.begin(); // getLastOpInBlock(actualConsumers);
-
-      LLVM_DEBUG({
-        LDBG("-- createToken: useGen5Barrier = "
-             << useGen5Barrier << " channel " << channel->uniqID);
-        producerOp->dump();
-        dstOp->dump();
-        consumerOp->dump();
-      });
-      // Need token only when we are not using inline barriers
-      if (!hasProdBar || !useGen5Barrier) {
-        ttnvws::TokenLoadType tokenLoadType;
-        auto copyOp = channel->getSrcOp();
-        if (isa<ttg::AsyncCopyGlobalToLocalOp>(copyOp)) {
-          tokenLoadType = ttnvws::TokenLoadType::AsyncLoadOp;
-        } else if (isProducerTMA(channel, true)) {
-          tokenLoadType = ttnvws::TokenLoadType::TMALoadOp;
-        } else if (isa<ttg::LocalStoreOp>(copyOp)) {
-          tokenLoadType = ttnvws::TokenLoadType::LocalStoreOp;
-        } else if (isa<ttng::TMEMLoadOp>(copyOp) ||
-                   isa<ttng::TMEMStoreOp>(consumerOp)) {
-          // Wrap-around channel: tmem_load signals tmem_store that the
-          // buffer has been consumed and can be overwritten.
-          tokenLoadType = ttnvws::TokenLoadType::TmemLoadOp;
-        } else if (isa<ttng::TMEMLoadOp>(consumerOp)) {
-          tokenLoadType = ttnvws::TokenLoadType::TmemLoadOp;
-        } else if (isa<ttng::TCGen5MMAOp>(consumerOp)) {
-          // For operand A of gen5, we have tmem_store + gen5.
-          tokenLoadType = ttnvws::TokenLoadType::TmemLoadOp;
+        // It is possible that this channel has two consumer taskIds.
+        // We can have multiple consumer ops for ChannelPost, or one consumer op
+        // has multiple actual consumers. Here we collect all consumer ops.
+        DenseSet<Operation *> actualConsumers;
+        SmallVector<Operation *> dstOps;
+        if (commSourceChannel->channelKind == DataChannelKind::SMEMPost) {
+          auto *cPost = static_cast<ChannelPost *>(commSourceChannel);
+          cPost->getDstOps(dstOps);
         } else {
-          llvm_unreachable("Unexpected load type");
+          dstOps.push_back(sourceDstOp);
         }
-        Value v;
-        Location tokenLoc = funcOp.getLoc();
-        if (!channel->srcName.empty())
-          tokenLoc = NameLoc::get(
-              StringAttr::get(funcOp.getContext(), channel->srcName), tokenLoc);
-        v = ttnvws::CreateTokenOp::create(
-            builder, tokenLoc, channel->getNumBuffers(), tokenLoadType);
-        commChannel.tokens[consumerAsyncTaskId] = v;
-      }
+        // If it is used by gen5, we can create a gen5 barrier for consumer
+        // release.
+        bool useGen5Barrier = true;
+        for (auto *dst : dstOps) {
+          auto consumers = getActualConsumers(dst);
+          for (auto *t : consumers) {
+            SmallVector<AsyncTaskId> asyncTasks = getAsyncTaskIds(t);
 
-      if (useGen5Barrier) {
-        Value v = createBarrierAlloc(funcOp, channel->getNumBuffers(),
-                                     channel->srcName);
-        commChannel.consumerBarriers[consumerAsyncTaskId] = v;
+            // Handle operations that belong to multiple tasks (e.g., boundary
+            // ops) Only include if this consumer belongs to the task we're
+            // processing
+            if (asyncTasks.empty()) {
+              LLVM_DEBUG({
+                LDBG("Skipping operation with no async tasks");
+                t->dump();
+              });
+              continue;
+            }
+
+            if (std::find(asyncTasks.begin(), asyncTasks.end(),
+                          consumerAsyncTaskId) != asyncTasks.end()) {
+              actualConsumers.insert(t);
+              // XXX: Op can have multiple async tasks
+
+              // If consumer and producer are not in the same block, but
+              // as long as all consumers are gen5, we can use a gen5 related
+              // barrier such as gen5.commit. Remove producerOp->getBlock() !=
+              // t->getBlock()
+              if (!isa<ttng::TCGen5MMAOp>(t))
+                useGen5Barrier = false;
+            }
+          }
+        }
+        assert(!actualConsumers.empty());
+        Operation *consumerOp =
+            *actualConsumers.begin(); // getLastOpInBlock(actualConsumers);
+
+        LLVM_DEBUG({
+          LDBG("-- createToken: useGen5Barrier = "
+               << useGen5Barrier << " channel "
+               << commSourceChannel->uniqID);
+          commSourceChannel->getSrcOp()->dump();
+          sourceDstOp->dump();
+          consumerOp->dump();
+        });
+        // Need token only when we are not using inline barriers
+        if ((!hasProdBar || !useGen5Barrier) &&
+            !commChannel.tokens.count(consumerAsyncTaskId)) {
+          ttnvws::TokenLoadType tokenLoadType;
+          auto copyOp = commSourceChannel->getSrcOp();
+          if (isa<ttg::AsyncCopyGlobalToLocalOp>(copyOp)) {
+            tokenLoadType = ttnvws::TokenLoadType::AsyncLoadOp;
+          } else if (isProducerTMA(commSourceChannel, true)) {
+            tokenLoadType = ttnvws::TokenLoadType::TMALoadOp;
+          } else if (isa<ttg::LocalStoreOp>(copyOp)) {
+            tokenLoadType = ttnvws::TokenLoadType::LocalStoreOp;
+          } else if (isa<ttng::TMEMLoadOp>(copyOp) ||
+                     isa<ttng::TMEMStoreOp>(consumerOp)) {
+            // Wrap-around channel: tmem_load signals tmem_store that the
+            // buffer has been consumed and can be overwritten.
+            tokenLoadType = ttnvws::TokenLoadType::TmemLoadOp;
+          } else if (isa<ttng::TMEMLoadOp>(consumerOp)) {
+            tokenLoadType = ttnvws::TokenLoadType::TmemLoadOp;
+          } else if (isa<ttng::TCGen5MMAOp>(consumerOp)) {
+            // For operand A of gen5, we have tmem_store + gen5.
+            tokenLoadType = ttnvws::TokenLoadType::TmemLoadOp;
+          } else {
+            llvm_unreachable("Unexpected load type");
+          }
+          Value v;
+          Location tokenLoc = funcOp.getLoc();
+          if (!commSourceChannel->srcName.empty())
+            tokenLoc = NameLoc::get(
+                StringAttr::get(funcOp.getContext(), commSourceChannel->srcName),
+                tokenLoc);
+          v = ttnvws::CreateTokenOp::create(
+              builder, tokenLoc, commSourceChannel->getNumBuffers(),
+              tokenLoadType);
+          commChannel.tokens[consumerAsyncTaskId] = v;
+        }
+
+        if (useGen5Barrier &&
+            !commChannel.consumerBarriers.count(consumerAsyncTaskId)) {
+          Value v = createBarrierAlloc(funcOp, commSourceChannel->getNumBuffers(),
+                                       commSourceChannel->srcName);
+          commChannel.consumerBarriers[consumerAsyncTaskId] = v;
+        }
       }
     }
 
