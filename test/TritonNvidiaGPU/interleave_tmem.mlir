@@ -554,4 +554,35 @@ tt.func @rollback_when_overlap_profile_unchanged() {
   tt.return
 }
 
+// Named barriers are ordering barriers. WS barrier restore must not move an
+// arrive across one when searching for the guarded memory op.
+// CHECK-LABEL: @restore_ws_arrive_stops_at_named_barrier
+tt.func @restore_ws_arrive_stops_at_named_barrier(
+    %bar: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>)
+    -> (tensor<128x64xf32, #linear64>, tensor<128x64xf32, #linear64>) {
+  %c9 = arith.constant 9 : i32
+  %c128 = arith.constant 128 : i32
+  %true = arith.constant true
+  %bias0 = arith.constant dense<1.0> : tensor<128x64xf32, #linear64>
+  %bias1 = arith.constant dense<2.0> : tensor<128x64xf32, #linear64>
+  %zero = arith.constant dense<0.0> : tensor<128x128xf32, #linear128>
+  %alloc = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  %noalias_alloc = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  %s0 = ttng.tmem_subslice %alloc {N = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable>
+  %v0 = ttng.tmem_load %s0 : !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x64xf32, #linear64>
+  %s1 = ttng.tmem_subslice %alloc {N = 64 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable>
+  %v1 = ttng.tmem_load %s1 : !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x64xf32, #linear64>
+  %out0 = arith.addf %v0, %bias0 : tensor<128x64xf32, #linear64>
+  %out1 = arith.addf %v1, %bias1 : tensor<128x64xf32, #linear64>
+
+  // CHECK: ttng.tmem_store
+  // CHECK-NEXT: ttng.wait_barrier_named
+  // CHECK-NEXT: ttng.arrive_barrier
+  // CHECK-SAME: channelGraph = array<i32: 4>
+  ttng.tmem_store %zero, %noalias_alloc, %true : tensor<128x128xf32, #linear128> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  ttng.wait_barrier_named %c9, %c128 : i32, i32
+  ttng.arrive_barrier %bar, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 4>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  tt.return %out0, %out1 : tensor<128x64xf32, #linear64>, tensor<128x64xf32, #linear64>
+}
+
 }
