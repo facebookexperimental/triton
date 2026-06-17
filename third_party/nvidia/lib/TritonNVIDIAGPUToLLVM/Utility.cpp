@@ -170,7 +170,7 @@ LogicalResult lowerLdStMatrix(
     SmallVector<Value> &vals, // Input for stmatrix, output for ldmatrix
     Value smemBase, Value affineOffset, uint64_t maskSpanAffineOffset,
     Type llvmElemTy, ConversionPatternRewriter &rewriter,
-    const ::triton::NVIDIA::TargetInfo &targetInfo) {
+    const ::triton::NVIDIA::TargetInfo &targetInfo, int64_t npotBufferBytes) {
   // Lower load via ldmatrix, store via stmatrix
 
   bool isStore = !vals.empty();
@@ -400,6 +400,11 @@ LogicalResult lowerLdStMatrix(
           reps.apply({{kReg, i2}, {kLane, 0}, {kWarp, 0}})[0].second;
       auto regIdxAddI8 = regIdxAdd * (bitwidth / 8);
       Value innerOffset = b.add(offset, b.i32_val(regIdxAddI8));
+      // For NPOT split-dim layouts, the offset space is pow2 but the
+      // allocation is NPOT. Wrap degenerate offsets to stay in bounds.
+      if (npotBufferBytes > 0) {
+        innerOffset = b.urem(innerOffset, b.i32_val(npotBufferBytes));
+      }
       auto vecAddr = b.gep(smemPtrTy, i8_ty, smemBase, innerOffset,
                            LLVM::GEPNoWrapFlags::inbounds);
       if (isStore) {

@@ -319,12 +319,38 @@ SmallVector<int64_t> getAllocationShapePerCTA(Attribute layout,
       auto packedAxis = getOrder(sharedMMALayout, shapeLogical)[0];
       shape[packedAxis] *= 2;
     }
-    // For NPOT dims (e.g. M=144), nvmmaSharedToLinearLayout rounds to pow2
-    // internally. The allocation must cover the pow2-rounded size so MMA reps
-    // don't read past the buffer.
-    for (auto &d : shape) {
-      if (!llvm::isPowerOf2_64(d))
-        d = llvm::NextPowerOf2(d);
+    // Round NPOT dims to pow2 to match the SMEM layout (prevents OOB).
+    // Exception: the contiguous dim keeps its NPOT size when contigBytes is a
+    // multiple of the swizzle width (it uses modular split-dim phases).
+    int rank = shape.size();
+    bool isTransposed = sharedMMALayout.getTransposed();
+    int contigDim = isTransposed ? 0 : rank - 1;
+    int elemBytes = sharedMMALayout.getElementBitWidth() / 8;
+    int swizzleBytes = sharedMMALayout.getSwizzlingByteWidth();
+    int64_t contigBytes = shape[contigDim] * elemBytes;
+    bool contigHasSplitDim = !llvm::isPowerOf2_64(shape[contigDim]) &&
+                             swizzleBytes > 0 &&
+                             contigBytes % swizzleBytes == 0;
+
+    for (size_t i = 0; i < shape.size(); i++) {
+      if (!llvm::isPowerOf2_64(shape[i])) {
+        if ((int)i == contigDim && contigHasSplitDim) {
+        } else {
+          shape[i] = llvm::NextPowerOf2(shape[i]);
+        }
+      }
+    }
+  }
+  // SwizzledSharedEncodingAttr: the XOR-based swizzle in toLinearLayout creates
+  // basis vectors for each row power-of-2 below the row count. The XOR
+  // composition of these bases spans a pow2-rounded offset space. For NPOT row
+  // dims, the offset space exceeds the NPOT allocation, causing OOB writes.
+  // Round NPOT dims to pow2 to match the swizzle's address range.
+  if (isa<SwizzledSharedEncodingAttr>(layout)) {
+    for (size_t i = 0; i < shape.size(); i++) {
+      if (!llvm::isPowerOf2_64(shape[i])) {
+        shape[i] = llvm::NextPowerOf2(shape[i]);
+      }
     }
   }
   return getShapePerCTA(layout, shape);
@@ -1252,11 +1278,6 @@ LinearLayout LinearEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
 
 SmallVector<unsigned>
 LinearEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape) const {
-  // When broadcasting the layout the shape changes, otherwise the shape is
-  // the same as the shape of the tensor
-  // We can either have BroadcastOp with SameOperandsAndResultEncoding, or keep
-  // the invariant that the shape of the LL is that of the tensor
-  // We choose the former for BC
   auto scaledLayout = get(getContext(), toLinearLayout(shape));
   auto kRegister = StringAttr::get(getContext(), "register");
   return scaledLayout.basesPerDim(kRegister, /*skipBroadcast=*/false);
@@ -3308,6 +3329,11 @@ struct TritonGPUInferLayoutInterface
         tryJoinOnAxis(ctx, ll, newLl, /*fwdInference=*/true, axis, loc);
 
     assert(result.succeeded());
+    auto noopEmitJ = []() { return InFlightDiagnostic(); };
+    if (failed(LinearEncodingAttr::verify(noopEmitJ, newLl))) {
+      return emitOptionalError(loc,
+                               "Join layout is not a valid LinearEncodingAttr");
+    }
     dstEnc = LinearEncodingAttr::get(ctx, std::move(newLl));
     return success();
   }
@@ -3363,6 +3389,11 @@ struct TritonGPUInferLayoutInterface
     SmallVector<int64_t> dstShape(shape.begin(), shape.end());
     dstShape.pop_back();
     newLl = newLl.reshapeOuts(standardOutDimPairs(ctx, dstShape));
+    auto noopEmitS = []() { return InFlightDiagnostic(); };
+    if (failed(LinearEncodingAttr::verify(noopEmitS, newLl))) {
+      return emitOptionalError(
+          loc, "Split layout is not a valid LinearEncodingAttr");
+    }
     dstEnc = LinearEncodingAttr::get(ctx, std::move(newLl));
     return success();
   }
@@ -3426,6 +3457,11 @@ struct TritonGPUInferLayoutInterface
     auto result = tryJoinOnAxis(ctx, ll, newLl, fwdInference, axis, loc);
     if (!result.succeeded())
       return result;
+    auto noopEmitF = []() { return InFlightDiagnostic(); };
+    if (failed(LinearEncodingAttr::verify(noopEmitF, newLl))) {
+      return emitOptionalError(
+          loc, "Fp4ToFp layout is not a valid LinearEncodingAttr");
+    }
     outEnc = LinearEncodingAttr::get(ctx, std::move(newLl));
     return success();
   }
@@ -4290,7 +4326,17 @@ getTMABlockShapeTiled(ArrayRef<int64_t> shapePerCTA, int elementBitWidth,
   // Last dim must equal the swizzle byte size
   if (swizzleBytes != 0) {
     auto contigDimSize = (8 * swizzleBytes) / elementBitWidth;
-    if (blockShape[contigDim] < contigDimSize) {
+    // NPOT contiguous dims are padded up to a pow2 in the SMEM allocation
+    // (getAllocationShapePerCTA) and the NVMMAShared builder picks the swizzle
+    // from that padded size. Compare against the padded size here so the
+    // memdesc verifier accepts a logical NPOT contig dim (e.g. N=24 padded to
+    // 32 for swizzle=64). The returned box size is overridden to contigDimSize
+    // below, so this only relaxes the rejection check; it does not enlarge any
+    // real TMA box (the test B-operand path uses cp.async, not TMA).
+    int64_t checkContig = llvm::isPowerOf2_64(blockShape[contigDim])
+                              ? blockShape[contigDim]
+                              : llvm::NextPowerOf2(blockShape[contigDim]);
+    if (checkContig < contigDimSize) {
       return emitError() << "block shape along the contiguous dimension "
                          << contigDim
                          << " is too small for the swizzle byte size "

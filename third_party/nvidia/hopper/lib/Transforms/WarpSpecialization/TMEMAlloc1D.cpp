@@ -317,6 +317,18 @@ ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
   assert((elemBitWidth == 16 || elemBitWidth == 32) &&
          "TMEM Layout don't support fp8");
   unsigned colStride = 32 / elemBitWidth;
+  // TMEM hardware requires blockN >= 8 and a multiple of 8. For 1D tensors
+  // promoted to TMEM, the logical blockN may be 1. Clamp ONLY the physical
+  // block carried by the encoding (encBlockN); keep the memdesc's logical
+  // shape last dim at the true blockN. tensorMemoryToLinearLayout clips the
+  // encoding's blockN back down via std::min(getBlockN(), shape[1]), so the
+  // encoding's blockN is a physical-block upper bound, not the memdesc shape.
+  // Widening the memdesc shape instead would make views/indexes/stores
+  // (e.g. tmem_store of a logical Nx1 register tensor, or memdesc_index whose
+  // result keeps the true width) disagree with srcShape[1:] and trip their
+  // verifiers.
+  int64_t encBlockN = std::max<int64_t>(blockN, 8);
+  encBlockN = llvm::alignTo(encBlockN, 8);
   // TODO(njriasan): Do we need to handle the ScaleDotElemType::E2M1 && transA
   // case at all from TCGen5MMAScaledOp::getBlockM?
   size_t CTASplitM;
@@ -336,7 +348,7 @@ ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
     assert(false && "Unsupported encoding");
   }
   auto outputEncoding = ttng::TensorMemoryEncodingAttr::get(
-      context, blockM, blockN, colStride, CTASplitM, CTASplitN, twoCTAs,
+      context, blockM, encBlockN, colStride, CTASplitM, CTASplitN, twoCTAs,
       ttng::TensorMemoryCTAMode::DEFAULT);
   if (highShape > 0) {
     llvm::SmallVector<int64_t> shapeVec{highShape, blockM, blockN};

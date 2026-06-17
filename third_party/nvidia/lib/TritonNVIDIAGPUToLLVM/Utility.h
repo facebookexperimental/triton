@@ -51,13 +51,17 @@ Value createLeaderCTAPredicate(Location loc, OpBuilder &rewriter);
 // Create bar.warp.sync
 void createSyncWarp(Location loc, OpBuilder &builder);
 
-// Lower ldmatrix and stmatrix
+// Lower ldmatrix and stmatrix.
+// npotBufferBytes: if > 0, wraps SMEM byte offsets via urem to stay within
+// the NPOT allocation. Used when the split-dim modular layout produces a
+// pow2 offset space larger than the NPOT buffer.
 LogicalResult lowerLdStMatrix(
     Location loc, LinearLayout cvt, bool transpose,
     SmallVector<Value> &vals, // Input for stmatrix, output for ldmatrix
     Value smemBase, Value affineOffset, uint64_t maskSpanAffineOffset,
     Type llvmElemTy, ConversionPatternRewriter &rewriter,
-    const mlir::triton::NVIDIA::TargetInfo &targetInfo);
+    const mlir::triton::NVIDIA::TargetInfo &targetInfo,
+    int64_t npotBufferBytes = 0);
 
 // Given a broadcast mask and the number of CTAs, create a mask of ones
 // where for ctaId, it sets as 1's the positions that are in the same broadcast
