@@ -346,6 +346,15 @@ struct ArriveBarrierOpConversion
                   ConversionPatternRewriter &rewriter) const override {
     bool isPerThread = op.getPerThread();
 
+    // A (non-perThread) arrive has block-level semantics, so we must
+    // synchronize the CTA before it. Technically this should be MemBar's job,
+    // but an arrive can follow TMEM accesses which have no MemBar equivalent.
+    // perThread arrives are per-thread (no leader pattern) and must NOT emit a
+    // CTA-wide barrier -- doing so would deadlock under warp specialization
+    // where not all threads of the CTA reach the arrive.
+    if (!isPerThread)
+      ttg::BarrierOp::create(rewriter, op.getLoc(), ttg::AddrSpace::Local);
+
     bool isRemoteBarrier = false;
     if (auto barType = dyn_cast<ttg::MemDescType>(op.getAlloc().getType())) {
       isRemoteBarrier =
