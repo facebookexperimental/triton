@@ -65,5 +65,15 @@ constrained p0 space. After the setup above it needs no arguments or edits:
   in base via `bench_one.py`), then `store_best.py` persists the best ACF to the store
 - **consume**: gated make_cubin hook applies the stored ACF on a store HIT
 
+`run_e2e_search.sh` defaults to the cuda-13.0 space + ptxas 13.0. The ptxas executable,
+search-space version, and consume gate must agree (a `cuda-X.Y` ACF is rejected by any
+other ptxas). Two thin wrappers pin a matching set so you don't have to:
+
+    bash third_party/compile_iq/smoke/run_e2e_cuda128.sh   # ptxas 12.8 (B200 production toolkit)
+    bash third_party/compile_iq/smoke/run_e2e_cuda130.sh   # ptxas 13.0
+
+Both accept `TIER` (p0/p1/p2 search-space tier, default p0) and the usual `PTXAS_KNOBS` /
+`CUDA_VISIBLE_DEVICES` / `PER_CAND_TIMEOUT` overrides.
+
 Helpers: `bench_one.py` (base-env compile+benchmark of one ACF), `store_best.py`
 (persist best ACF), `evo_search.py` (EVO orchestrator).
