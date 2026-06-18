@@ -21,6 +21,8 @@ from triton.compiler.errors import CompilationError
 from triton.backends.compiler import GPUTarget
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel, )
+from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
+    mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel, )
 
 # Skip the entire module if no HIP runtime is available.
 pytestmark = pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
@@ -685,3 +687,49 @@ def test_local_reshape_correctness_gfx1250(device):
     out = torch.empty((rows, cols), dtype=torch.float32, device=device)
     _local_reshape_kernel[(1, )](inp, out, ROWS=rows, COLS=cols)
     torch.testing.assert_close(out, inp.reshape(rows, cols))
+
+
+# ---------------------------------------------------------------------------
+# Test: mxfp TDM-pipelined GEMM compiles on gfx1250 with TDM + dot_scaled + WMMA.
+# ---------------------------------------------------------------------------
+
+
+def test_mxgemm_tdm_pipelined_compiles_gfx1250(device):
+    """The mxfp GEMM tutorial kernel should lower to TDM + dot_scaled + WMMA."""
+    compiled = compile_for_gfx1250(
+        _amd_mxfp_gemm_kernel,
+        signature={
+            "a_ptr": "*fp8e5",
+            "b_ptr": "*fp8e5",
+            "c_ptr": "*fp32",
+            "a_scale": "*i8",
+            "b_scale": "*i8",
+            "M": "i32",
+            "N": "i32",
+            "K": "i32",
+            "stride_am": "i64",
+            "stride_ak": "i64",
+            "stride_bk": "i64",
+            "stride_bn": "i64",
+            "stride_cm": "i64",
+            "stride_cn": "i64",
+            "stride_scale": "i64",
+        },
+        constexprs={
+            "DTYPE_A": "e5m2",
+            "DTYPE_B": "e5m2",
+            "SCALE_BLOCK": 32,
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 128,
+            "GROUP_SIZE_M": 8,
+            "TRANSPOSE_B": True,
+            "NUM_BUFFERS": 2,
+        },
+    )
+    ttgir = compiled.asm["ttgir"]
+    amdgcn = compiled.asm["amdgcn"]
+    assert "amdg.async_tdm_copy_global_to_local" in ttgir
+    assert "tt.dot_scaled" in ttgir
+    assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
+    assert "wmma" in amdgcn
