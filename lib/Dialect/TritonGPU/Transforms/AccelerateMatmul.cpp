@@ -23,7 +23,6 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
-#include "llvm/Support/MathExtras.h"
 
 namespace mlir {
 namespace triton {
@@ -207,8 +206,6 @@ getSharedMemoryMMAOperand(Value v, mlir::PatternRewriter &rewriter, int opIdx,
   auto newLayout = NVMMASharedEncodingAttr::get(
       argType.getContext(), argType.getShape(), newOrder, CGALayout,
       argType.getElementType(), isMMAv5Fp4Padded);
-  // For NPOT dims (e.g. M=144), getAllocationShapePerCTA rounds to pow2
-  // so the SMEM allocation covers all MMA reps. No allocShape padding needed.
   auto newType = MemDescType::get(argType.getShape(), argType.getElementType(),
                                   newLayout, SharedMemorySpace);
   rewriter.setInsertionPointAfterValue(arg);
