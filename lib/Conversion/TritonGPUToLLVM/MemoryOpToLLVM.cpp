@@ -210,6 +210,72 @@ struct LocalAllocOpConversion
       : ConvertOpToLLVMPattern<triton::gpu::LocalAllocOp>(converter, benefit),
         targetInfo(targetInfo) {}
 
+  // Check if this NVMMASharedEncoding allocation has NPOT contiguous dim with
+  // swizzle=0, which means the physical allocation is pow2-rounded and the
+  // padding elements must be zero-filled to avoid WGMMA reading garbage.
+  static bool needsZeroFillForNpotPadding(MemDescType memDescTy) {
+    auto encoding = dyn_cast<NVMMASharedEncodingAttr>(memDescTy.getEncoding());
+    if (!encoding || encoding.getSwizzlingByteWidth() != 0) {
+      return false;
+    }
+
+    auto shape = memDescTy.getAllocShape().take_back(memDescTy.getRank());
+    bool isTransposed = encoding.getTransposed();
+    int rank = shape.size();
+    int contigDim = isTransposed ? 0 : rank - 1;
+
+    if (llvm::isPowerOf2_64(shape[contigDim])) {
+      return false;
+    }
+
+    return true;
+  }
+
+  // Cooperative zero-fill of the SMEM allocation; each thread writes i32 zeros.
+  void emitSmemZeroFill(Location loc, Value smemBase, MemDescType memDescTy,
+                        Operation *op,
+                        ConversionPatternRewriter &rewriter) const {
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+
+    // Compute allocation size in bytes using the rounded shape.
+    auto allocShape = getAllocationShapePerCTA(memDescTy);
+    int64_t numElems = 1;
+    for (auto s : allocShape) {
+      numElems *= s;
+    }
+    int elemBitWidth = cast<NVMMASharedEncodingAttr>(memDescTy.getEncoding())
+                           .getElementBitWidth();
+    int64_t allocBytes = numElems * elemBitWidth / 8;
+
+    // Use i32 stores for efficiency: allocBytes / 4 words to write.
+    int64_t numWords = allocBytes / 4;
+
+    // Get thread ID and total threads from the module.
+    Value tid = getThreadId(rewriter, loc);
+    int numWarps = lookupNumWarps(op);
+    int threadsPerWarp = 32; // NVIDIA warp size
+    int numThreads = numWarps * threadsPerWarp;
+
+    auto i32PtrTy = LLVM::LLVMPointerType::get(rewriter.getContext(), 3);
+    Value smemI32 = b.bitcast(smemBase, i32PtrTy);
+    Value zero32 = b.i32_val(0);
+
+    for (int64_t w = 0; w * numThreads < numWords; w++) {
+      // idx = tid + w * numThreads
+      Value idx = (w == 0) ? tid : b.add(tid, b.i32_val(w * numThreads));
+      // For threads past numWords, clamp to 0 so they harmlessly
+      // write to the first word (which will be overwritten by the
+      // actual data store).
+      Value safeIdx = idx;
+      if ((w + 1) * numThreads > numWords) {
+        Value cond = b.icmp_slt(idx, b.i32_val(numWords));
+        safeIdx = b.select(cond, idx, b.i32_val(0));
+      }
+      Value ptr = b.gep(i32PtrTy, i32_ty, smemI32, safeIdx);
+      b.store(zero32, ptr);
+    }
+  }
+
   LogicalResult
   matchAndRewrite(triton::gpu::LocalAllocOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
@@ -231,6 +297,15 @@ struct LocalAllocOpConversion
     auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
     auto smemObj = SharedMemoryObject(smemBase, llvmElemTy, memDescTy.getRank(),
                                       loc, rewriter);
+
+    // swizzle=0 + NPOT contig dim: zero-fill the pow2-rounded padding so WGMMA
+    // can't read garbage from it.
+    if (op.getSrc() && needsZeroFillForNpotPadding(memDescTy)) {
+      emitSmemZeroFill(loc, smemBase, memDescTy, op.getOperation(), rewriter);
+      // Barrier to ensure zero-fill is complete before stores.
+      mlir::gpu::BarrierOp::create(rewriter, loc);
+    }
+
     // If there is an initial tensor, store it into the shared memory.
     if (op.getSrc()) {
       auto *ctx = op.getContext();
