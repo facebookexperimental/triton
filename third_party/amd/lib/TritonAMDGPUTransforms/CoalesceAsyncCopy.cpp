@@ -51,11 +51,9 @@ namespace {
 // ---------------------------------------------------------------------------
 // Op-specific traits (specialised below)
 // ---------------------------------------------------------------------------
-template <typename OpTy>
-struct OpTraits;
+template <typename OpTy> struct OpTraits;
 
-template <>
-struct OpTraits<ttg::AsyncCopyGlobalToLocalOp> {
+template <> struct OpTraits<ttg::AsyncCopyGlobalToLocalOp> {
   // Return the tensor whose encoding drives the distributed layout.
   static Value getSourceTensor(ttg::AsyncCopyGlobalToLocalOp op) {
     return op.getSrc();
@@ -70,9 +68,8 @@ struct OpTraits<ttg::AsyncCopyGlobalToLocalOp> {
   static constexpr bool capByRegToShared = true;
 
   // Build the effective pointer tensor type for canLoadDirectToLDS.
-  static RankedTensorType
-  getEffectivePtrType(ttg::AsyncCopyGlobalToLocalOp op,
-                      RankedTensorType srcTy) {
+  static RankedTensorType getEffectivePtrType(ttg::AsyncCopyGlobalToLocalOp op,
+                                              RankedTensorType srcTy) {
     return srcTy; // srcTy is already a tensor-of-pointers
   }
 
@@ -86,8 +83,7 @@ struct OpTraits<ttg::AsyncCopyGlobalToLocalOp> {
   }
 };
 
-template <>
-struct OpTraits<triton::amdgpu::BufferLoadToLocalOp> {
+template <> struct OpTraits<triton::amdgpu::BufferLoadToLocalOp> {
   // The "source tensor" whose encoding we manipulate is the offsets tensor.
   static Value getSourceTensor(triton::amdgpu::BufferLoadToLocalOp op) {
     return op.getOffsets();
@@ -128,8 +124,8 @@ struct CoalesceAsyncCopyToLocal : public OpRewritePattern<OpTy> {
   using Traits = OpTraits<OpTy>;
 
   CoalesceAsyncCopyToLocal(const triton::AMD::TargetInfo &targetInfo,
-                         const DenseMap<OpTy, unsigned> &contiguityMap,
-                         MLIRContext *ctx)
+                           const DenseMap<OpTy, unsigned> &contiguityMap,
+                           MLIRContext *ctx)
       : OpRewritePattern<OpTy>(ctx), targetInfo{targetInfo},
         contiguityMap{contiguityMap} {}
 
@@ -194,8 +190,7 @@ struct CoalesceAsyncCopyToLocal : public OpRewritePattern<OpTy> {
     int threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(mod);
 
     // Check whether the op already writes coalesced at the target contiguity.
-    RankedTensorType effectivePtrTy =
-        Traits::getEffectivePtrType(op, srcTy);
+    RankedTensorType effectivePtrTy = Traits::getEffectivePtrType(op, srcTy);
     if (LLVM::AMD::canLoadDirectToLDS(targetInfo, effectivePtrTy,
                                       dstTy.getEncoding(),
                                       dstTy.getAllocShape(), loadContig))
@@ -203,8 +198,8 @@ struct CoalesceAsyncCopyToLocal : public OpRewritePattern<OpTy> {
 
     if (!targetInfo.supportsDirectToLdsLoadBitWidth(loadContig * elemBitWidth))
       return rewriter.notifyMatchFailure(op,
-                                        "unable to find supported vector size "
-                                        "based on src and dst encodings");
+                                         "unable to find supported vector size "
+                                         "based on src and dst encodings");
 
     ttg::DistributedEncodingTrait newDistEnc;
 
@@ -227,8 +222,8 @@ struct CoalesceAsyncCopyToLocal : public OpRewritePattern<OpTy> {
       // to consecutive LDS offsets. Steps:
       //   1) log2(loadContig)    bases → register (contiguous elements/load)
       //   2) log2(threadsPerWarp) bases → lane    (warp-coalesced writes)
-      //   3) log2(numWarps)       bases → warp    (pad with broadcast if needed)
-      //   4) remaining bases → additional register bases
+      //   3) log2(numWarps)       bases → warp    (pad with broadcast if
+      //   needed) 4) remaining bases → additional register bases
 
       auto *ctx = srcTy.getContext();
       StringAttr kOffset = StringAttr::get(ctx, "offset");
@@ -284,7 +279,8 @@ struct CoalesceAsyncCopyToLocal : public OpRewritePattern<OpTy> {
       return rewriter.notifyMatchFailure(
           op, "Unable to find a new src layout to coalesce writes to LDS");
 
-    // Convert the source tensor (and optionally mask/other) to the new encoding.
+    // Convert the source tensor (and optionally mask/other) to the new
+    // encoding.
     auto convertLayout = [&rewriter](auto loc, Value old, auto newEnc) {
       auto oldTy = cast<RankedTensorType>(old.getType());
       RankedTensorType newTy = oldTy.cloneWithEncoding(newEnc);
@@ -352,8 +348,8 @@ public:
         unsigned contiguity =
             mlir::LLVM::AMD::getContiguity(globalCopyOp.getSrc(), axisAnalysis);
         if (auto mask = globalCopyOp.getMask())
-          contiguity = std::min<unsigned>(
-              contiguity, axisAnalysis.getMaskAlignment(mask));
+          contiguity = std::min<unsigned>(contiguity,
+                                          axisAnalysis.getMaskAlignment(mask));
         asyncCopyContiguity.insert({globalCopyOp, contiguity});
       }
 
@@ -372,8 +368,9 @@ public:
           ptrAlign = std::max(ptrDivisibility / elemNumBytes, 1u);
         }
 
-        // Alignment from the offset tensor's innermost (fast-varying) dimension,
-        // derived from axis-info divisibility — NOT capped by sizePerThread.
+        // Alignment from the offset tensor's innermost (fast-varying)
+        // dimension, derived from axis-info divisibility — NOT capped by
+        // sizePerThread.
         unsigned offsetAlign = 1;
         if (auto *offsetInfo = axisAnalysis.getAxisInfo(offsets)) {
           auto contiguityVec = offsetInfo->getContiguity();
