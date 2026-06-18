@@ -5,6 +5,7 @@
 #include "amd/lib/TritonAMDGPUTransforms/PipelineUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/Debug.h"
 #include <variant>
 
@@ -299,8 +300,29 @@ bool canBeConvertedToAsyncLoad(unsigned numBuffers, tt::LoadOp loadOp,
     return false;
 
   using tt::AMD::ISAFamily;
-  if (sharedEnc && llvm::is_contained({ISAFamily::CDNA3, ISAFamily::CDNA4},
-                                      targetInfo.getISAFamily())) {
+  bool isCDNA3or4 = llvm::is_contained({ISAFamily::CDNA3, ISAFamily::CDNA4},
+                                       targetInfo.getISAFamily());
+
+  // NPOT (non-power-of-2) shapes are routed off the AMD tensor-core path (the
+  // dot is gated to FMA in AccelerateAMDMatmul). Their loads cannot use async
+  // direct-to-LDS on GFX9: the padded_shared layout for an NPOT dim is not
+  // coalesceable (BufferLoadToLocal becomes unconvertible) and it crashes
+  // TritonAMDGPUBlockPingpong. Force the sync (register / local-store) pipeline
+  // for NPOT loads so the direct-to-LDS padded layout is never selected. This
+  // runs regardless of `sharedEnc`: the layout-selection call site
+  // (getSharedEncIfAllUsersAreDotEnc) passes a null sharedEnc, and gating only
+  // inside the `sharedEnc` block below would let a padded layout be picked
+  // there first. pow2 is unaffected. See T275979197.
+  static const bool allowNpot = triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
+  if (allowNpot && isCDNA3or4) {
+    auto resTy = dyn_cast<RankedTensorType>(loadOp.getType());
+    if (resTy && llvm::any_of(resTy.getShape(), [](int64_t d) {
+          return !llvm::isPowerOf2_64(d);
+        }))
+      return false;
+  }
+
+  if (sharedEnc && isCDNA3or4) {
     // Compute the final vecSize we can use for the combination of
     // sourceEncoding and sharedEncoding. We can only use AsyncCopy if the
     // target supports the requested or a smaller vecSize because we cannot

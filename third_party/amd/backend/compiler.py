@@ -162,6 +162,9 @@ class HIPBackend(BaseBackend):
 
     def load_dialects(self, ctx):
         amd.load_dialects(ctx)
+        # TLX frontends can emit tlx.* view/alias ops while still targeting the
+        # AMD backend, so register TLX IR before parsing user kernels.
+        tlx.load_dialects(ctx)
         if HIPBackend.instrumentation:
             HIPBackend.instrumentation.load_dialects(ctx)
 
@@ -298,9 +301,20 @@ class HIPBackend(BaseBackend):
         # Facebook end
         amd.passes.ttgpuir.add_prepare_if_combining(pm)
         passes.common.add_canonicalizer(pm)
+        # Late AMD passes can reintroduce dot-operand layout conversions as
+        # tensor local_alloc/local_load pairs. Run TLX propagation after
+        # canonicalization so the final cleanup sees and folds those fallbacks.
+        tlx.tlx_passes.add_tlx_propagate_layout(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
-        pm.run(mod, "make_ttgir")
+        # Consume tlx.warp_pipeline_stage border markers (rocdl.sched.barrier with
+        # triton.warp_pipeline.border / .priority attrs) for the TLX / triton.jit
+        # path. The gluon path runs this in gluon_to_ttgir; make_llir runs the
+        # conversion. Placed at the TTGIR stage (so it does not double-run for gluon
+        # kernels) and as the last pass before pm.run so the cleanup passes above do
+        # not strip the priority markers before the pipeliner consumes them.
+        amd.passes.ttgpuir.add_warp_pipeline(pm)
+        pm.run(mod, 'make_ttgir')
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
 

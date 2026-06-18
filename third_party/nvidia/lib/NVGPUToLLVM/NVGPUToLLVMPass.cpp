@@ -575,22 +575,27 @@ void freeTMAlloc(LLVM::LLVMFuncOp func, Value alloc, size_t size, Value pred,
     auto ctx = ret->getContext();
     auto loc = ret.getLoc();
     auto voidTy = void_ty(ctx);
-    // In WS mode, this code runs only in the default warp group's exit
-    // path. Workers are in the switch loop and cannot participate in a
-    // cluster-wide barrier. Use a CTA-level barrier instead (same as TLX).
     bool hasWarpSpecialize = false;
     func.walk([&](Operation *op) {
       if (isa<triton::gpu::WarpSpecializeOp>(op))
         hasWarpSpecialize = true;
     });
-    if ((twoCTAs || tlxPairedMMA) && !hasWarpSpecialize) {
+    if (tlxPairedMMA) {
+      // TLX paired MMA: do a cluster sync before tmem de-alloc. This works
+      // even in WS mode because the WS lowering inserts matching cluster
+      // arrives for the non-default warps right before their warp_return
+      // (gated by the cluster_sync_kernel_cleanup mod attr set below).
       NVVM::ClusterArriveOp::create(b, loc, UnitAttr::get(ctx));
       NVVM::ClusterWaitOp::create(b, loc, UnitAttr::get(ctx));
-      if (tlxPairedMMA) {
-        // mark mod attr so that WS lowering is aware of this cluster sync point
-        tlx::setClusterSyncKernelCleanupOnMod(func, true);
-      }
+      // mark mod attr so that WS lowering is aware of this cluster sync point
+      tlx::setClusterSyncKernelCleanupOnMod(func, true);
+    } else if (twoCTAs && !hasWarpSpecialize) {
+      NVVM::ClusterArriveOp::create(b, loc, UnitAttr::get(ctx));
+      NVVM::ClusterWaitOp::create(b, loc, UnitAttr::get(ctx));
     } else {
+      // Non-TLX 2-CTA AutoWS: this code runs only in the default warp group's
+      // exit path. Workers are in the switch loop and cannot participate in a
+      // cluster-wide barrier, so use a CTA-level barrier instead.
       NVVM::Barrier0Op::create(b, loc);
     }
     PTXBuilder ptxBuilder;

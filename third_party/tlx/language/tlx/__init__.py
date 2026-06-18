@@ -41,6 +41,7 @@ from .mem_ops import (
     local_gather,
     local_scatter,
     local_reinterpret,
+    local_reshape,
     local_slice,
     local_store,
     local_trans,
@@ -96,6 +97,7 @@ from .utility import (
 )
 from .mxfp8_utils import _to_mxfp8_block
 from .warp_ops import vote_ballot_sync, warp_redux
+from .warp_pipeline import warp_pipeline_stage
 
 __all__ = [
     # async_tasks
@@ -142,6 +144,7 @@ __all__ = [
     "local_scatter",
     "local_trans",
     "local_reinterpret",
+    "local_reshape",
     "allocate_tensor_descriptor",
     "async_amd_descriptor_load",
     "async_amd_descriptor_store",
@@ -197,4 +200,6 @@ __all__ = [
     "_to_mxfp8_block",
     # warp_ops
     "vote_ballot_sync",
+    # warp_pipeline
+    "warp_pipeline_stage",
 ]

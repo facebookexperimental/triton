@@ -291,7 +291,9 @@ MfmaIntrinsic::selectFor(Location loc, int version, unsigned mDim,
 
   // If We have more than one instrinsics, prefer those with a larger K.
   for (const auto [symbol, k, kBase] : llvm::drop_end(values)) {
-    if (inputKDim >= k)
+    // No-op for pow2 (instr K and inputKDim both pow2). Needed unconditionally;
+    // runs before allow_npot is consulted - do not gate.
+    if (inputKDim >= k && inputKDim % k == 0)
       return MfmaIntrinsic(symbol, mDim, nDim, k, kBase, aElemType, bElemType);
   }
 

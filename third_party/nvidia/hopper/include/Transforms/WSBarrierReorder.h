@@ -87,6 +87,15 @@ inline bool hasArriveLikeSemantics(Operation *op) {
              TCGen5CommitOp, MMAv5OpInterface>(op);
 }
 
+inline bool isBarrierLikeOp(Operation *op) {
+  return isa<ArriveBarrierOp, WaitBarrierOp, InitBarrierOp,
+             NamedBarrierArriveOp, NamedBarrierWaitOp>(op);
+}
+
+inline bool isNamedBarrierOp(Operation *op) {
+  return isa<NamedBarrierArriveOp, NamedBarrierWaitOp>(op);
+}
+
 inline bool canAdvanceWSBarrier(std::optional<DictionaryAttr> constraints,
                                 Operation *op) {
   if (op->getNumRegions() != 0)
@@ -96,6 +105,8 @@ inline bool canAdvanceWSBarrier(std::optional<DictionaryAttr> constraints,
   if (auto wait = dyn_cast<WaitBarrierOp>(op))
     return canAdvanceWSBarrierArrivePastWait(constraints,
                                              wait.getConstraints());
+  if (isNamedBarrierOp(op))
+    return false;
   return !hasArriveLikeSemantics(op);
 }
 
@@ -222,8 +233,7 @@ inline DenseMap<Operation *, Operation *>
 buildBarrierToMemoryOpMap(Block &block) {
   DenseMap<Operation *, Operation *> map;
   auto isMemoryOp = [](Operation *op) {
-    return !isMemoryEffectFree(op) &&
-           !isa<ArriveBarrierOp, WaitBarrierOp, InitBarrierOp>(op) &&
+    return !isMemoryEffectFree(op) && !isBarrierLikeOp(op) &&
            !op->hasTrait<OpTrait::IsTerminator>();
   };
 
@@ -232,6 +242,8 @@ buildBarrierToMemoryOpMap(Block &block) {
       if (!hasWSBarrierConstraints(arrive.getConstraints()))
         continue;
       for (auto *cur = arrive->getPrevNode(); cur; cur = cur->getPrevNode()) {
+        if (isNamedBarrierOp(cur))
+          break;
         if (isMemoryOp(cur)) {
           map[arrive] = cur;
           break;
@@ -241,6 +253,8 @@ buildBarrierToMemoryOpMap(Block &block) {
       if (!hasWSBarrierConstraints(wait.getConstraints()))
         continue;
       for (auto *cur = wait->getNextNode(); cur; cur = cur->getNextNode()) {
+        if (isNamedBarrierOp(cur))
+          break;
         if (isMemoryOp(cur)) {
           map[wait] = cur;
           break;

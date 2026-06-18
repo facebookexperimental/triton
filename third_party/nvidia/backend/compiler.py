@@ -651,6 +651,11 @@ class CUDABackend(BaseBackend):
         dump_enabled = pm.enable_debug()
         emuTF32 = capability // 10 >= 8
         passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
+        # Check user-visible tt.dot 2-CTA legality before lowering rewrites
+        # dot dependencies into TMEM alloc/load/store chains.
+        if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
+                and opt.ctas_per_cga is not None):
+            nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm)
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
@@ -848,6 +853,8 @@ class CUDABackend(BaseBackend):
         if "consan" in options.instrumentation_mode:
             # Call ConcurrencySanitizerPass here, before allocating global scratch memory but after allocating tensor and shared
             passes.ttgpuir.add_concurrency_sanitizer(pm)
+            passes.common.add_canonicalizer(pm)
+            passes.common.add_cse(pm)
         passes.ttgpuir.add_allocate_global_scratch_memory(pm)
         nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
         # Print TTGIR to TLX mapping before final emission (for debugging/analysis)
@@ -865,7 +872,7 @@ class CUDABackend(BaseBackend):
             CUDABackend.instrumentation.patch("ttgpuir_to_llvmir", pm, mod.context)
         nvidia.passes.hopper.add_tma_store_token_wait_lowering(pm)
         nvidia.passes.ttgpuir.add_to_llvmir(pm, capability, ptx_version)
-        passes.common.add_canonicalizer(pm)
+        passes.ttgpuir.add_canonicalize_llvm_ir(pm)
         passes.common.add_cse(pm)
         nvidia.passes.ttnvgpuir.add_nvgpu_to_llvm(pm)
         nvidia.passes.ttnvgpuir.add_warp_specialize_to_llvm(pm)

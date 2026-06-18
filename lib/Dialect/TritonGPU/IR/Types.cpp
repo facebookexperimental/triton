@@ -96,14 +96,20 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
   if (shape.empty()) {
     return emitError() << "rank 0 memdesc is not allowed";
   }
-  // Every dimension but the first (to allow for pipelining) must be a power of
-  // 2
-  if (!llvm::all_of(shape.drop_front(1), [](int64_t dim) {
+  // The allocation shape determines the physical layout, and every dimension
+  // but the first (to allow for pipelining) must be a power of 2. Exemptions:
+  //  - NVMMASharedEncodingAttr: NPOT shapes (e.g. M=144, K=96) are valid;
+  //    getAllocationShapePerCTA rounds to pow2 for physical allocation.
+  //  - TMEM scale encodings: K=96 mxf4nvf4 produces NPOT scale columns.
+  if (!isa<nvidia_gpu::TensorMemoryScalesEncodingAttr>(encoding) &&
+      !isa<nvidia_gpu::TensorMemoryEncodingAttr>(encoding) &&
+      !isa<NVMMASharedEncodingAttr>(encoding) &&
+      !llvm::all_of(allocShape.drop_front(1), [](int64_t dim) {
         return llvm::isPowerOf2_64(dim) && dim > 0;
       }))
     return emitError()
-           << "shape must have power-of-2 and non-zero dimensions; got "
-           << shape;
+           << "allocShape must have power-of-2 and non-zero dimensions; got "
+           << allocShape;
   if (shape.front() == 0)
     return emitError() << "shape has 0 dimension";
   if (allocShape.size() < shape.size())

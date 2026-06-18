@@ -1,3 +1,5 @@
+import random
+
 import pytest
 
 import torch
@@ -54,14 +56,33 @@ from triton.language.extra.tlx.tutorials.amd_fa_pipelined import (
     attention as _amd_fa_pipelined, )
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul as _amd_tdm_gemm_pipelined, )
+from triton.language.extra.tlx.tutorials.amd_gemm_warp_pipeline import (
+    matmul as _amd_gemm_warp_pipeline, )
+from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
+    matmul as _amd_mxfp_gemm_tdm_pipelined,
+    pack_scale as _amd_mxfp_pack_scale,
+)
+from triton.tools.mxfp import MXScaleTensor
+
+from triton.language.extra.tlx.tutorials.ikbo.ikbo_lce_triton import (
+    create_inputs as _ikbo_lce_create_inputs,
+    ikbo_lce as _ikbo_lce,
+    lce_reference as _ikbo_lce_reference,
+)
+from triton.language.extra.tlx.tutorials.ikbo.ikbo_fa_triton import (
+    create_inputs as _ikbo_fa_create_inputs,
+    fa_reference as _ikbo_fa_reference,
+    ikbo_fa as _ikbo_fa,
+)
 
 from triton.language.extra.tlx.tutorials.testing.multi_cta_layer_norm import (
     multi_cta_layernorm as _multi_cta_layernorm,
     multi_cta_layernorm_2d as _multi_cta_layernorm_2d,
 )
 
-from triton._internal_testing import is_blackwell, is_hopper, is_hopper_or_newer, is_hip, is_hip_gfx1250
-from triton.language.extra.tlx.tutorials.testing.gemm_shapes import BLACKWELL_GEMM_WS as _BLACKWELL_GEMM_WS_MORE_SHAPES
+from triton._internal_testing import is_blackwell, is_hopper, is_hopper_or_newer, is_hip, is_hip_cdna4, is_hip_gfx1250
+from triton.language.extra.tlx.tutorials.testing.gemm_shapes import (
+    BLACKWELL_GEMM_WS as _BLACKWELL_GEMM_WS_MORE_SHAPES, )
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -164,6 +185,26 @@ class Gemm:
             "BLOCK_M": 128,
             "BLOCK_N": 128,
             "BLOCK_K": 32,
+        },
+        "amd_gemm_warp_pipeline": {
+            "BLOCK_M": 256,
+            "BLOCK_N": 256,
+            "BLOCK_K": 32,
+            "GROUP_M": 8,
+            "NUM_BUFFERS": 3,
+            "num_warps": 8,
+        },
+        "amd_mxfp_gemm_tdm_pipelined": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 128,
+            "GROUP_SIZE_M": 8,
+            "NUM_BUFFERS": 2,
+            "DTYPE_A": "e5m2",
+            "DTYPE_B": "e5m2",
+            "SCALE_BLOCK": 32,
+            "num_warps": 4,
+            "waves_per_eu": 1,
         },
     }
 
@@ -304,9 +345,12 @@ class FlashAttention:
     @staticmethod
     def create_inputs(Z, H, N_CTX, HEAD_DIM, dtype=torch.float16):
         torch.manual_seed(20)
-        q = torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=dtype).normal_(mean=0.0, std=0.5).requires_grad_()
-        k = torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=dtype).normal_(mean=0.0, std=0.5).requires_grad_()
-        v = torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=dtype).normal_(mean=0.0, std=0.5).requires_grad_()
+        q = (torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=dtype).normal_(mean=0.0,
+                                                                                      std=0.5).requires_grad_())
+        k = (torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=dtype).normal_(mean=0.0,
+                                                                                      std=0.5).requires_grad_())
+        v = (torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=dtype).normal_(mean=0.0,
+                                                                                      std=0.5).requires_grad_())
         return q, k, v
 
     @staticmethod
@@ -332,7 +376,12 @@ def test_blackwell_gemm_ws(dtype):
 )
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_gemm_more_shapes(shape):
-    Gemm.run_test(_blackwell_gemm_ws, Gemm.CONFIGS["blackwell_gemm_ws"], shapes=[shape], dtype=torch.bfloat16)
+    Gemm.run_test(
+        _blackwell_gemm_ws,
+        Gemm.CONFIGS["blackwell_gemm_ws"],
+        shapes=[shape],
+        dtype=torch.bfloat16,
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
@@ -350,7 +399,11 @@ def test_blackwell_gemm_warp_barrier(dtype):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_gemm_clc_warp_barrier(dtype):
-    Gemm.run_test(_blackwell_gemm_clc, Gemm.CONFIGS["blackwell_gemm_clc_warp_barrier"], dtype=dtype)
+    Gemm.run_test(
+        _blackwell_gemm_clc,
+        Gemm.CONFIGS["blackwell_gemm_clc_warp_barrier"],
+        dtype=dtype,
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
@@ -601,7 +654,7 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8(HEAD_DIM, causal):
         torch.manual_seed(20)
         shape = (Z, H, N_CTX, HEAD_DIM)
         (q, q_scale, q_ref), (k, k_scale, k_ref), (v, v_scale,
-                                                   v_ref) = _generate_mxfp8_attention_inputs(shape, DEVICE, dtype)
+                                                   v_ref) = (_generate_mxfp8_attention_inputs(shape, DEVICE, dtype))
         ref_out = torch.nn.functional.scaled_dot_product_attention(q_ref, k_ref, v_ref, scale=sm_scale,
                                                                    is_causal=causal)
         tri_out = _blackwell_fa_ws_pipelined_persistent_mxfp8(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal,
@@ -666,7 +719,7 @@ def _assert_close_with_cosine(
 ) -> None:
     cosine = _cosine_similarity(actual, expected)
     # TODO: Enable value-based checking once MXFP8 backward tolerances settle.
-    assert cosine >= min_cosine, f"{label} cosine_similarity={cosine:.6f} fell below min_cosine={min_cosine:.6f}"
+    assert (cosine >= min_cosine), f"{label} cosine_similarity={cosine:.6f} fell below min_cosine={min_cosine:.6f}"
 
 
 @pytest.mark.parametrize(
@@ -693,7 +746,7 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
     torch.manual_seed(20)
 
     (q, q_scale, q_ref), (k, k_scale, k_ref), (v, v_scale,
-                                               v_ref) = _generate_mxfp8_attention_inputs(shape, DEVICE, dtype)
+                                               v_ref) = (_generate_mxfp8_attention_inputs(shape, DEVICE, dtype))
     q_ref = q_ref.detach().requires_grad_(True)
     k_ref = k_ref.detach().requires_grad_(True)
     v_ref = v_ref.detach().requires_grad_(True)
@@ -914,6 +967,57 @@ def test_amd_tdm_gemm_pipelined(dtype):
     Gemm.run_test(_amd_tdm_gemm_pipelined, Gemm.CONFIGS["amd_tdm_gemm_pipelined"], dtype=dtype)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_gemm_warp_pipeline(dtype):
+    Gemm.run_test(_amd_gemm_warp_pipeline, Gemm.CONFIGS["amd_gemm_warp_pipeline"], dtype=dtype)
+
+
+# =============================================================================
+# AMD MXFP TDM GEMM Tests (gfx1250)
+# =============================================================================
+
+
+def _mxfp_e8m0_to_float32(scale):
+    scale = scale.view(torch.uint8).to(torch.int32)
+    scale = scale << 23
+    return scale.view(torch.float32)
+
+
+def _torch_gemm_mxfp(a, b, a_scale, b_scale, scale_block, M, N, K):
+    a_scale_f32 = _mxfp_e8m0_to_float32(a_scale).repeat_interleave(scale_block, dim=1)[:M, :K]
+    b_scale_f32 = _mxfp_e8m0_to_float32(b_scale).repeat_interleave(scale_block, dim=1).T.contiguous()[:K, :N]
+    return torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32)
+
+
+def _init_fp8_e5m2(rows, cols):
+    return torch.randint(20, 40, (rows, cols), dtype=torch.uint8).view(torch.float8_e5m2)
+
+
+@pytest.mark.parametrize("TRANSPOSE_B", [False, True])
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_amd_mxfp_gemm_tdm_pipelined(TRANSPOSE_B):
+    torch.manual_seed(0)
+    M = N = 256
+    K = 512
+    scale_block = Gemm.CONFIGS["amd_mxfp_gemm_tdm_pipelined"]["SCALE_BLOCK"]
+    a = _init_fp8_e5m2(M, K)
+    b = _init_fp8_e5m2(K, N)
+    a_scale = MXScaleTensor(size=(M, triton.cdiv(K, scale_block))).random(high=32.0).data
+    b_scale = MXScaleTensor(size=(N, triton.cdiv(K, scale_block))).random(high=32.0).data
+    ref = _torch_gemm_mxfp(a, b, a_scale, b_scale, scale_block, M, N, K)
+
+    a_scale = _amd_mxfp_pack_scale(a_scale)
+    b_scale = _amd_mxfp_pack_scale(b_scale)
+    a_d = a.contiguous().to(DEVICE)
+    b_d = (b.T.contiguous() if TRANSPOSE_B else b.contiguous()).to(DEVICE)
+
+    config = Gemm.CONFIGS["amd_mxfp_gemm_tdm_pipelined"].copy()
+    config["TRANSPOSE_B"] = TRANSPOSE_B
+    out = _amd_mxfp_gemm_tdm_pipelined(a_d, b_d, a_scale.to(DEVICE), b_scale.to(DEVICE), config=config)
+    torch.testing.assert_close(out.cpu(), ref, rtol=1e-5, atol=2e-2)
+
+
 # =============================================================================
 # Multi-CTA Layer Normalization Tests
 # =============================================================================
@@ -950,3 +1054,108 @@ def test_multi_cta_layer_norm(num_ctas):
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or Blackwell GPU")
 def test_multi_cta_layer_norm_2d(num_ctas):
     LayerNorm.run_test(_multi_cta_layernorm_2d, num_ctas=num_ctas, BLOCK_SIZE_M=4)
+
+
+# =============================================================================
+# IKBO (In-Kernel Broadcast Optimization) Tests
+# =============================================================================
+
+
+class IkboLce:
+    """Common utilities for IKBO LCE tests."""
+
+    # (B, M, N, K_USER, K_CAND, cand_to_user_ratio)
+    SHAPES = [
+        (512, 128, 256, 1024, 1024, 70),
+        (1024, 433, 256, 1184, 872, 100),
+    ]
+
+    ERROR_MULTIPLIER = 1.0
+    ERROR_FLOOR = 1e-4
+
+    @staticmethod
+    def check_vs_fp32(out, ref_fp16, ref_fp32):
+        baseline_err = (ref_fp16.float() - ref_fp32).abs().max().item()
+        kernel_err = (out.float() - ref_fp32).abs().max().item()
+        threshold = max(IkboLce.ERROR_MULTIPLIER * baseline_err, IkboLce.ERROR_FLOOR)
+        assert kernel_err <= threshold, (f"IKBO LCE error exceeds baseline: "
+                                         f"kernel={kernel_err:.4e}, baseline={baseline_err:.4e}")
+
+
+class IkboFa:
+    """Common utilities for IKBO Flash Attention tests."""
+
+    # (B, n_seed, num_heads, d_head, max_seq_len, cand_to_user_ratio)
+    SHAPES = [
+        (512, 64, 1, 128, 512, 64),
+        (1024, 64, 2, 128, 1024, 64),
+    ]
+
+
+@pytest.mark.parametrize(
+    "B, M, N, K_USER, K_CAND, ratio",
+    IkboLce.SHAPES,
+    ids=[f"B{s[0]}_M{s[1]}" for s in IkboLce.SHAPES],
+)
+def test_ikbo_lce(B, M, N, K_USER, K_CAND, ratio):
+    torch.manual_seed(0)
+    cw_c, cw_u, e_c, e_u, idx = _ikbo_lce_create_inputs(
+        B,
+        M,
+        N,
+        K_USER,
+        K_CAND,
+        ratio,
+        device=DEVICE,
+    )
+    ref_fp32 = _ikbo_lce_reference(
+        cw_c.float(),
+        cw_u.float(),
+        e_c.float(),
+        e_u.float(),
+        idx,
+    )
+    ref_fp16 = _ikbo_lce_reference(cw_c, cw_u, e_c, e_u, idx)
+    out = _ikbo_lce(cw_c, cw_u, e_c, e_u, idx)
+    IkboLce.check_vs_fp32(out, ref_fp16, ref_fp32)
+
+
+@pytest.mark.parametrize(
+    "B, n_seed, num_heads, d_head, max_seq_len, ratio",
+    IkboFa.SHAPES,
+    ids=[f"B{s[0]}_h{s[2]}_d{s[3]}" for s in IkboFa.SHAPES],
+)
+def test_ikbo_fa(B, n_seed, num_heads, d_head, max_seq_len, ratio):
+    random.seed(0)
+    torch.manual_seed(0)
+    query, key, value, cand_to_user_index, cand_grid = _ikbo_fa_create_inputs(
+        B,
+        n_seed,
+        num_heads,
+        d_head,
+        max_seq_len,
+        cand_to_user_ratio=ratio,
+        device=DEVICE,
+    )
+    ref_out = _ikbo_fa_reference(
+        query,
+        key,
+        value,
+        cand_to_user_index,
+        n_seed,
+        num_heads,
+        d_head,
+        max_seq_len,
+    )
+    tri_out = _ikbo_fa(
+        query,
+        key,
+        value,
+        cand_to_user_index,
+        cand_grid,
+        n_seed,
+        num_heads,
+        d_head,
+        max_seq_len,
+    )
+    torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
