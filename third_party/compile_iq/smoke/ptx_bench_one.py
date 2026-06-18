@@ -27,14 +27,17 @@ PTXAS = None  # resolved in main()
 
 
 def _run_and_snapshot(ptx, spec, acf_path):
-    """ptxas(ptx[,acf]) -> cubin -> launch with fresh (deterministic) tensors -> return (kernel, tensors)."""
+    """ptxas(ptx[,acf]) -> cubin -> launch with fresh (deterministic) tensors -> return
+    (kernel, tensors, kernel_args, tensormaps). `tensormaps` (the PyCUtensorMap objects backing any TMA
+    descriptors) MUST be kept alive by the caller while it benchmarks via k.launch(...)."""
     cubin = L.ptxas_compile(ptx, PTXAS, arch=spec["arch"], acf_path=acf_path)
     k = L.load_cubin(cubin, spec["entry"], spec["shared"])
     tensors = L.alloc_tensors(spec, seed=0)
-    ka = L.kernel_args_from_spec(spec, tensors)
+    tms, addrs = L.build_tensormaps(spec, tensors)  # [] for non-TMA kernels
+    ka = L.kernel_args_from_spec(spec, tensors, addrs)
     k.launch(spec["grid"], spec["block"], ka)
     torch.cuda.synchronize()
-    return k, tensors, ka
+    return k, tensors, ka, tms
 
 
 def main():
@@ -52,10 +55,11 @@ def main():
 
     try:
         # 1) baseline reference (no ACF).
-        _, ref_tensors, _ = _run_and_snapshot(ptx, spec, None)
+        _, ref_tensors, _, _tms0 = _run_and_snapshot(ptx, spec, None)
         ref = [t.detach().clone() for t in ref_tensors]
-        # 2) candidate run (with ACF, or baseline again when acf is NONE).
-        k, tensors, ka = _run_and_snapshot(ptx, spec, acf_path)
+        # 2) candidate run (with ACF, or baseline again when acf is NONE). Keep `tms` alive: the TMA
+        #    descriptors it holds are referenced by `ka` for the duration of the benchmark below.
+        k, tensors, ka, tms = _run_and_snapshot(ptx, spec, acf_path)
         # 3) self-consistency: the ACF must not change any buffer beyond tolerance.
         for r, cur in zip(ref, tensors):
             denom = max(r.float().abs().max().item(), 1e-9)
@@ -66,6 +70,7 @@ def main():
         # 4) benchmark the candidate launch.
         ms = triton.testing.do_bench(lambda: k.launch(spec["grid"], spec["block"], ka), warmup=warmup, rep=rep,
                                      return_mode="mean")
+        del tms
         print(f"MS {ms}")
     except Exception as e:
         sys.stderr.write(f"[ptx_bench_one] {type(e).__name__}: {e}\n")

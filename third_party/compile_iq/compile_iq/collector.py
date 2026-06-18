@@ -32,19 +32,32 @@ def _dtype_str(dt) -> str:
 
 
 def _ordered_args(bound_args, constexpr_names):
-    """Classify each bound arg (in order) for build_spec: constexpr / tensor / scalar."""
+    """Classify each bound arg (in order) for build_spec: constexpr / tensor / tensordesc / scalar."""
     import torch
     ordered = []
     for name, val in bound_args.items():
         if name in constexpr_names:
             ordered.append(("constexpr", ))
         elif isinstance(val, torch.Tensor):
-            ordered.append(
-                ("tensor", {"shape": list(val.shape), "dtype": _dtype_str(val.dtype), "strides": list(val.stride())}))
+            ordered.append(("tensor", {
+                "id": val.data_ptr(), "shape": list(val.shape), "dtype": _dtype_str(val.dtype), "strides":
+                list(val.stride())
+            }))
+        elif type(val).__name__ == "TensorDescriptor":  # host-side TMA descriptor (no hard import)
+            base = val.base
+            ordered.append(("tensordesc", {
+                "base": {
+                    "id": base.data_ptr(), "shape": list(base.shape), "dtype": _dtype_str(base.dtype), "strides":
+                    list(base.stride())
+                },
+                "desc_shape": list(val.shape),
+                "desc_strides": list(val.strides),
+                "block_shape": list(val.block_shape),
+                "padding": 1 if getattr(val, "padding", "zero") == "nan" else 0,
+            }))
         elif isinstance(val, (bool, int, float)):
             ordered.append(("scalar", val))
         else:
-            # e.g. TensorDescriptor / other -- not expressible in the spec yet -> skip collection.
             raise NotImplementedError(f"unsupported arg type {type(val).__name__} for {name!r}")
     return ordered
 
