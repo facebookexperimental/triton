@@ -13,7 +13,6 @@
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
-#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "ttg-utility"
@@ -70,28 +69,17 @@ SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
       }
     }
 
-    // Fail loudly: an opt build skips the assert and returns {0,0,0}, causing
-    // silent div-by-zero/garbage downstream.
-    llvm::report_fatal_error(
-        "MMAv3 instrShape: no valid instrN found for the given BLOCK_N/dtype");
+    assert(false && "type not supported");
+    return {0, 0, 0};
   } else if (version == 5) {
     unsigned m = shape[0] >= 128 ? 128 : 64;
+    // Right now default to distributing along N. TODO: For cases where we have
+    // dot followed by reduction we need to be able to distribute along M.
+    //    if (numWarps > 4)
+    //      m = 64;
+    unsigned n = shape[1] >= 256 ? 256 : shape[1];
     unsigned k = 256 / eltType.getIntOrFloatBitWidth();
-
-    // Pow2: largest instrN <= 256 (legacy path, unchanged). NPOT: largest
-    // multiple-of-8 in [8,256] that divides BLOCK_N.
-    static const bool allowNpot =
-        triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
-    if (!allowNpot) {
-      unsigned n = shape[1] >= 256 ? 256 : shape[1];
-      return {m, n, k};
-    }
-    for (unsigned n = 256; n >= 8; n -= 8)
-      if (shape[1] % n == 0)
-        return {m, n, k};
-    // Fail loudly: an opt build skips the assert and returns {0,0,0}.
-    llvm::report_fatal_error(
-        "MMAv5 instrShape: no valid instrN (BLOCK_N must be a multiple of 8)");
+    return {m, n, k};
   } else {
     assert(false && "version not supported");
     return {0, 0};
@@ -146,14 +134,11 @@ unsigned getNumElementsPerThread(Operation *op, SmallVector<unsigned> order,
   unsigned maxMultiple = std::max(maxMultipleBytes / elemNumBytes, 1u);
   unsigned maxContig =
       std::min(valInfo.getContiguity(order[0]), shapePerCTA[order[0]]);
-  // For NPOT contiguity, use the largest pow2 factor for sizePerThread.
-  unsigned pow2Contig = highestPowOf2Divisor(maxContig);
-  unsigned alignment = std::min(maxMultiple, pow2Contig);
+  unsigned alignment = std::min(maxMultiple, maxContig);
   unsigned currPerThread = std::min(alignment, 128 / elemNumBits);
   LDBG("elemNumBytes: " << elemNumBytes
                         << ", divisibility: " << maxMultipleBytes
                         << ", contig: " << valInfo.getContiguity(order[0])
-                        << ", pow2Contig: " << pow2Contig
                         << ", alignment: " << alignment);
   return currPerThread;
 }

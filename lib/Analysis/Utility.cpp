@@ -17,7 +17,6 @@
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/SmallSet.h"
-#include "llvm/Support/MathExtras.h"
 
 namespace mlir {
 
@@ -160,10 +159,6 @@ SmallVector<unsigned> ReduceOpHelper::getScratchRepShape() {
 
 unsigned ReduceOpHelper::getScratchSizeInBytes() {
   auto smemShape = getScratchRepShape();
-  // Pad reduction axis to pow2 for NPOT inter-warp reads.
-  if (!smemShape.empty() && smemShape[axis] > 0 &&
-      !llvm::isPowerOf2_32(smemShape[axis]))
-    smemShape[axis] = llvm::NextPowerOf2(smemShape[axis]);
   auto elems = product<unsigned>(smemShape);
 
   unsigned bytesPerElem = 0;
@@ -961,13 +956,8 @@ bool supportMMA(triton::DotOp op, int version) {
     // If k size is smaller than the native mma size, we cannot use MMA.
     if (k < 256 / aElemTy.getIntOrFloatBitWidth())
       return false;
-    // NPOT: MMAv5 instrN allows any multiple of 8; pow2 keeps %16 so baseline
-    // N==8 dots don't flip MMAv2->MMAv5. NPOT N=24/40/... need %8.
-    static const bool allowNpot =
-        triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
-    unsigned nDiv = allowNpot ? 8 : 16;
     if (!(retShapePerCTA[rank - 2] % 64 == 0 &&
-          retShapePerCTA[rank - 1] % nDiv == 0))
+          retShapePerCTA[rank - 1] % 16 == 0))
       return false;
     return true;
   }

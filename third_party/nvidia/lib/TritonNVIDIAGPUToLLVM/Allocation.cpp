@@ -59,7 +59,7 @@ static unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
   auto [smem, _] = triton::gpu::optimalSwizzling(srcLayout, dstLayout, srcTiles,
                                                  dstTiles, bitwidth);
   auto reps = smem.getInDimSize(StringAttr::get(ctx, "reps"));
-  return smem.getTotalOutDimSizeProduct() / reps;
+  return smem.getTotalOutDimSize() / reps;
 }
 
 std::function<unsigned(Operation *)>
