@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=3 | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=3 smem-alloc-algo=0" | FileCheck %s
 
 // Test: When two SMEM buffers are in the same innermost loop, the memory
 // planner assigns both the same buffer.id (reuse group). The code partition

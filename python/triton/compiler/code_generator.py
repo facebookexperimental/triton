@@ -572,12 +572,19 @@ class CodeGenerator(ast.NodeVisitor):
             raise ValueError("nested comprehensions are not supported")
 
         comp = node.generators[0]
-        iter = self.visit(comp.iter)
-        if not isinstance(iter, tl_tuple):
-            raise NotImplementedError("only tuple comprehensions are supported")
+        if isinstance(comp.iter, ast.Call) and self.visit(comp.iter.func) is range:
+            args = [_unwrap_if_constexpr(self.visit(a)) for a in comp.iter.args]
+            items = [constexpr(i) for i in range(*args)]
+        else:
+            it = self.visit(comp.iter)
+            if not isinstance(it, tl_tuple):
+                raise NotImplementedError(
+                    "comprehension iterable must be a tuple or constexpr range(...)"
+                )
+            items = list(it)
 
         results = []
-        for item in iter:
+        for item in items:
             self.set_value(comp.target.id, item)
             results.append(self.visit(node.elt))
         return tl_tuple(results)

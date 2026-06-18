@@ -270,6 +270,26 @@ class Autotuner(KernelInterface):
             'early_config_prune': a function used to prune configs. It should have the signature
                 `prune_configs_by( configs: List[triton.Config], named_args: Dict[str, Any], **kwargs: Dict[str, Any]) -> List[triton.Config]:`
                 and return pruned configs. It should return at least one config.
+            'ir_config_prune': a function used to prune configs by inspecting each config's
+                *compiled artifact* (TTGIR/PTX). Unlike 'early_config_prune', which runs before any
+                compilation, this hook runs *after each config has been benchmarked*, reusing the
+                CompiledKernel the benchmark already produced (no extra compilation), so it can
+                filter on the generated IR. A config the predicate rejects is pruned by marking its
+                timing invalid (it can no longer be selected). Signature:
+                `ir_config_prune(config: triton.Config, asm: Dict[str, str], metadata) -> bool`
+                returning True to KEEP the config. `asm` is the CompiledKernel.asm dict (keys such
+                as 'ttir', 'ttgir', 'llir', 'ptx'); `metadata` is CompiledKernel.metadata. The
+                predicate MAY take an optional 4th argument
+                `ir_config_prune(config, asm, metadata, reference)` where `reference` is the
+                `(config, asm, metadata)` of the reference config (by default the first surviving
+                config); equivalence-style checks compare each config against it instead of relying
+                on call order.
+
+                This is the single IR-based pruning hook. Static bitwise-equivalence pruning (keep
+                only configs whose compiled IR matches a reference order, at TTGIR and/or PTX level)
+                can be layered on top of it by adapting a per-config equivalence *key* into an
+                `ir_config_prune` predicate. Triton core stays decoupled — such equivalence
+                checkers live outside core, not here.
         """
         if not configs:
             self.configs = [Config({}, num_warps=4, num_stages=3, num_ctas=1)]
@@ -321,10 +341,20 @@ class Autotuner(KernelInterface):
         self.perf_model = None
         self.configs_top_k = 1.0
         self.early_config_prune = None
+        self.ir_config_prune = None
         if prune_configs_by:
             self.perf_model = prune_configs_by.get("perf_model", self.perf_model)
             self.configs_top_k = prune_configs_by.get("top_k", self.configs_top_k)
             self.early_config_prune = prune_configs_by.get("early_config_prune", self.early_config_prune)
+            self.ir_config_prune = prune_configs_by.get("ir_config_prune", self.ir_config_prune)
+
+        # {Config: reason} for configs dropped by ir_config_prune (IR-based pruning, incl.
+        # static bitwise-equivalence pruning built on top of it in bitequiv). The number of
+        # configs pruned on the last tuning run is `len(<autotuned_kernel>.pruned_by_ir)`.
+        self.pruned_by_ir: Dict[Config, str] = {}
+        # The CompiledKernel produced by the most recent `_bench` launch, captured so the
+        # post-bench IR prune can inspect each config's artifact without recompiling.
+        self._last_compiled_kernel = None
 
         self.fn = fn
         self.base_fn = fn
@@ -439,6 +469,14 @@ class Autotuner(KernelInterface):
         return entropy_benchmarker
 
     def _bench(self, *args, config, **meta):
+        """Benchmark one config and return its timing ``[median, p20, p80]`` (``inf`` on
+        failure). As a side effect, records the config's ``CompiledKernel`` on
+        ``self._last_compiled_kernel`` (``None`` if it could not be compiled/launched) so the
+        post-bench IR prune can read its artifacts without recompiling. That kernel is the return
+        value of ``self.fn.run`` (jit.py fuses compile + launch), the only point a config's
+        compiled artifact surfaces — see the DESIGN NOTE in ``run``'s ``benchmark`` closure.
+        Return value unchanged.
+        """
         from ..compiler.errors import CompileTimeAssertionFailure
 
         verbose = knobs.autotuning.print
@@ -455,12 +493,16 @@ class Autotuner(KernelInterface):
         current = dict(meta, **config.all_kwargs())
         full_nargs = {**self.nargs, **current}
 
+        # Capture the CompiledKernel the launch returns (run(...) returns it even on a normal
+        # launch). `_bench` calls self.fn.run directly, so this is a CompiledKernel with `.asm`.
+        captured = []
+
         def kernel_call():
             if config.pre_hook:
                 config.pre_hook(full_nargs)
             self.pre_hook(full_nargs)
             try:
-                self.fn.run(
+                kernel = self.fn.run(
                     *args,
                     **current,
                 )
@@ -471,14 +513,19 @@ class Autotuner(KernelInterface):
                     # Throw exception raised by `self.fn.run`
                     raise
 
+            if kernel is not None:
+                captured.append(kernel)
             self.post_hook(full_nargs, exception=None)
 
+        self._last_compiled_kernel = None
         try:
-            return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+            timing = self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
         except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as e:
             if verbose:
                 print(f"Autotuning failed with {e}")
             return [float("inf"), float("inf"), float("inf")]
+        self._last_compiled_kernel = captured[-1] if captured else None
+        return timing
 
     def check_disk_cache(self, tuning_key, configs, bench_fn):
         # We can't serialize prehooks, so just give up and run the benchmarks.
@@ -749,7 +796,31 @@ class Autotuner(KernelInterface):
 
                     # facebook end
                     bench_start = time.time()
-                    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                    timings = {}
+                    compiled = {}  # config -> CompiledKernel (captured during the bench launch)
+                    for config in pruned_configs:
+                        timings[config] = self._bench(*args, config=config, **kwargs)
+                        compiled[config] = self._last_compiled_kernel
+                    # IR-based pruning runs here, AFTER benchmarking, reusing each config's
+                    # already-compiled artifact (no extra compile); a rejected config is pruned
+                    # by marking its timing invalid (inf) so it cannot win.
+                    #
+                    # DESIGN NOTE — why this is a post-bench pass and not an inline per-config
+                    # prune (raised in review D107928110): compilation is not a discrete step the
+                    # autotuner controls. A config's compiled artifact (CompiledKernel.asm) only
+                    # becomes available as the return value of `self.fn.run(...)` in jit.py, which
+                    # *fuses* compile + launch (JITFunction.run: compile on cache miss, then
+                    # launch, then return the kernel). `_bench` captures it as a side effect on
+                    # `self._last_compiled_kernel`. So a config's IR exists only once it has been
+                    # compiled AND benchmarked; pruning it *before* timing would require a separate
+                    # compile pass that re-implements jit.py's run pipeline (deliberately avoided).
+                    # Folding this pass into the loop above (per-config inline) is a pure code-org
+                    # change and is doable, but must still thread the captured kernel + reference
+                    # config through the loop and preserve the "first finite-time config =
+                    # reference" and "at least one survivor" semantics — left as a separate pass on
+                    # purpose; touch with care.
+                    if self.ir_config_prune is not None:
+                        self._ir_prune_after_bench(pruned_configs, timings, compiled)
                     bench_end = time.time()
                     self.bench_time = bench_end - bench_start
                     # facebook begin T203283446
@@ -820,6 +891,51 @@ class Autotuner(KernelInterface):
         self.nargs = None
         self._full_nargs = None
         return ret
+
+    def _ir_prune_after_bench(self, configs: List[Config], timings: Dict, compiled: Dict) -> None:
+        """Apply ``ir_config_prune`` after benchmarking, reusing each config's already-compiled
+        artifact — no recompilation, no separate run-pipeline pass.
+
+        Inspects only configs that compiled and benchmarked with a finite time (``compiled[c]``
+        is a CompiledKernel and ``timings[c]`` is not ``inf``); a config the predicate rejects is
+        pruned by setting ``timings[c] = [inf, inf, inf]`` so it cannot win, and recorded in
+        ``self.pruned_by_ir``.
+
+        The predicate is ``ir_config_prune(config, asm, metadata) -> bool`` (True KEEPs). It may
+        also take an optional 4th argument ``reference`` — the ``(config, asm, metadata)`` of the
+        reference config (by default the first surviving config) — so equivalence-style checks can
+        compare each config against a fixed reference instead of relying on call order.
+
+        The pruned configs are recorded in ``self.pruned_by_ir``; the prune count for the run is
+        ``len(self.pruned_by_ir)``.
+        """
+        self.pruned_by_ir = {}
+        prune = self.ir_config_prune
+        inf = float("inf")
+        # Only configs that compiled and timed finitely have an artifact worth checking.
+        items = [(c, compiled[c].asm, compiled[c].metadata)
+                 for c in configs
+                 if compiled.get(c) is not None and timings[c][0] != inf]
+        if not items:
+            return
+        reference = items[0]  # default reference = first surviving (finite-time) config
+        try:
+            accepts_reference = len(inspect.signature(prune).parameters) >= 4
+        except (TypeError, ValueError):
+            accepts_reference = False
+
+        for config, asm, metadata in items:
+            try:
+                keep = bool(
+                    prune(config, asm, metadata, reference) if accepts_reference else prune(config, asm, metadata))
+            except Exception as e:
+                raise AutotunerError(f"`ir_config_prune` raised on config {config}: {type(e).__name__}: {e}") from e
+            if not keep:
+                timings[config] = [inf, inf, inf]  # mark invalid so it can't be selected
+                self.pruned_by_ir[config] = "ir-prune"
+        if all(t[0] == inf for t in timings.values()):
+            raise AutotunerError("No valid autotuner configs after IR pruning. "
+                                 "`ir_config_prune` should keep at least one config.")
 
     def prune_configs(self, kwargs: Dict) -> List[Config]:
         pruned_configs = self.configs

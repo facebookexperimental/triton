@@ -11,6 +11,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/MathExtras.h"
 
 #define DEBUG_TYPE "tritonamdgpu-block-pingpong"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -985,6 +986,28 @@ void Pingponger::getDotPingponged() {
         .Case<ttg::AsyncWaitOp>(
             [&](auto asyncOp) { asyncWaitOps.push_back(asyncOp); });
   });
+
+  // NPOT (non-power-of-2) dots are routed to the FMA path on AMD (see the
+  // AccelerateAMDMatmul NPOT gate) and their loads use the sync pipeline (see
+  // canBeConvertedToAsyncLoad), so the MFMA-oriented pingpong schedule does not
+  // apply and would crash on the NPOT shapes. Skip the loop if any dot has a
+  // non-power-of-2 operand/result shape. See T275979197.
+  auto hasNpotShape = [](Operation *op) {
+    auto isNpot = [](Type ty) {
+      auto t = dyn_cast<RankedTensorType>(ty);
+      return t && llvm::any_of(t.getShape(), [](int64_t d) {
+               return !llvm::isPowerOf2_64(d);
+             });
+    };
+    return llvm::any_of(op->getOperandTypes(), isNpot) ||
+           llvm::any_of(op->getResultTypes(), isNpot);
+  };
+  for (auto dotOp : dotOps)
+    if (hasNpotShape(dotOp.getOperation()))
+      return;
+  for (auto scaledDotOp : scaledDotOps)
+    if (hasNpotShape(scaledDotOp.getOperation()))
+      return;
 
   // Currently, pingpong scheduling is known as helpful under limited condition.
   // Individual conditions are checked while collecting each operation such as

@@ -511,12 +511,14 @@ private:
       function_ref<Interval<size_t>(Value value)> getLiveness) {
     for (auto valueBufferIter : allocation->valueBuffer) {
       auto value = valueBufferIter.first;
-      auto *buffer = valueBufferIter.second;
-      bufferRange[buffer] = getLiveness(value);
-      LLVM_DEBUG({
-        llvm::dbgs() << "-- buffer " << buffer->id << "; value: ";
-        value.dump();
-      });
+      // After #9314 a value can map to multiple buffers (partitioned tensors).
+      for (auto *buffer : valueBufferIter.second) {
+        bufferRange[buffer] = getLiveness(value);
+        LLVM_DEBUG({
+          llvm::dbgs() << "-- buffer " << buffer->id << "; value: ";
+          value.dump();
+        });
+      }
     }
   }
 
@@ -2277,7 +2279,9 @@ public:
     for (auto alloc : allocs) {
       // size is 0, alignment is default, offset is default
       allocation.addBuffer<BufferT::BufferKind::Explicit>(alloc, 0);
-      BufferT *tBuf = allocation.valueBuffer[alloc];
+      // addBuffer maps the value to a single explicit buffer; take it. (After
+      // #9314 valueBuffer maps to a SmallVector<BufferT *>.)
+      BufferT *tBuf = allocation.valueBuffer[alloc].back();
       auto iter1 = allocToSize.find(alloc.getOperation());
       tBuf->rowSize = iter1->second.numRows;
       tBuf->colSize = iter1->second.numCols;
@@ -2310,11 +2314,13 @@ public:
     }
 
     for (auto valueBufferIter : allocation.valueBuffer) {
-      auto *buffer = valueBufferIter.second;
-      // valueBuffer maps value to BufferT
+      // valueBuffer maps a value to its BufferT(s). After #9314 a value can map
+      // to multiple buffers (partitioned tensors), so iterate over all of them.
       Operation *alloc = valueBufferIter.first.getDefiningOp();
       // bufferRange maps BufferT to interval
-      bufferRange[buffer] = allocToIntervals[alloc];
+      for (auto *buffer : valueBufferIter.second) {
+        bufferRange[buffer] = allocToIntervals[alloc];
+      }
     }
     // For each innermost loop according to program order (via
     // getIntervalForCtrlOp)
@@ -3654,7 +3660,7 @@ LogicalResult readDecisionsFromFile(SmallVector<Channel *> &channels,
 LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
                               StringRef readDecisionFile = "",
                               StringRef writeDecisionFile = "",
-                              int smemAllocAlgo = 0, unsigned smemBudget = 0,
+                              int smemAllocAlgo = 1, unsigned smemBudget = 0,
                               bool smemCircularReuse = false) {
 
   // Step 1: collect all communications between producers and consumers.
@@ -3709,6 +3715,7 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
   int effectiveSmemAllocAlgo = smemAllocAlgo;
   unsigned effectiveSmemBudget = smemBudget;
   bool effectiveSmemCircularReuse = smemCircularReuse;
+  bool hasSmemAllocAlgoAttr = false;
   funcOp->walk([&](scf::ForOp forOp) {
     if (!forOp->hasAttr("tt.warp_specialize"))
       return;
@@ -3723,8 +3730,10 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
     // Apply from outermost to innermost (innermost wins).
     for (auto it = loopChain.rbegin(); it != loopChain.rend(); ++it) {
       auto loop = *it;
-      if (auto attr = loop->getAttrOfType<IntegerAttr>("tt.smem_alloc_algo"))
+      if (auto attr = loop->getAttrOfType<IntegerAttr>("tt.smem_alloc_algo")) {
         effectiveSmemAllocAlgo = attr.getInt();
+        hasSmemAllocAlgoAttr = true;
+      }
       if (auto attr = loop->getAttrOfType<IntegerAttr>("tt.smem_budget"))
         effectiveSmemBudget = static_cast<unsigned>(attr.getInt());
       if (auto attr = loop->getAttrOfType<BoolAttr>("tt.smem_circular_reuse"))
@@ -3736,6 +3745,7 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
   if (effectiveSmemAllocAlgo == 1) {
     // New WSBuffer-based SMEM allocation (Phases 1-5).
     LDBG("using SMEM allocation algorithm 1 (WSBuffer-based)"
+         << (hasSmemAllocAlgoAttr ? "" : "; default when not specified")
          << " smemBudget=" << effectiveSmemBudget
          << " smemCircularReuse=" << effectiveSmemCircularReuse);
     assert(effectiveSmemBudget != 0 && "smem budget is not set");

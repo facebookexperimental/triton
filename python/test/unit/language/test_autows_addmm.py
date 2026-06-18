@@ -46,7 +46,6 @@ def addmm_kernel_tma_persistent_ws(
     A_COL_MAJOR: tl.constexpr,
     B_COL_MAJOR: tl.constexpr,
     DATA_PARTITION_FACTOR: tl.constexpr,
-    SMEM_ALLOC_ALGO: tl.constexpr,
 ):
     """Persistent TMA addmm (bias + matmul) with warp specialization."""
     dtype = tl.float16
@@ -66,7 +65,6 @@ def addmm_kernel_tma_persistent_ws(
             warp_specialize=True,
             disallow_acc_multi_buffer=True,
             data_partition_factor=DATA_PARTITION_FACTOR,
-            smem_alloc_algo=SMEM_ALLOC_ALGO,
             separate_epilogue_store=True,
     ):
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
@@ -106,7 +104,6 @@ def addmm_kernel_tma_persistent_ws(
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
-@pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
 @pytest.mark.parametrize("generate_subtiled_region", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_autows_addmm_tma_persistent(
@@ -123,7 +120,6 @@ def test_autows_addmm_tma_persistent(
     A_col_major,
     B_col_major,
     DATA_PARTITION_FACTOR,
-    SMEM_ALLOC_ALGO,
     generate_subtiled_region,
 ):
     """Test addmm kernel (bias + matmul) with warp_specialize=True."""
@@ -136,9 +132,6 @@ def test_autows_addmm_tma_persistent(
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
-
-    if BLOCK_SIZE_M == 256 and not FLATTEN and SMEM_ALLOC_ALGO == 0:
-        pytest.skip("Out of resources: shared memory exceeded")
 
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
@@ -210,7 +203,6 @@ def test_autows_addmm_tma_persistent(
             A_COL_MAJOR=A_col_major,
             B_COL_MAJOR=B_col_major,
             DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
-            SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
             num_stages=num_stages,
             num_warps=num_warps,
             generate_subtiled_region=generate_subtiled_region,

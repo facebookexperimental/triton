@@ -70,6 +70,11 @@ _EXAMPLES = [
     "08_reduction_order_numerics.py",
     "09_dot_to_mma_lowering.py",
     "10_mma_precision_numerics.py",
+    "11_coalesce_load_types.py",
+    "12_inner_tree_reduction.py",
+    "13_mma_hopper_vs_blackwell.py",
+    "14_mma_tensorcore_vs_fma.py",
+    "15_mma_multi_instruction.py",
 ]
 
 # Tutorials that demonstrate a single named compiler pass via the dump_passes /
@@ -85,6 +90,11 @@ _PASS_DIFF_EXAMPLES = {
     "06_warp_specialization.py",
     "07_reduction_lowering.py",
     "09_dot_to_mma_lowering.py",
+    "11_coalesce_load_types.py",
+    "12_inner_tree_reduction.py",
+    "13_mma_hopper_vs_blackwell.py",
+    "14_mma_tensorcore_vs_fma.py",
+    "15_mma_multi_instruction.py",
 }
 
 

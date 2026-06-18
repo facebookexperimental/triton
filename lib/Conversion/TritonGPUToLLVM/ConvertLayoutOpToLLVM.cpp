@@ -50,9 +50,12 @@ struct ConvertLayoutOpConversion
     StringAttr kLane = str_attr("lane");
     StringAttr kRegister = str_attr("register");
 
+    auto dims = conversion.getInDimNames();
+    bool alwaysUseWarpShuffle = cvtAlwaysUseWarpShuffle(op);
+    assert(!alwaysUseWarpShuffle || (!llvm::is_contained(dims, kBlock) &&
+                                     !llvm::is_contained(dims, kWarp)));
     assert(to_vector(conversion.getInDimNames()) ==
            to_vector(conversion.getOutDimNames()));
-    auto dims = conversion.getInDimNames();
     if (llvm::is_contained(dims, kBlock)) {
       // Case 1: Transfer between values in different CTAs.
       //          This requires moving values through distributed shared memory.
@@ -67,7 +70,7 @@ struct ConvertLayoutOpConversion
       // Case 3. Transfer between values in the same warp, in which case we try
       //         to move values using warp shuffles, though if the pattern is
       //         expensive enough we fall back to using shared memory
-      if (cvtNeedsWarpShuffle(srcTy, dstTy))
+      if (cvtNeedsWarpShuffle(srcTy, dstTy) || alwaysUseWarpShuffle)
         return transferWithinWarp(op, adaptor, rewriter);
 
       transferWithinBlockSwizzling(op, adaptor.getSrc(), rewriter);
@@ -178,59 +181,76 @@ struct ConvertLayoutOpConversion
     auto totalLoadCvt = dstLayout.invertAndCompose(smem);
 
     // The permutation exists by construction of the reps dimension in
-    // optimalSwizzling
-    auto permStore =
-        regPermForDivide(totalStoreCvt, reps, /*left=*/false).value();
-    totalStoreCvt = permStore.apply(totalStoreCvt);
-    auto permutedInVals = permStore.apply(inVals);
-    auto permLoad =
-        regPermForDivide(totalLoadCvt, reps, /*left=*/false).value();
-    totalLoadCvt = permLoad.apply(totalLoadCvt);
+    // optimalSwizzling for pow2 layouts. For NPOT (modular) layouts the
+    // reps division may fail; fall back to a single-rep path.
+    auto maybePermStore = regPermForDivide(totalStoreCvt, reps, /*left=*/false);
+    auto maybePermLoad = regPermForDivide(totalLoadCvt, reps, /*left=*/false);
+    if (maybePermStore.has_value() && maybePermLoad.has_value()) {
+      auto permStore = *maybePermStore;
+      auto permLoad = *maybePermLoad;
+      auto permStoreCvt = permStore.apply(totalStoreCvt);
+      auto permLoadCvt = permLoad.apply(totalLoadCvt);
+      auto maybeSCvt = divideRight(permStoreCvt, reps);
+      auto maybeLCvt = divideRight(permLoadCvt, reps);
+      if (maybeSCvt && maybeLCvt) {
+        auto permutedInVals = permStore.apply(inVals);
 
-    // Remove the reps and flatten into offset
-    auto storeCvt = *divideRight(totalStoreCvt, reps);
-    auto loadCvt = *divideRight(totalLoadCvt, reps);
-    auto kOffset = str_attr("offset");
-    storeCvt = storeCvt.reshapeOuts({{kOffset, storeCvt.getTotalOutDimSize()}});
-    loadCvt = loadCvt.reshapeOuts({{kOffset, loadCvt.getTotalOutDimSize()}});
+        // Remove the reps and flatten into offset
+        auto storeCvt = *maybeSCvt;
+        auto loadCvt = *maybeLCvt;
+        auto kOffset = str_attr("offset");
+        storeCvt = storeCvt.reshapeOuts(
+            {{kOffset,
+              static_cast<int32_t>(storeCvt.getTotalOutDimSizeProduct())}});
+        loadCvt = loadCvt.reshapeOuts(
+            {{kOffset,
+              static_cast<int32_t>(loadCvt.getTotalOutDimSizeProduct())}});
 
-    auto tileSize = storeCvt.getInDimSize(kReg);
+        auto tileSize = storeCvt.getInDimSize(kReg);
 
-    assert(permutedInVals.size() == tileSize * nReps);
-    SmallVector<Value> outVals;
-    auto affineOffset = b.i32_val(0);
-    auto maskSpanAffineOffset = 0;
+        assert(permutedInVals.size() == tileSize * nReps);
+        SmallVector<Value> outVals;
+        auto affineOffset = b.i32_val(0);
+        auto maskSpanAffineOffset = 0;
 
-    bool isWarpSync = mlir::isCvtWarpSync(srcLayout, dstLayout);
-    for (int i = 0; i < nReps; ++i) {
-      if (i > 0) {
-        if (isWarpSync) {
-          targetInfo.warpSync(loc, rewriter);
-        } else {
-          targetInfo.barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
+        bool isWarpSync = mlir::isCvtWarpSync(srcLayout, dstLayout);
+        auto syncBarrier = [&]() {
+          if (isWarpSync) {
+            targetInfo.warpSync(loc, rewriter);
+          } else {
+            targetInfo.barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
+          }
+        };
+        for (int i = 0; i < nReps; ++i) {
+          if (i > 0) {
+            syncBarrier();
+          }
+
+          auto tileInVals =
+              ArrayRef<Value>(permutedInVals).slice(i * tileSize, tileSize);
+          // Store
+          lowerLdStShared(loc, ctx, storeCvt, tileInVals, llvmElemTy, smemBase,
+                          /*paddingShifts=*/{}, affineOffset,
+                          maskSpanAffineOffset, rewriter, targetInfo);
+          syncBarrier();
+          // Load
+          SmallVector<Value> tileOutVals =
+              lowerLdStShared(loc, ctx, loadCvt, {}, llvmElemTy, smemBase,
+                              /*paddingShifts=*/{}, affineOffset,
+                              maskSpanAffineOffset, rewriter, targetInfo);
+          llvm::append_range(outVals, tileOutVals);
         }
-      }
-      auto tileInVals =
-          ArrayRef<Value>(permutedInVals).slice(i * tileSize, tileSize);
-      // Store
-      lowerLdStShared(loc, ctx, storeCvt, tileInVals, llvmElemTy, smemBase,
-                      /*paddingShifts=*/{}, affineOffset, maskSpanAffineOffset,
-                      rewriter, targetInfo);
-      if (isWarpSync) {
-        targetInfo.warpSync(loc, rewriter);
-      } else {
-        targetInfo.barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
-      }
-      // Load
-      SmallVector<Value> tileOutVals = lowerLdStShared(
-          loc, ctx, loadCvt, {}, llvmElemTy, smemBase, /*paddingShifts=*/{},
-          affineOffset, maskSpanAffineOffset, rewriter, targetInfo);
-      llvm::append_range(outVals, tileOutVals);
-    }
 
-    // Undo the permLoad used to divideRight
-    outVals = permLoad.inverse().apply(outVals);
-    return outVals;
+        // Undo the permLoad used to divideRight
+        outVals = permLoad.inverse().apply(outVals);
+        return outVals;
+      }
+    }
+    // NPOT-only fallback: the swizzled rep-split above can't express a modular
+    // smem, so emit one unswizzled store+load pass. pow2 never reaches here.
+    return runNpotFallback(loc, rewriter, targetInfo, srcLayout, dstLayout,
+                           totalStoreCvt, totalLoadCvt, smem, inVals,
+                           llvmElemTy, smemBase);
   }
 
   void transferWithinBlockSwizzling(ConvertLayoutOp op, Value src,

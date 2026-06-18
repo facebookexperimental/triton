@@ -42,6 +42,47 @@ static Attribute getDummyLayoutFromType(Type type) {
   return nullptr;
 }
 
+/// Extract the no-verify layout attribute from a type, if present.
+static NoVerifyLayoutAttr getNoVerifyLayoutFromType(Type type) {
+  if (auto tensorType = dyn_cast<RankedTensorType>(type)) {
+    return dyn_cast_or_null<NoVerifyLayoutAttr>(tensorType.getEncoding());
+  }
+  if (auto memDescType = dyn_cast<ttg::MemDescType>(type)) {
+    return dyn_cast_or_null<NoVerifyLayoutAttr>(memDescType.getEncoding());
+  }
+  return nullptr;
+}
+
+static bool containsNoVerifyLayout(Type type);
+
+static bool containsNoVerifyLayout(Attribute attr) {
+  if (!attr)
+    return false;
+  if (isa_and_nonnull<NoVerifyLayoutAttr>(attr))
+    return true;
+
+  bool found = false;
+  attr.walkImmediateSubElements(
+      [&](Attribute nestedAttr) {
+        found |= containsNoVerifyLayout(nestedAttr);
+      },
+      [&](Type nestedType) { found |= containsNoVerifyLayout(nestedType); });
+  return found;
+}
+
+static bool containsNoVerifyLayout(Type type) {
+  if (!type)
+    return false;
+  if (getNoVerifyLayoutFromType(type))
+    return true;
+
+  bool found = false;
+  type.walkImmediateSubElements(
+      [&](Attribute attr) { found |= containsNoVerifyLayout(attr); },
+      [&](Type nestedType) { found |= containsNoVerifyLayout(nestedType); });
+  return found;
+}
+
 /// Compute the resolved layout for a dummy register layout.
 /// If tmemCompatible is true, creates a TMEM-compatible register layout using
 /// getTmemCompatibleLayout. Otherwise, creates a default
@@ -144,30 +185,89 @@ static void replaceTypeWithNewEncoding(Value value, Attribute newEncoding) {
   value.setType(newType);
 }
 
-LogicalResult resolvePlaceholderLayouts(ModuleOp moduleOp) {
-  // Collect all values that have dummy layouts
-  DenseMap<Value, Attribute> valuesToResolve;
-  DenseMap<Value, Attribute> valuesToRefTMEMLayoutMap;
-
+static void
+collectValuesWithEncodings(ModuleOp moduleOp,
+                           function_ref<Attribute(Type)> getEncoding,
+                           DenseMap<Value, Attribute> &valuesToResolve) {
+  // Check module-like op results and nested op results.
   moduleOp.walk([&](Operation *op) {
-    // Check all result types for dummy layouts
     for (Value result : op->getResults()) {
-      if (Attribute dummyLayout = getDummyLayoutFromType(result.getType())) {
-        valuesToResolve.try_emplace(result, dummyLayout);
-      }
+      if (Attribute layout = getEncoding(result.getType()))
+        valuesToResolve.try_emplace(result, layout);
     }
 
-    // Check block arguments in all regions (for ops like WarpSpecializeOp)
+    // Check block arguments in all regions (for ops like WarpSpecializeOp).
     for (Region &region : op->getRegions()) {
       for (Block &block : region) {
         for (BlockArgument arg : block.getArguments()) {
-          if (Attribute dummyLayout = getDummyLayoutFromType(arg.getType())) {
-            valuesToResolve.try_emplace(arg, dummyLayout);
-          }
+          if (Attribute layout = getEncoding(arg.getType()))
+            valuesToResolve.try_emplace(arg, layout);
         }
       }
     }
   });
+}
+
+static LogicalResult unwrapNoVerifyLayouts(ModuleOp moduleOp) {
+  DenseMap<Value, Attribute> valuesToUnwrap;
+  collectValuesWithEncodings(
+      moduleOp,
+      [](Type type) -> Attribute { return getNoVerifyLayoutFromType(type); },
+      valuesToUnwrap);
+
+  for (auto &[value, layout] : valuesToUnwrap) {
+    auto noVerifyLayout = cast<NoVerifyLayoutAttr>(layout);
+    LLVM_DEBUG({
+      DBGS() << "Unwrapping no-verify layout: ";
+      noVerifyLayout.dump();
+      DBGS() << "  to: ";
+      noVerifyLayout.getLayout().dump();
+    });
+    replaceTypeWithNewEncoding(value, noVerifyLayout.getLayout());
+  }
+
+  bool foundResidualNoVerifyLayout = false;
+  auto checkType = [&](Type type, Operation *op) {
+    if (!containsNoVerifyLayout(type))
+      return;
+    foundResidualNoVerifyLayout = true;
+    op->emitError("unresolved TLX no-verify layout after placeholder "
+                  "layout resolution");
+  };
+  moduleOp.walk([&](Operation *op) {
+    for (Type type : op->getResultTypes())
+      checkType(type, op);
+    for (Region &region : op->getRegions()) {
+      for (Block &block : region) {
+        for (BlockArgument arg : block.getArguments()) {
+          if (containsNoVerifyLayout(arg.getType())) {
+            foundResidualNoVerifyLayout = true;
+            op->emitError("unresolved TLX no-verify layout on block argument "
+                          "after placeholder layout resolution");
+          }
+        }
+      }
+    }
+    for (NamedAttribute attr : op->getAttrs()) {
+      if (containsNoVerifyLayout(attr.getValue())) {
+        foundResidualNoVerifyLayout = true;
+        op->emitError("unresolved TLX no-verify layout in operation attribute "
+                      "after placeholder layout resolution");
+      }
+    }
+  });
+
+  return failure(foundResidualNoVerifyLayout);
+}
+
+LogicalResult resolvePlaceholderLayouts(ModuleOp moduleOp) {
+  if (failed(unwrapNoVerifyLayouts(moduleOp)))
+    return failure();
+
+  // Collect all values that have dummy layouts
+  DenseMap<Value, Attribute> valuesToResolve;
+  DenseMap<Value, Attribute> valuesToRefTMEMLayoutMap;
+  collectValuesWithEncodings(moduleOp, getDummyLayoutFromType, valuesToResolve);
 
   moduleOp.walk([&](Operation *op) {
     if (auto tmemLdOp = dyn_cast<ttng::TMEMLoadOp>(op)) {

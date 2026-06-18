@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file --nvgpu-test-ws-memory-planner=num-buffers=3 | FileCheck %s
+// RUN: triton-opt %s -split-input-file --nvgpu-test-ws-memory-planner="num-buffers=3 smem-alloc-algo=0" | FileCheck %s
 
 // Test: Persistent GEMM with data_partition_factor=2 produces two separate
 // tmem_loads, each with a 4-way split epilogue. The 4 epilogue SMEM buffers

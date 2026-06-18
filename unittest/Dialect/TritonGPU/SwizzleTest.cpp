@@ -276,6 +276,94 @@ TEST_F(SwizzleTest, Test128x128F16Transpose) {
   EXPECT_EQ(w, 0);
 }
 
+TEST_F(SwizzleTest, TestMixed48x64Bf16) {
+  // dim0=48 (NPOT), dim1=64 (pow2). Verify mixed swizzle path works.
+  LinearLayout src(
+      {{S("register"), {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {32, 0}}},
+       {S("lane"), {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}}},
+       {S("warp"), {{0, 32}}}},
+      {{S("dim0"), 48}, {S("dim1"), 64}}, /*requireSurjective=*/true);
+  LinearLayout dst(
+      {{S("register"), {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}, {0, 32}}},
+       {S("lane"), {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}}},
+       {S("warp"), {{32, 0}}}},
+      {{S("dim0"), 48}, {S("dim1"), 64}}, /*requireSurjective=*/true);
+
+  auto smem = optimalSwizzlingLdSt(src, dst, /*bitwidth=*/16);
+  EXPECT_TRUE(smem.hasInDim(S("vector")));
+  EXPECT_TRUE(smem.hasInDim(S("segment")));
+  EXPECT_TRUE(smem.hasOutDim(S("dim0")));
+  EXPECT_TRUE(smem.hasOutDim(S("dim1")));
+  EXPECT_TRUE(smem.isSurjective());
+
+  // Verify bank bases have non-zero NPOT (dim0) components — Z/r coupling
+  auto bankBases = smem.getBases().lookup(S("bank"));
+  int dim0Idx = smem.getOutDimIndex(S("dim0"));
+  bool hasCoupling = false;
+  for (auto &basis : bankBases)
+    hasCoupling |= (basis[dim0Idx] != 0);
+  EXPECT_TRUE(hasCoupling);
+}
+
+TEST_F(SwizzleTest, TestAllNpot48x48Bf16) {
+  // Both dims NPOT. Verify all-NPOT path returns valid layout.
+  LinearLayout src(
+      {{S("register"), {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {32, 0}}},
+       {S("lane"), {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}}},
+       {S("warp"), {{0, 32}}}},
+      {{S("dim0"), 48}, {S("dim1"), 48}}, /*requireSurjective=*/true);
+  LinearLayout dst(
+      {{S("register"), {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}, {0, 32}}},
+       {S("lane"), {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}}},
+       {S("warp"), {{32, 0}}}},
+      {{S("dim0"), 48}, {S("dim1"), 48}}, /*requireSurjective=*/true);
+
+  auto smem = optimalSwizzlingLdSt(src, dst, /*bitwidth=*/16);
+  EXPECT_TRUE(smem.hasInDim(S("vector")));
+  EXPECT_TRUE(smem.hasInDim(S("segment")));
+  EXPECT_TRUE(smem.hasOutDim(S("dim0")));
+  EXPECT_TRUE(smem.hasOutDim(S("dim1")));
+  EXPECT_TRUE(smem.isSurjective());
+
+  // Verify cross-dim coupling: dim0 driver bases have non-zero dim1 components
+  auto segBases = smem.getBases().lookup(S("segment"));
+  int dim1Idx = smem.getOutDimIndex(S("dim1"));
+  bool hasCoupling = false;
+  for (auto &basis : segBases)
+    hasCoupling |= (basis[dim1Idx] != 0);
+  EXPECT_TRUE(hasCoupling);
+}
+
+TEST_F(SwizzleTest, TestMixed33x128Bf16) {
+  // dim0=33 (NPOT), dim1=128 (pow2). Verify bank/r coupling to the NPOT dim in
+  // the mixed path.
+  LinearLayout src(
+      {{S("register"), {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {32, 0}}},
+       {S("lane"), {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}}},
+       {S("warp"), {{0, 32}, {0, 64}}}},
+      {{S("dim0"), 33}, {S("dim1"), 128}}, /*requireSurjective=*/true);
+  LinearLayout dst(
+      {{S("register"), {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}, {0, 32}}},
+       {S("lane"), {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}}},
+       {S("warp"), {{32, 0}, {0, 64}}}},
+      {{S("dim0"), 33}, {S("dim1"), 128}}, /*requireSurjective=*/true);
+
+  auto smem = optimalSwizzlingLdSt(src, dst, /*bitwidth=*/16);
+  EXPECT_TRUE(smem.hasInDim(S("vector")));
+  EXPECT_TRUE(smem.hasInDim(S("segment")));
+  EXPECT_TRUE(smem.hasOutDim(S("dim0")));
+  EXPECT_TRUE(smem.hasOutDim(S("dim1")));
+  EXPECT_TRUE(smem.isSurjective());
+
+  // Verify bank bases have non-zero NPOT (dim0) components — Z/r coupling
+  auto bankBases = smem.getBases().lookup(S("bank"));
+  int dim0Idx = smem.getOutDimIndex(S("dim0"));
+  bool hasCoupling = false;
+  for (auto &basis : bankBases)
+    hasCoupling |= (basis[dim0Idx] != 0);
+  EXPECT_TRUE(hasCoupling);
+}
+
 TEST_F(BankConflictTest, bankConflicts) {
   using mlir::triton::gpu::DotOperandEncodingAttr;
 

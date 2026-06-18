@@ -14,6 +14,8 @@
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/StrUtil.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/MathExtras.h"
+#include <optional>
 
 #define DEBUG_TYPE "ttgpu_to_llvm"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -342,6 +344,9 @@ LLVM::LLVMFuncOp appendOrGetExternFuncOp(RewriterBase &rewriter, Operation *op,
 
 // Multiply a square layout with 1 input and output dimension with a vector
 Value matrixVectorProd(TritonLLVMOpBuilder &b, const LinearLayout &A, Value x);
+
+// Whether the convert layout should be forced to use warp shuffles.
+bool cvtAlwaysUseWarpShuffle(triton::gpu::ConvertLayoutOp cvt);
 } // namespace gpu
 
 } // namespace triton
@@ -441,6 +446,9 @@ Value linearize(RewriterBase &rewriter, Location loc, ArrayRef<Value> multiDim,
 
 size_t linearize(ArrayRef<unsigned> multiDim, ArrayRef<unsigned> shape,
                  ArrayRef<unsigned> order);
+
+GlobalOp getOrInsertGlobalConstant(RewriterBase &rewriter, ModuleOp module,
+                                   Type type, Attribute content, StringRef key);
 
 Value addStringToModule(Location loc, RewriterBase &rewriter, StringRef key,
                         StringRef content);
@@ -603,6 +611,62 @@ llvm::MapVector<StringAttr, int32_t> getAllFreeVarMasks(MLIRContext *ctx);
 
 llvm::MapVector<StringAttr, int32_t> getFreeVariableMasks(Type type);
 
+// Fold a urem(offset, N) wrap into `cvt` by reducing each register basis mod N,
+// so offsets >= N collide with their canonical counterparts during ld/st. Used
+// by the SM100 NPOT NVMMA path (npotBufBytes > 0, see D99120849). Returns cvt
+// unchanged for pow2 / single-out-dim mismatch / unsound reduced bases (see
+// tryReduceBasesModN).
+LinearLayout applyNpotUremFold(const LinearLayout &cvt, int64_t effectiveSize);
+
+// Single-rep store/load fallback for the swizzling lowerings when rep-divide
+// fails (typically NPOT). Reshapes the cvts to one `kOffset` dim, applies the
+// NPOT kernel-equivalence fold, then emits a store/barrier/load triple.
+// `srcLayout`/`dstLayout` pick warpSync vs barrier; `smem` is the fold ref.
+SmallVector<Value> runNpotFallback(
+    Location loc, RewriterBase &rewriter, const TargetInfoBase &targetInfo,
+    const triton::LinearLayout &srcLayout,
+    const triton::LinearLayout &dstLayout, triton::LinearLayout totalStoreCvt,
+    triton::LinearLayout totalLoadCvt, const triton::LinearLayout &smem,
+    ArrayRef<Value> inVals, Type llvmElemTy, Value smemBase);
+
+// For NPOT swizzled SMEM, reshape both layouts to split output dims (dim0,
+// contig_intra, contig_phase) so invertAndCompose uses one algebra per dim
+// (XOR for pow2, ADD+mod for NPOT); without it lstsqModular mishandles the
+// XOR-coupled swizzle bases. Returns nullopt when no split is needed (pow2
+// shape, non-NVMMAShared encoding, or no swizzle).
+
+// Result of a successful NPOT contiguous-dim split: the two layouts with the
+// NPOT contiguous dim decomposed into (intra, phase).
+struct SplitNpotLayouts {
+  LinearLayout smem;
+  LinearLayout other;
+};
+
+std::optional<SplitNpotLayouts>
+splitNpotContiguousDim(triton::gpu::MemDescType memDescTy,
+                       LinearLayout smemLayout, LinearLayout otherLayout);
+
+/// Clamp vec size for NPOT tensor dimensions.
+/// (a) Round down to pow2 for valid vector load/store widths.
+/// (b) Clamp to alignment implied by non-pow2 sizePerThread.
+/// No-op for pow2; runs before allow_npot is consulted - do not gate.
+inline unsigned clampVecSizeForNpot(unsigned vec, RankedTensorType tensorTy) {
+  if (!llvm::isPowerOf2_32(vec))
+    vec = 1u << llvm::Log2_32(vec);
+  if (!tensorTy)
+    return vec;
+  if (auto blocked =
+          dyn_cast<triton::gpu::BlockedEncodingAttr>(tensorTy.getEncoding())) {
+    auto contOrder = triton::gpu::getOrder(tensorTy);
+    unsigned spt = blocked.getSizePerThread()[contOrder[0]];
+    if (spt > 0 && !llvm::isPowerOf2_32(spt)) {
+      unsigned maxAligned = spt & (0u - spt);
+      vec = std::min(vec, maxAligned);
+    }
+  }
+  return vec;
+}
+
 inline bool isCanonicalIndex(unsigned index, unsigned freeVarMask) {
   return (index & freeVarMask) == 0;
 }
@@ -630,6 +694,14 @@ SmallVector<Value> inlineRegion(RewriterBase &rewriter, Region &region,
   return inlineRegionImpl(rewriter, region, args,
                           mlir::TypeID::get<TerminatorOp>(), loc);
 }
+
+// #prevBlock
+// if (condition) {
+//   #ifBlock
+// }
+// #thenBlock
+std::tuple</*prevBlock=*/Block *, /*ifBlock=*/Block *, /*thenBlock=*/Block *>
+createIfBlock(ConversionPatternRewriter &b, Location loc, Value cnd);
 
 void finalizeTensorAtomicResults(Operation *op, RankedTensorType tensorTy,
                                  ConversionPatternRewriter &rewriter,

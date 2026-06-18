@@ -167,7 +167,7 @@ The PTX ISA mandates:
 This means a kernel cannot selectively enable 2-CTA on some dots but not others
 (e.g., FA with 2-CTA on the main GEMM but 1-CTA on softmax). It must be all or
 nothing. This is enforced at compile time by `CheckMatmulTwoCTAs`, which emits an
-error if any MMA ops disagree on `two_ctas`.
+error if any matmul ops disagree on `two_ctas`.
 
 The `two_ctas` attribute flows through:
 
@@ -324,7 +324,13 @@ errors (`"Barrier init outside of the first block in function"`).
    `is_async` check alone was insufficient — warp-specialized TLX IR causes
    barrier placement errors even when the pass finds no ops to transform.
 
-5. **`TritonToTritonGPUPass.cpp` fix**: The `TritonDotPattern` was dropping
+5. **Per-MMA cross-CTA sync barriers**: When a loop contains multiple 2-CTA
+   MMAs, `Insert2CTASync` allocates one cross-CTA barrier slot per MMA. Reusing
+   one barrier for all MMAs in the loop would conflate independent MMA phases
+   and can deadlock. This is required by AutoWS data partitioning, where a
+   larger logical tile can be split into multiple MMA ops in the same loop.
+
+6. **`TritonToTritonGPUPass.cpp` fix**: The `TritonDotPattern` was dropping
    `two_ctas` when recreating `DotOp` during TTIR→TTGIR conversion. Fixed by
    explicitly copying the attribute.
 
@@ -438,16 +444,12 @@ buck2 run @fbcode//mode/opt -m ovr_config//triton:beta \
 
 ### Current Limitations
 
-1. **Single 2-CTA MMA per loop iteration**: Multiple 2-CTA MMAs in the same loop
-   would require separate cross-CTA barriers to avoid phase conflicts. The
-   compiler currently asserts if multiple 2-CTA MMAs are detected in the same
-   loop. FA-style multi-MMA loops are future work.
+1. **Single phase bit per per-MMA barrier**: `Insert2CTASync` uses one barrier
+   slot per MMA with `phase = (iv - lb) % 2`. This is enough for the current
+   pipeline pattern, but deeper or more complex pipelines may need
+   multi-buffered cross-CTA barriers.
 
-2. **Single barrier for phase tracking**: `Insert2CTASync` uses one barrier with
-   `phase = (iv - lb) % 2`. This is enough for the current pipeline pattern, but
-   deeper or more complex pipelines may need multi-buffered cross-CTA barriers.
-
-3. **Pair-aligned tile scheduler requirement**: In 2-CTA mode, CTAs launch in
+2. **Pair-aligned tile scheduler requirement**: In 2-CTA mode, CTAs launch in
    pairs and the paired CTAs must map to compatible logical tiles. For the
    persistent matmul schedule used in the addmm repro, the CTA pair must stay on
    the same `pid_n` and cover adjacent `pid_m` tiles, so an odd `grid_m` must be
@@ -455,19 +457,28 @@ buck2 run @fbcode//mode/opt -m ovr_config//triton:beta \
    boundary and break the B-sharing contract. The compiler currently cannot
    prove arbitrary user tile schedulers are pair-aligned.
 
-4. **`BLOCK_M < 128` falls back to 1-CTA**: When `BLOCK_M < 128`, the TMEM
+3. **`BLOCK_M < 128` falls back to 1-CTA**: When `BLOCK_M < 128`, the TMEM
    instruction shape is 64, which requires `TensorMemoryCTAMode::TwoCTA_LHS` or
    `TensorMemoryCTAMode::TwoCTA_RHS` instead of `DEFAULT`. The compiler currently
    emits a warning and falls back to 1-CTA MMA if `two_ctas=True` with
    `BLOCK_M < 128`.
 
-5. **`TCGen5MMAScaledOp` is not handled by the load transform**: The current
+4. **`TCGen5MMAScaledOp` is not handled by the load transform**: The current
    `Transform2CTALoads` implementation handles `TCGen5MMAOp`. The scaled variant
    still needs explicit support before scaled MMA can use this 2-CTA path.
 
-6. **Mixed 2-CTA per kernel is impossible**: The PTX ISA requires all tcgen05
+5. **Mixed 2-CTA per kernel is impossible**: The PTX ISA requires all tcgen05
    instructions in a kernel to use the same `cta_group`. FA with selective 2-CTA
    on only some dots is impossible; a kernel must use 2-CTA on all dots or none.
+
+6. **Dependent 2-CTA dot chains are rejected before lowering**: The current
+   implementation supports multiple independent 2-CTA MMAs in one loop,
+   including Auto-WS data partitioning. It does not yet support FA-style chains
+   where one 2-CTA `tt.dot` consumes a value derived from an earlier 2-CTA
+   `tt.dot` result. `CheckMatmulTwoCTAs` rejects this true data dependency while
+   it is still explicit in TTGIR, before dot lowering rewrites the computation
+   into TMEM alloc/load/store chains. `Transform2CTALoads` remains a mechanical
+   B-load split for already-legal 2-CTA MMAs.
 
 7. **Host-side TMA descriptor shape is updated through IR type metadata**:
    `Transform2CTALoads` supports host-side TMA by updating the function argument's
@@ -546,9 +557,9 @@ buck2 run @fbcode//mode/opt -m ovr_config//triton:beta \
    larger even-sized CGA-X shapes such as `ctas_per_cga=(4,1,1)`. Requiring
    Y/Z == 1 is reasonable, but extending beyond `(2,1,1)` remains future work.
 
-6. **Improve diagnostics**: Replace internal asserts for unsupported multi-MMA
-   loop patterns with user-facing compiler diagnostics if those cases can be
-   reached from normal user code.
+6. **Improve diagnostics**: Replace internal asserts for unsupported 2-CTA
+   patterns with user-facing compiler diagnostics if those cases can be reached
+   from normal user code.
 
 7. **Improve pointer-store epilogue support**: Either expand Meta WS
    `isEpilogueStoreOp` to recognize pointer stores, or handle the same-partition

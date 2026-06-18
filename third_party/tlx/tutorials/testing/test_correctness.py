@@ -54,13 +54,20 @@ from triton.language.extra.tlx.tutorials.amd_fa_pipelined import (
     attention as _amd_fa_pipelined, )
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul as _amd_tdm_gemm_pipelined, )
+from triton.language.extra.tlx.tutorials.amd_gemm_warp_pipeline import (
+    matmul as _amd_gemm_warp_pipeline, )
+from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
+    matmul as _amd_mxfp_gemm_tdm_pipelined,
+    pack_scale as _amd_mxfp_pack_scale,
+)
+from triton.tools.mxfp import MXScaleTensor
 
 from triton.language.extra.tlx.tutorials.testing.multi_cta_layer_norm import (
     multi_cta_layernorm as _multi_cta_layernorm,
     multi_cta_layernorm_2d as _multi_cta_layernorm_2d,
 )
 
-from triton._internal_testing import is_blackwell, is_hopper, is_hopper_or_newer, is_hip, is_hip_gfx1250
+from triton._internal_testing import is_blackwell, is_hopper, is_hopper_or_newer, is_hip, is_hip_cdna4, is_hip_gfx1250
 from triton.language.extra.tlx.tutorials.testing.gemm_shapes import BLACKWELL_GEMM_WS as _BLACKWELL_GEMM_WS_MORE_SHAPES
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -164,6 +171,26 @@ class Gemm:
             "BLOCK_M": 128,
             "BLOCK_N": 128,
             "BLOCK_K": 32,
+        },
+        "amd_gemm_warp_pipeline": {
+            "BLOCK_M": 256,
+            "BLOCK_N": 256,
+            "BLOCK_K": 32,
+            "GROUP_M": 8,
+            "NUM_BUFFERS": 3,
+            "num_warps": 8,
+        },
+        "amd_mxfp_gemm_tdm_pipelined": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 128,
+            "GROUP_SIZE_M": 8,
+            "NUM_BUFFERS": 2,
+            "DTYPE_A": "e5m2",
+            "DTYPE_B": "e5m2",
+            "SCALE_BLOCK": 32,
+            "num_warps": 4,
+            "waves_per_eu": 1,
         },
     }
 
@@ -912,6 +939,57 @@ def test_amd_fa_pipelined(config_name, causal):
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
 def test_amd_tdm_gemm_pipelined(dtype):
     Gemm.run_test(_amd_tdm_gemm_pipelined, Gemm.CONFIGS["amd_tdm_gemm_pipelined"], dtype=dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_gemm_warp_pipeline(dtype):
+    Gemm.run_test(_amd_gemm_warp_pipeline, Gemm.CONFIGS["amd_gemm_warp_pipeline"], dtype=dtype)
+
+
+# =============================================================================
+# AMD MXFP TDM GEMM Tests (gfx1250)
+# =============================================================================
+
+
+def _mxfp_e8m0_to_float32(scale):
+    scale = scale.view(torch.uint8).to(torch.int32)
+    scale = scale << 23
+    return scale.view(torch.float32)
+
+
+def _torch_gemm_mxfp(a, b, a_scale, b_scale, scale_block, M, N, K):
+    a_scale_f32 = _mxfp_e8m0_to_float32(a_scale).repeat_interleave(scale_block, dim=1)[:M, :K]
+    b_scale_f32 = _mxfp_e8m0_to_float32(b_scale).repeat_interleave(scale_block, dim=1).T.contiguous()[:K, :N]
+    return torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32)
+
+
+def _init_fp8_e5m2(rows, cols):
+    return torch.randint(20, 40, (rows, cols), dtype=torch.uint8).view(torch.float8_e5m2)
+
+
+@pytest.mark.parametrize("TRANSPOSE_B", [False, True])
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_amd_mxfp_gemm_tdm_pipelined(TRANSPOSE_B):
+    torch.manual_seed(0)
+    M = N = 256
+    K = 512
+    scale_block = Gemm.CONFIGS["amd_mxfp_gemm_tdm_pipelined"]["SCALE_BLOCK"]
+    a = _init_fp8_e5m2(M, K)
+    b = _init_fp8_e5m2(K, N)
+    a_scale = MXScaleTensor(size=(M, triton.cdiv(K, scale_block))).random(high=32.0).data
+    b_scale = MXScaleTensor(size=(N, triton.cdiv(K, scale_block))).random(high=32.0).data
+    ref = _torch_gemm_mxfp(a, b, a_scale, b_scale, scale_block, M, N, K)
+
+    a_scale = _amd_mxfp_pack_scale(a_scale)
+    b_scale = _amd_mxfp_pack_scale(b_scale)
+    a_d = a.contiguous().to(DEVICE)
+    b_d = (b.T.contiguous() if TRANSPOSE_B else b.contiguous()).to(DEVICE)
+
+    config = Gemm.CONFIGS["amd_mxfp_gemm_tdm_pipelined"].copy()
+    config["TRANSPOSE_B"] = TRANSPOSE_B
+    out = _amd_mxfp_gemm_tdm_pipelined(a_d, b_d, a_scale.to(DEVICE), b_scale.to(DEVICE), config=config)
+    torch.testing.assert_close(out.cpu(), ref, rtol=1e-5, atol=2e-2)
 
 
 # =============================================================================

@@ -762,7 +762,6 @@ def _attn_bwd_dkdv(
                 warp_specialize=True,
                 merge_epilogue_to_computation=True,
                 tmem_alloc_algo=2,
-                smem_alloc_algo=1,
                 smem_budget=200000,
         ):
             dk, dv, curr_m = _attn_bwd_dkdv_inner(
@@ -1201,7 +1200,6 @@ def _attn_bwd_persist(
             warp_specialize=True,
             merge_epilogue_to_computation=True,
             tmem_alloc_algo=2,
-            smem_alloc_algo=1,
             smem_budget=200000,
     ):
         pid = tile_idx % n_tile_num
