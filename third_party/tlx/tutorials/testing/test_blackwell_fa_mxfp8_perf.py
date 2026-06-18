@@ -77,8 +77,7 @@ def _setup_bwd_inputs(shape, sm_scale, dtype, causal=False):
 
     triton.set_allocator(alloc_fn)
 
-    num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
-    grid = (min(num_sms, triton.cdiv(N_CTX, fwd_config["BLOCK_M"]) * Z * H), 1, 1)
+    grid = (triton.cdiv(N_CTX, fwd_config["BLOCK_M"]), H, Z)
     _attn_fwd_mxf8_ws.fn[grid](
         sm_scale,
         desc_m,
