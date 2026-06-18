@@ -491,66 +491,59 @@ public:
     // after every IR change.
     AMD::ModuleAxisInfoAnalysis axisAnalysis(m);
     DenseMap<ttg::AsyncCopyGlobalToLocalOp, unsigned> asyncCopyContiguity;
-    m->walk([&](ttg::AsyncCopyGlobalToLocalOp copyOp) {
-      unsigned contiguity =
-          mlir::LLVM::AMD::getContiguity(copyOp.getSrc(), axisAnalysis);
-      if (auto mask = copyOp.getMask()) {
-        contiguity =
-            std::min<unsigned>(contiguity, axisAnalysis.getMaskAlignment(mask));
-      }
-      asyncCopyContiguity.insert({copyOp, contiguity});
-    });
-
-    // Precompute the contiguity of all BufferLoadToLocal ops based on the ptr, offset, and
-    // mask contiguity/alignment to avoid rebuilding ModuleAxisInfoAnalysis
-    // after every IR change.
-    //
-    // For buffer_load_to_local, we use ptr+offset DIVISIBILITY (not the current
-    // encoding's sizePerThread) to derive contiguity, because the offsets
-    // tensor may have sizePerThread=1 while still being hardware-contiguous
-    // across multiple elements (the scalar ptr + offset pattern).  This mirrors
-    // the logic in CoalesceBufferOps::computePerThread.
     DenseMap<triton::amdgpu::BufferLoadToLocalOp, unsigned> bufferOpsToLocalContiguity;
-    m->walk([&](triton::amdgpu::BufferLoadToLocalOp bufOp) {
-      Value ptr = bufOp.getPtr();
-      Value offsets = bufOp.getOffsets();
-
-      auto offsetTy = cast<RankedTensorType>(offsets.getType());
-      unsigned elemBitWidth = triton::getPointeeBitWidth(ptr.getType());
-      unsigned elemNumBytes = std::max(elemBitWidth / 8, 1u);
-
-      // Alignment from the scalar base pointer divisibility.
-      unsigned ptrAlign = 1;
-      auto *ptrInfo = axisAnalysis.getAxisInfo(ptr);
-      if (ptrInfo) {
-        unsigned ptrDivisibility = ptrInfo->getDivisibility(0);
-        ptrAlign = std::max(ptrDivisibility / elemNumBytes, 1u);
+    m->walk([&](Operation* op) {
+      if (auto globalCopyOp = dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(op)) {
+        unsigned contiguity =
+            mlir::LLVM::AMD::getContiguity(globalCopyOp.getSrc(), axisAnalysis);
+        if (auto mask = globalCopyOp.getMask()) {
+          contiguity =
+              std::min<unsigned>(contiguity, axisAnalysis.getMaskAlignment(mask));
+        }
+        asyncCopyContiguity.insert({globalCopyOp, contiguity});
       }
 
-      // Alignment from the offset tensor's innermost (fast-varying) dimension,
-      // derived from axis-info divisibility — NOT capped by sizePerThread.
-      unsigned offsetAlign = 1;
-      auto *offsetInfo = axisAnalysis.getAxisInfo(offsets);
-      if (offsetInfo) {
-        auto contiguityVec = offsetInfo->getContiguity();
-        SmallVector<unsigned> offsetOrder = getOrderFromContiguity(contiguityVec);
-        unsigned innerDim = offsetOrder[0];
-        unsigned divisibility = offsetInfo->getDivisibility(innerDim);
-        offsetAlign = std::max(divisibility / elemNumBytes, 1u);
+      if (auto bufferCopyOp = dyn_cast<triton::amdgpu::BufferLoadToLocalOp>(op)) {
+        Value ptr = bufferCopyOp.getPtr();
+        Value offsets = bufferCopyOp.getOffsets();
+
+        auto offsetTy = cast<RankedTensorType>(offsets.getType());
+        unsigned elemBitWidth = triton::getPointeeBitWidth(ptr.getType());
+        unsigned elemNumBytes = std::max(elemBitWidth / 8, 1u);
+
+        // Alignment from the scalar base pointer divisibility.
+        unsigned ptrAlign = 1;
+        auto *ptrInfo = axisAnalysis.getAxisInfo(ptr);
+        if (ptrInfo) {
+          unsigned ptrDivisibility = ptrInfo->getDivisibility(0);
+          ptrAlign = std::max(ptrDivisibility / elemNumBytes, 1u);
+        }
+
+        // Alignment from the offset tensor's innermost (fast-varying) dimension,
+        // derived from axis-info divisibility — NOT capped by sizePerThread.
+        unsigned offsetAlign = 1;
+        auto *offsetInfo = axisAnalysis.getAxisInfo(offsets);
+        if (offsetInfo) {
+          auto contiguityVec = offsetInfo->getContiguity();
+          SmallVector<unsigned> offsetOrder = getOrderFromContiguity(contiguityVec);
+          unsigned innerDim = offsetOrder[0];
+          unsigned divisibility = offsetInfo->getDivisibility(innerDim);
+          offsetAlign = std::max(divisibility / elemNumBytes, 1u);
+        }
+
+        // Cap to the widest vectorized load (128 bits).
+        unsigned maxVec = 128 / elemBitWidth;
+        unsigned contiguity = std::min({ptrAlign, offsetAlign, maxVec});
+
+        // NOTE: For buffer_load_to_local, we intentionally do NOT cap by
+        // getMaskAlignment(mask). The mask for these ops may have a different
+        // (smaller) shape than the offsets tensor (e.g., mask_n[:, None] is
+        // [BLOCK_N, 1] while offsets is [BLOCK_N, BLOCK_D_Q]). getMaskAlignment
+        // would return 1 for such a 1-wide mask, incorrectly capping contiguity.
+        // The mask is applied per-row (one bit covers all BLOCK_D_Q elements),
+        // so it does not limit vectorization along the column (fast) dimension.
+        bufferOpsToLocalContiguity.insert({bufferCopyOp, contiguity});
       }
-
-      // Cap to the widest vectorized load (128 bits).
-      unsigned maxVec = 128 / elemBitWidth;
-      unsigned contiguity = std::min({ptrAlign, offsetAlign, maxVec});
-
-      // NOTE: For buffer_load_to_local, we intentionally do NOT cap by
-      // getMaskAlignment(mask). The mask for these ops may have a different
-      // (smaller) shape than the offsets tensor (e.g., mask_n[:, None] is
-      // [BLOCK_N, 1] while offsets is [BLOCK_N, BLOCK_D_Q]). getMaskAlignment
-      // would return 1 for such a 1-wide mask, incorrectly capping contiguity.
-      // The mask is applied per-row (one bit covers all BLOCK_D_Q elements),
-      // so it does not limit vectorization along the column (fast) dimension.
-      bufferOpsToLocalContiguity.insert({bufOp, contiguity});
     });
 
     patterns.add<CoalesceAsyncCopyWrites>(targetInfo, asyncCopyContiguity,
