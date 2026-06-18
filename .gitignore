@@ -101,6 +101,7 @@ python/triton/tlx
 # claude
 .claude/*
 !.claude/knowledge/
+!.claude/debug_helper/
 !.claude/reviewers/
 !.claude/rules/
 !.claude/skills/
