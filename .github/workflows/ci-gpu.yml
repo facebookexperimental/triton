@@ -95,6 +95,12 @@ jobs:
           . "${VENV_DIR}/bin/activate"
           python3 third_party/tlx/tutorials/amd-fa-pipelined_test.py --mode perf_test
 
+      - name: Run TLX AMD Addmm+GLU performance guard
+        run: |
+          set -euxo pipefail
+          . "${VENV_DIR}/bin/activate"
+          python3 third_party/tlx/tutorials/amd-addmm-glu-opt_test.py --mode perf_test
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/tlx-amd-meta' }}
