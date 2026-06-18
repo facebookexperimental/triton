@@ -16,6 +16,7 @@ Usage:
 """
 import argparse
 
+import pytest
 import torch
 import triton
 import triton.language as tl
@@ -1102,6 +1103,89 @@ def verify(name, got, ref, atol=2e-2, rtol=2e-2, log=True):
     return ok
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Performance regression guard
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Baseline TFLOPS measured on gfx950/MI350 (fp16, M=1024, N=21568). A kernel must
+# stay within PERF_TOL below its baseline or the perf test fails (catches
+# regressions). Regenerate the numbers with:
+#   python amd-addmm-glu-opt_test.py
+# then copy the printed Summary table values here.
+PERF_TOL = 0.15  # allow 15% slack below baseline (run-to-run noise + minor drift)
+
+# key: (kernel, K) -> TFLOPS
+PERF_BASELINE_TFLOPS = {
+    ("tlx_baseline", 256): 237,
+    ("tlx_baseline", 512): 355,
+    ("tlx_baseline", 1024): 459,
+    ("tlx_simple_async", 256): 169,
+    ("tlx_simple_async", 512): 269,
+    ("tlx_simple_async", 1024): 349,
+    ("tlx_optimized_async", 256): 181,
+    ("tlx_optimized_async", 512): 279,
+    ("tlx_optimized_async", 1024): 406,
+    ("tlx_optimized", 256): 280,
+    ("tlx_optimized", 512): 442,
+    ("tlx_optimized", 1024): 597,
+    ("tlx_persistent", 256): 298,
+    ("tlx_persistent", 512): 449,
+    ("tlx_persistent", 1024): 613,
+}
+
+
+def measure_tflops(kernel_fn, M, N, K):
+    """Verify correctness then return achieved TFLOPS for one config."""
+    torch.manual_seed(0)
+    a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
+    bias = torch.randn(N, device=DEVICE, dtype=torch.float16)
+    y = torch.randn(M, N, device=DEVICE, dtype=torch.float16)
+    ref = pytorch_baseline(bias, a, b, y)
+    fn = lambda: kernel_fn(a, b, bias, y)
+    assert verify("", fn(), ref, log=False), "correctness check failed"
+    ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+    total_flops = 2.0 * M * N * K
+    return total_flops / ms * 1e-9
+
+
+@pytest.mark.parametrize("K", sorted(BEST_CONFIG))
+@pytest.mark.parametrize("kernel_name", list(KERNEL_REGISTRY))
+def test_addmm_glu_performance(kernel_name, K):
+    """Guard against perf regressions: achieved TFLOPS must stay within PERF_TOL
+    of the recorded gfx950 baseline (M=1024, N=21568, fp16)."""
+    baseline = PERF_BASELINE_TFLOPS[(kernel_name, K)]
+    floor = baseline * (1 - PERF_TOL)
+    got = measure_tflops(get_kernel(kernel_name), M, N, K)
+    print(f"  {kernel_name:20s} K={K:5d} {got:7.1f} TFLOPS (baseline {baseline}, floor {floor:.1f})")
+    assert got >= floor, (f"perf regression: {kernel_name} K={K} -> "
+                          f"{got:.1f} TFLOPS < floor {floor:.1f} (baseline {baseline}, tol {PERF_TOL:.0%})")
+
+
+def run_perf_test(args):
+    """CLI entry: run the perf guard over all baseline configs, print a report,
+    and return True iff every kernel is within PERF_TOL of its baseline."""
+    tol = args.perf_tol
+    all_ok = True
+    print(f"\nPerformance regression test (floor = baseline * (1 - {tol:.0%}))")
+    print("-" * 78)
+    for (kernel_name, K), baseline in sorted(PERF_BASELINE_TFLOPS.items()):
+        floor = baseline * (1 - tol)
+        try:
+            got = measure_tflops(get_kernel(kernel_name), M, N, K)
+        except Exception as e:
+            all_ok = False
+            print(f"  [FAIL] {kernel_name:20s} K={K:5d} -> ERROR ({e})")
+            continue
+        ok = got >= floor
+        all_ok &= ok
+        print(f"  [{'PASS' if ok else 'FAIL'}] {kernel_name:20s} K={K:5d} "
+              f"{got:7.1f} TFLOPS (baseline {baseline}, floor {floor:.1f})")
+    print("-" * 78)
+    print("RESULT:", "PASS" if all_ok else "FAIL")
+    assert all_ok
+
+
 def print_summary_table(results, providers):
     """Print a markdown-style summary table of benchmark results."""
     rows = [(f"M={m} N={n} K={k}", results[(m, n, k)]) for (m, n, k) in sorted(results.keys())]
@@ -1180,8 +1264,16 @@ def parse_args():
                    help="K (contraction) sizes to benchmark; only stored-config sizes are supported")
     p.add_argument("--kernel", type=str, nargs="+", default=kernel_choices, choices=kernel_choices,
                    help="Kernel variants to benchmark")
+    p.add_argument("--mode", choices=["benchmark", "perf_test"], default="benchmark",
+                   help="benchmark: print TFLOPS table; perf_test: assert TFLOPS within PERF_TOL of baseline")
+    p.add_argument("--perf-tol", dest="perf_tol", type=float, default=PERF_TOL,
+                   help="perf_test slack below baseline (e.g. 0.15 = allow 15%% regression)")
     return p.parse_args()
 
 
 if __name__ == "__main__":
-    run_benchmark(parse_args())
+    args = parse_args()
+    if args.mode == "perf_test":
+        run_perf_test(args)
+    else:
+        run_benchmark(args)
