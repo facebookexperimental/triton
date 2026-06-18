@@ -164,7 +164,7 @@ if __name__ == "__main__":
             configs_bwd_2cta,
         )
 
-        _attn_bwd_ws.configs = (configs_bwd_1cta if args.num_ctas == 1 else configs_bwd_2cta)
+        _attn_bwd_ws.configs = configs_bwd_1cta if args.num_ctas == 1 else configs_bwd_2cta
         print(f"Filtering BWD configs to {args.num_ctas}-CTA only")
 
     if is_blackwell():
