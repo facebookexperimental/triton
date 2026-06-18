@@ -651,6 +651,11 @@ class CUDABackend(BaseBackend):
         dump_enabled = pm.enable_debug()
         emuTF32 = capability // 10 >= 8
         passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
+        # Check user-visible tt.dot 2-CTA legality before lowering rewrites
+        # dot dependencies into TMEM alloc/load/store chains.
+        if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
+                and opt.ctas_per_cga is not None):
+            nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm)
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
@@ -848,6 +853,8 @@ class CUDABackend(BaseBackend):
         if "consan" in options.instrumentation_mode:
             # Call ConcurrencySanitizerPass here, before allocating global scratch memory but after allocating tensor and shared
             passes.ttgpuir.add_concurrency_sanitizer(pm)
+            passes.common.add_canonicalizer(pm)
+            passes.common.add_cse(pm)
         passes.ttgpuir.add_allocate_global_scratch_memory(pm)
         nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
         # Print TTGIR to TLX mapping before final emission (for debugging/analysis)
@@ -865,7 +872,7 @@ class CUDABackend(BaseBackend):
             CUDABackend.instrumentation.patch("ttgpuir_to_llvmir", pm, mod.context)
         nvidia.passes.hopper.add_tma_store_token_wait_lowering(pm)
         nvidia.passes.ttgpuir.add_to_llvmir(pm, capability, ptx_version)
-        passes.common.add_canonicalizer(pm)
+        passes.ttgpuir.add_canonicalize_llvm_ir(pm)
         passes.common.add_cse(pm)
         nvidia.passes.ttnvgpuir.add_nvgpu_to_llvm(pm)
         nvidia.passes.ttnvgpuir.add_warp_specialize_to_llvm(pm)
@@ -1006,16 +1013,12 @@ class CUDABackend(BaseBackend):
             # Add --regAllocOptLevel=2 to work around ptxas 13.x bug
             reg_alloc = ["--regAllocOptLevel=2"]
 
-            # compile_iq Stage-3 consumption (gated, default off; fail-open): if the PTX
-            # hash hits the ACF store, append --apply-controls (reusing ptx_extra_options).
-            # Only when the ptxas in use supports it (>=13.3), so it stays fail-open
-            # otherwise. Fires per ptxas call, i.e. for each config compiled during autotuning.
+            # compile_iq Stage-3 consumption (gated, default off; fail-open): if the PTX hash hits
+            # the ACF store, append --apply-controls (version check + lookup live in the helper).
             if os.environ.get("FBTRITON_COMPILE_IQ_APPLY"):
                 try:
-                    from packaging.version import Version
-                    if Version(get_ptxas(self.target.arch).version) >= Version("13.3"):
-                        from triton.compile_iq.consume import acf_args_for
-                        ptx_extra_options += acf_args_for(src, arch)
+                    from triton.compile_iq.consume import acf_args_for
+                    ptx_extra_options += acf_args_for(src, arch, get_ptxas(self.target.arch).version)
                 except Exception:
                     pass
 

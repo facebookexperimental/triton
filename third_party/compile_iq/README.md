@@ -88,12 +88,18 @@ MISSes and compiles the unchanged baseline.
 ## How it works (mechanics)
 
 - **Correctness** is checked by *self-consistency* — an ACF must reproduce the no-ACF output
-  (rel ≤ 1e-2) — so it's op-agnostic (the no-ACF run is the reference).
-- **Per-candidate isolation**: each ACF is benchmarked in its own spawn subprocess. A
-  candidate that wedges (timeout), crashes (IMA), or diverges scores INVALID and the search
-  keeps moving — the factory never hangs.
-- **ACF application**: the per-launch `ptx_options="--apply-controls=<file>"` kwarg in the
-  factory/replay; the consume hook injects the same flag at `make_cubin`.
+  (rel ≤ 1e-2) — so it's op-agnostic (the no-ACF run is the reference). A diverging/erroring
+  candidate scores INVALID and the search moves on.
+- **ACF application**: the factory applies each candidate's ACF via the `ptx_options` launch kwarg
+  (→ `opt.ptx_options` → ptxas), and the consume hook appends `--apply-controls=<stored.acf>` to the
+  same `ptx_extra_options` at `make_cubin` — both feed ptxas an identical flag, so what the factory
+  benchmarks is byte-identical to what consume produces. Only **validated** (applied, self-consistent,
+  faster) ACFs are stored, so consume never applies a wedging ACF.
+- **Isolation**: each candidate is benchmarked in a throwaway spawn subprocess with a timeout, so an
+  ACF that wedges the GPU (cuda.synchronize never returns) is killed and scored INVALID rather than
+  hanging the search (CompileIQ evaluates the objective in an in-process thread pool, where a wedged
+  thread can't be killed). If EVERY candidate wedges, the GPU driver is most likely < CUDA 13.3
+  (cannot run `--apply-controls` cubins) — use a ≥ 13.3-driver box.
 - **Search**: `LocalSearchSpaceBin(COMPILE_IQ_SEARCH_SPACE_BIN)` (offline; no network),
   benchmarked under `gpu_benchmark_mode(clock_mhz=1965)` for stable measurements.
 

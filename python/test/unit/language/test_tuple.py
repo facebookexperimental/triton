@@ -383,3 +383,26 @@ def test_tuple_constexpr_function():
         tl.static_assert(passthrough_constexpr(TrivialTuple(0)).foo == 0)
 
     kernel[(1, )]()
+
+
+@triton.jit
+def _listcomp_range_kernel(X_ptr, Y_ptr, sb, si, sj, N: tl.constexpr):
+    b = tl.program_id(0)
+    Xb = X_ptr + b * sb
+    Yb = Y_ptr + b * sb
+    j = tl.arange(0, N)
+    row = [tl.load(Xb + i * si + j * sj) for i in range(N)]
+    row = [row[i] * (i + 1) for i in range(N)]
+    for i in tl.static_range(0, N):
+        tl.store(Yb + i * si + j * sj, row[i])
+
+
+@pytest.mark.parametrize("N", [4, 8, 32])
+def test_listcomp_range(N, device):
+    torch.manual_seed(0)
+    B = 4
+    x = torch.randn((B, N, N), dtype=torch.float32, device=device)
+    y = torch.empty_like(x)
+    _listcomp_range_kernel[(B, )](x, y, x.stride(0), x.stride(1), x.stride(2), N=N, num_warps=1)
+    scale = (torch.arange(N, device=device, dtype=torch.float32) + 1.0)[None, :, None]
+    torch.testing.assert_close(y, x * scale, rtol=0, atol=0)

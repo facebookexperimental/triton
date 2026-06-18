@@ -154,7 +154,6 @@ def _attn_fwd_inner_oss_dp(
             warp_specialize=warp_specialize,
             merge_epilogue=True,
             merge_correction=True,
-            smem_alloc_algo=1,
             # disallow_acc_multi_buffer=True,
             data_partition_factor=DP_FACTOR,
     ):
@@ -521,7 +520,6 @@ def _attn_fwd_persist(
             warp_specialize=warp_specialize and OUTER_LOOP,
             merge_epilogue=True,
             merge_correction=True,
-            smem_alloc_algo=1,
             data_partition_factor=DP_FACTOR,
     ):
         pid = tile_idx % n_tile_num
@@ -613,10 +611,10 @@ class FrozenDotAttrs:
 
 
 # FWD dot attrs: 2 copies for K and V, no reuse (separate buffer IDs)
-#FWD_DOT_ATTRS = FrozenDotAttrs({
+# FWD_DOT_ATTRS = FrozenDotAttrs({
 #    "qk": {"channels": ["opndB,smem,2,0"]},
 #    "pv": {"channels": ["opndB,smem,2,1"]},
-#})
+# })
 _FWD_DOT_ATTRS_SWP = FrozenDotAttrs({
     "qk": {"stage": "0", "order": "0", "channels": ["opndB,smem,2,0"]},
     "pv": {"stage": "1", "order": "1", "channels": ["opndB,smem,2,1"]},
@@ -1492,7 +1490,7 @@ attention = _attention_opt.apply
 @pytest.mark.parametrize("mode", ["fwd"])
 @pytest.mark.parametrize("baseVariant", ["ws_persistent", "ws"])
 @pytest.mark.parametrize("provider", ["triton-fp16"])
-@pytest.mark.parametrize("SUBTILING", [False])  #, True])
+@pytest.mark.parametrize("SUBTILING", [False])  # , True])
 @pytest.mark.parametrize("VECT_MUL", [0])  # , 1, 2, 3])
 @pytest.mark.parametrize("FADD2_REDUCE", [False])
 @pytest.mark.parametrize("bwd_config_idx", range(len(configs_bwd_persist)))
@@ -1525,9 +1523,9 @@ def test_op(
         _attn_bwd.configs = [configs_bwd_persist[bwd_config_idx]]
         _attn_bwd.cache = {}
     torch.manual_seed(20)
-    q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    v = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    q = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
+    k = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
+    v = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
     sm_scale = 0.5
     # reference implementation
     ref_dtype = dtype
@@ -1571,7 +1569,7 @@ def test_op(
     rtol = 0.0
     # Relative tolerance workaround for known hardware limitation of CDNA2 GPU.
     # For details see https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
-    if (torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a"):
+    if torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a":
         rtol = 1e-2
     torch.testing.assert_close(tri_dv, ref_dv, atol=1e-2, rtol=rtol)
     torch.testing.assert_close(tri_dk, ref_dk, atol=1e-2, rtol=rtol)
@@ -1587,7 +1585,7 @@ except BaseException:
     HAS_FLASH = False
 
 TORCH_HAS_FP8 = False
-BATCH, N_HEADS = 2, 4  #8
+BATCH, N_HEADS = 2, 4  # 8
 # vary seq length for fixed head and batch=4
 configs = []
 for HEAD_DIM in [128]:  # 64, 128]:
@@ -1615,7 +1613,7 @@ for HEAD_DIM in [128]:  # 64, 128]:
 
 @triton.testing.perf_report(configs)
 def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, baseVariant, provider, device=DEVICE):
-    assert mode in ["fwd"]  #, "bwd"]
+    assert mode in ["fwd"]  # , "bwd"]
     dtype = torch.float16
     if "triton" in provider:
         q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)

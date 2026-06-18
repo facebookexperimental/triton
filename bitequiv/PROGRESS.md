@@ -1,0 +1,86 @@
+# PROGRESS — bitequiv project state (session bootstrap)
+
+<!-- FORMAT: terse, machine-first. Status tags: [DONE] [WIP] [TODO] [BLOCKED] [DROP].
+     Dates absolute (YYYY-MM-DD). Update the "Last updated" line + relevant sections
+     at session end. Keep prose minimal; this file is read first every session. -->
+
+meta:
+  last_updated: 2026-06-10
+  today_phase: Week 1 — ramp-up / Starter Tasks
+  current_milestone: Starter (Weeks 1-2)
+  branch: bitequiv-starter (starter work); bitequiv (base)
+  hardware: H100, B200 (Nvidia)
+  midpoint_deadline: M1 fully complete before Week 5
+
+## READ-FIRST (load these before working)
+- bitequiv/CLAUDE.md — project guide (goals, milestones, guardrails, conventions)
+- NOTE: the knowledge-base/ teaching docs (foundations, tree-reduction, ttgir-level
+  optimizations, equivalence-check-level decision, starter-task overview + codebase-map,
+  ai-workflow, claude-chatting summaries) and the M1 design doc are not checked into this
+  starter branch — they live on the `youngzt/bitequiv-m1` branch.
+
+## MILESTONE STATUS
+- [WIP]  Starter (Wk1-2): autotune IR/PTX pruning + 10-15 example kernels (runtime correctness hook DROPPED in review refactor — equivalence is proven statically from IR, not by output comparison)
+- [WIP]  M1 (Wk3-5): STATIC TTGIR reduction-equivalence checker + autotuner integration DONE (initial): bitequiv/equivalence.py (reduction_signature/classify) + `reduction_equivalence_prune(level)` / `ir_based_prune_configs` built on the single `ir_config_prune` hook (prune to reference config's order, no launch). detect (unordered→N classes) + enforce-verify (inner_tree→1 class) validated. TODO: PTX/FMA backstop, multi-reduce/MMA (#mma layouts), design doc + progress post.
+- [TODO] M2 (Wk6-8): reduction layout-optimization pass + cross-config experiment framework + NCU profiling
+- [TODO] M3 (Wk8-10): GEMM/MMA equivalence; MMA constraint representation; match cuBLAS on ~5 shapes
+- [TODO] M4/5/6/7 (Wk10+, stretch): TC opt / PyTorch fusion / AMD / GEMM+LayerNorm
+- [TODO] Wrap-up (Wk11-12): polish, measurements, docs/runbooks, final presentation
+
+## STARTER TASK BREAKDOWN (current focus)
+- [TODO] T1: Nvidia collab-day notes on bitwise equivalence (Day 1)
+- [TODO] T2: generate 10-15 example kernels showing per-stage IR transforms; doc gaps for numerics-modifying passes; land as onboarding tutorials
+- [DROP] T3: runtime correctness-check hook (correctness_fn/correctness_prune) — REMOVED in the 2026-06-10 review refactor. Runtime output comparison is out of scope; bitwise equivalence is proven statically from the compiled IR (M1), not by comparing kernel outputs to a reference.
+- [DONE] T4: IR/PTX pruning — GPU-validated 2026-06-05 (GB300), 11/11 tests. ir_config_prune in prune_configs_by; all 4 example filters fire a real keep+drop: vectorization (PTX), AutoWS keep-path (TTGIR; persistent TMA matmul + tl.range(warp_specialize=True) + knobs.nvidia.use_meta_ws; FLATTEN=False kept / True dropped), TMEM_LOAD prune (TTGIR; fp32 input_precision tf32→tmem_load dropped / ieee kept). ONLY remaining: real TMEM_LOAD *accuracy-bug* repro (needs Nick/collab-day).
+
+## RECENT ACTIVITY (newest first)
+- 2026-06-10: addressed first review round on D107928110 (njriasan). Autotuner consolidation: REMOVED the runtime correctness mechanism (correctness_fn/correctness_prune/_check_correctness) — out of scope; equivalence is static/IR-only. Collapsed the three bespoke compile/launch paths into the single `ir_config_prune` hook (renamed this session from `artifact_config_prune`; method `_ir_prune_configs`, results dict `pruned_by_ir`); removed equivalence_fn/equivalence_level/equivalence_checkers/_equivalence_prune_configs/_resolve_equivalence_pipeline from core. Equivalence now lives in bitequiv: `ir_based_prune_configs(key_fn)` + `reduction_equivalence_prune(level)` produce an ir_config_prune predicate (reference = first config; exposes .classes/.pruned). print→logging. Constraint-pruning examples CONVERTED to assertion-based pytest (bitequiv/tests/test_constraint_pruning.py) and the examples script (bitequiv/examples/constraint_pruning_examples.py) removed; equivalence-prune unit tests moved to bitequiv/tests/test_equivalence.py. Deleted reports/ (run_gpu_validation.sh, run_t2_examples.sh, gpu_validation_result.txt). Design doc (equivalence-check-level-ttgir-vs-ptx.md) deferred to a follow-up.
+- 2026-06-08: made the equivalence check LEVEL-SELECTABLE. Autotuner gains prune_configs_by={"equivalence_level": "ttgir"|"ptx"|"both"|[...], "equivalence_checkers": <registry>}; per-level checkers are INJECTED (bitequiv.equivalence.CHECKERS = {"ttgir": reduction_equivalence_key, "ptx": _ptx stub}) so triton core stays decoupled. _equivalence_prune_configs now compiles each config once then runs a (level,checker) PIPELINE — multiple levels = two-stage (TTGIR pre-filter → PTX backstop on survivors); missing level or NotImplementedError → clear AutotunerError (never silently skipped). equivalence_classes now {level: {key: [Config]}}. ptx_reduction_signature is a NotImplementedError stub (the only thing to fill in to enable level="ptx"). equivalence_fn callable kept as "custom" back-compat. Tests: 28 pass (bitequiv 11 + autotuner 17, incl. two-stage + missing-level + not-implemented). Example uses equivalence_level="ttgir". Worktree /home/youngzt/triton-wt2 (youngzt/bitequiv-wt2) created for parallel sessions; this core work stays in main checkout.
+- 2026-06-08: MAJOR REDESIGN — equivalence check is now STATIC at TTGIR, not runtime. Built bitequiv/equivalence.py: reduction_signature(ttgir) extracts per-tt.reduce (axis, reduction_ordering, combine, layout-along-reduce-axis) from the compiled TTGIR; same signature => same reduction order => bitwise-equal (no launch, no input, no reference output). Added autotuner `equivalence_fn` hook (prune_configs_by) = _equivalence_prune_configs: compiles each config warmup=True, keeps only those matching the FIRST (reference) config's signature; exposes equivalence_classes/pruned_by_equivalence. Validated on GB300: unordered → 4 classes by warpsPerCTA@axis (num_warps 1/2/4/8 NOT equivalent); inner_tree → 1 class (layout-invariant, all equivalent). Tests: bitequiv/tests/test_equivalence.py (8 fixture) + 2 CPU autotuner tests → 21 pass. Example: example_static_reduction_equivalence (3 classes, prunes num_warps 2/8). NOTE: runtime correctness_fn (old T3) demoted to optional ground-truth oracle; it is NOT the equivalence mechanism. inner_tree requires TRITON_STRICT_REDUCTION_ORDERING set BEFORE import (knob read at import).
+- 2026-06-05: FINISHED T4 on -claude-full-auto. AutoWS keep-path now fires (persistent TMA matmul + tl.range(warp_specialize=True) + knobs.nvidia.use_meta_ws; FLATTEN=False warp-specializes→kept, True→dropped) and TMEM_LOAD prunes a REAL ttng.tmem_load (fp32 input_precision: tf32→MMAv5/TMEM→dropped, ieee→FMA→kept). Discovered AutoWS trigger conditions (TRITON_USE_META_WS + warp_specialize loop; redux.sync never for float add/mul; MMAv5/TMEM for cc100-103). Added 2 Blackwell GPU e2e tests → 11/11 pass; regression 15/1 skip; ruff 0.9.1 + yapf 0.43.0 clean. Updated constraint_pruning_examples.py + report. Branch hygiene: validated reports + session KB docs synced onto -claude-full-auto.
+- 2026-06-04: M1 design Q&A → equivalence-check-level-ttgir-vs-ptx.md. DECISION: build the equivalence checker primarily at TTGIR (tree shape = layout + inner_tree attr, fully recoverable via LinearLayout::apply + ReduceOpHelper, no GPU), PTX as a targeted backstop (FMA contraction / ptxas, becomes required at M3/MMA). Confirmed: NVIDIA ships no semantic PTX analyzer (only cuobjdump/nvdisasm/ptxas/ncu); semantic layer is net-new. For float add/mul redux.sync is never emitted → PTX deterministic from TTGIR. Mapped reduction lowering + layout APIs with verified file:line anchors. Also clarified: starter T3/T4 = autotuner HOOKS (socket), not the checker (plug=M1).
+- 2026-06-04: cleared the GPU-validation blocker on a fresh GB300 node (torch.cuda OK; fabricmanager irrelevant single-node). Ran reports/run_gpu_validation.sh (fixed stale venv path → triton/.venv): T3/T4 = 9/9 pass, test_autotuner.py = 15 pass/1 skip, examples green (T4-B AutoWS prunes-all on this target, handled). Updated starter-t3-t4-report.md (§1/§5/§7/§8) + gpu_validation_result.txt. T3/T4 now [DONE]. Uncommitted (awaiting user review).
+- 2026-06-03: implemented T3+T4 in python/triton/runtime/autotuner.py (correctness_fn/correctness_prune; ir_config_prune via run(warmup=True) IR/PTX inspection). 7/7 CPU logic tests pass (test_autotuner_constraint_prune.py); 2 GPU e2e tests + examples written. GPU validation BLOCKED: GB200 NVLink fabric stuck "In Progress" (CUDA err 802, nvidia-fabricmanager inactive) all session — auto-validation script launched (bitequiv/reports/run_gpu_validation.sh → gpu_validation_result.txt). Report: bitequiv/reports/starter-t3-t4-report.md.
+- 2026-06-03: mapped full codebase for Starter Task → starter-task-codebase-map.md (5 tiers). Confirmed real anchors: autotuner _bench/prune_configs, CompiledKernel.asm, reduction_ordering path, async_task_id (AutoWS), Coalesce/AxisInfo (vec), ttng.tmem_load. Found existing prune example (06-fused-attention.py) + bitwise tests (test_core.py L3155+) + autotuner test (test_autotuner.py L131).
+- 2026-06-03: loaded + summarized 4 foundational Workplace posts → bitwise-equivalence-workplace-posts.md. Key facts: Triton shuffle offset 16→1 (bfly) vs eager 1→up; FP32 never bitwise-equal by default (FP16/BF16 masked); vectorization equiv needs multiples-of-4; persistent→looped at R≈2048; FMA/div_rn/libdevice/FTZ as non-reduction sources.
+- 2026-06-03: explored Triton autotuner; wrote starter-task-overview.md (goal + T1-T4 grounded in real hooks). Created branch bitequiv-starter. Correction logged: reduction_ordering is now a Python enum, not "inner_tree" string.
+- 2026-06-03: conceptual Q&A → foundations doc + session summary. Settled: safe-set model, canonical-order-as-reference, TTGIR-vs-PTX knowability, carried-constraint architecture.
+- 2026-06-03: project scaffolding — bitequiv/CLAUDE.md, ai-workflow.md, root CLAUDE.md import pointer; created `bitequiv` branch; first commit.
+- 2026-06-02: project plan review + codebase exploration; tree-reduction KB doc; mapped existing infra vs to-build.
+
+## KEY FACTS (don't re-derive)
+- EXISTS: inner_tree / reduction_ordering (D100027220, full Python→MLIR→PTX path; count-up shuffles + balanced within-thread tree). TRITON_STRICT_REDUCTION_ORDERING env var. STABLE_REDUCTION layer_norm workaround (D104785121, real 5.24% NE gap). TritonParse (text-level IR/PTX diff, no semantic analysis). Autotuner hooks: early_config_prune, restore_value, per-config IR/PTX dump. triton_repro_bitwise.py (D100024902, Paul Zhang). LinearLayout (lib/Tools/LinearLayout). Reduce lowering: ReduceOpToLLVM.cpp.
+- TO BUILD (first-ever): PTX semantic tree reconstruction (backstop, for FMA/below-TTGIR); reduction layout-opt pass (M2); MMA constraint representation + lowering (M3); repeatable experiment framework.
+- BUILT (2026-06-08, refactored 2026-06-10): STATIC cross-config equivalence checker at TTGIR (no GPU run) = bitequiv/equivalence.py (reduction_signature/same_reduction_order/classify/reduction_equivalence_key) + `reduction_equivalence_prune(level)` / `ir_based_prune_configs(key_fn)` which build on the autotuner's single `ir_config_prune` hook (prune to reference = first config's reduction order; predicate exposes .classes/.pruned). Reductions only so far; #blocked layouts (#mma falls back to verbatim compare). Tree shape = layout-along-axis + reduction_ordering attr + combine op. inner_tree => layout-invariant (excluded from sig). FMA contraction is below TTGIR => PTX backstop still TODO.
+- MODEL: config = perf point AND numerics point. Equivalence = constraint on tuning search space (safe set). "Different bits ≠ incorrect" (determinism vs reference), except genuine bugs (TMEM_LOAD).
+- LEVELS: order knowable structurally at TTGIR (layout explicit) → do cheap pruning there; PTX = ground truth (FMA contraction, exact shuffles, hw redux, vectorization). TTIR/config alone = NOT enough (layout-free).
+- ARCH DIRECTION: carry an ORDER-INTENT constraint (not a frozen layout) TTGIR→PTX = constraint-aware passes + independent verifier + PTX-flag backstop (ptxas is outside MLIR).
+- AUTOTUNER HOOKS (verified): prune via early_config_prune (before compile) and the single ir_config_prune (after compile, run(warmup=True), inspects CompiledKernel.asm['ttir'|'ttgir'|'llir'|'ptx'] + .metadata) — both registered through prune_configs_by, applied in Autotuner.prune_configs. Static equivalence pruning is layered on ir_config_prune in bitequiv. (No runtime correctness hook — removed 2026-06-10.)
+- CORRECTION: reduction_ordering is a Python enum now (ReductionOrdering.INNER_TREE), but C++ ReduceOpToLLVM.cpp:isInnerTree still matches the "inner_tree" attribute string.
+
+## GUARDRAIL (always)
+Correctness gates performance. Re-run the bitwise-equivalence check after ANY perf-affecting change. AI may silently undo an ordering constraint while "optimizing" — defend with tests. State constraints in prompt + code comments. (See CLAUDE.md §6.)
+
+## BUILD/TEST REMINDERS
+- C++/MLIR change → rebuild: `pip install -e . --no-build-isolation`. Python-only → no rebuild.
+- Always `pre-commit run --all` before done. IR/PTX: `ir-debugging` skill.
+- Never run perf/benchmarks unless asked (`kernel-perf-testing` skill). Hang >mins → `third_party/tlx/killgpu.sh`.
+- Don't commit unless user asks. Disclose AI authorship in PRs.
+
+## OPEN QUESTIONS
+- Exact shape of TMEM_LOAD accuracy bug?
+- Nvidia collab-day decisions (esp. M3 scope, cuBLAS ordering)?
+- PTX analysis: static / LLM-assisted / hybrid? → RESOLVED: static; TTGIR-primary structural reconstruction, PTX as targeted backstop. (see equivalence-check-level-ttgir-vs-ptx.md)
+- TLX IR surface vs standard Triton for this analysis?
+- Promote reduction_ordering from request flag → carried, verified constraint?
+- ptxas-level controls for backstop (--fmad, fma vs mul+add)? → clarified: --fmad=false disables FFMA contraction; the ptxas/SASS gap is why PTX isn't absolute ground truth.
+- Reconstruct order at TTGIR cheaply enough for per-config autotuner use? → YES: reuse LinearLayout::apply + ReduceOpHelper (no GPU); for float add/mul redux.sync never fires so TTGIR fully determines the tree.
+- M1 build choices still open: first slice (f32 1D/2D sum), placement (hybrid Python + pybind to LinearLayout vs pure-Python blocked-layout re-impl).
+
+## UPDATE PROTOCOL (for Claude, at session end)
+1. Bump meta.last_updated.
+2. Add a one-line RECENT ACTIVITY entry (dated, newest first).
+3. Flip milestone/starter task tags; move finished items, add new TODOs.
+4. Append new KEY FACTS only if non-derivable; prune stale ones.
+5. Update OPEN QUESTIONS (resolve/add).
+6. Keep terse. Detail goes to knowledge-base/ docs, not here.

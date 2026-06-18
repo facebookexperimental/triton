@@ -17,7 +17,7 @@ Users can annotate `tl.dot` operations with per-operand channel specifications v
 
 ### Remaining Gap
 
-**SMEM algo 0**: The original `MemoryPlanner` class (used when `tt.smem_alloc_algo = 0` or not set)
+**SMEM algo 0**: The original `MemoryPlanner` class (used when `tt.smem_alloc_algo = 0`)
 does not receive annotations. All annotated kernels should use `tt.smem_alloc_algo = 1`.
 
 ### User-Facing API

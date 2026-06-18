@@ -84,6 +84,18 @@ def read_acf(ptx_sha: str, arch: str) -> bytes | None:
         return f.read()
 
 
+def read_meta(ptx_sha: str, arch: str) -> dict | None:
+    """The provenance metadata (baseline_ms, best_ms, ...) for a stored ACF, or None if absent."""
+    p = acf_path(ptx_sha, arch) + ".json"
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 def write_acf(ptx_sha: str, arch: str, data: bytes, meta: dict | None = None) -> str:
     p = acf_path(ptx_sha, arch)
     os.makedirs(os.path.dirname(p), exist_ok=True)

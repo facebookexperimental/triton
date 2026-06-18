@@ -149,6 +149,13 @@ LogicalResult lowerLocalStore(Location loc, MLIRContext *ctx, Value regVal,
     cvt = regLayout.invertAndCompose(sharedLL);
   } else {
     auto sharedLayout = toLinearLayout(memDescTy);
+    // NPOT swizzled SMEM: split contiguous dim into pow2 intra-tile + NPOT
+    // phase. No-op (returns nullopt) for pow2 / no swizzle / non-NVMMAShared.
+    if (auto split =
+            splitNpotContiguousDim(memDescTy, sharedLayout, regLayout)) {
+      sharedLayout = split->smem;
+      regLayout = split->other;
+    }
     cvt = regLayout.invertAndCompose(sharedLayout);
   }
   auto kBlock = str_attr("block");
@@ -209,9 +216,16 @@ struct LocalAllocOpConversion
     if (!op.isSharedMemoryAlloc())
       return failure();
     Location loc = op->getLoc();
+    auto memDescTy = cast<MemDescType>(op.getType());
+    // TODO: PartitionedSharedEncoding lowering will be enabled in subsequent
+    // PRs.
+    if (isa<triton::gpu::PartitionedSharedEncodingAttr>(
+            memDescTy.getEncoding())) {
+      return rewriter.notifyMatchFailure(
+          op, "PartitionedSharedEncoding not yet supported in lowering");
+    }
     Value smemBase =
         LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op.getOperation());
-    auto memDescTy = cast<MemDescType>(op.getType());
     auto typeConverter = getTypeConverter();
 
     auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
@@ -266,6 +280,13 @@ public:
     auto memDescVal = op.getSrc();
     auto regVal = op.getResult();
     auto memDescTy = cast<MemDescType>(memDescVal.getType());
+    // TODO: PartitionedSharedEncoding lowering will be enabled in subsequent
+    // PRs.
+    if (isa<triton::gpu::PartitionedSharedEncodingAttr>(
+            memDescTy.getEncoding())) {
+      return rewriter.notifyMatchFailure(
+          op, "PartitionedSharedEncoding not yet supported in lowering");
+    }
     auto regTy = cast<RankedTensorType>(regVal.getType());
     auto typeConverter = getTypeConverter();
 
@@ -287,6 +308,13 @@ public:
       cvt = regLayout.invertAndCompose(sharedLL);
     } else {
       auto sharedLayout = toLinearLayout(memDescTy);
+      // NPOT swizzled SMEM: split contiguous dim into pow2 intra-tile + NPOT
+      // phase. No-op (returns nullopt) for pow2 / no swizzle / non-NVMMAShared.
+      if (auto split =
+              splitNpotContiguousDim(memDescTy, sharedLayout, regLayout)) {
+        sharedLayout = split->smem;
+        regLayout = split->other;
+      }
       cvt = regLayout.invertAndCompose(sharedLayout);
     }
     auto kBlock = str_attr("block");
@@ -330,6 +358,13 @@ public:
     Value memDescVal = op.getDst();
     auto typeConverter = getTypeConverter();
     auto memDescTy = cast<MemDescType>(memDescVal.getType());
+    // TODO: PartitionedSharedEncoding lowering will be enabled in subsequent
+    // PRs.
+    if (isa<triton::gpu::PartitionedSharedEncodingAttr>(
+            memDescTy.getEncoding())) {
+      return rewriter.notifyMatchFailure(
+          op, "PartitionedSharedEncoding not yet supported in lowering");
+    }
     auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
     auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, adaptor.getDst(),
                                                          llvmElemTy, rewriter);
@@ -420,6 +455,13 @@ public:
     auto loc = op.getLoc();
     auto *ctx = op.getContext();
     auto memDescTy = cast<MemDescType>(op.getSrc().getType());
+    // TODO: PartitionedSharedEncoding lowering will be enabled in subsequent
+    // PRs.
+    if (isa<triton::gpu::PartitionedSharedEncodingAttr>(
+            memDescTy.getEncoding())) {
+      return rewriter.notifyMatchFailure(
+          op, "PartitionedSharedEncoding not yet supported in lowering");
+    }
     auto regTy = cast<RankedTensorType>(op.getType());
     auto typeConverter = getTypeConverter();
 
@@ -513,6 +555,13 @@ public:
     auto loc = op.getLoc();
     auto *ctx = op.getContext();
     auto memDescTy = cast<MemDescType>(op.getDst().getType());
+    // TODO: PartitionedSharedEncoding lowering will be enabled in subsequent
+    // PRs.
+    if (isa<triton::gpu::PartitionedSharedEncodingAttr>(
+            memDescTy.getEncoding())) {
+      return rewriter.notifyMatchFailure(
+          op, "PartitionedSharedEncoding not yet supported in lowering");
+    }
     auto valuesTy = cast<RankedTensorType>(op.getValues().getType());
     auto typeConverter = getTypeConverter();
 

@@ -6,15 +6,6 @@ Three stages, communicating only through disk (zero user surface):
   3. consumption: a ptxas shim applies the stored ACF during PTX->SASS (later).
 
 Enable collection by setting the env var FBTRITON_COMPILE_IQ_COLLECT=1. No kernel or
-Triton-user code changes are required.
+Triton-user code changes are required. Submodules (collector / factory / replay / consume /
+store) are imported directly where used; this package marker stays empty on purpose.
 """
-
-import os
-
-from . import collector, store
-
-__all__ = ["collector", "store", "collection_enabled"]
-
-
-def collection_enabled() -> bool:
-    return bool(os.environ.get("FBTRITON_COMPILE_IQ_COLLECT"))

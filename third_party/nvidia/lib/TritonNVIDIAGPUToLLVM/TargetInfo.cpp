@@ -97,8 +97,7 @@ matchReduxKind(triton::ReduceOp op, int computeCapability,
   if (!reduceOp)
     return std::nullopt;
   // redux.f32 is an sm_100-family feature; sm_120 lacks it.
-  if (computeCapability / 10 == 10 &&
-      reduceOp->getResultTypes()[0].isF32()) {
+  if (computeCapability / 10 == 10 && reduceOp->getResultTypes()[0].isF32()) {
     if (isa<arith::MinimumFOp, arith::MaximumFOp>(reduceOp))
       useNanQualifier = true;
     if (isa<arith::MaxNumFOp, arith::MaximumFOp>(reduceOp))
