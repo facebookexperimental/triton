@@ -168,6 +168,8 @@ struct ConvertLayoutOpConversion
 
     // At this point we have a type that's at least 8-bit
     // and we don't have broadcasting in the registers
+
+    // For NPOT cases the caller has already replaced these with pow2 layouts.
     auto bitwidth = llvmElemTy.getIntOrFloatBitWidth();
     auto smem = optimalSwizzlingLdSt(srcLayout, dstLayout, bitwidth);
 
@@ -205,6 +207,9 @@ struct ConvertLayoutOpConversion
         loadCvt = loadCvt.reshapeOuts(
             {{kOffset,
               static_cast<int32_t>(loadCvt.getTotalOutDimSizeProduct())}});
+
+        storeCvt = triton::applyNpotKernelFix(storeCvt, smem);
+        loadCvt = triton::applyNpotKernelFix(loadCvt, smem);
 
         auto tileSize = storeCvt.getInDimSize(kReg);
 
@@ -272,10 +277,38 @@ struct ConvertLayoutOpConversion
     dstLayout = dstLayout.sublayout({kReg, kLane, kWarp},
                                     to_vector(dstLayout.getOutDimNames()));
 
+    // Compute the dead register fixup map BEFORE unfolding. For NPOT src
+    // layouts, some register positions hold garbage from dead hardware
+    // positions (e.g., TMEM columns beyond N). We need to replace those
+    // with the values from their canonical (wrapped) counterparts.
+    auto deadRegMap =
+        triton::computeDeadPositionMap(srcLayout, kReg, kLane, kWarp);
+
+    // Unfold NPOT modular dims to pow2 only when dead positions are fixable
+    // per-register (canFixup). When lane/warp feed the NPOT dim the canonical
+    // register may live in another thread, so leave the modular layout to wrap
+    // dead positions through the SMEM transfer.
+    bool canFixup = triton::canFixupDeadPositions(srcLayout, kLane, kWarp) &&
+                    triton::canFixupDeadPositions(dstLayout, kLane, kWarp);
+    if (canFixup) {
+      srcLayout = triton::unfoldModularDimsForAlloc(srcLayout);
+      dstLayout = triton::unfoldModularDimsForAlloc(dstLayout);
+    }
+
     auto llvmElemTy = getTypeConverter()->convertType(srcTy.getElementType());
     auto smemBase =
         LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op.getOperation());
     auto inVals = unpackLLElements(loc, src, rewriter);
+
+    // Dead-register fixup: alias each dead reg to its canonical (wrapped)
+    // value.
+    for (auto &[deadReg, canonReg] : deadRegMap) {
+      if (deadReg < static_cast<int>(inVals.size()) &&
+          canonReg < static_cast<int>(inVals.size())) {
+        inVals[deadReg] = inVals[canonReg];
+      }
+    }
+
     auto outVals = transferWithinBlockSwizzlingImpl(
         loc, rewriter, srcLayout, dstLayout, inVals, llvmElemTy, smemBase);
 

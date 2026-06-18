@@ -299,7 +299,9 @@ LinearLayout::LinearLayout(
   if (size == 0)
     return LinearLayout::empty();
 
-  assert(llvm::isPowerOf2_32(size));
+  // strided1D/identity1D are pow2-only; NPOT callers must use modularStrided1D.
+  assert(llvm::isPowerOf2_32(size) &&
+         "strided1D/identity1D require a power-of-2 size");
   std::vector<std::vector<int32_t>> bases;
   for (int32_t i = 1; i < size; i *= 2) {
     bases.emplace_back(std::vector<int32_t>{i * stride});
@@ -316,7 +318,7 @@ LinearLayout::LinearLayout(
   if (size == 0)
     return LinearLayout::empty();
 
-  assert(llvm::isPowerOf2_32(size));
+  assert(llvm::isPowerOf2_32(size) && "zeros1D requires a power-of-2 size");
   std::vector<std::vector<int32_t>> zeros;
   for (int i = 1; i < size; i *= 2) {
     zeros.emplace_back(std::vector<int32_t>{0});

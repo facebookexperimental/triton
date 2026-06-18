@@ -500,6 +500,14 @@ static unsigned estimateConvertScratchCost(Value value, Attribute encoding) {
     if (encTrait && srcTy.getRank() != encTrait.getRank())
       continue;
     auto dstTy = srcTy.cloneWithEncoding(encoding);
+    // Guard NPOT shapes before cvtNeedsSharedMemory, which calls
+    // toLinearLayout and may crash on encodings that don't handle NPOT.
+    if (hasNpotShape(srcTy) || hasNpotShape(dstTy)) {
+      if (!npotSafeForLinearLayout(srcTy.getEncoding()) ||
+          !npotSafeForLinearLayout(dstTy.getEncoding())) {
+        continue;
+      }
+    }
     if (cvtNeedsSharedMemory(srcTy, dstTy)) {
       unsigned elems = getNumScratchElemsSwizzledCvt(srcTy, dstTy);
       cost += elems * getElementBitWidth(srcTy) / 8;
@@ -2035,6 +2043,14 @@ public:
       funcOp->walk([&](ConvertLayoutOp cvt) {
         auto srcTy = cvt.getSrc().getType();
         auto dstTy = cvt.getType();
+        // Guard NPOT shapes before cvtNeedsSharedMemory, which calls
+        // toLinearLayout and may crash on encodings that don't handle NPOT.
+        if (hasNpotShape(srcTy) || hasNpotShape(dstTy)) {
+          if (!npotSafeForLinearLayout(srcTy.getEncoding()) ||
+              !npotSafeForLinearLayout(dstTy.getEncoding())) {
+            return;
+          }
+        }
         if (!cvtNeedsSharedMemory(srcTy, dstTy))
           return;
         unsigned scratchBytes = getNumScratchElemsSwizzledCvt(srcTy, dstTy) *
