@@ -3,11 +3,9 @@
 Confirms the bundled Racket core (`_evo_manager`) ingests a real ptxas `.config`
 search space and runs one generation end-to-end, returning an `EvoResult`.
 
-This is the EVO counterpart to CIQ's `run_e2e.sh`. EVO and CIQ take *different*
-search-space artifacts:
-  - EVO  -> a `.config` file (Racket DNA), passed as EvoSearch(search_space=...)
-  - CIQ  -> a `.bin` blob, via COMPILE_IQ_SEARCH_SPACE_BIN + LocalSearchSpaceBin
-A `.bin` is rejected by EVO (ValueError); a `.config` is rejected by CIQ.
+A fast sanity check of the engine wiring before the full PTX-direct e2e
+(`run_e2e_cuda12{8,30}.sh`). EVO takes a `.config` search space (Racket DNA),
+passed as `EvoSearch(search_space=...)`.
 
 Must run in the `evo` conda env (Python 3.10, evo_nda). Pass a `.config` search
 space, or set SS_CONFIG / PTXAS_KNOBS:
