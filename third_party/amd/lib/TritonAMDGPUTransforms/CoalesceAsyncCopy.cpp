@@ -173,10 +173,10 @@ struct CoalesceAsyncCopyToLocal : public OpRewritePattern<OpTy> {
     // tensor-of-pointers encoding. BufferLoadToLocalOp must NOT apply this cap
     // because the offsets tensor sizePerThread may be 1 even when the true
     // contiguity is larger; we rely solely on ptr/offset divisibility.
-    if (Traits::capByRegToShared)
+    if (Traits::capByRegToShared) {
       loadContig = std::min<unsigned>(
           loadContig, regToSharedLayout.getNumConsecutiveInOut());
-
+    }
     // Select the largest supported load width ≤ loadContig.
     auto elemBitWidth = dstTy.getElementTypeBitWidth();
     loadContig =
@@ -278,6 +278,19 @@ struct CoalesceAsyncCopyToLocal : public OpRewritePattern<OpTy> {
     if (newDistEnc == srcTy.getEncoding())
       return rewriter.notifyMatchFailure(
           op, "Unable to find a new src layout to coalesce writes to LDS");
+
+    // Verify that the new encoding actually enables coalesced direct-to-LDS
+    // writes. This is a post-check: for some shapes (e.g. a 1D tensor whose
+    // size is smaller than threadsPerWarp * sizePerThread), the new blocked
+    // layout is overprovisioned and canLoadDirectToLDS will still fail.
+    unsigned newLoadContig = loadContig;
+    RankedTensorType newEffectivePtrTy =
+        effectivePtrTy.cloneWithEncoding(newDistEnc);
+    if (!LLVM::AMD::canLoadDirectToLDS(targetInfo, newEffectivePtrTy,
+                                       dstTy.getEncoding(),
+                                       dstTy.getAllocShape(), newLoadContig))
+      return rewriter.notifyMatchFailure(
+          op, "new encoding does not result in coalesced writes to LDS");
 
     // Convert the source tensor (and optionally mask/other) to the new
     // encoding.
