@@ -928,6 +928,18 @@ class JITFunction(JITCallable, KernelInterface[T]):
             kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
             if kernel is None:
                 return None
+            # compile_iq: dump a collection task for the offline ACF factory.
+            # Gated by TRITON_COMPILE_IQ_COLLECT; fires on the compile (cache-miss) path
+            # where signature/constexprs are in scope. Never affects the user run.
+            if os.environ.get("TRITON_COMPILE_IQ_COLLECT"):
+                try:
+                    from triton.compile_iq.collector import capture as _ciq_capture
+                    _ck = kernel.result() if hasattr(kernel, "result") else kernel
+                    _cg = grid(bound_args) if callable(grid) else grid
+                    _ciq_capture(jitfn=self, kernel=_ck, bound_args=bound_args, signature=signature,
+                                 constexprs=constexprs, grid=tuple(list(_cg) + [1, 1, 1])[:3])
+                except Exception:
+                    pass
             _fc_needs_insert = self.c_cache
         else:
             _fc_needs_insert = False
