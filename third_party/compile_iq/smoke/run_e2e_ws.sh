@@ -45,7 +45,7 @@ echo "ptxas=$PTXAS ($("$PTXAS" --version | grep -oE 'V[0-9.]+' | tail -1)) ; spa
 
 # --- [1/3] collect: the gated jit hook dumps source-free tasks (kernel.ptx + spec.json). ---
 echo "== [1/3] collect =="
-FBTRITON_COMPILE_IQ_COLLECT=1 "$PY" "$KERNEL" 2>&1 | grep -iE "collector|ws *:" || true
+TRITON_COMPILE_IQ_COLLECT=1 "$PY" "$KERNEL" 2>&1 | grep -iE "collector|ws *:" || true
 # pick the warp-specialized GEMM task (the TMA kernel), not the split-K reduce helper.
 WSTASK=""
 for d in "$COMPILE_IQ_TASK_DIR"/*/; do
@@ -68,7 +68,7 @@ fi
 echo "== [3/3] consume (timeout ${CONSUME_TIMEOUT}s) =="
 rc=0
 timeout -k 10 "$CONSUME_TIMEOUT" env \
-    FBTRITON_COMPILE_IQ_APPLY=1 FBTRITON_COMPILE_IQ_DEBUG=1 TRITON_ALWAYS_COMPILE=1 \
+    TRITON_COMPILE_IQ_APPLY=1 TRITON_COMPILE_IQ_DEBUG=1 TRITON_ALWAYS_COMPILE=1 \
     COMPILE_IQ_PTXAS_MIN_VERSION="$PTXAS_MIN_VERSION" WS_GEMM_SIZE="$WS_GEMM_SIZE" \
     "$PY" "$KERNEL" 2>&1 | grep -iE "compile_iq|HIT|MISS|ws *:|cuBLAS|speed" || rc=$?
 if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then

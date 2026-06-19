@@ -15,9 +15,9 @@ import os
 import re
 import sys
 
-# Single debug knob for all of compile_iq, default OFF. Set FBTRITON_COMPILE_IQ_DEBUG=1
+# Single debug knob for all of compile_iq, default OFF. Set TRITON_COMPILE_IQ_DEBUG=1
 # to trace when events are collected and when ACF lookups hit/miss.
-DEBUG_ENV = "FBTRITON_COMPILE_IQ_DEBUG"
+DEBUG_ENV = "TRITON_COMPILE_IQ_DEBUG"
 
 
 def debug_enabled() -> bool:

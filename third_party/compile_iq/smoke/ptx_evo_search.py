@@ -69,10 +69,20 @@ def main():
     ss = pathlib.Path(sys.argv[3])
     if len(sys.argv) > 4:
         PER_CAND_TIMEOUT = int(sys.argv[4])
-    print(f"[ptx-evo] ptx={PTX_FILE} space={ss.name} per_cand_timeout={PER_CAND_TIMEOUT}s", flush=True)
+    # Search depth (env-overridable). generations=1 is pure random sampling of `pool_size` ACFs;
+    # generations>=2 enables EVO's cull/mutate/breed loop -- the actual optimization. Larger spaces
+    # (p1/p2) and real perf searches want more of both (and pay more wedge cost). pool must be > cull.
+    gens = int(os.environ.get("EVO_GENERATIONS", "1"))
+    pool = int(os.environ.get("EVO_POOL", "6"))
+    cull = int(os.environ.get("EVO_CULL", "2"))
+    if cull % 2:  # EVO requires an even cull_size (pydantic: "multiple of 2")
+        cull = max(2, cull - 1)
+    print(
+        f"[ptx-evo] ptx={PTX_FILE} space={ss.name} per_cand_timeout={PER_CAND_TIMEOUT}s "
+        f"generations={gens} pool_size={pool} cull_size={cull}", flush=True)
 
-    cfg = EvoConfiguration(problem_type=ProblemType.MIN, num_objectives=1, qualitative=True, generations=1, pool_size=6,
-                           cull_size=2, mutate_rate=0.5, enable_db=False)
+    cfg = EvoConfiguration(problem_type=ProblemType.MIN, num_objectives=1, qualitative=True, generations=gens,
+                           pool_size=pool, cull_size=cull, mutate_rate=0.5, enable_db=False)
     search = EvoSearch(objective_function=objective, search_space=ss, evo_config=cfg, worker_type=WorkerTypes.DEFAULT,
                        debug=False)
     result = search.start(num_workers=1)

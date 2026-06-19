@@ -16,12 +16,12 @@ Like examples/user_kernel.py, this file has ZERO compile_iq references — colle
 and consumption are driven purely by environment variables, with no code change:
 
     # collect a task for this kernel/shape/config:
-    FBTRITON_COMPILE_IQ_COLLECT=1 COMPILE_IQ_TASK_DIR=/tmp/ciq_tasks \
+    TRITON_COMPILE_IQ_COLLECT=1 COMPILE_IQ_TASK_DIR=/tmp/ciq_tasks \
         python third_party/compile_iq/examples/blackwell_gemm_ws_sample.py
 
     # ...run the factory on the one task it produced, then consume:
-    FBTRITON_COMPILE_IQ_APPLY=1 COMPILE_IQ_STORE=/tmp/ciq_store \
-    FBTRITON_COMPILE_IQ_DEBUG=1 TRITON_ALWAYS_COMPILE=1 \
+    TRITON_COMPILE_IQ_APPLY=1 COMPILE_IQ_STORE=/tmp/ciq_store \
+    TRITON_COMPILE_IQ_DEBUG=1 TRITON_ALWAYS_COMPILE=1 \
         python third_party/compile_iq/examples/blackwell_gemm_ws_sample.py
 
 denoise.sh notes: its clock/power lock (`sudo nvidia-smi -lgc/-pm/--power-limit`) and
@@ -45,8 +45,10 @@ from triton.language.extra.tlx.tutorials.blackwell_gemm_ws import matmul
 try:
     from triton._internal_testing import is_blackwell
 except Exception:  # pragma: no cover - fallback if helper moves
+
     def is_blackwell():
         return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
+
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
