@@ -4,7 +4,7 @@ This is exactly what a user would write. It demonstrates Stage-1 collection's
 **zero user surface**: nothing in this file is aware of compile_iq. Collection is
 triggered entirely by the environment, with no change to this code:
 
-    FBTRITON_COMPILE_IQ_COLLECT=1 \
+    TRITON_COMPILE_IQ_COLLECT=1 \
     COMPILE_IQ_TASK_DIR=/tmp/ciq_tasks \
     TRITON_PTXAS_BLACKWELL_PATH=/path/to/ptxas13.3 \
     python user_kernel.py

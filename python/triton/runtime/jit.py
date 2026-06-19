@@ -928,9 +928,9 @@ class JITFunction(JITCallable, KernelInterface[T]):
             if kernel is None:
                 return None
             # compile_iq: dump a collection task for the offline ACF factory.
-            # Gated by FBTRITON_COMPILE_IQ_COLLECT; fires on the compile (cache-miss) path
+            # Gated by TRITON_COMPILE_IQ_COLLECT; fires on the compile (cache-miss) path
             # where signature/constexprs are in scope. Never affects the user run.
-            if os.environ.get("FBTRITON_COMPILE_IQ_COLLECT"):
+            if os.environ.get("TRITON_COMPILE_IQ_COLLECT"):
                 try:
                     from triton.compile_iq.collector import capture as _ciq_capture
                     _ck = kernel.result() if hasattr(kernel, "result") else kernel

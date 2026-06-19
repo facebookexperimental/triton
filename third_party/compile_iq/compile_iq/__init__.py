@@ -7,7 +7,7 @@ Three stages, communicating only through disk (zero user surface):
                   reference factory is the EVO route under smoke/ (ptx_evo_search + ptx_bench_one).
   3. consumption: a make_cubin shim appends --apply-controls for a stored ACF during PTX->SASS.
 
-Enable collection by setting FBTRITON_COMPILE_IQ_COLLECT=1; no kernel/Triton-user code changes are
+Enable collection by setting TRITON_COMPILE_IQ_COLLECT=1; no kernel/Triton-user code changes are
 required. Submodules (collector / consume / store / ptx_launch) are imported directly where used;
 this package marker stays empty on purpose.
 """

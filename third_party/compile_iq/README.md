@@ -8,9 +8,9 @@ assembling a *fixed* `kernel.ptx` with ptxas and launching the cubin via the CUD
 
 | Stage | What | Trigger | Requirements |
 |-------|------|---------|--------------|
-| **1. collect** | a gated hook in `jit.py` dumps a **source-free** task (`kernel.ptx` + `spec.json`) per kernel | `FBTRITON_COMPILE_IQ_COLLECT=1` | none (no `source.py`, no cuda-python) |
+| **1. collect** | a gated hook in `jit.py` dumps a **source-free** task (`kernel.ptx` + `spec.json`) per kernel | `TRITON_COMPILE_IQ_COLLECT=1` | none (no `source.py`, no cuda-python) |
 | **2. factory** | offline search over ACFs scored by `ptxas(fixed PTX)` + driver launch; keep the best → ACF store | EVO route under `smoke/` (`run_e2e_cuda12{8,30}.sh`) | EVO engine + ptxas + driver matching the tier |
-| **3. consume** | a gated `make_cubin` hook appends `--apply-controls=<stored.acf>` | `FBTRITON_COMPILE_IQ_APPLY=1` | ptxas matching the ACF version |
+| **3. consume** | a gated `make_cubin` hook appends `--apply-controls=<stored.acf>` | `TRITON_COMPILE_IQ_APPLY=1` | ptxas matching the ACF version |
 
 Content-addressed: the store key is `sha256(normalized PTX) × arch`, so one ACF transfers across
 runtime shapes (M,N,K) of the same kernel.
@@ -44,7 +44,7 @@ The `smoke/run_e2e_cuda12{8,30}.sh` wrappers pin a matching set (ptxas 12.8 / 13
 See `smoke/README.md`. Quick collect demo (source-free task, any matching ptxas):
 
 ```bash
-FBTRITON_COMPILE_IQ_COLLECT=1 FBTRITON_COMPILE_IQ_DEBUG=1 COMPILE_IQ_TASK_DIR=/tmp/ciq_tasks \
+TRITON_COMPILE_IQ_COLLECT=1 TRITON_COMPILE_IQ_DEBUG=1 COMPILE_IQ_TASK_DIR=/tmp/ciq_tasks \
   TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda-13.0/bin/ptxas \
   python third_party/compile_iq/examples/user_kernel.py
 # -> /tmp/ciq_tasks/<sha16>/{kernel.ptx, spec.json}   (no source.py)
@@ -60,9 +60,9 @@ PTXAS_KNOBS=/data/users/$USER/ptxas_knobs bash third_party/compile_iq/smoke/run_
 
 | Var | Purpose |
 |-----|---------|
-| `FBTRITON_COMPILE_IQ_COLLECT` | enable Stage 1 (collect) |
-| `FBTRITON_COMPILE_IQ_APPLY` | enable Stage 3 (consume) |
-| `FBTRITON_COMPILE_IQ_DEBUG` | trace collect / lookup hit-miss |
+| `TRITON_COMPILE_IQ_COLLECT` | enable Stage 1 (collect) |
+| `TRITON_COMPILE_IQ_APPLY` | enable Stage 3 (consume) |
+| `TRITON_COMPILE_IQ_DEBUG` | trace collect / lookup hit-miss |
 | `COMPILE_IQ_TASK_DIR` | where collect writes tasks (default `~/.compile_iq/tasks`) |
 | `COMPILE_IQ_STORE` | ACF store root (default `~/.compile_iq/store`) |
 | `COMPILE_IQ_PTXAS_MIN_VERSION` | consume's minimum ptxas version (default 13.3; lower it to match a 12.8/13.0 tier) |
