@@ -348,6 +348,13 @@ std::string translateLLVMIRToASM(
     setLLVMOption<bool>("print-after-all", true);
   }
 
+  // A/B: disable the post-RA machine scheduler (it can re-order the manual
+  // warp-pipeline schedule). RAII-scoped for this codegen only.
+  std::unique_ptr<ScopedLLVMOption<bool>> postMiSchedGuard;
+  if (triton::tools::getBoolEnv("TRITON_DISABLE_POST_MISCHED"))
+    postMiSchedGuard =
+        std::make_unique<ScopedLLVMOption<bool>>("enable-post-misched", false);
+
   bool disableLLVMOpt = triton::tools::getBoolEnv("DISABLE_LLVM_OPT");
   if (!disableLLVMOpt) {
     // Check to see if we are passing a list of flags to disable optimizations.

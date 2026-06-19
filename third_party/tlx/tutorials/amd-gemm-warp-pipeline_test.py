@@ -111,7 +111,10 @@ def gemm_wp(
         with tlx.warp_pipeline_stage("mfma", priority=0):
             acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
 
-        tlx.async_load_wait_group(2)
+        # Drain the buffer we are about to local_load (its A+B commits). With the
+        # wait placed before the prefetch commits, the oldest pending groups are
+        # next_buf's, so we must keep only (NUM_BUFFERS-2) buffers in flight.
+        tlx.async_load_wait_group((NUM_BUFFERS - 2) * 2)
 
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_offs = a_base_off + (k_prefetch + offs_k[None, :]) * stride_ak
