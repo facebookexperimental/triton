@@ -1015,7 +1015,7 @@ class CUDABackend(BaseBackend):
 
             # compile_iq Stage-3 consumption (gated, default off; fail-open): if the PTX hash hits
             # the ACF store, append --apply-controls (version check + lookup live in the helper).
-            if os.environ.get("FBTRITON_COMPILE_IQ_APPLY"):
+            if os.environ.get("TRITON_COMPILE_IQ_APPLY"):
                 try:
                     from triton.compile_iq.consume import acf_args_for
                     ptx_extra_options += acf_args_for(src, arch, get_ptxas(self.target.arch).version)

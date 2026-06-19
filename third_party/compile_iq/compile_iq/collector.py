@@ -1,5 +1,5 @@
 """Stage 1 — collection. A zero-user-surface hook (called from jit.py, gated by
-FBTRITON_COMPILE_IQ_COLLECT) that, when a kernel is compiled, dumps a self-contained, SOURCE-FREE
+TRITON_COMPILE_IQ_COLLECT) that, when a kernel is compiled, dumps a self-contained, SOURCE-FREE
 "compileIQ task" to disk for the offline (PTX-direct) factory.
 
 A task dir ($COMPILE_IQ_TASK_DIR/<ptx_sha[:16]>/) contains exactly:

@@ -3,10 +3,10 @@ apply a stored ACF (or [] on miss/error). Called by a gated hook in the NVIDIA b
 so the ACF is applied during normal PTX->SASS compilation. Fail-open: any miss/error returns [].
 
 TODO(compile_iq): the applied ACF is INVISIBLE to Triton's compile cache. The `--apply-controls`
-flag is appended inside make_cubin from the FBTRITON_COMPILE_IQ_APPLY env + this store lookup; it is
+flag is appended inside make_cubin from the TRITON_COMPILE_IQ_APPLY env + this store lookup; it is
 NOT part of `opt.ptx_options`/backend_options, and the ACF *bytes* aren't hashed anywhere. The cache
 key is `triton_key-src.hash-backend.hash-backend_options.hash-env_vars` (runtime/cache.py
-get_cache_key), and FBTRITON_COMPILE_IQ_APPLY is not in get_cache_invalidating_env_vars(). So a
+get_cache_key), and TRITON_COMPILE_IQ_APPLY is not in get_cache_invalidating_env_vars(). So a
 cached cubin is reused without re-running make_cubin -> the ACF is silently NOT applied, and a
 re-tuned ACF for the same kernel does not bust the cache. Consequence: consume currently REQUIRES
 TRITON_ALWAYS_COMPILE=1 to take effect. Fix: fold the ACF identity (e.g. its sha256, or the store
