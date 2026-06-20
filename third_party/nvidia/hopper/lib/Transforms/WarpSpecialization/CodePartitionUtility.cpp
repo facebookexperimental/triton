@@ -720,8 +720,7 @@ bool verifyReuseGroup2(ReuseGroup *group) {
     auto *srcB = chB->getSrcOp();
     if (srcA && srcB && srcA->getBlock() == srcB->getBlock() &&
         (appearsBefore(srcA, srcB) || appearsBefore(srcB, srcA))) {
-      llvm::errs() << "DEBUG verifyReuseGroup2: fallback accepted, producers "
-                      "in same block\n";
+      LDBG("verifyReuseGroup2: fallback accepted, producers in same block");
       return true;
     }
     LDBG("verifyReuseGroup2: no dependency chain between channels");
@@ -837,7 +836,7 @@ bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel) {
   return true;
 }
 
-bool isFullOverwriteReuseOwner(Channel *ownerCh) {
+bool isWholeAllocationOverwriteReuseOwner(Channel *ownerCh) {
   if (!ownerCh)
     return false;
   // The space owner / representative has no `buffer.offset` attribute on its
@@ -847,10 +846,9 @@ bool isFullOverwriteReuseOwner(Channel *ownerCh) {
     return false;
   if (ownerCh->channelKind != DataChannelKind::TMEMPost)
     return false;
-  // A `useC=false` MMA producer zeros the whole TMEM allocation before writing,
-  // overwriting any packed sibling columns. `isOperandDNoAcc` records exactly
-  // this (set in createChannelPost when the MMA's useAccumulator is
-  // const-false).
+  // A `useC=false` MMA producer zeros the whole TMEM allocation before writing.
+  // `isOperandDNoAcc` records this whole-allocation overwrite producer shape
+  // (set in createChannelPost when the MMA's useAccumulator is const-false).
   auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ownerCh);
   return tmemCh->isOperandDNoAcc;
 }

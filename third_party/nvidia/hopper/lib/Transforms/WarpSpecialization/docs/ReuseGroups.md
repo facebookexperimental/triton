@@ -353,7 +353,7 @@ on the last channel's consumer from the previous iteration. This is the original
 N>2 path and covers epilogue subtiling, where N subtiles share one SMEM buffer and
 are stored/loaded sequentially.
 
-### Full-overwrite owner ("hub" case)
+### Whole-allocation overwrite owner ("hub" case)
 
 Column-packed **TMEM** reuse groups (TMEM Packing, above) break the same-block
 assumption: the representative (the QK accumulator) is produced by a
@@ -370,8 +370,9 @@ next-iteration MMA wait for the default partition to finish reading the packed
 scalars (read after the inner loop). This is the FA-fwd-persistent TMEM aliasing
 race — latent on the non-early path, exposed by `early_tma_store`.
 
-The fix: when the representative satisfies `isFullOverwriteReuseOwner`, the owner
-back-waits on the packed siblings — but **cadence matters**, and getting it wrong
+The fix: when the representative satisfies
+`isWholeAllocationOverwriteReuseOwner`, the owner back-waits on the packed
+siblings - but **cadence matters**, and getting it wrong
 deadlocks:
 
 - **Inner-cadence siblings** (produced *inside* the owner's inner loop, e.g.
@@ -413,7 +414,7 @@ Without the fix (race):              With the fix (per outer tile):
                                          epilogue: task0 reads m_ij/l_i0
 ```
 
-`isFullOverwriteReuseOwner(ownerCh)` returns true when `ownerCh` is the
+`isWholeAllocationOverwriteReuseOwner(ownerCh)` returns true when `ownerCh` is the
 representative (its alloc has no `buffer.offset`) and is a `TmemDataChannelPost`
 with `isOperandDNoAcc == true` (set in `createChannelPost` when the producer MMA's
 `useAccumulator()` is constant-false). The outer-cadence siblings are collected in
@@ -451,4 +452,4 @@ runtime validation is the FA-fwd-persistent dp kernel determinism check.
 | `verifyReuseGroup2` | `CodePartitionUtility.cpp` | Verify 2-buffer reuse group constraints |
 | `orderReuseGroup2` | `CodePartitionUtility.cpp` | Determine early/late channel ordering |
 | `needExplicitReuseWait` | `CodePartitionUtility.cpp` | Check if explicit cross-channel wait is needed |
-| `isFullOverwriteReuseOwner` | `CodePartitionUtility.cpp` | Detect a representative whose useC=false MMA producer overwrites the whole allocation (needs back-edges to all packed siblings) |
+| `isWholeAllocationOverwriteReuseOwner` | `CodePartitionUtility.cpp` | Detect a representative whose producer overwrites the whole allocation (needs back-edges to live packed siblings) |

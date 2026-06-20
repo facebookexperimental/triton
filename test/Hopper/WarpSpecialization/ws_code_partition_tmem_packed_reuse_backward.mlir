@@ -1,6 +1,7 @@
 // RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=2 post-channel-creation=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s
 
-// Regression test for the FA-fwd-persistent TMEM aliasing race.
+// Regression test for whole-allocation overwrite with packed TMEM reuse,
+// exercised by the FA-fwd-persistent TMEM aliasing race.
 //
 // The memory planner packs the scalar buffers alpha/m_ij/l_i0 into the spare
 // columns (offsets 64/65/66) of the QK accumulator (buffer.id 8 for dp0,
@@ -17,7 +18,7 @@
 //     columns before the default partition (task 0) finishes reading them in the
 //     previous tile's epilogue -> the race.
 //
-// The fix (isFullOverwriteReuseOwner + the full-overwrite-owner "hub" case)
+// The fix (isWholeAllocationOverwriteReuseOwner + the overwrite-owner "hub" case)
 // emits, in the gemm partition (async_task_id = 1) and BEFORE the inner loop
 // (once per outer tile), a producer_acquire on each OUTER-cadence packed
 // sibling's token (dstTask = 0), using the sibling's OWN outer-loop phase. This

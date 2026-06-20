@@ -3144,18 +3144,18 @@ void insertAsyncComm(
     // Sibling channels for the N>2 same-block chain's wrap-around dependency
     // (epilogue subtiling): emitted at headProducer with the master's phase.
     SmallVector<Channel *> wrapAroundChannelsForReuseSync;
-    // Full-overwrite-owner ("hub") case: packed siblings whose data is produced
-    // and consumed OUTSIDE the owner's inner loop (outer cadence, e.g. m_ij /
-    // l_i0 read once per tile in the epilogue). These need a cross-iteration
-    // back-edge emitted BEFORE the inner loop using the sibling's own outer
-    // phase (NOT the owner's inner phase) — see the dedicated emission below.
-    SmallVector<Channel *> fullOverwriteOuterSiblings;
+    // Whole-allocation overwrite owner ("hub") case: packed siblings whose data
+    // is live across the owner's repeated-overwrite loop. These need a
+    // cross-iteration back-edge emitted before that loop using the sibling's
+    // own phase, not the owner's inner phase. In FA persistent this covers m_ij
+    // / l_i0 read once per tile in the epilogue.
+    SmallVector<Channel *> wholeOverwriteBackedgeSiblings;
     // True when masterChannel is the representative of a reuse group whose
-    // producer overwrites the whole physical buffer (useC=false MMA). Used by a
-    // debug-only verifier in the emission step to ensure no packed sibling's
-    // backward barrier is silently dropped. [[maybe_unused]]: only read inside
-    // an assert(), which is compiled out under NDEBUG.
-    [[maybe_unused]] bool masterIsFullOverwriteOwner = false;
+    // producer overwrites the whole physical buffer. Used by a debug-only
+    // verifier in the emission step to ensure no packed sibling's backward
+    // barrier is silently dropped. [[maybe_unused]]: only read inside an
+    // assert(), which is compiled out under NDEBUG.
+    [[maybe_unused]] bool masterIsWholeAllocationOverwriteOwner = false;
     int reuseGrp2 = channelInReuseGroup(masterChannel, config,
                                         /*reuseBarrier=*/false);
     if (reuseGrp2 >= 0 && !producerAcquireForChannelLoop) {
@@ -3198,53 +3198,52 @@ void insertAsyncComm(
         bool allSingleCopy = llvm::all_of(group->channels, [](Channel *ch) {
           return ch->getNumBuffers() == 1;
         });
-        Channel *rep = group->channels[0];
-        if (allSingleCopy && isFullOverwriteReuseOwner(rep)) {
-          // Full-overwrite-owner ("hub") case: the representative's producer is
-          // a useC=false MMA that ZEROS the entire physical allocation each
-          // iteration, clobbering every packed sibling's columns. When
-          // processing the owner, collect packed siblings that need a backward
-          // edge so the owner's overwrite waits for their cross-partition
-          // consumer to finish reading — the missing edge behind the
-          // FA-fwd-persistent TMEM aliasing race.
-          if (masterChannel == rep) {
-            masterIsFullOverwriteOwner = true;
-            int ownerProducerTask = rep->relation.first;
-            scf::ForOp ownerInnerLoop =
+        auto ownerIt = llvm::find_if(group->channels, [](Channel *ch) {
+          return isWholeAllocationOverwriteReuseOwner(ch);
+        });
+        if (allSingleCopy && ownerIt != group->channels.end()) {
+          Channel *owner = *ownerIt;
+          // Whole-allocation overwrite owner ("hub") case: the representative's
+          // producer overwrites the entire physical allocation each iteration,
+          // clobbering every packed sibling's columns. When processing the
+          // owner, collect packed siblings that need a backward edge so the
+          // next overwrite waits for their cross-partition consumers to finish
+          // reading.
+          if (masterChannel == owner) {
+            masterIsWholeAllocationOverwriteOwner = true;
+            int ownerProducerTask = owner->relation.first;
+            scf::ForOp ownerOverwriteLoop =
                 headProducer->getParentOfType<scf::ForOp>();
-            for (size_t i = 1; i < group->channels.size(); i++) {
-              Channel *sibling = group->channels[i];
+            auto hasConsumerOutsideTask = [](Channel *ch, int task) {
+              return llvm::any_of(
+                  ch->relation.second,
+                  [task](int consumerTask) { return consumerTask != task; });
+            };
+            auto isProducedWithinOverwriteLoop =
+                [ownerOverwriteLoop](Channel *ch) {
+                  Operation *producer = ch->getSrcOp();
+                  return ownerOverwriteLoop && producer &&
+                         ownerOverwriteLoop->isProperAncestor(producer);
+                };
+            for (Channel *sibling : group->channels) {
+              if (sibling == owner)
+                continue;
               // Skip siblings all of whose consumers are in the owner
               // producer's own partition (e.g. the P matrix at offset 0
-              // consumed by the PV MMA in the same gemm partition) — program
+              // consumed by the PV MMA in the same gemm partition) - program
               // order orders those.
-              bool crossPartition = false;
-              for (int ct : sibling->relation.second)
-                if (ct != ownerProducerTask)
-                  crossPartition = true;
-              if (!crossPartition)
+              if (!hasConsumerOutsideTask(sibling, ownerProducerTask))
                 continue;
-              // Only OUTER-cadence siblings need a cross-iteration back-edge.
-              // The owner MMA overwrites the buffer every inner-loop iteration;
-              // an inner-cadence sibling (produced inside the owner's inner
-              // loop, e.g. alpha) is produced and consumed within the same
-              // iteration and is already ordered by its per-iteration channel
-              // barriers. An outer-cadence sibling (produced outside the inner
-              // loop, e.g. m_ij / l_i0 read once per tile in the epilogue) is
-              // clobbered by the NEXT tile's first inner MMA — that is the
-              // race.
-              Operation *sibProducer = sibling->getSrcOp();
-              bool innerCadence = ownerInnerLoop && sibProducer &&
-                                  ownerInnerLoop->isProperAncestor(sibProducer);
-              if (innerCadence)
+              // Siblings produced within the owner's overwrite loop have the
+              // same cadence as the overwrite and are already ordered by their
+              // own per-iteration channel barriers. Siblings produced outside
+              // that loop may remain live until after the loop, so the next
+              // repeated overwrite must wait for their consumers. In FA
+              // persistent, alpha is inside the loop while m_ij/l_i0 are read
+              // once per tile in the epilogue.
+              if (isProducedWithinOverwriteLoop(sibling))
                 continue;
-              fullOverwriteOuterSiblings.push_back(sibling);
-              LLVM_DEBUG({
-                LDBG("full-overwrite reuse owner: channel "
-                     << rep->uniqID
-                     << " needs outer-cadence back-edge to packed sibling "
-                     << sibling->uniqID);
-              });
+              wholeOverwriteBackedgeSiblings.push_back(sibling);
             }
           }
         } else if (allSingleCopy) {
@@ -3323,12 +3322,6 @@ void insertAsyncComm(
                       }
                     }
                     earlyChannelForReuseSync = earlyChannel;
-                    LLVM_DEBUG({
-                      LDBG("N-reuse group: channel "
-                           << masterChannel->uniqID
-                           << " will wait on early channel "
-                           << earlyChannel->uniqID);
-                    });
                   }
                   break;
                 }
@@ -3340,12 +3333,6 @@ void insertAsyncComm(
               // TMA is still reading from the previous iteration.
               if (ordered[0] == masterChannel) {
                 wrapAroundChannelsForReuseSync.push_back(ordered.back());
-                LLVM_DEBUG({
-                  LDBG("N-reuse group: channel "
-                       << masterChannel->uniqID
-                       << " will wrap-around wait on last channel "
-                       << ordered.back()->uniqID);
-                });
               }
             } // end if (!hasSubtiledSrc && !hasSubtiledDst)
           } // end if (allSameBlock)
@@ -3804,70 +3791,6 @@ void insertAsyncComm(
                     WSBarrierAttr::forDstTask(funcOp.getContext(),
                                               wrapToken.first)
                         .build(funcOp.getContext()));
-            LLVM_DEBUG({
-              LDBG("Insert back-edge reuse ProducerAcquireOp for channel "
-                   << masterChannel->uniqID << " waiting on sibling channel "
-                   << wrapCh->uniqID);
-            });
-          }
-        }
-      }
-
-      // Full-overwrite-owner outer-cadence back-edges (the FA-fwd-persistent
-      // TMEM aliasing fix). The owner MMA runs at INNER-loop cadence, but these
-      // siblings (e.g. m_ij / l_i0) are read once per OUTER tile in the
-      // epilogue, so their empty barrier flips at outer cadence. We must NOT
-      // wait at the MMA with the owner's inner phase (that deadlocks). Instead,
-      // insert the producer_acquire BEFORE the owner's inner loop (once per
-      // tile) using the sibling's own outer-loop phase — identical to the phase
-      // the sibling's real producer_acquire uses — so the next tile's first MMA
-      // waits for the previous tile's epilogue read before the useC=false write
-      // zeros the sibling's columns. Pass the computed phase directly (lowering
-      // XORs it) for cross-iteration wrap-around semantics.
-      if (!fullOverwriteOuterSiblings.empty()) {
-        scf::ForOp ownerInnerLoop = headProducer->getParentOfType<scf::ForOp>();
-        if (ownerInnerLoop) {
-          DenseSet<Value> emittedOuterTokens;
-          for (Channel *sib : fullOverwriteOuterSiblings) {
-            auto sibTokenIt = tokenMap.find(sib);
-            if (sibTokenIt == tokenMap.end()) {
-              // Defense-in-depth: dropping a required sibling back-edge
-              // reintroduces the TMEM aliasing race.
-              assert(!masterIsFullOverwriteOwner &&
-                     "full-overwrite reuse owner missing backward barrier to a "
-                     "packed sibling channel (TMEM aliasing race)");
-              continue;
-            }
-            for (const auto &sibTok : sibTokenIt->second.tokens) {
-              if (!emittedOuterTokens.insert(sibTok.second).second)
-                continue;
-              builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
-              builder.setInsertionPoint(ownerInnerLoop);
-              builder.clearLoopScheduleInfo();
-              // Compute the sibling's OWN phase at the outer-loop level. The
-              // inner-loop op's parent is the outer loop, so getAccumCount
-              // resolves the same outer-loop accumCnt the sibling's real
-              // producer_acquire/consumer_release use. The siblings are
-              // single-buffered, so they sync via the per-channel path
-              // (reuseGroupIdx = -1), NOT the multi-buffer reuse-group accumCnt
-              // path (which getReuseChannels skips for numBuffers <= 1).
-              Value sibBufferIdx, sibPhase;
-              getBufferIdxAndPhase(builder, ownerInnerLoop.getOperation(),
-                                   sib->getNumBuffers(), regionsWithChannels,
-                                   sibBufferIdx, sibPhase, config,
-                                   /*reuseGroupIdx=*/-1, sib);
-              builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
-                  ownerInnerLoop.getLoc(), sibTok.second, sibBufferIdx,
-                  sibPhase,
-                  WSBarrierAttr::forDstTask(funcOp.getContext(), sibTok.first)
-                      .build(funcOp.getContext()));
-              LLVM_DEBUG({
-                LDBG("Insert outer-cadence back-edge ProducerAcquireOp before "
-                     "inner loop for owner channel "
-                     << masterChannel->uniqID << " waiting on sibling channel "
-                     << sib->uniqID);
-              });
-            }
           }
         }
       }
@@ -3956,6 +3879,54 @@ void insertAsyncComm(
                   tailProducer->getLoc(), token.second, bufferIdx,
                   WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
                       .build(funcOp.getContext()));
+        }
+      }
+    }
+
+    // Whole-allocation overwrite back-edges. The owner producer repeats in an
+    // inner loop, while these packed siblings are read after that loop. We must
+    // not wait at the owner with the owner's inner phase; that can deadlock for
+    // siblings whose empty barrier flips at the surrounding-loop cadence.
+    // Instead, insert the producer_acquire before the repeated overwrite loop
+    // using the sibling's own phase. In FA persistent this makes the next
+    // tile's first QK MMA wait for the previous tile's epilogue read of
+    // m_ij/l_i0.
+    if (!wholeOverwriteBackedgeSiblings.empty()) {
+      scf::ForOp ownerOverwriteLoop =
+          headProducer->getParentOfType<scf::ForOp>();
+      if (ownerOverwriteLoop) {
+        DenseSet<Value> emittedBackedgeTokens;
+        for (Channel *sib : wholeOverwriteBackedgeSiblings) {
+          auto sibTokenIt = tokenMap.find(sib);
+          if (sibTokenIt == tokenMap.end()) {
+            // Defense-in-depth: dropping a required sibling back-edge
+            // reintroduces the TMEM aliasing race.
+            assert(!masterIsWholeAllocationOverwriteOwner &&
+                   "whole-allocation overwrite reuse owner missing backward "
+                   "barrier to a packed sibling channel (TMEM aliasing race)");
+            continue;
+          }
+          for (const auto &sibTok : sibTokenIt->second.tokens) {
+            if (!emittedBackedgeTokens.insert(sibTok.second).second)
+              continue;
+            builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
+            builder.setInsertionPoint(ownerOverwriteLoop);
+            builder.clearLoopScheduleInfo();
+            // Compute the sibling's own phase at the loop containing the
+            // repeated overwrite. The sibling is single-buffered, so it syncs
+            // via the per-channel path (reuseGroupIdx = -1), not the
+            // multi-buffer reuse-group accumCnt path.
+            Value sibBufferIdx, sibPhase;
+            getBufferIdxAndPhase(builder, ownerOverwriteLoop.getOperation(),
+                                 sib->getNumBuffers(), regionsWithChannels,
+                                 sibBufferIdx, sibPhase, config,
+                                 /*reuseGroupIdx=*/-1, sib);
+            builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+                ownerOverwriteLoop.getLoc(), sibTok.second, sibBufferIdx,
+                sibPhase,
+                WSBarrierAttr::forDstTask(funcOp.getContext(), sibTok.first)
+                    .build(funcOp.getContext()));
+          }
         }
       }
     }
