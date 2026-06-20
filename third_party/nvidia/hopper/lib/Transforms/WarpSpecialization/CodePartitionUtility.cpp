@@ -837,6 +837,24 @@ bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel) {
   return true;
 }
 
+bool isFullOverwriteReuseOwner(Channel *ownerCh) {
+  if (!ownerCh)
+    return false;
+  // The space owner / representative has no `buffer.offset` attribute on its
+  // alloc; packed reusers carry `buffer.offset > 0`.
+  Operation *allocOp = ownerCh->getAllocOp();
+  if (!allocOp || allocOp->hasAttr("buffer.offset"))
+    return false;
+  if (ownerCh->channelKind != DataChannelKind::TMEMPost)
+    return false;
+  // A `useC=false` MMA producer zeros the whole TMEM allocation before writing,
+  // overwriting any packed sibling columns. `isOperandDNoAcc` records exactly
+  // this (set in createChannelPost when the MMA's useAccumulator is
+  // const-false).
+  auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ownerCh);
+  return tmemCh->isOperandDNoAcc;
+}
+
 void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                           unsigned numBuffers,
                           const DenseSet<Operation *> &regionsWithChannels,

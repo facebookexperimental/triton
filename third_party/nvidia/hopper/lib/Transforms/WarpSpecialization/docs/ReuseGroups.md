@@ -338,6 +338,91 @@ pp: producer = local_store (task 3, comp)     → consumer = tc_gen5_mma (task 1
   `needExplicitReuseWait` returns `false`.
 - Action: No change. Partition-internal ordering guarantees correctness.
 
+## N-Buffer Reuse Group Synchronization
+
+For reuse groups with more than two channels (`group->channels.size() > 2`),
+`insertAsyncComm` handles two distinct shapes. Both run only for single-copy
+groups (`getNumBuffers() == 1`, always true for TMEM).
+
+### Same-block linear chain (SMEM epilogue subtiling)
+
+When every channel's producer is in the **same block**, the channels are ordered
+by producer program order and a dependency chain is built: channel `i`'s producer
+back-waits on channel `i-1`'s consumer, and the first channel wraps around to wait
+on the last channel's consumer from the previous iteration. This is the original
+N>2 path and covers epilogue subtiling, where N subtiles share one SMEM buffer and
+are stored/loaded sequentially.
+
+### Full-overwrite owner ("hub" case)
+
+Column-packed **TMEM** reuse groups (TMEM Packing, above) break the same-block
+assumption: the representative (the QK accumulator) is produced by a
+`tc_gen5_mma` in the **inner** loop, while the packed scalar siblings
+(`alpha`/`m_ij`/`l_i0` at `buffer.offset` 64-66) are produced by `tmem_store` ops
+in the **outer** loop body. The producers are in different blocks, so the linear
+chain does not apply.
+
+The hazard: a `tc_gen5_mma` with `useC=false` **zeros the entire physical
+allocation** before writing — clobbering every packed sibling's columns, not just
+the owner's. The owner channel's barrier only frees the buffer with respect to the
+QK *result* consumer (released inside the inner loop); nothing makes the
+next-iteration MMA wait for the default partition to finish reading the packed
+scalars (read after the inner loop). This is the FA-fwd-persistent TMEM aliasing
+race — latent on the non-early path, exposed by `early_tma_store`.
+
+The fix: when the representative satisfies `isFullOverwriteReuseOwner`, the owner
+back-waits on the packed siblings — but **cadence matters**, and getting it wrong
+deadlocks:
+
+- **Inner-cadence siblings** (produced *inside* the owner's inner loop, e.g.
+  `alpha`): produced and consumed within the same inner iteration, already ordered
+  by their own per-iteration channel barriers. **No extra edge is added.**
+- **Outer-cadence siblings** (produced *outside* the inner loop, e.g.
+  `m_ij`/`l_i0`, read once per tile in the epilogue): these are the ones the next
+  tile's first inner MMA clobbers. For each such sibling whose consumer is in a
+  **different partition** than the owner producer, emit a `producer_acquire` on the
+  sibling's token **before the owner's inner loop** (once per outer tile), using
+  the **sibling's own outer-loop phase** (`getBufferIdxAndPhase(..., op = the inner
+  `scf.for`, reuseGroupIdx = -1, ch = sibling)`), so the next tile's first MMA
+  waits for the previous tile's epilogue read.
+
+Two details are essential and were the source of an initial deadlock:
+
+1. **Placement**: the wait goes *before the inner loop*, not at the MMA. The MMA
+   runs at inner cadence; an outer-cadence barrier waited on every inner iteration
+   never matches its phase and hangs.
+2. **Phase basis**: use the *sibling's* phase, not the owner's. The siblings are
+   single-buffered, so they sync via the per-channel path (`reuseGroupIdx = -1`);
+   `getReuseChannels` skips the multi-buffer reuse-group accumCnt path for
+   `numBuffers <= 1`. The inner-loop op's parent is the outer loop, so
+   `getAccumCount` resolves the same outer-loop accumCnt the sibling's real
+   producer_acquire/consumer_release use.
+
+Siblings consumed within the owner producer's own partition (e.g. the `P` matrix at
+`buffer.offset = 0`, consumed by the PV MMA in the same gemm partition) are skipped
+— program order already orders those.
+
+```
+Without the fix (race):              With the fix (per outer tile):
+  [outer tile body]                    [outer tile body]
+    inner loop {                         wait m_ij backward (task 0, outer phase)
+      tc_gen5_mma useC=false <-- 1st     wait l_i0 backward (task 0, outer phase)
+      ... }                              inner loop {
+    epilogue: task0 reads m_ij/l_i0        tc_gen5_mma useC=false  (now gated)
+                                           ... }
+                                         epilogue: task0 reads m_ij/l_i0
+```
+
+`isFullOverwriteReuseOwner(ownerCh)` returns true when `ownerCh` is the
+representative (its alloc has no `buffer.offset`) and is a `TmemDataChannelPost`
+with `isOperandDNoAcc == true` (set in `createChannelPost` when the producer MMA's
+`useAccumulator()` is constant-false). The outer-cadence siblings are collected in
+`fullOverwriteOuterSiblings`; a debug-only assert in the emission step guards
+against silently dropping a required sibling back-edge (the bug class reappearing).
+Regression test:
+`test/Hopper/WarpSpecialization/ws_code_partition_tmem_packed_reuse_backward.mlir`;
+runtime validation is the FA-fwd-persistent dp kernel determinism check.
+
 ## Key Attributes
 
 | Attribute | Description | Set by | Read by |
@@ -366,3 +451,4 @@ pp: producer = local_store (task 3, comp)     → consumer = tc_gen5_mma (task 1
 | `verifyReuseGroup2` | `CodePartitionUtility.cpp` | Verify 2-buffer reuse group constraints |
 | `orderReuseGroup2` | `CodePartitionUtility.cpp` | Determine early/late channel ordering |
 | `needExplicitReuseWait` | `CodePartitionUtility.cpp` | Check if explicit cross-channel wait is needed |
+| `isFullOverwriteReuseOwner` | `CodePartitionUtility.cpp` | Detect a representative whose useC=false MMA producer overwrites the whole allocation (needs back-edges to all packed siblings) |

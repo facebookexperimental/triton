@@ -348,6 +348,17 @@ SmallVector<Channel *> orderReuseGroupN(ReuseGroup *group);
 // Returns true otherwise (explicit synchronization needed).
 bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel);
 
+// Returns true when `ownerCh` is the representative (space owner) of a reuse
+// group whose producer is a `tc_gen5_mma` with `useC=false`. Such a producer
+// ZEROS and overwrites the ENTIRE physical TMEM allocation before writing, not
+// just its own column subslice — so it clobbers every packed sibling channel's
+// columns. The owner's producer_acquire must therefore back-wait on each packed
+// sibling's consumer_release (the missing edge that causes the
+// FA-fwd-persistent TMEM aliasing race). Detection: the channel is the
+// representative (its alloc has no `buffer.offset`) and is a
+// `TmemDataChannelPost` with `isOperandDNoAcc`.
+bool isFullOverwriteReuseOwner(Channel *ownerCh);
+
 } // namespace mlir
 
 #endif // NV_DIALECT_HOPPER_TRANSFORMS_CODEPARTITIONUTILITY_H_
