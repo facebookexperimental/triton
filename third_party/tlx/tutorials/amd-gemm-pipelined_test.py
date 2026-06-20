@@ -162,8 +162,10 @@ def matmul_kernel_pipelined_mi300(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, strid
     # In general, when using tl.load + local_store
     # num buffers = pipeline-stage(local-store) - pipeline-stage(local-load)
     NUM_BUFFERS = NUM_STAGES - 1
-    buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tlx.dtype_of(a_ptr), NUM_BUFFERS)
-    buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tlx.dtype_of(b_ptr), NUM_BUFFERS)
+    # `num` must be a constexpr; passing the bound `NUM_BUFFERS` local would be
+    # promoted to a tensor handle by the AST visitor, so pass the constexpr expr inline.
+    buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tlx.dtype_of(a_ptr), tl.constexpr(NUM_STAGES - 1))
+    buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tlx.dtype_of(b_ptr), tl.constexpr(NUM_STAGES - 1))
 
     # Pipeline Prologue. (NUM_STAGES - 1) iterations
     for i in tl.range(0, NUM_STAGES - 1, loop_unroll_factor=NUM_STAGES - 1):
