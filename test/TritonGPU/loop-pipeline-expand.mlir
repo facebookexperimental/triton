@@ -96,3 +96,58 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// Pipelining a loop with a TMA reduce (atomic add) requires the pipeliner to
+// predicate the reduce when it is cloned into a guarded iteration of a dynamic
+// loop. The reduce writes to global memory but has no mask/pred operand, so it
+// must be wrapped in an scf.if guard. Regression test for crash "pipeliner
+// doesn't know how to predicate this op" on ttng.async_tma_reduce.
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tma_reduce_pipeline_predicate
+  tt.func public @tma_reduce_pipeline_predicate(%arg0: tensor<128x128xf32, #blocked>, %arg1: !tt.tensordesc<tensor<128x128xf32, #shared>>, %arg2: i32, %arg3: i32) {
+    %c0_i32 = arith.constant 0 : i32
+    %cst = arith.constant dense<2.000000e+00> : tensor<128x128xf32, #blocked>
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<128x128xf32, #shared, #smem, mutable>
+    // CHECK: scf.if
+    // CHECK: ttng.async_tma_reduce
+    scf.for %arg4 = %c0_i32 to %arg3 step %arg2 : i32 {
+      %0 = arith.mulf %arg0, %cst {loop.cluster = 0 : i32, loop.stage = 0 : i32} : tensor<128x128xf32, #blocked>
+      ttg.local_store %0, %buf {loop.cluster = 0 : i32, loop.stage = 0 : i32} : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #shared, #smem, mutable>
+      %1 = ttng.async_tma_reduce add, %arg1[%arg4, %c0_i32] %buf {loop.cluster = 0 : i32, loop.stage = 0 : i32} : !tt.tensordesc<tensor<128x128xf32, #shared>>, !ttg.memdesc<128x128xf32, #shared, #smem, mutable> -> !ttg.async.token
+      ttng.async_tma_store_token_wait %1 {loop.cluster = 1 : i32, loop.stage = 1 : i32} : !ttg.async.token
+    } {tt.num_stages = 2 : i32, tt.scheduled_max_stage = 1 : i32}
+    tt.return
+  }
+}
+
+// -----
+
+// Same as above but for a TMA scatter, which likewise has no pred operand and
+// must be wrapped in an scf.if guard when predicated by the pipeliner.
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tma_scatter_pipeline_predicate
+  tt.func public @tma_scatter_pipeline_predicate(%arg0: tensor<8x128xf32, #blocked>, %arg1: !tt.tensordesc<tensor<1x128xf32, #shared>>, %arg2: i32, %arg3: i32, %arg5: tensor<8xi32, #blocked1>) -> i32 {
+    %c0_i32 = arith.constant 0 : i32
+    %cst = arith.constant dense<2.000000e+00> : tensor<8x128xf32, #blocked>
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<8x128xf32, #shared, #smem, mutable>
+    // CHECK: scf.if
+    // CHECK: ttng.async_tma_scatter
+    %acc = scf.for %arg4 = %c0_i32 to %arg3 step %arg2 iter_args(%a = %c0_i32) -> (i32) : i32 {
+      %0 = arith.mulf %arg0, %cst {loop.cluster = 0 : i32, loop.stage = 0 : i32} : tensor<8x128xf32, #blocked>
+      ttg.local_store %0, %buf {loop.cluster = 0 : i32, loop.stage = 0 : i32} : tensor<8x128xf32, #blocked> -> !ttg.memdesc<8x128xf32, #shared, #smem, mutable>
+      ttng.async_tma_scatter %arg1[%arg5, %arg4] %buf {loop.cluster = 0 : i32, loop.stage = 0 : i32} : !tt.tensordesc<tensor<1x128xf32, #shared>>, tensor<8xi32, #blocked1>, i32, !ttg.memdesc<8x128xf32, #shared, #smem, mutable>
+      %next = arith.addi %a, %arg4 {loop.cluster = 1 : i32, loop.stage = 1 : i32} : i32
+      scf.yield %next : i32
+    } {tt.num_stages = 2 : i32, tt.scheduled_max_stage = 1 : i32}
+    tt.return %acc : i32
+  }
+}
