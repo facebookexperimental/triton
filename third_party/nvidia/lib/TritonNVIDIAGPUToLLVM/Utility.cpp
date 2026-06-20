@@ -308,12 +308,9 @@ LogicalResult lowerLdStMatrix(
   assert(regsPerCoreTile * bitwidth ==
          ((!isStore && bitwidth == 8 && transpose) ? 64 : 32));
 
-  // ldmatrix/stmatrix requires pow2 tile offset dimension
-  if (!llvm::isPowerOf2_32(tile.getOutDimSize(kOffset)))
-    return failure();
   // If we are lowering a subslice, the subslice offsets shall not touch the
   // contiguous part of the tile
-  if (maskSpanAffineOffset & (tile.getOutDimSize(kOffset) - 1)) {
+  if (maskSpanAffineOffset & (tile.getOutDimSizeLog2(kOffset) - 1)) {
     return failure();
   }
 

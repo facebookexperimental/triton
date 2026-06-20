@@ -182,7 +182,7 @@ private:
 
     // If we are lowering a subslice, the subslice offsets shall not touch the
     // contiguous part of the tile
-    if (maskSpanAffineOffset & (tile.getOutDimSize(kOffset) - 1)) {
+    if (maskSpanAffineOffset & (tile.getOutDimSizeLog2(kOffset) - 1)) {
       return failure();
     }
 
@@ -453,8 +453,7 @@ public:
   LogicalResult
   matchAndRewrite(triton::gpu::BarrierOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (!isCDNA(targetInfo.getISAFamily()) ||
-        targetInfo.getISAFamily() == AMD::ISAFamily::GFX1250)
+    if (targetInfo.getIsaVersion().Major < 9)
       return failure();
     // Check no other memory addrspaces are selected.
     // TensorRead/Write are allowed but noop.
@@ -554,9 +553,10 @@ struct MemoryCounterWaitOpConversion
   LogicalResult
   matchAndRewrite(amdgpu::MemoryCounterWaitOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    // amdgpu::MemoryCounterWaitOp supports gfx9 onwards
     auto isaVersion = targetInfo.getIsaVersion();
 
-    /// If major version >= fgx12, lower  to
+    /// If major version >= gfx12, lower to
     ///   * ROCDL::WaitDscntOp if ds is present
     ///   * ROCDL::WaitLoadcntOp if load is present
     ///   * ROCDL::WaitStorecntOp if store is present

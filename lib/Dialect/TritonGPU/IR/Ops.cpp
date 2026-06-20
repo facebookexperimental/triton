@@ -606,7 +606,7 @@ LogicalResult MemDescReshapeOp::verify() {
   if (failed(inferReturnTypes(getContext(), getLoc(), srcType,
                               dstType.getShape(), expectedTy)))
     return failure();
-  return OpTrait::impl::verifyEquivalentType(expectedTy, dstType);
+  return OpTrait::impl::verifyEquivalentMemDescType(expectedTy, dstType);
 }
 
 static LogicalResult inferMemDescReshapeOpEncoding(ArrayRef<int64_t> srcShape,
@@ -800,8 +800,8 @@ LogicalResult verifyMemoryOpTypes(Operation *op, ShapedType srcTy,
 }
 
 LogicalResult verifyAllocOp(Operation *op, Value src, MemDescType dstTy) {
-  // MemDescType::verify already checks shape[i] <= allocShape[i].
-  // For NPOT dims, getAllocationShapePerCTA handles pow2 rounding.
+  if (dstTy.getShape() != dstTy.getAllocShape())
+    return op->emitOpError("result shape and its alloc shape must match");
 
   if (!src) {
     if (!dstTy.getMutableMemory()) {

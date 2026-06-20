@@ -850,7 +850,7 @@ class CUDABackend(BaseBackend):
         if "consan" in options.instrumentation_mode:
             # Call ConcurrencySanitizerPass here, before allocating global scratch memory but after allocating tensor and shared
             passes.ttgpuir.add_concurrency_sanitizer(pm)
-            passes.common.add_canonicalizer(pm)
+            passes.gluon.add_canonicalizer(pm)
             passes.common.add_cse(pm)
         passes.ttgpuir.add_allocate_global_scratch_memory(pm)
         nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
@@ -1004,11 +1004,20 @@ class CUDABackend(BaseBackend):
             ptx_extra_options = opt.ptx_options.split(" ") if opt.ptx_options else []
 
             # Use -Ofc mid to compile ConSan code, if nothing else is specified.
-            if "consan" in knobs.compilation.instrumentation_mode:
+            if any(mode in knobs.compilation.instrumentation_mode for mode in ["consan", "fpsan"]):
                 ptx_extra_options += ["-Ofc", "mid"]
 
             # Add --regAllocOptLevel=2 to work around ptxas 13.x bug
             reg_alloc = ["--regAllocOptLevel=2"]
+
+            # compile_iq Stage-3 consumption (gated, default off; fail-open): if the PTX hash hits
+            # the ACF store, append --apply-controls (version check + lookup live in the helper).
+            if os.environ.get("TRITON_COMPILE_IQ_APPLY"):
+                try:
+                    from triton.compile_iq.consume import acf_args_for
+                    ptx_extra_options += acf_args_for(src, arch, get_ptxas(self.target.arch).version)
+                except Exception:
+                    pass
 
             ptxas_cmd = [
                 ptxas,

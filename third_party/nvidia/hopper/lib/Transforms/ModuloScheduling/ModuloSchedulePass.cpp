@@ -3838,20 +3838,27 @@ void jsonDumpWarpGroups(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl) {
   os << "],\n";
 }
 
-void dumpScheduleGraphAsJSON(ModuleOp moduleOp, StringRef path,
-                             ArrayRef<ScheduledLoop> scheduledLoops) {
-  // Locate the kernel function.
+// ---------------------------------------------------------------------------
+// Shared JSON-dump helpers (used by both the ScheduleGraph and the DDG dumper).
+// ---------------------------------------------------------------------------
+
+// Locate the kernel function (first tt.func in the module).
+tt::FuncOp findKernelFn(ModuleOp moduleOp) {
   tt::FuncOp kernelFn;
   moduleOp.walk([&](tt::FuncOp fn) {
     if (!kernelFn)
       kernelFn = fn;
   });
+  return kernelFn;
+}
 
-  // Build dump context: function arg names + loop ids.
-  // Triton's TensorDescriptor flattens to 5 args (ptr, 2x shape, 2x stride)
-  // that all share the same loc name (e.g. "a_desc"). Mirror MLIR's auto-
-  // rename behavior: first occurrence keeps the bare name; subsequent ones
-  // get _0, _1, ... so each emitted Python identifier is unique.
+// Build the dump context: disambiguated function arg names + loop ids.
+// Triton's TensorDescriptor flattens to 5 args (ptr, 2x shape, 2x stride)
+// that all share the same loc name (e.g. "a_desc"). Mirror MLIR's auto-
+// rename behavior: first occurrence keeps the bare name; subsequent ones
+// get _0, _1, ... so each emitted Python identifier is unique.
+JsonDumpContext buildJsonDumpContext(tt::FuncOp kernelFn,
+                                     ArrayRef<ScheduledLoop> scheduledLoops) {
   JsonDumpContext dc;
   if (kernelFn) {
     llvm::StringMap<unsigned> nameUseCount;
@@ -3870,19 +3877,12 @@ void dumpScheduleGraphAsJSON(ModuleOp moduleOp, StringRef path,
   }
   for (size_t i = 0; i < scheduledLoops.size(); ++i)
     dc.loopIds[scheduledLoops[i].loop] = static_cast<int>(i);
+  return dc;
+}
 
-  std::error_code ec;
-  llvm::raw_fd_ostream os(path, ec);
-  if (ec) {
-    llvm::errs() << "[modulo-schedule] Failed to open dump file '" << path
-                 << "': " << ec.message() << "\n";
-    return;
-  }
-
-  os << "{\n";
-  os << "  \"schema_version\": \"0.1\",\n";
-
-  // kernel section.
+// Emit the `"kernel": { name, args }` section (with trailing comma).
+void jsonDumpKernelSection(llvm::raw_ostream &os, tt::FuncOp kernelFn,
+                           const JsonDumpContext &dc) {
   os << "  \"kernel\": {\n";
   os << "    \"name\": \""
      << jsonEscape(kernelFn ? kernelFn.getName() : StringRef("")) << "\",\n";
@@ -3897,8 +3897,12 @@ void dumpScheduleGraphAsJSON(ModuleOp moduleOp, StringRef path,
   }
   os << "    ]\n";
   os << "  },\n";
+}
 
-  // ops table — every op in the kernel function.
+// Emit the `"ops": { ... }` flat op table (with trailing comma) — every op in
+// the kernel function, so DDG / ScheduleGraph op_refs resolve without the IR.
+void jsonDumpOpsTable(llvm::raw_ostream &os, tt::FuncOp kernelFn,
+                      const JsonDumpContext &dc) {
   os << "  \"ops\": {\n";
   if (kernelFn) {
     SmallVector<Operation *> all;
@@ -3911,6 +3915,25 @@ void dumpScheduleGraphAsJSON(ModuleOp moduleOp, StringRef path,
       jsonDumpOpEntry(os, all[i], dc, /*isLast=*/i + 1 == all.size());
   }
   os << "  },\n";
+}
+
+void dumpScheduleGraphAsJSON(ModuleOp moduleOp, StringRef path,
+                             ArrayRef<ScheduledLoop> scheduledLoops) {
+  tt::FuncOp kernelFn = findKernelFn(moduleOp);
+  JsonDumpContext dc = buildJsonDumpContext(kernelFn, scheduledLoops);
+
+  std::error_code ec;
+  llvm::raw_fd_ostream os(path, ec);
+  if (ec) {
+    llvm::errs() << "[modulo-schedule] Failed to open dump file '" << path
+                 << "': " << ec.message() << "\n";
+    return;
+  }
+
+  os << "{\n";
+  os << "  \"schema_version\": \"0.1\",\n";
+  jsonDumpKernelSection(os, kernelFn, dc);
+  jsonDumpOpsTable(os, kernelFn, dc);
 
   // loops section — drive off scheduledLoops, each contains a ScheduleGraph
   // (which itself may contain nested loops, but in fbsource beta each
@@ -3941,6 +3964,170 @@ void dumpScheduleGraphAsJSON(ModuleOp moduleOp, StringRef path,
 
   llvm::errs() << "[modulo-schedule] Dumped schedule graph (v0.1) to " << path
                << " (" << scheduledLoops.size() << " loop(s))\n";
+}
+
+// ============================================================================
+// JSON DDG Dumper (TRITON_MODULO_DUMP_DDG)
+// ============================================================================
+//
+// Dumps the *pre-schedule* layer: everything the solver consumes to produce
+// the ScheduleGraph. This is the `DataDependenceGraph` (built by
+// `DataDependenceGraph::build` from the TTGIR) plus the MinII analysis the
+// solver derives from it and the loop structure / global budgets that drive
+// schedule-graph generation. Unlike the ScheduleGraph dump, NO scheduling
+// results appear here (no cycle/stage/cluster, no buffers, no warp groups, no
+// cross-WG barriers) — those are all produced *from* this input.
+//
+// Schema "ddg-0.1":
+//   config — schedule algo + SMEM/TMEM budgets (global solver knobs)
+//   kernel — signature; ops — flat op table (self-contained, same as the
+//            ScheduleGraph dump so op_refs resolve)
+//   loops[].{loop_id,is_outer,induction_var,bounds,step,trip_count,
+//            min_ii/res_mii/rec_mii, ddg:{nodes,edges}}
+//   ddg.nodes carry the per-op hardware cost the LatencyModel assigned:
+//     pipeline, latency, self_latency, occupancy, min_warps (+ super-node
+//     inner_ii/prologue_latency). ddg.edges carry src/dst/distance/latency.
+//   `occupancy` is the hardware-engine hold time (≪ latency for multi-
+//   outstanding TMA loads); see D107922325 / OpLatencyInfo::occupancy.
+
+// Emit one DDG node: per-op hardware cost the LatencyModel assigned (super-
+// nodes additionally carry inner_ii / prologue_latency).
+void jsonDumpDDGNode(llvm::raw_ostream &os, const ttg::DDGNode &n, bool isLast) {
+  os << "          {\"id\": " << n.idx << ", \"op_ref\": "
+     << (n.op ? std::string("\"") + jsonOpId(n.op) + "\"" : std::string("null"))
+     << ", \"op_kind\": \""
+     << (n.op ? jsonEscape(n.op->getName().getStringRef()) : std::string(""))
+     << "\", \"pipeline\": \"" << jsonEscape(ttg::getPipelineName(n.pipeline))
+     << "\", \"latency\": " << n.latency
+     << ", \"self_latency\": " << n.selfLatency
+     << ", \"occupancy\": " << n.occupancy << ", \"min_warps\": " << n.minWarps
+     << ", \"is_super_node\": " << (n.isSuperNode ? "true" : "false");
+  if (n.isSuperNode)
+    os << ", \"inner_ii\": " << n.innerII
+       << ", \"prologue_latency\": " << n.prologueLatency;
+  os << "}" << (isLast ? "" : ",") << "\n";
+}
+
+// Emit one DDG edge: data-dependence with loop-carried distance + latency.
+void jsonDumpDDGEdge(llvm::raw_ostream &os, const ttg::DDGEdge &e, bool isLast) {
+  os << "          {\"src\": " << e.srcIdx << ", \"dst\": " << e.dstIdx
+     << ", \"kind\": \"" << (e.distance > 0 ? "loop_carried" : "data") << "\""
+     << ", \"distance\": " << e.distance << ", \"latency\": " << e.latency
+     << "}" << (isLast ? "" : ",") << "\n";
+}
+
+void jsonDumpDDGLoop(llvm::raw_ostream &os, const ttg::DataDependenceGraph &ddg,
+                     scf::ForOp forOp, int loopId, bool isOuter,
+                     const JsonDumpContext &dc, bool isLast) {
+  os << "    {\n";
+  os << "      \"loop_id\": " << loopId << ",\n";
+  os << "      \"is_outer\": " << (isOuter ? "true" : "false") << ",\n";
+
+  // Trip count: constant-folded from the loop bounds (matches the logic in
+  // buildScheduleLoop). Falls back to the estimate when bounds are dynamic.
+  int tripCount = kEstimatedTripCount;
+  bool tripEstimated = true;
+  {
+    auto lb = forOp.getLowerBound().getDefiningOp<arith::ConstantIntOp>();
+    auto ub = forOp.getUpperBound().getDefiningOp<arith::ConstantIntOp>();
+    auto step = forOp.getStep().getDefiningOp<arith::ConstantIntOp>();
+    if (lb && ub && step && step.value() > 0) {
+      int64_t tc = (ub.value() - lb.value() + step.value() - 1) / step.value();
+      if (tc > 0) {
+        tripCount = static_cast<int>(tc);
+        tripEstimated = false;
+      }
+    }
+  }
+  os << "      \"trip_count\": " << tripCount << ",\n";
+  os << "      \"trip_count_estimated\": " << (tripEstimated ? "true" : "false")
+     << ",\n";
+
+  // Loop structure (known before scheduling).
+  os << "      \"induction_var\": {\"name\": \"";
+  if (auto loc = dyn_cast<NameLoc>(forOp.getInductionVar().getLoc()))
+    os << jsonEscape(loc.getName());
+  else
+    os << "iv";
+  os << "\", \"type\": \""
+     << jsonEscape(jsonTypeStr(forOp.getInductionVar().getType())) << "\"},\n";
+  os << "      \"lower_bound\": ";
+  jsonDumpOperandRef(os, forOp.getLowerBound(), dc);
+  os << ",\n      \"upper_bound\": ";
+  jsonDumpOperandRef(os, forOp.getUpperBound(), dc);
+  os << ",\n      \"step\": ";
+  jsonDumpOperandRef(os, forOp.getStep(), dc);
+  os << ",\n";
+
+  // MinII analysis: the lower bounds the solver computes from the DDG.
+  // min_ii = max(res_mii, rec_mii, super-node II).
+  os << "      \"min_ii\": " << ddg.computeMinII()
+     << ", \"res_mii\": " << ddg.computeResMII()
+     << ", \"rec_mii\": " << ddg.computeRecMII() << ",\n";
+
+  // The DDG itself: nodes (per-op HW cost from the LatencyModel) + edges
+  // (data-dependence, with loop-carried distance). This is the solver input.
+  os << "      \"ddg\": {\n";
+  os << "        \"nodes\": [\n";
+  auto nodes = ddg.getNodes();
+  for (size_t i = 0; i < nodes.size(); ++i)
+    jsonDumpDDGNode(os, nodes[i], /*isLast=*/i + 1 == nodes.size());
+  os << "        ],\n";
+
+  os << "        \"edges\": [\n";
+  auto edges = ddg.getEdges();
+  for (size_t i = 0; i < edges.size(); ++i)
+    jsonDumpDDGEdge(os, edges[i], /*isLast=*/i + 1 == edges.size());
+  os << "        ]\n";
+  os << "      }\n";
+  os << "    }" << (isLast ? "" : ",") << "\n";
+}
+
+void dumpDDGAsJSON(ModuleOp moduleOp, StringRef path,
+                   ArrayRef<ScheduledLoop> scheduledLoops) {
+  tt::FuncOp kernelFn = findKernelFn(moduleOp);
+  JsonDumpContext dc = buildJsonDumpContext(kernelFn, scheduledLoops);
+
+  std::error_code ec;
+  llvm::raw_fd_ostream os(path, ec);
+  if (ec) {
+    llvm::errs() << "[modulo-schedule] Failed to open DDG dump file '" << path
+                 << "': " << ec.message() << "\n";
+    return;
+  }
+
+  os << "{\n";
+  os << "  \"schema_version\": \"ddg-0.1\",\n";
+
+  // config — global knobs that shape how the solver turns this DDG into a
+  // ScheduleGraph (algorithm choice + memory budgets driving buffer sizing).
+  {
+    std::string algo = triton::tools::getStrEnv("TRITON_USE_MODULO_SCHEDULE");
+    if (algo.empty())
+      algo = "rau";
+    os << "  \"config\": {\"schedule_algo\": \"" << jsonEscape(algo)
+       << "\", \"smem_budget_bytes\": " << kSmemBudgetBytes()
+       << ", \"tmem_budget_bytes\": " << kTmemBudgetBytes << "},\n";
+  }
+
+  // kernel + ops sections (self-contained, same shape as the ScheduleGraph
+  // dump so DDG node op_refs resolve without the IR).
+  jsonDumpKernelSection(os, kernelFn, dc);
+  jsonDumpOpsTable(os, kernelFn, dc);
+
+  // loops — one DDG per scheduled loop (inner + outer for nested kernels).
+  os << "  \"loops\": [\n";
+  for (size_t i = 0; i < scheduledLoops.size(); ++i) {
+    const auto &sl = scheduledLoops[i];
+    scf::ForOp forOp = sl.loop;
+    jsonDumpDDGLoop(os, sl.ddg, forOp, static_cast<int>(i), sl.isOuter, dc,
+                    /*isLast=*/i + 1 == scheduledLoops.size());
+  }
+  os << "  ]\n";
+  os << "}\n";
+
+  llvm::errs() << "[modulo-schedule] Dumped DDG (ddg-0.1) to " << path << " ("
+               << scheduledLoops.size() << " loop(s))\n";
 }
 
 } // namespace
@@ -4157,6 +4344,12 @@ struct ModuloSchedulePass
     // Optional: dump the ScheduleGraph as JSON for the TLX emitter.
     if (const char *path = std::getenv("TRITON_MODULO_DUMP_SCHEDULE")) {
       dumpScheduleGraphAsJSON(moduleOp, path, scheduledLoops);
+    }
+    // Optional: dump the pre-schedule DDG layer (the solver's input + the
+    // MinII analysis it derives) as JSON. This is everything needed to
+    // regenerate the ScheduleGraph from the DDG.
+    if (const char *path = std::getenv("TRITON_MODULO_DUMP_DDG")) {
+      dumpDDGAsJSON(moduleOp, path, scheduledLoops);
     }
   }
 };
