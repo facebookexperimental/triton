@@ -120,6 +120,81 @@ Show backwards barriers as upward arrows or annotated return edges in the
 dependency graph. When a backwards token chain is expected but the SSA token
 is unused (not loop-carried), flag it as a potential issue.
 
+#### Column-Packed TMEM Aliasing (full-overwrite producers)
+
+**This is a high-value, easy-to-miss class.** The memory planner packs several
+small TMEM buffers into the spare *columns* of a larger allocation: they share one
+`buffer.id` but carry different `buffer.offset` values (e.g. a 128x128 QK
+accumulator at offset 0 with `alpha`/`m_ij`/`l_i0` scalars packed at columns
+64/65/66). Unlike *merged* barriers (one barrier protecting several buffers), each
+column-packed channel gets its **own independent token**. Every token is therefore
+individually arrive/wait-balanced, so the per-token checks in Sections 3-4 all
+pass even when the kernel races.
+
+The hazard appears when the **owner** of the allocation (the channel whose alloc
+has NO `buffer.offset`) is produced by a **full-overwrite producer** — a
+`tc_gen5_mma` with `useC=false` / `useAccumulator = false`, which ZEROS the entire
+allocation (all columns) before writing. Such a producer clobbers every packed
+sibling's columns, so its producer-side acquire must wait on the consumer-release
+of **every** packed sibling, not just its own channel. If a packed sibling is
+consumed by a *different* partition (e.g. the default/correction partition reads
+`alpha`/`m_ij`/`l_i0` after the inner loop) and there is no backward edge from
+that consumer to the owner's producer, the next-iteration MMA overwrites the
+scalars mid-read — a non-deterministic data race (the FA-fwd-persistent bug).
+
+When auditing, for each `buffer.id` with column-packed members:
+1. Identify the **owner** (alloc with no `buffer.offset`) and the **packed
+   siblings** (`buffer.offset > 0`).
+2. Check whether the owner's producer is a `tc_gen5_mma` with `useC=false`
+   (4th operand `%false`, or `useAccumulator` traced to a constant false). If so,
+   it overwrites ALL columns.
+3. For each packed sibling whose consumer is in a **different partition** than the
+   owner's producer, verify there is a backward `producer_acquire` / `wait_barrier`
+   on that sibling's token in the owner-producer's partition, before the owner's
+   overwrite. Mind the **cadence**: if the sibling is produced/consumed at the same
+   loop level as the MMA, the wait sits right before the MMA; if the sibling is
+   read at an outer level (e.g. a per-tile epilogue while the MMA runs in an inner
+   KV loop), the wait must sit **before the inner loop** and use the sibling's
+   outer-loop phase. A same-cadence wait on an outer-cadence barrier (or vice
+   versa) deadlocks rather than racing.
+4. **Flag a race if any such back-edge is missing** — the owner's barrier alone
+   (gating only the owner channel's own consumer) is NOT sufficient. Siblings
+   consumed within the owner-producer's own partition are safe (program order).
+
+This check is invisible to arrive/wait-count balancing: the missing edge is an
+*absent* barrier across physically-aliased columns, not an imbalanced one. The
+compiler models the required edge via `isFullOverwriteReuseOwner` in
+`CodePartitionUtility.cpp`; the regression IR is
+`test/Hopper/WarpSpecialization/ws_code_partition_tmem_packed_reuse_backward.mlir`.
+
+**Emit a coverage table (enumerate absences, not just presences).** The reason
+this class slips through is that reports describe the barriers that *exist*; force
+the analysis to enumerate the barriers that *should* exist. For each physical
+`buffer.id` whose owner has a full/partial-overwrite producer, emit one row per
+aliased buffer the write touches, and mark each ✓ ordered or ✗ MISSING:
+
+```
+Physical buffer.id = 8 (owner: QK accumulator, 128 cols)
+  Writer: tc_gen5_mma useC=false  (task 1, inner loop)  write-extent: cols 0-127
+  Aliased buffers overwritten:
+    cols 0-63  QK result   consumer task 5 (gemm-internal)   ✓ ordered (QK backward)
+    col  64    alpha       consumer task 0 (inner cadence)   ✓ own per-iter barrier
+    col  65    m_ij        consumer task 0 (outer cadence)   ✗ MISSING backward edge
+    col  66    l_i0        consumer task 0 (outer cadence)   ✗ MISSING backward edge
+```
+
+A ✗ is a race. Always print the table even when all cells are ✓ — the table is the
+artifact that makes an omission visible.
+
+This pattern rule is a manual stand-in for a future **executable** coverage
+verifier (a `triton-opt` pass / `doCodePartitionPost` invariant that models
+physical layout, per-op write extent, and loop cadence). See
+`third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/docs/WSAliasingCoverage.proposal.md`.
+When that verifier lands, this section becomes "run the verifier and interpret its
+output." To validate this rule today, run the skill against the pre-fix
+`ws_code_partition_tmem_packed_reuse_backward.mlir` (the back-edges removed) and
+confirm the coverage table reports ✗ for `m_ij`/`l_i0`.
+
 #### Barrier Mechanism Types
 
 | Mechanism | Arrive Side | Wait Side | Notes |
@@ -260,6 +335,14 @@ Include:
      If so, backwards sync is implicit. If single-buffered, check for explicit
      backward barriers.
    - Legacy WS: Does `consumer_release` pair with the next `producer_acquire`?
+10. **Check column-packed TMEM aliasing** (see "Column-Packed TMEM Aliasing"
+    above). Group `tmem_alloc` ops by `buffer.id`; within each group, separate the
+    owner (no `buffer.offset`) from packed siblings (`buffer.offset > 0`). If the
+    owner is produced by a `useC=false` `tc_gen5_mma` (full-allocation zeroing
+    write), verify its producer partition back-waits, before the MMA, on every
+    packed sibling whose consumer lives in another partition. Flag any missing
+    back-edge as a data race — this is NOT caught by arrive/wait-count balancing,
+    because each packed sibling's token is individually balanced.
 
 ## Example Reports
 
