@@ -28,20 +28,32 @@ Related skills: `autows-testing` (run tests), `ir-debugging` (IR dumps),
 
 ## Key Authoring Rules
 
-1. **Place `warp_specialize=True` on the outermost/persistent loop.** For
+1. **Prefer a persistent kernel — give AutoWS a loop to specialize.** AutoWS
+   pipelines work across *loop iterations* (the producer loads tile N+1 while
+   the consumers compute tile N), so a kernel with no loop gives the compiler
+   nothing to specialize and WS is silently stripped. Single-shot
+   pointwise / memory-bound ops — e.g. a fused SwiGLU forward that handles one
+   row-block per program — must be restructured into a **persistent** kernel
+   (`grid = #SMs`; each program loops over output tiles with
+   `tl.range(start_pid, num_tiles, NUM_SMS, warp_specialize=True)`) so the
+   load→compute→store pipeline spans iterations. This applies even when the
+   per-tile body has no reduction loop: the persistent tile loop is itself the
+   loop AutoWS specializes.
+
+2. **Place `warp_specialize=True` on the outermost/persistent loop.** For
    persistent kernels, annotate the tile loop
    (`tl.range(start_pid, num_tiles, NUM_SMS, warp_specialize=True)`), not the
    inner K-reduction loop. The inner loop uses plain `range()`. For
    non-persistent kernels, annotate the main compute loop.
 
-2. **Use TMA loads.** AutoWS partitions loads into a producer warp group and
+3. **Use TMA loads.** AutoWS partitions loads into a producer warp group and
    compute into consumer warp groups. This partitioning is most effective with
    TMA descriptor loads (`a_desc.load(...)`) rather than pointer-based
    `tl.load()`. TMA enables async bulk copies that the producer can issue
    independently while consumers compute. All reference kernels use
    `TensorDescriptor` + `desc.load()`/`desc.store()`.
 
-3. **Memory allocation and partition scheduling kwargs are Meta-only.** The
+4. **Memory allocation and partition scheduling kwargs are Meta-only.** The
    `tl.range()` kwargs for controlling memory allocation (`smem_alloc_algo`,
    `tmem_alloc_algo`, `smem_budget`, `smem_circular_reuse`) and partition
    scheduling (`merge_epilogue`, `merge_correction`,
