@@ -273,6 +273,13 @@ class HIPBackend(BaseBackend):
         if use_async_copy:
             amd.passes.ttgpuir.add_coalesce_async_copy(pm, options.arch)
         amd.passes.ttgpuir.add_convert_to_tensor_ops(pm)
+        # TTGIR-level replacement for the LLIR `LLIRSchedule` pass.
+        # Opt-in via TRITON_ENABLE_TTGIR_SCHED=1 (planning-only by default);
+        # mutate IR via TRITON_TTGIR_SCHED_APPLY=1. See
+        # third_party/amd/lib/TritonAMDGPUTransforms/DotDecomposeAndSchedule.cpp
+        # and claude/README.md.
+        if os.environ.get("TRITON_ENABLE_TTGIR_SCHED"):
+            amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm)
         passes.common.add_canonicalizer(pm)
         if options.schedule_hint.lower() != "none":
             for hint in options.schedule_hint.split(","):

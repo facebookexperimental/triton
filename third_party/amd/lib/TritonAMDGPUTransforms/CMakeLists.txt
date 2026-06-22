@@ -6,6 +6,7 @@ add_triton_library(TritonAMDGPUTransforms
   CoalesceBufferOps.cpp
   ConvertToBufferOps.cpp
   ConvertToTensorOps.cpp
+  DotDecomposeAndSchedule.cpp
   LowerBarrierOps.cpp
   OptimizeEpilogue.cpp
   OptimizeDotOperands.cpp
