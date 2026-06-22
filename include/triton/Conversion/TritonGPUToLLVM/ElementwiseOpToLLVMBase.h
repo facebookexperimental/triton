@@ -89,15 +89,8 @@ public:
     auto invReg = inv.sublayout(dims, {kReg});
     auto bases_inv = invReg.getBases();
     for (auto [c, d] : llvm::zip(constancy, dims)) {
-      // Only the largest pow2 divisor of the constancy maps cleanly onto
-      // register bases. For NPOT constancy (e.g. 48, from a store mask
-      // broadcast over a non-pow2 free dim) clamping to (c & -c) dedups the
-      // pow2 part and leaves the rest, instead of mis-treating 48 as 32
-      // (Log2_32 floor). Since c is a multiple of (c & -c), all constancy
-      // block boundaries are aligned to it, so the zeroed low bits never
-      // cross a block boundary. For pow2 c this is unchanged.
-      int64_t pow2C = c & (-c);
-      for (int i = 0; i < llvm::Log2_64(pow2C); i++) {
+      assert(llvm::isPowerOf2_32(c));
+      for (int i = 0; i < llvm::Log2_32(c); i++) {
         bases_inv[d][i] = {0};
       }
     }

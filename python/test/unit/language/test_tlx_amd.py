@@ -68,7 +68,7 @@ def _async_load_kernel(
     tl.store(output_ptr + offs, x + y, mask=mask)
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
 def test_async_load_compiles_gfx950(device):
     """async_load should produce async_copy_global_to_local in TTGIR on gfx950."""
     compiled = compile_for_gfx950(
@@ -125,7 +125,7 @@ def _local_load_kernel(
     tl.store(output_ptr + offs, x, mask=mask)
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
 def test_local_load_compiles_gfx950(device):
     """local_load after async_wait should compile and produce local_load in TTGIR."""
     compiled = compile_for_gfx950(
@@ -158,7 +158,7 @@ def _local_load_with_token_kernel(
     tl.store(output_ptr + offs, x, mask=mask)
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
 def test_local_load_with_token_compiles_gfx950(device):
     """local_load with a wait token should set syncedViaAsyncWait in TTGIR."""
     compiled = compile_for_gfx950(
@@ -219,7 +219,7 @@ def _token_in_loop_kernel(
     tl.store(output_ptr + offs, acc, mask=mask)
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
 def test_async_token_loop_compiles_gfx950(device):
     """async_token in scope around tl.range should compile without crashing."""
     compiled = compile_for_gfx950(
@@ -281,7 +281,7 @@ def _loop_carried_dot_layout_kernel(
     tl.store(c_ptrs, acc)
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
 def test_loop_carried_dot_layout_cleanup_compiles_gfx950(device):
     """Full AMD pipeline should remove late dot operand local_alloc fallbacks."""
     compiled = compile_for_gfx950(

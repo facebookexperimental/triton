@@ -8,11 +8,15 @@ import json
 import os
 import sys
 
-sys.path.insert(0, "/data/users/daohang/fbtriton/third_party/compile_iq")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # the compile_iq pkg root
 from compile_iq import store
 
 
 def main():
+    # TODO(compile_iq perf, item 3): gate stores on a heavy locked-clock A/B re-validation of the
+    # candidate (the ws_ab.py win-gate on branch daohang/compile_iq_perf_harness) -- only persist ACFs
+    # that beat the no-ACF baseline beyond the noise floor, so a winner's-curse / noise "win" is never
+    # stored. Today this stores the search's best unconditionally.
     task_dir, hex_file = sys.argv[1], sys.argv[2]
     spec = json.load(open(os.path.join(task_dir, "spec.json")))
     acf = bytes.fromhex(open(hex_file).read().strip())

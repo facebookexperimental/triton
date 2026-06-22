@@ -79,15 +79,11 @@ def main():
     rel = (c.float() - ref.float()).abs().max() / ref.float().abs().max()
     assert torch.isfinite(rel) and rel.item() <= REL_TOL, f"correctness failed: rel-err {rel.item():.3e}"
 
-    # Denoise-grade measurement: ws vs cuBLAS.
-    quantiles = [0.5, 0.2, 0.8]
-    ws_ms, ws_lo, ws_hi = triton.testing.do_bench(lambda: matmul(a, b), quantiles=quantiles, warmup=2000, rep=2000)
-    bl_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), warmup=2000, rep=2000, return_mode="mean")
+    # Denoise-grade measurement of the WS kernel (no cuBLAS baseline -- not needed for the e2e).
+    ws_ms = triton.testing.do_bench(lambda: matmul(a, b), warmup=2000, rep=2000, return_mode="median")
 
     print(f"shape M=N=K={M}  dtype={DTYPE}  heuristic-config (single)")
     print(f"  ws     : {ws_ms:.4f} ms  =  {_tflops(ws_ms):.1f} TFLOPS  (rel-err {rel.item():.2e})")
-    print(f"  cuBLAS : {bl_ms:.4f} ms  =  {_tflops(bl_ms):.1f} TFLOPS")
-    print(f"  ws/cuBLAS speed: {bl_ms / ws_ms:.3f}x")
 
 
 if __name__ == "__main__":

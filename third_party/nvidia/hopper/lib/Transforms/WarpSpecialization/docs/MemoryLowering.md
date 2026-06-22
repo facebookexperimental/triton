@@ -133,6 +133,32 @@ maximize overlap with computation. See
 [TMA Store Wait Pipeline](TMAStoreWaitPipeline.md) for the full
 annotation → validation → reorder → lowering sequence.
 
+### Pipeliner Predication of TMA Store-Family Ops
+
+Once the store-family ops are lowered early, the generic loop pipeliner
+(`TritonGPUPipeline`) can pull them into a software-pipelined loop. When that
+loop is treated as a *dynamic* loop (the runtime trip count is not statically
+known to be ≥ the number of pipeline stages — true for essentially every
+Triton `i32` loop), the pipeliner peels prologue/epilogue iterations and must
+**predicate** any op it speculatively executes for an iteration that may be
+past the real trip count. For a store this is not optional: running it for a
+non-existent iteration corrupts the output (and for a TMA *reduce* / atomic add,
+double-counts via a spurious atomic).
+
+The TMA store-family ops — `AsyncTMACopyLocalToGlobalOp`, `AsyncTMAReduceOp`,
+and `AsyncTMAScatterOp` — write to global memory but have **no mask/pred
+operand**, so they cannot be masked in place like `tt.store` or
+`tt.atomic_rmw`. Instead, `predicateOp` (in
+`lib/Dialect/TritonGPU/Transforms/Pipeliner/PipeliningUtility.cpp`) guards each
+one by wrapping it in `scf.if(pred) { op }` (yielding `ub.poison` for the
+optional token in the else branch). The paired `TMAStoreTokenWaitOp` is
+predicated the same way. **All three store-family ops must appear in that
+`scf.if`-wrapping list**; a missing entry makes the pipeliner abort with
+`pipeliner doesn't know how to predicate this op` (this was the original gap
+for `AsyncTMAReduceOp`/`AsyncTMAScatterOp`). Lit coverage:
+`test/TritonGPU/loop-pipeline-expand.mlir`
+(`@tma_reduce_pipeline_predicate`, `@tma_scatter_pipeline_predicate`).
+
 ## 1D TMEM Allocation
 
 **File**: `TMEMAlloc1D.cpp`

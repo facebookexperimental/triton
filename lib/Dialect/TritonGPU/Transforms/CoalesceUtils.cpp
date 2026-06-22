@@ -74,10 +74,6 @@ buildCoalescedEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis, Operation *op,
   }
 
   perThread = std::min<int>(perThread, std::max(numElems / numThreads, 1));
-  // Non-pow2 shapes can make numElems/numThreads non-pow2 (e.g. 768/128=6).
-  // Round down to pow2 so vector loads have valid widths and alignment.
-  if (!llvm::isPowerOf2_32(perThread))
-    perThread = 1u << llvm::Log2_32(perThread);
   LDBG("perThread: " << perThread);
 
   if (!dyn_cast<triton::LoadOp>(op)) {

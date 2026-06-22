@@ -14,12 +14,13 @@ Usage: python ptx_bench_one.py <kernel.ptx> <spec.json> <acf_path|NONE> [warmup]
 Prints exactly one line: "MS <float>" on success, else "INVALID".
 """
 import json
+import os
 import sys
 
 import torch
 import triton
 
-sys.path.insert(0, "/data/users/daohang/fbtriton/third_party/compile_iq")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # the compile_iq pkg root
 from compile_iq import ptx_launch as L
 
 REL_TOL = 1e-2
@@ -68,6 +69,9 @@ def main():
                 print("INVALID")
                 return
         # 4) benchmark the candidate launch.
+        # TODO(compile_iq perf, item 1): this runs at UNLOCKED clocks with a short do_bench, so the
+        # per-candidate ms is noisy (~+-2-4%). Lock the GPU to a sustainable clock for trustworthy
+        # search ranking (see ws_ab.py on branch daohang/compile_iq_perf_harness).
         ms = triton.testing.do_bench(lambda: k.launch(spec["grid"], spec["block"], ka), warmup=warmup, rep=rep,
                                      return_mode="mean")
         del tms

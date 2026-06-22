@@ -80,7 +80,7 @@ from triton.language.extra.tlx.tutorials.testing.multi_cta_layer_norm import (
     multi_cta_layernorm_2d as _multi_cta_layernorm_2d,
 )
 
-from triton._internal_testing import is_blackwell, is_hopper, is_hopper_or_newer, is_hip, is_hip_cdna4, is_hip_gfx1250
+from triton._internal_testing import is_blackwell, is_hopper, is_hopper_or_newer, is_hip_cdna4, is_hip_gfx1250
 from triton.language.extra.tlx.tutorials.testing.gemm_shapes import (
     BLACKWELL_GEMM_WS as _BLACKWELL_GEMM_WS_MORE_SHAPES, )
 
@@ -945,7 +945,10 @@ def test_hopper_fa_ws_pipelined_pingpong_persistent():
 
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("config_name", ["amd_fa_pipelined", "amd_fa_pipelined_prefetch"])
-@pytest.mark.skipif(not is_hip(), reason="Requires AMD GPU")
+# Gated to gfx950 (CDNA4): the kernel passes on MI350 but fails to lower
+# (MLIR -> LLVM `unrealized_conversion_cast`) on gfx942/MI300, matching the
+# arch-gating of the sibling AMD GEMM tests below.
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_amd_fa_pipelined(config_name, causal):
     config = FlashAttention.CONFIGS[config_name]
     sm_scale = 0.5

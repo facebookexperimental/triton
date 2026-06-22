@@ -8,7 +8,8 @@ launches the cubin via the CUDA driver, instead of recompiling the kernel from s
 
 Run (matching versions REQUIRED: a cuda-X.Y .config -> ACFs only ptxas X.Y accepts):
   conda run -n evo python ptx_evo_search.py <kernel.ptx> <spec.json> <search_space.config> [timeout_s]
-Emits the best candidate's hex ACF to <spec_dir>/best.acf.hex (override via EVO_BEST_OUT).
+Emits the best candidate's hex ACF to EVO_BEST_OUT (default: a fresh scratch dir, so the task dir
+stays input-only) and logs the (noisy) search-time win vs the no-ACF baseline.
 """
 import os
 import pathlib
@@ -96,9 +97,30 @@ def main():
         print("[ptx-evo] no valid candidate -- nothing to emit.", flush=True)
         return
 
-    best_out = os.environ.get("EVO_BEST_OUT", os.path.join(os.path.dirname(SPEC_FILE), "best.acf.hex"))
+    # Transient handoff to the (base-env) store step. Default to a fresh scratch dir, NOT the task dir
+    # -- the task dir stays input-only (kernel.ptx + spec.json). Callers set EVO_BEST_OUT explicitly.
+    best_out = os.environ.get("EVO_BEST_OUT") or os.path.join(tempfile.mkdtemp(prefix="ciq_evo_"), "best.acf.hex")
     with open(best_out, "w") as f:
         f.write(best["params"])
+    # Search-time win vs the no-ACF baseline (same cheap per-candidate bench -> NOISY; the trustworthy
+    # locked-clock A/B is at consumption). Best-effort: skip the win if baseline can't be measured.
+    # TODO(compile_iq perf, item 2): `best_ms` is the MIN over noisy candidates (winner's curse ->
+    # biased low) compared to a single un-selected baseline, so this win is inflated and unstable
+    # run-to-run. Replace with a per-candidate interleaved A/B (base vs ACF, median over rounds, locked
+    # clocks) so the reported win predicts consume.
+    base_ms = None
+    try:
+        bo = subprocess.run([BASE_PY, BENCH_ONE, PTX_FILE, SPEC_FILE, "NONE", "50", "100"], capture_output=True,
+                            text=True, timeout=PER_CAND_TIMEOUT + 60)
+        for line in bo.stdout.splitlines():
+            if line.startswith("MS "):
+                base_ms = float(line.split()[1])
+    except Exception:
+        pass
+    win = f"{(base_ms - best_ms) / base_ms * 100:+.2f}%" if base_ms else "n/a"
+    print(
+        f"[ptx-evo] best ACF search-time win={win} (best_ms={best_ms} vs no-ACF baseline={base_ms}; "
+        "NOISY -- validate at consume)", flush=True)
     print(f"[ptx-evo] wrote best ACF hex -> {best_out}", flush=True)
     print("PTX_EVO_SEARCH_OK")
 

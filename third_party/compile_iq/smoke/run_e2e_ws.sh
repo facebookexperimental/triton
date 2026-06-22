@@ -49,17 +49,18 @@ TRITON_COMPILE_IQ_COLLECT=1 "$PY" "$KERNEL" 2>&1 | grep -iE "collector|ws *:" ||
 # pick the warp-specialized GEMM task (the TMA kernel), not the split-K reduce helper.
 WSTASK=""
 for d in "$COMPILE_IQ_TASK_DIR"/*/; do
-    if grep -q '"matmul_kernel_tma_ws_blackwell"' "$d/spec.json" 2>/dev/null; then WSTASK="$d"; break; fi
+    if grep -q '"matmul_kernel_tma_ws_blackwell"' "$d/spec.json" 2>/dev/null; then WSTASK="${d%/}"; break; fi
 done
 [ -n "$WSTASK" ] || { echo "FAIL: no WS (TMA) task collected"; exit 1; }
 echo "   ws task: $WSTASK"
 
 # --- [2/3] factory: EVO over the tier, each candidate scored by PTX-direct driver launch. ---
 echo "== [2/3] factory: EVO PTX-direct ($(basename "$SS_CONFIG"), per-candidate ${PER_CAND_TIMEOUT}s) =="
-"$EVO_PY" -u "$HERE/ptx_evo_search.py" "$WSTASK/kernel.ptx" "$WSTASK/spec.json" "$SS_CONFIG" "$PER_CAND_TIMEOUT" \
-    2>&1 | grep -E "ptx-evo|PTX_EVO_SEARCH" || true
-if [ -f "$WSTASK/best.acf.hex" ]; then
-    "$PY" "$HERE/store_acf.py" "$WSTASK" "$WSTASK/best.acf.hex"
+BESTHEX="$(mktemp -d)/best.acf.hex"   # factory handoff -> kept OUT of the input-only task dir
+EVO_BEST_OUT="$BESTHEX" "$EVO_PY" -u "$HERE/ptx_evo_search.py" "$WSTASK/kernel.ptx" "$WSTASK/spec.json" \
+    "$SS_CONFIG" "$PER_CAND_TIMEOUT" 2>&1 | grep -E "ptx-evo|PTX_EVO_SEARCH" || true
+if [ -f "$BESTHEX" ]; then
+    "$PY" "$HERE/store_acf.py" "$WSTASK" "$BESTHEX"   # task dir read-only (spec for sha/arch); ACF from scratch
 else
     echo "   (no ACF minted -- consume will MISS = baseline)"
 fi
@@ -70,7 +71,7 @@ rc=0
 timeout -k 10 "$CONSUME_TIMEOUT" env \
     TRITON_COMPILE_IQ_APPLY=1 TRITON_COMPILE_IQ_DEBUG=1 TRITON_ALWAYS_COMPILE=1 \
     COMPILE_IQ_PTXAS_MIN_VERSION="$PTXAS_MIN_VERSION" WS_GEMM_SIZE="$WS_GEMM_SIZE" \
-    "$PY" "$KERNEL" 2>&1 | grep -iE "compile_iq|HIT|MISS|ws *:|cuBLAS|speed" || rc=$?
+    "$PY" "$KERNEL" 2>&1 | grep -iE "compile_iq|HIT|MISS|ws *:" || rc=$?
 if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
     echo "!! consume TIMED OUT -- applied ACF likely wedged the GPU. FAIL."; exit 1
 fi
