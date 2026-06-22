@@ -9,9 +9,9 @@
 # rebuilt with fill_tma_descriptor_tiled and passed as by-value 128B tensormaps. Correctness per
 # candidate is self-consistency vs the no-ACF launch; consume then validates vs torch in the sample.
 #
-# Defaults: WS_GEMM_SIZE=2048 (the 8192^3 config overflows B200 smem; 2048^3 fits), ptxas 13.0 + the
-# cuda-13.0 p0 tier (safest). Use TIER=p2 for the perf-win search. Version matching is required: the
-# ptxas must match the tier AND the installed driver (PTX ISA).
+# Defaults: WS_GEMM_SIZE=2048 (the 8192^3 config overflows B200 smem; 2048^3 fits), ptxas 12.8 + the
+# cuda-12.8 p0 tier (safest). Use TIER=p2 for the perf-win search. Version matching is required: the
+# ptxas must match the tier AND the installed driver (PTX ISA; a 12.8-ISA cubin runs on the 13.0 driver).
 #
 # Usage: third_party/compile_iq/smoke/run_e2e_ws.sh
 # Optional env: WS_GEMM_SIZE, TIER (p0/p1/p2, default p0), PTXAS_KNOBS, SS_CONFIG, PTXAS,
@@ -22,11 +22,11 @@ KERNEL="$HERE/../examples/blackwell_gemm_ws_sample.py"
 
 PY="${PY:-python}"
 EVO_PY="${EVO_PY:-$(conda info --base 2>/dev/null)/envs/evo/bin/python}"
-PTXAS="${PTXAS:-/usr/local/cuda-13.0/bin/ptxas}"
+PTXAS="${PTXAS:-/usr/local/cuda-12.8/bin/ptxas}"
 PTXAS_KNOBS="${PTXAS_KNOBS:-/data/users/$USER/ptxas_knobs}"
 TIER="${TIER:-p0}"
-SS_CONFIG="${SS_CONFIG:-$PTXAS_KNOBS/cuda-13.0-ptxas-${TIER}.config}"
-PTXAS_MIN_VERSION="${PTXAS_MIN_VERSION:-13.0}"
+SS_CONFIG="${SS_CONFIG:-$PTXAS_KNOBS/cuda-12.8-ptxas-${TIER}.config}"
+PTXAS_MIN_VERSION="${PTXAS_MIN_VERSION:-12.8}"
 PER_CAND_TIMEOUT="${PER_CAND_TIMEOUT:-30}"
 CONSUME_TIMEOUT="${CONSUME_TIMEOUT:-360}"
 
