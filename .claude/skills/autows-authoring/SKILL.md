@@ -61,6 +61,18 @@ Related skills: `autows-testing` (run tests), `ir-debugging` (IR dumps),
    exclusively by Meta's WS passes. They do not exist in OSS Triton's
    `tl.range()` — see [OSS Fallback](#oss-triton-fallback) for how to gate them.
 
+5. **Compute the post-loop epilogue from the genuine MMA accumulator — never a
+   synthetic matmul.** The partition scheduler keeps a post-loop
+   reduction/gate/epilogue only if it sits in a real MMA's backward slice. If the
+   reduction is fed by a *synthetic* matmul inserted only to create an MMA (e.g.
+   `(x·x)@e0` to get a row-sum), the post-loop region belongs to no genuine MMA
+   and the scheduler **elides the entire epilogue**: the kernel still emits
+   `ttg.warp_specialize` and passes a structural WS check, but the `tl.sum` /
+   normalize / `tt.store` ops are all dropped and the output is unwritten garbage
+   (a silent correctness failure, not a compile error). Reduce or gate from the
+   real `A@B` accumulator instead. Confirm the WS TTGIR has a dedicated
+   `"epilogue"` Meta partition and that the store ops survive.
+
 ---
 
 ## Enabling AutoWS
@@ -406,6 +418,13 @@ def test_my_kernel():
    ```bash
    TRITON_USE_META_WS=1 python python/tutorials/test_hopper_fwd_autows_vs_tlx.py
    ```
+
+> **`ttg.warp_specialize` is necessary, not sufficient.** Its presence or count
+> alone does not prove a correct WS kernel — an elided epilogue (Key Authoring
+> Rule 5) leaves the op in the IR while the stores are gone. Prefer the **named
+> Meta partition list** as the reliable signal: a `"load"` / `"gemm"` /
+> `"computation"` set, plus a dedicated `"epilogue"` partition whenever the kernel
+> has a post-loop epilogue.
 
 ---
 
