@@ -19,7 +19,7 @@ mlir_tablegen(Ops.h.inc -gen-op-decls)
 mlir_tablegen(Ops.cpp.inc -gen-op-defs)
 
 add_mlir_doc(TLXDialect TLXDialect dialects/ -gen-dialect-doc)
-add_mlir_doc(TLXOps TLXOps dialects/ -gen-op-doc)
+add_mlir_doc(TLXOps TLXOps dialects/ -gen-op-doc -dialect=tlx)
 add_public_tablegen_target(TLXTableGen)
 
 
