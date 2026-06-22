@@ -14,8 +14,6 @@
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/StrUtil.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/Support/MathExtras.h"
-#include <optional>
 
 #define DEBUG_TYPE "ttgpu_to_llvm"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -354,15 +352,49 @@ bool cvtAlwaysUseWarpShuffle(triton::gpu::ConvertLayoutOp cvt);
 namespace LLVM {
 using namespace mlir::triton;
 
+/// Represents a shared memory allocation for tensor operations.
+///
+/// For non-partitioned tensors, this contains a single base pointer.
+/// For partitioned tensors (PartitionedEncodingAttr), this contains multiple
+/// base pointers, one per partition.
 class SharedMemoryObject {
 public:
+  /// Single-base constructor (for non-partitioned tensors)
   SharedMemoryObject(Value base, Type baseElemType, ArrayRef<Value> offsets);
 
+  /// Multi-base constructor (for partitioned tensors)
+  SharedMemoryObject(ArrayRef<Value> bases, Type baseElemType,
+                     ArrayRef<Value> offsets);
+
+  /// Single-base constructor
   SharedMemoryObject(Value base, Type baseElemType, int64_t rank, Location loc,
                      RewriterBase &rewriter);
 
+  /// Multi-base constructor with zero offsets
+  SharedMemoryObject(ArrayRef<Value> bases, Type baseElemType, int64_t rank,
+                     Location loc, RewriterBase &rewriter);
+
   SmallVector<Value> getOffsets() const { return offsets; }
-  Value getBase() const { return base; }
+
+  /// Returns the single base pointer.
+  /// IMPORTANT: This asserts that there is exactly one base. For partitioned
+  /// tensors (multiple bases), use getBases() instead.
+  /// Callers should use getBases() and handle all partitions appropriately.
+  Value getBase() const {
+    assert(bases.size() == 1 &&
+           "getBase() called on partitioned tensor with multiple bases. "
+           "Use getBases() and handle all partitions.");
+    return bases[0];
+  }
+
+  /// Returns all base pointers. For partitioned tensors, returns one base
+  /// per partition.
+  ArrayRef<Value> getBases() const { return bases; }
+
+  /// Returns the number of base pointers (1 for non-partitioned, N for
+  /// partitioned).
+  size_t getNumBases() const { return bases.size(); }
+
   Type getBaseElemType() const { return baseElemType; }
 
   SmallVector<Value> getElems() const;
@@ -392,11 +424,10 @@ public:
     return offsets[dim];
   }
 
-  // TODO(Keren): deprecate the method once AMD backend has cleaned up
-  Value getBaseBeforeSlice(int dim, Location loc, RewriterBase &rewriter) const;
-
 private:
-  Value base; // i32 ptr. The start address of the shared memory object.
+  SmallVector<Value>
+      bases; // Shared memory base pointers. One for non-partitioned tensors,
+             // multiple for partitioned tensors (one per partition).
   Type baseElemType;
   SmallVector<Value>
       offsets; // i32 int. The offsets are zero at the initial allocation.
@@ -464,6 +495,19 @@ Value getProfileScratchPtr(Location loc, RewriterBase &rewriter,
 
 Value getSharedMemoryBase(Location loc, RewriterBase &rewriter,
                           const TargetInfoBase &target, Operation *op);
+
+/// Returns the allocation offsets for the given operation.
+/// For non-partitioned tensors, returns a single offset.
+/// For partitioned tensors, returns multiple offsets (one per partition).
+SmallVector<int64_t> getPartitionOffsets(Operation *op);
+
+/// Returns all shared memory bases for the given operation.
+/// For non-partitioned tensors, returns a single base pointer.
+/// For partitioned tensors, returns multiple base pointers (one per
+/// partition).
+SmallVector<Value> getSharedMemoryBases(Location loc, RewriterBase &rewriter,
+                                        const TargetInfoBase &target,
+                                        Operation *op);
 
 // -----------------------------------------------------------------------
 // MXFP utilities
@@ -556,7 +600,7 @@ uint32_t applyPadding(uint32_t baseOffset,
 SmallVector<Value> lowerLdStShared(
     Location loc, MLIRContext *ctx, LinearLayout cvt,
     ArrayRef<Value> valsArray, // Input for store, output for load
-    Type llvmElemTy, Value smemBase,
+    Type llvmElemTy, ArrayRef<Value> smemBases,
     ArrayRef<std::pair<unsigned, unsigned>> paddingShifts, Value affineOffset,
     uint64_t maskSpanAffineOffset, RewriterBase &rewriter,
     const TargetInfoBase &targetInfo, std::optional<int> maybeMaxVecElems = {},
@@ -572,7 +616,7 @@ SmallVector<Value> lowerLdStShared(
 SmallVector<Value> lowerLdSt(
     Location loc, MLIRContext *ctx, LinearLayout cvt,
     ArrayRef<Value> valsArray, // Input for store, output for load
-    Type llvmElemTy, Value smemBase,
+    Type llvmElemTy, ArrayRef<Value> smemBases,
     ArrayRef<std::pair<unsigned, unsigned>> paddingShifts, Value affineOffset,
     uint64_t maskSpanAffineOffset, Value laneId, Value warpId,
     RewriterBase &rewriter, const TargetInfoBase &targetInfo,
@@ -610,62 +654,6 @@ std::optional<LLVM::AtomicOrdering> getMemoryOrdering(MemSemantic memOrdering);
 llvm::MapVector<StringAttr, int32_t> getAllFreeVarMasks(MLIRContext *ctx);
 
 llvm::MapVector<StringAttr, int32_t> getFreeVariableMasks(Type type);
-
-// Fold a urem(offset, N) wrap into `cvt` by reducing each register basis mod N,
-// so offsets >= N collide with their canonical counterparts during ld/st. Used
-// by the SM100 NPOT NVMMA path (npotBufBytes > 0, see D99120849). Returns cvt
-// unchanged for pow2 / single-out-dim mismatch / unsound reduced bases (see
-// tryReduceBasesModN).
-LinearLayout applyNpotUremFold(const LinearLayout &cvt, int64_t effectiveSize);
-
-// Single-rep store/load fallback for the swizzling lowerings when rep-divide
-// fails (typically NPOT). Reshapes the cvts to one `kOffset` dim, applies the
-// NPOT kernel-equivalence fold, then emits a store/barrier/load triple.
-// `srcLayout`/`dstLayout` pick warpSync vs barrier; `smem` is the fold ref.
-SmallVector<Value> runNpotFallback(
-    Location loc, RewriterBase &rewriter, const TargetInfoBase &targetInfo,
-    const triton::LinearLayout &srcLayout,
-    const triton::LinearLayout &dstLayout, triton::LinearLayout totalStoreCvt,
-    triton::LinearLayout totalLoadCvt, const triton::LinearLayout &smem,
-    ArrayRef<Value> inVals, Type llvmElemTy, Value smemBase);
-
-// For NPOT swizzled SMEM, reshape both layouts to split output dims (dim0,
-// contig_intra, contig_phase) so invertAndCompose uses one algebra per dim
-// (XOR for pow2, ADD+mod for NPOT); without it lstsqModular mishandles the
-// XOR-coupled swizzle bases. Returns nullopt when no split is needed (pow2
-// shape, non-NVMMAShared encoding, or no swizzle).
-
-// Result of a successful NPOT contiguous-dim split: the two layouts with the
-// NPOT contiguous dim decomposed into (intra, phase).
-struct SplitNpotLayouts {
-  LinearLayout smem;
-  LinearLayout other;
-};
-
-std::optional<SplitNpotLayouts>
-splitNpotContiguousDim(triton::gpu::MemDescType memDescTy,
-                       LinearLayout smemLayout, LinearLayout otherLayout);
-
-/// Clamp vec size for NPOT tensor dimensions.
-/// (a) Round down to pow2 for valid vector load/store widths.
-/// (b) Clamp to alignment implied by non-pow2 sizePerThread.
-/// No-op for pow2; runs before allow_npot is consulted - do not gate.
-inline unsigned clampVecSizeForNpot(unsigned vec, RankedTensorType tensorTy) {
-  if (!llvm::isPowerOf2_32(vec))
-    vec = 1u << llvm::Log2_32(vec);
-  if (!tensorTy)
-    return vec;
-  if (auto blocked =
-          dyn_cast<triton::gpu::BlockedEncodingAttr>(tensorTy.getEncoding())) {
-    auto contOrder = triton::gpu::getOrder(tensorTy);
-    unsigned spt = blocked.getSizePerThread()[contOrder[0]];
-    if (spt > 0 && !llvm::isPowerOf2_32(spt)) {
-      unsigned maxAligned = spt & (0u - spt);
-      vec = std::min(vec, maxAligned);
-    }
-  }
-  return vec;
-}
 
 inline bool isCanonicalIndex(unsigned index, unsigned freeVarMask) {
   return (index & freeVarMask) == 0;

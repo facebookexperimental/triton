@@ -162,8 +162,10 @@ def matmul_kernel_pipelined_mi300(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, strid
     # In general, when using tl.load + local_store
     # num buffers = pipeline-stage(local-store) - pipeline-stage(local-load)
     NUM_BUFFERS = NUM_STAGES - 1
-    buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tlx.dtype_of(a_ptr), NUM_BUFFERS)
-    buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tlx.dtype_of(b_ptr), NUM_BUFFERS)
+    # `num` must be a constexpr; passing the bound `NUM_BUFFERS` local would be
+    # promoted to a tensor handle by the AST visitor, so pass the constexpr expr inline.
+    buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tlx.dtype_of(a_ptr), tl.constexpr(NUM_STAGES - 1))
+    buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tlx.dtype_of(b_ptr), tl.constexpr(NUM_STAGES - 1))
 
     # Pipeline Prologue. (NUM_STAGES - 1) iterations
     for i in tl.range(0, NUM_STAGES - 1, loop_unroll_factor=NUM_STAGES - 1):
@@ -185,7 +187,6 @@ def matmul_kernel_pipelined_mi300(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, strid
         a_k_smem_view = tlx.local_view(buffers_A, k % NUM_BUFFERS)
         b_k_smem_view = tlx.local_view(buffers_B, k % NUM_BUFFERS)
         a_load_reg = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K)
-        b_load_reg = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K)
 
         # do compute on data fetched ahead by NUM_STAGES - 1
         buf = (k - NUM_STAGES - 1) % NUM_BUFFERS
@@ -193,6 +194,7 @@ def matmul_kernel_pipelined_mi300(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, strid
         b_k_prev_shmem = tlx.local_view(buffers_B, buf)
         a_k_prev_reg = tlx.local_load(a_k_prev_shmem)
         b_k_prev_reg = tlx.local_load(b_k_prev_shmem)
+        b_load_reg = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K)
         acc = tl.dot(a_k_prev_reg, b_k_prev_reg, acc)
 
         # store data for k from regs to shmem, this is NUM_STAGES - 1 ahead of the k in the prev tl.dot

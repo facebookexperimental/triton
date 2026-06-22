@@ -14,9 +14,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/LayoutPropagationUtility.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
-#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/TypeSwitch.h"
-#include "llvm/Support/MathExtras.h"
 
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
@@ -83,7 +81,6 @@ bool isF16F8F4(ScaleDotElemType elemType) {
 SmallVector<unsigned, 3>
 warpsPerTile(Operation *dotOp, ArrayRef<int64_t> shape, int numWarps,
              std::pair<int64_t, int64_t> shapePerWarp) {
-  static const bool allowNpot = triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
   auto rank = shape.size();
   // Case 1: Early exit for batched matmul
   if (rank == 3)
@@ -115,8 +112,6 @@ warpsPerTile(Operation *dotOp, ArrayRef<int64_t> shape, int numWarps,
     ret[0] = static_cast<unsigned>(std::min(
         static_cast<int64_t>(numWarps),
         static_cast<int64_t>(llvm::divideCeil(shape[0], shapePerWarp.first))));
-    if (allowNpot && (numWarps % ret[0] != 0))
-      ret[0] = 1u << llvm::Log2_64(ret[0]);
     ret[1] = numWarps / ret[0];
     return ret;
   }
@@ -127,14 +122,9 @@ warpsPerTile(Operation *dotOp, ArrayRef<int64_t> shape, int numWarps,
   do {
     if (ret[0] * ret[1] >= numWarps)
       break;
-    auto tilesM = allowNpot
-                      ? llvm::divideCeil(tensorShape[0], shapePerWarp.first)
-                      : tensorShape[0] / shapePerWarp.first;
-    auto tilesN = allowNpot
-                      ? llvm::divideCeil(tensorShape[1], shapePerWarp.second)
-                      : tensorShape[1] / shapePerWarp.second;
-    if (tilesM / 2 / ret[0] >= tilesN / ret[1]) {
-      if (ret[0] < static_cast<unsigned>(tilesM)) {
+    if (tensorShape[0] / (shapePerWarp.first * 2) / ret[0] >=
+        tensorShape[1] / shapePerWarp.second / ret[1]) {
+      if (ret[0] < tensorShape[0] / shapePerWarp.first) {
         ret[0] *= 2;
       } else {
         ret[1] *= 2;
@@ -228,8 +218,7 @@ chooseMfmaInstruction(Location loc, int mfmaVersion, RankedTensorType cType,
 
   kDim = maybeMfmaIntrinsic->kDim;
   assert(kDim != 0);
-  if (enforcedNonKDim == 0 && (M % mDim != 0 || N % nDim != 0))
-    return failure();
+  assert(enforcedNonKDim != 0 || (M % mDim == 0 && N % nDim == 0));
   // If inputKSize % kDim != 0 (including the case where inputKSize < kDim),
   // this layout will introduce data duplication.
   if (inputKSize % kDim != 0) {
@@ -239,18 +228,6 @@ chooseMfmaInstruction(Location loc, int mfmaVersion, RankedTensorType cType,
         << ", which is not a multiple of tile k-dimension size inputKSize="
         << inputKSize
         << ". Using this intrinsic would introduce data duplication.";
-    return failure();
-  }
-  // NPOT (non-power-of-2) M/N/K is broken on the AMD MFMA path at several
-  // independent layers (rep-count mismatch, pipelined direct-to-LDS, padded
-  // shared->dot), so defer NPOT to the shape-agnostic FMA path, which is
-  // correct. pow2 is unaffected. Real MFMA NPOT support is tracked separately
-  // (T275979197 / T275959256).
-  static const bool allowNpot = triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
-  if (allowNpot && (!llvm::isPowerOf2_64(M) || !llvm::isPowerOf2_64(N) ||
-                    !llvm::isPowerOf2_64(inputKSize))) {
-    mlir::emitRemark(loc) << "NPOT (non-power-of-2) M/N/K is not supported on "
-                             "the AMD MFMA path; falling back to FMA.";
     return failure();
   }
   return maybeMfmaIntrinsic;
@@ -1529,29 +1506,7 @@ FailureOr<WmmaIntrinsic> chooseWmmaInstruction(Location loc, int wmmaVersion,
 
   kDim = maybeWmmaIntrinsic->kDim;
   assert(kDim != 0);
-  // NPOT-friendly fallback. Upstream had
-  //   assert(M % mDim == 0 && N % nDim == 0);
-  // We replace it with a soft failure so AMD WMMA gracefully falls back to
-  // FMA when the requested shape doesn't tile cleanly. No-op for pow2 (M,N>=16
-  // divide mDim/nDim=16; smaller pow2 fail selectFor first), so this stays
-  // ungated unlike the K check below; do not gate.
-  if (M % mDim != 0 || N % nDim != 0) {
-    mlir::emitRemark(loc) << "WMMA intrinsic '" << maybeWmmaIntrinsic->name
-                          << "' requires M (" << M << ") and N (" << N
-                          << ") divisible by tile dims (" << mDim << "x" << nDim
-                          << "); falling back to FMA.";
-    return failure();
-  }
-  static const bool allowNpot = triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
-  // NPOT (non-power-of-2) M/N/K has the same MFMA-family breakage on WMMA
-  // (rep-count mismatch etc.), so defer NPOT to the shape-agnostic FMA path.
-  // pow2 unaffected. Real support tracked in T275979197 / T275959256.
-  if (allowNpot && (!llvm::isPowerOf2_64(M) || !llvm::isPowerOf2_64(N) ||
-                    !llvm::isPowerOf2_64(inputKSize))) {
-    mlir::emitRemark(loc) << "NPOT (non-power-of-2) M/N/K is not supported on "
-                             "the AMD WMMA path; falling back to FMA.";
-    return failure();
-  }
+  assert(M % mDim == 0 && N % nDim == 0);
   return maybeWmmaIntrinsic;
 }
 
