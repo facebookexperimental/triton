@@ -5,8 +5,9 @@ description: >
   Use when the user wants to visualize, audit, or debug barrier usage across
   warp-specialized partitions, or when debugging a GPU kernel hang (deadlock).
   For hangs, first dump IR using the ir-debugging skill, then run this barrier
-  analysis to identify mismatched arrive/wait counts, missing backward barriers,
-  or other synchronization issues that cause deadlocks. Covers mbarriers, named
+  analysis to find the barrier that actually deadlocks -- reasoning with the
+  mbarrier phase model (NOT raw arrive/wait counts, which give false positives),
+  plus missing backward barriers and other synchronization issues. Covers mbarriers, named
   barriers, tcgen05 commit, TMA-implicit arrives, Aref-based synchronization,
   and producer/consumer barrier patterns.
 ---
@@ -208,6 +209,65 @@ confirm the coverage table reports ✗ for `m_ij`/`l_i0`.
 | **Aref (new pipeline)** | `aref.put.enter` / `aref.put.exit` | `aref.get.enter` / `aref.get.exit` | Cross-partition SSA deps rewritten to SMEM multibuffers. Handles sync internally. `async_ops` attr on exit specifies what async ops to wait on. |
 | **async_copy_mbarrier_arrive** | `async_copy_mbarrier_arrive` | `wait_barrier` | Arrives on mbarrier after all prior `cp.async` copies complete. |
 
+#### The mbarrier phase model — verify this before flagging ANY deadlock
+
+mbarriers (and every op that drives one: `arrive_barrier`, `tc_gen5_commit`, the
+implicit `tc_gen5_mma`/TMA arrive) are **phase-based, not counting semaphores**.
+This is the single most important thing to get right, and it is easy to get wrong:
+
+- `wait_barrier(bar, phase)` spins until the barrier's phase *parity* equals
+  `phase`, then returns. **It consumes nothing.** Any number of waits can be
+  satisfied by the *same* phase flip.
+- An arrive flips the phase once the barrier's expected arrival count is reached.
+- An "empty"/reuse barrier is initialized so the producer's **first**
+  `wait_barrier` (producer_acquire) passes with no arrive (the buffer starts
+  free; the acquire's phase is pre-inverted).
+
+**Therefore a raw arrive/wait count mismatch is NOT, by itself, a deadlock.**
+Tallying "barrier X has 2 `wait_barrier`s but only 1 arrive" yields a *candidate*,
+never a conclusion. Treating counts as a semaphore ("2 acquires consume, 1
+release produces → net deficit → deadlock") is the classic mistake — it is the
+wrong mental model for an mbarrier and produces false positives.
+
+The most common benign case: a producer waits on a single-buffered empty barrier
+**twice per iteration** (e.g. before two writes that reuse the buffer) while the
+consumer releases **once**:
+
+```
+acquire(a)  wait phase p     // before write #1
+write #1
+consumer reads, arrive       // ONE release: flips p -> p^1
+acquire(b)  wait phase p^1   // before write #2 -> passes on the SAME flip
+write #2
+```
+
+Across a loop this is **correct, not a deadlock**: the two acquires poll
+*opposite* parities, so `acquire(a)` of iteration N pairs with the release from
+iteration **N-1** (already happened → it passes immediately; it is *redundant*),
+and `acquire(b)` of iteration N pairs with iteration N's release. One release per
+iteration serves two polling waits (`acquire(b)_N` and `acquire(a)_{N+1}`). Two
+waits on one barrier with **opposite** phase expressions (`x` vs `NOT(x)`) is the
+*signature of this correct redundant pattern*, not a bug.
+
+**How to actually decide a `wait_barrier(bar, phase)` deadlocks.** Find the op
+that produces that exact phase (the arrive/commit/TMA-arrive on the *same*
+barrier slot) and confirm one of these *failure* conditions holds:
+
+1. **No producer at all** — no arrive targets that barrier slot anywhere, so the
+   phase is never produced → genuine deadlock.
+2. **Parity-cadence mismatch** — count phase *flips per iteration* against the
+   parities the waits require. Two waits requiring the **same** parity with only
+   one flip per iteration genuinely starves; two waits requiring **opposite**
+   parities with one flip per iteration is fine.
+3. **Cross-partition cycle** — the producing arrive is, transitively across
+   partitions, ordered *after* the very wait it must satisfy (A waits on `bar`,
+   gated on B; B's arrive on `bar` is gated on A passing that wait). A redundant
+   acquire that polls a *prior* iteration's flip does **not** create such a cycle.
+
+Only report a deadlock when (1), (2), or (3) holds. Otherwise classify an extra
+wait as **redundant (harmless over-synchronization)**, not wrong. Count-based
+tallies are useful only to surface candidates to run through this check.
+
 ### Section 3: Index and Phase Analysis
 
 For each barrier instance, describe:
@@ -233,8 +293,13 @@ Barrier: mbarrier for data-partitioned operands a0, a1, b (buffer.id = 2)
   Phase: same for all, accumCnt / 3
 ```
 
-Flag potential issues:
-- Mismatched arrive/wait counts
+Flag potential issues (verify against "The mbarrier phase model" above before
+calling anything a deadlock — a raw count mismatch is a candidate, not proof):
+- A `wait_barrier` whose required phase has no producing arrive on the same
+  barrier slot, a same-parity over-wait with too few flips per iteration, or a
+  cross-partition cycle ordering that arrive after the wait (the three genuine
+  deadlock conditions). A bare arrive/wait *count* mismatch is frequently just a
+  benign redundant acquire — do not report it as a deadlock on its own.
 - Missing phase tracking
 - Barriers with `buffer.copy` = 1 (no pipelining)
 - Merged barriers where byte counts don't match tensor sizes
