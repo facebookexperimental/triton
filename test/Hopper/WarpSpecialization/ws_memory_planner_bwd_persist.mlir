@@ -11,7 +11,12 @@
 // Key verification:
 //   - tt.tmem_alloc_algo=2 propagates from WS ForOp to innermost loop
 //   - TMEM reuse: dq reuses dpT (buffer.id=8), dv reuses qkT (buffer.id=7)
-//   - SMEM: budget-aware (smem_budget=200000), do gets copy=2, q stays at 1
+//   - SMEM: do and q are both cross-stage, so each gets its correctness floor
+//     copy=2. The cross-stage floor is strict and is never reverted for the
+//     (soft) smem_budget=200000: there is no TMA-staging space to reclaim here
+//     (this dump is pre-early-TMA-store-lowering), so the planner ships both at
+//     copy=2 (total 229376 B, still under the sm_100 hardware SMEM limit).
+//     v/k are co-live operand buffers and must NOT be aliased for reuse.
 
 // CHECK-LABEL: tt.func public @_attn_bwd_persist
 //
@@ -33,8 +38,8 @@
 // TMEM allocation: qkT owns buffer 7
 // CHECK: %qkT, %qkT_2 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32}
 //
-// SMEM allocation: q stays at copy=1 (budget limit)
-// CHECK: %q = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 2 : i32}
+// SMEM allocation: q is cross-stage (qkT stage 0, dk stage 1), gets copy=2
+// CHECK: %q = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 2 : i32}
 //
 // TMEM allocation: dv_3 (f32 accumulator) owns buffer 6
 // CHECK: %dv_3, %dv_4 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 6 : i32}

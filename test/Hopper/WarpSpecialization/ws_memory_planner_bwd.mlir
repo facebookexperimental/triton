@@ -1,9 +1,13 @@
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --nvgpu-test-ws-code-partition="num-buffers=1 post-channel-creation=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=OPERANDD
 
-// Test case: FA BWD pattern with budget-aware SMEM allocation (algo=1).
-// With smem_budget=200000, only one of the two cross-stage TMA buffers
-// (do, q) can get copy=2 before exceeding budget. The other stays at copy=1.
+// Test case: FA BWD pattern with SMEM allocation (algo=1).
+// Both do and q are cross-stage TMA buffers, so each gets its strict
+// correctness floor copy=2. The cross-stage floor is enforced first and is
+// never reverted for the (soft) smem_budget=200000 — dropping it would
+// reintroduce a producer/consumer slot collision that deadlocks at runtime.
+// There is no discretionary TMA-staging space to reclaim here, so the planner
+// ships both at copy=2 (total 229376 B, under the sm_100 hardware SMEM limit).
 //
 // The key buffers in allocation order:
 //   [0] dk: liveness=[44-112) size=128x128 - accumulator, long-lived
@@ -36,7 +40,7 @@
 //
 // SMEM allocations
 // CHECK: %do = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 1 : i32}
-// CHECK: %q = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 2 : i32}
+// CHECK: %q = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 2 : i32}
 // CHECK: %k_42 = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 3 : i32}
 // CHECK: %v_43 = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32}
 //

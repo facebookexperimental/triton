@@ -54,6 +54,7 @@ struct WSBuffer {
     bool       isCrossStage;   // src and dst in different loop.stage
     unsigned   bufferId;       // assigned buffer.id
     unsigned   numCopies;      // assigned buffer.copy (starts at 1)
+    unsigned   minCopies;      // strict cross-stage floor; numCopies never < this
 };
 ```
 
@@ -61,16 +62,33 @@ All WSBuffers start with:
 - A unique `bufferId` (0, 1, 2, …)
 - `numCopies = 1`
 
-### Phase 2: Enforce Cross-Stage Minimum
+### Phase 2: Enforce Cross-Stage Minimum (strict floor, applied first)
 
-Any WSBuffer with `isCrossStage == true` must have at least 2 copies
-(as long as `num_buffers >= 2`). For each such WSBuffer, set `numCopies = 2`.
+Any WSBuffer with `isCrossStage == true` is given a **correctness floor** equal
+to the number of pipeline stages its live range spans —
+`max(maxConsumerStage - minConsumerStage + 1, 1)`, capped at `num_buffers`. This
+is `>= 2` for a genuine cross-stage buffer, and exactly `1` (a no-op) otherwise.
+The floor is recorded in `minCopies` and applied to `numCopies` **first**, before
+any reuse or copy-increase step.
 
-Note: no budget check is performed here. The total SMEM may temporarily
-exceed the budget after this phase. Phase 4 will resolve this — either by
-grouping cross-stage buffers into reuse groups (which reduces physical SMEM)
-or by confirming the allocation fits. If Phase 4 cannot bring the total
-within budget, it reports the failure.
+This floor is **strict**: a cross-stage buffer with too few copies lets the
+producer overwrite a slot that a later-stage consumer still reads, which
+deadlocks at runtime. Therefore the floor is **never reverted for budget**. No
+budget check is performed in this phase; the total SMEM may temporarily exceed
+the budget afterwards.
+
+Budget is reconciled later (Phase 3.6) by reusing **discretionary** SMEM — the
+TMA store/reduce staging buffers (write → TMA op → dead). Co-live operand buffers
+(loaded once per outer iteration and read across the whole inner loop, e.g.
+`q`/`k`/`v`) are explicitly excluded from that reuse, since aliasing them is
+unsafe. If, even after staging reuse, the floored allocation still exceeds the
+budget, the planner **ships it anyway** rather than dropping a floor — the real
+hardware SMEM limit (an `OutOfResources` at codegen) is the backstop.
+
+> Earlier revision: a budget-gated revert here silently downgraded the
+> cross-stage `q` buffer to a single copy and deadlocked `_attn_bwd_persist`
+> (FA backward, `ws_persistent`, early-TMA). See
+> `.llms/rules/partition-scheduler-bugs.md` #8.
 
 ### Phase 3: Classify and Prioritize
 
@@ -587,11 +605,11 @@ This interface is unchanged.
 |-----------|----------|
 | Abstraction | `WSBuffer` struct per `local_alloc` |
 | Initial state | Phase 1: unique IDs, all `copy = 1` |
-| Cross-stage | Phase 2: force `copy ≥ 2` |
+| Cross-stage | Phase 2: strict floor `copy ≥ stage-span` (`minCopies`), applied first, never reverted |
 | Multi-buffering | Phase 4: iterative, budget-aware |
-| Reuse | Pair of 2 same-priority WSBuffers; grouping-first when copies ≥ 2 |
+| Reuse | Pair of 2 same-priority WSBuffers; grouping-first when copies ≥ 2. Phase 3.6 also reuses discretionary TMA-staging SMEM (never co-live operands) to fit cross-stage floors |
 | Max copies | `num_buffers` param (incremental cap) |
-| Budget | Enforced at every iteration |
+| Budget | Enforced for discretionary copies; cross-stage floor is exempt (HW SMEM limit is the backstop) |
 | Iteration order | Sorted by operation ID |
 
 ---
