@@ -8,6 +8,7 @@ import os
 import threading
 import re
 import textwrap
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import cached_property
@@ -148,6 +149,7 @@ class DependenciesFinder(ast.NodeVisitor):
             return
 
         if getattr(val, "__triton_aggregate__", False):
+            self.hasher.update(str(val.__annotations__).encode("utf-8"))
             for attr in val.hash_attrs:
                 self.record_reference(attr)
             return
@@ -412,6 +414,12 @@ class KernelInterface(Generic[T]):
                                                 extra_kwargs)
                 if proxy is not None:
                     cache[grid_key] = proxy
+                else:
+                    warnings.warn(
+                        f"[Triton] C JIT proxy creation returned None for kernel '{self._fn_name}', "
+                        f"falling back to Python dispatch (c_cache and dispatcher are enabled)",
+                        stacklevel=2,
+                    )
             if proxy is not None:
                 # For pure positional calls, return proxy directly — avoids
                 # the overhead of an intermediate Python *args/**kwargs closure
@@ -860,6 +868,25 @@ class JITFunction(JITCallable, KernelInterface[T]):
                             kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, None,
                                        None, None, *_fc_args)
                         return kernel
+        elif not _skip_fc and self.c_cache and not warmup:
+            reasons = []
+            if self.pre_run_hooks:
+                reasons.append("pre_run_hooks active")
+            if knobs.compilation.always_compile:
+                reasons.append("always_compile=True")
+            if knobs.runtime.add_stages_inspection_hook is not None:
+                reasons.append("add_stages_inspection_hook active")
+            if knobs.runtime.launch_enter_hook:
+                reasons.append("launch_enter_hook active")
+            if knobs.runtime.launch_exit_hook:
+                reasons.append("launch_exit_hook active")
+            if self.launch_metadata:
+                reasons.append("launch_metadata set")
+            warnings.warn(
+                f"[Triton] TRITON_ENABLE_C_CACHE: C fast path bypassed for kernel '{self._fn_name}': " +
+                (", ".join(reasons) if reasons else "unknown reason"),
+                stacklevel=2,
+            )
         _user_kwargs = dict(kwargs) if kwargs else {}
         kwargs["debug"] = kwargs.get("debug", self.debug) or knobs.runtime.debug
         # Enable sanitize_overflow if explicitly set via kwarg, env var (TRITON_SANITIZE_OVERFLOW), or if debug is enabled
@@ -901,6 +928,18 @@ class JITFunction(JITCallable, KernelInterface[T]):
             kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
             if kernel is None:
                 return None
+            # compile_iq: dump a collection task for the offline ACF factory.
+            # Gated by TRITON_COMPILE_IQ_COLLECT; fires on the compile (cache-miss) path
+            # where signature/constexprs are in scope. Never affects the user run.
+            if os.environ.get("TRITON_COMPILE_IQ_COLLECT"):
+                try:
+                    from triton.compile_iq.collector import capture as _ciq_capture
+                    _ck = kernel.result() if hasattr(kernel, "result") else kernel
+                    _cg = grid(bound_args) if callable(grid) else grid
+                    _ciq_capture(jitfn=self, kernel=_ck, bound_args=bound_args, signature=signature,
+                                 constexprs=constexprs, grid=tuple(list(_cg) + [1, 1, 1])[:3])
+                except Exception:
+                    pass
             _fc_needs_insert = self.c_cache
         else:
             _fc_needs_insert = False
@@ -940,6 +979,12 @@ class JITFunction(JITCallable, KernelInterface[T]):
                 _indices = kernel._dispatch_arg_indices
                 _disp(grid_0, grid_1, grid_2, stream, *[_vals[i] for i in _indices])
             else:
+                if knobs.nvidia.use_triton_dispatcher and _disp is None:
+                    warnings.warn(
+                        f"[Triton] TRITON_USE_TRITON_DISPATCHER=1 but kernel '{self._fn_name}' has no C dispatcher, "
+                        f"falling back to Python launch",
+                        stacklevel=2,
+                    )
                 launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
                 kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,
                            knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *bound_args.values())

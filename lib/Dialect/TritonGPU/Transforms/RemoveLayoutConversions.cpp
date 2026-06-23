@@ -121,7 +121,8 @@ private:
 
 class LayoutRematerialization {
 public:
-  LayoutRematerialization(FuncOp F) : funcOp(F) {}
+  LayoutRematerialization(FuncOp F, unsigned smemBudget = 0)
+      : funcOp(F), smemBudget(smemBudget) {}
 
   // Map the original value to the remat'ed one.
   void addRematValue(Value old, Attribute encoding, Value newV);
@@ -168,6 +169,9 @@ private:
   // DenseMap<std::pair<Operation*, Attribute>, Operation*>
   SetVector<Operation *> opToDelete;
   FuncOp funcOp;
+  // Meta extension: when > 0, the remove-layout pass is operating under a SMEM
+  // budget and convert-elimination hoists bypass the upstream perf cost gate.
+  unsigned smemBudget;
   DominanceInfo domInfo;
   PostDominanceInfo postDomInfo;
 };
@@ -1341,45 +1345,26 @@ static int64_t getByteCount(Value result, int64_t minElementCount = 0,
   return (elementCount * dtypeBitWidth) >> 3;
 }
 
-void LayoutRematerialization::backwardRematerialization(
-    ConvertLayoutOp convertOp) {
-  RankedTensorType targetType = convertOp.getType();
-  if (isa<DotOperandEncodingAttr>(targetType.getEncoding())) {
-    // DotOperand is hoisted by hoistDotOperand for pipelining purposes.
-    if (auto parentForOp = convertOp->getParentOfType<scf::ForOp>()) {
-      if (getNumStagesOrDefault(parentForOp, 3) > 1) {
-        return;
-      }
-    }
-  }
+/// Compute the cost of a ConvertLayoutOp with source \p convertSrc.
+int64_t getConvertCost(Value convertSrc) {
+  // Measure the number of bytes that we're manipulating with the
+  // ConvertLayoutOp. We pessimistically assume that we round-trip
+  // through shared memory and that we cannot vectorise sub-register
+  // loads/stores, so we set a minimum element count of 32 (the warp
+  // size and number of shared memory banks) and minimum bitwidth of
+  // 32 (the width per bank of the shared memory load/store unit).
+  auto convertLayoutBytes = getByteCount(convertSrc, 32, 32);
+  // We measure costs in standardised milli-SM-cycles. The smem load
+  // and store each cost 8 * convertLayoutBytes, and then we double
+  // it to account for extra cost due to synchronisation.
+  return 32 * convertLayoutBytes;
+}
 
-  Value oldV = convertOp.getSrc();
-  LDBG("check backward remat with source " << oldV << " encoding "
-                                           << targetType.getEncoding());
-  // Check to see if there are existing remat'ed values for the pair of oldValue
-  // and encoding. Make sure it dominates the current conversion.
-  Value newV = getRematValue(oldV, targetType.getEncoding());
-  if (newV && domInfo.properlyDominates(newV, convertOp)) {
-    // Replace it with the remat'ed value.
-    convertOp.replaceAllUsesWith(newV);
-    opToDelete.insert(convertOp);
-    LDBG("found remat'ed value" << newV);
-    return;
-  }
-
-  // 1. Take a backward slice of all the tensor dependencies that can be
-  // rematerialized.
-  SetVector<Value> slice;
-  DenseMap<Value, Attribute> layout;
-  LogicalResult result = getRematerializableSlice(
-      convertOp.getSrcMutable(), targetType.getEncoding(), slice, layout);
-  if (result.failed()) {
-    LDBG("  getRematerializableSlice failed");
-    return;
-  }
-
-  // 2. Determine whether rematerialisation is beneficial.
-
+/// Determine whether rematerializing \p slice is beneficial given that it will
+/// eliminate \p convertOp and require creating new convert ops with cost \p
+/// newCvtCost.
+bool isRematBeneficial(ConvertLayoutOp convertOp, const SetVector<Value> &slice,
+                       int64_t newCvtCost) {
   // Identify all operations in the slice
   SetVector<Operation *> sliceOps;
   for (Value v : slice) {
@@ -1388,65 +1373,49 @@ void LayoutRematerialization::backwardRematerialization(
     }
   }
 
-  // Compute single-use operations
-  DenseMap<Operation *, bool> isSingleUse;
-  std::function<bool(Operation *)> isOpSingleUse;
-  isOpSingleUse = [&](Operation *op) -> bool {
-    // lookup in memoization array:
-    auto it = isSingleUse.find(op);
-    if (it != isSingleUse.end()) {
-      return it->second;
+  // Determine which values used by operations outside the slice. We can use
+  // this to determine whether they will actually survive and therefore need to
+  // contribute to the cost.
+  SetVector<Value> nonSliceOnlyValues;
+
+  // Identify values that directly have uses outside the slice.
+  for (Value v : slice) {
+    for (auto &use : v.getUses()) {
+      auto *user = use.getOwner();
+      if (user == convertOp || sliceOps.contains(user))
+        continue;
+      nonSliceOnlyValues.insert(v);
+      break;
     }
+  }
 
-    bool singleUse = true;
-
-    for (Value result : op->getResults()) {
-      for (Operation *user : result.getUsers()) {
-        if (user == convertOp) {
-          continue;
-        }
-        if (sliceOps.contains(user)) {
-          if (!isOpSingleUse(user)) {
-            singleUse = false;
-            break;
-          }
-        } else {
-          singleUse = false;
-          break;
-        }
-      }
-      if (!singleUse) {
-        break;
-      }
+  // Expand the set to all transitive operands in the slice.
+  for (size_t i = 0; i < nonSliceOnlyValues.size(); ++i) {
+    Value v = nonSliceOnlyValues[i];
+    if (auto *op = v.getDefiningOp()) {
+      for (auto operand : op->getOperands())
+        if (slice.contains(operand))
+          nonSliceOnlyValues.insert(operand);
     }
+    // TODO: Handle block arguments.
+  }
 
-    // insert into memoization array:
-    isSingleUse[op] = singleUse;
-    return singleUse;
-  };
-
-  // Measure the number of bytes that we're manipulating with the
-  // ConvertLayoutOp. We pessimistically assume that we round-trip
-  // through shared memory and that we cannot vectorise sub-register
-  // loads/stores, so we set a minimum element count of 32 (the warp
-  // size and number of shared memory banks) and minimum bitwidth of
-  // 32 (the width per bank of the shared memory load/store unit).
-  int64_t convertLayoutBytes = getByteCount(convertOp.getSrc(), 32, 32);
-
-  // We measure costs in standardised milli-SM-cycles. The smem load
-  // and store each cost 8 * convertLayoutBytes, and then we double
-  // it to account for extra cost due to synchronisation.
-  int64_t convertLayoutCost = 32 * convertLayoutBytes;
-  int64_t rematerialisationCost = 0;
+  int64_t convertLayoutCost = getConvertCost(convertOp.getSrc());
+  int64_t rematerialisationCost = newCvtCost;
 
   // Evaluate single-use status for every operation in slice
   for (Operation *op : sliceOps) {
     auto dialect = op->getDialect();
-    if (isOpSingleUse(op)) {
-      // when we rematerialise, this operation does not get duplicated
-      // so it does not contribute to our cost model:
+    // If all of the results of the op are only used within the slice, when we
+    // rematerialise, this operation does not get duplicated so it does not
+    // contribute to our cost model.
+    bool isOpUsedOutsideSlice = llvm::any_of(op->getResults(), [&](Value v) {
+      return nonSliceOnlyValues.contains(v);
+    });
+    if (!isOpUsedOutsideSlice)
       continue;
-    } else if (isa<arith::ConstantOp>(op)) {
+
+    if (isa<arith::ConstantOp>(op)) {
       // special-case: arith.constant has zero cost
       continue;
     } else if (isa<LoadOp>(op) || isa<LocalLoadOp>(op)) {
@@ -1473,7 +1442,7 @@ void LayoutRematerialization::backwardRematerialization(
         // use chain.
         LDBG("  skipped rematerialization due to non-associative reduce in the "
              "slice");
-        return;
+        return false;
       }
       rematerialisationCost += helper.getIntraWarpSizeWithUniqueData();
       rematerialisationCost += 8 * helper.getInterWarpSizeWithUniqueData();
@@ -1485,7 +1454,47 @@ void LayoutRematerialization::backwardRematerialization(
     DBGS() << "  rematerialisation cost: " << rematerialisationCost << "\n";
   });
 
-  if (rematerialisationCost > convertLayoutCost) {
+  return convertLayoutCost >= rematerialisationCost;
+}
+
+void LayoutRematerialization::backwardRematerialization(
+    ConvertLayoutOp convertOp) {
+  RankedTensorType targetType = convertOp.getType();
+  if (isa<DotOperandEncodingAttr>(targetType.getEncoding())) {
+    // DotOperand is hoisted by hoistDotOperand for pipelining purposes.
+    if (auto parentForOp = convertOp->getParentOfType<scf::ForOp>()) {
+      if (getNumStagesOrDefault(parentForOp, 3) > 1) {
+        return;
+      }
+    }
+  }
+  Value oldV = convertOp.getSrc();
+  LDBG("check backward remat with source " << oldV << " encoding "
+                                           << targetType.getEncoding());
+  // Check to see if there are existing remat'ed values for the pair of oldValue
+  // and encoding. Make sure it dominates the current conversion.
+  Value newV = getRematValue(oldV, targetType.getEncoding());
+  if (newV && domInfo.properlyDominates(newV, convertOp)) {
+    // Replace it with the remat'ed value.
+    convertOp.replaceAllUsesWith(newV);
+    opToDelete.insert(convertOp);
+    LDBG("found remat'ed value" << newV);
+    return;
+  }
+
+  // 1. Take a backward slice of all the tensor dependencies that can be
+  // rematerialized.
+  SetVector<Value> slice;
+  DenseMap<Value, Attribute> layout;
+  LogicalResult result = getRematerializableSlice(
+      convertOp.getSrcMutable(), targetType.getEncoding(), slice, layout);
+  if (result.failed()) {
+    LDBG("  getRematerializableSlice failed");
+    return;
+  }
+
+  // 2. Determine whether rematerialisation is beneficial.
+  if (!isRematBeneficial(convertOp, slice, /*newCvtCost=*/0)) {
     LDBG("  skipped rematerialization due to higher cost");
     return;
   }
@@ -1685,6 +1694,14 @@ void LayoutRematerialization::hoistConvertOnTopOfExtOrBroadcast(
   Attribute srcEncoding = inferSrcEncoding(extOrBroadcastOp, dstEncoding);
   if (!srcEncoding)
     return;
+  // Under a SMEM budget (a Meta extension) eliminating convert-layout scratch
+  // takes priority over the upstream perf-cost heuristic (#9194), so force the
+  // hoist. Without a budget, keep the upstream cost gate.
+  if (smemBudget == 0) {
+    int64_t newCvtCost = getConvertCost(extOrBroadcastOp->getOperand(0));
+    if (!isRematBeneficial(convertOp, slice, newCvtCost))
+      return;
+  }
   // Move the convert before the ext op and rewrite the slice.
   OpBuilder builder(extOrBroadcastOp);
   auto tensorType =
@@ -1827,10 +1844,10 @@ bool backwardRematerialization(ModuleOp module) {
   return changed;
 }
 
-void hoistConvert(ModuleOp module) {
+void hoistConvert(ModuleOp module, unsigned smemBudget = 0) {
   SmallVector<ConvertLayoutOp> convertOps;
-  module.walk([](FuncOp funcOp) {
-    LayoutRematerialization layoutRemat(funcOp);
+  module.walk([smemBudget](FuncOp funcOp) {
+    LayoutRematerialization layoutRemat(funcOp, smemBudget);
     layoutRemat.hoistConvertOnTopOfExtOrBroadcast();
     layoutRemat.cleanup();
 
@@ -1967,7 +1984,7 @@ public:
     } while (changed);
     // 3. For remaining converts, try to hoist them above cast generating larger
     // size types in order to reduce the cost of the convert op.
-    hoistConvert(m);
+    hoistConvert(m, smemBudget);
     LLVM_DEBUG({
       DBGS() << "Module after hoisting converts:\n";
       m.dump();
@@ -1994,7 +2011,7 @@ public:
     // eliminate them by propagating the source encoding through their users.
     if (smemBudget > 0) {
       eliminateOverBudgetConverts(m);
-      hoistConvert(m);
+      hoistConvert(m, smemBudget);
       cleanupConvertOps();
     }
   }

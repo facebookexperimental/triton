@@ -30,6 +30,11 @@ public:
     auto loc = op.getLoc();
     MemDescType srcTy = op.getSrc().getType();
     RankedTensorType dstTy = op.getType();
+
+    // Partitioned tensors have multiple bases; fall back to generic lowering.
+    if (isa<triton::gpu::PartitionedSharedEncodingAttr>(srcTy.getEncoding())) {
+      return failure();
+    }
     auto typeConverter = this->getTypeConverter();
     auto llvmElemTy = typeConverter->convertType(dstTy.getElementType());
     unsigned bitWidth = llvmElemTy.getIntOrFloatBitWidth();
@@ -140,21 +145,17 @@ private:
     // memory. We require N number of lanes to be contiguous since they read
     // consecutive 64 bits loaded from the same lanes.
     tile = LinearLayout::identity1D(ldsParams.tileSize, kLane, kOffset);
-
     const auto isaFamily = targetInfo.getISAFamily();
-    // B8 types on gfx1250 require a different tile with double the contiguity
-    bool doubleB8Contiguity =
-        isaFamily == AMD::ISAFamily::GFX1250 && bitWidth == 8;
     const unsigned missingLanes =
         targetInfo.getWarpSize() / tile.getInDimSize(kLane);
     unsigned otherLanes = 1;
     if (isaFamily == AMD::ISAFamily::CDNA4) {
       otherLanes = (bitWidth == 8) ? 2 : 4;
-    } else if (doubleB8Contiguity) {
+    } else if (ldsParams.needsDoubleB8Contiguity) {
       otherLanes = 2;
     }
 
-    if (doubleB8Contiguity) {
+    if (ldsParams.needsDoubleB8Contiguity) {
       fullTile =
           tile * LinearLayout::identity1D(ldsParams.tileSize / 2, kReg, kAddr) *
           LinearLayout::identity1D(otherLanes, kLane, kAddr) *
@@ -457,7 +458,7 @@ public:
   LogicalResult
   matchAndRewrite(triton::gpu::BarrierOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (!isCDNA(targetInfo.getISAFamily()))
+    if (targetInfo.getIsaVersion().Major < 9)
       return failure();
     // Check no other memory addrspaces are selected.
     // TensorRead/Write are allowed but noop.
@@ -557,9 +558,10 @@ struct MemoryCounterWaitOpConversion
   LogicalResult
   matchAndRewrite(amdgpu::MemoryCounterWaitOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    // amdgpu::MemoryCounterWaitOp supports gfx9 onwards
     auto isaVersion = targetInfo.getIsaVersion();
 
-    /// If major version >= fgx12, lower  to
+    /// If major version >= gfx12, lower to
     ///   * ROCDL::WaitDscntOp if ds is present
     ///   * ROCDL::WaitLoadcntOp if load is present
     ///   * ROCDL::WaitStorecntOp if store is present

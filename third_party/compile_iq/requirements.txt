@@ -1,0 +1,27 @@
+# compile_iq factory environment (Stage 2).
+#
+# These are the *external* deps the factory needs to search + assemble ptxas ACFs.
+# Provision a box that has ptxas >= 13.3 (the nvidia-cuda-nvcc wheel below supplies it) with:
+#
+#     uv venv --python 3.13 .venv-ciq
+#     uv pip install -r third_party/compile_iq/requirements.txt
+#
+# Then install the proprietary CompileIQ engine + the search-space bin (see README.md) --
+# neither is on PyPI, so they are referenced here, not pinned/vendored.
+
+# ptxas 13.3 -- provides `--apply-controls` (ACF assembly). The PATH ptxas on a stock
+# devgpu is too old (12.x); this wheel ships ptxas under nvidia/cu13/bin/ptxas. The
+# factory auto-discovers it via find_ptxas(), or point TRITON_PTXAS_BLACKWELL_PATH at it.
+nvidia-cuda-nvcc==13.3.*
+
+# torch matching the fbtriton build (cu130). Install from the CUDA 13.0 index:
+#     uv pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cu130
+# (left unpinned here so the index-url install above wins; uncomment to hard-pin)
+# torch==2.12.0
+
+# --- NOT on PyPI; install separately (see README.md) ---
+# compileiq            : proprietary CompileIQ "Evo" engine. From a CompileIQ checkout:
+#                          git lfs install && git lfs pull && uv pip install .
+#                        or an internal Evo wheel: uv pip install <compileiq-evo-wheel>
+# search-space bin     : ptxas13.3.bin (separate NVIDIA artifact), pointed to by
+#                          COMPILE_IQ_SEARCH_SPACE_BIN -- not a Python package.

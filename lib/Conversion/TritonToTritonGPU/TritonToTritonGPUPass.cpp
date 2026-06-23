@@ -5,6 +5,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "proton/Dialect/include/Dialect/Proton/IR/Dialect.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "third_party/tlx/dialect/include/IR/Dialect.h"
 #include "triton/Conversion/TritonToTritonGPU/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -42,9 +43,10 @@ static void addNamedAttrs(Operation *op, DictionaryAttr dictAttrs) {
 // pinned layout is an anchor and forward-propagates). No-op for ops without the
 // trait, or when the encodings already match (the common case). Kept as a free
 // helper so any conversion pattern can reuse it, not just GenericOpPattern.
-static void unifyOperandEncodingsForSameEncoding(
-    Operation *op, TypeRange resultTypes, SmallVectorImpl<Value> &operands,
-    ConversionPatternRewriter &rewriter) {
+static void
+unifyOperandEncodingsForSameEncoding(Operation *op, TypeRange resultTypes,
+                                     SmallVectorImpl<Value> &operands,
+                                     ConversionPatternRewriter &rewriter) {
   if (!op->hasTrait<mlir::OpTrait::SameOperandsAndResultEncoding>())
     return;
   Attribute enc;
@@ -722,6 +724,13 @@ void populateTLXPatterns(TritonGPUTypeConverter &typeConverter,
   patterns.add<GenericOpPattern<triton::tlx::RequireLayoutOp>>(typeConverter, context);
   patterns.add<GenericOpPattern<triton::tlx::ReleaseLayoutOp>>(typeConverter,
                                                            context);
+  // AMD buffer ops emitted by TLX at TTIR level need encoding added
+  patterns.add<GenericOpPattern<triton::amdgpu::BufferLoadOp>>(typeConverter,
+                                                               context);
+  patterns.add<GenericOpPattern<triton::amdgpu::BufferStoreOp>>(typeConverter,
+                                                                context);
+  patterns.add<GenericOpPattern<triton::amdgpu::BufferLoadToLocalOp>>(
+      typeConverter, context);
 }
 
 //

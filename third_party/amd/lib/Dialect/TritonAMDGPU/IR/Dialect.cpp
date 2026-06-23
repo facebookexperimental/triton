@@ -26,8 +26,8 @@
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 #include "third_party/amd/include/Utils/Utility.h"
-#include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Interfaces.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
@@ -40,10 +40,22 @@
 // clang-format on
 
 #include "third_party/amd/include/Dialect/TritonAMDGPU/Utility/CommonUtils.h"
-#include "third_party/amd/lib/TritonAMDGPUToLLVM/TDMUtility.h"
 
 using namespace mlir;
+using namespace mlir::triton;
 using namespace mlir::triton::amdgpu;
+using ::mlir::triton::gpu::BlockedEncodingAttr;
+using ::mlir::triton::gpu::DotOperandEncodingAttr;
+
+// Local linearize helper to avoid circular dependency on TritonGPUToLLVM.
+static size_t linearizeIndices(llvm::ArrayRef<unsigned> multiDim,
+                               llvm::ArrayRef<unsigned> shape,
+                               llvm::ArrayRef<unsigned> order) {
+  size_t linear = 0;
+  for (unsigned dim : llvm::reverse(order))
+    linear = linear * shape[dim] + multiDim[dim];
+  return linear;
+}
 
 void mlir::triton::amdgpu::TritonAMDGPUDialect::initialize() {
   addAttributes<
@@ -184,7 +196,7 @@ LogicalResult ExtractSliceOp::verify() {
 // operations. When extract_slice is used to extract a portion that exactly
 // matches one of the original tensors concatenated by a concat operation, we
 // can eliminate extract_slice op and use the original tensor directly.
-struct CononicalizeExtractSliceAndConcat
+struct CanonicalizeExtractSliceAndConcat
     : public mlir::OpRewritePattern<amdgpu::ExtractSliceOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -223,7 +235,7 @@ struct CononicalizeExtractSliceAndConcat
     auto srcToDstShape = LLVM::AMD::multiDimElementwise<int64_t, int64_t>(
         dstShape, srcShape, std::divides<unsigned>());
     auto linearSrcIdx =
-        mlir::LLVM::linearize(multiDimSrcIdx, srcToDstShape, defaultOrder);
+        linearizeIndices(multiDimSrcIdx, srcToDstShape, defaultOrder);
 
     // Replace extract_slice with the concat operand
     assert(linearSrcIdx < concatOp->getNumOperands() &&
@@ -237,7 +249,7 @@ struct CononicalizeExtractSliceAndConcat
 
 void ExtractSliceOp::getCanonicalizationPatterns(
     mlir::RewritePatternSet &patterns, mlir::MLIRContext *context) {
-  patterns.add<CononicalizeExtractSliceAndConcat>(context);
+  patterns.add<CanonicalizeExtractSliceAndConcat>(context);
 }
 
 LogicalResult UpcastMXFPOp::verify() {
@@ -590,7 +602,7 @@ LogicalResult ConcatOp::verify() {
     auto multiDimOperandIdx = LLVM::AMD::multiDimElementwise<int32_t, int64_t>(
         elemCoordsArray, srcShape, std::divides<unsigned>());
     auto linearOperandIdx =
-        mlir::LLVM::linearize(multiDimOperandIdx, srcToDstShape, defaultOrder);
+        linearizeIndices(multiDimOperandIdx, srcToDstShape, defaultOrder);
 
     // 4.   subtract dst coordinates and start coordinates of the tile
 
@@ -618,6 +630,23 @@ LogicalResult ConcatOp::verify() {
   }
 
   return success();
+}
+
+LogicalResult BufferLoadToLocalOp::verify() {
+  auto mod = getOperation()->getParentOfType<ModuleOp>();
+  if (!mod)
+    return success();
+
+  auto arch = mlir::getAMDArch(mod);
+  // buffer_load_to_local is supported only on CDNA3 (gfx942) and CDNA4
+  // (gfx950) -- i.e. AMD::TargetInfo::supportsBufferLoadToLocal() returns
+  // isaFamily in {CDNA3, CDNA4}. We check the arch string directly here rather
+  // than constructing AMD::TargetInfo (or calling deduceISAFamily): both live
+  // in the TritonAMDGPUToLLVM lowering library, which this IR dialect library
+  // (TritonAMDGPUIR) must not depend on.
+  if (!arch || *arch == "gfx942" || *arch == "gfx950")
+    return success();
+  return emitError() << "BufferLoadToLocal unsupported on target architecture";
 }
 
 LogicalResult LocalLoadPackedTransposedOp::verify() {
@@ -769,8 +798,20 @@ LogicalResult AsyncTDMCopyLocalToGlobalOp::verify() {
 
   auto paddedEnc =
       llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(smemTy.getEncoding());
-  if (paddedEnc)
-    return emitOpError("TDM store does not support padding");
+  if (paddedEnc) {
+    // Check if we can apply the padding workaround, see the lowering to LLVM
+    // for more details.
+    auto intervals = paddedEnc.getIntervals();
+    if (intervals.size() != 1)
+      return emitOpError("TDM store only supports single interval paddings.");
+
+    if (intervals[0] != blockShape.back())
+      return emitOpError("TDM store padding is only supported when padding "
+                         "interval equals the innermost block dimension (got "
+                         "padInterval=")
+             << intervals[0] << ", innermost dimension=" << blockShape.back()
+             << ")";
+  }
 
   if (!paddedEnc && !swizzledEnc)
     return emitOpError("Invalid shared memory layout for TDM");
@@ -821,6 +862,51 @@ LogicalResult AsyncTDMScatterOp::verify() {
   return success();
 }
 
+LogicalResult AsyncTDMGatherOp::verify() {
+  auto tensorDescTy = getDesc().getType();
+  auto smemTy = getDst().getType();
+
+  // TDM gather mode only supports 2D tensors
+  auto blockShape = tensorDescTy.getBlockType().getShape();
+  if (blockShape.size() != 2)
+    return emitOpError("TDM gather only supports 2D tensors, got ")
+           << blockShape.size() << "D";
+
+  // Check that every dimension of the block shape is <= 2^16
+  auto verifyResult = verifyTDMBlockSize(getOperation(), blockShape);
+  if (failed(verifyResult))
+    return verifyResult;
+
+  auto srcRowIndicesType = cast<RankedTensorType>(getSrcRowIndices().getType());
+  if (srcRowIndicesType.getRank() != 1)
+    return emitOpError("src_row_indices must be a 1D tensor");
+
+  // Element type (i16 or i32) is already verified by ODS constraint
+  // TensorOf<[I16, I32]>
+
+  int64_t numIndices = srcRowIndicesType.getShape()[0];
+  if (!llvm::isPowerOf2_64(numIndices))
+    return emitOpError("src_row_indices size must be a power of 2, got ")
+           << numIndices;
+
+  auto swizzledEnc =
+      llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(smemTy.getEncoding());
+  if (swizzledEnc && swizzledEnc.getMaxPhase() != 1)
+    return emitOpError("TDM does not support swizzling");
+
+  auto paddedEnc =
+      llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(smemTy.getEncoding());
+  if (paddedEnc && !(paddedEnc.getIntervals().size() == 1 &&
+                     paddedEnc.getPaddings().size() == 1))
+    return emitOpError(
+        "TDM gather does not support multiple interval-padding pairs");
+
+  if (!paddedEnc && !swizzledEnc)
+    return emitOpError("Invalid shared memory layout for TDM");
+
+  return success();
+}
+
 // -- InitBarrierOp --
 LogicalResult InitBarrierOp::verify() {
   if (failed(verifyBarrierType(*this, getAlloc().getType())))
@@ -864,7 +950,7 @@ LogicalResult AsyncCopyMbarrierArriveOp::verify() {
 // prefetch instruction.
 LogicalResult TDMPrefetchOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
     SmallVectorImpl<Type> &inferredReturnTypes) {
   TDMPrefetchOp::Adaptor ad(operands, attributes, properties, regions);
 

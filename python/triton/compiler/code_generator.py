@@ -478,10 +478,7 @@ class CodeGenerator(ast.NodeVisitor):
         if isinstance(val, (ir.value, ir.block_argument)):
             val.set_loc(self.builder.create_name_loc(name, val.get_loc()))
         elif _is_triton_value(val):
-            handles = []
-            val._flatten_ir(handles)
-            for handle in handles:
-                handle.set_loc(self.builder.create_name_loc(name, handle.get_loc()))
+            val._set_name(self.builder, name)
 
     def set_value(self, name: str, value: Union[base_value, constexpr]) -> None:
         """This function:
@@ -572,12 +569,17 @@ class CodeGenerator(ast.NodeVisitor):
             raise ValueError("nested comprehensions are not supported")
 
         comp = node.generators[0]
-        iter = self.visit(comp.iter)
-        if not isinstance(iter, tl_tuple):
-            raise NotImplementedError("only tuple comprehensions are supported")
+        if isinstance(comp.iter, ast.Call) and self.visit(comp.iter.func) is range:
+            args = [_unwrap_if_constexpr(self.visit(a)) for a in comp.iter.args]
+            items = [constexpr(i) for i in range(*args)]
+        else:
+            it = self.visit(comp.iter)
+            if not isinstance(it, tl_tuple):
+                raise NotImplementedError("comprehension iterable must be a tuple or constexpr range(...)")
+            items = list(it)
 
         results = []
-        for item in iter:
+        for item in items:
             self.set_value(comp.target.id, item)
             results.append(self.visit(node.elt))
         return tl_tuple(results)

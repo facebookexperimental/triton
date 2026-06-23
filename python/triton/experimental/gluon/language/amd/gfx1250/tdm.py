@@ -62,6 +62,11 @@ class tensor_descriptor(ttgl.base_value):
     strides: ttgl.tuple
     type: tensor_descriptor_type
 
+    def _set_name(self, builder: ir.builder, name: str) -> None:
+        self.handle.set_loc(builder.create_name_loc(name, self.handle.get_loc()))
+        self.shape._set_name(builder, name + ".shape")
+        self.strides._set_name(builder, name + ".stride")
+
     def _flatten_ir(self, handles: List[ir.value]) -> None:
         handles.append(self.handle)
         self.shape._flatten_ir(handles)
@@ -213,6 +218,44 @@ def async_scatter(desc: tensor_descriptor, dst_row_indices: ttgl.tensor, dst_col
 
     _semantic.builder.create_async_tdm_scatter(desc.handle, dst_row_indices.handle, dst_col_offset_handle, src.handle,
                                                mbarrier_handle)
+
+
+@builtin
+def async_gather(desc: tensor_descriptor, src_row_indices: ttgl.tensor, src_col_offset, dst: shared_memory_descriptor,
+                 mbarrier: shared_memory_descriptor = None, _semantic=None) -> None:
+    """Gather data from non-contiguous rows in global memory to shared memory asynchronously.
+
+    This operation uses TDM gather mode to read data from non-contiguous rows in global memory.
+    Unlike async_load which reads from contiguous rows, gather allows reading from arbitrary
+    rows specified by the src_row_indices tensor.
+
+    The dtype of src_row_indices determines the index size:
+    - int16: up to 16 rows can be gathered per TDM instruction
+    - int32: up to 8 rows can be gathered per TDM instruction
+    If more rows are needed, multiple TDM instructions will be automatically issued.
+
+    Args:
+        desc (tensor_descriptor): the source tensor descriptor. Must be 2D.
+        src_row_indices (tensor): 1D tensor of row indices (int16 or int32) in the source tensor.
+        src_col_offset (int or tensor): the starting column offset in the source tensor
+                                        for all gathered rows.
+        dst (shared_memory_descriptor): the shared memory destination to store gathered data. Must be 2D.
+        mbarrier (shared_memory_descriptor, optional): The barrier object to signal "arrive" on.
+    """
+    ndim = len(desc.block_shape)
+    assert ndim == 2, f"TDM gather only supports 2D tensors, got {ndim}D"
+
+    dst_ndim = len(dst.shape)
+    assert dst_ndim == 2, f"TDM gather dst must be 2D, got {dst_ndim}D"
+
+    # Convert src_col_offset to i32
+    src_col_offset_handle = _semantic._convert_to_ir_values([src_col_offset], require_i64=False)[0]
+
+    mbarrier = _unwrap_if_constexpr(mbarrier)
+    mbarrier_handle = mbarrier.handle if mbarrier is not None else ttgl.ir.value()
+
+    _semantic.builder.create_async_tdm_gather(desc.handle, src_row_indices.handle, src_col_offset_handle, dst.handle,
+                                              mbarrier_handle)
 
 
 @builtin

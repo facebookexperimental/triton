@@ -720,8 +720,7 @@ bool verifyReuseGroup2(ReuseGroup *group) {
     auto *srcB = chB->getSrcOp();
     if (srcA && srcB && srcA->getBlock() == srcB->getBlock() &&
         (appearsBefore(srcA, srcB) || appearsBefore(srcB, srcA))) {
-      llvm::errs() << "DEBUG verifyReuseGroup2: fallback accepted, producers "
-                      "in same block\n";
+      LDBG("verifyReuseGroup2: fallback accepted, producers in same block");
       return true;
     }
     LDBG("verifyReuseGroup2: no dependency chain between channels");
@@ -835,6 +834,23 @@ bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel) {
        << "earlyChannel " << earlyChannel->uniqID << " and lateChannel "
        << lateChannel->uniqID);
   return true;
+}
+
+bool isWholeAllocationOverwriteReuseOwner(Channel *ownerCh) {
+  if (!ownerCh)
+    return false;
+  // The space owner / representative has no `buffer.offset` attribute on its
+  // alloc; packed reusers carry `buffer.offset > 0`.
+  Operation *allocOp = ownerCh->getAllocOp();
+  if (!allocOp || allocOp->hasAttr("buffer.offset"))
+    return false;
+  if (ownerCh->channelKind != DataChannelKind::TMEMPost)
+    return false;
+  // A `useC=false` MMA producer zeros the whole TMEM allocation before writing.
+  // `isOperandDNoAcc` records this whole-allocation overwrite producer shape
+  // (set in createChannelPost when the MMA's useAccumulator is const-false).
+  auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ownerCh);
+  return tmemCh->isOperandDNoAcc;
 }
 
 void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
@@ -2867,6 +2883,12 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
   // happen with data-partitioned computation groups where one producer feeds
   // multiple consumer partitions. If all producer tasks are co-located with
   // consumers, no cross-partition channel is needed.
+  // If producer has no task ID (e.g., an alloc that was hoisted above
+  // all partitions or never assigned), skip channel creation — there is
+  // no producer partition to synchronize with.
+  if (producerTaskIds.empty())
+    return;
+
   AsyncTaskId producerTaskId = -1;
   if (producerTaskIds.size() > 1) {
     DenseSet<int> consumerTaskIdSet(consumerTaskIds.begin(),

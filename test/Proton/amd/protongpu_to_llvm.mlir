@@ -80,8 +80,6 @@ module attributes {"ttg.num-warps" = 8 : i32, ttg.profile_scratch_memory_alignme
     // CHECK-DAG: rocdl.workgroup.id.x
     // CHECK-DAG: rocdl.workgroup.id.y
     // CHECK-DAG: rocdl.workgroup.id.z
-    // CHECK-DAG: rocdl.grid.dim.x
-    // CHECK-DAG: rocdl.grid.dim.y
     // CHECK-DAG: %[[PID:.*]] = llvm.trunc %{{.*}} : i64 to i32
     // CHECK-DAG: %[[SIZE:.*]] = llvm.mlir.constant(384 : i32)
     // CHECK-DAG: %{{.*}} = llvm.mul %[[PID]], %[[SIZE]] : i32

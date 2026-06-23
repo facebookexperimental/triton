@@ -1,6 +1,6 @@
 #include <Python.h>
 #include <cstddef>
-#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -8,6 +8,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -1532,8 +1533,9 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
   // When kwargs are present, merge them into positional args in C.
   // This mirrors the Python-side logic in jit.py run() c_cache path.
   if (kwnames && PyTuple_GET_SIZE(kwnames) > 0) {
-    if (!self->param_name_to_idx)
+    if (!self->param_name_to_idx) {
       goto fallback;
+    }
     Py_ssize_t nkw = PyTuple_GET_SIZE(kwnames);
     int total = self->n_params;
     // Allocate merged array on stack (max ~64 params for typical kernels)
@@ -1844,6 +1846,801 @@ PyObject *native_create_jit_proxy(PyObject *self_unused, PyObject *const *args,
   return (PyObject *)proxy;
 }
 
+/* =========================================================================
+ * _AutotuneCacheProxy: C-level proxy for autotuned kernels.
+ * Eliminates ~12us of Python overhead in Autotuner.run() by doing key
+ * extraction, config lookup, arg merging, and dispatch entirely in C.
+ * ========================================================================= */
+
+static constexpr int AT_MAX_KEY_FIELDS = 16;
+static constexpr int AT_MAX_CONSTEXPRS = 32;
+
+// One entry in the autotune dispatch table: maps an autotuner key to a
+// pre-built dispatch state (constexpr values, options_hash, cached grid).
+struct ATEntry {
+  PyObject **key_vals; // stored key values for equality check
+  int n_key_vals;
+  uint64_t key_hash;
+  bool occupied;
+
+  // Dispatch state for this config
+  PyObject **constexpr_vals; // config constexpr values to merge into full_args
+  int *constexpr_positions;  // which slots in full_args they go into
+  int n_constexprs;
+  uint64_t options_hash; // fc_options_hash for this winning config
+  PyObject *pre_hook;    // config pre_hook callable (NULL or Py_None = no hook)
+};
+
+static void at_entry_release(ATEntry &e) {
+  for (int j = 0; j < e.n_key_vals; j++)
+    Py_XDECREF(e.key_vals[j]);
+  free(e.key_vals);
+  for (int j = 0; j < e.n_constexprs; j++)
+    Py_XDECREF(e.constexpr_vals[j]);
+  free(e.constexpr_vals);
+  free(e.constexpr_positions);
+  Py_XDECREF(e.pre_hook);
+}
+
+static void at_table_resize(std::vector<ATEntry> &table,
+                            std::vector<std::vector<ATEntry>> &retired) {
+  size_t new_cap = table.size() * 2;
+  std::vector<ATEntry> new_table(new_cap);
+  for (size_t i = 0; i < table.size(); i++) {
+    if (table[i].occupied) {
+      size_t idx = table[i].key_hash % new_cap;
+      while (new_table[idx].occupied)
+        idx = (idx + 1) % new_cap;
+      new_table[idx] = table[i];
+    }
+  }
+  // Retain the old buffer instead of letting move-assignment free it: a
+  // concurrent lock-free lookup may still be reading entries from it after
+  // releasing the GIL inside PyObject_RichCompareBool. Entries are
+  // shallow-copied into new_table (they share the same key_vals/constexpr
+  // allocations, which stay owned by the live table), so the retired buffer
+  // is kept purely as valid backing memory and never releases entry contents.
+  retired.push_back(std::move(table));
+  table = std::move(new_table);
+}
+
+// Lookup is lock-free. A concurrent insert may resize the table while this
+// thread has released the GIL inside PyObject_RichCompareBool. Because resize
+// retains (never frees) the old buffer for the proxy's lifetime, reads here can
+// never touch freed memory; the worst case is a stale cap/idx producing a
+// false-negative that falls back to Python — always correct.
+static ATEntry *at_table_lookup(std::vector<ATEntry> &table, size_t count,
+                                uint64_t hash, PyObject *const *key_vals,
+                                int n_key_vals) {
+  if (table.empty() || count == 0)
+    return nullptr;
+  size_t cap = table.size();
+  size_t idx = hash % cap;
+  size_t probes = 0;
+  while (probes < cap) {
+    if (!table[idx].occupied)
+      return nullptr;
+    if (table[idx].key_hash == hash && table[idx].n_key_vals == n_key_vals) {
+      bool eq = true;
+      for (int i = 0; i < n_key_vals; i++) {
+        int cmp = PyObject_RichCompareBool(table[idx].key_vals[i], key_vals[i],
+                                           Py_EQ);
+        if (cmp <= 0) {
+          if (cmp == -1)
+            PyErr_Clear();
+          eq = false;
+          break;
+        }
+      }
+      if (eq)
+        return &table[idx];
+    }
+    idx = (idx + 1) % cap;
+    probes++;
+  }
+  return nullptr;
+}
+
+static void at_table_insert(std::vector<ATEntry> &table, size_t &count,
+                            std::vector<std::vector<ATEntry>> &retired,
+                            uint64_t hash, PyObject *const *key_vals,
+                            int n_key_vals, PyObject *const *constexpr_vals,
+                            int *constexpr_positions, int n_constexprs,
+                            uint64_t options_hash,
+                            PyObject *pre_hook = nullptr) {
+  if (table.empty())
+    table.resize(16);
+  if (count * 4 >= table.size() * 3)
+    at_table_resize(table, retired);
+
+  PyObject **kv = (PyObject **)malloc(n_key_vals * sizeof(PyObject *));
+  PyObject **cv = n_constexprs
+                      ? (PyObject **)malloc(n_constexprs * sizeof(PyObject *))
+                      : nullptr;
+  int *cp = n_constexprs ? (int *)malloc(n_constexprs * sizeof(int)) : nullptr;
+  // Bail out if any allocation failed (the entry is simply not cached, so the
+  // Python fallback handles this key). Guard kv only when n_key_vals > 0 since
+  // malloc(0) may legitimately return nullptr.
+  if ((n_key_vals && !kv) || (n_constexprs && (!cv || !cp))) {
+    free(kv);
+    free(cv);
+    free(cp);
+    return;
+  }
+  for (int i = 0; i < n_key_vals; i++) {
+    kv[i] = key_vals[i];
+    Py_INCREF(kv[i]);
+  }
+  for (int i = 0; i < n_constexprs; i++) {
+    cv[i] = constexpr_vals[i];
+    Py_INCREF(cv[i]);
+    cp[i] = constexpr_positions[i];
+  }
+
+  size_t cap = table.size();
+  size_t idx = hash % cap;
+  while (table[idx].occupied)
+    idx = (idx + 1) % cap;
+
+  table[idx].key_vals = kv;
+  table[idx].n_key_vals = n_key_vals;
+  table[idx].key_hash = hash;
+  table[idx].constexpr_vals = cv;
+  table[idx].constexpr_positions = cp;
+  table[idx].n_constexprs = n_constexprs;
+  table[idx].options_hash = options_hash;
+  table[idx].pre_hook = pre_hook;
+  if (pre_hook && pre_hook != Py_None)
+    Py_INCREF(pre_hook);
+  table[idx].occupied = true;
+  count++;
+}
+
+typedef struct {
+  PyObject_HEAD vectorcallfunc vectorcall;
+  PyObject *jit_fn;       // inner JITFunction
+  PyObject *params_list;  // JIT params (for fc_build_key)
+  PyObject *fallback_run; // Python Autotuner.run() bound method
+  PyObject *stream_getter;
+  PyObject *device_getter;
+  PyObject *grid_fn;           // callable grid, or NULL for static
+  PyObject *grid_static;       // static grid tuple, or NULL for callable
+  PyObject *param_name_to_idx; // dict for kwargs→positional merging (or NULL)
+  int *key_indices;            // positions in args for autotuner key
+  int n_key_indices;
+  int *dtype_indices; // positions of tensor args (for dtype in key)
+  int n_dtype_indices;
+  int n_params;                  // total params of inner JITFunction
+  std::vector<ATEntry> at_table; // autotune dispatch table
+  size_t at_count;               // number of occupied entries
+  // Old table buffers retained (never freed) across resizes so that a
+  // concurrent lock-free lookup that released the GIL mid-compare can never
+  // read freed memory. Released only when the proxy is destroyed.
+  std::vector<std::vector<ATEntry>> at_retired;
+} AutotuneCacheProxy;
+
+static PyObject *AutotuneCacheProxy_vectorcall(PyObject *callable,
+                                               PyObject *const *args,
+                                               size_t nargsf,
+                                               PyObject *kwnames);
+static void AutotuneCacheProxy_dealloc(PyObject *o);
+static int AutotuneCacheProxy_traverse(PyObject *o, visitproc visit, void *arg);
+static int AutotuneCacheProxy_clear(PyObject *o);
+
+static PyObject *AutotuneCacheProxy_vectorcall(PyObject *callable,
+                                               PyObject *const *args,
+                                               size_t nargsf,
+                                               PyObject *kwnames) {
+  AutotuneCacheProxy *self = (AutotuneCacheProxy *)callable;
+  Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
+  PyObject *e_pre_hook = nullptr; // owned ref, cleaned up at fallback
+
+  // Handle kwargs: merge into positional array using param_name_to_idx
+  PyObject *const *effective_args = args;
+  Py_ssize_t effective_nargs = nargs;
+  PyObject *merged_buf_storage[FC_MAX_ARGS];
+  if (kwnames && PyTuple_GET_SIZE(kwnames) > 0) {
+    if (!self->param_name_to_idx) {
+      goto fallback;
+    }
+    Py_ssize_t nkw = PyTuple_GET_SIZE(kwnames);
+    // Size the merged buffer on n_params (like JITCacheProxy) and fully
+    // initialize [0, total) before placing kwargs. This avoids leaving gaps
+    // when a kwarg targets a high-index param: every slot that effective_args
+    // can later read is guaranteed initialized.
+    Py_ssize_t total = self->n_params;
+    if (total > FC_MAX_ARGS) {
+      goto fallback;
+    }
+    for (Py_ssize_t i = 0; i < total; i++)
+      merged_buf_storage[i] = (i < nargs) ? (PyObject *)args[i] : Py_None;
+    // Place kwargs at correct positions
+    for (Py_ssize_t ki = 0; ki < nkw; ki++) {
+      PyObject *name = PyTuple_GET_ITEM(kwnames, ki);
+      PyObject *idx_obj =
+          PyDict_GetItem(self->param_name_to_idx, name); // borrowed
+      if (!idx_obj) {
+        goto fallback; // unknown kwarg
+      }
+      Py_ssize_t idx = PyLong_AsSsize_t(idx_obj);
+      if (idx < 0 || idx >= total)
+        goto fallback;
+      merged_buf_storage[idx] = (PyObject *)args[nargs + ki];
+    }
+    effective_args = merged_buf_storage;
+    effective_nargs = total;
+  }
+
+  {
+    // 1. Build autotuner key: extract key values + dtype codes
+    PyObject *key_buf[AT_MAX_KEY_FIELDS + FC_MAX_ARGS]; // stack alloc
+    int n_key = 0;
+    PyObject
+        *dtype_refs[AT_MAX_KEY_FIELDS]; // owned refs to DECREF after lookup
+    int n_dtype_refs = 0;
+
+    // Extract key field values from args by pre-computed indices
+    for (int i = 0; i < self->n_key_indices; i++) {
+      int idx = self->key_indices[i];
+      if (idx >= (int)effective_nargs)
+        goto fallback;
+      key_buf[n_key++] = effective_args[idx];
+    }
+    // Extract dtype from tensor args
+    for (int i = 0; i < self->n_dtype_indices; i++) {
+      int idx = self->dtype_indices[i];
+      if (idx >= (int)effective_nargs) {
+        for (int d = 0; d < n_dtype_refs; d++)
+          Py_DECREF(dtype_refs[d]);
+        goto fallback;
+      }
+      PyObject *arg = effective_args[idx];
+      // Fast path: check if it's a tensor (has dtype attribute)
+      if (g_tensor_api) {
+        int8_t st = g_tensor_api->get_scalar_type(arg);
+        if (st >= 0) {
+          static PyObject *dtype_str = nullptr;
+          if (!dtype_str)
+            dtype_str = PyUnicode_InternFromString("dtype");
+          PyObject *dtype = PyObject_GetAttr(arg, dtype_str);
+          if (!dtype) {
+            PyErr_Clear();
+            for (int d = 0; d < n_dtype_refs; d++)
+              Py_DECREF(dtype_refs[d]);
+            goto fallback;
+          }
+          key_buf[n_key++] = dtype;
+          dtype_refs[n_dtype_refs++] = dtype; // defer DECREF
+          continue;
+        }
+      }
+      // Slow path: try getting dtype attribute
+      static PyObject *dtype_str2 = nullptr;
+      if (!dtype_str2)
+        dtype_str2 = PyUnicode_InternFromString("dtype");
+      if (PyObject_HasAttr(arg, dtype_str2)) {
+        PyObject *dtype = PyObject_GetAttr(arg, dtype_str2);
+        if (!dtype) {
+          PyErr_Clear();
+          for (int d = 0; d < n_dtype_refs; d++)
+            Py_DECREF(dtype_refs[d]);
+          goto fallback;
+        }
+        key_buf[n_key++] = dtype;
+        dtype_refs[n_dtype_refs++] = dtype; // defer DECREF
+      }
+    }
+
+    // 2. Hash the key
+    uint64_t hash = 14695981039346656037ULL; // FNV-1a offset
+    for (int i = 0; i < n_key; i++) {
+      Py_hash_t h = PyObject_Hash(key_buf[i]);
+      if (h == -1) {
+        PyErr_Clear();
+        for (int d = 0; d < n_dtype_refs; d++)
+          Py_DECREF(dtype_refs[d]);
+        goto fallback;
+      }
+      hash ^= (uint64_t)h;
+      hash *= 1099511628211ULL;
+    }
+
+    // 3. Lookup in autotune table
+    ATEntry *entry =
+        at_table_lookup(self->at_table, self->at_count, hash, key_buf, n_key);
+    // Release dtype refs now that lookup is complete
+    for (int d = 0; d < n_dtype_refs; d++)
+      Py_DECREF(dtype_refs[d]);
+    if (!entry) {
+      goto fallback;
+    }
+
+    // Copy entry fields locally — entry pointer may be invalidated if another
+    // thread triggers at_table_insert (which resizes the vector) during any
+    // Python call below that releases the GIL.
+    PyObject **e_constexpr_vals = entry->constexpr_vals;
+    int *e_constexpr_positions = entry->constexpr_positions;
+    int e_n_constexprs = entry->n_constexprs;
+    uint64_t e_options_hash = entry->options_hash;
+    e_pre_hook = entry->pre_hook;
+    if (e_pre_hook)
+      Py_INCREF(e_pre_hook);
+
+    // 4. Build full_args: user args + constexpr values from config
+    PyObject *full_args[FC_MAX_ARGS];
+    int full_nargs = self->n_params;
+    // Copy user args
+    for (int i = 0; i < full_nargs; i++)
+      full_args[i] =
+          (i < (int)effective_nargs) ? (PyObject *)effective_args[i] : Py_None;
+    // Insert constexpr values from the winning config
+    for (int i = 0; i < e_n_constexprs; i++)
+      full_args[e_constexpr_positions[i]] = e_constexpr_vals[i];
+
+    // 4b. Call pre_hook before grid/fc_build_key — it mutates TensorDescriptors
+    // (e.g. block_shape) which affects the FC key hash. Must run before
+    // fc_build_key. If the C dispatch fails after this point, the Python
+    // fallback will call pre_hook again, but pre_hooks are idempotent.
+    if (e_pre_hook) {
+      static PyObject *arg_names_str2 = nullptr;
+      if (!arg_names_str2)
+        arg_names_str2 = PyUnicode_InternFromString("arg_names");
+      PyObject *arg_names = PyObject_GetAttr(self->jit_fn, arg_names_str2);
+      if (!arg_names) {
+        PyErr_Clear();
+        goto fallback;
+      }
+      PyObject *nargs_dict = PyDict_New();
+      if (!nargs_dict) {
+        Py_DECREF(arg_names);
+        goto fallback;
+      }
+      Py_ssize_t names_len = PyList_GET_SIZE(arg_names);
+      for (Py_ssize_t i = 0; i < names_len && i < full_nargs; i++) {
+        PyObject *name = PyList_GET_ITEM(arg_names, i);
+        PyDict_SetItem(nargs_dict, name, full_args[i]);
+      }
+      Py_DECREF(arg_names);
+      PyObject *hook_result = PyObject_CallOneArg(e_pre_hook, nargs_dict);
+      Py_DECREF(nargs_dict);
+      if (!hook_result) {
+        PyErr_Clear();
+        goto fallback;
+      }
+      Py_DECREF(hook_result);
+    }
+
+    // 5. Evaluate grid
+    PyObject *grid_tuple = nullptr;
+    bool grid_needs_decref = false;
+    if (self->grid_static) {
+      grid_tuple = self->grid_static;
+    } else if (self->grid_fn) {
+      // Callable grid must be re-evaluated every call — it may depend on
+      // non-key args (e.g. n_elements) that change between calls.
+      static PyObject *arg_names_str = nullptr;
+      if (!arg_names_str)
+        arg_names_str = PyUnicode_InternFromString("arg_names");
+      PyObject *arg_names = PyObject_GetAttr(self->jit_fn, arg_names_str);
+      if (!arg_names) {
+        PyErr_Clear();
+        goto fallback;
+      }
+      PyObject *meta = PyDict_New();
+      if (!meta) {
+        Py_DECREF(arg_names);
+        goto fallback;
+      }
+      Py_ssize_t names_len = PyList_GET_SIZE(arg_names);
+      for (Py_ssize_t i = 0; i < names_len && i < full_nargs; i++) {
+        PyObject *name = PyList_GET_ITEM(arg_names, i);
+        PyDict_SetItem(meta, name, full_args[i]);
+      }
+      Py_DECREF(arg_names);
+      grid_tuple = PyObject_CallOneArg(self->grid_fn, meta);
+      Py_DECREF(meta);
+      if (!grid_tuple)
+        goto fallback;
+      grid_needs_decref = true;
+    } else {
+      goto fallback;
+    }
+
+    // 6. Dispatch via native_fast_dispatch (reuse existing JIT C cache)
+    FastCache *cache =
+        fc_get_or_create(self->jit_fn, self->params_list, self->n_params);
+    if (!cache)
+      goto grid_cleanup;
+
+    FCCacheKey fc_key;
+    if (!fc_build_key(fc_key, cache, full_args, full_nargs, e_options_hash))
+      goto grid_cleanup;
+
+    {
+      FCEntry *fc_entry = cache->lookup(fc_key, full_args);
+      if (!fc_entry || !fc_entry->dispatcher)
+        goto grid_cleanup;
+
+      // Get stream
+      PyObject *dev = PyObject_CallNoArgs(self->device_getter);
+      if (!dev) {
+        PyErr_Clear();
+        goto grid_cleanup;
+      }
+      PyObject *stream_obj = PyObject_CallOneArg(self->stream_getter, dev);
+      Py_DECREF(dev);
+      if (!stream_obj) {
+        PyErr_Clear();
+        goto grid_cleanup;
+      }
+
+      // Extract grid values
+      Py_ssize_t gs =
+          PyTuple_Check(grid_tuple) ? PyTuple_GET_SIZE(grid_tuple) : 0;
+      static PyObject *one_obj = nullptr;
+      if (!one_obj)
+        one_obj = PyLong_FromLong(1);
+      PyObject *g0 = (gs > 0) ? PyTuple_GET_ITEM(grid_tuple, 0) : one_obj;
+      PyObject *g1 = (gs > 1) ? PyTuple_GET_ITEM(grid_tuple, 1) : one_obj;
+      PyObject *g2 = (gs > 2) ? PyTuple_GET_ITEM(grid_tuple, 2) : one_obj;
+
+      // Build dispatcher args: grid0, grid1, grid2, stream, *kernel_args
+      // Use dispatch_arg_indices when available (handles None pointer args
+      // correctly by only passing args the dispatcher actually needs).
+      int n_kernel_args = 0;
+      if (fc_entry->n_dispatch_args > 0) {
+        n_kernel_args = fc_entry->n_dispatch_args;
+      } else {
+        for (int i = 0; i < full_nargs && i < cache->n_params; i++) {
+          if (!cache->param_meta[i].is_constexpr)
+            n_kernel_args++;
+        }
+      }
+      Py_ssize_t vc_nargs = 3 + 1 + n_kernel_args;
+      PyObject **vc_args = (PyObject **)alloca(vc_nargs * sizeof(PyObject *));
+      vc_args[0] = g0;
+      vc_args[1] = g1;
+      vc_args[2] = g2;
+      vc_args[3] = stream_obj;
+      if (fc_entry->n_dispatch_args > 0) {
+        // Use stored dispatch_arg_indices to select only the args the
+        // dispatcher expects (skips None pointers, TMA shadow slots, etc.)
+        for (int j = 0; j < fc_entry->n_dispatch_args; j++)
+          vc_args[4 + j] = full_args[fc_entry->dispatch_arg_indices[j]];
+      } else {
+        // Legacy path: pass all non-constexpr args
+        int ki = 0;
+        for (int i = 0; i < full_nargs && i < cache->n_params; i++) {
+          if (!cache->param_meta[i].is_constexpr)
+            vc_args[4 + ki++] = full_args[i];
+        }
+      }
+      // Guard: clear stale exceptions before calling the dispatcher to prevent
+      // SystemError ("returned a result with an exception set") in td_get_ptr.
+      if (PyErr_Occurred()) {
+        PyErr_Clear();
+        Py_DECREF(stream_obj);
+        goto grid_cleanup;
+      }
+      PyObject *result =
+          PyObject_Vectorcall(fc_entry->dispatcher, vc_args, vc_nargs, nullptr);
+      Py_DECREF(stream_obj);
+      if (grid_needs_decref)
+        Py_DECREF(grid_tuple);
+      if (!result) {
+        Py_XDECREF(e_pre_hook);
+        return nullptr;
+      }
+      Py_DECREF(result);
+      Py_XDECREF(e_pre_hook);
+      Py_INCREF(fc_entry->kernel);
+      return fc_entry->kernel;
+    }
+
+  grid_cleanup:
+    if (grid_needs_decref)
+      Py_DECREF(grid_tuple);
+  }
+
+fallback:
+  Py_XDECREF(e_pre_hook);
+  return PyObject_Vectorcall(self->fallback_run, args, nargsf, kwnames);
+}
+
+static void AutotuneCacheProxy_dealloc(PyObject *o) {
+  PyObject_GC_UnTrack(o);
+  AutotuneCacheProxy *self = (AutotuneCacheProxy *)o;
+  Py_XDECREF(self->jit_fn);
+  Py_XDECREF(self->params_list);
+  Py_XDECREF(self->fallback_run);
+  Py_XDECREF(self->stream_getter);
+  Py_XDECREF(self->device_getter);
+  Py_XDECREF(self->grid_fn);
+  Py_XDECREF(self->grid_static);
+  Py_XDECREF(self->param_name_to_idx);
+  free(self->key_indices);
+  free(self->dtype_indices);
+  for (size_t i = 0; i < self->at_table.size(); i++) {
+    if (self->at_table[i].occupied)
+      at_entry_release(self->at_table[i]);
+  }
+  self->at_table.~vector();
+  // Retired buffers hold shallow copies that share allocations with the live
+  // table (already released above), so destroy them as raw memory only.
+  self->at_retired.~vector();
+  Py_TYPE(o)->tp_free(o);
+}
+
+static int AutotuneCacheProxy_traverse(PyObject *o, visitproc visit,
+                                       void *arg) {
+  AutotuneCacheProxy *self = (AutotuneCacheProxy *)o;
+  Py_VISIT(self->jit_fn);
+  Py_VISIT(self->params_list);
+  Py_VISIT(self->fallback_run);
+  Py_VISIT(self->stream_getter);
+  Py_VISIT(self->device_getter);
+  Py_VISIT(self->grid_fn);
+  Py_VISIT(self->grid_static);
+  Py_VISIT(self->param_name_to_idx);
+  for (size_t i = 0; i < self->at_table.size(); i++) {
+    if (self->at_table[i].occupied) {
+      ATEntry *entry = &self->at_table[i];
+      for (int j = 0; j < entry->n_key_vals; j++)
+        Py_VISIT(entry->key_vals[j]);
+      for (int j = 0; j < entry->n_constexprs; j++)
+        Py_VISIT(entry->constexpr_vals[j]);
+      Py_VISIT(entry->pre_hook);
+    }
+  }
+  return 0;
+}
+
+static int AutotuneCacheProxy_clear(PyObject *o) {
+  AutotuneCacheProxy *self = (AutotuneCacheProxy *)o;
+  Py_CLEAR(self->jit_fn);
+  Py_CLEAR(self->params_list);
+  Py_CLEAR(self->fallback_run);
+  Py_CLEAR(self->stream_getter);
+  Py_CLEAR(self->device_getter);
+  Py_CLEAR(self->grid_fn);
+  Py_CLEAR(self->grid_static);
+  Py_CLEAR(self->param_name_to_idx);
+  for (size_t i = 0; i < self->at_table.size(); i++) {
+    if (self->at_table[i].occupied) {
+      ATEntry *entry = &self->at_table[i];
+      for (int j = 0; j < entry->n_key_vals; j++)
+        Py_CLEAR(entry->key_vals[j]);
+      for (int j = 0; j < entry->n_constexprs; j++)
+        Py_CLEAR(entry->constexpr_vals[j]);
+      Py_CLEAR(entry->pre_hook);
+    }
+  }
+  return 0;
+}
+
+static PyTypeObject AutotuneCacheProxyType = {PyVarObject_HEAD_INIT(NULL, 0)};
+
+static void _init_autotune_cache_proxy_type() {
+  AutotuneCacheProxyType.tp_name = "triton._C.libtriton._AutotuneCacheProxy";
+  AutotuneCacheProxyType.tp_basicsize = sizeof(AutotuneCacheProxy);
+  AutotuneCacheProxyType.tp_flags =
+      Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_VECTORCALL | Py_TPFLAGS_HAVE_GC;
+  AutotuneCacheProxyType.tp_vectorcall_offset =
+      offsetof(AutotuneCacheProxy, vectorcall);
+  AutotuneCacheProxyType.tp_call = PyVectorcall_Call;
+  AutotuneCacheProxyType.tp_dealloc = AutotuneCacheProxy_dealloc;
+  AutotuneCacheProxyType.tp_traverse = AutotuneCacheProxy_traverse;
+  AutotuneCacheProxyType.tp_clear = AutotuneCacheProxy_clear;
+}
+
+// native_create_autotune_proxy(jit_fn, key_indices_list, dtype_indices_list,
+//                              params_list, n_params, stream_getter,
+//                              device_getter, fallback_run)
+PyObject *native_create_autotune_proxy(PyObject *self_unused,
+                                       PyObject *const *args,
+                                       Py_ssize_t nargs) {
+  if (nargs != 8) {
+    PyErr_SetString(PyExc_TypeError,
+                    "native_create_autotune_proxy expects 8 arguments");
+    return nullptr;
+  }
+  PyObject *jit_fn = args[0];
+  PyObject *key_indices_list = args[1];
+  PyObject *dtype_indices_list = args[2];
+  PyObject *params_list = args[3];
+  PyObject *n_params_obj = args[4];
+  PyObject *stream_getter = args[5];
+  PyObject *device_getter = args[6];
+  PyObject *fallback_run = args[7];
+
+  int n_params = (int)PyLong_AsLong(n_params_obj);
+  if (PyErr_Occurred())
+    return nullptr;
+
+  // Extract key_indices
+  Py_ssize_t n_keys = PyList_GET_SIZE(key_indices_list);
+  int *key_indices = (int *)malloc(n_keys * sizeof(int));
+  if (n_keys && !key_indices) {
+    PyErr_NoMemory();
+    return nullptr;
+  }
+  for (Py_ssize_t i = 0; i < n_keys; i++)
+    key_indices[i] = (int)PyLong_AsLong(PyList_GET_ITEM(key_indices_list, i));
+
+  // Extract dtype_indices
+  Py_ssize_t n_dtypes = PyList_GET_SIZE(dtype_indices_list);
+  int *dtype_indices = (int *)malloc(n_dtypes * sizeof(int));
+  if (n_dtypes && !dtype_indices) {
+    free(key_indices);
+    PyErr_NoMemory();
+    return nullptr;
+  }
+  for (Py_ssize_t i = 0; i < n_dtypes; i++)
+    dtype_indices[i] =
+        (int)PyLong_AsLong(PyList_GET_ITEM(dtype_indices_list, i));
+
+  if (PyErr_Occurred()) {
+    free(key_indices);
+    free(dtype_indices);
+    return nullptr;
+  }
+
+  AutotuneCacheProxy *proxy = (AutotuneCacheProxy *)PyObject_GC_New(
+      AutotuneCacheProxy, &AutotuneCacheProxyType);
+  if (!proxy) {
+    free(key_indices);
+    free(dtype_indices);
+    return nullptr;
+  }
+
+  proxy->vectorcall = AutotuneCacheProxy_vectorcall;
+  proxy->jit_fn = jit_fn;
+  Py_INCREF(jit_fn);
+  proxy->params_list = params_list;
+  Py_INCREF(params_list);
+  proxy->fallback_run = fallback_run;
+  Py_INCREF(fallback_run);
+  proxy->stream_getter = stream_getter;
+  Py_INCREF(stream_getter);
+  proxy->device_getter = device_getter;
+  Py_INCREF(device_getter);
+  proxy->grid_fn = nullptr;
+  proxy->grid_static = nullptr;
+  // Get _param_name_to_idx from jit_fn for kwargs→positional merging
+  static PyObject *pnti_str = nullptr;
+  if (!pnti_str)
+    pnti_str = PyUnicode_InternFromString("_param_name_to_idx");
+  PyObject *pnti = PyObject_GetAttr(jit_fn, pnti_str);
+  proxy->param_name_to_idx = pnti; // may be NULL if attr missing
+  if (!pnti)
+    PyErr_Clear();
+  proxy->key_indices = key_indices;
+  proxy->n_key_indices = (int)n_keys;
+  proxy->dtype_indices = dtype_indices;
+  proxy->n_dtype_indices = (int)n_dtypes;
+  proxy->n_params = n_params;
+  new (&proxy->at_table) std::vector<ATEntry>();
+  proxy->at_count = 0;
+  new (&proxy->at_retired) std::vector<std::vector<ATEntry>>();
+
+  PyObject_GC_Track((PyObject *)proxy);
+  return (PyObject *)proxy;
+}
+
+// native_autotune_proxy_insert(proxy, key_vals_list, constexpr_vals_list,
+//                              constexpr_positions_list, options_hash,
+//                              pre_hook)
+PyObject *native_autotune_proxy_insert(PyObject *self_unused,
+                                       PyObject *const *args,
+                                       Py_ssize_t nargs) {
+  if (nargs != 6) {
+    PyErr_SetString(PyExc_TypeError,
+                    "native_autotune_proxy_insert expects 6 arguments");
+    return nullptr;
+  }
+  PyObject *proxy_obj = args[0];
+  PyObject *key_vals_list = args[1];
+  PyObject *constexpr_vals_list = args[2];
+  PyObject *constexpr_positions_list = args[3];
+  PyObject *options_hash_obj = args[4];
+  PyObject *pre_hook_obj = args[5];
+
+  if (Py_TYPE(proxy_obj) != &AutotuneCacheProxyType) {
+    PyErr_SetString(PyExc_TypeError,
+                    "First argument must be AutotuneCacheProxy");
+    return nullptr;
+  }
+  AutotuneCacheProxy *proxy = (AutotuneCacheProxy *)proxy_obj;
+
+  uint64_t options_hash = PyLong_AsUnsignedLongLong(options_hash_obj);
+  if (PyErr_Occurred())
+    return nullptr;
+
+  Py_ssize_t n_key_vals = PyList_GET_SIZE(key_vals_list);
+  Py_ssize_t n_ce = PyList_GET_SIZE(constexpr_vals_list);
+
+  if (n_key_vals > AT_MAX_KEY_FIELDS || n_ce > AT_MAX_CONSTEXPRS) {
+    Py_RETURN_NONE; // too large, skip C cache silently
+  }
+
+  // Build key hash
+  uint64_t hash = 14695981039346656037ULL;
+  PyObject *key_vals_arr[AT_MAX_KEY_FIELDS];
+  for (Py_ssize_t i = 0; i < n_key_vals; i++) {
+    key_vals_arr[i] = PyList_GET_ITEM(key_vals_list, i);
+    Py_hash_t h = PyObject_Hash(key_vals_arr[i]);
+    if (h == -1) {
+      PyErr_Clear();
+      Py_RETURN_NONE;
+    }
+    hash ^= (uint64_t)h;
+    hash *= 1099511628211ULL;
+  }
+
+  // Build constexpr arrays
+  PyObject *ce_vals[AT_MAX_CONSTEXPRS];
+  int ce_positions[AT_MAX_CONSTEXPRS];
+  for (Py_ssize_t i = 0; i < n_ce; i++) {
+    ce_vals[i] = PyList_GET_ITEM(constexpr_vals_list, i);
+    ce_positions[i] =
+        (int)PyLong_AsLong(PyList_GET_ITEM(constexpr_positions_list, i));
+  }
+  if (PyErr_Occurred())
+    Py_RETURN_NONE;
+
+  at_table_insert(proxy->at_table, proxy->at_count, proxy->at_retired, hash,
+                  key_vals_arr, (int)n_key_vals, ce_vals, ce_positions,
+                  (int)n_ce, options_hash,
+                  (pre_hook_obj != Py_None) ? pre_hook_obj : nullptr);
+  Py_RETURN_NONE;
+}
+
+// native_autotune_proxy_set_grid(proxy, grid)
+// Sets the grid on the proxy. If grid is callable, stores as grid_fn.
+// If grid is a tuple/int, stores as grid_static.
+PyObject *native_autotune_proxy_set_grid(PyObject *self_unused,
+                                         PyObject *const *args,
+                                         Py_ssize_t nargs) {
+  if (nargs != 2) {
+    PyErr_SetString(PyExc_TypeError,
+                    "native_autotune_proxy_set_grid expects 2 arguments");
+    return nullptr;
+  }
+  PyObject *proxy_obj = args[0];
+  PyObject *grid = args[1];
+
+  if (Py_TYPE(proxy_obj) != &AutotuneCacheProxyType) {
+    PyErr_SetString(PyExc_TypeError,
+                    "First argument must be AutotuneCacheProxy");
+    return nullptr;
+  }
+  AutotuneCacheProxy *proxy = (AutotuneCacheProxy *)proxy_obj;
+
+  if (PyCallable_Check(grid) && !PyTuple_Check(grid)) {
+    Py_XDECREF(proxy->grid_fn);
+    Py_XDECREF(proxy->grid_static);
+    proxy->grid_fn = grid;
+    Py_INCREF(grid);
+    proxy->grid_static = nullptr;
+  } else {
+    Py_XDECREF(proxy->grid_fn);
+    Py_XDECREF(proxy->grid_static);
+    proxy->grid_fn = nullptr;
+    proxy->grid_static = nullptr;
+    // Normalize to tuple
+    PyObject *grid_tuple = grid;
+    if (!PyTuple_Check(grid)) {
+      grid_tuple = PyTuple_Pack(1, grid);
+      if (!grid_tuple)
+        return nullptr;
+    } else {
+      Py_INCREF(grid_tuple);
+    }
+    proxy->grid_static = grid_tuple;
+  }
+  Py_RETURN_NONE;
+}
+
 static PyMethodDef module_methods[] = {
     {"native_specialize_impl", (PyCFunction)specialize_impl, METH_FASTCALL,
      nullptr},
@@ -1853,6 +2650,12 @@ static PyMethodDef module_methods[] = {
      METH_FASTCALL, nullptr},
     {"native_create_jit_proxy", (PyCFunction)native_create_jit_proxy,
      METH_FASTCALL, nullptr},
+    {"native_create_autotune_proxy", (PyCFunction)native_create_autotune_proxy,
+     METH_FASTCALL, nullptr},
+    {"native_autotune_proxy_insert", (PyCFunction)native_autotune_proxy_insert,
+     METH_FASTCALL, nullptr},
+    {"native_autotune_proxy_set_grid",
+     (PyCFunction)native_autotune_proxy_set_grid, METH_FASTCALL, nullptr},
     {"register_tensor_access_api",
      (PyCFunction) + [](PyObject *self, PyObject *arg) -> PyObject * {
        (void)self;
@@ -1876,6 +2679,10 @@ void init_native_specialize(pybind11::module &m) {
   // Initialize JITCacheProxy type
   _init_jit_cache_proxy_type();
   if (PyType_Ready(&JITCacheProxyType) < 0)
+    return;
+  // Initialize AutotuneCacheProxy type
+  _init_autotune_cache_proxy_type();
+  if (PyType_Ready(&AutotuneCacheProxyType) < 0)
     return;
   // add functions to module
   PyModule_AddFunctions(m.ptr(), module_methods);

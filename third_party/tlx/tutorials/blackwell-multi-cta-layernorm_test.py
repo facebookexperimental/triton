@@ -243,6 +243,16 @@ def kernel_layernorm_multi_cta(
     tl.store(y_ptrs, y, mask=read_write_mask)
 
 
+# Below this feature width (N), the kernel is latency/overhead-bound and the
+# persistent + warp-specialized (2-WG) variant in
+# `blackwell_multi_cta_layernorm_ws_test.py` is faster: ~1.18-1.26x on B200
+# (fp16) at large M (>= 4096 rows), and ~parity at small M (the persistent loop
+# is too short to overlap there) -- so routing on N alone never regresses. At
+# larger N the problem becomes bandwidth-bound and persistence's reduced
+# concurrency makes WS slower, so we stay on this kernel.
+_WS_NARROW_N_THRESHOLD = 16384
+
+
 def multi_cta_layernorm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -251,6 +261,10 @@ def multi_cta_layernorm(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     TLX Multi-CTA Layer Normalization Forward Pass.
+
+    For narrow feature dimensions (N <= _WS_NARROW_N_THRESHOLD) this dispatches
+    to the persistent + warp-specialized (2-WG) fast path; otherwise it uses the
+    one-cluster-per-row-block kernel below. See _WS_NARROW_N_THRESHOLD.
 
     Args:
         x: Input tensor of shape [*, N] where * is any number of leading dimensions
@@ -263,6 +277,19 @@ def multi_cta_layernorm(
         mean: Mean tensor of shape [M] where M is the product of leading dimensions
         rstd: Reciprocal standard deviation of shape [M]
     """
+    # Narrow-N fast path: persistent + warp-specialized 2-WG kernel.
+    if x.shape[-1] <= _WS_NARROW_N_THRESHOLD:
+        # Absolute package import so it resolves both in a source checkout and
+        # under Buck. A bare `import blackwell_multi_cta_layernorm_ws_test` only
+        # works when the sibling is on sys.path by its bare name (source
+        # checkout / pytest prepend); under Buck the module ships nested at
+        # triton.language.extra.tlx.tutorials.* and the bare name is not found.
+        from triton.language.extra.tlx.tutorials.blackwell_multi_cta_layernorm_ws_test import (
+            multi_cta_layernorm_ws,
+        )
+
+        return multi_cta_layernorm_ws(x, weight, bias, eps)
+
     original_shape = x.shape
     x = x.reshape(-1, x.shape[-1])
     m, n = x.size()
@@ -334,8 +361,7 @@ def test_op(M, N, dtype):
     max_diff = torch.max(torch.abs(output_torch - output_triton)).item()
     print(f"[M={M}, N={N}, dtype={dtype}] Max difference: {max_diff}")
 
-    assert torch.allclose(output_torch, output_triton, rtol=rtol,
-                          atol=atol), (f"Output mismatch: max diff = {max_diff}")
+    assert torch.allclose(output_torch, output_triton, rtol=rtol, atol=atol), f"Output mismatch: max diff = {max_diff}"
 
 
 # %%

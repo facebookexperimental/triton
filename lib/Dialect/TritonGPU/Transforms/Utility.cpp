@@ -6,6 +6,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -1239,7 +1240,8 @@ Operation *convertDistributedOpEncoding(Attribute encoding, Operation *op) {
   // Convert output types
   SmallVector<Type, 4> newTypes;
   for (auto t : op->getResultTypes()) {
-    bool isAsync = isa<triton::gpu::AsyncCopyGlobalToLocalOp>(op);
+    bool isAsync = isa<triton::gpu::AsyncCopyGlobalToLocalOp,
+                       triton::amdgpu::BufferLoadToLocalOp>(op);
     newTypes.push_back(isAsync ? t : getNewType(t, encoding));
   }
 
@@ -1640,7 +1642,8 @@ void replaceUsesAndPropagateType(
       auto operands = llvm::to_vector(wait.getOperands());
       operands[operand->getOperandNumber()] = val;
       auto newWait = ttng::WarpGroupDotWaitOp::create(
-          builder, wait.getLoc(), operands, wait.getPendings());
+          builder, wait.getLoc(), operands, wait.getPendingsAttr(),
+          wait.getWarpGroupLocalAttr());
       wait.replaceAllUsesWith(newWait.getResults());
       wait.erase();
     } else {

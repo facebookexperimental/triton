@@ -1835,6 +1835,96 @@ SharedLinearEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
 }
 
 //===----------------------------------------------------------------------===//
+// PartitionedShared encoding
+//===----------------------------------------------------------------------===//
+
+void PartitionedSharedEncodingAttr::print(AsmPrinter &printer) const {
+  printer << "<{numPartitions = " << getNumPartitions()
+          << ", numGroups = " << getNumGroups()
+          << ", partitionDim = " << getPartitionDim()
+          << ", partitionLayout = " << getPartitionLayout() << "}>";
+}
+
+Attribute PartitionedSharedEncodingAttr::parse(AsmParser &parser, Type type) {
+  if (parser.parseLess().failed())
+    return {};
+  DictionaryAttr dict;
+  if (parser.parseAttribute(dict).failed())
+    return {};
+  if (parser.parseGreater().failed())
+    return {};
+
+  unsigned numPartitions = 0;
+  unsigned numGroups = 0;
+  unsigned partitionDim = 0;
+  Attribute partitionLayout = nullptr;
+
+  for (const NamedAttribute &attr : dict) {
+    if (attr.getName() == "numPartitions") {
+      if (parseUInt(parser, attr, numPartitions, "numPartitions").failed())
+        return {};
+    } else if (attr.getName() == "numGroups") {
+      if (parseUInt(parser, attr, numGroups, "numGroups").failed())
+        return {};
+    } else if (attr.getName() == "partitionDim") {
+      if (parseUInt(parser, attr, partitionDim, "partitionDim").failed())
+        return {};
+    } else if (attr.getName() == "partitionLayout") {
+      partitionLayout = attr.getValue();
+    } else {
+      parser.emitError(parser.getNameLoc(), "unexpected key: ")
+          << attr.getName().strref();
+      return {};
+    }
+  }
+
+  if (!partitionLayout) {
+    parser.emitError(parser.getNameLoc(), "missing partitionLayout");
+    return {};
+  }
+
+  auto sharedEnc = mlir::dyn_cast<SharedEncodingTrait>(partitionLayout);
+
+  if (!sharedEnc) {
+    parser.emitError(parser.getNameLoc(),
+                     "partitionLayout must be a SharedEncodingTrait");
+    return {};
+  }
+
+  return PartitionedSharedEncodingAttr::get(parser.getContext(), numPartitions,
+                                            numGroups, partitionDim, sharedEnc);
+}
+
+CGAEncodingAttr PartitionedSharedEncodingAttr::getCGALayout() const {
+  auto layoutEncTrait = cast<LayoutEncodingTrait>(getPartitionLayout());
+  return layoutEncTrait.getCGALayout();
+}
+
+LogicalResult PartitionedSharedEncodingAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, unsigned numPartitions,
+    unsigned numGroups, unsigned partitionDim,
+    SharedEncodingTrait partitionLayout) {
+  // Check numPartitions is a power of 2 and >= 2
+  // (numPartitions == 1 is just the inner layout, use that directly instead)
+  if (numPartitions < 2 || !llvm::isPowerOf2_32(numPartitions))
+    return emitError() << "numPartitions must be a power of 2 and at least 2";
+
+  // Check numGroups is a power of 2 and > 0
+  if (numGroups == 0 || !llvm::isPowerOf2_32(numGroups))
+    return emitError() << "numGroups must be a power of 2 and greater than 0";
+
+  // Check partitionDim is within bounds of the layout rank
+  auto layoutEncTrait = cast<LayoutEncodingTrait>(partitionLayout);
+  unsigned rank = layoutEncTrait.getRank();
+  if (partitionDim >= rank)
+    return emitError() << "partitionDim (" << partitionDim
+                       << ") must be less than the layout rank (" << rank
+                       << ")";
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // PaddedShared encoding
 //===----------------------------------------------------------------------===//
 
@@ -2007,9 +2097,12 @@ LogicalResult PaddedSharedEncodingAttr::verify(
 
   const auto &bases = ll.getBases();
 
-  // Check that we are not broadcasting or having repeated bases
-  if (!ll.isInvertible()) {
-    return emitError() << "Broadcasting is not supported.";
+  // Check that the offset input dimension produces no broadcasts or has
+  // repeated rows. Broadcasts introduced by the block dimension are allowed.
+  auto kOffset = StringAttr::get(ctx, "offset");
+  auto ctaLayout = ll.sublayout(kOffset, to_vector(ll.getOutDimNames()));
+  if (!ctaLayout.isInjective()) {
+    return emitError() << "Broadcasting in offset dimension is not supported.";
   }
 
   auto nonZero = [](auto val) { return val != 0; };
@@ -2399,6 +2492,14 @@ SwizzledSharedEncodingAttr AMDWmmaEncodingAttr::composeSharedLayoutForOperand(
                                          maxPhase, sharedOrder, cgaLayout);
 }
 
+bool AMDWmmaEncodingAttr::isEqualIgnoringCGALayout(
+    AMDWmmaEncodingAttr other) const {
+  return getVersion() == other.getVersion() &&
+         getCtaLayout() == other.getCtaLayout() &&
+         getInstrShape() == other.getInstrShape() &&
+         getIsTransposed() == other.getIsTransposed();
+}
+
 //===----------------------------------------------------------------------===//
 // Mma encoding
 //===----------------------------------------------------------------------===//
@@ -2758,8 +2859,17 @@ struct TritonGPUInferLayoutInterface
                    mlir::dyn_cast<DotOperandEncodingAttr>(operandEncoding)) {
       if (opIdx != dotOpEnc.getOpIdx())
         return emitOptionalError(location, "Wrong opIdx");
-      if (retEncoding != dotOpEnc.getParent())
+      auto parentEnc = dotOpEnc.getParent();
+      if (retEncoding != parentEnc) {
+        // For AMDWmma, compare all fields except the CGA layout. Because in
+        // multi-CTA, operands have different CGA layouts.
+        auto retWmma = dyn_cast<AMDWmmaEncodingAttr>(retEncoding);
+        auto parentWmma = dyn_cast<AMDWmmaEncodingAttr>(parentEnc);
+        if (retWmma && parentWmma &&
+            retWmma.isEqualIgnoringCGALayout(parentWmma))
+          return success();
         return emitOptionalError(location, "Incompatible parent encoding");
+      }
     } else
       return emitOptionalError(
           location, "Dot's a/b's encoding should be of DotOperandEncodingAttr");
@@ -2802,6 +2912,33 @@ struct TritonGPUInferLayoutInterface
       // Verify that the operands are supported on the selected MMA version.
       if (!supportMMA(dotOp, mmaResEncoding.getVersionMajor()))
         return op->emitError("unsupported MMA version");
+    }
+
+    // For AMDWmmaEncodingAttr verify multi-cta CGA layout compatibility
+    auto wmmaAEncoding = dyn_cast<AMDWmmaEncodingAttr>(aEncoding.getParent());
+    auto wmmaBEncoding = dyn_cast<AMDWmmaEncodingAttr>(bEncoding.getParent());
+    auto wmmaResEncoding = dyn_cast<AMDWmmaEncodingAttr>(resEnc);
+    if (wmmaAEncoding && wmmaBEncoding && wmmaResEncoding) {
+      auto resLL = wmmaResEncoding.getCGALayout().getLinearLayout();
+
+      if (!resLL.isInvertible())
+        return op->emitError("Accumulator CGA layout should not broadcast or "
+                             "have repeated rows");
+
+      auto aLL = wmmaAEncoding.getCGALayout().getLinearLayout();
+      auto bLL = wmmaBEncoding.getCGALayout().getLinearLayout();
+      // In multi-CTA, the CGA layout of operand 0 broadcasts across dim1 and
+      // operand 1 broadcasts across dim0.
+      auto ctx = op->getContext();
+      auto dim0 = StringAttr::get(ctx, "dim0");
+      auto dim1 = StringAttr::get(ctx, "dim1");
+      // Resize to size 1 makes the dimension broadcast-only (all bases
+      // become 0).
+      if (aLL != resLL.resizeOutDim(dim1, 1))
+        return op->emitError("Incompatible CGA layout for operand 0");
+
+      if (bLL != resLL.resizeOutDim(dim0, 1))
+        return op->emitError("Incompatible CGA layout for operand 1");
     }
     return success();
   }
@@ -4232,4 +4369,22 @@ std::optional<int> triton::gpu::getWarpSpecializeTag(Operation *op) {
     return cast<IntegerAttr>(op->getAttr(kWarpSpecializeTagAttrName)).getInt();
   }
   return std::nullopt;
+}
+
+PaddedSharedEncodingAttr triton::gpu::getPaddedEncoding(Attribute encoding) {
+  if (auto padded = dyn_cast<PaddedSharedEncodingAttr>(encoding))
+    return padded;
+  if (auto partitioned = dyn_cast<PartitionedSharedEncodingAttr>(encoding))
+    return dyn_cast<PaddedSharedEncodingAttr>(partitioned.getPartitionLayout());
+  return nullptr;
+}
+
+bool triton::gpu::isPaddedEncoding(Attribute encoding) {
+  return getPaddedEncoding(encoding) != nullptr;
+}
+
+unsigned triton::gpu::getMinInterval(Attribute encoding) {
+  auto padded = getPaddedEncoding(encoding);
+  assert(padded && "expected padded encoding or partitioned wrapping padded");
+  return padded.getMinInterval();
 }

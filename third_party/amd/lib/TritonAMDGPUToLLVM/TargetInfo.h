@@ -3,7 +3,7 @@
 
 #include "TritonAMDGPUToLLVM/TargetUtils.h"
 #include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
-#include "llvm/TargetParser/TargetParser.h"
+#include "llvm/TargetParser/AMDGPUTargetParser.h"
 #include <string>
 
 namespace mlir::triton::AMD {
@@ -22,7 +22,11 @@ public:
 
   int getSharedMemorySize() const;
 
+  size_t getSharedMemoryPartitionSize() const override;
+
   bool supportMaximumMinimum() const override;
+
+  bool supportDppBroadcast() const;
 
   Value getClusterCTAId(RewriterBase &rewriter, Location loc) const override;
 
@@ -49,6 +53,8 @@ public:
     unsigned instBitWidth;
     // Number of elements that the instruction needs to be contiguous in LDS
     unsigned tileSize;
+    // Whether B8 types require double contiguity (for certain architectures)
+    bool needsDoubleB8Contiguity;
   };
   // Get the ds_read_tr parameters for the instruction that operates on the
   // element granularty specified by bitWidth
@@ -103,10 +109,19 @@ public:
   bool requiresAliasInfoForAsyncOps() const;
   bool supportsDirectToLdsLoadBitWidth(int bitWidth) const;
   bool supportsDirectFromLdsStoreBitWidth(int bitWidth) const;
+  bool supportsBufferLoadToLocal() const;
+
+  // Whether this target uses asyncmark/wait_asyncmark intrinsics for
+  // async memory ops synchronization instead of waitcnt-based intrinsics waits.
+  bool useAsyncMarks() const;
 
   bool supportsMultiCTALaunch() const;
   bool supportsTDM() const;
   bool supportsClusterLoadBitWidth(int biwWidth) const;
+
+  bool supportsWaveId() const;
+  bool supportsPermlaneSwap() const;
+  bool supportsCvtPkScalePk8() const;
 
   void localLoadOpAnnotation(triton::gpu::LocalLoadOp localLoadOp,
                              Operation *llLoadOp) const override;

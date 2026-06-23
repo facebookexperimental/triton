@@ -19,10 +19,9 @@ def _separable_qk_layout():
     )
 
 
-_SEPARABLE_QK_LINEAR = (
-    "#ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 64]], "
-    "lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], "
-    "warp = [[32, 0], [64, 0], [0, 32]], block = []}>")
+_SEPARABLE_QK_LINEAR = ("#ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 64]], "
+                        "lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], "
+                        "warp = [[32, 0], [64, 0], [0, 32]], block = []}>")
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
@@ -39,5 +38,6 @@ def test_layout_shape_stride_maps_to_linear():
 
     # 3 warp bases -> 2**3 = 8 warps; the layout requires num_warps == 8.
     compiled = kernel.warmup(_separable_qk_layout(), grid=(1, ), num_warps=8)
-    ttir = compiled.asm["ttir"]
-    assert _SEPARABLE_QK_LINEAR in ttir
+    ttgir = compiled.asm["ttgir"]
+    assert "no_verify_layout" not in ttgir
+    assert _SEPARABLE_QK_LINEAR in ttgir

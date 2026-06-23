@@ -1,5 +1,5 @@
 #include "TritonAMDGPUToLLVM/TargetUtils.h"
-#include "llvm/TargetParser/TargetParser.h"
+#include "llvm/TargetParser/AMDGPUTargetParser.h"
 
 namespace mlir::triton::AMD {
 
@@ -61,6 +61,7 @@ bool isCDNA(ISAFamily isaFamily) {
   case ISAFamily::CDNA2:
   case ISAFamily::CDNA3:
   case ISAFamily::CDNA4:
+  case ISAFamily::GFX1250:
     return true;
   default:
     break;

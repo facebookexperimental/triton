@@ -209,8 +209,8 @@ void init_linear_layout(py::module &&m) {
           },
           py::arg("inputs"))
       .def("get_matrix_view", [](const LinearLayout &self) {
-        std::unique_ptr<uint64_t[]> matrix = mlir::triton::getMatrix(self);
-        auto nRows = self.getTotalOutDimSizeLog2();
+        std::unique_ptr<uint64_t[]> matrix = self.getGF2Matrix();
+        auto nRows = self.getTotalOutDimSizeBits();
         auto nCols = self.getTotalInDimSizeLog2();
         std::vector<std::vector<int>> result(nRows, std::vector<int>(nCols));
         for (size_t i = 0; i < nRows; ++i) {
