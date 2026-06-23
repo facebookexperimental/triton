@@ -775,8 +775,6 @@ lowerLocalLdSt(Location loc, MLIRContext *ctx,
                SharedMemoryObject smemObj, RewriterBase &rewriter,
                const TargetInfoBase &targetInfo, Operation *localLoadOp,
                std::optional<Value> ctaRank, std::optional<Value> barrierPtr) {
-  assert(cvt.getNumOutDims() == 1);
-  assert(*cvt.getOutDimNames().begin() == str_attr("offset"));
 
   auto isStore = !valsArray.empty();
   // Remove broadcasting in the registers
