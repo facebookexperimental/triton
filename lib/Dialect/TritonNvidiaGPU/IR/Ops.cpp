@@ -1036,6 +1036,9 @@ static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,
                                        MemDescType memdesc, StringRef regName) {
   if (type.getRank() != 2)
     return op->emitOpError(regName) << " must be a 2D tensor";
+  if (tlx::hasNoVerifyLayout(type.getEncoding()) ||
+      tlx::hasNoVerifyLayout(memdesc.getEncoding()))
+    return success();
   // Skip verification for placeholder layouts - they will be resolved later
   if (isa<triton::tlx::DummyTMEMLayoutAttr>(memdesc.getEncoding()))
     return success();
