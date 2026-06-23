@@ -645,7 +645,7 @@ bool isExpensiveToRemat(Operation *op, Attribute &targetEncoding) {
   return false;
 }
 
-bool canFoldIntoConversion(Operation *op, Attribute targetEncoding) {
+bool canUseResultEncoding(Operation *op, Attribute targetEncoding) {
   if (isa<triton::CatOp>(op))
     return !triton::gpu::isExpensiveCat(cast<triton::CatOp>(op),
                                         targetEncoding);
@@ -949,7 +949,7 @@ LogicalResult getConvertBackwardSlice(
         enqueue(definingOp->getOpOperand(0), encoding);
         continue;
       }
-      if (canFoldIntoConversion(definingOp, encoding))
+      if (canUseResultEncoding(definingOp, encoding))
         continue;
       if (stopPropagation && stopPropagation(definingOp))
         continue;
@@ -1642,8 +1642,7 @@ void replaceUsesAndPropagateType(
       auto operands = llvm::to_vector(wait.getOperands());
       operands[operand->getOperandNumber()] = val;
       auto newWait = ttng::WarpGroupDotWaitOp::create(
-          builder, wait.getLoc(), operands, wait.getPendingsAttr(),
-          wait.getWarpGroupLocalAttr());
+          builder, wait.getLoc(), operands, wait.getPendings());
       wait.replaceAllUsesWith(newWait.getResults());
       wait.erase();
     } else {
@@ -1755,6 +1754,20 @@ LogicalResult verifyBarrierType(Operation *op,
         barrierType.getRank() == 1 && barrierType.getShape()[0] <= numCTAs))
     return op->emitOpError("barrier allocation must be a descriptor of "
                            "Nxi64 type with N <= number of CTAs");
+
+  auto kBlock = StringAttr::get(op->getContext(), "block");
+  auto ll = toLinearLayout(barrierType).flattenOuts();
+  const auto &blockBases = ll.getBases().lookup(kBlock);
+  int i = 0;
+  for (const auto &basis : blockBases) {
+    if (basis[0] != 0 && basis[0] != int64_t(1) << i) {
+      return op->emitOpError(
+          "broadcasted cluster barriers require bases to be the sequence"
+          "1, 2, 4, 8, ... perhaps with zero bases interleaved.");
+    }
+    if (basis[0] != 0)
+      ++i;
+  }
   return success();
 }
 

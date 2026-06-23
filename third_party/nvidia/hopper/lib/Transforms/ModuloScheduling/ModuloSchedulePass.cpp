@@ -3992,7 +3992,8 @@ void dumpScheduleGraphAsJSON(ModuleOp moduleOp, StringRef path,
 
 // Emit one DDG node: per-op hardware cost the LatencyModel assigned (super-
 // nodes additionally carry inner_ii / prologue_latency).
-void jsonDumpDDGNode(llvm::raw_ostream &os, const ttg::DDGNode &n, bool isLast) {
+void jsonDumpDDGNode(llvm::raw_ostream &os, const ttg::DDGNode &n,
+                     bool isLast) {
   os << "          {\"id\": " << n.idx << ", \"op_ref\": "
      << (n.op ? std::string("\"") + jsonOpId(n.op) + "\"" : std::string("null"))
      << ", \"op_kind\": \""
@@ -4009,7 +4010,8 @@ void jsonDumpDDGNode(llvm::raw_ostream &os, const ttg::DDGNode &n, bool isLast) 
 }
 
 // Emit one DDG edge: data-dependence with loop-carried distance + latency.
-void jsonDumpDDGEdge(llvm::raw_ostream &os, const ttg::DDGEdge &e, bool isLast) {
+void jsonDumpDDGEdge(llvm::raw_ostream &os, const ttg::DDGEdge &e,
+                     bool isLast) {
   os << "          {\"src\": " << e.srcIdx << ", \"dst\": " << e.dstIdx
      << ", \"kind\": \"" << (e.distance > 0 ? "loop_carried" : "data") << "\""
      << ", \"distance\": " << e.distance << ", \"latency\": " << e.latency

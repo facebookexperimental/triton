@@ -302,6 +302,56 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// NOTE: beta intentionally does NOT reject ttng.cluster_arrive / ttng.cluster_wait
+// inside ttg.warp_specialize (beta's autows/TLX pipelines place them there and the
+// conversion lowers them with all-warps wrapping). Only ttng.cluster_barrier is
+// rejected. The arrive/wait warp-specialize invalid cases from upstream #9456 are
+// therefore omitted here.
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
+  tt.func @cluster_barrier_invalid() {
+    // expected-error @below {{requires ttg.num-ctas > 1}}
+    ttng.cluster_barrier
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
+  tt.func @cluster_barrier_in_default_region_invalid() {
+    ttg.warp_specialize()
+    default {
+      // expected-error @below {{cannot be used inside `ttg.warp_specialize`}}
+      ttng.cluster_barrier
+      ttg.warp_yield
+    }
+    partition0() num_warps(4) {
+      ttg.warp_return
+    } : () -> ()
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
+  tt.func @cluster_barrier_in_partition_invalid() {
+    ttg.warp_specialize()
+    default {
+      ttg.warp_yield
+    }
+    partition0() num_warps(4) {
+      // expected-error @below {{cannot be used inside `ttg.warp_specialize`}}
+      ttng.cluster_barrier
+      ttg.warp_return
+    } : () -> ()
+    tt.return
+  }
+}
+
+// -----
+
 // expected-error @+1 {{After removing the zero bases the layout must be bijective}}
 #linear = #ttg.linear<{register = [[0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 1]], warp = [[16, 0], [8, 0]], block = []}>
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
@@ -411,6 +461,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
   // expected-error @below {{TensorDescIm2ColType requires rank-2 blockType, got rank 3}}
   tt.func @tensordesc_im2col_wrong_rank(%desc: !ttng.tensordesc_im2col<tensor<32x64x128xf16>>) {
+    tt.return
+  }
+}
+
+// -----
+
+#shared_bad = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0], [2], [1]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 8 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @wait_barrier_invalid_cga_layout(%bar: !ttg.memdesc<4xi64, #shared_bad, #smem, mutable>, %phase: i32) {
+    // expected-error @below {{broadcasted cluster barriers require bases to be the sequence}}
+    ttng.wait_barrier %bar, %phase : !ttg.memdesc<4xi64, #shared_bad, #smem, mutable>
     tt.return
   }
 }

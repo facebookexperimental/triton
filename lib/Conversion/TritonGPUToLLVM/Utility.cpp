@@ -1297,7 +1297,7 @@ Value getGlobalScratchPtr(Location loc, RewriterBase &rewriter,
   ModuleOp mod = funcOp.getOperation()->getParentOfType<ModuleOp>();
   auto allocSizeAttr = mod.getOperation()->getAttrOfType<mlir::IntegerAttr>(
       "ttg.global_scratch_memory_size");
-  if (!allocSizeAttr) {
+  if (!allocSizeAttr || allocSizeAttr.getValue().isZero()) {
     return gmemBase;
   }
 
@@ -1767,8 +1767,8 @@ SmallVector<Value> inlineRegionImpl(RewriterBase &rewriter, Region &region,
   return vals;
 }
 
-std::tuple<Block *, Block *, Block *>
-createIfBlock(ConversionPatternRewriter &b, Location loc, Value cnd) {
+std::tuple<Block *, Block *, Block *> createIfBlock(RewriterBase &b,
+                                                    Location loc, Value cnd) {
   Block *prevBlock = b.getInsertionBlock();
   Block *ifBlock = b.splitBlock(prevBlock, b.getInsertionPoint());
 
