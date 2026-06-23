@@ -133,7 +133,6 @@ createTargetMachine(llvm::Module *module, std::string proc,
   bool disableLLVMOpt = mlir::triton::tools::getBoolEnv("DISABLE_LLVM_OPT");
   if (enable_fp_fusion)
     opt.AllowFPOpFusion = llvm::FPOpFusion::Fast;
-  opt.NoNaNsFPMath = true;
   opt.TrapUnreachable = true;
   opt.MCOptions.AsmVerbose = true;
   opt.MCOptions.PreserveAsmComments = true;
@@ -606,8 +605,7 @@ void init_triton_llvm(py::module &&m) {
   m.attr("OPTIMIZE_O1") = llvm::OptimizationLevel::O1;
   m.attr("OPTIMIZE_O2") = llvm::OptimizationLevel::O2;
   m.attr("OPTIMIZE_O3") = llvm::OptimizationLevel::O3;
-  m.attr("OPTIMIZE_Os") = llvm::OptimizationLevel::Os;
-  m.attr("OPTIMIZE_Oz") = llvm::OptimizationLevel::Oz;
+  // Os and Oz were removed from llvm::OptimizationLevel in LLVM 20+
 
   m.def(
       "to_module",

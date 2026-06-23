@@ -45,7 +45,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
   // CHECK-LABEL: arrive_barrier
   tt.func @arrive_barrier(%alloc: !ttg.memdesc<1xi64, #shared0, #smem>) {
-    // CHECK-NEXT: nvvm.barrier0
+    // CHECK-NEXT: nvvm.barrier
     // CHECK-NEXT: [[TID:%.*]] = nvvm.read.ptx.sreg.tid.x
     // CHECK-NEXT: [[C127:%.*]] = llvm.mlir.constant(127 : i32)
     // CHECK-NEXT: [[RTID:%.*]] = llvm.and [[TID]], [[C127]]
@@ -58,7 +58,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
   // CHECK-LABEL: arrive_barrier_pred
   tt.func @arrive_barrier_pred(%alloc: !ttg.memdesc<1xi64, #shared0, #smem>, %pred: i1) {
-    // CHECK-NEXT: nvvm.barrier0
+    // CHECK-NEXT: nvvm.barrier
     // CHECK-NEXT: [[TID:%.*]] = nvvm.read.ptx.sreg.tid.x
     // CHECK-NEXT: [[C127:%.*]] = llvm.mlir.constant(127 : i32)
     // CHECK-NEXT: [[RTID:%.*]] = llvm.and [[TID]], [[C127]]
@@ -581,7 +581,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: tma_store_token_wait_with_barriers
   // CHECK: nvvm.cp.async.bulk.wait_group 0 {read}
-  // CHECK: nvvm.barrier0
+  // CHECK: nvvm.barrier
   // CHECK: mbarrier.arrive.shared::cta.b64
   tt.func @tma_store_token_wait_with_barriers(%tma: !tt.tensordesc<tensor<128x128xf32, #shared1>>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32, %barrier: !ttg.memdesc<1xi64, #bar_layout, #smem, mutable>) {
     %true = arith.constant true

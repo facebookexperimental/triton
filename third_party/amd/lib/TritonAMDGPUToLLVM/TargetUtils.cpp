@@ -1,5 +1,5 @@
 #include "TritonAMDGPUToLLVM/TargetUtils.h"
-#include "llvm/TargetParser/TargetParser.h"
+#include "llvm/TargetParser/AMDGPUTargetParser.h"
 
 namespace mlir::triton::AMD {
 

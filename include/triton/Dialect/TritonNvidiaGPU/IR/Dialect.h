@@ -84,7 +84,8 @@ inline bool is2CTA(Operation *op) {
 }
 
 struct TensorMemory : public SideEffects::Resource::Base<TensorMemory> {
-  StringRef getName() final { return "<TensorMemory>"; }
+  StringRef getName() const final { return "<TensorMemory>"; }
+  SideEffects::Resource *getParent() const override { return nullptr; }
 };
 
 struct TMemAllocation {
