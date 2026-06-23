@@ -6,10 +6,21 @@ import triton
 
 from triton.language.extra.tlx.tutorials.amd_fa_pipelined import (
     attention as _amd_fa_pipelined, )
+from triton.language.extra.tlx.tutorials.amd_fa_persistent import (
+    attention as _amd_fa_persistent, )
 
 from triton._internal_testing import is_hip
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
+
+# Reference gfx950/MI350 baselines (bf16, H=64, TFLOPS), for regression context.
+# key: (kernel, B, D, N, causal) -> TFLOPS
+#   N=4096  (B=1): simple   64/128 F 614/646  T 344/341 ; prefetch 64/128 F 677/782 T 334/447 ;
+#                  persistent 64/128 F 695/828 T 620/697
+#   N=8192  (B=2): simple   64/128 F 668/704  T 380/372 ; prefetch 64/128 F 713/833 T 358/472 ;
+#                  persistent 64/128 F 726/879 T 694/794
+#   N=16384 (B=1): simple   64/128 F 668/724  T 432/475 ; prefetch 64/128 F 732/861 T 439/544 ;
+#                  persistent 64/128 F 744/894 T 741/837
 
 ATTENTION_METHODS = {
     "simple":
@@ -22,6 +33,8 @@ ATTENTION_METHODS = {
             "num_warps": 8,
             "PREFETCH": True,
         }),
+    "persistent":
+    lambda q, k, v, sm_scale, causal: _amd_fa_persistent(q, k, v, sm_scale, causal),
 }
 
 ref_lib = "SDPA"
