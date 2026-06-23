@@ -6,6 +6,8 @@
 #include "third_party/amd/include/Analysis/AxisInfoExt.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
 
 #undef DEBUG_TYPE
@@ -25,52 +27,136 @@ namespace {
 
 // On gfx9 global and buffer loads directly to shared memory need to write
 // coalesced. This pattern converts the layout of the src, mask and other to
-// ensure the owned data per thread is contiguous and does no exceed the
+// ensure the owned data per thread is contiguous and does not exceed the
 // supported load vector size.
-struct CoalesceAsyncCopyWrites
-    : public OpRewritePattern<ttg::AsyncCopyGlobalToLocalOp> {
-  CoalesceAsyncCopyWrites(const triton::AMD::TargetInfo &targetInfo,
-                          const DenseMap<ttg::AsyncCopyGlobalToLocalOp,
-                                         unsigned> &asyncCopyContiguity,
-                          MLIRContext *ctx)
-      : OpRewritePattern(ctx), targetInfo{targetInfo},
-        asyncCopyContiguity{std::move(asyncCopyContiguity)} {}
+//
+// Works for both ttg::AsyncCopyGlobalToLocalOp and
+// triton::amdgpu::BufferLoadToLocalOp via template specialisation of a few
+// op-specific helpers gathered in OpTraits<OpTy>.
+//
+// Key differences between the two op types:
+//   AsyncCopyGlobalToLocalOp  — source is a tensor-of-pointers (srcTy encodes
+//     both pointer element type and the distributed layout).  Contiguity is
+//     bounded by both the axis-info result AND the consecutive-in-out property
+//     of the reg→shared mapping.  canLoadDirectToLDS is called with srcTy
+//     directly.  The swizzled branch asserts sizePerThread >= loadContig.
+//
+//   BufferLoadToLocalOp       — source is a scalar pointer + offset tensor
+//     (i32). The true contiguity comes from pointer/offset divisibility and
+//     must NOT be additionally capped by the current reg→shared consecutive-
+//     in-out (which would clamp it to 1 when sizePerThread=[1]).
+//     canLoadDirectToLDS must be called with a reconstructed effective
+//     pointer tensor type.  The swizzled branch does not assert srcElemContig.
 
-  LogicalResult matchAndRewrite(ttg::AsyncCopyGlobalToLocalOp copyOp,
+// ---------------------------------------------------------------------------
+// Op-specific traits (specialised below)
+// ---------------------------------------------------------------------------
+template <typename OpTy> struct OpTraits;
+
+template <> struct OpTraits<ttg::AsyncCopyGlobalToLocalOp> {
+  // Return the tensor whose encoding drives the distributed layout.
+  static Value getSourceTensor(ttg::AsyncCopyGlobalToLocalOp op) {
+    return op.getSrc();
+  }
+
+  // Return the destination MemDesc value.
+  static Value getDestValue(ttg::AsyncCopyGlobalToLocalOp op) {
+    return op.getResult();
+  }
+
+  // Cap by regToSharedLayout?
+  static constexpr bool capByRegToShared = true;
+
+  // Build the effective pointer tensor type for canLoadDirectToLDS.
+  static RankedTensorType getEffectivePtrType(ttg::AsyncCopyGlobalToLocalOp op,
+                                              RankedTensorType srcTy) {
+    return srcTy; // srcTy is already a tensor-of-pointers
+  }
+
+  // Assert srcElemContig >= loadContig in the swizzled branch?
+  static constexpr bool assertSrcElemContig = true;
+
+  // Assign the (possibly converted) source operand back to the op.
+  static void assignSource(ttg::AsyncCopyGlobalToLocalOp op,
+                           PatternRewriter &rewriter, Value newSrc) {
+    op.getSrcMutable().assign(newSrc);
+  }
+};
+
+template <> struct OpTraits<triton::amdgpu::BufferLoadToLocalOp> {
+  // The "source tensor" whose encoding we manipulate is the offsets tensor.
+  static Value getSourceTensor(triton::amdgpu::BufferLoadToLocalOp op) {
+    return op.getOffsets();
+  }
+
+  // Return the destination MemDesc value.
+  static Value getDestValue(triton::amdgpu::BufferLoadToLocalOp op) {
+    return op.getDest();
+  }
+
+  static constexpr bool capByRegToShared = false;
+
+  // Build the effective pointer tensor type for canLoadDirectToLDS.
+  // BufferLoadToLocalOp uses a scalar ptr + offset tensor, so we reconstruct
+  // the pointer tensor type the same way the lowering does.
+  static RankedTensorType
+  getEffectivePtrType(triton::amdgpu::BufferLoadToLocalOp op,
+                      RankedTensorType /*offsetTy*/) {
+    return cast<RankedTensorType>(
+        LLVM::AMD::getPointerTypeWithShape(op.getPtr(), op.getOffsets()));
+  }
+
+  // Do NOT assert srcElemContig >= loadContig: the offsets tensor may have
+  // sizePerThread=1 even when the true data contiguity is larger.
+  static constexpr bool assertSrcElemContig = false;
+
+  static void assignSource(triton::amdgpu::BufferLoadToLocalOp op,
+                           PatternRewriter &rewriter, Value newOffsets) {
+    op.getOffsetsMutable().assign(newOffsets);
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Combined rewrite pattern
+// ---------------------------------------------------------------------------
+template <typename OpTy>
+struct CoalesceAsyncCopyToLocal : public OpRewritePattern<OpTy> {
+  using Traits = OpTraits<OpTy>;
+
+  CoalesceAsyncCopyToLocal(const triton::AMD::TargetInfo &targetInfo,
+                           const DenseMap<OpTy, unsigned> &contiguityMap,
+                           MLIRContext *ctx)
+      : OpRewritePattern<OpTy>(ctx), targetInfo{targetInfo},
+        contiguityMap{contiguityMap} {}
+
+  LogicalResult matchAndRewrite(OpTy op,
                                 PatternRewriter &rewriter) const override {
-    auto src = copyOp.getSrc();
-    auto dst = copyOp.getResult();
-    Value mask = copyOp.getMask();
-    Value other = copyOp.getOther();
+    Value srcTensor = Traits::getSourceTensor(op);
+    Value dst = Traits::getDestValue(op);
+    Value mask = op.getMask();
+    Value other = op.getOther();
 
-    auto srcTy = cast<RankedTensorType>(src.getType());
+    auto srcTy = cast<RankedTensorType>(srcTensor.getType());
     auto dstTy = cast<ttg::MemDescType>(dst.getType());
 
     auto blockedEnc = dyn_cast<ttg::BlockedEncodingAttr>(srcTy.getEncoding());
     if (!blockedEnc)
-      return rewriter.notifyMatchFailure(copyOp,
-                                         "src encoding must be #blocked");
+      return rewriter.notifyMatchFailure(op, "src encoding must be #blocked");
 
     if (!isa<ttg::SwizzledSharedEncodingAttr, ttg::PaddedSharedEncodingAttr>(
             dstTy.getEncoding())) {
       return rewriter.notifyMatchFailure(
-          copyOp, "dst encoding must be #swizzled or #padded");
+          op, "dst encoding must be #swizzled or #padded");
     }
 
-    // We start from the precomputed contiguity we got from AxisAnalysis.
-    unsigned loadContig = 0;
-    if (auto it = asyncCopyContiguity.find(copyOp);
-        it != asyncCopyContiguity.end())
-      loadContig = it->second;
-    else
-      return copyOp->emitError()
-             << "No contiguity information about the copy op";
+    // Retrieve the precomputed contiguity.
+    auto it = contiguityMap.find(op);
+    if (it == contiguityMap.end())
+      return op->emitError() << "No contiguity information about the copy op";
+    unsigned loadContig = it->second;
     assert(loadContig > 0);
 
-    // Further restrict the contiguity based on the contiguity of the src to dst
-    // layout e.g. if the order of the blocked and shared encoding is different
-    // we can only load one element at a time or if the shared encoding is
-    // swizzled we cannot exceed the vector size of the swizzling pattern
+    // Build the reg→shared layout mapping (used for cap and padded branch).
     LinearLayout regLayout = triton::gpu::toLinearLayout(srcTy);
     LinearLayout sharedLayout;
     auto paddedEnc =
@@ -81,83 +167,77 @@ struct CoalesceAsyncCopyWrites
       sharedLayout = triton::gpu::toLinearLayout(dstTy);
     }
     auto regToSharedLayout = regLayout.invertAndCompose(sharedLayout);
-    loadContig = std::min<unsigned>(loadContig,
-                                    regToSharedLayout.getNumConsecutiveInOut());
 
-    // Select the largest supported load width equal or smaller than loadContig
+    // AsyncCopyGlobalToLocalOp caps loadContig by the reg→shared consecutive-
+    // in-out, which bounds the real global-memory contiguity through the
+    // tensor-of-pointers encoding. BufferLoadToLocalOp must NOT apply this cap
+    // because the offsets tensor sizePerThread may be 1 even when the true
+    // contiguity is larger; we rely solely on ptr/offset divisibility.
+    if (Traits::capByRegToShared)
+      loadContig = std::min<unsigned>(
+          loadContig, regToSharedLayout.getNumConsecutiveInOut());
+
+    // Select the largest supported load width ≤ loadContig.
     auto elemBitWidth = dstTy.getElementTypeBitWidth();
     loadContig =
         fitToValidDirectToLdsVecSize(loadContig, elemBitWidth, targetInfo);
-
-    if (loadContig == 0) {
+    if (loadContig == 0)
       return rewriter.notifyMatchFailure(
-          copyOp, "could not find layout config to create coalesced writes");
-    }
+          op, "could not find layout config to create coalesced writes");
 
-    // Do not rewrite if we already use the correct contiguity (could be from a
-    // previous rewrite)
-    auto mod = copyOp->getParentOfType<ModuleOp>();
-    int numWarps = triton::gpu::lookupNumWarps(copyOp);
+    auto mod = op->template getParentOfType<ModuleOp>();
+    int numWarps = triton::gpu::lookupNumWarps(op);
     int threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(mod);
 
-    ttg::DistributedEncodingTrait newDistEnc;
+    // Check whether the op already writes coalesced at the target contiguity.
+    RankedTensorType effectivePtrTy = Traits::getEffectivePtrType(op, srcTy);
+    if (LLVM::AMD::canLoadDirectToLDS(targetInfo, effectivePtrTy,
+                                      dstTy.getEncoding(),
+                                      dstTy.getAllocShape(), loadContig))
+      return rewriter.notifyMatchFailure(op, "already writes coalesced");
 
-    if (LLVM::AMD::canLoadDirectToLDS(targetInfo, srcTy, dstTy.getEncoding(),
-                                      dstTy.getAllocShape(), loadContig)) {
-      return rewriter.notifyMatchFailure(copyOp, "already writes coalesced");
-    }
-    // Check if we support load contig because canLoadDirectToLds can change it
     if (!targetInfo.supportsDirectToLdsLoadBitWidth(loadContig * elemBitWidth))
-      return rewriter.notifyMatchFailure(copyOp,
+      return rewriter.notifyMatchFailure(op,
                                          "unable to find supported vector size "
                                          "based on src and dst encodings");
 
+    ttg::DistributedEncodingTrait newDistEnc;
+
     if (isa<ttg::SwizzledSharedEncodingAttr>(dstTy.getEncoding())) {
-      // For swizzled layouts we apply the swizzling during lowering so we only
-      // adjust the sizePerThread of the blocked encoding to avoid strided
-      // writes into LDS
+      // For swizzled layouts the swizzling is applied during lowering, so we
+      // only adjust sizePerThread to avoid strided writes into LDS.
       auto contigPerThread = ttg::getContigPerThread(srcTy);
-      auto srcElemContig = contigPerThread[blockedEnc.getOrder()[0]];
-      assert(srcElemContig >= loadContig);
+      if (Traits::assertSrcElemContig) {
+        auto srcElemContig = contigPerThread[blockedEnc.getOrder()[0]];
+        assert(srcElemContig >= loadContig);
+      }
       contigPerThread[blockedEnc.getOrder()[0]] = loadContig;
       newDistEnc = BlockedEncodingAttr::get(
-          copyOp.getContext(), srcTy.getShape(), contigPerThread,
+          op.getContext(), srcTy.getShape(), contigPerThread,
           blockedEnc.getOrder(), numWarps, threadsPerWarp,
           blockedEnc.getCGALayout());
     } else if (paddedEnc) {
-      // For padded layouts the linear_component maps from LDS offsets to n-D
-      // tensor indices. This mapping might reorder elements resulting in
-      // scattered writes into LDS which is not supported on GFX9. To ensure
-      // coalesced writes we change the src layout to a linear encoding which
-      // effectivly copies/mimicks the linear_component so each warp (reg+lane
-      // bases) map to consecutive LDS offsets resulting in coalesced writes
-      // The new linear encoding is build by taking bases from the
-      // linear_component and assigning them to reg/lane/warp bases in the
-      // following steps:
-      // 1) Take log2(loadContig) bases as reg bases to ensure our registers per
-      // load instruction point to contiguous elements in LDS.
-      // 2) Take log2(threadsPerWarp) as lane bases to ensure lanes write
-      // contiguous into LDS.
-      // 3) Take log2(numWarps) as warp bases or add braodcasting bases if we
-      // run out of bases
-      // 4) Take any remaining bases as additional reg bases
+      // For padded layouts we build a linear encoding whose reg/lane/warp bases
+      // are taken from the shared layout's offset bases so that each warp maps
+      // to consecutive LDS offsets. Steps:
+      //   1) log2(loadContig)    bases → register (contiguous elements/load)
+      //   2) log2(threadsPerWarp) bases → lane    (warp-coalesced writes)
+      //   3) log2(numWarps)       bases → warp    (pad with broadcast if
+      //   needed) 4) remaining bases → additional register bases
 
       auto *ctx = srcTy.getContext();
       StringAttr kOffset = StringAttr::get(ctx, "offset");
-
       auto rank = srcTy.getRank();
-
       auto offsetBases = sharedLayout.getBases().lookup(kOffset);
 
       int log2LoadContig = llvm::Log2_32(loadContig);
       int log2ThreadsPerWarp = llvm::Log2_32(threadsPerWarp);
       int log2NumWarps = llvm::Log2_32(numWarps);
 
-      if (offsetBases.size() < log2LoadContig + log2ThreadsPerWarp) {
+      if ((int)offsetBases.size() < log2LoadContig + log2ThreadsPerWarp)
         return rewriter.notifyMatchFailure(
-            copyOp, "dst shape is too small. We require at least loadContig * "
-                    "threadsPerWarp elements");
-      }
+            op, "dst shape is too small. We require at least loadContig * "
+                "threadsPerWarp elements");
 
       auto remainingBases = ArrayRef(offsetBases);
       auto takeN = [&remainingBases](size_t n) {
@@ -185,52 +265,56 @@ struct CoalesceAsyncCopyWrites
           newRegLayout, blockedEnc.getCGALayout(), srcTy.getShape());
 
       auto newRegToShared = newRegLayout.invertAndCompose(sharedLayout);
-      if (newRegToShared.getNumConsecutiveInOut() < loadContig) {
+      if (newRegToShared.getNumConsecutiveInOut() < loadContig)
         return rewriter.notifyMatchFailure(
-            copyOp, "could not coalesce global addresses based on the linear "
-                    "component of the padded encoding");
-      }
+            op, "could not coalesce global addresses based on the linear "
+                "component of the padded encoding");
 
       newDistEnc = ttg::LinearEncodingAttr::get(ctx, std::move(newRegLayout));
     } else {
       assert(false && "Unsupported layout");
     }
 
-    if (newDistEnc == srcTy.getEncoding()) {
+    if (newDistEnc == srcTy.getEncoding())
       return rewriter.notifyMatchFailure(
-          copyOp, "Unable to find a new src layout to coalesce writes to LDS");
-    }
+          op, "Unable to find a new src layout to coalesce writes to LDS");
 
-    // Convert layout of src, mask and other to new encoding
+    // Convert the source tensor (and optionally mask/other) to the new
+    // encoding.
     auto convertLayout = [&rewriter](auto loc, Value old, auto newEnc) {
       auto oldTy = cast<RankedTensorType>(old.getType());
-      RankedTensorType newSrcTy = oldTy.cloneWithEncoding(newEnc);
-      return ttg::ConvertLayoutOp::create(rewriter, loc, newSrcTy, old);
+      RankedTensorType newTy = oldTy.cloneWithEncoding(newEnc);
+      return ttg::ConvertLayoutOp::create(rewriter, loc, newTy, old);
     };
 
-    auto loc = copyOp->getLoc();
-    Value cvtSrc = convertLayout(loc, src, newDistEnc);
-
+    auto loc = op->getLoc();
+    Value newSrc = convertLayout(loc, srcTensor, newDistEnc);
     if (mask)
       mask = convertLayout(loc, mask, newDistEnc);
     if (other)
       other = convertLayout(loc, other, newDistEnc);
 
-    rewriter.modifyOpInPlace(copyOp, [&]() {
-      copyOp.getSrcMutable().assign(cvtSrc);
+    rewriter.modifyOpInPlace(op, [&]() {
+      Traits::assignSource(op, rewriter, newSrc);
       if (mask)
-        copyOp.getMaskMutable().assign(mask);
+        op.getMaskMutable().assign(mask);
       if (other)
-        copyOp.getOtherMutable().assign(other);
-      copyOp.setContiguity(loadContig);
+        op.getOtherMutable().assign(other);
+      op.setContiguity(loadContig);
     });
     return success();
   }
 
 private:
   const triton::AMD::TargetInfo &targetInfo;
-  const DenseMap<ttg::AsyncCopyGlobalToLocalOp, unsigned> &asyncCopyContiguity;
+  const DenseMap<OpTy, unsigned> &contiguityMap;
 };
+
+// Convenience aliases.
+using CoalesceAsyncCopyWrites =
+    CoalesceAsyncCopyToLocal<ttg::AsyncCopyGlobalToLocalOp>;
+using CoalesceBufferLoadToLocal =
+    CoalesceAsyncCopyToLocal<triton::amdgpu::BufferLoadToLocalOp>;
 
 } // anonymous namespace
 
@@ -252,22 +336,76 @@ public:
                             targetInfo.getISAFamily()))
       return; // This pass is CDNA3 and CDNA4 specific.
 
-    // Precompute the contiguity of all AsyncCopy ops based on the src and
-    // mask contiguity/alignment to avoid rebuilding ModuleAxisInfoAnalysis
-    // after every IR change.
+    // Precompute the contiguity of all async-copy ops before any IR changes to
+    // avoid rebuilding ModuleAxisInfoAnalysis on every pattern application.
     AMD::ModuleAxisInfoAnalysis axisAnalysis(m);
     DenseMap<ttg::AsyncCopyGlobalToLocalOp, unsigned> asyncCopyContiguity;
-    m->walk([&](ttg::AsyncCopyGlobalToLocalOp copyOp) {
-      unsigned contiguity =
-          mlir::LLVM::AMD::getContiguity(copyOp.getSrc(), axisAnalysis);
-      if (auto mask = copyOp.getMask()) {
-        contiguity =
-            std::min<unsigned>(contiguity, axisAnalysis.getMaskAlignment(mask));
+    DenseMap<triton::amdgpu::BufferLoadToLocalOp, unsigned>
+        bufferOpsToLocalContiguity;
+
+    m->walk([&](Operation *op) {
+      if (auto globalCopyOp = dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(op)) {
+        unsigned contiguity =
+            mlir::LLVM::AMD::getContiguity(globalCopyOp.getSrc(), axisAnalysis);
+        if (auto mask = globalCopyOp.getMask())
+          contiguity = std::min<unsigned>(contiguity,
+                                          axisAnalysis.getMaskAlignment(mask));
+        asyncCopyContiguity.insert({globalCopyOp, contiguity});
       }
-      asyncCopyContiguity.insert({copyOp, contiguity});
+
+      if (auto bufferCopyOp =
+              dyn_cast<triton::amdgpu::BufferLoadToLocalOp>(op)) {
+        Value ptr = bufferCopyOp.getPtr();
+        Value offsets = bufferCopyOp.getOffsets();
+
+        unsigned elemBitWidth = triton::getPointeeBitWidth(ptr.getType());
+        unsigned elemNumBytes = std::max(elemBitWidth / 8, 1u);
+
+        // Alignment from the scalar base pointer divisibility.
+        unsigned ptrAlign = 1;
+        if (auto *ptrInfo = axisAnalysis.getAxisInfo(ptr)) {
+          unsigned ptrDivisibility = ptrInfo->getDivisibility(0);
+          ptrAlign = std::max(ptrDivisibility / elemNumBytes, 1u);
+        }
+
+        // Alignment from the offset tensor's innermost (fast-varying)
+        // dimension, derived from axis-info divisibility — NOT capped by
+        // sizePerThread.
+        unsigned offsetAlign = 1;
+        if (auto *offsetInfo = axisAnalysis.getAxisInfo(offsets)) {
+          auto contiguityVec = offsetInfo->getContiguity();
+          SmallVector<unsigned> offsetOrder =
+              getOrderFromContiguity(contiguityVec);
+          unsigned innerDim = offsetOrder[0];
+          unsigned divisibility = offsetInfo->getDivisibility(innerDim);
+          offsetAlign = std::max(divisibility / elemNumBytes, 1u);
+        }
+
+        // Cap to the widest vectorised load (128 bits).
+        unsigned maxVec = 128 / elemBitWidth;
+
+        // Cap to the number of elements each thread can access in the offsets
+        // tensor. Vectorizing beyond what a thread owns is not possible.
+        auto offsetsTy = cast<RankedTensorType>(offsets.getType());
+        unsigned elemsPerThread =
+            triton::gpu::getTotalElemsPerThread(offsetsTy);
+        unsigned contiguity =
+            std::min({ptrAlign, offsetAlign, maxVec, elemsPerThread});
+
+        // NOTE: We intentionally do NOT cap by getMaskAlignment(mask). The
+        // mask for buffer_load_to_local may have a different (smaller) shape
+        // than the offsets tensor (e.g., mask_n[:, None] is [BLOCK_N, 1] while
+        // offsets is [BLOCK_N, BLOCK_D_Q]). getMaskAlignment would return 1
+        // for such a 1-wide mask, incorrectly capping contiguity along the
+        // fast (column) dimension.
+        bufferOpsToLocalContiguity.insert({bufferCopyOp, contiguity});
+      }
     });
+
     patterns.add<CoalesceAsyncCopyWrites>(targetInfo, asyncCopyContiguity,
                                           context);
+    patterns.add<CoalesceBufferLoadToLocal>(
+        targetInfo, bufferOpsToLocalContiguity, context);
 
     if (applyPatternsGreedily(m, std::move(patterns)).failed())
       signalPassFailure();
