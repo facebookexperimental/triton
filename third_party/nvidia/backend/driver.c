@@ -9,6 +9,10 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+/* Shared, Python-free data-driven launch core (params[]/TMA/attrs/launch).
+ * The same core is used by TritonCC / AOT-T via make_launcher_src. */
+#include "triton/runtime/launch.h"
+
 typedef struct {
   PyObject_HEAD;
   _Alignas(alignof(CUtensorMap)) CUtensorMap tensorMap;
@@ -1598,6 +1602,13 @@ bool launchHook(PyObject *hook, PyObject *metadata) {
   return true;
 }
 
+/* TRITON_ASSERT_NEW_LAUNCHER: when set, triton_launch_kernel failures are hard
+ * errors (no legacy fallback). Useful for CI / testing the new launcher. */
+static int g_triton_assert_new_launcher = 0;
+__attribute__((constructor)) static void triton_init_assert_knob(void) {
+  g_triton_assert_new_launcher = getenv("TRITON_ASSERT_NEW_LAUNCHER") ? 1 : 0;
+}
+
 static PyObject *launchKernel(PyObject *self, PyObject *args) {
   // ensure cuda context is valid before calling any CUDA APIs, e.g. before
   // calls to cuPointerGetAttributes
@@ -1647,61 +1658,211 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     goto cleanup;
   }
 
-  // Number of parameters passed to kernel. + 2 for global & profile scratch.
-  int num_params = num_args + 2;
-  void **params = (void **)alloca(num_params * sizeof(void *));
-  int params_idx = 0;
-  // This loop has to stay in the same function that owns params, since we are
-  // using alloca to allocate pointers to it on the stack of the function.
+  // ---- Route through the shared data-driven core triton_launch_kernel() ----
+  // The CPython arg extraction above is unchanged.  Instead of building a
+  // void *params[] and calling the legacy _launch(), we pack the extracted
+  // values into one flat args_buf and build a per-launch descriptor, then call
+  // the shared core in launch.h (the same core used by TritonCC / AOT-T).
+  //
+  // Safety net: if triton_launch_kernel fails, we automatically fall back to
+  // the proven legacy _launch() path and print a warning, so a bug in the
+  // new path never silently breaks production.
+  int num_params = (int)num_args + 2; // + global & profile scratch
+  if (num_params > TRITON_MAX_PARAMS) {
+    PyErr_Format(PyExc_RuntimeError,
+                 "Triton kernel has %d params, exceeds TRITON_MAX_PARAMS (%d)",
+                 num_params, TRITON_MAX_PARAMS);
+    goto cleanup;
+  }
+
+  triton_kernel_launch_desc_t desc;
+  desc.abi_version = TRITON_LAUNCH_DESC_ABI_VERSION;
+  desc.num_warps = num_warps;
+  desc.num_ctas = num_ctas;
+  desc.shared_mem = (unsigned)shared_memory;
+  desc.launch_pdl = launch_pdl;
+  desc.launch_cooperative_grid = launch_cooperative_grid;
+  desc.launch_cluster = (preferredClusterDimX > 0) ? 1 : 0;
+  desc.preferred_cluster_dims[0] = preferredClusterDimX;
+  desc.preferred_cluster_dims[1] = preferredClusterDimY;
+  desc.preferred_cluster_dims[2] = preferredClusterDimZ;
+  desc.num_params = num_params;
+  // JIT TMA descriptors are pre-built in Python and passed by value through
+  // args_buf as ordinary params (is_tma = 0); the launcher-built recipe path
+  // (num_tma_recipes > 0) is reserved for auto-TMA.
+  desc.num_tma_recipes = 0;
+
+  // First pass: compute the args_buf layout (offset + size per param) using the
+  // same per-type extractor size/alignment the legacy path used, so the kernel
+  // sees identically laid-out parameter values.
+  Extractor *extractors = (Extractor *)alloca(num_args * sizeof(Extractor));
+  size_t buf_size = 0;
+  size_t max_align = sizeof(void *); // scratch pointers need 8B alignment
   for (Py_ssize_t i = 0; i < num_args; ++i) {
-    // Get extractor that will send back a struct with
-    // * size for allocation
-    // * function to call to put the parameter in params buffer
-    Extractor extractor = getExtractor(extractor_data[i]);
-    if (extractor.extract == NULL) {
+    Extractor e = getExtractor(extractor_data[i]);
+    if (e.extract == NULL) {
       goto cleanup;
     }
+    extractors[i] = e;
+    size_t al = e.alignment ? e.alignment : (e.size ? e.size : 1);
+    // Round up to next power of two (required for bitmask alignment below).
+    {
+      size_t v = al;
+      v--;
+      v |= v >> 1;
+      v |= v >> 2;
+      v |= v >> 4;
+      v |= v >> 8;
+      v |= v >> 16;
+      if (sizeof(size_t) > 4)
+        v |= v >> 32;
+      v++;
+      al = v;
+    }
+    if (al > max_align) {
+      max_align = al;
+    }
+    buf_size = (buf_size + al - 1) & ~(al - 1);
+    desc.params[i].offset = (int)buf_size;
+    desc.params[i].size = (int)e.size;
+    desc.params[i].is_tma = 0;
+    buf_size += e.size;
+  }
+  // Scratch params: two device pointers, 8-byte aligned.
+  buf_size = (buf_size + 7) & ~((size_t)7);
+  desc.params[num_args].offset = (int)buf_size;
+  desc.params[num_args].size = (int)sizeof(void *);
+  desc.params[num_args].is_tma = 0;
+  buf_size += sizeof(void *);
+  desc.params[num_args + 1].offset = (int)buf_size;
+  desc.params[num_args + 1].size = (int)sizeof(void *);
+  desc.params[num_args + 1].is_tma = 0;
+  buf_size += sizeof(void *);
 
-    size_t alignment = extractor.alignment;
-    if (alignment != 0) {
-      // Allocate enough space on the stack to guarantee an aligned block.
-      size_t size_with_alignment = extractor.size + alignment - 1;
-      void *storage_ptr = alloca(size_with_alignment);
-      void *aligned_ptr = (void *)((((uintptr_t)storage_ptr) + alignment - 1) &
-                                   ~(alignment - 1));
-      if (aligned_ptr == NULL) {
-        PyErr_SetString(PyExc_MemoryError, "Failed to align parameter storage");
+  // Allocate args_buf aligned to the largest element alignment so that every
+  // offset (computed relative to an aligned base) is absolutely aligned.
+  void *args_buf_raw = alloca(buf_size + max_align - 1);
+  void *args_buf =
+      (void *)(((uintptr_t)args_buf_raw + max_align - 1) & ~(max_align - 1));
+
+  // Second pass: extract each arg value into args_buf at its offset.
+  for (Py_ssize_t i = 0; i < num_args; ++i) {
+    if (!extractors[i].extract((char *)args_buf + desc.params[i].offset,
+                               args_data[i])) {
+      goto cleanup;
+    }
+  }
+  if (!extractPointer((char *)args_buf + desc.params[num_args].offset,
+                      global_scratch_obj)) {
+    goto cleanup;
+  }
+  if (!extractPointer((char *)args_buf + desc.params[num_args + 1].offset,
+                      profile_scratch_obj)) {
+    goto cleanup;
+  }
+
+  {
+    const uint32_t grid[3] = {(uint32_t)gridX, (uint32_t)gridY,
+                              (uint32_t)gridZ};
+    CUresult _launch_err = CUDA_SUCCESS;
+    Py_BEGIN_ALLOW_THREADS;
+    // Parity with legacy _launch: allow non-portable 16-CTA clusters.
+    // Runs without the GIL (matching legacy _launch behavior).
+    if (num_ctas == 16) {
+      cuFuncSetAttribute((CUfunction)_function,
+                         CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
+                         1);
+      /* Return value intentionally ignored: on hardware that doesn't support
+       * this attribute, the call fails harmlessly and the subsequent launch
+       * will fail with a more specific error if clusters are truly needed.
+       * Logging here would spam stderr on every 16-CTA launch. */
+    }
+    _launch_err = triton_launch_kernel(grid, (CUstream)_stream,
+                                       (CUfunction)_function, args_buf, &desc);
+    Py_END_ALLOW_THREADS;
+    if (_launch_err != CUDA_SUCCESS) {
+      /* TRITON_ASSERT_NEW_LAUNCHER: in test/debug mode, skip fallback and
+       * fail hard so we know the new launcher has a bug (not masked). */
+      if (g_triton_assert_new_launcher) {
+        const char *_err_str = NULL;
+        cuGetErrorString(_launch_err, &_err_str);
+        PyErr_Format(PyExc_RuntimeError,
+                     "Triton Error [CUDA]: triton_launch_kernel failed: %s "
+                     "(TRITON_ASSERT_NEW_LAUNCHER=1, no fallback)",
+                     _err_str ? _err_str : "unknown");
         goto cleanup;
       }
-      params[params_idx] = aligned_ptr;
-    } else {
-      params[params_idx] = alloca(extractor.size);
-    }
-
-    PyObject *current_arg = args_data[i];
-    if (!extractor.extract(params[params_idx++], current_arg)) {
+      /* Shared-core launch failed — fall back to the proven legacy _launch()
+       * path so the kernel still runs.  Print a warning so the failure is
+       * visible and can be investigated without blocking the user. */
+      const char *_err_str = NULL;
+      cuGetErrorString(_launch_err, &_err_str);
+      static int _fb_warned = 0;
+      if (!__atomic_exchange_n(&_fb_warned, 1, __ATOMIC_RELAXED)) {
+        fprintf(stderr,
+                "[triton] WARNING: triton_launch_kernel failed (%s, err=%d), "
+                "falling back to legacy _launch path\n",
+                _err_str ? _err_str : "unknown", (int)_launch_err);
+      }
+      /* Rebuild params[] from the still-valid Python args and launch via the
+       * legacy path (same code that ran before this change). */
+      int _fb_num = (int)num_args + 2;
+      void **_fb_params = (void **)alloca(_fb_num * sizeof(void *));
+      int _fb_idx = 0;
+      int _fb_ok = 1;
+      for (Py_ssize_t i = 0; i < num_args && _fb_ok; ++i) {
+        Extractor _fb_e = extractors[i];
+        if (_fb_e.extract == NULL) {
+          _fb_ok = 0;
+          break;
+        }
+        size_t _fb_al = _fb_e.alignment;
+        if (_fb_al == 0)
+          _fb_al = _fb_e.size ? _fb_e.size : 1;
+        if (_fb_al != 0 && (_fb_al & (_fb_al - 1)) == 0) {
+          void *_fb_raw = alloca(_fb_e.size + _fb_al - 1);
+          _fb_params[_fb_idx] =
+              (void *)((((uintptr_t)_fb_raw) + _fb_al - 1) & ~(_fb_al - 1));
+        } else {
+          _fb_params[_fb_idx] = alloca(_fb_e.size);
+        }
+        if (!_fb_e.extract(_fb_params[_fb_idx++], args_data[i]))
+          _fb_ok = 0;
+      }
+      if (_fb_ok) {
+        _fb_params[_fb_idx] = alloca(sizeof(void *));
+        if (extractPointer(_fb_params[_fb_idx++], global_scratch_obj)) {
+          _fb_params[_fb_idx] = alloca(sizeof(void *));
+          if (extractPointer(_fb_params[_fb_idx++], profile_scratch_obj)) {
+            Py_BEGIN_ALLOW_THREADS;
+            _launch(gridX, gridY, gridZ, num_warps, num_ctas,
+                    launch_cooperative_grid, launch_pdl, preferredClusterDimX,
+                    preferredClusterDimY, preferredClusterDimZ, shared_memory,
+                    (CUstream)_stream, (CUfunction)_function, _fb_params);
+            Py_END_ALLOW_THREADS;
+            if (!PyErr_Occurred())
+              goto launch_ok; /* fallback succeeded */
+          }
+        }
+      }
+      /* Both paths failed. If the fallback set a more specific Python
+       * exception (e.g. extractor TypeError), keep it; otherwise report
+       * the original shared-core CUDA error. */
+      if (!PyErr_Occurred()) {
+        PyErr_Format(PyExc_RuntimeError,
+                     "Triton Error [CUDA]: triton_launch_kernel failed: %s "
+                     "(legacy fallback also failed)",
+                     _err_str ? _err_str : "unknown");
+      }
       goto cleanup;
     }
   }
-  // Add scratch objects.
-  params[params_idx] = alloca(sizeof(void *));
-  if (!extractPointer(params[params_idx++], global_scratch_obj)) {
-    goto cleanup;
-  }
-  params[params_idx] = alloca(sizeof(void *));
-  if (!extractPointer(params[params_idx++], profile_scratch_obj)) {
-    goto cleanup;
-  }
+launch_ok:
 
-  Py_BEGIN_ALLOW_THREADS;
-  _launch(gridX, gridY, gridZ, num_warps, num_ctas, launch_cooperative_grid,
-          launch_pdl, preferredClusterDimX, preferredClusterDimY,
-          preferredClusterDimZ, shared_memory, (CUstream)_stream,
-          (CUfunction)_function, params);
-  Py_END_ALLOW_THREADS;
-  if (PyErr_Occurred()) {
+  /* Symmetry with the legacy path: never run the exit hook with a pending
+   * Python exception. */
+  if (PyErr_Occurred())
     goto cleanup;
-  }
 
   if (!launchHook(launch_exit_hook, launch_metadata)) {
     goto cleanup;
