@@ -1,6 +1,10 @@
 """
-AMD Flash Attention Forward — Async DMA Kernel (CDNA4)
+AMD Flash Attention Forward — Async DMA Kernels (CDNA4)
 ============================================================
+
+Kernel variants (--kernel): async_simple, async_prefetch, persistent, cluster.
+The "cluster" variant is the rotated 4-cluster warp-pipeline kernel; it supports
+only the square anchor (D=128, N a multiple of BLOCK_M=256, >= 4 K/V blocks).
 
 Usage:
     # Defaults: -b 1 -hq 64 -sq 1024 8192 16384 -d 64 128 -causal false --kernel async_simple
@@ -14,6 +18,12 @@ Usage:
 
     # Multiple kernels
     python amd-fa-pipelined_test.py --kernel async_simple --dtype fp16
+
+    # Cluster kernel (D=128, N multiple of 256), both causal modes
+    python amd-fa-pipelined_test.py --kernel cluster -d 128 -sq 4096 16384 -causal true false
+
+    # Perf-regression guard for all kernels (incl. cluster)
+    python amd-fa-pipelined_test.py --mode perf_test
 """
 
 import argparse
@@ -627,6 +637,353 @@ def _attn_fwd_persistent(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Rotated 4-cluster warp pipeline (gfx950)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A flash-attention forward built on tlx.warp_pipeline_stage. The hot loop is
+# eight named logical sub-clusters rotated across a depth-4 / 2-slot-LDS software
+# pipeline:
+#
+#   dot_qk  -- Q * K^T MFMA -> qk scores
+#   dot_pv  -- P * V   MFMA -> acc
+#   VEC1    -- softmax numerator      (new row-max + exp2 burst -> p, alpha)
+#   VEC2    -- softmax denominator    (sum p, acc rescale, l_i, p->fp16 cast)
+#   LRK     -- local-read  K  (LDS -> regs)
+#   LRV     -- local-read  V  (LDS -> regs)
+#   ACK     -- async-copy  K  (global -> LDS)
+#   ACV     -- async-copy  V  (global -> LDS)
+#
+# Scope: the square anchor config (BLOCK_M=256, num_warps=8), both non-causal
+# and causal. Causal runs the unmasked rotated pipeline over the below-diagonal
+# region then the masked pipeline over the BLOCK_M/BLOCK_N diagonal band. D=64/256,
+# GQA, and the short-tail fallback are out of scope.
+
+
+@triton.aggregate
+class SoftmaxState:
+    """Running softmax accumulator (acc), denominator (l_i), and row-max (m_i),
+    with the two sub-cluster VEC primitives as methods.
+    """
+    acc: tl.tensor
+    l_i: tl.tensor
+    m_i: tl.tensor
+
+    @triton.jit
+    def create(BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr):
+        return SoftmaxState(
+            tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32),
+            tl.full([BLOCK_M], 1.0, dtype=tl.float32),
+            tl.full([BLOCK_M], float("-inf"), dtype=tl.float32),
+        )
+
+    @triton.jit
+    def _nan_max_combine(a, b):
+        return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
+
+    @triton.jit
+    def _row_max(qk):
+        """Row-max reduction with IEEE-754 NaN propagation (a NaN score reaches the
+        row max instead of being silently dropped). Plain tl.max does not expose
+        propagate_nan, so the reduction is spelled out with a custom combinator.
+
+        NaN-propagating max is less foldable than the plain `v_max3_f32` form and
+        raises register pressure; the non-causal path therefore needs
+        waves_per_eu=2 (see the host wrapper), without which it spills heavily and
+        regresses ~8x.
+        """
+        return tl.reduce(qk, 1, SoftmaxState._nan_max_combine)
+
+    @triton.jit
+    def vec1(self, qk, start_n, offs_m, offs_n, QK_SCALE: tl.constexpr, DIAG_OFFSET: tl.constexpr,
+             MASK_STEPS: tl.constexpr, IS_CAUSAL: tl.constexpr):
+        """VEC1: softmax numerator -- new row-max + exp2 burst.
+
+        From the qk scores produced by dot_qk this iteration, computes the new
+        running max, the unnormalized probabilities p = exp2(qk*scale - m_new),
+        and the rescale factor alpha = exp2(m_i - m_new). p and alpha are carried
+        to the next iteration (consumed by vec2 and dot_pv). This is the expensive
+        transcendental group, paired with the P*V MFMA so exp throughput overlaps
+        the matrix engine. Returns the state with m_i advanced, plus (p, alpha).
+
+        When MASK_STEPS, the scores are scaled and (causal-)masked before the
+        max/exp2; this path is taken only on the diagonal band. The unmasked branch
+        keeps the FMA-friendly form (scale folded into the max/exp2 inputs) so its
+        LLIR is identical to the unmasked-only schedule after DCE. The K-bound mask
+        is omitted: the anchor is square with N_CTX % BLOCK_N == 0 (no ragged tail).
+        The row-max propagates NaNs (see _row_max), matching the reference softmax.
+        """
+        if MASK_STEPS:
+            qk_sm = qk * QK_SCALE
+            if IS_CAUSAL:
+                kn = start_n + offs_n
+                qk_sm = tl.where(offs_m[:, None] + DIAG_OFFSET >= kn[None, :], qk_sm, float("-inf"))
+            m_ij = SoftmaxState._row_max(qk_sm)
+            m_new = tl.maximum(self.m_i, m_ij, propagate_nan=tl.PropagateNan.ALL)
+            p = tl.math.exp2(qk_sm - m_new[:, None])
+            alpha = tl.math.exp2(self.m_i - m_new)
+        else:
+            m_ij = SoftmaxState._row_max(qk) * QK_SCALE
+            m_new = tl.maximum(self.m_i, m_ij, propagate_nan=tl.PropagateNan.ALL)
+            p = tl.math.exp2(qk * QK_SCALE - m_new[:, None])
+            alpha = tl.math.exp2(self.m_i - m_new)
+        return SoftmaxState(self.acc, self.l_i, m_new), p, alpha
+
+    @triton.jit
+    def vec2(self, p, alpha, out_dtype: tl.constexpr):
+        """VEC2: softmax denominator + accumulator correction.
+
+        Op order matches the reference: row-sum first (l_ij), then accumulator
+        rescale (acc *= alpha), then running-denominator update, then p->fp16 cast.
+        p and alpha were produced by vec1 in the *previous* iteration. Returns the
+        state with acc/l_i advanced, plus the cast p.
+        """
+        l_ij = tl.sum(p, 1)
+        acc = self.acc * alpha[:, None]
+        l_i = self.l_i * alpha + l_ij
+        p_cast = p.to(out_dtype)
+        return SoftmaxState(acc, l_i, self.m_i), p_cast
+
+
+@triton.jit
+def _attn_inner_pipelined(
+    state,
+    q,
+    k_ptrs,
+    v_ptrs,
+    offs_m,
+    offs_n,
+    block_start,
+    block_end,
+    k_buf,
+    v_buf,
+    stride_kn,
+    stride_vn,
+    QK_SCALE: tl.constexpr,
+    DIAG_OFFSET: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BUF_DEPTH: tl.constexpr,
+    MASK_STEPS: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+):
+    """Rotated 4-cluster pipeline over output tiles [block_start, block_end).
+
+    Requires (block_end - block_start) >= 4. ``MASK_STEPS`` (constexpr) selects
+    causal masking in VEC1; when False the schedule is byte-identical to the
+    unmasked-only version after DCE. ``state`` (a SoftmaxState) is threaded in and
+    out so the caller can chain an unmasked region followed by a masked diagonal
+    band. K and V LDS buffers are owned by the caller and reused across calls.
+    """
+    # -- Prologue: prime the pipeline for output tile block_start ----------
+    # Commit order: K0, V0, K1, (barrier) K2, V1 -> pending {K2, V1}.
+    b0 = block_start
+    tok_k0 = tlx.async_load(k_ptrs + b0 * BLOCK_N * stride_kn, tlx.local_view(k_buf, 0))
+    tok_v0 = tlx.async_load(v_ptrs + b0 * BLOCK_N * stride_vn, tlx.local_view(v_buf, 0))
+    tlx.async_load_commit_group([tok_k0])  # ACK[0]
+    tlx.async_load_commit_group([tok_v0])  # ACV[0]
+    tok_k1 = tlx.async_load(k_ptrs + (b0 + 1) * BLOCK_N * stride_kn, tlx.local_view(k_buf, 1))
+    tlx.async_load_commit_group([tok_k1])  # ACK[1]
+
+    wait0 = tlx.async_load_wait_group(2)  # K[0] complete
+    kt0 = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, 0)), token=wait0, relaxed=True)  # LRK[0]
+    qk = tl.dot(q, kt0)  # dot_qk[0]
+    state, p_c, alpha_c = state.vec1(qk, b0 * BLOCK_N, offs_m, offs_n, QK_SCALE, DIAG_OFFSET, MASK_STEPS,
+                                     IS_CAUSAL)  # VEC1[block_start]
+
+    tl.debug_barrier()  # WAR: LRK[0] ds_read vs K[2] write into slot 0
+    tok_k2 = tlx.async_load(k_ptrs + (b0 + 2) * BLOCK_N * stride_kn, tlx.local_view(k_buf, 0))
+    tlx.async_load_commit_group([tok_k2])  # ACK[2] (slot 0 reuse)
+    # Pending after the ACK[2] commit, in order: K0, V0, K1, K2. wait_group(1)
+    # drains all but the newest (K2), so K1 is guaranteed complete before this
+    # LDS read; wait_group(2) would leave K1 in flight and race the local_load.
+    wait1 = tlx.async_load_wait_group(1)  # K[1] complete
+    kt_dot = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, 1)), token=wait1, relaxed=True)  # LRK[1]
+    tok_v1 = tlx.async_load(v_ptrs + (b0 + 1) * BLOCK_N * stride_vn, tlx.local_view(v_buf, 1))
+    tlx.async_load_commit_group([tok_v1])  # ACV[1]
+
+    # -- Main loop: output tiles [block_start, block_end-3) ----------------
+    for block_n in tl.range(block_start, block_end - 3, num_stages=0):
+        cur_slot = (block_n - block_start) % BUF_DEPTH
+        nxt_slot = (block_n + 1 - block_start) % BUF_DEPTH
+        ack_n = (block_n + 3) * BLOCK_N
+        acv_n = (block_n + 2) * BLOCK_N
+        ahead_n = (block_n + 1) * BLOCK_N
+
+        # cluster 0 DOT1: dot_qk[i+1] then VEC2[i].
+        with tlx.warp_pipeline_stage("dot1", priority=0):
+            qk = tl.dot(q, kt_dot)  # dot_qk s1 -> qk[i+1]
+            state, p_dot = state.vec2(p_c, alpha_c, q.dtype)  # VEC2 s0
+
+        tlx.async_load_wait_group(1)  # V[i] complete (for LRV[i])
+
+        # cluster 1 MEM1: LRV[i] then ACK[i+3].
+        with tlx.warp_pipeline_stage("mem1", priority=1):
+            v_dot = tlx.local_load(tlx.local_view(v_buf, cur_slot), relaxed=True)  # LRV s0
+            tok_k = tlx.async_load(k_ptrs + ack_n * stride_kn, tlx.local_view(k_buf, nxt_slot))
+            tlx.async_load_commit_group([tok_k])  # ACK s3
+
+        # cluster 2 DOT2: dot_pv[i] then VEC1[i+1] (exp2 burst lands after PV).
+        with tlx.warp_pipeline_stage("dot2", priority=0):
+            acc = tl.dot(p_dot, v_dot, state.acc)  # dot_pv s0
+            state = SoftmaxState(acc, state.l_i, state.m_i)
+            state, p_c, alpha_c = state.vec1(qk, ahead_n, offs_m, offs_n, QK_SCALE, DIAG_OFFSET, MASK_STEPS,
+                                             IS_CAUSAL)  # VEC1 s1 -> p[i+1]
+
+        tlx.async_load_wait_group(1)  # K[i+2] complete (for LRK[i+2])
+
+        # cluster 3 MEM2: LRK[i+2] then ACV[i+2].
+        with tlx.warp_pipeline_stage("mem2", priority=1):
+            kt_dot = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, cur_slot)), relaxed=True)  # LRK s2
+            tok_v = tlx.async_load(v_ptrs + acv_n * stride_vn, tlx.local_view(v_buf, cur_slot))
+            tlx.async_load_commit_group([tok_v])  # ACV s2
+
+    # -- Drain: last 3 output tiles, no OOB global prefetch ----------------
+    nm3 = block_end - 3
+    nm2 = block_end - 2
+    nm1 = block_end - 1
+    s_nm3 = (nm3 - block_start) % BUF_DEPTH
+    s_nm2 = (nm2 - block_start) % BUF_DEPTH
+    s_nm1 = (nm1 - block_start) % BUF_DEPTH
+
+    # output tile n-3 (also issues the final V prefetch, ACV[n-1])
+    qk = tl.dot(q, kt_dot)  # dot_qk[n-2]
+    tlx.async_load_wait_group(2)  # V[n-3] complete
+    v_dot = tlx.local_load(tlx.local_view(v_buf, s_nm3), relaxed=True)  # LRV[n-3]
+    state, p_dot = state.vec2(p_c, alpha_c, q.dtype)  # VEC2[n-3]
+    acc = tl.dot(p_dot, v_dot, state.acc)  # dot_pv[n-3]
+    state = SoftmaxState(acc, state.l_i, state.m_i)
+    state, p_c, alpha_c = state.vec1(qk, nm2 * BLOCK_N, offs_m, offs_n, QK_SCALE, DIAG_OFFSET, MASK_STEPS,
+                                     IS_CAUSAL)  # VEC1[n-2]
+    tl.debug_barrier()  # WAR: LRV[n-3] vs V[n-1] write
+    tok_vlast = tlx.async_load(v_ptrs + nm1 * BLOCK_N * stride_vn, tlx.local_view(v_buf, s_nm1))
+    tlx.async_load_commit_group([tok_vlast])  # ACV[n-1]
+    tlx.async_load_wait_group(2)  # K[n-1] complete
+    kt_dot = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, s_nm1)), relaxed=True)  # LRK[n-1]
+
+    # output tile n-2
+    qk = tl.dot(q, kt_dot)  # dot_qk[n-1]
+    tlx.async_load_wait_group(1)  # V[n-2] complete
+    v_dot = tlx.local_load(tlx.local_view(v_buf, s_nm2), relaxed=True)  # LRV[n-2]
+    state, p_dot = state.vec2(p_c, alpha_c, q.dtype)  # VEC2[n-2]
+    acc = tl.dot(p_dot, v_dot, state.acc)  # dot_pv[n-2]
+    state = SoftmaxState(acc, state.l_i, state.m_i)
+    state, p_c, alpha_c = state.vec1(qk, nm1 * BLOCK_N, offs_m, offs_n, QK_SCALE, DIAG_OFFSET, MASK_STEPS,
+                                     IS_CAUSAL)  # VEC1[n-1]
+
+    # output tile n-1 (final; no further dot_qk / prefetch)
+    tlx.async_load_wait_group(0)  # V[n-1] complete
+    v_dot = tlx.local_load(tlx.local_view(v_buf, s_nm1), relaxed=True)  # LRV[n-1]
+    state, p_dot = state.vec2(p_c, alpha_c, q.dtype)  # VEC2[n-1]
+    acc = tl.dot(p_dot, v_dot, state.acc)  # dot_pv[n-1]
+    state = SoftmaxState(acc, state.l_i, state.m_i)
+
+    return state
+
+
+@triton.jit
+def _attn_fwd_cluster_pipeline(
+    Q,
+    K,
+    V,
+    Out,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+    N_CTX,
+    sm_scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+):
+    """Rotated 4-cluster FA forward. Square anchor: N_CTX % BLOCK_N == 0,
+    BLOCK_M % BLOCK_N == 0, and each block range used is >= 4 tiles.
+
+    Non-causal: one unmasked pipeline over all blocks. Causal: an unmasked
+    pipeline over the full below-diagonal region followed by a masked pipeline
+    over the BLOCK_M/BLOCK_N diagonal band."""
+    _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
+                    stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om, stride_ok)
+
+    # Launch-axis assignment is chosen by IS_CAUSAL (the host grid matches):
+    #  - causal: head on axis 0, m-block on axis 1 -- packs the triangular
+    #    per-tile cost evenly onto CUs (712 vs 580 for m-major; measured on the
+    #    anchor).
+    #  - non-causal: m-block on axis 0 -- every tile is equal cost, and m-major
+    #    scheduling is faster here (1017 vs 897 for head-major; measured).
+    if IS_CAUSAL:
+        off_h = tl.program_id(0)
+        pid_m = tl.program_id(1)
+    else:
+        pid_m = tl.program_id(0)
+        off_h = tl.program_id(1)
+    off_z = tl.program_id(2)
+
+    q_off = off_z * stride_qz + off_h * stride_qh
+    k_off = off_z * stride_kz + off_h * stride_kh
+    v_off = off_z * stride_vz + off_h * stride_vh
+    o_off = off_z * stride_oz + off_h * stride_oh
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    q = tl.load(Q + q_off + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk, mask=offs_m[:, None] < N_CTX,
+                other=0.0)
+
+    QK_SCALE: tl.constexpr = sm_scale * 1.44269504089
+    DIAG_OFFSET: tl.constexpr = 0  # square anchor: N_CTX_K == N_CTX_Q
+
+    state = SoftmaxState.create(BLOCK_M, HEAD_DIM)
+
+    # Depth-4 pipeline, 2-slot double-buffered LDS for both K and V.
+    BUF_DEPTH: tl.constexpr = 2
+    k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, BUF_DEPTH)
+    v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, BUF_DEPTH)
+
+    k_ptrs = K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
+    v_ptrs = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
+
+    n_blocks = N_CTX // BLOCK_N
+
+    if IS_CAUSAL:
+        # Diagonal band is exactly BLOCK_M/BLOCK_N tiles; everything before it is
+        # fully below the diagonal (unmasked). Both ranges run the same deep
+        # rotated pipeline: the unmasked full region on the FMA-friendly path,
+        # then the masked band carrying the causal where(). The band is
+        # BLOCK_M/BLOCK_N tiles (>= 4 since BLOCK_M >=
+        # 4*BLOCK_N for the supported tiles) and the full region is a multiple of
+        # it, so both satisfy the pipeline's >= 4-tile requirement when non-empty.
+        masked_blocks: tl.constexpr = BLOCK_M // BLOCK_N
+        causal_end = (pid_m + 1) * masked_blocks
+        n_full = causal_end - masked_blocks
+        if n_full > 0:
+            state = _attn_inner_pipelined(state, q, k_ptrs, v_ptrs, offs_m, offs_n, 0, n_full, k_buf, v_buf, stride_kn,
+                                          stride_vn, QK_SCALE, DIAG_OFFSET, BLOCK_N, BUF_DEPTH, False, True)
+        state = _attn_inner_pipelined(state, q, k_ptrs, v_ptrs, offs_m, offs_n, n_full, causal_end, k_buf, v_buf,
+                                      stride_kn, stride_vn, QK_SCALE, DIAG_OFFSET, BLOCK_N, BUF_DEPTH, True, True)
+    else:
+        state = _attn_inner_pipelined(state, q, k_ptrs, v_ptrs, offs_m, offs_n, 0, n_blocks, k_buf, v_buf, stride_kn,
+                                      stride_vn, QK_SCALE, DIAG_OFFSET, BLOCK_N, BUF_DEPTH, False, False)
+
+    acc = state.acc / state.l_i[:, None]
+    o_ptrs = Out + o_off + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
+    tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=(offs_m[:, None] < N_CTX) & (offs_d[None, :] < HEAD_DIM))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Host wrapper
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -811,10 +1168,105 @@ def flash_attn_persistent(q, k, v, sm_scale, causal=False, **kw):
     return o
 
 
+def _cluster_default_block_n(causal):
+    """Shape-based BLOCK_N selection (BLOCK_M is fixed at 256, the validated tile).
+
+    Causal prefers BLOCK_N=32 at every measured size -- smaller K/V tiles mean
+    less wasted compute in the triangular masked region and more parallelism. On
+    gfx950 bn32 beats bn64 across the board (e.g. N=8192: 742 vs 601 TFLOPS;
+    N=16384: 746 vs 709). Non-causal prefers BLOCK_N=64 throughout (every tile is
+    full, so the larger tile amortizes the pipeline better).
+    """
+    if causal:
+        return 32
+    return 64
+
+
+def flash_attn_cluster_pipeline(q, k, v, sm_scale, causal=False, **kw):
+    """Rotated 4-cluster warp-pipeline FA forward. Square path: N_CTX % BLOCK_N == 0
+    and N_CTX % BLOCK_M == 0. BLOCK_M is fixed at 256 (the validated tile); BLOCK_N
+    defaults to a shape-based choice (see _cluster_default_block_n) and can be
+    overridden. Both non-causal and causal run the deep rotated pipeline (each
+    block range must be >= 4 K/V blocks)."""
+    B, H, N_CTX, D = q.shape
+    assert k.shape == (B, H, N_CTX, D) and v.shape == (B, H, N_CTX, D)
+
+    # The CDNA4 MFMA tile is 32 rows; each warp owns BLOCK_M // num_warps rows of
+    # the dot, so that ratio must be >= MFMA_M or the warp tiling is invalid and
+    # the kernel silently produces wrong output. Default num_warps to the largest
+    # power of two that keeps >= MFMA_M rows per warp (8 at BLOCK_M=256).
+    MFMA_M = 32
+    BLOCK_M = kw.pop("BLOCK_M", 256)
+    BLOCK_N = kw.pop("BLOCK_N", _cluster_default_block_n(causal))
+    num_warps = kw.pop("num_warps", min(8, max(1, BLOCK_M // MFMA_M)))
+    # waves_per_eu pins the AMDGPU occupancy target (LLVM "amdgpu-waves-per-eu").
+    # The NaN-propagating row-max (see _row_max) raises register pressure: the
+    # non-causal path MUST pin 2 or it spills heavily and regresses ~8x; the causal
+    # path is fastest unconstrained (0). 3 is consistently a large regression.
+    # Defaults are shape-dependent; pass waves_per_eu=... to override.
+    waves_per_eu = kw.pop("waves_per_eu", 0 if causal else 2)
+    assert N_CTX % BLOCK_N == 0, f"cluster_pipeline: N_CTX ({N_CTX}) must be a multiple of BLOCK_N ({BLOCK_N})"
+    assert N_CTX % BLOCK_M == 0, f"cluster_pipeline: N_CTX ({N_CTX}) must be a multiple of BLOCK_M ({BLOCK_M})"
+    assert BLOCK_M >= num_warps * MFMA_M, (
+        f"cluster_pipeline: BLOCK_M ({BLOCK_M}) must be >= num_warps ({num_warps}) * MFMA_M ({MFMA_M}); "
+        f"fewer than {MFMA_M} dot rows per warp gives an invalid MFMA tiling")
+    if causal:
+        # Causal splits into a below-diagonal region and a BLOCK_M/BLOCK_N-tile
+        # diagonal band; both run the deep rotated pipeline, whose 4-tile
+        # prologue/drain reads tiles up to block_end-1 and block_start+2. The band
+        # (and the full region, a multiple of it) must therefore be >= 4 tiles.
+        assert BLOCK_M % BLOCK_N == 0, (
+            f"cluster_pipeline causal: BLOCK_M ({BLOCK_M}) must be a multiple of BLOCK_N ({BLOCK_N})")
+        assert BLOCK_M // BLOCK_N >= 4, (
+            f"cluster_pipeline causal: diagonal band BLOCK_M/BLOCK_N ({BLOCK_M // BLOCK_N}) must be >= 4 tiles")
+    else:
+        # Non-causal runs the deep rotated pipeline over all blocks, which needs a >= 4-tile range.
+        assert N_CTX // BLOCK_N >= 4, "cluster_pipeline: need at least 4 K/V blocks for the rotated pipeline"
+
+    o = torch.empty_like(q)
+    m_blocks = triton.cdiv(N_CTX, BLOCK_M)
+    # Axis order must match the in-kernel program_id assignment (causal: head on
+    # axis 0; non-causal: m-block on axis 0).
+    grid = (H, m_blocks, B) if causal else (m_blocks, H, B)
+    _attn_fwd_cluster_pipeline[grid](
+        q,
+        k,
+        v,
+        o,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        v.stride(3),
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        o.stride(3),
+        N_CTX,
+        sm_scale,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        HEAD_DIM=D,
+        IS_CAUSAL=causal,
+        num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
+        **kw,
+    )
+    return o
+
+
 KERNEL_REGISTRY = {
     "async_simple": flash_attn_async_simple,
     "async_prefetch": flash_attn_async_prefetch,
     "persistent": flash_attn_persistent,
+    "cluster": flash_attn_cluster_pipeline,
 }
 
 
@@ -885,13 +1337,30 @@ def run_correctness_check(kernel_fn, dtype, causal, B=2, H=4, N=512, D=128):
     return verify(f"{kernel_fn.__name__} [{tag}]", out, ref)
 
 
+# The cluster kernel only handles the square anchor (N % BLOCK_M == 0, >= 4 K/V
+# blocks), so it is excluded from the arbitrary-/small-N sweep below and gets its
+# own block-aligned correctness test (test_fa_cluster_correctness).
+_ARBITRARY_N_KERNELS = [name for name in KERNEL_REGISTRY if name != "cluster"]
+
+
 @pytest.mark.parametrize("causal", [False, True], ids=["nocausal", "causal"])
 @pytest.mark.parametrize("n_test", [128, 192, 256, 500, 512, 1024])
-@pytest.mark.parametrize("kernel_name", list(KERNEL_REGISTRY.keys()))
+@pytest.mark.parametrize("kernel_name", _ARBITRARY_N_KERNELS)
 def test_fa_correctness(kernel_name, causal, n_test, dtype=torch.bfloat16, D=128):
     kernel_fn = get_kernel(kernel_name)
     ok = run_correctness_check(kernel_fn, dtype, causal, B=1, H=4, N=n_test, D=D)
     assert ok, f"Correctness failed: kernel={kernel_name} causal={causal} N={n_test}"
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["nocausal", "causal"])
+@pytest.mark.parametrize("N", [512, 1024, 2048], ids=["n512", "n1024", "n2048"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+def test_fa_cluster_correctness(causal, N, dtype, B=1, H=4, D=128):
+    """Cluster kernel vs PyTorch SDPA. N is a multiple of BLOCK_M=256 (>= 256) so
+    the square-anchor constraints hold (>= 4 N-blocks; causal diagonal band = 4
+    tiles)."""
+    ok = run_correctness_check(flash_attn_cluster_pipeline, dtype, causal, B=B, H=H, N=N, D=D)
+    assert ok, f"Correctness failed: cluster causal={causal} N={N} dtype={dtype}"
 
 
 def _ref_bottomright(q, k, v, sm, causal):
@@ -944,44 +1413,96 @@ PERF_CONFIGS = [(1, 4096), (2, 8192), (1, 16384)]
 # key: (kernel, B, D, N, causal) -> TFLOPS
 PERF_BASELINE_TFLOPS = {
     # B=1, N=4096
-    ("async_simple", 1, 64, 4096, False): 614,
-    ("async_simple", 1, 64, 4096, True): 344,
-    ("async_simple", 1, 128, 4096, False): 646,
-    ("async_simple", 1, 128, 4096, True): 341,
-    ("async_prefetch", 1, 64, 4096, False): 677,
-    ("async_prefetch", 1, 64, 4096, True): 334,
-    ("async_prefetch", 1, 128, 4096, False): 782,
-    ("async_prefetch", 1, 128, 4096, True): 447,
-    ("persistent", 1, 64, 4096, False): 695,
-    ("persistent", 1, 64, 4096, True): 620,
-    ("persistent", 1, 128, 4096, False): 828,
-    ("persistent", 1, 128, 4096, True): 697,
+    ("async_simple", 1, 64, 4096, False):
+    614,
+    ("async_simple", 1, 64, 4096, True):
+    344,
+    ("async_simple", 1, 128, 4096, False):
+    646,
+    ("async_simple", 1, 128, 4096, True):
+    341,
+    ("async_prefetch", 1, 64, 4096, False):
+    677,
+    ("async_prefetch", 1, 64, 4096, True):
+    334,
+    ("async_prefetch", 1, 128, 4096, False):
+    782,
+    ("async_prefetch", 1, 128, 4096, True):
+    447,
+    ("persistent", 1, 64, 4096, False):
+    695,
+    ("persistent", 1, 64, 4096, True):
+    620,
+    ("persistent", 1, 128, 4096, False):
+    828,
+    ("persistent", 1, 128, 4096, True):
+    697,
     # B=2, N=8192
-    ("async_simple", 2, 64, 8192, False): 668,
-    ("async_simple", 2, 64, 8192, True): 380,
-    ("async_simple", 2, 128, 8192, False): 704,
-    ("async_simple", 2, 128, 8192, True): 372,
-    ("async_prefetch", 2, 64, 8192, False): 713,
-    ("async_prefetch", 2, 64, 8192, True): 358,
-    ("async_prefetch", 2, 128, 8192, False): 833,
-    ("async_prefetch", 2, 128, 8192, True): 472,
-    ("persistent", 2, 64, 8192, False): 726,
-    ("persistent", 2, 64, 8192, True): 694,
-    ("persistent", 2, 128, 8192, False): 879,
-    ("persistent", 2, 128, 8192, True): 794,
+    ("async_simple", 2, 64, 8192, False):
+    668,
+    ("async_simple", 2, 64, 8192, True):
+    380,
+    ("async_simple", 2, 128, 8192, False):
+    704,
+    ("async_simple", 2, 128, 8192, True):
+    372,
+    ("async_prefetch", 2, 64, 8192, False):
+    713,
+    ("async_prefetch", 2, 64, 8192, True):
+    358,
+    ("async_prefetch", 2, 128, 8192, False):
+    833,
+    ("async_prefetch", 2, 128, 8192, True):
+    472,
+    ("persistent", 2, 64, 8192, False):
+    726,
+    ("persistent", 2, 64, 8192, True):
+    694,
+    ("persistent", 2, 128, 8192, False):
+    879,
+    ("persistent", 2, 128, 8192, True):
+    794,
     # B=1, N=16384
-    ("async_simple", 1, 64, 16384, False): 668,
-    ("async_simple", 1, 64, 16384, True): 432,
-    ("async_simple", 1, 128, 16384, False): 724,
-    ("async_simple", 1, 128, 16384, True): 475,
-    ("async_prefetch", 1, 64, 16384, False): 732,
-    ("async_prefetch", 1, 64, 16384, True): 439,
-    ("async_prefetch", 1, 128, 16384, False): 861,
-    ("async_prefetch", 1, 128, 16384, True): 544,
-    ("persistent", 1, 64, 16384, False): 744,
-    ("persistent", 1, 64, 16384, True): 741,
-    ("persistent", 1, 128, 16384, False): 894,
-    ("persistent", 1, 128, 16384, True): 837,
+    ("async_simple", 1, 64, 16384, False):
+    668,
+    ("async_simple", 1, 64, 16384, True):
+    432,
+    ("async_simple", 1, 128, 16384, False):
+    724,
+    ("async_simple", 1, 128, 16384, True):
+    475,
+    ("async_prefetch", 1, 64, 16384, False):
+    732,
+    ("async_prefetch", 1, 64, 16384, True):
+    439,
+    ("async_prefetch", 1, 128, 16384, False):
+    861,
+    ("async_prefetch", 1, 128, 16384, True):
+    544,
+    ("persistent", 1, 64, 16384, False):
+    744,
+    ("persistent", 1, 64, 16384, True):
+    741,
+    ("persistent", 1, 128, 16384, False):
+    894,
+    ("persistent", 1, 128, 16384, True):
+    837,
+    # cluster (D=128 only -- D=64/256 are out of scope for this kernel).
+    # Calibrated to the slower SKU in the CI pool (MI350, not the MI355X dev box):
+    # the cluster kernel is the fastest variant, so its 15% floor is the least
+    # forgiving of the ~18-20% cross-SKU clock gap. Baselines track MI350.
+    ("cluster", 1, 128, 4096, False):
+    780,
+    ("cluster", 1, 128, 4096, True):
+    565,
+    ("cluster", 2, 128, 8192, False):
+    830,
+    ("cluster", 2, 128, 8192, True):
+    638,
+    ("cluster", 1, 128, 16384, False):
+    865,
+    ("cluster", 1, 128, 16384, True):
+    612,
 }
 
 
@@ -1013,6 +1534,21 @@ def test_fa_performance(kernel_name, D, B, N, causal):
     print(f"  {kernel_name:14s} B={B} D={D:3d} N={N:5d} {'causal' if causal else 'nc':6s} "
           f"{got:7.1f} TFLOPS (baseline {baseline}, floor {floor:.1f})")
     assert got >= floor, (f"perf regression: {kernel_name} B={B} D={D} N={N} causal={causal} -> "
+                          f"{got:.1f} TFLOPS < floor {floor:.1f} (baseline {baseline}, tol {PERF_TOL:.0%})")
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["nocausal", "causal"])
+@pytest.mark.parametrize("B,N", PERF_CONFIGS, ids=[f"b{b}_n{n}" for b, n in PERF_CONFIGS])
+def test_fa_cluster_performance(B, N, causal):
+    """Perf guard for the cluster kernel (D=128 only -- D=64/256 are out of scope,
+    so it can't ride the generic D=[64,128] test_fa_performance sweep)."""
+    D = 128
+    baseline = PERF_BASELINE_TFLOPS[("cluster", B, D, N, causal)]
+    floor = baseline * (1 - PERF_TOL)
+    got = measure_tflops(flash_attn_cluster_pipeline, B, 64, N, D, causal)
+    print(f"  {'cluster':14s} B={B} D={D:3d} N={N:5d} {'causal' if causal else 'nc':6s} "
+          f"{got:7.1f} TFLOPS (baseline {baseline}, floor {floor:.1f})")
+    assert got >= floor, (f"perf regression: cluster B={B} D={D} N={N} causal={causal} -> "
                           f"{got:.1f} TFLOPS < floor {floor:.1f} (baseline {baseline}, tol {PERF_TOL:.0%})")
 
 
