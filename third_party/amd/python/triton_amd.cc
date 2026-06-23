@@ -31,7 +31,7 @@
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/SourceMgr.h"
-#include "llvm/TargetParser/TargetParser.h"
+#include "llvm/TargetParser/AMDGPUTargetParser.h"
 #include <array>
 #include <optional>
 #include <pybind11/pybind11.h>
@@ -104,6 +104,8 @@ void init_triton_amd_passes_ttgpuir(py::module &&m) {
                             const std::string &, bool, bool);
   ADD_PASS_WRAPPER_0("add_lower_barrier_ops",
                      mlir::createTritonAMDGPULowerBarrierOps);
+  ADD_FUNC_PASS_WRAPPER_0("add_optimize_buffer_op_ptr",
+                          mlir::createTritonAMDGPUOptimizeBufferOpPtr);
   ADD_PASS_WRAPPER_0("add_fold_true_cmpi", mlir::createTritonAMDFoldTrueCmpI);
 
   ADD_PASS_OPTION_WRAPPER_1("add_block_pingpong",
@@ -112,6 +114,8 @@ void init_triton_amd_passes_ttgpuir(py::module &&m) {
                             mlir::createTritonAMDGPUScheduleLoops, int);
   ADD_PASS_OPTION_WRAPPER_2("add_pipeline", mlir::createTritonAMDGPUPipeline,
                             bool, bool);
+  ADD_PASS_WRAPPER_0("add_coalesce_buffer_ops",
+                     mlir::createTritonAMDGPUCoalesceBufferOps);
   ADD_PASS_OPTION_WRAPPER_1("add_coalesce_async_copy",
                             mlir::createTritonAMDGPUCoalesceAsyncCopy,
                             std::string);
@@ -451,8 +455,7 @@ void init_triton_amd(py::module &&m) {
         std::unique_ptr<llvm::MCSubtargetInfo> sti(
             target->createMCSubtargetInfo(triple, arch, features));
 
-        llvm::MCContext ctx(triple, mai.get(), mri.get(), sti.get(), &srcMgr,
-                            &mcOptions);
+        llvm::MCContext ctx(triple, *mai, *mri, *sti, &srcMgr);
         std::unique_ptr<llvm::MCObjectFileInfo> mofi(
             target->createMCObjectFileInfo(ctx, /*PIC=*/false,
                                            /*LargeCodeModel=*/false));
@@ -479,7 +482,7 @@ void init_triton_amd(py::module &&m) {
         std::unique_ptr<llvm::MCAsmParser> parser(
             createMCAsmParser(srcMgr, ctx, *mcStreamer, *mai));
         std::unique_ptr<llvm::MCTargetAsmParser> tap(
-            target->createMCAsmParser(*sti, *parser, *mcii, mcOptions));
+            target->createMCAsmParser(*sti, *parser, *mcii));
         if (!tap)
           throw std::runtime_error("assembler initializtion error");
 

@@ -233,10 +233,12 @@ def get_llvm_package_info():
         return Package("llvm", "LLVM-C.lib", "", "LLVM_INCLUDE_DIRS", "LLVM_LIBRARY_DIR", "LLVM_SYSPATH")
     # use_assert_enabled_llvm = check_env_flag("TRITON_USE_ASSERT_ENABLED_LLVM", "False")
     # release_suffix = "assert" if use_assert_enabled_llvm else "release"
-    llvm_hash_path = os.path.join(get_base_dir(), "cmake", "llvm-hash.txt")
-    with open(llvm_hash_path, "r") as llvm_hash_file:
-        rev = llvm_hash_file.read(8)
-    name = f"llvm-{rev}-{system_suffix}"
+    llvm_info_path = os.path.join(get_base_dir(), "cmake", "llvm-info.json")
+    with open(llvm_info_path, "r") as llvm_info_file:
+        llvm_info = json.load(llvm_info_file)
+    rev = llvm_info["llvm_hash"][:8]
+    build_number = llvm_info.get("build_number")
+    name = f"llvm-{rev}-{system_suffix}-{build_number}"
     # Create a stable symlink that doesn't include revision
     sym_name = f"llvm-{system_suffix}"
     url = f"https://oaitriton.blob.core.windows.net/public/llvm-builds/{name}.tar.gz"
@@ -622,6 +624,15 @@ def download_and_copy_dependencies():
         url_func=lambda system, arch, version:
         f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_cupti/{system}-{arch}/cuda_cupti-{system}-{arch}-{version}-archive.tar.xz",
     )
+    download_and_copy(
+        name="cupti",
+        src_func=lambda system, arch, version: f"cuda_cupti-{system}-{arch}-{version}-archive/lib",
+        dst_path="lib/cupti-blackwell",
+        variable="TRITON_CUPTI_LIB_BLACKWELL_PATH",
+        version=NVIDIA_TOOLCHAIN_VERSION["cupti-blackwell"],
+        url_func=lambda system, arch, version:
+        f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_cupti/{system}-{arch}/cuda_cupti-{system}-{arch}-{version}-archive.tar.xz",
+    )
 
 
 backends = [*BackendInstaller.copy(["nvidia", "amd"]), *BackendInstaller.copy_externals()]
@@ -847,6 +858,11 @@ setup(
     package_dir=dict(get_package_dirs()),
     entry_points=get_entry_points(),
     include_package_data=True,
+    exclude_package_data={"": [
+        "__pycache__",
+        "__pycache__/*",
+        "*.py[cod]",
+    ]},
     ext_modules=[CMakeExtension("triton", "triton/_C/")],
     cmdclass={
         "bdist_wheel": plugin_bdist_wheel,

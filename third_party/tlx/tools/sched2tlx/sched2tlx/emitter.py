@@ -219,6 +219,21 @@ class RenderCtx:
     # Used when an emitter resolves a buffer via alloc_op_var instead of
     # (loop_id, buf_id).
     partition_alloc_names: dict[str, list[str]] = field(default_factory=dict)
+    # Monotonic, globally-unique counter for auto-named variables. Every
+    # auto-named op draws a fresh index via `fresh_idx()`, so names minted in
+    # different scopes (preamble, each per-WG outer-loop body, epilogue,
+    # infra-deps, ...) can NEVER collide. The previous code used a separate
+    # counter per scope that each restarted at 0, which silently produced
+    # duplicate names like `div_4`; inside a loop a reassigned name is
+    # loop-carried, so an in-loop op auto-named `div_4 = tile_id // div_4`
+    # clobbered the preamble's `div_4 = cdiv(N, 128)` and corrupted the tile
+    # address arithmetic on every iteration after the first.
+    _var_seq: int = 0
+
+    def fresh_idx(self) -> int:
+        """Return the next globally-unique auto-name index."""
+        self._var_seq += 1
+        return self._var_seq
 
 
 def _render_operand(ref: OperandRef, rctx: RenderCtx) -> str:
@@ -1143,15 +1158,13 @@ def _kernel_sig_lines(g: ScheduleGraph, lines: _Lines) -> None:
 def _emit_preamble(g: ScheduleGraph, loop: Loop, rctx: RenderCtx, lines: _Lines) -> None:
     lines += "# ── Preamble (function-scope ops before the loop) ──"
     pre_ops = _ops_before_loop(g, loop)
-    var_idx = 0
     for op in pre_ops:
         if op.kind in _SKIP_FUNCTION_SCOPE:
             continue
         if op.kind not in _NAMED_FUNCTION_OPS:
             continue
         # Auto-name based on op kind (descriptors get nice names).
-        name = _auto_name(op, var_idx)
-        var_idx += 1
+        name = _auto_name(op, rctx.fresh_idx())
         rctx.op_var[op.op_id] = name
         rhs = _render_op_expr(op, rctx)
         lines += f"{name} = {rhs}"
@@ -1845,7 +1858,6 @@ def _emit_default_partition(g: ScheduleGraph, loop: Loop, rctx: RenderCtx, lines
             lines += f"{ch['var_name']} = tlx.local_load({ch['bufname']}[0])"
         # Find the tmem_load → arith.truncf → ttg.convert_layout → tt.descriptor_store chain.
         # Render each non-skipped epilogue op.
-        var_idx = 0
         for op in epi_ops:
             if op.kind in _SKIP_FUNCTION_SCOPE:
                 continue
@@ -1861,8 +1873,7 @@ def _emit_default_partition(g: ScheduleGraph, loop: Loop, rctx: RenderCtx, lines
                 rt = op.result_types[0] if op.result_types else ""
                 sd = _parse_tensor_shape(rt)
                 target = _dtype_str_to_tl(sd[1]) if sd else "tl.float16"
-                name = f"trunc_{var_idx}"
-                var_idx += 1
+                name = f"trunc_{rctx.fresh_idx()}"
                 rctx.op_var[op.op_id] = name
                 lines += f"{name} = {inner}.to({target})"
                 continue
@@ -1882,8 +1893,7 @@ def _emit_default_partition(g: ScheduleGraph, loop: Loop, rctx: RenderCtx, lines
                 lines += "tlx.async_descriptor_store_wait(0)"
                 continue
             if op.kind in _NAMED_FUNCTION_OPS:
-                name = _auto_name(op, var_idx)
-                var_idx += 1
+                name = _auto_name(op, rctx.fresh_idx())
                 rctx.op_var[op.op_id] = name
                 lines += f"{name} = {_render_op_expr(op, rctx)}"
 
@@ -2762,9 +2772,7 @@ def _emit_in_loop_node(
     if n.op_kind in _IN_LOOP_NAMED_OPS and n.op_kind != "arith.constant":
         if op.op_id in rctx.op_var:
             return  # already named earlier in this scope
-        seed = int(rctx.op_var.get("__inloop_var_seed__", "0"))
-        name = _auto_name(op, 100 + seed)
-        rctx.op_var["__inloop_var_seed__"] = str(seed + 1)
+        name = _auto_name(op, rctx.fresh_idx())
         rctx.op_var[op.op_id] = name
         lines += f"{name} = {_render_op_expr(op, rctx)}"
         if _use_semaphore_ir():
@@ -3176,10 +3184,8 @@ def _replicate_infra_deps(
             if isinstance(o, OpRef):
                 _collect_infra_deps_recursive(g, o.op_id, visited, rctx, to_emit)
 
-    var_idx = 1000  # avoid clashing with preamble names
     for op in to_emit:
-        name = _auto_name(op, var_idx)
-        var_idx += 1
+        name = _auto_name(op, rctx.fresh_idx())
         rctx.op_var[op.op_id] = name
         lines += f"{name} = {_render_op_expr(op, rctx)}"
 
@@ -3489,7 +3495,6 @@ def _emit_outer_epilogue_partitioned(
     g: ScheduleGraph,
     rctx: RenderCtx,
     lines: _Lines,
-    var_idx: list[int],
 ) -> None:
     """Emit Pass A.5 partitioned epilogue chain inside the outer loop body.
 
@@ -3537,8 +3542,7 @@ def _emit_outer_epilogue_partitioned(
                 rt = op.result_types[0] if op.result_types else ""
                 sd = _parse_tensor_shape(rt)
                 target = _dtype_str_to_tl(sd[1]) if sd else "tl.float16"
-                name = f"trunc_g{gi}_{var_idx[0]}"
-                var_idx[0] += 1
+                name = f"trunc_g{gi}_{rctx.fresh_idx()}"
                 rctx.op_var[op.op_id] = name
                 lines += f"{name} = {inner}.to({target})"
                 continue
@@ -3613,7 +3617,6 @@ def _emit_outer_epilogue_subtiled(
     g: ScheduleGraph,
     rctx: RenderCtx,
     lines: _Lines,
-    var_idx: list[int],
 ) -> None:
     """Emit a Pass A.7 subtiled epilogue chain inside the outer loop body.
 
@@ -3668,8 +3671,7 @@ def _emit_outer_epilogue_subtiled(
                 rt = op.result_types[0] if op.result_types else ""
                 sd = _parse_tensor_shape(rt)
                 target = _dtype_str_to_tl(sd[1]) if sd else "tl.float16"
-                name = f"trunc_{sub_n}_{var_idx[0]}"
-                var_idx[0] += 1
+                name = f"trunc_{sub_n}_{rctx.fresh_idx()}"
                 rctx.op_var[op.op_id] = name
                 lines += f"{name} = {inner}.to({target})"
                 continue
@@ -3701,7 +3703,7 @@ def _emit_outer_epilogue_subtiled(
     # the persistent for-loop to drain remaining in-flight stores.
 
 
-def _emit_outer_op(n: Node, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines, var_idx: list[int]) -> None:
+def _emit_outer_op(n: Node, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) -> None:
     """Emit one outer-loop op (computational or epilogue side-effect)."""
     op = g.ops.get(n.op_ref) if n.op_ref else None
     if op is None or op.kind in _SKIP_FUNCTION_SCOPE:
@@ -3753,8 +3755,7 @@ def _emit_outer_op(n: Node, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines, va
         rt = op.result_types[0] if op.result_types else ""
         sd = _parse_tensor_shape(rt)
         target = _dtype_str_to_tl(sd[1]) if sd else "tl.float16"
-        name = f"trunc_{var_idx[0]}"
-        var_idx[0] += 1
+        name = f"trunc_{rctx.fresh_idx()}"
         rctx.op_var[op.op_id] = name
         lines += f"{name} = {inner}.to({target})"
         return
@@ -3772,8 +3773,7 @@ def _emit_outer_op(n: Node, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines, va
         lines += "tlx.async_descriptor_store_wait(0)"
         return
     if op.kind in _NAMED_FUNCTION_OPS:
-        name = _auto_name(op, var_idx[0])
-        var_idx[0] += 1
+        name = _auto_name(op, rctx.fresh_idx())
         rctx.op_var[op.op_id] = name
         lines += f"{name} = {_render_op_expr(op, rctx)}"
         return
@@ -3851,7 +3851,6 @@ def _emit_uwg_body_impl(
     lines += (f"# Outer persistent loop (loop {outer.loop_id}, II={outer.schedule.II}). "
               f"Each task replays it; body trimmed to this WG's ops.")
     with lines.block(f"for {out_iv} in range({out_lo}, {out_hi}, {out_step}):"):
-        var_idx = [0]
         # Per-tile TMEM ring-buffer indexing.
         if has_tmem:
             tc = rctx.tmem_count
@@ -3907,8 +3906,7 @@ def _emit_uwg_body_impl(
 
             in_loop_infra = [op for op in in_loop_infra if not _depends_on_outer_load(op.op_id)]
         for op in in_loop_infra:
-            name = _auto_name(op, var_idx[0])
-            var_idx[0] += 1
+            name = _auto_name(op, rctx.fresh_idx())
             rctx.op_var[op.op_id] = name
             lines += f"{name} = {_render_op_expr(op, rctx)}"
 
@@ -3924,7 +3922,7 @@ def _emit_uwg_body_impl(
             op = g.ops.get(n.op_ref) if n.op_ref else None
             if op is None or op.op_id in rctx.op_var:
                 continue
-            _emit_outer_op(n, g, rctx, lines, var_idx)
+            _emit_outer_op(n, g, rctx, lines)
 
         # Pass A.7: detect a subtiled epilogue chain. When present, the chain
         # nodes get emitted as a single `for sub_n` loop instead of per-op.
@@ -3943,7 +3941,7 @@ def _emit_uwg_body_impl(
                 continue
             if sub_info and i == subtile_start:
                 chain_nodes = outer_nodes[subtile_start:subtile_end]
-                _emit_outer_epilogue_subtiled(chain_nodes, sub_info[2], sub_info[3], g, rctx, lines, var_idx)
+                _emit_outer_epilogue_subtiled(chain_nodes, sub_info[2], sub_info[3], g, rctx, lines)
                 continue
             if sub_info and subtile_start < i < subtile_end:
                 continue  # already emitted inside the subtile loop
@@ -3956,12 +3954,11 @@ def _emit_uwg_body_impl(
                     g,
                     rctx,
                     lines,
-                    var_idx,
                 )
                 continue
             if part_info and part_start < i < part_end:
                 continue  # already emitted inside the partition loop
-            _emit_outer_op(n, g, rctx, lines, var_idx)
+            _emit_outer_op(n, g, rctx, lines)
 
         # Advance the TMEM ring counter at end of each tile (both default
         # and TC partitions, so tmem_buf/tmem_phase stay in sync).
