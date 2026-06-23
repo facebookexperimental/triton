@@ -344,6 +344,7 @@ class HIPBackend(BaseBackend):
                 knobs.amd.use_buffer_atomics,
                 knobs.amd.buffer_ops_analyze_small_tensor_range,
             )
+            amd.passes.ttgpuir.add_optimize_buffer_op_ptr(pm)
 
         # Facebook begin
         # D79814483: Disable amd.passes.ttgpuir.add_fold_true_cmpi
