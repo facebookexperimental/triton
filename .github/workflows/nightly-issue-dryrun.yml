@@ -1,0 +1,47 @@
+name: Nightly Issue Filing Dry Run
+
+# Manually exercise the report-nightly-failure.yml issue create/update path
+# without waiting for a real nightly failure on main.
+#
+# - First run with a given `tag` CREATES a [dry-run] issue.
+# - A second run with the same `tag` finds it by title+labels and UPDATES it
+#   (bumps the "Last updated" line in the body), proving the dedup path.
+#
+# The issue is labeled like any real nightly issue (ci_issues, nightly) but the
+# `[dry-run]` title prefix marks it as synthetic. Delete it when you are done.
+#
+# NOTE: GitHub's issue search index has a short lag. Wait ~1 min between runs so
+# the second run can find the issue created by the first (otherwise it may
+# create a duplicate instead of updating).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Suffix that keys the dry-run issue (same tag => same issue updated).
+        required: false
+        type: string
+        default: manual
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  dryrun:
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: "[nightly][dry-run] report-nightly-failure validation / ${{ inputs.tag }}"
+      normalized_failure_id: "dry-run-${{ inputs.tag }}"
+      raw_failure_ids: ""
+      workflow_name: ${{ github.workflow }}
+      job_name: dryrun
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ github.sha }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: "Synthetic dry-run item validating issue create/update. Safe to delete."
