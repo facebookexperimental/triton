@@ -7,6 +7,7 @@
 #include "mlir/Analysis/DataFlow/Utils.h"
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "tlx/dialect/include/Analysis/LayoutPropagation.h"
+#include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
@@ -267,7 +268,9 @@ getUserSharedOrder(ttg::LocalLoadOp localLoadOp) {
 
 static Attribute computeSharedEncFromDotEnc(ttg::DotOperandEncodingAttr dotEnc,
                                             ttg::LocalLoadOp localLoadOp,
-                                            bool useAsyncCopy) {
+                                            bool useAsyncCopy,
+                                            bool isBufferLoadToLocal,
+                                            ArrayRef<unsigned> bufferOrder) {
   auto resultType = cast<RankedTensorType>(localLoadOp.getType());
   auto order = ttg::getOrderForMemory(resultType);
   auto userOrder = getUserSharedOrder(localLoadOp);
@@ -288,6 +291,92 @@ static Attribute computeSharedEncFromDotEnc(ttg::DotOperandEncodingAttr dotEnc,
         if (auto padded = composePaddedLayout(
                 targetInfo, dotEnc, cast<ttg::TensorOrMemDesc>(type),
                 paddedOrder, /*useAsyncCopy=*/true)) {
+          // `composePaddedLayout` returns the bank-conflict-avoiding padded
+          // layout, derived from the DOT (read) order. Its linear component is
+          // a *permutation* AND, for a transposed operand, can flip the
+          // contiguous dimension relative to global memory.
+          //
+          // A gfx9 direct-to-LDS load writes each lane's data to a fixed
+          // coalesced LDS slot; the only freedom is which global element a lane
+          // reads. So a *permutation* of the LDS layout can be absorbed by
+          // re-routing the producer's global-side register tensor (the
+          // async-copy pointer tensor / the buffer-load offset tensor); that is
+          // what `tritonamdgpu-coalesce-async-copy` does for async_copy. A
+          // *transpose*, however, cannot: making the (N-contiguous) LDS write
+          // coalesced would force strided (K-apart) global reads -- you cannot
+          // coalesce both ends of a transpose.
+          //
+          // Two consequences, both verified on gfx950:
+          //  1. async_copy works because its post-padded coalescer absorbs the
+          //     permutation; buffer_load_to_local has no such pass, so the
+          //     permuted layout reaches lowering unabsorbed and fails
+          //     canLoadDirectToLDS.
+          //  2. Prototyping a buffer coalescer (mirroring coalesce-async-copy
+          //  on
+          //     the offset tensor) confirmed it absorbs permutations (the A /
+          //     opIdx=0 operand coalesced fine) but NOT the transpose: for the
+          //     B / opIdx=1 operand `composePaddedLayout` picks an N-contiguous
+          //     LDS order while B is K-contiguous in global, so reg->shared
+          //     consecutiveness collapses to 1 (< min direct-to-LDS vector) and
+          //     no register rewrite -- async or buffer -- can fix it.
+          //
+          // Fix: for buffer loads, rebuild the same pad intervals with an
+          // *identity* order equal to the producer's REAL global contiguity
+          // (`bufferOrder`, read from the offset tensor's AxisInfo by the
+          // caller -- the same signal the stock AMD path / CoalesceBufferOps
+          // use). This makes the alloc's LDS contiguity match the global read
+          // -> coalesced direct-to-LDS write for ANY operand layout (K- or
+          // N-contiguous), not just the K-contiguous tutorial operands; the
+          // dot-side transpose is handled on the read by ds_read_tr. The
+          // padding intervals are kept for ds_read bank-conflict mitigation;
+          // the permutation we drop is what the (absent) buffer coalescer would
+          // otherwise have to absorb. Fall back to the K-contiguous order only
+          // if AxisInfo could not determine the global order.
+          if (isBufferLoadToLocal) {
+            // K is dim 1 for opIdx0 (A) and dim 0 for opIdx1 (B).
+            unsigned kDimIndex = dotEnc.getOpIdx() == 0 ? 1 : 0;
+            SmallVector<unsigned> kContigOrder = {kDimIndex, 1 - kDimIndex};
+            SmallVector<unsigned> identityOrder =
+                bufferOrder.empty() ? kContigOrder
+                                    : llvm::to_vector(bufferOrder);
+            // Build the padded encoding for the ALLOCATION shape, not the
+            // (possibly sliced) view shape. When a K-slice of a padded buffer
+            // feeds the dot (fine per-MFMA ds_read interleave), the slice
+            // memdesc has shape=[M,sliceK] but allocShape=[M,fullK]; the padded
+            // encoding's linear component must match allocShape (MemDescType
+            // verify checks ll.outDims == allocShape) and addresses the correct
+            // sub-region (the slice reads logical (m, k<sliceK) through the
+            // full layout). Only intervals/paddings are read from it below and
+            // those are shape-independent, but use the alloc-shape layout (not
+            // the sliced view) so the rebuilt encoding's allocShape is
+            // consistent.
+            auto allocShape = type.getAllocShape();
+            auto fullType = ttg::MemDescType::get(
+                allocShape, type.getElementType(), type.getEncoding(),
+                type.getMemorySpace(), type.getMutableMemory(), allocShape);
+            auto paddedFull = composePaddedLayout(
+                targetInfo, dotEnc, cast<ttg::TensorOrMemDesc>(fullType),
+                paddedOrder, /*useAsyncCopy=*/true);
+            // The sliced view was paddable, so the (larger) allocation shape
+            // must be too; fail loudly rather than silently fall back to a
+            // sliced-shape layout if that invariant ever breaks (reviewer Q1).
+            assert(
+                paddedFull &&
+                "alloc-shape padded layout expected for a buffer_load_to_local"
+                " whose view shape was paddable");
+            auto paddedEnc = cast<ttg::PaddedSharedEncodingAttr>(paddedFull);
+            SmallVector<std::pair<unsigned, unsigned>> intervalPads;
+            for (auto [iv, pd] :
+                 llvm::zip(paddedEnc.getIntervals(), paddedEnc.getPaddings()))
+              intervalPads.emplace_back(iv, pd);
+            auto identity = ttg::PaddedSharedEncodingAttr::get(
+                localLoadOp->getContext(), intervalPads, identityOrder,
+                allocShape, ctaLayout);
+            LDBG("Rebuilt global-order identity padded encoding (allocShape) "
+                 "for buffer_load_to_local: "
+                 << identity);
+            return identity;
+          }
           LDBG("Deduced async-copy padded shared encoding from dot layout: "
                << padded);
           return padded;
@@ -366,6 +455,78 @@ static bool isFedByTDM(Value memdesc) {
 static bool isFedByAsyncLdsProducer(Value memdesc) {
   return isFedByAnyMemDescUser<ttg::AsyncCopyGlobalToLocalOp,
                                amdgpu::BufferLoadToLocalOp>(memdesc);
+}
+
+// True if the alloc feeding this memdesc is written by a `buffer_load_to_local`
+// (AMD direct-to-LDS buffer load).  Unlike the async-copy path, the
+// direct-to-LDS lowering cannot reorder the load source to follow a *permuted*
+// padded layout, so such allocs must use an identity padded layout
+// (see computeSharedEncFromDotEnc).
+static bool isFedByBufferLoadToLocal(Value memdesc) {
+  return isFedByAnyMemDescUser<amdgpu::BufferLoadToLocalOp>(memdesc);
+}
+
+// Find the buffer_load_to_local writing the alloc that feeds `memdesc`.
+static amdgpu::BufferLoadToLocalOp findBufferProducer(Value memdesc) {
+  llvm::SetVector<Value> worklist;
+  worklist.insert(findMemDescRoot(memdesc));
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    for (Operation *u : v.getUsers()) {
+      if (auto buf = dyn_cast<amdgpu::BufferLoadToLocalOp>(u))
+        return buf;
+      if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
+              ttg::MemDescSubsliceOp, ttg::MemDescTransOp,
+              ttg::MemDescReshapeOp, tlx::RequireLayoutOp>(u))
+        worklist.insert(u->getResult(0));
+    }
+  }
+  return nullptr;
+}
+
+// The identity padded-layout ORDER for a buffer_load_to_local-fed dot operand,
+// expressed in the local_load VIEW's coordinate space.
+//
+// The order is the producer's REAL global contiguity, read from the offset
+// tensor's AxisInfo (exactly the signal the stock AMD path / CoalesceBufferOps
+// use), NOT a hardcoded K-contiguous order and NOT the dot/read order. A gfx9
+// direct-to-LDS write needs the alloc's LDS contiguity == this global order, so
+// the write coalesces; the dot-side transpose is handled on the read by
+// ds_read_tr. Because the constraint lives on the alloc but we anchor on the
+// (possibly memdesc_trans'd) view, map the alloc-space global order to view
+// space via the memdesc_trans parity along the view->alloc chain (2D).
+//
+// Returns {} if there is no buffer producer or the order is undeterminable
+// (caller falls back to the hardcoded K-contiguous order).
+static SmallVector<unsigned>
+computeBufferViewOrder(Value memdesc, triton::ModuleAxisInfoAnalysis &axis) {
+  auto buf = findBufferProducer(memdesc);
+  if (!buf)
+    return {};
+  auto *info = axis.getAxisInfo(buf.getOffsets());
+  if (!info)
+    return {};
+  SmallVector<int64_t> contig(info->getContiguity().begin(),
+                              info->getContiguity().end());
+  SmallVector<unsigned> order = getOrderFromContiguity(contig);
+  // memdesc_trans parity between the view and the producer's alloc (2D
+  // operands).
+  bool swapped = false;
+  Value v = memdesc;
+  while (auto *def = v.getDefiningOp()) {
+    if (isa<ttg::MemDescTransOp>(def))
+      swapped = !swapped;
+    if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
+            ttg::MemDescSubsliceOp, ttg::MemDescTransOp, ttg::MemDescReshapeOp,
+            tlx::RequireLayoutOp>(def)) {
+      v = def->getOperand(0);
+      continue;
+    }
+    break;
+  }
+  if (swapped && order.size() == 2)
+    std::swap(order[0], order[1]);
+  return order;
 }
 
 static void applyRequireLayout(Attribute encoding, ttg::LocalLoadOp localLoadOp,
@@ -736,6 +897,11 @@ LogicalResult insertRequireLayout(ModuleOp m) {
   if (failed(solver.initializeAndRun(m)))
     return failure();
 
+  // Axis-info analysis: used to read the real global contiguity of
+  // buffer_load_to_local offset tensors when choosing the direct-to-LDS
+  // identity padded order (see computeBufferViewOrder).
+  triton::ModuleAxisInfoAnalysis axisInfo(m);
+
   // InsertRequireLayout owns constraint synthesis only:
   // 1. Discover dot-fed local_load ops and add the missing memdesc-side
   //    tlx.require_layout constraints for shared memory.
@@ -772,8 +938,18 @@ LogicalResult insertRequireLayout(ModuleOp m) {
     // async direct-to-LDS producers, prefer AMD's padded shared layout when it
     // is applicable and fall back to the dot-derived swizzled layout.
     bool useAsyncCopy = isFedByAsyncLdsProducer(localLoadOp->getOperand(0));
-    auto sharedEnc =
-        computeSharedEncFromDotEnc(dotEnc, localLoadOp, useAsyncCopy);
+    bool isBufferLoadToLocal =
+        isFedByBufferLoadToLocal(localLoadOp->getOperand(0));
+    // For the buffer direct-to-LDS path, source the identity padded order from
+    // the producer's real global contiguity (AxisInfo), not a hardcoded
+    // K-contiguous order -- this is what makes it correct for any operand
+    // layout, mirroring the stock AMD path.
+    SmallVector<unsigned> bufferOrder =
+        isBufferLoadToLocal
+            ? computeBufferViewOrder(localLoadOp->getOperand(0), axisInfo)
+            : SmallVector<unsigned>{};
+    auto sharedEnc = computeSharedEncFromDotEnc(
+        dotEnc, localLoadOp, useAsyncCopy, isBufferLoadToLocal, bufferOrder);
     applyRequireLayout(sharedEnc, localLoadOp, builder);
   });
 

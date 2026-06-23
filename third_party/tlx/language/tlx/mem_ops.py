@@ -826,6 +826,7 @@ def local_load(
     src: tlx.buffered_tensor,
     token: tlx.async_token = None,
     layout=None,
+    relaxed: bool = False,
     _semantic=None,
 ) -> tl.tensor:
     """
@@ -859,7 +860,7 @@ def local_load(
             enc = layout.to_ir(_semantic.builder, src.type.shape, src.type.element_ty)
             output = _semantic.builder.create_require_layout(output, enc)
         result = tl.tensor(output, block_type)
-        if token is not None and _semantic.builder.options.backend_name == "hip":
+        if (token is not None or relaxed) and _semantic.builder.options.backend_name == "hip":
             result.handle.set_attr("ttg.amdg.syncedViaAsyncWait", _semantic.builder.get_bool_attr(True))
         return result
 
