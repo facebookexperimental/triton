@@ -26,8 +26,8 @@
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 #include "third_party/amd/include/Utils/Utility.h"
-#include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Interfaces.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
@@ -40,10 +40,22 @@
 // clang-format on
 
 #include "third_party/amd/include/Dialect/TritonAMDGPU/Utility/CommonUtils.h"
-#include "third_party/amd/lib/TritonAMDGPUToLLVM/TDMUtility.h"
 
 using namespace mlir;
+using namespace mlir::triton;
 using namespace mlir::triton::amdgpu;
+using ::mlir::triton::gpu::BlockedEncodingAttr;
+using ::mlir::triton::gpu::DotOperandEncodingAttr;
+
+// Local linearize helper to avoid circular dependency on TritonGPUToLLVM.
+static size_t linearizeIndices(llvm::ArrayRef<unsigned> multiDim,
+                               llvm::ArrayRef<unsigned> shape,
+                               llvm::ArrayRef<unsigned> order) {
+  size_t linear = 0;
+  for (unsigned dim : llvm::reverse(order))
+    linear = linear * shape[dim] + multiDim[dim];
+  return linear;
+}
 
 void mlir::triton::amdgpu::TritonAMDGPUDialect::initialize() {
   addAttributes<
@@ -184,7 +196,7 @@ LogicalResult ExtractSliceOp::verify() {
 // operations. When extract_slice is used to extract a portion that exactly
 // matches one of the original tensors concatenated by a concat operation, we
 // can eliminate extract_slice op and use the original tensor directly.
-struct CononicalizeExtractSliceAndConcat
+struct CanonicalizeExtractSliceAndConcat
     : public mlir::OpRewritePattern<amdgpu::ExtractSliceOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -223,7 +235,7 @@ struct CononicalizeExtractSliceAndConcat
     auto srcToDstShape = LLVM::AMD::multiDimElementwise<int64_t, int64_t>(
         dstShape, srcShape, std::divides<unsigned>());
     auto linearSrcIdx =
-        mlir::LLVM::linearize(multiDimSrcIdx, srcToDstShape, defaultOrder);
+        linearizeIndices(multiDimSrcIdx, srcToDstShape, defaultOrder);
 
     // Replace extract_slice with the concat operand
     assert(linearSrcIdx < concatOp->getNumOperands() &&
@@ -237,7 +249,7 @@ struct CononicalizeExtractSliceAndConcat
 
 void ExtractSliceOp::getCanonicalizationPatterns(
     mlir::RewritePatternSet &patterns, mlir::MLIRContext *context) {
-  patterns.add<CononicalizeExtractSliceAndConcat>(context);
+  patterns.add<CanonicalizeExtractSliceAndConcat>(context);
 }
 
 LogicalResult UpcastMXFPOp::verify() {
@@ -590,7 +602,7 @@ LogicalResult ConcatOp::verify() {
     auto multiDimOperandIdx = LLVM::AMD::multiDimElementwise<int32_t, int64_t>(
         elemCoordsArray, srcShape, std::divides<unsigned>());
     auto linearOperandIdx =
-        mlir::LLVM::linearize(multiDimOperandIdx, srcToDstShape, defaultOrder);
+        linearizeIndices(multiDimOperandIdx, srcToDstShape, defaultOrder);
 
     // 4.   subtract dst coordinates and start coordinates of the tile
 
@@ -618,6 +630,23 @@ LogicalResult ConcatOp::verify() {
   }
 
   return success();
+}
+
+LogicalResult BufferLoadToLocalOp::verify() {
+  auto mod = getOperation()->getParentOfType<ModuleOp>();
+  if (!mod)
+    return success();
+
+  auto arch = mlir::getAMDArch(mod);
+  // buffer_load_to_local is supported only on CDNA3 (gfx942) and CDNA4
+  // (gfx950) -- i.e. AMD::TargetInfo::supportsBufferLoadToLocal() returns
+  // isaFamily in {CDNA3, CDNA4}. We check the arch string directly here rather
+  // than constructing AMD::TargetInfo (or calling deduceISAFamily): both live
+  // in the TritonAMDGPUToLLVM lowering library, which this IR dialect library
+  // (TritonAMDGPUIR) must not depend on.
+  if (!arch || *arch == "gfx942" || *arch == "gfx950")
+    return success();
+  return emitError() << "BufferLoadToLocal unsupported on target architecture";
 }
 
 LogicalResult LocalLoadPackedTransposedOp::verify() {
