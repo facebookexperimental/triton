@@ -812,6 +812,8 @@ struct WSBuffer {
   bool isCrossStage;
   unsigned bufferId;
   unsigned numCopies;
+  unsigned minCopies = 1; // Enforced correctness floor (cross-stage depth).
+                          // numCopies must never drop below this.
   WSBufferPriority priority;
   bool isPinned = false; // Set by user annotation; skips heuristic phases.
   unsigned tmaStaging =
@@ -1207,6 +1209,70 @@ static bool isSmemCrossStage(Operation *alloc,
   return false;
 }
 
+/// Compute the cross-stage depth required for an SMEM buffer: the number of
+/// pipeline stages its live range spans, i.e.
+///   max(maxConsumerStage - minConsumerStage + 1, 1).
+/// A genuine cross-stage buffer (consumers in >=2 distinct stages) yields >=2;
+/// everything else yields 1. Mirrors isSmemCrossStage: only buffers updated
+/// inside the innermost loop (srcOp has loop.stage) can be cross-stage, so a
+/// producer outside the loop yields depth 1.
+static unsigned getSmemCrossStageDepth(Operation *alloc,
+                                       SmallVector<Channel *> &channels) {
+  Channel *ch = findChannelForOp(alloc, channels);
+  if (!ch || ch->channelKind != DataChannelKind::SMEMPost)
+    return 1;
+
+  Operation *srcOp = ch->getSrcOp();
+  if (!srcOp || getLoopStage(srcOp) < 0)
+    return 1;
+
+  SmallVector<Operation *> dstOps;
+  ch->getDstOps(dstOps);
+  if (dstOps.empty()) {
+    if (Operation *dst = ch->getDstOp())
+      dstOps.push_back(dst);
+  }
+
+  int minStage = INT_MAX, maxStage = -1;
+  for (Operation *dstOp : dstOps) {
+    for (Operation *consumer : getActualConsumers(dstOp)) {
+      int stage = getLoopStage(consumer);
+      if (stage >= 0) {
+        minStage = std::min(minStage, stage);
+        maxStage = std::max(maxStage, stage);
+      }
+    }
+  }
+  if (maxStage < 0 || minStage == INT_MAX || maxStage == minStage)
+    return 1;
+  return static_cast<unsigned>(maxStage - minStage + 1);
+}
+
+/// Returns true if any actual consumer of the buffer is inside the pipelined
+/// inner loop (has loop.stage). Such a buffer (e.g. an operand loaded once per
+/// outer iteration and read every inner iteration) is live across the whole
+/// inner loop, so aliasing its SMEM onto another buffer for reuse is unsafe.
+/// TMA-staging buffers, in contrast, are written then stored then dead, so
+/// they are NOT flagged by this and remain reuse-eligible.
+static bool isSmemLiveAcrossInnerLoop(Operation *alloc,
+                                      SmallVector<Channel *> &channels) {
+  Channel *ch = findChannelForOp(alloc, channels);
+  if (!ch || ch->channelKind != DataChannelKind::SMEMPost)
+    return false;
+
+  SmallVector<Operation *> dstOps;
+  ch->getDstOps(dstOps);
+  if (dstOps.empty()) {
+    if (Operation *dst = ch->getDstOp())
+      dstOps.push_back(dst);
+  }
+  for (Operation *dstOp : dstOps)
+    for (Operation *consumer : getActualConsumers(dstOp))
+      if (getLoopStage(consumer) >= 0)
+        return true;
+  return false;
+}
+
 /// Compute the byte size for a local_alloc op.
 static unsigned getSmemAllocSizeBytes(ttg::LocalAllocOp alloc) {
   auto allocType = alloc.getType();
@@ -1344,12 +1410,11 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
     // Determine current copies (should be uniform within a fused group).
     unsigned currentCopies = wsBuffers[indices[0]].numCopies;
 
-    // Respect cross-stage minimum from Phase 2.
+    // Respect the enforced cross-stage floor from Phase 2 (the real stage
+    // span, not a hardcoded 2).
     unsigned minCopies = currentCopies;
-    for (unsigned idx : indices) {
-      if (wsBuffers[idx].isCrossStage)
-        minCopies = std::max(minCopies, 2u);
-    }
+    for (unsigned idx : indices)
+      minCopies = std::max(minCopies, wsBuffers[idx].minCopies);
     if (minCopies > currentCopies)
       currentCopies = minCopies;
 
@@ -1589,6 +1654,8 @@ static unsigned allocateSmemBuffers(
     if (it != allocToAnnotation.end() && it->second.memType == "smem") {
       buf.bufferId = it->second.bufferId;
       buf.numCopies = it->second.numCopies;
+      // Explicit annotation counts act as a never-reduce floor too.
+      buf.minCopies = it->second.numCopies;
       buf.isPinned = true;
       LDBG("Phase 1: WSBuffer pinned by annotation: bufferId="
            << buf.bufferId << " numCopies=" << buf.numCopies);
@@ -1630,8 +1697,15 @@ static unsigned allocateSmemBuffers(
     if (buf.isPinned)
       nextBufferId = std::max(nextBufferId, buf.bufferId + 1);
 
-  // ── Phase 2: Enforce cross-stage minimum ────────────────────────────
-  // Budget-aware: only set copy=2 if the total SMEM stays within budget.
+  // ── Phase 2: Enforce cross-stage minimum (FIRST, unconditionally) ────
+  // The cross-stage depth is a correctness floor dictated by the schedule: a
+  // buffer whose consumers span N pipeline stages needs N copies so the
+  // producer cannot overwrite a slot a later-stage consumer still reads.
+  // We reserve this floor FIRST, before any reuse/copy-increase step, and we
+  // NEVER revert it for budget. Budget is reconciled later by reclaiming
+  // discretionary (TMA-staging) space (Phase 3.6); if it still does not fit,
+  // we ship the floored allocation anyway (codegen's hardware-limit check is
+  // the backstop) rather than silently downgrading to a deadlocking depth 1.
   for (auto &buf : wsBuffers) {
     if (buf.isPinned) {
       if (buf.isCrossStage && buf.numCopies < 2) {
@@ -1643,20 +1717,13 @@ static unsigned allocateSmemBuffers(
       continue;
     }
     if (buf.isCrossStage && numBuffers >= 2) {
-      unsigned saved = buf.numCopies;
-      buf.numCopies = 2;
-      unsigned totalSmem = computeTotalSmem(wsBuffers);
-      if (totalSmem <= smemBudget) {
-        LDBG("Phase 2: WSBuffer[" << buf.bufferId
-                                  << "] cross-stage → numCopies=2"
-                                  << " (totalSmem=" << totalSmem << ")");
-      } else {
-        buf.numCopies = saved;
-        LDBG("Phase 2: WSBuffer["
-             << buf.bufferId << "] cross-stage copy=2 skipped"
-             << " (would exceed budget: " << totalSmem << " > " << smemBudget
-             << ")");
-      }
+      // floor = span of pipeline stages the buffer is live across (>=2 for a
+      // genuine cross-stage buffer; max(span, 1) otherwise), capped at the
+      // pipeline depth (numBuffers).
+      unsigned depth = getSmemCrossStageDepth(buf.allocOp, channels);
+      unsigned floor = std::min(depth, numBuffers);
+      buf.minCopies = std::max(buf.minCopies, floor);
+      buf.numCopies = std::max(buf.numCopies, buf.minCopies);
     }
   }
 
@@ -1717,6 +1784,15 @@ static unsigned allocateSmemBuffers(
           continue;
         if (buf.isInnermost)
           continue;
+        // Only reclaim genuinely discretionary space. Skip non-staging buffers
+        // that are read across the inner loop (e.g. operand buffers like q/k/v
+        // loaded once per outer iter and consumed every inner iteration): they
+        // are co-live with the whole loop, so aliasing them is unsafe. This is
+        // what lets the cross-stage floor be honored by reclaiming TMA-staging
+        // space rather than by clobbering live operands.
+        if (buf.tmaStaging == 0 &&
+            isSmemLiveAcrossInnerLoop(buf.allocOp, channels))
+          continue;
         reuseIndices.push_back(i);
       }
       // Sort by size descending — reuse largest buffers first.
@@ -1751,6 +1827,12 @@ static unsigned allocateSmemBuffers(
       LDBG("Phase 3.6: new total " << computeTotalSmem(wsBuffers));
     }
   }
+
+  // Note: the cross-stage floors reserved in Phase 2 are intentionally NOT
+  // reverted here even if the post-reuse total still exceeds the (soft) budget
+  // — dropping a floor reintroduces the producer/consumer slot collision that
+  // deadlocks at runtime. The hardware SMEM limit (an OutOfResources at
+  // codegen) is the backstop.
 
   // ── Phase 4: Iterative copy increase ────────────────────────────────
   // Process P0 then P1. P2 is never increased.
@@ -1871,7 +1953,8 @@ static unsigned allocateSmemBuffers(
                  << buf.bufferId << "] copies=" << currentGroupCopies
                  << " totalSmem=" << totalSmem << " ≤ " << smemBudget);
           } else {
-            buf.numCopies = saved;
+            // Never drop below the enforced cross-stage floor.
+            buf.numCopies = std::max(saved, buf.minCopies);
             // Try reusing an already-allocated buffer instead.
             DenseMap<unsigned, unsigned> phase4Claimed;
             if (auto *target = findReuseCandidate(buf, wsBuffers, channels,
@@ -1899,12 +1982,14 @@ static unsigned allocateSmemBuffers(
     }
 
     // Step 2: Finalize reuse decision.
-    // If final copies is even, split the group back.
+    // If final copies is even, split the group back — but never below either
+    // member's enforced cross-stage floor.
     if (isReuseGroup) {
       auto &bufA = wsBuffers[candidateIndices[0]];
       auto &bufB = wsBuffers[candidateIndices[1]];
-      if (bufA.numCopies % 2 == 0) {
-        unsigned half = bufA.numCopies / 2;
+      unsigned half = bufA.numCopies / 2;
+      if (bufA.numCopies % 2 == 0 && half >= bufA.minCopies &&
+          half >= bufB.minCopies) {
         bufA.numCopies = half;
         bufB.numCopies = half;
         bufB.bufferId = nextBufferId++;
