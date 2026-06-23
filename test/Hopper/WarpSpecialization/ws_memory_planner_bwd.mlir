@@ -1,4 +1,6 @@
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=1 --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=FLOOR
+// RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-circular-reuse=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=CIRCULAR
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --nvgpu-test-ws-code-partition="num-buffers=1 post-channel-creation=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=OPERANDD
 
 // Test case: FA BWD pattern with SMEM allocation (algo=1).
@@ -30,6 +32,7 @@
 //   - dq then reuses dpT (buffer.id=6)
 //   - dv_interm reuses qkT (buffer.id=5)
 
+// CHECK: warning: SMEM allocation requires {{[0-9]+}} bytes after discretionary reuse, exceeding configured smem-budget=200000; preserving cross-stage correctness floors
 // CHECK-LABEL: tt.func public @_attn_bwd
 //
 // SMEM allocations
@@ -58,6 +61,17 @@
 //
 // TMEM allocation: dq reuses dpT (buffer.id=8, buffer.offset=0) — key verification
 // CHECK: %dq, %dq_49 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 0 : i32}
+
+// FLOOR: warning: cross-stage SMEM buffer requires buffer.copy=2, exceeding configured num-buffers=1; enforcing the correctness floor
+// FLOOR-LABEL: tt.func public @_attn_bwd
+// FLOOR: %do = ttg.local_alloc {buffer.copy = 2 : i32
+// FLOOR: %q = ttg.local_alloc {buffer.copy = 2 : i32
+
+// CIRCULAR: warning: SMEM allocation requires {{[0-9]+}} bytes after discretionary reuse, exceeding configured smem-budget=200000; preserving cross-stage correctness floors
+// CIRCULAR: tt.func public @_attn_bwd
+// CIRCULAR: warning: cross-stage SMEM reuse group requires buffer.copy=3, exceeding configured num-buffers=2; enforcing the correctness floor
+// CIRCULAR: %do = ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = [[ID:[0-9]+]] : i32}
+// CIRCULAR: %q = ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = [[ID]] : i32}
 
 // -----// WarpSpec internal IR Dump After: doBufferAllocation
 #blocked = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>

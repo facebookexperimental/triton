@@ -1476,8 +1476,7 @@ void createTokenPost(
 
         LLVM_DEBUG({
           LDBG("-- createToken: useGen5Barrier = "
-               << useGen5Barrier << " channel "
-               << commSourceChannel->uniqID);
+               << useGen5Barrier << " channel " << commSourceChannel->uniqID);
           commSourceChannel->getSrcOp()->dump();
           sourceDstOp->dump();
           consumerOp->dump();
@@ -1509,19 +1508,20 @@ void createTokenPost(
           Value v;
           Location tokenLoc = funcOp.getLoc();
           if (!commSourceChannel->srcName.empty())
-            tokenLoc = NameLoc::get(
-                StringAttr::get(funcOp.getContext(), commSourceChannel->srcName),
-                tokenLoc);
-          v = ttnvws::CreateTokenOp::create(
-              builder, tokenLoc, commSourceChannel->getNumBuffers(),
-              tokenLoadType);
+            tokenLoc = NameLoc::get(StringAttr::get(funcOp.getContext(),
+                                                    commSourceChannel->srcName),
+                                    tokenLoc);
+          v = ttnvws::CreateTokenOp::create(builder, tokenLoc,
+                                            commSourceChannel->getNumBuffers(),
+                                            tokenLoadType);
           commChannel.tokens[consumerAsyncTaskId] = v;
         }
 
         if (useGen5Barrier &&
             !commChannel.consumerBarriers.count(consumerAsyncTaskId)) {
-          Value v = createBarrierAlloc(funcOp, commSourceChannel->getNumBuffers(),
-                                       commSourceChannel->srcName);
+          Value v =
+              createBarrierAlloc(funcOp, commSourceChannel->getNumBuffers(),
+                                 commSourceChannel->srcName);
           commChannel.consumerBarriers[consumerAsyncTaskId] = v;
         }
       }

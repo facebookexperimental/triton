@@ -1153,69 +1153,32 @@ static int getLoopStage(Operation *op) {
   return attr ? attr.getValue().getSExtValue() : -1;
 }
 
+static unsigned getSmemCrossStageDepth(Operation *alloc,
+                                       SmallVector<Channel *> &channels);
+
 static int getLoopCluster(Operation *op) {
   auto attr = op->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
   return attr ? attr.getValue().getSExtValue() : -1;
 }
 
 /// Check if a channel's actual consumers are in different loop.stage values.
-/// The producer stage is not considered because it may be in a different
-/// partition. We follow through memdesc_trans operations to find the actual
-/// consumers. Only returns true if the buffer is updated inside the innermost
-/// loop (srcOp has loop.stage).
+/// This is derived from the computed cross-stage depth so depth and boolean
+/// classification cannot drift.
 static bool isSmemCrossStage(Operation *alloc,
                              SmallVector<Channel *> &channels) {
-  Channel *ch = findChannelForOp(alloc, channels);
-  if (!ch || ch->channelKind != DataChannelKind::SMEMPost)
-    return false;
-
-  // Check that the source (producer) is inside the innermost loop.
-  // If srcOp doesn't have loop.stage, the buffer is written outside the loop
-  // and doesn't need double-buffering.
-  Operation *srcOp = ch->getSrcOp();
-  if (!srcOp)
-    return false;
-  int srcStage = getLoopStage(srcOp);
-  if (srcStage < 0)
-    return false;
-
-  SmallVector<Operation *> dstOps;
-  ch->getDstOps(dstOps);
-  if (dstOps.empty()) {
-    if (Operation *dst = ch->getDstOp())
-      dstOps.push_back(dst);
-  }
-
-  // Collect all actual consumers by following through memdesc_trans operations.
-  SmallVector<Operation *> actualConsumers;
-  for (Operation *dstOp : dstOps) {
-    auto consumers = getActualConsumers(dstOp);
-    for (auto *consumer : consumers)
-      actualConsumers.push_back(consumer);
-  }
-
-  // Check if actual consumers are in different stages.
-  int firstConsumerStage = -1;
-  for (Operation *consumer : actualConsumers) {
-    int stage = getLoopStage(consumer);
-    if (stage >= 0) {
-      if (firstConsumerStage < 0) {
-        firstConsumerStage = stage;
-      } else if (stage != firstConsumerStage) {
-        return true;
-      }
-    }
-  }
-  return false;
+  return getSmemCrossStageDepth(alloc, channels) > 1;
 }
 
 /// Compute the cross-stage depth required for an SMEM buffer: the number of
 /// pipeline stages its live range spans, i.e.
 ///   max(maxConsumerStage - minConsumerStage + 1, 1).
 /// A genuine cross-stage buffer (consumers in >=2 distinct stages) yields >=2;
-/// everything else yields 1. Mirrors isSmemCrossStage: only buffers updated
-/// inside the innermost loop (srcOp has loop.stage) can be cross-stage, so a
-/// producer outside the loop yields depth 1.
+/// everything else yields 1. Only buffers updated inside the innermost loop
+/// (srcOp has loop.stage) can be cross-stage, so a producer outside the loop
+/// yields depth 1. Consumers without loop.stage do not contribute to the span:
+/// an in-loop producer with only post-loop or otherwise un-staged consumers has
+/// no in-loop consumer/release cycle that requires multiple live slots, so its
+/// correctness depth is 1.
 static unsigned getSmemCrossStageDepth(Operation *alloc,
                                        SmallVector<Channel *> &channels) {
   Channel *ch = findChannelForOp(alloc, channels);
@@ -1309,19 +1272,6 @@ static unsigned computeTotalSmem(const SmallVector<WSBuffer> &wsBuffers) {
   unsigned total = 0;
   for (auto &kv : idInfo)
     total += kv.second.first * kv.second.second;
-  return total;
-}
-
-/// Compute the actual SMEM cost of TMA store staging buffers. Each entry
-/// is a separate physical alloc (they are NOT merged downstream), so count
-/// numEntries × size × copies, not max(size) × copies.
-static unsigned
-computeTMAStoreStagingSmem(const SmallVector<WSBuffer> &wsBuffers) {
-  unsigned total = 0;
-  for (const auto &buf : wsBuffers) {
-    if (buf.tmaStaging > 0 && buf.isAllocated)
-      total += buf.sizeBytes * buf.numCopies;
-  }
   return total;
 }
 
@@ -1617,7 +1567,7 @@ findReuseCandidate(WSBuffer &candidate, SmallVector<WSBuffer> &wsBuffers,
 /// New SMEM allocation: Phases 1–5.
 ///
 /// Phase 1: Create one WSBuffer per local_alloc, all copy=1, unique IDs.
-/// Phase 2: Enforce cross-stage minimum (copy >= 2).
+/// Phase 2: Enforce computed cross-stage correctness floors.
 /// Phase 3: Classify into priority levels P0/P1/P2.
 /// Phase 4: Iterative copy increase within SMEM budget.
 /// Phase 5: Emit buffer.id and buffer.copy attributes.
@@ -1708,20 +1658,36 @@ static unsigned allocateSmemBuffers(
   // the backstop) rather than silently downgrading to a deadlocking depth 1.
   for (auto &buf : wsBuffers) {
     if (buf.isPinned) {
-      if (buf.isCrossStage && buf.numCopies < 2) {
+      unsigned depth = getSmemCrossStageDepth(buf.allocOp, channels);
+      if (buf.numCopies < depth) {
+        buf.allocOp->emitWarning()
+            << "annotated cross-stage SMEM buffer has buffer.copy="
+            << buf.numCopies << ", below required cross-stage depth=" << depth
+            << "; preserving the annotation";
         LDBG("WARNING: pinned WSBuffer["
-             << buf.bufferId << "] is cross-stage but has numCopies="
-             << buf.numCopies << " — this may cause correctness issues"
-             << " (producer may overwrite before consumer reads)");
+             << buf.bufferId << "] has numCopies=" << buf.numCopies
+             << " below required cross-stage depth=" << depth
+             << " - preserving annotation");
       }
       continue;
     }
-    if (buf.isCrossStage && numBuffers >= 2) {
+    if (buf.isCrossStage) {
       // floor = span of pipeline stages the buffer is live across (>=2 for a
-      // genuine cross-stage buffer; max(span, 1) otherwise), capped at the
-      // pipeline depth (numBuffers).
+      // genuine cross-stage buffer; max(span, 1) otherwise). This is a
+      // correctness floor, so it is enforced even if it exceeds the
+      // user-requested numBuffers cap for discretionary buffering.
       unsigned depth = getSmemCrossStageDepth(buf.allocOp, channels);
-      unsigned floor = std::min(depth, numBuffers);
+      unsigned floor = depth;
+      if (floor > numBuffers) {
+        buf.allocOp->emitWarning()
+            << "cross-stage SMEM buffer requires buffer.copy=" << floor
+            << ", exceeding configured num-buffers=" << numBuffers
+            << "; enforcing the correctness floor";
+        LDBG("WARNING: WSBuffer["
+             << buf.bufferId << "] cross-stage floor " << floor
+             << " exceeds configured numBuffers=" << numBuffers
+             << " - enforcing correctness floor");
+      }
       buf.minCopies = std::max(buf.minCopies, floor);
       buf.numCopies = std::max(buf.numCopies, buf.minCopies);
     }
@@ -1833,6 +1799,19 @@ static unsigned allocateSmemBuffers(
   // — dropping a floor reintroduces the producer/consumer slot collision that
   // deadlocks at runtime. The hardware SMEM limit (an OutOfResources at
   // codegen) is the backstop.
+  unsigned postReuseTotal = computeTotalSmem(wsBuffers);
+  if (postReuseTotal > smemBudget) {
+    funcOp.emitWarning()
+        << "SMEM allocation requires " << postReuseTotal
+        << " bytes after discretionary reuse, exceeding configured "
+           "smem-budget="
+        << smemBudget
+        << "; preserving cross-stage correctness floors and leaving the "
+           "hardware SMEM limit as the final backstop";
+    LDBG("WARNING: post-reuse SMEM " << postReuseTotal << " exceeds budget "
+                                     << smemBudget
+                                     << " - preserving correctness floors");
+  }
 
   // ── Phase 4: Iterative copy increase ────────────────────────────────
   // Process P0 then P1. P2 is never increased.
@@ -1871,19 +1850,29 @@ static unsigned allocateSmemBuffers(
       // B shares A's buffer.id.
       bufB.bufferId = bufA.bufferId;
 
-      // Compute starting copies for the group based on cross-stage.
-      // A reuse group with a cross-stage buffer needs 3 copies minimum:
-      // 2 for the pair (one per buffer) + 1 for double-buffering the
-      // cross-stage read.
-      bool hasCrossStage = bufA.isCrossStage || bufB.isCrossStage;
-      unsigned groupStart = std::min(hasCrossStage ? 3u : 1u, numBuffers);
+      // Compute starting copies for the group from the already-enforced
+      // per-buffer floors. A reuse group with a member needing N individual
+      // copies needs 2*N-1 group copies so that member still has N effective
+      // slots after interleaving with its partner.
+      unsigned maxMinCopies = std::max(bufA.minCopies, bufB.minCopies);
+      unsigned groupStart = maxMinCopies >= 2 ? (2 * maxMinCopies - 1) : 1;
+      if (groupStart > numBuffers) {
+        bufA.allocOp->emitWarning()
+            << "cross-stage SMEM reuse group requires buffer.copy="
+            << groupStart << ", exceeding configured num-buffers=" << numBuffers
+            << "; enforcing the correctness floor";
+        LDBG("WARNING: reuse group ["
+             << bufA.bufferId << "] cross-stage floor " << groupStart
+             << " exceeds configured numBuffers=" << numBuffers
+             << " - enforcing correctness floor");
+      }
 
       bufA.numCopies = groupStart;
       bufB.numCopies = groupStart;
 
       LDBG("Phase 4: formed reuse group ["
            << bufA.bufferId << "] with startCopies=" << groupStart
-           << " (crossStage=" << hasCrossStage << ")");
+           << " (maxMinCopies=" << maxMinCopies << ")");
     }
 
     // Step 1: Incremental loop.

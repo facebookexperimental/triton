@@ -1,4 +1,5 @@
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
+// RUN: sed '/%qkT_80 = ttng.tc_gen5_mma/s/, loop.stage = [0-9] : i32//; /%dk_103 = ttng.tc_gen5_mma/s/, loop.stage = [0-9] : i32//' %s | triton-opt - --nvgpu-test-ws-memory-planner=num-buffers=1 --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=OUTSIDE-CONSUMERS
 
 // Test case: Cross-stage consumer detection for SMEM buffers
 //
@@ -22,6 +23,10 @@
 //   - Write (local_store): NO loop.stage (outside innermost loop)
 //   - Even though consumers are at different stages, the buffer is not updated
 //     inside the innermost loop, so it does NOT need double-buffering
+//
+// The OUTSIDE-CONSUMERS variant strips loop.stage from q's two actual
+// consumers while keeping q's producer staged. With no staged consumers,
+// q is outside the in-loop consumer/release cycle and keeps depth 1.
 
 // CHECK-LABEL: tt.func public @_attn_bwd_persist
 //
@@ -39,6 +44,9 @@
 //
 // SMEM: k store is outside innermost loop (no loop.stage), NOT cross-stage
 // CHECK: %k = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32}
+
+// OUTSIDE-CONSUMERS-LABEL: tt.func public @_attn_bwd_persist
+// OUTSIDE-CONSUMERS: %q = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 2 : i32}
 
 // -----// WarpSpec internal IR Dump After: doBufferAllocation
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
