@@ -1,4 +1,5 @@
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
+// RUN: sed 's/opndB,smem,2,1/opndB,smem,1,1/g' %s | triton-opt - --nvgpu-test-ws-memory-planner=num-buffers=2 --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=PINNED-WARN
 
 // Test case: Memory planner with user-provided tt.autows channel annotations.
 //
@@ -64,6 +65,10 @@
 //
 // SMEM: k pinned by annotation (qkT opndA) → buffer.id=0, buffer.copy=1
 // CHECK: %k = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 0 : i32}
+
+// PINNED-WARN: warning: annotated cross-stage SMEM buffer has buffer.copy=1, below required cross-stage depth=2; preserving the annotation
+// PINNED-WARN-LABEL: tt.func public @_attn_bwd_persist
+// PINNED-WARN: %q = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 1 : i32}
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>

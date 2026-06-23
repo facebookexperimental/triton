@@ -47,32 +47,20 @@ The merged TMA store group is treated as a P2_Other epilogue group.
 `increaseFusedEpilogueCopies` iteratively increases copies (up to
 `numBuffers`) while checking `computeTotalSmem ≤ smemBudget`.
 
-Since `computeTotalSmem` excludes `isTMAStoreStaging` buffers from its
-total, the budget check is effectively a no-op — copies always increase
-to `numBuffers`. This is by design: TMA store staging buffers live
-outside the pipelined inner loop and don't compete with channel buffers
-for pipeline depth.
+`computeTotalSmem` accounts for the active `buffer.id` groups using
+`max(size) × copies` per ID. For TMA store staging groups this matches the
+planner's reuse model, but the downstream physical allocation still leaves
+each staging alloc as a separate op.
 
-### Phase 4.6: Combined SMEM Budget Validation
+### Combined SMEM Cost
 
-After Phase 4.5, the combined SMEM cost is checked:
+If the planner needs an exact hardware-SMEM accounting pass for TMA store
+staging, the cost needs per-entry accounting because the allocs are NOT merged
+into one physical alloc downstream:
 
 ```
-channelSmem = computeTotalSmem(wsBuffers)           // excludes TMA staging
-tmaStoreSmem = computeTMAStoreStagingSmem(wsBuffers) // per-entry counting
-if (channelSmem + tmaStoreSmem > smemBudget):
-    cap all isTMAStoreStaging copies to 1
+tmaStoreSmem = numEntries * size * copies
 ```
-
-`computeTMAStoreStagingSmem` counts `numEntries × size × copies` (not
-`max(size) × copies`) because the allocs are NOT merged into one physical
-alloc downstream.
-
-This prevents SMEM overflow for tight-budget configs where Phase 4.5
-would otherwise increase TMA staging copies unchecked. For example:
-BWD config 1 (BLOCK_M1=64, EPILOGUE_SUBTILE=2) has 4 TMA store staging
-allocs of 16KB each — at 2 copies this is 128KB, exceeding the budget.
-Phase 4.6 caps copies to 1 (64KB), fitting within hardware limits.
 
 ### Phase 6: Hoist Before Outermost Loop
 
