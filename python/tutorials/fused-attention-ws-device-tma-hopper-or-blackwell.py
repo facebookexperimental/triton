@@ -4,7 +4,11 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _reduce_fadd2
+from triton.language.extra.cuda.inline_ptx_lib import (
+    _mul_f32x2,
+    _fma_f32x2,
+    _reduce_fadd2,
+)
 from triton.tools.tensor_descriptor import TensorDescriptor
 import os
 
@@ -1265,6 +1269,9 @@ class _attention_opt(torch.autograd.Function):
 
         ctx.grid = grid
         persistent = baseVariant == "persistent" or baseVariant == "ws_persistent"
+        # Enable Meta's warp-specialization path so the run command does not need
+        # TRITON_USE_META_WS=1 in the environment.
+        triton.knobs.nvidia.use_meta_ws = True
         if is_blackwell() and warp_specialize:
             extra_kern_args["maxnreg"] = 128
         if persistent:
@@ -1409,6 +1416,9 @@ class _attention_opt(torch.autograd.Function):
                 BATCH * N_HEAD,
             )  # batch*heads
 
+        # Enable Meta's warp-specialization path so the run command does not need
+        # TRITON_USE_META_WS=1 in the environment.
+        triton.knobs.nvidia.use_meta_ws = True
         if ctx.persistent:
             NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
@@ -1523,9 +1533,9 @@ def test_op(
         _attn_bwd.configs = [configs_bwd_persist[bwd_config_idx]]
         _attn_bwd.cache = {}
     torch.manual_seed(20)
-    q = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
-    k = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
-    v = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
+    q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    v = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
     sm_scale = 0.5
     # reference implementation
     ref_dtype = dtype
@@ -1569,7 +1579,7 @@ def test_op(
     rtol = 0.0
     # Relative tolerance workaround for known hardware limitation of CDNA2 GPU.
     # For details see https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
-    if torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a":
+    if (torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a"):
         rtol = 1e-2
     torch.testing.assert_close(tri_dv, ref_dv, atol=1e-2, rtol=rtol)
     torch.testing.assert_close(tri_dk, ref_dk, atol=1e-2, rtol=rtol)
