@@ -25,6 +25,22 @@ namespace tlx = triton::tlx;
 namespace amdgpu = triton::amdgpu;
 namespace ttag = triton::amdgpu;
 
+// Construct a CGAEncodingAttr from legacy (CTAsPerCGA, CTASplitNum, CTAOrder)
+// params. The single-CTA case must go through get1CTALayout: feeding all-1
+// params to CGAEncodingAttr::fromSplitParams builds a layout whose out-dims
+// don't survive transposeOuts, tripping a fatal LinearLayout assert.
+static ttg::CGAEncodingAttr makeCGALayout(mlir::MLIRContext *ctx,
+                                          llvm::ArrayRef<unsigned> CTAsPerCGA,
+                                          llvm::ArrayRef<unsigned> CTASplitNum,
+                                          llvm::ArrayRef<unsigned> CTAOrder) {
+  unsigned rank = CTAsPerCGA.size();
+  bool isSingleCTA = llvm::all_of(CTAsPerCGA, [](unsigned c) { return c == 1; });
+  if (isSingleCTA)
+    return ttg::CGAEncodingAttr::get1CTALayout(ctx, rank);
+  return ttg::CGAEncodingAttr::fromSplitParams(ctx, CTAsPerCGA, CTASplitNum,
+                                               CTAOrder);
+}
+
 void init_triton_tlx_ir(py::module &&m) {
   auto *builder_cls = ir::getBuilderClass();
   builder_cls
@@ -169,7 +185,7 @@ void init_triton_tlx_ir(py::module &&m) {
              assert(order.size() == CTASplitNum.size() && "shape mismatch");
              assert(order.size() == CTAOrder.size() && "shape mismatch");
              auto context = self.getBuilder().getContext();
-             auto CTALayout = ttg::CGAEncodingAttr::fromSplitParams(
+             auto CTALayout = makeCGALayout(
                  context, CTAsPerCGA, CTASplitNum, CTAOrder);
              return mlir::cast<Attribute>(ttg::SwizzledSharedEncodingAttr::get(
                  context, vectorSize, perPhase, maxPhase, order, CTALayout));
@@ -189,7 +205,7 @@ void init_triton_tlx_ir(py::module &&m) {
              intervalPads.reserve(intervals.size());
              for (auto [i, p] : llvm::zip(intervals, paddings))
                intervalPads.emplace_back(i, p);
-             auto CTALayout = ttg::CGAEncodingAttr::fromSplitParams(
+             auto CTALayout = makeCGALayout(
                  context, CTAsPerCGA, CTASplitNum, CTAOrder);
              return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
                  context, intervalPads, order, shape, CTALayout));
@@ -225,7 +241,7 @@ void init_triton_tlx_ir(py::module &&m) {
              /* Validation logic for user defined layout encoding end */
 
              auto context = self.getBuilder().getContext();
-             auto CTALayout = ttg::CGAEncodingAttr::fromSplitParams(
+             auto CTALayout = makeCGALayout(
                  context, CTAsPerCGA, CTASplitNum, CTAOrder);
              if (swizzled) {
                return mlir::cast<Attribute>(ttg::NVMMASharedEncodingAttr::get(
@@ -258,7 +274,7 @@ void init_triton_tlx_ir(py::module &&m) {
              SmallVector<unsigned, 2> CTAsPerCGA = {1, 1};
              SmallVector<unsigned, 2> CTASplitNum = {1, 1};
              SmallVector<unsigned, 2> CTAOrder = {1, 0};
-             auto CTALayout = ttg::CGAEncodingAttr::fromSplitParams(
+             auto CTALayout = makeCGALayout(
                  context, CTAsPerCGA, CTASplitNum, CTAOrder);
              return tlx::wrapNoVerifyLayout(mlir::cast<Attribute>(
                  ttg::NvidiaMmaEncodingAttr::get(context, versionMajor,

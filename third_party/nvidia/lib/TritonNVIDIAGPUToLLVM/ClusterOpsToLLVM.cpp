@@ -21,17 +21,118 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include "Dialect/NVGPU/IR/Dialect.h"
 #include "PatternTritonGPUOpToLLVM.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
 using namespace mlir::triton;
 
 namespace {
+static void createClusterArrive(OpBuilder &b, Location loc, bool relaxed) {
+  auto unitAttr = UnitAttr::get(b.getContext());
+  if (relaxed)
+    NVVM::ClusterArriveRelaxedOp::create(b, loc, unitAttr);
+  else
+    NVVM::ClusterArriveOp::create(b, loc, unitAttr);
+}
+
+static void createClusterWait(OpBuilder &b, Location loc) {
+  NVVM::ClusterWaitOp::create(b, loc, UnitAttr::get(b.getContext()));
+}
+
+template <typename EmitFn>
+LogicalResult lowerClusterSyncForAllWarps(Operation *op,
+                                          ConversionPatternRewriter &rewriter,
+                                          EmitFn emit) {
+  auto loc = op->getLoc();
+  auto mod = op->getParentOfType<ModuleOp>();
+  if (!mod)
+    return rewriter.notifyMatchFailure(op, "expected parent module");
+
+  // Emit the cluster sync directly (no warp_specialize wrapping) when either:
+  //  (a) it is already inside a warp_specialize region (e.g. the user placed
+  //      cluster_barrier() inside each async_task so every warp group
+  //      participates). The warp split already happened, so every warp of the
+  //      current region executes it; wrapping again would form an illegal
+  //      nested ttg.warp_specialize. OR
+  //  (b) the kernel carries the cluster-sync-kernel-init marker -- the
+  //      entry-block cluster sync inserted by maybeInsertClusterSync. For that
+  //      sync, ConvertWarpSpecializeToLLVM already emits the non-default warps'
+  //      "@!isDefault barrier.cluster.arrive" at WS entry. Wrapping here too
+  //      would double-count worker participation: the extra worker arrive
+  //      imbalances the cluster barrier (deadlock) and adds a spurious worker
+  //      wait.
+  if (op->getParentOfType<triton::gpu::WarpSpecializeOp>() ||
+      mlir::triton::tlx::hasClusterSyncKernelInit(op)) {
+    rewriter.setInsertionPoint(op);
+    emit(rewriter);
+    rewriter.eraseOp(op);
+    return success();
+  }
+
+  auto defaultNumWarps = triton::gpu::maybeLookupNumWarps(op);
+  if (!defaultNumWarps)
+    return rewriter.notifyMatchFailure(op, "missing contextual num-warps");
+  int totalNumWarps = *defaultNumWarps;
+  if (auto totalNumWarpsAttr =
+          mod->getAttrOfType<IntegerAttr>("ttg.total-num-warps"))
+    totalNumWarps = totalNumWarpsAttr.getInt();
+  int workerNumWarps = totalNumWarps - *defaultNumWarps;
+  if (workerNumWarps < 0)
+    return rewriter.notifyMatchFailure(op, "invalid total/default num-warps");
+
+  rewriter.setInsertionPoint(op);
+  if (workerNumWarps == 0) {
+    emit(rewriter);
+    rewriter.eraseOp(op);
+    return success();
+  }
+
+  SmallVector<int32_t> partitionNumWarps;
+  for (int remainingWarps = workerNumWarps; remainingWarps > 0;) {
+    int32_t partitionWarps =
+        llvm::bit_floor(static_cast<uint32_t>(remainingWarps));
+    partitionNumWarps.push_back(partitionWarps);
+    remainingWarps -= partitionWarps;
+  }
+
+  auto wsOp = triton::gpu::WarpSpecializeOp::create(rewriter, loc, TypeRange{},
+                                                    partitionNumWarps);
+  SmallVector<int32_t> startIds;
+  int startId = *defaultNumWarps;
+  for (int32_t partitionWarps : partitionNumWarps) {
+    startIds.push_back(startId);
+    startId += partitionWarps;
+  }
+  wsOp.setWarpGroupStartIds(startIds);
+
+  Block *defaultBlock = rewriter.createBlock(&wsOp.getDefaultRegion());
+  rewriter.setInsertionPointToEnd(defaultBlock);
+  emit(rewriter);
+  triton::gpu::WarpYieldOp::create(rewriter, loc, TypeRange(), ValueRange());
+
+  Block *partitionHolder = rewriter.createBlock(&wsOp.getPartitionOpHolder());
+  rewriter.setInsertionPointToStart(partitionHolder);
+  auto partitions = triton::gpu::WarpSpecializePartitionsOp::create(
+      rewriter, loc, ValueRange(),
+      /*numPartitionRegions=*/partitionNumWarps.size());
+  for (Region &partitionRegion : partitions.getPartitionRegions()) {
+    Block *partitionBlock = rewriter.createBlock(&partitionRegion);
+    rewriter.setInsertionPointToEnd(partitionBlock);
+    emit(rewriter);
+    triton::gpu::WarpReturnOp::create(rewriter, loc);
+  }
+
+  rewriter.eraseOp(op);
+  return success();
+}
+
 struct ClusterArriveOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::ClusterArriveOp> {
   using ConvertOpToLLVMPattern<
@@ -40,14 +141,9 @@ struct ClusterArriveOpConversion
   LogicalResult
   matchAndRewrite(triton::nvidia_gpu::ClusterArriveOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto ctx = rewriter.getContext();
-    auto unitAttr = UnitAttr::get(ctx);
-    if (op.getRelaxed()) {
-      rewriter.replaceOpWithNewOp<NVVM::ClusterArriveRelaxedOp>(op, unitAttr);
-    } else {
-      rewriter.replaceOpWithNewOp<NVVM::ClusterArriveOp>(op, unitAttr);
-    }
-    return success();
+    return lowerClusterSyncForAllWarps(op, rewriter, [&](OpBuilder &b) {
+      createClusterArrive(b, op.getLoc(), op.getRelaxed());
+    });
   }
 };
 
@@ -59,9 +155,23 @@ struct ClusterWaitOpConversion
   LogicalResult
   matchAndRewrite(triton::nvidia_gpu::ClusterWaitOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto ctx = rewriter.getContext();
-    rewriter.replaceOpWithNewOp<NVVM::ClusterWaitOp>(op, UnitAttr::get(ctx));
-    return success();
+    return lowerClusterSyncForAllWarps(
+        op, rewriter, [&](OpBuilder &b) { createClusterWait(b, op.getLoc()); });
+  }
+};
+
+struct ClusterBarrierOpConversion
+    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::ClusterBarrierOp> {
+  using ConvertOpToLLVMPattern<
+      triton::nvidia_gpu::ClusterBarrierOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::ClusterBarrierOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    return lowerClusterSyncForAllWarps(op, rewriter, [&](OpBuilder &b) {
+      createClusterArrive(b, op.getLoc(), op.getRelaxed());
+      createClusterWait(b, op.getLoc());
+    });
   }
 };
 
@@ -129,5 +239,6 @@ void mlir::triton::NVIDIA::populateClusterOpsToLLVMPatterns(
   patterns.add<ClusterWaitOpConversion>(typeConverter, benefit);
   patterns.add<ClusterSize1DOpConversion>(typeConverter, benefit);
   patterns.add<MapToRemoteBufferOpConversion>(typeConverter, benefit);
+  patterns.add<ClusterBarrierOpConversion>(typeConverter, benefit);
   return;
 }

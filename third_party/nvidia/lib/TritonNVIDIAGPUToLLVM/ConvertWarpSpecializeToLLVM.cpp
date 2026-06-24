@@ -1,5 +1,4 @@
 #include "TargetInfo.h"
-#include "TritonNVIDIAGPUToLLVM/PTXAsmFormat.h"
 #include "Utility.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Conversion/Passes.h"
@@ -8,7 +7,6 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/Pass/PassManager.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Passes.h"
 #include "triton/Conversion/TritonGPUToLLVM/TypeConverter.h"
@@ -46,7 +44,7 @@ public:
       : numThreadsPerWarp(numThreadsPerWarp) {}
 
   bool isBarrierOp(Operation *op) const override {
-    return isa<NVVM::Barrier0Op>(op);
+    return isa<NVVM::BarrierOp>(op);
   }
 
   Type getBarrierHandleType(MLIRContext *ctx) const override {
@@ -77,10 +75,7 @@ public:
     if (numThreads == 32) {
       LLVM::NVIDIA::createSyncWarp(b.getLoc(), b);
     } else {
-      NVVM::BarrierOp::create(b, b.getLoc(), mlir::TypeRange{}, handle,
-                              b.i32_val(numThreads),
-                              /*reductionOp=*/nullptr,
-                              /*reductionPredicate=*/nullptr);
+      NVVM::BarrierOp::create(b, b.getLoc(), handle, b.i32_val(numThreads));
     }
   }
 

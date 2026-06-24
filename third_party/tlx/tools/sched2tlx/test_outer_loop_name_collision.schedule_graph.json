@@ -1,0 +1,160 @@
+{
+  "schema_version": "0.1",
+  "kernel": {
+    "name": "repro_name_collision",
+    "args": []
+  },
+  "ops": {
+    "loop_bound_mul": {
+      "kind": "arith.muli",
+      "scope": "function",
+      "operands": [
+        {
+          "const": 4,
+          "type": "i32"
+        },
+        {
+          "const": 8,
+          "type": "i32"
+        }
+      ],
+      "result_types": [
+        "i32"
+      ],
+      "attributes": {}
+    },
+    "inner_for": {
+      "kind": "scf.for",
+      "scope": "loop:1",
+      "operands": [],
+      "result_types": [],
+      "attributes": {}
+    },
+    "body_off_mul": {
+      "kind": "arith.muli",
+      "scope": "loop:1",
+      "operands": [
+        {
+          "iv": 1
+        },
+        {
+          "const": 128,
+          "type": "i32"
+        }
+      ],
+      "result_types": [
+        "i32"
+      ],
+      "attributes": {}
+    },
+    "epilogue_store": {
+      "kind": "tt.descriptor_store",
+      "scope": "loop:1",
+      "operands": [
+        {
+          "arg": "out"
+        },
+        {
+          "const": 0,
+          "type": "tensor<128x128xf16>"
+        },
+        {
+          "op": "body_off_mul"
+        }
+      ],
+      "result_types": [],
+      "attributes": {}
+    }
+  },
+  "loops": [
+    {
+      "loop_id": 0,
+      "is_outer": false,
+      "warp_groups": [],
+      "schedule_loop": {
+        "id": 0,
+        "II": 1,
+        "max_stage": 0,
+        "induction_var": {
+          "name": "iv",
+          "type": "i32"
+        },
+        "lower_bound": {
+          "const": 0,
+          "type": "i32"
+        },
+        "upper_bound": {
+          "const": 4,
+          "type": "i32"
+        },
+        "step": {
+          "const": 1,
+          "type": "i32"
+        },
+        "buffers": [],
+        "graph": {
+          "nodes": [],
+          "edges": [],
+          "cross_wg_barriers": []
+        }
+      }
+    },
+    {
+      "loop_id": 1,
+      "is_outer": true,
+      "warp_groups": [
+        {
+          "id": 0,
+          "num_warps": 4,
+          "pipelines": [
+            "TMA"
+          ]
+        }
+      ],
+      "schedule_loop": {
+        "id": 1,
+        "II": 1,
+        "max_stage": 0,
+        "induction_var": {
+          "name": "iv",
+          "type": "i32"
+        },
+        "lower_bound": {
+          "const": 0,
+          "type": "i32"
+        },
+        "upper_bound": {
+          "op": "loop_bound_mul"
+        },
+        "step": {
+          "const": 1,
+          "type": "i32"
+        },
+        "buffers": [],
+        "graph": {
+          "nodes": [
+            {
+              "id": 0,
+              "op_ref": "inner_for",
+              "op_kind": "scf.for",
+              "warp_group": 0,
+              "child_pipeline_id": 0,
+              "produces_buffer": null,
+              "consumes_buffers": []
+            },
+            {
+              "id": 1,
+              "op_ref": "epilogue_store",
+              "op_kind": "tt.descriptor_store",
+              "warp_group": 0,
+              "produces_buffer": null,
+              "consumes_buffers": []
+            }
+          ],
+          "edges": [],
+          "cross_wg_barriers": []
+        }
+      }
+    }
+  ]
+}

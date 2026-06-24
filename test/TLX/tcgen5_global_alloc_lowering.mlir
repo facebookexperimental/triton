@@ -18,7 +18,7 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
   // CHECK: nvvm.cluster.arrive {aligned}
   // CHECK: nvvm.cluster.wait {aligned}
   // CHECK: tcgen05.alloc.cta_group::2
-  // CHECK: nvvm.barrier0
+  // CHECK: nvvm.barrier
   // CHECK: tcgen05.relinquish_alloc_permit.cta_group::2
   // CHECK: nvvm.cluster.arrive {aligned}
   // CHECK: nvvm.cluster.wait {aligned}

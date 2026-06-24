@@ -775,8 +775,6 @@ lowerLocalLdSt(Location loc, MLIRContext *ctx,
                SharedMemoryObject smemObj, RewriterBase &rewriter,
                const TargetInfoBase &targetInfo, Operation *localLoadOp,
                std::optional<Value> ctaRank, std::optional<Value> barrierPtr) {
-  assert(cvt.getNumOutDims() == 1);
-  assert(*cvt.getOutDimNames().begin() == str_attr("offset"));
 
   auto isStore = !valsArray.empty();
   // Remove broadcasting in the registers
@@ -1299,7 +1297,7 @@ Value getGlobalScratchPtr(Location loc, RewriterBase &rewriter,
   ModuleOp mod = funcOp.getOperation()->getParentOfType<ModuleOp>();
   auto allocSizeAttr = mod.getOperation()->getAttrOfType<mlir::IntegerAttr>(
       "ttg.global_scratch_memory_size");
-  if (!allocSizeAttr) {
+  if (!allocSizeAttr || allocSizeAttr.getValue().isZero()) {
     return gmemBase;
   }
 
@@ -1769,8 +1767,8 @@ SmallVector<Value> inlineRegionImpl(RewriterBase &rewriter, Region &region,
   return vals;
 }
 
-std::tuple<Block *, Block *, Block *>
-createIfBlock(ConversionPatternRewriter &b, Location loc, Value cnd) {
+std::tuple<Block *, Block *, Block *> createIfBlock(RewriterBase &b,
+                                                    Location loc, Value cnd) {
   Block *prevBlock = b.getInsertionBlock();
   Block *ifBlock = b.splitBlock(prevBlock, b.getInsertionPoint());
 

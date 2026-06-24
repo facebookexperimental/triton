@@ -104,7 +104,8 @@ using LinearEncodingCache = Cache<CacheKey, LinearEncodingAttr>;
 
 namespace mlir::triton::gpu {
 struct SharedMemory : public SideEffects::Resource::Base<SharedMemory> {
-  StringRef getName() final { return "<SharedMemory>"; }
+  StringRef getName() const final { return "<SharedMemory>"; }
+  SideEffects::Resource *getParent() const override { return nullptr; }
 };
 
 // Convert a distributed layout to a linear encoding
@@ -330,6 +331,8 @@ SetVector<int> getPartitionIds(OpOperand *use);
 bool hasPartition(Operation *op);
 bool hasWarpSpecializeTag(Operation *op);
 std::optional<int> getWarpSpecializeTag(Operation *op);
+/// Returns the size in bytes of a scalar type when stored in shared memory.
+size_t getSharedMemorySize(Type type);
 
 // Extract the PaddedSharedEncodingAttr from an encoding, whether standalone
 // or wrapped inside a PartitionedSharedEncodingAttr. Returns nullptr if the

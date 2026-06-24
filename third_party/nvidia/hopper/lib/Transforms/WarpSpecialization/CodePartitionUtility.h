@@ -348,6 +348,15 @@ SmallVector<Channel *> orderReuseGroupN(ReuseGroup *group);
 // Returns true otherwise (explicit synchronization needed).
 bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel);
 
+// Returns true when `ownerCh` is the space owner of a reuse group and its
+// producer overwrites the whole physical allocation before writing, not just
+// its logical slice. Packed sibling slices can be clobbered by such a producer,
+// so the owner needs back-edges to sibling consumers that are live across the
+// repeated overwrite. Detection: the channel is the representative (its alloc
+// has no `buffer.offset`) and is a `TmemDataChannelPost` with
+// `isOperandDNoAcc`.
+bool isWholeAllocationOverwriteReuseOwner(Channel *ownerCh);
+
 } // namespace mlir
 
 #endif // NV_DIALECT_HOPPER_TRANSFORMS_CODEPARTITIONUTILITY_H_
