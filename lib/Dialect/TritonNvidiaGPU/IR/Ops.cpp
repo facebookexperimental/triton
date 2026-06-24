@@ -72,7 +72,7 @@ LogicalResult MapToRemoteBufferOp::verify() {
 // -- WarpGroupDotOp --
 LogicalResult WarpGroupDotOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
     SmallVectorImpl<Type> &inferredReturnTypes) {
   // type is the same as the accumulator
   auto accTy = cast<RankedTensorType>(operands[2].getType());
@@ -179,7 +179,7 @@ bool WarpGroupDotOp::verifyDims() {
 // -- WarpGroupDotWaitOp --
 LogicalResult WarpGroupDotWaitOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
     SmallVectorImpl<Type> &inferredReturnTypes) {
   for (Value operand : operands)
     inferredReturnTypes.push_back(operand.getType());
@@ -217,19 +217,33 @@ LogicalResult FenceMBarrierInitReleaseClusterOp::verify() {
 
 // -- ClusterArriveOp --
 LogicalResult ClusterArriveOp::verify() {
-  // FB: comment out these because we allow the op in frontend/ttir, where the
-  // ir does not have tlx cluster dim yet int numCTAs =
-  // triton::gpu::lookupNumCTAs(getOperation()); if (numCTAs <= 1)
-  //   return emitOpError("requires ttg.num-ctas > 1");
+  // FB: verifier intentionally relaxed. The numCTAs > 1 check is omitted
+  // because the TLX frontend emits this op in frontend/ttir before the cluster
+  // dim is known. The upstream #9456 "cannot be inside ttg.warp_specialize"
+  // restriction is also NOT enforced here: beta's automatic-warp-specialization
+  // and TLX Blackwell pipelines legitimately place ttng.cluster_arrive inside a
+  // ttg.warp_specialize region, and beta's ClusterArriveOpConversion lowers it
+  // there (all-warps wrapping). Enforcing the restriction made PassManager::run
+  // fail across the Blackwell autows/TLX targets.
   return success();
 }
 
 // -- ClusterWaitOp --
 LogicalResult ClusterWaitOp::verify() {
-  // FB: comment out these because we allow the op in frontend/ttir, where the
-  // ir does not have tlx cluster dim yet int numCTAs =
-  // triton::gpu::lookupNumCTAs(getOperation()); if (numCTAs <= 1)
-  //   return emitOpError("requires ttg.num-ctas > 1");
+  // FB: verifier intentionally relaxed (see ClusterArriveOp::verify).
+  return success();
+}
+
+// -- ClusterBarrierOp --
+LogicalResult ClusterBarrierOp::verify() {
+  // ClusterBarrierOp is backend-inserted (not emitted by beta lowering, which
+  // has no TargetInfo::clusterBarrier creator), so the full upstream check
+  // applies; it never runs on real beta IR.
+  int numCTAs = triton::gpu::lookupNumCTAs(getOperation());
+  if (numCTAs <= 1)
+    return emitOpError("requires ttg.num-ctas > 1");
+  if (getOperation()->getParentOfType<mlir::triton::gpu::WarpSpecializeOp>())
+    return emitOpError("cannot be used inside `ttg.warp_specialize`");
   return success();
 }
 
@@ -631,6 +645,16 @@ LogicalResult TCGen5MMAOp::verify() {
   if (!getIsAsync() && !getBarriers().empty()) {
     return emitOpError("The op is synchronous but a barrier is present.");
   }
+  for (auto barrier : getBarriers()) {
+    auto barrierTy = cast<MemDescType>(barrier.getType());
+    // FB/beta divergence: beta's TLX / warp-spec paths emit multi-dimensional
+    // tc_gen5_mma barriers (e.g. 1x1xi64), which verifyBarrierType (which
+    // models only the rank-1 `Nxi64` mbarrier form introduced upstream by
+    // #9474) does not understand. Only verify the rank-1 form; leave beta's
+    // higher-rank barriers unchecked here as they were before #9474.
+    if (barrierTy.getRank() == 1 && failed(verifyBarrierType(*this, barrierTy)))
+      return failure();
+  }
   Type atype = getA().getType().getElementType();
   Type btype = getB().getType().getElementType();
   Type dtype = getD().getType().getElementType();
@@ -838,6 +862,9 @@ LogicalResult TCGen5CommitOp::verify() {
   auto numDescs = getDescs().size();
   if (numDescs > 2)
     return emitOpError("expected 0, 1, or 2 descriptors, got ") << numDescs;
+  auto barrierTy = getBarrier().getType();
+  if (failed(verifyBarrierType(*this, barrierTy)))
+    return failure();
   return success();
 }
 
@@ -1036,6 +1063,9 @@ static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,
                                        MemDescType memdesc, StringRef regName) {
   if (type.getRank() != 2)
     return op->emitOpError(regName) << " must be a 2D tensor";
+  if (tlx::hasNoVerifyLayout(type.getEncoding()) ||
+      tlx::hasNoVerifyLayout(memdesc.getEncoding()))
+    return success();
   // Skip verification for placeholder layouts - they will be resolved later
   if (isa<triton::tlx::DummyTMEMLayoutAttr>(memdesc.getEncoding()))
     return success();

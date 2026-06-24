@@ -136,6 +136,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: @dot_reg_operand_A
   // Generate a wgmma where the first operand is a struct.
+  // CHECK: %[[A_MOV0:.*]] = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "mov.b32 $0, $1;", "=r,r" %{{.*}} : (i32) -> i32
+  // CHECK: %[[A_MOV1:.*]] = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "mov.b32 $0, $1;", "=r,r" %{{.*}} : (i32) -> i32
+  // CHECK: %[[A_MOV2:.*]] = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "mov.b32 $0, $1;", "=r,r" %{{.*}} : (i32) -> i32
+  // CHECK: %[[A_MOV3:.*]] = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "mov.b32 $0, $1;", "=r,r" %{{.*}} : (i32) -> i32
+  // CHECK: nvvm.wgmma.fence.aligned
+  // CHECK: %[[A_PACK0:.*]] = llvm.insertvalue %[[A_MOV0]], %{{.*}}[0] : !llvm.struct<(i32, i32, i32, i32)>
+  // CHECK: %[[A_PACK1:.*]] = llvm.insertvalue %[[A_MOV1]], %[[A_PACK0]][1] : !llvm.struct<(i32, i32, i32, i32)>
+  // CHECK: %[[A_PACK2:.*]] = llvm.insertvalue %[[A_MOV2]], %[[A_PACK1]][2] : !llvm.struct<(i32, i32, i32, i32)>
+  // CHECK: %[[A_PACK3:.*]] = llvm.insertvalue %[[A_MOV3]], %[[A_PACK2]][3] : !llvm.struct<(i32, i32, i32, i32)>
+  // CHECK: nvg.wgmma %[[A_PACK3]], %{{.*}}
   // CHECK: nvg.wgmma {{.*}} : (!llvm.struct<(i32, i32, i32, i32)>, i64, i1) -> !llvm.struct<(f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32)>
   // CHECK: nvg.wgmma_wait_group %{{.*}} {pendings = 0 : i32} : !llvm.struct<(f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32)>
   tt.func @dot_reg_operand_A(%a: tensor<128x64xf16, #mma>, %b: !ttg.memdesc<64x64xf16, #shared, #smem>) {
@@ -249,11 +259,11 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
 module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.threads-per-warp" = 32 : i32} {
   tt.func @convert_mma_to_blocked(%a: tensor<128x256xf16, #mma>) {
     // CHECK-COUNT-8: llvm.store
-    //          CHECK: nvvm.barrier0
+    //          CHECK: nvvm.barrier
     // CHECK-COUNT-8: nvvm.ldmatrix
-    //          CHECK: nvvm.barrier0
+    //          CHECK: nvvm.barrier
     // CHECK-COUNT-8: llvm.store
-    //          CHECK: nvvm.barrier0
+    //          CHECK: nvvm.barrier
     // CHECK-COUNT-8: nvvm.ldmatrix
     %c = ttg.convert_layout %a : tensor<128x256xf16, #mma> -> tensor<128x256xf16, #blocked>
     tt.return
@@ -267,19 +277,19 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
 module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.threads-per-warp" = 32 : i32} {
   tt.func @convert_mma_to_blocked(%a: tensor<128x64xbf16, #linear>) {
     // CHECK: llvm.store {{.*}} : vector<4xi32>
-    // CHECK: nvvm.barrier0
+    // CHECK: nvvm.barrier
     // CHECK: llvm.load {{.*}} -> vector<4xi32>
-    // CHECK: nvvm.barrier0
+    // CHECK: nvvm.barrier
     // CHECK: llvm.store {{.*}} : vector<4xi32>
-    // CHECK: nvvm.barrier0
+    // CHECK: nvvm.barrier
     // CHECK: llvm.load {{.*}} -> vector<4xi32>
-    // CHECK: nvvm.barrier0
+    // CHECK: nvvm.barrier
     // CHECK: llvm.store {{.*}} : vector<4xi32>
-    // CHECK: nvvm.barrier0
+    // CHECK: nvvm.barrier
     // CHECK: llvm.load {{.*}} -> vector<4xi32>
-    // CHECK: nvvm.barrier0
+    // CHECK: nvvm.barrier
     // CHECK: llvm.store {{.*}} : vector<4xi32>
-    // CHECK: nvvm.barrier0
+    // CHECK: nvvm.barrier
     // CHECK: llvm.load {{.*}} -> vector<4xi32>
     // CHECK-NOT: llvm.store
     // CHECK-NOT: llvm.load
@@ -297,19 +307,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: convert_blocked_to_dot_rhs
   tt.func @convert_blocked_to_dot_rhs(%a: tensor<64x64xf16, #blocked>) {
     // CHECK-COUNT-1: llvm.store
-    //          CHECK: nvvm.barrier0
+    //          CHECK: nvvm.barrier
     // CHECK-COUNT-4: nvvm.ldmatrix
-    //          CHECK: nvvm.barrier0
+    //          CHECK: nvvm.barrier
     // CHECK-COUNT-1: llvm.store
-    //          CHECK: nvvm.barrier0
+    //          CHECK: nvvm.barrier
     // CHECK-COUNT-4: nvvm.ldmatrix
-    //          CHECK: nvvm.barrier0
+    //          CHECK: nvvm.barrier
     // CHECK-COUNT-1: llvm.store
-    //          CHECK: nvvm.barrier0
+    //          CHECK: nvvm.barrier
     // CHECK-COUNT-4: nvvm.ldmatrix
-    //          CHECK: nvvm.barrier0
+    //          CHECK: nvvm.barrier
     // CHECK-COUNT-1: llvm.store
-    //          CHECK: nvvm.barrier0
+    //          CHECK: nvvm.barrier
     // CHECK-COUNT-4: nvvm.ldmatrix
     %b = ttg.convert_layout %a  : tensor<64x64xf16, #blocked> -> tensor<64x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>>
     tt.return

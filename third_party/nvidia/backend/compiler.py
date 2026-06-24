@@ -81,12 +81,12 @@ def get_ptx_version_from_options(options, arch: int):
 def get_features(options, arch: int):
     ptx_version = get_ptx_version_from_options(options, arch)
 
-    # PTX 8.6 is the max version supported by llvm c1188642.
+    # PTX 8.6 is the max version supported by llvm 979132a0.
     #
     # To check if a newer PTX version is supported, increase this value
     # and run a test.  If it's not supported, LLVM will print a warning
     # like "+ptx8.4 is not a recognized feature for this target".
-    llvm_ptx_version = min(86, ptx_version)
+    llvm_ptx_version = min(90, ptx_version)
     features = f"+ptx{llvm_ptx_version}"
     return features
 
@@ -874,6 +874,17 @@ class CUDABackend(BaseBackend):
         nvidia.passes.ttgpuir.add_to_llvmir(pm, capability, ptx_version)
         passes.ttgpuir.add_canonicalize_llvm_ir(pm)
         passes.common.add_cse(pm)
+        # FB/beta divergence: upstream #9535 ("Re-order WS lowering and NVGPU
+        # lowering") is fully reverted for beta. #9535 moved warp-id
+        # relativization out of NVGPUToLLVM into the WS pass and ran WS-to-llvm
+        # before nvgpu-to-llvm. On beta's diverged NVGPU/WS lowering that (a)
+        # crashes ConvertNVGPUToLLVM with "operand #0 does not dominate this use"
+        # on every Blackwell warp-specialized/TLX/autows kernel, and (b) leaves
+        # the NVGPU WarpIdOp lowering using an absolute (non-relative) tid inside
+        # warp-specialize regions, which silently miscompiles warpgroup reductions
+        # (e.g. test_warpgroup_reduction returns 0). Beta keeps the pre-#9535
+        # behavior: NVGPUToLLVM relativizes the warp-group tid and runs before WS
+        # lowering.
         nvidia.passes.ttnvgpuir.add_nvgpu_to_llvm(pm)
         nvidia.passes.ttnvgpuir.add_warp_specialize_to_llvm(pm)
         passes.common.add_canonicalizer(pm)
@@ -1083,24 +1094,39 @@ please share the reproducer above with Triton project.
     def apply_compile_iq_acf(self, ck):
         """compile_iq consumption (gated by TRITON_COMPILE_IQ_APPLY).
 
-        If cached PTX hits ACF store, ptxas a new cubin as pending candidate and
-        benchmark decides winner.
-
-        ACF makes no difference in launch API."""
+        If the PTX hits the ACF store, obtain the assembled ACF cubin -- loaded from the ACF store if
+        already cached there, else ptxas --apply-controls'd once and persisted back to the store
+        (skips re-ptxas on later processes) -- and stash it as a pending candidate. The first launch
+        runs a plain-vs-ACF A/B and keeps the winner. Cubins live in the compile_iq ACF store + in
+        memory only; Triton's compile cache stays plain. ACF makes no difference to the launch ABI."""
         if not os.environ.get("TRITON_COMPILE_IQ_APPLY"):
             return
         try:
             ptx = ck.asm.get("ptx")
             if not ptx:
                 return
+            from triton.compile_iq import store
             from triton.compile_iq.consume import acf_args_for
             arch = sm_arch_from_capability(self.target.arch)
-            controls = acf_args_for(ptx, arch, get_ptxas(self.target.arch).version)
-            if not controls:
-                return
-            # opt fields used by _ptxas_compile (enable_fp_fusion, ptx_options) live on ck.metadata
-            # (it is built from {**options.__dict__}); capability matches make_cubin (self.target.arch).
-            cubin = self._ptxas_compile(ptx, ck.metadata, self.target.arch, apply_controls=controls)
+            ver = get_ptxas(self.target.arch).version
+            sha = store.ptx_sha256(ptx)
+            # Reuse the assembled ACF cubin from the (separate) ACF store if present -- skips re-running
+            # ptxas --apply-controls on every process. Version-tagged: the cached cubin is only valid for
+            # the ptxas that produced it. Only the assembly is reused cross-process; the launch-time
+            # plain-vs-ACF A/B still re-runs per process (the win decision stays in-memory). This never
+            # touches Triton's compile cache (which stays plain) -- only the compile_iq ACF store.
+            cubin = store.read_acf_cubin(sha, arch, ver)
+            if cubin is None:
+                controls = acf_args_for(ptx, arch, ver)  # ACF-store hit + ptxas version gate
+                if not controls:
+                    return
+                # opt fields used by _ptxas_compile (enable_fp_fusion, ptx_options) live on ck.metadata
+                # (it is built from {**options.__dict__}); capability matches make_cubin (self.target.arch).
+                cubin = self._ptxas_compile(ptx, ck.metadata, self.target.arch, apply_controls=controls)
+                store.write_acf_cubin(sha, arch, ver, cubin)  # persist assembly -> skip ptxas next time
+                store.dlog("consume", f"assembled+cached ACF cubin {sha[:16]} {arch} ptxas={ver}")
+            else:
+                store.dlog("consume", f"loaded ACF cubin from store {sha[:16]} {arch} ptxas={ver}")
             ck._compile_iq_acf_cubin = cubin  # pending candidate; the launch-time A/B decides
         except Exception as e:
             # Fail-open: APPLY never breaks compilation. Warn ONCE under DEBUG so the common

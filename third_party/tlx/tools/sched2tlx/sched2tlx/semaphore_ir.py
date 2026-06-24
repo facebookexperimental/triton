@@ -134,20 +134,20 @@ def _classify_consumer_access(op_kind: str) -> AccessKind:
     if op_kind in ("ttng.tmem_load", "ttg.local_load"):
         return AccessKind.READ
     if op_kind in (
-            "ttng.tmem_store",
-            "ttg.local_store",
-            "tt.descriptor_load",
-            "ttng.async_tma_copy_global_to_local",
-            "ttg.local_alloc",
+        "ttng.tmem_store",
+        "ttg.local_store",
+        "tt.descriptor_load",
+        "ttng.async_tma_copy_global_to_local",
+        "ttg.local_alloc",
     ):
         return AccessKind.STORE
     # MMA: assume Read on accumulator (useD=true is typical for FA inner-loop
     # P@V; useD=false only on first iter — proven dynamically). For the
     # initial pass, default to UNKNOWN; AssignStagePhase refines.
     if op_kind in (
-            "ttng.tc_gen5_mma",
-            "ttng.tc_gen5_mma_scaled",
-            "ttng.warp_group_dot",
+        "ttng.tc_gen5_mma",
+        "ttng.tc_gen5_mma_scaled",
+        "ttng.warp_group_dot",
     ):
         return AccessKind.UNKNOWN
     # Pure ops (arith, math, reduce, broadcast) on a loaded value just read.
@@ -205,7 +205,11 @@ def derive_semaphores(loop: Any, graph: Any = None) -> list[Semaphore]:
         # so the lowerer treats it as signal-only and the emitter doesn't
         # fabricate a spurious local_load/local_store.
         is_loop_carry = src.schedule_cycle > dst.schedule_cycle
-        has_buffer = (cb.paired_buffer_id is not None and cb.paired_buffer_id in bufs_by_id and not is_loop_carry)
+        has_buffer = (
+            cb.paired_buffer_id is not None
+            and cb.paired_buffer_id in bufs_by_id
+            and not is_loop_carry
+        )
         buf_ref = BufferRef(loop.loop_id, cb.paired_buffer_id) if has_buffer else None
         # When the cross_wg_barriers entry references a synthesized routing
         # buffer (def_op=None), the actual data buffer is the one defined by
@@ -217,7 +221,9 @@ def derive_semaphores(loop: Any, graph: Any = None) -> list[Semaphore]:
             paired = bufs_by_id[cb.paired_buffer_id]
             data_buf = paired
             if paired.def_op is None and dst.op_ref:
-                real = next((b for b in loop.schedule.buffers if b.def_op == dst.op_ref), None)
+                real = next(
+                    (b for b in loop.schedule.buffers if b.def_op == dst.op_ref), None
+                )
                 if real is not None:
                     data_buf = real
             depth = data_buf.count
@@ -272,21 +278,131 @@ def derive_semaphores(loop: Any, graph: Any = None) -> list[Semaphore]:
                 buffer=buf_ref,
                 depth=depth,
                 is_released=is_loop_carry,
-                producers=[ReleaseSite(
-                    node=NodeRef(loop.loop_id, src.id),
-                    async_kind=async_kind,
-                )],
-                consumers=[AcquireSite(
-                    node=NodeRef(loop.loop_id, dst.id),
-                    access_kind=access_kind,
-                )],
+                producers=[
+                    ReleaseSite(
+                        node=NodeRef(loop.loop_id, src.id),
+                        async_kind=async_kind,
+                    )
+                ],
+                consumers=[
+                    AcquireSite(
+                        node=NodeRef(loop.loop_id, dst.id),
+                        access_kind=access_kind,
+                    )
+                ],
                 empty_arrive_count=empty_ac,
-                note=(f"N{src.id}→N{dst.id}  {src.op_kind}→{dst.op_kind}  "
-                      f"cyc{src.schedule_cycle}→cyc{dst.schedule_cycle}  "
-                      f"{'LOOP-CARRY' if is_loop_carry else 'forward'}  "
-                      f"buf={cb.paired_buffer_id}  kind={cb.kind}"),
-            ))
+                note=(
+                    f"N{src.id}→N{dst.id}  {src.op_kind}→{dst.op_kind}  "
+                    f"cyc{src.schedule_cycle}→cyc{dst.schedule_cycle}  "
+                    f"{'LOOP-CARRY' if is_loop_carry else 'forward'}  "
+                    f"buf={cb.paired_buffer_id}  kind={cb.kind}"
+                ),
+            )
+        )
+
+    # ── Intra-WG async-load consumers (general inner-warp async TMA) ─────────
+    # `cross_wg_barriers` capture only CROSS-WG edges. When an async TMA load
+    # fills a buffer that is ALSO read by a consumer in the SAME warp group
+    # (e.g. a partition where the load shares a WG with the MMA reading its
+    # operand), that consumer must still wait on the load's completion (full)
+    # barrier and arrive its empty barrier — the load is async. Register those
+    # intra-WG consumers so `combine_semaphores` fans them into the load's
+    # existing semaphore: one shared full barrier (the load already signals it)
+    # plus a summed empty arrive_count. Without this the consumer would
+    # reference an unallocated `<buf>_full` and the empty recycle would under-
+    # count, racing the producer's next refill.
+    if graph is not None:
+        sems.extend(_derive_intrawg_async_consumers(loop, sched, graph, sems))
     return sems
+
+
+def _derive_intrawg_async_consumers(
+    loop: Any, sched: Any, graph: Any, existing_sems: list[Semaphore]
+) -> list[Semaphore]:
+    """Semaphores for async-TMA-load buffers consumed within the load's own WG.
+    See caller for rationale. One AcquireSite per intra-WG buffer (the buffer's
+    `local_alloc` node — the same node the MMA-operand wait path looks up)."""
+    nodes_by_op = {n.op_ref: n for n in sched.nodes if n.op_ref}
+    existing_keys = {
+        (
+            s.producers[0].node.node_id,
+            s.buffer.buffer_id if s.buffer else None,
+            s.consumers[0].node.node_id,
+        )
+        for s in existing_sems
+    }
+
+    def _refs_to(op_id: str) -> set[str]:
+        out: set[str] = set()
+        for oid, op in graph.ops.items():
+            for opnd in getattr(op, "operands", []):
+                if getattr(opnd, "op_id", None) == op_id:
+                    out.add(oid)
+        return out
+
+    extra: list[Semaphore] = []
+    for buf in sched.buffers:
+        if buf.kind != "smem" or not buf.def_op:
+            continue
+        alloc_op = graph.ops.get(buf.def_op)
+        if (
+            alloc_op is None
+            or alloc_op.kind != "ttg.local_alloc"
+            or not getattr(alloc_op, "operands", None)
+        ):
+            continue
+        ld = alloc_op.operands[0]
+        prod = nodes_by_op.get(getattr(ld, "op_id", None))
+        if prod is None or _classify_async_kind(prod.op_kind) != AsyncKind.TMA_LOAD:
+            continue
+        alloc_node = nodes_by_op.get(buf.def_op)
+        if alloc_node is None or alloc_node.warp_group != prod.warp_group:
+            continue  # cross-WG load→alloc already covered by cross_wg_barriers
+        key = (prod.id, buf.id, alloc_node.id)
+        if key in existing_keys:
+            continue  # already a cross_wg consumer (e.g. cross-WG load→MMA)
+        # Require a real HW reader of this buffer in the producer's WG (directly
+        # or via one memdesc_trans hop) — otherwise registering a consumer that
+        # never arrives empty would deadlock the producer's refill.
+        touched = _refs_to(buf.def_op)
+        reachable = set(touched)
+        for oid in touched:
+            reachable |= _refs_to(oid)
+        has_reader = any(
+            c.warp_group == prod.warp_group
+            and c.id not in (prod.id, alloc_node.id)
+            and c.op_ref in reachable
+            for c in sched.nodes
+        )
+        if not has_reader:
+            continue
+        existing_keys.add(key)
+        extra.append(
+            Semaphore(
+                sem_id=len(existing_sems) + len(extra),
+                buffer=BufferRef(loop.loop_id, buf.id),
+                depth=buf.count,
+                is_released=prod.schedule_cycle > alloc_node.schedule_cycle,
+                producers=[
+                    ReleaseSite(
+                        node=NodeRef(loop.loop_id, prod.id),
+                        async_kind=AsyncKind.TMA_LOAD,
+                    )
+                ],
+                consumers=[
+                    AcquireSite(
+                        node=NodeRef(loop.loop_id, alloc_node.id),
+                        access_kind=_classify_consumer_access(alloc_node.op_kind),
+                    )
+                ],
+                empty_arrive_count=1,
+                note=(
+                    f"intra-WG async TMA: N{prod.id}→N{alloc_node.id} "
+                    f"buf={buf.id} (load+consumer share wg{prod.warp_group})"
+                ),
+            )
+        )
+    return extra
 
 
 def combine_semaphores(sems: list[Semaphore]) -> list[Semaphore]:
@@ -341,7 +457,10 @@ def combine_semaphores(sems: list[Semaphore]) -> list[Semaphore]:
             consumers=[group[0].consumers[0]],
             pending_count=pending,
             empty_arrive_count=max(s.empty_arrive_count for s in group),
-            note=(f"combined {len(group)} producers → consumer N{consumer_id}; " + "; ".join(s.note for s in group)),
+            note=(
+                f"combined {len(group)} producers → consumer N{consumer_id}; "
+                + "; ".join(s.note for s in group)
+            ),
         )
         out.append(merged)
         next_id += 1
@@ -378,9 +497,17 @@ def combine_semaphores(sems: list[Semaphore]) -> list[Semaphore]:
             producers=[group[0].producers[0]],
             consumers=merged_consumers,
             pending_count=1,  # single producer → one arrival
-            # Pass A.5: max across merged consumers preserves partition fan-out.
-            empty_arrive_count=max(s.empty_arrive_count for s in group),
-            note=(f"fan-out: producer N{pid} → " + ", ".join(f"N{c.consumers[0].node.node_id}" for c in group)),
+            # The empty barrier receives one release per distinct consumer
+            # semaphore, so SUM their arrival counts (e.g. case7 dout → MMA +
+            # bias-reduce both release the shared buffer → arrive_count=2). Each
+            # member already carries its own count (1, or N for an A.5 partition
+            # fan-out), and the len(group)==1 branch above leaves the
+            # single-consumer-per-buffer case untouched.
+            empty_arrive_count=sum(s.empty_arrive_count for s in group),
+            note=(
+                f"fan-out: producer N{pid} → "
+                + ", ".join(f"N{c.consumers[0].node.node_id}" for c in group)
+            ),
         )
         final.append(merged)
         for s in group:
@@ -456,7 +583,9 @@ class LoweredSemaphore:
     full_name: str  # `<name>_full` python identifier
     empty_name: str  # `<name>_empty` python identifier
     alloc_full_stmt: str  # `<full_name> = tlx.alloc_barriers(...)`
-    alloc_empty_stmt: (str | None)  # `<empty_name> = tlx.alloc_barriers(...)`; None = signal-only
+    alloc_empty_stmt: (
+        str | None
+    )  # `<empty_name> = tlx.alloc_barriers(...)`; None = signal-only
     pre_arrive_stmt: str | None  # for is_released=True; pre-arrives FULL barrier
     arrive_count: int  # pending_count
     depth: int
@@ -492,7 +621,9 @@ def _bar_expect(name: str, slot_expr: str, n_bytes: int) -> str:
     return f"tlx.barrier_expect_bytes({name}[{slot_expr}], {n_bytes})"
 
 
-def lower_semaphore(sem: Semaphore, *, bytes_for_buffer=lambda b: 0) -> LoweredSemaphore:
+def lower_semaphore(
+    sem: Semaphore, *, bytes_for_buffer=lambda b: 0
+) -> LoweredSemaphore:
     """Mechanically lower a Semaphore into emittable TLX strings.
 
     Each cross-WG buffer Semaphore allocates two mbarriers: <name>_full
@@ -509,20 +640,30 @@ def lower_semaphore(sem: Semaphore, *, bytes_for_buffer=lambda b: 0) -> LoweredS
     empty_name = f"{base}_empty"
     depth = max(sem.depth, 1)
 
-    alloc_full_stmt = (f"{full_name} = tlx.alloc_barriers"
-                       f"(num_barriers={depth}, arrive_count={sem.pending_count})")
+    alloc_full_stmt = (
+        f"{full_name} = tlx.alloc_barriers"
+        f"(num_barriers={depth}, arrive_count={sem.pending_count})"
+    )
     # Signal-only semaphores (no buffer) don't need an empty side.
     # Pass A.5: empty barrier needs arrive_count = N when the consumer is
     # partitioned (each of the N parallel ops signals empty once).
     empty_ac = max(1, getattr(sem, "empty_arrive_count", 1) or 1)
-    alloc_empty_stmt = (None if sem.buffer is None else (f"{empty_name} = tlx.alloc_barriers("
-                                                         f"num_barriers={depth}, arrive_count={empty_ac})"))
+    alloc_empty_stmt = (
+        None
+        if sem.buffer is None
+        else (
+            f"{empty_name} = tlx.alloc_barriers("
+            f"num_barriers={depth}, arrive_count={empty_ac})"
+        )
+    )
 
     pre_arrive_stmt = None
     if sem.is_released:
         # Pre-arrive on the FULL barrier so iter-0 consumer wait passes
         # immediately (loop-carry init).
-        pre_arrive_stmt = (f"{_bar_arrive(full_name, '0')}  # is_released=True (loop-carry init)")
+        pre_arrive_stmt = (
+            f"{_bar_arrive(full_name, '0')}  # is_released=True (loop-carry init)"
+        )
 
     stage_expr = getattr(sem, "_stage_expr", "0")
     consumer_phase = getattr(sem, "_phase_expr", "(_it & 1)")
@@ -543,7 +684,9 @@ def lower_semaphore(sem: Semaphore, *, bytes_for_buffer=lambda b: 0) -> LoweredS
         if acq.access_kind == AccessKind.UNKNOWN:
             # MMA-like consumer recycles via HW mBarriers (the EMPTY
             # barrier slot lands on the MMA's mBarriers list).
-            consumer_mbarriers_at.setdefault(nid, []).append(f"{empty_name}[{stage_expr}]")
+            consumer_mbarriers_at.setdefault(nid, []).append(
+                f"{empty_name}[{stage_expr}]"
+            )
         else:
             # SW consumer: explicit arrive after read.
             consumer_arrive_at[nid] = _bar_arrive(empty_name, stage_expr)
@@ -562,12 +705,16 @@ def lower_semaphore(sem: Semaphore, *, bytes_for_buffer=lambda b: 0) -> LoweredS
         if alloc_empty_stmt is not None and not sem.is_released:
             producer_wait_at[nid] = _bar_wait(empty_name, stage_expr, producer_phase)
         if rel.async_kind in (AsyncKind.TC5_MMA, AsyncKind.WGMMA, AsyncKind.TMEM_COPY):
-            producer_mbarriers_at.setdefault(nid, []).append(f"{full_name}[{stage_expr}]")
+            producer_mbarriers_at.setdefault(nid, []).append(
+                f"{full_name}[{stage_expr}]"
+            )
         elif rel.async_kind == AsyncKind.TMA_LOAD:
             n_bytes = bytes_for_buffer(sem.buffer) if sem.buffer else 0
             if n_bytes > 0:
                 producer_expect_at[nid] = _bar_expect(full_name, stage_expr, n_bytes)
-            producer_mbarriers_at.setdefault(nid, []).append(f"{full_name}[{stage_expr}]")
+            producer_mbarriers_at.setdefault(nid, []).append(
+                f"{full_name}[{stage_expr}]"
+            )
         else:
             producer_arrive_at[nid] = _bar_arrive(full_name, stage_expr)
 
@@ -594,7 +741,9 @@ def lower_semaphore(sem: Semaphore, *, bytes_for_buffer=lambda b: 0) -> LoweredS
     )
 
 
-def lower_all(sems: list[Semaphore], buffers_by_id: dict | None = None) -> list[LoweredSemaphore]:
+def lower_all(
+    sems: list[Semaphore], buffers_by_id: dict | None = None
+) -> list[LoweredSemaphore]:
     """Convenience: lower every semaphore. Resolves byte counts from buffer ids."""
 
     def bytes_for(buf_ref):
@@ -622,12 +771,18 @@ class SemSet:
 
     lowered: list[LoweredSemaphore]
     # Index: (loop_id, consumer_node_id) → list of LoweredSemaphores.
-    by_consumer: dict[tuple[int, int], list[LoweredSemaphore]] = field(default_factory=dict)
+    by_consumer: dict[tuple[int, int], list[LoweredSemaphore]] = field(
+        default_factory=dict
+    )
     # Index: (loop_id, producer_node_id) → list of LoweredSemaphores.
-    by_producer: dict[tuple[int, int], list[LoweredSemaphore]] = field(default_factory=dict)
+    by_producer: dict[tuple[int, int], list[LoweredSemaphore]] = field(
+        default_factory=dict
+    )
     # Index: (loop_id, consumer_wg) → list of LoweredSemaphores requiring
     # a pre-arrive in that WG's preamble (is_released=True on the consumer side).
-    by_pre_arrive_wg: dict[tuple[int, int], list[LoweredSemaphore]] = field(default_factory=dict)
+    by_pre_arrive_wg: dict[tuple[int, int], list[LoweredSemaphore]] = field(
+        default_factory=dict
+    )
 
     @classmethod
     def build(
@@ -650,7 +805,9 @@ class SemSet:
                 cons = sem.consumers[0]
                 wg = wg_of_node.get((cons.node.loop_id, cons.node.node_id))
                 if wg is not None:
-                    out.by_pre_arrive_wg.setdefault((cons.node.loop_id, wg), []).append(ls)
+                    out.by_pre_arrive_wg.setdefault((cons.node.loop_id, wg), []).append(
+                        ls
+                    )
         return out
 
     def alloc_lines(self) -> list[str]:
@@ -735,7 +892,9 @@ class SemSet:
         return out
 
 
-def build_sem_set_for_loop(loop: Any, *, wg_of_node: dict[tuple[int, int], int] | None = None) -> SemSet:
+def build_sem_set_for_loop(
+    loop: Any, *, wg_of_node: dict[tuple[int, int], int] | None = None
+) -> SemSet:
     """End-to-end pipeline for a single loop: derive → combine → stage/phase → lower."""
     sems = derive_semaphores(loop)
     sems = combine_semaphores(sems)
@@ -745,7 +904,9 @@ def build_sem_set_for_loop(loop: Any, *, wg_of_node: dict[tuple[int, int], int] 
     return SemSet.build(lowered, wg_of_node=wg_of_node)
 
 
-def build_sem_set_for_graph(graph: Any, *, wg_of_node: dict[tuple[int, int], int] | None = None) -> SemSet:
+def build_sem_set_for_graph(
+    graph: Any, *, wg_of_node: dict[tuple[int, int], int] | None = None
+) -> SemSet:
     """Build one SemSet covering every loop's cross-WG barriers."""
     all_lowered: list[LoweredSemaphore] = []
     next_id = 0
@@ -760,7 +921,11 @@ def build_sem_set_for_graph(graph: Any, *, wg_of_node: dict[tuple[int, int], int
             ls.sem_id = next_id
             ls.sem.sem_id = next_id
             old_base = ls.name
-            new_base = (f"sem{next_id}_b{ls.sem.buffer.buffer_id}" if ls.sem.buffer is not None else f"sem{next_id}")
+            new_base = (
+                f"sem{next_id}_b{ls.sem.buffer.buffer_id}"
+                if ls.sem.buffer is not None
+                else f"sem{next_id}"
+            )
             if new_base != old_base:
                 ls.name = new_base
                 ls.full_name = f"{new_base}_full"
@@ -772,13 +937,27 @@ def build_sem_set_for_graph(graph: Any, *, wg_of_node: dict[tuple[int, int], int
                 ls.alloc_full_stmt = _ren(ls.alloc_full_stmt)
                 ls.alloc_empty_stmt = _ren(ls.alloc_empty_stmt)
                 ls.pre_arrive_stmt = _ren(ls.pre_arrive_stmt)
-                ls.consumer_wait_at = {k: _ren(v) for k, v in ls.consumer_wait_at.items()}
-                ls.consumer_arrive_at = {k: _ren(v) for k, v in ls.consumer_arrive_at.items()}
-                ls.consumer_mbarriers_at = {k: [_ren(s) for s in v] for k, v in ls.consumer_mbarriers_at.items()}
-                ls.producer_wait_at = {k: _ren(v) for k, v in ls.producer_wait_at.items()}
-                ls.producer_arrive_at = {k: _ren(v) for k, v in ls.producer_arrive_at.items()}
-                ls.producer_expect_at = {k: _ren(v) for k, v in ls.producer_expect_at.items()}
-                ls.producer_mbarriers_at = {k: [_ren(s) for s in v] for k, v in ls.producer_mbarriers_at.items()}
+                ls.consumer_wait_at = {
+                    k: _ren(v) for k, v in ls.consumer_wait_at.items()
+                }
+                ls.consumer_arrive_at = {
+                    k: _ren(v) for k, v in ls.consumer_arrive_at.items()
+                }
+                ls.consumer_mbarriers_at = {
+                    k: [_ren(s) for s in v] for k, v in ls.consumer_mbarriers_at.items()
+                }
+                ls.producer_wait_at = {
+                    k: _ren(v) for k, v in ls.producer_wait_at.items()
+                }
+                ls.producer_arrive_at = {
+                    k: _ren(v) for k, v in ls.producer_arrive_at.items()
+                }
+                ls.producer_expect_at = {
+                    k: _ren(v) for k, v in ls.producer_expect_at.items()
+                }
+                ls.producer_mbarriers_at = {
+                    k: [_ren(s) for s in v] for k, v in ls.producer_mbarriers_at.items()
+                }
             next_id += 1
         all_lowered.extend(lowered)
     return SemSet.build(all_lowered, wg_of_node=wg_of_node)

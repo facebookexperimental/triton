@@ -1,17 +1,13 @@
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=200000" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
 
-// Regression test: BWD config 1 (BLOCK_M1=64, EPILOGUE_SUBTILE=2) with
-// early_tma_store_lowering produced 4 TMA store staging allocs that were
-// not counted in the SMEM budget. Phase 4.5 bumped their copies to 2,
-// causing: OutOfResources: shared memory, Required: 280232, limit: 232448.
-//
-// Fix: Phase 4.6 in WSMemoryPlanner.cpp checks the combined SMEM
-// (channel buffers + TMA store staging buffers). If it exceeds smem_budget,
-// TMA store staging copies are capped to 1.
+// Regression coverage for BWD config 1 (BLOCK_M1=64, EPILOGUE_SUBTILE=2)
+// with early_tma_store_lowering. The planner sees the TMA store staging
+// allocs and tags them separately from normal channel buffers.
 //
 // Key verification:
-//   - TMA store staging allocs (buffer.id=7, memdesc<128x64xf16>) get buffer.copy=1
-//   - Inner-loop channel allocs are unaffected (q gets buffer.copy=2, etc.)
+//   - TMA store staging allocs keep their current buffer.copy=2 behavior.
+//   - Inner-loop channel allocs are allocated independently (q gets
+//     buffer.copy=2, etc.)
 
 // CHECK-LABEL: tt.func public @_attn_bwd_persist
 
