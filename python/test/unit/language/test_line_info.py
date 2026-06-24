@@ -7,7 +7,7 @@ import torch
 
 import triton
 import triton.language as tl
-from triton._internal_testing import is_hip, is_hopper_or_newer, is_interpreter
+from triton._internal_testing import is_hopper_or_newer, is_interpreter
 from triton._filecheck import run_filecheck
 
 

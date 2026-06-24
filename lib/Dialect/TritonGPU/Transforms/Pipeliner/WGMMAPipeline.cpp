@@ -215,8 +215,7 @@ static void threadValuesThroughWait(ttng::WarpGroupDotWaitOp wait,
   // We can't use replaceWithNewOp because we're changing the number of return
   // values in the operation.
   auto newWait = ttng::WarpGroupDotWaitOp::create(
-      builder, wait.getLoc(), llvm::to_vector(newOperands),
-      wait.getPendingsAttr(), wait.getWarpGroupLocalAttr());
+      builder, wait.getLoc(), llvm::to_vector(newOperands), wait.getPendings());
 
   auto dominatedByNewWait = [&](OpOperand &operand) {
     auto opInThisBlock =
@@ -660,8 +659,7 @@ static void insertAsyncWarpGroupDotWaitInLoop(
 
       OpBuilder builder((*firstUse)->getOwner());
       auto newWait = ttng::WarpGroupDotWaitOp::create(
-          builder, asyncDot->getLoc(), ArrayRef<Value>{}, 0,
-          /*warpGroupLocal=*/true);
+          builder, asyncDot->getLoc(), ArrayRef<Value>{}, 0);
 
       SmallVector<Value> users;
       for (; firstUse != uses.end(); ++firstUse) {

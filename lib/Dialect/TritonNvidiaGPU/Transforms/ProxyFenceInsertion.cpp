@@ -114,7 +114,6 @@ bool filterFn(Operation *op, Operation *other, Allocation *allocation) {
 class ProxyFenceAnalysis : public MembarOrFenceAnalysis {
 
 public:
-  ProxyFenceAnalysis() = default;
   explicit ProxyFenceAnalysis(Allocation *allocation, MembarFilterFn filter)
       : MembarOrFenceAnalysis(allocation, filter) {}
 
