@@ -538,6 +538,7 @@ Maps to `amd-addmm-glu-opt_test.py` (kernel `tlx_addmm_glu_kernel_optimized`, li
 - **Non-loop epilogue (Pass A.6):** `bias add → x = acc + bias → GLU out = x + x*y → store`. The accumulator is register-resident; bias/Y are loaded in the epilogue. This is list-scheduled as a straight-line region.
 - **Padded LDS for Y (Step 4.5 padding policy):** the async variant stages Y into a **padded** LDS buffer (`_y_padded_layout`, line 119: `with_identity_for([[BN, PAD]], [BM, BN], [1,0])`) so the `ds_read` of Y avoids bank conflicts. The padding adds `PAD` elements per row to the buffer's physical footprint, which the Step 4 budget check must count.
 - **Streaming epilogue traffic:** Y and C are touched once (`cache_modifier=".cs"`), so they should not be cached — a Pass C codegen detail, not a scheduling one.
+- **Step 4.8 priority — K-loop only:** the K-loop is GEMM's DDG, so Step 4.8 derives the identical `mem`=1 / `mfma`=0 (mem wins on **urgency** `U` — the latency-critical `global_load_lds`, the same MEM-bound case as GEMM). The point of interest is the *boundary*: the epilogue is a straight-line, single-warp-group region (Pass A.6, stage=0), so it carries **no** border markers and **no** `s_setprio` — Step 4.8 only ranks the clusters of a phase-offset pipelined loop. The async Y prefetch overlaps compute through list scheduling and `s_waitcnt vmcnt`, not through warp-pipeline priority.
 
 ## Worked Example: Flash Attention Forward
 
