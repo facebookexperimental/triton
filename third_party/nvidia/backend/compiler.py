@@ -394,7 +394,7 @@ class CUDABackend(BaseBackend):
     def make_launcher_src(self, metadata, src):
         """Generate a standalone C launcher source from Level 0 metadata.
 
-        The generated C file includes ``triton/runtime/launch.h`` and implements
+        The generated C file includes ``nvidia/backend/launch.h`` and implements
         a single entry point ``triton_launch_<kernel>()`` that sets up
         CUlaunchConfig with compile-time-known parameters baked in as constants,
         builds the kernel parameter array, and calls ``cuLaunchKernelEx``.
@@ -463,7 +463,7 @@ class CUDABackend(BaseBackend):
         lines.append(f"/* Kernel: {kernel_name} */")
         lines.append(f"/* ABI version: {launch_meta['abi_version']} */")
         lines.append("")
-        lines.append('#include "triton/runtime/launch.h"')
+        lines.append('#include "nvidia/backend/launch.h"')
         lines.append("")
 
         # ---- Args struct ----

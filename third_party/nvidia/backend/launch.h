@@ -1,5 +1,5 @@
 /*
- * triton/runtime/launch.h — Minimal runtime header for Triton standalone
+ * nvidia/backend/launch.h — Minimal runtime header for Triton standalone
  * launchers.
  *
  * This header provides everything a compiler-generated launcher needs to call

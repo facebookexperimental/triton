@@ -11,7 +11,7 @@
 
 /* Shared, Python-free data-driven launch core (params[]/TMA/attrs/launch).
  * The same core is used by TritonCC / AOT-T via make_launcher_src. */
-#include "triton/runtime/launch.h"
+#include "nvidia/backend/launch.h"
 
 typedef struct {
   PyObject_HEAD;
