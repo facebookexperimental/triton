@@ -35,6 +35,7 @@ This document describes a scheduling algorithm for AMD CDNA4 (MI350, gfx950) GPU
 - [Pass A.7: Epilogue Subtiling](#pass-a7-epilogue-subtiling)
 - [Pass B: Warp-Pipeline Reconstruction](#pass-b-warp-pipeline-reconstruction)
 - [Pass C: Code Generation and Instruction Ordering](#pass-c-code-generation-and-instruction-ordering)
+- [Integration with the Existing AMD Backend](#integration-with-the-existing-amd-backend)
 - [Worked Example: gfx950 Warp-Pipelined GEMM](#worked-example-gfx950-warp-pipelined-gemm)
 - [Worked Example: Fused addmm + GLU](#worked-example-fused-addmm--glu)
 - [Worked Example: Flash Attention Forward](#worked-example-flash-attention-forward)
@@ -420,6 +421,65 @@ Pass C takes the `(stage, cluster)` assignments and the border-tagged loop from 
 ### Relationship Between Pass A and Pass C
 
 Pass A decides *what overlaps* (stages, clusters, depths); Pass C decides *how the ISA expresses it* (`sched.group.barrier` ratios, `s_setprio`, `vmcnt`). The cluster IDs from Pass A Step 2.5 are the contract between them — Pass C never reorders across a cluster boundary.
+
+---
+
+## Integration with the Existing AMD Backend
+
+This algorithm does not replace the AMD pass pipeline — it slots into it. The entire warp-pipeline is held together by **one IR attribute contract**, not by TLX, which is what makes the integration small.
+
+### The seam: the border-marker attribute contract
+
+The whole mechanism is carried by two attributes on a marker op in the loop body:
+
+> **border marker** = an op (a `rocdl.sched.barrier`) carrying `triton.warp_pipeline.border` (StringAttr, the cluster label) and an optional `triton.warp_pipeline.priority` (IntegerAttr).
+
+- The TLX frontend only ever *emits* these via `create_warp_pipeline_border`.
+- `WarpPipeliner.cpp` *reads* them (`readBorderMarker`, WarpPipeliner.cpp:61/64), splits the loop body at borders into clusters, and propagates the priority onto each `scf.execute_region` (WarpPipeliner.cpp:157).
+- `ConvertWarpPipeline.cpp` turns the priority into `ROCDL::SetPrioOp(intAttr.getInt())` (ConvertWarpPipeline.cpp:253) and emits the `cond_barrier(warpHigh/warpLow)` phase shift itself (ConvertWarpPipeline.cpp:295/305).
+
+So connecting this algorithm to the backend reduces to: **a new TTGIR pass writes these two attributes onto marker ops; everything downstream is reused unchanged, and no `tlx.*` op is ever produced.**
+
+### Pass A/B/C mapped onto the real pipeline
+
+The pass order in `third_party/amd/backend/compiler.py` (`make_ttgir`, then `make_llir`):
+
+| This doc | Existing AMD pass (call site) | Status |
+|---|---|---|
+| **Pass A** — modulo schedule, II, buffer depth, stage, cluster | `add_schedule_loops` (ScheduleLoops.cpp, make_ttgir:320) + `add_pipeline` (LowerLoops/Pipeline, make_ttgir:321) | **scaffolding exists, cost model missing** |
+| **Pass A, Step 4.8** — `s_setprio` priority | nobody computes it automatically (only `BlockPingpong.cpp`'s hard-coded template) | **net-new**; output is the `.priority` integer |
+| **Pass B** — emit borders + sync | marker emission (today done by the TLX frontend) + `add_warp_pipeline` (WarpPipeliner.cpp, make_ttgir:370) splits clusters | WarpPipeliner exists; **marker emission is the new piece** (it replaces the human writing `warp_pipeline_stage`) |
+| **Pass C** — lower to `cond_barrier`/`s_setprio`/`vmcnt`/`sched.group.barrier` | `add_warp_pipeline_conversion` (ConvertWarpPipeline.cpp, make_llir:401) + `add_update_async_wait_count` (make_llir:400) + `lower_instruction_sched_hints` (make_llir:430) | **reused as-is** |
+
+### Where the new pass goes
+
+A single new TTGIR pass — `add_auto_warp_pipeline` — inserted in `make_ttgir` **after `add_pipeline` and immediately before `add_warp_pipeline`** (make_ttgir:370):
+
+- *After `add_pipeline`*: the loop is already multi-buffered, with the prologue/epilogue and async copies materialized, so the marker ops have real ops to bracket.
+- *Immediately before `add_warp_pipeline`*: that pass is deliberately placed last because the preceding `cse`/`dce` would otherwise strip the priority markers (compiler.py:364-369). The new emitter must run after that cleanup for the same reason (its markers survive because they hang on a side-effecting `sched.barrier`).
+
+The pass does exactly three things — build the DDG, run the modulo analysis (II / slack / occupancy), compute clusters + Step 4.8 priorities — then writes the `border`/`priority` markers. After that, `add_warp_pipeline → add_update_async_wait_count → add_warp_pipeline_conversion → lower_instruction_sched_hints` take over automatically.
+
+### Reused for free (the new scheduler never touches these)
+
+- **Two warp groups + `cond_barrier` phase shift** — `emitPipelinePrelude`/`emitPipelinePostlude` (ConvertWarpPipeline.cpp:295/305).
+- **`s_setprio`** — emitted from the priority attribute (ConvertWarpPipeline.cpp:253); Step 4.8 only supplies the integer.
+- **`vmcnt`** — `UpdateAsyncWaitCount.cpp` derives it by backward def-chain analysis.
+- **In-cluster `sched.group.barrier` / `iglp_opt`** — `lower_instruction_sched_hints`.
+
+This is the concrete meaning of "Pass C makes no scheduling decisions": on AMD it already exists.
+
+### Net-new work and blockers (priority order)
+
+1. **Latency + resource cost model (the hard blocker).** `add_schedule_loops` passes an *empty* `unusedOpLatency` today (ScheduleLoops.cpp:125), so there is currently no II / slack / occupancy to compute against. Both Pass A and Step 4.8 stand on this gfx950-microbenchmarked table (Limitations #1). Without it the rest is moot.
+2. **The marker-emitting pass** above — turning "human writes `warp_pipeline_stage`" into "compiler emits the attributes."
+3. **Mutual exclusion with `BlockPingpong.cpp`.** `add_block_pingpong` (make_ttgir:335-336) is the existing *automatic* competitor: it also emits `s_setprio` + `cond_barrier`, also runs before `add_warp_pipeline`, but only matches its hard-coded templates (1–2 dots, fixed tile sizes). The new pass and BlockPingpong must never transform the same loop — gate them with a knob (mirroring `knobs.amd.use_block_pingpong`), with the new general path taking the loops BlockPingpong's templates do not cover.
+
+### Subtleties
+
+- **Opt-in is automatic.** `WarpPipeliner.cpp` is a no-op when a loop has no borders, so the new pass only affects loops it chooses to mark — the blast radius is bounded.
+- **Gluon path.** `gluon_to_ttgir` runs its own `add_warp_pipeline` (compiler.py:387). Covering gluon kernels means running the emitter there too; the plain `triton.jit`/TTGIR path needs only the `make_ttgir` insertion.
+- **Who owns buffer depth.** Multi-buffering is decided by `add_schedule_loops` + `add_pipeline` from `num_stages`. Pass A's depth decision therefore belongs *inside* ScheduleLoops (feed it the cost model and let it set depth) rather than in the marker emitter — which is the choice between folding Pass A into ScheduleLoops ("all the way down", more invasive) and a separate post-pipeline analysis pass (lower risk, matches the Pass A/B split here).
 
 ---
 
