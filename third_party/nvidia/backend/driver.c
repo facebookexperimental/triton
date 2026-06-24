@@ -1683,6 +1683,11 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   desc.launch_pdl = launch_pdl;
   desc.launch_cooperative_grid = launch_cooperative_grid;
   desc.launch_cluster = (preferredClusterDimX > 0) ? 1 : 0;
+  // JIT variadic launcher uses the 1-D num_ctas cluster + preferred-cluster
+  // hint only; it never emits an explicit multi-dim CLUSTER_DIMENSION.
+  desc.cluster_dims[0] = 0;
+  desc.cluster_dims[1] = 0;
+  desc.cluster_dims[2] = 0;
   desc.preferred_cluster_dims[0] = preferredClusterDimX;
   desc.preferred_cluster_dims[1] = preferredClusterDimY;
   desc.preferred_cluster_dims[2] = preferredClusterDimZ;
@@ -1977,6 +1982,12 @@ typedef struct {
                                                index */
   TMASlotMeta tma_meta[TD_MAX_TMA_DESCS];
   CUtensorMap tma_descs[TD_MAX_TMA_DESCS] __attribute__((aligned(128)));
+  /* Converged launch: when set, this kernel launches through the shared core
+   * triton_launch_kernel() instead of the dispatcher's own cuLaunchKernelEx.
+   * Enabled for the common non-TMA, non multi-dim-cluster case (see
+   * TritonDispatcher_new); core_desc is built once and reused every launch. */
+  int use_core_launch;
+  triton_kernel_launch_desc_t core_desc;
 } TritonDispatcher;
 
 /* Forward declarations */
@@ -2289,6 +2300,12 @@ static inline CUresult td_relaunch(TritonDispatcher *d, unsigned gx,
                                    unsigned gy, unsigned gz, CUstream stream) {
   if (gx * gy * gz == 0)
     return CUDA_SUCCESS;
+  if (d->use_core_launch) {
+    /* Converged path: launch through the shared core in launch.h. */
+    const uint32_t grid[3] = {gx, gy, gz};
+    return triton_launch_kernel(grid, stream, d->function,
+                                (void *)d->arg_storage, &d->core_desc);
+  }
   CUlaunchConfig cfg;
   cfg.gridDimX = gx * d->grid_mult;
   cfg.gridDimY = gy;
@@ -2524,6 +2541,45 @@ static PyObject *TritonDispatcher_new(PyTypeObject *type, PyObject *args,
     na++;
   }
   self->num_launch_attrs = na;
+
+  /* Build a shared-core launch descriptor so this dispatcher can launch via
+   * triton_launch_kernel() -- one launch implementation shared with the JIT
+   * variadic launcher and TritonCC / AOT-T.  arg_storage is already a flat,
+   * fixed-stride (sizeof(TDArgSlot)) buffer with one slot per param, so the
+   * descriptor just maps param i -> slot offset i*sizeof(TDArgSlot).
+   *
+   * Restricted to the case the core models exactly today: no TMA (the core's
+   * recipe-based TMA construction is converged separately).  The shared core
+   * now handles both the 1-D num_ctas cluster and the explicit
+   * multi-dimensional cluster (cluster_dims), so only TMA kernels keep the
+   * dispatcher's own td_relaunch path. */
+  self->use_core_launch =
+      (self->num_tma_descs == 0 && self->total_params <= TRITON_MAX_PARAMS);
+  if (self->use_core_launch) {
+    memset(&self->core_desc, 0, sizeof(self->core_desc));
+    self->core_desc.abi_version = TRITON_LAUNCH_DESC_ABI_VERSION;
+    self->core_desc.num_warps = num_warps;
+    self->core_desc.num_ctas = num_ctas;
+    self->core_desc.shared_mem = (unsigned)shared_mem;
+    self->core_desc.launch_pdl = launch_pdl;
+    self->core_desc.launch_cooperative_grid = launch_coop;
+    self->core_desc.launch_cluster = launch_cluster;
+    /* Explicit multi-dim cluster (ctas_per_cga). When all <= 1, the core uses
+     * the 1-D num_ctas path; num_ctas takes priority, so 1-D and multi-dim are
+     * never both applied. */
+    self->core_desc.cluster_dims[0] = cluster_dim_x;
+    self->core_desc.cluster_dims[1] = cluster_dim_y;
+    self->core_desc.cluster_dims[2] = cluster_dim_z;
+    self->core_desc.num_params = self->total_params;
+    self->core_desc.num_tma_recipes = 0;
+    for (int i = 0; i < self->total_params; i++) {
+      /* size is unused by the core for non-TMA params (it indexes args_buf by
+       * offset); record the storage slot size for clarity. */
+      self->core_desc.params[i].offset = (int)(i * (int)sizeof(TDArgSlot));
+      self->core_desc.params[i].size = (int)sizeof(TDArgSlot);
+      self->core_desc.params[i].is_tma = 0;
+    }
+  }
 
   return (PyObject *)self;
 }
