@@ -230,12 +230,13 @@ def TritonNvidiaGPUPruneUnusedBarriersPass
 }
 
 def TritonNvidiaGPUCheckMatmulTwoCTAPass : Pass<"triton-nvidia-check-matmul-two-cta", "mlir::ModuleOp"> {
-  let summary = "Verify consistent two_ctas usage across matmuls";
+  let summary = "Verify legal and consistent two_ctas usage across matmuls";
 
   let description = [{
     Inspect all matmul operations and ensure they agree on the `two_ctas`
     setting. Propagate the chosen value to the module so later lowering steps
-    can access it. Compilation fails if mixed configurations are detected.
+    can access it. Compilation fails if mixed configurations are detected, or if
+    one 2-CTA `tt.dot` consumes a value derived from another 2-CTA `tt.dot`.
   }];
 }
 

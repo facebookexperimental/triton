@@ -279,7 +279,14 @@ def multi_cta_layernorm(
     """
     # Narrow-N fast path: persistent + warp-specialized 2-WG kernel.
     if x.shape[-1] <= _WS_NARROW_N_THRESHOLD:
-        from blackwell_multi_cta_layernorm_ws_test import multi_cta_layernorm_ws
+        # Absolute package import so it resolves both in a source checkout and
+        # under Buck. A bare `import blackwell_multi_cta_layernorm_ws_test` only
+        # works when the sibling is on sys.path by its bare name (source
+        # checkout / pytest prepend); under Buck the module ships nested at
+        # triton.language.extra.tlx.tutorials.* and the bare name is not found.
+        from triton.language.extra.tlx.tutorials.blackwell_multi_cta_layernorm_ws_test import (
+            multi_cta_layernorm_ws,
+        )
 
         return multi_cta_layernorm_ws(x, weight, bias, eps)
 

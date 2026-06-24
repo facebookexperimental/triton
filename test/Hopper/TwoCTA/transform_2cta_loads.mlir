@@ -149,6 +149,57 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
 
 // -----
 
+// Test: Multiple B loads from the same host-side TMA descriptor should all use
+// the same original block shape. The descriptor argument must be halved once,
+// not once per MMA user.
+// CHECK-LABEL: @matmul_2cta_host_tma_reused_desc
+// CHECK-SAME: !tt.tensordesc<tensor<64x64xf16>>
+// CHECK-NOT: tensor<64x32xf16>
+// CHECK: tt.descriptor_load %{{.*}} : !tt.tensordesc<tensor<64x64xf16>> -> tensor<64x64xf16
+// CHECK: tt.descriptor_load %{{.*}} : !tt.tensordesc<tensor<64x64xf16>> -> tensor<64x64xf16
+// CHECK: ttng.tc_gen5_mma {{.*}} {two_ctas}
+// CHECK: ttng.tc_gen5_mma {{.*}} {two_ctas}
+
+#blocked_r = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1_r = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked3_r = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#shared_r = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem_r = #ttg.shared_memory
+#tmem_r = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @matmul_2cta_host_tma_reused_desc(
+      %a_desc: !tt.tensordesc<tensor<128x64xf16>>,
+      %b_desc: !tt.tensordesc<tensor<64x128xf16>>) attributes {noinline = false} {
+    %true = arith.constant true
+    %c0_i32 = arith.constant 0 : i32
+    %c64_i32 = arith.constant 64 : i32
+    %c128_i32 = arith.constant 128 : i32
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked_r>
+
+    %a = tt.descriptor_load %a_desc[%c0_i32, %c0_i32] : !tt.tensordesc<tensor<128x64xf16>> -> tensor<128x64xf16, #blocked1_r>
+    %a_smem = ttg.local_alloc %a : (tensor<128x64xf16, #blocked1_r>) -> !ttg.memdesc<128x64xf16, #shared_r, #smem_r>
+
+    %b0 = tt.descriptor_load %b_desc[%c0_i32, %c0_i32] : !tt.tensordesc<tensor<64x128xf16>> -> tensor<64x128xf16, #blocked1_r>
+    %b0_smem = ttg.local_alloc %b0 : (tensor<64x128xf16, #blocked1_r>) -> !ttg.memdesc<64x128xf16, #shared_r, #smem_r>
+
+    %b1 = tt.descriptor_load %b_desc[%c64_i32, %c128_i32] : !tt.tensordesc<tensor<64x128xf16>> -> tensor<64x128xf16, #blocked1_r>
+    %b1_smem = ttg.local_alloc %b1 : (tensor<64x128xf16, #blocked1_r>) -> !ttg.memdesc<64x128xf16, #shared_r, #smem_r>
+
+    %acc_layout0 = ttg.convert_layout %cst : tensor<128x128xf32, #blocked_r> -> tensor<128x128xf32, #blocked3_r>
+    %acc_tmem0, %token0 = ttng.tmem_alloc %acc_layout0 : (tensor<128x128xf32, #blocked3_r>) -> (!ttg.memdesc<128x128xf32, #tmem_r, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    %mma_token0 = ttng.tc_gen5_mma %a_smem, %b0_smem, %acc_tmem0[%token0], %true, %true {two_ctas} : !ttg.memdesc<128x64xf16, #shared_r, #smem_r>, !ttg.memdesc<64x128xf16, #shared_r, #smem_r>, !ttg.memdesc<128x128xf32, #tmem_r, #ttng.tensor_memory, mutable>
+
+    %acc_layout1 = ttg.convert_layout %cst : tensor<128x128xf32, #blocked_r> -> tensor<128x128xf32, #blocked3_r>
+    %acc_tmem1, %token1 = ttng.tmem_alloc %acc_layout1 : (tensor<128x128xf32, #blocked3_r>) -> (!ttg.memdesc<128x128xf32, #tmem_r, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    %mma_token1 = ttng.tc_gen5_mma %a_smem, %b1_smem, %acc_tmem1[%token1], %true, %true {two_ctas} : !ttg.memdesc<128x64xf16, #shared_r, #smem_r>, !ttg.memdesc<64x128xf16, #shared_r, #smem_r>, !ttg.memdesc<128x128xf32, #tmem_r, #ttng.tensor_memory, mutable>
+
+    tt.return
+  }
+}
+
+// -----
+
 // Test: No two_ctas attribute - pass should not modify anything
 // CHECK-LABEL: @matmul_no_2cta
 // CHECK-NOT: nvg.cluster_id

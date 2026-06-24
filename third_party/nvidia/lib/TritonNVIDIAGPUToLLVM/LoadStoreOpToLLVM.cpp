@@ -159,12 +159,10 @@ struct LoadStoreConversionBase {
       return 1;
     auto contiguity = getContiguity(ptr);
     auto pointeeBitWidth = triton::getPointeeBitWidth(tensorTy);
-    // The maximum vector size is 128 bits on NVIDIA GPUs.
-    auto vec = std::min<unsigned>(128 / pointeeBitWidth, contiguity);
-    vec = clampVecSizeForNpot(vec, tensorTy);
     LDBG("getVectorSize contiguity = " << contiguity << " pointeeBitWidth = "
-                                       << pointeeBitWidth << " vec = " << vec);
-    return vec;
+                                       << pointeeBitWidth);
+    // The maximum vector size is 128 bits on NVIDIA GPUs.
+    return std::min<unsigned>(128 / pointeeBitWidth, contiguity);
   }
 
   unsigned getMaskAlignment(Value mask) const {
@@ -355,6 +353,8 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
                      .global()
                      .o("ca", op.getCache() == triton::CacheModifier::CA)
                      .o("cg", op.getCache() == triton::CacheModifier::CG)
+                     .o("cs", op.getCache() == triton::CacheModifier::CS)
+                     .o("cv", op.getCache() == triton::CacheModifier::CV)
                      .o("L1::evict_first",
                         op.getEvict() == triton::EvictionPolicy::EVICT_FIRST)
                      .o("L1::evict_last",
@@ -1305,51 +1305,6 @@ struct AsyncCopyGlobalToLocalOpConversion
     auto smemObj =
         getSharedMemoryObjectFromStruct(loc, llDst, resElemTy, rewriter);
     auto smemLayout = ttg::toLinearLayout(dstTy);
-
-    // NVMMAShared SMEM rounds non-contiguous NPOT dims to pow2. Before a
-    // contiguous-dim split, rebuild srcLayout to the pow2-rounded shape so the
-    // split's reshapeOuts stays surjective - only when the split will fire;
-    // pure non-contiguous NPOT (no split) must NOT rebuild.
-    if (dyn_cast<ttg::NVMMASharedEncodingAttr>(dstTy.getEncoding())) {
-      auto outDimNames = standardOutDimNames(ctx, srcTy.getRank());
-
-      // Will splitNpotContiguousDim split the contiguous dim? It does so only
-      // for a rank-2, swizzled, NPOT, swizzle-compatible contiguous dim. Probe
-      // it on smemLayout for BOTH args (NOT srcLayout): srcLayout may carry a
-      // smaller NPOT non-contiguous dim whose reshape into smem's pow2-rounded
-      // space is non-surjective and would crash the probe itself. smemLayout is
-      // self-consistent, so reshaping it twice is safe. The function takes its
-      // layouts by value, so only .has_value() matters here — no throwaway
-      // copies needed.
-      bool willSplit =
-          splitNpotContiguousDim(dstTy, smemLayout, smemLayout).has_value();
-
-      bool anyMismatch = false;
-      for (auto dim : outDimNames) {
-        if (srcLayout.hasOutDim(dim) &&
-            srcLayout.getOutDimSize(dim) < smemLayout.getOutDimSize(dim)) {
-          anyMismatch = true;
-          break;
-        }
-      }
-
-      if (willSplit && anyMismatch) {
-        SmallVector<int64_t> pow2Shape;
-        for (auto dim : outDimNames) {
-          pow2Shape.push_back(smemLayout.getOutDimSize(dim));
-        }
-        srcLayout = ttg::toLinearLayout(pow2Shape, srcTy.getEncoding());
-      }
-    }
-
-    // For NPOT swizzled SMEM, reshape both layouts to split the contiguous
-    // dim into (contig_intra, contig_phase) so invertAndCompose sees each
-    // output dim with a single algebra (XOR or ADD+mod).
-    if (auto split = splitNpotContiguousDim(dstTy, smemLayout, srcLayout)) {
-      smemLayout = split->smem;
-      srcLayout = split->other;
-    }
-
     auto cvt = srcLayout.invertAndCompose(smemLayout);
     if (!cvt.isTrivialOver({str_attr("block")})) {
       return emitError(loc,
@@ -1512,10 +1467,8 @@ struct AsyncTMACopyGlobalToLocalOpConversion
 
     uint32_t barrierMask =
         toLinearLayout(barrierTy).getFreeVariableMasks().lookup(kBlock);
-    // We emit a cluster-level barrier if we change the barrier and we don't
-    // multicast over that dimension (in which case that CTA would be predicated
-    // out)
-    bool clusterBarrier = barrierMask & ~maskCGABroadcast;
+    // We emit a cluster-level barrier when the barrier mask is set.
+    bool clusterBarrier = barrierMask != 0;
     if (clusterBarrier) {
       // This part is to support TMA into tcgen05.mma 2CTA mostly, i.e.,
       // barrierMask == 1
@@ -1557,12 +1510,18 @@ struct AsyncTMACopyGlobalToLocalOpConversion
           ptxBuilderTMA.newOperand(boxPred, "b"),
           ptxBuilderTMA.newOperand(shMemPtr, "r"),
           ptxBuilderTMA.newOperand(adaptor.getDesc(), "l")};
-      std::string tmaInst =
-          "@$0 cp.async.bulk.tensor." + std::to_string(rank) +
-          "d.shared::cluster.global.mbarrier::complete_tx::bytes";
+      // The destination SMEM scope is cluster-level whenever the copy involves
+      // the cluster -- a cluster barrier (#9510), multicast, or a 2-CTA group;
+      // otherwise it is CTA-local. The barrier component keys on the barrier
+      // layout (not the SMEM layout), matching #9510.
+      auto multicastMask = op.getMulticastTargets();
+      bool clusterScope = clusterBarrier || multicast ||
+                          multicastMask != nullptr || op.getTwoCta();
+      std::string tmaInst = "@$0 cp.async.bulk.tensor." + std::to_string(rank) +
+                            "d.shared::" + (clusterScope ? "cluster" : "cta") +
+                            ".global.mbarrier::complete_tx::bytes";
       if (op.getTwoCta())
         tmaInst += ".cta_group::2";
-      auto multicastMask = op.getMulticastTargets();
       if (multicastMask != nullptr)
         tmaInst += ".multicast::cluster";
       // Add L2 cache hint modifier if eviction policy is specified

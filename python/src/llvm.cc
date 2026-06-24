@@ -133,8 +133,6 @@ createTargetMachine(llvm::Module *module, std::string proc,
   bool disableLLVMOpt = mlir::triton::tools::getBoolEnv("DISABLE_LLVM_OPT");
   if (enable_fp_fusion)
     opt.AllowFPOpFusion = llvm::FPOpFusion::Fast;
-  opt.NoInfsFPMath = false;
-  opt.NoNaNsFPMath = true;
   opt.TrapUnreachable = true;
   opt.MCOptions.AsmVerbose = true;
   opt.MCOptions.PreserveAsmComments = true;
@@ -341,6 +339,13 @@ std::string translateLLVMIRToASM(llvm::Module &module,
     setLLVMOption<bool>("print-after-all", true);
   }
 
+  // A/B: disable the post-RA machine scheduler (it can re-order the manual
+  // warp-pipeline schedule). RAII-scoped for this codegen only.
+  std::unique_ptr<ScopedLLVMOption<bool>> postMiSchedGuard;
+  if (triton::tools::getBoolEnv("TRITON_DISABLE_POST_MISCHED"))
+    postMiSchedGuard =
+        std::make_unique<ScopedLLVMOption<bool>>("enable-post-misched", false);
+
   bool disableLLVMOpt = triton::tools::getBoolEnv("DISABLE_LLVM_OPT");
   if (!disableLLVMOpt) {
     // Check to see if we are passing a list of flags to disable optimizations.
@@ -406,12 +411,11 @@ std::string translateLLVMIRToASM(llvm::Module &module,
   return result;
 }
 
-std::string translateMIRToASM(const std::string &mirPath,
-                              const std::string &triple,
-                              const std::string &proc,
-                              const std::string &features,
-                              const std::vector<std::string> &flags,
-                              bool enable_fp_fusion, bool isObject) {
+std::string
+translateMIRToASM(const std::string &mirPath, const std::string &triple,
+                  const std::string &proc, const std::string &features,
+                  const std::vector<std::string> &flags, bool enable_fp_fusion,
+                  bool isObject, bool enableMISched) {
   using namespace mlir;
 
   // We need to start before machine-scheduler and disable it instead of simply
@@ -421,8 +425,9 @@ std::string translateMIRToASM(const std::string &mirPath,
   // Use RAII to set options and restore them when scope exits
   ScopedLLVMOption<std::string> startBeforeGuard("start-before",
                                                  "machine-scheduler");
-  ScopedLLVMOption<bool> enableMISchedGuard("enable-misched", false);
-  ScopedLLVMOption<bool> enablePostMISchedGuard("enable-post-misched", false);
+  ScopedLLVMOption<bool> enableMISchedGuard("enable-misched", enableMISched);
+  ScopedLLVMOption<bool> enablePostMISchedGuard("enable-post-misched",
+                                                enableMISched);
 
   if (triton::tools::getBoolEnv("LLVM_IR_ENABLE_DUMP")) {
     setLLVMOption<bool>("print-after-all", true);
@@ -607,8 +612,7 @@ void init_triton_llvm(py::module &&m) {
   m.attr("OPTIMIZE_O1") = llvm::OptimizationLevel::O1;
   m.attr("OPTIMIZE_O2") = llvm::OptimizationLevel::O2;
   m.attr("OPTIMIZE_O3") = llvm::OptimizationLevel::O3;
-  m.attr("OPTIMIZE_Os") = llvm::OptimizationLevel::Os;
-  m.attr("OPTIMIZE_Oz") = llvm::OptimizationLevel::Oz;
+  // Os and Oz were removed from llvm::OptimizationLevel in LLVM 20+
 
   m.def(
       "to_module",
@@ -850,18 +854,22 @@ void init_triton_llvm(py::module &&m) {
       "translate_mir_to_asm",
       [](std::string mirPath, std::string triple, std::string proc,
          std::string features, std::vector<std::string> flags,
-         bool enable_fp_fusion, bool isObject) -> py::object {
+         bool enable_fp_fusion, bool isObject,
+         bool enableMISched) -> py::object {
         std::string result;
         {
           py::gil_scoped_release allow_threads;
           result = translateMIRToASM(mirPath, triple, proc, features, flags,
-                                     enable_fp_fusion, isObject);
+                                     enable_fp_fusion, isObject, enableMISched);
         }
         if (isObject)
           return py::bytes(result);
         else
           return py::str(result);
       },
+      py::arg("mirPath"), py::arg("triple"), py::arg("proc"),
+      py::arg("features"), py::arg("flags"), py::arg("enable_fp_fusion"),
+      py::arg("isObject"), py::arg("enableMISched") = false,
       ret::take_ownership);
 
   m.def("init_targets", []() {

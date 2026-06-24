@@ -46,7 +46,7 @@ public:
       : numThreadsPerWarp(numThreadsPerWarp) {}
 
   bool isBarrierOp(Operation *op) const override {
-    return isa<NVVM::Barrier0Op>(op);
+    return isa<NVVM::BarrierOp>(op);
   }
 
   Type getBarrierHandleType(MLIRContext *ctx) const override {
@@ -77,10 +77,7 @@ public:
     if (numThreads == 32) {
       LLVM::NVIDIA::createSyncWarp(b.getLoc(), b);
     } else {
-      NVVM::BarrierOp::create(b, b.getLoc(), mlir::TypeRange{}, handle,
-                              b.i32_val(numThreads),
-                              /*reductionOp=*/nullptr,
-                              /*reductionPredicate=*/nullptr);
+      NVVM::BarrierOp::create(b, b.getLoc(), handle, b.i32_val(numThreads));
     }
   }
 

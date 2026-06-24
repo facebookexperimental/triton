@@ -224,6 +224,15 @@ Attribute mlir::triton::tlx::wrapNoVerifyLayout(Attribute layout) {
     return layout;
   if (!isa<ttg::DistributedEncodingTrait>(layout))
     return layout;
+  if (auto mmaLayout = dyn_cast<ttg::NvidiaMmaEncodingAttr>(layout);
+      mmaLayout && mmaLayout.isHopper())
+    return layout;
+  if (auto dotLayout = dyn_cast<ttg::DotOperandEncodingAttr>(layout)) {
+    if (auto parentLayout =
+            dyn_cast<ttg::NvidiaMmaEncodingAttr>(dotLayout.getParent());
+        parentLayout && parentLayout.isHopper())
+      return layout;
+  }
   return NoVerifyLayoutAttr::get(layout.getContext(), layout);
 }
 
