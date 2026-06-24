@@ -3381,6 +3381,36 @@ void insertAsyncComm(
           headProducer->getLoc(), 0, 1);
     }
 
+    // For SMEM channels whose producer/consumer ops live inside a
+    // SubtiledRegionOp, the barrier slot/phase must vary per tile: all subtiles
+    // share ONE barrier, so each must occupy a distinct generation. Lazily
+    // compute, once per region, a per-tile *flattened accumulation count*
+    // (accumCnt * numTiles + tileIdx) and thread it as a per-tile arg; the
+    // barrier bufferIdx/phase are then derived inside the tile body, forming
+    // one monotonic stream. Returns a null Value when no per-tile mapping
+    // exists (callers fall back to the shared bufferIdx/phase). Keyed by the
+    // SubtiledRegionOp so the producer and consumer regions get independent
+    // counts carrying their own task ids.
+    DenseMap<Operation *, Value> perTileStaggeredArg;
+    DenseSet<Operation *> perTileStaggeredTried;
+    auto getPerTileStaggeredArg = [&](ttng::SubtiledRegionOp sub) -> Value {
+      Operation *key = sub.getOperation();
+      if (perTileStaggeredTried.insert(key).second) {
+        Value result;
+        if (reuseGrp >= 0) {
+          SmallVector<Value> staggered;
+          OpBuilderWithAsyncTaskIds idxBuilder(sub.getOperation());
+          if (getPerTileStaggeredAccumCnt(idxBuilder, sub, sub.getOperation(),
+                                          regionsWithChannels, config, reuseGrp,
+                                          config->getGroup(reuseGrp)->channels,
+                                          bufferMap, staggered))
+            result = sub.addPerTileArg(staggered);
+        }
+        perTileStaggeredArg[key] = result;
+      }
+      return perTileStaggeredArg.lookup(key);
+    };
+
     // Lower TMA loads and TCGen5MMAOp first before inserting synchronization
     // primitives to avoid displacement.
 
@@ -3693,10 +3723,17 @@ void insertAsyncComm(
                                  ? tmaHeadProducer
                                  : producerAcquirePoint;
           auto tileToken = producerSubtiled.addSharedArg(token.second);
-          auto tileBufIdx = producerSubtiled.addSharedArg(bufferIdx);
-          auto tilePhase = producerSubtiled.addSharedArg(phase);
-          OpBuilder tileBuilder(annotTarget);
+          OpBuilderWithAsyncTaskIds tileBuilder(annotTarget);
           tileBuilder.setInsertionPoint(annotTarget);
+          Value tileBufIdx, tilePhase;
+          if (Value staggered = getPerTileStaggeredArg(producerSubtiled)) {
+            std::tie(tileBufIdx, tilePhase) = getBufferIdxAndPhase(
+                tileBuilder, annotTarget->getLoc(), staggered,
+                kv.second.front()->getNumBuffers());
+          } else {
+            tileBufIdx = producerSubtiled.addSharedArg(bufferIdx);
+            tilePhase = producerSubtiled.addSharedArg(phase);
+          }
           ttnvws::ProducerAcquireOp::create(
               tileBuilder, annotTarget->getLoc(), tileToken, tileBufIdx,
               tilePhase,
@@ -3858,9 +3895,17 @@ void insertAsyncComm(
                                  ? tailProducer
                                  : producerCommitPoint;
           auto tileToken = commitSubtiled.addSharedArg(token.second);
-          auto tileBufIdx = commitSubtiled.addSharedArg(bufferIdx);
-          OpBuilder tileBuilder(annotTarget);
+          OpBuilderWithAsyncTaskIds tileBuilder(annotTarget);
           tileBuilder.setInsertionPointAfter(annotTarget);
+          Value tileBufIdx;
+          if (Value staggered = getPerTileStaggeredArg(commitSubtiled)) {
+            // ProducerCommit only needs the buffer index (it is an arrive).
+            std::tie(tileBufIdx, std::ignore) = getBufferIdxAndPhase(
+                tileBuilder, annotTarget->getLoc(), staggered,
+                kv.second.front()->getNumBuffers());
+          } else {
+            tileBufIdx = commitSubtiled.addSharedArg(bufferIdx);
+          }
           ttnvws::ProducerCommitOp::create(
               tileBuilder, annotTarget->getLoc(), tileToken, tileBufIdx,
               WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
@@ -3977,10 +4022,17 @@ void insertAsyncComm(
             insertTarget = consumerWaitPoint;
           }
           auto tileToken = subtiled.addSharedArg(token.second);
-          auto tileBufIdx = subtiled.addSharedArg(bufferIdx);
-          auto tilePhase = subtiled.addSharedArg(phase);
-          OpBuilder tileBuilder(insertTarget);
+          OpBuilderWithAsyncTaskIds tileBuilder(insertTarget);
           tileBuilder.setInsertionPoint(insertTarget);
+          Value tileBufIdx, tilePhase;
+          if (Value staggered = getPerTileStaggeredArg(subtiled)) {
+            std::tie(tileBufIdx, tilePhase) = getBufferIdxAndPhase(
+                tileBuilder, insertTarget->getLoc(), staggered,
+                kv.second.front()->getNumBuffers());
+          } else {
+            tileBufIdx = subtiled.addSharedArg(bufferIdx);
+            tilePhase = subtiled.addSharedArg(phase);
+          }
           ttnvws::ConsumerWaitOp::create(tileBuilder, insertTarget->getLoc(),
                                          tileToken, tileBufIdx, tilePhase);
           LDBG("create inline ConsumerWait in SubtiledRegionOp "
@@ -4052,9 +4104,17 @@ void insertAsyncComm(
             insertTarget = consumerReleasePoint;
           }
           auto tileToken = subtiled.addSharedArg(token.second);
-          auto tileBufIdx = subtiled.addSharedArg(bufferIdx);
-          OpBuilder tileBuilder(insertTarget);
+          OpBuilderWithAsyncTaskIds tileBuilder(insertTarget);
           tileBuilder.setInsertionPointAfter(insertTarget);
+          Value tileBufIdx;
+          if (Value staggered = getPerTileStaggeredArg(subtiled)) {
+            // ConsumerRelease only needs the buffer index (it is an arrive).
+            std::tie(tileBufIdx, std::ignore) = getBufferIdxAndPhase(
+                tileBuilder, insertTarget->getLoc(), staggered,
+                kv.second.front()->getNumBuffers());
+          } else {
+            tileBufIdx = subtiled.addSharedArg(bufferIdx);
+          }
           ttnvws::ConsumerReleaseOp::create(tileBuilder, insertTarget->getLoc(),
                                             tileToken, tileBufIdx);
           LDBG("create inline ConsumerRelease in SubtiledRegionOp "
