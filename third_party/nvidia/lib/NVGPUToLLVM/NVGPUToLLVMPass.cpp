@@ -551,9 +551,9 @@ static Value createTMAlloc(IRRewriter &rewriter, LLVM::LLVMFuncOp func,
       /*onlyAttachMLIRArgs=*/true);
   auto voidTy = void_ty(func->getContext());
   ptxBuilder.launch(rewriter, loc, void_ty(func->getContext()));
-  NVVM::Barrier0Op::create(rewriter, loc);
+  NVVM::BarrierOp::create(rewriter, loc);
   Value address = b.load(i32_ty, sharedMem);
-  NVVM::Barrier0Op::create(rewriter, loc);
+  NVVM::BarrierOp::create(rewriter, loc);
   address = b.inttoptr(ptr_ty(func.getContext(), 6), address);
   return address;
 }
@@ -596,7 +596,7 @@ void freeTMAlloc(LLVM::LLVMFuncOp func, Value alloc, size_t size, Value pred,
       // Non-TLX 2-CTA AutoWS: this code runs only in the default warp group's
       // exit path. Workers are in the switch loop and cannot participate in a
       // cluster-wide barrier, so use a CTA-level barrier instead.
-      NVVM::Barrier0Op::create(b, loc);
+      NVVM::BarrierOp::create(b, loc);
     }
     PTXBuilder ptxBuilder;
     // Calculate the predicate in the inline asm to avoid creating long

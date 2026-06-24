@@ -196,7 +196,7 @@ LogicalResult ExtractSliceOp::verify() {
 // operations. When extract_slice is used to extract a portion that exactly
 // matches one of the original tensors concatenated by a concat operation, we
 // can eliminate extract_slice op and use the original tensor directly.
-struct CononicalizeExtractSliceAndConcat
+struct CanonicalizeExtractSliceAndConcat
     : public mlir::OpRewritePattern<amdgpu::ExtractSliceOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -249,7 +249,7 @@ struct CononicalizeExtractSliceAndConcat
 
 void ExtractSliceOp::getCanonicalizationPatterns(
     mlir::RewritePatternSet &patterns, mlir::MLIRContext *context) {
-  patterns.add<CononicalizeExtractSliceAndConcat>(context);
+  patterns.add<CanonicalizeExtractSliceAndConcat>(context);
 }
 
 LogicalResult UpcastMXFPOp::verify() {
@@ -632,6 +632,23 @@ LogicalResult ConcatOp::verify() {
   return success();
 }
 
+LogicalResult BufferLoadToLocalOp::verify() {
+  auto mod = getOperation()->getParentOfType<ModuleOp>();
+  if (!mod)
+    return success();
+
+  auto arch = mlir::getAMDArch(mod);
+  // buffer_load_to_local is supported only on CDNA3 (gfx942) and CDNA4
+  // (gfx950) -- i.e. AMD::TargetInfo::supportsBufferLoadToLocal() returns
+  // isaFamily in {CDNA3, CDNA4}. We check the arch string directly here rather
+  // than constructing AMD::TargetInfo (or calling deduceISAFamily): both live
+  // in the TritonAMDGPUToLLVM lowering library, which this IR dialect library
+  // (TritonAMDGPUIR) must not depend on.
+  if (!arch || *arch == "gfx942" || *arch == "gfx950")
+    return success();
+  return emitError() << "BufferLoadToLocal unsupported on target architecture";
+}
+
 LogicalResult LocalLoadPackedTransposedOp::verify() {
   auto srcTy = getSrc().getType();
   auto dstTy = getType();
@@ -933,7 +950,7 @@ LogicalResult AsyncCopyMbarrierArriveOp::verify() {
 // prefetch instruction.
 LogicalResult TDMPrefetchOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
     SmallVectorImpl<Type> &inferredReturnTypes) {
   TDMPrefetchOp::Adaptor ad(operands, attributes, properties, regions);
 

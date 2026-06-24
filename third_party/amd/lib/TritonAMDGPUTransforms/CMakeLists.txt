@@ -7,6 +7,7 @@ add_triton_library(TritonAMDGPUTransforms
   ConvertToBufferOps.cpp
   ConvertToTensorOps.cpp
   LowerBarrierOps.cpp
+  OptimizeBufferOpPtr.cpp
   OptimizeEpilogue.cpp
   OptimizeDotOperands.cpp
   HoistLayoutConversions.cpp

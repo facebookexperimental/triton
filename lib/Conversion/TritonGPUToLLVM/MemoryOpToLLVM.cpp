@@ -290,7 +290,8 @@ public:
       return failure();
     }
     // Keep the "partition" output dim (PartitionedSharedEncoding) so lowerLdSt
-    // can select the per-partition base pointer; lowerLdSt strips it afterwards.
+    // can select the per-partition base pointer; lowerLdSt strips it
+    // afterwards.
     SmallVector<StringAttr> ldStOutDims = {kOffset};
     auto kPartition = str_attr("partition");
     if (cvt.hasOutDim(kPartition))

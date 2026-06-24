@@ -1,3 +1,4 @@
+import math
 import random
 
 import pytest
@@ -54,13 +55,23 @@ from triton.language.extra.tlx.tutorials.hopper_fa_ws import (
     attention as _hopper_fa_ws, )
 from triton.language.extra.tlx.tutorials.amd_fa_pipelined import (
     attention as _amd_fa_pipelined, )
+from triton.language.extra.tlx.tutorials.amd_fa_persistent import (
+    attention as _amd_fa_persistent, )
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul as _amd_tdm_gemm_pipelined, )
 from triton.language.extra.tlx.tutorials.amd_gemm_warp_pipeline import (
     matmul as _amd_gemm_warp_pipeline, )
+from triton.language.extra.tlx.tutorials.amd_gemm_pipelined import (
+    matmul as _amd_gemm_pipelined, )
 from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
     matmul as _amd_mxfp_gemm_tdm_pipelined,
     pack_scale as _amd_mxfp_pack_scale,
+)
+from triton.language.extra.tlx.tutorials.amd_addmm_glu import (
+    KERNEL_REGISTRY as _amd_addmm_glu_registry,
+    pytorch_baseline as _amd_addmm_glu_baseline,
+    M as _amd_addmm_glu_M,
+    N as _amd_addmm_glu_N,
 )
 from triton.tools.mxfp import MXScaleTensor
 
@@ -80,7 +91,7 @@ from triton.language.extra.tlx.tutorials.testing.multi_cta_layer_norm import (
     multi_cta_layernorm_2d as _multi_cta_layernorm_2d,
 )
 
-from triton._internal_testing import is_blackwell, is_hopper, is_hopper_or_newer, is_hip_cdna4, is_hip_gfx1250
+from triton._internal_testing import is_blackwell, is_hopper, is_hopper_or_newer, is_hip, is_hip_cdna4, is_hip_gfx1250
 from triton.language.extra.tlx.tutorials.testing.gemm_shapes import (
     BLACKWELL_GEMM_WS as _BLACKWELL_GEMM_WS_MORE_SHAPES, )
 
@@ -959,6 +970,56 @@ def test_amd_fa_pipelined(config_name, causal):
         torch.testing.assert_close(tri_out, ref_out, atol=2e-2, rtol=0)
 
 
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "nocausal"])
+@pytest.mark.parametrize("N_CTX", [128, 192, 256, 500, 512, 1024])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_fa_persistent(N_CTX, causal):
+    """Persistent AMD FA fwd: async prefetch + XCD-grouped zig-zag scheduler."""
+    torch.manual_seed(42)
+    B, H, D = 1, 4, 128
+    dtype = torch.bfloat16
+    q = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=dtype)
+    k = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=dtype)
+    v = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=dtype)
+    sm = 1.0 / math.sqrt(D)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=sm)
+    out = _amd_fa_persistent(q, k, v, sm, causal)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "nocausal"])
+@pytest.mark.parametrize(
+    "q_len,kv_len",
+    [(256, 1024), (1024, 256), (1, 1024), (1024, 1024)],
+    ids=["cross_qlt", "cross_qgt", "decode", "square"],
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_fa_persistent_cross_attention(q_len, kv_len, causal):
+    """Persistent kernel with q_len != kv_len (cross-attention / decode).
+
+    Causal uses bottom-right alignment (key j attends iff j <= i + (kv_len -
+    q_len)) — the decode/KV-cache and FlashAttention convention.
+    """
+    torch.manual_seed(42)
+    B, H, D = 1, 8, 128
+    dtype = torch.bfloat16
+    q = torch.randn(B, H, q_len, D, device=DEVICE, dtype=dtype)
+    k = torch.randn(B, H, kv_len, D, device=DEVICE, dtype=dtype)
+    v = torch.randn(B, H, kv_len, D, device=DEVICE, dtype=dtype)
+    sm = 1.0 / math.sqrt(D)
+    if not causal:
+        ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=sm)
+    else:
+        i = torch.arange(q_len, device=q.device)[:, None]
+        j = torch.arange(kv_len, device=q.device)[None, :]
+        bias = torch.zeros(q_len, kv_len, device=q.device,
+                           dtype=q.dtype).masked_fill(~(j <= i + (kv_len - q_len)), float("-inf"))
+        ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=bias, scale=sm)
+    out = _amd_fa_persistent(q, k, v, sm, causal)
+    valid = ~torch.isnan(ref.float())  # fully-masked rows (q_len > kv_len) are undefined
+    torch.testing.assert_close(out.float()[valid], ref.float()[valid], atol=2e-2, rtol=2e-2)
+
+
 # =============================================================================
 # AMD TDM GEMM Tests (gfx1250)
 # =============================================================================
@@ -974,6 +1035,13 @@ def test_amd_tdm_gemm_pipelined(dtype):
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_amd_gemm_warp_pipeline(dtype):
     Gemm.run_test(_amd_gemm_warp_pipeline, Gemm.CONFIGS["amd_gemm_warp_pipeline"], dtype=dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip(), reason="Requires AMD GPU")
+def test_amd_gemm_pipelined(dtype):
+    # Autotuned kernel: no fixed config (config=None).
+    Gemm.run_test(_amd_gemm_pipelined, None, dtype=dtype)
 
 
 # =============================================================================
@@ -1019,6 +1087,26 @@ def test_amd_mxfp_gemm_tdm_pipelined(TRANSPOSE_B):
     config["TRANSPOSE_B"] = TRANSPOSE_B
     out = _amd_mxfp_gemm_tdm_pipelined(a_d, b_d, a_scale.to(DEVICE), b_scale.to(DEVICE), config=config)
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-5, atol=2e-2)
+
+
+# =============================================================================
+# AMD addmm + GLU Tests (gfx950)
+# =============================================================================
+
+
+@pytest.mark.parametrize("K", [256, 512, 1024])
+@pytest.mark.parametrize("kernel_name", list(_amd_addmm_glu_registry))
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_addmm_glu(kernel_name, K):
+    M, N = _amd_addmm_glu_M, _amd_addmm_glu_N
+    torch.manual_seed(0)
+    a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
+    bias = torch.randn(N, device=DEVICE, dtype=torch.float16)
+    y = torch.randn(M, N, device=DEVICE, dtype=torch.float16)
+    ref = _amd_addmm_glu_baseline(bias, a, b, y)
+    out = _amd_addmm_glu_registry[kernel_name](a, b, bias, y)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
 # =============================================================================

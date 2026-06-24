@@ -135,6 +135,9 @@ protected:
 
 class AxisInfoAnalysis : public dataflow::SparseForwardDataFlowAnalysis<
                              dataflow::Lattice<AxisInfo>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AxisInfoAnalysis)
+
 private:
   AxisInfoVisitorList visitors;
 

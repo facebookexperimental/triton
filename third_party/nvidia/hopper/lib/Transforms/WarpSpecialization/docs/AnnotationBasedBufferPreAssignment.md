@@ -61,7 +61,7 @@ The `tt.autows` attribute survives through `AccelerateMatmul` (which propagates 
 | Phase | Action | Annotated Buffer Behavior |
 |-------|--------|---------------------------|
 | 1. Initialize | Create `WSBuffer` per `local_alloc`, `bufferId = nextId++`, `numCopies = 1` | **Override**: set `bufferId` and `numCopies` from annotation, mark `isPinned = true` |
-| 2. Cross-stage minimum | `numCopies = 2` for cross-stage buffers | **Skip** pinned buffers |
+| 2. Cross-stage minimum | Enforce computed cross-stage depth for heuristic buffers | **Preserve** pinned buffers; warn if the annotation is below the computed required depth |
 | 3. Classify priorities | P0 (TMA+innermost), P1, P2 | **Skip** pinned buffers |
 | 4. Iterative copy increase | Increment copies within SMEM budget; optional circular reuse pairing | **Exclude** pinned buffers from candidates |
 | 5. Emit attributes | Write `buffer.id`, `buffer.copy` on each `local_alloc` | No change — emits from WSBuffer fields |
@@ -235,8 +235,16 @@ nextBufferId = std::max(nextBufferId, maxAnnotatedId);
 ```cpp
 // Phase 2 (cross-stage enforcement):
 for (auto &buf : wsBuffers) {
-  if (buf.isPinned) continue;  // NEW
-  if (buf.isCrossStage && numBuffers >= 2) { ... }
+  if (buf.isPinned) {
+    // Preserve the user annotation, but diagnose if it is below
+    // getSmemCrossStageDepth(buf.allocOp, channels).
+    continue;
+  }
+  if (buf.isCrossStage) {
+    // Enforce getSmemCrossStageDepth(buf.allocOp, channels) as an uncapped
+    // correctness floor. It may exceed numBuffers.
+    ...
+  }
 }
 
 // Phase 3 (priority classification):
@@ -353,7 +361,8 @@ if (!heuristicAllocs.empty()) {
 Add throughout the implementation:
 
 - **memType mismatch**: Warn if SMEM channel annotated with `"tmem"` or vice versa
-- **Cross-stage numCopies**: Warn if annotated SMEM `numCopies == 1` for a cross-stage buffer
+- **Cross-stage numCopies**: Warn if annotated SMEM `numCopies` is below the
+  computed cross-stage depth for that buffer
 - **TMEM reuse validity**: Warn on liveness overlap or size incompatibility
 - **LDBG logging** for all annotation decisions, matching existing style
 
