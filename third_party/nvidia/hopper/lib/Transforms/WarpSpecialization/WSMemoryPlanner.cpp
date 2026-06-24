@@ -844,7 +844,7 @@ getWSBufferUsageOrder(const WSBuffer &buf, SmallVector<Channel *> &channels,
 /// Format: "opndA,smem,2,0" → operand=opndA, memType=smem, numCopies=2,
 /// bufferId=0.
 struct ChannelAnnotation {
-  std::string operand; // "opndA", "opndB", "opndD"
+  std::string operand; // "opndA", "opndB", "opndD", or scaled-MMA scales
   std::string memType; // "smem", "tmem"
   unsigned numCopies;
   unsigned bufferId;
@@ -858,9 +858,25 @@ static std::optional<unsigned> parseUnsignedAnnotationField(StringRef field) {
   return value;
 }
 
+static std::optional<unsigned> getChannelAnnotationOperandIdx(StringRef name) {
+  if (name == "opndA")
+    return 0;
+  if (name == "opndB")
+    return 1;
+  if (name == "opndD")
+    return 2;
+  // In TCGen5MMAScaledOp, acc_dep is operand 3, so scales are operands 4/5.
+  if (name == "opndAScale" || name == "opndA_scale")
+    return 4;
+  if (name == "opndBScale" || name == "opndB_scale")
+    return 5;
+  return std::nullopt;
+}
+
 /// Parse tt.autows channel annotations from all MMA ops in parentOp.
 /// Returns a map from (mmaOp, operandIdx) → ChannelAnnotation, where
-/// operandIdx is 0=opndA, 1=opndB, 2=opndD.
+/// operandIdx is the actual MMA operand index: 0=opndA, 1=opndB, 2=opndD,
+/// and for scaled MMA only 4=opndAScale, 5=opndBScale.
 /// Detects and warns about conflicting annotations.
 static std::map<std::pair<Operation *, unsigned>, ChannelAnnotation>
 parseChannelAnnotations(Operation *parentOp) {
@@ -908,8 +924,8 @@ parseChannelAnnotations(Operation *parentOp) {
       ann.bufferId = *bufferId;
 
       // Validate operand name.
-      if (ann.operand != "opndA" && ann.operand != "opndB" &&
-          ann.operand != "opndD") {
+      auto opIdx = getChannelAnnotationOperandIdx(ann.operand);
+      if (!opIdx) {
         LDBG("WARNING: invalid operand name '"
              << ann.operand << "' in channel annotation, skipping");
         continue;
@@ -921,12 +937,8 @@ parseChannelAnnotations(Operation *parentOp) {
         continue;
       }
 
-      unsigned opIdx = ann.operand == "opndA"   ? 0
-                       : ann.operand == "opndB" ? 1
-                                                : 2; // opndD
-
       // Check for duplicate operand annotation on the same MMA.
-      auto key = std::make_pair(op, opIdx);
+      auto key = std::make_pair(op, *opIdx);
       auto dupIt = result.find(key);
       if (dupIt != result.end()) {
         auto &prev = dupIt->second;
@@ -1013,19 +1025,25 @@ static DenseMap<Operation *, ChannelAnnotation> buildAllocToAnnotationMap(
 
   for (auto &[key, ann] : annotations) {
     auto [mmaOp, opIdx] = key;
-    auto tcMma = dyn_cast<ttng::TCGen5MMAOp>(mmaOp);
-    if (!tcMma)
+    auto mma = dyn_cast<ttng::MMAv5OpInterface>(mmaOp);
+    if (!mma)
       continue;
 
     // Get the MMA operand value for this annotation.
     Value operandVal;
     if (opIdx == 0)
-      operandVal = tcMma.getA();
+      operandVal = mma.getA();
     else if (opIdx == 1)
-      operandVal = tcMma.getB();
+      operandVal = mma.getB();
     else if (opIdx == 2)
-      operandVal = tcMma.getD();
-    else
+      operandVal = mma.getAccumulator();
+    else if (auto scaledMma = dyn_cast<ttng::TCGen5MMAScaledOp>(mmaOp)) {
+      if (opIdx == 4)
+        operandVal = scaledMma.getAScale();
+      else if (opIdx == 5)
+        operandVal = scaledMma.getBScale();
+    }
+    if (!operandVal)
       continue;
 
     // Trace back to the defining alloc op.
