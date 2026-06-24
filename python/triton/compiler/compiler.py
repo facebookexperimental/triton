@@ -543,6 +543,15 @@ class CompiledKernel:
             return None
         return json.loads(raw) if isinstance(raw, str) else raw
 
+    def __del__(self):
+
+        if self.module is not None:
+            if knobs.runtime.module_unload_hook is not None:
+                knobs.runtime.module_unload_hook(self.module, self.function, self.name, self.metadata_group, self.hash)
+
+            driver.active.utils.unload_module(self.module)
+            self.module = None
+
     def _init_handles(self):
         if self.module is not None:
             return

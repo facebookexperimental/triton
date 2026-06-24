@@ -28,38 +28,38 @@ Related skills: `autows-testing` (run tests), `ir-debugging` (IR dumps),
 
 ## Key Authoring Rules
 
-1. **Prefer a persistent kernel — give AutoWS a loop to specialize.** AutoWS
-   pipelines work across *loop iterations* (the producer loads tile N+1 while
-   the consumers compute tile N), so a kernel with no loop gives the compiler
-   nothing to specialize and WS is silently stripped. Single-shot
-   pointwise / memory-bound ops — e.g. a fused SwiGLU forward that handles one
-   row-block per program — must be restructured into a **persistent** kernel
-   (`grid = #SMs`; each program loops over output tiles with
-   `tl.range(start_pid, num_tiles, NUM_SMS, warp_specialize=True)`) so the
-   load→compute→store pipeline spans iterations. This applies even when the
-   per-tile body has no reduction loop: the persistent tile loop is itself the
-   loop AutoWS specializes.
-
-2. **Place `warp_specialize=True` on the outermost/persistent loop.** For
+1. **Place `warp_specialize=True` on the outermost/persistent loop.** For
    persistent kernels, annotate the tile loop
    (`tl.range(start_pid, num_tiles, NUM_SMS, warp_specialize=True)`), not the
    inner K-reduction loop. The inner loop uses plain `range()`. For
    non-persistent kernels, annotate the main compute loop.
 
-3. **Use TMA loads.** AutoWS partitions loads into a producer warp group and
+2. **Use TMA loads.** AutoWS partitions loads into a producer warp group and
    compute into consumer warp groups. This partitioning is most effective with
    TMA descriptor loads (`a_desc.load(...)`) rather than pointer-based
    `tl.load()`. TMA enables async bulk copies that the producer can issue
    independently while consumers compute. All reference kernels use
    `TensorDescriptor` + `desc.load()`/`desc.store()`.
 
-4. **Memory allocation and partition scheduling kwargs are Meta-only.** The
+3. **Memory allocation and partition scheduling kwargs are Meta-only.** The
    `tl.range()` kwargs for controlling memory allocation (`smem_alloc_algo`,
    `tmem_alloc_algo`, `smem_budget`, `smem_circular_reuse`) and partition
    scheduling (`merge_epilogue`, `merge_correction`,
    `merge_epilogue_to_computation`, `separate_epilogue_store`) are consumed
    exclusively by Meta's WS passes. They do not exist in OSS Triton's
    `tl.range()` — see [OSS Fallback](#oss-triton-fallback) for how to gate them.
+
+5. **Compute the post-loop epilogue from the genuine MMA accumulator — never a
+   synthetic matmul.** The partition scheduler keeps a post-loop
+   reduction/gate/epilogue only if it sits in a real MMA's backward slice. If the
+   reduction is fed by a *synthetic* matmul inserted only to create an MMA (e.g.
+   `(x·x)@e0` to get a row-sum), the post-loop region belongs to no genuine MMA
+   and the scheduler **elides the entire epilogue**: the kernel still emits
+   `ttg.warp_specialize` and passes a structural WS check, but the `tl.sum` /
+   normalize / `tt.store` ops are all dropped and the output is unwritten garbage
+   (a silent correctness failure, not a compile error). Reduce or gate from the
+   real `A@B` accumulator instead. Confirm the WS TTGIR has a dedicated
+   `"epilogue"` Meta partition and that the store ops survive.
 
 ---
 
@@ -406,6 +406,13 @@ def test_my_kernel():
    ```bash
    TRITON_USE_META_WS=1 python python/tutorials/test_hopper_fwd_autows_vs_tlx.py
    ```
+
+> **`ttg.warp_specialize` is necessary, not sufficient.** Its presence or count
+> alone does not prove a correct WS kernel — an elided epilogue (Key Authoring
+> Rule 5) leaves the op in the IR while the stores are gone. Prefer the **named
+> Meta partition list** as the reliable signal: a `"load"` / `"gemm"` /
+> `"computation"` set, plus a dedicated `"epilogue"` partition whenever the kernel
+> has a post-loop epilogue.
 
 ---
 

@@ -285,8 +285,7 @@ def multi_cta_layernorm(
         # checkout / pytest prepend); under Buck the module ships nested at
         # triton.language.extra.tlx.tutorials.* and the bare name is not found.
         from triton.language.extra.tlx.tutorials.blackwell_multi_cta_layernorm_ws_test import (
-            multi_cta_layernorm_ws,
-        )
+            multi_cta_layernorm_ws, )
 
         return multi_cta_layernorm_ws(x, weight, bias, eps)
 

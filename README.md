@@ -960,6 +960,28 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
 
 [Warp-Specialized computation-pipelined pingpong FA fwd on Hopper](third_party/tlx/tutorials/hopper_fa_ws_pipelined_pingpong_test.py)
 
+### AMD kernels (gfx950 / CDNA4)
+
+[LDS-pipelined GEMM](third_party/tlx/tutorials/amd_gemm_pipelined.py)
+
+[Warp-pipelined GEMM](third_party/tlx/tutorials/amd_gemm_warp_pipeline.py)
+
+[Async-DMA Flash Attention fwd — simple / prefetch](third_party/tlx/tutorials/amd_fa_pipelined.py)
+
+[Persistent Flash Attention fwd — XCD zig-zag, cross-attention / decode](third_party/tlx/tutorials/amd_fa_persistent.py)
+
+[Fused addmm + GLU (Gated Linear Unit: out = x + x*y, x = A@B + bias)](third_party/tlx/tutorials/amd_addmm_glu.py)
+
+[IKBO Flash Attention (In-Kernel Broadcast Optimization, candidate/user broadcast)](third_party/tlx/tutorials/ikbo/ikbo_fa_triton.py)
+
+[IKBO LCE (logit cross-entropy over candidate/user embeddings — not attention)](third_party/tlx/tutorials/ikbo/ikbo_lce_triton.py)
+
+### AMD kernels (gfx1250)
+
+[TDM-pipelined GEMM](third_party/tlx/tutorials/amd_tdm_gemm_pipelined.py)
+
+[MXFP TDM-pipelined GEMM](third_party/tlx/tutorials/amd_mxfp_gemm_tdm_pipelined.py)
+
 
 
 
@@ -986,7 +1008,15 @@ To run Blackwell GEMM tutorial kernels, you can use the following command:
 
 By default only one autotune config will be used by correctness test.
 
-## Change 3: One performance test script for each op {gemm, matmul} x {hopper, blackwell}
+All kernels — Hopper, Blackwell, and AMD — share this one file; each test is
+arch-gated with `@pytest.mark.skipif`, so on any given GPU only the relevant
+cases run and the rest skip. To run just the AMD/IKBO cases:
+
+`pytest third_party/tlx/tutorials/testing/test_correctness.py -k "amd or ikbo"`
+
+(on gfx950 the gfx1250-only GEMM cases skip automatically).
+
+## Change 3: One performance test script per op × arch (Hopper, Blackwell, AMD)
 
 `third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_hopper_gemm_perf.py [--version {ws|pipelined}]`
 
@@ -994,7 +1024,40 @@ By default only one autotune config will be used by correctness test.
 
 `third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_blackwell_gemm_perf.py [--version {ws|pipelined|clc|2cta}]`
 
-`third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_blackwell_fa_perf.py [--version {ws|ws_pipelined|ws_pipelined_pingpong|ws_pipelined_pingpong_persistent}]`
+`third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_blackwell_fa_perf.py [--version {ws|ws_persistent|ws_pipelined|ws_pipelined_persistent|clc}]`
+
+`denoise.sh` wraps AMD runs too (it applies NUMA pinning and runs the
+benchmark; the GPU clock/power lock is NVIDIA-only and is simply skipped on AMD).
+gfx950 / CDNA4:
+
+`third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_amd_gemm_perf.py [--version {warp_pipeline|pipelined}]`
+
+`third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_amd_fa_perf.py [--version {simple|prefetch|persistent}]`
+
+`third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_amd_addmm_glu_perf.py [--version {tlx_baseline|tlx_simple_async|tlx_optimized_async|tlx_optimized|tlx_persistent}]`
+
+`third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_amd_ikbo_fa_perf.py`  (IKBO Flash Attention)
+
+`third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_amd_ikbo_lce_perf.py`  (IKBO LCE — distinct op, not attention)
+
+gfx1250:
+
+`third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_amd_mxfp_gemm_perf.py [--transpose-b]`
+
+## TLX-AMD CI
+
+AMD tutorial kernels are exercised by `.github/workflows/mi350.yml` on a gfx950
+(MI350 / CDNA4) runner, mirroring the H100 job in `.github/workflows/h100.yml`:
+
+- **`mi350-tlx-test`** — TLX unit tests (`python/test/unit/language/test_tlx_*.py`)
+  plus the tutorial correctness suite
+  (`third_party/tlx/tutorials/testing/test_correctness.py`). AMD and IKBO cases
+  run; Hopper/Blackwell and gfx1250 cases auto-skip via the arch gates.
+- **`mi350-meta-triton-test`** — TritonBench performance coverage (the AMD perf
+  scripts above are for local runs; perf-regression tracking lives in TritonBench).
+
+Both run on push, PR, and the nightly schedule; nightly failures are filed as
+issues via `report-nightly-failure.yml`.
 
 ## More reading materials
 
