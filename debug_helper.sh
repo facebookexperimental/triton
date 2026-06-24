@@ -5,6 +5,7 @@
 #   ./debug_helper.sh
 #   ./debug_helper.sh --list-investigations
 #   ./debug_helper.sh --run-subagent barrier_visualization <claude|codex> <ir-path> <out-dir> [context-file]
+#   ./debug_helper.sh --run-subagent ir_override_ablation <claude|codex> <ir-path> <out-dir> [context-file]
 
 set -euo pipefail
 
