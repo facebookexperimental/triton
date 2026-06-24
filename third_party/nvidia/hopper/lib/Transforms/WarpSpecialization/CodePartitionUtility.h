@@ -124,7 +124,7 @@ struct CommChannel {
   // barrier inline, such as the TMA load.
   std::optional<Value> producerBarrier;
   // Consumer barrier is only needed when the consumer op itself can update the
-  // barrier inline, such as MMAv5 ops.
+  // barrier inline, such as the TCGen5MMAOp.
   DenseMap<int, Value> consumerBarriers;
 };
 
@@ -133,13 +133,13 @@ namespace triton {
 namespace nvidia_gpu {
 struct TmemDataChannel : Channel {
   ttng::TMEMAllocOp tmemAllocOp;
-  ttng::MMAv5OpInterface tmemMmaOp;
+  ttng::TCGen5MMAOp tmemMmaOp;
   Operation *tmemProducerOp;
 
   TmemDataChannel(int producer, SmallVector<int> &consumers,
-                  ttng::TMEMAllocOp tmemAllocOp,
-                  ttng::MMAv5OpInterface tmemMmaOp, Operation *tmemConsumerOp,
-                  unsigned operandIdx, unsigned numBuffers, unsigned uniqID,
+                  ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp tmemMmaOp,
+                  Operation *tmemConsumerOp, unsigned operandIdx,
+                  unsigned numBuffers, unsigned uniqID,
                   Operation *tmemProducerOp = nullptr)
       : Channel(producer, consumers, tmemConsumerOp, operandIdx, numBuffers,
                 uniqID),
@@ -151,7 +151,7 @@ struct TmemDataChannel : Channel {
 
   ttng::TMEMAllocOp getTmemAllocOp() { return tmemAllocOp; }
   virtual Operation *getAllocOp() { return tmemAllocOp.getOperation(); }
-  ttng::MMAv5OpInterface getMmaOp() { return tmemMmaOp; }
+  ttng::TCGen5MMAOp getMmaOp() { return tmemMmaOp; }
   virtual Operation *getSrcOp() { return tmemProducerOp; }
 };
 
