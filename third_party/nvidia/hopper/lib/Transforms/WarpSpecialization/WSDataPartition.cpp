@@ -162,8 +162,6 @@ struct DataPartitionScheme {
             << shape[0] << " to " << slicedM
             << " rows would require updating tensor memory encoding blockM="
             << tmem.getBlockM();
-        LDBG("skipping M-dimension data partitioning for TMEM result: slicedM "
-             << slicedM << " < minimum encoded M " << minM);
         skipPartitioning = true;
         return false;
       }
@@ -1737,14 +1735,8 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
     }
     return true;
   }
-  if (partitionScheme.ops.empty()) {
-    if (partitionScheme.skipPartitioning) {
-      LDBG("skipping data partitioning due to incompatible TMEM encoding");
-    } else {
-      LDBG("skipping data partitioning");
-    }
+  if (partitionScheme.ops.empty())
     return true;
-  }
 
   // Bail out if a TensorDescType func arg is used as a ForOp init arg.
   // This case requires extra handling to update ForOp iter arg types
