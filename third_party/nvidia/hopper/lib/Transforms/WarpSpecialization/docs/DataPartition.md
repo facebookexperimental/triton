@@ -66,6 +66,12 @@ Drives partitioning from dot/MMA ops:
    - M is preferred; N is fallback.
 3. Call `getSliceToPartition` to trace the partition dimension through the
    dataflow graph.
+4. Reject trial schemes that would require changing an existing TMEM encoding
+   when partitioning along M. For example, splitting a `128x128` TMEM
+   allocation with `blockM=128` into two `64x128` slices is rejected before any
+   data partitioning rewrite; splitting `256x128` into `128x128` slices remains
+   valid. When this guard fires, data partitioning is skipped and the function
+   is otherwise left unchanged.
 
 ### Step 3: Slice Propagation (`getSliceToPartition`)
 
