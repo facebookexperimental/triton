@@ -504,7 +504,9 @@ stage 2:  mfma                      (MFMA)
 
 **Step 3 — Depth:** accumulator-to-MFMA lifetime spans the loads → `floor(lifetime/II)+1 = 3` buffers; vmcnt window `W=1` (keep newest load group in flight) → `async_load_wait_group(1)`.
 
-**Step 4.7 — Partition:** two-group warp-pipeline, clusters `{mfma}` (priority 0) and `{mem: next loads + ds_read}` (priority 1).
+**Step 4.7 — Partition:** two-group warp-pipeline, two clusters: `{mfma}` and `{mem: next loads + ds_read}`.
+
+**Step 4.8 — Priority:** Δ*=1 (`mfma` opposite `mem`, ≈ II/2). The mem cluster issues the latency-critical `global_load_lds` (high `U`) and is sparse on the contended issue unit (low `M`); the mfma cluster is the dense, self-paced ResMII monopolizer (high `M`, lower `U`). So `pscore(mem) > pscore(mfma)` → **`mem`=1, `mfma`=0** — the `priority=` the emitted border markers carry.
 
 **Pass B/C — Emitted IR (abbreviated; rendered as TLX for readability — the passes emit TTGIR borders + ROCDL, not `tlx.*`):**
 ```python
