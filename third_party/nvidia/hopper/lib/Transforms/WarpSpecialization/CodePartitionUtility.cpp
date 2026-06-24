@@ -853,18 +853,19 @@ bool isWholeAllocationOverwriteReuseOwner(Channel *ownerCh) {
   return tmemCh->isOperandDNoAcc;
 }
 
-void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
-                          unsigned numBuffers,
-                          const DenseSet<Operation *> &regionsWithChannels,
-                          Value &bufferIdx, Value &phase, ReuseConfig *config,
-                          int reuseGroupIdx, Channel *ch) {
+// Returns the (possibly reuse-group staggered) accumulation count for `ch` at
+// `op`: `accumCnt` for the representative channel (or when there is no reuse
+// group), or `accumCnt + theIdx` for a channel at position `theIdx` within its
+// reuse group. This is the raw count from which bufferIdx (% numBuffers) and
+// phase (/ numBuffers & 1) are derived.
+static Value
+getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
+                     const DenseSet<Operation *> &regionsWithChannels,
+                     ReuseConfig *config, int reuseGroupIdx, Channel *ch) {
   Value accumCnt =
       getAccumCount(builder, op, regionsWithChannels, config, reuseGroupIdx);
-  if (reuseGroupIdx < 0) {
-    std::tie(bufferIdx, phase) =
-        getBufferIdxAndPhase(builder, op->getLoc(), accumCnt, numBuffers);
-    return;
-  }
+  if (reuseGroupIdx < 0)
+    return accumCnt;
   // op is a user of the channel. accumCnt is the corresponding argument of the
   // parentForOp.
   // Go through chList in the parentForOp, assume ch is directly in parentForOp.
@@ -915,14 +916,11 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
     ++vecIdx;
   }
   assert(theIdx >= 0);
-  if (theIdx == 0) {
-    std::tie(bufferIdx, phase) =
-        getBufferIdxAndPhase(builder, op->getLoc(), accumCnt, numBuffers);
-    return;
-  }
-  // Increment accumCnt if there are multiple channels in the reuseGroup in this
-  // region.
-  // Create idxVal with the same type as accumCnt to ensure type compatibility
+  if (theIdx == 0)
+    return accumCnt;
+  // Stagger the count by the channel's position within the reuse group, so each
+  // channel occupies a distinct slot of the shared circular buffer.
+  // Create idxVal with the same type as accumCnt to ensure type compatibility.
   Value idxVal;
   if (accumCnt.getType().isIndex()) {
     idxVal = builder.createWithAsyncTaskIds<arith::ConstantIndexOp>(
@@ -932,11 +930,104 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
     idxVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
         op->getLoc(), theIdx, intType.getWidth());
   }
-  Value addRes = builder.createWithAsyncTaskIds<arith::AddIOp>(
-      op->getLoc(), accumCnt, idxVal);
+  return builder.createWithAsyncTaskIds<arith::AddIOp>(op->getLoc(), accumCnt,
+                                                       idxVal);
+}
 
+void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
+                          unsigned numBuffers,
+                          const DenseSet<Operation *> &regionsWithChannels,
+                          Value &bufferIdx, Value &phase, ReuseConfig *config,
+                          int reuseGroupIdx, Channel *ch) {
+  Value accumCnt = getStaggeredAccumCnt(builder, op, regionsWithChannels,
+                                        config, reuseGroupIdx, ch);
   std::tie(bufferIdx, phase) =
-      getBufferIdxAndPhase(builder, op->getLoc(), addRes, numBuffers);
+      getBufferIdxAndPhase(builder, op->getLoc(), accumCnt, numBuffers);
+}
+
+// Trace a per-tile buffer operand back through memdesc view ops to its
+// underlying multi-buffered allocation / buffer value.
+static Value traceToBufferBase(Value v) {
+  while (v) {
+    if (auto idx = v.getDefiningOp<ttg::MemDescIndexOp>()) {
+      v = idx.getSrc();
+      continue;
+    }
+    break;
+  }
+  return v;
+}
+
+bool getPerTileStaggeredAccumCnt(
+    OpBuilderWithAsyncTaskIds &builder, ttng::SubtiledRegionOp subtiled,
+    Operation *dominatingOp, const DenseSet<Operation *> &regionsWithChannels,
+    ReuseConfig *config, int reuseGroupIdx,
+    ArrayRef<Channel *> reuseGroupChannels,
+    const DenseMap<Channel *, Value> &bufferMap,
+    SmallVectorImpl<Value> &outStaggeredCnt) {
+  if (reuseGroupIdx < 0)
+    return false;
+  unsigned nTiles = subtiled.getNumTiles();
+  // Map each tile to the reuse-group channel whose buffer that tile accesses,
+  // by matching the per-tile buffer operand (possibly memdesc_index'd) against
+  // each channel's buffer. perTileArgs[j * nTiles + t] is position j of tile t.
+  SmallVector<Channel *> channelForTile(nTiles, nullptr);
+  auto perTileArgs = subtiled.getPerTileArgs();
+  for (auto *ch : reuseGroupChannels) {
+    Value base;
+    auto it = bufferMap.find(ch);
+    if (it != bufferMap.end())
+      base = it->second;
+    else if (ch->getAllocOp())
+      base = ch->getAllocOp()->getResult(0);
+    if (!base)
+      continue;
+    for (auto [idx, arg] : llvm::enumerate(perTileArgs)) {
+      if (traceToBufferBase(arg) == base)
+        channelForTile[idx % nTiles] = ch;
+    }
+  }
+  for (unsigned t = 0; t < nTiles; ++t)
+    if (!channelForTile[t])
+      return false;
+  // Shared accumulation count for the reuse group (advances by 1 per outer
+  // iteration; ALL subtiles of this group share ONE barrier pair).
+  Value accumCnt = getAccumCount(builder, dominatingOp, regionsWithChannels,
+                                 config, reuseGroupIdx);
+  Location loc = dominatingOp->getLoc();
+  Type cntTy = accumCnt.getType();
+  auto makeConst = [&](int64_t v) -> Value {
+    if (cntTy.isIndex())
+      return builder.createWithAsyncTaskIds<arith::ConstantIndexOp>(loc, v);
+    return builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+        loc, v, llvm::cast<IntegerType>(cntTy).getWidth());
+  };
+
+  // Flatten the per-iteration subtile uses into a SINGLE monotonic barrier
+  // stream, offsetting by the *tile index* (= the order in which the producer
+  // writes and the consumer reads the tiles):
+  //     flattened = accumCnt * numTiles + tileIdx
+  // The shared barrier then behaves as one stream advanced numTiles times per
+  // outer iteration. Using the tile index (NOT the reuse-group position) is
+  // what makes this correct even when numTiles > numBuffers: two same-iteration
+  // tiles may map to the same physical barrier slot, but because the flattened
+  // order equals the producer/consumer tile-walk order, the later tile's
+  // acquire simply waits for the earlier tile's slot to be released — a
+  // serialization, not a race. (The reuse-group position is a *permutation* of
+  // the tile order, which would commit the shared slot's generations out of
+  // order and corrupt.) The barrier slot need not match the data buffer slot;
+  // producer and consumer only need to agree, which they do: both subtiled
+  // regions walk tiles in the same order and tile t maps to the same buffer in
+  // both.
+  Value scaledAccum = builder.createWithAsyncTaskIds<arith::MulIOp>(
+      loc, accumCnt, makeConst(nTiles));
+  outStaggeredCnt.assign(nTiles, Value());
+  for (unsigned t = 0; t < nTiles; ++t)
+    outStaggeredCnt[t] =
+        t == 0 ? scaledAccum
+               : builder.createWithAsyncTaskIds<arith::AddIOp>(
+                     loc, scaledAccum, makeConst(static_cast<int64_t>(t)));
+  return true;
 }
 
 Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
