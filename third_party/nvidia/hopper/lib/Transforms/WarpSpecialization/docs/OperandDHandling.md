@@ -2,10 +2,11 @@
 
 Operand D is the MMA accumulator — the result of a matrix multiply-accumulate
 operation. On Blackwell, it resides in TMEM (`TMEMAllocOp`) and is written by
-`TCGen5MMAOp`. On Hopper, it is the result of `WarpGroupDotOp`. Operand D
-requires careful handling throughout the WS pipeline because it often crosses
-partition boundaries (the MMA runs on the consumer, but the result may be read
-by other partitions) and it carries state across loop iterations (accumulation).
+MMAv5 ops (`TCGen5MMAOp` and `TCGen5MMAScaledOp`). On Hopper, it is the result
+of `WarpGroupDotOp`. Operand D requires careful handling throughout the WS
+pipeline because it often crosses partition boundaries (the MMA runs on the
+consumer, but the result may be read by other partitions) and it carries state
+across loop iterations (accumulation).
 
 ## Overview of the Challenges
 
@@ -63,12 +64,13 @@ same reuse group.
 
 **File**: `CodePartitionUtility.cpp`
 **Entry**: called from `createChannelPost` when a `tmem_alloc` is identified
-as the D operand of a `TCGen5MMAOp` (i.e. `mmaOp.getD() == tmemAllocOp`).
+as the accumulator operand of an MMAv5 op (i.e.
+`mmaOp.getAccumulator() == tmemAllocOp`).
 
 Detection in `createChannelPost()`:
 ```cpp
-if (auto mmaOp = dyn_cast<TCGen5MMAOp>(user)) {
-  if (mmaOp.getD() == allocOp->getResult(0)) {
+if (auto mmaOp = dyn_cast<MMAv5OpInterface>(user)) {
+  if (mmaOp.getAccumulator() == allocOp->getResult(0)) {
     if (!isConstFalse(mmaOp.useAccumulator())) {
       isOperandD = true;
     }
@@ -84,8 +86,8 @@ a sliding window of producers (`currentProds`). Each TMEM user is classified:
 | Op type | Action |
 |---------|--------|
 | `TMEMStoreOp` | Clears `currentProds`, becomes new sole producer |
-| `TCGen5MMAOp` (same as `mmaOp`) | Both consumer (of `currentProds`) **and** producer. Creates channel `currentProds → mmaOp`, then sets `currentProds = [mmaOp]` |
-| `TCGen5MMAOp` (different MMA) | Consumer only (reads the TMEM as an operand other than D). Creates channel `currentProds → this MMA` |
+| `MMAv5OpInterface` (same as `mmaOp`) | Both consumer (of `currentProds`) **and** producer. Creates channel `currentProds → mmaOp`, then sets `currentProds = [mmaOp]` |
+| `MMAv5OpInterface` (different MMA) | Consumer only (reads the TMEM as an operand other than D). Creates channel `currentProds → this MMA` |
 | `TMEMLoadOp` | Consumer only. Creates channel `currentProds → tmem_load` |
 
 A channel is created only when `needsChannel(producerTaskId, consumerIds)`

@@ -14,12 +14,14 @@ into two M=128 pieces for two consumer groups.
 ```
 doTaskPartition          ← assigns ops to partitions
   → doTaskIdPropagate   ← propagates task IDs to all ops
-  → doDataPartition     ← THIS STEP: splits tensor dimensions (Hopper only)
+  → doDataPartition     ← THIS STEP: splits tensor dimensions
   → doPingPongPrep
 ```
 
-Data partitioning runs only on Hopper. On Blackwell, the partition scheduling
-pass (`PartitionSchedulingMeta`) handles spatial splitting differently.
+Data partitioning is exposed as `nvgpu-ws-data-partition` and is not Hopper
+only. Hopper-style AutoWS typically reaches it after task ID propagation, while
+Blackwell flows may run it as a separate pass when an explicit data partition
+factor is attached or multiple warp groups require per-consumer slices.
 
 ## `DataPartitionScheme`
 

@@ -165,9 +165,10 @@ Creates synchronization tokens for each channel group:
 - For each consumer group, creates a `CreateTokenOp` with `numBuffers` slots.
 - **TMA barrier pre-allocation**: When any channel in a group has a TMA
   producer, an mbarrier array is pre-allocated via `BarrierAllocOp`.
-- **Gen5 inline barriers**: For `TCGen5MMAOp` consumers, decides whether to
-  use the MMA op's built-in completion barrier instead of a separate token
-  (checked via `ProducerIsGen5`).
+- **Gen5 inline barriers**: For MMAv5 consumers (`TCGen5MMAOp` and
+  `TCGen5MMAScaledOp`), decides whether to use the MMA op's built-in
+  completion barrier instead of a separate token (checked via
+  `ProducerIsGen5`).
 - Results are stored in a `CommChannel` struct per channel, containing
   `tokens` (per consumer task ID), optional `producerBarrier` (for TMA/gen5),
   and optional `consumerBarriers` (for gen5 inline barriers).
