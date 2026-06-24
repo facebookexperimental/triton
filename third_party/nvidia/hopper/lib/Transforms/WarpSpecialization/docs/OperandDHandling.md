@@ -235,13 +235,13 @@ producerOp = channel->getSrcOp()
 consumerOp = actual consumer (resolved via getActualConsumers)
 
 1. producerBarrier
-   ├─ Producer is gen5 MMA?  → producerBarrier = createBarrierAlloc(numBuffers)
+   ├─ Producer is MMAv5 op?  → producerBarrier = createBarrierAlloc(numBuffers)
    └─ Producer is TMA load?  → producerBarrier = createBarrierAlloc(numBuffers)
    (Otherwise producerBarrier stays empty.)
 
 2. For each consumer task ID:
    a. Resolve the actual consumer op (via getActualConsumers).
-   b. useGen5Barrier = ALL actual consumers are TCGen5MMAOp?
+   b. useGen5Barrier = ALL actual consumers are MMAv5 ops?
    c. Token:
       ├─ hasProdBar AND useGen5Barrier → no token needed (fully inline)
       └─ otherwise → tokens[taskId] = CreateTokenOp(numBuffers, tokenLoadType)
@@ -252,9 +252,10 @@ consumerOp = actual consumer (resolved via getActualConsumers)
 
 ### `ProducerIsGen5()`
 
-Checks if the producer of a TMEM channel is a `TCGen5MMAOp` by comparing
-`mmaOp.getD()` with the alloc result. This determines whether the channel
-represents an operand D flow.
+Checks if the producer of a TMEM channel is an MMAv5 op by comparing
+`mmaOp.getAccumulator()` with the alloc result. This determines whether the
+channel represents an operand D flow for either `TCGen5MMAOp` or
+`TCGen5MMAScaledOp`.
 
 ### Applied to FA BWD dk
 
@@ -294,9 +295,9 @@ Result: `{producerBarrier=bar_B, consumerBarriers={}, tokens={task3: tok_B}}`
 the synchronization primitives. TMEM channels (`TMEMPost`) are processed
 **after** SMEM channels.
 
-### `desyncTCGen5MMAOp()`
+### `desyncMMAv5Op()`
 
-Makes the MMA asynchronous with barriers for operand D communication between
+Makes the MMAv5 op asynchronous with barriers for operand D communication between
 partitions. When the MMA's result needs to cross a partition boundary, this
 function:
 1. Adds completion barriers to the MMA op
@@ -312,10 +313,10 @@ for operand D synchronization.
 Enters the block when `commChannel.producerBarrier` is set.
 
 ```
-headProducer = gen5 MMA → dyn_cast<TCGen5MMAOp> succeeds → mmaOp is valid
+headProducer = gen5 MMA → dyn_cast<MMAv5OpInterface> succeeds → mmaOp is valid
 
-desyncTCGen5MMAOp(mmaOp, bar_B, ..., headConsumer=tmem_load,
-                  asProducerAcquire=false, addCompletionBarrier=true)
+desyncMMAv5Op(mmaOp, bar_B, ..., headConsumer=tmem_load,
+              asProducerAcquire=false, addCompletionBarrier=true)
   → mmaOp.addCompletionBarrier(bar_B)     // tc_gen5_commit signals bar_B
   → WaitBarrierOp(bar_B, phase)           // before tmem_load (consumer_wait)
 ```
@@ -352,8 +353,8 @@ consumerBarrier = bar_A
 producerAcquirePoint = headProducer = tmem_store
 addCompletionBarrier = true
 
-desyncTCGen5MMAOp(mmaOp, bar_A, ..., producerAcquirePoint=tmem_store,
-                  asProducerAcquire=true, addCompletionBarrier=true)
+desyncMMAv5Op(mmaOp, bar_A, ..., producerAcquirePoint=tmem_store,
+              asProducerAcquire=true, addCompletionBarrier=true)
   → mmaOp.addCompletionBarrier(bar_A)      // tc_gen5_commit signals bar_A
   → WaitBarrierOp(bar_A, phase XOR 1)      // before tmem_store
                                             // (inverted phase = producer_acquire)
@@ -469,7 +470,7 @@ race fix. However:
 - Program order within the warp group already guarantees that the
   `tmem_load` completes before the `tmem_store` writes (they execute
   sequentially in the same warp group).
-- The original `desyncTCGen5MMAOp` path creates a `WaitBarrier(bar_A)`
+- The original `desyncMMAv5Op` path creates a `WaitBarrier(bar_A)`
   before the `tmem_store` that waits for `tc_gen5_commit` — this is
   correct and sufficient.
 - Applying the token-based fix creates a circular dependency:
@@ -495,7 +496,7 @@ If the `tmem_store`'s producer task ID appears in the sibling
   (computation). `0 ∉ {3}` → different tasks → token fix applied.
 - **FA FWD (skipped):** `storeTaskId = 3` (computation),
   `loadTaskIds = {3}` (computation). `3 ∈ {3}` → same task →
-  `continue`, falls through to `desyncTCGen5MMAOp`.
+  `continue`, falls through to `desyncMMAv5Op`.
 
 **FA fwd summary table (per accumulator):**
 
@@ -504,7 +505,7 @@ If the `tmem_store`'s producer task ID appears in the sibling
 | **Producer** | tmem_store (computation, task 3) | gen5 MMA (gemm, task 1) |
 | **Consumer** | gen5 MMA (gemm, task 1) | tmem_load (computation, task 3) |
 | **Token fix?** | **No** — same-task guard | N/A |
-| **Sync mechanism** | `WaitBarrier(bar_A)` before tmem_store (original `desyncTCGen5MMAOp`) | `WaitBarrier(bar_B)` before tmem_load + `ConsumerRelease(tok_B)` after tmem_load |
+| **Sync mechanism** | `WaitBarrier(bar_A)` before tmem_store (original `desyncMMAv5Op`) | `WaitBarrier(bar_B)` before tmem_load + `ConsumerRelease(tok_B)` after tmem_load |
 
 ## Partition Scheduling: Operand D Markers
 
@@ -542,6 +543,6 @@ For a single TMEM accumulator (e.g. dk) with the cross-partition pattern
 | Entry point | `CodePartitionUtility.cpp` | `createChannelPost` |
 | Token/barrier alloc | `WSCodePartition.cpp` | `createTokenPost` |
 | Sync insertion | `WSCodePartition.cpp` | `insertAsyncComm` |
-| Gen5 desync helper | `WSCodePartition.cpp` | `desyncTCGen5MMAOp` |
+| MMAv5 desync helper | `WSCodePartition.cpp` | `desyncMMAv5Op` |
 | Operand-D race fix | `WSCodePartition.cpp` | `insertAsyncComm` (inline) |
 | Same-task guard | `WSCodePartition.cpp` | `insertAsyncComm` (inline) |

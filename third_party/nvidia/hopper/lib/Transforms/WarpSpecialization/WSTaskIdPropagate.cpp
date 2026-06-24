@@ -114,8 +114,8 @@ static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
 
     LDBG("Found MMA op with task_id: " << mmaOp);
 
-    // Step 2: Traverse operand D to find the TMEM alloc.
-    Value dOperand = mmaOp.getD();
+    // Step 2: Traverse the accumulator operand to find the TMEM alloc.
+    Value dOperand = mmaOp.getAccumulator();
     auto tmemAllocOp = findBaseTMEMAlloc(dOperand);
     if (!tmemAllocOp)
       return;

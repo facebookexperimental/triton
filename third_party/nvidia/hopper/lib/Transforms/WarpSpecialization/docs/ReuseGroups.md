@@ -146,7 +146,7 @@ about the ordering of `producer_acquire` across the two channels.
 | Mechanism | Condition | Insertion Point |
 |-----------|-----------|-----------------|
 | `ProducerAcquireOp` (token-based) | `consumerBarriers` empty | Before `headProducer` (or `producerAcquireForChannelLoop`) |
-| `WaitBarrierOp` (gen5 inline) | `consumerBarriers` populated | Before the producer, via `desyncTCGen5MMAOp(..., asProducerAcquire=true)` |
+| `WaitBarrierOp` (gen5 inline) | `consumerBarriers` populated | Before the producer, via `desyncMMAv5Op(..., asProducerAcquire=true)` |
 
 The variable `producerAcquireForChannelLoop` already handles the case of
 **forward/backward channel loops** (same alloc, same block, cycle through
@@ -290,7 +290,7 @@ if (producerAcquireForReuse && !producerAcquireForChannelLoop) {
 
 This reuses the existing `producerAcquireForChannelLoop` mechanism which
 flows through to both `ProducerAcquireOp` insertion and gen5 inline barrier
-`desyncTCGen5MMAOp` insertion.
+`desyncMMAv5Op` insertion.
 
 ### Processing Order
 

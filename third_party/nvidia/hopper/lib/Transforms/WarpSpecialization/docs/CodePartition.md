@@ -190,8 +190,8 @@ detailed decision tree, code paths, and a worked FA BWD example.
    - `ProducerCommitOp` after the producer (signal data is ready)
    - `ConsumerWaitOp` before the consumer (wait for data)
    - `ConsumerReleaseOp` after the consumer (signal buffer is free)
-4. **`desyncTCGen5MMAOp`**: Makes `TCGen5MMAOp` fully asynchronous by
-   attaching a completion barrier and creating a `WaitBarrierOp`.
+4. **`desyncMMAv5Op`**: Makes MMAv5 ops fully asynchronous by attaching a
+   completion barrier and creating a `WaitBarrierOp`.
 5. **Consumer release placement**: `consumerReleaseHeuristic` uses
    post-dominance analysis to find optimal placement.
 6. **Data-partitioned commit replacement**: In data-partitioned loops
