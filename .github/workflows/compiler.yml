@@ -73,6 +73,7 @@ jobs:
           python3 -m pip install cmake ninja lit
           LLVM="$GITHUB_WORKSPACE/llvm-install"
           cmake -G Ninja -B build \
+            -DTRITON_CACHE_PATH="$HOME/.triton" \
             -DLLVM_INCLUDE_DIRS="$LLVM/include" \
             -DLLVM_LIBRARY_DIR="$LLVM/lib" \
             -DLLVM_SYSPATH="$LLVM" \
