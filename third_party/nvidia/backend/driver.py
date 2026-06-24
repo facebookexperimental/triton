@@ -117,6 +117,9 @@ class CudaUtils(object):
         self.set_printf_fifo_size = mod.set_printf_fifo_size
         self.fill_tma_descriptor_tiled = mod.fill_tma_descriptor_tiled
         self.fill_tma_descriptor_im2col = mod.fill_tma_descriptor_im2col
+        # Test-only hook to exercise the shared-core recipe TMA encoder.
+        self._test_construct_tma_desc = getattr(mod, "_test_construct_tma_desc", None)
+        self._tma_desc_bytes = getattr(mod, "_tma_desc_bytes", None)
         self.launch = mod.launch
         self.build_signature_metadata = mod.build_signature_metadata
         self.fill_1d_tma_descriptor = mod.fill_1d_tma_descriptor

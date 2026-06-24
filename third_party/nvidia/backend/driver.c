@@ -1931,12 +1931,10 @@ typedef struct {
    */
   int shape_param_indices[TD_MAX_TENSORDESC_NDIM];
   int stride_param_indices[TD_MAX_TENSORDESC_NDIM];
-  /* Cache: skip cuTensorMapEncodeTiled if unchanged */
-  uint64_t cached_data_ptr;
-  int64_t cached_shape[TD_MAX_TENSORDESC_NDIM];
-  int64_t cached_strides[TD_MAX_TENSORDESC_NDIM];
-  int cached_fill; /* CUtensorMapFloatOOBfill value (padding mode) */
-  int cache_valid;
+  /* Shared per-slot TMA cache (launch.h): skips re-encoding when base ptr /
+   * shape / strides / fill mode are unchanged. Zero-initialized at build time.
+   */
+  triton_tma_cache_entry_t cache;
 } TMASlotMeta;
 
 typedef union {
@@ -2113,92 +2111,44 @@ static int td_extract_tensordesc(TritonDispatcher *self, int i, PyObject *a) {
     PyErr_Clear();
   }
 
-  /* Check cache (data_ptr + shape + strides + padding) */
-  int cache_hit = meta->cache_valid && (meta->cached_data_ptr == data_ptr) &&
-                  (meta->cached_fill == (int)fill);
-  if (cache_hit) {
-    for (int j = 0; j < ndim; j++) {
-      if (meta->cached_shape[j] != cur_shape[j] ||
-          meta->cached_strides[j] != cur_strides[j]) {
-        cache_hit = 0;
-        break;
-      }
-    }
+  /* Encode (or reuse cached) the CUtensorMap via the shared launch.h encoder.
+   * Pack base ptr + shape + strides into a flat args_buf in the layout the
+   * recipe offsets below describe (same layout as testConstructTmaDesc): the
+   * shared encoder does the row→col reversal, L2_128B promotion, fp4 expansion,
+   * and the small-tensor driver workaround, byte-identically to the proven JIT
+   * path that this used to duplicate. */
+  triton_tma_recipe_t recipe;
+  memset(&recipe, 0, sizeof(recipe));
+  recipe.ndim = ndim;
+  recipe.swizzle = meta->swizzle;
+  recipe.elem_type = meta->elem_type;
+  recipe.elem_size = meta->elem_size;
+  recipe.fp4_padded = meta->fp4_padded;
+  recipe.fill_mode =
+      (fill == CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA) ? 1 : 0;
+  recipe.ptr_offset = 0;
+  for (int j = 0; j < ndim; j++) {
+    recipe.block_shape[j] = meta->block_size[j];
+    recipe.shape_offsets[j] = (int)(8 + j * 8);
+    recipe.stride_offsets[j] = (int)(8 + ndim * 8 + j * 8);
   }
 
-  if (!cache_hit) {
-    /* Rebuild TMA descriptor in-place */
-    int elem_size = meta->elem_size;
-    int rank = ndim;
-    uint32_t blockSizeInt[TD_MAX_TENSORDESC_NDIM];
-    uint64_t shapeInt[TD_MAX_TENSORDESC_NDIM];
-    uint64_t stridesLL[TD_MAX_TENSORDESC_NDIM];
+  unsigned char tma_args_buf[8 + 2 * TD_MAX_TENSORDESC_NDIM * 8];
+  memcpy(tma_args_buf, &data_ptr, 8);
+  for (int j = 0; j < ndim; j++) {
+    memcpy(tma_args_buf + 8 + j * 8, &cur_shape[j], 8);
+    memcpy(tma_args_buf + 8 + ndim * 8 + j * 8, &cur_strides[j], 8);
+  }
 
-    int64_t *eshape = cur_shape;
-    int64_t expanded_shape_buf[TD_MAX_TENSORDESC_NDIM];
-    if (meta->fp4_padded) {
-      for (int j = 0; j < rank; j++)
-        expanded_shape_buf[j] = cur_shape[j];
-      expanded_shape_buf[rank - 1] *= 2;
-      eshape = expanded_shape_buf;
-    }
-
-    /* Reverse order for cuTensorMapEncodeTiled (row-major → col-major) */
-    for (int j = 0; j < rank; j++) {
-      blockSizeInt[rank - j - 1] = meta->block_size[j];
-      shapeInt[rank - j - 1] = (uint64_t)eshape[j];
-    }
-    for (int j = 0; j + 1 < rank; j++)
-      stridesLL[rank - j - 2] = (uint64_t)(elem_size * cur_strides[j]);
-    stridesLL[rank - 1] =
-        shapeInt[rank - 1] *
-        (rank == 1 ? (uint64_t)elem_size : stridesLL[rank - 2]);
-
-    uint32_t elementStrides[TD_MAX_TENSORDESC_NDIM] = {1, 1, 1, 1, 1};
-    static cuTensorMapEncodeTiled_t cuTensorMapEncodeTiled_fn = NULL;
-    if (!cuTensorMapEncodeTiled_fn)
-      cuTensorMapEncodeTiled_fn = getCuTensorMapEncodeTiledHandle();
-    if (!cuTensorMapEncodeTiled_fn)
-      return -1;
-
-    CUresult res = cuTensorMapEncodeTiled_fn(
-        &self->tma_descs[slot], meta->elem_type, rank,
-        (void *)(uintptr_t)data_ptr, shapeInt, stridesLL, blockSizeInt,
-        elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE, meta->swizzle,
-        CU_TENSOR_MAP_L2_PROMOTION_L2_128B, fill);
-    if (res != CUDA_SUCCESS) {
-      const char *str;
-      cuGetErrorString(res, &str);
-      PyErr_Format(PyExc_RuntimeError,
-                   "cuTensorMapEncodeTiled failed in TMA expansion: %s",
-                   str ? str : "?");
-      return -1;
-    }
-
-    /* CUTLASS driver workaround */
-    static int driver_version = -1;
-    if (driver_version < 0)
-      cuDriverGetVersion(&driver_version);
-    if (driver_version <= 13010) {
-      int max_byte_index = 0;
-      for (int j = 0; j < rank; j++) {
-        int bytes_stride = j == 0 ? elem_size : (int)stridesLL[j - 1];
-        max_byte_index += ((int)shapeInt[j] - 1) * bytes_stride;
-      }
-      if (max_byte_index + 1 < 128 * 1024) {
-        uint64_t *desc_u64 = (uint64_t *)&self->tma_descs[slot];
-        desc_u64[1] &= ~(1llu << 21);
-      }
-    }
-
-    /* Update cache */
-    meta->cached_data_ptr = data_ptr;
-    meta->cached_fill = (int)fill;
-    for (int j = 0; j < ndim; j++) {
-      meta->cached_shape[j] = cur_shape[j];
-      meta->cached_strides[j] = cur_strides[j];
-    }
-    meta->cache_valid = 1;
+  CUresult res = triton_construct_tma_desc_cached(
+      &self->tma_descs[slot], &recipe, tma_args_buf, &meta->cache);
+  if (res != CUDA_SUCCESS) {
+    const char *str;
+    cuGetErrorString(res, &str);
+    PyErr_Format(PyExc_RuntimeError,
+                 "cuTensorMapEncodeTiled failed in TMA expansion: %s",
+                 str ? str : "?");
+    return -1;
   }
 
   /* Fill shadow shape/stride kernel_params slots */
@@ -2496,7 +2446,7 @@ static PyObject *TritonDispatcher_new(PyTypeObject *type, PyObject *args,
           Py_DECREF(item);
         }
       }
-      m->cache_valid = 0;
+      memset(&m->cache, 0, sizeof(m->cache));
     }
     if (PyErr_Occurred()) {
       Py_DECREF(self);
@@ -3128,6 +3078,104 @@ static PyObject *py_create_fast_jit_type(PyObject *module,
 
 /* ========================================================================= */
 
+/* Test-only: drive the shared-core recipe TMA encoder (launch.h
+ * triton_construct_tma_desc) so unit tests can byte-compare it against the
+ * proven fillTMADescriptorTiled. Builds a recipe + flat args_buf
+ * (base_ptr, shape[ndim] i64, stride[ndim] i64) and returns the 128-byte
+ * CUtensorMap. fp4_padded=0 / fill_mode=0 for parity with
+ * fillTMADescriptorTiled. */
+static PyObject *testConstructTmaDesc(PyObject *self, PyObject *args) {
+  (void)self;
+  unsigned long long base_ptr;
+  int ndim, elem_type, elem_size, swizzle, fp4_padded, fill_mode;
+  PyObject *block_list, *shape_list, *stride_list;
+  if (!PyArg_ParseTuple(args, "KiiiiOOOii", &base_ptr, &ndim, &elem_type,
+                        &elem_size, &swizzle, &block_list, &shape_list,
+                        &stride_list, &fp4_padded, &fill_mode))
+    return NULL;
+  if (ndim < 1 || ndim > TRITON_MAX_TMA_DIMS) {
+    PyErr_SetString(PyExc_ValueError, "bad ndim");
+    return NULL;
+  }
+
+  triton_tma_recipe_t recipe;
+  memset(&recipe, 0, sizeof(recipe));
+  recipe.ndim = ndim;
+  recipe.swizzle = swizzle;
+  recipe.elem_type = elem_type;
+  recipe.elem_size = elem_size;
+  recipe.fp4_padded = fp4_padded;
+  recipe.fill_mode = fill_mode;
+  recipe.ptr_offset = 0;
+  recipe.desc_param_idx = 0;
+  for (int d = 0; d < ndim; d++) {
+    PyObject *b = PySequence_GetItem(block_list, d);
+    if (!b)
+      return NULL;
+    recipe.block_shape[d] = (uint32_t)PyLong_AsUnsignedLong(b);
+    Py_DECREF(b);
+    recipe.shape_offsets[d] = (int)(8 + d * 8);
+    recipe.stride_offsets[d] = (int)(8 + ndim * 8 + d * 8);
+  }
+  if (PyErr_Occurred())
+    return NULL;
+
+  size_t buf_size = 8 + (size_t)ndim * 16;
+  char *buf = (char *)calloc(1, buf_size);
+  if (!buf)
+    return PyErr_NoMemory();
+  memcpy(buf, &base_ptr, 8);
+  for (int d = 0; d < ndim; d++) {
+    PyObject *s = PySequence_GetItem(shape_list, d);
+    PyObject *st = PySequence_GetItem(stride_list, d);
+    if (!s || !st) {
+      Py_XDECREF(s);
+      Py_XDECREF(st);
+      free(buf);
+      return NULL;
+    }
+    int64_t sv = (int64_t)PyLong_AsLongLong(s);
+    int64_t stv = (int64_t)PyLong_AsLongLong(st);
+    Py_DECREF(s);
+    Py_DECREF(st);
+    memcpy(buf + 8 + d * 8, &sv, 8);
+    memcpy(buf + 8 + ndim * 8 + d * 8, &stv, 8);
+  }
+  if (PyErr_Occurred()) {
+    free(buf);
+    return NULL;
+  }
+
+  CUtensorMap out;
+  memset(&out, 0, sizeof(out));
+  CUresult r = triton_construct_tma_desc(&out, &recipe, buf);
+  free(buf);
+  if (r != CUDA_SUCCESS) {
+    const char *s = NULL;
+    cuGetErrorString(r, &s);
+    PyErr_Format(PyExc_RuntimeError, "triton_construct_tma_desc failed: %s",
+                 s ? s : "unknown");
+    return NULL;
+  }
+  return PyBytes_FromStringAndSize((const char *)&out, sizeof(CUtensorMap));
+}
+
+/* Test-only: return the 128 raw bytes of a PyCUtensorMap's tensorMap field
+ * using the real C struct offset (alignof(CUtensorMap) may be 64 or 128). */
+static PyObject *tmaDescBytes(PyObject *self, PyObject *args) {
+  (void)self;
+  PyObject *obj;
+  if (!PyArg_ParseTuple(args, "O", &obj))
+    return NULL;
+  if (Py_TYPE(obj) != &PyCUtensorMapType) {
+    PyErr_SetString(PyExc_TypeError, "expected a PyCUtensorMap");
+    return NULL;
+  }
+  return PyBytes_FromStringAndSize(
+      (const char *)&((PyCUtensorMapObject *)obj)->tensorMap,
+      sizeof(CUtensorMap));
+}
+
 static PyMethodDef ModuleMethods[] = {
     {"load_binary", loadBinary, METH_VARARGS,
      "Load provided cubin into CUDA driver"},
@@ -3160,6 +3208,10 @@ static PyMethodDef ModuleMethods[] = {
      "Create a heap type inheriting from JITFunction with C mp_subscript"},
     {"register_tensor_bridge", register_tensor_bridge, METH_O,
      "Register PyCapsule from _torch_bridge for fast TensorDescriptor access"},
+    {"_test_construct_tma_desc", testConstructTmaDesc, METH_VARARGS,
+     "test-only: run the shared-core recipe TMA encoder; returns 128 bytes"},
+    {"_tma_desc_bytes", tmaDescBytes, METH_VARARGS,
+     "test-only: return the 128 raw bytes of a PyCUtensorMap"},
 
     {NULL, NULL, 0, NULL} // sentinel
 };
