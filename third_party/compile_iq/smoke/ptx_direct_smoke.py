@@ -25,13 +25,13 @@ import torch
 import triton
 import triton.language as tl
 
-sys.path.insert(0, "/data/users/daohang/fbtriton/third_party/compile_iq")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # the compile_iq pkg root
 from compile_iq import ptx_launch as L
 from compile_iq import store as ciq_store
 
 HERE = pathlib.Path(__file__).resolve().parent
 BENCH_ONE = str(HERE / "ptx_bench_one.py")
-DEFAULT_PTXAS = "/data/users/daohang/miniconda3/lib/python3.13/site-packages/nvidia/cu13/bin/ptxas"
+DEFAULT_PTXAS = os.environ.get("TRITON_PTXAS_BLACKWELL_PATH", "ptxas")  # env/PATH; override with --ptxas
 
 
 @triton.jit

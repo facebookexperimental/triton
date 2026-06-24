@@ -8,7 +8,8 @@ launches the cubin via the CUDA driver, instead of recompiling the kernel from s
 
 Run (matching versions REQUIRED: a cuda-X.Y .config -> ACFs only ptxas X.Y accepts):
   conda run -n evo python ptx_evo_search.py <kernel.ptx> <spec.json> <search_space.config> [timeout_s]
-Emits the best candidate's hex ACF to <spec_dir>/best.acf.hex (override via EVO_BEST_OUT).
+Emits the best candidate's hex ACF to EVO_BEST_OUT (default: a fresh scratch dir, so the task dir
+stays input-only) and logs the (noisy) search-time win vs the no-ACF baseline.
 """
 import os
 import pathlib
@@ -69,10 +70,20 @@ def main():
     ss = pathlib.Path(sys.argv[3])
     if len(sys.argv) > 4:
         PER_CAND_TIMEOUT = int(sys.argv[4])
-    print(f"[ptx-evo] ptx={PTX_FILE} space={ss.name} per_cand_timeout={PER_CAND_TIMEOUT}s", flush=True)
+    # Search depth (env-overridable). generations=1 is pure random sampling of `pool_size` ACFs;
+    # generations>=2 enables EVO's cull/mutate/breed loop -- the actual optimization. Larger spaces
+    # (p1/p2) and real perf searches want more of both (and pay more wedge cost). pool must be > cull.
+    gens = int(os.environ.get("EVO_GENERATIONS", "1"))
+    pool = int(os.environ.get("EVO_POOL", "6"))
+    cull = int(os.environ.get("EVO_CULL", "2"))
+    if cull % 2:  # EVO requires an even cull_size (pydantic: "multiple of 2")
+        cull = max(2, cull - 1)
+    print(
+        f"[ptx-evo] ptx={PTX_FILE} space={ss.name} per_cand_timeout={PER_CAND_TIMEOUT}s "
+        f"generations={gens} pool_size={pool} cull_size={cull}", flush=True)
 
-    cfg = EvoConfiguration(problem_type=ProblemType.MIN, num_objectives=1, qualitative=True, generations=1, pool_size=6,
-                           cull_size=2, mutate_rate=0.5, enable_db=False)
+    cfg = EvoConfiguration(problem_type=ProblemType.MIN, num_objectives=1, qualitative=True, generations=gens,
+                           pool_size=pool, cull_size=cull, mutate_rate=0.5, enable_db=False)
     search = EvoSearch(objective_function=objective, search_space=ss, evo_config=cfg, worker_type=WorkerTypes.DEFAULT,
                        debug=False)
     result = search.start(num_workers=1)
@@ -86,9 +97,30 @@ def main():
         print("[ptx-evo] no valid candidate -- nothing to emit.", flush=True)
         return
 
-    best_out = os.environ.get("EVO_BEST_OUT", os.path.join(os.path.dirname(SPEC_FILE), "best.acf.hex"))
+    # Transient handoff to the (base-env) store step. Default to a fresh scratch dir, NOT the task dir
+    # -- the task dir stays input-only (kernel.ptx + spec.json). Callers set EVO_BEST_OUT explicitly.
+    best_out = os.environ.get("EVO_BEST_OUT") or os.path.join(tempfile.mkdtemp(prefix="ciq_evo_"), "best.acf.hex")
     with open(best_out, "w") as f:
         f.write(best["params"])
+    # Search-time win vs the no-ACF baseline (same cheap per-candidate bench -> NOISY; the trustworthy
+    # locked-clock A/B is at consumption). Best-effort: skip the win if baseline can't be measured.
+    # TODO(compile_iq perf, item 2): `best_ms` is the MIN over noisy candidates (winner's curse ->
+    # biased low) compared to a single un-selected baseline, so this win is inflated and unstable
+    # run-to-run. Replace with a per-candidate interleaved A/B (base vs ACF, median over rounds, locked
+    # clocks) so the reported win predicts consume.
+    base_ms = None
+    try:
+        bo = subprocess.run([BASE_PY, BENCH_ONE, PTX_FILE, SPEC_FILE, "NONE", "50", "100"], capture_output=True,
+                            text=True, timeout=PER_CAND_TIMEOUT + 60)
+        for line in bo.stdout.splitlines():
+            if line.startswith("MS "):
+                base_ms = float(line.split()[1])
+    except Exception:
+        pass
+    win = f"{(base_ms - best_ms) / base_ms * 100:+.2f}%" if base_ms else "n/a"
+    print(
+        f"[ptx-evo] best ACF search-time win={win} (best_ms={best_ms} vs no-ACF baseline={base_ms}; "
+        "NOISY -- validate at consume)", flush=True)
     print(f"[ptx-evo] wrote best ACF hex -> {best_out}", flush=True)
     print("PTX_EVO_SEARCH_OK")
 
