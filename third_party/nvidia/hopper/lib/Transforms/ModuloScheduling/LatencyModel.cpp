@@ -244,6 +244,30 @@ static int scaleByElements(int baseCycles, int64_t elements) {
                           kBaseElems);
 }
 
+// Reduction cost driver. A `tt.reduce`'s cost scales with its INPUT (operand)
+// element count, NOT the result/output count that getTensorElements() returns
+// (the result is the small reduced dim). The B200 clock64 study (~500 pts,
+// users/wl/wlei/latency_table/, REDUCE_FINDINGS.md) found:
+//   * input-elems is the driver (R²~0.8); output-len is uncorrelated (R²~0.05).
+//     Controlled sweep: output fixed, reduce-len varied → cost moves 3-25x.
+//   * last-axis (within-warp) vs outer-axis (cross-warp) reductions differ ~2x.
+// Returns the input element count; sets `lastAxis` = (reduce axis is the
+// contiguous/last dim).
+static int64_t reduceInputElements(tt::ReduceOp op, bool &lastAxis) {
+  lastAxis = true;
+  for (Value v : op.getOperands()) {
+    if (auto t = dyn_cast<RankedTensorType>(v.getType())) {
+      int64_t e = 1;
+      for (auto d : t.getShape())
+        e *= d;
+      int64_t rank = t.getRank();
+      lastAxis = (rank >= 1 && static_cast<int64_t>(op.getAxis()) == rank - 1);
+      return e;
+    }
+  }
+  return 0;
+}
+
 int LatencyModel::getCUDALatency(Operation *op) const {
   // Ops that don't produce tensor results but have real latency.
   // Check these before the scalar early-return.
@@ -276,20 +300,35 @@ int LatencyModel::getCUDALatency(Operation *op) const {
   if (elements == 0)
     return 1; // scalar arith — 1 cycle on the SM CUDA cores
 
-  // Reductions — refit to NCU chained measurements:
-  //   rowmax 425 cyc at 128x64, 461 cyc at 128x128, 1407 cyc at 256x128
-  //   rowsum 574 cyc at 128x64, 1691 cyc at 128x128, 10460 at 256x128
-  // Take base at 128x128 (16384 elems) and scale linearly. This under-counts
-  // 128x64 (model says 230 vs real 425, 287 vs real 574) — but the cleanest
-  // simple rule. Reductions should ideally key off the reduce-axis size, not
-  // total elements; left as future work.
+  // Reductions. Cost is driven by the INPUT (operand) element count: the result
+  // is the small reduced dim, so keying off it modeled a 128x64 reduce at ~13
+  // cyc vs ~896 measured. Bases below are calibrated at 16384 input elements
+  // (128x128) from a B200 clock64 microbench study and scaled linearly.
   if (auto reduceOp = dyn_cast<tt::ReduceOp>(op)) {
     bool isSum = false;
     reduceOp.getBody()->walk([&](Operation *inner) {
       if (isa<arith::AddFOp>(inner))
         isSum = true;
     });
-    return scaleByElements(isSum ? 1691 : 461, elements);
+    // Axis+op-aware bases @16384 input (B200 clock64 study):
+    //   sum:     last=1691  outer=963
+    //   max|min: last=461   outer=961
+    // The combine op (sum's fp-add vs max/min's compare) dominates on the LAST
+    // axis but is masked on the OUTER axis, which flips the ordering:
+    //   - last axis reduces within a warp via a SHFL.BFLY tree, so the op sits
+    //     on the critical path — sum's fp-add (1691) is costly, max's compare
+    //     (461) is cheap.
+    //   - outer axis reduces across warps via SMEM (STS/LDS) + a barrier; that
+    //     traffic dominates and masks the op, so sum (963) ~ max (961).
+    // Hence max is cheaper last-axis than outer, while sum is the reverse.
+    // Must stay >= selfLat (occupancy) below: the scheduler requires
+    // occupancy <= latency, so the selfLat input-elems fix forces this too.
+    bool lastAxis = true;
+    int64_t inElems = reduceInputElements(reduceOp, lastAxis);
+    if (inElems <= 0)
+      inElems = elements;
+    int base = isSum ? (lastAxis ? 1691 : 963) : (lastAxis ? 461 : 961);
+    return scaleByElements(base, inElems);
   }
 
   // Type conversions (truncf, extf, etc.). NCU benchmark reports the chain
@@ -354,7 +393,13 @@ int LatencyModel::getCUDASelfLat(Operation *op) const {
       if (isa<arith::AddFOp>(inner))
         isSum = true;
     });
-    return scaleByElements(isSum ? 639 : 304, elements);
+    // Same INPUT-elems fix as getCUDALatency. NCU selfLat bases are last-axis
+    // only (639 sum / 304 max @16384); axis-aware selfLat is future NCU work.
+    bool lastAxis = true;
+    int64_t inElems = reduceInputElements(reduceOp, lastAxis);
+    if (inElems <= 0)
+      inElems = elements;
+    return scaleByElements(isSum ? 639 : 304, inElems);
   }
 
   // Conversions: compiler-folded in microbench, so use small selfLat.
