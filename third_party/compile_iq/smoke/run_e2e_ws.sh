@@ -15,7 +15,8 @@
 #
 # Usage: third_party/compile_iq/smoke/run_e2e_ws.sh
 # Optional env: WS_GEMM_SIZE, TIER (p0/p1/p2, default p0), PTXAS_KNOBS, SS_CONFIG, PTXAS,
-#   PTXAS_MIN_VERSION, EVO_PY, PY, PER_CAND_TIMEOUT, CONSUME_TIMEOUT, CUDA_VISIBLE_DEVICES.
+#   PTXAS_MIN_VERSION, EVO_PY, PY, PER_CAND_TIMEOUT, CONSUME_TIMEOUT, CUDA_VISIBLE_DEVICES, TRITON_CACHE_DIR.
+# Consume runs twice -- WARM (compile-cache hit) and COLD (miss) -- to cover both paths.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KERNEL="$HERE/../examples/blackwell_gemm_ws_sample.py"
@@ -36,6 +37,9 @@ export TRITON_PTXAS_BLACKWELL_PATH="$PTXAS"
 export BASE_PY="$PY"
 export COMPILE_IQ_TASK_DIR="${COMPILE_IQ_TASK_DIR:-$(mktemp -d)}"
 export COMPILE_IQ_STORE="${COMPILE_IQ_STORE:-$(mktemp -d)}"
+# Fresh, controlled Triton compile cache: [1/3] collect compiles COLD into it (warming it), so the
+# [3/3a] WARM consume hits it; [3/3b] COLD consume uses a separate fresh cache to force a miss.
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$(mktemp -d)}"
 
 [ -x "$EVO_PY" ]    || { echo "FAIL: evo python not found at '$EVO_PY' -- set EVO_PY"; exit 1; }
 [ -f "$SS_CONFIG" ] || { echo "FAIL: search space not found at '$SS_CONFIG' -- set SS_CONFIG/PTXAS_KNOBS"; exit 1; }
@@ -65,16 +69,26 @@ else
     echo "   (no ACF minted -- consume will MISS = baseline)"
 fi
 
-# --- [3/3] consume: gated make_cubin hook applies the stored ACF on a HIT; sample checks vs torch. ---
-echo "== [3/3] consume (timeout ${CONSUME_TIMEOUT}s) =="
-rc=0
-timeout -k 10 "$CONSUME_TIMEOUT" env \
-    TRITON_COMPILE_IQ_APPLY=1 TRITON_COMPILE_IQ_DEBUG=1 TRITON_ALWAYS_COMPILE=1 \
-    COMPILE_IQ_PTXAS_MIN_VERSION="$PTXAS_MIN_VERSION" WS_GEMM_SIZE="$WS_GEMM_SIZE" \
-    "$PY" "$KERNEL" 2>&1 | grep -iE "compile_iq|HIT|MISS|ws *:" || rc=$?
-if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
-    echo "!! consume TIMED OUT -- applied ACF likely wedged the GPU. FAIL."; exit 1
-fi
+# --- [3/3] consume: the stored ACF is produced IN-MEMORY (apply_compile_iq_acf, via core
+#           _maybe_apply_compile_iq) as a candidate; the first launch A/B-benchmarks plain vs ACF and
+#           keeps the winner -- no TRITON_ALWAYS_COMPILE. Run TWICE to cover BOTH compile-cache states:
+#             (a) WARM -- reuse the cache [1/3] collect populated -> compile-cache HIT path (compiler.py:340)
+#             (b) COLD -- a fresh empty cache -> compile-cache MISS -> make_cubin plain + miss-path apply (:455)
+#           Both must log a consume HIT (candidate) + a [compile_iq.freewin] decision; sample checks vs torch.
+run_consume() {  # $1=label  $2=TRITON_CACHE_DIR
+    echo "== [3/3$1] consume (cache=$2 ; timeout ${CONSUME_TIMEOUT}s) =="
+    local rc=0
+    timeout -k 10 "$CONSUME_TIMEOUT" env \
+        TRITON_COMPILE_IQ_APPLY=1 TRITON_COMPILE_IQ_DEBUG=1 \
+        TRITON_CACHE_DIR="$2" \
+        COMPILE_IQ_PTXAS_MIN_VERSION="$PTXAS_MIN_VERSION" WS_GEMM_SIZE="$WS_GEMM_SIZE" \
+        "$PY" "$KERNEL" 2>&1 | grep -iE "compile_iq|freewin|HIT|MISS|ws *:" || rc=$?
+    if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+        echo "!! consume TIMED OUT -- applied ACF likely wedged the GPU. FAIL."; exit 1
+    fi
+}
+run_consume "a WARM (compile-cache HIT)"  "$TRITON_CACHE_DIR"   # warmed by [1/3] collect
+run_consume "b COLD (compile-cache MISS)" "$(mktemp -d)"        # fresh empty cache -> forced miss
 
 echo "== done; store: =="
 find "$COMPILE_IQ_STORE" -type f

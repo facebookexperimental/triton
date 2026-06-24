@@ -1,5 +1,6 @@
 from __future__ import annotations, division
 import ast
+import contextlib
 import copy
 import hashlib
 import inspect
@@ -48,6 +49,24 @@ def _ensure_torch_bridge():
 
 
 TRITON_MODULE = "triton.language"
+
+# compile_iq free-win: the launch-time plain-vs-ACF competition (CompiledKernel._compile_iq_resolve)
+# must NOT fire while the autotuner is benchmarking configs -- otherwise the one-shot A/B would run
+# mid-do_bench and corrupt a config's timing. The autotuner wraps its do_bench in this suppressor;
+# the autotune flow tunes configs on plain timing (ACF candidate-expansion is handled separately).
+_compile_iq_state = threading.local()
+
+
+@contextlib.contextmanager
+def _compile_iq_suppress_competition():
+    prev = getattr(_compile_iq_state, "suppressed", False)
+    _compile_iq_state.suppressed = True
+    try:
+        yield
+    finally:
+        _compile_iq_state.suppressed = prev
+
+
 GLUON_MODULE = "triton.experimental.gluon.language"
 
 T = TypeVar("T")
@@ -971,6 +990,13 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
             if hasattr(kernel, "result"):
                 kernel = kernel.result()
+            # compile_iq free-win: if a tuned ACF candidate is pending, run the one-shot plain-vs-ACF
+            # competition with the real args before launching, and keep the winner (no-op/near-zero
+            # cost otherwise; suppressed while the autotuner is benchmarking). Read _disp afterward so
+            # a rebuilt dispatcher for the winning function is used.
+            if (getattr(kernel, "_compile_iq_acf_cubin", None) is not None
+                    and not getattr(_compile_iq_state, "suppressed", False)):
+                kernel._compile_iq_resolve(grid_0, grid_1, grid_2, stream, bound_args)
             # launch kernel — prefer _TritonDispatcher (C direct cuLaunchKernelEx)
             # when available and hooks are not needed.
             _disp = getattr(kernel, '_dispatcher', None)

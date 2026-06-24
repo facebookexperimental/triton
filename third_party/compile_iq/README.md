@@ -10,7 +10,7 @@ assembling a *fixed* `kernel.ptx` with ptxas and launching the cubin via the CUD
 |-------|------|---------|--------------|
 | **1. collect** | a gated hook in `jit.py` dumps a **source-free** task (`kernel.ptx` + `spec.json`) per kernel | `TRITON_COMPILE_IQ_COLLECT=1` | none (no `source.py`, no cuda-python) |
 | **2. factory** | offline search over ACFs scored by `ptxas(fixed PTX)` + driver launch; keep the best → ACF store | EVO route under `smoke/` (`run_e2e_cuda12{8,30}.sh`) | EVO engine + ptxas + driver matching the tier |
-| **3. consume** | a gated `make_cubin` hook appends `--apply-controls=<stored.acf>` | `TRITON_COMPILE_IQ_APPLY=1` | ptxas matching the ACF version |
+| **3. consume** | a gated hook re-assembles the cubin from the (cached or fresh) PTX with `--apply-controls=<stored.acf>` as a candidate; the first launch A/B-benchmarks plain vs ACF and keeps the winner — all **in-memory** | `TRITON_COMPILE_IQ_APPLY=1` | ptxas matching the ACF version |
 
 Content-addressed: the store key is `sha256(normalized PTX) × arch`, so one ACF transfers across
 runtime shapes (M,N,K) of the same kernel.
@@ -25,9 +25,20 @@ runtime shapes (M,N,K) of the same kernel.
 - **factory** never runs Triton: it assembles the fixed PTX with `ptxas [--apply-controls=<acf>]`
   and launches via the driver (`ptx_launch.py`). The reference implementation is the EVO route in
   `smoke/` (`ptx_evo_search.py` + `ptx_bench_one.py`), driven by `smoke/run_e2e_cuda12{8,30}.sh`.
-- **consume** (`consume.py`, hook in `nvidia/backend/compiler.py:make_cubin`) re-assembles with the
-  stored ACF. ⚠️ The applied ACF is invisible to Triton's compile cache, so consume currently needs
-  `TRITON_ALWAYS_COMPILE=1` (see the TODO in `consume.py`).
+- **consume** (`consume.py` + `nvidia/backend/compiler.py:apply_compile_iq_acf`, driven by core
+  `compiler.py:_maybe_apply_compile_iq`) handles the stored ACF **in-memory** on BOTH the cache-hit
+  and freshly-compiled paths. It re-runs `ptxas(PTX, --apply-controls)` and stashes the ACF cubin as
+  a **pending candidate** (it does *not* overwrite the live cubin). The **first real launch** runs a
+  plain-vs-ACF benchmark competition (`CompiledKernel._compile_iq_resolve`, same benchmarker as the
+  autotuner) and keeps the winner — so consumption can **never regress** vs baseline (offline ACF
+  wins are noisy and don't always reproduce in-process). Triton's compile cache keeps its plain
+  no-ACF cubin, so the ACF is opaque to the cache by construction — **no `TRITON_ALWAYS_COMPILE`**
+  (a cache hit still re-checks the ACF store), and an APPLY-off run can never reload an ACF cubin.
+  The competition is suppressed while the autotuner is benchmarking (autotuned-kernel ACF support is
+  separate, future work). Costs (only on an ACF-store hit): one extra ptxas (PTX→SASS) per process
+  at first load + a one-time A/B at first launch; idempotency follows the autotuner's contract
+  (assumes overwrite-safe unless `restore_value`/`reset_to_zero` is declared — opt-in for bare `@jit`
+  is a TODO).
 
 ## Version matching (required, two axes)
 

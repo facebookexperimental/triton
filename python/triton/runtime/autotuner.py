@@ -12,7 +12,7 @@ from functools import cached_property
 from typing import Dict, Tuple, List, Optional
 
 from .. import knobs
-from .jit import KernelInterface, JITFunction
+from .jit import KernelInterface, JITFunction, _compile_iq_suppress_competition
 from .errors import OutOfResources, PTXASError, AutotunerError
 from .driver import driver
 from .cache import get_cache_manager, triton_key
@@ -495,7 +495,11 @@ class Autotuner(KernelInterface):
 
         self._last_compiled_kernel = None
         try:
-            timing = self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+            # compile_iq free-win: suppress the launch-time plain-vs-ACF competition so a pending ACF
+            # A/B never fires mid-do_bench and corrupts this config's timing (autotune flow tunes on
+            # plain timing; ACF candidate-expansion for autotuned kernels is handled separately).
+            with _compile_iq_suppress_competition():
+                timing = self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
         except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as e:
             if verbose:
                 print(f"Autotuning failed with {e}")

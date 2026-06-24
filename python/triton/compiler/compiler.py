@@ -337,7 +337,7 @@ def compile(src, target=None, options=None, _env_vars=None):
     always_compile = knobs.compilation.always_compile
     if not always_compile and metadata_path is not None:
         # cache hit!
-        res = CompiledKernel(src, metadata_group, hash)
+        res = _maybe_apply_compile_iq(CompiledKernel(src, metadata_group, hash))
         if compilation_listener:
             compilation_listener(
                 src=src,
@@ -452,7 +452,7 @@ def compile(src, target=None, options=None, _env_vars=None):
         compilation_listener(src=src, metadata=metadata, metadata_group=metadata_group, times=timer.end(),
                              cache_hit=False)
     # return handle to compiled kernel
-    return CompiledKernel(src, metadata_group, hash)
+    return _maybe_apply_compile_iq(CompiledKernel(src, metadata_group, hash))
 
 
 def make_backend(target: GPUTarget) -> BaseBackend:
@@ -461,6 +461,24 @@ def make_backend(target: GPUTarget) -> BaseBackend:
         raise RuntimeError(
             f"{len(actives)} compatible backends for target ({target.backend}) ({actives}). There should only be one.")
     return actives[0](target)
+
+
+def _maybe_apply_compile_iq(compiled_kernel):
+    """compile_iq: apply a stored ACF in-memory (gated by TRITON_COMPILE_IQ_APPLY).
+
+    Runs on BOTH the cache-hit and freshly-compiled paths.
+
+    NO-ACF SASS in compilation cache is never overwritten
+    """
+    if not os.environ.get("TRITON_COMPILE_IQ_APPLY"):
+        return compiled_kernel
+    try:
+        backend = make_backend(compiled_kernel.metadata.target)
+        if hasattr(backend, "apply_compile_iq_acf"):
+            backend.apply_compile_iq_acf(compiled_kernel)
+    except Exception:
+        pass
+    return compiled_kernel
 
 
 class LazyDict:
@@ -579,6 +597,12 @@ class CompiledKernel:
             knobs.runtime.kernel_load_end_hook(self.module, self.function, self.name, self.metadata_group, self.hash)
 
         # Create C dispatcher if enabled and schema is available.
+        self._build_dispatcher()
+
+    def _build_dispatcher(self):
+        # Create C dispatcher (if enabled and schema is available) for the current self.function.
+        # Factored out so it can be rebuilt after the function handle is swapped (e.g. the compile_iq
+        # free-win competition replacing the plain function with the ACF twin).
         self._dispatcher = None
         self._dispatch_arg_indices = None
         self._num_kernel_args = None
@@ -596,6 +620,60 @@ class CompiledKernel:
                     self._num_kernel_args = len(schema["args"])
             except (KeyError, TypeError, ValueError, RuntimeError, json.JSONDecodeError) as e:
                 logger.warning("Triton dispatcher creation failed for %s: %s", self.name, e)
+
+    def _compile_iq_resolve(self, grid_0, grid_1, grid_2, stream, bound_args):
+        """compile_iq free-win competition (one-shot, fail-open). A tuned ACF cubin candidate was
+        stashed at consume (apply_compile_iq_acf); it is a launch-equivalent twin of the plain cubin.
+        No regression: plain and ACF are benchmarked with the real launch args (autotuner benchmarker,
+        min median) and only the winner is kept as the live function -- plain stays in the pool, so
+        this can never be slower than baseline. In-memory only; the compile cache keeps its plain cubin.
+
+        Idempotency: the A/B re-launches the kernel on the user's buffers, so it assumes the kernel is
+        safe to re-run (overwrite outputs). This is the same contract as autotuning; a non-idempotent
+        kernel (accumulate / atomics / in-place) needs a restore/reset opt-in.
+
+        TODO(compile_iq): expose an idempotency opt-in surface (env/registry/kwarg) for bare @jit
+        kernels that lack @autotune's restore_value/reset_to_zero; default assumes overwrite-safe.
+        TODO(compile_iq): optional cross-process winner cache (key sha256(PTX) x arch x acf_sha ->
+        plain|acf) so later processes skip re-benchmarking; today the winner is in-memory per process.
+        TODO(compile_iq): ACF-wedge protection deferred to a separate PR -- the A/B piggybacks on
+        Triton's benchmarker (no timeout/watchdog), same exposure as autotuning any config. A stored
+        ACF was already screened out-of-process at the factory (spawn + per-candidate timeout +
+        self-consistency), so it has run without wedging before reaching consume.
+        """
+        acf_cubin = getattr(self, "_compile_iq_acf_cubin", None)
+        self._compile_iq_acf_cubin = None  # one-shot: resolve once, win or lose
+        if acf_cubin is None:
+            return
+        try:
+            self._init_handles()  # ensure the plain function/module are loaded
+            device = driver.active.get_current_device()
+            plain_function = self.function
+            acf_module, acf_function, _, _, _ = driver.active.utils.load_binary(self.name, acf_cubin,
+                                                                                self.metadata.shared, device)
+            bargs = tuple(bound_args.values())
+
+            def _call(func):
+                self._run(grid_0, grid_1, grid_2, stream, func, self.packed_metadata, None, None, None, *bargs)
+
+            benchmarker = driver.active.get_benchmarker()
+            warmup, rep = knobs.autotuning.warmup, knobs.autotuning.rep
+            plain_ms = benchmarker(lambda: _call(plain_function), warmup=warmup, rep=rep, quantiles=(0.5, 0.2, 0.8))[0]
+            acf_ms = benchmarker(lambda: _call(acf_function), warmup=warmup, rep=rep, quantiles=(0.5, 0.2, 0.8))[0]
+            winner = "acf" if acf_ms < plain_ms else "plain"
+            if winner == "acf":
+                # ACF wins -> make the twin the live kernel (in-memory only; compile cache untouched).
+                self.module, self.function, self.kernel = acf_module, acf_function, acf_cubin
+                self.asm["cubin"] = acf_cubin
+                self._build_dispatcher()  # rebuild the C dispatcher for the new function, if used
+            if os.environ.get("TRITON_COMPILE_IQ_DEBUG"):
+                print(
+                    f"[compile_iq.freewin] {self.name}: plain={plain_ms:.4f}ms acf={acf_ms:.4f}ms "
+                    f"-> kept {winner}", flush=True)
+        except Exception as e:  # never break the user's launch
+            if os.environ.get("TRITON_COMPILE_IQ_DEBUG"):
+                print(f"[compile_iq.freewin] {self.name}: error (fail-open, kept plain): "
+                      f"{type(e).__name__}: {e}", flush=True)
 
     @property
     def run(self):
