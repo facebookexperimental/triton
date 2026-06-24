@@ -5,7 +5,7 @@ on:
     branches:
       - llvm-head
     paths:
-      - cmake/llvm-hash.txt
+      - cmake/llvm-info.json
   pull_request:
     paths:
       - .github/workflows/llvm-build.yml
@@ -46,10 +46,14 @@ jobs:
       with:
         path: llvm-build
 
-    - name: Fetch LLVM Commit Hash
+    - name: Fetch LLVM Info
       shell: bash
       run: |
-        LLVM_COMMIT_HASH="$(cat llvm-build/cmake/llvm-hash.txt)"
+        LLVM_INFO="llvm-build/cmake/llvm-info.json"
+
+        # Parse cmake/llvm-info.json with sed so this step needs no jq/python
+        # (it runs before "Set up Python"); mirrors scripts/build-llvm-project.sh.
+        LLVM_COMMIT_HASH="$(sed -n 's/.*"llvm_hash"[[:space:]]*:[[:space:]]*"\([0-9a-f]*\)".*/\1/p' "${LLVM_INFO}")"
         echo "Found LLVM commit hash: ${LLVM_COMMIT_HASH}"
         echo "llvm_commit_hash=${LLVM_COMMIT_HASH}" >> ${GITHUB_ENV}
 
@@ -57,7 +61,13 @@ jobs:
         echo "Short LLVM commit hash: ${SHORT_LLVM_COMMIT_HASH}"
         echo "short_llvm_commit_hash=${SHORT_LLVM_COMMIT_HASH}" >> ${GITHUB_ENV}
 
-        INSTALL_DIR="llvm-${SHORT_LLVM_COMMIT_HASH}-${{ matrix.config.target-os }}-${{ matrix.config.arch }}"
+        LLVM_BUILD_NUMBER="$(sed -n 's/.*"build_number"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' "${LLVM_INFO}")"
+        echo "LLVM build number: ${LLVM_BUILD_NUMBER}"
+        echo "llvm_build_number=${LLVM_BUILD_NUMBER}" >> ${GITHUB_ENV}
+
+        # Artifact name must match what setup.py downloads:
+        # llvm-{short_hash}-{os}-{arch}-{build_number} (get_llvm_package_info, setup.py:241).
+        INSTALL_DIR="llvm-${SHORT_LLVM_COMMIT_HASH}-${{ matrix.config.target-os }}-${{ matrix.config.arch }}-${LLVM_BUILD_NUMBER}"
         echo "LLVM installation directory name: ${INSTALL_DIR}"
         echo "llvm_install_dir=${INSTALL_DIR}" >> ${GITHUB_ENV}
 
@@ -278,7 +288,7 @@ jobs:
       with:
         name: llvm-${{ matrix.config.target-os }}-${{ matrix.config.arch }}
         path: |
-          ${{ github.workspace }}/llvm-*-${{ matrix.config.target-os }}-${{ matrix.config.arch }}.tar.gz
+          ${{ github.workspace }}/${{ env.llvm_install_dir }}.tar.gz
 
     - name: Azure login
       if: ${{ (github.repository == 'triton-lang/triton') && github.ref_name == 'llvm-head' }}
