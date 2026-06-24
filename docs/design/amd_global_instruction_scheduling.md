@@ -51,7 +51,7 @@ This algorithm:
 
 The algorithm is inspired by the hand-tuned AMD TLX kernels in this tree — `amd_gemm_warp_pipeline.py`, `amd_fa_pipelined.py`, `amd-addmm-glu-opt_test.py`, `amd_tdm_gemm_pipelined.py` — and by the existing `BlockPingpong.cpp` scheduler. It formalizes the decisions those kernels make by hand (buffer depth, the `async_load_wait_group` count, the `warp_pipeline_stage` split, `s_setprio` priorities) into a systematic modulo-scheduling framework.
 
-The ultimate target is **TTGIR** lowered through the AMD backend (`third_party/amd/`). TLX is used for illustration because it maps closely to the AMD primitives (`tlx.async_load`, `tlx.warp_pipeline_stage`, `tlx.local_alloc`), but the algorithm's output is a scheduling specification that the AMD lowering passes (`WarpPipeliner.cpp`, `ConvertWarpPipeline.cpp`, `LoadStoreOpToLLVM.cpp`, `UpdateAsyncWaitCount.cpp`) consume.
+**The algorithm is implemented entirely as AMD backend compiler passes — it does not generate TLX.** It consumes a plain pipelined `scf.for` in ordinary **TTGIR** (no `tlx.*` annotations required — the same kind of input `BlockPingpong.cpp` operates on) and emits the fully lowered warp-pipeline IR directly: the border-split loop, the `cond_barrier` phase shift, `s_setprio`, `s_waitcnt vmcnt`, and `sched.group.barrier`, all the way down to ROCDL/LLVM. TLX primitives (`tlx.async_load`, `tlx.warp_pipeline_stage`, `tlx.local_alloc`) appear in this document only as a **human-readable rendering** of that IR, because they map one-to-one onto the AMD ops the passes emit; the actual artifacts are TTGIR attributes/ops and ROCDL intrinsics consumed and produced by the AMD lowering passes (`WarpPipeliner.cpp`, `ConvertWarpPipeline.cpp`, `LoadStoreOpToLLVM.cpp`, `UpdateAsyncWaitCount.cpp`). Nothing round-trips back up to the TLX frontend.
 
 ### Why AMD Is Different
 
@@ -405,13 +405,13 @@ This is where AMD diverges most from NVIDIA Pass B. NVIDIA reconstructs *asymmet
 
 **Step 4 — Assign warp counts and priorities.** Two warp groups (`warpSize × 4` threads each). **No register reallocation** (`reallocRegisters` is a no-op, ConvertWarpSpecializeToLLVM.cpp:168) — instead, each cluster carries the `s_setprio` priority computed in [Pass A Step 4.8](#step-48-derive-s_setprio-priorities-modulo-reservation-priority) and stored on its ScheduleNodes; Pass B only threads it through to `warp_pipeline_stage(..., priority=)` (it makes no priority decision of its own). Occupancy is set via `waves_per_eu`.
 
-**Step 5 — Generate TLX skeleton.** Emit the loop with `with tlx.warp_pipeline_stage(label, priority): ...` per cluster, the prologue async loads, and the epilogue drain — i.e. reproduce the structure of `amd_gemm_warp_pipeline.py` automatically.
+**Step 5 — Emit the warp-pipeline IR (backend, not TLX).** Write the result directly into TTGIR: the prologue async-copy sequence, the `scf.for` body split into `scf.execute_region` clusters carrying `triton.warp_pipeline.border` (cluster label) + `triton.warp_pipeline.priority` (from Step 4.8) attributes, the inter-cluster `s_waitcnt vmcnt` / `s_barrier` ops, and the epilogue drain — then hand off to `WarpPipeliner.cpp` → `ConvertWarpPipeline.cpp` for the `cond_barrier` phase-shift lowering down to ROCDL. The borders, priorities, and vmcnt waits are **IR attributes and ops, never `tlx.*` calls**. The emitted structure is identical to what `amd_gemm_warp_pipeline.py` writes by hand, which is the only reason the worked examples below render it as TLX for readability.
 
 ---
 
 ## Pass C: Code Generation and Instruction Ordering
 
-Pass C takes the `(stage, cluster)` assignments and the skeleton from Pass B and produces final TTGIR/LLVM ordering. It makes no scheduling decisions.
+Pass C takes the `(stage, cluster)` assignments and the border-tagged loop from Pass B and produces the final TTGIR→LLVM ordering. It makes no scheduling decisions.
 
 - **Loop regions:** expand prologue/kernel/epilogue. The `WarpPipeliner.cpp` pass splits the `scf.for` body at `warp_pipeline.border` markers into `scf.execute_region` clusters; `ConvertWarpPipeline.cpp` lowers them to the phase-shifted two-group schedule.
 - **Within-cluster instruction interleaving:** emit `sched.group.barrier` (`ROCDL::SchedGroupBarrier`, SchedInstructions.cpp; BlockPingpong.cpp:897) to interleave MFMA with VALU/`ds_read` at a chosen ratio (e.g. ~3 VALU per MFMA), bracketed by `sched.barrier` so the LLVM scheduler cannot move ops across cluster boundaries. Optionally emit `iglp_opt` for the attention pattern (the only `instruction_sched_hint` variant currently implemented, SchedInstructions.cpp:82). Emit `s_setprio` transitions at cluster entry/exit (`ROCDL::SetPrioOp`).
@@ -446,7 +446,7 @@ stage 2:  mfma                      (MFMA)
 
 **Step 4.7 — Partition:** two-group warp-pipeline, clusters `{mfma}` (priority 0) and `{mem: next loads + ds_read}` (priority 1).
 
-**Pass B/C — Generated structure (abbreviated):**
+**Pass B/C — Emitted IR (abbreviated; rendered as TLX for readability — the passes emit TTGIR borders + ROCDL, not `tlx.*`):**
 ```python
 # Prologue: issue NUM_BUFFERS async loads (global_load_lds)
 for i in range(NUM_BUFFERS):
@@ -578,7 +578,7 @@ Three AMD mechanisms appear, each mapping to a Pass B decision:
 
 The `local_trans` on K is a **metadata-only memdesc transpose**: it makes `local_load` land directly in `dot_op(opIdx=1)` layout, skipping the register-shuffle + LDS round-trip that `tl.dot(q, k.T)` would otherwise emit. In the ScheduleGraph this is a layout annotation on the LRK buffer's consumer, not a scheduled op.
 
-### Pass B/C, Step 5: Generated TLX Code (steady-state loop, abbreviated)
+### Pass B/C, Step 5: Emitted IR (steady-state loop, abbreviated; rendered as TLX for readability)
 
 ```python
 for block_n in tl.range(block_start, block_end - 3, num_stages=0):
@@ -611,7 +611,9 @@ for block_n in tl.range(block_start, block_end - 3, num_stages=0):
 
 The depth-4 prologue (prime K0/V0/K1/K2) and the 3-tile drain (no OOB prefetch) are exactly the prologue/epilogue structure Pass B Step 3 computes from `maxStage`.
 
-### Algorithm → TLX Code Mapping Summary
+### Algorithm → Emitted IR Mapping Summary
+
+(The right column shows the hand-written `cluster` kernel's TLX as a readable stand-in for the IR the backend passes emit — the passes produce the equivalent TTGIR borders / ROCDL, not this TLX source.)
 
 | Algorithm concept | FA `cluster` kernel realization |
 |---|---|
