@@ -106,7 +106,7 @@ static ttng::TMEMAllocOp findBaseTMEMAlloc(Value desc) {
 /// This function finds TMEMStoreOp (initialization) before the loop
 /// containing the MMA and assigns async_task_id to it if not already set.
 static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
-  funcOp.walk([&](ttng::TCGen5MMAOp mmaOp) {
+  funcOp.walk([&](ttng::MMAv5OpInterface mmaOp) {
     // Step 1: Check if the MMA op has a task_id set.
     auto mmaTaskIds = getAsyncTaskIds(mmaOp);
     if (mmaTaskIds.empty())
