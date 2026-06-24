@@ -2589,6 +2589,35 @@ static void partitionClusterGreedy(ttg::ScheduleLoop &loop) {
   });
 }
 
+/// Number of schedule-graph variants to dump for autotuning. Reads
+/// TRITON_MODULO_DUMP_TOPN (default 1 == legacy single-graph behavior). When
+/// > 1, the Phase-4 partitioner records the top-N candidate partitions and the
+/// dumper re-finalizes + emits all variants into one pluralized file
+/// (schedule_graph.json -> schedule_graphs.json). The rationale:
+/// our cost model ranks the candidate warp-group partitions but is not
+/// perfect, so the true-best schedule may be rank 2 or 3. Dumping the top-N
+/// lets an external harness run each and pick the empirical winner — modulo-
+/// based autotuning, analogous to Triton config autotuning but over schedules.
+static int getDumpTopN() {
+  auto v = triton::tools::getStrEnv("TRITON_MODULO_DUMP_TOPN");
+  if (v.empty())
+    return 1;
+  int n = std::atoi(v.c_str());
+  return n < 1 ? 1 : n;
+}
+
+/// Build the multi-variant dump filename by pluralizing the base path: insert
+/// an `s` before the final extension, so `schedule_graph.json` ->
+/// `schedule_graphs.json` (and `foo.json` -> `foos.json`). With no extension,
+/// `s` is appended. Used for the single-file top-N dump.
+static std::string pluralDumpPath(StringRef base) {
+  auto dot = base.rfind('.');
+  auto slash = base.find_last_of("/\\");
+  if (dot != StringRef::npos && (slash == StringRef::npos || dot > slash))
+    return (base.substr(0, dot) + "s" + base.substr(dot)).str();
+  return (base + "s").str();
+}
+
 /// Exhaustive partition pass: greedy agglomerative clustering followed by
 /// exhaustive enumeration over the resulting clusters. Each cluster is one
 /// "atom" in the partition decision; ops within a cluster always travel to
@@ -2696,6 +2725,29 @@ static void partitionExhaustive(ttg::ScheduleLoop &loop) {
     int wg = winner.assignment.clusterToWg[c.id];
     for (unsigned nid : c.nodeIds)
       loop.nodes[nid].warpGroup = wg;
+  }
+
+  // Record the top-N candidate partitions for the multi-graph autotuning dump
+  // (TRITON_MODULO_DUMP_TOPN). Each is a node-indexed raw warpGroup vector
+  // (NONE ops = -1), best-first; [0] mirrors the winner just applied above.
+  // The dumper later re-finalizes each (infra-op propagation + barrier
+  // synthesis + buffer merging) on a pre-partition snapshot and emits it as a
+  // separate JSON so the schedule is explored, not just the partition.
+  loop.partitionCost = winner.cost; // committed (rank-0) cost
+  loop.topPartitions.clear();
+  loop.topPartitionCosts.clear();
+  if (int topN = getDumpTopN(); topN > 1) {
+    size_t kn = std::min<size_t>(topN, scored.size());
+    for (size_t k = 0; k < kn; ++k) {
+      SmallVector<int> nodeWG(loop.nodes.size(), -1);
+      for (const auto &c : clusters) {
+        int wg = scored[k].assignment.clusterToWg[c.id];
+        for (unsigned nid : c.nodeIds)
+          nodeWG[nid] = wg;
+      }
+      loop.topPartitions.push_back(std::move(nodeWG));
+      loop.topPartitionCosts.push_back(scored[k].cost);
+    }
   }
 
   LLVM_DEBUG({
@@ -3189,6 +3241,14 @@ struct ScheduledLoop {
   ttg::DataDependenceGraph ddg;
   bool isOuter{false};
   std::optional<ttg::ModuloScheduleResult> outerSched;
+
+  // Pre-partition snapshot of `graph`, taken right before the Phase-4
+  // warp-group partition commits the winner. Only populated when
+  // TRITON_MODULO_DUMP_TOPN > 1. The top-N autotuning dump re-finalizes each
+  // alternative partition (from graph.loops[*].topPartitions) on a fresh copy
+  // of this pristine base, so synthesized barriers/channels for one candidate
+  // never leak into another.
+  ttg::ScheduleGraph prePartitionGraph;
 };
 
 /// Schedule `loop` and append the result to `out`. Wraps `scheduleOneLoop`
@@ -3306,6 +3366,36 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
       schedLoop.physicalBuffers.clear();
       mergeNonOverlappingBuffers(schedLoop);
     }
+}
+
+/// Re-run the partition-dependent finalization on ONE loop for the top-N
+/// autotuning dump, given a raw node→warpGroup assignment (a candidate from
+/// `ScheduleLoop::topPartitions`). Mirrors the per-loop steps in
+/// `applyGlobalWarpPartition` (infra-op demotion/propagation, cross-group
+/// barrier synthesis, then a fresh buffer-merge), but driven by an explicit
+/// assignment instead of the cost-model winner. `schedLoop` must be a fresh
+/// copy of the pre-partition graph (so no prior candidate's synthesized
+/// channels are present). Used only for the JSON dump — never mutates IR.
+///
+/// NOTE: unlike the committed winner path (which runs barrier insertion as a
+/// global per-loop pass for cross-loop super-node coordination), this applies
+/// finalization per-loop. For single-loop kernels (case1/case3) the result is
+/// identical; for outer+inner nests the cross-loop barrier attachment may
+/// differ slightly — acceptable for an autotuning candidate dump.
+static void finalizeLoopPartitionForDump(ttg::ScheduleLoop &schedLoop,
+                                         ArrayRef<int> nodeWarpGroups) {
+  if (schedLoop.II <= 0)
+    return;
+  for (auto &node : schedLoop.nodes)
+    node.warpGroup =
+        node.id < nodeWarpGroups.size() ? nodeWarpGroups[node.id] : -1;
+  demoteScalarArithToInfra(schedLoop);
+  propagateWarpGroupToInfraOps(schedLoop);
+  insertCrossGroupBarriers(schedLoop);
+  for (auto &buf : schedLoop.buffers)
+    buf.mergeGroupId = UINT_MAX;
+  schedLoop.physicalBuffers.clear();
+  mergeNonOverlappingBuffers(schedLoop);
 }
 
 // ============================================================================
@@ -3663,6 +3753,8 @@ void jsonDumpScheduleLoop(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl,
   os << "    {\n";
   os << "      \"id\": " << loopId << ",\n";
   os << "      \"II\": " << sl.II << ",\n";
+  os << "      \"partition_cost\": " << llvm::format("%.4f", sl.partitionCost)
+     << ",\n";
   os << "      \"max_stage\": " << sl.maxStage << ",\n";
   os << "      \"prologue_latency\": " << sl.prologueLatency << ",\n";
   os << "      \"trip_count\": " << sl.tripCount << ",\n";
@@ -3917,21 +4009,21 @@ void jsonDumpOpsTable(llvm::raw_ostream &os, tt::FuncOp kernelFn,
   os << "  },\n";
 }
 
-void dumpScheduleGraphAsJSON(ModuleOp moduleOp, StringRef path,
-                             ArrayRef<ScheduledLoop> scheduledLoops) {
+// Write ONE schedule-graph JSON document (kernel + ops + loops) to `os`.
+// Factored out so both the single-graph dumper and the multi-variant dumper
+// (top-N autotuning) can reuse it — each variant is a self-contained doc.
+void writeScheduleGraphDoc(llvm::raw_ostream &os, ModuleOp moduleOp,
+                           ArrayRef<ScheduledLoop> scheduledLoops,
+                           int variantId = -1) {
   tt::FuncOp kernelFn = findKernelFn(moduleOp);
   JsonDumpContext dc = buildJsonDumpContext(kernelFn, scheduledLoops);
 
-  std::error_code ec;
-  llvm::raw_fd_ostream os(path, ec);
-  if (ec) {
-    llvm::errs() << "[modulo-schedule] Failed to open dump file '" << path
-                 << "': " << ec.message() << "\n";
-    return;
-  }
-
   os << "{\n";
   os << "  \"schema_version\": \"0.1\",\n";
+  // Autotuning variant id == predicted-performance rank (0 = cost-model best,
+  // emitted first). Absent for legacy single-graph dumps.
+  if (variantId >= 0)
+    os << "  \"variant_id\": " << variantId << ",\n";
   jsonDumpKernelSection(os, kernelFn, dc);
   jsonDumpOpsTable(os, kernelFn, dc);
 
@@ -3960,8 +4052,21 @@ void dumpScheduleGraphAsJSON(ModuleOp moduleOp, StringRef path,
     os << "    }" << (i + 1 == scheduledLoops.size() ? "" : ",") << "\n";
   }
   os << "  ]\n";
-  os << "}\n";
+  os << "}";
+}
 
+// Single-graph dump (legacy / TOPN=1): open `path` and write one doc.
+void dumpScheduleGraphAsJSON(ModuleOp moduleOp, StringRef path,
+                             ArrayRef<ScheduledLoop> scheduledLoops) {
+  std::error_code ec;
+  llvm::raw_fd_ostream os(path, ec);
+  if (ec) {
+    llvm::errs() << "[modulo-schedule] Failed to open dump file '" << path
+                 << "': " << ec.message() << "\n";
+    return;
+  }
+  writeScheduleGraphDoc(os, moduleOp, scheduledLoops);
+  os << "\n";
   llvm::errs() << "[modulo-schedule] Dumped schedule graph (v0.1) to " << path
                << " (" << scheduledLoops.size() << " loop(s))\n";
 }
@@ -4130,6 +4235,34 @@ void dumpDDGAsJSON(ModuleOp moduleOp, StringRef path,
                << scheduledLoops.size() << " loop(s))\n";
 }
 
+// Multi-variant dump (TOPN>1): write ALL top-N partition graphs into ONE file
+// as {"variants": [graph0, graph1, ...]}. The array is ordered by predicted
+// performance — variants[0] is the cost-model winner (supposed-fastest first) —
+// and each graph carries its own "variant_id" matching that rank.
+void dumpScheduleGraphsJSON(ModuleOp moduleOp, StringRef path,
+                            ArrayRef<SmallVector<ScheduledLoop, 2>> variants) {
+  std::error_code ec;
+  llvm::raw_fd_ostream os(path, ec);
+  if (ec) {
+    llvm::errs() << "[modulo-schedule] Failed to open dump file '" << path
+                 << "': " << ec.message() << "\n";
+    return;
+  }
+  os << "{\n  \"schema_version\": \"0.1\",\n";
+  os << "  \"num_variants\": " << variants.size() << ",\n";
+  // Ordered best-predicted-first (ascending cost-model cost).
+  os << "  \"sorted_by\": \"predicted_perf_desc\",\n";
+  os << "  \"variants\": [\n";
+  for (size_t k = 0; k < variants.size(); ++k) {
+    writeScheduleGraphDoc(os, moduleOp, variants[k], /*variantId=*/(int)k);
+    os << (k + 1 == variants.size() ? "\n" : ",\n");
+  }
+  os << "  ]\n}\n";
+  llvm::errs() << "[modulo-schedule] Dumped " << variants.size()
+               << " schedule-graph variant(s) to " << path
+               << " (top-N autotuning, best-predicted first)\n";
+}
+
 } // namespace
 
 // ============================================================================
@@ -4285,6 +4418,14 @@ struct ModuloSchedulePass
       // cross-loop coordination possible (e.g., outer-loop super-node
       // matched to inner-loop MMA's warp group).
       // ================================================================
+      // For top-N autotuning: snapshot each loop's pristine pre-partition
+      // graph (no warp-group assignment, no synthesized barriers/channels)
+      // before the winner is committed. Overwritten each iteration so it
+      // reflects the final converged schedule. Cheap value copy; only when
+      // multi-graph dump is requested.
+      if (getDumpTopN() > 1)
+        for (auto &sl : scheduledLoops)
+          sl.prePartitionGraph = sl.graph;
       applyGlobalWarpPartition(scheduledLoops);
 
       // ================================================================
@@ -4343,7 +4484,66 @@ struct ModuloSchedulePass
 
     // Optional: dump the ScheduleGraph as JSON for the TLX emitter.
     if (const char *path = std::getenv("TRITON_MODULO_DUMP_SCHEDULE")) {
-      dumpScheduleGraphAsJSON(moduleOp, path, scheduledLoops);
+      int topN = getDumpTopN();
+      if (topN <= 1) {
+        // Legacy single-graph dump (the cost-model winner committed to IR).
+        dumpScheduleGraphAsJSON(moduleOp, path, scheduledLoops);
+      } else {
+        // Top-N autotuning: emit ALL variants into ONE file, pluralized
+        // (schedule_graph.json -> schedule_graphs.json), ordered best-predicted
+        // first (variant 0 == committed winner). An external harness reads the
+        // `variants` array, emits + runs each, and picks the empirical winner.
+        //
+        // How many variants we can actually produce: the min over schedulable
+        // loops of available candidate partitions. Loops that fell back to
+        // greedy or had < 2 clusters contribute no alternatives.
+        size_t numVariants = static_cast<size_t>(topN);
+        bool sawSchedulable = false;
+        for (auto &sl : scheduledLoops)
+          for (auto &schedLoop : sl.graph.loops)
+            if (schedLoop.II > 0) {
+              sawSchedulable = true;
+              numVariants =
+                  std::min(numVariants, schedLoop.topPartitions.size());
+            }
+        // Always emit at least the committed winner (variant 0) when any loop
+        // was schedulable: `topPartitions` can be empty (greedy fallback or
+        // exhaustive partitioning off), which would otherwise collapse the dump
+        // to zero variants and drop even the winner.
+        numVariants = sawSchedulable ? std::max<size_t>(numVariants, 1) : 1;
+
+        SmallVector<SmallVector<ScheduledLoop, 2>, 3> variants;
+        for (size_t k = 0; k < numVariants; ++k) {
+          // Variant 0 reuses the committed winner graph as-is; k >= 1 is built
+          // off the pristine pre-partition snapshot, re-finalized with
+          // candidate-k's partition. Only the fields the dumper reads (loop,
+          // isOuter, graph) are populated.
+          SmallVector<ScheduledLoop, 2> variant;
+          for (auto &sl : scheduledLoops) {
+            ScheduledLoop v;
+            v.loop = sl.loop;
+            v.isOuter = sl.isOuter;
+            if (k == 0) {
+              v.graph = sl.graph; // committed winner
+            } else {
+              v.graph = sl.prePartitionGraph; // pristine copy
+              for (size_t li = 0; li < v.graph.loops.size(); ++li) {
+                auto &dstLoop = v.graph.loops[li];
+                auto &liveLoop = sl.graph.loops[li];
+                if (dstLoop.II > 0 && k < liveLoop.topPartitions.size()) {
+                  finalizeLoopPartitionForDump(dstLoop,
+                                               liveLoop.topPartitions[k]);
+                  if (k < liveLoop.topPartitionCosts.size())
+                    dstLoop.partitionCost = liveLoop.topPartitionCosts[k];
+                }
+              }
+            }
+            variant.push_back(std::move(v));
+          }
+          variants.push_back(std::move(variant));
+        }
+        dumpScheduleGraphsJSON(moduleOp, pluralDumpPath(path), variants);
+      }
     }
     // Optional: dump the pre-schedule DDG layer (the solver's input + the
     // MinII analysis it derives) as JSON. This is everything needed to
