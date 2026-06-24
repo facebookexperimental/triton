@@ -2518,24 +2518,27 @@ ttng::WaitBarrierOp desyncTCGen5MMAOp(
 #endif
 }
 
-void replaceBufferReuse(triton::FuncOp funcOp,
-                        const DenseMap<Channel *, SmallVector<Channel *>>
-                            &channelsGroupedByConsumers,
-                        const SmallVector<Channel *> &orderedChannels,
-                        ReuseConfig *config) {
-  // Multiple channels can associate with the same alloc.
+void replaceBufferReuse(triton::FuncOp funcOp, ReuseConfig *config) {
+  // Collapse every reuse group: rewrite each non-representative channel's
+  // allocation onto the representative's allocation and erase it. We iterate
+  // config->groups directly -- the source of truth for what must be collapsed
+  // -- rather than the post-merge channel lists. Channels merged into a shared
+  // consumer group during consumer-merging are removed from orderedChannels, so
+  // iterating those lists would skip them and leave their duplicate physical
+  // buffers alive (SMEM OOM, e.g. subtiled-region epilogue staging). Iterating
+  // groups visits every non-representative channel regardless of merge state.
   DenseSet<Operation *> handledAllocs;
-  for (auto *key : orderedChannels) {
-    auto it = channelsGroupedByConsumers.find(key);
-    assert(it != channelsGroupedByConsumers.end());
-    Channel *channel = it->second.front();
-    // For each reuse group, choose a representative channel.
-    int reuseGrp = channelInReuseGroup(channel, config, false /*reuseBarrier*/);
-    if (reuseGrp < 0)
+  for (unsigned reuseGrp = 0; reuseGrp < config->getGroupSize(); ++reuseGrp) {
+    auto *group = config->getGroup(reuseGrp);
+    if (group->channels.size() <= 1)
       continue;
-    // The biggest type should be the representative.
-    auto *repCh = config->getGroup(reuseGrp)->channels[0];
-    if (channel != repCh && channel->getAllocOp() != repCh->getAllocOp()) {
+    // The no-offset / biggest-type channel is the representative; its
+    // allocation is kept and every other channel in the group folds into it.
+    auto *repCh = group->channels[0];
+    for (size_t ci = 1; ci < group->channels.size(); ++ci) {
+      Channel *channel = group->channels[ci];
+      if (channel->getAllocOp() == repCh->getAllocOp())
+        continue;
       if (handledAllocs.count(channel->getAllocOp()))
         continue;
       LLVM_DEBUG({
@@ -4982,8 +4985,7 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
 
   foldLocalLoads(funcOp);
   cleanupTmemTokens(funcOp);
-  replaceBufferReuse(funcOp, channelsGroupedByConsumers, orderedChannels,
-                     &config);
+  replaceBufferReuse(funcOp, &config);
 
   // Lower SubtiledRegionOps whose tile body spans multiple async tasks.
   // Single-task SubtiledRegionOps are preserved and handled by SpecializeOp.

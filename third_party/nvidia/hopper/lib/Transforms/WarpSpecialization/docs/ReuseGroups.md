@@ -115,11 +115,23 @@ channels share no circular barrier).
 ### 3. Buffer Replacement
 
 `replaceBufferReuse` rewrites all IR uses of non-representative alloc ops to
-point at the representative's alloc:
+point at the representative's alloc. It iterates `config->groups` **directly**
+(the source of truth for what must be collapsed) and folds every
+non-representative channel of each group into `channels[0]`. It deliberately
+does **not** iterate the post-merge channel lists: the reuse-group
+consumer-merge in `doCodePartitionPost` removes a non-representative channel
+from `orderedChannels` whenever it shares a consumer op with the representative
+(e.g. epilogue subtiles that all feed one `ttng.subtiled_region`). Iterating
+`orderedChannels` would therefore skip those merged-out channels and leave their
+duplicate physical buffers alive — doubling SMEM and causing `OutOfResources`.
+Iterating groups visits every non-representative channel regardless of merge
+state.
 
 - **SMEM channels**: When the alloc types match, uses direct
-  `replaceUsesOfWith` to swap the alloc result, then erases the old alloc.
-  Type mismatches are skipped (SMEM cannot be reinterpreted like TMEM).
+  `replaceUsesOfWith` to swap the alloc result, then erases the old alloc. This
+  generic rewrite also updates `ttng.subtiled_region` operands, which are
+  ordinary users of the alloc result. Type mismatches are skipped (SMEM cannot
+  be reinterpreted like TMEM).
 
 - **TMEM channels**: Inserts a `sliceAndReinterpretMDTMEM` op at the
   `buffer.offset` column within the representative's TMEM allocation. If the
