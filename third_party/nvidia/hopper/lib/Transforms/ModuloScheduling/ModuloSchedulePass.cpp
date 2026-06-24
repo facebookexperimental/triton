@@ -2290,6 +2290,110 @@ enumerateClusterPartitions(int numClusters) {
   return result;
 }
 
+/// True iff `op` produces a *register* tensor value via COMPUTE (arith / math /
+/// reduce / convert / select etc.) — i.e. a value that, when it crosses a WG
+/// boundary, must be staged through SMEM (register→SMEM→register).
+///
+/// Residency-aware, lowering-aware (the subtle part):
+///  - Loads (`tt.load`, `descriptor_load`, `descriptor_gather`) ALSO produce a
+///    register-typed result, but they are SMEM-destined: they lower to TMA
+///    (global→SMEM) and the consumer/MMA reads SMEM directly. No round-trip —
+///    even though they're not lowered yet at schedule time. EXCLUDED.
+///  - tcgen05 MMA (→TMEM) and TMEM copies operate on memdesc and yield an async
+///    token / no value — never a register tensor. EXCLUDED explicitly so a
+///    future tensor-typed result can't be miscounted.
+///  - Pointer-element tensors (`!tt.ptr<...>`) must not be split across WGs (the
+///    partition scheduler can't form a pointer cross-WG channel), so they never
+///    incur a register round-trip. EXCLUDED. See partition-scheduler-bugs.md.
+/// Net: only genuine register compute chains (the FA softmax `subf→exp2`) count;
+/// GEMM/wgrad cross-WG edges (all load/MMA) score zero.
+static bool isRegisterComputeValue(Operation *op) {
+  if (!op || op->getNumResults() == 0)
+    return false;
+  if (isa<tt::LoadOp, tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op))
+    return false; // SMEM-destined (TMA), not a register round-trip
+  if (isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp, ttng::TMEMCopyOp>(op))
+    return false; // TMEM/memdesc ops, token/void result — not registers
+  auto rtt = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+  if (!rtt)
+    return false;
+  if (isa<tt::PointerType>(rtt.getElementType()))
+    return false; // pointer tensors aren't cross-WG channelable
+  return true;
+}
+
+/// Element count of `op`'s (register) result tensor; 0 if not static/ranked.
+static int64_t registerTensorElems(Operation *op) {
+  auto rtt = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+  if (!rtt)
+    return 0;
+  int64_t e = 1;
+  for (auto d : rtt.getShape()) {
+    if (d <= 0 || ShapedType::isDynamic(d))
+      return 0;
+    e *= d;
+  }
+  return e;
+}
+
+/// Cycles to move `elems` register elements to/from SMEM — matches the
+/// LatencyModel's LocalLoad/LocalStore base `scaleByElements(105, elems)` with
+/// the 16384-elem (128x128) reference.
+static int smemMoveCost(int64_t elems) {
+  return static_cast<int>(105.0 * static_cast<double>(elems) / 16384.0);
+}
+
+/// Cross-WG handshake round-trip LATENCY (cycles) for a register→SMEM→register
+/// hop: the consumer WG's WaitBarrier blocks until the producer's store is
+/// visible and its ArriveBarrier fires, then the consumer loads back from SMEM.
+/// This is a *latency* stall (the consumer cannot proceed), dominated by the
+/// cross-WG mbarrier signal+wait round-trip plus SMEM store/load availability —
+/// NOT the cheap barrier *issue* occupancy (`kBarrierOverhead`). Sized from the
+/// FA-fwd softmax-cut measurement: the SMEM-move occupancy alone (~110 cyc)
+/// failed to de-rank the split partition, while charging the full handshake
+/// latency (~550 cyc here) flips it to the unified partition that measures
+/// ~2.5x faster on B200.
+constexpr int kCrossWGRoundTripLatency = 500;
+
+/// Accumulate the register→SMEM→register round-trip LATENCY (cycles) per WG for
+/// cross-WG edges that CUT A REGISTER COMPUTE CHAIN. The synthesized
+/// `local_store`/`local_load` + handshake do NOT exist at scoring time
+/// (`insertCrossGroupBarriers` adds them later), so the per-WG makespan misses
+/// the per-iteration stall a split inflicts on a serial chain (the FA softmax).
+///
+/// Charged ONLY when BOTH endpoints are register-compute ops (the genuine
+/// reg→SMEM→reg round-trip the consumer stalls on). Loads (→TMA/SMEM), MMA
+/// (→TMEM), and stores are excluded — their cross-WG values are SMEM/TMEM
+/// resident, not a register hand-off, and (being unavoidable) are present in
+/// every candidate anyway. Net: zero for GEMM/LayerNorm/wgrad partitions; only
+/// a CUDA-chain cut (FA softmax) pays.
+static void accumulateCrossWGRoundTrip(
+    const ttg::ScheduleLoop &loop,
+    const llvm::SmallDenseMap<unsigned, int> &nodeToWg,
+    llvm::SmallDenseMap<int, int> &rtPerWg) {
+  for (const auto &edge : loop.edges) {
+    auto sIt = nodeToWg.find(edge.srcId);
+    auto dIt = nodeToWg.find(edge.dstId);
+    if (sIt == nodeToWg.end() || dIt == nodeToWg.end())
+      continue;
+    if (sIt->second == dIt->second)
+      continue; // same WG: stays in registers, no staging
+    const auto &sN = loop.nodes[edge.srcId];
+    // Only a register-compute → register-compute hop is a real round-trip the
+    // consumer stalls on. Excludes loads/MMA/TMA/stores (SMEM/TMEM resident).
+    if (!isRegisterComputeValue(sN.op) ||
+        !isRegisterComputeValue(loop.nodes[edge.dstId].op))
+      continue;
+    int64_t elems = registerTensorElems(sN.op);
+    if (elems <= 0)
+      continue;
+    int freq = std::max(sN.frequencyMultiplier, 1);
+    // Consumer eats the full handshake latency + SMEM load occupancy, per iter.
+    int rt = kCrossWGRoundTripLatency + smemMoveCost(elems);
+    rtPerWg[dIt->second] += rt * freq;
+  }
+}
+
 static ScoredCandidate scoreCandidate(const ClusterAssignment &assn,
                                       const SmallVector<OpCluster> &clusters,
                                       const ttg::ScheduleLoop &loop,
@@ -2309,13 +2413,18 @@ static ScoredCandidate scoreCandidate(const ClusterAssignment &assn,
   // Each WG's makespan now depends on its chosen warp count: ops with
   // minWarps=4 (SFU/CUDA tile) cost more if the WG only gets 1 warp.
   // Layer C: also accumulate per-WG register footprint.
+  // Cross-WG register round-trip cost per WG (see accumulateCrossWGRoundTrip).
+  llvm::SmallDenseMap<int, int> rtPerWg;
+  accumulateCrossWGRoundTrip(loop, nodeToWg, rtPerWg);
+
   int bottleneck = 0;
   int totalRegs = kDefaultWGFootprint; // include implicit "default" WG
   for (auto &[wgId, nodes] : wgToNodes) {
     int wgWarps = wgRequiredWarps(nodes, loop);
     int ms = computeMultiPipelineMakespan(nodes, loop, wgWarps);
     int barCost = computeWGBarrierCost(nodes, loop, nodeToWg, wgId);
-    int wgCost = ms + barCost;
+    int rtCost = rtPerWg.lookup(wgId);
+    int wgCost = ms + barCost + rtCost;
     int fp = wgFootprint(wgWarps);
     totalRegs += fp;
     if (verbose) {
@@ -2328,7 +2437,7 @@ static ScoredCandidate scoreCandidate(const ClusterAssignment &assn,
         }
         llvm::dbgs() << "] warps=" << wgWarps << " regs=" << fp
                      << " makespan=" << ms << " barCost=" << barCost
-                     << " wgCost=" << wgCost << "\n";
+                     << " rtCost=" << rtCost << " wgCost=" << wgCost << "\n";
       });
     }
     bottleneck = std::max(bottleneck, wgCost);
@@ -2468,13 +2577,16 @@ static double evalGreedyCost(const SmallVector<GreedyWG> &wgs,
     for (unsigned nid : wgs[wgi].nodeIds)
       nodeToWg[nid] = static_cast<int>(wgi);
   }
+  llvm::SmallDenseMap<int, int> rtPerWg;
+  accumulateCrossWGRoundTrip(loop, nodeToWg, rtPerWg);
   int bottleneck = 0;
   for (unsigned wgi = 0; wgi < wgs.size(); ++wgi) {
     int wgWarps = wgRequiredWarps(wgs[wgi].nodeIds, loop);
     int ms = computeMultiPipelineMakespan(wgs[wgi].nodeIds, loop, wgWarps);
     int barCost = computeWGBarrierCost(wgs[wgi].nodeIds, loop, nodeToWg,
                                        static_cast<int>(wgi));
-    bottleneck = std::max(bottleneck, ms + barCost);
+    bottleneck = std::max(bottleneck,
+                          ms + barCost + rtPerWg.lookup(static_cast<int>(wgi)));
     totalRegs += wgFootprint(wgWarps);
   }
   int deficit = std::max(0, totalRegs - kBlackwellSMRegs);
@@ -2589,6 +2701,35 @@ static void partitionClusterGreedy(ttg::ScheduleLoop &loop) {
   });
 }
 
+/// Number of schedule-graph variants to dump for autotuning. Reads
+/// TRITON_MODULO_DUMP_TOPN (default 1 == legacy single-graph behavior). When
+/// > 1, the Phase-4 partitioner records the top-N candidate partitions and the
+/// dumper re-finalizes + emits all variants into one pluralized file
+/// (schedule_graph.json -> schedule_graphs.json). The rationale:
+/// our cost model ranks the candidate warp-group partitions but is not
+/// perfect, so the true-best schedule may be rank 2 or 3. Dumping the top-N
+/// lets an external harness run each and pick the empirical winner — modulo-
+/// based autotuning, analogous to Triton config autotuning but over schedules.
+static int getDumpTopN() {
+  auto v = triton::tools::getStrEnv("TRITON_MODULO_DUMP_TOPN");
+  if (v.empty())
+    return 1;
+  int n = std::atoi(v.c_str());
+  return n < 1 ? 1 : n;
+}
+
+/// Build the multi-variant dump filename by pluralizing the base path: insert
+/// an `s` before the final extension, so `schedule_graph.json` ->
+/// `schedule_graphs.json` (and `foo.json` -> `foos.json`). With no extension,
+/// `s` is appended. Used for the single-file top-N dump.
+static std::string pluralDumpPath(StringRef base) {
+  auto dot = base.rfind('.');
+  auto slash = base.find_last_of("/\\");
+  if (dot != StringRef::npos && (slash == StringRef::npos || dot > slash))
+    return (base.substr(0, dot) + "s" + base.substr(dot)).str();
+  return (base + "s").str();
+}
+
 /// Exhaustive partition pass: greedy agglomerative clustering followed by
 /// exhaustive enumeration over the resulting clusters. Each cluster is one
 /// "atom" in the partition decision; ops within a cluster always travel to
@@ -2605,6 +2746,19 @@ static void partitionExhaustive(ttg::ScheduleLoop &loop) {
     // Single cluster (or none): one WG, set everything to wg0.
     for (auto &node : loop.nodes)
       node.warpGroup = (node.pipeline == ttg::HWPipeline::NONE) ? -1 : 0;
+    // For the top-N autotuning dump, record this fixed single partition so the
+    // variant assembler treats this loop as "1 candidate, held fixed across
+    // variants" rather than "0 candidates" — otherwise a single-cluster sibling
+    // loop (e.g. an epilogue) would zero out the whole multi-variant dump.
+    loop.topPartitions.clear();
+    loop.topPartitionCosts.clear();
+    if (getDumpTopN() > 1) {
+      SmallVector<int> nodeWG(loop.nodes.size(), -1);
+      for (auto &node : loop.nodes)
+        nodeWG[node.id] = node.warpGroup;
+      loop.topPartitions.push_back(std::move(nodeWG));
+      loop.topPartitionCosts.push_back(loop.partitionCost);
+    }
     return;
   }
 
@@ -2696,6 +2850,29 @@ static void partitionExhaustive(ttg::ScheduleLoop &loop) {
     int wg = winner.assignment.clusterToWg[c.id];
     for (unsigned nid : c.nodeIds)
       loop.nodes[nid].warpGroup = wg;
+  }
+
+  // Record the top-N candidate partitions for the multi-graph autotuning dump
+  // (TRITON_MODULO_DUMP_TOPN). Each is a node-indexed raw warpGroup vector
+  // (NONE ops = -1), best-first; [0] mirrors the winner just applied above.
+  // The dumper later re-finalizes each (infra-op propagation + barrier
+  // synthesis + buffer merging) on a pre-partition snapshot and emits it as a
+  // separate JSON so the schedule is explored, not just the partition.
+  loop.partitionCost = winner.cost; // committed (rank-0) cost
+  loop.topPartitions.clear();
+  loop.topPartitionCosts.clear();
+  if (int topN = getDumpTopN(); topN > 1) {
+    size_t kn = std::min<size_t>(topN, scored.size());
+    for (size_t k = 0; k < kn; ++k) {
+      SmallVector<int> nodeWG(loop.nodes.size(), -1);
+      for (const auto &c : clusters) {
+        int wg = scored[k].assignment.clusterToWg[c.id];
+        for (unsigned nid : c.nodeIds)
+          nodeWG[nid] = wg;
+      }
+      loop.topPartitions.push_back(std::move(nodeWG));
+      loop.topPartitionCosts.push_back(scored[k].cost);
+    }
   }
 
   LLVM_DEBUG({
@@ -3189,6 +3366,14 @@ struct ScheduledLoop {
   ttg::DataDependenceGraph ddg;
   bool isOuter{false};
   std::optional<ttg::ModuloScheduleResult> outerSched;
+
+  // Pre-partition snapshot of `graph`, taken right before the Phase-4
+  // warp-group partition commits the winner. Only populated when
+  // TRITON_MODULO_DUMP_TOPN > 1. The top-N autotuning dump re-finalizes each
+  // alternative partition (from graph.loops[*].topPartitions) on a fresh copy
+  // of this pristine base, so synthesized barriers/channels for one candidate
+  // never leak into another.
+  ttg::ScheduleGraph prePartitionGraph;
 };
 
 /// Schedule `loop` and append the result to `out`. Wraps `scheduleOneLoop`
@@ -3306,6 +3491,36 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
       schedLoop.physicalBuffers.clear();
       mergeNonOverlappingBuffers(schedLoop);
     }
+}
+
+/// Re-run the partition-dependent finalization on ONE loop for the top-N
+/// autotuning dump, given a raw node→warpGroup assignment (a candidate from
+/// `ScheduleLoop::topPartitions`). Mirrors the per-loop steps in
+/// `applyGlobalWarpPartition` (infra-op demotion/propagation, cross-group
+/// barrier synthesis, then a fresh buffer-merge), but driven by an explicit
+/// assignment instead of the cost-model winner. `schedLoop` must be a fresh
+/// copy of the pre-partition graph (so no prior candidate's synthesized
+/// channels are present). Used only for the JSON dump — never mutates IR.
+///
+/// NOTE: unlike the committed winner path (which runs barrier insertion as a
+/// global per-loop pass for cross-loop super-node coordination), this applies
+/// finalization per-loop. For single-loop kernels (case1/case3) the result is
+/// identical; for outer+inner nests the cross-loop barrier attachment may
+/// differ slightly — acceptable for an autotuning candidate dump.
+static void finalizeLoopPartitionForDump(ttg::ScheduleLoop &schedLoop,
+                                         ArrayRef<int> nodeWarpGroups) {
+  if (schedLoop.II <= 0)
+    return;
+  for (auto &node : schedLoop.nodes)
+    node.warpGroup =
+        node.id < nodeWarpGroups.size() ? nodeWarpGroups[node.id] : -1;
+  demoteScalarArithToInfra(schedLoop);
+  propagateWarpGroupToInfraOps(schedLoop);
+  insertCrossGroupBarriers(schedLoop);
+  for (auto &buf : schedLoop.buffers)
+    buf.mergeGroupId = UINT_MAX;
+  schedLoop.physicalBuffers.clear();
+  mergeNonOverlappingBuffers(schedLoop);
 }
 
 // ============================================================================
@@ -3663,6 +3878,8 @@ void jsonDumpScheduleLoop(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl,
   os << "    {\n";
   os << "      \"id\": " << loopId << ",\n";
   os << "      \"II\": " << sl.II << ",\n";
+  os << "      \"partition_cost\": " << llvm::format("%.4f", sl.partitionCost)
+     << ",\n";
   os << "      \"max_stage\": " << sl.maxStage << ",\n";
   os << "      \"prologue_latency\": " << sl.prologueLatency << ",\n";
   os << "      \"trip_count\": " << sl.tripCount << ",\n";
@@ -3917,21 +4134,21 @@ void jsonDumpOpsTable(llvm::raw_ostream &os, tt::FuncOp kernelFn,
   os << "  },\n";
 }
 
-void dumpScheduleGraphAsJSON(ModuleOp moduleOp, StringRef path,
-                             ArrayRef<ScheduledLoop> scheduledLoops) {
+// Write ONE schedule-graph JSON document (kernel + ops + loops) to `os`.
+// Factored out so both the single-graph dumper and the multi-variant dumper
+// (top-N autotuning) can reuse it — each variant is a self-contained doc.
+void writeScheduleGraphDoc(llvm::raw_ostream &os, ModuleOp moduleOp,
+                           ArrayRef<ScheduledLoop> scheduledLoops,
+                           int variantId = -1) {
   tt::FuncOp kernelFn = findKernelFn(moduleOp);
   JsonDumpContext dc = buildJsonDumpContext(kernelFn, scheduledLoops);
 
-  std::error_code ec;
-  llvm::raw_fd_ostream os(path, ec);
-  if (ec) {
-    llvm::errs() << "[modulo-schedule] Failed to open dump file '" << path
-                 << "': " << ec.message() << "\n";
-    return;
-  }
-
   os << "{\n";
   os << "  \"schema_version\": \"0.1\",\n";
+  // Autotuning variant id == predicted-performance rank (0 = cost-model best,
+  // emitted first). Absent for legacy single-graph dumps.
+  if (variantId >= 0)
+    os << "  \"variant_id\": " << variantId << ",\n";
   jsonDumpKernelSection(os, kernelFn, dc);
   jsonDumpOpsTable(os, kernelFn, dc);
 
@@ -3960,8 +4177,21 @@ void dumpScheduleGraphAsJSON(ModuleOp moduleOp, StringRef path,
     os << "    }" << (i + 1 == scheduledLoops.size() ? "" : ",") << "\n";
   }
   os << "  ]\n";
-  os << "}\n";
+  os << "}";
+}
 
+// Single-graph dump (legacy / TOPN=1): open `path` and write one doc.
+void dumpScheduleGraphAsJSON(ModuleOp moduleOp, StringRef path,
+                             ArrayRef<ScheduledLoop> scheduledLoops) {
+  std::error_code ec;
+  llvm::raw_fd_ostream os(path, ec);
+  if (ec) {
+    llvm::errs() << "[modulo-schedule] Failed to open dump file '" << path
+                 << "': " << ec.message() << "\n";
+    return;
+  }
+  writeScheduleGraphDoc(os, moduleOp, scheduledLoops);
+  os << "\n";
   llvm::errs() << "[modulo-schedule] Dumped schedule graph (v0.1) to " << path
                << " (" << scheduledLoops.size() << " loop(s))\n";
 }
@@ -4132,6 +4362,34 @@ void dumpDDGAsJSON(ModuleOp moduleOp, StringRef path,
                << scheduledLoops.size() << " loop(s))\n";
 }
 
+// Multi-variant dump (TOPN>1): write ALL top-N partition graphs into ONE file
+// as {"variants": [graph0, graph1, ...]}. The array is ordered by predicted
+// performance — variants[0] is the cost-model winner (supposed-fastest first) —
+// and each graph carries its own "variant_id" matching that rank.
+void dumpScheduleGraphsJSON(ModuleOp moduleOp, StringRef path,
+                            ArrayRef<SmallVector<ScheduledLoop, 2>> variants) {
+  std::error_code ec;
+  llvm::raw_fd_ostream os(path, ec);
+  if (ec) {
+    llvm::errs() << "[modulo-schedule] Failed to open dump file '" << path
+                 << "': " << ec.message() << "\n";
+    return;
+  }
+  os << "{\n  \"schema_version\": \"0.1\",\n";
+  os << "  \"num_variants\": " << variants.size() << ",\n";
+  // Ordered best-predicted-first (ascending cost-model cost).
+  os << "  \"sorted_by\": \"predicted_perf_desc\",\n";
+  os << "  \"variants\": [\n";
+  for (size_t k = 0; k < variants.size(); ++k) {
+    writeScheduleGraphDoc(os, moduleOp, variants[k], /*variantId=*/(int)k);
+    os << (k + 1 == variants.size() ? "\n" : ",\n");
+  }
+  os << "  ]\n}\n";
+  llvm::errs() << "[modulo-schedule] Dumped " << variants.size()
+               << " schedule-graph variant(s) to " << path
+               << " (top-N autotuning, best-predicted first)\n";
+}
+
 } // namespace
 
 // ============================================================================
@@ -4287,6 +4545,14 @@ struct ModuloSchedulePass
       // cross-loop coordination possible (e.g., outer-loop super-node
       // matched to inner-loop MMA's warp group).
       // ================================================================
+      // For top-N autotuning: snapshot each loop's pristine pre-partition
+      // graph (no warp-group assignment, no synthesized barriers/channels)
+      // before the winner is committed. Overwritten each iteration so it
+      // reflects the final converged schedule. Cheap value copy; only when
+      // multi-graph dump is requested.
+      if (getDumpTopN() > 1)
+        for (auto &sl : scheduledLoops)
+          sl.prePartitionGraph = sl.graph;
       applyGlobalWarpPartition(scheduledLoops);
 
       // ================================================================
@@ -4345,7 +4611,77 @@ struct ModuloSchedulePass
 
     // Optional: dump the ScheduleGraph as JSON for the TLX emitter.
     if (const char *path = std::getenv("TRITON_MODULO_DUMP_SCHEDULE")) {
-      dumpScheduleGraphAsJSON(moduleOp, path, scheduledLoops);
+      int topN = getDumpTopN();
+      if (topN <= 1) {
+        // Legacy single-graph dump (the cost-model winner committed to IR).
+        dumpScheduleGraphAsJSON(moduleOp, path, scheduledLoops);
+      } else {
+        // Top-N autotuning: emit ALL variants into ONE file, pluralized
+        // (schedule_graph.json -> schedule_graphs.json), ordered best-predicted
+        // first (variant 0 == committed winner). An external harness reads the
+        // `variants` array, emits + runs each, and picks the empirical winner.
+        //
+        // How many variants we can actually produce: the min over schedulable
+        // loops of available candidate partitions. Loops that fell back to
+        // greedy or had < 2 clusters contribute no alternatives.
+        // Variant count = MAX over schedulable loops of available candidate
+        // partitions (capped at topN). A loop with a single fixed partition
+        // (e.g. <2 clusters) is held fixed across variants via index clamping
+        // below, so it no longer caps the dump. If a loop went to greedy and
+        // recorded no partition, we can't safely build alternatives → fall back
+        // to a single (committed-winner) variant.
+        size_t maxAvail = 0;
+        bool sawSchedulable = false, anyEmpty = false;
+        for (auto &sl : scheduledLoops)
+          for (auto &schedLoop : sl.graph.loops)
+            if (schedLoop.II > 0) {
+              sawSchedulable = true;
+              if (schedLoop.topPartitions.empty())
+                anyEmpty = true;
+              maxAvail = std::max(maxAvail, schedLoop.topPartitions.size());
+            }
+        size_t numVariants =
+            (!sawSchedulable || anyEmpty)
+                ? 1
+                : std::min<size_t>(topN, std::max<size_t>(1, maxAvail));
+
+        SmallVector<SmallVector<ScheduledLoop, 2>, 3> variants;
+        for (size_t k = 0; k < numVariants; ++k) {
+          // Variant 0 reuses the committed winner graph as-is; k >= 1 is built
+          // off the pristine pre-partition snapshot, re-finalized with
+          // candidate-k's partition. Only the fields the dumper reads (loop,
+          // isOuter, graph) are populated.
+          SmallVector<ScheduledLoop, 2> variant;
+          for (auto &sl : scheduledLoops) {
+            ScheduledLoop v;
+            v.loop = sl.loop;
+            v.isOuter = sl.isOuter;
+            if (k == 0) {
+              v.graph = sl.graph; // committed winner
+            } else {
+              v.graph = sl.prePartitionGraph; // pristine copy
+              for (size_t li = 0; li < v.graph.loops.size(); ++li) {
+                auto &dstLoop = v.graph.loops[li];
+                auto &liveLoop = sl.graph.loops[li];
+                if (dstLoop.II > 0 && !liveLoop.topPartitions.empty()) {
+                  // Loops with their own candidate-k vary; loops with fewer
+                  // candidates (a single fixed partition) clamp to their last
+                  // one so they stay constant across variants.
+                  size_t idx =
+                      std::min(k, liveLoop.topPartitions.size() - 1);
+                  finalizeLoopPartitionForDump(dstLoop,
+                                               liveLoop.topPartitions[idx]);
+                  if (idx < liveLoop.topPartitionCosts.size())
+                    dstLoop.partitionCost = liveLoop.topPartitionCosts[idx];
+                }
+              }
+            }
+            variant.push_back(std::move(v));
+          }
+          variants.push_back(std::move(variant));
+        }
+        dumpScheduleGraphsJSON(moduleOp, pluralDumpPath(path), variants);
+      }
     }
     // Optional: dump the pre-schedule DDG layer (the solver's input + the
     // MinII analysis it derives) as JSON. This is everything needed to

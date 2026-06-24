@@ -3,6 +3,10 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/Membar.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+// NOTE: ClusterBarrierInsertion.h is intentionally omitted -- beta does not
+// carry the TritonNvidiaGPU ClusterBarrierInsertion transform/header.
 
 using namespace mlir;
 
@@ -16,6 +20,10 @@ struct TestMembarPass
   StringRef getArgument() const final { return "test-print-membar"; }
   StringRef getDescription() const final {
     return "print the result of the allocation pass";
+  }
+
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<triton::nvidia_gpu::TritonNvidiaGPUDialect>();
   }
 
   void runOnOperation() override {

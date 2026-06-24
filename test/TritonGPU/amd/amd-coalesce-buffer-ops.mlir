@@ -158,17 +158,22 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 // The pass explicitly skips BufferLoadToLocalOp regardless of alignment information.
 // ptr div = 16 bytes would allow perThread=4 for f32, but the op is not touched.
 
-// CHECK-LABEL: buffer_load_to_local_excluded
+// Test 9: buffer_load_to_local coalesces its i32 OFFSET tensor (the offset
+// drives the global-load addressing) from sizePerThread=1 to 4, while the
+// shared-memory result memdesc is left untouched -- convertDistributedOpEncoding
+// skips the result because BufferLoadToLocalOp is treated as async.
+// CHECK: #[[$BL2L:.*]] = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+// CHECK-LABEL: buffer_load_to_local_coalesced
 #blocked8 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
 #shared8 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
-  tt.func @buffer_load_to_local_excluded(
+  tt.func @buffer_load_to_local_coalesced(
       %ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32},
       %offsets: tensor<1024xi32, #blocked8> {tt.divisibility = 16 : i32},
       %dst: !ttg.memdesc<1024xf32, #shared8, #smem, mutable>) {
-    // CHECK-NOT: ttg.convert_layout
-    // CHECK: amdg.buffer_load_to_local %{{.*}}[%{{.*}}] into %{{.*}}
+    // CHECK: %[[OFF:.*]] = ttg.convert_layout %{{.*}} : tensor<1024xi32, #blocked{{.*}}> -> tensor<1024xi32, #[[$BL2L]]>
+    // CHECK: amdg.buffer_load_to_local %{{.*}}[%[[OFF]]] into %{{.*}} : <f32>[tensor<1024xi32, #[[$BL2L]]>] -> <1024xf32, #shared{{.*}}, #smem, mutable>
     %token = amdg.buffer_load_to_local %ptr[%offsets] into %dst : !tt.ptr<f32>[tensor<1024xi32, #blocked8>] -> <1024xf32, #shared8, #smem, mutable>
     tt.return
   }
