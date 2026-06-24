@@ -1,23 +1,20 @@
 import argparse
 
 import torch
-
 import triton
-
+from triton._internal_testing import is_blackwell
 from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent_mxfp8 import (
+    _attn_fwd_mxf8_ws,
+    _mxf8_host_descriptor_pre_hook,
     attention as _attention_ws_pipelined_persistent_mxfp8,
     attention_bwd as _attention_bwd_mxfp8,
     generate_attention_inputs,
-    _attn_fwd_mxf8_ws,
-    _mxf8_host_descriptor_pre_hook,
 )
 from triton.language.extra.tlx.tutorials.testing.test_correctness import (
     _quantize_mxfp8_bwd_operand,
     FlashAttention,
 )
 from triton.tools.tensor_descriptor import TensorDescriptor
-
-from triton._internal_testing import is_blackwell
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -29,7 +26,13 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 # Facebook: If you are developing in fbsource, use tritonbench instead to collect perf numbers.
 
 
-def _setup_bwd_inputs(shape, sm_scale, dtype):
+def _attention_matmul_flops(batch, h, n_ctx, head_dim, causal):
+    # Causal self-attention uses lower-triangular score positions, including the diagonal.
+    score_elements = n_ctx * (n_ctx + 1) // 2 if causal else n_ctx * n_ctx
+    return 2.0 * batch * h * score_elements * head_dim
+
+
+def _setup_bwd_inputs(shape, sm_scale, dtype, causal=False):
     Z, H, N_CTX, HEAD_DIM = shape
     (q, q_scale, q_ref), (k, k_scale, k_ref), (v, v_scale, v_ref) = generate_attention_inputs(shape, DEVICE, dtype)
 
@@ -90,7 +93,7 @@ def _setup_bwd_inputs(shape, sm_scale, dtype):
         desc_v_scale,
         N_CTX=N_CTX,
         HEAD_DIM=HEAD_DIM,
-        STAGE=1,
+        STAGE=3 if causal else 1,
         num_stages=1,
         num_warps=4,
         **fwd_config,
@@ -117,7 +120,7 @@ def _setup_bwd_inputs(shape, sm_scale, dtype):
     }
 
 
-def create_benchmark(mode="fwd"):
+def create_benchmark(mode="fwd", causal=False):
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
@@ -127,8 +130,8 @@ def create_benchmark(mode="fwd"):
             line_vals=["ws_pipelined_persistent_mxfp8"],
             line_names=["ws_pipelined_persistent_mxfp8"],
             ylabel="TFLOPS",
-            plot_name=f"flash-attention-{mode}-performance-mxfp8-d128",
-            args={"BATCH": 4, "H": 32, "HEAD_DIM": 128, "causal": False},
+            plot_name=f"flash-attention-{mode}-performance-mxfp8-d128-{'causal' if causal else 'noncausal'}",
+            args={"BATCH": 4, "H": 32, "HEAD_DIM": 128, "causal": causal},
         ))
     def benchmark(BATCH, H, N_CTX, HEAD_DIM, causal, provider):
         shape = (BATCH, H, N_CTX, HEAD_DIM)
@@ -137,7 +140,7 @@ def create_benchmark(mode="fwd"):
         dtype = torch.float8_e4m3fn
 
         if mode == "bwd":
-            bwd = _setup_bwd_inputs(shape, sm_scale, dtype)
+            bwd = _setup_bwd_inputs(shape, sm_scale, dtype, causal=causal)
             fn = lambda: _attention_bwd_mxfp8(
                 bwd["do_fp8"],
                 bwd["do_fp8_dv"],
@@ -157,6 +160,7 @@ def create_benchmark(mode="fwd"):
                 bwd["do_scale_dv"],
                 sm_scale,
                 do_bf16=bwd["do_bf16"],
+                causal=causal,
             )
         else:
             (q, q_scale, _), (k, k_scale, _), (v, v_scale, _) = generate_attention_inputs(shape, DEVICE, dtype)
@@ -169,7 +173,7 @@ def create_benchmark(mode="fwd"):
             rep=500,
         )
 
-        flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
+        flops_per_matmul = _attention_matmul_flops(BATCH, H, N_CTX, HEAD_DIM, causal)
         # fwd: 2 matmuls (QK, PV). bwd: 5 matmuls (QK^T, V·dO^T, P^T·dO, dS^T·Q, dS_trans·K)
         total_flops = 2 * flops_per_matmul if mode == "fwd" else 5 * flops_per_matmul
 
@@ -190,11 +194,17 @@ if __name__ == "__main__":
         choices=["fwd", "bwd"],
         help="Benchmark forward or backward pass (default: fwd)",
     )
+    parser.add_argument(
+        "--causal",
+        action="store_true",
+        help="Benchmark the causal variant (default: non-causal)",
+    )
     args = parser.parse_args()
 
     if is_blackwell():
-        print(f"Running MXFP8 flash attention {args.mode} benchmark")
-        benchmark = create_benchmark(mode=args.mode)
+        kind = "causal" if args.causal else "non-causal"
+        print(f"Running MXFP8 flash attention {args.mode} {kind} benchmark")
+        benchmark = create_benchmark(mode=args.mode, causal=args.causal)
         benchmark.run(print_data=True)
     else:
         print("Skipping benchmarks, no Blackwell GPU found.")
