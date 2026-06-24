@@ -214,7 +214,15 @@ class RenderCtx:
     # for descriptor_load / MMA / epilogue check this and fan out N parallel
     # ops with per-group M-offsets. The legacy `buffer_var[key]` still maps
     # to the FIRST group's name so single-group code paths keep working.
-    partition_buffer_names: dict[tuple[int, int], list[str]] = field(default_factory=dict)
+    partition_buffer_names: dict[tuple[int, int], list[str]] = field(
+        default_factory=dict
+    )
+    # True iff the kernel has an MMA → default-partition `acc_tmem` hand-off.
+    # When False (e.g. case6 LayerNorm — no MMA), the emitter must NOT allocate
+    # `acc_tmem` barriers nor emit the default task's `barrier_wait(acc_tmem_full)`:
+    # with no MMA there is no `tcgen05_commit` to arrive it, so the wait would
+    # deadlock. Set in `emit()`.
+    has_acc_tmem_handoff: bool = True
     # Mirror of partition_buffer_names keyed by def_op id (the SSA alloc).
     # Used when an emitter resolves a buffer via alloc_op_var instead of
     # (loop_id, buf_id).
@@ -300,8 +308,11 @@ def _render_const(ref: ConstRef) -> str:
     if v is None:
         return "0"
     # Non-finite floats are dumped as JSON strings ("inf"/"-inf"/"nan").
-    scalar = (f"float('{v}')" if isinstance(v, str) and v in ("inf", "-inf", "nan") else
-              ("True" if v != 0 else "False") if ref.type == "i1" else repr(v))
+    scalar = (
+        f"float('{v}')"
+        if isinstance(v, str) and v in ("inf", "-inf", "nan")
+        else ("True" if v != 0 else "False") if ref.type == "i1" else repr(v)
+    )
     # Tensor splat (e.g., dense<-inf> in tensor<128xf32>) — wrap with
     # tl.full so the loop-carried iter_arg keeps its tensor type. Without
     # this, init `m_i = float('-inf')` is a Python scalar that mismatches
@@ -310,7 +321,11 @@ def _render_const(ref: ConstRef) -> str:
         sd = _parse_tensor_shape(ref.type)
         if sd:
             shape, dtype = sd
-            shape_str = (str(shape[0]) + "," if len(shape) == 1 else ", ".join(str(d) for d in shape))
+            shape_str = (
+                str(shape[0]) + ","
+                if len(shape) == 1
+                else ", ".join(str(d) for d in shape)
+            )
             tl_dtype = _dtype_str_to_tl(dtype)
             return f"tl.full(({shape_str}), {scalar}, {tl_dtype})"
     return scalar
@@ -430,16 +445,21 @@ def _render_make_tensor_descriptor(op: Op, rctx: RenderCtx) -> str:
 
     ops = op.operands
     ptr = _render_operand(ops[0], rctx)
-    shape = [_render_operand(o, rctx) for o in ops[n_ptr:n_ptr + n_shape]]
-    strides = [_render_operand(o, rctx) for o in ops[n_ptr + n_shape:n_ptr + n_shape + n_stride]]
+    shape = [_render_operand(o, rctx) for o in ops[n_ptr : n_ptr + n_shape]]
+    strides = [
+        _render_operand(o, rctx)
+        for o in ops[n_ptr + n_shape : n_ptr + n_shape + n_stride]
+    ]
     rt = op.result_types[0] if op.result_types else ""
     block_info = _parse_desc_block_shape(rt)
     if block_info is None:
         return f"tl.make_tensor_descriptor({ptr}, [{', '.join(shape)}], [{', '.join(strides)}], [...])"
     block_dims, _ = block_info
     block_str = ", ".join(str(d) for d in block_dims)
-    return (f"tl.make_tensor_descriptor({ptr}, [{', '.join(shape)}], "
-            f"[{', '.join(strides)}], [{block_str}])")
+    return (
+        f"tl.make_tensor_descriptor({ptr}, [{', '.join(shape)}], "
+        f"[{', '.join(strides)}], [{block_str}])"
+    )
 
 
 def _render_descriptor_load(op: Op, rctx: RenderCtx) -> str:
@@ -786,7 +806,10 @@ _IN_LOOP_NAMED_OPS = _NAMED_FUNCTION_OPS | {
 
 # Ops we skip emission for entirely at function scope (handled elsewhere or no-op).
 _SKIP_FUNCTION_SCOPE = {
-    "scf.for", "scf.yield", "tt.return", "ttg.local_alloc",  # hoisted to top-of-kernel allocs
+    "scf.for",
+    "scf.yield",
+    "tt.return",
+    "ttg.local_alloc",  # hoisted to top-of-kernel allocs
     "ttng.tmem_alloc",  # hoisted to top-of-kernel allocs
     "ttng.tmem_store",  # init-zero handled by use_acc=False on first MMA
     "arith.constant",  # inlined
@@ -890,7 +913,9 @@ def _semir_producer_arrives(loop_id: int, node_id: int, rctx: RenderCtx) -> list
     return rctx.sem_set.producer_arrives(loop_id, node_id)
 
 
-def _semir_producer_expect_bytes(loop_id: int, node_id: int, rctx: RenderCtx) -> list[str]:
+def _semir_producer_expect_bytes(
+    loop_id: int, node_id: int, rctx: RenderCtx
+) -> list[str]:
     """`tlx.barrier_expect_bytes(...)` lines for a TMA producer, before the load."""
     if not _use_semaphore_ir() or rctx.sem_set is None:
         return []
@@ -904,7 +929,9 @@ def _semir_producer_mbarriers(loop_id: int, node_id: int, rctx: RenderCtx) -> li
     return rctx.sem_set.mbarriers_for(loop_id, node_id)
 
 
-def _semir_producer_barrier_for_tma(loop_id: int, node_id: int, rctx: RenderCtx) -> str | None:
+def _semir_producer_barrier_for_tma(
+    loop_id: int, node_id: int, rctx: RenderCtx
+) -> str | None:
     """Single barrier slot expression a TMA load passes as its mbarrier arg.
     The TMA producer should have exactly one outgoing semaphore."""
     slots = _semir_producer_mbarriers(loop_id, node_id, rctx)
@@ -931,7 +958,9 @@ def _semir_pre_arrives_for_wg(loop_id: int, wg: int, rctx: RenderCtx) -> list[st
     return rctx.sem_set.pre_arrives_for_wg(loop_id, wg)
 
 
-def _semir_emit_consumer_block(n: Node, g: ScheduleGraph, loop: Loop, rctx: RenderCtx, lines: "_Lines") -> None:
+def _semir_emit_consumer_block(
+    n: Node, g: ScheduleGraph, loop: Loop, rctx: RenderCtx, lines: "_Lines"
+) -> None:
     """Emit consumer-side waits + local_loads + recycle arrives for every
     semaphore where this node is a SW consumer. UNKNOWN-access (MMA-like)
     consumers are skipped — the MMA emit branch handles them via mBarriers.
@@ -986,8 +1015,9 @@ def _semir_emit_consumer_block(n: Node, g: ScheduleGraph, loop: Loop, rctx: Rend
                 rctx.op_var[prod_node.op_ref] = chan_var
 
 
-def _semir_mma_operand_waits_and_mbarriers(op: Op, g: ScheduleGraph, loop: Loop,
-                                           rctx: RenderCtx) -> tuple[list[str], list[str]]:
+def _semir_mma_operand_waits_and_mbarriers(
+    op: Op, g: ScheduleGraph, loop: Loop, rctx: RenderCtx
+) -> tuple[list[str], list[str]]:
     """For an MMA op, look up SemIR semaphores guarding its operand buffers.
     The schedule's cross_wg_barriers list names the local_alloc node as
     consumer (not the MMA), so we look up consumer-waits on that alloc node.
@@ -1032,7 +1062,9 @@ def _semir_mma_operand_waits_and_mbarriers(op: Op, g: ScheduleGraph, loop: Loop,
         # fallback — the bridge's own emit path (downstream in async_dot)
         # adds the wait + empty mBarrier. Without this skip we'd emit
         # duplicate barrier_waits and double-recycle the empty barrier.
-        if any(c.kind == "tmem" and c.alloc_op_id == alloc_op_id for c in rctx.channels):
+        if any(
+            c.kind == "tmem" and c.alloc_op_id == alloc_op_id for c in rctx.channels
+        ):
             continue
         # Intra-WG fallback: no SemIR cross-WG semaphore for this operand
         # (producer + consumer share a WG). Use the legacy `<buf>_full`/
@@ -1114,10 +1146,16 @@ def _semir_emit_producer_block(
         if c.kind != "tmem" or not c.bridge_op_id:
             continue
         bridge_op = g.ops.get(c.bridge_op_id)
-        if (bridge_op and bridge_op.operands and isinstance(bridge_op.operands[0], OpRef)
-                and bridge_op.operands[0].op_id == op.op_id):
-            lines += (f"tlx.barrier_wait({_bar_empty(c.name)}[0], "
-                      f"(_it & 1) ^ 1)  # TMEM bridge")
+        if (
+            bridge_op
+            and bridge_op.operands
+            and isinstance(bridge_op.operands[0], OpRef)
+            and bridge_op.operands[0].op_id == op.op_id
+        ):
+            lines += (
+                f"tlx.barrier_wait({_bar_empty(c.name)}[0], "
+                f"(_it & 1) ^ 1)  # TMEM bridge"
+            )
             lines += f"tlx.local_store({c.name}[0], {value_var})"
             lines += f"tlx.barrier_arrive({_bar_full(c.name)}[0], 1)"
 
@@ -1155,7 +1193,9 @@ def _kernel_sig_lines(g: ScheduleGraph, lines: _Lines) -> None:
 # ===========================================================================
 
 
-def _emit_preamble(g: ScheduleGraph, loop: Loop, rctx: RenderCtx, lines: _Lines) -> None:
+def _emit_preamble(
+    g: ScheduleGraph, loop: Loop, rctx: RenderCtx, lines: _Lines
+) -> None:
     lines += "# ── Preamble (function-scope ops before the loop) ──"
     pre_ops = _ops_before_loop(g, loop)
     for op in pre_ops:
@@ -1255,7 +1295,11 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
         if b.kind == "smem":
             # 1D shapes need trailing comma in Python tuple syntax
             # (`(256,)` not `(256)`); 2D+ are fine as-is.
-            shape = (str(b.shape[0]) + "," if len(b.shape) == 1 else ", ".join(str(d) for d in b.shape))
+            shape = (
+                str(b.shape[0]) + ","
+                if len(b.shape) == 1
+                else ", ".join(str(d) for d in b.shape)
+            )
             # Prefer the def_op's actual MLIR dtype string (preserves bf16
             # vs f16, which `element_bits` collapses).
             dtype = _bits_to_tl_dtype(b.element_bits, is_float=True)
@@ -1282,9 +1326,12 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
                             if sd:
                                 dtype = _dtype_str_to_tl(sd[1])
                                 break
-            origin = ("channel for cross-WG hand-off"
-                      if b.def_op is None else f"modulo lifetime [{b.live_start}..{b.live_end}], "
-                      f"II={loop.schedule.II}")
+            origin = (
+                "channel for cross-WG hand-off"
+                if b.def_op is None
+                else f"modulo lifetime [{b.live_start}..{b.live_end}], "
+                f"II={loop.schedule.II}"
+            )
             mgid = b.merge_group_id
             reuse = ""
             if mgid is not None and mgid in merge_group_owner:
@@ -1296,14 +1343,19 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
                 # Per-group shape replaces the partition_dim (M=0) with mSize.
                 pshape_dims = list(b.shape)
                 pshape_dims[b.partition_dim] = b.m_size
-                pshape_str = (str(pshape_dims[0]) + "," if len(pshape_dims) == 1 else ", ".join(
-                    str(d) for d in pshape_dims))
+                pshape_str = (
+                    str(pshape_dims[0]) + ","
+                    if len(pshape_dims) == 1
+                    else ", ".join(str(d) for d in pshape_dims)
+                )
                 names = []
                 for gi in range(b.partition_count):
                     gvar = f"{var}_g{gi}"
                     names.append(gvar)
-                    lines += (f"{gvar} = tlx.local_alloc(({pshape_str}), {dtype}, "
-                              f"{b.count}{reuse})")
+                    lines += (
+                        f"{gvar} = tlx.local_alloc(({pshape_str}), {dtype}, "
+                        f"{b.count}{reuse})"
+                    )
                 rctx.partition_buffer_names[(loop.loop_id, b.id)] = names
                 if b.def_op:
                     rctx.partition_alloc_names[b.def_op] = names
@@ -1311,11 +1363,17 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
                 # that references `buffer_var[key]` resolves to a real alloc.
                 lines += f"{var} = {names[0]}"
             else:
-                lines += (f"{var} = tlx.local_alloc(({shape}), {dtype}, {b.count}{reuse})")
+                lines += (
+                    f"{var} = tlx.local_alloc(({shape}), {dtype}, {b.count}{reuse})"
+                )
             if mgid is not None and mgid not in merge_group_owner:
                 merge_group_owner[mgid] = var
         elif b.kind == "tmem":
-            shape = (str(b.shape[0]) + "," if len(b.shape) == 1 else ", ".join(str(d) for d in b.shape))
+            shape = (
+                str(b.shape[0]) + ","
+                if len(b.shape) == 1
+                else ", ".join(str(d) for d in b.shape)
+            )
             # TMEM dtype: prefer the def_op's MLIR type (P_tmem is bf16,
             # accumulator is fp32) — element_bits alone collapses bf16/f16.
             dtype = "tl.float32"
@@ -1331,10 +1389,14 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
             if mgid is not None and mgid in merge_group_owner:
                 reuse = f", reuse={merge_group_owner[mgid]}"
                 origin_suffix = f"; reuses {merge_group_owner[mgid]} (group {mgid})"
-            lines += (f"# {loop_tag}-loop buf {b.id}: TMEM count={b.count} "
-                      f"(producer→consumer pipelining across iters{origin_suffix})")
-            lines += (f"{var} = tlx.local_alloc(({shape}), {dtype}, "
-                      f"{b.count}, tlx.storage_kind.tmem{reuse})")
+            lines += (
+                f"# {loop_tag}-loop buf {b.id}: TMEM count={b.count} "
+                f"(producer→consumer pipelining across iters{origin_suffix})"
+            )
+            lines += (
+                f"{var} = tlx.local_alloc(({shape}), {dtype}, "
+                f"{b.count}, tlx.storage_kind.tmem{reuse})"
+            )
             if mgid is not None and mgid not in merge_group_owner:
                 merge_group_owner[mgid] = var
         elif b.kind == "barrier":
@@ -1366,34 +1428,48 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
         if op.kind == "ttg.local_alloc":
             if op.op_id in rctx.alloc_op_var:
                 continue
-            shape_dt = (_parse_tensor_shape(op.result_types[0]) if op.result_types else None)
+            shape_dt = (
+                _parse_tensor_shape(op.result_types[0]) if op.result_types else None
+            )
             if not shape_dt:
                 continue
             shape, dtype_str = shape_dt
-            shape_str = ", ".join(str(d) for d in shape) + ("," if len(shape) == 1 else "")
+            shape_str = ", ".join(str(d) for d in shape) + (
+                "," if len(shape) == 1 else ""
+            )
             dtype = _dtype_str_to_tl(dtype_str)
             name = f"q_smem_{len(rctx.alloc_op_var)}"
             rctx.alloc_op_var[op.op_id] = name
-            lines += (f"# {name}: function-scope SMEM alloc (e.g., per-tile "
-                      f"resident Q tile in non-persistent FA)")
+            lines += (
+                f"# {name}: function-scope SMEM alloc (e.g., per-tile "
+                f"resident Q tile in non-persistent FA)"
+            )
             lines += f"{name} = tlx.local_alloc(({shape_str}), {dtype}, 1)"
             # If this alloc is fed by a function-scope tt.descriptor_load,
             # track it: we need to emit the TMA load (in MEM-role WG) +
             # consumer-side wait (in MMA-role WG) outside the K-loop.
             if op.operands and isinstance(op.operands[0], OpRef):
                 load_op = g.ops.get(op.operands[0].op_id)
-                if (load_op and load_op.kind == "tt.descriptor_load" and load_op.scope == "function"):
-                    rctx.fn_scope_loads.append({
-                        "alloc_var": name,
-                        "alloc_op_id": op.op_id,
-                        "load_op_id": load_op.op_id,
-                        "load_op": load_op,
-                    })
+                if (
+                    load_op
+                    and load_op.kind == "tt.descriptor_load"
+                    and load_op.scope == "function"
+                ):
+                    rctx.fn_scope_loads.append(
+                        {
+                            "alloc_var": name,
+                            "alloc_op_id": op.op_id,
+                            "load_op_id": load_op.op_id,
+                            "load_op": load_op,
+                        }
+                    )
             continue
         if op.kind == "ttng.tmem_alloc":
             if op.op_id in rctx.alloc_op_var:
                 continue  # already emitted from loop.buffers list
-            shape_dt = (_parse_tensor_shape(op.result_types[0]) if op.result_types else None)
+            shape_dt = (
+                _parse_tensor_shape(op.result_types[0]) if op.result_types else None
+            )
             shape = shape_dt[0] if shape_dt else [128, 128]
             dtype = _dtype_str_to_tl(shape_dt[1]) if shape_dt else "tl.float32"
             shape_str = ", ".join(str(d) for d in shape)
@@ -1408,12 +1484,18 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
             # via op_var, the bare name without `[0]` wins and we get
             # `local_load(acc_tmem)` instead of `local_load(acc_tmem[0])`.
             rctx.alloc_op_var[op.op_id] = name
-            lines += (f"{name} = tlx.local_alloc(({shape_str}), {dtype}, 1, "
-                      f"tlx.storage_kind.tmem)")
+            lines += (
+                f"{name} = tlx.local_alloc(({shape_str}), {dtype}, 1, "
+                f"tlx.storage_kind.tmem)"
+            )
     # Epilogue staging SMEM (for the descriptor_store) — derived from the
     # store op's source tensor shape.
     epi_store = next(
-        (op for op in g.ops.values() if op.scope == "function" and op.kind == "tt.descriptor_store"),
+        (
+            op
+            for op in g.ops.values()
+            if op.scope == "function" and op.kind == "tt.descriptor_store"
+        ),
         None,
     )
     if epi_store and len(epi_store.operands) >= 2:
@@ -1425,11 +1507,15 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
         if isinstance(epi_store.operands[0], OpRef):
             desc_op = g.ops.get(epi_store.operands[0].op_id)
             if desc_op:
-                bs = _parse_desc_block_shape(desc_op.result_types[0] if desc_op.result_types else "")
+                bs = _parse_desc_block_shape(
+                    desc_op.result_types[0] if desc_op.result_types else ""
+                )
                 if bs:
                     shape, dtype = bs[0], _dtype_str_to_tl(bs[1])
         elif isinstance(epi_store.operands[0], ArgRef):
-            arg = next((a for a in g.kernel.args if a.name == epi_store.operands[0].name), None)
+            arg = next(
+                (a for a in g.kernel.args if a.name == epi_store.operands[0].name), None
+            )
             if arg:
                 bs = _parse_desc_block_shape(arg.type)
                 if bs:
@@ -1482,9 +1568,16 @@ class Channel:
     consumer_node: int | None = None
     buffer_id: int | None = None
     loop_id: int | None = None  # which loop owns the buffer
+    # Number of distinct consumer WGs reading this buffer. >1 when one buffer
+    # feeds multiple consumers (e.g. case7 dout → MMA + bias-reduce); the empty
+    # barrier's arrive_count must equal this so the producer waits for ALL
+    # consumers to release the slot before recycling it.
+    num_consumers: int = 1
 
 
-def _derive_crossloop_result_channels(g: ScheduleGraph, rctx: RenderCtx) -> list[dict[str, Any]]:
+def _derive_crossloop_result_channels(
+    g: ScheduleGraph, rctx: RenderCtx
+) -> list[dict[str, Any]]:
     """Detect references to scf.for results (= final iter_arg values) from
     function-scope ops (the default partition's epilogue). The value lives
     in the WG that wrote the last iter_arg yield — if that WG isn't the
@@ -1503,7 +1596,9 @@ def _derive_crossloop_result_channels(g: ScheduleGraph, rctx: RenderCtx) -> list
         if not specs:
             continue
         # Build wg_of for this loop's nodes.
-        wg_of_op: dict[str, int] = {n.op_ref: n.warp_group for n in loop.schedule.nodes if n.op_ref}
+        wg_of_op: dict[str, int] = {
+            n.op_ref: n.warp_group for n in loop.schedule.nodes if n.op_ref
+        }
         for idx, init, yld in specs:
             # Find the producer WG of the yield value.
             if not isinstance(yld, OpRef):
@@ -1519,8 +1614,12 @@ def _derive_crossloop_result_channels(g: ScheduleGraph, rctx: RenderCtx) -> list
                 if op.scope != "function":
                     continue
                 for o in op.operands:
-                    if (isinstance(o, OpRef) and o.result_idx == idx and (find := g.ops.get(o.op_id))
-                            and find.kind == "scf.for"):
+                    if (
+                        isinstance(o, OpRef)
+                        and o.result_idx == idx
+                        and (find := g.ops.get(o.op_id))
+                        and find.kind == "scf.for"
+                    ):
                         referenced_by_epi = True
                         break
                 if referenced_by_epi:
@@ -1536,19 +1635,23 @@ def _derive_crossloop_result_channels(g: ScheduleGraph, rctx: RenderCtx) -> list
                     shape, dt = sd
                     dtype = _dtype_str_to_tl(dt)
             var_name = _iter_arg_python_name(loop.loop_id, idx, init)
-            out.append({
-                "bufname": f"epi_{var_name}_smem",
-                "shape": shape,
-                "dtype": dtype,
-                "loop_id": loop.loop_id,
-                "idx": idx,
-                "producer_wg": prod_wg,
-                "var_name": var_name,
-            })
+            out.append(
+                {
+                    "bufname": f"epi_{var_name}_smem",
+                    "shape": shape,
+                    "dtype": dtype,
+                    "loop_id": loop.loop_id,
+                    "idx": idx,
+                    "producer_wg": prod_wg,
+                    "var_name": var_name,
+                }
+            )
     return out
 
 
-def _alias_predecessors(channel_name: str, rctx: RenderCtx, graph: ScheduleGraph) -> list[str]:
+def _alias_predecessors(
+    channel_name: str, rctx: RenderCtx, graph: ScheduleGraph
+) -> list[str]:
     """For a channel buffer that reuses another buffer's bytes, return the
     list of buffer NAMES whose `_empty` must be signaled before this
     channel's producer overwrites the storage.
@@ -1671,20 +1774,35 @@ def _derive_tmem_channels(g: ScheduleGraph, inner: Loop) -> list[Channel]:
                     continue
                 # tc_gen5_mma writes operand[2] (acc).
                 if op.kind == "ttng.tc_gen5_mma" and len(op.operands) >= 3:
-                    if (isinstance(op.operands[2], OpRef) and op.operands[2].op_id == b_def_op):
+                    if (
+                        isinstance(op.operands[2], OpRef)
+                        and op.operands[2].op_id == b_def_op
+                    ):
                         producer_wgs.add(wg)
-                    if (isinstance(op.operands[0], OpRef) and op.operands[0].op_id == b_def_op):
+                    if (
+                        isinstance(op.operands[0], OpRef)
+                        and op.operands[0].op_id == b_def_op
+                    ):
                         consumer_wgs.add(wg)
-                    if (isinstance(op.operands[1], OpRef) and op.operands[1].op_id == b_def_op):
+                    if (
+                        isinstance(op.operands[1], OpRef)
+                        and op.operands[1].op_id == b_def_op
+                    ):
                         consumer_wgs.add(wg)
                 # tmem_load reads operand[0].
                 if op.kind == "ttng.tmem_load" and op.operands:
-                    if (isinstance(op.operands[0], OpRef) and op.operands[0].op_id == b_def_op):
+                    if (
+                        isinstance(op.operands[0], OpRef)
+                        and op.operands[0].op_id == b_def_op
+                    ):
                         consumer_wgs.add(wg)
                 # tmem_store: MLIR layout is [dest, token, value, pred] —
                 # operand[0] is the destination buffer.
                 if op.kind == "ttng.tmem_store" and len(op.operands) >= 1:
-                    if (isinstance(op.operands[0], OpRef) and op.operands[0].op_id == b_def_op):
+                    if (
+                        isinstance(op.operands[0], OpRef)
+                        and op.operands[0].op_id == b_def_op
+                    ):
                         producer_wgs.add(wg)
                 # tmem_alloc(value) is itself the alloc — when it carries a
                 # value operand, it both *is* the buffer AND stores to it.
@@ -1694,7 +1812,9 @@ def _derive_tmem_channels(g: ScheduleGraph, inner: Loop) -> list[Channel]:
                 if op.kind == "ttng.tmem_alloc" and oid == b_def_op and op.operands:
                     bridge_op_id = oid
                     val_ref = op.operands[0]
-                    val_wg = (wg_of.get(val_ref.op_id) if isinstance(val_ref, OpRef) else None)
+                    val_wg = (
+                        wg_of.get(val_ref.op_id) if isinstance(val_ref, OpRef) else None
+                    )
                     # Actual producer is the value's WG; the "consumer" is
                     # the WG that owns the alloc op (which will read it).
                     if val_wg is not None:
@@ -1718,7 +1838,8 @@ def _derive_tmem_channels(g: ScheduleGraph, inner: Loop) -> list[Channel]:
                     kind="tmem",
                     alloc_op_id=b_def_op,
                     bridge_op_id=bridge_op_id,
-                ))
+                )
+            )
     return out
 
 
@@ -1729,6 +1850,14 @@ def _derive_channels(loop: Loop, rctx: RenderCtx) -> list[Channel]:
     each entry already records which buffer (if any) is the data payload
     via `paired_buffer_id`. Entries without a paired buffer are pure
     handshake signals (named barriers) and don't need a Channel."""
+    # Distinct consumer WGs per buffer — a buffer shared by >1 consumer WG
+    # (e.g. case7 dout feeding both the MMA and the bias-reduce) needs its empty
+    # barrier's arrive_count = #consumers (else the producer recycles the slot
+    # after only one consumer releases it → mid-read overwrite).
+    consumers_by_buf: dict[int, set[int]] = {}
+    for cb in loop.schedule.cross_wg_barriers:
+        if cb.paired_buffer_id is not None:
+            consumers_by_buf.setdefault(cb.paired_buffer_id, set()).add(cb.consumer_wg)
     seen: set[int] = set()
     out: list[Channel] = []
     for cb in loop.schedule.cross_wg_barriers:
@@ -1741,11 +1870,16 @@ def _derive_channels(loop: Loop, rctx: RenderCtx) -> list[Channel]:
         seen.add(buf_id)
         out.append(
             Channel(
-                name=rctx.buffer_var.get((loop.loop_id, buf.id), f"L{loop.loop_id}_{_buffer_var_name(buf)}"),
+                name=rctx.buffer_var.get(
+                    (loop.loop_id, buf.id), f"L{loop.loop_id}_{_buffer_var_name(buf)}"
+                ),
                 depth=buf.count,
                 producer_wg=cb.producer_wg,
                 consumer_wg=cb.consumer_wg,
-            ))
+                buffer_id=buf_id,
+                num_consumers=len(consumers_by_buf.get(buf_id, {cb.consumer_wg})),
+            )
+        )
     return out
 
 
@@ -1774,24 +1908,36 @@ def _emit_mbarriers(
         if ch.name in seen:
             continue
         seen.add(ch.name)
-        lines += (f"# {ch.name}: wg{ch.producer_wg} → wg{ch.consumer_wg}, "
-                  f"depth={ch.depth} (matches buffer ring count)")
-        lines += (f"{_bar_full(ch.name)} = tlx.alloc_barriers"
-                  f"(num_barriers={ch.depth}, arrive_count=1)")
-        lines += (f"{_bar_empty(ch.name)} = tlx.alloc_barriers"
-                  f"(num_barriers={ch.depth}, arrive_count=1)")
+        lines += (
+            f"# {ch.name}: wg{ch.producer_wg} → wg{ch.consumer_wg}, "
+            f"depth={ch.depth} (matches buffer ring count)"
+        )
+        lines += (
+            f"{_bar_full(ch.name)} = tlx.alloc_barriers"
+            f"(num_barriers={ch.depth}, arrive_count=1)"
+        )
+        lines += (
+            f"{_bar_empty(ch.name)} = tlx.alloc_barriers"
+            f"(num_barriers={ch.depth}, arrive_count={ch.num_consumers})"
+        )
     # The outer-loop TMEM buffer is a cross-WG channel: TC partition writes
     # it (via MMA), default partition reads it (via tmem_load). Producer and
     # consumer are in different warp groups → needs full/empty mbarrier
     # pairs, exactly like the SMEM channels above. Depth and bank count
     # come from outer-loop schedule_loop.buffers[tmem].count.
     if have_separate_tmem_handoff and "acc_tmem" not in seen:
-        lines += (f"# acc_tmem: cross-WG channel TC → default "
-                  f"(outer-loop TMEM buf, depth={tmem_count})")
-        lines += (f"acc_tmem_full = tlx.alloc_barriers"
-                  f"(num_barriers={tmem_count}, arrive_count=1)")
-        lines += (f"acc_tmem_empty = tlx.alloc_barriers"
-                  f"(num_barriers={tmem_count}, arrive_count=1)")
+        lines += (
+            f"# acc_tmem: cross-WG channel TC → default "
+            f"(outer-loop TMEM buf, depth={tmem_count})"
+        )
+        lines += (
+            f"acc_tmem_full = tlx.alloc_barriers"
+            f"(num_barriers={tmem_count}, arrive_count=1)"
+        )
+        lines += (
+            f"acc_tmem_empty = tlx.alloc_barriers"
+            f"(num_barriers={tmem_count}, arrive_count=1)"
+        )
         seen.add("acc_tmem")
     # Extra buffers: load → MMA pipelines that aren't cross-WG channels but
     # still need barriers (TMA loads are async).
@@ -1800,10 +1946,14 @@ def _emit_mbarriers(
             continue
         seen.add(name)
         lines += f"# {name}: TMA-load → consumer barrier (intra-WG async)"
-        lines += (f"{_bar_full(name)} = tlx.alloc_barriers"
-                  f"(num_barriers={depth}, arrive_count=1)")
-        lines += (f"{_bar_empty(name)} = tlx.alloc_barriers"
-                  f"(num_barriers={depth}, arrive_count=1)")
+        lines += (
+            f"{_bar_full(name)} = tlx.alloc_barriers"
+            f"(num_barriers={depth}, arrive_count=1)"
+        )
+        lines += (
+            f"{_bar_empty(name)} = tlx.alloc_barriers"
+            f"(num_barriers={depth}, arrive_count=1)"
+        )
     lines += ""
 
 
@@ -1844,13 +1994,19 @@ def _loop_range_expr(loop: Loop, rctx: RenderCtx) -> str:
     return f"range({lo}, {hi}, {step})"
 
 
-def _emit_default_partition(g: ScheduleGraph, loop: Loop, rctx: RenderCtx, lines: _Lines) -> None:
+def _emit_default_partition(
+    g: ScheduleGraph, loop: Loop, rctx: RenderCtx, lines: _Lines
+) -> None:
     # The caller (`_emit_uwg_body_impl`) has already opened the
     # `with tlx.async_task("default"):` block — emit body directly here.
     epi_ops = _ops_after_loop(g, loop)
     if True:
-        # acc_tmem is a legacy carve-out under SemIR — full+empty pair.
-        lines += "tlx.barrier_wait(acc_tmem_full[0], 0)"
+        _n0 = len(lines.buf)  # detect an empty default-task body below
+        # acc_tmem is a legacy carve-out under SemIR — full+empty pair. Only
+        # wait when an MMA actually produces it (else nothing arrives → hang;
+        # e.g. case6 LayerNorm has no MMA).
+        if rctx.has_acc_tmem_handoff:
+            lines += "tlx.barrier_wait(acc_tmem_full[0], 0)"
         # Cross-loop iter_arg result channels: pull each cross-WG iter_arg
         # final value from its SMEM channel and bind to the iter_arg var.
         for ch in rctx.crossloop_channels:
@@ -1896,6 +2052,11 @@ def _emit_default_partition(g: ScheduleGraph, loop: Loop, rctx: RenderCtx, lines
                 name = _auto_name(op, rctx.fresh_idx())
                 rctx.op_var[op.op_id] = name
                 lines += f"{name} = {_render_op_expr(op, rctx)}"
+        if len(lines.buf) == _n0:
+            # No work landed in the default task (e.g. case6 with no acc_tmem
+            # hand-off and the store living in a compute WG). Keep the
+            # `with tlx.async_task("default"):` block valid Python.
+            lines += "pass"
 
 
 def _op_depends_on_iv(op_id: str, g: ScheduleGraph, lid: int, cache: dict) -> bool:
@@ -1938,7 +2099,9 @@ def _iv_dep_op_subtree(load_op: Op, g: ScheduleGraph, lid: int) -> set[str]:
     return out
 
 
-def _render_load_offsets_at(load_op: Op, g: ScheduleGraph, rctx: RenderCtx, lid: int, iv_expr: str) -> list[str]:
+def _render_load_offsets_at(
+    load_op: Op, g: ScheduleGraph, rctx: RenderCtx, lid: int, iv_expr: str
+) -> list[str]:
     """Render the load's offset operands as-if the induction var = `iv_expr`
     (e.g. `(tile_id + nprog)` for the next-tile prefetch). Bypasses the var
     cache for IV-dependent offset ops so they inline-render with the shift."""
@@ -1966,8 +2129,13 @@ def _register_consumed_loads(loop: Loop, g: ScheduleGraph):
     for n in loop.schedule.nodes:
         if n.op_kind != "tt.descriptor_load" or not n.op_ref:
             continue
-        consumed_by_alloc = any(op.kind == "ttg.local_alloc" and op.operands and isinstance(op.operands[0], OpRef)
-                                and op.operands[0].op_id == n.op_ref for op in g.ops.values())
+        consumed_by_alloc = any(
+            op.kind == "ttg.local_alloc"
+            and op.operands
+            and isinstance(op.operands[0], OpRef)
+            and op.operands[0].op_id == n.op_ref
+            for op in g.ops.values()
+        )
         if not consumed_by_alloc:
             out.append(n)
     return out
@@ -1986,7 +2154,11 @@ def _emit_warp_group(
         return
 
     # Filter to ops that emit something. Allocs are SSA-only.
-    emit_nodes = [n for n in nodes if n.op_kind not in ("ttg.local_alloc", "ttng.tmem_alloc", "scf.yield")]
+    emit_nodes = [
+        n
+        for n in nodes
+        if n.op_kind not in ("ttg.local_alloc", "ttng.tmem_alloc", "scf.yield")
+    ]
     if not emit_nodes:
         return
 
@@ -2004,9 +2176,14 @@ def _emit_warp_group(
     for ch in channels:
         if ch.producer_wg == wg.id or ch.consumer_wg == wg.id:
             for b in loop.schedule.buffers:
-                if b.id in (None, ):
+                if b.id in (None,):
                     continue
-                if (rctx.buffer_var.get((loop.loop_id, b.id), f"L{loop.loop_id}_{_buffer_var_name(b)}") == ch.name):
+                if (
+                    rctx.buffer_var.get(
+                        (loop.loop_id, b.id), f"L{loop.loop_id}_{_buffer_var_name(b)}"
+                    )
+                    == ch.name
+                ):
                     touched_buf_ids.add(b.id)
     # For a MEM-only WG (descriptor_load split out from the alloc/MMA WG),
     # follow each load → downstream local_alloc to find the actual data
@@ -2026,7 +2203,9 @@ def _emit_warp_group(
                 if b.def_op == oid:
                     touched_buf_ids.add(b.id)
     depths = [
-        b.count for b in loop.schedule.buffers if b.id in touched_buf_ids and b.kind in ("smem", "tmem") and b.count > 1
+        b.count
+        for b in loop.schedule.buffers
+        if b.id in touched_buf_ids and b.kind in ("smem", "tmem") and b.count > 1
     ]
     rep_depth = max(depths) if depths else 1
     iv = loop.schedule.induction_var_name
@@ -2076,7 +2255,9 @@ def _emit_warp_group(
         if mma_op is None:
             continue
         for src_idx in (0, 1):
-            if len(mma_op.operands) > src_idx and isinstance(mma_op.operands[src_idx], OpRef):
+            if len(mma_op.operands) > src_idx and isinstance(
+                mma_op.operands[src_idx], OpRef
+            ):
                 mma_alloc_op_ids.add(mma_op.operands[src_idx].op_id)
     for fl in rctx.fn_scope_loads:
         load_op = fl["load_op"]
@@ -2087,7 +2268,11 @@ def _emit_warp_group(
             desc = _render_operand(load_op.operands[0], rctx)
             offsets = [_render_operand(o, rctx) for o in load_op.operands[1:]]
             offs_str = ", ".join(offsets)
-            shape_dt = (_parse_tensor_shape(load_op.result_types[0]) if load_op.result_types else None)
+            shape_dt = (
+                _parse_tensor_shape(load_op.result_types[0])
+                if load_op.result_types
+                else None
+            )
             shape = shape_dt[0] if shape_dt else [0]
             dtype = shape_dt[1] if shape_dt else "f16"
             n_bytes = 1
@@ -2096,10 +2281,14 @@ def _emit_warp_group(
             n_bytes *= _bytes_per_elem_bits(16 if dtype in ("f16", "bf16") else 32)
             lines += "# load Q tile (per-tile resident)"
             lines += f"tlx.barrier_expect_bytes({fl['alloc_var']}_full[0], {n_bytes})"
-            lines += (f"tlx.async_descriptor_load({desc}, {fl['alloc_var']}[0], "
-                      f"[{offs_str}], {fl['alloc_var']}_full[0])")
+            lines += (
+                f"tlx.async_descriptor_load({desc}, {fl['alloc_var']}[0], "
+                f"[{offs_str}], {fl['alloc_var']}_full[0])"
+            )
         if fl["alloc_op_id"] in mma_alloc_op_ids:
-            lines += (f"tlx.barrier_wait({fl['alloc_var']}_full[0], 0)  # wait Q tile loaded")
+            lines += (
+                f"tlx.barrier_wait({fl['alloc_var']}_full[0], 0)  # wait Q tile loaded"
+            )
     if has_mma:
         # acc_tmem is a legacy carve-out under SemIR (cross-region edge,
         # not in the inner-loop's cross_wg_barriers). Still uses
@@ -2131,9 +2320,11 @@ def _emit_warp_group(
             if prod_cyc is None or cons_cyc is None:
                 continue
             if prod_cyc > cons_cyc:
-                lines += (f"tlx.barrier_arrive({_bar_full(c.name)}[0], 1)  "
-                          f"# loop-carry pre-arrive (producer cyc={prod_cyc} > "
-                          f"consumer cyc={cons_cyc})")
+                lines += (
+                    f"tlx.barrier_arrive({_bar_full(c.name)}[0], 1)  "
+                    f"# loop-carry pre-arrive (producer cyc={prod_cyc} > "
+                    f"consumer cyc={cons_cyc})"
+                )
 
     # Per-WG iter_arg trim (mirror of _emit_inner_loop_in_outer): keep only
     # iter_args this WG's ops actually consume. Init each before the loop;
@@ -2148,9 +2339,11 @@ def _emit_warp_group(
         for o in op_obj.operands:
             if isinstance(o, IterArgRef) and o.loop_id == loop.loop_id:
                 used_idxs.add(o.idx)
-    kept = [(idx, init, yld, _iter_arg_python_name(loop.loop_id, idx, init))
-            for (idx, init, yld) in iter_specs
-            if idx in used_idxs]
+    kept = [
+        (idx, init, yld, _iter_arg_python_name(loop.loop_id, idx, init))
+        for (idx, init, yld) in iter_specs
+        if idx in used_idxs
+    ]
     saved_iter_arg_var = dict(rctx.iter_arg_var)
     for idx, init, _yld, name in kept:
         rctx.iter_arg_var[(loop.loop_id, idx)] = name
@@ -2187,18 +2380,28 @@ def _emit_warp_group(
             lines += f"{bar} = tlx.alloc_barriers(num_barriers={NB})"
             with lines.block(f"if {lo_b} < {hi_b}:"):
                 lines += f"tlx.barrier_expect_bytes({bar}[0], {nbytes})"
-                lines += (f"tlx.async_descriptor_load({desc}, {ring}[0], [{offs0}], {bar}[0])")
-            prefetch_loads.append({
-                "node": ln,
-                "op": lop,
-                "ring": ring,
-                "bar": bar,
-                "nbytes": nbytes,
-                "desc": desc,
-                "NB": NB,
-                "ld_var": f"_pf{i}_val",
-            })
+                lines += (
+                    f"tlx.async_descriptor_load({desc}, {ring}[0], [{offs0}], {bar}[0])"
+                )
+            prefetch_loads.append(
+                {
+                    "node": ln,
+                    "op": lop,
+                    "ring": ring,
+                    "bar": bar,
+                    "nbytes": nbytes,
+                    "desc": desc,
+                    "NB": NB,
+                    "ld_var": f"_pf{i}_val",
+                }
+            )
     prefetch_node_ids = {p["node"].op_ref for p in prefetch_loads}
+
+    # A non-default async_task cannot capture a RankedTensorType from the
+    # enclosing (function) scope. Re-materialize any function-scope register
+    # tensors this WG consumes (e.g. case6 v2's W/B loads) with task-local
+    # names; restore the global bindings after the body. No-op if none.
+    _reg_loc_saved = _localize_captured_reg_tensors(g, emit_nodes, rctx, lines)
 
     if True:
         with lines.block(f"for {iv} in {_loop_range_expr(loop, rctx)}:"):
@@ -2212,7 +2415,11 @@ def _emit_warp_group(
             lines += f"phase = (_it // {rep_depth}) & 1"
             # Skip bridge ops (cross-WG TMEM tmem_alloc(value)): emitted as
             # local_store + barrier_arrive in the value producer's WG.
-            bridge_op_ids = {c.bridge_op_id for c in rctx.channels if c.kind == "tmem" and c.bridge_op_id}
+            bridge_op_ids = {
+                c.bridge_op_id
+                for c in rctx.channels
+                if c.kind == "tmem" and c.bridge_op_id
+            }
             # M2 (load prefetch): wait the current tile's load, bind its SSA var
             # to the local_load, and prefetch the next tile into the alternate
             # ring slot. The blocking descriptor_load node is skipped below.
@@ -2224,12 +2431,16 @@ def _emit_warp_group(
                 lines += f"{p['ld_var']} = tlx.local_load({p['ring']}[_pf_slot])"
                 rctx.op_var[p["op"].op_id] = p["ld_var"]
                 next_iv = f"({iv} + {step_expr})"
-                offs_n = ", ".join(_render_load_offsets_at(p["op"], g, rctx, loop.loop_id, next_iv))
+                offs_n = ", ".join(
+                    _render_load_offsets_at(p["op"], g, rctx, loop.loop_id, next_iv)
+                )
                 lines += f"_pf_nslot = (_it + 1) % {nbv}"
                 with lines.block(f"if {next_iv} < {hi_b}:"):
                     lines += f"tlx.barrier_expect_bytes({p['bar']}[_pf_nslot], {p['nbytes']})"
-                    lines += (f"tlx.async_descriptor_load({p['desc']}, {p['ring']}[_pf_nslot], "
-                              f"[{offs_n}], {p['bar']}[_pf_nslot])")
+                    lines += (
+                        f"tlx.async_descriptor_load({p['desc']}, {p['ring']}[_pf_nslot], "
+                        f"[{offs_n}], {p['bar']}[_pf_nslot])"
+                    )
             for n in emit_nodes:
                 if n.op_ref in bridge_op_ids or n.op_ref in prefetch_node_ids:
                     continue
@@ -2264,6 +2475,13 @@ def _emit_warp_group(
             # prior async tcgen5 ops in this WG (the PV MMAs). Without it,
             # a plain barrier_arrive races with the still-pending HW MMA.
             lines += "tlx.tcgen05_commit(acc_tmem_full[0])"
+
+    # Restore global (preamble) names shadowed by the per-WG localization above.
+    for _oid, _prev in _reg_loc_saved.items():
+        if _prev is None:
+            rctx.op_var.pop(_oid, None)
+        else:
+            rctx.op_var[_oid] = _prev
 
 
 def _use_acc_expr(op: Op, loop: Loop, rctx: RenderCtx) -> str:
@@ -2315,7 +2533,11 @@ def _emit_in_loop_node(
                 continue
             if c.consumer_node == n.id and c.producer_node is not None:
                 prod_op = next(
-                    (nn.op_ref for nn in loop.schedule.nodes if nn.id == c.producer_node),
+                    (
+                        nn.op_ref
+                        for nn in loop.schedule.nodes
+                        if nn.id == c.producer_node
+                    ),
                     None,
                 )
                 if prod_op is None:
@@ -2324,31 +2546,56 @@ def _emit_in_loop_node(
                 # tmem_alloc(value) absorbs the same SSA value), skip the SMEM
                 # channel — TMEM is the natural staging for MMA-bound values.
                 already_tmem = any(
-                    tc.kind == "tmem" and tc.bridge_op_id and ((lambda bop: bop and bop.operands and isinstance(
-                        bop.operands[0], OpRef) and bop.operands[0].op_id == prod_op)(g.ops.get(tc.bridge_op_id)))
-                    for tc in rctx.channels)
+                    tc.kind == "tmem"
+                    and tc.bridge_op_id
+                    and (
+                        (
+                            lambda bop: bop
+                            and bop.operands
+                            and isinstance(bop.operands[0], OpRef)
+                            and bop.operands[0].op_id == prod_op
+                        )(g.ops.get(tc.bridge_op_id))
+                    )
+                    for tc in rctx.channels
+                )
                 if already_tmem:
                     continue
                 # Detect backward-edge / loop-carry channels (producer_cycle >
                 # consumer_cycle within an iter): these are release SIGNALS
                 # not data transfers — emit barrier-only, no load/store.
                 prod_cyc = next(
-                    (nn.schedule_cycle for nn in loop.schedule.nodes if nn.id == c.producer_node),
+                    (
+                        nn.schedule_cycle
+                        for nn in loop.schedule.nodes
+                        if nn.id == c.producer_node
+                    ),
                     None,
                 )
                 cons_cyc = next(
-                    (nn.schedule_cycle for nn in loop.schedule.nodes if nn.id == c.consumer_node),
+                    (
+                        nn.schedule_cycle
+                        for nn in loop.schedule.nodes
+                        if nn.id == c.consumer_node
+                    ),
                     None,
                 )
-                is_loop_carry = (prod_cyc is not None and cons_cyc is not None and prod_cyc > cons_cyc)
+                is_loop_carry = (
+                    prod_cyc is not None
+                    and cons_cyc is not None
+                    and prod_cyc > cons_cyc
+                )
                 if c.kind == "named" or is_loop_carry:
                     # Signal-only: just wait for producer signal. No buffer
                     # load (the synthesized buffer for loop-carry channels is
                     # an artifact — it may even alias another buffer's storage,
                     # which would CORRUPT memory if we wrote/read it).
-                    kind_note = ("named-channel" if c.kind == "named" else "loop-carry release")
-                    lines += (f"tlx.barrier_wait({_bar_full(c.name)}[0], _it & 1)  "
-                              f"# {kind_note} (n{c.producer_node}→n{c.consumer_node})")
+                    kind_note = (
+                        "named-channel" if c.kind == "named" else "loop-carry release"
+                    )
+                    lines += (
+                        f"tlx.barrier_wait({_bar_full(c.name)}[0], _it & 1)  "
+                        f"# {kind_note} (n{c.producer_node}→n{c.consumer_node})"
+                    )
                     continue
                 seed = int(rctx.op_var.get("__inloop_var_seed__", "0"))
                 chan_var = f"chan_{c.name}_{seed}"
@@ -2361,7 +2608,11 @@ def _emit_in_loop_node(
                 lines += f"tlx.barrier_arrive({_bar_empty(c.name)}[0], 1)"
                 rctx.op_var[prod_op] = chan_var
 
-    _load_buf = (_find_load_target_buffer(n, op, g, loop) if n.op_kind == "tt.descriptor_load" else None)
+    _load_buf = (
+        _find_load_target_buffer(n, op, g, loop)
+        if n.op_kind == "tt.descriptor_load"
+        else None
+    )
     if _load_buf is None and n.op_kind == "tt.descriptor_load":
         # No original staging buffer — the load result is a register tile that
         # the schedule routes to a consumer in ANOTHER warp group (LayerNorm:
@@ -2375,7 +2626,9 @@ def _emit_in_loop_node(
         # synthesized cross-WG channel for register-consumed loads): stage it
         # through SMEM here, signalling the buffer's full barrier.
         buf = _load_buf
-        buf_var = rctx.buffer_var.get((loop.loop_id, buf.id), f"L{loop.loop_id}_{_buffer_var_name(buf)}")
+        buf_var = rctx.buffer_var.get(
+            (loop.loop_id, buf.id), f"L{loop.loop_id}_{_buffer_var_name(buf)}"
+        )
         desc = _render_operand(op.operands[0], rctx)
         offsets = [_render_operand(o, rctx) for o in op.operands[1:]]
         offs_str = ", ".join(offsets)
@@ -2398,8 +2651,15 @@ def _emit_in_loop_node(
                 # expect bytes, load with full as the mbarrier arg.
                 ph = "(_it & 1)" if buf.count == 1 else "phase"
                 idx = "0" if buf.count == 1 else "buf"
-                nbytes = ((buf.shape[0] * buf.shape[1] *
-                           _bytes_per_elem_bits(buf.element_bits)) if len(buf.shape) >= 2 else buf.size_bytes)
+                nbytes = (
+                    (
+                        buf.shape[0]
+                        * buf.shape[1]
+                        * _bytes_per_elem_bits(buf.element_bits)
+                    )
+                    if len(buf.shape) >= 2
+                    else buf.size_bytes
+                )
                 full = _bar_full(buf_var)
                 empty = _bar_empty(buf_var)
                 lines += f"tlx.barrier_wait({empty}[{idx}], {ph} ^ 1)"
@@ -2410,8 +2670,10 @@ def _emit_in_loop_node(
             # is the full (BM, BK), so the SMEM destination must match. The
             # MMA emit takes per-group `tlx.local_slice` views to feed the
             # N async_dot calls.
-            lines += (f"tlx.async_descriptor_load({desc}, {buf_var}[{data_slot}], "
-                      f"[{offs_str}], {bar_arg})")
+            lines += (
+                f"tlx.async_descriptor_load({desc}, {buf_var}[{data_slot}], "
+                f"[{offs_str}], {bar_arg})"
+            )
             return
         # Legacy: per-buffer index AND phase. The loop's `buf` and `phase` are sized
         # for the loop's max-depth ring. A count=1 buffer needs:
@@ -2426,15 +2688,20 @@ def _emit_in_loop_node(
         else:
             idx = "buf"
             ph = "phase"
-        nbytes = ((buf.shape[0] * buf.shape[1] *
-                   _bytes_per_elem_bits(buf.element_bits)) if len(buf.shape) >= 2 else buf.size_bytes)
+        nbytes = (
+            (buf.shape[0] * buf.shape[1] * _bytes_per_elem_bits(buf.element_bits))
+            if len(buf.shape) >= 2
+            else buf.size_bytes
+        )
         full = _bar_full(buf_var)
         empty = _bar_empty(buf_var)
         lines += f"# load → {buf_var}"
         lines += f"tlx.barrier_wait({empty}[{idx}], {ph} ^ 1)"
         lines += f"tlx.barrier_expect_bytes({full}[{idx}], {nbytes})"
-        lines += (f"tlx.async_descriptor_load({desc}, {buf_var}[{idx}], "
-                  f"[{offs_str}], {full}[{idx}])")
+        lines += (
+            f"tlx.async_descriptor_load({desc}, {buf_var}[{idx}], "
+            f"[{offs_str}], {full}[{idx}])"
+        )
         return
 
     if n.op_kind == "ttng.tc_gen5_mma":
@@ -2442,6 +2709,15 @@ def _emit_in_loop_node(
         # B may go through ttg.memdesc_trans — walk through it.
         a_buf, a_loop = _resolve_alloc_to_buffer(op.operands[0], g, loop)
         b_buf, b_loop = _resolve_alloc_to_buffer(op.operands[1], g, loop)
+        # Either operand may go through ttg.memdesc_trans: wgrad transposes A
+        # (tl.trans(dout) → doutᵀ @ act), FA-style transposes B. Walk through
+        # it on whichever side, and render that operand via tlx.local_trans.
+        a_via_trans = False
+        if a_buf is None and isinstance(op.operands[0], OpRef):
+            mid_a = g.ops.get(op.operands[0].op_id)
+            if mid_a and mid_a.kind == "ttg.memdesc_trans" and mid_a.operands:
+                a_buf, a_loop = _resolve_alloc_to_buffer(mid_a.operands[0], g, loop)
+                a_via_trans = True
         b_via_trans = False
         if b_buf is None and isinstance(op.operands[1], OpRef):
             mid_op = g.ops.get(op.operands[1].op_id)
@@ -2470,20 +2746,31 @@ def _emit_in_loop_node(
         # Q SMEM hoisted as `q_smem_*`).
         def _resolve_alloc_var(operand: OperandRef, buf, lp) -> str:
             if buf is not None and lp is not None:
-                return rctx.buffer_var.get((lp.loop_id, buf.id), f"L{lp.loop_id}_{_buffer_var_name(buf)}")
+                return rctx.buffer_var.get(
+                    (lp.loop_id, buf.id), f"L{lp.loop_id}_{_buffer_var_name(buf)}"
+                )
             if isinstance(operand, OpRef) and operand.op_id in rctx.alloc_op_var:
                 return rctx.alloc_op_var[operand.op_id]
             return "<a?>"
 
         a_var = _resolve_alloc_var(op.operands[0], a_buf, a_loop)
         b_var = _resolve_alloc_var(op.operands[1], b_buf, b_loop)
+        if a_via_trans and isinstance(op.operands[0], OpRef):
+            mid_a = g.ops.get(op.operands[0].op_id)
+            if mid_a and mid_a.kind == "ttg.memdesc_trans" and mid_a.operands:
+                a_var = _resolve_alloc_var(mid_a.operands[0], a_buf, a_loop)
         if b_via_trans and isinstance(op.operands[1], OpRef):
             mid_op = g.ops.get(op.operands[1].op_id)
             if mid_op and mid_op.kind == "ttg.memdesc_trans" and mid_op.operands:
                 b_var = _resolve_alloc_var(mid_op.operands[0], b_buf, b_loop)
         lines += "# MMA"
         # Determine destination TMEM acc and name, regardless of barrier path.
-        b_expr_pre = (f"tlx.local_trans({b_var}[{b_idx}])" if b_via_trans else f"{b_var}[{b_idx}]")
+        b_expr_pre = (
+            f"tlx.local_trans({b_var}[{b_idx}])" if b_via_trans else f"{b_var}[{b_idx}]"
+        )
+        a_expr_pre = (
+            f"tlx.local_trans({a_var}[{a_idx}])" if a_via_trans else f"{a_var}[{a_idx}]"
+        )
         acc_idx = "tmem_buf" if rctx.tmem_count > 1 else "0"
         dest_var = "acc_tmem"
         dest_op_id = None
@@ -2500,20 +2787,27 @@ def _emit_in_loop_node(
             #  (3) TMEM channel operands (e.g., PV MMA reading P_tmem written
             #      by softmax via the bridge) — full+empty pair, legacy carve.
             #  (4) the MMA's own producer-side semaphores (acc TMEM signals).
-            opnd_waits, opnd_mbar = _semir_mma_operand_waits_and_mbarriers(op, g, loop, rctx)
+            opnd_waits, opnd_mbar = _semir_mma_operand_waits_and_mbarriers(
+                op, g, loop, rctx
+            )
             for w in opnd_waits:
                 lines += w
             # TMEM bridge operand: wait the bridge's full barrier; the empty
             # side goes into the MMA's mBarriers list for HW recycle.
             tmem_chan_for_recycle: list[str] = []
             for src_idx in (0, 1):
-                if not (len(op.operands) > src_idx and isinstance(op.operands[src_idx], OpRef)):
+                if not (
+                    len(op.operands) > src_idx
+                    and isinstance(op.operands[src_idx], OpRef)
+                ):
                     continue
                 src_id = op.operands[src_idx].op_id
                 for c in rctx.channels:
                     if c.kind == "tmem" and c.alloc_op_id == src_id:
-                        lines += (f"tlx.barrier_wait({_bar_full(c.name)}[0], "
-                                  f"_it & 1)  # TMEM bridge operand")
+                        lines += (
+                            f"tlx.barrier_wait({_bar_full(c.name)}[0], "
+                            f"_it & 1)  # TMEM bridge operand"
+                        )
                         tmem_chan_for_recycle.append(f"{_bar_empty(c.name)}[0]")
             for w in _semir_consumer_waits(loop.loop_id, n.id, rctx):
                 lines += w
@@ -2531,44 +2825,66 @@ def _emit_in_loop_node(
             # is attached to every call — the empty barrier's arrive_count
             # was set to N at allocation time.
             if n.partition_count > 1:
-                dest_names = (rctx.partition_alloc_names.get(dest_op_id) if dest_op_id else None)
+                dest_names = (
+                    rctx.partition_alloc_names.get(dest_op_id) if dest_op_id else None
+                )
                 N = n.partition_count
                 m_size = n.m_size
                 if dest_names is None or len(dest_names) != N or m_size <= 0:
-                    lines += (f"# WARNING: partition_count={N} but TMEM per-group "
-                              f"names missing; falling back to single MMA")
+                    lines += (
+                        f"# WARNING: partition_count={N} but TMEM per-group "
+                        f"names missing; falling back to single MMA"
+                    )
                     if mbar_list:
                         mb = ", ".join(mbar_list)
-                        lines += (f"tlx.async_dot({a_var}[{a_idx}], {b_expr_pre}, "
-                                  f"{dest_var}[{acc_idx}], use_acc=use_acc, "
-                                  f"mBarriers=[{mb}])")
+                        lines += (
+                            f"tlx.async_dot({a_expr_pre}, {b_expr_pre}, "
+                            f"{dest_var}[{acc_idx}], use_acc=use_acc, "
+                            f"mBarriers=[{mb}])"
+                        )
                     else:
-                        lines += (f"tlx.async_dot({a_var}[{a_idx}], {b_expr_pre}, "
-                                  f"{dest_var}[{acc_idx}], use_acc=use_acc)")
+                        lines += (
+                            f"tlx.async_dot({a_expr_pre}, {b_expr_pre}, "
+                            f"{dest_var}[{acc_idx}], use_acc=use_acc)"
+                        )
                     return
                 # A SMEM is shared (full BM tile); slice along M for each group.
-                bk = (a_buf.shape[1] if (a_buf is not None and len(a_buf.shape) >= 2) else 0)
+                bk = (
+                    a_buf.shape[1]
+                    if (a_buf is not None and len(a_buf.shape) >= 2)
+                    else 0
+                )
                 for gi in range(N):
                     dg = dest_names[gi]
-                    a_view = (f"tlx.local_slice({a_var}[{a_idx}], "
-                              f"[{gi * m_size}, 0], [{m_size}, {bk}])")
+                    a_view = (
+                        f"tlx.local_slice({a_var}[{a_idx}], "
+                        f"[{gi * m_size}, 0], [{m_size}, {bk}])"
+                    )
                     if mbar_list:
                         mb = ", ".join(mbar_list)
-                        lines += (f"tlx.async_dot({a_view}, {b_expr_pre}, "
-                                  f"{dg}[{acc_idx}], use_acc=use_acc, "
-                                  f"mBarriers=[{mb}])")
+                        lines += (
+                            f"tlx.async_dot({a_view}, {b_expr_pre}, "
+                            f"{dg}[{acc_idx}], use_acc=use_acc, "
+                            f"mBarriers=[{mb}])"
+                        )
                     else:
-                        lines += (f"tlx.async_dot({a_view}, {b_expr_pre}, "
-                                  f"{dg}[{acc_idx}], use_acc=use_acc)")
+                        lines += (
+                            f"tlx.async_dot({a_view}, {b_expr_pre}, "
+                            f"{dg}[{acc_idx}], use_acc=use_acc)"
+                        )
                 return
 
             if mbar_list:
                 mb = ", ".join(mbar_list)
-                lines += (f"tlx.async_dot({a_var}[{a_idx}], {b_expr_pre}, "
-                          f"{dest_var}[{acc_idx}], use_acc=use_acc, mBarriers=[{mb}])")
+                lines += (
+                    f"tlx.async_dot({a_expr_pre}, {b_expr_pre}, "
+                    f"{dest_var}[{acc_idx}], use_acc=use_acc, mBarriers=[{mb}])"
+                )
             else:
-                lines += (f"tlx.async_dot({a_var}[{a_idx}], {b_expr_pre}, "
-                          f"{dest_var}[{acc_idx}], use_acc=use_acc)")
+                lines += (
+                    f"tlx.async_dot({a_expr_pre}, {b_expr_pre}, "
+                    f"{dest_var}[{acc_idx}], use_acc=use_acc)"
+                )
             return
 
         # ── Legacy channel-based path ─────────────────────────────────────
@@ -2585,7 +2901,9 @@ def _emit_in_loop_node(
         # barrier above already covers them with `[buf]` indexing.
         local_buf_def_ops = {b.def_op for b in loop.schedule.buffers}
         for src_idx in (0, 1):
-            if not (len(op.operands) > src_idx and isinstance(op.operands[src_idx], OpRef)):
+            if not (
+                len(op.operands) > src_idx and isinstance(op.operands[src_idx], OpRef)
+            ):
                 continue
             src_id = op.operands[src_idx].op_id
             if src_id in local_buf_def_ops:
@@ -2615,7 +2933,9 @@ def _emit_in_loop_node(
         # uses this exact `mBarriers=[acc_full, kv_empties[k_buf]]` idiom.
         mbar_list = []
         # (1) Cross-WG TMEM producer barriers.
-        producer_chans = [c for c in rctx.channels if c.kind == "tmem" and c.alloc_op_id == dest_op_id]
+        producer_chans = [
+            c for c in rctx.channels if c.kind == "tmem" and c.alloc_op_id == dest_op_id
+        ]
         for c in producer_chans:
             mbar_list.append(f"{_bar_full(c.name)}[0]")
         # (2) SMEM operand `_empty` barriers — released by HW when reads
@@ -2638,10 +2958,12 @@ def _emit_in_loop_node(
                 mbar_list.append(f"{_bar_full(c.name)}[0]")
         if mbar_list:
             mb = ", ".join(mbar_list)
-            lines += (f"tlx.async_dot({a_var}[{a_idx}], {b_expr}, {dest_var}[{acc_idx}], "
-                      f"use_acc=use_acc, mBarriers=[{mb}])")
+            lines += (
+                f"tlx.async_dot({a_expr_pre}, {b_expr}, {dest_var}[{acc_idx}], "
+                f"use_acc=use_acc, mBarriers=[{mb}])"
+            )
         else:
-            lines += f"tlx.async_dot({a_var}[{a_idx}], {b_expr}, {dest_var}[{acc_idx}], use_acc=use_acc)"
+            lines += f"tlx.async_dot({a_expr_pre}, {b_expr}, {dest_var}[{acc_idx}], use_acc=use_acc)"
         # NOTE: no explicit `barrier_arrive` for the SMEM operand `_empty`
         # barriers — the MMA hardware signals them via mBarriers above.
         return
@@ -2678,8 +3000,10 @@ def _emit_in_loop_node(
             if c.loop_id is not None and c.loop_id != loop.loop_id:
                 continue
             if c.producer_node == n.id:
-                lines += (f"tlx.barrier_arrive({_bar_full(c.name)}[0], 1)  "
-                          f"# named-channel signal (n{c.producer_node}→n{c.consumer_node})")
+                lines += (
+                    f"tlx.barrier_arrive({_bar_full(c.name)}[0], 1)  "
+                    f"# named-channel signal (n{c.producer_node}→n{c.consumer_node})"
+                )
         return
     if n.op_kind == "tt.store":
         ptr = _render_operand(op.operands[0], rctx)
@@ -2696,8 +3020,10 @@ def _emit_in_loop_node(
             rctx._store_from_channel = None
             desc = _render_operand(op.operands[0], rctx)
             offs_str = ", ".join(_render_operand(o, rctx) for o in op.operands[2:])
-            lines += (f"tlx.async_descriptor_store({desc}, "
-                      f"{sc['buf_var']}[{sc['slot']}], [{offs_str}])")
+            lines += (
+                f"tlx.async_descriptor_store({desc}, "
+                f"{sc['buf_var']}[{sc['slot']}], [{offs_str}])"
+            )
             lines += "tlx.async_descriptor_store_wait(0)"
             if sc["arrive"]:
                 lines += sc["arrive"]
@@ -2712,7 +3038,9 @@ def _emit_in_loop_node(
         bid = op.attributes.get("buffer.id")
         buf = next((b for b in loop.schedule.buffers if b.id == bid), None)
         if buf is not None:
-            buf_var = rctx.buffer_var.get((loop.loop_id, buf.id), f"L{loop.loop_id}_{_buffer_var_name(buf)}")
+            buf_var = rctx.buffer_var.get(
+                (loop.loop_id, buf.id), f"L{loop.loop_id}_{_buffer_var_name(buf)}"
+            )
             slot = "buf" if buf.count > 1 else "0"
         else:
             buf_var, slot = "c_smem", "0"
@@ -2726,7 +3054,9 @@ def _emit_in_loop_node(
             lines += "tlx.async_descriptor_store_wait(0)  # drain prev store (deferred)"
             lines += f"tlx.local_store({buf_var}[{slot}], {value_expr})"
             lines += "tlx.fence_async_shared()"
-            lines += (f"tlx.async_descriptor_store({desc}, {buf_var}[{slot}], [{offs_str}])")
+            lines += (
+                f"tlx.async_descriptor_store({desc}, {buf_var}[{slot}], [{offs_str}])"
+            )
             rctx._needs_store_drain = True
             return
         lines += f"tlx.local_store({buf_var}[{slot}], {value_expr})"
@@ -2789,25 +3119,50 @@ def _emit_in_loop_node(
                 continue
             if c.producer_node == n.id and c.consumer_node is not None:
                 already_tmem = any(
-                    tc.kind == "tmem" and tc.bridge_op_id and ((lambda bop: bop and bop.operands and isinstance(
-                        bop.operands[0], OpRef) and bop.operands[0].op_id == op.op_id)(g.ops.get(tc.bridge_op_id)))
-                    for tc in rctx.channels)
+                    tc.kind == "tmem"
+                    and tc.bridge_op_id
+                    and (
+                        (
+                            lambda bop: bop
+                            and bop.operands
+                            and isinstance(bop.operands[0], OpRef)
+                            and bop.operands[0].op_id == op.op_id
+                        )(g.ops.get(tc.bridge_op_id))
+                    )
+                    for tc in rctx.channels
+                )
                 if already_tmem:
                     continue
                 # Loop-carry detection: same as consumer side. Signal-only.
                 prod_cyc = next(
-                    (nn.schedule_cycle for nn in loop.schedule.nodes if nn.id == c.producer_node),
+                    (
+                        nn.schedule_cycle
+                        for nn in loop.schedule.nodes
+                        if nn.id == c.producer_node
+                    ),
                     None,
                 )
                 cons_cyc = next(
-                    (nn.schedule_cycle for nn in loop.schedule.nodes if nn.id == c.consumer_node),
+                    (
+                        nn.schedule_cycle
+                        for nn in loop.schedule.nodes
+                        if nn.id == c.consumer_node
+                    ),
                     None,
                 )
-                is_loop_carry = (prod_cyc is not None and cons_cyc is not None and prod_cyc > cons_cyc)
+                is_loop_carry = (
+                    prod_cyc is not None
+                    and cons_cyc is not None
+                    and prod_cyc > cons_cyc
+                )
                 if c.kind == "named" or is_loop_carry:
-                    kind_note = ("named-channel" if c.kind == "named" else "loop-carry release")
-                    lines += (f"tlx.barrier_arrive({_bar_full(c.name)}[0], 1)  "
-                              f"# {kind_note} signal (n{c.producer_node}→n{c.consumer_node})")
+                    kind_note = (
+                        "named-channel" if c.kind == "named" else "loop-carry release"
+                    )
+                    lines += (
+                        f"tlx.barrier_arrive({_bar_full(c.name)}[0], 1)  "
+                        f"# {kind_note} signal (n{c.producer_node}→n{c.consumer_node})"
+                    )
                     continue
                 # Layer 1: wait for slot free before overwriting.
                 lines += f"tlx.barrier_wait({_bar_empty(c.name)}[0], (_it & 1) ^ 1)"
@@ -2815,8 +3170,10 @@ def _emit_in_loop_node(
                 # group alias), the preceding alias members' consumers
                 # must also have finished before we overwrite.
                 for pred_name in _alias_predecessors(c.name, rctx, g):
-                    lines += (f"tlx.barrier_wait({_bar_empty(pred_name)}[0], "
-                              f"(_it & 1) ^ 1)  # alias predecessor")
+                    lines += (
+                        f"tlx.barrier_wait({_bar_empty(pred_name)}[0], "
+                        f"(_it & 1) ^ 1)  # alias predecessor"
+                    )
                 lines += f"tlx.local_store({c.name}[0], {name})"
                 lines += f"tlx.barrier_arrive({_bar_full(c.name)}[0], 1)"
         # Cross-WG TMEM bridge producer: emits the local_store + barrier
@@ -2831,8 +3188,12 @@ def _emit_in_loop_node(
             if c.kind != "tmem" or not c.bridge_op_id:
                 continue
             bridge_op = g.ops.get(c.bridge_op_id)
-            if (bridge_op and bridge_op.operands and isinstance(bridge_op.operands[0], OpRef)
-                    and bridge_op.operands[0].op_id == op.op_id):
+            if (
+                bridge_op
+                and bridge_op.operands
+                and isinstance(bridge_op.operands[0], OpRef)
+                and bridge_op.operands[0].op_id == op.op_id
+            ):
                 # Same per-iter parity as the schedule-channel path.
                 lines += f"tlx.barrier_wait({_bar_empty(c.name)}[0], (_it & 1) ^ 1)"
                 lines += f"tlx.local_store({c.name}[0], {name})"
@@ -2843,7 +3204,9 @@ def _emit_in_loop_node(
     lines += f"# (unhandled in-loop op: {n.op_kind})"
 
 
-def _find_load_target_buffer(node: Node, op: Op, g: ScheduleGraph, loop: Loop) -> Buffer | None:
+def _find_load_target_buffer(
+    node: Node, op: Op, g: ScheduleGraph, loop: Loop
+) -> Buffer | None:
     """Find the SMEM buffer that consumes this descriptor_load's result."""
     # Walk g.ops for an alloc whose first operand is `op`.
     for cand in g.ops.values():
@@ -2890,7 +3253,9 @@ def _find_channel_producer_buffer(node: Node, loop: Loop) -> Buffer | None:
     return None
 
 
-def _resolve_alloc_to_buffer(operand: OperandRef, g: ScheduleGraph, loop: Loop) -> tuple[Buffer | None, Loop | None]:
+def _resolve_alloc_to_buffer(
+    operand: OperandRef, g: ScheduleGraph, loop: Loop
+) -> tuple[Buffer | None, Loop | None]:
     """Find the (buffer, owning_loop) for an operand that is an alloc OpRef.
     Searches the given loop first, then any other loop in the graph (so an
     inner-loop MMA can find a buffer that's owned by the outer-loop schedule,
@@ -2972,7 +3337,9 @@ class UnifiedWG:
     is_default: bool = False
 
 
-def _unified_warp_groups(graph: ScheduleGraph, outer: Loop | None, inner: Loop | None) -> list[UnifiedWG]:
+def _unified_warp_groups(
+    graph: ScheduleGraph, outer: Loop | None, inner: Loop | None
+) -> list[UnifiedWG]:
     """Build the unified warp-group list for the whole kernel.
 
     Mirrors auto-WS's task-id propagation: each (role, scope) pair becomes
@@ -2991,12 +3358,19 @@ def _unified_warp_groups(graph: ScheduleGraph, outer: Loop | None, inner: Loop |
         # separate empty default would deadlock on the acc_tmem carve-out — so
         # instead promote the COMPUTE warp group (most warps, not a pure TMA
         # producer) to be the "default" task.
-        epi_ops = [o for o in _ops_after_loop(graph, outer) if o.kind not in _SKIP_FUNCTION_SCOPE]
+        epi_ops = [
+            o
+            for o in _ops_after_loop(graph, outer)
+            if o.kind not in _SKIP_FUNCTION_SCOPE
+        ]
         has_epilogue = len(epi_ops) > 0
         default_wg_id: int | None = None
         if not has_epilogue:
-            candidates = [w for w in outer.warp_groups if "TMA" not in w.pipelines and "TC" not in w.pipelines
-                          ] or [w for w in outer.warp_groups if "TMA" not in w.pipelines]
+            candidates = [
+                w
+                for w in outer.warp_groups
+                if "TMA" not in w.pipelines and "TC" not in w.pipelines
+            ] or [w for w in outer.warp_groups if "TMA" not in w.pipelines]
             if candidates:
                 default_wg_id = max(candidates, key=lambda w: w.num_warps).id
         if default_wg_id is None:
@@ -3008,10 +3382,15 @@ def _unified_warp_groups(graph: ScheduleGraph, outer: Loop | None, inner: Loop |
                     inner_wg=None,
                     num_warps=4,
                     is_default=True,
-                ))
+                )
+            )
         for wg in outer.warp_groups:
             roles = "+".join(wg.pipelines)
-            primary = ("TC" if "TC" in wg.pipelines else ("TMA" if "TMA" in wg.pipelines else roles))
+            primary = (
+                "TC"
+                if "TC" in wg.pipelines
+                else ("TMA" if "TMA" in wg.pipelines else roles)
+            )
             # Layer B: trust the schedule pass's per-WG num_warps decision
             # (= max minWarps over the WG's ops, snapped to {1,2,4,8}).
             # The previous binary "has TMEM ops? → 4w/152r else 1w/24r"
@@ -3029,7 +3408,8 @@ def _unified_warp_groups(graph: ScheduleGraph, outer: Loop | None, inner: Loop |
                     num_warps=num_warps,
                     num_regs=(None if is_def else num_regs),
                     is_default=is_def,
-                ))
+                )
+            )
         return out
 
     # Persistent / nested-loop kernel (case2):
@@ -3053,13 +3433,18 @@ def _unified_warp_groups(graph: ScheduleGraph, outer: Loop | None, inner: Loop |
             inner_wg=None,
             num_warps=4,
             is_default=True,
-        ))
+        )
+    )
 
     # One UWG per inner warp group. Trust the schedule pass's num_warps
     # decision (Layer B); see the case1 branch above for the rationale.
     for wg in inner.warp_groups:
         roles = "+".join(wg.pipelines)
-        primary = ("TC" if "TC" in wg.pipelines else ("TMA" if "TMA" in wg.pipelines else roles))
+        primary = (
+            "TC"
+            if "TC" in wg.pipelines
+            else ("TMA" if "TMA" in wg.pipelines else roles)
+        )
         num_warps = wg.num_warps
         num_regs = 152 if num_warps >= 4 else 24
         out.append(
@@ -3070,7 +3455,8 @@ def _unified_warp_groups(graph: ScheduleGraph, outer: Loop | None, inner: Loop |
                 inner_wg=wg.id,
                 num_warps=num_warps,
                 num_regs=num_regs,
-            ))
+            )
+        )
     return out
 
 
@@ -3113,7 +3499,9 @@ def _inner_nodes_for_uwg(inner: Loop, uwg: UnifiedWG) -> list[Node]:
     return sorted(out, key=lambda n: (n.schedule_stage, n.schedule_cluster, n.id))
 
 
-def _depends_on_iv_or_iter_arg(g: ScheduleGraph, op_id: str, visited: set[str] | None = None) -> bool:
+def _depends_on_iv_or_iter_arg(
+    g: ScheduleGraph, op_id: str, visited: set[str] | None = None
+) -> bool:
     """True if op_id (transitively) references a loop IV or iter_arg.
     Such ops must be emitted INSIDE the loop body, not at task entry."""
     if visited is None:
@@ -3190,6 +3578,71 @@ def _replicate_infra_deps(
         lines += f"{name} = {_render_op_expr(op, rctx)}"
 
 
+def _result_is_register_tensor(op: Op) -> bool:
+    """True if op's first result is a register tensor (RankedTensorType).
+    Such values are ILLEGAL to capture across a WarpSpecializeOp boundary
+    ("WarpSpecializeOp should not capture RankedTensorType"); scalars,
+    descriptors (!tt.tensordesc) and memdescs (!ttg.memdesc) are fine."""
+    return bool(op.result_types) and op.result_types[0].lstrip().startswith("tensor<")
+
+
+def _localize_captured_reg_tensors(
+    g: ScheduleGraph,
+    target_nodes: list[Node],
+    rctx: RenderCtx,
+    lines: _Lines,
+) -> dict[str, str | None]:
+    """Re-materialize, with task-local names, any function-scope register-tensor
+    op a non-default warp group consumes that is currently bound to a global
+    (preamble) variable. A non-default `tlx.async_task` may not capture a
+    RankedTensorType from the enclosing scope (e.g. case6 v2: the W/B loads
+    `ext_7`/`ext_8` are used inside a non-default compute WG), so each such task
+    gets its own copy of the (cheap, loop-invariant) value instead of capturing
+    it. Returns {op_id: prev_var} so the caller can restore the global bindings
+    after this WG's body. No-op when the WG captures nothing (the common case)."""
+    order: list[Op] = []
+    seen: set[str] = set()
+
+    def walk(op_id: str) -> None:
+        if op_id in seen:
+            return
+        seen.add(op_id)
+        op = g.ops.get(op_id)
+        if op is None or _depends_on_iv_or_iter_arg(g, op_id):
+            return
+        for o in op.operands:
+            if isinstance(o, OpRef):
+                walk(o.op_id)
+        # Candidate: a register-tensor value already named at function scope
+        # (preamble). Re-emit it here so the task doesn't capture it.
+        if op.op_id in rctx.op_var and _result_is_register_tensor(op):
+            order.append(op)
+
+    for n in target_nodes:
+        if not n.op_ref:
+            continue
+        top = g.ops.get(n.op_ref)
+        if top is None:
+            continue
+        for o in top.operands:
+            if isinstance(o, OpRef):
+                walk(o.op_id)
+
+    if not order:
+        return {}
+    saved: dict[str, str | None] = {op.op_id: rctx.op_var.get(op.op_id) for op in order}
+    lines += "# Re-materialize function-scope register tensors locally (a "
+    lines += "# non-default warp group cannot capture RankedTensorType)."
+    vidx = 600
+    for op in order:  # deps-before-dependents (toposort from walk)
+        name = f"_wgloc{vidx}"
+        vidx += 1
+        rhs = _render_op_expr(op, rctx)  # operands already rebound to locals
+        rctx.op_var[op.op_id] = name
+        lines += f"{name} = {rhs}"
+    return saved
+
+
 # ---------------------------------------------------------------------------
 # Iter-arg threading (port of WSSpecialize::collectBlockArgsForTask +
 # SpecializeForOp). Each per-UWG specialized loop keeps only the iter_args
@@ -3218,7 +3671,9 @@ def _find_loop_for(g: ScheduleGraph, loop: Loop) -> Op | None:
     return None
 
 
-def _loop_iter_args(g: ScheduleGraph, loop: Loop) -> list[tuple[int, OperandRef, OperandRef]]:
+def _loop_iter_args(
+    g: ScheduleGraph, loop: Loop
+) -> list[tuple[int, OperandRef, OperandRef]]:
     """Return [(idx, init_ref, yield_ref), ...] for `loop`'s iter_args.
 
     init_ref comes from scf.for operand[3+idx]; yield_ref from scf.yield
@@ -3241,10 +3696,10 @@ def _loop_iter_args(g: ScheduleGraph, loop: Loop) -> list[tuple[int, OperandRef,
         if isinstance(init, OpRef):
             init_op = g.ops.get(init.op_id)
             if init_op is not None and init_op.kind in (
-                    "ttng.tmem_alloc",
-                    "ttg.local_alloc",
-                    "ttng.tmem_store",
-                    "ub.poison",
+                "ttng.tmem_alloc",
+                "ttg.local_alloc",
+                "ttng.tmem_store",
+                "ub.poison",
             ):
                 continue
         # Skip iter_args whose type is a memory descriptor or async token.
@@ -3266,7 +3721,11 @@ def _iter_args_used_by_inner_uwg(
     `loop:<inner_id>` AND warp_group == uwg.inner_wg) references it."""
     if uwg.inner_wg is None:
         return []
-    wg_op_ids = {n.op_ref for n in inner.schedule.nodes if n.warp_group == uwg.inner_wg and n.op_ref}
+    wg_op_ids = {
+        n.op_ref
+        for n in inner.schedule.nodes
+        if n.warp_group == uwg.inner_wg and n.op_ref
+    }
     used: set[int] = set()
     for oid in wg_op_ids:
         op = g.ops.get(oid)
@@ -3290,7 +3749,9 @@ def _iter_arg_python_name(loop_id: int, idx: int, init: OperandRef) -> str:
     return f"i{loop_id}_{idx}"
 
 
-def _has_smem_ring_buffer_inner(inner: Loop, uwg: UnifiedWG) -> bool:
+def _has_smem_ring_buffer_inner(
+    inner: Loop, uwg: UnifiedWG, channels: list[Any] | None = None
+) -> bool:
     """Does this UWG touch any SMEM buffer in the inner loop?
 
     Returns True for any partition that reads or writes a SMEM buf, even
@@ -3300,9 +3761,24 @@ def _has_smem_ring_buffer_inner(inner: Loop, uwg: UnifiedWG) -> bool:
     """
     if inner is None or uwg.inner_wg is None:
         return False
+    # A UWG that consumes (or produces) a cross-WG SMEM channel ring-indexes it
+    # with `smem_accum` too — e.g. the case7 bias-reduce WG reads the shared
+    # dout SMEM via local_load. Detect this from the raw cross_wg_barriers
+    # (authoritative): the deduped `channels` list can merge a shared buffer's
+    # second consumer away, but SemIR still emits its ring-indexed local_load.
+    for cb in getattr(inner.schedule, "cross_wg_barriers", []):
+        if uwg.inner_wg not in (cb.consumer_wg, cb.producer_wg):
+            continue
+        buf = next(
+            (b for b in inner.schedule.buffers if b.id == cb.paired_buffer_id), None
+        )
+        if buf is not None and buf.kind == "smem":
+            return True
     nodes = _inner_nodes_for_uwg(inner, uwg)
     for n in nodes:
-        for bid in n.consumes_buffers + ([n.produces_buffer] if n.produces_buffer is not None else []):
+        for bid in n.consumes_buffers + (
+            [n.produces_buffer] if n.produces_buffer is not None else []
+        ):
             buf = next((b for b in inner.schedule.buffers if b.id == bid), None)
             if buf and buf.kind == "smem":
                 return True
@@ -3330,7 +3806,9 @@ def _smem_depth_for_uwg(inner: Loop, uwg: UnifiedWG) -> int:
     nodes = _inner_nodes_for_uwg(inner, uwg)
     # Use produces_buffer / consumes_buffers to find inner SMEM depth.
     for n in nodes:
-        for bid in n.consumes_buffers + ([n.produces_buffer] if n.produces_buffer is not None else []):
+        for bid in n.consumes_buffers + (
+            [n.produces_buffer] if n.produces_buffer is not None else []
+        ):
             buf = next((b for b in inner.schedule.buffers if b.id == bid), None)
             if buf and buf.kind == "smem" and buf.count > 1:
                 return buf.count
@@ -3381,25 +3859,31 @@ def _emit_inner_loop_in_outer(
             if prod_cyc is None or cons_cyc is None:
                 continue
             if prod_cyc > cons_cyc:
-                lines += (f"tlx.barrier_arrive({_bar_full(c.name)}[0], 1)  "
-                          f"# loop-carry pre-arrive (producer cyc={prod_cyc} > "
-                          f"consumer cyc={cons_cyc})")
+                lines += (
+                    f"tlx.barrier_arrive({_bar_full(c.name)}[0], 1)  "
+                    f"# loop-carry pre-arrive (producer cyc={prod_cyc} > "
+                    f"consumer cyc={cons_cyc})"
+                )
 
     # Per-UWG iter_arg trim (mirror of WSSpecialize::SpecializeForOp): only
     # keep iter_args this UWG's inner ops actually consume. Init each kept
     # one before the loop; reassign at end of body from the yield expression.
     iter_specs = _loop_iter_args(g, inner)
     used_idxs = _iter_args_used_by_inner_uwg(g, inner, uwg)
-    kept = [(idx, init, yld, _iter_arg_python_name(inner.loop_id, idx, init))
-            for (idx, init, yld) in iter_specs
-            if idx in used_idxs]
+    kept = [
+        (idx, init, yld, _iter_arg_python_name(inner.loop_id, idx, init))
+        for (idx, init, yld) in iter_specs
+        if idx in used_idxs
+    ]
     saved_iter_arg_var = dict(rctx.iter_arg_var)
     for idx, init, _yld, name in kept:
         rctx.iter_arg_var[(inner.loop_id, idx)] = name
         lines += f"{name} = {_render_operand(init, rctx)}"
 
-    lines += (f"# Inner K-loop (loop {inner.loop_id}, II={inner.schedule.II}). "
-              f"SMEM ring depth={depth}; smem_accum persists across outer tiles.")
+    lines += (
+        f"# Inner K-loop (loop {inner.loop_id}, II={inner.schedule.II}). "
+        f"SMEM ring depth={depth}; smem_accum persists across outer tiles."
+    )
     with lines.block(f"for {iv} in range({lo}, {hi}, {step}):"):
         if persistent:
             # accum_cnt persists across tiles
@@ -3416,13 +3900,15 @@ def _emit_inner_loop_in_outer(
             lines += f"phase = (_it // {depth}) & 1"
         # Skip bridge ops (cross-WG TMEM tmem_alloc(value)): they're emitted
         # as local_store + barrier_arrive in the value producer's WG body.
-        bridge_op_ids = {c.bridge_op_id for c in rctx.channels if c.kind == "tmem" and c.bridge_op_id}
+        bridge_op_ids = {
+            c.bridge_op_id for c in rctx.channels if c.kind == "tmem" and c.bridge_op_id
+        }
         for n in _inner_nodes_for_uwg(inner, uwg):
             if n.op_kind in (
-                    "ttg.local_alloc",
-                    "ttng.tmem_alloc",
-                    "scf.yield",
-                    "ttg.memdesc_trans",
+                "ttg.local_alloc",
+                "ttng.tmem_alloc",
+                "scf.yield",
+                "ttg.memdesc_trans",
             ):
                 continue  # SSA wrappers — not emitted as side effects
             if n.op_ref in bridge_op_ids:
@@ -3530,8 +4016,14 @@ def _emit_outer_epilogue_partitioned(
             if op is None or op.kind in _SKIP_FUNCTION_SCOPE:
                 continue
             if op.kind == "ttng.tmem_load":
-                dest_op_id = (op.operands[0].op_id if op.operands and isinstance(op.operands[0], OpRef) else None)
-                pnames = (rctx.partition_alloc_names.get(dest_op_id) if dest_op_id else None)
+                dest_op_id = (
+                    op.operands[0].op_id
+                    if op.operands and isinstance(op.operands[0], OpRef)
+                    else None
+                )
+                pnames = (
+                    rctx.partition_alloc_names.get(dest_op_id) if dest_op_id else None
+                )
                 tmem_name = pnames[gi] if pnames else f"acc_tmem_g{gi}"
                 acc_var = f"acc_g{gi}"
                 lines += f"{acc_var} = tlx.local_load({tmem_name}[tmem_buf])"
@@ -3570,8 +4062,10 @@ def _emit_outer_epilogue_partitioned(
                             if bs:
                                 bn = bs[0][1]
                 value_expr = _render_operand(op.operands[1], rctx)
-                lines += (f"tlx.local_store(tlx.local_slice(c_smem[0], "
-                          f"[{gi * m_size}, 0], [{m_size}, {bn}]), {value_expr})")
+                lines += (
+                    f"tlx.local_store(tlx.local_slice(c_smem[0], "
+                    f"[{gi * m_size}, 0], [{m_size}, {bn}]), {value_expr})"
+                )
                 continue
     # Release TMEM as soon as both loads are done — store happens against
     # registers + c_smem now, no longer reads acc_tmem.
@@ -3656,8 +4150,10 @@ def _emit_outer_epilogue_subtiled(
                 continue
             if op.kind == "ttng.tmem_load":
                 acc_var = f"acc_{sub_n}"
-                lines += (f"acc_sub_{sub_n} = tlx.subslice(acc_tmem[tmem_buf], "
-                          f"{n_off}, {sub_size})")
+                lines += (
+                    f"acc_sub_{sub_n} = tlx.subslice(acc_tmem[tmem_buf], "
+                    f"{n_off}, {sub_size})"
+                )
                 lines += f"{acc_var} = tlx.local_load(acc_sub_{sub_n})"
                 rctx.op_var[op.op_id] = acc_var
                 # Release TMEM the moment the final load completes — TMA
@@ -3696,8 +4192,10 @@ def _emit_outer_epilogue_subtiled(
                 # L2 to drop the staging buffer after the TMA store, freeing
                 # cache capacity for actual data traffic. Should help memory
                 # throughput on large shapes.
-                lines += (f"tlx.async_descriptor_store({desc}, c_smem[{smem_slot}], "
-                          f'[{offs_str}], eviction_policy="evict_first")')
+                lines += (
+                    f"tlx.async_descriptor_store({desc}, c_smem[{smem_slot}], "
+                    f'[{offs_str}], eviction_policy="evict_first")'
+                )
                 continue
     # NOTE: no per-tile wait(0). The caller emits a single wait(0) AFTER
     # the persistent for-loop to drain remaining in-flight stores.
@@ -3743,8 +4241,10 @@ def _emit_outer_op(n: Node, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) ->
         # typically 1, so phase flips every tile).
         lines += f"tlx.barrier_wait({empty_bar}[0], (tmem_accum_cnt & 1) ^ 1)"
         lines += f"tlx.barrier_expect_bytes({full_bar}[0], {n_bytes})"
-        lines += (f"tlx.async_descriptor_load({desc}, {bufname}[0], "
-                  f"[{offs_str}], {full_bar}[0])")
+        lines += (
+            f"tlx.async_descriptor_load({desc}, {bufname}[0], "
+            f"[{offs_str}], {full_bar}[0])"
+        )
         lines += f"tlx.barrier_wait({full_bar}[0], tmem_accum_cnt & 1)"
         lines += f"{var_name} = tlx.local_load({bufname}[0])"
         lines += f"tlx.barrier_arrive({empty_bar}[0], 1)"
@@ -3801,6 +4301,74 @@ def _emit_uwg_body(
         rctx.op_var = op_var_snapshot
 
 
+def _emit_outer_reduction_stores(
+    g: ScheduleGraph,
+    outer: Loop,
+    inner: Loop | None,
+    uwg: UnifiedWG,
+    rctx: RenderCtx,
+    lines: _Lines,
+) -> None:
+    """Emit outer-scope `tt.store` ops (e.g. case7's fused bias gradient db)
+    whose value is produced by a `tt.reduce` in THIS uwg's inner loop.
+
+    The scheduler leaves such pointer-typed stores unassigned (warp_group ==
+    -1) and wraps them in an idempotent `if pid == 0` guard — the reduced
+    value is identical across the guarded-away tiles. We emit them
+    unconditionally right after this uwg's inner loop, where the loop-carried
+    accumulator is still live, mirroring the hand-written
+    `tl.store(bias_out + offs, acc)` idiom. No-op for every uwg that doesn't
+    own such a reduction (i.e. all the other cases)."""
+    if inner is None or uwg.inner_wg is None:
+        return
+    reduce_ids = {
+        n.op_ref
+        for n in inner.schedule.nodes
+        if n.warp_group == uwg.inner_wg
+        and n.op_ref
+        and g.ops.get(n.op_ref) is not None
+        and g.ops[n.op_ref].kind == "tt.reduce"
+    }
+    if not reduce_ids:
+        return
+    # The store value comes through the inner loop's RESULT (the post-loop value
+    # of the reduction accumulator), so connect the store to this uwg by walking
+    # the value back to the inner loop's `scf.for` op — NOT to the reduce op
+    # directly (the reduce is yielded inside the loop body, never an operand of
+    # the loop). `reduce_ids` above already gates to the reduction-owning uwg.
+    inner_for = _find_loop_for(g, inner)
+    inner_for_id = inner_for.op_id if inner_for is not None else None
+    if inner_for_id is None:
+        return
+
+    def _from_inner_loop(op_id: str, seen: set[str]) -> bool:
+        if op_id in seen:
+            return False
+        seen.add(op_id)
+        if op_id == inner_for_id:
+            return True
+        o = g.ops.get(op_id)
+        if o is None:
+            return False
+        return any(
+            isinstance(x, OpRef) and _from_inner_loop(x.op_id, seen) for x in o.operands
+        )
+
+    outer_scope = f"loop:{outer.loop_id}"
+    for op_id, op in g.ops.items():
+        if op.kind != "tt.store" or op.scope != outer_scope:
+            continue
+        if len(op.operands) < 2 or not isinstance(op.operands[1], OpRef):
+            continue
+        if not _from_inner_loop(op.operands[1].op_id, set()):
+            continue
+        ptr_expr = _render_operand(op.operands[0], rctx)
+        val_expr = _render_operand(op.operands[1], rctx)
+        lines += "# fused reduction store (e.g. bias gradient db): the reduced value is"
+        lines += "# identical across the guarded-away tiles, so store unconditionally."
+        lines += f"tl.store({ptr_expr}, {val_expr})"
+
+
 def _emit_uwg_body_impl(
     g: ScheduleGraph,
     outer: Loop,
@@ -3828,7 +4396,7 @@ def _emit_uwg_body_impl(
 
     # Persistent path: outer for-loop wrapping per-WG body.
     # Counter declarations BEFORE the outer loop.
-    if _has_smem_ring_buffer_inner(inner, uwg):
+    if _has_smem_ring_buffer_inner(inner, uwg, channels):
         # smem_accum: K-loop ring index (persists across persistent tiles
         # so the SMEM ring keeps rotating through the outer iterations).
         lines += "smem_accum = 0"
@@ -3848,8 +4416,10 @@ def _emit_uwg_body_impl(
     out_hi = _render_operand(outer.schedule.upper_bound, rctx)
     out_step = _render_operand(outer.schedule.step, rctx)
 
-    lines += (f"# Outer persistent loop (loop {outer.loop_id}, II={outer.schedule.II}). "
-              f"Each task replays it; body trimmed to this WG's ops.")
+    lines += (
+        f"# Outer persistent loop (loop {outer.loop_id}, II={outer.schedule.II}). "
+        f"Each task replays it; body trimmed to this WG's ops."
+    )
     with lines.block(f"for {out_iv} in range({out_lo}, {out_hi}, {out_step}):"):
         # Per-tile TMEM ring-buffer indexing.
         if has_tmem:
@@ -3904,7 +4474,9 @@ def _emit_uwg_body_impl(
                 dep_cache[op_id] = result
                 return result
 
-            in_loop_infra = [op for op in in_loop_infra if not _depends_on_outer_load(op.op_id)]
+            in_loop_infra = [
+                op for op in in_loop_infra if not _depends_on_outer_load(op.op_id)
+            ]
         for op in in_loop_infra:
             name = _auto_name(op, rctx.fresh_idx())
             rctx.op_var[op.op_id] = name
@@ -3931,13 +4503,20 @@ def _emit_uwg_body_impl(
         subtile_end = sub_info[1] if sub_info else -1
         # Pass A.5: detect partitioned epilogue chain (mutually exclusive with
         # A.7 for now — A.7+A.5 interaction is future work).
-        part_info = (_find_partition_chain(outer_nodes, g, outer) if not sub_info else None)
+        part_info = (
+            _find_partition_chain(outer_nodes, g, outer) if not sub_info else None
+        )
         part_start = part_info[0] if part_info else -1
         part_end = part_info[1] if part_info else -1
         for i, n in enumerate(outer_nodes):
             if n.child_pipeline_id is not None:
                 # Super-node → emit the inner K-loop here.
-                _emit_inner_loop_in_outer(g, inner, uwg, channels, rctx, lines, persistent=True)
+                _emit_inner_loop_in_outer(
+                    g, inner, uwg, channels, rctx, lines, persistent=True
+                )
+                # Fused post-loop reduction store (e.g. case7 bias gradient db),
+                # emitted in the WG that owns the reduction accumulator.
+                _emit_outer_reduction_stores(g, outer, inner, uwg, rctx, lines)
                 continue
             if sub_info and i == subtile_start:
                 chain_nodes = outer_nodes[subtile_start:subtile_end]
@@ -3979,10 +4558,14 @@ def _emit_uwg_body_impl(
 
 def emit(graph: ScheduleGraph) -> str:
     lines = _Lines()
-    lines += "# AUTO-GENERATED by sched2tlx — do not edit by hand."
+    # Emit a generated-code marker so linters/formatters (arc f, black) skip the
+    # output. Token is split here so this emitter source isn't itself flagged.
+    lines += "# @" + "generated by sched2tlx — do not edit by hand."
     lines += f"# Source: schedule_graph for kernel `{graph.kernel.name}`"
     if graph.loops:
-        wgs = ", ".join(f"wg{w.id}=[{'+'.join(w.pipelines)}]" for w in graph.loops[0].warp_groups)
+        wgs = ", ".join(
+            f"wg{w.id}=[{'+'.join(w.pipelines)}]" for w in graph.loops[0].warp_groups
+        )
         lines += f"# Warp groups (loop 0): {wgs}"
     lines += "import torch"
     lines += "import triton"
@@ -4017,6 +4600,13 @@ def emit(graph: ScheduleGraph) -> str:
         buffer_var={},
         alloc_op_var={},
         loop_iv=iv_names,
+    )
+    # The acc_tmem TC→default-epilogue hand-off only exists if the kernel has
+    # an MMA producing the accumulator. Without one (e.g. case6 LayerNorm), the
+    # default task must not wait on acc_tmem_full (nothing arrives it → hang).
+    rctx.has_acc_tmem_handoff = any(
+        op.kind in ("ttng.tc_gen5_mma", "ttng.tc_gen5_mma_scaled")
+        for op in graph.ops.values()
     )
 
     lines.indent = 1
@@ -4062,8 +4652,10 @@ def emit(graph: ScheduleGraph) -> str:
             rctx.buffer_var[(outer_loop.loop_id, buf.id)] = name
             if buf.def_op:
                 rctx.alloc_op_var[buf.def_op] = name
-            lines += (f"# {name}: outer-loop SMEM buf {buf.id}, count={buf.count} "
-                      f"(per-tile resident, e.g. Q tile through K-loop)")
+            lines += (
+                f"# {name}: outer-loop SMEM buf {buf.id}, count={buf.count} "
+                f"(per-tile resident, e.g. Q tile through K-loop)"
+            )
             lines += f"{name} = tlx.local_alloc(({shape}), {dtype}, {buf.count})"
 
         # Dedicated SMEM staging per outer-loop `tt.descriptor_load` (e.g.
@@ -4100,8 +4692,10 @@ def emit(graph: ScheduleGraph) -> str:
                 n_elems *= d
             n_bytes = n_elems * bits // 8
             bufname = f"outer_load_{node.id}_smem"
-            lines += (f"# {bufname}: dedicated staging for outer descriptor_load "
-                      f"N{node.id} (shape ({shape_str}))")
+            lines += (
+                f"# {bufname}: dedicated staging for outer descriptor_load "
+                f"N{node.id} (shape ({shape_str}))"
+            )
             lines += f"{bufname} = tlx.local_alloc(({shape_str}), {dtype_tl}, 1)"
             rctx.outer_load_bindings[node.id] = {
                 "bufname": bufname,
@@ -4135,11 +4729,15 @@ def emit(graph: ScheduleGraph) -> str:
                 for gi in range(buf.partition_count):
                     gname = f"{name}_g{gi}"
                     names.append(gname)
-                    lines += (f"# {gname}: Pass A.5 group {gi}/{buf.partition_count}"
-                              f" of partitioned TMEM acc buf {buf.id} "
-                              f"(per-group shape ({pshape_str}))")
-                    lines += (f"{gname} = tlx.local_alloc(({pshape_str}), "
-                              f"tl.float32, {buf.count}, tlx.storage_kind.tmem)")
+                    lines += (
+                        f"# {gname}: Pass A.5 group {gi}/{buf.partition_count}"
+                        f" of partitioned TMEM acc buf {buf.id} "
+                        f"(per-group shape ({pshape_str}))"
+                    )
+                    lines += (
+                        f"{gname} = tlx.local_alloc(({pshape_str}), "
+                        f"tl.float32, {buf.count}, tlx.storage_kind.tmem)"
+                    )
                 rctx.partition_buffer_names[(outer_loop.loop_id, buf.id)] = names
                 if buf.def_op:
                     rctx.partition_alloc_names[buf.def_op] = names
@@ -4147,14 +4745,20 @@ def emit(graph: ScheduleGraph) -> str:
                 # references it without partition awareness still resolves.
                 lines += f"{name} = {names[0]}"
             else:
-                lines += (f"# {name}: outer-loop buf {buf.id}, count={buf.count} "
-                          f"(TC writes / default reads across {buf.count} tiles)")
-                lines += (f"{name} = tlx.local_alloc(({shape}), tl.float32, "
-                          f"{buf.count}, tlx.storage_kind.tmem)")
+                lines += (
+                    f"# {name}: outer-loop buf {buf.id}, count={buf.count} "
+                    f"(TC writes / default reads across {buf.count} tiles)"
+                )
+                lines += (
+                    f"{name} = tlx.local_alloc(({shape}), tl.float32, "
+                    f"{buf.count}, tlx.storage_kind.tmem)"
+                )
         # Epilogue staging SMEM (for descriptor_store) — derive from the
         # store's descriptor operand. The descriptor may be a kernel arg
         # (case2) or a make_tensor_descriptor op (case1).
-        epi_store = next((op for op in graph.ops.values() if op.kind == "tt.descriptor_store"), None)
+        epi_store = next(
+            (op for op in graph.ops.values() if op.kind == "tt.descriptor_store"), None
+        )
         if epi_store and epi_store.operands:
             shape = [128, 128]
             dtype = "tl.float16"
@@ -4162,7 +4766,9 @@ def emit(graph: ScheduleGraph) -> str:
             if isinstance(op0, OpRef):
                 desc_op = graph.ops.get(op0.op_id)
                 if desc_op:
-                    bs = _parse_desc_block_shape(desc_op.result_types[0] if desc_op.result_types else "")
+                    bs = _parse_desc_block_shape(
+                        desc_op.result_types[0] if desc_op.result_types else ""
+                    )
                     if bs:
                         shape, dtype = bs[0], _dtype_str_to_tl(bs[1])
             elif isinstance(op0, ArgRef):
@@ -4227,7 +4833,8 @@ def emit(graph: ScheduleGraph) -> str:
                         consumer_node=cb.consumer_node,
                         buffer_id=None,
                         loop_id=L.loop_id,
-                    ))
+                    )
+                )
                 continue
             buf_var = rctx.buffer_var.get((L.loop_id, cb.paired_buffer_id))
             if buf_var is None:
@@ -4243,7 +4850,8 @@ def emit(graph: ScheduleGraph) -> str:
                     consumer_node=cb.consumer_node,
                     buffer_id=cb.paired_buffer_id,
                     loop_id=L.loop_id,
-                ))
+                )
+            )
     # TMEM cross-WG channels (e.g. case3 qk_tmem TC→softmax, P_tmem
     # softmax→TC). Detected by walking alloc op_id ↔ writer/reader WGs.
     # For non-persistent kernels (only one loop, treated as outer), the
@@ -4283,7 +4891,9 @@ def emit(graph: ScheduleGraph) -> str:
     # the TMEM bridge channel by direct cross-WG TMEM store, so the SMEM
     # staging buffer (and its full+empty barrier pair) is dead. Dropping
     # it removes one barrier_wait + barrier_arrive per iter from each side.
-    bridge_op_ids = {c.bridge_op_id for c in channels if c.kind == "tmem" and c.bridge_op_id}
+    bridge_op_ids = {
+        c.bridge_op_id for c in channels if c.kind == "tmem" and c.bridge_op_id
+    }
     node_op_ref: dict[tuple[int, int], str] = {}
     for L in graph.loops:
         for n in L.schedule.nodes:
@@ -4320,10 +4930,19 @@ def emit(graph: ScheduleGraph) -> str:
                 continue
             # Only allocate barriers for buffers fed by an async load
             # (TMA descriptor_load) — others are pure register-staging.
-            has_load = any(op.kind in ("ttg.local_alloc", ) and op.operands and (isinstance(op.operands[0], OpRef) and (
-                (g_op := graph.ops.get(op.operands[0].op_id)) and g_op.kind == "tt.descriptor_load"))
-                           for oid, op in graph.ops.items()
-                           if oid == b.def_op)
+            has_load = any(
+                op.kind in ("ttg.local_alloc",)
+                and op.operands
+                and (
+                    isinstance(op.operands[0], OpRef)
+                    and (
+                        (g_op := graph.ops.get(op.operands[0].op_id))
+                        and g_op.kind == "tt.descriptor_load"
+                    )
+                )
+                for oid, op in graph.ops.items()
+                if oid == b.def_op
+            )
             if has_load:
                 extra.append((name, b.count))
     # Outer-loop intra-WG TMA loads (case5 bias): their SMEM bufs need
@@ -4344,9 +4963,13 @@ def emit(graph: ScheduleGraph) -> str:
     for ch in rctx.crossloop_channels:
         extra.append((ch["bufname"], 1))
         # Hoist alloc here (no def_op — synthesized).
-        shape = ", ".join(str(d) for d in ch["shape"]) + ("," if len(ch["shape"]) == 1 else "")
-        lines += (f"# {ch['bufname']}: cross-loop iter_arg result channel "
-                  f"(loop {ch['loop_id']} iter_arg {ch['idx']} → epilogue)")
+        shape = ", ".join(str(d) for d in ch["shape"]) + (
+            "," if len(ch["shape"]) == 1 else ""
+        )
+        lines += (
+            f"# {ch['bufname']}: cross-loop iter_arg result channel "
+            f"(loop {ch['loop_id']} iter_arg {ch['idx']} → epilogue)"
+        )
         lines += f"{ch['bufname']} = tlx.local_alloc(({shape}), {ch['dtype']}, 1)"
 
     # ── No warp specialization (single warp group) ──────────────────────────
@@ -4357,19 +4980,49 @@ def emit(graph: ScheduleGraph) -> str:
     # task. A TC-free / memory-bound loop (e.g. LayerNorm) gets its load/compute
     # overlap from async TMA + double-buffering within the single warp group;
     # warp specialization would only add barriers.
+    #
+    # This fast path is TC-FREE ONLY. A single-WG partition that still contains
+    # an MMA (TC) / TMEM accumulator needs the full WS path: the MMA→epilogue
+    # TMEM hand-off barriers and the in-WG async-load completion barriers must
+    # be allocated, and the default partition must emit the epilogue store.
+    # (Such a partition — load+MMA serialized in one WG — is the worst-ranked
+    # candidate, but the autotuner still needs it to lower correctly.)
     real_wg_ids = sorted(
-        {n.warp_group
-         for L in graph.loops
-         for n in L.schedule.nodes
-         if n.warp_group is not None and n.warp_group >= 0})
-    if inner_loop is None and not rctx.crossloop_channels and len(real_wg_ids) <= 1:
+        {
+            n.warp_group
+            for L in graph.loops
+            for n in L.schedule.nodes
+            if n.warp_group is not None and n.warp_group >= 0
+        }
+    )
+
+    def _is_tc_node(n: Node) -> bool:
+        op = graph.ops.get(n.op_ref) if n.op_ref else None
+        return op is not None and op.kind in (
+            "ttng.tc_gen5_mma",
+            "ttng.tc_gen5_mma_scaled",
+            "ttng.warp_group_dot",
+            "tt.dot",
+        )
+
+    has_tc = any(_is_tc_node(n) for L in graph.loops for n in L.schedule.nodes)
+    if (
+        inner_loop is None
+        and not rctx.crossloop_channels
+        and len(real_wg_ids) <= 1
+        and not has_tc
+    ):
         rctx.channels = []
         rctx.sem_set = None
         # M1 (store deferral): in the single-WG path, in-loop TMA stores use the
         # deferred-wait pattern so the store latency overlaps the next iteration's
         # load+compute instead of blocking. Scoped here so the WS path is intact.
         rctx.defer_inloop_store = True
-        wg_obj = (next((w for w in outer_loop.warp_groups if w.id == real_wg_ids[0]), None) if real_wg_ids else None)
+        wg_obj = (
+            next((w for w in outer_loop.warp_groups if w.id == real_wg_ids[0]), None)
+            if real_wg_ids
+            else None
+        )
         if wg_obj is not None:
             _emit_warp_group(graph, outer_loop, wg_obj, [], rctx, lines)
         return lines.render()
@@ -4400,39 +5053,59 @@ def emit(graph: ScheduleGraph) -> str:
         # hand-off, and per-loop iter_arg result channels). Keep the legacy
         # full+empty pair convention for these — they're emitted/consumed by
         # the legacy code paths in _emit_default_partition / _emit_warp_group.
-        if "acc_tmem" not in {c.name for c in channels}:
-            lines += (f"# acc_tmem: cross-region TC-loop → default-epilogue "
-                      f"hand-off, depth={rctx.tmem_count} (legacy carve-out)")
-            lines += (f"acc_tmem_full = tlx.alloc_barriers"
-                      f"(num_barriers={rctx.tmem_count}, arrive_count=1)")
-            lines += (f"acc_tmem_empty = tlx.alloc_barriers"
-                      f"(num_barriers={rctx.tmem_count}, arrive_count=1)")
+        if rctx.has_acc_tmem_handoff and "acc_tmem" not in {c.name for c in channels}:
+            lines += (
+                f"# acc_tmem: cross-region TC-loop → default-epilogue "
+                f"hand-off, depth={rctx.tmem_count} (legacy carve-out)"
+            )
+            lines += (
+                f"acc_tmem_full = tlx.alloc_barriers"
+                f"(num_barriers={rctx.tmem_count}, arrive_count=1)"
+            )
+            lines += (
+                f"acc_tmem_empty = tlx.alloc_barriers"
+                f"(num_barriers={rctx.tmem_count}, arrive_count=1)"
+            )
         # TMEM bridge channels (e.g., FA's softmax → P_tmem TMEM that the
         # PV MMA reads). Their full/empty barriers get emitted by the SW
         # producer block + consumer-side wait.
         for c in channels:
             if c.kind != "tmem" or not c.bridge_op_id:
                 continue
-            lines += (f"# {c.name}: TMEM bridge channel "
-                      f"(SW producer → MMA consumer via TMEM, depth={c.depth})")
-            lines += (f"{_bar_full(c.name)} = tlx.alloc_barriers"
-                      f"(num_barriers={c.depth}, arrive_count=1)")
-            lines += (f"{_bar_empty(c.name)} = tlx.alloc_barriers"
-                      f"(num_barriers={c.depth}, arrive_count=1)")
+            lines += (
+                f"# {c.name}: TMEM bridge channel "
+                f"(SW producer → MMA consumer via TMEM, depth={c.depth})"
+            )
+            lines += (
+                f"{_bar_full(c.name)} = tlx.alloc_barriers"
+                f"(num_barriers={c.depth}, arrive_count=1)"
+            )
+            lines += (
+                f"{_bar_empty(c.name)} = tlx.alloc_barriers"
+                f"(num_barriers={c.depth}, arrive_count=1)"
+            )
         # Function-scope per-tile-resident loads (e.g. FA's Q tile): one
         # mbarrier per load. Emitted by MEM-role WG, consumed by the WG
         # whose MMA reads the alloc.
         for fl in rctx.fn_scope_loads:
             lines += f"# {fl['alloc_var']}_full: per-tile resident load barrier"
-            lines += (f"{fl['alloc_var']}_full = tlx.alloc_barriers"
-                      f"(num_barriers=1, arrive_count=1)")
+            lines += (
+                f"{fl['alloc_var']}_full = tlx.alloc_barriers"
+                f"(num_barriers=1, arrive_count=1)"
+            )
         for name, depth in extra or []:
-            lines += (f"# {name}: legacy carve-out (cross-loop iter_arg or "
-                      f"intra-WG async load)")
-            lines += (f"{_bar_full(name)} = tlx.alloc_barriers"
-                      f"(num_barriers={depth}, arrive_count=1)")
-            lines += (f"{_bar_empty(name)} = tlx.alloc_barriers"
-                      f"(num_barriers={depth}, arrive_count=1)")
+            lines += (
+                f"# {name}: legacy carve-out (cross-loop iter_arg or "
+                f"intra-WG async load)"
+            )
+            lines += (
+                f"{_bar_full(name)} = tlx.alloc_barriers"
+                f"(num_barriers={depth}, arrive_count=1)"
+            )
+            lines += (
+                f"{_bar_empty(name)} = tlx.alloc_barriers"
+                f"(num_barriers={depth}, arrive_count=1)"
+            )
     else:
         # Function-scope per-tile-resident loads (e.g. FA's Q tile): one
         # mbarrier per load. Routed through `extra` so the legacy
@@ -4444,6 +5117,7 @@ def emit(graph: ScheduleGraph) -> str:
             channels,
             lines,
             tmem_count=rctx.tmem_count,
+            have_separate_tmem_handoff=rctx.has_acc_tmem_handoff,
             extra_buffers=extra_with_fnscope,
         )
     rctx.channels = channels
@@ -4454,10 +5128,17 @@ def emit(graph: ScheduleGraph) -> str:
     with lines.block("with tlx.async_tasks():"):
         for uwg in uwgs:
             # Reference Phase 4's plan so the role attribution is visible.
-            origin = (f"outer wg{uwg.outer_wg}" if uwg.outer_wg is not None else
-                      (f"inner wg{uwg.inner_wg}" if uwg.inner_wg is not None else "(none)"))
+            origin = (
+                f"outer wg{uwg.outer_wg}"
+                if uwg.outer_wg is not None
+                else (
+                    f"inner wg{uwg.inner_wg}" if uwg.inner_wg is not None else "(none)"
+                )
+            )
             lines += f"# Async task: role={uwg.role} ← {origin} (Phase 4 plan)"
             with lines.block(_task_header(uwg)):
-                _emit_uwg_body(graph, outer_loop, inner_loop, uwg, channels, rctx, lines)
+                _emit_uwg_body(
+                    graph, outer_loop, inner_loop, uwg, channels, rctx, lines
+                )
 
     return lines.render()
