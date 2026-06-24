@@ -38,8 +38,7 @@ using namespace mlir::triton::gpu;
 
 static SmallVector<unsigned>
 basesPerDimImpl(const LinearLayout::BasesT &namedBases, StringAttr dimName,
-                size_t rank, bool skipBroadcast = true,
-                ArrayRef<int32_t> outDimSizes = {});
+                size_t rank, bool skipBroadcast = true);
 
 // Utility
 namespace mlir {
@@ -319,13 +318,6 @@ SmallVector<int64_t> getAllocationShapePerCTA(Attribute layout,
       auto packedAxis = getOrder(sharedMMALayout, shapeLogical)[0];
       shape[packedAxis] *= 2;
     }
-    // For NPOT dims (e.g. M=144), nvmmaSharedToLinearLayout rounds to pow2
-    // internally. The allocation must cover the pow2-rounded size so MMA reps
-    // don't read past the buffer.
-    for (auto &d : shape) {
-      if (!llvm::isPowerOf2_64(d))
-        d = llvm::NextPowerOf2(d);
-    }
   }
   return getShapePerCTA(layout, shape);
 }
@@ -337,18 +329,6 @@ SmallVector<int64_t> getShapePerCTA(Type type) {
 
 SmallVector<int64_t> getAllocationShapePerCTA(Type type) {
   auto tensorType = cast<TensorOrMemDesc>(type);
-  // For a MemDescType, physical SMEM is sized by allocShape (take_back(rank)
-  // drops the leading multibuffer dim), which the Attribute overload then
-  // pow2-rounds for NVMMASharedEncodingAttr. Only NPOT allocShapes need this;
-  // pow2 keeps the parent getShape() path bit-for-bit (allocShape==shape for a
-  // LocalAllocOp, and pow2 subviews sized by getShape() pre-NPOT).
-  if (auto memDesc = dyn_cast<MemDescType>(type)) {
-    auto allocShape = memDesc.getAllocShape().take_back(memDesc.getRank());
-    bool npot = llvm::any_of(allocShape,
-                             [](int64_t d) { return !llvm::isPowerOf2_64(d); });
-    if (npot)
-      return getAllocationShapePerCTA(tensorType.getEncoding(), allocShape);
-  }
   return getAllocationShapePerCTA(tensorType.getEncoding(),
                                   tensorType.getShape());
 }
@@ -473,16 +453,14 @@ SmallVector<unsigned> CGAEncodingAttr::getCTAsPerCGA() const {
   const auto &ll = getLinearLayout();
   auto rank = ll.getNumOutDims();
   return basesPerDimImpl(ll.getBases(), StringAttr::get(getContext(), "block"),
-                         rank, /*skipBroadcast=*/false,
-                         llvm::to_vector(ll.getOutDimSizes()));
+                         rank, /*skipBroadcast=*/false);
 }
 
 SmallVector<unsigned> CGAEncodingAttr::getCTASplitNum() const {
   const auto &ll = getLinearLayout();
   auto rank = ll.getNumOutDims();
   return basesPerDimImpl(ll.getBases(), StringAttr::get(getContext(), "block"),
-                         rank, /*skipBroadcast=*/true,
-                         llvm::to_vector(ll.getOutDimSizes()));
+                         rank);
 }
 
 SmallVector<unsigned> CGAEncodingAttr::getCTAOrder() const {
@@ -975,19 +953,7 @@ LinearEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
   for (auto inDim : linearLayout.getInDimNames()) {
     withoutBroadcast = withoutBroadcast.removeZeroBasesAlongDim(inDim);
   }
-  // NPOT: Modular (non-power-of-2) layouts have pow2 input dims that map
-  // onto NPOT output dims via modular reduction, so
-  // getTotalInDimSize() > getTotalOutDimSizeProduct() by construction.
-  // isInvertible() requires these to be equal, which is only valid for pow2
-  // layouts. For modular layouts, surjectivity is the correct invariant:
-  // every output element must be covered, but the "dead" input values above
-  // the NPOT output size are expected to alias via urem wrapping.
-  if (withoutBroadcast.isModular()) {
-    if (!withoutBroadcast.isSurjective()) {
-      return emitError()
-             << "After removing the zero bases the layout must be surjective";
-    }
-  } else if (!withoutBroadcast.isInvertible()) {
+  if (!withoutBroadcast.isInvertible()) {
     return emitError()
            << "After removing the zero bases the layout must be bijective";
   }
@@ -1035,79 +1001,28 @@ Attribute LinearEncodingAttr::parse(AsmParser &parser, Type type) {
 
 static SmallVector<unsigned>
 basesPerDimImpl(const LinearLayout::BasesT &namedBases, StringAttr dimName,
-                size_t rank, bool skipBroadcast,
-                ArrayRef<int32_t> outDimSizes) {
+                size_t rank, bool skipBroadcast) {
   const auto &bases = namedBases.find(dimName)->second;
 
   if (bases.empty()) {
     return SmallVector<unsigned>(rank, 1);
   }
 
-  // Check if any output dim is NPOT and we should use exact counting.
-  bool hasNpotDim = false;
-  if (skipBroadcast && !outDimSizes.empty()) {
-    for (auto s : outDimSizes) {
-      if (!llvm::isPowerOf2_32(s)) {
-        hasNpotDim = true;
-        break;
-      }
-    }
-  }
-
-  if (!hasNpotDim) {
-    // Fast path: pow2 dims use XOR, each basis doubles the count.
-    SmallVector<unsigned> ret(rank, 1);
-    auto nonZero = [](auto val) { return val != 0; };
-    int nonZeroIdx = 0;
-    for (const auto &basis : bases) {
-      auto it = std::find_if(basis.begin(), basis.end(), nonZero);
-      if (it != basis.end()) {
-        nonZeroIdx = it - basis.begin();
-        ret[nonZeroIdx] *= 2;
-      } else if (!skipBroadcast) {
-        ret[nonZeroIdx] *= 2;
-      }
-    }
-    return ret;
-  }
-
-  // Enumerate all 2^k subsets per dimension, count unique values.
-  // Group bases by their non-zero output dimension.
-  SmallVector<SmallVector<int32_t>> dimBases(rank);
-  for (const auto &basis : bases) {
-    for (size_t d = 0; d < rank; ++d) {
-      if (basis[d] != 0) {
-        dimBases[d].push_back(basis[d]);
-        break; // Each basis has at most one non-zero element.
-      }
-    }
-  }
-
   SmallVector<unsigned> ret(rank, 1);
-  for (size_t d = 0; d < rank; ++d) {
-    if (dimBases[d].empty())
-      continue;
-    unsigned k = dimBases[d].size();
-    int32_t dimSize = outDimSizes[d];
-    if (llvm::isPowerOf2_32(dimSize)) {
-      // Pow2 dim: XOR never collides, count is 2^k.
-      ret[d] = 1u << k;
-    } else {
-      // Enumerate subset sums mod dimSize.
-      SmallVector<bool> seen(dimSize, false);
-      unsigned numSubsets = 1u << k;
-      for (unsigned mask = 0; mask < numSubsets; ++mask) {
-        int32_t val = 0;
-        for (unsigned b = 0; b < k; ++b) {
-          if (mask & (1u << b))
-            val = (val + dimBases[d][b]) % dimSize;
-        }
-        seen[val] = true;
-      }
-      unsigned count = 0;
-      for (bool s : seen)
-        count += s;
-      ret[d] = count;
+  auto nonZero = [](auto val) { return val != 0; };
+  int nonZeroIdx = 0;
+  for (const auto &basis : bases) {
+    auto it = std::find_if(basis.begin(), basis.end(), nonZero);
+    // Bases can have one or zero non-zero elements
+    // Skip a basis if it's broadcasting (all zeros)
+    // e.g. warps for DotOperandEncodingAttr (see ampereDotToLinearLayout)
+    if (it != basis.end()) {
+      nonZeroIdx = it - basis.begin();
+      ret[nonZeroIdx] *= 2;
+    } else if (!skipBroadcast) {
+      // If we've seen a non-zero basis, we double the size of the previous dim
+      // This is just needed to count the CTAsPerCGA
+      ret[nonZeroIdx] *= 2;
     }
   }
   return ret;
@@ -1117,8 +1032,7 @@ SmallVector<unsigned>
 LinearEncodingAttr::basesPerDim(StringAttr dimName, bool skipBroadcast) const {
   const auto &ll = getLinearLayout();
   auto rank = ll.getNumOutDims();
-  return basesPerDimImpl(ll.getBases(), dimName, rank, skipBroadcast,
-                         llvm::to_vector(ll.getOutDimSizes()));
+  return basesPerDimImpl(ll.getBases(), dimName, rank, skipBroadcast);
 }
 
 CGAEncodingAttr linearToCGAEncodingAttr(const LinearLayout &ll,
@@ -1219,8 +1133,7 @@ SmallVector<unsigned> LinearEncodingAttr::getSizePerThread() const {
     ctaShape[dim] /= 2;
     registers.pop_back();
   }
-  return basesPerDimImpl(bases, kRegister, rank, /*skipBroadcast=*/true,
-                         llvm::to_vector(ll.getOutDimSizes()));
+  return basesPerDimImpl(bases, kRegister, rank);
 }
 
 SmallVector<unsigned> LinearEncodingAttr::getOrder() const {
@@ -1804,15 +1717,7 @@ SharedLinearEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
   LinearLayout withoutBroadcast =
       linearLayout.removeZeroBasesAlongDim(kOffset).removeZeroBasesAlongDim(
           kBlock);
-  // NPOT: Same modular-layout guard as LinearEncodingAttr::verify.
-  // Modular layouts are surjective but not bijective (pow2 input > NPOT
-  // output).
-  if (withoutBroadcast.isModular()) {
-    if (!withoutBroadcast.isSurjective()) {
-      return emitError()
-             << "After removing the zero bases the layout must be surjective";
-    }
-  } else if (!withoutBroadcast.isInvertible()) {
+  if (!withoutBroadcast.isInvertible()) {
     return emitError()
            << "After removing the zero bases the layout must be bijective";
   }
@@ -1896,8 +1801,7 @@ SharedLinearEncodingAttr::basesPerDim(StringAttr dimName,
                                       bool skipBroadcast) const {
   const auto &ll = getLinearLayout();
   auto rank = ll.getNumOutDims();
-  return basesPerDimImpl(ll.getBases(), dimName, rank, skipBroadcast,
-                         llvm::to_vector(ll.getOutDimSizes()));
+  return basesPerDimImpl(ll.getBases(), dimName, rank, skipBroadcast);
 }
 
 SmallVector<unsigned>
@@ -2000,10 +1904,10 @@ LogicalResult PartitionedSharedEncodingAttr::verify(
     function_ref<InFlightDiagnostic()> emitError, unsigned numPartitions,
     unsigned numGroups, unsigned partitionDim,
     SharedEncodingTrait partitionLayout) {
-  // Check numPartitions is a power of 2 and > 0
-  if (numPartitions == 0 || !llvm::isPowerOf2_32(numPartitions))
-    return emitError()
-           << "numPartitions must be a power of 2 and greater than 0";
+  // Check numPartitions is a power of 2 and >= 2
+  // (numPartitions == 1 is just the inner layout, use that directly instead)
+  if (numPartitions < 2 || !llvm::isPowerOf2_32(numPartitions))
+    return emitError() << "numPartitions must be a power of 2 and at least 2";
 
   // Check numGroups is a power of 2 and > 0
   if (numGroups == 0 || !llvm::isPowerOf2_32(numGroups))
@@ -2257,8 +2161,7 @@ PaddedSharedEncodingAttr::basesPerDim(StringAttr dimName,
                                       bool skipBroadcast) const {
   const auto &ll = getLinearComponent();
   auto rank = ll.getNumOutDims();
-  return basesPerDimImpl(ll.getBases(), dimName, rank, skipBroadcast,
-                         llvm::to_vector(ll.getOutDimSizes()));
+  return basesPerDimImpl(ll.getBases(), dimName, rank, skipBroadcast);
 }
 
 int64_t PaddedSharedEncodingAttr::getPaddedSize(ArrayRef<int64_t> shape) const {
@@ -2657,8 +2560,7 @@ NvidiaMmaEncodingAttr::getRepForOperand(ArrayRef<int64_t> shape, int bitwidth,
     numRep.push_back(1);
   }
   for (auto [s, size, warp] : llvm::zip(shape, tileSize, warpsPerCTA)) {
-    numRep.push_back(
-        std::max<int64_t>(1, mlir::ceil(s, (int64_t)(size * warp))));
+    numRep.push_back(std::max<int64_t>(1, s / (size * warp)));
   }
   return numRep;
 }
@@ -3537,11 +3439,8 @@ struct TritonGPUVerifyTensorLayoutInterface
       return makeErr() << "Layout has rank " << rank
                        << ", but the tensor it's attached to has rank "
                        << rankedTy.getRank() << ".";
-    static const bool allowNpot =
-        triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
-    if (!allowNpot && llvm::any_of(rankedTy.getShape(), [](int64_t i) {
-          return !llvm::isPowerOf2_64(i);
-        })) {
+    if (llvm::any_of(rankedTy.getShape(),
+                     [](int64_t i) { return !llvm::isPowerOf2_64(i); })) {
       return makeErr() << "Layout has shape " << rankedTy.getShape()
                        << ", but the tensor it's attached to has shape "
                        << rankedTy.getShape()
@@ -3593,14 +3492,12 @@ struct TritonGPUVerifyTensorLayoutInterface
 
     auto kBlock = StringAttr::get(op->getContext(), "block");
     int nCTAsLayout;
-    int64_t tensorSize = 1;
+    int tensorSize = 1;
     int tensorRank = 0;
     if (auto sharedLinearEnc = dyn_cast<SharedLinearEncodingAttr>(layout)) {
       const auto &ll = sharedLinearEnc.getLinearLayout();
       nCTAsLayout = ll.getInDimSize(kBlock);
-      // NPOT: use getTotalOutDimSizeProduct() to handle modular layouts
-      // where out dim sizes may be non-power-of-2.
-      tensorSize = ll.getTotalOutDimSizeProduct();
+      tensorSize = ll.getTotalOutDimSize();
       tensorRank = ll.getNumOutDims();
     } else {
       // It'd be nice to be able to do toLinearLayout, but the multibuffering
@@ -3781,7 +3678,7 @@ std::string mlir::triton::gpu::getDistributedLayoutStr(LinearLayout &ll,
   StringAttr kWarp = StringAttr::get(ctx, "warp");
   StringAttr kBlock = StringAttr::get(ctx, "block");
 
-  int64_t tensorSize = ll.getTotalOutDimSizeProduct();
+  int64_t tensorSize = ll.getTotalOutDimSize();
   std::vector<std::string> elementMapping(tensorSize);
   std::vector<std::string> threadMapping;
   auto shape = convertType<int64_t>(llvm::to_vector(ll.getOutDimSizes()));
@@ -4472,4 +4369,22 @@ std::optional<int> triton::gpu::getWarpSpecializeTag(Operation *op) {
     return cast<IntegerAttr>(op->getAttr(kWarpSpecializeTagAttrName)).getInt();
   }
   return std::nullopt;
+}
+
+PaddedSharedEncodingAttr triton::gpu::getPaddedEncoding(Attribute encoding) {
+  if (auto padded = dyn_cast<PaddedSharedEncodingAttr>(encoding))
+    return padded;
+  if (auto partitioned = dyn_cast<PartitionedSharedEncodingAttr>(encoding))
+    return dyn_cast<PaddedSharedEncodingAttr>(partitioned.getPartitionLayout());
+  return nullptr;
+}
+
+bool triton::gpu::isPaddedEncoding(Attribute encoding) {
+  return getPaddedEncoding(encoding) != nullptr;
+}
+
+unsigned triton::gpu::getMinInterval(Attribute encoding) {
+  auto padded = getPaddedEncoding(encoding);
+  assert(padded && "expected padded encoding or partitioned wrapping padded");
+  return padded.getMinInterval();
 }

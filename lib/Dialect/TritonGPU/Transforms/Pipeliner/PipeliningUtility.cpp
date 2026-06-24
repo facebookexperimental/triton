@@ -295,7 +295,15 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     return op;
   }
   // Ops without a built-in pred operand: wrap in scf.if.
-  if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::TMAStoreTokenWaitOp>(op)) {
+  //
+  // The TMA "store" family (copy local->global, reduce, scatter) all write to
+  // global memory but have no mask/pred operand, so they cannot be masked in
+  // place. They must be predicated when the pipeliner peels prologue/epilogue
+  // iterations of a dynamic loop: executing a store/reduce/scatter for an
+  // iteration past the real trip count would corrupt the output (e.g. a
+  // spurious atomic add for a TMA reduce). Guard them with scf.if(pred).
+  if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp,
+          ttng::AsyncTMAScatterOp, ttng::TMAStoreTokenWaitOp>(op)) {
     rewriter.setInsertionPoint(op);
     bool hasResults = op->getNumResults() > 0;
     auto ifOp =
@@ -594,19 +602,9 @@ mlir::triton::getMultiBufferedType(ttg::MemDescType memDescType,
   auto shape = memDescType.getShape();
   SmallVector<int64_t> bufferShape(shape.begin(), shape.end());
   bufferShape.insert(bufferShape.begin(), depth);
-  // Reduce allocShape to the buffer rank before prepending the multibuffer
-  // depth. getBufferViewType drops shape's leading dim but not allocShape, so a
-  // single-buffer view can arrive with allocShape rank > shape rank; prepending
-  // depth onto that yields a rank-(N+1) allocShape on a rank-N type, which
-  // trips MemDescIndexOp::verify ("memdesc_index of a memdesc_index"). For NPOT
-  // tiles allocShape has the SAME rank as shape, so take_back is a no-op (NPOT
-  // pow2 rounding preserved).
-  auto allocShape = memDescType.getAllocShape().take_back(shape.size());
-  SmallVector<int64_t> bufferAllocShape(allocShape.begin(), allocShape.end());
-  bufferAllocShape.insert(bufferAllocShape.begin(), depth);
   return ttg::MemDescType::get(
       bufferShape, memDescType.getElementType(), memDescType.getEncoding(),
-      memDescType.getMemorySpace(), /*mutableMemory*/ true, bufferAllocShape);
+      memDescType.getMemorySpace(), /*mutableMemory*/ true);
 }
 
 ttg::SharedEncodingTrait mlir::triton::getSharedEncoding(RankedTensorType ty) {

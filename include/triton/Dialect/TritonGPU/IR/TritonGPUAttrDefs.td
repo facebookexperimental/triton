@@ -906,12 +906,7 @@ for
       // starting from the contiguous dimension
       for (unsigned d = 0; d < rank - 1; ++d) {
         unsigned i = order[d];
-        unsigned dimSize = std::max<unsigned>(1, shapePerCTA[i] / sizePerThread[i]);
-        // Round the inner-dim bound DOWN to pow2: rounding up would map threads
-        // past the data; leftover lanes/warps/CTAs go to the last dim, so
-        // coverage holds. (Verifier also requires pow2 threadsPerWarp/warpsPerCTA.)
-        unsigned dimSizePow2 = 1u << llvm::Log2_32(dimSize);
-        unsigned threadsPerCTA = std::clamp<unsigned>(remainingThreads, 1, dimSizePow2);
+        unsigned threadsPerCTA = std::clamp<unsigned>(remainingThreads, 1, std::max<unsigned>(1, shapePerCTA[i] / sizePerThread[i]));
         threadsPerWarp[i] = std::clamp<unsigned>(threadsPerCTA, 1, remainingLanes);
         warpsPerCTA[i] = std::clamp<unsigned>(threadsPerCTA / threadsPerWarp[i], 1, remainingWarps);
         remainingWarps /= warpsPerCTA[i];
@@ -944,9 +939,7 @@ for
       // starting from the most strided dimension
       for (int d = rank - 1; d >= 0; --d) {
         unsigned i = order[d];
-        unsigned ctaDimSize = std::max<unsigned>(1, shape[i] / sizePerThread[i]);
-        unsigned ctaDimSizePow2 = 1u << llvm::Log2_32(ctaDimSize);
-        CTAsPerCGA[i] = std::clamp<unsigned>(remainingCTAs, 1, ctaDimSizePow2);
+        CTAsPerCGA[i] = std::clamp<unsigned>(remainingCTAs, 1, std::max<unsigned>(1, shape[i] / sizePerThread[i]));
         CTASplitNum[i] = CTAsPerCGA[i];
         remainingCTAs /= CTAsPerCGA[i];
       }

@@ -36,6 +36,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/TensorMemoryUtils.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOpInterfaces.cpp.inc"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+#include "triton/Tools/StrUtil.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
 
@@ -71,7 +72,7 @@ LogicalResult MapToRemoteBufferOp::verify() {
 // -- WarpGroupDotOp --
 LogicalResult WarpGroupDotOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
     SmallVectorImpl<Type> &inferredReturnTypes) {
   // type is the same as the accumulator
   auto accTy = cast<RankedTensorType>(operands[2].getType());
@@ -178,7 +179,7 @@ bool WarpGroupDotOp::verifyDims() {
 // -- WarpGroupDotWaitOp --
 LogicalResult WarpGroupDotWaitOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
     SmallVectorImpl<Type> &inferredReturnTypes) {
   for (Value operand : operands)
     inferredReturnTypes.push_back(operand.getType());
@@ -1035,6 +1036,9 @@ static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,
                                        MemDescType memdesc, StringRef regName) {
   if (type.getRank() != 2)
     return op->emitOpError(regName) << " must be a 2D tensor";
+  if (tlx::hasNoVerifyLayout(type.getEncoding()) ||
+      tlx::hasNoVerifyLayout(memdesc.getEncoding()))
+    return success();
   // Skip verification for placeholder layouts - they will be resolved later
   if (isa<triton::tlx::DummyTMEMLayoutAttr>(memdesc.getEncoding()))
     return success();
@@ -1605,6 +1609,30 @@ LogicalResult TensormapCreateOp::verify() {
            << getElementStride().size() << " but expected " << rank;
   }
   return success();
+}
+
+// -- CLCTryCancelOp --
+static LogicalResult verifyCLCResultMemdesc(Location loc, MemDescType desc) {
+  auto int_ty = dyn_cast<IntegerType>(desc.getElementType());
+  if (!int_ty || int_ty.getWidth() != 64) {
+    return emitError(loc)
+           << "Expected CLC result buffer to have type int64, but got"
+           << desc.getElementType();
+  }
+  if (desc.getShape().size() != 1 || desc.getShape()[0] != 2) {
+    return emitError(loc)
+           << "Expected CLC result buffer to have shape [2], but got ["
+           << triton::join(desc.getShape(), ", ") << "]";
+  }
+  return success();
+}
+
+LogicalResult CLCTryCancelOp::verify() {
+  return verifyCLCResultMemdesc(getLoc(), getResult().getType());
+}
+
+LogicalResult CLCLoadResultOp::verify() {
+  return verifyCLCResultMemdesc(getLoc(), getSrc().getType());
 }
 
 } // namespace nvidia_gpu

@@ -35,7 +35,8 @@
 
 namespace mlir::triton::amd {
 struct L2Cache : public SideEffects::Resource::Base<L2Cache> {
-  StringRef getName() final { return "<AMDGPU::L2Cache>"; }
+  StringRef getName() const final { return "<AMDGPU::L2Cache>"; }
+  SideEffects::Resource *getParent() const override { return nullptr; }
 };
 } // namespace mlir::triton::amd
 

@@ -9,11 +9,16 @@
 // CHECK-LABEL: @swap_transposed_alloc
 //
 // After buffer allocation, the dsT alloc is swapped to non-transposed #shared
-// layout and hoisted above the loop.
+// layout and hoisted above the loop. The first two allocs are the original
+// k_smem/q_smem buffers; dsT remains after them because hoisting preserves
+// producer order.
+// CHECK: ttg.local_alloc : () -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
+// CHECK: ttg.local_alloc : () -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
 // CHECK: %[[B0:.*]] = ttg.local_alloc : () -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
 //
 // Inside the loop, memdesc_trans goes from #shared (non-transposed) to #shared1
 // (transposed), confirming the swap happened:
+// CHECK: ttg.local_store {{.*}}, %[[B0]]
 // CHECK: gen5_mma %[[B0]]
 // CHECK: %[[T0:.*]] = ttg.memdesc_trans %[[B0]]{{.*}} !ttg.memdesc<128x128xbf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xbf16, #shared1, #smem, mutable>
 // CHECK: gen5_mma %[[T0]]

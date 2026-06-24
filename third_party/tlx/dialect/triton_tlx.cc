@@ -5,6 +5,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "passes.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "tlx/dialect/include/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -22,6 +23,23 @@ namespace ttg = triton::gpu;
 namespace ttng = triton::nvidia_gpu;
 namespace tlx = triton::tlx;
 namespace amdgpu = triton::amdgpu;
+namespace ttag = triton::amdgpu;
+
+// Construct a CGAEncodingAttr from legacy (CTAsPerCGA, CTASplitNum, CTAOrder)
+// params. The single-CTA case must go through get1CTALayout: feeding all-1
+// params to CGAEncodingAttr::fromSplitParams builds a layout whose out-dims
+// don't survive transposeOuts, tripping a fatal LinearLayout assert.
+static ttg::CGAEncodingAttr makeCGALayout(mlir::MLIRContext *ctx,
+                                          llvm::ArrayRef<unsigned> CTAsPerCGA,
+                                          llvm::ArrayRef<unsigned> CTASplitNum,
+                                          llvm::ArrayRef<unsigned> CTAOrder) {
+  unsigned rank = CTAsPerCGA.size();
+  bool isSingleCTA = llvm::all_of(CTAsPerCGA, [](unsigned c) { return c == 1; });
+  if (isSingleCTA)
+    return ttg::CGAEncodingAttr::get1CTALayout(ctx, rank);
+  return ttg::CGAEncodingAttr::fromSplitParams(ctx, CTAsPerCGA, CTASplitNum,
+                                               CTAOrder);
+}
 
 void init_triton_tlx_ir(py::module &&m) {
   auto *builder_cls = ir::getBuilderClass();
@@ -167,7 +185,7 @@ void init_triton_tlx_ir(py::module &&m) {
              assert(order.size() == CTASplitNum.size() && "shape mismatch");
              assert(order.size() == CTAOrder.size() && "shape mismatch");
              auto context = self.getBuilder().getContext();
-             auto CTALayout = ttg::CGAEncodingAttr::fromSplitParams(
+             auto CTALayout = makeCGALayout(
                  context, CTAsPerCGA, CTASplitNum, CTAOrder);
              return mlir::cast<Attribute>(ttg::SwizzledSharedEncodingAttr::get(
                  context, vectorSize, perPhase, maxPhase, order, CTALayout));
@@ -187,7 +205,7 @@ void init_triton_tlx_ir(py::module &&m) {
              intervalPads.reserve(intervals.size());
              for (auto [i, p] : llvm::zip(intervals, paddings))
                intervalPads.emplace_back(i, p);
-             auto CTALayout = ttg::CGAEncodingAttr::fromSplitParams(
+             auto CTALayout = makeCGALayout(
                  context, CTAsPerCGA, CTASplitNum, CTAOrder);
              return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
                  context, intervalPads, order, shape, CTALayout));
@@ -223,7 +241,7 @@ void init_triton_tlx_ir(py::module &&m) {
              /* Validation logic for user defined layout encoding end */
 
              auto context = self.getBuilder().getContext();
-             auto CTALayout = ttg::CGAEncodingAttr::fromSplitParams(
+             auto CTALayout = makeCGALayout(
                  context, CTAsPerCGA, CTASplitNum, CTAOrder);
              if (swizzled) {
                return mlir::cast<Attribute>(ttg::NVMMASharedEncodingAttr::get(
@@ -256,7 +274,7 @@ void init_triton_tlx_ir(py::module &&m) {
              SmallVector<unsigned, 2> CTAsPerCGA = {1, 1};
              SmallVector<unsigned, 2> CTASplitNum = {1, 1};
              SmallVector<unsigned, 2> CTAOrder = {1, 0};
-             auto CTALayout = ttg::CGAEncodingAttr::fromSplitParams(
+             auto CTALayout = makeCGALayout(
                  context, CTAsPerCGA, CTASplitNum, CTAOrder);
              return tlx::wrapNoVerifyLayout(mlir::cast<Attribute>(
                  ttg::NvidiaMmaEncodingAttr::get(context, versionMajor,
@@ -977,6 +995,36 @@ void init_triton_tlx_ir(py::module &&m) {
              return self.create<tt::MakeTensorDescOp>(
                  base, shape, strides, descPtr, tensorShape, isSignedInteger,
                  paddingOption);
+           })
+      // AMD buffer ops
+      .def("create_buffer_load",
+           [](TritonOpBuilder &self, Value ptr, Value offsets,
+              std::optional<Value> mask, std::optional<Value> other,
+              tt::CacheModifier cache) -> Value {
+             auto offsetsType = cast<RankedTensorType>(offsets.getType());
+             auto ptrType = cast<tt::PointerType>(ptr.getType());
+             auto resultType = RankedTensorType::get(offsetsType.getShape(),
+                                                     ptrType.getPointeeType(),
+                                                     offsetsType.getEncoding());
+             return self.create<ttag::BufferLoadOp>(
+                 resultType, ptr, offsets, Value() /*stride*/, cache,
+                 mask.value_or(Value()), other.value_or(Value()));
+           })
+      .def("create_buffer_store",
+           [](TritonOpBuilder &self, Value storedValue, Value ptr,
+              Value offsets, std::optional<Value> mask,
+              tt::CacheModifier cache) {
+             self.create<ttag::BufferStoreOp>(storedValue, ptr, offsets,
+                                              Value() /*stride*/, cache,
+                                              mask.value_or(Value()));
+           })
+      .def("create_buffer_load_to_local",
+           [](TritonOpBuilder &self, Value dest, Value ptr, Value offsets,
+              std::optional<Value> mask, std::optional<Value> other,
+              tt::CacheModifier cache) -> Value {
+             return self.create<ttag::BufferLoadToLocalOp>(
+                 dest, ptr, offsets, mask.value_or(Value()),
+                 other.value_or(Value()), Value() /*stride*/, cache);
            });
 }
 
@@ -1014,6 +1062,7 @@ void init_triton_tlx(py::module &&m) {
   m.def("load_dialects", [](mlir::MLIRContext &context) {
     mlir::DialectRegistry registry;
     registry.insert<mlir::triton::tlx::TLXDialect>();
+    registry.insert<ttag::TritonAMDGPUDialect>();
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
   });

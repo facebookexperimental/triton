@@ -33,7 +33,8 @@ namespace {
 
 bool isAsyncProxyWrite(Operation *op) {
   return isa<triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp,
-             triton::nvidia_gpu::AsyncTMAGatherOp>(op);
+             triton::nvidia_gpu::AsyncTMAGatherOp,
+             triton::nvidia_gpu::CLCTryCancelOp>(op);
 }
 
 Value getSmemDest(Operation *op) {
@@ -44,6 +45,9 @@ Value getSmemDest(Operation *op) {
   if (auto asyncTMAGatherOp =
           dyn_cast<triton::nvidia_gpu::AsyncTMAGatherOp>(op)) {
     return asyncTMAGatherOp.getResult();
+  }
+  if (auto clcTryCancelOp = dyn_cast<triton::nvidia_gpu::CLCTryCancelOp>(op)) {
+    return clcTryCancelOp.getResult();
   }
   return Value();
 }
