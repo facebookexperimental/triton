@@ -2290,6 +2290,110 @@ enumerateClusterPartitions(int numClusters) {
   return result;
 }
 
+/// True iff `op` produces a *register* tensor value via COMPUTE (arith / math /
+/// reduce / convert / select etc.) — i.e. a value that, when it crosses a WG
+/// boundary, must be staged through SMEM (register→SMEM→register).
+///
+/// Residency-aware, lowering-aware (the subtle part):
+///  - Loads (`tt.load`, `descriptor_load`, `descriptor_gather`) ALSO produce a
+///    register-typed result, but they are SMEM-destined: they lower to TMA
+///    (global→SMEM) and the consumer/MMA reads SMEM directly. No round-trip —
+///    even though they're not lowered yet at schedule time. EXCLUDED.
+///  - tcgen05 MMA (→TMEM) and TMEM copies operate on memdesc and yield an async
+///    token / no value — never a register tensor. EXCLUDED explicitly so a
+///    future tensor-typed result can't be miscounted.
+///  - Pointer-element tensors (`!tt.ptr<...>`) must not be split across WGs (the
+///    partition scheduler can't form a pointer cross-WG channel), so they never
+///    incur a register round-trip. EXCLUDED. See partition-scheduler-bugs.md.
+/// Net: only genuine register compute chains (the FA softmax `subf→exp2`) count;
+/// GEMM/wgrad cross-WG edges (all load/MMA) score zero.
+static bool isRegisterComputeValue(Operation *op) {
+  if (!op || op->getNumResults() == 0)
+    return false;
+  if (isa<tt::LoadOp, tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op))
+    return false; // SMEM-destined (TMA), not a register round-trip
+  if (isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp, ttng::TMEMCopyOp>(op))
+    return false; // TMEM/memdesc ops, token/void result — not registers
+  auto rtt = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+  if (!rtt)
+    return false;
+  if (isa<tt::PointerType>(rtt.getElementType()))
+    return false; // pointer tensors aren't cross-WG channelable
+  return true;
+}
+
+/// Element count of `op`'s (register) result tensor; 0 if not static/ranked.
+static int64_t registerTensorElems(Operation *op) {
+  auto rtt = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+  if (!rtt)
+    return 0;
+  int64_t e = 1;
+  for (auto d : rtt.getShape()) {
+    if (d <= 0 || ShapedType::isDynamic(d))
+      return 0;
+    e *= d;
+  }
+  return e;
+}
+
+/// Cycles to move `elems` register elements to/from SMEM — matches the
+/// LatencyModel's LocalLoad/LocalStore base `scaleByElements(105, elems)` with
+/// the 16384-elem (128x128) reference.
+static int smemMoveCost(int64_t elems) {
+  return static_cast<int>(105.0 * static_cast<double>(elems) / 16384.0);
+}
+
+/// Cross-WG handshake round-trip LATENCY (cycles) for a register→SMEM→register
+/// hop: the consumer WG's WaitBarrier blocks until the producer's store is
+/// visible and its ArriveBarrier fires, then the consumer loads back from SMEM.
+/// This is a *latency* stall (the consumer cannot proceed), dominated by the
+/// cross-WG mbarrier signal+wait round-trip plus SMEM store/load availability —
+/// NOT the cheap barrier *issue* occupancy (`kBarrierOverhead`). Sized from the
+/// FA-fwd softmax-cut measurement: the SMEM-move occupancy alone (~110 cyc)
+/// failed to de-rank the split partition, while charging the full handshake
+/// latency (~550 cyc here) flips it to the unified partition that measures
+/// ~2.5x faster on B200.
+constexpr int kCrossWGRoundTripLatency = 500;
+
+/// Accumulate the register→SMEM→register round-trip LATENCY (cycles) per WG for
+/// cross-WG edges that CUT A REGISTER COMPUTE CHAIN. The synthesized
+/// `local_store`/`local_load` + handshake do NOT exist at scoring time
+/// (`insertCrossGroupBarriers` adds them later), so the per-WG makespan misses
+/// the per-iteration stall a split inflicts on a serial chain (the FA softmax).
+///
+/// Charged ONLY when BOTH endpoints are register-compute ops (the genuine
+/// reg→SMEM→reg round-trip the consumer stalls on). Loads (→TMA/SMEM), MMA
+/// (→TMEM), and stores are excluded — their cross-WG values are SMEM/TMEM
+/// resident, not a register hand-off, and (being unavoidable) are present in
+/// every candidate anyway. Net: zero for GEMM/LayerNorm/wgrad partitions; only
+/// a CUDA-chain cut (FA softmax) pays.
+static void accumulateCrossWGRoundTrip(
+    const ttg::ScheduleLoop &loop,
+    const llvm::SmallDenseMap<unsigned, int> &nodeToWg,
+    llvm::SmallDenseMap<int, int> &rtPerWg) {
+  for (const auto &edge : loop.edges) {
+    auto sIt = nodeToWg.find(edge.srcId);
+    auto dIt = nodeToWg.find(edge.dstId);
+    if (sIt == nodeToWg.end() || dIt == nodeToWg.end())
+      continue;
+    if (sIt->second == dIt->second)
+      continue; // same WG: stays in registers, no staging
+    const auto &sN = loop.nodes[edge.srcId];
+    // Only a register-compute → register-compute hop is a real round-trip the
+    // consumer stalls on. Excludes loads/MMA/TMA/stores (SMEM/TMEM resident).
+    if (!isRegisterComputeValue(sN.op) ||
+        !isRegisterComputeValue(loop.nodes[edge.dstId].op))
+      continue;
+    int64_t elems = registerTensorElems(sN.op);
+    if (elems <= 0)
+      continue;
+    int freq = std::max(sN.frequencyMultiplier, 1);
+    // Consumer eats the full handshake latency + SMEM load occupancy, per iter.
+    int rt = kCrossWGRoundTripLatency + smemMoveCost(elems);
+    rtPerWg[dIt->second] += rt * freq;
+  }
+}
+
 static ScoredCandidate scoreCandidate(const ClusterAssignment &assn,
                                       const SmallVector<OpCluster> &clusters,
                                       const ttg::ScheduleLoop &loop,
@@ -2309,13 +2413,18 @@ static ScoredCandidate scoreCandidate(const ClusterAssignment &assn,
   // Each WG's makespan now depends on its chosen warp count: ops with
   // minWarps=4 (SFU/CUDA tile) cost more if the WG only gets 1 warp.
   // Layer C: also accumulate per-WG register footprint.
+  // Cross-WG register round-trip cost per WG (see accumulateCrossWGRoundTrip).
+  llvm::SmallDenseMap<int, int> rtPerWg;
+  accumulateCrossWGRoundTrip(loop, nodeToWg, rtPerWg);
+
   int bottleneck = 0;
   int totalRegs = kDefaultWGFootprint; // include implicit "default" WG
   for (auto &[wgId, nodes] : wgToNodes) {
     int wgWarps = wgRequiredWarps(nodes, loop);
     int ms = computeMultiPipelineMakespan(nodes, loop, wgWarps);
     int barCost = computeWGBarrierCost(nodes, loop, nodeToWg, wgId);
-    int wgCost = ms + barCost;
+    int rtCost = rtPerWg.lookup(wgId);
+    int wgCost = ms + barCost + rtCost;
     int fp = wgFootprint(wgWarps);
     totalRegs += fp;
     if (verbose) {
@@ -2328,7 +2437,7 @@ static ScoredCandidate scoreCandidate(const ClusterAssignment &assn,
         }
         llvm::dbgs() << "] warps=" << wgWarps << " regs=" << fp
                      << " makespan=" << ms << " barCost=" << barCost
-                     << " wgCost=" << wgCost << "\n";
+                     << " rtCost=" << rtCost << " wgCost=" << wgCost << "\n";
       });
     }
     bottleneck = std::max(bottleneck, wgCost);
@@ -2468,13 +2577,16 @@ static double evalGreedyCost(const SmallVector<GreedyWG> &wgs,
     for (unsigned nid : wgs[wgi].nodeIds)
       nodeToWg[nid] = static_cast<int>(wgi);
   }
+  llvm::SmallDenseMap<int, int> rtPerWg;
+  accumulateCrossWGRoundTrip(loop, nodeToWg, rtPerWg);
   int bottleneck = 0;
   for (unsigned wgi = 0; wgi < wgs.size(); ++wgi) {
     int wgWarps = wgRequiredWarps(wgs[wgi].nodeIds, loop);
     int ms = computeMultiPipelineMakespan(wgs[wgi].nodeIds, loop, wgWarps);
     int barCost = computeWGBarrierCost(wgs[wgi].nodeIds, loop, nodeToWg,
                                        static_cast<int>(wgi));
-    bottleneck = std::max(bottleneck, ms + barCost);
+    bottleneck = std::max(bottleneck,
+                          ms + barCost + rtPerWg.lookup(static_cast<int>(wgi)));
     totalRegs += wgFootprint(wgWarps);
   }
   int deficit = std::max(0, totalRegs - kBlackwellSMRegs);
@@ -2634,6 +2746,19 @@ static void partitionExhaustive(ttg::ScheduleLoop &loop) {
     // Single cluster (or none): one WG, set everything to wg0.
     for (auto &node : loop.nodes)
       node.warpGroup = (node.pipeline == ttg::HWPipeline::NONE) ? -1 : 0;
+    // For the top-N autotuning dump, record this fixed single partition so the
+    // variant assembler treats this loop as "1 candidate, held fixed across
+    // variants" rather than "0 candidates" — otherwise a single-cluster sibling
+    // loop (e.g. an epilogue) would zero out the whole multi-variant dump.
+    loop.topPartitions.clear();
+    loop.topPartitionCosts.clear();
+    if (getDumpTopN() > 1) {
+      SmallVector<int> nodeWG(loop.nodes.size(), -1);
+      for (auto &node : loop.nodes)
+        nodeWG[node.id] = node.warpGroup;
+      loop.topPartitions.push_back(std::move(nodeWG));
+      loop.topPartitionCosts.push_back(loop.partitionCost);
+    }
     return;
   }
 
@@ -4497,20 +4622,26 @@ struct ModuloSchedulePass
         // How many variants we can actually produce: the min over schedulable
         // loops of available candidate partitions. Loops that fell back to
         // greedy or had < 2 clusters contribute no alternatives.
-        size_t numVariants = static_cast<size_t>(topN);
-        bool sawSchedulable = false;
+        // Variant count = MAX over schedulable loops of available candidate
+        // partitions (capped at topN). A loop with a single fixed partition
+        // (e.g. <2 clusters) is held fixed across variants via index clamping
+        // below, so it no longer caps the dump. If a loop went to greedy and
+        // recorded no partition, we can't safely build alternatives → fall back
+        // to a single (committed-winner) variant.
+        size_t maxAvail = 0;
+        bool sawSchedulable = false, anyEmpty = false;
         for (auto &sl : scheduledLoops)
           for (auto &schedLoop : sl.graph.loops)
             if (schedLoop.II > 0) {
               sawSchedulable = true;
-              numVariants =
-                  std::min(numVariants, schedLoop.topPartitions.size());
+              if (schedLoop.topPartitions.empty())
+                anyEmpty = true;
+              maxAvail = std::max(maxAvail, schedLoop.topPartitions.size());
             }
-        // Always emit at least the committed winner (variant 0) when any loop
-        // was schedulable: `topPartitions` can be empty (greedy fallback or
-        // exhaustive partitioning off), which would otherwise collapse the dump
-        // to zero variants and drop even the winner.
-        numVariants = sawSchedulable ? std::max<size_t>(numVariants, 1) : 1;
+        size_t numVariants =
+            (!sawSchedulable || anyEmpty)
+                ? 1
+                : std::min<size_t>(topN, std::max<size_t>(1, maxAvail));
 
         SmallVector<SmallVector<ScheduledLoop, 2>, 3> variants;
         for (size_t k = 0; k < numVariants; ++k) {
@@ -4530,11 +4661,16 @@ struct ModuloSchedulePass
               for (size_t li = 0; li < v.graph.loops.size(); ++li) {
                 auto &dstLoop = v.graph.loops[li];
                 auto &liveLoop = sl.graph.loops[li];
-                if (dstLoop.II > 0 && k < liveLoop.topPartitions.size()) {
+                if (dstLoop.II > 0 && !liveLoop.topPartitions.empty()) {
+                  // Loops with their own candidate-k vary; loops with fewer
+                  // candidates (a single fixed partition) clamp to their last
+                  // one so they stay constant across variants.
+                  size_t idx =
+                      std::min(k, liveLoop.topPartitions.size() - 1);
                   finalizeLoopPartitionForDump(dstLoop,
-                                               liveLoop.topPartitions[k]);
-                  if (k < liveLoop.topPartitionCosts.size())
-                    dstLoop.partitionCost = liveLoop.topPartitionCosts[k];
+                                               liveLoop.topPartitions[idx]);
+                  if (idx < liveLoop.topPartitionCosts.size())
+                    dstLoop.partitionCost = liveLoop.topPartitionCosts[idx];
                 }
               }
             }
