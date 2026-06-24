@@ -89,21 +89,36 @@ jobs:
           set -eux
           bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --install-torch-wheel "${TORCH_NIGHTLY_URL}"
       - name: Run TLX unit tests
+        id: run_unit_tests
         timeout-minutes: 5
         run: |
           set -eux
           . "${SETUP_SCRIPT}"
           uv pip install pytest
           pytest python/test/unit/language/test_tlx_*.py -v --junitxml=/tmp/tlx-unit.xml
+      - name: Run TLX tutorial correctness tests
+        id: run_correctness_tests
+        timeout-minutes: 10
+        run: |
+          set -eux
+          . "${SETUP_SCRIPT}"
+          # AMD (gfx950/CDNA4) + ikbo cases run; Hopper/Blackwell and gfx1250
+          # cases auto-skip via @pytest.mark.skipif arch gates.
+          pytest third_party/tlx/tutorials/testing/test_correctness.py -v --junitxml=/tmp/tlx-correctness.xml
       - name: Collect nightly failures (TLX)
         id: parse
         if: always() && github.event_name == 'schedule'
         run: |
           . "${SETUP_SCRIPT}"
+          FAILED_FLAG=""
+          if [[ "${{ steps.run_unit_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" ]]; then
+            FAILED_FLAG="--failed --bucket mi350-tlx-job-failed"
+          fi
           python3 .github/scripts/parse_junit_failures.py \
-            --junit /tmp/tlx-unit.xml \
+            --junit /tmp/tlx-unit.xml /tmp/tlx-correctness.xml \
             --workflow "${GITHUB_WORKFLOW}" \
-            --job "mi350-tlx-test"
+            --job "mi350-tlx-test" \
+            ${FAILED_FLAG}
 
   # ----- Nightly issue filing (schedule only) -----
   report-mi350-tritonbench:
