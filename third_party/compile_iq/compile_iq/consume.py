@@ -25,10 +25,9 @@ def acf_args_for(ptx: str, arch: str | None, ptxas_version: str) -> list[str]:
         from packaging.version import Version
         if not arch:
             return []
-        # Minimum ptxas version that can apply our ACFs. Defaults to 13.3 (the version the
-        # production CIQ search space `ptxas13.3.bin` targets). Override to match an ACF stored
-        # from a different-versioned search space -- e.g. an EVO `cuda-13.0` tier needs ptxas 13.0,
-        # since an ACF is rejected ("Invalid compiler controls file") by a mismatched ptxas.
+        # Minimum ptxas version that can apply ACFs. Defaults to 13.3 (the GA version that supports
+        # --apply-controls). An ACF must be applied with a ptxas matching the version it was minted
+        # with, since a mismatched ptxas rejects it ("Invalid compiler controls file").
         min_version = os.environ.get("COMPILE_IQ_PTXAS_MIN_VERSION", "13.3")
         if Version(ptxas_version) < Version(min_version):
             store.dlog(
