@@ -792,6 +792,20 @@ SmallVector<Channel *> orderReuseGroupN(ReuseGroup *group) {
   return ordered;
 }
 
+// A consumer drains its read of the shared buffer at its own program point only
+// if it is *synchronous*. An asynchronous MMA (a Blackwell tcgen05 op with
+// is_async, or an async Hopper wgmma) merely *issues* at that point and reads
+// its operand asynchronously, so same-partition program order does not order
+// the read before a later producer's overwrite. Such a consumer cannot rely on
+// program order for reuse safety and needs an explicit reuse barrier.
+static bool isAsyncReadConsumer(Operation *op) {
+  if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(op))
+    return mma.isAsync();
+  if (auto wgmma = dyn_cast<ttng::WarpGroupDotOp>(op))
+    return wgmma.getIsAsync();
+  return false;
+}
+
 bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel) {
   Operation *earlyProducer = earlyChannel->getSrcOp();
   Operation *lateConsumer = lateChannel->getDstOp();
@@ -817,12 +831,27 @@ bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel) {
     if (!samePartition)
       continue;
 
-    // Same partition: check if earlyProducer appears before lateConsumer.
-    // If so, partition-internal ordering guarantees that lateConsumer's
-    // consumer_release will happen before earlyProducer's next
-    // producer_acquire.
+    // Same partition: program order *issues* the consumer before the producer's
+    // next overwrite. That frees the shared buffer without an explicit reuse
+    // barrier only if the consumer is *synchronous* -- i.e. it drains its read
+    // at its own program point. An asynchronous consumer (a Blackwell tcgen05
+    // is_async mma, or an async Hopper wgmma) merely issues there and reads its
+    // operand asynchronously, so the producer can overwrite the buffer while
+    // the read is still in flight; that case needs the explicit reuse barrier.
+    // (FA-fwd-persistent: the late P channel's only consumer is the PV tcgen05
+    // mma, which is async -- eliding the wait was the WAR race that overwrote P
+    // and produced NaN.)
+    //
+    // FIXME(reuse WAR, quantifier): the buffer is free only after *every*
+    // consumer has read it, so the wait may be elided only if ALL
+    // actualConsumers satisfy same-partition + appearsBefore + synchronous. The
+    // `return false` below still elides on the FIRST qualifying consumer
+    // (existential), which is latent-unsafe when a late channel has multiple
+    // consumers (e.g. one same-partition + one cross-partition). Safe today
+    // only because these reuse-group late channels have a single consumer.
     if (earlyProducer->getBlock() == consumer->getBlock() &&
-        appearsBefore(earlyProducer, consumer)) {
+        appearsBefore(earlyProducer, consumer) &&
+        !isAsyncReadConsumer(consumer)) {
       LDBG("needExplicitReuseWait: no explicit wait needed, "
            << "earlyChannel " << earlyChannel->uniqID << " and lateChannel "
            << lateChannel->uniqID << " have same-partition ordering");
