@@ -149,9 +149,20 @@ stream advanced `numTiles` times per outer iteration:
 - The offset is the **tile index** (producer/consumer walk order), NOT the
   reuse-group position. Using the reuse position (a permutation of tile order)
   commits a shared slot's generations out of order and corrupts data.
-- The barrier slot need not equal the data buffer slot — producer and consumer
-  only need to agree, which they do (both walk tiles in the same order, and tile
-  `t` maps to the same buffer in both regions).
+- **The data buffer slot must use this SAME flattened count.** It is not enough
+  for producer and consumer to merely agree on the data slot: a data slot may be
+  reused only `>= numBuffers` flattened generations apart, otherwise the shared
+  barrier (which frees a slot `numBuffers` generations later) cannot serialize the
+  reuse. The staging-buffer `memdesc_index` is therefore derived from the same
+  `accumCnt * numTiles + tileIdx` count — see `getStaggeredAccumCnt`'s
+  SubtiledRegionOp branch (`CodePartitionUtility.cpp`), which keys off the
+  per-tile-operand position so it matches this barrier count. The generic
+  reuse-group `accumCnt + reuseGroupPosition` stagger is wrong here: it uses a
+  counter unrelated to the barrier generation and, because all subtiles share one
+  `subtiled_region` consumer, collapses distinct subtiles onto one slot — the
+  EPILOGUE_SUBTILE>2 staging-buffer race. (`numTiles=2` happened to be correct by
+  coincidence: two slots are always distinct and reuse exactly every 3
+  generations.)
 - This is correct even when `numTiles > numBuffers`: two same-iteration tiles
   may land on one slot, but because flattened order == tile-walk order, the
   later tile's acquire simply *waits* for the earlier tile's slot to be released

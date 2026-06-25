@@ -853,11 +853,23 @@ bool isWholeAllocationOverwriteReuseOwner(Channel *ownerCh) {
   return tmemCh->isOperandDNoAcc;
 }
 
+// Defined below; forward-declared so getStaggeredAccumCnt can match a channel's
+// buffer against a SubtiledRegionOp's per-tile operands.
+static Value traceToBufferBase(Value v);
+
 // Returns the (possibly reuse-group staggered) accumulation count for `ch` at
 // `op`: `accumCnt` for the representative channel (or when there is no reuse
 // group), or `accumCnt + theIdx` for a channel at position `theIdx` within its
 // reuse group. This is the raw count from which bufferIdx (% numBuffers) and
 // phase (/ numBuffers & 1) are derived.
+//
+// Subtiled-region reuse members are special: the N subtiles share ONE barrier
+// pair and ONE physical buffer, so the staging-buffer slot must use the same
+// per-tile *flattened* count the shared barrier uses
+// (getPerTileStaggeredAccumCnt):
+//   flattened = accumCnt * numTiles + tileIdx
+// keyed by the tile-walk index, NOT the reuse-group consumer position. See the
+// in-function comment and docs/SubtileOperator.md / docs/ReuseGroups.md.
 static Value
 getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                      const DenseSet<Operation *> &regionsWithChannels,
@@ -866,6 +878,51 @@ getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
       getAccumCount(builder, op, regionsWithChannels, config, reuseGroupIdx);
   if (reuseGroupIdx < 0)
     return accumCnt;
+  // Subtiled-region reuse members must index the staging buffer with the SAME
+  // per-tile flattened accumulation count the shared barrier uses
+  // (getPerTileStaggeredAccumCnt):
+  //   flattened = accumCnt * numTiles + tileIdx
+  // keyed by the tile-walk index (this channel's position among the
+  // SubtiledRegionOp's per-tile operands), NOT the reuse-group consumer
+  // position computed below. The generic `accumCnt + position` stagger is only
+  // valid for non-subtiled reuse groups; for an N-subtile group that shares one
+  // barrier pair and one physical buffer it (a) uses a counter unrelated to the
+  // barrier generation and (b) collapses distinct subtiles onto the same slot
+  // when they all feed the one subtiled_region consumer, aliasing the staging
+  // buffer and racing the store (manifests at EPILOGUE_SUBTILE > 2). Using the
+  // flattened count makes the data slot == barrier generation % numBuffers, so
+  // the shared barrier serializes every reuse of a physical slot.
+  if (auto subtiled = dyn_cast<ttng::SubtiledRegionOp>(op)) {
+    Value chBase;
+    if (ch && ch->getAllocOp())
+      chBase = ch->getAllocOp()->getResult(0);
+    if (chBase) {
+      unsigned nTiles = subtiled.getNumTiles();
+      int tileIdx = -1;
+      for (auto [idx, arg] : llvm::enumerate(subtiled.getPerTileArgs())) {
+        if (traceToBufferBase(arg) == chBase) {
+          tileIdx = static_cast<int>(idx % nTiles);
+          break;
+        }
+      }
+      if (tileIdx >= 0) {
+        Type cntTy = accumCnt.getType();
+        auto makeConst = [&](int64_t v) -> Value {
+          if (cntTy.isIndex())
+            return builder.createWithAsyncTaskIds<arith::ConstantIndexOp>(
+                op->getLoc(), v);
+          return builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+              op->getLoc(), v, llvm::cast<IntegerType>(cntTy).getWidth());
+        };
+        Value scaled = builder.createWithAsyncTaskIds<arith::MulIOp>(
+            op->getLoc(), accumCnt, makeConst(static_cast<int64_t>(nTiles)));
+        if (tileIdx == 0)
+          return scaled;
+        return builder.createWithAsyncTaskIds<arith::AddIOp>(
+            op->getLoc(), scaled, makeConst(tileIdx));
+      }
+    }
+  }
   // op is a user of the channel. accumCnt is the corresponding argument of the
   // parentForOp.
   // Go through chList in the parentForOp, assume ch is directly in parentForOp.
