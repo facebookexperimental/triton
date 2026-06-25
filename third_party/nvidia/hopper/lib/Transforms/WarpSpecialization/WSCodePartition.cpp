@@ -3391,7 +3391,8 @@ void insertAsyncComm(
     // representative multibuffer alloc threaded in as shared args. lowering
     // replaces tileIdx with `arith.constant t` per tile, so producer-tile-t and
     // consumer-tile-t independently agree on
-    //   slot = (accumCnt * numTiles + t) % numBuffers
+    //   slot = (accumCnt + t) % numBuffers   (accumCnt advances by
+    //   numTiles/iter)
     // by construction -- no operand matching, which is what made the prior
     // threaded-count approach permute the producer/consumer mapping and corrupt
     // data. columnOffset (global TMA N-coord) and the data leaf stay per-tile
@@ -3435,14 +3436,7 @@ void insertAsyncComm(
         // inlined before scheduleLoops.
         b.clearLoopScheduleInfo();
         Location loc = sub.getLoc();
-        unsigned nTiles = sub.getNumTiles();
         Type cntTy = accumArg.getType();
-        auto makeConst = [&](int64_t v) -> Value {
-          if (cntTy.isIndex())
-            return b.createWithAsyncTaskIds<arith::ConstantIndexOp>(loc, v);
-          return b.createWithAsyncTaskIds<arith::ConstantIntOp>(
-              loc, v, cast<IntegerType>(cntTy).getWidth());
-        };
         // Extend the i32 builtin tileIdx to accumCnt's type before flattening.
         Value tileIdxExt;
         if (cntTy.isIndex())
@@ -3451,12 +3445,16 @@ void insertAsyncComm(
         else
           tileIdxExt =
               b.createWithAsyncTaskIds<arith::ExtUIOp>(loc, cntTy, tileIdx);
-        // flattened = accumCnt * numTiles + tileIdx (same ordering the data
-        // slot and the barrier must share).
-        Value scaled = b.createWithAsyncTaskIds<arith::MulIOp>(
-            loc, accumArg, makeConst(nTiles));
+        // flattened = accumCnt + tileIdx. `accumCnt` already advances by the
+        // per-iteration consumption stride (numTiles, applied on the
+        // loop-carried reuse-group counter in
+        // WSBuffer.cpp::getAccumForReuseGroup), so the flattened stream is
+        // `iter*numTiles + tileIdx` -- the same ordering the data slot and the
+        // shared barrier must share. The `* numTiles` factor used to live here;
+        // moving it onto the counter keeps a single per-channel stride rule and
+        // stops it from leaking onto non-subtile counters.
         Value flattened =
-            b.createWithAsyncTaskIds<arith::AddIOp>(loc, scaled, tileIdxExt);
+            b.createWithAsyncTaskIds<arith::AddIOp>(loc, accumArg, tileIdxExt);
         std::tie(slot.bufferIdx, slot.phase) =
             getBufferIdxAndPhase(b, loc, flattened, numBuffers);
         // Build the staging view from the in-body base (IsolatedFromAbove: must

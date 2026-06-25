@@ -70,10 +70,23 @@ operation).
 
 ### Step 5: Generate Yield Values
 
-- `generateYieldCntsForForOp`: at each loop yield, the `accumCnt` is
-  incremented by the number of times it was consumed in the loop body.
-- For reuse groups, the counter is shared — each channel in the group
-  offsets its buffer index by its position within the group.
+The per-iteration increment (stride) is **per channel**, not per loop — it is the
+number of buffer slots that channel consumes in one iteration:
+
+- `generateYieldCntsForForOp`: a channel that lives directly in the loop body
+  (TMEM accumulator, A/B loads) consumes one slot per iteration, so its
+  `accumCnt` increments by **1**.
+- For reuse groups, the counter is shared — each channel in the group offsets
+  its buffer index by its position within the group. A **subtiled** reuse group
+  shares one multibuffer across `numTiles` tiles consumed per iteration, so its
+  counter advances by **numTiles** (`getReuseGroupStride` →
+  `getAccumForReuseGroup`); the subtile index math is then just
+  `accumCnt + tileIdx` (see [Subtile Operator](SubtileOperator.md)).
+
+> A loop-scoped increment (returning numTiles whenever the loop contains *any*
+> `SubtiledRegionOp`) is wrong: it stamps the subtile stride onto co-resident
+> non-subtile counters and collapses their slot/phase — the AutoWS subtile GEMM
+> deadlock.
 
 ## Interaction with Reuse Groups
 
