@@ -1427,6 +1427,27 @@ BlockArgument SubtiledRegionOp::addSharedArg(Value value) {
   return tileBlock.insertArgument(insertPos, value.getType(), getLoc());
 }
 
+BlockArgument SubtiledRegionOp::addPerTileArg(ArrayRef<Value> valuesPerTile) {
+  unsigned nTiles = getNumTiles();
+  assert(valuesPerTile.size() == nTiles &&
+         "addPerTileArg expects exactly numTiles values");
+  Block &tileBlock = getTileRegion().front();
+
+  // The new tile block argument goes right after the existing per-tile args
+  // (i.e. before any shared args / optional tile index). Compute this BEFORE
+  // appending operands, since getNumPerTilePositions() reads
+  // perTileArgs.size().
+  unsigned insertPos = getNumPerTilePositions();
+
+  // Append the per-tile operands to the perTileArgs segment. They form a new
+  // position K with operands [K*nTiles .. (K+1)*nTiles) in tile order, matching
+  // the indexing used by lowerSubtiledRegion (perTileArgs[j*nTiles + t]).
+  getPerTileArgsMutable().append(ValueRange(valuesPerTile));
+
+  return tileBlock.insertArgument(insertPos, valuesPerTile.front().getType(),
+                                  getLoc());
+}
+
 LogicalResult SubtiledRegionOp::verify() {
   unsigned nTiles = getNumTiles();
   if (nTiles == 0)

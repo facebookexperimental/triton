@@ -73,6 +73,7 @@ from triton.language.extra.tlx.tutorials.amd_addmm_glu import (
     M as _amd_addmm_glu_M,
     N as _amd_addmm_glu_N,
 )
+from triton.language.extra.tlx.tutorials import amd_hstu_attn as _hstu
 from triton.tools.mxfp import MXScaleTensor
 
 from triton.language.extra.tlx.tutorials.ikbo.ikbo_lce_triton import (
@@ -356,12 +357,9 @@ class FlashAttention:
     @staticmethod
     def create_inputs(Z, H, N_CTX, HEAD_DIM, dtype=torch.float16):
         torch.manual_seed(20)
-        q = (torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=dtype).normal_(mean=0.0,
-                                                                                      std=0.5).requires_grad_())
-        k = (torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=dtype).normal_(mean=0.0,
-                                                                                      std=0.5).requires_grad_())
-        v = (torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=dtype).normal_(mean=0.0,
-                                                                                      std=0.5).requires_grad_())
+        q = torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=dtype).normal_(mean=0.0, std=0.5).requires_grad_()
+        k = torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=dtype).normal_(mean=0.0, std=0.5).requires_grad_()
+        v = torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=dtype).normal_(mean=0.0, std=0.5).requires_grad_()
         return q, k, v
 
     @staticmethod
@@ -665,7 +663,7 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8(HEAD_DIM, causal):
         torch.manual_seed(20)
         shape = (Z, H, N_CTX, HEAD_DIM)
         (q, q_scale, q_ref), (k, k_scale, k_ref), (v, v_scale,
-                                                   v_ref) = (_generate_mxfp8_attention_inputs(shape, DEVICE, dtype))
+                                                   v_ref) = _generate_mxfp8_attention_inputs(shape, DEVICE, dtype)
         ref_out = torch.nn.functional.scaled_dot_product_attention(q_ref, k_ref, v_ref, scale=sm_scale,
                                                                    is_causal=causal)
         tri_out = _blackwell_fa_ws_pipelined_persistent_mxfp8(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal,
@@ -730,7 +728,7 @@ def _assert_close_with_cosine(
 ) -> None:
     cosine = _cosine_similarity(actual, expected)
     # TODO: Enable value-based checking once MXFP8 backward tolerances settle.
-    assert (cosine >= min_cosine), f"{label} cosine_similarity={cosine:.6f} fell below min_cosine={min_cosine:.6f}"
+    assert cosine >= min_cosine, f"{label} cosine_similarity={cosine:.6f} fell below min_cosine={min_cosine:.6f}"
 
 
 @pytest.mark.parametrize(
@@ -746,8 +744,9 @@ def _assert_close_with_cosine(
         # (2, 1, 1152),
     ],
 )
+@pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
-def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
+def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX, causal):
     """MXFP8 backward correctness vs PyTorch autograd on randomized inputs."""
     sm_scale = 0.5
     dtype = torch.float8_e4m3fn
@@ -757,11 +756,11 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
     torch.manual_seed(20)
 
     (q, q_scale, q_ref), (k, k_scale, k_ref), (v, v_scale,
-                                               v_ref) = (_generate_mxfp8_attention_inputs(shape, DEVICE, dtype))
+                                               v_ref) = _generate_mxfp8_attention_inputs(shape, DEVICE, dtype)
     q_ref = q_ref.detach().requires_grad_(True)
     k_ref = k_ref.detach().requires_grad_(True)
     v_ref = v_ref.detach().requires_grad_(True)
-    ref_out = torch.nn.functional.scaled_dot_product_attention(q_ref, k_ref, v_ref, scale=sm_scale, is_causal=False)
+    ref_out = torch.nn.functional.scaled_dot_product_attention(q_ref, k_ref, v_ref, scale=sm_scale, is_causal=causal)
     do_bf16 = torch.randn_like(ref_out)
     ref_out.backward(do_bf16)
 
@@ -825,7 +824,7 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
         desc_v_scale,
         N_CTX=N_CTX,
         HEAD_DIM=head_dim,
-        STAGE=1,
+        STAGE=3 if causal else 1,
         num_stages=1,
         num_warps=4,
         **fwd_config,
@@ -850,6 +849,7 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
         do_scale_dv,
         sm_scale,
         do_bf16=do_bf16,
+        causal=causal,
     )
     ref_dq = q_ref.grad.detach()
     ref_dk = k_ref.grad.detach()
@@ -1021,6 +1021,99 @@ def test_amd_fa_persistent_cross_attention(q_len, kv_len, causal):
 
 
 # =============================================================================
+# AMD HSTU Attention Tests (gfx950)
+# =============================================================================
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+@pytest.mark.parametrize("batch_size, max_seq_len, sparsity, heads, attn_dim, hidden_dim", _hstu.get_inputs())
+def test_hstu_attention(batch_size, max_seq_len, sparsity, heads, attn_dim, hidden_dim):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
+    dropout_pr = 0.0
+    target_size = 20
+    sl_alpha = 2.0
+
+    # In prod, BF16 is used by HSTU attention
+    dtype = torch.bfloat16
+    invalid_attn_mask_type = "lower_triangular"
+    causal = True
+    alpha = 1.0 / attn_dim * 10000
+
+    # generate inputs
+    torch.manual_seed(1001)  # for reproducibility
+    lengths = _hstu.generate_sparse_seq_len(
+        size=batch_size,
+        max_seq_len=max_seq_len,
+        sparsity=sparsity,
+        device=torch.device("cuda"),
+    )
+    lengths = _hstu.apply_SL(lengths, sl_alpha, max_seq_len=max_seq_len)
+    num_targets = torch.randint(
+        1,
+        target_size + 1,
+        (batch_size, ),
+        device=lengths.device,
+        dtype=lengths.dtype,
+    )
+    num_targets = torch.where(num_targets > lengths, lengths, num_targets)
+    seq_offsets = torch.zeros((batch_size + 1, ), dtype=torch.int64, device=torch.device("cuda"))
+    seq_offsets[1:] = torch.cumsum(lengths, dim=0)
+    L = int(seq_offsets[-1].item())
+    x = torch.empty(
+        (L, heads, attn_dim * 2 + hidden_dim),
+        dtype=dtype,
+        device=torch.device("cuda"),
+    ).uniform_(-0.01, 0.01)
+    q, k, v = torch.split(x, [attn_dim, attn_dim, hidden_dim], dim=-1)
+
+    q = _hstu.switch_to_contiguous_if_needed(q)
+    k = _hstu.switch_to_contiguous_if_needed(k)
+    v = _hstu.switch_to_contiguous_if_needed(v)
+
+    _hstu.sanity_check_attention(
+        max_seq_len=max_seq_len,
+        q=q,
+        k=k,
+        v=v,
+        seq_offsets=seq_offsets,
+        invalid_attn_mask_type=invalid_attn_mask_type,
+        dropout_pr=dropout_pr,
+        attn_bias=None,
+        max_attn_len=None,
+        contextual_seq_len=0,
+    )
+
+    def triton_attn():
+        return _hstu.triton_hstu_attention_fwd(max_seq_len, alpha, q, k, v, seq_offsets, causal, num_targets,
+                                               0,  # max_attn_len,
+                                               0,  # contextual_seq_len
+                                               True,  # sort_by_length,
+                                               )
+
+    def torch_attn():
+        return _hstu.torch_hstu_attention(
+            max_seq_len,
+            alpha,
+            q,
+            k,
+            v,
+            seq_offsets,
+            causal,
+            dropout_pr=0.0,
+            training=False,
+            num_targets=num_targets,
+            max_attn_len=0,
+            contextual_seq_len=0,
+            min_full_attn_seq_len=0,
+        )
+
+    out = triton_attn() * max_seq_len
+    out_ref = torch_attn() * max_seq_len
+    torch.testing.assert_close(out, out_ref, atol=1e-3, rtol=0)
+
+
+# =============================================================================
 # AMD TDM GEMM Tests (gfx1250)
 # =============================================================================
 
@@ -1169,8 +1262,8 @@ class IkboLce:
         baseline_err = (ref_fp16.float() - ref_fp32).abs().max().item()
         kernel_err = (out.float() - ref_fp32).abs().max().item()
         threshold = max(IkboLce.ERROR_MULTIPLIER * baseline_err, IkboLce.ERROR_FLOOR)
-        assert kernel_err <= threshold, (f"IKBO LCE error exceeds baseline: "
-                                         f"kernel={kernel_err:.4e}, baseline={baseline_err:.4e}")
+        assert kernel_err <= threshold, (
+            f"IKBO LCE error exceeds baseline: kernel={kernel_err:.4e}, baseline={baseline_err:.4e}")
 
 
 class IkboFa:

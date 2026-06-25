@@ -17,9 +17,16 @@ While this approach places more responsibility on the user, it reduces the compi
 
 ## The DSL Extension
 
+> **Hardware availability tags.** Each op below is tagged with the targets it runs on:
+> `**[Hopper+]**` = NVIDIA Hopper and newer; `**[MI300+]**` = AMD MI300 (CDNA3) and MI350 (CDNA4);
+> `**[MI350]**` = AMD MI350 (CDNA4) only. A trailing `?` (e.g. `**[MI300+?]**`) marks AMD availability
+> that has **not been confirmed yet** and needs verification.
+> Note: async copies (`async_load` and its commit/wait groups) and the AMD buffer ops require **MI350** —
+> they are **not** available on MI300. `barrier_arrive` on AMD requires `arrive_count == 1`.
+
 ### Local buffer operations
 
-- `buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS)` **[Hopper+]**
+- `buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS)` **[Hopper+, MI300+]**
 
     Allocate `NUM_BUFFERS` buffers in local memory per thread block, each of the specified size. The memory layout is inferred from its consumers.
 
@@ -29,38 +36,38 @@ While this approach places more responsibility on the user, it reduces the compi
     Allocate `NUM_BUFFERS` of buffers in the tensor memory per thread block, each with size size. The memory layout is inferred from its consumers.
 
 
-- `buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS, reuse=other_buffers)` **[Hopper+]**
+- `buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS, reuse=other_buffers)` **[Hopper+, MI300+]**
 
     Alias this allocation to an existing `buffered_tensor` so multiple logical buffers reuse the same underlying local storage (SMEM or TMEM) without reallocation.
 
 
-- `buffer = tlx.local_view(buffers, buffer_idx)` or `buffer = buffers[buffer_idx]` **[Hopper+]**
+- `buffer = tlx.local_view(buffers, buffer_idx)` or `buffer = buffers[buffer_idx]` **[Hopper+, MI300+]**
 
     Return a subview of the buffer indexed by `buffer_idx` from `buffers`. Both the explicit `local_view()` call and the indexing syntax `[]` are supported.
 
 
-- `distributed_tensor = tlx.local_load(buffer, optional_token)` **[Hopper+]**
+- `distributed_tensor = tlx.local_load(buffer, optional_token)` **[Hopper+, MI300+]**
 
     Loads the buffer from local memory or tensor memory into a distributed tensor.
 
 
-- `tlx.local_store(buffer, distributed_tensor)` **[Hopper+]**
+- `tlx.local_store(buffer, distributed_tensor)` **[Hopper+, MI300+]**
 
     Store a distributed tensor into a buffer in local memory or tensor memory.
 
-- `distributed_tensor = tlx.local_gather(src, indices, axis, optional_token)` **[Hopper+]**
+- `distributed_tensor = tlx.local_gather(src, indices, axis, optional_token)` **[Hopper+, MI300+?]**
 
     Gather elements from shared memory along a specified axis using an indices tensor. The output shape matches the indices shape, and elements are gathered from `src` at positions specified by `indices` along the given `axis`.
 
-- `tlx.local_scatter(dst, src, indices, axis, optional_token)` **[Hopper+]**
+- `tlx.local_scatter(dst, src, indices, axis, optional_token)` **[Hopper+, MI300+?]**
 
     Scatter elements to shared memory along a specified axis using an indices tensor. Elements from `src` are written to `dst` at positions specified by `indices` along the given `axis`.
 
-- `buffer = tlx.local_trans(buffer, dims)` **[Hopper+]**
+- `buffer = tlx.local_trans(buffer, dims)` **[Hopper+, MI300+]**
 
     Permutes the dimensions of a tensor.
 
-- `buffer = tlx.local_slice(buffer, offsets=[m, n], shapes=[M, N])` **[Hopper+]**
+- `buffer = tlx.local_slice(buffer, offsets=[m, n], shapes=[M, N])` **[Hopper+, MI300+]**
 
     Slice a `M x N` tensor at a `m x n` offset.
 
@@ -69,7 +76,7 @@ While this approach places more responsibility on the user, it reduces the compi
 TLX provides you the ability to reuse the same allocated buffer across multiple disjoint steps in your kernel. This is
 useful to allow additional pipelining when you may not have enough isolated SMEM or TMEM.
 
-- `tlx.storage_alias_spec(storage=storage_kind)` **[Hopper+]**
+- `tlx.storage_alias_spec(storage=storage_kind)` **[Hopper+, MI300+]**
 
     Defines a buffer that you will want to share across multiple aliases. The storage
     can be either SMEM or TMEM. To use this in an allocation you should provide the spec in the `reuse`
@@ -104,7 +111,7 @@ m_tiles = tlx.local_alloc(
 )
 ```
 
-- `tlx.reuse_group(*tensors, group_type=REUSE_TYPE, group_size=SUBTILE_SIZE)` **[Hopper+]**
+- `tlx.reuse_group(*tensors, group_type=REUSE_TYPE, group_size=SUBTILE_SIZE)` **[Hopper+, MI300+]**
 
     A reuse group expresses how you intend to access the shared buffer.
     There are two types: Shared or Distinct. A shared buffer wants to occupy the same memory
@@ -331,7 +338,7 @@ Binary wheels are available for CPython 3.10-3.14.
    tlx.async_descriptor_load(desc, buffer, offsets=[m_offset, n_offset], barrier=mbar)
    ```
 
-- `desc = tlx.reinterpret_tensor_descriptor(desc_ptr, block_shape, dtype)` **[Hopper+]**
+- `desc = tlx.reinterpret_tensor_descriptor(desc_ptr, block_shape, dtype)` **[Hopper+, MI300+]**
 
    Reinterpret a tensor descriptor pointer as a TMA-backed tensor descriptor object.
 
@@ -351,18 +358,18 @@ Binary wheels are available for CPython 3.10-3.14.
    tlx.async_descriptor_load(a_desc, buffer, offsets=[offs_m, offs_k], barrier=mbar)
    ```
 
-- `tlx.async_load(tensor_ptr, buffer, optional_mask, optional_other, cache_modifier, eviction_policy, is_volatile)` **[Hopper+]**
+- `tlx.async_load(tensor_ptr, buffer, optional_mask, optional_other, cache_modifier, eviction_policy, is_volatile)` **[Hopper+, MI350]**
 
    Load a chunk of data from global memory into a local memory buffer asynchronously.
 
    The operation returns a token object which can be used to track the completion of the operation.
 
 
-- `tlx.async_load_commit_group(tokens)` **[Hopper+]**
+- `tlx.async_load_commit_group(tokens)` **[Hopper+, MI350]**
 
    Commits all prior initiated but uncommitted async_load ops an async group. Optionally, each token represents a tracked async load operation.
 
-- `tlx.async_load_wait_group(pendings, tokens)` **[Hopper+]**
+- `tlx.async_load_wait_group(pendings, tokens)` **[Hopper+, MI350]**
 
    Wait for completion of prior asynchronous copy operations. The `pendings` argument indicates the number of in-flight operations not completed.
    Optionally, each token represents a tracked async commit group operation.
@@ -936,6 +943,254 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
         )
   tlx.prefetch(desc_in, tensormap=True)
   ```
+
+
+## Buffer Operations (AMD)
+
+> **[MI350]** — available on AMD MI350 (CDNA4) only; not available on MI300.
+
+Buffer operations access global memory via a scalar base pointer and a tensor of i32 element offsets, rather than a tensor of pointers. This maps directly to AMD's hardware buffer instructions, which use a resource descriptor and byte offsets, enabling the hardware to do out-of-bounds checking and cache optimization.
+
+### `tlx.buffer_load`
+
+Load a tensor of values from global memory.
+
+```python
+result = tlx.buffer_load(ptr, offsets, mask=None, other=None, cache=None)
+```
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `ptr` | scalar pointer | Base address in global memory. |
+| `offsets` | i32 tensor | Per-element byte offsets from `ptr`. |
+| `mask` | bool tensor, optional | When `mask[i]` is `False`, the element is not loaded. |
+| `other` | tensor or scalar, optional | Value used for masked-out elements (where `mask[i]` is `False`). |
+| `cache` | str, optional | Cache modifier (e.g. `".ca"`, `".cg"`). |
+
+**Returns**: A tensor with the same shape as `offsets` and element type matching the pointee type of `ptr`.
+
+Lowers to `amdg.buffer_load`, which is eventually lowered to `rocdl.raw.ptr.buffer.load`.
+
+### `tlx.buffer_store`
+
+Store a tensor of values to global memory.
+
+```python
+tlx.buffer_store(stored_value, ptr, offsets, mask=None, cache=None)
+```
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `stored_value` | tensor | Values to write. |
+| `ptr` | scalar pointer | Base address in global memory. |
+| `offsets` | i32 tensor | Per-element byte offsets from `ptr`. |
+| `mask` | bool tensor, optional | When `mask[i]` is `False`, the element is not written. |
+| `cache` | str, optional | Cache modifier. |
+
+**Returns**: Nothing.
+
+Lowers to `amdg.buffer_store`, which is eventually lowered to `rocdl.raw.ptr.buffer.store`.
+
+### `tlx.buffer_load_to_local`
+
+Async load from global memory directly into shared (local) memory, bypassing registers. This is useful for producer warps that prefetch data into shared memory for other warps to consume.
+
+```python
+token = tlx.buffer_load_to_local(dest, ptr, offsets, mask=None, other=None, cache_modifier="")
+```
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `dest` | `tlx.buffered_tensor` | Destination slice in shared memory. |
+| `ptr` | scalar pointer | Base address in global memory. |
+| `offsets` | i32 tensor | Per-element byte offsets from `ptr`. |
+| `mask` | bool tensor, optional | When `mask[i]` is `False`, the element is not loaded. |
+| `other` | tensor or scalar, optional | Value used for masked-out elements. |
+| `cache_modifier` | str, optional | Cache modifier string (default `""`). |
+
+**Returns**: A `tlx.async_token` that can be used with `tlx.async_load_wait_group()` to synchronize on the completion of the transfer.
+
+Lowers to `amdg.buffer_load_to_local`, which is eventually lowered to `rocdl.raw.ptr.buffer.load.async.lds` — a single hardware instruction that moves data from global memory to LDS without going through VGPRs.
+
+### Example
+
+```python
+import triton.language.extra.tlx as tlx
+
+@triton.jit
+def kernel(src_ptr, dst_ptr, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.arange(0, BLOCK_SIZE).to(tl.int32)
+    mask = offsets < BLOCK_SIZE
+
+    # Load from global memory using buffer semantics
+    data = tlx.buffer_load(src_ptr, offsets, mask=mask, other=0.0)
+
+    # Store to global memory using buffer semantics
+    tlx.buffer_store(data, dst_ptr, offsets, mask=mask)
+```
+
+For the async global-to-shared variant, see the warp-pipeline GEMM example (`third_party/amd/python/examples/gluon/f16_gemm_warp_pipeline_gfx1250.py`).
+
+## AMD TDM Descriptor Loads
+
+`tlx.async_amd_descriptor_load(desc, result, offsets, pred=None)` issues an AMD
+TDM descriptor load from global memory to a TLX local buffer. It is available on
+TDM-capable AMD targets (`gfx1250+`) and should be synchronized with
+`tlx.async_amd_descriptor_wait`.
+
+`tlx.async_amd_descriptor_load_group(descs, results, offsets, warp_masks,
+preds=None)` groups multiple AMD TDM descriptor loads behind one static hardware
+TDM instruction. Each list entry is one arm:
+
+| Argument | Description |
+|----------|-------------|
+| `descs[i]` | Tensor descriptor for arm `i`. |
+| `results[i]` | Local buffer or local view receiving arm `i`. |
+| `offsets[i]` | Offset list for arm `i`; all arms must have the same rank. |
+| `warp_masks[i]` | Bitmask selecting the waves that use arm `i`. |
+| `preds[i]` | Optional predicate for arm `i`; defaults to true. |
+
+The warp masks must be non-empty, disjoint, axis-aligned, and cover all waves in
+the CTA exactly once. The grouped operation currently requires one CTA, the same
+rank and element bitwidth for every arm, one shared cache modifier, and shared
+layouts supported by AMD TDM lowering. This is useful for kernels where
+different wave groups load different inputs, such as A/B GEMM tiles or A/B plus
+scale tiles in MXFP GEMM, while keeping the assembly to one TDM instruction per
+load group.
+
+Example:
+```python
+a_tok = tlx.async_amd_descriptor_load_group(
+    [a_desc, b_desc],
+    [tlx.local_view(a_buf, slot), tlx.local_view(b_buf, slot)],
+    [[off_m, k * BLOCK_K], [k * BLOCK_K, off_n]],
+    [0b0011, 0b1100],
+)
+tlx.async_amd_descriptor_wait(0, [a_tok])
+```
+
+## Warp Pipeline (AMD)
+
+> **[MI350]** — AMD MI350 (CDNA4); not available on MI300.
+
+`tlx.warp_pipeline_stage(label, *, priority=None)` is a context manager that marks explicit pipeline stage boundaries inside a loop. The compiler partitions the loop body at these boundaries and inserts conditional barriers so that one warp group executes one stage ahead of the other, overlapping memory latency with compute.
+
+**This is an explicit partitioning marker, not an automatic optimization.** Correctness depends on the user's buffering and synchronization structure. In particular:
+- Use multi-buffered shared memory (typically triple buffering with `NUM_BUFFERS=3`) to prevent data races between warp groups accessing the same buffer.
+- Use explicit `tlx.async_load_wait_group()` to ensure data is ready before consumption.
+- Handle prologue (prefetch) and epilogue (drain) around the main loop.
+
+See the gfx1250 warp-pipeline GEMM example (`third_party/amd/python/examples/gluon/f16_gemm_warp_pipeline_gfx1250.py`) for the full pattern.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `label` | `str` | Stage name for diagnostics (e.g. `"load"`, `"compute"`) |
+| `priority` | `int` (0-3), optional | Hardware scheduling hint, maps to `s_setprio`. Higher = more urgent. |
+
+Auto software pipelining is automatically disabled on loops that contain warp pipeline stages.
+
+Example (simplified — see gfx1250 example for production pattern):
+```python
+import triton.language.extra.tlx as tlx
+
+@triton.jit
+def gemm_kernel(..., BLOCK_K: tl.constexpr, NUM_BUFFERS: tl.constexpr):
+    buf_A = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, NUM_BUFFERS)
+    buf_B = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, NUM_BUFFERS)
+
+    # Prologue: prefetch NUM_BUFFERS-1 tiles into shared memory
+    for i in tl.range(0, NUM_BUFFERS - 1, loop_unroll_factor=NUM_BUFFERS - 1):
+        tlx.async_load(a_ptrs, tlx.local_view(buf_A, i), mask=...)
+        tlx.async_load(b_ptrs, tlx.local_view(buf_B, i), mask=...)
+        tlx.async_load_commit_group()
+        a_ptrs += BLOCK_K * stride_ak; b_ptrs += BLOCK_K * stride_bk
+    tlx.async_load_wait_group(NUM_BUFFERS - 2)
+
+    # Main loop with warp pipelining
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in tl.range(NUM_BUFFERS - 1, K_ITERS):
+        consumer = (k - (NUM_BUFFERS - 1)) % NUM_BUFFERS
+        producer = k % NUM_BUFFERS
+        with tlx.warp_pipeline_stage("lds_load", priority=1):
+            a_tile = tlx.local_load(tlx.local_view(buf_A, consumer))
+            b_tile = tlx.local_load(tlx.local_view(buf_B, consumer))
+        tlx.async_load_wait_group(0)
+        with tlx.warp_pipeline_stage("compute_and_load", priority=0):
+            tlx.async_load(a_ptrs, tlx.local_view(buf_A, producer), mask=...)
+            tlx.async_load_commit_group()
+            acc = tl.dot(a_tile, b_tile, acc)
+
+    # Epilogue: drain remaining buffers
+    ...
+```
+
+## Scaled Dot (AMD)
+
+`tlx.dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None, *, fast_math=False, lhs_k_pack=True, rhs_k_pack=True, out_dtype=tl.float32, tiles_per_warp=None)`
+is a thin wrapper around `tl.dot_scaled`. Without `tiles_per_warp` it is exactly
+equivalent to `tl.dot_scaled` — pass it only when you need the AMD-specific
+WMMA scheduling hint described below.
+
+### `tiles_per_warp` — what it controls
+
+| Concept | Controlled by | What it means |
+|---------|---------------|---------------|
+| **Warp distribution** | `warpsPerCTA` (chosen automatically by `AccelerateAMDMatmul::planWarps`) | How the total result tile is split *across* warps along M/N. |
+| **Per-warp tiling** | `tiles_per_warp` (this hint) | How many `instrShape`-sized WMMA tiles *each warp* covers contiguously before the layout repeats. |
+
+So `tiles_per_warp=[2, 2]` does **not** mean "distribute 4 tiles across 4
+warps." It means *each* warp emits a 2×2 block of WMMA instruction tiles,
+holding the corresponding 2×2 accumulator registers. Concretely, for a
+`tt.dot_scaled` lowered to gfx1250 WMMA (`instrShape = [16, 16, K]`),
+4 warps, `warpsPerCTA = [2, 2]`:
+
+| `tiles_per_warp` | Per-warp coverage (M × N) | Per-CTA coverage before repeat (M × N) |
+|------------------|---------------------------|----------------------------------------|
+| `[1, 1]` (default) | `16 × 16` | `32 × 32` |
+| `[2, 2]`           | `32 × 32` | `64 × 64` |
+
+For a `256 × 256` result, `[1, 1]` repeats the layout `8 × 8` times,
+`[2, 2]` repeats it `4 × 4`. Larger `tiles_per_warp` gives each warp more
+contiguous accumulator state (better register reuse for preshuffled
+MXFP scales, fewer warp-level reductions), at the cost of more registers
+per warp.
+
+Together, `instrShape`, `warpsPerCTA`, and `tiles_per_warp` define the M/N
+extent of one CTA-level WMMA layout period:
+`period[d] = instrShape[d] * warpsPerCTA[d] * tiles_per_warp[d]`. If the result
+tile is larger than this period, the period repeats. The K entry of
+`instrShape` is the per-instruction reduction depth and is handled separately
+from this M/N tiling.
+
+`tiles_per_warp` is validated by `AccelerateAMDMatmul`: it must have one
+entry per result-tile dim, each entry must be positive, and
+`instrShape[d] * warpsPerCTA[d] * tiles_per_warp[d]` must fit in the result
+tile shape.
+
+### Example
+
+```python
+import triton.language.extra.tlx as tlx
+
+acc = tlx.dot_scaled(
+    a, a_scale, "e5m2",
+    b, b_scale, "e5m2",
+    acc,
+    tiles_per_warp=[2, 2],   # pack 2x2 WMMA tiles per warp for preshuffled MXFP
+)
+```
+
+### Mechanism (for IR-level users)
+
+The wrapper attaches `amdg.wmma_tiles_per_warp = array<i32: m, n>` on the
+resulting `tt.dot_scaled` op. `ScaledBlockedToScaledWMMAF8F6F4` reads the
+attribute and substitutes `m, n` for the default `1, 1` when building the
+WMMA encoding. Setting the attribute directly on a `tt.dot[_scaled]` op
+in MLIR has the same effect; the wrapper just spares Python kernels from
+hand-poking attributes.
+
+Currently consumed only by the scaled-WMMA pattern (gfx1250). Regular
+`tt.dot` WMMA and the MFMA patterns do not read it.
 
 ## Kernels Implemented with TLX
 
