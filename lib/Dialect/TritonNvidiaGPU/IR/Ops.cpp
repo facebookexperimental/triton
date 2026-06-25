@@ -1427,25 +1427,32 @@ BlockArgument SubtiledRegionOp::addSharedArg(Value value) {
   return tileBlock.insertArgument(insertPos, value.getType(), getLoc());
 }
 
-BlockArgument SubtiledRegionOp::addPerTileArg(ArrayRef<Value> valuesPerTile) {
-  unsigned nTiles = getNumTiles();
-  assert(valuesPerTile.size() == nTiles &&
-         "addPerTileArg expects exactly numTiles values");
+bool SubtiledRegionOp::hasTileIndex() {
   Block &tileBlock = getTileRegion().front();
+  unsigned numPerTile = getNumPerTilePositions();
+  unsigned numShared = getSharedArgs().size();
+  return tileBlock.getNumArguments() == numPerTile + numShared + 1;
+}
 
-  // The new tile block argument goes right after the existing per-tile args
-  // (i.e. before any shared args / optional tile index). Compute this BEFORE
-  // appending operands, since getNumPerTilePositions() reads
-  // perTileArgs.size().
-  unsigned insertPos = getNumPerTilePositions();
+BlockArgument SubtiledRegionOp::getTileIndexArg() {
+  if (!hasTileIndex())
+    return nullptr;
+  Block &tileBlock = getTileRegion().front();
+  return tileBlock.getArgument(tileBlock.getNumArguments() - 1);
+}
 
-  // Append the per-tile operands to the perTileArgs segment. They form a new
-  // position K with operands [K*nTiles .. (K+1)*nTiles) in tile order, matching
-  // the indexing used by lowerSubtiledRegion (perTileArgs[j*nTiles + t]).
-  getPerTileArgsMutable().append(ValueRange(valuesPerTile));
-
-  return tileBlock.insertArgument(insertPos, valuesPerTile.front().getType(),
-                                  getLoc());
+void SubtiledRegionOp::removePerTilePosition(unsigned posIdx) {
+  unsigned nTiles = getNumTiles();
+  assert(posIdx < getNumPerTilePositions() &&
+         "removePerTilePosition: position out of range");
+  Block &tileBlock = getTileRegion().front();
+  // Erase the position's numTiles operands [posIdx*nTiles, (posIdx+1)*nTiles).
+  // The op uses AttrSizedOperandSegments, so go through the segment-aware
+  // MutableOperandRange::erase (NOT Operation::eraseOperand, which would desync
+  // operandSegmentSizes). The block remains [perTile.., shared.., tileIdx?] and
+  // remaining per-tile positions keep their [j*nTiles+t] layout.
+  getPerTileArgsMutable().erase(posIdx * nTiles, nTiles);
+  tileBlock.eraseArgument(posIdx);
 }
 
 LogicalResult SubtiledRegionOp::verify() {

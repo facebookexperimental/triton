@@ -100,15 +100,14 @@ Key functions:
   preceding region op, then arithmetically adding the remaining offset
 - `getBufferIdxAndPhase` / `getStaggeredAccumCnt` — for the first channel in the
   ordered list, uses `accumCnt` directly; each subsequent channel at position N
-  adds N to stagger its slot within the shared circular buffer. **Exception —
-  subtiled-region reuse groups:** when the user op is a `SubtiledRegionOp`,
-  `getStaggeredAccumCnt` instead returns the per-tile *flattened* count
-  `accumCnt * numTiles + tileIdx` (tileIdx = the channel's position among the
-  region's per-tile operands), matching the shared barrier's
-  `getPerTileStaggeredAccumCnt`. The `+ position` stagger is wrong for subtiles:
-  the N subtiles share one barrier pair, so the data slot must equal the barrier
-  generation `% numBuffers` (else slots alias within a `numBuffers` window and
-  race — the EPILOGUE_SUBTILE>2 staging-buffer bug). See
+  adds N to stagger its slot within the shared circular buffer. **Subtiled-region
+  reuse groups do NOT flow through here for their staging slot:** the N subtiles
+  share one barrier pair and one physical alloc, so both the data slot and the
+  barrier `bufferIdx`/`phase` are computed *inside the tile body* from the builtin
+  `tileIdx` (`flattened = accumCnt * numTiles + tileIdx`, `% numBuffers`), keeping
+  data slot == barrier generation. The generic `+ position` stagger is wrong for
+  subtiles (it aliases distinct subtiles within a `numBuffers` window and races —
+  the EPILOGUE_SUBTILE>2 staging-buffer bug). See
   [SubtileOperator](SubtileOperator.md).
 - `getReuseAccumArgIdx` — returns the position of a group's `accumCnt`
   argument within the region's full argument list

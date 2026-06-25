@@ -2,9 +2,9 @@
 
 // Test: with EPILOGUE_SUBTILE=4 (numTiles=4) the N epilogue subtiles form a
 // reuse group that shares ONE physical SMEM staging buffer (buffer.copy=3) AND
-// ONE barrier pair. The physical staging-buffer slot index MUST use the same
-// per-tile *flattened* accumulation count the shared barrier uses
-// (getPerTileStaggeredAccumCnt): flattened = accumCnt * numTiles + tileIdx.
+// ONE barrier pair. The physical staging-buffer slot index MUST equal the
+// shared barrier's slot, both derived from the per-tile *flattened* count
+// flattened = accumCnt * numTiles + tileIdx, taken % numBuffers.
 //
 // The bug: createBufferPost derived the data-buffer index from the generic
 // reuse-group stagger (accumCnt + reuseGroupPosition). Because all subtiles feed
@@ -15,26 +15,29 @@
 // generate_subtiled_region=True, EPILOGUE_SUBTILE=4). numTiles=2 happened to be
 // correct (two slots are always distinct); numTiles>2 needs the flattened count.
 //
-// After the fix getStaggeredAccumCnt returns accumCnt*numTiles + tileIdx for
-// subtiled-region reuse members, so the staging-buffer slot == barrier
-// generation % numBuffers and the shared barrier serializes every slot reuse.
+// Option 3 fix: every SMEM-rotation value (the staging-buffer slot AND the
+// shared barrier's bufferIdx/phase) is computed INSIDE the tile body from the
+// builtin tileIdx. lowering replaces tileIdx with `arith.constant t`, so the
+// first subtile (tileIdx 0, the +0 folds away) flattens to `muli %arg, %c4_i64`;
+// the resulting %IDX = (flattened % 3) indexes BOTH the 3x128x32 data staging
+// buffer and the 3x1xi64 barrier. This fails on the buggy collapsed reuse-position
+// index and on any scheme where the data slot and barrier slot diverge.
 
 // CHECK-LABEL: @matmul_kernel_tma_persistent_ws
 //
 // The epilogue staging buffer is a single shared 3-deep 128x32 alloc.
 // CHECK: ttg.local_alloc {allocation.shareGroup = 0 : i32, buffer.copy = 3 : i32, buffer.id = 2 : i32} : () -> !ttg.memdesc<3x128x32xf16
 //
-// In the epilogue partition (async_task_id = 0), the staging-buffer slot index
-// must come from the flattened per-tile count (accumCnt * numTiles(4) + tileIdx)
-// % numBuffers -- the SAME counter the shared barrier uses -- NOT the collapsed
-// `arith.addi %accumCnt, %c1` reuse-group stagger that aliased the slots before
-// the fix. Tie the 128x32 staging memdesc_index back to a `muli %arg, %c4`
-// (the flattened counter) so this fails on the buggy collapsed indexing.
+// In the epilogue partition (async_task_id = 0): flattened count, its % numBuffers
+// reduction, then the SAME %IDX indexing the data staging buffer (3x128x32) and
+// the shared barrier (3x1xi64).
 // CHECK:      %[[FLAT:[0-9]+]] = arith.muli %arg{{[0-9]+}}, %c4_i64 {async_task_id = array<i32: 0>}
-// CHECK-NEXT: %[[OFF:[0-9]+]] = arith.addi %[[FLAT]], %c2_i64 {async_task_id = array<i32: 0>}
-// CHECK:      %[[MOD:[0-9]+]] = arith.subi %[[OFF]], %{{[0-9]+}} {async_task_id = array<i32: 0>}
-// CHECK-NEXT: %[[IDX:[0-9]+]] = arith.trunci %[[MOD]] {async_task_id = array<i32: 0>} : i64 to i32
-// CHECK-NEXT: ttg.memdesc_index %{{[0-9]+}}[%[[IDX]]] {async_task_id = array<i32: 0>} : !ttg.memdesc<3x128x32xf16
+// CHECK:      %[[DIV:[0-9]+]] = arith.divui %[[FLAT]], %c3_i64 {async_task_id = array<i32: 0>}
+// CHECK:      %[[MUL:[0-9]+]] = arith.muli %[[DIV]], %c3_i64 {async_task_id = array<i32: 0>}
+// CHECK:      %[[MOD:[0-9]+]] = arith.subi %[[FLAT]], %[[MUL]] {async_task_id = array<i32: 0>}
+// CHECK:      %[[IDX:[0-9]+]] = arith.trunci %[[MOD]] {async_task_id = array<i32: 0>} : i64 to i32
+// CHECK:      ttg.memdesc_index %{{[0-9]+}}[%[[IDX]]] {async_task_id = array<i32: 0>} : !ttg.memdesc<3x128x32xf16
+// CHECK:      ttg.memdesc_index %{{[0-9]+}}[%[[IDX]]] {async_task_id = array<i32: 0>} : !ttg.memdesc<3x1xi64
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
