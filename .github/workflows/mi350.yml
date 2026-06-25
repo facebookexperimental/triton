@@ -88,6 +88,11 @@ jobs:
         run: |
           set -eux
           bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --install-torch-wheel "${TORCH_NIGHTLY_URL}"
+      - name: Install torchao from source
+        run: |
+          . "${SETUP_SCRIPT}"
+          uv pip install --no-build-isolation --no-deps "git+https://github.com/pytorch/ao.git"
+          python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
       - name: Run TLX unit tests
         id: run_unit_tests
         timeout-minutes: 5
