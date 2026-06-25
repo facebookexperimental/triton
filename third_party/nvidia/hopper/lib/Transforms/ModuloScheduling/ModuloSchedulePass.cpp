@@ -2302,11 +2302,12 @@ enumerateClusterPartitions(int numClusters) {
 ///  - tcgen05 MMA (→TMEM) and TMEM copies operate on memdesc and yield an async
 ///    token / no value — never a register tensor. EXCLUDED explicitly so a
 ///    future tensor-typed result can't be miscounted.
-///  - Pointer-element tensors (`!tt.ptr<...>`) must not be split across WGs (the
+///  - Pointer-element tensors (`!tt.ptr<...>`) must not be split across WGs
+///  (the
 ///    partition scheduler can't form a pointer cross-WG channel), so they never
 ///    incur a register round-trip. EXCLUDED. See partition-scheduler-bugs.md.
-/// Net: only genuine register compute chains (the FA softmax `subf→exp2`) count;
-/// GEMM/wgrad cross-WG edges (all load/MMA) score zero.
+/// Net: only genuine register compute chains (the FA softmax `subf→exp2`)
+/// count; GEMM/wgrad cross-WG edges (all load/MMA) score zero.
 static bool isRegisterComputeValue(Operation *op) {
   if (!op || op->getNumResults() == 0)
     return false;
@@ -2367,10 +2368,10 @@ constexpr int kCrossWGRoundTripLatency = 500;
 /// resident, not a register hand-off, and (being unavoidable) are present in
 /// every candidate anyway. Net: zero for GEMM/LayerNorm/wgrad partitions; only
 /// a CUDA-chain cut (FA softmax) pays.
-static void accumulateCrossWGRoundTrip(
-    const ttg::ScheduleLoop &loop,
-    const llvm::SmallDenseMap<unsigned, int> &nodeToWg,
-    llvm::SmallDenseMap<int, int> &rtPerWg) {
+static void
+accumulateCrossWGRoundTrip(const ttg::ScheduleLoop &loop,
+                           const llvm::SmallDenseMap<unsigned, int> &nodeToWg,
+                           llvm::SmallDenseMap<int, int> &rtPerWg) {
   for (const auto &edge : loop.edges) {
     auto sIt = nodeToWg.find(edge.srcId);
     auto dIt = nodeToWg.find(edge.dstId);
@@ -4667,8 +4668,7 @@ struct ModuloSchedulePass
                   // Loops with their own candidate-k vary; loops with fewer
                   // candidates (a single fixed partition) clamp to their last
                   // one so they stay constant across variants.
-                  size_t idx =
-                      std::min(k, liveLoop.topPartitions.size() - 1);
+                  size_t idx = std::min(k, liveLoop.topPartitions.size() - 1);
                   finalizeLoopPartitionForDump(dstLoop,
                                                liveLoop.topPartitions[idx]);
                   if (idx < liveLoop.topPartitionCosts.size())

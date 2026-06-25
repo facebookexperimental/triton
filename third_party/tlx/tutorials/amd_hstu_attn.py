@@ -5,9 +5,6 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 import torch
 import torch.nn.functional as F
-import pytest
-import sys
-import argparse
 
 try:
     from triton.language.extra.libdevice import (

@@ -1225,6 +1225,8 @@ Currently consumed only by the scaled-WMMA pattern (gfx1250). Regular
 
 [Persistent Flash Attention fwd — XCD zig-zag, cross-attention / decode](third_party/tlx/tutorials/amd_fa_persistent.py)
 
+[Rotated 4-cluster Flash Attention fwd](third_party/tlx/tutorials/amd_fa_cluster.py)
+
 [Fused addmm + GLU (Gated Linear Unit: out = x + x*y, x = A@B + bias)](third_party/tlx/tutorials/amd_addmm_glu.py)
 
 [IKBO Flash Attention (In-Kernel Broadcast Optimization, candidate/user broadcast)](third_party/tlx/tutorials/ikbo/ikbo_fa_triton.py)
@@ -1287,7 +1289,10 @@ gfx950 / CDNA4:
 
 `third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_amd_gemm_perf.py [--version {warp_pipeline|pipelined}]`
 
-`third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_amd_fa_perf.py [--version {simple|prefetch|persistent}]`
+`third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_amd_fa_perf.py [--version {simple|prefetch|persistent|cluster}]`
+
+Without `--version`, AMD FA perf runs `simple`, `prefetch`, and `persistent`; select
+`cluster` explicitly because it is D=128-only.
 
 `third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_amd_addmm_glu_perf.py [--version {tlx_baseline|tlx_simple_async|tlx_optimized_async|tlx_optimized|tlx_persistent}]`
 
