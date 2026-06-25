@@ -129,8 +129,37 @@ Default: `False`.
 
 When `insertAsyncComm` (WSCodePartition) discovers a sync point inside a
 SubtiledRegionOp's tile body, it creates the NVWS op (ProducerAcquireOp,
-ConsumerWaitOp, etc.) directly inside the tile body, threading the token,
-bufferIdx, and phase values through `addSharedArg`.
+ConsumerWaitOp, etc.) directly inside the tile body. The token is threaded as a
+`addSharedArg` (one logical channel for all tiles).
+
+#### Per-tile barrier index (shared barrier, `addPerTileArg`)
+
+The barrier slot/phase, however, must **not** be shared across tiles. A subtile
+group is a reuse group of `numTiles` distinct, concurrent buffers that all share
+**one** barrier pair, so every tile must occupy a distinct barrier *generation*.
+
+`insertAsyncComm` therefore computes a per-tile **flattened accumulation count**
+`flattened = accumCnt * numTiles + tileIdx` (`getPerTileStaggeredAccumCnt` in
+`CodePartitionUtility.cpp`) and threads it as a `SubtiledRegionOp::addPerTileArg`
+(one i64 per tile). The barrier `bufferIdx = flattened % numBuffers` and
+`phase = flattened / numBuffers` are then derived *inside* the tile body from
+that per-tile arg. This makes the shared barrier behave as a single monotonic
+stream advanced `numTiles` times per outer iteration:
+
+- The offset is the **tile index** (producer/consumer walk order), NOT the
+  reuse-group position. Using the reuse position (a permutation of tile order)
+  commits a shared slot's generations out of order and corrupts data.
+- The barrier slot need not equal the data buffer slot — producer and consumer
+  only need to agree, which they do (both walk tiles in the same order, and tile
+  `t` maps to the same buffer in both regions).
+- This is correct even when `numTiles > numBuffers`: two same-iteration tiles
+  may land on one slot, but because flattened order == tile-walk order, the
+  later tile's acquire simply *waits* for the earlier tile's slot to be released
+  (a serialization, not a race). Using `addSharedArg` for the index instead
+  (every tile the same slot/phase) deadlocks.
+
+If the per-tile→channel mapping can't be established (e.g. not a reuse group),
+the code falls back to the original shared `addSharedArg` index/phase.
 
 Before `doTokenLowering` runs, all SubtiledRegionOps containing NVWS ops
 are inlined via `lowerSubtiledRegion`. This puts the NVWS ops in flat IR

@@ -1135,6 +1135,10 @@ def _patch_lang_core(lang, scope: _LangPatchScope):
             return builder.get_fp8e4nv_ty()
         elif self.name == 'fp8e4b15':
             return builder.get_fp8e4b15_ty()
+        elif self.name == 'fp8e5b16':
+            return builder.get_fp8e5b16_ty()
+        elif self.name == 'fp8e4b8':
+            return builder.get_fp8e4b8_ty()
         elif self.name == 'fp16':
             return builder.get_half_ty()
         elif self.name == 'bf16':
@@ -1200,6 +1204,9 @@ def _patch_lang(fn):
 
 # TODO: wrap everything in triton tensors
 def _implicit_cvt(arg):
+    if isinstance(arg, bool):
+        handle = TensorHandle(np.array([arg], dtype=np.bool_), tl.int1)
+        return tl.tensor(handle, tl.int1)
     if isinstance(arg, int):
         ty = tl.str_to_ty(triton.runtime.jit.mangle_type(arg), None)
         dtype = np.int32

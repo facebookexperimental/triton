@@ -1214,49 +1214,6 @@ void TMEMAllocOp::getEffects(
                          TensorMemory::get());
 }
 
-// -- TMEMCopyOp --
-static bool hasShape(MemDescType type, ArrayRef<int64_t> shape) {
-  return type.getRank() == static_cast<int64_t>(shape.size()) &&
-         llvm::equal(type.getShape(), shape);
-}
-
-static LogicalResult verifyScaleTMEMCopyShape(TMEMCopyOp op, MemDescType srcTy,
-                                              MemDescType dstTy) {
-  auto isI8MemDesc = [](MemDescType type) {
-    return type.getElementType().isIntOrFloat() &&
-           type.getElementType().getIntOrFloatBitWidth() == 8;
-  };
-  auto emitScaleShapeError = [&]() -> LogicalResult {
-    return op.emitOpError()
-           << "scale tmem_copy requires an explicit packed i8 SMEM shape "
-              "matching the rank-2 TMEM scale shape; accepted source shapes "
-              "are [rows / 128, cols / 4, 32, 16], [rows / 128, cols / 4, "
-              "32, 4, 4], [1, rows / 128, cols / 4, 2, 256], or "
-              "[rows / 128, (cols / 4) * 512]";
-  };
-
-  if (!isI8MemDesc(srcTy) || !isI8MemDesc(dstTy))
-    return emitScaleShapeError();
-
-  if (dstTy.getRank() != 2)
-    return emitScaleShapeError();
-
-  int64_t rows = dstTy.getDimSize(0);
-  int64_t cols = dstTy.getDimSize(1);
-  if (rows % 128 != 0 || cols % 4 != 0)
-    return emitScaleShapeError();
-
-  int64_t repRows = rows / 128;
-  int64_t repCols = cols / 4;
-  if (hasShape(srcTy, {repRows, repCols, 32, 16}) ||
-      hasShape(srcTy, {repRows, repCols, 32, 4, 4}) ||
-      hasShape(srcTy, {1, repRows, repCols, 2, 256}) ||
-      hasShape(srcTy, {repRows, repCols * 512}))
-    return success();
-
-  return emitScaleShapeError();
-}
-
 LogicalResult TMEMCopyOp::verify() {
   if (!isa<triton::gpu::SharedMemorySpaceAttr>(
           getSrc().getType().getMemorySpace()))
@@ -1297,8 +1254,6 @@ LogicalResult TMEMCopyOp::verify() {
     if (nvmmaEnc && nvmmaEnc.getSwizzlingByteWidth() != 0) {
       return emitOpError("The source should not be swizzled for now");
     }
-    if (failed(verifyScaleTMEMCopyShape(*this, srcTy, dstTy)))
-      return failure();
   } else {
     if (getSrc().getType().getShape() != getDst().getType().getShape()) {
       return emitOpError(
@@ -1470,6 +1425,27 @@ BlockArgument SubtiledRegionOp::addSharedArg(Value value) {
   unsigned insertPos = hasTileIndex ? tileBlock.getNumArguments() - 1
                                     : tileBlock.getNumArguments();
   return tileBlock.insertArgument(insertPos, value.getType(), getLoc());
+}
+
+BlockArgument SubtiledRegionOp::addPerTileArg(ArrayRef<Value> valuesPerTile) {
+  unsigned nTiles = getNumTiles();
+  assert(valuesPerTile.size() == nTiles &&
+         "addPerTileArg expects exactly numTiles values");
+  Block &tileBlock = getTileRegion().front();
+
+  // The new tile block argument goes right after the existing per-tile args
+  // (i.e. before any shared args / optional tile index). Compute this BEFORE
+  // appending operands, since getNumPerTilePositions() reads
+  // perTileArgs.size().
+  unsigned insertPos = getNumPerTilePositions();
+
+  // Append the per-tile operands to the perTileArgs segment. They form a new
+  // position K with operands [K*nTiles .. (K+1)*nTiles) in tile order, matching
+  // the indexing used by lowerSubtiledRegion (perTileArgs[j*nTiles + t]).
+  getPerTileArgsMutable().append(ValueRange(valuesPerTile));
+
+  return tileBlock.insertArgument(insertPos, valuesPerTile.front().getType(),
+                                  getLoc());
 }
 
 LogicalResult SubtiledRegionOp::verify() {

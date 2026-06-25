@@ -356,12 +356,9 @@ class FlashAttention:
     @staticmethod
     def create_inputs(Z, H, N_CTX, HEAD_DIM, dtype=torch.float16):
         torch.manual_seed(20)
-        q = (torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=dtype).normal_(mean=0.0,
-                                                                                      std=0.5).requires_grad_())
-        k = (torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=dtype).normal_(mean=0.0,
-                                                                                      std=0.5).requires_grad_())
-        v = (torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=dtype).normal_(mean=0.0,
-                                                                                      std=0.5).requires_grad_())
+        q = torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=dtype).normal_(mean=0.0, std=0.5).requires_grad_()
+        k = torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=dtype).normal_(mean=0.0, std=0.5).requires_grad_()
+        v = torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=dtype).normal_(mean=0.0, std=0.5).requires_grad_()
         return q, k, v
 
     @staticmethod
@@ -665,7 +662,7 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8(HEAD_DIM, causal):
         torch.manual_seed(20)
         shape = (Z, H, N_CTX, HEAD_DIM)
         (q, q_scale, q_ref), (k, k_scale, k_ref), (v, v_scale,
-                                                   v_ref) = (_generate_mxfp8_attention_inputs(shape, DEVICE, dtype))
+                                                   v_ref) = _generate_mxfp8_attention_inputs(shape, DEVICE, dtype)
         ref_out = torch.nn.functional.scaled_dot_product_attention(q_ref, k_ref, v_ref, scale=sm_scale,
                                                                    is_causal=causal)
         tri_out = _blackwell_fa_ws_pipelined_persistent_mxfp8(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal,
@@ -730,7 +727,7 @@ def _assert_close_with_cosine(
 ) -> None:
     cosine = _cosine_similarity(actual, expected)
     # TODO: Enable value-based checking once MXFP8 backward tolerances settle.
-    assert (cosine >= min_cosine), f"{label} cosine_similarity={cosine:.6f} fell below min_cosine={min_cosine:.6f}"
+    assert cosine >= min_cosine, f"{label} cosine_similarity={cosine:.6f} fell below min_cosine={min_cosine:.6f}"
 
 
 @pytest.mark.parametrize(
@@ -746,8 +743,9 @@ def _assert_close_with_cosine(
         # (2, 1, 1152),
     ],
 )
+@pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
-def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
+def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX, causal):
     """MXFP8 backward correctness vs PyTorch autograd on randomized inputs."""
     sm_scale = 0.5
     dtype = torch.float8_e4m3fn
@@ -757,11 +755,11 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
     torch.manual_seed(20)
 
     (q, q_scale, q_ref), (k, k_scale, k_ref), (v, v_scale,
-                                               v_ref) = (_generate_mxfp8_attention_inputs(shape, DEVICE, dtype))
+                                               v_ref) = _generate_mxfp8_attention_inputs(shape, DEVICE, dtype)
     q_ref = q_ref.detach().requires_grad_(True)
     k_ref = k_ref.detach().requires_grad_(True)
     v_ref = v_ref.detach().requires_grad_(True)
-    ref_out = torch.nn.functional.scaled_dot_product_attention(q_ref, k_ref, v_ref, scale=sm_scale, is_causal=False)
+    ref_out = torch.nn.functional.scaled_dot_product_attention(q_ref, k_ref, v_ref, scale=sm_scale, is_causal=causal)
     do_bf16 = torch.randn_like(ref_out)
     ref_out.backward(do_bf16)
 
@@ -825,7 +823,7 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
         desc_v_scale,
         N_CTX=N_CTX,
         HEAD_DIM=head_dim,
-        STAGE=1,
+        STAGE=3 if causal else 1,
         num_stages=1,
         num_warps=4,
         **fwd_config,
@@ -850,6 +848,7 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX):
         do_scale_dv,
         sm_scale,
         do_bf16=do_bf16,
+        causal=causal,
     )
     ref_dq = q_ref.grad.detach()
     ref_dk = k_ref.grad.detach()
@@ -1169,8 +1168,8 @@ class IkboLce:
         baseline_err = (ref_fp16.float() - ref_fp32).abs().max().item()
         kernel_err = (out.float() - ref_fp32).abs().max().item()
         threshold = max(IkboLce.ERROR_MULTIPLIER * baseline_err, IkboLce.ERROR_FLOOR)
-        assert kernel_err <= threshold, (f"IKBO LCE error exceeds baseline: "
-                                         f"kernel={kernel_err:.4e}, baseline={baseline_err:.4e}")
+        assert kernel_err <= threshold, (
+            f"IKBO LCE error exceeds baseline: kernel={kernel_err:.4e}, baseline={baseline_err:.4e}")
 
 
 class IkboFa:
