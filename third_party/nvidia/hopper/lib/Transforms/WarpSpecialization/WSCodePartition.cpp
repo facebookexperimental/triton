@@ -907,6 +907,8 @@ static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance,
                             sharedMemorySpace, /*mutableMemory=*/true);
   Value barrierAlloc = mlir::triton::gpu::LocalAllocOp::create(
       builder, loc, barrierMemDescType, Value());
+  barrierAlloc.getDefiningOp()->setAttr(kWarpSpecializeGeneratedBarrierAttrName,
+                                        builder.getUnitAttr());
   for (unsigned i = 0; i < distance; i++) {
     Value idx = arith::ConstantIntOp::create(builder, loc, i, 32);
     Value barrierView = ttg::MemDescIndexOp::create(
@@ -1668,8 +1670,9 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
     unsigned elemBitWidth = elemType.getIntOrFloatBitWidth();
     unsigned colStride = 32 / elemBitWidth;
     auto encoding = ttng::TensorMemoryEncodingAttr::get(
-        context, blockM, bufferShape[1], colStride, /*CTASplitM=*/1,
-        /*CTASplitN=*/1, /*twoCTAs=*/false, ttng::TensorMemoryCTAMode::DEFAULT);
+        context, blockM, bufferShape[1], colStride,
+        ttg::CGAEncodingAttr::get1CTALayout(context, 2),
+        /*twoCTAs=*/false, ttng::TensorMemoryCTAMode::DEFAULT);
     Type memdescType =
         ttg::MemDescType::get(bufferShape, elemType, encoding,
                               tensorMemorySpace, /*mutableMemory*/ true);

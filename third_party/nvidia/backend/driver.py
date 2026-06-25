@@ -1,15 +1,19 @@
 import ast
 import functools
 import os
+import re
 import subprocess
 import triton
-import re
 from pathlib import Path
 from triton import knobs
 from triton.runtime.build import compile_module_from_src
 from triton.runtime import _allocation
 from triton.backends.compiler import GPUTarget
-from triton.backends.driver import GPUDriver
+from triton.backends.driver import (
+    GPUDriver,
+    decompose_descriptor,
+    wrap_handle_tensordesc_impl,
+)
 
 dirname = os.path.dirname(os.path.realpath(__file__))
 include_dirs = [os.path.join(dirname, "include")]
@@ -308,23 +312,9 @@ class TmaDescKernelParam:
         return self.desc.data_ptr()
 
 
-def make_tensordesc_arg(arg, metadata):
+def make_tensordesc_arg(arg, metadata, _):
     if metadata is None:
-        # Currently the host side tensor descriptors get decomposed in
-        # the frontend to tensor desc, shape, and strides. We have no
-        # way to use these shape and strides when processing tensor
-        # descriptors which is why we provide our own decomposition
-        # above. Sadly this means we have to pass the shape and strides
-        # twice.
-        return [
-            arg.base,
-            *arg.shape,
-            *arg.strides,
-            arg.padding == "nan",
-            arg.round_f32_to_tf32,
-            *arg.shape,
-            *arg.strides,
-        ]
+        return decompose_descriptor(arg)
 
     swizzle = metadata["swizzle"]
     elem_size = metadata["elem_size"]
@@ -381,32 +371,7 @@ def make_tensordesc_arg(arg, metadata):
 
 
 def wrap_handle_tensordesc(launcher, signature, tensordesc_meta):
-    has_tensor_desc_arg = any(isinstance(sig, str) and sig.startswith("tensordesc") for sig in signature.values())
-    if not has_tensor_desc_arg:
-        return launcher
-
-    tensordesc_indices = set(
-        [i for i, sig in enumerate(signature.values()) if isinstance(sig, str) and sig.startswith("tensordesc")])
-    assert not tensordesc_meta or len(tensordesc_meta) == len(tensordesc_indices)
-    if not tensordesc_meta:
-        tensordesc_meta = [None] * len(tensordesc_indices)
-
-    def inner(*args):
-        base_args = args[:-1]
-        kernel_args = args[-1]
-
-        final_kernel_args = []
-        tensordesc_idx = 0
-        for i, arg in enumerate(kernel_args):
-            if i in tensordesc_indices:
-                final_kernel_args.extend(make_tensordesc_arg(arg, tensordesc_meta[tensordesc_idx]))
-                tensordesc_idx += 1
-            else:
-                final_kernel_args.append(arg)
-
-        return launcher(*base_args, final_kernel_args)
-
-    return inner
+    return wrap_handle_tensordesc_impl(launcher, signature, tensordesc_meta, make_tensordesc_arg)
 
 
 class CudaLauncher(object):
