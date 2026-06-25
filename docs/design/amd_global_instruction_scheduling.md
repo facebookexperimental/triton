@@ -28,12 +28,14 @@ This document describes a scheduling algorithm for AMD CDNA4 (MI350, gfx950) GPU
   - [Step 4: LDS Budget and the vmcnt Window](#step-4-lds-budget-and-the-vmcnt-window)
   - [Step 4.5: Lifetime-Aware LDS Buffer Merging](#step-45-lifetime-aware-lds-buffer-merging)
   - [Step 4.7: Warp-Group Partitioning](#step-47-warp-group-partitioning)
+  - [Step 4.8: Derive s_setprio Priorities (Modulo-Reservation Priority)](#step-48-derive-s_setprio-priorities-modulo-reservation-priority)
   - [Step 5: Emit ScheduleGraph](#step-5-emit-schedulegraph)
 - [Pass A.5: Data Partitioning (Optional)](#pass-a5-data-partitioning-optional)
 - [Pass A.6: Scheduling Non-Loop Regions](#pass-a6-scheduling-non-loop-regions)
 - [Pass A.7: Epilogue Subtiling](#pass-a7-epilogue-subtiling)
 - [Pass B: Warp-Pipeline Reconstruction](#pass-b-warp-pipeline-reconstruction)
 - [Pass C: Code Generation and Instruction Ordering](#pass-c-code-generation-and-instruction-ordering)
+- [Integration with the Existing AMD Backend](#integration-with-the-existing-amd-backend)
 - [Worked Example: gfx950 Warp-Pipelined GEMM](#worked-example-gfx950-warp-pipelined-gemm)
 - [Worked Example: Fused addmm + GLU](#worked-example-fused-addmm--glu)
 - [Worked Example: Flash Attention Forward](#worked-example-flash-attention-forward)
@@ -50,7 +52,7 @@ This algorithm:
 
 The algorithm is inspired by the hand-tuned AMD TLX kernels in this tree — `amd_gemm_warp_pipeline.py`, `amd_fa_pipelined.py`, `amd-addmm-glu-opt_test.py`, `amd_tdm_gemm_pipelined.py` — and by the existing `BlockPingpong.cpp` scheduler. It formalizes the decisions those kernels make by hand (buffer depth, the `async_load_wait_group` count, the `warp_pipeline_stage` split, `s_setprio` priorities) into a systematic modulo-scheduling framework.
 
-The ultimate target is **TTGIR** lowered through the AMD backend (`third_party/amd/`). TLX is used for illustration because it maps closely to the AMD primitives (`tlx.async_load`, `tlx.warp_pipeline_stage`, `tlx.local_alloc`), but the algorithm's output is a scheduling specification that the AMD lowering passes (`WarpPipeliner.cpp`, `ConvertWarpPipeline.cpp`, `LoadStoreOpToLLVM.cpp`, `UpdateAsyncWaitCount.cpp`) consume.
+**The algorithm is implemented entirely as AMD backend compiler passes — it does not generate TLX.** It consumes a plain pipelined `scf.for` in ordinary **TTGIR** (no `tlx.*` annotations required — the same kind of input `BlockPingpong.cpp` operates on) and emits the fully lowered warp-pipeline IR directly: the border-split loop, the `cond_barrier` phase shift, `s_setprio`, `s_waitcnt vmcnt`, and `sched.group.barrier`, all the way down to ROCDL/LLVM. TLX primitives (`tlx.async_load`, `tlx.warp_pipeline_stage`, `tlx.local_alloc`) appear in this document only as a **human-readable rendering** of that IR, because they map one-to-one onto the AMD ops the passes emit; the actual artifacts are TTGIR attributes/ops and ROCDL intrinsics consumed and produced by the AMD lowering passes (`WarpPipeliner.cpp`, `ConvertWarpPipeline.cpp`, `LoadStoreOpToLLVM.cpp`, `UpdateAsyncWaitCount.cpp`). Nothing round-trips back up to the TLX frontend.
 
 ### Why AMD Is Different
 
@@ -106,6 +108,7 @@ The ScheduleGraph is built from the DDG and points into the TTGIR via `Operation
 Phase 0 (Schedule):   DDG + Rau's → ScheduleNode.cycle/stage
 Phase 1 (Buffers):    Stage diffs → ScheduleBuffer.count + vmcnt window
 Phase 1.5 (Partition):Separation cost + makespan → ScheduleNode.warpGroup/stage
+                      MRT slack + occupancy      → ScheduleNode.s_setprio
 Phase 2 (Expand):     Bottom-up → prologueNodes/epilogueNodes
 Phase 3 (Lower):      ScheduleGraph → async copies + vmcnt waits + cond_barrier
                       + warp_pipeline_stage borders + sched.group.barrier + s_setprio
@@ -115,7 +118,7 @@ Phase 3 is where AMD diverges most: instead of emitting `mbarrier.{init,arrive,w
 
 ### Algorithm Summary
 
-**Pass A — Scheduling (iterative).** Schedules all regions, derives LDS depths, checks the LDS budget, partitions ops into warp-pipeline stages/groups, and applies DDG transformations — re-running until stable. Loop regions use modulo scheduling (Rau's algorithm) to minimize II; non-loop regions use list scheduling. From the schedule it derives LDS buffer depths and the per-loop **vmcnt window** (Step 3), merges LDS buffers with non-overlapping lifetimes (Step 4.5), runs a kernel-wide LDS budget check (Step 4), and partitions ops into warp groups/stages using latency-aware multi-pipeline clustering (Step 4.7). DDG transformations — data partitioning (A.5) and epilogue subtiling (A.7) — can trigger a re-schedule. Converges in 1–2 iterations.
+**Pass A — Scheduling (iterative).** Schedules all regions, derives LDS depths, checks the LDS budget, partitions ops into warp-pipeline stages/groups, and applies DDG transformations — re-running until stable. Loop regions use modulo scheduling (Rau's algorithm) to minimize II; non-loop regions use list scheduling. From the schedule it derives LDS buffer depths and the per-loop **vmcnt window** (Step 3), merges LDS buffers with non-overlapping lifetimes (Step 4.5), runs a kernel-wide LDS budget check (Step 4), and partitions ops into warp groups/stages using latency-aware multi-pipeline clustering (Step 4.7), then derives each cluster's `s_setprio` priority from the modulo reservation table (Step 4.8). DDG transformations — data partitioning (A.5) and epilogue subtiling (A.7) — can trigger a re-schedule. Converges in 1–2 iterations.
 
 **Pass B — Warp-Pipeline Reconstruction.** Reads the stage/group partition from the ScheduleGraph and reconstructs the AMD two-warp-group phase-shifted pipeline: it groups same-stage ops into clusters, inserts the `cond_barrier` phase shift in the prelude (one group runs a stage ahead), places `s_waitcnt vmcnt` waits and `s_barrier` cluster barriers where the modulo schedule requires cross-cluster ordering, and assigns each cluster an `s_setprio` priority. This is the analog of NVIDIA Pass B, but symmetric (both groups run the same code) rather than role-specialized.
 
@@ -136,6 +139,7 @@ Phase 3 is where AMD diverges most: instead of emitting `mbarrier.{init,arrive,w
 │   Step 4.5: merge non-overlapping LDS buffers       │
 │   Step 4:  kernel-wide LDS budget check (160 KB)    │
 │   Step 4.7: warp-group / stage partitioning         │
+│   Step 4.8: s_setprio from modulo MRT (slack + occ) │
 │   DDG transforms: A.5 data partition, A.7 subtile   │
 │         ── any DDG changed? ── yes → re-run ─────────│
 └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┤ no (converged) ─ ─ ─ ─ ─┘
@@ -335,9 +339,38 @@ Latency-aware multi-pipeline clustering, as in NVIDIA Step 4.7 — compute a **s
 
 The result for GEMM: a single two-group warp-pipeline with `{MFMA}` and `{MEM}` clusters. For FA: the same two groups, with VALU/transcendental ops co-scheduled into the compute cluster (mixed MFMA+VALU), mirroring how `BlockPingpong` interleaves ~3 SALU/VALU per MFMA via `sched.group.barrier` (BlockPingpong.cpp:897-901).
 
+### Step 4.8: Derive s_setprio Priorities (Modulo-Reservation Priority)
+
+`s_setprio` is the per-cluster issue priority Pass C emits. This step computes it **from the modulo reservation table (MRT) built in Step 2** — not from a memory-vs-compute label. The "memory cluster → 1, compute cluster → 0" rule that `BlockPingpong.cpp` hard-codes (BlockPingpong.cpp:61-62, 678-707) is the *output* of this derivation on GEMM/FA, not its premise.
+
+**The lever.** The two warp groups run the same clusters ping-ponged by an offset Δ (Step 4.8b); at every cycle one group is in cluster `c` and the other in `c⊖Δ`. Where both occupy the **same** pipeline — almost always VALU (address arithmetic in the mem cluster, softmax/scale in the compute cluster) — only one can issue, and `s_setprio` picks it. Two quantities read off the MRT decide the right pick:
+
+- **Monopolization** `M(c)` — `c`'s occupancy of the *contended* pipeline, straight from the MRT: `M(c) = Σ_p contended(p)·occ(c,p)`. A cluster dense on the contended unit must get *low* priority: if it wins the slot it monopolizes issue and the opposite warp cannot make progress, collapsing the overlap (BlockPingpong.cpp:689-692).
+- **Issue urgency** `U(c)` — how much delaying `c`'s issue grows the makespan: the modulo slack of its ops plus the latency-criticality of any async load it issues (a `global_load_lds` must be issued early enough that its ~600-cycle round-trip is hidden). `U(c) = max_{op∈c} [ crit(op) + isAsyncLoad(op)·latencyPressure(op) ]`.
+
+**Step 4.8a — MRT occupancy & slack.** From the Step 2 schedule, for each cluster `c` and pipeline `p` take `occ(c,p)` = cycles of `p` used within the II window. Under the same modulo constraints (`consumer ≥ producer + latency − d·II`) compute `slack(op) = ALAP(op) − ASAP(op)` and `crit(op) = 1 − slack(op)/(maxSlack + ε)` ∈ [0,1]. Ops on the recurrence circuit κ* that set RecMII have `crit ≈ 1`; ops that are only resource-bound (they set ResMII but lie on no tight cycle — e.g. the MFMA in a MEM-bound GEMM) keep positive slack and lower `crit`.
+
+**Step 4.8b — Ping-pong offset Δ.** The offset is *derived*, not assumed to be "one stage": it is the cluster shift that minimizes contention in the overlapped MRT.
+
+```
+Δ* = argmin_Δ  Σ_c Σ_p  max(0, occ(c,p) + occ(c⊖Δ,p) − cap(p))
+```
+
+For the 2-cluster GEMM body Δ*=1 (≈ II/2: `mfma` opposite `mem`); for FA's 4-cluster body Δ*=2 (`dot1`↔`dot2`, `mem1`↔`mem2` never co-occupy). `contended(p)` is the set of pipelines with residual co-occupancy at Δ*. This Δ* is what the rest of the doc calls the one-stage phase offset.
+
+**Step 4.8c — Priority.** Rank clusters by
+
+```
+pscore(c) = U(c) − λ·M(c)
+```
+
+and quantize to the `s_setprio` 0–3 range by rank; the two-group ping-pong collapses this to {0,1}. The value is stored on each cluster's ScheduleNodes (`s_setprio` field) and realized verbatim in Pass C.
+
+**Reduction to mem=1 / dot=0 (why it matches the hand kernels).** On GEMM and FA the compute cluster is dense on the contended VALU/MFMA units (`M` high) and self-paced, while the mem cluster is sparse on VALU (`M` low) but issues the latency-critical `global_load_lds` (`U` high). So `pscore(mem) > pscore(dot)` → **mem=1, dot=0**, matching every hand-tuned kernel — computed from the MRT, not labelled. The rule is general: it elevates whichever cluster is the *sparse co-issuer* on the contended unit, so a compute-sparse / memory-dense loop (heavy LDS packing, tiny MFMA) flips the assignment — which a fixed op-type heuristic cannot.
+
 ### Step 5: Emit ScheduleGraph
 
-Package all decisions: cycles, stages, LDS buffers with lifetimes + padding policy + merge groups, vmcnt windows, and the two-group/stage partition. This graph is the sole input to Pass B.
+Package all decisions: cycles, stages, LDS buffers with lifetimes + padding policy + merge groups, vmcnt windows, the two-group/stage partition, and the per-cluster `s_setprio` priorities. This graph is the sole input to Pass B.
 
 ---
 
@@ -371,15 +404,15 @@ This is where AMD diverges most from NVIDIA Pass B. NVIDIA reconstructs *asymmet
 
 **Step 3 — Compute prologue/epilogue structure.** Prologue depth = max stage across all ops (drains the pipeline fill); epilogue drains the in-flight loads. Same loop-expansion math as NVIDIA, realized by the prologue async-load sequence + the `tl.static_range` drain loop seen in the hand-written kernels.
 
-**Step 4 — Assign warp counts and priorities.** Two warp groups (`warpSize × 4` threads each). **No register reallocation** (`reallocRegisters` is a no-op, ConvertWarpSpecializeToLLVM.cpp:168) — instead, each cluster gets an `s_setprio` priority from the ScheduleNode (MFMA cluster → priority 0 in the hand kernels means "yield issue to let memory co-issue"; the convention is encoded in `warp_pipeline_stage(..., priority=)`). Occupancy is set via `waves_per_eu`.
+**Step 4 — Assign warp counts and priorities.** Two warp groups (`warpSize × 4` threads each). **No register reallocation** (`reallocRegisters` is a no-op, ConvertWarpSpecializeToLLVM.cpp:168) — instead, each cluster carries the `s_setprio` priority computed in [Pass A Step 4.8](#step-48-derive-s_setprio-priorities-modulo-reservation-priority) and stored on its ScheduleNodes; Pass B only threads it through to `warp_pipeline_stage(..., priority=)` (it makes no priority decision of its own). Occupancy is set via `waves_per_eu`.
 
-**Step 5 — Generate TLX skeleton.** Emit the loop with `with tlx.warp_pipeline_stage(label, priority): ...` per cluster, the prologue async loads, and the epilogue drain — i.e. reproduce the structure of `amd_gemm_warp_pipeline.py` automatically.
+**Step 5 — Emit the warp-pipeline IR (backend, not TLX).** Write the result directly into TTGIR: the prologue async-copy sequence, the `scf.for` body split into `scf.execute_region` clusters carrying `triton.warp_pipeline.border` (cluster label) + `triton.warp_pipeline.priority` (from Step 4.8) attributes, the inter-cluster `s_waitcnt vmcnt` / `s_barrier` ops, and the epilogue drain — then hand off to `WarpPipeliner.cpp` → `ConvertWarpPipeline.cpp` for the `cond_barrier` phase-shift lowering down to ROCDL. The borders, priorities, and vmcnt waits are **IR attributes and ops, never `tlx.*` calls**. The emitted structure is identical to what `amd_gemm_warp_pipeline.py` writes by hand, which is the only reason the worked examples below render it as TLX for readability.
 
 ---
 
 ## Pass C: Code Generation and Instruction Ordering
 
-Pass C takes the `(stage, cluster)` assignments and the skeleton from Pass B and produces final TTGIR/LLVM ordering. It makes no scheduling decisions.
+Pass C takes the `(stage, cluster)` assignments and the border-tagged loop from Pass B and produces the final TTGIR→LLVM ordering. It makes no scheduling decisions.
 
 - **Loop regions:** expand prologue/kernel/epilogue. The `WarpPipeliner.cpp` pass splits the `scf.for` body at `warp_pipeline.border` markers into `scf.execute_region` clusters; `ConvertWarpPipeline.cpp` lowers them to the phase-shifted two-group schedule.
 - **Within-cluster instruction interleaving:** emit `sched.group.barrier` (`ROCDL::SchedGroupBarrier`, SchedInstructions.cpp; BlockPingpong.cpp:897) to interleave MFMA with VALU/`ds_read` at a chosen ratio (e.g. ~3 VALU per MFMA), bracketed by `sched.barrier` so the LLVM scheduler cannot move ops across cluster boundaries. Optionally emit `iglp_opt` for the attention pattern (the only `instruction_sched_hint` variant currently implemented, SchedInstructions.cpp:82). Emit `s_setprio` transitions at cluster entry/exit (`ROCDL::SetPrioOp`).
@@ -388,6 +421,65 @@ Pass C takes the `(stage, cluster)` assignments and the skeleton from Pass B and
 ### Relationship Between Pass A and Pass C
 
 Pass A decides *what overlaps* (stages, clusters, depths); Pass C decides *how the ISA expresses it* (`sched.group.barrier` ratios, `s_setprio`, `vmcnt`). The cluster IDs from Pass A Step 2.5 are the contract between them — Pass C never reorders across a cluster boundary.
+
+---
+
+## Integration with the Existing AMD Backend
+
+This algorithm does not replace the AMD pass pipeline — it slots into it. The entire warp-pipeline is held together by **one IR attribute contract**, not by TLX, which is what makes the integration small.
+
+### The seam: the border-marker attribute contract
+
+The whole mechanism is carried by two attributes on a marker op in the loop body:
+
+> **border marker** = an op (a `rocdl.sched.barrier`) carrying `triton.warp_pipeline.border` (StringAttr, the cluster label) and an optional `triton.warp_pipeline.priority` (IntegerAttr).
+
+- The TLX frontend only ever *emits* these via `create_warp_pipeline_border`.
+- `WarpPipeliner.cpp` *reads* them (`readBorderMarker`, WarpPipeliner.cpp:61/64), splits the loop body at borders into clusters, and propagates the priority onto each `scf.execute_region` (WarpPipeliner.cpp:157).
+- `ConvertWarpPipeline.cpp` turns the priority into `ROCDL::SetPrioOp(intAttr.getInt())` (ConvertWarpPipeline.cpp:253) and emits the `cond_barrier(warpHigh/warpLow)` phase shift itself (ConvertWarpPipeline.cpp:295/305).
+
+So connecting this algorithm to the backend reduces to: **a new TTGIR pass writes these two attributes onto marker ops; everything downstream is reused unchanged, and no `tlx.*` op is ever produced.**
+
+### Pass A/B/C mapped onto the real pipeline
+
+The pass order in `third_party/amd/backend/compiler.py` (`make_ttgir`, then `make_llir`):
+
+| This doc | Existing AMD pass (call site) | Status |
+|---|---|---|
+| **Pass A** — modulo schedule, II, buffer depth, stage, cluster | `add_schedule_loops` (ScheduleLoops.cpp, make_ttgir:320) + `add_pipeline` (LowerLoops/Pipeline, make_ttgir:321) | **scaffolding exists, cost model missing** |
+| **Pass A, Step 4.8** — `s_setprio` priority | nobody computes it automatically (only `BlockPingpong.cpp`'s hard-coded template) | **net-new**; output is the `.priority` integer |
+| **Pass B** — emit borders + sync | marker emission (today done by the TLX frontend) + `add_warp_pipeline` (WarpPipeliner.cpp, make_ttgir:370) splits clusters | WarpPipeliner exists; **marker emission is the new piece** (it replaces the human writing `warp_pipeline_stage`) |
+| **Pass C** — lower to `cond_barrier`/`s_setprio`/`vmcnt`/`sched.group.barrier` | `add_warp_pipeline_conversion` (ConvertWarpPipeline.cpp, make_llir:401) + `add_update_async_wait_count` (make_llir:400) + `lower_instruction_sched_hints` (make_llir:430) | **reused as-is** |
+
+### Where the new pass goes
+
+A single new TTGIR pass — `add_auto_warp_pipeline` — inserted in `make_ttgir` **after `add_pipeline` and immediately before `add_warp_pipeline`** (make_ttgir:370):
+
+- *After `add_pipeline`*: the loop is already multi-buffered, with the prologue/epilogue and async copies materialized, so the marker ops have real ops to bracket.
+- *Immediately before `add_warp_pipeline`*: that pass is deliberately placed last because the preceding `cse`/`dce` would otherwise strip the priority markers (compiler.py:364-369). The new emitter must run after that cleanup for the same reason (its markers survive because they hang on a side-effecting `sched.barrier`).
+
+The pass does exactly three things — build the DDG, run the modulo analysis (II / slack / occupancy), compute clusters + Step 4.8 priorities — then writes the `border`/`priority` markers. After that, `add_warp_pipeline → add_update_async_wait_count → add_warp_pipeline_conversion → lower_instruction_sched_hints` take over automatically.
+
+### Reused for free (the new scheduler never touches these)
+
+- **Two warp groups + `cond_barrier` phase shift** — `emitPipelinePrelude`/`emitPipelinePostlude` (ConvertWarpPipeline.cpp:295/305).
+- **`s_setprio`** — emitted from the priority attribute (ConvertWarpPipeline.cpp:253); Step 4.8 only supplies the integer.
+- **`vmcnt`** — `UpdateAsyncWaitCount.cpp` derives it by backward def-chain analysis.
+- **In-cluster `sched.group.barrier` / `iglp_opt`** — `lower_instruction_sched_hints`.
+
+This is the concrete meaning of "Pass C makes no scheduling decisions": on AMD it already exists.
+
+### Net-new work and blockers (priority order)
+
+1. **Latency + resource cost model (the hard blocker).** `add_schedule_loops` passes an *empty* `unusedOpLatency` today (ScheduleLoops.cpp:125), so there is currently no II / slack / occupancy to compute against. Both Pass A and Step 4.8 stand on this gfx950-microbenchmarked table (Limitations #1). Without it the rest is moot.
+2. **The marker-emitting pass** above — turning "human writes `warp_pipeline_stage`" into "compiler emits the attributes."
+3. **Mutual exclusion with `BlockPingpong.cpp`.** `add_block_pingpong` (make_ttgir:335-336) is the existing *automatic* competitor: it also emits `s_setprio` + `cond_barrier`, also runs before `add_warp_pipeline`, but only matches its hard-coded templates (1–2 dots, fixed tile sizes). The new pass and BlockPingpong must never transform the same loop — gate them with a knob (mirroring `knobs.amd.use_block_pingpong`), with the new general path taking the loops BlockPingpong's templates do not cover.
+
+### Subtleties
+
+- **Opt-in is automatic.** `WarpPipeliner.cpp` is a no-op when a loop has no borders, so the new pass only affects loops it chooses to mark — the blast radius is bounded.
+- **Gluon path.** `gluon_to_ttgir` runs its own `add_warp_pipeline` (compiler.py:387). Covering gluon kernels means running the emitter there too; the plain `triton.jit`/TTGIR path needs only the `make_ttgir` insertion.
+- **Who owns buffer depth.** Multi-buffering is decided by `add_schedule_loops` + `add_pipeline` from `num_stages`. Pass A's depth decision therefore belongs *inside* ScheduleLoops (feed it the cost model and let it set depth) rather than in the marker emitter — which is the choice between folding Pass A into ScheduleLoops ("all the way down", more invasive) and a separate post-pipeline analysis pass (lower risk, matches the Pass A/B split here).
 
 ---
 
@@ -412,9 +504,11 @@ stage 2:  mfma                      (MFMA)
 
 **Step 3 — Depth:** accumulator-to-MFMA lifetime spans the loads → `floor(lifetime/II)+1 = 3` buffers; vmcnt window `W=1` (keep newest load group in flight) → `async_load_wait_group(1)`.
 
-**Step 4.7 — Partition:** two-group warp-pipeline, clusters `{mfma}` (priority 0) and `{mem: next loads + ds_read}` (priority 1).
+**Step 4.7 — Partition:** two-group warp-pipeline, two clusters: `{mfma}` and `{mem: next loads + ds_read}`.
 
-**Pass B/C — Generated structure (abbreviated):**
+**Step 4.8 — Priority:** Δ*=1 (`mfma` opposite `mem`, ≈ II/2). The mem cluster issues the latency-critical `global_load_lds` (high `U`) and is sparse on the contended issue unit (low `M`); the mfma cluster is the dense, self-paced ResMII monopolizer (high `M`, lower `U`). So `pscore(mem) > pscore(mfma)` → **`mem`=1, `mfma`=0** — the `priority=` the emitted border markers carry.
+
+**Pass B/C — Emitted IR (abbreviated; rendered as TLX for readability — the passes emit TTGIR borders + ROCDL, not `tlx.*`):**
 ```python
 # Prologue: issue NUM_BUFFERS async loads (global_load_lds)
 for i in range(NUM_BUFFERS):
@@ -444,6 +538,9 @@ Maps to `amd-addmm-glu-opt_test.py` (kernel `tlx_addmm_glu_kernel_optimized`, li
 - **Non-loop epilogue (Pass A.6):** `bias add → x = acc + bias → GLU out = x + x*y → store`. The accumulator is register-resident; bias/Y are loaded in the epilogue. This is list-scheduled as a straight-line region.
 - **Padded LDS for Y (Step 4.5 padding policy):** the async variant stages Y into a **padded** LDS buffer (`_y_padded_layout`, line 119: `with_identity_for([[BN, PAD]], [BM, BN], [1,0])`) so the `ds_read` of Y avoids bank conflicts. The padding adds `PAD` elements per row to the buffer's physical footprint, which the Step 4 budget check must count.
 - **Streaming epilogue traffic:** Y and C are touched once (`cache_modifier=".cs"`), so they should not be cached — a Pass C codegen detail, not a scheduling one.
+**Step 4.8 — Priority.** The K-loop is GEMM's DDG, so the derivation is identical — Δ\*=1, the mem cluster wins on **urgency** `U` (the latency-critical `global_load_lds`, the same MEM-bound case as GEMM) → **`mem`=1, `mfma`=0**. The async **Y prefetch** simply joins the `mem` cluster: it adds one more `global_load_lds` to MEM occupancy and, being latency-critical, *reinforces* `U(mem)` rather than changing its class.
+
+The instructive part is the *boundary*. The fused bias+GLU **epilogue is a non-loop region** (Pass A.6, list-scheduled, `stage=0`), never split into two phase-offset clusters, so Step 4.8 assigns it **no priority at all** — no `s_setprio`, no border marker — because there are no two warp groups contending on a shared issue port. This is the general edge of the step: **Step 4.8 fires only on warp-pipelined loops, not on straight-line regions.** What overlap the epilogue has (e.g. `ds_write` of Y sub-tile `s+1` over the `buffer_store` of sub-tile `s`, Pass A.7) is realized by `sched.group.barrier` ordering in Pass C and by `s_waitcnt vmcnt`, not by warp-pipeline priority.
 
 ## Worked Example: Flash Attention Forward
 
@@ -517,14 +614,24 @@ Two 2-slot buffers: `2 × (BLOCK_N × HEAD_DIM) × sizeof(bf16) × 2` = `2 × (6
 
 ### Pass A, Step 4.7: Warp-Group / Cluster Partition
 
-Step 4.7 produces **four clusters in two priority classes**, realized directly by the kernel's `with tlx.warp_pipeline_stage(label, priority=...)` blocks:
+Step 4.7 produces **four clusters**, realized directly by the kernel's `with tlx.warp_pipeline_stage(label, priority=...)` blocks; the `priority=` values themselves are assigned in [Step 4.8](#step-48-derive-s_setprio-priorities-modulo-reservation-priority), not here:
 
-- **DOT clusters** (`dot1`, `dot2`) → `priority=0`. MFMA + the dependent VALU softmax ops are kept in one cluster because softmax must follow QK on the *same* data — separating them across warp groups would cost a full `s_barrier` per element of a long dependency chain (high separation cost). Priority 0 yields the issue slot so memory can co-issue.
-- **MEM clusters** (`mem1`, `mem2`) → `priority=1`. The `ds_read` + `global_load_lds` pair. Higher priority keeps the memory wavefront driving the async engine.
+- **DOT clusters** (`dot1`, `dot2`). MFMA + the dependent VALU softmax ops are kept in one cluster because softmax must follow QK on the *same* data — separating them across warp groups would cost a full `s_barrier` per element of a long dependency chain (high separation cost).
+- **MEM clusters** (`mem1`, `mem2`). The `ds_read` + `global_load_lds` pair, kept together so the read of the just-arrived tile overlaps the issue of a future tile.
 
 Both warp groups run **all four clusters** phase-offset by one stage (`cond_barrier`), the AMD warp-pipeline model — not asymmetric producer/consumer roles. This is the same shape `BlockPingpong.cpp` builds by hand for GEMM, here generalized to FA's four clusters.
 
 `num_warps = 8` at BLOCK_M=256 (the wrapper enforces `BLOCK_M ≥ num_warps × MFMA_M`, MFMA_M=32): fewer than 32 dot-rows per warp would be an invalid MFMA tiling.
+
+### Pass A, Step 4.8: Priorities from the MRT
+
+The four clusters fall into the kernel's two `priority` classes through the Step 4.8 derivation — not by labelling them mem vs compute:
+
+- **Contended unit.** At Δ*=2 each mem cluster runs opposite a dot cluster. The pipeline they share is **VALU**: the mem clusters issue address arithmetic while the dot clusters run the exp2/scale softmax burst, so `contended = {VALU}`.
+- **Monopolization `M`.** `M(dot1) = M(dot2)` is high — dense MFMA plus the heavy exp2 VEC burst saturate the VALU issue. `M(mem1) = M(mem2)` is low — only a handful of address-update VALU ops. A high-priority dot cluster would monopolize VALU and starve the opposite mem warp's address calc (BlockPingpong.cpp:689-692).
+- **Urgency `U`.** `U(mem1) = U(mem2)` is high — each issues a `global_load_lds` (ACK/ACV) whose ~600-cycle round-trip must be hidden across the depth-4 pipeline, so its *issue timing* is latency-critical. `U(dot1) = U(dot2)` is lower — the one-iteration `(p, alpha)` stagger gives the compute clusters issue slack.
+
+So `pscore(mem) = U − λM` exceeds `pscore(dot)` → **mem1/mem2 → priority 1, dot1/dot2 → priority 0** — exactly the `priority=` the kernel writes by hand, now produced by Step 4.8 rather than asserted. (If the loop were memory-dense and compute-sparse, the same arithmetic would flip it; that is the point of deriving rather than labelling.)
 
 ### Pass B, Step 2: Synchronization
 
@@ -536,7 +643,7 @@ Three AMD mechanisms appear, each mapping to a Pass B decision:
 
 The `local_trans` on K is a **metadata-only memdesc transpose**: it makes `local_load` land directly in `dot_op(opIdx=1)` layout, skipping the register-shuffle + LDS round-trip that `tl.dot(q, k.T)` would otherwise emit. In the ScheduleGraph this is a layout annotation on the LRK buffer's consumer, not a scheduled op.
 
-### Pass B/C, Step 5: Generated TLX Code (steady-state loop, abbreviated)
+### Pass B/C, Step 5: Emitted IR (steady-state loop, abbreviated; rendered as TLX for readability)
 
 ```python
 for block_n in tl.range(block_start, block_end - 3, num_stages=0):
@@ -569,7 +676,9 @@ for block_n in tl.range(block_start, block_end - 3, num_stages=0):
 
 The depth-4 prologue (prime K0/V0/K1/K2) and the 3-tile drain (no OOB prefetch) are exactly the prologue/epilogue structure Pass B Step 3 computes from `maxStage`.
 
-### Algorithm → TLX Code Mapping Summary
+### Algorithm → Emitted IR Mapping Summary
+
+(The right column shows the hand-written `cluster` kernel's TLX as a readable stand-in for the IR the backend passes emit — the passes produce the equivalent TTGIR borders / ROCDL, not this TLX source.)
 
 | Algorithm concept | FA `cluster` kernel realization |
 |---|---|
@@ -577,7 +686,7 @@ The depth-4 prologue (prime K0/V0/K1/K2) and the 3-tile drain (no OOB prefetch) 
 | Step 2.5 cluster IDs | `"dot1"/"mem1"/"dot2"/"mem2"` borders |
 | Step 3 buffer depth | `BUF_DEPTH = 2`, slot = `(block_n - block_start) % BUF_DEPTH` |
 | vmcnt window | `async_load_wait_group(1)` |
-| Step 4.7 priority class | `priority=0` (DOT) / `priority=1` (MEM) → `s_setprio` |
+| Step 4.8 priority (modulo MRT) | `priority=0` (DOT) / `priority=1` (MEM) → `s_setprio` |
 | Pass B WAR `s_barrier` | `tl.debug_barrier()` at slot-reuse points |
 | Pass B phase offset | `cond_barrier` (emitted by `ConvertWarpPipeline.cpp`) |
 | layout annotation | `tlx.local_trans` (K → dot-operand layout, no shuffle) |
@@ -610,4 +719,4 @@ The depth-4 prologue (prime K0/V0/K1/K2) and the 3-tile drain (no OOB prefetch) 
 
 ## Complexity
 
-Same asymptotic profile as the NVIDIA design: modulo scheduling per region is the dominant cost (Rau's iterative placement, `O(|ops| × II × backtrack)`), the budget/merge checks are `O(buffers²)` over live-interval pairs, and Pass A converges in 1–2 iterations. The AMD-specific passes (vmcnt window computation, padding-aware budget, two-group partition) are linear in the schedule size and do not change the overall complexity.
+Same asymptotic profile as the NVIDIA design: modulo scheduling per region is the dominant cost (Rau's iterative placement, `O(|ops| × II × backtrack)`), the budget/merge checks are `O(buffers²)` over live-interval pairs, and Pass A converges in 1–2 iterations. The AMD-specific passes (vmcnt window computation, padding-aware budget, two-group partition, and the modulo-MRT `s_setprio` derivation of Step 4.8 — `O(|ops|)` for ASAP/ALAP slack plus `O(clusters² × pipelines)` for the Δ search) are linear-to-quadratic in the schedule size and do not change the overall complexity.
