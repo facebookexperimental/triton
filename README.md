@@ -17,9 +17,16 @@ While this approach places more responsibility on the user, it reduces the compi
 
 ## The DSL Extension
 
+> **Hardware availability tags.** Each op below is tagged with the targets it runs on:
+> `**[Hopper+]**` = NVIDIA Hopper and newer; `**[MI300+]**` = AMD MI300 (CDNA3) and MI350 (CDNA4);
+> `**[MI350]**` = AMD MI350 (CDNA4) only. A trailing `?` (e.g. `**[MI300+?]**`) marks AMD availability
+> that has **not been confirmed yet** and needs verification.
+> Note: async copies (`async_load` and its commit/wait groups) and the AMD buffer ops require **MI350** —
+> they are **not** available on MI300. `barrier_arrive` on AMD requires `arrive_count == 1`.
+
 ### Local buffer operations
 
-- `buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS)` **[Hopper+]**
+- `buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS)` **[Hopper+, MI300+]**
 
     Allocate `NUM_BUFFERS` buffers in local memory per thread block, each of the specified size. The memory layout is inferred from its consumers.
 
@@ -29,38 +36,38 @@ While this approach places more responsibility on the user, it reduces the compi
     Allocate `NUM_BUFFERS` of buffers in the tensor memory per thread block, each with size size. The memory layout is inferred from its consumers.
 
 
-- `buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS, reuse=other_buffers)` **[Hopper+]**
+- `buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS, reuse=other_buffers)` **[Hopper+, MI300+]**
 
     Alias this allocation to an existing `buffered_tensor` so multiple logical buffers reuse the same underlying local storage (SMEM or TMEM) without reallocation.
 
 
-- `buffer = tlx.local_view(buffers, buffer_idx)` or `buffer = buffers[buffer_idx]` **[Hopper+]**
+- `buffer = tlx.local_view(buffers, buffer_idx)` or `buffer = buffers[buffer_idx]` **[Hopper+, MI300+]**
 
     Return a subview of the buffer indexed by `buffer_idx` from `buffers`. Both the explicit `local_view()` call and the indexing syntax `[]` are supported.
 
 
-- `distributed_tensor = tlx.local_load(buffer, optional_token)` **[Hopper+]**
+- `distributed_tensor = tlx.local_load(buffer, optional_token)` **[Hopper+, MI300+]**
 
     Loads the buffer from local memory or tensor memory into a distributed tensor.
 
 
-- `tlx.local_store(buffer, distributed_tensor)` **[Hopper+]**
+- `tlx.local_store(buffer, distributed_tensor)` **[Hopper+, MI300+]**
 
     Store a distributed tensor into a buffer in local memory or tensor memory.
 
-- `distributed_tensor = tlx.local_gather(src, indices, axis, optional_token)` **[Hopper+]**
+- `distributed_tensor = tlx.local_gather(src, indices, axis, optional_token)` **[Hopper+, MI300+?]**
 
     Gather elements from shared memory along a specified axis using an indices tensor. The output shape matches the indices shape, and elements are gathered from `src` at positions specified by `indices` along the given `axis`.
 
-- `tlx.local_scatter(dst, src, indices, axis, optional_token)` **[Hopper+]**
+- `tlx.local_scatter(dst, src, indices, axis, optional_token)` **[Hopper+, MI300+?]**
 
     Scatter elements to shared memory along a specified axis using an indices tensor. Elements from `src` are written to `dst` at positions specified by `indices` along the given `axis`.
 
-- `buffer = tlx.local_trans(buffer, dims)` **[Hopper+]**
+- `buffer = tlx.local_trans(buffer, dims)` **[Hopper+, MI300+]**
 
     Permutes the dimensions of a tensor.
 
-- `buffer = tlx.local_slice(buffer, offsets=[m, n], shapes=[M, N])` **[Hopper+]**
+- `buffer = tlx.local_slice(buffer, offsets=[m, n], shapes=[M, N])` **[Hopper+, MI300+]**
 
     Slice a `M x N` tensor at a `m x n` offset.
 
@@ -69,7 +76,7 @@ While this approach places more responsibility on the user, it reduces the compi
 TLX provides you the ability to reuse the same allocated buffer across multiple disjoint steps in your kernel. This is
 useful to allow additional pipelining when you may not have enough isolated SMEM or TMEM.
 
-- `tlx.storage_alias_spec(storage=storage_kind)` **[Hopper+]**
+- `tlx.storage_alias_spec(storage=storage_kind)` **[Hopper+, MI300+]**
 
     Defines a buffer that you will want to share across multiple aliases. The storage
     can be either SMEM or TMEM. To use this in an allocation you should provide the spec in the `reuse`
@@ -104,7 +111,7 @@ m_tiles = tlx.local_alloc(
 )
 ```
 
-- `tlx.reuse_group(*tensors, group_type=REUSE_TYPE, group_size=SUBTILE_SIZE)` **[Hopper+]**
+- `tlx.reuse_group(*tensors, group_type=REUSE_TYPE, group_size=SUBTILE_SIZE)` **[Hopper+, MI300+]**
 
     A reuse group expresses how you intend to access the shared buffer.
     There are two types: Shared or Distinct. A shared buffer wants to occupy the same memory
@@ -331,7 +338,7 @@ Binary wheels are available for CPython 3.10-3.14.
    tlx.async_descriptor_load(desc, buffer, offsets=[m_offset, n_offset], barrier=mbar)
    ```
 
-- `desc = tlx.reinterpret_tensor_descriptor(desc_ptr, block_shape, dtype)` **[Hopper+]**
+- `desc = tlx.reinterpret_tensor_descriptor(desc_ptr, block_shape, dtype)` **[Hopper+, MI300+]**
 
    Reinterpret a tensor descriptor pointer as a TMA-backed tensor descriptor object.
 
@@ -351,18 +358,18 @@ Binary wheels are available for CPython 3.10-3.14.
    tlx.async_descriptor_load(a_desc, buffer, offsets=[offs_m, offs_k], barrier=mbar)
    ```
 
-- `tlx.async_load(tensor_ptr, buffer, optional_mask, optional_other, cache_modifier, eviction_policy, is_volatile)` **[Hopper+]**
+- `tlx.async_load(tensor_ptr, buffer, optional_mask, optional_other, cache_modifier, eviction_policy, is_volatile)` **[Hopper+, MI350]**
 
    Load a chunk of data from global memory into a local memory buffer asynchronously.
 
    The operation returns a token object which can be used to track the completion of the operation.
 
 
-- `tlx.async_load_commit_group(tokens)` **[Hopper+]**
+- `tlx.async_load_commit_group(tokens)` **[Hopper+, MI350]**
 
    Commits all prior initiated but uncommitted async_load ops an async group. Optionally, each token represents a tracked async load operation.
 
-- `tlx.async_load_wait_group(pendings, tokens)` **[Hopper+]**
+- `tlx.async_load_wait_group(pendings, tokens)` **[Hopper+, MI350]**
 
    Wait for completion of prior asynchronous copy operations. The `pendings` argument indicates the number of in-flight operations not completed.
    Optionally, each token represents a tracked async commit group operation.
@@ -940,6 +947,8 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
 
 ## Buffer Operations (AMD)
 
+> **[MI350]** — available on AMD MI350 (CDNA4) only; not available on MI300.
+
 Buffer operations access global memory via a scalar base pointer and a tensor of i32 element offsets, rather than a tensor of pointers. This maps directly to AMD's hardware buffer instructions, which use a resource descriptor and byte offsets, enabling the hardware to do out-of-bounds checking and cache optimization.
 
 ### `tlx.buffer_load`
@@ -1061,6 +1070,8 @@ tlx.async_amd_descriptor_wait(0, [a_tok])
 ```
 
 ## Warp Pipeline (AMD)
+
+> **[MI350]** — AMD MI350 (CDNA4); not available on MI300.
 
 `tlx.warp_pipeline_stage(label, *, priority=None)` is a context manager that marks explicit pipeline stage boundaries inside a loop. The compiler partitions the loop body at these boundaries and inserts conditional barriers so that one warp group executes one stage ahead of the other, overlapping memory latency with compute.
 
