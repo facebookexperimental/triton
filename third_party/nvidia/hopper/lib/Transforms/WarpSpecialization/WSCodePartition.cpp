@@ -3587,7 +3587,7 @@ void insertAsyncComm(
 
     for (const auto &token : commChannel.tokens) {
       // Use token for producer acquire and consumer release.
-      if (commChannel.consumerBarriers.empty()) {
+      if (!commChannel.consumerBarriers.count(token.first)) {
         // Insert ProducerAcquireOp before the producer.
         auto producerAcquirePoint =
             getSameLevelOp(headConsumer, tmaHeadProducer);
@@ -3889,7 +3889,7 @@ void insertAsyncComm(
 
       // Insert ConsumerReleaseOp, if consumer is not a TCGen5MMAOp. For
       // TCGen5MMAOp, TCGen5MMAOp lowering will handle the ConsumerReleaseOp.
-      if (commChannel.consumerBarriers.empty()) {
+      if (!commChannel.consumerBarriers.count(token.first)) {
         auto consumerReleasePoint =
             consumerReleaseHeuristic(tailProducer, tailConsumer, token.first);
         auto subtiled = getEnclosingSubtiledRegionTile(consumerReleasePoint);
@@ -4266,6 +4266,93 @@ static void mergeDuplicateLocalAllocs(triton::FuncOp &funcOp) {
   }
 }
 
+static bool haveSameIntegerAttr(Operation *a, Operation *b,
+                                StringRef attrName) {
+  auto attrA = a->getAttrOfType<IntegerAttr>(attrName);
+  auto attrB = b->getAttrOfType<IntegerAttr>(attrName);
+  if (!attrA || !attrB)
+    return attrA == attrB;
+  return attrA.getInt() == attrB.getInt();
+}
+
+static bool canShareTMALoadBuffer(ttg::LocalAllocOp a, ttg::LocalAllocOp b) {
+  if (a.getType() != b.getType())
+    return false;
+  auto bufferIdA = a->getAttrOfType<IntegerAttr>("buffer.id");
+  auto bufferIdB = b->getAttrOfType<IntegerAttr>("buffer.id");
+  if (!bufferIdA || !bufferIdB || bufferIdA.getInt() != bufferIdB.getInt())
+    return false;
+  return haveSameIntegerAttr(a, b, "buffer.offset") &&
+         haveSameIntegerAttr(a, b, "buffer.copy");
+}
+
+static void mergeDuplicateTMALoadLocalStores(triton::FuncOp &funcOp) {
+  SmallVector<tt::DescriptorLoadOp> tmaLoads;
+  funcOp.walk([&](tt::DescriptorLoadOp loadOp) { tmaLoads.push_back(loadOp); });
+
+  for (auto loadOp : tmaLoads) {
+    SmallVector<ttg::LocalStoreOp> localStores;
+    for (Operation *user : loadOp->getUsers()) {
+      auto storeOp = dyn_cast<ttg::LocalStoreOp>(user);
+      if (!storeOp)
+        continue;
+      if (storeOp.getSrc() != loadOp.getResult())
+        continue;
+      auto allocOp = storeOp.getDst().getDefiningOp<ttg::LocalAllocOp>();
+      if (!allocOp)
+        continue;
+      localStores.push_back(storeOp);
+    }
+
+    if (localStores.size() < 2)
+      continue;
+
+    llvm::sort(localStores, [](ttg::LocalStoreOp a, ttg::LocalStoreOp b) {
+      return appearsBefore(a.getOperation(), b.getOperation());
+    });
+
+    SmallPtrSet<Operation *, 8> erasedStores;
+    for (unsigned i = 0; i < localStores.size(); ++i) {
+      auto canonicalStore = localStores[i];
+      if (erasedStores.contains(canonicalStore.getOperation()))
+        continue;
+      auto canonicalAlloc =
+          canonicalStore.getDst().getDefiningOp<ttg::LocalAllocOp>();
+      if (!canonicalAlloc)
+        continue;
+
+      for (unsigned j = i + 1; j < localStores.size(); ++j) {
+        auto duplicateStore = localStores[j];
+        if (erasedStores.contains(duplicateStore.getOperation()))
+          continue;
+        auto duplicateAlloc =
+            duplicateStore.getDst().getDefiningOp<ttg::LocalAllocOp>();
+        if (!duplicateAlloc)
+          continue;
+        if (!canShareTMALoadBuffer(canonicalAlloc, duplicateAlloc))
+          continue;
+
+        LLVM_DEBUG({
+          LDBG("mergeDuplicateTMALoadLocalStores: merging duplicate store for "
+               "descriptor load");
+          loadOp->dump();
+          LDBG("  canonical alloc:");
+          canonicalAlloc->dump();
+          LDBG("  duplicate alloc:");
+          duplicateAlloc->dump();
+        });
+
+        duplicateAlloc.getResult().replaceAllUsesWith(
+            canonicalAlloc.getResult());
+        erasedStores.insert(duplicateStore.getOperation());
+        duplicateStore.erase();
+        if (duplicateAlloc->use_empty())
+          duplicateAlloc.erase();
+      }
+    }
+  }
+}
+
 // Remove redundant TMEM zeroing stores.
 // When a TMEMAllocOp is used as operand D of a TCGen5MMAOp with
 // useAccumulator=false (on the first iteration), any preceding
@@ -4537,6 +4624,9 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
 }
 
 void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
+  // Merge duplicate TMA-load local stores before post-channel discovery.
+  mergeDuplicateTMALoadLocalStores(funcOp);
+
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
   collectPostChannels(channelsOrigin, funcOp);
