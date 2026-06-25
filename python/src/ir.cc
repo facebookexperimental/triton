@@ -849,8 +849,8 @@ void init_triton_ir(py::module_ &m) {
 
   py::class_<OpBuilder::InsertPoint>(m, "InsertPoint");
 
-  static py::class_<TritonOpBuilder> builder_cls(
-      m, "builder", py::module_local(), py::dynamic_attr());
+  static py::class_<TritonOpBuilder> builder_cls(m, "builder",
+                                                 py::dynamic_attr());
   builderClassPtr = &builder_cls;
   builder_cls.def(py::init<MLIRContext *>())
       .def("get_op_builder", &TritonOpBuilder::getBuilder, ret::reference)

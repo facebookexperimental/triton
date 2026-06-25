@@ -682,7 +682,8 @@ LogicalResult MemDescReinterpretOp::verify() {
     auto dstPat = getPadPattern(dstTy);
     if (srcPat.size() != dstPat.size() ||
         !std::equal(srcPat.begin(), srcPat.end(), dstPat.begin())) {
-      return emitError("cannot reinterpret with different padding pattern");
+      if (!(*this)->hasAttr("tlx.allow_different_padding_pattern"))
+        return emitError("cannot reinterpret with different padding pattern");
     }
   }
 

@@ -297,13 +297,14 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
   assert(vec * elemBitwidth <= 128);
 
   // Get pointer to remote shared memory if needed.
-  if (ctaId.has_value()) {
+  bool hasRemoteCta = ctaId && *ctaId;
+  if (hasRemoteCta) {
     ptr = mapa(rewriter, loc, ptr, *ctaId, pred);
   }
 
   PTXBuilder builder;
   auto st = builder.create("st")
-                ->o(ctaId.has_value() ? "shared::cluster" : "shared::cta")
+                ->o(hasRemoteCta ? "shared::cluster" : "shared::cta")
                 .v(vec, /*predicate=*/vec > 1)
                 .b(elemBitwidth);
   auto *ptrOpr = builder.newAddrOperand(ptr, "r");
@@ -414,13 +415,14 @@ Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
   assert(vec * elemBitwidth <= 128);
 
   // Get pointer to remote shared memory if needed.
-  if (ctaId.has_value()) {
+  bool hasRemoteCta = ctaId && *ctaId;
+  if (hasRemoteCta) {
     ptr = mapa(rewriter, loc, ptr, *ctaId, pred);
   }
 
   PTXBuilder builder;
   auto ld = builder.create("ld")
-                ->o(ctaId.has_value() ? "shared::cluster" : "shared::cta")
+                ->o(hasRemoteCta ? "shared::cluster" : "shared::cta")
                 .v(vec, /*predicate=*/vec > 1)
                 .b(elemBitwidth);
 

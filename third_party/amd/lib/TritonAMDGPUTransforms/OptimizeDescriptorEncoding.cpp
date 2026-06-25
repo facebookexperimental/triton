@@ -143,11 +143,23 @@ static LogicalResult alignTDMDescriptorEncodings(mlir::ModuleOp &m) {
 
   auto record = [&](Operation *op, Value desc,
                     Attribute encoding) -> WalkResult {
-    auto [it, inserted] = descToEncoding.try_emplace(desc, encoding);
-    if (!inserted && it->second != encoding) {
-      op->emitError() << "TDM ops using the same descriptor require "
-                         "conflicting memdesc layouts";
-      return WalkResult::interrupt();
+    SmallVector<Value> descChain;
+    Value cur = desc;
+    while (cur) {
+      descChain.push_back(cur);
+      auto updateOp = cur.getDefiningOp<tt::amdgpu::UpdateTensorDescriptorOp>();
+      if (!updateOp)
+        break;
+      cur = updateOp.getDesc();
+    }
+
+    for (Value chainedDesc : descChain) {
+      auto [it, inserted] = descToEncoding.try_emplace(chainedDesc, encoding);
+      if (!inserted && it->second != encoding) {
+        op->emitError() << "TDM ops using the same descriptor require "
+                           "conflicting memdesc layouts";
+        return WalkResult::interrupt();
+      }
     }
     return WalkResult::advance();
   };

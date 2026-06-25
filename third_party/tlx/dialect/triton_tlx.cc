@@ -2,11 +2,13 @@
 #include "Transforms/Passes.h"
 #include "ir.h"
 #include "mlir/Pass/PassManager.h"
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
 namespace ir {
-pybind11::class_<TritonOpBuilder> *getBuilderClass();
+nanobind::class_<TritonOpBuilder> *getBuilderClass();
 } // namespace ir
 #include "amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
@@ -20,7 +22,7 @@ pybind11::class_<TritonOpBuilder> *getBuilderClass();
 #include "triton/Tools/LayoutUtils.h"
 #include "llvm/Support/Casting.h"
 
-namespace py = pybind11;
+namespace py = nanobind;
 using namespace mlir;
 namespace tt = triton;
 namespace ttg = triton::gpu;
@@ -48,7 +50,7 @@ static ttg::CGAEncodingAttr makeCGALayout(mlir::MLIRContext *ctx,
   return ttg::CGAEncodingAttr::get1CTALayout(ctx, rank);
 }
 
-void init_triton_tlx_ir(py::module &&m) {
+void init_triton_tlx_ir(py::module_ &m) {
   auto *builder_cls = ir::getBuilderClass();
   builder_cls
       ->def(
@@ -564,8 +566,13 @@ void init_triton_tlx_ir(py::module &&m) {
                      self.getBuilder().getI32Type(), pred);
                }
              }
+             Value updatedDesc =
+                 self.create<amdgpu::UpdateTensorDescriptorOp>(
+                         desc.getType(), desc, ValueRange(indices),
+                         ValueRange(), pred32, /*clamp_bounds=*/false)
+                     .getResult();
              return self.create<amdgpu::AsyncTDMCopyGlobalToLocalOp>(
-                 desc, indices, result, pred32, barrier.value_or(Value()));
+                 updatedDesc, result, barrier.value_or(Value()));
            })
       .def("create_async_tdm_group_copy_global_to_local",
            [](TritonOpBuilder &self, std::vector<Value> descs,
@@ -601,8 +608,13 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_async_tdm_copy_local_to_global",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> indices,
               Value src, std::optional<Value> barrier) {
+             Value updatedDesc =
+                 self.create<amdgpu::UpdateTensorDescriptorOp>(
+                         desc.getType(), desc, ValueRange(indices),
+                         ValueRange(), Value(), /*clamp_bounds=*/false)
+                     .getResult();
              self.create<amdgpu::AsyncTDMCopyLocalToGlobalOp>(
-                 desc, indices, src, barrier.value_or(Value()));
+                 updatedDesc, src, barrier.value_or(Value()));
            })
       // AMD-only: emit amdgpu.tdm_prefetch — an L2 prefetch hint with no
       // memdesc. Pred is i1 here (unlike the load's i32 pred); we
@@ -1032,7 +1044,7 @@ void init_triton_tlx_ir(py::module &&m) {
            });
 }
 
-void init_triton_tlx_passes(py::module &&m) {
+void init_triton_tlx_passes(py::module_ &m) {
   ADD_PASS_WRAPPER_0("add_tlx_propagate_layout", tlx::createTlxPropagateLayout);
   ADD_PASS_WRAPPER_0("add_tlx_insert_require_layout",
                      tlx::createTLXInsertRequireLayout);
@@ -1061,7 +1073,7 @@ void init_triton_tlx_passes(py::module &&m) {
         });
 }
 
-void init_triton_tlx(py::module &&m) {
+void init_triton_tlx(py::module_ &m) {
   // load dialects
   m.def("load_dialects", [](mlir::MLIRContext &context) {
     mlir::DialectRegistry registry;
@@ -1071,6 +1083,8 @@ void init_triton_tlx(py::module &&m) {
     context.loadAllAvailableDialects();
   });
 
-  init_triton_tlx_ir(m.def_submodule("tlx_ir"));
-  init_triton_tlx_passes(m.def_submodule("tlx_passes"));
+  auto tlxIrModule = m.def_submodule("tlx_ir");
+  init_triton_tlx_ir(tlxIrModule);
+  auto tlxPassesModule = m.def_submodule("tlx_passes");
+  init_triton_tlx_passes(tlxPassesModule);
 }

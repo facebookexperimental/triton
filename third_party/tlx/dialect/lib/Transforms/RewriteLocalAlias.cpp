@@ -29,6 +29,15 @@ namespace tlx {
 
 namespace {
 
+static ttg::MemDescReinterpretOp createAliasReinterpret(OpBuilder &builder,
+                                                        Location loc,
+                                                        ttg::MemDescType type,
+                                                        Value source) {
+  auto op = ttg::MemDescReinterpretOp::create(builder, loc, type, source);
+  op->setAttr("tlx.allow_different_padding_pattern", builder.getUnitAttr());
+  return op;
+}
+
 // Total logical storage bits for a memdesc view, matching the calculation in
 // MemDescReinterpretOp::verify (lib/Dialect/TritonGPU/IR/Ops.cpp).
 int64_t getMemDescStorageBits(ttg::MemDescType ty) {
@@ -70,8 +79,7 @@ FailureOr<Value> emitAliasView(OpBuilder &builder, Operation *errorOp,
   int64_t dstBits = getMemDescStorageBits(dstTy);
 
   if (srcBits == dstBits) {
-    return ttg::MemDescReinterpretOp::create(builder, loc, dstTy, base)
-        .getResult();
+    return createAliasReinterpret(builder, loc, dstTy, base).getResult();
   }
 
   if (srcBits < dstBits || srcBits % dstBits != 0)
@@ -114,8 +122,7 @@ FailureOr<Value> emitAliasView(OpBuilder &builder, Operation *errorOp,
       intermediateShape, dstTy.getElementType(), dstTy.getEncoding(),
       dstTy.getMemorySpace(), dstTy.getMutableMemory(), intermediateShape);
   Value intermediate =
-      ttg::MemDescReinterpretOp::create(builder, loc, intermediateTy, base)
-          .getResult();
+      createAliasReinterpret(builder, loc, intermediateTy, base).getResult();
 
   // Step 2: drop the ratio dim with memdesc_index[0]; result is a fresh
   // descriptor of shape == layoutShape.
@@ -133,8 +140,7 @@ FailureOr<Value> emitAliasView(OpBuilder &builder, Operation *errorOp,
   // same-size reinterpret. Otherwise the slot is already the destination.
   if (dstRank == (int64_t)encRank)
     return slot;
-  return Value(
-      ttg::MemDescReinterpretOp::create(builder, loc, dstTy, slot).getResult());
+  return Value(createAliasReinterpret(builder, loc, dstTy, slot).getResult());
 }
 
 } // namespace
