@@ -36,7 +36,13 @@ Facebook: If you are developing in fbsource, use tritonbench instead to collect 
 """
 
 
-def create_benchmark(versions, mode="fwd"):
+def _attention_matmul_flops(batch, h, n_ctx, head_dim, causal):
+    # Causal self-attention uses lower-triangular score positions, including the diagonal.
+    score_elements = n_ctx * (n_ctx + 1) // 2 if causal else n_ctx * n_ctx
+    return 2.0 * batch * h * score_elements * head_dim
+
+
+def create_benchmark(versions, mode="fwd", causal=False):
     line_vals = [ref_lib.lower()] + versions
     line_names = [ref_lib] + versions
 
@@ -48,8 +54,8 @@ def create_benchmark(versions, mode="fwd"):
             line_vals=line_vals,
             line_names=line_names,
             ylabel="TFLOPS",
-            plot_name=f"flash-attention-{mode}-performance-fp16",
-            args={"BATCH": 4, "H": 32, "HEAD_DIM": 128, "causal": True},
+            plot_name=f"flash-attention-{mode}-performance-fp16-{'causal' if causal else 'noncausal'}",
+            args={"BATCH": 4, "H": 32, "HEAD_DIM": 128, "causal": causal},
         ))
     def benchmark(BATCH, H, N_CTX, HEAD_DIM, causal, provider):
         q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=torch.float16).requires_grad_()
@@ -66,6 +72,7 @@ def create_benchmark(versions, mode="fwd"):
                     q.grad, k.grad, v.grad = None, None, None
                     o = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=sm_scale, is_causal=causal)
                     o.backward(do)
+
             elif provider in ATTENTION_METHODS:
                 attention = ATTENTION_METHODS[provider]
                 if provider == "ws_pipelined_persistent":
@@ -74,12 +81,14 @@ def create_benchmark(versions, mode="fwd"):
                         q.grad, k.grad, v.grad = None, None, None
                         o = attention(q, k, v, sm_scale, causal)
                         o.backward(do)
+
                 elif provider == "ws":
 
                     def fn():
                         q.grad, k.grad, v.grad = None, None, None
                         o = attention(q, k, v, sm_scale)
                         o.backward(do)
+
                 else:
 
                     def fn():
@@ -106,7 +115,7 @@ def create_benchmark(versions, mode="fwd"):
             rep=500,
         )
 
-        flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
+        flops_per_matmul = _attention_matmul_flops(BATCH, H, N_CTX, HEAD_DIM, causal)
         # fwd: 2 matmuls (QK, PV). bwd: 5 matmuls (dQK, dPV, dV, dK, dQ) = 2.5x fwd
         total_flops = 2 * flops_per_matmul if mode == "fwd" else 5 * flops_per_matmul
 
@@ -141,6 +150,11 @@ if __name__ == "__main__":
         choices=[1, 2],
         help="Filter BWD configs: 0=all (default), 1=1-CTA only, 2=2-CTA only",
     )
+    parser.add_argument(
+        "--causal",
+        action="store_true",
+        help="Benchmark the causal variant (default: non-causal)",
+    )
     args = parser.parse_args()
 
     if args.num_ctas and args.mode == "bwd":
@@ -149,13 +163,15 @@ if __name__ == "__main__":
             configs_bwd_1cta,
             configs_bwd_2cta,
         )
+
         _attn_bwd_ws.configs = configs_bwd_1cta if args.num_ctas == 1 else configs_bwd_2cta
         print(f"Filtering BWD configs to {args.num_ctas}-CTA only")
 
     if is_blackwell():
         versions = args.version if args.version else list(ATTENTION_METHODS.keys())
-        print(f"Running {args.mode} benchmarks for: {versions}")
-        benchmark = create_benchmark(versions, mode=args.mode)
+        kind = "causal" if args.causal else "non-causal"
+        print(f"Running {args.mode} {kind} benchmarks for: {versions}")
+        benchmark = create_benchmark(versions, mode=args.mode, causal=args.causal)
         benchmark.run(print_data=True)
     else:
         print("Skipping benchmarks, no Blackwell GPU found.")

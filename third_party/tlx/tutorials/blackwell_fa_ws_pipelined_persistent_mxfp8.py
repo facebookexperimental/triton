@@ -122,6 +122,7 @@ def _compute_offsets(
 
 @triton.jit
 def _mask_scalar(qk, col_limit_right, s, i):
+    # Forward orientation: keep columns c < col_limit_right, mask c >= it to -inf.
     col_lim_right_s = col_limit_right - s
     col_lim_right_cur = max(col_lim_right_s, 0)
     mask = -1 << col_lim_right_cur
@@ -130,7 +131,18 @@ def _mask_scalar(qk, col_limit_right, s, i):
 
 
 @triton.jit
-def _apply_causal_mask(qk, col_limit_right, BLOCK_N: tl.constexpr):
+def _mask_scalar_transposed(qk, col_limit_left, s, i):
+    # Transposed orientation (backward qkT[N, M]): keep columns c >= col_limit_left
+    # (i.e. keep keys where m >= n), mask c < it to -inf. Mirror of _mask_scalar:
+    # same per-16-block bitmask, but the kept side is flipped.
+    col_lim_left_cur = max(col_limit_left - s, 0)
+    mask = -1 << col_lim_left_cur
+    keep_i_bit = (mask & (1 << i)) != 0
+    return tl.where(keep_i_bit, qk, -float("inf"))
+
+
+@triton.jit
+def _apply_causal_mask(qk, col_limit, BLOCK_N: tl.constexpr, TRANSPOSED: tl.constexpr):
     # Apply causal mask via a bitmask calculated for each block of 16 elements.
     # This allows the efficient R2P (register to predicate) instruction to be used at the SASS level.
     # Credit to Tri Dao,
@@ -138,10 +150,17 @@ def _apply_causal_mask(qk, col_limit_right, BLOCK_N: tl.constexpr):
     #
     # NOTE: We use map_elementwise here in order to generate an interleaved sequence of instructions
     # that processes one element of qk at a time. This improves ptxas's resulting SASS.
-    offs_n = tl.arange(0, BLOCK_N)[None, :]
-    s = offs_n & ~0xF
-    i = offs_n & 0xF
-    return tl.map_elementwise(_mask_scalar, qk, col_limit_right, s, i)
+    #
+    # Forward (TRANSPOSED=False): qk is [M, N], col_limit is the per-query right
+    # bound on keys (offs_m - start_n + 1). Backward (TRANSPOSED=True): qk is the
+    # transposed qkT [N, M], col_limit is the per-key left bound on queries
+    # (offs_n - curr_m); masks columns m < n so only m >= n survive.
+    offs = tl.arange(0, BLOCK_N)[None, :]
+    s = offs & ~0xF
+    i = offs & 0xF
+    if TRANSPOSED:
+        return tl.map_elementwise(_mask_scalar_transposed, qk, col_limit, s, i)
+    return tl.map_elementwise(_mask_scalar, qk, col_limit, s, i)
 
 
 @triton.jit
@@ -198,7 +217,7 @@ def _softmax_inner_loop(
 
         if STAGE == 2:
             col_limit_right = (offs_m - start_n + 1)[:, None]
-            qk = _apply_causal_mask(qk, col_limit_right, BLOCK_N)
+            qk = _apply_causal_mask(qk, col_limit_right, BLOCK_N, TRANSPOSED=False)
 
         qk_reshaped = tl.reshape(qk, [BLOCK_M_SPLIT, NUM_BLOCKS, VEC_SIZE])
         block_maxes = tl.max(qk_reshaped, 2)
@@ -1338,6 +1357,55 @@ mxfp8_bwd_configs = [
 
 
 @triton.jit
+def _get_bwd_start_m(pid, BLOCK_N1, STAGE: tl.constexpr):
+    # Backward sweeps query (M) blocks for a fixed key/value (N) tile.
+    # Causal (STAGE == 3): a key block at position start_n = pid * BLOCK_N1 only
+    # receives gradient from query blocks at m >= start_n, so the sweep starts at
+    # the diagonal (start_m == start_n). Non-causal (STAGE == 1): full sweep.
+    if STAGE == 3:
+        return pid * BLOCK_N1
+    else:
+        tl.static_assert(STAGE == 1)
+        return 0
+
+
+@triton.jit
+def _get_unfused_bwd_loop_bounds(start_n, N_CTX, BLOCK_N1, STAGE: tl.constexpr):
+    if STAGE == 1:
+        # Sometimes-true diagonal section for causal backward.
+        lo, hi = start_n, start_n + BLOCK_N1
+    elif STAGE == 2:
+        # Automatically-true section after the diagonal.
+        lo, hi = start_n + BLOCK_N1, N_CTX
+    else:
+        tl.static_assert(STAGE == 3)
+        # Non-causal full sweep.
+        lo, hi = 0, N_CTX
+    return lo, hi
+
+
+@triton.jit
+def _get_bwd_tile_info(
+    tile_idx,
+    n_tile_num,
+    H,
+    N_CTX,
+    BLOCK_M1: tl.constexpr,
+    BLOCK_N1: tl.constexpr,
+    STAGE: tl.constexpr,
+):
+    off_seq_h = tile_idx // n_tile_num
+    off_z = off_seq_h // H
+    off_h = off_seq_h % H
+    pid = tile_idx % n_tile_num
+    start_n = pid * BLOCK_N1
+    base_q = (off_z * H + off_h).to(tl.int64) * N_CTX
+    start_m = _get_bwd_start_m(pid, BLOCK_N1, STAGE)
+    num_steps = (N_CTX - start_m) // BLOCK_M1
+    return off_seq_h, off_z, off_h, pid, start_n, base_q, start_m, num_steps
+
+
+@triton.jit
 def _softmax_recompute_quantization_iter(
     blk_idx,
     qk_scale,
@@ -1372,6 +1440,9 @@ def _softmax_recompute_quantization_iter(
     REP_N: tl.constexpr,
     REP_M: tl.constexpr,
     DS_NUM_SUBS: tl.constexpr,
+    curr_m,
+    start_n,
+    MASK: tl.constexpr,
 ):
     DS_M_SUB: tl.constexpr = BLOCK_M1 // DS_NUM_SUBS
     _, tmem_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
@@ -1394,6 +1465,10 @@ def _softmax_recompute_quantization_iter(
     qkT_scaled = _fma_f32x2(qkT, qk_scale, -m[None, :])
     # Clamp to prevent FP32 overflow downstream in P*dP
     qkT_scaled = tl.minimum(qkT_scaled, 20.0)
+    if MASK:
+        offs_n = start_n + tl.arange(0, BLOCK_N1)
+        col_limit_left = (offs_n - curr_m)[:, None]
+        qkT_scaled = _apply_causal_mask(qkT_scaled, col_limit_left, BLOCK_M1, TRANSPOSED=True)
     pT = tl.math.exp2(qkT_scaled)
 
     # Quantize P^T -> TMEM with fixed pow2 scale.
@@ -1468,6 +1543,91 @@ def _softmax_recompute_quantization_iter(
     tlx.barrier_arrive(d_empties[d_buf_id])
 
 
+@triton.jit
+def _softmax_recompute_quantization_loop(
+    blk_idx,
+    qk_scale,
+    qk_tiles,
+    qk_fulls,
+    qk_empties,
+    p_tiles,
+    p_scale_buf_smem,
+    p_fulls,
+    dp_tiles,
+    dp_fulls,
+    dp_empties,
+    ds_tiles_smem,
+    ds_scale_smem,
+    ds_scale_dq_smem,
+    sM_tiles,
+    sD_tiles,
+    ds_fulls,
+    ds_empties,
+    m_fulls,
+    m_empties,
+    d_fulls,
+    d_empties,
+    NUM_BUFFERS_TMEM: tl.constexpr,
+    NUM_BUFFERS_DS: tl.constexpr,
+    M_STAGE: tl.constexpr,
+    D_STAGE: tl.constexpr,
+    BLOCK_M1: tl.constexpr,
+    BLOCK_N1: tl.constexpr,
+    VEC_SIZE: tl.constexpr,
+    p_dtype: tl.constexpr,
+    REP_N: tl.constexpr,
+    REP_M: tl.constexpr,
+    DS_NUM_SUBS: tl.constexpr,
+    start_m,
+    end_m,
+    start_n,
+    MASK: tl.constexpr,
+):
+    curr_m = start_m
+    for _ in range(0, (end_m - start_m) // BLOCK_M1):
+        _softmax_recompute_quantization_iter(
+            blk_idx,
+            qk_scale,
+            qk_tiles,
+            qk_fulls,
+            qk_empties,
+            p_tiles,
+            p_scale_buf_smem,
+            p_fulls,
+            dp_tiles,
+            dp_fulls,
+            dp_empties,
+            ds_tiles_smem,
+            ds_scale_smem,
+            ds_scale_dq_smem,
+            sM_tiles,
+            sD_tiles,
+            ds_fulls,
+            ds_empties,
+            m_fulls,
+            m_empties,
+            d_fulls,
+            d_empties,
+            NUM_BUFFERS_TMEM,
+            NUM_BUFFERS_DS,
+            M_STAGE,
+            D_STAGE,
+            BLOCK_M1,
+            BLOCK_N1,
+            VEC_SIZE,
+            p_dtype,
+            REP_N,
+            REP_M,
+            DS_NUM_SUBS,
+            curr_m,
+            start_n,
+            MASK,
+        )
+        blk_idx += 1
+        curr_m += BLOCK_M1
+    return blk_idx
+
+
 # "Separable" thread-value layout for the 128x128 QK^T accumulator read out
 # of TMEM, written purely as shape/stride (flat row-major offset = n*128 + m):
 # value -> M, thread -> N. Pinning this on the qkT load makes P / dP / dS share
@@ -1493,7 +1653,7 @@ _DPT_SEPARABLE_LAYOUT = tlx.layout(
 
 @triton.autotune(
     configs=mxfp8_bwd_configs,
-    key=["N_CTX", "HEAD_DIM", "H"],
+    key=["N_CTX", "HEAD_DIM", "H", "STAGE"],
 )
 @triton.jit  # pragma: no cover
 def _attn_bwd_mxf8_ws(
@@ -1531,6 +1691,7 @@ def _attn_bwd_mxf8_ws(
     DQ_REDUCE_NCOL: tl.constexpr,
     M_STAGE: tl.constexpr,
     D_STAGE: tl.constexpr,
+    STAGE: tl.constexpr,
 ) -> None:
     tl.static_assert(HEAD_DIM == 128)
     tl.static_assert(BLOCK_N1 == 128)
@@ -1560,19 +1721,29 @@ def _attn_bwd_mxf8_ws(
 
     qk_scale = sm_scale * 1.44269504  # sm_scale / ln(2) for exp2
 
-    # Tile decomposition (dense, non-causal):
+    # Tile decomposition:
     #   tile_idx -> (off_z, off_h, pid)
     #   pid = N-block index within (z, h)
+    # Each N-tile sweeps query (M) blocks from start_m to N_CTX. For non-causal
+    # (STAGE == 1) start_m is 0 (full sweep); for causal (STAGE == 3) start_m is
+    # the diagonal (pid * BLOCK_N1). num_steps is therefore computed per-tile
+    # inside each partition once pid is known.
     n_tile_num = N_CTX // BLOCK_N1
-    num_steps = N_CTX // BLOCK_M1  # full M sweep per N-tile
     prog_id = tl.program_id(0)
     num_progs = tl.num_programs(0)
     total_tiles = n_tile_num * Z * H
 
     tiles_per_sm = total_tiles // num_progs
-    if prog_id < total_tiles % num_progs:
+    extra_tiles = total_tiles % num_progs
+    if prog_id < extra_tiles:
         tiles_per_sm += 1
-    tile_idx = prog_id
+    if STAGE == 3:
+        tile_idx_start = prog_id * (total_tiles // num_progs) + min(prog_id, extra_tiles)
+        tile_idx_step = 1
+    else:
+        tl.static_assert(STAGE == 1)
+        tile_idx_start = prog_id
+        tile_idx_step = num_progs
 
     DS_NUM_SUBS: tl.constexpr = 2
 
@@ -1936,60 +2107,28 @@ def _attn_bwd_mxf8_ws(
             p_scale_const = tl.full([REP_N, REP_M, 32, 4, 4], P_FIXED_E8M0, dtype=tl.uint8)
             tlx.local_store(p_scale_smem[0], p_scale_const)
 
+            tile_idx = tile_idx_start
             blk_idx = 0
             for _i in range(tiles_per_sm):
                 _, persistent_tmem_phase = get_bufidx_phase(_i, NUM_BUFFERS_TMEM)
-                off_seq_h = tile_idx // n_tile_num
-                off_z = off_seq_h // H
-                off_h = off_seq_h % H
-                pid = tile_idx % n_tile_num
-                start_n = pid * BLOCK_N1
-                base_q = (off_z * H + off_h).to(tl.int64) * N_CTX
-
-                # Prologue: produce P for the first M-block.
-                # Call _softmax_recompute_quantization_iter with
-                # p_scale_tmem_prologue
-                _softmax_recompute_quantization_iter(
-                    blk_idx,
-                    qk_scale,
-                    qk_tiles,
-                    qk_fulls,
-                    qk_empties,
-                    p_tiles,
-                    p_scale_smem,
-                    p_fulls,
-                    dp_tiles,
-                    dp_fulls,
-                    dp_empties,
-                    ds_tiles_smem,
-                    ds_scale_smem,
-                    ds_scale_dq_smem,
-                    sM_tiles,
-                    sD_tiles,
-                    ds_fulls,
-                    ds_empties,
-                    m_fulls,
-                    m_empties,
-                    d_fulls,
-                    d_empties,
-                    NUM_BUFFERS_TMEM,
-                    NUM_BUFFERS_DS,
-                    M_STAGE,
-                    D_STAGE,
+                off_seq_h, off_z, off_h, pid, start_n, base_q, _start_m, _num_steps = (_get_bwd_tile_info(
+                    tile_idx,
+                    n_tile_num,
+                    H,
+                    N_CTX,
                     BLOCK_M1,
                     BLOCK_N1,
-                    VEC_SIZE,
-                    p_dtype,
-                    REP_N,
-                    REP_M,
-                    DS_NUM_SUBS,
-                )
-                blk_idx += 1
+                    STAGE,
+                ))
 
-                for _ in range(1, num_steps):
-                    # Call _softmax_recompute_quantization_iter with
-                    # p_scale_tmem
-                    _softmax_recompute_quantization_iter(
+                # Automatically false: causal blocks with curr_m < start_n are
+                # omitted by _get_bwd_start_m().
+                if STAGE & 1:
+                    lo, hi = _get_unfused_bwd_loop_bounds(start_n, N_CTX, BLOCK_N1, STAGE=4 - STAGE)
+                    # Causal: sometimes-true diagonal section, kept in the
+                    # prologue location. Non-causal: full automatically-true
+                    # sweep.
+                    blk_idx = _softmax_recompute_quantization_loop(
                         blk_idx,
                         qk_scale,
                         qk_tiles,
@@ -2023,8 +2162,55 @@ def _attn_bwd_mxf8_ws(
                         REP_N,
                         REP_M,
                         DS_NUM_SUBS,
+                        lo,
+                        hi,
+                        start_n,
+                        MASK=STAGE == 3,
                     )
-                    blk_idx += 1
+
+                if STAGE & 2:
+                    lo, hi = _get_unfused_bwd_loop_bounds(start_n, N_CTX, BLOCK_N1, STAGE=2)
+                    # Automatically true: all remaining active M blocks are
+                    # strictly below the diagonal and skip the causal mask.
+                    blk_idx = _softmax_recompute_quantization_loop(
+                        blk_idx,
+                        qk_scale,
+                        qk_tiles,
+                        qk_fulls,
+                        qk_empties,
+                        p_tiles,
+                        p_scale_smem,
+                        p_fulls,
+                        dp_tiles,
+                        dp_fulls,
+                        dp_empties,
+                        ds_tiles_smem,
+                        ds_scale_smem,
+                        ds_scale_dq_smem,
+                        sM_tiles,
+                        sD_tiles,
+                        ds_fulls,
+                        ds_empties,
+                        m_fulls,
+                        m_empties,
+                        d_fulls,
+                        d_empties,
+                        NUM_BUFFERS_TMEM,
+                        NUM_BUFFERS_DS,
+                        M_STAGE,
+                        D_STAGE,
+                        BLOCK_M1,
+                        BLOCK_N1,
+                        VEC_SIZE,
+                        p_dtype,
+                        REP_N,
+                        REP_M,
+                        DS_NUM_SUBS,
+                        lo,
+                        hi,
+                        start_n,
+                        MASK=False,
+                    )
 
                 # Epilogue: dK / dV TMA store
                 kv_buf_id, kv_phase = get_bufidx_phase(_i, NUM_BUFFERS_KV)
@@ -2076,19 +2262,24 @@ def _attn_bwd_mxf8_ws(
                             slice_id * slice_size,
                         ],
                     )
-                tile_idx += num_progs
+                tile_idx += tile_idx_step
             tlx.async_descriptor_store_wait(0)
 
         # ----- Reduction warp: TMA atomic-reduce-add of dQ to GMEM -----
         with tlx.async_task(num_warps=4, registers=112):
+            tile_idx = tile_idx_start
             blk_idx = 0
             for _i in range(tiles_per_sm):
-                off_seq_h = tile_idx // n_tile_num
-                off_z = off_seq_h // H
-                off_h = off_seq_h % H
-                base_q = (off_z * H + off_h).to(tl.int64) * N_CTX
-
-                curr_m = 0
+                off_seq_h, off_z, off_h, pid, start_n, base_q, start_m, num_steps = (_get_bwd_tile_info(
+                    tile_idx,
+                    n_tile_num,
+                    H,
+                    N_CTX,
+                    BLOCK_M1,
+                    BLOCK_N1,
+                    STAGE,
+                ))
+                curr_m = start_m
                 for _ in range(num_steps):
                     _, tmem_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
                     tlx.barrier_wait(dq_fulls[0], tmem_phase)
@@ -2122,14 +2313,24 @@ def _attn_bwd_mxf8_ws(
 
                     curr_m += BLOCK_M1
                     blk_idx += 1
-                tile_idx += num_progs
+                tile_idx += tile_idx_step
             tlx.async_descriptor_store_wait(0)
 
         # ----- MMA warp: 5 blockscaled GEMMs per M-block -----
         with tlx.async_task(num_warps=1, registers=80):
+            tile_idx = tile_idx_start
             blk_idx = 0
             for _i in range(tiles_per_sm):
                 kv_buf_id, kv_phase = get_bufidx_phase(_i, NUM_BUFFERS_KV)
+                off_seq_h, off_z, off_h, pid, start_n, base_q, start_m, num_steps = (_get_bwd_tile_info(
+                    tile_idx,
+                    n_tile_num,
+                    H,
+                    N_CTX,
+                    BLOCK_M1,
+                    BLOCK_N1,
+                    STAGE,
+                ))
                 # --- Prolog: first M-block ---
                 q_buf_id, q_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
                 do_buf_id, do_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
@@ -2421,18 +2622,22 @@ def _attn_bwd_mxf8_ws(
                         k_dq_empties[kv_buf_id],
                     ],
                 )
-                tile_idx += num_progs
+                tile_idx += tile_idx_step
 
         # ----- Load warp: TMA loads of FP8 data + scales -----
         with tlx.async_task(num_warps=1, registers=24):
+            tile_idx = tile_idx_start
             blk_idx = 0
             for _i in range(tiles_per_sm):
-                off_seq_h = tile_idx // n_tile_num
-                off_z = off_seq_h // H
-                off_h = off_seq_h % H
-                pid = tile_idx % n_tile_num
-                start_n = pid * BLOCK_N1
-                base_q = (off_z * H + off_h).to(tl.int64) * N_CTX
+                off_seq_h, off_z, off_h, pid, start_n, base_q, start_m, num_steps = (_get_bwd_tile_info(
+                    tile_idx,
+                    n_tile_num,
+                    H,
+                    N_CTX,
+                    BLOCK_M1,
+                    BLOCK_N1,
+                    STAGE,
+                ))
                 # Scale TMA layout: [Z*H, REP_N (or REP_M), REP_HEAD, 2, 256].
                 # Tile selects (z, h) via off_seq_h, and the M / N index via
                 # the 2nd dim.
@@ -2441,7 +2646,7 @@ def _attn_bwd_mxf8_ws(
 
                 # Load K data + scale and first Q + scale
                 # Share 1 barrier.
-                curr_m = 0
+                curr_m = start_m
                 q_buf_id, q_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
                 q_scale_m = (curr_m // 128) * REP_M
                 # Share this barrier to signify K empty
@@ -2487,7 +2692,15 @@ def _attn_bwd_mxf8_ws(
                 )
 
                 # Load V data + scale and do data + scale.
-                # Share 1 barrier
+                # Share 1 barrier. V / V_scale are per-tile KV buffers freed by the
+                # same do_empties barrier as dO (MMA 2 reads both V and dO and
+                # arrives do_empties), so this wait MUST precede the V load. Issuing
+                # the V TMA before the wait lets the next tile's V clobber v_smem
+                # while the current tile's MMA 2 is still reading it - a cross-tile
+                # WAR race that only surfaces in causal (variable num_steps) runs.
+                do_buf_id, do_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
+                do_scale_m = (curr_m // 128) * REP_M
+                tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
                 tlx.barrier_expect_bytes(
                     do_fulls[kv_buf_id],
                     K_BYTES * BLOCK_N1 * HEAD_DIM + SCALE_BYTES + (DO_BYTES * BLOCK_M1 * HEAD_DIM) + SCALE_BYTES,
@@ -2504,9 +2717,6 @@ def _attn_bwd_mxf8_ws(
                     [sf_off_seq_h, kv_scale_n.to(tl.int32), 0, 0, 0],
                     do_fulls[kv_buf_id],
                 )
-                do_buf_id, do_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
-                do_scale_m = (curr_m // 128) * REP_M
-                tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
                 tlx.async_descriptor_load(
                     desc_do,
                     do_smem[do_buf_id],
@@ -2683,7 +2893,7 @@ def _attn_bwd_mxf8_ws(
                     [sf_off_seq_h, 0, (last_m // 128) * REP_M, 0, 0],
                     q_dk_fulls[last_q_buf_id],
                 )
-                tile_idx += num_progs
+                tile_idx += tile_idx_step
 
 
 # ---------------------------------------------------------------------------
@@ -2710,6 +2920,7 @@ def attention_bwd(
     do_dv_scale,
     sm_scale,
     do_bf16=None,
+    causal=False,
 ):
     """MXFP8 attention backward.
 
@@ -2729,10 +2940,12 @@ def attention_bwd(
 
     Returns (dQ, dK, dV) with dQ in FP32, dK / dV in BF16.
 
-    Non-causal only. Assumes N_CTX is a multiple of 128.
+    Supports causal masking via `causal` (each key block only receives gradient
+    from query blocks at or below the diagonal). Assumes N_CTX is a multiple of
+    128.
     """
-    assert q.shape == q_dk.shape == k.shape == k_dq.shape == v.shape == do.shape, (
-        "Q, Q_dK, K, K_dQ, V, dO must have the same shape")
+    assert (q.shape == q_dk.shape == k.shape == k_dq.shape == v.shape ==
+            do.shape), "Q, Q_dK, K, K_dQ, V, dO must have the same shape"
     Z, H, N_CTX, HEAD_DIM = q.shape
     assert HEAD_DIM == 128, "this kernel only supports HEAD_DIM = 128"
     assert N_CTX % 128 == 0, "N_CTX must be a multiple of 128 (BLOCK_M1)"
@@ -2795,8 +3008,11 @@ def attention_bwd(
 
     def grid(meta):
         total_tiles = triton.cdiv(N_CTX, meta["BLOCK_N1"]) * Z * H
+        n_progs = min(NUM_SMS, total_tiles)
+        if causal:
+            n_progs = max(n_progs, triton.cdiv(total_tiles, 2))
         return (
-            min(NUM_SMS, total_tiles),
+            n_progs,
             1,
             1,
         )
@@ -2828,6 +3044,7 @@ def attention_bwd(
         HEAD_DIM=HEAD_DIM,
         M_STAGE=2,
         D_STAGE=2,
+        STAGE=3 if causal else 1,
     )
     return dq, dk, dv
 
@@ -2880,8 +3097,8 @@ class _attention(torch.autograd.Function):
             strides=[1],
             block_shape=[1],
         )
-        assert k_scale is not None and v_scale is not None and q_scale is not None, (
-            "All scales must be provided for MXFP8")
+        assert (k_scale is not None and v_scale is not None
+                and q_scale is not None), "All scales must be provided for MXFP8"
         dummy_block_shape = [1, 1, 1, 1, 1]
         desc_q_scale = TensorDescriptor.from_tensor(q_scale, block_shape=dummy_block_shape)
         desc_k_scale = TensorDescriptor.from_tensor(k_scale, block_shape=dummy_block_shape)
