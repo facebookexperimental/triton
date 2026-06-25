@@ -2817,6 +2817,18 @@ void insertAsyncComm(
     }
   }
 
+  // Asymmetric subtiled channels (producer inside a ttng.subtiled_region, N
+  // flat consumers outside) appear as N sibling ChannelPosts that share the
+  // SAME in-body template producer and the SAME reuse-group token, but land in
+  // separate consumer groups (distinct flat consumer ops). The producer-side
+  // ProducerAcquire/Commit live in the shared tile body and after lowering
+  // replicate once per tile, so they must be emitted by exactly ONE sibling;
+  // the others would double-arrive the barrier (and re-run the in-body view
+  // rewire / per-tile-position removal). This set records (tile region, token)
+  // pairs already emitted so later siblings skip producer-side emission while
+  // still emitting their own flat consumer wait/release.
+  DenseSet<std::pair<Operation *, const void *>> emittedSubtiledProducerTokens;
+
   // Go through each channel group.
   for (auto kv : orderedChannelsGroupedByConsumers) {
     // Find head and tail ops.
@@ -2926,7 +2938,19 @@ void insertAsyncComm(
     };
 
     // Find head producer
-    auto producerBlock = kv.second.front()->getSrcOp()->getBlock();
+    Operation *frontSrcOp = kv.second.front()->getSrcOp();
+    if (!frontSrcOp) {
+      auto *fc = kv.second.front();
+      funcOp.emitError()
+          << "warp specialization: could not resolve the producer of "
+          << to_string(fc->channelKind) << " channel #" << fc->uniqID << " ('"
+          << fc->srcName
+          << "'). Its producer most likely lives inside a ttng.subtiled_region "
+             "whose shared per-tile buffer position was consumed by another "
+             "channel; this subtiled-region channel topology is not supported.";
+      llvm_unreachable("insertAsyncComm: null producer for channel");
+    }
+    auto producerBlock = frontSrcOp->getBlock();
     Operation *headProducer = nullptr;
     for (auto &op : producerBlock->getOperations()) {
       if (producerOps.count(&op)) {
@@ -2944,7 +2968,19 @@ void insertAsyncComm(
     }
 
     // Find head consumer and tail consumer
-    auto consumerBlock = kv.second.front()->getDstOp()->getBlock();
+    Operation *frontDstOp = kv.second.front()->getDstOp();
+    if (!frontDstOp) {
+      auto *fc = kv.second.front();
+      funcOp.emitError()
+          << "warp specialization: could not resolve the consumer of "
+          << to_string(fc->channelKind) << " channel #" << fc->uniqID << " ('"
+          << fc->srcName
+          << "'). Its consumer most likely lives inside a ttng.subtiled_region "
+             "whose shared per-tile buffer position was consumed by another "
+             "channel; this subtiled-region channel topology is not supported.";
+      llvm_unreachable("insertAsyncComm: null consumer for channel");
+    }
+    auto consumerBlock = frontDstOp->getBlock();
     Operation *headConsumer = nullptr;
     for (auto &op : consumerBlock->getOperations()) {
       if (consumerOps.count(&op)) {
@@ -3779,6 +3815,17 @@ void insertAsyncComm(
     }
 
     for (const auto &token : commChannel.tokens) {
+      // If the producer lives inside a tile body, only the first sibling that
+      // shares this (tile region, token) emits the producer-side ops; later
+      // siblings skip them (see emittedSubtiledProducerTokens above).
+      bool skipSubtiledProducerEmit = false;
+      if (auto prodRegion = getEnclosingSubtiledRegionTile(tmaHeadProducer)) {
+        skipSubtiledProducerEmit =
+            !emittedSubtiledProducerTokens
+                 .insert({prodRegion.getOperation(),
+                          token.second.getAsOpaquePointer()})
+                 .second;
+      }
       // Use token for producer acquire and consumer release.
       if (commChannel.consumerBarriers.empty()) {
         // Insert ProducerAcquireOp before the producer.
@@ -3788,7 +3835,9 @@ void insertAsyncComm(
             getEnclosingSubtiledRegionTile(producerAcquirePoint);
         if (!producerSubtiled)
           producerSubtiled = getEnclosingSubtiledRegionTile(tmaHeadProducer);
-        if (producerSubtiled) {
+        if (producerSubtiled && skipSubtiledProducerEmit) {
+          // Producer acquire already emitted by an earlier sibling.
+        } else if (producerSubtiled) {
           auto annotTarget = getEnclosingSubtiledRegionTile(tmaHeadProducer)
                                  ? tmaHeadProducer
                                  : producerAcquirePoint;
@@ -3960,7 +4009,9 @@ void insertAsyncComm(
             getEnclosingSubtiledRegionTile(producerCommitPoint);
         if (!commitSubtiled)
           commitSubtiled = getEnclosingSubtiledRegionTile(tailProducer);
-        if (commitSubtiled) {
+        if (commitSubtiled && skipSubtiledProducerEmit) {
+          // Producer commit already emitted by an earlier sibling.
+        } else if (commitSubtiled) {
           auto annotTarget = getEnclosingSubtiledRegionTile(tailProducer)
                                  ? tailProducer
                                  : producerCommitPoint;

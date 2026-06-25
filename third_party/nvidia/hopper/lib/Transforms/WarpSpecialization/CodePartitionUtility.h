@@ -101,6 +101,18 @@ public:
   virtual unsigned getNumBuffers();
 
   Operation *allocOp;
+
+  // Producer op (ttg.local_store / async_tma_copy / the in-body template store
+  // of a ttng.subtiled_region), resolved and cached in createChannelPost at
+  // channel-creation time, before any buffer rewriting. getSrcOp() returns this
+  // when set. Caching is required for subtiled-region producers: when a
+  // *sibling* channel that shares the same template store is lowered,
+  // insertAsyncComm rewires the in-body store and removes the shared per-tile
+  // buffer position, so a later alloc-walk in getSrcOp() would find nothing and
+  // return null (SIGSEGV at the getSrcOp()->getBlock() deref). The template op
+  // itself survives, so the cached pointer stays valid. Null for direct
+  // alloc-with-src producers.
+  Operation *cachedSrcOp = nullptr;
 };
 
 struct ReuseGroup {

@@ -93,6 +93,14 @@ Operation *skipIdxOp(Operation *op) {
 }
 
 Operation *ChannelPost::getSrcOp() {
+  // Prefer the producer cached at channel-creation time. This is the only
+  // reliable source for a producer inside a ttng.subtiled_region: once a
+  // sibling channel (sharing the same in-body template store and per-tile
+  // buffer position) is lowered, insertAsyncComm rewires that store and removes
+  // the shared per-tile position, so the alloc-walk below would no longer reach
+  // it.
+  if (cachedSrcOp)
+    return cachedSrcOp;
   for (auto usr : allocOp->getUsers()) {
     Operation *user = skipIdxOp(usr);
     if (!user)
@@ -2937,6 +2945,12 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
       channels.push_back(std::make_unique<ChannelPost>(
           producerTaskId, consumerTaskIds, allocOp, channels.size()));
       channels.back()->srcName = getOutermostNameFromLoc(allocOp->getLoc());
+      auto *post = static_cast<ChannelPost *>(channels.back().get());
+      // Cache the resolved producer op so getSrcOp() survives a sibling
+      // subtiled-region channel's lowering. Skip the direct alloc-with-src case
+      // (producerOp == allocOp), where getSrcOp() intentionally returns null.
+      if (producerOp != allocOp)
+        post->cachedSrcOp = producerOp;
     }
   }
 }

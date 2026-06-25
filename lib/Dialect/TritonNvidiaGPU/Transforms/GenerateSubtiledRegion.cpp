@@ -417,7 +417,14 @@ static void
 collectSplitTreeLeaves(triton::SplitOp rootSplit,
                        SmallVectorImpl<Value> &leafValues,
                        SmallVectorImpl<Operation *> &innerSetupOps) {
-  SmallVector<Value> worklist = {rootSplit.getOutLHS(), rootSplit.getOutRHS()};
+  // Push RHS first so LHS is popped (and emitted) first, matching the inner
+  // convention below. This makes leafValues left-to-right (tile 0 = leftmost
+  // subtile), so the producer's per-tile order agrees with the consumer's
+  // program/column order. A reversed root order silently swaps the subtile
+  // halves for asymmetric (producer-subtiled, flat-consumer) channels, and
+  // deadlocks them when numTiles > numBuffers (the flat consumer would release
+  // staging slots in an order incompatible with the producer's reuse).
+  SmallVector<Value> worklist = {rootSplit.getOutRHS(), rootSplit.getOutLHS()};
   while (!worklist.empty()) {
     Value v = worklist.pop_back_val();
     auto innerSplit = getInnerSplit(v);
