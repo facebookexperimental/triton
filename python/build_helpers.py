@@ -87,11 +87,6 @@ def _normalize_required_path(value: str, name: str) -> str:
     return normalized
 
 
-# Taken from https://github.com/pytorch/pytorch/blob/master/tools/setup_helpers/env.py
-def check_env_flag(name: str, default: str = "") -> bool:
-    return os.getenv(name, default).upper() in ["ON", "1", "YES", "TRUE", "Y"]
-
-
 def open_url(url):
     user_agent = "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0"
     headers = {
@@ -223,6 +218,7 @@ class DownloadProgressReader:
 
     def __getattr__(self, name):
         return getattr(self.response, name)
+
 
 def _extract_archive(archive_path, download_dir):
     with contextlib.ExitStack() as stack:

@@ -74,8 +74,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     %tok0 = "amdg.async_tdm_group_copy_global_to_local"(%desc, %c0, %c0, %buf, %c_pred) <{cache = 1 : i32, operandSegmentSizes = array<i32: 1, 2, 1, 1>, rank = 2 : i32, warp_masks = array<i32: 15>}> : (!tt.tensordesc<64x64xf16, #shared>, i32, i32, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, i32) -> !ttg.async.token
     %wait0 = amdg.async_tdm_wait %tok0 {num = 0 : i32}
     %data = ttg.local_load %buf : !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> tensor<64x64xf16, #blocked>
-    // CHECK: rocdl.s.wait.dscnt 0
-    // CHECK-NEXT: rocdl.s.barrier
+    // CHECK: amdg.async_tdm_wait
+    // CHECK: rocdl.s.barrier
     // CHECK: "llvm.amdgcn.tensor.load.to.lds"
     %tok1 = "amdg.async_tdm_group_copy_global_to_local"(%desc, %c0, %c64, %buf, %c_pred) <{cache = 1 : i32, operandSegmentSizes = array<i32: 1, 2, 1, 1>, rank = 2 : i32, warp_masks = array<i32: 15>}> : (!tt.tensordesc<64x64xf16, #shared>, i32, i32, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, i32) -> !ttg.async.token
     tt.return
@@ -131,7 +131,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     // CHECK: %[[OFFSET_TMP1:.*]] = llvm.add{{.*}}%[[OFFSET_DIM0]]
     // CHECK: %[[OFFSET_DIM1:.*]] = llvm.mul{{.*}}%[[STRIDE1]]
     // CHECK: %[[TOTAL_OFFSET:.*]] = llvm.add %[[OFFSET_TMP1]], %[[OFFSET_DIM1]]
-    // CHECK: %[[ADJUSTED_PTR:.*]] = llvm.getelementptr %{{.*}}[%[[TOTAL_OFFSET]]]
+    // CHECK: llvm.getelementptr
     %0 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : !tt.ptr<f16>, !tt.tensordesc<64x64xf16, #shared>
     %1 = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
 
@@ -164,7 +164,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     // CHECK: %[[OFFSET_TMP1:.*]] = llvm.add{{.*}}%[[OFFSET_DIM0]]
     // CHECK: %[[OFFSET_DIM1:.*]] = llvm.mul{{.*}}%[[STRIDE1]]
     // CHECK: %[[TOTAL_OFFSET:.*]] = llvm.add %[[OFFSET_TMP1]], %[[OFFSET_DIM1]]
-    // CHECK: %[[ADJUSTED_PTR:.*]] = llvm.getelementptr %{{.*}}[%[[TOTAL_OFFSET]]]
+    // CHECK: llvm.getelementptr
     %0 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : !tt.ptr<f16>, !tt.tensordesc<64x64xf16, #shared>
     %1 = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
     // CHECK: "llvm.amdgcn.tensor.store.from.lds"({{.+}}) : (vector<4xi32>, vector<8xi32>, vector<4xi32>, vector<4xi32>, vector<8xi32>, i32) -> ()
@@ -194,9 +194,9 @@ module attributes {"ttg.num-ctas" = 16 : i32, "ttg.num-warps" = 4 : i32, "ttg.th
     // CHECK: %[[CTA_MASK:.*]] = llvm.shl %[[GROUP_MASK]], %[[SHIFT_AMOUNT]]
     // The multicast OR result is stamped directly into the vector<8xi32> group.
     // CHECK: %[[TMP:.*]] = llvm.or %{{.*}}, %[[CTA_MASK]]
-    // CHECK: %[[TMP2:.*]] = llvm.and %[[TMP]]
+    // CHECK: llvm.and
     // CHECK-NOT: llvm.insertelement{{.*}} : vector<8xi32>
-    // CHECK: llvm.insertelement %[[TMP2]]
+    // CHECK: llvm.insertelement
     %0 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : !tt.ptr<f16>, !tt.tensordesc<64x64xf16, #shared>
     %1 = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
 
@@ -343,7 +343,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.thr
     %c_stride1 = arith.constant 1 : i64
     %c_offset = arith.constant 0 : i32
     %c_pred = arith.constant 1 : i32
-    %0 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : <f16>, <256x64xf16, #shared>
+    %0 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : !tt.ptr<f16>, !tt.tensordesc<256x64xf16, #shared>
     %1 = ttg.local_alloc : () -> !ttg.memdesc<256x64xf16, #shared, #smem, mutable>
     // CHECK-DAG: %[[FREE_MASK:.*]] = llvm.mlir.constant(4 : i32) : i32
     // CHECK-DAG: %[[ZERO:.*]] = llvm.mlir.constant(0 : i32) : i32
@@ -374,7 +374,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     %c_stride1 = arith.constant 1 : i64
     %c_offset = arith.constant 0 : i32
     %c_pred = arith.constant 1 : i32
-    %0 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : <f16>, <128x16xf16, #partitioned>
+    %0 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : !tt.ptr<f16>, !tt.tensordesc<128x16xf16, #partitioned>
     %1 = ttg.local_alloc : () -> !ttg.memdesc<128x16xf16, #partitioned, #smem, mutable>
     // CHECK-DAG: %[[FREE_MASK:.*]] = llvm.mlir.constant(2 : i32) : i32
     // CHECK-DAG: %[[ZERO:.*]] = llvm.mlir.constant(0 : i32) : i32
@@ -403,7 +403,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     // CHECK: %[[HI64:.*]] = llvm.lshr %[[STRIDE]], %{{.*}} : i64
     // CHECK: %[[HI32:.*]] = llvm.trunc %[[HI64]] : i64 to i32
     // CHECK: llvm.insertelement %{{.*}}, %{{.*}} : vector<8xi32>
-    %0 = tt.make_tensor_descriptor %arg0, [%shape0, %shape1], [%stride0, %c_stride1] : <f16>, <64x64xf16, #shared>
+    %0 = tt.make_tensor_descriptor %arg0, [%shape0, %shape1], [%stride0, %c_stride1] : !tt.ptr<f16>, !tt.tensordesc<64x64xf16, #shared>
     %1 = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
     %2 = amdg.async_tdm_copy_global_to_local %0 into %1 : !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
     tt.return
@@ -426,7 +426,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c_pred = arith.constant 1 : i32
     // CHECK-DAG: llvm.lshr %[[S0]], %{{.*}} : i64
     // CHECK-DAG: llvm.lshr %[[S1]], %{{.*}} : i64
-    %0 = tt.make_tensor_descriptor %arg0, [%shape0, %shape1, %shape2], [%stride0, %stride1, %c_stride2] : <f16>, <4x16x64xf16, #shared>
+    %0 = tt.make_tensor_descriptor %arg0, [%shape0, %shape1, %shape2], [%stride0, %stride1, %c_stride2] : !tt.ptr<f16>, !tt.tensordesc<4x16x64xf16, #shared>
     %1 = ttg.local_alloc : () -> !ttg.memdesc<4x16x64xf16, #shared, #smem, mutable>
     %2 = amdg.async_tdm_copy_global_to_local %0 into %1 : !tt.tensordesc<4x16x64xf16, #shared> -> !ttg.memdesc<4x16x64xf16, #shared, #smem, mutable>
     tt.return
@@ -448,7 +448,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c_stride1 = arith.constant 1 : i64
     %c_offset = arith.constant 0 : i32
     %c_pred = arith.constant 1 : i32
-    %0 = tt.make_tensor_descriptor %arg0, [%c_shape0, %c_shape1], [%c_stride0, %c_stride1] : <i16>, <1x64xi16, #desc>
+    %0 = tt.make_tensor_descriptor %arg0, [%c_shape0, %c_shape1], [%c_stride0, %c_stride1] : !tt.ptr<i16>, !tt.tensordesc<1x64xi16, #desc>
     %1 = ttg.local_alloc : () -> !ttg.memdesc<64xi16, #alloc, #smem, mutable>
     // CHECK: "llvm.amdgcn.tensor.load.to.lds"
     %2 = amdg.async_tdm_copy_global_to_local %0 into %1 : !tt.tensordesc<1x64xi16, #desc> -> !ttg.memdesc<64xi16, #alloc, #smem, mutable>

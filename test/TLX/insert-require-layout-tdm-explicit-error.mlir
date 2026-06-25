@@ -19,8 +19,9 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     %c0 = arith.constant 0 : i32
     %alloc = ttg.local_alloc {tlx.layout_is_explicit} : () -> !ttg.memdesc<2x128x32xf16, #shared, #smem, mutable>
     %buf = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x128x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+    %tdm_desc0 = amdg.update_tensor_descriptor %desc add_offsets = [%m, %k] pred = %p : !tt.tensordesc<128x32xf16>
     // expected-error @+1 {{TDM operand requires a padded shared encoding}}
-    %tok = amdg.async_tdm_copy_global_to_local %desc[%m, %k] into %buf, pred = %p : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+    %tok = amdg.async_tdm_copy_global_to_local %tdm_desc0 into %buf : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
     tt.return
   }
 }
@@ -39,8 +40,9 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     %c0 = arith.constant 0 : i32
     %alloc = ttg.local_alloc {tlx.layout_is_explicit} : () -> !ttg.memdesc<2x128x32xf16, #shared, #smem, mutable>
     %buf = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x128x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+    %tdm_desc1 = amdg.update_tensor_descriptor %desc add_offsets = [%m, %k] : !tt.tensordesc<128x32xf16>
     // expected-error @+1 {{TDM operand requires a padded shared encoding}}
-    amdg.async_tdm_copy_local_to_global %desc[%m, %k] from %buf : !ttg.memdesc<128x32xf16, #shared, #smem, mutable> -> !tt.tensordesc<128x32xf16>
+    amdg.async_tdm_copy_local_to_global %tdm_desc1 from %buf : !ttg.memdesc<128x32xf16, #shared, #smem, mutable> -> !tt.tensordesc<128x32xf16>
     tt.return
   }
 }
@@ -60,7 +62,8 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     %c0 = arith.constant 0 : i32
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #shared, #smem, mutable>
     %buf = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x128x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
-    %tok = amdg.async_tdm_copy_global_to_local %desc[%m, %k] into %buf, pred = %p : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+    %tdm_desc2 = amdg.update_tensor_descriptor %desc add_offsets = [%m, %k] pred = %p : !tt.tensordesc<128x32xf16>
+    %tok = amdg.async_tdm_copy_global_to_local %tdm_desc2 into %buf : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
     tt.return
   }
 }
@@ -79,7 +82,8 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     %c0 = arith.constant 0 : i32
     %alloc = ttg.local_alloc {tlx.layout_is_explicit} : () -> !ttg.memdesc<2x128x32xf16, #padded, #smem, mutable>
     %buf = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x128x32xf16, #padded, #smem, mutable> -> !ttg.memdesc<128x32xf16, #padded, #smem, mutable>
-    %tok = amdg.async_tdm_copy_global_to_local %desc[%m, %k] into %buf, pred = %p : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #padded, #smem, mutable>
+    %tdm_desc3 = amdg.update_tensor_descriptor %desc add_offsets = [%m, %k] pred = %p : !tt.tensordesc<128x32xf16>
+    %tok = amdg.async_tdm_copy_global_to_local %tdm_desc3 into %buf : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #padded, #smem, mutable>
     tt.return
   }
 }

@@ -209,7 +209,7 @@ module attributes {"ttg.target" = "hip:gfx1250", "ttg.num-ctas" = 1 : i32, "ttg.
   // CHECK-LABEL: memdesc_reinterpret_padded_shared_rank_change
   // CHECK: ttg.memdesc_reinterpret
   tt.func @memdesc_reinterpret_padded_shared_rank_change(%arg0 : !ttg.memdesc<2x256x128xf16, #padded_a, #smem, mutable>) {
-    %0 = ttg.memdesc_reinterpret %arg0 : !ttg.memdesc<2x256x128xf16, #padded_a, #smem, mutable> -> !ttg.memdesc<1x256x256xbf16, #padded_c, #smem, mutable>
+    %0 = ttg.memdesc_reinterpret %arg0 {tlx.allow_different_padding_pattern} : !ttg.memdesc<2x256x128xf16, #padded_a, #smem, mutable> -> !ttg.memdesc<1x256x256xbf16, #padded_c, #smem, mutable>
     tt.return
   }
 }

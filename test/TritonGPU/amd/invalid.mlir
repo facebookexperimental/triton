@@ -234,8 +234,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %pred: i32
   ) {
     %c0_i32 = arith.constant 0 : i32
+    %tdm_desc0 = amdg.update_tensor_descriptor %tensorDesc add_offsets = [%c0_i32, %c0_i32] pred = %pred : !tt.tensordesc<128x64xf16>
     // expected-error @+1 {{TDM load only supports single interval-padding pairs}}
-    %0 = amdg.async_tdm_copy_global_to_local %tensorDesc[%c0_i32, %c0_i32] into %memDesc, pred = %pred : !tt.tensordesc<128x64xf16> -> !ttg.memdesc<128x64xf16, #shared_2_intervals, #smem, mutable>
+    %0 = amdg.async_tdm_copy_global_to_local %tdm_desc0 into %memDesc : !tt.tensordesc<128x64xf16> -> !ttg.memdesc<128x64xf16, #shared_2_intervals, #smem, mutable>
     tt.return
   }
 }

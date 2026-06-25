@@ -17,9 +17,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %alloc_b = ttg.local_alloc : () -> !ttg.memdesc<1x128x32xf16, #shared_b, #smem, mutable>
     %buf_a = ttg.memdesc_index %alloc_a[%c0] : !ttg.memdesc<1x128x32xf16, #shared_a, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared_a, #smem, mutable>
     %buf_b = ttg.memdesc_index %alloc_b[%c0] : !ttg.memdesc<1x128x32xf16, #shared_b, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared_b, #smem, mutable>
-    %tok_a = amdg.async_tdm_copy_global_to_local %desc[%m, %k] into %buf_a, pred = %p : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #shared_a, #smem, mutable>
+    %tdm_desc0 = amdg.update_tensor_descriptor %desc add_offsets = [%m, %k] pred = %p : !tt.tensordesc<128x32xf16>
+    %tok_a = amdg.async_tdm_copy_global_to_local %tdm_desc0 into %buf_a : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #shared_a, #smem, mutable>
+    %tdm_desc1 = amdg.update_tensor_descriptor %desc add_offsets = [%m, %k] pred = %p : !tt.tensordesc<128x32xf16>
     // expected-error @+1 {{TDM ops using the same descriptor require conflicting memdesc layouts}}
-    %tok_b = amdg.async_tdm_copy_global_to_local %desc[%m, %k] into %buf_b, pred = %p : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #shared_b, #smem, mutable>
+    %tok_b = amdg.async_tdm_copy_global_to_local %tdm_desc1 into %buf_b : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #shared_b, #smem, mutable>
     tt.return
   }
 }

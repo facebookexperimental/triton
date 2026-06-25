@@ -10,7 +10,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
     // CHECK: %[[ALLOC:.*]] = ttg.local_alloc : () -> !ttg.memdesc<2x256x128xf16, #[[$A:.*]], #smem, mutable>
     %a = ttg.local_alloc : () -> !ttg.memdesc<2x256x128xf16, #padded_a, #smem, mutable>
     // CHECK-NOT: tlx.local_alias
-    // CHECK: ttg.memdesc_reinterpret %[[ALLOC]] : !ttg.memdesc<2x256x128xf16, #[[$A]], #smem, mutable> -> !ttg.memdesc<1x256x256xbf16, #[[$C:.*]], #smem, mutable>
+    // CHECK: ttg.memdesc_reinterpret %[[ALLOC]] {tlx.allow_different_padding_pattern} : !ttg.memdesc<2x256x128xf16, #[[$A]], #smem, mutable> -> !ttg.memdesc<1x256x256xbf16, #[[$C:.*]], #smem, mutable>
     %c = tlx.local_alias %a : !ttg.memdesc<2x256x128xf16, #padded_a, #smem, mutable> -> !ttg.memdesc<1x256x256xbf16, #padded_c, #smem, mutable>
     tt.return
   }
@@ -33,10 +33,10 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
     // CHECK: %[[ALLOC:.*]] = ttg.local_alloc : () -> !ttg.memdesc<2x32x128xf16, #[[$A:.*]], #smem, mutable>
     %a = ttg.local_alloc : () -> !ttg.memdesc<2x32x128xf16, #padded_a_small, #smem1, mutable>
     // CHECK-NOT: tlx.local_alias
-    // CHECK: %[[BIG:.*]] = ttg.memdesc_reinterpret %[[ALLOC]] : !ttg.memdesc<2x32x128xf16, #[[$A]], #smem, mutable> -> !ttg.memdesc<8x32x32xbf16, #[[$C:.*]], #smem, mutable>
+    // CHECK: %[[BIG:.*]] = ttg.memdesc_reinterpret %[[ALLOC]] {tlx.allow_different_padding_pattern} : !ttg.memdesc<2x32x128xf16, #[[$A]], #smem, mutable> -> !ttg.memdesc<8x32x32xbf16, #[[$C:.*]], #smem, mutable>
     // CHECK: %[[C0:.*]] = arith.constant 0 : i32
     // CHECK: %[[SLOT:.*]] = ttg.memdesc_index %[[BIG]][%[[C0]]] : !ttg.memdesc<8x32x32xbf16, #[[$C]], #smem, mutable> -> !ttg.memdesc<32x32xbf16, #[[$C]], #smem, mutable>
-    // CHECK: ttg.memdesc_reinterpret %[[SLOT]] : !ttg.memdesc<32x32xbf16, #[[$C]], #smem, mutable> -> !ttg.memdesc<1x32x32xbf16, #[[$C]], #smem, mutable>
+    // CHECK: ttg.memdesc_reinterpret %[[SLOT]] {tlx.allow_different_padding_pattern} : !ttg.memdesc<32x32xbf16, #[[$C]], #smem, mutable> -> !ttg.memdesc<1x32x32xbf16, #[[$C]], #smem, mutable>
     %c = tlx.local_alias %a : !ttg.memdesc<2x32x128xf16, #padded_a_small, #smem1, mutable> -> !ttg.memdesc<1x32x32xbf16, #padded_c_small, #smem1, mutable>
     tt.return
   }

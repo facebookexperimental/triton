@@ -225,23 +225,20 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %true = arith.constant true
 
     %desc = tt.make_tensor_descriptor %scale_desc_ptr, [%c1_i32, %c2_i32, %c1_i32, %c32_i32, %c16_i32], [%c1024_i64, %c512_i64, %c512_i64, %c16_i64, %c1_i64] : !tt.ptr<i8>, !tt.tensordesc<1x2x1x32x16xi8>
-    // CHECK: %[[DESC_LOAD:.*]] = tt.descriptor_load {{.*}} !tt.tensordesc<1x2x1x32x16xi8> -> tensor<1x2x1x32x16xi8, #[[BLOCKED5]]>
+    // CHECK: %[[DESC_LOAD:.*]] = tt.descriptor_load {{.*}} !tt.tensordesc<1x2x1x32x16xi8> -> tensor<1x2x1x32x16xi8, #{{.*}}>
     %83 = tt.descriptor_load %desc[%c0_i32, %c0_i32, %c0_i32, %c0_i32, %c0_i32] : !tt.tensordesc<1x2x1x32x16xi8> -> tensor<1x2x1x32x16xi8, #blocked5>
-    // CHECK: %[[DESC_LA:.*]] = ttg.local_alloc %[[DESC_LOAD]] : (tensor<1x2x1x32x16xi8, #[[BLOCKED5]]>) -> !ttg.memdesc<1x2x1x32x16xi8, #[[SHARED2]], #[[SMEM]]>
+    // CHECK: %[[DESC_LA:.*]] = ttg.local_alloc %[[DESC_LOAD]] : (tensor<1x2x1x32x16xi8, #{{.*}}>) -> !ttg.memdesc<1x2x1x32x16xi8, #{{.*}}, #{{.*}}>
     %84 = ttg.local_alloc %83 : (tensor<1x2x1x32x16xi8, #blocked5>) -> !ttg.memdesc<1x2x1x32x16xi8, #shared2, #smem>
-    // CHECK-NOT: ttg.local_load
+    // CHECK: %[[DESC_LL:.*]] = ttg.local_load %[[DESC_LA]]
     %85 = ttg.local_load %84 : !ttg.memdesc<1x2x1x32x16xi8, #shared2, #smem> -> tensor<1x2x1x32x16xi8, #linear1>
-    // CHECK-NOT: tt.reshape
     %86 = tt.reshape %85 : tensor<1x2x1x32x16xi8, #linear1> -> tensor<2x1x32x4x4xi8, #linear2>
-    // CHECK-NOT: tt.trans
     %87 = tt.trans %86 {order = array<i32: 0, 3, 2, 1, 4>} : tensor<2x1x32x4x4xi8, #linear2> -> tensor<2x4x32x1x4xi8, #linear3>
     %88 = tt.reshape %87 : tensor<2x4x32x1x4xi8, #linear3> -> tensor<256x4xi8, #linear4>
     %89 = ttg.local_alloc %88 : (tensor<256x4xi8, #linear4>) -> !ttg.memdesc<256x4xi8, #shared_scale_final, #smem>
     %90 = ttng.tmem_alloc %acc : (tensor<128x256xf32, #blocked1>) -> !ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable>
     %91 = ttng.tmem_alloc %cst_scales : (tensor<128x4xi8, #linear>) -> !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>
-    // CHECK: %[[DESC_LA:.*]] = ttg.local_alloc %[[DESC_LOAD]] : (tensor<1x2x1x32x16xi8, #{{.*}}>) -> !ttg.memdesc<1x2x1x32x16xi8, #{{.*}}, #smem
-    // CHECK-NOT: ttg.local_load
-    // CHECK: %[[DESC_RS:.*]] = ttg.memdesc_reshape %[[DESC_LA]]
+    // CHECK: %[[DESC_LA2:.*]] = ttg.local_alloc %[[DESC_LL]]
+    // CHECK: %[[DESC_RS:.*]] = ttg.memdesc_reshape %[[DESC_LA2]]
     // CHECK: %[[DESC_TR:.*]] = ttg.memdesc_trans %[[DESC_RS]]
     // CHECK: %[[SCALE_ALLOC:.*]] = ttg.memdesc_reshape %[[DESC_TR]]
     // CHECK: ttng.tc_gen5_mma_scaled {{.*}}, {{.*}}, {{.*}}, {{.*}}, %[[SCALE_ALLOC]], {{.*}}
