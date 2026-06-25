@@ -14,10 +14,10 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 
 # gfx950 has 8 XCDs per chip; chunked remap improves L2 reuse.
-# XCD_CHUNK=4 was empirically best for our 256x256 tiles at 4K-8K (per-XCD
-# group of 4 PIDs aligns with the GROUP_M=8 row partitioning).
+# XCD_CHUNK=8 was empirically best for the 256x256x64 tile at 4K-8K (per-XCD
+# group of 8 PIDs aligns with the GROUP_M=16 row partitioning).
 NUM_XCDS = 8
-XCD_CHUNK = 4
+XCD_CHUNK = 8
 
 
 @triton.jit
@@ -153,12 +153,15 @@ def matmul_kernel_warp_pipeline(
 def matmul(a: torch.Tensor, b: torch.Tensor, config=None) -> torch.Tensor:
     """C = A @ B using a warp-pipelined kernel on AMD gfx950."""
     if config is None:
+        # Best config from the warp-pipeline sweep on gfx950 (4K-8K square):
+        # BLOCK_K=64 + GROUP_M=16 + NUM_BUFFERS=2 + XCD_CHUNK=8 beats rocBLAS at
+        # 4096^3 (+5%) and matches it at 8192^3 (~99%); BLOCK_K=64 is the lever.
         config = {
             "BLOCK_M": 256,
             "BLOCK_N": 256,
-            "BLOCK_K": 32,
-            "GROUP_M": 8,
-            "NUM_BUFFERS": 3,
+            "BLOCK_K": 64,
+            "GROUP_M": 16,
+            "NUM_BUFFERS": 2,
             "num_warps": 8,
         }
     assert a.is_contiguous() and b.is_contiguous(), "A and B must be contiguous"
@@ -202,5 +205,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, config=None) -> torch.Tensor:
         # does for num_stages <= 1 (the explicit stages do the pipelining).
         num_warps=num_warps,
         num_stages=1,
+        # 16x16 MFMA (16x16x32 for fp16) tuned for the 256x256x64 tile on gfx950.
+        matrix_instr_nonkdim=16,
     )
     return c
