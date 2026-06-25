@@ -97,6 +97,13 @@ loads for the same MMA), they are fused onto a single barrier:
 4. **Multiple copies, one wait**: Each `AsyncTMACopyGlobalToLocalOp` references
    the shared barrier. The consumer issues a single `WaitBarrierOp`.
 
+In the post-allocated path, the inverse shape is also supported after code
+partitioning merges duplicate `ttg.local_store` ops for the same TMA descriptor
+load: one TMA descriptor load can feed one SMEM allocation with multiple
+consumers. Memory lowering emits a single `AsyncTMACopyGlobalToLocalOp` for
+that allocation, creates wait barriers for each consumer task, and removes the
+now-redundant high-level descriptor load and producer-side local store.
+
 See [Barrier Fusion](BarrierFusion.md) for more details.
 
 ## TMA Store Lowering
