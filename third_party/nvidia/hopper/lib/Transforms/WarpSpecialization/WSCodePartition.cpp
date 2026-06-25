@@ -3990,7 +3990,7 @@ void insertAsyncComm(
                  .second;
       }
       // Use token for producer acquire and consumer release.
-      if (commChannel.consumerBarriers.empty()) {
+      if (!commChannel.consumerBarriers.count(token.first)) {
         // Insert ProducerAcquireOp before the producer.
         auto producerAcquirePoint =
             getSameLevelOp(headConsumer, tmaHeadProducer);
@@ -4409,8 +4409,10 @@ void insertAsyncComm(
       }
 
       // Insert ConsumerReleaseOp, if consumer is not an MMAv5 op. For MMAv5,
-      // MMA lowering will handle the ConsumerReleaseOp.
-      if (commChannel.consumerBarriers.empty()) {
+      // MMA lowering will handle the ConsumerReleaseOp. A channel can mix MMAv5
+      // and non-MMAv5 consumers, so check the barrier per consumer task rather
+      // than treating the whole channel as all-MMAv5 or all-token-based.
+      if (!commChannel.consumerBarriers.count(token.first)) {
         // Route the release off this token's OWN tail consumer, mirroring the
         // per-token tokenHeadConsumer the ConsumerWait uses. The group-wide
         // `tailConsumer` is the last consumer op regardless of task, which for
@@ -4867,6 +4869,13 @@ static void mergeDuplicateLocalAllocs(triton::FuncOp &funcOp) {
           LDBG("  type: " << type);
         });
 
+        SmallVector<AsyncTaskId> taskIds = getAsyncTaskIds(firstAlloc);
+        for (AsyncTaskId taskId : getAsyncTaskIds(laterAlloc)) {
+          if (!llvm::is_contained(taskIds, taskId))
+            taskIds.push_back(taskId);
+        }
+        firstAlloc->setAttr(kAsyncTaskIdAttrName,
+                            OpBuilder(firstAlloc).getI32ArrayAttr(taskIds));
         laterAlloc.getResult().replaceAllUsesWith(firstAlloc.getResult());
         toErase.push_back(laterAlloc);
       }
