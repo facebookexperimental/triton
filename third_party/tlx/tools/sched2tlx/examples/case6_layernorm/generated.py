@@ -18,13 +18,13 @@ def layernorm_fwd_nows(
     # ── Preamble (function-scope ops before the loop) ──
     pid_0 = tl.program_id(0)
     nprog_0 = tl.num_programs(0)
-    add_2 = (M + 7)
-    div_3 = (add_2 // 8)
+    add_3 = (M + 7)
+    div_4 = (add_3 // 8)
     x_desc = tl.make_tensor_descriptor(X, [M, 512], [512, 1], [8, 512])
     y_desc = tl.make_tensor_descriptor(Y, [M, 512], [512, 1], [8, 512])
-    range_6 = tl.arange(0, 512)
-    ext_7 = tl.load((W + range_6))[None, :].to(tl.float32)
-    ext_8 = tl.load((B + range_6))[None, :].to(tl.float32)
+    range_7 = tl.arange(0, 512)
+    ext_8 = tl.load((W + range_7))[None, :].to(tl.float32)
+    ext_9 = tl.load((B + range_7))[None, :].to(tl.float32)
 
     # ── Multi-buffered allocations (from modulo's lifetime analysis) ──
     # inner-loop buf 0: SMEM count=1 (modulo lifetime [1915..1915], II=594)
@@ -35,23 +35,23 @@ def layernorm_fwd_nows(
     L0_smem_2 = tlx.local_alloc((8, 512), tl.float16, 1)
 
     # ── Mbarriers (SemIR: full+empty pair per semaphore) ──
-    # sem0_b1: N1→N2  tt.descriptor_load→arith.extf  cyc1→cyc749  forward  buf=1  kind=mbarrier
-    sem0_b1_full = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
-    sem0_b1_empty = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
+    # L0_smem_1: N1→N2  tt.descriptor_load→arith.extf  cyc1→cyc749  forward  buf=1  kind=mbarrier
+    L0_smem_1_full = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
+    L0_smem_1_empty = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
     # sem1_b2: N21→N22  arith.truncf→tt.descriptor_store  cyc1889→cyc1915  forward  buf=2  kind=mbarrier
     sem1_b2_full = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
     sem1_b2_empty = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
     with tlx.async_tasks():
         # Async task: role=TMA ← inner wg0 (Phase 4 plan)
         with tlx.async_task(num_warps=1, num_regs=24):
-            for tile_id in range(pid_0, div_3, nprog_0):
+            for tile_id in range(pid_0, div_4, nprog_0):
                 _it = (tile_id - pid_0) // nprog_0
                 buf = _it % 2
                 phase = (_it // 2) & 1
-                tlx.barrier_wait(sem0_b1_empty[(_it % 2)], (((_it // 2) & 1) ^ 1))
-                tlx.barrier_expect_bytes(sem0_b1_full[(_it % 2)], 8192)
+                tlx.barrier_wait(L0_smem_1_empty[(_it % 2)], (((_it // 2) & 1) ^ 1))
+                tlx.barrier_expect_bytes(L0_smem_1_full[(_it % 2)], 8192)
                 # load → L0_smem_1
-                tlx.async_descriptor_load(x_desc, L0_smem_1[buf], [(tile_id * 8), 0], sem0_b1_full[(_it % 2)])
+                tlx.async_descriptor_load(x_desc, L0_smem_1[buf], [(tile_id * 8), 0], L0_smem_1_full[(_it % 2)])
         # Async task: role=default ← inner wg1 (Phase 4 plan)
         with tlx.async_task("default"):
             # Re-materialize function-scope register tensors locally (a 
@@ -59,40 +59,40 @@ def layernorm_fwd_nows(
             _wgloc600 = tl.arange(0, 512)
             _wgloc601 = tl.load((W + _wgloc600))[None, :].to(tl.float32)
             _wgloc602 = tl.load((B + _wgloc600))[None, :].to(tl.float32)
-            for tile_id in range(pid_0, div_3, nprog_0):
+            for tile_id in range(pid_0, div_4, nprog_0):
                 _it = (tile_id - pid_0) // nprog_0
                 buf = _it % 2
                 phase = (_it // 2) & 1
-                tlx.barrier_wait(sem0_b1_full[(_it % 2)], ((_it // 2) & 1))
-                chan_sem0_b1_0 = tlx.local_load(L0_smem_1[(_it % 2)])
-                tlx.barrier_arrive(sem0_b1_empty[(_it % 2)], 1)
-                ext_101 = chan_sem0_b1_0.to(tl.float32)
-                mulf_102 = (ext_101 * ext_101)
-                red_103 = tl.sum(ext_101, 1)
-                red_104 = tl.sum(mulf_102, 1)
-                divf_105 = (red_103 / tl.full((8,), 512, tl.float32))
-                expand_106 = divf_105[:, None]
-                bcast_107 = expand_106
-                subf_108 = (ext_101 - bcast_107)
-                mulf_109 = (divf_105 * divf_105)
-                divf_110 = (red_104 / tl.full((8,), 512, tl.float32))
-                subf_111 = (divf_110 - mulf_109)
-                addf_112 = (subf_111 + eps)
-                sqrt_113 = tl.math.sqrt(addf_112)
-                divf_114 = (tl.full((8,), 1, tl.float32) / sqrt_113)
-                expand_115 = divf_114[:, None]
-                bcast_116 = expand_115
-                mulf_117 = (subf_108 * bcast_116)
-                mulf_118 = (mulf_117 * _wgloc601)
-                addf_119 = (mulf_118 + _wgloc602)
-                trunc_120 = addf_119.to(tl.float16)
+                tlx.barrier_wait(L0_smem_1_full[(_it % 2)], ((_it // 2) & 1))
+                chan_L0_smem_1_0 = tlx.local_load(L0_smem_1[(_it % 2)])
+                tlx.barrier_arrive(L0_smem_1_empty[(_it % 2)], 1)
+                ext_10 = chan_L0_smem_1_0.to(tl.float32)
+                mulf_11 = (ext_10 * ext_10)
+                red_12 = tl.sum(ext_10, 1)
+                red_13 = tl.sum(mulf_11, 1)
+                divf_14 = (red_12 / tl.full((8,), 512, tl.float32))
+                expand_15 = divf_14[:, None]
+                bcast_16 = expand_15
+                subf_17 = (ext_10 - bcast_16)
+                mulf_18 = (divf_14 * divf_14)
+                divf_19 = (red_13 / tl.full((8,), 512, tl.float32))
+                subf_20 = (divf_19 - mulf_18)
+                addf_21 = (subf_20 + eps)
+                sqrt_22 = tl.math.sqrt(addf_21)
+                divf_23 = (tl.full((8,), 1, tl.float32) / sqrt_22)
+                expand_24 = divf_23[:, None]
+                bcast_25 = expand_24
+                mulf_26 = (subf_17 * bcast_25)
+                mulf_27 = (mulf_26 * _wgloc601)
+                addf_28 = (mulf_27 + _wgloc602)
+                trunc_29 = addf_28.to(tl.float16)
                 tlx.barrier_wait(sem1_b2_empty[0], ((_it & 1) ^ 1))
-                tlx.local_store(L0_smem_2[0], trunc_120)
+                tlx.local_store(L0_smem_2[0], trunc_29)
                 tlx.fence_async_shared()
                 tlx.barrier_arrive(sem1_b2_full[0], 1)
         # Async task: role=TMA ← inner wg2 (Phase 4 plan)
         with tlx.async_task(num_warps=1, num_regs=24):
-            for tile_id in range(pid_0, div_3, nprog_0):
+            for tile_id in range(pid_0, div_4, nprog_0):
                 _it = (tile_id - pid_0) // nprog_0
                 buf = _it % 1
                 phase = (_it // 1) & 1
