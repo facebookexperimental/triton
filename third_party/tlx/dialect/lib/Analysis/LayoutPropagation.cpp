@@ -238,9 +238,8 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
         unsigned blockN = srcEncoding.getBlockN();
         auto newTmemEncoding = ttng::TensorMemoryEncodingAttr::get(
             tmemEncoding.getContext(), blockM, blockN,
-            tmemEncoding.getColStride(), tmemEncoding.getCTASplitM(),
-            tmemEncoding.getCTASplitN(), tmemEncoding.getTwoCTAs(),
-            tmemEncoding.getCtaMode());
+            tmemEncoding.getColStride(), tmemEncoding.getCGALayout(),
+            tmemEncoding.getTwoCTAs(), tmemEncoding.getCtaMode());
         const auto updatedResultLayoutEncoding =
             LayoutEncoding(newTmemEncoding);
         auto operandLattice = operands[0];
@@ -651,8 +650,8 @@ LogicalResult LayoutForwardPropagation::visitOperation(
                                 static_cast<unsigned>(dstTy.getShape().back()));
           auto newEncoding = ttng::TensorMemoryEncodingAttr::get(
               op->getContext(), blockM, blockN, encoding.getColStride(),
-              encoding.getCTASplitM(), encoding.getCTASplitN(),
-              encoding.getTwoCTAs(), encoding.getCtaMode());
+              encoding.getCGALayout(), encoding.getTwoCTAs(),
+              encoding.getCtaMode());
           operandLayoutEncoding = LayoutEncoding(newEncoding);
         } else if (isa<ttng::TensorMemoryScalesEncodingAttr,
                        triton::tlx::DummyTMEMLayoutAttr>(operandEncoding)) {

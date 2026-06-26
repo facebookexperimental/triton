@@ -770,9 +770,7 @@ struct TCGen5CommitOpConversion
 
     bool twoCTAs = ttng::getModuleTwoCTAs(op) || tlx::tlxEnablePairedMMA(op);
     if (twoCTAs) {
-      Value leftClusterId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
-      leftClusterId = b.and_(leftClusterId, b.i32_val(1));
-      Value cluster0 = b.icmp_eq(leftClusterId, b.i32_val(0));
+      Value cluster0 = LLVM::NVIDIA::createLeadCTAPredicate(loc, rewriter);
       pred = b.and_(pred, cluster0);
     }
 

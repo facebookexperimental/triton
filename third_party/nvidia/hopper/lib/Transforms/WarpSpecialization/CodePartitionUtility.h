@@ -188,6 +188,9 @@ struct TmemDataChannelPost : Channel {
 } // namespace nvidia_gpu
 } // namespace triton
 
+constexpr static char kWarpSpecializeGeneratedBarrierAttrName[] =
+    "ttg.ws_generated_barrier";
+
 bool enclosing(scf::IfOp ifOp, Operation *op);
 bool enclosing(scf::ForOp forOp, Operation *op);
 
@@ -374,6 +377,7 @@ bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel);
 // has no `buffer.offset`) and is a `TmemDataChannelPost` with
 // `isOperandDNoAcc`.
 bool isWholeAllocationOverwriteReuseOwner(Channel *ownerCh);
+void invalidateWarpSpecializeBarriers(triton::FuncOp funcOp);
 
 } // namespace mlir
 

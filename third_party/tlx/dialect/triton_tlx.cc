@@ -216,17 +216,22 @@ void init_triton_tlx_ir(py::module &&m) {
               unsigned colStride, unsigned CTASplitM, unsigned CTASplitN,
               unsigned ctaMode) {
              auto context = self.getBuilder().getContext();
+             llvm::SmallVector<unsigned, 2> splits = {CTASplitM, CTASplitN};
+             llvm::SmallVector<unsigned, 2> order = {0, 1};
+             auto cgaLayout = makeCGALayout(context, splits, splits, order);
              return mlir::cast<Attribute>(ttng::TensorMemoryEncodingAttr::get(
-                 context, blockM, blockN, colStride, CTASplitM, CTASplitN,
+                 context, blockM, blockN, colStride, cgaLayout,
                  /*twoCTAs=*/false,
                  static_cast<ttng::TensorMemoryCTAMode>(ctaMode)));
            })
       .def("make_tensor_memory_scales_encoding_attr",
            [](TritonOpBuilder &self, unsigned CTASplitM, unsigned CTASplitN) {
              auto context = self.getBuilder().getContext();
+             llvm::SmallVector<unsigned, 2> splits = {CTASplitM, CTASplitN};
+             llvm::SmallVector<unsigned, 2> order = {0, 1};
+             auto cgaLayout = makeCGALayout(context, splits, splits, order);
              return mlir::cast<Attribute>(
-                 ttng::TensorMemoryScalesEncodingAttr::get(context, CTASplitM,
-                                                           CTASplitN));
+                 ttng::TensorMemoryScalesEncodingAttr::get(context, cgaLayout));
            })
       .def("make_nv_mma_shared_encoding_attr",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
@@ -984,8 +989,8 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, int nbytes, int alignment) -> Value {
              auto ptrType = triton::PointerType::get(
                  self.getBuilder().getI8Type(), /*addressSpace=*/1);
-             return self.create<ttg::GlobalScratchAllocOp>(ptrType, nbytes,
-                                                           alignment);
+             return self.create<ttg::GlobalScratchAllocOp>(
+                 ptrType, nbytes, alignment, mlir::UnitAttr());
            })
       // Make a tensor descriptor with optional desc_ptr
       .def("create_make_tensor_descriptor",

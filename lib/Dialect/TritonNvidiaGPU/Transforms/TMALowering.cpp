@@ -200,7 +200,7 @@ public:
       // Create global scratch allocation when desc_ptr is not provided
       auto alloc = triton::gpu::GlobalScratchAllocOp::create(
           rewriter, loc, getPointerType(rewriter.getI8Type()), TMA_SIZE_BYTES,
-          TMA_ALIGN);
+          TMA_ALIGN, UnitAttr());
       descPtr = alloc.getResult();
     }
 
