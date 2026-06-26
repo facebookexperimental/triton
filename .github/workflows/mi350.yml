@@ -5,8 +5,8 @@ on:
       - main
   pull_request:
   schedule:
-    # Nightly run at 08:00 UTC.
-    - cron: '0 8 * * *'
+    # Every 6 hours at the top of the hour (00:00, 06:00, 12:00, 18:00 UTC).
+    - cron: '0 */6 * * *'
 
 env:
   MAX_JOBS: 16
@@ -57,7 +57,7 @@ jobs:
           # stable logical bucket identity for this job.
           BUCKET="amd-tritonbench"
           TITLE="[nightly] ${GITHUB_WORKFLOW} / mi350-meta-triton-test / ${BUCKET}"
-          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"mi350-meta-triton-test","summary":"TritonBench tests failed on MI350 (see run log)."}]'
+          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"mi350-meta-triton-test","summary":"TritonBench tests failed on MI350 (see run log).","repro":""}]'
           echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
 
   mi350-tlx-test:
@@ -149,6 +149,7 @@ jobs:
       event_name: ${{ github.event_name }}
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
 
   report-mi350-tlx:
     needs: mi350-tlx-test
@@ -173,6 +174,34 @@ jobs:
       event_name: ${{ github.event_name }}
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+
+  # ----- Nightly issue reconciliation: close recovered issues (schedule only) -----
+  reconcile-mi350-tritonbench:
+    needs: mi350-meta-triton-test
+    if: always() && github.event_name == 'schedule' && (needs.mi350-meta-triton-test.result == 'success' || needs.mi350-meta-triton-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: ${{ github.workflow }}
+      job_name: mi350-meta-triton-test
+      failures: ${{ needs.mi350-meta-triton-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  reconcile-mi350-tlx:
+    needs: mi350-tlx-test
+    if: always() && github.event_name == 'schedule' && (needs.mi350-tlx-test.result == 'success' || needs.mi350-tlx-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: ${{ github.workflow }}
+      job_name: mi350-tlx-test
+      failures: ${{ needs.mi350-tlx-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}

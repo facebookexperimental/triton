@@ -10,8 +10,8 @@ on:
     types: [checks_requested]
   workflow_dispatch:
   schedule:
-    # Nightly run at 07:00 UTC.
-    - cron: '0 7 * * *'
+    # Every 6 hours at :15 past (00:15, 06:15, 12:15, 18:15 UTC).
+    - cron: '15 */6 * * *'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -122,3 +122,18 @@ jobs:
       event_name: ${{ github.event_name }}
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+
+  # ----- Nightly issue reconciliation: close recovered issues (schedule only) -----
+  reconcile-compiler-lit:
+    needs: lit-tests
+    if: always() && github.event_name == 'schedule' && (needs.lit-tests.result == 'success' || needs.lit-tests.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: ${{ github.workflow }}
+      job_name: lit-tests
+      failures: ${{ needs.lit-tests.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
