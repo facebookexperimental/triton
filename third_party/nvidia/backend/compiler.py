@@ -186,7 +186,7 @@ class CUDAOptions:
     sanitize_overflow: bool = False
     arch: str = None
     instrumentation_mode: str = ""
-    early_tma_store_lowering: bool = False
+    early_tma_store_lowering: Optional[None] = None
     generate_subtiled_region: bool = False
 
     def __post_init__(self):
@@ -626,12 +626,9 @@ class CUDABackend(BaseBackend):
                 ir.builder(mod.context).get_int32_attr(opt.maxRegAutoWS),
             )
 
-        # Add early TMA store lowering attribute
-        if opt.early_tma_store_lowering:
-            mod.set_attr(
-                "ttg.early_tma_store_lowering",
-                ir.builder(mod.context).get_bool_attr(True),
-            )
+        # Add early TMA store lowering attribute. Default value is True.
+        if opt.early_tma_store_lowering or opt.early_tma_store_lowering is None:
+            mod.set_attr("ttg.early_tma_store_lowering", ir.builder(mod.context).get_bool_attr(True))
 
         if opt.cluster_dims is not None:
             # Set cluster_info attributes on the module
@@ -728,16 +725,14 @@ class CUDABackend(BaseBackend):
                 # TRITON_USE_MODULO_SCHEDULE=sms|exhaustive|random
                 nvidia.passes.hopper.add_modulo_schedule(pm)
             nvidia.passes.hopper.add_data_partitioning(pm, 1)
-            # assign_latencies sets tt.latency on loads/MMAs (stage-distance
-            # latencies). schedule_loops reads tt.latency AND tt.autows:
-            # when MMA ops have tt.autows, scheduleKeyOpsAnnotation places
-            # them at the annotated stages/clusters while scheduling all
-            # other ops (loads, softmax, barriers) via the standard
-            # latency-based heuristic. Without assign_latencies, the WS
-            # pass's internal scheduleLoops has no latencies and can't
-            # enter the code path that reads tt.autows annotations.
-            passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
-            passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
+            # The modulo / LLM scheduler above already produced the full loop
+            # schedule (loop.stage / loop.cluster). Re-running assign_latencies +
+            # schedule_loops here would recompute and OVERRIDE it, so only run
+            # them on the default path where no custom scheduler set the schedule.
+            uses_custom_schedule = knobs.nvidia.use_llm_schedule or knobs.nvidia.use_modulo_schedule is not None
+            if not uses_custom_schedule:
+                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
+                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
             if not knobs.nvidia.use_meta_ws:
                 # 2-CTA + upstream WS is not supported
                 if opt.cluster_dims is None or max(opt.cluster_dims) < 2:
@@ -855,8 +850,6 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_concurrency_sanitizer(pm)
             passes.gluon.add_canonicalizer(pm)
             passes.common.add_cse(pm)
-        passes.ttgpuir.add_allocate_global_scratch_memory(pm)
-        nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
         # Print TTGIR to TLX mapping before final emission (for debugging/analysis)
         tlx_dump_dir = None
         tlx_saved_fd = None
@@ -870,6 +863,8 @@ class CUDABackend(BaseBackend):
         # instrumentation point here so we can override IRs above (e.g., ttir and ttgir)
         if CUDABackend.instrumentation:
             CUDABackend.instrumentation.patch("ttgpuir_to_llvmir", pm, mod.context)
+        passes.ttgpuir.add_allocate_global_scratch_memory(pm)
+        nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
         nvidia.passes.hopper.add_tma_store_token_wait_lowering(pm)
         nvidia.passes.ttgpuir.add_to_llvmir(pm, capability, ptx_version)
         passes.ttgpuir.add_canonicalize_llvm_ir(pm)
@@ -1029,6 +1024,7 @@ class CUDABackend(BaseBackend):
             if os.environ.get("TRITON_COMPILE_IQ_APPLY"):
                 try:
                     from triton.compile_iq.consume import acf_args_for
+
                     ptx_extra_options += acf_args_for(src, arch, get_ptxas(self.target.arch).version)
                 except Exception:
                     pass

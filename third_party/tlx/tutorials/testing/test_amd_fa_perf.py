@@ -8,6 +8,8 @@ from triton.language.extra.tlx.tutorials.amd_fa_pipelined import (
     attention as _amd_fa_pipelined, )
 from triton.language.extra.tlx.tutorials.amd_fa_persistent import (
     attention as _amd_fa_persistent, )
+from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
+    attention as _amd_fa_cluster, )
 
 from triton._internal_testing import is_hip
 
@@ -35,7 +37,10 @@ ATTENTION_METHODS = {
         }),
     "persistent":
     lambda q, k, v, sm_scale, causal: _amd_fa_persistent(q, k, v, sm_scale, causal),
+    "cluster":
+    lambda q, k, v, sm_scale, causal: _amd_fa_cluster(q, k, v, sm_scale, causal),
 }
+DEFAULT_ATTENTION_VERSIONS = ["simple", "prefetch", "persistent"]
 
 ref_lib = "SDPA"
 
@@ -43,11 +48,19 @@ ref_lib = "SDPA"
 def create_benchmark(versions):
     line_vals = [ref_lib.lower()] + versions
     line_names = [ref_lib] + versions
+    x_vals = [(1024, 128), (4096, 128), (8192, 128)] if "cluster" in versions else [
+        (1024, 64),
+        (4096, 64),
+        (8192, 64),
+        (1024, 128),
+        (4096, 128),
+        (8192, 128),
+    ]
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=["N_CTX", "HEAD_DIM"],
-            x_vals=[(1024, 64), (4096, 64), (8192, 64), (1024, 128), (4096, 128), (8192, 128)],
+            x_vals=x_vals,
             line_arg="provider",
             line_vals=line_vals,
             line_names=line_names,
@@ -94,7 +107,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if is_hip():
-        versions = args.version if args.version else list(ATTENTION_METHODS.keys())
+        versions = args.version if args.version else DEFAULT_ATTENTION_VERSIONS
         print(f"Running benchmarks for: {versions}")
         benchmark = create_benchmark(versions)
         benchmark.run(print_data=True)

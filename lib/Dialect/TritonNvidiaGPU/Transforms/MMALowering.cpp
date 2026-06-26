@@ -66,12 +66,29 @@ struct TCGen5MMAScaleSharedToTmemConversion
     auto oldType = cast<ttg::MemDescType>(operand.get().getType());
     auto numElems = product(oldType.getShape());
     Type elType = oldType.getElementType();
-    ttg::CGAEncodingAttr CGALayout = ttg::getCGALayout(oldType.getEncoding());
-    auto CTASplitNum = CGALayout.getCTASplitNum();
+    // The scales SMEM source may use a flexible multi-dimensional layout (e.g.
+    // a 5D `1x2x32x4x4` shape), whose CGALayout has the source's rank. The
+    // scales TMEM encoding is always rank 2, so derive a rank-2 CGALayout from
+    // the source's CTA split rather than reusing the (possibly higher-rank)
+    // source CGALayout directly.
+    SmallVector<unsigned> srcCTAsPerCGA =
+        ttg::getCTAsPerCGA(oldType.getEncoding());
+    ttg::CGAEncodingAttr CGALayout;
+    if (product<unsigned>(srcCTAsPerCGA) == 1) {
+      CGALayout = ttg::CGAEncodingAttr::get1CTALayout(context, /*rank=*/2);
+    } else {
+      SmallVector<unsigned> srcCTASplitNum =
+          ttg::getCTASplitNum(oldType.getEncoding());
+      unsigned ctasPerCGA = product<unsigned>(srcCTAsPerCGA);
+      unsigned ctaSplitNum = product<unsigned>(srcCTASplitNum);
+      CGALayout = ttg::CGAEncodingAttr::fromSplitParams(
+          context, /*CTAsPerCGA=*/{ctasPerCGA, 1u},
+          /*CTASplitNum=*/{ctaSplitNum, 1u}, /*CTAOrder=*/{0u, 1u});
+    }
     // Distribute the scales across the rows of the MMA operation.
     SmallVector<int64_t> shape = {rows, numElems / rows};
-    Attribute scaleEncoding = TensorMemoryScalesEncodingAttr::get(
-        context, CTASplitNum[0], CTASplitNum[1]);
+    Attribute scaleEncoding =
+        TensorMemoryScalesEncodingAttr::get(context, CGALayout);
     Type scaleAType =
         ttg::MemDescType::get(shape, elType, scaleEncoding, tensorMemorySpace,
                               /*mutableMemory=*/true);
