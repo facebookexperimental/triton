@@ -49,6 +49,14 @@ Step 11: replaceBufferReuse        — rewrite non-representative allocs
 Step 12: specializeRegion          — clone ops into WarpSpecializeOp regions
 ```
 
+Before channel discovery, the post-allocated path also merges duplicate
+`descriptor_load -> local_store -> local_alloc` chains when memory planning has
+assigned the local allocs the same physical `buffer.id`, layout, offset, and
+copy count. This represents one TMA-loaded SMEM tile with multiple consumers,
+for example an A tile consumed by both scalar normalization math and a gen5 MMA.
+After merging, channel discovery sees one producer-side store and multiple
+consumer uses of the same SMEM buffer.
+
 ## `doBufferAllocation` — Pre-pass
 
 **Function**: `doBufferAllocation(funcOp)`
@@ -171,6 +179,12 @@ Creates synchronization tokens for each channel group:
 - Results are stored in a `CommChannel` struct per channel, containing
   `tokens` (per consumer task ID), optional `producerBarrier` (for TMA/gen5),
   and optional `consumerBarriers` (for gen5 inline barriers).
+
+Channels can mix gen5 and non-gen5 consumers. In that case, gen5 consumers use
+their inline completion barrier while non-gen5 consumers still get token-based
+producer acquire and consumer release operations. Synchronization insertion must
+therefore check `consumerBarriers` per consumer task ID rather than treating the
+whole channel as all-gen5 or all-token-based.
 
 ## Synchronization Insertion
 
