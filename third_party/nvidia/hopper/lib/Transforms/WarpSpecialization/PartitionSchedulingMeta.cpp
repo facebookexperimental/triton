@@ -369,6 +369,20 @@ public:
         mmas, [](Operation *op) { return isa<ttng::MMAv5OpInterface>(op); });
   }
 
+  /// True when the WS loop has no MMA but contains an in-register reduction
+  /// (tt.reduce). This anchors the no-MMA reduction-kernel path (RMS norm,
+  /// LayerNorm, softmax-only) where there is neither an MMA nor a TMA-atomic
+  /// reduce to drive a compute partition. Any triton::ReduceOp
+  /// (tl.sum/max/min/argmax/...) counts; the walk covers nested loops.
+  bool hasComputeAnchorNoMMA() const {
+    if (!mmas.empty())
+      return false;
+    // Copy the lightweight op handle: walk() is non-const but this method is.
+    scf::ForOp loop = mainLoop;
+    return loop.walk([](triton::ReduceOp) { return WalkResult::interrupt(); })
+        .wasInterrupted();
+  }
+
   /// Get the shared ops (ops appearing in multiple MMA backward slices).
   const DenseSet<Operation *> &getSharedOps() const { return sharedOps; }
 
@@ -858,12 +872,18 @@ static PartitionLayout createPartitionLayout(PartitionSet &schedule,
   bool hasEpilogue =
       !categorizer.getOpsInCategory(OpCategory::EpilogueStore).empty();
   bool hasMMAv5 = categorizer.hasMMAv5();
+  // No-MMA reduction kernels (RMS norm / LayerNorm / softmax-only): no MMA and
+  // no TMA-atomic reduce, but an in-register tt.reduce. These need a reduction
+  // (default) partition to hold the tensor compute. Gated to the no-MMA case so
+  // MMA kernels are unaffected.
+  bool hasComputeAnchor = categorizer.hasComputeAnchorNoMMA();
 
   LLVM_DEBUG(llvm::dbgs() << "[partition-layout] dpFactor=" << dpFactor
                           << ", hasCorrection=" << hasCorrection
                           << ", hasReduction=" << hasReduction
                           << ", hasEpilogue=" << hasEpilogue
-                          << ", hasMMAv5=" << hasMMAv5 << "\n");
+                          << ", hasMMAv5=" << hasMMAv5
+                          << ", hasComputeAnchor=" << hasComputeAnchor << "\n");
 
   // Correction partition: needed when we have correction ops and not merging.
   if (hasCorrection && !options.mergeCorrection) {
@@ -871,8 +891,10 @@ static PartitionLayout createPartitionLayout(PartitionSet &schedule,
     layout.correctionPartition->setType("correction");
   }
 
-  // Reduction partition: for bwd.
-  if (hasReduction && !options.mergeReduction) {
+  // Reduction partition: for bwd TMA-reduce kernels, OR no-MMA in-register
+  // reduction kernels. Created first so it gets index 0 (the default 4-warp
+  // group), which is where the heavy tensor compute belongs.
+  if ((hasReduction || hasComputeAnchor) && !options.mergeReduction) {
     layout.reductionPartition = schedule.addPartition(0);
     layout.reductionPartition->setType("reduction");
   }
@@ -1216,6 +1238,9 @@ struct ScheduleResult {
   DenseMap<Operation *, unsigned> opToDpId;
   DenseMap<unsigned, Partition *> dpIdToPartition;
   bool createComputePartitions;
+  // True for no-MMA in-register reduction kernels (RMS/LayerNorm). Enables the
+  // scalar-offset partition fixup in runOnOperation; inert for MMA kernels.
+  bool noMMACompute = false;
 };
 
 // Pre-schedule DataPartition-categorized ops and shared ops to their
@@ -1550,6 +1575,23 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
     }
   }
 
+  // No-MMA reduction kernels (RMS/LayerNorm) have only an epilogue_store
+  // partition (merge_epilogue=true suppresses the non-store epilogue). The
+  // anchoring above keys on epiloguePartition, so the in-loop TMA store would
+  // otherwise be left for the relaxed Phase 4 load-user walk and pulled into
+  // the reduction partition. Anchor in-loop epilogue store ops to
+  // epilogue_store here (before Phase 4) so scheduleUsers stops at them; the
+  // staging local_alloc stays in reduction, forming the reduction->store SMEM
+  // channel. Gated to the no-MMA case so MMA kernels are untouched.
+  if (mmas.empty() && layout.epilogueStorePartition) {
+    for (auto loop : loops) {
+      loop.walk([&](Operation *op) {
+        if (isEpilogueStoreOp(op))
+          tryScheduleOp(layout.epilogueStorePartition, op);
+      });
+    }
+  }
+
   // Schedule MMAs and their associated stores
   for (auto loop : loops) {
     for (auto &op : loop.getOps()) {
@@ -1625,8 +1667,12 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
   // the use chain. Without this guard, load-user scheduling from
   // descriptor_load (m/Di metadata) transitively pulls the entire softmax
   // chain into the reduction partition.
+  // Exception: no-MMA reduction kernels (mmas.empty()) have no Phase 5 to fall
+  // back on, so the load-user walk is exactly how the reduction (default)
+  // partition gets its tensor compute — run it even when default==reduction.
   if (defaultPartition &&
-      (!layout.reductionPartition || defaultPartition != reductionPartition)) {
+      (!layout.reductionPartition || defaultPartition != reductionPartition ||
+       mmas.empty())) {
     for (Operation *loadOrAlloc : loadsAndAllocs) {
       scf::ForOp parentLoop = loadOrAlloc->getParentOfType<scf::ForOp>();
       if (!parentLoop) {
@@ -1954,7 +2000,8 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
                         localSchedOpts,
                         categorizer.getOpToDpIdMap(),
                         std::move(dpIdToPartition),
-                        createComputePartitions};
+                        createComputePartitions,
+                        categorizer.hasComputeAnchorNoMMA()};
 }
 
 namespace {
@@ -2666,6 +2713,38 @@ void PartitionSchedulingMeta::runOnOperation() {
       // This must run after all partition assignments are finalized (after
       // propagatePartitions + optimizeSchedule) but before serialization.
       splitDataPartitionedIfOps(loop, schedule);
+
+      // No-MMA reduction kernels (RMS norm / LayerNorm) have no MMA backward
+      // slice to anchor partition assignment for scalar index/offset ops
+      // (e.g. offs_m = tile_id * 64) that feed the descriptor loads/stores.
+      // propagatePartitions skips these (isScalarOp), yet the
+      // tt.warp_specialize verifier requires every op in the loop to carry
+      // ttg.partition. Assign each still-unannotated value-producing op the
+      // union of its partitioned users' ids, iterating to a fixpoint so chains
+      // (muli -> addi -> descriptor_load) resolve. setPartition sorts/dedups
+      // and propagates to region terminators. An offset feeding both load and
+      // store gets both ids and is replicated by code partition (no
+      // cross-partition scalar channel). Gated to the no-MMA case so MMA
+      // kernels are untouched.
+      if (result->noMMACompute) {
+        bool changed = true;
+        while (changed) {
+          changed = false;
+          loop.walk([&](Operation *op) {
+            if (op->getNumResults() == 0 || hasPartition(op))
+              return;
+            SetVector<int> unionIds;
+            for (Operation *user : op->getUsers()) {
+              SetVector<int> userIds = safeGetPartitionIds(user);
+              unionIds.insert(userIds.begin(), userIds.end());
+            }
+            if (!unionIds.empty()) {
+              setPartition(op, unionIds);
+              changed = true;
+            }
+          });
+        }
+      }
 
       // Estimate total warps for the WS schedule. If the estimate exceeds
       // the hardware warp limit, skip WS for the entire function.
