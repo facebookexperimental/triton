@@ -122,3 +122,17 @@ jobs:
       event_name: ${{ github.event_name }}
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
+
+  # ----- Nightly issue reconciliation: close recovered issues (schedule only) -----
+  reconcile-compiler-lit:
+    needs: lit-tests
+    if: always() && github.event_name == 'schedule' && (needs.lit-tests.result == 'success' || needs.lit-tests.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: ${{ github.workflow }}
+      job_name: lit-tests
+      failures: ${{ needs.lit-tests.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

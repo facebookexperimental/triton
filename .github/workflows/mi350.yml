@@ -169,6 +169,33 @@ jobs:
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
 
+  # ----- Nightly issue reconciliation: close recovered issues (schedule only) -----
+  reconcile-mi350-tritonbench:
+    needs: mi350-meta-triton-test
+    if: always() && github.event_name == 'schedule' && (needs.mi350-meta-triton-test.result == 'success' || needs.mi350-meta-triton-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: ${{ github.workflow }}
+      job_name: mi350-meta-triton-test
+      failures: ${{ needs.mi350-meta-triton-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  reconcile-mi350-tlx:
+    needs: mi350-tlx-test
+    if: always() && github.event_name == 'schedule' && (needs.mi350-tlx-test.result == 'success' || needs.mi350-tlx-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: ${{ github.workflow }}
+      job_name: mi350-tlx-test
+      failures: ${{ needs.mi350-tlx-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
   cancel-in-progress: true

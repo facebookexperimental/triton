@@ -91,6 +91,8 @@ def build_items(failures, workflow, job):
             "issue_title": f"[nightly] {workflow} / {job} / {norm}",
             "job_name": job,
             "summary": info["summary"],
+            # Real per-test signal: safe for reconcile to close on recovery.
+            "fallback": False,
         })
     return items
 
@@ -105,6 +107,8 @@ def build_missing_junit_item(missing_paths, workflow, job):
         "issue_title": f"[nightly] {workflow} / {job} / {norm}",
         "job_name": job,
         "summary": f"Pytest failed before producing JUnit XML: {', '.join(missing_paths)}",
+        # Job-level fallback: no per-test signal -> reconcile must not close.
+        "fallback": True,
     }
 
 
@@ -116,6 +120,8 @@ def build_bucket_item(bucket, workflow, job):
         "issue_title": f"[nightly] {workflow} / {job} / {bucket}",
         "job_name": job,
         "summary": "Job failed but no test failures could be parsed (see run log).",
+        # Job-level fallback: no per-test signal -> reconcile must not close.
+        "fallback": True,
     }
 
 
