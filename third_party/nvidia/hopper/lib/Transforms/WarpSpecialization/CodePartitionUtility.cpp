@@ -697,6 +697,14 @@ static bool hasDependencyChain(Channel *A, Channel *B) {
 }
 
 bool verifyReuseGroup2(ReuseGroup *group) {
+  // TODO(reuse-group generalization): this handles exactly 2 channels at a
+  // single copy. Evaluate generalizing to reuse groups of size N (>2) and to
+  // multi-buffered groups (getNumBuffers() >= 2, e.g. the FA-fwd-persistent
+  // cross-stage QK/P reuse). A prior unused verifyReuseGroupN/orderReuseGroupN
+  // attempted the size-N axis but was dead code (and still assumed single
+  // copy), so it was removed; fold both axes here when a real
+  // N-channel/multi-copy case lands, with the reuse-WAR index/phase taken from
+  // the depth-aware getBufferIdxAndPhase.
   assert(group->channels.size() == 2 &&
          "verifyReuseGroup2 requires exactly 2 channels");
   auto *chA = group->channels[0];
@@ -744,52 +752,6 @@ std::pair<Channel *, Channel *> orderReuseGroup2(ReuseGroup *group) {
   if (appearsBefore(chA->getSrcOp(), chB->getSrcOp()))
     return {chA, chB};
   return {chB, chA};
-}
-
-bool verifyReuseGroupN(ReuseGroup *group) {
-  if (group->channels.size() < 2) {
-    LDBG("verifyReuseGroupN: need at least 2 channels, got "
-         << group->channels.size());
-    return false;
-  }
-  // All channels must have single-copy buffers and producers in the same block.
-  Block *commonBlock = nullptr;
-  for (auto *ch : group->channels) {
-    if (ch->getNumBuffers() != 1) {
-      LDBG("verifyReuseGroupN: channel " << ch->uniqID
-                                         << " has numBuffers != 1");
-      return false;
-    }
-    auto *producer = ch->getSrcOp();
-    if (!producer) {
-      LDBG("verifyReuseGroupN: channel " << ch->uniqID << " has no producer");
-      return false;
-    }
-    if (!commonBlock) {
-      commonBlock = producer->getBlock();
-    } else if (producer->getBlock() != commonBlock) {
-      LDBG("verifyReuseGroupN: producers are in different blocks");
-      return false;
-    }
-  }
-  return true;
-}
-
-SmallVector<Channel *> orderReuseGroupN(ReuseGroup *group) {
-  SmallVector<Channel *> ordered(group->channels.begin(),
-                                 group->channels.end());
-  // Sort by program order of producer ops. All producers are in the same
-  // block (verified by verifyReuseGroupN), so appearsBefore gives a total
-  // order.
-  llvm::sort(ordered, [](Channel *a, Channel *b) {
-    return appearsBefore(a->getSrcOp(), b->getSrcOp());
-  });
-  LLVM_DEBUG({
-    LDBG("orderReuseGroupN: ordered " << ordered.size() << " channels:");
-    for (unsigned i = 0; i < ordered.size(); i++)
-      LDBG("  [" << i << "] channel " << ordered[i]->uniqID);
-  });
-  return ordered;
 }
 
 bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel) {

@@ -122,6 +122,68 @@ static void emitScheduleFromGraph(scf::ForOp loop,
                  IntegerAttr::get(IntegerType::get(ctx, 32), 0));
   }
 
+  // ── Default-partition selection (register-sink rule) ──
+  // Default behavior: reserve partition 0 as an empty default warp group (the
+  // epilogue runs there), shift modulo's workers to 1..N (partOf(wg)=wg+1).
+  // With TRITON_MODULO_REG_DEFAULT: instead pick the highest register-footprint
+  // 4-warp CONSUMER warp group as the default (partOf(D)=0) and fold the
+  // epilogue into it. The hardware reallocates registers (setmaxnreg) so the
+  // 1-warp producers (TMA/MMA) release registers to the default partition;
+  // making the heaviest consumer the default lets it absorb that surplus
+  // (CUTLASS/CudaDMA consumer-as-main pattern). See paste P2396373676.
+  int maxWg = -1;
+  for (const auto &node : schedLoop.nodes)
+    maxWg = std::max(maxWg, node.warpGroup);
+  auto snapWarps = [](int m) {
+    if (m <= 1)
+      return 1;
+    if (m <= 2)
+      return 2;
+    if (m <= 4)
+      return 4;
+    return 8;
+  };
+  SmallVector<int> wgMaxMinWarps(std::max(maxWg + 1, 0), 0);
+  SmallVector<int> wgMaxStage(std::max(maxWg + 1, 0), 0);
+  SmallVector<int64_t> wgRegFootprint(std::max(maxWg + 1, 0), 0);
+  for (const auto &node : schedLoop.nodes) {
+    if (!node.op || node.warpGroup < 0)
+      continue;
+    wgMaxMinWarps[node.warpGroup] =
+        std::max(wgMaxMinWarps[node.warpGroup], std::max(node.minWarps, 1));
+    wgMaxStage[node.warpGroup] =
+        std::max(wgMaxStage[node.warpGroup], node.cycle / II);
+    // Register footprint ~= sum of register-resident tensor results (skip
+    // memdesc results, which live in SMEM/TMEM, not registers).
+    for (Value res : node.op->getResults())
+      if (auto tt = dyn_cast<RankedTensorType>(res.getType()))
+        if (tt.getElementType().isIntOrFloat())
+          wgRegFootprint[node.warpGroup] +=
+              tt.getNumElements() *
+              (tt.getElementType().getIntOrFloatBitWidth() / 8);
+  }
+  bool regDefault = triton::tools::getBoolEnv("TRITON_MODULO_REG_DEFAULT");
+  int defaultWg = -1; // -1 = reserve a separate empty default (legacy)
+  if (regDefault) {
+    int64_t best = -1;
+    for (int wg = 0; wg <= maxWg; ++wg)
+      if (snapWarps(wgMaxMinWarps[wg]) >= 4 && wgRegFootprint[wg] > best) {
+        best = wgRegFootprint[wg];
+        defaultWg = wg;
+      }
+  }
+  // warpGroup -> partition id. Legacy: reserve 0, shift workers +1.
+  // Reg-default: defaultWg -> 0, the rest fill 1..N (skipping defaultWg,
+  // contiguous).
+  auto partOf = [&](int wg) -> int32_t {
+    if (!regDefault || defaultWg < 0)
+      return wg + 1;
+    if (wg == defaultWg)
+      return 0;
+    return (wg < defaultWg) ? wg + 1 : wg;
+  };
+  int numParts = (regDefault && defaultWg >= 0) ? (maxWg + 1) : (maxWg + 2);
+
   // ── 1.5. Per-op: ttg.partition (= our Phase B warp-group decision) ──
   // Emit the WG ID as a DenseI32ArrayAttr so the downstream WS pass
   // (PartitionSchedulingMeta) can pick it up directly instead of
@@ -129,14 +191,71 @@ static void emitScheduleFromGraph(scf::ForOp loop,
   // (unassigned NONE/infrastructure ops) — the downstream pass will
   // propagate them via SSA traversal.
   for (const auto &node : schedLoop.nodes) {
-    if (!node.op || node.warpGroup < 0)
+    if (!node.op)
       continue;
     auto opIt = ddg.getOpToIdx().find(node.op);
     if (opIt != ddg.getOpToIdx().end() && opIt->second != node.id)
       continue; // multi-stage super-node duplicate
-    int32_t wg = static_cast<int32_t>(node.warpGroup);
+    // Reserve partition 0 as the DEFAULT warp group (runs the epilogue /
+    // non-specialized code), per the WS framework convention. Shift modulo's
+    // workers to partitions 1..N. Without this, the epilogue's tmem_load
+    // collapses into the MMA's partition (handleOperandD "Unexpected
+    // Producer").
+    int32_t wg;
+    if (node.warpGroup >= 0) {
+      wg = partOf(node.warpGroup);
+    } else if (!node.replicatedGroups.empty()) {
+      // Replicated infra op: its consumers span warp groups (e.g. case7's
+      // `iv * stride` offset feeding two parallel loads in different
+      // partitions). ttg.partition must be a SINGLE id (doTaskIdPropagate
+      // asserts size==1), so seed it with the lowest consumer partition; the
+      // backend's scalar task-id backward-propagation then clones it into the
+      // other consuming tasks (it's rematerializable scalar arith). The native
+      // backend has no per-task inlining step (unlike sched2tlx), so without a
+      // seed NVGPUWarpSpecialization rejects the loop ("op does not have
+      // expected attribute ttg.partition").
+      wg = partOf(*std::min_element(node.replicatedGroups.begin(),
+                                    node.replicatedGroups.end()));
+    } else {
+      continue; // warpGroup == -1 (no assigned consumers) — leave to backend.
+    }
     node.op->setAttr(ttg::kPartitionAttrName,
                      DenseI32ArrayAttr::get(ctx, ArrayRef<int32_t>{wg}));
+  }
+
+  // ── 1.5b. Function-scope EPILOGUE → default partition (id 0) ──
+  // The post-loop epilogue (e.g. the accumulator tmem_load -> divide -> truncf
+  // -> store chain) lives outside any partition. It must be assigned to the
+  // reserved default partition (0) so the backend anchors it AFTER the
+  // warp_specialize region; otherwise its tmem_load has no ordering dependency
+  // on the region and gets hoisted above the loop, reading the accumulator
+  // before the MMA writes it -> garbage. We derive the epilogue by walking
+  // forward from the loop's results (the dataflow that defines "post-loop"), so
+  // modulo owns this placement and the backend honors ttg.partition verbatim —
+  // no epilogue routing is needed in PartitionSchedulingMeta.
+  {
+    SmallVector<OpOperand *> worklist;
+    for (OpResult result : loop.getResults())
+      for (OpOperand &use : result.getUses())
+        worklist.push_back(&use);
+    DenseSet<Operation *> visited;
+    auto zeroPart = DenseI32ArrayAttr::get(ctx, ArrayRef<int32_t>{0});
+    while (!worklist.empty()) {
+      OpOperand *use = worklist.pop_back_val();
+      Operation *user = use->getOwner();
+      if (!visited.insert(user).second)
+        continue;
+      // Skip ops nested in a loop deeper than `loop` (those are not epilogue).
+      if (auto parent = user->getParentOfType<scf::ForOp>())
+        if (loop->isProperAncestor(parent))
+          continue;
+      // Do not override an existing partition assignment.
+      if (!user->hasAttr(ttg::kPartitionAttrName))
+        user->setAttr(ttg::kPartitionAttrName, zeroPart);
+      for (OpResult result : user->getResults())
+        for (OpOperand &nextUse : result.getUses())
+          worklist.push_back(&nextUse);
+    }
   }
 
   // ── 1.6. Per-loop: ttg.partition_num_warps ──
@@ -147,29 +266,15 @@ static void emitScheduleFromGraph(scf::ForOp loop,
   // WS pass can honor modulo's choice instead of re-deriving from a binary
   // tmem-presence heuristic. (Mirrors jsonDumpWarpGroups' num_warps.)
   {
-    int maxWg = -1;
-    for (const auto &node : schedLoop.nodes)
-      maxWg = std::max(maxWg, node.warpGroup);
     if (maxWg >= 0) {
-      SmallVector<int> wgMaxMinWarps(maxWg + 1, 0);
-      for (const auto &node : schedLoop.nodes) {
-        if (node.warpGroup < 0)
-          continue;
-        wgMaxMinWarps[node.warpGroup] = std::max(
-            wgMaxMinWarps[node.warpGroup], std::max(node.minWarps, 1));
-      }
-      auto snapWarps = [](int m) {
-        if (m <= 1)
-          return 1;
-        if (m <= 2)
-          return 2;
-        if (m <= 4)
-          return 4;
-        return 8;
-      };
-      SmallVector<int32_t> numWarps(maxWg + 1, 1);
+      // partOf maps warpGroup -> partition; index 0 is the default WG.
+      SmallVector<int32_t> numWarps(numParts, 1);
+      if (!(regDefault && defaultWg >= 0))
+        numWarps[0] = 4; // reserved empty default warp group (legacy)
       for (int wg = 0; wg <= maxWg; ++wg)
-        numWarps[wg] = snapWarps(wgMaxMinWarps[wg] == 0 ? 1 : wgMaxMinWarps[wg]);
+        numWarps[partOf(wg)] =
+            snapWarps(wgMaxMinWarps[wg] == 0 ? 1 : wgMaxMinWarps[wg]);
+      numWarps[0] = std::max<int32_t>(numWarps[0], 4); // default is a full WG
       loop->setAttr("ttg.partition_num_warps",
                     DenseI32ArrayAttr::get(ctx, numWarps));
     }
@@ -190,21 +295,14 @@ static void emitScheduleFromGraph(scf::ForOp loop,
   // channel-buffering offsets. The tag is required to be present; PSM resets it
   // to the loop's WS index during serialize.
   {
-    int maxWg = -1;
-    for (const auto &node : schedLoop.nodes)
-      maxWg = std::max(maxWg, node.warpGroup);
     if (maxWg >= 0) {
-      SmallVector<int> wgMaxStage(maxWg + 1, 0);
-      for (const auto &node : schedLoop.nodes) {
-        if (node.warpGroup < 0)
-          continue;
-        wgMaxStage[node.warpGroup] =
-            std::max(wgMaxStage[node.warpGroup], node.cycle / II);
-      }
-      SmallVector<Attribute> stageAttrs;
+      // Placed by partOf; index 0 (the default WG) defaults to stage 0 and is
+      // overwritten when reg-default makes a real consumer the default.
+      SmallVector<Attribute> stageAttrs(
+          numParts, IntegerAttr::get(IntegerType::get(ctx, 32), 0));
       for (int wg = 0; wg <= maxWg; ++wg)
-        stageAttrs.push_back(
-            IntegerAttr::get(IntegerType::get(ctx, 32), wgMaxStage[wg]));
+        stageAttrs[partOf(wg)] =
+            IntegerAttr::get(IntegerType::get(ctx, 32), wgMaxStage[wg]);
       loop->setAttr(ttg::kPartitionStagesAttrName,
                     ArrayAttr::get(ctx, stageAttrs));
       loop->setAttr(ttg::kWarpSpecializeTagAttrName,
@@ -247,10 +345,9 @@ static void emitScheduleFromGraph(scf::ForOp loop,
     // Carry it so the downstream allocator can reuse modulo's coloring instead
     // of running its own merge.
     if (buf.mergeGroupId != UINT_MAX)
-      buf.defOp->setAttr(
-          "buffer.merge_group_id",
-          IntegerAttr::get(IntegerType::get(ctx, 32),
-                           static_cast<int>(buf.mergeGroupId)));
+      buf.defOp->setAttr("buffer.merge_group_id",
+                         IntegerAttr::get(IntegerType::get(ctx, 32),
+                                          static_cast<int>(buf.mergeGroupId)));
   }
 
   // ── 4. Clean up internal attrs ──
@@ -3051,6 +3148,13 @@ static void propagateWarpGroupToInfraOps(ttg::ScheduleLoop &loop) {
         node.warpGroup = *consumerGroups.begin();
       } else {
         node.warpGroup = kReplicatedWarpGroup; // Replicated.
+        // Record the consuming groups so §1.5 can emit a multi-id
+        // ttg.partition. The native backend has no per-task inlining step
+        // (unlike sched2tlx), so a replicated infra op must carry an explicit
+        // partition set or NVGPUWarpSpecialization rejects it (every in-loop
+        // op needs ttg.partition).
+        node.replicatedGroups.assign(consumerGroups.begin(),
+                                     consumerGroups.end());
       }
       changed = true;
     }
@@ -3067,6 +3171,35 @@ static void propagateWarpGroupToInfraOps(ttg::ScheduleLoop &loop) {
     llvm::dbgs() << "[PassB.1.5] Infra ops: " << replicated << " replicated, "
                  << unassigned << " unassigned\n";
   });
+}
+
+/// Co-locate each MMA-operand staging `local_alloc` with its producer load's
+/// warp group. A `local_alloc %loadResult` puts a load's register result into
+/// SMEM for the MMA; it MUST live in the same warp group as the load. If the
+/// clustering placed it in the MMA's group instead (heavy-op pull), the load's
+/// register result crosses the WG boundary and the consumer WG re-stages it
+/// through a fresh in-loop local_alloc (SMEM→reg→SMEM) — which the software
+/// pipeliner cannot predicate (Fatal pipeliner error). Keeping load + its
+/// operand alloc together makes the load WG own one SMEM buffer the MMA reads
+/// directly, matching the standard WS partition. Run AFTER infra-op
+/// propagation so warpGroups are final.
+static void coLocateOperandAllocsWithLoads(ttg::ScheduleLoop &loop) {
+  llvm::DenseMap<Operation *, int> opToWg;
+  for (const auto &node : loop.nodes)
+    if (node.op)
+      opToWg[node.op] = node.warpGroup;
+  for (auto &node : loop.nodes) {
+    auto alloc = dyn_cast_or_null<ttg::LocalAllocOp>(node.op);
+    if (!alloc || !alloc.getSrc())
+      continue;
+    Operation *def = alloc.getSrc().getDefiningOp();
+    if (def &&
+        isa<tt::LoadOp, tt::DescriptorLoadOp, tt::DescriptorGatherOp>(def)) {
+      auto it = opToWg.find(def);
+      if (it != opToWg.end() && it->second >= 0)
+        node.warpGroup = it->second;
+    }
+  }
 }
 
 // ============================================================================
@@ -3548,6 +3681,7 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
       }
       demoteScalarArithToInfra(schedLoop);
       propagateWarpGroupToInfraOps(schedLoop);
+      coLocateOperandAllocsWithLoads(schedLoop);
     }
   }
 
@@ -3599,6 +3733,7 @@ static void finalizeLoopPartitionForDump(ttg::ScheduleLoop &schedLoop,
         node.id < nodeWarpGroups.size() ? nodeWarpGroups[node.id] : -1;
   demoteScalarArithToInfra(schedLoop);
   propagateWarpGroupToInfraOps(schedLoop);
+  coLocateOperandAllocsWithLoads(schedLoop);
   insertCrossGroupBarriers(schedLoop);
   for (auto &buf : schedLoop.buffers)
     buf.mergeGroupId = UINT_MAX;
