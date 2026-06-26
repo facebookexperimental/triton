@@ -5,8 +5,8 @@ on:
       - main
   pull_request:
   schedule:
-    # Nightly run at 08:00 UTC.
-    - cron: '0 8 * * *'
+    # Every 6 hours at the top of the hour (00:00, 06:00, 12:00, 18:00 UTC).
+    - cron: '0 */6 * * *'
 
 env:
   MAX_JOBS: 16
@@ -57,7 +57,7 @@ jobs:
           # stable logical bucket identity for this job.
           BUCKET="amd-tritonbench"
           TITLE="[nightly] ${GITHUB_WORKFLOW} / mi350-meta-triton-test / ${BUCKET}"
-          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"mi350-meta-triton-test","summary":"TritonBench tests failed on MI350 (see run log)."}]'
+          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"mi350-meta-triton-test","summary":"TritonBench tests failed on MI350 (see run log).","repro":""}]'
           echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
 
   mi350-tlx-test:
@@ -144,6 +144,7 @@ jobs:
       event_name: ${{ github.event_name }}
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
 
   report-mi350-tlx:
     needs: mi350-tlx-test
@@ -168,6 +169,7 @@ jobs:
       event_name: ${{ github.event_name }}
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
 
   # ----- Nightly issue reconciliation: close recovered issues (schedule only) -----
   reconcile-mi350-tritonbench:
