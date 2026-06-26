@@ -983,6 +983,12 @@ class CUDABackend(BaseBackend):
         return ret
 
     def make_cubin(self, src, metadata, opt, capability):
+        # compile_iq: keep Triton's compile cache canonical -- make_cubin always assembles the plain
+        # (no-ACF) cubin. A tuned ACF is applied in-memory at load time via apply_compile_iq_acf
+        # (see core compiler.py _maybe_apply_compile_iq), never baked into the cached cubin.
+        return self._ptxas_compile(src, opt, capability)
+
+    def _ptxas_compile(self, src, opt, capability, apply_controls=None):
         ptxas = get_ptxas(self.target.arch).path
         with (
                 tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".ptx") as fsrc,
@@ -1083,6 +1089,54 @@ please share the reproducer above with Triton project.
             if os.path.exists(fbin):
                 os.remove(fbin)
         return cubin
+
+    def apply_compile_iq_acf(self, ck):
+        """compile_iq consumption (gated by TRITON_COMPILE_IQ_APPLY).
+
+        If the PTX hits the ACF store, obtain the assembled ACF cubin -- loaded from the ACF store if
+        already cached there, else ptxas --apply-controls'd once and persisted back to the store
+        (skips re-ptxas on later processes) -- and stash it as a pending candidate. The first launch
+        runs a plain-vs-ACF A/B and keeps the winner. Cubins live in the compile_iq ACF store + in
+        memory only; Triton's compile cache stays plain. ACF makes no difference to the launch ABI."""
+        if not os.environ.get("TRITON_COMPILE_IQ_APPLY"):
+            return
+        try:
+            ptx = ck.asm.get("ptx")
+            if not ptx:
+                return
+            from triton.compile_iq import store
+            from triton.compile_iq.consume import acf_args_for
+            arch = sm_arch_from_capability(self.target.arch)
+            ver = get_ptxas(self.target.arch).version
+            sha = store.ptx_sha256(ptx)
+            # Reuse the assembled ACF cubin from the (separate) ACF store if present -- skips re-running
+            # ptxas --apply-controls on every process. Version-tagged: the cached cubin is only valid for
+            # the ptxas that produced it. Only the assembly is reused cross-process; the launch-time
+            # plain-vs-ACF A/B still re-runs per process (the win decision stays in-memory). This never
+            # touches Triton's compile cache (which stays plain) -- only the compile_iq ACF store.
+            cubin = store.read_acf_cubin(sha, arch, ver)
+            if cubin is None:
+                controls = acf_args_for(ptx, arch, ver)  # ACF-store hit + ptxas version gate
+                if not controls:
+                    return
+                # opt fields used by _ptxas_compile (enable_fp_fusion, ptx_options) live on ck.metadata
+                # (it is built from {**options.__dict__}); capability matches make_cubin (self.target.arch).
+                cubin = self._ptxas_compile(ptx, ck.metadata, self.target.arch, apply_controls=controls)
+                store.write_acf_cubin(sha, arch, ver, cubin)  # persist assembly -> skip ptxas next time
+                store.dlog("consume", f"assembled+cached ACF cubin {sha[:16]} {arch} ptxas={ver}")
+            else:
+                store.dlog("consume", f"loaded ACF cubin from store {sha[:16]} {arch} ptxas={ver}")
+            ck._compile_iq_acf_cubin = cubin  # pending candidate; the launch-time A/B decides
+        except Exception as e:
+            # Fail-open: APPLY never breaks compilation. Warn ONCE under DEBUG so the common
+            # "APPLY set but the optional compile_iq package is stripped/missing" case (e.g. an OSS
+            # build) is observable instead of silently running plain.
+            if os.environ.get("TRITON_COMPILE_IQ_DEBUG") and not getattr(type(self), "_compile_iq_apply_warned", False):
+                type(self)._compile_iq_apply_warned = True
+                kind = "compile_iq module not found" if isinstance(e, ImportError) else f"{type(e).__name__}: {e}"
+                print(
+                    f"[compile_iq] TRITON_COMPILE_IQ_APPLY set but consume unavailable ({kind}) "
+                    "-- running plain SASS", flush=True)
 
     def add_stages(self, stages, options, language):
         capability = self._parse_arch(options.arch)
