@@ -17,6 +17,16 @@ from triton.backends.driver import (
 
 dirname = os.path.dirname(os.path.realpath(__file__))
 include_dirs = [os.path.join(dirname, "include")]
+# Path to the shared data-driven launcher core. It lives in the nvidia backend
+# dir (next to driver.c / driver.py) and is the canonical source for C/C++
+# consumers (cc_library triton_launch_h). driver.c is compiled via a fixed
+# Remote-Execution command that ignores include_dirs, so we inline this header
+# into the driver.c source at build time (see CudaUtils.__init__) rather than
+# relying on an -I path. In both source and packaged/buck builds the header
+# sits next to this file.
+_launch_h_candidates = [
+    os.path.join(dirname, "launch.h"),
+]
 libdevice_dir = os.path.join(dirname, "lib")
 libraries = ["libcuda.so.1"]
 PyCUtensorMap = None
@@ -68,8 +78,24 @@ class CudaUtils(object):
         return cls.instance
 
     def __init__(self):
+        # Inline the shared launcher core (launch.h) directly into the driver
+        # source: the fbcode Remote-Execution compile uses a fixed clang command
+        # that does not honor include_dirs, so an `#include "triton/runtime/
+        # launch.h"` would not resolve. Substituting the header text keeps a
+        # single source of truth (launch.h) while making the compile
+        # self-contained.
+        driver_src = Path(os.path.join(dirname, "driver.c")).read_text()
+        launch_h_path = next((p for p in _launch_h_candidates if os.path.exists(p)), None)
+        if launch_h_path is None:
+            raise FileNotFoundError(f"launch.h not found in any of: {_launch_h_candidates}")
+        launch_h_src = Path(launch_h_path).read_text()
+        include_marker = '#include "nvidia/backend/launch.h"'
+        if include_marker not in driver_src:
+            raise RuntimeError(f"driver.c must contain the marker {include_marker!r} for "
+                               "launch.h inlining, but it was not found")
+        driver_src = driver_src.replace(include_marker, launch_h_src)
         mod = compile_module_from_src(
-            src=Path(os.path.join(dirname, "driver.c")).read_text(),
+            src=driver_src,
             name="cuda_utils",
             library_dirs=library_dirs(),
             include_dirs=include_dirs,
@@ -92,6 +118,9 @@ class CudaUtils(object):
         self.set_printf_fifo_size = mod.set_printf_fifo_size
         self.fill_tma_descriptor_tiled = mod.fill_tma_descriptor_tiled
         self.fill_tma_descriptor_im2col = mod.fill_tma_descriptor_im2col
+        # Test-only hook to exercise the shared-core recipe TMA encoder.
+        self._test_construct_tma_desc = getattr(mod, "_test_construct_tma_desc", None)
+        self._tma_desc_bytes = getattr(mod, "_tma_desc_bytes", None)
         self.launch = mod.launch
         self.build_signature_metadata = mod.build_signature_metadata
         self.fill_1d_tma_descriptor = mod.fill_1d_tma_descriptor

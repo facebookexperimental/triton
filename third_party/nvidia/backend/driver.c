@@ -9,6 +9,10 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+/* Shared, Python-free data-driven launch core (params[]/TMA/attrs/launch).
+ * The same core is used by TritonCC / AOT-T via make_launcher_src. */
+#include "nvidia/backend/launch.h"
+
 typedef struct {
   PyObject_HEAD;
   _Alignas(alignof(CUtensorMap)) CUtensorMap tensorMap;
@@ -1611,6 +1615,13 @@ bool launchHook(PyObject *hook, PyObject *metadata) {
   return true;
 }
 
+/* TRITON_ASSERT_NEW_LAUNCHER: when set, triton_launch_kernel failures are hard
+ * errors (no legacy fallback). Useful for CI / testing the new launcher. */
+static int g_triton_assert_new_launcher = 0;
+__attribute__((constructor)) static void triton_init_assert_knob(void) {
+  g_triton_assert_new_launcher = getenv("TRITON_ASSERT_NEW_LAUNCHER") ? 1 : 0;
+}
+
 static PyObject *launchKernel(PyObject *self, PyObject *args) {
   // ensure cuda context is valid before calling any CUDA APIs, e.g. before
   // calls to cuPointerGetAttributes
@@ -1660,61 +1671,216 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     goto cleanup;
   }
 
-  // Number of parameters passed to kernel. + 2 for global & profile scratch.
-  int num_params = num_args + 2;
-  void **params = (void **)alloca(num_params * sizeof(void *));
-  int params_idx = 0;
-  // This loop has to stay in the same function that owns params, since we are
-  // using alloca to allocate pointers to it on the stack of the function.
+  // ---- Route through the shared data-driven core triton_launch_kernel() ----
+  // The CPython arg extraction above is unchanged.  Instead of building a
+  // void *params[] and calling the legacy _launch(), we pack the extracted
+  // values into one flat args_buf and build a per-launch descriptor, then call
+  // the shared core in launch.h (the same core used by TritonCC / AOT-T).
+  //
+  // Safety net: if triton_launch_kernel fails, we automatically fall back to
+  // the proven legacy _launch() path and print a warning, so a bug in the
+  // new path never silently breaks production.
+  int num_params = (int)num_args + 2; // + global & profile scratch
+  if (num_params > TRITON_MAX_PARAMS) {
+    PyErr_Format(PyExc_RuntimeError,
+                 "Triton kernel has %d params, exceeds TRITON_MAX_PARAMS (%d)",
+                 num_params, TRITON_MAX_PARAMS);
+    goto cleanup;
+  }
+
+  triton_kernel_launch_desc_t desc;
+  desc.abi_version = TRITON_LAUNCH_DESC_ABI_VERSION;
+  desc.num_warps = num_warps;
+  desc.num_ctas = num_ctas;
+  desc.shared_mem = (unsigned)shared_memory;
+  desc.launch_pdl = launch_pdl;
+  desc.launch_cooperative_grid = launch_cooperative_grid;
+  desc.launch_cluster = (preferredClusterDimX > 0) ? 1 : 0;
+  // JIT variadic launcher uses the 1-D num_ctas cluster + preferred-cluster
+  // hint only; it never emits an explicit multi-dim CLUSTER_DIMENSION.
+  desc.cluster_dims[0] = 0;
+  desc.cluster_dims[1] = 0;
+  desc.cluster_dims[2] = 0;
+  desc.preferred_cluster_dims[0] = preferredClusterDimX;
+  desc.preferred_cluster_dims[1] = preferredClusterDimY;
+  desc.preferred_cluster_dims[2] = preferredClusterDimZ;
+  desc.num_params = num_params;
+  // JIT TMA descriptors are pre-built in Python and passed by value through
+  // args_buf as ordinary params (is_tma = 0); the launcher-built recipe path
+  // (num_tma_recipes > 0) is reserved for auto-TMA.
+  desc.num_tma_recipes = 0;
+
+  // First pass: compute the args_buf layout (offset + size per param) using the
+  // same per-type extractor size/alignment the legacy path used, so the kernel
+  // sees identically laid-out parameter values.
+  Extractor *extractors = (Extractor *)alloca(num_args * sizeof(Extractor));
+  size_t buf_size = 0;
+  size_t max_align = sizeof(void *); // scratch pointers need 8B alignment
   for (Py_ssize_t i = 0; i < num_args; ++i) {
-    // Get extractor that will send back a struct with
-    // * size for allocation
-    // * function to call to put the parameter in params buffer
-    Extractor extractor = getExtractor(extractor_data[i]);
-    if (extractor.extract == NULL) {
+    Extractor e = getExtractor(extractor_data[i]);
+    if (e.extract == NULL) {
       goto cleanup;
     }
+    extractors[i] = e;
+    size_t al = e.alignment ? e.alignment : (e.size ? e.size : 1);
+    // Round up to next power of two (required for bitmask alignment below).
+    {
+      size_t v = al;
+      v--;
+      v |= v >> 1;
+      v |= v >> 2;
+      v |= v >> 4;
+      v |= v >> 8;
+      v |= v >> 16;
+      if (sizeof(size_t) > 4)
+        v |= v >> 32;
+      v++;
+      al = v;
+    }
+    if (al > max_align) {
+      max_align = al;
+    }
+    buf_size = (buf_size + al - 1) & ~(al - 1);
+    desc.params[i].offset = (int)buf_size;
+    desc.params[i].size = (int)e.size;
+    desc.params[i].is_tma = 0;
+    buf_size += e.size;
+  }
+  // Scratch params: two device pointers, 8-byte aligned.
+  buf_size = (buf_size + 7) & ~((size_t)7);
+  desc.params[num_args].offset = (int)buf_size;
+  desc.params[num_args].size = (int)sizeof(void *);
+  desc.params[num_args].is_tma = 0;
+  buf_size += sizeof(void *);
+  desc.params[num_args + 1].offset = (int)buf_size;
+  desc.params[num_args + 1].size = (int)sizeof(void *);
+  desc.params[num_args + 1].is_tma = 0;
+  buf_size += sizeof(void *);
 
-    size_t alignment = extractor.alignment;
-    if (alignment != 0) {
-      // Allocate enough space on the stack to guarantee an aligned block.
-      size_t size_with_alignment = extractor.size + alignment - 1;
-      void *storage_ptr = alloca(size_with_alignment);
-      void *aligned_ptr = (void *)((((uintptr_t)storage_ptr) + alignment - 1) &
-                                   ~(alignment - 1));
-      if (aligned_ptr == NULL) {
-        PyErr_SetString(PyExc_MemoryError, "Failed to align parameter storage");
+  // Allocate args_buf aligned to the largest element alignment so that every
+  // offset (computed relative to an aligned base) is absolutely aligned.
+  void *args_buf_raw = alloca(buf_size + max_align - 1);
+  void *args_buf =
+      (void *)(((uintptr_t)args_buf_raw + max_align - 1) & ~(max_align - 1));
+
+  // Second pass: extract each arg value into args_buf at its offset.
+  for (Py_ssize_t i = 0; i < num_args; ++i) {
+    if (!extractors[i].extract((char *)args_buf + desc.params[i].offset,
+                               args_data[i])) {
+      goto cleanup;
+    }
+  }
+  if (!extractPointer((char *)args_buf + desc.params[num_args].offset,
+                      global_scratch_obj)) {
+    goto cleanup;
+  }
+  if (!extractPointer((char *)args_buf + desc.params[num_args + 1].offset,
+                      profile_scratch_obj)) {
+    goto cleanup;
+  }
+
+  {
+    const uint32_t grid[3] = {(uint32_t)gridX, (uint32_t)gridY,
+                              (uint32_t)gridZ};
+    CUresult _launch_err = CUDA_SUCCESS;
+    Py_BEGIN_ALLOW_THREADS;
+    // Parity with legacy _launch: allow non-portable 16-CTA clusters.
+    // Runs without the GIL (matching legacy _launch behavior).
+    if (num_ctas == 16) {
+      cuFuncSetAttribute((CUfunction)_function,
+                         CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
+                         1);
+      /* Return value intentionally ignored: on hardware that doesn't support
+       * this attribute, the call fails harmlessly and the subsequent launch
+       * will fail with a more specific error if clusters are truly needed.
+       * Logging here would spam stderr on every 16-CTA launch. */
+    }
+    _launch_err = triton_launch_kernel(grid, (CUstream)_stream,
+                                       (CUfunction)_function, args_buf, &desc);
+    Py_END_ALLOW_THREADS;
+    if (_launch_err != CUDA_SUCCESS) {
+      /* TRITON_ASSERT_NEW_LAUNCHER: in test/debug mode, skip fallback and
+       * fail hard so we know the new launcher has a bug (not masked). */
+      if (g_triton_assert_new_launcher) {
+        const char *_err_str = NULL;
+        cuGetErrorString(_launch_err, &_err_str);
+        PyErr_Format(PyExc_RuntimeError,
+                     "Triton Error [CUDA]: triton_launch_kernel failed: %s "
+                     "(TRITON_ASSERT_NEW_LAUNCHER=1, no fallback)",
+                     _err_str ? _err_str : "unknown");
         goto cleanup;
       }
-      params[params_idx] = aligned_ptr;
-    } else {
-      params[params_idx] = alloca(extractor.size);
-    }
-
-    PyObject *current_arg = args_data[i];
-    if (!extractor.extract(params[params_idx++], current_arg)) {
+      /* Shared-core launch failed — fall back to the proven legacy _launch()
+       * path so the kernel still runs.  Print a warning so the failure is
+       * visible and can be investigated without blocking the user. */
+      const char *_err_str = NULL;
+      cuGetErrorString(_launch_err, &_err_str);
+      static int _fb_warned = 0;
+      if (!__atomic_exchange_n(&_fb_warned, 1, __ATOMIC_RELAXED)) {
+        fprintf(stderr,
+                "[triton] WARNING: triton_launch_kernel failed (%s, err=%d), "
+                "falling back to legacy _launch path\n",
+                _err_str ? _err_str : "unknown", (int)_launch_err);
+      }
+      /* Rebuild params[] from the still-valid Python args and launch via the
+       * legacy path (same code that ran before this change). */
+      int _fb_num = (int)num_args + 2;
+      void **_fb_params = (void **)alloca(_fb_num * sizeof(void *));
+      int _fb_idx = 0;
+      int _fb_ok = 1;
+      for (Py_ssize_t i = 0; i < num_args && _fb_ok; ++i) {
+        Extractor _fb_e = extractors[i];
+        if (_fb_e.extract == NULL) {
+          _fb_ok = 0;
+          break;
+        }
+        size_t _fb_al = _fb_e.alignment;
+        if (_fb_al == 0)
+          _fb_al = _fb_e.size ? _fb_e.size : 1;
+        if (_fb_al != 0 && (_fb_al & (_fb_al - 1)) == 0) {
+          void *_fb_raw = alloca(_fb_e.size + _fb_al - 1);
+          _fb_params[_fb_idx] =
+              (void *)((((uintptr_t)_fb_raw) + _fb_al - 1) & ~(_fb_al - 1));
+        } else {
+          _fb_params[_fb_idx] = alloca(_fb_e.size);
+        }
+        if (!_fb_e.extract(_fb_params[_fb_idx++], args_data[i]))
+          _fb_ok = 0;
+      }
+      if (_fb_ok) {
+        _fb_params[_fb_idx] = alloca(sizeof(void *));
+        if (extractPointer(_fb_params[_fb_idx++], global_scratch_obj)) {
+          _fb_params[_fb_idx] = alloca(sizeof(void *));
+          if (extractPointer(_fb_params[_fb_idx++], profile_scratch_obj)) {
+            Py_BEGIN_ALLOW_THREADS;
+            _launch(gridX, gridY, gridZ, num_warps, num_ctas,
+                    launch_cooperative_grid, launch_pdl, preferredClusterDimX,
+                    preferredClusterDimY, preferredClusterDimZ, shared_memory,
+                    (CUstream)_stream, (CUfunction)_function, _fb_params);
+            Py_END_ALLOW_THREADS;
+            if (!PyErr_Occurred())
+              goto launch_ok; /* fallback succeeded */
+          }
+        }
+      }
+      /* Both paths failed. If the fallback set a more specific Python
+       * exception (e.g. extractor TypeError), keep it; otherwise report
+       * the original shared-core CUDA error. */
+      if (!PyErr_Occurred()) {
+        PyErr_Format(PyExc_RuntimeError,
+                     "Triton Error [CUDA]: triton_launch_kernel failed: %s "
+                     "(legacy fallback also failed)",
+                     _err_str ? _err_str : "unknown");
+      }
       goto cleanup;
     }
   }
-  // Add scratch objects.
-  params[params_idx] = alloca(sizeof(void *));
-  if (!extractPointer(params[params_idx++], global_scratch_obj)) {
-    goto cleanup;
-  }
-  params[params_idx] = alloca(sizeof(void *));
-  if (!extractPointer(params[params_idx++], profile_scratch_obj)) {
-    goto cleanup;
-  }
+launch_ok:
 
-  Py_BEGIN_ALLOW_THREADS;
-  _launch(gridX, gridY, gridZ, num_warps, num_ctas, launch_cooperative_grid,
-          launch_pdl, preferredClusterDimX, preferredClusterDimY,
-          preferredClusterDimZ, shared_memory, (CUstream)_stream,
-          (CUfunction)_function, params);
-  Py_END_ALLOW_THREADS;
-  if (PyErr_Occurred()) {
+  /* Symmetry with the legacy path: never run the exit hook with a pending
+   * Python exception. */
+  if (PyErr_Occurred())
     goto cleanup;
-  }
 
   if (!launchHook(launch_exit_hook, launch_metadata)) {
     goto cleanup;
@@ -1778,12 +1944,10 @@ typedef struct {
    */
   int shape_param_indices[TD_MAX_TENSORDESC_NDIM];
   int stride_param_indices[TD_MAX_TENSORDESC_NDIM];
-  /* Cache: skip cuTensorMapEncodeTiled if unchanged */
-  uint64_t cached_data_ptr;
-  int64_t cached_shape[TD_MAX_TENSORDESC_NDIM];
-  int64_t cached_strides[TD_MAX_TENSORDESC_NDIM];
-  int cached_fill; /* CUtensorMapFloatOOBfill value (padding mode) */
-  int cache_valid;
+  /* Shared per-slot TMA cache (launch.h): skips re-encoding when base ptr /
+   * shape / strides / fill mode are unchanged. Zero-initialized at build time.
+   */
+  triton_tma_cache_entry_t cache;
 } TMASlotMeta;
 
 typedef union {
@@ -1829,6 +1993,12 @@ typedef struct {
                                                index */
   TMASlotMeta tma_meta[TD_MAX_TMA_DESCS];
   CUtensorMap tma_descs[TD_MAX_TMA_DESCS] __attribute__((aligned(128)));
+  /* Converged launch: when set, this kernel launches through the shared core
+   * triton_launch_kernel() instead of the dispatcher's own cuLaunchKernelEx.
+   * Enabled for the common non-TMA, non multi-dim-cluster case (see
+   * TritonDispatcher_new); core_desc is built once and reused every launch. */
+  int use_core_launch;
+  triton_kernel_launch_desc_t core_desc;
 } TritonDispatcher;
 
 /* Forward declarations */
@@ -1954,92 +2124,44 @@ static int td_extract_tensordesc(TritonDispatcher *self, int i, PyObject *a) {
     PyErr_Clear();
   }
 
-  /* Check cache (data_ptr + shape + strides + padding) */
-  int cache_hit = meta->cache_valid && (meta->cached_data_ptr == data_ptr) &&
-                  (meta->cached_fill == (int)fill);
-  if (cache_hit) {
-    for (int j = 0; j < ndim; j++) {
-      if (meta->cached_shape[j] != cur_shape[j] ||
-          meta->cached_strides[j] != cur_strides[j]) {
-        cache_hit = 0;
-        break;
-      }
-    }
+  /* Encode (or reuse cached) the CUtensorMap via the shared launch.h encoder.
+   * Pack base ptr + shape + strides into a flat args_buf in the layout the
+   * recipe offsets below describe (same layout as testConstructTmaDesc): the
+   * shared encoder does the row→col reversal, L2_128B promotion, fp4 expansion,
+   * and the small-tensor driver workaround, byte-identically to the proven JIT
+   * path that this used to duplicate. */
+  triton_tma_recipe_t recipe;
+  memset(&recipe, 0, sizeof(recipe));
+  recipe.ndim = ndim;
+  recipe.swizzle = meta->swizzle;
+  recipe.elem_type = meta->elem_type;
+  recipe.elem_size = meta->elem_size;
+  recipe.fp4_padded = meta->fp4_padded;
+  recipe.fill_mode =
+      (fill == CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA) ? 1 : 0;
+  recipe.ptr_offset = 0;
+  for (int j = 0; j < ndim; j++) {
+    recipe.block_shape[j] = meta->block_size[j];
+    recipe.shape_offsets[j] = (int)(8 + j * 8);
+    recipe.stride_offsets[j] = (int)(8 + ndim * 8 + j * 8);
   }
 
-  if (!cache_hit) {
-    /* Rebuild TMA descriptor in-place */
-    int elem_size = meta->elem_size;
-    int rank = ndim;
-    uint32_t blockSizeInt[TD_MAX_TENSORDESC_NDIM];
-    uint64_t shapeInt[TD_MAX_TENSORDESC_NDIM];
-    uint64_t stridesLL[TD_MAX_TENSORDESC_NDIM];
+  unsigned char tma_args_buf[8 + 2 * TD_MAX_TENSORDESC_NDIM * 8];
+  memcpy(tma_args_buf, &data_ptr, 8);
+  for (int j = 0; j < ndim; j++) {
+    memcpy(tma_args_buf + 8 + j * 8, &cur_shape[j], 8);
+    memcpy(tma_args_buf + 8 + ndim * 8 + j * 8, &cur_strides[j], 8);
+  }
 
-    int64_t *eshape = cur_shape;
-    int64_t expanded_shape_buf[TD_MAX_TENSORDESC_NDIM];
-    if (meta->fp4_padded) {
-      for (int j = 0; j < rank; j++)
-        expanded_shape_buf[j] = cur_shape[j];
-      expanded_shape_buf[rank - 1] *= 2;
-      eshape = expanded_shape_buf;
-    }
-
-    /* Reverse order for cuTensorMapEncodeTiled (row-major → col-major) */
-    for (int j = 0; j < rank; j++) {
-      blockSizeInt[rank - j - 1] = meta->block_size[j];
-      shapeInt[rank - j - 1] = (uint64_t)eshape[j];
-    }
-    for (int j = 0; j + 1 < rank; j++)
-      stridesLL[rank - j - 2] = (uint64_t)(elem_size * cur_strides[j]);
-    stridesLL[rank - 1] =
-        shapeInt[rank - 1] *
-        (rank == 1 ? (uint64_t)elem_size : stridesLL[rank - 2]);
-
-    uint32_t elementStrides[TD_MAX_TENSORDESC_NDIM] = {1, 1, 1, 1, 1};
-    static cuTensorMapEncodeTiled_t cuTensorMapEncodeTiled_fn = NULL;
-    if (!cuTensorMapEncodeTiled_fn)
-      cuTensorMapEncodeTiled_fn = getCuTensorMapEncodeTiledHandle();
-    if (!cuTensorMapEncodeTiled_fn)
-      return -1;
-
-    CUresult res = cuTensorMapEncodeTiled_fn(
-        &self->tma_descs[slot], meta->elem_type, rank,
-        (void *)(uintptr_t)data_ptr, shapeInt, stridesLL, blockSizeInt,
-        elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE, meta->swizzle,
-        CU_TENSOR_MAP_L2_PROMOTION_L2_128B, fill);
-    if (res != CUDA_SUCCESS) {
-      const char *str;
-      cuGetErrorString(res, &str);
-      PyErr_Format(PyExc_RuntimeError,
-                   "cuTensorMapEncodeTiled failed in TMA expansion: %s",
-                   str ? str : "?");
-      return -1;
-    }
-
-    /* CUTLASS driver workaround */
-    static int driver_version = -1;
-    if (driver_version < 0)
-      cuDriverGetVersion(&driver_version);
-    if (driver_version <= 13010) {
-      int max_byte_index = 0;
-      for (int j = 0; j < rank; j++) {
-        int bytes_stride = j == 0 ? elem_size : (int)stridesLL[j - 1];
-        max_byte_index += ((int)shapeInt[j] - 1) * bytes_stride;
-      }
-      if (max_byte_index + 1 < 128 * 1024) {
-        uint64_t *desc_u64 = (uint64_t *)&self->tma_descs[slot];
-        desc_u64[1] &= ~(1llu << 21);
-      }
-    }
-
-    /* Update cache */
-    meta->cached_data_ptr = data_ptr;
-    meta->cached_fill = (int)fill;
-    for (int j = 0; j < ndim; j++) {
-      meta->cached_shape[j] = cur_shape[j];
-      meta->cached_strides[j] = cur_strides[j];
-    }
-    meta->cache_valid = 1;
+  CUresult res = triton_construct_tma_desc_cached(
+      &self->tma_descs[slot], &recipe, tma_args_buf, &meta->cache);
+  if (res != CUDA_SUCCESS) {
+    const char *str;
+    cuGetErrorString(res, &str);
+    PyErr_Format(PyExc_RuntimeError,
+                 "cuTensorMapEncodeTiled failed in TMA expansion: %s",
+                 str ? str : "?");
+    return -1;
   }
 
   /* Fill shadow shape/stride kernel_params slots */
@@ -2141,6 +2263,12 @@ static inline CUresult td_relaunch(TritonDispatcher *d, unsigned gx,
                                    unsigned gy, unsigned gz, CUstream stream) {
   if (gx * gy * gz == 0)
     return CUDA_SUCCESS;
+  if (d->use_core_launch) {
+    /* Converged path: launch through the shared core in launch.h. */
+    const uint32_t grid[3] = {gx, gy, gz};
+    return triton_launch_kernel(grid, stream, d->function,
+                                (void *)d->arg_storage, &d->core_desc);
+  }
   CUlaunchConfig cfg;
   cfg.gridDimX = gx * d->grid_mult;
   cfg.gridDimY = gy;
@@ -2331,7 +2459,7 @@ static PyObject *TritonDispatcher_new(PyTypeObject *type, PyObject *args,
           Py_DECREF(item);
         }
       }
-      m->cache_valid = 0;
+      memset(&m->cache, 0, sizeof(m->cache));
     }
     if (PyErr_Occurred()) {
       Py_DECREF(self);
@@ -2376,6 +2504,45 @@ static PyObject *TritonDispatcher_new(PyTypeObject *type, PyObject *args,
     na++;
   }
   self->num_launch_attrs = na;
+
+  /* Build a shared-core launch descriptor so this dispatcher can launch via
+   * triton_launch_kernel() -- one launch implementation shared with the JIT
+   * variadic launcher and TritonCC / AOT-T.  arg_storage is already a flat,
+   * fixed-stride (sizeof(TDArgSlot)) buffer with one slot per param, so the
+   * descriptor just maps param i -> slot offset i*sizeof(TDArgSlot).
+   *
+   * Restricted to the case the core models exactly today: no TMA (the core's
+   * recipe-based TMA construction is converged separately).  The shared core
+   * now handles both the 1-D num_ctas cluster and the explicit
+   * multi-dimensional cluster (cluster_dims), so only TMA kernels keep the
+   * dispatcher's own td_relaunch path. */
+  self->use_core_launch =
+      (self->num_tma_descs == 0 && self->total_params <= TRITON_MAX_PARAMS);
+  if (self->use_core_launch) {
+    memset(&self->core_desc, 0, sizeof(self->core_desc));
+    self->core_desc.abi_version = TRITON_LAUNCH_DESC_ABI_VERSION;
+    self->core_desc.num_warps = num_warps;
+    self->core_desc.num_ctas = num_ctas;
+    self->core_desc.shared_mem = (unsigned)shared_mem;
+    self->core_desc.launch_pdl = launch_pdl;
+    self->core_desc.launch_cooperative_grid = launch_coop;
+    self->core_desc.launch_cluster = launch_cluster;
+    /* Explicit multi-dim cluster (ctas_per_cga). When all <= 1, the core uses
+     * the 1-D num_ctas path; num_ctas takes priority, so 1-D and multi-dim are
+     * never both applied. */
+    self->core_desc.cluster_dims[0] = cluster_dim_x;
+    self->core_desc.cluster_dims[1] = cluster_dim_y;
+    self->core_desc.cluster_dims[2] = cluster_dim_z;
+    self->core_desc.num_params = self->total_params;
+    self->core_desc.num_tma_recipes = 0;
+    for (int i = 0; i < self->total_params; i++) {
+      /* size is unused by the core for non-TMA params (it indexes args_buf by
+       * offset); record the storage slot size for clarity. */
+      self->core_desc.params[i].offset = (int)(i * (int)sizeof(TDArgSlot));
+      self->core_desc.params[i].size = (int)sizeof(TDArgSlot);
+      self->core_desc.params[i].is_tma = 0;
+    }
+  }
 
   return (PyObject *)self;
 }
@@ -2924,6 +3091,104 @@ static PyObject *py_create_fast_jit_type(PyObject *module,
 
 /* ========================================================================= */
 
+/* Test-only: drive the shared-core recipe TMA encoder (launch.h
+ * triton_construct_tma_desc) so unit tests can byte-compare it against the
+ * proven fillTMADescriptorTiled. Builds a recipe + flat args_buf
+ * (base_ptr, shape[ndim] i64, stride[ndim] i64) and returns the 128-byte
+ * CUtensorMap. fp4_padded=0 / fill_mode=0 for parity with
+ * fillTMADescriptorTiled. */
+static PyObject *testConstructTmaDesc(PyObject *self, PyObject *args) {
+  (void)self;
+  unsigned long long base_ptr;
+  int ndim, elem_type, elem_size, swizzle, fp4_padded, fill_mode;
+  PyObject *block_list, *shape_list, *stride_list;
+  if (!PyArg_ParseTuple(args, "KiiiiOOOii", &base_ptr, &ndim, &elem_type,
+                        &elem_size, &swizzle, &block_list, &shape_list,
+                        &stride_list, &fp4_padded, &fill_mode))
+    return NULL;
+  if (ndim < 1 || ndim > TRITON_MAX_TMA_DIMS) {
+    PyErr_SetString(PyExc_ValueError, "bad ndim");
+    return NULL;
+  }
+
+  triton_tma_recipe_t recipe;
+  memset(&recipe, 0, sizeof(recipe));
+  recipe.ndim = ndim;
+  recipe.swizzle = swizzle;
+  recipe.elem_type = elem_type;
+  recipe.elem_size = elem_size;
+  recipe.fp4_padded = fp4_padded;
+  recipe.fill_mode = fill_mode;
+  recipe.ptr_offset = 0;
+  recipe.desc_param_idx = 0;
+  for (int d = 0; d < ndim; d++) {
+    PyObject *b = PySequence_GetItem(block_list, d);
+    if (!b)
+      return NULL;
+    recipe.block_shape[d] = (uint32_t)PyLong_AsUnsignedLong(b);
+    Py_DECREF(b);
+    recipe.shape_offsets[d] = (int)(8 + d * 8);
+    recipe.stride_offsets[d] = (int)(8 + ndim * 8 + d * 8);
+  }
+  if (PyErr_Occurred())
+    return NULL;
+
+  size_t buf_size = 8 + (size_t)ndim * 16;
+  char *buf = (char *)calloc(1, buf_size);
+  if (!buf)
+    return PyErr_NoMemory();
+  memcpy(buf, &base_ptr, 8);
+  for (int d = 0; d < ndim; d++) {
+    PyObject *s = PySequence_GetItem(shape_list, d);
+    PyObject *st = PySequence_GetItem(stride_list, d);
+    if (!s || !st) {
+      Py_XDECREF(s);
+      Py_XDECREF(st);
+      free(buf);
+      return NULL;
+    }
+    int64_t sv = (int64_t)PyLong_AsLongLong(s);
+    int64_t stv = (int64_t)PyLong_AsLongLong(st);
+    Py_DECREF(s);
+    Py_DECREF(st);
+    memcpy(buf + 8 + d * 8, &sv, 8);
+    memcpy(buf + 8 + ndim * 8 + d * 8, &stv, 8);
+  }
+  if (PyErr_Occurred()) {
+    free(buf);
+    return NULL;
+  }
+
+  CUtensorMap out;
+  memset(&out, 0, sizeof(out));
+  CUresult r = triton_construct_tma_desc(&out, &recipe, buf);
+  free(buf);
+  if (r != CUDA_SUCCESS) {
+    const char *s = NULL;
+    cuGetErrorString(r, &s);
+    PyErr_Format(PyExc_RuntimeError, "triton_construct_tma_desc failed: %s",
+                 s ? s : "unknown");
+    return NULL;
+  }
+  return PyBytes_FromStringAndSize((const char *)&out, sizeof(CUtensorMap));
+}
+
+/* Test-only: return the 128 raw bytes of a PyCUtensorMap's tensorMap field
+ * using the real C struct offset (alignof(CUtensorMap) may be 64 or 128). */
+static PyObject *tmaDescBytes(PyObject *self, PyObject *args) {
+  (void)self;
+  PyObject *obj;
+  if (!PyArg_ParseTuple(args, "O", &obj))
+    return NULL;
+  if (Py_TYPE(obj) != &PyCUtensorMapType) {
+    PyErr_SetString(PyExc_TypeError, "expected a PyCUtensorMap");
+    return NULL;
+  }
+  return PyBytes_FromStringAndSize(
+      (const char *)&((PyCUtensorMapObject *)obj)->tensorMap,
+      sizeof(CUtensorMap));
+}
+
 static PyMethodDef ModuleMethods[] = {
     {"load_binary", loadBinary, METH_VARARGS,
      "Load provided cubin into CUDA driver"},
@@ -2958,6 +3223,10 @@ static PyMethodDef ModuleMethods[] = {
      "Create a heap type inheriting from JITFunction with C mp_subscript"},
     {"register_tensor_bridge", register_tensor_bridge, METH_O,
      "Register PyCapsule from _torch_bridge for fast TensorDescriptor access"},
+    {"_test_construct_tma_desc", testConstructTmaDesc, METH_VARARGS,
+     "test-only: run the shared-core recipe TMA encoder; returns 128 bytes"},
+    {"_tma_desc_bytes", tmaDescBytes, METH_VARARGS,
+     "test-only: return the 128 raw bytes of a PyCUtensorMap"},
 
     {NULL, NULL, 0, NULL} // sentinel
 };

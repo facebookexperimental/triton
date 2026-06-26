@@ -1,6 +1,6 @@
 """Tests for C-to-Python fallback warnings.
 
-Validates that when TRITON_USE_TRITON_DISPATCHER=1 or TRITON_ENABLE_C_CACHE=1
+Validates that when TRITON_USE_C_DISPATCHER=1 or TRITON_ENABLE_C_CACHE=1
 is set but the C path cannot be used, a visible warning is emitted so users
 are aware of the fallback.
 """
@@ -33,11 +33,11 @@ def _compile_kernel(fn, signature, constexprs=None, attrs=None):
 
 
 class TestDispatcherFallbackWarning:
-    """Tests for TRITON_USE_TRITON_DISPATCHER fallback warnings."""
+    """Tests for TRITON_USE_C_DISPATCHER fallback warnings."""
 
     def test_dispatcher_fallback_warning_in_compiled_kernel_getitem(self, monkeypatch):
         """CompiledKernel.__getitem__ should warn when dispatcher flag is on but _dispatcher is None."""
-        monkeypatch.setenv("TRITON_USE_TRITON_DISPATCHER", "1")
+        monkeypatch.setenv("TRITON_USE_C_DISPATCHER", "1")
         compiled = _compile_kernel(
             add_kernel,
             signature={"X": "*fp32", "Y": "*fp32", "OUT": "*fp32", "N": "i32"},
@@ -52,16 +52,16 @@ class TestDispatcherFallbackWarning:
             compiled[(1, 1, 1)]  # noqa: F841
             # Should have emitted a fallback warning
             dispatcher_warnings = [
-                x for x in w if "TRITON_USE_TRITON_DISPATCHER=1" in str(x.message)
-                and "falling back to Python runner" in str(x.message)
+                x for x in w
+                if "TRITON_USE_C_DISPATCHER=1" in str(x.message) and "falling back to Python runner" in str(x.message)
             ]
             assert len(dispatcher_warnings) == 1, (
                 f"Expected 1 dispatcher fallback warning, got {len(dispatcher_warnings)}. "
                 f"All warnings: {[str(x.message) for x in w]}")
 
     def test_no_warning_when_dispatcher_flag_off(self, monkeypatch):
-        """No warning when TRITON_USE_TRITON_DISPATCHER is not set."""
-        monkeypatch.setenv("TRITON_USE_TRITON_DISPATCHER", "0")
+        """No warning when TRITON_USE_C_DISPATCHER is not set."""
+        monkeypatch.setenv("TRITON_USE_C_DISPATCHER", "0")
         compiled = _compile_kernel(
             add_kernel,
             signature={"X": "*fp32", "Y": "*fp32", "OUT": "*fp32", "N": "i32"},
@@ -72,12 +72,12 @@ class TestDispatcherFallbackWarning:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             compiled[(1, 1, 1)]  # noqa: F841
-            dispatcher_warnings = [x for x in w if "TRITON_USE_TRITON_DISPATCHER" in str(x.message)]
+            dispatcher_warnings = [x for x in w if "TRITON_USE_C_DISPATCHER" in str(x.message)]
             assert len(dispatcher_warnings) == 0
 
     def test_dispatcher_fallback_warning_in_jit_run(self, monkeypatch):
         """JITFunction.run() should warn when dispatcher flag is on but kernel has no dispatcher."""
-        monkeypatch.setenv("TRITON_USE_TRITON_DISPATCHER", "1")
+        monkeypatch.setenv("TRITON_USE_C_DISPATCHER", "1")
         monkeypatch.setenv("TRITON_ENABLE_C_CACHE", "0")
 
         @triton.jit
@@ -106,8 +106,8 @@ class TestDispatcherFallbackWarning:
             warnings.simplefilter("always")
             simple_kernel[(1, )](x, N, BLOCK=1024)
             dispatcher_warnings = [
-                x for x in w if "TRITON_USE_TRITON_DISPATCHER=1" in str(x.message)
-                and "falling back to Python launch" in str(x.message)
+                x for x in w
+                if "TRITON_USE_C_DISPATCHER=1" in str(x.message) and "falling back to Python launch" in str(x.message)
             ]
             assert len(dispatcher_warnings) == 1, (
                 f"Expected 1 dispatcher fallback warning, got {len(dispatcher_warnings)}. "
@@ -120,7 +120,7 @@ class TestCCacheFallbackWarning:
     def test_c_cache_bypass_warning_with_hooks(self, monkeypatch):
         """C fast path should warn when bypassed due to launch hooks."""
         monkeypatch.setenv("TRITON_ENABLE_C_CACHE", "1")
-        monkeypatch.setenv("TRITON_USE_TRITON_DISPATCHER", "0")
+        monkeypatch.setenv("TRITON_USE_C_DISPATCHER", "0")
 
         @triton.jit(c_cache=True)
         def hook_kernel(X, N, BLOCK: tl.constexpr):
@@ -155,7 +155,7 @@ class TestCCacheFallbackWarning:
     def test_no_c_cache_warning_when_fast_path_works(self, monkeypatch):
         """No warning should be emitted when C fast path is used successfully."""
         monkeypatch.setenv("TRITON_ENABLE_C_CACHE", "1")
-        monkeypatch.setenv("TRITON_USE_TRITON_DISPATCHER", "1")
+        monkeypatch.setenv("TRITON_USE_C_DISPATCHER", "1")
 
         @triton.jit(c_cache=True)
         def fast_kernel(X, N, BLOCK: tl.constexpr):
@@ -184,7 +184,7 @@ class TestCCacheFallbackWarning:
     def test_c_cache_hit_no_dispatcher_warning(self, monkeypatch):
         """When dispatcher flag is on but kernel has no dispatcher, run() should warn."""
         monkeypatch.setenv("TRITON_ENABLE_C_CACHE", "1")
-        monkeypatch.setenv("TRITON_USE_TRITON_DISPATCHER", "1")
+        monkeypatch.setenv("TRITON_USE_C_DISPATCHER", "1")
 
         @triton.jit(c_cache=True)
         def nodispatch_kernel(X, N, BLOCK: tl.constexpr):
@@ -213,8 +213,8 @@ class TestCCacheFallbackWarning:
             warnings.simplefilter("always")
             nodispatch_kernel[lambda meta: (1, )](x, N, BLOCK=1024)
             dispatcher_warnings = [
-                x for x in w if "TRITON_USE_TRITON_DISPATCHER=1" in str(x.message)
-                and "falling back to Python launch" in str(x.message)
+                x for x in w
+                if "TRITON_USE_C_DISPATCHER=1" in str(x.message) and "falling back to Python launch" in str(x.message)
             ]
             assert len(dispatcher_warnings) == 1, (
                 f"Expected 1 dispatcher fallback warning, got {len(dispatcher_warnings)}. "
@@ -227,7 +227,7 @@ class TestProxyFallbackWarning:
     def test_proxy_creation_failure_warning(self, monkeypatch):
         """Should warn when native_create_jit_proxy returns None."""
         monkeypatch.setenv("TRITON_ENABLE_C_CACHE", "1")
-        monkeypatch.setenv("TRITON_USE_TRITON_DISPATCHER", "1")
+        monkeypatch.setenv("TRITON_USE_C_DISPATCHER", "1")
 
         @triton.jit(c_cache=True)
         def proxy_kernel(X, N, BLOCK: tl.constexpr):

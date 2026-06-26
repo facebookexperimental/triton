@@ -247,14 +247,14 @@ def test_launcher_src_exists():
 
 
 def test_launcher_src_includes_launch_h():
-    """Generated C source should include triton/runtime/launch.h."""
+    """Generated C source should include nvidia/backend/launch.h."""
     compiled = _compile_kernel(
         add_kernel,
         signature={"X": "*fp32", "Y": "*fp32", "OUT": "*fp32", "N": "i32"},
         constexprs={"BLOCK": 1024},
     )
     src = compiled.asm["launcher_src"]
-    assert '#include "triton/runtime/launch.h"' in src
+    assert '#include "nvidia/backend/launch.h"' in src
 
 
 def test_launcher_src_no_python_h():
@@ -305,8 +305,27 @@ def test_launcher_src_bakes_constants():
     )
     src = compiled.asm["launcher_src"]
     md = compiled.metadata
-    assert f"/*num_warps=*/{md.num_warps}" in src
-    assert f"/*shared_mem=*/{md.shared}u" in src
+    assert f".num_warps = {md.num_warps}," in src
+    assert f".shared_mem = {md.shared}u," in src
+    # Param offsets use offsetof (C compiler owns layout, not Python).
+    assert "offsetof(" in src
+
+
+def test_launcher_src_emits_cluster_dims():
+    """The descriptor should carry the explicit multi-dim cluster_dims so the
+    shared core can build CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION for the
+    ctas_per_cga path (converged onto triton_launch_kernel, not a separate
+    launcher)."""
+    compiled = _compile_kernel(
+        add_kernel,
+        signature={"X": "*fp32", "Y": "*fp32", "OUT": "*fp32", "N": "i32"},
+        constexprs={"BLOCK": 1024},
+    )
+    src = compiled.asm["launcher_src"]
+    assert ".cluster_dims = {" in src
+    # Sanity: still emits the 1-D num_ctas path inputs too (both are present;
+    # the core gives num_ctas priority over cluster_dims).
+    assert ".num_ctas = " in src
 
 
 def test_launcher_src_has_abi_version_comment():
@@ -318,6 +337,94 @@ def test_launcher_src_has_abi_version_comment():
     )
     src = compiled.asm["launcher_src"]
     assert "ABI version: 1" in src
+
+
+def test_launcher_src_compiles_with_gcc():
+    """Generated C should compile with the system C compiler (validates struct
+    layout, offsetof usage, and launch.h compatibility)."""
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+    import triton.backends.nvidia
+
+    @triton.jit
+    def _gcc_test_add(X, Y, OUT, N, BLOCK: tl.constexpr):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < N
+        tl.store(OUT + offs, tl.load(X + offs, mask=mask) + tl.load(Y + offs, mask=mask), mask=mask)
+
+    # Force a fresh triton compilation cache so we always run make_launcher_src
+    # (the disk cache keys on source hash + options, not compiler.py version).
+    with tempfile.TemporaryDirectory() as fresh_cache:
+        prev_cache = os.environ.get("TRITON_CACHE_DIR")
+        os.environ["TRITON_CACHE_DIR"] = fresh_cache
+        try:
+            compiled = _compile_kernel(
+                _gcc_test_add,
+                signature={"X": "*fp32", "Y": "*fp32", "OUT": "*fp32", "N": "i32"},
+                constexprs={"BLOCK": 1024},
+            )
+        finally:
+            if prev_cache is None:
+                os.environ.pop("TRITON_CACHE_DIR", None)
+            else:
+                os.environ["TRITON_CACHE_DIR"] = prev_cache
+
+    src = compiled.asm.get("launcher_src")
+    if not src:
+        # Diagnostic: understand WHY launcher_src is missing on this environment
+        target = triton.runtime.driver.active.get_current_target()
+        from triton.compiler.compiler import make_backend
+        backend = make_backend(target)
+        diag = (f"launcher_src not in asm. Diagnostics:\n"
+                f"  target: {target}\n"
+                f"  backend type: {type(backend).__name__}\n"
+                f"  has make_launcher_src: {hasattr(backend, 'make_launcher_src')}\n"
+                f"  asm keys: {sorted(compiled.asm.keys())}\n"
+                f"  TRITON_CACHE_DIR: {os.environ.get('TRITON_CACHE_DIR', '<not set>')}")
+        pytest.fail(diag)
+
+    # Find launch.h: try the canonical source location, then the packaged one.
+    backend_dir = os.path.dirname(os.path.realpath(triton.backends.nvidia.__file__))
+    candidates = [
+        os.path.join(backend_dir, "launch.h"),
+        os.path.join(backend_dir, "..", "..", "..", "python", "triton", "runtime", "launch.h"),
+    ]
+    launch_h = next((p for p in candidates if os.path.exists(p)), None)
+    if launch_h is None:
+        pytest.skip("launch.h not found for compile test")
+
+    # Find a C compiler
+    cc = shutil.which("gcc") or shutil.which("clang") or shutil.which("cc")
+    if cc is None:
+        pytest.skip("No C compiler available")
+
+    # Find cuda.h include dir
+    cuda_include = os.path.join(backend_dir, "include")
+    if not os.path.exists(os.path.join(cuda_include, "cuda.h")):
+        pytest.skip("cuda.h not found")
+
+    with tempfile.NamedTemporaryFile(suffix=".c", mode="w", delete=False) as f:
+        # Inline launch.h into the source (same as the JIT runtime compile does
+        # via driver.py) so we only need -I for cuda.h — avoids fragile
+        # triton_include path resolution in buck link-tree environments.
+        from pathlib import Path
+        launch_h_content = Path(launch_h).read_text()
+        test_src = src.replace('#include "nvidia/backend/launch.h"', launch_h_content)
+        f.write(test_src)
+        f.flush()
+        try:
+            result = subprocess.run(
+                [cc, "-fsyntax-only", "-c", f.name, f"-I{cuda_include}"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            assert result.returncode == 0, (f"Generated launcher_src failed to compile:\n"
+                                            f"stdout: {result.stdout}\nstderr: {result.stderr}")
+        finally:
+            os.unlink(f.name)
 
 
 # =============================================================================
@@ -443,7 +550,7 @@ def test_hookchain_bool_after_remove():
 
 def test_dispatcher_created_with_flag(monkeypatch):
     """CompiledKernel._dispatcher should be set when use_triton_dispatcher is enabled."""
-    monkeypatch.setenv("TRITON_USE_TRITON_DISPATCHER", "1")
+    monkeypatch.setenv("TRITON_USE_C_DISPATCHER", "1")
     compiled = _compile_kernel(
         add_kernel,
         signature={"X": "*fp32", "Y": "*fp32", "OUT": "*fp32", "N": "i32"},
@@ -455,7 +562,7 @@ def test_dispatcher_created_with_flag(monkeypatch):
 
 def test_dispatcher_not_created_without_flag(monkeypatch):
     """CompiledKernel._dispatcher should be None without the flag."""
-    monkeypatch.setenv("TRITON_USE_TRITON_DISPATCHER", "0")
+    monkeypatch.setenv("TRITON_USE_C_DISPATCHER", "0")
     compiled = _compile_kernel(
         add_kernel,
         signature={"X": "*fp32", "Y": "*fp32", "OUT": "*fp32", "N": "i32"},
@@ -467,7 +574,7 @@ def test_dispatcher_not_created_without_flag(monkeypatch):
 
 def test_dispatcher_is_callable(monkeypatch):
     """_TritonDispatcher should be callable when created."""
-    monkeypatch.setenv("TRITON_USE_TRITON_DISPATCHER", "1")
+    monkeypatch.setenv("TRITON_USE_C_DISPATCHER", "1")
     compiled = _compile_kernel(
         add_kernel,
         signature={"X": "*fp32", "Y": "*fp32", "OUT": "*fp32", "N": "i32"},
@@ -493,7 +600,7 @@ def test_launch_metadata_returns_none_without_hooks():
 
 def test_dispatcher_e2e(monkeypatch):
     """End-to-end: _TritonDispatcher dispatches correctly on GPU."""
-    monkeypatch.setenv("TRITON_USE_TRITON_DISPATCHER", "1")
+    monkeypatch.setenv("TRITON_USE_C_DISPATCHER", "1")
     compiled = _compile_kernel(
         add_kernel,
         signature={"X": "*fp32", "Y": "*fp32", "OUT": "*fp32", "N": "i32"},
@@ -516,7 +623,7 @@ def test_dispatcher_e2e(monkeypatch):
 
 def test_dispatcher_getitem_jit_runner(monkeypatch):
     """CompiledKernel.__getitem__ should return a _TritonJITRunner when dispatcher is available."""
-    monkeypatch.setenv("TRITON_USE_TRITON_DISPATCHER", "1")
+    monkeypatch.setenv("TRITON_USE_C_DISPATCHER", "1")
     compiled = _compile_kernel(
         add_kernel,
         signature={"X": "*fp32", "Y": "*fp32", "OUT": "*fp32", "N": "i32"},
