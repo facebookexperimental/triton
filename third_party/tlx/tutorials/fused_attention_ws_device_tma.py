@@ -1238,8 +1238,7 @@ def _attn_bwd_persist(
 class _attention_opt(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE,
-                early_tma_store_lowering=False):
+    def forward(ctx, q, k, v, causal, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE):
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         # when v is in float8_e5m2 it is transposed.
@@ -1338,7 +1337,6 @@ class _attention_opt(torch.autograd.Function):
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
         ctx.persistent = persistent
-        ctx.early_tma_store_lowering = early_tma_store_lowering
         return o
 
     @staticmethod
@@ -1482,7 +1480,6 @@ class _attention_opt(torch.autograd.Function):
                     dtype=torch_dtype_to_triton(q.dtype),
                     warp_specialize=warp_specialize,
                     maxRegAutoWS=192,
-                    early_tma_store_lowering=ctx.early_tma_store_lowering,
                 )
             else:
                 _attn_bwd[grid](
@@ -1508,7 +1505,6 @@ class _attention_opt(torch.autograd.Function):
                     dtype=torch_dtype_to_triton(q.dtype),
                     warp_specialize=warp_specialize,
                     maxRegAutoWS=192,
-                    early_tma_store_lowering=ctx.early_tma_store_lowering,
                 )
 
         return dq, dk, dv, None, None, None, None, None, None, None
@@ -1533,7 +1529,6 @@ attention = _attention_opt.apply
 @pytest.mark.parametrize("VECT_MUL", [0])  # , 1, 2, 3])
 @pytest.mark.parametrize("FADD2_REDUCE", [False])
 @pytest.mark.parametrize("bwd_config_idx", range(len(configs_bwd_persist)))
-@pytest.mark.parametrize("early_tma_store_lowering", [False])
 def test_op(
     Z,
     H,
@@ -1547,7 +1542,6 @@ def test_op(
     VECT_MUL,
     FADD2_REDUCE,
     bwd_config_idx,
-    early_tma_store_lowering,
     dtype=torch.float16,
 ):
     # For fwd mode, only run once (bwd_config_idx=0) to avoid redundant tests
@@ -1555,8 +1549,6 @@ def test_op(
         pytest.skip("bwd_config_idx only applies to bwd mode")
     if mode == "bwd" and "fp8" in provider:
         pytest.skip("Backward pass with FP8 is not supported.")
-    if mode == "bwd" and HEAD_DIM == 128 and bwd_config_idx == 1 and early_tma_store_lowering:
-        pytest.skip("bwd_config_idx of 1 does not work with hDim 128 + early_tma_store")
     if mode == "bwd" and HEAD_DIM == 64 and bwd_config_idx == 1:
         pytest.skip("bwd_config_idx of 1 does not work with hDim 64")
     if mode == "bwd" and baseVariant == "ws_persistent":
@@ -1598,10 +1590,7 @@ def test_op(
         v = v.permute(0, 1, 3, 2).contiguous()
         v = v.permute(0, 1, 3, 2)
         v = v.to(torch.float8_e5m2)
-    if mode == "fwd" and early_tma_store_lowering:
-        pytest.skip("early_tma_store_lowering only applies to bwd mode")
-    tri_out = attention(q, k, v, causal, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE,
-                        early_tma_store_lowering).half()
+    tri_out = attention(q, k, v, causal, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE).half()
     if mode == "fwd":
         atol = 3 if "fp8" in provider else 1e-2
         torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
@@ -1674,9 +1663,7 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, baseVariant, provider
         SUBTILING = True
         VECT_MUL = 1
         FADD2_REDUCE = False
-        early_tma_store_lowering = True
-        fn = lambda: attention(q, k, v, False, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE,
-                               early_tma_store_lowering)
+        fn = lambda: attention(q, k, v, False, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE)
         if mode == "bwd":
             o = fn()
             do = torch.randn_like(o)

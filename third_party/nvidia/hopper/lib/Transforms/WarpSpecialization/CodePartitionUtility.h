@@ -188,6 +188,9 @@ struct TmemDataChannelPost : Channel {
 } // namespace nvidia_gpu
 } // namespace triton
 
+constexpr static char kWarpSpecializeGeneratedBarrierAttrName[] =
+    "ttg.ws_generated_barrier";
+
 bool enclosing(scf::IfOp ifOp, Operation *op);
 bool enclosing(scf::ForOp forOp, Operation *op);
 
@@ -347,16 +350,6 @@ bool verifyReuseGroup2(ReuseGroup *group);
 // Returns {earlyChannel, lateChannel}.
 std::pair<Channel *, Channel *> orderReuseGroup2(ReuseGroup *group);
 
-// Verify that a reuse group with N channels (N >= 2) is well-formed:
-// - At least 2 channels, each with a single copy (getNumBuffers() == 1).
-// - All producers are in the same block (so program order gives a total order).
-bool verifyReuseGroupN(ReuseGroup *group);
-
-// For a verified N-channel reuse group, order channels by program order of
-// their producer ops (getSrcOp()). Returns a sorted vector where channels[0]
-// is earliest and channels[N-1] is latest in program order.
-SmallVector<Channel *> orderReuseGroupN(ReuseGroup *group);
-
 // Given ordered channels {early, late} in a reuse group, determine
 // whether we need to explicitly move late's producer_acquire to before early's
 // producer.
@@ -374,6 +367,7 @@ bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel);
 // has no `buffer.offset`) and is a `TmemDataChannelPost` with
 // `isOperandDNoAcc`.
 bool isWholeAllocationOverwriteReuseOwner(Channel *ownerCh);
+void invalidateWarpSpecializeBarriers(triton::FuncOp funcOp);
 
 } // namespace mlir
 

@@ -37,12 +37,12 @@ def matmul_kernel_tma_persistent_simple(
     c_smem = tlx.local_alloc((128, 128), tl.float16, 1)
 
     # ── Mbarriers (SemIR: full+empty pair per semaphore) ──
-    # sem0_b0: N1→N2  tt.descriptor_load→ttg.local_alloc  cyc1→cyc557  forward  buf=0  kind=mbarrier
-    sem0_b0_full = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
-    sem0_b0_empty = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
-    # sem1_b1: N3→N4  tt.descriptor_load→ttg.local_alloc  cyc31→cyc587  forward  buf=1  kind=mbarrier
-    sem1_b1_full = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
-    sem1_b1_empty = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
+    # L0_smem_0: N1→N2  tt.descriptor_load→ttg.local_alloc  cyc1→cyc557  forward  buf=0  kind=mbarrier
+    L0_smem_0_full = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
+    L0_smem_0_empty = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
+    # L0_smem_1: N3→N4  tt.descriptor_load→ttg.local_alloc  cyc31→cyc587  forward  buf=1  kind=mbarrier
+    L0_smem_1_full = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
+    L0_smem_1_empty = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
     # acc_tmem: cross-region TC-loop → default-epilogue hand-off, depth=2 (legacy carve-out)
     acc_tmem_full = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
     acc_tmem_empty = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
@@ -78,10 +78,10 @@ def matmul_kernel_tma_persistent_simple(
                     _it = smem_accum
                     buf = smem_accum % 2
                     phase = (smem_accum // 2) & 1
-                    tlx.barrier_wait(sem0_b0_empty[(_it % 2)], (((_it // 2) & 1) ^ 1))
-                    tlx.barrier_expect_bytes(sem0_b0_full[(_it % 2)], 16384)
+                    tlx.barrier_wait(L0_smem_0_empty[(_it % 2)], (((_it // 2) & 1) ^ 1))
+                    tlx.barrier_expect_bytes(L0_smem_0_full[(_it % 2)], 16384)
                     # load → L0_smem_0
-                    tlx.async_descriptor_load(a_desc, L0_smem_0[buf], [((tile_id // div_4) * 128), (k * 64)], sem0_b0_full[(_it % 2)])
+                    tlx.async_descriptor_load(a_desc, L0_smem_0[buf], [((tile_id // div_4) * 128), (k * 64)], L0_smem_0_full[(_it % 2)])
                     smem_accum += 1
         # Async task: role=TMA ← inner wg1 (Phase 4 plan)
         with tlx.async_task(num_warps=1, num_regs=24):
@@ -93,10 +93,10 @@ def matmul_kernel_tma_persistent_simple(
                     _it = smem_accum
                     buf = smem_accum % 2
                     phase = (smem_accum // 2) & 1
-                    tlx.barrier_wait(sem1_b1_empty[(_it % 2)], (((_it // 2) & 1) ^ 1))
-                    tlx.barrier_expect_bytes(sem1_b1_full[(_it % 2)], 16384)
+                    tlx.barrier_wait(L0_smem_1_empty[(_it % 2)], (((_it // 2) & 1) ^ 1))
+                    tlx.barrier_expect_bytes(L0_smem_1_full[(_it % 2)], 16384)
                     # load → L0_smem_1
-                    tlx.async_descriptor_load(b_desc, L0_smem_1[buf], [((tile_id % div_4) * 128), (k * 64)], sem1_b1_full[(_it % 2)])
+                    tlx.async_descriptor_load(b_desc, L0_smem_1[buf], [((tile_id % div_4) * 128), (k * 64)], L0_smem_1_full[(_it % 2)])
                     smem_accum += 1
         # Async task: role=TC ← inner wg2 (Phase 4 plan)
         with tlx.async_task(num_warps=1, num_regs=24):
@@ -114,10 +114,10 @@ def matmul_kernel_tma_persistent_simple(
                     buf = smem_accum % 2
                     phase = (smem_accum // 2) & 1
                     # MMA
-                    tlx.barrier_wait(sem0_b0_full[(_it % 2)], ((_it // 2) & 1))
-                    tlx.barrier_wait(sem1_b1_full[(_it % 2)], ((_it // 2) & 1))
+                    tlx.barrier_wait(L0_smem_0_full[(_it % 2)], ((_it // 2) & 1))
+                    tlx.barrier_wait(L0_smem_1_full[(_it % 2)], ((_it // 2) & 1))
                     use_acc = (k > 0)
-                    tlx.async_dot(L0_smem_0[buf], tlx.local_trans(L0_smem_1[buf]), acc_tmem[tmem_buf], use_acc=use_acc, mBarriers=[sem0_b0_empty[(_it % 2)], sem1_b1_empty[(_it % 2)]])
+                    tlx.async_dot(L0_smem_0[buf], tlx.local_trans(L0_smem_1[buf]), acc_tmem[tmem_buf], use_acc=use_acc, mBarriers=[L0_smem_0_empty[(_it % 2)], L0_smem_1_empty[(_it % 2)]])
                     smem_accum += 1
                     i0_0 = True
                 tlx.tcgen05_commit(acc_tmem_full[tmem_buf])

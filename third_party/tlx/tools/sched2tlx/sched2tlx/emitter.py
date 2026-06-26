@@ -978,6 +978,13 @@ def _semir_emit_consumer_block(
         if cons is None or cons.access_kind == AccessKind.UNKNOWN:
             # MMA-like consumer: handled by the MMA emit (wait + mBarriers).
             continue
+        if n.op_kind == "ttg.memdesc_trans":
+            # A memdesc_trans is an address/layout calc for a downstream MMA
+            # that reads the channel SMEM directly — never a register consumer.
+            # Materializing it here (local_load → local_trans of a register)
+            # would crash. Its handshake is owned by the MMA operand path, which
+            # looks up this trans node.
+            continue
         if sem.buffer is None:
             # Signal-only semaphore: just the wait, no local_load.
             lines += f"{wait}  # {sem.note}"
@@ -1044,13 +1051,36 @@ def _semir_mma_operand_waits_and_mbarriers(
         alloc_node = nodes_by_op.get(alloc_op_id)
         if alloc_node is None:
             continue
-        cons_sems = rctx.sem_set.by_consumer.get((loop.loop_id, alloc_node.id), [])
+        # The cross-WG consumer recorded in the schedule may be the alloc node
+        # (operand buffer lives in the MMA WG) OR — when modulo co-locates the
+        # operand alloc with its producer load — the memdesc_trans node that
+        # reads the SMEM operand into the MMA. Look up both so the MMA itself
+        # owns the handshake (wait on full + recycle empty), instead of a
+        # register-materializing consumer block (which would `local_trans` a
+        # register and crash).
+        cand_ids = {alloc_node.id}
+        trans_node = nodes_by_op.get(operand.op_id)
+        if trans_node is not None:
+            cand_ids.add(trans_node.id)
+        cons_sems = [
+            ls
+            for cid in cand_ids
+            for ls in rctx.sem_set.by_consumer.get((loop.loop_id, cid), [])
+        ]
         if cons_sems:
             for ls in cons_sems:
                 if ls.sem_id in seen_sems:
                     continue
                 seen_sems.add(ls.sem_id)
-                wait = ls.consumer_wait_at.get(alloc_node.id)
+                # Use the semaphore's own recorded consumer node for the wait.
+                cnode = (
+                    ls.sem.consumers[0].node.node_id
+                    if ls.sem.consumers
+                    else alloc_node.id
+                )
+                wait = ls.consumer_wait_at.get(cnode) or ls.consumer_wait_at.get(
+                    alloc_node.id
+                )
                 if wait:
                     waits.append(wait)
                 # HW recycle: MMA reading the SMEM operand signals the EMPTY
@@ -1072,6 +1102,20 @@ def _semir_mma_operand_waits_and_mbarriers(
         # slot/phase use the buffer's ring count (matches the load).
         buf = next((b for b in loop.schedule.buffers if b.def_op == alloc_op_id), None)
         if buf is None:
+            continue
+        # If a TMA-fed cross-WG SemIR semaphore already covers this buffer, its
+        # consumer handshake is emitted by the MMA-node SemIR path (consumer
+        # waits + mBarriers, keyed on the MMA node). Adding the legacy `[buf]`
+        # handshake here too would double-wait/double-arrive the same barrier.
+        # (Intra-WG TMA buffers never reach this fallback — their consumer is
+        # the alloc node, handled by the cons_sems branch above.)
+        if rctx.sem_set is not None and any(
+            ls.sem.buffer is not None
+            and ls.sem.buffer.buffer_id == buf.id
+            and ls.sem.producers
+            and ls.sem.producers[0].async_kind == AsyncKind.TMA_LOAD
+            for ls in rctx.sem_set.lowered
+        ):
             continue
         buf_var = rctx.buffer_var.get((loop.loop_id, buf.id))
         if buf_var is None:
@@ -5041,13 +5085,33 @@ def emit(graph: ScheduleGraph) -> str:
         # (NVWS protocol). Signal-only Semaphores (no buffer) only allocate
         # the full barrier — there's no recycle direction.
         lines += "# ── Mbarriers (SemIR: full+empty pair per semaphore) ──"
+        # A buffer with multiple cross-WG consumers (e.g. wgrad dout feeding
+        # both the MMA and the bias-reduce) yields several semaphores that share
+        # one buffer-named barrier pair. They must allocate ONCE, and the empty
+        # barrier's arrive_count = sum over consumers (each arrives empty once);
+        # otherwise the producer recycles the slot after one consumer releases →
+        # mid-read overwrite. Dedup by name and sum the empty arrive_counts.
+        empty_total: dict[str, int] = {}
+        for ls in rctx.sem_set.lowered:
+            if ls.alloc_empty_stmt is not None:
+                m = re.search(r"arrive_count=(\d+)", ls.alloc_empty_stmt)
+                empty_total[ls.empty_name] = empty_total.get(ls.empty_name, 0) + (
+                    int(m.group(1)) if m else 1
+                )
+        seen_alloc: set[str] = set()
         for ls in rctx.sem_set.lowered:
             sem = ls.sem
-            note = sem.note or ""
-            lines += f"# {ls.name}: {note}"
+            if ls.full_name in seen_alloc:
+                continue
+            seen_alloc.add(ls.full_name)
+            lines += f"# {ls.name}: {sem.note or ''}"
             lines += ls.alloc_full_stmt
             if ls.alloc_empty_stmt is not None:
-                lines += ls.alloc_empty_stmt
+                lines += re.sub(
+                    r"arrive_count=\d+",
+                    f"arrive_count={empty_total[ls.empty_name]}",
+                    ls.alloc_empty_stmt,
+                )
         # Cross-loop / cross-region edges that aren't in any loop's
         # cross_wg_barriers (e.g., the acc_tmem TC-loop → default-epilogue
         # hand-off, and per-loop iter_arg result channels). Keep the legacy
