@@ -139,6 +139,79 @@ static void emitScheduleFromGraph(scf::ForOp loop,
                      DenseI32ArrayAttr::get(ctx, ArrayRef<int32_t>{wg}));
   }
 
+  // ── 1.6. Per-loop: ttg.partition_num_warps ──
+  // The per-partition warp count is a real schedule decision (Layer B): each
+  // warp group's count = max(minWarps) over its ops, snapped to {1,2,4,8}.
+  // Emit it as a DenseI32ArrayAttr indexed by partition id — the SAME shape as
+  // the final ttg.warp_specialize `partitionNumWarps` attr — so the downstream
+  // WS pass can honor modulo's choice instead of re-deriving from a binary
+  // tmem-presence heuristic. (Mirrors jsonDumpWarpGroups' num_warps.)
+  {
+    int maxWg = -1;
+    for (const auto &node : schedLoop.nodes)
+      maxWg = std::max(maxWg, node.warpGroup);
+    if (maxWg >= 0) {
+      SmallVector<int> wgMaxMinWarps(maxWg + 1, 0);
+      for (const auto &node : schedLoop.nodes) {
+        if (node.warpGroup < 0)
+          continue;
+        wgMaxMinWarps[node.warpGroup] = std::max(
+            wgMaxMinWarps[node.warpGroup], std::max(node.minWarps, 1));
+      }
+      auto snapWarps = [](int m) {
+        if (m <= 1)
+          return 1;
+        if (m <= 2)
+          return 2;
+        if (m <= 4)
+          return 4;
+        return 8;
+      };
+      SmallVector<int32_t> numWarps(maxWg + 1, 1);
+      for (int wg = 0; wg <= maxWg; ++wg)
+        numWarps[wg] = snapWarps(wgMaxMinWarps[wg] == 0 ? 1 : wgMaxMinWarps[wg]);
+      loop->setAttr("ttg.partition_num_warps",
+                    DenseI32ArrayAttr::get(ctx, numWarps));
+    }
+  }
+
+  // ── 1.7. Per-loop: ttg.partition.stages + ttg.warp_specialize.tag ──
+  // These are exactly what PartitionSet::fromLoop() (the WS backend's
+  // honor-preset hook in PartitionSchedulingMeta::getInitialSchedule) requires.
+  // Emitting them makes the backend adopt modulo's ttg.partition assignment
+  // verbatim instead of re-deriving partitions from its own MMA-backward-slice
+  // heuristic — i.e. all partition decisions come from modulo. Ops modulo left
+  // unassigned (warpGroup<0 infra ops) are still filled in by the backend's
+  // propagatePartitions after fromLoop.
+  //
+  // Per-partition stage = max loop.stage over that partition's ops. This
+  // matches PSM's own convention (compute/MMA partition lands at the higher
+  // stage, loads/epilogue at stage 0); the value is otherwise only used for
+  // channel-buffering offsets. The tag is required to be present; PSM resets it
+  // to the loop's WS index during serialize.
+  {
+    int maxWg = -1;
+    for (const auto &node : schedLoop.nodes)
+      maxWg = std::max(maxWg, node.warpGroup);
+    if (maxWg >= 0) {
+      SmallVector<int> wgMaxStage(maxWg + 1, 0);
+      for (const auto &node : schedLoop.nodes) {
+        if (node.warpGroup < 0)
+          continue;
+        wgMaxStage[node.warpGroup] =
+            std::max(wgMaxStage[node.warpGroup], node.cycle / II);
+      }
+      SmallVector<Attribute> stageAttrs;
+      for (int wg = 0; wg <= maxWg; ++wg)
+        stageAttrs.push_back(
+            IntegerAttr::get(IntegerType::get(ctx, 32), wgMaxStage[wg]));
+      loop->setAttr(ttg::kPartitionStagesAttrName,
+                    ArrayAttr::get(ctx, stageAttrs));
+      loop->setAttr(ttg::kWarpSpecializeTagAttrName,
+                    IntegerAttr::get(IntegerType::get(ctx, 32), 0));
+    }
+  }
+
   // ── 2. Per-loop: tt.modulo_ii, tt.scheduled_max_stage ──
   loop->setAttr("tt.modulo_ii",
                 IntegerAttr::get(IntegerType::get(ctx, 32), II));
@@ -169,6 +242,15 @@ static void emitScheduleFromGraph(scf::ForOp loop,
                        IntegerAttr::get(IntegerType::get(ctx, 32), buf.count));
     buf.defOp->setAttr("buffer.id",
                        IntegerAttr::get(IntegerType::get(ctx, 32), buf.id));
+    // Step 4.5 buffer-merge decision: buffers sharing a merge_group_id were
+    // colored to the same physical SMEM/TMEM slot (interval-graph coloring).
+    // Carry it so the downstream allocator can reuse modulo's coloring instead
+    // of running its own merge.
+    if (buf.mergeGroupId != UINT_MAX)
+      buf.defOp->setAttr(
+          "buffer.merge_group_id",
+          IntegerAttr::get(IntegerType::get(ctx, 32),
+                           static_cast<int>(buf.mergeGroupId)));
   }
 
   // ── 4. Clean up internal attrs ──

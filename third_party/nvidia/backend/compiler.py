@@ -725,16 +725,14 @@ class CUDABackend(BaseBackend):
                 # TRITON_USE_MODULO_SCHEDULE=sms|exhaustive|random
                 nvidia.passes.hopper.add_modulo_schedule(pm)
             nvidia.passes.hopper.add_data_partitioning(pm, 1)
-            # assign_latencies sets tt.latency on loads/MMAs (stage-distance
-            # latencies). schedule_loops reads tt.latency AND tt.autows:
-            # when MMA ops have tt.autows, scheduleKeyOpsAnnotation places
-            # them at the annotated stages/clusters while scheduling all
-            # other ops (loads, softmax, barriers) via the standard
-            # latency-based heuristic. Without assign_latencies, the WS
-            # pass's internal scheduleLoops has no latencies and can't
-            # enter the code path that reads tt.autows annotations.
-            passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
-            passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
+            # The modulo / LLM scheduler above already produced the full loop
+            # schedule (loop.stage / loop.cluster). Re-running assign_latencies +
+            # schedule_loops here would recompute and OVERRIDE it, so only run
+            # them on the default path where no custom scheduler set the schedule.
+            uses_custom_schedule = knobs.nvidia.use_llm_schedule or knobs.nvidia.use_modulo_schedule is not None
+            if not uses_custom_schedule:
+                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
+                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
             if not knobs.nvidia.use_meta_ws:
                 # 2-CTA + upstream WS is not supported
                 if opt.cluster_dims is None or max(opt.cluster_dims) < 2:
