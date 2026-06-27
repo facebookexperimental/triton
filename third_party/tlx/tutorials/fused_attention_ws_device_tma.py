@@ -669,7 +669,7 @@ def _attn_bwd_dkdv_inner(
     HEAD_DIM: tl.constexpr,
     MASK: tl.constexpr,
     dtype: tl.constexpr,
-    EPILOGUE_SUBTILE: tl.constexpr,
+    DQ_SUBTILE: tl.constexpr,
     LN2: tl.constexpr,
     RESCHED: tl.constexpr,
     BWD_DOT_ATTRS: tl.constexpr = None,
@@ -706,9 +706,9 @@ def _attn_bwd_dkdv_inner(
     else:
         dk += tl.dot(dsT, tl.trans(qT))
         dq = tl.dot(tl.trans(dsT), k)
-    dqs = _split_n_2D(dq, EPILOGUE_SUBTILE)
-    slice_size: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
-    for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
+    dqs = _split_n_2D(dq, DQ_SUBTILE)
+    slice_size: tl.constexpr = HEAD_DIM // DQ_SUBTILE
+    for slice_id in tl.static_range(0, DQ_SUBTILE):
         dqN = dqs[slice_id] * LN2
         desc_dq.atomic_add([(off_bh + curr_m).to(tl.int32), slice_id * slice_size], dqN)
     curr_m += step_m
@@ -745,7 +745,9 @@ def _attn_bwd_dkdv(
     dtype: tl.constexpr,
     warp_specialize: tl.constexpr,  #
     EPILOGUE_SUBTILE: tl.constexpr,
+    DQ_SUBTILE: tl.constexpr,
     BWD_DOT_ATTRS: tl.constexpr = None,
+    SMEM_BUDGET: tl.constexpr = 200000,
 ):
     offs_n = start_n + tl.arange(0, BLOCK_N1)
 
@@ -762,7 +764,8 @@ def _attn_bwd_dkdv(
                 warp_specialize=True,
                 merge_epilogue_to_computation=True,
                 tmem_alloc_algo=2,
-                smem_budget=200000,
+                smem_alloc_algo=1,
+                smem_budget=SMEM_BUDGET,
         ):
             dk, dv, curr_m = _attn_bwd_dkdv_inner(
                 dk,
@@ -784,7 +787,7 @@ def _attn_bwd_dkdv(
                 HEAD_DIM,
                 MASK,
                 dtype,
-                EPILOGUE_SUBTILE,
+                DQ_SUBTILE,
                 LN2,
                 True,
                 BWD_DOT_ATTRS,
@@ -811,7 +814,7 @@ def _attn_bwd_dkdv(
                 HEAD_DIM,
                 MASK,
                 dtype,
-                EPILOGUE_SUBTILE,
+                DQ_SUBTILE,
                 LN2,
                 True,
                 BWD_DOT_ATTRS,
@@ -825,6 +828,9 @@ def _bwd_host_descriptor_pre_hook(nargs):
     BLOCK_N1 = nargs["BLOCK_N1"]
     HEAD_DIM = nargs["HEAD_DIM"]
     EPILOGUE_SUBTILE = nargs["EPILOGUE_SUBTILE"]
+    # DQ_SUBTILE controls dq atomic_add staging only; defaults to
+    # EPILOGUE_SUBTILE so existing configs continue to behave the same.
+    DQ_SUBTILE = nargs.get("DQ_SUBTILE", EPILOGUE_SUBTILE)
     if not isinstance(nargs["desc_q"], TensorDescriptor):
         return
 
@@ -835,7 +841,7 @@ def _bwd_host_descriptor_pre_hook(nargs):
 
     nargs["desc_q"].block_shape = [BLOCK_M1, HEAD_DIM]
     nargs["desc_do"].block_shape = [BLOCK_M1, HEAD_DIM]
-    nargs["desc_dq"].block_shape = [BLOCK_M1, HEAD_DIM // EPILOGUE_SUBTILE]
+    nargs["desc_dq"].block_shape = [BLOCK_M1, HEAD_DIM // DQ_SUBTILE]
     nargs["desc_v"].block_shape = [BLOCK_N1, HEAD_DIM]
     nargs["desc_k"].block_shape = [BLOCK_N1, HEAD_DIM]
     nargs["desc_dv"].block_shape = [BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
@@ -852,6 +858,7 @@ configs_bwd = [
             "BLOCK_M2": 128,
             "BLOCK_N2": 128,
             "EPILOGUE_SUBTILE": 4,
+            "DQ_SUBTILE": 4,
             "BWD_DOT_ATTRS": FrozenDotAttrs(None),
         },
         num_warps=4,
@@ -868,6 +875,7 @@ configs_bwd_subtile_opt = [
             "BLOCK_M2": 128,
             "BLOCK_N2": 128,
             "EPILOGUE_SUBTILE": 4,
+            "DQ_SUBTILE": 4,
             "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM64_TMEM,
         },
         num_warps=4,
@@ -884,6 +892,7 @@ configs_bwd_persist = [
             "BLOCK_M2": 128,
             "BLOCK_N2": 128,
             "EPILOGUE_SUBTILE": 4,
+            "DQ_SUBTILE": 4,
             "BWD_DOT_ATTRS": _DEFAULT_BWD_DOT_ATTRS,
         },
         num_warps=4,
@@ -892,26 +901,32 @@ configs_bwd_persist = [
     ),
     triton.Config(
         {
-            "BLOCK_M1": 128, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 128, "EPILOGUE_SUBTILE": 4, "BWD_DOT_ATTRS":
+            "BLOCK_M1": 128, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 128, "EPILOGUE_SUBTILE": 4, "DQ_SUBTILE": 4, "BWD_DOT_ATTRS":
             _BWD_DOT_ATTRS_SCHED,  # use memory planner heuristics
         },
         num_warps=4,
         num_stages=2,
         pre_hook=_bwd_host_descriptor_pre_hook,
     ),
-    # triton.Config( # test dk/dv staging buffer reuse
-    #    {
-    #        "BLOCK_M1": 128,
-    #        "BLOCK_N1": 128,
-    #        "BLOCK_M2": 128,
-    #        "BLOCK_N2": 128,
-    #        "EPILOGUE_SUBTILE": 2,
-    #        "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_TMEM,
-    #    },
-    #    num_warps=4,
-    #    num_stages=2,
-    #    pre_hook=_bwd_host_descriptor_pre_hook,
-    # ),
+    triton.Config( # test dk/dv staging buffer reuse
+        {
+            "BLOCK_M1": 128,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 128,
+            "EPILOGUE_SUBTILE": 2,
+            "DQ_SUBTILE": 4,
+            # The 3-group TMEM reuse benefits from extra SMEM headroom so Phase 4
+            # can pipeline (double-buffer) its staging; the other configs keep the
+            # default 200000 (a larger budget double-buffers their early-TMA store
+            # staging, which the store lowering mishandles -> wrong dv/dk/dq).
+            "SMEM_BUDGET": 220000,
+            "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_TMEM,
+        },
+        num_warps=4,
+        num_stages=2,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+    ),
     triton.Config(
         {
             "BLOCK_M1": 64,
@@ -919,6 +934,7 @@ configs_bwd_persist = [
             "BLOCK_M2": 128,
             "BLOCK_N2": 128,
             "EPILOGUE_SUBTILE": 2,
+            "DQ_SUBTILE": 4,
             "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM64_TMEM,
         },
         num_warps=4,
@@ -932,6 +948,7 @@ configs_bwd_persist = [
             "BLOCK_M2": 128,
             "BLOCK_N2": 128,
             "EPILOGUE_SUBTILE": 2,
+            "DQ_SUBTILE": 4,
             "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM64,
         },
         num_warps=4,
@@ -968,7 +985,9 @@ def _attn_bwd_core(
     dtype: tl.constexpr,
     warp_specialize: tl.constexpr,  #
     EPILOGUE_SUBTILE: tl.constexpr,
+    DQ_SUBTILE: tl.constexpr,
     BWD_DOT_ATTRS: tl.constexpr = None,
+    SMEM_BUDGET: tl.constexpr = 200000,
 ):
     off_chz = (bhid * N_CTX).to(tl.int64)
     off_bh = ((stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)) // stride_tok
@@ -1009,7 +1028,9 @@ def _attn_bwd_core(
         dtype=dtype,
         warp_specialize=warp_specialize,
         EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
+        DQ_SUBTILE=DQ_SUBTILE,
         BWD_DOT_ATTRS=BWD_DOT_ATTRS,
+        SMEM_BUDGET=SMEM_BUDGET,
     )
 
     dvs = _split_n_2D(dv, EPILOGUE_SUBTILE)
@@ -1060,7 +1081,9 @@ def _attn_bwd(
     dtype: tl.constexpr,
     warp_specialize: tl.constexpr,  #
     EPILOGUE_SUBTILE: tl.constexpr,
+    DQ_SUBTILE: tl.constexpr,
     BWD_DOT_ATTRS: tl.constexpr = None,
+    SMEM_BUDGET: tl.constexpr = 200000,
 ):
     bhid = tl.program_id(2)
     pid = tl.program_id(0)
@@ -1091,7 +1114,9 @@ def _attn_bwd(
         dtype,
         warp_specialize,
         EPILOGUE_SUBTILE,
+        DQ_SUBTILE,
         BWD_DOT_ATTRS,
+        SMEM_BUDGET,
     )
 
 
@@ -1125,7 +1150,9 @@ def _attn_bwd_persist(
     dtype: tl.constexpr,
     warp_specialize: tl.constexpr,  #
     EPILOGUE_SUBTILE: tl.constexpr,
+    DQ_SUBTILE: tl.constexpr,
     BWD_DOT_ATTRS: tl.constexpr = None,
+    SMEM_BUDGET: tl.constexpr = 200000,
 ):
     n_tile_num = tl.cdiv(N_CTX, BLOCK_N1)
     prog_id = tl.program_id(0)
@@ -1155,7 +1182,7 @@ def _attn_bwd_persist(
         desc_dq,
         shape=[y_dim, HEAD_DIM],
         strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_M1, HEAD_DIM // EPILOGUE_SUBTILE],
+        block_shape=[BLOCK_M1, HEAD_DIM // DQ_SUBTILE],
     )
     desc_v = _maybe_make_tensor_desc(
         desc_v,
@@ -1200,7 +1227,8 @@ def _attn_bwd_persist(
             warp_specialize=True,
             merge_epilogue_to_computation=True,
             tmem_alloc_algo=2,
-            smem_budget=200000,
+            smem_alloc_algo=1,
+            smem_budget=SMEM_BUDGET,
     ):
         pid = tile_idx % n_tile_num
         bhid = tile_idx // n_tile_num
@@ -1230,7 +1258,9 @@ def _attn_bwd_persist(
             dtype,
             False,
             EPILOGUE_SUBTILE,
+            DQ_SUBTILE,
             BWD_DOT_ATTRS,
+            SMEM_BUDGET,
         )
         tile_idx += num_progs
 
@@ -1551,6 +1581,18 @@ def test_op(
         pytest.skip("Backward pass with FP8 is not supported.")
     if mode == "bwd" and HEAD_DIM == 64 and bwd_config_idx == 1:
         pytest.skip("bwd_config_idx of 1 does not work with hDim 64")
+    # SUBTILING / VECT_MUL / FADD2_REDUCE only affect the forward kernels; the
+    # backward kernels ignore them. Running bwd across both SUBTILING values
+    # would re-run identical backward tests, so keep a single representative.
+    if mode == "bwd" and SUBTILING:
+        pytest.skip("SUBTILING is forward-only; redundant for bwd")
+    # bwd_config_idx 2 is the _BWD_DOT_ATTRS_TMEM 3-group TMEM-reuse config
+    # (BLOCK_M1=128, EPILOGUE_SUBTILE=2). The reuse packs dpT/dq/dsT into one
+    # TMEM allocation, which (with early TMA store now always on) fits only the
+    # non-persistent (ws) backward; the persistent path's TMEM budget cannot hold
+    # it. Dedicated coverage: test_bwd_tmem_dsT_reuse_3group.
+    if mode == "bwd" and bwd_config_idx == 2 and baseVariant == "ws_persistent":
+        pytest.skip("_BWD_DOT_ATTRS_TMEM 3-group reuse is not supported on the persistent path")
     if mode == "bwd" and baseVariant == "ws_persistent":
         _attn_bwd_persist.configs = [configs_bwd_persist[bwd_config_idx]]
         _attn_bwd_persist.cache = {}
