@@ -356,6 +356,12 @@ bool verifyReuseGroup2(ReuseGroup *group);
 // Returns {earlyChannel, lateChannel}.
 std::pair<Channel *, Channel *> orderReuseGroup2(ReuseGroup *group);
 
+// Order an N-channel single-copy reuse group into one dependency chain
+// (channel i's consumer reaches channel i+1's producer). Generalizes
+// orderReuseGroup2 to N channels and across partitions. Returns the ordered
+// channels, or an empty vector if no unique total chain order exists.
+SmallVector<Channel *> orderReuseGroupChain(ReuseGroup *group);
+
 // Verify that a reuse group with N channels (N >= 2) is well-formed:
 // - At least 2 channels, each with a single copy (getNumBuffers() == 1).
 // - All producers are in the same block (so program order gives a total order).
@@ -384,6 +390,14 @@ bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel);
 // `isOperandDNoAcc`.
 bool isWholeAllocationOverwriteReuseOwner(Channel *ownerCh);
 void invalidateWarpSpecializeBarriers(triton::FuncOp funcOp);
+
+// Verify an A5 (cross-partition) reuse group: a single-copy group of >= 3
+// channels whose producers span more than one block, where only a 2-channel
+// "core" (producers co-located in one block) needs an explicit reuse barrier
+// and every "extra" channel elides against the core via needExplicitReuseWait
+// (same-partition implicit ordering enforces the WAR). Realized case: FA-bwd
+// `_BWD_DOT_ATTRS_TMEM` group {dpT, dq, dsT}. Returns true iff treatable.
+bool verifyReuseGroupCrossPartition(ReuseGroup *group);
 
 } // namespace mlir
 

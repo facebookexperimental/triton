@@ -701,8 +701,12 @@ def _attn_bwd_dkdv_inner(
     dsT = pT * (dpT - Di[None, :])
     dsT = dsT.to(dtype)
     if RESCHED:
-        dq = tl.dot(tl.trans(dsT), k, attrs=BWD_DOT_ATTRS.get("dq"))
+        # dk reads dsT from the reused TMEM buffer-5; dq writes the same buffer.
+        # dk must read before dq overwrites (cf. TLX
+        # blackwell_fa_ws_pipelined_persistent: "dk must read dsT_tmem BEFORE
+        # dq writes ... same TMEM slot"). Emit dk first.
         dk += tl.dot(dsT, tl.trans(qT), attrs=BWD_DOT_ATTRS.get("dk"))
+        dq = tl.dot(tl.trans(dsT), k, attrs=BWD_DOT_ATTRS.get("dq"))
     else:
         dk += tl.dot(dsT, tl.trans(qT))
         dq = tl.dot(tl.trans(dsT), k)
@@ -1651,6 +1655,39 @@ def test_op(
     torch.testing.assert_close(tri_dv, ref_dv, atol=1e-2, rtol=rtol)
     torch.testing.assert_close(tri_dk, ref_dk, atol=1e-2, rtol=rtol)
     torch.testing.assert_close(tri_dq, ref_dq, atol=1e-2, rtol=rtol)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")
+def test_bwd_tmem_dsT_reuse_3group():
+    # Regression for the 3-group TMEM-reuse accuracy bug.
+    #
+    # configs_bwd_persist[2] == _BWD_DOT_ATTRS_TMEM routes dsT through a TMEM
+    # buffer shared by {dpT, dq, dsT} (buffer.id=5) so dk reads dsT from TMEM
+    # instead of SMEM. The kernel computes dq and dk both from dsT and they
+    # alias the same TMEM slot: dk MUST read dsT before dq overwrites the slot
+    # (cf. TLX blackwell_fa_ws_pipelined_persistent: "dk must read dsT_tmem
+    # BEFORE dq writes ... same TMEM slot"). Before the fix the kernel emitted
+    # dq before dk, so dq clobbered dsT and the backward produced NaN. This test
+    # fails (NaN in dv/dk/dq) without the dk-before-dq ordering and passes with
+    # it.
+    #
+    # Runs on the non-persistent ("ws") backward, which is the usable path; the
+    # persistent backward separately exceeds the 512-unit TMEM limit (see NOTE
+    # in the launcher) and is not exercised here.
+    test_op(
+        Z=8,
+        H=16,
+        N_CTX=1024,
+        HEAD_DIM=128,
+        causal=False,
+        mode="bwd",
+        baseVariant="ws",
+        provider="triton-fp16",
+        SUBTILING=False,  # forward-only knob; inert for the bwd kernel
+        VECT_MUL=0,
+        FADD2_REDUCE=False,
+        bwd_config_idx=2,
+    )
 
 
 try:

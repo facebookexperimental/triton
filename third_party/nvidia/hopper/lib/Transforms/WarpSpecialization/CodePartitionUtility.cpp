@@ -843,6 +843,48 @@ std::pair<Channel *, Channel *> orderReuseGroup2(ReuseGroup *group) {
       "direction (overlapping but temporally unordered reuse pair)");
 }
 
+SmallVector<Channel *> orderReuseGroupChain(ReuseGroup *group) {
+  // Topologically order the group's channels into one dependency chain:
+  // channel i's consumer reaches channel i+1's producer (via SSA use-def or
+  // same-block program order — both captured by hasDependencyChain). This
+  // generalizes orderReuseGroup2 to N channels and, unlike the A3 same-block
+  // sort, works across partitions (e.g. FA-bwd {dpT,dsT,dq}: dpT->dsT by SSA,
+  // dsT->dq by gemm-partition op order). Returns the ordered channels, or an
+  // empty vector when no unique total chain order exists (caller falls back).
+  unsigned n = group->channels.size();
+  SmallVector<Channel *> chans(group->channels.begin(), group->channels.end());
+  SmallVector<SmallVector<bool>> edge(n, SmallVector<bool>(n, false));
+  SmallVector<unsigned> indeg(n, 0);
+  for (unsigned i = 0; i < n; ++i)
+    for (unsigned j = 0; j < n; ++j)
+      if (i != j && hasDependencyChain(chans[i], chans[j])) {
+        edge[i][j] = true;
+        ++indeg[j];
+      }
+  // Kahn's algorithm requiring a unique zero-in-degree node at each step, so the
+  // chain order is unambiguous (true for a real reuse cycle like dpT->dsT->dq).
+  SmallVector<Channel *> ordered;
+  SmallVector<bool> used(n, false);
+  for (unsigned step = 0; step < n; ++step) {
+    int pick = -1;
+    for (unsigned i = 0; i < n; ++i) {
+      if (used[i] || indeg[i] != 0)
+        continue;
+      if (pick != -1)
+        return {}; // ambiguous: more than one head this step
+      pick = static_cast<int>(i);
+    }
+    if (pick == -1)
+      return {}; // cycle among edges: no total order
+    used[pick] = true;
+    ordered.push_back(chans[pick]);
+    for (unsigned j = 0; j < n; ++j)
+      if (edge[pick][j] && indeg[j] > 0)
+        --indeg[j];
+  }
+  return ordered;
+}
+
 bool verifyReuseGroupN(ReuseGroup *group) {
   if (group->channels.size() < 2) {
     LDBG("verifyReuseGroupN: need at least 2 channels, got "
@@ -955,6 +997,37 @@ bool isWholeAllocationOverwriteReuseOwner(Channel *ownerCh) {
   // (set in createChannelPost when the MMA's useAccumulator is const-false).
   auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ownerCh);
   return tmemCh->isOperandDNoAcc;
+}
+
+bool verifyReuseGroupCrossPartition(ReuseGroup *group) {
+  // Cross-partition reuse: a single-copy reuse group of >= 3 channels whose
+  // PRODUCERS span more than one partition (async_task_id) AND that admit a
+  // unique total dependency-chain order (channel i's consumer reaches channel
+  // i+1's producer). Such a group cannot be handled by the same-block A3 path:
+  // its channels share one block at this stage (partitions are still
+  // async_task_id tags pre-specialization, so a block-based test would always
+  // see "one block"), but the cross-partition writers need explicit reuse
+  // barriers — a same-partition program-order elision is unsound for them.
+  //
+  // Realized case: FA-bwd `_BWD_DOT_ATTRS_TMEM` {dpT, dsT, dq} on one buffer.id:
+  // dpT (gemm) -> dsT (computation tmem_store) -> dq (gemm). The computation
+  // writer dsT needs a cross-iteration WAR against dq, which the A3 single-wrap
+  // omits (it raced across the persistent outer loop).
+  if (group->channels.size() <= 2)
+    return false;
+  for (auto *ch : group->channels) {
+    if (ch->getNumBuffers() != 1 || !ch->getSrcOp())
+      return false;
+  }
+  // Cross-partition: producers span >= 2 distinct producer task ids. (Detect by
+  // task id, not block — at doCodePartition every channel is in one block.)
+  llvm::DenseSet<int> producerTasks;
+  for (auto *ch : group->channels)
+    producerTasks.insert(ch->relation.first);
+  if (producerTasks.size() < 2)
+    return false; // all producers in one partition -> same-block A3 path
+  // Require a unique total dependency-chain order over the channels.
+  return !orderReuseGroupChain(group).empty();
 }
 
 // Returns the (possibly reuse-group staggered) accumulation count for `ch` at
