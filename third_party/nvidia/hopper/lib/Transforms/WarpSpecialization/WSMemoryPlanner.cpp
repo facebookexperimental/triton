@@ -795,11 +795,58 @@ private:
 
 namespace {
 
+/// Extract a human-readable name from an op's location.
+/// Walks NameLoc, CallSiteLoc(NameLoc(...)), and FusedLoc chains.
+/// Falls back to "file:line" from FileLineColLoc if no NameLoc is found.
+static std::string getLocName(Operation *op) {
+  if (!op)
+    return "";
+  // First try to find a NameLoc.
+  auto walkName = [](Location loc, auto &self) -> std::string {
+    if (auto nameLoc = dyn_cast<NameLoc>(loc))
+      return nameLoc.getName().str();
+    if (auto callSiteLoc = dyn_cast<CallSiteLoc>(loc))
+      return self(callSiteLoc.getCallee(), self);
+    if (auto fusedLoc = dyn_cast<FusedLoc>(loc))
+      for (Location sub : fusedLoc.getLocations()) {
+        auto s = self(sub, self);
+        if (!s.empty())
+          return s;
+      }
+    return "";
+  };
+  std::string name = walkName(op->getLoc(), walkName);
+  if (!name.empty())
+    return name;
+  // Fallback: extract file:line from FileLineColLoc.
+  auto walkFile = [](Location loc, auto &self) -> std::string {
+    if (auto fileLoc = dyn_cast<FileLineColLoc>(loc)) {
+      std::string filename = fileLoc.getFilename().str();
+      size_t lastSlash = filename.rfind('/');
+      if (lastSlash != std::string::npos)
+        filename = filename.substr(lastSlash + 1);
+      return filename + ":" + std::to_string(fileLoc.getLine());
+    }
+    if (auto callSiteLoc = dyn_cast<CallSiteLoc>(loc))
+      return self(callSiteLoc.getCallee(), self);
+    if (auto fusedLoc = dyn_cast<FusedLoc>(loc))
+      for (Location sub : fusedLoc.getLocations()) {
+        auto s = self(sub, self);
+        if (!s.empty())
+          return s;
+      }
+    return "";
+  };
+  return walkFile(op->getLoc(), walkFile);
+}
+
 /// Priority levels for SMEM multi-buffering candidates.
 enum class WSBufferPriority {
-  P0_InnermostTMA = 0, // innermost loop + TMA channel
-  P1_InnermostNonTMA,  // innermost loop, non-TMA
-  P2_Other,            // outside loop / non-innermost (never increased)
+  P0_InnermostTMA = 0,    // innermost loop + TMA channel
+  P1_InnermostNonTMA,     // innermost loop, non-TMA
+  P2_InnerTMAStaging,     // TMA staging buffer inside the innermost loop (e.g. dq)
+  P3_OuterTMAStaging,     // TMA staging buffer outside loops (e.g. dk, dv)
+  P4_Other,               // outside loop / non-innermost (regular epilogue)
 };
 
 /// A wrapper around one ttg.local_alloc op for the new SMEM allocation.
@@ -820,6 +867,8 @@ struct WSBuffer {
       0; // 0=normal, 1=TMA store staging, 2=TMA reduce staging
   bool isAllocated =
       false; // Has dedicated SMEM; false = reuses another buffer.
+  int reuseTargetBufferId =
+      -1; // bufferId of the reuse target, -1 = no reuse.
 };
 
 static unsigned
@@ -1303,7 +1352,7 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
         tmaStagingGroups[desc].push_back(i);
       continue;
     }
-    if (buf.priority != WSBufferPriority::P2_Other)
+    if (buf.priority != WSBufferPriority::P4_Other)
       continue;
     Channel *ch = findChannelForOp(buf.allocOp, channels);
     Operation *origLoad = findOriginalLoadForChannel(ch);
@@ -1341,61 +1390,148 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
 /// Epilogue buffers merged in Phase 3.5 share a single bufferId but are
 /// left at numCopies=1 by Phase 4. Increase copies uniformly for each
 /// fused group while staying within the SMEM budget.
+/// Phase 4.5: Iterative copy increase for fused groups eligible for epilogue-
+/// style budget bumping. Inner-loop TMA staging is tried first (highest pay-
+/// off per slot), then outer-loop TMA staging, then regular P4_Other groups.
 static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
                                         unsigned numBuffers,
                                         unsigned smemBudget) {
-  // Collect fused P2_Other groups by bufferId.
+  // Eligible priority tiers, in the order Phase 4.5 should try to bump them.
+  static const WSBufferPriority kPhase45Order[] = {
+      WSBufferPriority::P2_InnerTMAStaging, // dq \u2014 highest payoff per slot
+      WSBufferPriority::P3_OuterTMAStaging, // dk / dv
+      WSBufferPriority::P4_Other,           // regular epilogue / non-innermost
+  };
+  auto isEligible = [&](WSBufferPriority p) {
+    for (auto q : kPhase45Order)
+      if (p == q)
+        return true;
+    return false;
+  };
+
+  LDBG("Phase 4.5: enter \u2014 numBuffers=" << numBuffers
+                                        << " smemBudget=" << smemBudget
+                                        << " totalBuffers=" << wsBuffers.size()
+                                        << " currentTotalSmem="
+                                        << computeTotalSmem(wsBuffers));
+
+  // Collect eligible groups by bufferId and remember each group's priority.
   DenseMap<unsigned, SmallVector<unsigned>> epilogueGroups;
+  DenseMap<unsigned, WSBufferPriority> groupPriority;
+  unsigned skippedPinned = 0, skippedPriority = 0;
   for (unsigned i = 0; i < wsBuffers.size(); ++i) {
     auto &buf = wsBuffers[i];
-    if (buf.isPinned || buf.priority != WSBufferPriority::P2_Other)
+    if (buf.isPinned) {
+      ++skippedPinned;
+      LDBG("Phase 4.5: skip WSBuffer["
+           << i << "] bufferId=" << buf.bufferId
+           << " \u2014 isPinned (copies=" << buf.numCopies
+           << ", tmaStaging=" << buf.tmaStaging << ")");
       continue;
+    }
+    if (!isEligible(buf.priority)) {
+      ++skippedPriority;
+      LDBG("Phase 4.5: skip WSBuffer["
+           << i << "] bufferId=" << buf.bufferId << " \u2014 priority="
+           << static_cast<int>(buf.priority) << " (not eligible)"
+           << " copies=" << buf.numCopies
+           << " tmaStaging=" << buf.tmaStaging);
+      continue;
+    }
     epilogueGroups[buf.bufferId].push_back(i);
+    groupPriority[buf.bufferId] = buf.priority;
   }
 
-  for (auto &[bufferId, indices] : epilogueGroups) {
-    if (indices.size() < 2)
-      continue;
+  LDBG("Phase 4.5: collected " << epilogueGroups.size()
+                               << " eligible groups (skippedPinned="
+                               << skippedPinned << " skippedPriority="
+                               << skippedPriority << ")");
 
-    // Determine current copies (should be uniform within a fused group).
-    unsigned currentCopies = wsBuffers[indices[0]].numCopies;
+  // Walk tiers in priority order, and within each tier sort by bufferId for
+  // determinism (DenseMap iteration is otherwise non-deterministic).
+  for (auto pri : kPhase45Order) {
+    SmallVector<unsigned> ids;
+    for (auto &kv : epilogueGroups)
+      if (groupPriority.lookup(kv.first) == pri)
+        ids.push_back(kv.first);
+    llvm::sort(ids);
+    LDBG("Phase 4.5: tier=P" << static_cast<int>(pri) << " groups=" << ids.size());
 
-    // Respect the enforced cross-stage floor from Phase 2 (the real stage
-    // span, not a hardcoded 2).
-    unsigned minCopies = currentCopies;
-    for (unsigned idx : indices)
-      minCopies = std::max(minCopies, wsBuffers[idx].minCopies);
-    if (minCopies > currentCopies)
-      currentCopies = minCopies;
-
-    // Iteratively increase numCopies up to numBuffers.
-    unsigned tryCopies = currentCopies + 1;
-    while (tryCopies <= numBuffers) {
-      // Tentatively set all buffers in the group.
-      SmallVector<unsigned> saved;
-      for (unsigned idx : indices)
-        saved.push_back(wsBuffers[idx].numCopies);
-
-      for (unsigned idx : indices)
-        wsBuffers[idx].numCopies = tryCopies;
-
-      unsigned totalSmem = computeTotalSmem(wsBuffers);
-      if (totalSmem <= smemBudget) {
-        LDBG("Phase 4.5: epilogue group bufferId="
-             << bufferId << " copies=" << tryCopies
-             << " totalSmem=" << totalSmem << " ≤ " << smemBudget);
-        tryCopies++;
-      } else {
-        // Revert and stop.
-        for (unsigned k = 0; k < indices.size(); ++k)
-          wsBuffers[indices[k]].numCopies = saved[k];
-        LDBG("Phase 4.5: epilogue group bufferId="
-             << bufferId << " copies=" << tryCopies << " totalSmem="
-             << totalSmem << " > " << smemBudget << " — budget exhausted");
-        break;
+    for (unsigned bufferId : ids) {
+      auto &indices = epilogueGroups[bufferId];
+      if (indices.size() < 2) {
+        LDBG("Phase 4.5: bufferId=" << bufferId << " \u2014 only "
+                                    << indices.size()
+                                    << " buffer(s) in group, skipping");
+        continue;
       }
+
+      unsigned currentCopies = wsBuffers[indices[0]].numCopies;
+      unsigned firstSize = wsBuffers[indices[0]].sizeBytes;
+      unsigned firstTmaStaging = wsBuffers[indices[0]].tmaStaging;
+
+      // Respect the enforced cross-stage floor from Phase 2 (the real stage
+      // span via WSBuffer::minCopies, not a hardcoded 2). Phase 4.5 copy
+      // bumps must never undercut this floor.
+      unsigned minCopies = currentCopies;
+      bool anyCrossStage = false;
+      for (unsigned idx : indices) {
+        if (wsBuffers[idx].isCrossStage)
+          anyCrossStage = true;
+        minCopies = std::max(minCopies, wsBuffers[idx].minCopies);
+      }
+      if (minCopies > currentCopies)
+        currentCopies = minCopies;
+
+      LDBG("Phase 4.5:   bufferId="
+           << bufferId << " priority=P" << static_cast<int>(pri)
+           << " groupSize=" << indices.size() << " perAllocSize=" << firstSize
+           << " tmaStaging=" << firstTmaStaging
+           << " currentCopies=" << currentCopies
+           << " anyCrossStage=" << anyCrossStage
+           << " \u2014 will try bumping to numBuffers=" << numBuffers);
+
+      if (currentCopies >= numBuffers) {
+        LDBG("Phase 4.5:   bufferId="
+             << bufferId << " currentCopies=" << currentCopies
+             << " already >= numBuffers=" << numBuffers
+             << " \u2014 no room to bump");
+        continue;
+      }
+
+      unsigned tryCopies = currentCopies + 1;
+      while (tryCopies <= numBuffers) {
+        SmallVector<unsigned> saved;
+        for (unsigned idx : indices)
+          saved.push_back(wsBuffers[idx].numCopies);
+
+        for (unsigned idx : indices)
+          wsBuffers[idx].numCopies = tryCopies;
+
+        unsigned totalSmem = computeTotalSmem(wsBuffers);
+        if (totalSmem <= smemBudget) {
+          LDBG("Phase 4.5:     bufferId="
+               << bufferId << " copies=" << tryCopies
+               << " totalSmem=" << totalSmem << " \u2264 " << smemBudget
+               << " \u2014 kept");
+          tryCopies++;
+        } else {
+          for (unsigned k = 0; k < indices.size(); ++k)
+            wsBuffers[indices[k]].numCopies = saved[k];
+          LDBG("Phase 4.5:     bufferId="
+               << bufferId << " copies=" << tryCopies << " totalSmem="
+               << totalSmem << " > " << smemBudget
+               << " \u2014 budget exhausted, reverted to copies=" << saved[0]);
+          break;
+        }
+      }
+
+      LDBG("Phase 4.5:   bufferId=" << bufferId << " final copies="
+                                    << wsBuffers[indices[0]].numCopies);
     }
   }
+
+  LDBG("Phase 4.5: exit \u2014 finalTotalSmem=" << computeTotalSmem(wsBuffers));
 }
 
 /// Get the maximum linearized order among a buffer's consumers via its channel.
@@ -1596,7 +1732,7 @@ static unsigned allocateSmemBuffers(
     buf.isCrossStage = isSmemCrossStage(alloc, channels);
     buf.bufferId = nextBufferId++;
     buf.numCopies = 1;
-    buf.priority = WSBufferPriority::P2_Other;
+    buf.priority = WSBufferPriority::P4_Other;
     buf.isAllocated = true; // default: every buffer gets dedicated SMEM
 
     // Check for annotation-based pre-assignment.
@@ -1694,15 +1830,25 @@ static unsigned allocateSmemBuffers(
   }
 
   // ── Phase 3: Classify and prioritize ────────────────────────────────
+  // TMA staging buffers (buf.tmaStaging > 0) behave like rotating epilogue
+  // slots regardless of innermost-ness: their `numCopies` controls pipeline
+  // overlap between successive store / reduce iterations rather than channel
+  // depth. They are split into inner vs outer tiers so Phase 4.5 can bump the
+  // inner-loop ones first — those pay the per-iteration cost and have the
+  // higher payoff from one more rotating slot.
   for (auto &buf : wsBuffers) {
     if (buf.isPinned)
       continue;
-    if (buf.isInnermost && buf.isTMA) {
+    if (buf.tmaStaging > 0) {
+      buf.priority = buf.isInnermost
+                         ? WSBufferPriority::P2_InnerTMAStaging
+                         : WSBufferPriority::P3_OuterTMAStaging;
+    } else if (buf.isInnermost && buf.isTMA) {
       buf.priority = WSBufferPriority::P0_InnermostTMA;
     } else if (buf.isInnermost) {
       buf.priority = WSBufferPriority::P1_InnermostNonTMA;
     } else {
-      buf.priority = WSBufferPriority::P2_Other;
+      buf.priority = WSBufferPriority::P4_Other;
     }
     LDBG("Phase 3: WSBuffer["
          << buf.bufferId << "] priority=" << static_cast<int>(buf.priority)
@@ -1712,7 +1858,7 @@ static unsigned allocateSmemBuffers(
     LLVM_DEBUG(buf.allocOp->dump());
   }
 
-  // ── Phase 3.5: Merge P2_Other buffers from the same original load ───
+  // ── Phase 3.5: Merge P4_Other buffers from the same original load ───
   // Epilogue buffers (e.g., from splitting a tmem_load result into sub-tiles
   // stored to separate SMEM buffers) have disjoint liveness and can share
   // the same buffer.id to reduce SMEM usage before the copy increase pass.
@@ -1783,6 +1929,7 @@ static unsigned allocateSmemBuffers(
                                           claimedTargets);
         if (target) {
           buf.isAllocated = false;
+          buf.reuseTargetBufferId = target->bufferId;
           LDBG("Phase 3.6: WSBuffer[" << idx << "] (" << buf.sizeBytes
                                       << "B) reuses WSBuffer["
                                       << target->bufferId << "]");
@@ -1997,7 +2144,7 @@ static unsigned allocateSmemBuffers(
 
   LDBG("Phase 4 complete: totalSmem=" << computeTotalSmem(wsBuffers));
 
-  // ── Phase 4.5: Iterative copy increase for fused P2_Other groups ────
+  // ── Phase 4.5: Iterative copy increase for fused eligible groups ────
   increaseFusedEpilogueCopies(wsBuffers, numBuffers, smemBudget);
 
   LDBG("Phase 4.5 complete: totalSmem=" << computeTotalSmem(wsBuffers));
@@ -2011,6 +2158,21 @@ static unsigned allocateSmemBuffers(
     if (!buf.isAllocated) {
       buf.allocOp->setAttr("allocation.shareGroup",
                            IntegerAttr::get(i32Type, buf.bufferId));
+      buf.allocOp->setAttr("allocation.reuseTarget",
+                           IntegerAttr::get(i32Type, buf.reuseTargetBufferId));
+      // Find the target buffer's name for the remark.
+      std::string targetName;
+      for (auto &other : wsBuffers) {
+        if ((int)other.bufferId == buf.reuseTargetBufferId) {
+          targetName = getLocName(other.allocOp);
+          break;
+        }
+      }
+      std::string bufName = getLocName(buf.allocOp);
+      auto diag = buf.allocOp->emitRemark()
+          << "SMEM buffer \"" << bufName << "\" (buffer.id=" << buf.bufferId
+          << ", " << buf.sizeBytes << "B) reuses \""
+          << targetName << "\" (buffer.id=" << buf.reuseTargetBufferId << ")";
     }
     if (buf.tmaStaging > 0) {
       buf.allocOp->setAttr("buffer.tmaStaging",
