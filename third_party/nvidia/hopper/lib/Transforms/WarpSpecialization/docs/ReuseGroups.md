@@ -19,7 +19,7 @@ the `WSCodePartition.cpp` / `CodePartitionUtility.cpp` comments:
 | **A2** | 2-buffer real reuse | TMEM/SMEM | exactly 2 single-copy channels with **overlapping** reuse AND a consumer→producer dependency chain — TMEM (overlapping columns **and** chain) or SMEM (chain) | `verifyReuseGroup2` |
 | **A3** | N-buffer SMEM epilogue | SMEM | ≥2 single-copy channels sharing one circular buffer, stored/loaded sequentially, all producers in one block (epilogue subtiling) | `verifyReuseGroupN` + inline chain |
 | **A4** | TMEM column packing | TMEM | same `buffer.id`, **disjoint** columns (`buffer.offset`) — spatial packing, no cross-channel sync; materialized by `replaceBufferReuse`'s column slice | none (`tmemReuseGroupOverlaps` false) |
-| **A5** | Cross-partition reuse | TMEM | single-copy ≥3-channel group: a 2-channel **core** plus **extras** that elide via same-partition ordering | `verifyReuseGroupCrossPartition` |
+| **A5** | Cross-partition reuse | TMEM | single-copy ≥3-channel group whose producers span >1 partition AND admit a unique **dependency-chain** order; synced like A2 on the chain **endpoints** | `verifyReuseGroupCrossPartition` |
 | **A6** | Whole-allocation-overwrite hub | TMEM | a `useC=false` owner overwrites the **whole** allocation, clobbering spatially-packed (distinct-`buffer.offset`) siblings; emits back-edges to those siblings | `isWholeAllocationOverwriteReuseOwner` |
 
 A1 uses temporal slot staggering (multi-buffered). A2/A3/A5/A6 are single-copy
@@ -555,6 +555,109 @@ Regression test:
 `test/Hopper/WarpSpecialization/ws_code_partition_tmem_packed_reuse_backward.mlir`;
 runtime validation is the FA-fwd-persistent dp kernel determinism check.
 
+### A6 applies only to spatial packing (distinct `buffer.offset`)
+
+The N>2 dispatch checks the A6 hub case **first**, but only when the group is
+**spatial packing** — its channels occupy **≥2 distinct `buffer.offset`s** within
+the owner's columns (e.g. alpha/m_ij/l_i0 at offsets 64/65/66 inside the QK
+accumulator). A group whose channels **all share the same offset** is
+**full-overlap temporal reuse**, not packing, and must NOT enter A6 even though
+its `useC=false` owner satisfies `isWholeAllocationOverwriteReuseOwner`: the hub
+back-edges assume packed siblings live in *different* columns, so applying them to
+a full-overlap group emits **incorrect** synchronization.
+
+Realized case: FA-bwd `{dpT, dq, dsT}` (`buffer.id=5`, all at offset 0). Routed
+to A6 it mis-synchronizes the `dq` overwrite against `dk`'s read of `dsT` →
+wrong `dq` (this is exactly the [BwdTmemReuseSlotHazard](BwdTmemReuseSlotHazard.md)
+class, re-exposed when Nick's A6 landed in `origin/main`). Excluded from A6, the
+group relies on its standard per-channel barriers plus the kernel's dk-before-dq
+ordering, which is correct.
+
+The gate (`WSCodePartition.cpp`, N>2 dispatch): A6 fires only when an
+`isWholeAllocationOverwriteReuseOwner` is present **and** the group spans ≥2
+distinct `buffer.offset`s (`isSpatialPacking`). Note the discriminators that do
+**not** work here: column-range overlap (`tmemReuseGroupOverlaps`) is true for
+both shapes (the owner spans the packed siblings' columns either way), and
+block-based `verifyReuseGroupCrossPartition` is unusable at this stage because
+partitions are still `async_task_id` tags within a single block.
+
+## A5: Cross-Partition Reuse (N ≥ 3, realized as TMEM)
+
+A fifth shape that does **not** fit A1–A4: a single-copy reuse group of **≥ 3
+channels** sharing one **overlapping** buffer, whose producers span **more than
+one partition/block**. It is distinct from every other category:
+
+| | A5 group `{dpT, dq, dsT}` |
+|---|---|
+| A1 SMEM circular | ✗ single-copy, not multi-buffered |
+| A2 2-buffer (`verifyReuseGroup2`) | ✗ 3 channels, not 2 |
+| A3 SMEM epilogue (`verifyReuseGroupN`) | ✗ TMEM, and producers not all same block |
+| A4 TMEM column packing | ✗ columns **overlap** (temporal reuse, not disjoint) |
+
+**Realized case** — FA-bwd config `_BWD_DOT_ATTRS_TMEM`
+(`fused_attention_ws_device_tma.py`): three dots share one TMEM `buffer.id`
+(`dpT.opndD`, `dq.opndD`, `dk.opndA = dsT`). The distinguishing annotation vs
+the default is `dk: "opndA,tmem,1,5"` — `dk` reads `dsT` from the same TMEM
+buffer that `dpT`/`dq` write. The group is formed **by annotation**
+(`FrozenDotAttrs` channel specs pre-assign the shared `buffer.id`), not by the
+overlap/liveness heuristics.
+
+### Predicate
+
+`verifyReuseGroupCrossPartition` (`CodePartitionUtility.cpp`) accepts the group
+iff:
+
+1. **≥ 3 channels**, all **single-copy** (`getNumBuffers() == 1`).
+2. Producers span **> 1 partition** (`relation.first` — the producer
+   `async_task_id`). This is detected by task id, **not** block: at
+   `doCodePartition` the partitions are still `async_task_id` tags within one
+   block, so a block-based test would always see "one block".
+3. The channels admit a **unique total dependency-chain order** —
+   `orderReuseGroupChain(group)` returns a non-empty ordering (channel `i`'s
+   consumer reaches channel `i+1`'s producer via SSA use-def or same-block
+   program order). For `{dpT, dsT, dq}` this is `dpT → dsT → dq`.
+
+If no unique chain order exists the predicate returns false and the group falls
+back to the per-channel barriers.
+
+### Synchronization
+
+Handled inline in `insertAsyncComm` (its own `verifyReuseGroupCrossPartition`
+branch, **decoupled** from the A3 same-block chain — it pushes nothing onto
+`wrapAroundChannelsForReuseSync`). The chain `dpT → dsT → dq` is ordered by
+**inherent edges**, so the shared slot is used strictly in order within a tile,
+and only the cross-iteration WAR needs an explicit barrier:
+
+- **dpT → dsT** is a data dependency (`dsT` is computed from `dpT` in the
+  computation partition), so `dsT`'s write follows `dpT`'s read for free.
+- **dsT → dq** is gemm-partition program order within the same SWP stage (the
+  `dk` MMA reads `dsT` before the `dq` MMA overwrites the slot; consecutive
+  tcgen05 MMAs execute in issue order), so `dq`'s write follows `dsT`'s read for
+  free. (This is why `dk` must be emitted before `dq` — see the accuracy fix.)
+- **cross-iteration WAR** (the only explicit edge): the next tile's first write
+  (`dpT`) must wait for the previous tile's last read (`dq`). Emitted exactly
+  like the 2-buffer **A2** case applied to the chain **endpoints** — early =
+  first (`dpT`), late = last (`dq`): the late channel's `producer_acquire` is
+  relocated ahead of the early channel's producer so the shared slot's empty
+  barrier (flipped by `dq`'s consumer release) gates the `dpT` overwrite, plus an
+  intra-iteration wait of the late writer on the early reader (subsumed by
+  program order; kept for parity with A2).
+
+Because each channel still gets **its own per-channel barrier** and `dsT`'s
+consumer (`dk` MMA) lives in a *different task* than the representative's
+consumer, `createTokenPost` allocates a **dedicated gen5 consumer barrier** for
+that consumer task — otherwise `dsT`'s consumer-release silently drops and `dk`
+deadlocks (the `BwdTmemDotAttrsDeadlock` fix).
+
+### Status / caveats
+
+- A5 enters via the `group->channels.size() > 2` clause of the dispatch gate;
+  `verifyReuseGroupCrossPartition` validates treatability and is checked **before**
+  the A3 `allSameBlock` chain so the cross-partition group does not fall into A3.
+- For the **contract** (bail on unhandled reuse), a size-> 2 group is "handled"
+  iff `verifyReuseGroupN(group) || verifyReuseGroupCrossPartition(group)`; any
+  other size-> 2 group should bail.
+
 ## Key Attributes
 
 | Attribute | Description | Set by | Read by |
@@ -590,3 +693,5 @@ runtime validation is the FA-fwd-persistent dp kernel determinism check.
 | `verifyReuseGroupN` | `CodePartitionUtility.cpp` | **Live** gate for the SMEM epilogue path: SMEM, single-copy, producers same block, N ≥ 2 |
 | N-buffer sync (epilogue) | `WSCodePartition.cpp` (`insertAsyncComm`) | Inline chain + wrap-around `ProducerAcquireOp` insertion |
 | `orderReuseGroupN` | `CodePartitionUtility.cpp` | Producer-order sort helper — **still unused** (inline does its own sort) |
+| `verifyReuseGroupCrossPartition` | `CodePartitionUtility.cpp` | A5 predicate: cross-partition N≥3 reuse (producers span >1 task) with a unique dependency-chain order (FA-bwd `{dpT,dsT,dq}`) |
+| `orderReuseGroupChain` | `CodePartitionUtility.cpp` | Topologically orders an N-channel single-copy reuse group into one dependency chain (`dpT→dsT→dq`); empty if no unique order |
