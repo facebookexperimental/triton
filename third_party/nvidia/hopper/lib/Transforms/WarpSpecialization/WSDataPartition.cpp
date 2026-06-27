@@ -8,6 +8,8 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
+#include <optional>
+
 using namespace mlir::triton;
 using namespace mlir::triton::gpu;
 namespace ttng = mlir::triton::nvidia_gpu;
@@ -265,6 +267,70 @@ static bool needToSlice(Value v, unsigned dim, int size) {
   return shape.size() > dim && shape[dim] > size;
 }
 
+static bool isDotOrMMAv5Op(Operation *op) {
+  return isa<nvidia_gpu::WarpGroupDotOp, ttng::MMAv5OpInterface>(op);
+}
+
+static Value getDotOperandA(Operation *op) {
+  if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(op))
+    return dotOp.getA();
+  if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(op))
+    return mmaOp.getA();
+  llvm_unreachable("expected dot or MMAv5 op");
+}
+
+static Value getDotOperandB(Operation *op) {
+  if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(op))
+    return dotOp.getB();
+  if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(op))
+    return mmaOp.getB();
+  llvm_unreachable("expected dot or MMAv5 op");
+}
+
+static Value getDotAccumulatorInput(Operation *op) {
+  if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(op))
+    return dotOp.getC();
+  if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(op))
+    return mmaOp.getAccumulator();
+  llvm_unreachable("expected dot or MMAv5 op");
+}
+
+static Value getDotPartitionRoot(Operation *op) {
+  if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(op))
+    return dotOp.getD();
+  if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(op))
+    return mmaOp.getAccumulator();
+  llvm_unreachable("expected dot or MMAv5 op");
+}
+
+static Value getMMAv5ScaleOperand(Operation *op, unsigned operandIdx) {
+  auto scaledMmaOp = dyn_cast<ttng::TCGen5MMAScaledOp>(op);
+  if (!scaledMmaOp)
+    return {};
+  assert((operandIdx == 0 || operandIdx == 1) && "unexpected MMA operand");
+  return operandIdx == 0 ? scaledMmaOp.getAScale() : scaledMmaOp.getBScale();
+}
+
+static std::optional<unsigned>
+getTmemCopySrcPartitionDim(ttng::TMEMCopyOp copyOp, unsigned dstDim) {
+  if (dstDim == DataPartitionScheme::noOpPartitionDim)
+    return dstDim;
+
+  auto dstTy = copyOp.getDst().getType();
+  if (!isa<nvidia_gpu::TensorMemoryScalesEncodingAttr>(dstTy.getEncoding()))
+    return dstDim;
+
+  // Scale TMEM copy sources encode logical rows as packed 32x128b chunks.
+  // The common forms put repRows in dim 0; the 5D TMA form uses dim 1.
+  if (dstDim != 0)
+    return std::nullopt;
+  auto srcShape = copyOp.getSrc().getType().getShape();
+  if (srcShape.size() == 5 && srcShape[0] == 1 && srcShape[3] == 2 &&
+      srcShape[4] == 256)
+    return 1;
+  return 0;
+}
+
 // Duplicate the op for different partition dims.
 static bool rematerializeOp(Operation *op, DataPartitionScheme &partitionScheme,
                             unsigned currentDim) {
@@ -380,14 +446,45 @@ static bool getBackwardSliceToPartition(Value v,
                                        remappedDim)) {
         return false;
       }
+    } else if (auto tmemAllocOp = dyn_cast<nvidia_gpu::TMEMAllocOp>(op)) {
+      for (Value operand : op->getOperands()) {
+        if (!getBackwardSliceToPartition(operand, partitionScheme,
+                                         currentDim)) {
+          return false;
+        }
+      }
+      for (Operation *user : tmemAllocOp.getResult().getUsers()) {
+        auto copyOp = dyn_cast<ttng::TMEMCopyOp>(user);
+        if (!copyOp || copyOp.getDst() != tmemAllocOp.getResult())
+          continue;
+        if (!partitionScheme.ops.insert(copyOp)) {
+          if (!isControlFlowOp(copyOp) &&
+              partitionScheme.opPartitionDims[copyOp] != currentDim) {
+            return false;
+          }
+          continue;
+        }
+        partitionScheme.opPartitionDims[copyOp] = currentDim;
+        auto srcDim = getTmemCopySrcPartitionDim(copyOp, currentDim);
+        if (!srcDim)
+          return false;
+        if (!getBackwardSliceToPartition(copyOp.getSrc(), partitionScheme,
+                                         *srcDim))
+          return false;
+        if (auto barrier = copyOp.getBarrier()) {
+          if (!getBackwardSliceToPartition(
+                  barrier, partitionScheme,
+                  DataPartitionScheme::noOpPartitionDim))
+            return false;
+        }
+      }
     } else if (op->hasTrait<OpTrait::Elementwise>() ||
                isa<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
                    arith::ExtFOp, BroadcastOp, ExpandDimsOp, MakeRangeOp,
                    SplatOp, ConvertLayoutOp, triton::gpu::LocalAllocOp, LoadOp,
                    TransOp, MemDescTransOp, AtomicRMWOp, triton::AddPtrOp,
-                   nvidia_gpu::TMEMAllocOp, nvidia_gpu::TMEMLoadOp,
-                   nvidia_gpu::TMEMStoreOp, FpToFpOp, SplitOp, JoinOp,
-                   ReshapeOp, MapElementwiseOp>(op)) {
+                   nvidia_gpu::TMEMLoadOp, nvidia_gpu::TMEMStoreOp, FpToFpOp,
+                   SplitOp, JoinOp, ReshapeOp, MapElementwiseOp>(op)) {
       for (Value operand : op->getOperands())
         if (!getBackwardSliceToPartition(operand, partitionScheme,
                                          currentDim)) {
@@ -402,17 +499,40 @@ static bool getBackwardSliceToPartition(Value v,
                                        currentDim))
         return false;
       partitionScheme.dotPartitionOperand[dotOp] = currentDim == 0 ? 0 : 1;
-    } else if (auto dotOp = dyn_cast<nvidia_gpu::TCGen5MMAOp>(op)) {
-      if (!getBackwardSliceToPartition(currentDim == 0 ? dotOp.getA()
-                                                       : dotOp.getB(),
-                                       partitionScheme, currentDim)) {
+    } else if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(op)) {
+      unsigned operandIdx = currentDim == 0 ? 0 : 1;
+      Value operand = operandIdx == 0 ? mmaOp.getA() : mmaOp.getB();
+      if (!getBackwardSliceToPartition(operand, partitionScheme, currentDim)) {
         return false;
       }
-      if (!getBackwardSliceToPartition(dotOp.getD(), partitionScheme,
+      if (!getBackwardSliceToPartition(mmaOp.getAccumulator(), partitionScheme,
                                        currentDim)) {
         return false;
       }
-      partitionScheme.dotPartitionOperand[dotOp] = currentDim == 0 ? 0 : 1;
+      if (Value scale = getMMAv5ScaleOperand(op, operandIdx)) {
+        // TODO: Add correctness coverage for this scale slicing path. PTX scale
+        // layouts are logical (M-or-N, K/scale_vec), so output M/N
+        // partitioning slices the selected scale operand along logical dim 0.
+        if (!getBackwardSliceToPartition(scale, partitionScheme,
+                                         /*currentDim=*/0))
+          return false;
+      }
+      partitionScheme.dotPartitionOperand[mmaOp] = operandIdx;
+    } else if (auto tmemCopyOp = dyn_cast<ttng::TMEMCopyOp>(op)) {
+      auto srcDim = getTmemCopySrcPartitionDim(tmemCopyOp, currentDim);
+      if (!srcDim)
+        return false;
+      if (!getBackwardSliceToPartition(tmemCopyOp.getSrc(), partitionScheme,
+                                       *srcDim))
+        return false;
+      if (!getBackwardSliceToPartition(tmemCopyOp.getDst(), partitionScheme,
+                                       currentDim))
+        return false;
+      if (auto barrier = tmemCopyOp.getBarrier()) {
+        if (!getBackwardSliceToPartition(barrier, partitionScheme,
+                                         DataPartitionScheme::noOpPartitionDim))
+          return false;
+      }
     } else if (isa<ttng::ReinterpretTensorDescOp, MakeTensorDescOp>(op)) {
       return true;
     } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
@@ -562,27 +682,32 @@ static bool getForwardSliceToPartition(Value v,
       return forwardSlice.empty();
     };
 
-    if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(depOp)) {
-      if ((currentDim == 0 && v == dotOp.getB()) ||
-          (currentDim == 1 && v == dotOp.getA())) {
+    if (isDotOrMMAv5Op(depOp)) {
+      Value opndA = getDotOperandA(depOp);
+      Value opndB = getDotOperandB(depOp);
+      if ((currentDim == 0 && v == opndB) || (currentDim == 1 && v == opndA)) {
         // It is fine to continue the partition if the dot output is immediately
         // stored out via an atomic add, as the dot computes a partial result.
-        if (onlyUsedByAtomicStore(dotOp.getD())) {
-          partitionScheme.dotPartitionOperand[dotOp] =
-              v == dotOp.getA() ? 0 : 1;
+        if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(depOp);
+            dotOp && onlyUsedByAtomicStore(dotOp.getD())) {
+          partitionScheme.dotPartitionOperand[depOp] = v == opndA ? 0 : 1;
           // Duplicate the users of the dot output since the shape of the output
           // will not be changed
           currentDim = DataPartitionScheme::noOpPartitionDim;
         } else {
           LLVM_DEBUG({
-            auto opnd = (v == dotOp.getA()) ? "A" : "B";
+            auto opnd = (v == opndA) ? "A" : "B";
             LDBG("skip partitioning along K of " << opnd << " of dot\n");
-            dotOp.dump();
+            depOp->dump();
           });
           return false;
         }
+      } else if (v == opndA || v == getMMAv5ScaleOperand(depOp, 0)) {
+        partitionScheme.dotPartitionOperand[depOp] = 0;
+      } else if (v == opndB || v == getMMAv5ScaleOperand(depOp, 1)) {
+        partitionScheme.dotPartitionOperand[depOp] = 1;
       } else {
-        partitionScheme.dotPartitionOperand[dotOp] = currentDim == 0 ? 0 : 1;
+        partitionScheme.dotPartitionOperand[depOp] = currentDim == 0 ? 0 : 1;
       }
     }
 
@@ -653,17 +778,12 @@ static bool getSliceToPartition(Value root,
                                          currentDim))
           return false;
       }
-    } else if (isa<nvidia_gpu::WarpGroupDotOp, nvidia_gpu::TCGen5MMAOp>(op)) {
+    } else if (isDotOrMMAv5Op(op)) {
       unsigned opndIndx = partitionScheme.dotPartitionOperand[op];
       if (!getBackwardSliceToPartition(op->getOperand(opndIndx),
                                        partitionScheme, currentDim))
         return false;
-      Value accumulator;
-      if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(op)) {
-        accumulator = dotOp.getC();
-      } else if (auto dotOp = dyn_cast<nvidia_gpu::TCGen5MMAOp>(op)) {
-        accumulator = dotOp.getD();
-      }
+      Value accumulator = getDotAccumulatorInput(op);
 
       if (currentDim == 0 && opndIndx == 0 ||
           currentDim == 1 && opndIndx == 1) {
@@ -671,12 +791,22 @@ static bool getSliceToPartition(Value root,
         if (!getBackwardSliceToPartition(accumulator, partitionScheme,
                                          currentDim))
           return false;
+        if (Value scale = getMMAv5ScaleOperand(op, opndIndx)) {
+          if (!getBackwardSliceToPartition(scale, partitionScheme,
+                                           /*currentDim=*/0))
+            return false;
+        }
       } else {
         // slice the other operand
         unsigned otherOpndIndx = 1 - opndIndx;
         if (!getBackwardSliceToPartition(op->getOperand(otherOpndIndx),
                                          partitionScheme, 1 - currentDim))
           return false;
+        if (Value scale = getMMAv5ScaleOperand(op, otherOpndIndx)) {
+          if (!getBackwardSliceToPartition(scale, partitionScheme,
+                                           /*currentDim=*/0))
+            return false;
+        }
         // Hanlde accumulator
         if (!getBackwardSliceToPartition(accumulator, partitionScheme,
                                          DataPartitionScheme::noOpPartitionDim))
@@ -697,7 +827,7 @@ static bool computePartitionScheme(triton::FuncOp &funcOp,
   // Prefer dots that span multiple async task IDs, but preserve explicit data
   // partitioning for IR that does not have multi-task dot annotations.
   funcOp.walk([&](Operation *op) {
-    if (!isa<nvidia_gpu::WarpGroupDotOp, nvidia_gpu::TCGen5MMAOp>(op))
+    if (!isDotOrMMAv5Op(op))
       return;
     if (getAsyncTaskIds(op).size() > 1)
       dots.insert(op);
@@ -719,17 +849,7 @@ static bool computePartitionScheme(triton::FuncOp &funcOp,
     }
 
     // partition along M first, otherwise along N
-    Value opndA, opndB, accumulator;
-
-    if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(op)) {
-      opndA = dotOp.getA();
-      opndB = dotOp.getB();
-      accumulator = dotOp.getD();
-    } else if (auto dotOp = dyn_cast<nvidia_gpu::TCGen5MMAOp>(op)) {
-      opndA = dotOp.getA();
-      opndB = dotOp.getB();
-      accumulator = dotOp.getD();
-    }
+    Value accumulator = getDotPartitionRoot(op);
 
     auto dotType = accumulator.getType();
     LLVM_DEBUG({
@@ -879,7 +999,7 @@ static void rewriteRematerializedOps(triton::FuncOp &funcOp,
         } else if (auto memDescTransOp = dyn_cast<MemDescTransOp>(user)) {
           userDim = partitionScheme.flipPartitionDim(
               userDim, memDescTransOp.getOrder(), true);
-        } else if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(user)) {
+        } else if (isDotOrMMAv5Op(user)) {
           // infer userDim for dot
           assert(partitionScheme.dotPartitionOperand.contains(user) &&
                  "no operand info");
@@ -958,7 +1078,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
       if (dim == DataPartitionScheme::noOpPartitionDim) {
         // Just duplicate the op for noOpPartitionDim
         needRetype = false;
-      } else if (isa<nvidia_gpu::WarpGroupDotOp, nvidia_gpu::TCGen5MMAOp>(op)) {
+      } else if (isDotOrMMAv5Op(op)) {
         assert(partitionScheme.dotPartitionOperand.contains(op) &&
                "no operand info");
         unsigned opndIndx = partitionScheme.dotPartitionOperand[op];
@@ -1132,6 +1252,14 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
       mappings.map(tmemStOp.getSrc(), cvtOp->getResult(0));
     }
     newOp = cloneAndSetResultType(op);
+  } else if (auto tmemCopyOp = dyn_cast<nvidia_gpu::TMEMCopyOp>(op)) {
+    sliceOp(tmemCopyOp.getDst(), offset, mappings, reverseMappings,
+            partitionScheme);
+    sliceOp(tmemCopyOp.getSrc(), offset, mappings, reverseMappings,
+            partitionScheme);
+    if (auto barrier = tmemCopyOp.getBarrier())
+      sliceOp(barrier, offset, mappings, reverseMappings, partitionScheme);
+    newOp = cloneAndSetResultType(op);
   } else if (auto tmemAllocOp = dyn_cast<nvidia_gpu::TMEMAllocOp>(op)) {
     for (Value operand : op->getOperands())
       sliceOp(operand, offset, mappings, reverseMappings, partitionScheme);
@@ -1295,33 +1423,36 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     newV.setType(newType);
     mappings.map(v, newV);
     reverseMappings.map(newV, v);
-  } else if (isa<nvidia_gpu::WarpGroupDotOp, nvidia_gpu::TCGen5MMAOp>(op)) {
+  } else if (isDotOrMMAv5Op(op)) {
     assert(partitionScheme.dotPartitionOperand.contains(op) &&
            "no operand info");
     unsigned opndIndx = partitionScheme.dotPartitionOperand[op];
     LDBG("slicing operand " << opndIndx << "\n");
     sliceOp(op->getOperand(opndIndx), offset, mappings, reverseMappings,
             partitionScheme);
+    if (Value scale = getMMAv5ScaleOperand(op, opndIndx)) {
+      LDBG("slicing scale operand " << opndIndx << "\n");
+      sliceOp(scale, offset, mappings, reverseMappings, partitionScheme);
+    }
     if (dim == 0 && opndIndx == 1 || dim == 1 && opndIndx == 0) {
       // slice the other operand
       unsigned otherOpndIndx = 1 - opndIndx;
       LDBG("slicing operand " << otherOpndIndx << "\n");
       sliceOp(op->getOperand(otherOpndIndx), offset, mappings, reverseMappings,
               partitionScheme);
+      if (Value scale = getMMAv5ScaleOperand(op, otherOpndIndx)) {
+        LDBG("slicing scale operand " << otherOpndIndx << "\n");
+        sliceOp(scale, offset, mappings, reverseMappings, partitionScheme);
+      }
     }
     // Handle accumulator
-    Value accumulator;
-    if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(op)) {
-      accumulator = dotOp.getC();
-    } else if (auto dotOp = dyn_cast<nvidia_gpu::TCGen5MMAOp>(op)) {
-      accumulator = dotOp.getD();
-    }
+    Value accumulator = getDotAccumulatorInput(op);
     LDBG("slicing accumulator\n");
     sliceOp(accumulator, offset, mappings, reverseMappings, partitionScheme);
 
     // Handle token
-    if (auto dotOp = dyn_cast<nvidia_gpu::TCGen5MMAOp>(op)) {
-      if (auto token = dotOp.getAccDep()) {
+    if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(op)) {
+      if (auto token = mmaOp.getAccDep()) {
         LDBG("slicing token \n");
         sliceOp(token, offset, mappings, reverseMappings, partitionScheme);
       }
