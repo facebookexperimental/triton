@@ -91,7 +91,18 @@ TMemAllocation getTmemAllocSizes(MemDescType memDescType) {
 }
 
 uint32_t getTMemSubSliceOffset(MemDescType memDescType, int32_t nOffset) {
-  auto llInv = toLinearLayout(memDescType).pseudoinvert();
+  // The offset is computed in the *allocation*'s layout (the parent tile the
+  // subslice indexes into), so use getAllocShape() rather than the (possibly
+  // smaller) view shape. Strip multibuffering by taking only the trailing two
+  // dims: the column offset lives within a single 2D tile and the buffer index
+  // is carried by the base pointer. Without dropping the leading dim, a
+  // multibuffered (rank-3) memdesc trips the shape.size() == 2 assert in
+  // tensorMemoryToLinearLayout. (Equivalent to the original
+  // toLinearLayout(memDescType), which used
+  // getAllocShape().take_back(getRank()), except it keeps the inner 2 dims
+  // instead of all getRank() dims.)
+  auto shape = memDescType.getAllocShape().take_back(2);
+  auto llInv = toLinearLayout(shape, memDescType.getEncoding()).pseudoinvert();
   auto dimNames = llvm::to_vector(llInv.getInDimNames());
   SmallVector<std::pair<StringAttr, int32_t>> logicalOffsets;
   logicalOffsets.reserve(dimNames.size());
