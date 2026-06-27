@@ -19,9 +19,10 @@ and consumption are driven purely by environment variables, with no code change:
     TRITON_COMPILE_IQ_COLLECT=1 COMPILE_IQ_TASK_DIR=/tmp/ciq_tasks \
         python third_party/compile_iq/examples/blackwell_gemm_ws_sample.py
 
-    # ...run the factory on the one task it produced, then consume:
+    # ...run the factory on the one task it produced, then consume (the stored ACF is applied
+    # in-memory at load -- no TRITON_ALWAYS_COMPILE needed, even on a warm compile cache):
     TRITON_COMPILE_IQ_APPLY=1 COMPILE_IQ_STORE=/tmp/ciq_store \
-    TRITON_COMPILE_IQ_DEBUG=1 TRITON_ALWAYS_COMPILE=1 \
+    TRITON_COMPILE_IQ_DEBUG=1 \
         python third_party/compile_iq/examples/blackwell_gemm_ws_sample.py
 
 denoise.sh notes: its clock/power lock (`sudo nvidia-smi -lgc/-pm/--power-limit`) and
