@@ -123,7 +123,7 @@ static inline triton_cuLaunchKernelEx_fn triton_get_launch_kernel_ex(void) {
  * runtime, so a stale ctypes mirror (launch_desc.py) or generated launcher is
  * caught instead of silently corrupting kernel args.
  */
-#define TRITON_LAUNCH_DESC_ABI_VERSION 1
+#define TRITON_LAUNCH_DESC_ABI_VERSION 2
 
 /* static_assert spelling differs between C11 and C++; provide one name. */
 #if defined(__cplusplus)
@@ -180,6 +180,12 @@ typedef struct {
   int launch_pdl;
   int launch_cooperative_grid;
   int launch_cluster;
+  /* Explicit multi-dimensional cluster (the ctas_per_cga path): when num_ctas
+   * == 1 and any entry is > 1, these become
+   * CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION. All entries <= 1 means "no explicit
+   * cluster" -- the 1-D num_ctas path runs instead. (num_ctas takes priority,
+   * so the two are never both applied.) */
+  int cluster_dims[3];
   int preferred_cluster_dims[3];
 
   int num_params;
@@ -201,7 +207,7 @@ TRITON_STATIC_ASSERT(sizeof(triton_param_desc_t) == 3 * sizeof(int),
 TRITON_STATIC_ASSERT(sizeof(triton_tma_recipe_t) == 23 * sizeof(int),
                      "triton_tma_recipe_t layout drift");
 TRITON_STATIC_ASSERT(sizeof(triton_kernel_launch_desc_t) ==
-                         11 * sizeof(int) +
+                         14 * sizeof(int) +
                              TRITON_MAX_PARAMS * sizeof(triton_param_desc_t) +
                              sizeof(int) +
                              TRITON_MAX_TMA_DESCS * sizeof(triton_tma_recipe_t),
@@ -352,12 +358,23 @@ triton_launch_kernel(const uint32_t grid[3], CUstream stream,
     num_attrs++;
   }
 
-  if (desc->launch_cluster || desc->num_ctas > 1) {
+  int has_multidim_cluster =
+      (desc->cluster_dims[0] > 1 || desc->cluster_dims[1] > 1 ||
+       desc->cluster_dims[2] > 1);
+  if (desc->launch_cluster || desc->num_ctas > 1 || has_multidim_cluster) {
     if (desc->num_ctas > 1) {
+      /* 1-D cluster: num_ctas CTAs along x. */
       attrs[num_attrs].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
       attrs[num_attrs].value.clusterDim.x = (unsigned)desc->num_ctas;
       attrs[num_attrs].value.clusterDim.y = 1;
       attrs[num_attrs].value.clusterDim.z = 1;
+      num_attrs++;
+    } else if (has_multidim_cluster) {
+      /* Explicit multi-dimensional cluster (ctas_per_cga). */
+      attrs[num_attrs].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+      attrs[num_attrs].value.clusterDim.x = (unsigned)desc->cluster_dims[0];
+      attrs[num_attrs].value.clusterDim.y = (unsigned)desc->cluster_dims[1];
+      attrs[num_attrs].value.clusterDim.z = (unsigned)desc->cluster_dims[2];
       num_attrs++;
     }
     attrs[num_attrs].id =

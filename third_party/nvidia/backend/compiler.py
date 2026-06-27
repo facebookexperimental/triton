@@ -554,6 +554,7 @@ class CUDABackend(BaseBackend):
         lines.append(f"        .launch_pdl = {launch_pdl},")
         lines.append(f"        .launch_cooperative_grid = {launch_coop},")
         lines.append(f"        .launch_cluster = {launch_cluster_flag},")
+        lines.append(f"        .cluster_dims = {{{cluster_dims[0]}, {cluster_dims[1]}, {cluster_dims[2]}}},")
         lines.append(f"        .preferred_cluster_dims = {{{preferred[0]}, {preferred[1]}, {preferred[2]}}},")
         lines.append(f"        .num_params = {num_params},")
         lines.append("        .params = {")
