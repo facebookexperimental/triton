@@ -1016,7 +1016,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
             else:
                 if knobs.nvidia.use_triton_dispatcher and _disp is None:
                     warnings.warn(
-                        f"[Triton] TRITON_USE_TRITON_DISPATCHER=1 but kernel '{self._fn_name}' has no C dispatcher, "
+                        f"[Triton] TRITON_USE_C_DISPATCHER=1 but kernel '{self._fn_name}' has no C dispatcher, "
                         f"falling back to Python launch",
                         stacklevel=2,
                     )

@@ -757,7 +757,7 @@ class CompiledKernel:
 
         if knobs.nvidia.use_triton_dispatcher and dispatcher is None:
             warnings.warn(
-                f"[Triton] TRITON_USE_TRITON_DISPATCHER=1 but CompiledKernel '{self.name}' has no C dispatcher, "
+                f"[Triton] TRITON_USE_C_DISPATCHER=1 but CompiledKernel '{self.name}' has no C dispatcher, "
                 f"falling back to Python runner",
                 stacklevel=2,
             )
