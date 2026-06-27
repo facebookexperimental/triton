@@ -337,6 +337,12 @@ void fuseTcgen05CommitBarriers(triton::FuncOp &funcOp);
 void doTMAStoreLowering(triton::FuncOp &funcOp);
 bool appearsBefore(Operation *A, Operation *B);
 
+// Verify that an A1 (SMEM circular reuse) group is well-formed:
+// - Multi-buffered (channels[0]->getNumBuffers() > 1).
+// - Every producer/consumer of every channel lives in one common basic block.
+// Returns true if valid, false otherwise.
+bool verifyReuseGroup1(ReuseGroup *group);
+
 // Verify that a 2-buffer reuse group is well-formed:
 // - Exactly 2 channels, each with a single copy (getNumBuffers() == 1).
 // - A dependency chain exists from one channel's consumer to the other's
@@ -349,6 +355,16 @@ bool verifyReuseGroup2(ReuseGroup *group);
 // chain from A's consumer to B's producer (A.consumer -> ... -> B.producer).
 // Returns {earlyChannel, lateChannel}.
 std::pair<Channel *, Channel *> orderReuseGroup2(ReuseGroup *group);
+
+// Verify that a reuse group with N channels (N >= 2) is well-formed:
+// - At least 2 channels, each with a single copy (getNumBuffers() == 1).
+// - All producers are in the same block (so program order gives a total order).
+bool verifyReuseGroupN(ReuseGroup *group);
+
+// For a verified N-channel reuse group, order channels by program order of
+// their producer ops (getSrcOp()). Returns a sorted vector where channels[0]
+// is earliest and channels[N-1] is latest in program order.
+SmallVector<Channel *> orderReuseGroupN(ReuseGroup *group);
 
 // Given ordered channels {early, late} in a reuse group, determine
 // whether we need to explicitly move late's producer_acquire to before early's
