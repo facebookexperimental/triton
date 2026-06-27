@@ -468,6 +468,9 @@ class CUDABackend(BaseBackend):
 
         # ---- Args struct ----
         lines.append("typedef struct {")
+        if not args:
+            # Zero-arg kernel: empty struct is a GCC extension, not valid C.
+            lines.append("    char _unused;")
         for arg in args:
             c_ty = _c_type(arg["type"])
             if c_ty is None:
@@ -476,6 +479,44 @@ class CUDABackend(BaseBackend):
             lines.append(f"    {c_ty} {arg['name']};")
         lines.append(f"}} {safe_name}_args_t;")
         lines.append("")
+
+        # ---- Buffer type: args + scratch, used for offsetof in the descriptor.
+        # Natural (non-packed) alignment: each kernel param pointer (built from
+        # offsetof below) lands on a correctly-aligned, correctly-sized value.
+        # The C compiler — not Python — owns the args-buffer layout.
+        buf_t = f"{safe_name}_buf_t"
+        lines.append("typedef struct {")
+        lines.append(f"    {safe_name}_args_t k;")
+        lines.append("    CUdeviceptr _global_scratch;")
+        lines.append("    CUdeviceptr _profile_scratch;")
+        lines.append(f"}} {buf_t};")
+        lines.append("")
+
+        # Helper: offsetof expression for a field inside buf_t.k
+        def _off(field):
+            return f"(int)offsetof({buf_t}, k.{field})"
+
+        # Build param descriptors. offsetof gives the offset and sizeof gives
+        # the size, so the C compiler owns the layout end to end -- no Python
+        # type->size table that could silently disagree with the real ABI for an
+        # unmapped C type.
+        param_entries = []
+        for arg in args:
+            c_ty = _c_type(arg["type"])
+            param_entries.append((_off(arg["name"]), f"(int)sizeof({c_ty})", 0))
+        # Scratch params (device pointers).
+        param_entries.append((f"(int)offsetof({buf_t}, _global_scratch)", "(int)sizeof(CUdeviceptr)", 0))
+        param_entries.append((f"(int)offsetof({buf_t}, _profile_scratch)", "(int)sizeof(CUdeviceptr)", 0))
+        num_params = len(param_entries)
+        # Mirror the fixed cap in launch.h: triton_kernel_launch_desc_t.params is
+        # a triton_param_desc_t[TRITON_MAX_PARAMS] array, so a descriptor with
+        # more entries would overflow the static initializer. Bail out (the
+        # consumer falls back to the variadic launcher) instead of emitting C
+        # that overflows or silently truncates.
+        TRITON_MAX_PARAMS = 256  # keep in sync with launch.h
+        if num_params > TRITON_MAX_PARAMS:
+            return (f"/* Launcher not generated: {num_params} params exceeds "
+                    f"TRITON_MAX_PARAMS ({TRITON_MAX_PARAMS}) */\n")
 
         # ---- Launch function ----
         lines.append("/**")
@@ -491,58 +532,45 @@ class CUDABackend(BaseBackend):
             lines.append(f" *   profile_scratch_size={profile_scratch_size}")
         lines.append(" */")
 
+        # ---- Launch wrapper (descriptor is function-local to avoid name collisions
+        # when TritonCC puts multiple specs in the same .cpp) ----
         lines.append(f"CUresult triton_launch_{safe_name}(")
         lines.append("    const uint32_t grid[3],")
         lines.append("    CUstream stream,")
         lines.append("    CUfunction function,")
         lines.append(f"    {safe_name}_args_t *args,")
-        # Always include scratch params for stable ABI across all kernels.
-        # Callers pass 0/NULL when the kernel doesn't use scratch buffers.
         lines.append("    CUdeviceptr global_scratch,")
         lines.append("    CUdeviceptr profile_scratch")
         lines.append(") {")
-
-        # Null checks
         lines.append("    if (!args) return CUDA_ERROR_INVALID_VALUE;")
-        lines.append("    if (!function) return CUDA_ERROR_INVALID_HANDLE;")
         lines.append("")
 
-        # Build params array
-        param_names = [f"args->{arg['name']}" for arg in args]
-        param_names.append("global_scratch")
-        param_names.append("profile_scratch")
-
-        lines.append("    /* Kernel parameter pointers */")
-        for i, pname in enumerate(param_names):
-            lines.append(f"    void *_param{i} = (void *)&{pname};")
-        lines.append("    void *params[] = {")
-        for i in range(len(param_names)):
-            comma = "," if i < len(param_names) - 1 else ""
-            lines.append(f"        _param{i}{comma}")
+        # Static const descriptor inside function body
+        lines.append("    static const triton_kernel_launch_desc_t desc = {")
+        lines.append("        .abi_version = TRITON_LAUNCH_DESC_ABI_VERSION,")
+        lines.append(f"        .num_warps = {num_warps},")
+        lines.append(f"        .num_ctas = {num_ctas},")
+        lines.append(f"        .shared_mem = {shared_mem}u,")
+        lines.append(f"        .launch_pdl = {launch_pdl},")
+        lines.append(f"        .launch_cooperative_grid = {launch_coop},")
+        lines.append(f"        .launch_cluster = {launch_cluster_flag},")
+        lines.append(f"        .preferred_cluster_dims = {{{preferred[0]}, {preferred[1]}, {preferred[2]}}},")
+        lines.append(f"        .num_params = {num_params},")
+        lines.append("        .params = {")
+        for off_expr, sz, is_tma in param_entries:
+            lines.append(f"            {{{off_expr}, {sz}, {is_tma}}},")
+        lines.append("        },")
+        lines.append("        .num_tma_recipes = 0,")
+        lines.append("        /* tma_recipes zero-initialized by C default */")
         lines.append("    };")
         lines.append("")
-
-        # Build launch attributes (compile-time constants)
-        lines.append("    /* Launch attributes (compile-time constants) */")
-        lines.append("    CUlaunchAttribute attrs[TRITON_MAX_LAUNCH_ATTRS];")
-        lines.append("    unsigned num_attrs = triton_build_launch_attrs(")
-        lines.append("        attrs,")
-        lines.append(f"        /*launch_pdl=*/{launch_pdl},")
-        lines.append(f"        /*launch_cooperative_grid=*/{launch_coop},")
-        lines.append(f"        /*num_ctas=*/{num_ctas},")
-        lines.append(f"        /*launch_cluster=*/{launch_cluster_flag},")
-        lines.append(f"        /*preferred_cluster_dim_x=*/{preferred[0]},")
-        lines.append(f"        /*preferred_cluster_dim_y=*/{preferred[1]},")
-        lines.append(f"        /*preferred_cluster_dim_z=*/{preferred[2]}")
-        lines.append("    );")
+        lines.append("    /* Pack args + scratch into one buffer; launcher reads by offset. */")
+        lines.append(f"    {buf_t} buf;")
+        lines.append("    buf.k = *args;")
+        lines.append("    buf._global_scratch = global_scratch;")
+        lines.append("    buf._profile_scratch = profile_scratch;")
         lines.append("")
-
-        # Call triton_launch_kernel
-        lines.append("    return triton_launch_kernel(")
-        lines.append(f"        grid, /*num_warps=*/{num_warps}, /*num_ctas=*/{num_ctas},")
-        lines.append(f"        /*shared_mem=*/{shared_mem}u, stream, function,")
-        lines.append("        params, attrs, num_attrs")
-        lines.append("    );")
+        lines.append("    return triton_launch_kernel(grid, stream, function, &buf, &desc);")
         lines.append("}")
 
         return "\n".join(lines) + "\n"

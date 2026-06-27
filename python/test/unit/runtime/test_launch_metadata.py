@@ -17,8 +17,14 @@ from triton.backends.nvidia.driver import (
     expand_signature,
     make_kernel_signature,
 )
+from triton._internal_testing import is_cuda
 from triton.compiler.compiler import ASTSource, compile as triton_compile, make_backend
 from triton.knobs import HookChain
+
+# These tests validate NVIDIA-specific launch metadata and the CUDA C
+# `launcher_src` (CUresult/CUdeviceptr/cuda.h/launch.h). The HIP backend has no
+# make_launcher_src, so skip the whole module on non-CUDA targets.
+pytestmark = pytest.mark.skipif(not is_cuda(), reason="NVIDIA launch metadata / launcher_src is CUDA-only")
 
 
 @triton.jit
@@ -305,8 +311,10 @@ def test_launcher_src_bakes_constants():
     )
     src = compiled.asm["launcher_src"]
     md = compiled.metadata
-    assert f"/*num_warps=*/{md.num_warps}" in src
-    assert f"/*shared_mem=*/{md.shared}u" in src
+    assert f".num_warps = {md.num_warps}," in src
+    assert f".shared_mem = {md.shared}u," in src
+    # Param offsets use offsetof (C compiler owns layout, not Python).
+    assert "offsetof(" in src
 
 
 def test_launcher_src_has_abi_version_comment():
@@ -318,6 +326,94 @@ def test_launcher_src_has_abi_version_comment():
     )
     src = compiled.asm["launcher_src"]
     assert "ABI version: 1" in src
+
+
+def test_launcher_src_compiles_with_gcc():
+    """Generated C should compile with the system C compiler (validates struct
+    layout, offsetof usage, and launch.h compatibility)."""
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+    import triton.backends.nvidia
+
+    @triton.jit
+    def _gcc_test_add(X, Y, OUT, N, BLOCK: tl.constexpr):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < N
+        tl.store(OUT + offs, tl.load(X + offs, mask=mask) + tl.load(Y + offs, mask=mask), mask=mask)
+
+    # Force a fresh triton compilation cache so we always run make_launcher_src
+    # (the disk cache keys on source hash + options, not compiler.py version).
+    with tempfile.TemporaryDirectory() as fresh_cache:
+        prev_cache = os.environ.get("TRITON_CACHE_DIR")
+        os.environ["TRITON_CACHE_DIR"] = fresh_cache
+        try:
+            compiled = _compile_kernel(
+                _gcc_test_add,
+                signature={"X": "*fp32", "Y": "*fp32", "OUT": "*fp32", "N": "i32"},
+                constexprs={"BLOCK": 1024},
+            )
+        finally:
+            if prev_cache is None:
+                os.environ.pop("TRITON_CACHE_DIR", None)
+            else:
+                os.environ["TRITON_CACHE_DIR"] = prev_cache
+
+    src = compiled.asm.get("launcher_src")
+    if not src:
+        # Diagnostic: understand WHY launcher_src is missing on this environment
+        target = triton.runtime.driver.active.get_current_target()
+        from triton.compiler.compiler import make_backend
+        backend = make_backend(target)
+        diag = (f"launcher_src not in asm. Diagnostics:\n"
+                f"  target: {target}\n"
+                f"  backend type: {type(backend).__name__}\n"
+                f"  has make_launcher_src: {hasattr(backend, 'make_launcher_src')}\n"
+                f"  asm keys: {sorted(compiled.asm.keys())}\n"
+                f"  TRITON_CACHE_DIR: {os.environ.get('TRITON_CACHE_DIR', '<not set>')}")
+        pytest.fail(diag)
+
+    # Find launch.h: try the canonical source location, then the packaged one.
+    backend_dir = os.path.dirname(os.path.realpath(triton.backends.nvidia.__file__))
+    candidates = [
+        os.path.join(backend_dir, "launch.h"),
+        os.path.join(backend_dir, "..", "..", "..", "python", "triton", "runtime", "launch.h"),
+    ]
+    launch_h = next((p for p in candidates if os.path.exists(p)), None)
+    if launch_h is None:
+        pytest.skip("launch.h not found for compile test")
+
+    # Find a C compiler
+    cc = shutil.which("gcc") or shutil.which("clang") or shutil.which("cc")
+    if cc is None:
+        pytest.skip("No C compiler available")
+
+    # Find cuda.h include dir
+    cuda_include = os.path.join(backend_dir, "include")
+    if not os.path.exists(os.path.join(cuda_include, "cuda.h")):
+        pytest.skip("cuda.h not found")
+
+    with tempfile.NamedTemporaryFile(suffix=".c", mode="w", delete=False) as f:
+        # Inline launch.h into the source (same as the JIT runtime compile does
+        # via driver.py) so we only need -I for cuda.h — avoids fragile
+        # triton_include path resolution in buck link-tree environments.
+        from pathlib import Path
+        launch_h_content = Path(launch_h).read_text()
+        test_src = src.replace('#include "triton/runtime/launch.h"', launch_h_content)
+        f.write(test_src)
+        f.flush()
+        try:
+            result = subprocess.run(
+                [cc, "-fsyntax-only", "-c", f.name, f"-I{cuda_include}"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            assert result.returncode == 0, (f"Generated launcher_src failed to compile:\n"
+                                            f"stdout: {result.stdout}\nstderr: {result.stderr}")
+        finally:
+            os.unlink(f.name)
 
 
 # =============================================================================
