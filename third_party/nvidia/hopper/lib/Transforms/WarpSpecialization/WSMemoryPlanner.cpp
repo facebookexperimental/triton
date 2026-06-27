@@ -1281,12 +1281,23 @@ static unsigned computeTotalSmem(const SmallVector<WSBuffer> &wsBuffers) {
 static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
                                   SmallVector<Channel *> &channels) {
   DenseMap<Operation *, SmallVector<unsigned>> loadGroups;
-  // TMA staging buffers: group per descriptor so dk slices share one id,
-  // dv slices share another, dq reduce slices share a third, etc.
-  DenseMap<Value, SmallVector<unsigned>> tmaStagingGroups;
+  // TMA staging buffers: group per (descriptor, original load) so dk slices
+  // share one id, dv slices another, dq reduce slices a third, etc. The
+  // original-load component (the source tmem_load / accumulator, reached via
+  // findOriginalLoadForChannel — the same discriminator the loadGroups path
+  // below uses) keeps the two data partitions of a data-partitioned epilogue
+  // separate: both store to the SAME descriptor but trace back to different
+  // accumulators, so they must NOT share one physical staging buffer (doing so
+  // makes the two concurrent partitions alias one slot/barrier -> corrupt
+  // output + deadlock). When the load can't be traced (origLoad == null), the
+  // key degenerates to the descriptor alone, preserving the prior behavior
+  // (e.g. FA backward, where each descriptor already has a single source).
+  DenseMap<std::pair<Value, Operation *>, SmallVector<unsigned>>
+      tmaStagingGroups;
   for (unsigned i = 0; i < wsBuffers.size(); ++i) {
     auto &buf = wsBuffers[i];
-    // TMA staging buffers: group per descriptor regardless of priority.
+    // TMA staging buffers: group per (descriptor, original load) regardless of
+    // priority.
     if (buf.tmaStaging > 0) {
       Value desc;
       for (auto user : buf.allocOp->getUsers()) {
@@ -1299,8 +1310,11 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
           break;
         }
       }
-      if (desc)
-        tmaStagingGroups[desc].push_back(i);
+      if (desc) {
+        Operation *origLoad =
+            findOriginalLoadForChannel(findChannelForOp(buf.allocOp, channels));
+        tmaStagingGroups[{desc, origLoad}].push_back(i);
+      }
       continue;
     }
     if (buf.priority != WSBufferPriority::P2_Other)
@@ -1333,8 +1347,8 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
   for (auto &[origLoad, indices] : loadGroups)
     mergeGroup(indices, "epilogue fusion");
 
-  for (auto &[desc, indices] : tmaStagingGroups)
-    mergeGroup(indices, "TMA staging per-descriptor fusion");
+  for (auto &[key, indices] : tmaStagingGroups)
+    mergeGroup(indices, "TMA staging per-(descriptor,load) fusion");
 }
 
 /// Phase 4.5: Iterative copy increase for fused P2_Other groups.

@@ -199,6 +199,27 @@ the now-dead per-tile buffer positions are removed (`removePerTilePosition`) —
 Non-reuse / single-copy (`numBuffers == 1`) / non-subtiled cases fall back to a
 shared `addSharedArg` barrier index/phase.
 
+#### Channel topologies: inside→outside vs both-endpoints-subtiled
+
+An epilogue SMEM channel whose producer is inside a `ttng.subtiled_region` has
+two consumer shapes:
+
+- **Inside→outside** (`separate_epilogue_store=True`, the producer subtiled but
+  each subtile's consumer a *flat* op outside): represented as `numTiles` sibling
+  `ChannelPost`s sharing one in-body template producer and one reuse-group token;
+  the producer-side acquire/commit is emitted by exactly one sibling
+  (`emittedSubtiledProducerTokens`). See bug #10 in the partition-scheduler rules.
+- **Both-endpoints-subtiled** (producer subtiled AND consumer subtiled, in
+  *different* async tasks — the `DATA_PARTITION_FACTOR=2` epilogue): the
+  `numTiles` per-tile allocs of one (producer region, consumer region) pair are
+  **collapsed** into a single `ChannelPost` in `collectPostChannels`
+  (`getSubtiledChannelEndpoints` resolves the two regions; the dedup key is the
+  region pair, gated on the regions being in different tasks). The collapsed
+  channel is the sole member of a degenerate size-1 subtiled reuse group (see
+  [Reuse Groups](ReuseGroups.md)), so the in-body slot math above is unchanged.
+  Per-data-partition separation of the shared physical staging buffer is done in
+  the memory planner (cross-partition staging split). See bug #11.
+
 Before `doTokenLowering` runs, all SubtiledRegionOps containing NVWS ops
 are inlined via `lowerSubtiledRegion`. This puts the NVWS ops in flat IR
 where `doTokenLowering` processes them normally — replacing them with
@@ -216,6 +237,9 @@ hardware `WaitBarrierOp`/`ArriveBarrierOp`.
 | `test/TritonNvidiaGPU/invalid.mlir` | Verifier error cases |
 | `test/Hopper/WarpSpecialization/ws_token_lowering_subtiled_region.mlir` | Token lowering with SubtiledRegionOps inside warp_specialize |
 | `test/Hopper/WarpSpecialization/ws_code_partition_subtiled_region.mlir` | Code partition with SMEM channels between SubtiledRegionOps |
+| `test/Hopper/WarpSpecialization/ws_code_partition_subtiled_region_inbody.mlir` | Both-endpoints-subtiled in-body SMEM rotation (DP=1) |
+| `test/Hopper/WarpSpecialization/ws_subtiled_region_inside_outside.mlir` | Asymmetric inside→outside (flat consumer) channel |
+| `test/Hopper/WarpSpecialization/ws_subtiled_region_dp2_both_subtiled.mlir` | Both-endpoints-subtiled DP=2: cross-partition staging split + channel collapse |
 | `python/test/unit/language/test_tutorial09_warp_specialization.py` | Blackwell GEMM e2e (parametrized with `generate_subtiled_region`) |
 | `python/test/unit/language/test_autows_addmm.py` | Addmm e2e (parametrized with `generate_subtiled_region`) |
 | `test_subtile_gemm.py` | Standalone addmm + subtile e2e |

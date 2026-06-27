@@ -4958,6 +4958,15 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
       assert(false);
   }
   for (auto kv : bufferIdToChannels) {
+    // A collapsed both-endpoints-subtiled channel is the sole channel under its
+    // buffer.id (its numTiles per-tile allocs were folded into one ChannelPost
+    // in collectPostChannels), but it still needs the reuse-group machinery:
+    // the in-body per-tile slot rotation (getOrComputeSubtiledSlot fires only
+    // for reuseGrp >= 0) and the numTiles loop-counter stride
+    // (getReuseGroupStride). Form a degenerate size-1 group for it.
+    bool size1Subtiled = kv.second.size() == 1 &&
+                         channelIsSubtiled(kv.second[0]) &&
+                         kv.second[0]->getNumBuffers() > 1;
     if (kv.second.size() > 1) {
       // If all channels reference the same alloc op, they are lifecycle
       // phases of one buffer, not distinct buffers reusing memory.
@@ -4976,23 +4985,26 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
       });
       if (allSameAlloc)
         continue;
-
-      ReuseGroup group;
-      // make sure the channel without buffer.offset is the first one (i.e the
-      // representative channel)
-      std::vector<Channel *> ordered(kv.second);
-      std::stable_partition(ordered.begin(), ordered.end(), [](Channel *ch) {
-        auto bufferOffset =
-            ch->getAllocOp()->getAttrOfType<IntegerAttr>("buffer.offset");
-        if (bufferOffset)
-          return false;
-        return true;
-      });
-      group.channels = ordered;
-      LDBG("ReuseGroup with size " << kv.second.size() << " buffer.id "
-                                   << kv.first << "\n");
-      config.groups.push_back(group);
+    } else if (!size1Subtiled) {
+      continue;
     }
+
+    ReuseGroup group;
+    // make sure the channel without buffer.offset is the first one (i.e the
+    // representative channel)
+    std::vector<Channel *> ordered(kv.second);
+    std::stable_partition(ordered.begin(), ordered.end(), [](Channel *ch) {
+      auto bufferOffset =
+          ch->getAllocOp()->getAttrOfType<IntegerAttr>("buffer.offset");
+      if (bufferOffset)
+        return false;
+      return true;
+    });
+    group.channels = ordered;
+    LDBG("ReuseGroup with size "
+         << kv.second.size() << " buffer.id " << kv.first
+         << (size1Subtiled ? " (subtiled)" : "") << "\n");
+    config.groups.push_back(group);
   }
   // Merge consumer groups for channels in the same reuse group.
   // All channels in a reuse group share a barrier, so they must be processed

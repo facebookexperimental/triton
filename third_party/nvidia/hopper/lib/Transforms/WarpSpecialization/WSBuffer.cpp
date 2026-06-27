@@ -792,7 +792,12 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
   }
   // Handle reuse groups.
   for (unsigned idx = 0; idx < config->getGroupSize(); ++idx) {
-    if (config->getGroup(idx)->channels.size() <= 1)
+    // A collapsed both-subtiled channel is the sole member of its group but
+    // still carries a shared accumCnt (numTiles stride); keep it. This must
+    // match getAccumCnts / getReuseChannels, which also special-case size-1
+    // subtiled groups, or the loop arg count and accumCnt indices disagree.
+    if (config->getGroup(idx)->channels.size() <= 1 &&
+        !channelIsSubtiled(config->getGroup(idx)->channels[0]))
       continue;
     if (config->getGroup(idx)->channels[0]->getNumBuffers() <= 1)
       continue;
