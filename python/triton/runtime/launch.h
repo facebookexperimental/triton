@@ -227,40 +227,212 @@ typedef CUresult (*triton_cuTensorMapEncodeTiled_fn)(
 
 static triton_cuTensorMapEncodeTiled_fn g_triton_tma_encode_fn = NULL;
 
+/* Shared libcuda handle for constructor-time symbol resolution. Intentionally
+ * never dlclose'd: the library stays mapped for the process lifetime (same
+ * pattern as triton_init_launch_kernel_ex above). */
+static void *g_triton_libcuda = NULL;
+
+/* Resolved CUDA driver version (e.g. 12080 for 12.8) for the small-tensor
+ * CUtensorMap workaround below. <= 0 if unavailable. Resolved by the
+ * constructor below, so triton_get_driver_version() is a plain read. */
+typedef CUresult (*triton_cuDriverGetVersion_fn)(int *);
+static int g_triton_driver_version = -1;
+
 /**
- * Initialize cuTensorMapEncodeTiled at program startup (same pattern as
- * triton_init_launch_kernel_ex). Thread-safe by running before main().
+ * Resolve cuTensorMapEncodeTiled + cuDriverGetVersion once at program startup.
+ *
+ * No synchronization or once-guard is needed: __attribute__((constructor))
+ * functions run before main(), sequentially and single-threaded, so these
+ * writes complete before any thread can call the getters, and after startup the
+ * globals are only ever read. The globals are also `static` (file-local), so
+ * each translation unit that includes this header gets its own private copy and
+ * its own constructor -- there is no shared state across TUs to race on.
+ * Multiple TUs simply repeat a refcounted, never-closed dlopen, which is
+ * harmless (libcuda stays mapped for the process lifetime).
  */
-__attribute__((constructor)) static void triton_init_tma_encode(void) {
-  void *lib = dlopen("libcuda.so.1", RTLD_LAZY);
-  if (!lib)
+__attribute__((constructor)) static void triton_init_cuda_symbols(void) {
+  g_triton_libcuda = dlopen("libcuda.so.1", RTLD_LAZY);
+  if (!g_triton_libcuda)
     return;
-  g_triton_tma_encode_fn =
-      (triton_cuTensorMapEncodeTiled_fn)dlsym(lib, "cuTensorMapEncodeTiled");
+  g_triton_tma_encode_fn = (triton_cuTensorMapEncodeTiled_fn)dlsym(
+      g_triton_libcuda, "cuTensorMapEncodeTiled");
+  triton_cuDriverGetVersion_fn ver_fn = (triton_cuDriverGetVersion_fn)dlsym(
+      g_triton_libcuda, "cuDriverGetVersion");
+  int v = 0;
+  if (ver_fn && ver_fn(&v) == CUDA_SUCCESS)
+    g_triton_driver_version = v;
 }
 
 static inline triton_cuTensorMapEncodeTiled_fn triton_get_tma_encode(void) {
   return g_triton_tma_encode_fn;
 }
 
+static inline int triton_get_driver_version(void) {
+  return g_triton_driver_version;
+}
+
 /**
  * Construct a single CUtensorMap from a TMA recipe and user args.
  *
- * STUB: only the shared-core skeleton (recipe struct + this launcher call site)
- * lands in this diff. The encoder body must match the proven JIT encoder
- * byte-for-byte (row-major -> column-major dim reversal, derived outermost
- * stride, L2_128B promotion, small-tensor driver workaround); that correct
- * implementation, with a byte-compare unit test, lands in a later diff. No
- * consumer emits TMA recipes until then (num_tma_recipes == 0), so this path is
- * never exercised in the meantime.
+ * Mirrors the proven JIT TMA encoder (driver.c td_extract_tensordesc /
+ * fill_tma_descriptor_tiled): shape/stride are read from args_buf in Triton
+ * row-major order, then reversed to column-major for cuTensorMapEncodeTiled;
+ * the outermost global stride is derived; L2 promotion is 128B; and the
+ * small-tensor CUtensorMap bit workaround is applied on driver <= 13010.
  */
 static inline CUresult
 triton_construct_tma_desc(CUtensorMap *desc, const triton_tma_recipe_t *recipe,
                           const void *args_buf) {
-  (void)desc;
-  (void)recipe;
-  (void)args_buf;
-  return CUDA_ERROR_NOT_SUPPORTED;
+
+  triton_cuTensorMapEncodeTiled_fn encode_fn = triton_get_tma_encode();
+  if (!encode_fn)
+    return CUDA_ERROR_NOT_FOUND;
+
+  int rank = recipe->ndim;
+  CUdeviceptr base_ptr;
+  memcpy(&base_ptr, (const char *)args_buf + recipe->ptr_offset,
+         sizeof(base_ptr));
+
+  /* Read per-dim shape and stride from args_buf in Triton (row-major) order. */
+  int64_t shp[TRITON_MAX_TMA_DIMS] = {0};
+  int64_t strd[TRITON_MAX_TMA_DIMS] = {0};
+  for (int j = 0; j < rank; j++) {
+    memcpy(&shp[j], (const char *)args_buf + recipe->shape_offsets[j],
+           sizeof(int64_t));
+    if (recipe->stride_offsets[j] >= 0)
+      memcpy(&strd[j], (const char *)args_buf + recipe->stride_offsets[j],
+             sizeof(int64_t));
+    else
+      strd[j] = 0;
+  }
+  if (recipe->fp4_padded && rank > 0)
+    shp[rank - 1] *= 2;
+
+  /* Reverse row-major -> column-major for cuTensorMapEncodeTiled. */
+  cuuint64_t global_dim[TRITON_MAX_TMA_DIMS] = {0};
+  cuuint64_t global_strides[TRITON_MAX_TMA_DIMS] = {0};
+  cuuint32_t box_dim[TRITON_MAX_TMA_DIMS] = {0};
+  cuuint32_t elem_strides[TRITON_MAX_TMA_DIMS] = {1, 1, 1, 1, 1};
+  for (int j = 0; j < rank; j++) {
+    box_dim[rank - 1 - j] = recipe->block_shape[j];
+    global_dim[rank - 1 - j] = (cuuint64_t)shp[j];
+  }
+  for (int j = 0; j + 1 < rank; j++)
+    global_strides[rank - 2 - j] =
+        (cuuint64_t)((int64_t)recipe->elem_size * strd[j]);
+  if (rank > 0)
+    global_strides[rank - 1] =
+        global_dim[rank - 1] *
+        (rank == 1 ? (cuuint64_t)recipe->elem_size : global_strides[rank - 2]);
+
+  CUtensorMapSwizzle swizzle_mode = (CUtensorMapSwizzle)recipe->swizzle;
+  CUtensorMapFloatOOBfill fill =
+      recipe->fill_mode ? CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA
+                        : CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE;
+
+  CUresult r =
+      encode_fn(desc, (CUtensorMapDataType)recipe->elem_type, (cuuint32_t)rank,
+                (void *)(uintptr_t)base_ptr, global_dim, global_strides,
+                box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                swizzle_mode, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, fill);
+  if (r != CUDA_SUCCESS)
+    return r;
+
+  /* Small-tensor CUtensorMap workaround for driver <= 13010 (mirrors the JIT
+   * dispatcher path): clear bit 21 of word 1 when the tensor fits in 128 KiB.
+   * Match the proven path's behavior: apply the workaround when the driver
+   * version is unknown (drv == -1) or known to be <= 13010. */
+  int drv = triton_get_driver_version();
+  if (drv <= 13010) {
+    int64_t max_byte_index = 0;
+    for (int j = 0; j < rank; j++) {
+      int64_t bytes_stride = (j == 0) ? (int64_t)recipe->elem_size
+                                      : (int64_t)global_strides[j - 1];
+      max_byte_index += ((int64_t)global_dim[j] - 1) * bytes_stride;
+    }
+    if (max_byte_index + 1 < 128 * 1024) {
+      uint64_t *desc_u64 = (uint64_t *)desc;
+      desc_u64[1] &= ~(1ull << 21);
+    }
+  }
+  return CUDA_SUCCESS;
+}
+
+/**
+ * Optional per-recipe TMA cache.
+ *
+ * Callers that relaunch the same kernel repeatedly (e.g. the JIT dispatcher)
+ * can pass one cache entry per TMA recipe plus stable CUtensorMap storage to
+ * triton_launch_kernel_cached(); the launcher then skips cuTensorMapEncodeTiled
+ * when a tensordesc's base ptr / shape / strides / fill mode are unchanged
+ * since the last launch. One entry per recipe; zero-initialize before first
+ * use.
+ *
+ * fill_mode is part of the key because callers (e.g. the dispatcher) may flip a
+ * recipe's padding mode between launches; a stale descriptor must not be
+ * reused.
+ */
+typedef struct {
+  int valid;
+  uint64_t ptr;
+  int64_t shape[TRITON_MAX_TMA_DIMS];
+  int64_t stride[TRITON_MAX_TMA_DIMS];
+  int fill_mode;
+} triton_tma_cache_entry_t;
+
+/**
+ * Like triton_construct_tma_desc, but skips re-encoding when the inputs match
+ * the cache. *desc must be stable storage that persists across calls (so a
+ * cached descriptor can be reused). If cache is NULL, always encodes.
+ */
+static inline CUresult triton_construct_tma_desc_cached(
+    CUtensorMap *desc, const triton_tma_recipe_t *recipe, const void *args_buf,
+    triton_tma_cache_entry_t *cache) {
+  if (!cache)
+    return triton_construct_tma_desc(desc, recipe, args_buf);
+
+  uint64_t cur_ptr = 0;
+  memcpy(&cur_ptr, (const char *)args_buf + recipe->ptr_offset,
+         sizeof(cur_ptr));
+  int64_t cur_shape[TRITON_MAX_TMA_DIMS] = {0};
+  int64_t cur_stride[TRITON_MAX_TMA_DIMS] = {0};
+  for (int d = 0; d < recipe->ndim; d++) {
+    memcpy(&cur_shape[d], (const char *)args_buf + recipe->shape_offsets[d],
+           sizeof(int64_t));
+    if (recipe->stride_offsets[d] >= 0)
+      memcpy(&cur_stride[d], (const char *)args_buf + recipe->stride_offsets[d],
+             sizeof(int64_t));
+    else
+      cur_stride[d] = -1; /* sentinel: contiguous dim (stride_offsets < 0).
+                           * Safe: stride_offsets is compile-time-static per
+                           * recipe, and real strides are always >= 0. */
+  }
+
+  if (cache->valid && cache->ptr == cur_ptr &&
+      cache->fill_mode == recipe->fill_mode) {
+    int same = 1;
+    for (int d = 0; d < recipe->ndim; d++) {
+      if (cache->shape[d] != cur_shape[d] ||
+          cache->stride[d] != cur_stride[d]) {
+        same = 0;
+        break;
+      }
+    }
+    if (same)
+      return CUDA_SUCCESS; /* reuse the previously-encoded *desc */
+  }
+
+  CUresult r = triton_construct_tma_desc(desc, recipe, args_buf);
+  if (r == CUDA_SUCCESS) {
+    cache->valid = 1;
+    cache->ptr = cur_ptr;
+    cache->fill_mode = recipe->fill_mode;
+    for (int d = 0; d < recipe->ndim; d++) {
+      cache->shape[d] = cur_shape[d];
+      cache->stride[d] = cur_stride[d];
+    }
+  }
+  return r;
 }
 
 /* -------------------------------------------------------------------------
@@ -268,23 +440,36 @@ triton_construct_tma_desc(CUtensorMap *desc, const triton_tma_recipe_t *recipe,
  * ------------------------------------------------------------------------- */
 
 /**
- * Launch a Triton kernel.  This is the ONLY launch entry point.
+ * Shared launch core (NVIDIA/CUDA only): constructs TMA descriptors, builds the
+ * params[] array and launch attributes, then issues cuLaunchKernelEx.
  *
- * All consumers (JIT variadic launcher, TritonCC, AOT-T) call this function.
- * It handles: TMA construction, params[] layout, launch attrs,
- * cuLaunchKernelEx.
+ * This is the internal implementation. Consumers (JIT variadic launcher,
+ * TritonCC, AOT-T) do not call it directly; they go through one of the two thin
+ * wrappers below:
+ *   - triton_launch_kernel()        stateless: TMA descriptors are rebuilt on
+ *                                   the stack every call (no cache).
+ *   - triton_launch_kernel_cached() reuses caller-owned TMA descriptor storage
+ *                                   and an optional per-recipe cache.
  *
  * @param grid       Grid dimensions [x, y, z]
  * @param stream     CUDA stream
  * @param function   CUDA function handle
  * @param args_buf   Flat buffer containing user args at known offsets
  * @param desc       Per-kernel static launch descriptor (compiler-generated)
+ * @param tma_descs  Storage for >= desc->num_tma_recipes CUtensorMap, filled
+ *                   here from desc->tma_recipes + args_buf and pointed at by
+ * the kernel's TMA params. Must be 64-byte aligned; unused when
+ *                   desc->num_tma_recipes == 0.
+ * @param tma_cache  Optional per-recipe cache (>= desc->num_tma_recipes
+ * entries, zero-initialized before first use) so a repeated launch can skip
+ * re-encoding an unchanged CUtensorMap. NULL disables caching (descriptors are
+ * rebuilt every call).
  * @return           CUDA_SUCCESS or error code
  */
-static inline CUresult
-triton_launch_kernel(const uint32_t grid[3], CUstream stream,
-                     CUfunction function, void *args_buf,
-                     const triton_kernel_launch_desc_t *desc) {
+static inline CUresult triton_launch_kernel_impl(
+    const uint32_t grid[3], CUstream stream, CUfunction function,
+    void *args_buf, const triton_kernel_launch_desc_t *desc,
+    CUtensorMap *tma_descs, triton_tma_cache_entry_t *tma_cache) {
 
   if (!function)
     return CUDA_ERROR_INVALID_HANDLE;
@@ -304,7 +489,8 @@ triton_launch_kernel(const uint32_t grid[3], CUstream stream,
   if (!launch_fn)
     return CUDA_ERROR_NOT_FOUND;
 
-  /* --- TMA: construct descriptors from recipes --- */
+  /* --- TMA: construct descriptors from recipes (cached if tma_cache != NULL)
+   */
   if (desc->num_tma_recipes > 0) {
     if (desc->num_tma_recipes > TRITON_MAX_TMA_DESCS) {
       fprintf(stderr,
@@ -321,10 +507,10 @@ triton_launch_kernel(const uint32_t grid[3], CUstream stream,
       return CUDA_ERROR_NOT_SUPPORTED;
     }
   }
-  __attribute__((aligned(64))) CUtensorMap tma_descs[TRITON_MAX_TMA_DESCS];
   for (int i = 0; i < desc->num_tma_recipes; i++) {
-    TRITON_CUDA_CHECK(triton_construct_tma_desc(
-        &tma_descs[i], &desc->tma_recipes[i], args_buf));
+    TRITON_CUDA_CHECK(triton_construct_tma_desc_cached(
+        &tma_descs[i], &desc->tma_recipes[i], args_buf,
+        tma_cache ? &tma_cache[i] : NULL));
   }
 
   /* --- Build kernel params[] array --- */
@@ -411,6 +597,33 @@ triton_launch_kernel(const uint32_t grid[3], CUstream stream,
   config.numAttrs = num_attrs;
 
   return launch_fn(&config, function, params, NULL);
+}
+
+static inline CUresult
+triton_launch_kernel(const uint32_t grid[3], CUstream stream,
+                     CUfunction function, void *args_buf,
+                     const triton_kernel_launch_desc_t *desc) {
+  /* Stateless path: TMA descriptors built on the stack each call, no cache. */
+  __attribute__((aligned(64))) CUtensorMap tma_descs[TRITON_MAX_TMA_DESCS];
+  return triton_launch_kernel_impl(grid, stream, function, args_buf, desc,
+                                   tma_descs, NULL);
+}
+
+/**
+ * Cached variant for callers that relaunch the same kernel repeatedly.
+ *
+ * @param tma_descs  Caller-owned stable storage of >= desc->num_tma_recipes
+ *                   CUtensorMap (persisted across calls so cached descriptors
+ *                   can be reused); should be 64-byte aligned.
+ * @param tma_cache  Caller-owned array of >= desc->num_tma_recipes cache
+ *                   entries, zero-initialized before first use. May be NULL.
+ */
+static inline CUresult triton_launch_kernel_cached(
+    const uint32_t grid[3], CUstream stream, CUfunction function,
+    void *args_buf, const triton_kernel_launch_desc_t *desc,
+    CUtensorMap *tma_descs, triton_tma_cache_entry_t *tma_cache) {
+  return triton_launch_kernel_impl(grid, stream, function, args_buf, desc,
+                                   tma_descs, tma_cache);
 }
 
 /* -------------------------------------------------------------------------
