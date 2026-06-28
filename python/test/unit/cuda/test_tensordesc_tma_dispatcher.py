@@ -3,7 +3,7 @@
 Verifies that kernels using TMA-path TensorDescriptors (nvTmaDesc) produce
 correct results when launched via:
   1. C fast cache (c_cache=True) — cache key correctly built
-  2. _TritonDispatcher (TRITON_USE_TRITON_DISPATCHER=1) — nvTmaDesc dispatched
+  2. _TritonDispatcher (TRITON_USE_C_DISPATCHER=1) — nvTmaDesc dispatched
   3. Repeated calls hit cache and still produce correct results
 """
 
@@ -50,7 +50,7 @@ class TestTmaTensorDescCorrectness(TestCase):
     """Verify TMA TensorDescriptor produces correct results via fast cache + dispatcher."""
 
     def setUp(self):
-        patcher = patch.dict(os.environ, {"TRITON_USE_TRITON_DISPATCHER": "1"})
+        patcher = patch.dict(os.environ, {"TRITON_USE_C_DISPATCHER": "1"})
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -176,7 +176,7 @@ class TestTmaCacheKeyDiscrimination(TestCase):
     """Verify the C fast cache correctly distinguishes TMA TensorDescriptor specializations."""
 
     def setUp(self):
-        patcher = patch.dict(os.environ, {"TRITON_USE_TRITON_DISPATCHER": "1"})
+        patcher = patch.dict(os.environ, {"TRITON_USE_C_DISPATCHER": "1"})
         patcher.start()
         self.addCleanup(patcher.stop)
 
