@@ -479,9 +479,7 @@ class CudaLauncher(object):
             if size > 0:
                 grid_size = gridX * gridY * gridZ
                 alloc_size = grid_size * self.num_ctas * size
-                return active_driver.allocate_default_profile_scratch(
-                    alloc_size, align, stream
-                )
+                return active_driver.allocate_default_profile_scratch(alloc_size, align, stream)
             return None
 
         global_scratch = allocate_scratch(self.global_scratch_size, self.global_scratch_align, _allocation._allocator)
@@ -492,9 +490,7 @@ class CudaLauncher(object):
                 _allocation._profile_allocator,
             )
         else:
-            profile_scratch = allocate_default_profile_scratch(
-                self.profile_scratch_size, self.profile_scratch_align
-            )
+            profile_scratch = allocate_default_profile_scratch(self.profile_scratch_size, self.profile_scratch_align)
 
         self.launch(
             gridX,
