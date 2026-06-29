@@ -1364,12 +1364,76 @@ void createTokenPost(
         auto repIt = tokenMap.find(repChannel);
         assert(repIt != tokenMap.end() &&
                "Representative channel should have been processed first");
-        // Share the representative's CommChannel
-        tokenMap[channel] = repIt->second;
+        // Copy the representative's CommChannel (producerBarrier +
+        // its own consumerBarriers).
+        CommChannel commChannel = repIt->second;
+
+        // Fix 1 (BwdTmemDotAttrsDeadlock.md): the representative's
+        // consumerBarriers only covers the representative's own
+        // consumer task. For non-representative channels whose
+        // consumer lives in a DIFFERENT task (e.g. FA-bwd
+        // `_BWD_DOT_ATTRS_TMEM` 3-channel reuse group {dpT, dq,
+        // dsT_0}: dpT's consumer is in computation task 3 but
+        // dsT_0's consumer dk MMA is in gemm task 1), allocate a
+        // dedicated gen5 consumer barrier for each missing
+        // consumer task. Without this the dsT_0 channel's
+        // consumer-release path silently drops at line 3522
+        // (`if (commChannel.consumerBarriers.count(consumerTaskId))`
+        // is false), so dk MMA never gets its TMEM-A
+        // completion-barrier attachment and the next iteration's
+        // computation-partition tmem_store deadlocks waiting on
+        // dsT_0's empty mbarrier.
+        auto dstOp = it->second.front()->getDstOp();
+        for (auto consumerAsyncTaskId : channel->relation.second) {
+          if (commChannel.consumerBarriers.count(consumerAsyncTaskId))
+            continue;
+          // Recompute useGen5Barrier for THIS channel's consumer task,
+          // mirroring the logic used for the representative below
+          // (lines 1416-1455).
+          DenseSet<Operation *> actualConsumers;
+          SmallVector<Operation *> dstOps;
+          if (channel->channelKind == DataChannelKind::SMEMPost) {
+            auto *cPost = static_cast<ChannelPost *>(channel);
+            cPost->getDstOps(dstOps);
+          } else {
+            dstOps.push_back(dstOp);
+          }
+          bool useGen5Barrier = true;
+          for (auto *dst : dstOps) {
+            auto consumers = getActualConsumers(dst);
+            for (auto *t : consumers) {
+              SmallVector<AsyncTaskId> asyncTasks = getAsyncTaskIds(t);
+              if (asyncTasks.empty())
+                continue;
+              if (std::find(asyncTasks.begin(), asyncTasks.end(),
+                            consumerAsyncTaskId) != asyncTasks.end()) {
+                actualConsumers.insert(t);
+                if (!isa<ttng::TCGen5MMAOp>(t))
+                  useGen5Barrier = false;
+              }
+            }
+          }
+          if (actualConsumers.empty() || !useGen5Barrier)
+            continue;
+          Value v = createBarrierAlloc(funcOp, channel->getNumBuffers(),
+                                       channel->srcName);
+          commChannel.consumerBarriers[consumerAsyncTaskId] = v;
+          LDBG("createTokenPost Fix1: non-rep channel "
+               << channel->uniqID
+               << " allocated gen5 consumer barrier for task "
+               << consumerAsyncTaskId
+               << " (rep channel " << repChannel->uniqID
+               << " did not cover this task)");
+        }
+
+        // Share the (possibly extended) CommChannel.
+        tokenMap[channel] = commChannel;
         LDBG("createToken: channel "
              << channel->uniqID
              << " shares CommChannel from representative channel "
-             << repChannel->uniqID);
+             << repChannel->uniqID << " ("
+             << commChannel.consumerBarriers.size()
+             << " consumer barriers)");
         continue;
       }
     }
@@ -2163,6 +2227,17 @@ DenseMap<Channel *, Value> createBufferPost(
     if (oldAllocOp->getAttr("buffer.offset"))
       buffer.getDefiningOp()->setAttr("buffer.offset",
                                       oldAllocOp->getAttr("buffer.offset"));
+    if (oldAllocOp->getAttr("buffer.tmaStaging"))
+      buffer.getDefiningOp()->setAttr("buffer.tmaStaging",
+                                      oldAllocOp->getAttr("buffer.tmaStaging"));
+    if (oldAllocOp->getAttr("allocation.reuseTarget"))
+      buffer.getDefiningOp()->setAttr(
+          "allocation.reuseTarget",
+          oldAllocOp->getAttr("allocation.reuseTarget"));
+    if (oldAllocOp->getAttr("allocation.shareGroup"))
+      buffer.getDefiningOp()->setAttr(
+          "allocation.shareGroup",
+          oldAllocOp->getAttr("allocation.shareGroup"));
     SmallVector<Operation *> users;
     for (auto *user : oldAllocOp->getResult(0).getUsers())
       users.push_back(user);
@@ -3736,6 +3811,10 @@ void insertAsyncComm(
                     WSBarrierAttr::forDstTask(funcOp.getContext(),
                                               earlyToken.first)
                         .build(funcOp.getContext()));
+            acquireOp->emitRemark()
+                << "reuse barrier: channel " << masterChannel->uniqID
+                << " waits on channel " << earlyChannelForReuseSync->uniqID
+                << " (intra-iteration)";
             LLVM_DEBUG({
               LDBG("Insert intra-iteration reuse ProducerAcquireOp for late "
                    "channel "
@@ -4702,6 +4781,261 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
   });
 }
 
+// ── mergeStagingReuseIntoHost ───────────────────────────────────────────
+// Realize the planner's `allocation.reuseTarget` annotation by replacing
+// each TMA staging local_alloc with a `ttg.memdesc_reinterpret` view of
+// the host alloc whose `buffer.id` matches the reuseTarget value.
+//
+// Background: the memory planner (Phase 3.6 in WSMemoryPlanner.cpp) sets
+//   allocation.reuseTarget = <host bufferId>
+// on a staging alloc and accounts for the staging as 0 extra bytes in
+// computeTotalSmem (it expects the staging to share the host's physical
+// region). However, AllocateSharedMemoryNv ignores this annotation and
+// gives the staging its own offset, so the layout silently overshoots
+// the planner's budget by the staging's footprint.
+//
+// This function closes the gap by rewriting all uses of the staging
+// alloc to view the host alloc directly via memdesc_reinterpret. The
+// staging alloc is then erased. Downstream layout (AllocateSharedMemoryNv)
+// sees only the host alloc + the view (which is a Pure op with no SMEM
+// impact), and reuse is realized.
+//
+// Cross-partition ordering is already enforced by the Step 7.5
+// producer_acquire barrier inserted earlier in doCodePartitionPost
+// (see commit c67893c25): the staging writer blocks until the host
+// channel's last consumer has released its SMEM. Intra-partition
+// ordering was already validated by the planner's findReuseCandidate.
+static unsigned computeMemDescBytes(ttg::MemDescType ty) {
+  int64_t numElems = 0;
+  if (auto paddedEnc =
+          dyn_cast<ttg::PaddedSharedEncodingAttr>(ty.getEncoding())) {
+    SmallVector<int64_t> unpaddedShape = ttg::getShapePerCTA(ty);
+    numElems = paddedEnc.getPaddedSize(unpaddedShape);
+  } else {
+    auto shapePerCTA = ttg::getAllocationShapePerCTA(ty);
+    numElems = product<int64_t>(shapePerCTA);
+  }
+  return static_cast<unsigned>(numElems * ty.getElementTypeBitWidth() / 8);
+}
+
+// Conservative check: only allow reuse when both the staging and host
+// memdescs share the exact same encoding Attribute. Different swizzle
+// patterns would make memdesc_reinterpret unsound because TMA reads
+// would interpret bytes differently.
+static bool areEncodingsCompatibleForReuse(ttg::MemDescType host,
+                                           ttg::MemDescType staging) {
+  return host.getEncoding() == staging.getEncoding() &&
+         host.getMemorySpace() == staging.getMemorySpace() &&
+         host.getElementType() == staging.getElementType();
+}
+
+void mergeStagingReuseIntoHost(triton::FuncOp funcOp,
+                               const SmallVector<Channel *> &orderedChannels) {
+  // (a) Build {bufferId -> host LocalAllocOp} by walking funcOp directly.
+  // Note: we cannot iterate orderedChannels here — earlier passes
+  // (replaceBufferReuse, foldLocalLoads) may have erased some allocs,
+  // leaving Channel::getAllocOp() returning dangling pointers.
+  DenseMap<unsigned, ttg::LocalAllocOp> hostAllocById;
+  funcOp.walk([&](ttg::LocalAllocOp alloc) {
+    if (!alloc.isSharedMemoryAlloc())
+      return;
+    if (alloc->getAttr("buffer.tmaStaging"))
+      return; // host cannot itself be staging
+    if (alloc->getAttr("allocation.reuseTarget"))
+      return; // and cannot itself be a reuser
+    if (auto attr = alloc->getAttrOfType<IntegerAttr>("buffer.id"))
+      hostAllocById[attr.getInt()] = alloc;
+  });
+
+  // (b) Collect every staging alloc carrying allocation.reuseTarget,
+  // grouped by host buffer.id. We do this in a separate pass so that the
+  // rewrite phase can determine maxStorageType across the entire alias
+  // class (host + all stagings targeting the same host) before mutating
+  // IR, mirroring the bookkeeping in
+  // third_party/tlx/dialect/lib/Transforms/RewriteLocalAlias.cpp:90-109.
+  DenseMap<unsigned, SmallVector<ttg::LocalAllocOp>> stagingsByHostId;
+  funcOp.walk([&](ttg::LocalAllocOp stagingAlloc) {
+    auto reuseAttr =
+        stagingAlloc->getAttrOfType<IntegerAttr>("allocation.reuseTarget");
+    if (!reuseAttr)
+      return;
+    auto stagingAttr =
+        stagingAlloc->getAttrOfType<IntegerAttr>("buffer.tmaStaging");
+    if (!stagingAttr)
+      return; // only TMA stagings carry reuseTarget in practice
+    stagingsByHostId[reuseAttr.getInt()].push_back(stagingAlloc);
+  });
+
+  // (c) For each host with at least one reuser, emit the TLX-shape IR:
+  //
+  //   %backing = ttg.local_alloc          : !memdesc<maxStorageType, ...>
+  //   %host    = ttg.memdesc_reinterpret %backing : ... -> hostType
+  //   %stagingK = ttg.memdesc_reinterpret %backing : ... -> stagingType_K
+  //
+  // This matches the post-`TLXRewriteLocalAlias` shape from
+  // third_party/tlx/dialect/lib/Transforms/RewriteLocalAlias.cpp:135-196:
+  // a single fresh ttg.local_alloc of the max storage type, with one
+  // ttg.memdesc_reinterpret per logical alias including the host. The
+  // hypothesis (validated empirically against the FA-bwd idx=2 hang) is
+  // that downstream LLVM lowering handles this uniform "all reads through
+  // reinterpret of a generic backing" shape correctly, whereas a typed
+  // host alloc whose region is shared via a sibling reinterpret triggers
+  // a pathological loop in an LLVM-NVPTX optimization pass.
+  for (auto &[hostId, allStagings] : stagingsByHostId) {
+    auto hostIt = hostAllocById.find(hostId);
+    if (hostIt == hostAllocById.end()) {
+      for (auto stagingAlloc : allStagings) {
+        stagingAlloc->emitWarning("[staging-reuse] host buffer.id=")
+            << hostId << " not found; staging keeps its own region";
+        stagingAlloc->removeAttr("allocation.reuseTarget");
+      }
+      continue;
+    }
+    ttg::LocalAllocOp hostAlloc = hostIt->second;
+    auto hostTy = cast<ttg::MemDescType>(hostAlloc.getResult().getType());
+    unsigned hostBytes = computeMemDescBytes(hostTy);
+
+    // (c.1) Filter to viable stagings (byte-fit + encoding compatibility
+    // against the host). Drop reuseTarget on each rejected staging so
+    // later walks don't reprocess it.
+    SmallVector<ttg::LocalAllocOp> viable;
+    for (ttg::LocalAllocOp stagingAlloc : allStagings) {
+      auto stagingTy =
+          cast<ttg::MemDescType>(stagingAlloc.getResult().getType());
+      unsigned stagingBytes = computeMemDescBytes(stagingTy);
+      if (stagingBytes > hostBytes) {
+        stagingAlloc->emitWarning("[staging-reuse] staging needs ")
+            << stagingBytes << "B but host (buffer.id=" << hostId << ") has "
+            << hostBytes << "B; cannot reuse";
+        stagingAlloc->removeAttr("allocation.reuseTarget");
+        continue;
+      }
+      if (!areEncodingsCompatibleForReuse(hostTy, stagingTy)) {
+        stagingAlloc->emitWarning(
+            "[staging-reuse] incompatible SMEM encodings between staging "
+            "and host (buffer.id=")
+            << hostId << "); cannot reuse";
+        stagingAlloc->removeAttr("allocation.reuseTarget");
+        continue;
+      }
+      viable.push_back(stagingAlloc);
+    }
+    if (viable.empty())
+      continue;
+
+    // (c.2) maxStorageType across host + all viable stagings. For
+    // dk/dv_staging both sides have equal byte size so maxType == hostTy;
+    // for strictly-smaller stagings, hostTy still wins. We keep the lookup
+    // explicit so the analog with TLX's allocToMaxStorageType
+    // (RewriteLocalAlias.cpp:90-109) is obvious.
+    ttg::MemDescType maxType = hostTy;
+    unsigned maxBytes = hostBytes;
+    for (ttg::LocalAllocOp stagingAlloc : viable) {
+      auto stagingTy =
+          cast<ttg::MemDescType>(stagingAlloc.getResult().getType());
+      unsigned stagingBytes = computeMemDescBytes(stagingTy);
+      if (stagingBytes > maxBytes) {
+        maxType = stagingTy;
+        maxBytes = stagingBytes;
+      }
+    }
+
+    // (d) Create the fresh backing alloc at the host's insertion point.
+    // When maxType == hostType (the common case — dk/dv_staging both have
+    // equal byte size to dk/dv), the host's planner attributes (buffer.id,
+    // buffer.copy, etc.) are stamped DIRECTLY onto the backing alloc and
+    // we skip emitting an identity host view. This is required because
+    // an identity ttg.memdesc_reinterpret (same source and destination
+    // MemDescType) is canonicalized away by later TTGIR passes, which
+    // would strip the planner attributes if they only lived on the view.
+    // When maxType != hostType (staging larger than host — currently
+    // impossible given the byte-fit check above, but kept correct for
+    // forward compatibility), we create a separate host view so the
+    // reinterpret is non-identity and survives canonicalization.
+    OpBuilder builder(hostAlloc);
+    builder.setInsertionPoint(hostAlloc);
+    auto backingAlloc =
+        ttg::LocalAllocOp::create(builder, hostAlloc.getLoc(), maxType);
+    bool maxEqualsHost = (maxType == hostTy);
+    if (maxEqualsHost) {
+      // Stamp every host attribute (alignment, buffer.id, buffer.copy,
+      // async_task_id, allocation.shareGroup, ...) onto the backing alloc.
+      for (NamedAttribute attr : hostAlloc->getAttrs())
+        backingAlloc->setAttr(attr.getName(), attr.getValue());
+    } else {
+      // Backing carries only alignment + async_task_id; planner attrs
+      // move onto the host view below.
+      if (auto alignAttr = hostAlloc->getAttr("alignment"))
+        backingAlloc->setAttr("alignment", alignAttr);
+      if (auto taskIds = hostAlloc->getAttr("async_task_id"))
+        backingAlloc->setAttr("async_task_id", taskIds);
+    }
+
+    // (e) Replace host uses. If maxType == hostType we wire host consumers
+    // directly to the backing alloc (no view). Otherwise we build a
+    // non-identity host view that carries the planner attributes (this
+    // path mirrors RewriteLocalAlias.cpp:173-178).
+    Value hostReplacement;
+    Operation *insertAnchor = backingAlloc;
+    if (maxEqualsHost) {
+      hostReplacement = backingAlloc.getResult();
+    } else {
+      builder.setInsertionPointAfter(backingAlloc);
+      auto hostView = ttg::MemDescReinterpretOp::create(
+          builder, hostAlloc.getLoc(), hostTy, backingAlloc.getResult());
+      for (NamedAttribute attr : hostAlloc->getAttrs()) {
+        if (attr.getName() == "alignment")
+          continue;
+        hostView->setAttr(attr.getName(), attr.getValue());
+      }
+      hostReplacement = hostView.getResult();
+      insertAnchor = hostView;
+    }
+    hostAlloc.getResult().replaceAllUsesWith(hostReplacement);
+    hostAlloc.erase();
+    // Invalidate the map entry — hostAlloc has been erased.
+    hostAllocById.erase(hostIt);
+
+    // (f) Build one stagingView per viable staging. Propagate planner
+    // attributes (including async_task_id) but explicitly OMIT
+    // buffer.tmaStaging — downstream passes walk ttg.local_alloc ops with
+    // that attribute and assume the defining op is castable to
+    // LocalAllocOp; a MemDescReinterpretOp carrying it would be
+    // misclassified. The orphaned staging LocalAllocOp keeps
+    // buffer.tmaStaging so those walks still find it.
+    for (ttg::LocalAllocOp stagingAlloc : viable) {
+      auto stagingTy =
+          cast<ttg::MemDescType>(stagingAlloc.getResult().getType());
+      builder.setInsertionPointAfter(insertAnchor);
+      auto stagingView = ttg::MemDescReinterpretOp::create(
+          builder, stagingAlloc.getLoc(), stagingTy,
+          backingAlloc.getResult());
+      for (StringRef name :
+           {"buffer.id", "buffer.copy", "buffer.idx_in_group",
+            "allocation.shareGroup", "async_task_id"}) {
+        if (auto a = stagingAlloc->getAttr(name))
+          stagingView->setAttr(name, a);
+      }
+
+      LDBG("[staging-reuse] merged staging (buffer.id="
+           << stagingAlloc->getAttrOfType<IntegerAttr>("buffer.id").getInt()
+           << ", " << computeMemDescBytes(stagingTy)
+           << "B) onto shared backing alloc for host (buffer.id=" << hostId
+           << ", " << hostBytes << "B)");
+
+      // (g) Rewire staging uses. We do NOT erase eagerly: earlier passes
+      // may retain pointers (e.g., Channel::allocOp) to the staging op;
+      // dereferencing them would be a use-after-free. Leave the staging
+      // orphaned (zero users); MLIR's DCE / canonicalization removes it
+      // later, after all consumers of Channel state have run.
+      stagingAlloc.getResult().replaceAllUsesWith(stagingView.getResult());
+      // Drop reuseTarget on the orphaned staging too so any subsequent
+      // walk scanning for the attribute won't re-process it.
+      stagingAlloc->removeAttr("allocation.reuseTarget");
+    }
+  }
+}
+
 void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
@@ -4892,6 +5226,40 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
     LDBG("\n\nafter appendAccumCntsForOps");
     funcOp.dump();
   });
+  // Step 4.5: Collect TMA staging reuse info before createBufferPost
+  // rewrites the alloc ops (which would lose the local_store users).
+  struct StagingReuseInfo {
+    unsigned targetBufferId;
+    Operation *firstStore;
+  };
+  SmallVector<StagingReuseInfo> stagingReuseInfos;
+  funcOp.walk([&](ttg::LocalAllocOp allocOp) {
+    auto reuseAttr =
+        allocOp->getAttrOfType<IntegerAttr>("allocation.reuseTarget");
+    auto stagingAttr =
+        allocOp->getAttrOfType<IntegerAttr>("buffer.tmaStaging");
+    if (!reuseAttr || !stagingAttr)
+      return;
+    // Find the first local_store user.
+    Operation *firstStore = nullptr;
+    for (auto *user : allocOp->getUsers()) {
+      if (isa<ttg::LocalStoreOp>(user)) {
+        if (!firstStore || user->isBeforeInBlock(firstStore))
+          firstStore = user;
+      }
+    }
+    if (!firstStore) {
+      LDBG("Step 4.5: staging alloc has reuseTarget="
+           << reuseAttr.getInt() << " but no local_store user");
+      return;
+    }
+    stagingReuseInfos.push_back({(unsigned)reuseAttr.getInt(), firstStore});
+    LDBG("Step 4.5: collected staging reuse: target buffer.id="
+         << reuseAttr.getInt() << " firstStore found");
+  });
+  LDBG("Step 4.5: collected " << stagingReuseInfos.size()
+       << " staging reuse entries");
+
   // Step 5: Create buffers. An array of buffers for each channel.
   DenseMap<Channel *, Value> bufferMap =
       createBufferPost(channelsGroupedByProducers, channels, funcOp, &config,
@@ -4924,6 +5292,67 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
     funcOp.dump();
   });
 
+  // Step 7.5: Insert cross-partition sync barriers for TMA staging SMEM reuse.
+  // MUST run BEFORE Step 8 (insertAsyncComm). insertAsyncComm has a cleanup
+  // sweep (removeTokenfNotUsed) that erases any token alloc currently lacking
+  // users. If our staging-reuse barrier ran after that sweep, the v/do tokens
+  // we depend on would already be freed and we'd dereference dangling memory.
+  // Inserting the producer_acquire here adds a real use that keeps the token
+  // alive through the sweep.
+  {
+    // Build a map from buffer.id → channel for looking up inner-loop channels.
+    DenseMap<unsigned, Channel *> bufferIdToChannel;
+    for (auto *ch : orderedChannels) {
+      auto *allocOp = ch->getAllocOp();
+      if (!allocOp)
+        continue;
+      if (auto attr = allocOp->getAttrOfType<IntegerAttr>("buffer.id"))
+        bufferIdToChannel[attr.getInt()] = ch;
+    }
+
+    for (auto &info : stagingReuseInfos) {
+      auto targetIt = bufferIdToChannel.find(info.targetBufferId);
+      if (targetIt == bufferIdToChannel.end()) {
+        LDBG("Step 7.5: target buffer.id=" << info.targetBufferId
+             << " — channel not found, skipping");
+        continue;
+      }
+      Channel *targetChannel = targetIt->second;
+      auto targetTokenIt = tokenMap.find(targetChannel);
+      if (targetTokenIt == tokenMap.end() ||
+          targetTokenIt->second.tokens.empty()) {
+        LDBG("Step 7.5: target channel " << targetChannel->uniqID
+             << " has no tokens, skipping");
+        continue;
+      }
+
+      Operation *firstStore = info.firstStore;
+      OpBuilderWithAsyncTaskIds builder(firstStore);
+      builder.setInsertionPoint(firstStore);
+      auto asyncTaskIds = getAsyncTaskIds(firstStore);
+      builder.setAsynTaskIdsFromArray(asyncTaskIds);
+
+      for (const auto &[taskId, tokenValue] :
+           targetTokenIt->second.tokens) {
+        Value bufIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+            firstStore->getLoc(), 0, 32);
+        Value phase = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+            firstStore->getLoc(), 0, 1);
+        auto acquireOp =
+            builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+                firstStore->getLoc(), tokenValue, bufIdx, phase);
+        acquireOp->emitRemark()
+            << "TMA staging reuse barrier: staging buffer waits on "
+            << "target buffer.id=" << info.targetBufferId
+            << " consumer release";
+        LDBG("Step 7.5: Inserted ProducerAcquireOp for staging → target "
+             << info.targetBufferId);
+      }
+    }
+    LDBG("Step 7.5: processed " << stagingReuseInfos.size()
+         << " staging reuse entries");
+  }
+
   // Step 8: add async communication ops (ProducerAcquire etc). Also lower
   // TMA loads.
   insertAsyncComm(funcOp, channelsGroupedByConsumers, orderedChannels, tokenMap,
@@ -4947,6 +5376,16 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
   cleanupTmemTokens(funcOp);
   replaceBufferReuse(funcOp, channelsGroupedByConsumers, orderedChannels,
                      &config);
+
+  // Realize allocation.reuseTarget annotations from the memory planner:
+  // rewrite TMA staging allocs into memdesc_reinterpret views of their
+  // host allocs so AllocateSharedMemoryNv only sees the host (and the
+  // planner's reuse accounting matches actual codegen footprint).
+  mergeStagingReuseIntoHost(funcOp, orderedChannels);
+  LLVM_DEBUG({
+    LDBG("\n\nAfter mergeStagingReuseIntoHost");
+    funcOp.dump();
+  });
 
   // Lower SubtiledRegionOps whose tile body spans multiple async tasks.
   // Single-task SubtiledRegionOps are preserved and handled by SpecializeOp.

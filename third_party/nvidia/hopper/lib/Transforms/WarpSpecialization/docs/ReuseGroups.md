@@ -184,14 +184,36 @@ channels share no circular barrier).
 `replaceBufferReuse` rewrites all IR uses of non-representative alloc ops to
 point at the representative's alloc:
 
-- **SMEM channels**: When the alloc types match, uses direct
-  `replaceUsesOfWith` to swap the alloc result, then erases the old alloc.
-  Type mismatches are skipped (SMEM cannot be reinterpreted like TMEM).
+- **SMEM channels (same buffer.id, same type)**: When the alloc types match,
+  uses direct `replaceUsesOfWith` to swap the alloc result, then erases the
+  old alloc.
+
+- **SMEM channels (same buffer.id, different type)**: Type mismatch within
+  the *same* `bufferId` group is skipped here — `AllocateSharedMemoryNv`
+  resolves these via liveness-based overlap when the two channels are
+  not co-live.
+
+- **SMEM channels with `allocation.reuseTarget = N` (cross-buffer reuse)**:
+  Driven by the planner's Phase 3.6 hint (see
+  [TMAStoreWaitPipeline.md §Phase 3.6](TMAStoreWaitPipeline.md#phase-36-inter-buffer-smem-reuse-via-allocationreuetarget)).
+  The staging alloc carries `allocation.reuseTarget = <host bufferId>`;
+  `replaceBufferReuse` rewrites the staging alloc into a
+  `memdesc_reinterpret` view of the host alloc (the one with
+  `buffer.id = N`) and erases the staging alloc. The reinterpret is sound
+  because the host alloc's storage covers ≥ `staging.size × staging.numCopies`
+  bytes (guaranteed by `findReuseCandidate`'s size check), and cross-partition
+  ordering is enforced by the Step 7.5 `producer_acquire` barrier inserted
+  earlier in `doCodePartition`.
 
 - **TMEM channels**: Inserts a `sliceAndReinterpretMDTMEM` op at the
   `buffer.offset` column within the representative's TMEM allocation. If the
   primary representative's type cannot accommodate the slice, other group
   representatives are tried before emitting an error.
+
+Without this reinterpret step for SMEM cross-buffer reuse, `AllocateSharedMemoryNv`
+would place the staging alloc at a fresh offset (it has no awareness of
+`allocation.reuseTarget`), and the planner's Phase 3.6 "free" accounting would
+silently overrun the SMEM budget at codegen time.
 
 ### 4. `allocation.shareGroup` Attribute
 
