@@ -107,6 +107,34 @@ an epilogue group. `increaseFusedEpilogueCopies` iteratively bumps
 `numCopies` from the current value up to `numBuffers`, accepting each
 bump as long as `computeTotalSmem ≤ smemBudget`.
 
+#### `K | S` cap for same-partition (wait_group-drained) staging
+
+A staging group holds **S** subtiles (`S = indices.size()`, the fused
+`EPILOGUE_SUBTILE` / `DQ_SUBTILE` stores) that rotate through **K =
+numCopies** slots. How the buffer is drained — and therefore which K values
+are *correct* — depends on the channel's producer/consumer topology:
+
+- **Same-partition staging** (producer and consumer in the same warp task,
+  e.g. bwd `dk`/`dv`/`dq`): drained only by `cp.async.bulk.wait_group(K-1)`,
+  with the per-tile slot `theIdx % K` (see `getStaggeredAccumCnt`). The fixed
+  in-flight-count wait is correct only if same-slot stores are exactly K apart
+  across the tile boundary, i.e. **K must divide S**. A non-dividing K (e.g.
+  `K=3, S=4`, or `K > S`) makes a store clobber a slot before it drains →
+  wrong gradients, with nothing downstream to catch it.
+- **Cross-partition staging** (producer task ≠ consumer task, e.g. fwd
+  `desc_o`): the slot/phase come from a continuous `accumCnt` producer/consumer
+  mbarrier rotation and tolerate **any** K.
+
+Phase 4.5 therefore detects same-partition staging via
+`getAsyncTaskIds(ch->getSrcOp()) == getAsyncTaskIds(ch->getDstOp())` and, for
+those groups, only accepts a `tryCopies` that divides S (others are skipped).
+This is a **defensive backstop**: in all shipped configs `num_stages = 2` and
+`S ∈ {2,4}`, so `K | S` already holds and the cap is a no-op — it exists to
+keep a future `num_stages`/subtile combination from silently violating the
+rotation invariant. The cross-stage floor (`WSBuffer::minCopies`) is a hard
+correctness floor and is never reduced; if it itself violates `K | S` for a
+wait_group ring the pass emits an `LDBG` warning rather than dropping below it.
+
 `computeTotalSmem` accounts for the active `buffer.id` groups using
 `max(size) × copies` per ID. For TMA store staging groups this matches the
 planner's reuse model, but the downstream physical allocation still leaves
@@ -276,34 +304,56 @@ hint. To actually realize the SMEM overlap in the emitted kernel, two
 coordinated steps are required inside `doCodePartition` before the layout
 pass (`AllocateSharedMemoryNv`) runs:
 
-### Step 1: Insert the Cross-Partition Reuse Barrier (Step 7.5)
+### Step 1: Insert the Cross-Tile Reuse WAR Barrier (Step 7.5)
 
-Before the staging buffer's *first store*, emit a `nvws.producer_acquire`
-that consumes the host buffer's wait token. This blocks the staging-buffer
-writer until the host channel's last consumer has released its SMEM slot,
-making it safe for the two allocs to alias.
+Because the staging buffer aliases the host operand SMEM, the **next tile's
+operand load** must not overwrite that SMEM until the **previous tile's staging
+TMA store** has finished reading it. Step 7.5 emits a dedicated, single-buffered
+cross-partition token for this write-after-read edge:
+
+- the **load task** does a `producer_acquire` at the **top of the persistent
+  outer loop** (before the operand loads), and
+- the **staging task** does a `consumer_release` at the **bottom of the outer
+  loop** (after the staging stores, which have already drained).
+
+Both are loop-carried (phase derived from the outer-loop induction variable via
+`getBufferIdxAndPhase`), so the edge serializes `load(tile N+1)` after
+`staging-store(tile N)`. The load and staging genuinely alias the same SMEM, so
+this serialization removes no legitimate overlap.
 
 ```mlir
-nvws.producer_acquire %host_token, %c0_i32, %false
-    {async_task_id = array<i32: 3>} : tensor<1x!nvws.token>, i32, i1
-ttg.local_store %payload, %desc_dv_staging
-    : tensor<128x64xf16> -> !ttg.memdesc<128x64xf16, ...>
+scf.for %tile = ... {
+  nvws.producer_acquire %reuse_token, %idx, %phase   // load task, top
+  ... operand loads (v/do) ...
+  ... MMAs, epilogue, dv/dk staging stores + async_tma_store_token_wait ...
+  nvws.consumer_release %reuse_token, %idx           // staging task, bottom
+  scf.yield
+}
 ```
 
-**Important ordering constraint**: this insertion **must** run **before**
-`insertAsyncComm`. `insertAsyncComm` ends with a cleanup sweep
-(`removeTokenfNotUsed`) that erases any token alloc currently lacking
-users. Because the host token is only used by the barrier we are about
-to insert, deferring the barrier insertion to after `insertAsyncComm`
-causes the cleanup to free the host token first, after which the
-deferred insertion dereferences the freed Value (use-after-free,
-manifesting as a `malloc(): unaligned tcache` abort inside MLIR's
-verifier on a later op).
+**Why a dedicated token (not the host operand's own barrier).** The host
+operand buffer's empty barrier is released by its MMA consumer, which finishes
+*before* the staging store — too early. It also cannot carry an extra release
+from the staging task: the staging task and the MMA task have different warp
+counts, which trips the `consumerWarps == nWarps` assert in `WSLowerToken`. A
+separate token has a uniform consumer (the staging task), avoiding the conflict.
 
-This is enforced as "Step 7.5" — running between `createTokenPost`
-(Step 7) and `insertAsyncComm` (Step 8) so the `producer_acquire`'s
-operand becomes a real use of the host token before the cleanup sweep.
-See commit `c67893c25` for the bug-fix that re-ordered this step.
+**Earlier (degenerate) design — fixed.** Step 7.5 previously emitted a
+`producer_acquire` on the *host* token before the staging store, with constant
+`bufferIdx = 0` / `phase = 0`. That gated the wrong direction (the staging
+*write* after the host read, which the dv/dk accumulator-complete wait already
+covers) and, with a constant phase, never alternated across the persistent loop
+— a no-op. It happened to be harmless on the non-persistent (single-tile) path
+but left the persistent path with a cross-tile SMEM race (non-deterministic
+wrong dv/dk gradients). The cross-tile WAR token above replaces it. Regression
+coverage: `test_bwd_tmem_dsT_reuse_3group_persistent`.
+
+**Important ordering constraint**: this insertion **must** run **before**
+`insertAsyncComm`, whose cleanup sweep (`removeTokenfNotUsed`) erases any token
+alloc currently lacking users — the freshly-created reuse token only gains uses
+once the acquire/release are inserted. This is enforced as "Step 7.5" — running
+between `createTokenPost` (Step 7) and `insertAsyncComm` (Step 8). See commit
+`c67893c25` for the related ordering bug-fix.
 
 ### Step 2: Reinterpret Staging Alloc into Host Alloc
 

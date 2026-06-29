@@ -5430,15 +5430,30 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
     funcOp.dump();
   });
 
-  // Step 7.5: Insert cross-partition sync barriers for TMA staging SMEM reuse.
-  // MUST run BEFORE Step 8 (insertAsyncComm). insertAsyncComm has a cleanup
-  // sweep (removeTokenfNotUsed) that erases any token alloc currently lacking
-  // users. If our staging-reuse barrier ran after that sweep, the v/do tokens
-  // we depend on would already be freed and we'd dereference dangling memory.
-  // Inserting the producer_acquire here adds a real use that keeps the token
-  // alive through the sweep.
-  {
-    // Build a map from buffer.id → channel for looking up inner-loop channels.
+  // Step 7.5: Insert a cross-tile WAR barrier for TMA staging SMEM reuse.
+  //
+  // The dv/dk TMA-staging buffers alias the v/do operand SMEM
+  // (allocation.reuseTarget, realized later by mergeStagingReuseIntoHost). In a
+  // persistent (outer-tile) loop the *next* tile's operand load must not
+  // overwrite that SMEM until the *previous* tile's staging TMA store has
+  // finished reading it. The host operand buffer's own empty barrier is
+  // released by its MMA consumer (which finishes before the staging store), and
+  // it cannot carry an extra release from the staging task — the staging task
+  // has a different warp count than the MMA task, which trips the
+  // `consumerWarps == nWarps` assert in WSLowerToken. So emit a dedicated,
+  // single-buffered cross-partition token (mirroring the TLX `k_empties`
+  // pattern): the load task acquires it at the top of the persistent outer loop
+  // (before the operand loads); the staging task releases it at the bottom
+  // (after the staging stores, which have already drained). The acquire/release
+  // are loop-carried (phase derived from the outer induction variable), so the
+  // edge serializes load(tile N+1) after staging-store(tile N). The load and
+  // staging genuinely alias the same SMEM, so this serialization removes no
+  // legitimate overlap.
+  //
+  // MUST run BEFORE Step 8 (insertAsyncComm), whose removeTokenfNotUsed cleanup
+  // sweep would otherwise free the freshly-created token (it only has uses once
+  // the acquire/release below are inserted).
+  if (!stagingReuseInfos.empty()) {
     DenseMap<unsigned, Channel *> bufferIdToChannel;
     for (auto *ch : orderedChannels) {
       auto *allocOp = ch->getAllocOp();
@@ -5448,47 +5463,107 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
         bufferIdToChannel[attr.getInt()] = ch;
     }
 
+    // Resolve every staging pair to its (outer loop, staging task, load task).
+    // The cross-tile WAR token is intentionally coarse: a single
+    // producer_acquire at the top of the outer-loop body (before *all* operand
+    // loads) and a single consumer_release at the bottom (after *all* staging
+    // stores) serialize tile N+1's loads behind tile N's staging stores. That
+    // covers every aliasing pair *provided* they share one outer loop, one
+    // staging task, and one load task -- which holds for FA-bwd (v/do are
+    // loaded by the load task; dv/dk are stored by the staging task). If a
+    // future kernel spreads staging pairs across different tasks or loops, a
+    // single token cannot cover them all, so detect that and skip rather than
+    // emit a barrier that silently guards only one pair.
+    //
+    // Derive staging/load tasks from the *matched* entry (not from
+    // stagingReuseInfos.front(), which may have been skipped above) so the
+    // barrier's task IDs always agree with the selected outer loop.
+    scf::ForOp outerLoop;
+    AsyncTaskId stagingTask = -1;
+    AsyncTaskId loadTask = -1;
+    unsigned matched = 0;
+    bool consistent = true;
     for (auto &info : stagingReuseInfos) {
-      auto targetIt = bufferIdToChannel.find(info.targetBufferId);
-      if (targetIt == bufferIdToChannel.end()) {
-        LDBG("Step 7.5: target buffer.id=" << info.targetBufferId
-             << " — channel not found, skipping");
+      auto it = bufferIdToChannel.find(info.targetBufferId);
+      if (it == bufferIdToChannel.end() || !it->second->getSrcOp())
         continue;
-      }
-      Channel *targetChannel = targetIt->second;
-      auto targetTokenIt = tokenMap.find(targetChannel);
-      if (targetTokenIt == tokenMap.end() ||
-          targetTokenIt->second.tokens.empty()) {
-        LDBG("Step 7.5: target channel " << targetChannel->uniqID
-             << " has no tokens, skipping");
+      auto loop = info.firstStore->getParentOfType<scf::ForOp>();
+      if (!loop)
         continue;
-      }
-
-      Operation *firstStore = info.firstStore;
-      OpBuilderWithAsyncTaskIds builder(firstStore);
-      builder.setInsertionPoint(firstStore);
-      auto asyncTaskIds = getAsyncTaskIds(firstStore);
-      builder.setAsynTaskIdsFromArray(asyncTaskIds);
-
-      for (const auto &[taskId, tokenValue] :
-           targetTokenIt->second.tokens) {
-        Value bufIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-            firstStore->getLoc(), 0, 32);
-        Value phase = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-            firstStore->getLoc(), 0, 1);
-        auto acquireOp =
-            builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
-                firstStore->getLoc(), tokenValue, bufIdx, phase);
-        acquireOp->emitRemark()
-            << "TMA staging reuse barrier: staging buffer waits on "
-            << "target buffer.id=" << info.targetBufferId
-            << " consumer release";
-        LDBG("Step 7.5: Inserted ProducerAcquireOp for staging → target "
-             << info.targetBufferId);
+      AsyncTaskId sTask = getAsyncTaskIds(info.firstStore).front();
+      AsyncTaskId lTask = getAsyncTaskIds(it->second->getSrcOp()).front();
+      if (matched++ == 0) {
+        outerLoop = loop;
+        stagingTask = sTask;
+        loadTask = lTask;
+      } else if (loop != outerLoop || sTask != stagingTask ||
+                 lTask != loadTask) {
+        consistent = false;
       }
     }
-    LDBG("Step 7.5: processed " << stagingReuseInfos.size()
-         << " staging reuse entries");
+
+    if (matched && !consistent) {
+      LDBG("Step 7.5: staging-reuse pairs span multiple outer loops / load / "
+           "staging tasks; cross-tile WAR barrier not inserted (unhandled)");
+    } else if (matched && outerLoop && loadTask != stagingTask) {
+      MLIRContext *ctx = funcOp.getContext();
+      // Create the synthetic reuse token at function entry.
+      OpBuilder entryB(funcOp);
+      entryB.setInsertionPointToStart(&funcOp.getBody().front());
+      Value reuseToken = ttnvws::CreateTokenOp::create(
+          entryB, funcOp.getLoc(), /*numBuffers=*/1,
+          ttnvws::TokenLoadType::LocalStoreOp);
+
+      // producer_acquire (load task) at the top of the outer loop body. The
+      // phase must flip once per outer iteration, so feed getBufferIdxAndPhase
+      // a 0-based iteration counter. Normalize as (iv - lb) / step rather than
+      // the raw induction variable so the parity is correct for any lower bound
+      // / step; when the loop is already normalized (lb=0, step=1 -- the AutoWS
+      // persistent case, whose body carries the real tile id separately) this
+      // is just the induction variable and the extra arith is folded away.
+      {
+        Operation *firstBodyOp = &outerLoop.getBody()->front();
+        OpBuilderWithAsyncTaskIds builder(firstBodyOp);
+        builder.setInsertionPoint(firstBodyOp);
+        builder.setAsynTaskIdsFromArray({loadTask});
+        Location loc = firstBodyOp->getLoc();
+        Value iterIdx = outerLoop.getInductionVar();
+        APInt lbVal, stepVal;
+        bool lbIsZero =
+            matchPattern(outerLoop.getLowerBound(), m_ConstantInt(&lbVal)) &&
+            lbVal.isZero();
+        bool stepIsOne =
+            matchPattern(outerLoop.getStep(), m_ConstantInt(&stepVal)) &&
+            stepVal.isOne();
+        if (!lbIsZero || !stepIsOne) {
+          Value rel = builder.createWithAsyncTaskIds<arith::SubIOp>(
+              loc, iterIdx, outerLoop.getLowerBound());
+          iterIdx = builder.createWithAsyncTaskIds<arith::DivUIOp>(
+              loc, rel, outerLoop.getStep());
+        }
+        Value ivExt = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
+            loc, builder.getIntegerType(64), iterIdx);
+        auto idxPhase =
+            getBufferIdxAndPhase(builder, loc, ivExt, /*numBuffers=*/1);
+        builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+            loc, reuseToken, idxPhase.first, idxPhase.second,
+            WSBarrierAttr::forDstTask(ctx, stagingTask).build(ctx));
+      }
+      // consumer_release (staging task) at the bottom, after staging stores.
+      {
+        Operation *term = outerLoop.getBody()->getTerminator();
+        OpBuilderWithAsyncTaskIds builder(term);
+        builder.setInsertionPoint(term);
+        builder.setAsynTaskIdsFromArray({stagingTask});
+        Value bufIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+            term->getLoc(), 0, 32);
+        builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
+            term->getLoc(), reuseToken, bufIdx,
+            WSBarrierAttr::forDstTask(ctx, loadTask).build(ctx));
+      }
+      LDBG("Step 7.5: inserted cross-tile staging-reuse WAR barrier (load "
+           << loadTask << " -> staging " << stagingTask << ")");
+    }
   }
 
   // Step 8: add async communication ops (ProducerAcquire etc). Also lower
