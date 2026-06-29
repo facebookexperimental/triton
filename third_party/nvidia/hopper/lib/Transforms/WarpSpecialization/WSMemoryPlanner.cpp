@@ -2523,9 +2523,8 @@ private:
     Attribute tensorMemorySpace = ttng::TensorMemorySpaceAttr::get(ctx);
     Type elemType = scaleType.getElementType();
     ttg::CGAEncodingAttr cgaLayout = ttg::getCGALayout(scaleType.getEncoding());
-    auto ctaSplitNum = cgaLayout.getCTASplitNum();
-    auto scaleEncoding = ttng::TensorMemoryScalesEncodingAttr::get(
-        ctx, ctaSplitNum[0], ctaSplitNum[1]);
+    auto scaleEncoding =
+        ttng::TensorMemoryScalesEncodingAttr::get(ctx, cgaLayout);
     SmallVector<int64_t> shape = {
         rows, ceil<int64_t>(product(scaleType.getShape()), rows)};
     auto futureType =
