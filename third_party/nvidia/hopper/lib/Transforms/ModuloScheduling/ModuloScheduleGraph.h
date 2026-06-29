@@ -127,7 +127,12 @@ struct ScheduleNode {
   llvm::SmallVector<unsigned, 2> consumesBuffers; // indices into buffers
 
   // Warp specialization (from Phase 1.5)
-  int warpGroup{-1}; // -1 = unassigned
+  int warpGroup{-1}; // -1 = unassigned, -2 = replicated (see replicatedGroups)
+  // When warpGroup == -2 (replicated infra op whose consumers span multiple
+  // warp groups), the set of consumer warp groups it must be cloned into.
+  // Emitted as a multi-id ttg.partition so the WS pass replicates it. Empty
+  // unless replicated.
+  llvm::SmallVector<int, 4> replicatedGroups;
 
   bool isSuperNode() const { return childPipelineId != UINT_MAX; }
   bool hasBuffer() const {
@@ -226,6 +231,24 @@ struct ScheduleLoop {
     int64_t expectBytes{0};
   };
   llvm::SmallVector<CrossGroupBarrier, 4> crossGroupBarriers;
+
+  // Top-N alternative warp-group partitions for multi-graph autotuning dump.
+  // Each entry is node-indexed (size == nodes.size()) giving the raw
+  // cluster-applied warpGroup per node (NONE ops = -1), BEFORE infra-op
+  // propagation / barrier synthesis. [0] is the committed winner; [1..] are
+  // the next-best candidates from the Phase-4 cost model. Populated only when
+  // TRITON_MODULO_DUMP_TOPN > 1; empty otherwise. Re-finalized + dumped into
+  // one pluralized file (schedule_graphs.json) so an external harness can
+  // autotune over them.
+  llvm::SmallVector<llvm::SmallVector<int>, 3> topPartitions;
+
+  // Phase-4 cost-model cost for THIS loop's committed/dumped partition (lower
+  // == predicted faster). Dumped as `partition_cost` so an autotuning harness
+  // can check the cost-model ranking against measured perf, and tell whether
+  // equal-cost variants actually run equally fast. 0 = unset.
+  double partitionCost{0.0};
+  // Costs parallel to `topPartitions[k]` (best-first), populated with it.
+  llvm::SmallVector<double, 3> topPartitionCosts;
 
   // Lookup
   llvm::DenseMap<Operation *, unsigned> opToNodeId;

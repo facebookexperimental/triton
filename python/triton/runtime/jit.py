@@ -1,5 +1,6 @@
 from __future__ import annotations, division
 import ast
+import contextlib
 import copy
 import hashlib
 import inspect
@@ -48,7 +49,27 @@ def _ensure_torch_bridge():
 
 
 TRITON_MODULE = "triton.language"
+
+# compile_iq free-win: the launch-time plain-vs-ACF competition (CompiledKernel._compile_iq_resolve)
+# must NOT fire while the autotuner is benchmarking configs -- otherwise the one-shot A/B would run
+# mid-do_bench and corrupt a config's timing. The autotuner wraps its do_bench in this suppressor;
+# the autotune flow tunes configs on plain timing (ACF candidate-expansion is handled separately).
+_compile_iq_state = threading.local()
+
+
+@contextlib.contextmanager
+def _compile_iq_suppress_competition():
+    prev = getattr(_compile_iq_state, "suppressed", False)
+    _compile_iq_state.suppressed = True
+    try:
+        yield
+    finally:
+        _compile_iq_state.suppressed = prev
+
+
 GLUON_MODULE = "triton.experimental.gluon.language"
+
+INDENT_PATTERN = re.compile(r"^(?P<indent>[ \t]*)def\s+\w+\s*\(", re.MULTILINE)
 
 T = TypeVar("T")
 
@@ -149,6 +170,7 @@ class DependenciesFinder(ast.NodeVisitor):
             return
 
         if getattr(val, "__triton_aggregate__", False):
+            self.hasher.update(str(val.__annotations__).encode("utf-8"))
             for attr in val.hash_attrs:
                 self.record_reference(attr)
             return
@@ -526,7 +548,14 @@ class JITCallable:
         self._hash_lock = threading.RLock()
 
         # function source code (without decorators)
-        src = textwrap.dedent("".join(self.raw_src))
+        raw_src_str = "".join(self.raw_src)
+
+        # get file name, starting line number and starting col number
+        self.file_name = fn.__code__.co_filename
+        self.def_file_line_number = get_def_line_number(self.raw_src, self.starting_line_number)
+        self.def_file_col_number = get_def_col_number(raw_src_str)
+
+        src = textwrap.dedent(raw_src_str)
         src = src[re.search(r"^def\s+\w+\s*\(", src, re.MULTILINE).start():]
         self._src = src
         self.hash = None
@@ -927,6 +956,18 @@ class JITFunction(JITCallable, KernelInterface[T]):
             kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
             if kernel is None:
                 return None
+            # compile_iq: dump a collection task for the offline ACF factory.
+            # Gated by TRITON_COMPILE_IQ_COLLECT; fires on the compile (cache-miss) path
+            # where signature/constexprs are in scope. Never affects the user run.
+            if os.environ.get("TRITON_COMPILE_IQ_COLLECT"):
+                try:
+                    from triton.compile_iq.collector import capture as _ciq_capture
+                    _ck = kernel.result() if hasattr(kernel, "result") else kernel
+                    _cg = grid(bound_args) if callable(grid) else grid
+                    _ciq_capture(jitfn=self, kernel=_ck, bound_args=bound_args, signature=signature,
+                                 constexprs=constexprs, grid=tuple(list(_cg) + [1, 1, 1])[:3])
+                except Exception:
+                    pass
             _fc_needs_insert = self.c_cache
         else:
             _fc_needs_insert = False
@@ -958,6 +999,13 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
             if hasattr(kernel, "result"):
                 kernel = kernel.result()
+            # compile_iq free-win: if a tuned ACF candidate is pending, run the one-shot plain-vs-ACF
+            # competition with the real args before launching, and keep the winner (no-op/near-zero
+            # cost otherwise; suppressed while the autotuner is benchmarking). Read _disp afterward so
+            # a rebuilt dispatcher for the winning function is used.
+            if (getattr(kernel, "_compile_iq_acf_cubin", None) is not None
+                    and not getattr(_compile_iq_state, "suppressed", False)):
+                kernel._compile_iq_resolve(grid_0, grid_1, grid_2, stream, bound_args)
             # launch kernel — prefer _TritonDispatcher (C direct cuLaunchKernelEx)
             # when available and hooks are not needed.
             _disp = getattr(kernel, '_dispatcher', None)
@@ -968,7 +1016,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
             else:
                 if knobs.nvidia.use_triton_dispatcher and _disp is None:
                     warnings.warn(
-                        f"[Triton] TRITON_USE_TRITON_DISPATCHER=1 but kernel '{self._fn_name}' has no C dispatcher, "
+                        f"[Triton] TRITON_USE_C_DISPATCHER=1 but kernel '{self._fn_name}' has no C dispatcher, "
                         f"falling back to Python launch",
                         stacklevel=2,
                     )
@@ -1077,13 +1125,13 @@ class JITFunction(JITCallable, KernelInterface[T]):
                 return tl.dtype(value)
             if isinstance(value, dict):
                 if 'constexpr' in value:
-                    return tl.constexpr(value['constexpr'])
+                    return tl.constexpr(convert_to_tuple_if_list(value['constexpr']))
                 if 'jit_function' in value:
                     jf_key = value['jit_function']
                     if jf_key in _triton_jit_function_registry:
                         return _triton_jit_function_registry[jf_key]
                     raise RuntimeError(f"Unable to resolve JITFunction {jf_key} for preload")
-            return value
+            return convert_to_tuple_if_list(value)
 
         constexprs = {key: _decode_constant(value) for key, value in zip(constant_keys, constant_vals)}
         attrs_keys = map(tuple, deserialized_obj['attrs_keys'])
@@ -1318,22 +1366,30 @@ def reinterpret(tensor, dtype):
         raise TypeError(f"Cannot reinterpret a {type(tensor)}.")
 
 
-def get_jit_fn_file_line(fn):
-    base_fn = fn
-    while not isinstance(base_fn, JITCallable):
-        base_fn = base_fn.fn
-    file_name = base_fn.fn.__code__.co_filename
-    begin_line = base_fn.starting_line_number
+def get_def_line_number(raw_src, starting_line_number):
+    def_file_line_number = starting_line_number
     # Match the following pattern:
     # @triton.autotune(...) <- foo.__code__.co_firstlineno
     # @triton.heuristics(...)
     # @triton.jit
     # def foo(...): <- this line is the first line
-    for idx, line in enumerate(base_fn.raw_src):
+    for idx, line in enumerate(raw_src):
         if line.strip().startswith("def "):
-            begin_line += idx
+            def_file_line_number += idx
             break
-    return file_name, begin_line
+    return def_file_line_number
+
+
+def get_def_col_number(raw_src_str):
+    # Find the amount of indenting to use in the source location information.
+    indented_def = INDENT_PATTERN.search(raw_src_str)
+    if not indented_def:
+        raise ValueError("No function definition found for kernel")
+    # Consider spaces and tabs as single characters to match the ast
+    def_file_col_number = len(indented_def.group("indent"))
+    # Columns start at 1
+    def_file_col_number += 1
+    return def_file_col_number
 
 
 class BoundConstexprFunction(JITCallable):

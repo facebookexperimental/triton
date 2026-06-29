@@ -4,6 +4,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
+#include "nvidia/hopper/lib/Transforms/WarpSpecialization/CodePartitionUtility.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
@@ -43,7 +44,7 @@ int doTaskIdPropagate(triton::FuncOp &funcOp);
 LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
                               StringRef readDecisionFile = "",
                               StringRef writeDecisionFile = "",
-                              int smemAllocAlgo = 0, unsigned smemBudget = 0,
+                              int smemAllocAlgo = 1, unsigned smemBudget = 0,
                               bool smemCircularReuse = false);
 void doBufferAllocation(triton::FuncOp &funcOp);
 void doHoistLoopInvariantTMEMStore(triton::FuncOp &funcOp);
@@ -229,7 +230,7 @@ public:
 
     if (failed(doMemoryPlanner(funcOp, numStages, /*readDecisionFile=*/"",
                                /*writeDecisionFile=*/"",
-                               /*smemAllocAlgo=*/0, smemBudget))) {
+                               /*smemAllocAlgo=*/1, smemBudget))) {
       signalPassFailure();
       return;
     }
@@ -286,6 +287,7 @@ public:
 
     doLowerSubtiledRegionsWithNVWSOps(funcOp);
     doTokenLowering(funcOp, numWarpGroups - 1);
+    invalidateWarpSpecializeBarriers(funcOp);
     if (dumpIntermediateSteps) {
       llvm::dbgs()
           << "// -----// WarpSpec internal IR Dump After: doTokenLowering\n";

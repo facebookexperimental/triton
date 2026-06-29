@@ -14,12 +14,14 @@ into two M=128 pieces for two consumer groups.
 ```
 doTaskPartition          ← assigns ops to partitions
   → doTaskIdPropagate   ← propagates task IDs to all ops
-  → doDataPartition     ← THIS STEP: splits tensor dimensions (Hopper only)
+  → doDataPartition     ← THIS STEP: splits tensor dimensions
   → doPingPongPrep
 ```
 
-Data partitioning runs only on Hopper. On Blackwell, the partition scheduling
-pass (`PartitionSchedulingMeta`) handles spatial splitting differently.
+Data partitioning is exposed as `nvgpu-ws-data-partition` and is not Hopper
+only. Hopper-style AutoWS typically reaches it after task ID propagation, while
+Blackwell flows may run it as a separate pass when an explicit data partition
+factor is attached or multiple warp groups require per-consumer slices.
 
 ## `DataPartitionScheme`
 
@@ -58,7 +60,8 @@ Runs to a fixed point.
 
 Drives partitioning from dot/MMA ops:
 
-1. Collect all `WarpGroupDotOp` and `TCGen5MMAOp` operations.
+1. Collect all `WarpGroupDotOp` operations and all operations implementing
+   `MMAv5OpInterface`.
 2. For each dot with multiple `async_task_id` values, determine the partition
    dimension from the accumulator shape:
    - **M dimension** (dim 0): if `shapePerCTA[0] / numPartitions >= 64`
@@ -66,6 +69,12 @@ Drives partitioning from dot/MMA ops:
    - M is preferred; N is fallback.
 3. Call `getSliceToPartition` to trace the partition dimension through the
    dataflow graph.
+4. Reject trial schemes that would require changing an existing TMEM encoding
+   when partitioning along M. For example, splitting a `128x128` TMEM
+   allocation with `blockM=128` into two `64x128` slices is rejected before any
+   data partitioning rewrite; splitting `256x128` into `128x128` slices remains
+   valid. When this guard fires, data partitioning is skipped and the function
+   is otherwise left unchanged.
 
 ### Step 3: Slice Propagation (`getSliceToPartition`)
 
@@ -132,6 +141,28 @@ slicing and along which dimension.
 If a `TensorDescType` function argument is also used as a loop init value, the
 pass currently bails out. Updating both the function signature and the loop
 carried argument/result types consistently requires additional handling.
+
+### MMAv5 Scaled MMA
+
+Scaled MMAv5 ops are partitioned through `MMAv5OpInterface` for the ordinary
+MMA operands and accumulator. Scale operands are handled only for
+`TCGen5MMAScaledOp`, because scale operands are not part of the generic MMAv5
+interface.
+
+The scale TMEM memdesc is treated logically as `(BLOCK_MN,
+BLOCK_K / scale_vec_size)`. Therefore:
+
+- M/output dim 0 partitioning slices `A` and `A_scale`; `A_scale` is sliced
+  along logical scale dim 0.
+- N/output dim 1 partitioning slices `B` and `B_scale`; `B_scale` is sliced
+  along logical scale dim 0.
+- Logical scale dim 1 is the K/scale-vector dimension and is not sliced by the
+  normal M/N data partitioning path.
+
+Scale buffers populated by `TMEMCopyOp` also need their copy source sliced to
+match the destination scale rows. The copy source uses packed 32x128b chunks,
+so the source partition dimension is the packed `repRows` dimension rather than
+the logical scale dimension directly.
 
 ### Interaction with Task IDs
 

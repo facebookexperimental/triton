@@ -47,6 +47,40 @@ def compile_only(kernel, *args, grid=(1, ), **meta):
     return kernel.warmup(*args, grid=grid, **meta)
 
 
+# compute-capability -> human label, used by the cross-arch MMA tutorials.
+_CC_NAMES = {80: "Ampere sm_80", 90: "Hopper sm_90", 100: "Blackwell sm_100", 120: "Blackwell sm_120"}
+
+
+def cc_name(cc):
+    """Human-readable name for a CUDA compute capability (e.g. 90 -> 'Hopper sm_90')."""
+    return _CC_NAMES.get(cc, f"sm_{cc}")
+
+
+def compile_for_target(kernel, signature, constexprs, cc, **options):
+    """Compile a ``@triton.jit`` kernel for an ARBITRARY arch — no device required.
+
+    ``compile_only`` always targets the *current* GPU. To contrast how a pass
+    lowers the same kernel on different hardware (e.g. Hopper wgmma vs Blackwell
+    tcgen05), we instead build an :class:`ASTSource` by hand and hand it an
+    explicit :class:`GPUTarget`, so the whole TTIR->...->PTX pipeline runs for
+    ``cc`` even on a box whose GPU is a different arch. Only *compilation* is
+    arch-free; launching still needs the real hardware (the tutorials self-gate
+    their runtime correctness check accordingly).
+
+    ``signature`` maps each kernel arg name to a Triton type string
+    (``"*fp16"``, ``"*fp32"``, ``"constexpr"`` ...); ``constexprs`` maps the
+    constexpr arg names to their values. ``options`` (``num_warps``,
+    ``num_stages`` ...) are forwarded verbatim. The result exposes the same
+    ``.asm`` keys as :func:`compile_only`.
+    """
+    import triton  # local import: keep this helper module dependency-light
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+
+    src = ASTSource(fn=kernel, signature=signature, constexprs=constexprs)
+    return triton.compile(src, target=GPUTarget("cuda", cc, 32), options=options or None)
+
+
 def banner(title):
     print("\n" + "=" * 78)
     print(title)

@@ -3,7 +3,7 @@
 
 #include "TritonAMDGPUToLLVM/TargetUtils.h"
 #include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
-#include "llvm/TargetParser/TargetParser.h"
+#include "llvm/TargetParser/AMDGPUTargetParser.h"
 #include <string>
 
 namespace mlir::triton::AMD {
@@ -22,7 +22,11 @@ public:
 
   int getSharedMemorySize() const;
 
+  size_t getSharedMemoryPartitionSize() const override;
+
   bool supportMaximumMinimum() const override;
+
+  bool supportDppBroadcast() const;
 
   Value getClusterCTAId(RewriterBase &rewriter, Location loc) const override;
 
@@ -105,6 +109,11 @@ public:
   bool requiresAliasInfoForAsyncOps() const;
   bool supportsDirectToLdsLoadBitWidth(int bitWidth) const;
   bool supportsDirectFromLdsStoreBitWidth(int bitWidth) const;
+  bool supportsBufferLoadToLocal() const;
+
+  // Whether this target uses asyncmark/wait_asyncmark intrinsics for
+  // async memory ops synchronization instead of waitcnt-based intrinsics waits.
+  bool useAsyncMarks() const;
 
   bool supportsMultiCTALaunch() const;
   bool supportsTDM() const;

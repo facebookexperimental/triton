@@ -9,6 +9,9 @@ on:
     branches: [main, 'dev-**']
     types: [checks_requested]
   workflow_dispatch:
+  schedule:
+    # Every 6 hours at :15 past (00:15, 06:15, 12:15, 18:15 UTC).
+    - cron: '15 */6 * * *'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -21,6 +24,8 @@ jobs:
     name: LIT Tests
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      failures: ${{ steps.parse.outputs.failures }}
 
     steps:
       - name: Checkout
@@ -32,34 +37,43 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Get LLVM hash
+      - name: Get LLVM info
         id: llvm-hash
         run: |
-          HASH=$(cat cmake/llvm-hash.txt)
+          # Parse cmake/llvm-info.json with sed (no jq/python dep), matching
+          # scripts/build-llvm-project.sh and the llvm-build.yml producer.
+          HASH=$(sed -n 's/.*"llvm_hash"[[:space:]]*:[[:space:]]*"\([0-9a-f]*\)".*/\1/p' cmake/llvm-info.json)
+          BUILD=$(sed -n 's/.*"build_number"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' cmake/llvm-info.json)
           echo "hash=$HASH" >> "$GITHUB_OUTPUT"
           echo "short=${HASH:0:8}" >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
 
       - name: Cache LLVM
         id: cache-llvm
         uses: actions/cache@v4
         with:
           path: llvm-install
-          key: llvm-ubuntu-x64-${{ steps.llvm-hash.outputs.short }}
+          key: llvm-ubuntu-x64-${{ steps.llvm-hash.outputs.short }}-${{ steps.llvm-hash.outputs.build }}
 
       - name: Download LLVM
         if: steps.cache-llvm.outputs.cache-hit != 'true'
         run: |
-          TARBALL="llvm-${{ steps.llvm-hash.outputs.short }}-ubuntu-x64.tar.gz"
-          curl -sLO "https://oaitriton.blob.core.windows.net/public/llvm-builds/${TARBALL}"
+          # Artifact name must include the build number (get_llvm_package_info, setup.py:241).
+          DIR="llvm-${{ steps.llvm-hash.outputs.short }}-ubuntu-x64-${{ steps.llvm-hash.outputs.build }}"
+          TARBALL="${DIR}.tar.gz"
+          curl -fsSLO "https://oaitriton.blob.core.windows.net/public/llvm-builds/${TARBALL}"
           tar xzf "${TARBALL}"
-          mv "llvm-${{ steps.llvm-hash.outputs.short }}-ubuntu-x64" llvm-install
+          mv "${DIR}" llvm-install
           rm "${TARBALL}"
 
       - name: Build and run LIT tests
+        id: lit
         run: |
+          set -o pipefail
           python3 -m pip install cmake ninja lit
           LLVM="$GITHUB_WORKSPACE/llvm-install"
           cmake -G Ninja -B build \
+            -DTRITON_CACHE_PATH="$HOME/.triton" \
             -DLLVM_INCLUDE_DIRS="$LLVM/include" \
             -DLLVM_LIBRARY_DIR="$LLVM/lib" \
             -DLLVM_SYSPATH="$LLVM" \
@@ -67,4 +81,59 @@ jobs:
             -DTRITON_BUILD_UT=OFF \
             -DLLVM_EXTERNAL_LIT="$(which lit)" \
             .
-          ninja -C build check-triton-lit-tests
+          ninja -C build check-triton-lit-tests 2>&1 | tee /tmp/lit.log
+
+      - name: Collect nightly failures (LIT)
+        id: parse
+        if: always() && github.event_name == 'schedule'
+        run: |
+          FAILED_FLAG=""
+          if [ "${{ steps.lit.outcome }}" = "failure" ]; then
+            FAILED_FLAG="--failed"
+          fi
+          python3 .github/scripts/parse_lit_failures.py \
+            --log /tmp/lit.log \
+            --workflow "${GITHUB_WORKFLOW}" \
+            --job "lit-tests" \
+            --bucket "compiler-lit" \
+            ${FAILED_FLAG}
+
+  # ----- Nightly issue filing (schedule only) -----
+  report-compiler-lit:
+    needs: lit-tests
+    if: always() && github.event_name == 'schedule' && needs.lit-tests.outputs.failures != '' && needs.lit-tests.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.lit-tests.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: ${{ github.workflow }}
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ github.sha }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+
+  # ----- Nightly issue reconciliation: close recovered issues (schedule only) -----
+  reconcile-compiler-lit:
+    needs: lit-tests
+    if: always() && github.event_name == 'schedule' && (needs.lit-tests.result == 'success' || needs.lit-tests.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: ${{ github.workflow }}
+      job_name: lit-tests
+      failures: ${{ needs.lit-tests.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

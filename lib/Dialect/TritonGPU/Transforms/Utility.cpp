@@ -6,6 +6,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -644,7 +645,7 @@ bool isExpensiveToRemat(Operation *op, Attribute &targetEncoding) {
   return false;
 }
 
-bool canFoldIntoConversion(Operation *op, Attribute targetEncoding) {
+bool canUseResultEncoding(Operation *op, Attribute targetEncoding) {
   if (isa<triton::CatOp>(op))
     return !triton::gpu::isExpensiveCat(cast<triton::CatOp>(op),
                                         targetEncoding);
@@ -986,7 +987,7 @@ LogicalResult getConvertBackwardSlice(
         enqueue(definingOp->getOpOperand(0), encoding);
         continue;
       }
-      if (canFoldIntoConversion(definingOp, encoding))
+      if (canUseResultEncoding(definingOp, encoding))
         continue;
       if (stopPropagation && stopPropagation(definingOp))
         continue;
@@ -1277,7 +1278,8 @@ Operation *convertDistributedOpEncoding(Attribute encoding, Operation *op) {
   // Convert output types
   SmallVector<Type, 4> newTypes;
   for (auto t : op->getResultTypes()) {
-    bool isAsync = isa<triton::gpu::AsyncCopyGlobalToLocalOp>(op);
+    bool isAsync = isa<triton::gpu::AsyncCopyGlobalToLocalOp,
+                       triton::amdgpu::BufferLoadToLocalOp>(op);
     newTypes.push_back(isAsync ? t : getNewType(t, encoding));
   }
 
@@ -1790,6 +1792,20 @@ LogicalResult verifyBarrierType(Operation *op,
         barrierType.getRank() == 1 && barrierType.getShape()[0] <= numCTAs))
     return op->emitOpError("barrier allocation must be a descriptor of "
                            "Nxi64 type with N <= number of CTAs");
+
+  auto kBlock = StringAttr::get(op->getContext(), "block");
+  auto ll = toLinearLayout(barrierType).flattenOuts();
+  const auto &blockBases = ll.getBases().lookup(kBlock);
+  int i = 0;
+  for (const auto &basis : blockBases) {
+    if (basis[0] != 0 && basis[0] != int64_t(1) << i) {
+      return op->emitOpError(
+          "broadcasted cluster barriers require bases to be the sequence"
+          "1, 2, 4, 8, ... perhaps with zero bases interleaved.");
+    }
+    if (basis[0] != 0)
+      ++i;
+  }
   return success();
 }
 

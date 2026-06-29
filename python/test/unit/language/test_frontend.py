@@ -26,14 +26,10 @@ def anchor(v):
     pass
 
 
-@tl.core._aggregate
+@triton.aggregate
 class Pair:
     first: tl.tensor
     second: tl.tensor
-
-    def __init__(self, first, second):
-        self.first = first
-        self.second = second
 
     @triton.jit
     def get_first(self):
@@ -119,12 +115,9 @@ def test_jit_method():
     anchor(b)
 
 
-@tl.core._aggregate
+@triton.aggregate
 class TypeWithJitGetItem:
     value: tl.tensor
-
-    def __init__(self, value):
-        self.value = value
 
     @triton.jit
     def __getitem__(self, ind):
@@ -145,7 +138,7 @@ def test_jit_getitem():
     # CHECK: tt.return [[ARG0]]
 
 
-@tl.core._aggregate
+@triton.aggregate
 class TypeWithBuiltinInitializer:
     value: tl.tensor
 
@@ -161,6 +154,58 @@ def test_aggregate_initializers():
     # CHECK: [[RANGE:%.*]] = tt.make_range {end = 4 : i32, start = 0 : i32}
     # CHECK: call @{{.*}}anchor{{.*}}([[RANGE]])
     anchor(value)
+
+
+def test_aggregate_auto_init_assigns_members():
+
+    @triton.aggregate
+    class State:
+        x: tl.constexpr
+        y: tl.constexpr
+
+    state = State(3, y=7)
+    assert isinstance(state.x, tl.constexpr)
+    assert isinstance(state.y, tl.constexpr)
+    assert state.x.value == 3
+    assert state.y.value == 7
+
+
+def test_aggregate_auto_init_with_tuples():
+
+    class Shape(NamedTuple):
+        x: tl.constexpr
+        y: tl.constexpr
+
+    @triton.aggregate
+    class State:
+        shape: tl.tuple
+        strides: tl.tuple
+
+    state = State(Shape(3, tl.constexpr(7)), (7, tl.constexpr(1)))
+    assert isinstance(state.shape, tl.tuple)
+    assert isinstance(state.shape.x, tl.constexpr)
+    assert isinstance(state.shape.y, tl.constexpr)
+    assert state.shape[0].value == 3
+    assert state.shape[1].value == 7
+
+    assert isinstance(state.strides, tl.tuple)
+    assert isinstance(state.strides[0], tl.constexpr)
+    assert isinstance(state.strides[1], tl.constexpr)
+    assert state.strides[0].value == 7
+    assert state.strides[1].value == 1
+
+
+def test_aggregate_auto_init_respects_user_defined_init():
+
+    @triton.aggregate
+    class State:
+        x: tl.constexpr
+
+        def __init__(self, x):
+            self.x = tl.constexpr(x + 1)
+
+    state = State(10)
+    assert state.x.value == 11
 
 
 @triton.jit
@@ -203,7 +248,7 @@ def test_call_in_loop():
         acc = accumulate(acc, i)
 
 
-@tl.core._aggregate
+@triton.aggregate
 class FunctionParent:
 
     @triton.jit
@@ -226,14 +271,10 @@ def test_function_name_mangling():
     FunctionParent.function_with_name()
 
 
-@tl.core._aggregate
+@triton.aggregate
 class AggregateWithConstexpr:
     a: tl.tensor
     b: tl.constexpr
-
-    def __init__(self, a, b):
-        self.a = a
-        self.b = b
 
     @staticmethod
     def create(a):
@@ -263,18 +304,14 @@ def test_aggregate_with_constexpr():
     # CHECK: arith.addi %arg0, %cst : tensor<4xi32>
 
 
-@tl.core._aggregate
+@triton.aggregate
 class AggregateWithTuple:
     a: tl.tuple
-
-    @triton.constexpr_function
-    def __init__(self, a):
-        self.a = tl.tuple((a, ))
 
     @staticmethod
     @triton.jit
     def create(a):
-        return AggregateWithTuple(a)
+        return AggregateWithTuple((a, ))
 
 
 @triton.jit
@@ -352,16 +389,13 @@ def test_constexpr_getitem():
 @triton.constexpr_function
 def Box(T):
 
-    @tl.core._aggregate
+    @triton.aggregate
     class BoxImpl:
         value: T
 
         @triton.jit
         def create(value):
             return BoxImpl(value)
-
-        def __init__(self, value):
-            self.value = value
 
     return BoxImpl
 
@@ -461,7 +495,7 @@ def test_tuple_constexpr():
     run_parser(foo, args=(test, ))
 
 
-@tl.core._aggregate
+@triton.aggregate
 class AggregateWithConstexprFunction:
     val: tl.constexpr
     val_squared: tl.constexpr

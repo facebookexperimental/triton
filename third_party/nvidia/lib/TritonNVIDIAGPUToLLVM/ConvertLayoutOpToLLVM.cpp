@@ -50,7 +50,7 @@ struct ConvertLayoutOpSwizzlingConversion
     assert(to_vector(conversion.getInDimNames()) ==
            to_vector(conversion.getOutDimNames()));
     auto dims = conversion.getInDimNames();
-    if (!llvm::is_contained(dims, kBlock) &&
+    if (!llvm::is_contained(dims, kBlock) && !cvtAlwaysUseWarpShuffle(op) &&
         cvtNeedsSharedMemory(srcTy, dstTy)) {
       auto loc = op.getLoc();
       // Remove the kBlock dimension from the layout as it's the identity in the
@@ -223,39 +223,6 @@ struct ConvertLayoutOpSwizzlingConversion
     // Undo the permLoad used to divideRight
     outVals = permLoad.inverse().apply(outVals);
     return outVals;
-  }
-
-  LogicalResult
-  transferWithinBlockSwizzling(ConvertLayoutOp op, Value src,
-                               ConversionPatternRewriter &rewriter) const {
-    auto loc = op.getLoc();
-    auto *ctx = op.getContext();
-    auto srcTy = op.getSrc().getType();
-    auto dstTy = op.getType();
-
-    // Remove the kBlock dimension from the layout as it's the identity in the
-    // cvt
-    auto srcLayout = toLinearLayout(srcTy);
-    auto dstLayout = toLinearLayout(dstTy);
-    auto kReg = str_attr("register");
-    auto kLane = str_attr("lane");
-    auto kWarp = str_attr("warp");
-    srcLayout = srcLayout.sublayout({kReg, kLane, kWarp},
-                                    to_vector(srcLayout.getOutDimNames()));
-    dstLayout = dstLayout.sublayout({kReg, kLane, kWarp},
-                                    to_vector(dstLayout.getOutDimNames()));
-
-    auto llvmElemTy = getTypeConverter()->convertType(srcTy.getElementType());
-    auto smemBase =
-        LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op.getOperation());
-    auto inVals = unpackLLElements(loc, src, rewriter);
-    auto outVals = transferWithinBlockSwizzling(
-        loc, rewriter, srcLayout, dstLayout, inVals, llvmElemTy, smemBase);
-
-    Value result =
-        packLLElements(loc, getTypeConverter(), outVals, rewriter, dstTy);
-    rewriter.replaceOp(op, result);
-    return success();
   }
 };
 

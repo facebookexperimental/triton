@@ -7,7 +7,9 @@ Redesign the SMEM allocation in `MemoryPlanner::run()` so that:
 1. Each `local_alloc` is modeled as a **WSBuffer**.
 2. Every WSBuffer starts with a single copy (`buffer.copy = 1`).
 3. WSBuffers that span multiple `loop.stage` must have at least 2 copies.
-4. `num_buffers` (the `--num-buffers` pass parameter) determines the maximum copies.
+4. `num_buffers` (the `--num-buffers` pass parameter) determines the maximum
+   discretionary copies. Correctness floors may exceed it and are still
+   enforced.
 5. Copies are incrementally increased for high-priority WSBuffers while
    fitting within the SMEM budget.
 6. A pass option `--smem-circular-reuse` (default: off) gates all
@@ -30,7 +32,7 @@ Redesign the SMEM allocation in `MemoryPlanner::run()` so that:
 | Term | Meaning |
 |------|---------|
 | **WSBuffer** | A wrapper around one `ttg.local_alloc` op, tracking its size, liveness interval, channel properties, and allocation decisions (`buffer.id`, `buffer.copy`). |
-| **num_buffers** | The `--num-buffers` pass parameter. Determines the maximum `buffer.copy` value for any WSBuffer. |
+| **num_buffers** | The `--num-buffers` pass parameter. Determines the maximum discretionary `buffer.copy` value for any WSBuffer. Correctness floors may exceed it. |
 | **Reuse group** | A pair of WSBuffers that share a single `buffer.id`. The physical allocation is `max(size_A, size_B) * buffer.copy`. Only formed when `--smem-circular-reuse` is on. |
 | **smem-circular-reuse** | Pass option (default: off). When on, enables reuse-group pairing in Phase 4. When off, every WSBuffer keeps its own `buffer.id`. |
 | **Cross-stage** | A WSBuffer whose channel has producer and consumer(s) in different `loop.stage` values. |
@@ -54,6 +56,7 @@ struct WSBuffer {
     bool       isCrossStage;   // src and dst in different loop.stage
     unsigned   bufferId;       // assigned buffer.id
     unsigned   numCopies;      // assigned buffer.copy (starts at 1)
+    unsigned   minCopies;      // strict cross-stage floor; numCopies never < this
 };
 ```
 
@@ -61,16 +64,46 @@ All WSBuffers start with:
 - A unique `bufferId` (0, 1, 2, …)
 - `numCopies = 1`
 
-### Phase 2: Enforce Cross-Stage Minimum
+### Phase 2: Enforce Cross-Stage Minimum (strict floor, applied first)
 
-Any WSBuffer with `isCrossStage == true` must have at least 2 copies
-(as long as `num_buffers >= 2`). For each such WSBuffer, set `numCopies = 2`.
+Any WSBuffer with `isCrossStage == true` is given a **correctness floor** equal
+to the number of pipeline stages its live range spans —
+`max(maxConsumerStage - minConsumerStage + 1, 1)`. This is `>= 2` for a genuine
+cross-stage buffer, and exactly `1` (a no-op) otherwise. The floor is recorded
+in `minCopies` and applied to `numCopies` **first**, before any reuse or
+copy-increase step.
 
-Note: no budget check is performed here. The total SMEM may temporarily
-exceed the budget after this phase. Phase 4 will resolve this — either by
-grouping cross-stage buffers into reuse groups (which reduces physical SMEM)
-or by confirming the allocation fits. If Phase 4 cannot bring the total
-within budget, it reports the failure.
+Only actual consumers with `loop.stage` participate in this span. If an
+in-loop producer feeds only post-loop or otherwise un-staged consumers, the
+depth remains `1`: those consumers are outside the pipelined
+producer/consumer slot-rotation cycle, so they do not create a cross-stage
+correctness floor.
+
+The correctness floor is not capped by `num_buffers`. If the floor exceeds the
+configured `num_buffers`, the planner emits a warning and enforces the floor
+anyway. Under-allocating here can silently reintroduce a producer/consumer slot
+collision and hang at runtime; exceeding the soft knob is safer and remains
+subject to the hardware SMEM limit.
+
+This floor is **strict**: a cross-stage buffer with too few copies lets the
+producer overwrite a slot that a later-stage consumer still reads, which
+deadlocks at runtime. Therefore the floor is **never reverted for budget**. No
+budget check is performed in this phase; the total SMEM may temporarily exceed
+the budget afterwards.
+
+Budget is reconciled later (Phase 3.6) by reusing **discretionary** SMEM — the
+TMA store/reduce staging buffers (write → TMA op → dead). Co-live operand buffers
+(loaded once per outer iteration and read across the whole inner loop, e.g.
+`q`/`k`/`v`) are explicitly excluded from that reuse, since aliasing them is
+unsafe. If, even after staging reuse, the floored allocation still exceeds the
+budget, the planner emits a warning and **ships it anyway** rather than dropping
+a floor — the real hardware SMEM limit (an `OutOfResources` at codegen) is the
+backstop.
+
+> Earlier revision: a budget-gated revert here silently downgraded the
+> cross-stage `q` buffer to a single copy and deadlocked `_attn_bwd_persist`
+> (FA backward, `ws_persistent`, early-TMA). See
+> `.llms/rules/partition-scheduler-bugs.md` #8.
 
 ### Phase 3: Classify and Prioritize
 
@@ -304,15 +337,12 @@ Both at `numCopies = 2` from Phase 2. `currentGroupCopies = 1`.
 **P0: `do`, `q`**  (`smem-circular-reuse = true`)
 
 |candidates|=2 → group `do`+`q` upfront. Both are cross-stage (need 2
-individual copies), so group minimum = `2*2-1 = 3`. But `num_buffers = 2`,
-so `3 > num_buffers` — the group's starting copies is clamped to
-`num_buffers = 2`. `currentGroupCopies = 2`.
+individual copies), so group minimum = `2*2-1 = 3`. This is a correctness
+floor, so it is enforced even though `num_buffers = 2`; the planner emits a
+warning and starts the group at `currentGroupCopies = 3`.
 
-- Level 2: group not yet at 2.
-  - Group tries `numCopies = 2`: cost = max(32,32) × 2 = 64 KB.
-    total = 32(dsT) + **64**(do+q) + 32(k) + 32(v) = 160 KB ≤ 227 KB ✓.
-  - Commit. Advance.
-- Level 3: 3 > 2 → exit (num_buffers = 2). **Done.**
+- Level 3: 3 > 2 → no discretionary P0 increment is attempted. The floor
+  remains enforced. **Done.**
 
 **P1: `dsT`**
 
@@ -322,8 +352,8 @@ With `smem-circular-reuse = false` (do=2, q=2, separate):
 - Level 2: total = 64(dsT) + 64(do) + 64(q) + 32(k) + 32(v) = 256 KB > 227 KB ✗.
   Cannot increase.
 
-With `smem-circular-reuse = true` (do+q group at 2):
-- Level 2: total = 64(dsT) + 64(do+q) + 32(k) + 32(v) = 192 KB ≤ 227 KB ✓.
+With `smem-circular-reuse = true` (do+q group at 3):
+- Level 2: total = 64(dsT) + 96(do+q) + 32(k) + 32(v) = 224 KB ≤ 227 KB ✓.
   Commit.
 
 **P2: `k_42`, `v_43`**
@@ -349,16 +379,16 @@ Total SMEM = 32 + 64 + 64 + 32 + 32 = 224 KB
 | WSBuffer | `buffer.id` | `buffer.copy` | Reuse Group |
 |----------|-------------|---------------|-------------|
 | `dsT`    | 0           | 2             | — |
-| `do`     | 1           | 2             | `do` + `q` |
-| `q`      | 1           | 2             | `do` + `q` |
+| `do`     | 1           | 3             | `do` + `q` |
+| `q`      | 1           | 3             | `do` + `q` |
 | `k_42`   | 2           | 1             | — |
 | `v_43`   | 3           | 1             | — |
 
 ```
-Total SMEM = 64 + 64 + 32 + 32 = 192 KB
+Total SMEM = 64 + 96 + 32 + 32 = 224 KB
 ```
 
-Grouping `do`+`q` saves 64 KB (from 224 KB to 160 KB for those two),
+Grouping `do`+`q` saves 32 KB (from 128 KB to 96 KB for those two),
 freeing budget for `dsT` to increase to 2 copies.
 
 ---
@@ -587,11 +617,11 @@ This interface is unchanged.
 |-----------|----------|
 | Abstraction | `WSBuffer` struct per `local_alloc` |
 | Initial state | Phase 1: unique IDs, all `copy = 1` |
-| Cross-stage | Phase 2: force `copy ≥ 2` |
+| Cross-stage | Phase 2: strict floor `copy ≥ stage-span` (`minCopies`), applied first, never reverted |
 | Multi-buffering | Phase 4: iterative, budget-aware |
-| Reuse | Pair of 2 same-priority WSBuffers; grouping-first when copies ≥ 2 |
-| Max copies | `num_buffers` param (incremental cap) |
-| Budget | Enforced at every iteration |
+| Reuse | Pair of 2 same-priority WSBuffers; grouping-first when copies ≥ 2. Phase 3.6 also reuses discretionary TMA-staging SMEM (never co-live operands) to fit cross-stage floors |
+| Max copies | `num_buffers` param for discretionary increments; correctness floors may exceed it |
+| Budget | Enforced for discretionary copies; cross-stage floor is exempt (HW SMEM limit is the backstop) |
 | Iteration order | Sorted by operation ID |
 
 ---

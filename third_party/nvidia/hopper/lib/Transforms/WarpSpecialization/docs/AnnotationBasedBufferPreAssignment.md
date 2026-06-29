@@ -2,7 +2,7 @@
 
 ## Overview
 
-Users can annotate `tl.dot` operations with per-operand channel specifications via the `attrs` dict. These annotations flow through the compiler as a `tt.autows` JSON string attribute on `ttng.tc_gen5_mma` ops and can be consumed by WSMemoryPlanner to **pre-assign** `buffer.copy`, `buffer.id`, and `buffer.offset` — bypassing heuristic allocation for annotated buffers while leaving un-annotated buffers unchanged.
+Users can annotate `tl.dot` / `tl.dot_scaled` operations with per-operand channel specifications via the `attrs` dict. These annotations flow through the compiler as a `tt.autows` JSON string attribute on `ttng.tc_gen5_mma` / `ttng.tc_gen5_mma_scaled` ops and can be consumed by WSMemoryPlanner to **pre-assign** `buffer.copy`, `buffer.id`, and `buffer.offset` — bypassing heuristic allocation for annotated buffers while leaving un-annotated buffers unchanged.
 
 ## Implementation Status
 
@@ -17,7 +17,7 @@ Users can annotate `tl.dot` operations with per-operand channel specifications v
 
 ### Remaining Gap
 
-**SMEM algo 0**: The original `MemoryPlanner` class (used when `tt.smem_alloc_algo = 0` or not set)
+**SMEM algo 0**: The original `MemoryPlanner` class (used when `tt.smem_alloc_algo = 0`)
 does not receive annotations. All annotated kernels should use `tt.smem_alloc_algo = 1`.
 
 ### User-Facing API
@@ -35,7 +35,7 @@ Each channel string: `"operand,memoryType,numCopies,bufferId"`
 
 | Field | Values | Description |
 |-------|--------|-------------|
-| `operand` | `opndA`, `opndB`, `opndD` | Which MMA operand this channel feeds |
+| `operand` | `opndA`, `opndB`, `opndD`, `opndAScale`, `opndBScale` | Which MMA operand this channel feeds. Scale operands apply only to `ttng.tc_gen5_mma_scaled`. |
 | `memoryType` | `smem`, `tmem` | Memory backing for the channel |
 | `numCopies` | integer | Multi-buffering depth |
 | `bufferId` | integer | Buffer identity; shared IDs form reuse groups |
@@ -61,7 +61,7 @@ The `tt.autows` attribute survives through `AccelerateMatmul` (which propagates 
 | Phase | Action | Annotated Buffer Behavior |
 |-------|--------|---------------------------|
 | 1. Initialize | Create `WSBuffer` per `local_alloc`, `bufferId = nextId++`, `numCopies = 1` | **Override**: set `bufferId` and `numCopies` from annotation, mark `isPinned = true` |
-| 2. Cross-stage minimum | `numCopies = 2` for cross-stage buffers | **Skip** pinned buffers |
+| 2. Cross-stage minimum | Enforce computed cross-stage depth for heuristic buffers | **Preserve** pinned buffers; warn if the annotation is below the computed required depth |
 | 3. Classify priorities | P0 (TMA+innermost), P1, P2 | **Skip** pinned buffers |
 | 4. Iterative copy increase | Increment copies within SMEM budget; optional circular reuse pairing | **Exclude** pinned buffers from candidates |
 | 5. Emit attributes | Write `buffer.id`, `buffer.copy` on each `local_alloc` | No change — emits from WSBuffer fields |
@@ -80,6 +80,13 @@ The `tt.autows` attribute survives through `AccelerateMatmul` (which propagates 
 | A | `ChannelPost` (SMEM) or `TmemDataChannelPost` (TMEM) | `operandIdx` / trace through users | smem or tmem |
 | B | `ChannelPost` (SMEM) or `TmemDataChannelPost` (TMEM) | `operandIdx` / trace through users | smem or tmem |
 | D | `TmemDataChannelPost` | `isOperandD = true` | tmem (always) |
+| A scale | `ChannelPost` (SMEM) or `TmemDataChannelPost` (TMEM) | `operandIdx = 4` (`a_scale`) | smem or tmem |
+| B scale | `ChannelPost` (SMEM) or `TmemDataChannelPost` (TMEM) | `operandIdx = 5` (`b_scale`) | smem or tmem |
+
+For `ttng.tc_gen5_mma_scaled`, the fixed operand order is:
+`a=0`, `b=1`, `d=2`, `acc_dep=3`, `a_scale=4`, `b_scale=5`,
+`useD=6`, `pred=7`, followed by variadic barriers and barrier predicates.
+The scale annotations therefore use operand indices 4 and 5.
 
 ---
 
@@ -235,8 +242,16 @@ nextBufferId = std::max(nextBufferId, maxAnnotatedId);
 ```cpp
 // Phase 2 (cross-stage enforcement):
 for (auto &buf : wsBuffers) {
-  if (buf.isPinned) continue;  // NEW
-  if (buf.isCrossStage && numBuffers >= 2) { ... }
+  if (buf.isPinned) {
+    // Preserve the user annotation, but diagnose if it is below
+    // getSmemCrossStageDepth(buf.allocOp, channels).
+    continue;
+  }
+  if (buf.isCrossStage) {
+    // Enforce getSmemCrossStageDepth(buf.allocOp, channels) as an uncapped
+    // correctness floor. It may exceed numBuffers.
+    ...
+  }
 }
 
 // Phase 3 (priority classification):
@@ -353,7 +368,8 @@ if (!heuristicAllocs.empty()) {
 Add throughout the implementation:
 
 - **memType mismatch**: Warn if SMEM channel annotated with `"tmem"` or vice versa
-- **Cross-stage numCopies**: Warn if annotated SMEM `numCopies == 1` for a cross-stage buffer
+- **Cross-stage numCopies**: Warn if annotated SMEM `numCopies` is below the
+  computed cross-stage depth for that buffer
 - **TMEM reuse validity**: Warn on liveness overlap or size incompatibility
 - **LDBG logging** for all annotation decisions, matching existing style
 

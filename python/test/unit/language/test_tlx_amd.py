@@ -21,6 +21,8 @@ from triton.compiler.errors import CompilationError
 from triton.backends.compiler import GPUTarget
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel, )
+from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
+    mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel, )
 
 # Skip the entire module if no HIP runtime is available.
 pytestmark = pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
@@ -66,7 +68,7 @@ def _async_load_kernel(
     tl.store(output_ptr + offs, x + y, mask=mask)
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
 def test_async_load_compiles_gfx950(device):
     """async_load should produce async_copy_global_to_local in TTGIR on gfx950."""
     compiled = compile_for_gfx950(
@@ -123,7 +125,7 @@ def _local_load_kernel(
     tl.store(output_ptr + offs, x, mask=mask)
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
 def test_local_load_compiles_gfx950(device):
     """local_load after async_wait should compile and produce local_load in TTGIR."""
     compiled = compile_for_gfx950(
@@ -156,7 +158,7 @@ def _local_load_with_token_kernel(
     tl.store(output_ptr + offs, x, mask=mask)
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
 def test_local_load_with_token_compiles_gfx950(device):
     """local_load with a wait token should set syncedViaAsyncWait in TTGIR."""
     compiled = compile_for_gfx950(
@@ -217,7 +219,7 @@ def _token_in_loop_kernel(
     tl.store(output_ptr + offs, acc, mask=mask)
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
 def test_async_token_loop_compiles_gfx950(device):
     """async_token in scope around tl.range should compile without crashing."""
     compiled = compile_for_gfx950(
@@ -228,6 +230,70 @@ def test_async_token_loop_compiles_gfx950(device):
     ttgir = compiled.asm["ttgir"]
     assert "local_load" in ttgir
     assert "async_wait" in ttgir
+
+
+# ---------------------------------------------------------------------------
+# Test: loop-carried dot operands do not fall back through tensor local_alloc.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _loop_carried_dot_layout_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    K_ITERS: tl.constexpr,
+):
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * (BLOCK_K * K_ITERS) + offs_k[None, :]
+    b_ptrs = b_ptr + offs_k[:, None] * BLOCK_N + offs_n[None, :]
+
+    a_buffers = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, 2)
+    b_buffers = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, 2)
+
+    a_buf = tlx.local_view(a_buffers, 0)
+    b_buf = tlx.local_view(b_buffers, 0)
+    tlx.local_store(a_buf, tl.load(a_ptrs))
+    tlx.local_store(b_buf, tl.load(b_ptrs))
+
+    a_reg = tlx.local_load(a_buf)
+    b_reg = tlx.local_load(b_buf)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in tl.range(0, K_ITERS - 1, num_stages=0):
+        acc = tl.dot(a_reg, b_reg, acc)
+        next_slot = (k + 1) % 2
+        next_a = tlx.local_view(a_buffers, next_slot)
+        next_b = tlx.local_view(b_buffers, next_slot)
+        tlx.local_store(next_a, tl.load(a_ptrs + (k + 1) * BLOCK_K))
+        tlx.local_store(next_b, tl.load(b_ptrs + (k + 1) * BLOCK_K * BLOCK_N))
+        a_reg = tlx.local_load(next_a)
+        b_reg = tlx.local_load(next_b)
+
+    acc = tl.dot(a_reg, b_reg, acc)
+    c_ptrs = c_ptr + offs_m[:, None] * BLOCK_N + offs_n[None, :]
+    tl.store(c_ptrs, acc)
+
+
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
+def test_loop_carried_dot_layout_cleanup_compiles_gfx950(device):
+    """Full AMD pipeline should remove late dot operand local_alloc fallbacks."""
+    compiled = compile_for_gfx950(
+        _loop_carried_dot_layout_kernel,
+        signature={"a_ptr": "*fp16", "b_ptr": "*fp16", "c_ptr": "*fp32"},
+        constexprs={"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 32, "K_ITERS": 3},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "ttg.local_alloc %" not in ttgir
+    assert "tt.dot" in ttgir
+    assert "amdgcn" in compiled.asm
+    assert len(compiled.asm["amdgcn"]) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -570,3 +636,100 @@ def test_amd_tdm_gemm_pipelined_compiles_gfx1250(device):
     assert "ttg.padded_shared" in ttgir, "expected propagated padded encoding"
     amdgcn = compiled.asm["amdgcn"]
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
+
+
+# ---------------------------------------------------------------------------
+# Test: tlx.local_reshape reinterprets a flat LDS buffer as a 2D tile.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _local_reshape_kernel(
+    input_ptr,
+    output_ptr,
+    ROWS: tl.constexpr,
+    COLS: tl.constexpr,
+):
+    offsets = tl.arange(0, ROWS * COLS)
+    values = tl.load(input_ptr + offsets)
+
+    flat_buffers = tlx.local_alloc((ROWS * COLS, ), tl.float32, 1)
+    flat = tlx.local_view(flat_buffers, 0)
+    tlx.local_store(flat, values)
+
+    reshaped = tlx.local_reshape(flat, [ROWS, COLS])
+    result = tlx.local_load(reshaped)
+
+    offs_m = tl.arange(0, ROWS)
+    offs_n = tl.arange(0, COLS)
+    output_offsets = offs_m[:, None] * COLS + offs_n[None, :]
+    tl.store(output_ptr + output_offsets, result)
+
+
+def test_local_reshape_compiles_gfx1250(device):
+    """tlx.local_reshape should lower to ttg.memdesc_reshape and compile."""
+    compiled = compile_for_gfx1250(
+        _local_reshape_kernel,
+        signature={"input_ptr": "*fp32", "output_ptr": "*fp32"},
+        constexprs={"ROWS": 8, "COLS": 8},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "ttg.memdesc_reshape" in ttgir, ("expected memdesc_reshape in TTGIR, got:\n" + ttgir)
+    assert "amdgcn" in compiled.asm
+    assert len(compiled.asm["amdgcn"]) > 0
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_local_reshape_correctness_gfx1250(device):
+    """End-to-end: local_reshape reinterprets a flat LDS buffer as a 2D tile."""
+    rows, cols = 8, 8
+    inp = torch.arange(rows * cols, dtype=torch.float32, device=device)
+    out = torch.empty((rows, cols), dtype=torch.float32, device=device)
+    _local_reshape_kernel[(1, )](inp, out, ROWS=rows, COLS=cols)
+    torch.testing.assert_close(out, inp.reshape(rows, cols))
+
+
+# ---------------------------------------------------------------------------
+# Test: mxfp TDM-pipelined GEMM compiles on gfx1250 with TDM + dot_scaled + WMMA.
+# ---------------------------------------------------------------------------
+
+
+def test_mxgemm_tdm_pipelined_compiles_gfx1250(device):
+    """The mxfp GEMM tutorial kernel should lower to TDM + dot_scaled + WMMA."""
+    compiled = compile_for_gfx1250(
+        _amd_mxfp_gemm_kernel,
+        signature={
+            "a_ptr": "*fp8e5",
+            "b_ptr": "*fp8e5",
+            "c_ptr": "*fp32",
+            "a_scale": "*i8",
+            "b_scale": "*i8",
+            "M": "i32",
+            "N": "i32",
+            "K": "i32",
+            "stride_am": "i64",
+            "stride_ak": "i64",
+            "stride_bk": "i64",
+            "stride_bn": "i64",
+            "stride_cm": "i64",
+            "stride_cn": "i64",
+            "stride_scale": "i64",
+        },
+        constexprs={
+            "DTYPE_A": "e5m2",
+            "DTYPE_B": "e5m2",
+            "SCALE_BLOCK": 32,
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 128,
+            "GROUP_SIZE_M": 8,
+            "TRANSPOSE_B": True,
+            "NUM_BUFFERS": 2,
+        },
+    )
+    ttgir = compiled.asm["ttgir"]
+    amdgcn = compiled.asm["amdgcn"]
+    assert "amdg.async_tdm_copy_global_to_local" in ttgir
+    assert "tt.dot_scaled" in ttgir
+    assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
+    assert "wmma" in amdgcn

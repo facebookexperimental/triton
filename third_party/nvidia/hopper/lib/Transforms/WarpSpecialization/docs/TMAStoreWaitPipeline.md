@@ -13,70 +13,118 @@ the ordering anchor for channels feeding TMA stores. The producer-side
 descriptor; later wait annotation and rotation reason about the sequence of
 stores to a shared staging buffer.
 
-## Memory Planner: `isTMAStoreStaging` Handling
+## Memory Planner: `buffer.tmaStaging` Handling
 
 **File**: `WSMemoryPlanner.cpp` (within `allocateSmemBuffers`)
 
 When `early_tma_store_lowering` is enabled, the `local_alloc` ops created
-for TMA store staging are visible to the memory planner. These allocs feed
-`AsyncTMACopyLocalToGlobalOp` and are detected by checking users:
+for TMA store staging are visible to the memory planner. Each WSBuffer is
+classified by which TMA op it feeds (Phase 1):
 
 ```cpp
 for (auto user : alloc->getUsers()) {
-    if (isa<ttng::AsyncTMACopyLocalToGlobalOp>(user))
-        buf.isTMAStoreStaging = true;
+    if (isa<ttng::AsyncTMACopyLocalToGlobalOp>(user)) {
+        buf.tmaStaging = 1;   // regular TMA store staging (dk, dv, c, o, ...)
+        break;
+    }
+    if (isa<ttng::AsyncTMAReduceOp>(user)) {
+        buf.tmaStaging = 2;   // TMA atomic-add reduce staging (dq, ...)
+        break;
+    }
 }
 ```
 
-The `isTMAStoreStaging` flag triggers a special path through four phases:
+`buf.tmaStaging` is a classification tag (0 = not TMA staging, 1 = store,
+2 = reduce), not a count. It is propagated to the resulting `local_alloc`
+op as the `buffer.tmaStaging` attribute and consumed by later passes that
+need to distinguish reduce staging from regular store staging.
 
-### Phase 3.5: TMA Store Staging Fusion
+The flag drives a special path through three phases:
 
-All `isTMAStoreStaging` WSBuffers are merged into a single `bufferId`
-(via `fuseEpilogueWSBuffers`). This groups the dk/dv epilogue store
-staging buffers together. The merge uses the first buffer's ID for all.
+### Phase 3.5: TMA Staging Fusion
 
-Note: the shared `bufferId` affects `computeTotalSmem`'s cost model
-(`max(size) × copies` per ID) but does **not** cause physical alloc
-merging downstream — each alloc remains separate through
-`AllocateSharedMemoryNv`.
+All TMA staging WSBuffers that feed the same TMA descriptor are merged
+into a single `bufferId` (via `fuseEpilogueWSBuffers`). For example, the
+4 subtile stagings of `desc_dq` (under `EPILOGUE_SUBTILE=4`) all share
+one `bufferId`, as do the dk and dv subtile stagings (each per their own
+descriptor).
+
+The shared `bufferId` is honored by `doCodePartition` downstream: the
+subtile allocs are physically merged into one `local_alloc` of shape
+`numCopies x original_shape` (e.g., `1x128x32xf32` for `numCopies=1`).
+All subtile stores then index into the same physical SMEM region via
+`memdesc_index`. As a result `computeTotalSmem`'s cost model
+(`max(size) × copies` per `bufferId`) matches the actual post-merge
+physical footprint — there is no per-entry multiplier to add.
+
+### Phase 3.6: Inter-Buffer SMEM Reuse via `allocation.reuseTarget`
+
+When the post-Phase-3.5 SMEM total still exceeds `smemBudget`,
+the planner runs an inter-buffer reuse pass (`Phase 3.6: Reuse
+allocated buffers when base total exceeds budget` in
+`WSMemoryPlanner.cpp::allocateSmemBuffers`). It looks for a host
+buffer whose physical SMEM region can be overlapped with a staging
+buffer's region without a liveness conflict (the host's last consumer
+finishes before the staging's first store), and annotates the staging
+alloc with `allocation.reuseTarget = <host bufferId>`. The annotated
+WSBuffer's footprint is then counted against the host's region in the
+planner's `computeTotalSmem` accounting (i.e. it costs 0 extra bytes
+as long as `max(host, staging × copies)` fits inside the host's
+existing allocation).
+
+Concrete example for FA-bwd: with `_BWD_DOT_ATTRS_TMEM` and
+`BLOCK_M1=128`, the planner annotates
+
+```mlir
+%desc_dv_staging = ttg.local_alloc {
+  allocation.reuseTarget = 3 : i32,   // v's buffer.id
+  buffer.copy = 2, buffer.id = 22, buffer.tmaStaging = 1
+} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+
+%desc_dk_staging = ttg.local_alloc {
+  allocation.reuseTarget = 4 : i32,   // do's buffer.id
+  buffer.copy = 2, buffer.id = 24, buffer.tmaStaging = 1
+} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+```
+
+so that the planner can keep both staging groups at `numCopies=2`
+inside the 220 KB budget by treating them as "free" (they share v's
+and do's 32 KB regions respectively).
+
+**Important:** the planner sets the attribute and accounts for the
+reuse, but the SMEM layout pass (`AllocateSharedMemoryNv`) does *not*
+read `allocation.reuseTarget` directly — it sees the staging alloc as
+a request for its own region. Realizing the reuse therefore requires
+an extra step in `doCodePartition` that rewrites the staging alloc
+into a reinterpret view of the host alloc (see
+[CodePartition: Realizing `allocation.reuseTarget`](#code-partition-realizing-allocationreuetarget)
+below).
 
 ### Phase 4.5: Epilogue Group Copy Increase
 
-The merged TMA store group is treated as a P2_Other epilogue group.
-`increaseFusedEpilogueCopies` iteratively increases copies (up to
-`numBuffers`) while checking `computeTotalSmem ≤ smemBudget`.
+Each fused P2_Other group (including TMA staging groups) is treated as
+an epilogue group. `increaseFusedEpilogueCopies` iteratively bumps
+`numCopies` from the current value up to `numBuffers`, accepting each
+bump as long as `computeTotalSmem ≤ smemBudget`.
 
-Since `computeTotalSmem` excludes `isTMAStoreStaging` buffers from its
-total, the budget check is effectively a no-op — copies always increase
-to `numBuffers`. This is by design: TMA store staging buffers live
-outside the pipelined inner loop and don't compete with channel buffers
-for pipeline depth.
+`computeTotalSmem` accounts for the active `buffer.id` groups using
+`max(size) × copies` per ID. For TMA store staging groups this matches the
+planner's reuse model, but the downstream physical allocation still leaves
+each staging alloc as a separate op.
 
-### Phase 4.6: Combined SMEM Budget Validation
+### Combined SMEM Cost
 
-After Phase 4.5, the combined SMEM cost is checked:
+If the planner needs an exact hardware-SMEM accounting pass for TMA store
+staging, the cost needs per-entry accounting because the allocs are NOT merged
+into one physical alloc downstream:
 
 ```
-channelSmem = computeTotalSmem(wsBuffers)           // excludes TMA staging
-tmaStoreSmem = computeTMAStoreStagingSmem(wsBuffers) // per-entry counting
-if (channelSmem + tmaStoreSmem > smemBudget):
-    cap all isTMAStoreStaging copies to 1
+tmaStoreSmem = numEntries * size * copies
 ```
-
-`computeTMAStoreStagingSmem` counts `numEntries × size × copies` (not
-`max(size) × copies`) because the allocs are NOT merged into one physical
-alloc downstream.
-
-This prevents SMEM overflow for tight-budget configs where Phase 4.5
-would otherwise increase TMA staging copies unchecked. For example:
-BWD config 1 (BLOCK_M1=64, EPILOGUE_SUBTILE=2) has 4 TMA store staging
-allocs of 16KB each — at 2 copies this is 128KB, exceeding the budget.
-Phase 4.6 caps copies to 1 (64KB), fitting within hardware limits.
 
 ### Phase 6: Hoist Before Outermost Loop
 
-All `isTMAStoreStaging` allocs are moved before the outermost enclosing
+All TMA staging allocs are moved before the outermost enclosing
 `scf.for` loop. This is required for the rotation mechanism
 (`doAnnotateTMAStoreWaits`) which reads `buffer.copy` and only annotates
 allocs that are outside all loops.
@@ -218,3 +266,82 @@ concrete hardware operations:
 
 See also [Memory Lowering](MemoryLowering.md) for the broader context of
 how TMA stores fit into the WS memory lowering pipeline.
+
+## Code Partition: Realizing `allocation.reuseTarget`
+
+**File**: `WSCodePartition.cpp::doCodePartitionPost`
+
+The planner's `allocation.reuseTarget = N` annotation is a SMEM-accounting
+hint. To actually realize the SMEM overlap in the emitted kernel, two
+coordinated steps are required inside `doCodePartition` before the layout
+pass (`AllocateSharedMemoryNv`) runs:
+
+### Step 1: Insert the Cross-Partition Reuse Barrier (Step 7.5)
+
+Before the staging buffer's *first store*, emit a `nvws.producer_acquire`
+that consumes the host buffer's wait token. This blocks the staging-buffer
+writer until the host channel's last consumer has released its SMEM slot,
+making it safe for the two allocs to alias.
+
+```mlir
+nvws.producer_acquire %host_token, %c0_i32, %false
+    {async_task_id = array<i32: 3>} : tensor<1x!nvws.token>, i32, i1
+ttg.local_store %payload, %desc_dv_staging
+    : tensor<128x64xf16> -> !ttg.memdesc<128x64xf16, ...>
+```
+
+**Important ordering constraint**: this insertion **must** run **before**
+`insertAsyncComm`. `insertAsyncComm` ends with a cleanup sweep
+(`removeTokenfNotUsed`) that erases any token alloc currently lacking
+users. Because the host token is only used by the barrier we are about
+to insert, deferring the barrier insertion to after `insertAsyncComm`
+causes the cleanup to free the host token first, after which the
+deferred insertion dereferences the freed Value (use-after-free,
+manifesting as a `malloc(): unaligned tcache` abort inside MLIR's
+verifier on a later op).
+
+This is enforced as "Step 7.5" — running between `createTokenPost`
+(Step 7) and `insertAsyncComm` (Step 8) so the `producer_acquire`'s
+operand becomes a real use of the host token before the cleanup sweep.
+See commit `c67893c25` for the bug-fix that re-ordered this step.
+
+### Step 2: Reinterpret Staging Alloc into Host Alloc
+
+After Step 7.5 makes the cross-partition timing safe, the staging
+`local_alloc` is **replaced** by a `memdesc_reinterpret` view of the
+host alloc. All uses of the staging memdesc (TMA copy/reduce ops,
+`memdesc_index` for rotation, `local_store`, etc.) are rewritten to
+reference the reinterpret view, and the original staging alloc is
+erased.
+
+This is analogous to the TMEM path in the existing `replaceBufferReuse`
+(which uses `sliceAndReinterpretMDTMEM` to overlay multiple TMEM
+allocs into one region — see
+[ReuseGroups.md §3 Buffer Replacement](ReuseGroups.md#3-buffer-replacement)),
+extended to SMEM:
+
+```mlir
+# Before:
+%v             = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared>
+%dv_staging    = ttg.local_alloc {allocation.reuseTarget = 3}
+                                 : () -> !ttg.memdesc<2x128x64xf16, #shared>
+... %dv_staging uses ...
+
+# After:
+%v             = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared>
+%dv_staging.view = ttg.memdesc_reinterpret %v
+                  : !ttg.memdesc<128x128xf16> -> !ttg.memdesc<2x128x64xf16>
+... %dv_staging.view uses ...
+# (original %dv_staging is erased)
+```
+
+The reinterpret is sound because the host alloc's storage covers at
+least `staging.size × staging.numCopies` bytes (this is exactly the
+condition `findReuseCandidate` checks when picking a target).
+
+### Why both steps are necessary
+
+| Step omitted | Symptom |
+|---|---|
+| Step 1 (cross-partition barrier) | Race: staging writer can clobber the host region while the host's consumer is still reading. |
+| Step 2 (reinterpret merge) | `AllocateSharedMemoryNv` places staging at a fresh offset (it has no awareness of `allocation.reuseTarget`), so the planner's "free" accounting is wrong: actual SMEM usage = planner total + Σ(staging × copies). For FA-bwd idx=2 / idx=0 this gap is ~64 KB and pushes the kernel over B200's 232 KB SMEM ceiling at codegen time. |

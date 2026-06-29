@@ -274,14 +274,15 @@ TritonIntegerRangeAnalysis::maybeGetTripCount(LoopLikeOpInterface loop) {
         const dataflow::IntegerValueRangeLattice *lattice =
             getLatticeElementFor(getProgramPointBefore(block), value);
         if (lattice != nullptr && !lattice->getValue().isUninitialized())
-          return getUpper ? lattice->getValue().getValue().smax()
-                          : lattice->getValue().getValue().smin();
+          return getUpper.value_or(false)
+                     ? lattice->getValue().getValue().smax()
+                     : lattice->getValue().getValue().smin();
       }
     }
     if (defaultVal)
       return *defaultVal;
-    return getUpper ? APInt::getSignedMaxValue(width)
-                    : APInt::getSignedMinValue(width);
+    return getUpper.value_or(false) ? APInt::getSignedMaxValue(width)
+                                    : APInt::getSignedMinValue(width);
   };
 
   Block *block = iv->getParentBlock();
@@ -709,25 +710,33 @@ void TritonIntegerRangeAnalysis::visitRegionSuccessors(
     assert(inputs.size() == operands->size() &&
            "expected the same number of successor inputs as operands");
 
+    auto valueToLattices = [&](Value v) { return getLatticeElement(v); };
     unsigned firstIndex = 0;
     if (inputs.size() != lattices.size()) {
-      if (successor.isParent()) {
+      if (!point->isBlockStart()) {
         if (!inputs.empty()) {
           firstIndex = cast<OpResult>(inputs.front()).getResultNumber();
         }
-        visitNonControlFlowArguments(
-            branch, successor,
-            branch->getResults().slice(firstIndex, inputs.size()), lattices,
-            firstIndex);
+        SmallVector<Value> nonSuccessorInputs =
+            branch.getNonSuccessorInputs(RegionSuccessor::parent());
+        SmallVector<dataflow::IntegerValueRangeLattice *>
+            nonSuccessorInputLattices =
+                llvm::map_to_vector(nonSuccessorInputs, valueToLattices);
+        visitNonControlFlowArguments(branch, RegionSuccessor::parent(),
+                                     nonSuccessorInputs,
+                                     nonSuccessorInputLattices);
       } else {
-        if (!inputs.empty()) {
+        if (!inputs.empty())
           firstIndex = cast<BlockArgument>(inputs.front()).getArgNumber();
-        }
-        visitNonControlFlowArguments(
-            branch, successor,
-            successor.getSuccessor()->getArguments().slice(firstIndex,
-                                                           inputs.size()),
-            lattices, firstIndex);
+        Region *region = point->getBlock()->getParent();
+        SmallVector<Value> nonSuccessorInputs =
+            branch.getNonSuccessorInputs(RegionSuccessor(region));
+        SmallVector<dataflow::IntegerValueRangeLattice *>
+            nonSuccessorInputLattices =
+                llvm::map_to_vector(nonSuccessorInputs, valueToLattices);
+        visitNonControlFlowArguments(branch, RegionSuccessor(region),
+                                     nonSuccessorInputs,
+                                     nonSuccessorInputLattices);
       }
     }
 
@@ -754,14 +763,17 @@ void TritonIntegerRangeAnalysis::visitRegionSuccessors(
         // further changes/updates are possible).
         changed = argLat->join(IntegerValueRange::getMaxRange(oper));
       } else {
-        // Else, propagate pred operands.
-        auto operLat = *getLatticeElementFor(point, oper);
-        changed = argLat->join(operLat);
+        // Else, propagate pred operands. Known-trip-count loops are bounded by
+        // loopVisits, so join the value directly and avoid LLVM's generic
+        // merge-site widening for long-but-finite loop simulations.
+        auto *operLat = getLatticeElementFor(point, oper);
+        changed =
+            loop ? argLat->join(operLat->getValue()) : argLat->join(*operLat);
         LLVM_DEBUG({
           if (changed == ChangeResult::Change) {
             DBGS() << "Operand lattice ";
             oper.printAsOperand(llvm::dbgs(), {});
-            llvm::dbgs() << " --> " << operLat.getValue() << "\n";
+            llvm::dbgs() << " --> " << operLat->getValue() << "\n";
           }
         });
       }

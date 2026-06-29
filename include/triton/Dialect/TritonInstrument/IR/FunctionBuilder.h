@@ -22,10 +22,11 @@ namespace mlir::triton {
 class FuncOp;
 
 namespace instrument {
+std::string mangleType(Type t);
 
 class ManglingArgs {
 public:
-  using Arg = std::variant<Type, int, std::string>;
+  using Arg = std::variant<Type, uint64_t, std::string>;
 
   ManglingArgs() = default;
   ManglingArgs(const ManglingArgs &) = default;
@@ -51,9 +52,8 @@ public:
 
   std::string mangleArg(Arg arg) const {
     if (auto type = std::get_if<Type>(&arg)) {
-      auto hash = static_cast<uint64_t>(mlir::hash_value(*type));
-      return std::string("_T") + llvm::utohexstr(hash);
-    } else if (auto intVal = std::get_if<int>(&arg)) {
+      return std::string("_") + mangleType(*type);
+    } else if (auto intVal = std::get_if<uint64_t>(&arg)) {
       return std::string("_I") + std::to_string(*intVal);
     } else if (auto stringVal = std::get_if<std::string>(&arg)) {
       return *stringVal;
@@ -74,18 +74,14 @@ private:
   SmallVector<Arg> args;
 };
 
-/// Utility to mangle helper function names produced by the instrumentation
-/// passes. The mangled name encodes the base name, number of warps and the
-/// participating types.
-std::string mangleInstrumentHelperName(const std::string &baseName,
-                                       int numWarps,
-                                       llvm::ArrayRef<Type> types);
-
 class FunctionBuilder {
 public:
   FunctionBuilder(ModuleOp module, AuxDataMap &auxData)
       : module(module), auxData(auxData) {}
 
+  // Create a function that fills a global tensor with a scalar value.
+  void createFillGlobalTensorCall(ImplicitLocOpBuilder &b, Value ptr,
+                                  RankedTensorType type, Value scalar);
   // setWaiting: mark the base thread as waiting on the given barrier phase and
   // record that phase for deadlock detection.
   void createSetWaitingCall(ImplicitLocOpBuilder &b, Value mbar, int thread,
@@ -97,10 +93,23 @@ public:
   // matching barrier phases.
   void createCheckAllActiveWaitingCall(ImplicitLocOpBuilder &b, int activeMask,
                                        Value pred, Operation *insertPoint);
+  // verifyBarrierCanInit: ensure the barrier is currently invalidated before
+  // initializing it again.
+  void createVerifyBarrierCanInitCall(ImplicitLocOpBuilder &b, Value mbar,
+                                      Operation *insertPoint);
+  // verifyBarrierInitialized: ensure the barrier has been initialized and not
+  // invalidated before it is used.
+  void createVerifyBarrierInitializedCall(ImplicitLocOpBuilder &b, Value mbar,
+                                          Value pred, Operation *insertPoint);
   // initBarrierState: Initialize the tracked barrier state to phase 0 and set
-  // both the initial and current arrival counts.
+  // both the initial and current arrival counts. A zero state denotes an
+  // invalidated/uninitialized barrier.
   void createInitBarrierStateCall(ImplicitLocOpBuilder &b, Value mbar,
                                   int count, Operation *insertPoint);
+  // invalidateBarrierState: clear the tracked barrier lifecycle state and any
+  // waiting bits for the barrier.
+  void createInvalidateBarrierStateCall(ImplicitLocOpBuilder &b, Value mbar,
+                                        Operation *insertPoint);
   // verifyBarrierArrive: Check that applying the arrive count would not drive
   // the tracked current count negative. Triggers an assertion on failure.
   void createVerifyBarrierArriveCall(ImplicitLocOpBuilder &b, Value mbar,
@@ -149,6 +158,16 @@ public:
   void createTrackVisibleReadsCall(ImplicitLocOpBuilder &b, Value mbar,
                                    int thread, Value pred, MemType memType,
                                    Operation *insertPoint);
+  // clearBarrierWriteTracking: clear all write tracking associated with the
+  // given barrier row.
+  void createClearBarrierWriteTrackingCall(ImplicitLocOpBuilder &b, Value mbar,
+                                           Value pred, MemType memType,
+                                           Operation *insertPoint);
+  // clearBarrierReadTracking: clear all read tracking associated with the
+  // given barrier row.
+  void createClearBarrierReadTrackingCall(ImplicitLocOpBuilder &b, Value mbar,
+                                          Value pred, MemType memType,
+                                          Operation *insertPoint);
   // transferVisibleWrites: transfer write visibility tracked by a barrier to
   // all threads in threadMask.
   void createTransferVisibleWritesCall(ImplicitLocOpBuilder &b, Value mbar,

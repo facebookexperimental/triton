@@ -33,7 +33,8 @@ namespace {
 
 bool isAsyncProxyWrite(Operation *op) {
   return isa<triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp,
-             triton::nvidia_gpu::AsyncTMAGatherOp>(op);
+             triton::nvidia_gpu::AsyncTMAGatherOp,
+             triton::nvidia_gpu::CLCTryCancelOp>(op);
 }
 
 Value getSmemDest(Operation *op) {
@@ -44,6 +45,9 @@ Value getSmemDest(Operation *op) {
   if (auto asyncTMAGatherOp =
           dyn_cast<triton::nvidia_gpu::AsyncTMAGatherOp>(op)) {
     return asyncTMAGatherOp.getResult();
+  }
+  if (auto clcTryCancelOp = dyn_cast<triton::nvidia_gpu::CLCTryCancelOp>(op)) {
+    return clcTryCancelOp.getResult();
   }
   return Value();
 }
@@ -110,7 +114,6 @@ bool filterFn(Operation *op, Operation *other, Allocation *allocation) {
 class ProxyFenceAnalysis : public MembarOrFenceAnalysis {
 
 public:
-  ProxyFenceAnalysis() = default;
   explicit ProxyFenceAnalysis(Allocation *allocation, MembarFilterFn filter)
       : MembarOrFenceAnalysis(allocation, filter) {}
 
@@ -155,7 +158,7 @@ void ProxyFenceAnalysis::update(Operation *op, BlockInfo *blockInfo,
       memoryEffectOpInterface.getEffects(effectInstances);
       for (auto effectInstance : effectInstances) {
         if (auto value = effectInstance.getValue()) {
-          for (auto bufferId : allocation->getBufferIds(value)) {
+          for (auto bufferId : allocation->getAllBufferIdsWithAliases(value)) {
             if (bufferId != Allocation::InvalidBufferId) {
               auto interval = allocation->getAllocatedInterval(bufferId);
               auto slice = AllocationSlice(value, interval);

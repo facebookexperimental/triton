@@ -51,11 +51,12 @@ fi
 echo "Running core Triton python unit tests"
 pytest python/test/unit/language/test_tutorial09_warp_specialization.py
 pytest python/test/unit/language/test_autows_addmm.py
+pytest python/test/unit/language/test_autows_quantized_matmul.py
 pytest third_party/tlx/tutorials/testing/test_correctness_autows.py
 
 echo "Run autoWS tutorial kernels"
 echo "Verifying correctness of FA tutorial kernels"
-TRITON_ALWAYS_COMPILE=1 pytest third_party/tlx/tutorials/fused_attention_ws_device_tma.py
+pytest third_party/tlx/tutorials/fused_attention_ws_device_tma.py
 
 echo "run for Hopper or Blackwell"
-TRITON_ALWAYS_COMPILE=1 TRITON_USE_META_WS=1 pytest python/tutorials/fused-attention-ws-device-tma-hopper-or-blackwell.py
+pytest python/tutorials/fused-attention-ws-device-tma-hopper-or-blackwell.py

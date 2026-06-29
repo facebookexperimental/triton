@@ -281,6 +281,10 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
   auto containsLocalBarrier = [](Operation *op) {
     if (isa<gpu::BarrierOp>(op))
       return true;
+    if (isa<triton::nvidia_gpu::ClusterBarrierOp>(op))
+      return true;
+    if (isa<triton::nvidia_gpu::ClusterWaitOp>(op))
+      return true;
     if (isa<triton::gpu::WarpSpecializePartitionsOp>(op))
       return true;
     if (auto barrier = dyn_cast<triton::gpu::BarrierOp>(op))
@@ -334,7 +338,8 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
         memoryEffectOpInterface.getEffects(effectInstances);
         for (auto effectInstance : effectInstances) {
           if (auto value = effectInstance.getValue()) {
-            for (auto bufferId : allocation->getBufferIds(value)) {
+            for (auto bufferId :
+                 allocation->getAllBufferIdsWithAliases(value)) {
               if (bufferId != Allocation::InvalidBufferId) {
                 auto interval = allocation->getAllocatedInterval(bufferId);
                 auto slice = AllocationSlice(value, interval);

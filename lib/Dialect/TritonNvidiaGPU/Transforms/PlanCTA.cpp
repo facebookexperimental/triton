@@ -125,8 +125,6 @@ private:
   bool processBroadcast(triton::BroadcastOp broadcast, Attribute layout);
   bool processExpandDimsBackward(triton::ExpandDimsOp expandDims,
                                  ttg::DistributedEncodingTrait newResultLayout);
-  bool processExpandDimsForward(triton::ExpandDimsOp expandDims,
-                                ttg::DistributedEncodingTrait newSrcLayout);
 
   bool processConvertLayoutBackward(ttg::ConvertLayoutOp convertLayout,
                                     CastOp cast);
@@ -317,13 +315,13 @@ bool CTAPlanner::processReduce(triton::FuncOp &funcOp) {
 
     llvm::SmallVector<unsigned> CTASplitNum = CTAsPerCGA;
 
-    // If numCTAs > 1 and the only dimension is the reduced dimension, after the
-    // above two for-loops, CTAsPerCGA = [0] and remainingCTAs = numCTAs. We set
-    // CTAsPerCGA[0] = numCTAs and keep CTASplitNum[0] = 1 to ensure that no
-    // cross-CTA reduction is required, although this will introduce duplicated
-    // calculation
-    if (remainingCTAs > 0)
+    // If numCTAs > 1 and the only dimension is the reduced dimension, the
+    // loops above leave all CTAs unassigned. Put the remaining CTAs on that
+    // dimension so that they all collaborate in the reduction.
+    if (remainingCTAs > 0) {
       CTAsPerCGA[order[rank - 1]] *= remainingCTAs;
+      CTASplitNum[order[rank - 1]] = CTAsPerCGA[order[rank - 1]];
+    }
 
     auto numWarps = ttg::lookupNumWarps(reduce);
     auto CGALayout = ttg::CGAEncodingAttr::fromSplitParams(
@@ -333,11 +331,15 @@ bool CTAPlanner::processReduce(triton::FuncOp &funcOp) {
     auto newSrcLayout =
         replaceCGALayout(cast<ttg::DistributedEncodingTrait>(srcLayout),
                          srcShape, numWarps, CGALayout);
-    auto newResultLayout =
-        ttg::SliceEncodingAttr::get(context, axis, newSrcLayout);
     unsigned numOperands = reduce.getNumOperands();
+    unsigned numResults = reduce.getNumResults();
     SmallVector<Attribute> newSrcLayoutVec(numOperands, newSrcLayout);
-    SmallVector<Attribute> newResultLayoutVec(numOperands, newResultLayout);
+    Attribute newResultLayout;
+    if (rank > 1) {
+      newResultLayout =
+          ttg::SliceEncodingAttr::get(context, axis, newSrcLayout);
+    }
+    SmallVector<Attribute> newResultLayoutVec(numResults, newResultLayout);
 
     insertCasts(reduce.getOperation(), newSrcLayoutVec, newResultLayoutVec);
   });
@@ -353,7 +355,8 @@ void CTAPlanner::processStoreLikeOps(triton::FuncOp &funcOp) {
                   triton::DescriptorStoreLikeOpInterface, AsyncStoreOp>(op))
       stores.push_back(op);
   });
-  assert(stores.size() > 0 && "Cannot find store-like ops");
+  if (stores.empty())
+    return;
 
   ttg::CGAEncodingAttr CGALayout;
   for (Operation *store : stores) {
@@ -718,13 +721,6 @@ bool CTAPlanner::processExpandDimsBackward(
   auto newSrcLayout = ttg::SliceEncodingAttr::get(
       newResultLayout.getContext(), expandDims.getAxis(), newResultLayout);
   insertCasts(expandDims.getOperation(), {newSrcLayout}, {newResultLayout});
-  return true;
-}
-
-bool CTAPlanner::processExpandDimsForward(
-    triton::ExpandDimsOp expandDims,
-    ttg::DistributedEncodingTrait newSrcLayout) {
-  llvm::report_fatal_error("processExpandDimsForward not implemented yet");
   return true;
 }
 

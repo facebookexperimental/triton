@@ -295,7 +295,15 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     return op;
   }
   // Ops without a built-in pred operand: wrap in scf.if.
-  if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::TMAStoreTokenWaitOp>(op)) {
+  //
+  // The TMA "store" family (copy local->global, reduce, scatter) all write to
+  // global memory but have no mask/pred operand, so they cannot be masked in
+  // place. They must be predicated when the pipeliner peels prologue/epilogue
+  // iterations of a dynamic loop: executing a store/reduce/scatter for an
+  // iteration past the real trip count would corrupt the output (e.g. a
+  // spurious atomic add for a TMA reduce). Guard them with scf.if(pred).
+  if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp,
+          ttng::AsyncTMAScatterOp, ttng::TMAStoreTokenWaitOp>(op)) {
     rewriter.setInsertionPoint(op);
     bool hasResults = op->getNumResults() > 0;
     auto ifOp =
@@ -729,7 +737,7 @@ allocTMABuffers(scf::ForOp forOp,
     auto loc = op.getLoc();
     Value alloc = triton::gpu::GlobalScratchAllocOp::create(
         rewriter, loc, triton::getPointerType(rewriter.getI8Type()),
-        maxStage * ttng::TMA_SIZE_BYTES, ttng::TMA_ALIGN);
+        maxStage * ttng::TMA_SIZE_BYTES, ttng::TMA_ALIGN, UnitAttr());
     tmaBufferMapping[op.getOperation()] = alloc;
   });
 }

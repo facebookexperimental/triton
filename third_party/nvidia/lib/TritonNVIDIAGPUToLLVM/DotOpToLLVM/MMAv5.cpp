@@ -23,6 +23,8 @@ DotOpMmaV5TmemLoader mlir::triton::NVIDIA::DotOpMmaV5TmemLoader::build(
     Location loc, RewriterBase &rewriter, gpu::MemDescType memTy,
     Value tmemBase) {
   auto ctx = loc.getContext();
+  // We take the full layout even when it is a subview
+  // We'll just iterate the real shape when calling tmemLoad tho
   auto ll = toLinearLayout(memTy);
   auto layout = cast<ttng::TensorMemoryEncodingAttr>(memTy.getEncoding());
   auto bitwidth = memTy.getElementTypeBitWidth();
@@ -450,7 +452,8 @@ LogicalResult convertDotImpl(const LLVMTypeConverter &typeConverter,
   auto tensorMemAttr =
       cast<ttng::TensorMemoryEncodingAttr>(dTensorTy.getEncoding());
   unsigned mmaSizeM = tensorMemAttr.getBlockM();
-  unsigned mmaSizeN = tensorMemAttr.getBlockN();
+  // Account for subslices
+  unsigned mmaSizeN = std::min<unsigned>(tensorMemAttr.getBlockN(), N);
   // Checked in the verifier
   assert(mmaSizeN <= 256 &&
          "The maximum size of an MMA instruction is 128x256");
@@ -770,9 +773,7 @@ struct TCGen5CommitOpConversion
 
     bool twoCTAs = ttng::getModuleTwoCTAs(op) || tlx::tlxEnablePairedMMA(op);
     if (twoCTAs) {
-      Value leftClusterId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
-      leftClusterId = b.and_(leftClusterId, b.i32_val(1));
-      Value cluster0 = b.icmp_eq(leftClusterId, b.i32_val(0));
+      Value cluster0 = LLVM::NVIDIA::createLeadCTAPredicate(loc, rewriter);
       pred = b.and_(pred, cluster0);
     }
 

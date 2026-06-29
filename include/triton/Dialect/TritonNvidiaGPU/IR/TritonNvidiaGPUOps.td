@@ -33,6 +33,7 @@ include "triton/Dialect/Triton/IR/TritonOpInterfaces.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUTypes.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUTypeInterfaces.td"
+include "triton/Dialect/TritonGPU/IR/TritonGPUOpInterfaces.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td" // Pure
 include "mlir/Interfaces/InferTypeOpInterface.td" // SameOperandsAndResultType
@@ -46,7 +47,7 @@ def TensorMemory : Resource<"::mlir::triton::nvidia_gpu::TensorMemory">;
 
 class TTNG_Op<string mnemonic, list<Trait> traits = []> :
     Op<TritonNvidiaGPU_Dialect, mnemonic,
-       !listconcat(traits, [VerifyTensorLayoutsTrait])> {
+       !listconcat(traits, [VerifyTensorLayoutsTrait, VerifyMemDescLayoutsTrait])> {
 }
 
 def TTNG_FenceAsyncSharedOp : TTNG_Op<"fence_async_shared"> {
@@ -92,7 +93,7 @@ def TTNG_FenceMBarrierInitReleaseClusterOp : TTNG_Op<
 }
 
 def TTNG_ClusterArriveOp : TTNG_Op<"cluster_arrive", []> {
-  let arguments = (ins I1Attr:$relaxed);
+  let arguments = (ins DefaultValuedAttr<BoolAttr, "false">:$relaxed);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
 }
@@ -130,6 +131,113 @@ def TTNG_MapToRemoteBufferOp : TTNG_Op<"map_to_remote_buffer", [Pure, MemDescVie
   let assemblyFormat = [{$src`,` $ctaRank attr-dict `:` qualified(type($src)) `->` qualified(type($result))}];
 
   let hasVerifier = 1;
+}
+
+def TTNG_ClusterBarrierOp : TTNG_Op<"cluster_barrier", []> {
+  let arguments = (ins DefaultValuedAttr<BoolAttr, "false">:$relaxed);
+  let summary = "Synchronize all warps at cluster scope";
+  let description = [{
+    Lowers to a cluster arrive/wait pair.
+
+    In warp-specialized kernels, lowering wraps the barrier in a synthetic
+    `ttg.warp_specialize` region so worker warps also execute the barrier.
+    This op cannot be placed inside an existing `ttg.warp_specialize`.
+  }];
+  let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
+}
+
+//
+// Cluster Launch Control (CLC) Ops - Blackwell SM100+
+//
+def TTNG_CLCTryCancelOp : TTNG_Op<"clc_try_cancel", []> {
+  let summary = "Issue CLC try_cancel to cancel a pending cluster";
+
+  let description = [{
+    Issues a clusterlaunchcontrol.try_cancel instruction to atomically cancel
+    a pending cluster launch. The result is written asynchronously to the
+    result buffer and the mbarrier is signaled on completion.
+
+    This is used for dynamic persistent kernels on Blackwell (SM100+).
+
+    The result buffer must be 16-byte aligned shared memory.
+    The mbarrier must be 8-byte aligned shared memory.
+  }];
+
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$result,
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$mbarrier,
+    I1Attr:$multicast
+  );
+
+  let assemblyFormat = [{
+    $result `,` $mbarrier attr-dict `:` qualified(type($result)) `,` qualified(type($mbarrier))
+  }];
+  let hasVerifier = 1;
+}
+
+def TTNG_CLCLoadResultOp : TTNG_Op<"clc_load_result", []> {
+  let summary = "Load CLC response from shared memory into registers";
+
+  let description = [{
+    Loads the 128-bit CLC response from shared memory into two i64 registers.
+    This allows subsequent is_canceled and get_first_ctaid operations to
+    operate on registers without re-reading shared memory.
+  }];
+
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src
+  );
+
+  let results = (outs I128:$clcResult);
+
+  let assemblyFormat = [{
+    $src attr-dict `:` qualified(type($src)) `->` type($clcResult)
+  }];
+  let hasVerifier = 1;
+}
+
+def TTNG_CLCIsCanceledOp : TTNG_Op<"clc_is_canceled", [Pure]> {
+  let summary = "Check if CLC response indicates successful cancellation";
+
+  let description = [{
+    Decodes the CLC response to check if a cluster was successfully
+    canceled. Returns true if canceled, false otherwise.
+  }];
+
+  let arguments = (ins I128:$clcResult);
+
+  let results = (outs I1:$is_canceled);
+
+  let assemblyFormat = [{
+    $clcResult attr-dict `:` type($clcResult) `->` type($is_canceled)
+  }];
+}
+
+def TTNG_CLCGetProgramIdOp : TTNG_Op<"clc_get_program_id", [Pure]> {
+  let summary = "Get CTA ID coordinate from CLC response";
+
+  let description = [{
+    Decodes the CLC response to get the first CTA ID coordinate of the
+    canceled cluster. The dim attribute specifies which dimension (0=x, 1=y, 2=z).
+  }];
+
+  let arguments = (ins
+    I128:$clcResult,
+    TT_ProgramDim:$dim
+  );
+
+  let results = (outs I32:$result);
+
+  let assemblyFormat = [{
+    $clcResult `,` $dim attr-dict `:` type($clcResult) `->` type($result)
+  }];
+
+  let builders = [
+    OpBuilder<(ins "Value":$clcResult, "int":$axis), [{
+      build($_builder, $_state, clcResult, ProgramIDDim(axis));
+    }]>
+  ];
 }
 
 //
@@ -805,7 +913,9 @@ def TTNG_TCGen5MMAScaledOp : TTNG_Op<"tc_gen5_mma_scaled", [
 
   let description = [{
     $d += matrix_multiply(scale($lhs, $lhs_scale), scale(rlhs, $rhs_scale))
-    if is_async is false, the op executes synchronously. The barrier operands must not be present in that case.
+    If $two_ctas is set the op will execute a matmul across two contiguous CTAs, it will read the data distributed across the two CTAs
+    and synchronize both CTAs if the op is synchronous.
+    If is_async is false, the op executes synchronously. The barrier operands must not be present in that case.
     Otherwise, if a barrier is given, the op will trigger a commit/arrive on it.
     The result will be safe to read after a barrier wait.
 
@@ -1087,7 +1197,8 @@ def TTNG_TCGen5GlobalAllocOp : TTNG_Op<"tcgen5_global_alloc", []> {
   let assemblyFormat = "attr-dict";
 }
 
-def TTNG_TMEMSubSliceOp : TTNG_Op<"tmem_subslice", [Pure]> {
+def TTNG_TMEMSubSliceOp : TTNG_Op<"tmem_subslice", [Pure,
+                                                    MemDescViewTrait]> {
   let summary = "Take a subslice of a tensor memory allocation";
   let description = [{
     This operation takes a subslice of a tensor memory allocation and returns a new descriptor
@@ -1318,6 +1429,13 @@ def TTNG_SubtiledRegionOp : TTNG_Op<"subtiled_region", [
     /// Append a shared arg and add a corresponding tile block argument.
     /// Returns the new tile block argument.
     BlockArgument addSharedArg(Value value);
+
+    /// Append a new per-tile arg position and add a corresponding tile block
+    /// argument. `valuesPerTile.size()` must equal numTiles; valuesPerTile[t]
+    /// is the value for tile t. The new tile block argument is inserted after
+    /// the existing per-tile args (before shared args / tile index), preserving
+    /// the [perTile.., shared.., tileIdx] ordering. Returns it.
+    BlockArgument addPerTileArg(::llvm::ArrayRef<::mlir::Value> valuesPerTile);
 
     /// Number of per-tile arg positions (K). Each position has numTiles
     /// operands in perTileArgs.

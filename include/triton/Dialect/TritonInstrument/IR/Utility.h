@@ -8,7 +8,12 @@
 
 #include <array>
 
+namespace mlir::triton::gpu {
+class GlobalScratchAllocOp;
+}
+
 namespace mlir::triton::instrument {
+class FunctionBuilder;
 
 constexpr int numMemTypes = getMaxEnumValForMemType() + 1;
 
@@ -22,18 +27,25 @@ namespace CommitKind {
 enum Kind { None = -1, AsyncCp = 0, Wgmma, TmaStore, NumCommitKinds };
 }
 
+void createAssertInThread(ImplicitLocOpBuilder &b, Value condition,
+                          StringRef message);
 Operation *createStoreScratchMemory(OpBuilder &b, Location loc, Value alloc,
                                     Value tensor, RankedTensorType tensorType);
 Value createLoadScratchMemory(OpBuilder &b, Location loc, Value alloc,
                               RankedTensorType tensorType);
+gpu::GlobalScratchAllocOp
+createThirdPartyScratchAlloc(OpBuilder &b, Location loc, Type ptrType,
+                             int64_t sizeInBytes, int64_t alignment);
 Value expandOuterSlicedDim(OpBuilder &b, Location loc, Value tensor);
+RankedTensorType getIntTensorType(Region *region, ArrayRef<int64_t> shape,
+                                  unsigned bitWidth);
 TypedValue<RankedTensorType> createConstIntTensor(OpBuilder &builder,
                                                   Location loc, int64_t val,
                                                   RankedTensorType tensorType,
                                                   bool isSigned = false);
 FuncOp getEntryPoint(ModuleOp module);
 gpu::DistributedEncodingTrait
-getSingleDimSliceEncoding(gpu::BlockedEncodingAttr encoding, int dim);
+getSingleDimSliceEncoding(gpu::DistributedEncodingTrait encoding, int dim);
 
 struct ValueType {
   Value value;
@@ -82,7 +94,8 @@ struct AuxDataMap {
   RegionToValueMap waiting;
   std::array<bool, numMemTypes> hasNonTrivialAliasing{};
 
-  void populateAndPassToWarpSpecialize(ModuleOp module);
+  void populateAndPassToWarpSpecialize(ModuleOp module,
+                                       FunctionBuilder &funcBuilder);
 
 private:
   void getBuffersAndBarriers(

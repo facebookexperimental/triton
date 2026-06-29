@@ -78,10 +78,6 @@ public:
     addLegalOp<triton::gpu::WarpYieldOp>();
     addLegalOp<triton::gpu::WarpSpecializePartitionsOp>();
     addLegalOp<triton::gpu::WarpReturnOp>();
-    addDynamicallyLegalOp<triton::gpu::GlobalScratchAllocOp>(
-        [](triton::gpu::GlobalScratchAllocOp op) {
-          return op.getBackend() != "default";
-        });
   }
 };
 
@@ -189,8 +185,8 @@ struct ConvertTritonGPUToLLVM
                                                            patterns, benefit);
     mlir::triton::NVIDIA::populateFp4ToFpToLLVMPatterns(typeConverter, patterns,
                                                         benefit);
-    mlir::triton::populateInstrumentationToLLVMPatterns(
-        typeConverter, targetInfo, patterns, benefit);
+    mlir::triton::populateInstrumentationToLLVMPatterns(typeConverter,
+                                                        patterns);
 
     TritonLLVMConversionTarget convTarget(*context);
     if (failed(applyPartialConversion(mod, convTarget, std::move(patterns))))

@@ -606,7 +606,7 @@ LogicalResult MemDescReshapeOp::verify() {
   if (failed(inferReturnTypes(getContext(), getLoc(), srcType,
                               dstType.getShape(), expectedTy)))
     return failure();
-  return OpTrait::impl::verifyEquivalentType(expectedTy, dstType);
+  return OpTrait::impl::verifyEquivalentMemDescType(expectedTy, dstType);
 }
 
 static LogicalResult inferMemDescReshapeOpEncoding(ArrayRef<int64_t> srcShape,
@@ -982,6 +982,23 @@ LogicalResult MemDescIndexOp::verify() {
   }
   bool is1D =
       srcTy.getRank() == 1 && dstTy.getRank() == 1 && dstTy.getDimSize(0) == 1;
+  // Beta divergence: upstream #7777's "src and result must have the same
+  // encoding" check is too strict for two beta cases:
+  //  - indexing a multibuffered TMEM channel reduces rank and re-derives the
+  //    per-buffer tensor-memory encoding (e.g. colStride), so the encodings
+  //    legitimately differ for TMEM; and
+  //  - reducing a shared buffer down to a 1D result re-derives the natural 1D
+  //    (single-order) shared encoding.
+  // Restrict the check to non-TMEM sources with a non-1D result.
+  bool isTMem = isa<triton::nvidia_gpu::TensorMemoryEncodingAttr,
+                    triton::nvidia_gpu::TensorMemoryScalesEncodingAttr>(
+      srcTy.getEncoding());
+  bool resultIs1D = dstTy.getRank() == 1;
+  if (!is1D && !isTMem && !resultIs1D &&
+      srcTy.getEncoding() != dstTy.getEncoding()) {
+    return emitError("src and result must have the same encoding");
+  }
+  // memdesc_index reduces rank by 1 and preserves the trailing shape.
   bool correctRank = srcTy.getRank() == dstTy.getRank() + 1 || is1D;
   if (!correctRank) {
     return emitError(
@@ -1056,6 +1073,9 @@ LogicalResult MemDescSubsliceOp::verify() {
   if (srcTy.getElementType() != dstTy.getElementType()) {
     return emitError("result element type must match desc element type");
   }
+  if (srcTy.getEncoding() != dstTy.getEncoding()) {
+    return emitError("src and result must have the same encoding");
+  }
   if (getOffsets().size() != srcTy.getRank()) {
     return emitError("offsets must have the same rank as input");
   }
@@ -1094,6 +1114,9 @@ LogicalResult MemDescSubsliceOp::verify() {
       if (offset & (dstTy.getDimSize(dim) - 1)) {
         return emitError("The split offset may not touch the tile");
       }
+      if (offset >= srcTy.getDimSize(dim)) {
+        return emitError("The split offset may not exceed the source shape");
+      }
     }
   }
 
@@ -1108,10 +1131,12 @@ LogicalResult MemDescSubsliceOp::verify() {
   } else {
     ll = triton::gpu::toLinearLayout(srcTy);
   }
-  // NYI: We don't support non-trivial block dimension for now.
-  auto kBlock = mlir::StringAttr::get(getContext(), "block");
-  if (ll.getInDimSize(kBlock) != 1) {
-    return emitError("non-trivial block dimension not supported");
+
+  // If any block basis is fully broadcasted, multiple CTAs can alias the same
+  // output tile region. Subslice on such layouts is unsupported.
+  auto kBlock = mlir::StringAttr::get(ctx, "block");
+  if (ll.getFreeVariableMasks()[kBlock] != 0) {
+    return emitError("We don't support splitting with broadcasted CTA outputs");
   }
 
   auto llInv = ll.invert();
@@ -1124,9 +1149,15 @@ LogicalResult MemDescSubsliceOp::verify() {
     for (int dimSize = dstTy.getDimSize(dim); dimSize < srcTy.getDimSize(dim);
          dimSize *= 2) {
       namedOffsets[dim] = {kDim, dimSize};
-      if (!llvm::isPowerOf2_32(llInv.apply(namedOffsets)[0].second)) {
+      auto offsetAndBlock = llInv.apply(namedOffsets);
+      auto offset = offsetAndBlock[0];
+      auto block = offsetAndBlock[1];
+      if (!llvm::isPowerOf2_32(offset.second) && offset.second != 0) {
         return emitError(
             "We don't support splitting along the swizzling pattern");
+      }
+      if (block.second != 0) {
+        return emitError("We don't support splitting along CTA dimensions");
       }
     }
   }
@@ -1429,10 +1460,10 @@ LogicalResult WarpYieldOp::verify() {
 
 // Get the size of a scalar type when stored in shared memory.
 // TODO: Generalize this as needed.
-static size_t getSharedMemorySize(Type type) {
+size_t getSharedMemorySize(Type type) {
   if (isa<IntegerType, FloatType>(type))
     return llvm::divideCeil(type.getIntOrFloatBitWidth(), 8);
-  if (isa<PointerType, TensorDescType>(type))
+  if (isa<PointerType, TensorDescInterface>(type))
     return 8;
   if (auto desc = dyn_cast<MemDescType>(type)) {
     if (!isa<SharedMemorySpaceAttr,
@@ -1452,14 +1483,18 @@ static size_t getSharedMemorySize(Type type) {
       mlir::debugString(type));
 }
 
-std::pair<uint64_t, uint64_t> WarpSpecializeOp::getCaptureSizeAlign() {
+uint64_t WarpSpecializeOp::getCaptureSize() {
   uint64_t captureSize = 0;
   // Tightly pack the captures in memory.
   for (Type type : getPartitionOp().getOperandTypes()) {
     captureSize += getSharedMemorySize(type);
   }
+  return captureSize;
+}
+
+uint64_t WarpSpecializeOp::getCaptureAlign() {
   // Align the captures to 8 bytes.
-  return {captureSize, 8};
+  return 8;
 }
 
 unsigned WarpSpecializeOp::getTotalPartitionWarps() {

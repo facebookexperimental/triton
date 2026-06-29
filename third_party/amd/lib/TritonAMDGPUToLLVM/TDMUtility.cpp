@@ -10,52 +10,12 @@
 namespace mlir::LLVM::AMD {
 namespace {
 
-// Helper to encode a 48-bit value: 32 bits in first word, 16 bits in second
-// word
-static void encode48BitValue(RewriterBase &rewriter, TritonLLVMOpBuilder &b,
-                             Value value, SmallVector<Value> &group,
-                             int startIdx) {
-  // Lower 32 bits go into the first word
-  group[startIdx] = b.trunc(i32_ty, value);
-  // Upper 16 bits go into the lower 16 bits of the second word
-  Value upperBits = b.trunc(i32_ty, b.lshr(value, b.i32_val(32)));
-  group[startIdx + 1] =
-      b.or_(group[startIdx + 1], b.and_(upperBits, b.i32_val(0xFFFF)));
-}
-
 // Helper to decode a value spanning two 32-bit words
 static Value decode48BitValue(RewriterBase &rewriter, TritonLLVMOpBuilder &b,
                               ArrayRef<Value> group, int startIdx) {
   Value low = b.lshr(group[startIdx], b.i32_val(16));
   Value high = b.shl(group[startIdx + 1], b.i32_val(16));
   return b.or_(low, high);
-}
-
-// Decode a TDM descriptor from group vectors into
-// (base, [shape0, shape1], [stride0, stride1]).
-std::tuple<Value, SmallVector<Value>, SmallVector<Value>>
-decodeTDMDescriptor(RewriterBase &rewriter, Location loc,
-                    ArrayRef<Value> group0, ArrayRef<Value> group1) {
-  auto ctx = rewriter.getContext();
-  auto b = TritonLLVMOpBuilder(loc, rewriter);
-  Type globalPtrTy = ptr_ty(ctx, 1);
-
-  Value globalAddrLow = group0[2];
-  Value globalAddrHigh = b.and_(group0[3], b.i32_val(0x7FFFFFFF));
-  globalAddrLow = b.zext(i64_ty, globalAddrLow);
-  globalAddrHigh = b.shl(b.zext(i64_ty, globalAddrHigh), b.i64_val(32));
-  Value globalAddr = b.or_(globalAddrLow, globalAddrHigh);
-  Value srcPtr = b.inttoptr(globalPtrTy, globalAddr);
-
-  Value tensorStride0 = group1[5];
-  Value tensorStride1 = b.i32_val(1);
-  SmallVector<Value> tensorStride = {tensorStride0, tensorStride1};
-
-  Value tensorShape1 = decode48BitValue(rewriter, b, group1, 1);
-  Value tensorShape0 = decode48BitValue(rewriter, b, group1, 2);
-  SmallVector<Value> tensorShape = {tensorShape0, tensorShape1};
-
-  return {srcPtr, tensorShape, tensorStride};
 }
 
 // C++ wrapper for the shared tdmGetWarpDistribution function
@@ -292,7 +252,7 @@ TDMDescriptor createTDMDescriptor(RewriterBase &rewriter, Location loc,
     group1[0] = b.or_(group1[0], b.i32_val((log2PadInterval - 1) << 22));
     group1[0] = b.or_(group1[0], b.i32_val((padAmountInDwords - 1) << 25));
   }
-  // Encode tensor shapes using 48-bit encoding
+  // Encode 32-bit tensor shapes
   group1[1] = b.shl(tensorShape[numDims - 1], v16);
   group1[2] = b.lshr(tensorShape[numDims - 1], v16);
 
@@ -304,7 +264,7 @@ TDMDescriptor createTDMDescriptor(RewriterBase &rewriter, Location loc,
   // Block shapes
   group1[3] = b.or_(group1[3], b.i32_val(blockShape[numDims - 1] << 16));
   if (numDims >= 2) {
-    group1[4] = b.i32_val(blockShape[numDims - 2]);
+    group1[4] = b.i32_val(blockShape[numDims - 2] & 0xFFFF);
   }
   // tile_dim2 (upper 16 bits of group1[4])
   if (numDims >= 3) {
@@ -462,7 +422,8 @@ void fillTDMDescriptor(
     std::optional<std::reference_wrapper<SmallVector<Value>>> group2,
     std::optional<std::reference_wrapper<SmallVector<Value>>> group3,
     SmallVector<Value> offset, Value dstPtr, Value pred, Value multicastMask,
-    Value barrierPtr, const triton::LinearLayout &cgaLayout, Value ctaId) {
+    Value barrierPtr, const triton::LinearLayout &cgaLayout, Value ctaId,
+    bool isStore) {
   size_t numDims = offset.size();
   assert(numDims >= 1 && numDims <= 5 && "TDM supports 1D to 5D tensors.");
 
@@ -550,6 +511,32 @@ void fillTDMDescriptor(
     tensorShape[i] = b.smax(b.i32_val(0), b.sub(tensorShape[i], fullOffset));
   }
 
+  // TDM store does not support padding in general. However, if the padding
+  // interval equals the innermost dimension, we can support it by:
+  // 1. Adjusting fastest tile_dim0 to include padding (tile_dim0 + padding).
+  // Note that in triton numDims-1 is the fastest dim whereas dim0 is the
+  // fastest in the TDM descriptor.
+  // 2. Setting tensor_dim0 (fastest) to min(tensor_dim0, original_tile_dim0).
+  // We have to do this after adjusting the tensor shape based on the offset and
+  // cga offset.
+  // This leverages HW OOB checking to skip padding elements while
+  // preserving the original tensor shape if smaller. Note that the pre
+  // conditions are checked in the verifier already
+  bool adjustedBlockShape = false;
+  if (isStore && padInterval > 0 && padAmount > 0) {
+    adjustedBlockShape = true;
+    Value originalTileDim0 = decodedBlockShape[numDims - 1];
+
+    // Adjust block shape (tile dimension) to include padding
+    decodedBlockShape[numDims - 1] =
+        b.add(originalTileDim0, b.i32_val(padAmount));
+
+    // Adjust tensor dimension to be min(tensor_dim0, original_tile_dim0)
+    Value cmp = b.icmp_ult(tensorShape[numDims - 1], originalTileDim0);
+    tensorShape[numDims - 1] =
+        b.select(cmp, tensorShape[numDims - 1], originalTileDim0);
+  }
+
   // Update group0 with addresses
   Value globalAddr = b.ptrtoint(i64_ty, srcPtr);
   Value ldsAddr = b.ptrtoint(i32_ty, dstPtr);
@@ -584,6 +571,14 @@ void fillTDMDescriptor(
     group1[0] = b.and_(group1[0], b.i32_val(0xFFFBFFFF));
   }
 
+  if (adjustedBlockShape) {
+    // Re-encode the adjusted tile_dim0 (block shape) into upper 16 bits of
+    // group1[3]. This is the same for 1D-5D tensors.
+    group1[3] = b.and_(group1[3], b.i32_val(0xFFFF));
+    group1[3] =
+        b.or_(group1[3], b.shl(decodedBlockShape[numDims - 1], b.i32_val(16)));
+  }
+
   // Update group2/group3 for higher dimensions
   if (numDims >= 3) {
     group2.value().get()[0] = tensorShape[numDims - 3];
@@ -611,10 +606,10 @@ void fillTDMDescriptor(
 void fillTDMDescriptorForGatherScatter(
     RewriterBase &rewriter, Location loc,
     const LLVMTypeConverter *typeConverter, Type elementType,
-    SmallVector<int64_t> blockShape, SmallVector<Value> &group0,
-    SmallVector<Value> &group1, SmallVector<Value> &group2,
-    SmallVector<Value> &group3, Value ldsRowOffset, Value globalColOffset,
-    Value ldsPtr, Value pred, Value barrierPtr,
+    SmallVector<int64_t> blockShape, unsigned padInterval, unsigned padAmount,
+    SmallVector<Value> &group0, SmallVector<Value> &group1,
+    SmallVector<Value> &group2, SmallVector<Value> &group3, Value ldsRowOffset,
+    Value globalColOffset, Value ldsPtr, Value pred, Value barrierPtr,
     const triton::LinearLayout &cgaLayout, Value ctaId,
     ArrayRef<Value> rowIndices, bool use32BitIndices) {
   assert(!rowIndices.empty() && "Gather/scatter requires row indices.");
@@ -630,16 +625,13 @@ void fillTDMDescriptorForGatherScatter(
       decodeTDMDescriptorFull(rewriter, loc, group0, group1, group2, group3,
                               /*numDims=*/2);
 
-  // Apply CTA offsets to the base pointer
+  // Apply CTA column offset to the base pointer.
+  // Row positions are specified by rowIndices, so only column offset applies.
   auto kBlock = str_attr("block");
   auto cgaOffsets =
       applyLinearLayout(loc, rewriter, cgaLayout, {{kBlock, ctaId}});
-  Value cgaBaseOffset = b.i32_val(0);
-  for (size_t i = 0; i < 2; ++i) {
-    Value dimOffset = b.mul(cgaOffsets[i].second, tensorStride[i]);
-    cgaBaseOffset = b.add(cgaBaseOffset, dimOffset);
-  }
-  globalPtr = b.gep(globalPtrTy, elementType, globalPtr, cgaBaseOffset);
+  Value cgaColOffset = b.mul(cgaOffsets[1].second, tensorStride[1]);
+  globalPtr = b.gep(globalPtrTy, elementType, globalPtr, cgaColOffset);
 
   // For scatter, only apply column offset to global address
   // Row positions are specified by rowIndices
@@ -648,7 +640,19 @@ void fillTDMDescriptorForGatherScatter(
 
   // Calculate LDS offset based on row offset only (column always starts at 0)
   Value ldsOffset = b.mul(ldsRowOffset, b.i32_val(blockShape[1]));
+
+  // Apply padding if needed
+  if (padInterval > 0 && padAmount > 0) {
+    Value iVal = b.i32_val(log2(padInterval));
+    Value pVal = b.i32_val(log2(padAmount));
+    Value padOffset = b.shl(i32_ty, b.ashr(ldsOffset, iVal), pVal);
+    ldsOffset = b.add(ldsOffset, padOffset);
+  }
   ldsPtr = b.gep(sharedPtrTy, elementType, ldsPtr, ldsOffset);
+
+  // Adjust column tensor shape for OOB handling - subtract column offset to
+  // get remaining elements.
+  tensorShape[1] = b.smax(b.i32_val(0), b.sub(tensorShape[1], globalColOffset));
 
   // Update group0 with addresses and enable gather/scatter mode
   Value globalAddr = b.ptrtoint(i64_ty, globalPtr);
@@ -670,7 +674,7 @@ void fillTDMDescriptorForGatherScatter(
   Value typeBits = b.and_(group0[3], b.i32_val(0xC0000000));
   group0[3] = b.or_(typeBits, globalAddrHigh);
 
-  // Update group1 with tensor shapes (keep original for stride calculation)
+  // Update group1 with adjusted tensor shapes for proper OOB handling
   group1[1] = b.shl(tensorShape[1], b.i32_val(16));
   group1[2] = b.lshr(tensorShape[1], b.i32_val(16));
   group1[2] = b.or_(group1[2], b.shl(tensorShape[0], b.i32_val(16)));
@@ -741,8 +745,10 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
 
   assert(blockShape.size() <= 5);
 
+  auto v8i32Ty = VectorType::get(8, rewriter.getI32Type());
+  Value group4Zero = LLVM::ZeroOp::create(rewriter, loc, v8i32Ty);
+
   if (blockShape.size() > 2) {
-    // Use full variant for >2D tensors
     auto group0Vec = SmallVector<Value>(desc.begin(), desc.begin() + 4);
     auto group1Vec = SmallVector<Value>(desc.begin() + 4, desc.begin() + 12);
     auto group2Vec = SmallVector<Value>(desc.begin() + 12, desc.begin() + 16);
@@ -752,7 +758,7 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
                       to_vector(blockShape), numWarps, padInterval, padAmount,
                       group0Vec, group1Vec, std::ref(group2Vec),
                       std::ref(group3Vec), to_vector(offset), dstPtr, pred,
-                      multicastMask, barrierPtr, cgaLayout, ctaId);
+                      multicastMask, barrierPtr, cgaLayout, ctaId, !isLoad);
 
     auto group0 = packLLVector(loc, group0Vec, rewriter);
     auto group1 = packLLVector(loc, group1Vec, rewriter);
@@ -763,9 +769,8 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
                                        : "llvm.amdgcn.tensor.store.from.lds";
     LLVM::createLLVMIntrinsicCallOp(
         rewriter, loc, intrinsicName, {},
-        {group0, group1, group2, group3, b.i32_val(0)});
+        {group0, group1, group2, group3, group4Zero, b.i32_val(0)});
   } else {
-    // Use d2 variant for 1D-2D tensors
     auto group0Vec = SmallVector<Value>(desc.begin(), desc.begin() + 4);
     auto group1Vec = SmallVector<Value>(desc.begin() + 4, desc.end());
 
@@ -773,15 +778,19 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
                       to_vector(blockShape), numWarps, padInterval, padAmount,
                       group0Vec, group1Vec, std::nullopt, std::nullopt,
                       to_vector(offset), dstPtr, pred, multicastMask,
-                      barrierPtr, cgaLayout, ctaId);
+                      barrierPtr, cgaLayout, ctaId, !isLoad);
 
     auto group0 = packLLVector(loc, group0Vec, rewriter);
     auto group1 = packLLVector(loc, group1Vec, rewriter);
+    auto v4i32Ty = VectorType::get(4, rewriter.getI32Type());
+    Value group2Zero = LLVM::ZeroOp::create(rewriter, loc, v4i32Ty);
+    Value group3Zero = LLVM::ZeroOp::create(rewriter, loc, v4i32Ty);
 
-    const char *intrinsicName = isLoad ? "llvm.amdgcn.tensor.load.to.lds.d2"
-                                       : "llvm.amdgcn.tensor.store.from.lds.d2";
-    LLVM::createLLVMIntrinsicCallOp(rewriter, loc, intrinsicName, {},
-                                    {group0, group1, b.i32_val(0)});
+    const char *intrinsicName = isLoad ? "llvm.amdgcn.tensor.load.to.lds"
+                                       : "llvm.amdgcn.tensor.store.from.lds";
+    LLVM::createLLVMIntrinsicCallOp(
+        rewriter, loc, intrinsicName, {},
+        {group0, group1, group2Zero, group3Zero, group4Zero, b.i32_val(0)});
   }
 }
 
@@ -800,6 +809,7 @@ size_t getTDMGatherScatterInstrinsicCount(size_t numIndices,
 void emitTDMGatherScatter(RewriterBase &rewriter, Location loc,
                           const LLVMTypeConverter *typeConverter,
                           ArrayRef<Value> desc, ArrayRef<int64_t> blockShape,
+                          unsigned padInterval, unsigned padAmount,
                           Value ldsPtr, Value pred, Type elementType,
                           Value barrierPtr,
                           const triton::LinearLayout &cgaLayout, Value ctaId,
@@ -844,9 +854,10 @@ void emitTDMGatherScatter(RewriterBase &rewriter, Location loc,
     // - ldsRowOffset: row offset within shared memory for this batch
     // - colOffset: starting column in global memory
     fillTDMDescriptorForGatherScatter(
-        rewriter, loc, typeConverter, elementType, to_vector(blockShape), g0,
-        g1, g2, g3, b.i32_val(startIdx), colOffset, ldsPtr, pred, barrierPtr,
-        cgaLayout, ctaId, batchIndices, use32BitIndices);
+        rewriter, loc, typeConverter, elementType, to_vector(blockShape),
+        padInterval, padAmount, g0, g1, g2, g3, b.i32_val(startIdx), colOffset,
+        ldsPtr, pred, barrierPtr, cgaLayout, ctaId, batchIndices,
+        use32BitIndices);
 
     // Pack and emit the instruction
     auto group0 = packLLVector(loc, g0, rewriter);
@@ -854,14 +865,14 @@ void emitTDMGatherScatter(RewriterBase &rewriter, Location loc,
     auto group2 = packLLVector(loc, g2, rewriter);
     auto group3 = packLLVector(loc, g3, rewriter);
 
-    // Gather/scatter uses full 4-group format (not the d2 variant) for indices
-    // Gather: tensor.load.to.lds (global -> LDS)
-    // Scatter: tensor.store.from.lds (LDS -> global)
+    auto v8i32Ty = VectorType::get(8, rewriter.getI32Type());
+    Value group4Zero = LLVM::ZeroOp::create(rewriter, loc, v8i32Ty);
+
     const char *intrinsicName = isGather ? "llvm.amdgcn.tensor.load.to.lds"
                                          : "llvm.amdgcn.tensor.store.from.lds";
     LLVM::createLLVMIntrinsicCallOp(
         rewriter, loc, intrinsicName, {},
-        {group0, group1, group2, group3, b.i32_val(0)});
+        {group0, group1, group2, group3, group4Zero, b.i32_val(0)});
   }
 }
 
@@ -954,6 +965,12 @@ SmallVector<Value> emitTDMPrefetch(RewriterBase &rewriter, Location loc,
                                         {kLane, laneId},
                                         {kWarp, warpId},
                                         {kBlock, ctaId}});
+
+  int cacheScope = 8; // (8) = L2 scope
+  int hintValue = cacheScope | static_cast<int>(isSpeculative);
+  Value hint = LLVM::ConstantOp::create(rewriter, loc, i32_ty,
+                                        rewriter.getI32IntegerAttr(hintValue));
+
   // Iterate over each register and emit a prefetch intrinsic
   SmallVector<Value> offsets(ll.getInDimSize(kRegister));
   for (int reg = 0; reg < ll.getInDimSize(kRegister); reg++) {
@@ -961,17 +978,16 @@ SmallVector<Value> emitTDMPrefetch(RewriterBase &rewriter, Location loc,
         ll.apply({{kRegister, reg}, {kLane, 0}, {kWarp, 0}, {kBlock, 0}});
 
     // XOR the base indices with the register specific indices
-    SmallVector<std::pair<StringAttr, Value>> indices;
+    SmallVector<Value> indices;
     for (auto [base, regIdx] : llvm::zip(baseIndices, regIndices)) {
       assert(base.first == regIdx.first);
       Value combined = b.xor_(base.second, b.i32_val(regIdx.second));
-      indices.emplace_back(base.first, combined);
+      indices.emplace_back(combined);
     }
 
     // Compute the local offset from tile ptr for this prefetch based on the
     // computed indices
-    Value localOffset =
-        dot64(to_vector(make_second_range(indices)), scaledStride);
+    Value localOffset = dot64(indices, scaledStride);
     auto prefetchPtr = b.gep(globalPtrTy, elementType, tilePtr, localOffset);
 
     // Mask the prefetch if the offset is out of bounds
@@ -989,13 +1005,9 @@ SmallVector<Value> emitTDMPrefetch(RewriterBase &rewriter, Location loc,
                            afterPrefetch);
 
     rewriter.setInsertionPointToStart(prefetchBlock);
-    int cache_scope = 8; // (8) = L2 scope
-    int speculative = isSpeculative;
-    int llvmTemporalHint = cache_scope | speculative;
-    Value scope = LLVM::ConstantOp::create(
-        rewriter, loc, i32_ty, rewriter.getI32IntegerAttr(llvmTemporalHint));
+
     LLVM::createLLVMIntrinsicCallOp(
-        rewriter, loc, "llvm.amdgcn.global.prefetch", {}, {prefetchPtr, scope});
+        rewriter, loc, "llvm.amdgcn.global.prefetch", {}, {prefetchPtr, hint});
 
     rewriter.setInsertionPointToEnd(prefetchBlock);
     LLVM::BrOp::create(rewriter, loc, afterPrefetch);

@@ -5,6 +5,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "proton/Dialect/include/Dialect/Proton/IR/Dialect.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "third_party/tlx/dialect/include/IR/Dialect.h"
 #include "triton/Conversion/TritonToTritonGPU/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -42,9 +43,10 @@ static void addNamedAttrs(Operation *op, DictionaryAttr dictAttrs) {
 // pinned layout is an anchor and forward-propagates). No-op for ops without the
 // trait, or when the encodings already match (the common case). Kept as a free
 // helper so any conversion pattern can reuse it, not just GenericOpPattern.
-static void unifyOperandEncodingsForSameEncoding(
-    Operation *op, TypeRange resultTypes, SmallVectorImpl<Value> &operands,
-    ConversionPatternRewriter &rewriter) {
+static void
+unifyOperandEncodingsForSameEncoding(Operation *op, TypeRange resultTypes,
+                                     SmallVectorImpl<Value> &operands,
+                                     ConversionPatternRewriter &rewriter) {
   if (!op->hasTrait<mlir::OpTrait::SameOperandsAndResultEncoding>())
     return;
   Attribute enc;
@@ -229,18 +231,6 @@ private:
     SmallVector<T> res(vec.begin(), vec.end());
     res.insert(res.begin() + axis, 1);
     return res;
-  }
-
-  // Example:    order = [   0, 2, 1, 3], dim = 2
-  //          resOrder = [2, 0, 3, 1, 4]
-  SmallVector<unsigned> insertOrder(ArrayRef<unsigned> order,
-                                    unsigned axis) const {
-    SmallVector<unsigned> resOrder(order.begin(), order.end());
-    for (unsigned i = 0; i < resOrder.size(); ++i)
-      if (resOrder[i] >= axis)
-        ++resOrder[i];
-    resOrder.insert(resOrder.begin(), axis);
-    return resOrder;
   }
 };
 
@@ -722,6 +712,13 @@ void populateTLXPatterns(TritonGPUTypeConverter &typeConverter,
   patterns.add<GenericOpPattern<triton::tlx::RequireLayoutOp>>(typeConverter, context);
   patterns.add<GenericOpPattern<triton::tlx::ReleaseLayoutOp>>(typeConverter,
                                                            context);
+  // AMD buffer ops emitted by TLX at TTIR level need encoding added
+  patterns.add<GenericOpPattern<triton::amdgpu::BufferLoadOp>>(typeConverter,
+                                                               context);
+  patterns.add<GenericOpPattern<triton::amdgpu::BufferStoreOp>>(typeConverter,
+                                                                context);
+  patterns.add<GenericOpPattern<triton::amdgpu::BufferLoadToLocalOp>>(
+      typeConverter, context);
 }
 
 //

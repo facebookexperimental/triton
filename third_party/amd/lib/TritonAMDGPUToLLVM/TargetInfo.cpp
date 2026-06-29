@@ -85,7 +85,7 @@ int TargetInfo::getWarpSize() const {
 }
 
 int TargetInfo::getSharedMemorySize() const {
-  // Should return the maximum capacity in kbyte
+  // Should return the maximum capacity in bytes
   switch (getISAFamily()) {
   case ISAFamily::GFX1250:
     return 320 * 1024;
@@ -96,8 +96,19 @@ int TargetInfo::getSharedMemorySize() const {
   }
 }
 
+size_t TargetInfo::getSharedMemoryPartitionSize() const {
+  switch (getISAFamily()) {
+  case ISAFamily::GFX1250:
+    return 64 * 1024;
+  default:
+    // No partitioning on other targets
+    return 0;
+  }
+}
+
 bool TargetInfo::supportMaximumMinimum() const {
-  return getISAFamily() == ISAFamily::CDNA4;
+  return getISAFamily() == ISAFamily::CDNA4 ||
+         getISAFamily() == ISAFamily::GFX1250;
 }
 
 Value TargetInfo::getClusterCTAId(RewriterBase &rewriter, Location loc) const {
@@ -105,10 +116,8 @@ Value TargetInfo::getClusterCTAId(RewriterBase &rewriter, Location loc) const {
     return arith::ConstantIntOp::create(rewriter, loc, 0, 32);
 
   // We dispatch only along x; return the workgroup id x
-  return LLVM::createLLVMIntrinsicCallOp(rewriter, loc,
-                                         "llvm.amdgcn.cluster.workgroup.id.x",
-                                         {rewriter.getI32Type()}, {})
-      .getResult(0);
+  return ROCDL::ClusterWorkgroupIdXOp::create(rewriter, loc,
+                                              rewriter.getI32Type());
 }
 
 Value TargetInfo::ballot(RewriterBase &rewriter, Location loc, Type type,
@@ -489,7 +498,7 @@ bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
     buf = createDppReduxOpWithBoundCtrl(valType, buf, 1 + dppCtrlRowShr,
                                         allRows, allBanks);
 
-    if (isCDNA(getISAFamily())) {
+    if (supportDppBroadcast()) {
       // row_bcast:15 row_mask:0xa
       buf = createDppReduxOpWithBoundCtrl(
           valType, buf, static_cast<uint32_t>(DppCtrl::BCAST15), 0xa, allBanks);
@@ -499,7 +508,6 @@ bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
           valType, buf, static_cast<uint32_t>(DppCtrl::BCAST31), allRows,
           allBanks);
     } else {
-      // RDNA doesn't have broadcast dpp mode
       Type actualType = castToAndSExtInt(rewriter, loc, buf, valType, 32);
 
       // Lanes 0-15 read from lane 31 and lanes 16-31 read from lane 15.
@@ -725,6 +733,16 @@ bool TargetInfo::supportsDirectFromLdsStoreBitWidth(int bitWidth) const {
   return false;
 }
 
+bool TargetInfo::supportsBufferLoadToLocal() const {
+  return llvm::is_contained({ISAFamily::CDNA3, ISAFamily::CDNA4},
+                            getISAFamily());
+}
+
+bool TargetInfo::useAsyncMarks() const {
+  return llvm::is_contained({ISAFamily::CDNA3, ISAFamily::CDNA4},
+                            getISAFamily());
+}
+
 bool TargetInfo::supportsWaveId() const {
   return getISAFamily() == ISAFamily::RDNA4 ||
          getISAFamily() == ISAFamily::GFX1250;
@@ -745,4 +763,19 @@ void TargetInfo::localLoadOpAnnotation(triton::gpu::LocalLoadOp localLoadOp,
     AMD::addLocalLoadNoAliasScope(localLoadOp, cast<LLVM::LoadOp>(llLoadOp));
 }
 
+bool TargetInfo::supportDppBroadcast() const {
+  switch (getISAFamily()) {
+  case ISAFamily::CDNA1:
+  case ISAFamily::CDNA2:
+  case ISAFamily::CDNA3:
+  case ISAFamily::CDNA4:
+    return true;
+  case ISAFamily::GFX1250:
+    return false;
+  default:
+    break;
+  }
+
+  return false;
+}
 } // namespace mlir::triton::AMD

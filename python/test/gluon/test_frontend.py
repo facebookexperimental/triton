@@ -8,11 +8,19 @@ from triton.experimental.gluon import language as ttgl
 from triton.experimental.gluon.language.nvidia import blackwell
 from triton.experimental.gluon.language.nvidia import hopper
 from triton.experimental.gluon.language.nvidia.hopper import cluster
-from triton.experimental.gluon.language.nvidia.blackwell import mbarrier, tma, TensorMemoryLayout, TensorMemoryScalesLayout, async_copy
+from triton.experimental.gluon.language.nvidia.blackwell import (
+    mbarrier,
+    tma,
+    TensorMemoryLayout,
+    TensorMemoryScalesLayout,
+    async_copy,
+)
 from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 from triton.experimental.gluon.language.amd import _layouts as amd_layouts
 from triton.experimental.gluon.language.amd.cdna4 import async_copy as cdna4_async_copy
-from triton.experimental.gluon.language.amd.gfx1250 import async_copy as gfx1250_async_copy
+from triton.experimental.gluon.language.amd.gfx1250 import (
+    async_copy as gfx1250_async_copy,
+)
 from triton.experimental.gluon.language.amd.gfx1250 import mbarrier as gfx1250_mbarrier
 from triton.experimental.gluon.language.amd.gfx1250 import cluster as gfx1250_cluster
 from triton.experimental.gluon.language.extra import libdevice
@@ -24,7 +32,7 @@ from triton.compiler.errors import CompilationError, CompileTimeAssertionFailure
 
 TARGET_PAT = re.compile('ttg.target = "[^"]*"')
 # HIP backend can add this attribute to function parameters
-PTRRANGE_PAT = re.compile('(, )?tt.pointer_range = 32 : i32')
+PTRRANGE_PAT = re.compile("(, )?tt.pointer_range = 32 : i32")
 LIBDEVICE_PAT = re.compile('{libname = "", libpath = "", pure = true, symbol = "__.*"}')
 
 BLACKWELL_TARGET = GPUTarget("cuda", 100, 32)
@@ -41,8 +49,10 @@ ALL_TARGETS = [AMPERE_TARGET, HOPPER_TARGET, BLACKWELL_TARGET, HIP_TARGET_RDNA4]
 
 def anonymize_ir(ir):
     ir = TARGET_PAT.sub('ttg.target = "..."', ir)
-    ir = PTRRANGE_PAT.sub('', ir)
-    ir = LIBDEVICE_PAT.sub('{libname = "", libpath = "", pure = true, symbol = "..."}', ir)
+    ir = PTRRANGE_PAT.sub("", ir)
+    ir = LIBDEVICE_PAT.sub(
+        '{libname = "", libpath = "", pure = true, symbol = "..."}', ir
+    )
     return ir
 
 
@@ -51,23 +61,35 @@ def make_args(*args, **kwargs):
 
 
 @gluon.jit
-def convert_layout_kernel(XBLOCK: ttgl.constexpr, layout_a: ttgl.constexpr, layout_b: ttgl.constexpr):
+def convert_layout_kernel(
+    XBLOCK: ttgl.constexpr, layout_a: ttgl.constexpr, layout_b: ttgl.constexpr
+):
     x = ttgl.arange(0, XBLOCK, layout=layout_a)
     res = ttgl.convert_layout(x, layout_b)  # noqa: F841
 
 
 @pytest.mark.parametrize("target", ALL_TARGETS)
 def test_convert_layout(target):
-    layout_a = ttgl.BlockedLayout(size_per_thread=[1], threads_per_warp=[32], warps_per_cta=[4], order=[0])
+    layout_a = ttgl.BlockedLayout(
+        size_per_thread=[1], threads_per_warp=[32], warps_per_cta=[4], order=[0]
+    )
     layout_b = ttgl.SliceLayout(
-        1, ttgl.BlockedLayout(size_per_thread=[1, 1], threads_per_warp=[1, 32], warps_per_cta=[1, 4], order=[1, 0]))
+        1,
+        ttgl.BlockedLayout(
+            size_per_thread=[1, 1],
+            threads_per_warp=[1, 32],
+            warps_per_cta=[1, 4],
+            order=[1, 0],
+        ),
+    )
     mod = run_parser(
         convert_layout_kernel,
         *make_args(128, layout_a, layout_b, num_warps=layout_a.warps_per_cta[0]),
         target=target,
     )
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
@@ -77,7 +99,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
@@ -95,7 +118,8 @@ def test_simple_ops(target):
         target=target,
     )
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @simple_ops_kernel(%arg0: i32) attributes {noinline = false} {
     %c1_i32 = arith.constant 1 : i32
@@ -105,7 +129,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @filecheck_test
@@ -124,7 +149,9 @@ def test_histogram_frontend():
 @gluon.jit
 def test_convert_layout_assert_trivial():
     # CHECK: test_convert_layout_assert_trivial
-    parent_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 128], [32, 1], [4, 1], [0, 1])
+    parent_layout: ttgl.constexpr = ttgl.BlockedLayout(
+        [1, 128], [32, 1], [4, 1], [0, 1]
+    )
     slice_layout: ttgl.constexpr = ttgl.SliceLayout(1, parent_layout)
     equiv_layout: ttgl.constexpr = ttgl.BlockedLayout([1], [32], [4], [0])
 
@@ -146,7 +173,9 @@ def test_convert_layout_not_trivial(target):
         dst_layout = ttgl.BlockedLayout([1], [32], [4], [0])
         run_parser(kernel, *make_args(src_layout, dst_layout), target=target)
 
-    assert "layout conversion from BlockedLayout(size_per_thread=[2]" in str(e.value.__cause__)
+    assert "layout conversion from BlockedLayout(size_per_thread=[2]" in str(
+        e.value.__cause__
+    )
     assert "to BlockedLayout(size_per_thread=[1]" in str(e.value.__cause__)
     assert "is not trivial" in str(e.value.__cause__)
 
@@ -155,7 +184,9 @@ def test_convert_layout_not_trivial(target):
         dst_layout = ttgl.AutoLayout()
         run_parser(kernel, *make_args(src_layout, dst_layout), target=target)
 
-    assert "layout conversion from BlockedLayout(size_per_thread=[2]" in str(e.value.__cause__)
+    assert "layout conversion from BlockedLayout(size_per_thread=[2]" in str(
+        e.value.__cause__
+    )
     assert "to AutoLayout() is not trivial" in str(e.value.__cause__)
 
     with pytest.raises(CompilationError) as e:
@@ -169,8 +200,13 @@ def test_convert_layout_not_trivial(target):
 
 
 @gluon.jit
-def shared_memory_kernel(XBLOCK: ttgl.constexpr, YBLOCK: ttgl.constexpr, layout_a: ttgl.constexpr,
-                         layout_b: ttgl.constexpr, smem_layout: ttgl.constexpr):
+def shared_memory_kernel(
+    XBLOCK: ttgl.constexpr,
+    YBLOCK: ttgl.constexpr,
+    layout_a: ttgl.constexpr,
+    layout_b: ttgl.constexpr,
+    smem_layout: ttgl.constexpr,
+):
     unused = ttgl.allocate_shared_memory(ttgl.int32, [XBLOCK, YBLOCK], smem_layout)
     a = ttgl.full([XBLOCK, YBLOCK], 0, ttgl.int32, layout_a)
     ttgl.static_assert(a.numel == unused.numel)
@@ -183,16 +219,31 @@ def shared_memory_kernel(XBLOCK: ttgl.constexpr, YBLOCK: ttgl.constexpr, layout_
 
 @pytest.mark.parametrize("target", ALL_TARGETS)
 def test_shared_memory(target):
-    layout_a = ttgl.BlockedLayout(size_per_thread=[1, 1], threads_per_warp=[1, 32], warps_per_cta=[4, 1], order=[1, 0])
-    layout_b = ttgl.BlockedLayout(size_per_thread=[1, 4], threads_per_warp=[1, 32], warps_per_cta=[4, 1], order=[1, 0])
-    smem_layout = ttgl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=32, rank=2)
+    layout_a = ttgl.BlockedLayout(
+        size_per_thread=[1, 1],
+        threads_per_warp=[1, 32],
+        warps_per_cta=[4, 1],
+        order=[1, 0],
+    )
+    layout_b = ttgl.BlockedLayout(
+        size_per_thread=[1, 4],
+        threads_per_warp=[1, 32],
+        warps_per_cta=[4, 1],
+        order=[1, 0],
+    )
+    smem_layout = ttgl.NVMMASharedLayout(
+        swizzle_byte_width=128, element_bitwidth=32, rank=2
+    )
     mod = run_parser(
         shared_memory_kernel,
-        *make_args(8, 32, layout_a, layout_b, smem_layout, num_warps=layout_a.warps_per_cta[0]),
+        *make_args(
+            8, 32, layout_a, layout_b, smem_layout, num_warps=layout_a.warps_per_cta[0]
+        ),
         target=target,
     )
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
@@ -209,7 +260,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
@@ -218,19 +270,28 @@ def tensor_memory_kernel(layout: ttgl.constexpr, tmem_layout: ttgl.constexpr):
     YBLOCK: ttgl.constexpr = tmem_layout.block[1]
     a = ttgl.full([XBLOCK, YBLOCK], 0, ttgl.int32, layout)
     _ = ttgl.nvidia.blackwell.allocate_tensor_memory(ttgl.int32, a.shape, tmem_layout)
-    mem = ttgl.nvidia.blackwell.allocate_tensor_memory(ttgl.int32, a.shape, tmem_layout, a)
+    mem = ttgl.nvidia.blackwell.allocate_tensor_memory(
+        ttgl.int32, a.shape, tmem_layout, a
+    )
     b = mem.load(layout)  # noqa: F841
     mem.store(a)
     slice1 = mem.slice(0, YBLOCK // 2)  # noqa: F841
     slice2 = mem.slice(YBLOCK // 2, YBLOCK // 2)  # noqa: F841
 
-    buffers = ttgl.nvidia.blackwell.allocate_tensor_memory(ttgl.float32, [2, XBLOCK, YBLOCK], tmem_layout)
+    buffers = ttgl.nvidia.blackwell.allocate_tensor_memory(
+        ttgl.float32, [2, XBLOCK, YBLOCK], tmem_layout
+    )
     for ivar in range(2):
         buffers.index(ivar).load(layout)
 
 
 def test_tensor_memory():
-    layout = ttgl.BlockedLayout(size_per_thread=[1, 64], threads_per_warp=[32, 1], warps_per_cta=[4, 1], order=[0, 1])
+    layout = ttgl.BlockedLayout(
+        size_per_thread=[1, 64],
+        threads_per_warp=[32, 1],
+        warps_per_cta=[4, 1],
+        order=[0, 1],
+    )
     tmem_layout = TensorMemoryLayout(block=[128, 128], col_stride=1)
     mod = run_parser(
         tensor_memory_kernel,
@@ -238,10 +299,10 @@ def test_tensor_memory():
         target=BLACKWELL_TARGET,
     )
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
-#tmem1 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @tensor_memory_kernel() attributes {noinline = false} {
     %c0_i32 = arith.constant 0 : i32
@@ -251,8 +312,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %result_1 = ttng.tmem_load %result_0 : !ttg.memdesc<128x128xi32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xi32, #blocked>
     %true = arith.constant true
     ttng.tmem_store %cst, %result_0, %true : tensor<128x128xi32, #blocked> -> !ttg.memdesc<128x128xi32, #tmem, #ttng.tensor_memory, mutable>
-    %0 = ttng.tmem_subslice %result_0 {N = 0 : i32} : !ttg.memdesc<128x128xi32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xi32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
-    %1 = ttng.tmem_subslice %result_0 {N = 64 : i32} : !ttg.memdesc<128x128xi32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xi32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
+    %0 = ttng.tmem_subslice %result_0 {N = 0 : i32} : !ttg.memdesc<128x128xi32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xi32, #tmem, #ttng.tensor_memory, mutable, 128x128>
+    %1 = ttng.tmem_subslice %result_0 {N = 64 : i32} : !ttg.memdesc<128x128xi32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xi32, #tmem, #ttng.tensor_memory, mutable, 128x128>
     %result_2 = ttng.tmem_alloc : () -> !ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     %c0_i32_3 = arith.constant 0 : i32
     %c2_i32 = arith.constant 2 : i32
@@ -268,11 +329,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
-def shared_memory_subview_kernel(XBLOCK: ttgl.constexpr, layout: ttgl.constexpr, smem_layout: ttgl.constexpr):
+def shared_memory_subview_kernel(
+    XBLOCK: ttgl.constexpr, layout: ttgl.constexpr, smem_layout: ttgl.constexpr
+):
     XHALF: ttgl.constexpr = XBLOCK // 2
     smem = ttgl.allocate_shared_memory(ttgl.int32, [XBLOCK, XBLOCK], smem_layout)
     view = smem.slice(XHALF, XHALF, dim=1)
@@ -283,7 +347,12 @@ def shared_memory_subview_kernel(XBLOCK: ttgl.constexpr, layout: ttgl.constexpr,
 
 @pytest.mark.parametrize("target", ALL_TARGETS)
 def test_shared_memory_subview(target):
-    layout = ttgl.BlockedLayout(size_per_thread=[1, 1], threads_per_warp=[1, 32], warps_per_cta=[4, 1], order=[1, 0])
+    layout = ttgl.BlockedLayout(
+        size_per_thread=[1, 1],
+        threads_per_warp=[1, 32],
+        warps_per_cta=[4, 1],
+        order=[1, 0],
+    )
     smem_layout = ttgl.SwizzledSharedLayout(1, 1, 1, [1, 0])
     mod = run_parser(
         shared_memory_subview_kernel,
@@ -291,7 +360,8 @@ def test_shared_memory_subview(target):
         target=target,
     )
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [0, 1]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
@@ -307,11 +377,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
-def shared_memory_index_kernel(XBLOCK: ttgl.constexpr, layout: ttgl.constexpr, smem_layout: ttgl.constexpr):
+def shared_memory_index_kernel(
+    XBLOCK: ttgl.constexpr, layout: ttgl.constexpr, smem_layout: ttgl.constexpr
+):
     smem = ttgl.allocate_shared_memory(ttgl.int32, [4, XBLOCK], smem_layout)
     for ivar in range(4):
         smem.index(ivar).load(layout)
@@ -319,7 +392,9 @@ def shared_memory_index_kernel(XBLOCK: ttgl.constexpr, layout: ttgl.constexpr, s
 
 @pytest.mark.parametrize("target", ALL_TARGETS)
 def test_shared_memory_index(target):
-    layout = ttgl.BlockedLayout(size_per_thread=[1], threads_per_warp=[32], warps_per_cta=[4], order=[0])
+    layout = ttgl.BlockedLayout(
+        size_per_thread=[1], threads_per_warp=[32], warps_per_cta=[4], order=[0]
+    )
     smem_layout = ttgl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0])
     mod = run_parser(
         shared_memory_index_kernel,
@@ -327,7 +402,8 @@ def test_shared_memory_index(target):
         target=target,
     )
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
@@ -348,7 +424,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
@@ -363,7 +440,8 @@ def shared_memory_permute_kernel():
 def test_shared_memory_permute(target):
     mod = run_parser(shared_memory_permute_kernel, target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0, 1]}>
 #smem = #ttg.shared_memory
@@ -374,23 +452,27 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
 def shared_memory_cast_kernel():
-    layout_a: ttgl.constexpr = ttgl.NVMMASharedLayout(swizzle_byte_width=64, transposed=False, element_bitwidth=8,
-                                                      rank=2)
-    layout_T: ttgl.constexpr = ttgl.NVMMASharedLayout(swizzle_byte_width=64, transposed=True, element_bitwidth=8,
-                                                      rank=2)
+    layout_a: ttgl.constexpr = ttgl.NVMMASharedLayout(
+        swizzle_byte_width=64, transposed=False, element_bitwidth=8, rank=2
+    )
+    layout_T: ttgl.constexpr = ttgl.NVMMASharedLayout(
+        swizzle_byte_width=64, transposed=True, element_bitwidth=8, rank=2
+    )
     smem = ttgl.allocate_shared_memory(ttgl.int8, [2, 256, 128], layout_a)
     perm = smem.index(0).permute((1, 0))
     ttgl.static_assert(perm.type.layout == layout_T)
     # Check that the MLIR type and Gluon types match by emitting a call.
     anchor_noinline(perm)
 
-    layout_b: ttgl.constexpr = ttgl.NVMMASharedLayout(swizzle_byte_width=64, transposed=False, element_bitwidth=16,
-                                                      rank=4)
+    layout_b: ttgl.constexpr = ttgl.NVMMASharedLayout(
+        swizzle_byte_width=64, transposed=False, element_bitwidth=16, rank=4
+    )
     smem = ttgl.allocate_shared_memory(ttgl.float16, [32, 1, 4, 64], layout_b)
     smem.reshape((128, 64))
 
@@ -401,7 +483,8 @@ def shared_memory_cast_kernel():
 def test_shared_memory_cast(target):
     mod = run_parser(shared_memory_cast_kernel, target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = true, elementBitWidth = 8}>
 #shared2 = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16, rank = 4}>
@@ -424,7 +507,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
@@ -446,10 +530,6 @@ def warp_specialize_worker1(a, b, e: ttgl.constexpr):
 class Pair:
     first: tl.tensor
     second: tl.tensor
-
-    def __init__(self, first, second):
-        self.first = first
-        self.second = second
 
 
 @gluon.jit
@@ -491,20 +571,28 @@ def test_warp_specialize():
     c = ttgl.arange(0, 4, layout=layout)
     pair = Pair(a, b)
     e: ttgl.constexpr = 42
-    a, b = ttgl.warp_specialize([
-        (warp_specialize_default, (pair, c, e)),
-        (warp_specialize_worker0, (pair, c, e)),
-        (warp_specialize_worker1, (pair, c, e)),
-    ], [4, 4], [24, 48])
+    a, b = ttgl.warp_specialize(
+        [
+            (warp_specialize_default, (pair, c, e)),
+            (warp_specialize_worker0, (pair, c, e)),
+            (warp_specialize_worker1, (pair, c, e)),
+        ],
+        [4, 4],
+        [24, 48],
+    )
     anchor(a)
     anchor(b)
 
     # CHECK: ttg.warp_specialize([[A]], [[B]], [[C]])
     # CHECK: (tensor<1xi32, [[BLOCKED]]>, tensor<2xi32, [[BLOCKED]]>, tensor<4xi32, [[BLOCKED]]>) -> ()
-    ttgl.warp_specialize([
-        (warp_specialize_worker0, (pair, c, e)),
-        (warp_specialize_worker1, (pair, c, e)),
-    ], [4], [48])
+    ttgl.warp_specialize(
+        [
+            (warp_specialize_worker0, (pair, c, e)),
+            (warp_specialize_worker1, (pair, c, e)),
+        ],
+        [4],
+        [48],
+    )
 
 
 @gluon.jit
@@ -545,11 +633,15 @@ def test_num_warps_caller_context():
     # CHECK: func private @{{.*}}ws_test_worker1{{.*}}_NW1() attributes {noinline = false, "ttg.num-warps" = 1 : i32}
     # CHECK: func private @{{.*}}ws_body{{.*}}_NW1"() attributes {noinline = false, "ttg.num-warps" = 1 : i32}
     # CHECK: func private @{{.*}}anchor{{.*}}_NW1(%arg0: tensor<128xi32, [[BLOCKED_NW1]]>) attributes {noinline = false, "ttg.num-warps" = 1 : i32}
-    ttgl.warp_specialize([
-        (ws_test_default, ()),
-        (ws_test_worker0, ()),
-        (ws_test_worker1, ()),
-    ], [2, 1], [80, 80])
+    ttgl.warp_specialize(
+        [
+            (ws_test_default, ()),
+            (ws_test_worker0, ()),
+            (ws_test_worker1, ()),
+        ],
+        [2, 1],
+        [80, 80],
+    )
 
 
 @gluon.jit
@@ -567,7 +659,8 @@ def mbarrier_kernel():
 def test_mbarrier(target):
     mod = run_parser(mbarrier_kernel, target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
@@ -585,7 +678,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
@@ -594,9 +688,12 @@ def mbarrier_sync_cluster_init_kernel():
 
 
 def test_mbarrier_sync_cluster_init():
-    mod = run_parser(mbarrier_sync_cluster_init_kernel, *make_args(num_ctas=2), target=HOPPER_TARGET)
+    mod = run_parser(
+        mbarrier_sync_cluster_init_kernel, *make_args(num_ctas=2), target=HOPPER_TARGET
+    )
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @mbarrier_sync_cluster_init_kernel() attributes {noinline = false} {
     tt.call @triton.experimental.gluon.language.nvidia.hopper.mbarrier.sync_cluster_init__() : () -> ()
@@ -604,12 +701,12 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   }
   tt.func private @triton.experimental.gluon.language.nvidia.hopper.mbarrier.sync_cluster_init__() attributes {noinline = false} {
     ttng.fence_mbarrier_init_release_cluster
-    ttng.cluster_arrive {relaxed = true}
-    ttng.cluster_wait
+    ttng.cluster_barrier {relaxed = true}
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
@@ -621,12 +718,19 @@ def tcgen05_mma_kernel(nvmma_layout: ttgl.constexpr, acc_layout: ttgl.constexpr)
 
 
 def test_tcgen05_mma():
-    nvmma_layout = ttgl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16, rank=2)
+    nvmma_layout = ttgl.NVMMASharedLayout(
+        swizzle_byte_width=128, element_bitwidth=16, rank=2
+    )
     acc_layout = TensorMemoryLayout([128, 128], col_stride=2)
 
-    mod = run_parser(tcgen05_mma_kernel, *make_args(nvmma_layout, acc_layout), target=BLACKWELL_TARGET)
+    mod = run_parser(
+        tcgen05_mma_kernel,
+        *make_args(nvmma_layout, acc_layout),
+        target=BLACKWELL_TARGET,
+    )
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 2>
@@ -641,11 +745,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
-def tcgen05_mma_scaled_kernel(nvmma_layout: ttgl.constexpr, acc_layout: ttgl.constexpr, scale_layout: ttgl.constexpr):
+def tcgen05_mma_scaled_kernel(
+    nvmma_layout: ttgl.constexpr,
+    acc_layout: ttgl.constexpr,
+    scale_layout: ttgl.constexpr,
+):
     a = ttgl.allocate_shared_memory(ttgl.float8e5, [128, 128], nvmma_layout)
     b = ttgl.allocate_shared_memory(ttgl.float8e5, [128, 128], nvmma_layout)
     scale_a = blackwell.allocate_tensor_memory(ttgl.int8, [128, 32], scale_layout)
@@ -655,14 +764,20 @@ def tcgen05_mma_scaled_kernel(nvmma_layout: ttgl.constexpr, acc_layout: ttgl.con
 
 
 def test_tcgen05_mma_scaled():
-    nvmma_layout = ttgl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16, rank=2)
+    nvmma_layout = ttgl.NVMMASharedLayout(
+        swizzle_byte_width=128, element_bitwidth=16, rank=2
+    )
     scale_layout = TensorMemoryScalesLayout()
     acc_layout = TensorMemoryLayout([128, 128], col_stride=2)
 
-    mod = run_parser(tcgen05_mma_scaled_kernel, *make_args(nvmma_layout, acc_layout, scale_layout),
-                     target=BLACKWELL_TARGET)
+    mod = run_parser(
+        tcgen05_mma_scaled_kernel,
+        *make_args(nvmma_layout, acc_layout, scale_layout),
+        target=BLACKWELL_TARGET,
+    )
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 2>
@@ -680,7 +795,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
@@ -693,12 +809,19 @@ def tcgen05_mma_mbar_kernel(nvmma_layout: ttgl.constexpr, acc_layout: ttgl.const
 
 
 def test_tcgen05_mma_mbar():
-    nvmma_layout = ttgl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16, rank=2)
+    nvmma_layout = ttgl.NVMMASharedLayout(
+        swizzle_byte_width=128, element_bitwidth=16, rank=2
+    )
     acc_layout = TensorMemoryLayout([128, 128], col_stride=2)
 
-    mod = run_parser(tcgen05_mma_mbar_kernel, *make_args(nvmma_layout, acc_layout), target=BLACKWELL_TARGET)
+    mod = run_parser(
+        tcgen05_mma_mbar_kernel,
+        *make_args(nvmma_layout, acc_layout),
+        target=BLACKWELL_TARGET,
+    )
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
@@ -716,7 +839,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @filecheck_test
@@ -732,8 +856,9 @@ def test_tcgen05_commit():
 @gluon.jit
 def tcgen05_commit_multicast_two_ctas_kernel():
     cga_layout: ttgl.constexpr = [[1, 0]]
-    nvmma_layout: ttgl.constexpr = ttgl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16, rank=2,
-                                                          cga_layout=cga_layout)
+    nvmma_layout: ttgl.constexpr = ttgl.NVMMASharedLayout(
+        swizzle_byte_width=128, element_bitwidth=16, rank=2, cga_layout=cga_layout
+    )
     a = ttgl.allocate_shared_memory(ttgl.float16, [128, 128], nvmma_layout)
     b = ttgl.allocate_shared_memory(ttgl.float16, [128, 128], nvmma_layout)
     barrier = mbarrier.allocate_mbarrier(two_ctas=True)
@@ -741,9 +866,14 @@ def tcgen05_commit_multicast_two_ctas_kernel():
 
 
 def test_tcgen05_commit_multicast_two_ctas():
-    mod = run_parser(tcgen05_commit_multicast_two_ctas_kernel, *make_args(num_ctas=2), target=BLACKWELL_TARGET)
+    mod = run_parser(
+        tcgen05_commit_multicast_two_ctas_kernel,
+        *make_args(num_ctas=2),
+        target=BLACKWELL_TARGET,
+    )
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0]]}>
 #shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
 #smem = #ttg.shared_memory
@@ -764,7 +894,8 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return %1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
@@ -780,15 +911,20 @@ def warpgroup_mma_kernel(nvmma_layout: ttgl.constexpr, acc_layout: ttgl.constexp
 
 
 def test_warpgroup_mma():
-    nvmma_layout = ttgl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16, rank=2)
-    mma_layout = ttgl.NVMMADistributedLayout(version=[3, 0], warps_per_cta=[4, 1], instr_shape=[16, 32, 16])
+    nvmma_layout = ttgl.NVMMASharedLayout(
+        swizzle_byte_width=128, element_bitwidth=16, rank=2
+    )
+    mma_layout = ttgl.NVMMADistributedLayout(
+        version=[3, 0], warps_per_cta=[4, 1], instr_shape=[16, 32, 16]
+    )
     mod = run_parser(
         warpgroup_mma_kernel,
         *make_args(nvmma_layout, mma_layout),
         target=HOPPER_TARGET,
     )
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 32, 16]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
@@ -805,13 +941,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
 def warpgroup_mma_wait_kernel():
-    layout: ttgl.constexpr = ttgl.NVMMADistributedLayout(version=[3, 0], warps_per_cta=[4, 1], instr_shape=[16, 32, 16])
-    acc = hopper.warpgroup_mma_init(ttgl.full([128, 128], 0, dtype=ttgl.float16, layout=layout))
+    layout: ttgl.constexpr = ttgl.NVMMADistributedLayout(
+        version=[3, 0], warps_per_cta=[4, 1], instr_shape=[16, 32, 16]
+    )
+    acc = hopper.warpgroup_mma_init(
+        ttgl.full([128, 128], 0, dtype=ttgl.float16, layout=layout)
+    )
     acc = hopper.warpgroup_mma_wait(num_outstanding=1, deps=[acc])
     _ = acc + acc
 
@@ -819,7 +960,8 @@ def warpgroup_mma_wait_kernel():
 def test_warpgroup_mma_wait():
     mod = run_parser(warpgroup_mma_wait_kernel, target=HOPPER_TARGET)
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 32, 16]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @warpgroup_mma_wait_kernel() attributes {noinline = false} {
@@ -830,12 +972,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
 def async_tma_kernel(input_desc, XBLOCK: ttgl.constexpr):
-    smem = ttgl.allocate_shared_memory(ttgl.float16, [XBLOCK, XBLOCK], input_desc.layout)
+    smem = ttgl.allocate_shared_memory(
+        ttgl.float16, [XBLOCK, XBLOCK], input_desc.layout
+    )
     bar = ttgl.allocate_shared_memory(ttgl.int64, [1], mbarrier.MBarrierLayout())
     mbarrier.init(bar, count=1)
 
@@ -854,7 +999,9 @@ def async_tma_kernel(input_desc, XBLOCK: ttgl.constexpr):
 def test_async_tma(target):
     input = MockTensor(ttgl.float16, (1024, 1024))
     XBLOCK = 128
-    shared_layout = ttgl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16, rank=2)
+    shared_layout = ttgl.NVMMASharedLayout(
+        swizzle_byte_width=128, element_bitwidth=16, rank=2
+    )
     input_desc = TensorDescriptor.from_tensor(input, [XBLOCK, XBLOCK], shared_layout)
 
     mod = run_parser(
@@ -863,7 +1010,8 @@ def test_async_tma(target):
         target=target,
     )
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
@@ -889,12 +1037,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
 def async_tma_blackwell_kernel(input_desc, XBLOCK: ttgl.constexpr):
-    smem = ttgl.allocate_shared_memory(ttgl.float16, [XBLOCK, XBLOCK], input_desc.layout)
+    smem = ttgl.allocate_shared_memory(
+        ttgl.float16, [XBLOCK, XBLOCK], input_desc.layout
+    )
     bar = ttgl.allocate_shared_memory(ttgl.int64, [1], mbarrier.MBarrierLayout())
     mbarrier.init(bar, count=1)
 
@@ -913,7 +1064,9 @@ def async_tma_blackwell_kernel(input_desc, XBLOCK: ttgl.constexpr):
 def test_async_tma_blackwell():
     input = MockTensor(ttgl.float16, (1024, 1024))
     XBLOCK = 128
-    shared_layout = ttgl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16, rank=2)
+    shared_layout = ttgl.NVMMASharedLayout(
+        swizzle_byte_width=128, element_bitwidth=16, rank=2
+    )
     input_desc = TensorDescriptor.from_tensor(input, [1, XBLOCK], shared_layout)
 
     mod = run_parser(
@@ -922,7 +1075,8 @@ def test_async_tma_blackwell():
         target=BLACKWELL_TARGET,
     )
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -948,7 +1102,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 def test_mlir_attr_error():
@@ -960,15 +1115,21 @@ def test_mlir_attr_error():
     with pytest.raises(CompilationError) as e:
         run_parser(kernel)
 
-    assert "order must be a permutation of 0..(rank-1), but was [1]" in str(e.value.__cause__)
+    assert "order must be a permutation of 0..(rank-1), but was [1]" in str(
+        e.value.__cause__
+    )
 
 
 def test_tensor_layout_type_changed():
 
     @gluon.jit
     def kernel():
-        layout: ttgl.constexpr = ttgl.BlockedLayout(size_per_thread=[1, 1], threads_per_warp=[1, 32],
-                                                    warps_per_cta=[1, 4], order=[1, 0])
+        layout: ttgl.constexpr = ttgl.BlockedLayout(
+            size_per_thread=[1, 1],
+            threads_per_warp=[1, 32],
+            warps_per_cta=[1, 4],
+            order=[1, 0],
+        )
         x = ttgl.zeros([128], ttgl.float32)
         y = ttgl.zeros([128, 128], ttgl.float32, layout=layout)
         c = ttgl.to_tensor(True)
@@ -984,13 +1145,16 @@ def test_tensor_layout_type_changed():
 @gluon.jit
 def tmem_index_kernel():
     layout: ttgl.constexpr = TensorMemoryLayout(block=[128, 128], col_stride=1)
-    tmem = ttgl.nvidia.blackwell.allocate_tensor_memory(ttgl.int32, [2, 256, 256], layout)
+    tmem = ttgl.nvidia.blackwell.allocate_tensor_memory(
+        ttgl.int32, [2, 256, 256], layout
+    )
     tmem.index(0)
 
 
 def test_tmem_index_constexpr():
     expecttest.assert_expected_inline(
-        anonymize_ir(run_parser(tmem_index_kernel).str_nodebug()), """\
+        anonymize_ir(run_parser(tmem_index_kernel).str_nodebug()),
+        """\
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @tmem_index_kernel() attributes {noinline = false} {
@@ -1000,7 +1164,53 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+""",
+    )
+
+
+@gluon.jit
+def tmem_subslice_reg_layout_kernel():
+    layout: ttgl.constexpr = TensorMemoryLayout(block=[128, 256], col_stride=1, cga_layout=((1, 0), (2, 0)))
+    tmem = ttgl.nvidia.blackwell.allocate_tensor_memory(ttgl.float32, [2, 512, 256], layout)
+    sub = tmem.index(0).slice(0, 32)
+    _ = sub.load()
+
+
+def test_tmem_subslice_reg_layout_constexpr():
+    expecttest.assert_expected_inline(
+        anonymize_ir(
+            run_parser(
+                tmem_subslice_reg_layout_kernel,
+                *make_args(num_warps=4, num_ctas=4),
+                target=BLACKWELL_TARGET,
+            ).str_nodebug()), """\
+#linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = [[128, 0], [256, 0]]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 256, colStride = 1, CGALayout = [[1, 0], [2, 0]]>
+module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @tmem_subslice_reg_layout_kernel() attributes {noinline = false} {
+    %result = ttng.tmem_alloc : () -> !ttg.memdesc<2x512x256xf32, #tmem, #ttng.tensor_memory, mutable>
+    %c0_i32 = arith.constant 0 : i32
+    %0 = ttg.memdesc_index %result[%c0_i32] : !ttg.memdesc<2x512x256xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<512x256xf32, #tmem, #ttng.tensor_memory, mutable>
+    %1 = ttng.tmem_subslice %0 {N = 0 : i32} : !ttg.memdesc<512x256xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<512x32xf32, #tmem, #ttng.tensor_memory, mutable, 512x256>
+    %result_0 = ttng.tmem_load %1 : !ttg.memdesc<512x32xf32, #tmem, #ttng.tensor_memory, mutable, 512x256> -> tensor<512x32xf32, #linear>
+    tt.return
+  }
+}
 """)
+
+
+@filecheck_test
+@gluon.jit
+def test_tmem_reduction_default_layout_constexpr():
+    # CHECK-LABEL: @test_tmem_reduction_default_layout_constexpr
+    layout: ttgl.constexpr = TensorMemoryLayout(block=[128, 128], col_stride=1)
+    tmem = ttgl.nvidia.blackwell.allocate_tensor_memory(ttgl.float32, [128, 128], layout)
+    # CHECK: ttng.tmem_load {{.*}} {abs = true, redOp = #ttng.redOp<min>}
+    _ = tmem.load_min(abs=True)
+    # CHECK: ttng.tmem_load {{.*}} {NaN = true, redOp = #ttng.redOp<max>}
+    # CHECK-NOT: ttng.tmem_load
+    # CHECK: tt.return
+    _ = tmem.load_max(propagate_nan=tl.PropagateNan.ALL)
 
 
 @gluon.jit
@@ -1017,7 +1227,8 @@ def test_layout_mangling():
         smem_and_layout_user(smem, a)
 
     expecttest.assert_expected_inline(
-        anonymize_ir(run_parser(kernel).str_nodebug()), """\
+        anonymize_ir(run_parser(kernel).str_nodebug()),
+        """\
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
@@ -1030,7 +1241,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
@@ -1045,7 +1257,8 @@ def broadcast_kernel():
 def test_broadcast(target):
     mod = run_parser(broadcast_kernel, target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @broadcast_kernel() attributes {noinline = false} {
@@ -1063,7 +1276,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
@@ -1097,7 +1311,8 @@ def math_kernel():
 def test_math(target):
     mod = run_parser(math_kernel, target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @math_kernel() attributes {noinline = false} {
@@ -1131,7 +1346,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
@@ -1153,7 +1369,8 @@ def libdevice_kernel():
 def test_libdevice(target):
     mod = run_parser(libdevice_kernel, target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @libdevice_kernel() attributes {noinline = false} {
@@ -1177,7 +1394,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
@@ -1195,7 +1413,8 @@ def libdevice_implicit_broadcast_kernel():
 def test_libdevice_implicit_broadcast(target):
     mod = run_parser(libdevice_implicit_broadcast_kernel, target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @libdevice_implicit_broadcast_kernel() attributes {noinline = false} {
@@ -1219,7 +1438,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
@@ -1255,7 +1475,8 @@ def reduce_kernel(out):
 def test_reduce(target):
     mod = run_parser(reduce_kernel, *make_args(MockTensor(ttgl.float32)), target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #linear = #ttg.linear<{register = [[64], [128]], lane = [[1], [2], [4], [8], [0]], warp = [[16], [32]], block = []}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
@@ -1353,7 +1574,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return %2, %3 : f32, f32
   }
 }
-""")
+""",
+    )
 
 
 @filecheck_test
@@ -1378,8 +1600,13 @@ def test_elementwise_core():
 
 @gluon.jit
 def linear_layout_kernel():
-    ll: ttgl.constexpr = ttgl.DistributedLinearLayout(reg_bases=[[1]], lane_bases=[[2], [4], [8], [16], [32]],
-                                                      warp_bases=[[64], [128]], block_bases=[], shape=[256])
+    ll: ttgl.constexpr = ttgl.DistributedLinearLayout(
+        reg_bases=[[1]],
+        lane_bases=[[2], [4], [8], [16], [32]],
+        warp_bases=[[64], [128]],
+        block_bases=[],
+        shape=[256],
+    )
     ttgl.arange(0, 256, layout=ll)
 
 
@@ -1387,7 +1614,8 @@ def linear_layout_kernel():
 def test_linear_layout(target):
     mod = run_parser(linear_layout_kernel, target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #linear = #ttg.linear<{register = [[1]], lane = [[2], [4], [8], [16], [32]], warp = [[64], [128]], block = []}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @linear_layout_kernel() attributes {noinline = false} {
@@ -1395,7 +1623,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @filecheck_test
@@ -1403,9 +1632,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 def test_dot_operand_layout():
     # CHECK: [[NVMMA:#.*]] = #ttg.nvidia_mma
     # CHECK: test_dot_operand_layout
-    mma_layout: ttgl.constexpr = ttgl.NVMMADistributedLayout(version=[3, 0], warps_per_cta=[4, 1],
-                                                             instr_shape=[16, 32, 16])
-    layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=0, parent=mma_layout, k_width=2)
+    mma_layout: ttgl.constexpr = ttgl.NVMMADistributedLayout(
+        version=[3, 0], warps_per_cta=[4, 1], instr_shape=[16, 32, 16]
+    )
+    layout: ttgl.constexpr = ttgl.DotOperandLayout(
+        operand_index=0, parent=mma_layout, k_width=2
+    )
     # CHECK: arith.constant {{.*}} tensor<256x128xf16, #ttg.dot_op<{opIdx = 0, parent = [[NVMMA]], kWidth = 2}>>
     x = ttgl.full([256, 128], 0.0, ttgl.float16, layout)
     y = x.sum(axis=1)
@@ -1464,7 +1696,9 @@ def test_tensor_reshape():
     a = ttgl.full([256], 1, ttgl.int32, layout)
     # CHECK: tt.reshape {{.*}} : tensor<256xi32, [[BLOCKED]]> -> tensor<8x4x8xi32, [[BLOCKED1]]>
     v = a.reshape([8, 4, 8])
-    expect_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 1, 2], [2, 4, 4], [4, 1, 1], [2, 1, 0])
+    expect_layout: ttgl.constexpr = ttgl.BlockedLayout(
+        [1, 1, 2], [2, 4, 4], [4, 1, 1], [2, 1, 0]
+    )
     ttgl.static_assert(v.type.layout == expect_layout)
 
 
@@ -1478,46 +1712,142 @@ def test_static_assert():
         run_parser(static_assert_kernel)
 
 
-@pytest.mark.parametrize("reg_layout, shared_layout, shape, bitwidth, ref_conflicts", [
-    (ttgl.BlockedLayout([1], [32], [4], [0]), ttgl.SwizzledSharedLayout(1, 1, 1, order=[0]), [32], 32, 0),
-    (ttgl.BlockedLayout([1], [32], [4], [0]), ttgl.SwizzledSharedLayout(1, 1, 1, order=[0]), [32], 16, 0),
-    # MMAv3 accumulator tile lowered with the 128B swizzle (WGMMA default path).
-    (ttgl.NVMMADistributedLayout(version=[3, 0], warps_per_cta=[4, 1], instr_shape=[16, 32, 16]),
-     ttgl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16, rank=2), [128, 128], 16, 0),
-    # Small-M tiles disable swizzling entirely.
-    # MMAv2 rhs operand emitted with the 64B swizzle.
-    (ttgl.DotOperandLayout(
-        operand_index=1, parent=ttgl.NVMMADistributedLayout(version=[2, 0], warps_per_cta=[1, 4], instr_shape=[16, 8]),
-        k_width=2), ttgl.NVMMASharedLayout(swizzle_byte_width=64, element_bitwidth=16, rank=2), [64, 32], 16, 0),
-    # MMAv2 lhs operand uses the transposed 64B swizzle flavour.
-    (ttgl.DotOperandLayout(
-        operand_index=0, parent=ttgl.NVMMADistributedLayout(version=[2, 0], warps_per_cta=[1, 4], instr_shape=[16, 8]),
-        k_width=2), ttgl.NVMMASharedLayout(swizzle_byte_width=64, element_bitwidth=16, rank=2,
-                                           transposed=True), [32, 64], 16, 0),
-    # int8 tensor-core tiles follow the 32B swizzle path.
-    (ttgl.DotOperandLayout(
-        operand_index=1, parent=ttgl.NVMMADistributedLayout(version=[2, 0], warps_per_cta=[1, 4], instr_shape=[16, 8]),
-        k_width=1), ttgl.NVMMASharedLayout(swizzle_byte_width=32, element_bitwidth=8, rank=2), [8, 32], 8, 0),
-    # Small-M tiles disable swizzling entirely.
-    (ttgl.NVMMADistributedLayout(version=[2, 0], warps_per_cta=[4, 1], instr_shape=[16, 8]),
-     ttgl.NVMMASharedLayout(swizzle_byte_width=64, element_bitwidth=16, rank=2, transposed=True), [64, 64], 16, 0),
-    (ttgl.NVMMADistributedLayout(version=[3, 0], warps_per_cta=[2, 2], instr_shape=[16, 32, 16]),
-     ttgl.NVMMASharedLayout(swizzle_byte_width=64, element_bitwidth=16, rank=2), [64, 32], 16, 0),
-    (ttgl.NVMMADistributedLayout(version=[2, 0], warps_per_cta=[4, 1], instr_shape=[16, 8]),
-     ttgl.NVMMASharedLayout(swizzle_byte_width=32, element_bitwidth=8, rank=2), [32, 32], 8, 0),
-    (ttgl.NVMMADistributedLayout(version=[2, 0], warps_per_cta=[2, 4], instr_shape=[16, 8]),
-     ttgl.NVMMASharedLayout(swizzle_byte_width=0, element_bitwidth=16, rank=2), [4, 64], 16, 3),
-    (ttgl.NVMMADistributedLayout(version=[3, 0], warps_per_cta=[4, 1], instr_shape=[16, 32, 16]),
-     ttgl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=32, rank=2), [128, 64], 32, 1),
-])
+@pytest.mark.parametrize(
+    "reg_layout, shared_layout, shape, bitwidth, ref_conflicts",
+    [
+        (
+            ttgl.BlockedLayout([1], [32], [4], [0]),
+            ttgl.SwizzledSharedLayout(1, 1, 1, order=[0]),
+            [32],
+            32,
+            0,
+        ),
+        (
+            ttgl.BlockedLayout([1], [32], [4], [0]),
+            ttgl.SwizzledSharedLayout(1, 1, 1, order=[0]),
+            [32],
+            16,
+            0,
+        ),
+        # MMAv3 accumulator tile lowered with the 128B swizzle (WGMMA default path).
+        (
+            ttgl.NVMMADistributedLayout(
+                version=[3, 0], warps_per_cta=[4, 1], instr_shape=[16, 32, 16]
+            ),
+            ttgl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16, rank=2),
+            [128, 128],
+            16,
+            0,
+        ),
+        # Small-M tiles disable swizzling entirely.
+        # MMAv2 rhs operand emitted with the 64B swizzle.
+        (
+            ttgl.DotOperandLayout(
+                operand_index=1,
+                parent=ttgl.NVMMADistributedLayout(
+                    version=[2, 0], warps_per_cta=[1, 4], instr_shape=[16, 8]
+                ),
+                k_width=2,
+            ),
+            ttgl.NVMMASharedLayout(swizzle_byte_width=64, element_bitwidth=16, rank=2),
+            [64, 32],
+            16,
+            0,
+        ),
+        # MMAv2 lhs operand uses the transposed 64B swizzle flavour.
+        (
+            ttgl.DotOperandLayout(
+                operand_index=0,
+                parent=ttgl.NVMMADistributedLayout(
+                    version=[2, 0], warps_per_cta=[1, 4], instr_shape=[16, 8]
+                ),
+                k_width=2,
+            ),
+            ttgl.NVMMASharedLayout(
+                swizzle_byte_width=64, element_bitwidth=16, rank=2, transposed=True
+            ),
+            [32, 64],
+            16,
+            0,
+        ),
+        # int8 tensor-core tiles follow the 32B swizzle path.
+        (
+            ttgl.DotOperandLayout(
+                operand_index=1,
+                parent=ttgl.NVMMADistributedLayout(
+                    version=[2, 0], warps_per_cta=[1, 4], instr_shape=[16, 8]
+                ),
+                k_width=1,
+            ),
+            ttgl.NVMMASharedLayout(swizzle_byte_width=32, element_bitwidth=8, rank=2),
+            [8, 32],
+            8,
+            0,
+        ),
+        # Small-M tiles disable swizzling entirely.
+        (
+            ttgl.NVMMADistributedLayout(
+                version=[2, 0], warps_per_cta=[4, 1], instr_shape=[16, 8]
+            ),
+            ttgl.NVMMASharedLayout(
+                swizzle_byte_width=64, element_bitwidth=16, rank=2, transposed=True
+            ),
+            [64, 64],
+            16,
+            0,
+        ),
+        (
+            ttgl.NVMMADistributedLayout(
+                version=[3, 0], warps_per_cta=[2, 2], instr_shape=[16, 32, 16]
+            ),
+            ttgl.NVMMASharedLayout(swizzle_byte_width=64, element_bitwidth=16, rank=2),
+            [64, 32],
+            16,
+            0,
+        ),
+        (
+            ttgl.NVMMADistributedLayout(
+                version=[2, 0], warps_per_cta=[4, 1], instr_shape=[16, 8]
+            ),
+            ttgl.NVMMASharedLayout(swizzle_byte_width=32, element_bitwidth=8, rank=2),
+            [32, 32],
+            8,
+            0,
+        ),
+        (
+            ttgl.NVMMADistributedLayout(
+                version=[2, 0], warps_per_cta=[2, 4], instr_shape=[16, 8]
+            ),
+            ttgl.NVMMASharedLayout(swizzle_byte_width=0, element_bitwidth=16, rank=2),
+            [4, 64],
+            16,
+            3,
+        ),
+        (
+            ttgl.NVMMADistributedLayout(
+                version=[3, 0], warps_per_cta=[4, 1], instr_shape=[16, 32, 16]
+            ),
+            ttgl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=32, rank=2),
+            [128, 64],
+            32,
+            1,
+        ),
+    ],
+)
 def test_bank_conflicts(reg_layout, shared_layout, shape, bitwidth, ref_conflicts):
     dtype = {8: ttgl.int8, 16: ttgl.float16, 32: ttgl.float32}[bitwidth]
-    args = (ttgl.distributed_type(dtype, shape,
-                                  reg_layout), ttgl.shared_memory_descriptor_type(dtype, shape, shared_layout,
-                                                                                  shape), ref_conflicts)
+    args = (
+        ttgl.distributed_type(dtype, shape, reg_layout),
+        ttgl.shared_memory_descriptor_type(dtype, shape, shared_layout, shape),
+        ref_conflicts,
+    )
 
     @gluon.jit
-    def kernel(reg_type: ttgl.constexpr, shared_type: ttgl.constexpr, ref_conflicts: ttgl.constexpr):
+    def kernel(
+        reg_type: ttgl.constexpr,
+        shared_type: ttgl.constexpr,
+        ref_conflicts: ttgl.constexpr,
+    ):
         conflicts: ttgl.constexpr = ttgl.bank_conflicts(reg_type, shared_type)
         ttgl.static_assert(conflicts == ref_conflicts)
 
@@ -1530,7 +1860,10 @@ def test_bank_conflicts(reg_layout, shared_layout, shape, bitwidth, ref_conflict
         (ttgl.BlockedLayout([1], [4], [4], [0]), [16]),
         (ttgl.BlockedLayout([1], [4], [4], [0], [[1], [0]]), [32]),
         (ttgl.BlockedLayout([8, 1], [8, 4], [1, 4], [0, 1], [[0, 1]]), [64, 128]),
-        (ttgl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16, rank=2), [64, 64]),
+        (
+            ttgl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16, rank=2),
+            [64, 64],
+        ),
         (TensorMemoryLayout((64, 64), col_stride=2), [64, 64]),
     ],
 )
@@ -1604,9 +1937,12 @@ def cluster_arrive_wait_ops_kernel():
 
 
 def test_cluster_arrive_wait_ops():
-    mod = run_parser(cluster_arrive_wait_ops_kernel, *make_args(num_ctas=2), target=HOPPER_TARGET)
+    mod = run_parser(
+        cluster_arrive_wait_ops_kernel, *make_args(num_ctas=2), target=HOPPER_TARGET
+    )
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @cluster_arrive_wait_ops_kernel() attributes {noinline = false} {
     ttng.cluster_arrive {relaxed = false}
@@ -1614,7 +1950,8 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @filecheck_test
@@ -1630,17 +1967,22 @@ def cluster_barrier_multi_cta_kernel():
 
 
 def test_cluster_barrier_multi_cta():
-    mod = run_parser(cluster_barrier_multi_cta_kernel, *make_args(num_ctas=2), target=BLACKWELL_TARGET)
+    mod = run_parser(
+        cluster_barrier_multi_cta_kernel,
+        *make_args(num_ctas=2),
+        target=BLACKWELL_TARGET,
+    )
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @cluster_barrier_multi_cta_kernel() attributes {noinline = false} {
-    ttng.cluster_arrive {relaxed = false}
-    ttng.cluster_wait
+    ttng.cluster_barrier
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @filecheck_test
@@ -1649,7 +1991,9 @@ def test_inline_asm_elementwise():
     layout: ttgl.constexpr = ttgl.BlockedLayout([1], [32], [4], [0])
     x = ttgl.arange(0, 16, layout)
     # CHECK: elementwise_inline_asm {{.*}} : tensor<16xi32, [[BLOCKED:#.*]]> -> tensor<16xi32, [[BLOCKED]]>
-    ttgl.inline_asm_elementwise("mov $0, $0;", "=r,r", [x], dtype=x.dtype, is_pure=True, pack=1)
+    ttgl.inline_asm_elementwise(
+        "mov $0, $0;", "=r,r", [x], dtype=x.dtype, is_pure=True, pack=1
+    )
 
 
 @gluon.jit
@@ -1662,9 +2006,12 @@ def load_kernel(inp, xnumel):
 
 @pytest.mark.parametrize("target", ALL_TARGETS)
 def test_load(target):
-    mod = run_parser(load_kernel, *make_args(MockTensor(ttgl.float32), xnumel=100), target=target)
+    mod = run_parser(
+        load_kernel, *make_args(MockTensor(ttgl.float32), xnumel=100), target=target
+    )
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @load_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: i32) attributes {noinline = false} {
@@ -1679,19 +2026,28 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
 def async_copy_kernel(inp, xnumel, XBLOCK: ttgl.constexpr):
-    smem = ttgl.allocate_shared_memory(inp.dtype.element_ty, [XBLOCK], ttgl.SwizzledSharedLayout(1, 1, 1, order=[0]))
+    smem = ttgl.allocate_shared_memory(
+        inp.dtype.element_ty, [XBLOCK], ttgl.SwizzledSharedLayout(1, 1, 1, order=[0])
+    )
     block_layout: ttgl.constexpr = ttgl.BlockedLayout([2], [32], [4], [0])
     xindex = ttgl.arange(0, XBLOCK, block_layout)
     mask = ttgl.max_constancy(xindex < xnumel, 2)
 
     async_copy.async_copy_global_to_shared(smem, inp + xindex)
-    async_copy.async_copy_global_to_shared(smem, inp + xindex, mask, cache_modifier=".ca", eviction_policy="evict_last",
-                                           volatile=True)
+    async_copy.async_copy_global_to_shared(
+        smem,
+        inp + xindex,
+        mask,
+        cache_modifier=".ca",
+        eviction_policy="evict_last",
+        volatile=True,
+    )
 
     mbar = ttgl.allocate_shared_memory(ttgl.int64, [1], mbarrier.MBarrierLayout())
     async_copy.mbarrier_arrive(mbar)
@@ -1708,7 +2064,8 @@ def test_async_copy(target):
         target=target,
     )
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
@@ -1732,7 +2089,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @pytest.mark.parametrize("target", ALL_TARGETS)
@@ -1749,7 +2107,8 @@ def test_split_join_subtile(target):
 
     mod = run_parser(kernel, target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 2, 64], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 2, 1]}>
 #blocked2 = #ttg.blocked<{sizePerThread = [1, 64, 2], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 1, 2]}>
@@ -1767,7 +2126,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @filecheck_test
@@ -1797,7 +2157,12 @@ def test_auto_layout_broadcast():
     # CHECK: [[X:%.*]] = arith.constant dense<1> : tensor<16x1xi32, #gluon.auto_encoding>
     # CHECK: [[Y:%.*]] = arith.constant dense<2> : tensor<1x16xi32, [[BLOCKED]]>
     x = ttgl.full([16, 1], 1, ttgl.int32, layout=ttgl.AutoLayout())
-    y = ttgl.full([1, 16], 2, ttgl.int32, layout=ttgl.BlockedLayout([1, 1], [1, 32], [4, 1], [1, 0]))
+    y = ttgl.full(
+        [1, 16],
+        2,
+        ttgl.int32,
+        layout=ttgl.BlockedLayout([1, 1], [1, 32], [4, 1], [1, 0]),
+    )
 
     # CHECK: [[XCVT:%.*]] = gluon.set_auto_layout [[X]] : tensor<16x1xi32, #gluon.auto_encoding> -> tensor<16x1xi32, [[BLOCKED]]>
     # CHECK: [[XBCAST:%.*]] = tt.broadcast [[XCVT]]
@@ -1874,24 +2239,68 @@ def test_atomic_cas():
 
 @gluon.jit
 def amd_mfma_layout_kernel():
-    ttgl.full([128, 32], 0, ttgl.float32, layout=amd_layouts.AMDMFMALayout(version=3, instr_shape=[32, 32, 8],
-                                                                           transposed=True, warps_per_cta=[4, 1]))
+    ttgl.full(
+        [128, 32],
+        0,
+        ttgl.float32,
+        layout=amd_layouts.AMDMFMALayout(
+            version=3, instr_shape=[32, 32, 8], transposed=True, warps_per_cta=[4, 1]
+        ),
+    )
 
-    ttgl.full([128, 32], 0, ttgl.float32, layout=amd_layouts.AMDMFMALayout(version=3, instr_shape=[32, 32,
-                                                                                                   8], transposed=True,
-                                                                           warps_per_cta=[4, 1], tiles_per_warp=[2, 2]))
+    ttgl.full(
+        [128, 32],
+        0,
+        ttgl.float32,
+        layout=amd_layouts.AMDMFMALayout(
+            version=3,
+            instr_shape=[32, 32, 8],
+            transposed=True,
+            warps_per_cta=[4, 1],
+            tiles_per_warp=[2, 2],
+        ),
+    )
 
-    ttgl.full([128, 32], 0, ttgl.float32, layout=amd_layouts.AMDMFMALayout(version=3, instr_shape=[32, 32,
-                                                                                                   8], transposed=True,
-                                                                           warps_per_cta=[4, 1], tiles_per_warp=[1, 1]))
+    ttgl.full(
+        [128, 32],
+        0,
+        ttgl.float32,
+        layout=amd_layouts.AMDMFMALayout(
+            version=3,
+            instr_shape=[32, 32, 8],
+            transposed=True,
+            warps_per_cta=[4, 1],
+            tiles_per_warp=[1, 1],
+        ),
+    )
 
-    ttgl.full([128, 32], 0, ttgl.float64,
-              layout=amd_layouts.AMDMFMALayout(version=3, instr_shape=[16, 16, 16], transposed=True,  #
-                                               warps_per_cta=[4, 1], element_bitwidth=64, tiles_per_warp=[1, 1]))
+    ttgl.full(
+        [128, 32],
+        0,
+        ttgl.float64,
+        layout=amd_layouts.AMDMFMALayout(
+            version=3,
+            instr_shape=[16, 16, 16],
+            transposed=True,  #
+            warps_per_cta=[4, 1],
+            element_bitwidth=64,
+            tiles_per_warp=[1, 1],
+        ),
+    )
 
-    ttgl.full([128, 32], 0, ttgl.int32,
-              layout=amd_layouts.AMDMFMALayout(version=3, instr_shape=[16, 16, 16], transposed=True,  #
-                                               warps_per_cta=[4, 1], element_bitwidth=32, tiles_per_warp=[1, 1]))
+    ttgl.full(
+        [128, 32],
+        0,
+        ttgl.int32,
+        layout=amd_layouts.AMDMFMALayout(
+            version=3,
+            instr_shape=[16, 16, 16],
+            transposed=True,  #
+            warps_per_cta=[4, 1],
+            element_bitwidth=32,
+            tiles_per_warp=[1, 1],
+        ),
+    )
 
 
 @pytest.mark.parametrize("target", [HIP_TARGET_CDNA3, HIP_TARGET_CDNA4])
@@ -1899,7 +2308,8 @@ def test_amd_mfma_layout(target):
 
     module = run_parser(amd_mfma_layout_kernel, target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [4, 1], instrShape = [32, 32, 8], isTransposed = true}>
 #mma1 = #ttg.amd_mfma<{version = 3, warpsPerCTA = [4, 1], instrShape = [32, 32, 8], isTransposed = true, tilesPerWarp = [2, 2]}>
 #mma2 = #ttg.amd_mfma<{version = 3, warpsPerCTA = [4, 1], instrShape = [16, 16, 16], isTransposed = true, elementBitWidth = 64}>
@@ -1919,7 +2329,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
@@ -1929,8 +2340,9 @@ def add_int(a, b):
 
 @gluon.jit
 def infer_layout_for_amd_mfma_kernel():
-    layout: ttgl.constexpr = amd_layouts.AMDMFMALayout(version=3, instr_shape=[32, 32, 8], transposed=True,
-                                                       warps_per_cta=[4, 1])
+    layout: ttgl.constexpr = amd_layouts.AMDMFMALayout(
+        version=3, instr_shape=[32, 32, 8], transposed=True, warps_per_cta=[4, 1]
+    )
     a = ttgl.full([128, 32], 1, ttgl.int32, layout)
     b = ttgl.reduce(a, 1, add_int)
     ttgl.static_assert(b.type.layout == ttgl.SliceLayout(1, layout))
@@ -1941,7 +2353,8 @@ def test_infer_layout_for_amd_mfma(target):
     module = run_parser(infer_layout_for_amd_mfma_kernel, target=target)
 
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [4, 1], instrShape = [32, 32, 8], isTransposed = true}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 64 : i32} {
   tt.func public @infer_layout_for_amd_mfma_kernel() attributes {noinline = false} {
@@ -1962,26 +2375,52 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return %1 : i32
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
 def amd_wmma_layout_kernel():
-    ttgl.full([64, 64], 0, ttgl.float16, layout=amd_layouts.AMDWMMALayout(version=2, warp_bases=[[0, 1], [0, 2]],
-                                                                          transposed=True))
-    ttgl.full([64, 64], 0, ttgl.float16, layout=amd_layouts.AMDWMMALayout(version=2, transposed=True,
-                                                                          warp_bases=[[0, 1], [1, 0]]))
-    ttgl.full([64, 64], 0, ttgl.float16, layout=amd_layouts.AMDWMMALayout(version=2, transposed=False,
-                                                                          warp_bases=[[0, 1], [0, 2]]))
-    ttgl.full([64, 64], 0, ttgl.float16, layout=amd_layouts.AMDWMMALayout(version=2, transposed=False,
-                                                                          warp_bases=[[0, 1], [1, 0]]))
+    ttgl.full(
+        [64, 64],
+        0,
+        ttgl.float16,
+        layout=amd_layouts.AMDWMMALayout(
+            version=2, warp_bases=[[0, 1], [0, 2]], transposed=True
+        ),
+    )
+    ttgl.full(
+        [64, 64],
+        0,
+        ttgl.float16,
+        layout=amd_layouts.AMDWMMALayout(
+            version=2, transposed=True, warp_bases=[[0, 1], [1, 0]]
+        ),
+    )
+    ttgl.full(
+        [64, 64],
+        0,
+        ttgl.float16,
+        layout=amd_layouts.AMDWMMALayout(
+            version=2, transposed=False, warp_bases=[[0, 1], [0, 2]]
+        ),
+    )
+    ttgl.full(
+        [64, 64],
+        0,
+        ttgl.float16,
+        layout=amd_layouts.AMDWMMALayout(
+            version=2, transposed=False, warp_bases=[[0, 1], [1, 0]]
+        ),
+    )
 
 
 @pytest.mark.parametrize("target", [HIP_TARGET_RDNA4])
 def test_amd_wmma_layout(target):
     module = run_parser(amd_wmma_layout_kernel, target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #mma = #ttg.amd_wmma<{version = 2, isTranspose = true, ctaLayout = {warp = [[0, 1], [0, 2]]}}>
 #mma1 = #ttg.amd_wmma<{version = 2, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}}>
 #mma2 = #ttg.amd_wmma<{version = 2, isTranspose = false, ctaLayout = {warp = [[0, 1], [0, 2]]}}>
@@ -1999,12 +2438,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
 def infer_layout_for_amd_wmma_kernel():
-    layout: ttgl.constexpr = amd_layouts.AMDWMMALayout(version=2, transposed=True, warp_bases=[[1, 0], [2, 0]])
+    layout: ttgl.constexpr = amd_layouts.AMDWMMALayout(
+        version=2, transposed=True, warp_bases=[[1, 0], [2, 0]]
+    )
     a = ttgl.full([128, 32], 1, ttgl.float16, layout)
     b = ttgl.reduce(a, 1, add_int)
     ttgl.static_assert(b.type.layout == ttgl.SliceLayout(1, layout))
@@ -2014,7 +2456,8 @@ def infer_layout_for_amd_wmma_kernel():
 def test_infer_layout_for_amd_wmma(target):
     module = run_parser(infer_layout_for_amd_wmma_kernel, target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #mma = #ttg.amd_wmma<{version = 2, isTranspose = true, ctaLayout = {warp = [[1, 0], [2, 0]]}}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @infer_layout_for_amd_wmma_kernel() attributes {noinline = false} {
@@ -2035,7 +2478,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return %1 : f16
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
@@ -2070,7 +2514,8 @@ def test_amd_async_copy_global_to_shared(target):
     ptr = MockTensor(ttgl.float16)
     mod = run_parser(amd_async_copy_global_to_shared, *make_args(ptr), target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
@@ -2116,7 +2561,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
@@ -2144,7 +2590,8 @@ def test_amd_async_copy_shared_to_global(target):
     ptr = MockTensor(ttgl.float16)
     mod = run_parser(amd_async_copy_shared_to_global, *make_args(ptr), target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
@@ -2177,7 +2624,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
@@ -2189,14 +2637,16 @@ def amd_commit_group():
 def test_amd_commit_group(target):
     mod = run_parser(amd_wait_group, target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 64 : i32} {
   tt.func public @amd_wait_group() attributes {noinline = false} {
     %0 = ttg.async_wait {num = 0 : i32}
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
@@ -2208,14 +2658,16 @@ def amd_wait_group():
 def test_amd_async_wait(target):
     mod = run_parser(amd_wait_group, target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 64 : i32} {
   tt.func public @amd_wait_group() attributes {noinline = false} {
     %0 = ttg.async_wait {num = 0 : i32}
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @pytest.mark.parametrize("target", [HIP_TARGET_CDNA4])
@@ -2231,7 +2683,8 @@ def test_amd_load_shared_relaxed(target):
 
     mod = run_parser(kernel, target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [32, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
@@ -2242,7 +2695,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @pytest.mark.parametrize("target", [HIP_TARGET_CDNA4])
@@ -2259,7 +2713,8 @@ def test_amd_load_shared_relaxed_in_loop(target):
 
     mod = run_parser(kernel, target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [32, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
@@ -2279,7 +2734,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
@@ -2311,7 +2767,8 @@ def test_amd_global_load_to_shared(target):
     ptr = MockTensor(ttgl.float16)
     mod = run_parser(amd_global_load_to_shared, *make_args(ptr), target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [32, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
@@ -2359,7 +2816,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
@@ -2396,7 +2854,8 @@ def test_buffer_load_to_shared(target):
     ptr = MockTensor(ttgl.float16)
     mod = run_parser(buffer_load_to_shared_kernel, *make_args(ptr), target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [32, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
@@ -2439,32 +2898,58 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
 def buffer_load_store_kernel(x, y):
-    layout: ttgl.constexpr = ttgl.BlockedLayout(size_per_thread=[1, 1], threads_per_warp=[1, 64], warps_per_cta=[4, 1],
-                                                order=[1, 0])
+    layout: ttgl.constexpr = ttgl.BlockedLayout(
+        size_per_thread=[1, 1],
+        threads_per_warp=[1, 64],
+        warps_per_cta=[4, 1],
+        order=[1, 0],
+    )
 
-    offsets = ttgl.arange(0, 64 * 64).reshape(64, 64)
-    offsets = ttgl.convert_layout(offsets, layout=layout)
+    auto_layout_offsets = ttgl.arange(0, 64 * 64).reshape(64, 64)
+    offsets = ttgl.convert_layout(auto_layout_offsets, layout=layout)
     mask = ttgl.full((64, 64), 1, tl.int1, layout=layout)
     other = ttgl.full((64, 64), 1.0, tl.float32, layout=layout)
-    a = ttgl.amd.cdna3.buffer_load(ptr=x, offsets=offsets, mask=mask, other=other, cache='.ca')
-    ttgl.amd.cdna3.buffer_store(stored_value=a, ptr=y, offsets=offsets, mask=mask, cache='.cs')
+    a = ttgl.amd.cdna3.buffer_load(
+        ptr=x, offsets=offsets, mask=mask, other=other, cache=".ca"
+    )
+    ttgl.amd.cdna3.buffer_store(
+        stored_value=a, ptr=y, offsets=offsets, mask=mask, cache=".cs"
+    )
 
-    a = ttgl.amd.cdna4.buffer_load(ptr=x, offsets=offsets, mask=mask, other=other, cache='.ca')
-    ttgl.amd.cdna4.buffer_store(stored_value=a, ptr=y, offsets=offsets, mask=mask, cache='.cs')
+    a = ttgl.amd.cdna4.buffer_load(
+        ptr=x, offsets=offsets, mask=mask, other=other, cache=".ca"
+    )
+    ttgl.amd.cdna4.buffer_store(
+        stored_value=a, ptr=y, offsets=offsets, mask=mask, cache=".cs"
+    )
+
+    # Test auto layout support
+    auto_layout_mask = ttgl.full((64, 64), 1, tl.int1)
+    auto_layout_other = ttgl.full((64, 64), 1.0, tl.float32)
+    a = ttgl.amd.cdna4.buffer_load(
+        ptr=x, offsets=offsets, mask=auto_layout_mask, other=auto_layout_other
+    )
+    ttgl.amd.cdna4.buffer_store(
+        stored_value=a, ptr=y, offsets=auto_layout_offsets, mask=auto_layout_mask
+    )
 
 
 def test_buffer_load_store():
     x = MockTensor(ttgl.float32)
     y = MockTensor(ttgl.float32)
-    module = run_parser(buffer_load_store_kernel, *make_args(x, y), target=HIP_TARGET_CDNA3)
+    module = run_parser(
+        buffer_load_store_kernel, *make_args(x, y), target=HIP_TARGET_CDNA3
+    )
 
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 64 : i32} {
   tt.func public @buffer_load_store_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
@@ -2479,40 +2964,72 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     amdg.buffer_store %3, %arg1[%2], %cst cacheModifier = cs : tensor<64x64xf32, #blocked>
     %4 = amdg.buffer_load %arg0[%2], %cst, %cst_1 cacheModifier = ca : tensor<64x64xf32, #blocked>
     amdg.buffer_store %4, %arg1[%2], %cst cacheModifier = cs : tensor<64x64xf32, #blocked>
+    %true_2 = arith.constant true
+    %cst_3 = arith.constant dense<true> : tensor<64x64xi1, #gluon.auto_encoding>
+    %cst_4 = arith.constant 1.000000e+00 : f32
+    %cst_5 = arith.constant dense<1.000000e+00> : tensor<64x64xf32, #gluon.auto_encoding>
+    %5 = gluon.set_auto_layout %cst_3 : tensor<64x64xi1, #gluon.auto_encoding> -> tensor<64x64xi1, #blocked>
+    %6 = gluon.set_auto_layout %cst_5 : tensor<64x64xf32, #gluon.auto_encoding> -> tensor<64x64xf32, #blocked>
+    %7 = amdg.buffer_load %arg0[%2], %5, %6 : tensor<64x64xf32, #blocked>
+    %8 = gluon.set_auto_layout %1 : tensor<64x64xi32, #gluon.auto_encoding> -> tensor<64x64xi32, #blocked>
+    %9 = gluon.set_auto_layout %cst_3 : tensor<64x64xi1, #gluon.auto_encoding> -> tensor<64x64xi1, #blocked>
+    amdg.buffer_store %7, %arg1[%8], %9 : tensor<64x64xf32, #blocked>
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
 def buffer_load_store_with_broadcast_kernel(x, y):
-    layout: ttgl.constexpr = ttgl.BlockedLayout(size_per_thread=[1, 1], threads_per_warp=[1, 64], warps_per_cta=[4, 1],
-                                                order=[1, 0])
+    layout: ttgl.constexpr = ttgl.BlockedLayout(
+        size_per_thread=[1, 1],
+        threads_per_warp=[1, 64],
+        warps_per_cta=[4, 1],
+        order=[1, 0],
+    )
 
     offsets = ttgl.arange(0, 64 * 64).reshape(64, 64)
     offsets = ttgl.convert_layout(offsets, layout=layout)
     other = ttgl.full((64, 64), 1.0, tl.float32, layout=layout)
 
     mask = ttgl.full((64, 1), 1, tl.int1, layout=layout)
-    a = ttgl.amd.cdna3.buffer_load(ptr=x, offsets=offsets, mask=mask, other=other, cache='.ca')
-    ttgl.amd.cdna3.buffer_store(stored_value=a, ptr=y, offsets=offsets, mask=mask, cache='.cs')
+    a = ttgl.amd.cdna3.buffer_load(
+        ptr=x, offsets=offsets, mask=mask, other=other, cache=".ca"
+    )
+    ttgl.amd.cdna3.buffer_store(
+        stored_value=a, ptr=y, offsets=offsets, mask=mask, cache=".cs"
+    )
 
     mask = ttgl.full((1, 64), 1, tl.int1, layout=layout)
-    a = ttgl.amd.cdna3.buffer_load(ptr=x, offsets=offsets, mask=mask, other=other, cache='.ca')
-    ttgl.amd.cdna3.buffer_store(stored_value=a, ptr=y, offsets=offsets, mask=mask, cache='.cs')
+    a = ttgl.amd.cdna3.buffer_load(
+        ptr=x, offsets=offsets, mask=mask, other=other, cache=".ca"
+    )
+    ttgl.amd.cdna3.buffer_store(
+        stored_value=a, ptr=y, offsets=offsets, mask=mask, cache=".cs"
+    )
 
-    a = ttgl.amd.cdna3.buffer_load(ptr=x, offsets=offsets, mask=mask, other=1.0, cache='.ca')
-    ttgl.amd.cdna3.buffer_store(stored_value=a, ptr=y, offsets=offsets, mask=mask, cache='.cs')
+    a = ttgl.amd.cdna3.buffer_load(
+        ptr=x, offsets=offsets, mask=mask, other=1.0, cache=".ca"
+    )
+    ttgl.amd.cdna3.buffer_store(
+        stored_value=a, ptr=y, offsets=offsets, mask=mask, cache=".cs"
+    )
 
 
 def test_buffer_load_store_with_broadcast():
     x = MockTensor(ttgl.float16)
     y = MockTensor(ttgl.float16)
-    module = run_parser(buffer_load_store_with_broadcast_kernel, *make_args(x, y), target=HIP_TARGET_CDNA3)
+    module = run_parser(
+        buffer_load_store_with_broadcast_kernel,
+        *make_args(x, y),
+        target=HIP_TARGET_CDNA3,
+    )
 
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 64 : i32} {
   tt.func public @buffer_load_store_with_broadcast_kernel(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f16> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
@@ -2545,7 +3062,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @pytest.mark.parametrize("target", [HIP_TARGET_RDNA3])
@@ -2553,10 +3071,22 @@ def test_amd_rdna3_wmma(target):
 
     @gluon.jit
     def kernel():
-        wmma_layout: ttgl.constexpr = ttgl.amd.AMDWMMALayout(version=1, transposed=True, warp_bases=[[1, 0], [2, 0]])
+        wmma_layout: ttgl.constexpr = ttgl.amd.AMDWMMALayout(
+            version=1, transposed=True, warp_bases=[[1, 0], [2, 0]]
+        )
 
-        a = ttgl.full([64, 64], 1.0, ttgl.float16, layout=ttgl.DotOperandLayout(0, wmma_layout, 16))
-        b = ttgl.full([64, 64], 2.0, ttgl.float16, layout=ttgl.DotOperandLayout(1, wmma_layout, 16))
+        a = ttgl.full(
+            [64, 64],
+            1.0,
+            ttgl.float16,
+            layout=ttgl.DotOperandLayout(0, wmma_layout, 16),
+        )
+        b = ttgl.full(
+            [64, 64],
+            2.0,
+            ttgl.float16,
+            layout=ttgl.DotOperandLayout(1, wmma_layout, 16),
+        )
 
         acc = ttgl.full([64, 64], 0.0, ttgl.float32, layout=wmma_layout)
         acc = ttgl.amd.rdna3.wmma(a, b, acc)
@@ -2566,7 +3096,8 @@ def test_amd_rdna3_wmma(target):
 
     module = run_parser(kernel, target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #mma = #ttg.amd_wmma<{version = 1, isTranspose = true, ctaLayout = {warp = [[1, 0], [2, 0]]}}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @kernel() attributes {noinline = false} {
@@ -2581,7 +3112,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @pytest.mark.parametrize("target", [HIP_TARGET_RDNA4])
@@ -2589,10 +3121,16 @@ def test_amd_rdna4_wmma(target):
 
     @gluon.jit
     def kernel():
-        wmma_layout: ttgl.constexpr = ttgl.amd.AMDWMMALayout(version=2, transposed=True, warp_bases=[[1, 0], [2, 0]])
+        wmma_layout: ttgl.constexpr = ttgl.amd.AMDWMMALayout(
+            version=2, transposed=True, warp_bases=[[1, 0], [2, 0]]
+        )
 
-        a = ttgl.full([64, 64], 1.0, ttgl.float16, layout=ttgl.DotOperandLayout(0, wmma_layout, 8))
-        b = ttgl.full([64, 64], 2.0, ttgl.float16, layout=ttgl.DotOperandLayout(1, wmma_layout, 8))
+        a = ttgl.full(
+            [64, 64], 1.0, ttgl.float16, layout=ttgl.DotOperandLayout(0, wmma_layout, 8)
+        )
+        b = ttgl.full(
+            [64, 64], 2.0, ttgl.float16, layout=ttgl.DotOperandLayout(1, wmma_layout, 8)
+        )
 
         acc = ttgl.full([64, 64], 0.0, ttgl.float32, layout=wmma_layout)
         acc = ttgl.amd.rdna4.wmma(a, b, acc)
@@ -2602,7 +3140,8 @@ def test_amd_rdna4_wmma(target):
 
     module = run_parser(kernel, target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #mma = #ttg.amd_wmma<{version = 2, isTranspose = true, ctaLayout = {warp = [[1, 0], [2, 0]]}}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @kernel() attributes {noinline = false} {
@@ -2617,7 +3156,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @pytest.mark.parametrize("target", [HIP_TARGET_CDNA3, HIP_TARGET_CDNA4])
@@ -2625,13 +3165,26 @@ def test_amd_mfma(target):
 
     @gluon.jit
     def kernel():
-        mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(version=3, warps_per_cta=[4, 1], instr_shape=[32, 32, 8],
-                                                             transposed=True)
+        mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(
+            version=3, warps_per_cta=[4, 1], instr_shape=[32, 32, 8], transposed=True
+        )
 
-        a = ttgl.full([64, 32], 1.0, ttgl.float32, layout=ttgl.DotOperandLayout(operand_index=0, parent=mfma_layout,
-                                                                                k_width=8))
-        b = ttgl.full([32, 64], 2.0, ttgl.float32, layout=ttgl.DotOperandLayout(operand_index=1, parent=mfma_layout,
-                                                                                k_width=8))
+        a = ttgl.full(
+            [64, 32],
+            1.0,
+            ttgl.float32,
+            layout=ttgl.DotOperandLayout(
+                operand_index=0, parent=mfma_layout, k_width=8
+            ),
+        )
+        b = ttgl.full(
+            [32, 64],
+            2.0,
+            ttgl.float32,
+            layout=ttgl.DotOperandLayout(
+                operand_index=1, parent=mfma_layout, k_width=8
+            ),
+        )
 
         acc = ttgl.full([64, 64], 0.0, ttgl.float32, layout=mfma_layout)
         acc = ttgl.amd.cdna3.mfma(a, b, acc)
@@ -2640,7 +3193,8 @@ def test_amd_mfma(target):
 
     module = run_parser(kernel, target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [4, 1], instrShape = [32, 32, 8], isTransposed = true}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 64 : i32} {
   tt.func public @kernel() attributes {noinline = false} {
@@ -2655,7 +3209,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @pytest.mark.parametrize("target", [HIP_TARGET_CDNA4])
@@ -2663,23 +3218,33 @@ def test_amd_mfma_scaled(target):
 
     @gluon.jit
     def kernel():
-        mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True,
-                                                             warps_per_cta=[1, 1])
-        a_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=16)
-        b_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=16)
-        a_scale_layout: ttgl.constexpr = ttgl.amd.cdna4.get_mfma_scale_layout(a_layout, [16, 4])
-        b_scale_layout: ttgl.constexpr = ttgl.amd.cdna4.get_mfma_scale_layout(b_layout, [16, 4])
+        mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(
+            version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[1, 1]
+        )
+        a_layout: ttgl.constexpr = ttgl.DotOperandLayout(
+            operand_index=0, parent=mfma_layout, k_width=16
+        )
+        b_layout: ttgl.constexpr = ttgl.DotOperandLayout(
+            operand_index=1, parent=mfma_layout, k_width=16
+        )
+        a_scale_layout: ttgl.constexpr = ttgl.amd.cdna4.get_mfma_scale_layout(
+            a_layout, [16, 4]
+        )
+        b_scale_layout: ttgl.constexpr = ttgl.amd.cdna4.get_mfma_scale_layout(
+            b_layout, [16, 4]
+        )
 
         a = ttgl.full([16, 64], 0x11, ttgl.uint8, a_layout)
         b = ttgl.full([64, 16], 0x22, ttgl.uint8, b_layout)
         a_scale = ttgl.full([16, 4], 0x02, ttgl.uint8, a_scale_layout)
         b_scale = ttgl.full([16, 4], 0x01, ttgl.uint8, b_scale_layout)
         acc = ttgl.full([16, 16], 0, ttgl.float32, mfma_layout)
-        ttgl.amd.cdna4.mfma_scaled(a, a_scale, 'e2m1', b, b_scale, 'e2m1', acc)
+        ttgl.amd.cdna4.mfma_scaled(a, a_scale, "e2m1", b, b_scale, "e2m1", acc)
 
     module = run_parser(kernel, *make_args(num_warps=1), target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #linear = #ttg.linear<{register = [], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp = [], block = []}>
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 128], isTransposed = true}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "...", "ttg.threads-per-warp" = 64 : i32} {
@@ -2699,7 +3264,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @pytest.mark.parametrize("target", [HIP_TARGET_CDNA4])
@@ -2707,15 +3273,22 @@ def test_amd_mfma_scaled_none(target):
 
     @gluon.jit
     def kernel():
-        mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(4, [16, 16, 128], True, [1, 1])
-        a = ttgl.full([16, 64], 0x11, ttgl.uint8, ttgl.DotOperandLayout(0, mfma_layout, 16))
-        b = ttgl.full([64, 16], 0x22, ttgl.uint8, ttgl.DotOperandLayout(1, mfma_layout, 16))
+        mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(
+            4, [16, 16, 128], True, [1, 1]
+        )
+        a = ttgl.full(
+            [16, 64], 0x11, ttgl.uint8, ttgl.DotOperandLayout(0, mfma_layout, 16)
+        )
+        b = ttgl.full(
+            [64, 16], 0x22, ttgl.uint8, ttgl.DotOperandLayout(1, mfma_layout, 16)
+        )
         acc = ttgl.full([16, 16], 0, ttgl.float32, mfma_layout)
-        ttgl.amd.cdna4.mfma_scaled(a, None, 'e2m1', b, None, 'e2m1', acc)
+        ttgl.amd.cdna4.mfma_scaled(a, None, "e2m1", b, None, "e2m1", acc)
 
     module = run_parser(kernel, *make_args(num_warps=1), target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #linear = #ttg.linear<{register = [], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp = [], block = []}>
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 128], isTransposed = true}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "...", "ttg.threads-per-warp" = 64 : i32} {
@@ -2735,7 +3308,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @pytest.mark.parametrize("target", [HIP_TARGET_CDNA4])
@@ -2743,15 +3317,22 @@ def test_amd_mfma_scaled_scalar(target):
 
     @gluon.jit
     def kernel():
-        mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(4, [16, 16, 128], True, [1, 1])
-        a = ttgl.full([16, 64], 0x11, ttgl.uint8, ttgl.DotOperandLayout(0, mfma_layout, 16))
-        b = ttgl.full([64, 16], 0x22, ttgl.uint8, ttgl.DotOperandLayout(1, mfma_layout, 16))
+        mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(
+            4, [16, 16, 128], True, [1, 1]
+        )
+        a = ttgl.full(
+            [16, 64], 0x11, ttgl.uint8, ttgl.DotOperandLayout(0, mfma_layout, 16)
+        )
+        b = ttgl.full(
+            [64, 16], 0x22, ttgl.uint8, ttgl.DotOperandLayout(1, mfma_layout, 16)
+        )
         acc = ttgl.full([16, 16], 0, ttgl.float32, mfma_layout)
-        ttgl.amd.cdna4.mfma_scaled(a, 0x02, 'e2m1', b, 0x01, 'e2m1', acc)
+        ttgl.amd.cdna4.mfma_scaled(a, 0x02, "e2m1", b, 0x01, "e2m1", acc)
 
     module = run_parser(kernel, *make_args(num_warps=1), target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #linear = #ttg.linear<{register = [], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp = [], block = []}>
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 128], isTransposed = true}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "...", "ttg.threads-per-warp" = 64 : i32} {
@@ -2771,7 +3352,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @pytest.mark.parametrize("target", [HIP_TARGET_GFX1250])
@@ -2779,26 +3361,42 @@ def test_amd_wmma_scaled(target):
 
     @gluon.jit
     def kernel():
-        wmma_layout: ttgl.constexpr = ttgl.amd.AMDWMMALayout(version=3, transposed=True, warp_bases=[[0, 1], [1, 0]],
-                                                             instr_shape=[16, 16, 128])
-        wmma_layout_packed: ttgl.constexpr = ttgl.amd.AMDWMMALayout(version=3, transposed=True, warp_bases=[[0, 1],
-                                                                                                            [1, 0]],
-                                                                    instr_shape=[16, 16, 64])
-        a_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=0, parent=wmma_layout_packed, k_width=16)
-        b_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=1, parent=wmma_layout_packed, k_width=16)
-        a_scale_layout: ttgl.constexpr = ttgl.amd.gfx1250.get_wmma_scale_layout(a_layout, [32, 4])
-        b_scale_layout: ttgl.constexpr = ttgl.amd.gfx1250.get_wmma_scale_layout(b_layout, [32, 4])
+        wmma_layout: ttgl.constexpr = ttgl.amd.AMDWMMALayout(
+            version=3,
+            transposed=True,
+            warp_bases=[[0, 1], [1, 0]],
+            instr_shape=[16, 16, 128],
+        )
+        wmma_layout_packed: ttgl.constexpr = ttgl.amd.AMDWMMALayout(
+            version=3,
+            transposed=True,
+            warp_bases=[[0, 1], [1, 0]],
+            instr_shape=[16, 16, 64],
+        )
+        a_layout: ttgl.constexpr = ttgl.DotOperandLayout(
+            operand_index=0, parent=wmma_layout_packed, k_width=16
+        )
+        b_layout: ttgl.constexpr = ttgl.DotOperandLayout(
+            operand_index=1, parent=wmma_layout_packed, k_width=16
+        )
+        a_scale_layout: ttgl.constexpr = ttgl.amd.gfx1250.get_wmma_scale_layout(
+            a_layout, [32, 4]
+        )
+        b_scale_layout: ttgl.constexpr = ttgl.amd.gfx1250.get_wmma_scale_layout(
+            b_layout, [32, 4]
+        )
 
         a = ttgl.full([32, 64], 0x11, ttgl.uint8, a_layout)
         b = ttgl.full([64, 32], 0x22, ttgl.uint8, b_layout)
         a_scale = ttgl.full([32, 4], 0x02, ttgl.uint8, a_scale_layout)
         b_scale = ttgl.full([32, 4], 0x01, ttgl.uint8, b_scale_layout)
         acc = ttgl.full([32, 32], 0, ttgl.float32, wmma_layout)
-        ttgl.amd.gfx1250.wmma_scaled(a, a_scale, 'e2m1', b, b_scale, 'e2m1', acc)
+        ttgl.amd.gfx1250.wmma_scaled(a, a_scale, "e2m1", b, b_scale, "e2m1", acc)
 
     module = run_parser(kernel, *make_args(num_warps=4), target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #linear = #ttg.linear<{register = [[0, 1], [0, 2]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0]], warp = [[0, 0], [16, 0]], block = []}>
 #linear1 = #ttg.linear<{register = [[0, 1], [0, 2]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0]], warp = [[16, 0], [0, 0]], block = []}>
 #mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 64]}>
@@ -2820,7 +3418,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @pytest.mark.parametrize("target", [HIP_TARGET_GFX1250])
@@ -2828,8 +3427,12 @@ def test_amd_wmma_scaled_none(target):
 
     @gluon.jit
     def kernel():
-        wmma_layout: ttgl.constexpr = ttgl.amd.AMDWMMALayout(3, True, [], [], [16, 16, 128])
-        wmma_layout_packed: ttgl.constexpr = ttgl.amd.AMDWMMALayout(3, True, [], [], [16, 16, 64])
+        wmma_layout: ttgl.constexpr = ttgl.amd.AMDWMMALayout(
+            3, True, [], [], [16, 16, 128]
+        )
+        wmma_layout_packed: ttgl.constexpr = ttgl.amd.AMDWMMALayout(
+            3, True, [], [], [16, 16, 64]
+        )
         a_layout: ttgl.constexpr = ttgl.DotOperandLayout(0, wmma_layout_packed, 16)
         b_layout: ttgl.constexpr = ttgl.DotOperandLayout(1, wmma_layout_packed, 16)
 
@@ -2837,11 +3440,12 @@ def test_amd_wmma_scaled_none(target):
         b = ttgl.full([64, 16], 0x22, ttgl.uint8, b_layout)
         acc = ttgl.full([16, 16], 0, ttgl.float32, wmma_layout)
 
-        ttgl.amd.gfx1250.wmma_scaled(a, None, 'e2m1', b, None, 'e2m1', acc)
+        ttgl.amd.gfx1250.wmma_scaled(a, None, "e2m1", b, None, "e2m1", acc)
 
     module = run_parser(kernel, *make_args(num_warps=1), target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #linear = #ttg.linear<{register = [[0, 1], [0, 2]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0]], warp = [], block = []}>
 #mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {}, instrShape = [16, 16, 64]}>
 #mma1 = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {}, instrShape = [16, 16, 128]}>
@@ -2862,7 +3466,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @pytest.mark.parametrize("target", [HIP_TARGET_GFX1250])
@@ -2870,8 +3475,12 @@ def test_amd_wmma_scaled_scalar(target):
 
     @gluon.jit
     def kernel():
-        wmma_layout: ttgl.constexpr = ttgl.amd.AMDWMMALayout(3, True, [], [], [16, 16, 128])
-        wmma_layout_packed: ttgl.constexpr = ttgl.amd.AMDWMMALayout(3, True, [], [], [16, 16, 64])
+        wmma_layout: ttgl.constexpr = ttgl.amd.AMDWMMALayout(
+            3, True, [], [], [16, 16, 128]
+        )
+        wmma_layout_packed: ttgl.constexpr = ttgl.amd.AMDWMMALayout(
+            3, True, [], [], [16, 16, 64]
+        )
         a_layout: ttgl.constexpr = ttgl.DotOperandLayout(0, wmma_layout_packed, 16)
         b_layout: ttgl.constexpr = ttgl.DotOperandLayout(1, wmma_layout_packed, 16)
 
@@ -2879,11 +3488,12 @@ def test_amd_wmma_scaled_scalar(target):
         b = ttgl.full([64, 16], 0x22, ttgl.uint8, b_layout)
         acc = ttgl.full([16, 16], 0, ttgl.float32, wmma_layout)
 
-        ttgl.amd.gfx1250.wmma_scaled(a, 0x02, 'e2m1', b, 0x01, 'e2m1', acc)
+        ttgl.amd.gfx1250.wmma_scaled(a, 0x02, "e2m1", b, 0x01, "e2m1", acc)
 
     module = run_parser(kernel, *make_args(num_warps=1), target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #linear = #ttg.linear<{register = [[0, 1], [0, 2]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0]], warp = [], block = []}>
 #mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {}, instrShape = [16, 16, 64]}>
 #mma1 = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {}, instrShape = [16, 16, 128]}>
@@ -2904,14 +3514,72 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
+
+
+@pytest.mark.parametrize("target", [HIP_TARGET_GFX1250])
+def test_amd_wmma_scale_layout_for_multicta(target):
+
+    @gluon.jit
+    def kernel():
+        a_layout: ttgl.constexpr = ttgl.DotOperandLayout(
+            operand_index=0,  #
+            parent=ttgl.amd.AMDWMMALayout(
+                version=3,
+                transposed=True,
+                warp_bases=[[0, 1], [1, 0]],
+                instr_shape=[16, 16, 64],
+                cga_layout=[[0, 0], [1, 0]],
+            ),  #
+            k_width=16,
+        )
+        a_scale_layout: ttgl.constexpr = ttgl.amd.gfx1250.get_wmma_scale_layout(
+            a_layout, [64, 4]
+        )
+        ttgl.full([64, 4], 0x02, ttgl.uint8, a_scale_layout)
+
+        b_layout: ttgl.constexpr = ttgl.DotOperandLayout(
+            operand_index=1,  #
+            parent=ttgl.amd.AMDWMMALayout(
+                version=3,
+                transposed=True,
+                warp_bases=[[0, 1], [1, 0]],
+                instr_shape=[16, 16, 64],
+                cga_layout=[[1, 0], [0, 0]],
+            ),  #
+            k_width=16,
+        )
+        b_scale_layout: ttgl.constexpr = ttgl.amd.gfx1250.get_wmma_scale_layout(
+            b_layout, [64, 4]
+        )
+        ttgl.full([64, 4], 0x01, ttgl.uint8, b_scale_layout)
+
+    module = run_parser(kernel, *make_args(num_warps=4, num_ctas=4), target=target)
+    expecttest.assert_expected_inline(
+        anonymize_ir(module.str_nodebug()),
+        """\
+#linear = #ttg.linear<{register = [[0, 1], [0, 2]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0]], warp = [[0, 0], [16, 0]], block = [[0, 0], [32, 0]]}>
+#linear1 = #ttg.linear<{register = [[0, 1], [0, 2]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0]], warp = [[16, 0], [0, 0]], block = [[32, 0], [0, 0]]}>
+module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @kernel() attributes {noinline = false} {
+    %c2_i8 = arith.constant 2 : i8
+    %cst = arith.constant dense<2> : tensor<64x4xi8, #linear>
+    %c1_i8 = arith.constant 1 : i8
+    %cst_0 = arith.constant dense<1> : tensor<64x4xi8, #linear1>
+    tt.return
+  }
+}
+""",
+    )
 
 
 @gluon.jit
 def padded_shared_layout_kernel():
     shape: ttgl.constexpr = [64, 64]
     padded_shared_layout: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
-        interval_padding_pairs=[[2, 1], [4, 2], [8, 4]], shape=shape, order=[1, 0])
+        interval_padding_pairs=[[2, 1], [4, 2], [8, 4]], shape=shape, order=[1, 0]
+    )
     ttgl.allocate_shared_memory(ttgl.int32, shape, padded_shared_layout)
 
 
@@ -2920,7 +3588,8 @@ def test_padded_shared_layout(target):
     # This test is used to test the construction of PaddedSharedEncodingAttr in the gluon.
     module = run_parser(padded_shared_layout_kernel, target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #shared = #ttg.padded_shared<[2:+1, 4:+2, 8:+4] {order = [1, 0], shape = [64, 64]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 64 : i32} {
@@ -2929,15 +3598,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
 def infer_layout_for_padded_shared_kernel():
     shape: ttgl.constexpr = [32, 4, 32]
     initial_order: ttgl.constexpr = [2, 0, 1]
-    layout: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(interval_padding_pairs=[[2, 1], [4, 2], [8, 4]],
-                                                                       shape=shape, order=initial_order)
+    layout: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
+        interval_padding_pairs=[[2, 1], [4, 2], [8, 4]],
+        shape=shape,
+        order=initial_order,
+    )
     smem = ttgl.allocate_shared_memory(ttgl.int32, shape, layout)
 
     reshaped = smem.permute((1, 0, 2))
@@ -2959,7 +3632,10 @@ def infer_layout_for_padded_shared_kernel():
     perm_shape: ttgl.constexpr = [4, 32, 32]
     perm_order: ttgl.constexpr = [2, 1, 0]
     ref_layout: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
-        interval_padding_pairs=[[2, 1], [4, 2], [8, 4]], shape=perm_shape, order=perm_order)
+        interval_padding_pairs=[[2, 1], [4, 2], [8, 4]],
+        shape=perm_shape,
+        order=perm_order,
+    )
     ttgl.static_assert(reshaped.type.layout == ref_layout)
 
 
@@ -2969,7 +3645,8 @@ def test_infer_layout_for_padded_shared(target):
     # This conversion is in layoutToGluon and ttgl.permute will finally use it.
     module = run_parser(infer_layout_for_padded_shared_kernel, target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #shared = #ttg.padded_shared<[2:+1, 4:+2, 8:+4] {order = [2, 0, 1], shape = [32, 4, 32]}>
 #shared1 = #ttg.padded_shared<[2:+1, 4:+2, 8:+4] {order = [2, 1, 0], shape = [4, 32, 32]}>
 #smem = #ttg.shared_memory
@@ -2980,7 +3657,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @filecheck_test
@@ -3004,7 +3682,7 @@ def test_buffer_atomic_rmw(target):
         ttgl.amd.cdna3.buffer_atomic_min(int32_ptr, offsets, val)
         ttgl.amd.cdna3.buffer_atomic_and(int32_ptr, offsets, val)
         ttgl.amd.cdna3.buffer_atomic_or(int32_ptr, offsets, val)
-        #value broadcast
+        # value broadcast
         ttgl.amd.cdna3.buffer_atomic_xor(int32_ptr, offsets, value=1)
 
         # operands should be unsigned
@@ -3014,28 +3692,37 @@ def test_buffer_atomic_rmw(target):
         ttgl.amd.cdna3.buffer_atomic_add(uint32_ptr, offsets, val)
 
         val = val.cast(ttgl.int64)
-        #mask broadcast
+        # mask broadcast
         ttgl.amd.cdna3.buffer_atomic_xchg(int64_ptr, offsets, val, mask=0)
 
         mask = ttgl.full([BLOCK], True, ttgl.int32, layout=ttgl.AutoLayout())
         val = ttgl.zeros([BLOCK], ttgl.float16, layout=ttgl.AutoLayout())
         ttgl.amd.cdna3.buffer_atomic_add(fp16_ptr, offsets, val, mask=mask)
         ttgl.amd.cdna3.buffer_atomic_add(fp16_ptr, offsets, val, mask=mask, scope="sys")
-        ttgl.amd.cdna3.buffer_atomic_add(fp16_ptr, offsets, val, mask=mask, scope="cta", sem="relaxed")
+        ttgl.amd.cdna3.buffer_atomic_add(
+            fp16_ptr, offsets, val, mask=mask, scope="cta", sem="relaxed"
+        )
 
         val = val.cast(ttgl.float32)
         ttgl.amd.cdna3.buffer_atomic_add(fp32_ptr, offsets, val, mask=mask)
         ttgl.amd.cdna3.buffer_atomic_add(fp32_ptr, offsets, val, mask=mask, scope="sys")
-        ttgl.amd.cdna3.buffer_atomic_add(fp32_ptr, offsets, val, mask=mask, scope="cta", sem="relaxed")
+        ttgl.amd.cdna3.buffer_atomic_add(
+            fp32_ptr, offsets, val, mask=mask, scope="cta", sem="relaxed"
+        )
 
     fp16_ptr = MockTensor(ttgl.float16)
     fp32_ptr = MockTensor(ttgl.float32)
     int_ptr = MockTensor(ttgl.int32)
     uint_ptr = MockTensor(ttgl.uint32)
     int64_ptr = MockTensor(ttgl.int64)
-    module = run_parser(kernel, *make_args(int_ptr, uint_ptr, int64_ptr, fp16_ptr, fp32_ptr), target=target)
+    module = run_parser(
+        kernel,
+        *make_args(int_ptr, uint_ptr, int64_ptr, fp16_ptr, fp32_ptr),
+        target=target,
+    )
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 64 : i32} {
   tt.func public @kernel(%arg0: !tt.ptr<i32> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<i32> {tt.divisibility = 16 : i32}, %arg2: !tt.ptr<i64> {tt.divisibility = 16 : i32}, %arg3: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg4: !tt.ptr<f32> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     %0 = tt.make_range {end = 1 : i32, start = 0 : i32} : tensor<1xi32, #gluon.auto_encoding>
@@ -3098,7 +3785,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return %0 : tensor<1xf16, #gluon.auto_encoding>
   }
 }
-""")
+""",
+    )
 
 
 @pytest.mark.parametrize("target", [HIP_TARGET_CDNA4])
@@ -3111,12 +3799,15 @@ def test_buffer_atomic_rmw_bf16(target):
         ttgl.amd.cdna4.buffer_atomic_add(bf16_ptr, offsets, val, mask=0)
         mask = ttgl.full([1], True, ttgl.int32, layout=ttgl.AutoLayout())
         ttgl.amd.cdna4.buffer_atomic_add(bf16_ptr, offsets, val, mask=mask, scope="sys")
-        ttgl.amd.cdna4.buffer_atomic_add(bf16_ptr, offsets, val, mask=mask, scope="cta", sem="relaxed")
+        ttgl.amd.cdna4.buffer_atomic_add(
+            bf16_ptr, offsets, val, mask=mask, scope="cta", sem="relaxed"
+        )
 
     bf16_ptr = MockTensor(ttgl.bfloat16)
     module = run_parser(kernel, *make_args(bf16_ptr), target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 64 : i32} {
   tt.func public @kernel(%arg0: !tt.ptr<bf16> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     %0 = tt.make_range {end = 1 : i32, start = 0 : i32} : tensor<1xi32, #gluon.auto_encoding>
@@ -3147,10 +3838,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return %0 : tensor<1xbf16, #gluon.auto_encoding>
   }
 }
-""")
+""",
+    )
 
 
-@pytest.mark.parametrize("target", [HIP_TARGET_CDNA3, HIP_TARGET_CDNA4, HIP_TARGET_GFX1250])
+@pytest.mark.parametrize(
+    "target", [HIP_TARGET_CDNA3, HIP_TARGET_CDNA4, HIP_TARGET_GFX1250]
+)
 def test_amd_warp_pipeline(target):
 
     @gluon.jit
@@ -3168,9 +3862,10 @@ def test_amd_warp_pipeline(target):
 
     module = run_parser(kernel, *make_args(num_warps=8), target=target)
     ir_str = anonymize_ir(module.str_nodebug())
-    ir_str = re.sub(r'("ttg\.threads-per-warp"\s*=\s*)\d{2}', r'\1...', ir_str)
+    ir_str = re.sub(r'("ttg\.threads-per-warp"\s*=\s*)\d{2}', r"\1...", ir_str)
     expecttest.assert_expected_inline(
-        ir_str, """\
+        ir_str,
+        """\
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "...", "ttg.threads-per-warp" = ... : i32} {
   tt.func public @kernel() attributes {noinline = false} {
     %c0_i32 = arith.constant 0 : i32
@@ -3196,7 +3891,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
@@ -3227,12 +3923,16 @@ def test_get_num_warps():
     # CHECK: tt.func private @{{.*}}print_num_warps{{.*}}NW8
     # CHECK-NEXT arith.constant 8 : i32
     print_num_warps()
-    ttgl.warp_specialize([
-        (print_num_warps, ()),
-        (print_num_warps, ()),
-        (print_num_warps, ()),
-        (print_num_warps, ()),
-    ], [1, 2, 8], [24, 24, 24])
+    ttgl.warp_specialize(
+        [
+            (print_num_warps, ()),
+            (print_num_warps, ()),
+            (print_num_warps, ()),
+            (print_num_warps, ()),
+        ],
+        [1, 2, 8],
+        [24, 24, 24],
+    )
 
 
 @filecheck_test
@@ -3261,7 +3961,9 @@ def test_non_scalar_loop_bounds():
 
     @gluon.jit
     def kernel():
-        x = ttgl.full([32], 0, ttgl.int32, layout=ttgl.BlockedLayout([1], [32], [1], [0]))
+        x = ttgl.full(
+            [32], 0, ttgl.int32, layout=ttgl.BlockedLayout([1], [32], [1], [0])
+        )
         for _ in range(x, 10, 1):
             pass
 
@@ -3272,7 +3974,9 @@ def test_non_scalar_loop_bounds():
 
     @gluon.jit
     def kernel():
-        x = ttgl.full([32], 0, ttgl.int32, layout=ttgl.BlockedLayout([1], [32], [1], [0]))
+        x = ttgl.full(
+            [32], 0, ttgl.int32, layout=ttgl.BlockedLayout([1], [32], [1], [0])
+        )
         for _ in range(1, x, 1):
             pass
 
@@ -3283,7 +3987,9 @@ def test_non_scalar_loop_bounds():
 
     @gluon.jit
     def kernel():
-        x = ttgl.full([32], 0, ttgl.int32, layout=ttgl.BlockedLayout([1], [32], [1], [0]))
+        x = ttgl.full(
+            [32], 0, ttgl.int32, layout=ttgl.BlockedLayout([1], [32], [1], [0])
+        )
         for _ in range(1, 10, x):
             pass
 
@@ -3295,13 +4001,22 @@ def test_non_scalar_loop_bounds():
 
 @gluon.jit
 def amd_tdm_load_kernel(ptr):
-    SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[32, 4]], [16, 64], [1, 0])
+    SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
+        [[32, 4]], [16, 64], [1, 0]
+    )
     BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0])
 
-    desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base=ptr, shape=(32, 128), strides=(128, 1),
-                                                       block_shape=(16, 64), layout=SHARED_LAYOUT)
+    desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=ptr,
+        shape=(32, 128),
+        strides=(128, 1),
+        block_shape=(16, 64),
+        layout=SHARED_LAYOUT,
+    )
 
-    buffer = ttgl.allocate_shared_memory(desc.dtype, shape=desc.block_shape, layout=desc.layout)
+    buffer = ttgl.allocate_shared_memory(
+        desc.dtype, shape=desc.block_shape, layout=desc.layout
+    )
     ttgl.amd.gfx1250.tdm.async_load(desc, offsets=[0, 2], dest=buffer)
 
     ttgl.amd.gfx1250.tdm.async_wait(0)
@@ -3314,7 +4029,8 @@ def test_amd_tdm_load(target):
     ptr = MockTensor(ttgl.float16)
     module = run_parser(amd_tdm_load_kernel, *make_args(ptr), target)
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [16, 64]}>
 #smem = #ttg.shared_memory
@@ -3335,12 +4051,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
 def amd_host_tdm_load_kernel(desc):
-    buffer = ttgl.allocate_shared_memory(desc.dtype, shape=desc.block_shape, layout=desc.layout)
+    buffer = ttgl.allocate_shared_memory(
+        desc.dtype, shape=desc.block_shape, layout=desc.layout
+    )
     ttgl.amd.gfx1250.tdm.async_load(desc, offsets=[0, 2], dest=buffer)
 
     ttgl.amd.gfx1250.tdm.async_wait(0)
@@ -3352,10 +4071,13 @@ def test_amd_host_tdm_load(target):
 
     ptr = MockTensor(ttgl.float16, shape=(32, 128))
     layout = ttgl.PaddedSharedLayout.with_identity_for([[32, 4]], [16, 64], [1, 0])
-    desc = gluon.amd.gfx1250.TensorDescriptor.from_tensor(ptr, block_shape=(16, 64), layout=layout)
+    desc = gluon.amd.gfx1250.TensorDescriptor.from_tensor(
+        ptr, block_shape=(16, 64), layout=layout
+    )
     module = run_parser(amd_host_tdm_load_kernel, *make_args(desc), target)
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [16, 64]}>
 #smem = #ttg.shared_memory
@@ -3371,7 +4093,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
@@ -3379,11 +4102,18 @@ def amd_tdm_store_kernel(ptr):
     SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(1, 1, 1, [1, 0])
     BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0])
 
-    desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base=ptr, shape=(32, 128), strides=(128, 1),
-                                                       block_shape=(16, 64), layout=SHARED_LAYOUT)
+    desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=ptr,
+        shape=(32, 128),
+        strides=(128, 1),
+        block_shape=(16, 64),
+        layout=SHARED_LAYOUT,
+    )
 
     value = ttgl.full([16, 64], 1.0, ttgl.float16, layout=BLOCKED_LAYOUT)
-    buffer = ttgl.allocate_shared_memory(desc.dtype, desc.block_shape, desc.layout, value)
+    buffer = ttgl.allocate_shared_memory(
+        desc.dtype, desc.block_shape, desc.layout, value
+    )
 
     ttgl.amd.gfx1250.tdm.async_store(desc, offsets=[0, 2], src=buffer)
     ttgl.amd.gfx1250.tdm.async_wait(0)
@@ -3395,7 +4125,8 @@ def test_amd_tdm_store(target):
     ptr = MockTensor(ttgl.float16)
     module = run_parser(amd_tdm_store_kernel, *make_args(ptr), target)
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
@@ -3416,15 +4147,21 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
 def amd_tdm_load_pred_kernel(ptr):
-    layout: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[32, 4]], [64, 64], [1, 0])
-    desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base=ptr, shape=(64, 64), strides=(64, 1), block_shape=(64, 64),
-                                                       layout=layout)
-    buffer = ttgl.allocate_shared_memory(desc.dtype, shape=desc.block_shape, layout=desc.layout)
+    layout: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
+        [[32, 4]], [64, 64], [1, 0]
+    )
+    desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=ptr, shape=(64, 64), strides=(64, 1), block_shape=(64, 64), layout=layout
+    )
+    buffer = ttgl.allocate_shared_memory(
+        desc.dtype, shape=desc.block_shape, layout=desc.layout
+    )
     ttgl.amd.gfx1250.tdm.async_load(desc, offsets=[0, 2], dest=buffer, pred=0)
     ttgl.amd.gfx1250.tdm.async_load(desc, offsets=[0, 2], dest=buffer, pred=1)
 
@@ -3435,7 +4172,8 @@ def test_amd_tdm_load_pred(target):
     ptr = MockTensor(ttgl.float16)
     module = run_parser(amd_tdm_load_pred_kernel, *make_args(ptr), target)
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #shared = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [64, 64]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
@@ -3457,12 +4195,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
 def amd_mbarrier_kernel():
-    bar = ttgl.allocate_shared_memory(ttgl.int64, [1], gfx1250_mbarrier.MBarrierLayout())
+    bar = ttgl.allocate_shared_memory(
+        ttgl.int64, [1], gfx1250_mbarrier.MBarrierLayout()
+    )
     gfx1250_mbarrier.init(bar, count=2)
     prior_phase = gfx1250_mbarrier.arrive(bar)
     gfx1250_mbarrier.wait(bar, prior_phase)
@@ -3472,7 +4213,8 @@ def amd_mbarrier_kernel():
 def test_amd_mbarrier(target):
     mod = run_parser(amd_mbarrier_kernel, target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
@@ -3484,12 +4226,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
 def amd_async_copy_mbarrier_kernel(ptr):
-    bar = ttgl.allocate_shared_memory(ttgl.int64, [1], gfx1250_mbarrier.MBarrierLayout())
+    bar = ttgl.allocate_shared_memory(
+        ttgl.int64, [1], gfx1250_mbarrier.MBarrierLayout()
+    )
     gfx1250_async_copy.mbarrier_arrive(bar)
 
 
@@ -3498,7 +4243,8 @@ def test_amd_async_copy_mbarrier(target):
     ptr = MockTensor(ttgl.float16)
     mod = run_parser(amd_async_copy_mbarrier_kernel, *make_args(ptr), target=target)
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
@@ -3508,19 +4254,31 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
 def amd_tdm_load_mbarrier_kernel(ptr):
-    SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[32, 4]], [16, 64], [1, 0])
+    SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
+        [[32, 4]], [16, 64], [1, 0]
+    )
     BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0])
 
-    desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base=ptr, shape=(32, 128), strides=(128, 1),
-                                                       block_shape=(16, 64), layout=SHARED_LAYOUT)
+    desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=ptr,
+        shape=(32, 128),
+        strides=(128, 1),
+        block_shape=(16, 64),
+        layout=SHARED_LAYOUT,
+    )
 
-    bar = ttgl.allocate_shared_memory(ttgl.int64, [1], gfx1250_mbarrier.MBarrierLayout())
-    buffer = ttgl.allocate_shared_memory(desc.dtype, shape=desc.block_shape, layout=desc.layout)
+    bar = ttgl.allocate_shared_memory(
+        ttgl.int64, [1], gfx1250_mbarrier.MBarrierLayout()
+    )
+    buffer = ttgl.allocate_shared_memory(
+        desc.dtype, shape=desc.block_shape, layout=desc.layout
+    )
     gfx1250_mbarrier.init(bar, count=1)
     ttgl.amd.gfx1250.tdm.async_load(desc, offsets=[0, 2], dest=buffer, mbarrier=bar)
     buffer.load(layout=BLOCKED_LAYOUT)
@@ -3533,16 +4291,20 @@ def amd_cluster_barrier_arrive_kernel():
 
 @pytest.mark.parametrize("target", [HIP_TARGET_GFX1250])
 def test_amd_cluster_barrier_arrive(target):
-    mod = run_parser(amd_cluster_barrier_arrive_kernel, *make_args(num_ctas=2), target=target)
+    mod = run_parser(
+        amd_cluster_barrier_arrive_kernel, *make_args(num_ctas=2), target=target
+    )
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @amd_cluster_barrier_arrive_kernel() attributes {noinline = false} {
     amdg.cluster_barrier_arrive
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @gluon.jit
@@ -3552,16 +4314,20 @@ def amd_cluster_barrier_wait_kernel():
 
 @pytest.mark.parametrize("target", [HIP_TARGET_GFX1250])
 def test_amd_cluster_barrier_wait(target):
-    mod = run_parser(amd_cluster_barrier_wait_kernel, *make_args(num_ctas=2), target=target)
+    mod = run_parser(
+        amd_cluster_barrier_wait_kernel, *make_args(num_ctas=2), target=target
+    )
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()), """\
+        anonymize_ir(mod.str_nodebug()),
+        """\
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @amd_cluster_barrier_wait_kernel() attributes {noinline = false} {
     amdg.cluster_barrier_wait
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @pytest.mark.parametrize("target", [HIP_TARGET_GFX1250])
@@ -3570,7 +4336,8 @@ def test_amd_tdm_load_mbarrier(target):
     ptr = MockTensor(ttgl.float16)
     module = run_parser(amd_tdm_load_mbarrier_kernel, *make_args(ptr), target)
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [16, 64]}>
 #shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -3593,7 +4360,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @pytest.mark.parametrize("target", [BLACKWELL_TARGET, HOPPER_TARGET])
@@ -3602,7 +4370,9 @@ def test_nv_tma_descriptor_load_kernel(target):
     @gluon.jit
     def nv_tma_descriptor_load_kernel(input_ptr):
         XBLOCK: ttgl.constexpr = 128
-        smem_layout: ttgl.constexpr = ttgl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=32, rank=2)
+        smem_layout: ttgl.constexpr = ttgl.NVMMASharedLayout(
+            swizzle_byte_width=128, element_bitwidth=32, rank=2
+        )
         input_desc = tma.make_tensor_descriptor(
             input_ptr,
             shape=[XBLOCK, XBLOCK],
@@ -3619,7 +4389,8 @@ def test_nv_tma_descriptor_load_kernel(target):
     ptr = MockTensor(ttgl.float32)
     module = run_parser(nv_tma_descriptor_load_kernel, *make_args(ptr), target)
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
 #shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
@@ -3642,7 +4413,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @pytest.mark.parametrize("target", [BLACKWELL_TARGET, HOPPER_TARGET])
@@ -3651,7 +4423,9 @@ def test_nv_tma_descriptor_store_kernel(target):
     @gluon.jit
     def nv_tma_descriptor_store_kernel(input_ptr):
         XBLOCK: ttgl.constexpr = 128
-        smem_layout: ttgl.constexpr = ttgl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=32, rank=2)
+        smem_layout: ttgl.constexpr = ttgl.NVMMASharedLayout(
+            swizzle_byte_width=128, element_bitwidth=32, rank=2
+        )
         input_desc = tma.make_tensor_descriptor(
             input_ptr,
             shape=[XBLOCK, XBLOCK],
@@ -3666,7 +4440,8 @@ def test_nv_tma_descriptor_store_kernel(target):
     ptr = MockTensor(ttgl.float32)
     module = run_parser(nv_tma_descriptor_store_kernel, *make_args(ptr), target)
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
@@ -3684,14 +4459,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 @filecheck_test
 def tmem_constexpr():
     tmem_shape: ttgl.constexpr = (64, 64)
     bitwidth: ttgl.constexpr = 32
-    tmem_layout: ttgl.constexpr = TensorMemoryLayout(tmem_shape, col_stride=32 // bitwidth)
+    tmem_layout: ttgl.constexpr = TensorMemoryLayout(
+        tmem_shape, col_stride=32 // bitwidth
+    )
 
     # CHECK-NOT: constexpr
     anchor_noinline(tmem_layout)
@@ -3700,15 +4478,16 @@ def tmem_constexpr():
 def test_auto_layout_convert_store_val():
 
     @gluon.jit
-    def kernel(out_ptr,  #
-               XBLOCK: ttgl.constexpr, YBLOCK: ttgl.constexpr):
+    def kernel(out_ptr, XBLOCK: ttgl.constexpr, YBLOCK: ttgl.constexpr):  #
         blocked: ttgl.constexpr = ttgl.BlockedLayout([1, 4], [32, 1], [2, 2], [1, 0])
         indices_x = ttgl.arange(0, XBLOCK)
         indices_y = ttgl.arange(0, YBLOCK)
         out_offsets = indices_x[:, None] + indices_y[None, :]
         mask = (indices_x[:, None] < 100) & (indices_y[None, :] < 200)
         out_ptrs = ttgl.set_auto_layout(out_ptr + out_offsets, blocked)
-        value = ttgl.full([XBLOCK, YBLOCK], 0, dtype=ttgl.float32, layout=ttgl.AutoLayout())
+        value = ttgl.full(
+            [XBLOCK, YBLOCK], 0, dtype=ttgl.float32, layout=ttgl.AutoLayout()
+        )
         ttgl.store(out_ptrs, value, mask=mask)
 
     XBLOCK = 128
@@ -3716,7 +4495,8 @@ def test_auto_layout_convert_store_val():
     output = MockTensor(ttgl.float32)
     module = run_parser(kernel, *make_args(output, XBLOCK, YBLOCK))
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [2, 2], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
@@ -3749,14 +4529,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )
 
 
 def test_auto_layout_convert_store_ptr():
 
     @gluon.jit
-    def kernel(out_ptr,  #
-               XBLOCK: ttgl.constexpr, YBLOCK: ttgl.constexpr):
+    def kernel(out_ptr, XBLOCK: ttgl.constexpr, YBLOCK: ttgl.constexpr):  #
         blocked: ttgl.constexpr = ttgl.BlockedLayout([1, 4], [32, 1], [2, 2], [1, 0])
         indices_x = ttgl.arange(0, XBLOCK)
         indices_y = ttgl.arange(0, YBLOCK)
@@ -3770,7 +4550,8 @@ def test_auto_layout_convert_store_ptr():
     output = MockTensor(ttgl.float32)
     module = run_parser(kernel, *make_args(output, XBLOCK, YBLOCK))
     expecttest.assert_expected_inline(
-        anonymize_ir(module.str_nodebug()), """\
+        anonymize_ir(module.str_nodebug()),
+        """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [2, 2], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
@@ -3802,4 +4583,5 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-""")
+""",
+    )

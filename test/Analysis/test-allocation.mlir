@@ -31,6 +31,10 @@
 #PADDED_SHARED_1_16x256 = #ttg.padded_shared<[128:+4, 256:+8] {order = [1, 0], shape = [16, 256]}>
 #PADDED_SHARED_2_16x256 = #ttg.padded_shared<[64:+2, 128:+4, 256:+8] {order = [1, 0], shape = [16, 256]}>
 
+// PartitionedSharedEncoding attributes for testing
+#PARTITIONED_SHARED_SWIZZLE = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 2, partitionDim = 0, partitionLayout = #A_SHARED}>
+#PARTITIONED_SHARED_PADDED = #ttg.partitioned_shared<{numPartitions = 4, numGroups = 1, partitionDim = 1, partitionLayout = #PADDED_SHARED_0_16x32}>
+
 #smem = #ttg.shared_memory
 
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
@@ -454,19 +458,19 @@ tt.func @for(%lb : index, %ub : index, %step : index, %A : !tt.ptr<f16>, %B : !t
 // expected-remark @below {{size = 24576}}
 tt.func @for_if_slice(%lb : index, %ub : index, %step : index, %A : !tt.ptr<f16>, %B : !tt.ptr<f16>, %i1 : i1) {
   // expected-remark @below {{offset = 0, size = 8192}}
-  %a_shared_init = ttg.local_alloc : () -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %a_shared_init = ttg.local_alloc : () -> !ttg.memdesc<128x32xf16, #A_SHARED_1D, #ttg.shared_memory, mutable>
   // expected-remark @below {{offset = 8192, size = 8192}}
-  %b_shared_init = ttg.local_alloc : () -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %b_shared_init = ttg.local_alloc : () -> !ttg.memdesc<128x32xf16, #A_SHARED_1D, #ttg.shared_memory, mutable>
   // expected-remark @below {{offset = 16384, size = 8192}}
-  %c_shared_init = ttg.local_alloc : () -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
-  %a_shared, %b_shared, %c_shared = scf.for %iv = %lb to %ub step %step iter_args(%a_shared = %a_shared_init, %b_shared = %b_shared_init, %c_shared = %c_shared_init) -> (!ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>, !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>, !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>) {
+  %c_shared_init = ttg.local_alloc : () -> !ttg.memdesc<128x32xf16, #A_SHARED_1D, #ttg.shared_memory, mutable>
+  %a_shared, %b_shared, %c_shared = scf.for %iv = %lb to %ub step %step iter_args(%a_shared = %a_shared_init, %b_shared = %b_shared_init, %c_shared = %c_shared_init) -> (!ttg.memdesc<128x32xf16, #A_SHARED_1D, #ttg.shared_memory, mutable>, !ttg.memdesc<128x32xf16, #A_SHARED_1D, #ttg.shared_memory, mutable>, !ttg.memdesc<128x32xf16, #A_SHARED_1D, #ttg.shared_memory, mutable>) {
     scf.if %i1 {
       %zero = arith.constant 0 : i32
       %index = arith.constant 8 : i32
-      %cst0 = ttg.memdesc_index %a_shared[%index] : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<32xf16, #A_SHARED_1D, #ttg.shared_memory, mutable>
+      %cst0 = ttg.memdesc_index %a_shared[%index] : !ttg.memdesc<128x32xf16, #A_SHARED_1D, #ttg.shared_memory, mutable> -> !ttg.memdesc<32xf16, #A_SHARED_1D, #ttg.shared_memory, mutable>
       scf.yield
     }
-    scf.yield %b_shared, %a_shared, %a_shared : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>, !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>, !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+    scf.yield %b_shared, %a_shared, %a_shared : !ttg.memdesc<128x32xf16, #A_SHARED_1D, #ttg.shared_memory, mutable>, !ttg.memdesc<128x32xf16, #A_SHARED_1D, #ttg.shared_memory, mutable>, !ttg.memdesc<128x32xf16, #A_SHARED_1D, #ttg.shared_memory, mutable>
   }
   tt.return
 }
@@ -850,9 +854,9 @@ tt.func @aliasing_in_partition() {
   }
   partition0() num_warps(4) {
     // expected-remark @below {{offset = 0, size = 16}}
-    %0 = ttg.local_alloc : () -> !ttg.memdesc<2x1xi64, #A_SHARED, #smem, mutable>
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<2x1xi64, #A_SHARED_1D, #smem, mutable>
     %c0_i32 = arith.constant 0 : i32
-    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<2x1xi64, #A_SHARED, #smem, mutable> -> !ttg.memdesc<1xi64, #A_SHARED_1D, #smem, mutable>
+    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<2x1xi64, #A_SHARED_1D, #smem, mutable> -> !ttg.memdesc<1xi64, #A_SHARED_1D, #smem, mutable>
     // expected-remark @below {{offset = 16, size = 16}}
     %2 = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #A_SHARED_1D, #smem, mutable>
     "use"(%1) : (!ttg.memdesc<1xi64, #A_SHARED_1D, #smem, mutable>) -> ()
@@ -1084,4 +1088,29 @@ tt.func public @remote_shmem_store_kernel(%store_val: tensor<1xf32>) {
   tt.return
 }
 
+// PartitionedSharedEncoding with swizzled inner layout: 64x32xf16, 2 partitions, 2 groups each
+// Without partition-size, pieces are placed consecutively
+// expected-remark @below {{partitioned_shared_swizzle_alloc}}
+// expected-remark @below {{size = 4096}}
+tt.func @partitioned_shared_swizzle_alloc() {
+  // 2 partition buffers, each containing 2 groups = 2048 bytes each
+  // expected-remark @below {{offset = 0, size = 2048}}
+  // expected-remark @below {{offset = 2048, size = 2048}}
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<64x32xf16, #PARTITIONED_SHARED_SWIZZLE, #ttg.shared_memory, mutable>
+  tt.return
+}
+
+// PartitionedSharedEncoding with padded inner layout: 64x32xf16, 4 partitions, 1 group each
+// Without partition-size, pieces are placed consecutively
+// expected-remark @below {{partitioned_shared_padded_alloc}}
+// expected-remark @below {{size = 4220}}
+tt.func @partitioned_shared_padded_alloc() {
+  // 4 partition buffers, each containing 1 group = 1052 bytes each
+  // expected-remark @below {{offset = 0, size = 1052}}
+  // expected-remark @below {{offset = 1056, size = 1052}}
+  // expected-remark @below {{offset = 2112, size = 1052}}
+  // expected-remark @below {{offset = 3168, size = 1052}}
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<64x32xf16, #PARTITIONED_SHARED_PADDED, #ttg.shared_memory, mutable>
+  tt.return
+}
 }

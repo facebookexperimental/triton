@@ -33,4 +33,10 @@ Attribute buildDefaultTDMDescriptorEncoding(
     MLIRContext *ctx, ArrayRef<int64_t> shape, ArrayRef<unsigned> order,
     triton::gpu::CGAEncodingAttr cgaLayout, Type elementType);
 
+triton::gpu::PaddedSharedEncodingAttr
+getPaddedEncodingForDotOp(mlir::MLIRContext *context, int opIdx,
+                          ArrayRef<int64_t> shape, ArrayRef<unsigned> order,
+                          triton::gpu::CGAEncodingAttr CGALayout,
+                          unsigned typeWidthInBit);
+
 #endif

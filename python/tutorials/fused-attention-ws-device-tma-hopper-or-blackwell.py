@@ -4,7 +4,11 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _reduce_fadd2
+from triton.language.extra.cuda.inline_ptx_lib import (
+    _mul_f32x2,
+    _fma_f32x2,
+    _reduce_fadd2,
+)
 from triton.tools.tensor_descriptor import TensorDescriptor
 import os
 
@@ -154,8 +158,6 @@ def _attn_fwd_inner_oss_dp(
             warp_specialize=warp_specialize,
             merge_epilogue=True,
             merge_correction=True,
-            smem_alloc_algo=1,
-            # disallow_acc_multi_buffer=True,
             data_partition_factor=DP_FACTOR,
     ):
         start_n = tl.multiple_of(start_n, BLOCK_N)
@@ -521,7 +523,6 @@ def _attn_fwd_persist(
             warp_specialize=warp_specialize and OUTER_LOOP,
             merge_epilogue=True,
             merge_correction=True,
-            smem_alloc_algo=1,
             data_partition_factor=DP_FACTOR,
     ):
         pid = tile_idx % n_tile_num
@@ -613,10 +614,10 @@ class FrozenDotAttrs:
 
 
 # FWD dot attrs: 2 copies for K and V, no reuse (separate buffer IDs)
-#FWD_DOT_ATTRS = FrozenDotAttrs({
+# FWD_DOT_ATTRS = FrozenDotAttrs({
 #    "qk": {"channels": ["opndB,smem,2,0"]},
 #    "pv": {"channels": ["opndB,smem,2,1"]},
-#})
+# })
 _FWD_DOT_ATTRS_SWP = FrozenDotAttrs({
     "qk": {"stage": "0", "order": "0", "channels": ["opndB,smem,2,0"]},
     "pv": {"stage": "1", "order": "1", "channels": ["opndB,smem,2,1"]},
@@ -1269,51 +1270,55 @@ class _attention_opt(torch.autograd.Function):
         persistent = baseVariant == "persistent" or baseVariant == "ws_persistent"
         if is_blackwell() and warp_specialize:
             extra_kern_args["maxnreg"] = 128
-        if persistent:
-            _attn_fwd_persist[grid_persist](
-                sm_scale,
-                M,  #
-                q.shape[0],
-                q.shape[1],  #
-                desc_q,
-                desc_k,
-                desc_v,
-                desc_o,  #
-                N_CTX=q.shape[2],  #
-                HEAD_DIM=HEAD_DIM_K,  #
-                FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
-                STAGE=stage,  #
-                warp_specialize=warp_specialize,
-                OUTER_LOOP=True,
-                dtype=torch_dtype_to_triton(q.dtype),
-                SUBTILING=SUBTILING,
-                VECT_MUL=VECT_MUL,
-                FADD2_REDUCE=FADD2_REDUCE,
-                FWD_DOT_ATTRS=_FWD_DOT_ATTRS,
-                **extra_kern_args,
-            )
-        else:
-            _attn_fwd[grid](
-                sm_scale,
-                M,  #
-                q.shape[0],
-                q.shape[1],  #
-                desc_q,
-                desc_k,
-                desc_v,
-                desc_o,  #
-                N_CTX=q.shape[2],  #
-                HEAD_DIM=HEAD_DIM_K,  #
-                FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
-                STAGE=stage,  #
-                warp_specialize=warp_specialize,
-                dtype=torch_dtype_to_triton(q.dtype),
-                SUBTILING=SUBTILING,
-                VECT_MUL=VECT_MUL,
-                FADD2_REDUCE=FADD2_REDUCE,
-                FWD_DOT_ATTRS=_FWD_DOT_ATTRS,
-                **extra_kern_args,
-            )
+        # Use scope() to enable Meta's warp-specialization path so the run command
+        # does not need TRITON_USE_META_WS=1, and restore the knob on exit.
+        with triton.knobs.nvidia.scope():
+            triton.knobs.nvidia.use_meta_ws = True
+            if persistent:
+                _attn_fwd_persist[grid_persist](
+                    sm_scale,
+                    M,  #
+                    q.shape[0],
+                    q.shape[1],  #
+                    desc_q,
+                    desc_k,
+                    desc_v,
+                    desc_o,  #
+                    N_CTX=q.shape[2],  #
+                    HEAD_DIM=HEAD_DIM_K,  #
+                    FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
+                    STAGE=stage,  #
+                    warp_specialize=warp_specialize,
+                    OUTER_LOOP=True,
+                    dtype=torch_dtype_to_triton(q.dtype),
+                    SUBTILING=SUBTILING,
+                    VECT_MUL=VECT_MUL,
+                    FADD2_REDUCE=FADD2_REDUCE,
+                    FWD_DOT_ATTRS=_FWD_DOT_ATTRS,
+                    **extra_kern_args,
+                )
+            else:
+                _attn_fwd[grid](
+                    sm_scale,
+                    M,  #
+                    q.shape[0],
+                    q.shape[1],  #
+                    desc_q,
+                    desc_k,
+                    desc_v,
+                    desc_o,  #
+                    N_CTX=q.shape[2],  #
+                    HEAD_DIM=HEAD_DIM_K,  #
+                    FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
+                    STAGE=stage,  #
+                    warp_specialize=warp_specialize,
+                    dtype=torch_dtype_to_triton(q.dtype),
+                    SUBTILING=SUBTILING,
+                    VECT_MUL=VECT_MUL,
+                    FADD2_REDUCE=FADD2_REDUCE,
+                    FWD_DOT_ATTRS=_FWD_DOT_ATTRS,
+                    **extra_kern_args,
+                )
 
         ctx.save_for_backward(q, k, v, o, M)
 
@@ -1411,68 +1416,72 @@ class _attention_opt(torch.autograd.Function):
                 BATCH * N_HEAD,
             )  # batch*heads
 
-        if ctx.persistent:
-            NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+        # Use scope() to enable Meta's warp-specialization path so the run command
+        # does not need TRITON_USE_META_WS=1, and restore the knob on exit.
+        with triton.knobs.nvidia.scope():
+            triton.knobs.nvidia.use_meta_ws = True
+            if ctx.persistent:
+                NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
-            def grid_persist_bwd(meta):
-                return (
-                    min(
-                        NUM_SMS,
-                        triton.cdiv(N_CTX, meta["BLOCK_N1"]) * BATCH * N_HEAD,
-                    ),
-                    1,
-                    1,
+                def grid_persist_bwd(meta):
+                    return (
+                        min(
+                            NUM_SMS,
+                            triton.cdiv(N_CTX, meta["BLOCK_N1"]) * BATCH * N_HEAD,
+                        ),
+                        1,
+                        1,
+                    )
+
+                _attn_bwd_persist[grid_persist_bwd](
+                    desc_q,
+                    desc_k,
+                    desc_v,
+                    ctx.sm_scale,
+                    desc_do,
+                    desc_dq,
+                    desc_dk,
+                    desc_dv,  #
+                    M,
+                    delta,  #
+                    q.stride(0),
+                    q.stride(1),
+                    q.stride(2),
+                    q.stride(3),  #
+                    BATCH,
+                    N_HEAD,
+                    N_CTX,  #
+                    BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
+                    HEAD_DIM=ctx.HEAD_DIM,  #
+                    dtype=torch_dtype_to_triton(q.dtype),
+                    warp_specialize=warp_specialize,
+                    maxRegAutoWS=192,
                 )
-
-            _attn_bwd_persist[grid_persist_bwd](
-                desc_q,
-                desc_k,
-                desc_v,
-                ctx.sm_scale,
-                desc_do,
-                desc_dq,
-                desc_dk,
-                desc_dv,  #
-                M,
-                delta,  #
-                q.stride(0),
-                q.stride(1),
-                q.stride(2),
-                q.stride(3),  #
-                BATCH,
-                N_HEAD,
-                N_CTX,  #
-                BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
-                HEAD_DIM=ctx.HEAD_DIM,  #
-                dtype=torch_dtype_to_triton(q.dtype),
-                warp_specialize=warp_specialize,
-                maxRegAutoWS=192,
-            )
-        else:
-            _attn_bwd[grid](
-                desc_q,
-                desc_k,
-                desc_v,
-                ctx.sm_scale,
-                desc_do,
-                desc_dq,
-                desc_dk,
-                desc_dv,  #
-                M,
-                delta,  #
-                q.stride(0),
-                q.stride(1),
-                q.stride(2),
-                q.stride(3),  #
-                BATCH,
-                N_HEAD,
-                N_CTX,  #
-                BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
-                HEAD_DIM=ctx.HEAD_DIM,  #
-                dtype=torch_dtype_to_triton(q.dtype),
-                warp_specialize=warp_specialize,
-                maxRegAutoWS=192,
-            )
+            else:
+                _attn_bwd[grid](
+                    desc_q,
+                    desc_k,
+                    desc_v,
+                    ctx.sm_scale,
+                    desc_do,
+                    desc_dq,
+                    desc_dk,
+                    desc_dv,  #
+                    M,
+                    delta,  #
+                    q.stride(0),
+                    q.stride(1),
+                    q.stride(2),
+                    q.stride(3),  #
+                    BATCH,
+                    N_HEAD,
+                    N_CTX,  #
+                    BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
+                    HEAD_DIM=ctx.HEAD_DIM,  #
+                    dtype=torch_dtype_to_triton(q.dtype),
+                    warp_specialize=warp_specialize,
+                    maxRegAutoWS=192,
+                )
 
         return dq, dk, dv, None, None, None, None, None, None
 
@@ -1492,7 +1501,7 @@ attention = _attention_opt.apply
 @pytest.mark.parametrize("mode", ["fwd"])
 @pytest.mark.parametrize("baseVariant", ["ws_persistent", "ws"])
 @pytest.mark.parametrize("provider", ["triton-fp16"])
-@pytest.mark.parametrize("SUBTILING", [False])  #, True])
+@pytest.mark.parametrize("SUBTILING", [False])  # , True])
 @pytest.mark.parametrize("VECT_MUL", [0])  # , 1, 2, 3])
 @pytest.mark.parametrize("FADD2_REDUCE", [False])
 @pytest.mark.parametrize("bwd_config_idx", range(len(configs_bwd_persist)))
@@ -1525,9 +1534,9 @@ def test_op(
         _attn_bwd.configs = [configs_bwd_persist[bwd_config_idx]]
         _attn_bwd.cache = {}
     torch.manual_seed(20)
-    q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    v = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    q = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
+    k = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
+    v = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
     sm_scale = 0.5
     # reference implementation
     ref_dtype = dtype
@@ -1571,7 +1580,7 @@ def test_op(
     rtol = 0.0
     # Relative tolerance workaround for known hardware limitation of CDNA2 GPU.
     # For details see https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
-    if (torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a"):
+    if torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a":
         rtol = 1e-2
     torch.testing.assert_close(tri_dv, ref_dv, atol=1e-2, rtol=rtol)
     torch.testing.assert_close(tri_dk, ref_dk, atol=1e-2, rtol=rtol)
@@ -1587,7 +1596,7 @@ except BaseException:
     HAS_FLASH = False
 
 TORCH_HAS_FP8 = False
-BATCH, N_HEADS = 2, 4  #8
+BATCH, N_HEADS = 2, 4  # 8
 # vary seq length for fixed head and batch=4
 configs = []
 for HEAD_DIM in [128]:  # 64, 128]:
@@ -1615,7 +1624,7 @@ for HEAD_DIM in [128]:  # 64, 128]:
 
 @triton.testing.perf_report(configs)
 def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, baseVariant, provider, device=DEVICE):
-    assert mode in ["fwd"]  #, "bwd"]
+    assert mode in ["fwd"]  # , "bwd"]
     dtype = torch.float16
     if "triton" in provider:
         q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
