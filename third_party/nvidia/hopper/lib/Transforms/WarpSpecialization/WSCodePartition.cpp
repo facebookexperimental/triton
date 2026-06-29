@@ -1421,8 +1421,7 @@ void createTokenPost(
           LDBG("createTokenPost Fix1: non-rep channel "
                << channel->uniqID
                << " allocated gen5 consumer barrier for task "
-               << consumerAsyncTaskId
-               << " (rep channel " << repChannel->uniqID
+               << consumerAsyncTaskId << " (rep channel " << repChannel->uniqID
                << " did not cover this task)");
         }
 
@@ -1432,8 +1431,7 @@ void createTokenPost(
              << channel->uniqID
              << " shares CommChannel from representative channel "
              << repChannel->uniqID << " ("
-             << commChannel.consumerBarriers.size()
-             << " consumer barriers)");
+             << commChannel.consumerBarriers.size() << " consumer barriers)");
         continue;
       }
     }
@@ -3226,16 +3224,16 @@ void insertAsyncComm(
         });
         // A6 (whole-allocation-overwrite hub) targets SPATIAL PACKING: siblings
         // packed at DISTINCT `buffer.offset`s within the owner's columns (e.g.
-        // FA-fwd alpha/m_ij/l_i0 at offsets 64/65/66 inside the QK accumulator).
-        // A group whose channels all share the SAME offset is full-overlap
-        // TEMPORAL reuse (e.g. FA-bwd {dpT,dq,dsT}, all offset 0) and must NOT
-        // be routed to A6 even when it has a useC=false owner — it needs the
-        // same-block reuse chain (A3) / cross-partition (A5) barrier below, or
-        // dq's async overwrite races dk's async read of dsT. (Column-range
-        // overlap can't distinguish them — the owner spans the packed siblings'
-        // columns in both cases; and block-based verifyReuseGroupCrossPartition
-        // is unusable here since partitions are still async_task_id tags in one
-        // block.)
+        // FA-fwd alpha/m_ij/l_i0 at offsets 64/65/66 inside the QK
+        // accumulator). A group whose channels all share the SAME offset is
+        // full-overlap TEMPORAL reuse (e.g. FA-bwd {dpT,dq,dsT}, all offset 0)
+        // and must NOT be routed to A6 even when it has a useC=false owner — it
+        // needs the same-block reuse chain (A3) / cross-partition (A5) barrier
+        // below, or dq's async overwrite races dk's async read of dsT.
+        // (Column-range overlap can't distinguish them — the owner spans the
+        // packed siblings' columns in both cases; and block-based
+        // verifyReuseGroupCrossPartition is unusable here since partitions are
+        // still async_task_id tags in one block.)
         llvm::DenseSet<int64_t> bufferOffsets;
         for (auto *ch : group->channels) {
           int64_t off = 0;
@@ -3323,8 +3321,7 @@ void insertAsyncComm(
             return ch->channelKind == DataChannelKind::TMEM ||
                    ch->channelKind == DataChannelKind::TMEMPost;
           });
-          if (isTmemGroup && !isSpatialPacking &&
-              group->channels.size() >= 3 &&
+          if (isTmemGroup && !isSpatialPacking && group->channels.size() >= 3 &&
               orderReuseGroupChain(group).empty()) {
             llvm::report_fatal_error(
                 "TMEM reuse group with >= 3 buffers has no unique "
@@ -3332,38 +3329,43 @@ void insertAsyncComm(
                 "consumers are not totally ordered, so a correct reuse barrier "
                 "cannot be emitted (this would otherwise deadlock or "
                 "miscompile). Order the slot's writers/readers into a chain - "
-                "e.g. ensure dk reads dsT before dq overwrites the shared slot.");
+                "e.g. ensure dk reads dsT before dq overwrites the shared "
+                "slot.");
           }
           if (verifyReuseGroupCrossPartition(group)) {
             // A5: cross-partition dependency-chain reuse (e.g. FA-bwd
             // {dpT,dsT,dq}). Producers span >1 partition but share one block at
-            // this code-partition stage. DECOUPLED from the A3 same-block chain:
-            // it emits no per-consecutive wrap-around barriers. Two ingredients:
+            // this code-partition stage. DECOUPLED from the A3 same-block
+            // chain: it emits no per-consecutive wrap-around barriers. Two
+            // ingredients:
             //
-            //  (1) Ordering dpT -> dsT -> dq is *enforced by inherent edges*, so
+            //  (1) Ordering dpT -> dsT -> dq is *enforced by inherent edges*,
+            //  so
             //      the shared TMEM slot is written/read strictly in that order
             //      within a tile:
-            //        - dpT -> dsT is a data dependency (dsT is computed from dpT
+            //        - dpT -> dsT is a data dependency (dsT is computed from
+            //        dpT
             //          in the computation partition: read dpT, then store dsT),
             //          so dsT's write necessarily follows dpT's read.
-            //        - dsT -> dq is gemm-partition program order within the same
+            //        - dsT -> dq is gemm-partition program order within the
+            //        same
             //          SWP stage: the dk MMA reads dsT before the dq MMA
-            //          overwrites the slot, and consecutive tcgen05 MMAs execute
-            //          in issue order, so dq's write necessarily follows dsT's
-            //          read.
+            //          overwrites the slot, and consecutive tcgen05 MMAs
+            //          execute in issue order, so dq's write necessarily
+            //          follows dsT's read.
             //      No explicit barrier is needed for these middle edges.
             //
             //  (2) The only non-inherent edge is the cross-iteration WAR: the
             //      NEXT tile's first write (dpT) must wait for the PREVIOUS
-            //      tile's last read (dq) before reusing the slot. This is emitted
-            //      exactly like the 2-buffer A2 case, applied to the chain
-            //      ENDPOINTS — early = first buffer (dpT), late = last buffer
-            //      (dq): relocate the late channel's producer_acquire ahead of
-            //      the early channel's producer so the shared slot's empty
-            //      barrier (flipped by dq's consumer release) gates the dpT
-            //      overwrite; and record the early channel so the late writer
-            //      also intra-waits the early reader (subsumed by program order,
-            //      kept for parity with A2).
+            //      tile's last read (dq) before reusing the slot. This is
+            //      emitted exactly like the 2-buffer A2 case, applied to the
+            //      chain ENDPOINTS — early = first buffer (dpT), late = last
+            //      buffer (dq): relocate the late channel's producer_acquire
+            //      ahead of the early channel's producer so the shared slot's
+            //      empty barrier (flipped by dq's consumer release) gates the
+            //      dpT overwrite; and record the early channel so the late
+            //      writer also intra-waits the early reader (subsumed by
+            //      program order, kept for parity with A2).
             SmallVector<Channel *> ordered = orderReuseGroupChain(group);
             if (ordered.size() == group->channels.size()) {
               Channel *firstCh = ordered.front(); // dpT
@@ -5146,11 +5148,9 @@ void mergeStagingReuseIntoHost(triton::FuncOp funcOp,
           cast<ttg::MemDescType>(stagingAlloc.getResult().getType());
       builder.setInsertionPointAfter(insertAnchor);
       auto stagingView = ttg::MemDescReinterpretOp::create(
-          builder, stagingAlloc.getLoc(), stagingTy,
-          backingAlloc.getResult());
-      for (StringRef name :
-           {"buffer.id", "buffer.copy", "buffer.idx_in_group",
-            "allocation.shareGroup", "async_task_id"}) {
+          builder, stagingAlloc.getLoc(), stagingTy, backingAlloc.getResult());
+      for (StringRef name : {"buffer.id", "buffer.copy", "buffer.idx_in_group",
+                             "allocation.shareGroup", "async_task_id"}) {
         if (auto a = stagingAlloc->getAttr(name))
           stagingView->setAttr(name, a);
       }
@@ -5374,8 +5374,7 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
   funcOp.walk([&](ttg::LocalAllocOp allocOp) {
     auto reuseAttr =
         allocOp->getAttrOfType<IntegerAttr>("allocation.reuseTarget");
-    auto stagingAttr =
-        allocOp->getAttrOfType<IntegerAttr>("buffer.tmaStaging");
+    auto stagingAttr = allocOp->getAttrOfType<IntegerAttr>("buffer.tmaStaging");
     if (!reuseAttr || !stagingAttr)
       return;
     // Find the first local_store user.
@@ -5396,7 +5395,7 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
          << reuseAttr.getInt() << " firstStore found");
   });
   LDBG("Step 4.5: collected " << stagingReuseInfos.size()
-       << " staging reuse entries");
+                              << " staging reuse entries");
 
   // Step 5: Create buffers. An array of buffers for each channel.
   DenseMap<Channel *, Value> bufferMap =
@@ -5452,7 +5451,7 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
       auto targetIt = bufferIdToChannel.find(info.targetBufferId);
       if (targetIt == bufferIdToChannel.end()) {
         LDBG("Step 7.5: target buffer.id=" << info.targetBufferId
-             << " — channel not found, skipping");
+                                           << " — channel not found, skipping");
         continue;
       }
       Channel *targetChannel = targetIt->second;
@@ -5460,7 +5459,7 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
       if (targetTokenIt == tokenMap.end() ||
           targetTokenIt->second.tokens.empty()) {
         LDBG("Step 7.5: target channel " << targetChannel->uniqID
-             << " has no tokens, skipping");
+                                         << " has no tokens, skipping");
         continue;
       }
 
@@ -5470,8 +5469,7 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
       auto asyncTaskIds = getAsyncTaskIds(firstStore);
       builder.setAsynTaskIdsFromArray(asyncTaskIds);
 
-      for (const auto &[taskId, tokenValue] :
-           targetTokenIt->second.tokens) {
+      for (const auto &[taskId, tokenValue] : targetTokenIt->second.tokens) {
         Value bufIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
             firstStore->getLoc(), 0, 32);
         Value phase = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
@@ -5488,7 +5486,7 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
       }
     }
     LDBG("Step 7.5: processed " << stagingReuseInfos.size()
-         << " staging reuse entries");
+                                << " staging reuse entries");
   }
 
   // Step 8: add async communication ops (ProducerAcquire etc). Also lower

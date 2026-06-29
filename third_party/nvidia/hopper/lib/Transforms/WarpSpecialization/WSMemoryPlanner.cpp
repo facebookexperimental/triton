@@ -842,11 +842,11 @@ static std::string getLocName(Operation *op) {
 
 /// Priority levels for SMEM multi-buffering candidates.
 enum class WSBufferPriority {
-  P0_InnermostTMA = 0,    // innermost loop + TMA channel
-  P1_InnermostNonTMA,     // innermost loop, non-TMA
-  P2_InnerTMAStaging,     // TMA staging buffer inside the innermost loop (e.g. dq)
-  P3_OuterTMAStaging,     // TMA staging buffer outside loops (e.g. dk, dv)
-  P4_Other,               // outside loop / non-innermost (regular epilogue)
+  P0_InnermostTMA = 0, // innermost loop + TMA channel
+  P1_InnermostNonTMA,  // innermost loop, non-TMA
+  P2_InnerTMAStaging,  // TMA staging buffer inside the innermost loop (e.g. dq)
+  P3_OuterTMAStaging,  // TMA staging buffer outside loops (e.g. dk, dv)
+  P4_Other,            // outside loop / non-innermost (regular epilogue)
 };
 
 /// A wrapper around one ttg.local_alloc op for the new SMEM allocation.
@@ -867,8 +867,7 @@ struct WSBuffer {
       0; // 0=normal, 1=TMA store staging, 2=TMA reduce staging
   bool isAllocated =
       false; // Has dedicated SMEM; false = reuses another buffer.
-  int reuseTargetBufferId =
-      -1; // bufferId of the reuse target, -1 = no reuse.
+  int reuseTargetBufferId = -1; // bufferId of the reuse target, -1 = no reuse.
 };
 
 static unsigned
@@ -1427,11 +1426,10 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
     return false;
   };
 
-  LDBG("Phase 4.5: enter \u2014 numBuffers=" << numBuffers
-                                        << " smemBudget=" << smemBudget
-                                        << " totalBuffers=" << wsBuffers.size()
-                                        << " currentTotalSmem="
-                                        << computeTotalSmem(wsBuffers));
+  LDBG("Phase 4.5: enter \u2014 numBuffers="
+       << numBuffers << " smemBudget=" << smemBudget
+       << " totalBuffers=" << wsBuffers.size()
+       << " currentTotalSmem=" << computeTotalSmem(wsBuffers));
 
   // Collect eligible groups by bufferId and remember each group's priority.
   DenseMap<unsigned, SmallVector<unsigned>> epilogueGroups;
@@ -1442,9 +1440,8 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
     if (buf.isPinned) {
       ++skippedPinned;
       LDBG("Phase 4.5: skip WSBuffer["
-           << i << "] bufferId=" << buf.bufferId
-           << " \u2014 isPinned (copies=" << buf.numCopies
-           << ", tmaStaging=" << buf.tmaStaging << ")");
+           << i << "] bufferId=" << buf.bufferId << " \u2014 isPinned (copies="
+           << buf.numCopies << ", tmaStaging=" << buf.tmaStaging << ")");
       continue;
     }
     if (!isEligible(buf.priority)) {
@@ -1452,18 +1449,16 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
       LDBG("Phase 4.5: skip WSBuffer["
            << i << "] bufferId=" << buf.bufferId << " \u2014 priority="
            << static_cast<int>(buf.priority) << " (not eligible)"
-           << " copies=" << buf.numCopies
-           << " tmaStaging=" << buf.tmaStaging);
+           << " copies=" << buf.numCopies << " tmaStaging=" << buf.tmaStaging);
       continue;
     }
     epilogueGroups[buf.bufferId].push_back(i);
     groupPriority[buf.bufferId] = buf.priority;
   }
 
-  LDBG("Phase 4.5: collected " << epilogueGroups.size()
-                               << " eligible groups (skippedPinned="
-                               << skippedPinned << " skippedPriority="
-                               << skippedPriority << ")");
+  LDBG("Phase 4.5: collected "
+       << epilogueGroups.size() << " eligible groups (skippedPinned="
+       << skippedPinned << " skippedPriority=" << skippedPriority << ")");
 
   // Walk tiers in priority order, and within each tier sort by bufferId for
   // determinism (DenseMap iteration is otherwise non-deterministic).
@@ -1473,7 +1468,8 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
       if (groupPriority.lookup(kv.first) == pri)
         ids.push_back(kv.first);
     llvm::sort(ids);
-    LDBG("Phase 4.5: tier=P" << static_cast<int>(pri) << " groups=" << ids.size());
+    LDBG("Phase 4.5: tier=P" << static_cast<int>(pri)
+                             << " groups=" << ids.size());
 
     for (unsigned bufferId : ids) {
       auto &indices = epilogueGroups[bufferId];
@@ -1504,16 +1500,15 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
       LDBG("Phase 4.5:   bufferId="
            << bufferId << " priority=P" << static_cast<int>(pri)
            << " groupSize=" << indices.size() << " perAllocSize=" << firstSize
-           << " tmaStaging=" << firstTmaStaging
-           << " currentCopies=" << currentCopies
-           << " anyCrossStage=" << anyCrossStage
+           << " tmaStaging=" << firstTmaStaging << " currentCopies="
+           << currentCopies << " anyCrossStage=" << anyCrossStage
            << " \u2014 will try bumping to numBuffers=" << numBuffers);
 
       if (currentCopies >= numBuffers) {
-        LDBG("Phase 4.5:   bufferId="
-             << bufferId << " currentCopies=" << currentCopies
-             << " already >= numBuffers=" << numBuffers
-             << " \u2014 no room to bump");
+        LDBG("Phase 4.5:   bufferId=" << bufferId
+                                      << " currentCopies=" << currentCopies
+                                      << " already >= numBuffers=" << numBuffers
+                                      << " \u2014 no room to bump");
         continue;
       }
 
@@ -1528,17 +1523,17 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
 
         unsigned totalSmem = computeTotalSmem(wsBuffers);
         if (totalSmem <= smemBudget) {
-          LDBG("Phase 4.5:     bufferId="
-               << bufferId << " copies=" << tryCopies
-               << " totalSmem=" << totalSmem << " \u2264 " << smemBudget
-               << " \u2014 kept");
+          LDBG("Phase 4.5:     bufferId=" << bufferId << " copies=" << tryCopies
+                                          << " totalSmem=" << totalSmem
+                                          << " \u2264 " << smemBudget
+                                          << " \u2014 kept");
           tryCopies++;
         } else {
           for (unsigned k = 0; k < indices.size(); ++k)
             wsBuffers[indices[k]].numCopies = saved[k];
           LDBG("Phase 4.5:     bufferId="
-               << bufferId << " copies=" << tryCopies << " totalSmem="
-               << totalSmem << " > " << smemBudget
+               << bufferId << " copies=" << tryCopies
+               << " totalSmem=" << totalSmem << " > " << smemBudget
                << " \u2014 budget exhausted, reverted to copies=" << saved[0]);
           break;
         }
@@ -1858,9 +1853,8 @@ static unsigned allocateSmemBuffers(
     if (buf.isPinned)
       continue;
     if (buf.tmaStaging > 0) {
-      buf.priority = buf.isInnermost
-                         ? WSBufferPriority::P2_InnerTMAStaging
-                         : WSBufferPriority::P3_OuterTMAStaging;
+      buf.priority = buf.isInnermost ? WSBufferPriority::P2_InnerTMAStaging
+                                     : WSBufferPriority::P3_OuterTMAStaging;
     } else if (buf.isInnermost && buf.isTMA) {
       buf.priority = WSBufferPriority::P0_InnermostTMA;
     } else if (buf.isInnermost) {
@@ -2188,9 +2182,10 @@ static unsigned allocateSmemBuffers(
       }
       std::string bufName = getLocName(buf.allocOp);
       auto diag = buf.allocOp->emitRemark()
-          << "SMEM buffer \"" << bufName << "\" (buffer.id=" << buf.bufferId
-          << ", " << buf.sizeBytes << "B) reuses \""
-          << targetName << "\" (buffer.id=" << buf.reuseTargetBufferId << ")";
+                  << "SMEM buffer \"" << bufName
+                  << "\" (buffer.id=" << buf.bufferId << ", " << buf.sizeBytes
+                  << "B) reuses \"" << targetName
+                  << "\" (buffer.id=" << buf.reuseTargetBufferId << ")";
     }
     if (buf.tmaStaging > 0) {
       buf.allocOp->setAttr("buffer.tmaStaging",
@@ -2446,9 +2441,8 @@ private:
     Attribute tensorMemorySpace = ttng::TensorMemorySpaceAttr::get(ctx);
     Type elemType = scaleType.getElementType();
     ttg::CGAEncodingAttr cgaLayout = ttg::getCGALayout(scaleType.getEncoding());
-    auto ctaSplitNum = cgaLayout.getCTASplitNum();
-    auto scaleEncoding = ttng::TensorMemoryScalesEncodingAttr::get(
-        ctx, ctaSplitNum[0], ctaSplitNum[1]);
+    auto scaleEncoding =
+        ttng::TensorMemoryScalesEncodingAttr::get(ctx, cgaLayout);
     SmallVector<int64_t> shape = {
         rows, ceil<int64_t>(product(scaleType.getShape()), rows)};
     auto futureType =
