@@ -861,8 +861,9 @@ SmallVector<Channel *> orderReuseGroupChain(ReuseGroup *group) {
         edge[i][j] = true;
         ++indeg[j];
       }
-  // Kahn's algorithm requiring a unique zero-in-degree node at each step, so the
-  // chain order is unambiguous (true for a real reuse cycle like dpT->dsT->dq).
+  // Kahn's algorithm requiring a unique zero-in-degree node at each step, so
+  // the chain order is unambiguous (true for a real reuse cycle like
+  // dpT->dsT->dq).
   SmallVector<Channel *> ordered;
   SmallVector<bool> used(n, false);
   for (unsigned step = 0; step < n; ++step) {
@@ -1009,10 +1010,10 @@ bool verifyReuseGroupCrossPartition(ReuseGroup *group) {
   // see "one block"), but the cross-partition writers need explicit reuse
   // barriers — a same-partition program-order elision is unsound for them.
   //
-  // Realized case: FA-bwd `_BWD_DOT_ATTRS_TMEM` {dpT, dsT, dq} on one buffer.id:
-  // dpT (gemm) -> dsT (computation tmem_store) -> dq (gemm). The computation
-  // writer dsT needs a cross-iteration WAR against dq, which the A3 single-wrap
-  // omits (it raced across the persistent outer loop).
+  // Realized case: FA-bwd `_BWD_DOT_ATTRS_TMEM` {dpT, dsT, dq} on one
+  // buffer.id: dpT (gemm) -> dsT (computation tmem_store) -> dq (gemm). The
+  // computation writer dsT needs a cross-iteration WAR against dq, which the A3
+  // single-wrap omits (it raced across the persistent outer loop).
   if (group->channels.size() <= 2)
     return false;
   for (auto *ch : group->channels) {
