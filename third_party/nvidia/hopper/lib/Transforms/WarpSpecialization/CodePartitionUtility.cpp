@@ -696,15 +696,86 @@ static bool hasDependencyChain(Channel *A, Channel *B) {
   return false;
 }
 
+bool verifyReuseGroup1(ReuseGroup *group) {
+  // A1 (SMEM circular reuse): the channels share a single multi-buffered
+  // circular buffer and rely on accumCnt staggering, which is only well-defined
+  // when (a) the group is multi-buffered and (b) every producer/consumer of
+  // every logical buffer lives in one common basic block (the loop body).
+  if (group->channels.empty())
+    return false;
+  if (group->channels[0]->getNumBuffers() <= 1) {
+    LDBG("verifyReuseGroup1: group is single-buffered (numCopies <= 1)");
+    return false;
+  }
+  // Subtiled-region groups are not handled as A1 SMEM circular reuse: their
+  // producer/consumer ops legitimately live inside the SubtiledRegionOp
+  // per-tile block (a different basic block than the loop body), and their
+  // synchronization is provided by the subtiled-region lowering (per-tile
+  // barriers) rather than by A1 accumCnt staggering. The single-basic-block
+  // invariant below therefore does not apply, so skip them here instead of
+  // flagging them as ill-formed.
+  for (auto *ch : group->channels) {
+    for (Operation *op : {ch->getSrcOp(), ch->getDstOp()}) {
+      if (op && op->getParentOfType<ttng::SubtiledRegionOp>()) {
+        LDBG("verifyReuseGroup1: channel "
+             << ch->uniqID << " is inside a subtiled region; not an A1 group");
+        return true;
+      }
+    }
+  }
+  Block *commonBlock = nullptr;
+  for (auto *ch : group->channels) {
+    // getSrcOp()/getDstOp() (singular) are safe here: A1 groups are SMEM
+    // channels with a single producer/consumer each.
+    Operation *endpoints[] = {ch->getSrcOp(), ch->getDstOp()};
+    for (auto *op : endpoints) {
+      if (!op) {
+        LDBG("verifyReuseGroup1: channel " << ch->uniqID
+                                           << " missing producer/consumer");
+        return false;
+      }
+      if (!commonBlock) {
+        commonBlock = op->getBlock();
+      } else if (op->getBlock() != commonBlock) {
+        LDBG("verifyReuseGroup1: producer/consumer of channel "
+             << ch->uniqID << " not in the common basic block");
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// For a TMEM reuse group, return true iff the channels' column ranges
+// (`[buffer.offset, buffer.offset + numCols)`) overlap. Overlapping columns
+// mean the channels share the same physical TMEM space and reuse it across
+// time — a real reuse group needing synchronization (e.g. dp/dq, qk/dv).
+// Fully-disjoint columns are spatial packing, materialized by
+// replaceBufferReuse's column slice, and need no cross-channel sync.
+static bool tmemReuseGroupOverlaps(ReuseGroup *group) {
+  struct ColRange {
+    int64_t lo, hi;
+  };
+  SmallVector<ColRange> ranges;
+  for (auto *ch : group->channels) {
+    auto *allocOp = ch->getAllocOp();
+    if (!allocOp)
+      return false;
+    auto memDescType = cast<ttg::MemDescType>(allocOp->getResult(0).getType());
+    int64_t numCols = ttng::getTmemAllocSizes(memDescType).numCols;
+    int64_t off = 0;
+    if (auto a = allocOp->getAttrOfType<IntegerAttr>("buffer.offset"))
+      off = a.getInt();
+    ranges.push_back({off, off + numCols});
+  }
+  for (unsigned i = 0; i < ranges.size(); ++i)
+    for (unsigned j = i + 1; j < ranges.size(); ++j)
+      if (ranges[i].lo < ranges[j].hi && ranges[j].lo < ranges[i].hi)
+        return true;
+  return false;
+}
+
 bool verifyReuseGroup2(ReuseGroup *group) {
-  // TODO(reuse-group generalization): this handles exactly 2 channels at a
-  // single copy. Evaluate generalizing to reuse groups of size N (>2) and to
-  // multi-buffered groups (getNumBuffers() >= 2, e.g. the FA-fwd-persistent
-  // cross-stage QK/P reuse). A prior unused verifyReuseGroupN/orderReuseGroupN
-  // attempted the size-N axis but was dead code (and still assumed single
-  // copy), so it was removed; fold both axes here when a real
-  // N-channel/multi-copy case lands, with the reuse-WAR index/phase taken from
-  // the depth-aware getBufferIdxAndPhase.
   assert(group->channels.size() == 2 &&
          "verifyReuseGroup2 requires exactly 2 channels");
   auto *chA = group->channels[0];
@@ -714,27 +785,41 @@ bool verifyReuseGroup2(ReuseGroup *group) {
   if (chA->getNumBuffers() != 1 || chB->getNumBuffers() != 1)
     return false;
 
+  // TMEM real reuse requires BOTH:
+  //  (1) overlapping columns — the two channels occupy the same physical TMEM
+  //      space (disjoint columns are A4 spatial packing, handled by
+  //      replaceBufferReuse with no cross-channel sync), AND
+  //  (2) a consumer->producer dependency chain in either direction — proof the
+  //      two are temporally ordered (a real reuse), not concurrently live.
+  // Overlap alone would trust the planner's non-concurrency guarantee without
+  // verifying it; the chain confirms the reuse is real and gives
+  // `orderReuseGroup2` a reliable early/late ordering (rather than guessing via
+  // program order). This mirrors the SMEM path below.
+  if (chA->channelKind == DataChannelKind::TMEMPost &&
+      chB->channelKind == DataChannelKind::TMEMPost) {
+    if (!tmemReuseGroupOverlaps(group)) {
+      LDBG("verifyReuseGroup2: TMEM channels "
+           << chA->uniqID << "/" << chB->uniqID
+           << " disjoint columns (spatial packing, not a sync reuse group)");
+      return false;
+    }
+    bool chain = hasDependencyChain(chA, chB) || hasDependencyChain(chB, chA);
+    LDBG("verifyReuseGroup2: TMEM channels "
+         << chA->uniqID << "/" << chB->uniqID << " overlap=1 chain=" << chain);
+    return chain;
+  }
+
+  // SMEM (and other) real reuse: a consumer->producer dependency chain in
+  // either direction (e.g. qk/pp). The SMEM epilogue-subtile case (producers
+  // in the same block, no chain) is NOT handled here — it is the N-buffer
+  // path (verifyReuseGroupN).
   bool hasAtoB = hasDependencyChain(chA, chB);
   bool hasBtoA = hasDependencyChain(chB, chA);
   LDBG("verifyReuseGroup2: channel " << chA->uniqID << " -> channel "
                                      << chB->uniqID << ": " << hasAtoB);
   LDBG("verifyReuseGroup2: channel " << chB->uniqID << " -> channel "
                                      << chA->uniqID << ": " << hasBtoA);
-  if (!hasAtoB && !hasBtoA) {
-    // Fallback: check if producers are ordered in program order within
-    // the same block. Covers epilogue subtile stores that share a buffer
-    // but have producer/consumer in different partitions.
-    auto *srcA = chA->getSrcOp();
-    auto *srcB = chB->getSrcOp();
-    if (srcA && srcB && srcA->getBlock() == srcB->getBlock() &&
-        (appearsBefore(srcA, srcB) || appearsBefore(srcB, srcA))) {
-      LDBG("verifyReuseGroup2: fallback accepted, producers in same block");
-      return true;
-    }
-    LDBG("verifyReuseGroup2: no dependency chain between channels");
-    return false;
-  }
-  return true;
+  return hasAtoB || hasBtoA;
 }
 
 std::pair<Channel *, Channel *> orderReuseGroup2(ReuseGroup *group) {
@@ -748,10 +833,67 @@ std::pair<Channel *, Channel *> orderReuseGroup2(ReuseGroup *group) {
     return {chA, chB};
   if (hasDependencyChain(chB, chA))
     return {chB, chA};
-  // Fallback: order by producer program order.
-  if (appearsBefore(chA->getSrcOp(), chB->getSrcOp()))
-    return {chA, chB};
-  return {chB, chA};
+  // Unreachable for a verified group: verifyReuseGroup2 now requires a
+  // dependency chain in one direction (both for SMEM and overlapping TMEM), so
+  // a group reaching here is an overlapping-but-unordered (concurrently
+  // aliased) pair — a memory-planner contract violation that would otherwise
+  // yield a guessed (possibly wrong) barrier direction. Fail loudly instead.
+  llvm::report_fatal_error(
+      "orderReuseGroup2: reuse group has no dependency chain in either "
+      "direction (overlapping but temporally unordered reuse pair)");
+}
+
+bool verifyReuseGroupN(ReuseGroup *group) {
+  if (group->channels.size() < 2) {
+    LDBG("verifyReuseGroupN: need at least 2 channels, got "
+         << group->channels.size());
+    return false;
+  }
+  // The N-buffer (epilogue subtile) path is SMEM-only: it shares one circular
+  // SMEM buffer across N sub-tile stores. TMEM reuse is handled by
+  // verifyReuseGroup2 (overlap) + replaceBufferReuse (column packing).
+  // All channels must be SMEM, single-copy, with producers in the same block.
+  Block *commonBlock = nullptr;
+  for (auto *ch : group->channels) {
+    if (ch->channelKind != DataChannelKind::SMEMPost) {
+      LDBG("verifyReuseGroupN: channel " << ch->uniqID << " is not SMEM");
+      return false;
+    }
+    if (ch->getNumBuffers() != 1) {
+      LDBG("verifyReuseGroupN: channel " << ch->uniqID
+                                         << " has numBuffers != 1");
+      return false;
+    }
+    auto *producer = ch->getSrcOp();
+    if (!producer) {
+      LDBG("verifyReuseGroupN: channel " << ch->uniqID << " has no producer");
+      return false;
+    }
+    if (!commonBlock) {
+      commonBlock = producer->getBlock();
+    } else if (producer->getBlock() != commonBlock) {
+      LDBG("verifyReuseGroupN: producers are in different blocks");
+      return false;
+    }
+  }
+  return true;
+}
+
+SmallVector<Channel *> orderReuseGroupN(ReuseGroup *group) {
+  SmallVector<Channel *> ordered(group->channels.begin(),
+                                 group->channels.end());
+  // Sort by program order of producer ops. All producers are in the same
+  // block (verified by verifyReuseGroupN), so appearsBefore gives a total
+  // order.
+  llvm::sort(ordered, [](Channel *a, Channel *b) {
+    return appearsBefore(a->getSrcOp(), b->getSrcOp());
+  });
+  LLVM_DEBUG({
+    LDBG("orderReuseGroupN: ordered " << ordered.size() << " channels:");
+    for (unsigned i = 0; i < ordered.size(); i++)
+      LDBG("  [" << i << "] channel " << ordered[i]->uniqID);
+  });
+  return ordered;
 }
 
 bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel) {

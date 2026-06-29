@@ -3136,8 +3136,13 @@ void insertAsyncComm(
           // before overwriting it.
           earlyChannelForReuseSync = earlyChannel;
         }
-      } else if (group->channels.size() > 2) {
-        // N-buffer reuse group handling (N > 2).
+      } else if (group->channels.size() > 2 || verifyReuseGroupN(group)) {
+        // N-buffer reuse group handling: N > 2, or a 2-channel SMEM
+        // epilogue-subtile group admitted by verifyReuseGroupN (SMEM,
+        // single-copy, producers same block — also covers the 2-channel SMEM
+        // epilogue; the real-reuse 2-channel case went to A2 above). The body
+        // dispatches A6 whole-allocation-overwrite hub, then A3 same-block
+        // chain (and, after the 3-group fix commit, A5 cross-partition).
         bool allSingleCopy = llvm::all_of(group->channels, [](Channel *ch) {
           return ch->getNumBuffers() == 1;
         });
@@ -4861,6 +4866,26 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
       llvm::remove_if(orderedChannels,
                       [&](Channel *ch) { return mergedChannels.count(ch); }),
       orderedChannels.end());
+
+  // Condition checking for reuse groups (see ReuseGroups.md):
+  //  - A1 (SMEM circular reuse): a multi-buffered group must have numCopies > 1
+  //    and all producers/consumers of its logical buffers in one basic block,
+  //    otherwise the shared accumCnt staggering is ill-defined. The memory
+  //    planner has already committed to aliasing these buffers, so a violation
+  //    is a hard error rather than a silent fallback.
+  //  - A2 (2-buffer) / A3 (N-buffer) single-copy sync are verified at use in
+  //    insertAsyncComm (verifyReuseGroup2 / the inline N-buffer path).
+  for (unsigned i = 0; i < config.getGroupSize(); ++i) {
+    auto *group = config.getGroup(i);
+    if (group->channels.empty())
+      continue;
+    if (group->channels[0]->getNumBuffers() > 1 && !verifyReuseGroup1(group))
+      llvm::report_fatal_error(
+          "SMEM circular reuse group is ill-formed: a multi-buffered reuse "
+          "group requires all producers/consumers of its logical buffers to be "
+          "in the same basic block");
+  }
+
   appendAccumCntsForOps(asyncTaskTopOps, channels, regionsWithChannels,
                         &config);
   LLVM_DEBUG({
