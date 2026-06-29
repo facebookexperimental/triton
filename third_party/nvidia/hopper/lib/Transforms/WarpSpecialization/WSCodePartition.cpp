@@ -3224,7 +3224,29 @@ void insertAsyncComm(
         auto ownerIt = llvm::find_if(group->channels, [](Channel *ch) {
           return isWholeAllocationOverwriteReuseOwner(ch);
         });
-        if (allSingleCopy && ownerIt != group->channels.end()) {
+        // A6 (whole-allocation-overwrite hub) targets SPATIAL PACKING: siblings
+        // packed at DISTINCT `buffer.offset`s within the owner's columns (e.g.
+        // FA-fwd alpha/m_ij/l_i0 at offsets 64/65/66 inside the QK accumulator).
+        // A group whose channels all share the SAME offset is full-overlap
+        // TEMPORAL reuse (e.g. FA-bwd {dpT,dq,dsT}, all offset 0) and must NOT
+        // be routed to A6 even when it has a useC=false owner — it needs the
+        // same-block reuse chain (A3) / cross-partition (A5) barrier below, or
+        // dq's async overwrite races dk's async read of dsT. (Column-range
+        // overlap can't distinguish them — the owner spans the packed siblings'
+        // columns in both cases; and block-based verifyReuseGroupCrossPartition
+        // is unusable here since partitions are still async_task_id tags in one
+        // block.)
+        llvm::DenseSet<int64_t> bufferOffsets;
+        for (auto *ch : group->channels) {
+          int64_t off = 0;
+          if (auto *a = ch->getAllocOp())
+            if (auto attr = a->getAttrOfType<IntegerAttr>("buffer.offset"))
+              off = attr.getInt();
+          bufferOffsets.insert(off);
+        }
+        bool isSpatialPacking = bufferOffsets.size() >= 2;
+        if (allSingleCopy && ownerIt != group->channels.end() &&
+            isSpatialPacking) {
           Channel *owner = *ownerIt;
           // Whole-allocation overwrite owner ("hub") case: the representative's
           // producer overwrites the entire physical allocation each iteration,
@@ -3285,7 +3307,83 @@ void insertAsyncComm(
                   return ch->getSrcOp()->getBlock() == refBlock;
                 });
           }
-          if (allSameBlock) {
+          // A TMEM reuse group with >= 3 buffers is a temporal, full-overlap
+          // reuse of ONE TMEM slot by >= 3 producers (e.g. FA-bwd
+          // {dpT,dsT,dq}). Its correctness depends on a unique total
+          // write/read order of the slot, which we derive as the dependency
+          // chain (orderReuseGroupChain). If no unique chain order exists
+          // (ambiguous or cyclic producer/consumer ordering — e.g. the dq MMA
+          // emitted before the dk read of dsT), NEITHER reuse path can emit a
+          // correct WAR: the A5 cross-partition path silently mis-syncs, and
+          // the A3 same-block path emits a barrier on a later same-partition op
+          // and deadlocks. Require the chain and fail loudly at compile time
+          // instead. (Spatial packing — distinct buffer.offsets, handled by A6
+          // above — is excluded: those siblings are independent, not a chain.)
+          bool isTmemGroup = llvm::all_of(group->channels, [](Channel *ch) {
+            return ch->channelKind == DataChannelKind::TMEM ||
+                   ch->channelKind == DataChannelKind::TMEMPost;
+          });
+          if (isTmemGroup && !isSpatialPacking &&
+              group->channels.size() >= 3 &&
+              orderReuseGroupChain(group).empty()) {
+            llvm::report_fatal_error(
+                "TMEM reuse group with >= 3 buffers has no unique "
+                "dependency-chain order: the shared TMEM slot's producers and "
+                "consumers are not totally ordered, so a correct reuse barrier "
+                "cannot be emitted (this would otherwise deadlock or "
+                "miscompile). Order the slot's writers/readers into a chain - "
+                "e.g. ensure dk reads dsT before dq overwrites the shared slot.");
+          }
+          if (verifyReuseGroupCrossPartition(group)) {
+            // A5: cross-partition dependency-chain reuse (e.g. FA-bwd
+            // {dpT,dsT,dq}). Producers span >1 partition but share one block at
+            // this code-partition stage. DECOUPLED from the A3 same-block chain:
+            // it emits no per-consecutive wrap-around barriers. Two ingredients:
+            //
+            //  (1) Ordering dpT -> dsT -> dq is *enforced by inherent edges*, so
+            //      the shared TMEM slot is written/read strictly in that order
+            //      within a tile:
+            //        - dpT -> dsT is a data dependency (dsT is computed from dpT
+            //          in the computation partition: read dpT, then store dsT),
+            //          so dsT's write necessarily follows dpT's read.
+            //        - dsT -> dq is gemm-partition program order within the same
+            //          SWP stage: the dk MMA reads dsT before the dq MMA
+            //          overwrites the slot, and consecutive tcgen05 MMAs execute
+            //          in issue order, so dq's write necessarily follows dsT's
+            //          read.
+            //      No explicit barrier is needed for these middle edges.
+            //
+            //  (2) The only non-inherent edge is the cross-iteration WAR: the
+            //      NEXT tile's first write (dpT) must wait for the PREVIOUS
+            //      tile's last read (dq) before reusing the slot. This is emitted
+            //      exactly like the 2-buffer A2 case, applied to the chain
+            //      ENDPOINTS — early = first buffer (dpT), late = last buffer
+            //      (dq): relocate the late channel's producer_acquire ahead of
+            //      the early channel's producer so the shared slot's empty
+            //      barrier (flipped by dq's consumer release) gates the dpT
+            //      overwrite; and record the early channel so the late writer
+            //      also intra-waits the early reader (subsumed by program order,
+            //      kept for parity with A2).
+            SmallVector<Channel *> ordered = orderReuseGroupChain(group);
+            if (ordered.size() == group->channels.size()) {
+              Channel *firstCh = ordered.front(); // dpT
+              Channel *lastCh = ordered.back();   // dq
+              if (masterChannel == lastCh &&
+                  needExplicitReuseWait(firstCh, lastCh)) {
+                auto *earlyProducer = firstCh->getSrcOp();
+                auto *lateConsumer = lastCh->getDstOp();
+                if (earlyProducer->getBlock() == headProducer->getBlock() &&
+                    lateConsumer->getBlock() == earlyProducer->getBlock() &&
+                    appearsBefore(earlyProducer, headProducer)) {
+                  producerAcquireForChannelLoop = earlyProducer;
+                }
+                earlyChannelForReuseSync = firstCh;
+              }
+            } else {
+              LDBG("Cross-partition N-reuse: no unique dependency-chain order; "
+                   "falling back to per-channel barriers");
+            }
+          } else if (allSameBlock) {
             // Order channels by producer program order.
             SmallVector<Channel *> ordered(group->channels.begin(),
                                            group->channels.end());
@@ -3358,7 +3456,7 @@ void insertAsyncComm(
                 wrapAroundChannelsForReuseSync.push_back(ordered.back());
               }
             } // end if (!hasSubtiledSrc && !hasSubtiledDst)
-          } // end if (allSameBlock)
+          } // end if (cross-partition A5) / else if (allSameBlock A3)
         } // end else if (allSingleCopy)
       } // end else if (group->channels.size() > 2)
     }
@@ -3804,6 +3902,31 @@ void insertAsyncComm(
                 headProducer->getLoc(), 1, 1);
             Value phaseFlipped = builder.createWithAsyncTaskIds<arith::XOrIOp>(
                 headProducer->getLoc(), phase, one);
+            // If the early channel's consumer is a gen5 MMA, it releases the
+            // reused buffer on its inline consumerBarrier, not on this token.
+            // A token-based producer_acquire would wait on a never-arrived
+            // token (deadlock: the dsT_0/buffer-5 {dpT,dq,dsT} FA-bwd reuse
+            // group). Emit the write-after-read as a WaitBarrier on that
+            // consumerBarrier instead (mirrors desyncTCGen5MMAOp
+            // asProducerAcquire): the late writer waits for the gen5 consumer's
+            // release of the shared buffer before overwriting it.
+            auto cbIt =
+                earlyTokenIt->second.consumerBarriers.find(earlyToken.first);
+            if (cbIt != earlyTokenIt->second.consumerBarriers.end()) {
+              Value cbar =
+                  getBarrierForPipelineStage(builder, cbIt->second, bufferIdx);
+              Value phI32 = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
+                  headProducer->getLoc(), builder.getI32Type(), phaseFlipped);
+              builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+                  headProducer->getLoc(), cbar, phI32);
+              LLVM_DEBUG({
+                LDBG("Insert intra-iteration reuse WaitBarrier (gen5 consumer) "
+                     "for late channel "
+                     << masterChannel->uniqID << " on early channel "
+                     << earlyChannelForReuseSync->uniqID);
+              });
+              continue;
+            }
             auto acquireOp =
                 builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
                     headProducer->getLoc(), earlyToken.second, bufferIdx,
@@ -3846,6 +3969,21 @@ void insertAsyncComm(
             builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
             builder.setInsertionPoint(headProducer);
             builder.setLoopScheduleInfoFromOp(headProducer);
+            // gen5 consumer: release is on the consumerBarrier, not the token
+            // (see intra-iteration block). Emit the wrap-around WAR as a
+            // WaitBarrier on that barrier. Uses `phase` (not phase^1) to match
+            // the wrap-around semantics (passes on the first iteration).
+            auto wcbIt =
+                wrapTokenIt->second.consumerBarriers.find(wrapToken.first);
+            if (wcbIt != wrapTokenIt->second.consumerBarriers.end()) {
+              Value cbar =
+                  getBarrierForPipelineStage(builder, wcbIt->second, bufferIdx);
+              Value phI32 = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
+                  headProducer->getLoc(), builder.getI32Type(), phase);
+              builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+                  headProducer->getLoc(), cbar, phI32);
+              continue;
+            }
             auto acquireOp =
                 builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
                     headProducer->getLoc(), wrapToken.second, bufferIdx, phase,
