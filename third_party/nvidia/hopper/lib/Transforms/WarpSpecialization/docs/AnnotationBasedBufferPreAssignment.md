@@ -2,7 +2,7 @@
 
 ## Overview
 
-Users can annotate `tl.dot` operations with per-operand channel specifications via the `attrs` dict. These annotations flow through the compiler as a `tt.autows` JSON string attribute on `ttng.tc_gen5_mma` ops and can be consumed by WSMemoryPlanner to **pre-assign** `buffer.copy`, `buffer.id`, and `buffer.offset` — bypassing heuristic allocation for annotated buffers while leaving un-annotated buffers unchanged.
+Users can annotate `tl.dot` / `tl.dot_scaled` operations with per-operand channel specifications via the `attrs` dict. These annotations flow through the compiler as a `tt.autows` JSON string attribute on `ttng.tc_gen5_mma` / `ttng.tc_gen5_mma_scaled` ops and can be consumed by WSMemoryPlanner to **pre-assign** `buffer.copy`, `buffer.id`, and `buffer.offset` — bypassing heuristic allocation for annotated buffers while leaving un-annotated buffers unchanged.
 
 ## Implementation Status
 
@@ -35,7 +35,7 @@ Each channel string: `"operand,memoryType,numCopies,bufferId"`
 
 | Field | Values | Description |
 |-------|--------|-------------|
-| `operand` | `opndA`, `opndB`, `opndD` | Which MMA operand this channel feeds |
+| `operand` | `opndA`, `opndB`, `opndD`, `opndAScale`, `opndBScale` | Which MMA operand this channel feeds. Scale operands apply only to `ttng.tc_gen5_mma_scaled`. |
 | `memoryType` | `smem`, `tmem` | Memory backing for the channel |
 | `numCopies` | integer | Multi-buffering depth |
 | `bufferId` | integer | Buffer identity; shared IDs form reuse groups |
@@ -80,6 +80,13 @@ The `tt.autows` attribute survives through `AccelerateMatmul` (which propagates 
 | A | `ChannelPost` (SMEM) or `TmemDataChannelPost` (TMEM) | `operandIdx` / trace through users | smem or tmem |
 | B | `ChannelPost` (SMEM) or `TmemDataChannelPost` (TMEM) | `operandIdx` / trace through users | smem or tmem |
 | D | `TmemDataChannelPost` | `isOperandD = true` | tmem (always) |
+| A scale | `ChannelPost` (SMEM) or `TmemDataChannelPost` (TMEM) | `operandIdx = 4` (`a_scale`) | smem or tmem |
+| B scale | `ChannelPost` (SMEM) or `TmemDataChannelPost` (TMEM) | `operandIdx = 5` (`b_scale`) | smem or tmem |
+
+For `ttng.tc_gen5_mma_scaled`, the fixed operand order is:
+`a=0`, `b=1`, `d=2`, `acc_dep=3`, `a_scale=4`, `b_scale=5`,
+`useD=6`, `pred=7`, followed by variadic barriers and barrier predicates.
+The scale annotations therefore use operand indices 4 and 5.
 
 ---
 

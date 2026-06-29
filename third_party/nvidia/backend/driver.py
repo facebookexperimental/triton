@@ -122,6 +122,9 @@ class CudaUtils(object):
         self.set_printf_fifo_size = mod.set_printf_fifo_size
         self.fill_tma_descriptor_tiled = mod.fill_tma_descriptor_tiled
         self.fill_tma_descriptor_im2col = mod.fill_tma_descriptor_im2col
+        # Test-only hook to exercise the shared-core recipe TMA encoder.
+        self._test_construct_tma_desc = getattr(mod, "_test_construct_tma_desc", None)
+        self._tma_desc_bytes = getattr(mod, "_tma_desc_bytes", None)
         self.launch = mod.launch
         self.build_signature_metadata = mod.build_signature_metadata
         self.fill_1d_tma_descriptor = mod.fill_1d_tma_descriptor
@@ -462,6 +465,8 @@ class CudaLauncher(object):
         *args,
     ):
 
+        active_driver = triton.runtime.driver.active
+
         def allocate_scratch(size, align, allocator):
             if size > 0:
                 grid_size = gridX * gridY * gridZ
@@ -470,12 +475,26 @@ class CudaLauncher(object):
                 return alloc_fn(alloc_size, align, stream)
             return None
 
+        def allocate_default_profile_scratch(size, align):
+            if size > 0:
+                grid_size = gridX * gridY * gridZ
+                alloc_size = grid_size * self.num_ctas * size
+                return active_driver.allocate_default_profile_scratch(
+                    alloc_size, align, stream
+                )
+            return None
+
         global_scratch = allocate_scratch(self.global_scratch_size, self.global_scratch_align, _allocation._allocator)
-        profile_scratch = allocate_scratch(
-            self.profile_scratch_size,
-            self.profile_scratch_align,
-            _allocation._profile_allocator,
-        )
+        if _allocation.has_profile_allocator():
+            profile_scratch = allocate_scratch(
+                self.profile_scratch_size,
+                self.profile_scratch_align,
+                _allocation._profile_allocator,
+            )
+        else:
+            profile_scratch = allocate_default_profile_scratch(
+                self.profile_scratch_size, self.profile_scratch_align
+            )
 
         self.launch(
             gridX,

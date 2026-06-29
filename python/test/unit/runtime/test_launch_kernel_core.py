@@ -1,7 +1,7 @@
 """Tests that the JIT variadic launcher (driver.c::launchKernel) routes through
 the shared data-driven core ``triton_launch_kernel`` in ``triton/runtime/launch.h``.
 
-The default launch path (no ``TRITON_USE_TRITON_DISPATCHER``) goes through
+The default launch path (no ``TRITON_USE_C_DISPATCHER``) goes through
 ``kernel.run() -> CudaLauncher -> launchKernel``. To make these tests robust
 regardless of defaults, each test installs a ``launch_enter_hook``: jit.py only
 takes the C-dispatcher / c_cache fast paths when *no* launch hooks are set, so a
