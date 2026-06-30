@@ -258,24 +258,6 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                           Value &bufferIdx, Value &phase, ReuseConfig *config,
                           int reuseGroupIdx, Channel *ch);
 
-// For a SubtiledRegionOp whose tile bodies carry a reuse group of SMEM channels
-// (one channel per tile), compute the per-tile *flattened* accumulation count
-// (accumCnt * numTiles + tileIdx) used for the SHARED barrier. Deriving the
-// barrier slot/phase inside the tile body from this count makes the shared
-// barrier one monotonic stream advanced numTiles times per outer iteration, so
-// no two subtiles collide on the same slot at the same phase generation. The
-// values are emitted at `builder`'s insertion point (must dominate `subtiled`)
-// and returned in tile order in `outStaggeredCnt`. Returns false if the
-// per-tile -> channel mapping cannot be fully established (caller should fall
-// back to a shared barrier index/phase).
-bool getPerTileStaggeredAccumCnt(
-    OpBuilderWithAsyncTaskIds &builder, ttng::SubtiledRegionOp subtiled,
-    Operation *dominatingOp, const DenseSet<Operation *> &regionsWithChannels,
-    ReuseConfig *config, int reuseGroupIdx,
-    ArrayRef<Channel *> reuseGroupChannels,
-    const DenseMap<Channel *, Value> &bufferMap,
-    SmallVectorImpl<Value> &outStaggeredCnt);
-
 Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
                                  Value barrierAlloc, Value bufferIdx);
 

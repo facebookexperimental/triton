@@ -124,9 +124,17 @@ Key functions:
 - `getAccumForReuseGroup` — computes the `accumCnt` SSA value at a given
   operation by walking back through the channel list to find the nearest
   preceding region op, then arithmetically adding the remaining offset
-- `getBufferIdxAndPhase` — for the first channel in the ordered list, uses
-  `accumCnt` directly; each subsequent channel at position N adds N to stagger
-  its slot within the shared circular buffer
+- `getBufferIdxAndPhase` / `getStaggeredAccumCnt` — for the first channel in the
+  ordered list, uses `accumCnt` directly; each subsequent channel at position N
+  adds N to stagger its slot within the shared circular buffer. **Subtiled-region
+  reuse groups do NOT flow through here for their staging slot:** the N subtiles
+  share one barrier pair and one physical alloc, so both the data slot and the
+  barrier `bufferIdx`/`phase` are computed *inside the tile body* from the builtin
+  `tileIdx` (`flattened = accumCnt * numTiles + tileIdx`, `% numBuffers`), keeping
+  data slot == barrier generation. The generic `+ position` stagger is wrong for
+  subtiles (it aliases distinct subtiles within a `numBuffers` window and races —
+  the EPILOGUE_SUBTILE>2 staging-buffer bug). See
+  [SubtileOperator](SubtileOperator.md).
 - `getReuseAccumArgIdx` — returns the position of a group's `accumCnt`
   argument within the region's full argument list
 
@@ -182,11 +190,22 @@ channels share no circular barrier).
 ### 3. Buffer Replacement
 
 `replaceBufferReuse` rewrites all IR uses of non-representative alloc ops to
-point at the representative's alloc:
+point at the representative's alloc. It iterates `config->groups` **directly**
+(the source of truth for what must be collapsed) and folds every
+non-representative channel of each group into `channels[0]`. It deliberately
+does **not** iterate the post-merge channel lists: the reuse-group
+consumer-merge in `doCodePartitionPost` removes a non-representative channel
+from `orderedChannels` whenever it shares a consumer op with the representative
+(e.g. epilogue subtiles that all feed one `ttng.subtiled_region`). Iterating
+`orderedChannels` would therefore skip those merged-out channels and leave their
+duplicate physical buffers alive — doubling SMEM and causing `OutOfResources`.
+Iterating groups visits every non-representative channel regardless of merge
+state.
 
 - **SMEM channels (same buffer.id, same type)**: When the alloc types match,
   uses direct `replaceUsesOfWith` to swap the alloc result, then erases the
-  old alloc.
+  old alloc. This generic rewrite also updates `ttng.subtiled_region` operands,
+  which are ordinary users of the alloc result.
 
 - **SMEM channels (same buffer.id, different type)**: Type mismatch within
   the *same* `bufferId` group is skipped here — `AllocateSharedMemoryNv`
@@ -197,7 +216,7 @@ point at the representative's alloc:
   Driven by the planner's Phase 3.6 hint (see
   [TMAStoreWaitPipeline.md §Phase 3.6](TMAStoreWaitPipeline.md#phase-36-inter-buffer-smem-reuse-via-allocationreuetarget)).
   The staging alloc carries `allocation.reuseTarget = <host bufferId>`;
-  `replaceBufferReuse` rewrites the staging alloc into a
+  the follow-up staging-reuse merge rewrites the staging alloc into a
   `memdesc_reinterpret` view of the host alloc (the one with
   `buffer.id = N`) and erases the staging alloc. The reinterpret is sound
   because the host alloc's storage covers ≥ `staging.size × staging.numCopies`

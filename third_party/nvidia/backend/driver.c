@@ -1674,12 +1674,6 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   // the proven legacy _launch() path and print a warning, so a bug in the
   // new path never silently breaks production.
   int num_params = (int)num_args + 2; // + global & profile scratch
-  if (num_params > TRITON_MAX_PARAMS) {
-    PyErr_Format(PyExc_RuntimeError,
-                 "Triton kernel has %d params, exceeds TRITON_MAX_PARAMS (%d)",
-                 num_params, TRITON_MAX_PARAMS);
-    goto cleanup;
-  }
 
   triton_kernel_launch_desc_t desc;
   desc.abi_version = TRITON_LAUNCH_DESC_ABI_VERSION;
@@ -1704,6 +1698,12 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   desc.preferred_cluster_dims[1] = preferredClusterDimY;
   desc.preferred_cluster_dims[2] = preferredClusterDimZ;
   desc.num_params = num_params;
+  // Per-launch param table (pointer + count; no static cap). alloca'd here and
+  // read by the shared core through desc.params; freed when launchKernel
+  // returns.
+  triton_param_desc_t *pdescs = (triton_param_desc_t *)alloca(
+      (size_t)num_params * sizeof(triton_param_desc_t));
+  desc.params = pdescs;
   // JIT TMA descriptors are pre-built in Python and passed by value through
   // args_buf as ordinary params (is_tma = 0); the launcher-built recipe path
   // (num_tma_recipes > 0) is reserved for auto-TMA.
@@ -1743,20 +1743,20 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
       max_align = al;
     }
     buf_size = (buf_size + al - 1) & ~(al - 1);
-    desc.params[i].offset = (int)buf_size;
-    desc.params[i].size = (int)e.size;
-    desc.params[i].is_tma = 0;
+    pdescs[i].offset = (int)buf_size;
+    pdescs[i].size = (int)e.size;
+    pdescs[i].is_tma = 0;
     buf_size += e.size;
   }
   // Scratch params: two device pointers, 8-byte aligned.
   buf_size = (buf_size + 7) & ~((size_t)7);
-  desc.params[num_args].offset = (int)buf_size;
-  desc.params[num_args].size = (int)sizeof(void *);
-  desc.params[num_args].is_tma = 0;
+  pdescs[num_args].offset = (int)buf_size;
+  pdescs[num_args].size = (int)sizeof(void *);
+  pdescs[num_args].is_tma = 0;
   buf_size += sizeof(void *);
-  desc.params[num_args + 1].offset = (int)buf_size;
-  desc.params[num_args + 1].size = (int)sizeof(void *);
-  desc.params[num_args + 1].is_tma = 0;
+  pdescs[num_args + 1].offset = (int)buf_size;
+  pdescs[num_args + 1].size = (int)sizeof(void *);
+  pdescs[num_args + 1].is_tma = 0;
   buf_size += sizeof(void *);
 
   // Allocate args_buf aligned to the largest element alignment so that every
@@ -1767,16 +1767,16 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
 
   // Second pass: extract each arg value into args_buf at its offset.
   for (Py_ssize_t i = 0; i < num_args; ++i) {
-    if (!extractors[i].extract((char *)args_buf + desc.params[i].offset,
+    if (!extractors[i].extract((char *)args_buf + pdescs[i].offset,
                                args_data[i])) {
       goto cleanup;
     }
   }
-  if (!extractPointer((char *)args_buf + desc.params[num_args].offset,
+  if (!extractPointer((char *)args_buf + pdescs[num_args].offset,
                       global_scratch_obj)) {
     goto cleanup;
   }
-  if (!extractPointer((char *)args_buf + desc.params[num_args + 1].offset,
+  if (!extractPointer((char *)args_buf + pdescs[num_args + 1].offset,
                       profile_scratch_obj)) {
     goto cleanup;
   }
@@ -1833,7 +1833,7 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
        * the offsets were already laid out with correct per-param alignment. */
       void **_fb_params = (void **)alloca((size_t)num_params * sizeof(void *));
       for (int i = 0; i < num_params; ++i)
-        _fb_params[i] = (char *)args_buf + desc.params[i].offset;
+        _fb_params[i] = (char *)args_buf + pdescs[i].offset;
       Py_BEGIN_ALLOW_THREADS;
       _launch(gridX, gridY, gridZ, num_warps, num_ctas, launch_cooperative_grid,
               launch_pdl, preferredClusterDimX, preferredClusterDimY,
@@ -1978,6 +1978,10 @@ typedef struct {
    * TritonDispatcher_new); core_desc is built once and reused every launch. */
   int use_core_launch;
   triton_kernel_launch_desc_t core_desc;
+  /* Owned storage for core_desc.params (which is now a pointer, not an inline
+   * array). The dispatcher self-caps kernel args at TD_MAX_KERNEL_ARGS, so the
+   * param table (args + 2 scratch) fits here; core_desc.params points at it. */
+  triton_param_desc_t core_params[TD_MAX_KERNEL_ARGS + 2];
 } TritonDispatcher;
 
 /* Forward declarations */
@@ -2495,8 +2499,8 @@ static PyObject *TritonDispatcher_new(PyTypeObject *type, PyObject *args,
    * now handles both the 1-D num_ctas cluster and the explicit
    * multi-dimensional cluster (cluster_dims), so only TMA kernels keep the
    * dispatcher's own td_relaunch path. */
-  self->use_core_launch =
-      (self->num_tma_descs == 0 && self->total_params <= TRITON_MAX_PARAMS);
+  self->use_core_launch = (self->num_tma_descs == 0 &&
+                           self->total_params <= TD_MAX_KERNEL_ARGS + 2);
   if (self->use_core_launch) {
     memset(&self->core_desc, 0, sizeof(self->core_desc));
     self->core_desc.abi_version = TRITON_LAUNCH_DESC_ABI_VERSION;
@@ -2514,12 +2518,15 @@ static PyObject *TritonDispatcher_new(PyTypeObject *type, PyObject *args,
     self->core_desc.cluster_dims[2] = cluster_dim_z;
     self->core_desc.num_params = self->total_params;
     self->core_desc.num_tma_recipes = 0;
+    /* params is a pointer; point it at the dispatcher-owned core_params storage
+     * (built once, reused every launch). */
+    self->core_desc.params = self->core_params;
     for (int i = 0; i < self->total_params; i++) {
       /* size is unused by the core for non-TMA params (it indexes args_buf by
        * offset); record the storage slot size for clarity. */
-      self->core_desc.params[i].offset = (int)(i * (int)sizeof(TDArgSlot));
-      self->core_desc.params[i].size = (int)sizeof(TDArgSlot);
-      self->core_desc.params[i].is_tma = 0;
+      self->core_params[i].offset = (int)(i * (int)sizeof(TDArgSlot));
+      self->core_params[i].size = (int)sizeof(TDArgSlot);
+      self->core_params[i].is_tma = 0;
     }
   }
 

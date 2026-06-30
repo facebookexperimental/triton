@@ -536,6 +536,7 @@ class language_knobs(base_knobs):
     fp32_default: env_opt_str = env_opt_str("TRITON_F32_DEFAULT")
     default_fp_fusion: env_bool = env_bool("TRITON_DEFAULT_FP_FUSION", True)
     strict_reduction_ordering: env_bool = env_bool("TRITON_STRICT_REDUCTION_ORDERING")
+    allow_npot: env_bool = env_bool("TRITON_ALLOW_NPOT")
 
 
 class nvidia_knobs(base_knobs):
