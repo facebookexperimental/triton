@@ -2053,7 +2053,8 @@ void populateTTirToCudaTileConversionPatternsAndLegality(
     ConvertGenericOp<triton::MulhiUIOp, cuda_tile::MulhiIOp, Signedness::None, IntegerUpCast::None>,
     ConvertGenericOp<triton::PtrToIntOp, cuda_tile::PtrToIntOp, Signedness::None, IntegerUpCast::None>,
     ConvertGenericOp<triton::PreciseDivFOp, cuda_tile::DivFOp, Signedness::None, IntegerUpCast::None>,
-    ConvertGenericOp<triton::PreciseSqrtOp, cuda_tile::SqrtOp, Signedness::None, IntegerUpCast::None>
+    ConvertGenericOp<triton::PreciseSqrtOp, cuda_tile::SqrtOp, Signedness::None, IntegerUpCast::None>,
+    ConvertGenericOp<triton::TanhApproxOp, cuda_tile::TanHOp, Signedness::None, IntegerUpCast::None>
 >(typeConverter, context, approx, flushToZero);
 
   patterns.add<ConvertFuncOp>(typeConverter, context, computeCapability, numCTAInCGA,  occupancy);
