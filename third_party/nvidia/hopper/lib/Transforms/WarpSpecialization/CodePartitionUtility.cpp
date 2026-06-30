@@ -781,8 +781,15 @@ bool verifyReuseGroup2(ReuseGroup *group) {
   auto *chA = group->channels[0];
   auto *chB = group->channels[1];
 
-  // Only handle single-copy buffers.
-  if (chA->getNumBuffers() != 1 || chB->getNumBuffers() != 1)
+  // The ordinary 2-channel reuse path is single-copy. A multi-copy pair is
+  // admitted only for the FA-fwd full-overwrite owner shape: the owner MMA
+  // rewrites the whole physical TMEM slot, so its acquire must be relocated to
+  // wait for the sibling's async reader even when the planner raised
+  // buffer.copy for cross-stage liveness.
+  bool hasWholeOverwriteOwner = isWholeAllocationOverwriteReuseOwner(chA) ||
+                                isWholeAllocationOverwriteReuseOwner(chB);
+  if ((chA->getNumBuffers() != 1 || chB->getNumBuffers() != 1) &&
+      !hasWholeOverwriteOwner)
     return false;
 
   // TMEM real reuse requires BOTH:

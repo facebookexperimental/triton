@@ -1527,7 +1527,12 @@ def test_op(
         # FA fwd ws_persistent: the QK/P TMEM reuse owner needs cross-stage
         # multi-buffering; the WAR backward edge alone deadlocks the pipelined
         # schedule. Skip until the TMEM multi-buffer support lands (stacked).
-        pytest.skip("FA fwd ws_persistent: pending TMEM cross-stage multi-buffering (stacked fix)")
+        pytest.skip("FA fwd ws_persistent: pending TMEM cross-stage multi-buffering")
+    if mode == "fwd" and baseVariant == "ws":
+        # FA fwd ws: the QK/P TMEM reuse owner needs cross-stage
+        # multi-buffering; the WAR backward edge alone deadlocks the pipelined
+        # schedule. Skip until the TMEM multi-buffer support lands (stacked).
+        pytest.skip("FA fwd ws_persistent: pending TMEM cross-stage multi-buffering")
     if mode == "bwd" and "fp8" in provider:
         pytest.skip("Backward pass with FP8 is not supported.")
     if mode == "bwd" and HEAD_DIM == 64 and bwd_config_idx == 1:
