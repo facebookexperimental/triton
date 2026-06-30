@@ -70,7 +70,6 @@ class FlashAttention:
 @pytest.mark.parametrize("maxRegAutoWS", [152, 192])
 @pytest.mark.parametrize("pingpongAutoWS", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
-@pytest.mark.skip(reason="FA fwd ws_persistent: needs TMEM cross-stage multi-buffering (stacked fix WIP)")
 def test_autows_fa_dp_non_causal(SUBTILING, SUBTILING_P, VECT_MUL, FADD2_REDUCE, BLOCK_N, GROUP_SIZE_N, maxRegAutoWS,
                                  pingpongAutoWS):
     config = FlashAttention.CONFIGS["autows_fa_dp"].copy()
