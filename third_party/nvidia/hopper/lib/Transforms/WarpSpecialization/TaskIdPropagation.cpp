@@ -4,6 +4,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Support/LLVM.h"
 #include "nvidia/hopper/lib/Transforms/WarpSpecialization/Utility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -203,33 +204,68 @@ LogicalResult TaskIdBackwardPropagation::visitOperation(
 
 void TaskIdBackwardPropagation::visitBranchOperand(OpOperand &operand) {
   auto defOp = operand.getOwner();
-  assert(isa<scf::IfOp>(defOp) || isa<scf::ForOp>(defOp));
 
-  SmallVector<TaskId> lattices(defOp->getNumResults(),
-                               TaskId::getUninitialized());
-  for (auto [i, result] : llvm::enumerate(defOp->getResults())) {
-    auto resultLattice = getLatticeElement(result);
-    // Wait for all the results to be initialized.
-    if (resultLattice->getValue().isUninitialized())
-      return;
-    lattices[i] =
-        resultLattice->getValue().meet(lattices[i], resultLattice->getValue());
+  // The framework routes here every operand of a branch-like op that is NOT
+  // forwarded into a successor region/block (forwarded operands are meet with
+  // their region/block-argument lattices by the framework directly). For the
+  // structured scf ops this is the trip-count / condition control operand; we
+  // propagate the union of the op's result task ids into the loop/if body via
+  // its yield(s) so the body computes for every consumer task.
+  if (isa<scf::IfOp>(defOp) || isa<scf::ForOp>(defOp)) {
+    SmallVector<TaskId> lattices(defOp->getNumResults(),
+                                 TaskId::getUninitialized());
+    for (auto [i, result] : llvm::enumerate(defOp->getResults())) {
+      auto resultLattice = getLatticeElement(result);
+      // Wait for all the results to be initialized.
+      if (resultLattice->getValue().isUninitialized())
+        return;
+      lattices[i] = resultLattice->getValue().meet(lattices[i],
+                                                   resultLattice->getValue());
+    }
+
+    // Propagate to the yield ops
+    if (auto forOp = dyn_cast<scf::ForOp>(defOp)) {
+      auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+      propagateToYield(yieldOp, lattices);
+    } else if (auto ifOp = dyn_cast<scf::IfOp>(defOp)) {
+      propagateToYield(ifOp.thenYield(), lattices);
+      if (!ifOp.getElseRegion().empty())
+        propagateToYield(ifOp.elseYield(), lattices);
+    }
+    return;
+    // TODO(Arda): Address what happens when loop is annotated
   }
 
-  // Propagate to the yield ops
-  if (auto forOp = dyn_cast<scf::ForOp>(defOp)) {
-    auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-    propagateToYield(yieldOp, lattices);
-  } else if (auto ifOp = dyn_cast<scf::IfOp>(defOp)) {
-    propagateToYield(ifOp.thenYield(), lattices);
-    if (!ifOp.getElseRegion().empty())
-      propagateToYield(ifOp.elseYield(), lattices);
-  } else {
-    llvm_unreachable("Unknown branch operation");
+  // Unstructured control flow (e.g. `cf.cond_br` produced by
+  // tritongpu-fuse-nested-loops). The non-forwarded operand is the branch
+  // condition / selector. It must be available on every warp group that
+  // executes either successor, so give it the union of the task ids flowing
+  // into the successor blocks (the forwarded destination operands, whose
+  // lattices the framework has already populated from the block arguments). A
+  // pure control op like `cf.cond_br` has no results, so there is nothing to
+  // back-propagate from results; the successor-operand union is the correct
+  // backward signal. This mirrors how scf.if's condition acquires the union of
+  // its body task ids via propagateToParent.
+  if (auto branch = dyn_cast<BranchOpInterface>(defOp)) {
+    auto condLattice = getLatticeElement(operand.get());
+    for (unsigned i = 0, e = defOp->getNumSuccessors(); i < e; ++i) {
+      SuccessorOperands succOperands = branch.getSuccessorOperands(i);
+      for (Value forwarded : succOperands.getForwardedOperands()) {
+        auto fwdLattice = getLatticeElement(forwarded);
+        if (fwdLattice->getValue().isUninitialized())
+          continue;
+        ChangeResult changed = condLattice->meet(fwdLattice->getValue());
+        propagateIfChanged(condLattice, changed);
+      }
+    }
+    return;
   }
+
+  // RegionBranchOpInterface ops (e.g. ttg.warp_specialize) only reach here for
+  // operands not forwarded to any region; such ops carry no extra control
+  // operands today, so there is nothing to propagate. Safely ignore rather
+  // than abort so future region-branch shapes do not crash the analysis.
   return;
-
-  // TODO(Arda): Address what happens when loop is annotated
 }
 
 void TaskIdBackwardPropagation::visitCallOperand(OpOperand &operand) {

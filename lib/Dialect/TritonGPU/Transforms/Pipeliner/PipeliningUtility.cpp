@@ -302,8 +302,18 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
   // iterations of a dynamic loop: executing a store/reduce/scatter for an
   // iteration past the real trip count would corrupt the output (e.g. a
   // spurious atomic add for a TMA reduce). Guard them with scf.if(pred).
+  // Also handle the high-level TMA descriptor ops (tt.descriptor_store /
+  // _reduce / _scatter / _load / _gather) when they reach the pipeliner
+  // un-lowered -- e.g. autoWS backward loops where the TMA lowering did not run
+  // before tritongpu-pipeline. None of these high-level ops carry a pred/mask
+  // operand, so they take the scf.if(pred) guard. The store-like ops have no
+  // results; the load-like ops have a result, which the wrapper below yields as
+  // poison on the else branch (the predicated-out value is never consumed).
   if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp,
-          ttng::AsyncTMAScatterOp, ttng::TMAStoreTokenWaitOp>(op)) {
+          ttng::AsyncTMAScatterOp, ttng::TMAStoreTokenWaitOp,
+          tt::DescriptorStoreOp, tt::DescriptorReduceOp,
+          tt::DescriptorScatterOp, tt::DescriptorLoadOp,
+          tt::DescriptorGatherOp>(op)) {
     rewriter.setInsertionPoint(op);
     bool hasResults = op->getNumResults() > 0;
     auto ifOp =
