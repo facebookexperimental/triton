@@ -1,0 +1,27 @@
+ce3c8447e02d428f18fb5ae9be64a5fa8e9b2109
+facebookexperimental/triton #1636
+Recorded: 2026-06-08
+
+Purpose: pin the upstream base so the numerical-inconsistency repro is
+reproducible even after the divergence is fixed. These examples use ONLY stock
+@triton.autotune / triton.Config / kernel.warmup() -- no project-local autotuner
+changes (equivalence_fn / equivalence_level / artifact_config_prune).
+
+This is the nearest non-"bitequiv:" ancestor of the branch these examples live on
+(youngzt/triton-wt-numerical-eg), confirmed an ancestor of
+facebookexperimental/triton. To reproduce the exact behavior shown here, build
+Triton at this commit and run the examples on a CUDA GPU.
+
+----------------------------------------------------------------------
+Demonstration environment (where divergence was actually observed):
+  - Triton build:  3.6.0+fb.beta  (the fork's in-tree build under
+                   /home/youngzt/bitwise-equiv/triton/python)
+  - GPU:           NVIDIA GB300 (Blackwell, sm_103a, cc 10.3), devgpu013
+  - torch:         2.7.1+cu128
+  - Date:          2026-06-08
+
+Note on the stock PyPI wheel: `triton==3.3.1` CANNOT target sm_103a (its bundled
+LLVM rejects the processor: "Cannot select intrinsic llvm.nvvm.shfl.sync.bfly").
+So on Blackwell you must use the fork build, not the wheel. The divergence itself
+is plain upstream behavior (unordered reductions / MMA precision modes), not
+fork-specific -- it reproduces anywhere the kernels compile.
