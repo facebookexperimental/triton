@@ -105,3 +105,39 @@ def write_acf(ptx_sha: str, arch: str, data: bytes, meta: dict | None = None) ->
         with open(p + ".json", "w") as f:
             json.dump(meta, f, indent=2, default=str)
     return p
+
+
+# --- assembled ACF-cubin cache --------------------------------------------------------------------
+# The cubin produced by `ptxas PTX --apply-controls=<acf>` is cached here so consume doesn't re-run
+# ptxas on every process. It lives in the compile_iq ACF store ONLY -- never in Triton's compile
+# cache (which stays plain), so the opaqueness invariant holds. It is the assembly that's reused
+# cross-process; the plain-vs-ACF A/B and its win decision remain in-memory per process.
+#
+# Tagged by ptxas version: the .acf bytes are version-independent, but the assembled cubin is only
+# valid for the ptxas that produced it -- serving a mismatched cubin would be a correctness bug.
+
+
+def _ptxas_tag(ptxas_version: str) -> str:
+    return re.sub(r"[^0-9A-Za-z._]", "", ptxas_version or "")[:32] or "unknown"
+
+
+def acf_cubin_path(ptx_sha: str, arch: str, ptxas_version: str) -> str:
+    return os.path.join(store_root(), arch, f"{ptx_sha}.{_ptxas_tag(ptxas_version)}.acf.cubin")
+
+
+def read_acf_cubin(ptx_sha: str, arch: str, ptxas_version: str) -> bytes | None:
+    p = acf_cubin_path(ptx_sha, arch, ptxas_version)
+    if not os.path.exists(p):
+        return None
+    with open(p, "rb") as f:
+        return f.read()
+
+
+def write_acf_cubin(ptx_sha: str, arch: str, ptxas_version: str, data: bytes) -> str:
+    p = acf_cubin_path(ptx_sha, arch, ptxas_version)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = f"{p}.tmp.{os.getpid()}"  # write+rename so a concurrent reader never sees a partial cubin
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, p)
+    return p

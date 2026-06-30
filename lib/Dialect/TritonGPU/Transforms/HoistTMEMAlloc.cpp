@@ -158,8 +158,17 @@ public:
     Value newToken = sinkValueRedefinition(rewriter, load.getDep(),
                                            load.getToken(), domOp->getBlock());
     if (newToken != load.getToken()) {
-      for (OpOperand *use : uses)
-        use->set(newToken);
+      // Iterate the live use list with make_early_inc_range: the OpOperand*
+      // captured above may dangle (sinkValueRedefinition can reallocate operand
+      // storage) and set() mutates the list. Skip uses newToken does not
+      // dominate -- when threaded out of an enclosing region it is that
+      // region's result, which does not dominate uses inside the region; those
+      // keep the original token, which still dominates them.
+      DominanceInfo postSinkDomInfo;
+      for (OpOperand &use :
+           llvm::make_early_inc_range(load.getToken().getUses()))
+        if (postSinkDomInfo.properlyDominates(newToken, use.getOwner()))
+          use.set(newToken);
     }
     return success();
   }

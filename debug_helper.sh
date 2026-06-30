@@ -6,6 +6,13 @@
 #   ./debug_helper.sh --list-investigations
 #   ./debug_helper.sh --run-subagent barrier_visualization <claude|codex> <ir-path> <out-dir> [context-file]
 #   ./debug_helper.sh --run-subagent ir_override_ablation <claude|codex> <ir-path> <out-dir> [context-file]
+#   ./debug_helper.sh --run-subagent compute_sanitizer <claude|codex> <ir-path> <out-dir> [context-file]
+#
+# The compute_sanitizer investigation is a runtime check: it runs the kernel's
+# reproduce command under NVIDIA compute-sanitizer (memcheck/racecheck/
+# initcheck/synccheck). The reproduce command is read from the context file or a
+# shared-context.md alongside the IR path. Set COMPUTE_SANITIZER_BIN to override
+# the auto-detected compute-sanitizer binary.
 
 set -euo pipefail
 
@@ -76,6 +83,42 @@ validate_llm() {
             exit 1
             ;;
     esac
+}
+
+# Locate the NVIDIA compute-sanitizer binary. It is frequently not on PATH, so
+# fall back to the active CUDA toolkit and any versioned install (newest wins).
+# Honor an explicit COMPUTE_SANITIZER_BIN override first. Prints the resolved
+# path on success; returns non-zero when nothing usable is found.
+resolve_compute_sanitizer() {
+    if [[ -n "${COMPUTE_SANITIZER_BIN:-}" ]]; then
+        if [[ -x "${COMPUTE_SANITIZER_BIN}" ]]; then
+            echo "${COMPUTE_SANITIZER_BIN}"
+            return 0
+        fi
+        echo "Warning: COMPUTE_SANITIZER_BIN='${COMPUTE_SANITIZER_BIN}' is not executable; ignoring." >&2
+    fi
+
+    if command -v compute-sanitizer >/dev/null 2>&1; then
+        command -v compute-sanitizer
+        return 0
+    fi
+
+    if [[ -x /usr/local/cuda/bin/compute-sanitizer ]]; then
+        echo /usr/local/cuda/bin/compute-sanitizer
+        return 0
+    fi
+
+    local best="" candidate
+    for candidate in /usr/local/cuda-*/bin/compute-sanitizer; do
+        [[ -x "$candidate" ]] || continue
+        best="$candidate"
+    done
+    if [[ -n "$best" ]]; then
+        echo "$best"
+        return 0
+    fi
+
+    return 1
 }
 
 log_line() {
@@ -263,6 +306,12 @@ subagent_prompt() {
     local template_path
     template_path="$(subagent_template_path "$investigation")"
 
+    # Runtime investigations (e.g. compute_sanitizer) need the sanitizer binary,
+    # which is usually not on PATH. Resolve it once and expose it to every
+    # template; static investigations simply ignore the placeholder.
+    local compute_sanitizer_bin
+    compute_sanitizer_bin="$(resolve_compute_sanitizer || true)"
+
     render_template "$template_path" \
         INVESTIGATION "$investigation" \
         REPO_ROOT "$REPO_ROOT" \
@@ -271,7 +320,8 @@ subagent_prompt() {
         REPORT_PATH "$report_path" \
         INSIGHTS_PATH "$insights_path" \
         STATUS_PATH "$status_path" \
-        CONTEXT_FILE "${context_file:-<none>}"
+        CONTEXT_FILE "${context_file:-<none>}" \
+        COMPUTE_SANITIZER_BIN "${compute_sanitizer_bin:-<not-found>}"
 }
 
 run_template_subagent() {

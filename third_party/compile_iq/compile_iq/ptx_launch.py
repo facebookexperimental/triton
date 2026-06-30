@@ -86,7 +86,9 @@ def parse_arch(ptx: str) -> str:
 
 
 def _param_kind(p: str) -> str:
-    """Map a PTX `.param` declaration to a launch-arg kind: 'ptr' | 'i64' | 'f64' | 'f32' | 'i32'."""
+    """Map a PTX `.param` declaration to a launch-arg kind: 'tma' | 'ptr' | 'i64' | 'f64' | 'f32' | 'i32'."""
+    if ".b8" in p and "[" in p:
+        return "tma"  # a by-value byte-array param == a 128B CUtensorMap (TMA descriptor)
     if ".ptr" in p:
         return "ptr"
     if ".u64" in p or ".s64" in p or ".b64" in p:
@@ -112,17 +114,25 @@ def build_spec(ptx: str, metadata, grid, ordered_args, ptxas: str) -> dict:
     """Build the source-free launch spec from a compiled kernel + its (bound-order) call args.
 
     ordered_args: list in source/bound order, each one of:
-        ("tensor", {"shape", "dtype", "strides"}) | ("scalar", value) | ("constexpr",)
+        ("tensor", {"id", "shape", "dtype", "strides"})
+        ("tensordesc", {"base": {"id","shape","dtype","strides"}, "desc_shape", "desc_strides",
+                        "block_shape", "padding"})   # host-side TMA TensorDescriptor
+        ("scalar", value) | ("constexpr",)
     Applies Triton's specialization (drop constexprs and `equal_to_1` integer scalars), maps the
-    survivors onto the PTX `.entry` param slots, and appends the two trailing null scratch pointers.
-    Raises NotImplementedError for kernels this PTX-direct prototype does not yet cover (non-null
-    global/profile scratch, multi-CTA/cluster, tensordesc/other arg types, or any param mismatch) so
-    the caller fails open and simply does not collect that kernel."""
+    survivors onto the PTX `.entry` param slots -- including expanding each TensorDescriptor into its
+    [tensormap, *shape, *strides] params (the TMA ABI, see nvidia/backend/driver.py
+    make_tensordesc_arg) -- and appends the two trailing null scratch pointers. Backing tensors are
+    deduped by `id` so descriptors that share a tensor share one allocation.
+
+    Raises NotImplementedError for kernels this PTX-direct path does not cover yet (non-null
+    global/profile scratch, multi-CTA/cluster, fp4-padded/im2col TMA, other arg types, or any param
+    mismatch) so the caller fails open and simply does not collect that kernel."""
     name, kinds = parse_entry(ptx)
     gss = int(getattr(metadata, "global_scratch_size", 0) or 0)
     pss = int(getattr(metadata, "profile_scratch_size", 0) or 0)
     num_ctas = int(getattr(metadata, "num_ctas", 1) or 1)
     cluster = list(getattr(metadata, "cluster_dims", getattr(metadata, "cluster", [1, 1, 1])) or [1, 1, 1])
+    tdmeta = list(getattr(metadata, "tensordesc_meta", None) or [])
     if gss or pss:
         raise NotImplementedError(f"non-null scratch (global={gss} profile={pss})")
     if num_ctas != 1 or any(int(c) != 1 for c in cluster):
@@ -131,40 +141,94 @@ def build_spec(ptx: str, metadata, grid, ordered_args, ptxas: str) -> dict:
         raise NotImplementedError("expected two trailing scratch pointer params")
     user_kinds = kinds[:-2]  # drop global_scratch + profile_scratch
 
-    survivors = []  # (sk, value) post-specialization, in param order
+    tensors = []
+    _id2idx = {}
+
+    def _tensor_idx(info):
+        key = info.get("id")
+        if key is not None and key in _id2idx:
+            return _id2idx[key]
+        idx = len(tensors)
+        tensors.append({"shape": list(info["shape"]), "dtype": info["dtype"], "strides": list(info["strides"])})
+        if key is not None:
+            _id2idx[key] = idx
+        return idx
+
+    # Specialize: drop constexprs and equal_to_1 int scalars (what Triton removes from kernel params).
+    survivors = []
     for a in ordered_args:
         if a[0] == "constexpr":
             continue
-        if a[0] == "tensor":
-            survivors.append(("tensor", a[1]))
+        if a[0] in ("tensor", "tensordesc"):
+            survivors.append(a)
         elif a[0] == "scalar":
             v = a[1]
             if isinstance(v, bool):
                 survivors.append(("scalar", int(v)))
             elif isinstance(v, int) and v == 1:
-                continue  # equal_to_1 specialization: dropped from the kernel signature
+                continue
             else:
                 survivors.append(("scalar", v))
         else:
             raise NotImplementedError(f"unsupported arg kind {a[0]!r}")
-    if len(survivors) != len(user_kinds):
-        raise NotImplementedError(f"param parity: {len(survivors)} survivors != {len(user_kinds)} PTX user params")
 
-    tensors, args = [], []
-    for (sk, sv), k in zip(survivors, user_kinds):
-        if sk == "tensor":
-            if k != "ptr":
+    args, tensordescs, ki, tdmi = [], [], 0, 0
+
+    def _kind_at(i):
+        if i >= len(user_kinds):
+            raise NotImplementedError("param parity: ran past PTX user params")
+        return user_kinds[i]
+
+    for s in survivors:
+        if s[0] == "tensor":
+            if _kind_at(ki) != "ptr":
                 raise NotImplementedError("tensor arg mapped to a non-pointer PTX param")
-            args.append({"t": len(tensors)})
-            tensors.append({"shape": list(sv["shape"]), "dtype": sv["dtype"], "strides": list(sv["strides"])})
-        else:  # scalar
-            if k == "ptr":
-                raise NotImplementedError("scalar arg mapped to a pointer PTX param")
-            args.append({k: int(sv) if k in ("i32", "i64") else float(sv)})
+            args.append({"t": _tensor_idx(s[1])})
+            ki += 1
+        elif s[0] == "scalar":
+            k = _kind_at(ki)
+            if k in ("ptr", "tma"):
+                raise NotImplementedError("scalar arg mapped to a pointer/tma PTX param")
+            args.append({k: int(s[1]) if k in ("i32", "i64") else float(s[1])})
+            ki += 1
+        else:  # tensordesc -> [tensormap, *desc_shape, *desc_strides]
+            info = s[1]
+            if tdmi >= len(tdmeta):
+                raise NotImplementedError("more tensordesc args than tensordesc_meta entries")
+            meta = tdmeta[tdmi]
+            tdmi += 1
+            if meta.get("fp4_padded") or meta.get("is_im2col"):
+                raise NotImplementedError("fp4-padded / im2col TMA not supported yet")
+            if _kind_at(ki) != "tma":
+                raise NotImplementedError("tensordesc arg not aligned to a tensormap PTX param")
+            rank = len(info["desc_shape"])
+            args.append({"tma": len(tensordescs)})
+            tensordescs.append({
+                "base": _tensor_idx(info["base"]),
+                "desc_shape": list(info["desc_shape"]),
+                "desc_strides": list(info["desc_strides"]),
+                "swizzle": int(meta["swizzle"]),
+                "elem_size": int(meta["elem_size"]),
+                "elem_type": int(meta["elem_type"]),
+                "block_size": list(meta["block_size"]),
+                "padding": int(info.get("padding", 0)),
+            })
+            ki += 1
+            for d in range(rank):  # *shape params
+                k = _kind_at(ki)
+                args.append({k: int(info["desc_shape"][d])})
+                ki += 1
+            for d in range(rank):  # *stride params
+                k = _kind_at(ki)
+                args.append({k: int(info["desc_strides"][d])})
+                ki += 1
+
+    if ki != len(user_kinds):
+        raise NotImplementedError(f"param parity: consumed {ki} != {len(user_kinds)} PTX user params")
     args += [{"null": True}, {"null": True}]  # global_scratch, profile_scratch
 
     g = list(grid)
-    return {
+    spec = {
         "entry": name,
         "arch": parse_arch(ptx),
         "shared": int(getattr(metadata, "shared", 0) or 0),
@@ -175,6 +239,9 @@ def build_spec(ptx: str, metadata, grid, ordered_args, ptxas: str) -> dict:
         "tensors": tensors,
         "args": args,
     }
+    if tensordescs:
+        spec["tensordescs"] = tensordescs
+    return spec
 
 
 # --------------------------------------------------------------------------------------
@@ -225,27 +292,33 @@ class LoadedKernel:
         return cls(cubin, name, shared)
 
     def launch(self, grid, block, kernel_args, stream=0):
-        """kernel_args: ordered list of ('ptr', int_addr) | ('i32', int) | ('i64', int) | ('null',).
-        Builds the void** kernelParams array Triton's launcher would build and calls cuLaunchKernel."""
+        """kernel_args: ordered list of ('ptr', addr) | ('i32', int) | ('i64', int) | ('f32', float) |
+        ('null',) | ('tma', addr_of_128B_tensormap). Builds the void** kernelParams array Triton's
+        launcher would build and calls cuLaunchKernel. For 'tma' the param IS passed by value (128
+        bytes), so the kernelParams slot points straight at the tensormap bytes -- the caller must keep
+        the backing PyCUtensorMap objects alive across the launch."""
         gx, gy, gz = (tuple(grid) + (1, 1, 1))[:3]
         bx, by, bz = (tuple(block) + (1, 1, 1))[:3]
-        holders = []  # keep ctypes objects alive until after launch
-        for a in kernel_args:
+        arr = (ctypes.c_void_p * len(kernel_args))()
+        holders = []  # keep ctypes value objects alive until after launch
+        for i, a in enumerate(kernel_args):
             kind = a[0]
+            if kind == "tma":  # by-value tensormap: slot points directly at the 128B descriptor
+                arr[i] = ctypes.c_void_p(int(a[1]))
+                continue
             if kind == "ptr":
-                holders.append(ctypes.c_void_p(int(a[1])))
+                h = ctypes.c_void_p(int(a[1]))
             elif kind == "null":
-                holders.append(ctypes.c_void_p(0))
+                h = ctypes.c_void_p(0)
             elif kind == "i32":
-                holders.append(ctypes.c_int32(int(a[1])))
+                h = ctypes.c_int32(int(a[1]))
             elif kind == "i64":
-                holders.append(ctypes.c_int64(int(a[1])))
+                h = ctypes.c_int64(int(a[1]))
             elif kind == "f32":
-                holders.append(ctypes.c_float(float(a[1])))
+                h = ctypes.c_float(float(a[1]))
             else:
                 raise ValueError(f"unsupported kernel arg kind: {kind}")
-        arr = (ctypes.c_void_p * len(holders))()
-        for i, h in enumerate(holders):
+            holders.append(h)
             arr[i] = ctypes.cast(ctypes.pointer(h), ctypes.c_void_p)
         _chk(_drv.cuLaunchKernel(self.func, gx, gy, gz, bx, by, bz, self.shared, stream, int(ctypes.addressof(arr)), 0))
 
@@ -298,12 +371,38 @@ def alloc_tensors(spec, device="cuda", seed=0):
     return out
 
 
-def kernel_args_from_spec(spec, tensors):
-    """Turn the spec's final arg list + allocated tensors into the launch() kernel_args."""
+def build_tensormaps(spec, tensors):
+    """Build the 128B CUtensorMap for each spec tensordesc via Triton's tensormap encoder, and return
+    (objs, addrs): the PyCUtensorMap objects (KEEP ALIVE across launch) and the address of each one's
+    128-byte tensormap (id(obj) + (basicsize - 128)). Empty for non-TMA kernels."""
+    tds = spec.get("tensordescs")
+    if not tds:
+        return [], []
+    import triton
+    try:
+        from triton.backends.nvidia.driver import TMA_DTYPE_DEVICE_TO_HOST as _D2H
+    except Exception:
+        _D2H = {i: i for i in range(16)}
+    fill = triton.runtime.driver.active.utils.fill_tma_descriptor_tiled
+    objs, addrs = [], []
+    for td in tds:
+        base = tensors[td["base"]]
+        tm = fill(base.data_ptr(), td["swizzle"], td["elem_size"], _D2H[td["elem_type"]], list(td["block_size"]),
+                  list(td["desc_shape"]), list(td["desc_strides"]), td["padding"])
+        objs.append(tm)
+        addrs.append(id(tm) + (type(tm).__basicsize__ - 128))
+    return objs, addrs
+
+
+def kernel_args_from_spec(spec, tensors, tensormap_addrs=None):
+    """Turn the spec's final arg list + allocated tensors (+ tensormap addrs) into launch() args."""
+    tensormap_addrs = tensormap_addrs or []
     ka = []
     for a in spec["args"]:
         if "t" in a:
             ka.append(("ptr", tensors[a["t"]].data_ptr()))
+        elif "tma" in a:
+            ka.append(("tma", tensormap_addrs[a["tma"]]))
         elif a.get("null"):
             ka.append(("null", ))
         elif "i32" in a:
