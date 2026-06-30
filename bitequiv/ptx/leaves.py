@@ -56,3 +56,47 @@ def leaf_coord(ev, du, load_inst, slot):
     masked = "m" if load_inst.predicate is not None else "u"
     w = "" if width is None else f"/{width}"
     return f"{coord}{w}|{masked}"
+
+
+def leaf_columns(ev, du, load_inst, slot):
+    """Layout-invariant element-index image of one (vector-)load across the WHOLE thread grid.
+
+    The load address is an :class:`Affine` ``const + sum(coeff*sym)``. The columns this load
+    reads, as the thread index ranges over the launch grid, are ``{(numeric_part)/width}``
+    expanded over every ``%tid`` symbol's range. Symbolic terms that are CONSTANT across a
+    single reduction (the base pointer param, the row ``%ctaid`` offset) are dropped — they are
+    identical for every config compared and for every leaf of one row, so dropping them yields
+    a layout-invariant per-row column set. Returns ``frozenset[int]`` or ``None`` when the
+    image cannot be proven (non-affine address, unknown ``%tid`` range, or a non-tid varying
+    symbol), in which case the collapse pass must NOT fire (stays conservative)."""
+    at = du.index_of(load_inst)
+    addr = ev.of_address(load_inst.operands[1], at)
+    width = _load_width(load_inst.modifiers)
+    if not isinstance(addr, Affine) or width is None or width == 0:
+        return None
+    base = addr.const + (slot * width if slot else 0)
+    grid = []  # (coeff, n) for each thread-index symbol that selects a column
+    for sym, coeff in addr.terms:
+        if sym.startswith("%tid"):
+            n = ev.reqntid.get(sym.split(".")[-1])
+            if n is None:
+                return None
+            grid.append((coeff, n))
+        elif sym.startswith("%laneid"):
+            grid.append((coeff, 32))
+        elif (sym.startswith("%ctaid") or sym.startswith("%nctaid") or sym.startswith("%ntid")
+              or sym.startswith("param:") or sym.startswith("sym:") or sym.startswith("reg:")
+              or sym.startswith("opq:")):
+            # constant across this reduction (row index / base ptr / unmodellable row math)
+            # -> drop; it is identical for every config and every leaf of one row.
+            continue
+        else:
+            return None  # an unknown varying symbol -> cannot prove the image; be conservative
+    cols = {base}
+    for coeff, n in grid:
+        cols = {c + coeff * t for c in cols for t in range(n)}
+        if len(cols) > 1 << 20:  # safety cap; refuse to materialize an absurd image
+            return None
+    if any(c % width for c in cols):
+        return None
+    return frozenset(c // width for c in cols)

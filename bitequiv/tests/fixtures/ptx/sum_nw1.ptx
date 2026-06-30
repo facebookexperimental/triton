@@ -528,7 +528,7 @@ $L__func_end0:
                                         // -- End function
 }
 	.file	1 "/tmp/capture_fixtures.py"
-	.file	2 "/home/youngzt/bitwise-equiv/triton/python/triton/language/standard.py"
+	.file	2 "python/triton/language/standard.py"
 	.section	.debug_abbrev
 	{
 .b8 1                                   // Abbreviation Code
