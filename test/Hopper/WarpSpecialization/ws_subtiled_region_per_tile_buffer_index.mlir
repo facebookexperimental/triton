@@ -26,7 +26,7 @@
 // CHECK-LABEL: @matmul_kernel_tma_persistent_ws
 //
 // The epilogue staging buffer is a single shared 3-deep 128x32 alloc.
-// CHECK: ttg.local_alloc {allocation.shareGroup = 0 : i32, buffer.copy = 3 : i32, buffer.id = 2 : i32} : () -> !ttg.memdesc<3x128x32xf16
+// CHECK: ttg.local_alloc {allocation.shareGroup = 0 : i32, buffer.copy = 3 : i32, buffer.id = 2 : i32, buffer.tmaStaging = 1 : i32} : () -> !ttg.memdesc<3x128x32xf16
 //
 // In the epilogue partition (async_task_id = 0): flattened count, its % numBuffers
 // reduction, then the SAME %IDX indexing the data staging buffer (3x128x32) and
