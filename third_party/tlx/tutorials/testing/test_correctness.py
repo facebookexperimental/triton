@@ -57,6 +57,8 @@ from triton.language.extra.tlx.tutorials.amd_fa_pipelined import (
     attention as _amd_fa_pipelined, )
 from triton.language.extra.tlx.tutorials.amd_fa_persistent import (
     attention as _amd_fa_persistent, )
+from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
+    attention as _amd_fa_cluster, )
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul as _amd_tdm_gemm_pipelined, )
 from triton.language.extra.tlx.tutorials.amd_gemm_warp_pipeline import (
@@ -73,6 +75,7 @@ from triton.language.extra.tlx.tutorials.amd_addmm_glu import (
     M as _amd_addmm_glu_M,
     N as _amd_addmm_glu_N,
 )
+from triton.language.extra.tlx.tutorials import amd_hstu_attn as _hstu
 from triton.tools.mxfp import MXScaleTensor
 
 from triton.language.extra.tlx.tutorials.ikbo.ikbo_lce_triton import (
@@ -1017,6 +1020,114 @@ def test_amd_fa_persistent_cross_attention(q_len, kv_len, causal):
     out = _amd_fa_persistent(q, k, v, sm, causal)
     valid = ~torch.isnan(ref.float())  # fully-masked rows (q_len > kv_len) are undefined
     torch.testing.assert_close(out.float()[valid], ref.float()[valid], atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["nocausal", "causal"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_fa_cluster(causal, dtype):
+    torch.manual_seed(42)
+    B, H, N_CTX, D = 1, 4, 1024, 128
+    q = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=dtype)
+    k = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=dtype)
+    v = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=dtype)
+    sm = 1.0 / math.sqrt(D)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=sm)
+    out = _amd_fa_cluster(q, k, v, sm, causal)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+# =============================================================================
+# AMD HSTU Attention Tests (gfx950)
+# =============================================================================
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+@pytest.mark.parametrize("batch_size, max_seq_len, sparsity, heads, attn_dim, hidden_dim", _hstu.get_inputs())
+def test_hstu_attention(batch_size, max_seq_len, sparsity, heads, attn_dim, hidden_dim):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
+    dropout_pr = 0.0
+    target_size = 20
+    sl_alpha = 2.0
+
+    # In prod, BF16 is used by HSTU attention
+    dtype = torch.bfloat16
+    invalid_attn_mask_type = "lower_triangular"
+    causal = True
+    alpha = 1.0 / attn_dim * 10000
+
+    # generate inputs
+    torch.manual_seed(1001)  # for reproducibility
+    lengths = _hstu.generate_sparse_seq_len(
+        size=batch_size,
+        max_seq_len=max_seq_len,
+        sparsity=sparsity,
+        device=torch.device("cuda"),
+    )
+    lengths = _hstu.apply_SL(lengths, sl_alpha, max_seq_len=max_seq_len)
+    num_targets = torch.randint(
+        1,
+        target_size + 1,
+        (batch_size, ),
+        device=lengths.device,
+        dtype=lengths.dtype,
+    )
+    num_targets = torch.where(num_targets > lengths, lengths, num_targets)
+    seq_offsets = torch.zeros((batch_size + 1, ), dtype=torch.int64, device=torch.device("cuda"))
+    seq_offsets[1:] = torch.cumsum(lengths, dim=0)
+    L = int(seq_offsets[-1].item())
+    x = torch.empty(
+        (L, heads, attn_dim * 2 + hidden_dim),
+        dtype=dtype,
+        device=torch.device("cuda"),
+    ).uniform_(-0.01, 0.01)
+    q, k, v = torch.split(x, [attn_dim, attn_dim, hidden_dim], dim=-1)
+
+    q = _hstu.switch_to_contiguous_if_needed(q)
+    k = _hstu.switch_to_contiguous_if_needed(k)
+    v = _hstu.switch_to_contiguous_if_needed(v)
+
+    _hstu.sanity_check_attention(
+        max_seq_len=max_seq_len,
+        q=q,
+        k=k,
+        v=v,
+        seq_offsets=seq_offsets,
+        invalid_attn_mask_type=invalid_attn_mask_type,
+        dropout_pr=dropout_pr,
+        attn_bias=None,
+        max_attn_len=None,
+        contextual_seq_len=0,
+    )
+
+    def triton_attn():
+        return _hstu.triton_hstu_attention_fwd(max_seq_len, alpha, q, k, v, seq_offsets, causal, num_targets,
+                                               0,  # max_attn_len,
+                                               0,  # contextual_seq_len
+                                               True,  # sort_by_length,
+                                               )
+
+    def torch_attn():
+        return _hstu.torch_hstu_attention(
+            max_seq_len,
+            alpha,
+            q,
+            k,
+            v,
+            seq_offsets,
+            causal,
+            dropout_pr=0.0,
+            training=False,
+            num_targets=num_targets,
+            max_attn_len=0,
+            contextual_seq_len=0,
+            min_full_attn_seq_len=0,
+        )
+
+    out = triton_attn() * max_seq_len
+    out_ref = torch_attn() * max_seq_len
+    torch.testing.assert_close(out, out_ref, atol=1e-3, rtol=0)
 
 
 # =============================================================================

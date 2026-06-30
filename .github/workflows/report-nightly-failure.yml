@@ -54,6 +54,11 @@ on:
         required: false
         type: string
         default: ""
+      repro:
+        description: Optional local reproduce command for this failure.
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -82,6 +87,7 @@ jobs:
             const eventName = ${{ toJSON(inputs.event_name) }};
             const runAttempt = ${{ toJSON(inputs.run_attempt) }};
             const summary = ${{ toJSON(inputs.summary) }};
+            const repro = ${{ toJSON(inputs.repro) }};
 
             // Normalize raw IDs into a readable list (accepts newline or JSON).
             let rawList = [];
@@ -113,6 +119,8 @@ jobs:
               "",
               "### Raw failing test IDs",
               rawBlock,
+              "",
+              repro ? "### Reproduce\n```\n" + repro + "\n```" : "",
               "",
               summary ? "### Summary\n```\n" + summary + "\n```" : "",
               "",

@@ -982,6 +982,23 @@ LogicalResult MemDescIndexOp::verify() {
   }
   bool is1D =
       srcTy.getRank() == 1 && dstTy.getRank() == 1 && dstTy.getDimSize(0) == 1;
+  // Beta divergence: upstream #7777's "src and result must have the same
+  // encoding" check is too strict for two beta cases:
+  //  - indexing a multibuffered TMEM channel reduces rank and re-derives the
+  //    per-buffer tensor-memory encoding (e.g. colStride), so the encodings
+  //    legitimately differ for TMEM; and
+  //  - reducing a shared buffer down to a 1D result re-derives the natural 1D
+  //    (single-order) shared encoding.
+  // Restrict the check to non-TMEM sources with a non-1D result.
+  bool isTMem = isa<triton::nvidia_gpu::TensorMemoryEncodingAttr,
+                    triton::nvidia_gpu::TensorMemoryScalesEncodingAttr>(
+      srcTy.getEncoding());
+  bool resultIs1D = dstTy.getRank() == 1;
+  if (!is1D && !isTMem && !resultIs1D &&
+      srcTy.getEncoding() != dstTy.getEncoding()) {
+    return emitError("src and result must have the same encoding");
+  }
+  // memdesc_index reduces rank by 1 and preserves the trailing shape.
   bool correctRank = srcTy.getRank() == dstTy.getRank() + 1 || is1D;
   if (!correctRank) {
     return emitError(
@@ -1056,6 +1073,9 @@ LogicalResult MemDescSubsliceOp::verify() {
   if (srcTy.getElementType() != dstTy.getElementType()) {
     return emitError("result element type must match desc element type");
   }
+  if (srcTy.getEncoding() != dstTy.getEncoding()) {
+    return emitError("src and result must have the same encoding");
+  }
   if (getOffsets().size() != srcTy.getRank()) {
     return emitError("offsets must have the same rank as input");
   }
@@ -1093,6 +1113,9 @@ LogicalResult MemDescSubsliceOp::verify() {
     } else {
       if (offset & (dstTy.getDimSize(dim) - 1)) {
         return emitError("The split offset may not touch the tile");
+      }
+      if (offset >= srcTy.getDimSize(dim)) {
+        return emitError("The split offset may not exceed the source shape");
       }
     }
   }

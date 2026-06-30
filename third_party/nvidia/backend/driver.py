@@ -1,18 +1,36 @@
 import ast
 import functools
 import os
+import re
 import subprocess
 import triton
-import re
 from pathlib import Path
 from triton import knobs
 from triton.runtime.build import compile_module_from_src
 from triton.runtime import _allocation
 from triton.backends.compiler import GPUTarget
-from triton.backends.driver import GPUDriver
+from triton.backends.driver import (
+    GPUDriver,
+    decompose_descriptor,
+    wrap_handle_tensordesc_impl,
+)
 
 dirname = os.path.dirname(os.path.realpath(__file__))
 include_dirs = [os.path.join(dirname, "include")]
+# Path(s) to the shared data-driven launcher core. driver.c is compiled via a
+# fixed Remote-Execution command that ignores include_dirs, so we inline this
+# header into the driver.c source at build time (see CudaUtils.__init__) rather
+# than relying on an -I path.
+#
+# The first candidate (backend/launch.h) is a vendored copy that ships with the
+# nvidia backend resources (the BUCK glob packages it next to driver.py), so it
+# is present in packaged/buck builds. The second is the canonical source used by
+# C/C++ consumers (cc_library triton_launch_h). Keep the two in sync; the
+# canonical is python/triton/runtime/launch.h.
+_launch_h_candidates = [
+    os.path.join(dirname, "launch.h"),
+    os.path.join(dirname, "..", "..", "..", "python", "triton", "runtime", "launch.h"),
+]
 libdevice_dir = os.path.join(dirname, "lib")
 libraries = ["libcuda.so.1"]
 PyCUtensorMap = None
@@ -64,8 +82,24 @@ class CudaUtils(object):
         return cls.instance
 
     def __init__(self):
+        # Inline the shared launcher core (launch.h) directly into the driver
+        # source: the fbcode Remote-Execution compile uses a fixed clang command
+        # that does not honor include_dirs, so an `#include "triton/runtime/
+        # launch.h"` would not resolve. Substituting the header text keeps a
+        # single source of truth (launch.h) while making the compile
+        # self-contained.
+        driver_src = Path(os.path.join(dirname, "driver.c")).read_text()
+        launch_h_path = next((p for p in _launch_h_candidates if os.path.exists(p)), None)
+        if launch_h_path is None:
+            raise FileNotFoundError(f"launch.h not found in any of: {_launch_h_candidates}")
+        launch_h_src = Path(launch_h_path).read_text()
+        include_marker = '#include "triton/runtime/launch.h"'
+        if include_marker not in driver_src:
+            raise RuntimeError(f"driver.c must contain the marker {include_marker!r} for "
+                               "launch.h inlining, but it was not found")
+        driver_src = driver_src.replace(include_marker, launch_h_src)
         mod = compile_module_from_src(
-            src=Path(os.path.join(dirname, "driver.c")).read_text(),
+            src=driver_src,
             name="cuda_utils",
             library_dirs=library_dirs(),
             include_dirs=include_dirs,
@@ -88,6 +122,9 @@ class CudaUtils(object):
         self.set_printf_fifo_size = mod.set_printf_fifo_size
         self.fill_tma_descriptor_tiled = mod.fill_tma_descriptor_tiled
         self.fill_tma_descriptor_im2col = mod.fill_tma_descriptor_im2col
+        # Test-only hook to exercise the shared-core recipe TMA encoder.
+        self._test_construct_tma_desc = getattr(mod, "_test_construct_tma_desc", None)
+        self._tma_desc_bytes = getattr(mod, "_tma_desc_bytes", None)
         self.launch = mod.launch
         self.build_signature_metadata = mod.build_signature_metadata
         self.fill_1d_tma_descriptor = mod.fill_1d_tma_descriptor
@@ -308,23 +345,9 @@ class TmaDescKernelParam:
         return self.desc.data_ptr()
 
 
-def make_tensordesc_arg(arg, metadata):
+def make_tensordesc_arg(arg, metadata, _):
     if metadata is None:
-        # Currently the host side tensor descriptors get decomposed in
-        # the frontend to tensor desc, shape, and strides. We have no
-        # way to use these shape and strides when processing tensor
-        # descriptors which is why we provide our own decomposition
-        # above. Sadly this means we have to pass the shape and strides
-        # twice.
-        return [
-            arg.base,
-            *arg.shape,
-            *arg.strides,
-            arg.padding == "nan",
-            arg.round_f32_to_tf32,
-            *arg.shape,
-            *arg.strides,
-        ]
+        return decompose_descriptor(arg)
 
     swizzle = metadata["swizzle"]
     elem_size = metadata["elem_size"]
@@ -381,32 +404,7 @@ def make_tensordesc_arg(arg, metadata):
 
 
 def wrap_handle_tensordesc(launcher, signature, tensordesc_meta):
-    has_tensor_desc_arg = any(isinstance(sig, str) and sig.startswith("tensordesc") for sig in signature.values())
-    if not has_tensor_desc_arg:
-        return launcher
-
-    tensordesc_indices = set(
-        [i for i, sig in enumerate(signature.values()) if isinstance(sig, str) and sig.startswith("tensordesc")])
-    assert not tensordesc_meta or len(tensordesc_meta) == len(tensordesc_indices)
-    if not tensordesc_meta:
-        tensordesc_meta = [None] * len(tensordesc_indices)
-
-    def inner(*args):
-        base_args = args[:-1]
-        kernel_args = args[-1]
-
-        final_kernel_args = []
-        tensordesc_idx = 0
-        for i, arg in enumerate(kernel_args):
-            if i in tensordesc_indices:
-                final_kernel_args.extend(make_tensordesc_arg(arg, tensordesc_meta[tensordesc_idx]))
-                tensordesc_idx += 1
-            else:
-                final_kernel_args.append(arg)
-
-        return launcher(*base_args, final_kernel_args)
-
-    return inner
+    return wrap_handle_tensordesc_impl(launcher, signature, tensordesc_meta, make_tensordesc_arg)
 
 
 class CudaLauncher(object):
@@ -467,6 +465,8 @@ class CudaLauncher(object):
         *args,
     ):
 
+        active_driver = triton.runtime.driver.active
+
         def allocate_scratch(size, align, allocator):
             if size > 0:
                 grid_size = gridX * gridY * gridZ
@@ -475,12 +475,22 @@ class CudaLauncher(object):
                 return alloc_fn(alloc_size, align, stream)
             return None
 
+        def allocate_default_profile_scratch(size, align):
+            if size > 0:
+                grid_size = gridX * gridY * gridZ
+                alloc_size = grid_size * self.num_ctas * size
+                return active_driver.allocate_default_profile_scratch(alloc_size, align, stream)
+            return None
+
         global_scratch = allocate_scratch(self.global_scratch_size, self.global_scratch_align, _allocation._allocator)
-        profile_scratch = allocate_scratch(
-            self.profile_scratch_size,
-            self.profile_scratch_align,
-            _allocation._profile_allocator,
-        )
+        if _allocation.has_profile_allocator():
+            profile_scratch = allocate_scratch(
+                self.profile_scratch_size,
+                self.profile_scratch_align,
+                _allocation._profile_allocator,
+            )
+        else:
+            profile_scratch = allocate_default_profile_scratch(self.profile_scratch_size, self.profile_scratch_align)
 
         self.launch(
             gridX,
