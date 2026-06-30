@@ -209,6 +209,25 @@ two consumer shapes:
   `ChannelPost`s sharing one in-body template producer and one reuse-group token;
   the producer-side acquire/commit is emitted by exactly one sibling
   (`emittedSubtiledProducerTokens`). See bug #10 in the partition-scheduler rules.
+- **Same-task interleaved** (`separate_epilogue_store=False`): the producer
+  `local_store` and the consumer `async_tma_copy_local_to_global` are both in the
+  epilogue task, so there is no cross-task channel and *no WS reuse barrier* — the
+  only drain sync is the per-tile `async_tma_store_token_wait`. These two endpoints
+  must therefore live in **one** `SubtiledRegionOp` whose tile body is
+  `store_t → copy_t → token_wait` (per tile), so the TMA wait drains a staging slot
+  before a later subtile reuses it. `collectPerTileChain`
+  (`GenerateSubtiledRegion.cpp`) achieves this by following a `local_store`'s SMEM
+  buffer to a **same-task** TMA copy and pulling it into the same per-tile chain;
+  `buildSingleSubtiledRegionN` then emits one region (the store and copy share one
+  per-tile buffer position). Emitting two *sequential* same-task regions instead
+  (all stores, then all copies) races the staging slot whenever
+  `numTiles > buffer.copy` — the slot is overwritten before its copy drains —
+  because, unlike the cross-task paths, there is no concurrency and no barrier to
+  serialize the reuse. A debug assert in the separate-region branch guards this
+  invariant. Because a same-task tile body now has both a write and a read of the
+  one slot, `getReuseGroupStride` (`WSBuffer.cpp`) counts slot *lifecycles*
+  (writes, falling back to reads), not raw buffer-touching ops, so the counter
+  stride stays `numTiles`.
 - **Both-endpoints-subtiled** (producer subtiled AND consumer subtiled, in
   *different* async tasks — the `DATA_PARTITION_FACTOR=2` epilogue): the
   `numTiles` per-tile allocs of one (producer region, consumer region) pair are
