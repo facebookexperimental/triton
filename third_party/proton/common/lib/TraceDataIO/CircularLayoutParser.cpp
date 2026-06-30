@@ -35,12 +35,14 @@ const CircularLayoutParserConfig &CircularLayoutParser::getConfig() const {
   return static_cast<const CircularLayoutParserConfig &>(config);
 }
 
-void CircularLayoutParser::parseMetadata() {
+bool CircularLayoutParser::parseMetadata() {
   uint32_t preamble = decoder.decode<I32Entry>()->value;
+  if (preamble == 0)
+    return false;
   if (preamble != kPreamble) {
     if (std::getenv("PROTON_DISABLE_PREAMBLE_CHECK")) {
       std::cerr << "Warning: Invalid preamble" << std::endl;
-      return;
+      return false;
     }
     throw PreambleException("Invalid preamble");
   }
@@ -77,6 +79,7 @@ void CircularLayoutParser::parseMetadata() {
     trace.uid = uid;
     trace.count = count;
   }
+  return true;
 }
 
 void CircularLayoutParser::parseProfileEvents() {
@@ -150,8 +153,9 @@ void CircularLayoutParser::parseSegment(
 
 void CircularLayoutParser::parseBlock() {
   try {
-    parseMetadata();
-    parseProfileEvents();
+    if (parseMetadata()) {
+      parseProfileEvents();
+    } // else skip this block since it's not profiled
   } catch (const PreambleException &e) {
     reportException(e, buffer.position());
   }

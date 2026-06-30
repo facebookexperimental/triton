@@ -3,7 +3,7 @@
 Verifies that kernels using TMA-path TensorDescriptors (nvTmaDesc) produce
 correct results when launched via:
   1. C fast cache (c_cache=True) — cache key correctly built
-  2. _TritonDispatcher (TRITON_USE_TRITON_DISPATCHER=1) — nvTmaDesc dispatched
+  2. _TritonDispatcher (TRITON_USE_C_DISPATCHER=1) — nvTmaDesc dispatched
   3. Repeated calls hit cache and still produce correct results
 """
 
@@ -50,7 +50,7 @@ class TestTmaTensorDescCorrectness(TestCase):
     """Verify TMA TensorDescriptor produces correct results via fast cache + dispatcher."""
 
     def setUp(self):
-        patcher = patch.dict(os.environ, {"TRITON_USE_TRITON_DISPATCHER": "1"})
+        patcher = patch.dict(os.environ, {"TRITON_USE_C_DISPATCHER": "1"})
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -171,12 +171,46 @@ class TestTmaTensorDescCorrectness(TestCase):
         expected = src[row_off:row_off + M_BLOCK, col_off:col_off + N_BLOCK]
         torch.testing.assert_close(out, expected)
 
+    def test_padding_modes_oob_fill_correct(self):
+        """Both padding modes produce correct out-of-bounds fill through the
+        converged launch.h encoder (driver.c td_extract_tensordesc now builds
+        the CUtensorMap via triton_construct_tma_desc_cached, which maps
+        recipe.fill_mode -> the CUtensorMapFloatOOBfill). A fully out-of-bounds
+        TMA load returns 0 with padding='zero' and NaN with padding='nan'.
+
+        Note: this exercises fill_mode plumbing/correctness, not the cache-key
+        discrimination on fill — the two padding values specialize separately so
+        they do not share a dispatcher cache slot. The fill_mode cache key in
+        triton_tma_cache_entry_t is kept as defensive parity with the dispatcher's
+        original cached_fill.
+        """
+        device = _get_device()
+        M_BLOCK, N_BLOCK = 8, 32
+        M, N = M_BLOCK * 2, N_BLOCK * 2
+        src = torch.arange(M * N, device=device, dtype=torch.float16).reshape(M, N)
+
+        desc_zero = TensorDescriptor(src, shape=src.shape, strides=src.stride(), block_shape=[M_BLOCK, N_BLOCK],
+                                     padding="zero")
+        desc_nan = TensorDescriptor(src, shape=src.shape, strides=src.stride(), block_shape=[M_BLOCK, N_BLOCK],
+                                    padding="nan")
+
+        out_zero = torch.full((M_BLOCK, N_BLOCK), -1.0, device=device, dtype=torch.float16)
+        out_nan = torch.full((M_BLOCK, N_BLOCK), -1.0, device=device, dtype=torch.float16)
+
+        # row_off == M -> the whole block is out of bounds, so the output is
+        # entirely the fill value.
+        _tma_load_offset_kernel[(1, )](out_zero, desc_zero, M, 0, M, N, M_BLOCK, N_BLOCK)
+        _tma_load_offset_kernel[(1, )](out_nan, desc_nan, M, 0, M, N, M_BLOCK, N_BLOCK)
+
+        torch.testing.assert_close(out_zero, torch.zeros_like(out_zero))
+        self.assertTrue(torch.isnan(out_nan.float()).all().item())
+
 
 class TestTmaCacheKeyDiscrimination(TestCase):
     """Verify the C fast cache correctly distinguishes TMA TensorDescriptor specializations."""
 
     def setUp(self):
-        patcher = patch.dict(os.environ, {"TRITON_USE_TRITON_DISPATCHER": "1"})
+        patcher = patch.dict(os.environ, {"TRITON_USE_C_DISPATCHER": "1"})
         patcher.start()
         self.addCleanup(patcher.stop)
 

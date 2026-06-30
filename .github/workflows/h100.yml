@@ -5,8 +5,8 @@ on:
       - main
   pull_request:
   schedule:
-    # Nightly run at 07:30 UTC.
-    - cron: '30 7 * * *'
+    # Every 6 hours at :30 past (00:30, 06:30, 12:30, 18:30 UTC).
+    - cron: '30 */6 * * *'
 
 jobs:
   h100-meta-triton-test:
@@ -65,7 +65,7 @@ jobs:
           # stable logical bucket identity for this job.
           BUCKET="h100-tritonbench"
           TITLE="[nightly] ${GITHUB_WORKFLOW} / h100-meta-triton-test / ${BUCKET}"
-          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"h100-meta-triton-test","summary":"TritonBench tests failed on H100 (see run log)."}]'
+          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"h100-meta-triton-test","summary":"TritonBench tests failed on H100 (see run log).","repro":""}]'
           echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
 
   h100-tlx-test:
@@ -150,6 +150,7 @@ jobs:
       event_name: ${{ github.event_name }}
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
 
   report-h100-tlx:
     needs: h100-tlx-test
@@ -174,6 +175,34 @@ jobs:
       event_name: ${{ github.event_name }}
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+
+  # ----- Nightly issue reconciliation: close recovered issues (schedule only) -----
+  reconcile-h100-tritonbench:
+    needs: h100-meta-triton-test
+    if: always() && github.event_name == 'schedule' && (needs.h100-meta-triton-test.result == 'success' || needs.h100-meta-triton-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: ${{ github.workflow }}
+      job_name: h100-meta-triton-test
+      failures: ${{ needs.h100-meta-triton-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  reconcile-h100-tlx:
+    needs: h100-tlx-test
+    if: always() && github.event_name == 'schedule' && (needs.h100-tlx-test.result == 'success' || needs.h100-tlx-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: ${{ github.workflow }}
+      job_name: h100-tlx-test
+      failures: ${{ needs.h100-tlx-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}

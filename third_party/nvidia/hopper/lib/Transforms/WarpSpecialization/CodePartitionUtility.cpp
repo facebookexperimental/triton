@@ -222,8 +222,8 @@ void ChannelPost::getDstOps(SmallVector<Operation *> &dsts) {
 }
 
 static bool isTmemProducer(Operation *allocOp, Operation *user) {
-  if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
-    if (mmaOp.getD() == allocOp->getResult(0))
+  if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(user)) {
+    if (mmaOp.getAccumulator() == allocOp->getResult(0))
       return true;
   }
   if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user))
@@ -696,6 +696,85 @@ static bool hasDependencyChain(Channel *A, Channel *B) {
   return false;
 }
 
+bool verifyReuseGroup1(ReuseGroup *group) {
+  // A1 (SMEM circular reuse): the channels share a single multi-buffered
+  // circular buffer and rely on accumCnt staggering, which is only well-defined
+  // when (a) the group is multi-buffered and (b) every producer/consumer of
+  // every logical buffer lives in one common basic block (the loop body).
+  if (group->channels.empty())
+    return false;
+  if (group->channels[0]->getNumBuffers() <= 1) {
+    LDBG("verifyReuseGroup1: group is single-buffered (numCopies <= 1)");
+    return false;
+  }
+  // Subtiled-region groups are not handled as A1 SMEM circular reuse: their
+  // producer/consumer ops legitimately live inside the SubtiledRegionOp
+  // per-tile block (a different basic block than the loop body), and their
+  // synchronization is provided by the subtiled-region lowering (per-tile
+  // barriers) rather than by A1 accumCnt staggering. The single-basic-block
+  // invariant below therefore does not apply, so skip them here instead of
+  // flagging them as ill-formed.
+  for (auto *ch : group->channels) {
+    for (Operation *op : {ch->getSrcOp(), ch->getDstOp()}) {
+      if (op && op->getParentOfType<ttng::SubtiledRegionOp>()) {
+        LDBG("verifyReuseGroup1: channel "
+             << ch->uniqID << " is inside a subtiled region; not an A1 group");
+        return true;
+      }
+    }
+  }
+  Block *commonBlock = nullptr;
+  for (auto *ch : group->channels) {
+    // getSrcOp()/getDstOp() (singular) are safe here: A1 groups are SMEM
+    // channels with a single producer/consumer each.
+    Operation *endpoints[] = {ch->getSrcOp(), ch->getDstOp()};
+    for (auto *op : endpoints) {
+      if (!op) {
+        LDBG("verifyReuseGroup1: channel " << ch->uniqID
+                                           << " missing producer/consumer");
+        return false;
+      }
+      if (!commonBlock) {
+        commonBlock = op->getBlock();
+      } else if (op->getBlock() != commonBlock) {
+        LDBG("verifyReuseGroup1: producer/consumer of channel "
+             << ch->uniqID << " not in the common basic block");
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// For a TMEM reuse group, return true iff the channels' column ranges
+// (`[buffer.offset, buffer.offset + numCols)`) overlap. Overlapping columns
+// mean the channels share the same physical TMEM space and reuse it across
+// time — a real reuse group needing synchronization (e.g. dp/dq, qk/dv).
+// Fully-disjoint columns are spatial packing, materialized by
+// replaceBufferReuse's column slice, and need no cross-channel sync.
+static bool tmemReuseGroupOverlaps(ReuseGroup *group) {
+  struct ColRange {
+    int64_t lo, hi;
+  };
+  SmallVector<ColRange> ranges;
+  for (auto *ch : group->channels) {
+    auto *allocOp = ch->getAllocOp();
+    if (!allocOp)
+      return false;
+    auto memDescType = cast<ttg::MemDescType>(allocOp->getResult(0).getType());
+    int64_t numCols = ttng::getTmemAllocSizes(memDescType).numCols;
+    int64_t off = 0;
+    if (auto a = allocOp->getAttrOfType<IntegerAttr>("buffer.offset"))
+      off = a.getInt();
+    ranges.push_back({off, off + numCols});
+  }
+  for (unsigned i = 0; i < ranges.size(); ++i)
+    for (unsigned j = i + 1; j < ranges.size(); ++j)
+      if (ranges[i].lo < ranges[j].hi && ranges[j].lo < ranges[i].hi)
+        return true;
+  return false;
+}
+
 bool verifyReuseGroup2(ReuseGroup *group) {
   assert(group->channels.size() == 2 &&
          "verifyReuseGroup2 requires exactly 2 channels");
@@ -706,27 +785,41 @@ bool verifyReuseGroup2(ReuseGroup *group) {
   if (chA->getNumBuffers() != 1 || chB->getNumBuffers() != 1)
     return false;
 
+  // TMEM real reuse requires BOTH:
+  //  (1) overlapping columns — the two channels occupy the same physical TMEM
+  //      space (disjoint columns are A4 spatial packing, handled by
+  //      replaceBufferReuse with no cross-channel sync), AND
+  //  (2) a consumer->producer dependency chain in either direction — proof the
+  //      two are temporally ordered (a real reuse), not concurrently live.
+  // Overlap alone would trust the planner's non-concurrency guarantee without
+  // verifying it; the chain confirms the reuse is real and gives
+  // `orderReuseGroup2` a reliable early/late ordering (rather than guessing via
+  // program order). This mirrors the SMEM path below.
+  if (chA->channelKind == DataChannelKind::TMEMPost &&
+      chB->channelKind == DataChannelKind::TMEMPost) {
+    if (!tmemReuseGroupOverlaps(group)) {
+      LDBG("verifyReuseGroup2: TMEM channels "
+           << chA->uniqID << "/" << chB->uniqID
+           << " disjoint columns (spatial packing, not a sync reuse group)");
+      return false;
+    }
+    bool chain = hasDependencyChain(chA, chB) || hasDependencyChain(chB, chA);
+    LDBG("verifyReuseGroup2: TMEM channels "
+         << chA->uniqID << "/" << chB->uniqID << " overlap=1 chain=" << chain);
+    return chain;
+  }
+
+  // SMEM (and other) real reuse: a consumer->producer dependency chain in
+  // either direction (e.g. qk/pp). The SMEM epilogue-subtile case (producers
+  // in the same block, no chain) is NOT handled here — it is the N-buffer
+  // path (verifyReuseGroupN).
   bool hasAtoB = hasDependencyChain(chA, chB);
   bool hasBtoA = hasDependencyChain(chB, chA);
   LDBG("verifyReuseGroup2: channel " << chA->uniqID << " -> channel "
                                      << chB->uniqID << ": " << hasAtoB);
   LDBG("verifyReuseGroup2: channel " << chB->uniqID << " -> channel "
                                      << chA->uniqID << ": " << hasBtoA);
-  if (!hasAtoB && !hasBtoA) {
-    // Fallback: check if producers are ordered in program order within
-    // the same block. Covers epilogue subtile stores that share a buffer
-    // but have producer/consumer in different partitions.
-    auto *srcA = chA->getSrcOp();
-    auto *srcB = chB->getSrcOp();
-    if (srcA && srcB && srcA->getBlock() == srcB->getBlock() &&
-        (appearsBefore(srcA, srcB) || appearsBefore(srcB, srcA))) {
-      LDBG("verifyReuseGroup2: fallback accepted, producers in same block");
-      return true;
-    }
-    LDBG("verifyReuseGroup2: no dependency chain between channels");
-    return false;
-  }
-  return true;
+  return hasAtoB || hasBtoA;
 }
 
 std::pair<Channel *, Channel *> orderReuseGroup2(ReuseGroup *group) {
@@ -740,10 +833,57 @@ std::pair<Channel *, Channel *> orderReuseGroup2(ReuseGroup *group) {
     return {chA, chB};
   if (hasDependencyChain(chB, chA))
     return {chB, chA};
-  // Fallback: order by producer program order.
-  if (appearsBefore(chA->getSrcOp(), chB->getSrcOp()))
-    return {chA, chB};
-  return {chB, chA};
+  // Unreachable for a verified group: verifyReuseGroup2 now requires a
+  // dependency chain in one direction (both for SMEM and overlapping TMEM), so
+  // a group reaching here is an overlapping-but-unordered (concurrently
+  // aliased) pair — a memory-planner contract violation that would otherwise
+  // yield a guessed (possibly wrong) barrier direction. Fail loudly instead.
+  llvm::report_fatal_error(
+      "orderReuseGroup2: reuse group has no dependency chain in either "
+      "direction (overlapping but temporally unordered reuse pair)");
+}
+
+SmallVector<Channel *> orderReuseGroupChain(ReuseGroup *group) {
+  // Topologically order the group's channels into one dependency chain:
+  // channel i's consumer reaches channel i+1's producer (via SSA use-def or
+  // same-block program order — both captured by hasDependencyChain). This
+  // generalizes orderReuseGroup2 to N channels and, unlike the A3 same-block
+  // sort, works across partitions (e.g. FA-bwd {dpT,dsT,dq}: dpT->dsT by SSA,
+  // dsT->dq by gemm-partition op order). Returns the ordered channels, or an
+  // empty vector when no unique total chain order exists (caller falls back).
+  unsigned n = group->channels.size();
+  SmallVector<Channel *> chans(group->channels.begin(), group->channels.end());
+  SmallVector<SmallVector<bool>> edge(n, SmallVector<bool>(n, false));
+  SmallVector<unsigned> indeg(n, 0);
+  for (unsigned i = 0; i < n; ++i)
+    for (unsigned j = 0; j < n; ++j)
+      if (i != j && hasDependencyChain(chans[i], chans[j])) {
+        edge[i][j] = true;
+        ++indeg[j];
+      }
+  // Kahn's algorithm requiring a unique zero-in-degree node at each step, so
+  // the chain order is unambiguous (true for a real reuse cycle like
+  // dpT->dsT->dq).
+  SmallVector<Channel *> ordered;
+  SmallVector<bool> used(n, false);
+  for (unsigned step = 0; step < n; ++step) {
+    int pick = -1;
+    for (unsigned i = 0; i < n; ++i) {
+      if (used[i] || indeg[i] != 0)
+        continue;
+      if (pick != -1)
+        return {}; // ambiguous: more than one head this step
+      pick = static_cast<int>(i);
+    }
+    if (pick == -1)
+      return {}; // cycle among edges: no total order
+    used[pick] = true;
+    ordered.push_back(chans[pick]);
+    for (unsigned j = 0; j < n; ++j)
+      if (edge[pick][j] && indeg[j] > 0)
+        --indeg[j];
+  }
+  return ordered;
 }
 
 bool verifyReuseGroupN(ReuseGroup *group) {
@@ -752,9 +892,16 @@ bool verifyReuseGroupN(ReuseGroup *group) {
          << group->channels.size());
     return false;
   }
-  // All channels must have single-copy buffers and producers in the same block.
+  // The N-buffer (epilogue subtile) path is SMEM-only: it shares one circular
+  // SMEM buffer across N sub-tile stores. TMEM reuse is handled by
+  // verifyReuseGroup2 (overlap) + replaceBufferReuse (column packing).
+  // All channels must be SMEM, single-copy, with producers in the same block.
   Block *commonBlock = nullptr;
   for (auto *ch : group->channels) {
+    if (ch->channelKind != DataChannelKind::SMEMPost) {
+      LDBG("verifyReuseGroupN: channel " << ch->uniqID << " is not SMEM");
+      return false;
+    }
     if (ch->getNumBuffers() != 1) {
       LDBG("verifyReuseGroupN: channel " << ch->uniqID
                                          << " has numBuffers != 1");
@@ -851,6 +998,37 @@ bool isWholeAllocationOverwriteReuseOwner(Channel *ownerCh) {
   // (set in createChannelPost when the MMA's useAccumulator is const-false).
   auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ownerCh);
   return tmemCh->isOperandDNoAcc;
+}
+
+bool verifyReuseGroupCrossPartition(ReuseGroup *group) {
+  // Cross-partition reuse: a single-copy reuse group of >= 3 channels whose
+  // PRODUCERS span more than one partition (async_task_id) AND that admit a
+  // unique total dependency-chain order (channel i's consumer reaches channel
+  // i+1's producer). Such a group cannot be handled by the same-block A3 path:
+  // its channels share one block at this stage (partitions are still
+  // async_task_id tags pre-specialization, so a block-based test would always
+  // see "one block"), but the cross-partition writers need explicit reuse
+  // barriers — a same-partition program-order elision is unsound for them.
+  //
+  // Realized case: FA-bwd `_BWD_DOT_ATTRS_TMEM` {dpT, dsT, dq} on one
+  // buffer.id: dpT (gemm) -> dsT (computation tmem_store) -> dq (gemm). The
+  // computation writer dsT needs a cross-iteration WAR against dq, which the A3
+  // single-wrap omits (it raced across the persistent outer loop).
+  if (group->channels.size() <= 2)
+    return false;
+  for (auto *ch : group->channels) {
+    if (ch->getNumBuffers() != 1 || !ch->getSrcOp())
+      return false;
+  }
+  // Cross-partition: producers span >= 2 distinct producer task ids. (Detect by
+  // task id, not block — at doCodePartition every channel is in one block.)
+  llvm::DenseSet<int> producerTasks;
+  for (auto *ch : group->channels)
+    producerTasks.insert(ch->relation.first);
+  if (producerTasks.size() < 2)
+    return false; // all producers in one partition -> same-block A3 path
+  // Require a unique total dependency-chain order over the channels.
+  return !orderReuseGroupChain(group).empty();
 }
 
 // Returns the (possibly reuse-group staggered) accumulation count for `ch` at
@@ -1210,7 +1388,7 @@ static std::string getNodeId(Operation *op) {
 /// computation).
 static bool isKeyOp(Operation *op) {
   // GEMM operations
-  if (isa<ttng::TCGen5MMAOp>(op))
+  if (isa<ttng::MMAv5OpInterface>(op))
     return true;
 
   // Load operations
@@ -1302,6 +1480,15 @@ static std::string getKeyOpDescription(Operation *op) {
   auto formatOutput = [](Value val) -> std::string {
     return getShapeStr(val.getType());
   };
+
+  // For scaled GEMM, show operand names/shapes with scale tensors.
+  if (auto mmaOp = dyn_cast<ttng::TCGen5MMAScaledOp>(op)) {
+    ss << opName << " " << formatInput(mmaOp.getA()) << " * "
+       << formatInput(mmaOp.getAScale()) << " @ " << formatInput(mmaOp.getB())
+       << " * " << formatInput(mmaOp.getBScale()) << " -> "
+       << formatInput(mmaOp.getD());
+    return result;
+  }
 
   // For GEMM, show operand names/shapes: A @ B -> D
   if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(op)) {
@@ -1521,7 +1708,15 @@ static std::string getKeyOpLabel(Operation *op) {
   };
 
   // Build the label based on operation type
-  if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(op)) {
+  if (auto mmaOp = dyn_cast<ttng::TCGen5MMAScaledOp>(op)) {
+    // Scaled GEMM: D = mma_scaled(A, AScale, B, BScale)
+    std::string aName = getValueDisplayName(mmaOp.getA());
+    std::string aScaleName = getValueDisplayName(mmaOp.getAScale());
+    std::string bName = getValueDisplayName(mmaOp.getB());
+    std::string bScaleName = getValueDisplayName(mmaOp.getBScale());
+    label += outputName + " = " + opName + "(" + aName + ", " + aScaleName +
+             ", " + bName + ", " + bScaleName + ")";
+  } else if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(op)) {
     // GEMM: D = mma(A, B)
     std::string aName = getValueDisplayName(mmaOp.getA());
     std::string bName = getValueDisplayName(mmaOp.getB());
@@ -2333,7 +2528,7 @@ void dumpSmemBufferLiveness(
 }
 ///
 /// This function creates producer-consumer channels for a TMEM allocation that
-/// is used as the accumulator (operand D) of a TCGen5MMA operation. The
+/// is used as the accumulator (operand D) of an MMAv5 operation. The
 /// accumulator follows a read-modify-write pattern where:
 ///   1. A producer writes to the TMEM (either a tmem_store or an MMA)
 ///   2. The MMA reads the accumulator, performs computation, and writes back
@@ -2352,7 +2547,7 @@ void dumpSmemBufferLiveness(
 /// @param channels Output vector to collect the created channels
 /// @return success() if channels were created successfully, failure() otherwise
 static LogicalResult
-handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
+handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
                SmallVector<std::unique_ptr<Channel>> &channels) {
   SmallVector<Operation *> consumers;
   SmallVector<Operation *> producers;
@@ -2382,13 +2577,12 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
   }
   auto forOp = mmaOp->getParentOfType<scf::ForOp>();
   if (!forOp) {
-    return mmaOp.emitError(
+    return mmaOp->emitError(
         "handleOperandD: MMA operation is not inside a scf.for loop");
   }
   // Track multiple producers when channels are skipped (same task IDs).
   // All producers in the vector must share the exact same task IDs.
   SmallVector<Operation *> currentProds;
-  auto ctx = forOp.getContext();
   SmallVector<int> channelsToBeUpdate;
 
   // Track the first producer and last consumer across the entire TMEM lifecycle
@@ -2407,8 +2601,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
   // channel (init_store -> load) — which silently drops the back-edge and
   // leaves the in-body load unsynchronized with the previous iteration's
   // MMA commit. See OperandDChannelLoopFix.md for the full analysis.
-  bool hasBodyChannelLoop = false;
-  {
+  bool hasBodyChannelLoop = [&]() {
     Operation *firstInBodyLoad = nullptr;
     Operation *firstInBodyStoreOrMma = nullptr;
     for (Operation &op : forOp.getBody()->without_terminator()) {
@@ -2418,16 +2611,15 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
         if (!firstInBodyLoad)
           firstInBodyLoad = &op;
       } else if (isa<ttng::TMEMStoreOp>(&op) ||
-                 (isa<ttng::TCGen5MMAOp>(&op) && &op == mmaOp.getOperation())) {
+                 (isa<ttng::MMAv5OpInterface>(&op) &&
+                  &op == mmaOp.getOperation())) {
         if (!firstInBodyStoreOrMma)
           firstInBodyStoreOrMma = &op;
       }
     }
-    if (firstInBodyLoad && firstInBodyStoreOrMma &&
-        firstInBodyLoad->isBeforeInBlock(firstInBodyStoreOrMma)) {
-      hasBodyChannelLoop = true;
-    }
-  }
+    return firstInBodyLoad && firstInBodyStoreOrMma &&
+           firstInBodyLoad->isBeforeInBlock(firstInBodyStoreOrMma);
+  }();
 
   // Check for producers outside the loop body (e.g., tmem_store before the
   // loop that initializes the accumulator). These producers dominate the
@@ -2469,7 +2661,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
     if (!users.count(&op))
       continue;
     handledUsers.insert(&op);
-    if (auto mmaOpT = dyn_cast<ttng::TCGen5MMAOp>(&op)) {
+    if (auto mmaOpT = dyn_cast<ttng::MMAv5OpInterface>(&op)) {
       if (&op == mmaOp.getOperation()) {
         // This uses and defines D. Will be both producer and consumer.
         // If useAcc is false, the MMA doesn't read the accumulator - it
@@ -2509,7 +2701,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
           }
         }
         if (currentProds.empty()) {
-          mmaOp.emitError(
+          mmaOp->emitError(
               "handleOperandD: no producer found for MMA operand D. "
               "Expected a tmem_store before the loop or use_acc=false.");
           return failure();
@@ -2518,7 +2710,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
         auto producerTaskIds = getAsyncTaskIds(currentProds.front());
         auto consumerIds = getAsyncTaskIds(&op);
         if (producerTaskIds.size() != 1) {
-          mmaOp.emitError(
+          mmaOp->emitError(
               "handleOperandD: expected exactly one producer task ID, got ")
               << producerTaskIds.size();
           return failure();
@@ -2538,21 +2730,21 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
           currentProds.push_back(&op);
         }
       } else {
-        if (mmaOpT.getD() == tmemAllocOp.getResult()) {
-          mmaOp.emitError(
+        if (mmaOpT.getAccumulator() == tmemAllocOp.getResult()) {
+          mmaOp->emitError(
               "handleOperandD: unexpected MMA using same TMEM as operand D");
           return failure();
         }
         // This uses tmem. mark as tmem.end = channel_id
         if (currentProds.empty()) {
-          mmaOpT.emitError(
+          mmaOpT->emitError(
               "handleOperandD: no producer found for MMA consumer");
           return failure();
         }
         // Start a channel from currentProds to op
         auto producerTaskIds = getAsyncTaskIds(currentProds.front());
         if (producerTaskIds.size() != 1) {
-          mmaOpT.emitError(
+          mmaOpT->emitError(
               "handleOperandD: expected exactly one producer task ID, got ")
               << producerTaskIds.size();
           return failure();
@@ -2619,7 +2811,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
   for (auto idx : channelsToBeUpdate) {
     if (currentProds.empty()) {
       // This can happen if ForOp never produces - should not occur in valid IR
-      return mmaOp.emitError(
+      return mmaOp->emitError(
           "handleOperandD: no producer found for deferred channel update");
     }
     // For deferred channels, we only have one channel per consumer, so use
@@ -2762,11 +2954,11 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
   bool isOperandDNoAcc = false;
   if (auto tmemAllocOp = dyn_cast<ttng::TMEMAllocOp>(allocOp)) {
     bool isOperandD = false;
-    ttng::TCGen5MMAOp mmaOp;
+    ttng::MMAv5OpInterface mmaOp;
     // Go through users of the first result (i.e exclude token).
     for (auto user : tmemAllocOp.getResult().getUsers()) {
-      if (auto mmaOpT = dyn_cast<ttng::TCGen5MMAOp>(user)) {
-        if (mmaOpT.getD() == allocOp->getResult(0)) {
+      if (auto mmaOpT = dyn_cast<ttng::MMAv5OpInterface>(user)) {
+        if (mmaOpT.getAccumulator() == allocOp->getResult(0)) {
           if (!isConstFalse(mmaOpT.useAccumulator())) {
             mmaOp = mmaOpT;
             isOperandD = true;
@@ -2815,9 +3007,9 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
     assert(isa<ttg::LocalAllocOp>(allocOp));
     auto localAlloc = cast<ttg::LocalAllocOp>(allocOp);
     for (auto user : allocOp->getUsers()) {
-      if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
+      if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(user)) {
         // Alloc associated with operand D can have multiple producers.
-        assert(mmaOp.getD() != allocOp->getResult(0));
+        assert(mmaOp.getAccumulator() != allocOp->getResult(0));
         consumers.push_back(user);
       } else if (isa<ttg::LocalStoreOp>(user)) {
         assert(producerOp == nullptr);

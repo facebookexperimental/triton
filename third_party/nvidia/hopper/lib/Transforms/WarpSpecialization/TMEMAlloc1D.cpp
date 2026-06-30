@@ -319,24 +319,21 @@ ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
   unsigned colStride = 32 / elemBitWidth;
   // TODO(njriasan): Do we need to handle the ScaleDotElemType::E2M1 && transA
   // case at all from TCGen5MMAScaledOp::getBlockM?
-  size_t CTASplitM;
-  size_t CTASplitN;
+  ttg::CGAEncodingAttr cgaLayout;
   bool twoCTAs = false;
-  if (auto ttgLayout = mlir::dyn_cast<ttg::LayoutEncodingTrait>(encoding)) {
-    auto ctaLayoutAttr = ttg::getCGALayout(encoding);
-    CTASplitM = ctaLayoutAttr.getCTASplitNum()[0];
-    CTASplitN = ctaLayoutAttr.getCTASplitNum()[1];
-  } else if (auto tmemLayout =
-                 mlir::dyn_cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
-                     encoding)) {
-    CTASplitM = tmemLayout.getCTASplitM();
-    CTASplitN = tmemLayout.getCTASplitN();
+  if (auto tmemLayout =
+          mlir::dyn_cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
+              encoding)) {
+    cgaLayout = tmemLayout.getCGALayout();
     twoCTAs = tmemLayout.getTwoCTAs();
+  } else if (auto ttgLayout =
+                 mlir::dyn_cast<ttg::LayoutEncodingTrait>(encoding)) {
+    cgaLayout = ttg::getCGALayout(encoding);
   } else {
     assert(false && "Unsupported encoding");
   }
   auto outputEncoding = ttng::TensorMemoryEncodingAttr::get(
-      context, blockM, blockN, colStride, CTASplitM, CTASplitN, twoCTAs,
+      context, blockM, blockN, colStride, cgaLayout, twoCTAs,
       ttng::TensorMemoryCTAMode::DEFAULT);
   if (highShape > 0) {
     llvm::SmallVector<int64_t> shapeVec{highShape, blockM, blockN};

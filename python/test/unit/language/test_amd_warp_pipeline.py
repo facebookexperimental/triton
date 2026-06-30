@@ -6,11 +6,7 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-
-
-def is_hip():
-    return triton.runtime.driver.active.get_current_target().backend == "hip"
-
+from triton._internal_testing import is_hip
 
 # --- Runtime test: simple GEMM with warp pipeline ---
 
