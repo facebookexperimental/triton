@@ -1,5 +1,6 @@
 add_triton_library(TritonNvidiaGPUTransforms
   CheckMatmulTwoCTAs.cpp
+  ConSanNVIDIA.cpp
   FenceInsertion.cpp
   GenerateSubtiledRegion.cpp
   InterleaveTMem.cpp
@@ -24,5 +25,7 @@ add_triton_library(TritonNvidiaGPUTransforms
   TritonGPUIR
   TritonGPUTransforms
   TritonNvidiaGPUIR
+  TritonInstrumentTransforms
+  TritonInstrumentIR
   MLIRTransformUtils
 )
