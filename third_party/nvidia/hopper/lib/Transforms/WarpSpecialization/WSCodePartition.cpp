@@ -2295,6 +2295,15 @@ DenseMap<Channel *, Value> createBufferPost(
         } else if (innerFor) {
           getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
                                bufferIdx, _phase, config, reuseGrp, channel);
+        } else if (user->getParentOfType<scf::WhileOp>()) {
+          // OperandD user directly in a persistent scf.while after region
+          // (e.g. the gemm's peeled k=0 MMA or the epilogue's tmem_load).
+          // These must rotate with the while-carried accumulator counter so
+          // the writer and reader agree on the buffer slot across persistent
+          // iterations. getAccumCount resolves `user` to the while's
+          // accumulator accumCnt.
+          getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
+                               bufferIdx, _phase, config, reuseGrp, channel);
         } else {
           std::tie(bufferIdx, _phase) = getBufferIdxAndPhaseForOutsideLoopOps(
               builder, user, channel, oldAllocOp, numBuffers,
@@ -2336,6 +2345,12 @@ DenseMap<Channel *, Value> createBufferPost(
           getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
                                bufferIdx, _phase, config, reuseGrp, channel);
         }
+      } else if (user->getParentOfType<scf::WhileOp>()) {
+        // Channel user directly in a persistent scf.while after region: rotate
+        // with the while-carried accumCnt (getAccumCount resolves `user` to it)
+        // rather than treating it as a truly-outside-loop op.
+        getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
+                             bufferIdx, _phase, config, reuseGrp, channel);
       } else {
         // For operations outside loops (epilogue), compute the
         // correct bufferIdx and phase based on the parent loop's final
@@ -4765,9 +4780,18 @@ void removeRedundantTmemZeroStores(triton::FuncOp &funcOp) {
       // legitimate and must be kept.
       // In persistent BWD FA, the outer persistent loop contains both
       // the zero-store and the inner loop (which contains the MMA).
-      auto zeroStoreParentLoop = zeroStoreOp->getParentOfType<scf::ForOp>();
+      // The persistent outer loop may be an scf.for or, for a static
+      // persistent while-loop kernel, an scf.while (the zero-store lives
+      // directly in the while's after region). Without recognizing the
+      // while case, the redundant zero-store survives and becomes a
+      // cross-partition channel that races the gemm partition across
+      // persistent iterations (a hang).
+      Operation *zeroStoreParentLoop =
+          zeroStoreOp->getParentOfType<scf::ForOp>();
+      if (!zeroStoreParentLoop)
+        zeroStoreParentLoop = zeroStoreOp->getParentOfType<scf::WhileOp>();
       if (zeroStoreParentLoop &&
-          (zeroStoreParentLoop == mmaParentLoop ||
+          (zeroStoreParentLoop == mmaParentLoop.getOperation() ||
            zeroStoreParentLoop->isProperAncestor(mmaParentLoop))) {
         LLVM_DEBUG({
           LDBG("Removing redundant TMEM zero-store for operand D: "
@@ -4778,27 +4802,20 @@ void removeRedundantTmemZeroStores(triton::FuncOp &funcOp) {
     }
   });
   for (auto op : toErase) {
-    // TMEMStoreOp may produce a token result that has downstream uses.
-    // Replace the output token with the input token before erasing.
-    for (unsigned i = 0; i < op.getNumResults(); ++i) {
-      if (!op.getResult(i).use_empty()) {
-        // Find the corresponding input token operand to forward.
-        // TMEMStoreOp signature: (src, dst[token], pred) -> token
-        // The token input is the second operand (getToken()).
-        if (i == 0 && op.getNumOperands() >= 2) {
-          Value inputToken = op.getOperand(1);
-          if (inputToken.getType() == op.getResult(i).getType() &&
-              inputToken != op.getResult(i)) {
-            op.getResult(i).replaceAllUsesWith(inputToken);
-            continue;
-          }
-        }
-        // Cannot safely replace — skip erasing this op.
-        goto next_op;
-      }
+    // The store may produce a token result that downstream ops depend on
+    // (e.g. the inner loop's accumulator iter_arg init is the store's token).
+    // Forward the store's *input* dep token (getDep()) to its result token
+    // (getToken()) so the dependency chain skips the removed store. Using the
+    // dst memdesc operand here instead of the dep token would type-mismatch and
+    // leave the store un-erased (the static-persistent-while hang).
+    Value resultTok = op.getToken();
+    if (resultTok && !resultTok.use_empty()) {
+      Value inputTok = op.getDep();
+      if (!inputTok)
+        continue; // no input token to forward; keep the store
+      resultTok.replaceAllUsesWith(inputTok);
     }
     op.erase();
-  next_op:;
   }
 }
 

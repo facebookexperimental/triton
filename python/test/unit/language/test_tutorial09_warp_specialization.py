@@ -179,6 +179,7 @@ def matmul_kernel_tma_static_persistent_ws_while(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    EPILOGUE_SUBTILE: tl.constexpr,
     NUM_SMS: tl.constexpr,
 ):
     dtype = tl.float16
@@ -203,7 +204,13 @@ def matmul_kernel_tma_static_persistent_ws_while(
             b = b_desc.load([offs_bn, offs_k])
             accumulator = tl.dot(a, b.T, accumulator)
 
-        c_desc.store([offs_am, offs_bn], accumulator.to(dtype))
+        acc_slices = _split_n_2D(accumulator, EPILOGUE_SUBTILE)
+        slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
+        for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
+            c_desc.store(
+                [offs_am, offs_bn + slice_id * slice_size],
+                acc_slices[slice_id].to(dtype),
+            )
         tile_id += NUM_SMS
 
 
@@ -663,7 +670,8 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 # Test 2b: Static persistent matmul with a while-loop outer loop
 # ============================================================================
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
-def test_tutorial09_matmul_tma_static_persistent_while_loop_warp_specialize():
+@pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
+def test_tutorial09_matmul_tma_static_persistent_while_loop_warp_specialize(EPILOGUE_SUBTILE):
     """Test a static persistent matmul whose persistent outer loop is a while loop."""
     M, N, K = 2048, 2048, 256
     BLOCK_SIZE_M = 128
@@ -692,7 +700,7 @@ def test_tutorial09_matmul_tma_static_persistent_while_loop_warp_specialize():
 
         a_desc = TensorDescriptor(A, A.shape, A.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_K])
         b_desc = TensorDescriptor(B, B.shape, B.stride(), [BLOCK_SIZE_N, BLOCK_SIZE_K])
-        c_desc = TensorDescriptor(C, C.shape, C.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_N])
+        c_desc = TensorDescriptor(C, C.shape, C.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_N // EPILOGUE_SUBTILE])
 
         grid = lambda META: (min(
             NUM_SMS,
@@ -710,6 +718,7 @@ def test_tutorial09_matmul_tma_static_persistent_while_loop_warp_specialize():
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             BLOCK_SIZE_K=BLOCK_SIZE_K,
             GROUP_SIZE_M=GROUP_SIZE_M,
+            EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
             NUM_SMS=NUM_SMS,
             num_stages=num_stages,
             num_warps=num_warps,
