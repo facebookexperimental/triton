@@ -889,6 +889,12 @@ class JITFunction(JITCallable, KernelInterface[T]):
                     if _globals_ok:
                         kernel = result
                         if not getattr(kernel, '_dispatcher', None):
+                            if knobs.nvidia.use_triton_dispatcher:
+                                warnings.warn(
+                                    f"[Triton] TRITON_USE_C_DISPATCHER=1 but kernel '{self._fn_name}' has no C "
+                                    f"dispatcher, falling back to Python launch",
+                                    stacklevel=2,
+                                )
                             grid_size = len(_fc_grid) if isinstance(_fc_grid, (tuple, list)) else 1
                             grid_0 = _fc_grid[0] if grid_size > 0 else 1
                             grid_1 = _fc_grid[1] if grid_size > 1 else 1

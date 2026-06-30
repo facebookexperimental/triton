@@ -508,15 +508,6 @@ class CUDABackend(BaseBackend):
         param_entries.append((f"(int)offsetof({buf_t}, _global_scratch)", "(int)sizeof(CUdeviceptr)", 0))
         param_entries.append((f"(int)offsetof({buf_t}, _profile_scratch)", "(int)sizeof(CUdeviceptr)", 0))
         num_params = len(param_entries)
-        # Mirror the fixed cap in launch.h: triton_kernel_launch_desc_t.params is
-        # a triton_param_desc_t[TRITON_MAX_PARAMS] array, so a descriptor with
-        # more entries would overflow the static initializer. Bail out (the
-        # consumer falls back to the variadic launcher) instead of emitting C
-        # that overflows or silently truncates.
-        TRITON_MAX_PARAMS = 256  # keep in sync with launch.h
-        if num_params > TRITON_MAX_PARAMS:
-            return (f"/* Launcher not generated: {num_params} params exceeds "
-                    f"TRITON_MAX_PARAMS ({TRITON_MAX_PARAMS}) */\n")
 
         # ---- Launch function ----
         lines.append("/**")
@@ -545,6 +536,14 @@ class CUDABackend(BaseBackend):
         lines.append("    if (!args) return CUDA_ERROR_INVALID_VALUE;")
         lines.append("")
 
+        # Param table: a separate function-local static const array. desc.params
+        # is a pointer (launch.h ABI v3), so the table lives outside the desc and
+        # there is no static cap on the number of params.
+        lines.append("    static const triton_param_desc_t desc_params[] = {")
+        for off_expr, sz, is_tma in param_entries:
+            lines.append(f"        {{{off_expr}, {sz}, {is_tma}}},")
+        lines.append("    };")
+        lines.append("")
         # Static const descriptor inside function body
         lines.append("    static const triton_kernel_launch_desc_t desc = {")
         lines.append("        .abi_version = TRITON_LAUNCH_DESC_ABI_VERSION,")
@@ -557,10 +556,7 @@ class CUDABackend(BaseBackend):
         lines.append(f"        .cluster_dims = {{{cluster_dims[0]}, {cluster_dims[1]}, {cluster_dims[2]}}},")
         lines.append(f"        .preferred_cluster_dims = {{{preferred[0]}, {preferred[1]}, {preferred[2]}}},")
         lines.append(f"        .num_params = {num_params},")
-        lines.append("        .params = {")
-        for off_expr, sz, is_tma in param_entries:
-            lines.append(f"            {{{off_expr}, {sz}, {is_tma}}},")
-        lines.append("        },")
+        lines.append("        .params = desc_params,")
         lines.append("        .num_tma_recipes = 0,")
         lines.append("        /* tma_recipes zero-initialized by C default */")
         lines.append("    };")

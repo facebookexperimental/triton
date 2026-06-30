@@ -593,7 +593,7 @@ class TritonSemantic(Generic[TensorTy]):
         if end <= start:
             raise ValueError("arange's end argument must be greater than the start argument")
         range = end - start
-        if (range & (range - 1)) != 0:
+        if not knobs.language.allow_npot and (range & (range - 1)) != 0:
             raise ValueError("arange's range must be a power of 2")
         shape = [range]
         if ret_ty is None:

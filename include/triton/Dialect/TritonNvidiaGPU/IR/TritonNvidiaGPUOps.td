@@ -1430,18 +1430,24 @@ def TTNG_SubtiledRegionOp : TTNG_Op<"subtiled_region", [
     /// Returns the new tile block argument.
     BlockArgument addSharedArg(Value value);
 
-    /// Append a new per-tile arg position and add a corresponding tile block
-    /// argument. `valuesPerTile.size()` must equal numTiles; valuesPerTile[t]
-    /// is the value for tile t. The new tile block argument is inserted after
-    /// the existing per-tile args (before shared args / tile index), preserving
-    /// the [perTile.., shared.., tileIdx] ordering. Returns it.
-    BlockArgument addPerTileArg(::llvm::ArrayRef<::mlir::Value> valuesPerTile);
+    /// Erase per-tile arg position `posIdx` (0-based among the K positions):
+    /// removes its numTiles operands and the matching tile block argument,
+    /// preserving the [perTile.., shared.., tileIdx] ordering and the
+    /// [j*numTiles+t] layout of the remaining positions.
+    void removePerTilePosition(unsigned posIdx);
 
     /// Number of per-tile arg positions (K). Each position has numTiles
     /// operands in perTileArgs.
     unsigned getNumPerTilePositions() {
       return getPerTileArgs().size() / getNumTiles();
     }
+
+    /// True if the tile body has the trailing optional i32 tile-index block
+    /// argument (set to `arith.constant t` per tile during lowering).
+    bool hasTileIndex();
+
+    /// Returns the trailing tile-index block argument, or null if absent.
+    ::mlir::BlockArgument getTileIndexArg();
   }];
 
   let hasCustomAssemblyFormat = 1;

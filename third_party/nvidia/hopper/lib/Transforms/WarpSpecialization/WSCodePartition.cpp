@@ -2577,24 +2577,27 @@ desyncMMAv5Op(OpBuilderWithAsyncTaskIds &builder, ttng::MMAv5OpInterface mmaOp,
   return waitOp;
 }
 
-void replaceBufferReuse(triton::FuncOp funcOp,
-                        const DenseMap<Channel *, SmallVector<Channel *>>
-                            &channelsGroupedByConsumers,
-                        const SmallVector<Channel *> &orderedChannels,
-                        ReuseConfig *config) {
-  // Multiple channels can associate with the same alloc.
+void replaceBufferReuse(triton::FuncOp funcOp, ReuseConfig *config) {
+  // Collapse every reuse group: rewrite each non-representative channel's
+  // allocation onto the representative's allocation and erase it. We iterate
+  // config->groups directly -- the source of truth for what must be collapsed
+  // -- rather than the post-merge channel lists. Channels merged into a shared
+  // consumer group during consumer-merging are removed from orderedChannels, so
+  // iterating those lists would skip them and leave their duplicate physical
+  // buffers alive (SMEM OOM, e.g. subtiled-region epilogue staging). Iterating
+  // groups visits every non-representative channel regardless of merge state.
   DenseSet<Operation *> handledAllocs;
-  for (auto *key : orderedChannels) {
-    auto it = channelsGroupedByConsumers.find(key);
-    assert(it != channelsGroupedByConsumers.end());
-    Channel *channel = it->second.front();
-    // For each reuse group, choose a representative channel.
-    int reuseGrp = channelInReuseGroup(channel, config, false /*reuseBarrier*/);
-    if (reuseGrp < 0)
+  for (unsigned reuseGrp = 0; reuseGrp < config->getGroupSize(); ++reuseGrp) {
+    auto *group = config->getGroup(reuseGrp);
+    if (group->channels.size() <= 1)
       continue;
-    // The biggest type should be the representative.
-    auto *repCh = config->getGroup(reuseGrp)->channels[0];
-    if (channel != repCh && channel->getAllocOp() != repCh->getAllocOp()) {
+    // The no-offset / biggest-type channel is the representative; its
+    // allocation is kept and every other channel in the group folds into it.
+    auto *repCh = group->channels[0];
+    for (size_t ci = 1; ci < group->channels.size(); ++ci) {
+      Channel *channel = group->channels[ci];
+      if (channel->getAllocOp() == repCh->getAllocOp())
+        continue;
       if (handledAllocs.count(channel->getAllocOp()))
         continue;
       LLVM_DEBUG({
@@ -3547,33 +3550,102 @@ void insertAsyncComm(
     }
 
     // For SMEM channels whose producer/consumer ops live inside a
-    // SubtiledRegionOp, the barrier slot/phase must vary per tile: all subtiles
-    // share ONE barrier, so each must occupy a distinct generation. Lazily
-    // compute, once per region, a per-tile *flattened accumulation count*
-    // (accumCnt * numTiles + tileIdx) and thread it as a per-tile arg; the
-    // barrier bufferIdx/phase are then derived inside the tile body, forming
-    // one monotonic stream. Returns a null Value when no per-tile mapping
-    // exists (callers fall back to the shared bufferIdx/phase). Keyed by the
-    // SubtiledRegionOp so the producer and consumer regions get independent
-    // counts carrying their own task ids.
-    DenseMap<Operation *, Value> perTileStaggeredArg;
-    DenseSet<Operation *> perTileStaggeredTried;
-    auto getPerTileStaggeredArg = [&](ttng::SubtiledRegionOp sub) -> Value {
+    // SubtiledRegionOp, EVERY SMEM-rotation value (the staging-buffer slot and
+    // the shared barrier's bufferIdx/phase) is computed INSIDE the tile body
+    // from the op's builtin tileIdx block arg, with accumCnt and the
+    // representative multibuffer alloc threaded in as shared args. lowering
+    // replaces tileIdx with `arith.constant t` per tile, so producer-tile-t and
+    // consumer-tile-t independently agree on
+    //   slot = (accumCnt * numTiles + t) % numBuffers
+    // by construction -- no operand matching, which is what made the prior
+    // threaded-count approach permute the producer/consumer mapping and corrupt
+    // data. columnOffset (global TMA N-coord) and the data leaf stay per-tile
+    // operands. Computed once per SubtiledRegionOp (producer and consumer are
+    // distinct ops); the body's SMEM-store dest / TMA-copy source is rewired to
+    // the in-body view here, and the now-dead per-tile buffer positions are
+    // removed after all barriers are emitted (see cleanup below).
+    struct SubtiledSlot {
+      Value bufferIdx;
+      Value phase;
+      bool valid = false;
+    };
+    DenseMap<Operation *, SubtiledSlot> subtiledSlotCache;
+    SmallVector<ttng::SubtiledRegionOp> subtiledRegionsTouched;
+    auto getOrComputeSubtiledSlot =
+        [&](ttng::SubtiledRegionOp sub) -> SubtiledSlot {
       Operation *key = sub.getOperation();
-      if (perTileStaggeredTried.insert(key).second) {
-        Value result;
-        if (reuseGrp >= 0) {
-          SmallVector<Value> staggered;
-          OpBuilderWithAsyncTaskIds idxBuilder(sub.getOperation());
-          if (getPerTileStaggeredAccumCnt(idxBuilder, sub, sub.getOperation(),
-                                          regionsWithChannels, config, reuseGrp,
-                                          config->getGroup(reuseGrp)->channels,
-                                          bufferMap, staggered))
-            result = sub.addPerTileArg(staggered);
+      auto cached = subtiledSlotCache.find(key);
+      if (cached != subtiledSlotCache.end())
+        return cached->second;
+      SubtiledSlot slot;
+      unsigned numBuffers = kv.second.front()->getNumBuffers();
+      Value repAlloc = bufferMap.lookup(masterChannel);
+      // Only multi-buffered subtiled reuse members take the in-body path;
+      // single-task / single-copy / non-reuse cases fall back to a shared
+      // bufferIdx/phase (slot.valid == false).
+      if (reuseGrp >= 0 && numBuffers > 1 && repAlloc) {
+        // accumCnt is created OUTSIDE the region so it dominates `sub`.
+        OpBuilderWithAsyncTaskIds idxB(sub.getOperation());
+        Value accumCnt = getAccumCount(idxB, sub.getOperation(),
+                                       regionsWithChannels, config, reuseGrp);
+        BlockArgument accumArg = sub.addSharedArg(accumCnt);
+        BlockArgument baseArg = sub.addSharedArg(repAlloc);
+        BlockArgument tileIdx = sub.getTileIndexArg();
+        assert(tileIdx && "subtiled region missing builtin tile index");
+        Block &tileBlock = sub.getTileRegion().front();
+        OpBuilderWithAsyncTaskIds b(sub.getOperation());
+        b.setInsertionPointToStart(&tileBlock);
+        b.setAsyncTaskIdsFromOp(sub.getOperation());
+        // In-body ops must NOT carry loop.stage/loop.cluster: the region is
+        // inlined before scheduleLoops.
+        b.clearLoopScheduleInfo();
+        Location loc = sub.getLoc();
+        unsigned nTiles = sub.getNumTiles();
+        Type cntTy = accumArg.getType();
+        auto makeConst = [&](int64_t v) -> Value {
+          if (cntTy.isIndex())
+            return b.createWithAsyncTaskIds<arith::ConstantIndexOp>(loc, v);
+          return b.createWithAsyncTaskIds<arith::ConstantIntOp>(
+              loc, v, cast<IntegerType>(cntTy).getWidth());
+        };
+        // Extend the i32 builtin tileIdx to accumCnt's type before flattening.
+        Value tileIdxExt;
+        if (cntTy.isIndex())
+          tileIdxExt =
+              b.createWithAsyncTaskIds<arith::IndexCastOp>(loc, cntTy, tileIdx);
+        else
+          tileIdxExt =
+              b.createWithAsyncTaskIds<arith::ExtUIOp>(loc, cntTy, tileIdx);
+        // flattened = accumCnt * numTiles + tileIdx (same ordering the data
+        // slot and the barrier must share).
+        Value scaled = b.createWithAsyncTaskIds<arith::MulIOp>(
+            loc, accumArg, makeConst(nTiles));
+        Value flattened =
+            b.createWithAsyncTaskIds<arith::AddIOp>(loc, scaled, tileIdxExt);
+        std::tie(slot.bufferIdx, slot.phase) =
+            getBufferIdxAndPhase(b, loc, flattened, numBuffers);
+        // Build the staging view from the in-body base (IsolatedFromAbove: must
+        // use the block-arg base, never the outer alloc value).
+        Value view = createBufferView(b, baseArg, slot.bufferIdx);
+        // Rewire the body's SMEM-store dest / TMA-copy source (a per-tile block
+        // arg) to the in-body view, leaving its per-tile position dead.
+        auto rewireBufferArg = [&](Value bufOperand) {
+          auto bArg = dyn_cast<BlockArgument>(bufOperand);
+          if (bArg && bArg.getOwner() == &tileBlock &&
+              bArg.getArgNumber() < sub.getNumPerTilePositions())
+            bArg.replaceAllUsesWith(view);
+        };
+        for (Operation &op : tileBlock.without_terminator()) {
+          if (auto st = dyn_cast<ttg::LocalStoreOp>(&op))
+            rewireBufferArg(st.getDst());
+          else if (auto cp = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(&op))
+            rewireBufferArg(cp.getSrc());
         }
-        perTileStaggeredArg[key] = result;
+        slot.valid = true;
+        subtiledRegionsTouched.push_back(sub);
       }
-      return perTileStaggeredArg.lookup(key);
+      subtiledSlotCache[key] = slot;
+      return slot;
     };
 
     // Lower TMA loads and MMAv5 ops first before inserting synchronization
@@ -3888,10 +3960,10 @@ void insertAsyncComm(
           OpBuilderWithAsyncTaskIds tileBuilder(annotTarget);
           tileBuilder.setInsertionPoint(annotTarget);
           Value tileBufIdx, tilePhase;
-          if (Value staggered = getPerTileStaggeredArg(producerSubtiled)) {
-            std::tie(tileBufIdx, tilePhase) = getBufferIdxAndPhase(
-                tileBuilder, annotTarget->getLoc(), staggered,
-                kv.second.front()->getNumBuffers());
+          SubtiledSlot slot = getOrComputeSubtiledSlot(producerSubtiled);
+          if (slot.valid) {
+            tileBufIdx = slot.bufferIdx;
+            tilePhase = slot.phase;
           } else {
             tileBufIdx = producerSubtiled.addSharedArg(bufferIdx);
             tilePhase = producerSubtiled.addSharedArg(phase);
@@ -4099,11 +4171,10 @@ void insertAsyncComm(
           OpBuilderWithAsyncTaskIds tileBuilder(annotTarget);
           tileBuilder.setInsertionPointAfter(annotTarget);
           Value tileBufIdx;
-          if (Value staggered = getPerTileStaggeredArg(commitSubtiled)) {
+          SubtiledSlot slot = getOrComputeSubtiledSlot(commitSubtiled);
+          if (slot.valid) {
             // ProducerCommit only needs the buffer index (it is an arrive).
-            std::tie(tileBufIdx, std::ignore) = getBufferIdxAndPhase(
-                tileBuilder, annotTarget->getLoc(), staggered,
-                kv.second.front()->getNumBuffers());
+            tileBufIdx = slot.bufferIdx;
           } else {
             tileBufIdx = commitSubtiled.addSharedArg(bufferIdx);
           }
@@ -4226,10 +4297,10 @@ void insertAsyncComm(
           OpBuilderWithAsyncTaskIds tileBuilder(insertTarget);
           tileBuilder.setInsertionPoint(insertTarget);
           Value tileBufIdx, tilePhase;
-          if (Value staggered = getPerTileStaggeredArg(subtiled)) {
-            std::tie(tileBufIdx, tilePhase) = getBufferIdxAndPhase(
-                tileBuilder, insertTarget->getLoc(), staggered,
-                kv.second.front()->getNumBuffers());
+          SubtiledSlot slot = getOrComputeSubtiledSlot(subtiled);
+          if (slot.valid) {
+            tileBufIdx = slot.bufferIdx;
+            tilePhase = slot.phase;
           } else {
             tileBufIdx = subtiled.addSharedArg(bufferIdx);
             tilePhase = subtiled.addSharedArg(phase);
@@ -4308,11 +4379,10 @@ void insertAsyncComm(
           OpBuilderWithAsyncTaskIds tileBuilder(insertTarget);
           tileBuilder.setInsertionPointAfter(insertTarget);
           Value tileBufIdx;
-          if (Value staggered = getPerTileStaggeredArg(subtiled)) {
+          SubtiledSlot slot = getOrComputeSubtiledSlot(subtiled);
+          if (slot.valid) {
             // ConsumerRelease only needs the buffer index (it is an arrive).
-            std::tie(tileBufIdx, std::ignore) = getBufferIdxAndPhase(
-                tileBuilder, insertTarget->getLoc(), staggered,
-                kv.second.front()->getNumBuffers());
+            tileBufIdx = slot.bufferIdx;
           } else {
             tileBufIdx = subtiled.addSharedArg(bufferIdx);
           }
@@ -4345,6 +4415,26 @@ void insertAsyncComm(
           }
         }
       }
+    }
+
+    // Remove per-tile buffer positions left dead by the in-body view rewire:
+    // the producer SMEM-store dest, and (in the consumer) both the dead leaf
+    // duplicate and the rewired TMA-copy source. columnOffset / data-leaf
+    // positions stay (still used). Remove descending so earlier indices stay
+    // valid. R1 guard: a missed dead position would keep a reverted
+    // (collapsed-index) staging view live and re-introduce the race.
+    for (ttng::SubtiledRegionOp sub : subtiledRegionsTouched) {
+      Block &tileBlock = sub.getTileRegion().front();
+      SmallVector<unsigned> deadPositions;
+      for (unsigned p = 0, e = sub.getNumPerTilePositions(); p < e; ++p)
+        if (tileBlock.getArgument(p).use_empty())
+          deadPositions.push_back(p);
+      assert(
+          !deadPositions.empty() &&
+          "subtiled reuse region: expected >=1 dead per-tile buffer position "
+          "after in-body view rewire");
+      for (unsigned p : llvm::reverse(deadPositions))
+        sub.removePerTilePosition(p);
     }
 
     // Optimize TMA loads.
@@ -5554,8 +5644,7 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
 
   foldLocalLoads(funcOp);
   cleanupTmemTokens(funcOp);
-  replaceBufferReuse(funcOp, channelsGroupedByConsumers, orderedChannels,
-                     &config);
+  replaceBufferReuse(funcOp, &config);
 
   // Realize allocation.reuseTarget annotations from the memory planner:
   // rewrite TMA staging allocs into memdesc_reinterpret views of their

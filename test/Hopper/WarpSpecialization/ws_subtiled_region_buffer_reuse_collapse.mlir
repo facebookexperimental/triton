@@ -1,15 +1,33 @@
 // RUN: triton-opt %s --nvgpu-warp-specialization="generate-subtiled-region=true num-stages=3 smem-budget=232448" | FileCheck %s
 
-// Test: per-tile barrier index for the SMEM channel that flows through an
-// epilogue ttng.subtiled_region. The N subtiles of a tile share ONE barrier
-// (reuse group), so the barrier slot/phase must be indexed by a *flattened*
-// accumulation count (accumCnt * numTiles + tileIdx) -- one monotonic stream --
-// rather than a single shared index. Without this, every subtile collapses onto
-// the representative's barrier slot/phase and the kernel deadlocks.
+// Test: the N epilogue subtiles that flow through a ttng.subtiled_region form a
+// reuse group and must collapse onto ONE physical SMEM staging allocation.
 //
-// This is a reduced version of test_tutorial09 matmul_kernel_tma_persistent_ws
+// All subtiles feed the SAME subtiled_region consumer, so the reuse-group
+// consumer-merge in doCodePartitionPost fires and removes the non-representative
+// channel from orderedChannels. replaceBufferReuse used to iterate
+// orderedChannels, so it never visited the merged-out channel and left its
+// duplicate physical buffer alive -- doubling epilogue SMEM and causing
+// `OutOfResources: shared memory` at BLOCK_SIZE_M=256 (test_tutorial09
+// matmul_kernel_tma_persistent_ws, generate_subtiled_region=True,
+// EPILOGUE_SUBTILE=2). replaceBufferReuse now iterates the reuse groups
+// directly, so the merged channel is collapsed regardless of merge bookkeeping.
+//
+// This is the same reduced input as ws_subtiled_region_per_tile_barrier.mlir
 // (EPILOGUE_SUBTILE=2 -> numTiles=2), captured just before
-// NVGPUWarpSpecialization.
+// NVGPUWarpSpecialization; here we assert the buffer collapse rather than the
+// barrier indexing.
+
+// CHECK-LABEL: @matmul_kernel_tma_persistent_ws
+//
+// Exactly one shared epilogue staging buffer survives (the reuse-group
+// representative), hoisted to function entry ahead of ttg.warp_specialize.
+// Before the fix there were two, each tagged allocation.shareGroup (the bug).
+// The reuse-group buffers share buffer.id = 2; the first CHECK matches the
+// representative and CHECK-NOT forbids any second shared buffer through EOF (and
+// also fails loudly if warp specialization / buffering did not run at all).
+// CHECK: ttg.local_alloc {allocation.shareGroup = 0 : i32, buffer.copy = 3 : i32, buffer.id = 2 : i32, buffer.tmaStaging = 1 : i32} : () -> !ttg.memdesc<3x128x64xf16, #shared, #smem, mutable>
+// CHECK-NOT: allocation.shareGroup
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
@@ -22,32 +40,6 @@
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.early_tma_store_lowering = true, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
 
-  // CHECK-LABEL: @matmul_kernel_tma_persistent_ws
-  // CHECK: ttg.warp_specialize
-  //
-  // Epilogue producer partition (async_task_id 0): the staging-buffer slot AND
-  // the shared barrier slot are both derived IN-BODY from the per-tile flattened
-  // count flattened = accumCnt * numTiles(2) + tileIdx, taken % numBuffers(3).
-  // The first subtile (tileIdx 0, the +0 folds) flattens to `muli %arg, %c2_i64`;
-  // the resulting %IDX indexes BOTH the 3x128x64 data staging buffer and the
-  // 3x1xi64 barrier (data slot == barrier slot).
-  // CHECK:      %[[FLAT:[0-9]+]] = arith.muli %arg{{[0-9]+}}, %c2_i64 {async_task_id = array<i32: 0>}
-  // CHECK:      %[[DIV:[0-9]+]] = arith.divui %[[FLAT]], %c3_i64 {async_task_id = array<i32: 0>}
-  // CHECK:      %[[MUL:[0-9]+]] = arith.muli %[[DIV]], %c3_i64 {async_task_id = array<i32: 0>}
-  // CHECK:      %[[MOD:[0-9]+]] = arith.subi %[[FLAT]], %[[MUL]] {async_task_id = array<i32: 0>}
-  // CHECK:      %[[IDX:[0-9]+]] = arith.trunci %[[MOD]] {async_task_id = array<i32: 0>} : i64 to i32
-  // CHECK:      ttg.memdesc_index %{{[0-9]+}}[%[[IDX]]] {async_task_id = array<i32: 0>} : !ttg.memdesc<3x128x64xf16
-  // CHECK:      ttng.wait_barrier {{.*}}WSBarrier = {dstTask = 2 : i32}
-  // CHECK:      ttg.local_store
-  // CHECK:      ttng.arrive_barrier {{.*}}WSBarrier = {dstTask = 2 : i32}
-  //
-  // The second subtile (tileIdx 1) flattens to `addi %.., %c1_i64`, giving a
-  // DISTINCT barrier generation -- the property the buggy shared-index version
-  // lacked (it deadlocked).
-  // CHECK:      arith.addi %{{[0-9]+}}, %c1_i64 {async_task_id = array<i32: 0>}
-  // CHECK:      ttng.wait_barrier {{.*}}WSBarrier = {dstTask = 2 : i32}
-  // CHECK:      ttg.local_store
-  // CHECK:      ttng.arrive_barrier {{.*}}WSBarrier = {dstTask = 2 : i32}
   tt.func public @matmul_kernel_tma_persistent_ws(%arg0: !tt.tensordesc<tensor<128x64xf16, #shared>>, %arg1: i32, %arg2: i32, %arg3: i64, %arg4: i64, %arg5: !tt.tensordesc<tensor<128x64xf16, #shared>>, %arg6: i32, %arg7: i32, %arg8: i64, %arg9: i64, %arg10: !tt.tensordesc<tensor<128x64xf16, #shared>>, %arg11: i32, %arg12: i32, %arg13: i64, %arg14: i64, %arg15: i32 {tt.divisibility = 16 : i32}, %arg16: i32 {tt.divisibility = 16 : i32}, %arg17: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     %false = arith.constant false
     %true = arith.constant true
