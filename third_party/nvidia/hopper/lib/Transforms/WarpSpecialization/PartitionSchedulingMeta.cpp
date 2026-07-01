@@ -2672,15 +2672,27 @@ void PartitionSchedulingMeta::runOnOperation() {
       // the wait itself wasn't categorized or propagated. Copy the partition
       // from the token's defining op.
       loop.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
-        if (hasPartition(waitOp))
-          return;
         Value token = waitOp.getToken();
-        if (auto *defOp = token.getDefiningOp()) {
-          if (hasPartition(defOp)) {
-            auto ids = getPartitionIds(defOp);
-            setPartition(waitOp, ids);
-          }
-        }
+        auto *defOp = token.getDefiningOp();
+        if (!defOp || !hasPartition(defOp))
+          return;
+        // For an IN-LOOP reduce-staging drain (from `store_reduce="add"`), the
+        // wait must live in the SAME partition as its producer so it gates the
+        // producer's NEXT-iteration store — the per-iteration WAR on the
+        // single-slot TMA-reduce staging buffer. `isEpilogueStoreOp` categorizes
+        // the wait as an epilogue store -> epilogue partition, which is correct
+        // for a POST-loop epilogue store (drains once, after the loop) but wrong
+        // for an in-loop reduce: the wait ends up in a different partition than
+        // the `local_store`/`async_tma_reduce`, so it no longer serializes the
+        // single slot -> torn `store_reduce` -> wrong, non-deterministic result
+        // (HSTU cross-attn dq; T277922819). Override to the producer partition
+        // specifically when the token comes from an AsyncTMAReduceOp. Leave the
+        // plain-store / already-partitioned epilogue waits (which the post-loop
+        // path — e.g. FA bwd — relies on) unchanged.
+        bool fromReduce = isa<ttng::AsyncTMAReduceOp>(defOp);
+        if (hasPartition(waitOp) && !fromReduce)
+          return;
+        setPartition(waitOp, getPartitionIds(defOp));
       });
 
       currentPhase = "optimize";
