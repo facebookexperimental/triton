@@ -34,7 +34,11 @@ def NVGPUWarpSpecialization : Pass<"nvgpu-warp-specialization", "mlir::ModuleOp"
              "SMEM budget in bytes (0 = auto-detect from target)">,
     Option<"generateSubtiledRegion", "generate-subtiled-region",
              "bool", /*default*/"false",
-             "Generate SubtiledRegionOp from epilogue split patterns">
+             "Generate SubtiledRegionOp from epilogue split patterns">,
+    Option<"tilePrefetchDepth", "tile-prefetch-depth",
+             "int32_t", /*default*/"1",
+             "Number of buffers for the dynamic-persistent tile-id broadcast "
+             "channel (cross-partition run-once atomic support)">
     ];
 }
 
