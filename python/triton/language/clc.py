@@ -17,38 +17,17 @@ high-level ``ttng.clc_advance`` op. The response buffer, mbarrier, phase, and th
 issue/wait overlap are ALL handled by a later compiler lowering pass -- the kernel
 author writes none of that plumbing. The API is standalone (it does not require
 warp specialization).
+
+``ClcTileScheduler`` now lives in ``triton.language.schedule`` as one of the
+unified tile schedulers (all share the ``is_valid`` / ``tile_id`` / ``advance``
+API); it is re-exported here, and ``clc_tile_scheduler`` remains as the
+convenience factory.
 """
 import triton.language.core as tl
 from triton.language.core import builtin
+from triton.language.schedule import ClcTileScheduler
 
 __all__ = ["clc_tile_scheduler", "ClcTileScheduler"]
-
-
-@tl._aggregate
-class ClcTileScheduler:
-    # Decoded current tile: validity + (x, y, z) program-id coordinates.
-    _valid: tl.tensor
-    _x: tl.tensor
-    _y: tl.tensor
-    _z: tl.tensor
-
-    @builtin
-    def is_valid(self, _semantic=None):
-        """Whether the current tile holds real work. Use as the ``while`` condition."""
-        return self._valid
-
-    @builtin
-    def advance(self, _semantic=None):
-        """Fetch the next tile and return the updated scheduler."""
-        is_valid, x, y, z = _semantic.builder.create_clc_advance()
-        return ClcTileScheduler(tl.tensor(is_valid, tl.int1), tl.tensor(x, tl.int32), tl.tensor(y, tl.int32),
-                                tl.tensor(z, tl.int32))
-
-
-# `@_aggregate` only transfers methods (not properties) onto the value class, so
-# attach the `tile_id` accessor property here. Returns a 3-tuple; index it as
-# `tile_id[0|1|2]`.
-ClcTileScheduler.tile_id = property(lambda self: tl.tuple([self._x, self._y, self._z]))
 
 
 @builtin
