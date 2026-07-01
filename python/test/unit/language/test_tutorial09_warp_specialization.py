@@ -1147,7 +1147,13 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(EPI
         )
 
         ttgir = kernel.asm["ttgir"]
-        assert "scf.while" in ttgir, "Expected persistent outer loop to lower to scf.while"
+        if SCHEDULE is tl.NonPersistentScheduler:
+            # The non-persistent schedule's outer loop provably runs exactly once
+            # (`_valid` flips True->False), so triton-simplify-single-trip-while
+            # optimizes the `scf.while` away at the TTIR stage.
+            assert "scf.while" not in ttgir, "Expected single-trip outer while to be optimized away"
+        else:
+            assert "scf.while" in ttgir, "Expected persistent outer loop to lower to scf.while"
         assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
         assert ("ttng.tc_gen5_mma" in ttgir or "ttng.warp_group_dot" in ttgir), "Expected an MMA instruction"
         assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
