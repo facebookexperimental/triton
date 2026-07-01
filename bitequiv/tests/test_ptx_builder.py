@@ -57,10 +57,14 @@ def test_fma_sorts_multiply_pair_but_addend_is_positional():
     assert fab.sig() != fca.sig()  # a*b+c != c*a+b
 
 
-def test_modifiers_are_signature_significant():
+def test_rn_normalized_other_modifiers_significant():
     x, y = Leaf("x"), Leaf("y")
-    assert FpOp("add", (".rn", ".f32"), (x, y)).sig() != FpOp("add", (".f32", ), (x, y)).sig()
+    # .rn is the DEFAULT rounding for add/mul/fma (op.f32 == op.rn.f32 bit-for-bit), so it is
+    # normalized away -- this is what lets enable_fp_fusion's implicit-vs-explicit-.rn variants
+    # merge. Every OTHER modifier changes the bits and stays significant.
+    assert FpOp("add", (".rn", ".f32"), (x, y)).sig() == FpOp("add", (".f32", ), (x, y)).sig()
     assert FpOp("add", (".ftz", ".f32"), (x, y)).sig() != FpOp("add", (".f32", ), (x, y)).sig()
+    assert FpOp("add", (".rz", ".f32"), (x, y)).sig() != FpOp("add", (".f32", ), (x, y)).sig()
 
 
 def test_shfl_offset_sequence_is_positional():

@@ -48,13 +48,37 @@ different launch geometries or un-modeled accumulations never collapse to an emp
 contract/reorder. PTX is the practical check, not absolute ground truth (SASS via
 ``cuobjdump`` would be); ``--fmad=false`` pins the fusion decision. See ``design-doc.md``.
 """
-from pyptx.ir.nodes import Function
+from pyptx.ir.nodes import Function, ImmediateOperand, RegisterOperand
 from pyptx.parser import parse
 from pyptx.parser.parser import ParseError
 
 from bitequiv.ptx.affine import reqntid_of
 from bitequiv.ptx.builder import entry_signatures
 from bitequiv.ptx.linker import linearize
+
+
+def _loop_steps(func):
+    """Sorted multiset of loop-induction SELF-INCREMENT constants: every ``add R, R, IMM``
+    where dst==src0 is a loop counter stepped by a compile-time constant (for a chunked
+    reduction this is exactly BLOCK_N — the cross-chunk column stride). This is a LAYOUT-/
+    num_warps-INVARIANT, BLOCK_N-FAITHFUL fence: the reconstruction cannot follow the loop
+    back-edge, so a collapsed per-chunk reduction loses the chunk SIZE; folding the loop step
+    into the entry signature restores it. Adding it can only SPLIT classes further (it is extra
+    distinguishing info), so it is monotonically sound — it never causes an over-merge."""
+    steps = []
+    for inst in linearize(func):
+        if inst.opcode == "add" and len(inst.operands) == 3:
+            d, a, b = inst.operands
+            if (isinstance(d, RegisterOperand) and isinstance(a, RegisterOperand) and d.name == a.name
+                    and isinstance(b, ImmediateOperand)):
+                try:
+                    v = int(b.text, 0)
+                except (ValueError, TypeError):
+                    continue
+                if v != 0:
+                    steps.append(v)
+    return tuple(sorted(steps))
+
 
 # Tensor-core opcodes that accumulate without a tree this engine models; an entry carrying
 # one gets a conservative fingerprint so it never matches on an empty signature (mirrors the
@@ -107,11 +131,21 @@ def _mma_guard(func):
 
 
 def _entry_signature(func):
-    """Full canonical signature string for one ``.entry``: launch geometry + the
-    reconstructed reduction tree(s) + the MMA guard."""
-    ntid = reqntid_of(func)
-    parts = ["ntid=" + (",".join(f"{k}{v}" for k, v in sorted(ntid.items())) if ntid else "?")]
-    parts.extend(entry_signatures(func))  # one per result store; sorted, canonical
+    """Full canonical signature string for one ``.entry``: the reconstructed reduction tree(s)
+    + the MMA guard. NOTE: ``ntid`` (launch geometry = 32*num_warps) is deliberately NOT
+    included when there is a real reconstructed reduction, because num_warps is exactly the
+    layout dimension we want to be invariant to — the reduction tree signature (with balanced
+    reductions collapsed to a layout-invariant form) already captures everything bit-relevant.
+    ntid is kept ONLY as the empty-signature guard (no reduction reconstructed), so different
+    geometries cannot collapse to an empty match."""
+    sigs = list(entry_signatures(func))  # one per result store; sorted, canonical
+    parts = list(sigs)
+    if not sigs:
+        ntid = reqntid_of(func)
+        parts.append("ntid=" + (",".join(f"{k}{v}" for k, v in sorted(ntid.items())) if ntid else "?"))
+    steps = _loop_steps(func)  # BLOCK_N fence for chunked/looped reductions (monotonically sound)
+    if steps:
+        parts.append("loops=" + ",".join(map(str, steps)))
     guard = _mma_guard(func)
     if guard:
         parts.append(guard)
