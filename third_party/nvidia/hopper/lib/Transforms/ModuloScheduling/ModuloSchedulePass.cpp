@@ -3504,6 +3504,12 @@ scheduleOneLoop(scf::ForOp loop, const ttg::LatencyModel &model,
       case ttg::HWPipeline::NONE:
         ++nNONE;
         break;
+      // AMD pipelines (not produced by the NV classifier this dump runs under).
+      case ttg::HWPipeline::MFMA:
+      case ttg::HWPipeline::LDS:
+      case ttg::HWPipeline::GLOBAL:
+      case ttg::HWPipeline::VALU:
+        break;
       }
     }
     llvm::dbgs() << "[" << label << "] Pipeline counts: TMA=" << nMEM
@@ -4676,7 +4682,7 @@ struct ModuloSchedulePass
 
   void runOnOperation() override {
     auto moduleOp = getOperation();
-    ttg::LatencyModel model;
+    ttg::NVLatencyModel model;
     triton::ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
 
     // ================================================================
@@ -5099,7 +5105,7 @@ struct ListSchedulePass
 
   void runOnOperation() override {
     auto moduleOp = getOperation();
-    ttg::LatencyModel model;
+    ttg::NVLatencyModel model;
 
     moduleOp.walk([&](scf::ForOp loop) {
       if (loop->hasAttr("tt.modulo_ii"))

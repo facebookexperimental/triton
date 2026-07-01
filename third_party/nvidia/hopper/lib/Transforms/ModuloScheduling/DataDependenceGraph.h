@@ -40,6 +40,12 @@ struct DDGNode {
   bool isSuperNode{false}; // True if this node represents an inner loop
   int innerII{0};          // If super-node, the inner loop's II
   int prologueLatency{0};  // If super-node, cycles before TC starts (MEM busy)
+  // Target-specific accumulator-buffer size (e.g. Blackwell TMEM columns),
+  // precomputed via LatencyModel so the schedulers stay HW-agnostic. 0 = none.
+  // AMDGPU has no separate accumulator memory (MFMA accumulates in VGPRs), so
+  // AMDLatencyModel leaves this 0 — it is NV-only today but kept on the shared
+  // node so the schedulers need no per-backend field.
+  int64_t tmemAllocCols{0};
   llvm::SmallVector<unsigned> succs;
   llvm::SmallVector<unsigned> preds;
 };
