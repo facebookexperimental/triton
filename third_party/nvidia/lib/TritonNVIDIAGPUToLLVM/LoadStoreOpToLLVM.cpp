@@ -1259,7 +1259,9 @@ struct AsyncCopyGlobalToLocalOpConversion
     auto emitCpAsync = [&b, threadPred, ptrTy, hasMask = bool(llMask)](
                            RewriterBase &rewriter, Location loc,
                            ArrayRef<Value> vals, Value shmemAddr, int startIdx,
-                           VectorType vecTy) -> SmallVector<Value> {
+                           VectorType vecTy,
+                           std::optional<Value> ctaId) -> SmallVector<Value> {
+      assert(!ctaId.has_value() && "cp.async does not support cross-cta loads");
       assert(isa<VectorType>(vecTy));
       auto *ctx = rewriter.getContext();
       auto elemTy = vecTy.getElementType();
@@ -1306,13 +1308,11 @@ struct AsyncCopyGlobalToLocalOpConversion
       return emitError(loc,
                        "cp.async does not support non-trivial block dimension");
     }
-    cvt = cvt.sublayout(
-        {str_attr("register"), str_attr("lane"), str_attr("warp")},
-        {str_attr("offset")});
     auto affineOffset = smemObj.getShmemOffset(loc, rewriter, dstTy);
     auto maskSpanAffineOffset = SharedMemoryObject::getMaskSpanOffsets(dstTy);
     auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
-    lowerLdSt(loc, ctx, cvt, vals, resElemTy, smemObj.getBase(),
+    SmallVector<Value> smemBases = {smemObj.getBase()};
+    lowerLdSt(loc, ctx, cvt, vals, resElemTy, smemBases,
               /*paddingShifts=*/{}, affineOffset, maskSpanAffineOffset, laneId,
               warpId, rewriter, targetInfo, maxVec, emitCpAsync);
 

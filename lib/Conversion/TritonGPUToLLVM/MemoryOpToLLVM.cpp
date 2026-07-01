@@ -143,7 +143,7 @@ LogicalResult lowerLocalStore(Location loc, MLIRContext *ctx, Value regVal,
     cvt = regLayout.invertAndCompose(sharedLayout);
   }
   auto kBlock = str_attr("block");
-  // NYI. We would need to emit a map.shared::cluster instruction.
+  // We could support it by removing this check if we ever want to
   if (!cvt.isTrivialOver({kBlock})) {
     return failure();
   }
@@ -288,7 +288,7 @@ public:
       cvt = regLayout.invertAndCompose(sharedLayout);
     }
     auto kBlock = str_attr("block");
-    // NYI. We would need to emit a map.shared::cluster instruction.
+    // We could support it by removing this check if we ever want to
     if (!cvt.isTrivialOver({kBlock})) {
       return failure();
     }
