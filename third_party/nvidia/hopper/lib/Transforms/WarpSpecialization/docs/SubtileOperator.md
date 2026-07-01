@@ -236,6 +236,15 @@ two consumer shapes:
   region pair, gated on the regions being in different tasks). The collapsed
   channel is the sole member of a degenerate size-1 subtiled reuse group (see
   [Reuse Groups](ReuseGroups.md)), so the in-body slot math above is unchanged.
+  This collapse fires for **any `buffer.copy`, including `buffer.copy == 1`** (the
+  DP=1 epilogue): the `numBuffers > 1` reuse-group guards are relaxed for channels
+  flagged `ChannelPost::isCollapsedBothSubtiled` (queried via
+  `channelIsCollapsedBothSubtiled` — the *narrow* predicate, NOT the broad
+  `channelIsSubtiled`, which would also match a consumer-only-subtiled bias load),
+  the in-body math collapses all subtiles onto one physical slot (`bufferIdx == 0`,
+  alternating phase), and the skipped sibling per-tile allocs
+  (`ChannelPost::collapsedSiblingAllocs`) are erased after the rewire. Omitting
+  any of this leaves the sibling staging alloc live → SMEM OOM (bug #13).
   Per-data-partition separation of the shared physical staging buffer is done in
   the memory planner (cross-partition staging split). See bug #11.
 
@@ -256,7 +265,8 @@ hardware `WaitBarrierOp`/`ArriveBarrierOp`.
 | `test/TritonNvidiaGPU/invalid.mlir` | Verifier error cases |
 | `test/Hopper/WarpSpecialization/ws_token_lowering_subtiled_region.mlir` | Token lowering with SubtiledRegionOps inside warp_specialize |
 | `test/Hopper/WarpSpecialization/ws_code_partition_subtiled_region.mlir` | Code partition with SMEM channels between SubtiledRegionOps |
-| `test/Hopper/WarpSpecialization/ws_code_partition_subtiled_region_inbody.mlir` | Both-endpoints-subtiled in-body SMEM rotation (DP=1) |
+| `test/Hopper/WarpSpecialization/ws_code_partition_subtiled_region_inbody.mlir` | Both-endpoints-subtiled in-body SMEM rotation (DP=1, buffer.copy=3) |
+| `test/Hopper/WarpSpecialization/ws_code_partition_subtiled_region_inbody_copy1.mlir` | Both-endpoints-subtiled in-body SMEM rotation (DP=1, buffer.copy=1: single-slot collapse + sibling erase, bug #13) |
 | `test/Hopper/WarpSpecialization/ws_subtiled_region_inside_outside.mlir` | Asymmetric inside→outside (flat consumer) channel |
 | `test/Hopper/WarpSpecialization/ws_subtiled_region_dp2_both_subtiled.mlir` | Both-endpoints-subtiled DP=2: cross-partition staging split + channel collapse |
 | `python/test/unit/language/test_tutorial09_warp_specialization.py` | Blackwell GEMM e2e (parametrized with `generate_subtiled_region`) |

@@ -3452,10 +3452,15 @@ void insertAsyncComm(
       SubtiledSlot slot;
       unsigned numBuffers = kv.second.front()->getNumBuffers();
       Value repAlloc = bufferMap.lookup(masterChannel);
-      // Only multi-buffered subtiled reuse members take the in-body path;
-      // single-task / single-copy / non-reuse cases fall back to a shared
+      // Subtiled reuse members take the in-body path regardless of buffer.copy:
+      // a collapsed both-endpoints-subtiled channel at numBuffers == 1 still
+      // rotates the shared single slot by tile (bufferIdx == 0, phase
+      // alternates) -- the OOM-fixing collapse to one physical staging buffer.
+      // Non-subtiled single-copy / non-reuse cases fall back to a shared
       // bufferIdx/phase (slot.valid == false).
-      if (reuseGrp >= 0 && numBuffers > 1 && repAlloc) {
+      if (reuseGrp >= 0 &&
+          (numBuffers > 1 || channelIsCollapsedBothSubtiled(masterChannel)) &&
+          repAlloc) {
         // accumCnt is created OUTSIDE the region so it dominates `sub`.
         OpBuilderWithAsyncTaskIds idxB(sub.getOperation());
         Value accumCnt = getAccumCount(idxB, sub.getOperation(),
@@ -4285,6 +4290,25 @@ void insertAsyncComm(
         sub.removePerTilePosition(p);
     }
 
+    // Erase the collapsed both-endpoints-subtiled sibling allocs: the in-body
+    // view rewire above redirected every per-tile use of the sibling staging
+    // buffers to the representative's single physical buffer, so they are now
+    // dead. Erasing them here (rather than leaning on a later DCE) is what
+    // reclaims the duplicate staging SMEM that otherwise OOMs at
+    // buffer.copy==1, and the assert catches a future collapse that misses a
+    // use. No-op for every non-collapsed channel (empty list).
+    if (masterChannel->channelKind == DataChannelKind::SMEMPost) {
+      auto *cp = static_cast<ChannelPost *>(masterChannel);
+      for (Operation *sib : cp->collapsedSiblingAllocs) {
+        assert(sib->use_empty() &&
+               "collapsed both-subtiled sibling alloc still has users after "
+               "in-body view rewire");
+        if (sib->use_empty())
+          sib->erase();
+      }
+      cp->collapsedSiblingAllocs.clear();
+    }
+
     // Optimize TMA loads.
     if (tmaLoads.size() > 0) {
       // Instead of headConsumer, need to lift out to the same scope.
@@ -4963,10 +4987,11 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
     // in collectPostChannels), but it still needs the reuse-group machinery:
     // the in-body per-tile slot rotation (getOrComputeSubtiledSlot fires only
     // for reuseGrp >= 0) and the numTiles loop-counter stride
-    // (getReuseGroupStride). Form a degenerate size-1 group for it.
-    bool size1Subtiled = kv.second.size() == 1 &&
-                         channelIsSubtiled(kv.second[0]) &&
-                         kv.second[0]->getNumBuffers() > 1;
+    // (getReuseGroupStride). Form a degenerate size-1 group for it -- including
+    // at buffer.copy == 1 (the DP=1 both-subtiled epilogue), where the collapse
+    // to a single physical staging slot is what avoids the SMEM OOM.
+    bool size1Subtiled =
+        kv.second.size() == 1 && channelIsCollapsedBothSubtiled(kv.second[0]);
     if (kv.second.size() > 1) {
       // If all channels reference the same alloc op, they are lifecycle
       // phases of one buffer, not distinct buffers reusing memory.

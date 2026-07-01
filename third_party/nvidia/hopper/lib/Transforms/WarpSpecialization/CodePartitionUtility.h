@@ -113,6 +113,22 @@ public:
   // itself survives, so the cached pointer stays valid. Null for direct
   // alloc-with-src producers.
   Operation *cachedSrcOp = nullptr;
+
+  // For a collapsed both-endpoints-subtiled channel, the per-tile staging
+  // allocs of this (producer region, consumer region) pair other than the
+  // representative (allocOp). collectPostChannels records them here instead of
+  // creating duplicate channels; after the in-body view rewire removes their
+  // per-tile positions they become use_empty and are erased in insertAsyncComm.
+  // Empty for every non-collapsed channel.
+  SmallVector<Operation *> collapsedSiblingAllocs;
+
+  // True only for the representative of a both-endpoints-subtiled collapse
+  // (producer AND consumer in different-task ttng.subtiled_regions), set in
+  // collectPostChannels. This — NOT the broad channelIsSubtiled (which is also
+  // true for a consumer-only-subtiled channel such as an epilogue bias load) —
+  // gates the size-1 subtiled reuse-group / in-body slot-rotation machinery at
+  // buffer.copy == 1. See channelIsCollapsedBothSubtiled.
+  bool isCollapsedBothSubtiled = false;
 };
 
 struct ReuseGroup {
@@ -232,6 +248,11 @@ void getReuseChannels(ReuseGroup *gruop, Operation *regionOp,
 // member of its reuse group, so reuse-group machinery must treat it specially
 // even at size 1.
 bool channelIsSubtiled(Channel *ch);
+// Narrow form of channelIsSubtiled: true only for the representative of a
+// both-endpoints-subtiled collapse (ChannelPost::isCollapsedBothSubtiled). Used
+// to extend the subtiled reuse-group / in-body rotation machinery to
+// buffer.copy == 1 without misfiring on consumer-only-subtiled channels.
+bool channelIsCollapsedBothSubtiled(Channel *ch);
 
 // Skip the accumCnt for unique channels.
 unsigned getReuseAccumArgIdx(Operation *regionOp,

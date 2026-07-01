@@ -352,7 +352,12 @@ bool immediateEnclosing(scf::IfOp ifOp, Operation *subOp) {
 // Control Ops can be replaced during the pass, but channel srcOp/dstOp should
 // be valid.
 static bool needAccumCntForReuse(Operation *ctrlOp, ReuseGroup *group) {
-  if (group->channels[0]->getNumBuffers() <= 1)
+  // A collapsed both-endpoints-subtiled channel is the sole member of its group
+  // and still needs a shared accumCnt (the numTiles counter stride feeds the
+  // in-body per-tile slot/phase rotation) even at buffer.copy == 1. Only plain
+  // single-buffered groups carry no accumCnt.
+  if (group->channels[0]->getNumBuffers() <= 1 &&
+      !channelIsCollapsedBothSubtiled(group->channels[0]))
     return false;
   // Goes through each channel in the ResuseGroup, check srcOp and dstOp to
   // see if it is inside ctrlOp.
@@ -471,11 +476,30 @@ bool channelIsSubtiled(Channel *ch) {
   return inSubtiled(ch->getSrcOp()) || inSubtiled(ch->getDstOp());
 }
 
+// True only for the representative of a both-endpoints-subtiled collapse: its
+// producer AND consumer are in different-task ttng.subtiled_regions, so the
+// numTiles per-tile staging allocs were folded into this one ChannelPost in
+// collectPostChannels (which sets the flag). Unlike channelIsSubtiled, this is
+// NOT true for a consumer-only-subtiled channel (e.g. an epilogue bias load
+// whose local_store sits outside the region), so it safely gates the size-1
+// subtiled reuse-group / in-body rotation machinery at buffer.copy == 1 without
+// pulling such channels into a degenerate group (which has no per-tile staging
+// buffer to rotate → empty deadPositions assert in insertAsyncComm).
+bool channelIsCollapsedBothSubtiled(Channel *ch) {
+  if (!ch || ch->channelKind != DataChannelKind::SMEMPost)
+    return false;
+  return static_cast<ChannelPost *>(ch)->isCollapsedBothSubtiled;
+}
+
 void getReuseChannels(ReuseGroup *group, Operation *regionOp,
                       SmallVector<Operation *> &chList) {
   if (!isa<scf::ForOp>(regionOp) && !isa<scf::IfOp>(regionOp))
     return;
-  if (group->channels[0]->getNumBuffers() <= 1)
+  // A collapsed subtiled channel needs its dst region threaded into chList for
+  // the numTiles counter stride even at buffer.copy == 1 (single physical slot,
+  // alternating barrier phase); only plain single-buffered groups bail here.
+  if (group->channels[0]->getNumBuffers() <= 1 &&
+      !channelIsCollapsedBothSubtiled(group->channels[0]))
     return;
   // Size-1 reuse groups normally carry no shared circular buffer, but a
   // collapsed subtiled channel is intentionally alone in its group and still
@@ -677,9 +701,13 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
 int channelInReuseGroup(Channel *channel, ReuseConfig *config,
                         bool reuseBarrier) {
   for (unsigned idx = 0; idx < config->getGroupSize(); idx++) {
-    // Reuse the same barriers when numBuffers > 1.
+    // Reuse the same barriers when numBuffers > 1. A collapsed subtiled channel
+    // (size-1 group) must still be discoverable even at buffer.copy == 1: its
+    // in-body per-tile rotation drives reuseGrp through
+    // getOrComputeSubtiledSlot.
     if (config->getGroup(idx)->channels[0]->getNumBuffers() <= 1 &&
-        reuseBarrier)
+        reuseBarrier &&
+        !channelIsCollapsedBothSubtiled(config->getGroup(idx)->channels[0]))
       continue;
     for (auto *ch : config->getGroup(idx)->channels) {
       if (channel == ch)
@@ -3037,9 +3065,12 @@ void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
   // one logical channel resolve to the SAME (producer subtiled region, consumer
   // subtiled region) pair. Create a single collapsed ChannelPost per pair (its
   // numTiles per-tile buffers are internal instances indexed in-body by the
-  // builtin tileIdx); the sibling per-tile allocs are skipped here. The first
-  // alloc encountered for a pair becomes the channel's representative.
-  DenseSet<std::pair<Operation *, Operation *>> seenSubtiledPairs;
+  // builtin tileIdx); the sibling per-tile allocs are recorded on the
+  // representative channel (collapsedSiblingAllocs) so they can be erased once
+  // the in-body view rewire makes them dead. The first alloc encountered for a
+  // pair becomes the channel's representative.
+  DenseMap<std::pair<Operation *, Operation *>, ChannelPost *>
+      seenSubtiledPairs;
   funcOp.walk([&](Operation *op) {
     // FIXME: It is possible that a local_alloc can start a channel, when a
     // gemm's operand is in smem and comes from local_alloc.
@@ -3061,8 +3092,28 @@ void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
               getAsyncTaskIds(consRegion.getOperation())) {
         auto key = std::make_pair(prodRegion.getOperation(),
                                   consRegion.getOperation());
-        if (!seenSubtiledPairs.insert(key).second)
-          return; // sibling per-tile alloc; folded into the collapsed channel
+        auto it = seenSubtiledPairs.find(key);
+        if (it != seenSubtiledPairs.end()) {
+          // Sibling per-tile alloc: fold it into the collapsed channel. Record
+          // it on the representative so insertAsyncComm can erase it after the
+          // in-body view rewire removes its per-tile positions.
+          if (it->second)
+            it->second->collapsedSiblingAllocs.push_back(op);
+          return;
+        }
+        // First alloc for this pair becomes the representative channel.
+        size_t before = channels.size();
+        createChannelPost(op, dom, channels, includeSameTaskSmemChannels);
+        ChannelPost *rep = nullptr;
+        if (channels.size() > before &&
+            channels.back()->channelKind == DataChannelKind::SMEMPost) {
+          rep = static_cast<ChannelPost *>(channels.back().get());
+          // Mark the representative so the size-1 subtiled reuse-group /
+          // in-body rotation machinery fires for it even at buffer.copy == 1.
+          rep->isCollapsedBothSubtiled = true;
+        }
+        seenSubtiledPairs[key] = rep;
+        return;
       }
       createChannelPost(op, dom, channels, includeSameTaskSmemChannels);
     }
