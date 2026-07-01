@@ -992,7 +992,13 @@ LinearEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
   for (auto inDim : linearLayout.getInDimNames()) {
     withoutBroadcast = withoutBroadcast.removeZeroBasesAlongDim(inDim);
   }
-  if (!withoutBroadcast.isInvertible()) {
+  if (withoutBroadcast.isModular()) {
+    if (!withoutBroadcast.isSurjective()) {
+      return emitError() << "NPOT distributed layout not yet supported: after "
+                            "removing the zero bases the modular layout must "
+                            "be surjective";
+    }
+  } else if (!withoutBroadcast.isInvertible()) {
     return emitError()
            << "After removing the zero bases the layout must be bijective";
   }
@@ -1757,7 +1763,7 @@ SharedLinearEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
   LinearLayout withoutBroadcast =
       linearLayout.removeZeroBasesAlongDim(kOffset).removeZeroBasesAlongDim(
           kBlock);
-  if (!withoutBroadcast.isInvertible()) {
+  if (!withoutBroadcast.isModular() && !withoutBroadcast.isInvertible()) {
     return emitError()
            << "After removing the zero bases the layout must be bijective";
   }
@@ -2975,18 +2981,18 @@ struct TritonGPUInferLayoutInterface
     }
 
     // For AMDWmmaEncodingAttr verify multi-cta CGA layout compatibility
-    auto wmmaAEncoding = dyn_cast<AMDWmmaEncodingAttr>(aEncoding.getParent());
-    auto wmmaBEncoding = dyn_cast<AMDWmmaEncodingAttr>(bEncoding.getParent());
+    auto wmmaAParentEnc = dyn_cast<AMDWmmaEncodingAttr>(aEncoding.getParent());
+    auto wmmaBParentEnc = dyn_cast<AMDWmmaEncodingAttr>(bEncoding.getParent());
     auto wmmaResEncoding = dyn_cast<AMDWmmaEncodingAttr>(resEnc);
-    if (wmmaAEncoding && wmmaBEncoding && wmmaResEncoding) {
+    if (wmmaAParentEnc && wmmaBParentEnc && wmmaResEncoding) {
       auto resLL = wmmaResEncoding.getCGALayout().getLinearLayout();
 
       if (!resLL.isInvertible())
         return op->emitError("Accumulator CGA layout should not broadcast or "
                              "have repeated rows");
 
-      auto aLL = wmmaAEncoding.getCGALayout().getLinearLayout();
-      auto bLL = wmmaBEncoding.getCGALayout().getLinearLayout();
+      auto aLL = aEncoding.getCGALayout().getLinearLayout();
+      auto bLL = bEncoding.getCGALayout().getLinearLayout();
       // In multi-CTA, the CGA layout of operand 0 broadcasts across dim1 and
       // operand 1 broadcasts across dim0.
       auto ctx = op->getContext();
@@ -3550,10 +3556,21 @@ struct TritonGPUVerifyTensorLayoutInterface
              << "Non-distributed layout is not allowed in tensor type.";
     if (llvm::any_of(rankedTy.getShape(),
                      [](int64_t i) { return !llvm::isPowerOf2_64(i); })) {
-      return makeErr() << "Layout has shape " << rankedTy.getShape()
-                       << ", but the tensor it's attached to has shape "
-                       << rankedTy.getShape()
-                       << " which is not a power of two.";
+      static const bool allowNpot =
+          mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
+      if (!allowNpot) {
+        return makeErr() << "Layout has shape " << rankedTy.getShape()
+                         << ", but the tensor it's attached to has shape "
+                         << rankedTy.getShape()
+                         << " which is not a power of two.";
+      }
+      return makeErr()
+             << "NPOT layout not yet supported: tensor shape "
+             << rankedTy.getShape()
+             << " has a non-power-of-2 dimension that is not supported by this "
+                "distributed layout's lowering in this build yet "
+                "(TRITON_ALLOW_NPOT only enables shapes handled by a landed "
+                "NPOT slice).";
     }
     auto ll = toLinearLayout(rankedTy);
     ModuleOp module = op->getParentOfType<ModuleOp>();

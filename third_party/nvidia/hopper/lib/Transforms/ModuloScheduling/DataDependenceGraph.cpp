@@ -7,7 +7,6 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/Debug.h"
@@ -22,8 +21,6 @@
 
 namespace mlir::triton::gpu {
 
-namespace ttng = mlir::triton::nvidia_gpu;
-
 unsigned DataDependenceGraph::addNode(Operation *op,
                                       const LatencyModel &model) {
   auto info = model.getLatency(op);
@@ -36,6 +33,7 @@ unsigned DataDependenceGraph::addNode(Operation *op,
   node.selfLatency = info.selfLatency;
   node.minWarps = info.minWarps;
   node.occupancy = info.occupancy;
+  node.tmemAllocCols = model.getAccumulatorAllocCols(op);
   nodes.push_back(node);
   opToIdx[op] = idx;
   return idx;
@@ -165,24 +163,19 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
     auto innerLoop = dyn_cast<scf::ForOp>(node.op);
     if (!innerLoop)
       continue;
-    // Find TMEM memdescs written by MMA inside the inner loop.
-    llvm::DenseSet<Value> tmemWritten;
+    // Find accumulator buffers written by an MMA inside the inner loop
+    // (target-specific, via the latency model — e.g. Blackwell TMEM).
+    llvm::DenseSet<Value> accWritten;
     innerLoop.walk([&](Operation *op) {
-      if (isa<triton::nvidia_gpu::TCGen5MMAOp,
-              triton::nvidia_gpu::TCGen5MMAScaledOp>(op)) {
-        // MMA operand 2 is the accumulator (TMEM memdesc).
-        if (op->getNumOperands() > 2)
-          tmemWritten.insert(op->getOperand(2));
-      }
+      if (Value w = model.getAccumulatorWrite(op))
+        accWritten.insert(w);
     });
-    // Find tmem_load ops outside the inner loop that read the same TMEM.
+    // Find ops outside the inner loop that read the same accumulator.
     for (auto &other : ddg.nodes) {
       if (other.idx == node.idx)
         continue;
-      if (!isa<triton::nvidia_gpu::TMEMLoadOp>(other.op))
-        continue;
-      Value tmemSrc = other.op->getOperand(0);
-      if (tmemWritten.count(tmemSrc)) {
+      Value accRead = model.getAccumulatorRead(other.op);
+      if (accRead && accWritten.count(accRead)) {
         ddg.addEdge(node.idx, other.idx, node.latency, /*distance=*/0);
       }
     }

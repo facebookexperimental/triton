@@ -2,20 +2,28 @@
 #define TRITON_NVIDIA_HOPPER_MODULO_SCHEDULING_LATENCY_MODEL_H
 
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/Value.h"
 #include "llvm/ADT/StringRef.h"
 
 namespace mlir::triton::gpu {
 
-/// Hardware pipeline classification for Blackwell SM100.
-/// Each op executes on exactly one pipeline; distinct pipelines overlap.
+/// Hardware pipeline (resource) classification. Each op executes on exactly one
+/// pipeline; distinct pipelines overlap. The set spans both backends — a given
+/// LatencyModel only ever emits its own target's subset.
 enum class HWPipeline {
+  // NVIDIA (Hopper/Blackwell):
   TMA,  // Async TMA engine: descriptor_load/store/gather. Named TMA (not
         // MEM) because a regular ld.global has CUDA-core-like self latency;
         // this pipeline specifically models the async TMA unit.
   TC,   // Tensor Core (tc_gen05_mma, warp_group_dot)
   CUDA, // General CUDA cores (arith.*, tt.reduce, type conversions)
   SFU,  // Special Function Unit (math.exp2, math.log2, math.rsqrt)
-  NONE  // Scalar/index ops, control flow — zero latency, no resource
+  // AMD (CDNA):
+  MFMA,   // Matrix engine (v_mfma) — AMD analog of TC
+  LDS,    // LDS unit (ds_read / ds_write)
+  GLOBAL, // Async global memory (buffer_load, incl. buffer_load_to_lds)
+  VALU,   // Vector ALU (arith.*, conversions) — AMD analog of CUDA
+  NONE    // Scalar/index ops, control flow — zero latency, no resource
 };
 
 /// Return a human-readable name for a pipeline.
@@ -66,20 +74,44 @@ struct OpLatencyInfo {
   int occupancy{0};
 };
 
-/// Hardware latency model for Blackwell SM100.
-///
-/// Classifies TTGIR operations into hardware pipelines and assigns
-/// cycle-accurate latencies from microbenchmark data. Initially hardcoded
-/// for Blackwell; designed to be subclassed for other architectures.
-///
-/// Latency values are from the WS Global Instruction Scheduling design doc
-/// (D95269626) and validated by the latency microbenchmark harness.
+/// Abstract latency-model interface consumed by the (hardware-agnostic)
+/// scheduling core (DataDependenceGraph, reservation table, schedulers). A
+/// backend supplies a concrete subclass — NVLatencyModel below, and a future
+/// AMDLatencyModel in the AMD backend. Only getLatency is required; the
+/// accumulator hooks default to "no hazard / not an accumulator alloc", which
+/// is correct for targets (e.g. AMD) that accumulate in registers.
 class LatencyModel {
 public:
   virtual ~LatencyModel() = default;
 
   /// Classify an operation and return its pipeline + latency.
-  virtual OpLatencyInfo getLatency(Operation *op) const;
+  virtual OpLatencyInfo getLatency(Operation *op) const = 0;
+
+  /// Cross-region accumulator-hazard hooks. The DDG uses these to add an edge
+  /// from a super-node (inner loop) to a later op that reads an accumulator the
+  /// loop's MMA wrote, so the reader is not scheduled before accumulation
+  /// finishes. Defaults: no hazard / not an accumulator alloc.
+  ///   getAccumulatorWrite: accumulator buffer this op writes, or null.
+  ///   getAccumulatorRead:  accumulator buffer this op reads, or null.
+  ///   getAccumulatorAllocCols: column count of a target-specific accumulator
+  ///     alloc (e.g. Blackwell TMEM) for buffer feasibility; 0 otherwise.
+  virtual Value getAccumulatorWrite(Operation *op) const { return {}; }
+  virtual Value getAccumulatorRead(Operation *op) const { return {}; }
+  virtual int64_t getAccumulatorAllocCols(Operation *op) const { return 0; }
+};
+
+/// NVIDIA Hopper/Blackwell latency model.
+///
+/// Classifies TTGIR operations into hardware pipelines and assigns
+/// cycle-accurate latencies from microbenchmark data. Latency values are from
+/// the WS Global Instruction Scheduling design doc (D95269626) and validated by
+/// the latency microbenchmark harness.
+class NVLatencyModel : public LatencyModel {
+public:
+  OpLatencyInfo getLatency(Operation *op) const override;
+  Value getAccumulatorWrite(Operation *op) const override;
+  Value getAccumulatorRead(Operation *op) const override;
+  int64_t getAccumulatorAllocCols(Operation *op) const override;
 
   /// Classify which hardware pipeline an operation uses.
   HWPipeline classifyPipeline(Operation *op) const;

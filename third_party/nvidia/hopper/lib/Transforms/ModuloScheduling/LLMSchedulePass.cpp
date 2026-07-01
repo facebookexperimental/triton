@@ -296,7 +296,7 @@ struct LLMSchedulePass
 
   void runOnOperation() override {
     auto moduleOp = getOperation();
-    ttg::LatencyModel model;
+    ttg::NVLatencyModel model;
 
     SmallVector<scf::ForOp> loops;
     moduleOp.walk([&](scf::ForOp loop) {
