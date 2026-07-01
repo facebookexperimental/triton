@@ -110,28 +110,210 @@ scf.while (%v=%v0, %x=%x0, %y=%y0, %z=%z0) : (i1,i32,i32,i32) -> (i1,i32,i32,i32
 No `init_barrier` / `wait_barrier` / `barrier_expect` / `clc_try_cancel` /
 `clc_load_result` — those belong to the lowering.
 
-## Lowering (future work)
+## Lowering
 
-A TTIR→TTGIR pass expands each persistent loop containing `ttng.clc_advance`:
+`clc_advance` is remapped to **two ops linked by a token**, and only later
+materialized into mbarriers by a **dedicated TTGIR pass that runs before AutoWS**.
+Crucially, mbarriers are not introduced by the split — the token stands in for the
+async dependency until materialization.
 
-1. Allocate the response buffer (`memdesc<2xi64>`) and the "full" mbarrier at
-   function scope; init / inval them.
-2. Expand `clc_advance` into the low-level sequence:
-   - **issue:** `ttng.clc_try_cancel(resp, bar)` + `barrier_expect(bar, 16)`
-   - **wait+decode:** `wait_barrier(bar, phase)` + `ttng.clc_load_result(resp)` +
-     `ttng.clc_is_canceled` (→ `isValid`) + `ttng.clc_get_program_id` (→ x/y/z).
-3. **Pull the issue up** to the top of the loop body so the CLC latency overlaps
-   the tile's compute (issue early, wait late). This is the request/acquire split
-   — an optimization owned by the compiler, not the user.
-4. **Infer the mbarrier phase** from the loop induction (parity toggles once per
-   iteration).
-5. **Drop unused coordinates.** If the kernel only reads `tile_id[0]`, the `y`/`z`
-   results (and their carried loop values) are removed via dead loop-carried
-   value elimination, so no work is emitted for them.
+### Token form (reuses `!ttg.async_token`)
 
-Prefetch depth (`TRITON_WS_TILE_PREFETCH_DEPTH`) is also a lowering-side concern:
-depth 1 is single-stage; depth > 1 (multi-stage run-ahead) additionally requires
-drain-on-exit because the CLC claim is destructive.
+Two ops model the intermediate form; together they are exactly `clc_advance`
+(the split is result-preserving — we remap one op to two):
+
+- `ttng.clc_try_cancel_async : !ttg.async_token` — issue the async CLC request.
+  Returns **only a token**, nothing else. Effectful (claims a pending cluster).
+- `ttng.clc_read(!ttg.async_token) -> (i1 isValid, i32 x, i32 y, i32 z)` — await
+  the token and return the decoded tile. Same results as `clc_advance` (it must
+  return `is_valid` too).
+
+The token is `!ttg.async_token`, the same completion-handle type used by
+`cp.async` / TMA / `tcgen05` — so the existing async-dependency machinery applies.
+
+### Stage 1 — split (minimal, trivially correct)
+
+For each `%v,%x,%y,%z = ttng.clc_advance`, emit the issue immediately followed by
+the read, linked by a token — no code motion yet:
+```mlir
+%tok = ttng.clc_try_cancel_async : !ttg.async_token
+%v,%x,%y,%z = ttng.clc_read %tok : i1, i32, i32, i32
+```
+This is a pure structural remap (`clc_advance` ≡ `clc_read(clc_try_cancel_async())`);
+placing them adjacent is always correct. Overlap is introduced by the next pass.
+
+### Stage 2 — `clc_try_cancel_async` hoisting / unification (dedicated TTGIR pass, before AutoWS)
+
+Promotes each `clc_try_cancel_async` to the **earliest safe program point that
+dominates its `clc_read`** consumer(s). The goal is to maximize the distance
+between the async issue and the decode so the CLC round-trip is hidden behind
+compute — i.e. `clc_read`'s (eventual) wait rarely stalls.
+
+- **Same block (common case):** move the issue above the tile's compute (e.g. to
+  the top of the persistent loop body).
+- **Across basic blocks:** the issue can be hoisted out of conditional regions.
+  E.g. if `advance` appears in *both* arms of an `if/else` (a masked path),
+  **unify** the two issues into a single `clc_try_cancel_async` at the common
+  dominator (before the branch); each arm's `clc_read` consumes the shared token.
+  This both starts the request earlier and removes the redundant issue.
+
+**Correctness invariant — issue/read count parity.** Every dynamic path must
+execute exactly one `clc_try_cancel_async` per `clc_read`: an issue claims one
+pending cluster and a read consumes one response. The pass must never introduce
+an issue on a path that has no read (over-claim → lost/duplicated tiles, wrong
+termination) nor drop an issue on a path that reads. Hoisting past a branch is
+therefore legal only when *every* path from the hoisted location issues-and-reads
+exactly once (e.g. both `if/else` arms advance); otherwise the issue stays inside
+its conditional region. The token SSA edge makes this dominance-based code motion;
+the effect (claims a cluster) is what bounds it.
+
+Within a persistent loop, hoisting to the loop-body top gives one-iteration
+overlap; hoisting *across* iterations (loop rotation / run-ahead) is the depth>1
+prefetch case (token becomes loop-carried; needs drain-on-exit) — future.
+
+IR after Stage 2 (hoisted issue; still **no** mbarrier / buffer / phase — the
+token form flows unchanged into AutoWS):
+```mlir
+scf.while (%v=%v0,%x=%x0,%y=%y0,%z=%z0) : (i1,i32,i32,i32) -> (i1,i32,i32,i32) {
+  scf.condition(%v) %v, %x, %y, %z
+} do {
+^bb0(%v: i1, %x: i32, %y: i32, %z: i32):
+  %tok = ttng.clc_try_cancel_async : !ttg.async_token        // hoisted issue
+  ... compute using %x (guarded by problem bounds) ...
+  %v1,%x1,%y1,%z1 = ttng.clc_read %tok : i1, i32, i32, i32   // decode / await
+  scf.yield %v1, %x1, %y1, %z1
+}
+```
+
+### Stage 3 — AutoWS handling (fused into `WSAtomicBroadcast`)
+
+The token form flows **into** AutoWS unchanged. The CLC fetch is the same shape
+as the atomic tile-counter that `WSAtomicBroadcast` already handles — a run-once
+"claim the next tile" whose loop-carried result feeds *every* partition — so the
+handling is **fused into that pass** (see
+`third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSAtomicBroadcast.cpp`
+and `docs/.../CrossPartitionAtomicSupport.md`). Without this, each partition would
+run its own `clc_try_cancel_async`, cancel a different pending cluster, and
+diverge → deadlock.
+
+Primary scheme:
+
+1. **Recognize** the CLC fetch (`clc_try_cancel_async` + `clc_read`) as a
+   run-once loop-carried tile producer, alongside `atomic_rmw`.
+2. **Map all CLC ops to a single partition — the producer.** Both the issue and
+   the `clc_read` (decode) live only in the producer partition; no other partition
+   runs any CLC op. (The token stays intra-producer, so its completion is a local
+   wait, materialized in Stage 4.)
+3. **Broadcast `clc_read`'s 4-tuple `(is_valid, x, y, z)` through SMEM** to all
+   partitions, reusing the atomic-broadcast data path: the producer
+   `splat`→`local_store`s each scalar into a small SMEM slot; every partition
+   `local_load`→`unsplat`s it; the `scf.while` loop-carried tile is rewired to the
+   broadcast values. The `local_store`→`local_load` edges become the usual
+   `doCodePartitionPost` SMEM channels. `is_valid` is part of the broadcast tuple
+   (it drives every partition's loop).
+4. **Reject/bail** exactly like atomic broadcast's case-3: if the fetch's results
+   are not cleanly loop-carried-to-all, fall back to `removeWarpSpecializeAttr`
+   (unspecialized but compilable — never a crash).
+
+#### Followup optimizations (to explore, not in the first cut)
+
+- **Broadcast the response and decode per partition.** Instead of broadcasting the
+  decoded 4-tuple, broadcast the raw CLC response (or keep the token) and let each
+  partition run its own `clc_read`/decode. Only `clc_try_cancel_async` must remain
+  single (one claim) and delayed (overlap); the decode is pure and replicable.
+  This shrinks/changes the broadcast payload and composes with per-partition
+  dead-coordinate dropping (each partition decodes only the coords it uses). To be
+  explored as a channel optimization.
+- **Dedicated tile-computation partition/buffer.** Put the generic "tile
+  computation" (the `program_id` → tile-coordinate / offset math, e.g. the grouped
+  swizzle in `_compute_pid`) in its own partition with its own channel/buffer,
+  rather than replicating it in every partition. More flexible partitioning.
+
+Both are followup optimizations to the channel/broadcast design; the first cut
+uses the simple "producer decodes, broadcast the 4-tuple" scheme above.
+
+### Stage 4 — materialize token → mbarrier (after AutoWS)
+
+Runs *after* AutoWS, so it operates on the token pair as it now sits in the
+producer partition (Stage 3 put all CLC ops there). It converts the async token
+into the real barrier ops. This is a **separate barrier from the broadcast**:
+Stage 3 / AutoWS already created the SMEM channels (with their own full/empty
+mbarriers) that distribute the decoded 4-tuple to the other partitions; Stage 4
+only handles the CLC-response completion barrier local to the producer.
+
+Materialization (producer partition, depth-1):
+
+1. Allocate the response buffer (`memdesc<2xi64>`) and one **completion mbarrier**
+   at function scope; init / inval.
+2. `clc_try_cancel_async` → `ttng.clc_try_cancel(resp, bar)` + `barrier_expect(bar, 16)`.
+3. `clc_read %tok` → `wait_barrier(bar, phase)` + `ttng.clc_load_result(resp)` +
+   `ttng.clc_is_canceled` (→ `isValid`) + `ttng.clc_get_program_id` (→ x/y/z).
+
+#### Phase handling (one-sided channel)
+
+The CLC response is written by hardware (`try_cancel`) and read by `clc_read` —
+there is only the **"full" (data-ready) side** of a channel; there is no "empty"
+(buffer-free) side, because the single response buffer is reused each iteration
+and reuse is naturally program-ordered (the next iteration's issue at the loop-body
+top follows this iteration's read at the bottom, in the same partition). So a
+single completion mbarrier suffices, and only its phase must be tracked.
+
+**Require the phase to be a loop-carried variable, toggled before each advance.**
+Materialization adds an `i32`/`i1` phase iter_arg to the persistent `scf.while`,
+initialized to 0; `clc_read` waits with the carried phase, and the phase is XOR'd
+with 1 in the loop yield (once per iteration). This is:
+
+- **the same shape the software pipeliner already uses for TMA / async waits** —
+  `Pipeliner/LowerLoops.cpp` carries `phase` as an iter_arg and toggles it with
+  `arith.xori` at the yield (`phase = forOp.getRegionIterArg(...)`;
+  `newPhase = xori(phase, 1)`); and
+- **the one-sided (`numBuffers = 1`) case of the WS channel logic** — the channel
+  path computes `phase = (accumCnt / numBuffers) & 1` from a loop-carried
+  `accumCnt` in `CodePartitionUtility.cpp::getBufferIdxAndPhase`, which for a
+  single buffer reduces to `accumCnt & 1`, i.e. a per-iteration toggle.
+
+**TMA lowering reference (`lib/Dialect/TritonGPU/Transforms/Pipeliner/LowerLoops.cpp`).**
+The software pipeliner lowers `tt.descriptor_load` into exactly this shape; reuse it:
+
+- **Barrier ring:** `triton::createBarrierAlloc(loop, numBuffers)` (allocates +
+  inits `numBuffers` mbarriers); slot via
+  `triton::createSingleBufferView(builder, alloc, idx)`.
+- **Issue:** `ttng.BarrierExpectOp(bar, sizeInBytes, pred)` +
+  `ttng.AsyncTMACopyGlobalToLocalOp(...)` (`createTMABarrierAndWait` ~L380-403,
+  `createTMAAsyncLoad` ~L240-252). CLC substitutes `clc_try_cancel(resp, bar)`.
+- **Wait:** `ttng.WaitBarrierOp(barView, phase)` (~L402). CLC follows it with
+  `clc_load_result` + `clc_is_canceled` / `clc_get_program_id`.
+- **Phase + indices as loop-carried iter_args** (~L535-588): `insert/extract`
+  init `-1`, `phase` init `0`, added via `addIterArgsToLoop`; advanced per
+  iteration with `createIncrementModulo(idx, numBuffers, …)` and
+  `phase = select(cndExt, xori(phase, 1), phase)`; yield patched (~L612-618).
+
+For CLC depth-1 (`numBuffers = 1`) the ring wraps every iteration, so `cndExt` is
+always true and the phase reduces to a plain per-iteration `xori(phase, 1)` — the
+"loop-carried, toggled-before-each-advance" phase, and no separate insert/extract
+index is needed. Two differences to handle: CLC's loop is an `scf.while`
+(persistent), not `scf.for`, so the phase iter-arg follows the while before/after
+regions (cf. `getAccumCount`'s scf.while handling in `CodePartitionUtility.cpp`)
+rather than the scf.for-shaped `addIterArgsToLoop`; and the "copy" is
+`clc_try_cancel` (+ decode on read) instead of `async_tma_copy` (+ local_load).
+
+Depth > 1 (future) generalizes this to a buffer ring: the carried counter becomes
+`accumCnt`, `bufferIdx = accumCnt % depth`, `phase = (accumCnt / depth) & 1` (the
+full channel form), and the destructive claim then also needs drain-on-exit.
+
+### Pipeline
+
+```
+frontend ttng.clc_advance                          (TTIR)
+   -> [Stage 1: split]         clc_try_cancel_async (token) + clc_read  (adjacent)
+   -> [Stage 2: hoist/unify]   clc_try_cancel_async promoted to earliest safe point
+   -> [Stage 3: AutoWS]        producer runs fetch + broadcast decoded 4-tuple  (fused into WSAtomicBroadcast)
+   -> [Stage 4: materialize]   token -> buffer + completion mbarrier + loop-carried phase (after AutoWS)
+```
+
+Prefetch depth (`TRITON_WS_TILE_PREFETCH_DEPTH`) is a materialization-stage
+concern: depth 1 is single-stage; depth > 1 (multi-stage run-ahead) additionally
+requires drain-on-exit because the CLC claim is destructive.
 
 ## Design decisions & rationale
 
@@ -157,23 +339,10 @@ drain-on-exit because the CLC claim is destructive.
 - **Phase and the issue/wait overlap are inferred in the pass.** Since the pass
   already analyzes the persistent loop, it owns phase parity and the request
   pull-up; the frontend carries no counter.
-
-## Status & testing
-
-- Implemented: the `ttng.clc_advance` op, the `create_clc_advance` builder
-  binding, and the `tl.clc_tile_scheduler` frontend.
-- Not implemented: the lowering pass. Until it lands the feature is **not
-  executable**; tests in `python/test/unit/language/test_triton_clc.py` are
-  IR-only (assert the high-level op appears, the loop carries `(i1,i32,i32,i32)`,
-  and no barrier/buffer ops are present).
-- A runnable end-to-end CLC GEMM was validated on GB200 in an earlier prototype
-  that emitted the raw barrier sequence directly (git history); those correctness
-  tests will be re-enabled once the lowering pass exists.
-
-## Future work
-
-- The TTIR→TTGIR lowering pass described above.
-- AutoWS integration: because the scheduler is partition-agnostic and carries
-  only decoded scalars, a WS pass can broadcast just the used coordinates across
-  partitions.
-- Multi-stage prefetch (`depth > 1`) with drain-on-exit.
+- **Token-based split before mbarriers, reusing `!ttg.async_token`.** Splitting
+  `clc_advance` into `clc_try_cancel_async` (→ token) + `clc_read` (token →
+  decoded tile) expresses the request/acquire structure and enables the overlap
+  hoist *without* introducing mbarriers, using the same async-token dependency
+  model as `cp.async` / TMA. mbarriers are materialized only in a later pass
+  (after AutoWS), keeping the two concerns — async structure vs. barrier
+  realization — cleanly separated and independently testable.
