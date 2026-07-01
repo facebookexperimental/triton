@@ -1070,8 +1070,8 @@ def test_tutorial09_matmul_tma_clc_persistent_while_loop_warp_specialize(EPILOGU
 # ============================================================================
 _UNIFIED_SCHEDULES = [
     tl.NonPersistentScheduler,
-    tl.StaticPersistentScheduler,
-    tl.DynamicPersistentScheduler,
+    tl.StaticPersistent1DScheduler,
+    tl.DynamicPersistent1DScheduler,
     tl.ClcTileScheduler,
 ]
 
@@ -1156,7 +1156,7 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(EPI
             assert "ttng.clc_try_cancel" in ttgir, "Expected CLC scheduling in IR"
         else:
             assert "ttng.clc_" not in ttgir, "Expected non-CLC scheduling"
-        if SCHEDULE is tl.DynamicPersistentScheduler:
+        if SCHEDULE is tl.DynamicPersistent1DScheduler:
             assert "atomic" in ttgir, "Expected an atomic op driving the dynamic tile id"
 
         ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)

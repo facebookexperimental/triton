@@ -40,8 +40,8 @@ from triton.runtime.jit import jit
 __all__ = [
     "TileScheduler",
     "NonPersistentScheduler",
-    "StaticPersistentScheduler",
-    "DynamicPersistentScheduler",
+    "StaticPersistent1DScheduler",
+    "DynamicPersistent1DScheduler",
     "ClcTileScheduler",
 ]
 
@@ -122,7 +122,7 @@ _attach_tile_id(NonPersistentScheduler)
 
 
 @tl._aggregate
-class StaticPersistentScheduler(_CountingTileScheduler):
+class StaticPersistent1DScheduler(_CountingTileScheduler):
     """Static persistent: grid == min(num_programs, num_tiles); each program walks
     tiles ``pid, pid + num_programs, pid + 2*num_programs, ...`` until the count is
     exhausted. ``is_valid`` is the count-based one from ``_CountingTileScheduler``.
@@ -136,20 +136,20 @@ class StaticPersistentScheduler(_CountingTileScheduler):
 
     @jit
     def initialize(lowering_args, num_tiles_fn, tile_counter):
-        return StaticPersistentScheduler(tl.program_id(0), tl.to_tensor(0), tl.to_tensor(0), tl.num_programs(0),
-                                         lowering_args, num_tiles_fn)
+        return StaticPersistent1DScheduler(tl.program_id(0), tl.to_tensor(0), tl.to_tensor(0), tl.num_programs(0),
+                                           lowering_args, num_tiles_fn)
 
     @jit
     def advance(self):
-        return StaticPersistentScheduler(self._x + self._stride, self._y, self._z, self._stride, self._lowering_args,
-                                         self._num_tiles_fn)
+        return StaticPersistent1DScheduler(self._x + self._stride, self._y, self._z, self._stride, self._lowering_args,
+                                           self._num_tiles_fn)
 
 
-_attach_tile_id(StaticPersistentScheduler)
+_attach_tile_id(StaticPersistent1DScheduler)
 
 
 @tl._aggregate
-class DynamicPersistentScheduler(_CountingTileScheduler):
+class DynamicPersistent1DScheduler(_CountingTileScheduler):
     """Dynamic (work-stealing) persistent: grid == min(num_programs, num_tiles);
     each program claims the next tile from a shared global atomic counter, so tiles
     are distributed by demand rather than a fixed stride. The host allocates
@@ -165,17 +165,17 @@ class DynamicPersistentScheduler(_CountingTileScheduler):
 
     @jit
     def initialize(lowering_args, num_tiles_fn, tile_counter):
-        return DynamicPersistentScheduler(tl.program_id(0), tl.to_tensor(0), tl.to_tensor(0), tile_counter,
-                                          lowering_args, num_tiles_fn)
+        return DynamicPersistent1DScheduler(tl.program_id(0), tl.to_tensor(0), tl.to_tensor(0), tile_counter,
+                                            lowering_args, num_tiles_fn)
 
     @jit
     def advance(self):
         next_tile = tl.atomic_add(self._counter, 1)
-        return DynamicPersistentScheduler(next_tile, self._y, self._z, self._counter, self._lowering_args,
-                                          self._num_tiles_fn)
+        return DynamicPersistent1DScheduler(next_tile, self._y, self._z, self._counter, self._lowering_args,
+                                            self._num_tiles_fn)
 
 
-_attach_tile_id(DynamicPersistentScheduler)
+_attach_tile_id(DynamicPersistent1DScheduler)
 
 
 @tl._aggregate

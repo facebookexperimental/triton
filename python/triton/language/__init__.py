@@ -9,8 +9,8 @@ from .clc import clc_tile_scheduler, ClcTileScheduler
 from .schedule import (
     TileScheduler,
     NonPersistentScheduler,
-    StaticPersistentScheduler,
-    DynamicPersistentScheduler,
+    StaticPersistent1DScheduler,
+    DynamicPersistent1DScheduler,
 )
 from .standard import (
     argmax,
@@ -181,8 +181,8 @@ __all__ = [
     "ClcTileScheduler",
     "TileScheduler",
     "NonPersistentScheduler",
-    "StaticPersistentScheduler",
-    "DynamicPersistentScheduler",
+    "StaticPersistent1DScheduler",
+    "DynamicPersistent1DScheduler",
     "atomic_add",
     "atomic_and",
     "atomic_cas",

@@ -1,7 +1,7 @@
 """Tests for the unified tile-scheduler stdlib (``triton.language.schedule``).
 
-All four schedules -- ``NonPersistentScheduler``, ``StaticPersistentScheduler``,
-``DynamicPersistentScheduler``, ``ClcTileScheduler`` -- expose the same opaque
+All four schedules -- ``NonPersistentScheduler``, ``StaticPersistent1DScheduler``,
+``DynamicPersistent1DScheduler``, ``ClcTileScheduler`` -- expose the same opaque
 loop API (``initialize`` / ``is_valid`` / ``tile_id`` / ``advance``), so a single
 persistent loop body works for any schedule and the schedule can be selected as a
 ``tl.constexpr`` (the autotuning axis).
@@ -38,8 +38,8 @@ requires_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="require
 # CLC needs Blackwell; the other three run on any GPU.
 _PERSISTENT_SCHEDULES = [
     tl.NonPersistentScheduler,
-    tl.StaticPersistentScheduler,
-    tl.DynamicPersistentScheduler,
+    tl.StaticPersistent1DScheduler,
+    tl.DynamicPersistent1DScheduler,
 ]
 _ALL_SCHEDULES = _PERSISTENT_SCHEDULES + [tl.ClcTileScheduler]
 
@@ -147,14 +147,14 @@ def test_scheduler_forms_while_loop(schedule):
 
 def test_static_persistent_uses_num_programs_stride():
     sig = {"counts_ptr": "*i32", "M": "i32", "N": "i32", "tile_counter": "*i32"}
-    ttir = initial_ttir(_count_kernel, sig, {"BLOCK_M": 64, "BLOCK_N": 64, "SCHEDULE": tl.StaticPersistentScheduler})
+    ttir = initial_ttir(_count_kernel, sig, {"BLOCK_M": 64, "BLOCK_N": 64, "SCHEDULE": tl.StaticPersistent1DScheduler})
     assert "tt.get_num_programs" in ttir, "static persistent advances by num_programs"
     assert "ttng.clc_advance" not in ttir
 
 
 def test_dynamic_persistent_advances_via_atomic():
     sig = {"counts_ptr": "*i32", "M": "i32", "N": "i32", "tile_counter": "*i32"}
-    ttir = initial_ttir(_count_kernel, sig, {"BLOCK_M": 64, "BLOCK_N": 64, "SCHEDULE": tl.DynamicPersistentScheduler})
+    ttir = initial_ttir(_count_kernel, sig, {"BLOCK_M": 64, "BLOCK_N": 64, "SCHEDULE": tl.DynamicPersistent1DScheduler})
     # Two atomic_rmw: the kernel body's count + the scheduler's tile claim.
     assert ttir.count("tt.atomic_rmw") >= 2, "dynamic persistent claims tiles via an atomic counter"
     assert "ttng.clc_advance" not in ttir
