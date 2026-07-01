@@ -57,6 +57,10 @@ bool enclosing(scf::ForOp forOp, Operation *op) {
   return forOp->isProperAncestor(op);
 }
 
+bool enclosing(scf::WhileOp whileOp, Operation *op) {
+  return whileOp->isProperAncestor(op);
+}
+
 bool hasLoopCarriedAccToken(Operation *tmemAlloc, scf::ForOp forOp) {
   for (auto *user : tmemAlloc->getResult(0).getUsers()) {
     auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(user);
@@ -369,6 +373,12 @@ static bool needAccumCntForReuse(Operation *ctrlOp, ReuseGroup *group) {
       if (enclosing(ifOp, ch->getDstOp()))
         return true;
     }
+    if (auto whileOp = dyn_cast<scf::WhileOp>(ctrlOp)) {
+      if (enclosing(whileOp, ch->getSrcOp()))
+        return true;
+      if (enclosing(whileOp, ch->getDstOp()))
+        return true;
+    }
   }
   return false;
 }
@@ -399,7 +409,14 @@ unsigned getAccumCnts(Operation *ctrlOp,
         ++cnt;
       continue;
     }
-    llvm_unreachable("region op other than If/For is not supported");
+    if (auto whileOp = dyn_cast<scf::WhileOp>(ctrlOp)) {
+      // A persistent while loop carries an accumCnt for every channel-bearing
+      // region nested inside it, so the count is in phase across iterations.
+      if (enclosing(whileOp, op))
+        ++cnt;
+      continue;
+    }
+    llvm_unreachable("region op other than If/For/While is not supported");
   }
   if (!config)
     return cnt;
@@ -418,14 +435,13 @@ unsigned getAccumCnts(Operation *ctrlOp,
 // decide accumCnts for reuse groups. When reuseGroupIdx is negative,
 // we find the argument index associated with unique channels inside
 // ctrlOp.
-unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
+unsigned getAccumArgIdx(Operation *parentForOp, Operation *ctrlOp,
                         const DenseSet<Operation *> &regionsWithChannels,
                         ReuseConfig *config, int reuseGroupIdx) {
   if (reuseGroupIdx >= 0) {
     auto cnts = getAccumCnts(parentForOp, regionsWithChannels, nullptr);
     for (unsigned idx = 0; idx < reuseGroupIdx; ++idx) {
-      if (needAccumCntForReuse(parentForOp.getOperation(),
-                               config->getGroup(idx)))
+      if (needAccumCntForReuse(parentForOp, config->getGroup(idx)))
         ++cnts;
     }
     return cnts;
@@ -447,8 +463,7 @@ unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
     }
   });
   assert(found && "error in getAccumArgIdx");
-  LDBG("getAccumArgIdx: " << parentForOp.getOperation() << " " << ctrlOp << " "
-                          << ctrlId);
+  LDBG("getAccumArgIdx: " << parentForOp << " " << ctrlOp << " " << ctrlId);
   return ctrlId;
 }
 
@@ -457,7 +472,8 @@ unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
 // that is directly in regionOp and encloses the channel.
 void getReuseChannels(ReuseGroup *group, Operation *regionOp,
                       SmallVector<Operation *> &chList) {
-  if (!isa<scf::ForOp>(regionOp) && !isa<scf::IfOp>(regionOp))
+  if (!isa<scf::ForOp>(regionOp) && !isa<scf::IfOp>(regionOp) &&
+      !isa<scf::WhileOp>(regionOp))
     return;
   if (group->channels.size() <= 1 || group->channels[0]->getNumBuffers() <= 1)
     return;
@@ -508,6 +524,23 @@ void getReuseChannels(ReuseGroup *group, Operation *regionOp,
               LDBG("\nchannel with DstOp: ");
               op.dump();
             });
+            chList.push_back(&op);
+          }
+        }
+      }
+    }
+    return;
+  }
+  if (auto whileOp = dyn_cast<scf::WhileOp>(regionOp)) {
+    // Channels of a persistent while live in its after region body.
+    for (Operation &op : whileOp.getAfterBody()->without_terminator()) {
+      if (isa<scf::ForOp>(&op) || isa<scf::IfOp>(&op)) {
+        if (needAccumCntForReuse(&op, group)) {
+          chList.push_back(&op);
+        }
+      } else {
+        for (auto *ch : group->channels) {
+          if (&op == ch->getDstOp()) {
             chList.push_back(&op);
           }
         }
@@ -621,9 +654,25 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                     ReuseConfig *config, int reuseGroupIdx) {
   auto parentForOp = op->getParentOfType<scf::ForOp>();
 
-  // Handle operations outside loops (e.g., epilogue operations).
-  // These operations don't participate in buffer cycling, so return constant 0.
   if (!parentForOp) {
+    // An op directly in a persistent scf.while after region (no enclosing for)
+    // gets its accumCnt from the while's after-region arguments, which are
+    // carried across persistent iterations.
+    if (auto parentWhileOp = op->getParentOfType<scf::WhileOp>()) {
+      Block *afterBlk = parentWhileOp.getAfterBody();
+      auto *pOp = op->getParentOp();
+      unsigned tSize = afterBlk->getNumArguments();
+      unsigned parentTCnts =
+          getAccumCnts(parentWhileOp, regionsWithChannels, config);
+      unsigned accumArgId = getAccumArgIdx(
+          parentWhileOp, pOp, regionsWithChannels, config, reuseGroupIdx);
+      Value accumCnt = afterBlk->getArgument(tSize - parentTCnts + accumArgId);
+      assert((accumCnt.getType().isIntOrIndex()) &&
+             "while accumCnt resolved to a non-integer value");
+      return accumCnt;
+    }
+    // Handle operations outside loops (e.g., epilogue operations).
+    // These operations don't participate in buffer cycling, return constant 0.
     LDBG("getAccumCount: operation outside loop, returning constant 0");
     return arith::ConstantIndexOp::create(builder, op->getLoc(), 0);
   }
@@ -650,6 +699,14 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                   << " accumArgId=" << accumArgId
                   << " argNum=" << (tSize - parentTCnts + accumArgId)
                   << " reuseGroupIdx=" << reuseGroupIdx);
+  // accumCnt must be an integer/index counter. If the positional indexing above
+  // lands on a non-integer loop-carried value (e.g. a tensor accumulator), the
+  // accumCnt threading for the enclosing control flow is wrong — fail loudly
+  // here instead of crashing later in cast<IntegerType> in
+  // getBufferIdxAndPhase.
+  assert((accumCnt.getType().isIntOrIndex()) &&
+         "accumCnt resolved to a non-integer loop-carried value; accumCnt "
+         "threading for the enclosing loop is incomplete");
   return accumCnt;
 }
 
@@ -1098,9 +1155,14 @@ getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   // Go through chList in the parentForOp, assume ch is directly in parentForOp.
   // FIXME: handle the case where ch is inside in IfOp.
   SmallVector<Operation *> chList;
-  auto parentForOp = op->getParentOfType<scf::ForOp>();
-  getReuseChannels(config->getGroup(reuseGroupIdx), parentForOp.getOperation(),
-                   chList);
+  // The enclosing loop holding the reuse-group channels can be an scf.for or,
+  // for a static persistent while-loop kernel, an scf.while (the channels live
+  // directly in the while's after region). Using getParentOfType<scf::ForOp>()
+  // alone would be null for the while case and crash getReuseChannels.
+  Operation *parentLoop = op->getParentOfType<scf::ForOp>();
+  if (!parentLoop)
+    parentLoop = op->getParentOfType<scf::WhileOp>();
+  getReuseChannels(config->getGroup(reuseGroupIdx), parentLoop, chList);
   assert(chList.size() >= 1);
 
   // When multiple channels in the reuse group share the same getDstOp() but

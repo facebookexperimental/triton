@@ -87,6 +87,16 @@ void getAccumCntsPreOrder(Operation *ctrlOp,
         }
       }
     }
+    // A persistent scf.while can directly carry a channel (e.g. the
+    // accumulator/epilogue channel that lives in its after region). Count it
+    // so it gets its own accumCnt, advanced once per persistent iteration.
+    if (auto whileOp = dyn_cast<scf::WhileOp>(subOp)) {
+      for (auto *op : regionsWithChannels) {
+        if (subOp == op) {
+          preOrderOps.push_back(subOp);
+        }
+      }
+    }
   });
 }
 
@@ -103,6 +113,13 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
                                 SmallVector<Operation *> &taskTopOps,
                                 DenseSet<Operation *> &regionsWithChannels,
                                 ReuseConfig *config);
+
+// Thread accumCnt loop-carried values through a persistent scf.while loop so
+// that buffer indices/phases stay in sync across persistent iterations.
+scf::WhileOp createNewWhileWrapper(scf::WhileOp origWhileOp,
+                                   SmallVector<Operation *> &taskTopOps,
+                                   DenseSet<Operation *> &regionsWithChannels,
+                                   ReuseConfig *config);
 
 // If there is a channel directly inside IfOp, update endAccum and endAccumElse.
 static void generateYieldCntsForIfOp(scf::IfOp ifOp, Value &endAccum,
@@ -376,6 +393,21 @@ Value getAccumForReuseGroup(Operation *op, SmallVector<Operation *> &chList,
         accumCntLoc(forOp.getLoc()), arg, lit);
     return endAccum;
   }
+  // A persistent scf.while carries the reuse-group accumCnt in its after
+  // region arguments, mirroring the scf.for case above.
+  if (auto whileOp = dyn_cast<scf::WhileOp>(ctrlOp)) {
+    auto argIdx = getAccumArgIdx(whileOp, nullptr, regionsWithChannels, config,
+                                 reuseGroupIdx);
+    auto numArgs = whileOp.getAfterBody()->getArguments().size();
+    auto tCnts =
+        getAccumCnts(whileOp.getOperation(), regionsWithChannels, config);
+    Value arg = whileOp.getAfterBody()->getArgument(numArgs - tCnts + argIdx);
+    Value lit = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+        whileOp.getLoc(), before ? opIdx : opIdx + 1, 64);
+    Value endAccum = builder.createWithAsyncTaskIds<arith::AddIOp>(
+        accumCntLoc(whileOp.getLoc()), arg, lit);
+    return endAccum;
+  }
   if (isa<scf::IfOp>(ctrlOp)) {
     // Find parentChList in parent scope and get value for the op
     // right before ctrlOp in parentChList.
@@ -641,6 +673,9 @@ void collectRegionsWithChannels(const SmallVector<Channel *> &channels,
       regionsWithChannels.insert(pOp);
     if (auto ifOp = dyn_cast<scf::IfOp>(pOp))
       regionsWithChannels.insert(pOp);
+    // Channel directly in a persistent scf.while after region.
+    if (auto whileOp = dyn_cast<scf::WhileOp>(pOp))
+      regionsWithChannels.insert(pOp);
   }
 }
 
@@ -666,6 +701,11 @@ void collectRegionsWithChannelsPost(
           }
           if (auto ifOp = dyn_cast<scf::IfOp>(pOp))
             regionsWithChannels.insert(pOp);
+          // Accumulator consumer/producer directly in a persistent scf.while
+          // (e.g. the epilogue read in the after region). The accumulator
+          // rotates once per persistent iteration, so the while carries it.
+          if (auto whileOp = dyn_cast<scf::WhileOp>(pOp))
+            regionsWithChannels.insert(pOp);
         }
         continue;
       }
@@ -679,6 +719,8 @@ void collectRegionsWithChannelsPost(
       regionsWithChannels.insert(pOp);
     if (auto ifOp = dyn_cast<scf::IfOp>(pOp))
       regionsWithChannels.insert(pOp);
+    if (auto whileOp = dyn_cast<scf::WhileOp>(pOp))
+      regionsWithChannels.insert(pOp);
     // When producer is in a different (outer) scope than consumer,
     // also register the producer's parent. This handles Q buffers in
     // persistent FA kernels: Q is produced in the outer tile loop but
@@ -691,6 +733,8 @@ void collectRegionsWithChannelsPost(
         if (isa<scf::ForOp>(srcParent))
           regionsWithChannels.insert(srcParent);
         if (isa<scf::IfOp>(srcParent))
+          regionsWithChannels.insert(srcParent);
+        if (isa<scf::WhileOp>(srcParent))
           regionsWithChannels.insert(srcParent);
       }
     }
@@ -709,6 +753,10 @@ void updateAccumLoopCount(SmallVector<Operation *> &opList,
       auto newForOp =
           createNewLoopWrapper(forOp, taskTopOps, regionsWithChannels, config);
       oldToNew[op] = newForOp.getOperation();
+    } else if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
+      auto newWhileOp = createNewWhileWrapper(whileOp, taskTopOps,
+                                              regionsWithChannels, config);
+      oldToNew[op] = newWhileOp.getOperation();
     } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
       if (enclosingAChannel(ifOp.getOperation(), regionsWithChannels)) {
         auto newIfOp =
@@ -753,12 +801,28 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
   });
 
   scf::ForOp parentForOp = origForOp->getParentOfType<scf::ForOp>();
+  // The nearest enclosing loop that carries accumCnt can also be a persistent
+  // scf.while: in that case the accumCnt is carried by the while's after
+  // region, and the inner loop starts from the matching after-region argument.
+  scf::WhileOp parentWhileOp;
+  if (!parentForOp)
+    parentWhileOp = origForOp->getParentOfType<scf::WhileOp>();
 
+  // Block holding the parent's accumCnt arguments (for-loop body or while-loop
+  // after body) and the parent op used for index computation.
+  Block *parentAccumBlock = nullptr;
+  Operation *parentAccumOp = nullptr;
   unsigned pArgSize = 0, pCnts = 0, accumArgId = 0;
   if (parentForOp) {
-    pArgSize = parentForOp.getBody()->getArguments().size();
-    pCnts =
-        getAccumCnts(parentForOp.getOperation(), regionsWithChannels, config);
+    parentAccumBlock = parentForOp.getBody();
+    parentAccumOp = parentForOp.getOperation();
+  } else if (parentWhileOp) {
+    parentAccumBlock = parentWhileOp.getAfterBody();
+    parentAccumOp = parentWhileOp.getOperation();
+  }
+  if (parentAccumBlock) {
+    pArgSize = parentAccumBlock->getArguments().size();
+    pCnts = getAccumCnts(parentAccumOp, regionsWithChannels, config);
   }
 
   SmallVector<Operation *> preOrderOps;
@@ -766,20 +830,21 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
                        preOrderOps);
   unsigned tCnts = preOrderOps.size();
 
-  if (preOrderOps.size() > 0 && parentForOp) {
-    // Find the accumArgId for preOrderOps[0] in parentForOp.
-    accumArgId = getAccumArgIdx(parentForOp, preOrderOps[0],
+  if (preOrderOps.size() > 0 && parentAccumOp) {
+    // Find the accumArgId for preOrderOps[0] in the parent loop.
+    accumArgId = getAccumArgIdx(parentAccumOp, preOrderOps[0],
                                 regionsWithChannels, config, -1);
   }
 
   // Get initial value of accumCnts prior to the loop.
   SmallVector<Value> initialAccums;
   for (unsigned i = 0; i < tCnts; ++i) {
-    // If there is an outer loop, use the corresponding argument value.
+    // If there is an enclosing loop (for or while), use the corresponding
+    // argument value so the counter continues across outer iterations.
     Value startAccum;
-    if (parentForOp)
+    if (parentAccumBlock)
       startAccum =
-          parentForOp.getBody()->getArgument(pArgSize - pCnts + accumArgId + i);
+          parentAccumBlock->getArgument(pArgSize - pCnts + accumArgId + i);
     else {
       OpBuilderWithAsyncTaskIds builder(origForOp->getContext());
       builder.setAsynTaskIdsFromArray(getNestedAsyncTaskIds(origForOp));
@@ -947,6 +1012,251 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
   return newForOp;
 }
 
+// Recreate `whileOp` with `numAccumCnts` additional i64 loop-carried values
+// threaded through its before region, condition op, after region, and yield.
+// The new counters are appended:
+//   - to the init operands (seeded from `initialAccums`),
+//   - as the trailing before-region block arguments,
+//   - forwarded verbatim by the scf.condition into the after region (and the
+//     while results),
+//   - as the trailing after-region block arguments, and
+//   - yielded back as themselves (a placeholder the caller rewrites so the
+//     after region yields the inner loop's final accumCnt).
+static scf::WhileOp createNewWhileLoop(scf::WhileOp whileOp,
+                                       SmallVector<Value> &initialAccums) {
+  auto loc = whileOp.getLoc();
+  OpBuilderWithAsyncTaskIds builder(whileOp.getContext());
+  builder.setAsynTaskIdsFromArray(getNestedAsyncTaskIds(whileOp));
+  unsigned numAccumCnts = initialAccums.size();
+
+  Block *beforeBlk = whileOp.getBeforeBody();
+  Block *afterBlk = whileOp.getAfterBody();
+
+  // Step 1: append i64 accumCnt arguments to the before and after blocks.
+  for (unsigned i = 0; i < numAccumCnts; ++i) {
+    beforeBlk->addArgument(builder.getI64Type(), accumCntLoc(loc));
+    afterBlk->addArgument(builder.getI64Type(), accumCntLoc(loc));
+  }
+
+  // Step 2: forward the new before-region args through the condition op so they
+  // reach the after region (and the while results).
+  auto condOp = whileOp.getConditionOp();
+  builder.setInsertionPoint(condOp);
+  SmallVector<Value> condArgs(condOp.getArgs());
+  unsigned beforeArgN = beforeBlk->getNumArguments();
+  for (unsigned i = 0; i < numAccumCnts; ++i)
+    condArgs.push_back(beforeBlk->getArgument(beforeArgN - numAccumCnts + i));
+  builder.createWithAsyncTaskIds<scf::ConditionOp>(
+      condOp.getLoc(), condOp.getCondition(), condArgs);
+  condOp.erase();
+
+  // Step 3: yield the new after-region args (placeholder; the caller replaces
+  // these uses with the inner loop's final accumCnt value).
+  auto yieldOp = whileOp.getYieldOp();
+  builder.setInsertionPoint(yieldOp);
+  SmallVector<Value> yieldArgs(yieldOp.getOperands());
+  unsigned afterArgN = afterBlk->getNumArguments();
+  for (unsigned i = 0; i < numAccumCnts; ++i)
+    yieldArgs.push_back(afterBlk->getArgument(afterArgN - numAccumCnts + i));
+  builder.createWithAsyncTaskIds<scf::YieldOp>(yieldOp.getLoc(), yieldArgs);
+  yieldOp.erase();
+
+  // Step 4: build the new while op with extended init operands / result types,
+  // then move the (already-extended) before/after regions into it.
+  SmallVector<Value> newInits(whileOp.getInits());
+  for (auto v : initialAccums)
+    newInits.push_back(v);
+  SmallVector<Type> newResultTypes(whileOp->getResultTypes());
+  for (unsigned i = 0; i < numAccumCnts; ++i)
+    newResultTypes.push_back(builder.getI64Type());
+
+  builder.setInsertionPoint(whileOp);
+  auto newWhileOp = builder.createWithAsyncTaskIds<scf::WhileOp>(
+      loc, newResultTypes, newInits);
+  for (auto attr : whileOp->getAttrs())
+    newWhileOp->setAttr(attr.getName(), attr.getValue());
+  newWhileOp.getBefore().takeBody(whileOp.getBefore());
+  newWhileOp.getAfter().takeBody(whileOp.getAfter());
+
+  // Step 5: rewire the original results and erase the old loop.
+  for (unsigned i = 0; i < whileOp.getNumResults(); ++i)
+    whileOp.getResult(i).replaceAllUsesWith(newWhileOp.getResult(i));
+  whileOp.erase();
+  return newWhileOp;
+}
+
+// Thread accumCnt through a persistent scf.while loop. The while is assumed to
+// be outermost (its parent is the func), so the counters are seeded to 0 and
+// carried across persistent iterations. Channel-bearing region ops (the inner
+// warp-specialized scf.for) live in the after region and are processed
+// recursively; the final accumCnt they produce is yielded back so the next
+// persistent iteration continues from the correct buffer index / phase.
+scf::WhileOp createNewWhileWrapper(scf::WhileOp origWhileOp,
+                                   SmallVector<Operation *> &taskTopOps,
+                                   DenseSet<Operation *> &regionsWithChannels,
+                                   ReuseConfig *config) {
+  LLVM_DEBUG({
+    LDBG("call createNewWhileWrapper on");
+    origWhileOp.dump();
+  });
+
+  // One accumCnt per channel-bearing region op nested under the while.
+  SmallVector<Operation *> preOrderOps;
+  getAccumCntsPreOrder(origWhileOp.getOperation(), regionsWithChannels,
+                       preOrderOps);
+  unsigned tCnts = preOrderOps.size();
+  if (tCnts == 0)
+    return origWhileOp;
+
+  OpBuilderWithAsyncTaskIds builder(origWhileOp->getContext());
+  builder.setAsynTaskIdsFromArray(getNestedAsyncTaskIds(origWhileOp));
+  builder.setInsertionPoint(origWhileOp);
+  auto loc = origWhileOp.getLoc();
+
+  // The persistent while is outermost: seed every counter to 0.
+  SmallVector<Value> initialAccums;
+  for (unsigned i = 0; i < tCnts; ++i)
+    initialAccums.push_back(
+        builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 0, 64));
+
+  // Reuse groups (e.g. the multi-buffered epilogue TMA-store staging that the
+  // subtiled epilogue creates) get their own accumCnt, appended after the
+  // per-region counters. Mirrors createNewLoopWrapper. The while is outermost,
+  // so the prior value resolves to a constant 0.
+  for (unsigned idx = 0; idx < config->getGroupSize(); ++idx) {
+    if (config->getGroup(idx)->channels.size() <= 1)
+      continue;
+    if (config->getGroup(idx)->channels[0]->getNumBuffers() <= 1)
+      continue;
+    SmallVector<Operation *> chList;
+    getReuseChannels(config->getGroup(idx), origWhileOp.getOperation(), chList);
+    if (chList.empty())
+      continue;
+    Operation *parentOp = origWhileOp->getParentOp();
+    SmallVector<Operation *> parentChList;
+    getReuseChannels(config->getGroup(idx), parentOp, parentChList);
+    if (parentChList.empty())
+      parentChList.push_back(origWhileOp.getOperation());
+    Value prevAccum =
+        getAccumForReuseGroup(origWhileOp.getOperation(), parentChList,
+                              regionsWithChannels, config, idx, true);
+    initialAccums.push_back(prevAccum);
+  }
+
+  unsigned totalCnts = initialAccums.size();
+  scf::WhileOp newWhileOp = createNewWhileLoop(origWhileOp, initialAccums);
+
+  // Update bookkeeping references from origWhileOp to newWhileOp.
+  auto asyncTaskItr = std::find(taskTopOps.begin(), taskTopOps.end(),
+                                origWhileOp.getOperation());
+  if (asyncTaskItr != taskTopOps.end())
+    *asyncTaskItr = newWhileOp.getOperation();
+  if (regionsWithChannels.contains(origWhileOp.getOperation())) {
+    regionsWithChannels.erase(origWhileOp.getOperation());
+    regionsWithChannels.insert(newWhileOp.getOperation());
+  }
+
+  // Recursively thread accumCnt through the channel-bearing region ops in the
+  // after region (e.g. the inner warp-specialized scf.for). Their start value
+  // is wired to the while's after-region accumCnt arguments by
+  // createNewLoopWrapper.
+  SmallVector<Operation *> opList;
+  for (Operation &op : newWhileOp.getAfterBody()->without_terminator()) {
+    if (isa<scf::ForOp>(&op) || isa<scf::IfOp>(&op))
+      opList.push_back(&op);
+  }
+  updateAccumLoopCount(opList, taskTopOps, regionsWithChannels, config);
+
+  // Wire the after-region yield so each accumCnt yields the final value
+  // produced by its region op, instead of the placeholder pass-through created
+  // in createNewWhileLoop. This mirrors the for-loop body handling in
+  // createNewLoopWrapper.
+  Operation *yieldOp = newWhileOp.getAfterBody()->getTerminator();
+  unsigned afterArgSize = newWhileOp.getAfterBody()->getNumArguments();
+  unsigned accumArgId = afterArgSize - totalCnts;
+
+  // If the while directly carries a channel (the accumulator/epilogue channel
+  // in the after region), its counter is first in preorder and advances by one
+  // per persistent iteration. This mirrors the direct-channel handling in
+  // createNewLoopWrapper.
+  for (auto *op : regionsWithChannels) {
+    if (newWhileOp.getOperation() == op) {
+      Value arg = newWhileOp.getAfterBody()->getArgument(accumArgId);
+      OpBuilderWithAsyncTaskIds yieldBuilder(newWhileOp.getContext());
+      yieldBuilder.setAsynTaskIdsFromArray(getNestedAsyncTaskIds(newWhileOp));
+      yieldBuilder.setInsertionPoint(yieldOp);
+      Value one =
+          yieldBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
+      Value endAccum = yieldBuilder.createWithAsyncTaskIds<arith::AddIOp>(
+          accumCntLoc(loc), arg, one);
+      yieldOp->replaceUsesOfWith(arg, endAccum);
+      ++accumArgId;
+      break;
+    }
+  }
+
+  // Nested channel-bearing region ops (e.g. the inner warp-specialized
+  // scf.for): yield the final accumCnt each one produces.
+  DenseSet<Operation *> seenOps;
+  for (auto *op : opList) {
+    if (!enclosingAChannel(op, regionsWithChannels))
+      continue;
+    auto numRes = op->getNumResults();
+    unsigned cnts = getAccumCnts(op, regionsWithChannels, config);
+    for (unsigned i = 0; i < cnts; ++i) {
+      Value arg = newWhileOp.getAfterBody()->getArgument(accumArgId);
+      Value endAccum = op->getResult(numRes - cnts + i);
+      yieldOp->replaceUsesOfWith(arg, endAccum);
+      ++accumArgId;
+    }
+    if (cnts > 0)
+      seenOps.insert(op);
+  }
+
+  // Reuse-group counters: yield the staggered accumCnt for each multi-buffered
+  // reuse group with channels in the while. Mirrors createNewLoopWrapper.
+  for (unsigned idx = 0; idx < config->getGroupSize(); ++idx) {
+    SmallVector<Operation *> chList;
+    getReuseChannels(config->getGroup(idx), newWhileOp.getOperation(), chList);
+    if (chList.empty())
+      continue;
+    Operation *lastCh = chList.back();
+    if (seenOps.contains(lastCh))
+      continue;
+    Value whileYield = getAccumForReuseGroup(
+        lastCh, chList, regionsWithChannels, config, idx, false);
+    Value arg = newWhileOp.getAfterBody()->getArgument(accumArgId);
+    yieldOp->replaceUsesOfWith(arg, whileYield);
+    ++accumArgId;
+  }
+
+  // Every appended counter must have been rewired above. A leftover placeholder
+  // (an appended after-yield operand still equal to its own after-region arg)
+  // yields the counter back as itself, making it loop-invariant across
+  // persistent iterations: the buffer index / mbarrier phase never advance and
+  // the kernel silently deadlocks. That is exactly the failure class this
+  // threading exists to prevent, so catch it here rather than at runtime.
+#ifndef NDEBUG
+  assert(accumArgId == afterArgSize &&
+         "not all accumCnt counters were wired into the while after-yield");
+  unsigned yieldN = yieldOp->getNumOperands();
+  for (unsigned i = 0; i < totalCnts; ++i) {
+    Value placeholder =
+        newWhileOp.getAfterBody()->getArgument(afterArgSize - totalCnts + i);
+    assert(
+        yieldOp->getOperand(yieldN - totalCnts + i) != placeholder &&
+        "accumCnt after-yield still holds its placeholder arg (counter would "
+        "be loop-invariant across persistent iterations)");
+  }
+#endif
+
+  LLVM_DEBUG({
+    LDBG("-- after createNewWhileWrapper ");
+    newWhileOp.dump();
+  });
+  return newWhileOp;
+}
+
 void appendAccumCntsForOps(SmallVector<Operation *> &taskTopOps,
                            const SmallVector<Channel *> &channels,
                            DenseSet<Operation *> &regionsWithChannels,
@@ -958,6 +1268,10 @@ void appendAccumCntsForOps(SmallVector<Operation *> &taskTopOps,
       opList.push_back(op);
     }
     if (auto origForOp = dyn_cast<scf::ForOp>(op))
+      opList.push_back(op);
+    // A static persistent kernel's outer loop can be an scf.while; thread
+    // accumCnt through it just like the persistent scf.for case.
+    if (auto origWhileOp = dyn_cast<scf::WhileOp>(op))
       opList.push_back(op);
   }
   Value tmpAccumLoopCount;

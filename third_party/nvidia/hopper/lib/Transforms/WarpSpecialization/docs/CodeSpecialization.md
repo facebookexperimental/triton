@@ -39,10 +39,12 @@ For each partition (starting with the default region, then each consumer
 region), `SpecializeOp` recursively clones operations into the target region
 using `IRMapping`.
 
-#### `SpecializeForOp`
+#### `SpecializeForOp` / `SpecializeWhileOp`
 
-`scf::ForOp` requires special handling because different partitions may use
-different subsets of the loop's block arguments and yield values:
+Loop ops require special handling because their region arguments, yielded
+values, and results must be remapped consistently per partition. For `scf.for`,
+different partitions may use different subsets of the loop's block arguments
+and yield values:
 
 1. Collect only the block arguments used by the specific task.
 2. Create a **trimmed loop** with only the needed arguments.
@@ -51,6 +53,12 @@ different subsets of the loop's block arguments and yield values:
 
 This means the same source loop may become different loops in different
 partition regions, each with a reduced set of loop-carried values.
+
+`scf.while` currently preserves the full while signature for each partition.
+It has two regions, so specialization maps the before-region arguments,
+after-region arguments, `scf.condition` forwarded values, and after-region
+`scf.yield` backedge values. Unlike `scf.for`, while results are tied to the
+`scf.condition` operands rather than the yield operands.
 
 #### `SpecializeIfOp`
 

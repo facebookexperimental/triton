@@ -811,6 +811,55 @@ void appendToForOpYield(scf::ForOp forOp, ArrayRef<Value> newOperands) {
   yieldOp->erase();
 }
 
+//===----------------------------------------------------------------------===//
+// Loop-kind-agnostic helpers (scf.for / scf.while)
+//===----------------------------------------------------------------------===//
+
+LoopCarriedSlot getLoopCarriedSlot(LoopLikeOpInterface loop, unsigned k) {
+  LoopCarriedSlot slot;
+  Operation *op = loop.getOperation();
+  // iterArg and yielded are 1:1 with the slot index for both loop kinds and are
+  // safe to query through the interface (both kinds expose getRegionIterArgs
+  // and getYieldedValuesMutable).
+  slot.iterArg = loop.getRegionIterArgs()[k];
+  if (auto yielded = loop.getYieldedValuesMutable())
+    slot.yielded = &(*yielded)[k];
+
+  // The init OpOperand must be fetched from the concrete op: the
+  // LoopLikeOpInterface default getInitsMutable() returns {} for scf.while.
+  if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+    slot.init = &forOp.getInitArgsMutable()[k];
+    slot.result = forOp->getOpResult(k);
+    return slot;
+  }
+
+  auto whileOp = cast<scf::WhileOp>(op);
+  slot.init = &whileOp.getInitsMutable()[k];
+  // results / after-args align with scf.condition forwarded operands, not with
+  // the iter-arg index. Find the forwarded position carrying this "before" arg
+  // (the case for appended counters and pass-through carried values).
+  //
+  // Contract for the two cases this loop does NOT fully resolve:
+  //   - Not forwarded at all: a "before"-only value (e.g. the raw loop
+  //     predicate) is legal in scf.while and leaves slot.result / slot.afterArg
+  //     null. Callers that need them must check (see LoopCarriedSlot in the
+  //     header and the assert in WSCodePartition
+  //     getOutOfScopeBufferIdxAndPhase).
+  //   - Forwarded to more than one condition slot: only the first forwarded
+  //     position is associated with this slot; later duplicates are ignored.
+  //     Safe today because every threaded counter is forwarded exactly once; a
+  //     general duplicate-forwarding loop would need per-position resolution.
+  auto condOp = whileOp.getConditionOp();
+  for (auto [j, fwd] : llvm::enumerate(condOp.getArgs())) {
+    if (fwd == slot.iterArg) {
+      slot.result = whileOp->getOpResult(j);
+      slot.afterArg = whileOp.getAfterArguments()[j];
+      break;
+    }
+  }
+  return slot;
+}
+
 scf::IfOp replaceIfOpWithNewSignature(OpBuilder &rewriter, scf::IfOp ifOp,
                                       TypeRange newResultTypes) {
   SmallVector<std::tuple<Value, Value>> replacements;

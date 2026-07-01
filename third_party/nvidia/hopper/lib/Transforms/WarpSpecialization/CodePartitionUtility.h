@@ -205,6 +205,7 @@ constexpr static char kWarpSpecializeGeneratedBarrierAttrName[] =
 
 bool enclosing(scf::IfOp ifOp, Operation *op);
 bool enclosing(scf::ForOp forOp, Operation *op);
+bool enclosing(scf::WhileOp whileOp, Operation *op);
 
 /// Returns true if \p tmemAlloc has a MMAv5OpInterface user inside \p forOp
 /// whose acc_dep token is a loop iter_arg of \p forOp and whose output
@@ -222,8 +223,9 @@ unsigned getAccumCnts(Operation *ctrlOp,
 
 // We pass in groupIdx, if it is -1, we are getting accumCnt for a channel
 // not in a reuse group, directly in ctrlOp. ctrlOp can be null if
-// reuseGroupIdx >= 0.
-unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
+// reuseGroupIdx >= 0. parentOp is the control-flow op (scf.for or the after
+// region of an scf.while) whose accumCnt arguments we are indexing into.
+unsigned getAccumArgIdx(Operation *parentOp, Operation *ctrlOp,
                         const DenseSet<Operation *> &regionsWithChannels,
                         ReuseConfig *config, int reuseGroupIdx);
 

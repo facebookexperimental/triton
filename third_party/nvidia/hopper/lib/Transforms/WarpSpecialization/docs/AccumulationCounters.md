@@ -88,6 +88,86 @@ number of buffer slots that channel consumes in one iteration:
 > non-subtile counters and collapses their slot/phase — the AutoWS subtile GEMM
 > deadlock.
 
+## Persistent `scf.while` Loops
+
+A static persistent kernel's outer loop may be an `scf.while` instead of an
+`scf.for` (e.g. `while tile_id < num_tiles:` with `tile_id += NUM_SMS`). The
+accumulation counters must still be carried across persistent iterations so
+buffer indices and mbarrier phases stay in phase, exactly as for the `scf.for`
+persistent case. Without this, every persistent iteration would restart the
+counter at 0 while the hardware mbarrier phases keep advancing, producing a
+runtime deadlock, and the buffer-index lookup would mis-resolve to a non-integer
+loop-carried value (e.g. a tensor accumulator), crashing in `cast<IntegerType>`.
+
+The `scf.while` is threaded analogously to `scf.for` (`createNewWhileWrapper` /
+`createNewWhileLoop`):
+
+1. Each accumCnt is added as an `i64` to the **init operands**, the **before**
+   block args, and the **after** block args.
+2. The `scf.condition` op **forwards** the before-region accumCnt args into the
+   after region (and the while results).
+3. The after-region `scf.yield` yields the next accumCnt value back, so it flows
+   to the next iteration's before args.
+
+Two kinds of counters can live on a persistent while:
+
+- **Nested-loop counter** — for the inner warp-specialized `scf.for` (e.g. the
+  A/B TMA load channel). Seeded from the while's after-region arg; the inner
+  loop yields its final value back.
+- **Direct counter** — for a channel whose producer/consumer lives directly in
+  the while's after region (e.g. the accumulator/epilogue channel). Like a
+  channel directly in an `scf.for`, it advances by one per persistent iteration.
+
+For ops directly in the after region, `getAccumCount` resolves the counter from
+the while's after-region arguments (no enclosing `scf.for`). In
+`createBufferPost`, operandD/TMEM users (and other channel users) that live
+directly in the after region must use `getBufferIdxAndPhase(builder, user, ...)`
+so their buffer slot rotates with the while-carried counter — matching the
+writer's slot — rather than the truly-outside-loop fallback (which would pin the
+slot to 0 and race across persistent iterations).
+
+`scf.while` regions are registered in `regionsWithChannels`
+(`collectRegionsWithChannels` / `collectRegionsWithChannelsPost`), counted by
+`getAccumCnts` / `getAccumCntsPreOrder`, and indexed by `getAccumArgIdx` the same
+way `scf.for`/`scf.if` are.
+
+### Reuse groups directly in a persistent `scf.while`
+
+A subtiled epilogue (`EPILOGUE_SUBTILE > 1`) emits several TMA stores that share
+one multi-buffered staging buffer — a **reuse group** whose channels live
+directly in the while's after region (a *second* channel directly in the while,
+in addition to the operand-D accumulator). Reuse groups get their own appended
+accumCnt, after the per-region counters. The while path mirrors the `scf.for`
+reuse handling end-to-end:
+
+- `createNewWhileWrapper` appends a reuse-group counter to `initialAccums`
+  (seeded via `getAccumForReuseGroup`, which is a constant 0 for the outermost
+  while) and wires its yield with the staggered next value.
+- `getReuseChannels`, `needAccumCntForReuse`, and `getAccumForReuseGroup` accept
+  `scf::WhileOp` (iterating / indexing the after region).
+- `getStaggeredAccumCnt` finds the enclosing loop as `scf::ForOp` **or**
+  `scf::WhileOp` — using `getParentOfType<scf::ForOp>()` alone is null for an op
+  in the while's after region and would crash `getReuseChannels`.
+
+Missing any of these makes the per-channel accumCnt index run past the counters
+actually threaded into the while (an out-of-bounds after-region argument /
+non-integer accumCnt), the same failure class the `getAccumCount` `isIntOrIndex`
+assertion guards against.
+
+### Redundant accumulator zero-store removal
+
+`removeRedundantTmemZeroStores` (`WSCodePartition.cpp`) drops the explicit
+`tmem_store 0` that initializes the accumulator when the MMA already zeroes it
+via `useAccumulator=false` on the first iteration. Without this, the zero-store
+becomes a *cross-partition* channel (epilogue zeroes, gemm reads) that, in a
+persistent loop, races/hangs across tiles. It must recognize the persistent
+outer loop as an `scf.while` (not only `scf.for`) — the zero-store lives directly
+in the while's after region, so its enclosing loop is found via
+`getParentOfType<scf::WhileOp>()`. The erase step forwards the store's input dep
+token (`getDep()`) to its result token (`getToken()`) so the accumulator
+dependency chain skips the removed store; forwarding the wrong operand leaves the
+store un-erased and reintroduces the cross-tile race.
+
 ## Interaction with Reuse Groups
 
 When channels share a reuse group (same `buffer.id`), they share a single
@@ -107,6 +187,7 @@ See [Reuse Groups](ReuseGroups.md) for more details.
 |----------|-------------|
 | `appendAccumCntsForOps` | Entry point: identifies channels needing counters |
 | `createNewLoop` / `createNewLoopWrapper` | Extends `scf::ForOp` with extra block arguments |
+| `createNewWhileLoop` / `createNewWhileWrapper` | Threads accumCnt through a persistent `scf::WhileOp` (before/after regions, condition, yield) |
 | `rewriteIfOp` | Extends `scf::IfOp` results with accumCnt outputs |
 | `updateAccumLoopCount` | Recursively threads counters through nested control flow |
 | `generateYieldCntsForForOp` | Generates loop yield values for counters |

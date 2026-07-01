@@ -89,8 +89,11 @@ An operation can be a channel endpoint if it is:
 The core channel creation logic:
 
 1. For each result of the producer op, collect all **transitive users**
-   (`getTransitiveUsers`) — tracking through `scf::YieldOp` to reach real
-   users across loop iterations.
+   (`getTransitiveUsers`) — tracking through loop-carried values to reach real
+   users across iterations. For `scf.for`, this follows `scf.yield` to loop
+   results. For `scf.while`, after-region `scf.yield` values feed the next
+   iteration's before-region arguments, while `scf.condition` forwarded
+   operands feed while results and after-region arguments.
 2. Filter by **dominance**: only consider users properly dominated by the
    producer.
 3. For each user in a **different partition** (different `async_task_id`),
