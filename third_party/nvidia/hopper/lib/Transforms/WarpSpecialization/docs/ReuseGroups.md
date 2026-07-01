@@ -188,6 +188,32 @@ up which group a channel belongs to (returning -1 if none). The `reuseBarrier`
 flag skips groups whose representative has `numBuffers <= 1` (single-buffered
 channels share no circular barrier).
 
+#### Dedicated reuse-WAR tokens (synthetic)
+
+Separately from the shared per-channel tokens above, two reuse hazards are
+guarded by a **freshly minted** token (`ttnvws::CreateTokenOp` at function
+entry) plus a `producer_acquire`/`consumer_release` pair, each tagged
+`WSBarrierAttr::forDstTask(...)` at the *other* task. These are **not** A1–A6
+categories — they are cross-iteration write-after-read edges layered on top of
+buffer reuse:
+
+| Site (`WSCodePartition.cpp`) | Mem | Reuse kind | Hazard guarded |
+|---|---|---|---|
+| operand-D **same-iteration guard** (`guardToken`, ~L3760) | TMEM | same `buffer.id`, same partition, `isSameIterGuard` | the guard channel's `tmem_load` must read before the next iteration's `tmem_store` (MMA operand D) overwrites the accumulator |
+| **staging↔operand** reuse (`reuseToken`, Step 7.5, ~L5530) | SMEM | cross-`buffer.id` via `allocation.reuseTarget`, cross partition | the next persistent tile's operand load must not overwrite the SMEM until the previous tile's staging TMA store has drained (bug #9 / D109859261) |
+
+Both mirror the manual TLX empties-token idiom. They differ only in the
+`bufferIdx`/`phase` source: the guard token uses
+`getBufferIdxAndPhase(numBuffers)`; the Step 7.5 token uses `numBuffers = 1` with
+a loop-carried phase derived from the outer induction variable.
+
+**Redundancy (candidate for a helper).** The two sites currently duplicate (a)
+the func-entry token-mint idiom (`OpBuilder(funcOp)` →
+`setInsertionPointToStart(&funcOp.getBody().front())` → `CreateTokenOp::create`)
+and (b) the acquire-then-release `forDstTask` WAR-pair emission. These could be
+factored into shared helpers (e.g. `createReuseWarToken` +
+`emitTokenWarPair`); not yet done.
+
 ### 3. Buffer Replacement
 
 `replaceBufferReuse` rewrites all IR uses of non-representative alloc ops to
@@ -214,6 +240,16 @@ state.
   not co-live.
 
 - **SMEM channels with `allocation.reuseTarget = N` (cross-buffer reuse)**:
+  This is a **distinct mechanism from the A1–A6 categories** above — those group
+  channels that share **one `buffer.id`**, whereas here the staging and host keep
+  **different `buffer.id`s** linked only by `reuseTarget`, so they never form a
+  `ReuseGroup`. The distinct `buffer.id`s are **required, not stylistic**: Step
+  7.5 identifies the host operand by resolving `bufferIdToChannel[reuseTarget]`.
+  If the staging shared the host's `buffer.id`, that map (last-wins per id)
+  collides — the target resolves to the staging itself, so `loadTask ==
+  stagingTask` and the cross-tile WAR barrier is **silently dropped** (empirically:
+  the Step 7.5 token + acquire/release vanish, no compensating barrier, and the
+  bug-#9 race returns with no error).
   Driven by the planner's Phase 3.6 hint (see
   [TMAStoreWaitPipeline.md §Phase 3.6](TMAStoreWaitPipeline.md#phase-36-inter-buffer-smem-reuse-via-allocationreuetarget)).
   The staging alloc carries `allocation.reuseTarget = <host bufferId>`;
@@ -221,9 +257,28 @@ state.
   `memdesc_reinterpret` view of the host alloc (the one with
   `buffer.id = N`) and erases the staging alloc. The reinterpret is sound
   because the host alloc's storage covers ≥ `staging.size × staging.numCopies`
-  bytes (guaranteed by `findReuseCandidate`'s size check), and cross-partition
-  ordering is enforced by the Step 7.5 `producer_acquire` barrier inserted
-  earlier in `doCodePartition`.
+  bytes (guaranteed by `findReuseCandidate`'s size check) **and** the two
+  encodings match (`areReuseEncodingsCompatible`; an encoding-incompatible reuse
+  is never marked, or realization would silently drop it and under-count SMEM —
+  bug #10).
+
+  Because the staging *aliases* the host operand SMEM, the two must never be
+  live at once. On the persistent (outer-tile) path this is a **cross-tile**
+  write-after-read: the next tile's operand load (load task) must not overwrite
+  that SMEM until the previous tile's staging TMA store (staging task) has
+  drained. That edge is enforced by the Step 7.5 barrier in `doCodePartition` —
+  a dedicated single-buffered **cross-partition** reuse token (not the host
+  operand's own barrier, whose consumer warp count differs and would trip
+  `WSLowerToken`'s `consumerWarps == nWarps`): the load task `producer_acquire`s
+  it at the top of the outer loop with a loop-carried phase (from the induction
+  variable), and the staging task `consumer_release`s it at the bottom after the
+  staging stores drain. (An earlier degenerate version emitted a constant
+  `bufferIdx=0`/`phase=0` acquire on the host token that `WSLowerToken` elided to
+  a no-op — harmless on the single-tile path, a cross-tile SMEM race on the
+  persistent path. Bug #9 / D109859261; see
+  [TMAStoreWaitPipeline.md](TMAStoreWaitPipeline.md) and
+  `.llms/rules/partition-scheduler-bugs.md` #9, lit test
+  `ws_code_partition_bwd_persist_staging_war.mlir`.)
 
 - **TMEM channels**: Inserts a `sliceAndReinterpretMDTMEM` op at the
   `buffer.offset` column within the representative's TMEM allocation. If the
