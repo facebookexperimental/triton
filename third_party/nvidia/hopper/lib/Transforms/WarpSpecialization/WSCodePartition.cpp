@@ -125,6 +125,16 @@ getOutOfScopeBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
   Operation *bbAargOwner = bbArg.getOwner()->getParentOp();
   if (auto forOp = dyn_cast<scf::ForOp>(bbAargOwner)) {
     accumCnt = forOp.getResult(bbArg.getArgNumber() - 1);
+  } else if (auto whileOp = dyn_cast<scf::WhileOp>(bbAargOwner)) {
+    if (bbArg.getOwner() == whileOp.getBeforeBody()) {
+      auto slot =
+          getLoopCarriedSlot(cast<LoopLikeOpInterface>(whileOp.getOperation()),
+                             bbArg.getArgNumber());
+      assert(slot.result && "expected accumCnt while arg to have a result");
+      accumCnt = slot.result;
+    } else {
+      accumCnt = whileOp.getResult(bbArg.getArgNumber());
+    }
   } else {
     llvm_unreachable("Unexpected block argument owner");
   }
@@ -146,9 +156,24 @@ void getTransitiveUsers(Value root,
     if (auto yieldOp = dyn_cast<scf::YieldOp>(userOp)) {
       for (OpOperand &operand : yieldOp->getOpOperands()) {
         if (operand.get() == root) {
-          auto result =
-              yieldOp->getParentOp()->getResult(operand.getOperandNumber());
-          getTransitiveUsers(result, users);
+          Operation *parentOp = yieldOp->getParentOp();
+          if (auto whileOp = dyn_cast<scf::WhileOp>(parentOp)) {
+            getTransitiveUsers(
+                whileOp.getBeforeArguments()[operand.getOperandNumber()],
+                users);
+          } else {
+            auto result = parentOp->getResult(operand.getOperandNumber());
+            getTransitiveUsers(result, users);
+          }
+        }
+      }
+    } else if (auto condOp = dyn_cast<scf::ConditionOp>(userOp)) {
+      auto whileOp = cast<scf::WhileOp>(condOp->getParentOp());
+      for (OpOperand &operand : condOp.getArgsMutable()) {
+        if (operand.get() == root) {
+          unsigned resultIdx = operand.getOperandNumber() - 1;
+          getTransitiveUsers(whileOp.getResult(resultIdx), users);
+          getTransitiveUsers(whileOp.getAfterArguments()[resultIdx], users);
         }
       }
     } else {
@@ -1180,7 +1205,7 @@ static std::pair<Value, Value> getBufferIdxAndPhaseForOutsideLoopOps(
       }
     }
 
-    auto parentLoop = opInsideLoop->getParentOfType<scf::ForOp>();
+    auto parentLoop = opInsideLoop->getParentOfType<LoopLikeOpInterface>();
     if (isPrologue) {
       // For prologue operations (initialization), use initial values
       // and place before the loop
@@ -1223,8 +1248,8 @@ static bool checkConsumersInLoops(Channel *channel) {
 
   // Special case when srcOp or dstOp is scf.for;
   // we need to check if operations inside the loop need sync
-  bool srcIsLoop = isa<scf::ForOp>(srcOp);
-  bool dstIsLoop = isa<scf::ForOp>(dstOp);
+  bool srcIsLoop = isa<LoopLikeOpInterface>(srcOp);
+  bool dstIsLoop = isa<LoopLikeOpInterface>(dstOp);
 
   if (srcIsLoop || dstIsLoop) {
     // When the channel endpoints are loop operations themselves,
@@ -1238,8 +1263,10 @@ static bool checkConsumersInLoops(Channel *channel) {
   }
 
   // Normal case: check if ops are outside loops
-  bool producerOutsideLoop = srcOp && !srcOp->getParentOfType<scf::ForOp>();
-  bool consumerOutsideLoop = dstOp && !dstOp->getParentOfType<scf::ForOp>();
+  bool producerOutsideLoop =
+      srcOp && !srcOp->getParentOfType<LoopLikeOpInterface>();
+  bool consumerOutsideLoop =
+      dstOp && !dstOp->getParentOfType<LoopLikeOpInterface>();
 
   // If both producer and consumer ops are outside loops, check if actual
   // consumers are inside loops. This handles both cases:
@@ -1271,7 +1298,7 @@ static bool checkConsumersInLoops(Channel *channel) {
           if (std::find(consumerTasks.begin(), consumerTasks.end(),
                         consumerTaskId) != consumerTasks.end()) {
             // Check if this consumer is inside a loop
-            if (consumer->getParentOfType<scf::ForOp>()) {
+            if (consumer->getParentOfType<LoopLikeOpInterface>()) {
               hasConsumersInLoops = true;
               LDBG("createToken: found consumer with task "
                    << consumerTaskId << " inside loop for channel "
@@ -2268,6 +2295,15 @@ DenseMap<Channel *, Value> createBufferPost(
         } else if (innerFor) {
           getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
                                bufferIdx, _phase, config, reuseGrp, channel);
+        } else if (user->getParentOfType<scf::WhileOp>()) {
+          // OperandD user directly in a persistent scf.while after region
+          // (e.g. the gemm's peeled k=0 MMA or the epilogue's tmem_load).
+          // These must rotate with the while-carried accumulator counter so
+          // the writer and reader agree on the buffer slot across persistent
+          // iterations. getAccumCount resolves `user` to the while's
+          // accumulator accumCnt.
+          getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
+                               bufferIdx, _phase, config, reuseGrp, channel);
         } else {
           std::tie(bufferIdx, _phase) = getBufferIdxAndPhaseForOutsideLoopOps(
               builder, user, channel, oldAllocOp, numBuffers,
@@ -2309,6 +2345,12 @@ DenseMap<Channel *, Value> createBufferPost(
           getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
                                bufferIdx, _phase, config, reuseGrp, channel);
         }
+      } else if (user->getParentOfType<scf::WhileOp>()) {
+        // Channel user directly in a persistent scf.while after region: rotate
+        // with the while-carried accumCnt (getAccumCount resolves `user` to it)
+        // rather than treating it as a truly-outside-loop op.
+        getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
+                             bufferIdx, _phase, config, reuseGrp, channel);
       } else {
         // For operations outside loops (epilogue), compute the
         // correct bufferIdx and phase based on the parent loop's final
@@ -4877,9 +4919,18 @@ void removeRedundantTmemZeroStores(triton::FuncOp &funcOp) {
       // legitimate and must be kept.
       // In persistent BWD FA, the outer persistent loop contains both
       // the zero-store and the inner loop (which contains the MMA).
-      auto zeroStoreParentLoop = zeroStoreOp->getParentOfType<scf::ForOp>();
+      // The persistent outer loop may be an scf.for or, for a static
+      // persistent while-loop kernel, an scf.while (the zero-store lives
+      // directly in the while's after region). Without recognizing the
+      // while case, the redundant zero-store survives and becomes a
+      // cross-partition channel that races the gemm partition across
+      // persistent iterations (a hang).
+      Operation *zeroStoreParentLoop =
+          zeroStoreOp->getParentOfType<scf::ForOp>();
+      if (!zeroStoreParentLoop)
+        zeroStoreParentLoop = zeroStoreOp->getParentOfType<scf::WhileOp>();
       if (zeroStoreParentLoop &&
-          (zeroStoreParentLoop == mmaParentLoop ||
+          (zeroStoreParentLoop == mmaParentLoop.getOperation() ||
            zeroStoreParentLoop->isProperAncestor(mmaParentLoop))) {
         LLVM_DEBUG({
           LDBG("Removing redundant TMEM zero-store for operand D: "
@@ -4890,27 +4941,20 @@ void removeRedundantTmemZeroStores(triton::FuncOp &funcOp) {
     }
   });
   for (auto op : toErase) {
-    // TMEMStoreOp may produce a token result that has downstream uses.
-    // Replace the output token with the input token before erasing.
-    for (unsigned i = 0; i < op.getNumResults(); ++i) {
-      if (!op.getResult(i).use_empty()) {
-        // Find the corresponding input token operand to forward.
-        // TMEMStoreOp signature: (src, dst[token], pred) -> token
-        // The token input is the second operand (getToken()).
-        if (i == 0 && op.getNumOperands() >= 2) {
-          Value inputToken = op.getOperand(1);
-          if (inputToken.getType() == op.getResult(i).getType() &&
-              inputToken != op.getResult(i)) {
-            op.getResult(i).replaceAllUsesWith(inputToken);
-            continue;
-          }
-        }
-        // Cannot safely replace — skip erasing this op.
-        goto next_op;
-      }
+    // The store may produce a token result that downstream ops depend on
+    // (e.g. the inner loop's accumulator iter_arg init is the store's token).
+    // Forward the store's *input* dep token (getDep()) to its result token
+    // (getToken()) so the dependency chain skips the removed store. Using the
+    // dst memdesc operand here instead of the dep token would type-mismatch and
+    // leave the store un-erased (the static-persistent-while hang).
+    Value resultTok = op.getToken();
+    if (resultTok && !resultTok.use_empty()) {
+      Value inputTok = op.getDep();
+      if (!inputTok)
+        continue; // no input token to forward; keep the store
+      resultTok.replaceAllUsesWith(inputTok);
     }
     op.erase();
-  next_op:;
   }
 }
 
@@ -5717,15 +5761,23 @@ public:
     // Set NameLoc("accum_cnt") on ForOp block arguments whose corresponding
     // yield operand already has an "accum_cnt" NameLoc. This must be done at
     // the end because earlier steps may replace ForOps and lose block arg locs.
-    funcOp.walk([&](scf::ForOp forOp) {
-      auto yieldOp = llvm::cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-      unsigned numIterArgs = forOp.getNumRegionIterArgs();
+    funcOp.walk([&](LoopLikeOpInterface loop) {
+      // The back-edge terminator is the last region's terminator: the body
+      // scf.yield for scf.for, the "after" scf.yield for scf.while. Skip any
+      // other loop-like op whose terminator is not an scf.yield.
+      auto yieldOp = llvm::dyn_cast<scf::YieldOp>(
+          loop.getOperation()
+              ->getRegion(loop.getOperation()->getNumRegions() - 1)
+              .front()
+              .getTerminator());
+      if (!yieldOp)
+        return;
+      unsigned numIterArgs = loop.getRegionIterArgs().size();
       for (unsigned i = 0; i < numIterArgs; ++i) {
         Value yieldVal = yieldOp.getOperand(i);
         if (auto nameLoc = llvm::dyn_cast<NameLoc>(yieldVal.getLoc())) {
           if (nameLoc.getName().getValue() == "accum_cnt") {
-            // The iter arg is block arg at index i+1 (skip induction var).
-            auto arg = forOp.getRegionIterArg(i);
+            auto arg = loop.getRegionIterArgs()[i];
             arg.setLoc(NameLoc::get(
                 StringAttr::get(funcOp.getContext(), "accum_cnt")));
           }

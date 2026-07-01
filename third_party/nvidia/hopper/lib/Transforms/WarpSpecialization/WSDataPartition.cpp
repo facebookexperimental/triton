@@ -32,7 +32,8 @@ static bool containsAll(const SmallVector<AsyncTaskId> &superset,
 }
 
 static bool isControlFlowOp(Operation *op) {
-  return isa<ReturnOp, FuncOp, scf::YieldOp, scf::ForOp, scf::IfOp>(op);
+  return isa<ReturnOp, FuncOp, scf::YieldOp, scf::ConditionOp, scf::ForOp,
+             scf::IfOp, scf::WhileOp>(op);
 }
 
 // Ensure all ops in the def-use chain carry the correct async task IDs.
@@ -53,7 +54,8 @@ static void fixTaskId(triton::FuncOp &funcOp) {
         // Backward propagation: ensure def covers op's task IDs.
         if (!containsAll(defTaskIds, asyncTaskIds)) {
           // Skip control flow ops.
-          if (isa<scf::YieldOp, scf::ForOp, scf::IfOp>(op))
+          if (isa<scf::YieldOp, scf::ConditionOp, scf::ForOp, scf::IfOp,
+                  scf::WhileOp>(op))
             continue;
           // Only propagate backward to arithmetic ops (e.g. constants).
           // Const ops with same value but different task ids can be folded.
@@ -73,8 +75,10 @@ static void fixTaskId(triton::FuncOp &funcOp) {
 
         // Forward propagation: ensure op covers def's task IDs
         if (operand.hasOneUse() && !containsAll(asyncTaskIds, defTaskIds)) {
-          // YieldOp may lose task attribute during MLIR canonicalization.
-          if (isa<scf::YieldOp, scf::IfOp>(op)) {
+          // YieldOp/ConditionOp may lose task attributes during MLIR
+          // canonicalization.
+          if (isa<scf::YieldOp, scf::ConditionOp, scf::IfOp, scf::WhileOp>(
+                  op)) {
             LLVM_DEBUG({
               LDBG("forward fixing taskId for");
               defOp->dump();
@@ -566,16 +570,36 @@ static bool getBackwardSliceToPartition(Value v,
     assert(isa<BlockArgument>(v) && "value is not an operation or block ");
     auto bbArg = cast<BlockArgument>(v);
     Operation *bbAargOwner = bbArg.getOwner()->getParentOp();
-    if (auto forOp = dyn_cast<scf::ForOp>(bbAargOwner)) {
-      // track initial value
-      auto initArg = forOp.getInitArgs()[bbArg.getArgNumber() - 1];
-      if (!getBackwardSliceToPartition(initArg, partitionScheme, currentDim)) {
-        return false;
-      }
-      // track yield value
-      auto yieldArg = forOp.getYieldedValues()[bbArg.getArgNumber() - 1];
-      if (!getBackwardSliceToPartition(yieldArg, partitionScheme, currentDim)) {
-        return false;
+    if (auto loop = dyn_cast<LoopLikeOpInterface>(bbAargOwner)) {
+      if (auto whileOp = dyn_cast<scf::WhileOp>(bbAargOwner);
+          whileOp && bbArg.getOwner() == whileOp.getAfterBody()) {
+        // scf.while "after" arg j is fed from the scf.condition forwarded
+        // operand j (which also feeds result j).
+        Value fwd = whileOp.getConditionOp().getArgs()[bbArg.getArgNumber()];
+        if (!getBackwardSliceToPartition(fwd, partitionScheme, currentDim)) {
+          return false;
+        }
+      } else {
+        // scf.for body iter arg, or scf.while "before" arg: track the init
+        // value and the value yielded back for the next iteration. The slot
+        // abstraction hides the induction-variable offset (scf.for) and the
+        // two-region structure (scf.while). A scf.for induction variable is not
+        // in getRegionIterArgs() and is skipped.
+        auto iterArgs = loop.getRegionIterArgs();
+        auto it = llvm::find(iterArgs, bbArg);
+        if (it != iterArgs.end()) {
+          auto slot =
+              getLoopCarriedSlot(loop, std::distance(iterArgs.begin(), it));
+          if (slot.init && !getBackwardSliceToPartition(
+                               slot.init->get(), partitionScheme, currentDim)) {
+            return false;
+          }
+          if (slot.yielded &&
+              !getBackwardSliceToPartition(slot.yielded->get(), partitionScheme,
+                                           currentDim)) {
+            return false;
+          }
+        }
       }
     } else if (isa<triton::FuncOp>(bbAargOwner)) {
       if (isa<TensorDescType>(bbArg.getType())) {
@@ -721,11 +745,34 @@ static bool getForwardSliceToPartition(Value v,
       for (OpOperand &operand : yieldOp->getOpOperands()) {
         if (operand.get() == v) {
           partitionScheme.ops.insert(parentOp);
-          if (!getForwardSliceToPartition(
-                  parentOp->getResult(operand.getOperandNumber()),
-                  partitionScheme, currentDim, seen))
+          unsigned idx = operand.getOperandNumber();
+          // For scf.for / scf.if, yield operand k feeds result k. For an
+          // scf.while "after" yield, operand k instead feeds "before" arg k
+          // (the loop-carry back edge); results come from scf.condition.
+          Value fwd;
+          if (auto whileOp = dyn_cast<scf::WhileOp>(parentOp))
+            fwd = whileOp.getBeforeArguments()[idx];
+          else
+            fwd = parentOp->getResult(idx);
+          if (!getForwardSliceToPartition(fwd, partitionScheme, currentDim,
+                                          seen))
             return false;
-          ;
+        }
+      }
+    } else if (auto condOp = dyn_cast<scf::ConditionOp>(depOp)) {
+      // scf.while "before" terminator: a forwarded operand feeds both the
+      // matching result and the matching "after" arg.
+      auto whileOp = cast<scf::WhileOp>(condOp->getParentOp());
+      partitionScheme.ops.insert(whileOp);
+      for (OpOperand &operand : condOp.getArgsMutable()) {
+        if (operand.get() == v) {
+          unsigned argIdx = operand.getOperandNumber() - 1;
+          if (!getForwardSliceToPartition(whileOp->getResult(argIdx),
+                                          partitionScheme, currentDim, seen))
+            return false;
+          if (!getForwardSliceToPartition(whileOp.getAfterArguments()[argIdx],
+                                          partitionScheme, currentDim, seen))
+            return false;
         }
       }
     }
@@ -1377,7 +1424,10 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     }
     auto newCoordVal = coordVal;
     if (offset) {
-      builder.setInsertionPointAfter(coordVal.getDefiningOp());
+      if (auto *defOp = coordVal.getDefiningOp())
+        builder.setInsertionPointAfter(defOp);
+      else
+        builder.setInsertionPoint(op);
       Value offsetVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
           op->getLoc(), offset * shape[dim] / numOfPartitions, 32);
       newCoordVal = builder.createWithAsyncTaskIds<arith::AddIOp>(
@@ -1578,6 +1628,113 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
         reverseMappings.map(newSlicedResult, newResult);
       }
     }
+  } else if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
+    SmallVector<Value> newLoopArgs(whileOp.getInits().begin(),
+                                   whileOp.getInits().end());
+    struct NewWhileSlot {
+      unsigned slotIdx;
+      BlockArgument oldBeforeArg;
+      BlockArgument oldAfterArg;
+      OpResult oldResult;
+    };
+    SmallVector<NewWhileSlot> newSlots;
+
+    for (auto [slotIdx, initArg] : llvm::enumerate(whileOp.getInits())) {
+      auto newInitArgOp =
+          sliceOp(initArg, offset, mappings, reverseMappings, partitionScheme);
+      Value newInitArg = mappings.lookupOrNull(initArg);
+      if (!newInitArg && isa<BlockArgument>(initArg)) {
+        auto bbArg = cast<BlockArgument>(initArg);
+        Block *parentBlock = bbArg.getOwner();
+        unsigned argIndex = bbArg.getArgNumber();
+        Region *parentRegion = parentBlock->getParent();
+        Region &newParentRegion =
+            newInitArgOp->getRegion(parentRegion->getRegionNumber());
+        newInitArg = newParentRegion.front().getArgument(argIndex);
+      }
+      if (!newInitArg)
+        continue;
+
+      assert(newInitArg != initArg && "value not sliced");
+      newLoopArgs.push_back(newInitArg);
+      auto slot = getLoopCarriedSlot(
+          cast<LoopLikeOpInterface>(whileOp.getOperation()), slotIdx);
+      newSlots.push_back({static_cast<unsigned>(slotIdx), slot.iterArg,
+                          slot.afterArg, slot.result});
+    }
+
+    builder.setInsertionPoint(op);
+    SmallVector<Type> resultTypes(whileOp->getResultTypes());
+    for (Value newArg :
+         llvm::drop_begin(newLoopArgs, whileOp.getInits().size()))
+      resultTypes.push_back(newArg.getType());
+    auto newWhileOp = builder.createWithAsyncTaskIds<scf::WhileOp>(
+        whileOp.getLoc(), resultTypes, newLoopArgs);
+    newWhileOp->setAttrs(whileOp->getAttrs());
+    partitionScheme.ops.insert(newWhileOp);
+    newOp = newWhileOp;
+
+    SmallVector<Type> beforeArgTypes;
+    for (Value arg : newLoopArgs)
+      beforeArgTypes.push_back(arg.getType());
+    SmallVector<Location> beforeLocs(beforeArgTypes.size(), whileOp.getLoc());
+    SmallVector<Location> afterLocs(resultTypes.size(), whileOp.getLoc());
+    if (newWhileOp.getBefore().empty())
+      newWhileOp.getBefore().emplaceBlock();
+    if (newWhileOp.getAfter().empty())
+      newWhileOp.getAfter().emplaceBlock();
+    newWhileOp.getBeforeBody()->addArguments(beforeArgTypes, beforeLocs);
+    newWhileOp.getAfterBody()->addArguments(resultTypes, afterLocs);
+    newWhileOp.getBeforeBody()->getOperations().splice(
+        newWhileOp.getBeforeBody()->getOperations().begin(),
+        whileOp.getBeforeBody()->getOperations());
+    newWhileOp.getAfterBody()->getOperations().splice(
+        newWhileOp.getAfterBody()->getOperations().begin(),
+        whileOp.getAfterBody()->getOperations());
+
+    for (auto [oldArg, newArg] :
+         llvm::zip(whileOp.getBeforeArguments(),
+                   newWhileOp.getBeforeArguments().take_front(
+                       whileOp.getBeforeArguments().size())))
+      oldArg.replaceAllUsesWith(newArg);
+    for (auto [oldArg, newArg] :
+         llvm::zip(whileOp.getAfterArguments(),
+                   newWhileOp.getAfterArguments().take_front(
+                       whileOp.getAfterArguments().size())))
+      oldArg.replaceAllUsesWith(newArg);
+
+    for (unsigned i = 0; i < whileOp.getNumResults(); ++i)
+      whileOp.getResult(i).replaceAllUsesWith(newWhileOp.getResult(i));
+    whileOp->setAttr("to_be_removed", builder.getUnitAttr());
+
+    unsigned appendedIdx = 0;
+    unsigned oldInitCount = whileOp.getInits().size();
+    unsigned oldResultCount = whileOp.getNumResults();
+    for (const NewWhileSlot &slot : newSlots) {
+      Value newBeforeArg =
+          newWhileOp.getBeforeArguments()[oldInitCount + appendedIdx];
+      newWhileOp.getConditionOp().getArgsMutable().append(newBeforeArg);
+      mappings.map(slot.oldBeforeArg, newBeforeArg);
+      reverseMappings.map(newBeforeArg, slot.oldBeforeArg);
+
+      if (slot.oldAfterArg) {
+        Value newAfterArg =
+            newWhileOp.getAfterArguments()[oldResultCount + appendedIdx];
+        mappings.map(slot.oldAfterArg, newAfterArg);
+        mappings.map(
+            newWhileOp.getAfterArguments()[slot.oldAfterArg.getArgNumber()],
+            newAfterArg);
+        reverseMappings.map(newAfterArg, slot.oldAfterArg);
+      }
+      if (slot.oldResult) {
+        Value newResult = newWhileOp.getResult(oldResultCount + appendedIdx);
+        mappings.map(slot.oldResult, newResult);
+        mappings.map(newWhileOp.getResult(slot.oldResult.getResultNumber()),
+                     newResult);
+        reverseMappings.map(newResult, slot.oldResult);
+      }
+      ++appendedIdx;
+    }
   } else if (auto yieldOp = dyn_cast<scf::YieldOp>(op)) {
     // For ForOp yields, only append sliced yield operands for positions where
     // the parent ForOp actually added a new init arg. The ForOp slicing records
@@ -1586,15 +1743,37 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     // mapped (not sliced outside the loop), appending would create a
     // type/ordering mismatch between init args and yield operands.
     auto parentForOp = dyn_cast<scf::ForOp>(yieldOp->getParentOp());
+    auto parentWhileOp = dyn_cast<scf::WhileOp>(yieldOp->getParentOp());
     int num = yieldOp.getNumOperands();
     for (int i = 0; i < num; i++) {
       auto operand = yieldOp.getOperand(i);
       sliceOp(operand, offset, mappings, reverseMappings, partitionScheme);
       if (auto newV = mappings.lookupOrNull(operand)) {
         // Only append if the parent ForOp also has a corresponding new result.
-        if (!parentForOp || mappings.lookupOrNull(parentForOp.getResult(i)))
+        if ((!parentForOp || mappings.lookupOrNull(parentForOp.getResult(i))) &&
+            !parentWhileOp)
+          yieldOp->insertOperands(op->getNumOperands(), newV);
+        // scf.while: append unconditionally when the operand was sliced. Unlike
+        // scf.for there is no per-index result guard here because the while
+        // branch above appends a loop-carried arg for every sliced init, and
+        // for a while the after-yield operand k feeds before-arg k 1:1, so a
+        // sliced yield operand always has a matching appended before-arg. This
+        // holds for the loop-carried values this pass threads
+        // (accumulators/counters); slicing an after-region-only value whose
+        // init was not sliced would break the 1:1 alignment and needs a guard
+        // analogous to the for path.
+        if (parentWhileOp)
           yieldOp->insertOperands(op->getNumOperands(), newV);
       }
+    }
+    newOp = op;
+  } else if (auto condOp = dyn_cast<scf::ConditionOp>(op)) {
+    int num = condOp.getArgs().size();
+    for (int i = 0; i < num; i++) {
+      auto operand = condOp.getArgs()[i];
+      sliceOp(operand, offset, mappings, reverseMappings, partitionScheme);
+      if (auto newV = mappings.lookupOrNull(operand))
+        condOp.getArgsMutable().append(newV);
     }
     newOp = op;
   } else if (auto reduceOp = dyn_cast<ReduceOp>(op)) {
@@ -1655,7 +1834,7 @@ static bool doDeepCleanup(triton::FuncOp &funcOp,
 
     // Identify root ops that are not used so to be deleted.
     funcOp.walk([&](Operation *op) {
-      if (isa<scf::YieldOp>(op))
+      if (isa<scf::YieldOp, scf::ConditionOp>(op))
         return;
       if (!partitionScheme.ops.contains(op))
         return;
@@ -1665,12 +1844,12 @@ static bool doDeepCleanup(triton::FuncOp &funcOp,
       if (!isMemoryEffectFree(op))
         opsCanBeTriviallyDead.insert(op);
 
-      // Don't delete ForOps or IfOps directly. After slicing, the only
-      // ForOps/IfOps remaining in the partition scheme are the final sliced
+      // Don't delete region ops directly. After slicing, the only
+      // region ops remaining in the partition scheme are the final sliced
       // versions (originals were erased via "to_be_removed"). These contain
       // the partitioned ops and must be preserved. Let the canonicalization
       // patterns handle dead argument elimination instead.
-      if (isa<scf::ForOp, scf::IfOp>(op))
+      if (isa<scf::ForOp, scf::IfOp, scf::WhileOp>(op))
         return;
 
       bool notUsed = true;
@@ -1715,6 +1894,8 @@ static bool doDeepCleanup(triton::FuncOp &funcOp,
                                             funcOp.getContext());
     scf::IfOp::getCanonicalizationPatterns(cleanUpPatterns,
                                            funcOp.getContext());
+    scf::WhileOp::getCanonicalizationPatterns(cleanUpPatterns,
+                                              funcOp.getContext());
     if (applyPatternsGreedily(funcOp, std::move(cleanUpPatterns)).failed()) {
       return false;
     }
@@ -1875,11 +2056,11 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
   for (auto &[argIndex, dim] : partitionScheme.funcArgPartitionDims) {
     auto bbArg = funcOp.getArgument(argIndex);
     for (Operation *user : bbArg.getUsers()) {
-      if (auto forOp = dyn_cast<scf::ForOp>(user)) {
-        for (Value initArg : forOp.getInitArgs()) {
+      if (auto loop = dyn_cast<LoopLikeOpInterface>(user)) {
+        for (Value initArg : loop.getInits()) {
           if (initArg == bbArg) {
             LDBG("TensorDescType func arg " << argIndex
-                                            << " used as ForOp init arg; "
+                                            << " used as loop init arg; "
                                                "not supported yet");
             return false;
           }
@@ -2194,12 +2375,12 @@ public:
 
   void runOnFuncOp(triton::FuncOp funcOp) {
     std::optional<uint32_t> dataPartitonFactor;
-    SmallVector<scf::ForOp> loops;
-    funcOp->walk([&](scf::ForOp forOp) {
-      if (forOp->hasAttr(mlir::triton::kWarpSpecializeAttrName))
-        loops.push_back(forOp);
+    SmallVector<LoopLikeOpInterface> loops;
+    funcOp->walk([&](LoopLikeOpInterface loop) {
+      if (loop->hasAttr(mlir::triton::kWarpSpecializeAttrName))
+        loops.push_back(loop);
       if (auto factor =
-              forOp->getAttrOfType<IntegerAttr>(kDataPartitionAttrName)) {
+              loop->getAttrOfType<IntegerAttr>(kDataPartitionAttrName)) {
         assert((!dataPartitonFactor || factor.getInt() == dataPartitonFactor) &&
                "data partition factor mismatch");
         dataPartitonFactor = factor.getInt();

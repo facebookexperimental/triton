@@ -196,6 +196,74 @@ output." To validate this rule today, run the skill against the pre-fix
 `ws_code_partition_tmem_packed_reuse_backward.mlir` (the back-edges removed) and
 confirm the coverage table reports ✗ for `m_ij`/`l_i0`.
 
+#### Redundant cross-partition accumulator init (persistent-loop cross-tile hazard)
+
+**This is the opposite failure mode from a deadlock false-positive: an extra
+channel that should not exist at all, which the per-barrier checks happily report
+as "balanced and correct."** A GEMM/attention accumulator (TMEM operand D) is
+normally zero-initialized *implicitly* by the MMA's `useAccumulator=false` on the
+first inner-loop iteration — no explicit store, no channel. If an explicit
+`ttng.tmem_store <zero>` into that same accumulator ALSO survives, and it lives in
+a **different partition** than the MMA (e.g. the epilogue/reduction partition
+zeroes while the gemm partition does the `useAccumulator=false` MMA), then the
+store becomes a **redundant cross-partition channel**: producer = the zeroing
+partition, consumer = the MMA. Each of its barriers is individually
+arrive/wait-balanced, so Sections 3–4 pass — but in a **persistent** kernel
+(outer `scf.for` or `scf.while`) that channel is carried across tiles and the
+zeroing partition races the MMA/read partition from one tile to the next → a
+non-deterministic **hang** (the static-persistent-while-GEMM bug).
+
+The tell is *structural divergence + redundancy*, not an imbalance:
+- The accumulator carries **more handshake barriers than necessary** — a correct
+  accumulator needs only FULL (MMA-commit → reader-wait) and EMPTY (reader-arrive
+  → MMA-reuse-wait). A redundant zero-store adds a *second* pair (reuse-wait
+  before the store + ready-arrive after it), i.e. ~4 accumulator barriers / 2
+  `tc_gen5_commit`s instead of ~2 / 1.
+- An explicit `tmem_store` of a constant-zero tensor into an operand-D
+  accumulator coexists with an MMA on the same accumulator whose `useAccumulator`
+  4th operand is `%false` (or a loop iter-arg whose init is false).
+
+**Detection.** For each TMEM operand-D accumulator (`buffer.id` of the MMA's
+accumulator, typically a `4x…xf32 #tmem` alloc):
+1. Find its `tc_gen5_mma` writer and read whether `useAccumulator` is false on the
+   first iteration (4th operand `%false`, or an inner-loop iter-arg with `%false`
+   init → `%true` thereafter). If so, the MMA self-zeroes.
+2. Look for an `ttng.tmem_store` of a constant-zero tensor (`arith.constant
+   dense<0.0…>`) into that same accumulator.
+3. If both exist, check whether the store and the MMA are in **different
+   partitions** (compare `async_task_id` / the `ttg.partition.types` region).
+4. **Flag a cross-tile race/hang** when the redundant zero-store exists in a
+   different partition AND the enclosing structure is a persistent loop
+   (`scf.for` or `scf.while`). The correct IR has the store removed entirely —
+   the MMA's `useAccumulator=false` is the only initializer.
+
+This is invisible to arrive/wait balancing because the defect is a *channel that
+should not exist*, with its own perfectly-balanced barriers — not a missing or
+imbalanced arrive. The compiler removes it in `removeRedundantTmemZeroStores`
+(`WSCodePartition.cpp`); the persistent **while** case additionally requires that
+pass to recognize `scf::WhileOp` as the outer loop (the zero-store sits directly
+in the while's after region) and to forward the store's dep token (`getDep()` →
+`getToken()`) when erasing — otherwise the store survives and the hang returns.
+
+**Emit a coverage row per operand-D accumulator** (print it even when clean):
+
+```
+Operand-D accumulator buffer.id = 3 (TMEM 4x128x128xf32)
+  MMA writer: tc_gen5_mma useAccumulator=false (first iter)  -> self-zeroes
+  Explicit zero-store present? : YES  ttng.tmem_store <0>  (task 0, epilogue)
+  MMA partition / store partition : task 1 (gemm) / task 0 (epilogue)  -> DIFFERENT
+  Persistent outer loop : scf.while
+  Verdict: ✗ REDUNDANT cross-partition zero-store -> cross-tile race/hang
+           (expected: store removed; init via useAccumulator=false only)
+```
+
+A ✗ here means the redundant init channel must be removed. A clean accumulator
+prints `Explicit zero-store present? : NO  -> ✓ init via useAccumulator=false`.
+To validate this rule, run the skill on the pre-fix static-persistent
+while-loop GEMM TTGIR (`matmul_kernel_tma_static_persistent_ws_while`): the
+broken version shows the explicit `tmem_store <0>` + 4 accumulator barriers / 2
+commits and must report ✗; the fixed version has 0 stores / 2 barriers / 1 commit.
+
 #### Barrier Mechanism Types
 
 | Mechanism | Arrive Side | Wait Side | Notes |
@@ -408,6 +476,16 @@ Include:
     packed sibling whose consumer lives in another partition. Flag any missing
     back-edge as a data race — this is NOT caught by arrive/wait-count balancing,
     because each packed sibling's token is individually balanced.
+11. **Check for a redundant cross-partition accumulator zero-store** (see
+    "Redundant cross-partition accumulator init" above). For each operand-D TMEM
+    accumulator whose `tc_gen5_mma` has `useAccumulator=false` on the first
+    iteration, look for an explicit `ttng.tmem_store` of a constant-zero tensor
+    into the same accumulator. If that store is in a different partition than the
+    MMA and the kernel is persistent (`scf.for`/`scf.while` outer loop), flag a
+    cross-tile race/hang: the store is redundant (the MMA self-zeroes) and forms
+    an extra cross-partition channel. This is NOT caught by arrive/wait-count
+    balancing — the extra channel's barriers are individually balanced; it is a
+    channel that should not exist. Emit the coverage row even when clean.
 
 ## Example Reports
 
