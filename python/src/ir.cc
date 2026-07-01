@@ -2057,8 +2057,30 @@ void init_triton_ir(py::module &&m) {
 
             TritonSourceMgrDiagnosticHandler diagHandler =
                 setupTritonDiagnosticHandler(context);
-            if (failed(self.run(mod.getOperation())))
-              throw std::runtime_error("PassManager::run failed");
+
+            // The default SourceMgr handler only writes to stderr, so a
+            // deliberate emitError reject is invisible to a caller inspecting
+            // only the exception text. Capture the first error diagnostic and
+            // append it, keeping the "PassManager::run failed" prefix so
+            // callers / tests that substring-match it still work.
+            std::string firstErrDiag;
+            ScopedDiagnosticHandler captureHandler(
+                context, [&](Diagnostic &diag) {
+                  if (diag.getSeverity() == DiagnosticSeverity::Error &&
+                      firstErrDiag.empty()) {
+                    firstErrDiag = diag.str();
+                  }
+                  // Return failure so the diagnostic continues on to the
+                  // SourceMgr handler above (preserving the stderr output).
+                  return failure();
+                });
+
+            if (failed(self.run(mod.getOperation()))) {
+              std::string msg = "PassManager::run failed";
+              if (!firstErrDiag.empty())
+                msg += ": " + firstErrDiag;
+              throw std::runtime_error(msg);
+            }
           },
           py::call_guard<py::gil_scoped_release>());
 }

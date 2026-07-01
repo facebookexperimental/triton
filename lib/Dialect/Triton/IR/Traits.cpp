@@ -6,6 +6,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/ErrorHandling.h"
 
 using namespace mlir;
@@ -80,6 +81,8 @@ OpTrait::impl::verifySameOperandsAndResultEncoding(Operation *op) {
 }
 
 LogicalResult OpTrait::impl::verifyTensorSize(Operation *op) {
+  static const bool allowNpot =
+      mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
   for (auto opType : op->getOperandTypes()) {
     if (auto tensorType = dyn_cast<RankedTensorType>(opType)) {
       int64_t numElements = 1;
@@ -89,7 +92,7 @@ LogicalResult OpTrait::impl::verifyTensorSize(Operation *op) {
         return op->emitError("Maximum allowed number of elements is ")
                << maxTensorNumElements << ", but " << *op
                << " has more than that";
-      if ((numElements & (numElements - 1)) != 0)
+      if (!allowNpot && (numElements & (numElements - 1)) != 0)
         return op->emitError("Number of elements must be power-of-two, but ")
                << *op << " doesn't follow the rule (" << numElements << ")"
                << " elements";
@@ -104,7 +107,7 @@ LogicalResult OpTrait::impl::verifyTensorSize(Operation *op) {
         return op->emitError("Maximum allowed number of elements is ")
                << maxTensorNumElements << ", but " << *op
                << " has more than that";
-      if ((numElements & (numElements - 1)) != 0)
+      if (!allowNpot && (numElements & (numElements - 1)) != 0)
         return op->emitError("Number of elements must be power-of-two, but ")
                << *op << " doesn't follow the rule (" << numElements << ")"
                << " elements";

@@ -296,6 +296,13 @@ applyLinearLayout(Location loc, RewriterBase &rewriter,
     shift += layout.getInDimSizeLog2(inDimName);
   }
 
+  if (layout.isModular()) {
+    mlir::emitError(loc) << "NPOT layout not yet supported in lowering: "
+                            "applyLinearLayout cannot index a modular "
+                            "(non-power-of-2) output dimension yet";
+    return outIndices;
+  }
+
   for (auto &[outDimName, outIdx] : outIndices) {
     // Apply flattened sublayout for this output
     auto matrix = layout.sublayout(inDimNames, outDimName).flattenIns();
