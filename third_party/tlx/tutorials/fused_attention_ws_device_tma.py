@@ -1406,10 +1406,14 @@ class _attention_opt(torch.autograd.Function):
 
         triton.set_allocator(alloc_fn)
 
-        # NOTE: persistent backward (_attn_bwd_persist) is not yet usable:
-        # the kernel body exceeds the 512-unit TMEM hardware limit (needs 704)
-        # and the pipeliner cannot predicate tt.descriptor_reduce (atomic_add
-        # via TMA). Use non-persistent backward until compiler support improves.
+        # NOTE: the persistent backward (_attn_bwd_persist) is functional for
+        # the tested configs (bwd_config_idx 0-4). bwd_config_idx 2
+        # (_BWD_DOT_ATTRS_TMEM, the 3-group dpT/dq/dsT TMEM reuse) additionally
+        # requires early_tma_store_lowering=True and relies on the cross-tile
+        # staging-reuse WAR barrier (WSCodePartition.cpp Step 7.5) — without it
+        # the dv/dk TMA-staging buffers (aliasing the v/do operand SMEM) race
+        # the next tile's operand load. See test_bwd_tmem_dsT_reuse_3group and
+        # test_bwd_tmem_dsT_reuse_3group_persistent.
         desc_k = TensorDescriptor(
             arg_k,
             shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
