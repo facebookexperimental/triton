@@ -1750,6 +1750,99 @@ void init_triton_ir(py::module &&m) {
                throw pybind11::index_error("program_id must be in [0,3]");
              return self.create<GetNumProgramsOp>(axis);
            })
+      // CLC (Cluster Launch Control) scheduler primitives - SM100+ (Blackwell).
+      // These live on the standard builder so `tl.clc` is self-contained (works
+      // without importing TLX). They build the same ttng CLC ops used by Gluon
+      // and TLX. The buffer/barrier allocation, phase, and decode are all
+      // hidden behind these helpers so the kernel author never writes the
+      // plumbing.
+      .def("create_clc_alloc_response",
+           [](TritonOpBuilder &self) -> Value {
+             // A CLC response is 16 bytes; the ops require a rank-1 memdesc of
+             // exactly 2 x i64 (see verifyCLCResultMemdesc).
+             auto ctx = self.getBuilder().getContext();
+             auto cga = ttg::CGAEncodingAttr::get1CTALayout(ctx, /*rank=*/1);
+             llvm::SmallVector<unsigned> order{0};
+             Attribute enc = ttg::SwizzledSharedEncodingAttr::get(
+                 ctx, /*vectorSize=*/1, /*perPhase=*/1, /*maxPhase=*/1, order,
+                 cga);
+             auto memSpace = ttg::SharedMemorySpaceAttr::get(ctx);
+             auto memDescType = ttg::MemDescType::get(
+                 {2}, self.getBuilder().getI64Type(), enc, memSpace,
+                 /*mutableMemory=*/true);
+             return self.create<ttg::LocalAllocOp>(memDescType);
+           })
+      .def("create_clc_alloc_barriers",
+           [](TritonOpBuilder &self, int numBarriers) -> Value {
+             auto ctx = self.getBuilder().getContext();
+             auto cga = ttg::CGAEncodingAttr::get1CTALayout(ctx, /*rank=*/1);
+             llvm::SmallVector<unsigned> order{0};
+             Attribute enc = ttg::SwizzledSharedEncodingAttr::get(
+                 ctx, /*vectorSize=*/1, /*perPhase=*/1, /*maxPhase=*/1, order,
+                 cga);
+             auto memSpace = ttg::SharedMemorySpaceAttr::get(ctx);
+             auto barriersTy = ttg::MemDescType::get(
+                 {numBarriers}, self.getBuilder().getI64Type(), enc, memSpace,
+                 /*mutableMemory=*/true);
+             auto singleTy = ttg::MemDescType::get(
+                 {1}, self.getBuilder().getI64Type(), enc, memSpace,
+                 /*mutableMemory=*/true);
+             Value bufs = self.create<ttg::LocalAllocOp>(barriersTy);
+             for (int i = 0; i < numBarriers; i++) {
+               Value idx = self.create<arith::ConstantIntOp>(
+                   self.getBuilder().getI32Type(), i);
+               Value buf =
+                   self.create<ttg::MemDescIndexOp>(singleTy, bufs, idx);
+               self.create<ttng::InitBarrierOp>(buf, /*arriveCount=*/1);
+             }
+             return bufs;
+           })
+      .def("create_clc_subview",
+           [](TritonOpBuilder &self, Value buffer, Value idx) -> Value {
+             auto ty = cast<ttg::MemDescType>(buffer.getType());
+             auto singleTy =
+                 ttg::MemDescType::get({1}, ty.getElementType(),
+                                       ty.getEncoding(), ty.getMemorySpace(),
+                                       /*mutableMemory=*/ty.getMutableMemory());
+             return self.create<ttg::MemDescIndexOp>(singleTy, buffer, idx);
+           })
+      .def("create_clc_try_cancel",
+           [](TritonOpBuilder &self, Value response, Value mbar,
+              bool multicast) -> void {
+             self.create<ttng::CLCTryCancelOp>(response, mbar, multicast);
+           })
+      .def("create_clc_barrier_expect",
+           [](TritonOpBuilder &self, Value mbar, int expectBytes) -> void {
+             Value pred = self.create<arith::ConstantIntOp>(
+                 self.getBuilder().getI1Type(), true);
+             self.create<ttng::BarrierExpectOp>(mbar, expectBytes, pred);
+           })
+      .def("create_clc_barrier_wait",
+           [](TritonOpBuilder &self, Value mbar, Value phase) -> void {
+             Value pred = self.create<arith::ConstantIntOp>(
+                 self.getBuilder().getI1Type(), true);
+             self.create<ttng::WaitBarrierOp>(mbar, phase, pred);
+           })
+      .def("create_clc_load_result",
+           [](TritonOpBuilder &self, Value response) -> Value {
+             return self.create<ttng::CLCLoadResultOp>(response);
+           })
+      .def("create_clc_is_canceled",
+           [](TritonOpBuilder &self, Value clcResult) -> Value {
+             return self.create<ttng::CLCIsCanceledOp>(clcResult);
+           })
+      .def("create_clc_get_program_id",
+           [](TritonOpBuilder &self, Value clcResult, int dim) -> Value {
+             return self.create<ttng::CLCGetProgramIdOp>(clcResult, dim);
+           })
+      .def("create_clc_null_result",
+           [](TritonOpBuilder &self) -> Value {
+             // A dummy i128 used to seed the scheduler's carried CLC result
+             // before the first try_cancel. It is never decoded (the first
+             // iteration reads program_id instead).
+             return self.create<arith::ConstantIntOp>(
+                 self.getBuilder().getIntegerType(128), 0);
+           })
       .def("create_dot",
            [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
               mlir::Value &c, InputPrecision inputPrecision,
