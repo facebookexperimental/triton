@@ -1784,6 +1784,58 @@ def _hstu_attn_bwd_redq(  # noqa C901
         block_shape=[BLOCK_M, DimQ],
     )
     last_block_start_n = tl.maximum(0, (tl.cdiv(seq_len_kv, BLOCK_N) - 1) * BLOCK_N)
+    if AUTOWS:
+        # AutoWS requires a SINGLE inner-loop structure. The peeled main-loop +
+        # separate masked-last-block call below expands (via inlining) into TWO
+        # inner Q-loops, so the memory planner merges the two loops' per-iteration
+        # TMEM slots into one cross-loop reuse group that the reuse-barrier pass
+        # cannot order ("TMEM reuse group has no unique dependency-chain order").
+        # Match the TLX kernel (attn_bwd_ws): iterate every KV block in one masked
+        # loop — masking is a no-op for full blocks. Kept autoWS-only (constexpr)
+        # so the non-WS peeled fast path is unchanged.
+        for start_n in tl.range(0, seq_len_kv, BLOCK_N):
+            _hstu_attn_bwd_inner(
+                start_n,
+                seq_start_kv,
+                seq_len_kv,
+                seq_start_q,
+                seq_len_q,
+                desc_q,
+                desc_k,
+                desc_v,
+                desc_do,
+                desc_dk,
+                desc_dq,
+                DV,
+                stride_qh,
+                stride_kh,
+                stride_vh,
+                stride_doh,
+                stride_dvn,
+                stride_dvh,
+                alpha,
+                attn_scale,
+                M,
+                Delta,
+                stride_mm,
+                off_h,
+                off_h_kv,
+                H_kv,
+                uih_len_q,
+                num_softmax_heads,
+                DimQ,
+                DimV,
+                ALLOW_TF32,
+                BLOCK_M,
+                BLOCK_N,
+                ATTN_SCALE_TYPE,
+                GQA_ATOMIC_ADD=G > 1,
+                SHARED_KV=SHARED_KV,
+                MASK_KV=True,
+                HAS_CAUSAL=HAS_CAUSAL,
+                AUTOWS=AUTOWS,
+            )
+        return
     for start_n in tl.range(0, last_block_start_n, BLOCK_N):
         _hstu_attn_bwd_inner(
             start_n,
