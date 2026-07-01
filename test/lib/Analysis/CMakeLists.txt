@@ -6,5 +6,5 @@ add_library(TritonTestAnalysis
   TestMembar.cpp
   TestPrintNesting.cpp
 )
-target_link_libraries(TritonTestAnalysis PUBLIC MLIRPass TritonAnalysis)
+target_link_libraries(TritonTestAnalysis PUBLIC MLIRPass TritonAnalysis TritonNvidiaGPUTransforms)
 target_compile_options(TritonTestAnalysis PRIVATE ${TRITON_DISABLE_EH_RTTI_FLAGS})
