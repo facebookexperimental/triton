@@ -3096,6 +3096,18 @@ def _hstu_attn_bwd_redkv_inner(  # noqa C901
     tl.store(dq_ptrs, dq.to(q.dtype), mask=mask_m[:, None])
 
 
+# AutoWS reduce_dq TMEM/SMEM buffer placement (below, inlined as `attrs=` dict
+# literals at each tl.dot — a module-global dict subscripted inside @triton.jit
+# is rejected by the frontend, so the channels are written inline). Matches the
+# hand-written TLX reuse decisions (cf. TLX attn_bwd_ws and FA
+# _BWD_DOT_ATTRS_TMEM in fused_attention_ws_device_tma.py). Channel fmt:
+# "operand,memType,copies,bufferId"; a shared bufferId forms a reuse group.
+#   id2: S(qkᵀ) owner, reused by P (dv's operand A)      -> P shares S's slot
+#   id5: dP(dact) owner, reused by dqᵀ (dq's operand D)  -> dq shares dP's slot (TLX dp reuse=dq)
+#   id8: dsᵀ (dqk_trans) in SMEM, operand A of dk and operand B of dq
+#   id7: dv (or dk's P·do part) standalone ; id10: dk (dsᵀ·q) standalone
+
+
 @triton.jit
 def _hstu_attn_bwd_inner(  # noqa C901
     start_n,
@@ -3187,6 +3199,7 @@ def _hstu_attn_bwd_inner(  # noqa C901
         qk_trans = tl.dot(
             k,
             tl.trans(q),
+            attrs={"channels": ["opndD,tmem,1,2"]} if AUTOWS else None,
         )
         if MASK_KV or HAS_CAUSAL:
             valid_mask_trans = backward_valid_mask(
@@ -3217,12 +3230,21 @@ def _hstu_attn_bwd_inner(  # noqa C901
         do = desc_do.load([q_offset.to(tl.int32), off_h * stride_doh])
 
         if SHARED_KV:
-            dk = tl.dot(act_qk_trans, do, dk, allow_tf32=ALLOW_TF32)
+            dk = tl.dot(
+                act_qk_trans, do, dk, allow_tf32=ALLOW_TF32,
+                attrs={"channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]} if AUTOWS else None,
+            )
         else:
             # pyrefly: ignore [unbound-name]
-            dv = tl.dot(act_qk_trans, do, dv, allow_tf32=ALLOW_TF32)
+            dv = tl.dot(
+                act_qk_trans, do, dv, allow_tf32=ALLOW_TF32,
+                attrs={"channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]} if AUTOWS else None,
+            )
 
-        dact_qk_trans = tl.dot(v, tl.trans(do), allow_tf32=ALLOW_TF32)
+        dact_qk_trans = tl.dot(
+            v, tl.trans(do), allow_tf32=ALLOW_TF32,
+            attrs={"channels": ["opndD,tmem,1,5"]} if AUTOWS else None,
+        )
         if num_softmax_heads > 0:  # autoWS: constexpr (see note above)
             dqk_trans = backward_d_softmax_activation(
                 dact_qk_trans, Delta_off, offs_m, stride_mm, mask_m, pT
@@ -3233,11 +3255,20 @@ def _hstu_attn_bwd_inner(  # noqa C901
             )
         dqk_trans = dqk_trans.to(k.dtype)
         if SHARED_KV:
-            dk_attn = tl.dot(dqk_trans, q, allow_tf32=ALLOW_TF32)
+            dk_attn = tl.dot(
+                dqk_trans, q, allow_tf32=ALLOW_TF32,
+                attrs={"channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]} if AUTOWS else None,
+            )
             dk = dk + dk_attn * alpha
         else:
-            dk = tl.dot(dqk_trans, q, dk, allow_tf32=ALLOW_TF32)
-        dq_trans = tl.dot(tl.trans(k), dqk_trans)
+            dk = tl.dot(
+                dqk_trans, q, dk, allow_tf32=ALLOW_TF32,
+                attrs={"channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]} if AUTOWS else None,
+            )
+        dq_trans = tl.dot(
+            tl.trans(k), dqk_trans,
+            attrs={"channels": ["opndB,smem,1,8", "opndD,tmem,1,5"]} if AUTOWS else None,
+        )
         dq_trans = dq_trans * alpha
         dq = tl.trans(dq_trans)
         desc_dq.store(
