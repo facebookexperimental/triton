@@ -6,6 +6,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/ErrorHandling.h"
 
 using namespace mlir;
@@ -34,17 +35,11 @@ LogicalResult OpTrait::impl::verifyEquivalentTensorType(Type typeA,
       ->verifyLayoutsAreEqual(shapeA, encodingA, encodingB, {});
 }
 
-static LogicalResult verifySameEncoding(Type typeA, Type typeB,
-                                        bool allowTensorPointerType) {
-  // TODO(Keren): the allowTensorPointerType argument is a hack to allow.
-  // The type checking code is kind of a mess with the current design.
+static LogicalResult verifySameEncoding(Type typeA, Type typeB) {
   auto getEncoding = [=](Type type) -> Attribute {
     Attribute ret;
     if (auto tensorType = dyn_cast<RankedTensorType>(type)) {
       ret = tensorType.getEncoding();
-    }
-    if (!allowTensorPointerType) {
-      assert(!triton::isTensorPointerType(type));
     }
     return ret;
   };
@@ -55,22 +50,20 @@ static LogicalResult verifySameEncoding(Type typeA, Type typeB,
   return encodingA == encodingB ? success() : failure();
 }
 
-LogicalResult
-OpTrait::impl::verifySameOperandsEncoding(Operation *op,
-                                          bool allowTensorPointerType) {
+LogicalResult OpTrait::impl::verifySameOperandsEncoding(Operation *op) {
   if (failed(verifyAtLeastNOperands(op, 1)))
     return failure();
 
   auto type = op->getOperand(0).getType();
   for (auto opType : llvm::drop_begin(op->getOperandTypes(), 1))
-    if (failed(verifySameEncoding(opType, type, allowTensorPointerType)))
+    if (failed(verifySameEncoding(opType, type)))
       return op->emitOpError() << "requires the same encoding for all operands";
 
   return success();
 }
 
-LogicalResult OpTrait::impl::verifySameOperandsAndResultEncoding(
-    Operation *op, bool allowTensorPointerType) {
+LogicalResult
+OpTrait::impl::verifySameOperandsAndResultEncoding(Operation *op) {
   if (op->getNumOperands() == 0)
     return success();
 
@@ -80,14 +73,16 @@ LogicalResult OpTrait::impl::verifySameOperandsAndResultEncoding(
 
   auto type = op->getOperand(0).getType();
   for (auto resultType : op->getResultTypes())
-    if (failed(verifySameEncoding(resultType, type, allowTensorPointerType)))
+    if (failed(verifySameEncoding(resultType, type)))
       return op->emitOpError()
              << "requires the same encoding for all operands and results";
 
-  return verifySameOperandsEncoding(op, allowTensorPointerType);
+  return verifySameOperandsEncoding(op);
 }
 
 LogicalResult OpTrait::impl::verifyTensorSize(Operation *op) {
+  static const bool allowNpot =
+      mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
   for (auto opType : op->getOperandTypes()) {
     if (auto tensorType = dyn_cast<RankedTensorType>(opType)) {
       int64_t numElements = 1;
@@ -97,7 +92,7 @@ LogicalResult OpTrait::impl::verifyTensorSize(Operation *op) {
         return op->emitError("Maximum allowed number of elements is ")
                << maxTensorNumElements << ", but " << *op
                << " has more than that";
-      if ((numElements & (numElements - 1)) != 0)
+      if (!allowNpot && (numElements & (numElements - 1)) != 0)
         return op->emitError("Number of elements must be power-of-two, but ")
                << *op << " doesn't follow the rule (" << numElements << ")"
                << " elements";
@@ -112,7 +107,7 @@ LogicalResult OpTrait::impl::verifyTensorSize(Operation *op) {
         return op->emitError("Maximum allowed number of elements is ")
                << maxTensorNumElements << ", but " << *op
                << " has more than that";
-      if ((numElements & (numElements - 1)) != 0)
+      if (!allowNpot && (numElements & (numElements - 1)) != 0)
         return op->emitError("Number of elements must be power-of-two, but ")
                << *op << " doesn't follow the rule (" << numElements << ")"
                << " elements";

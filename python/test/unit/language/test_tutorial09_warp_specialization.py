@@ -384,7 +384,6 @@ def _reduce_k_kernel(
 @pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
-@pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("generate_subtiled_region", [True, False])
 @pytest.mark.parametrize("separate_epilogue_store", [True, False])
@@ -400,7 +399,6 @@ def test_tutorial09_matmul_tma_warp_specialize(
     num_warps,
     A_col_major,
     B_col_major,
-    use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     generate_subtiled_region,
     separate_epilogue_store,
@@ -464,7 +462,6 @@ def test_tutorial09_matmul_tma_warp_specialize(
             SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
-            early_tma_store_lowering=use_early_tma_store_lowering,
             generate_subtiled_region=generate_subtiled_region,
         )
 
@@ -493,7 +490,6 @@ def test_tutorial09_matmul_tma_warp_specialize(
 @pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
-@pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("generate_subtiled_region", [True, False])
 @pytest.mark.parametrize("separate_epilogue_store", [True, False])
@@ -511,7 +507,6 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     EPILOGUE_SUBTILE,
     A_col_major,
     B_col_major,
-    use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     generate_subtiled_region,
     separate_epilogue_store,
@@ -599,7 +594,6 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
             SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
-            early_tma_store_lowering=use_early_tma_store_lowering,
             generate_subtiled_region=generate_subtiled_region,
         )
 
@@ -628,7 +622,6 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 @pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
-@pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("generate_subtiled_region", [True, False])
 @pytest.mark.parametrize("separate_epilogue_store", [True, False])
@@ -646,7 +639,6 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     EPILOGUE_SUBTILE,
     A_col_major,
     B_col_major,
-    use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     generate_subtiled_region,
     separate_epilogue_store,
@@ -712,7 +704,6 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
             SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
-            early_tma_store_lowering=use_early_tma_store_lowering,
             generate_subtiled_region=generate_subtiled_region,
         )
 
@@ -797,7 +788,6 @@ def test_tutorial09_multi_epilogue_subtile():
             SEPARATE_EPILOGUE_STORE=False,
             num_stages=num_stages,
             num_warps=num_warps,
-            early_tma_store_lowering=True,
         )
 
         # Verify warp specialization actually ran (ttg.warp_return is only
@@ -946,7 +936,6 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize_splitk(
 @pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
-@pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("enable_pingpong", [False, True])
 @pytest.mark.parametrize("separate_epilogue_store", [True, False])
@@ -962,7 +951,6 @@ def test_hopper_matmul_tma_warp_specialize(
     num_warps,
     A_col_major,
     B_col_major,
-    use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     enable_pingpong,
     separate_epilogue_store,
@@ -1023,7 +1011,6 @@ def test_hopper_matmul_tma_warp_specialize(
             SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
-            early_tma_store_lowering=use_early_tma_store_lowering,
             pingpongAutoWS=enable_pingpong,
             maxRegAutoWS=208 if DATA_PARTITION_FACTOR > 1 else 248,
         )
@@ -1049,7 +1036,6 @@ def test_hopper_matmul_tma_warp_specialize(
 @pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
-@pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("enable_pingpong", [False, True])
 @pytest.mark.parametrize("separate_epilogue_store", [True, False])
@@ -1065,7 +1051,6 @@ def test_hopper_matmul_tma_persistent_warp_specialize(
     num_warps,
     A_col_major,
     B_col_major,
-    use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     enable_pingpong,
     separate_epilogue_store,
@@ -1144,7 +1129,6 @@ def test_hopper_matmul_tma_persistent_warp_specialize(
             SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
-            early_tma_store_lowering=use_early_tma_store_lowering,
             pingpongAutoWS=enable_pingpong,
             maxRegAutoWS=208 if DATA_PARTITION_FACTOR > 1 else 248,
         )
@@ -1171,7 +1155,6 @@ def test_hopper_matmul_tma_persistent_warp_specialize(
 @pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
-@pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("enable_pingpong", [False, True])
 @pytest.mark.parametrize("separate_epilogue_store", [True, False])
@@ -1187,7 +1170,6 @@ def test_hopper_matmul_descriptor_persistent_warp_specialize(
     num_warps,
     A_col_major,
     B_col_major,
-    use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     enable_pingpong,
     separate_epilogue_store,
@@ -1251,7 +1233,6 @@ def test_hopper_matmul_descriptor_persistent_warp_specialize(
             SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
-            early_tma_store_lowering=use_early_tma_store_lowering,
             pingpongAutoWS=enable_pingpong,
             maxRegAutoWS=208 if DATA_PARTITION_FACTOR > 1 else 248,
         )
@@ -1319,7 +1300,6 @@ def test_warp_specialize_num_warps_8():
             SEPARATE_EPILOGUE_STORE=False,
             num_stages=2,
             num_warps=8,
-            early_tma_store_lowering=True,
         )
 
         ttgir = kernel.asm["ttgir"]

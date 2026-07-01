@@ -16,6 +16,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Tools/Sys/Dump.hpp"
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/Debug.h"
 //===----------------------------------------------------------------------===//
@@ -192,7 +193,7 @@ struct PipelinePass : public impl::TritonGPUPipelineBase<PipelinePass> {
     // pipeline expansion.
     lowerLoops(moduleOp);
     if (dumpIntermediateSteps) {
-      llvm::dbgs()
+      ::mlir::triton::tools::mlirDumpsOrDbgs()
           << "// -----// SoftwarePipeliner internal IR Dump After: LowerLoops\n"
           << moduleOp << "\n\n\n";
     }
@@ -200,9 +201,10 @@ struct PipelinePass : public impl::TritonGPUPipelineBase<PipelinePass> {
     // Apply the pipeline expansion.
     expandLoops(moduleOp);
     if (dumpIntermediateSteps) {
-      llvm::dbgs() << "// -----// SoftwarePipeliner internal IR Dump After: "
-                      "ExpandLoops\n"
-                   << moduleOp << "\n\n\n";
+      ::mlir::triton::tools::mlirDumpsOrDbgs()
+          << "// -----// SoftwarePipeliner internal IR Dump After: "
+             "ExpandLoops\n"
+          << moduleOp << "\n\n\n";
     }
 
     // Cleanup the IR from the pipeline attributes.

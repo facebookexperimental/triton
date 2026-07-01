@@ -13,6 +13,15 @@ First ask the user:
 1. Where is the IR? Accept either a file or a dump directory. If it is a
    directory, list plausible IR files and ask the user to pick one.
 2. Where should debug_helper dump output? Create the directory if needed.
+3. Is there a reproduce command (a `pytest`/`python` invocation that runs the
+   kernel)? Some investigations are RUNTIME checks — for example
+   `compute_sanitizer` runs the real kernel and cannot work from IR alone. If
+   the user has one, record it; if not, note that runtime investigations may
+   return `needs_context` asking for it.
+
+Write the goal, IR path, and reproduce command (if any) into
+`<output-dir>/shared-context.md` so every subagent can find them; pass it as the
+context file to runtime investigations that need a reproduce command.
 
 After the user answers:
 1. Append a run log at `<output-dir>/run.log` recording selected LLM, permission

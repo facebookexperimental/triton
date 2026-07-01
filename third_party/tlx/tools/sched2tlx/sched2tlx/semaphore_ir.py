@@ -97,8 +97,19 @@ class Semaphore:
     note: str = ""
 
     def name(self) -> str:
-        """Stable Python identifier used in emitted code."""
+        """Stable Python identifier used in emitted code.
+
+        A buffer filled by an async TMA load and consumed cross-WG is the SAME
+        channel as the buffer's own full/empty pair: the TMA signals `full`, the
+        consumer recycles `empty`. Name it after the buffer (`L<loop>_smem_<id>`)
+        so the barrier allocation, the `async_descriptor_load`, and the consumer
+        wait/arrive all reference one pair — instead of a separate `sem*_b*` that
+        no producer ever arrives. Non-TMA (register/compute) cross-WG channels
+        keep the `sem*_b*` name.
+        """
         if self.buffer is not None:
+            if self.producers and self.producers[0].async_kind == AsyncKind.TMA_LOAD:
+                return f"L{self.buffer.loop_id}_smem_{self.buffer.buffer_id}"
             return f"sem{self.sem_id}_b{self.buffer.buffer_id}"
         return f"sem{self.sem_id}_signal"
 
@@ -228,6 +239,22 @@ def derive_semaphores(loop: Any, graph: Any = None) -> list[Semaphore]:
                     data_buf = real
             depth = data_buf.count
         async_kind = _classify_async_kind(src.op_kind)
+        # A cross-WG producer that is a `local_alloc` fed by a TMA load is
+        # effectively TMA-produced: the `descriptor_load` + `local_alloc` fuse
+        # into an `async_tma_copy` straight into this buffer. Classify it as
+        # TMA_LOAD so the channel unifies onto the buffer's own full/empty pair
+        # (`L<loop>_smem_<id>`, see Semaphore.name) instead of a separate
+        # `sem*_b*` that no producer ever arrives.
+        if async_kind == AsyncKind.NONE and graph is not None and src.op_ref:
+            src_op = graph.ops.get(src.op_ref)
+            if src_op is not None and src_op.kind == "ttg.local_alloc":
+                for opnd in getattr(src_op, "operands", []) or []:
+                    feeder = graph.ops.get(getattr(opnd, "op_id", None))
+                    if feeder is not None and (
+                        _classify_async_kind(feeder.kind) == AsyncKind.TMA_LOAD
+                    ):
+                        async_kind = AsyncKind.TMA_LOAD
+                        break
         access_kind = _classify_consumer_access(dst.op_kind)
 
         # Pass A.5: if the consumer node was annotated with partition_count>1,
@@ -921,11 +948,20 @@ def build_sem_set_for_graph(
             ls.sem_id = next_id
             ls.sem.sem_id = next_id
             old_base = ls.name
-            new_base = (
-                f"sem{next_id}_b{ls.sem.buffer.buffer_id}"
-                if ls.sem.buffer is not None
-                else f"sem{next_id}"
-            )
+            # TMA-fed buffer channels keep their buffer-based name
+            # (`L<loop>_smem_<id>`) — it's already unique across loops and must
+            # match the `async_descriptor_load`/consumer barrier references.
+            # Only `sem*` channels need renumbering for cross-loop uniqueness.
+            if (
+                ls.sem.buffer is not None
+                and ls.sem.producers
+                and ls.sem.producers[0].async_kind == AsyncKind.TMA_LOAD
+            ):
+                new_base = ls.sem.name()
+            elif ls.sem.buffer is not None:
+                new_base = f"sem{next_id}_b{ls.sem.buffer.buffer_id}"
+            else:
+                new_base = f"sem{next_id}"
             if new_base != old_base:
                 ls.name = new_base
                 ls.full_name = f"{new_base}_full"

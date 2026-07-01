@@ -13,7 +13,6 @@ def Proton_Dialect : Dialect {
   }];
 
   let dependentDialects = [];
-
 }
 
 #endif

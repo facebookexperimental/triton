@@ -136,7 +136,7 @@ struct CommChannel {
   // barrier inline, such as the TMA load.
   std::optional<Value> producerBarrier;
   // Consumer barrier is only needed when the consumer op itself can update the
-  // barrier inline, such as the TCGen5MMAOp.
+  // barrier inline, such as MMAv5 ops.
   DenseMap<int, Value> consumerBarriers;
 };
 
@@ -145,13 +145,13 @@ namespace triton {
 namespace nvidia_gpu {
 struct TmemDataChannel : Channel {
   ttng::TMEMAllocOp tmemAllocOp;
-  ttng::TCGen5MMAOp tmemMmaOp;
+  ttng::MMAv5OpInterface tmemMmaOp;
   Operation *tmemProducerOp;
 
   TmemDataChannel(int producer, SmallVector<int> &consumers,
-                  ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp tmemMmaOp,
-                  Operation *tmemConsumerOp, unsigned operandIdx,
-                  unsigned numBuffers, unsigned uniqID,
+                  ttng::TMEMAllocOp tmemAllocOp,
+                  ttng::MMAv5OpInterface tmemMmaOp, Operation *tmemConsumerOp,
+                  unsigned operandIdx, unsigned numBuffers, unsigned uniqID,
                   Operation *tmemProducerOp = nullptr)
       : Channel(producer, consumers, tmemConsumerOp, operandIdx, numBuffers,
                 uniqID),
@@ -163,7 +163,7 @@ struct TmemDataChannel : Channel {
 
   ttng::TMEMAllocOp getTmemAllocOp() { return tmemAllocOp; }
   virtual Operation *getAllocOp() { return tmemAllocOp.getOperation(); }
-  ttng::TCGen5MMAOp getMmaOp() { return tmemMmaOp; }
+  ttng::MMAv5OpInterface getMmaOp() { return tmemMmaOp; }
   virtual Operation *getSrcOp() { return tmemProducerOp; }
 };
 
@@ -199,6 +199,9 @@ struct TmemDataChannelPost : Channel {
 };
 } // namespace nvidia_gpu
 } // namespace triton
+
+constexpr static char kWarpSpecializeGeneratedBarrierAttrName[] =
+    "ttg.ws_generated_barrier";
 
 bool enclosing(scf::IfOp ifOp, Operation *op);
 bool enclosing(scf::ForOp forOp, Operation *op);
@@ -334,6 +337,12 @@ void fuseTcgen05CommitBarriers(triton::FuncOp &funcOp);
 void doTMAStoreLowering(triton::FuncOp &funcOp);
 bool appearsBefore(Operation *A, Operation *B);
 
+// Verify that an A1 (SMEM circular reuse) group is well-formed:
+// - Multi-buffered (channels[0]->getNumBuffers() > 1).
+// - Every producer/consumer of every channel lives in one common basic block.
+// Returns true if valid, false otherwise.
+bool verifyReuseGroup1(ReuseGroup *group);
+
 // Verify that a 2-buffer reuse group is well-formed:
 // - Exactly 2 channels, each with a single copy (getNumBuffers() == 1).
 // - A dependency chain exists from one channel's consumer to the other's
@@ -346,6 +355,12 @@ bool verifyReuseGroup2(ReuseGroup *group);
 // chain from A's consumer to B's producer (A.consumer -> ... -> B.producer).
 // Returns {earlyChannel, lateChannel}.
 std::pair<Channel *, Channel *> orderReuseGroup2(ReuseGroup *group);
+
+// Order an N-channel single-copy reuse group into one dependency chain
+// (channel i's consumer reaches channel i+1's producer). Generalizes
+// orderReuseGroup2 to N channels and across partitions. Returns the ordered
+// channels, or an empty vector if no unique total chain order exists.
+SmallVector<Channel *> orderReuseGroupChain(ReuseGroup *group);
 
 // Verify that a reuse group with N channels (N >= 2) is well-formed:
 // - At least 2 channels, each with a single copy (getNumBuffers() == 1).
@@ -374,6 +389,15 @@ bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel);
 // has no `buffer.offset`) and is a `TmemDataChannelPost` with
 // `isOperandDNoAcc`.
 bool isWholeAllocationOverwriteReuseOwner(Channel *ownerCh);
+void invalidateWarpSpecializeBarriers(triton::FuncOp funcOp);
+
+// Verify an A5 (cross-partition) reuse group: a single-copy group of >= 3
+// channels whose producers span more than one block, where only a 2-channel
+// "core" (producers co-located in one block) needs an explicit reuse barrier
+// and every "extra" channel elides against the core via needExplicitReuseWait
+// (same-partition implicit ordering enforces the WAR). Realized case: FA-bwd
+// `_BWD_DOT_ATTRS_TMEM` group {dpT, dq, dsT}. Returns true iff treatable.
+bool verifyReuseGroupCrossPartition(ReuseGroup *group);
 
 } // namespace mlir
 
