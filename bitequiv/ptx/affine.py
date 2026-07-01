@@ -162,11 +162,18 @@ def _set_bits_mask(aff):
 class AffineEval:
     """Evaluate integer registers to :class:`Affine` / :class:`Opaque`, memoized per def."""
 
-    def __init__(self, defuse, reqntid=None):
+    def __init__(self, defuse, reqntid=None, absorb_opaque=False):
         self.du = defuse
         self.reqntid = reqntid or {}  # {'x': N, 'y': .., 'z': ..}
         self._memo = {}  # id(Def) -> value
         self._stack = set()
+        # When True, an unmodellable value becomes a fresh DROPPABLE symbol ("opq:N") instead
+        # of an Opaque that poisons the whole expression. Used only by the column-image
+        # extractor (leaf_columns), which keeps the %tid-linear part and drops opq:/param:/
+        # ctaid symbols — so an opaque ROW base (e.g. mul(stride, ctaid)) no longer hides the
+        # tid-dependent COLUMN offset. Never used for the identity-bearing leaf_coord.
+        self.absorb_opaque = absorb_opaque
+        self._opq = 0
 
     # -- operand entry points -------------------------------------------------
 
@@ -334,10 +341,18 @@ class AffineEval:
 
     # -- opaque construction (structural, register-name independent) -----------
 
+    def _fresh_opq(self):
+        self._opq += 1
+        return _symbol(f"opq:{self._opq}")  # droppable symbol (range unknown)
+
     def _opaque_pair(self, a, name, b):
+        if self.absorb_opaque:
+            return self._fresh_opq()
         return Opaque(f"{name}({canon(a)},{canon(b)})")
 
     def _opaque_def(self, d):
+        if self.absorb_opaque:
+            return self._fresh_opq()
         inst = d.inst
         parts = [canon(self.of_operand(o, d.index)) for o in inst.operands[1:]]
         slot = "" if d.slot is None else f"#{d.slot}"
