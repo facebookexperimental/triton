@@ -127,7 +127,12 @@ struct ScheduleNode {
   llvm::SmallVector<unsigned, 2> consumesBuffers; // indices into buffers
 
   // Warp specialization (from Phase 1.5)
-  int warpGroup{-1}; // -1 = unassigned
+  int warpGroup{-1}; // -1 = unassigned, -2 = replicated (see replicatedGroups)
+  // When warpGroup == -2 (replicated infra op whose consumers span multiple
+  // warp groups), the set of consumer warp groups it must be cloned into.
+  // Emitted as a multi-id ttg.partition so the WS pass replicates it. Empty
+  // unless replicated.
+  llvm::SmallVector<int, 4> replicatedGroups;
 
   bool isSuperNode() const { return childPipelineId != UINT_MAX; }
   bool hasBuffer() const {

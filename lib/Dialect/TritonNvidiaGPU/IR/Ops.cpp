@@ -28,6 +28,7 @@
 #include "mlir/Support/LLVM.h"
 #include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Analysis/Utility.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
@@ -36,6 +37,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/TensorMemoryUtils.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOpInterfaces.cpp.inc"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+#include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/StrUtil.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -196,6 +198,8 @@ LogicalResult WarpGroupDotWaitOp::verify() {
 LogicalResult InitBarrierOp::verify() {
   if (failed(verifyBarrierType(*this, getAlloc().getType())))
     return failure();
+  if (getCount() < 1)
+    return emitOpError("count must be greater than or equal to 1");
   return success();
 }
 
@@ -606,11 +610,14 @@ getMMAv5DTypeKindAndAcc(Type t) {
     return {{MMADTypeKind::f16, {Float32Type::get(ctx)}}};
   }
   // TODO: float6 and explicit float4 types are not supported yet.
-  // TODO: tcgen05.mma supports ui8/si8 -> s32 MMA, but Triton does not.
   // FIXME: i8 is used to represent float4 types.
-  if (isa<Float8E4M3FNType, Float8E5M2Type>(t) || t.isInteger(8)) {
+  if (isa<FloatType>(t) && llvm::is_contained(std::array<unsigned, 3>{4, 6, 8},
+                                              t.getIntOrFloatBitWidth())) {
     return {
         {MMADTypeKind::f8f6f4, {Float16Type::get(ctx), Float32Type::get(ctx)}}};
+  }
+  if (t.isInteger(8)) {
+    return {{MMADTypeKind::i8, {IntegerType::get(ctx, 32)}}};
   }
   return std::nullopt;
 }
@@ -661,6 +668,13 @@ LogicalResult TCGen5MMAOp::verify() {
   if (failed(verifyMMADType(*this, atype, btype, dtype)))
     return failure();
 
+  if (getA().getType().getRank() != 2)
+    return emitOpError("LHS operand must have a rank-2 tensor");
+  if (getB().getType().getRank() != 2)
+    return emitOpError("RHS operand must have a rank-2 tensor");
+  if (getD().getType().getRank() != 2)
+    return emitOpError("Return operand must have a rank-2 tensor");
+
   auto aEnc = getA().getType().getEncoding();
   if (!isa<NVMMASharedEncodingAttr, SharedLinearEncodingAttr,
            TensorMemoryEncodingAttr>(aEnc))
@@ -684,7 +698,10 @@ LogicalResult TCGen5MMAOp::verify() {
            << retType.getElementTypeBitWidth() << " but got "
            << retEnc.getColStride();
   // The maximum size of a MMA instruction is 128x256
-  if (retEnc.getBlockN() > 256)
+  auto ctaShape = getShapePerCTA(retEnc.getCGALayout().getCTASplitNum(),
+                                 retType.getShape());
+  auto instrSizeN = std::min<unsigned>(retEnc.getBlockN(), ctaShape[1]);
+  if (instrSizeN > 256)
     return emitOpError("The block size of the return operand must be less than "
                        "or equal to 256");
 
@@ -764,7 +781,6 @@ bool TCGen5MMAOp::verifyDims() {
 }
 
 bool TCGen5MMAOp::verifyOutputDims() {
-
   if (getTwoCtas()) {
     // Here we have to relax the verification to support two possibilities
     // - For TLX 2CTA:
@@ -845,14 +861,15 @@ void TCGen5MMAOp::build(OpBuilder &builder, OperationState &state, Type token,
                         Value a, Value b, Value d, Value accDep, Value useD,
                         Value pred, bool twoCtas, bool multicast,
                         ValueRange barriers, ValueRange barrierPreds,
-                        bool isAsync) {
+                        bool isAsync, bool isUnsigned) {
   if (!barriers.empty()) {
     isAsync = true;
   }
   build(builder, state, token, a, b, d, accDep, useD, pred, barriers,
         barrierPreds, isAsync ? builder.getUnitAttr() : UnitAttr(),
         twoCtas ? builder.getUnitAttr() : UnitAttr(),
-        multicast ? builder.getUnitAttr() : UnitAttr());
+        multicast ? builder.getUnitAttr() : UnitAttr(),
+        isUnsigned ? builder.getUnitAttr() : UnitAttr());
 }
 
 bool TCGen5MMAOp::isAsync() { return getIsAsync(); }
@@ -869,9 +886,36 @@ LogicalResult TCGen5CommitOp::verify() {
 }
 
 // -- TCGen5MMAScaledOp --
+
+static Type getScaledMMAOperandType(Type elementType,
+                                    ScaleDotElemType scaleType) {
+  MLIRContext *ctx = elementType.getContext();
+  if (isa<FloatType>(elementType))
+    return elementType;
+  switch (scaleType) {
+  case ScaleDotElemType::E4M3:
+    return Float8E4M3FNType::get(ctx);
+  case ScaleDotElemType::E5M2:
+    return Float8E5M2Type::get(ctx);
+  case ScaleDotElemType::E2M3:
+    return Float6E2M3FNType::get(ctx);
+  case ScaleDotElemType::E3M2:
+    return Float6E3M2FNType::get(ctx);
+  case ScaleDotElemType::E2M1:
+    return Float4E2M1FNType::get(ctx);
+  case ScaleDotElemType::BF16:
+    return BFloat16Type::get(ctx);
+  case ScaleDotElemType::FP16:
+    return Float16Type::get(ctx);
+  }
+  llvm_unreachable("Unsupported type.");
+};
+
 LogicalResult TCGen5MMAScaledOp::verify() {
-  Type atype = getA().getType().getElementType();
-  Type btype = getB().getType().getElementType();
+  Type atype =
+      getScaledMMAOperandType(getA().getType().getElementType(), getAType());
+  Type btype =
+      getScaledMMAOperandType(getB().getType().getElementType(), getBType());
   Type dtype = getD().getType().getElementType();
   if (failed(verifyMMADType(*this, atype, btype, dtype)))
     return failure();
@@ -1235,11 +1279,43 @@ LogicalResult TMEMCopyOp::verify() {
     return emitOpError("Source must have at least 16-byte alignment to be "
                        "representable in a matrix descriptor.");
   }
+  // FB/beta divergence: beta's TMEMCopy supports flexible multi-dimensional
+  // SMEM source shapes (e.g. 5D TMA scale loads) into a DummyTMEMLayoutAttr
+  // destination whose deferred layout is resolved later. Such swizzled
+  // multi-dim sources have no representable linear layout yet (toLinearLayout
+  // would report_fatal_error "Illegal shared layout"), so skip the upstream
+  // cga-layout equality check entirely when the destination layout is still a
+  // placeholder.
+  if (!isa<triton::tlx::DummyTMEMLayoutAttr>(dstTy.getEncoding())) {
+    auto shmemLl = toLinearLayout(srcTy);
+    auto tmemLl = toLinearLayout(dstTy);
 
-  auto mod = getOperation()->getParentOfType<ModuleOp>();
-  unsigned numCTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);
-  if (numCTAs != 1)
-    return emitOpError("NYI: Only one CTA is supported for now.");
+    // The upstream cga-layout equality check uses invertAndCompose, which
+    // requires matching out-dim names AND tmem out-dim sizes >= shmem out-dim
+    // sizes (its internal assertion). beta's flexible multi-dimensional scale
+    // SMEM sources can be larger than the tmem destination, which would trip
+    // that assertion, so only run the check when the out-dims are compatible
+    // (the rank-equal case upstream assumes).
+    bool compatibleOutDims =
+        llvm::equal(shmemLl.getOutDimNames(), tmemLl.getOutDimNames());
+    if (compatibleOutDims) {
+      for (auto dim : tmemLl.getOutDimNames()) {
+        if (tmemLl.getOutDimSize(dim) < shmemLl.getOutDimSize(dim)) {
+          compatibleOutDims = false;
+          break;
+        }
+      }
+    }
+    if (compatibleOutDims) {
+      auto kBlock = StringAttr::get(srcTy.getContext(), "block");
+      auto cvt = tmemLl.invertAndCompose(shmemLl);
+      if (!cvt.isTrivialOver(kBlock))
+        return emitOpError("The source and destination must have the same cga "
+                           "layout. Got source: ")
+               << shmemLl.toString()
+               << " and destination: " << tmemLl.toString();
+    }
+  }
 
   // Fp4 we could lift if we needed
   auto nvmmaEnc =
@@ -1288,6 +1364,10 @@ LogicalResult TMEMSubSliceOp::verify() {
 
   if (!isa<triton::nvidia_gpu::TensorMemorySpaceAttr>(srcTy.getMemorySpace()))
     return emitOpError("The source must be a tensor memory buffer.");
+  // Beta divergence: TMEM subslices may be higher-rank (multibuffered) and may
+  // reduce blockN (packed/reuse), so we do not enforce upstream #7777's
+  // rank==2 / same-encoding / same-allocShape restrictions. We require equal
+  // rank and innermost-dimension slicing instead.
   if (srcTy.getRank() != dstTy.getRank())
     return emitOpError(
         "The destination must have the same rank as the source.");
@@ -1324,8 +1404,7 @@ LogicalResult TMEMSubSliceOp::verify() {
       return emitOpError("The destination must use the same TMEM encoding kind "
                          "as the source.");
     if (dstTmemEncoding.getBlockM() != encoding.getBlockM() ||
-        dstTmemEncoding.getCTASplitM() != encoding.getCTASplitM() ||
-        dstTmemEncoding.getCTASplitN() != encoding.getCTASplitN() ||
+        dstTmemEncoding.getCGALayout() != encoding.getCGALayout() ||
         dstTmemEncoding.getColStride() != encoding.getColStride())
       return emitOpError("The destination must have the same block size and "
                          "CTASplit size as the source.");
@@ -1336,13 +1415,24 @@ LogicalResult TMEMSubSliceOp::verify() {
     if (!dstScaleEncoding)
       return emitOpError("The destination must use the same TMEM encoding kind "
                          "as the source.");
-    if (dstScaleEncoding.getCTASplitM() != scaleEncoding.getCTASplitM() ||
-        dstScaleEncoding.getCTASplitN() != scaleEncoding.getCTASplitN())
+    if (dstScaleEncoding.getCGALayout() != scaleEncoding.getCGALayout())
       return emitOpError(
           "The destination must have the same CTASplit size as the source.");
   } else if (!isa<triton::tlx::DummyTMEMLayoutAttr>(dstEncoding)) {
     return emitOpError(
         "The destination must use the same TMEM encoding kind as the source.");
+  }
+  // Checks adopted from upstream #7777 that are compatible with beta's
+  // higher-rank / reduced-blockN subslices.
+  if (srcTy.getElementType() != dstTy.getElementType())
+    return emitOpError(
+        "The source and result must have the same element type.");
+  auto offset = getN();
+  if (offset & (dstTy.getShape().back() - 1)) {
+    return emitError("The split offset may not touch the tile");
+  }
+  if (offset >= srcTy.getShape().back()) {
+    return emitError("The split offset may not exceed the source shape");
   }
   return mlir::success();
 }
@@ -1358,8 +1448,8 @@ void TMEMSubSliceOp::build(OpBuilder &builder, OperationState &state,
     unsigned newBlockN = std::min<unsigned>(encoding.getBlockN(), size);
     newEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
         builder.getContext(), encoding.getBlockM(), newBlockN,
-        encoding.getColStride(), encoding.getCTASplitM(),
-        encoding.getCTASplitN(), encoding.getTwoCTAs(), encoding.getCtaMode());
+        encoding.getColStride(), encoding.getCGALayout(), encoding.getTwoCTAs(),
+        encoding.getCtaMode());
   }
   auto subsliceType = gpu::MemDescType::get(
       shape, allocTy.getElementType(), newEncoding, allocTy.getMemorySpace(),
@@ -1427,25 +1517,32 @@ BlockArgument SubtiledRegionOp::addSharedArg(Value value) {
   return tileBlock.insertArgument(insertPos, value.getType(), getLoc());
 }
 
-BlockArgument SubtiledRegionOp::addPerTileArg(ArrayRef<Value> valuesPerTile) {
-  unsigned nTiles = getNumTiles();
-  assert(valuesPerTile.size() == nTiles &&
-         "addPerTileArg expects exactly numTiles values");
+bool SubtiledRegionOp::hasTileIndex() {
   Block &tileBlock = getTileRegion().front();
+  unsigned numPerTile = getNumPerTilePositions();
+  unsigned numShared = getSharedArgs().size();
+  return tileBlock.getNumArguments() == numPerTile + numShared + 1;
+}
 
-  // The new tile block argument goes right after the existing per-tile args
-  // (i.e. before any shared args / optional tile index). Compute this BEFORE
-  // appending operands, since getNumPerTilePositions() reads
-  // perTileArgs.size().
-  unsigned insertPos = getNumPerTilePositions();
+BlockArgument SubtiledRegionOp::getTileIndexArg() {
+  if (!hasTileIndex())
+    return nullptr;
+  Block &tileBlock = getTileRegion().front();
+  return tileBlock.getArgument(tileBlock.getNumArguments() - 1);
+}
 
-  // Append the per-tile operands to the perTileArgs segment. They form a new
-  // position K with operands [K*nTiles .. (K+1)*nTiles) in tile order, matching
-  // the indexing used by lowerSubtiledRegion (perTileArgs[j*nTiles + t]).
-  getPerTileArgsMutable().append(ValueRange(valuesPerTile));
-
-  return tileBlock.insertArgument(insertPos, valuesPerTile.front().getType(),
-                                  getLoc());
+void SubtiledRegionOp::removePerTilePosition(unsigned posIdx) {
+  unsigned nTiles = getNumTiles();
+  assert(posIdx < getNumPerTilePositions() &&
+         "removePerTilePosition: position out of range");
+  Block &tileBlock = getTileRegion().front();
+  // Erase the position's numTiles operands [posIdx*nTiles, (posIdx+1)*nTiles).
+  // The op uses AttrSizedOperandSegments, so go through the segment-aware
+  // MutableOperandRange::erase (NOT Operation::eraseOperand, which would desync
+  // operandSegmentSizes). The block remains [perTile.., shared.., tileIdx?] and
+  // remaining per-tile positions keep their [j*nTiles+t] layout.
+  getPerTileArgsMutable().erase(posIdx * nTiles, nTiles);
+  tileBlock.eraseArgument(posIdx);
 }
 
 LogicalResult SubtiledRegionOp::verify() {
@@ -1622,10 +1719,12 @@ static LogicalResult verifyCLCResultMemdesc(Location loc, MemDescType desc) {
            << "Expected CLC result buffer to have type int64, but got"
            << desc.getElementType();
   }
-  if (desc.getShape().size() != 1 || desc.getShape()[0] != 2) {
-    return emitError(loc)
-           << "Expected CLC result buffer to have shape [2], but got ["
-           << triton::join(desc.getShape(), ", ") << "]";
+  auto layout = desc.getEncoding();
+  auto rank = desc.getRank();
+  if (rank != 1 || desc.getDimSize(0) != 2) {
+    return emitError(loc) << "Expected CLC result buffer to have rank 1 and a "
+                             "single dimension equal to 2, but got "
+                          << desc.getShape() << ".";
   }
   return success();
 }

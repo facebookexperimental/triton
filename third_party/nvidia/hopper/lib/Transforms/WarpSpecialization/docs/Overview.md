@@ -15,7 +15,7 @@ orchestrates sub-passes as function calls within a single monolithic pass:
 ```
 doTaskPartition          (Hopper only; skipped on Blackwell)
   → doTaskIdPropagate
-  → doDataPartition      (Hopper only; skipped on Blackwell)
+  → doDataPartition      (via nvgpu-ws-data-partition when requested)
   → doPingPongPrep       (optional, if pingpongAutoWS is set)
   → doBufferAllocation
   → doMemoryPlanner
@@ -25,9 +25,11 @@ doTaskPartition          (Hopper only; skipped on Blackwell)
   → doLoopSchedulePreprocessing + scheduleLoops  (external, not in this directory)
 ```
 
-On Blackwell, only `doTaskIdPropagate` runs for annotation (task partition and
-data partition are skipped). The task assignments are expected to come from
-an earlier partition scheduling pass (`PartitionSchedulingMeta`).
+On Blackwell, task assignments are expected to come from an earlier partition
+scheduling pass (`PartitionSchedulingMeta`) rather than `doTaskPartition`.
+Data partitioning is not Hopper-only; it can run as the separate
+`nvgpu-ws-data-partition` pass when an explicit data partition factor or warp
+group configuration requires per-consumer slices.
 
 Before `PartitionSchedulingMeta`, the Meta WS backend runs
 `nvgpu-sink-broadcast` to move `tt.broadcast` producer chains next to their
@@ -52,7 +54,7 @@ the emitted register allocation matches the backend warp-group granularity.
 | `WSTaskPartition.cpp` | `doTaskPartition` | Assigns `async_task_id` to anchor ops (loads, dots, stores) — Hopper only |
 | `TaskIdPropagation.cpp` | — | `TaskIdBackwardPropagation` sparse dataflow analysis |
 | `WSTaskIdPropagate.cpp` | `doTaskIdPropagate` | Runs analysis and materializes task IDs |
-| `WSDataPartition.cpp` | `doDataPartition` | Splits ops along M/N dimensions across warp groups — Hopper only |
+| `WSDataPartition.cpp` | `doDataPartition` / `nvgpu-ws-data-partition` | Splits ops along M/N dimensions across warp groups |
 | `PingPong.cpp` | `doPingPongPrep` / `doPingPongSync` | Named barrier insertion for ping-pong scheduling |
 | `WSCodePartition.cpp` | `doBufferAllocation` | Channel discovery and SMEM/TMEM allocation hoisting (pre-pass) |
 | `WSBuffer.cpp` | `appendAccumCntsForOps` | Accumulation counter infrastructure for multi-buffer indexing |

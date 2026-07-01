@@ -57,6 +57,8 @@ from triton.language.extra.tlx.tutorials.amd_fa_pipelined import (
     attention as _amd_fa_pipelined, )
 from triton.language.extra.tlx.tutorials.amd_fa_persistent import (
     attention as _amd_fa_persistent, )
+from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
+    attention as _amd_fa_cluster, )
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul as _amd_tdm_gemm_pipelined, )
 from triton.language.extra.tlx.tutorials.amd_gemm_warp_pipeline import (
@@ -1018,6 +1020,21 @@ def test_amd_fa_persistent_cross_attention(q_len, kv_len, causal):
     out = _amd_fa_persistent(q, k, v, sm, causal)
     valid = ~torch.isnan(ref.float())  # fully-masked rows (q_len > kv_len) are undefined
     torch.testing.assert_close(out.float()[valid], ref.float()[valid], atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["nocausal", "causal"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_fa_cluster(causal, dtype):
+    torch.manual_seed(42)
+    B, H, N_CTX, D = 1, 4, 1024, 128
+    q = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=dtype)
+    k = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=dtype)
+    v = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=dtype)
+    sm = 1.0 / math.sqrt(D)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=sm)
+    out = _amd_fa_cluster(q, k, v, sm, causal)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
 # =============================================================================

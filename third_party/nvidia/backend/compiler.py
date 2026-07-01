@@ -468,6 +468,9 @@ class CUDABackend(BaseBackend):
 
         # ---- Args struct ----
         lines.append("typedef struct {")
+        if not args:
+            # Zero-arg kernel: empty struct is a GCC extension, not valid C.
+            lines.append("    char _unused;")
         for arg in args:
             c_ty = _c_type(arg["type"])
             if c_ty is None:
@@ -476,6 +479,35 @@ class CUDABackend(BaseBackend):
             lines.append(f"    {c_ty} {arg['name']};")
         lines.append(f"}} {safe_name}_args_t;")
         lines.append("")
+
+        # ---- Buffer type: args + scratch, used for offsetof in the descriptor.
+        # Natural (non-packed) alignment: each kernel param pointer (built from
+        # offsetof below) lands on a correctly-aligned, correctly-sized value.
+        # The C compiler — not Python — owns the args-buffer layout.
+        buf_t = f"{safe_name}_buf_t"
+        lines.append("typedef struct {")
+        lines.append(f"    {safe_name}_args_t k;")
+        lines.append("    CUdeviceptr _global_scratch;")
+        lines.append("    CUdeviceptr _profile_scratch;")
+        lines.append(f"}} {buf_t};")
+        lines.append("")
+
+        # Helper: offsetof expression for a field inside buf_t.k
+        def _off(field):
+            return f"(int)offsetof({buf_t}, k.{field})"
+
+        # Build param descriptors. offsetof gives the offset and sizeof gives
+        # the size, so the C compiler owns the layout end to end -- no Python
+        # type->size table that could silently disagree with the real ABI for an
+        # unmapped C type.
+        param_entries = []
+        for arg in args:
+            c_ty = _c_type(arg["type"])
+            param_entries.append((_off(arg["name"]), f"(int)sizeof({c_ty})", 0))
+        # Scratch params (device pointers).
+        param_entries.append((f"(int)offsetof({buf_t}, _global_scratch)", "(int)sizeof(CUdeviceptr)", 0))
+        param_entries.append((f"(int)offsetof({buf_t}, _profile_scratch)", "(int)sizeof(CUdeviceptr)", 0))
+        num_params = len(param_entries)
 
         # ---- Launch function ----
         lines.append("/**")
@@ -491,58 +523,51 @@ class CUDABackend(BaseBackend):
             lines.append(f" *   profile_scratch_size={profile_scratch_size}")
         lines.append(" */")
 
+        # ---- Launch wrapper (descriptor is function-local to avoid name collisions
+        # when TritonCC puts multiple specs in the same .cpp) ----
         lines.append(f"CUresult triton_launch_{safe_name}(")
         lines.append("    const uint32_t grid[3],")
         lines.append("    CUstream stream,")
         lines.append("    CUfunction function,")
         lines.append(f"    {safe_name}_args_t *args,")
-        # Always include scratch params for stable ABI across all kernels.
-        # Callers pass 0/NULL when the kernel doesn't use scratch buffers.
         lines.append("    CUdeviceptr global_scratch,")
         lines.append("    CUdeviceptr profile_scratch")
         lines.append(") {")
-
-        # Null checks
         lines.append("    if (!args) return CUDA_ERROR_INVALID_VALUE;")
-        lines.append("    if (!function) return CUDA_ERROR_INVALID_HANDLE;")
         lines.append("")
 
-        # Build params array
-        param_names = [f"args->{arg['name']}" for arg in args]
-        param_names.append("global_scratch")
-        param_names.append("profile_scratch")
-
-        lines.append("    /* Kernel parameter pointers */")
-        for i, pname in enumerate(param_names):
-            lines.append(f"    void *_param{i} = (void *)&{pname};")
-        lines.append("    void *params[] = {")
-        for i in range(len(param_names)):
-            comma = "," if i < len(param_names) - 1 else ""
-            lines.append(f"        _param{i}{comma}")
+        # Param table: a separate function-local static const array. desc.params
+        # is a pointer (launch.h ABI v3), so the table lives outside the desc and
+        # there is no static cap on the number of params.
+        lines.append("    static const triton_param_desc_t desc_params[] = {")
+        for off_expr, sz, is_tma in param_entries:
+            lines.append(f"        {{{off_expr}, {sz}, {is_tma}}},")
         lines.append("    };")
         lines.append("")
-
-        # Build launch attributes (compile-time constants)
-        lines.append("    /* Launch attributes (compile-time constants) */")
-        lines.append("    CUlaunchAttribute attrs[TRITON_MAX_LAUNCH_ATTRS];")
-        lines.append("    unsigned num_attrs = triton_build_launch_attrs(")
-        lines.append("        attrs,")
-        lines.append(f"        /*launch_pdl=*/{launch_pdl},")
-        lines.append(f"        /*launch_cooperative_grid=*/{launch_coop},")
-        lines.append(f"        /*num_ctas=*/{num_ctas},")
-        lines.append(f"        /*launch_cluster=*/{launch_cluster_flag},")
-        lines.append(f"        /*preferred_cluster_dim_x=*/{preferred[0]},")
-        lines.append(f"        /*preferred_cluster_dim_y=*/{preferred[1]},")
-        lines.append(f"        /*preferred_cluster_dim_z=*/{preferred[2]}")
-        lines.append("    );")
+        # Static const descriptor inside function body
+        lines.append("    static const triton_kernel_launch_desc_t desc = {")
+        lines.append("        .abi_version = TRITON_LAUNCH_DESC_ABI_VERSION,")
+        lines.append(f"        .num_warps = {num_warps},")
+        lines.append(f"        .num_ctas = {num_ctas},")
+        lines.append(f"        .shared_mem = {shared_mem}u,")
+        lines.append(f"        .launch_pdl = {launch_pdl},")
+        lines.append(f"        .launch_cooperative_grid = {launch_coop},")
+        lines.append(f"        .launch_cluster = {launch_cluster_flag},")
+        lines.append(f"        .cluster_dims = {{{cluster_dims[0]}, {cluster_dims[1]}, {cluster_dims[2]}}},")
+        lines.append(f"        .preferred_cluster_dims = {{{preferred[0]}, {preferred[1]}, {preferred[2]}}},")
+        lines.append(f"        .num_params = {num_params},")
+        lines.append("        .params = desc_params,")
+        lines.append("        .num_tma_recipes = 0,")
+        lines.append("        /* tma_recipes zero-initialized by C default */")
+        lines.append("    };")
         lines.append("")
-
-        # Call triton_launch_kernel
-        lines.append("    return triton_launch_kernel(")
-        lines.append(f"        grid, /*num_warps=*/{num_warps}, /*num_ctas=*/{num_ctas},")
-        lines.append(f"        /*shared_mem=*/{shared_mem}u, stream, function,")
-        lines.append("        params, attrs, num_attrs")
-        lines.append("    );")
+        lines.append("    /* Pack args + scratch into one buffer; launcher reads by offset. */")
+        lines.append(f"    {buf_t} buf;")
+        lines.append("    buf.k = *args;")
+        lines.append("    buf._global_scratch = global_scratch;")
+        lines.append("    buf._profile_scratch = profile_scratch;")
+        lines.append("")
+        lines.append("    return triton_launch_kernel(grid, stream, function, &buf, &desc);")
         lines.append("}")
 
         return "\n".join(lines) + "\n"
@@ -594,7 +619,6 @@ class CUDABackend(BaseBackend):
         # dummy layouts
         tlx.tlx_passes.add_tlx_storage_alias_lowering(pm)
 
-        passes.ttir.add_rewrite_tensor_pointer(pm)
         if capability // 10 < 9:
             passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
         passes.common.add_canonicalizer(pm)
@@ -725,16 +749,14 @@ class CUDABackend(BaseBackend):
                 # TRITON_USE_MODULO_SCHEDULE=sms|exhaustive|random
                 nvidia.passes.hopper.add_modulo_schedule(pm)
             nvidia.passes.hopper.add_data_partitioning(pm, 1)
-            # assign_latencies sets tt.latency on loads/MMAs (stage-distance
-            # latencies). schedule_loops reads tt.latency AND tt.autows:
-            # when MMA ops have tt.autows, scheduleKeyOpsAnnotation places
-            # them at the annotated stages/clusters while scheduling all
-            # other ops (loads, softmax, barriers) via the standard
-            # latency-based heuristic. Without assign_latencies, the WS
-            # pass's internal scheduleLoops has no latencies and can't
-            # enter the code path that reads tt.autows annotations.
-            passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
-            passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
+            # The modulo / LLM scheduler above already produced the full loop
+            # schedule (loop.stage / loop.cluster). Re-running assign_latencies +
+            # schedule_loops here would recompute and OVERRIDE it, so only run
+            # them on the default path where no custom scheduler set the schedule.
+            uses_custom_schedule = knobs.nvidia.use_llm_schedule or knobs.nvidia.use_modulo_schedule is not None
+            if not uses_custom_schedule:
+                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
+                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
             if not knobs.nvidia.use_meta_ws:
                 # 2-CTA + upstream WS is not supported
                 if opt.cluster_dims is None or max(opt.cluster_dims) < 2:
@@ -852,8 +874,6 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_concurrency_sanitizer(pm)
             passes.gluon.add_canonicalizer(pm)
             passes.common.add_cse(pm)
-        passes.ttgpuir.add_allocate_global_scratch_memory(pm)
-        nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
         # Print TTGIR to TLX mapping before final emission (for debugging/analysis)
         tlx_dump_dir = None
         tlx_saved_fd = None
@@ -867,6 +887,8 @@ class CUDABackend(BaseBackend):
         # instrumentation point here so we can override IRs above (e.g., ttir and ttgir)
         if CUDABackend.instrumentation:
             CUDABackend.instrumentation.patch("ttgpuir_to_llvmir", pm, mod.context)
+        passes.ttgpuir.add_allocate_global_scratch_memory(pm)
+        nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
         nvidia.passes.hopper.add_tma_store_token_wait_lowering(pm)
         nvidia.passes.ttgpuir.add_to_llvmir(pm, capability, ptx_version)
         passes.ttgpuir.add_canonicalize_llvm_ir(pm)
@@ -985,6 +1007,12 @@ class CUDABackend(BaseBackend):
         return ret
 
     def make_cubin(self, src, metadata, opt, capability):
+        # compile_iq: keep Triton's compile cache canonical -- make_cubin always assembles the plain
+        # (no-ACF) cubin. A tuned ACF is applied in-memory at load time via apply_compile_iq_acf
+        # (see core compiler.py _maybe_apply_compile_iq), never baked into the cached cubin.
+        return self._ptxas_compile(src, opt, capability)
+
+    def _ptxas_compile(self, src, opt, capability, apply_controls=None):
         ptxas = get_ptxas(self.target.arch).path
         with (
                 tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".ptx") as fsrc,
@@ -1026,6 +1054,7 @@ class CUDABackend(BaseBackend):
             if os.environ.get("TRITON_COMPILE_IQ_APPLY"):
                 try:
                     from triton.compile_iq.consume import acf_args_for
+
                     ptx_extra_options += acf_args_for(src, arch, get_ptxas(self.target.arch).version)
                 except Exception:
                     pass
@@ -1084,6 +1113,54 @@ please share the reproducer above with Triton project.
             if os.path.exists(fbin):
                 os.remove(fbin)
         return cubin
+
+    def apply_compile_iq_acf(self, ck):
+        """compile_iq consumption (gated by TRITON_COMPILE_IQ_APPLY).
+
+        If the PTX hits the ACF store, obtain the assembled ACF cubin -- loaded from the ACF store if
+        already cached there, else ptxas --apply-controls'd once and persisted back to the store
+        (skips re-ptxas on later processes) -- and stash it as a pending candidate. The first launch
+        runs a plain-vs-ACF A/B and keeps the winner. Cubins live in the compile_iq ACF store + in
+        memory only; Triton's compile cache stays plain. ACF makes no difference to the launch ABI."""
+        if not os.environ.get("TRITON_COMPILE_IQ_APPLY"):
+            return
+        try:
+            ptx = ck.asm.get("ptx")
+            if not ptx:
+                return
+            from triton.compile_iq import store
+            from triton.compile_iq.consume import acf_args_for
+            arch = sm_arch_from_capability(self.target.arch)
+            ver = get_ptxas(self.target.arch).version
+            sha = store.ptx_sha256(ptx)
+            # Reuse the assembled ACF cubin from the (separate) ACF store if present -- skips re-running
+            # ptxas --apply-controls on every process. Version-tagged: the cached cubin is only valid for
+            # the ptxas that produced it. Only the assembly is reused cross-process; the launch-time
+            # plain-vs-ACF A/B still re-runs per process (the win decision stays in-memory). This never
+            # touches Triton's compile cache (which stays plain) -- only the compile_iq ACF store.
+            cubin = store.read_acf_cubin(sha, arch, ver)
+            if cubin is None:
+                controls = acf_args_for(ptx, arch, ver)  # ACF-store hit + ptxas version gate
+                if not controls:
+                    return
+                # opt fields used by _ptxas_compile (enable_fp_fusion, ptx_options) live on ck.metadata
+                # (it is built from {**options.__dict__}); capability matches make_cubin (self.target.arch).
+                cubin = self._ptxas_compile(ptx, ck.metadata, self.target.arch, apply_controls=controls)
+                store.write_acf_cubin(sha, arch, ver, cubin)  # persist assembly -> skip ptxas next time
+                store.dlog("consume", f"assembled+cached ACF cubin {sha[:16]} {arch} ptxas={ver}")
+            else:
+                store.dlog("consume", f"loaded ACF cubin from store {sha[:16]} {arch} ptxas={ver}")
+            ck._compile_iq_acf_cubin = cubin  # pending candidate; the launch-time A/B decides
+        except Exception as e:
+            # Fail-open: APPLY never breaks compilation. Warn ONCE under DEBUG so the common
+            # "APPLY set but the optional compile_iq package is stripped/missing" case (e.g. an OSS
+            # build) is observable instead of silently running plain.
+            if os.environ.get("TRITON_COMPILE_IQ_DEBUG") and not getattr(type(self), "_compile_iq_apply_warned", False):
+                type(self)._compile_iq_apply_warned = True
+                kind = "compile_iq module not found" if isinstance(e, ImportError) else f"{type(e).__name__}: {e}"
+                print(
+                    f"[compile_iq] TRITON_COMPILE_IQ_APPLY set but consume unavailable ({kind}) "
+                    "-- running plain SASS", flush=True)
 
     def add_stages(self, stages, options, language):
         capability = self._parse_arch(options.arch)

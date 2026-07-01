@@ -1289,6 +1289,20 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
                           DenseMap<unsigned, Partition *>(),
                           /*createComputePartitions=*/true};
 
+  // Modulo path is authoritative for partitioning. If the loop was modulo-
+  // scheduled (carries tt.modulo_ii) but fromLoop() above found no honorable
+  // preset schedule, FAIL rather than re-deriving partitions below — a
+  // re-derivation would silently override modulo's decisions, which is exactly
+  // what TRITON_USE_MODULO_SCHEDULE must prevent. The caller turns this
+  // nullopt into a pass failure for modulo loops.
+  if (mainLoop->hasAttr("tt.modulo_ii")) {
+    mainLoop->emitError(
+        "modulo-scheduled loop has no honorable partition schedule "
+        "(missing/invalid ttg.partition.stages or ttg.warp_specialize.tag); "
+        "refusing to re-derive partitions under the modulo path");
+    return std::nullopt;
+  }
+
   // Collect all loops (nested + main)
   SmallVector<scf::ForOp> loops{mainLoop.getOps<scf::ForOp>()};
   loops.push_back(mainLoop);
@@ -2683,8 +2697,18 @@ void PartitionSchedulingMeta::runOnOperation() {
     if (auto attr2 = loop->getAttrOfType<BoolAttr>("tt.merge_epilogue"))
       schedOpts.mergeEpilogue = attr2.getValue();
 
-    if (std::optional<ScheduleResult> result =
-            getInitialSchedule(loop, schedOpts)) {
+    std::optional<ScheduleResult> result = getInitialSchedule(loop, schedOpts);
+    if (!result) {
+      // getInitialSchedule emits a diagnostic and returns nullopt for a
+      // modulo-scheduled loop with no honorable preset partition schedule.
+      // Under the modulo path partitions are authoritative, so fail the pass
+      // instead of silently re-deriving or dropping WS. For non-modulo loops,
+      // nullopt just means "nothing to specialize" — skip as before.
+      if (loop->hasAttr("tt.modulo_ii"))
+        return signalPassFailure();
+      continue;
+    }
+    {
       PartitionSet &schedule = result->schedule;
       currentPhase = "propagate";
       propagatePartitions(loop, schedule, result->createComputePartitions);

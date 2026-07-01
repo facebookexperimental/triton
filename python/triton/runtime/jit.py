@@ -1,5 +1,6 @@
 from __future__ import annotations, division
 import ast
+import contextlib
 import copy
 import hashlib
 import inspect
@@ -48,7 +49,27 @@ def _ensure_torch_bridge():
 
 
 TRITON_MODULE = "triton.language"
+
+# compile_iq free-win: the launch-time plain-vs-ACF competition (CompiledKernel._compile_iq_resolve)
+# must NOT fire while the autotuner is benchmarking configs -- otherwise the one-shot A/B would run
+# mid-do_bench and corrupt a config's timing. The autotuner wraps its do_bench in this suppressor;
+# the autotune flow tunes configs on plain timing (ACF candidate-expansion is handled separately).
+_compile_iq_state = threading.local()
+
+
+@contextlib.contextmanager
+def _compile_iq_suppress_competition():
+    prev = getattr(_compile_iq_state, "suppressed", False)
+    _compile_iq_state.suppressed = True
+    try:
+        yield
+    finally:
+        _compile_iq_state.suppressed = prev
+
+
 GLUON_MODULE = "triton.experimental.gluon.language"
+
+INDENT_PATTERN = re.compile(r"^(?P<indent>[ \t]*)def\s+\w+\s*\(", re.MULTILINE)
 
 T = TypeVar("T")
 
@@ -527,7 +548,14 @@ class JITCallable:
         self._hash_lock = threading.RLock()
 
         # function source code (without decorators)
-        src = textwrap.dedent("".join(self.raw_src))
+        raw_src_str = "".join(self.raw_src)
+
+        # get file name, starting line number and starting col number
+        self.file_name = fn.__code__.co_filename
+        self.def_file_line_number = get_def_line_number(self.raw_src, self.starting_line_number)
+        self.def_file_col_number = get_def_col_number(raw_src_str)
+
+        src = textwrap.dedent(raw_src_str)
         src = src[re.search(r"^def\s+\w+\s*\(", src, re.MULTILINE).start():]
         self._src = src
         self.hash = None
@@ -861,6 +889,12 @@ class JITFunction(JITCallable, KernelInterface[T]):
                     if _globals_ok:
                         kernel = result
                         if not getattr(kernel, '_dispatcher', None):
+                            if knobs.nvidia.use_triton_dispatcher:
+                                warnings.warn(
+                                    f"[Triton] TRITON_USE_C_DISPATCHER=1 but kernel '{self._fn_name}' has no C "
+                                    f"dispatcher, falling back to Python launch",
+                                    stacklevel=2,
+                                )
                             grid_size = len(_fc_grid) if isinstance(_fc_grid, (tuple, list)) else 1
                             grid_0 = _fc_grid[0] if grid_size > 0 else 1
                             grid_1 = _fc_grid[1] if grid_size > 1 else 1
@@ -971,6 +1005,13 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
             if hasattr(kernel, "result"):
                 kernel = kernel.result()
+            # compile_iq free-win: if a tuned ACF candidate is pending, run the one-shot plain-vs-ACF
+            # competition with the real args before launching, and keep the winner (no-op/near-zero
+            # cost otherwise; suppressed while the autotuner is benchmarking). Read _disp afterward so
+            # a rebuilt dispatcher for the winning function is used.
+            if (getattr(kernel, "_compile_iq_acf_cubin", None) is not None
+                    and not getattr(_compile_iq_state, "suppressed", False)):
+                kernel._compile_iq_resolve(grid_0, grid_1, grid_2, stream, bound_args)
             # launch kernel — prefer _TritonDispatcher (C direct cuLaunchKernelEx)
             # when available and hooks are not needed.
             _disp = getattr(kernel, '_dispatcher', None)
@@ -981,7 +1022,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
             else:
                 if knobs.nvidia.use_triton_dispatcher and _disp is None:
                     warnings.warn(
-                        f"[Triton] TRITON_USE_TRITON_DISPATCHER=1 but kernel '{self._fn_name}' has no C dispatcher, "
+                        f"[Triton] TRITON_USE_C_DISPATCHER=1 but kernel '{self._fn_name}' has no C dispatcher, "
                         f"falling back to Python launch",
                         stacklevel=2,
                     )
@@ -1331,22 +1372,30 @@ def reinterpret(tensor, dtype):
         raise TypeError(f"Cannot reinterpret a {type(tensor)}.")
 
 
-def get_jit_fn_file_line(fn):
-    base_fn = fn
-    while not isinstance(base_fn, JITCallable):
-        base_fn = base_fn.fn
-    file_name = base_fn.fn.__code__.co_filename
-    begin_line = base_fn.starting_line_number
+def get_def_line_number(raw_src, starting_line_number):
+    def_file_line_number = starting_line_number
     # Match the following pattern:
     # @triton.autotune(...) <- foo.__code__.co_firstlineno
     # @triton.heuristics(...)
     # @triton.jit
     # def foo(...): <- this line is the first line
-    for idx, line in enumerate(base_fn.raw_src):
+    for idx, line in enumerate(raw_src):
         if line.strip().startswith("def "):
-            begin_line += idx
+            def_file_line_number += idx
             break
-    return file_name, begin_line
+    return def_file_line_number
+
+
+def get_def_col_number(raw_src_str):
+    # Find the amount of indenting to use in the source location information.
+    indented_def = INDENT_PATTERN.search(raw_src_str)
+    if not indented_def:
+        raise ValueError("No function definition found for kernel")
+    # Consider spaces and tabs as single characters to match the ast
+    def_file_col_number = len(indented_def.group("indent"))
+    # Columns start at 1
+    def_file_col_number += 1
+    return def_file_col_number
 
 
 class BoundConstexprFunction(JITCallable):

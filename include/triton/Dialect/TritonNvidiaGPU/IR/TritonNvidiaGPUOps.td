@@ -866,6 +866,9 @@ def TTNG_TCGen5MMAOp : TTNG_Op<"tc_gen5_mma", [
     This operation takes and produces an optional token to indicate TMEM read
     and write on its accumulator operand. When the tokens are present, they can
     be used to check aliasing and modref on the accumulator memory.
+
+    The `isUnsigned` attribute is only relevant when performing an integer MMA operation.
+    If true, the integer values are treated as unsigned, otherwise they are treated as signed.
   }];
 
   let arguments = (ins
@@ -879,7 +882,8 @@ def TTNG_TCGen5MMAOp : TTNG_Op<"tc_gen5_mma", [
     Variadic<I1>:$barrier_preds,
     UnitAttr:$is_async,
     UnitAttr:$two_ctas,
-    UnitAttr:$multicast
+    UnitAttr:$multicast,
+    UnitAttr:$is_unsigned
   );
   let results = (outs Optional<TTG_AsyncToken>:$token);
 
@@ -890,7 +894,8 @@ def TTNG_TCGen5MMAOp : TTNG_Op<"tc_gen5_mma", [
       CArg<"bool", "false">:$multicast,
       CArg<"ValueRange", "{}">:$barriers,
       CArg<"ValueRange", "{}">:$barrier_preds,
-      CArg<"bool", "false">:$is_async)>
+      CArg<"bool", "false">:$is_async,
+      CArg<"bool", "false">:$is_unsigned)>
   ];
 
   let assemblyFormat = [{
@@ -913,7 +918,9 @@ def TTNG_TCGen5MMAScaledOp : TTNG_Op<"tc_gen5_mma_scaled", [
 
   let description = [{
     $d += matrix_multiply(scale($lhs, $lhs_scale), scale(rlhs, $rhs_scale))
-    if is_async is false, the op executes synchronously. The barrier operands must not be present in that case.
+    If $two_ctas is set the op will execute a matmul across two contiguous CTAs, it will read the data distributed across the two CTAs
+    and synchronize both CTAs if the op is synchronous.
+    If is_async is false, the op executes synchronously. The barrier operands must not be present in that case.
     Otherwise, if a barrier is given, the op will trigger a commit/arrive on it.
     The result will be safe to read after a barrier wait.
 
@@ -1195,7 +1202,8 @@ def TTNG_TCGen5GlobalAllocOp : TTNG_Op<"tcgen5_global_alloc", []> {
   let assemblyFormat = "attr-dict";
 }
 
-def TTNG_TMEMSubSliceOp : TTNG_Op<"tmem_subslice", [Pure]> {
+def TTNG_TMEMSubSliceOp : TTNG_Op<"tmem_subslice", [Pure,
+                                                    MemDescViewTrait]> {
   let summary = "Take a subslice of a tensor memory allocation";
   let description = [{
     This operation takes a subslice of a tensor memory allocation and returns a new descriptor
@@ -1427,18 +1435,24 @@ def TTNG_SubtiledRegionOp : TTNG_Op<"subtiled_region", [
     /// Returns the new tile block argument.
     BlockArgument addSharedArg(Value value);
 
-    /// Append a new per-tile arg position and add a corresponding tile block
-    /// argument. `valuesPerTile.size()` must equal numTiles; valuesPerTile[t]
-    /// is the value for tile t. The new tile block argument is inserted after
-    /// the existing per-tile args (before shared args / tile index), preserving
-    /// the [perTile.., shared.., tileIdx] ordering. Returns it.
-    BlockArgument addPerTileArg(::llvm::ArrayRef<::mlir::Value> valuesPerTile);
+    /// Erase per-tile arg position `posIdx` (0-based among the K positions):
+    /// removes its numTiles operands and the matching tile block argument,
+    /// preserving the [perTile.., shared.., tileIdx] ordering and the
+    /// [j*numTiles+t] layout of the remaining positions.
+    void removePerTilePosition(unsigned posIdx);
 
     /// Number of per-tile arg positions (K). Each position has numTiles
     /// operands in perTileArgs.
     unsigned getNumPerTilePositions() {
       return getPerTileArgs().size() / getNumTiles();
     }
+
+    /// True if the tile body has the trailing optional i32 tile-index block
+    /// argument (set to `arith.constant t` per tile during lowering).
+    bool hasTileIndex();
+
+    /// Returns the trailing tile-index block argument, or null if absent.
+    ::mlir::BlockArgument getTileIndexArg();
   }];
 
   let hasCustomAssemblyFormat = 1;

@@ -36,9 +36,15 @@ Key attributes:
 
 Key methods:
 - `addSharedArg(Value)` — appends a shared arg and adds a tile block
-  argument. Used by `insertAsyncComm` to make NVWS token/bufferIdx/phase
+  argument. Used by `insertAsyncComm` to make NVWS token / accumCnt / base-alloc
   values accessible inside the tile body.
+- `removePerTilePosition(unsigned)` — erases a per-tile position's `numTiles`
+  operands and its tile block argument (segment-aware, via
+  `getPerTileArgsMutable().erase`). Used to drop buffer positions left dead after
+  the in-body view rewire.
 - `getNumPerTilePositions()` — returns `perTileArgs.size() / numTiles`.
+- `hasTileIndex()` / `getTileIndexArg()` — query / fetch the trailing optional
+  i32 tile-index block argument.
 
 If the tile body yields M values, the op produces `numTiles * M` results,
 grouped by yield position (matching `tt.join` argument order).
@@ -132,34 +138,56 @@ SubtiledRegionOp's tile body, it creates the NVWS op (ProducerAcquireOp,
 ConsumerWaitOp, etc.) directly inside the tile body. The token is threaded as a
 `addSharedArg` (one logical channel for all tiles).
 
-#### Per-tile barrier index (shared barrier, `addPerTileArg`)
+#### Per-tile SMEM rotation (in-body, off the builtin `tileIdx`)
 
-The barrier slot/phase, however, must **not** be shared across tiles. A subtile
-group is a reuse group of `numTiles` distinct, concurrent buffers that all share
-**one** barrier pair, so every tile must occupy a distinct barrier *generation*.
+The barrier slot/phase AND the staging-buffer slot must **not** be shared across
+tiles. A subtile group is a reuse group of `numTiles` distinct, concurrent
+buffers that all share **one** barrier pair and **one** physical multibuffer
+alloc, so every tile must occupy a distinct *generation*.
 
-`insertAsyncComm` therefore computes a per-tile **flattened accumulation count**
-`flattened = accumCnt * numTiles + tileIdx` (`getPerTileStaggeredAccumCnt` in
-`CodePartitionUtility.cpp`) and threads it as a `SubtiledRegionOp::addPerTileArg`
-(one i64 per tile). The barrier `bufferIdx = flattened % numBuffers` and
-`phase = flattened / numBuffers` are then derived *inside* the tile body from
-that per-tile arg. This makes the shared barrier behave as a single monotonic
-stream advanced `numTiles` times per outer iteration:
+Every SMEM-rotation value is therefore computed **inside the tile body** from the
+op's **builtin `tileIdx`** block arg, with `accumCnt` and the representative
+multibuffer alloc threaded in as two `SubtiledRegionOp::addSharedArg`s. For each
+multi-buffered subtiled reuse member, `insertAsyncComm` emits, once per region at
+the tile-body entry (`getOrComputeSubtiledSlot` in `WSCodePartition.cpp`):
 
-- The offset is the **tile index** (producer/consumer walk order), NOT the
-  reuse-group position. Using the reuse position (a permutation of tile order)
-  commits a shared slot's generations out of order and corrupts data.
-- The barrier slot need not equal the data buffer slot — producer and consumer
-  only need to agree, which they do (both walk tiles in the same order, and tile
-  `t` maps to the same buffer in both regions).
-- This is correct even when `numTiles > numBuffers`: two same-iteration tiles
-  may land on one slot, but because flattened order == tile-walk order, the
-  later tile's acquire simply *waits* for the earlier tile's slot to be released
-  (a serialization, not a race). Using `addSharedArg` for the index instead
-  (every tile the same slot/phase) deadlocks.
+```
+flattened = accumCnt * numTiles + tileIdx       // tileIdx = builtin block arg
+bufferIdx = flattened % numBuffers               // getBufferIdxAndPhase
+phase     = (flattened / numBuffers) & 1
+view      = memdesc_index[baseArg, bufferIdx]    // built from the in-body base
+```
 
-If the per-tile→channel mapping can't be established (e.g. not a reuse group),
-the code falls back to the original shared `addSharedArg` index/phase.
+`lowerSubtiledRegion` replaces `tileIdx` with `arith.constant t` per tile, so
+the shared barrier behaves as one monotonic stream advanced `numTiles` times per
+outer iteration. The producer SMEM-store dest and consumer `async_tma_copy`
+source are rewired to `view`, and the now-dead per-tile buffer positions are
+removed (`removePerTilePosition`) — `columnOffset` and the data leaf stay
+per-tile operands.
+
+- The offset is the **builtin tile index** (producer/consumer replication
+  order), NOT the reuse-group position. Producer-tile-`t` and consumer-tile-`t`
+  are the same logical subtile by construction (both regions replicate from the
+  same ordered split-tree leaves), so deriving the slot from `tileIdx` makes
+  producer and consumer agree on `slot = (accumCnt*numTiles + t) % numBuffers`
+  with **no operand matching**. An earlier approach that keyed the count off the
+  *threaded* per-tile buffer operands (matched via `traceToBufferBase`) permuted
+  the tile→count mapping differently between producer and consumer (the consumer
+  carries the SMEM buffer at two per-tile positions) and corrupted data.
+- **The data buffer slot uses this SAME in-body count**, so it equals the barrier
+  generation `% numBuffers`. A data slot may be reused only `>= numBuffers`
+  flattened generations apart; sharing the barrier's count guarantees the shared
+  barrier serializes every slot reuse. The generic reuse-group
+  `accumCnt + reuseGroupPosition` stagger is wrong here: it collapses distinct
+  subtiles onto one slot (the EPILOGUE_SUBTILE>2 staging-buffer race;
+  `numTiles=2` was correct only by coincidence).
+- This is correct even when `numTiles > numBuffers`: two same-iteration tiles may
+  land on one slot, but because flattened order == tile-walk order, the later
+  tile's acquire simply *waits* for the earlier tile's slot to be released (a
+  serialization, not a race).
+
+Non-reuse / single-copy (`numBuffers == 1`) / non-subtiled cases fall back to a
+shared `addSharedArg` barrier index/phase.
 
 Before `doTokenLowering` runs, all SubtiledRegionOps containing NVWS ops
 are inlined via `lowerSubtiledRegion`. This puts the NVWS ops in flat IR

@@ -1,0 +1,103 @@
+name: Reconcile Nightly Issues
+
+# Reusable workflow that CLOSES previously-filed nightly failure issues once the
+# corresponding failure identity stops appearing. Complements
+# report-nightly-failure.yml (which only creates/updates). Called once per test
+# job on every nightly run, regardless of whether the job passed or failed, so a
+# recovered test gets its issue closed (the report-* jobs are skipped when the
+# failure set is empty and therefore can never close anything).
+
+on:
+  workflow_call:
+    inputs:
+      workflow_name:
+        description: Name of the workflow (issue title scope).
+        required: true
+        type: string
+      job_name:
+        description: Name of the job (issue title scope).
+        required: true
+        type: string
+      failures:
+        description: JSON array of currently-failing items from the parser (may be empty).
+        required: false
+        type: string
+        default: "[]"
+      run_url:
+        description: URL of the nightly run (for the close comment).
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Close recovered nightly issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const workflowName = ${{ toJSON(inputs.workflow_name) }};
+            const jobName = ${{ toJSON(inputs.job_name) }};
+            const runUrl = ${{ toJSON(inputs.run_url) }};
+            const rawFailures = ${{ toJSON(inputs.failures) }};
+
+            let failures = [];
+            try {
+              failures = JSON.parse((rawFailures || "").trim() || "[]");
+            } catch (e) {
+              core.warning(`Could not parse failures input; aborting reconcile: ${e}`);
+              return;
+            }
+
+            // Safety guard: a job-level fallback item (compile error, timeout, or
+            // missing JUnit XML) means we have NO reliable per-test signal for this
+            // run. Closing now could wrongly resolve a real failure during an infra
+            // outage, so we close nothing.
+            if (failures.some(f => f && f.fallback === true)) {
+              core.info("Fallback failure present (no per-test signal); skipping close reconciliation.");
+              return;
+            }
+
+            const stillFailing = new Set(failures.map(f => f.issue_title));
+            const labels = ["ci_issues", "nightly"];
+            const prefix = `[nightly] ${workflowName} / ${jobName} / `;
+
+            // Enumerate open issues for this workflow+job (scoped by title prefix
+            // so one workflow's run never touches another's issues).
+            const openIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              labels: labels.join(","),
+              per_page: 100,
+            });
+
+            let closed = 0;
+            for (const issue of openIssues) {
+              if (issue.pull_request) continue;
+              if (!issue.title.startsWith(prefix)) continue;   // scope to this job
+              if (stillFailing.has(issue.title)) continue;      // still broken: leave open
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: "✅ Auto-closing: this failure identity no longer appears in the latest nightly run (" + runUrl + "). A new issue will be filed automatically if it recurs.",
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: "closed",
+                state_reason: "completed",
+              });
+              core.info(`Closed recovered issue #${issue.number}: ${issue.title}`);
+              closed += 1;
+            }
+            core.info(`Reconcile complete for "${prefix}": closed ${closed} issue(s).`);

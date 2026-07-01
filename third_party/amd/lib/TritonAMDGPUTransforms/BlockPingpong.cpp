@@ -9,6 +9,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/ADT/TypeSwitch.h"
 
@@ -1266,12 +1267,19 @@ struct TritonAMDGPUBlockPingpongPass
 
   void runOnOperation() override {
     ModuleOp m = getOperation();
+    bool transformed = false;
     for (auto funcOp : m.getOps<tt::FuncOp>()) {
       funcOp.walk([&](scf::ForOp forOp) {
         Pingponger pingponger(forOp, ttg::lookupNumWarps(forOp), numStages);
         pingponger.getDotPingponged();
+        transformed = true;
       });
     }
+    // Pingpong reorders async copies/commits around the merged ttg.async_wait,
+    // invalidating any `num` Pipeline.cpp set earlier. Recompute against the
+    // post-reorder IR.
+    if (transformed)
+      mlir::triton::updateWaits(m);
   }
 };
 
