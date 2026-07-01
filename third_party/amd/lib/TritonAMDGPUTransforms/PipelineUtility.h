@@ -21,6 +21,12 @@ constexpr char AttrBypassLDS[] = "amdg.bypass_lds_load";
 // - serialize schedule to IR for the next expandLoops function.
 void lowerLoops(ModuleOp moduleOp, bool useAsyncCopy, bool usePingpong);
 
+// Run the general pipeline expander on every loop carrying a serialized
+// CoarseSchedule (loop.stage / loop.cluster). Exposed so the decompose+modulo
+// pipeline (change #4) can reuse the expander after it re-buffers + serializes
+// its own modulo-derived schedule, without going through lowerLoops.
+void expandLoops(ModuleOp moduleOp);
+
 // LoadInfo encapsulates a load's key aspects wrt scheduling. The `distToUse`
 // and `use` fields grab values from getIndirectLevel() which is a thin wrapper
 // of triton::gpu::loadOpsToIndirectionLevel(). Consider the DU chain,
