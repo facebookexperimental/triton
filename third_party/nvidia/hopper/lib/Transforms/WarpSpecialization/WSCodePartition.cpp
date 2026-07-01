@@ -3123,9 +3123,36 @@ void insertAsyncComm(
       if (regionCmp < 0) {
         // A/producer in nested region. Lift up headProducer till it is
         // in the same scope as headConsumer.
+        //
+        // Besides MMAv5 / SubtiledRegion producers, the operand-D accumulator
+        // whose final in-loop writer is a `tmem_store` read by a post-loop
+        // `tmem_load` is also supported (e.g. HSTU reduce_dq: the gen5 MMA
+        // accumulates into the dq TMEM, a correction partition does a
+        // read-modify-write `tmem_store`, and the epilogue reads the corrected
+        // value). The store — not the upstream MMA — is this channel's real
+        // producer, so it is synchronized via the token path (ProducerCommit
+        // after the loop / ConsumerWait at the epilogue), not a gen5 completion
+        // barrier. `createTokenPost` leaves `producerBarrier` unset for this
+        // shape (the producer is not an MMAv5 op), so lifting the buffer/phase
+        // computation to the loop level here is all that is required; assert
+        // that invariant so a future producerBarrier path is not silently
+        // dropped.
+        bool isOperandDTmemStore = false;
+        if (!isa<ttng::MMAv5OpInterface>(headProducer) &&
+            !headProducer->getParentOfType<ttng::SubtiledRegionOp>() &&
+            masterChannel->channelKind == DataChannelKind::TMEMPost &&
+            isa<ttng::TMEMStoreOp>(headProducer) &&
+            isa<ttng::TMEMLoadOp>(headConsumer)) {
+          auto *tmemCh =
+              static_cast<ttng::TmemDataChannelPost *>(masterChannel);
+          isOperandDTmemStore =
+              tmemCh->isOperandD && !commChannel.producerBarrier;
+        }
         assert((isa<ttng::MMAv5OpInterface>(headProducer) ||
-                headProducer->getParentOfType<ttng::SubtiledRegionOp>()) &&
-               "Only MMAv5 or SubtiledRegionOp-nested ops supported");
+                headProducer->getParentOfType<ttng::SubtiledRegionOp>() ||
+                isOperandDTmemStore) &&
+               "Only MMAv5, SubtiledRegionOp-nested, or operand-D tmem_store "
+               "producers supported");
         nestedInsertionTarget = getSameLevelOp(headConsumer, headProducer);
         producerInNestedRegion = true;
       } else if (regionCmp > 0) {
@@ -3357,13 +3384,33 @@ void insertAsyncComm(
           if (isTmemGroup && !isSpatialPacking &&
               group->channels.size() >= 3 &&
               orderReuseGroupChain(group).empty()) {
-            llvm::report_fatal_error(
+            // Name the offending group + its members so the failure is
+            // self-diagnosing (which buffer.id / which allocs / their locs).
+            std::string detail;
+            llvm::raw_string_ostream os(detail);
+            if (auto *a0 = group->channels.front()->getAllocOp())
+              if (auto id = a0->getAttrOfType<IntegerAttr>("buffer.id"))
+                os << " buffer.id=" << id.getInt();
+            os << " members=" << group->channels.size() << " [";
+            for (auto *ch : group->channels) {
+              if (auto *a = ch->getAllocOp()) {
+                int64_t off = 0;
+                if (auto o = a->getAttrOfType<IntegerAttr>("buffer.offset"))
+                  off = o.getInt();
+                os << " {off=" << off << " ";
+                a->getLoc().print(os);
+                os << "}";
+              }
+            }
+            os << " ]";
+            llvm::report_fatal_error(llvm::Twine(
                 "TMEM reuse group with >= 3 buffers has no unique "
                 "dependency-chain order: the shared TMEM slot's producers and "
                 "consumers are not totally ordered, so a correct reuse barrier "
                 "cannot be emitted (this would otherwise deadlock or "
                 "miscompile). Order the slot's writers/readers into a chain - "
-                "e.g. ensure dk reads dsT before dq overwrites the shared slot.");
+                "e.g. ensure dk reads dsT before dq overwrites the shared "
+                "slot." + detail));
           }
           if (verifyReuseGroupCrossPartition(group)) {
             // A5: cross-partition dependency-chain reuse (e.g. FA-bwd

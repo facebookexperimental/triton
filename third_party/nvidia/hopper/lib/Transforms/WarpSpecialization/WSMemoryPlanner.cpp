@@ -840,6 +840,20 @@ static std::string getLocName(Operation *op) {
   return walkFile(op->getLoc(), walkFile);
 }
 
+/// True if `op` is a TMEM accumulator alloc (operand D of an MMAv5 op) — i.e. a
+/// loop-carried accumulator when it is also read back. Used only for diagnostics
+/// ([[maybe_unused]]: referenced only inside LLVM_DEBUG, compiled out in NDEBUG).
+[[maybe_unused]] static bool isOperandDAlloc(Operation *op) {
+  if (!isa<ttng::TMEMAllocOp>(op))
+    return false;
+  Value res = op->getResult(0);
+  for (Operation *u : res.getUsers())
+    if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(u))
+      if (mma.getAccumulator() == res)
+        return true;
+  return false;
+}
+
 /// Priority levels for SMEM multi-buffering candidates.
 enum class WSBufferPriority {
   P0_InnermostTMA = 0,    // innermost loop + TMA channel
@@ -3630,10 +3644,18 @@ public:
             cand->rowOffset = alloc->rowOffset;
             cand->colOffset = colOffset;
             cand->reuseOwner = alloc;
+            // Reuse-group membership, reported from the planner's own decision
+            // point (reuses getLocName/isOperandDAlloc — no separate walk).
+            // Same buffer.id ties the group together; col=0 is temporal
+            // full-overlap, col>0 is spatial packing; `opD` flags a
+            // loop-carried accumulator sharing the slot (the L6 hazard).
             LLVM_DEBUG({
-              LDBG("set offset to " << cand->rowOffset << " " << cand->colOffset
-                                    << " sameLoop " << sameLoop(alloc) << ":");
-              cand->owner->dump();
+              LDBG("TMEM reuse: \""
+                   << getLocName(cand->owner) << "\""
+                   << (isOperandDAlloc(cand->owner) ? " opD" : "")
+                   << " reuses \"" << getLocName(alloc->owner) << "\" row="
+                   << cand->rowOffset << " col=" << cand->colOffset
+                   << " sameLoop=" << sameLoop(alloc));
             });
             return alloc;
           }
@@ -4175,6 +4197,7 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
     if (failed(planner.run(bufferId)))
       return failure();
   }
+
 
   // If a write decision file is provided, serialize decisions to file.
   if (!writeDecisionFile.empty()) {
