@@ -15,7 +15,7 @@ orchestrates sub-passes as function calls within a single monolithic pass:
 ```
 doTaskPartition          (Hopper only; skipped on Blackwell)
   → doTaskIdPropagate
-  → doAtomicBroadcast    (cross-partition run-once atomic support)
+  → doDynamicTileBroadcast  (run-once tile-id: atomic counter + CLC fetch)
   → doDataPartition      (via nvgpu-ws-data-partition when requested)
   → doPingPongPrep       (optional, if pingpongAutoWS is set)
   → doBufferAllocation
@@ -69,7 +69,7 @@ recognizes the `scf.while` outer loop (same doc).
 | `WSTaskPartition.cpp` | `doTaskPartition` | Assigns `async_task_id` to anchor ops (loads, dots, stores) — Hopper only |
 | `TaskIdPropagation.cpp` | — | `TaskIdBackwardPropagation` sparse dataflow analysis |
 | `WSTaskIdPropagate.cpp` | `doTaskIdPropagate` | Runs analysis and materializes task IDs |
-| `WSAtomicBroadcast.cpp` | `doAtomicBroadcast` | Cross-partition run-once atomic support: run a dynamic-persistent tile-id `atomic_add` once and broadcast it (or gracefully reject unsupported atomics). See [CrossPartitionAtomicSupport.md](CrossPartitionAtomicSupport.md) |
+| `WSAtomicBroadcast.cpp` | `doDynamicTileBroadcast` | Cross-partition run-once "claim next tile" support: run a dynamic-persistent tile-id producer once and broadcast it, for both a `tt.atomic_rmw` counter and a CLC tile-scheduler fetch (`ttng.clc_read`) — or gracefully reject unsupported shapes. See [CrossPartitionAtomicSupport.md](CrossPartitionAtomicSupport.md) |
 | `WSDataPartition.cpp` | `doDataPartition` / `nvgpu-ws-data-partition` | Splits ops along M/N dimensions across warp groups |
 | `PingPong.cpp` | `doPingPongPrep` / `doPingPongSync` | Named barrier insertion for ping-pong scheduling |
 | `WSCodePartition.cpp` | `doBufferAllocation` | Channel discovery and SMEM/TMEM allocation hoisting (pre-pass) |

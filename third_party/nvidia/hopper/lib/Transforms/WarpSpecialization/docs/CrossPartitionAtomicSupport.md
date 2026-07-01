@@ -23,7 +23,19 @@ result is the loop-carried value used by every partition) to **all** partitions,
 so each warp group bumps the counter independently, diverges onto a different
 tile, and the producer/consumer barriers never match → **runtime deadlock**.
 
-## Pass: `doAtomicBroadcast`
+## Pass: `doDynamicTileBroadcast`
+
+> Also handles the CLC tile scheduler. The same run-once + broadcast idea applies
+> to `tl.clc_tile_scheduler`, whose fetch is the token pair
+> `ttng.clc_try_cancel_async` (→ `!ttg.async.token`) + `ttng.clc_read` (→
+> `{isValid, x, y, z}`). Those decoded results are the loop-carried values used by
+> every partition, so — exactly like the atomic counter — the pass runs the fetch
+> once in the owner (producer) partition and broadcasts the decoded results
+> through SMEM (the `is_valid` i1 is widened to i32 for the SMEM round-trip). The
+> owner-local CLC completion mbarrier is materialized separately, after AutoWS, by
+> the `clc-materialize` pass (see `docs/design/triton-clc-tile-scheduler.md`).
+> `doDynamicTileBroadcast` is the single merged entry that processes both
+> `tt.atomic_rmw` and `ttng.clc_read`.
 
 Runs in `WarpSpecialization.cpp::runOnFuncOp` immediately **after**
 `doTaskIdPropagate` (so partitions are materialized as `async_task_id`) and

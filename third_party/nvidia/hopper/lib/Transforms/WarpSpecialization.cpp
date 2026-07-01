@@ -43,7 +43,8 @@ static LogicalResult cleanupWarpSpecializedLoops(Operation *op) {
 int doTaskIdPropagate(triton::FuncOp &funcOp);
 // Cross-partition run-once atomic support. Returns failure() when an atomic
 // forces a graceful warp-specialization reject (kernel already de-specialized).
-LogicalResult doAtomicBroadcast(triton::FuncOp funcOp, int tilePrefetchDepth);
+LogicalResult doDynamicTileBroadcast(triton::FuncOp funcOp,
+                                     int tilePrefetchDepth);
 LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
                               StringRef readDecisionFile = "",
                               StringRef writeDecisionFile = "",
@@ -202,23 +203,25 @@ public:
       llvm::dbgs() << "\n\n\n";
     }
 
-    // Cross-partition run-once atomic support: classify each side-effecting
-    // atomic and either pass it through (single-partition), transform it into a
-    // run-once + SMEM broadcast (all-partition scalar loop-carried counter), or
-    // gracefully bail out of warp specialization (unsupported shape). On a
-    // reject we strip all WS metadata via removeWarpSpecializeAttr (which now
-    // also clears the `async_task_id`s that doTaskIdPropagate materialized
-    // above) so downstream sees a plain, compilable non-WS kernel. The
-    // broadcast channel depth comes from the `tile-prefetch-depth` pass option
-    // (a Python knob), not an env var.
-    if (failed(doAtomicBroadcast(funcOp, tilePrefetchDepth))) {
-      LDBG("Atomic broadcast rejected warp specialization. Skipping.");
+    // Cross-partition run-once, loop-carried "claim the next tile" support for
+    // dynamic-persistent kernels. Handles both the `tt.atomic_rmw` tile counter
+    // and the CLC tile-scheduler fetch (`ttng.clc_read`) with the same idea:
+    // run the claim once in the owner/producer partition and broadcast the
+    // loop-carried result(s) to every partition through SMEM, or gracefully
+    // bail out of warp specialization (unsupported shape). On a reject we strip
+    // all WS metadata via removeWarpSpecializeAttr (which also clears the
+    // `async_task_id`s that doTaskIdPropagate materialized above) so downstream
+    // sees a plain, compilable non-WS kernel. The broadcast channel depth comes
+    // from the `tile-prefetch-depth` pass option (a Python knob), not an env
+    // var.
+    if (failed(doDynamicTileBroadcast(funcOp, tilePrefetchDepth))) {
+      LDBG("Dynamic tile broadcast rejected warp specialization. Skipping.");
       removeWarpSpecializeAttr(funcOp);
       return;
     }
     if (dumpIntermediateSteps) {
       llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                      "doAtomicBroadcast\n";
+                      "doDynamicTileBroadcast\n";
       moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
       llvm::dbgs() << "\n\n\n";
     }
