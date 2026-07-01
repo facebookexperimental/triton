@@ -137,23 +137,6 @@ static AsyncTaskId getOwnerPartition(scf::WhileOp whileOp,
   return owner;
 }
 
-// Strip every warp-specialization artifact so downstream passes see a plain
-// (non-WS) loop. Mirrors NVGPUWarpSpecializationPass::removeWarpSpecializeAttr
-// but also clears the `async_task_id` attributes that `doTaskIdPropagate` has
-// already materialized (this pass runs after propagation, unlike the other
-// AutoWS bail-outs).
-static void rejectWarpSpecialization(triton::FuncOp funcOp) {
-  funcOp->walk([&](Operation *op) {
-    op->removeAttr("async_task_id");
-    op->removeAttr(tt::gpu::kPartitionAttrName);
-    op->removeAttr(tt::gpu::kPartitionOutputsAttrName);
-    op->removeAttr(tt::gpu::kPartitionStagesAttrName);
-    op->removeAttr(tt::gpu::kWarpSpecializeTagAttrName);
-    op->removeAttr(tt::kWarpSpecializeAttrName);
-    op->removeAttr(kPartitionTypesAttrName);
-  });
-}
-
 // Transform a case-2 atomic (see file header). `depth` is the tile-prefetch
 // depth; v1 only supports depth == 1.
 //
@@ -242,8 +225,11 @@ static LogicalResult transformAtomic(triton::FuncOp funcOp,
 
 // Entry point: classify and (where applicable) transform every `tt.atomic_rmw`.
 // Returns failure() when an atomic forces a graceful warp-specialization
-// reject; the caller then bails out of WS leaving an unspecialized, correct
-// kernel.
+// reject. The caller is responsible for stripping WS metadata (via
+// removeWarpSpecializeAttr, which clears both the partition ids and the
+// async_task_ids) so the kernel is left unspecialized-but-compilable; this
+// keeps a single source of truth for the reject teardown shared with the other
+// AutoWS bail-outs.
 LogicalResult doAtomicBroadcast(triton::FuncOp funcOp, int tilePrefetchDepth) {
   SmallVector<tt::AtomicRMWOp> atomics;
   funcOp.walk([&](tt::AtomicRMWOp op) { atomics.push_back(op); });
@@ -256,13 +242,11 @@ LogicalResult doAtomicBroadcast(triton::FuncOp funcOp, int tilePrefetchDepth) {
       continue;
     case AtomicWSCase::Reject:
       LDBG("Warp specialization does not support this atomic shape. Skipping.");
-      rejectWarpSpecialization(funcOp);
       return failure();
     case AtomicWSCase::Transform:
       if (failed(
               transformAtomic(funcOp, atomicOp, whileOp, tilePrefetchDepth))) {
         LDBG("atomic broadcast transform failed; skipping WS.");
-        rejectWarpSpecialization(funcOp);
         return failure();
       }
       continue;

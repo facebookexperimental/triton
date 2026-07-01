@@ -117,12 +117,23 @@ public:
   // regions as WS regions and crashes when sibling ops in an scf.if/else aren't
   // tagged. Stripping everything ensures downstream sees a plain (non-WS) loop.
   void removeWarpSpecializeAttr(triton::FuncOp funcOp) {
-    funcOp->walk([&](scf::ForOp forOp) {
-      forOp->removeAttr(mlir::triton::kWarpSpecializeAttrName);
-      forOp->removeAttr(mlir::triton::gpu::kPartitionStagesAttrName);
-      forOp->removeAttr(mlir::triton::gpu::kWarpSpecializeTagAttrName);
-    });
+    auto stripLoop = [](Operation *loop) {
+      loop->removeAttr(mlir::triton::kWarpSpecializeAttrName);
+      loop->removeAttr(mlir::triton::gpu::kPartitionStagesAttrName);
+      loop->removeAttr(mlir::triton::gpu::kWarpSpecializeTagAttrName);
+      loop->removeAttr(kPartitionTypesAttrName);
+    };
+    funcOp->walk([&](scf::ForOp forOp) { stripLoop(forOp); });
+    funcOp->walk([&](scf::WhileOp whileOp) { stripLoop(whileOp); });
     funcOp->walk([&](Operation *op) {
+      // Strip both the partition id (`ttg.partition`) and the task id
+      // (`async_task_id`). The task id is only present once `doTaskIdPropagate`
+      // has run (e.g. the atomic-broadcast reject path bails after
+      // propagation); for the earlier bail-outs it simply does not exist yet
+      // and this is a no-op. Leaving either behind produces a half-tagged state
+      // that the downstream `tritongpu-pipeline` pass mis-treats as a WS
+      // region.
+      op->removeAttr("async_task_id");
       op->removeAttr(mlir::triton::gpu::kPartitionAttrName);
       op->removeAttr(mlir::triton::gpu::kPartitionOutputsAttrName);
     });
@@ -195,11 +206,14 @@ public:
     // atomic and either pass it through (single-partition), transform it into a
     // run-once + SMEM broadcast (all-partition scalar loop-carried counter), or
     // gracefully bail out of warp specialization (unsupported shape). On a
-    // reject the kernel is left unspecialized-but-compilable. The broadcast
-    // channel depth comes from the `tile-prefetch-depth` pass option (a Python
-    // knob), not an env var.
+    // reject we strip all WS metadata via removeWarpSpecializeAttr (which now
+    // also clears the `async_task_id`s that doTaskIdPropagate materialized
+    // above) so downstream sees a plain, compilable non-WS kernel. The
+    // broadcast channel depth comes from the `tile-prefetch-depth` pass option
+    // (a Python knob), not an env var.
     if (failed(doAtomicBroadcast(funcOp, tilePrefetchDepth))) {
       LDBG("Atomic broadcast rejected warp specialization. Skipping.");
+      removeWarpSpecializeAttr(funcOp);
       return;
     }
     if (dumpIntermediateSteps) {
