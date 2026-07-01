@@ -18,8 +18,16 @@ namespace mlir::triton::gpu {
 // ── ModuloReservationTable ──────────────────────────────────────────────────
 
 ModuloReservationTable::ModuloReservationTable(int II) : II{II} {
-  for (auto pipe :
-       {HWPipeline::TMA, HWPipeline::TC, HWPipeline::CUDA, HWPipeline::SFU}) {
+  // One row per hardware pipeline (NV + AMD). reserve()/unreserve() index
+  // table[pipeline][slot] directly, so every non-NONE pipeline must have a row
+  // or it would index a default-constructed empty SmallVector. NONE is handled
+  // specially (no resource) by all methods.
+  // MFMA is AMD's matrix engine and TC is NV's tensor core — functionally
+  // analogous, but kept as distinct pipelines so each backend's LatencyModel
+  // reserves its own row (a kernel only ever uses one of them).
+  for (auto pipe : {HWPipeline::TMA, HWPipeline::TC, HWPipeline::CUDA,
+                    HWPipeline::SFU, HWPipeline::MFMA, HWPipeline::LDS,
+                    HWPipeline::GLOBAL, HWPipeline::VALU}) {
     table[pipe].assign(II, -1);
   }
 }

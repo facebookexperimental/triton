@@ -152,25 +152,35 @@ multi-buffered subtiled reuse member, `insertAsyncComm` emits, once per region a
 the tile-body entry (`getOrComputeSubtiledSlot` in `WSCodePartition.cpp`):
 
 ```
-flattened = accumCnt * numTiles + tileIdx       // tileIdx = builtin block arg
+flattened = accumCnt + tileIdx                   // tileIdx = builtin block arg
 bufferIdx = flattened % numBuffers               // getBufferIdxAndPhase
 phase     = (flattened / numBuffers) & 1
 view      = memdesc_index[baseArg, bufferIdx]    // built from the in-body base
 ```
 
+The `numTiles` factor lives on the **loop-carried counter**, not in this index
+math: the subtiled reuse group's `accumCnt` advances by `numTiles` per outer
+iteration (`getReuseGroupStride` / `getAccumForReuseGroup` in `WSBuffer.cpp`),
+so the flattened stream is still `iter*numTiles + tileIdx`. Keeping the stride
+on the counter — rather than an in-body `accumCnt * numTiles` — enforces a single
+**per-channel** stride rule and stops the `numTiles` factor from leaking onto
+co-resident non-subtile counters (e.g. the depth-2 TMEM accumulator, whose
+slot/phase otherwise collapse → deadlock). See `docs/AccumulationCounters.md`.
+
 `lowerSubtiledRegion` replaces `tileIdx` with `arith.constant t` per tile, so
 the shared barrier behaves as one monotonic stream advanced `numTiles` times per
-outer iteration. The producer SMEM-store dest and consumer `async_tma_copy`
-source are rewired to `view`, and the now-dead per-tile buffer positions are
-removed (`removePerTilePosition`) — `columnOffset` and the data leaf stay
-per-tile operands.
+outer iteration (the advance now comes from `accumCnt += numTiles`). The producer
+SMEM-store dest and consumer `async_tma_copy` source are rewired to `view`, and
+the now-dead per-tile buffer positions are removed (`removePerTilePosition`) —
+`columnOffset` and the data leaf stay per-tile operands.
 
 - The offset is the **builtin tile index** (producer/consumer replication
   order), NOT the reuse-group position. Producer-tile-`t` and consumer-tile-`t`
   are the same logical subtile by construction (both regions replicate from the
   same ordered split-tree leaves), so deriving the slot from `tileIdx` makes
-  producer and consumer agree on `slot = (accumCnt*numTiles + t) % numBuffers`
-  with **no operand matching**. An earlier approach that keyed the count off the
+  producer and consumer agree on `slot = (accumCnt + t) % numBuffers` (with
+  `accumCnt` advancing by `numTiles`/iter) with **no operand matching**. An
+  earlier approach that keyed the count off the
   *threaded* per-tile buffer operands (matched via `traceToBufferBase`) permuted
   the tile→count mapping differently between producer and consumer (the consumer
   carries the SMEM buffer at two per-tile positions) and corrupted data.

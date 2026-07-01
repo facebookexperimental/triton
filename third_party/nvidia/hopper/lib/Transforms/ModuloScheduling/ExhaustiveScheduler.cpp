@@ -16,7 +16,6 @@
 #include "ExhaustiveScheduler.h"
 
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/Support/Debug.h"
 #include <algorithm>
 #include <chrono>
@@ -26,8 +25,6 @@
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 
 namespace mlir::triton::gpu {
-
-namespace ttng = triton::nvidia_gpu;
 
 // ── Buffer extraction ───────────────────────────────────────────────────────
 
@@ -60,12 +57,16 @@ extractBuffers(const DataDependenceGraph &ddg) {
       buf.sizeBytes =
           elems * memDesc.getElementType().getIntOrFloatBitWidth() / 8;
       buf.tmemCols = 0;
-    } else if (isa<ttng::TMEMAllocOp>(op)) {
-      auto memDesc = dyn_cast<MemDescType>(op->getResult(0).getType());
-      if (!memDesc)
-        continue;
+    } else if (node.tmemAllocCols > 0) {
+      // Target-specific accumulator alloc (e.g. Blackwell TMEM), size
+      // precomputed on the DDG node via the LatencyModel (HW-agnostic here).
+      // Invariant: the LatencyModel sets tmemAllocCols > 0 for every real
+      // accumulator and 0 otherwise, so this identifies accumulator buffers
+      // without a backend-specific op check. A 0-col accumulator would be
+      // dropped here — asserted impossible in
+      // NVLatencyModel::getAccumulatorAllocCols.
       buf.kind = BufKind::TMEM;
-      buf.tmemCols = ttng::getTmemAllocSizes(memDesc).numCols;
+      buf.tmemCols = node.tmemAllocCols;
       buf.sizeBytes = 0;
     } else {
       continue;

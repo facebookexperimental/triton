@@ -619,7 +619,6 @@ class CUDABackend(BaseBackend):
         # dummy layouts
         tlx.tlx_passes.add_tlx_storage_alias_lowering(pm)
 
-        passes.ttir.add_rewrite_tensor_pointer(pm)
         if capability // 10 < 9:
             passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
         passes.common.add_canonicalizer(pm)

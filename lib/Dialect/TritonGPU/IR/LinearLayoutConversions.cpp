@@ -10,6 +10,7 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/StrUtil.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -841,7 +842,7 @@ LinearLayout wmmaDotOperandToLinearLayout(DotOperandEncodingAttr dotWmmaLayout,
       permuteDimNames(standardOutDimNames(ctx, rank), order);
   dotOperanLayout = dotOperanLayout.transposeOuts(repDimNames);
 
-  return combineCtaCgaWithShape(dotOperanLayout, wmmaLayout.getCGALayout(),
+  return combineCtaCgaWithShape(dotOperanLayout, dotWmmaLayout.getCGALayout(),
                                 shape);
 }
 
@@ -1214,10 +1215,16 @@ LinearLayout TritonGPUDialect::toLinearLayout(ArrayRef<int64_t> shape,
   if (auto distributed = dyn_cast<DistributedEncodingTrait>(layout)) {
     result = distributed.toLinearLayout(shape);
   } else {
-    assert(llvm::all_of(shape,
-                        [](int64_t dim) {
-                          return llvm::isPowerOf2_32(dim) && dim >= 1;
-                        }) &&
+    // This helper has no error channel; relax the pow2 assert under the flag so
+    // an NPOT shape reaches a recoverable reject in the conversion patterns
+    // instead of aborting here.
+    static const bool allowNpot =
+        mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
+    assert((allowNpot || llvm::all_of(shape,
+                                      [](int64_t dim) {
+                                        return llvm::isPowerOf2_32(dim) &&
+                                               dim >= 1;
+                                      })) &&
            "shape must be a postive power of 2");
     if (auto shared = dyn_cast<SwizzledSharedEncodingAttr>(layout)) {
       result = swizzledSharedToLinearLayout(shape, shared);
@@ -1398,6 +1405,7 @@ chooseDsReadTrLayout(Attribute enc, ArrayRef<int64_t> shape,
 LinearLayout chooseScaledWmmaScaleLayout(MLIRContext *ctx, int dotOperandIdx,
                                          ArrayRef<int64_t> dotOperandShape,
                                          unsigned wmmaMDim,
+                                         unsigned scaleFactor,
                                          LinearLayout ctaLayout,
                                          CGAEncodingAttr cgaLayout) {
   using basisT = std::vector<std::vector<int32_t>>;
@@ -1419,9 +1427,9 @@ LinearLayout chooseScaledWmmaScaleLayout(MLIRContext *ctx, int dotOperandIdx,
   auto dimK = outDimNames[rank - 1];
   auto dimNonK = outDimNames[rank - 2];
 
-  // Each lane holds kWidth=4 consecutive values along the K dim.
-  // The first 16 lanes are distributed along the nonK dim.
-  unsigned scaleKWidth = 4;
+  // Each lane holds kWidth=4(scale32) or kWidth=8(scale16) consecutive values
+  // along the K dim. The first 16 lanes are distributed along the nonK dim.
+  unsigned scaleKWidth = scaleFactor == 32 ? 4 : 8;
   auto kSize = dotOperandShape[1];
   LinearLayout tileLayout =
       LinearLayout::identity1D(scaleKWidth, kRegister, dimK) *
@@ -1754,6 +1762,25 @@ chooseMfmaLikeStoreLayout(RankedTensorType valType) {
   swapLL *= LinearLayout({{dimN, dimNBases}}, {dimN});
 
   return mfmaLL.compose(swapLL);
+}
+
+LinearLayout getTDMLinearLayout(ArrayRef<int64_t> blockShape,
+                                ArrayRef<unsigned> warpsPerCTA,
+                                const LinearLayout &cgaLayout) {
+  int numDims = blockShape.size();
+  auto ctx = cgaLayout.getOutDimNames().begin()->getContext();
+
+  assert(numDims >= 1 && numDims <= 5 && "TDM supports 1D to 5D tensors");
+  assert(static_cast<int>(warpsPerCTA.size()) == numDims);
+
+  SmallVector<unsigned> messageShape(numDims);
+  for (int i = 0; i < numDims; ++i)
+    messageShape[i] = blockShape[i] / warpsPerCTA[i];
+
+  auto order = getMatrixOrder(numDims, /*rowMajor=*/false);
+
+  return identityStandardND(S("message"), messageShape, order) *
+         identityStandardND(S("warp"), warpsPerCTA, order) * cgaLayout;
 }
 
 } // namespace mlir::triton::gpu

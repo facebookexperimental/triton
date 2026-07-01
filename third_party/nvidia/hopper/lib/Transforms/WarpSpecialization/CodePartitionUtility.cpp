@@ -97,6 +97,14 @@ Operation *skipIdxOp(Operation *op) {
 }
 
 Operation *ChannelPost::getSrcOp() {
+  // Prefer the producer cached at channel-creation time. This is the only
+  // reliable source for a producer inside a ttng.subtiled_region: once a
+  // sibling channel (sharing the same in-body template store and per-tile
+  // buffer position) is lowered, insertAsyncComm rewires that store and removes
+  // the shared per-tile position, so the alloc-walk below would no longer reach
+  // it.
+  if (cachedSrcOp)
+    return cachedSrcOp;
   for (auto usr : allocOp->getUsers()) {
     Operation *user = skipIdxOp(usr);
     if (!user)
@@ -838,8 +846,15 @@ bool verifyReuseGroup2(ReuseGroup *group) {
   auto *chA = group->channels[0];
   auto *chB = group->channels[1];
 
-  // Only handle single-copy buffers.
-  if (chA->getNumBuffers() != 1 || chB->getNumBuffers() != 1)
+  // The ordinary 2-channel reuse path is single-copy. A multi-copy pair is
+  // admitted only for the FA-fwd full-overwrite owner shape: the owner MMA
+  // rewrites the whole physical TMEM slot, so its acquire must be relocated to
+  // wait for the sibling's async reader even when the planner raised
+  // buffer.copy for cross-stage liveness.
+  bool hasWholeOverwriteOwner = isWholeAllocationOverwriteReuseOwner(chA) ||
+                                isWholeAllocationOverwriteReuseOwner(chB);
+  if ((chA->getNumBuffers() != 1 || chB->getNumBuffers() != 1) &&
+      !hasWholeOverwriteOwner)
     return false;
 
   // TMEM real reuse requires BOTH:
@@ -996,6 +1011,20 @@ SmallVector<Channel *> orderReuseGroupN(ReuseGroup *group) {
   return ordered;
 }
 
+// A consumer drains its read of the shared buffer at its own program point only
+// if it is *synchronous*. An asynchronous MMA (a Blackwell tcgen05 op with
+// is_async, or an async Hopper wgmma) merely *issues* at that point and reads
+// its operand asynchronously, so same-partition program order does not order
+// the read before a later producer's overwrite. Such a consumer cannot rely on
+// program order for reuse safety and needs an explicit reuse barrier.
+static bool isAsyncReadConsumer(Operation *op) {
+  if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(op))
+    return mma.isAsync();
+  if (auto wgmma = dyn_cast<ttng::WarpGroupDotOp>(op))
+    return wgmma.getIsAsync();
+  return false;
+}
+
 bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel) {
   Operation *earlyProducer = earlyChannel->getSrcOp();
   Operation *lateConsumer = lateChannel->getDstOp();
@@ -1021,12 +1050,27 @@ bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel) {
     if (!samePartition)
       continue;
 
-    // Same partition: check if earlyProducer appears before lateConsumer.
-    // If so, partition-internal ordering guarantees that lateConsumer's
-    // consumer_release will happen before earlyProducer's next
-    // producer_acquire.
+    // Same partition: program order *issues* the consumer before the producer's
+    // next overwrite. That frees the shared buffer without an explicit reuse
+    // barrier only if the consumer is *synchronous* -- i.e. it drains its read
+    // at its own program point. An asynchronous consumer (a Blackwell tcgen05
+    // is_async mma, or an async Hopper wgmma) merely issues there and reads its
+    // operand asynchronously, so the producer can overwrite the buffer while
+    // the read is still in flight; that case needs the explicit reuse barrier.
+    // (FA-fwd-persistent: the late P channel's only consumer is the PV tcgen05
+    // mma, which is async -- eliding the wait was the WAR race that overwrote P
+    // and produced NaN.)
+    //
+    // FIXME(reuse WAR, quantifier): the buffer is free only after *every*
+    // consumer has read it, so the wait may be elided only if ALL
+    // actualConsumers satisfy same-partition + appearsBefore + synchronous. The
+    // `return false` below still elides on the FIRST qualifying consumer
+    // (existential), which is latent-unsafe when a late channel has multiple
+    // consumers (e.g. one same-partition + one cross-partition). Safe today
+    // only because these reuse-group late channels have a single consumer.
     if (earlyProducer->getBlock() == consumer->getBlock() &&
-        appearsBefore(earlyProducer, consumer)) {
+        appearsBefore(earlyProducer, consumer) &&
+        !isAsyncReadConsumer(consumer)) {
       LDBG("needExplicitReuseWait: no explicit wait needed, "
            << "earlyChannel " << earlyChannel->uniqID << " and lateChannel "
            << lateChannel->uniqID << " have same-partition ordering");
@@ -3191,6 +3235,12 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
       channels.push_back(std::make_unique<ChannelPost>(
           producerTaskId, consumerTaskIds, allocOp, channels.size()));
       channels.back()->srcName = getOutermostNameFromLoc(allocOp->getLoc());
+      auto *post = static_cast<ChannelPost *>(channels.back().get());
+      // Cache the resolved producer op so getSrcOp() survives a sibling
+      // subtiled-region channel's lowering. Skip the direct alloc-with-src case
+      // (producerOp == allocOp), where getSrcOp() intentionally returns null.
+      if (producerOp != allocOp)
+        post->cachedSrcOp = producerOp;
     }
   }
 }

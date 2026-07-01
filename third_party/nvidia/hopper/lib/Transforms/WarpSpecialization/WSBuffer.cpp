@@ -221,20 +221,14 @@ static void generateYieldCntsForThenBlock(
   }
 }
 
-// Determine the per-iteration accumCnt increment for a ForOp.  When the loop
-// body contains a SubtiledRegionOp, each iteration processes numTiles tiles,
-// so the increment must be numTiles instead of 1.
-static int64_t getAccumCntIncrement(scf::ForOp forOp) {
-  int64_t increment = 1;
-  forOp.walk([&](triton::nvidia_gpu::SubtiledRegionOp subOp) {
-    unsigned numTiles = subOp.getNumTiles();
-    if (numTiles > static_cast<unsigned>(increment))
-      increment = numTiles;
-  });
-  return increment;
-}
-
-// Increment by the appropriate amount for unique channels.
+// Yield the per-iteration accumCnt for a channel that lives directly in the
+// loop body (not inside a SubtiledRegionOp tile body). Such a channel consumes
+// one buffer slot per iteration, so its counter always increments by 1.
+// Channels whose producer/consumer ops live inside a SubtiledRegionOp carry
+// their per-iteration stride on the reuse-group counter instead -- see
+// getAccumForReuseGroup. (Historically a SubtiledRegionOp anywhere in the loop
+// made this return numTiles, which wrongly stamped the numTiles stride onto the
+// TMEM accumulator and collapsed its depth-2 slot/phase, deadlocking the GEMM.)
 static Value generateYieldCntsForForOp(scf::ForOp forOp, unsigned accumArgId) {
   Operation *yieldOp = forOp.getBody()->getTerminator();
   Value arg = forOp.getBody()->getArgument(accumArgId);
@@ -242,16 +236,70 @@ static Value generateYieldCntsForForOp(scf::ForOp forOp, unsigned accumArgId) {
   builder.setAsynTaskIdsFromArray(getNestedAsyncTaskIds(forOp));
   builder.setInsertionPoint(yieldOp);
   auto loc = forOp.getLoc();
-  int64_t increment = getAccumCntIncrement(forOp);
-  Value incVal =
-      builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, increment, 64);
-  Value endAccum = builder.createWithAsyncTaskIds<arith::AddIOp>(
-      accumCntLoc(loc), arg, incVal);
+  // Make sure accumCnt = argValue + 1, increment by 1.
+  Value one = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
+  Value endAccum =
+      builder.createWithAsyncTaskIds<arith::AddIOp>(accumCntLoc(loc), arg, one);
   return endAccum;
 }
 
 static bool isRegionOp(Operation *op) {
   return isa<scf::ForOp>(op) || isa<scf::IfOp>(op);
+}
+
+// The SubtiledRegionOp enclosing `op` (op may BE the region or be nested in
+// it).
+static ttng::SubtiledRegionOp enclosingSubtiledOf(Operation *op) {
+  if (!op)
+    return nullptr;
+  if (auto s = dyn_cast<ttng::SubtiledRegionOp>(op))
+    return s;
+  return op->getParentOfType<ttng::SubtiledRegionOp>();
+}
+
+// Per-iteration buffer-consumption stride for a reuse group.
+//
+// A plain reuse group advances its counter once per channel position (stride
+// 1). A *subtiled* reuse group shares one multibuffer across `numTiles` tiles
+// that are consumed within a single outer iteration, so its counter must
+// advance by numTiles per iteration. This stride used to live in the in-body
+// index math as `accumCnt * numTiles`; moving it onto the loop-carried counter
+// keeps a single per-channel stride rule and stops the numTiles factor from
+// leaking onto co-resident non-subtile counters (the TMEM-accumulator hang).
+//
+// The tile body is not yet replicated here, so we derive the per-tile
+// consumption count structurally -- counting the buffer-touching ops in the one
+// tile body -- and scale by numTiles, rather than hardcoding numTiles. The
+// in-body flattening (`accumCnt + tileIdx`, tileIdx in [0, numTiles)) only
+// supports one consumption per tile, which we assert.
+static int64_t getReuseGroupStride(ReuseGroup *group) {
+  ttng::SubtiledRegionOp sub;
+  for (auto *ch : group->channels) {
+    // Only SMEM(-post) channels participate in subtiled reuse. Skip TMEM(-post)
+    // channels: they never subtile and getDstOp() can be unsafe on operand-D.
+    if (ch->channelKind != DataChannelKind::SMEM &&
+        ch->channelKind != DataChannelKind::SMEMPost)
+      continue;
+    if ((sub = enclosingSubtiledOf(ch->getSrcOp())))
+      break;
+    if ((sub = enclosingSubtiledOf(ch->getDstOp())))
+      break;
+  }
+  if (!sub)
+    return 1;
+  // Count buffer-slot consumptions inside one (not-yet-replicated) tile body.
+  int64_t perTile = 0;
+  for (Operation &op : sub.getTileRegion().front().without_terminator()) {
+    if (isa<ttg::LocalStoreOp, ttng::AsyncTMACopyLocalToGlobalOp,
+            ttg::LocalLoadOp>(&op))
+      ++perTile;
+  }
+  if (perTile == 0)
+    perTile = 1;
+  assert(perTile == 1 &&
+         "subtiled reuse group with >1 buffer consumption per tile is not "
+         "supported by the in-body accumCnt + tileIdx flattening");
+  return static_cast<int64_t>(sub.getNumTiles()) * perTile;
 }
 
 // op is in chList, chList is the list of operations under a ctrlOp enclosing
@@ -262,6 +310,10 @@ Value getAccumForReuseGroup(Operation *op, SmallVector<Operation *> &chList,
                             DenseSet<Operation *> &regionsWithChannels,
                             ReuseConfig *config, int reuseGroupIdx,
                             bool before) {
+  // Per-iteration buffer-consumption stride for this reuse group: 1 for plain
+  // reuse groups, numTiles for subtiled groups, so each counted chList position
+  // advances the counter by the buffer's true per-iteration consumption.
+  int64_t stride = getReuseGroupStride(config->getGroup(reuseGroupIdx));
   // If op is a region op, we can get its result at the matching ArgIdx.
   // Otherwise, we need to find the last region op prior to op and accumulate
   // from there.
@@ -319,7 +371,9 @@ Value getAccumForReuseGroup(Operation *op, SmallVector<Operation *> &chList,
     auto loc = op->getLoc();
     // From the last region op, accumulate till before or after "op".
     Value lit = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-        loc, before ? opIdx - lastRegionIdx - 1 : opIdx - lastRegionIdx, 64);
+        loc,
+        (before ? opIdx - lastRegionIdx - 1 : opIdx - lastRegionIdx) * stride,
+        64);
     Value endAccum = builder.createWithAsyncTaskIds<arith::AddIOp>(
         accumCntLoc(loc), res, lit);
     return endAccum;
@@ -334,7 +388,7 @@ Value getAccumForReuseGroup(Operation *op, SmallVector<Operation *> &chList,
         getAccumCnts(forOp.getOperation(), regionsWithChannels, config);
     Value arg = forOp.getBody()->getArgument(numArgs - tCnts + argIdx);
     Value lit = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-        forOp.getLoc(), before ? opIdx : opIdx + 1, 64);
+        forOp.getLoc(), (before ? opIdx : opIdx + 1) * stride, 64);
     Value endAccum = builder.createWithAsyncTaskIds<arith::AddIOp>(
         accumCntLoc(forOp.getLoc()), arg, lit);
     return endAccum;
@@ -363,14 +417,14 @@ Value getAccumForReuseGroup(Operation *op, SmallVector<Operation *> &chList,
     Value startOfIf = getAccumForReuseGroup(
         ctrlOp, parentChList, regionsWithChannels, config, reuseGroupIdx, true);
     Value lit = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-        ctrlOp->getLoc(), before ? opIdx : opIdx + 1, 64);
+        ctrlOp->getLoc(), (before ? opIdx : opIdx + 1) * stride, 64);
     Value endAccum = builder.createWithAsyncTaskIds<arith::AddIOp>(
         accumCntLoc(ctrlOp->getLoc()), startOfIf, lit);
     return endAccum;
   }
   assert(isa<tt::FuncOp>(ctrlOp));
   return builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-      op->getLoc(), before ? opIdx : opIdx + 1, 64);
+      op->getLoc(), (before ? opIdx : opIdx + 1) * stride, 64);
 }
 
 scf::IfOp rewriteIfOp(scf::IfOp ifOp, SmallVector<Operation *> &taskTopOps,
@@ -1175,6 +1229,26 @@ scf::WhileOp createNewWhileWrapper(scf::WhileOp origWhileOp,
     yieldOp->replaceUsesOfWith(arg, whileYield);
     ++accumArgId;
   }
+
+  // Every appended counter must have been rewired above. A leftover placeholder
+  // (an appended after-yield operand still equal to its own after-region arg)
+  // yields the counter back as itself, making it loop-invariant across
+  // persistent iterations: the buffer index / mbarrier phase never advance and
+  // the kernel silently deadlocks. That is exactly the failure class this
+  // threading exists to prevent, so catch it here rather than at runtime.
+#ifndef NDEBUG
+  assert(accumArgId == afterArgSize &&
+         "not all accumCnt counters were wired into the while after-yield");
+  unsigned yieldN = yieldOp->getNumOperands();
+  for (unsigned i = 0; i < totalCnts; ++i) {
+    Value placeholder =
+        newWhileOp.getAfterBody()->getArgument(afterArgSize - totalCnts + i);
+    assert(
+        yieldOp->getOperand(yieldN - totalCnts + i) != placeholder &&
+        "accumCnt after-yield still holds its placeholder arg (counter would "
+        "be loop-invariant across persistent iterations)");
+  }
+#endif
 
   LLVM_DEBUG({
     LDBG("-- after createNewWhileWrapper ");

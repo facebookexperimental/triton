@@ -48,11 +48,18 @@ static void padToMaxWarpGroups(WarpSpecializeOp op, int numExtraWarpGroups) {
   }
   op.setPartitionNumWarps(partitionNumWarps);
 
-  // Set the requested registers to low for the padded partitions that do
-  // nothing.
+  // Set the requested registers as low as legally possible for the padded
+  // partitions that do nothing. `nvvm.setmaxregister` requires the per-thread
+  // register count to be in [24, 256] (a multiple of 8) on all sm_90+ targets
+  // (Hopper and Blackwell), so 24 is the floor. Using a below-minimum value
+  // (e.g. 16) is only masked when a padding partition shares a warp group with
+  // a real partition requesting >= 24 (the warp group's request is the max over
+  // its members); when it does not, the illegal value reaches `setmaxregister`
+  // and lowering fails the verifier.
+  constexpr int32_t kMinLegalRegisters = 24;
   if (auto reqRegs = op.getRequestedRegisters()) {
     SmallVector<int32_t> newReqRegs(*reqRegs);
-    newReqRegs.append(paddingPartitionSizes.size(), 16);
+    newReqRegs.append(paddingPartitionSizes.size(), kMinLegalRegisters);
     op.setRequestedRegisters(newReqRegs);
   }
 
