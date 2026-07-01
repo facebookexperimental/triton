@@ -228,23 +228,44 @@ tt.func @no_barrier_before_perthread_arrive(%arg: tensor<32x16xf16, #blocked_pt>
 
 // -----
 
-// Verify that a regular (non-perThread) arrive after a shared memory write
-// DOES get a ttg.barrier inserted before it (existing behavior preserved).
+// A regular arrive is a synchronization point whose physical CTA barrier is
+// emitted during lowering. Membar must not insert a duplicate barrier, but it
+// must retain the arrive's dependency for a subsequent wait.
 
 #shared_reg = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #blocked_reg = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #A_SHARED_reg = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [1, 0]}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 1024 : i32} {
-// CHECK-LABEL: @barrier_before_regular_arrive
-tt.func @barrier_before_regular_arrive(%arg: tensor<32x16xf16, #blocked_reg>) {
+// CHECK-LABEL: @no_membar_before_regular_arrive
+tt.func @no_membar_before_regular_arrive(%arg: tensor<32x16xf16, #blocked_reg>) {
   %alloc = ttg.local_alloc : () -> !ttg.memdesc<32x16xf16, #A_SHARED_reg, #ttg.shared_memory, mutable>
   %barrier = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_reg, #ttg.shared_memory, mutable>
   //      CHECK: ttg.local_store
-  // CHECK-NEXT: ttg.barrier local
   // CHECK-NEXT: ttng.arrive_barrier
   ttg.local_store %arg, %alloc : tensor<32x16xf16, #blocked_reg> -> !ttg.memdesc<32x16xf16, #A_SHARED_reg, #ttg.shared_memory, mutable>
   ttng.arrive_barrier %barrier, 1 : !ttg.memdesc<1xi64, #shared_reg, #ttg.shared_memory, mutable>
+  tt.return
+}
+
+// CHECK-LABEL: @wait_then_regular_arrive
+tt.func @wait_then_regular_arrive(%phase: i32) {
+  %barrier = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_reg, #ttg.shared_memory, mutable>
+  //      CHECK: ttng.wait_barrier
+  // CHECK-NEXT: ttng.arrive_barrier
+  ttng.wait_barrier %barrier, %phase : !ttg.memdesc<1xi64, #shared_reg, #ttg.shared_memory, mutable>
+  ttng.arrive_barrier %barrier, 1 : !ttg.memdesc<1xi64, #shared_reg, #ttg.shared_memory, mutable>
+  tt.return
+}
+
+// CHECK-LABEL: @regular_arrive_then_wait
+tt.func @regular_arrive_then_wait(%phase: i32) {
+  %barrier = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_reg, #ttg.shared_memory, mutable>
+  //      CHECK: ttng.arrive_barrier
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttng.wait_barrier
+  ttng.arrive_barrier %barrier, 1 : !ttg.memdesc<1xi64, #shared_reg, #ttg.shared_memory, mutable>
+  ttng.wait_barrier %barrier, %phase : !ttg.memdesc<1xi64, #shared_reg, #ttg.shared_memory, mutable>
   tt.return
 }
 }
