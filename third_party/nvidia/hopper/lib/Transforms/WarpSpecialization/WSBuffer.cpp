@@ -1176,6 +1176,26 @@ scf::WhileOp createNewWhileWrapper(scf::WhileOp origWhileOp,
     ++accumArgId;
   }
 
+  // Every appended counter must have been rewired above. A leftover placeholder
+  // (an appended after-yield operand still equal to its own after-region arg)
+  // yields the counter back as itself, making it loop-invariant across
+  // persistent iterations: the buffer index / mbarrier phase never advance and
+  // the kernel silently deadlocks. That is exactly the failure class this
+  // threading exists to prevent, so catch it here rather than at runtime.
+#ifndef NDEBUG
+  assert(accumArgId == afterArgSize &&
+         "not all accumCnt counters were wired into the while after-yield");
+  unsigned yieldN = yieldOp->getNumOperands();
+  for (unsigned i = 0; i < totalCnts; ++i) {
+    Value placeholder =
+        newWhileOp.getAfterBody()->getArgument(afterArgSize - totalCnts + i);
+    assert(
+        yieldOp->getOperand(yieldN - totalCnts + i) != placeholder &&
+        "accumCnt after-yield still holds its placeholder arg (counter would "
+        "be loop-invariant across persistent iterations)");
+  }
+#endif
+
   LLVM_DEBUG({
     LDBG("-- after createNewWhileWrapper ");
     newWhileOp.dump();

@@ -1753,6 +1753,15 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
         if ((!parentForOp || mappings.lookupOrNull(parentForOp.getResult(i))) &&
             !parentWhileOp)
           yieldOp->insertOperands(op->getNumOperands(), newV);
+        // scf.while: append unconditionally when the operand was sliced. Unlike
+        // scf.for there is no per-index result guard here because the while
+        // branch above appends a loop-carried arg for every sliced init, and
+        // for a while the after-yield operand k feeds before-arg k 1:1, so a
+        // sliced yield operand always has a matching appended before-arg. This
+        // holds for the loop-carried values this pass threads
+        // (accumulators/counters); slicing an after-region-only value whose
+        // init was not sliced would break the 1:1 alignment and needs a guard
+        // analogous to the for path.
         if (parentWhileOp)
           yieldOp->insertOperands(op->getNumOperands(), newV);
       }

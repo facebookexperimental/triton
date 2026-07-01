@@ -847,6 +847,17 @@ LoopCarriedSlot getLoopCarriedSlot(LoopLikeOpInterface loop, unsigned k) {
   // results / after-args align with scf.condition forwarded operands, not with
   // the iter-arg index. Find the forwarded position carrying this "before" arg
   // (the case for appended counters and pass-through carried values).
+  //
+  // Contract for the two cases this loop does NOT fully resolve:
+  //   - Not forwarded at all: a "before"-only value (e.g. the raw loop
+  //     predicate) is legal in scf.while and leaves slot.result / slot.afterArg
+  //     null. Callers that need them must check (see LoopCarriedSlot in the
+  //     header and the assert in WSCodePartition
+  //     getOutOfScopeBufferIdxAndPhase).
+  //   - Forwarded to more than one condition slot: only the first forwarded
+  //     position is associated with this slot; later duplicates are ignored.
+  //     Safe today because every threaded counter is forwarded exactly once; a
+  //     general duplicate-forwarding loop would need per-position resolution.
   auto condOp = whileOp.getConditionOp();
   for (auto [j, fwd] : llvm::enumerate(condOp.getArgs())) {
     if (fwd == slot.iterArg) {
