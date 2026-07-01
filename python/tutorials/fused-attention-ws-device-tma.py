@@ -211,6 +211,7 @@ configs = [
         },
         num_stages=s,
         num_warps=w,
+        maxRegAutoWS=152,  # Preserve the tuned compute-partition budget.
         pre_hook=_host_descriptor_pre_hook,
         # ir_override=f"/home/mren/OpenSource/tritonbench/override/_attn_fwd_persist.ttgir"
 #    ) for BM in [256] for BN in [128] for s in NUM_STAGES_OPTIONS for w in [4]
