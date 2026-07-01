@@ -99,7 +99,10 @@ _DEFAULT_OUT = os.path.join(os.path.dirname(__file__), "result.txt")
 # Checker plumbing
 # --------------------------------------------------------------------------- #
 def load_checker(spec):
-    """Load a ``module:function`` checker into ``descriptor(ptx) -> hashable``."""
+    """Load a ``module:function`` checker into ``descriptor(asm_text) -> hashable``.
+
+    The driver feeds the descriptor the IR text of the artifact selected by
+    ``--artifact`` (``ptx`` for the PTX checker, ``ttgir`` for the TTGIR checker)."""
     if ":" not in spec:
         raise ValueError(f"--checker must be 'module:function', got {spec!r}")
     module_name, func_name = spec.split(":", 1)
@@ -128,7 +131,7 @@ def _descriptor_verdict(desc):
     return "SUPPORTED", "checker reconstructed a reduction descriptor"
 
 
-def kernel_support(spec, checker):
+def kernel_support(spec, checker, artifact="ptx"):
     """Stage 1 verdict for one kernel: (verdict, detail).
 
     A declared ``known_limitation`` (the author knows the checker can't model this
@@ -139,9 +142,10 @@ def kernel_support(spec, checker):
     ref = spec.config_space("light")[0]
     try:
         ck = spec.compile(ref, spec.precision_size)
+        desc = checker(ck.asm[artifact])
     except Exception as exc:  # noqa: BLE001
-        return "UNSUPPORTED", f"reference config failed to compile: {type(exc).__name__}"
-    verdict, detail = _descriptor_verdict(checker(ck.asm["ptx"]))
+        return "UNSUPPORTED", f"reference config failed to compile or check: {type(exc).__name__}"
+    verdict, detail = _descriptor_verdict(desc)
     if spec.known_limitation:
         return "LIMITED", spec.known_limitation
     return verdict, detail
@@ -160,7 +164,7 @@ def _spanned_axes(configs):
     return spans
 
 
-def evaluate_precision(spec, checker, config_effort, fuzzer_effort):
+def evaluate_precision(spec, checker, config_effort, fuzzer_effort, artifact="ptx"):
     """Compile + checker-partition + fuzz one kernel; return a result dict."""
     size = spec.precision_size
     configs = spec.config_space(config_effort)
@@ -172,7 +176,7 @@ def evaluate_precision(spec, checker, config_effort, fuzzer_effort):
             fails += 1
             continue
         compiled[config] = ck
-        checker_key[config] = checker(ck.asm["ptx"])
+        checker_key[config] = checker(ck.asm[artifact])
     ok = list(compiled)
     if not ok:
         return dict(name=spec.name, attempted=len(configs), ok=0, fails=fails)
@@ -195,18 +199,18 @@ def evaluate_precision(spec, checker, config_effort, fuzzer_effort):
 # --------------------------------------------------------------------------- #
 # Stage 3 — performance
 # --------------------------------------------------------------------------- #
-def evaluate_performance(spec, checker):
+def evaluate_performance(spec, checker, artifact="ptx"):
     """Benchmark a perf-capable kernel; compare within-set spread to the global ceiling."""
     size = spec.perf_size
     configs = spec.perf_config_space()
     ms, bits, checker_key, fails = {}, {}, {}, 0
     for config in configs:
         try:
-            milliseconds, output_bytes, ptx = spec.benchmark(config, size)
+            milliseconds, output_bytes, asm = spec.benchmark(config, size)
         except Exception:  # noqa: BLE001
             fails += 1
             continue
-        ms[config], bits[config], checker_key[config] = milliseconds, output_bytes, checker(ptx)
+        ms[config], bits[config], checker_key[config] = milliseconds, output_bytes, checker(asm[artifact])
     ok = list(ms)
     if not ok:
         return dict(name=spec.name, ok=0, fails=fails)
@@ -325,6 +329,12 @@ def parse_args(argv):
     p.add_argument("--config-effort", default="light", choices=("light", "heavy"))
     p.add_argument("--fuzzer-effort", default="fast", choices=("fast", "convincing"))
     p.add_argument("--checker", default=_DEFAULT_CHECKER, help="module:function descriptor (default: repo checker)")
+    p.add_argument("--artifact", default="ptx", choices=("ptx", "ttgir"),
+                   help="which compiled IR artifact to feed the checker (default: ptx)")
+    p.add_argument(
+        "--allow-unsound", action="store_true",
+        help="report over-merges but exit 0 instead of 1 — for checkers that are "
+        "expectedly not sound (e.g. the TTGIR checker, blind to FMA contraction)")
     p.add_argument("--out", default=_DEFAULT_OUT, help="result table path")
     return p.parse_args(argv)
 
@@ -346,6 +356,7 @@ def main(argv=None):
         "==========================",
         f"generated:      {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"checker:        {args.checker}",
+        f"artifact:       {args.artifact}",
         f"device:         {device}",
         f"config effort:  {args.config_effort}",
         f"fuzzer effort:  {args.fuzzer_effort} ({repeats} seeds/config)",
@@ -363,7 +374,7 @@ def main(argv=None):
         print("== Stage 1: support ==", flush=True)
         results = []
         for spec in specs:
-            verdict, detail = kernel_support(spec, checker)
+            verdict, detail = kernel_support(spec, checker, args.artifact)
             results.append(dict(name=spec.name, verdict=verdict, detail=detail))
             print(f"  {spec.name}: {verdict} — {detail}", flush=True)
         sections.append(render_stage1(results))
@@ -374,7 +385,7 @@ def main(argv=None):
         for spec in specs:
             n_configs = len(spec.config_space(args.config_effort))
             print(f"  {spec.name}: {n_configs} configs x {repeats} fuzz seeds ...", flush=True)
-            r = evaluate_precision(spec, checker, args.config_effort, args.fuzzer_effort)
+            r = evaluate_precision(spec, checker, args.config_effort, args.fuzzer_effort, args.artifact)
             results.append(r)
             if r.get("ok"):
                 total_over_merges += r["over_merges"]
@@ -395,17 +406,22 @@ def main(argv=None):
                 print(f"  {spec.name}: no perf hook; skipping.", flush=True)
                 continue
             print(f"  {spec.name}: benchmarking {len(spec.perf_config_space())} configs ...", flush=True)
-            results.append(evaluate_performance(spec, checker))
+            results.append(evaluate_performance(spec, checker, args.artifact))
         if results:
             sections.append(render_stage3(results))
 
     write_report(args.out, header, sections)
     print(f"\nWROTE {args.out}")
     if 2 in stages:
-        print(f"SOUNDNESS: total over-merges (must be 0) = {total_over_merges}")
+        gate = "0; --allow-unsound" if args.allow_unsound else "must be 0"
+        print(f"SOUNDNESS: total over-merges ({gate}) = {total_over_merges}")
         if any_unsound or total_over_merges:
             print("RESULT: UNSOUND — the checker merged configs the fuzzer proved different.")
-            return 1
+            if not args.allow_unsound:
+                return 1
+            print("NOTE: --allow-unsound set — reporting the over-merges instead of failing "
+                  "(expected for the TTGIR checker, which is blind to FMA contraction).")
+            return 0
         print("RESULT: SOUND — checker partition refines the empirical partition.")
     return 0
 
