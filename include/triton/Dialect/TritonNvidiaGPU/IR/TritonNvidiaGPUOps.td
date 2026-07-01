@@ -241,48 +241,36 @@ def TTNG_CLCGetProgramIdOp : TTNG_Op<"clc_get_program_id", [Pure]> {
 }
 
 //
-// High-level CLC scheduler ops (barrier-free; lowered later)
+// High-level CLC scheduler op (barrier-free; lowered later)
 //
-// These express a dynamic-persistent CLC schedule WITHOUT any mbarrier /
-// response buffer / phase, so pre-warp-specialization IR stays clean and the
-// persistent loop carries only the 128-bit CLC result. A later lowering pass
-// materializes the response buffer + mbarrier, expands the fetch into the
-// low-level `clc_try_cancel` + `barrier_expect` (issue) and `wait_barrier` +
-// `clc_load_result` (consume), pulls the issue up to overlap the CLC latency
-// with compute, resolves the initial seed, and infers the phase from the loop.
-
-def TTNG_CLCInitOp : TTNG_Op<"clc_init", [Pure]> {
-  let summary = "Seed CLC result for this CTA's statically-launched tile";
-
-  let description = [{
-    Produces the initial 128-bit CLC response for this CTA's own
-    statically-launched tile -- the first tile of a persistent CLC loop, before
-    any cancellation. A later lowering pass resolves it so that `clc_is_canceled`
-    returns true and `clc_get_program_id` returns this program's id. This lets
-    the persistent loop carry only the CLC result (no separate valid/counter
-    state); the seed vs. fetched-tile distinction becomes a lowering concern.
-  }];
-
-  let results = (outs I128:$clcResult);
-
-  let assemblyFormat = [{ attr-dict `:` type($clcResult) }];
-}
+// `clc_advance` expresses a dynamic-persistent CLC fetch WITHOUT any mbarrier /
+// response buffer / phase, so pre-warp-specialization IR stays clean. It returns
+// the decoded next tile directly: an `is_valid` predicate plus the (x, y, z)
+// program-id coordinates. The initial tile needs no op -- it is just this CTA's
+// `program_id` with is_valid = true. A later lowering pass materializes the
+// response buffer + mbarrier, expands `clc_advance` into the low-level
+// `clc_try_cancel` + `barrier_expect` (issue) and `wait_barrier` +
+// `clc_load_result` + `clc_is_canceled` / `clc_get_program_id` (consume + decode),
+// pulls the issue up to overlap the CLC latency with compute, infers the phase,
+// and drops any unused coordinate (dead loop-carried value elimination).
 
 def TTNG_CLCAdvanceOp : TTNG_Op<"clc_advance", []> {
-  let summary = "High-level CLC advance: fetch the next tile's response";
+  let summary = "High-level CLC advance: fetch the next tile (decoded)";
 
   let description = [{
-    Fetches the next work tile via Cluster Launch Control and returns the opaque
-    128-bit CLC response (decode with `clc_is_canceled` / `clc_get_program_id`).
+    Fetches the next work tile via Cluster Launch Control and returns it decoded:
+    `isValid` (a tile was successfully claimed) and its (`x`, `y`, `z`)
+    program-id coordinates.
 
     References no mbarrier or buffer -- a later lowering pass materializes them,
-    splits the fetch into an (overlap-hoisted) async issue and a wait+load, and
-    infers the phase. One per persistent-loop iteration.
+    splits the fetch into an (overlap-hoisted) async issue and a wait+load+decode,
+    infers the phase, and drops unused coordinates. One per persistent-loop
+    iteration.
   }];
 
-  let results = (outs I128:$clcResult);
+  let results = (outs I1:$isValid, I32:$x, I32:$y, I32:$z);
 
-  let assemblyFormat = [{ attr-dict `:` type($clcResult) }];
+  let assemblyFormat = [{ attr-dict `:` type($isValid) `,` type($x) `,` type($y) `,` type($z) }];
 }
 
 //

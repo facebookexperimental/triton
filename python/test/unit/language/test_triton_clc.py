@@ -1,11 +1,14 @@
 """Tests for the core Triton CLC (Cluster Launch Control) tile scheduler.
 
 CLC is a Blackwell (SM100+) feature. The scheduler (`tl.clc_tile_scheduler`)
-emits high-level, barrier-free ops (`clc_init` / `clc_advance` + the pure
-`clc_is_canceled` / `clc_get_program_id`) into the initial TTIR; a later compiler
-lowering pass materializes the response buffer, mbarrier, phase, seed, and the
-issue/wait overlap. Until that lowering lands these tests are IR-only: they check
-the shape of the initial TTIR (which is target-independent and needs no GPU).
+emits a single high-level, barrier-free op (`ttng.clc_advance`) that returns the
+decoded next tile {is_valid, x, y, z}; the initial tile is just `program_id`. A
+later compiler lowering pass materializes the response buffer, mbarrier, phase,
+and the issue/wait overlap, and decodes/drops unused coordinates. Until that
+lowering lands these tests are IR-only: they check the shape of the initial TTIR
+(which is target-independent and needs no GPU).
+
+See docs/design/triton-clc-tile-scheduler.md.
 """
 import pytest
 
@@ -30,14 +33,16 @@ def initial_ttir(fn, signature, constexprs=None):
     return str(src.make_ir(target, options, codegen_fns, module_map, context))
 
 
-# Barrier / buffer ops that must NOT appear in the initial TTIR -- they belong to
-# the deferred lowering, not the high-level scheduler.
-_BARRIER_OPS = [
+# Ops that must NOT appear in the high-level (pre-lowering) TTIR: barriers and the
+# low-level CLC decode/fetch primitives all belong to the deferred lowering.
+_LOWERING_ONLY_OPS = [
     "ttng.init_barrier",
     "ttng.wait_barrier",
     "ttng.barrier_expect",
     "ttng.clc_try_cancel",
     "ttng.clc_load_result",
+    "ttng.clc_is_canceled",
+    "ttng.clc_get_program_id",
 ]
 
 
@@ -98,51 +103,49 @@ def _clc_matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K,  #
 # ---------------------------------------------------------------------------
 # IR-shape tests (no GPU required)
 # ---------------------------------------------------------------------------
-def test_clc_scheduler_emits_high_level_ops():
+def test_clc_scheduler_emits_advance_and_seed():
     ttir = initial_ttir(_clc_count_kernel, {"counts_ptr": "*i32", "num_tiles": "i32"})
-    for op in ("ttng.clc_init", "ttng.clc_advance", "ttng.clc_is_canceled", "ttng.clc_get_program_id"):
-        assert op in ttir, f"expected {op} in initial TTIR"
+    assert "ttng.clc_advance" in ttir, "expected the fetch op in the initial TTIR"
+    assert "tt.get_program_id" in ttir, "the initial tile should be seeded from program_id"
     assert "scf.while" in ttir, "expected the scheduler to form an scf.while persistent loop"
 
 
-def test_clc_scheduler_carries_only_i128():
-    # The persistent loop should carry exactly one value: the 128-bit CLC result.
+def test_clc_scheduler_carries_decoded_tile():
+    # The persistent loop carries the decoded tile: {is_valid, x, y, z}.
     ttir = initial_ttir(_clc_count_kernel, {"counts_ptr": "*i32", "num_tiles": "i32"})
-    assert "scf.while" in ttir
-    assert "(i128) -> i128" in ttir, "the scheduler loop must carry only the i128 CLC result"
+    assert "(i1, i32, i32, i32) -> (i1, i32, i32, i32)" in ttir, \
+        "the scheduler loop must carry the decoded tile (is_valid, x, y, z)"
 
 
-def test_clc_initial_ttir_has_no_barriers():
-    # Barrier/buffer plumbing must live entirely in the deferred lowering.
+def test_clc_initial_ttir_has_no_lowering_ops():
+    # Barriers, buffers, and the low-level decode primitives live in the pass.
     ttir = initial_ttir(_clc_count_kernel, {"counts_ptr": "*i32", "num_tiles": "i32"})
-    for op in _BARRIER_OPS:
+    for op in _LOWERING_ONLY_OPS:
         assert op not in ttir, f"{op} must not appear in the high-level TTIR"
 
 
-def test_clc_drops_unused_tile_dims():
-    # Only tile_id[0] is read, so exactly one dimension should be decoded.
+def test_clc_one_advance_per_iteration():
     ttir = initial_ttir(_clc_count_kernel, {"counts_ptr": "*i32", "num_tiles": "i32"})
-    assert ttir.count("ttng.clc_get_program_id") == 1, "unused tile dimensions should not be decoded"
+    assert ttir.count("ttng.clc_advance") == 1, "exactly one fetch per persistent-loop iteration"
 
 
-def test_clc_gemm_emits_high_level_ops():
+def test_clc_gemm_emits_high_level_op():
     sig = {
         "a_ptr": "*fp16", "b_ptr": "*fp16", "c_ptr": "*fp16", "M": "i32", "N": "i32", "K": "i32", "stride_am": "i32",
         "stride_ak": "i32", "stride_bk": "i32", "stride_bn": "i32", "stride_cm": "i32", "stride_cn": "i32"
     }
     constexprs = {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8}
     ttir = initial_ttir(_clc_matmul_kernel, sig, constexprs)
-    assert "ttng.clc_init" in ttir and "ttng.clc_advance" in ttir
-    assert "scf.while" in ttir
-    for op in _BARRIER_OPS:
+    assert "ttng.clc_advance" in ttir and "scf.while" in ttir
+    for op in _LOWERING_ONLY_OPS:
         assert op not in ttir, f"{op} must not appear in the high-level TTIR"
 
 
 # ---------------------------------------------------------------------------
 # Execution is deferred until the CLC lowering pass lands (see
-# memory: clc-ttir-ops-followup). The GEMM/work-stealing correctness tests will
-# be re-enabled then.
+# docs/design/triton-clc-tile-scheduler.md). The GEMM/work-stealing correctness tests
+# will be re-enabled then.
 # ---------------------------------------------------------------------------
-@pytest.mark.skip(reason="CLC lowering (ttng.clc_init/clc_advance -> barrier ops) not implemented yet")
+@pytest.mark.skip(reason="CLC lowering (ttng.clc_advance -> barrier ops) not implemented yet")
 def test_clc_gemm_execution():
     pass

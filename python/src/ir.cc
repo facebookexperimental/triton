@@ -1750,27 +1750,16 @@ void init_triton_ir(py::module &&m) {
                throw pybind11::index_error("program_id must be in [0,3]");
              return self.create<GetNumProgramsOp>(axis);
            })
-      // CLC (Cluster Launch Control) scheduler ops - SM100+ (Blackwell).
-      // High-level, barrier-free ops emitted before warp specialization. A
-      // later lowering pass materializes the response buffer + mbarrier,
-      // resolves the seed, splits the fetch into an (overlap-hoisted) issue +
-      // wait, and infers the phase. The kernel author never writes any
-      // buffer/barrier/phase.
-      .def("create_clc_init",
-           [](TritonOpBuilder &self) -> Value {
-             return self.create<ttng::CLCInitOp>();
-           })
+      // CLC (Cluster Launch Control) scheduler - SM100+ (Blackwell).
+      // `clc_advance` is the single high-level, barrier-free op: it returns the
+      // decoded next tile {isValid, x, y, z}. The initial tile needs no op
+      // (just program_id + true). A later lowering pass materializes the
+      // response buffer + mbarrier, splits the fetch into an (overlap-hoisted)
+      // issue + wait + decode, and infers the phase.
       .def("create_clc_advance",
-           [](TritonOpBuilder &self) -> Value {
-             return self.create<ttng::CLCAdvanceOp>();
-           })
-      .def("create_clc_is_canceled",
-           [](TritonOpBuilder &self, Value clcResult) -> Value {
-             return self.create<ttng::CLCIsCanceledOp>(clcResult);
-           })
-      .def("create_clc_get_program_id",
-           [](TritonOpBuilder &self, Value clcResult, int dim) -> Value {
-             return self.create<ttng::CLCGetProgramIdOp>(clcResult, dim);
+           [](TritonOpBuilder &self) -> std::vector<Value> {
+             auto op = self.create<ttng::CLCAdvanceOp>();
+             return {op.getIsValid(), op.getX(), op.getY(), op.getZ()};
            })
       .def("create_dot",
            [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
