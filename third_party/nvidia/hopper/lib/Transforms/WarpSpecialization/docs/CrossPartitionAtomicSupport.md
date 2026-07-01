@@ -4,10 +4,6 @@
 (pipeline wiring), with supporting fixes in `WSCodePartition.cpp` and
 `lib/Dialect/TritonGPU/Transforms/WarpSpecialization/OptimizePartitionWarps.cpp`.
 
-> The original design exploration lives in
-> [`CrossPartitionAtomicSupport.proposal.md`](CrossPartitionAtomicSupport.proposal.md).
-> This document describes what was actually implemented.
-
 ## Problem
 
 A dynamic (work-stealing) persistent kernel claims its next tile from a global
