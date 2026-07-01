@@ -285,6 +285,8 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
       return true;
     if (isa<triton::nvidia_gpu::ClusterWaitOp>(op))
       return true;
+    if (auto arrive = dyn_cast<triton::nvidia_gpu::ArriveBarrierOp>(op))
+      return !arrive.getPerThread();
     if (isa<triton::gpu::WarpSpecializePartitionsOp>(op))
       return true;
     if (auto barrier = dyn_cast<triton::gpu::BarrierOp>(op))
@@ -292,7 +294,13 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
     return false;
   };
 
-  if (containsLocalBarrier(op)) {
+  auto arrive = dyn_cast<triton::nvidia_gpu::ArriveBarrierOp>(op);
+  if (arrive && !arrive.getPerThread()) {
+    // Lowering emits the CTA barrier for regular arrives so it also covers
+    // TMEM accesses. Model that synchronization here, but keep tracking the
+    // arrive's own effects for subsequent operations.
+    blockInfo->sync();
+  } else if (containsLocalBarrier(op)) {
     // If the current op is a local barrier, we sync previous reads and writes
     blockInfo->sync();
     return;
@@ -325,9 +333,7 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
     // Each thread's program order guarantees its own SMEM ops are visible
     // before its arrive, and the mbarrier accumulates all arrivals before
     // releasing the waiter.
-    bool isPerThreadArrive = false;
-    if (auto arriveOp = dyn_cast<triton::nvidia_gpu::ArriveBarrierOp>(op))
-      isPerThreadArrive = arriveOp.getPerThread();
+    bool isPerThreadArrive = arrive && arrive.getPerThread();
 
     if (!isPerThreadArrive) {
       if (auto memoryEffectOpInterface =
@@ -352,14 +358,6 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
             }
           }
         }
-      }
-      // If this op may be signalling other threads asynchronously, make sure
-      // all shared memory transactions are complete beforehand.
-      if (isa<triton::nvidia_gpu::ArriveBarrierOp>(op)) {
-        Interval<size_t> allIntervals(0, std::numeric_limits<size_t>::max());
-        auto allMemorySlice = AllocationSlice(allIntervals);
-        curBlockInfo.syncWriteSlices[allMemorySlice].insert(op);
-        curBlockInfo.syncReadSlices[allMemorySlice].insert(op);
       }
     }
     scratchBufferId = allocation->getBufferId(op);
