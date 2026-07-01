@@ -11,6 +11,8 @@ using namespace mlir;
 using namespace mlir::triton;
 using namespace mlir::triton::gpu;
 
+static constexpr int32_t kMinRegisterCount = 24;
+
 // Given a `ttg.warp_specialize` with a certain number of existing warps, pad it
 // with extra warps until it has the same number of full warp groups as the
 // largest partitioning. This ensures that all threads can be present to
@@ -48,11 +50,11 @@ static void padToMaxWarpGroups(WarpSpecializeOp op, int numExtraWarpGroups) {
   }
   op.setPartitionNumWarps(partitionNumWarps);
 
-  // Set the requested registers to low for the padded partitions that do
-  // nothing.
+  // Padded partitions do no work, but their request may become the allocation
+  // for a mixed warp group. Keep it at the minimum legal setmaxnreg value.
   if (auto reqRegs = op.getRequestedRegisters()) {
     SmallVector<int32_t> newReqRegs(*reqRegs);
-    newReqRegs.append(paddingPartitionSizes.size(), 16);
+    newReqRegs.append(paddingPartitionSizes.size(), kMinRegisterCount);
     op.setRequestedRegisters(newReqRegs);
   }
 
@@ -232,7 +234,7 @@ struct AllocateWarpGroups
 
         int leftover = registerBudget / (baseNumWarps * threadsPerWarp);
         leftover = leftover / 8 * 8;
-        if (leftover < 24)
+        if (leftover < kMinRegisterCount)
           return;
 
         for (const WarpGroupInfo &wg : warpGroups) {
@@ -267,7 +269,7 @@ struct AllocateWarpGroups
 
         int leftoverRegsPerThread = remainingRegs / leftoverThreads;
         leftoverRegsPerThread = leftoverRegsPerThread / 8 * 8;
-        if (leftoverRegsPerThread < 24)
+        if (leftoverRegsPerThread < kMinRegisterCount)
           return;
 
         for (const WarpGroupInfo &wg : warpGroups) {

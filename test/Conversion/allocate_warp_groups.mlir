@@ -95,6 +95,33 @@ tt.func @setmaxnreg() {
 
 // -----
 
+// Verify that padding cannot expose an illegal register count when it shares a
+// warp group with a sentinel partition.
+// CHECK: module attributes {ttg.maxnreg = 128 : i32, "ttg.num-warps" = 8 : i32, "ttg.total-num-warps" = 16 : i32}
+module attributes {ttg.maxnreg = 128 : i32, "ttg.num-warps" = 8 : i32} {
+
+tt.func @sentinel_partition_with_padding() {
+  // The six real partition warps require two padding warps. Partition 1 and
+  // the padding partition occupy the same physical warp group.
+  // CHECK: ttg.warp_specialize() attributes {actualRegisters = array<i32: 160, 160, 24, 24>, requestedRegisters = array<i32: -1, -1, 24>, warpGroupStartIds = array<i32: 8, 12, 14>}
+  ttg.warp_specialize() attributes {requestedRegisters = array<i32: -1, -1>}
+  default {
+    ttg.warp_yield
+  }
+  partition0() num_warps(4) {
+    ttg.warp_return
+  }
+  partition1() num_warps(2) {
+    ttg.warp_return
+  } : () -> ()
+  // CHECK: partition2() num_warps(2)
+  tt.return
+}
+
+}
+
+// -----
+
 // CHECK: module attributes {ttg.maxnreg = 128 : i32
 module attributes {"ttg.num-warps" = 8 : i32} {
 
