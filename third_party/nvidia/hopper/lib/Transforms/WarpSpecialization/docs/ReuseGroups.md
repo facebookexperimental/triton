@@ -103,6 +103,42 @@ Reuse groups are formed in `doCodePartitionPost` (`WSCodePartition.cpp`):
 4. **Create `ReuseGroup`**: Push the ordered channel list into a new
    `ReuseGroup` and append it to `config.groups`.
 
+### Degenerate size-1 subtiled reuse group
+
+Normally a reuse group needs ≥ 2 channels (two different `allocOp`s that share a
+`buffer.id`). The **both-endpoints-subtiled** epilogue channel is the exception:
+`collectPostChannels` collapses the `numTiles` per-tile staging allocs of one
+(producer `ttng.subtiled_region`, consumer `ttng.subtiled_region`) pair into a
+**single** `ChannelPost` (the per-tile buffers become in-body instances indexed
+by the builtin `tileIdx`). That lone channel still needs the reuse-group
+machinery — the in-body per-tile slot rotation (`getOrComputeSubtiledSlot` fires
+only for `reuseGrp >= 0`) and the `numTiles` loop-counter stride
+(`getReuseGroupStride`). So `doCodePartitionPost` forms a **size-1** group for it
+when `channelIsSubtiled(ch) && ch->getNumBuffers() > 1`, and the
+`channels.size() <= 1` early-returns in `getReuseChannels`
+(`CodePartitionUtility.cpp`) and `createNewLoopWrapper` (`WSBuffer.cpp`) are
+relaxed for subtiled groups (`channelIsSubtiled`). These three sites must agree
+or `getAccumCnts` (which counts the group) and the loop-arg creation disagree →
+out-of-bounds `getArgument` in `getAccumCount`.
+
+The collapse only fires for a **cross-task** pair (producer-region task ≠
+consumer-region task); when `separate_epilogue_store=False` puts both regions in
+the epilogue task there is no cross-task channel, so the per-tile allocs are
+handled by the ordinary same-task reuse machinery and must NOT be collapsed
+(collapsing drops a sibling alloc that is never folded → SMEM OOM). See
+[Subtile Operator](SubtileOperator.md).
+
+### Cross-partition staging split (memory planner)
+
+For a data-partitioned epilogue (`tt.data_partition_factor > 1`) with
+`early_tma_store_lowering`, every partition's TMA-store staging buffer targets the
+**same** descriptor. `WSMemoryPlanner.cpp` `fuseEpilogueWSBuffers` therefore keys
+the TMA-staging fusion on `(descriptor, originalLoad)` — `originalLoad` traces the
+`local_store` source back to the originating `ttng.tmem_load` / accumulator — so
+the two partitions get **distinct** `buffer.id`s instead of sharing one physical
+buffer + barrier (which aliases concurrent partitions → corruption + deadlock).
+This mirrors the non-staging `loadGroups` discriminator.
+
 ## What Reuse Groups Affect
 
 ### 1. Accumulation Counters

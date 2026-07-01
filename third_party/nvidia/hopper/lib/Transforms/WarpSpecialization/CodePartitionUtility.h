@@ -232,6 +232,12 @@ unsigned getAccumArgIdx(Operation *parentOp, Operation *ctrlOp,
 void getReuseChannels(ReuseGroup *gruop, Operation *regionOp,
                       SmallVector<Operation *> &chList);
 
+// True when the channel's producer or consumer op is inside (or is) a
+// ttng.subtiled_region. A collapsed both-endpoints-subtiled channel is the sole
+// member of its reuse group, so reuse-group machinery must treat it specially
+// even at size 1.
+bool channelIsSubtiled(Channel *ch);
+
 // Skip the accumCnt for unique channels.
 unsigned getReuseAccumArgIdx(Operation *regionOp,
                              const DenseSet<Operation *> &regionsWithChannels,
