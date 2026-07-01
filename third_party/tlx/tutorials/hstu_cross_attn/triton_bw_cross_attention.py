@@ -3199,7 +3199,7 @@ def _hstu_attn_bwd_inner(  # noqa C901
         qk_trans = tl.dot(
             k,
             tl.trans(q),
-            attrs={"channels": ["opndD,tmem,1,2"]} if AUTOWS else None,
+            attrs={"stage": "0", "order": "0", "channels": ["opndD,tmem,1,2"]} if AUTOWS else None,
         )
         if MASK_KV or HAS_CAUSAL:
             valid_mask_trans = backward_valid_mask(
@@ -3232,18 +3232,18 @@ def _hstu_attn_bwd_inner(  # noqa C901
         if SHARED_KV:
             dk = tl.dot(
                 act_qk_trans, do, dk, allow_tf32=ALLOW_TF32,
-                attrs={"channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]} if AUTOWS else None,
+                attrs={"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]} if AUTOWS else None,
             )
         else:
             # pyrefly: ignore [unbound-name]
             dv = tl.dot(
                 act_qk_trans, do, dv, allow_tf32=ALLOW_TF32,
-                attrs={"channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]} if AUTOWS else None,
+                attrs={"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]} if AUTOWS else None,
             )
 
         dact_qk_trans = tl.dot(
             v, tl.trans(do), allow_tf32=ALLOW_TF32,
-            attrs={"channels": ["opndD,tmem,1,5"]} if AUTOWS else None,
+            attrs={"stage": "0", "order": "2", "channels": ["opndD,tmem,1,5"]} if AUTOWS else None,
         )
         if num_softmax_heads > 0:  # autoWS: constexpr (see note above)
             dqk_trans = backward_d_softmax_activation(
@@ -3257,17 +3257,17 @@ def _hstu_attn_bwd_inner(  # noqa C901
         if SHARED_KV:
             dk_attn = tl.dot(
                 dqk_trans, q, allow_tf32=ALLOW_TF32,
-                attrs={"channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]} if AUTOWS else None,
+                attrs={"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]} if AUTOWS else None,
             )
             dk = dk + dk_attn * alpha
         else:
             dk = tl.dot(
                 dqk_trans, q, dk, allow_tf32=ALLOW_TF32,
-                attrs={"channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]} if AUTOWS else None,
+                attrs={"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]} if AUTOWS else None,
             )
         dq_trans = tl.dot(
             tl.trans(k), dqk_trans,
-            attrs={"channels": ["opndB,smem,1,8", "opndD,tmem,1,5"]} if AUTOWS else None,
+            attrs={"stage": "1", "order": "1", "channels": ["opndB,smem,1,8", "opndD,tmem,1,11"]} if AUTOWS else None,
         )
         dq_trans = dq_trans * alpha
         dq = tl.trans(dq_trans)
