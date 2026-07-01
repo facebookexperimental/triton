@@ -727,7 +727,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 # ============================================================================
 # Test 2b: Static persistent matmul with a while-loop outer loop
 # ============================================================================
-@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+@pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell")
 @pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
 def test_tutorial09_matmul_tma_static_persistent_while_loop_warp_specialize(EPILOGUE_SUBTILE):
     """Test a static persistent matmul whose persistent outer loop is a while loop."""
@@ -785,7 +785,8 @@ def test_tutorial09_matmul_tma_static_persistent_while_loop_warp_specialize(EPIL
         ttgir = kernel.asm["ttgir"]
         assert "scf.while" in ttgir, "Expected persistent outer loop to lower to scf.while"
         assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
-        assert "ttng.tc_gen5_mma" in ttgir, "Expected Blackwell MMA instruction"
+        # Blackwell lowers to tcgen5 MMA; Hopper lowers to wgmma (warp_group_dot).
+        assert ("ttng.tc_gen5_mma" in ttgir or "ttng.warp_group_dot" in ttgir), "Expected an MMA instruction"
         assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
         assert "ttng.clc_" not in ttgir, "Expected static persistent scheduling, not CLC"
 
@@ -796,14 +797,7 @@ def test_tutorial09_matmul_tma_static_persistent_while_loop_warp_specialize(EPIL
 # ============================================================================
 # Test 2c: Dynamic (work-stealing) persistent matmul with a while-loop outer loop
 # ============================================================================
-@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
-@pytest.mark.xfail(
-    run=False,
-    reason="Dynamic persistent: the side-effecting atomic_add that claims the "
-    "tile id is cloned into every warp-specialized partition (async_task_id "
-    "0/1/2), so each warp group claims a different tile and the partitions "
-    "deadlock. Needs the side-effecting tile-id op to execute once and be "
-    "broadcast across partitions (a scalar cross-partition channel).")
+@pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell")
 @pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
 def test_tutorial09_matmul_tma_dynamic_persistent_while_loop_warp_specialize(EPILOGUE_SUBTILE):
     """Dynamic persistent matmul: the while-loop tile id is claimed via atomic_add."""
@@ -866,7 +860,8 @@ def test_tutorial09_matmul_tma_dynamic_persistent_while_loop_warp_specialize(EPI
         ttgir = kernel.asm["ttgir"]
         assert "scf.while" in ttgir, "Expected persistent outer loop to lower to scf.while"
         assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
-        assert "ttng.tc_gen5_mma" in ttgir, "Expected Blackwell MMA instruction"
+        # Blackwell lowers to tcgen5 MMA; Hopper lowers to wgmma (warp_group_dot).
+        assert ("ttng.tc_gen5_mma" in ttgir or "ttng.warp_group_dot" in ttgir), "Expected an MMA instruction"
         assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
         assert "atomic" in ttgir, "Expected an atomic op driving the dynamic tile id"
         assert "ttng.clc_" not in ttgir, "Expected dynamic atomic scheduling, not CLC"

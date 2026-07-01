@@ -41,6 +41,9 @@ static LogicalResult cleanupWarpSpecializedLoops(Operation *op) {
 }
 
 int doTaskIdPropagate(triton::FuncOp &funcOp);
+// Cross-partition run-once atomic support. Returns failure() when an atomic
+// forces a graceful warp-specialization reject (kernel already de-specialized).
+LogicalResult doAtomicBroadcast(triton::FuncOp funcOp, int tilePrefetchDepth);
 LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
                               StringRef readDecisionFile = "",
                               StringRef writeDecisionFile = "",
@@ -184,6 +187,24 @@ public:
     if (dumpIntermediateSteps) {
       llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
                       "doTaskIdPropagate\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
+    }
+
+    // Cross-partition run-once atomic support: classify each side-effecting
+    // atomic and either pass it through (single-partition), transform it into a
+    // run-once + SMEM broadcast (all-partition scalar loop-carried counter), or
+    // gracefully bail out of warp specialization (unsupported shape). On a
+    // reject the kernel is left unspecialized-but-compilable. The broadcast
+    // channel depth comes from the `tile-prefetch-depth` pass option (a Python
+    // knob), not an env var.
+    if (failed(doAtomicBroadcast(funcOp, tilePrefetchDepth))) {
+      LDBG("Atomic broadcast rejected warp specialization. Skipping.");
+      return;
+    }
+    if (dumpIntermediateSteps) {
+      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                      "doAtomicBroadcast\n";
       moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
       llvm::dbgs() << "\n\n\n";
     }

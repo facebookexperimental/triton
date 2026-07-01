@@ -3525,9 +3525,14 @@ void insertAsyncComm(
                            kv.second.front()->getNumBuffers(),
                            regionsWithChannels, bufferIdx, phase, config,
                            reuseGrp, masterChannel);
-    } else if (auto forOp = headProducer->getParentOfType<scf::ForOp>()) {
+    } else if (headProducer->getParentOfType<scf::ForOp>() ||
+               headProducer->getParentOfType<scf::WhileOp>()) {
       // headProducer can be local_store but bufferIdx will be used
-      // by tmaLoad as well.
+      // by tmaLoad as well. A producer directly in a persistent scf.while
+      // after region (e.g. the dynamic-persistent tile-id broadcast slot)
+      // also needs the accumCnt-derived buffer index/phase so the mbarrier
+      // parity toggles across persistent iterations; getBufferIdxAndPhase ->
+      // getAccumCount resolves the counter from the while's after-region args.
       if (producerAcquireForChannelLoop) {
         builder.setInsertionPoint(producerAcquireForChannelLoop);
       } else {
@@ -3542,7 +3547,7 @@ void insertAsyncComm(
                            regionsWithChannels, bufferIdx, phase, config,
                            reuseGrp, masterChannel);
     } else {
-      // Producer is not in a ForOp, create phase and bufferIdx here.
+      // Producer is truly outside any loop, create phase and bufferIdx here.
       bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
           headProducer->getLoc(), 0, 32);
       phase = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
