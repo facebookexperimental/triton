@@ -16,7 +16,14 @@
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
 
   // CHECK-LABEL: @dp1_epilogue_subtile
-  // CHECK: ttng.subtiled_region
+  // Split-tree leaves must be collected left-to-right: tile 0 is the leftmost
+  // subtile (outLHS), so the per-tile operands begin with outLHS. A reversed
+  // root order makes the producer's tile order disagree with the consumer's
+  // column order, which silently swaps the subtile halves for asymmetric
+  // (producer-subtiled, flat-consumer) channels and deadlocks them when
+  // numTiles > numBuffers.
+  // CHECK: %[[LHS:.*]], %[[RHS:.*]] = tt.split
+  // CHECK: ttng.subtiled_region per_tile(%[[LHS]], %[[RHS]], %[[LHS]], %[[RHS]],
   tt.func @dp1_epilogue_subtile(
       %tmem_buf: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
       %acc_tok: !ttg.async.token,

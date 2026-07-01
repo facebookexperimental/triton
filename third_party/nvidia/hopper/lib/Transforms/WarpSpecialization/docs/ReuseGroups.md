@@ -130,10 +130,11 @@ Key functions:
   reuse groups do NOT flow through here for their staging slot:** the N subtiles
   share one barrier pair and one physical alloc, so both the data slot and the
   barrier `bufferIdx`/`phase` are computed *inside the tile body* from the builtin
-  `tileIdx` (`flattened = accumCnt * numTiles + tileIdx`, `% numBuffers`), keeping
-  data slot == barrier generation. The generic `+ position` stagger is wrong for
-  subtiles (it aliases distinct subtiles within a `numBuffers` window and races —
-  the EPILOGUE_SUBTILE>2 staging-buffer bug). See
+  `tileIdx` (`flattened = accumCnt + tileIdx`, `% numBuffers`; `accumCnt`
+  advances by `numTiles` per iteration), keeping data slot == barrier generation.
+  The generic `+ position` stagger is wrong for subtiles (it aliases distinct
+  subtiles within a `numBuffers` window and races — the EPILOGUE_SUBTILE>2
+  staging-buffer bug). See
   [SubtileOperator](SubtileOperator.md).
 - `getReuseAccumArgIdx` — returns the position of a group's `accumCnt`
   argument within the region's full argument list

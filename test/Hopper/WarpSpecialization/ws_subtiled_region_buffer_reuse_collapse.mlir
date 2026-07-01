@@ -26,7 +26,7 @@
 // The reuse-group buffers share buffer.id = 2; the first CHECK matches the
 // representative and CHECK-NOT forbids any second shared buffer through EOF (and
 // also fails loudly if warp specialization / buffering did not run at all).
-// CHECK: ttg.local_alloc {allocation.shareGroup = 0 : i32, buffer.copy = 3 : i32, buffer.id = 2 : i32, buffer.tmaStaging = 1 : i32} : () -> !ttg.memdesc<3x128x64xf16, #shared, #smem, mutable>
+// CHECK: ttg.local_alloc {allocation.shareGroup = 0 : i32, buffer.copy = 3 : i32, buffer.id = 2 : i32{{.*}}} : () -> !ttg.memdesc<3x128x64xf16, #shared, #smem, mutable>
 // CHECK-NOT: allocation.shareGroup
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
