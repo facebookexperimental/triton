@@ -2,7 +2,8 @@
 
 Triton Cluster Launch Control (CLC) tile scheduler.
 
-Status: **frontend + high-level IR op landed; lowering pass is future work.**
+Status: **frontend + Stages 1/2/4 lowering landed (single-CTA, non-WS); Stage 3
+(AutoWS) is future work.**
 
 ## Motivation
 
@@ -34,6 +35,8 @@ design adds a **core Triton (`tl.`) scheduler** that hides all of that.
   (`warp_specialize=False`); WS is an orthogonal, later concern.
 - **Minimal, opaque API.** The kernel author never sees a buffer, barrier,
   phase, or the `try_cancel`/`wait` split.
+- **Single CTA only (for now).** Multi-cluster / multi-CTA is not yet supported;
+  the materialization pass rejects `num-ctas > 1`. Multi-CTA is future work.
 
 ## API
 
@@ -346,3 +349,31 @@ requires drain-on-exit because the CLC claim is destructive.
   model as `cp.async` / TMA. mbarriers are materialized only in a later pass
   (after AutoWS), keeping the two concerns — async structure vs. barrier
   realization — cleanly separated and independently testable.
+
+## Status & testing
+
+- **Implemented (this branch):** the `tl.clc_tile_scheduler` frontend and
+  `ttng.clc_advance` op; the token ops `ttng.clc_try_cancel_async` /
+  `ttng.clc_read`; and Stages 1 (`triton-nvidia-gpu-clc-split`), 2
+  (`triton-nvidia-gpu-clc-hoist`) and 4 (`triton-nvidia-gpu-clc-materialize`) as
+  TTGIR passes (`lib/Dialect/TritonNvidiaGPU/Transforms/CLCLowering.cpp`), wired
+  into the NVIDIA Blackwell `make_ttgir` pipeline — split + hoist before warp
+  specialization, materialize after.
+- **Restriction:** single CTA only — `clc-materialize` errors on `num-ctas > 1`.
+- **Not in this branch:** Stage 3 (AutoWS handling / `WSAtomicBroadcast` fusion).
+  Today the kernel runs with `warp_specialize=False`; Stage 2's hoist is
+  same-block only (cross-block unification is a follow-up).
+- **Tests:** `python/test/unit/language/test_triton_clc.py` — frontend IR-shape
+  checks (no GPU) plus Blackwell execution tests (scheduler claims each tile
+  exactly once; CLC GEMM correctness) and a materialized-TTGIR check.
+
+## Future work (next branch)
+
+- **Stage 3:** AutoWS handling fused into `WSAtomicBroadcast` — the producer runs
+  the fetch and the decoded 4-tuple is broadcast through SMEM; materialization
+  then runs after AutoWS for WS kernels.
+- Multi-cluster / multi-CTA support (lift the single-CTA restriction).
+- Multi-stage prefetch (`depth > 1`) with drain-on-exit (loop-carried token).
+- Cross-basic-block hoist / unification in Stage 2.
+- Channel optimizations: broadcast-and-decode-per-partition; a dedicated
+  tile-computation partition/buffer.

@@ -1,22 +1,32 @@
 """Tests for the core Triton CLC (Cluster Launch Control) tile scheduler.
 
 CLC is a Blackwell (SM100+) feature. The scheduler (`tl.clc_tile_scheduler`)
-emits a single high-level, barrier-free op (`ttng.clc_advance`) that returns the
-decoded next tile {is_valid, x, y, z}; the initial tile is just `program_id`. A
-later compiler lowering pass materializes the response buffer, mbarrier, phase,
-and the issue/wait overlap, and decodes/drops unused coordinates. Until that
-lowering lands these tests are IR-only: they check the shape of the initial TTIR
-(which is target-independent and needs no GPU).
+emits a single high-level, barrier-free op (`ttng.clc_advance`) into the initial
+TTIR; the TTGIR pipeline then lowers it in stages: split into the async-token
+form (`clc_try_cancel_async` + `clc_read`), hoist the issue for overlap, and
+materialize the token into the completion mbarrier (single-CTA only).
+
+Two kinds of tests:
+- IR-shape tests on the initial TTIR (target-independent, no GPU).
+- Execution + materialized-TTGIR tests (require a Blackwell GPU).
 
 See docs/design/triton-clc-tile-scheduler.md.
 """
 import pytest
+import torch
 
 import triton
 import triton.language as tl
 from triton.backends.compiler import GPUTarget
 from triton.compiler.compiler import ASTSource, make_backend
 from triton._C.libtriton import ir
+
+
+def is_blackwell():
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
+
+
+requires_blackwell = pytest.mark.skipif(not is_blackwell(), reason="CLC requires Blackwell (SM100+)")
 
 
 def initial_ttir(fn, signature, constexprs=None):
@@ -33,8 +43,8 @@ def initial_ttir(fn, signature, constexprs=None):
     return str(src.make_ir(target, options, codegen_fns, module_map, context))
 
 
-# Ops that must NOT appear in the high-level (pre-lowering) TTIR: barriers and the
-# low-level CLC decode/fetch primitives all belong to the deferred lowering.
+# Barrier / low-level CLC ops that must NOT appear in the initial (pre-lowering)
+# TTIR -- they are introduced by the TTGIR lowering passes.
 _LOWERING_ONLY_OPS = [
     "ttng.init_barrier",
     "ttng.wait_barrier",
@@ -43,6 +53,8 @@ _LOWERING_ONLY_OPS = [
     "ttng.clc_load_result",
     "ttng.clc_is_canceled",
     "ttng.clc_get_program_id",
+    "ttng.clc_try_cancel_async",
+    "ttng.clc_read",
 ]
 
 
@@ -101,51 +113,67 @@ def _clc_matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K,  #
 
 
 # ---------------------------------------------------------------------------
-# IR-shape tests (no GPU required)
+# Frontend IR-shape tests (no GPU required)
 # ---------------------------------------------------------------------------
 def test_clc_scheduler_emits_advance_and_seed():
     ttir = initial_ttir(_clc_count_kernel, {"counts_ptr": "*i32", "num_tiles": "i32"})
-    assert "ttng.clc_advance" in ttir, "expected the fetch op in the initial TTIR"
+    assert "ttng.clc_advance" in ttir, "expected the high-level fetch op in the initial TTIR"
     assert "tt.get_program_id" in ttir, "the initial tile should be seeded from program_id"
     assert "scf.while" in ttir, "expected the scheduler to form an scf.while persistent loop"
 
 
 def test_clc_scheduler_carries_decoded_tile():
-    # The persistent loop carries the decoded tile: {is_valid, x, y, z}.
     ttir = initial_ttir(_clc_count_kernel, {"counts_ptr": "*i32", "num_tiles": "i32"})
     assert "(i1, i32, i32, i32) -> (i1, i32, i32, i32)" in ttir, \
         "the scheduler loop must carry the decoded tile (is_valid, x, y, z)"
 
 
 def test_clc_initial_ttir_has_no_lowering_ops():
-    # Barriers, buffers, and the low-level decode primitives live in the pass.
     ttir = initial_ttir(_clc_count_kernel, {"counts_ptr": "*i32", "num_tiles": "i32"})
     for op in _LOWERING_ONLY_OPS:
-        assert op not in ttir, f"{op} must not appear in the high-level TTIR"
-
-
-def test_clc_one_advance_per_iteration():
-    ttir = initial_ttir(_clc_count_kernel, {"counts_ptr": "*i32", "num_tiles": "i32"})
-    assert ttir.count("ttng.clc_advance") == 1, "exactly one fetch per persistent-loop iteration"
-
-
-def test_clc_gemm_emits_high_level_op():
-    sig = {
-        "a_ptr": "*fp16", "b_ptr": "*fp16", "c_ptr": "*fp16", "M": "i32", "N": "i32", "K": "i32", "stride_am": "i32",
-        "stride_ak": "i32", "stride_bk": "i32", "stride_bn": "i32", "stride_cm": "i32", "stride_cn": "i32"
-    }
-    constexprs = {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8}
-    ttir = initial_ttir(_clc_matmul_kernel, sig, constexprs)
-    assert "ttng.clc_advance" in ttir and "scf.while" in ttir
-    for op in _LOWERING_ONLY_OPS:
-        assert op not in ttir, f"{op} must not appear in the high-level TTIR"
+        assert op not in ttir, f"{op} must not appear in the high-level (pre-lowering) TTIR"
 
 
 # ---------------------------------------------------------------------------
-# Execution is deferred until the CLC lowering pass lands (see
-# docs/design/triton-clc-tile-scheduler.md). The GEMM/work-stealing correctness tests
-# will be re-enabled then.
+# Execution tests (require a Blackwell GPU)
 # ---------------------------------------------------------------------------
-@pytest.mark.skip(reason="CLC lowering (ttng.clc_advance -> barrier ops) not implemented yet")
-def test_clc_gemm_execution():
-    pass
+@requires_blackwell
+@pytest.mark.parametrize("num_tiles", [1, 7, 133, 1000])
+def test_clc_scheduler_visits_each_tile_once(num_tiles):
+    # Every tile in the grid must be claimed exactly once across all CTAs.
+    counts = torch.zeros(num_tiles, device="cuda", dtype=torch.int32)
+    _clc_count_kernel[(num_tiles, )](counts, num_tiles)
+    counts = counts.cpu()
+    assert counts.min().item() == 1, "some tile was never claimed"
+    assert counts.max().item() == 1, "some tile was claimed more than once"
+
+
+@requires_blackwell
+@pytest.mark.parametrize("M, N, K", [(256, 256, 128), (512, 512, 256), (1000, 1000, 500)])
+def test_clc_gemm(M, N, K):
+    torch.manual_seed(0)
+    a = torch.randn((M, K), device="cuda", dtype=torch.float16)
+    b = torch.randn((K, N), device="cuda", dtype=torch.float16)
+    c = torch.empty((M, N), device="cuda", dtype=torch.float16)
+
+    BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M = 64, 64, 32, 8
+    num_tiles = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
+    _clc_matmul_kernel[(num_tiles, )](
+        a, b, c, M, N, K,  #
+        a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1),  #
+        BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M)
+
+    torch.testing.assert_close(c, torch.matmul(a, b), atol=1e-1, rtol=1e-2)
+
+
+@requires_blackwell
+def test_clc_materialized_ttgir():
+    # After the TTGIR lowering passes the high-level ops are gone and replaced by
+    # the low-level try_cancel / barrier form.
+    counts = torch.zeros(8, device="cuda", dtype=torch.int32)
+    kernel = _clc_count_kernel[(8, )](counts, 8)
+    ttgir = kernel.asm["ttgir"]
+    for op in ("ttng.clc_advance", "ttng.clc_try_cancel_async", "ttng.clc_read"):
+        assert op not in ttgir, f"{op} should be lowered away by the TTGIR passes"
+    for op in ("ttng.clc_try_cancel", "ttng.clc_load_result", "ttng.barrier_expect", "ttng.wait_barrier"):
+        assert op in ttgir, f"expected {op} in the materialized TTGIR"

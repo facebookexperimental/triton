@@ -274,6 +274,49 @@ def TTNG_CLCAdvanceOp : TTNG_Op<"clc_advance", []> {
 }
 
 //
+// Token form of the CLC fetch (produced by the Stage-1 split of clc_advance)
+//
+// `clc_advance` is remapped to `clc_try_cancel_async` (async issue -> token) +
+// `clc_read` (await the token -> decoded tile). The token is `!ttg.async.token`,
+// reusing the same async-dependency model as cp.async / TMA, so the issue can be
+// hoisted for overlap without introducing any mbarrier. A later pass materializes
+// the token into the low-level barrier form.
+
+def TTNG_CLCTryCancelAsyncOp : TTNG_Op<"clc_try_cancel_async", []> {
+  let summary = "Issue an async CLC request; returns a token (issue half)";
+
+  let description = [{
+    Issues an asynchronous Cluster Launch Control request to fetch the next work
+    tile (cancelling a pending cluster). Returns only an async token; the paired
+    `clc_read` awaits it and returns the decoded tile. References no mbarrier or
+    buffer. Effectful (claims a pending cluster) so it is neither DCE'd nor
+    hoisted out of the persistent loop.
+  }];
+
+  let results = (outs TTG_AsyncToken:$token);
+
+  let assemblyFormat = [{ attr-dict `:` type($token) }];
+}
+
+def TTNG_CLCReadOp : TTNG_Op<"clc_read", []> {
+  let summary = "Await a CLC token and return the decoded tile (read half)";
+
+  let description = [{
+    Consumer half of the async CLC fetch started by `clc_try_cancel_async`: awaits
+    the token and returns the decoded tile -- `isValid` plus the (`x`, `y`, `z`)
+    program-id coordinates. References no mbarrier or buffer.
+  }];
+
+  let arguments = (ins TTG_AsyncToken:$token);
+
+  let results = (outs I1:$isValid, I32:$x, I32:$y, I32:$z);
+
+  let assemblyFormat = [{
+    $token attr-dict `:` type($token) `->` type($isValid) `,` type($x) `,` type($y) `,` type($z)
+  }];
+}
+
+//
 // WarpGroupDot Op
 //
 def TTNG_WarpGroupDotOp : TTNG_Op<"warp_group_dot", [
