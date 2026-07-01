@@ -89,8 +89,12 @@ private:
 
 static void createRegRealloc(TritonLLVMIRRewriter &b, int curRegs,
                              int adjRegs) {
-  curRegs = std::min(256, curRegs);
-  adjRegs = std::min(256, adjRegs);
+  // nvvm.setmaxregister requires the per-thread register count to be in the
+  // range [24, 256] (a multiple of 8). Clamp both ends: below-minimum requests
+  // (e.g. from a do-nothing padding partition) would otherwise emit an illegal
+  // setmaxregister and fail the verifier.
+  curRegs = std::clamp(curRegs, 24, 256);
+  adjRegs = std::clamp(adjRegs, 24, 256);
   // Round to a multiple of 8 (hardware requirement).
   adjRegs = adjRegs / 8 * 8;
   curRegs = curRegs / 8 * 8;
