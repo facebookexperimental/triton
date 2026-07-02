@@ -59,6 +59,15 @@ struct ScheduleBuffer {
   // The MLIR op that originally defines this buffer (e.g., local_alloc)
   Operation *defOp{nullptr};
 
+  // Pass A.5 data partitioning. When partitionCount > 1 the emitter splits this
+  // buffer into partitionCount per-group allocations, each replacing
+  // shape[partitionDim] with mSize (used for the TMEM accumulator: full
+  // (BM, BN) shape here, emitted as N groups of (mSize, BN)). Default 1 =
+  // unpartitioned. The shared A/B SMEM operands stay unpartitioned.
+  unsigned partitionCount{1};
+  unsigned partitionDim{0}; // 0 = M, 1 = N
+  unsigned mSize{0};        // per-partition size along partitionDim
+
   int64_t sizeBytes() const {
     if (kind == MemoryKind::BARRIER)
       return 8; // mbarrier object is 8 bytes in SMEM
@@ -133,6 +142,14 @@ struct ScheduleNode {
   // Emitted as a multi-id ttg.partition so the WS pass replicates it. Empty
   // unless replicated.
   llvm::SmallVector<int, 4> replicatedGroups;
+
+  // Pass A.5 data partitioning (carried from DDGNode). partitionCount > 1 marks
+  // a partitioned MMA bundle: the emitter fans it into partitionCount async_dots
+  // slicing mSize rows along partitionDim into per-group accumulators. Default
+  // 1 = unpartitioned.
+  unsigned partitionCount{1};
+  unsigned partitionDim{0}; // 0 = M, 1 = N
+  unsigned mSize{0};        // per-partition size along partitionDim
 
   bool isSuperNode() const { return childPipelineId != UINT_MAX; }
   bool hasBuffer() const {
