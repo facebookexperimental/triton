@@ -762,12 +762,12 @@ class Autotuner(KernelInterface):
             key = tuple(key)
             if key not in self.cache:
                 used_cached_result = False
-                # Add wave-quant NPOT candidates BEFORE pruning so they are first-class configs,
-                # culled by the same early_config_prune / top_k path as the user's configs.
-                configs = self.configs
                 if getattr(self, "include_npot", False) and knobs.language.allow_npot:
-                    configs = self._add_wave_quant_npot_configs(configs, _args)
-                pruned_configs = self.prune_configs(kwargs, configs)
+                    # Prune the NPOT-augmented list via the helper (keeps prune_configs 1-arg).
+                    configs = self._add_wave_quant_npot_configs(self.configs, _args)
+                    pruned_configs = self._prune_configs(kwargs, configs)
+                else:
+                    pruned_configs = self.prune_configs(kwargs)
 
                 def benchmark():
                     # facebook begin
@@ -930,9 +930,11 @@ class Autotuner(KernelInterface):
             raise AutotunerError("No valid autotuner configs after IR pruning. "
                                  "`ir_config_prune` should keep at least one config.")
 
-    def prune_configs(self, kwargs: Dict, configs: Optional[List[Config]] = None) -> List[Config]:
-        if configs is None:
-            configs = self.configs
+    def prune_configs(self, kwargs: Dict) -> List[Config]:
+        # Keep 1-arg: subclasses (e.g. hammer, fast_moe) override this; NPOT prunes via _prune_configs.
+        return self._prune_configs(kwargs, self.configs)
+
+    def _prune_configs(self, kwargs: Dict, configs: List[Config]) -> List[Config]:
         pruned_configs = configs
         if self.early_config_prune:
             pruned_configs = self.early_config_prune(configs, self.nargs, **kwargs)
