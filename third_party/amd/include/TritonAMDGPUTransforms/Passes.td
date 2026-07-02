@@ -368,4 +368,41 @@ def TritonAMDGPUWarpPipeline: Pass<"tritonamdgpu-warp-pipeline", "mlir::ModuleOp
   let dependentDialects = ["mlir::ROCDL::ROCDLDialect, mlir::triton::amdgpu::TritonAMDGPUDialect"];
 }
 
+def TritonAMDGPUDotDecomposeAndSchedule : Pass<"tritonamdgpu-dot-decompose-and-schedule", "mlir::ModuleOp"> {
+  let summary = "Decompose tt.dot into MFMA-tile-sized sub-dots and schedule them";
+
+  let description = [{
+    Phase 0 — no-op scaffold for the TTGIR-level replacement of the
+    `TRITON_ENABLE_LLIR_SCHED` LLVM-IR scheduler (the latter lives on the
+    matmul_4waves branch of ROCm/triton, not here). Walks `tt.FuncOp` /
+    `scf.ForOp` and emits a remark counting the inner-loop `tt.dot` ops it
+    found, but does not modify the IR. Subsequent phases will (1) split
+    each candidate `tt.dot` along M then N down to MFMA-tile granularity,
+    reusing the partition machinery from
+    `nvidia/hopper/.../WSDataPartition.cpp` and the AMD shmem-subview
+    helpers from `BlockPingpong.cpp::genLocalSlice`, then (2) reorder the
+    resulting sub-dots and `ttg.local_load` ops with the 4-MFMA-per-GR /
+    1-MFMA-per-LR recipe, inserting `triton_amdgpu.sched_barrier` markers
+    that lower to `llvm.amdgcn.sched.barrier(0)` so the LLVM backend's
+    misched can stay enabled.
+
+    Opt-in behind `TRITON_ENABLE_TTGIR_SCHED=1`. See
+    `~/AMD/triton/claude/llir_sched_at_ttgir_design.md` and
+    `llir_sched_at_ttgir_plan.md` for design + plan.
+  }];
+
+  let options = [
+    Option<"mode", "mode", "std::string", /*default=*/"\"\"",
+           "Explicit sub-mode that overrides env-var dispatch (so the same pass "
+           "can be placed at multiple pipeline slots without colliding): "
+           "''=env dispatch (default), 'early-lower', 'decompose', 'modulo'.">,
+  ];
+
+  let dependentDialects = ["mlir::triton::TritonDialect",
+                           "mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::amdgpu::TritonAMDGPUDialect",
+                           "mlir::scf::SCFDialect",
+                           "mlir::ROCDL::ROCDLDialect"];
+}
+
 #endif
