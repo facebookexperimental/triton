@@ -232,9 +232,16 @@ LogicalResult getConvertBackwardSlice(
 // Populate pattern to remove dead cycles in ForOp.
 // opsCanBeTriviallyDead specifies the operations of which the side effect can
 // be ignored.
+// NOTE (beta): retained alongside runDeadIterArgElimination because the beta
+// WSDataPartition deep-cleanup relies on the opsCanBeTriviallyDead allowlist,
+// which the LivenessAnalysis-based runDeadIterArgElimination cannot express.
 void populateForOpDeadArgumentElimination(
     RewritePatternSet &patterns,
     const DenseSet<Operation *> &opsCanBeTriviallyDead = {});
+
+/// Run a dataflow analysis over \p top to identify block arguments to loops
+/// that are dead, and replace their usage with the corresponding init value.
+void runDeadIterArgElimination(Operation *top);
 
 // Convert an \param index to a multi-dim coordinate given \param shape and
 // \param order.
