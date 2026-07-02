@@ -31,8 +31,8 @@ static OpPrintingFlags getOpPrintingFlagsWithLoc() {
 }
 
 static LogicalResult cleanupWarpSpecializedLoops(Operation *op) {
+  runDeadIterArgElimination(op);
   RewritePatternSet patterns(op->getContext());
-  populateForOpDeadArgumentElimination(patterns);
   scf::ForOp::getCanonicalizationPatterns(patterns, op->getContext());
   scf::IfOp::getCanonicalizationPatterns(patterns, op->getContext());
   mlir::triton::gpu::WarpSpecializeOp::getCanonicalizationPatterns(

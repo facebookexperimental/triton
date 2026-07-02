@@ -2,6 +2,7 @@
 
 #include <fstream>
 
+#include "mlir/Analysis/DataFlow/LivenessAnalysis.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Dominance.h"
@@ -1447,6 +1448,25 @@ void populateForOpDeadArgumentElimination(
     const DenseSet<Operation *> &opsCanBeTriviallyDead) {
   patterns.add<ForOpDeadArgElimination>(patterns.getContext(),
                                         opsCanBeTriviallyDead);
+}
+
+void runDeadIterArgElimination(Operation *top) {
+  // The op we are running on must not have any results, because the liveness
+  // analysis will not consider their users.
+  assert(top->hasTrait<OpTrait::ZeroResults>() && "op cannot have results");
+  dataflow::RunLivenessAnalysis la{top};
+
+  // We just replace users of the block arg with their corresponding init value.
+  // Dead code elimination can then do the actual removal.
+  top->walk([&](Operation *op) {
+    if (auto loopLike = dyn_cast<LoopLikeOpInterface>(op)) {
+      for (auto [idx, arg] : llvm::enumerate(loopLike.getRegionIterArgs())) {
+        const auto *liveness = la.getLiveness(arg);
+        if (liveness && !liveness->isLive)
+          arg.replaceAllUsesWith(loopLike.getInits()[idx]);
+      }
+    }
+  });
 }
 
 ttg::LocalAllocOp findShmemAlloc(Value operand) {
