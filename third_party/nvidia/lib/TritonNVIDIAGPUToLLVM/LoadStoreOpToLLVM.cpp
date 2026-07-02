@@ -162,7 +162,8 @@ struct LoadStoreConversionBase {
     LDBG("getVectorSize contiguity = " << contiguity << " pointeeBitWidth = "
                                        << pointeeBitWidth);
     // The maximum vector size is 128 bits on NVIDIA GPUs.
-    return std::min<unsigned>(128 / pointeeBitWidth, contiguity);
+    unsigned vec = std::min<unsigned>(128 / pointeeBitWidth, contiguity);
+    return clampVecSizeForNpot(vec, tensorTy);
   }
 
   unsigned getMaskAlignment(Value mask) const {
