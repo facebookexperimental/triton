@@ -73,8 +73,10 @@ Drives partitioning from dot/MMA ops:
    when partitioning along M. For example, splitting a `128x128` TMEM
    allocation with `blockM=128` into two `64x128` slices is rejected before any
    data partitioning rewrite; splitting `256x128` into `128x128` slices remains
-   valid. When this guard fires, data partitioning is skipped and the function
-   is otherwise left unchanged.
+   valid. This applies only to regular `TensorMemoryEncodingAttr` TMEM buffers;
+   `TensorMemoryScalesEncodingAttr` scale buffers keep their scale encoding
+   when sliced. When this guard fires, data partitioning is skipped and the
+   function is otherwise left unchanged.
 
 ### Step 3: Slice Propagation (`getSliceToPartition`)
 
@@ -90,6 +92,20 @@ Traces the partition dimension backward and forward from the accumulator:
   through result users. Handles `YieldOp` (follow to loop result users),
   `IfOp` (follow to if result), and tracks dimension remapping through
   layout-changing ops.
+
+For `ReshapeOp` and `MemDescReshapeOp`, the pass remaps partition dimensions
+by comparing flattened element intervals for each candidate source/destination
+dimension. This permits reshapes such as:
+
+```mlir
+tensor<1x1x1x4x256xi8> -> tensor<256x4xi8>
+```
+
+to carry an M-dimension partition from logical scale dim 0 back to the packed
+scale dimension. If no interval-preserving dimension exists, ordinary tensor
+reshapes reject the partition trial; memdesc reshapes are allowed to become a
+partition boundary, and the rewrite clones the full reshape before inserting a
+`ttg.memdesc_subslice` on the reshaped result.
 
 ### Step 4: Rematerialization (`rewriteRematerializedOps`)
 
@@ -109,6 +125,12 @@ For each partition offset (0 to `numPartitions - 1`):
    `[1]` and one with `[2]`.
 3. Function arguments with `TensorDescType` have their block type sliced to
    match the partition factor.
+
+`ttg.local_load` is shape-preserving and can be sliced with the same simple
+clone/retype path as `ttg.local_alloc`. This matters for scale paths that load
+packed scale tiles from SMEM, reshape them into logical `(BLOCK_MN,
+BLOCK_K / scale_vec_size)`, and then allocate scale TMEM for
+`ttng.tc_gen5_mma_scaled`.
 
 ### Step 6: Cleanup (`doDeepCleanup`)
 
@@ -154,8 +176,54 @@ match the destination scale rows. The copy source uses packed 32x128b chunks,
 so the source partition dimension is the packed `repRows` dimension rather than
 the logical scale dimension directly.
 
+Scale buffers populated by `ttng.tmem_alloc %src` follow the same logical
+partitioning rule. When the allocation result uses
+`TensorMemoryScalesEncodingAttr`, slicing preserves that encoding instead of
+trying to reinterpret it as a regular accumulator TMEM encoding. The compatible
+distributed source layout is recomputed from the sliced scale memdesc type, so
+the source tensor and destination scale TMEM agree after partitioning.
+
+Example: a `BLOCK_M=256` scaled MMA with data partition factor 2 is rewritten
+into two M partitions:
+
+```mlir
+%acc0, %tok0 = ttng.tmem_alloc
+  : () -> (!ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+%acc1, %tok1 = ttng.tmem_alloc
+  : () -> (!ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+
+%a0 = tt.descriptor_load ... : !tt.tensordesc<tensor<128x128xf8E4M3FN, ...>>
+%a1 = tt.descriptor_load ... : !tt.tensordesc<tensor<128x128xf8E4M3FN, ...>>
+
+%a_scale0 = ttng.tmem_alloc %scale0
+  : (tensor<128x4xi8, ...>) -> !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>
+%a_scale1 = ttng.tmem_alloc %scale1
+  : (tensor<128x4xi8, ...>) -> !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>
+
+ttng.tc_gen5_mma_scaled %a0, %b, %acc0[%tok0], %a_scale0, %b_scale, ...
+  : !ttg.memdesc<128x128xf8E4M3FN, ...>,
+    !ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable>,
+    !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>, ...
+ttng.tc_gen5_mma_scaled %a1, %b, %acc1[%tok1], %a_scale1, %b_scale, ...
+  : !ttg.memdesc<128x128xf8E4M3FN, ...>,
+    !ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable>,
+    !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>, ...
+```
+
 ### Interaction with Task IDs
 
 Data partitioning operates **after** task ID assignment. The offset parameter
 selects which task ID from the original array. This is how N consumer warp
 groups each get their slice of the data.
+
+## Regression Tests
+
+- `test/Hopper/WarpSpecialization/ws_data_partition_scaled_memdesc_reshape_reproducer.mlir`
+  covers the positive `BLOCK_M=256` scaled-MMA case. It checks that M
+  partitioning produces two `128x256` accumulator TMEM allocations, two
+  `128x4` A-scale TMEM allocations, and two `tc_gen5_mma_scaled` ops with
+  `128x128` A operands.
+- `test/Hopper/WarpSpecialization/ws_data_partition_tmem_encoding_bail.mlir`
+  covers the bailout path where M partitioning would slice regular accumulator
+  TMEM below its `blockM=128` encoding, including a scaled-MMA
+  `memdesc_reshape` reproducer.
