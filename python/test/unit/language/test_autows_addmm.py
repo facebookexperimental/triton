@@ -128,15 +128,6 @@ def test_autows_addmm_tma_persistent(
     if FLATTEN:
         pytest.skip("FLATTEN will not WarpSpecialize although it will otherwise pass.")
 
-    if generate_subtiled_region and not use_early_tma_store_lowering and EPILOGUE_SUBTILE == 2:
-        # Pre-existing GenerateSubtiledRegion bug on the non-early-TMA-store
-        # subtiling path: NVGPUWarpSpecialization aborts with
-        # "'arith.trunci' op operation destroyed but still has uses". Reproduces
-        # identically without the both-subtiled OOM fix, so it is unrelated; only
-        # EPILOGUE_SUBTILE==2 is affected (EPI=1 and EPI=4 pass on this path).
-        # TODO: fix the non-early-TMA subtiling lowering and remove this skip.
-        pytest.skip("TODO: pre-existing trunci-destroyed bug in non-early-TMA subtiling (EPI=2)")
-
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")

@@ -2829,6 +2829,17 @@ void insertAsyncComm(
   // still emitting their own flat consumer wait/release.
   DenseSet<std::pair<Operation *, const void *>> emittedSubtiledProducerTokens;
 
+  // Inside->outside subtiled channels whose numTiles siblings are DISTINCT
+  // single-copy buffers (not a reuse group) need a PER-TILE producer token so
+  // each replicated tile acquires/commits only its own sibling's barrier. That
+  // single per-tile acquire/commit is emitted once per region; this set records
+  // regions already emitted so later siblings skip producer-side emission.
+  DenseSet<Operation *> emittedSubtiledPerTileProducer;
+  // Region -> its per-tile producer token block arg. Persists across sibling
+  // iterations so the position is added exactly once and later siblings reuse
+  // it (a per-iteration cache would re-add a dead position each sibling).
+  DenseMap<Operation *, BlockArgument> perTileProducerTokenCache;
+
   // Go through each channel group.
   for (auto kv : orderedChannelsGroupedByConsumers) {
     // Find head and tail ops.
@@ -3383,7 +3394,26 @@ void insertAsyncComm(
       // If the producer is nested we need to pull the buffer + index
       // calculation to the lift-up headProducer.
       if (producerInNestedRegion) {
-        builder.setInsertionPoint(nestedInsertionTarget);
+        Operation *idxAnchor = nestedInsertionTarget;
+        // Inside->outside subtiled channel: the producer lives in a
+        // ttng.subtiled_region, but this sibling's flat consumer may be
+        // scheduled BEFORE that region (the addmm bias straddle). The outer
+        // bufferIdx/phase is a pure function of the loop-carried accumCnt
+        // (which dominates the whole loop body), so materializing it at the
+        // earliest endpoint changes only the def location, not the value.
+        // Anchor before the flat consumer when it precedes the region so the
+        // def dominates its consumer_wait/release.
+        if (getEnclosingSubtiledRegionTile(headProducer) &&
+            !getEnclosingSubtiledRegionTile(headConsumer)) {
+          Operation *flatConsumerAnchor =
+              getSameLevelOp(headProducer, headConsumer);
+          if (flatConsumerAnchor &&
+              flatConsumerAnchor->getBlock() ==
+                  nestedInsertionTarget->getBlock() &&
+              appearsBefore(flatConsumerAnchor, nestedInsertionTarget))
+            idxAnchor = flatConsumerAnchor;
+        }
+        builder.setInsertionPoint(idxAnchor);
       } else {
         assert(consumerInNestedRegion);
         builder.setInsertionPoint(tmaHeadProducer);
@@ -3520,6 +3550,79 @@ void insertAsyncComm(
       }
       subtiledSlotCache[key] = slot;
       return slot;
+    };
+
+    // Inside->outside subtiled producer with DISTINCT per-tile buffers
+    // (slot.valid == false -- single-copy siblings, NOT a reuse group): the
+    // numTiles siblings share ONE template store that writes a per-tile buffer
+    // position, but each tile's write must handshake ONLY its own sibling's
+    // barrier. Thread the numTiles sibling tokens as ONE per-tile arg (ordered
+    // by the store's per-tile buffer position, so token[t] matches the buffer
+    // tile t writes) and emit a single acquire/commit referencing it, so
+    // replication maps tile t -> sibling t's barrier. Using addSharedArg here
+    // instead makes every replicated tile arrive on every sibling's barrier
+    // (over-commit -> deadlock). Returns null (caller falls back to the shared
+    // path) when the topology doesn't match. Cached per region (see
+    // perTileProducerTokenCache declared above the loop, so it persists across
+    // sibling iterations) so the acquire and commit reuse the one position.
+    auto getOrComputePerTileProducerToken =
+        [&](ttng::SubtiledRegionOp sub) -> BlockArgument {
+      Operation *key = sub.getOperation();
+      auto cached = perTileProducerTokenCache.find(key);
+      if (cached != perTileProducerTokenCache.end())
+        return cached->second;
+      BlockArgument nullArg;
+      unsigned nTiles = sub.getNumTiles();
+      // The shared template store's dest is a per-tile buffer block arg; its
+      // operands give the sibling buffer for each tile, in tile order.
+      auto storeOp = dyn_cast<ttg::LocalStoreOp>(masterChannel->getSrcOp());
+      if (!storeOp)
+        return nullArg;
+      auto storeDst = dyn_cast<BlockArgument>(storeOp.getDst());
+      if (!storeDst || storeDst.getOwner() != &sub.getTileRegion().front() ||
+          storeDst.getArgNumber() >= sub.getNumPerTilePositions())
+        return nullArg;
+      unsigned pos = storeDst.getArgNumber();
+      auto allocOf = [](Value v) -> Operation * {
+        Operation *d = v.getDefiningOp();
+        while (auto idx = dyn_cast_or_null<ttg::MemDescIndexOp>(d))
+          d = idx.getSrc().getDefiningOp();
+        return d;
+      };
+      // For each sibling (channel sharing this template store), match its
+      // buffer alloc to the store's per-tile buffer operand to find its tile
+      // index, then place its token at that tile slot.
+      SmallVector<Value> perTileTokens(nTiles, Value());
+      for (auto &kv2 : orderedChannelsGroupedByConsumers) {
+        Channel *sib = kv2.first;
+        if (sib->getSrcOp() != masterChannel->getSrcOp())
+          continue;
+        auto tokIt = tokenMap.find(kv2.second.front());
+        if (tokIt == tokenMap.end() || sib->relation.second.empty())
+          continue;
+        // tokens is keyed by consumer task id; take this sibling's own token.
+        Value sibToken =
+            tokIt->second.tokens.lookup(sib->relation.second.front());
+        if (!sibToken)
+          continue;
+        Value sibAllocVal = bufferMap.lookup(sib);
+        if (!sibAllocVal)
+          continue;
+        Operation *sibAlloc = sibAllocVal.getDefiningOp();
+        for (unsigned t = 0; t < nTiles; ++t) {
+          Value opnd = sub.getPerTileArgs()[pos * nTiles + t];
+          if (allocOf(opnd) == sibAlloc) {
+            perTileTokens[t] = sibToken;
+            break;
+          }
+        }
+      }
+      for (Value v : perTileTokens)
+        if (!v)
+          return nullArg;
+      BlockArgument arg = sub.addPerTilePosition(perTileTokens);
+      perTileProducerTokenCache[key] = arg;
+      return arg;
     };
 
     // Lower TMA loads and TCGen5MMAOp first before inserting synchronization
@@ -3843,28 +3946,51 @@ void insertAsyncComm(
         if (producerSubtiled && skipSubtiledProducerEmit) {
           // Producer acquire already emitted by an earlier sibling.
         } else if (producerSubtiled) {
+          SubtiledSlot slot = getOrComputeSubtiledSlot(producerSubtiled);
+          // Distinct-buffer inside->outside siblings (slot.valid == false) get
+          // a PER-TILE token so each replicated tile acquires only its own
+          // buffer's barrier; emitted once per region.
+          BlockArgument perTileTok;
+          if (!slot.valid)
+            perTileTok = getOrComputePerTileProducerToken(producerSubtiled);
           auto annotTarget = getEnclosingSubtiledRegionTile(tmaHeadProducer)
                                  ? tmaHeadProducer
                                  : producerAcquirePoint;
-          auto tileToken = producerSubtiled.addSharedArg(token.second);
-          OpBuilderWithAsyncTaskIds tileBuilder(annotTarget);
-          tileBuilder.setInsertionPoint(annotTarget);
-          Value tileBufIdx, tilePhase;
-          SubtiledSlot slot = getOrComputeSubtiledSlot(producerSubtiled);
-          if (slot.valid) {
-            tileBufIdx = slot.bufferIdx;
-            tilePhase = slot.phase;
+          if (perTileTok) {
+            if (!emittedSubtiledPerTileProducer.count(
+                    producerSubtiled.getOperation())) {
+              OpBuilderWithAsyncTaskIds tileBuilder(annotTarget);
+              tileBuilder.setInsertionPoint(annotTarget);
+              Value tileBufIdx = producerSubtiled.addSharedArg(bufferIdx);
+              Value tilePhase = producerSubtiled.addSharedArg(phase);
+              ttnvws::ProducerAcquireOp::create(
+                  tileBuilder, annotTarget->getLoc(), perTileTok, tileBufIdx,
+                  tilePhase,
+                  WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
+                      .build(funcOp.getContext()));
+              LDBG("create inline per-tile ProducerAcquire in SubtiledRegionOp "
+                   << masterChannel->uniqID << " ");
+            }
           } else {
-            tileBufIdx = producerSubtiled.addSharedArg(bufferIdx);
-            tilePhase = producerSubtiled.addSharedArg(phase);
+            auto tileToken = producerSubtiled.addSharedArg(token.second);
+            OpBuilderWithAsyncTaskIds tileBuilder(annotTarget);
+            tileBuilder.setInsertionPoint(annotTarget);
+            Value tileBufIdx, tilePhase;
+            if (slot.valid) {
+              tileBufIdx = slot.bufferIdx;
+              tilePhase = slot.phase;
+            } else {
+              tileBufIdx = producerSubtiled.addSharedArg(bufferIdx);
+              tilePhase = producerSubtiled.addSharedArg(phase);
+            }
+            ttnvws::ProducerAcquireOp::create(
+                tileBuilder, annotTarget->getLoc(), tileToken, tileBufIdx,
+                tilePhase,
+                WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
+                    .build(funcOp.getContext()));
+            LDBG("create inline ProducerAcquire in SubtiledRegionOp "
+                 << masterChannel->uniqID << " ");
           }
-          ttnvws::ProducerAcquireOp::create(
-              tileBuilder, annotTarget->getLoc(), tileToken, tileBufIdx,
-              tilePhase,
-              WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
-                  .build(funcOp.getContext()));
-          LDBG("create inline ProducerAcquire in SubtiledRegionOp "
-               << masterChannel->uniqID << " ");
         } else {
           builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
           if (producerAcquireForChannelLoop) {
@@ -4017,26 +4143,50 @@ void insertAsyncComm(
         if (commitSubtiled && skipSubtiledProducerEmit) {
           // Producer commit already emitted by an earlier sibling.
         } else if (commitSubtiled) {
+          SubtiledSlot slot = getOrComputeSubtiledSlot(commitSubtiled);
+          // Distinct-buffer inside->outside siblings (slot.valid == false) get
+          // a PER-TILE token so each replicated tile commits only its own
+          // buffer's barrier; emitted once per region (marks the region done so
+          // later siblings skip producer emission).
+          BlockArgument perTileTok;
+          if (!slot.valid)
+            perTileTok = getOrComputePerTileProducerToken(commitSubtiled);
           auto annotTarget = getEnclosingSubtiledRegionTile(tailProducer)
                                  ? tailProducer
                                  : producerCommitPoint;
-          auto tileToken = commitSubtiled.addSharedArg(token.second);
-          OpBuilderWithAsyncTaskIds tileBuilder(annotTarget);
-          tileBuilder.setInsertionPointAfter(annotTarget);
-          Value tileBufIdx;
-          SubtiledSlot slot = getOrComputeSubtiledSlot(commitSubtiled);
-          if (slot.valid) {
-            // ProducerCommit only needs the buffer index (it is an arrive).
-            tileBufIdx = slot.bufferIdx;
+          if (perTileTok) {
+            if (!emittedSubtiledPerTileProducer.count(
+                    commitSubtiled.getOperation())) {
+              OpBuilderWithAsyncTaskIds tileBuilder(annotTarget);
+              tileBuilder.setInsertionPointAfter(annotTarget);
+              Value tileBufIdx = commitSubtiled.addSharedArg(bufferIdx);
+              ttnvws::ProducerCommitOp::create(
+                  tileBuilder, annotTarget->getLoc(), perTileTok, tileBufIdx,
+                  WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
+                      .build(funcOp.getContext()));
+              emittedSubtiledPerTileProducer.insert(
+                  commitSubtiled.getOperation());
+              LDBG("create inline per-tile ProducerCommit in SubtiledRegionOp "
+                   << masterChannel->uniqID << " ");
+            }
           } else {
-            tileBufIdx = commitSubtiled.addSharedArg(bufferIdx);
+            auto tileToken = commitSubtiled.addSharedArg(token.second);
+            OpBuilderWithAsyncTaskIds tileBuilder(annotTarget);
+            tileBuilder.setInsertionPointAfter(annotTarget);
+            Value tileBufIdx;
+            if (slot.valid) {
+              // ProducerCommit only needs the buffer index (it is an arrive).
+              tileBufIdx = slot.bufferIdx;
+            } else {
+              tileBufIdx = commitSubtiled.addSharedArg(bufferIdx);
+            }
+            ttnvws::ProducerCommitOp::create(
+                tileBuilder, annotTarget->getLoc(), tileToken, tileBufIdx,
+                WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
+                    .build(funcOp.getContext()));
+            LDBG("create inline ProducerCommit in SubtiledRegionOp "
+                 << masterChannel->uniqID << " ");
           }
-          ttnvws::ProducerCommitOp::create(
-              tileBuilder, annotTarget->getLoc(), tileToken, tileBufIdx,
-              WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
-                  .build(funcOp.getContext()));
-          LDBG("create inline ProducerCommit in SubtiledRegionOp "
-               << masterChannel->uniqID << " ");
         } else {
           LLVM_DEBUG({
             LDBG("Insert ProducerCommitOp " << masterChannel->uniqID << " ");
@@ -4209,22 +4359,44 @@ void insertAsyncComm(
       // Insert ConsumerReleaseOp, if consumer is not a TCGen5MMAOp. For
       // TCGen5MMAOp, TCGen5MMAOp lowering will handle the ConsumerReleaseOp.
       if (commChannel.consumerBarriers.empty()) {
-        auto consumerReleasePoint =
-            consumerReleaseHeuristic(tailProducer, tailConsumer, token.first);
+        // Route the release off this token's OWN tail consumer, mirroring the
+        // per-token tokenHeadConsumer the ConsumerWait uses. The group-wide
+        // `tailConsumer` is the last consumer op regardless of task, which for
+        // an inside->outside subtiled channel whose producer region is
+        // scheduled AFTER this token's flat consumer (the addmm epilogue
+        // "straddle") resolves to the region itself -> the release would be
+        // emitted inline in the producer's region (wrong partition) while the
+        // wait stays flat, so the flat consumer's barrier is never released and
+        // the producer's next-iteration acquire deadlocks. Task-id filtering
+        // skips the task-0 region and lands on the flat task-2 consumer.
+        Operation *tokenTailConsumer = tailConsumer;
+        for (auto &op :
+             llvm::reverse(tailConsumer->getBlock()->getOperations())) {
+          if (consumerOps.count(&op)) {
+            auto taskIds = getAsyncTaskIds(&op);
+            if (std::find(taskIds.begin(), taskIds.end(), token.first) !=
+                taskIds.end()) {
+              tokenTailConsumer = &op;
+              break;
+            }
+          }
+        }
+        auto consumerReleasePoint = consumerReleaseHeuristic(
+            tailProducer, tokenTailConsumer, token.first);
         auto subtiled = getEnclosingSubtiledRegionTile(consumerReleasePoint);
         if (!subtiled)
-          subtiled = getEnclosingSubtiledRegionTile(tailConsumer);
+          subtiled = getEnclosingSubtiledRegionTile(tokenTailConsumer);
         if (!subtiled) {
-          if (auto sr = dyn_cast<ttng::SubtiledRegionOp>(tailConsumer))
+          if (auto sr = dyn_cast<ttng::SubtiledRegionOp>(tokenTailConsumer))
             subtiled = sr;
         }
         if (subtiled) {
-          Operation *insertTarget = tailConsumer;
-          if (isa<ttng::SubtiledRegionOp>(tailConsumer)) {
+          Operation *insertTarget = tokenTailConsumer;
+          if (isa<ttng::SubtiledRegionOp>(tokenTailConsumer)) {
             auto &tileBlock = subtiled.getTileRegion().front();
             insertTarget = &*std::prev(tileBlock.without_terminator().end());
-          } else if (getEnclosingSubtiledRegionTile(tailConsumer)) {
-            insertTarget = tailConsumer;
+          } else if (getEnclosingSubtiledRegionTile(tokenTailConsumer)) {
+            insertTarget = tokenTailConsumer;
           } else {
             insertTarget = consumerReleasePoint;
           }
