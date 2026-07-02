@@ -3,6 +3,7 @@
 
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -31,9 +32,6 @@ class SwizzledSharedEncodingAttr;
 SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
                                                 const ArrayRef<int64_t> &shape,
                                                 Type type, int numWarps);
-
-// Return true if the Load uses block pointer.
-bool isLoadFromTensorPtr(triton::LoadOp op);
 
 // Gets the order of a tensor from its contiguity. Places the dimensions with
 // the largest contiguity as the inner most dimension. If the contiguity is
@@ -173,6 +171,43 @@ scf::IfOp replaceIfOpWithNewSignature(OpBuilder &rewriter, scf::IfOp ifOp,
 
 // Append the given |newOperands| to the |forOp|'s yield op.
 void appendToForOpYield(scf::ForOp forOp, ArrayRef<Value> newOperands);
+
+//===----------------------------------------------------------------------===//
+// Loop-kind-agnostic helpers (scf.for / scf.while)
+//
+// AutoWS historically assumed every loop was an scf.for, where a loop's
+// init[k], regionIterArg[k], yieldOperand[k] and result[k] are all 1:1 aligned
+// and body argument 0 is the induction variable. That alignment does not hold
+// for scf.while, which has two regions ("before" ending in scf.condition,
+// "after" ending in scf.yield), no induction variable, and results that align
+// with the scf.condition forwarded operands rather than the scf.yield. These
+// helpers hide those differences so call sites can treat both uniformly.
+//===----------------------------------------------------------------------===//
+
+// One loop-carried value, identified by its iter-arg slot index `k` (0-based
+// index into getRegionIterArgs(), which is 1:1 with inits and yielded values
+// for both scf.for and scf.while). This hides the induction-variable offset and
+// the two-region structure of scf.while.
+struct LoopCarriedSlot {
+  // The loop init operand for this slot (init -> iterArg on loop entry).
+  OpOperand *init = nullptr;
+  // The region iter arg: scf.for body arg (k+1); scf.while "before" arg k.
+  BlockArgument iterArg;
+  // The value yielded back for the next iteration: scf.for scf.yield operand k;
+  // scf.while "after" scf.yield operand k.
+  OpOperand *yielded = nullptr;
+  // The loop result tied to this slot, if any. For scf.for this is result k.
+  // For scf.while this is non-null only when the matching "before" arg is
+  // forwarded by scf.condition (otherwise the slot has no tied result).
+  OpResult result;
+  // scf.while only: the "after" region argument fed from scf.condition for this
+  // slot, if forwarded. Null for scf.for and for non-forwarded while slots.
+  BlockArgument afterArg;
+};
+
+// Build the slot descriptor for iter-arg index `k`
+// (k < loop.getRegionIterArgs().size()).
+LoopCarriedSlot getLoopCarriedSlot(LoopLikeOpInterface loop, unsigned k);
 
 Operation *cloneWithInferType(mlir::OpBuilder &rewriter, Operation *op,
                               IRMapping &mapping);

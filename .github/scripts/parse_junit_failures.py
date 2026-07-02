@@ -33,6 +33,21 @@ def normalize(node_id: str) -> str:
     return PARAM_SUFFIX.sub("", node_id)
 
 
+def pytest_repro(norm: str) -> str:
+    """Best-effort local reproduce command for a normalized pytest identity.
+
+    JUnit ``classname`` is the dotted module path (e.g.
+    ``python.test.unit.language.test_tlx_dot``), so convert it back to a file
+    path and join the test function. Returns "" for non-pytest identities
+    (job-level buckets without a ``::`` separator).
+    """
+    if "::" not in norm:
+        return ""
+    module, _, func = norm.partition("::")
+    path = module.replace(".", "/") + ".py"
+    return f"python -m pytest {path}::{func} -v"
+
+
 def raw_id(classname: str, name: str) -> str:
     """Reconstruct a stable raw test id from JUnit classname + name."""
     classname = (classname or "").strip()
@@ -91,6 +106,9 @@ def build_items(failures, workflow, job):
             "issue_title": f"[nightly] {workflow} / {job} / {norm}",
             "job_name": job,
             "summary": info["summary"],
+            "repro": pytest_repro(norm),
+            # Real per-test signal: safe for reconcile to close on recovery.
+            "fallback": False,
         })
     return items
 
@@ -105,6 +123,9 @@ def build_missing_junit_item(missing_paths, workflow, job):
         "issue_title": f"[nightly] {workflow} / {job} / {norm}",
         "job_name": job,
         "summary": f"Pytest failed before producing JUnit XML: {', '.join(missing_paths)}",
+        "repro": "",
+        # Job-level fallback: no per-test signal -> reconcile must not close.
+        "fallback": True,
     }
 
 
@@ -116,6 +137,9 @@ def build_bucket_item(bucket, workflow, job):
         "issue_title": f"[nightly] {workflow} / {job} / {bucket}",
         "job_name": job,
         "summary": "Job failed but no test failures could be parsed (see run log).",
+        "repro": "",
+        # Job-level fallback: no per-test signal -> reconcile must not close.
+        "fallback": True,
     }
 
 

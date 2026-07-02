@@ -41,10 +41,20 @@ def parse_log(path):
     return ids
 
 
-def build_items(ids, workflow, job, bucket):
-    if not ids:
-        # Nothing parseable but the caller told us the run failed -> bucket.
-        ids = [bucket]
+def lit_repro(ident, fallback):
+    """Best-effort local reproduce command for a LIT identity.
+
+    ``ident`` looks like ``TRITON :: Conversion/foo.mlir``; the path after
+    ``::`` is relative to the ``test/`` suite root. Returns "" for the
+    job-level bucket fallback (no per-test path).
+    """
+    if fallback or "::" not in ident:
+        return ""
+    rel = ident.split("::", 1)[-1].strip()
+    return f"lit -v test/{rel}" if rel else ""
+
+
+def build_items(ids, workflow, job, fallback):
     items = []
     for ident in ids:
         items.append({
@@ -53,6 +63,10 @@ def build_items(ids, workflow, job, bucket):
             "issue_title": f"[nightly] {workflow} / {job} / {ident}",
             "job_name": job,
             "summary": f"LIT test failed: {ident}",
+            "repro": lit_repro(ident, fallback),
+            # fallback=True means the bucket identity (no per-test signal), so
+            # reconcile must not close per-test issues from this run.
+            "fallback": fallback,
         })
     return items
 
@@ -75,8 +89,11 @@ def main():
     if not ids and not args.failed:
         # Step passed and nothing parsed -> no issues.
         items = []
+    elif not ids:
+        # Step failed but nothing parseable -> stable bucket fallback.
+        items = build_items([args.bucket], args.workflow, args.job, fallback=True)
     else:
-        items = build_items(ids, args.workflow, args.job, args.bucket)
+        items = build_items(ids, args.workflow, args.job, fallback=False)
 
     payload = json.dumps(items)
     out_path = os.environ.get("GITHUB_OUTPUT")

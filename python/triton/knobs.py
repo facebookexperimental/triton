@@ -520,7 +520,7 @@ class runtime_knobs(base_knobs):
     kernel_load_end_hook: HookChain[InitHandleHook] = HookChain(reversed=True)
 
     # hook to unload module when kernel is freed
-    module_unload_hook: HookChain[InitHandleHook] = HookChain()
+    kernel_unload_hook: HookChain[InitHandleHook] = HookChain()
 
     # Hook for inspecting compiled functions and modules
     jit_cache_hook: Optional[JITHook] = None
@@ -536,6 +536,7 @@ class language_knobs(base_knobs):
     fp32_default: env_opt_str = env_opt_str("TRITON_F32_DEFAULT")
     default_fp_fusion: env_bool = env_bool("TRITON_DEFAULT_FP_FUSION", True)
     strict_reduction_ordering: env_bool = env_bool("TRITON_STRICT_REDUCTION_ORDERING")
+    allow_npot: env_bool = env_bool("TRITON_ALLOW_NPOT")
 
 
 class nvidia_knobs(base_knobs):
@@ -559,8 +560,7 @@ class nvidia_knobs(base_knobs):
     dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
     dump_tlx_benchmark: env_bool = env_bool("TRITON_DUMP_TLX_BENCHMARK")
     use_no_compile_launcher: env_bool = env_bool("TRITON_USE_NO_COMPILE_LAUNCHER")
-    use_llvm_launcher: env_bool = env_bool("TRITON_USE_LLVM_LAUNCHER")
-    use_triton_dispatcher: env_bool = env_bool("TRITON_USE_TRITON_DISPATCHER")
+    use_triton_dispatcher: env_bool = env_bool("TRITON_USE_C_DISPATCHER")
     use_autotune_c_cache: env_bool = env_bool("TRITON_AUTOTUNE_USE_C_CACHE")
     generate_subtiled_region: env_bool = env_bool("TRITON_GENERATE_SUBTILED_REGION")
     # When True, run the triton-nvidia-interleave-tmem pass on Blackwell.

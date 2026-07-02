@@ -34,7 +34,8 @@ static ttg::CGAEncodingAttr makeCGALayout(mlir::MLIRContext *ctx,
                                           llvm::ArrayRef<unsigned> CTASplitNum,
                                           llvm::ArrayRef<unsigned> CTAOrder) {
   unsigned rank = CTAsPerCGA.size();
-  bool isSingleCTA = llvm::all_of(CTAsPerCGA, [](unsigned c) { return c == 1; });
+  bool isSingleCTA =
+      llvm::all_of(CTAsPerCGA, [](unsigned c) { return c == 1; });
   if (isSingleCTA)
     return ttg::CGAEncodingAttr::get1CTALayout(ctx, rank);
   return ttg::CGAEncodingAttr::fromSplitParams(ctx, CTAsPerCGA, CTASplitNum,
@@ -185,8 +186,8 @@ void init_triton_tlx_ir(py::module &&m) {
              assert(order.size() == CTASplitNum.size() && "shape mismatch");
              assert(order.size() == CTAOrder.size() && "shape mismatch");
              auto context = self.getBuilder().getContext();
-             auto CTALayout = makeCGALayout(
-                 context, CTAsPerCGA, CTASplitNum, CTAOrder);
+             auto CTALayout =
+                 makeCGALayout(context, CTAsPerCGA, CTASplitNum, CTAOrder);
              return mlir::cast<Attribute>(ttg::SwizzledSharedEncodingAttr::get(
                  context, vectorSize, perPhase, maxPhase, order, CTALayout));
            })
@@ -205,8 +206,8 @@ void init_triton_tlx_ir(py::module &&m) {
              intervalPads.reserve(intervals.size());
              for (auto [i, p] : llvm::zip(intervals, paddings))
                intervalPads.emplace_back(i, p);
-             auto CTALayout = makeCGALayout(
-                 context, CTAsPerCGA, CTASplitNum, CTAOrder);
+             auto CTALayout =
+                 makeCGALayout(context, CTAsPerCGA, CTASplitNum, CTAOrder);
              return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
                  context, intervalPads, order, shape, CTALayout));
            })
@@ -215,17 +216,22 @@ void init_triton_tlx_ir(py::module &&m) {
               unsigned colStride, unsigned CTASplitM, unsigned CTASplitN,
               unsigned ctaMode) {
              auto context = self.getBuilder().getContext();
+             llvm::SmallVector<unsigned, 2> splits = {CTASplitM, CTASplitN};
+             llvm::SmallVector<unsigned, 2> order = {0, 1};
+             auto cgaLayout = makeCGALayout(context, splits, splits, order);
              return mlir::cast<Attribute>(ttng::TensorMemoryEncodingAttr::get(
-                 context, blockM, blockN, colStride, CTASplitM, CTASplitN,
+                 context, blockM, blockN, colStride, cgaLayout,
                  /*twoCTAs=*/false,
                  static_cast<ttng::TensorMemoryCTAMode>(ctaMode)));
            })
       .def("make_tensor_memory_scales_encoding_attr",
            [](TritonOpBuilder &self, unsigned CTASplitM, unsigned CTASplitN) {
              auto context = self.getBuilder().getContext();
+             llvm::SmallVector<unsigned, 2> splits = {CTASplitM, CTASplitN};
+             llvm::SmallVector<unsigned, 2> order = {0, 1};
+             auto cgaLayout = makeCGALayout(context, splits, splits, order);
              return mlir::cast<Attribute>(
-                 ttng::TensorMemoryScalesEncodingAttr::get(context, CTASplitM,
-                                                           CTASplitN));
+                 ttng::TensorMemoryScalesEncodingAttr::get(context, cgaLayout));
            })
       .def("make_nv_mma_shared_encoding_attr",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
@@ -241,8 +247,8 @@ void init_triton_tlx_ir(py::module &&m) {
              /* Validation logic for user defined layout encoding end */
 
              auto context = self.getBuilder().getContext();
-             auto CTALayout = makeCGALayout(
-                 context, CTAsPerCGA, CTASplitNum, CTAOrder);
+             auto CTALayout =
+                 makeCGALayout(context, CTAsPerCGA, CTASplitNum, CTAOrder);
              if (swizzled) {
                return mlir::cast<Attribute>(ttg::NVMMASharedEncodingAttr::get(
                    context, shape, order, CTALayout, elemType, fp4Padded));
@@ -274,8 +280,8 @@ void init_triton_tlx_ir(py::module &&m) {
              SmallVector<unsigned, 2> CTAsPerCGA = {1, 1};
              SmallVector<unsigned, 2> CTASplitNum = {1, 1};
              SmallVector<unsigned, 2> CTAOrder = {1, 0};
-             auto CTALayout = makeCGALayout(
-                 context, CTAsPerCGA, CTASplitNum, CTAOrder);
+             auto CTALayout =
+                 makeCGALayout(context, CTAsPerCGA, CTASplitNum, CTAOrder);
              return tlx::wrapNoVerifyLayout(mlir::cast<Attribute>(
                  ttg::NvidiaMmaEncodingAttr::get(context, versionMajor,
                                                  versionMinor, warpsPerCTA,
@@ -983,8 +989,8 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, int nbytes, int alignment) -> Value {
              auto ptrType = triton::PointerType::get(
                  self.getBuilder().getI8Type(), /*addressSpace=*/1);
-             return self.create<ttg::GlobalScratchAllocOp>(ptrType, nbytes,
-                                                           alignment);
+             return self.create<ttg::GlobalScratchAllocOp>(
+                 ptrType, nbytes, alignment, mlir::UnitAttr());
            })
       // Make a tensor descriptor with optional desc_ptr
       .def("create_make_tensor_descriptor",

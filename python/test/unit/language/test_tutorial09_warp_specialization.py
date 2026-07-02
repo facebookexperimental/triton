@@ -163,6 +163,58 @@ def matmul_kernel_tma_persistent_ws(
 
 
 # ============================================================================
+# Kernel 2b: matmul_kernel_tma_static_persistent_ws_while
+# Static persistent TMA matmul whose persistent outer loop is a while loop.
+# Work assignment is still static: each CTA processes tile_id += NUM_SMS.
+# ============================================================================
+@triton.jit
+def matmul_kernel_tma_static_persistent_ws_while(
+    a_desc,
+    b_desc,
+    c_desc,
+    M,
+    N,
+    K,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    EPILOGUE_SUBTILE: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    dtype = tl.float16
+    start_pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    num_tiles = num_pid_m * num_pid_n
+
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    tile_id = start_pid
+
+    while tile_id < num_tiles:
+        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        offs_am = pid_m * BLOCK_SIZE_M
+        offs_bn = pid_n * BLOCK_SIZE_N
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in tl.range(k_tiles, warp_specialize=True):
+            offs_k = ki * BLOCK_SIZE_K
+            a = a_desc.load([offs_am, offs_k])
+            b = b_desc.load([offs_bn, offs_k])
+            accumulator = tl.dot(a, b.T, accumulator)
+
+        acc_slices = _split_n_2D(accumulator, EPILOGUE_SUBTILE)
+        slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
+        for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
+            c_desc.store(
+                [offs_am, offs_bn + slice_id * slice_size],
+                acc_slices[slice_id].to(dtype),
+            )
+        tile_id += NUM_SMS
+
+
+# ============================================================================
 # Kernel 3: matmul_kernel_descriptor_persistent - Device-side TMA descriptors
 # Uses warp_specialize with flatten in outer tile loop
 # ============================================================================
@@ -384,7 +436,6 @@ def _reduce_k_kernel(
 @pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
-@pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("generate_subtiled_region", [True, False])
 @pytest.mark.parametrize("separate_epilogue_store", [True, False])
@@ -400,7 +451,6 @@ def test_tutorial09_matmul_tma_warp_specialize(
     num_warps,
     A_col_major,
     B_col_major,
-    use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     generate_subtiled_region,
     separate_epilogue_store,
@@ -464,7 +514,6 @@ def test_tutorial09_matmul_tma_warp_specialize(
             SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
-            early_tma_store_lowering=use_early_tma_store_lowering,
             generate_subtiled_region=generate_subtiled_region,
         )
 
@@ -493,7 +542,6 @@ def test_tutorial09_matmul_tma_warp_specialize(
 @pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
-@pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("generate_subtiled_region", [True, False])
 @pytest.mark.parametrize("separate_epilogue_store", [True, False])
@@ -511,7 +559,6 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     EPILOGUE_SUBTILE,
     A_col_major,
     B_col_major,
-    use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     generate_subtiled_region,
     separate_epilogue_store,
@@ -599,7 +646,6 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
             SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
-            early_tma_store_lowering=use_early_tma_store_lowering,
             generate_subtiled_region=generate_subtiled_region,
         )
 
@@ -610,6 +656,75 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
         assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
 
         # Verify correctness
+        ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
+        torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
+
+
+# ============================================================================
+# Test 2b: Static persistent matmul with a while-loop outer loop
+# ============================================================================
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+@pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
+def test_tutorial09_matmul_tma_static_persistent_while_loop_warp_specialize(EPILOGUE_SUBTILE):
+    """Test a static persistent matmul whose persistent outer loop is a while loop."""
+    M, N, K = 2048, 2048, 256
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 64
+    GROUP_SIZE_M = 8
+    num_stages = 3
+    num_warps = 4
+
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+
+        dtype = torch.float16
+        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+        device = "cuda"
+
+        torch.manual_seed(42)
+        A = torch.randn((M, K), dtype=dtype, device=device)
+        B = torch.randn((N, K), dtype=dtype, device=device)
+        C = torch.empty((M, N), dtype=dtype, device=device)
+
+        def alloc_fn(size, align, stream):
+            return torch.empty(size, dtype=torch.int8, device="cuda")
+
+        triton.set_allocator(alloc_fn)
+
+        a_desc = TensorDescriptor(A, A.shape, A.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_K])
+        b_desc = TensorDescriptor(B, B.shape, B.stride(), [BLOCK_SIZE_N, BLOCK_SIZE_K])
+        c_desc = TensorDescriptor(C, C.shape, C.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_N // EPILOGUE_SUBTILE])
+
+        grid = lambda META: (min(
+            NUM_SMS,
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        ), )
+
+        kernel = matmul_kernel_tma_static_persistent_ws_while[grid](
+            a_desc,
+            b_desc,
+            c_desc,
+            M,
+            N,
+            K,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=GROUP_SIZE_M,
+            EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
+            NUM_SMS=NUM_SMS,
+            num_stages=num_stages,
+            num_warps=num_warps,
+        )
+
+        ttgir = kernel.asm["ttgir"]
+        assert "scf.while" in ttgir, "Expected persistent outer loop to lower to scf.while"
+        assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
+        assert "ttng.tc_gen5_mma" in ttgir, "Expected Blackwell MMA instruction"
+        assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
+        assert "ttng.clc_" not in ttgir, "Expected static persistent scheduling, not CLC"
+
         ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
         torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
 
@@ -628,7 +743,6 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 @pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
-@pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("generate_subtiled_region", [True, False])
 @pytest.mark.parametrize("separate_epilogue_store", [True, False])
@@ -646,7 +760,6 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     EPILOGUE_SUBTILE,
     A_col_major,
     B_col_major,
-    use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     generate_subtiled_region,
     separate_epilogue_store,
@@ -712,7 +825,6 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
             SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
-            early_tma_store_lowering=use_early_tma_store_lowering,
             generate_subtiled_region=generate_subtiled_region,
         )
 
@@ -797,7 +909,6 @@ def test_tutorial09_multi_epilogue_subtile():
             SEPARATE_EPILOGUE_STORE=False,
             num_stages=num_stages,
             num_warps=num_warps,
-            early_tma_store_lowering=True,
         )
 
         # Verify warp specialization actually ran (ttg.warp_return is only
@@ -946,7 +1057,6 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize_splitk(
 @pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
-@pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("enable_pingpong", [False, True])
 @pytest.mark.parametrize("separate_epilogue_store", [True, False])
@@ -962,7 +1072,6 @@ def test_hopper_matmul_tma_warp_specialize(
     num_warps,
     A_col_major,
     B_col_major,
-    use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     enable_pingpong,
     separate_epilogue_store,
@@ -1023,7 +1132,6 @@ def test_hopper_matmul_tma_warp_specialize(
             SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
-            early_tma_store_lowering=use_early_tma_store_lowering,
             pingpongAutoWS=enable_pingpong,
             maxRegAutoWS=208 if DATA_PARTITION_FACTOR > 1 else 248,
         )
@@ -1049,7 +1157,6 @@ def test_hopper_matmul_tma_warp_specialize(
 @pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
-@pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("enable_pingpong", [False, True])
 @pytest.mark.parametrize("separate_epilogue_store", [True, False])
@@ -1065,7 +1172,6 @@ def test_hopper_matmul_tma_persistent_warp_specialize(
     num_warps,
     A_col_major,
     B_col_major,
-    use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     enable_pingpong,
     separate_epilogue_store,
@@ -1144,7 +1250,6 @@ def test_hopper_matmul_tma_persistent_warp_specialize(
             SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
-            early_tma_store_lowering=use_early_tma_store_lowering,
             pingpongAutoWS=enable_pingpong,
             maxRegAutoWS=208 if DATA_PARTITION_FACTOR > 1 else 248,
         )
@@ -1171,7 +1276,6 @@ def test_hopper_matmul_tma_persistent_warp_specialize(
 @pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
-@pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("enable_pingpong", [False, True])
 @pytest.mark.parametrize("separate_epilogue_store", [True, False])
@@ -1187,7 +1291,6 @@ def test_hopper_matmul_descriptor_persistent_warp_specialize(
     num_warps,
     A_col_major,
     B_col_major,
-    use_early_tma_store_lowering,
     DATA_PARTITION_FACTOR,
     enable_pingpong,
     separate_epilogue_store,
@@ -1251,7 +1354,6 @@ def test_hopper_matmul_descriptor_persistent_warp_specialize(
             SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             num_stages=num_stages,
             num_warps=num_warps,
-            early_tma_store_lowering=use_early_tma_store_lowering,
             pingpongAutoWS=enable_pingpong,
             maxRegAutoWS=208 if DATA_PARTITION_FACTOR > 1 else 248,
         )
@@ -1319,7 +1421,6 @@ def test_warp_specialize_num_warps_8():
             SEPARATE_EPILOGUE_STORE=False,
             num_stages=2,
             num_warps=8,
-            early_tma_store_lowering=True,
         )
 
         ttgir = kernel.asm["ttgir"]

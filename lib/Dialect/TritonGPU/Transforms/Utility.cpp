@@ -87,10 +87,6 @@ SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
   }
 }
 
-bool isLoadFromTensorPtr(triton::LoadOp op) {
-  return mlir::triton::isTensorPointerType(op.getPtr().getType());
-}
-
 SmallVector<unsigned, 4>
 getOrderFromContiguity(const SmallVector<int64_t> &arr) {
   SmallVector<unsigned, 4> ret(arr.size());
@@ -591,15 +587,10 @@ Attribute inferDstEncoding(Operation *op, Attribute encoding) {
 }
 
 bool isExpensiveLoadOrStore(Operation *op) {
-  // Case 1: Pointer of tensor is always expensive
-  auto operandType = op->getOperand(0).getType();
-  if (triton::isTensorPointerType(operandType))
-    return true;
-  // Case 2a: A size 1 tensor is not expensive since all threads will load the
-  // same
+  // size 1 tensor is not expensive since all threads will load the same
   if (isSingleValue(op->getOperand(0)))
     return false;
-  // Case 2b: Tensor of pointers has more threads than elements
+  // Tensor of pointers has more threads than elements
   // we can presume a high hit-rate that makes it cheap to load
   auto ptrType = cast<RankedTensorType>(op->getOperand(0).getType());
   auto mod = op->getParentOfType<ModuleOp>();
@@ -818,6 +809,55 @@ void appendToForOpYield(scf::ForOp forOp, ArrayRef<Value> newOperands) {
   OpBuilder builder(yieldOp);
   scf::YieldOp::create(builder, yieldOp->getLoc(), operands);
   yieldOp->erase();
+}
+
+//===----------------------------------------------------------------------===//
+// Loop-kind-agnostic helpers (scf.for / scf.while)
+//===----------------------------------------------------------------------===//
+
+LoopCarriedSlot getLoopCarriedSlot(LoopLikeOpInterface loop, unsigned k) {
+  LoopCarriedSlot slot;
+  Operation *op = loop.getOperation();
+  // iterArg and yielded are 1:1 with the slot index for both loop kinds and are
+  // safe to query through the interface (both kinds expose getRegionIterArgs
+  // and getYieldedValuesMutable).
+  slot.iterArg = loop.getRegionIterArgs()[k];
+  if (auto yielded = loop.getYieldedValuesMutable())
+    slot.yielded = &(*yielded)[k];
+
+  // The init OpOperand must be fetched from the concrete op: the
+  // LoopLikeOpInterface default getInitsMutable() returns {} for scf.while.
+  if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+    slot.init = &forOp.getInitArgsMutable()[k];
+    slot.result = forOp->getOpResult(k);
+    return slot;
+  }
+
+  auto whileOp = cast<scf::WhileOp>(op);
+  slot.init = &whileOp.getInitsMutable()[k];
+  // results / after-args align with scf.condition forwarded operands, not with
+  // the iter-arg index. Find the forwarded position carrying this "before" arg
+  // (the case for appended counters and pass-through carried values).
+  //
+  // Contract for the two cases this loop does NOT fully resolve:
+  //   - Not forwarded at all: a "before"-only value (e.g. the raw loop
+  //     predicate) is legal in scf.while and leaves slot.result / slot.afterArg
+  //     null. Callers that need them must check (see LoopCarriedSlot in the
+  //     header and the assert in WSCodePartition
+  //     getOutOfScopeBufferIdxAndPhase).
+  //   - Forwarded to more than one condition slot: only the first forwarded
+  //     position is associated with this slot; later duplicates are ignored.
+  //     Safe today because every threaded counter is forwarded exactly once; a
+  //     general duplicate-forwarding loop would need per-position resolution.
+  auto condOp = whileOp.getConditionOp();
+  for (auto [j, fwd] : llvm::enumerate(condOp.getArgs())) {
+    if (fwd == slot.iterArg) {
+      slot.result = whileOp->getOpResult(j);
+      slot.afterArg = whileOp.getAfterArguments()[j];
+      break;
+    }
+  }
+  return slot;
 }
 
 scf::IfOp replaceIfOpWithNewSignature(OpBuilder &rewriter, scf::IfOp ifOp,
@@ -1220,9 +1260,6 @@ static bool skipOperand(Operation *op, unsigned operandNumber) {
 Operation *convertDistributedOpEncoding(Attribute encoding, Operation *op) {
   OpBuilder builder(op);
   // Convert operands
-  // For load/store with tensor pointers, we don't have to change the
-  // operands' type, we do this by changing the outputs' type of
-  // `make_tensor_ptr`
   SmallVector<Value, 4> newArgs;
   for (auto &opOperand : op->getOpOperands()) {
     Value operand = opOperand.get();

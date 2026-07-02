@@ -85,7 +85,8 @@ A simpler approach using backward slicing from dot/MMA ops. Used on Hopper.
 
 ### Algorithm
 
-1. Collect all `scf::ForOp` loops, `WarpGroupDotOp`, load ops, and store ops.
+1. Collect all loop-like ops (`scf::ForOp`, `scf::WhileOp`), `WarpGroupDotOp`,
+   load ops, and store ops.
 2. For each dot, compute the backward slice of operands A and B.
 3. Any `DescriptorLoadOp`, `DescriptorGatherOp`, or expensive `LoadOp` in the
    backward slice is a **producer** (task ID 0).
@@ -131,11 +132,17 @@ analysis framework.
    the minimum partition ID).
 2. Handle operand D initialization: find `TMEMStoreOp` before the loop that
    writes to the MMA's accumulator, assign it the appropriate task ID.
-3. Mark all `scf::ForOp` loops with the union of all task IDs.
+3. Mark all `scf::ForOp` and `scf::WhileOp` loops with the union of all task
+   IDs.
 4. Run the backward dataflow solver.
 5. Materialize: update `async_task_id` on all ops from the solver's lattice.
 6. `labelParentOps`: ensure parent ops have the union of their children's
    task IDs.
+
+For `scf.while`, result task IDs propagate through the `scf.condition`
+forwarded operands because while results are produced by the before-region
+terminator, not by the after-region `scf.yield`. The after-region yield still
+models the backedge to the next iteration's before-region arguments.
 
 ## Data Partitioning
 

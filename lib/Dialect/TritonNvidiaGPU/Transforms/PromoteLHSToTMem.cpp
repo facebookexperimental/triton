@@ -53,11 +53,9 @@ static StringRef getOpndAMemType(Operation *op) {
 }
 
 template <class MMAOpTy>
-Attribute getLHSTMemLayout(MMAOpTy tcGen5MMAOp, gpu::MemDescType lhsTMEMType,
-                           ttg::CGAEncodingAttr cgaLayout) {
+Attribute getLHSTMemLayout(MMAOpTy tcGen5MMAOp, gpu::MemDescType lhsTMEMType) {
   int numWarps = ttg::lookupNumWarps(tcGen5MMAOp);
-  return nvidia_gpu::getDefaultLayoutForTmemLdSt(lhsTMEMType, numWarps,
-                                                 cgaLayout);
+  return nvidia_gpu::getDefaultLayoutForTmemLdSt(lhsTMEMType, numWarps);
 }
 
 template <class MMAOpTy> class LHSToTMem : public OpRewritePattern<MMAOpTy> {
@@ -116,7 +114,7 @@ public:
     auto srcLayout = srcType.getEncoding();
     auto accTMemEncoding = dyn_cast<TensorMemoryEncodingAttr>(
         tcGen5MMAOp.getD().getType().getEncoding());
-    auto CTASplitNum = triton::gpu::getCGALayout(srcLayout).getCTASplitNum();
+    auto cgaLayout = triton::gpu::getCGALayout(srcLayout);
     // TMem encoding for A operand is the same as for D (Acc), but packed for
     // bitwidth=16
     unsigned elemBitWidth =
@@ -128,7 +126,7 @@ public:
     const unsigned colStride = 1;
     auto aTMemEncoding = TensorMemoryEncodingAttr::get(
         context, accTMemEncoding.getBlockM(), lhs.getType().getShape()[1],
-        colStride, CTASplitNum[0], CTASplitNum[1], accTMemEncoding.getTwoCTAs(),
+        colStride, cgaLayout, accTMemEncoding.getTwoCTAs(),
         accTMemEncoding.getCtaMode() == TensorMemoryCTAMode::TwoCTA_RHS
             ? TensorMemoryCTAMode::TwoCTA_LHS
             : accTMemEncoding.getCtaMode());
@@ -144,8 +142,7 @@ public:
     if (!layoutTmemCompatible) {
       if (!comesFromLoadOrBlockArg(src) ||
           triton::tools::getBoolEnv("ALLOW_LHS_TMEM_LAYOUT_CONVERSION")) {
-        newLayout = getLHSTMemLayout(tcGen5MMAOp, lhsMemDescType,
-                                     ttg::getCGALayout(srcType.getEncoding()));
+        newLayout = getLHSTMemLayout(tcGen5MMAOp, lhsMemDescType);
       } else {
         return failure();
       }

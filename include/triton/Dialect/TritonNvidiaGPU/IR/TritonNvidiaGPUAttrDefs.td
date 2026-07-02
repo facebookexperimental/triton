@@ -5,6 +5,7 @@ include "mlir/IR/AttrTypeBase.td"
 include "mlir/IR/EnumAttr.td"
 include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUDialect.td"
 include "triton/Dialect/Triton/IR/TritonInterfaces.td"
+include "triton/Dialect/TritonGPU/IR/TritonGPUAttrInterfaces.td"
 include "mlir/IR/EnumAttr.td"
 
 //===----------------------------------------------------------------------===//
@@ -69,7 +70,24 @@ def TTNG_TMEMLoadReduceModifierEnum : EnumAttr<TritonNvidiaGPU_Dialect, TTNG_TME
   let assemblyFormat = "`<` $value `>`";
 }
 
-def TTG_TensorMemoryEncodingAttr : AttrDef<TritonNvidiaGPU_Dialect, "TensorMemoryEncoding"> {
+def TTNG_CGALayoutRankTwoParam
+    : AttrOrTypeParameter<"::mlir::triton::gpu::CGAEncodingAttr",
+                          "rank-2 CGA layout"> {
+  let parser = [{
+    [&]() -> ::mlir::FailureOr<::mlir::triton::gpu::CGAEncodingAttr> {
+      return ::mlir::triton::nvidia_gpu::parseCGALayoutRankTwo($_parser);
+    }()
+  }];
+  let printer = [{
+    ::mlir::triton::nvidia_gpu::printCGALayoutRankTwo($_printer, $_self);
+  }];
+  let defaultValue =
+      "::mlir::triton::gpu::CGAEncodingAttr::get1CTALayout($_ctxt, 2)";
+}
+
+def TTG_TensorMemoryEncodingAttr
+    : AttrDef<TritonNvidiaGPU_Dialect, "TensorMemoryEncoding",
+              [LayoutEncodingTrait]> {
   let mnemonic = "tensor_memory_encoding";
   let attrName = "triton.gpu.tensor_memory_encoding";
   let description = [{
@@ -86,8 +104,7 @@ def TTG_TensorMemoryEncodingAttr : AttrDef<TritonNvidiaGPU_Dialect, "TensorMemor
     "unsigned":$blockM,
     "unsigned":$blockN,
     "unsigned":$colStride,
-    DefaultValuedParameter<"unsigned", "1">:$CTASplitM,
-    DefaultValuedParameter<"unsigned", "1">:$CTASplitN,
+    TTNG_CGALayoutRankTwoParam:$CGALayout,
     DefaultValuedParameter<"bool", "false">:$twoCTAs,
     DefaultValuedParameter<"TensorMemoryCTAMode", "TensorMemoryCTAMode::DEFAULT">:$ctaMode
   );
@@ -95,7 +112,9 @@ def TTG_TensorMemoryEncodingAttr : AttrDef<TritonNvidiaGPU_Dialect, "TensorMemor
   let assemblyFormat = "`<` struct(params) `>`";
 }
 
-def TTG_TensorMemoryScalesEncodingAttr : AttrDef<TritonNvidiaGPU_Dialect, "TensorMemoryScalesEncoding"> {
+def TTG_TensorMemoryScalesEncodingAttr
+    : AttrDef<TritonNvidiaGPU_Dialect, "TensorMemoryScalesEncoding",
+              [LayoutEncodingTrait]> {
   let mnemonic = "tensor_memory_scales_encoding";
   let attrName = "triton.gpu.tensor_memory_scales_encoding";
   let description = [{
@@ -107,9 +126,9 @@ def TTG_TensorMemoryScalesEncodingAttr : AttrDef<TritonNvidiaGPU_Dialect, "Tenso
   }];
   let parameters = (
     ins
-    DefaultValuedParameter<"unsigned", "1">:$CTASplitM,
-    DefaultValuedParameter<"unsigned", "1">:$CTASplitN
+    TTNG_CGALayoutRankTwoParam:$CGALayout
   );
+  let genVerifyDecl = 1;
   let assemblyFormat = "`<` struct(params) `>`";
 }
 

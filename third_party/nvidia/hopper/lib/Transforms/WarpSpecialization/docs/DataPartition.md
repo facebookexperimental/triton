@@ -14,12 +14,14 @@ into two M=128 pieces for two consumer groups.
 ```
 doTaskPartition          ← assigns ops to partitions
   → doTaskIdPropagate   ← propagates task IDs to all ops
-  → doDataPartition     ← THIS STEP: splits tensor dimensions (Hopper only)
+  → doDataPartition     ← THIS STEP: splits tensor dimensions
   → doPingPongPrep
 ```
 
-Data partitioning runs only on Hopper. On Blackwell, the partition scheduling
-pass (`PartitionSchedulingMeta`) handles spatial splitting differently.
+Data partitioning is exposed as `nvgpu-ws-data-partition` and is not Hopper
+only. Hopper-style AutoWS typically reaches it after task ID propagation, while
+Blackwell flows may run it as a separate pass when an explicit data partition
+factor is attached or multiple warp groups require per-consumer slices.
 
 ## `DataPartitionScheme`
 
@@ -49,8 +51,8 @@ Before partitioning, ensures all ops in def-use chains carry correct
 
 - **Backward**: If an op uses a value defined by an `arith` op that lacks the
   consumer's task ID, propagate backward.
-- **Forward**: If a `YieldOp` or `IfOp` has a single-use operand whose
-  defining op has extra task IDs, propagate forward.
+- **Forward**: If a `YieldOp`, `ConditionOp`, `IfOp`, or `WhileOp` has a
+  single-use operand whose defining op has extra task IDs, propagate forward.
 
 Runs to a fixed point.
 
@@ -58,7 +60,8 @@ Runs to a fixed point.
 
 Drives partitioning from dot/MMA ops:
 
-1. Collect all `WarpGroupDotOp` and `TCGen5MMAOp` operations.
+1. Collect all `WarpGroupDotOp` operations and all operations implementing
+   `MMAv5OpInterface`.
 2. For each dot with multiple `async_task_id` values, determine the partition
    dimension from the accumulator shape:
    - **M dimension** (dim 0): if `shapePerCTA[0] / numPartitions >= 64`
@@ -84,9 +87,10 @@ Traces the partition dimension backward and forward from the accumulator:
   produce scalar types.
 
 - **`getForwardSliceToPartition`**: From the accumulator, walks forward
-  through result users. Handles `YieldOp` (follow to loop result users),
-  `IfOp` (follow to if result), and tracks dimension remapping through
-  layout-changing ops.
+  through result users. Handles `YieldOp` (follow to `scf.for` / `scf.if`
+  results, or to the `scf.while` before-region backedge), `ConditionOp`
+  (follow to `scf.while` results and after-region arguments), and tracks
+  dimension remapping through layout-changing ops.
 
 ### Step 4: Rematerialization (`rewriteRematerializedOps`)
 
@@ -106,6 +110,11 @@ For each partition offset (0 to `numPartitions - 1`):
    `[1]` and one with `[2]`.
 3. Function arguments with `TensorDescType` have their block type sliced to
    match the partition factor.
+
+For `scf.while`, slicing may append extra loop-carried values. The new
+before-region argument is forwarded through `scf.condition` to create the
+matching while result and after-region argument, and the after-region
+`scf.yield` appends the sliced next-iteration value.
 
 ### Step 6: Cleanup (`doDeepCleanup`)
 
@@ -128,6 +137,32 @@ The partition dimension is tracked through shape-changing operations:
 When a `TensorDescType` function argument feeds a partitioned op, its block
 type is sliced. The `funcArgPartitionDims` map tracks which arguments need
 slicing and along which dimension.
+
+If a `TensorDescType` function argument is also used as a loop init value, the
+pass currently bails out. Updating both the function signature and the loop
+carried argument/result types consistently requires additional handling.
+
+### MMAv5 Scaled MMA
+
+Scaled MMAv5 ops are partitioned through `MMAv5OpInterface` for the ordinary
+MMA operands and accumulator. Scale operands are handled only for
+`TCGen5MMAScaledOp`, because scale operands are not part of the generic MMAv5
+interface.
+
+The scale TMEM memdesc is treated logically as `(BLOCK_MN,
+BLOCK_K / scale_vec_size)`. Therefore:
+
+- M/output dim 0 partitioning slices `A` and `A_scale`; `A_scale` is sliced
+  along logical scale dim 0.
+- N/output dim 1 partitioning slices `B` and `B_scale`; `B_scale` is sliced
+  along logical scale dim 0.
+- Logical scale dim 1 is the K/scale-vector dimension and is not sliced by the
+  normal M/N data partitioning path.
+
+Scale buffers populated by `TMEMCopyOp` also need their copy source sliced to
+match the destination scale rows. The copy source uses packed 32x128b chunks,
+so the source partition dimension is the packed `repRows` dimension rather than
+the logical scale dimension directly.
 
 ### Interaction with Task IDs
 

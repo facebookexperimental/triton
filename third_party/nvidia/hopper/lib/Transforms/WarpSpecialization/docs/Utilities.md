@@ -37,9 +37,9 @@ each operation. They can also be read from `ttg.partition` attributes (used by
 
 ### `labelParentOps`
 
-After task IDs are assigned to leaf ops, parent ops (loops, if-ops) need the
-union of their children's task IDs. `labelParentOps` walks the parent chain
-up to the enclosing `FuncOp`, calling `addAsyncTaskIds` at each level.
+After task IDs are assigned to leaf ops, parent ops (loops, if-ops, while-ops)
+need the union of their children's task IDs. `labelParentOps` walks the parent
+chain up to the enclosing `FuncOp`, calling `addAsyncTaskIds` at each level.
 
 ## `OpBuilderWithAsyncTaskIds`
 

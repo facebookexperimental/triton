@@ -43,15 +43,19 @@ Operation *streamPredication(RewriterBase &rewriter, Operation *op,
   } else if (auto prefetchOp = dyn_cast<triton::amdgpu::TDMPrefetchOp>(op)) {
     rewriter.setInsertionPoint(prefetchOp);
     Value mask = arith::AndIOp::create(rewriter, prefetchOp->getLoc(),
-                                       copyOp.getPred(), pred);
-    copyOp.getPredMutable().assign(mask);
+                                       prefetchOp.getPred(), pred);
+    prefetchOp.getPredMutable().assign(mask);
     return op;
   } else if (auto waitOp = dyn_cast<triton::amdgpu::AsyncTDMWait>(op)) {
     return op;
   }
   return tt::wrapInMaskOp(rewriter, op, pred);
 }
+} // namespace
 
+// Exposed for reuse by the decompose+modulo pipeline (change #4): deserialize
+// the CoarseSchedule the caller serialized and run the general pipeline
+// expander.
 void expandLoops(ModuleOp moduleOp) {
   SmallVector<scf::ForOp> loops;
   moduleOp->walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
@@ -114,7 +118,6 @@ void expandLoops(ModuleOp moduleOp) {
 
   tt::resolveMaskOp(moduleOp);
 }
-} // namespace
 
 struct PipelinePass : impl::TritonAMDGPUPipelineBase<PipelinePass> {
   using Base::Base;

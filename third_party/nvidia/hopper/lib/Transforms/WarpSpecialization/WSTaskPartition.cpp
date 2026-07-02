@@ -31,14 +31,14 @@ void doTaskPartition(triton::FuncOp &funcOp, unsigned numWarpGroups) {
   if (!allAsyncTasks.empty())
     return;
 
-  SmallVector<scf::ForOp> loops;
+  SmallVector<LoopLikeOpInterface> loops;
   bool hasLoad = false;
   SmallVector<Operation *> stores;
   SmallVector<Operation *> dots;
 
   funcOp.walk([&](Operation *op) {
-    if (scf::ForOp forOp = dyn_cast<scf::ForOp>(op))
-      loops.push_back(forOp);
+    if (auto loop = dyn_cast<LoopLikeOpInterface>(op))
+      loops.push_back(loop);
     else if (isa<ttng::WarpGroupDotOp>(op))
       dots.push_back(op);
     else if (isa<tt::LoadOp, tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op))

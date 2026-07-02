@@ -7,6 +7,25 @@ assigns them the same `buffer.id` so that downstream code partitioning replaces
 all but one allocation with views into a single representative buffer. This
 reduces SMEM and TMEM pressure without changing program semantics.
 
+## Reuse Categories (A1–A6)
+
+Code partitioning classifies each reuse group (channels sharing a `buffer.id`)
+by how it must be synchronized. These labels are used throughout this doc and in
+the `WSCodePartition.cpp` / `CodePartitionUtility.cpp` comments:
+
+| | Category | Mem | Shape | Predicate / handler |
+|---|---|---|---|---|
+| **A1** | SMEM circular reuse | SMEM | multi-buffered (`numCopies > 1`), all producers/consumers in one block; cycles channels through *time slots* of one circular buffer via `accumCnt` staggering | `verifyReuseGroup1` |
+| **A2** | 2-buffer real reuse | TMEM/SMEM | exactly 2 single-copy channels with **overlapping** reuse AND a consumer→producer dependency chain — TMEM (overlapping columns **and** chain) or SMEM (chain) | `verifyReuseGroup2` |
+| **A3** | N-buffer SMEM epilogue | SMEM | ≥2 single-copy channels sharing one circular buffer, stored/loaded sequentially, all producers in one block (epilogue subtiling) | `verifyReuseGroupN` + inline chain |
+| **A4** | TMEM column packing | TMEM | same `buffer.id`, **disjoint** columns (`buffer.offset`) — spatial packing, no cross-channel sync; materialized by `replaceBufferReuse`'s column slice | none (`tmemReuseGroupOverlaps` false) |
+| **A5** | Cross-partition reuse | TMEM | single-copy ≥3-channel group whose producers span >1 partition AND admit a unique **dependency-chain** order; synced like A2 on the chain **endpoints** | `verifyReuseGroupCrossPartition` |
+| **A6** | Whole-allocation-overwrite hub | TMEM | a `useC=false` owner overwrites the **whole** allocation, clobbering spatially-packed (distinct-`buffer.offset`) siblings; emits back-edges to those siblings | `isWholeAllocationOverwriteReuseOwner` |
+
+A1 uses temporal slot staggering (multi-buffered). A2/A3/A5/A6 are single-copy
+(`buffer.copy = 1`) and get explicit reuse barriers. A4 needs no synchronization
+(the columns are disjoint). Each category is detailed in its own section below.
+
 ## Requirements for Reuse
 
 Two channels can share a buffer when:
@@ -153,13 +172,20 @@ This mirrors the non-staging `loadGroups` discriminator.
 
 ### 1. Accumulation Counters
 
+> **SMEM-only.** Cross-group count accumulation applies **only to
+> multi-buffered SMEM circular reuse**. TMEM reuse groups do **not** accumulate
+> across the group — see [SMEM vs TMEM](#smem-vs-tmem-accumulation) below.
+
 When channels in a reuse group share a multi-buffered circular buffer, a shared
 **accumulation counter** (`accumCnt`) tracks which buffer slot to use. The
 counter is carried as a loop argument and incremented as channels are consumed.
 
 Key functions:
-- `needAccumCntForReuse` — returns true when a loop/if region contains at
-  least one src or dst op of the reuse group and the group is multi-buffered
+- `needAccumCntForReuse` — returns true when **the group is multi-buffered**
+  (`channels[0]->getNumBuffers() > 1`) **and** a loop/if region contains at
+  least one src or dst op of the reuse group. It short-circuits to `false` for
+  single-buffered groups (`CodePartitionUtility.cpp:346-348`), so no shared
+  `accumCnt` loop argument is created for them.
 - `getAccumForReuseGroup` — computes the `accumCnt` SSA value at a given
   operation by walking back through the channel list to find the nearest
   preceding region op, then arithmetically adding the remaining offset
@@ -169,13 +195,55 @@ Key functions:
   reuse groups do NOT flow through here for their staging slot:** the N subtiles
   share one barrier pair and one physical alloc, so both the data slot and the
   barrier `bufferIdx`/`phase` are computed *inside the tile body* from the builtin
-  `tileIdx` (`flattened = accumCnt * numTiles + tileIdx`, `% numBuffers`), keeping
-  data slot == barrier generation. The generic `+ position` stagger is wrong for
-  subtiles (it aliases distinct subtiles within a `numBuffers` window and races —
-  the EPILOGUE_SUBTILE>2 staging-buffer bug). See
+  `tileIdx` (`flattened = accumCnt + tileIdx`, `% numBuffers`; `accumCnt`
+  advances by `numTiles` per iteration), keeping data slot == barrier generation.
+  The generic `+ position` stagger is wrong for subtiles (it aliases distinct
+  subtiles within a `numBuffers` window and races — the EPILOGUE_SUBTILE>2
+  staging-buffer bug). See
   [SubtileOperator](SubtileOperator.md).
 - `getReuseAccumArgIdx` — returns the position of a group's `accumCnt`
   argument within the region's full argument list
+
+#### Condition check (A1)
+
+Because the memory planner has already committed to aliasing a multi-buffered
+SMEM circular reuse group, code partitioning **validates** the A1 preconditions
+before emitting any `accumCnt` for it. After reuse-group formation (and before
+`appendAccumCntsForOps`), `doCodePartitionPost` calls `verifyReuseGroup1` on
+every multi-buffered group and `report_fatal_error`s if it fails:
+
+- **Multi-buffered** — `channels[0]->getNumBuffers() > 1` (this is also what
+  classifies the group as A1 rather than A2/A3).
+- **Common basic block** — every channel's producer (`getSrcOp()`) and consumer
+  (`getDstOp()`) live in one common block, so the shared `accumCnt` staggering
+  is well-defined.
+
+A violation is a hard error (not a silent fallback) because the buffers are
+already physically aliased; proceeding would emit incorrect synchronization.
+
+#### SMEM vs TMEM accumulation
+
+The `accumCnt` stagger is a **temporal** mechanism: it cycles the channels of a
+group through the *time slots* of one shared multi-buffered circular buffer.
+This is exactly how **SMEM circular reuse** works (the group is multi-buffered).
+
+**TMEM reuse does not use it.** TMEM column-packed reuse groups are
+**single-buffered** (`numBuffers == 1`); each accumulator is placed at its own
+**spatial column** via `buffer.offset` in `replaceBufferReuse`, not in a shared
+time slot. Consequently:
+
+1. `needAccumCntForReuse` returns `false` (single-buffered) → no shared
+   `accumCnt` loop argument is added for the group.
+2. The accumCnt/buffer-index path calls `channelInReuseGroup(channel, config)`
+   with the default `reuseBarrier=true`, which skips groups whose representative
+   has `numBuffers <= 1` → returns `-1`.
+3. With `reuseGroupIdx < 0`, `getBufferIdxAndPhase` takes the plain per-channel
+   branch — **no `+N` stagger across the group.**
+
+So `accumCnt` accumulation is exclusive to the SMEM circular-reuse path. TMEM
+reuse participates in reuse groups only for **spatial packing** (`buffer.offset`)
+and **barrier sharing** (looked up with `reuseBarrier=false`), never for
+cross-group count accumulation.
 
 ### 2. Token/Barrier Sharing
 
@@ -184,6 +252,32 @@ barriers; non-representative channels reuse them. `channelInReuseGroup` looks
 up which group a channel belongs to (returning -1 if none). The `reuseBarrier`
 flag skips groups whose representative has `numBuffers <= 1` (single-buffered
 channels share no circular barrier).
+
+#### Dedicated reuse-WAR tokens (synthetic)
+
+Separately from the shared per-channel tokens above, two reuse hazards are
+guarded by a **freshly minted** token (`ttnvws::CreateTokenOp` at function
+entry) plus a `producer_acquire`/`consumer_release` pair, each tagged
+`WSBarrierAttr::forDstTask(...)` at the *other* task. These are **not** A1–A6
+categories — they are cross-iteration write-after-read edges layered on top of
+buffer reuse:
+
+| Site (`WSCodePartition.cpp`) | Mem | Reuse kind | Hazard guarded |
+|---|---|---|---|
+| operand-D **same-iteration guard** (`guardToken`, ~L3760) | TMEM | same `buffer.id`, same partition, `isSameIterGuard` | the guard channel's `tmem_load` must read before the next iteration's `tmem_store` (MMA operand D) overwrites the accumulator |
+| **staging↔operand** reuse (`reuseToken`, Step 7.5, ~L5530) | SMEM | cross-`buffer.id` via `allocation.reuseTarget`, cross partition | the next persistent tile's operand load must not overwrite the SMEM until the previous tile's staging TMA store has drained (bug #9 / D109859261) |
+
+Both mirror the manual TLX empties-token idiom. They differ only in the
+`bufferIdx`/`phase` source: the guard token uses
+`getBufferIdxAndPhase(numBuffers)`; the Step 7.5 token uses `numBuffers = 1` with
+a loop-carried phase derived from the outer induction variable.
+
+**Redundancy (candidate for a helper).** The two sites currently duplicate (a)
+the func-entry token-mint idiom (`OpBuilder(funcOp)` →
+`setInsertionPointToStart(&funcOp.getBody().front())` → `CreateTokenOp::create`)
+and (b) the acquire-then-release `forDstTask` WAR-pair emission. These could be
+factored into shared helpers (e.g. `createReuseWarToken` +
+`emitTokenWarPair`); not yet done.
 
 ### 3. Buffer Replacement
 
@@ -200,16 +294,66 @@ duplicate physical buffers alive — doubling SMEM and causing `OutOfResources`.
 Iterating groups visits every non-representative channel regardless of merge
 state.
 
-- **SMEM channels**: When the alloc types match, uses direct
-  `replaceUsesOfWith` to swap the alloc result, then erases the old alloc. This
-  generic rewrite also updates `ttng.subtiled_region` operands, which are
-  ordinary users of the alloc result. Type mismatches are skipped (SMEM cannot
-  be reinterpreted like TMEM).
+- **SMEM channels (same buffer.id, same type)**: When the alloc types match,
+  uses direct `replaceUsesOfWith` to swap the alloc result, then erases the
+  old alloc. This generic rewrite also updates `ttng.subtiled_region` operands,
+  which are ordinary users of the alloc result.
+
+- **SMEM channels (same buffer.id, different type)**: Type mismatch within
+  the *same* `bufferId` group is skipped here — `AllocateSharedMemoryNv`
+  resolves these via liveness-based overlap when the two channels are
+  not co-live.
+
+- **SMEM channels with `allocation.reuseTarget = N` (cross-buffer reuse)**:
+  This is a **distinct mechanism from the A1–A6 categories** above — those group
+  channels that share **one `buffer.id`**, whereas here the staging and host keep
+  **different `buffer.id`s** linked only by `reuseTarget`, so they never form a
+  `ReuseGroup`. The distinct `buffer.id`s are **required, not stylistic**: Step
+  7.5 identifies the host operand by resolving `bufferIdToChannel[reuseTarget]`.
+  If the staging shared the host's `buffer.id`, that map (last-wins per id)
+  collides — the target resolves to the staging itself, so `loadTask ==
+  stagingTask` and the cross-tile WAR barrier is **silently dropped** (empirically:
+  the Step 7.5 token + acquire/release vanish, no compensating barrier, and the
+  bug-#9 race returns with no error).
+  Driven by the planner's Phase 3.6 hint (see
+  [TMAStoreWaitPipeline.md §Phase 3.6](TMAStoreWaitPipeline.md#phase-36-inter-buffer-smem-reuse-via-allocationreuetarget)).
+  The staging alloc carries `allocation.reuseTarget = <host bufferId>`;
+  the follow-up staging-reuse merge rewrites the staging alloc into a
+  `memdesc_reinterpret` view of the host alloc (the one with
+  `buffer.id = N`) and erases the staging alloc. The reinterpret is sound
+  because the host alloc's storage covers ≥ `staging.size × staging.numCopies`
+  bytes (guaranteed by `findReuseCandidate`'s size check) **and** the two
+  encodings match (`areReuseEncodingsCompatible`; an encoding-incompatible reuse
+  is never marked, or realization would silently drop it and under-count SMEM —
+  bug #10).
+
+  Because the staging *aliases* the host operand SMEM, the two must never be
+  live at once. On the persistent (outer-tile) path this is a **cross-tile**
+  write-after-read: the next tile's operand load (load task) must not overwrite
+  that SMEM until the previous tile's staging TMA store (staging task) has
+  drained. That edge is enforced by the Step 7.5 barrier in `doCodePartition` —
+  a dedicated single-buffered **cross-partition** reuse token (not the host
+  operand's own barrier, whose consumer warp count differs and would trip
+  `WSLowerToken`'s `consumerWarps == nWarps`): the load task `producer_acquire`s
+  it at the top of the outer loop with a loop-carried phase (from the induction
+  variable), and the staging task `consumer_release`s it at the bottom after the
+  staging stores drain. (An earlier degenerate version emitted a constant
+  `bufferIdx=0`/`phase=0` acquire on the host token that `WSLowerToken` elided to
+  a no-op — harmless on the single-tile path, a cross-tile SMEM race on the
+  persistent path. Bug #9 / D109859261; see
+  [TMAStoreWaitPipeline.md](TMAStoreWaitPipeline.md) and
+  `.llms/rules/partition-scheduler-bugs.md` #9, lit test
+  `ws_code_partition_bwd_persist_staging_war.mlir`.)
 
 - **TMEM channels**: Inserts a `sliceAndReinterpretMDTMEM` op at the
   `buffer.offset` column within the representative's TMEM allocation. If the
   primary representative's type cannot accommodate the slice, other group
   representatives are tried before emitting an error.
+
+Without this reinterpret step for SMEM cross-buffer reuse, `AllocateSharedMemoryNv`
+would place the staging alloc at a fresh offset (it has no awareness of
+`allocation.reuseTarget`), and the planner's Phase 3.6 "free" accounting would
+silently overrun the SMEM budget at codegen time.
 
 ### 4. `allocation.shareGroup` Attribute
 
@@ -231,7 +375,7 @@ about the ordering of `producer_acquire` across the two channels.
 | Mechanism | Condition | Insertion Point |
 |-----------|-----------|-----------------|
 | `ProducerAcquireOp` (token-based) | `consumerBarriers` empty | Before `headProducer` (or `producerAcquireForChannelLoop`) |
-| `WaitBarrierOp` (gen5 inline) | `consumerBarriers` populated | Before the producer, via `desyncTCGen5MMAOp(..., asProducerAcquire=true)` |
+| `WaitBarrierOp` (gen5 inline) | `consumerBarriers` populated | Before the producer, via `desyncMMAv5Op(..., asProducerAcquire=true)` |
 
 The variable `producerAcquireForChannelLoop` already handles the case of
 **forward/backward channel loops** (same alloc, same block, cycle through
@@ -269,19 +413,55 @@ For a reuse group with 2 buffers A and B (`buffer.copy=1`):
 bool verifyReuseGroup2(ReuseGroup *group);
 ```
 
+`verifyReuseGroup2` recognizes only **real** 2-buffer reuse — two channels that
+share the same physical space and reuse it across time. The signal differs by
+memory kind:
+
+- **TMEM**: real reuse iff the two channels' **column ranges overlap**
+  (`[buffer.offset, buffer.offset + numCols)`) **and** there is a
+  consumer→producer **dependency chain** in either direction. Disjoint columns
+  are *spatial packing* (e.g. two independent accumulators side-by-side),
+  materialized by `replaceBufferReuse`'s column slice — they need no
+  cross-channel sync and are **not** treated as a reuse group here. Requiring
+  the chain in addition to overlap means the two accesses are provably
+  temporally ordered (a real reuse, not concurrently-live aliasing) and gives
+  `orderReuseGroup2` a reliable early/late ordering — the same standard SMEM
+  already meets.
+- **SMEM**: real reuse iff there is a consumer→producer **dependency chain** in
+  either direction (e.g. `qk/pp`).
+
+The SMEM **epilogue-subtile** case (producers in the same block, no dependency
+chain) is deliberately **not** handled here — it is the N-buffer path
+(`verifyReuseGroupN`). This split keeps `verifyReuseGroup2` strictly about
+overlapping-space reuse.
+
 Implementation:
 ```
 verifyReuseGroup2(group):
   assert group.channels.size() == 2
   A = group.channels[0], B = group.channels[1]
-  assert A.getNumBuffers() == 1 && B.getNumBuffers() == 1
 
-  // Check dependency chain: A.consumer → B.producer or B.consumer → A.producer
-  hasAtoB = isDependencyChain(A.dstOp, B.srcOp)
-  hasBtoA = isDependencyChain(B.dstOp, A.srcOp)
-  assert (hasAtoB || hasBtoA) // At least one direction
-  return true
+  // Only single-copy buffers are handled.
+  if A.getNumBuffers() != 1 || B.getNumBuffers() != 1:
+    return false
+
+  // TMEM: real reuse iff the column ranges overlap (same space) AND a
+  // consumer->producer dependency chain orders the two (real temporal reuse,
+  // not concurrent aliasing).
+  if A and B are both TMEM:
+    if not tmemReuseGroupOverlaps(group):
+      return false                                    // disjoint = spatial packing
+    return hasDependencyChain(A, B) || hasDependencyChain(B, A)
+
+  // SMEM: real reuse iff a consumer→producer dependency chain exists.
+  return hasDependencyChain(A, B) || hasDependencyChain(B, A)
 ```
+
+`hasDependencyChain(A, B)` walks the transitive users of `A.dstOp` looking for
+`B.srcOp`, and also treats same-block program order (`A.dstOp` before
+`B.srcOp`) as an implicit dependency. `tmemReuseGroupOverlaps` computes each
+channel's column interval from `getTmemAllocSizes(...).numCols` and
+`buffer.offset` and returns true if any two intervals intersect.
 
 #### `orderReuseGroup2`
 
@@ -296,9 +476,16 @@ Implementation:
 ```
 orderReuseGroup2(group):
   A = group.channels[0], B = group.channels[1]
-  if isDependencyChain(A.dstOp, B.srcOp):
+  if hasDependencyChain(A, B):    // A.consumer -> B.producer
     return {A, B}
-  return {B, A}
+  if hasDependencyChain(B, A):
+    return {B, A}
+  // Unreachable for a verified group: verifyReuseGroup2 now requires a chain in
+  // one direction (both SMEM and overlapping TMEM). A group with no chain is an
+  // overlapping-but-unordered (concurrently aliased) pair — a memory-planner
+  // contract violation — so fail loudly instead of guessing a barrier direction
+  // from program order.
+  report_fatal_error("orderReuseGroup2: reuse group has no dependency chain")
 ```
 
 #### `needExplicitReuseWait`
@@ -314,15 +501,14 @@ bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel);
 Implementation:
 ```
 needExplicitReuseWait(earlyChannel, lateChannel):
-  bConsumerOp = getUniqueActualConsumer(lateChannel.dstOp, consumerTaskId)
   aProducerOp = earlyChannel.srcOp
-
-  bConsumerTasks = getAsyncTaskIds(bConsumerOp)
-  aProducerTasks = getAsyncTaskIds(aProducerOp)
-
-  if bConsumerTasks and aProducerTasks share a common taskId:
-    if appearsBefore(aProducerOp, bConsumerOp):
-      return false  // No explicit wait needed (qk/pp case)
+  // Resolve through memdesc_trans etc. — there may be more than one.
+  for bConsumerOp in getActualConsumers(lateChannel.dstOp):
+    if getAsyncTaskIds(bConsumerOp) shares a taskId with getAsyncTaskIds(aProducerOp):
+      // Same partition: program order already serializes the release before
+      // the next acquire.
+      if aProducerOp, bConsumerOp in same block and appearsBefore(aProducerOp, bConsumerOp):
+        return false  // No explicit wait needed (qk/pp case)
 
   return true  // Need explicit wait (dp/dq case)
 ```
@@ -375,7 +561,7 @@ if (producerAcquireForReuse && !producerAcquireForChannelLoop) {
 
 This reuses the existing `producerAcquireForChannelLoop` mechanism which
 flows through to both `ProducerAcquireOp` insertion and gen5 inline barrier
-`desyncTCGen5MMAOp` insertion.
+`desyncMMAv5Op` insertion.
 
 ### Processing Order
 
@@ -509,6 +695,109 @@ Regression test:
 `test/Hopper/WarpSpecialization/ws_code_partition_tmem_packed_reuse_backward.mlir`;
 runtime validation is the FA-fwd-persistent dp kernel determinism check.
 
+### A6 applies only to spatial packing (distinct `buffer.offset`)
+
+The N>2 dispatch checks the A6 hub case **first**, but only when the group is
+**spatial packing** — its channels occupy **≥2 distinct `buffer.offset`s** within
+the owner's columns (e.g. alpha/m_ij/l_i0 at offsets 64/65/66 inside the QK
+accumulator). A group whose channels **all share the same offset** is
+**full-overlap temporal reuse**, not packing, and must NOT enter A6 even though
+its `useC=false` owner satisfies `isWholeAllocationOverwriteReuseOwner`: the hub
+back-edges assume packed siblings live in *different* columns, so applying them to
+a full-overlap group emits **incorrect** synchronization.
+
+Realized case: FA-bwd `{dpT, dq, dsT}` (`buffer.id=5`, all at offset 0). Routed
+to A6 it mis-synchronizes the `dq` overwrite against `dk`'s read of `dsT` →
+wrong `dq` (this is exactly the [BwdTmemReuseSlotHazard](BwdTmemReuseSlotHazard.md)
+class, re-exposed when Nick's A6 landed in `origin/main`). Excluded from A6, the
+group relies on its standard per-channel barriers plus the kernel's dk-before-dq
+ordering, which is correct.
+
+The gate (`WSCodePartition.cpp`, N>2 dispatch): A6 fires only when an
+`isWholeAllocationOverwriteReuseOwner` is present **and** the group spans ≥2
+distinct `buffer.offset`s (`isSpatialPacking`). Note the discriminators that do
+**not** work here: column-range overlap (`tmemReuseGroupOverlaps`) is true for
+both shapes (the owner spans the packed siblings' columns either way), and
+block-based `verifyReuseGroupCrossPartition` is unusable at this stage because
+partitions are still `async_task_id` tags within a single block.
+
+## A5: Cross-Partition Reuse (N ≥ 3, realized as TMEM)
+
+A fifth shape that does **not** fit A1–A4: a single-copy reuse group of **≥ 3
+channels** sharing one **overlapping** buffer, whose producers span **more than
+one partition/block**. It is distinct from every other category:
+
+| | A5 group `{dpT, dq, dsT}` |
+|---|---|
+| A1 SMEM circular | ✗ single-copy, not multi-buffered |
+| A2 2-buffer (`verifyReuseGroup2`) | ✗ 3 channels, not 2 |
+| A3 SMEM epilogue (`verifyReuseGroupN`) | ✗ TMEM, and producers not all same block |
+| A4 TMEM column packing | ✗ columns **overlap** (temporal reuse, not disjoint) |
+
+**Realized case** — FA-bwd config `_BWD_DOT_ATTRS_TMEM`
+(`fused_attention_ws_device_tma.py`): three dots share one TMEM `buffer.id`
+(`dpT.opndD`, `dq.opndD`, `dk.opndA = dsT`). The distinguishing annotation vs
+the default is `dk: "opndA,tmem,1,5"` — `dk` reads `dsT` from the same TMEM
+buffer that `dpT`/`dq` write. The group is formed **by annotation**
+(`FrozenDotAttrs` channel specs pre-assign the shared `buffer.id`), not by the
+overlap/liveness heuristics.
+
+### Predicate
+
+`verifyReuseGroupCrossPartition` (`CodePartitionUtility.cpp`) accepts the group
+iff:
+
+1. **≥ 3 channels**, all **single-copy** (`getNumBuffers() == 1`).
+2. Producers span **> 1 partition** (`relation.first` — the producer
+   `async_task_id`). This is detected by task id, **not** block: at
+   `doCodePartition` the partitions are still `async_task_id` tags within one
+   block, so a block-based test would always see "one block".
+3. The channels admit a **unique total dependency-chain order** —
+   `orderReuseGroupChain(group)` returns a non-empty ordering (channel `i`'s
+   consumer reaches channel `i+1`'s producer via SSA use-def or same-block
+   program order). For `{dpT, dsT, dq}` this is `dpT → dsT → dq`.
+
+If no unique chain order exists the predicate returns false and the group falls
+back to the per-channel barriers.
+
+### Synchronization
+
+Handled inline in `insertAsyncComm` (its own `verifyReuseGroupCrossPartition`
+branch, **decoupled** from the A3 same-block chain — it pushes nothing onto
+`wrapAroundChannelsForReuseSync`). The chain `dpT → dsT → dq` is ordered by
+**inherent edges**, so the shared slot is used strictly in order within a tile,
+and only the cross-iteration WAR needs an explicit barrier:
+
+- **dpT → dsT** is a data dependency (`dsT` is computed from `dpT` in the
+  computation partition), so `dsT`'s write follows `dpT`'s read for free.
+- **dsT → dq** is gemm-partition program order within the same SWP stage (the
+  `dk` MMA reads `dsT` before the `dq` MMA overwrites the slot; consecutive
+  tcgen05 MMAs execute in issue order), so `dq`'s write follows `dsT`'s read for
+  free. (This is why `dk` must be emitted before `dq` — see the accuracy fix.)
+- **cross-iteration WAR** (the only explicit edge): the next tile's first write
+  (`dpT`) must wait for the previous tile's last read (`dq`). Emitted exactly
+  like the 2-buffer **A2** case applied to the chain **endpoints** — early =
+  first (`dpT`), late = last (`dq`): the late channel's `producer_acquire` is
+  relocated ahead of the early channel's producer so the shared slot's empty
+  barrier (flipped by `dq`'s consumer release) gates the `dpT` overwrite, plus an
+  intra-iteration wait of the late writer on the early reader (subsumed by
+  program order; kept for parity with A2).
+
+Because each channel still gets **its own per-channel barrier** and `dsT`'s
+consumer (`dk` MMA) lives in a *different task* than the representative's
+consumer, `createTokenPost` allocates a **dedicated gen5 consumer barrier** for
+that consumer task — otherwise `dsT`'s consumer-release silently drops and `dk`
+deadlocks (the `BwdTmemDotAttrsDeadlock` fix).
+
+### Status / caveats
+
+- A5 enters via the `group->channels.size() > 2` clause of the dispatch gate;
+  `verifyReuseGroupCrossPartition` validates treatability and is checked **before**
+  the A3 `allSameBlock` chain so the cross-partition group does not fall into A3.
+- For the **contract** (bail on unhandled reuse), a size-> 2 group is "handled"
+  iff `verifyReuseGroupN(group) || verifyReuseGroupCrossPartition(group)`; any
+  other size-> 2 group should bail.
+
 ## Key Attributes
 
 | Attribute | Description | Set by | Read by |
@@ -534,7 +823,15 @@ runtime validation is the FA-fwd-persistent dp kernel determinism check.
 | SMEM `buffer.id` assignment | `WSMemoryPlanner.cpp` | Assign `buffer.id` to SMEM allocs |
 | SMEM circular reuse (Phase 4) | `WSMemoryPlanner.cpp` | Form SMEM reuse pairs, maximize copies |
 | TMEM `applyAllocationState` | `WSMemoryPlanner.cpp` | Assign `buffer.id` + `buffer.offset` to TMEM allocs |
-| `verifyReuseGroup2` | `CodePartitionUtility.cpp` | Verify 2-buffer reuse group constraints |
+| `verifyReuseGroup1` | `CodePartitionUtility.cpp` | Verify A1 (SMEM circular reuse): multi-buffered + all producers/consumers in one block |
+| `verifyReuseGroup2` | `CodePartitionUtility.cpp` | Real 2-buffer reuse: TMEM (column overlap AND dependency chain), or SMEM (dependency chain) |
+| `tmemReuseGroupOverlaps` | `CodePartitionUtility.cpp` | True if a TMEM group's channel column ranges overlap (real reuse vs spatial packing) |
 | `orderReuseGroup2` | `CodePartitionUtility.cpp` | Determine early/late channel ordering |
 | `needExplicitReuseWait` | `CodePartitionUtility.cpp` | Check if explicit cross-channel wait is needed |
 | `isWholeAllocationOverwriteReuseOwner` | `CodePartitionUtility.cpp` | Detect a representative whose producer overwrites the whole allocation (needs back-edges to live packed siblings) |
+| `hasDependencyChain` | `CodePartitionUtility.cpp` | True if A's consumer reaches B's producer (transitive or program order) |
+| `verifyReuseGroupN` | `CodePartitionUtility.cpp` | **Live** gate for the SMEM epilogue path: SMEM, single-copy, producers same block, N ≥ 2 |
+| N-buffer sync (epilogue) | `WSCodePartition.cpp` (`insertAsyncComm`) | Inline chain + wrap-around `ProducerAcquireOp` insertion |
+| `orderReuseGroupN` | `CodePartitionUtility.cpp` | Producer-order sort helper — **still unused** (inline does its own sort) |
+| `verifyReuseGroupCrossPartition` | `CodePartitionUtility.cpp` | A5 predicate: cross-partition N≥3 reuse (producers span >1 task) with a unique dependency-chain order (FA-bwd `{dpT,dsT,dq}`) |
+| `orderReuseGroupChain` | `CodePartitionUtility.cpp` | Topologically orders an N-channel single-copy reuse group into one dependency chain (`dpT→dsT→dq`); empty if no unique order |

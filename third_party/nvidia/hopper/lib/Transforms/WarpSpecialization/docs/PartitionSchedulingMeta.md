@@ -77,6 +77,37 @@ Epilogue store ops are independent of these knobs — they always go to
 | Blackwell flex fwd | mergeEpilogue | correction, gemm, load, comp×2 |
 | Hopper FA fwd | mergeCorrection + mergeEpilogue | load, comp×2 |
 | Simple GEMM | separateEpilogueStore | gemm, load, epilogue, epilogue_store |
+| No-MMA reduction (RMS/LayerNorm) | mergeEpilogue + separateEpilogueStore | reduction, load, epilogue_store |
+
+The **No-MMA reduction** layout serves reduction-only kernels (RMS norm,
+LayerNorm, softmax-only) that have **no MMA** and use a plain in-register
+`tt.reduce` (not a TMA-atomic reduce). The `reduction` partition is the default
+(index 0, 4 warps) and holds all tensor compute (square, `tt.reduce`,
+accumulate, the rsqrt/normalize chain). The whole path is gated to
+`mmas.empty()`, so MMA kernels — including the MMA-with-epilogue-reduction case —
+are unaffected. Mechanics:
+
+- **Trigger** (`OpCategorizer::hasComputeAnchorNoMMA`): `mmas.empty()` and the
+  loop nest contains any `triton::ReduceOp`. Drives `hasComputeAnchor` in
+  `createPartitionLayout`.
+- **Reduction first → index 0**: the reduction branch fires for
+  `hasReduction || hasComputeAnchor`, and because it runs before the
+  load/epilogue_store branches it gets index 0 (the default 4-warp group), so
+  `getDefaultPartition()` becomes non-null.
+- **Phase 4 runs** (see the guard exception below): with `defaultPartition ==
+  reductionPartition`, the load-user walk routes the in-loop tensor compute into
+  the reduction partition (there is no Phase 5 for no-MMA kernels).
+- **In-loop epilogue-store anchoring**: the generic anchoring keys on the
+  non-store `epiloguePartition` (null here under `mergeEpilogue`), so a no-MMA
+  gated step anchors in-loop epilogue store ops — the TMA store **and** its
+  `async_tma_store_token_wait` — to `epilogue_store` *before* Phase 4. The
+  staging `local_alloc` stays in reduction, forming the reduction→store SMEM
+  channel.
+- **Scalar-offset fixup**: before serialization, a no-MMA gated fixpoint assigns
+  each still-unannotated value-producing op (e.g. `offs = i * 64`) the union of
+  its partitioned users' ids (`muli` feeding both load and store gets both).
+  These scalar ops are otherwise skipped by `propagatePartitions` yet must carry
+  `ttg.partition` for the `tt.warp_specialize` verifier.
 
 ## Phase 1: Operation Categorization (`OpCategorizer`)
 
@@ -170,8 +201,11 @@ created gets index 0, which becomes the "default" warp group in
 
 1. **Correction** — when `!mergeCorrection && hasCorrection`. Serves as default
    for FA/flex (shared ops, load users go here). Created first → index 0.
-2. **Reduction** — when `!mergeReduction && hasReduction`. Serves as default for
-   bwd. Created first → index 0.
+2. **Reduction** — when `!mergeReduction && (hasReduction || hasComputeAnchor)`.
+   Serves as default for bwd (TMA-atomic reduce) and for no-MMA in-register
+   reduction kernels. `hasComputeAnchor` is true only when `mmas.empty()` and the
+   loop contains a `tt.reduce` (`OpCategorizer::hasComputeAnchorNoMMA`), so it
+   never fires for MMA kernels. Created first → index 0.
 3. **Gemm** — only when MMAv5 ops exist (Blackwell). Hopper `warp_group_dot`
    is not MMAv5, so no gemm partition is created for Hopper.
 4. **Load** — always.
@@ -212,7 +246,10 @@ those ops go to the next available partition in the fallback chain.
    no real correction/epilogue/computation partition exists yet), load-user
    scheduling is **skipped** to prevent transitively pulling the softmax
    chain into the reduction partition. Phase 5's MMA forward walk handles
-   these ops instead.
+   these ops instead. **Exception**: no-MMA reduction kernels (`mmas.empty()`)
+   have no Phase 5, so the guard adds `|| mmas.empty()` and the load-user walk
+   runs — it is exactly how the reduction (default) partition receives its
+   tensor compute (square, `tt.reduce`, accumulate, normalize).
 2. **Correction ops** → correction partition (+ `scheduleUsers` for transitive
    users). `scheduleUsers` walks **forward only** through the use chain
    starting from the correction-categorized op (the `tmem_load` of the PV

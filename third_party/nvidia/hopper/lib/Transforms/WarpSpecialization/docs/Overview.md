@@ -15,7 +15,7 @@ orchestrates sub-passes as function calls within a single monolithic pass:
 ```
 doTaskPartition          (Hopper only; skipped on Blackwell)
   → doTaskIdPropagate
-  → doDataPartition      (Hopper only; skipped on Blackwell)
+  → doDataPartition      (via nvgpu-ws-data-partition when requested)
   → doPingPongPrep       (optional, if pingpongAutoWS is set)
   → doBufferAllocation
   → doMemoryPlanner
@@ -25,9 +25,11 @@ doTaskPartition          (Hopper only; skipped on Blackwell)
   → doLoopSchedulePreprocessing + scheduleLoops  (external, not in this directory)
 ```
 
-On Blackwell, only `doTaskIdPropagate` runs for annotation (task partition and
-data partition are skipped). The task assignments are expected to come from
-an earlier partition scheduling pass (`PartitionSchedulingMeta`).
+On Blackwell, task assignments are expected to come from an earlier partition
+scheduling pass (`PartitionSchedulingMeta`) rather than `doTaskPartition`.
+Data partitioning is not Hopper-only; it can run as the separate
+`nvgpu-ws-data-partition` pass when an explicit data partition factor or warp
+group configuration requires per-consumer slices.
 
 Before `PartitionSchedulingMeta`, the Meta WS backend runs
 `nvgpu-sink-broadcast` to move `tt.broadcast` producer chains next to their
@@ -42,6 +44,20 @@ when AutoWS assigns registers to non-tensor and tensor partitions. If either
 knob is provided from the Python frontend, its value must be divisible by 8 so
 the emitted register allocation matches the backend warp-group granularity.
 
+## Persistent loops (`scf.for` and `scf.while`)
+
+A static-persistent kernel's outer (tile) loop may be either an `scf.for` or an
+`scf.while` (e.g. `while tile_id < num_tiles: ... tile_id += NUM_SMS`). Both are
+first-class: warp-group cloning (`SpecializeWhileOp`), task-id propagation, data
+partitioning, and barrier handling all accept `scf::WhileOp`. The cross-tile
+accumulation-counter threading — seeding/carrying `accumCnt` through the while's
+init operands, before/after block args, `scf.condition`, and `scf.yield`,
+including the direct accumulator channel and reuse-group (subtiled-epilogue
+staging) counters — is described in
+[Accumulation Counters](AccumulationCounters.md#persistent-scfwhile-loops). The
+redundant accumulator zero-store removal that avoids a cross-tile race also
+recognizes the `scf.while` outer loop (same doc).
+
 ## File Map
 
 | File | Function / Pass | Description |
@@ -52,7 +68,7 @@ the emitted register allocation matches the backend warp-group granularity.
 | `WSTaskPartition.cpp` | `doTaskPartition` | Assigns `async_task_id` to anchor ops (loads, dots, stores) — Hopper only |
 | `TaskIdPropagation.cpp` | — | `TaskIdBackwardPropagation` sparse dataflow analysis |
 | `WSTaskIdPropagate.cpp` | `doTaskIdPropagate` | Runs analysis and materializes task IDs |
-| `WSDataPartition.cpp` | `doDataPartition` | Splits ops along M/N dimensions across warp groups — Hopper only |
+| `WSDataPartition.cpp` | `doDataPartition` / `nvgpu-ws-data-partition` | Splits ops along M/N dimensions across warp groups |
 | `PingPong.cpp` | `doPingPongPrep` / `doPingPongSync` | Named barrier insertion for ping-pong scheduling |
 | `WSCodePartition.cpp` | `doBufferAllocation` | Channel discovery and SMEM/TMEM allocation hoisting (pre-pass) |
 | `WSBuffer.cpp` | `appendAccumCntsForOps` | Accumulation counter infrastructure for multi-buffer indexing |

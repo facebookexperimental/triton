@@ -7,7 +7,6 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/Debug.h"
@@ -22,8 +21,6 @@
 
 namespace mlir::triton::gpu {
 
-namespace ttng = mlir::triton::nvidia_gpu;
-
 unsigned DataDependenceGraph::addNode(Operation *op,
                                       const LatencyModel &model) {
   auto info = model.getLatency(op);
@@ -36,6 +33,7 @@ unsigned DataDependenceGraph::addNode(Operation *op,
   node.selfLatency = info.selfLatency;
   node.minWarps = info.minWarps;
   node.occupancy = info.occupancy;
+  node.tmemAllocCols = model.getAccumulatorAllocCols(op);
   nodes.push_back(node);
   opToIdx[op] = idx;
   return idx;
@@ -165,24 +163,19 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
     auto innerLoop = dyn_cast<scf::ForOp>(node.op);
     if (!innerLoop)
       continue;
-    // Find TMEM memdescs written by MMA inside the inner loop.
-    llvm::DenseSet<Value> tmemWritten;
+    // Find accumulator buffers written by an MMA inside the inner loop
+    // (target-specific, via the latency model — e.g. Blackwell TMEM).
+    llvm::DenseSet<Value> accWritten;
     innerLoop.walk([&](Operation *op) {
-      if (isa<triton::nvidia_gpu::TCGen5MMAOp,
-              triton::nvidia_gpu::TCGen5MMAScaledOp>(op)) {
-        // MMA operand 2 is the accumulator (TMEM memdesc).
-        if (op->getNumOperands() > 2)
-          tmemWritten.insert(op->getOperand(2));
-      }
+      if (Value w = model.getAccumulatorWrite(op))
+        accWritten.insert(w);
     });
-    // Find tmem_load ops outside the inner loop that read the same TMEM.
+    // Find ops outside the inner loop that read the same accumulator.
     for (auto &other : ddg.nodes) {
       if (other.idx == node.idx)
         continue;
-      if (!isa<triton::nvidia_gpu::TMEMLoadOp>(other.op))
-        continue;
-      Value tmemSrc = other.op->getOperand(0);
-      if (tmemWritten.count(tmemSrc)) {
+      Value accRead = model.getAccumulatorRead(other.op);
+      if (accRead && accWritten.count(accRead)) {
         ddg.addEdge(node.idx, other.idx, node.latency, /*distance=*/0);
       }
     }
@@ -274,6 +267,28 @@ DataDependenceGraph::computeCriticalPathHeights() const {
   for (unsigned i = 0; i < nodes.size(); ++i)
     computeHeight(i);
   return heights;
+}
+
+void DataDependenceGraph::applyDataPartition(
+    const llvm::DenseMap<Operation *, DataPartitionInfo> &mmaInfo) {
+  if (mmaInfo.empty())
+    return;
+  for (auto &node : nodes) {
+    if (!node.op)
+      continue;
+    auto it = mmaInfo.find(node.op);
+    if (it == mmaInfo.end() || it->second.count <= 1)
+      continue;
+    const DataPartitionInfo &info = it->second;
+    node.partitionCount = info.count;
+    node.partitionDim = info.dim;
+    node.mSize = info.mSize;
+    // The bundle issues `count` MMAs back-to-back on the tensor core, so it
+    // ties up the TC pipeline `count`× as long. Scale occupancy so ResMII
+    // reflects the N hardware issues (the result latency is unchanged).
+    node.occupancy = std::max(pipelineOccupancy(node), 1) *
+                     static_cast<int>(info.count);
+  }
 }
 
 int DataDependenceGraph::computeResMII() const {

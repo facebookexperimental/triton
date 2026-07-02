@@ -89,8 +89,11 @@ An operation can be a channel endpoint if it is:
 The core channel creation logic:
 
 1. For each result of the producer op, collect all **transitive users**
-   (`getTransitiveUsers`) — tracking through `scf::YieldOp` to reach real
-   users across loop iterations.
+   (`getTransitiveUsers`) — tracking through loop-carried values to reach real
+   users across iterations. For `scf.for`, this follows `scf.yield` to loop
+   results. For `scf.while`, after-region `scf.yield` values feed the next
+   iteration's before-region arguments, while `scf.condition` forwarded
+   operands feed while results and after-region arguments.
 2. Filter by **dominance**: only consider users properly dominated by the
    producer.
 3. For each user in a **different partition** (different `async_task_id`),
@@ -165,9 +168,10 @@ Creates synchronization tokens for each channel group:
 - For each consumer group, creates a `CreateTokenOp` with `numBuffers` slots.
 - **TMA barrier pre-allocation**: When any channel in a group has a TMA
   producer, an mbarrier array is pre-allocated via `BarrierAllocOp`.
-- **Gen5 inline barriers**: For `TCGen5MMAOp` consumers, decides whether to
-  use the MMA op's built-in completion barrier instead of a separate token
-  (checked via `ProducerIsGen5`).
+- **Gen5 inline barriers**: For MMAv5 consumers (`TCGen5MMAOp` and
+  `TCGen5MMAScaledOp`), decides whether to use the MMA op's built-in
+  completion barrier instead of a separate token (checked via
+  `ProducerIsGen5`).
 - Results are stored in a `CommChannel` struct per channel, containing
   `tokens` (per consumer task ID), optional `producerBarrier` (for TMA/gen5),
   and optional `consumerBarriers` (for gen5 inline barriers).
@@ -189,8 +193,8 @@ detailed decision tree, code paths, and a worked FA BWD example.
    - `ProducerCommitOp` after the producer (signal data is ready)
    - `ConsumerWaitOp` before the consumer (wait for data)
    - `ConsumerReleaseOp` after the consumer (signal buffer is free)
-4. **`desyncTCGen5MMAOp`**: Makes `TCGen5MMAOp` fully asynchronous by
-   attaching a completion barrier and creating a `WaitBarrierOp`.
+4. **`desyncMMAv5Op`**: Makes MMAv5 ops fully asynchronous by attaching a
+   completion barrier and creating a `WaitBarrierOp`.
 5. **Consumer release placement**: `consumerReleaseHeuristic` uses
    post-dominance analysis to find optimal placement.
 6. **Data-partitioned commit replacement**: In data-partitioned loops

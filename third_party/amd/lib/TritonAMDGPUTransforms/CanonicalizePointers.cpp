@@ -464,8 +464,8 @@ struct FatPointers {
 
     friend bool operator==(const FatPtrAttrs &lhs, const FatPtrAttrs &rhs) {
       return lhs.canNarrow == rhs.canNarrow &&
-             lhs.attributes == rhs.attributes &&
-             lhs.smallTensorBase == rhs.smallTensorBase;
+             lhs.isSmallTensor == rhs.isSmallTensor &&
+             lhs.attributes.getArrayRef() == rhs.attributes.getArrayRef();
     }
 
     friend bool operator!=(const FatPtrAttrs &lhs, const FatPtrAttrs &rhs) {
@@ -476,20 +476,17 @@ struct FatPointers {
                                  const FatPtrAttrs &rhs) {
       FatPtrAttrs result;
       result.canNarrow = lhs.canNarrow && rhs.canNarrow;
-      for (auto &[key, val] : lhs.attributes) {
-        auto it = rhs.attributes.find(key);
-        if (it != rhs.attributes.end() && it->second == val)
-          result.attributes[key] = val;
+      result.isSmallTensor = lhs.isSmallTensor && rhs.isSmallTensor;
+      for (const auto &attr : lhs.attributes) {
+        auto it = rhs.attributes.find(attr.first);
+        if (it != rhs.attributes.end() && it->second == attr.second)
+          result.attributes[attr.first] = attr.second;
       }
-      if (lhs.smallTensorBase && lhs.smallTensorBase == rhs.smallTensorBase)
-        result.smallTensorBase = lhs.smallTensorBase;
       return result;
     }
 
-    llvm::DenseMap<StringRef, Attribute> attributes;
-    // If the fat-pointer points to somewhere in a small-tensor, keep track the
-    // base of the tensor.
-    Value smallTensorBase;
+    llvm::SmallMapVector<StringRef, Attribute, 2> attributes;
+    bool isSmallTensor = false;
     bool canNarrow = false;
   };
 
@@ -579,7 +576,7 @@ Value createTensorPointer(RewriterBase &rewriter, Value basePtr, Value offset,
     auto addPtrOp =
         tt::AddPtrOp::create(rewriter, loc, basePtr.getType(), basePtr, offset);
     for (const auto &attribute : fatPtrAttrs.attributes)
-      addPtrOp->setAttr(attribute.getFirst(), attribute.getSecond());
+      addPtrOp->setAttr(attribute.first, attribute.second);
     return addPtrOp.getResult();
   }
 
@@ -601,7 +598,7 @@ Value createTensorPointer(RewriterBase &rewriter, Value basePtr, Value offset,
       tt::AddPtrOp::create(rewriter, loc, tensorPtrType, tensorPtr, offset);
 
   for (const auto &attribute : fatPtrAttrs.attributes)
-    addPtrOp->setAttr(attribute.getFirst(), attribute.getSecond());
+    addPtrOp->setAttr(attribute.first, attribute.second);
   return addPtrOp.getResult();
 }
 
@@ -762,7 +759,7 @@ public:
     rewriter.setInsertionPoint(addPtrOp);
 
     if (fatPtrs.contains({fatPtrBase, fatPtrOffset}) &&
-        fatPtrs.at({fatPtrBase, fatPtrOffset}).smallTensorBase)
+        fatPtrs.at({fatPtrBase, fatPtrOffset}).isSmallTensor)
       return rewriteSmallTensorPtr(addPtrOp, adaptor, rewriter);
 
     // Query all discardable attributes that we want to preserve
@@ -878,7 +875,7 @@ private:
     const auto &oldAttr = fatPtrs.at({fatPtrBase, fatPtrOffset});
 
     LDBG("smal-tensor addPtr: " << addPtrOp);
-    LDBG("   - with tensor-base: " << oldAttr.smallTensorBase);
+    LDBG("   - isSmallTensor: " << oldAttr.isSmallTensor);
     LDBG("   - with originl offset: " << origOffset);
     LDBG("   - fatPtr base: " << fatPtrBase);
     LDBG("   - fatPtr offst: " << fatPtrOffset);
@@ -1458,12 +1455,10 @@ public:
                                              selectOp.getCondition(),
                                              fatPtrTrue[1], fatPtrFalse[1]);
 
-    assert((fatPtrs.at({fatPtrTrue[0], fatPtrTrue[1]}) ==
-            fatPtrs.at({fatPtrFalse[0], fatPtrFalse[1]})) &&
-           "expected can narrow to be the same for both fatPtrT and fatPtrF");
-
     rewriter.replaceOpWithMultiple(selectOp, {{newBase, newOffset}});
-    fatPtrs[{newBase, newOffset}] = fatPtrs.at({fatPtrTrue[0], fatPtrTrue[1]});
+    fatPtrs[{newBase, newOffset}] = FatPointers::FatPtrAttrs::intersect(
+        fatPtrs.at({fatPtrTrue[0], fatPtrTrue[1]}),
+        fatPtrs.at({fatPtrFalse[0], fatPtrFalse[1]}));
 
     return success();
   }
@@ -1859,7 +1854,7 @@ struct InitFuncPtrArgs : OpRewritePattern<tt::FuncOp> {
       rewriter.replaceAllUsesExcept(arg, dummyCast.getResult(0), dummyCast);
       fatPtrs[{arg, zeroOffset}].canNarrow = true;
       if (bitness != 64)
-        fatPtrs[{arg, zeroOffset}].smallTensorBase = arg;
+        fatPtrs[{arg, zeroOffset}].isSmallTensor = true;
     }
 
     newOp->setDiscardableAttr(kInitFuncArgsRewritten, rewriter.getUnitAttr());

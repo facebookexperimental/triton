@@ -37,6 +37,22 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
+static bool isWarpSpecializeBarrierAlloc(Value value) {
+  auto alloc = dyn_cast_or_null<ttg::LocalAllocOp>(value.getDefiningOp());
+  return alloc && alloc->hasAttr(kWarpSpecializeGeneratedBarrierAttrName);
+}
+
+static void invalidateBarrierAlloc(OpBuilder &builder, Value barrierAlloc) {
+  auto barrierType = cast<ttg::MemDescType>(barrierAlloc.getType());
+  int64_t numBarriers = barrierType.getShape().front();
+  assert(numBarriers > 0 && "expected at least one barrier");
+  for (int64_t i = 0; i < numBarriers; ++i) {
+    Value barrierView = mlir::triton::createSingleBufferView(
+        builder, barrierAlloc, static_cast<int>(i));
+    ttng::InvalBarrierOp::create(builder, barrierAlloc.getLoc(), barrierView);
+  }
+}
+
 Operation *SpecializeOp(Operation *op, IRMapping &mapping,
                         OpBuilderWithAsyncTaskIds &builder,
                         AsyncTaskId asyncTaskId);
@@ -92,6 +108,17 @@ static bool isYieldedValueAvailableForTask(Value value,
         forOp.getInitArgs()[argNumber - forOp.getNumInductionVars()];
     if (Operation *def = initArg.getDefiningOp())
       return hasAsyncTaskId(def, asyncTaskId);
+  } else if (auto whileOp = dyn_cast<scf::WhileOp>(owner)) {
+    if (blockArg.getOwner() == whileOp.getBeforeBody()) {
+      Value initArg = whileOp.getInits()[blockArg.getArgNumber()];
+      if (Operation *def = initArg.getDefiningOp())
+        return hasAsyncTaskId(def, asyncTaskId);
+    } else if (blockArg.getOwner() == whileOp.getAfterBody()) {
+      Value forwarded =
+          whileOp.getConditionOp().getArgs()[blockArg.getArgNumber()];
+      if (Operation *def = forwarded.getDefiningOp())
+        return hasAsyncTaskId(def, asyncTaskId);
+    }
   }
 
   return false;
@@ -412,6 +439,78 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
   return newForOp;
 }
 
+Operation *SpecializeWhileOp(scf::WhileOp whileOp, IRMapping &mapping,
+                             OpBuilderWithAsyncTaskIds &builder,
+                             AsyncTaskId asyncTaskId) {
+  SmallVector<Value> newInits;
+  for (Value init : whileOp.getInits())
+    newInits.push_back(mapping.lookupOrDefault(init));
+
+  builder.setLoopScheduleInfoFromOp(whileOp);
+  auto newWhileOp = builder.createWithAsyncTaskIds<scf::WhileOp>(
+      whileOp.getLoc(), whileOp->getResultTypes(), newInits);
+  builder.clearLoopScheduleInfo();
+  for (auto attr : whileOp->getAttrs()) {
+    if (attr.getName() != "async_task_id")
+      newWhileOp->setAttr(attr.getName(), attr.getValue());
+  }
+
+  SmallVector<Type> beforeTypes;
+  for (Value init : newInits)
+    beforeTypes.push_back(init.getType());
+  SmallVector<Type> afterTypes(whileOp->getResultTypes());
+  SmallVector<Location> beforeLocs(beforeTypes.size(), whileOp.getLoc());
+  SmallVector<Location> afterLocs(afterTypes.size(), whileOp.getLoc());
+  if (newWhileOp.getBefore().empty())
+    newWhileOp.getBefore().emplaceBlock();
+  if (newWhileOp.getAfter().empty())
+    newWhileOp.getAfter().emplaceBlock();
+  newWhileOp.getBeforeBody()->addArguments(beforeTypes, beforeLocs);
+  newWhileOp.getAfterBody()->addArguments(afterTypes, afterLocs);
+
+  IRMapping localMapping = mapping;
+  for (auto [oldArg, newArg] :
+       llvm::zip(whileOp.getBeforeArguments(), newWhileOp.getBeforeArguments()))
+    localMapping.map(oldArg, newArg);
+  for (auto [oldArg, newArg] :
+       llvm::zip(whileOp.getAfterArguments(), newWhileOp.getAfterArguments()))
+    localMapping.map(oldArg, newArg);
+
+  OpBuilderWithAsyncTaskIds whileBuilder(whileOp.getContext());
+  whileBuilder.setAsynTaskIdsFromArray({asyncTaskId});
+
+  whileBuilder.setInsertionPointToStart(newWhileOp.getBeforeBody());
+  for (Operation &op : whileOp.getBeforeBody()->without_terminator())
+    SpecializeOp(&op, localMapping, whileBuilder, asyncTaskId);
+  auto condOp = whileOp.getConditionOp();
+  SmallVector<Value> condArgs;
+  for (Value arg : condOp.getArgs())
+    condArgs.push_back(localMapping.lookupOrDefault(arg));
+  whileBuilder.setLoopScheduleInfoFromOp(condOp);
+  whileBuilder.createWithAsyncTaskIds<scf::ConditionOp>(
+      condOp.getLoc(), localMapping.lookupOrDefault(condOp.getCondition()),
+      condArgs);
+  whileBuilder.clearLoopScheduleInfo();
+
+  whileBuilder.setInsertionPointToStart(newWhileOp.getAfterBody());
+  for (Operation &op : whileOp.getAfterBody()->without_terminator())
+    SpecializeOp(&op, localMapping, whileBuilder, asyncTaskId);
+  auto yieldOp = whileOp.getYieldOp();
+  SmallVector<Value> yieldArgs;
+  for (Value arg : yieldOp.getOperands())
+    yieldArgs.push_back(localMapping.lookupOrDefault(arg));
+  whileBuilder.setLoopScheduleInfoFromOp(yieldOp);
+  whileBuilder.createWithAsyncTaskIds<scf::YieldOp>(yieldOp.getLoc(),
+                                                    yieldArgs);
+  whileBuilder.clearLoopScheduleInfo();
+
+  for (auto [oldResult, newResult] :
+       llvm::zip(whileOp.getResults(), newWhileOp.getResults()))
+    mapping.map(oldResult, newResult);
+
+  return newWhileOp;
+}
+
 Operation *SpecializeOp(Operation *op, IRMapping &mapping,
                         OpBuilderWithAsyncTaskIds &builder,
                         AsyncTaskId asyncTaskId) {
@@ -438,6 +537,8 @@ Operation *SpecializeOp(Operation *op, IRMapping &mapping,
       return SpecializeIfOp(ifOp, mapping, builder, asyncTaskId);
     } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       return SpecializeForOp(forOp, mapping, builder, asyncTaskId);
+    } else if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
+      return SpecializeWhileOp(whileOp, mapping, builder, asyncTaskId);
     } else if (auto reduceOp = dyn_cast<triton::ReduceOp>(op)) {
       Operation *newOp = builder.clone(*op, mapping);
       // recursively set async task ids for child ops
@@ -624,7 +725,7 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
 
   // Copy partition types attribute from the loop to the WarpSpecializeOp.
   // This is needed by OptimizePartitionWarps for type-aware warp assignment.
-  funcOp.walk([&](scf::ForOp forOp) {
+  funcOp.walk([&](LoopLikeOpInterface forOp) {
     if (auto typesAttr =
             forOp->getAttrOfType<ArrayAttr>(kPartitionTypesAttrName)) {
       wsOp->setAttr(kPartitionTypesAttrName, typesAttr);
@@ -633,7 +734,7 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
 
   // Copy partition types attribute from the loop to the WarpSpecializeOp.
   // This is needed by OptimizePartitionWarps for type-aware warp assignment.
-  funcOp.walk([&](scf::ForOp forOp) {
+  funcOp.walk([&](LoopLikeOpInterface forOp) {
     if (auto typesAttr =
             forOp->getAttrOfType<ArrayAttr>(kPartitionTypesAttrName)) {
       wsOp->setAttr(kPartitionTypesAttrName, typesAttr);
@@ -694,6 +795,21 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
           if (usedInPartition) {
             Value initArg = forOp.getInitArgs()[resIdx];
             mapping.map(result, initArg);
+          }
+        }
+      } else if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
+        for (unsigned resIdx = 0; resIdx < whileOp.getNumResults(); ++resIdx) {
+          auto result = whileOp.getResult(resIdx);
+          bool usedInPartition = false;
+          for (Operation *user : result.getUsers()) {
+            if (hasAsyncTaskId(user, asyncTaskId)) {
+              usedInPartition = true;
+              break;
+            }
+          }
+          if (usedInPartition) {
+            Value forwarded = whileOp.getConditionOp().getArgs()[resIdx];
+            mapping.map(result, forwarded);
           }
         }
       }
@@ -817,6 +933,29 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
     }
 
     op->erase();
+  }
+}
+
+void invalidateWarpSpecializeBarriers(triton::FuncOp funcOp) {
+  SmallVector<ttg::WarpSpecializeOp> wsOps;
+  funcOp.walk([&](ttg::WarpSpecializeOp wsOp) { wsOps.push_back(wsOp); });
+
+  for (ttg::WarpSpecializeOp wsOp : wsOps) {
+    SetVector<Value> barrierAllocs;
+    auto partitionOp = wsOp.getPartitionOp();
+    for (Value operand : partitionOp->getOperands()) {
+      if (!isWarpSpecializeBarrierAlloc(operand))
+        continue;
+      barrierAllocs.insert(operand);
+    }
+
+    if (barrierAllocs.empty())
+      continue;
+
+    ImplicitLocOpBuilder builder(wsOp.getLoc(), wsOp);
+    builder.setInsertionPointAfter(wsOp);
+    for (Value barrierAlloc : barrierAllocs)
+      invalidateBarrierAlloc(builder, barrierAlloc);
   }
 }
 

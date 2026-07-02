@@ -106,7 +106,7 @@ static ttng::TMEMAllocOp findBaseTMEMAlloc(Value desc) {
 /// This function finds TMEMStoreOp (initialization) before the loop
 /// containing the MMA and assigns async_task_id to it if not already set.
 static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
-  funcOp.walk([&](ttng::TCGen5MMAOp mmaOp) {
+  funcOp.walk([&](ttng::MMAv5OpInterface mmaOp) {
     // Step 1: Check if the MMA op has a task_id set.
     auto mmaTaskIds = getAsyncTaskIds(mmaOp);
     if (mmaTaskIds.empty())
@@ -114,16 +114,16 @@ static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
 
     LDBG("Found MMA op with task_id: " << mmaOp);
 
-    // Step 2: Traverse operand D to find the TMEM alloc.
-    Value dOperand = mmaOp.getD();
+    // Step 2: Traverse the accumulator operand to find the TMEM alloc.
+    Value dOperand = mmaOp.getAccumulator();
     auto tmemAllocOp = findBaseTMEMAlloc(dOperand);
     if (!tmemAllocOp)
       return;
 
-    // Find the for loop containing the MMA
-    auto forOp = mmaOp->getParentOfType<scf::ForOp>();
-    if (!forOp) {
-      LDBG("MMA op is not inside a scf.for loop");
+    // Find the loop containing the MMA
+    auto loop = mmaOp->getParentOfType<LoopLikeOpInterface>();
+    if (!loop) {
+      LDBG("MMA op is not inside a loop");
       return;
     }
 
@@ -134,7 +134,7 @@ static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
         continue;
 
       // Check if this store is outside and before the loop
-      if (forOp->isProperAncestor(storeOp) || !appearsBefore(storeOp, forOp))
+      if (loop->isProperAncestor(storeOp) || !appearsBefore(storeOp, loop))
         continue;
 
       // Find the earliest user with an async task ID to use as the source.
@@ -224,8 +224,9 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
   // assume this is for the inputs and can state this as needed.
   funcOp.walk([&](LLVM::AssumeOp op) { setAsyncTaskIds(op, allTasks); });
 
-  // Mark all forOps with all async tasks. We assume DCE can
-  // prune any unused loops. Also propagate to loop bounds (start, stop, step).
+  // Mark all loops with all async tasks. We assume DCE can prune any unused
+  // loops. Also propagate to scf.for loop bounds (start, stop, step) since
+  // they are outside the loop body.
   funcOp.walk([&](scf::ForOp op) {
     setAsyncTaskIds(op, allTasks);
     if (auto *defOp = op.getLowerBound().getDefiningOp())
@@ -235,6 +236,7 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
     if (auto *defOp = op.getStep().getDefiningOp())
       addAsyncTaskIds(defOp, allTasks);
   });
+  funcOp.walk([&](scf::WhileOp op) { setAsyncTaskIds(op, allTasks); });
 
   SymbolTableCollection symbolTable;
   Operation *op = funcOp.getOperation();
