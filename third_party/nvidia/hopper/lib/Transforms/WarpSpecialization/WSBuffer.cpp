@@ -287,13 +287,23 @@ static int64_t getReuseGroupStride(ReuseGroup *group) {
   }
   if (!sub)
     return 1;
-  // Count buffer-slot consumptions inside one (not-yet-replicated) tile body.
-  int64_t perTile = 0;
+  // Count distinct staging-slot lifecycles per tile (not raw buffer-touching
+  // ops). A slot is consumed once per tile: a local_store writes it and a
+  // paired async_tma_copy / local_load reads the SAME slot. In the same-task
+  // (separate_epilogue_store=False) epilogue the store and its TMA copy are
+  // interleaved into ONE region (see GenerateSubtiledRegion
+  // collectPerTileChain), so the body has both a write and a read of the one
+  // slot -- counting both would double the stride. Count writes (slot
+  // acquisitions); a consumer-only region (cross-task epilogue) has no write,
+  // so fall back to counting reads.
+  int64_t writes = 0, reads = 0;
   for (Operation &op : sub.getTileRegion().front().without_terminator()) {
-    if (isa<ttg::LocalStoreOp, ttng::AsyncTMACopyLocalToGlobalOp,
-            ttg::LocalLoadOp>(&op))
-      ++perTile;
+    if (isa<ttg::LocalStoreOp>(&op))
+      ++writes;
+    else if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttg::LocalLoadOp>(&op))
+      ++reads;
   }
+  int64_t perTile = writes > 0 ? writes : reads;
   if (perTile == 0)
     perTile = 1;
   assert(perTile == 1 &&
@@ -857,7 +867,12 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
   }
   // Handle reuse groups.
   for (unsigned idx = 0; idx < config->getGroupSize(); ++idx) {
-    if (config->getGroup(idx)->channels.size() <= 1)
+    // A collapsed both-subtiled channel is the sole member of its group but
+    // still carries a shared accumCnt (numTiles stride); keep it. This must
+    // match getAccumCnts / getReuseChannels, which also special-case size-1
+    // subtiled groups, or the loop arg count and accumCnt indices disagree.
+    if (config->getGroup(idx)->channels.size() <= 1 &&
+        !channelIsSubtiled(config->getGroup(idx)->channels[0]))
       continue;
     if (config->getGroup(idx)->channels[0]->getNumBuffers() <= 1)
       continue;

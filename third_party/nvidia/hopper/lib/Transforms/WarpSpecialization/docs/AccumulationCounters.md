@@ -82,6 +82,12 @@ number of buffer slots that channel consumes in one iteration:
   counter advances by **numTiles** (`getReuseGroupStride` →
   `getAccumForReuseGroup`); the subtile index math is then just
   `accumCnt + tileIdx` (see [Subtile Operator](SubtileOperator.md)).
+  `getReuseGroupStride` derives the per-tile factor by counting staging-slot
+  *lifecycles* in the tile body (writes, falling back to reads), **not** raw
+  buffer-touching ops: a same-task interleaved tile body
+  (`separate_epilogue_store=False`) holds both a `local_store` and an
+  `async_tma_copy` of the **same** slot, so counting both would wrongly double the
+  stride.
 
 > A loop-scoped increment (returning numTiles whenever the loop contains *any*
 > `SubtiledRegionOp`) is wrong: it stamps the subtile stride onto co-resident
