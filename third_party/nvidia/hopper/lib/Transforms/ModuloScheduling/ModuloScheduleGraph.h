@@ -144,9 +144,9 @@ struct ScheduleNode {
   llvm::SmallVector<int, 4> replicatedGroups;
 
   // Pass A.5 data partitioning (carried from DDGNode). partitionCount > 1 marks
-  // a partitioned MMA bundle: the emitter fans it into partitionCount async_dots
-  // slicing mSize rows along partitionDim into per-group accumulators. Default
-  // 1 = unpartitioned.
+  // a partitioned MMA bundle: the emitter fans it into partitionCount
+  // async_dots slicing mSize rows along partitionDim into per-group
+  // accumulators. Default 1 = unpartitioned.
   unsigned partitionCount{1};
   unsigned partitionDim{0}; // 0 = M, 1 = N
   unsigned mSize{0};        // per-partition size along partitionDim

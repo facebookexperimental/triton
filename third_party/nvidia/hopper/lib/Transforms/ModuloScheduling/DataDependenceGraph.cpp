@@ -286,8 +286,8 @@ void DataDependenceGraph::applyDataPartition(
     // The bundle issues `count` MMAs back-to-back on the tensor core, so it
     // ties up the TC pipeline `count`× as long. Scale occupancy so ResMII
     // reflects the N hardware issues (the result latency is unchanged).
-    node.occupancy = std::max(pipelineOccupancy(node), 1) *
-                     static_cast<int>(info.count);
+    node.occupancy =
+        std::max(pipelineOccupancy(node), 1) * static_cast<int>(info.count);
   }
 }
 
