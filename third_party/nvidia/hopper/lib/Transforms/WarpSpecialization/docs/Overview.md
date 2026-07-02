@@ -44,6 +44,20 @@ when AutoWS assigns registers to non-tensor and tensor partitions. If either
 knob is provided from the Python frontend, its value must be divisible by 8 so
 the emitted register allocation matches the backend warp-group granularity.
 
+## Persistent loops (`scf.for` and `scf.while`)
+
+A static-persistent kernel's outer (tile) loop may be either an `scf.for` or an
+`scf.while` (e.g. `while tile_id < num_tiles: ... tile_id += NUM_SMS`). Both are
+first-class: warp-group cloning (`SpecializeWhileOp`), task-id propagation, data
+partitioning, and barrier handling all accept `scf::WhileOp`. The cross-tile
+accumulation-counter threading — seeding/carrying `accumCnt` through the while's
+init operands, before/after block args, `scf.condition`, and `scf.yield`,
+including the direct accumulator channel and reuse-group (subtiled-epilogue
+staging) counters — is described in
+[Accumulation Counters](AccumulationCounters.md#persistent-scfwhile-loops). The
+redundant accumulator zero-store removal that avoids a cross-tile race also
+recognizes the `scf.while` outer loop (same doc).
+
 ## File Map
 
 | File | Function / Pass | Description |
@@ -118,3 +132,4 @@ the emitted register allocation matches the backend warp-group granularity.
 - [Utilities](Utilities.md) — `OpBuilderWithAsyncTaskIds`, task ID helpers, location utilities
 - [Memory Planner Visualization](MemoryPlannerVisualization.md) — debug DOT graph tools
 - [TMA Store Wait Pipeline](TMAStoreWaitPipeline.md) — annotation, reordering, and lowering of TMA store waits
+- [Debugging Accuracy / Deadlocks](DebuggingAccuracyAndDeadlocks.md) — triage process for AutoWS wrong-results / hang bugs (tools, skills, methodology)

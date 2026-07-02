@@ -1580,6 +1580,27 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
                 break
         if sub_count > 1 and sub_n_size > 0 and len(shape) >= 2:
             shape = [shape[0], sub_n_size]
+        # Pass A.5: a data-partitioned accumulator stores one (m_size, BN) group
+        # at a time reusing a single staging buffer — shrink c_smem to
+        # (m_size, BN). Halves the epilogue SMEM so deeper operand rings fit.
+        part_m = 0
+        for lp in g.loops:
+            for b in lp.schedule.buffers:
+                if b.kind == "tmem" and b.partition_count > 1:
+                    part_m = b.m_size
+                    break
+            if part_m:
+                break
+        if part_m and len(shape) >= 2:
+            # A.5 and A.7 both reshape this staging buffer; the epilogue path
+            # treats them as mutually exclusive (`_find_partition_chain` runs
+            # only `if not sub_info`). Assert that here so the shrink is a
+            # load-bearing invariant rather than an incidental one.
+            assert sub_count <= 1, (
+                "Pass A.5 (data partition) and Pass A.7 (epilogue subtile) "
+                "both reshaped c_smem; they are mutually exclusive by design"
+            )
+            shape = [part_m, shape[1]]
         shape_str = ", ".join(str(d) for d in shape)
         lines += f"c_smem = tlx.local_alloc(({shape_str}), {dtype}, 1)"
     lines += ""
@@ -4010,11 +4031,23 @@ def _find_partition_chain(
             break
     if chain_start < 0:
         return None
-    chain_end = chain_start + 1
+    # The chain is tmem_load → (truncf | convert_layout)* → descriptor_store.
+    # If the store is present in this WG's nodes, end the chain just past it.
+    # If it isn't (the scheduler placed the store in a different WG), bound
+    # chain_end at the last recognized cast/convert instead of running to the
+    # end of the WG — otherwise unrelated trailing nodes get swallowed into the
+    # chain and silently dropped. The caller splices the cross-WG store back in.
+    cast_kinds = ("ttng.tmem_load", "arith.truncf", "ttg.convert_layout")
+    store_idx = -1
+    last_cast_idx = chain_start
     for j in range(chain_start, len(outer_nodes)):
-        chain_end = j + 1
-        if outer_nodes[j].op_kind == "tt.descriptor_store":
+        kind = outer_nodes[j].op_kind
+        if kind == "tt.descriptor_store":
+            store_idx = j
             break
+        if kind in cast_kinds:
+            last_cast_idx = j
+    chain_end = (store_idx + 1) if store_idx >= 0 else (last_cast_idx + 1)
     return chain_start, chain_end, pcount, msize
 
 
@@ -4029,31 +4062,34 @@ def _emit_outer_epilogue_partitioned(
     """Emit Pass A.5 partitioned epilogue chain inside the outer loop body.
 
     The kernel's c_desc is still (BM, BN), but the TMEM accumulator was
-    split into N (m_size, BN) groups. We load each group, cast to the
-    store dtype, `tl.cat` them back along M into a (BM, BN) tile, then
-    issue a single descriptor_store against the full tile.
+    split into N (m_size, BN) groups. Each group is handled independently:
+    load its (m_size, BN) accumulator, cast to the store dtype, stage it
+    into a single reused (m_size, BN) c_smem[0], and TMA-store it at the
+    group's M row offset (base_row + gi*m_size). Reusing one c_smem buffer
+    is safe because async_descriptor_store_wait drains the prior group's
+    store before the next group overwrites it.
 
         tlx.barrier_wait(acc_tmem_full[tmem_buf], tmem_phase)
-        acc_g0 = tlx.local_load(acc_tmem_g0[tmem_buf]); trunc_g0 = ...
-        acc_g1 = tlx.local_load(acc_tmem_g1[tmem_buf]); trunc_g1 = ...
+        for gi in range(N):                       # unrolled below
+            acc_gi   = tlx.local_load(acc_tmem_g{gi}[tmem_buf])
+            trunc_gi = acc_gi.to(store_dtype)
+            tlx.local_store(c_smem[0], trunc_gi)
+            tlx.fence_async_shared()
+            tlx.async_descriptor_store(
+                c_desc, c_smem[0], [row + gi*m_size, col])
+            tlx.async_descriptor_store_wait(0)
         tlx.barrier_arrive(acc_tmem_empty[tmem_buf], 1)
-        c_full = tl.cat([trunc_g0, trunc_g1], dim=0)  # (BM, BN)
-        tlx.local_store(c_smem[0], c_full)
-        tlx.fence_async_shared()
-        tlx.async_descriptor_store(c_desc, c_smem[0], [m, n])
-        tlx.async_descriptor_store_wait(0)
 
-    This keeps c_desc and c_smem at the full (BM, BN) shape so the
-    launcher's `c_desc.block_shape = (BM, BN)` contract is unchanged.
+    c_desc stays (BM, BN) so the launcher's `c_desc.block_shape = (BM, BN)`
+    contract is unchanged; c_smem is shrunk to (m_size, BN) at its alloc
+    site since only one group's tile is staged at a time.
     """
-    lines += f"# Pass A.5 partitioned epilogue (N={N}, m_size={m_size})"
+    lines += f"# Pass A.5 partitioned epilogue (N={N}, m_size={m_size}, per-group c_smem)"
     lines += "tlx.barrier_wait(acc_tmem_full[tmem_buf], tmem_phase)"
-    # Per-group: load → cast → local_store into c_smem at per-group M-slice.
-    # Defer the single descriptor_store + drain until after all groups have
-    # written into c_smem. Avoids a register-level cat.
-    store_desc: str | None = None
-    store_offsets: list[str] = []
-    bn = 0
+    # Each group loads its (m_size, BN) accumulator, casts, writes a single
+    # reused (m_size, BN) c_smem buffer, and TMA-stores it at the group's M row
+    # offset (base + gi*m_size). Reusing one c_smem is safe: the
+    # async_descriptor_store_wait drains the prior group before the next writes.
     for gi in range(N):
         for n in chain_nodes:
             op = g.ops.get(n.op_ref) if n.op_ref else None
@@ -4086,39 +4122,28 @@ def _emit_outer_epilogue_partitioned(
                 rctx.op_var[op.op_id] = _render_operand(op.operands[0], rctx)
                 continue
             if op.kind == "tt.descriptor_store":
-                if store_desc is None:
-                    store_desc = _render_operand(op.operands[0], rctx)
-                    store_offsets = [_render_operand(o, rctx) for o in op.operands[2:]]
-                    # BN from descriptor block shape (second op operand).
-                    if isinstance(op.operands[0], OpRef):
-                        desc_op = g.ops.get(op.operands[0].op_id)
-                        if desc_op and desc_op.result_types:
-                            bs = _parse_desc_block_shape(desc_op.result_types[0])
-                            if bs:
-                                bn = bs[0][1]
-                    elif isinstance(op.operands[0], ArgRef):
-                        arg = next(
-                            (a for a in g.kernel.args if a.name == op.operands[0].name),
-                            None,
-                        )
-                        if arg:
-                            bs = _parse_desc_block_shape(arg.type)
-                            if bs:
-                                bn = bs[0][1]
+                store_desc = _render_operand(op.operands[0], rctx)
+                offs = [_render_operand(o, rctx) for o in op.operands[2:]]
                 value_expr = _render_operand(op.operands[1], rctx)
+                # Group gi's tile goes to M row offset (base_row + gi*m_size).
+                row = offs[0] if gi == 0 else f"({offs[0]} + {gi * m_size})"
+                col = offs[1] if len(offs) > 1 else "0"
+                lines += f"tlx.local_store(c_smem[0], {value_expr})"
+                lines += "tlx.fence_async_shared()"
                 lines += (
-                    f"tlx.local_store(tlx.local_slice(c_smem[0], "
-                    f"[{gi * m_size}, 0], [{m_size}, {bn}]), {value_expr})"
+                    f"tlx.async_descriptor_store({store_desc}, c_smem[0], "
+                    f"[{row}, {col}])"
                 )
+                lines += "tlx.async_descriptor_store_wait(0)"
                 continue
-    # Release TMEM as soon as both loads are done — store happens against
-    # registers + c_smem now, no longer reads acc_tmem.
+            # Safety net: an unrecognized op kind landed inside the partition
+            # chain (e.g. a scheduler-interleaved side effect between the cast
+            # and the store). Emit it once — via the normal outer-op path on the
+            # first group — rather than silently dropping it.
+            if gi == 0:
+                _emit_outer_op(n, g, rctx, lines)
+    # All groups' TMEM read + stored — release the accumulator for the next tile.
     lines += "tlx.barrier_arrive(acc_tmem_empty[tmem_buf], 1)"
-    if store_desc is not None:
-        offs_str = ", ".join(store_offsets)
-        lines += "tlx.fence_async_shared()"
-        lines += f"tlx.async_descriptor_store({store_desc}, c_smem[0], [{offs_str}])"
-        lines += "tlx.async_descriptor_store_wait(0)"
 
 
 def _find_subtile_chain(outer_nodes: list[Node]) -> tuple[int, int, int, int] | None:
@@ -4552,6 +4577,25 @@ def _emit_uwg_body_impl(
         )
         part_start = part_info[0] if part_info else -1
         part_end = part_info[1] if part_info else -1
+        # Pass A.5: the partition scheduler may assign the epilogue
+        # `tt.descriptor_store` to a different warp group than its tmem_load →
+        # trunc → convert chain (the chain lands in the TMEM-reading WG, the
+        # store in the default/epilogue WG). `outer_nodes` is per-WG, so neither
+        # WG sees the whole chain. Locate the store globally: the partitioned
+        # epilogue (emitted in the tmem_load's WG, where the cast values are
+        # live) issues it, and the orphan store in the other WG is skipped.
+        part_acc = any(
+            b.kind == "tmem" and b.partition_count > 1
+            for b in outer.schedule.buffers
+        )
+        global_store = (
+            next(
+                (n for n in outer.schedule.nodes if n.op_kind == "tt.descriptor_store"),
+                None,
+            )
+            if part_acc
+            else None
+        )
         for i, n in enumerate(outer_nodes):
             if n.child_pipeline_id is not None:
                 # Super-node → emit the inner K-loop here.
@@ -4569,7 +4613,13 @@ def _emit_uwg_body_impl(
             if sub_info and subtile_start < i < subtile_end:
                 continue  # already emitted inside the subtile loop
             if part_info and i == part_start:
-                chain_nodes = outer_nodes[part_start:part_end]
+                chain_nodes = list(outer_nodes[part_start:part_end])
+                # Splice in the cross-WG epilogue store if the chain didn't
+                # already capture it (store assigned to a different WG).
+                if global_store is not None and all(
+                    cn.id != global_store.id for cn in chain_nodes
+                ):
+                    chain_nodes.append(global_store)
                 _emit_outer_epilogue_partitioned(
                     chain_nodes,
                     part_info[2],
@@ -4581,6 +4631,12 @@ def _emit_uwg_body_impl(
                 continue
             if part_info and part_start < i < part_end:
                 continue  # already emitted inside the partition loop
+            if (
+                global_store is not None
+                and part_info is None
+                and n.id == global_store.id
+            ):
+                continue  # epilogue store emitted by the partitioned epilogue in the tmem_load's WG
             _emit_outer_op(n, g, rctx, lines)
 
         # Advance the TMEM ring counter at end of each tile (both default
@@ -4839,6 +4895,27 @@ def emit(graph: ScheduleGraph) -> str:
             # emitter can overlap the next local_store with the prior TMA
             # store (matches blackwell_gemm_ws tutorial). For S=2 this gives
             # same total SMEM as the un-subtiled baseline but unlocks overlap.
+            # Pass A.5: a data-partitioned accumulator stores one (m_size, BN)
+            # group at a time reusing this buffer — shrink c_smem to (m_size, BN)
+            # so deeper operand rings fit in SMEM.
+            part_m = 0
+            for lp in graph.loops:
+                for b in lp.schedule.buffers:
+                    if b.kind == "tmem" and b.partition_count > 1:
+                        part_m = b.m_size
+                        break
+                if part_m:
+                    break
+            if part_m and len(shape) >= 2:
+                # A.5 and A.7 both reshape this staging buffer; the epilogue
+                # path treats them as mutually exclusive (`_find_partition_chain`
+                # runs only `if not sub_info`). Assert that here so the shrink is
+                # a load-bearing invariant rather than an incidental one.
+                assert sub_count <= 1, (
+                    "Pass A.5 (data partition) and Pass A.7 (epilogue subtile) "
+                    "both reshaped c_smem; they are mutually exclusive by design"
+                )
+                shape = [part_m, shape[1]]
             buf_count = 2 if sub_count > 1 else 1
             shape_str = ", ".join(str(d) for d in shape)
             lines += f"c_smem = tlx.local_alloc(({shape_str}), {dtype}, {buf_count})"

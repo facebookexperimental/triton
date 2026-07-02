@@ -1,0 +1,414 @@
+"""bitequiv evaluation framework — the team's standard ruler for a PTX equivalence checker.
+
+WHAT THIS IS
+------------
+One driver, three stages, run from the command line, that measure how good a
+static bitwise-equivalence checker is at deciding which autotuner configs of a
+reduction kernel produce identical output bits. The checker under test is
+pluggable (``--checker``); by default it is the repo checker
+``bitequiv.ptx_reduction.ptx_reduction_descriptor``. This script changes no
+checker code — it only evaluates one.
+
+WHY THREE STAGES
+----------------
+The question "is this checker good?" splits into three independent questions, so
+the framework answers them separately and you can run only the ones you need:
+
+  Stage 1 — SUPPORT.   Does the checker even understand this kind of kernel?
+      For each kernel it probes the checker on a reference config and reports
+      SUPPORTED / LIMITED / UNSUPPORTED. Today this is a thin heuristic on the
+      descriptor (empty / unparseable => UNSUPPORTED, a tensor-core ``mma`` guard
+      => LIMITED, otherwise SUPPORTED) plus any limitation the kernel author
+      declared (the ``cond_reduce`` control-flow kernel is the example). The repo
+      checker accepts essentially every reduction, so this stage is a placeholder;
+      ``kernel_support`` is the documented extension point for when a checker can
+      declare real support itself.
+
+  Stage 2 — PRECISION.   Of the configs it supports, how well does the checker
+      partition them, and is it SOUND? It builds the config space, compiles each
+      config to PTX, asks the checker to group them, and independently fuzzes
+      every config (the empirical ground truth). It then reports, per kernel:
+        * how many equivalence classes the checker found and the largest one
+          (the bit-equivalent search space the checker recovers);
+        * how many classes the fuzzer found and the largest one (the recovery
+          CEILING — the most the checker could ever recover);
+        * OVER-MERGES — pairs the checker called equal but the fuzzer separated.
+          This is the soundness violation count and MUST be 0;
+        * REFINES — whether the checker partition refines the empirical one (the
+          formal statement of soundness).
+
+  Stage 3 — PERFORMANCE (opt-in).   Given a bit-exactness constraint, how much
+      speed is on the table? It benchmarks a perf-capable kernel across configs,
+      finds the global-fastest CEILING (a normal autotuner, no equivalence
+      constraint), then looks inside one checker-certified equivalence set:
+      after verifying every member is byte-identical, it reports the fastest vs
+      slowest member (the tuning freedom the checker hands the autotuner) and the
+      best member vs the ceiling (the cost of demanding identical bits).
+
+EFFORT KNOBS
+------------
+  --config-effort  light (~10 configs, quick gate)  |  heavy (full sweep, ~1000-3000)
+  --fuzzer-effort  fast (10 random seeds)            |  convincing (1000 seeds)
+A fuzzer can only refute equivalence, never prove it, so more seeds = stronger
+evidence of soundness, never certainty.
+
+OUTPUT
+------
+A plain, human-readable table file (``--out``, default
+``bitequiv/evaluation/result.txt``; gitignored — regenerate on demand) plus a
+short summary on stdout whose soundness line the pytest gate parses.
+
+LAYOUT
+------
+  eval_kernels.py       — every test kernel + its KernelSpec (the registry).
+  equivalence_fuzzer.py — standalone empirical oracle + partition/soundness math.
+  evaluate.py (here)    — the 3-stage CLI driver; orchestration only.
+
+EXAMPLES
+--------
+  # quick smoke / what the pytest gate runs:
+  python -m bitequiv.evaluation.evaluate --stages 1,2 --config-effort light --fuzzer-effort fast
+  # full standard run with perf:
+  python -m bitequiv.evaluation.evaluate --stages 1,2,3 --config-effort heavy --fuzzer-effort convincing
+  # evaluate a different / experimental checker:
+  python -m bitequiv.evaluation.evaluate --checker my.module:my_descriptor
+"""
+
+import argparse
+import datetime
+import importlib
+import os
+import sys
+
+# Make ``bitequiv`` importable whether launched as ``-m bitequiv.evaluation.evaluate``
+# or as a plain script path.
+_REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
+
+import torch  # noqa: E402
+
+from bitequiv.evaluation import eval_kernels, equivalence_fuzzer  # noqa: E402
+from bitequiv.evaluation.eval_kernels import _AXIS_ORDER, config_label, resolve_kernels  # noqa: E402
+
+_DEFAULT_CHECKER = "bitequiv.ptx_reduction:ptx_reduction_descriptor"
+_DEFAULT_OUT = os.path.join(os.path.dirname(__file__), "result.txt")
+
+
+# --------------------------------------------------------------------------- #
+# Checker plumbing
+# --------------------------------------------------------------------------- #
+def load_checker(spec):
+    """Load a ``module:function`` checker into ``descriptor(ptx) -> hashable``."""
+    if ":" not in spec:
+        raise ValueError(f"--checker must be 'module:function', got {spec!r}")
+    module_name, func_name = spec.split(":", 1)
+    module = importlib.import_module(module_name)
+    return getattr(module, func_name)
+
+
+def _descriptor_verdict(desc):
+    """Heuristic SUPPORTED/LIMITED/UNSUPPORTED from a checker descriptor alone.
+
+    The repo descriptor is a compact *hash* per entry (e.g. ``ntid=x32|<hash>``),
+    so we cannot read the tree out of it — the only checker-agnostic signals are:
+    a non-empty parseable descriptor (the checker accepted the kernel), the
+    plaintext ``unanalyzed-mma`` guard (a tensor-core op it does not model), or an
+    empty / unparseable result. This is why Stage 1 is a placeholder: today's
+    checker accepts essentially every reduction, so a real LIMITED/UNSUPPORTED
+    signal must come from a declared limitation or a checker that self-declares
+    support (the ``kernel_support`` extension point).
+    """
+    if not desc:
+        return "UNSUPPORTED", "empty descriptor (no entry / no reduction reconstructed)"
+    if not isinstance(desc, (tuple, list)):
+        return "UNSUPPORTED", "checker could not parse the PTX"
+    if any("unanalyzed-mma" in str(s) for s in desc):
+        return "LIMITED", "contains a tensor-core (mma) op the checker does not model"
+    return "SUPPORTED", "checker reconstructed a reduction descriptor"
+
+
+def kernel_support(spec, checker):
+    """Stage 1 verdict for one kernel: (verdict, detail).
+
+    A declared ``known_limitation`` (the author knows the checker can't model this
+    kernel soundly, e.g. control flow) downgrades to LIMITED regardless of the
+    descriptor heuristic — Stage 1 is a placeholder until the checker can declare
+    real support itself.
+    """
+    ref = spec.config_space("light")[0]
+    try:
+        ck = spec.compile(ref, spec.precision_size)
+    except Exception as exc:  # noqa: BLE001
+        return "UNSUPPORTED", f"reference config failed to compile: {type(exc).__name__}"
+    verdict, detail = _descriptor_verdict(checker(ck.asm["ptx"]))
+    if spec.known_limitation:
+        return "LIMITED", spec.known_limitation
+    return verdict, detail
+
+
+# --------------------------------------------------------------------------- #
+# Stage 2 — precision
+# --------------------------------------------------------------------------- #
+def _spanned_axes(configs):
+    """Which knobs vary within a set (= the tuning freedom that set recovers)."""
+    spans = {}
+    for axis in _AXIS_ORDER:
+        vals = sorted({getattr(c, axis) for c in configs}, key=lambda v: (v is None, v))
+        if len(vals) > 1:
+            spans[axis] = vals
+    return spans
+
+
+def evaluate_precision(spec, checker, config_effort, fuzzer_effort):
+    """Compile + checker-partition + fuzz one kernel; return a result dict."""
+    size = spec.precision_size
+    configs = spec.config_space(config_effort)
+    compiled, checker_key, fails = {}, {}, 0
+    for config in configs:
+        try:
+            ck = spec.compile(config, size)
+        except Exception:  # noqa: BLE001
+            fails += 1
+            continue
+        compiled[config] = ck
+        checker_key[config] = checker(ck.asm["ptx"])
+    ok = list(compiled)
+    if not ok:
+        return dict(name=spec.name, attempted=len(configs), ok=0, fails=fails)
+
+    repeats = equivalence_fuzzer.effort_repeats(fuzzer_effort)
+    empirical_key = equivalence_fuzzer.empirical_keys(
+        lambda config, seed: spec.run(config, compiled[config], seed, size), ok, repeats)
+
+    checker_sets = equivalence_fuzzer.partition(ok, checker_key)
+    empirical_sets = equivalence_fuzzer.partition(ok, empirical_key)
+    holds, straddle = equivalence_fuzzer.refines(ok, checker_key, empirical_key)
+    largest = max(checker_sets, key=len)
+    return dict(name=spec.name, attempted=len(configs), ok=len(ok), fails=fails, checker_n=len(checker_sets),
+                checker_max=equivalence_fuzzer.max_class_size(checker_sets), empirical_n=len(empirical_sets),
+                empirical_max=equivalence_fuzzer.max_class_size(empirical_sets),
+                over_merges=equivalence_fuzzer.over_merges(ok, checker_key, empirical_key), refines=holds,
+                straddle=straddle, largest_set=sorted(largest, key=config_label), largest_spans=_spanned_axes(largest))
+
+
+# --------------------------------------------------------------------------- #
+# Stage 3 — performance
+# --------------------------------------------------------------------------- #
+def evaluate_performance(spec, checker):
+    """Benchmark a perf-capable kernel; compare within-set spread to the global ceiling."""
+    size = spec.perf_size
+    configs = spec.perf_config_space()
+    ms, bits, checker_key, fails = {}, {}, {}, 0
+    for config in configs:
+        try:
+            milliseconds, output_bytes, ptx = spec.benchmark(config, size)
+        except Exception:  # noqa: BLE001
+            fails += 1
+            continue
+        ms[config], bits[config], checker_key[config] = milliseconds, output_bytes, checker(ptx)
+    ok = list(ms)
+    if not ok:
+        return dict(name=spec.name, ok=0, fails=fails)
+
+    ceiling = min(ms[c] for c in ok)
+    ceiling_config = min(ok, key=lambda c: ms[c])
+    slowest = max(ms[c] for c in ok)
+
+    def best_slow(group):
+        return min(ms[c] for c in group), max(ms[c] for c in group)
+
+    checker_big = max(equivalence_fuzzer.partition(ok, checker_key), key=len)
+    empirical_big = max(equivalence_fuzzer.partition(ok, bits), key=len)
+    chk_fast, chk_slow = best_slow(checker_big)
+    emp_fast, emp_slow = best_slow(empirical_big)
+    return dict(name=spec.name, ok=len(ok), fails=fails, size=size, ceiling=ceiling, ceiling_config=ceiling_config,
+                slowest=slowest, checker_set_size=len(checker_big),
+                checker_byte_identical=len({bits[c]
+                                            for c in checker_big}) == 1, checker_fast=chk_fast, checker_slow=chk_slow,
+                empirical_set_size=len(empirical_big), empirical_fast=emp_fast, empirical_slow=emp_slow)
+
+
+# --------------------------------------------------------------------------- #
+# Report rendering
+# --------------------------------------------------------------------------- #
+def _table(headers, rows):
+    grid = [headers] + [[str(x) for x in r] for r in rows]
+    widths = [max(len(row[i]) for row in grid) for i in range(len(headers))]
+    fmt = lambda vals: "  ".join(str(v).ljust(w) for v, w in zip(vals, widths))
+    return [fmt(headers), fmt(["-" * w for w in widths])] + [fmt(r) for r in rows[:]]
+
+
+def render_stage1(results):
+    lines = ["STAGE 1 — kernel support", "-" * 24, ""]
+    rows = [[r["name"], r["verdict"], r["detail"]] for r in results]
+    lines += _table(["kernel", "verdict", "detail"], rows)
+    lines.append("")
+    return lines
+
+
+def render_stage2(results):
+    lines = ["STAGE 2 — checker precision (soundness + partition)", "-" * 51, ""]
+    rows = []
+    for r in results:
+        if not r.get("ok"):
+            rows.append([r["name"], f"0/{r['attempted']}", "-", "-", "-", "-", "-"])
+            continue
+        rows.append([
+            r["name"],
+            f"{r['ok']}/{r['attempted']}",
+            f"{r['checker_n']} (max {r['checker_max']})",
+            f"{r['empirical_n']} (max {r['empirical_max']})",
+            str(r["over_merges"]),
+            "yes" if r["refines"] else "NO",
+        ])
+    lines += _table(["kernel", "configs", "checker sets", "empirical sets (ceiling)", "over-merges", "refines"],
+                    [[row[0], row[1], row[2], row[3], row[4], row[5]] for row in rows])
+    lines.append("")
+    lines.append("over-merges = configs the checker merged but the fuzzer separated (MUST be 0 = sound).")
+    lines.append("empirical-sets max = the recovery ceiling (the largest bit-equivalent set that exists).")
+    lines.append("")
+    lines.append("Largest checker-equivalent set per kernel (the recovered tuning freedom):")
+    for r in results:
+        if not r.get("ok"):
+            continue
+        spans = r["largest_spans"]
+        span_text = "; ".join(f"{a}∈{[v for v in vals]}" for a, vals in spans.items()) or "(singleton)"
+        lines.append(f"  {r['name']}: {len(r['largest_set'])} configs spanning {span_text}")
+        for config in r["largest_set"][:5]:
+            lines.append(f"      - {config_label(config)}")
+        if len(r["largest_set"]) > 5:
+            lines.append(f"      - ... (+{len(r['largest_set']) - 5} more)")
+    lines.append("")
+    return lines
+
+
+def render_stage3(results):
+    lines = ["STAGE 3 — performance vs ceiling (optional)", "-" * 43, ""]
+    for r in results:
+        if not r.get("ok"):
+            lines.append(f"{r['name']}: no configs benchmarked (failed {r.get('fails', 0)}).")
+            lines.append("")
+            continue
+        rows, cols = r["size"]
+        lines.append(f"{r['name']}  (size {rows}x{cols}, do_bench x3 min-of-medians)")
+        lines.append(f"  unconstrained CEILING (fastest of all, bits NOT reproducible): "
+                     f"{r['ceiling']:.3f} ms @ {config_label(r['ceiling_config'])}")
+        lines.append(f"  full-space spread: {r['slowest']:.3f} ms slowest -> {r['slowest'] / r['ceiling']:.2f}x")
+        lines.append(f"  largest CHECKER-certified set: {r['checker_set_size']} configs, "
+                     f"byte-identical={r['checker_byte_identical']}; "
+                     f"{r['checker_fast']:.3f}..{r['checker_slow']:.3f} ms "
+                     f"({r['checker_slow'] / r['checker_fast']:.2f}x within-set freedom); "
+                     f"best is {r['checker_fast'] / r['ceiling']:.2f}x off ceiling")
+        lines.append(f"  largest EMPIRICAL (true) set: {r['empirical_set_size']} configs; "
+                     f"{r['empirical_fast']:.3f}..{r['empirical_slow']:.3f} ms "
+                     f"({r['empirical_slow'] / r['empirical_fast']:.2f}x) -> the freedom a perfect checker recovers")
+        lines.append("")
+    return lines
+
+
+def write_report(path, header, sections):
+    lines = list(header)
+    for section in sections:
+        lines += section
+    with open(path, "w") as f:
+        f.write("\n".join(lines).rstrip("\n") + "\n")
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def parse_args(argv):
+    p = argparse.ArgumentParser(description="bitequiv evaluation framework (see module docstring).")
+    p.add_argument("--kernels", default="all", help="'all' or comma list: " + ",".join(eval_kernels.REGISTRY))
+    p.add_argument("--stages", default="1,2", help="comma list of stages to run (Stage 3 perf is opt-in)")
+    p.add_argument("--config-effort", default="light", choices=("light", "heavy"))
+    p.add_argument("--fuzzer-effort", default="fast", choices=("fast", "convincing"))
+    p.add_argument("--checker", default=_DEFAULT_CHECKER, help="module:function descriptor (default: repo checker)")
+    p.add_argument("--out", default=_DEFAULT_OUT, help="result table path")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if not torch.cuda.is_available():
+        print("no CUDA GPU available; the framework needs one to compile and run kernels. Skipping.")
+        return 0
+
+    stages = {int(s) for s in args.stages.split(",") if s.strip()}
+    specs = resolve_kernels(args.kernels)
+    checker = load_checker(args.checker)
+    repeats = equivalence_fuzzer.effort_repeats(args.fuzzer_effort)
+    device = torch.cuda.get_device_name()
+
+    header = [
+        "bitequiv evaluation result",
+        "==========================",
+        f"generated:      {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"checker:        {args.checker}",
+        f"device:         {device}",
+        f"config effort:  {args.config_effort}",
+        f"fuzzer effort:  {args.fuzzer_effort} ({repeats} seeds/config)",
+        f"kernels:        {', '.join(s.name for s in specs)}",
+        f"stages:         {','.join(str(s) for s in sorted(stages))}",
+        "",
+    ]
+    print("\n".join(header))
+
+    sections = []
+    total_over_merges = 0
+    any_unsound = False
+
+    if 1 in stages:
+        print("== Stage 1: support ==", flush=True)
+        results = []
+        for spec in specs:
+            verdict, detail = kernel_support(spec, checker)
+            results.append(dict(name=spec.name, verdict=verdict, detail=detail))
+            print(f"  {spec.name}: {verdict} — {detail}", flush=True)
+        sections.append(render_stage1(results))
+
+    if 2 in stages:
+        print("== Stage 2: precision ==", flush=True)
+        results = []
+        for spec in specs:
+            n_configs = len(spec.config_space(args.config_effort))
+            print(f"  {spec.name}: {n_configs} configs x {repeats} fuzz seeds ...", flush=True)
+            r = evaluate_precision(spec, checker, args.config_effort, args.fuzzer_effort)
+            results.append(r)
+            if r.get("ok"):
+                total_over_merges += r["over_merges"]
+                any_unsound = any_unsound or not r["refines"]
+                print(
+                    f"    -> {r['ok']}/{r['attempted']} ok | checker max set {r['checker_max']} "
+                    f"| empirical ceiling {r['empirical_max']} | over-merges {r['over_merges']} "
+                    f"| refines {r['refines']}", flush=True)
+            else:
+                print(f"    -> 0/{r['attempted']} compiled (build drift?)", flush=True)
+        sections.append(render_stage2(results))
+
+    if 3 in stages:
+        print("== Stage 3: performance ==", flush=True)
+        results = []
+        for spec in specs:
+            if not spec.supports_perf:
+                print(f"  {spec.name}: no perf hook; skipping.", flush=True)
+                continue
+            print(f"  {spec.name}: benchmarking {len(spec.perf_config_space())} configs ...", flush=True)
+            results.append(evaluate_performance(spec, checker))
+        if results:
+            sections.append(render_stage3(results))
+
+    write_report(args.out, header, sections)
+    print(f"\nWROTE {args.out}")
+    if 2 in stages:
+        print(f"SOUNDNESS: total over-merges (must be 0) = {total_over_merges}")
+        if any_unsound or total_over_merges:
+            print("RESULT: UNSOUND — the checker merged configs the fuzzer proved different.")
+            return 1
+        print("RESULT: SOUND — checker partition refines the empirical partition.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

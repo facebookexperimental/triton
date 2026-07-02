@@ -1406,10 +1406,14 @@ class _attention_opt(torch.autograd.Function):
 
         triton.set_allocator(alloc_fn)
 
-        # NOTE: persistent backward (_attn_bwd_persist) is not yet usable:
-        # the kernel body exceeds the 512-unit TMEM hardware limit (needs 704)
-        # and the pipeliner cannot predicate tt.descriptor_reduce (atomic_add
-        # via TMA). Use non-persistent backward until compiler support improves.
+        # NOTE: the persistent backward (_attn_bwd_persist) is functional for
+        # the tested configs (bwd_config_idx 0-4). bwd_config_idx 2
+        # (_BWD_DOT_ATTRS_TMEM, the 3-group dpT/dq/dsT TMEM reuse) additionally
+        # requires early_tma_store_lowering=True and relies on the cross-tile
+        # staging-reuse WAR barrier (WSCodePartition.cpp Step 7.5) — without it
+        # the dv/dk TMA-staging buffers (aliasing the v/do operand SMEM) race
+        # the next tile's operand load. See test_bwd_tmem_dsT_reuse_3group and
+        # test_bwd_tmem_dsT_reuse_3group_persistent.
         desc_k = TensorDescriptor(
             arg_k,
             shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
@@ -1592,11 +1596,10 @@ def test_op(
         pytest.skip("SUBTILING is forward-only; redundant for bwd")
     # bwd_config_idx 2 is the _BWD_DOT_ATTRS_TMEM 3-group TMEM-reuse config
     # (BLOCK_M1=128, EPILOGUE_SUBTILE=2). The reuse packs dpT/dq/dsT into one
-    # TMEM allocation, which (with early TMA store now always on) fits only the
-    # non-persistent (ws) backward; the persistent path's TMEM budget cannot hold
-    # it. Dedicated coverage: test_bwd_tmem_dsT_reuse_3group.
-    if mode == "bwd" and bwd_config_idx == 2 and baseVariant == "ws_persistent":
-        pytest.skip("_BWD_DOT_ATTRS_TMEM 3-group reuse is not supported on the persistent path")
+    # TMEM allocation, which only fits via the early-TMA store staging (now
+    # always on; #1709 removed the early_tma_store_lowering knob). It runs on
+    # both the non-persistent (ws) and persistent (ws_persistent) backends
+    # (dedicated coverage: test_bwd_tmem_dsT_reuse_3group / _persistent).
     if mode == "bwd" and baseVariant == "ws_persistent":
         _attn_bwd_persist.configs = [configs_bwd_persist[bwd_config_idx]]
         _attn_bwd_persist.cache = {}
@@ -1671,9 +1674,7 @@ def test_bwd_tmem_dsT_reuse_3group():
     # fails (NaN in dv/dk/dq) without the dk-before-dq ordering and passes with
     # it.
     #
-    # Runs on the non-persistent ("ws") backward, which is the usable path; the
-    # persistent backward separately exceeds the 512-unit TMEM limit (see NOTE
-    # in the launcher) and is not exercised here.
+    # Runs on the non-persistent ("ws") backward.
     test_op(
         Z=8,
         H=16,
@@ -1684,6 +1685,33 @@ def test_bwd_tmem_dsT_reuse_3group():
         baseVariant="ws",
         provider="triton-fp16",
         SUBTILING=False,  # forward-only knob; inert for the bwd kernel
+        VECT_MUL=0,
+        FADD2_REDUCE=False,
+        bwd_config_idx=2,
+    )
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")
+def test_bwd_tmem_dsT_reuse_3group_persistent():
+    # Regression for the PERSISTENT 3-group TMEM-reuse SMEM race.
+    #
+    # Same config as test_bwd_tmem_dsT_reuse_3group but on the persistent
+    # backward (_attn_bwd_persist). The dv/dk TMA-staging buffers alias the v/do
+    # operand SMEM (allocation.reuseTarget); across the persistent outer tile
+    # loop the next tile's operand load raced the previous tile's staging TMA
+    # store (Step-7.5 cross-tile WAR barrier in WSCodePartition.cpp). Before the
+    # fix this produced non-deterministic wrong gradients (max-abs error ~3-4);
+    # with the dedicated cross-tile reuse token it is correct and deterministic.
+    test_op(
+        Z=8,
+        H=16,
+        N_CTX=1024,
+        HEAD_DIM=128,
+        causal=False,
+        mode="bwd",
+        baseVariant="ws_persistent",
+        provider="triton-fp16",
+        SUBTILING=False,
         VECT_MUL=0,
         FADD2_REDUCE=False,
         bwd_config_idx=2,

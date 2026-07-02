@@ -269,6 +269,28 @@ DataDependenceGraph::computeCriticalPathHeights() const {
   return heights;
 }
 
+void DataDependenceGraph::applyDataPartition(
+    const llvm::DenseMap<Operation *, DataPartitionInfo> &mmaInfo) {
+  if (mmaInfo.empty())
+    return;
+  for (auto &node : nodes) {
+    if (!node.op)
+      continue;
+    auto it = mmaInfo.find(node.op);
+    if (it == mmaInfo.end() || it->second.count <= 1)
+      continue;
+    const DataPartitionInfo &info = it->second;
+    node.partitionCount = info.count;
+    node.partitionDim = info.dim;
+    node.mSize = info.mSize;
+    // The bundle issues `count` MMAs back-to-back on the tensor core, so it
+    // ties up the TC pipeline `count`× as long. Scale occupancy so ResMII
+    // reflects the N hardware issues (the result latency is unchanged).
+    node.occupancy =
+        std::max(pipelineOccupancy(node), 1) * static_cast<int>(info.count);
+  }
+}
+
 int DataDependenceGraph::computeResMII() const {
   // Per-pipeline busy time (cycles) bounds II from below: II ≥ pipeLoad / N
   // where N is the number of identical units on the pipeline (assumed 1).

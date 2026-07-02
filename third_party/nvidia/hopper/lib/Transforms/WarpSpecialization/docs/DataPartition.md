@@ -51,8 +51,8 @@ Before partitioning, ensures all ops in def-use chains carry correct
 
 - **Backward**: If an op uses a value defined by an `arith` op that lacks the
   consumer's task ID, propagate backward.
-- **Forward**: If a `YieldOp` or `IfOp` has a single-use operand whose
-  defining op has extra task IDs, propagate forward.
+- **Forward**: If a `YieldOp`, `ConditionOp`, `IfOp`, or `WhileOp` has a
+  single-use operand whose defining op has extra task IDs, propagate forward.
 
 Runs to a fixed point.
 
@@ -89,9 +89,10 @@ Traces the partition dimension backward and forward from the accumulator:
   produce scalar types.
 
 - **`getForwardSliceToPartition`**: From the accumulator, walks forward
-  through result users. Handles `YieldOp` (follow to loop result users),
-  `IfOp` (follow to if result), and tracks dimension remapping through
-  layout-changing ops.
+  through result users. Handles `YieldOp` (follow to `scf.for` / `scf.if`
+  results, or to the `scf.while` before-region backedge), `ConditionOp`
+  (follow to `scf.while` results and after-region arguments), and tracks
+  dimension remapping through layout-changing ops.
 
 For `ReshapeOp` and `MemDescReshapeOp`, the pass remaps partition dimensions
 by comparing flattened element intervals for each candidate source/destination
@@ -132,6 +133,11 @@ packed scale tiles from SMEM, reshape them into logical `(BLOCK_MN,
 BLOCK_K / scale_vec_size)`, and then allocate scale TMEM for
 `ttng.tc_gen5_mma_scaled`.
 
+For `scf.while`, slicing may append extra loop-carried values. The new
+before-region argument is forwarded through `scf.condition` to create the
+matching while result and after-region argument, and the after-region
+`scf.yield` appends the sliced next-iteration value.
+
 ### Step 6: Cleanup (`doDeepCleanup`)
 
 After rewriting, runs dead code elimination and removes orphaned operations
@@ -153,6 +159,10 @@ The partition dimension is tracked through shape-changing operations:
 When a `TensorDescType` function argument feeds a partitioned op, its block
 type is sliced. The `funcArgPartitionDims` map tracks which arguments need
 slicing and along which dimension.
+
+If a `TensorDescType` function argument is also used as a loop init value, the
+pass currently bails out. Updating both the function signature and the loop
+carried argument/result types consistently requires additional handling.
 
 ### MMAv5 Scaled MMA
 
