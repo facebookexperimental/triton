@@ -212,6 +212,13 @@ public:
               // All users are loop-carried outputs, so we don't need to
               // push users to a later stage.
               opLatency[&op] = 0;
+              // A loop-carried WS accumulator (e.g. HSTU bwd dv/dk) is drained
+              // after the loop; keeping self_latency=1 here only raises the
+              // shared loop's maxStage (dragging single-slot cross-partition
+              // accumulators like dqT into a deeper peel). Zero it so the WS
+              // schedule stays shallow (TLX-like). redq (non-meta-WS) is
+              // unaffected and keeps its acc multi-buffering.
+              mmaSelfLatency[mma] = 0;
               continue;
             } else if (!ttng::requiresAccMultiBuffering(mma, forOp) ||
                        (ttng::isAccMultibufferingPossible(mma, forOp) &&
