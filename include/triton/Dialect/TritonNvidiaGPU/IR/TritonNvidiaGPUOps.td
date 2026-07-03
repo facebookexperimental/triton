@@ -1435,6 +1435,18 @@ def TTNG_SubtiledRegionOp : TTNG_Op<"subtiled_region", [
     /// Returns the new tile block argument.
     BlockArgument addSharedArg(Value value);
 
+    /// Append a NEW per-tile arg position (the inverse of removePerTilePosition):
+    /// `perTileValues` must have exactly numTiles entries (value for tile 0, 1,
+    /// ...). Appends them as the last per-tile position (operands
+    /// [K*numTiles + t]) and inserts one tile block argument at the end of the
+    /// per-tile block args (before the shared args / tileIdx), preserving the
+    /// [perTile.., shared.., tileIdx] ordering. All entries must share a type.
+    /// Returns the new tile block argument (which lowering substitutes with
+    /// `perTileValues[t]` for tile t). Used to thread a per-tile token/barrier
+    /// for inside->outside subtiled channels whose numTiles siblings are
+    /// distinct buffers (each tile handshakes only its own sibling's barrier).
+    ::mlir::BlockArgument addPerTilePosition(::mlir::ValueRange perTileValues);
+
     /// Erase per-tile arg position `posIdx` (0-based among the K positions):
     /// removes its numTiles operands and the matching tile block argument,
     /// preserving the [perTile.., shared.., tileIdx] ordering and the

@@ -126,9 +126,6 @@ def test_autows_addmm_tma_persistent(
     if FLATTEN:
         pytest.skip("FLATTEN will not WarpSpecialize although it will otherwise pass.")
 
-    if generate_subtiled_region:
-        pytest.skip("TODO: enable generate_subtiled_region=True")
-
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")

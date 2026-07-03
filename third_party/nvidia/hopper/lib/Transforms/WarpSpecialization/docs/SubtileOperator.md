@@ -38,6 +38,11 @@ Key methods:
 - `addSharedArg(Value)` — appends a shared arg and adds a tile block
   argument. Used by `insertAsyncComm` to make NVWS token / accumCnt / base-alloc
   values accessible inside the tile body.
+- `addPerTilePosition(ValueRange)` — appends a NEW per-tile position (inverse of
+  `removePerTilePosition`): takes exactly `numTiles` values (tile 0, 1, …) and
+  adds one tile block argument that lowering substitutes per tile. Used by
+  `insertAsyncComm` to thread a **per-tile producer token** for inside→outside
+  channels whose siblings are distinct buffers (see below).
 - `removePerTilePosition(unsigned)` — erases a per-tile position's `numTiles`
   operands and its tile block argument (segment-aware, via
   `getPerTileArgsMutable().erase`). Used to drop buffer positions left dead after
@@ -206,9 +211,34 @@ two consumer shapes:
 
 - **Inside→outside** (`separate_epilogue_store=True`, the producer subtiled but
   each subtile's consumer a *flat* op outside): represented as `numTiles` sibling
-  `ChannelPost`s sharing one in-body template producer and one reuse-group token;
-  the producer-side acquire/commit is emitted by exactly one sibling
-  (`emittedSubtiledProducerTokens`). See bug #10 in the partition-scheduler rules.
+  `ChannelPost`s sharing one in-body template producer, each with its own flat
+  consumer. There are two sub-shapes depending on staging `buffer.copy`:
+  - **Multi-buffered** (`buffer.copy > 1`): the siblings are one reuse group over
+    one physical multibuffer; the in-body slot rotation (`getOrComputeSubtiledSlot`)
+    fires and the producer acquire/commit use one shared reuse-group token with a
+    per-tile *slot*. Emitted by exactly one sibling (`emittedSubtiledProducerTokens`).
+  - **Single-buffered** (`buffer.copy == 1`): the siblings are **distinct buffers**
+    (different `buffer.id`, NOT a reuse group), so `getOrComputeSubtiledSlot`
+    returns invalid and there is no shared slot. Each tile writes its own buffer
+    (a per-tile buffer position) and must acquire/commit ONLY its own buffer's
+    barrier. Because the tile body is replicated per tile, the `numTiles` sibling
+    tokens are threaded as ONE **per-tile** arg (`addPerTilePosition`, ordered by
+    the template store's per-tile buffer operands so token[t] matches the buffer
+    tile t writes) and a single producer acquire/commit references it — so tile t
+    handshakes exactly sibling t's barrier. Emitted once per region
+    (`emittedSubtiledPerTileProducer`). Threading the tokens *shared* instead made
+    every replicated tile arrive on *every* sibling's barrier (over-commit → the
+    producer/consumer handshake is imbalanced → **runtime deadlock**).
+
+  Two additional straddle hazards on this path (fixed): (a) the outer
+  `bufferIdx`/`phase` for a flat consumer scheduled *before* the producer region
+  must be anchored at the earliest endpoint, else it fails SSA dominance
+  (verifier: `arith.trunci ... destroyed but still has uses`); (b) the flat
+  consumer's `consumer_release` must be routed off its own per-token consumer, not
+  the group-wide `tailConsumer` (which the straddle resolves to the region itself,
+  misrouting the release into the producer partition and dropping it). See bug #10
+  in the partition-scheduler rules and
+  `test/Hopper/WarpSpecialization/ws_subtiled_inside_outside_channel.mlir`.
 - **Same-task interleaved** (`separate_epilogue_store=False`): the producer
   `local_store` and the consumer `async_tma_copy_local_to_global` are both in the
   epilogue task, so there is no cross-task channel and *no WS reuse barrier* — the
@@ -236,6 +266,15 @@ two consumer shapes:
   region pair, gated on the regions being in different tasks). The collapsed
   channel is the sole member of a degenerate size-1 subtiled reuse group (see
   [Reuse Groups](ReuseGroups.md)), so the in-body slot math above is unchanged.
+  This collapse fires for **any `buffer.copy`, including `buffer.copy == 1`** (the
+  DP=1 epilogue): the `numBuffers > 1` reuse-group guards are relaxed for channels
+  flagged `ChannelPost::isCollapsedBothSubtiled` (queried via
+  `channelIsCollapsedBothSubtiled` — the *narrow* predicate, NOT the broad
+  `channelIsSubtiled`, which would also match a consumer-only-subtiled bias load),
+  the in-body math collapses all subtiles onto one physical slot (`bufferIdx == 0`,
+  alternating phase), and the skipped sibling per-tile allocs
+  (`ChannelPost::collapsedSiblingAllocs`) are erased after the rewire. Omitting
+  any of this leaves the sibling staging alloc live → SMEM OOM (bug #13).
   Per-data-partition separation of the shared physical staging buffer is done in
   the memory planner (cross-partition staging split). See bug #11.
 
@@ -256,8 +295,10 @@ hardware `WaitBarrierOp`/`ArriveBarrierOp`.
 | `test/TritonNvidiaGPU/invalid.mlir` | Verifier error cases |
 | `test/Hopper/WarpSpecialization/ws_token_lowering_subtiled_region.mlir` | Token lowering with SubtiledRegionOps inside warp_specialize |
 | `test/Hopper/WarpSpecialization/ws_code_partition_subtiled_region.mlir` | Code partition with SMEM channels between SubtiledRegionOps |
-| `test/Hopper/WarpSpecialization/ws_code_partition_subtiled_region_inbody.mlir` | Both-endpoints-subtiled in-body SMEM rotation (DP=1) |
+| `test/Hopper/WarpSpecialization/ws_code_partition_subtiled_region_inbody.mlir` | Both-endpoints-subtiled in-body SMEM rotation (DP=1, buffer.copy=3) |
+| `test/Hopper/WarpSpecialization/ws_code_partition_subtiled_region_inbody_copy1.mlir` | Both-endpoints-subtiled in-body SMEM rotation (DP=1, buffer.copy=1: single-slot collapse + sibling erase, bug #13) |
 | `test/Hopper/WarpSpecialization/ws_subtiled_region_inside_outside.mlir` | Asymmetric inside→outside (flat consumer) channel |
+| `test/Hopper/WarpSpecialization/ws_subtiled_inside_outside_channel.mlir` | Inside→outside STRADDLE, single-copy distinct buffers: dominance anchor + per-tile producer token + per-token consumer release (addmm EPI=2, `separate_epilogue_store`, non-early-TMA) |
 | `test/Hopper/WarpSpecialization/ws_subtiled_region_dp2_both_subtiled.mlir` | Both-endpoints-subtiled DP=2: cross-partition staging split + channel collapse |
 | `python/test/unit/language/test_tutorial09_warp_specialization.py` | Blackwell GEMM e2e (parametrized with `generate_subtiled_region`) |
 | `python/test/unit/language/test_autows_addmm.py` | Addmm e2e (parametrized with `generate_subtiled_region`) |

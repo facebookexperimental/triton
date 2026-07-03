@@ -114,12 +114,41 @@ by the builtin `tileIdx`). That lone channel still needs the reuse-group
 machinery — the in-body per-tile slot rotation (`getOrComputeSubtiledSlot` fires
 only for `reuseGrp >= 0`) and the `numTiles` loop-counter stride
 (`getReuseGroupStride`). So `doCodePartitionPost` forms a **size-1** group for it
-when `channelIsSubtiled(ch) && ch->getNumBuffers() > 1`, and the
-`channels.size() <= 1` early-returns in `getReuseChannels`
-(`CodePartitionUtility.cpp`) and `createNewLoopWrapper` (`WSBuffer.cpp`) are
-relaxed for subtiled groups (`channelIsSubtiled`). These three sites must agree
-or `getAccumCnts` (which counts the group) and the loop-arg creation disagree →
-out-of-bounds `getArgument` in `getAccumCount`.
+whenever `channelIsCollapsedBothSubtiled(ch)` — **independent of `buffer.copy`**.
+The `numBuffers > 1` / `getNumBuffers() <= 1` guards that normally gate the reuse
+machinery are relaxed for these channels at **six** sites that must agree:
+`needAccumCntForReuse`, `getReuseChannels`, `channelInReuseGroup`
+(`CodePartitionUtility.cpp`), `createNewLoopWrapper` (`WSBuffer.cpp`),
+`getOrComputeSubtiledSlot` and the `size1Subtiled` group formation
+(`WSCodePartition.cpp`). The accumCnt-counting subset (`needAccumCntForReuse` →
+`getAccumCnts`, `getReuseChannels`, `createNewLoopWrapper`) must stay in lockstep
+or the loop-arg count and accumCnt indices disagree → out-of-bounds
+`getArgument` in `getAccumCount`.
+
+The discriminator is the **narrow** `channelIsCollapsedBothSubtiled`
+(`ChannelPost::isCollapsedBothSubtiled`, set in `collectPostChannels` only when
+producer AND consumer are in different-task subtiled regions), **not** the broad
+`channelIsSubtiled`. The broad form is also true for a *consumer-only-subtiled*
+channel — e.g. an epilogue **bias** load whose `local_store` sits outside the
+region but whose `local_load` is inside the producer subtiled region. Such a
+channel has no per-tile staging buffer to rotate; routing it through the in-body
+path (at `buffer.copy == 1`) would push its region into `subtiledRegionsTouched`
+with nothing to rewire → empty `deadPositions` assert in `insertAsyncComm`. The
+pre-existing `channels.size() <= 1` subtiled exceptions still use the broad
+`channelIsSubtiled` (a size-1 group is only ever the collapsed channel, so the
+two agree there).
+
+At `buffer.copy == 1` (the DP=1 both-subtiled epilogue) the in-body math reduces
+to `bufferIdx = (accumCnt + tileIdx) % 1 == 0` with `phase = (accumCnt + tileIdx) & 1`:
+all `numTiles` subtiles share **one** physical staging slot and serialize via the
+alternating barrier phase (later tiles *wait* for the earlier tile's slot
+release — a serialization, not a race). Collapsing to one physical slot is what
+avoids the SMEM `OutOfResources`. The skipped sibling per-tile allocs are
+recorded on the representative `ChannelPost` (`collapsedSiblingAllocs`) in
+`collectPostChannels` and **erased** in `insertAsyncComm` once the in-body view
+rewire makes them `use_empty` (asserting if a recorded sibling still has a use —
+a missed collapse). Without that erase the dead sibling alloc (mutable SMEM →
+carries an `Allocate` effect) is double-counted at allocation.
 
 The collapse only fires for a **cross-task** pair (producer-region task ≠
 consumer-region task); when `separate_epilogue_store=False` puts both regions in

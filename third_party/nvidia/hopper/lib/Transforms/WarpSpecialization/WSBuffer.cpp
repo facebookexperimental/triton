@@ -874,7 +874,11 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
     if (config->getGroup(idx)->channels.size() <= 1 &&
         !channelIsSubtiled(config->getGroup(idx)->channels[0]))
       continue;
-    if (config->getGroup(idx)->channels[0]->getNumBuffers() <= 1)
+    // A collapsed subtiled channel carries its shared accumCnt (numTiles
+    // stride) even at buffer.copy == 1; keep its loop arg so the count matches
+    // getAccumCnts / getReuseChannels. Plain single-buffered groups skip.
+    if (config->getGroup(idx)->channels[0]->getNumBuffers() <= 1 &&
+        !channelIsCollapsedBothSubtiled(config->getGroup(idx)->channels[0]))
       continue;
     Operation *parentOp = origForOp->getParentOp();
 #if 0
