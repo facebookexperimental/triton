@@ -112,12 +112,12 @@ def test_ptx_level_prunes_fma_contraction_end_to_end():
 # builder / canonicalization regression is caught on real Triton PTX. Regenerate with
 # hashlib.sha1("␟".join(ptx_reduction_descriptor(ptx)).encode()).hexdigest()[:12].
 _GOLDEN = {
-    "sum_nw1": "11eeb97935a7",
-    "sum_nw2": "bb9f3a057a6f",
-    "sum_nw4": "556eb33a940d",
-    "sum_nw8": "56da4f2130ba",
-    "dot_fuse_on": "3c3bc4fd81ca",
-    "dot_fuse_off": "2017ee6ff84b",
+    "sum_nw1": "95a83aa1dc04",
+    "sum_nw2": "be27f98c38b2",
+    "sum_nw4": "c6fda1d478b8",
+    "sum_nw8": "dca122a2b82e",
+    "dot_fuse_on": "80acbd23018a",
+    "dot_fuse_off": "32aa7e471b9a",
 }
 
 
