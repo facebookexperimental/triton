@@ -74,10 +74,19 @@ input elements → reconstruct the add/fma tree → compare trees structurally.*
 - `triton_repro_bitwise.py` (Paul Zhang, D100024902); FBGEMM correctness-vs-perf
   pruning split (D75976113).
 
-**To build (first-ever):** PTX *semantic* tree reconstruction; static cross-config
-equivalence checker (no GPU run); autotuner equivalence pruning; reduction layout
-optimization pass (M2); MMA constraint representation + lowering (M3); the
-repeatable experiment framework.
+**Built so far (M1, in-tree — reuse, don't reinvent):**
+- **TTGIR checker** — MLIR-native data-layout reduction-order checker
+  (`bitequiv/ttgir_reduction.py` → C++ `lib/Analysis/ReductionOrder.cpp` via
+  `toLinearLayout`; autotuner API in `bitequiv/equivalence_ttgir.py`). Fixes the
+  reduction *association order*; **blind to FMA contraction** (layout-only).
+- **PTX checker** — its sibling (`bitequiv/ptx_reduction.py`), reconstructs the
+  reduction tree from PTX, so it *also* catches FMA contraction (below TTGIR).
+- **Evaluation framework** — `bitequiv/evaluation/` measures either checker against an
+  empirical fuzzer; pick the checker with `--checker module:function` and the IR it
+  reads with `--artifact ptx|ttgir`.
+
+**Still to build (first-ever):** reduction layout-optimization pass (M2); MMA
+constraint representation + lowering (M3).
 
 ## 6. ⚠️ Critical guardrail for AI-assisted work
 

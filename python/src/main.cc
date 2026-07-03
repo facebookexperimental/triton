@@ -39,6 +39,7 @@ namespace py = pybind11;
 void init_triton_env_vars(pybind11::module &m);
 void init_triton_ir(pybind11::module &&m);
 void init_triton_llvm(pybind11::module &&m);
+void init_triton_bitequiv(pybind11::module &&m);
 void init_triton_interpreter(pybind11::module &&m);
 void init_triton_passes(pybind11::module &&m);
 void init_triton_stacktrace_hook(pybind11::module &m);
@@ -56,6 +57,7 @@ PYBIND11_MODULE(libtriton, m) {
   init_triton_passes(m.def_submodule("passes"));
   init_triton_interpreter(m.def_submodule("interpreter"));
   init_triton_llvm(m.def_submodule("llvm"));
+  init_triton_bitequiv(m.def_submodule("bitequiv"));
   init_linear_layout(m.def_submodule("linear_layout"));
   init_gluon_ir(m.def_submodule("gluon_ir"));
   FOR_EACH_P(INIT_BACKEND, TRITON_BACKENDS_TUPLE)
