@@ -7,7 +7,7 @@ and collected in :data:`REGISTRY`. A spec knows everything the driver
   * which autotuner knobs the kernel accepts (``axes``) and how to expand them
     into a config list at a given effort (``config_space``);
   * how to ``compile`` a config to a ``CompiledKernel`` (the driver reads
-    ``ck.asm["ptx"]`` for the checker);
+    ``ck.asm[<artifact>]`` — ``ptx`` or ``ttgir`` per ``--artifact`` — for the checker);
   * how to ``run`` a config on a random seed and return the output ``bytes``
     (the fuzzer's ground-truth observation; welford concatenates Mean + Var);
   * a small precision size for Stages 1-2 and, for perf-capable kernels, a
@@ -390,7 +390,10 @@ def _bench_ms(thunk):
 
 
 def _persist_benchmark(config, size):
-    """Compile + time the persistent kernel on plain data; returns (ms, output_bytes, ptx)."""
+    """Compile + time the persistent kernel on plain data; returns (ms, output_bytes, asm).
+
+    Returns the full ``ck.asm`` dict so the driver can hand the checker whichever
+    artifact ``--artifact`` selects (``ptx`` or ``ttgir``)."""
     rows, cols = size
     src = _randn_2d(rows, cols, 0)
     out = torch.empty(rows, device=DEVICE, dtype=torch.float32)
@@ -405,7 +408,7 @@ def _persist_benchmark(config, size):
 
     thunk()
     torch.cuda.synchronize()
-    return _bench_ms(thunk), _to_bytes(out), ck.asm["ptx"]
+    return _bench_ms(thunk), _to_bytes(out), ck.asm
 
 
 def _persist_perf_configs():
@@ -436,7 +439,7 @@ class KernelSpec:
     known_limitation: str  # non-empty => Stage 1 reports LIMITED with this note
     compile_fn: object  # (config, size) -> CompiledKernel
     run_fn: object  # (config, ck, seed, size) -> bytes
-    perf_fn: object = None  # (config, size) -> (ms, bytes, ptx); None => no Stage 3
+    perf_fn: object = None  # (config, size) -> (ms, bytes, asm_dict); None => no Stage 3
     perf_configs_fn: object = None  # () -> list[Config]; None => no Stage 3
 
     @property
