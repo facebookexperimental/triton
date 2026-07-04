@@ -226,6 +226,39 @@ Data partitioning operates **after** task ID assignment. The offset parameter
 selects which task ID from the original array. This is how N consumer warp
 groups each get their slice of the data.
 
+### Loop-Carried Accumulator Initialization
+
+A `use_acc` MMA whose accumulator is a mutable TMEM alloc reused across a loop
+does not thread the accumulator as an SSA value. Instead the alloc is loop
+invariant and the loop carries an `async.token` that orders the in-place
+reads/writes; cross-iteration accumulation is driven by the persistent memory
+plus the `use_acc` flag. Such an accumulator is frequently zero-initialized by a
+pre-loop whole-tensor store, e.g. `tmem_store %cst, %acc`, whose result token
+seeds the loop-carried accumulator token.
+
+When the accumulator alloc is sliced, this initializing store must be sliced
+too. `getBackwardSliceToPartition` therefore inspects the users of a partitioned
+`TMEMAllocOp` and pulls any whole-accumulator `TMEMStoreOp` (and, backward, its
+source) into the scheme, partitioned along the same dimension — mirroring the
+existing handling of `TMEMCopyOp` initializers. Each per-partition accumulator
+then gets its own sliced zero-init store and its own loop-carried token.
+
+If the store is left unpartitioned, two failures follow:
+
+1. **Uninitialized slices** — the sliced accumulators are never zero-initialized.
+2. **Undead original** — the sliced MMAs reuse the *original* accumulator's loop
+   token (because slicing that token, defined by the unsliced store, yields
+   nothing to append as a new loop arg). The shared token stays live through the
+   sliced ops, so `populateForOpDeadArgumentElimination` cannot drop the
+   original loop arg, and the full-size original accumulator chain survives into
+   later passes (e.g. producing an invalid `256`-row TMEM allocation that
+   `NVGPUWarpSpecialization` rejects with `blockM must be 64 or 128`).
+
+This matters for reduction-style backward kernels such as HSTU
+`reduce_dq`, where the `dk` accumulator (`use_acc`, KV-row partitioned) is
+zero-initialized before the Q loop while the sibling `dk_attn` accumulator (not
+`use_acc`) is seeded directly by its alloc token and so was already handled.
+
 ## Regression Tests
 
 - `test/Hopper/WarpSpecialization/ws_data_partition_scaled_memdesc_reshape_reproducer.mlir`

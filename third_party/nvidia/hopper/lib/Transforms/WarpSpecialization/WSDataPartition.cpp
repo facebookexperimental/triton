@@ -163,6 +163,8 @@ struct DataPartitionScheme {
         if (slicedM >= minM)
           continue;
 
+        // TMEM allocations are >= 128 rows (128 lanes), so an M-dim slice below
+        // blockM is not representable -- cannot partition along M here.
         op->emitWarning()
             << "skipping M-dimension data partitioning because slicing "
                "TMEM result from "
@@ -212,7 +214,11 @@ struct DataPartitionScheme {
       if (dotPartitionOperand.contains(op)) {
         operand = "operand " + std::to_string(dotPartitionOperand.at(op));
       }
-      assert(opPartitionDims.contains(op) && "missing partition dim");
+      if (!opPartitionDims.contains(op)) {
+        LDBG(" <no partition dim> " << operand);
+        op->dump();
+        continue;
+      }
       LDBG(" dim " << opPartitionDims.at(op) << " " << operand);
       op->dump();
     }
@@ -306,6 +312,30 @@ static Value getDotPartitionRoot(Operation *op) {
   if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(op))
     return mmaOp.getAccumulator();
   llvm_unreachable("expected dot or MMAv5 op");
+}
+
+// SSA value carrying the dot's output, for the "output is only consumed by an
+// atomic/reduce store" check that authorizes replicate-and-reduce partitioning
+// along the contraction (K) dim. A Hopper wgmma yields the result directly; an
+// MMAv5 accumulator lives in TMEM and is read back by a tmem_load, so return
+// that load's result (the value that flows to the reduce store). Returns null if
+// there is not exactly one such load (ambiguous -> don't replicate).
+static Value getDotOutputValue(Operation *op) {
+  if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(op))
+    return dotOp.getD();
+  if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(op)) {
+    Value acc = mmaOp.getAccumulator();
+    ttng::TMEMLoadOp load;
+    for (Operation *user : acc.getUsers()) {
+      if (auto l = dyn_cast<ttng::TMEMLoadOp>(user)) {
+        if (load)
+          return {}; // more than one load of the accumulator -> ambiguous
+        load = l;
+      }
+    }
+    return load ? load.getResult() : Value{};
+  }
+  return {};
 }
 
 static Value getMMAv5ScaleOperand(Operation *op, unsigned operandIdx) {
@@ -588,6 +618,29 @@ static bool getBackwardSliceToPartition(Value v,
             return false;
         }
       }
+      // Capture a whole-accumulator initializing store (e.g. a pre-loop
+      // `tmem_store %cst, %acc` that zero-inits a use_acc MMA accumulator). Its
+      // result token seeds the loop-carried accumulator token; if the store is
+      // not partitioned along with the accumulator, the sliced accumulators
+      // reuse the original's loop token (blocking dead-arg elimination of the
+      // unsliced original) and are never initialized. The store writes the full
+      // accumulator, so its source is partitioned along the same dim.
+      for (Operation *user : tmemAllocOp.getResult().getUsers()) {
+        auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user);
+        if (!storeOp || storeOp.getDst() != tmemAllocOp.getResult())
+          continue;
+        if (!partitionScheme.ops.insert(storeOp)) {
+          if (!isControlFlowOp(storeOp) &&
+              partitionScheme.opPartitionDims[storeOp] != currentDim) {
+            return false;
+          }
+          continue;
+        }
+        partitionScheme.opPartitionDims[storeOp] = currentDim;
+        if (!getBackwardSliceToPartition(storeOp.getSrc(), partitionScheme,
+                                         currentDim))
+          return false;
+      }
     } else if (op->hasTrait<OpTrait::Elementwise>() ||
                isa<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
                    arith::ExtFOp, BroadcastOp, ExpandDimsOp, MakeRangeOp,
@@ -861,9 +914,13 @@ static bool getForwardSliceToPartition(Value v,
       Value opndB = getDotOperandB(depOp);
       if ((currentDim == 0 && v == opndB) || (currentDim == 1 && v == opndA)) {
         // It is fine to continue the partition if the dot output is immediately
-        // stored out via an atomic add, as the dot computes a partial result.
-        if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(depOp);
-            dotOp && onlyUsedByAtomicStore(dotOp.getD())) {
+        // stored out via an atomic/reduce add, as each partition then computes a
+        // partial result that the atomic add reduces in global memory. Handles
+        // both Hopper wgmma (SSA result) and Blackwell MMAv5 (TMEM accumulator
+        // read back by a tmem_load, e.g. HSTU reduce_dq: dqT = Kt @ dST is a
+        // KV-contraction whose tmem_load -> trans -> descriptor_reduce(add)).
+        if (Value dotOut = getDotOutputValue(depOp);
+            dotOut && onlyUsedByAtomicStore(dotOut)) {
           partitionScheme.dotPartitionOperand[depOp] = v == opndA ? 0 : 1;
           // Duplicate the users of the dot output since the shape of the output
           // will not be changed
