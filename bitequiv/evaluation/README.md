@@ -69,11 +69,39 @@ python -m bitequiv.evaluation.evaluate --checker my.module:my_descriptor        
 ```
 
 Flags: `--kernels all|<comma list>`, `--stages 1,2[,3]`, `--config-effort`,
-`--fuzzer-effort`, `--checker module:function`, `--out <path>`.
+`--fuzzer-effort`, `--checker module:function`, `--artifact ptx|ttgir`,
+`--allow-unsound`, `--out <path>`.
 
 The GPU-gated pytest `bitequiv/tests/test_ptx_kernel_suite.py` runs Stage 2
 (light / fast) as a subprocess and asserts **over-merges == 0**. If a kernel
 launch ever hangs, kill it with `third_party/tlx/killgpu.sh`.
+
+## Running against the TTGIR checker
+
+The framework is checker- and artifact-pluggable, so it also measures the **TTGIR**
+reduction-order checker (`bitequiv.ttgir_reduction.ttgir_reduction_descriptor`, the
+MLIR-native sibling of the PTX checker). Point `--checker` at it and feed it TTGIR
+instead of PTX with `--artifact ttgir`:
+
+```bash
+python -m bitequiv.evaluation.evaluate \
+  --checker bitequiv.ttgir_reduction:ttgir_reduction_descriptor \
+  --artifact ttgir --allow-unsound --stages 1,2
+```
+
+The TTGIR checker is **expectedly not sound**: TTGIR fixes the reduction
+*association order* but is provably blind to **FMA contraction** (whether a `mul`
+feeding a reduction fuses into a single rounded `fma`), which is decided *below*
+TTGIR and gated by `enable_fp_fusion`. So on the mul-fed kernels (`dot`, `welford`)
+it over-merges configs whose bits differ — which is precisely the gap the PTX
+checker closes. That is why we pass `--allow-unsound`: the framework still emits the
+full report (with the honest over-merge count) and exits 0 instead of failing the
+soundness gate. The over-merges it reports are the documented finding — compare the
+TTGIR partition (this run) against the PTX one (the default run) to see exactly the
+FMA-fusion pairs PTX separates and TTGIR cannot.
+
+The GPU-gated pytest `bitequiv/tests/test_ttgir_kernel_suite.py` drives this and
+asserts the report is produced (it does **not** assert over-merges == 0).
 
 ## What the baseline run shows
 
