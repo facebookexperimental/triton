@@ -4,7 +4,10 @@ Status: design note, written 2026-07 alongside the throughput-based latency
 model change (PR #1912). Audience: whoever replaces the current heuristic
 modulo scheduler (Rau IMS / SMS / exhaustive, dispatched in
 `ModuloReservationTable.cpp:runModuloScheduling`) with a global optimal
-solver (ILP / CP-SAT, "Twill-style").
+solver (ILP / CP-SAT, "Twill-style"). Extended 2026-07-05 with a gap
+analysis against the Twill paper itself (Soi et al., "Optimal Software
+Pipelining and Warp Specialization for Tensor Core GPUs",
+arXiv:2512.18134) — see "Gap analysis" below.
 
 ## Why this note exists
 
@@ -140,3 +143,145 @@ Any solver rewrite should reproduce, on B200:
 - case6 layernorm: schedules at all (guard-2 canary), store channel depth 2.
 - case5: non-NaN output (guard-3 canary).
 `examples/testing/run_regression.py` automates the correctness+perf sweep.
+
+## Gap analysis: current pipeline vs. Twill (arXiv:2512.18134)
+
+Twill (Soi, Yadav et al.) formulates SWP and WS as ONE optimization problem:
+an ILP finds an optimal modulo schedule (M, I), the schedule is unrolled into
+a straight-line program Q (prologue + one steady-state copy + epilogue), and
+an SMT solver then jointly re-derives the schedule `op[v,i,t]` AND the warp
+assignment `opw[v,w]` under memory, register, cross-warp-spill and
+blocking-sync constraints. On FA fwd it rediscovers FA3 (Hopper ping-pong)
+and FA4 (Blackwell 3-WG rescale split) from first principles; solve times are
+19–269 s.
+
+Our pipeline is the opposite shape — "schedule first, partition second, patch
+third": DDG → MinII → Rau IMS heuristic (`ModuloReservationTable.cpp`) →
+cluster partitioner scoring a frozen schedule
+(`ModuloSchedulePass.cpp:scoreCandidate`) → `insertCrossGroupBarriers` →
+sched2tlx emitter. The FA softmax-cut 5x regression (guard 1) is a measured
+instance of exactly the failure mode Twill's joint formulation exists to
+prevent: the scheduler picked a tighter II that was only realizable by
+cutting a register chain, and the cost of the cut was invisible to it. The
+gaps, roughly ordered by structural depth:
+
+### 1. Schedule and WS partition are solved separately (the big one)
+
+Twill's CROSS-WARPSPILLS constraint puts the reg→SMEM→reg round-trip
+directly into the dependence delay of the joint problem; its CONCURRENCY
+constraint models blocking waits interrupting same-warp issue. Our
+equivalents (`kCrossWGRoundTripLatency`, `smemMoveCost`,
+`computeWGBarrierCost`) live in the partitioner's after-the-fact score,
+where they can only de-rank bad partitions of an already-fixed schedule.
+Guard 1's migration plan ("delete the guard, price the cut in the
+objective") is the first step of this; the end state is warp assignment as
+a decision variable co-solved with placement.
+
+### 2. Heuristic search → complete solver
+
+Rau IMS + ejection + a bounded II window is an incomplete search; guard 2
+(the window) exists only because of that incompleteness and disappears under
+any complete method. `ExhaustiveScheduler.cpp` (branch-and-bound + joint
+SMEM/TMEM feasibility, practical to ~20 ops) is the in-tree seed: its buffer
+extraction and feasibility check are exactly the constraints a CP-SAT/ILP
+backend needs. Twill uses CBC for the ILP and Yices2 (QF_LIA) for the joint
+problem; OR-Tools CP-SAT is likely the better modern default.
+
+### 3. Cost normalization is a tractability PREREQUISITE
+
+Optimal modulo scheduling is exponential in the sum of edge delays, not just
+|G|. Feeding raw calibrated costs (hundreds–thousands of cycles) to a solver
+is intractable. Twill §5.2 solves a small side-ZLP: find integer costs C'
+minimizing ratio distortion vs. C, with sum(C') ≤ U (they use U=300; SCIP,
+<500 ms). Note the per-op calibration in `NVLatencyModel.cpp` transfers
+unchanged — normalization is a layer on top, applied at solver-input time.
+Side benefit: our per-cycle reservation table currently pretends a
+resolution the model doesn't actually have; normalized costs are more
+honest about that.
+
+### 4. Scalar occupancy → resource reservation tables (RRTs)
+
+`ModuloReservationTable` gives each pipeline one row with exclusive interval
+occupancy. It cannot express pipelined units (issue throughput ≠ completion
+latency), multi-instance resources (cap(f) > 1), or ops touching different
+units in different cycles of their execution. The 2026-07
+`occupancy`/`selfLatency` split is a two-field approximation of a pipelined
+unit; an RRT (per-cycle usage vector per op + per-unit capacity, Twill §3.1)
+expresses it natively and would subsume the split.
+
+### 5. Memory and register pressure as scheduling constraints
+
+Twill encodes liveness (`live[v,i,t]`, backward-dataflow rules as SMT
+implications) and enforces MEMORYCAPACITY per memory and REGISTERLIMIT per
+warp inside the joint problem. Our main path (Rau IMS) is memory-blind;
+only the exhaustive branch checks budgets, and only post-placement.
+Two concrete consequences for the rewrite:
+- Buffer/channel depths become decision variables under the SMEM budget
+  (replacing the `lifetime/II+1` store-consumer-only rule — see the channel
+  depth section above, including the unexplained 6x register-consumer
+  hazard that must be priced first).
+- Register budget must be a conservative, tunable parameter, not the
+  architectural max: Twill's Blackwell-bwd experiment found a schedule
+  their own model said fits, yet ptxas spilled badly; re-solving with a
+  reduced register budget produced the (faster) FA4-style 3-WG strategy.
+  Expect the same ptxas gap here.
+
+### 6. Variable-latency ops: classify, don't average
+
+Twill §5.3 splits variable-latency ops in two: *streaming* ops (no incoming
+deps, e.g. TMA input loads) get latency 0 in the cost model, live on a
+dedicated warp, and their pipeline depth is exposed as an autotuning
+parameter outside the solver; dependent variable-latency ops are forced
+onto the designated VL warp (VARIABLELATENCY constraint). We currently give
+TMA loads one calibrated fixed latency and derive depth from lifetime/II.
+Adopting the streaming classification shrinks the solve space AND removes
+the worst source of static-latency error from the schedule.
+
+### 7. Blocking-sync issue interference, modeled not penalized
+
+The `TRITON_MODULO_STAGE_SEPARATION` min(syncWork, asyncWork) penalty is a
+self-declared workaround for the Fig.-2 problem in the paper (a blocking
+wait on one op stalls issue of independent ops on the same warp). Twill's
+CONCURRENCY constraint is the principled version: designate blocking edges;
+forbid co-scheduling other ops on the consumer's warp across the wait. In a
+joint formulation the penalty is deleted and the constraint does its job.
+
+### 8. Scheduling granularity: sub-tiling
+
+Easy to miss but load-bearing: Twill reports the joint problem is UNSAT on
+the un-sub-tiled tutorial FA — FA3 ping-pong and FA4's two softmax groups
+require splitting one tile-level op into two sub-tile instances that
+interleave. Our DDG nodes are whole TTGIR ops, so ping-pong-class schedules
+are not merely unreached by the heuristic, they are ABSENT from the solution
+space. A pre-scheduling sub-tiling transform (or reuse of AutoWS subtile
+machinery) is required before a solver can find them.
+
+### 9. Emitter legality as explicit constraints
+
+Covered by guard 3 above; restated here because it generalizes: the solver
+formulation should carry a versioned whitelist of emitter-lowerable
+partition/loop shapes (outer-loop single-WG, blockM≤128 TMEM, ...) as hard
+constraints, each removed as the emitter gains the capability — never
+encoded implicitly in costs, or the solver will route around it and regress
+correctness.
+
+### Suggested sequencing
+
+1. **Now, heuristic unchanged**: keep calibrating the second-order terms in
+   `scoreCandidate` (barrier round-trips, channel SMEM, wave quantization) —
+   these become objective terms later, no work wasted.
+2. **Mid**: grow `ExhaustiveScheduler` into a CP-SAT backend for schedule +
+   buffer depths only (partitioner stays), with cost normalization. This
+   alone deletes guard 2.
+3. **Long**: joint schedule+partition formulation (deletes guard 1, converts
+   guard 3 to constraints), sub-tiling in front, streaming depths handed to
+   the autotuner. Position it as an offline/autotune tool, not the default
+   JIT path — Twill's own solve times (tens of seconds to minutes) imply
+   the same.
+
+The validation harness above is the gate for every step, and the
+"Why this note exists" principle is the order of operations: a complete
+solver exploits model error maximally, so model calibration must land
+BEFORE each increment of solver power, not after. (`LLMSchedulePass.cpp`,
+the experimental Claude-API scheduler, shares the same DDG serialization
+and should reuse the same canaries.)
