@@ -2474,6 +2474,40 @@ struct SqrtOpConversion
 private:
   bool ftz;
 };
+struct TanhApproxFallbackConversion
+    : ElementwiseOpConversionBase<triton::TanhApproxOp,
+                                  TanhApproxFallbackConversion> {
+  using Base = ElementwiseOpConversionBase<triton::TanhApproxOp,
+                                           TanhApproxFallbackConversion>;
+  using Base::Base;
+  using Adaptor = typename Base::OpAdaptor;
+
+  SmallVector<Value> createDestOps(triton::TanhApproxOp op, OpAdaptor adaptor,
+                                   ConversionPatternRewriter &rewriter,
+                                   Type elemTy, MultipleOperandsRange operands,
+                                   Location loc) const {
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    Value input = operands[0][0];
+    bool isF64 = elemTy.isF64();
+    bool needsCast = !elemTy.isF32() && !isF64;
+
+    Type computeTy = isF64 ? f64_ty : f32_ty;
+    if (needsCast)
+      input = b.fpext(f32_ty, input);
+
+    StringRef funcName = isF64 ? "__ocml_tanh_f64" : "__ocml_tanh_f32";
+    auto funcType = LLVM::LLVMFunctionType::get(computeTy, {computeTy});
+    LLVM::LLVMFuncOp funcOp =
+        appendOrGetExternFuncOp(rewriter, op, funcName, funcType);
+    Value result =
+        LLVM::createLLVMCallOp(rewriter, loc, funcOp, input).getResult();
+
+    if (needsCast)
+      result = b.fptrunc(elemTy, result);
+    return {result};
+  }
+};
+
 } // namespace
 
 namespace mlir::triton::AMD {
@@ -2524,6 +2558,9 @@ void populateElementwiseOpToLLVMPatterns(
       typeConverter, axisInfoAnalysis, benefit);
   patterns.add<ElementwiseOpConversion<triton::PreciseSqrtOp, LLVM::SqrtOp>>(
       typeConverter, axisInfoAnalysis, benefit);
+
+  patterns.add<TanhApproxFallbackConversion>(typeConverter, axisInfoAnalysis,
+                                             benefit);
 
   patterns.add<FDivOpConversion>(typeConverter, axisInfoAnalysis, benefit);
   patterns.add<FSubOpConversion>(typeConverter, axisInfoAnalysis, benefit);
