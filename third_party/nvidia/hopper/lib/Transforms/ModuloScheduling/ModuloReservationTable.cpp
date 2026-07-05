@@ -266,8 +266,13 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
   if (maxII <= 0)
     maxII = 2 * minII;
 
-  // Cap maxII to avoid spending too long on large DDGs.
-  maxII = std::min(maxII, minII + 10);
+  // Cap maxII to avoid spending too long on large DDGs. The slack window
+  // scales with minII: GPU inner-loop IIs are hundreds of cycles with
+  // multi-hundred-cycle op durations, so a fixed +10 window (classic CPU
+  // modulo-scheduling folklore) is too narrow to absorb reservation-table
+  // fragmentation when one pipeline is saturated (ResMII-bound with zero
+  // slack, e.g. layernorm's CUDA pipe).
+  maxII = std::min(maxII, minII + std::max(10, minII / 8));
 
   LLVM_DEBUG({
     DBGS() << "MinII=" << minII << " MaxII=" << maxII
