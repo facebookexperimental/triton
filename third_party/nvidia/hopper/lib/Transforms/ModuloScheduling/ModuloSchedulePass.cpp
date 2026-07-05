@@ -3877,6 +3877,9 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
       // is also marginal: the outer II is dominated by the inner-loop
       // super-node (thousands of cycles), so overlapping the epilogue saves a
       // few percent at best while risking an unlowerable partition.
+      // This is an EMITTER-capability legality constraint — keep it (in some
+      // form) even under a global solver. See docs/SolverMigrationNotes.md
+      // (guard 3).
       if (sl.isOuter) {
         for (auto &node : schedLoop.nodes)
           node.warpGroup = (node.pipeline == ttg::HWPipeline::NONE) ? -1 : 0;

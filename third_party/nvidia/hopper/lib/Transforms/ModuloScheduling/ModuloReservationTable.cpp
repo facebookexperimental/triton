@@ -271,7 +271,9 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
   // multi-hundred-cycle op durations, so a fixed +10 window (classic CPU
   // modulo-scheduling folklore) is too narrow to absorb reservation-table
   // fragmentation when one pipeline is saturated (ResMII-bound with zero
-  // slack, e.g. layernorm's CUDA pipe).
+  // slack, e.g. layernorm's CUDA pipe). A complete (ILP-style) search has no
+  // such fragmentation failure mode — see docs/SolverMigrationNotes.md
+  // (guard 2).
   maxII = std::min(maxII, minII + std::max(10, minII / 8));
 
   LLVM_DEBUG({

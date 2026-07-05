@@ -196,6 +196,11 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
   // another TC node through intra-iteration (distance-0) dependence edges.
   // Runs BEFORE Phase 3 so loop-carried TC→TC back-edges see the corrected
   // occupancy.
+  //
+  // NOTE: this is a guard for the HEURISTIC search pipeline, not a hardware
+  // truth — a future global solver should delete it and price the cross-WG
+  // channel cost in its objective instead. See
+  // docs/SolverMigrationNotes.md (guard 1).
   {
     SmallVector<unsigned> tcNodes;
     for (const auto &node : ddg.nodes)
