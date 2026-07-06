@@ -38,6 +38,10 @@ import triton.language.extra.tlx as tlx
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
+def _gemm_tflops(ms: float, M: int, N: int, K: int) -> float:
+    return 2 * M * N * K / (ms * 1e-3) / 1e12
+
+
 def is_gfx1250_available():
     try:
         target = triton.runtime.driver.active.get_current_target()
@@ -496,8 +500,8 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
     tlx.async_amd_descriptor_wait(0)
 
 
-def matmul_tdm_pipelined(a: torch.Tensor, b: torch.Tensor, BLOCK_M: int = 128, BLOCK_N: int = 128,
-                         BLOCK_K: int = 32) -> torch.Tensor:
+def matmul_tdm_pipelined(a: torch.Tensor, b: torch.Tensor, BLOCK_M: int = 128, BLOCK_N: int = 128, BLOCK_K: int = 32,
+                         BENCHMARK: str | None = None, BENCHMARK_NUM_ITERS: int = 32) -> torch.Tensor:
     assert a.is_contiguous() and b.is_contiguous(), "A and B must be contiguous"
     assert a.dtype == b.dtype, "A and B must have the same dtype"
     M, K = a.shape
@@ -508,17 +512,28 @@ def matmul_tdm_pipelined(a: torch.Tensor, b: torch.Tensor, BLOCK_M: int = 128, B
 
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
-    matmul_tdm_pipelined_kernel[grid](
-        a,
-        b,
-        c,
-        M,
-        N,
-        K,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-    )
+
+    def run_kernel():
+        return matmul_tdm_pipelined_kernel[grid](
+            a,
+            b,
+            c,
+            M,
+            N,
+            K,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+        )
+
+    if BENCHMARK == "graph":
+        ms = triton.testing.do_bench_cudagraph(run_kernel, rep=BENCHMARK_NUM_ITERS)
+        print(f"execution time: {ms} ms, {_gemm_tflops(ms, M, N, K):.2f} TFLOPS")
+    elif BENCHMARK == "eager":
+        ms = triton.testing.do_bench(run_kernel, warmup=30, rep=BENCHMARK_NUM_ITERS)
+        print(f"execution time: {ms} ms, {_gemm_tflops(ms, M, N, K):.2f} TFLOPS")
+    else:
+        run_kernel()
     return c
 
 
@@ -530,6 +545,8 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule(
     NUM_BUFFERS: int = 2,
     TRANSPOSE_B: bool = False,
     L2_PREFETCH_DISTANCE: int = 2,
+    BENCHMARK: str | None = None,
+    BENCHMARK_NUM_ITERS: int = 32,
 ) -> torch.Tensor:
     assert a.is_contiguous() and b.is_contiguous(), "A and B must be contiguous"
     assert a.dtype == b.dtype, "A and B must have the same dtype"
@@ -544,28 +561,39 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule(
     c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
     grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), )
-    matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel[grid](
-        a,
-        b,
-        c,
-        M,
-        N,
-        K,
-        a.stride(0),
-        a.stride(1),
-        stride_bk,
-        stride_bn,
-        c.stride(0),
-        c.stride(1),
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        NUM_BUFFERS=NUM_BUFFERS,
-        TRANSPOSE_B=TRANSPOSE_B,
-        L2_PREFETCH_DISTANCE=L2_PREFETCH_DISTANCE,
-        num_warps=4,
-        waves_per_eu=1,
-    )
+
+    def run_kernel():
+        return matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel[grid](
+            a,
+            b,
+            c,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            stride_bk,
+            stride_bn,
+            c.stride(0),
+            c.stride(1),
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            NUM_BUFFERS=NUM_BUFFERS,
+            TRANSPOSE_B=TRANSPOSE_B,
+            L2_PREFETCH_DISTANCE=L2_PREFETCH_DISTANCE,
+            num_warps=4,
+            waves_per_eu=1,
+        )
+
+    if BENCHMARK == "graph":
+        ms = triton.testing.do_bench_cudagraph(run_kernel, rep=BENCHMARK_NUM_ITERS)
+        print(f"execution time: {ms} ms, {_gemm_tflops(ms, M, N, K):.2f} TFLOPS")
+    elif BENCHMARK == "eager":
+        ms = triton.testing.do_bench(run_kernel, warmup=30, rep=BENCHMARK_NUM_ITERS)
+        print(f"execution time: {ms} ms, {_gemm_tflops(ms, M, N, K):.2f} TFLOPS")
+    else:
+        run_kernel()
     return c
 
 
@@ -692,10 +720,63 @@ def test_matmul_tdm_pipelined_single_warp_per_simd_schedule_gfx1250(TRANSPOSE_B)
 
 
 if __name__ == "__main__":
+    import argparse
+
     if not is_gfx1250_available():
         raise SystemExit("Requires gfx1250 hardware")
-    a = torch.randn((512, 256), device=DEVICE, dtype=torch.float16)
-    b = torch.randn((256, 512), device=DEVICE, dtype=torch.float16)
-    out = matmul_tdm_pipelined(a, b, BLOCK_M=128, BLOCK_N=128, BLOCK_K=32)
-    ref = torch.matmul(a, b)
-    print(f"max abs diff: {(out - ref).abs().max().item():.4f}")
+
+    parser = argparse.ArgumentParser(description="Benchmark the TLX AMD f16 TDM GEMM tutorial kernels")
+    parser.add_argument("--kernel", choices=["simple", "single_warp"], default="single_warp")
+    parser.add_argument("-M", type=int, default=2048, help="problem M size")
+    parser.add_argument("-N", type=int, default=1024, help="problem N size")
+    parser.add_argument("-K", type=int, default=8192, help="problem K size")
+    parser.add_argument("-BM", type=int, default=256, help="BLOCK_M")
+    parser.add_argument("-BN", type=int, default=256, help="BLOCK_N")
+    parser.add_argument("-BK", type=int, default=128, help="BLOCK_K for --kernel simple")
+    parser.add_argument("--num_buffers", type=int, default=2, choices=[2, 3, 4])
+    parser.add_argument("--transpose_b", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--l2_prefetch_distance", type=int, default=2)
+    parser.add_argument("--benchmark_mode", choices=["eager", "graph", "none"], default="eager")
+    parser.add_argument("--benchmark_num_iters", type=int, default=32)
+    parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+    a = torch.randn((args.M, args.K), device=DEVICE, dtype=torch.float16)
+    if args.kernel == "single_warp" and args.transpose_b:
+        b = torch.randn((args.N, args.K), device=DEVICE, dtype=torch.float16)
+    else:
+        b = torch.randn((args.K, args.N), device=DEVICE, dtype=torch.float16)
+
+    benchmark = None if args.benchmark_mode == "none" else args.benchmark_mode
+    if args.kernel == "simple":
+        if args.transpose_b:
+            raise SystemExit("--kernel simple expects non-transposed B; pass --no-transpose_b")
+        out = matmul_tdm_pipelined(
+            a,
+            b,
+            BLOCK_M=args.BM,
+            BLOCK_N=args.BN,
+            BLOCK_K=args.BK,
+            BENCHMARK=benchmark,
+            BENCHMARK_NUM_ITERS=args.benchmark_num_iters,
+        )
+        b_ref = b
+    else:
+        out = matmul_tdm_pipelined_single_warp_per_simd_schedule(
+            a,
+            b,
+            BLOCK_M=args.BM,
+            BLOCK_N=args.BN,
+            NUM_BUFFERS=args.num_buffers,
+            TRANSPOSE_B=args.transpose_b,
+            L2_PREFETCH_DISTANCE=args.l2_prefetch_distance,
+            BENCHMARK=benchmark,
+            BENCHMARK_NUM_ITERS=args.benchmark_num_iters,
+        )
+        b_ref = b.T if args.transpose_b else b
+
+    if args.check:
+        ref = torch.matmul(a.to(torch.float32), b_ref.to(torch.float32)).to(out.dtype)
+        print(f"max abs diff: {(out - ref).abs().max().item():.4f}")

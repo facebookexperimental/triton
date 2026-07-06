@@ -1170,6 +1170,10 @@ DTYPE_TO_TRITON = {
 }
 
 
+def _mxfp_gemm_tflops(ms: float, M: int, N: int, K: int) -> float:
+    return 2 * M * N * K / (ms * 1e-3) / 1e12
+
+
 def _init_data(dtype: str, rows: int, cols: int):
     if dtype == "float4":
         return MXFP4Tensor(size=(rows, cols)).random()
@@ -1201,6 +1205,9 @@ def mxgemm_tdm_pipelined(
     K: int | None = None,
     TDM_FUSION: str = "none",
     TDM_SPLIT: bool = False,
+    GROUP_SIZE_M: int = 8,
+    BENCHMARK: str | None = None,
+    BENCHMARK_NUM_ITERS: int = 32,
 ) -> torch.Tensor:
     if M is None:
         M = a.shape[0]
@@ -1220,40 +1227,51 @@ def mxgemm_tdm_pipelined(
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
     a_scale_arg = a_scale if WITH_A_SCALE else b_scale
     grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), )
-    mxgemm_tdm_pipelined_kernel[grid](
-        a,
-        b,
-        c,
-        a_scale_arg,
-        b_scale,
-        M,
-        N,
-        K,
-        a.stride(0),
-        a.stride(1),
-        stride_bk,
-        stride_bn,
-        c.stride(0),
-        c.stride(1),
-        b_scale.stride(0),
-        DTYPE_A=DTYPE_A,
-        DTYPE_B=DTYPE_B,
-        SCALE_BLOCK=32,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        GROUP_SIZE_M=8,
-        TRANSPOSE_B=TRANSPOSE_B,
-        NUM_BUFFERS=NUM_BUFFERS,
-        SCALE_PRESHUFFLE=SCALE_PRESHUFFLE,
-        WITH_A_SCALE=WITH_A_SCALE,
-        SCHEDULE=SCHEDULE,
-        TDM_FUSION=TDM_FUSION,
-        L2_PREFETCH_DISTANCE=L2_PREFETCH_DISTANCE,
-        TDM_SPLIT=TDM_SPLIT,
-        num_warps=4,
-        waves_per_eu=1,
-    )
+
+    def run_kernel():
+        return mxgemm_tdm_pipelined_kernel[grid](
+            a,
+            b,
+            c,
+            a_scale_arg,
+            b_scale,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            stride_bk,
+            stride_bn,
+            c.stride(0),
+            c.stride(1),
+            b_scale.stride(0),
+            DTYPE_A=DTYPE_A,
+            DTYPE_B=DTYPE_B,
+            SCALE_BLOCK=32,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            GROUP_SIZE_M=GROUP_SIZE_M,
+            TRANSPOSE_B=TRANSPOSE_B,
+            NUM_BUFFERS=NUM_BUFFERS,
+            SCALE_PRESHUFFLE=SCALE_PRESHUFFLE,
+            WITH_A_SCALE=WITH_A_SCALE,
+            SCHEDULE=SCHEDULE,
+            TDM_FUSION=TDM_FUSION,
+            L2_PREFETCH_DISTANCE=L2_PREFETCH_DISTANCE,
+            TDM_SPLIT=TDM_SPLIT,
+            num_warps=4,
+            waves_per_eu=1,
+        )
+
+    if BENCHMARK == "graph":
+        ms = triton.testing.do_bench_cudagraph(run_kernel, rep=BENCHMARK_NUM_ITERS)
+        print(f"execution time: {ms} ms, {_mxfp_gemm_tflops(ms, M, N, K):.2f} TFLOPS")
+    elif BENCHMARK == "eager":
+        ms = triton.testing.do_bench(run_kernel, warmup=30, rep=BENCHMARK_NUM_ITERS)
+        print(f"execution time: {ms} ms, {_mxfp_gemm_tflops(ms, M, N, K):.2f} TFLOPS")
+    else:
+        run_kernel()
     return c
 
 
@@ -1427,3 +1445,86 @@ def test_mxgemm_tdm_pipelined_gfx1250(TRANSPOSE_B, SEED, M, N, K, SCHEDULE, DTYP
                                NUM_BUFFERS, DTYPE_TO_TRITON[DTYPE_A], DTYPE_TO_TRITON[DTYPE_B], SCALE_PRESHUFFLE,
                                WITH_A_SCALE, SCHEDULE, L2_PREFETCH_DISTANCE, M, N, K, TDM_FUSION, TDM_SPLIT)
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-5, atol=2e-2)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Benchmark the TLX AMD MXFP TDM GEMM tutorial kernel")
+    parser.add_argument("-M", type=int, default=2048, help="problem M size")
+    parser.add_argument("-N", type=int, default=1024, help="problem N size")
+    parser.add_argument("-K", type=int, default=8192, help="problem K size")
+    parser.add_argument("-BM", type=int, default=256, help="BLOCK_M")
+    parser.add_argument("-BN", type=int, default=256, help="BLOCK_N")
+    parser.add_argument("-BK", type=int, default=256, help="BLOCK_K")
+    parser.add_argument("--num_warps", type=int, default=4, choices=[4], help="kernel num_warps")
+    parser.add_argument("--num_buffers", type=int, default=3, choices=[2, 3, 4])
+    parser.add_argument("--group_size_m", type=int, default=8, choices=[1, 2, 4, 8])
+    parser.add_argument("--dtype_a", type=str, default="float8_e4m3", choices=tuple(DTYPE_TO_TRITON))
+    parser.add_argument("--dtype_b", type=str, default="float4", choices=tuple(DTYPE_TO_TRITON))
+    parser.add_argument("--scale_preshuffled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--with_a_scale", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--transpose_b", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--schedule", type=str, default="sliceMNK",
+                        choices=["baseline", "sliceK", "sliceNK", "sliceMNK"])
+    parser.add_argument("--tdm_fusion", type=str, default="partial", choices=["none", "2way", "4way", "partial"])
+    parser.add_argument("--partial_tdm", action="store_true",
+                        help="Alias for --tdm_fusion partial, matching the Gluon CLI spelling")
+    parser.add_argument("--tdm_split", action="store_true")
+    parser.add_argument("--l2_prefetch_distance", type=int, default=-1,
+                        help="Prefetch distance in K iterations; -1 disables L2 prefetch")
+    parser.add_argument("--benchmark_mode", choices=["eager", "graph", "none"], default="eager")
+    parser.add_argument("--benchmark_num_iters", type=int, default=32)
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+    a = _init_data(args.dtype_a, args.M, args.K)
+    b = _init_data(args.dtype_b, args.K, args.N)
+    if args.with_a_scale:
+        a_scale = MXScaleTensor(size=(args.M, triton.cdiv(args.K, 32))).random(high=32.0).data
+    else:
+        a_scale = None
+    b_scale = MXScaleTensor(size=(args.N, triton.cdiv(args.K, 32))).random(high=32.0).data
+
+    a_scale_input = pack_scale(a_scale) if args.scale_preshuffled and a_scale is not None else a_scale
+    b_scale_input = pack_scale(b_scale) if args.scale_preshuffled else b_scale
+    if args.dtype_a == "float4":
+        a = a.to_packed_tensor(dim=1)
+    if args.dtype_b == "float4":
+        b = b.to_packed_tensor(dim=0)
+
+    a_d = a.data.contiguous().cuda() if args.dtype_a == "float4" else a.contiguous().cuda()
+    if args.dtype_b == "float4":
+        b_d = b.data.T.contiguous().cuda() if args.transpose_b else b.data.contiguous().cuda()
+    else:
+        b_d = b.T.contiguous().cuda() if args.transpose_b else b.contiguous().cuda()
+    a_scale_d = a_scale_input.cuda() if a_scale_input is not None else None
+    b_scale_d = b_scale_input.cuda()
+
+    benchmark = None if args.benchmark_mode == "none" else args.benchmark_mode
+    mxgemm_tdm_pipelined(
+        a_d,
+        b_d,
+        a_scale_d,
+        b_scale_d,
+        args.BM,
+        args.BN,
+        args.BK,
+        args.transpose_b,
+        args.num_buffers,
+        DTYPE_TO_TRITON[args.dtype_a],
+        DTYPE_TO_TRITON[args.dtype_b],
+        args.scale_preshuffled,
+        args.with_a_scale,
+        args.schedule,
+        args.l2_prefetch_distance,
+        args.M,
+        args.N,
+        args.K,
+        "partial" if args.partial_tdm else args.tdm_fusion,
+        args.tdm_split,
+        args.group_size_m,
+        benchmark,
+        args.benchmark_num_iters,
+    )
