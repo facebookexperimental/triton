@@ -27,7 +27,6 @@ constexpr static char AttrHasTLXOpsName[] = "tlx.has_tlx_ops";
 constexpr static char AttrHasWarpSpecOpsName[] = "tlx.has_warp_spec_ops";
 constexpr static char AttrTLXEnablePairedCTAMMAName[] =
     "tlx.enable_paired_cta_mma";
-constexpr static char AttrLayoutIsExplicitName[] = "tlx.layout_is_explicit";
 
 bool tlxEnablePairedMMA(Operation *op);
 
