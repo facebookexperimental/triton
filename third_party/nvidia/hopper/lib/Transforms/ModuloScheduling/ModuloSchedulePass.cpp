@@ -4147,8 +4147,33 @@ static void clampOuterStagesAndClusters(scf::ForOp outerLoop) {
 // Gated by TRITON_MODULO_CPSAT_JOINT=1; any failure falls back to
 // partitionExhaustive.
 // ============================================================================
+/// Enumerate a buffer's REAL consumers (walking through transparent view
+/// ops), as (consumerId, latency, accumulated distance) — the leaves
+/// walkLastConsumerEnd maxes over, serialized so the v2 joint model can
+/// express depth = lifetime/II + 1 over cycle VARIABLES.
+static void
+collectRealConsumers(const ttg::ScheduleLoop &loop, unsigned startId,
+                     int distAcc, llvm::DenseSet<unsigned> &seen,
+                     SmallVectorImpl<std::tuple<unsigned, int, int>> &out) {
+  for (const auto &edge : loop.edges) {
+    if (edge.srcId != startId)
+      continue;
+    if (!seen.insert(edge.dstId).second)
+      continue;
+    const auto &consumer = loop.getNode(edge.dstId);
+    int totalDist = distAcc + static_cast<int>(edge.distance);
+    bool transparent =
+        consumer.pipeline == ttg::HWPipeline::NONE && consumer.latency == 0;
+    if (transparent) {
+      collectRealConsumers(loop, consumer.id, totalDist, seen, out);
+      continue;
+    }
+    out.push_back({consumer.id, consumer.latency, totalDist});
+  }
+}
+
 static bool partitionJointCPSAT(ttg::ScheduleLoop &loop,
-                                int64_t reservedSmemBytes) {
+                                int64_t reservedSmemBytes, bool v2) {
   if (loop.II <= 0)
     return false;
   auto clusters = buildClusters(loop);
@@ -4188,7 +4213,9 @@ static bool partitionJointCPSAT(ttg::ScheduleLoop &loop,
   }
   llvm::json::Array jNodes;
   for (const auto &n : loop.nodes) {
-    if (!nodeToCluster.count(n.id))
+    // v1 models only clustered nodes; v2 needs cycle variables for ALL
+    // nodes (buffer producers are NONE-pipeline local_allocs).
+    if (!v2 && !nodeToCluster.count(n.id))
       continue;
     jNodes.push_back(llvm::json::Object{
         {"id", static_cast<int64_t>(n.id)},
@@ -4203,10 +4230,24 @@ static bool partitionJointCPSAT(ttg::ScheduleLoop &loop,
   for (const auto &edge : loop.edges) {
     auto s = nodeToCluster.find(edge.srcId);
     auto d = nodeToCluster.find(edge.dstId);
-    if (s == nodeToCluster.end() || d == nodeToCluster.end())
+    bool crossCluster = s != nodeToCluster.end() && d != nodeToCluster.end() &&
+                        s->second != d->second;
+    // v1 models only cross-cluster edges; v2 needs every dependence.
+    if (!v2 && !crossCluster)
       continue;
-    if (s->second == d->second)
+    if (v2 && !crossCluster) {
+      jEdges.push_back(llvm::json::Object{
+          {"src", static_cast<int64_t>(edge.srcId)},
+          {"dst", static_cast<int64_t>(edge.dstId)},
+          {"latency", edge.latency},
+          {"distance", static_cast<int64_t>(edge.distance)},
+          {"freq", 1},
+          {"rt", 0},
+          {"xissue", 0},
+          {"chan_bytes", 0},
+      });
       continue;
+    }
     const auto &sN = loop.nodes[edge.srcId];
     const auto &dN = loop.nodes[edge.dstId];
     int freq =
@@ -4248,14 +4289,48 @@ static bool partitionJointCPSAT(ttg::ScheduleLoop &loop,
       !env.empty())
     timeLimitS = std::max(1.0, std::atof(env.c_str()));
 
+  // v2: serialize the SMEM data buffers so depth = lifetime/II + 1 becomes
+  // a function of the re-solved cycles. fixed_smem carries everything the
+  // model does not re-derive (other loops, barrier buffers, merge-group
+  // residue — an approximation where merging shares storage; the model is
+  // conservative there).
+  llvm::json::Array jBuffers;
+  int64_t modeledBytes = 0;
+  if (v2) {
+    for (const auto &n : loop.nodes) {
+      if (n.producesBuffer == UINT_MAX)
+        continue;
+      const auto &buf = loop.buffers[n.producesBuffer];
+      if (buf.kind != ttg::MemoryKind::SMEM)
+        continue;
+      llvm::DenseSet<unsigned> seen;
+      seen.insert(n.id);
+      SmallVector<std::tuple<unsigned, int, int>, 4> consumers;
+      collectRealConsumers(loop, n.id, 0, seen, consumers);
+      llvm::json::Array jCons;
+      for (auto &[cid, lat, dist] : consumers)
+        jCons.push_back(llvm::json::Object{{"node", static_cast<int64_t>(cid)},
+                                           {"latency", lat},
+                                           {"distance", dist}});
+      jBuffers.push_back(
+          llvm::json::Object{{"producer", static_cast<int64_t>(n.id)},
+                             {"size_bytes", buf.sizeBytes()},
+                             {"consumers", std::move(jCons)}});
+      modeledBytes += buf.totalBytes();
+    }
+  }
+  int64_t committedSmem = computeTotalSmem(loop) + reservedSmemBytes;
+
   llvm::json::Object root{
       {"version", "cpsat-0.1"},
-      {"mode", "partition"},
+      {"mode", v2 ? "joint" : "partition"},
       {"ii", loop.II},
       {"clusters", std::move(jClusters)},
       {"nodes", std::move(jNodes)},
       {"edges", std::move(jEdges)},
-      {"committed_smem", computeTotalSmem(loop) + reservedSmemBytes},
+      {"buffers", std::move(jBuffers)},
+      {"committed_smem", committedSmem},
+      {"fixed_smem", std::max<int64_t>(0, committedSmem - modeledBytes)},
       {"smem_budget", kSmemBudgetBytes()},
       {"default_wg_footprint", kDefaultWGFootprint},
       {"sm_regs", kBlackwellSMRegs},
@@ -4282,6 +4357,52 @@ static bool partitionJointCPSAT(ttg::ScheduleLoop &loop,
   auto *wgMap = obj->getObject("wg");
   if (!status || *status != "ok" || !wgMap)
     return false;
+
+  // v2: write the re-solved cycles back and re-derive the buffer liveness
+  // and counts from them (same walk the original derivation used). Paired
+  // BARRIER-kind buffers keep their creation-time counts — the follow-up
+  // merge pass re-colors everything, and when the solver keeps the hinted
+  // cycles this is a no-op.
+  if (v2) {
+    auto *cyc = obj->getObject("cycles");
+    if (!cyc)
+      return false;
+    // Safety net, mirroring runCPSATSchedule's re-verification: never
+    // apply a solution that violates a dependence (the subprocess is
+    // advisory, not part of the correctness TCB).
+    for (const auto &edge : loop.edges) {
+      auto s = cyc->getInteger(std::to_string(edge.srcId));
+      auto d = cyc->getInteger(std::to_string(edge.dstId));
+      if (!s || !d)
+        return false;
+      if (*d <
+          *s + edge.latency - static_cast<int64_t>(edge.distance) * loop.II) {
+        LLVM_DEBUG(llvm::dbgs() << "[Phase4-JOINT] v2 verify failed: N"
+                                << edge.srcId << " -> N" << edge.dstId << "\n");
+        return false;
+      }
+    }
+    for (auto &node : loop.nodes) {
+      auto v = cyc->getInteger(std::to_string(node.id));
+      if (!v)
+        return false;
+      node.cycle = static_cast<int>(*v);
+      node.stage = node.cycle / loop.II;
+    }
+    for (auto &node : loop.nodes) {
+      if (node.producesBuffer == UINT_MAX)
+        continue;
+      auto &buf = loop.buffers[node.producesBuffer];
+      if (buf.kind == ttg::MemoryKind::BARRIER)
+        continue;
+      llvm::DenseSet<unsigned> seen;
+      seen.insert(node.id);
+      buf.liveStart = node.cycle;
+      buf.liveEnd =
+          walkLastConsumerEnd(loop, node.id, node.cycle, loop.II, 0, seen);
+      buf.count = computeBufferCount(loop, node.id);
+    }
+  }
 
   // Apply, same shape as partitionExhaustive's winner application: NONE ops
   // reset to -1 (propagateWarpGroupToInfraOps attaches them later).
@@ -4374,9 +4495,15 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
         partitionIntoWarpGroups(schedLoop);
       } else {
         int64_t reserved = allLoopsSmem - computeTotalSmem(schedLoop);
-        bool jointDone =
-            triton::tools::getBoolEnv("TRITON_MODULO_CPSAT_JOINT") &&
-            partitionJointCPSAT(schedLoop, reserved);
+        // TRITON_MODULO_CPSAT_JOINT: "1" = v1 (wg only, cycles fixed),
+        // "2" = v2 (cycles + wg in one solve). v2 falls back to v1, both
+        // fall back to the exhaustive scorer.
+        auto jointEnv = triton::tools::getStrEnv("TRITON_MODULO_CPSAT_JOINT");
+        bool jointDone = false;
+        if (jointEnv == "2")
+          jointDone = partitionJointCPSAT(schedLoop, reserved, /*v2=*/true);
+        if (!jointDone && !jointEnv.empty() && jointEnv != "0")
+          jointDone = partitionJointCPSAT(schedLoop, reserved, /*v2=*/false);
         if (!jointDone)
           partitionExhaustive(schedLoop, reserved);
       }

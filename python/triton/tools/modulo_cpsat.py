@@ -387,6 +387,11 @@ def solve_partition(prob):
         cj = cindex.get(e["dst_cluster"])
         if ci is None or cj is None or ci == cj:
             continue
+        if e["distance"] > 0 and e.get("rt", 0) > 0:
+            # LEGALITY (same as the joint mode): register loop-carried
+            # values live in iter_args with no cross-WG channel semantics.
+            model.Add(same_wg(ci, cj) == 1)
+            continue
         cross = same_wg(ci, cj).Not()
         slack = (nodes[e["dst"]]["cycle"] - nodes[e["src"]]["cycle"] - e["latency"] + e["distance"] * ii)
         if e.get("rt", 0) > 0:
@@ -444,6 +449,276 @@ def solve_partition(prob):
     }
 
 
+def solve_joint(prob):
+    """Joint-formulation v2 (SolverMigrationNotes, step 4 item 1): cycles AND
+    warp assignment in ONE solve at the committed II. Where v1 held the
+    schedule fixed and charged partition costs against its precomputed
+    slack/overlap constants, v2 makes those couplings functions of the cycle
+    VARIABLES, so the solver can REORDER instead of paying:
+
+      - cross-WG register hand-off is a conditional HARD latency on the
+        dependence edge (Twill's CROSS-WARPSPILLS): cutting an edge means
+        the consumer really waits rt cycles — which is what lets the
+        recurrence-span term pull an urgent hand-off (case3's alpha) early
+        instead of merely penalizing the cut;
+      - same-WG issue serialization is a conditional modular NoOverlap over
+        the WG's issue durations (an in-order warp cannot co-issue);
+      - the async-flight exclusion becomes a circular-difference constraint:
+        for async u and sync v in one WG, delta = (phase_v - phase_u) mod II
+        must satisfy latency_u <= delta <= II - duration_v (v's issue fits
+        in the gap after u's flight); if latency_u + duration_v >= II the
+        pair simply cannot share a WG (this is what forces the
+        load/compute/store specialization of TC-free loops from first
+        principles);
+      - SMEM buffer depths follow the re-solved stages (lifetime/II + 1
+        over the real-consumer walk serialized by the C++ side), sharing
+        one budget with the conditional channel bytes.
+
+    TMEM stage structure is NOT re-constrained here (fixed-II re-solves
+    rarely move it and the upstream budget already held); revisit if a
+    case trips.
+    """
+    ii = prob["ii"]
+    clusters = prob["clusters"]
+    nodes = prob["nodes"]
+    node_by_id = {nd["id"]: nd for nd in nodes}
+    edges = prob["edges"]
+    ncl = len(clusters)
+    cindex = {c["id"]: i for i, c in enumerate(clusters)}
+    cluster_of = {}
+    for c in clusters:
+        for nid in c["nodes"]:
+            cluster_of[nid] = cindex[c["id"]]
+
+    cp = _critical_path([node_by_id[i] for i in sorted(node_by_id)],
+                        [dict(e, src=e["src"], dst=e["dst"]) for e in edges])
+    if cp is None:
+        return {"status": "error", "message": "cycle in distance-0 edges"}
+    max_dur = max((nd["duration"] for nd in nodes), default=1)
+    max_stages = min(32, max(4, (cp + max_dur) // ii + 2))
+    horizon = max_stages * ii
+
+    model = cp_model.CpModel()
+    cycle = {nd["id"]: model.NewIntVar(0, horizon - 1, f"cyc_{nd['id']}") for nd in nodes}
+    stage = {nd["id"]: model.NewIntVar(0, max_stages - 1, f"stg_{nd['id']}") for nd in nodes}
+    phase = {nd["id"]: model.NewIntVar(0, ii - 1, f"phs_{nd['id']}") for nd in nodes}
+    for nd in nodes:
+        i = nd["id"]
+        model.AddDivisionEquality(stage[i], cycle[i], ii)
+        model.AddModuloEquality(phase[i], cycle[i], ii)
+        model.AddHint(cycle[i], max(0, min(horizon - 1, nd["cycle"])))
+
+    wg = [model.NewIntVar(0, ncl - 1, f"wg_{c['id']}") for c in clusters]
+    prefix_max = wg[0]
+    model.Add(wg[0] == 0)
+    for i in range(1, ncl):
+        model.Add(wg[i] <= prefix_max + 1)
+        nxt = model.NewIntVar(0, ncl - 1, f"pmax_{i}")
+        model.AddMaxEquality(nxt, [prefix_max, wg[i]])
+        prefix_max = nxt
+    used_wgs = model.NewIntVar(1, ncl, "used_wgs")
+    model.Add(used_wgs == prefix_max + 1)
+
+    same_cache = {}
+
+    def same_wg(i, j):
+        key = (min(i, j), max(i, j))
+        if key not in same_cache:
+            s = model.NewBoolVar(f"same_{key[0]}_{key[1]}")
+            model.Add(wg[key[0]] == wg[key[1]]).OnlyEnforceIf(s)
+            model.Add(wg[key[0]] != wg[key[1]]).OnlyEnforceIf(s.Not())
+            same_cache[key] = s
+        return same_cache[key]
+
+    # Dependences, with the cross-WG hand-off as a conditional hard latency.
+    # Distance-0 edges get a STRICT +1 floor: half the ScheduleLoop-level
+    # edges carry latency 0/1 (issue-order semantics, not the DDG's
+    # data-ready latencies), and letting connected ops tie on one cycle
+    # makes the emitter's expression rendering inline/duplicate operands
+    # with iter-arg version skew (measured: case3 wrong results).
+    terms = []
+    chan_terms = []
+    seen_pairs = set()
+    for e in edges:
+        lat = max(e["latency"], 1) if e["distance"] == 0 else e["latency"]
+        base = cycle[e["src"]] + lat - e["distance"] * ii
+        model.Add(cycle[e["dst"]] >= base)
+        if e["distance"] == 0:
+            model.Add(stage[e["src"]] <= stage[e["dst"]])
+        ci = cluster_of.get(e["src"])
+        cj = cluster_of.get(e["dst"])
+        if ci is None or cj is None or ci == cj:
+            continue
+        if e["distance"] > 0 and e.get("rt", 0) > 0:
+            # LEGALITY: a register loop-carried value cannot cross WGs — it
+            # lives in iter_args with no channel semantics (the semaphore
+            # layer strips cycle-inverted edges to signal-only and the
+            # emitter falls back to cross-WG recomputation, which is wrong).
+            model.Add(same_wg(ci, cj) == 1)
+            continue
+        cross = same_wg(ci, cj).Not()
+        if e.get("rt", 0) > 0:
+            model.Add(cycle[e["dst"]] >= base + e["rt"]).OnlyEnforceIf(cross)
+        terms.append(1024 * e["xissue"] * cross)
+        pair = (e["src"], e["dst"])
+        if e.get("chan_bytes", 0) > 0 and pair not in seen_pairs:
+            seen_pairs.add(pair)
+            cb = model.NewIntVar(0, e["chan_bytes"], f"cb_{pair[0]}_{pair[1]}")
+            model.Add(cb == e["chan_bytes"]).OnlyEnforceIf(cross)
+            model.Add(cb == 0).OnlyEnforceIf(cross.Not())
+            chan_terms.append(cb)
+
+    # Chip-wide per-pipeline modular NoOverlap (same as the schedule solve).
+    def modular_segments(i, dur, tag, presence=None):
+        segs = []
+        end1 = model.NewIntVar(1, ii, f"end1_{tag}")
+        model.AddMinEquality(end1, [phase[i] + dur, ii])
+        size1 = model.NewIntVar(1, dur, f"size1_{tag}")
+        model.Add(size1 == end1 - phase[i])
+        if presence is None:
+            segs.append(model.NewIntervalVar(phase[i], size1, end1, f"seg1_{tag}"))
+        else:
+            segs.append(model.NewOptionalIntervalVar(phase[i], size1, end1, presence, f"seg1_{tag}"))
+        if dur > 1:
+            over = model.NewIntVar(0, dur - 1, f"over_{tag}")
+            model.AddMaxEquality(over, [phase[i] + dur - ii, 0])
+            wraps = model.NewBoolVar(f"wrap_{tag}")
+            model.Add(over >= 1).OnlyEnforceIf(wraps)
+            model.Add(over == 0).OnlyEnforceIf(wraps.Not())
+            pres2 = wraps
+            if presence is not None:
+                pres2 = model.NewBoolVar(f"wrappres_{tag}")
+                model.AddBoolAnd([wraps, presence]).OnlyEnforceIf(pres2)
+                model.AddBoolOr([wraps.Not(), presence.Not()]).OnlyEnforceIf(pres2.Not())
+            segs.append(model.NewOptionalIntervalVar(0, over, over, pres2, f"seg2_{tag}"))
+        return segs
+
+    by_pipe = {}
+    for nd in nodes:
+        if nd["pipeline"] != "NONE" and nd["duration"] > ii:
+            return {"status": "error", "message": "duration exceeds II"}
+        if nd["pipeline"] != "NONE":
+            by_pipe.setdefault(nd["pipeline"], []).append(nd["id"])
+    for pipe, members in by_pipe.items():
+        if len(members) < 2:
+            continue
+        segs = []
+        for i in members:
+            segs += modular_segments(i, max(node_by_id[i]["duration"], 1), f"p_{pipe}_{i}")
+        model.AddNoOverlap(segs)
+
+    # Same-WG issue serialization: an in-order warp cannot co-issue two ops.
+    assign = {}
+    for i, c in enumerate(clusters):
+        for w in range(ncl):
+            a = model.NewBoolVar(f"a_{i}_{w}")
+            model.Add(wg[i] == w).OnlyEnforceIf(a)
+            model.Add(wg[i] != w).OnlyEnforceIf(a.Not())
+            assign[(i, w)] = a
+    for w in range(ncl):
+        segs = []
+        for c in clusters:
+            for nid in c["nodes"]:
+                segs += modular_segments(nid, max(node_by_id[nid]["duration"], 1), f"w{w}_{nid}",
+                                         presence=assign[(cindex[c["id"]], w)])
+        if segs:
+            model.AddNoOverlap(segs)
+
+    # Async-flight exclusion within a WG (circular difference encoding).
+    ASYNC = ("TMA", "TC", "MFMA")
+    clustered = [nid for c in clusters for nid in c["nodes"]]
+    for u in clustered:
+        nu = node_by_id[u]
+        if nu["pipeline"] not in ASYNC or nu["latency"] <= nu["duration"]:
+            continue
+        flight = min(nu["latency"], ii)
+        for v in clustered:
+            nv = node_by_id[v]
+            if nv["pipeline"] in ASYNC or nv["pipeline"] == "NONE" or u == v:
+                continue
+            ci, cj = cluster_of[u], cluster_of[v]
+            if ci == cj:
+                continue  # same cluster is same WG by construction: tolerated
+            s = same_wg(ci, cj)
+            dv = max(nv["duration"], 1)
+            if flight + dv >= ii:
+                model.Add(s == 0)  # cannot share a WG at this II at all
+                continue
+            tmp = model.NewIntVar(1, 2 * ii - 1, f"cd_{u}_{v}")
+            model.Add(tmp == phase[v] - phase[u] + ii)
+            delta = model.NewIntVar(0, ii - 1, f"delta_{u}_{v}")
+            model.AddModuloEquality(delta, tmp, ii)
+            model.Add(delta >= flight).OnlyEnforceIf(s)
+            model.Add(delta <= ii - dv).OnlyEnforceIf(s)
+
+    # SMEM: buffer depths follow the re-solved stages; one budget with the
+    # conditional channel bytes.
+    depth_vars = []
+    smem_terms = []
+    for b in prob["buffers"]:
+        p = b["producer"]
+        ends = [cycle[p]]
+        for cons in b["consumers"]:
+            ends.append(cycle[cons["node"]] + cons["latency"] + cons["distance"] * ii)
+        last_end = model.NewIntVar(0, horizon + 2 * ii, f"lend_b{p}")
+        model.AddMaxEquality(last_end, ends)
+        lifetime = model.NewIntVar(0, horizon + 2 * ii, f"life_b{p}")
+        model.Add(lifetime == last_end - cycle[p])
+        dm1 = model.NewIntVar(0, max_stages + 2, f"dm1_b{p}")
+        model.AddDivisionEquality(dm1, lifetime, ii)
+        depth = model.NewIntVar(1, max_stages + 3, f"depth_b{p}")
+        model.Add(depth == dm1 + 1)
+        depth_vars.append(depth)
+        smem_terms.append(b["size_bytes"] * depth)
+    smem_total = model.NewIntVar(0, prob["smem_budget"], "smem_total")
+    model.Add(smem_total == prob["fixed_smem"] + sum(smem_terms) + sum(chan_terms))
+
+    # Register budget (same as v1 partition mode).
+    fp_table = prob["warp_footprint"]
+    fp_terms = []
+    for w in range(ncl):
+        warps_w = model.NewIntVar(0, 8, f"warps_{w}")
+        model.AddAllowedAssignments([warps_w], [[0], [1], [2], [4], [8]])
+        for i, c in enumerate(clusters):
+            model.Add(warps_w >= c["min_warps"]).OnlyEnforceIf(assign[(i, w)])
+        fp_w = model.NewIntVar(0, max(fp_table), f"fp_{w}")
+        model.AddElement(warps_w, fp_table, fp_w)
+        fp_terms.append(fp_w)
+    total_regs = model.NewIntVar(0, 1 << 22, "total_regs")
+    model.Add(total_regs == prob["default_wg_footprint"] + sum(fp_terms))
+    deficit = model.NewIntVar(0, 1 << 22, "deficit")
+    model.AddMaxEquality(deficit, [total_regs - prob["sm_regs"], 0])
+    residual = model.NewIntVar(0, 1 << 22, "residual")
+    model.AddMaxEquality(residual, [deficit - prob["default_slack"], 0])
+
+    # Objective: the schedule solve's terms + the partition costs that stay
+    # soft (barrier issue, register residual, WG-count tie-break). The rt
+    # and flight-window couplings are HARD constraints now — no double
+    # charge.
+    max_stage = model.NewIntVar(0, max_stages - 1, "max_stage")
+    model.AddMaxEquality(max_stage, list(stage.values()))
+    reg_pressure = sum(cycle[e["dst"]] - cycle[e["src"]] for e in edges if e["distance"] == 0)
+    rec_span = sum(cycle[e["src"]] - cycle[e["dst"]] for e in edges if e["distance"] > 0 and e["src"] != e["dst"])
+    model.Minimize(10240000 * max_stage - 102400 * sum(depth_vars) + 8192 * rec_span + 1024 * reg_pressure +
+                   smem_total + sum(terms) + 512 * residual - used_wgs)
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = float(prob.get("time_limit_s", 20.0))
+    solver.parameters.num_workers = 8
+    status = solver.Solve(model)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return {"status": "error", "message": f"joint solve status {status}"}
+    return {
+        "status": "ok",
+        "wg": {str(c["id"]): solver.Value(wg[i])
+               for i, c in enumerate(clusters)},
+        "cycles": {str(nd["id"]): solver.Value(cycle[nd["id"]])
+                   for nd in nodes},
+        "used_wgs": solver.Value(used_wgs),
+        "objective": solver.ObjectiveValue(),
+    }
+
+
 def main():
     if len(sys.argv) != 3:
         print("usage: python -m triton.tools.modulo_cpsat <problem.json> <solution.json>", file=sys.stderr)
@@ -451,8 +726,8 @@ def main():
     with open(sys.argv[1]) as f:
         prob = json.load(f)
 
-    if prob.get("mode") == "partition":
-        result = solve_partition(prob)
+    if prob.get("mode") in ("partition", "joint"):
+        result = solve_partition(prob) if prob["mode"] == "partition" else solve_joint(prob)
         with open(sys.argv[2], "w") as f:
             json.dump(result, f)
         return 0 if result["status"] == "ok" else 1

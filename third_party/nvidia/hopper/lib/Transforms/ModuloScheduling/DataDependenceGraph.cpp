@@ -2,6 +2,7 @@
 
 #include "DataDependenceGraph.h"
 #include "ModuloReservationTable.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -201,7 +202,14 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
   // truth — a future global solver should delete it and price the cross-WG
   // channel cost in its objective instead. See
   // docs/SolverMigrationNotes.md (guard 1).
-  {
+  //
+  // TRITON_MODULO_DISABLE_MMA_GUARD=1 bypasses it — the step-4
+  // deletion-of-guard-1 experiment: with the joint (cycles+wg) CP-SAT
+  // partitioner, the cross-WG hand-off is a hard conditional latency in
+  // the model, so softmax cohesion should emerge at the LOWER unguarded
+  // MinII without this fence. Gated by the case3 canary before any
+  // default change.
+  if (!mlir::triton::tools::getBoolEnv("TRITON_MODULO_DISABLE_MMA_GUARD")) {
     SmallVector<unsigned> tcNodes;
     for (const auto &node : ddg.nodes)
       if (node.pipeline == HWPipeline::TC)

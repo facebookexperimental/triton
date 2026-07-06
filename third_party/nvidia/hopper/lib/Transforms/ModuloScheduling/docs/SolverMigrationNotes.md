@@ -400,6 +400,24 @@ parallel.
    the alpha hand-off's urgency exists only relative to a partition.
    Measured targets: case3 B-config ≥ 651 without joint partitioning
    enabled being the excuse; explore whether C's 664 improves further.
+   **[2026-07-06 status: infrastructure LANDED
+   (TRITON_MODULO_CPSAT_JOINT=2, solve_joint in modulo_cpsat.py: full
+   dependence + per-pipeline and conditional per-WG modular NoOverlap +
+   circular-difference flight exclusion + depth-from-stage SMEM + cycle
+   write-back with buffer re-derivation and a C++ dependence
+   re-verification), but case3 cycle re-solve is BLOCKED on a data-fidelity
+   gap: ScheduleLoop edges carry issue-order latencies (20/40 edges are
+   0/1, not the DDG's data latencies) and NO anti-dependence (iter-arg
+   WAR) edges — the solver can legally reorder version-sensitive chains,
+   and the emitter then inlines/duplicates operands with iter-arg version
+   skew (measured wrong results; a strict +1 edge separation removed ties
+   but not unconnected reordering, confirming the missing-WAR-edge root
+   cause). Working envelope: case1/5/7 hint-parity, case6 re-solved
+   cycles PASS. Unblock: serialize DDG-fidelity latencies + WAR edges
+   into the joint problem, or host v2 at the DDG stage and forward wg
+   through the ScheduleLoop mapping. A register-loop-carry ⇒ same-WG
+   LEGALITY constraint was added to both joint modes along the way
+   (iter-args have no cross-WG channel semantics).]**
 2. **Delete guard 1 for the joint path.** Once v2 owns partitioning
    jointly with cycles, the Phase 2.75 occupancy inflation
    (DataDependenceGraph.cpp) is a pure solution-space fence for that
@@ -407,6 +425,17 @@ parallel.
    FA's softmax cohesion still emerges from the round-trip/flight-window
    constraints at the LOWER unguarded MinII (1325), and the case3 canary
    holds. Keep the guard for the heuristic paths (they still need it).
+   **[DONE 2026-07-06 — VALIDATED, did not need v2:**
+   TRITON_MODULO_DISABLE_MMA_GUARD=1 bypasses Phase 2.75; with the cpsat
+   schedule + the v1 joint partitioner, case3 solves at the unguarded
+   MinII=1325, the partition keeps the softmax chain co-resident (5 WGs,
+   exp2+rowsum together — the cut guard 1 existed to prevent does NOT
+   happen), correctness passes, and it measures **665.7 TFLOPS at
+   (1,32,8192) — the best configuration yet** (vs 664.1 guarded full
+   stack, 650 default, 651 canary). The guard is now provably redundant
+   for the joint path; actual code deletion should land together with
+   making joint partitioning that path's default. The env bypass stays
+   for A/B until then.]**
 3. **Guard 3 → versioned emitter-capability constraints.** Express
    "outer loops single-WG" and "blockM ≤ 128 TMEM" as explicit legality
    constraints in the partition model, versioned with the emitter; fix
