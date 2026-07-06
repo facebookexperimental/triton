@@ -227,6 +227,12 @@ class RenderCtx:
     # Used when an emitter resolves a buffer via alloc_op_var instead of
     # (loop_id, buf_id).
     partition_alloc_names: dict[str, list[str]] = field(default_factory=dict)
+    # Pass A.7: op ids of kernel-internal `tt.make_tensor_descriptor`s that feed
+    # a subtiled epilogue store → the sub-tile N width. A subtiled store writes
+    # an N-slice of width sub_size, so the descriptor block N must match (the TMA
+    # copy asserts descriptor-block == source shape). Populated once in emit();
+    # consumed by `_render_make_tensor_descriptor` to override block N.
+    subtiled_desc_ops: dict[str, int] = field(default_factory=dict)
     # Monotonic, globally-unique counter for auto-named variables. Every
     # auto-named op draws a fresh index via `fresh_idx()`, so names minted in
     # different scopes (preamble, each per-WG outer-loop body, epilogue,
@@ -455,6 +461,11 @@ def _render_make_tensor_descriptor(op: Op, rctx: RenderCtx) -> str:
     if block_info is None:
         return f"tl.make_tensor_descriptor({ptr}, [{', '.join(shape)}], [{', '.join(strides)}], [...])"
     block_dims, _ = block_info
+    # Pass A.7: if this descriptor feeds a subtiled store, its block N must match
+    # the sub-tile width (the store writes an N-slice of that width).
+    sub_n = rctx.subtiled_desc_ops.get(op.op_id)
+    if sub_n is not None and len(block_dims) >= 2:
+        block_dims = list(block_dims[:-1]) + [sub_n]
     block_str = ", ".join(str(d) for d in block_dims)
     return (
         f"tl.make_tensor_descriptor({ptr}, [{', '.join(shape)}], "
@@ -4209,10 +4220,36 @@ def _emit_outer_epilogue_subtiled(
     # `wait(0)` is emitted by the caller AFTER the persistent loop ends.
     # Pattern matches blackwell_gemm_ws tutorial.
     BUF_RING = 2  # matches buf.count set in extractBufferShape / _emit_buffers
+    # Outer-loop TMA loads feeding the epilogue (case5/case7 bias) are full
+    # 128xBN register tensors; each sub-tile's acc is subsliced to 128xsub_size,
+    # so those operands must be reloaded sliced along N to match. Collect their
+    # op ids + staging bufname + row count once. Their pre-chain full local_load
+    # is left dead (DCE'd); the sliced reloads read the same still-valid SMEM
+    # (same default WG, sequential before the next tile's refill).
+    _bias_reload = []  # (op_id, bufname, rows)
+    _var_to_opid = {v: k for k, v in rctx.op_var.items()}
+    for _b in rctx.outer_load_bindings.values():
+        _opid = _var_to_opid.get(_b["var_name"])
+        if _opid is None:
+            continue
+        _op = g.ops.get(_opid)
+        _rows = 128
+        if _op is not None and _op.result_types:
+            _sh = _parse_tensor_shape(_op.result_types[0])
+            if _sh and _sh[0]:
+                _rows = _sh[0][0]
+        _bias_reload.append((_opid, _b["bufname"], _rows))
     for sub_n in range(S):
         n_off = sub_n * sub_size
         smem_slot = sub_n % BUF_RING
         is_last_sub = sub_n == S - 1
+        for _bi, (_opid, _bufname, _rows) in enumerate(_bias_reload):
+            _bvar = f"biassub_{sub_n}_{_bi}"
+            lines += (
+                f"{_bvar} = tlx.local_load(tlx.local_slice({_bufname}[0], "
+                f"[0, {n_off}], [{_rows}, {sub_size}]))"
+            )
+            rctx.op_var[_opid] = _bvar
         for n in chain_nodes:
             op = g.ops.get(n.op_ref) if n.op_ref else None
             if op is None or op.kind in _SKIP_FUNCTION_SCOPE:
@@ -4708,6 +4745,20 @@ def emit(graph: ScheduleGraph) -> str:
         op.kind in ("ttng.tc_gen5_mma", "ttng.tc_gen5_mma_scaled")
         for op in graph.ops.values()
     )
+
+    # Pass A.7: map kernel-internal make_tensor_descriptor ops feeding a subtiled
+    # store to the sub-tile N width, so their block N is emitted to match. Must
+    # run before the preamble (where descriptors are rendered).
+    for _loop in graph.loops:
+        for _node in _loop.schedule.nodes:
+            if _node.subtile_count <= 1 or _node.op_kind != "tt.descriptor_store":
+                continue
+            _store = graph.ops.get(_node.op_ref) if _node.op_ref else None
+            if _store is None or not _store.operands:
+                continue
+            _dref = _store.operands[0]
+            if isinstance(_dref, OpRef):
+                rctx.subtiled_desc_ops[_dref.op_id] = _node.n_size
 
     lines.indent = 1
     if outer_loop is None:

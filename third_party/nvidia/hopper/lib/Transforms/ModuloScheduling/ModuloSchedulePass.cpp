@@ -987,8 +987,58 @@ static bool bufferReachesPartMMA(const ttg::ScheduleLoop &loop,
   return false;
 }
 
+// Pass A.7: mark the epilogue value-chain (tmem_load -> ... -> descriptor_store)
+// with the subtile factor S and per-sub-tile N width, so the sched2tlx emitter
+// unrolls S sub-stores along N (overlapping TMA store i with compute of i+1).
+// Opt-in: getEpilogueSubtileForOp only returns S>1 when
+// TRITON_MODULO_EPILOGUE_SUBTILE is set, so this is a no-op by default.
+static void markEpilogueSubtileChain(ttg::ScheduleLoop &loop) {
+  llvm::DenseMap<Operation *, unsigned> opToNode;
+  for (unsigned i = 0; i < loop.nodes.size(); ++i)
+    if (loop.nodes[i].op)
+      opToNode[loop.nodes[i].op] = i;
+
+  for (auto &store : loop.nodes) {
+    if (!store.op || !isa<tt::DescriptorStoreOp>(store.op))
+      continue;
+    int S = getEpilogueSubtileForOp(store.op);
+    if (S <= 1)
+      continue;
+    auto storeOp = cast<tt::DescriptorStoreOp>(store.op);
+    auto srcTy = dyn_cast<RankedTensorType>(storeOp.getSrc().getType());
+    if (!srcTy || srcTy.getRank() < 2)
+      continue;
+    int nSize = static_cast<int>(srcTy.getShape()[1]) / S;
+
+    auto mark = [&](Operation *op) {
+      auto it = opToNode.find(op);
+      if (it == opToNode.end())
+        return;
+      loop.nodes[it->second].subtileCount = S;
+      loop.nodes[it->second].nSize = nSize;
+    };
+    mark(store.op);
+    // Walk the stored-VALUE chain (not the descriptor / index operands) back to
+    // the accumulator tmem_load, marking each epilogue node. Stop at tmem_load:
+    // its operands come from the K-loop, not the epilogue chain.
+    llvm::SmallVector<Value, 4> work{storeOp.getSrc()};
+    llvm::DenseSet<Operation *> seen;
+    while (!work.empty()) {
+      Operation *def = work.pop_back_val().getDefiningOp();
+      if (!def || !seen.insert(def).second || !opToNode.count(def))
+        continue;
+      mark(def);
+      if (def->getName().getStringRef() == "ttng.tmem_load")
+        continue;
+      for (Value operand : def->getOperands())
+        work.push_back(operand);
+    }
+  }
+}
+
 static void allocateBuffersForLoop(ttg::ScheduleLoop &loop,
                                    const DataPartitionPlan &plan) {
+  markEpilogueSubtileChain(loop);
   llvm::SmallVector<unsigned, 4> dataBufferIds;
   // Pass A.5: when this loop carries a partitioned MMA bundle, the DP-inflated
   // II collapses operand SMEM rings to depth 1 (computeBufferCount =
@@ -4703,12 +4753,16 @@ void jsonDumpScheduleLoop(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl,
     if (n.isSuperNode())
       os << ", \"child_pipeline_id\": " << n.childPipelineId
          << ", \"prologue_latency\": " << n.prologueLatency;
-    // Pass A.5 data-partition fields on the (single) MMA bundle node. A.7
-    // subtile fields remain a separate follow-up.
+    // Pass A.5 data-partition fields on the (single) MMA bundle node.
     if (n.partitionCount > 1)
       os << ", \"partition_count\": " << n.partitionCount
          << ", \"partition_dim\": " << n.partitionDim
          << ", \"m_size\": " << n.mSize;
+    // Pass A.7 subtile fields (subtile_count == 1 => not subtiled). The
+    // sched2tlx emitter reads subtile_count + n_size to unroll the epilogue.
+    os << ", \"subtile_count\": " << n.subtileCount
+       << ", \"subtile_index\": " << n.subtileIndex
+       << ", \"n_offset\": " << n.nOffset << ", \"n_size\": " << n.nSize;
     os << "}" << (i + 1 == sl.nodes.size() ? "" : ",") << "\n";
   }
   os << "        ],\n";
