@@ -317,8 +317,11 @@ if(TRITON_BUILD_PYTHON_MODULE)
   set(PYTHON_SRC_PATH ${CMAKE_CURRENT_SOURCE_DIR}/python/src)
   include_directories(${PYTHON_SRC_PATH})
 
-  # Python Interpreter is used to run lit tests. nanobind requires CMake's
-  # FindPython package state rather than just the Python::Module target.
+  # Python3 is used throughout Triton, including the interpreter for lit tests.
+  # Newer nanobind CMake packages require the real FindPython package state
+  # before find_package(nanobind): checking only for a manually-created
+  # Python::Module alias is not sufficient, because nanobind also expects
+  # targets/variables such as Python::Interpreter from find_package(Python).
   find_package(Python3 REQUIRED COMPONENTS Development.Module Interpreter)
   set(Python_EXECUTABLE "${Python3_EXECUTABLE}")
   find_package(Python REQUIRED COMPONENTS Development.Module Interpreter)
