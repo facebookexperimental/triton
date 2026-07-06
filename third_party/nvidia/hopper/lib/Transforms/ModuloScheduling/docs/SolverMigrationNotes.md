@@ -368,9 +368,16 @@ correctness.
    round-trip constant were added to protect now emerges from first
    principles; this is the concrete path to deleting guard 1 once the
    joint mode owns partitioning. Full stack (cpsat schedule + joint
-   partition) passes correctness on case3 with a 5-WG variant (PV-MMA
-   merged into rescale — the different cycle placement changes the
-   overlap costs; unmeasured, follow-up).
+   partition, 2026-07-06 measurements): correctness passes on all cases;
+   on case3 it produces a 5-WG variant (PV-MMA merged into the rescale
+   WG) that measures **664.1 TFLOPS at (1,32,8192) — 2.1% ABOVE the 651
+   canary** (vs 650 for the hand-protected 6-WG + Rau default, 639 for
+   the cpsat schedule under the heuristic partition). The B < A < C
+   ordering is the joint-formulation thesis in one row of data: the
+   solver's schedule loses to Rau under the old partition but wins when
+   paired with its own matching partition. Small shapes are within noise
+   (±5%); case6's II-517 schedule is perf-flat vs the II-534 default
+   (memory-bound — the bottleneck is the emitter's 3-WG structure).
    Still open for v2: joint cycles+wg in one solve (fixes the alpha-order
    blind spot), guard-3 as an in-model legality constraint, sub-tiling.
 
