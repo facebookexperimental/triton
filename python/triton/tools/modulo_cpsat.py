@@ -211,7 +211,18 @@ def solve_at_ii(prob, ii, time_limit_s, hint=None):
     max_stage = model.NewIntVar(0, max_stages - 1, "max_stage")
     model.AddMaxEquality(max_stage, stage)
     reg_pressure = sum(cycle[e["dst"]] - cycle[e["src"]] for e in edges if e["distance"] == 0)
-    model.Minimize(10240000 * max_stage - 102400 * sum(depth_vars) + 1024 * reg_pressure + smem_total)
+    # Recurrence-chain criticality (SolverMigrationNotes, step 3): for each
+    # loop-carried back edge (u -> v, distance > 0), cycle[u] - cycle[v] is
+    # the scheduled span of the recurrence circuit's forward chain.
+    # Compressing it pushes all slack onto the back edge, so when the
+    # model's latencies UNDERESTIMATE the chain (FA's softmax measures
+    # ~1745 cyc/iter against a modeled II of 1459) the realized iteration
+    # time degrades as little as possible. Weighted far above regPressure:
+    # this is exactly the term whose absence let the solver reorder case3's
+    # rowsum after the P-tile store (regPressure strictly preferred it; 8%
+    # slower on hardware). Self-edges (u == v) contribute a constant 0.
+    rec_span = sum(cycle[e["src"]] - cycle[e["dst"]] for e in edges if e["distance"] > 0 and e["src"] != e["dst"])
+    model.Minimize(10240000 * max_stage - 102400 * sum(depth_vars) + 8192 * rec_span + 1024 * reg_pressure + smem_total)
 
     if hint:
         for i in range(n):
@@ -265,12 +276,186 @@ def _normalized_hint(prob, ii, time_limit_s):
     return None
 
 
+def _mod_overlap(a_start, a_dur, b_start, b_dur, ii):
+    """Overlap (cycles) of two cyclic intervals on [0, ii)."""
+
+    def segs(s, d):
+        s %= ii
+        d = min(d, ii)
+        if s + d <= ii:
+            return [(s, s + d)]
+        return [(s, ii), (0, s + d - ii)]
+
+    total = 0
+    for s1, e1 in segs(a_start, a_dur):
+        for s2, e2 in segs(b_start, b_dur):
+            total += max(0, min(e1, e2) - max(s1, s2))
+    return total
+
+
+def solve_partition(prob):
+    """Joint-formulation v1 (SolverMigrationNotes step 3): warp-group
+    assignment as a constraint problem AGAINST the committed schedule
+    (cycles held fixed — the Twill-style re-solve at the schedule's II).
+    The partition-relevant costs the heuristic partitioner scores post-hoc
+    become model terms:
+
+      - split cost: two clusters sharing a WG serialize on the warp's issue
+        stream, so their ops' scheduled modular-interval OVERLAP is exactly
+        the parallelism the schedule assumed and the merge destroys
+        (replaces computeMultiPipelineMakespan's list-scheduling proxy);
+      - merge pressure: a register-compute edge cut across WGs pays the
+        measured reg->SMEM->reg hand-off, but only the part that does not
+        fit in the schedule's slack (refines accumulateCrossWGRoundTrip,
+        which charges the full round-trip regardless of slack);
+      - cross-WG barrier issue cost (measured mbarrier/named constants);
+      - register budget with the calibrated footprint table + default-WG
+        slack model; synthesized channel SMEM as a HARD capacity constraint.
+
+    Schedule-side blind spot this v1 cannot fix (documented in
+    SolverMigrationNotes): op ORDER inside a WG is frozen by the scheduler,
+    which ran before any partition existed — e.g. case3's alpha hand-off
+    urgency. That needs joint cycles+wg (v2).
+    """
+    ii = prob["ii"]
+    clusters = prob["clusters"]
+    nodes = {nd["id"]: nd for nd in prob["nodes"]}
+    ncl = len(clusters)
+    model = cp_model.CpModel()
+    wg = [model.NewIntVar(0, ncl - 1, f"wg_{c['id']}") for c in clusters]
+    cindex = {c["id"]: i for i, c in enumerate(clusters)}
+
+    # Symmetry breaking: WG ids appear in first-use order.
+    prefix_max = wg[0]
+    model.Add(wg[0] == 0)
+    for i in range(1, ncl):
+        model.Add(wg[i] <= prefix_max + 1)
+        nxt = model.NewIntVar(0, ncl - 1, f"pmax_{i}")
+        model.AddMaxEquality(nxt, [prefix_max, wg[i]])
+        prefix_max = nxt
+    used_wgs = model.NewIntVar(1, ncl, "used_wgs")
+    model.Add(used_wgs == prefix_max + 1)
+
+    same_cache = {}
+
+    def same_wg(i, j):
+        key = (min(i, j), max(i, j))
+        if key not in same_cache:
+            s = model.NewBoolVar(f"same_{key[0]}_{key[1]}")
+            model.Add(wg[key[0]] == wg[key[1]]).OnlyEnforceIf(s)
+            model.Add(wg[key[0]] != wg[key[1]]).OnlyEnforceIf(s.Not())
+            same_cache[key] = s
+        return same_cache[key]
+
+    terms = []
+
+    # Split cost: scheduled parallelism destroyed by merging two clusters
+    # into one in-order warp. The occupied window depends on the op class
+    # (Twill's CONCURRENCY insight / the stageMix penalty's rationale):
+    #   async (TMA/TC) vs sync (CUDA/SFU): the async op's full LATENCY
+    #     window — sync work the schedule placed during the flight is
+    #     blocked by the same-warp wait if merged;
+    #   sync vs sync (different rows): both block the warp for their
+    #     issue duration;
+    #   async vs async: issue duration only — hardware overlaps the
+    #     flights regardless of warp assignment, merging is nearly free.
+    ASYNC = ("TMA", "TC", "MFMA")
+
+    def window(nd, other):
+        if nd["pipeline"] in ASYNC and other["pipeline"] not in ASYNC:
+            return max(nd["duration"], nd["latency"])
+        return nd["duration"]
+
+    for i in range(ncl):
+        for j in range(i + 1, ncl):
+            ov = 0
+            for u in clusters[i]["nodes"]:
+                for v in clusters[j]["nodes"]:
+                    nu, nv = nodes[u], nodes[v]
+                    if nu["pipeline"] == nv["pipeline"]:
+                        continue  # same row: already serialized chip-wide
+                    ov += _mod_overlap(nu["cycle"], window(nu, nv), nv["cycle"], window(nv, nu), ii) * max(
+                        nu["freq"], nv["freq"])
+            if ov > 0:
+                terms.append(2 * ov * same_wg(i, j))
+
+    # Merge pressure + barrier issue on cross-WG edges; channel SMEM (hard).
+    chan_bytes_total = []
+    seen_pairs = set()
+    for e in prob["edges"]:
+        ci = cindex.get(e["src_cluster"])
+        cj = cindex.get(e["dst_cluster"])
+        if ci is None or cj is None or ci == cj:
+            continue
+        cross = same_wg(ci, cj).Not()
+        slack = (nodes[e["dst"]]["cycle"] - nodes[e["src"]]["cycle"] - e["latency"] + e["distance"] * ii)
+        if e.get("rt", 0) > 0:
+            shortfall = max(0, e["rt"] - max(0, slack)) * e["freq"]
+            if shortfall > 0:
+                terms.append(2 * shortfall * cross)
+        terms.append(2 * e["xissue"] * cross)
+        pair = (e["src"], e["dst"])
+        if e.get("chan_bytes", 0) > 0 and pair not in seen_pairs:
+            seen_pairs.add(pair)
+            cb = model.NewIntVar(0, e["chan_bytes"], f"cb_{pair[0]}_{pair[1]}")
+            model.Add(cb == e["chan_bytes"]).OnlyEnforceIf(cross)
+            model.Add(cb == 0).OnlyEnforceIf(cross.Not())
+            chan_bytes_total.append(cb)
+    model.Add(prob["committed_smem"] + sum(chan_bytes_total) <= prob["smem_budget"])
+
+    # Register budget: per-WG warp counts from the assigned clusters'
+    # minWarps, footprints from the calibrated table, default-WG slack model.
+    fp_table = prob["warp_footprint"]  # indexed by warp count 0..8
+    total_regs_terms = []
+    for w in range(ncl):
+        warps_w = model.NewIntVar(0, 8, f"warps_{w}")
+        model.AddAllowedAssignments([warps_w], [[0], [1], [2], [4], [8]])
+        for i, c in enumerate(clusters):
+            a = model.NewBoolVar(f"a_{i}_{w}")
+            model.Add(wg[i] == w).OnlyEnforceIf(a)
+            model.Add(wg[i] != w).OnlyEnforceIf(a.Not())
+            model.Add(warps_w >= c["min_warps"]).OnlyEnforceIf(a)
+        fp_w = model.NewIntVar(0, max(fp_table), f"fp_{w}")
+        model.AddElement(warps_w, fp_table, fp_w)
+        total_regs_terms.append(fp_w)
+    total_regs = model.NewIntVar(0, 1 << 22, "total_regs")
+    model.Add(total_regs == prob["default_wg_footprint"] + sum(total_regs_terms))
+    deficit = model.NewIntVar(0, 1 << 22, "deficit")
+    model.AddMaxEquality(deficit, [total_regs - prob["sm_regs"], 0])
+    residual = model.NewIntVar(0, 1 << 22, "residual")
+    model.AddMaxEquality(residual, [deficit - prob["default_slack"], 0])
+    terms.append(residual)  # x1 while cycle terms are x2 == kDeficitPenalty 0.5
+
+    # Tie-break: prefer MORE warp groups on ties (kPerWGTieBreak analog).
+    model.Minimize(sum(terms) - used_wgs)
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = float(prob.get("time_limit_s", 20.0))
+    solver.parameters.num_workers = 8
+    status = solver.Solve(model)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return {"status": "error", "message": f"partition solve status {status}"}
+    return {
+        "status": "ok",
+        "wg": {str(c["id"]): solver.Value(wg[i])
+               for i, c in enumerate(clusters)},
+        "used_wgs": solver.Value(used_wgs),
+        "objective": solver.ObjectiveValue(),
+    }
+
+
 def main():
     if len(sys.argv) != 3:
         print("usage: python -m triton.tools.modulo_cpsat <problem.json> <solution.json>", file=sys.stderr)
         return 2
     with open(sys.argv[1]) as f:
         prob = json.load(f)
+
+    if prob.get("mode") == "partition":
+        result = solve_partition(prob)
+        with open(sys.argv[2], "w") as f:
+            json.dump(result, f)
+        return 0 if result["status"] == "ok" else 1
 
     time_limit_s = float(prob.get("time_limit_s", 20.0))
     min_ii = prob["min_ii"]

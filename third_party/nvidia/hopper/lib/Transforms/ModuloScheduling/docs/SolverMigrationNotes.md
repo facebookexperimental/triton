@@ -334,6 +334,45 @@ correctness.
    the autotuner. Position it as an offline/autotune tool, not the default
    JIT path — Twill's own solve times (tens of seconds to minutes) imply
    the same.
+   **[STARTED 2026-07-05, branch hwu27/modulo-cpsat-joint — two pieces
+   landed]**
+   (a) *Recurrence-chain criticality priced in the schedule objective*:
+   for each loop-carried back edge, the forward-chain span
+   `cycle[src] − cycle[dst]` is minimized at 8x the regPressure weight —
+   compressing recurrence circuits so model-underestimated chains (FA's
+   softmax: ~1745 real vs 1459 modeled cyc/iter) degrade the realized
+   iteration time as little as possible. On case3 this recovered the step-2
+   gap from 598 to 639.5 TFLOPS (canary 651). The remaining ~1.8% is a
+   SCHEDULE-side blind spot no schedule-only term can fix: the alpha
+   hand-off's urgency (its consumer sits in another WG) is invisible
+   before a partition exists — the precise motivation for (b) and for
+   joint cycles+wg (v2).
+   (b) *Joint partition v1* (`TRITON_MODULO_CPSAT_JOINT=1`, opt-in;
+   `partitionJointCPSAT` → `solve_partition` in modulo_cpsat.py): warp
+   assignment solved by CP-SAT against the committed schedule (cycles
+   fixed — Twill's re-solve shape), replacing scoreCandidate's
+   enumerate-and-score with constraints over the SAME calibrated costs:
+   async-flight-window overlap as the split cost (Twill's CONCURRENCY
+   insight — merging blocks sync work scheduled during a TMA/TC flight;
+   this term is what makes or breaks the model, issue-only windows
+   over-merge everything), slack-aware reg→SMEM→reg round-trips (refines
+   accumulateCrossWGRoundTrip, which ignores slack), measured barrier
+   issue costs, register footprint table + default-WG slack, channel SMEM
+   as a hard capacity constraint. Would-be-demoted scalar arith is
+   excluded (its cross-cluster edges are fictional — demotion replicates
+   it per WG; serializing it let the solver glue loader WGs together
+   through a shared index op).
+   **Result: reproduces the committed partitions on ALL five cases —
+   byte-identical generated.py — including case3's 6-WG FA structure with
+   the softmax chain intact.** The partition that guard 1 and the fitted
+   round-trip constant were added to protect now emerges from first
+   principles; this is the concrete path to deleting guard 1 once the
+   joint mode owns partitioning. Full stack (cpsat schedule + joint
+   partition) passes correctness on case3 with a 5-WG variant (PV-MMA
+   merged into rescale — the different cycle placement changes the
+   overlap costs; unmeasured, follow-up).
+   Still open for v2: joint cycles+wg in one solve (fixes the alpha-order
+   blind spot), guard-3 as an in-model legality constraint, sub-tiling.
 
 The validation harness above is the gate for every step, and the
 "Why this note exists" principle is the order of operations: a complete

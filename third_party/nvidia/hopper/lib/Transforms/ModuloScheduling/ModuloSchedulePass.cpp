@@ -8,6 +8,9 @@
 
 #include <cmath>
 
+#include "CPSATScheduler.h"
+#include "llvm/Support/JSON.h"
+
 #include "DataDependenceGraph.h"
 #include "LatencyModel.h"
 #include "ModuloReservationTable.h"
@@ -3634,26 +3637,26 @@ static constexpr int kReplicatedWarpGroup = -2;
 /// (`arith.muli → tt.descriptor_load`) and case3's `sem0_full`
 /// (`arith.addi → tt.descriptor_load`). Mirrors Meta's
 /// `TaskIdBackwardPropagation` (`isScalarArithOrMath`) treatment.
+/// Scalar arith/math on the CUDA pipe gets demoted to infra after
+/// partitioning (replicated into each consumer WG, no cross-WG hand-off).
+/// Tensor-result arith/math is real compute (extf, mulf, addf, truncf, ...)
+/// — those ARE anchors.
+static bool isDemotableScalarArith(const ttg::ScheduleNode &node) {
+  if (!node.op || node.pipeline != ttg::HWPipeline::CUDA)
+    return false;
+  StringRef dialect = node.op->getDialect()->getNamespace();
+  if (dialect != "arith" && dialect != "math")
+    return false;
+  for (auto t : node.op->getResultTypes())
+    if (isa<RankedTensorType>(t))
+      return false;
+  return true;
+}
+
 static void demoteScalarArithToInfra(ttg::ScheduleLoop &loop) {
   for (auto &node : loop.nodes) {
-    if (!node.op)
-      continue;
-    if (node.pipeline != ttg::HWPipeline::CUDA)
-      continue;
-    StringRef dialect = node.op->getDialect()->getNamespace();
-    if (dialect != "arith" && dialect != "math")
-      continue;
-    // Tensor-result arith/math is real compute (extf, mulf, addf,
-    // truncf, ...) — those ARE anchors.
-    bool isScalar = true;
-    for (auto t : node.op->getResultTypes())
-      if (isa<RankedTensorType>(t)) {
-        isScalar = false;
-        break;
-      }
-    if (!isScalar)
-      continue;
-    node.warpGroup = -1; // hand off to propagateWarpGroupToInfraOps
+    if (isDemotableScalarArith(node))
+      node.warpGroup = -1; // hand off to propagateWarpGroupToInfraOps
   }
 }
 
@@ -4134,6 +4137,180 @@ static void clampOuterStagesAndClusters(scf::ForOp outerLoop) {
   }
 }
 
+// ============================================================================
+// Joint formulation v1 (SolverMigrationNotes, step 3): warp-group assignment
+// solved by CP-SAT against the committed schedule, replacing scoreCandidate's
+// enumerate-and-score with a constraint model over the SAME calibrated costs.
+// Cycles stay fixed (the Twill-style re-solve holds II and, in this v1, the
+// placement); the model derives split/merge pressure from the schedule
+// itself — see solve_partition in python/triton/tools/modulo_cpsat.py.
+// Gated by TRITON_MODULO_CPSAT_JOINT=1; any failure falls back to
+// partitionExhaustive.
+// ============================================================================
+static bool partitionJointCPSAT(ttg::ScheduleLoop &loop,
+                                int64_t reservedSmemBytes) {
+  if (loop.II <= 0)
+    return false;
+  auto clusters = buildClusters(loop);
+  // Exclude ops that demoteScalarArithToInfra will demote after
+  // partitioning: they are REPLICATED into each consumer WG, so their
+  // cross-cluster edges never become real barriers — serializing them
+  // would let the solver glue unrelated clusters together through a shared
+  // scalar op just to save fictional barrier-issue cost.
+  for (auto &c : clusters) {
+    llvm::erase_if(c.nodeIds, [&](unsigned nid) {
+      return isDemotableScalarArith(loop.nodes[nid]);
+    });
+  }
+  llvm::erase_if(clusters,
+                 [](const OpCluster &c) { return c.nodeIds.empty(); });
+  if (clusters.size() < 2)
+    return false;
+
+  llvm::SmallDenseMap<unsigned, int> nodeToCluster;
+  for (const auto &c : clusters)
+    for (unsigned nid : c.nodeIds)
+      nodeToCluster[nid] = c.id;
+  bool loopHasTC = llvm::any_of(loop.nodes, [](const ttg::ScheduleNode &n) {
+    return n.pipeline == ttg::HWPipeline::TC;
+  });
+
+  llvm::json::Array jClusters;
+  for (const auto &c : clusters) {
+    llvm::json::Array nids;
+    for (unsigned nid : c.nodeIds)
+      nids.push_back(static_cast<int64_t>(nid));
+    jClusters.push_back(llvm::json::Object{
+        {"id", c.id},
+        {"min_warps", wgRequiredWarps(c.nodeIds, loop)},
+        {"nodes", std::move(nids)},
+    });
+  }
+  llvm::json::Array jNodes;
+  for (const auto &n : loop.nodes) {
+    if (!nodeToCluster.count(n.id))
+      continue;
+    jNodes.push_back(llvm::json::Object{
+        {"id", static_cast<int64_t>(n.id)},
+        {"cycle", n.cycle},
+        {"duration", std::max(n.selfLatency, 1)},
+        {"latency", std::max(n.latency, 0)},
+        {"pipeline", ttg::getPipelineName(n.pipeline)},
+        {"freq", std::max(n.frequencyMultiplier, 1)},
+    });
+  }
+  llvm::json::Array jEdges;
+  for (const auto &edge : loop.edges) {
+    auto s = nodeToCluster.find(edge.srcId);
+    auto d = nodeToCluster.find(edge.dstId);
+    if (s == nodeToCluster.end() || d == nodeToCluster.end())
+      continue;
+    if (s->second == d->second)
+      continue;
+    const auto &sN = loop.nodes[edge.srcId];
+    const auto &dN = loop.nodes[edge.dstId];
+    int freq =
+        std::max(std::max(sN.frequencyMultiplier, dN.frequencyMultiplier), 1);
+    int rt = 0;
+    if (isRegisterComputeValue(sN.op) && isRegisterComputeValue(dN.op)) {
+      if (int64_t bytes = registerTensorBytes(sN.op); bytes > 0)
+        rt = kCrossWGRoundTripLatency + smemMoveCost(bytes);
+    }
+    // One barrier instruction per side per iteration, kind as
+    // insertCrossGroupBarriers picks it (TC producer → named).
+    int xissue = 2 * freq *
+                 (sN.pipeline == ttg::HWPipeline::TC ? kNamedBarrierIssueCost
+                                                     : kMBarrierIssueCost);
+    auto spec = resolveCrossWGChannel(loop, edge, loopHasTC);
+    int64_t chanBytes =
+        spec.synthesize ? spec.synthesizedBytes() + 2 * spec.depth * 8 : 0;
+    jEdges.push_back(llvm::json::Object{
+        {"src", static_cast<int64_t>(edge.srcId)},
+        {"dst", static_cast<int64_t>(edge.dstId)},
+        {"src_cluster", s->second},
+        {"dst_cluster", d->second},
+        {"latency", edge.latency},
+        {"distance", static_cast<int64_t>(edge.distance)},
+        {"freq", freq},
+        {"rt", rt},
+        {"xissue", xissue},
+        {"chan_bytes", chanBytes},
+    });
+  }
+
+  llvm::json::Array fpTable;
+  for (int w = 0; w <= 8; ++w)
+    fpTable.push_back((w == 1 || w == 2 || w == 4 || w == 8) ? wgFootprint(w)
+                                                             : 0);
+
+  double timeLimitS = 20.0;
+  if (auto env = triton::tools::getStrEnv("TRITON_MODULO_CPSAT_TIMEOUT_S");
+      !env.empty())
+    timeLimitS = std::max(1.0, std::atof(env.c_str()));
+
+  llvm::json::Object root{
+      {"version", "cpsat-0.1"},
+      {"mode", "partition"},
+      {"ii", loop.II},
+      {"clusters", std::move(jClusters)},
+      {"nodes", std::move(jNodes)},
+      {"edges", std::move(jEdges)},
+      {"committed_smem", computeTotalSmem(loop) + reservedSmemBytes},
+      {"smem_budget", kSmemBudgetBytes()},
+      {"default_wg_footprint", kDefaultWGFootprint},
+      {"sm_regs", kBlackwellSMRegs},
+      {"default_slack", kDefaultSlack},
+      {"warp_footprint", std::move(fpTable)},
+      {"time_limit_s", timeLimitS},
+  };
+  std::string problemJson;
+  llvm::raw_string_ostream os(problemJson);
+  os << llvm::json::Value(std::move(root));
+
+  auto rawOut = ttg::runCPSATSubprocess(problemJson);
+  if (failed(rawOut))
+    return false;
+  auto parsed = llvm::json::parse(*rawOut);
+  if (!parsed) {
+    llvm::consumeError(parsed.takeError());
+    return false;
+  }
+  auto *obj = parsed->getAsObject();
+  if (!obj)
+    return false;
+  auto status = obj->getString("status");
+  auto *wgMap = obj->getObject("wg");
+  if (!status || *status != "ok" || !wgMap)
+    return false;
+
+  // Apply, same shape as partitionExhaustive's winner application: NONE ops
+  // reset to -1 (propagateWarpGroupToInfraOps attaches them later).
+  for (auto &node : loop.nodes)
+    node.warpGroup = -1;
+  for (const auto &c : clusters) {
+    auto v = wgMap->getInteger(std::to_string(c.id));
+    if (!v)
+      return false;
+    for (unsigned nid : c.nodeIds)
+      loop.nodes[nid].warpGroup = static_cast<int>(*v);
+  }
+  loop.topPartitions.clear();
+  loop.topPartitionCosts.clear();
+  if (auto objVal = obj->getNumber("objective"))
+    loop.partitionCost = *objVal;
+  LLVM_DEBUG({
+    llvm::dbgs() << "[Phase4-JOINT] CP-SAT partition: "
+                 << obj->getInteger("used_wgs").value_or(-1)
+                 << " WGs, cost=" << loop.partitionCost << "\n";
+    for (const auto &c : clusters)
+      llvm::dbgs() << "[Phase4-JOINT]   C" << c.id << " ("
+                   << ttg::getPipelineName(c.pipeline) << ") → wg"
+                   << wgMap->getInteger(std::to_string(c.id)).value_or(-1)
+                   << "\n";
+  });
+  return true;
+}
+
 /// Pass B: Per-loop warp-group partition + cross-group barriers. Each
 /// ScheduleLoop gets its own Phase 4 partition run with its own II.
 /// Nested kernels (case2/case5) get inner-partition (e.g., 3-WG GEMM
@@ -4144,6 +4321,8 @@ static void clampOuterStagesAndClusters(scf::ForOp outerLoop) {
 ///
 /// `TRITON_MODULO_EXHAUSTIVE_PARTITION=0|off|false` opts into the greedy
 /// fallback partitioner. Default is the exhaustive Phase 4 search.
+/// `TRITON_MODULO_CPSAT_JOINT=1` opts into the CP-SAT joint partition
+/// above (falls back to exhaustive per loop on solver failure).
 static void
 applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
   auto exhaustiveEnv =
@@ -4194,8 +4373,12 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
       if (useGreedy) {
         partitionIntoWarpGroups(schedLoop);
       } else {
-        partitionExhaustive(schedLoop,
-                            allLoopsSmem - computeTotalSmem(schedLoop));
+        int64_t reserved = allLoopsSmem - computeTotalSmem(schedLoop);
+        bool jointDone =
+            triton::tools::getBoolEnv("TRITON_MODULO_CPSAT_JOINT") &&
+            partitionJointCPSAT(schedLoop, reserved);
+        if (!jointDone)
+          partitionExhaustive(schedLoop, reserved);
       }
       demoteScalarArithToInfra(schedLoop);
       propagateWarpGroupToInfraOps(schedLoop);

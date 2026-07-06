@@ -36,6 +36,11 @@ runCPSATSchedule(const DataDependenceGraph &ddg, int minII,
                  const ModuloScheduleResult *incumbent = nullptr,
                  int smemBudget = 232448, int tmemColLimit = 512);
 
+/// Run the modulo_cpsat solver subprocess on an arbitrary problem JSON and
+/// return the raw solution JSON text. Shared by the schedule backend above
+/// and the joint-partition mode (ModuloSchedulePass's partitionJointCPSAT).
+FailureOr<std::string> runCPSATSubprocess(llvm::StringRef problemJson);
+
 } // namespace mlir::triton::gpu
 
 #endif // TRITON_NVIDIA_HOPPER_MODULO_SCHEDULING_CPSAT_H

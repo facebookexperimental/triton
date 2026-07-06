@@ -151,16 +151,7 @@ static bool verifySolution(const DataDependenceGraph &ddg,
   return true;
 }
 
-FailureOr<ModuloScheduleResult>
-runCPSATSchedule(const DataDependenceGraph &ddg, int minII,
-                 const ModuloScheduleResult *incumbent, int smemBudget,
-                 int tmemColLimit) {
-  if (minII <= 0 || ddg.getNumNodes() == 0)
-    return failure();
-  int maxII = serialUpperBound(ddg, minII);
-  LLVM_DEBUG(DBGS() << "minII=" << minII << " maxII(serial bound)=" << maxII
-                    << " nodes=" << ddg.getNumNodes() << "\n");
-
+FailureOr<std::string> runCPSATSubprocess(llvm::StringRef problemJson) {
   llvm::SmallString<128> inPath, outPath;
   if (llvm::sys::fs::createTemporaryFile("modulo-cpsat-in", "json", inPath))
     return failure();
@@ -178,8 +169,7 @@ runCPSATSchedule(const DataDependenceGraph &ddg, int minII,
     llvm::raw_fd_ostream os(inPath, ec);
     if (ec)
       return failure();
-    os << buildProblemJSON(ddg, minII, maxII, smemBudget, tmemColLimit,
-                           incumbent);
+    os << problemJson;
   }
 
   // Same subprocess pattern as LLMSchedulePass. The default command form
@@ -198,7 +188,24 @@ runCPSATSchedule(const DataDependenceGraph &ddg, int minII,
   auto bufOrErr = llvm::MemoryBuffer::getFile(outPath);
   if (!bufOrErr)
     return failure();
-  auto parsed = llvm::json::parse((*bufOrErr)->getBuffer());
+  return (*bufOrErr)->getBuffer().str();
+}
+
+FailureOr<ModuloScheduleResult>
+runCPSATSchedule(const DataDependenceGraph &ddg, int minII,
+                 const ModuloScheduleResult *incumbent, int smemBudget,
+                 int tmemColLimit) {
+  if (minII <= 0 || ddg.getNumNodes() == 0)
+    return failure();
+  int maxII = serialUpperBound(ddg, minII);
+  LLVM_DEBUG(DBGS() << "minII=" << minII << " maxII(serial bound)=" << maxII
+                    << " nodes=" << ddg.getNumNodes() << "\n");
+
+  auto rawOut = runCPSATSubprocess(
+      buildProblemJSON(ddg, minII, maxII, smemBudget, tmemColLimit, incumbent));
+  if (failed(rawOut))
+    return failure();
+  auto parsed = llvm::json::parse(*rawOut);
   if (!parsed) {
     llvm::consumeError(parsed.takeError());
     return failure();
