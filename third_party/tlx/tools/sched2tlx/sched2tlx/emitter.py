@@ -825,6 +825,18 @@ def _function_scope_ops_in_order(graph: ScheduleGraph) -> list[Op]:
     return [op for op in graph.ops.values() if op.scope == "function"]
 
 
+def _descriptor_reduce_desc_ops(graph: ScheduleGraph) -> set[str]:
+    """op_ids of make_tensor_descriptor ops feeding a tt.descriptor_reduce —
+    these are re-materialized inside the consuming task, not the preamble."""
+    out: set[str] = set()
+    for op in graph.ops.values():
+        if op.kind != "tt.descriptor_reduce" or not op.operands:
+            continue
+        if isinstance(op.operands[0], OpRef):
+            out.add(op.operands[0].op_id)
+    return out
+
+
 def _ops_before_loop(graph: ScheduleGraph, loop: Loop) -> list[Op]:
     """Function-scope ops that come strictly before the loop (preamble)."""
     out: list[Op] = []
@@ -1023,7 +1035,7 @@ def _semir_emit_consumer_block(
 
 
 def _semir_mma_operand_waits_and_mbarriers(
-    op: Op, g: ScheduleGraph, loop: Loop, rctx: RenderCtx
+    op: Op, g: ScheduleGraph, loop: Loop, rctx: RenderCtx, node: Node | None = None
 ) -> tuple[list[str], list[str]]:
     """For an MMA op, look up SemIR semaphores guarding its operand buffers.
     The schedule's cross_wg_barriers list names the local_alloc node as
@@ -1081,10 +1093,40 @@ def _semir_mma_operand_waits_and_mbarriers(
                 wait = ls.consumer_wait_at.get(cnode) or ls.consumer_wait_at.get(
                     alloc_node.id
                 )
-                if wait:
+                # Multi-consumer dedup: when >1 MMA in this WG reads the same
+                # single-buffered operand (FA-bwd dO → dpT + dV), its `_full`
+                # completes once per load — wait it only on the FIRST consumer
+                # (a 2nd wait on the same phase deadlocks); its `_empty`
+                # (arrive_count=1) must be signalled only by the LAST consumer
+                # (else it frees early and the producer overwrites mid-read).
+                # Key the dedup on the OPERAND buffer (the alloc this MMA reads),
+                # matching _opbuf_users — the semaphore's own buffer_id may be the
+                # cross-WG channel's paired buffer (e.g. dsT: operand buf3 vs
+                # channel buf4), which wouldn't match.
+                obuf = next(
+                    (b for b in loop.schedule.buffers if b.def_op == alloc_op_id),
+                    None,
+                )
+                bufid = (
+                    obuf.id
+                    if obuf is not None
+                    else (
+                        ls.sem.buffer.buffer_id if ls.sem.buffer is not None else None
+                    )
+                )
+                users = (
+                    (getattr(rctx, "_opbuf_users", {}) or {}).get(bufid, [])
+                    if bufid is not None
+                    else []
+                )
+                is_first = node is None or not users or node.id == users[0]
+                if wait and is_first:
                     waits.append(wait)
-                # HW recycle: MMA reading the SMEM operand signals the EMPTY
-                # barrier when reads complete (lets producer overwrite).
+                # HW recycle: EVERY consuming MMA signals EMPTY. The empty's
+                # arrive_count = #consumers (SemIR sums the per-consumer
+                # cross_wg_barriers), so all N arrives are required — do NOT
+                # dedup (that would leave the producer's empty-wait short → hang).
+                # (The FULL wait above IS deduped: a load's full completes once.)
                 if ls.alloc_empty_stmt is not None:
                     mbar.append(f"{ls.empty_name}[{ls.slot_expr}]")
             continue
@@ -1122,7 +1164,18 @@ def _semir_mma_operand_waits_and_mbarriers(
             continue
         idx = "0" if buf.count == 1 else "buf"
         ph = "(_it & 1)" if buf.count == 1 else "phase"
-        waits.append(f"tlx.barrier_wait({_bar_full(buf_var)}[{idx}], {ph})")
+        # Multi-consumer dedup: when several MMAs in this WG read the same
+        # single-buffered operand (e.g. FA-bwd dO feeds both dpT and dV), its
+        # `_full` completes ONCE per load — wait it only on the FIRST consumer
+        # (a second wait on the same phase would block forever) and recycle the
+        # `_empty` only on the LAST consumer (so the producer can't overwrite
+        # while an earlier-issued MMA still reads). Matches the hand-written
+        # kernel's single do_fulls wait + single do_empties arrive.
+        users = (getattr(rctx, "_opbuf_users", {}) or {}).get(buf.id, [])
+        is_first = node is None or not users or node.id == users[0]
+        if is_first:
+            waits.append(f"tlx.barrier_wait({_bar_full(buf_var)}[{idx}], {ph})")
+        # Every consuming MMA recycles EMPTY (arrive_count=#consumers in SemIR).
         mbar.append(f"{_bar_empty(buf_var)}[{idx}]")
     return waits, mbar
 
@@ -1242,10 +1295,17 @@ def _emit_preamble(
 ) -> None:
     lines += "# ── Preamble (function-scope ops before the loop) ──"
     pre_ops = _ops_before_loop(g, loop)
+    # Descriptors consumed by an in-loop tt.descriptor_reduce (FA-bwd dQ) are
+    # re-materialized inside the consuming task, not captured from the preamble:
+    # an in-task async_descriptor_store infers an nvmma_shared tensordesc type
+    # that mismatches the bare type at the warp_specialize capture boundary.
+    reduce_descs = _descriptor_reduce_desc_ops(g)
     for op in pre_ops:
         if op.kind in _SKIP_FUNCTION_SCOPE:
             continue
         if op.kind not in _NAMED_FUNCTION_OPS:
+            continue
+        if op.op_id in reduce_descs:
             continue
         # Auto-name based on op kind (descriptors get nice names).
         name = _auto_name(op, rctx.fresh_idx())
@@ -1334,7 +1394,10 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
         # Per-loop unique name to avoid id collisions between inner/outer.
         var = f"L{loop.loop_id}_{_buffer_var_name(b)}"
         rctx.buffer_var[(loop.loop_id, b.id)] = var
-        if b.def_op:
+        # A double-buffered buffer and its paired barrier share a def_op; the
+        # barrier must not overwrite the data buffer's alloc_op_var mapping (else
+        # a data operand renders as the barrier var, e.g. `L0_bar_4`).
+        if b.def_op and b.kind != "barrier":
             rctx.alloc_op_var[b.def_op] = var
         if b.kind == "smem":
             # 1D shapes need trailing comma in Python tuple syntax
@@ -1453,6 +1516,11 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
     # canonical `acc_tmem` name (the running accumulator the epilogue
     # reads); smaller TMEM ops (e.g., qk scratch) get suffixed names.
     fn_ops = list(g.ops.values())
+    # TMEM interval-coloring: disjoint-lifetime accumulators share a
+    # storage_alias_spec (FA-bwd: qkT and dQ → one slot), so the function-scope
+    # accs fit the 512-col TMEM budget. {alloc_op_id: color} for aliased accs.
+    tmem_alias = _tmem_alias_groups(g)
+    tmem_spec_var: dict[int, str] = {}  # color → emitted spec var name
 
     def _tmem_size(op):
         if op.kind != "ttng.tmem_alloc" or not op.result_types:
@@ -1528,10 +1596,28 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
             # via op_var, the bare name without `[0]` wins and we get
             # `local_load(acc_tmem)` instead of `local_load(acc_tmem[0])`.
             rctx.alloc_op_var[op.op_id] = name
-            lines += (
-                f"{name} = tlx.local_alloc(({shape_str}), {dtype}, 1, "
-                f"tlx.storage_kind.tmem)"
-            )
+            # If this acc is in an aliased color group, route it through a
+            # shared storage_alias_spec (no set_buffer_overlap → all members
+            # overlap at offset 0, size=max; safe since lifetimes are disjoint).
+            color = tmem_alias.get(op.op_id)
+            if color is not None:
+                spec = tmem_spec_var.get(color)
+                if spec is None:
+                    spec = f"tmem_alias_{color}"
+                    tmem_spec_var[color] = spec
+                    lines += (
+                        f"{spec} = tlx.storage_alias_spec("
+                        f"storage=tlx.storage_kind.tmem)"
+                    )
+                lines += (
+                    f"{name} = tlx.local_alloc(({shape_str}), {dtype}, 1, "
+                    f"tlx.storage_kind.tmem, reuse={spec})"
+                )
+            else:
+                lines += (
+                    f"{name} = tlx.local_alloc(({shape_str}), {dtype}, 1, "
+                    f"tlx.storage_kind.tmem)"
+                )
     # Epilogue staging SMEM (for the descriptor_store) — derived from the
     # store op's source tensor shape.
     epi_store = next(
@@ -1603,6 +1689,35 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
             shape = [part_m, shape[1]]
         shape_str = ", ".join(str(d) for d in shape)
         lines += f"c_smem = tlx.local_alloc(({shape_str}), {dtype}, 1)"
+    # Dedicated staging SMEM for an in-loop TMA reduce (e.g. FA-bwd dQ
+    # atomic-add). Separate from c_smem because the reduce runs inside the loop
+    # in its own warp group while the dK/dV epilogue stores reuse c_smem
+    # post-loop in another warp group — sharing would race across groups.
+    redu_op = next(
+        (op for op in g.ops.values() if op.kind == "tt.descriptor_reduce"),
+        None,
+    )
+    if redu_op and redu_op.operands:
+        rshape: list[int] = [128, 128]
+        rdtype = "tl.float16"
+        if isinstance(redu_op.operands[0], OpRef):
+            desc_op = g.ops.get(redu_op.operands[0].op_id)
+            if desc_op:
+                bs = _parse_desc_block_shape(
+                    desc_op.result_types[0] if desc_op.result_types else ""
+                )
+                if bs:
+                    rshape, rdtype = bs[0], _dtype_str_to_tl(bs[1])
+        elif isinstance(redu_op.operands[0], ArgRef):
+            arg = next(
+                (a for a in g.kernel.args if a.name == redu_op.operands[0].name), None
+            )
+            if arg:
+                bs = _parse_desc_block_shape(arg.type)
+                if bs:
+                    rshape, rdtype = bs[0], _dtype_str_to_tl(bs[1])
+        rshape_str = ", ".join(str(d) for d in rshape)
+        lines += f"dq_smem = tlx.local_alloc(({rshape_str}), {rdtype}, 1)"
     lines += ""
 
 
@@ -1887,7 +2002,14 @@ def _derive_tmem_channels(g: ScheduleGraph, inner: Loop) -> list[Channel]:
                         consumer_wgs.add(wg)
             if not producer_wgs or not consumer_wgs:
                 continue
-            if producer_wgs == consumer_wgs:
+            # Same-WG: skip the SMEM-style channel UNLESS it's a tmem_alloc(value)
+            # bridge (bridge_op_id set). An intra-WG bridge (FA-bwd dsT/pT at
+            # small BLOCK_M, where the value-store and the consuming MMA land in
+            # one WG) still needs the producer local_store + full/empty handshake
+            # emitted (the async MMA reads TMEM); routing it through the bridge
+            # path provides exactly that, and prevents the broken intra-WG
+            # fallback (which references undeclared `<buf>_full`).
+            if producer_wgs == consumer_wgs and bridge_op_id is None:
                 continue
             seen_alloc.add(b_def_op)
             # Pick a representative producer/consumer wg for naming.
@@ -1903,6 +2025,90 @@ def _derive_tmem_channels(g: ScheduleGraph, inner: Loop) -> list[Channel]:
                     kind="tmem",
                     alloc_op_id=b_def_op,
                     bridge_op_id=bridge_op_id,
+                )
+            )
+    return out
+
+
+def _derive_smem_bridge_channels(g: ScheduleGraph, inner: Loop) -> list[Channel]:
+    """Intra-WG SMEM `local_alloc(value)` → MMA bridges — the SMEM analogue of
+    the intra-WG `tmem_alloc(value)` bridge in `_derive_tmem_channels`.
+
+    A register value staged to SMEM via `ttg.local_alloc(%val)` and consumed by
+    MMA operand(s) in the SAME warp group. `cross_wg_barriers` only cover
+    cross-WG staging, so an intra-WG such buffer is otherwise emitted with NO
+    store into it and NO barriers (FA-bwd `dsT` when softmax + dK/dQ MMAs share
+    a WG — the all-MMA-in-one-WG partition variants). Emit it as a bridge
+    channel; `kind="tmem"` reuses the bridge store+handshake emission path
+    verbatim (local_store + full/empty, no fence — MMA consumer). Storage is
+    unaffected: the buffer stays SMEM (allocated by the normal buffer emission);
+    the bridge only adds the value store and the completion barriers.
+    """
+    wg_of = {n.op_ref: n.warp_group for n in inner.schedule.nodes if n.op_ref}
+
+    def _operand_alloc(op: Op, si: int) -> str | None:
+        if len(op.operands) <= si or not isinstance(op.operands[si], OpRef):
+            return None
+        aid = op.operands[si].op_id
+        mid = g.ops.get(aid)
+        if (
+            mid is not None
+            and mid.kind == "ttg.memdesc_trans"
+            and mid.operands
+            and isinstance(mid.operands[0], OpRef)
+        ):
+            aid = mid.operands[0].op_id
+        return aid
+
+    out: list[Channel] = []
+    for L in g.loops:
+        for b in L.schedule.buffers:
+            if b.kind != "smem" or not b.def_op:
+                continue
+            alloc = g.ops.get(b.def_op)
+            if (
+                alloc is None
+                or alloc.kind != "ttg.local_alloc"
+                or not alloc.operands
+                or not isinstance(alloc.operands[0], OpRef)
+            ):
+                continue  # plain alloc (no staged value) — a load ring, not a bridge
+            valop = g.ops.get(alloc.operands[0].op_id)
+            if valop is not None and valop.kind == "tt.descriptor_load":
+                continue  # TMA-fed ring — handled by the async-load path, not here
+            val_wg = wg_of.get(alloc.operands[0].op_id)
+            if val_wg is None:
+                continue
+            # MMA operand consumers of this buffer (count occurrences for the
+            # empty barrier's arrive_count — each consuming MMA arrives once).
+            cons_wgs: set[int] = set()
+            n_uses = 0
+            for oid, op in g.ops.items():
+                if op.kind not in ("ttng.tc_gen5_mma", "ttng.tc_gen5_mma_scaled"):
+                    continue
+                w = wg_of.get(oid)
+                if w is None:
+                    continue
+                for si in (0, 1):
+                    if _operand_alloc(op, si) == b.def_op:
+                        cons_wgs.add(w)
+                        n_uses += 1
+            if not cons_wgs or cons_wgs != {val_wg}:
+                continue  # cross-WG (cross_wg_barriers cover it) or no MMA consumer
+            if any(cb.paired_buffer_id == b.id for cb in L.schedule.cross_wg_barriers):
+                continue  # already staged by a synthesized cross-WG channel
+            out.append(
+                Channel(
+                    name=b.def_op,  # resolved to the buffer var by the caller
+                    depth=b.count,
+                    producer_wg=val_wg,
+                    consumer_wg=val_wg,
+                    kind="tmem",  # reuse bridge store+handshake emission
+                    alloc_op_id=b.def_op,
+                    bridge_op_id=b.def_op,
+                    loop_id=L.loop_id,
+                    buffer_id=b.id,
+                    num_consumers=max(1, n_uses),
                 )
             )
     return out
@@ -2027,6 +2233,260 @@ def _emit_mbarriers(
 # ===========================================================================
 
 
+def _reassign_orphan_nodes(graph: ScheduleGraph, loop: Loop) -> None:
+    """The partition pass leaves pipeline=NONE sink ops (e.g. the FA-bwd dQ
+    `tt.descriptor_reduce`) at warp_group=-1 — no compute pipeline of their
+    own. Fold each into the warp group that produces its data, so it executes
+    in the same task that computed the value (matching how a hand-written WS
+    kernel puts the dQ atomic-add in the reduction task next to its tmem_load).
+
+    Walks the op's SSA operands transitively to the nearest producing node with
+    a real warp group. Idempotent — repeats to a fixpoint so orphan chains
+    resolve."""
+    node_by_op = {n.op_ref: n for n in loop.schedule.nodes if n.op_ref}
+    changed = True
+    while changed:
+        changed = False
+        for n in loop.schedule.nodes:
+            if n.warp_group != -1 or not n.op_ref:
+                continue
+            op = graph.ops.get(n.op_ref)
+            if op is None:
+                continue
+            for operand in op.operands:
+                src_op = getattr(operand, "op_id", None)
+                if src_op is None:
+                    continue
+                producer = node_by_op.get(src_op)
+                if producer is not None and producer.warp_group != -1:
+                    n.warp_group = producer.warp_group
+                    changed = True
+                    break
+
+
+def _epilogue_acc_wg(g: ScheduleGraph, rctx: RenderCtx) -> dict[str, int]:
+    """Map each non-canonical epilogue-output TMEM accumulator (var name) to the
+    warp group whose in-loop MMA produces it.
+
+    The legacy single-accumulator handoff carves out one canonical `acc_tmem`.
+    FA-bwd writes dK and dV into two *additional* distinct TMEM accumulators
+    that an epilogue `tmem_load` reads; each needs its own full barrier that its
+    producer WG commits after the loop. Result is cached on rctx."""
+    cached = getattr(rctx, "_epilogue_acc_wg_cache", None)
+    if cached is not None:
+        return cached
+    epi_vars: set[str] = set()
+    for op in g.ops.values():
+        if op.scope != "function" or op.kind != "ttng.tmem_load":
+            continue
+        if op.operands and isinstance(op.operands[0], OpRef):
+            v = rctx.alloc_op_var.get(op.operands[0].op_id)
+            if v and v != "acc_tmem":
+                epi_vars.add(v)
+    out: dict[str, int] = {}
+    for L in g.loops:
+        for n in L.schedule.nodes:
+            if not n.op_ref or "mma" not in n.op_kind.lower():
+                continue
+            op = g.ops.get(n.op_ref)
+            if op is None or len(op.operands) < 3:
+                continue
+            if not isinstance(op.operands[2], OpRef):
+                continue
+            v = rctx.alloc_op_var.get(op.operands[2].op_id)
+            if v in epi_vars and n.warp_group != -1:
+                out[v] = n.warp_group
+    rctx._epilogue_acc_wg_cache = out
+    return out
+
+
+def _buf_mma_consumer_counts(g: ScheduleGraph) -> dict[str, int]:
+    """{buffer_var_name: number of in-loop MMA nodes consuming it}. An operand
+    buffer read by N MMAs in a WG has its EMPTY barrier arrived N times (each
+    async_dot recycles via mBarriers), so its arrive_count must be N. Cross-WG
+    channels get this via the SemIR per-consumer sum; intra-WG load buffers
+    (the `extra` carve-out) are hardcoded to 1 and need this override."""
+    out: dict[str, int] = {}
+    for loop in g.loops:
+        by_def: dict[str, int] = {}
+        for n in loop.schedule.nodes:
+            if not n.op_ref or "mma" not in n.op_kind.lower():
+                continue
+            op = g.ops.get(n.op_ref)
+            if op is None:
+                continue
+            for o in op.operands[:2]:
+                aid = getattr(o, "op_id", None)
+                if aid is None:
+                    continue
+                mid = g.ops.get(aid)
+                if mid is not None and mid.kind == "ttg.memdesc_trans" and mid.operands:
+                    aid = getattr(mid.operands[0], "op_id", aid)
+                by_def[aid] = by_def.get(aid, 0) + 1
+        for b in loop.schedule.buffers:
+            if b.def_op and by_def.get(b.def_op, 0) > 1:
+                cnt = by_def[b.def_op]
+                var = f"L{loop.loop_id}_{_buffer_var_name(b)}"
+                out[var] = cnt
+                out[b.id] = cnt  # by buffer id for semaphore-side lookup
+                # Propagate across the merge group: a cross-WG channel's
+                # synthesized data buffer (def_op=None) aliases the real alloc
+                # the MMAs read (same merge_group_id) and is what the SemIR
+                # semaphore references (e.g. dsT: MMAs read buf3, channel=buf4,
+                # both mgid=3).
+                if b.merge_group_id is not None:
+                    for o in loop.schedule.buffers:
+                        if o.merge_group_id == b.merge_group_id:
+                            out[o.id] = cnt
+                            out[f"L{loop.loop_id}_{_buffer_var_name(o)}"] = cnt
+    return out
+
+
+def _tmem_cyclic_occupies(lo: int, hi: int, ii: int) -> list[tuple[int, int]]:
+    """Project an ABSOLUTE-issue-time lifetime [lo, hi] onto the cyclic [0, II)
+    footprint it occupies. `lo`/`hi` are in absolute issue time (stage*II +
+    within-II cycle), so the caller guarantees hi >= lo. A span >= II covers the
+    whole loop; otherwise it is one [s, e) window that splits into two pieces
+    when it crosses the II boundary. (Do NOT pass a raw within-II [lo, hi] where
+    a prior-iteration consumer can make hi < lo — that inversion is exactly the
+    bug this absolute-time formulation avoids.)"""
+    length = hi - lo
+    if length >= ii:
+        return [(0, ii)]
+    s = lo % ii
+    e = s + length
+    if e <= ii:
+        return [(s, e)]
+    return [(s, ii), (0, e - ii)]
+
+
+def _tmem_lifetimes_conflict(
+    la: tuple[int, int] | None, lb: tuple[int, int] | None, ii: int
+) -> bool:
+    """Two TMEM-accumulator lifetimes conflict iff their cyclic footprints
+    intersect. `None` = whole-loop (an accumulator read only in the epilogue),
+    which conflicts with everything."""
+    if la is None or lb is None:
+        return True
+    oa = _tmem_cyclic_occupies(la[0], la[1], ii)
+    ob = _tmem_cyclic_occupies(lb[0], lb[1], ii)
+    return any(s1 < e2 and s2 < e1 for (s1, e1) in oa for (s2, e2) in ob)
+
+
+def _tmem_alias_groups(g: ScheduleGraph) -> dict[str, int]:
+    """Interval-color the function-scope TMEM accumulators so disjoint-lifetime
+    accs share storage (FA-bwd: qkT and dQ never overlap → one slot). Returns
+    {tmem_alloc_op_id: color_id}; only colors with ≥2 members get aliased.
+
+    Lifetime of each acc, modulo the loop II:
+      - accumulator (read only in the post-loop epilogue, i.e. dV/dK) → live the
+        whole loop, conflicts with everything;
+      - per-iter (in-loop consumer) → [producer_cycle .. last_consumer_cycle],
+        which may wrap past II.
+    Two per-iter lifetimes conflict iff their cyclic projections intersect.
+    Cross-WG/iteration ordering is already enforced by the schedule's dataflow
+    barriers (same guarantee the hand-written kernel's qk_p/dp_dq reuse relies
+    on), so sharing a slot needs no new barrier."""
+    loops = [L for L in g.loops if not L.is_outer] or g.loops
+    if not loops:
+        return {}
+    loop = loops[0]
+    II = max(loop.schedule.II, 1)
+
+    # Only alias when TMEM would otherwise overflow the 512-column budget.
+    # Aliasing forces two accumulators to share one physical slot, but the
+    # emitter gives each its OWN recycle barrier (the shared slot's two readers
+    # are not jointly gated), which is unsafe unless space pressure demands it.
+    # When everything already fits (e.g. small BLOCK_M/HEAD_DIM), don't alias.
+    def _tmem_cols(dims: list[int], bits: int) -> int:
+        if len(dims) < 2:
+            return 0
+        return max(1, (dims[1] * bits + 31) // 32)
+
+    total_cols = 0
+    for b in loop.schedule.buffers:
+        if b.kind == "tmem":
+            total_cols += _tmem_cols(b.shape, b.element_bits)
+    for op in g.ops.values():
+        if op.scope == "function" and op.kind == "ttng.tmem_alloc" and op.result_types:
+            sd = _parse_tensor_shape(op.result_types[0])
+            if sd:
+                bits = 16 if sd[1] in ("f16", "bf16") else 32
+                total_cols += _tmem_cols(sd[0], bits)
+    if total_cols <= 512:
+        return {}
+
+    def _is_mma(n: Node) -> bool:
+        return bool(n.op_ref) and "mma" in n.op_kind.lower()
+
+    # Epilogue (function-scope) tmem_load reads → accumulator marker.
+    epi_read: set[str] = set()
+    for op in g.ops.values():
+        if op.scope == "function" and op.kind == "ttng.tmem_load" and op.operands:
+            if isinstance(op.operands[0], OpRef):
+                epi_read.add(op.operands[0].op_id)
+
+    # Per-alloc producer + in-loop consumer cycles.
+    accs: dict[str, dict] = {}
+    for n in loop.schedule.nodes:
+        if not n.op_ref:
+            continue
+        op = g.ops.get(n.op_ref)
+        if op is None:
+            continue
+        # Absolute issue time = stage*II + within-II cycle. Using absolute time
+        # (not the raw within-II cycle) is what keeps a lifetime's hi >= lo when
+        # a consumer reads a value produced in an EARLIER iteration (multi-stage
+        # / skewed schedules) — otherwise max(cons_cycle) < min(prod_cycle)
+        # inverts the interval and the cyclic-overlap test silently misses real
+        # conflicts, mis-coloring overlapping accumulators onto one slot.
+        abs_t = n.schedule_stage * II + n.schedule_cycle
+        if _is_mma(n) and len(op.operands) >= 3 and isinstance(op.operands[2], OpRef):
+            aid = op.operands[2].op_id
+            if g.ops.get(aid) and g.ops[aid].kind == "ttng.tmem_alloc":
+                accs.setdefault(aid, {"prod": [], "cons": []})["prod"].append(abs_t)
+        if (
+            op.kind == "ttng.tmem_load"
+            and op.operands
+            and isinstance(op.operands[0], OpRef)
+        ):
+            aid = op.operands[0].op_id
+            if g.ops.get(aid) and g.ops[aid].kind == "ttng.tmem_alloc":
+                accs.setdefault(aid, {"prod": [], "cons": []})["cons"].append(abs_t)
+
+    # Build lifetimes. whole=None means whole-loop (conflicts all).
+    life: dict[str, tuple | None] = {}
+    for aid, d in accs.items():
+        if not d["prod"]:
+            continue
+        if aid in epi_read or not d["cons"]:
+            life[aid] = None  # accumulator → whole loop
+        else:
+            life[aid] = (min(d["prod"]), max(d["cons"]))
+
+    # Greedy coloring (largest-first for stable packing). Conflict = cyclic
+    # lifetime overlap; see _tmem_lifetimes_conflict / _tmem_cyclic_occupies.
+    order = sorted(life.keys(), key=lambda a: (life[a] is not None, a))
+    color: dict[str, int] = {}
+    colors: list[list[str]] = []
+    for aid in order:
+        placed = False
+        for ci, members in enumerate(colors):
+            if all(
+                not _tmem_lifetimes_conflict(life[aid], life[m], II) for m in members
+            ):
+                members.append(aid)
+                color[aid] = ci
+                placed = True
+                break
+        if not placed:
+            color[aid] = len(colors)
+            colors.append([aid])
+    # Only colors with ≥2 members are worth aliasing.
+    multi = {ci for ci, m in enumerate(colors) if len(m) > 1}
+    return {aid: ci for aid, ci in color.items() if ci in multi}
+
+
 def _nodes_in_warp_group(loop: Loop, wg: int) -> list[Node]:
     return sorted(
         [n for n in loop.schedule.nodes if n.warp_group == wg],
@@ -2083,10 +2543,25 @@ def _emit_default_partition(
             if op.kind in _SKIP_FUNCTION_SCOPE:
                 continue
             if op.kind == "ttng.tmem_load":
-                lines += "acc = tlx.local_load(acc_tmem[0])"
-                # acc_tmem is a legacy carve-out under SemIR — full+empty.
-                lines += "tlx.barrier_arrive(acc_tmem_empty[0], 1)"
-                rctx.op_var[op.op_id] = "acc"
+                # Resolve the source TMEM alloc → its emitted buffer var so a
+                # multi-output epilogue (FA-bwd: dV from acc_tmem_6, dK from
+                # acc_tmem_8) reads the correct accumulator instead of all
+                # aliasing acc_tmem[0]. Each non-canonical accumulator gets its
+                # own full/empty handoff (see _emit_epilogue_acc_handoff).
+                src_var = "acc_tmem"
+                if op.operands and isinstance(op.operands[0], OpRef):
+                    src_var = rctx.alloc_op_var.get(op.operands[0].op_id, "acc_tmem")
+                if src_var == "acc_tmem":
+                    name = "acc"
+                    lines += f"{name} = tlx.local_load({src_var}[0])"
+                    # acc_tmem is a legacy carve-out under SemIR — full+empty.
+                    lines += "tlx.barrier_arrive(acc_tmem_empty[0], 1)"
+                else:
+                    name = f"acc_{rctx.fresh_idx()}"
+                    lines += f"tlx.barrier_wait({src_var}_full[0], 0)"
+                    lines += f"{name} = tlx.local_load({src_var}[0])"
+                    lines += f"tlx.barrier_arrive({src_var}_empty[0], 1)"
+                rctx.op_var[op.op_id] = name
                 continue
             if op.kind == "arith.truncf":
                 inner = _render_operand(op.operands[0], rctx)
@@ -2217,6 +2692,48 @@ def _emit_warp_group(
     nodes = _nodes_in_warp_group(loop, wg.id)
     if not nodes:
         return
+
+    # Per-operand-buffer MMA user lists (emission order) for the multi-consumer
+    # intra-WG fallback: an operand read by >1 MMA in this WG must wait its
+    # `_full` once (first user) and recycle `_empty` once (last user).
+    opbuf_users: dict[int, list[int]] = {}
+    for nd in nodes:
+        if nd.op_kind != "ttng.tc_gen5_mma" or not nd.op_ref:
+            continue
+        mop = g.ops.get(nd.op_ref)
+        if mop is None:
+            continue
+        for src_idx in (0, 1):
+            if len(mop.operands) <= src_idx or not isinstance(
+                mop.operands[src_idx], OpRef
+            ):
+                continue
+            aid = mop.operands[src_idx].op_id
+            mid = g.ops.get(aid)
+            if (
+                mid is not None
+                and mid.kind == "ttg.memdesc_trans"
+                and mid.operands
+                and isinstance(mid.operands[0], OpRef)
+            ):
+                aid = mid.operands[0].op_id
+            buf = next(
+                (
+                    b
+                    for b in loop.schedule.buffers
+                    if b.def_op == aid and b.kind != "barrier"
+                ),
+                None,
+            )
+            if buf is not None and nd.id not in opbuf_users.setdefault(buf.id, []):
+                opbuf_users[buf.id].append(nd.id)
+    rctx._opbuf_users = opbuf_users
+    # Per-WG-body dedup of identical `_full` waits: a single-buffered operand
+    # read by >1 MMA in this WG completes its full ONCE per load, so a repeated
+    # `barrier_wait(<buf>_full[0], <same phase>)` would block forever. The
+    # strings are identical for count=1 operands (same slot+phase), so exact-
+    # match dedup is safe (count=2 buffers differ in slot/phase and are kept).
+    rctx._emitted_full_waits = set()
 
     # Filter to ops that emit something. Allocs are SSA-only.
     emit_nodes = [
@@ -2540,6 +3057,13 @@ def _emit_warp_group(
             # prior async tcgen5 ops in this WG (the PV MMAs). Without it,
             # a plain barrier_arrive races with the still-pending HW MMA.
             lines += "tlx.tcgen05_commit(acc_tmem_full[0])"
+        # Non-canonical epilogue accumulators this WG produces (FA-bwd: dK in
+        # the dK-MMA's WG, dV in the dV-MMA's WG). Independent of has_mma (which
+        # only flags the canonical acc_tmem producer) — commit so the default
+        # partition's post-loop tmem_load sees the completed accumulator.
+        for var, pwg in _epilogue_acc_wg(g, rctx).items():
+            if pwg == wg.id:
+                lines += f"tlx.tcgen05_commit({var}_full[0])"
 
     # Restore global (preamble) names shadowed by the per-WG localization above.
     for _oid, _prev in _reg_loc_saved.items():
@@ -2853,28 +3377,61 @@ def _emit_in_loop_node(
             #      by softmax via the bridge) — full+empty pair, legacy carve.
             #  (4) the MMA's own producer-side semaphores (acc TMEM signals).
             opnd_waits, opnd_mbar = _semir_mma_operand_waits_and_mbarriers(
-                op, g, loop, rctx
+                op, g, loop, rctx, n
             )
+            _seen_fw = getattr(rctx, "_emitted_full_waits", None)
             for w in opnd_waits:
+                # Skip a duplicate `_full` wait already emitted in this WG body
+                # (multi-consumer single-buffered operand — see _emit_warp_group).
+                # _seen_fw is only set on the _emit_warp_group path; other paths
+                # (e.g. case2 persistent inner loop) never multi-consume, so skip.
+                if _seen_fw is not None and "_full[" in w and "barrier_wait" in w:
+                    if w in _seen_fw:
+                        continue
+                    _seen_fw.add(w)
                 lines += w
             # TMEM bridge operand: wait the bridge's full barrier; the empty
             # side goes into the MMA's mBarriers list for HW recycle.
             tmem_chan_for_recycle: list[str] = []
+            _seen_fw_br = getattr(rctx, "_emitted_full_waits", None)
             for src_idx in (0, 1):
                 if not (
                     len(op.operands) > src_idx
                     and isinstance(op.operands[src_idx], OpRef)
                 ):
                     continue
-                src_id = op.operands[src_idx].op_id
+                # Match the operand's alloc directly, or through one
+                # memdesc_trans hop (a bridge operand read transposed, e.g.
+                # FA-bwd dK reads trans(dsT)). Direct-match cases are unchanged.
+                cand_ids = [op.operands[src_idx].op_id]
+                mid = g.ops.get(cand_ids[0])
+                if (
+                    mid is not None
+                    and mid.kind == "ttg.memdesc_trans"
+                    and mid.operands
+                    and isinstance(mid.operands[0], OpRef)
+                ):
+                    cand_ids.append(mid.operands[0].op_id)
                 for c in rctx.channels:
-                    if c.kind == "tmem" and c.alloc_op_id == src_id:
-                        lines += (
+                    if c.kind == "tmem" and c.alloc_op_id in cand_ids:
+                        fw = (
                             f"tlx.barrier_wait({_bar_full(c.name)}[0], "
                             f"_it & 1)  # TMEM bridge operand"
                         )
+                        # Multi-consumer dedup: a bridge read by >1 MMA in this
+                        # WG (FA-bwd dsT → dK+dQ) has its `_full` completed once
+                        # per store — wait it only on the first consumer. Each
+                        # consumer still arrives `_empty` (arrive_count=#uses).
+                        if _seen_fw_br is None or fw not in _seen_fw_br:
+                            lines += fw
+                            if _seen_fw_br is not None:
+                                _seen_fw_br.add(fw)
                         tmem_chan_for_recycle.append(f"{_bar_empty(c.name)}[0]")
             for w in _semir_consumer_waits(loop.loop_id, n.id, rctx):
+                if _seen_fw is not None and "_full[" in w and "barrier_wait" in w:
+                    if w in _seen_fw:
+                        continue
+                    _seen_fw.add(w)
                 lines += w
             lines += f"use_acc = {_use_acc_expr(op, loop, rctx)}"
             mbar_list: list[str] = []
@@ -3129,6 +3686,39 @@ def _emit_in_loop_node(
         lines += f"tlx.async_descriptor_store({desc}, {buf_var}[{slot}], [{offs_str}])"
         lines += "tlx.async_descriptor_store_wait(0)"
         return
+    if n.op_kind == "tt.descriptor_reduce":
+        # Atomic-add store (e.g. FA-bwd dQ: many K-tiles accumulate into the same
+        # Q rows). Like the in-loop store but with store_reduce="add".
+        # operands = [desc, value, off0, off1, ...].
+        # Re-materialize the descriptor here (task-local) rather than capturing
+        # it from the preamble: an in-task async_descriptor_store infers an
+        # nvmma_shared tensordesc type that mismatches the bare captured type.
+        if isinstance(op.operands[0], OpRef):
+            desc_op = g.ops.get(op.operands[0].op_id)
+            if desc_op is not None and desc_op.op_id not in rctx.op_var:
+                dname = _auto_name(desc_op, rctx.fresh_idx())
+                rctx.op_var[desc_op.op_id] = dname
+                lines += f"{dname} = {_render_op_expr(desc_op, rctx)}"
+        desc = _render_operand(op.operands[0], rctx)
+        value_expr = _render_operand(op.operands[1], rctx)
+        offs_str = ", ".join(_render_operand(o, rctx) for o in op.operands[2:])
+        bid = op.attributes.get("buffer.id")
+        buf = next((b for b in loop.schedule.buffers if b.id == bid), None)
+        if buf is not None:
+            buf_var = rctx.buffer_var.get(
+                (loop.loop_id, buf.id), f"L{loop.loop_id}_{_buffer_var_name(buf)}"
+            )
+            slot = "buf" if buf.count > 1 else "0"
+        else:
+            buf_var, slot = "dq_smem", "0"
+        lines += f"tlx.local_store({buf_var}[{slot}], {value_expr})"
+        lines += "tlx.fence_async_shared()"
+        lines += (
+            f"tlx.async_descriptor_store({desc}, {buf_var}[{slot}], "
+            f'[{offs_str}], store_reduce="add")'
+        )
+        lines += "tlx.async_descriptor_store_wait(0)"
+        return
     # Multi-result ops.
     if n.op_kind == "tt.split":
         # Returns (left, right) — assign as tuple.
@@ -3327,14 +3917,18 @@ def _resolve_alloc_to_buffer(
     e.g., case3's per-tile-resident Q SMEM)."""
     if not isinstance(operand, OpRef):
         return None, None
+    # A data operand (MMA/trans input) resolves to the SMEM/TMEM data buffer,
+    # never its paired barrier — a double-buffered buffer and its barrier share
+    # the same def_op, so skip barrier-kind entries to avoid mis-resolving to
+    # the barrier (which would emit `L<lp>_bar_<id>` as an MMA operand).
     for b in loop.schedule.buffers:
-        if b.def_op == operand.op_id:
+        if b.def_op == operand.op_id and b.kind != "barrier":
             return b, loop
     for L in g.loops:
         if L is loop:
             continue
         for b in L.schedule.buffers:
-            if b.def_op == operand.op_id:
+            if b.def_op == operand.op_id and b.kind != "barrier":
                 return b, L
     return None, None
 
@@ -4084,7 +4678,9 @@ def _emit_outer_epilogue_partitioned(
     contract is unchanged; c_smem is shrunk to (m_size, BN) at its alloc
     site since only one group's tile is staged at a time.
     """
-    lines += f"# Pass A.5 partitioned epilogue (N={N}, m_size={m_size}, per-group c_smem)"
+    lines += (
+        f"# Pass A.5 partitioned epilogue (N={N}, m_size={m_size}, per-group c_smem)"
+    )
     lines += "tlx.barrier_wait(acc_tmem_full[tmem_buf], tmem_phase)"
     # Each group loads its (m_size, BN) accumulator, casts, writes a single
     # reused (m_size, BN) c_smem buffer, and TMA-stores it at the group's M row
@@ -4585,8 +5181,7 @@ def _emit_uwg_body_impl(
         # epilogue (emitted in the tmem_load's WG, where the cast values are
         # live) issues it, and the orphan store in the other WG is skipped.
         part_acc = any(
-            b.kind == "tmem" and b.partition_count > 1
-            for b in outer.schedule.buffers
+            b.kind == "tmem" and b.partition_count > 1 for b in outer.schedule.buffers
         )
         global_store = (
             next(
@@ -4608,7 +5203,9 @@ def _emit_uwg_body_impl(
                 continue
             if sub_info and i == subtile_start:
                 chain_nodes = outer_nodes[subtile_start:subtile_end]
-                _emit_outer_epilogue_subtiled(chain_nodes, sub_info[2], sub_info[3], g, rctx, lines)
+                _emit_outer_epilogue_subtiled(
+                    chain_nodes, sub_info[2], sub_info[3], g, rctx, lines
+                )
                 continue
             if sub_info and subtile_start < i < subtile_end:
                 continue  # already emitted inside the subtile loop
@@ -4677,6 +5274,10 @@ def emit(graph: ScheduleGraph) -> str:
     outer_loop = _find_outer_loop(graph)
     inner_loop = _find_inner_loop(graph, outer_loop) if outer_loop else None
 
+    # Fold pipeline=NONE sink ops (warp_group=-1) into their producer's group.
+    for L in graph.loops:
+        _reassign_orphan_nodes(graph, L)
+
     # Disambiguate IV names. MLIR loc carries no semantic name → "iv" by
     # default. Rename outer IV to "tile_id" and inner IV to "k" so they
     # don't shadow each other in the per-task body.
@@ -4701,6 +5302,9 @@ def emit(graph: ScheduleGraph) -> str:
         alloc_op_var={},
         loop_iv=iv_names,
     )
+    # Per-buffer MMA-consumer counts → intra-WG `extra` empties need
+    # arrive_count = N consumers (each consuming async_dot recycles EMPTY).
+    rctx._buf_consumer_count = _buf_mma_consumer_counts(graph)
     # The acc_tmem TC→default-epilogue hand-off only exists if the kernel has
     # an MMA producing the accumulator. Without one (e.g. case6 LayerNorm), the
     # default task must not wait on acc_tmem_full (nothing arrives it → hang).
@@ -5002,6 +5606,15 @@ def emit(graph: ScheduleGraph) -> str:
             else:
                 channels.append(tc)
                 by_name[tc.name] = tc
+        # Intra-WG SMEM local_alloc(value) → MMA bridges (v3/v4-style
+        # all-MMA-in-one-WG partitions): the SMEM analogue of the intra-WG
+        # TMEM bridge, otherwise emitted with no store + no barriers.
+        for sb in _derive_smem_bridge_channels(graph, detect_loop):
+            sb.name = rctx.buffer_var.get((sb.loop_id, sb.buffer_id), sb.name)
+            if sb.name in by_name:
+                continue  # already covered by a TMEM/cross-WG channel
+            channels.append(sb)
+            by_name[sb.name] = sb
     # Merge schedule-driven channels (cross_wg_barriers) — these are
     # authoritative for register-typed cross-WG flows. Skip if a channel
     # for the same buffer name already exists (e.g., DDG-detected SMEM
@@ -5175,6 +5788,17 @@ def emit(graph: ScheduleGraph) -> str:
                 empty_total[ls.empty_name] = empty_total.get(ls.empty_name, 0) + (
                     int(m.group(1)) if m else 1
                 )
+        # Floor each empty's arrive_count by the buffer's true #MMA-consumers.
+        # The cb-sum above undercounts when several MMAs read one channel buffer
+        # but the schedule recorded a single cross_wg_barrier (FA-bwd dsT feeds
+        # both dK and dQ → 1 cb entry, but 2 async_dots recycle EMPTY).
+        bcc = getattr(rctx, "_buf_consumer_count", {}) or {}
+        for ls in rctx.sem_set.lowered:
+            if ls.alloc_empty_stmt is None or ls.sem.buffer is None:
+                continue
+            cnt = bcc.get(ls.sem.buffer.buffer_id, 0)
+            if cnt > empty_total.get(ls.empty_name, 1):
+                empty_total[ls.empty_name] = cnt
         seen_alloc: set[str] = set()
         for ls in rctx.sem_set.lowered:
             sem = ls.sem
@@ -5221,9 +5845,13 @@ def emit(graph: ScheduleGraph) -> str:
                 f"{_bar_full(c.name)} = tlx.alloc_barriers"
                 f"(num_barriers={c.depth}, arrive_count=1)"
             )
+            # Empty arrive_count = #MMA consumers: each consuming MMA arrives
+            # `_empty` once via mBarriers, and the producer's empty-wait must
+            # see ALL of them before overwriting the slot. 1-consumer bridges
+            # (num_consumers defaults to 1) are unchanged.
             lines += (
                 f"{_bar_empty(c.name)} = tlx.alloc_barriers"
-                f"(num_barriers={c.depth}, arrive_count=1)"
+                f"(num_barriers={c.depth}, arrive_count={c.num_consumers})"
             )
         # Function-scope per-tile-resident loads (e.g. FA's Q tile): one
         # mbarrier per load. Emitted by MEM-role WG, consumed by the WG
@@ -5234,18 +5862,28 @@ def emit(graph: ScheduleGraph) -> str:
                 f"{fl['alloc_var']}_full = tlx.alloc_barriers"
                 f"(num_barriers=1, arrive_count=1)"
             )
+        # Non-canonical epilogue accumulators (FA-bwd dK/dV): full+empty pair
+        # each, committed post-loop by the producing WG, read by the default
+        # partition. (The else/legacy branch routes these through extra_buffers.)
+        for var in _epilogue_acc_wg(graph, rctx):
+            lines += f"# {var}_full: epilogue accumulator handoff (TC → default)"
+            lines += f"{var}_full = tlx.alloc_barriers(num_barriers=1, arrive_count=1)"
+            lines += f"{var}_empty = tlx.alloc_barriers(num_barriers=1, arrive_count=1)"
         for name, depth in extra or []:
             lines += (
                 f"# {name}: legacy carve-out (cross-loop iter_arg or "
                 f"intra-WG async load)"
             )
+            # EMPTY arrive_count = #MMA consumers (a load read by N MMAs in the
+            # WG is recycled by N async_dots); FULL stays 1 (single producer).
+            eac = (getattr(rctx, "_buf_consumer_count", {}) or {}).get(name, 1)
             lines += (
                 f"{_bar_full(name)} = tlx.alloc_barriers"
                 f"(num_barriers={depth}, arrive_count=1)"
             )
             lines += (
                 f"{_bar_empty(name)} = tlx.alloc_barriers"
-                f"(num_barriers={depth}, arrive_count=1)"
+                f"(num_barriers={depth}, arrive_count={eac})"
             )
     else:
         # Function-scope per-tile-resident loads (e.g. FA's Q tile): one
@@ -5254,6 +5892,10 @@ def emit(graph: ScheduleGraph) -> str:
         extra_with_fnscope = list(extra)
         for fl in rctx.fn_scope_loads:
             extra_with_fnscope.append((fl["alloc_var"], 1))
+        # Non-canonical epilogue accumulators (FA-bwd dK/dV): one full+empty
+        # pair each, committed by the producing WG after its loop.
+        for var in _epilogue_acc_wg(graph, rctx):
+            extra_with_fnscope.append((var, 1))
         _emit_mbarriers(
             channels,
             lines,
