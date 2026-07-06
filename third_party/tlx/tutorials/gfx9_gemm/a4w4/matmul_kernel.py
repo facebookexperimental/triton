@@ -292,8 +292,7 @@ def _a4w4_kernel(
             tlx.buffer_load_to_local(smem_a[0], a_base, a_offsets)
             tlx.buffer_load_to_local(smem_b_left[0], b_base, b_left_offsets)
             a_sc_buf1 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets), blocked_scales_a)
-            b_sc_left_buf1 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_left_offsets),
-                                                blocked_scales_b)
+            b_sc_left_buf1 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_left_offsets), blocked_scales_b)
             tlx.async_load_commit_group()
 
         with tlx.warp_pipeline_stage("mfma", priority=0):
@@ -320,8 +319,7 @@ def _a4w4_kernel(
             b_sc_right_reg_buf2 = tlx.require_layout(tlx.local_load(smem_bs[0]), scale_b_layout)
             tlx.buffer_load_to_local(smem_a[1], a_base, a_offsets_next)
             tlx.buffer_load_to_local(smem_b_left[1], b_base, b_left_offsets_next)
-            a_sc_buf3 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets_next),
-                                           blocked_scales_a)
+            a_sc_buf3 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets_next), blocked_scales_a)
             b_sc_left_buf3 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_left_offsets_next),
                                                 blocked_scales_b)
             tlx.async_load_commit_group()

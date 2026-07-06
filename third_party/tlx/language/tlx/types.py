@@ -101,13 +101,7 @@ class distributed_linear_layout_encoding(layout_encoding):
 
 class amd_mfma_layout_encoding(layout_encoding):
 
-    def __init__(self,
-                 version,
-                 instr_shape,
-                 transposed,
-                 warps_per_cta,
-                 element_bitwidth=32,
-                 tiles_per_warp=None,
+    def __init__(self, version, instr_shape, transposed, warps_per_cta, element_bitwidth=32, tiles_per_warp=None,
                  cga_bases=None):
         super().__init__()
         self.version = int(version)
@@ -120,13 +114,7 @@ class amd_mfma_layout_encoding(layout_encoding):
 
     @staticmethod
     @constexpr_function
-    def make(version,
-             instr_shape,
-             transposed,
-             warps_per_cta,
-             element_bitwidth=32,
-             tiles_per_warp=None,
-             cga_bases=None):
+    def make(version, instr_shape, transposed, warps_per_cta, element_bitwidth=32, tiles_per_warp=None, cga_bases=None):
         return amd_mfma_layout_encoding(version, instr_shape, transposed, warps_per_cta, element_bitwidth,
                                         tiles_per_warp, cga_bases)
 
