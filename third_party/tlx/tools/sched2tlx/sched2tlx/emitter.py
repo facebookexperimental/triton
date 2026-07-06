@@ -293,7 +293,8 @@ def _render_operand(ref: OperandRef, rctx: RenderCtx) -> str:
                 specs = _loop_iter_args(rctx.graph, target)
                 for idx, init, _yld in specs:
                     if idx == ref.result_idx:
-                        return _iter_arg_python_name(target.loop_id, idx, init)
+                        return _iter_arg_python_name(
+                            target.loop_id, idx, init, specs)
         # Already-named op → use its var. Otherwise inline-render.
         if ref.op_id in rctx.op_var:
             return rctx.op_var[ref.op_id]
@@ -1671,6 +1672,7 @@ def _derive_crossloop_result_channels(
         specs = _loop_iter_args(g, loop)
         if not specs:
             continue
+        for_op = _find_loop_for(g, loop)
         # Build wg_of for this loop's nodes.
         wg_of_op: dict[str, int] = {
             n.op_ref: n.warp_group for n in loop.schedule.nodes if n.op_ref
@@ -1695,6 +1697,7 @@ def _derive_crossloop_result_channels(
                         and o.result_idx == idx
                         and (find := g.ops.get(o.op_id))
                         and find.kind == "scf.for"
+                        and (for_op is None or o.op_id == for_op.op_id)
                     ):
                         referenced_by_epi = True
                         break
@@ -1710,7 +1713,7 @@ def _derive_crossloop_result_channels(
                 if sd:
                     shape, dt = sd
                     dtype = _dtype_str_to_tl(dt)
-            var_name = _iter_arg_python_name(loop.loop_id, idx, init)
+            var_name = _iter_arg_python_name(loop.loop_id, idx, init, specs)
             out.append(
                 {
                     "bufname": f"epi_{var_name}_smem",
@@ -2038,10 +2041,46 @@ def _emit_mbarriers(
 # ===========================================================================
 
 
-def _nodes_in_warp_group(loop: Loop, wg: int) -> list[Node]:
-    return sorted(
-        [n for n in loop.schedule.nodes if n.warp_group == wg],
-        key=lambda n: (n.schedule_stage, n.schedule_cluster, n.id),
+def _sink_tmem_loads(nodes: list[Node], g: ScheduleGraph | None) -> list[Node]:
+    """Load-at-use: sink each ttng.tmem_load node to just before its first
+    in-WG consumer. Render order otherwise follows the schedule, so a load
+    scheduled early keeps its whole tile live in registers across the body
+    (128 f32 regs/thread for a 128x128 acc) and ptxas spills — measured
+    3.1x slower on the sub-tiled FA kernel. The load's barrier wait moves
+    with it (consumer-side waits are always safe to delay). Loads already
+    adjacent to their first consumer — every committed case — are unmoved,
+    preserving byte parity."""
+    if g is None:
+        return nodes
+    out = list(nodes)
+    for n in list(out):
+        if n.op_kind != "ttng.tmem_load" or not n.op_ref:
+            continue
+        pos = out.index(n)
+        first_use = None
+        for j in range(pos + 1, len(out)):
+            m = out[j]
+            op = g.ops.get(m.op_ref) if m.op_ref else None
+            if op and any(
+                getattr(o, "op_id", None) == n.op_ref for o in op.operands
+            ):
+                first_use = j
+                break
+        if first_use is not None and first_use > pos + 1:
+            out.pop(pos)
+            out.insert(first_use - 1, n)
+    return out
+
+
+def _nodes_in_warp_group(
+    loop: Loop, wg: int, g: ScheduleGraph | None = None
+) -> list[Node]:
+    return _sink_tmem_loads(
+        sorted(
+            [n for n in loop.schedule.nodes if n.warp_group == wg],
+            key=lambda n: (n.schedule_stage, n.schedule_cluster, n.id),
+        ),
+        g,
     )
 
 
@@ -2094,10 +2133,22 @@ def _emit_default_partition(
             if op.kind in _SKIP_FUNCTION_SCOPE:
                 continue
             if op.kind == "ttng.tmem_load":
-                lines += "acc = tlx.local_load(acc_tmem[0])"
-                # acc_tmem is a legacy carve-out under SemIR — full+empty.
+                # Resolve WHICH accumulator this load reads — sub-tiled
+                # kernels have one function-scope acc buffer per sub-tile
+                # instance, so the buffer must come from the op's operand,
+                # not the legacy singleton name.
+                src = None
+                if op.operands and hasattr(op.operands[0], "op_id"):
+                    src = rctx.alloc_op_var.get(op.operands[0].op_id)
+                src = src or "acc_tmem"
+                name = "acc" if "acc" not in rctx.op_var.values() else \
+                    f"acc_{rctx.fresh_idx()}"
+                lines += f"{name} = tlx.local_load({src}[0])"
+                # acc_tmem_full/empty is the shared commit-tracking pair (one
+                # tcgen05_commit covers every acc); each rendered load arrives
+                # the empty once — the alloc's arrive_count counts these sites.
                 lines += "tlx.barrier_arrive(acc_tmem_empty[0], 1)"
-                rctx.op_var[op.op_id] = "acc"
+                rctx.op_var[op.op_id] = name
                 continue
             if op.kind == "arith.truncf":
                 inner = _render_operand(op.operands[0], rctx)
@@ -2124,10 +2175,27 @@ def _emit_default_partition(
                 lines += f"tlx.async_descriptor_store({desc}, c_smem[0], [{offs_str}])"
                 lines += "tlx.async_descriptor_store_wait(0)"
                 continue
-            if op.kind in _NAMED_FUNCTION_OPS:
+            if op.kind == "tt.store":
+                # Function-scope epilogue store (e.g. FA's M_lse write-back).
+                ptr = _render_operand(op.operands[0], rctx)
+                val = _render_operand(op.operands[1], rctx)
+                if len(op.operands) > 2:
+                    mask = _render_operand(op.operands[2], rctx)
+                    lines += f"tl.store({ptr}, {val}, mask={mask})"
+                else:
+                    lines += f"tl.store({ptr}, {val})"
+                continue
+            if op.kind in _IN_LOOP_NAMED_OPS:
                 name = _auto_name(op, rctx.fresh_idx())
                 rctx.op_var[op.op_id] = name
                 lines += f"{name} = {_render_op_expr(op, rctx)}"
+                continue
+            # Refuse to silently drop epilogue work (dropped ops read as a
+            # passing kernel with wrong outputs — the M_lse class of bug).
+            raise NotImplementedError(
+                f"sched2tlx: unhandled function-scope epilogue op kind "
+                f"'{op.kind}' ({op.op_id}) in the default task"
+            )
         if len(lines.buf) == _n0:
             # No work landed in the default task (e.g. case6 with no acc_tmem
             # hand-off and the store living in a compute WG). Keep the
@@ -2225,7 +2293,7 @@ def _emit_warp_group(
     rctx: RenderCtx,
     lines: _Lines,
 ) -> None:
-    nodes = _nodes_in_warp_group(loop, wg.id)
+    nodes = _nodes_in_warp_group(loop, wg.id, g)
     if not nodes:
         return
 
@@ -2416,7 +2484,7 @@ def _emit_warp_group(
             if isinstance(o, IterArgRef) and o.loop_id == loop.loop_id:
                 used_idxs.add(o.idx)
     kept = [
-        (idx, init, yld, _iter_arg_python_name(loop.loop_id, idx, init))
+        (idx, init, yld, _iter_arg_python_name(loop.loop_id, idx, init, iter_specs))
         for (idx, init, yld) in iter_specs
         if idx in used_idxs
     ]
@@ -3813,16 +3881,42 @@ def _iter_args_used_by_inner_uwg(
     return sorted(used)
 
 
-def _iter_arg_python_name(loop_id: int, idx: int, init: OperandRef) -> str:
-    """Stable per-loop iter_arg name. Use semantic hints from the init when
-    the pattern is unmistakable (FA softmax: -inf → m_i, 1.0 → l_i); fall
-    back to `i{loop}_{idx}` otherwise."""
+def _iter_arg_semantic_base(loop_id: int, init: OperandRef) -> str | None:
     if isinstance(init, ConstRef):
         if init.value == "-inf":
             return f"m_i_{loop_id}"
         if init.value == 1 and "tensor" in (init.type or ""):
             return f"l_i_{loop_id}"
-    return f"i{loop_id}_{idx}"
+    return None
+
+
+def _iter_arg_python_name(
+    loop_id: int,
+    idx: int,
+    init: OperandRef,
+    iter_specs: list[tuple[int, OperandRef, OperandRef]] | None = None,
+) -> str:
+    """Stable per-loop iter_arg name. Use semantic hints from the init when
+    the pattern is unmistakable (FA softmax: -inf → m_i, 1.0 → l_i); fall
+    back to `i{loop}_{idx}` otherwise.
+
+    Sub-tiled loops carry several iter_args with the SAME init pattern (one
+    m_i/l_i per sub-tile instance). The lowest-indexed instance keeps the
+    historical bare name so single-instance kernels emit byte-identically;
+    later instances get an `_<idx>` suffix. Callers must pass the loop's
+    full iter_specs for the disambiguation to see its siblings."""
+    base = _iter_arg_semantic_base(loop_id, init)
+    if base is None:
+        return f"i{loop_id}_{idx}"
+    if iter_specs is not None:
+        first = min(
+            (i for (i, ini, *_r) in iter_specs
+             if _iter_arg_semantic_base(loop_id, ini) == base),
+            default=idx,
+        )
+        if idx != first:
+            return f"{base}_{idx}"
+    return base
 
 
 def _has_smem_ring_buffer_inner(
@@ -3947,7 +4041,7 @@ def _emit_inner_loop_in_outer(
     iter_specs = _loop_iter_args(g, inner)
     used_idxs = _iter_args_used_by_inner_uwg(g, inner, uwg)
     kept = [
-        (idx, init, yld, _iter_arg_python_name(inner.loop_id, idx, init))
+        (idx, init, yld, _iter_arg_python_name(inner.loop_id, idx, init, iter_specs))
         for (idx, init, yld) in iter_specs
         if idx in used_idxs
     ]
@@ -3979,7 +4073,7 @@ def _emit_inner_loop_in_outer(
         bridge_op_ids = {
             c.bridge_op_id for c in rctx.channels if c.kind == "tmem" and c.bridge_op_id
         }
-        for n in _inner_nodes_for_uwg(inner, uwg):
+        for n in _sink_tmem_loads(_inner_nodes_for_uwg(inner, uwg), g):
             if n.op_kind in (
                 "ttg.local_alloc",
                 "ttng.tmem_alloc",
@@ -5254,9 +5348,18 @@ def emit(graph: ScheduleGraph) -> str:
                 f"acc_tmem_full = tlx.alloc_barriers"
                 f"(num_barriers={rctx.tmem_count}, arrive_count=1)"
             )
+            # One arrive per function-scope epilogue tmem_load: sub-tiled
+            # kernels load one acc per instance and each load arrives the
+            # shared empty once. Persistent kernels (outer-loop epilogue)
+            # have zero function-scope loads — keep the legacy count of 1.
+            n_epi_acc_loads = sum(
+                1 for op in graph.ops.values()
+                if op.kind == "ttng.tmem_load" and op.scope == "function"
+            )
             lines += (
                 f"acc_tmem_empty = tlx.alloc_barriers"
-                f"(num_barriers={rctx.tmem_count}, arrive_count=1)"
+                f"(num_barriers={rctx.tmem_count}, "
+                f"arrive_count={max(1, n_epi_acc_loads)})"
             )
         # TMEM bridge channels (e.g., FA's softmax → P_tmem TMEM that the
         # PV MMA reads). Their full/empty barriers get emitted by the SW

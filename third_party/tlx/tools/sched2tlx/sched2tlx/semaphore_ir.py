@@ -309,6 +309,27 @@ def derive_semaphores(loop: Any, graph: Any = None) -> list[Semaphore]:
                 for cand in sched.nodes:
                     if cand.op_ref in expanded:
                         empty_ac = max(empty_ac, cand.partition_count or 1)
+        # Sub-tiled graphs: a single wrapper node (memdesc_trans) may feed
+        # SEVERAL distinct MMA nodes in the same WG. The emitter folds the
+        # wrapper into each MMA's operand expression, so EACH MMA attaches
+        # this buffer's empty in its mBarriers — one hardware arrive per MMA
+        # per iteration, even though the DDG sees one consumer node. Count
+        # the distinct arriving MMAs; single-consumer wrappers are unchanged
+        # (sum == 1 == the old count).
+        if graph is not None and dst.op_kind == "ttg.memdesc_trans" and dst.op_ref:
+            mma_arrivers = 0
+            for cand in sched.nodes:
+                if cand.id == dst.id or not cand.op_ref:
+                    continue
+                cand_op = graph.ops.get(cand.op_ref)
+                if cand_op is None or not cand_op.kind.startswith("ttng.tc_gen5_mma"):
+                    continue
+                for opnd in cand_op.operands:
+                    if getattr(opnd, "op_id", None) == dst.op_ref:
+                        mma_arrivers += max(1, cand.partition_count or 1)
+                        break
+            if mma_arrivers:
+                empty_ac = max(empty_ac, mma_arrivers)
 
         sems.append(
             Semaphore(
