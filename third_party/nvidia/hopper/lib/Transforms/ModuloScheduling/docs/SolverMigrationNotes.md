@@ -497,7 +497,9 @@ parallel.
    GPU) → correctness + per-shape perf vs the committed kernel
    (--perf-tol) → the case3 canary as a hard absolute gate
    (--canary-tflops, default 651). Validated end-to-end (joint1 all
-   parity; full-noguard case3 canary 664/651 OK). REMAINING: broader
+   parity; full-noguard case3 canary 664/651 OK). Full per-config,
+   per-shape speedup tables: docs/SolverConfigMeasurements.md
+   (2026-07-06). REMAINING: broader
    kernel corpus, CI wiring.]**
 
 The validation harness above is the gate for every step, and the
