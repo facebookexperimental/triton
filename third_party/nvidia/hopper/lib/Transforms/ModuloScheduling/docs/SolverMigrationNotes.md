@@ -412,12 +412,27 @@ parallel.
    and the emitter then inlines/duplicates operands with iter-arg version
    skew (measured wrong results; a strict +1 edge separation removed ties
    but not unconnected reordering, confirming the missing-WAR-edge root
-   cause). Working envelope: case1/5/7 hint-parity, case6 re-solved
-   cycles PASS. Unblock: serialize DDG-fidelity latencies + WAR edges
-   into the joint problem, or host v2 at the DDG stage and forward wg
-   through the ScheduleLoop mapping. A register-loop-carry ⇒ same-WG
-   LEGALITY constraint was added to both joint modes along the way
-   (iter-args have no cross-WG channel semantics).]**
+   cause). A register-loop-carry ⇒ same-WG LEGALITY constraint was added
+   to both joint modes along the way (iter-args have no cross-WG channel
+   semantics).]**
+   **[UNBLOCKED 2026-07-06 (same day): iter-arg WAR edges are now derived
+   from the scf.for at serialization time — every direct reader of a
+   block argument gets a strict ordering edge to the yield-operand
+   producer (the emitter renders the update as a reassignment at the
+   producer's cycle position). With them, ALL v2 configs pass
+   correctness: case1/5/7 hint-parity, case6 re-solved cycles PASS,
+   case3 PASS on both the Rau-hint path (returns to 6-WG committed
+   parity — the 5-WG merge was only objective-profitable together with
+   the now-forbidden version-skewed reorder) and the cpsat-schedule path
+   (5 WGs, re-solved cycles, at both guarded II=1459 and unguarded
+   II=1325). Measured: 664.9 TFLOPS at (1,32,8192) for both v2
+   full-stack configs — the ~665 plateau is now reproduced by THREE
+   independent configurations (v1-joint 664.1, v1-joint+no-guard 665.7,
+   v2 664.9), strong evidence it is the real softmax-chain bound of this
+   5-WG design point rather than a solver artifact. The remaining
+   fidelity item (ScheduleLoop edges carry issue-order latencies, not
+   DDG data latencies) is now a PERF-modeling refinement, not a
+   correctness issue.]**
 2. **Delete guard 1 for the joint path.** Once v2 owns partitioning
    jointly with cycles, the Phase 2.75 occupancy inflation
    (DataDependenceGraph.cpp) is a pure solution-space fence for that

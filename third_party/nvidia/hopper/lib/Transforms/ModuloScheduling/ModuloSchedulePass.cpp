@@ -4279,6 +4279,44 @@ static bool partitionJointCPSAT(ttg::ScheduleLoop &loop,
     });
   }
 
+  // v2: iter-arg anti-dependence (WAR) edges. The emitter renders an
+  // iter-arg update as a reassignment at the yield-operand producer's
+  // cycle position, so every DIRECT reader of the block argument (which
+  // must see the PREVIOUS iteration's value) has to be emitted strictly
+  // before it. The data edges don't encode this — without it the v2
+  // re-solve legally reorders version-sensitive chains and the emitted
+  // kernel reads the wrong iter-arg version (measured on case3). Derived
+  // values are materialized at their own cycles and need no ordering;
+  // only direct block-argument readers do.
+  if (v2 && loop.forOp) {
+    llvm::DenseMap<Operation *, unsigned> opToNode;
+    for (const auto &n : loop.nodes)
+      if (n.op)
+        opToNode[n.op] = n.id;
+    Operation *yield = loop.forOp.getBody()->getTerminator();
+    for (auto [i, arg] : llvm::enumerate(loop.forOp.getRegionIterArgs())) {
+      Operation *writer = yield->getOperand(i).getDefiningOp();
+      auto wIt = writer ? opToNode.find(writer) : opToNode.end();
+      if (wIt == opToNode.end())
+        continue;
+      for (Operation *user : arg.getUsers()) {
+        auto rIt = opToNode.find(user);
+        if (rIt == opToNode.end() || rIt->second == wIt->second)
+          continue;
+        jEdges.push_back(llvm::json::Object{
+            {"src", static_cast<int64_t>(rIt->second)},
+            {"dst", static_cast<int64_t>(wIt->second)},
+            {"latency", 1},
+            {"distance", 0},
+            {"freq", 1},
+            {"rt", 0},
+            {"xissue", 0},
+            {"chan_bytes", 0},
+        });
+      }
+    }
+  }
+
   llvm::json::Array fpTable;
   for (int w = 0; w <= 8; ++w)
     fpTable.push_back((w == 1 || w == 2 || w == 4 || w == 8) ? wgFootprint(w)
