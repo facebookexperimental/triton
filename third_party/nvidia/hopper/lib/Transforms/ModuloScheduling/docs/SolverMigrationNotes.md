@@ -381,6 +381,48 @@ correctness.
    Still open for v2: joint cycles+wg in one solve (fixes the alpha-order
    blind spot), guard-3 as an in-model legality constraint, sub-tiling.
 
+### Step 4 (next, planned 2026-07-06): from v1 to owning the decisions
+
+Agreed priority: **items 1+2 first — they are one unit of work** with
+directly measurable expectations (the two open numbers from step 3: does
+the joint-cycle solve lift the B config past 639, and is 664 the ceiling
+of the C config or just the first point above it). Item 3 rides on
+emitter-side staffing; item 4 is the most research-heavy and has the
+highest ceiling. Item 5 gates any default flip and can proceed in
+parallel.
+
+1. **Step-3 v2: cycles + wg in ONE solve.** Today the joint mode holds
+   the schedule fixed (Twill's two-step shape); v2 makes the flight-window
+   overlap, slack-aware round-trips, and channel constraints functions of
+   cycle VARIABLES instead of precomputed constants, so op order inside a
+   WG can react to partition pressure. This is the only fix for the
+   alpha-order blind spot (the residual 651-vs-639 gap of the B config):
+   the alpha hand-off's urgency exists only relative to a partition.
+   Measured targets: case3 B-config ≥ 651 without joint partitioning
+   enabled being the excuse; explore whether C's 664 improves further.
+2. **Delete guard 1 for the joint path.** Once v2 owns partitioning
+   jointly with cycles, the Phase 2.75 occupancy inflation
+   (DataDependenceGraph.cpp) is a pure solution-space fence for that
+   path. Acceptance: remove it under TRITON_MODULO_CPSAT_JOINT, verify
+   FA's softmax cohesion still emerges from the round-trip/flight-window
+   constraints at the LOWER unguarded MinII (1325), and the case3 canary
+   holds. Keep the guard for the heuristic paths (they still need it).
+3. **Guard 3 → versioned emitter-capability constraints.** Express
+   "outer loops single-WG" and "blockM ≤ 128 TMEM" as explicit legality
+   constraints in the partition model, versioned with the emitter; fix
+   the emitter's blockM>128 TMEM gap to unblock case2 end-to-end (the
+   solver side is already verified healthy on its 256-blockM IR: II=1024,
+   sane 3-WG).
+4. **Sub-tiling in front of the solver** (gap 8 above): without
+   splitting tile-level ops into sub-tile instances, ping-pong/FA4-class
+   schedules are absent from the solution space entirely. Likely reuses
+   AutoWS subtile machinery; the largest expressiveness jump and the
+   least scoped item — treat as its own design note when started.
+5. **Default-flip gate (parallelizable):** a kernel corpus beyond
+   case1-7, solve-time budget policy (keep the offline/autotune
+   positioning), solver configs wired into run_regression.py, and the
+   case3 canary as the hard gate.
+
 The validation harness above is the gate for every step, and the
 "Why this note exists" principle is the order of operations: a complete
 solver exploits model error maximally, so model calibration must land
