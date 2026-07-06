@@ -358,11 +358,18 @@ void DataDependenceGraph::applyDataPartition(
     node.partitionCount = info.count;
     node.partitionDim = info.dim;
     node.mSize = info.mSize;
-    // The bundle issues `count` MMAs back-to-back on the tensor core, so it
-    // ties up the TC pipeline `count`× as long. Scale occupancy so ResMII
-    // reflects the N hardware issues (the result latency is unchanged).
-    node.occupancy =
-        std::max(pipelineOccupancy(node), 1) * static_cast<int>(info.count);
+    // M-split conserves MAC area: the throughput-based occupancy (MACs /
+    // rate — see getMMAOccupancyCycles) of the full-tile MMA already counts
+    // every row the N sub-MMAs issue, so the bundle's TC busy time stays
+    // ~occ_full. The old ×N scale double-counted the area and inflated
+    // ResMII (case2: II 1024→2048 at N=2 for identical MAC work), which
+    // systematically biased any model-cost comparison against partitioning.
+    // What does scale with N is the SM dispatch floor: N sub-issues each
+    // hold the pipe at least selfLatency (the tcgen05 issue cost).
+    int occFull = std::max(pipelineOccupancy(node), 1);
+    int issueFloor =
+        std::max(node.selfLatency, 1) * static_cast<int>(info.count);
+    node.occupancy = std::max(occFull, issueFloor);
   }
 }
 

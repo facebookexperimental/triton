@@ -11,6 +11,7 @@ not need the original IR or any out-of-band context.
   "schema_version": "0.1",
   "kernel": { ... },
   "ops": { "<id>": { ... }, ... },
+  "data_partition_candidates": [ { ... }, ... ],
   "loops": [ { ... }, ... ]
 }
 ```
@@ -18,6 +19,20 @@ not need the original IR or any out-of-band context.
 - `kernel` — function signature.
 - `ops` — flat **table** (string id → op record) of every op the emitter may
   need: function-scope (preamble/epilogue) ops AND in-loop scheduled ops.
+- `data_partition_candidates` — Pass A.5 candidate surface (may be absent in
+  older dumps). One entry per MMA node with at least one legal M-split:
+
+  ```json
+  {"loop_id": 0, "node_id": 5, "op_kind": "ttng.tc_gen5_mma", "dim": 0,
+   "applied_n": 1, "factors": [{"n": 2, "m_size": 64}]}
+  ```
+
+  `factors` lists every legal split factor (BM % n == 0, BM/n >= max(64,
+  TMEM blockM)); `applied_n` is the factor actually applied in THIS dump
+  (1 = unpartitioned). The emitter ignores this section — it is consumed by
+  the twill enumeration driver (`twill_solver/dp_enum.py`), which re-runs
+  the modulo pass with `TRITON_DATA_PARTITION_N=<n>` per candidate and
+  A/B-gates the result on GPU.
 - `loops` — each scheduled loop's schedule graph (nodes + edges) plus its
   bounds and induction variable.
 

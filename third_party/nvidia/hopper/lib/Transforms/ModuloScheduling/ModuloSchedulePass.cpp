@@ -899,6 +899,68 @@ static unsigned resolveDataPartitionFactor(Operation *mma, int optionFactor) {
   return 1;
 }
 
+// One legal way to M-split an MMA's accumulator: factor `n`, per-group tile
+// height `mSize`, and the TMEMAllocOp the accumulator traces to.
+struct DataPartitionCandidate {
+  Operation *mma = nullptr;
+  Operation *allocOp = nullptr;
+  unsigned n = 1;
+  unsigned mSize = 0;
+};
+
+// Enumerate every legal A.5 M-split (dim 0) of `op`'s accumulator: any N with
+// BM % N == 0 and BM/N >= max(64, TMEM blockM constraint), accumulator
+// traceable to a TMEMAllocOp. Single source of legality for both the planner
+// (which applies the user-resolved N) and the schedule-graph dump (which
+// lists all candidates for the twill enumeration driver).
+static SmallVector<DataPartitionCandidate>
+enumerateDataPartitionCandidates(Operation *op) {
+  SmallVector<DataPartitionCandidate> out;
+  Value acc;
+  if (auto m = dyn_cast<ttng::TCGen5MMAOp>(op))
+    acc = m.getAccumulator();
+  else if (auto m = dyn_cast<ttng::TCGen5MMAScaledOp>(op))
+    acc = m.getAccumulator();
+  else
+    return out;
+
+  auto accTy = dyn_cast<ttg::MemDescType>(acc.getType());
+  if (!accTy)
+    return out;
+  auto shape = ttg::getShapePerCTA(accTy);
+  if (shape.size() != 2)
+    return out;
+  int64_t bm = shape[0];
+  int64_t minM = 64;
+  if (auto tmem = dyn_cast<ttng::TensorMemoryEncodingAttr>(accTy.getEncoding()))
+    minM = std::max<int64_t>(minM, tmem.getBlockM() *
+                                       tmem.getCGALayout().getCTASplitNum()[0]);
+
+  // Trace the accumulator memdesc to its TMEMAllocOp. The persistent shape
+  // carries only the write-dep token as an inner-loop iter-arg, so the
+  // memdesc usually resolves to the outer alloc directly; peel a loop-carried
+  // memdesc iter-arg defensively.
+  Value root = acc;
+  if (auto ba = dyn_cast<BlockArgument>(root)) {
+    if (auto forOp = dyn_cast<scf::ForOp>(ba.getOwner()->getParentOp()))
+      if (OpOperand *init = forOp.getTiedLoopInit(ba))
+        root = init->get();
+  }
+  auto allocOp = root.getDefiningOp<ttng::TMEMAllocOp>();
+  if (!allocOp) {
+    LDBG("[A.5] skip MMA: accumulator TMEMAllocOp not found");
+    return out;
+  }
+
+  for (int64_t n = 2; n * minM <= bm; ++n) {
+    if (bm % n != 0)
+      continue;
+    out.push_back({op, allocOp.getOperation(), static_cast<unsigned>(n),
+                   static_cast<unsigned>(bm / n)});
+  }
+  return out;
+}
+
 // Phase 1a: build the data-partition plan. M-split (dim 0) of each tc_gen5_mma
 // accumulator by factor N, when legal: BM % N == 0, BM/N >= 64, and the sliced
 // M still satisfies the TMEM blockM constraint. A/B SMEM operands stay shared
@@ -907,61 +969,21 @@ static DataPartitionPlan computeDataPartitionPlan(ModuleOp moduleOp,
                                                   int optionFactor) {
   DataPartitionPlan plan;
   moduleOp.walk([&](Operation *op) {
-    Value acc;
-    if (auto m = dyn_cast<ttng::TCGen5MMAOp>(op))
-      acc = m.getAccumulator();
-    else if (auto m = dyn_cast<ttng::TCGen5MMAScaledOp>(op))
-      acc = m.getAccumulator();
-    else
+    if (!isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp>(op))
       return;
-
     unsigned N = resolveDataPartitionFactor(op, optionFactor);
     if (N <= 1)
       return;
-
-    auto accTy = dyn_cast<ttg::MemDescType>(acc.getType());
-    if (!accTy)
-      return;
-    auto shape = ttg::getShapePerCTA(accTy);
-    if (shape.size() != 2)
-      return;
-    int64_t bm = shape[0];
-    if (bm % static_cast<int64_t>(N) != 0)
-      return;
-    int64_t mSize = bm / static_cast<int64_t>(N);
-    if (mSize < 64) {
-      LDBG("[A.5] skip MMA: sliced M " << mSize << " < 64");
+    for (const auto &c : enumerateDataPartitionCandidates(op)) {
+      if (c.n != N)
+        continue;
+      ttg::DataPartitionInfo info{c.n, /*dim=*/0u, c.mSize};
+      plan.mmaInfo[op] = info;
+      plan.accInfo[c.allocOp] = info;
+      LDBG("[A.5] partition MMA N=" << c.n << " mSize=" << c.mSize);
       return;
     }
-    if (auto tmem =
-            dyn_cast<ttng::TensorMemoryEncodingAttr>(accTy.getEncoding())) {
-      int64_t minM = tmem.getBlockM() * tmem.getCGALayout().getCTASplitNum()[0];
-      if (mSize < minM) {
-        LDBG("[A.5] skip MMA: sliced M " << mSize << " < TMEM blockM " << minM);
-        return;
-      }
-    }
-
-    // Trace the accumulator memdesc to its TMEMAllocOp. The persistent shape
-    // carries only the write-dep token as an inner-loop iter-arg, so the
-    // memdesc usually resolves to the outer alloc directly; peel a loop-carried
-    // memdesc iter-arg defensively.
-    Value root = acc;
-    if (auto ba = dyn_cast<BlockArgument>(root)) {
-      if (auto forOp = dyn_cast<scf::ForOp>(ba.getOwner()->getParentOp()))
-        if (OpOperand *init = forOp.getTiedLoopInit(ba))
-          root = init->get();
-    }
-    auto allocOp = root.getDefiningOp<ttng::TMEMAllocOp>();
-    if (!allocOp) {
-      LDBG("[A.5] skip MMA: accumulator TMEMAllocOp not found");
-      return;
-    }
-
-    ttg::DataPartitionInfo info{N, /*dim=*/0u, static_cast<unsigned>(mSize)};
-    plan.mmaInfo[op] = info;
-    plan.accInfo[allocOp.getOperation()] = info;
-    LDBG("[A.5] partition MMA N=" << N << " mSize=" << mSize);
+    LDBG("[A.5] skip MMA: no legal M-split for N=" << N);
   });
   return plan;
 }
@@ -5062,6 +5084,43 @@ void jsonDumpOpsTable(llvm::raw_ostream &os, tt::FuncOp kernelFn,
   os << "  },\n";
 }
 
+// Pass A.5 candidate surface for the twill enumeration driver: every legal
+// M-split (loop, MMA node, N, m_size) plus the factor actually applied in
+// THIS dump (applied_n; 1 = unpartitioned). The driver re-runs the pass with
+// TRITON_DATA_PARTITION_N=<n> per candidate and A/B-gates the result — see
+// third_party/tlx/tools/sched2tlx/twill_solver/dp_enum.py.
+void jsonDumpDataPartitionCandidates(llvm::raw_ostream &os,
+                                     ArrayRef<ScheduledLoop> scheduledLoops) {
+  os << "  \"data_partition_candidates\": [";
+  bool first = true;
+  for (size_t li = 0; li < scheduledLoops.size(); ++li) {
+    const auto &sl = scheduledLoops[li];
+    if (sl.graph.loops.empty())
+      continue;
+    for (const auto &n : sl.graph.loops.front().nodes) {
+      if (!n.op)
+        continue;
+      auto cands = enumerateDataPartitionCandidates(n.op);
+      if (cands.empty())
+        continue;
+      os << (first ? "\n" : ",\n");
+      first = false;
+      os << "    {\"loop_id\": " << li << ", \"node_id\": " << n.id
+         << ", \"op_kind\": \"" << jsonEscape(n.op->getName().getStringRef())
+         << "\", \"dim\": 0, \"applied_n\": "
+         << (n.partitionCount > 1 ? n.partitionCount : 1) << ", \"factors\": [";
+      for (size_t i = 0; i < cands.size(); ++i) {
+        if (i)
+          os << ", ";
+        os << "{\"n\": " << cands[i].n << ", \"m_size\": " << cands[i].mSize
+           << "}";
+      }
+      os << "]}";
+    }
+  }
+  os << (first ? "" : "\n  ") << "],\n";
+}
+
 // Write ONE schedule-graph JSON document (kernel + ops + loops) to `os`.
 // Factored out so both the single-graph dumper and the multi-variant dumper
 // (top-N autotuning) can reuse it — each variant is a self-contained doc.
@@ -5079,6 +5138,7 @@ void writeScheduleGraphDoc(llvm::raw_ostream &os, ModuleOp moduleOp,
     os << "  \"variant_id\": " << variantId << ",\n";
   jsonDumpKernelSection(os, kernelFn, dc);
   jsonDumpOpsTable(os, kernelFn, dc);
+  jsonDumpDataPartitionCandidates(os, scheduledLoops);
 
   // loops section — drive off scheduledLoops, each contains a ScheduleGraph
   // (which itself may contain nested loops, but in fbsource beta each
