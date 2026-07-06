@@ -1413,6 +1413,17 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
             if mgid is not None and mgid not in merge_group_owner:
                 merge_group_owner[mgid] = var
         elif b.kind == "tmem":
+            # Emitter capability (EmitterCaps.kMaxTMEMBlockM in
+            # ModuloSchedulePass.cpp): TMEM accumulators support
+            # blockM <= 128 — no MMA splitting for larger tiles yet.
+            # Fail clearly instead of emitting a kernel that traps
+            # (case2's 256-blockM pre_modulo is the known instance).
+            if len(b.shape) >= 1 and b.shape[0] > 128:
+                raise NotImplementedError(
+                    f"TMEM buffer {b.id} has blockM={b.shape[0]} > 128; "
+                    "the emitter cannot split MMAs for tiles beyond the "
+                    "TMEM row limit (EmitterCaps.kMaxTMEMBlockM). "
+                    "Regenerate the schedule with blockM <= 128.")
             shape = (
                 str(b.shape[0]) + ","
                 if len(b.shape) == 1
@@ -1516,6 +1527,16 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
             )
             shape = shape_dt[0] if shape_dt else [128, 128]
             dtype = _dtype_str_to_tl(shape_dt[1]) if shape_dt else "tl.float32"
+            # Emitter capability (EmitterCaps.kMaxTMEMBlockM): TMEM
+            # accumulators support blockM <= 128 — fail clearly instead of
+            # emitting a kernel that traps (case2's 256-blockM pre_modulo
+            # is the known instance).
+            if shape and shape[0] > 128:
+                raise NotImplementedError(
+                    f"function-scope TMEM alloc has blockM={shape[0]} > 128; "
+                    "the emitter cannot split MMAs for tiles beyond the TMEM "
+                    "row limit (EmitterCaps.kMaxTMEMBlockM). Regenerate the "
+                    "schedule with blockM <= 128.")
             shape_str = ", ".join(str(d) for d in shape)
             # Reserve `acc_tmem` for the LARGEST function-scope tmem_alloc
             # (the running output accumulator); secondary ones (e.g., QK
@@ -4845,6 +4866,18 @@ def emit(graph: ScheduleGraph) -> str:
                 # references it without partition awareness still resolves.
                 lines += f"{name} = {names[0]}"
             else:
+                # Emitter capability (EmitterCaps.kMaxTMEMBlockM): TMEM
+                # accumulators support blockM <= 128 — fail clearly instead
+                # of emitting a kernel that traps (case2's 256-blockM
+                # pre_modulo is the known instance; the unpartitioned
+                # carve-out path is where it lands).
+                if buf.shape and buf.shape[0] > 128:
+                    raise NotImplementedError(
+                        f"TMEM accumulator buf {buf.id} has "
+                        f"blockM={buf.shape[0]} > 128; the emitter cannot "
+                        "split MMAs for tiles beyond the TMEM row limit "
+                        "(EmitterCaps.kMaxTMEMBlockM). Regenerate the "
+                        "schedule with blockM <= 128.")
                 lines += (
                     f"# {name}: outer-loop buf {buf.id}, count={buf.count} "
                     f"(TC writes / default reads across {buf.count} tiles)"

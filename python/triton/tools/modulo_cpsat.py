@@ -335,6 +335,9 @@ def solve_partition(prob):
         prefix_max = nxt
     used_wgs = model.NewIntVar(1, ncl, "used_wgs")
     model.Add(used_wgs == prefix_max + 1)
+    # Emitter-capability legality (versioned; see EmitterCaps in
+    # ModuloSchedulePass.cpp): e.g. outer loops are single-WG.
+    model.Add(used_wgs <= prob.get("max_wgs", ncl))
 
     same_cache = {}
 
@@ -518,6 +521,9 @@ def solve_joint(prob):
         prefix_max = nxt
     used_wgs = model.NewIntVar(1, ncl, "used_wgs")
     model.Add(used_wgs == prefix_max + 1)
+    # Emitter-capability legality (versioned; see EmitterCaps in
+    # ModuloSchedulePass.cpp): e.g. outer loops are single-WG.
+    model.Add(used_wgs <= prob.get("max_wgs", ncl))
 
     same_cache = {}
 

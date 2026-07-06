@@ -4138,6 +4138,27 @@ static void clampOuterStagesAndClusters(scf::ForOp outerLoop) {
 }
 
 // ============================================================================
+// Emitter (sched2tlx) capability facts — versioned LEGALITY constraints.
+// These describe what the emitter can lower, not what hardware allows;
+// encode them explicitly (constraints), never in costs, or a solver will
+// route around them and regress correctness (SolverMigrationNotes,
+// guard 3 / step-4 item 3). Bump kVersion when the emitter gains a
+// capability and delete the corresponding constraint.
+// ============================================================================
+struct EmitterCaps {
+  static constexpr int kVersion = 1; // sched2tlx as of 2026-07
+  // Outer persistent loops must stay single-WG: only INNER loop bodies
+  // lower multi-WG; splitting an outer epilogue silently drops its ops
+  // (guard 3's NaN). Enforced by the isOuter early-out in
+  // applyGlobalWarpPartition and by max_wgs in the joint model.
+  static constexpr bool kOuterLoopSingleWG = true;
+  // TMEM accumulator allocation supports blockM <= 128 (no MMA splitting
+  // for larger tiles). Blocks case2's 256-blockM pre_modulo end-to-end;
+  // the emitter raises a clear error (see _emit_buffers in emitter.py).
+  static constexpr int kMaxTMEMBlockM = 128;
+};
+
+// ============================================================================
 // Joint formulation v1 (SolverMigrationNotes, step 3): warp-group assignment
 // solved by CP-SAT against the committed schedule, replacing scoreCandidate's
 // enumerate-and-score with a constraint model over the SAME calibrated costs.
@@ -4362,6 +4383,12 @@ static bool partitionJointCPSAT(ttg::ScheduleLoop &loop,
   llvm::json::Object root{
       {"version", "cpsat-0.1"},
       {"mode", v2 ? "joint" : "partition"},
+      {"emitter_caps_version", EmitterCaps::kVersion},
+      // Inner loops only reach this partitioner today (the isOuter
+      // early-out enforces EmitterCaps::kOuterLoopSingleWG before it);
+      // max_wgs carries the same legality in-model for when outer loops
+      // are routed here.
+      {"max_wgs", static_cast<int64_t>(clusters.size())},
       {"ii", loop.II},
       {"clusters", std::move(jClusters)},
       {"nodes", std::move(jNodes)},

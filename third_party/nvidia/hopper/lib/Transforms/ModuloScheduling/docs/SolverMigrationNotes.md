@@ -457,15 +457,48 @@ parallel.
    the emitter's blockM>128 TMEM gap to unblock case2 end-to-end (the
    solver side is already verified healthy on its 256-blockM IR: II=1024,
    sane 3-WG).
+   **[PARTIAL 2026-07-06: the constraint side is DONE — `EmitterCaps`
+   (versioned, kVersion=1) in ModuloSchedulePass.cpp carries
+   kOuterLoopSingleWG (referenced by the isOuter early-out and plumbed as
+   `max_wgs` into both joint solver modes) and kMaxTMEMBlockM=128; the
+   emitter now raises a clear NotImplementedError naming the capability
+   for blockM>128 TMEM accumulators on all three of its TMEM render paths
+   (case2's trap is a named error instead of a silently-trapping kernel;
+   committed cases emit byte-identically). REMAINING: the actual
+   MMA-splitting emitter feature — staffing-dependent, unchanged.]**
 4. **Sub-tiling in front of the solver** (gap 8 above): without
    splitting tile-level ops into sub-tile instances, ping-pong/FA4-class
    schedules are absent from the solution space entirely. Likely reuses
    AutoWS subtile machinery; the largest expressiveness jump and the
    least scoped item — treat as its own design note when started.
+   **[DESIGN NOTE DONE 2026-07-06: docs/SubTilingDesign.md.** Key
+   corrections from the scout: the AutoWS SubtiledRegionOp is a pattern
+   recognizer for already-split epilogue chains, NOT a splitter — the
+   reusable slicing core is WSDataPartition.cpp (M-split of MMA/TMEM/
+   reduce/elementwise/iter_args, needs a new non-task-ID driver). Plan:
+   Route A (env-gated IR pre-split, TRITON_MODULO_SUBTILE_M=2, ~zero
+   downstream blast radius since everything is shape-driven) then Route B
+   (DDG-level virtual split, prices split-vs-unsplit in one solve, but
+   breaks the one-node-per-Operation* and one-var-per-op_id invariants).
+   All preconditions are met by items 1+2 (guard-1 off is REQUIRED —
+   with 4 chained TC nodes the guard would price the split at ResMII
+   2918, strictly worse). M-split only (reduce is axis-1); MinII
+   1459→~1198 but the real payoff is schedulability. Acceptance: beat
+   the 665 plateau on case3, anti-phase structure EMERGES from the joint
+   constraints without ping-pong-specific code.]**
 5. **Default-flip gate (parallelizable):** a kernel corpus beyond
    case1-7, solve-time budget policy (keep the offline/autotune
    positioning), solver configs wired into run_regression.py, and the
    case3 canary as the hard gate.
+   **[FIRST CUT DONE 2026-07-06:
+   `examples/testing/solver_regression.py` — for each solver config
+   (cpsat / joint1 / joint2 / full / full-noguard) × regenerable case:
+   regenerate → emit → byte-parity fast path (identical codegen skips the
+   GPU) → correctness + per-shape perf vs the committed kernel
+   (--perf-tol) → the case3 canary as a hard absolute gate
+   (--canary-tflops, default 651). Validated end-to-end (joint1 all
+   parity; full-noguard case3 canary 664/651 OK). REMAINING: broader
+   kernel corpus, CI wiring.]**
 
 The validation harness above is the gate for every step, and the
 "Why this note exists" principle is the order of operations: a complete
