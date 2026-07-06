@@ -845,6 +845,15 @@ def mxgemm_tdm_pipelined_kernel(
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     c_offsets = (stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]).to(tl.int32)
     c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    if SCHEDULE == "sliceMNK":
+        c_desc = tl.make_tensor_descriptor(
+            c_ptr,
+            shape=[M, N],
+            strides=[stride_cm, tl.constexpr(1)],
+            block_shape=[BLOCK_M, BLOCK_N],
+        )
+        c_off_m = pid_m * BLOCK_M
+        c_off_n = pid_n * BLOCK_N
 
     a_scale_layout: tl.constexpr = _scale_shared_layout(a_scale_shape)
     b_scale_layout: tl.constexpr = _scale_shared_layout(b_scale_shape)
@@ -1068,13 +1077,20 @@ def mxgemm_tdm_pipelined_kernel(
         acc_top = tl.join(c00, c01).permute(0, 2, 1).reshape((SUBTILE_M, BLOCK_N))
         acc_bot = tl.join(c10, c11).permute(0, 2, 1).reshape((SUBTILE_M, BLOCK_N))
         acc = tl.join(acc_top, acc_bot).permute(2, 0, 1).reshape((BLOCK_M, BLOCK_N))
-        acc = tlx.require_amd_wmma_layout(acc, warp_bases=STORE_WARP_BASES, reg_bases=STORE_REG_BASES,
-                                          instr_shape=STORE_INSTR_SHAPE)
-        c_offsets_store = tlx.require_amd_wmma_layout(c_offsets, warp_bases=STORE_WARP_BASES, reg_bases=STORE_REG_BASES,
-                                                      instr_shape=STORE_INSTR_SHAPE)
-        c_mask_store = tlx.require_amd_wmma_layout(c_mask, warp_bases=STORE_WARP_BASES, reg_bases=STORE_REG_BASES,
-                                                   instr_shape=STORE_INSTR_SHAPE)
-        tlx.buffer_store(acc, c_ptr, c_offsets_store, mask=c_mask_store)
+        if (c_off_m + BLOCK_M <= M) & (c_off_n + BLOCK_N <= N):
+            c_buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tlx.dtype_of(c_ptr), 1)
+            c_view = tlx.local_view(c_buf, 0)
+            tlx.local_store(c_view, acc.to(tlx.dtype_of(c_ptr)))
+            tlx.async_amd_descriptor_store(c_desc, c_view, [c_off_m, c_off_n])
+            tlx.async_amd_descriptor_wait(0)
+        else:
+            acc_store = tlx.require_amd_wmma_layout(acc, warp_bases=STORE_WARP_BASES, reg_bases=STORE_REG_BASES,
+                                                    instr_shape=STORE_INSTR_SHAPE)
+            c_offsets_store = tlx.require_amd_wmma_layout(c_offsets, warp_bases=STORE_WARP_BASES,
+                                                          reg_bases=STORE_REG_BASES, instr_shape=STORE_INSTR_SHAPE)
+            c_mask_store = tlx.require_amd_wmma_layout(c_mask, warp_bases=STORE_WARP_BASES, reg_bases=STORE_REG_BASES,
+                                                       instr_shape=STORE_INSTR_SHAPE)
+            tlx.buffer_store(acc_store, c_ptr, c_offsets_store, mask=c_mask_store)
     elif SCHEDULE == "sliceNK":
         SUBTILE_N: tl.constexpr = BLOCK_N // 2
         c0 = tl.zeros((BLOCK_M, SUBTILE_N), dtype=tl.float32)
@@ -1349,6 +1365,7 @@ def test_mxgemm_tdm_split_compiles_gfx1250():
     ttgir = compiled.asm["ttgir"]
     amdgcn = compiled.asm["amdgcn"]
     assert "amdg.async_tdm_group_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
     assert "warp_masks = array<i32: 5, 10>" in ttgir
     assert "tt.dot_scaled" in ttgir
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
