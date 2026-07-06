@@ -19,11 +19,13 @@ from triton.language.extra.tlx.tutorials.blackwell_gemm_2cta import (
 from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent import (
     attention as _blackwell_fa_ws_pipelined_persistent,
     _attn_bwd_preprocess as _blackwell_fa_bwd_preprocess,
+    _attn_bwd_dq_postprocess as _blackwell_fa_bwd_dq_postprocess,
     _attn_bwd_ws as _blackwell_fa_bwd_ws,
     _attn_fwd_ws as _blackwell_fa_fwd_ws,
     _host_descriptor_pre_hook as _blackwell_fa_fwd_pre_hook,
     configs_bwd_1cta as _configs_bwd_1cta,
     configs_bwd_2cta as _configs_bwd_2cta,
+    _bwd_selected_meta,
 )
 from triton.language.extra.tlx.tutorials.blackwell_fa_clc import (
     attention as _blackwell_fa_clc, )
@@ -592,9 +594,12 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
         _blackwell_fa_bwd_preprocess[pre_grid](o, do, delta, N_CTX, BLOCK_M=PRE_BLOCK, HEAD_DIM=HEAD_DIM)
 
         # Backward: main kernel
-        dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
+        dq = torch.empty(q.shape, device=q.device, dtype=torch.float32)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
+
+        _HALF_HD = HEAD_DIM // 2
+        dq_accum = torch.zeros([Z, H, N_CTX, HEAD_DIM], device=q.device, dtype=torch.float32)
 
         dummy_block_4d = [1, 1, 1, 1]
         desc_shape = [Z, H, N_CTX, HEAD_DIM]
@@ -603,7 +608,9 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
         desc_bv = TensorDescriptor(v, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
         desc_bq = TensorDescriptor(q, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
         desc_do = TensorDescriptor(do, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
-        desc_dq = TensorDescriptor(dq, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
+        _dq_desc_shape = [Z, H, 2 * N_CTX, _HALF_HD]
+        _dq_desc_strides = [H * N_CTX * HEAD_DIM, N_CTX * HEAD_DIM, _HALF_HD, 1]
+        desc_dq = TensorDescriptor(dq_accum, shape=_dq_desc_shape, strides=_dq_desc_strides, block_shape=dummy_block_4d)
         desc_dk = TensorDescriptor(dk, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
         desc_dv = TensorDescriptor(dv, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
         desc_m = TensorDescriptor(M, shape=[Z * H * N_CTX], strides=[1], block_shape=[1])
@@ -648,6 +655,14 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
             HEAD_DIM=HEAD_DIM,
             STAGE=stage,
+        )
+
+        _blk = _bwd_selected_meta["BLOCK_M1"] // _bwd_selected_meta["NUM_CTAS"]
+        post_grid = (N_CTX // PRE_BLOCK, Z * H)
+        _blackwell_fa_bwd_dq_postprocess[post_grid](
+            dq_accum, dq, N_CTX,
+            BLK=_blk, HALF_HD=HEAD_DIM // 2,
+            BLOCK_M=PRE_BLOCK, HEAD_DIM=HEAD_DIM,
         )
 
         torch.testing.assert_close(dv, ref_dv, atol=1e-2, rtol=0)
