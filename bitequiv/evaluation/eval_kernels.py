@@ -269,14 +269,14 @@ def cond_reduce_kernel(input_ptr, output_ptr, M, N, input_stride_m, input_stride
 # --------------------------------------------------------------------------- #
 # Per-kernel compile / run (and perf for the looped kernel)
 # --------------------------------------------------------------------------- #
-def _simple_compile(config, size):
+def _simple_compile(config, size, maxnreg=None):
     rows, cols = size
     src = _adv_sum_2d(rows, cols, 0)
     out = torch.empty(rows, device=DEVICE, dtype=torch.float32)
     return sum_dim1_kernel.warmup(src, out, rows, cols, src.stride(0), src.stride(1), grid=(rows, ), BLOCK_N=cols,
                                   ROWS_PER_BLOCK=1, REDUCTION_ORDERING=_ORDERING[config.reduction_ordering],
                                   num_warps=config.num_warps, num_stages=config.num_stages,
-                                  enable_fp_fusion=config.enable_fp_fusion)
+                                  enable_fp_fusion=config.enable_fp_fusion, maxnreg=maxnreg)
 
 
 def _simple_run(config, ck, seed, size):
@@ -288,7 +288,7 @@ def _simple_run(config, ck, seed, size):
     return _to_bytes(out)
 
 
-def _persist_compile(config, size):
+def _persist_compile(config, size, maxnreg=None):
     rows, cols = size
     src = _adv_sum_2d(rows, cols, 0)
     out = torch.empty(rows, device=DEVICE, dtype=torch.float32)
@@ -296,7 +296,7 @@ def _persist_compile(config, size):
                                           BLOCK_N=config.block_n, ROWS_PER_BLOCK=1,
                                           REDUCTION_ORDERING=_ORDERING[config.reduction_ordering],
                                           num_warps=config.num_warps, num_stages=config.num_stages,
-                                          enable_fp_fusion=config.enable_fp_fusion)
+                                          enable_fp_fusion=config.enable_fp_fusion, maxnreg=maxnreg)
 
 
 def _persist_run(config, ck, seed, size):
@@ -308,14 +308,14 @@ def _persist_run(config, ck, seed, size):
     return _to_bytes(out)
 
 
-def _welford_compile(config, size):
+def _welford_compile(config, size, maxnreg=None):
     rows, cols = size
     src = _adv_sum_2d(rows, cols, 0)
     mean = torch.empty(rows, device=DEVICE, dtype=torch.float32)
     var = torch.empty(rows, device=DEVICE, dtype=torch.float32)
     return welford_kernel.warmup(src, mean, var, cols, src.stride(0), grid=(rows, ), BLOCK_SIZE=config.block_n,
                                  num_warps=config.num_warps, num_stages=config.num_stages,
-                                 enable_fp_fusion=config.enable_fp_fusion)
+                                 enable_fp_fusion=config.enable_fp_fusion, maxnreg=maxnreg)
 
 
 def _welford_run(config, ck, seed, size):
@@ -328,13 +328,13 @@ def _welford_run(config, ck, seed, size):
     return _to_bytes(mean) + _to_bytes(var)  # both outputs must match for bit-equivalence
 
 
-def _rowsum_compile(config, size):
+def _rowsum_compile(config, size, maxnreg=None):
     rows, cols = size
     src = _adv_sum_2d(rows, cols, 0)
     out = torch.empty(rows, device=DEVICE, dtype=torch.float32)
     return rowsum_kernel.warmup(src, out, cols, src.stride(0), grid=(rows, ), BLOCK=cols,
                                 ORD=_ORDERING[config.reduction_ordering], num_warps=config.num_warps,
-                                num_stages=config.num_stages, enable_fp_fusion=config.enable_fp_fusion)
+                                num_stages=config.num_stages, enable_fp_fusion=config.enable_fp_fusion, maxnreg=maxnreg)
 
 
 def _rowsum_run(config, ck, seed, size):
@@ -346,13 +346,13 @@ def _rowsum_run(config, ck, seed, size):
     return _to_bytes(out)
 
 
-def _rowdot_compile(config, size):
+def _rowdot_compile(config, size, maxnreg=None):
     rows, cols = size
     a, b = _adv_dot_2d(rows, cols, 0)
     out = torch.empty(rows, device=DEVICE, dtype=torch.float32)
     return rowdot_kernel.warmup(a, b, out, cols, a.stride(0), grid=(rows, ), BLOCK=cols,
                                 ORD=_ORDERING[config.reduction_ordering], num_warps=config.num_warps,
-                                num_stages=config.num_stages, enable_fp_fusion=config.enable_fp_fusion)
+                                num_stages=config.num_stages, enable_fp_fusion=config.enable_fp_fusion, maxnreg=maxnreg)
 
 
 def _rowdot_run(config, ck, seed, size):
@@ -364,14 +364,14 @@ def _rowdot_run(config, ck, seed, size):
     return _to_bytes(out)
 
 
-def _cond_compile(config, size):
+def _cond_compile(config, size, maxnreg=None):
     rows, cols = size
     src = _adv_sum_2d(rows, cols, 0)
     out = torch.empty(rows, device=DEVICE, dtype=torch.float32)
     return cond_reduce_kernel.warmup(src, out, rows, cols, src.stride(0), src.stride(1), grid=(rows, ), BLOCK_N=cols,
                                      ROWS_PER_BLOCK=1, REDUCTION_ORDERING=_ORDERING[config.reduction_ordering],
                                      num_warps=config.num_warps, num_stages=config.num_stages,
-                                     enable_fp_fusion=config.enable_fp_fusion)
+                                     enable_fp_fusion=config.enable_fp_fusion, maxnreg=maxnreg)
 
 
 def _cond_run(config, ck, seed, size):
@@ -486,8 +486,8 @@ class KernelSpec:
     def config_space(self, config_effort):
         return build_configs(self.axes, config_effort)
 
-    def compile(self, config, size):
-        return self.compile_fn(config, size)
+    def compile(self, config, size, maxnreg=None):
+        return self.compile_fn(config, size, maxnreg=maxnreg)
 
     def run(self, config, ck, seed, size):
         return self.run_fn(config, ck, seed, size)

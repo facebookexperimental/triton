@@ -2,16 +2,16 @@
 
 WHAT THIS IS
 ------------
-One driver, three stages, run from the command line, that measure how good a
+One driver, four stages, run from the command line, that measure how good a
 static bitwise-equivalence checker is at deciding which autotuner configs of a
 reduction kernel produce identical output bits. The checker under test is
 pluggable (``--checker``); by default it is the repo checker
 ``bitequiv.ptx_reduction.ptx_reduction_descriptor``. This script changes no
 checker code — it only evaluates one.
 
-WHY THREE STAGES
-----------------
-The question "is this checker good?" splits into three independent questions, so
+WHY SEPARATE STAGES
+-------------------
+The question "is this checker good?" splits into independent questions, so
 the framework answers them separately and you can run only the ones you need:
 
   Stage 1 — SUPPORT.   Does the checker even understand this kind of kernel?
@@ -45,6 +45,16 @@ the framework answers them separately and you can run only the ones you need:
       slowest member (the tuning freedom the checker hands the autotuner) and the
       best member vs the ceiling (the cost of demanding identical bits).
 
+  Stage 4 — EQUIVALENCE UNDER REGISTER PRESSURE (opt-in).   Does the checker's
+      verdict survive ptxas (PTX -> SASS) across a WHOLE diverse equivalence set? It
+      fuzzes each checker-equivalence set (diverse num_warps / num_stages /
+      enable_fp_fusion / block_n) while ALSO capping ``maxnreg`` low enough to make
+      ptxas spill. ``maxnreg`` only adds a ``.maxnreg`` directive (same PTX body =>
+      same checker classes) but changes ptxas allocation, so the set spans diverse
+      configs AND register regimes. One checker class == one bit-class (over-merges 0)
+      means equivalence holds across diverse configs even under spilling; a bit-split
+      would flag any ptxas-induced break. Run at heavy config effort + the large tensor.
+
 EFFORT KNOBS
 ------------
   --config-effort  light (~10 configs, quick gate)  |  heavy (full sweep, ~1000-3000)
@@ -62,7 +72,7 @@ LAYOUT
 ------
   eval_kernels.py       — every test kernel + its KernelSpec (the registry).
   equivalence_fuzzer.py — standalone empirical oracle + partition/soundness math.
-  evaluate.py (here)    — the 3-stage CLI driver; orchestration only.
+  evaluate.py (here)    — the staged CLI driver; orchestration only.
 
 EXAMPLES
 --------
@@ -234,6 +244,78 @@ def evaluate_performance(spec, checker, artifact="ptx", config_effort="light"):
 
 
 # --------------------------------------------------------------------------- #
+# Stage 4 — equivalence under register pressure (post-ptxas / the PTX->SASS gap)
+# --------------------------------------------------------------------------- #
+def evaluate_ptxas_robustness(spec, checker, config_effort, fuzzer_effort, artifact, maxnreg_sweep):
+    """Does the checker's equivalence verdict survive ptxas across a WHOLE diverse set?
+
+    Take the full ``config_effort`` config space (diverse num_warps / num_stages /
+    enable_fp_fusion / block_n) and ALSO cap ``maxnreg`` low enough to make ptxas spill. A
+    ``.maxnreg`` directive leaves the PTX reduction body identical, so it does not change the
+    checker descriptor -- the diverse configs and the register regimes fall into the SAME
+    checker-equivalence classes. We then fuzz every ``(config, maxnreg)`` member and check each
+    checker class is still a single bit-class. So this stresses the cross-config equivalence
+    claim AND the PTX->SASS gap (register spilling) at once: one checker class == one bit-class
+    (over-merges 0) means equivalence holds across diverse configs even under spilling.
+
+    Uses ``precision_size`` (a sizable 8K-16K-column tensor): the larger ``perf_size`` overflows
+    shared memory / trips ptxas at heavy config scale, and register pressure here is driven by the
+    config diversity (num_stages / block_n) plus the ``maxnreg`` cap, not by tensor size.
+    """
+    size = spec.precision_size
+    caps = [None] + list(maxnreg_sweep)
+    base = spec.config_space(config_effort)
+    compiled, checker_key, nregs, nspills, items, fails = {}, {}, {}, {}, [], 0
+    for cfg in base:
+        for cap in caps:
+            key = (cfg, cap)
+            try:
+                ck = spec.compile(cfg, size, maxnreg=cap)
+                spec.run(cfg, ck, 0, size)  # one launch populates ck.n_regs / ck.n_spills (lazy)
+            except Exception:  # noqa: BLE001
+                fails += 1
+                continue
+            compiled[key] = ck
+            checker_key[key] = checker(ck.asm[artifact])
+            nregs[key], nspills[key] = getattr(ck, "n_regs", None), getattr(ck, "n_spills", None)
+            items.append(key)
+    attempted = len(base) * len(caps)
+    if not items:
+        return dict(name=spec.name, ok=0, attempted=attempted, fails=fails)
+
+    repeats = equivalence_fuzzer.effort_repeats(fuzzer_effort)
+    empirical_key = equivalence_fuzzer.empirical_keys(lambda key, seed: spec.run(key[0], compiled[key], seed, size),
+                                                      items, repeats)
+    checker_sets = equivalence_fuzzer.partition(items, checker_key)
+    empirical_sets = equivalence_fuzzer.partition(items, empirical_key)
+    holds, _ = equivalence_fuzzer.refines(items, checker_key, empirical_key)
+    largest = max(checker_sets, key=len)
+
+    def _reg_range(keys):
+        vals = [nregs[k] for k in keys if nregs[k] is not None]
+        return (min(vals), max(vals)) if vals else None
+
+    def _spill_range(keys):
+        vals = [nspills[k] for k in keys if nspills[k] is not None]
+        return (min(vals), max(vals)) if vals else None
+
+    spans = {}
+    for axis in _AXIS_ORDER:
+        vals = sorted({getattr(k[0], axis) for k in largest}, key=lambda v: (v is None, v))
+        if len(vals) > 1:
+            spans[axis] = vals
+    return dict(name=spec.name, size=size, ok=len(items), attempted=attempted, fails=fails, n_configs=len(base),
+                caps=caps, checker_n=len(checker_sets), checker_max=len(largest), empirical_n=len(empirical_sets),
+                empirical_max=equivalence_fuzzer.max_class_size(empirical_sets),
+                over_merges=equivalence_fuzzer.over_merges(items, checker_key, empirical_key), refines=holds,
+                n_spilled=sum(1 for k in items
+                              if (nspills[k] or 0) > 0), reg_range=_reg_range(items), spill_range=_spill_range(items),
+                largest_spans=spans, largest_maxnreg=sorted({k[1]
+                                                             for k in largest}, key=lambda v: (v is None, v)),
+                largest_reg_range=_reg_range(largest), largest_spilled=sum(1 for k in largest if (nspills[k] or 0) > 0))
+
+
+# --------------------------------------------------------------------------- #
 # Report rendering
 # --------------------------------------------------------------------------- #
 def _table(headers, rows):
@@ -311,6 +393,45 @@ def render_stage3(results):
     return lines
 
 
+def render_stage4(results):
+    lines = ["STAGE 4 — equivalence under register pressure (post-ptxas / the PTX->SASS gap)", "-" * 78, ""]
+    lines.append("Fuzz each WHOLE checker-equivalence set (DIVERSE configs) while also capping maxnreg to make")
+    lines.append("ptxas spill. maxnreg only adds a .maxnreg directive (same PTX body => same checker classes) but")
+    lines.append("changes ptxas allocation. One checker class == one bit-class (over-merges 0) => equivalence holds")
+    lines.append("across diverse configs AND register spilling.")
+    lines.append("")
+    total_om = 0
+    for r in results:
+        if not r.get("ok"):
+            lines.append(f"{r['name']}: no members compiled ({r.get('attempted')} attempted, {r.get('fails')} failed).")
+            lines.append("")
+            continue
+        total_om += r["over_merges"]
+        nr, nc = r["size"]
+        caps = ["none" if c is None else str(c) for c in r["caps"]]
+        lines.append(f"{r['name']}  (size {nr}x{nc}; {r['n_configs']} configs x maxnreg{caps} = "
+                     f"{r['ok']}/{r['attempted']} members)")
+        rr, sr = r["reg_range"], r["spill_range"]
+        lines.append(f"  ptxas variation: n_regs {rr[0]}..{rr[1]}" +
+                     (f" | spill 0..{sr[1]} B" if sr and sr[1] else " | spill 0 B") +
+                     f" | spilled members: {r['n_spilled']}/{r['ok']}")
+        lines.append(f"  checker classes: {r['checker_n']} (max {r['checker_max']}) | empirical classes: "
+                     f"{r['empirical_n']} (max {r['empirical_max']}) | over-merges: {r['over_merges']} "
+                     f"| refines: {'yes' if r['refines'] else 'NO'}")
+        span_txt = "; ".join(f"{a}∈{v}" for a, v in r["largest_spans"].items()) or "(singleton)"
+        mnr = ["none" if c is None else c for c in r["largest_maxnreg"]]
+        lgr = r["largest_reg_range"]
+        lines.append(f"  largest class: {r['checker_max']} members spanning {span_txt}; maxnreg∈{mnr}" +
+                     (f"; n_regs {lgr[0]}..{lgr[1]}" if lgr else "") +
+                     f"; spilled {r['largest_spilled']}/{r['checker_max']}")
+        lines.append(f"  => equivalence under register pressure: {'PRESERVED' if r['over_merges'] == 0 else 'BROKEN'}")
+        lines.append("")
+    lines.append(f"OVERALL over-merges across kernels (under forced spilling): {total_om} "
+                 f"({'PTX equivalence survives ptxas across the whole set' if total_om == 0 else 'BREAK detected'})")
+    lines.append("")
+    return lines
+
+
 def write_report(path, header, sections):
     lines = list(header)
     for section in sections:
@@ -335,6 +456,11 @@ def parse_args(argv):
         "--allow-unsound", action="store_true",
         help="report over-merges but exit 0 instead of 1 — for checkers that are "
         "expectedly not sound (e.g. the TTGIR checker, blind to FMA contraction)")
+    p.add_argument(
+        "--maxnreg-sweep", default="16",
+        help="Stage 4: comma list of maxnreg caps (added on top of the diverse config space to "
+        "force ptxas spilling; a None/uncapped baseline is always included). Each cap multiplies "
+        "the member count, so keep it small at heavy config effort")
     p.add_argument("--out", default=_DEFAULT_OUT, help="result table path")
     return p.parse_args(argv)
 
@@ -409,6 +535,26 @@ def main(argv=None):
             results.append(evaluate_performance(spec, checker, args.artifact, args.config_effort))
         if results:
             sections.append(render_stage3(results))
+
+    if 4 in stages:
+        print("== Stage 4: equivalence under register pressure (post-ptxas) ==", flush=True)
+        maxnreg_sweep = [int(x) for x in args.maxnreg_sweep.split(",") if x.strip()]
+        results = []
+        for spec in specs:
+            members = len(spec.config_space(args.config_effort)) * (1 + len(maxnreg_sweep))
+            print(
+                f"  {spec.name}: ~{members} (config x maxnreg{['none'] + maxnreg_sweep}) members "
+                f"x {repeats} fuzz seeds ...", flush=True)
+            r = evaluate_ptxas_robustness(spec, checker, args.config_effort, args.fuzzer_effort, args.artifact,
+                                          maxnreg_sweep)
+            results.append(r)
+            if r.get("ok"):
+                print(
+                    f"    -> {r['ok']}/{r['attempted']} members | spilled {r['n_spilled']} | checker classes "
+                    f"{r['checker_n']} (max {r['checker_max']}) | over-merges {r['over_merges']}", flush=True)
+            else:
+                print(f"    -> 0/{r.get('attempted')} compiled (fails: {r.get('fails')})", flush=True)
+        sections.append(render_stage4(results))
 
     write_report(args.out, header, sections)
     print(f"\nWROTE {args.out}")
