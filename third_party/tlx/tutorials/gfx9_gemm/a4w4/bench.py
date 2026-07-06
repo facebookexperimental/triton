@@ -219,6 +219,7 @@ def main():
 
     print("\nTLX a4w4 gfx950:")
     print(f"{'M':>6s} {'N':>6s} {'K':>6s}  {'status':>10s}  {'max_err':>10s}  {'TLX':>17s}")
+    failed = False
     for M, N, K in sizes:
         a, b, a_scales, b_scales = generate_mxfp4_inputs(M, N, K)
         cache_dir = shape_cache_dir(args.cache_dir, M, N, K)
@@ -230,6 +231,7 @@ def main():
             ref = torch_reference(a, b, a_scales, b_scales)
             max_err = (c - ref).abs().max().item()
             ok = torch.allclose(c, ref, atol=args.atol, rtol=args.rtol)
+            failed |= not ok
             if ok and not args.no_bench:
                 ms = triton.testing.do_bench(lambda: matmul(a, b, a_scales, b_scales), warmup=args.warmup, rep=args.rep)
                 perf = f"{tflops(ms, M, N, K):8.1f}T/{ms:6.3f}ms"
@@ -237,6 +239,8 @@ def main():
                 perf = "-"
         status = "ok" if ok else "FAIL"
         print(f"{M:6d} {N:6d} {K:6d}  {status:>10s}  {max_err:10.4f}  {perf:>17s}", flush=True)
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

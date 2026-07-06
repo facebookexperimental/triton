@@ -101,6 +101,19 @@ jobs:
           . "${VENV_DIR}/bin/activate"
           python3 third_party/tlx/tutorials/amd-addmm-glu-opt_test.py --mode perf_test
 
+      - name: Run TLX gfx9 GEMM performance guards
+        run: |
+          set -euxo pipefail
+          . "${VENV_DIR}/bin/activate"
+          rm -rf /tmp/triton-cache/tlx-gfx9-a4w4-ci
+          python3 third_party/tlx/tutorials/gfx9_gemm/a16w16/bench.py --version 9 --K 4096
+          python3 third_party/tlx/tutorials/gfx9_gemm/a4w4/bench.py \
+            --K 4096 \
+            --compile-workers 0 \
+            --cache-dir /tmp/triton-cache/tlx-gfx9-a4w4-ci \
+            --warmup 25 \
+            --rep 200
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/tlx-amd-meta' }}
