@@ -131,3 +131,67 @@ Do it after Route A has proven the win.
   period) without any ping-pong-specific code — the named-barrier
   recurrence should EMERGE from TC NoOverlap + the flight-window
   constraints, the same way softmax cohesion emerged in step 4 item 2.
+
+## Experiment log (2026-07-06) — Route A executed, measured post-mortem
+
+Vehicle: cheaper than the planned IR pre-split — a source-level split,
+`sched2tlx/examples/testing/subtiling/fa_subtiled_experiment.py`
+(BLOCK_M=256 written as two 128-row sub-tiles sharing each iteration's
+K/V; no WS in source; the solver stack decides everything). Sanity: the
+ping-pong tutorial measures 1197 TFLOPS at (1,32,8192) = 1.8× the 665
+plateau, so the design-point hypothesis is real; the vehicle itself
+passes correctness on the default pipeline (312 TFLOPS).
+
+What worked end-to-end:
+
+- DDG grows 31→55 nodes exactly as predicted; cpsat solves II=2396, Rau
+  II=2487 (recurrence-bound; MinII ~1198 was the resource floor).
+- The joint-v1 partitioner on the Rau schedule produced a perfect
+  ping-pong-SHAPED 6-WG partition from first principles — 2 TMA, 2 TC,
+  2 softmax WGs, each sub-tile's chain in its own WG. The structural
+  half of the emergence criterion is met.
+- After hand-patching the emitted kernel (below), correctness PASSES.
+
+Emitter: three defect classes, hand-patch spec committed as the diff
+pair `subtiling/fa_subtiled_rau_generated.py` (raw, launch-fails) vs
+`subtiling/fa_subtiled_rau_handpatched.py` (runs): (1) cross-region
+channels (`epi_*`, the acc carve-out) are name-keyed singletons — the
+second sub-tile's instances shadow the first's in Python; (2) empty
+barriers count distinct consumer WGs, but tcgen05 arrives are per-MMA —
+a K tile read by two QK dots in one WG needs arrive_count=2, not 1
+(symptom: "unspecified launch failure" in the TC warp); (3) the M_lse
+epilogue stores are dropped entirely.
+
+MEASURED: **206.7 TFLOPS** at (1,32,8192) — below the plateau AND below
+the unsplit default pipeline. A K-ring depth probe (1→2, hand-mirrored
+from the V ring) changed nothing (206.4): ring depth is not the limiter.
+
+Root cause: the two sub-tile chains run IN PHASE, not anti-phase. The
+Rau schedule puts sub0's and sub1's softmax tmem_loads 128 cycles apart
+(cyc 1458 vs 1586, ~5% of II) — the partition is ping-pong-shaped but
+the schedule is lockstep. Each chain's per-iteration acc rescale is a
+full TMEM round-trip inside the loop-carry cycle (PV MMA(i−1) → sem7 →
+tmem_load 128×128 f32 → ×alpha → tmem_store → sem3 → PV MMA(i)), and
+the TMEM ld/st port and SFU are per-SM resources shared by both softmax
+WGs. Measured steady state ≈11.3K cycles/iteration vs modeled II 2487
+(4.5×). The model prices tmem_load/store and exp2 as per-WG
+fixed-latency/occupancy ops with NO shared-across-WG engine, so
+overlapping the two chains is modeled as free when in hardware it
+halves (or worse) both. The hand ping-pong's named barriers are exactly
+a cross-WG mutual exclusion on this phase — the structure the model
+cannot currently prefer because it cannot see the contention.
+
+Verdict and order of work (the design point is NOT falsified — the
+tutorial proves 1197 is reachable; this is a model + emitter fidelity
+gap):
+
+1. Latency model: add per-SM shared engines (TMEM ld/st port, SFU)
+   as cross-WG reservations in the joint formulation. With NoOverlap on
+   a shared engine, anti-phase staggering becomes the only feasible
+   packing — emergent ping-pong, no special-case code. This is the
+   research item with the measurement (11.3K vs 2487) attached.
+2. Emitter multi-instance generalization: per-instance channel naming
+   (defect 1), per-MMA arrive counts (defect 2), don't drop epilogue
+   ops (defect 3). Prerequisite for ANY sub-tiled emission; the
+   hand-patch diff is the spec.
+3. Only then re-run this experiment; acceptance (beat 665) stands.

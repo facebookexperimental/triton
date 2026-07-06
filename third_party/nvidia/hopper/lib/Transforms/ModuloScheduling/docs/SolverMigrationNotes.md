@@ -486,6 +486,21 @@ parallel.
    1459→~1198 but the real payoff is schedulability. Acceptance: beat
    the 665 plateau on case3, anti-phase structure EMERGES from the joint
    constraints without ping-pong-specific code.]**
+   **[ROUTE A EXECUTED 2026-07-06 — measured post-mortem in
+   SubTilingDesign.md "Experiment log"; assets in
+   `sched2tlx/examples/testing/subtiling/`. End-to-end sub-tiled solver
+   kernel runs CORRECTLY after hand-patching three emitter defect
+   classes (singleton cross-region channels, per-WG-deduped arrive
+   counts vs per-MMA hardware arrives, dropped M_lse epilogue stores —
+   the hand-patch diff is the emitter spec). Partition side of the
+   emergence criterion met (joint-v1 rediscovered a 6-WG
+   ping-pong-shaped partition). Perf: 206.7 TFLOPS — the two sub-tile
+   chains schedule IN PHASE (tmem_loads 128 cyc apart) and contend on
+   the per-SM TMEM port/SFU, which the model does not price; measured
+   11.3K cyc/iter vs modeled II 2487. NEXT: shared-across-WG engine
+   reservations in the model (emergent anti-phase), then the emitter
+   multi-instance generalization, then re-measure. The 1197-TFLOPS
+   tutorial measurement keeps the design-point hypothesis alive.]**
 5. **Default-flip gate (parallelizable):** a kernel corpus beyond
    case1-7, solve-time budget policy (keep the offline/autotune
    positioning), solver configs wired into run_regression.py, and the
