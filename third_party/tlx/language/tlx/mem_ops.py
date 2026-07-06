@@ -1086,6 +1086,7 @@ def async_amd_descriptor_load(
     result: tlx.buffered_tensor,
     offsets: list[tl.tensor],
     pred: tl.tensor = None,
+    clamp_bounds: tl.constexpr = False,
     _semantic=None,
 ) -> tlx.async_token:
     """Asynchronous descriptor load from global to a local buffer (AMD).
@@ -1137,6 +1138,7 @@ def async_amd_descriptor_load(
         result.handle,
         pred_handle,
         None,
+        bool(tl._unwrap_if_constexpr(clamp_bounds)),
     )
     return tlx.async_token(token_handle)
 
@@ -1205,6 +1207,7 @@ def async_amd_descriptor_store(
     desc: tl.tensor_descriptor_base,
     source: tlx.buffered_tensor,
     offsets: list[tl.tensor],
+    clamp_bounds: tl.constexpr = False,
     _semantic=None,
 ) -> None:
     """Asynchronous descriptor store from a local buffer to global (AMD).
@@ -1262,6 +1265,7 @@ def async_amd_descriptor_store(
         offsets_handles,
         source.handle,
         None,
+        bool(tl._unwrap_if_constexpr(clamp_bounds)),
     )
 
 

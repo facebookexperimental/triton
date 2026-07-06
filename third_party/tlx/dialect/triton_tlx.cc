@@ -555,25 +555,31 @@ void init_triton_tlx_ir(py::module_ &m) {
       // user's local buffer (the Python wrapper restricts callers to AMD
       // TDM-capable targets). The op's pred operand is i32; this binding
       // extends an i1 pred to i32 for convenience.
-      .def("create_async_tdm_copy_global_to_local",
-           [](TritonOpBuilder &self, Value desc, std::vector<Value> indices,
-              Value result, Value pred,
-              std::optional<Value> barrier) -> mlir::Value {
-             Value pred32 = pred;
-             if (auto intTy = dyn_cast<IntegerType>(pred.getType())) {
-               if (intTy.getWidth() == 1) {
-                 pred32 = self.create<arith::ExtUIOp>(
-                     self.getBuilder().getI32Type(), pred);
-               }
-             }
-             Value updatedDesc =
-                 self.create<amdgpu::UpdateTensorDescriptorOp>(
-                         desc.getType(), desc, ValueRange(indices),
-                         ValueRange(), pred32, /*clamp_bounds=*/false)
-                     .getResult();
-             return self.create<amdgpu::AsyncTDMCopyGlobalToLocalOp>(
-                 updatedDesc, result, barrier.value_or(Value()));
-           })
+      .def(
+          "create_async_tdm_copy_global_to_local",
+          [](TritonOpBuilder &self, Value desc, std::vector<Value> indices,
+             Value result, Value pred, std::optional<Value> barrier,
+             bool clampBounds) -> mlir::Value {
+            Value pred32 = pred;
+            if (auto intTy = dyn_cast<IntegerType>(pred.getType())) {
+              if (intTy.getWidth() == 1) {
+                pred32 = self.create<arith::ExtUIOp>(
+                    self.getBuilder().getI32Type(), pred);
+              }
+            }
+            Value updatedDesc =
+                self.create<amdgpu::UpdateTensorDescriptorOp>(
+                        desc.getType(), desc, ValueRange(indices), ValueRange(),
+                        pred32, /*clamp_bounds=*/false)
+                    .getResult();
+            if (clampBounds)
+              updatedDesc.getDefiningOp()->setAttr(
+                  "clamp_bounds", self.getBuilder().getUnitAttr());
+            return self.create<amdgpu::AsyncTDMCopyGlobalToLocalOp>(
+                updatedDesc, result, barrier.value_or(Value()));
+          },
+          py::arg("desc"), py::arg("indices"), py::arg("result"),
+          py::arg("pred"), py::arg("barrier"), py::arg("clampBounds") = false)
       .def("create_async_tdm_group_copy_global_to_local",
            [](TritonOpBuilder &self, std::vector<Value> descs,
               std::vector<Value> indices, std::vector<Value> results,
@@ -605,17 +611,23 @@ void init_triton_tlx_ir(py::module_ &m) {
       // the user's local buffer. The op has no `pred` operand (unlike the
       // load) and returns no SSA value, so `AsyncTDMWait` synchronizes via
       // its IR-walk fallback rather than via tokens.
-      .def("create_async_tdm_copy_local_to_global",
-           [](TritonOpBuilder &self, Value desc, std::vector<Value> indices,
-              Value src, std::optional<Value> barrier) {
-             Value updatedDesc =
-                 self.create<amdgpu::UpdateTensorDescriptorOp>(
-                         desc.getType(), desc, ValueRange(indices),
-                         ValueRange(), Value(), /*clamp_bounds=*/false)
-                     .getResult();
-             self.create<amdgpu::AsyncTDMCopyLocalToGlobalOp>(
-                 updatedDesc, src, barrier.value_or(Value()));
-           })
+      .def(
+          "create_async_tdm_copy_local_to_global",
+          [](TritonOpBuilder &self, Value desc, std::vector<Value> indices,
+             Value src, std::optional<Value> barrier, bool clampBounds) {
+            Value updatedDesc =
+                self.create<amdgpu::UpdateTensorDescriptorOp>(
+                        desc.getType(), desc, ValueRange(indices), ValueRange(),
+                        Value(), /*clamp_bounds=*/false)
+                    .getResult();
+            if (clampBounds)
+              updatedDesc.getDefiningOp()->setAttr(
+                  "clamp_bounds", self.getBuilder().getUnitAttr());
+            self.create<amdgpu::AsyncTDMCopyLocalToGlobalOp>(
+                updatedDesc, src, barrier.value_or(Value()));
+          },
+          py::arg("desc"), py::arg("indices"), py::arg("src"),
+          py::arg("barrier"), py::arg("clampBounds") = false)
       // AMD-only: emit amdgpu.tdm_prefetch — an L2 prefetch hint with no
       // memdesc. Pred is i1 here (unlike the load's i32 pred); we
       // truncate from i32 if the caller passed a wider int.
