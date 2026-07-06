@@ -1,3 +1,6 @@
+import importlib.util
+from pathlib import Path
+
 import pytest
 
 import torch
@@ -14,10 +17,16 @@ from triton.language.extra.tlx.tutorials.blackwell_gemm_2cta import (
     matmul as _blackwell_gemm_2cta, )
 from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent import (
     attention as _blackwell_fa_ws_pipelined_persistent, )
-from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent_mxfp8 import (
-    attention as _blackwell_fa_ws_pipelined_persistent_mxfp8,
-    generate_attention_inputs as _generate_mxfp8_attention_inputs,
-)
+try:
+    from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent_mxfp8 import (
+        attention as _blackwell_fa_ws_pipelined_persistent_mxfp8,
+        generate_attention_inputs as _generate_mxfp8_attention_inputs,
+    )
+except ModuleNotFoundError as e:
+    if e.name != "torchao":
+        raise
+    _blackwell_fa_ws_pipelined_persistent_mxfp8 = None
+    _generate_mxfp8_attention_inputs = None
 from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined import (
     attention as _blackwell_fa_ws_pipelined, )
 from triton.language.extra.tlx.tutorials.blackwell_fa_ws_persistent import (
@@ -37,9 +46,24 @@ from triton.language.extra.tlx.tutorials.hopper_fa_ws_pipelined import (
 from triton.language.extra.tlx.tutorials.hopper_fa_ws import (
     attention as _hopper_fa_ws, )
 
-from triton._internal_testing import is_blackwell, is_hopper
+from triton._internal_testing import is_blackwell, is_hip_gfx1250, is_hopper
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
+
+_AMD_MXFP_GEMM_MODULE = None
+
+
+def _load_amd_mxfp_gemm_module():
+    global _AMD_MXFP_GEMM_MODULE
+    if _AMD_MXFP_GEMM_MODULE is None:
+        path = Path(__file__).resolve().parents[1] / "amd-mxfp-gemm-tdm-pipelined_test.py"
+        spec = importlib.util.spec_from_file_location("tlx_amd_mxfp_gemm_tdm_pipelined_test", path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        _AMD_MXFP_GEMM_MODULE = module
+    return _AMD_MXFP_GEMM_MODULE
+
 
 # =============================================================================
 # GEMM: Common utilities and configs
@@ -148,6 +172,129 @@ class Gemm:
             torch_output = torch.matmul(a, b)
             triton_output = matmul_fn(a, b, config=config)
             torch.testing.assert_close(triton_output, torch_output)
+
+
+class AmdMXFPGemm:
+    """AMD gfx1250 MXFP GEMM e2e configs."""
+
+    CONFIGS = [
+        pytest.param(
+            {
+                "M": 256,
+                "N": 256,
+                "K": 768,
+                "SCHEDULE": "sliceMNK",
+                "DTYPE_A": "float8_e4m3",
+                "DTYPE_B": "float4",
+                "BLOCK_M": 256,
+                "BLOCK_N": 256,
+                "BLOCK_K": 256,
+                "TRANSPOSE_B": True,
+                "NUM_BUFFERS": 3,
+                "SCALE_PRESHUFFLE": True,
+                "WITH_A_SCALE": True,
+                "TDM_FUSION": "partial",
+                "L2_PREFETCH_DISTANCE": -1,
+                "TDM_SPLIT": True,
+            },
+            id="sliceMNK-split-partial-fp8e4m3-fp4-bT-3buf",
+        ),
+        pytest.param(
+            {
+                "M": 256,
+                "N": 256,
+                "K": 768,
+                "SCHEDULE": "sliceMNK",
+                "DTYPE_A": "float8_e4m3",
+                "DTYPE_B": "float4",
+                "BLOCK_M": 256,
+                "BLOCK_N": 256,
+                "BLOCK_K": 256,
+                "TRANSPOSE_B": False,
+                "NUM_BUFFERS": 2,
+                "SCALE_PRESHUFFLE": True,
+                "WITH_A_SCALE": True,
+                "TDM_FUSION": "partial",
+                "L2_PREFETCH_DISTANCE": -1,
+                "TDM_SPLIT": True,
+            },
+            id="sliceMNK-split-partial-fp8e4m3-fp4-b-2buf",
+        ),
+        pytest.param(
+            {
+                "M": 128,
+                "N": 128,
+                "K": 768,
+                "SCHEDULE": "sliceMNK",
+                "DTYPE_A": "float8_e4m3",
+                "DTYPE_B": "float8_e4m3",
+                "BLOCK_M": 128,
+                "BLOCK_N": 128,
+                "BLOCK_K": 256,
+                "TRANSPOSE_B": True,
+                "NUM_BUFFERS": 3,
+                "SCALE_PRESHUFFLE": True,
+                "WITH_A_SCALE": True,
+                "TDM_FUSION": "none",
+                "L2_PREFETCH_DISTANCE": -1,
+                "TDM_SPLIT": True,
+            },
+            id="sliceMNK-split-none-fp8e4m3-fp8e4m3-bT-128x128-3buf",
+        ),
+    ]
+
+    @staticmethod
+    def run_test(config):
+        mxfp = _load_amd_mxfp_gemm_module()
+        M = config["M"]
+        N = config["N"]
+        K = config["K"]
+        dtype_a = config["DTYPE_A"]
+        dtype_b = config["DTYPE_B"]
+
+        torch.manual_seed(0)
+        a = mxfp._init_data(dtype_a, M, K)
+        b = mxfp._init_data(dtype_b, K, N)
+        a_scale = mxfp.MXScaleTensor(size=(M, triton.cdiv(K, 32))).random(high=32.0).data
+        b_scale = mxfp.MXScaleTensor(size=(N, triton.cdiv(K, 32))).random(high=32.0).data
+        ref = mxfp.torch_gemm_mxfp(a, b, a_scale, b_scale, 32, M, N, K)
+
+        a_scale_input = mxfp.pack_scale(a_scale) if config["SCALE_PRESHUFFLE"] else a_scale
+        b_scale_input = mxfp.pack_scale(b_scale) if config["SCALE_PRESHUFFLE"] else b_scale
+        if dtype_a == "float4":
+            a = a.to_packed_tensor(dim=1)
+        if dtype_b == "float4":
+            b = b.to_packed_tensor(dim=0)
+
+        a_d = a.data.contiguous().cuda() if dtype_a == "float4" else a.contiguous().cuda()
+        if dtype_b == "float4":
+            b_d = b.data.T.contiguous().cuda() if config["TRANSPOSE_B"] else b.data.contiguous().cuda()
+        else:
+            b_d = b.T.contiguous().cuda() if config["TRANSPOSE_B"] else b.contiguous().cuda()
+
+        out = mxfp.mxgemm_tdm_pipelined(
+            a_d,
+            b_d,
+            a_scale_input.cuda(),
+            b_scale_input.cuda(),
+            config["BLOCK_M"],
+            config["BLOCK_N"],
+            config["BLOCK_K"],
+            config["TRANSPOSE_B"],
+            config["NUM_BUFFERS"],
+            mxfp.DTYPE_TO_TRITON[dtype_a],
+            mxfp.DTYPE_TO_TRITON[dtype_b],
+            config["SCALE_PRESHUFFLE"],
+            config["WITH_A_SCALE"],
+            config["SCHEDULE"],
+            config["L2_PREFETCH_DISTANCE"],
+            M,
+            N,
+            K,
+            config["TDM_FUSION"],
+            config["TDM_SPLIT"],
+        )
+        torch.testing.assert_close(out.cpu(), ref, rtol=1e-5, atol=2e-2)
 
 
 # =============================================================================
@@ -302,6 +449,17 @@ def test_blackwell_gemm_2cta(dtype):
 
 
 # =============================================================================
+# AMD gfx1250 MXFP GEMM Tests
+# =============================================================================
+
+
+@pytest.mark.parametrize("config", AmdMXFPGemm.CONFIGS)
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires AMD gfx1250 GPU")
+def test_amd_mxfp_gemm_tdm_split(config):
+    AmdMXFPGemm.run_test(config)
+
+
+# =============================================================================
 # Blackwell Flash Attention Tests
 # =============================================================================
 
@@ -373,6 +531,8 @@ def test_blackwell_fa_ws_pipelined_persistent_warp_barrier(causal, RESCALE_OPT, 
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_fa_ws_pipelined_persistent_mxfp8(HEAD_DIM, causal):
+    if _blackwell_fa_ws_pipelined_persistent_mxfp8 is None or _generate_mxfp8_attention_inputs is None:
+        pytest.skip("Requires torchao")
     config = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent_mxfp8"]
     sm_scale = 0.5
     dtype = torch.float8_e4m3fn
