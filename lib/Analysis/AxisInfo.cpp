@@ -142,6 +142,14 @@ public:
   AxisInfo
   getAxisInfo(OpTy op,
               ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) override {
+    if (operands.empty()) {
+      if (op->getNumResults() == 0)
+        return AxisInfo();
+      return AxisInfo::getPessimisticValueState(op->getResult(0));
+    }
+    auto tensorType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+    if (tensorType && tensorType.getRank() != operands[0]->getValue().getRank())
+      return AxisInfo::getPessimisticValueState(op->getResult(0));
     return operands[0]->getValue();
   }
 };
@@ -155,6 +163,11 @@ public:
   AxisInfo
   getAxisInfo(mlir::UnrealizedConversionCastOp op,
               ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) override {
+    if (operands.empty()) {
+      if (op->getNumResults() == 0)
+        return AxisInfo();
+      return AxisInfo::getPessimisticValueState(op->getResult(0));
+    }
     auto tensorType = dyn_cast<RankedTensorType>(op.getResultTypes()[0]);
     if (tensorType &&
         tensorType.getRank() != operands[0]->getValue().getRank()) {
@@ -1180,6 +1193,8 @@ AxisInfoAnalysis::AxisInfoAnalysis(DataFlowSolver &solver)
   visitors.append<CastOpAxisInfoVisitor<arith::ExtSIOp>,
                   CastOpAxisInfoVisitor<arith::ExtUIOp>,
                   CastOpAxisInfoVisitor<arith::TruncIOp>,
+                  CastOpAxisInfoVisitor<arith::ExtFOp>,
+                  CastOpAxisInfoVisitor<arith::TruncFOp>,
                   CastOpAxisInfoVisitor<triton::gpu::ConvertLayoutOp>,
                   CastOpAxisInfoVisitor<triton::BitcastOp>,
                   CastOpAxisInfoVisitor<triton::gluon::SetAutoLayoutOp>>();

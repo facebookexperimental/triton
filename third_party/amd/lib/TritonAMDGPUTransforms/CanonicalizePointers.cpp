@@ -2016,11 +2016,13 @@ void TritonAMDGPUCanonicalizePointersPass::runOnOperation() {
       return !(ifOp->hasAttr(kSCFThenRewrittenAttr) &&
                ifOp->hasAttr(kSCFElseRewrittenAttr));
     }
-    // Buffer ops already use scalar ptr + i32 offsets (BufferOpInterface),
-    // so they don't need pointer canonicalization.
+    // Buffer ops already use scalar ptr + i32 offsets (BufferOpInterface), but
+    // their scalar base can still be derived from a function pointer argument
+    // that was rewritten to a fat-pointer unrealized cast above. In that case
+    // the op is in opsToRewrite and must materialize the scalar base pointer.
     if (llvm::isa<triton::amdgpu::BufferLoadOp, triton::amdgpu::BufferStoreOp,
                   triton::amdgpu::BufferLoadToLocalOp>(op))
-      return true;
+      return !opsToRewrite.contains(op);
     return !opsToRewrite.contains(op);
   };
 
@@ -2047,6 +2049,11 @@ void TritonAMDGPUCanonicalizePointersPass::runOnOperation() {
   patterns.add<
       ConvertFuncOpArgsUnrealizedCasts, ConvertBroadcastOp, ConvertSplatOp,
       ConvertConvertLayoutOp, ConvertAddPtrOp, ConvertExtractSliceOp,
+      MaterializeFatPointer<triton::amdgpu::BufferLoadOp>,
+      MaterializeFatPointer<triton::amdgpu::BufferLoadToLocalOp, 1>,
+      MaterializeFatPointer<triton::amdgpu::BufferStoreOp, 1>,
+      MaterializeFatPointer<triton::amdgpu::BufferAtomicRMWOp>,
+      MaterializeFatPointer<triton::amdgpu::BufferAtomicCASOp>,
       MaterializeFatPointer<tt::AtomicCASOp>,
       MaterializeFatPointer<tt::AtomicRMWOp>,
       MaterializeFatPointer<tt::BitcastOp>, MaterializeFatPointer<tt::LoadOp>,

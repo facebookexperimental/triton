@@ -65,6 +65,42 @@ def require_tmem_scales_layout(src: tlx.buffered_tensor, _builder=None):
 
 
 @tl.builtin
+def require_layout(src, layout: tl.constexpr, _semantic=None):
+    """Require an explicit TLX/TritonGPU layout on a tensor or memdesc value."""
+    layout = tl._unwrap_if_constexpr(layout)
+    if not isinstance(layout, tlx.layout_encoding):
+        raise TypeError(f"`layout` must be a tlx.layout_encoding, got {type(layout).__name__}")
+    handle = _semantic.builder.create_require_layout(src.handle, layout.to_ir(_semantic.builder))
+    if isinstance(src, tlx.buffered_tensor):
+        if not isinstance(layout, tlx.shared_layout_encoding):
+            raise TypeError("buffered tensors require a shared layout encoding")
+        return tlx.buffered_tensor(handle, src.dtype, src.shape, src.type.num, src.type.storage, layout)
+    return tl.tensor(handle, src.type)
+
+
+@tl.builtin
+def cast_preserve_layout(src, dtype: tl.constexpr, fp_downcast_rounding: tl.constexpr = None,
+                         bitcast: tl.constexpr = False, _semantic=None):
+    """Cast a tensor while preserving its current IR layout encoding."""
+    src = _semantic.to_tensor(src)
+    dtype = tl._unwrap_if_constexpr(dtype)
+    fp_downcast_rounding = tl._unwrap_if_constexpr(fp_downcast_rounding)
+    bitcast = tl._unwrap_if_constexpr(bitcast)
+    if src.type.is_block():
+        dst_ty = src.type.with_element_ty(dtype)
+    else:
+        dst_ty = dtype
+    rounding = None if bitcast else _semantic._str_to_rounding_mode(fp_downcast_rounding)
+    handle = _semantic.builder.create_layout_preserving_cast(
+        src.handle,
+        dst_ty.to_ir(_semantic.builder),
+        rounding,
+        bitcast,
+    )
+    return tl.tensor(handle, dst_ty)
+
+
+@tl.builtin
 def require_amd_wmma_layout(src, version: tl.constexpr = 3, transposed: tl.constexpr = True,
                             warp_bases: tl.constexpr = ((0, 2), (2, 0)), reg_bases: tl.constexpr = ((0, 1), (1, 0)),
                             instr_shape: tl.constexpr = (16, 16, 128), _semantic=None):
