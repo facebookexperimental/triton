@@ -25,6 +25,10 @@ def _verify_buffer_ops(ptr, offsets, mask=None, other=None):
         assert mask is not None, "when other is set, mask must also be set"
 
 
+def _value_or_empty(value):
+    return value.handle if value is not None else ir.value()
+
+
 @tl.builtin
 def buffer_load(ptr, offsets, mask=None, other=None, cache=None, _semantic=None):
     """
@@ -55,8 +59,8 @@ def buffer_load(ptr, offsets, mask=None, other=None, cache=None, _semantic=None)
         other = _semantic.cast(other, ptr.type.scalar.element_ty)
         offsets, other = _semantic.broadcast_impl_value(offsets, other)
 
-    mask_handle = mask.handle if mask is not None else None
-    other_handle = other.handle if other is not None else None
+    mask_handle = _value_or_empty(mask)
+    other_handle = _value_or_empty(other)
     cache_modifier = _semantic._str_to_load_cache_modifier(cache) if cache else ir.CACHE_MODIFIER.NONE
 
     ret_ty = tl.block_type(ptr.type.scalar.element_ty, offsets.type.get_block_shapes())
@@ -93,7 +97,7 @@ def buffer_store(stored_value, ptr, offsets, mask=None, cache=None, _semantic=No
         offsets, stored_value = _semantic.broadcast_impl_value(offsets, stored_value)
         offsets, mask = _semantic.broadcast_impl_value(offsets, mask)
 
-    mask_handle = mask.handle if mask is not None else None
+    mask_handle = _value_or_empty(mask)
     cache_modifier = _semantic._str_to_store_cache_modifier(cache) if cache else ir.CACHE_MODIFIER.NONE
 
     _semantic.builder.create_buffer_store(stored_value.handle, ptr.handle, offsets.handle, mask_handle, cache_modifier)
@@ -138,8 +142,8 @@ def buffer_load_to_local(
         other = _semantic.cast(other, ptr.type.scalar.element_ty)
         offsets, other = _semantic.broadcast_impl_value(offsets, other)
 
-    mask_handle = mask.handle if mask is not None else None
-    other_handle = other.handle if other is not None else None
+    mask_handle = _value_or_empty(mask)
+    other_handle = _value_or_empty(other)
     cache_mod = _semantic._str_to_load_cache_modifier(cache_modifier) if cache_modifier else ir.CACHE_MODIFIER.NONE
 
     handle = _semantic.builder.create_buffer_load_to_local(dest.handle, ptr.handle, offsets.handle, mask_handle,
@@ -352,8 +356,8 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
             raise TypeError(f"`layout` must be a tlx.shared_layout_encoding, got {type(layout).__name__}")
         layout_handle = layout.to_ir(_semantic.builder)
 
-    alias_handle = None
-    shared_buffer_handle = None
+    alias_handle = ir.value()
+    shared_buffer_handle = ir.value()
     if reuse:
         if isinstance(reuse, tlx.buffered_tensor):
             # Legacy behavior: reuse an existing buffer's memory
@@ -721,8 +725,8 @@ def async_load(
             _semantic.builder.create_async_load(
                 src.handle,
                 result.handle,
-                None,
-                None,
+                ir.value(),
+                ir.value(),
                 cache,
                 eviction,
                 is_volatile,
@@ -763,13 +767,13 @@ def async_load(
         _semantic.builder.create_async_load(
             src.handle,
             result.handle,
-            mask.handle if mask else None,
-            other.handle if other else None,
+            _value_or_empty(mask),
+            _value_or_empty(other),
             cache,
             eviction,
             is_volatile,
-            None,
-            None,
+            ir.value(),
+            ir.value(),
             False,
         ))
 
@@ -823,11 +827,11 @@ def local_load(
         _assert_blackwell_for_tmem(_semantic.builder.options.arch)
         tmem_compatible_layout_encoding = _create_tmem_compatible_tensor_layout_encoding(_semantic.builder, src)
         load_handle = _semantic.builder.create_tmem_load(src.handle, tmem_compatible_layout_encoding,
-                                                         token.handle if token else None)
+                                                         _value_or_empty(token))
         output = _semantic.builder.create_release_layout(load_handle)
         return tl.tensor(output, block_type)
     else:
-        output = _semantic.builder.create_local_load(src.handle, token.handle if token else None)
+        output = _semantic.builder.create_local_load(src.handle, _value_or_empty(token))
         result = tl.tensor(output, block_type)
         if relaxed:
             result.handle.set_attr("ttg.amdg.syncedViaAsyncWait", _semantic.builder.get_bool_attr(True))
@@ -1136,7 +1140,7 @@ def async_amd_descriptor_load(
         offsets_handles,
         result.handle,
         pred_handle,
-        None,
+        ir.value(),
     )
     return tlx.async_token(token_handle)
 
@@ -1261,7 +1265,7 @@ def async_amd_descriptor_store(
         desc.handle,
         offsets_handles,
         source.handle,
-        None,
+        ir.value(),
     )
 
 
