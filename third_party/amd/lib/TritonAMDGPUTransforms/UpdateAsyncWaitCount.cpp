@@ -70,14 +70,27 @@ int getNumberOfAsyncCopyInstructions(RankedTensorType globalType,
   }
   LinearLayout globalToSharedLayout =
       globalLayout.invertAndCompose(sharedLayout);
+
+  // If the warp dimension has free variables, not all warps execute this async
+  // copy — the lowering will predicate execution to canonical warps only (via
+  // emitRedundantThreadPredicate + emitBranch). Non-canonical warps branch over
+  // the buffer_load instructions entirely, so their vmcnt is not incremented.
+  auto kWarp = StringAttr::get(globalType.getContext(), "warp");
+  if (globalToSharedLayout.getFreeVariableMasks().lookup(kWarp) != 0) {
+    return 0;
+  }
   contig = std::min(contig, globalToSharedLayout.getNumConsecutiveInOut());
 
   if (mask)
     contig = std::min<int>(contig, axisInfo.getMaskAlignment(mask));
 
-  // Divide number of registers by contig to get the number of async intrinsics
-  int numberOfRegisters = globalToSharedLayout.getInDimSize(
-      StringAttr::get(globalType.getContext(), "register"));
+  // Divide number of registers by contig to get the number of async intrinsics.
+  // Strip zero bases from the register dimension first — a zero basis means
+  // multiple register indices map to the same offset, so no additional load
+  // instruction is generated.
+  auto kReg = StringAttr::get(globalType.getContext(), "register");
+  int numberOfRegisters =
+      globalToSharedLayout.removeZeroBasesAlongDim(kReg).getInDimSize(kReg);
   return std::max(1, numberOfRegisters / contig);
 }
 
@@ -420,9 +433,20 @@ struct TritonAMDGPUUpdateAsyncWaitCountPass
 
       auto v = [&]() -> int {
         using namespace triton::amdgpu;
-        // Load and store always emit 1 instrinsic
-        if (isa<AsyncTDMCopyGlobalToLocalOp, AsyncTDMCopyLocalToGlobalOp>(op)) {
-          return 1;
+        if (auto copyOp = dyn_cast<AsyncTDMCopyGlobalToLocalOp>(op)) {
+          auto smemTy = copyOp.getResult().getType();
+          int numWarps = ttg::lookupNumWarps(op);
+          auto [_, numInstr] =
+              mlir::LLVM::AMD::distributeTDMWarpsAlignToPartition(
+                  smemTy.getShape(), numWarps, smemTy.getEncoding());
+          return numInstr;
+        } else if (auto copyOp = dyn_cast<AsyncTDMCopyLocalToGlobalOp>(op)) {
+          auto smemTy = copyOp.getSrc().getType();
+          int numWarps = ttg::lookupNumWarps(op);
+          auto [_, numInstr] =
+              mlir::LLVM::AMD::distributeTDMWarpsAlignToPartition(
+                  smemTy.getShape(), numWarps, smemTy.getEncoding());
+          return numInstr;
         } else if (isa<AsyncTDMScatterOp, AsyncTDMGatherOp>(op)) {
           // For scatter and gather we need to get the count of TDM intrinsics
           // based on the row indices tensor type
