@@ -1283,6 +1283,50 @@ def test_async_amd_desc_store_compiles_gfx1250(device):
         "expected tensor_store_from_lds intrinsic in AMDGCN, got:\n" + amdgcn)
 
 
+@triton.jit
+def _update_tensor_descriptor_store_kernel(
+    a_ptr,
+    output_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    a_desc = tl.make_tensor_descriptor(
+        a_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        output_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+    smem = tlx.local_view(buf, 0)
+
+    tlx.async_amd_descriptor_load(a_desc, smem, [0, 0])
+    tlx.async_amd_descriptor_wait(0)
+    out_desc = tlx.update_tensor_descriptor(out_desc, add_offsets=[0, 0], clamp_bounds=True)
+    tlx.async_amd_descriptor_store(out_desc, smem)
+    tlx.async_amd_descriptor_wait(0)
+
+
+def test_update_tensor_descriptor_store_compiles_gfx1250(device):
+    compiled = compile_for_gfx1250(
+        _update_tensor_descriptor_store_kernel,
+        signature={"a_ptr": "*fp16", "output_ptr": "*fp16", "M": "i32", "N": "i32"},
+        constexprs={"BLOCK_M": 16, "BLOCK_N": 32},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.update_tensor_descriptor" in ttgir, ("expected update_tensor_descriptor in TTGIR, got:\n" + ttgir)
+    assert "clamp_bounds" in ttgir, ("expected clamp_bounds on update_tensor_descriptor in TTGIR, got:\n" + ttgir)
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir, (
+        "expected amdg.async_tdm_copy_local_to_global in TTGIR, got:\n" + ttgir)
+
+
 def test_async_amd_desc_store_correctness_gfx1250(device, fresh_triton_cache):
     """End-to-end: TDM load + TDM store round-trips A -> output on gfx1250 hw."""
     if not is_gfx1250_available():

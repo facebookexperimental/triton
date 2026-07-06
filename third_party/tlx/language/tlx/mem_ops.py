@@ -1080,6 +1080,63 @@ def _layouts_match(actual, expected):
     return False
 
 
+def _updated_tensor_descriptor(desc, handle):
+    if isinstance(desc, tl.tensor_descriptor):
+        return tl.tensor_descriptor(handle, list(desc.shape.values), list(desc.strides.values), desc.block_type)
+    return tl.tensor_descriptor_base(handle, desc.block_type)
+
+
+@tl.builtin
+def update_tensor_descriptor(
+    desc: tl.tensor_descriptor_base,
+    add_offsets: Optional[list[tl.tensor]] = None,
+    set_bounds: Optional[list[tl.tensor]] = None,
+    pred: tl.tensor = None,
+    clamp_bounds: tl.constexpr = False,
+    _semantic=None,
+) -> tl.tensor_descriptor_base:
+    """Update selected fields of an AMD TDM tensor descriptor.
+
+    This mirrors Gluon's ``gl.amd.gfx1250.tdm.update_tensor_descriptor``:
+    ``add_offsets`` advances the descriptor tile position, ``set_bounds``
+    rewrites descriptor bounds, ``pred`` rewrites the descriptor predicate, and
+    ``clamp_bounds=True`` derives edge-tile bounds from ``add_offsets``.
+    """
+    assert isinstance(desc, tl.tensor_descriptor_base)
+    if add_offsets is None and set_bounds is None and pred is None:
+        raise ValueError("tlx.update_tensor_descriptor requires at least one of add_offsets, set_bounds, pred")
+    clamp_bounds = bool(tl._unwrap_if_constexpr(clamp_bounds))
+    if clamp_bounds:
+        if add_offsets is None:
+            raise ValueError("tlx.update_tensor_descriptor: clamp_bounds requires add_offsets")
+        if set_bounds is not None:
+            raise ValueError("tlx.update_tensor_descriptor: clamp_bounds and set_bounds are mutually exclusive")
+
+    rank = len(desc.block_shape)
+    add_offset_handles = []
+    if add_offsets is not None:
+        assert len(add_offsets) == rank, f"expected {rank} add_offsets, but got {len(add_offsets)}"
+        add_offset_handles = _semantic._convert_to_ir_values(add_offsets, require_i64=False)
+    set_bounds_handles = []
+    if set_bounds is not None:
+        assert len(set_bounds) == rank, f"expected {rank} set_bounds, but got {len(set_bounds)}"
+        set_bounds_handles = _semantic._convert_to_ir_values(set_bounds, require_i64=False)
+
+    pred_handle = None
+    if pred is not None:
+        pred = _semantic.to_tensor(pred)
+        pred_handle = pred.handle
+
+    handle = _semantic.builder.create_update_tensor_descriptor(
+        desc.handle,
+        add_offset_handles,
+        set_bounds_handles,
+        pred_handle,
+        clamp_bounds,
+    )
+    return _updated_tensor_descriptor(desc, handle)
+
+
 @tl.builtin
 def async_amd_descriptor_load(
     desc: tl.tensor_descriptor_base,
@@ -1206,7 +1263,7 @@ def async_amd_descriptor_load_group(
 def async_amd_descriptor_store(
     desc: tl.tensor_descriptor_base,
     source: tlx.buffered_tensor,
-    offsets: list[tl.tensor],
+    offsets: Optional[list[tl.tensor]] = None,
     clamp_bounds: tl.constexpr = False,
     _semantic=None,
 ) -> None:
@@ -1239,7 +1296,8 @@ def async_amd_descriptor_store(
     assert is_amd_tdm_target(arch), (
         f"async_amd_descriptor_store is only available on AMD TDM-capable targets, got arch={arch}")
     ndim = len(desc.block_shape)
-    assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
+    if offsets is not None:
+        assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
     # Auto-propagated layouts (no `layout=` passed to local_alloc) are silently
     # rewritten by TLXInsertRequireLayout. Explicit padded layouts are preserved
@@ -1259,7 +1317,7 @@ def async_amd_descriptor_store(
                 stacklevel=2,
             )
 
-    offsets_handles = _semantic._convert_to_ir_values(offsets, require_i64=False)
+    offsets_handles = [] if offsets is None else _semantic._convert_to_ir_values(offsets, require_i64=False)
     _semantic.builder.create_async_tdm_copy_local_to_global(
         desc.handle,
         offsets_handles,

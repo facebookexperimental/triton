@@ -274,37 +274,48 @@ def _mxgemm_issue_split_loads(
 
     if TDM_FUSION == "partial":
         tl.static_assert(WITH_A_SCALE, "split partial TDM fusion requires WITH_A_SCALE")
+        a0_load_desc = tlx.update_tensor_descriptor(a0_desc, add_offsets=a_offsets)
+        a1_load_desc = tlx.update_tensor_descriptor(a1_desc, add_offsets=a_offsets)
+        b0_load_desc = tlx.update_tensor_descriptor(b0_desc, add_offsets=b_offsets)
+        b1_load_desc = tlx.update_tensor_descriptor(b1_desc, add_offsets=b_offsets)
+        a_scale_load_desc = tlx.update_tensor_descriptor(a_scale_desc, add_offsets=scale_offsets)
+        b_scale_load_desc = tlx.update_tensor_descriptor(b_scale_desc, add_offsets=scale_offsets)
         tlx.async_amd_descriptor_load_group(
-            [a0_desc, b0_desc],
+            [a0_load_desc, b0_load_desc],
             [tlx.local_view(a0_buf, slot), tlx.local_view(b0_buf, slot)],
-            [a_offsets, b_offsets],
+            [[0, 0], [0, 0]],
             [0b0101, 0b1010],
             preds=[pred, pred],
         )
         tlx.async_amd_descriptor_load_group(
-            [a1_desc, b1_desc],
+            [a1_load_desc, b1_load_desc],
             [tlx.local_view(a1_buf, slot), tlx.local_view(b1_buf, slot)],
-            [a_offsets, b_offsets],
+            [[0, 0], [0, 0]],
             [0b0101, 0b1010],
             preds=[pred, pred],
         )
         tlx.async_amd_descriptor_load_group(
-            [a_scale_desc, b_scale_desc],
+            [a_scale_load_desc, b_scale_load_desc],
             [tlx.local_view(a_scale_buf, slot), tlx.local_view(b_scale_buf, slot)],
-            [scale_offsets, scale_offsets],
+            [[0, 0], [0, 0]],
             [0b0101, 0b1010],
             preds=[pred, pred],
         )
     else:
         tl.static_assert(TDM_FUSION == "none", "TDM_SPLIT supports TDM_FUSION values: none, partial")
-        _mxgemm_issue_load_a_scale(a_scale_desc, a_scale_buf, load_idx, pred, BLOCK_K_SCALE_PRESHUFFLED, NUM_BUFFERS,
-                                   SCALE_PRESHUFFLE, WITH_A_SCALE)
-        _mxgemm_issue_load_b_scale(b_scale_desc, b_scale_buf, load_idx, pred, BLOCK_K_SCALE_PRESHUFFLED, NUM_BUFFERS,
-                                   SCALE_PRESHUFFLE)
-        tlx.async_amd_descriptor_load(a0_desc, tlx.local_view(a0_buf, slot), a_offsets, pred=pred)
-        tlx.async_amd_descriptor_load(b0_desc, tlx.local_view(b0_buf, slot), b_offsets, pred=pred)
-        tlx.async_amd_descriptor_load(a1_desc, tlx.local_view(a1_buf, slot), a_offsets, pred=pred)
-        tlx.async_amd_descriptor_load(b1_desc, tlx.local_view(b1_buf, slot), b_offsets, pred=pred)
+        if WITH_A_SCALE:
+            a_scale_load_desc = tlx.update_tensor_descriptor(a_scale_desc, add_offsets=scale_offsets)
+            tlx.async_amd_descriptor_load(a_scale_load_desc, tlx.local_view(a_scale_buf, slot), [0, 0], pred=pred)
+        b_scale_load_desc = tlx.update_tensor_descriptor(b_scale_desc, add_offsets=scale_offsets)
+        a0_load_desc = tlx.update_tensor_descriptor(a0_desc, add_offsets=a_offsets)
+        a1_load_desc = tlx.update_tensor_descriptor(a1_desc, add_offsets=a_offsets)
+        b0_load_desc = tlx.update_tensor_descriptor(b0_desc, add_offsets=b_offsets)
+        b1_load_desc = tlx.update_tensor_descriptor(b1_desc, add_offsets=b_offsets)
+        tlx.async_amd_descriptor_load(b_scale_load_desc, tlx.local_view(b_scale_buf, slot), [0, 0], pred=pred)
+        tlx.async_amd_descriptor_load(a0_load_desc, tlx.local_view(a0_buf, slot), [0, 0], pred=pred)
+        tlx.async_amd_descriptor_load(b0_load_desc, tlx.local_view(b0_buf, slot), [0, 0], pred=pred)
+        tlx.async_amd_descriptor_load(a1_load_desc, tlx.local_view(a1_buf, slot), [0, 0], pred=pred)
+        tlx.async_amd_descriptor_load(b1_load_desc, tlx.local_view(b1_buf, slot), [0, 0], pred=pred)
     return load_idx + 1
 
 

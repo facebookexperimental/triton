@@ -607,6 +607,33 @@ void init_triton_tlx_ir(py::module_ &m) {
               unsigned pendings) -> mlir::Value {
              return self.create<amdgpu::AsyncTDMWait>(asyncTokens, pendings);
            })
+      .def(
+          "create_update_tensor_descriptor",
+          [](TritonOpBuilder &self, Value desc, std::vector<Value> addOffsets,
+             std::vector<Value> setBounds, std::optional<Value> pred,
+             bool clampBounds) -> mlir::Value {
+            Value pred32;
+            if (pred) {
+              pred32 = *pred;
+              if (auto intTy = dyn_cast<IntegerType>(pred32.getType())) {
+                if (intTy.getWidth() == 1) {
+                  pred32 = self.create<arith::ExtUIOp>(
+                      self.getBuilder().getI32Type(), pred32);
+                }
+              }
+            }
+            Value updatedDesc =
+                self.create<amdgpu::UpdateTensorDescriptorOp>(
+                        desc.getType(), desc, ValueRange(addOffsets),
+                        ValueRange(setBounds), pred32, /*clamp_bounds=*/false)
+                    .getResult();
+            if (clampBounds)
+              updatedDesc.getDefiningOp()->setAttr(
+                  "clamp_bounds", self.getBuilder().getUnitAttr());
+            return updatedDesc;
+          },
+          py::arg("desc"), py::arg("addOffsets"), py::arg("setBounds"),
+          py::arg("pred").none() = py::none(), py::arg("clampBounds") = false)
       // AMD-only: emit amdgpu.async_tdm_copy_local_to_global directly from
       // the user's local buffer. The op has no `pred` operand (unlike the
       // load) and returns no SSA value, so `AsyncTDMWait` synchronizes via
@@ -615,14 +642,17 @@ void init_triton_tlx_ir(py::module_ &m) {
           "create_async_tdm_copy_local_to_global",
           [](TritonOpBuilder &self, Value desc, std::vector<Value> indices,
              Value src, std::optional<Value> barrier, bool clampBounds) {
-            Value updatedDesc =
-                self.create<amdgpu::UpdateTensorDescriptorOp>(
-                        desc.getType(), desc, ValueRange(indices), ValueRange(),
-                        Value(), /*clamp_bounds=*/false)
-                    .getResult();
-            if (clampBounds)
-              updatedDesc.getDefiningOp()->setAttr(
-                  "clamp_bounds", self.getBuilder().getUnitAttr());
+            Value updatedDesc = desc;
+            if (!indices.empty() || clampBounds) {
+              updatedDesc =
+                  self.create<amdgpu::UpdateTensorDescriptorOp>(
+                          desc.getType(), desc, ValueRange(indices),
+                          ValueRange(), Value(), /*clamp_bounds=*/false)
+                      .getResult();
+              if (clampBounds)
+                updatedDesc.getDefiningOp()->setAttr(
+                    "clamp_bounds", self.getBuilder().getUnitAttr());
+            }
             self.create<amdgpu::AsyncTDMCopyLocalToGlobalOp>(
                 updatedDesc, src, barrier.value_or(Value()));
           },
