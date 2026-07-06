@@ -146,10 +146,19 @@ What worked end-to-end:
 
 - DDG grows 31→55 nodes exactly as predicted; cpsat solves II=2396, Rau
   II=2487 (recurrence-bound; MinII ~1198 was the resource floor).
-- The joint-v1 partitioner on the Rau schedule produced a perfect
-  ping-pong-SHAPED 6-WG partition from first principles — 2 TMA, 2 TC,
-  2 softmax WGs, each sub-tile's chain in its own WG. The structural
-  half of the emergence criterion is met.
+- The partitioner produced a perfect ping-pong-SHAPED 6-WG partition
+  from first principles — 2 TMA, 2 TC, 2 softmax WGs, each sub-tile's
+  chain in its own WG. The structural half of the emergence criterion
+  is met. [CORRECTED 2026-07-06: re-derivation shows this partition is
+  the HEURISTIC scoreCandidate partitioner's output (byte-identical
+  warp groups, same partition_cost 2509.994) — the winning kernel is
+  Rau schedule + heuristic partition, no CP-SAT anywhere in its
+  production. joint-v1 on the same graph chooses a DIFFERENT 5-WG
+  partition ([1,1,1,4,4]: both MMA dots in ONE TC warp — the
+  tutorial's in-order single-MMA-WG shape). This is the first case
+  where heuristic and joint diverge; the joint variant is unemitted/
+  unmeasured and worth a follow-up, since the dissection suggests
+  single-MMA-WG issue order is exactly the anti-phase mechanism.]
 - After hand-patching the emitted kernel (below), correctness PASSES.
 
 Emitter: three defect classes, hand-patch spec committed as the diff

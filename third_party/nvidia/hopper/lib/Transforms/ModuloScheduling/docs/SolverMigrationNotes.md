@@ -493,8 +493,11 @@ parallel.
    classes (singleton cross-region channels, per-WG-deduped arrive
    counts vs per-MMA hardware arrives, dropped M_lse epilogue stores —
    the hand-patch diff is the emitter spec). Partition side of the
-   emergence criterion met (joint-v1 rediscovered a 6-WG
-   ping-pong-shaped partition). As emitted: 206.7 TFLOPS.]**
+   emergence criterion met — CORRECTED: the 6-WG ping-pong-shaped
+   partition is the HEURISTIC partitioner's own output (verified
+   byte-identical; the winning kernel is Rau + heuristic end to end);
+   joint-v1 diverges on this graph to an unmeasured 5-WG
+   single-MMA-WG variant. As emitted: 206.7 TFLOPS.]**
    **[ROUTE A ACCEPTANCE MET same day — 703–720 TFLOPS at (1,32,8192),
    ABOVE the 665–666 single-tile plateau. The clock64 replay
    (SubTilingDesign.md "Where the 11.3K cycles actually went") showed
