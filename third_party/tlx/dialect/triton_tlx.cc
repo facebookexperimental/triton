@@ -77,22 +77,6 @@ static void ensureModuleBlockedLayoutContext(TritonOpBuilder &self,
   moduleOp->setAttr(ttg::AttrNumWarpsName, b.getI32IntegerAttr(numWarps));
 }
 
-static Type getElementType(Type type) {
-  if (auto rankedType = dyn_cast<RankedTensorType>(type))
-    return rankedType.getElementType();
-  return type;
-}
-
-static Type getLayoutPreservingType(Value src, Type dstType) {
-  auto srcType = src.getType();
-  auto dstElementType = getElementType(dstType);
-  if (auto srcTensorType = dyn_cast<RankedTensorType>(srcType)) {
-    return RankedTensorType::get(srcTensorType.getShape(), dstElementType,
-                                 srcTensorType.getEncoding());
-  }
-  return dstElementType;
-}
-
 void init_triton_tlx_ir(py::module_ &m) {
   auto *builder_cls = ir::getBuilderClass();
   builder_cls
@@ -156,36 +140,6 @@ void init_triton_tlx_ir(py::module_ &m) {
              } else {
                throw std::runtime_error("Unsupported type");
              }
-           })
-      .def("create_layout_preserving_cast",
-           [](TritonOpBuilder &self, Value &src, Type &dstType,
-              std::optional<tt::RoundingMode> roundingMode,
-              bool bitcast) -> Value {
-             auto resultType = getLayoutPreservingType(src, dstType);
-             auto srcElementType = getElementType(src.getType());
-             auto dstElementType = getElementType(resultType);
-             if (srcElementType == dstElementType)
-               return src;
-             if (bitcast)
-               return self.create<tt::BitcastOp>(resultType, src);
-             if (isa<FloatType>(srcElementType) &&
-                 isa<FloatType>(dstElementType)) {
-               if (roundingMode.has_value()) {
-                 auto roundingAttr = tt::RoundingModeAttr::get(
-                     self.getContext(), roundingMode.value());
-                 return self.create<tt::FpToFpOp>(resultType, src,
-                                                  roundingAttr);
-               }
-               unsigned srcWidth = srcElementType.getIntOrFloatBitWidth();
-               unsigned dstWidth = dstElementType.getIntOrFloatBitWidth();
-               if (srcWidth > dstWidth)
-                 return self.create<arith::TruncFOp>(resultType, src);
-               if (srcWidth < dstWidth)
-                 return self.create<arith::ExtFOp>(resultType, src);
-               return self.create<tt::BitcastOp>(resultType, src);
-             }
-             throw std::runtime_error(
-                 "Unsupported layout-preserving cast element types");
            })
       .def("create_release_layout",
            [](TritonOpBuilder &self, Value &v) -> Value {

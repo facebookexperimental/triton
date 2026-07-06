@@ -57,8 +57,8 @@ from .mem_ops import (
     subslice,
     tmem_copy,
 )
-from .mma_ops import (async_dot, async_dot_scaled, async_dot_wait, cast_preserve_layout, dot_scaled,
-                      require_amd_wmma_layout, require_layout, tcgen05_commit)
+from .mma_ops import (async_dot, async_dot_scaled, async_dot_wait, dot_scaled, release_layout, require_amd_wmma_layout,
+                      require_layout, tcgen05_commit)
 from .types import (
     async_token,
     amd_mfma_layout_encoding,
@@ -185,7 +185,7 @@ __all__ = [
     # mma_ops
     "dot_scaled",
     "require_layout",
-    "cast_preserve_layout",
+    "release_layout",
     "require_amd_wmma_layout",
     "async_dot",
     "async_dot_scaled",

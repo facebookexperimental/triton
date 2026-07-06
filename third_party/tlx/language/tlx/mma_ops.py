@@ -79,25 +79,10 @@ def require_layout(src, layout: tl.constexpr, _semantic=None):
 
 
 @tl.builtin
-def cast_preserve_layout(src, dtype: tl.constexpr, fp_downcast_rounding: tl.constexpr = None,
-                         bitcast: tl.constexpr = False, _semantic=None):
-    """Cast a tensor while preserving its current IR layout encoding."""
+def release_layout(src, _semantic=None):
+    """Release an explicit register layout so following user-level ops use normal layout assignment."""
     src = _semantic.to_tensor(src)
-    dtype = tl._unwrap_if_constexpr(dtype)
-    fp_downcast_rounding = tl._unwrap_if_constexpr(fp_downcast_rounding)
-    bitcast = tl._unwrap_if_constexpr(bitcast)
-    if src.type.is_block():
-        dst_ty = src.type.with_element_ty(dtype)
-    else:
-        dst_ty = dtype
-    rounding = None if bitcast else _semantic._str_to_rounding_mode(fp_downcast_rounding)
-    handle = _semantic.builder.create_layout_preserving_cast(
-        src.handle,
-        dst_ty.to_ir(_semantic.builder),
-        rounding,
-        bitcast,
-    )
-    return tl.tensor(handle, dst_ty)
+    return tl.tensor(_semantic.builder.create_release_layout(src.handle), src.type)
 
 
 @tl.builtin

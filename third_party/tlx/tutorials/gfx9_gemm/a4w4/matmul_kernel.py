@@ -377,12 +377,12 @@ def _a4w4_kernel(
     c_right_offsets = tl.add(c_left_offsets, c_right_delta, sanitize_overflow=False)
     c_tile_base = c_ptr + pid_m * BLOCK_M * stride_cm
     c_left_offsets = tlx.require_layout(c_left_offsets, store_layout_c)
-    c_left = tlx.require_layout(tlx.cast_preserve_layout(acc_left, c_ptr.dtype.element_ty), store_layout_c)
+    c_left = tlx.require_layout(tlx.release_layout(acc_left).to(c_ptr.dtype.element_ty), store_layout_c)
     tlx.buffer_store(c_left, c_tile_base, c_left_offsets)
 
     acc_right = tlx.dot_scaled(a_next, a_sc_reg_buf2, "e2m1", b_right, b_sc_right_reg_buf2, "e2m1", acc_right)
     c_right_offsets = tlx.require_layout(c_right_offsets, store_layout_c)
-    c_right = tlx.require_layout(tlx.cast_preserve_layout(acc_right, c_ptr.dtype.element_ty), store_layout_c)
+    c_right = tlx.require_layout(tlx.release_layout(acc_right).to(c_ptr.dtype.element_ty), store_layout_c)
     tlx.buffer_store(c_right, c_tile_base, c_right_offsets)
 
 
