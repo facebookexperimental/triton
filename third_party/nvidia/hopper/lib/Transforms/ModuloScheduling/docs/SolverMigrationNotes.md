@@ -494,13 +494,22 @@ parallel.
    counts vs per-MMA hardware arrives, dropped M_lse epilogue stores —
    the hand-patch diff is the emitter spec). Partition side of the
    emergence criterion met (joint-v1 rediscovered a 6-WG
-   ping-pong-shaped partition). Perf: 206.7 TFLOPS — the two sub-tile
-   chains schedule IN PHASE (tmem_loads 128 cyc apart) and contend on
-   the per-SM TMEM port/SFU, which the model does not price; measured
-   11.3K cyc/iter vs modeled II 2487. NEXT: shared-across-WG engine
-   reservations in the model (emergent anti-phase), then the emitter
-   multi-instance generalization, then re-measure. The 1197-TFLOPS
-   tutorial measurement keeps the design-point hypothesis alive.]**
+   ping-pong-shaped partition). As emitted: 206.7 TFLOPS.]**
+   **[ROUTE A ACCEPTANCE MET same day — 703–720 TFLOPS at (1,32,8192),
+   ABOVE the 665–666 single-tile plateau. The clock64 replay
+   (SubTilingDesign.md "Where the 11.3K cycles actually went") showed
+   the dominant cost was REGISTER SPILLS, not TMEM contention: the
+   schedule hoisted each softmax WG's 128-reg acc tmem_load ~5000 cyc
+   ahead of its use; sinking it to the use site is worth ×2.7 alone
+   (206.7→557), P-bridge depth 2 and de-instrumentation the rest.
+   Supporting calibration: tmem_port_contention.py microbench (TMEM
+   round-trip 41 cyc + 4.2 cyc/KB; dual-WG interference ×1.33–1.48 —
+   real but second-order) and the 1197-TFLOPS tutorial dissection
+   (dedicated correction WG, ballot-gated rescale skip, in-order
+   single-MMA-WG anti-phase, TMEM aliasing). Work items re-ranked in
+   SubTilingDesign.md: (1) load-at-use emitter rule / register-liveness
+   in model, (2) emitter multi-instance generalization, (3) shared
+   engines, (4) tutorial-structure items toward 1197.]**
 5. **Default-flip gate (parallelizable):** a kernel corpus beyond
    case1-7, solve-time budget policy (keep the offline/autotune
    positioning), solver configs wired into run_regression.py, and the

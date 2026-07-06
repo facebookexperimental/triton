@@ -13,13 +13,16 @@ Assets for the sub-tiling experiment described in
   schedule (II=2487, 6-WG ping-pong-shaped partition). KNOWN BROKEN:
   fails at launch. Kept as the diff baseline.
 - `fa_subtiled_rau_handpatched.py` — the same kernel hand-patched to run
-  (correctness PASS; 206.7 TFLOPS at (1,32,8192)). The diff against the
-  raw file is the spec of the three emitter defect classes for
-  multi-instance graphs; see the file header. Run directly:
+  (correctness PASS; **703–720 TFLOPS at (1,32,8192)** — above the
+  665–666 single-tile plateau). The diff against the raw file is the
+  spec of the emitter defect classes for multi-instance graphs plus the
+  spill-inducing load-placement fix; see the file header. Run directly:
   `python fa_subtiled_rau_handpatched.py [--small] [--bench]`.
 
-Headline result: correct end-to-end sub-tiled solver kernel achieved,
-but 206.7 TFLOPS vs the 665 plateau — the two sub-tile chains execute in
-lockstep and contend on the per-SM TMEM port/SFU, which the latency
-model does not price (no shared-across-WG engine). Next steps live in
-SubTilingDesign.md.
+Headline result: the Route A acceptance criterion is MET — the
+sub-tiled solver kernel beats every committed single-tile config. The
+decisive fix was register live-range, not TMEM contention: the emitted
+schedule hoisted each softmax WG's 128-reg acc tmem_load ~5000 cycles
+ahead of its use, and the resulting ptxas spills inflated the iteration
+3.1× (206.7 TFLOPS as emitted). Full breakdown, microbench numbers, and
+the re-ranked model/emitter work items live in SubTilingDesign.md.

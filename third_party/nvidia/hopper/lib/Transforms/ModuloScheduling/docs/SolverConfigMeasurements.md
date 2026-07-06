@@ -73,3 +73,34 @@ stacks +2% (the ~665 TFLOPS plateau, 4th independent reproduction).
 | case5 2048³/4096³/8192³ | 1.00x / 1.00x / 0.99x | ad-hoc bench |
 | case6 (all shapes) | 1.00x | 1638 / 2621 / 3084 GB/s |
 | case7 (all shapes) | 1.00x | parity |
+
+## Re-measurement (2026-07-06, second session) + sub-tiled kernel
+
+All five config tables above REPRODUCE within ±0.02x noise (fresh
+`solver_regression.py --keep` run + ad-hoc case5 bench; the only
+outside-noise entries are the same two as before: cpsat-alone case3
+canary 639.9/651 MISS, full/full-noguard 664.1/666.1 canary OK).
+
+New: the Route A sub-tiled FA kernel
+(`sched2tlx/examples/testing/subtiling/fa_subtiled_rau_handpatched.py`,
+BLOCK_M=256 as 2×128 sub-tiles, Rau schedule + joint partition + the
+five hand-fixes documented in its header) vs the committed case3
+kernel. Not a solver config yet — it stands in for the emitter/model
+work items in SubTilingDesign.md. Correctness PASS on all shapes.
+
+| case3 shape | Speedup | Sub-tiled | Committed |
+|---|---|---|---|
+| (1,4,512) | 0.73x | 17.5 TFLOPS | 23.9 TFLOPS |
+| (1,8,1024) | 0.73x | 95.3 TFLOPS | 131.5 TFLOPS |
+| (2,16,2048) | **1.25x** | 504.7 TFLOPS | 404.3 TFLOPS |
+| (1,16,4096) | **1.26x** | 593.8 TFLOPS | 469.3 TFLOPS |
+| (2,16,4096) | **1.13x** | 615.6 TFLOPS | 543.4 TFLOPS |
+| (1,32,8192) | **1.07x** | 695.4 TFLOPS | 651.2 TFLOPS |
+
+The shape profile is the wave-quantization signature of halving the
+grid (256-row tiles): at (1,4,512)/(1,8,1024) the sub-tiled grid is
+2/4 CTAs per head-batch — too few to fill 148 SMs — while the
+mid-range shapes gain the most (fewer, fuller waves) and the largest
+shape keeps +7% (695–720 TFLOPS across runs; the 4-run best is 719.9 =
+1.11x). A production autotuner would pick sub-tiled for N_CTX ≥ 2048
+and the single-tile kernel below that.
