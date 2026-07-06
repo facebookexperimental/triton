@@ -1144,7 +1144,7 @@ void init_triton_tlx_ir(py::module_ &m) {
              auto op = self.create<ttag::BufferLoadOp>(
                  resultType, ptr, offsets, Value() /*stride*/, cache,
                  mask.value_or(Value()), other.value_or(Value()));
-             op->setAttr("tlx.layout_is_explicit",
+             op->setAttr("tlx.preserve_buffer_layout",
                          self.getBuilder().getUnitAttr());
              return op.getResult();
            })
@@ -1155,7 +1155,7 @@ void init_triton_tlx_ir(py::module_ &m) {
              auto op = self.create<ttag::BufferStoreOp>(
                  storedValue, ptr, offsets, Value() /*stride*/, cache,
                  mask.value_or(Value()));
-             op->setAttr("tlx.layout_is_explicit",
+             op->setAttr("tlx.preserve_buffer_layout",
                          self.getBuilder().getUnitAttr());
            })
       .def("create_buffer_load_to_local",
