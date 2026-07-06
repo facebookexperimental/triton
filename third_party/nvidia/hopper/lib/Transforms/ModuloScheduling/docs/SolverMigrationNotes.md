@@ -81,6 +81,14 @@ solves with II as a variable or sweeps II exactly with feasibility as a
 constraint; reservation-table fragmentation is not a failure mode of a
 complete search. No replacement needed.
 
+**[DONE for the CP-SAT backend, 2026-07-05, branch
+hwu27/modulo-cpsat-backend]** `TRITON_USE_MODULO_SCHEDULE=cpsat` sweeps II
+from minII to the true feasibility bound (critical path + serial work)
+with no window; the window now applies to the heuristic paths only. The
+guard-2 canary resolved exactly as predicted: CP-SAT schedules layernorm
+AT MinII=517 — the perfect CUDA-row packing Rau's incomplete search could
+not find anywhere in [517, 527] — with maxStage 3 vs Rau's 4 at II=534.
+
 ## Guard 3: outer WS loops forced single-WG
 
 Where: `ModuloSchedulePass.cpp:applyGlobalWarpPartition` (the `sl.isOuter`
@@ -292,6 +300,35 @@ correctness.
 2. **Mid**: grow `ExhaustiveScheduler` into a CP-SAT backend for schedule +
    buffer depths only (partitioner stays), with cost normalization. This
    alone deletes guard 2.
+   **[DONE 2026-07-05, branch hwu27/modulo-cpsat-backend]**
+   `TRITON_USE_MODULO_SCHEDULE=cpsat` (opt-in; default path unchanged):
+   `CPSATScheduler.cpp` serializes the DDG + buffers and drives an OR-Tools
+   CP-SAT solver in a Python subprocess
+   (`python/triton/tools/modulo_cpsat.py`, same subprocess pattern as
+   LLMSchedulePass), then RE-VERIFIES the returned schedule in C++ — the
+   solver is advisory, never trusted. Model: modular NoOverlap per pipeline
+   (selfLatency reservations, wrap-around split), dependence + def-before-
+   use, SMEM depth budget decided JOINTLY with the schedule, TMEM as exact
+   cumulative (vs the exhaustive's conservative coloring), objective =
+   ExhaustiveScheduler's score. Rau runs first as a warm-start incumbent
+   hint. Cost normalization (Twill §5.2, side CP-SAT ILP, U=300 via
+   TRITON_MODULO_CPSAT_NORMALIZE) seeds the search — with interval
+   encoding it is an accelerator, not a tractability requirement (that
+   requirement is specific to time-indexed formulations).
+   Validation: case1/5/7 reproduce II=256 (+8192 outer) with identical
+   structure; case3 II=1459; case6 II=517 < Rau's 534 (guard-2 canary,
+   see above); all correctness PASS.
+   **Measured first-principle instance (KEEP THIS IN MIND FOR STEP 3):**
+   at equal II=1459, CP-SAT's model-optimal placement reorders case3 FA's
+   softmax rowsum after the P-tile trunc/store (the regPressure objective
+   strictly prefers it; a linear earliest-placement term cannot fix this —
+   it systematically prefers short-op-first on a serialized pipeline row,
+   639-cycle reduce vs 105-cycle trunc) and measures 598 vs 651 TFLOPS at
+   (1,32,8192) — an 8% loss the model cannot see. The recurrence-chain
+   criticality of the rowsum is exactly the kind of term the joint
+   formulation's objective must price before the solver is allowed to own
+   these decisions. Until then: cpsat is opt-in and the case3 canary gates
+   any default flip.
 3. **Long**: joint schedule+partition formulation (deletes guard 1, converts
    guard 3 to constraints), sub-tiling in front, streaming depths handed to
    the autotuner. Position it as an offline/autotune tool, not the default
