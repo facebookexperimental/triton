@@ -490,9 +490,7 @@ def G_plain_sum_looped(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr
         tmp0 = (r0_2 + 128 * x1).to(tl.int32)
         tmp1 = tl.full([1, 1], 5744, tl.int32)
         tmp2 = tmp0 < tmp1  # [scope: neither] boundary MASK (a predicate, not an address) — handled
-        tmp3 = tl.load(in_ptr0 + (x0 + 128 * r0_2 + 16384 * x1),
-                       r0_mask & tmp2 & xmask,
-                       eviction_policy='evict_first',
+        tmp3 = tl.load(in_ptr0 + (x0 + 128 * r0_2 + 16384 * x1), r0_mask & tmp2 & xmask, eviction_policy='evict_first',
                        other=0.0).to(tl.float32)
         tmp4 = tl.broadcast_to(tmp3, [XBLOCK, R0_BLOCK])
         # [scope: TTGIR] the cross-chunk running accumulate (arith.addf + select) is NOT a
