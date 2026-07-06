@@ -525,11 +525,16 @@ static void emitMMAAnnotations(scf::ForOp loop,
 // Step 3: Derive per-resource buffer depths from modulo schedule
 // ============================================================================
 
-// Blackwell sm_100 SMEM budget (reserve some for barriers/scratch).
-constexpr int kSmemBudgetBytesDefault = 228 * 1024;
+// Blackwell sm_100 SMEM budget. 232448 B (= 227 KB) is the per-block optin
+// limit the driver actually enforces (see _max_shared_mem_for_capability in
+// third_party/nvidia/backend/compiler.py and ExhaustiveScheduler.h, which
+// already used it); the previous 228*1024 here exceeded it by 1 KB, so a
+// plan sized exactly to budget could still fail at kernel load.
+constexpr int kSmemBudgetBytesDefault = 232448;
 
-/// Effective SMEM budget — defaults to 228 KB (B200) but can be overridden
-/// via TRITON_MODULO_SMEM_BUDGET_KB for A.7 demo / stress tests.
+/// Effective SMEM budget — defaults to the B200 per-block optin limit
+/// (232448 B = 227 KB) but can be overridden via TRITON_MODULO_SMEM_BUDGET_KB
+/// for A.7 demo / stress tests.
 static int smemBudget() {
   auto env = triton::tools::getStrEnv("TRITON_MODULO_SMEM_BUDGET_KB");
   if (!env.empty()) {
@@ -1951,6 +1956,19 @@ static void mergeNonOverlappingBuffers(ttg::ScheduleLoop &loop) {
 // Step 4.7: Warp Group Partitioning (latency-aware multi-pipeline clustering)
 // ============================================================================
 
+// Barrier-instruction issue costs (cycles the issuing warp is occupied).
+// Measured on B200 via third_party/tlx/tools/microbench/cross_wg_handoff.py
+// (2026-07-05, tlx.clock64 loops, two 4-warp WGs in one CTA, 2048 iters):
+//   named barrier (bar.arrive / bar.sync, 256 threads): 30 cyc one-way —
+//     the pre-measurement guess (30) was exact for named barriers.
+//   mbarrier arrive, back-to-back on one barrier: ~51 cyc/instruction
+//     (incl. ~6 cyc loop overhead) — mbarrier instructions stall the
+//     issuing warp ~1.5x longer than named-barrier instructions.
+constexpr int kMBarrierIssueCost = 45;
+constexpr int kNamedBarrierIssueCost = 30;
+// Blended pre-measurement constant, still used by computeSeparationCost's
+// legacy coupling metric (greedy pre-clustering) where the barrier kind is
+// unknown.
 constexpr int kBarrierOverhead = 30;
 
 /// Per-WG warp issue cost added by the barriers each op needs. Each barrier
@@ -1963,7 +1981,7 @@ constexpr int kBarrierOverhead = 30;
 /// stream. This helper estimates that per-WG barrier-issue cost so it can be
 /// folded into per-WG bottleneck.
 ///
-/// Heuristic per op IN this WG:
+/// Heuristic per op IN this WG (all mbarrier instructions):
 ///   TMA load (MEM):      +2 barriers (wait_empty + expect_bytes)
 ///   MMA (TC):            +2 barriers (operand wait_full × 2 typical)
 ///   tmem_store (CUDA):   +1 barrier  (tcgen05_commit)
@@ -1971,11 +1989,14 @@ constexpr int kBarrierOverhead = 30;
 ///                        +1 barrier  (wait_full on the consumer side or
 ///                                     barrier_arrive on the producer side
 ///                                     when not folded into the MMA's
-///                                     `mBarriers` HW-arrival list).
+///                                     `mBarriers` HW-arrival list),
+/// priced by the barrier kind insertCrossGroupBarriers will pick for the
+/// edge: TC producer → named barrier, anything else → mbarrier.
 static int computeWGBarrierCost(
     const SmallVector<unsigned> &nodeIds, const ttg::ScheduleLoop &loop,
     const llvm::SmallDenseMap<unsigned, int> &nodeToWg, int thisWg) {
-  int barriers = 0;
+  int mbarrierInsts = 0;
+  int namedInsts = 0;
   llvm::SmallDenseSet<unsigned, 8> nodeSet;
   for (unsigned nid : nodeIds)
     nodeSet.insert(nid);
@@ -1988,12 +2009,12 @@ static int computeWGBarrierCost(
     const auto &n = loop.nodes[nid];
     int freq = std::max(n.frequencyMultiplier, 1);
     if (n.pipeline == ttg::HWPipeline::TMA) {
-      barriers += 2 * freq; // wait_empty + expect_bytes
+      mbarrierInsts += 2 * freq; // wait_empty + expect_bytes
     } else if (n.pipeline == ttg::HWPipeline::TC) {
-      barriers += 2 * freq; // operand wait_full × ~2
+      mbarrierInsts += 2 * freq; // operand wait_full × ~2
     } else if (n.op && llvm::StringRef(n.op->getName().getStringRef())
                            .contains("tmem_store")) {
-      barriers += 1 * freq; // tcgen05_commit
+      mbarrierInsts += 1 * freq; // tcgen05_commit
     }
   }
   // Cross-WG edge: one wait/arrive on each side. Already counted above some
@@ -2008,10 +2029,16 @@ static int computeWGBarrierCost(
       continue;
     int freq = std::max(loop.nodes[edge.srcId].frequencyMultiplier,
                         loop.nodes[edge.dstId].frequencyMultiplier);
-    if (srcIt->second == thisWg || dstIt->second == thisWg)
-      barriers += freq; // 1 instruction on whichever side is `thisWg`
+    if (srcIt->second == thisWg || dstIt->second == thisWg) {
+      // Same kind selection as insertCrossGroupBarriers: TC → named.
+      if (loop.nodes[edge.srcId].pipeline == ttg::HWPipeline::TC)
+        namedInsts += freq;
+      else
+        mbarrierInsts += freq;
+    }
   }
-  return barriers * kBarrierOverhead;
+  return mbarrierInsts * kMBarrierIssueCost +
+         namedInsts * kNamedBarrierIssueCost;
 }
 
 /// Compute separation cost between each pair of pipelines.
@@ -2351,6 +2378,52 @@ constexpr double kDeficitPenalty = 0.5;
 // same-pipe ops; -0.001 only matters when costs are exactly equal.
 constexpr double kPerWGTieBreak = -0.001;
 
+// ── Second-order terms: channel-SMEM capacity + CTA co-residency ──────────
+//
+// B200 (sm_100a) per-SM occupancy limits for the co-residency bound. 64
+// warps/SM and 32 CTAs/SM per the vendored cuda_occupancy.h sm_100 entries;
+// the register file (kBlackwellSMRegs above) and the SMEM budget
+// (kSmemBudgetBytes()) are the existing constants.
+constexpr int kMaxWarpsPerSM = 64;
+constexpr int kMaxCTAsPerSM = 32;
+// Per-SM SMEM capacity and the driver's per-resident-CTA reservation, for
+// the co-residency bound (cuda_occupancy.h sm_100: sharedMemPerMultiprocessor
+// = 228 KB, reservedSharedMemPerBlock = 1 KB). Distinct from the per-block
+// optin limit kSmemBudgetBytes() used for the launchability gate.
+constexpr int64_t kSmemPerSMBytes = 228 * 1024;
+constexpr int64_t kReservedSmemPerCTABytes = 1024;
+
+// Hard penalty for candidates that cannot launch at all: predicted SMEM
+// (committed buffers + synthesized cross-WG channels) past the per-block
+// optin limit fails with OutOfResources at kernel load, and > 64 warps/CTA
+// exceeds the 2048-thread block limit. Large enough to dominate any
+// bottleneck difference, plus a proportional tail so that if EVERY
+// candidate is infeasible the least-bad one still wins deterministically.
+constexpr double kInfeasiblePenalty = 1e7;
+
+// Co-residency penalty weight (cost units per co-resident CTA short of
+// kCoResidencyTargetCTAs). DEFAULT 0 — deliberately: on the current
+// sched2tlx suite the term is not actionable, because (a) the persistent
+// cases launch grid == #SMs (1 CTA/SM by construction) and (b)
+// AllocateWarpGroups' maxnreg auto-fill sizes every WS kernel to the full
+// register file, pinning co-residency at 1 regardless of partition. The
+// bound is still computed and logged per candidate so a workload that CAN
+// co-reside (memory-bound kernels launched with >1 CTA/SM — e.g. case6's
+// handwritten reference launches num_sms*4) can enable it via
+// TRITON_MODULO_CORES_PENALTY without a rebuild. case1's committed
+// footprint sits 12.9% above the 2-CTA SMEM bound (the nearest real
+// target); see docs/SolverMigrationNotes.md.
+constexpr int kCoResidencyTargetCTAs = 2;
+static double coResidencyPenalty() {
+  auto env = triton::tools::getStrEnv("TRITON_MODULO_CORES_PENALTY");
+  if (!env.empty()) {
+    // Clamp: a negative weight would invert the term into a REWARD for
+    // low co-residency; malformed input parses to 0 (the default).
+    return std::max(0.0, std::atof(env.c_str()));
+  }
+  return 0.0;
+}
+
 static int regsForWarpCount(int numWarps) {
   if (numWarps >= 8)
     return 232;
@@ -2392,9 +2465,12 @@ struct ScoredCandidate {
   ClusterAssignment assignment;
   int bottleneckChainWall{0};
   int crossWgEdges{0};
-  int totalRegs{0};    // Σ over WGs of num_warps × 32 × regs (incl. default).
-  bool feasible{true}; // false = busts SM register budget.
-  double cost{0.0};    // +infinity when !feasible (excluded by min-cost pick).
+  int totalRegs{0}; // Σ over WGs of num_warps × 32 × regs (incl. default).
+  int64_t channelSmemBytes{0}; // predicted synthesized cross-WG channel SMEM
+  int coResidentCTAs{1};       // CTAs of this footprint that fit on one SM
+  bool feasible{true};         // false = busts register/SMEM/warp-slot budget
+  double cost{0.0}; // includes kInfeasiblePenalty when unlaunchable (SMEM
+                    // over budget / >64 warps), so min-cost pick avoids it.
 };
 
 /// Greedy agglomerative clustering. For each non-NONE op, BFS through the
@@ -2684,24 +2760,48 @@ static int64_t registerTensorElems(Operation *op) {
   return e;
 }
 
-/// Cycles to move `elems` register elements to/from SMEM — matches the
-/// LatencyModel's LocalLoad/LocalStore base `scaleByElements(105, elems)` with
-/// the 16384-elem (128x128) reference.
-static int smemMoveCost(int64_t elems) {
-  return static_cast<int>(105.0 * static_cast<double>(elems) / 16384.0);
+/// Cycles to move `bytes` of a register tensor through SMEM across a WG
+/// boundary (the store + load sides of a cross-WG channel). Measured on B200
+/// via third_party/tlx/tools/microbench/cross_wg_handoff.py (2026-07-05):
+/// a reg→SMEM→reg ping-pong between two 4-warp WGs costs, one-way,
+///   61 + 16.1 cyc/KB   (linear fit over 2KB..64KB fp32 tiles;
+///                        e.g. a 128x64 fp32 tile = 32KB → 560 cyc one-way)
+/// The fixed 61 is folded into kCrossWGRoundTripLatency below; this helper
+/// carries the size-dependent slope only. The previous form
+/// (105*elems/16384, which claimed to mirror the LatencyModel's
+/// local_load/store cost — the model actually returns a FLAT 105)
+/// underpriced the slope 5-10x.
+static int smemMoveCost(int64_t bytes) {
+  return static_cast<int>(16.0 * static_cast<double>(bytes) / 1024.0);
 }
 
-/// Cross-WG handshake round-trip LATENCY (cycles) for a register→SMEM→register
+/// Byte size of `op`'s (register) result tensor; 0 if not static/ranked.
+static int64_t registerTensorBytes(Operation *op) {
+  int64_t elems = registerTensorElems(op);
+  if (elems <= 0)
+    return 0;
+  auto rtt = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+  if (!rtt || !rtt.getElementType().isIntOrFloat())
+    return 0;
+  return elems * rtt.getElementType().getIntOrFloatBitWidth() / 8;
+}
+
+/// Fixed cross-WG handshake LATENCY (cycles) for a register→SMEM→register
 /// hop: the consumer WG's WaitBarrier blocks until the producer's store is
-/// visible and its ArriveBarrier fires, then the consumer loads back from SMEM.
-/// This is a *latency* stall (the consumer cannot proceed), dominated by the
-/// cross-WG mbarrier signal+wait round-trip plus SMEM store/load availability —
-/// NOT the cheap barrier *issue* occupancy (`kBarrierOverhead`). Sized from the
-/// FA-fwd softmax-cut measurement: the SMEM-move occupancy alone (~110 cyc)
-/// failed to de-rank the split partition, while charging the full handshake
-/// latency (~550 cyc here) flips it to the unified partition that measures
-/// ~2.5x faster on B200.
-constexpr int kCrossWGRoundTripLatency = 500;
+/// visible and its ArriveBarrier fires, then the consumer loads back from
+/// SMEM; with a depth-1 channel the producer also serializes on the
+/// empty-barrier return. Measured on B200 (cross_wg_handoff.py, 2026-07-05):
+///   92 cyc  signal-only one-way (mbarrier arrive → waiter wake-up)
+///   61 cyc  fixed part of the data-direction hand-off (store → arrive →
+///           wake → load; the size term is carried by smemMoveCost)
+/// Per steady-state iteration a depth-1 channel pays the data-forward
+/// hand-off plus the signal-only return: 61 + 92 ≈ 150.
+/// The previous value (500) was back-fitted from a single FA-fwd A/B before
+/// the slope was measured: it absorbed the then-underpriced 32KB move cost
+/// (real ~515 cyc, modeled ~52). With the measured slope the FA softmax-cut
+/// candidate now scores 150 + 16*32 ≈ 660 per iteration (vs ~550 under the
+/// old constants), so it stays de-ranked (canary: case3 ≥ 651 TFLOPS).
+constexpr int kCrossWGRoundTripLatency = 150;
 
 /// Accumulate the register→SMEM→register round-trip LATENCY (cycles) per WG for
 /// cross-WG edges that CUT A REGISTER COMPUTE CHAIN. The synthesized
@@ -2732,19 +2832,254 @@ accumulateCrossWGRoundTrip(const ttg::ScheduleLoop &loop,
     if (!isRegisterComputeValue(sN.op) ||
         !isRegisterComputeValue(loop.nodes[edge.dstId].op))
       continue;
-    int64_t elems = registerTensorElems(sN.op);
-    if (elems <= 0)
+    int64_t bytes = registerTensorBytes(sN.op);
+    if (bytes <= 0)
       continue;
     int freq = std::max(sN.frequencyMultiplier, 1);
-    // Consumer eats the full handshake latency + SMEM load occupancy, per iter.
-    int rt = kCrossWGRoundTripLatency + smemMoveCost(elems);
+    // Consumer eats the full handshake latency + SMEM move cost, per iter.
+    int rt = kCrossWGRoundTripLatency + smemMoveCost(bytes);
     rtPerWg[dIt->second] += rt * freq;
   }
+}
+
+/// Resolution of one cross-WG edge's data channel — the SINGLE source of
+/// truth shared by the real synthesis (insertCrossGroupBarriers) and the
+/// scoring-time predictor (predictChannelSmemBytes), so the two cannot
+/// drift.
+struct CrossWGChannelSpec {
+  unsigned pairedBuf{UINT_MAX};  // existing buffer the channel reuses
+  bool synthesize{false};        // true → a new SMEM channel buffer is needed
+  SmallVector<int64_t, 4> shape; // synthesized channel shape
+  unsigned elementBitWidth{0};
+  unsigned depth{1}; // reused buffer's count, or the floor/lifetime rule
+
+  // Same math as ScheduleBuffer::sizeBytes()*count (elems first, so
+  // sub-byte element types like fp4 don't truncate to zero).
+  int64_t synthesizedBytes() const {
+    if (!synthesize)
+      return 0;
+    int64_t elems = 1;
+    for (auto d : shape)
+      elems *= d;
+    return elems * elementBitWidth / 8 * depth;
+  }
+};
+
+static CrossWGChannelSpec resolveCrossWGChannel(const ttg::ScheduleLoop &loop,
+                                                const ttg::ScheduleEdge &edge,
+                                                bool loopHasTC) {
+  CrossWGChannelSpec spec;
+  const auto &src = loop.nodes[edge.srcId];
+  const auto &dst = loop.nodes[edge.dstId];
+
+  if (src.producesBuffer != UINT_MAX) {
+    spec.pairedBuf = src.producesBuffer;
+    spec.depth = loop.buffers[spec.pairedBuf].count;
+    return spec;
+  }
+  if (src.pipeline == ttg::HWPipeline::TMA && src.op) {
+    // TMA load → memdesc-rebind chain (local_alloc, memdesc_trans,
+    // memdesc_subview) → ... lowering step: the load's data lands in the
+    // SMEM region the downstream `local_alloc` defines. There's no
+    // register intermediate — the load writes directly to that SMEM (TMA
+    // hardware path). So instead of synthesizing a separate staging
+    // buffer for this cross-WG edge (which would double the SMEM cost
+    // for K/V tiles when MEM and TC end up in different WGs), walk
+    // through the metadata-rebind chain to find the downstream node that
+    // owns the actual data buffer, and reuse it. The TMA's completion
+    // barrier is the same mbarrier that fires when the destination SMEM
+    // is full — no extra buffer required.
+    llvm::SmallDenseSet<unsigned, 4> seen;
+    seen.insert(edge.srcId);
+    SmallVector<unsigned, 4> stack;
+    stack.push_back(edge.srcId);
+    while (!stack.empty() && spec.pairedBuf == UINT_MAX) {
+      unsigned cur = stack.pop_back_val();
+      for (const auto &e : loop.edges) {
+        if (e.srcId != cur || !seen.insert(e.dstId).second)
+          continue;
+        const auto &dn = loop.nodes[e.dstId];
+        if (dn.producesBuffer != UINT_MAX &&
+            loop.buffers[dn.producesBuffer].kind == ttg::MemoryKind::SMEM) {
+          spec.pairedBuf = dn.producesBuffer;
+          spec.depth = loop.buffers[spec.pairedBuf].count;
+          break;
+        }
+        // Continue walking through metadata-rebind ops (zero-latency
+        // NONE pipeline whose result is a memdesc).
+        if (dn.op && dn.op->getNumResults() == 1 &&
+            isa<ttg::MemDescType>(dn.op->getResult(0).getType())) {
+          stack.push_back(e.dstId);
+        }
+      }
+    }
+    if (spec.pairedBuf != UINT_MAX)
+      return spec;
+  }
+
+  // Register-typed cross-WG flow (e.g. FA's alpha 256-vector or softmax→TC
+  // P-tile bridge): the value must be staged through a synthesized SMEM
+  // channel.
+  //
+  // Channel depth. Default: depth-2 for the TMA-load→compute channel of a
+  // TC-free pipelined loop (load warp prefetches one iteration ahead);
+  // depth-1 for other register hand-offs. Deepening register-consumer
+  // channels beyond that measured 6x SLOWER on FA (the P-tile bridge's
+  // extra SMEM + barrier traffic broke the softmax/MMA pingpong), so the
+  // lifetime rule below is scoped to async TMA-STORE consumers only.
+  //
+  // TMA-store consumers get the same `lifetime / II + 1` rule
+  // computeBufferCount applies to data buffers, with the hand-off
+  // spanning src's write to dst's completion (dst.latency included: the
+  // store holds its slot until the transfer drains). A store channel
+  // whose lifetime exceeds II must be double-buffered or the producer WG
+  // serializes on the store WG's drain every iteration — exactly the
+  // layernorm compute→store stall the fixed depth-1 rule produced (0.53x
+  // of handwritten). Store channels short relative to II (GEMM outer-loop
+  // epilogues) keep depth 1, same as before.
+  {
+    unsigned floorDepth =
+        (!loopHasTC && src.pipeline == ttg::HWPipeline::TMA) ? 2u : 1u;
+    unsigned lifetimeDepth = 1;
+    bool dstIsTMAStore =
+        dst.op &&
+        isa<tt::DescriptorStoreOp, ttng::AsyncTMACopyLocalToGlobalOp>(dst.op);
+    if (dstIsTMAStore && loop.II > 0) {
+      int chanLifetime =
+          std::max(0, (dst.cycle + std::max(dst.latency, 0)) - src.cycle);
+      lifetimeDepth = static_cast<unsigned>(chanLifetime / loop.II + 1);
+    }
+    spec.depth = std::max(lifetimeDepth, floorDepth);
+  }
+  // Derive shape + element width from the producer's result type.
+  if (src.op && src.op->getNumResults() > 0) {
+    Type resTy = src.op->getResult(0).getType();
+    auto setFromShaped = [&](llvm::ArrayRef<int64_t> shape, Type elemTy) {
+      if (!elemTy.isIntOrFloat())
+        return;
+      for (auto d : shape) {
+        if (d <= 0 || ShapedType::isDynamic(d))
+          return;
+      }
+      for (auto d : shape)
+        spec.shape.push_back(d);
+      spec.elementBitWidth = elemTy.getIntOrFloatBitWidth();
+    };
+    if (auto memDesc = dyn_cast<ttg::MemDescType>(resTy))
+      setFromShaped(memDesc.getShape(), memDesc.getElementType());
+    else if (auto tt = dyn_cast<RankedTensorType>(resTy))
+      setFromShaped(tt.getShape(), tt.getElementType());
+  }
+  // No usable shape (scalar or unknown) → signal-only barrier, no buffer.
+  spec.synthesize = !spec.shape.empty();
+  return spec;
+}
+
+/// Predict the SMEM bytes `insertCrossGroupBarriers` will SYNTHESIZE for a
+/// candidate's cross-WG channels. The channels do not exist at scoring time
+/// (they are created only for the committed winner), so without this term a
+/// partition whose channels push total SMEM past the per-block limit scores
+/// as if it were free and then fails with OutOfResources at kernel load —
+/// the budget reducers run before partitioning and never see channels.
+///
+/// Uses the same resolveCrossWGChannel as the synthesis; the only remaining
+/// divergence is inherent to scoring time: the candidate's nodeToWg covers
+/// clustered (non-NONE) nodes, while the final assignment also propagates
+/// infra ops (demoteScalarArithToInfra etc.) before synthesis — so this is
+/// an estimate, not an exact preview. Adds the full+empty mbarrier pair the
+/// emitter allocates per synthesized channel (2 * depth * 8 B — never
+/// counted by computeTotalSmem; negligible but free to include).
+static int64_t
+predictChannelSmemBytes(const ttg::ScheduleLoop &loop,
+                        const llvm::SmallDenseMap<unsigned, int> &nodeToWg) {
+  bool loopHasTC = llvm::any_of(loop.nodes, [](const ttg::ScheduleNode &n) {
+    return n.pipeline == ttg::HWPipeline::TC;
+  });
+  int64_t total = 0;
+  llvm::SmallDenseSet<std::pair<unsigned, unsigned>, 8> seenPairs;
+  for (const auto &edge : loop.edges) {
+    auto sIt = nodeToWg.find(edge.srcId);
+    auto dIt = nodeToWg.find(edge.dstId);
+    if (sIt == nodeToWg.end() || dIt == nodeToWg.end())
+      continue;
+    if (sIt->second == dIt->second)
+      continue;
+    if (!seenPairs.insert({edge.srcId, edge.dstId}).second)
+      continue;
+    auto spec = resolveCrossWGChannel(loop, edge, loopHasTC);
+    if (!spec.synthesize)
+      continue;
+    total += spec.synthesizedBytes() + 2 * spec.depth * 8;
+  }
+  return total;
+}
+
+/// Channel-SMEM capacity + CTA co-residency terms, shared by scoreCandidate
+/// and evalGreedyCost so the two ranking paths cannot drift.
+/// `committedSmemBytes` is the candidate-invariant baseline: this loop's
+/// committed buffers PLUS every other loop's committed buffers in the same
+/// kernel (nested/sibling loops coexist — the budget reducers enforce the
+/// limit jointly across loops, see reduceBuffersForGlobalBudget, and the
+/// capacity gate here must do the same or a nested kernel can pick an
+/// unlaunchable partition). Computed once per loop by the partitioners.
+struct SecondOrderTerms {
+  int64_t channelSmemBytes{0}; // predicted synthesized channel SMEM
+  int64_t totalSmemBytes{0};   // committed (all loops) + predicted channels
+  int64_t smemOverBytes{0};    // overflow past kSmemBudgetBytes()
+  int coResidentCTAs{1};       // min over warp/reg/SMEM per-SM bounds
+  double penalty{0.0};         // additive cost penalty
+  bool feasible{true};         // false = cannot launch (SMEM or warp slots)
+};
+
+static SecondOrderTerms
+computeSecondOrderTerms(const ttg::ScheduleLoop &loop,
+                        const llvm::SmallDenseMap<unsigned, int> &nodeToWg,
+                        int totalRegs, int explicitWarps,
+                        int64_t committedSmemBytes) {
+  SecondOrderTerms t;
+  t.channelSmemBytes = predictChannelSmemBytes(loop, nodeToWg);
+  t.totalSmemBytes = committedSmemBytes + t.channelSmemBytes;
+  t.smemOverBytes = std::max<int64_t>(0, t.totalSmemBytes - kSmemBudgetBytes());
+
+  // CTA warp count as AllocateWarpGroups will see it: 4 default warps plus
+  // the explicit WGs padded to whole warp groups. (The default WG's 4 warps
+  // are a model assumption shared with kDefaultWGFootprint; the pass does
+  // not read ttg.num-warps today.)
+  int ctaWarps = 4 + ((explicitWarps + 3) / 4) * 4;
+
+  if (t.smemOverBytes > 0) {
+    t.feasible = false;
+    t.penalty += kInfeasiblePenalty + static_cast<double>(t.smemOverBytes);
+  }
+  if (ctaWarps > kMaxWarpsPerSM) {
+    t.feasible = false;
+    t.penalty += kInfeasiblePenalty +
+                 1000.0 * static_cast<double>(ctaWarps - kMaxWarpsPerSM);
+  }
+
+  // Wave quantization, in the only form knowable at compile time (the grid
+  // is a runtime launch parameter): how many CTAs of this footprint can
+  // co-reside on one SM. Register overshoot is NOT gated here — the
+  // existing residual penalty models the maxnreg trim behavior instead.
+  // The SMEM bound follows the occupancy calculator's rule (vendored
+  // cuda_occupancy.h, sm_100): per-SM capacity divided by the CTA's SMEM
+  // plus the driver's per-CTA reservation — NOT the per-block optin limit.
+  int coResWarps = kMaxWarpsPerSM / std::max(ctaWarps, 1);
+  int coResRegs = kBlackwellSMRegs / std::max(totalRegs, 1);
+  int coResSmem = static_cast<int>(
+      kSmemPerSMBytes /
+      std::max<int64_t>(t.totalSmemBytes + kReservedSmemPerCTABytes, 1));
+  t.coResidentCTAs = std::max(0, std::min(std::min(coResWarps, coResRegs),
+                                          std::min(coResSmem, kMaxCTAsPerSM)));
+  t.penalty += coResidencyPenalty() *
+               std::max(0, kCoResidencyTargetCTAs - t.coResidentCTAs);
+  return t;
 }
 
 static ScoredCandidate scoreCandidate(const ClusterAssignment &assn,
                                       const SmallVector<OpCluster> &clusters,
                                       const ttg::ScheduleLoop &loop,
+                                      int64_t committedSmemBytes,
                                       bool verbose = false) {
   // Group nodes by warp group via cluster → wg mapping.
   llvm::DenseMap<int, SmallVector<unsigned>> wgToNodes;
@@ -2767,8 +3102,10 @@ static ScoredCandidate scoreCandidate(const ClusterAssignment &assn,
 
   int bottleneck = 0;
   int totalRegs = kDefaultWGFootprint; // include implicit "default" WG
+  int explicitWarps = 0;
   for (auto &[wgId, nodes] : wgToNodes) {
     int wgWarps = wgRequiredWarps(nodes, loop);
+    explicitWarps += wgWarps;
     int ms = computeMultiPipelineMakespan(nodes, loop, wgWarps);
     int barCost = computeWGBarrierCost(nodes, loop, nodeToWg, wgId);
     int rtCost = rtPerWg.lookup(wgId);
@@ -2863,13 +3200,25 @@ static ScoredCandidate scoreCandidate(const ClusterAssignment &assn,
   // (and that's where 3-9× perf collapses observed in perf_sweep.py).
   int deficit = std::max(0, totalRegs - kBlackwellSMRegs);
   int residual = std::max(0, deficit - kDefaultSlack);
-  sc.feasible = (residual == 0);
+  // Channel-SMEM capacity + co-residency (see computeSecondOrderTerms).
+  auto so = computeSecondOrderTerms(loop, nodeToWg, totalRegs, explicitWarps,
+                                    committedSmemBytes);
+  sc.channelSmemBytes = so.channelSmemBytes;
+  sc.coResidentCTAs = so.coResidentCTAs;
+  sc.feasible = (residual == 0) && so.feasible;
+  if (verbose) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "[Score-VERBOSE]   chanSmem=" << so.channelSmemBytes
+               << " totalSmem=" << so.totalSmemBytes << "/"
+               << kSmemBudgetBytes() << " coRes=" << so.coResidentCTAs
+               << " soPenalty=" << so.penalty << "\n");
+  }
   // Cross-WG barrier issue cost is now folded into per-WG bottleneck via
   // `computeWGBarrierCost`, so the legacy `crossEdges * kBarrierOverhead`
   // global term is dropped — keeping it would double-charge the same
   // barriers.
   sc.cost = static_cast<double>(bottleneck) + residual * kDeficitPenalty +
-            assn.numWgs * kPerWGTieBreak + stageMixPenalty;
+            assn.numWgs * kPerWGTieBreak + stageMixPenalty + so.penalty;
   return sc;
 }
 
@@ -2916,7 +3265,8 @@ struct GreedyWG {
 /// Compute the cost of a partition. Mirrors `scoreCandidate`'s formula.
 /// Returns +inf if the partition busts the SM register budget (Layer C).
 static double evalGreedyCost(const SmallVector<GreedyWG> &wgs,
-                             const ttg::ScheduleLoop &loop) {
+                             const ttg::ScheduleLoop &loop,
+                             int64_t committedSmemBytes) {
   // Bottleneck = max per-WG makespan, computed at each WG's required warps.
   // Also accumulate per-WG register footprint (Layer C).
   int totalRegs = kDefaultWGFootprint; // include implicit "default" WG
@@ -2928,8 +3278,10 @@ static double evalGreedyCost(const SmallVector<GreedyWG> &wgs,
   llvm::SmallDenseMap<int, int> rtPerWg;
   accumulateCrossWGRoundTrip(loop, nodeToWg, rtPerWg);
   int bottleneck = 0;
+  int explicitWarps = 0;
   for (unsigned wgi = 0; wgi < wgs.size(); ++wgi) {
     int wgWarps = wgRequiredWarps(wgs[wgi].nodeIds, loop);
+    explicitWarps += wgWarps;
     int ms = computeMultiPipelineMakespan(wgs[wgi].nodeIds, loop, wgWarps);
     int barCost = computeWGBarrierCost(wgs[wgi].nodeIds, loop, nodeToWg,
                                        static_cast<int>(wgi));
@@ -2939,17 +3291,23 @@ static double evalGreedyCost(const SmallVector<GreedyWG> &wgs,
   }
   int deficit = std::max(0, totalRegs - kBlackwellSMRegs);
   int residual = std::max(0, deficit - kDefaultSlack);
+  // Channel-SMEM capacity + co-residency, same terms as scoreCandidate.
+  auto so = computeSecondOrderTerms(loop, nodeToWg, totalRegs, explicitWarps,
+                                    committedSmemBytes);
   // Cross-WG barrier-issue cost is folded into per-WG bottleneck via
   // `computeWGBarrierCost`; the legacy global `crossEdges * kBarrierOverhead`
   // term has been dropped to avoid double-charging.
   return static_cast<double>(bottleneck) + residual * kDeficitPenalty +
-         wgs.size() * kPerWGTieBreak;
+         wgs.size() * kPerWGTieBreak + so.penalty;
 }
 
-/// Greedy cluster-based partitioner.
-static void partitionClusterGreedy(ttg::ScheduleLoop &loop) {
+/// Greedy cluster-based partitioner. `reservedSmemBytes` = committed SMEM of
+/// every OTHER loop in the kernel (see computeSecondOrderTerms).
+static void partitionClusterGreedy(ttg::ScheduleLoop &loop,
+                                   int64_t reservedSmemBytes = 0) {
   if (loop.II <= 0)
     return;
+  const int64_t committedSmem = computeTotalSmem(loop) + reservedSmemBytes;
 
   auto clusters = buildClusters(loop);
   if (clusters.size() < 2) {
@@ -2976,7 +3334,7 @@ static void partitionClusterGreedy(ttg::ScheduleLoop &loop) {
                    << ") size=" << c.nodeIds.size() << "\n";
     }
   });
-  double currentCost = evalGreedyCost(wgs, loop);
+  double currentCost = evalGreedyCost(wgs, loop, committedSmem);
   LLVM_DEBUG(llvm::dbgs() << "[Greedy] Initial cost = " << currentCost << "\n");
 
   // Greedy merge loop.
@@ -2994,7 +3352,7 @@ static void partitionClusterGreedy(ttg::ScheduleLoop &loop) {
         trial[i].nodeIds.append(trial[j].nodeIds.begin(),
                                 trial[j].nodeIds.end());
         trial.erase(trial.begin() + j);
-        double trialCost = evalGreedyCost(trial, loop);
+        double trialCost = evalGreedyCost(trial, loop, committedSmem);
         if (trialCost < bestCost) {
           bestCost = trialCost;
           bestI = i;
@@ -3083,9 +3441,14 @@ static std::string pluralDumpPath(StringRef base) {
 /// "atom" in the partition decision; ops within a cluster always travel to
 /// the same WG, but different clusters on the same pipeline can be split
 /// onto different WGs.
-static void partitionExhaustive(ttg::ScheduleLoop &loop) {
+static void partitionExhaustive(ttg::ScheduleLoop &loop,
+                                int64_t reservedSmemBytes = 0) {
   if (loop.II <= 0)
     return;
+  // Candidate-invariant SMEM baseline for the capacity/co-residency terms:
+  // this loop's committed buffers plus every other loop's (nested/sibling
+  // loops coexist in the same CTA).
+  const int64_t committedSmem = computeTotalSmem(loop) + reservedSmemBytes;
 
   // ── Greedy agglomerative clustering ──────────────────────────────────────
   auto clusters = buildClusters(loop);
@@ -3122,7 +3485,7 @@ static void partitionExhaustive(ttg::ScheduleLoop &loop) {
     LLVM_DEBUG(llvm::dbgs() << "[Phase4] " << clusters.size() << " clusters"
                             << (forceGreedy ? " (forced)" : " > 10")
                             << " — using cluster-greedy\n");
-    partitionClusterGreedy(loop);
+    partitionClusterGreedy(loop, reservedSmemBytes);
     return;
   }
 
@@ -3172,14 +3535,17 @@ static void partitionExhaustive(ttg::ScheduleLoop &loop) {
                           << "  numClusters=" << clusters.size()
                           << "  numCandidates=" << candidates.size() << "\n");
   for (unsigned ci = 0; ci < candidates.size(); ++ci) {
-    auto sc = scoreCandidate(candidates[ci], clusters, loop, /*verbose=*/true);
+    auto sc = scoreCandidate(candidates[ci], clusters, loop, committedSmem,
+                             /*verbose=*/true);
     scored.push_back(sc);
     LLVM_DEBUG({
       llvm::dbgs() << "[Phase4-VERBOSE] cand[" << ci << "] ";
       printAssignment(llvm::dbgs(), sc.assignment, clusters);
       llvm::dbgs() << "  numWgs=" << sc.assignment.numWgs
                    << "  bottleneck=" << sc.bottleneckChainWall
-                   << "  xEdges=" << sc.crossWgEdges << "  cost=" << sc.cost
+                   << "  xEdges=" << sc.crossWgEdges
+                   << "  chanSmem=" << sc.channelSmemBytes
+                   << "  coRes=" << sc.coResidentCTAs << "  cost=" << sc.cost
                    << "\n";
     });
   }
@@ -3397,6 +3763,16 @@ static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
     if (src.warpGroup == dst.warpGroup)
       continue;
 
+    // Avoid duplicate barriers for the same (producer, consumer) pair.
+    // Deduping BEFORE channel resolution also prevents the orphaned
+    // duplicate channel buffer the old order created (a second edge between
+    // the same pair — e.g. an op consuming the same value through two
+    // operands — synthesized a second buffer, then skipped only the barrier
+    // record), and keeps the scoring-time predictor's per-pair accounting
+    // exact.
+    if (!seenBarrierPairs.insert({edge.srcId, edge.dstId}).second)
+      continue;
+
     // Determine barrier kind from the producer/consumer pipeline.
     ttg::ScheduleLoop::BarrierKind kind;
     if (src.pipeline == ttg::HWPipeline::TMA) {
@@ -3410,75 +3786,20 @@ static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
       kind = ttg::ScheduleLoop::BarrierKind::MBARRIER;
     }
 
-    // Find the paired data buffer (if any) to determine depth.
-    unsigned depth = 1;
-    unsigned pairedBuf = UINT_MAX;
-    if (src.producesBuffer != UINT_MAX) {
-      pairedBuf = src.producesBuffer;
-      depth = loop.buffers[pairedBuf].count;
-    } else if (src.pipeline == ttg::HWPipeline::TMA && src.op) {
-      // TMA load → memdesc-rebind chain (local_alloc, memdesc_trans,
-      // memdesc_subview) → ... lowering step: the load's data lands in the
-      // SMEM region the downstream `local_alloc` defines. There's no
-      // register intermediate — the load writes directly to that SMEM (TMA
-      // hardware path). So instead of synthesizing a separate staging
-      // buffer for this cross-WG edge (which would double the SMEM cost
-      // for K/V tiles when MEM and TC end up in different WGs), walk
-      // through the metadata-rebind chain to find the downstream node that
-      // owns the actual data buffer, and reuse it. The TMA's completion
-      // barrier is the same mbarrier that fires when the destination SMEM
-      // is full — no extra buffer required.
-      llvm::SmallDenseSet<unsigned, 4> seen;
-      seen.insert(edge.srcId);
-      SmallVector<unsigned, 4> stack;
-      stack.push_back(edge.srcId);
-      while (!stack.empty() && pairedBuf == UINT_MAX) {
-        unsigned cur = stack.pop_back_val();
-        for (const auto &e : loop.edges) {
-          if (e.srcId != cur || !seen.insert(e.dstId).second)
-            continue;
-          const auto &dn = loop.nodes[e.dstId];
-          if (dn.producesBuffer != UINT_MAX &&
-              loop.buffers[dn.producesBuffer].kind == ttg::MemoryKind::SMEM) {
-            pairedBuf = dn.producesBuffer;
-            depth = loop.buffers[pairedBuf].count;
-            break;
-          }
-          // Continue walking through metadata-rebind ops (zero-latency
-          // NONE pipeline whose result is a memdesc).
-          if (dn.op && dn.op->getNumResults() == 1 &&
-              isa<ttg::MemDescType>(dn.op->getResult(0).getType())) {
-            stack.push_back(e.dstId);
-          }
-        }
-      }
-    }
-    if (pairedBuf == UINT_MAX) {
+    // Resolve the channel: reuse the producer's data buffer / the TMA
+    // destination buffer, or get a synthesis spec (shape + depth rule).
+    // Shared with the scoring-time predictor — see resolveCrossWGChannel.
+    auto spec = resolveCrossWGChannel(loop, edge, loopHasTC);
+    unsigned depth = spec.depth;
+    unsigned pairedBuf = spec.pairedBuf;
+    if (spec.synthesize) {
       // Register-typed cross-WG flow (e.g. FA's alpha 256-vector or
       // softmax→TC P-tile bridge). The producer op holds the value in
       // registers; to ferry it to a different warp group we must stage it
-      // through SMEM/TMEM with this barrier guarding the hand-off.
-      // Allocate the buffer here so it's part of loop.buffers — Step 4
-      // (budget) and Step 4.5 (lifetime merging) see it like any other.
-      ttg::ScheduleBuffer chan;
-      chan.id = loop.buffers.size();
-      chan.kind = ttg::MemoryKind::SMEM;
-      // Channel depth. Default: depth-2 for the TMA-load→compute channel of a
-      // TC-free pipelined loop (load warp prefetches one iteration ahead);
-      // depth-1 for other register hand-offs. Deepening register-consumer
-      // channels beyond that measured 6x SLOWER on FA (the P-tile bridge's
-      // extra SMEM + barrier traffic broke the softmax/MMA pingpong), so the
-      // lifetime rule below is scoped to async TMA-STORE consumers only.
-      //
-      // TMA-store consumers get the same `lifetime / II + 1` rule
-      // computeBufferCount applies to data buffers, with the hand-off
-      // spanning src's write to dst's completion (dst.latency included: the
-      // store holds its slot until the transfer drains). A store channel
-      // whose lifetime exceeds II must be double-buffered or the producer WG
-      // serializes on the store WG's drain every iteration — exactly the
-      // layernorm compute→store stall the fixed depth-1 rule produced (0.53x
-      // of handwritten). Store channels short relative to II (GEMM outer-loop
-      // epilogues) keep depth 1, same as before.
+      // through SMEM with this barrier guarding the hand-off. Allocate the
+      // buffer here so it's part of loop.buffers — Step 4.5 (lifetime
+      // merging) sees it like any other, and the partitioner's capacity
+      // gate has already priced it via predictChannelSmemBytes.
       //
       // Depth>1 is safe to emit here: ring indexing for count>1 cross-WG
       // channels already exists and is exercised today (e.g. case3 FA has a
@@ -3486,54 +3807,17 @@ static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
       // count via ScheduleBuffer::totalBytes() (= sizeBytes() * count), which
       // the Step-4 budget, the JSON `total_bytes`, and the emitter's
       // local_alloc(..., count) all consume.
-      {
-        unsigned floorDepth =
-            (!loopHasTC && src.pipeline == ttg::HWPipeline::TMA) ? 2u : 1u;
-        unsigned lifetimeDepth = 1;
-        bool dstIsTMAStore =
-            dst.op &&
-            isa<tt::DescriptorStoreOp, ttng::AsyncTMACopyLocalToGlobalOp>(
-                dst.op);
-        if (dstIsTMAStore && loop.II > 0) {
-          int chanLifetime =
-              std::max(0, (dst.cycle + std::max(dst.latency, 0)) - src.cycle);
-          lifetimeDepth = static_cast<unsigned>(chanLifetime / loop.II + 1);
-        }
-        chan.count = std::max(lifetimeDepth, floorDepth);
-      }
-      depth = chan.count;
+      ttg::ScheduleBuffer chan;
+      chan.id = loop.buffers.size();
+      chan.kind = ttg::MemoryKind::SMEM;
+      chan.count = spec.depth;
       chan.liveStart = src.cycle;
       chan.liveEnd = dst.cycle + std::max(dst.latency, 0);
-      // Derive shape + element width from the producer's result type.
-      Operation *prodOp = src.op;
-      if (prodOp && prodOp->getNumResults() > 0) {
-        Type resTy = prodOp->getResult(0).getType();
-        auto setFromShaped = [&](llvm::ArrayRef<int64_t> shape, Type elemTy) {
-          if (!elemTy.isIntOrFloat())
-            return;
-          for (auto d : shape) {
-            if (d <= 0 || ShapedType::isDynamic(d))
-              return;
-          }
-          for (auto d : shape)
-            chan.shape.push_back(d);
-          chan.elementBitWidth = elemTy.getIntOrFloatBitWidth();
-        };
-        if (auto memDesc = dyn_cast_or_null<ttg::MemDescType>(resTy))
-          setFromShaped(memDesc.getShape(), memDesc.getElementType());
-        else if (auto tt = dyn_cast_or_null<RankedTensorType>(resTy))
-          setFromShaped(tt.getShape(), tt.getElementType());
-      }
-      // Skip if we couldn't determine a usable shape (scalar or unknown).
-      if (!chan.shape.empty()) {
-        loop.buffers.push_back(chan);
-        pairedBuf = chan.id;
-      }
+      chan.shape.assign(spec.shape.begin(), spec.shape.end());
+      chan.elementBitWidth = spec.elementBitWidth;
+      loop.buffers.push_back(chan);
+      pairedBuf = chan.id;
     }
-
-    // Avoid duplicate barriers for the same (producer, consumer) pair.
-    if (!seenBarrierPairs.insert({edge.srcId, edge.dstId}).second)
-      continue;
 
     ttg::ScheduleLoop::CrossGroupBarrier bar;
     bar.producerNodeId = edge.srcId;
@@ -3866,6 +4150,14 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
       triton::tools::getStrEnv("TRITON_MODULO_EXHAUSTIVE_PARTITION");
   bool useGreedy = (exhaustiveEnv == "0" || exhaustiveEnv == "false" ||
                     exhaustiveEnv == "off");
+  // Whole-kernel committed SMEM: a loop's partition candidates must fit
+  // alongside every OTHER loop's buffers (nested/sibling loops coexist in
+  // the CTA — the budget reducers already enforce the limit jointly, see
+  // reduceBuffersForGlobalBudget; the channel-capacity gate must too).
+  int64_t allLoopsSmem = 0;
+  for (auto &sl : scheduledLoops)
+    for (auto &schedLoop : sl.graph.loops)
+      allLoopsSmem += computeTotalSmem(schedLoop);
   for (auto &sl : scheduledLoops) {
     for (auto &schedLoop : sl.graph.loops) {
       if (schedLoop.II <= 0)
@@ -3902,7 +4194,8 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
       if (useGreedy) {
         partitionIntoWarpGroups(schedLoop);
       } else {
-        partitionExhaustive(schedLoop);
+        partitionExhaustive(schedLoop,
+                            allLoopsSmem - computeTotalSmem(schedLoop));
       }
       demoteScalarArithToInfra(schedLoop);
       propagateWarpGroupToInfraOps(schedLoop);

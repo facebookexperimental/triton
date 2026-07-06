@@ -270,6 +270,25 @@ correctness.
 1. **Now, heuristic unchanged**: keep calibrating the second-order terms in
    `scoreCandidate` (barrier round-trips, channel SMEM, wave quantization) —
    these become objective terms later, no work wasted.
+   **[DONE 2026-07-05, branch hwu27/modulo-second-order-calibration]**
+   Measured with a new in-tree microbenchmark
+   (`third_party/tlx/tools/microbench/cross_wg_handoff.py`, tlx.clock64
+   ping-pong between two 4-warp WGs on B200): mbarrier one-way handshake
+   92 cyc, named-barrier one-way 30 cyc (the old kBarrierOverhead=30 guess
+   was exact for named, ~1.5x low for mbarrier), reg→SMEM→reg hand-off
+   61 + 16.1 cyc/KB. The old decomposition was wrong in both directions —
+   kCrossWGRoundTripLatency=500 (now 150) had absorbed a 5-10x underpriced
+   move slope (105/16384-elems, now 16 cyc/KB byte-based); the totals
+   happened to agree near the one 32KB FA point the 500 was fitted on.
+   Also added: scoring-time channel-SMEM capacity prediction
+   (`predictChannelSmemBytes` replays `insertCrossGroupBarriers`; over-
+   budget → kInfeasiblePenalty since channels were never budget-checked
+   and failed only at kernel load), and the CTA co-residency bound
+   (computed + logged; penalty defaults to 0 via TRITON_MODULO_CORES_PENALTY
+   because persistent grids and maxnreg auto-fill pin co-residency at 1 on
+   the current suite — see the constant's comment). All 5 regenerable cases
+   emit byte-identical generated.py; canaries hold (case3 650 TFLOPS ≈ 651
+   within do_bench noise, kernel unchanged).
 2. **Mid**: grow `ExhaustiveScheduler` into a CP-SAT backend for schedule +
    buffer depths only (partitioner stays), with cost normalization. This
    alone deletes guard 2.
