@@ -35,11 +35,12 @@ compiles and launches kernels); the checker itself is pure Python.
   empirical classes (count + largest = the recovery **ceiling**), **over-merges**
   (configs the checker merged but the fuzzer separated — the soundness violation,
   **must be 0**), and whether the checker partition **refines** the empirical one.
-- **Stage 3 — performance (opt-in).** Benchmark a perf-capable kernel across
-  configs, find the global-fastest **ceiling** (a normal, equivalence-blind
-  autotuner), then inside one checker-certified set (after verifying every member
-  is byte-identical) report fastest-vs-slowest (tuning freedom) and best-vs-ceiling
-  (the cost of demanding identical bits).
+- **Stage 3 — performance (opt-in).** Benchmark every kernel across its config
+  space (same coverage as Stage 2, per `--config-effort`), find the global-fastest
+  **ceiling** (a normal, equivalence-blind autotuner), then inside one
+  checker-certified set (after verifying every member is byte-identical) report
+  fastest-vs-slowest (tuning freedom) and best-vs-ceiling (the cost of demanding
+  identical bits).
 
 ## Effort knobs
 
@@ -54,9 +55,9 @@ stronger evidence of soundness, never certainty.
 ## Kernels
 
 `sum_dim1_simple` (single-tile column sum), `sum_dim1_persistent` (looped column
-sum, perf-capable), `welford` (mean/variance, 2 outputs), `sum` (row sum), `dot`
+sum), `welford` (mean/variance, 2 outputs), `sum` (row sum), `dot`
 (row dot product), `cond_reduce` (column sum behind a data-dependent branch — the
-control-flow example for Stage 1).
+control-flow example for Stage 1). All six are benchmarked in Stage 3.
 
 ## Run
 

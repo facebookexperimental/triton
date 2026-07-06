@@ -38,7 +38,7 @@ the framework answers them separately and you can run only the ones you need:
           formal statement of soundness).
 
   Stage 3 — PERFORMANCE (opt-in).   Given a bit-exactness constraint, how much
-      speed is on the table? It benchmarks a perf-capable kernel across configs,
+      speed is on the table? It benchmarks every kernel across its config space,
       finds the global-fastest CEILING (a normal autotuner, no equivalence
       constraint), then looks inside one checker-certified equivalence set:
       after verifying every member is byte-identical, it reports the fastest vs
@@ -199,10 +199,10 @@ def evaluate_precision(spec, checker, config_effort, fuzzer_effort, artifact="pt
 # --------------------------------------------------------------------------- #
 # Stage 3 — performance
 # --------------------------------------------------------------------------- #
-def evaluate_performance(spec, checker, artifact="ptx"):
-    """Benchmark a perf-capable kernel; compare within-set spread to the global ceiling."""
+def evaluate_performance(spec, checker, artifact="ptx", config_effort="light"):
+    """Benchmark a kernel across its config space; compare within-set spread to the global ceiling."""
     size = spec.perf_size
-    configs = spec.perf_config_space()
+    configs = spec.config_space(config_effort)
     ms, bits, checker_key, fails = {}, {}, {}, 0
     for config in configs:
         try:
@@ -405,8 +405,8 @@ def main(argv=None):
             if not spec.supports_perf:
                 print(f"  {spec.name}: no perf hook; skipping.", flush=True)
                 continue
-            print(f"  {spec.name}: benchmarking {len(spec.perf_config_space())} configs ...", flush=True)
-            results.append(evaluate_performance(spec, checker, args.artifact))
+            print(f"  {spec.name}: benchmarking {len(spec.config_space(args.config_effort))} configs ...", flush=True)
+            results.append(evaluate_performance(spec, checker, args.artifact, args.config_effort))
         if results:
             sections.append(render_stage3(results))
 
