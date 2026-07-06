@@ -1772,6 +1772,18 @@ static unsigned allocateSmemBuffers(
       buf.isPinned = true;
       LDBG("Phase 1: WSBuffer pinned by annotation: bufferId="
            << buf.bufferId << " numCopies=" << buf.numCopies);
+    } else if (auto copies = alloc->getAttrOfType<IntegerAttr>(
+                   kAtomicBroadcastCopiesAttrName)) {
+      // Cross-partition atomic broadcast slot (dynamic-persistent tile id):
+      // WSAtomicBroadcast stamped the requested tile-prefetch depth on the
+      // alloc. Pin the buffer to it so the planner honors the depth exactly and
+      // accounts for the extra copies against the SMEM budget, instead of
+      // leaving this non-innermost (P4_Other) channel single-buffered.
+      buf.numCopies = copies.getInt();
+      buf.minCopies = copies.getInt();
+      buf.isPinned = true;
+      LDBG("Phase 1: WSBuffer pinned by atomic-broadcast depth: numCopies="
+           << buf.numCopies);
     }
 
     // Detect TMA staging buffers: allocs whose users include
