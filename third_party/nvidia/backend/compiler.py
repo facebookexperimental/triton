@@ -732,6 +732,7 @@ class CUDABackend(BaseBackend):
                 dump_enabled,
                 smem_budget,
                 generate_subtiled,
+                knobs.nvidia.ws_tile_prefetch_depth,
             )
             if not knobs.nvidia.use_meta_ws:
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
@@ -782,6 +783,7 @@ class CUDABackend(BaseBackend):
                     dump_enabled,
                     smem_budget,
                     generate_subtiled,
+                    knobs.nvidia.ws_tile_prefetch_depth,
                 )
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_optimize_partition_warps(pm)

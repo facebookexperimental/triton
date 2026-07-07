@@ -660,9 +660,13 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
         _blk = _bwd_selected_meta["BLOCK_M1"] // _bwd_selected_meta["NUM_CTAS"]
         post_grid = (N_CTX // PRE_BLOCK, Z * H)
         _blackwell_fa_bwd_dq_postprocess[post_grid](
-            dq_accum, dq, N_CTX,
-            BLK=_blk, HALF_HD=HEAD_DIM // 2,
-            BLOCK_M=PRE_BLOCK, HEAD_DIM=HEAD_DIM,
+            dq_accum,
+            dq,
+            N_CTX,
+            BLK=_blk,
+            HALF_HD=HEAD_DIM // 2,
+            BLOCK_M=PRE_BLOCK,
+            HEAD_DIM=HEAD_DIM,
         )
 
         torch.testing.assert_close(dv, ref_dv, atol=1e-2, rtol=0)

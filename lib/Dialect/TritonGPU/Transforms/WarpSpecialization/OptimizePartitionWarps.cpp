@@ -163,14 +163,29 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
   // Because the partition region is isolated from above, we could in theory
   // compile it to PTX and read the number of registers that got allocated.
   SmallVector<unsigned> maxTensorRegs;
+  // Whether a partition contains any tensor at all (including single-element
+  // ones). This gates layout relayout when the warp count changes, and is kept
+  // separate from the register-budget estimate below: a single-element tensor
+  // (e.g. the scalar broadcast AutoWS synthesizes for a dynamic-persistent tile
+  // id) must be relayouted if its partition's warps change, but must NOT
+  // reclassify an otherwise non-tensor partition into the tensor register
+  // class.
+  SmallVector<bool> partitionHasTensor;
   for (Region *partition : wsOp.getPartitionRegions()) {
     unsigned &tensorRegs = maxTensorRegs.emplace_back(0);
+    bool &hasTensor = partitionHasTensor.emplace_back(false);
 
     partition->walk([&](Operation *op) {
       for (Type type :
            llvm::concat<Type>(op->getOperandTypes(), op->getResultTypes())) {
-        if (auto tensor = dyn_cast<RankedTensorType>(type))
+        if (auto tensor = dyn_cast<RankedTensorType>(type)) {
+          hasTensor = true;
+          // A single-element tensor is logically a scalar and carries no
+          // meaningful tensor register footprint, so ignore it for the budget.
+          if (tensor.getNumElements() <= 1)
+            continue;
           tensorRegs = std::max(tensorRegs, getTensorNumI32Regs(tensor));
+        }
       }
     });
     // Assume that the largest tensor accounts for half of the registers used
@@ -293,9 +308,10 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
   int maxRegAutoWS = hasMax ? maxRegAttr.getInt() : -1;
 
   SmallVector<int32_t> estRegUsage(partitionNumWarps.size());
-  for (auto [partition, newNumWarps, prevNumWarps, tensorRegs, estRegs] :
-       llvm::zip(wsOp.getPartitionRegions(), partitionNumWarps,
-                 wsOp.getPartitionNumWarps(), maxTensorRegs, estRegUsage)) {
+  for (auto [partition, newNumWarps, prevNumWarps, tensorRegs, hasTensor,
+             estRegs] : llvm::zip(wsOp.getPartitionRegions(), partitionNumWarps,
+                                  wsOp.getPartitionNumWarps(), maxTensorRegs,
+                                  partitionHasTensor, estRegUsage)) {
     // When both min and max are provided, use the current heuristic.
     // When only min is provided (the default), tensor partitions get -1
     // (sentinel for "split leftover evenly") while non-tensor partitions
@@ -303,9 +319,10 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
     estRegs = hasMax ? (tensorRegs ? maxRegAutoWS : minRegAutoWS)
                      : (tensorRegs ? -1 : minRegAutoWS);
 
-    // Layouts need to be reassigned if the number of warps changed and there
-    // are tensor computations.
-    if (newNumWarps == prevNumWarps || !tensorRegs)
+    // Layouts need to be reassigned if the number of warps changed and the
+    // partition contains any tensor (even a single-element broadcast tensor,
+    // which is excluded from tensorRegs above but still needs relayout).
+    if (newNumWarps == prevNumWarps || !hasTensor)
       continue;
     // We need to reassign layouts.
     if (failed(relayoutWarps(axisInfo, partition, prevNumWarps, newNumWarps,
