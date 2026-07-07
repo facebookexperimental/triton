@@ -101,6 +101,7 @@ _HSTU_BWD_DOT_ATTRS_DEFAULT = FrozenDotAttrs(
         "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},
         "dpT": {"stage": "0", "order": "2", "channels": ["opndD,tmem,1,5"]},
         "dk": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]},
+        "dk_shared": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,7"]},
         "dq": {"stage": "1", "order": "1", "channels": ["opndB,smem,1,8", "opndD,tmem,1,11"]},
     }
 )
@@ -118,6 +119,7 @@ _HSTU_BWD_DOT_ATTRS_TLX = FrozenDotAttrs(
         "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},
         "dpT": {"stage": "0", "order": "2", "channels": ["opndD,tmem,1,11"]},
         "dk": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]},
+        "dk_shared": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,7"]},
         "dq": {"stage": "1", "order": "1", "channels": ["opndB,smem,1,8", "opndD,tmem,1,11"]},
     }
 )
@@ -138,7 +140,14 @@ _HSTU_ATTRS_QKT = tl.constexpr(_HSTU_BWD_DOT_ATTRS_TLX.get("qkT"))
 _HSTU_ATTRS_DV = tl.constexpr(_HSTU_BWD_DOT_ATTRS_TLX.get("dv"))
 _HSTU_ATTRS_DPT = tl.constexpr(_HSTU_BWD_DOT_ATTRS_TLX.get("dpT"))
 _HSTU_ATTRS_DK = tl.constexpr(_HSTU_BWD_DOT_ATTRS_TLX.get("dk"))
+_HSTU_ATTRS_DK_SHARED = tl.constexpr(_HSTU_BWD_DOT_ATTRS_TLX.get("dk_shared"))
 _HSTU_ATTRS_DQ = tl.constexpr(_HSTU_BWD_DOT_ATTRS_TLX.get("dq"))
+
+# "compute fold": fold dk_attn (dqk @ q) into the dv/dk accumulator (TLX 2kv
+# parity) instead of a separate dk_attn tile + register add. Kept behind a
+# constexpr gate (env HSTU_COMPUTE_FOLD=1) while the partition scheduler
+# interaction (spurious correction partition) is under investigation.
+_HSTU_COMPUTE_FOLD = tl.constexpr(os.environ.get("HSTU_COMPUTE_FOLD", "0") == "1")
 
 
 def set_bwd_dot_attrs(cfg: "FrozenDotAttrs") -> None:
@@ -147,11 +156,12 @@ def set_bwd_dot_attrs(cfg: "FrozenDotAttrs") -> None:
     Pass _HSTU_BWD_DOT_ATTRS_DEFAULT or _HSTU_BWD_DOT_ATTRS_TLX. Call before the
     kernel compiles (use TRITON_ALWAYS_COMPILE=1 to force a recompile).
     """
-    global _HSTU_ATTRS_QKT, _HSTU_ATTRS_DV, _HSTU_ATTRS_DPT, _HSTU_ATTRS_DK, _HSTU_ATTRS_DQ
+    global _HSTU_ATTRS_QKT, _HSTU_ATTRS_DV, _HSTU_ATTRS_DPT, _HSTU_ATTRS_DK, _HSTU_ATTRS_DK_SHARED, _HSTU_ATTRS_DQ
     _HSTU_ATTRS_QKT = tl.constexpr(cfg.get("qkT"))
     _HSTU_ATTRS_DV = tl.constexpr(cfg.get("dv"))
     _HSTU_ATTRS_DPT = tl.constexpr(cfg.get("dpT"))
     _HSTU_ATTRS_DK = tl.constexpr(cfg.get("dk"))
+    _HSTU_ATTRS_DK_SHARED = tl.constexpr(cfg.get("dk_shared"))
     _HSTU_ATTRS_DQ = tl.constexpr(cfg.get("dq"))
 
 
@@ -1859,6 +1869,11 @@ def _hstu_attn_bwd_redq(  # noqa C901
             BLOCK_N,
             warp_specialize=WS_ON,
             merge_epilogue_to_computation=WS_ON,
+            # With the compute fold, the dk accumulator's cross-iteration
+            # tmem_load is categorized as a correction op; merge it into the
+            # computation partition instead of spawning a separate correction
+            # partition (which would exceed the 16-warp budget).
+            merge_correction=WS_ON,
             data_partition_factor=(2 if BLOCK_N >= 256 else 1),
         ):
             _hstu_attn_bwd_inner(
@@ -3334,23 +3349,37 @@ def _hstu_attn_bwd_inner(  # noqa C901
             dqk_trans = backward_d_silu_activation(
                 dact_qk_trans, pT, qk_trans, scale, valid_mask_trans
             )
-        dqk_trans = dqk_trans.to(k.dtype)
-        dq_trans = tl.dot(
-            tl.trans(k), dqk_trans,
-            attrs=_HSTU_ATTRS_DQ if WS_ON else None,
-        )
-        if SHARED_KV:
-            dk_attn = tl.dot(
-                dqk_trans, q, allow_tf32=ALLOW_TF32,
-                attrs=_HSTU_ATTRS_DK if WS_ON else None,
+        if SHARED_KV and _HSTU_COMPUTE_FOLD:
+            # Fold dk_attn into dk: pre-scale alpha into dqk_trans (fp32) so both
+            # the dq and dk_attn dots carry alpha, then accumulate dk_attn
+            # directly into the dv/dk accumulator (dk_shared -> buffer id 7).
+            dqk_trans = (dqk_trans * alpha).to(k.dtype)
+            dq_trans = tl.dot(
+                tl.trans(k), dqk_trans,
+                attrs=_HSTU_ATTRS_DQ if WS_ON else None,
             )
-            dk = dk + dk_attn * alpha
-        else:
             dk = tl.dot(
                 dqk_trans, q, dk, allow_tf32=ALLOW_TF32,
-                attrs=_HSTU_ATTRS_DK if WS_ON else None,
+                attrs=_HSTU_ATTRS_DK_SHARED if WS_ON else None,
             )
-        dq_trans = dq_trans * alpha
+        else:
+            dqk_trans = dqk_trans.to(k.dtype)
+            dq_trans = tl.dot(
+                tl.trans(k), dqk_trans,
+                attrs=_HSTU_ATTRS_DQ if WS_ON else None,
+            )
+            if SHARED_KV:
+                dk_attn = tl.dot(
+                    dqk_trans, q, allow_tf32=ALLOW_TF32,
+                    attrs=_HSTU_ATTRS_DK if WS_ON else None,
+                )
+                dk = dk + dk_attn * alpha
+            else:
+                dk = tl.dot(
+                    dqk_trans, q, dk, allow_tf32=ALLOW_TF32,
+                    attrs=_HSTU_ATTRS_DK if WS_ON else None,
+                )
+            dq_trans = dq_trans * alpha
         dq = tl.trans(dq_trans)
         desc_dq.store(
             [q_offset.to(tl.int32), DimQ * off_h],
