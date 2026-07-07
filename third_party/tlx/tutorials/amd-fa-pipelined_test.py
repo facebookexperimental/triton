@@ -687,9 +687,9 @@ class SoftmaxState:
         propagate_nan, so the reduction is spelled out with a custom combinator.
 
         NaN-propagating max is less foldable than the plain `v_max3_f32` form and
-        raises register pressure; the non-causal path therefore needs
-        waves_per_eu=2 (see the host wrapper), without which it spills heavily and
-        regresses ~8x.
+        raises register pressure; the host wrapper pins the non-causal occupancy
+        target to keep the AMDGPU register allocator away from the heavy-spill
+        path.
         """
         return tl.reduce(qk, 1, SoftmaxState._nan_max_combine)
 
@@ -1200,11 +1200,13 @@ def flash_attn_cluster_pipeline(q, k, v, sm_scale, causal=False, **kw):
     BLOCK_N = kw.pop("BLOCK_N", _cluster_default_block_n(causal))
     num_warps = kw.pop("num_warps", min(8, max(1, BLOCK_M // MFMA_M)))
     # waves_per_eu pins the AMDGPU occupancy target (LLVM "amdgpu-waves-per-eu").
-    # The NaN-propagating row-max (see _row_max) raises register pressure: the
-    # non-causal path MUST pin 2 or it spills heavily and regresses ~8x; the causal
-    # path is fastest unconstrained (0). 3 is consistently a large regression.
+    # The NaN-propagating row-max (see _row_max) raises register pressure. On the
+    # current gfx950 LLVM backend, pinning non-causal to 2 waves/eu overconstrains
+    # allocation and sends this kernel down a heavy-spill path; 1 keeps the
+    # measured guard configs near the original baseline. The causal path remains
+    # fastest unconstrained (0).
     # Defaults are shape-dependent; pass waves_per_eu=... to override.
-    waves_per_eu = kw.pop("waves_per_eu", 0 if causal else 2)
+    waves_per_eu = kw.pop("waves_per_eu", 0 if causal else 1)
     assert N_CTX % BLOCK_N == 0, f"cluster_pipeline: N_CTX ({N_CTX}) must be a multiple of BLOCK_N ({BLOCK_N})"
     assert N_CTX % BLOCK_M == 0, f"cluster_pipeline: N_CTX ({N_CTX}) must be a multiple of BLOCK_M ({BLOCK_M})"
     assert BLOCK_M >= num_warps * MFMA_M, (
