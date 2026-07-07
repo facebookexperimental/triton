@@ -8,6 +8,8 @@
 
 #include <cmath>
 
+#include "llvm/Support/JSON.h"
+
 #include "DataDependenceGraph.h"
 #include "LatencyModel.h"
 #include "ModuloReservationTable.h"
@@ -987,10 +989,10 @@ static bool bufferReachesPartMMA(const ttg::ScheduleLoop &loop,
   return false;
 }
 
-// Pass A.7: mark the epilogue value-chain (tmem_load -> ... -> descriptor_store)
-// with the subtile factor S and per-sub-tile N width, so the sched2tlx emitter
-// unrolls S sub-stores along N (overlapping TMA store i with compute of i+1).
-// Opt-in: getEpilogueSubtileForOp only returns S>1 when
+// Pass A.7: mark the epilogue value-chain (tmem_load -> ... ->
+// descriptor_store) with the subtile factor S and per-sub-tile N width, so the
+// sched2tlx emitter unrolls S sub-stores along N (overlapping TMA store i with
+// compute of i+1). Opt-in: getEpilogueSubtileForOp only returns S>1 when
 // TRITON_MODULO_EPILOGUE_SUBTILE is set, so this is a no-op by default.
 static void markEpilogueSubtileChain(ttg::ScheduleLoop &loop) {
   llvm::DenseMap<Operation *, unsigned> opToNode;
@@ -3684,26 +3686,26 @@ static constexpr int kReplicatedWarpGroup = -2;
 /// (`arith.muli → tt.descriptor_load`) and case3's `sem0_full`
 /// (`arith.addi → tt.descriptor_load`). Mirrors Meta's
 /// `TaskIdBackwardPropagation` (`isScalarArithOrMath`) treatment.
+/// Scalar arith/math on the CUDA pipe gets demoted to infra after
+/// partitioning (replicated into each consumer WG, no cross-WG hand-off).
+/// Tensor-result arith/math is real compute (extf, mulf, addf, truncf, ...)
+/// — those ARE anchors.
+static bool isDemotableScalarArith(const ttg::ScheduleNode &node) {
+  if (!node.op || node.pipeline != ttg::HWPipeline::CUDA)
+    return false;
+  StringRef dialect = node.op->getDialect()->getNamespace();
+  if (dialect != "arith" && dialect != "math")
+    return false;
+  for (auto t : node.op->getResultTypes())
+    if (isa<RankedTensorType>(t))
+      return false;
+  return true;
+}
+
 static void demoteScalarArithToInfra(ttg::ScheduleLoop &loop) {
   for (auto &node : loop.nodes) {
-    if (!node.op)
-      continue;
-    if (node.pipeline != ttg::HWPipeline::CUDA)
-      continue;
-    StringRef dialect = node.op->getDialect()->getNamespace();
-    if (dialect != "arith" && dialect != "math")
-      continue;
-    // Tensor-result arith/math is real compute (extf, mulf, addf,
-    // truncf, ...) — those ARE anchors.
-    bool isScalar = true;
-    for (auto t : node.op->getResultTypes())
-      if (isa<RankedTensorType>(t)) {
-        isScalar = false;
-        break;
-      }
-    if (!isScalar)
-      continue;
-    node.warpGroup = -1; // hand off to propagateWarpGroupToInfraOps
+    if (isDemotableScalarArith(node))
+      node.warpGroup = -1; // hand off to propagateWarpGroupToInfraOps
   }
 }
 
@@ -3861,6 +3863,12 @@ static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
       chan.id = loop.buffers.size();
       chan.kind = ttg::MemoryKind::SMEM;
       chan.count = spec.depth;
+      // Preserve the TC-free pipelined-loop rule that landed on main after
+      // the calibration fork: the TMA-load→compute channel keeps depth 2 so
+      // the load warp prefetches one iteration ahead.
+      if (!loopHasTC && src.pipeline == ttg::HWPipeline::TMA)
+        chan.count = std::max<unsigned>(chan.count, 2u);
+      depth = chan.count;
       chan.liveStart = src.cycle;
       chan.liveEnd = dst.cycle + std::max(dst.latency, 0);
       chan.shape.assign(spec.shape.begin(), spec.shape.end());
@@ -4184,6 +4192,27 @@ static void clampOuterStagesAndClusters(scf::ForOp outerLoop) {
   }
 }
 
+// ============================================================================
+// Emitter (sched2tlx) capability facts — versioned LEGALITY constraints.
+// These describe what the emitter can lower, not what hardware allows;
+// encode them explicitly (constraints), never in costs, or a solver will
+// route around them and regress correctness (SolverMigrationNotes,
+// guard 3 / step-4 item 3). Bump kVersion when the emitter gains a
+// capability and delete the corresponding constraint.
+// ============================================================================
+struct EmitterCaps {
+  static constexpr int kVersion = 1; // sched2tlx as of 2026-07
+  // Outer persistent loops must stay single-WG: only INNER loop bodies
+  // lower multi-WG; splitting an outer epilogue silently drops its ops
+  // (guard 3's NaN). Enforced by the isOuter early-out in
+  // applyGlobalWarpPartition and by max_wgs in the joint model.
+  static constexpr bool kOuterLoopSingleWG = true;
+  // TMEM accumulator allocation supports blockM <= 128 (no MMA splitting
+  // for larger tiles). Blocks case2's 256-blockM pre_modulo end-to-end;
+  // the emitter raises a clear error (see _emit_buffers in emitter.py).
+  static constexpr int kMaxTMEMBlockM = 128;
+};
+
 /// Pass B: Per-loop warp-group partition + cross-group barriers. Each
 /// ScheduleLoop gets its own Phase 4 partition run with its own II.
 /// Nested kernels (case2/case5) get inner-partition (e.g., 3-WG GEMM
@@ -4219,9 +4248,8 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
       // is also marginal: the outer II is dominated by the inner-loop
       // super-node (thousands of cycles), so overlapping the epilogue saves a
       // few percent at best while risking an unlowerable partition.
-      // This is an EMITTER-capability legality constraint — keep it (in some
-      // form) even under a global solver. See docs/SolverMigrationNotes.md
-      // (guard 3).
+      // This is an EMITTER-capability legality constraint (EmitterCaps::
+      // kOuterLoopSingleWG).
       if (sl.isOuter) {
         for (auto &node : schedLoop.nodes)
           node.warpGroup = (node.pipeline == ttg::HWPipeline::NONE) ? -1 : 0;
@@ -4244,8 +4272,8 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
       if (useGreedy) {
         partitionIntoWarpGroups(schedLoop);
       } else {
-        partitionExhaustive(schedLoop,
-                            allLoopsSmem - computeTotalSmem(schedLoop));
+        int64_t reserved = allLoopsSmem - computeTotalSmem(schedLoop);
+        partitionExhaustive(schedLoop, reserved);
       }
       demoteScalarArithToInfra(schedLoop);
       propagateWarpGroupToInfraOps(schedLoop);

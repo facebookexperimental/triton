@@ -5,6 +5,7 @@
 #include <assert.h>
 #include <cstdlib>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -64,6 +65,7 @@ inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
     "TRITON_MODULO_DUMP_TOPN",
     "TRITON_MODULO_REG_DEFAULT",
     "TRITON_MODULO_CORES_PENALTY",
+    "TRITON_MODULO_DISABLE_MMA_GUARD",
     "TRITON_DATA_PARTITION_N",
     "TRITON_PARTITION_SCHEDULING_ENABLE_DUMP_DOT",
     "TRITON_PARTITION_SCHEDULING_DUMP_DATA_ONLY",

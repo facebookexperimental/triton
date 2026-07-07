@@ -95,13 +95,23 @@ def fa_fwd_kernel_nows(
             l_i_0 = tlx.local_load(epi_l_i_0_smem[0])
             acc = tlx.local_load(acc_tmem[0])
             tlx.barrier_arrive(acc_tmem_empty[0], 1)
-            trunc_12 = (acc / l_i_0[:, None]).to(tl.bfloat16)
-            tlx.local_store(c_smem[0], trunc_12)
+            expand_12 = l_i_0[:, None]
+            bcast_13 = expand_12
+            divf_14 = (acc / bcast_13)
+            trunc_15 = divf_14.to(tl.bfloat16)
+            tlx.local_store(c_smem[0], trunc_15)
             tlx.fence_async_shared()
             tlx.async_descriptor_store(out_desc, c_smem[0], [add_5, 0])
             tlx.async_descriptor_store_wait(0)
-            range_13 = tl.arange(0, 128)
-            add_14 = (mul_4 + range_13)
+            range_16 = tl.arange(0, 128)
+            splat_17 = mul_4
+            add_18 = (splat_17 + range_16)
+            addptr_19 = (M_lse + mul_3)
+            splat_20 = addptr_19
+            addptr_21 = (splat_20 + add_18)
+            log2_22 = tl.math.log2(l_i_0)
+            addf_23 = (m_i_0 + log2_22)
+            tl.store(addptr_21, addf_23)
         # Async task: role=TMA ← inner wg0 (Phase 4 plan)
         with tlx.async_task(num_warps=1, num_regs=24):
             # load Q tile (per-tile resident)
@@ -133,7 +143,7 @@ def fa_fwd_kernel_nows(
                 _it = (tile_id - 0) // 1
                 buf = _it % 1
                 phase = (_it // 1) & 1
-                mdt_15 = tlx.local_trans(L0_smem_1[0])
+                mdt_24 = tlx.local_trans(L0_smem_1[0])
                 # MMA
                 tlx.barrier_wait(L0_smem_1_full[0], (_it & 1))
                 tlx.barrier_wait(sem5_full[0], (_it & 1))
@@ -148,30 +158,30 @@ def fa_fwd_kernel_nows(
                 buf = _it % 1
                 phase = (_it // 1) & 1
                 tlx.barrier_wait(sem1_full[0], (_it & 1))  # N7→N8  ttng.tc_gen5_mma→ttng.tmem_load  cyc558→cyc1461  forward  buf=None  kind=named
-                tmload_16 = tlx.local_load(acc_tmem_4[0])
+                tmload_25 = tlx.local_load(acc_tmem_4[0])
                 tlx.barrier_arrive(sem5_full[0], 1)
-                red_17 = tl.max(tmload_16, 1)
-                mulf_18 = (tmload_16 * (sm_scale * 1.4427))
-                mulf_19 = (red_17 * (sm_scale * 1.4427))
-                maxf_20 = tl.maximum(m_i_0, mulf_19)
-                expand_21 = maxf_20[:, None]
-                bcast_22 = expand_21
-                subf_23 = (mulf_18 - bcast_22)
-                exp2_24 = tl.math.exp2(subf_23)
-                subf_25 = (m_i_0 - maxf_20)
-                exp2_26 = tl.math.exp2(subf_25)
+                red_26 = tl.max(tmload_25, 1)
+                mulf_27 = (tmload_25 * (sm_scale * 1.4427))
+                mulf_28 = (red_26 * (sm_scale * 1.4427))
+                maxf_29 = tl.maximum(m_i_0, mulf_28)
+                expand_30 = maxf_29[:, None]
+                bcast_31 = expand_30
+                subf_32 = (mulf_27 - bcast_31)
+                exp2_33 = tl.math.exp2(subf_32)
+                subf_34 = (m_i_0 - maxf_29)
+                exp2_35 = tl.math.exp2(subf_34)
                 tlx.barrier_wait(sem2_b4_empty[0], ((_it & 1) ^ 1))
-                tlx.local_store(L0_smem_4[0], exp2_26)
+                tlx.local_store(L0_smem_4[0], exp2_35)
                 tlx.barrier_arrive(sem2_b4_full[0], 1)
-                mulf_27 = (l_i_0 * exp2_26)
-                red_28 = tl.sum(exp2_24, 1)
-                trunc_29 = exp2_24.to(tl.bfloat16)
+                mulf_36 = (l_i_0 * exp2_35)
+                red_37 = tl.sum(exp2_33, 1)
+                trunc_38 = exp2_33.to(tl.bfloat16)
                 tlx.barrier_wait(L0_acc_tmem_2_empty[0], (_it & 1) ^ 1)  # TMEM bridge
-                tlx.local_store(L0_acc_tmem_2[0], trunc_29)
+                tlx.local_store(L0_acc_tmem_2[0], trunc_38)
                 tlx.barrier_arrive(L0_acc_tmem_2_full[0], 1)
-                addf_30 = (mulf_27 + red_28)
-                m_i_0 = maxf_20
-                l_i_0 = addf_30
+                addf_39 = (mulf_36 + red_37)
+                m_i_0 = maxf_29
+                l_i_0 = addf_39
             tlx.local_store(epi_m_i_0_smem[0], m_i_0)
             tlx.barrier_arrive(epi_m_i_0_smem_full[0], 1)
             tlx.local_store(epi_l_i_0_smem[0], l_i_0)
@@ -183,16 +193,16 @@ def fa_fwd_kernel_nows(
                 _it = (tile_id - 0) // 1
                 buf = _it % 1
                 phase = (_it // 1) & 1
-                tlx.barrier_wait(sem6_full[0], (_it & 1))  # N28→N23  ttng.tc_gen5_mma→ttng.tmem_load  cyc3100→cyc564  LOOP-CARRY  buf=None  kind=named
-                tmload_31 = tlx.local_load(acc_tmem[0])
                 tlx.barrier_wait(sem2_b4_full[0], (_it & 1))
                 chan_sem2_b4_0 = tlx.local_load(L0_smem_4[0])
                 tlx.barrier_arrive(sem2_b4_empty[0], 1)
-                expand_32 = chan_sem2_b4_0[:, None]
-                cvt_33 = expand_32
-                bcast_34 = cvt_33
-                mulf_35 = (tmload_31 * bcast_34)
-                tlx.local_store(acc_tmem[0], mulf_35)
+                expand_40 = chan_sem2_b4_0[:, None]
+                cvt_41 = expand_40
+                bcast_42 = cvt_41
+                tlx.barrier_wait(sem6_full[0], (_it & 1))  # N28→N23  ttng.tc_gen5_mma→ttng.tmem_load  cyc3100→cyc564  LOOP-CARRY  buf=None  kind=named
+                tmload_43 = tlx.local_load(acc_tmem[0])
+                mulf_44 = (tmload_43 * bcast_42)
+                tlx.local_store(acc_tmem[0], mulf_44)
                 tlx.barrier_arrive(sem4_full[0], 1)
         # Async task: role=TC ← inner wg5 (Phase 4 plan)
         with tlx.async_task(num_warps=1, num_regs=24):
