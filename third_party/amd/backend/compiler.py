@@ -285,8 +285,24 @@ class HIPBackend(BaseBackend):
         use_async_copy = is_async_copy_enabled(options.arch)
         use_block_pingpong = is_pingpong_schedule_enabled(options.arch, use_async_copy)
 
-        amd.passes.ttgpuir.add_schedule_loops(pm, options.num_stages)
-        amd.passes.ttgpuir.add_pipeline(pm, use_async_copy, use_block_pingpong)
+        # E4: when TRITON_ENABLE_AMD_MODULO is set, the AMD modulo scheduler
+        # replaces schedule-loops — it builds the DDG (TritonGPUModuloCore) with
+        # AMDLatencyModel and serializes a CoarseSchedule that add_pipeline then
+        # consumes (multi-buffer + expansion). Needs TRITON_AMD_MODULO_SERIALIZE=1.
+        if os.environ.get("TRITON_USE_MODULO_SCHEDULE"):
+            # decompose+modulo pipeline (changes #1-#4): early-lower tt.load ->
+            # single-buffer async_copy+local_load, then the ModuloDotSchedule
+            # expander (re-buffer single->multi + ring index, general expander),
+            # replacing schedule_loops + add_pipeline. async_wait counts are
+            # fixed by add_update_async_wait_count downstream.
+            amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "early-lower")
+            amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "expand")
+        elif os.environ.get("TRITON_ENABLE_AMD_MODULO"):
+            amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "")
+            amd.passes.ttgpuir.add_pipeline(pm, use_async_copy, use_block_pingpong)
+        else:
+            amd.passes.ttgpuir.add_schedule_loops(pm, options.num_stages)
+            amd.passes.ttgpuir.add_pipeline(pm, use_async_copy, use_block_pingpong)
         if use_async_copy:
             amd.passes.ttgpuir.add_coalesce_async_copy(pm, options.arch)
         amd.passes.ttgpuir.add_convert_to_tensor_ops(pm)
