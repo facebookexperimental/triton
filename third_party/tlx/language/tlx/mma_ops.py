@@ -1,7 +1,18 @@
 import triton.language.core as tl
+from triton._C.libtriton import ir
 
 from . import types as tlx
 from .utility import cuda_parse_arch
+
+
+def _predicate_or_empty(pred, _semantic):
+    if pred is None:
+        return ir.value()
+    if isinstance(pred, tl.tensor):
+        return pred.handle
+    if isinstance(pred, tl.constexpr):
+        return _semantic.builder.get_int1(pred.value)
+    return _semantic.to_tensor(pred).handle
 
 
 def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builder=None, fp4Padded: bool = False):
@@ -165,7 +176,7 @@ def async_dot(
         acc_handle = require_tmem_layout_col_stride(acc, 1, _semantic.builder)
         handles = [t.handle for t in mBarriers]
         is_async = force_async or len(handles) > 0
-        use_acc_handle = None
+        use_acc_handle = ir.value()
         if use_acc is not None:
             assert isinstance(use_acc, tl.tensor) or isinstance(
                 use_acc, tl.constexpr), (f"use_acc must be a tensor or constexpr, but got {type(use_acc)}")
@@ -173,8 +184,8 @@ def async_dot(
                 use_acc_handle = use_acc.handle
             else:
                 use_acc_handle = _semantic.builder.get_int1(use_acc.value)
-        output = _semantic.builder.create_tcgen5_dot(A_handle, B_handle, acc_handle, use_acc_handle, pred, two_ctas,
-                                                     handles, is_async)
+        output = _semantic.builder.create_tcgen5_dot(A_handle, B_handle, acc_handle, use_acc_handle,
+                                                     _predicate_or_empty(pred, _semantic), two_ctas, handles, is_async)
         return tl.tensor(output, tl.void)
     else:
         mma_layout = _semantic.builder.make_nv_mma_encoding_attr(A_handle, acc_handle, version, 0,
@@ -326,7 +337,7 @@ def async_dot_scaled(
     acc_handle = require_tmem_layout_col_stride(acc, 1, _semantic.builder)
     bar_handles = [t.handle for t in mBarriers]
     is_async = force_async or len(bar_handles) > 0
-    use_acc_handle = None
+    use_acc_handle = ir.value()
     if use_acc is not None:
         assert isinstance(use_acc, tl.tensor) or isinstance(
             use_acc, tl.constexpr), (f"use_acc must be a tensor or constexpr, but got {type(use_acc)}")
@@ -343,7 +354,7 @@ def async_dot_scaled(
         A_type,
         B_type,
         use_acc_handle,
-        pred,
+        _predicate_or_empty(pred, _semantic),
         two_ctas,
         bar_handles,
         is_async,
