@@ -139,6 +139,18 @@ public:
     });
   }
 
+  // Dump the whole module to llvm::dbgs() after a pipeline step, gated on the
+  // `dump-intermediate-steps` pass option. Collapses the identical dump blocks
+  // that otherwise dominate runOnFuncOp; the emitted text is unchanged.
+  void dumpAfter(ModuleOp moduleOp, StringRef stepName) {
+    if (!dumpIntermediateSteps)
+      return;
+    llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: " << stepName
+                 << "\n";
+    moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+    llvm::dbgs() << "\n\n\n";
+  }
+
   void runOnFuncOp(triton::FuncOp funcOp, int defaultNumStages) {
     bool enabled = false;
     funcOp->walk([&](Operation *op) {
@@ -195,12 +207,7 @@ public:
       signalPassFailure();
       return;
     }
-    if (dumpIntermediateSteps) {
-      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                      "doTaskIdPropagate\n";
-      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-      llvm::dbgs() << "\n\n\n";
-    }
+    dumpAfter(moduleOp, "doTaskIdPropagate");
 
     // Cross-partition run-once atomic support: classify each side-effecting
     // atomic and either pass it through (single-partition), transform it into a
@@ -216,21 +223,11 @@ public:
       removeWarpSpecializeAttr(funcOp);
       return;
     }
-    if (dumpIntermediateSteps) {
-      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                      "doAtomicBroadcast\n";
-      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-      llvm::dbgs() << "\n\n\n";
-    }
+    dumpAfter(moduleOp, "doAtomicBroadcast");
 
     if (pingpongAutoWS) {
       doPingPongPrep(funcOp, numWarpGroups, capability, defaultNumStages);
-      if (dumpIntermediateSteps) {
-        llvm::dbgs()
-            << "// -----// WarpSpec internal IR Dump After: doPingPongPrep\n";
-        moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-        llvm::dbgs() << "\n\n\n";
-      }
+      dumpAfter(moduleOp, "doPingPongPrep");
     }
 
     // Remove redundant TMEM zeroing stores before buffer allocation.
@@ -247,21 +244,10 @@ public:
     // Canonicalize the SMEM/TEM buffers.
     // Create buffers for register channels.
     doBufferAllocation(funcOp);
-
-    if (dumpIntermediateSteps) {
-      llvm::dbgs()
-          << "// -----// WarpSpec internal IR Dump After: doBufferAllocation\n";
-      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-      llvm::dbgs() << "\n\n\n";
-    }
+    dumpAfter(moduleOp, "doBufferAllocation");
 
     doHoistLoopInvariantTMEMStore(funcOp);
-    if (dumpIntermediateSteps) {
-      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                      "doHoistLoopInvariantTMEMStore\n";
-      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-      llvm::dbgs() << "\n\n\n";
-    }
+    dumpAfter(moduleOp, "doHoistLoopInvariantTMEMStore");
 
     if (failed(doMemoryPlanner(funcOp, numStages, /*readDecisionFile=*/"",
                                /*writeDecisionFile=*/"",
@@ -269,101 +255,48 @@ public:
       signalPassFailure();
       return;
     }
-    if (dumpIntermediateSteps) {
-      llvm::dbgs()
-          << "// -----// WarpSpec internal IR Dump After: doMemoryPlanner\n";
-      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-      llvm::dbgs() << "\n\n\n";
-    }
+    dumpAfter(moduleOp, "doMemoryPlanner");
 
     if (generateSubtiledRegion) {
       doGenerateSubtiledRegion(funcOp);
-      if (dumpIntermediateSteps) {
-        llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                        "doGenerateSubtiledRegion\n";
-        moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-        llvm::dbgs() << "\n\n\n";
-      }
+      dumpAfter(moduleOp, "doGenerateSubtiledRegion");
     }
 
     doAnnotateTMAStoreWaits(funcOp);
-    if (dumpIntermediateSteps) {
-      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                      "doAnnotateTMAStoreWaits\n";
-      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-      llvm::dbgs() << "\n\n\n";
-    }
+    dumpAfter(moduleOp, "doAnnotateTMAStoreWaits");
 
     doValidateTMAStoreAnnotations(funcOp);
-    if (dumpIntermediateSteps) {
-      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                      "doValidateTMAStoreAnnotations\n";
-      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-      llvm::dbgs() << "\n\n\n";
-    }
+    dumpAfter(moduleOp, "doValidateTMAStoreAnnotations");
 
     doCodePartitionPost(funcOp, numStages);
-    if (dumpIntermediateSteps) {
-      llvm::dbgs()
-          << "// -----// WarpSpec internal IR Dump After: doCodePartition\n";
-      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-      llvm::dbgs() << "\n\n\n";
-    }
+    // Label kept as "doCodePartition" for output stability (see WS-15).
+    dumpAfter(moduleOp, "doCodePartition");
 
     if (pingpongAutoWS) {
       doPingPongSync(funcOp, numWarpGroups, capability);
-      if (dumpIntermediateSteps) {
-        llvm::dbgs()
-            << "// -----// WarpSpec internal IR Dump After: doPingPongSync\n";
-        moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-        llvm::dbgs() << "\n\n\n";
-      }
+      dumpAfter(moduleOp, "doPingPongSync");
     }
 
     doLowerSubtiledRegionsWithNVWSOps(funcOp);
     doTokenLowering(funcOp, numWarpGroups - 1);
     invalidateWarpSpecializeBarriers(funcOp);
-    if (dumpIntermediateSteps) {
-      llvm::dbgs()
-          << "// -----// WarpSpec internal IR Dump After: doTokenLowering\n";
-      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-      llvm::dbgs() << "\n\n\n";
-    }
+    dumpAfter(moduleOp, "doTokenLowering");
 
     triton::gpu::doLoopSchedulePreprocessing(moduleOp, builder);
-    if (dumpIntermediateSteps) {
-      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                      "doLoopSchedulePreprocessing\n";
-      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-      llvm::dbgs() << "\n\n\n";
-    }
+    dumpAfter(moduleOp, "doLoopSchedulePreprocessing");
+
     triton::gpu::scheduleLoops(moduleOp, defaultNumStages, true);
-    if (dumpIntermediateSteps) {
-      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                      "doLoopSchedule\n";
-      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-      llvm::dbgs() << "\n\n\n";
-    }
+    dumpAfter(moduleOp, "doLoopSchedule");
 
     doLowerRemainingSubtiledRegions(funcOp);
     if (failed(cleanupWarpSpecializedLoops(funcOp))) {
       signalPassFailure();
       return;
     }
-    if (dumpIntermediateSteps) {
-      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                      "cleanupWarpSpecializedLoops\n";
-      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-      llvm::dbgs() << "\n\n\n";
-    }
+    dumpAfter(moduleOp, "cleanupWarpSpecializedLoops");
 
     doTMAStoreWaitReorder(funcOp);
-    if (dumpIntermediateSteps) {
-      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                      "doTMAStoreWaitReorder\n";
-      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-      llvm::dbgs() << "\n\n\n";
-    }
+    dumpAfter(moduleOp, "doTMAStoreWaitReorder");
   }
 
   void runOnOperation() override {
