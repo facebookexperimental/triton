@@ -223,15 +223,26 @@ def derive_semaphores(loop: Any, graph: Any = None) -> list[Semaphore]:
         )
         buf_ref = BufferRef(loop.loop_id, cb.paired_buffer_id) if has_buffer else None
         # When the cross_wg_barriers entry references a synthesized routing
-        # buffer (def_op=None), the actual data buffer is the one defined by
-        # the consumer's ttg.local_alloc op. The semaphore depth must match
-        # that data buffer's ring count, otherwise the producer can't
-        # pipeline across slots and small-input correctness suffers.
+        # buffer (def_op=None) and the consumer is a `ttg.local_alloc`, the
+        # actual data buffer is the one that alloc defines. The semaphore depth
+        # must match that data buffer's ring count, otherwise the producer
+        # can't pipeline across slots and small-input correctness suffers.
+        #
+        # The redirect is scoped to local_alloc consumers: for a TMA-store
+        # consumer the synthesized channel IS the data buffer the store reads,
+        # while the store op also owns a zero-lifetime staging buffer
+        # (def_op == the store op) — redirecting to that collapsed a depth-2
+        # store channel's semaphore back to depth 1 and serialized the
+        # producer WG on the store drain (layernorm 3-WG).
         depth = cb.depth
         if has_buffer:
             paired = bufs_by_id[cb.paired_buffer_id]
             data_buf = paired
-            if paired.def_op is None and dst.op_ref:
+            if (
+                paired.def_op is None
+                and dst.op_kind == "ttg.local_alloc"
+                and dst.op_ref
+            ):
                 real = next(
                     (b for b in loop.schedule.buffers if b.def_op == dst.op_ref), None
                 )
