@@ -206,6 +206,10 @@ SmallVector<unsigned> getOrder(SharedEncodingTrait layout,
   if (auto sharedLayout = dyn_cast<AMDRotatingSharedEncodingAttr>(layout)) {
     return llvm::to_vector(sharedLayout.getOrder());
   }
+  if (auto partitionedLayout =
+          dyn_cast<PartitionedSharedEncodingAttr>(layout)) {
+    return getOrder(partitionedLayout.getPartitionLayout(), shape);
+  }
   llvm::report_fatal_error("Unimplemented usage of getOrder for MemDescType");
   return {};
 }
@@ -429,6 +433,27 @@ verifyLayoutOrder(function_ref<InFlightDiagnostic()> emitError,
   return success();
 }
 
+static LogicalResult
+verifyDistributedLinearLayout(function_ref<InFlightDiagnostic()> emitError,
+                              const LinearLayout &linearLayout,
+                              StringRef subject) {
+  LinearLayout flattened = linearLayout.flattenIns().flattenOuts();
+  auto inDim = *flattened.getInDimNames().begin();
+  LinearLayout withoutBroadcast = flattened.removeZeroBasesAlongDim(inDim);
+  if (!llvm::all_of(withoutBroadcast.getBases().lookup(inDim),
+                    [](const auto &basis) {
+                      return llvm::isPowerOf2_32(basis.front());
+                    })) {
+    return emitError() << "After removing the zero bases " << subject
+                       << " must be a permutation matrix";
+  }
+  if (!withoutBroadcast.isInvertible()) {
+    return emitError() << "After removing the zero bases " << subject
+                       << " must be a permutation matrix";
+  }
+  return success();
+}
+
 LogicalResult
 CGAEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
                         LinearLayout linearLayout) {
@@ -451,7 +476,8 @@ CGAEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
                        << outDimNames << "].";
   }
 
-  return success();
+  return verifyDistributedLinearLayout(emitError, linearLayout,
+                                       "the CGA encoding");
 }
 
 CGAEncodingAttr CGAEncodingAttr::get1CTALayout(MLIRContext *ctx, int rank) {
@@ -852,7 +878,6 @@ mlir::triton::gpu::parseCGAAttr(AsmParser &parser, Attribute attr,
   auto ctx = parser.getContext();
   auto cgaName = StringAttr::get(ctx, "CGALayout");
   std::vector<std::vector<int32_t>> bases;
-  bases.reserve(array.size());
   for (Attribute vecAttr : array) {
     SmallVector<unsigned> basisValues;
     NamedAttribute basisAttr(cgaName, vecAttr);
@@ -865,7 +890,6 @@ mlir::triton::gpu::parseCGAAttr(AsmParser &parser, Attribute attr,
       return {};
     }
     std::vector<int32_t> basis;
-    basis.reserve(basisValues.size());
     for (unsigned value : basisValues)
       basis.push_back(static_cast<int32_t>(value));
     bases.push_back(std::move(basis));
@@ -874,8 +898,21 @@ mlir::triton::gpu::parseCGAAttr(AsmParser &parser, Attribute attr,
   LinearLayout::BasesT namedBases;
   namedBases.insert(
       std::make_pair(StringAttr::get(ctx, "block"), std::move(bases)));
-  LinearLayout ll(namedBases, standardOutDimNames(ctx, rank));
-  return CGAEncodingAttr::get(ctx, std::move(ll));
+  // Compute the minimum size that the LL fits in to be able to call the
+  // requiresSurjective = false constructor. Thisway, if the CGAEncoding
+  // is not surjective it'll error out with a nice message rather than crash
+  auto outDims = standardOutDimPairs(ctx, SmallVector<int64_t>(rank, 1));
+  for (const auto &basis : namedBases.begin()->second) {
+    for (auto [i, value] : llvm::enumerate(basis))
+      outDims[i].second =
+          std::max<int64_t>(outDims[i].second, llvm::NextPowerOf2(value));
+  }
+  LinearLayout ll(std::move(namedBases), outDims,
+                  /*requireSurjective=*/false);
+  auto cgaLayout = parser.getChecked<CGAEncodingAttr>(ctx, std::move(ll));
+  if (!cgaLayout)
+    return {};
+  return cgaLayout;
 }
 
 Attribute BlockedEncodingAttr::parse(AsmParser &parser, Type type) {
@@ -2606,7 +2643,7 @@ NvidiaMmaEncodingAttr::getRepForOperand(ArrayRef<int64_t> shape, int bitwidth,
     tileSize.push_back(1);
   }
   // warpSizeK * (warpRepK * VecBitWidth)
-  auto tileBitWidthK = (isAmpere() && bitwidth == 64) ? (4 * 256) : (4 * 64);
+  auto tileBitWidthK = bitwidth == 64 ? (2 * 256) : (4 * 64);
   if (opIdx == 0) {
     // m x k
     tileSize.push_back(16);

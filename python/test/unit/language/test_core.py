@@ -1945,10 +1945,6 @@ def test_atomic_unsupported_type(dtype_str, device):
 @pytest.mark.parametrize("size", [1, 4, 16])
 @pytest.mark.parametrize("op", ["add", "cas"])
 def test_tensor_atomic_use_result(dtype_str, size, op, device):
-    if is_hip():
-        pytest.skip(
-            "HIP is broken because (1) it doesn't support thread predicate in atomic cas, and (2) it doesn't support"
-            " atomic rmw with float16")
 
     @triton.jit
     def kernel(index_ptr, out_ptr, size: tl.constexpr, op: tl.constexpr):
@@ -3932,6 +3928,21 @@ def get_test_dot_vdot2_cases():
     ]
 
 
+def get_test_dot_small_mn_wmma_cases():
+    if not is_hip_gfx1250():
+        return []
+    return [(*shape_nw, False, False, 'none', 'ieee', 'float16', 'float32', 1, None)
+            for shape_nw in [(8, 8, 32, 1), (8, 32, 32, 1), (32, 8, 32, 1)]]
+
+
+def get_test_dot_small_k_wmma_cases():
+    if not is_hip_gfx1250():
+        return []
+    return [(16, 64, k_size, 4, False, False, 'none', 'ieee', 'float32', 'float32', 1, None) for k_size in [2]] + \
+           [(16, 64, k_size, 4, False, False, 'none', 'ieee', 'float16', 'float32', 1, None) for k_size in [2, 4, 8, 16, 32]] + \
+           [(16, 64, k_size, 4, False, False, 'none', 'ieee', 'float8e5', 'float32', 1, None) for k_size in [2, 4, 8, 16, 32, 64]]
+
+
 def get_test_small_dots_cases():
     if not is_cuda():
         return []
@@ -3947,7 +3958,8 @@ def get_test_small_dots_cases():
     get_test_dot_vdot2_cases() + get_test_dot_double_rate_cases() + get_test_dot_base_cases() +
     get_test_dot_mixed_sizes_cases() + get_test_dot_transposed_op_base_cases() + get_test_dot_h100_shortcut_cases() +
     get_test_dot_mfma_edge_cases() + get_test_dot_fp8_output_cases() + get_test_dot_small_k_mfma_cases() +
-    get_test_dot_small_mn_mfma_cases() + get_test_dot_softmax() + get_test_small_dots_cases(),
+    get_test_dot_small_mn_mfma_cases() + get_test_dot_small_mn_wmma_cases() + get_test_dot_small_k_wmma_cases() +
+    get_test_dot_softmax() + get_test_small_dots_cases(),
 )
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
 def test_dot(
@@ -4276,7 +4288,7 @@ def test_dot(
                 ptx,
             )
     elif in_dtype == "int8":
-        if is_tcgen5:
+        if is_tcgen5 and capability[0:2] != (10, 3):
             assert re.search(r"tcgen05.mma.cta_group::1.kind::i8", ptx)
         elif capability[0] == 7 and capability[1] == 5:  # Turing
             assert "mma.sync.aligned.m8n8k16.row.col.satfinite.s32.s8.s8.s32" in ptx

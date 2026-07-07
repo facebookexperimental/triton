@@ -15,6 +15,17 @@ namespace mlir {
 
 namespace tt = mlir::triton;
 
+// Discardable i32 attribute stamped by WSAtomicBroadcast on the
+// dynamic-persistent tile-id broadcast slot's `local_alloc` to request a
+// specific multi-buffer depth (tile prefetch depth). `allocateSmemBuffers`
+// (WSMemoryPlanner) pins the buffer's copy count to this value so the requested
+// depth is honored end-to-end (buffer shape + accumCnt-driven slot/phase),
+// rather than leaving this non-innermost broadcast channel single-buffered.
+// Defined here so the producer (WSAtomicBroadcast) and the consumer
+// (WSMemoryPlanner) share one source of truth for the name.
+constexpr llvm::StringLiteral kAtomicBroadcastCopiesAttrName =
+    "ttg.atomic_broadcast_copies";
+
 enum class DataChannelKind : int {
   SMEM = 0,
   TMEM = 1,
