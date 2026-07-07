@@ -1,0 +1,487 @@
+{{def_kernel("Q", "K", "V", "LSE", "MAX", "KV_NUM_BLKS", "KV_IDX", "FULL_KV_NUM_BLKS", "FULL_KV_IDX")}}
+    # TLX 4-Task Warp-Specialized Flex Attention Forward Kernel (Blackwell)
+    #
+    # Architecture (modeled after _attn_fwd_ws from tlx_attention_ws_pipelined.py):
+    #   Task 1 "default" : Correction (alpha scaling) + Epilogue (normalize, store)
+    #   Task 2 (replicated): Softmax + score_mod/mask_mod via modification() macros
+    #   Task 3            : MMA via tlx.async_dot (Q@K^T, P@V)
+    #   Task 4            : TMA Load (Q, K, V)
+    #
+    # Memory hierarchy:
+    #   SMEM: Q tiles (split), K tiles, V tiles (double buffered)
+    #   TMEM: QK scores, P values, accumulator, alpha/l/m corrections
+
+    tl.static_assert(SPARSE_Q_BLOCK_SIZE >= BLOCK_M and SPARSE_Q_BLOCK_SIZE % BLOCK_M == 0)
+    tl.static_assert(SPARSE_KV_BLOCK_SIZE >= BLOCK_N and SPARSE_KV_BLOCK_SIZE % BLOCK_N == 0)
+
+    stride_qz, stride_qh, stride_qm, stride_qk = {{stride("Q")}}
+    stride_kz, stride_kh, stride_kn, stride_kk = {{stride("K")}}
+    stride_vz, stride_vh, stride_vn, stride_vk = {{stride("V")}}
+
+    ZQ = {{size("Q", 0)}}
+    HQ = {{size("Q", 1)}}
+    Q_LEN = {{size("Q", 2)}}
+    ZKV = {{size("K", 0)}}
+    KV_LEN = {{size("K", 2)}}
+
+    MATMUL_PRECISION = Q.dtype.element_ty
+
+    q_start = tl.program_id(0).to(INDEX_DTYPE)
+    off_zq = tl.program_id(1).to(INDEX_DTYPE)
+    off_hq = tl.program_id(2).to(INDEX_DTYPE)
+
+    off_zkv = off_zq % ZKV
+    off_hkv = off_hq // GQA_SHARED_HEADS
+    off_g = off_hq % GQA_SHARED_HEADS
+
+    q_offset = off_zq * stride_qz + off_hq * stride_qh
+    k_offset = off_zkv * stride_kz + off_hkv * stride_kh
+    v_offset = off_zkv * stride_vz + off_hkv * stride_vh
+
+    Q = Q + q_offset
+    K = K + k_offset
+    V = V + v_offset
+
+    # TMA descriptors
+    desc_q = tl.make_tensor_descriptor(
+        base=Q, shape=[Q_LEN, QK_HEAD_DIM], strides=[stride_qm, 1],
+        block_shape=[BLOCK_M // 2, QK_HEAD_DIM_ROUNDED],
+    )
+    desc_k = tl.make_tensor_descriptor(
+        base=K, shape=[KV_LEN, QK_HEAD_DIM], strides=[stride_kn, 1],
+        block_shape=[BLOCK_N, QK_HEAD_DIM_ROUNDED],
+    )
+    desc_v = tl.make_tensor_descriptor(
+        base=V, shape=[KV_LEN, V_HEAD_DIM], strides=[stride_vn, 1],
+        block_shape=[BLOCK_N, V_HEAD_DIM_ROUNDED],
+    )
+
+    # Sparse block setup
+    SPARSE_Z = {{size("KV_NUM_BLKS", 0)}}
+    SPARSE_HQ = {{size("KV_NUM_BLKS", 1)}}
+    sparse_idx_z = off_zq % SPARSE_Z
+    sparse_idx_hq = off_hq % SPARSE_HQ
+    SPARSE_Q_MULTIPLE: tl.constexpr = (SPARSE_Q_BLOCK_SIZE // BLOCK_M)
+    SPARSE_KV_MULTIPLE: tl.constexpr = (SPARSE_KV_BLOCK_SIZE // BLOCK_N)
+    stride_kv_num_blks_h = {{stride("KV_NUM_BLKS", 1)}}
+    stride_kv_idx_h = {{stride("KV_IDX", 1)}}
+    stride_kv_idx_m = {{stride("KV_IDX", 2)}}
+    sparse_hz_offset = sparse_idx_z * SPARSE_HQ + sparse_idx_hq
+    sparse_kv_num_blks_offset = sparse_hz_offset * stride_kv_num_blks_h + q_start // SPARSE_Q_MULTIPLE
+    sparse_kv_idx_offset = sparse_hz_offset * stride_kv_idx_h + (q_start // SPARSE_Q_MULTIPLE) * stride_kv_idx_m  # noqa: B950
+
+    # ===================== CONSTANTS =====================
+    NUM_MMA_GROUPS: tl.constexpr = 2
+    BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
+    NUM_KV_BUFFERS: tl.constexpr = 2
+    NUM_QK_BUFFERS: tl.constexpr = 1
+    dtype_bytes: tl.constexpr = 2  # bf16/fp16
+
+    # ===================== SMEM ALLOCATIONS =====================
+    q_tiles = tlx.local_alloc((BLOCK_M_SPLIT, QK_HEAD_DIM_ROUNDED), MATMUL_PRECISION, NUM_MMA_GROUPS)
+    k_tiles = tlx.local_alloc((BLOCK_N, QK_HEAD_DIM_ROUNDED), MATMUL_PRECISION, NUM_KV_BUFFERS)
+    v_tiles = tlx.local_alloc((BLOCK_N, V_HEAD_DIM_ROUNDED), MATMUL_PRECISION, NUM_KV_BUFFERS)
+
+    # ===================== TMEM ALLOCATIONS =====================
+    qk_tmem = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), tl.float32, NUM_MMA_GROUPS * NUM_QK_BUFFERS, tlx.storage_kind.tmem)
+    p_tmem = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), MATMUL_PRECISION, NUM_MMA_GROUPS * NUM_QK_BUFFERS, tlx.storage_kind.tmem)
+    acc_tmem = tlx.local_alloc((BLOCK_M_SPLIT, V_HEAD_DIM_ROUNDED), tl.float32, NUM_MMA_GROUPS * NUM_QK_BUFFERS, tlx.storage_kind.tmem)
+
+    # alpha/l/m use SMEM (not TMEM) to avoid TMEM minimum-size alignment issues
+    alpha_smem = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, NUM_MMA_GROUPS)
+    l_smem = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, NUM_MMA_GROUPS)
+    m_smem = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, NUM_MMA_GROUPS)
+
+    # ===================== BARRIERS =====================
+    q_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
+    k_fulls = tlx.alloc_barriers(num_barriers=NUM_KV_BUFFERS)
+    k_empties = tlx.alloc_barriers(num_barriers=NUM_KV_BUFFERS)
+    v_fulls = tlx.alloc_barriers(num_barriers=NUM_KV_BUFFERS)
+    v_empties = tlx.alloc_barriers(num_barriers=NUM_KV_BUFFERS)
+    qk_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_QK_BUFFERS)
+    p_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_QK_BUFFERS)
+    acc_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_QK_BUFFERS)
+    acc_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_QK_BUFFERS)
+    alpha_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
+    alpha_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
+    l_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
+
+    with tlx.async_tasks():
+
+        # ================================================================
+        # TASK 1: CORRECTION + EPILOGUE  (default, gets remaining warps)
+        # ================================================================
+        with tlx.async_task("default"):
+            kv_indices_c = KV_IDX + sparse_kv_idx_offset
+            kv_num_blocks_c = tl.load(KV_NUM_BLKS + sparse_kv_num_blks_offset)
+            block_n_end_c = tl.minimum(kv_num_blocks_c * SPARSE_KV_MULTIPLE, tl.maximum(tl.cdiv(KV_LEN, BLOCK_N), 1))
+
+            total_blocks = block_n_end_c
+            if HAS_FULL_BLOCKS:
+                fkv_num_blocks_c = tl.load(FULL_KV_NUM_BLKS + sparse_kv_num_blks_offset)
+                total_blocks = total_blocks + tl.minimum(fkv_num_blocks_c * SPARSE_KV_MULTIPLE, tl.maximum(tl.cdiv(KV_LEN, BLOCK_N), 1))
+
+            accum_cnt_c = 0
+            for _block in range(0, total_blocks):
+                for cid in tl.static_range(NUM_MMA_GROUPS):
+                    # Wait for alpha from softmax
+                    tlx.barrier_wait(alpha_fulls[cid], (accum_cnt_c // 1) & 1)
+                    alpha_val = tlx.local_load(alpha_smem[cid])
+                    tlx.barrier_arrive(alpha_empties[cid])
+
+                    # Scale accumulator by alpha correction
+                    acc_val = tlx.local_load(acc_tmem[cid])
+                    acc_val = acc_val * alpha_val
+                    tlx.local_store(acc_tmem[cid], acc_val)
+                    tlx.barrier_arrive(acc_fulls[cid])
+
+                accum_cnt_c += 1
+
+            # ---- Epilogue: normalize and store output ----
+            for cid in tl.static_range(NUM_MMA_GROUPS):
+                tlx.barrier_wait(l_fulls[cid], 0)
+                l_val = tlx.local_load(l_smem[cid])
+                m_val = tlx.local_load(m_smem[cid])
+
+                tlx.barrier_wait(acc_empties[cid], 0)
+                acc_val = tlx.local_load(acc_tmem[cid])
+                acc_val = acc_val / l_val
+                lse_val = tl.reshape(m_val, [BLOCK_M_SPLIT]) + tl.math.log2(tl.reshape(l_val, [BLOCK_M_SPLIT]))
+
+                offs_m_cid = q_start * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
+                idx_zq = tl.program_id(1).to(INDEX_DTYPE)
+                idx_hq = tl.program_id(2).to(INDEX_DTYPE)
+                idx_m = offs_m_cid[:, None].to(INDEX_DTYPE)
+                idx_d = tl.arange(0, V_HEAD_DIM_ROUNDED)[None, :].to(INDEX_DTYPE)
+                mask = (idx_m < Q_LEN) & (idx_d < V_HEAD_DIM)
+                {{store_output(("idx_zq", "idx_hq", "idx_m", "idx_d"), "acc_val", "mask", indent_width=16, val_shape=("BLOCK_M_SPLIT", "V_HEAD_DIM_ROUNDED"))}}
+
+                if OUTPUT_LOGSUMEXP:
+                    off_hz = off_zq * HQ + off_hq
+                    l_ptrs = LSE + off_hz * Q_LEN + offs_m_cid
+                    if IS_DIVISIBLE:
+                        tl.store(l_ptrs, lse_val)
+                    else:
+                        tl.store(l_ptrs, lse_val, mask=offs_m_cid < Q_LEN)
+
+                if OUTPUT_MAX:
+                    off_hz = off_zq * HQ + off_hq
+                    max_ptrs = MAX + off_hz * Q_LEN + offs_m_cid
+                    m_scalar = tl.reshape(m_val, [BLOCK_M_SPLIT])
+                    if IS_DIVISIBLE:
+                        tl.store(max_ptrs, m_scalar)
+                    else:
+                        tl.store(max_ptrs, m_scalar, mask=offs_m_cid < Q_LEN)
+
+        # ================================================================
+        # TASK 2: SOFTMAX + MODIFICATIONS  (replicated x NUM_MMA_GROUPS)
+        # ================================================================
+        with tlx.async_task(num_warps=4, registers=152, replicate=NUM_MMA_GROUPS):
+            cid = tlx.async_task_replica_id()
+            offs_m = q_start * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
+            m_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32) - float("inf")
+            l_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32) + 1.0
+            qk_scale = SM_SCALE  # natural scale; RCP_LN2 applied after score_mod/mask_mod
+            RCP_LN2 = 1.44269504  # log2(e): change of base for the exp2 softmax
+
+            # Sparse indices
+            kv_indices_s = KV_IDX + sparse_kv_idx_offset
+            kv_start_s = tl.load(kv_indices_s) * SPARSE_KV_BLOCK_SIZE
+            kv_num_blocks_s = tl.load(KV_NUM_BLKS + sparse_kv_num_blks_offset)
+            block_n_end_s = tl.minimum(kv_num_blocks_s * SPARSE_KV_MULTIPLE, tl.maximum(tl.cdiv(KV_LEN, BLOCK_N), 1))
+
+            offs_n = kv_start_s + tl.arange(0, BLOCK_N)
+            kv_offset_s = 0
+            accum_cnt_s = 0
+
+            # ---- Normal blocks (apply score_mod AND mask_mod) ----
+            for _sn in range(0, block_n_end_s):
+                tlx.barrier_wait(qk_fulls[cid], accum_cnt_s & 1)
+                qk = tlx.local_load(qk_tmem[cid])
+
+                # Scale and apply score_mod
+                qk = qk * qk_scale
+                m = get_bounded_indices(offs_m[:, None], Q_LEN if not IS_DIVISIBLE else None)
+                n = get_bounded_indices(offs_n[None, :], KV_LEN if not IS_DIVISIBLE else None)
+
+                {{ modification(
+                    subgraph_number=0,
+                    output_name="post_mod_scores",
+                    score="qk",
+                    b="off_zq",
+                    h="off_hq",
+                    m="m",
+                    n="n",
+                    out="qk"
+                ) | indent_except_first(4) }}
+
+                if not IS_DIVISIBLE:
+                    post_mod_scores = tl.where(offs_n[None, :] < KV_LEN, post_mod_scores, float("-inf"))
+
+                # Apply mask_mod (non-full blocks)
+                {{ modification(
+                    subgraph_number=1,
+                    output_name="mask_mod_output",
+                    score="qk",
+                    b="off_zq",
+                    h="off_hq",
+                    m="m",
+                    n="n",
+                ) | indent_except_first(4) }}
+
+                if not IS_DIVISIBLE:
+                    mask_mod_output = tl.where(offs_n[None, :] < KV_LEN, mask_mod_output, False)
+                post_mod_scores = tl.where(mask_mod_output, post_mod_scores, float("-inf"))
+                # Change of base now that score_mod + mask_mod are applied.
+                post_mod_scores = post_mod_scores * RCP_LN2
+
+                # Online softmax
+                m_ij = tl.maximum(m_i, tl.max(post_mod_scores, 1))
+                if not ROWS_GUARANTEED_SAFE:
+                    m_ij_masked = tl.where(m_ij == float("-inf"), 0, m_ij)
+                else:
+                    m_ij_masked = m_ij
+                alpha = tl.math.exp2(m_i - m_ij_masked)
+                p = tl.math.exp2(post_mod_scores - m_ij_masked[:, None])
+                l_i = l_i * alpha + tl.sum(p, 1)
+                m_i = m_ij
+
+                # Store alpha to TMEM for correction task
+                tlx.barrier_wait(alpha_empties[cid], accum_cnt_s & 1 ^ 1)
+                tlx.local_store(alpha_smem[cid], alpha[:, None])
+                tlx.barrier_arrive(alpha_fulls[cid])
+
+                # Store P to TMEM for MMA task (P@V)
+                p = p.to(MATMUL_PRECISION)
+                tlx.local_store(p_tmem[cid], p)
+                tlx.barrier_arrive(p_fulls[cid])
+
+                offset = get_offset_for_next_block(
+                    _sn, kv_indices_s, kv_num_blocks_s,
+                    SPARSE_KV_BLOCK_SIZE, SPARSE_KV_MULTIPLE, BLOCK_N, BLOCKS_ARE_CONTIGUOUS
+                )
+                offs_n = offs_n + offset
+                kv_offset_s += offset
+                accum_cnt_s += 1
+
+            # ---- Full blocks (apply score_mod ONLY, skip mask_mod) ----
+            if HAS_FULL_BLOCKS:
+                fkv_indices_s = FULL_KV_IDX + sparse_kv_idx_offset
+                fkv_start_s = tl.load(fkv_indices_s) * SPARSE_KV_BLOCK_SIZE
+                fkv_num_blocks_s = tl.load(FULL_KV_NUM_BLKS + sparse_kv_num_blks_offset)
+                fblock_n_end_s = tl.minimum(fkv_num_blocks_s * SPARSE_KV_MULTIPLE, tl.maximum(tl.cdiv(KV_LEN, BLOCK_N), 1))
+                offs_n = fkv_start_s + tl.arange(0, BLOCK_N)
+                kv_offset_s = 0
+
+                for _sn in range(0, fblock_n_end_s):
+                    tlx.barrier_wait(qk_fulls[cid], accum_cnt_s & 1)
+                    qk = tlx.local_load(qk_tmem[cid])
+
+                    qk = qk * qk_scale
+                    m = get_bounded_indices(offs_m[:, None], Q_LEN if not IS_DIVISIBLE else None)
+                    n = get_bounded_indices(offs_n[None, :], KV_LEN if not IS_DIVISIBLE else None)
+
+                    {{ modification(
+                        subgraph_number=0,
+                        output_name="post_mod_scores",
+                        score="qk",
+                        b="off_zq",
+                        h="off_hq",
+                        m="m",
+                        n="n",
+                        out="qk"
+                    ) | indent_except_first(5) }}
+
+                    if not IS_DIVISIBLE:
+                        post_mod_scores = tl.where(offs_n[None, :] < KV_LEN, post_mod_scores, float("-inf"))
+
+                    # Change of base now that score_mod is applied.
+                    post_mod_scores = post_mod_scores * RCP_LN2
+
+                    m_ij = tl.maximum(m_i, tl.max(post_mod_scores, 1))
+                    if not ROWS_GUARANTEED_SAFE:
+                        m_ij_masked = tl.where(m_ij == float("-inf"), 0, m_ij)
+                    else:
+                        m_ij_masked = m_ij
+                    alpha = tl.math.exp2(m_i - m_ij_masked)
+                    p = tl.math.exp2(post_mod_scores - m_ij_masked[:, None])
+                    l_i = l_i * alpha + tl.sum(p, 1)
+                    m_i = m_ij
+
+                    tlx.barrier_wait(alpha_empties[cid], accum_cnt_s & 1 ^ 1)
+                    tlx.local_store(alpha_smem[cid], alpha[:, None])
+                    tlx.barrier_arrive(alpha_fulls[cid])
+
+                    p = p.to(MATMUL_PRECISION)
+                    tlx.local_store(p_tmem[cid], p)
+                    tlx.barrier_arrive(p_fulls[cid])
+
+                    offset = get_offset_for_next_block(
+                        _sn, fkv_indices_s, fkv_num_blocks_s,
+                        SPARSE_KV_BLOCK_SIZE, SPARSE_KV_MULTIPLE, BLOCK_N, BLOCKS_ARE_CONTIGUOUS
+                    )
+                    offs_n = offs_n + offset
+                    kv_offset_s += offset
+                    accum_cnt_s += 1
+
+            # Store final l_i, m_i for epilogue
+            tlx.local_store(l_smem[cid], l_i[:, None])
+            tlx.local_store(m_smem[cid], m_i[:, None])
+            tlx.barrier_arrive(l_fulls[cid])
+
+        # ================================================================
+        # TASK 3: MMA  (1 warp, async_dot for Q@K^T and P@V)
+        #
+        # Interleaved pattern (matches _attn_fwd_ws reference):
+        #   Peeled iter 0:  Q[0]@K[0] → Q[1]@K[0] → P[0]@V[0]
+        #   Loop iter i:    Q[0]@K[i] → P[1]@V[i-1] → Q[1]@K[i] → P[0]@V[i]
+        #   Cleanup:        P[1]@V[last]
+        #
+        # This overlaps P[1]@V with Q@K, hiding softmax latency.
+        # ================================================================
+        with tlx.async_task(num_warps=1, registers=24):
+            kv_indices_m = KV_IDX + sparse_kv_idx_offset
+            kv_num_blocks_m = tl.load(KV_NUM_BLKS + sparse_kv_num_blks_offset)
+            block_n_end_m = tl.minimum(kv_num_blocks_m * SPARSE_KV_MULTIPLE, tl.maximum(tl.cdiv(KV_LEN, BLOCK_N), 1))
+
+            total_blocks_m = block_n_end_m
+            if HAS_FULL_BLOCKS:
+                fkv_num_blocks_m = tl.load(FULL_KV_NUM_BLKS + sparse_kv_num_blks_offset)
+                total_blocks_m = total_blocks_m + tl.minimum(fkv_num_blocks_m * SPARSE_KV_MULTIPLE, tl.maximum(tl.cdiv(KV_LEN, BLOCK_N), 1))
+
+            # Wait for Q to be loaded (ONCE, before the loop)
+            tlx.barrier_wait(q_fulls[0], 0)
+            tlx.barrier_wait(q_fulls[1], 0)
+
+            # ---- Peeled first iteration (block 0) ----
+            accum_cnt_m = 0
+            k_buf = 0
+            v_buf = 0
+
+            # Q[0]@K[0] → QK[0]
+            tlx.barrier_wait(k_fulls[0], 0)
+            k_t = tlx.local_trans(k_tiles[0])
+            tlx.async_dot(q_tiles[0], k_t, qk_tmem[0], use_acc=False, mBarriers=[qk_fulls[0]])
+            # Q[1]@K[0] → QK[1], release K[0]
+            tlx.async_dot(q_tiles[1], k_t, qk_tmem[1], use_acc=False, mBarriers=[qk_fulls[1], k_empties[0]])
+
+            # P[0]@V[0] → acc[0] (first write, use_acc=False)
+            tlx.barrier_wait(v_fulls[0], 0)
+            tlx.barrier_wait(p_fulls[0], 0)
+            tlx.barrier_wait(acc_fulls[0], 0)
+            tlx.async_dot(p_tmem[0], v_tiles[0], acc_tmem[0], use_acc=False, force_async=True)
+
+            acc1_init = False
+
+            # ---- Interleaved loop (blocks 1..N-1) ----
+            for _block in range(1, total_blocks_m):
+                v_buf_prev = accum_cnt_m % NUM_KV_BUFFERS
+                qk_phase_prev = accum_cnt_m & 1
+
+                accum_cnt_m = accum_cnt_m + 1
+                k_buf = accum_cnt_m % NUM_KV_BUFFERS
+                v_buf = accum_cnt_m % NUM_KV_BUFFERS
+                k_phase = (accum_cnt_m // NUM_KV_BUFFERS) & 1
+                qk_phase = accum_cnt_m & 1
+
+                # Q[0]@K[i] → QK[0]
+                tlx.barrier_wait(k_fulls[k_buf], k_phase)
+                k_t = tlx.local_trans(k_tiles[k_buf])
+                tlx.async_dot(q_tiles[0], k_t, qk_tmem[0], use_acc=False, mBarriers=[qk_fulls[0]])
+
+                # P[1]@V[i-1] → acc[1] (INTERLEAVED from previous iteration!)
+                tlx.barrier_wait(p_fulls[1], qk_phase_prev)
+                tlx.barrier_wait(acc_fulls[1], qk_phase_prev)
+                tlx.async_dot(p_tmem[1], v_tiles[v_buf_prev], acc_tmem[1],
+                              use_acc=acc1_init, mBarriers=[v_empties[v_buf_prev]])
+                acc1_init = True
+
+                # Q[1]@K[i] → QK[1], release K[i]
+                tlx.async_dot(q_tiles[1], k_t, qk_tmem[1], use_acc=False,
+                              mBarriers=[qk_fulls[1], k_empties[k_buf]])
+
+                # P[0]@V[i] → acc[0] (accumulate)
+                v_phase = (accum_cnt_m // NUM_KV_BUFFERS) & 1
+                tlx.barrier_wait(v_fulls[v_buf], v_phase)
+                tlx.barrier_wait(p_fulls[0], qk_phase)
+                tlx.barrier_wait(acc_fulls[0], qk_phase)
+                tlx.async_dot(p_tmem[0], v_tiles[v_buf], acc_tmem[0],
+                              use_acc=True, force_async=True)
+
+            # ---- Cleanup: final P[1]@V[last] ----
+            qk_phase = accum_cnt_m & 1
+            tlx.tcgen05_commit(acc_empties[0])
+
+            tlx.barrier_wait(p_fulls[1], qk_phase)
+            tlx.barrier_wait(acc_fulls[1], qk_phase)
+            tlx.async_dot(p_tmem[1], v_tiles[v_buf], acc_tmem[1],
+                          use_acc=acc1_init,
+                          mBarriers=[acc_empties[1], v_empties[v_buf]])
+
+        # ================================================================
+        # TASK 4: LOAD  (1 warp, TMA loads for Q, K, V)
+        # ================================================================
+        with tlx.async_task(num_warps=1, registers=24):
+            # Load Q[0] and Q[1] via TMA (once)
+            q_base = (q_start * BLOCK_M).to(tl.int32)
+            tlx.barrier_expect_bytes(q_fulls[0], dtype_bytes * BLOCK_M_SPLIT * QK_HEAD_DIM_ROUNDED)
+            tlx.async_descriptor_load(desc_q, q_tiles[0], [q_base, 0], q_fulls[0])
+            tlx.barrier_expect_bytes(q_fulls[1], dtype_bytes * BLOCK_M_SPLIT * QK_HEAD_DIM_ROUNDED)
+            tlx.async_descriptor_load(desc_q, q_tiles[1], [q_base + BLOCK_M_SPLIT, 0], q_fulls[1])
+
+            # Sparse indices for load
+            kv_indices_ld = KV_IDX + sparse_kv_idx_offset
+            kv_start_ld = tl.load(kv_indices_ld) * SPARSE_KV_BLOCK_SIZE
+            kv_num_blocks_ld = tl.load(KV_NUM_BLKS + sparse_kv_num_blks_offset)
+            block_n_end_ld = tl.minimum(kv_num_blocks_ld * SPARSE_KV_MULTIPLE, tl.maximum(tl.cdiv(KV_LEN, BLOCK_N), 1))
+
+            # Load K/V for normal blocks
+            kv_offset_ld = 0
+            accum_cnt_ld = 0
+            for _sn in range(0, block_n_end_ld):
+                buf = accum_cnt_ld % NUM_KV_BUFFERS
+                kv_base = kv_start_ld + kv_offset_ld
+
+                # Load K
+                tlx.barrier_wait(k_empties[buf], (accum_cnt_ld // NUM_KV_BUFFERS) & 1 ^ 1)
+                tlx.barrier_expect_bytes(k_fulls[buf], dtype_bytes * BLOCK_N * QK_HEAD_DIM_ROUNDED)
+                tlx.async_descriptor_load(desc_k, k_tiles[buf], [kv_base, 0], k_fulls[buf])
+
+                # Load V
+                tlx.barrier_wait(v_empties[buf], (accum_cnt_ld // NUM_KV_BUFFERS) & 1 ^ 1)
+                tlx.barrier_expect_bytes(v_fulls[buf], dtype_bytes * BLOCK_N * V_HEAD_DIM_ROUNDED)
+                tlx.async_descriptor_load(desc_v, v_tiles[buf], [kv_base, 0], v_fulls[buf])
+
+                offset = get_offset_for_next_block(
+                    _sn, kv_indices_ld, kv_num_blocks_ld,
+                    SPARSE_KV_BLOCK_SIZE, SPARSE_KV_MULTIPLE, BLOCK_N, BLOCKS_ARE_CONTIGUOUS
+                )
+                kv_offset_ld += offset
+                accum_cnt_ld += 1
+
+            # Load K/V for full blocks
+            if HAS_FULL_BLOCKS:
+                fkv_indices_ld = FULL_KV_IDX + sparse_kv_idx_offset
+                fkv_start_ld = tl.load(fkv_indices_ld) * SPARSE_KV_BLOCK_SIZE
+                fkv_num_blocks_ld = tl.load(FULL_KV_NUM_BLKS + sparse_kv_num_blks_offset)
+                fblock_n_end_ld = tl.minimum(fkv_num_blocks_ld * SPARSE_KV_MULTIPLE, tl.maximum(tl.cdiv(KV_LEN, BLOCK_N), 1))
+
+                kv_offset_ld = 0
+                for _sn in range(0, fblock_n_end_ld):
+                    buf = accum_cnt_ld % NUM_KV_BUFFERS
+                    kv_base = fkv_start_ld + kv_offset_ld
+
+                    tlx.barrier_wait(k_empties[buf], (accum_cnt_ld // NUM_KV_BUFFERS) & 1 ^ 1)
+                    tlx.barrier_expect_bytes(k_fulls[buf], dtype_bytes * BLOCK_N * QK_HEAD_DIM_ROUNDED)
+                    tlx.async_descriptor_load(desc_k, k_tiles[buf], [kv_base, 0], k_fulls[buf])
+
+                    tlx.barrier_wait(v_empties[buf], (accum_cnt_ld // NUM_KV_BUFFERS) & 1 ^ 1)
+                    tlx.barrier_expect_bytes(v_fulls[buf], dtype_bytes * BLOCK_N * V_HEAD_DIM_ROUNDED)
+                    tlx.async_descriptor_load(desc_v, v_tiles[buf], [kv_base, 0], v_fulls[buf])
+
+                    offset = get_offset_for_next_block(
+                        _sn, fkv_indices_ld, fkv_num_blocks_ld,
+                        SPARSE_KV_BLOCK_SIZE, SPARSE_KV_MULTIPLE, BLOCK_N, BLOCKS_ARE_CONTIGUOUS
+                    )
+                    kv_offset_ld += offset
+                    accum_cnt_ld += 1

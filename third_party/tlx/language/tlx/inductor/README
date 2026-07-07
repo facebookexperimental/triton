@@ -1,0 +1,7 @@
+### Q1 FY26 Plan
+
+In Q1’26, we plan to gate most future iterations within the `fb/` folder until they are production-ready. This includes:
+
+- modifying **TLX template files**
+- modifying **TLX heuristic configurations**
+- tuning **TLX template options**
