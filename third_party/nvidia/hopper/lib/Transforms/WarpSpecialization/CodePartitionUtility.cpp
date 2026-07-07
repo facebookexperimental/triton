@@ -3073,7 +3073,11 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
         createChannelsForProducers(currentProds, producerTaskId, consumerIds,
                                    tmemAllocOp.getOperation(), user, channels);
       } else {
-        assert(false && "Unexpected Producer Found");
+        // Producer and consumer are in the same task (partition) -- no
+        // cross-partition channel is needed for this post-loop TMEM load.
+        // (Previously asserted; a same-partition post-loop accumulator load is
+        // legitimate under data partitioning where the epilogue is merged into
+        // the computation partition.)
       }
     }
   }

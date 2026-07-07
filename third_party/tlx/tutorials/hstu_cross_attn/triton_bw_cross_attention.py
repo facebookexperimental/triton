@@ -1853,7 +1853,14 @@ def _hstu_attn_bwd_redq(  # noqa C901
         # Match the TLX kernel (attn_bwd_ws): iterate every KV block in one masked
         # loop — masking is a no-op for full blocks. Kept autoWS-only (constexpr)
         # so the non-WS peeled fast path is unchanged.
-        for start_n in tl.range(0, seq_len_kv, BLOCK_N):
+        for start_n in tl.range(
+            0,
+            seq_len_kv,
+            BLOCK_N,
+            warp_specialize=WS_ON,
+            merge_epilogue_to_computation=WS_ON,
+            data_partition_factor=(2 if BLOCK_N >= 256 else 1),
+        ):
             _hstu_attn_bwd_inner(
                 start_n,
                 seq_start_kv,

@@ -2667,10 +2667,30 @@ struct PartitionSchedulingMeta
 
 void PartitionSchedulingMeta::runOnOperation() {
   SmallVector<scf::ForOp> loops;
+  SmallVector<scf::ForOp> nestedWSLoops;
   getOperation().walk([&](scf::ForOp loop) {
-    if (loop->hasAttr(kWarpSpecializeAttrName))
-      loops.push_back(loop);
+    if (!loop->hasAttr(kWarpSpecializeAttrName))
+      return;
+    // A warp_specialize loop nested inside another warp_specialize loop is part
+    // of the same warp-specialized region (one physical set of warp groups
+    // subdivides the outer loop body). Schedule only the OUTERMOST such loop so
+    // the warp budget is counted once for the nest; getInitialSchedule already
+    // schedules the nested loop's ops via mainLoop.getOps<scf::ForOp>(). Without
+    // this, a nested pair is scheduled twice and its budget summed, which can
+    // spuriously exceed the 16-warp limit and drop warp specialization.
+    for (Operation *p = loop->getParentOp(); p; p = p->getParentOp()) {
+      if (isa<scf::ForOp>(p) && p->hasAttr(kWarpSpecializeAttrName)) {
+        nestedWSLoops.push_back(loop);
+        return;
+      }
+    }
+    loops.push_back(loop);
   });
+  // The nested loops are subsumed by their outer WS region; strip their
+  // attribute so the downstream WarpSpecialization pass does not treat them as
+  // independent regions.
+  for (auto loop : nestedWSLoops)
+    loop->removeAttr(kWarpSpecializeAttrName);
   for (auto [idx, loop] : llvm::enumerate(loops)) {
     // Build SchedulingOptions from pass options and per-loop attributes.
     SchedulingOptions schedOpts;
