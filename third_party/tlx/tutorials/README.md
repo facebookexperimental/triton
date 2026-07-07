@@ -1,14 +1,6 @@
 # TLX Tutorial Kernel Benchmarks
 
-This directory contains runnable TLX tutorial kernels. For AMD gfx1250 TDM
-GEMM examples, run from the Triton repository root with the TLX language path
-on `PYTHONPATH`:
-
-```bash
-cd /home/ibutygin/tlx/triton
-PYTHONPATH=python:third_party/tlx/language \
-python3 third_party/tlx/tutorials/<kernel>.py --help
-```
+This directory contains runnable TLX tutorial kernels.
 
 The benchmark CLIs print:
 
@@ -16,12 +8,11 @@ The benchmark CLIs print:
 execution time: <ms> ms, <tflops> TFLOPS
 ```
 
-## MXFP GEMM
+## MXFP gfx1250 GEMM
 
 Default split fp8e4m3 x fp4 sliceMNK config used for TLX/Gluon comparisons:
 
 ```bash
-PYTHONPATH=python:third_party/tlx/language \
 python3 third_party/tlx/tutorials/amd-mxfp-gemm-tdm-pipelined_test.py \
   -M 2048 -N 1024 -K 8192 \
   -BM 256 -BN 256 -BK 256 \
@@ -38,7 +29,6 @@ python3 third_party/tlx/tutorials/amd-mxfp-gemm-tdm-pipelined_test.py \
 Use CUDA-graph benchmarking when launch overhead should be removed:
 
 ```bash
-PYTHONPATH=python:third_party/tlx/language \
 python3 third_party/tlx/tutorials/amd-mxfp-gemm-tdm-pipelined_test.py \
   -M 2048 -N 1024 -K 8192 \
   -BM 256 -BN 256 -BK 256 \
@@ -57,7 +47,6 @@ python3 third_party/tlx/tutorials/amd-mxfp-gemm-tdm-pipelined_test.py \
 Single-warp-per-SIMD TDM schedule:
 
 ```bash
-PYTHONPATH=python:third_party/tlx/language \
 python3 third_party/tlx/tutorials/amd-tdm-gemm-pipelined_test.py \
   --kernel single_warp \
   -M 2048 -N 1024 -K 8192 \
@@ -71,7 +60,6 @@ python3 third_party/tlx/tutorials/amd-tdm-gemm-pipelined_test.py \
 Simple two-buffer TDM pipeline:
 
 ```bash
-PYTHONPATH=python:third_party/tlx/language \
 python3 third_party/tlx/tutorials/amd-tdm-gemm-pipelined_test.py \
   --kernel simple \
   -M 2048 -N 1024 -K 8192 \
