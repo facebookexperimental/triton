@@ -890,16 +890,17 @@ def test_async_amd_desc_load_pred_compiles_gfx1250(device):
         constexprs={"BLOCK_M": 16, "BLOCK_N": 32, "DO_LOAD": 1},
     )
     ttgir = compiled.asm["ttgir"]
-    # Capture the SSA name fed into the TDM op's pred operand and verify
-    # its definition is i32 — either an explicit i1->i32 extension, or
+    # Capture the SSA name fed into the descriptor update's pred operand and
+    # verify its definition is i32 — either an explicit i1->i32 extension, or
     # (after constant folding) a fresh `arith.constant N : i32`.
-    tdm_match = re.search(r"amdg\.async_tdm_copy_global_to_local\b.*pred = (%\S+)", ttgir)
-    assert tdm_match, ("expected amdg.async_tdm_copy_global_to_local with pred operand, got:\n" + ttgir)
-    pred_ssa = re.escape(tdm_match.group(1))
+    update_match = re.search(r"amdg\.update_tensor_descriptor\b.*pred = (%\S+)", ttgir)
+    assert update_match, ("expected amdg.update_tensor_descriptor with pred operand, got:\n" + ttgir)
+    pred_ssa = re.escape(update_match.group(1))
     has_extension = bool(re.search(rf"{pred_ssa}\s*=\s*arith\.extui\b.*:\s*i1\s+to\s+i32", ttgir))
     has_folded = bool(re.search(rf"{pred_ssa}\s*=\s*arith\.constant\s+\S+\s*:\s*i32", ttgir))
-    assert has_extension or has_folded, (f"expected pred ({tdm_match.group(1)}) to be defined by arith.extui (i1->i32) "
-                                         f"or arith.constant : i32, got:\n" + ttgir)
+    assert has_extension or has_folded, (
+        f"expected pred ({update_match.group(1)}) to be defined by arith.extui (i1->i32) "
+        f"or arith.constant : i32, got:\n" + ttgir)
 
 
 @triton.jit
