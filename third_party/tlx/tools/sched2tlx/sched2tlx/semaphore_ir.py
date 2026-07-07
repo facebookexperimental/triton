@@ -340,7 +340,131 @@ def derive_semaphores(loop: Any, graph: Any = None) -> list[Semaphore]:
     # count, racing the producer's next refill.
     if graph is not None:
         sems.extend(_derive_intrawg_async_consumers(loop, sched, graph, sems))
+        sems.extend(_derive_intrawg_async_result_consumers(loop, sched, graph, sems))
     return sems
+
+
+# Producers whose async RESULT lives in registers/TMEM (not an SMEM buffer that
+# _derive_intrawg_async_consumers already handles): tc_gen5_mma writes a TMEM
+# accumulator; tmem_copy writes TMEM.
+_ASYNC_RESULT_KINDS = (
+    "ttng.tc_gen5_mma",
+    "ttng.tc_gen5_mma_scaled",
+    "ttng.tmem_copy",
+)
+
+
+def _derive_intrawg_async_result_consumers(
+    loop: Any, sched: Any, graph: Any, existing_sems: list[Semaphore]
+) -> list[Semaphore]:
+    """Completion semaphores for an async producer whose register/TMEM RESULT is
+    consumed within the producer's OWN warp group (in-loop).
+
+    `cross_wg_barriers` capture only CROSS-WG edges, and the sibling
+    `_derive_intrawg_async_consumers` covers async-TMA SMEM buffers. This closes
+    the remaining hole: an async result (a `tc_gen5_mma` accumulator or a
+    `tmem_copy`) read by ANY consumer in the same warp group — a `tmem_load`, or
+    another `tc_gen5_mma` reading it as an operand. Without a barrier the
+    consumer races the still-in-flight async producer (tcgen05 writes TMEM
+    asynchronously; the reader must gate on completion). The canonical case is
+    FA-bwd's `dpT = V@dOᵀ` MMA → `dsT = pT*(dpT-Di)` read, both in `wg1`.
+
+    Handshake mirrors the cross-WG named semaphore, intra-WG: one signal-only
+    (bufferless) semaphore per (producer, consumer) pair — the producer arrives
+    its `_full` via mBarriers on HW completion, the consumer waits it. No
+    empty/recycle side is needed: producer and consumer share a warp group
+    (sequential issue) and the consumer carries its own tcgen05 completion wait,
+    so the next iteration's producer is only issued after this read completes.
+
+    Generality note: this covers every async-result → same-WG in-loop consumer
+    edge. In the current generated set only the MMA-acc → `tmem_load` shape
+    occurs (case4); MMA→MMA and `tmem_copy` consumers are structurally handled
+    but not yet exercised by any kernel.
+    """
+    # Map every op_id that names an async result → its producer node. Include
+    # BOTH the producer's own SSA (token/dep operands reference it directly) and,
+    # for an MMA, its accumulator operand (operand[2], the real data hazard).
+    prod_by_result: dict[str, Any] = {}
+    for n in sched.nodes:
+        if n.op_kind not in _ASYNC_RESULT_KINDS or not n.op_ref:
+            continue
+        prod_by_result.setdefault(n.op_ref, n)
+        op = graph.ops.get(n.op_ref)
+        if op is None:
+            continue
+        if "tc_gen5_mma" in n.op_kind and len(getattr(op, "operands", [])) >= 3:
+            acc_id = getattr(op.operands[2], "op_id", None)
+            if acc_id is not None:
+                prod_by_result.setdefault(acc_id, n)
+    if not prod_by_result:
+        return []
+    existing_pairs = {
+        (cb.producer_node, cb.consumer_node) for cb in sched.cross_wg_barriers
+    }
+
+    def _deref(op_id: str) -> str:
+        # One wrapper hop (memdesc_trans / local_alloc) to the underlying value.
+        op = graph.ops.get(op_id)
+        if (
+            op is not None
+            and op.kind in ("ttg.memdesc_trans", "ttg.local_alloc")
+            and getattr(op, "operands", None)
+        ):
+            inner = getattr(op.operands[0], "op_id", None)
+            if inner is not None:
+                return inner
+        return op_id
+
+    extra: list[Semaphore] = []
+    seen_pairs: set[tuple[int, int]] = set()
+    for n in sched.nodes:
+        op = graph.ops.get(n.op_ref) if n.op_ref else None
+        if op is None:
+            continue
+        for opnd in getattr(op, "operands", []):
+            oid = getattr(opnd, "op_id", None)
+            if oid is None:
+                continue
+            prod = None
+            for cand in (oid, _deref(oid)):
+                prod = prod_by_result.get(cand)
+                if prod is not None:
+                    break
+            if prod is None or prod.id == n.id:
+                continue
+            if prod.warp_group != n.warp_group:
+                continue  # cross-WG — already covered by cross_wg_barriers
+            pair = (prod.id, n.id)
+            if pair in existing_pairs or pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            extra.append(
+                Semaphore(
+                    sem_id=len(existing_sems) + len(extra),
+                    buffer=None,  # signal-only completion handshake
+                    depth=1,
+                    is_released=prod.schedule_cycle > n.schedule_cycle,
+                    producers=[
+                        ReleaseSite(
+                            node=NodeRef(loop.loop_id, prod.id),
+                            async_kind=_classify_async_kind(prod.op_kind),
+                        )
+                    ],
+                    consumers=[
+                        AcquireSite(
+                            node=NodeRef(loop.loop_id, n.id),
+                            access_kind=_classify_consumer_access(n.op_kind),
+                        )
+                    ],
+                    empty_arrive_count=1,
+                    note=(
+                        f"intra-WG async result: N{prod.id}→N{n.id} "
+                        f"({prod.op_kind.split('.')[-1]}→{n.op_kind.split('.')[-1]}, "
+                        f"wg{prod.warp_group})"
+                    ),
+                )
+            )
+    return extra
 
 
 def _derive_intrawg_async_consumers(
