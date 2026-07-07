@@ -13,343 +13,343 @@
     ]
   },
   "ops": {
-    "op_88510686042160": {
+    "op_669535616": {
       "kind": "arith.constant",
       "scope": "function",
       "operands": [],
       "result_types": ["i1"],
       "attributes": {"value": 0}
     },
-    "op_88510686042288": {
+    "op_669535728": {
       "kind": "arith.constant",
       "scope": "function",
       "operands": [],
       "result_types": ["i1"],
       "attributes": {"value": -1}
     },
-    "op_88510686042416": {
+    "op_669542512": {
       "kind": "arith.constant",
       "scope": "function",
       "operands": [],
       "result_types": ["i32"],
       "attributes": {"value": 148}
     },
-    "op_88510686042544": {
+    "op_669543856": {
       "kind": "arith.constant",
       "scope": "function",
       "operands": [],
       "result_types": ["i32"],
       "attributes": {"value": 128}
     },
-    "op_88510686042672": {
+    "op_669544064": {
       "kind": "arith.constant",
       "scope": "function",
       "operands": [],
       "result_types": ["i32"],
       "attributes": {"value": 64}
     },
-    "op_88510686042800": {
+    "op_669545408": {
       "kind": "arith.constant",
       "scope": "function",
       "operands": [],
       "result_types": ["i32"],
       "attributes": {"value": 0}
     },
-    "op_88510686042928": {
+    "op_669536368": {
       "kind": "arith.constant",
       "scope": "function",
       "operands": [],
       "result_types": ["i32"],
       "attributes": {"value": 1}
     },
-    "op_88510686043056": {
+    "op_669536576": {
       "kind": "arith.constant",
       "scope": "function",
       "operands": [],
       "result_types": ["i32"],
       "attributes": {"value": 127}
     },
-    "op_88510686043184": {
+    "op_669546416": {
       "kind": "arith.constant",
       "scope": "function",
       "operands": [],
       "result_types": ["i32"],
       "attributes": {"value": 63}
     },
-    "op_88510686043312": {
+    "op_669548944": {
       "kind": "arith.constant",
       "scope": "function",
       "operands": [],
       "result_types": ["tensor<128x128xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"],
       "attributes": {"value": "dense<0.000000e+00> : tensor<128x128xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"}
     },
-    "op_88510686043440": {
+    "op_669549152": {
       "kind": "tt.get_program_id",
       "scope": "function",
       "operands": [],
       "result_types": ["i32"],
       "attributes": {"axis": 0}
     },
-    "op_88991722428400": {
+    "op_669484208": {
       "kind": "arith.addi",
       "scope": "function",
       "operands": [{"arg": "arg4"}, {"const": 127, "type": "i32"}],
       "result_types": ["i32"],
       "attributes": {"overflowFlags": "#arith.overflow<none>"}
     },
-    "op_88991722428640": {
+    "op_669487056": {
       "kind": "arith.divsi",
       "scope": "function",
-      "operands": [{"op": "op_88991722428400"}, {"const": 128, "type": "i32"}],
+      "operands": [{"op": "op_669484208"}, {"const": 128, "type": "i32"}],
       "result_types": ["i32"],
       "attributes": {}
     },
-    "op_88991722428880": {
+    "op_669490240": {
       "kind": "arith.addi",
       "scope": "function",
       "operands": [{"arg": "arg5"}, {"const": 127, "type": "i32"}],
       "result_types": ["i32"],
       "attributes": {"overflowFlags": "#arith.overflow<none>"}
     },
-    "op_88991722429120": {
+    "op_669495600": {
       "kind": "arith.divsi",
       "scope": "function",
-      "operands": [{"op": "op_88991722428880"}, {"const": 128, "type": "i32"}],
+      "operands": [{"op": "op_669490240"}, {"const": 128, "type": "i32"}],
       "result_types": ["i32"],
       "attributes": {}
     },
-    "op_88991722429360": {
+    "op_669551968": {
       "kind": "arith.addi",
       "scope": "function",
       "operands": [{"arg": "arg6"}, {"const": 63, "type": "i32"}],
       "result_types": ["i32"],
       "attributes": {"overflowFlags": "#arith.overflow<none>"}
     },
-    "op_88991722429600": {
+    "op_669552240": {
       "kind": "arith.divsi",
       "scope": "function",
-      "operands": [{"op": "op_88991722429360"}, {"const": 64, "type": "i32"}],
+      "operands": [{"op": "op_669551968"}, {"const": 64, "type": "i32"}],
       "result_types": ["i32"],
       "attributes": {}
     },
-    "op_88991722429840": {
+    "op_669552512": {
       "kind": "arith.muli",
       "scope": "function",
-      "operands": [{"op": "op_88991722428640"}, {"op": "op_88991722429120"}],
+      "operands": [{"op": "op_669487056"}, {"op": "op_669495600"}],
       "result_types": ["i32"],
       "attributes": {"overflowFlags": "#arith.overflow<none>"}
     },
-    "op_88991722430080": {
+    "op_669554384": {
       "kind": "arith.subi",
       "scope": "function",
-      "operands": [{"op": "op_88510686043440"}, {"const": 148, "type": "i32"}],
+      "operands": [{"op": "op_669549152"}, {"const": 148, "type": "i32"}],
       "result_types": ["i32"],
       "attributes": {"overflowFlags": "#arith.overflow<none>"}
     },
-    "op_88991722430320": {
+    "op_669555344": {
       "kind": "arith.divsi",
       "scope": "loop:1",
-      "operands": [{"iv": 1}, {"op": "op_88991722429120"}],
+      "operands": [{"iv": 1}, {"op": "op_669495600"}],
       "result_types": ["i32"],
       "attributes": {"loop.cluster": 6, "loop.stage": 0}
     },
-    "op_88923002951344": {
+    "op_669555616": {
       "kind": "arith.remsi",
       "scope": "loop:1",
-      "operands": [{"iv": 1}, {"op": "op_88991722429120"}],
+      "operands": [{"iv": 1}, {"op": "op_669495600"}],
       "result_types": ["i32"],
       "attributes": {"loop.cluster": 7, "loop.stage": 0}
     },
-    "op_88991722430560": {
+    "op_669555888": {
       "kind": "arith.muli",
       "scope": "loop:1",
-      "operands": [{"op": "op_88991722430320"}, {"const": 128, "type": "i32"}],
+      "operands": [{"op": "op_669555344"}, {"const": 128, "type": "i32"}],
       "result_types": ["i32"],
       "attributes": {"loop.cluster": 8, "loop.stage": 0, "overflowFlags": "#arith.overflow<none>"}
     },
-    "op_88991722430800": {
+    "op_669556160": {
       "kind": "arith.muli",
       "scope": "loop:1",
-      "operands": [{"op": "op_88923002951344"}, {"const": 128, "type": "i32"}],
+      "operands": [{"op": "op_669555616"}, {"const": 128, "type": "i32"}],
       "result_types": ["i32"],
       "attributes": {"loop.cluster": 9, "loop.stage": 0, "overflowFlags": "#arith.overflow<none>"}
     },
-    "op_88716844731152": {
+    "op_669573712": {
       "kind": "ttng.tmem_alloc",
       "scope": "loop:1",
       "operands": [],
       "result_types": ["!ttg.memdesc<128x128xf32, #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>, #ttng.tensor_memory, mutable>", "!ttg.async.token"],
-      "attributes": {"buffer.id": 0, "buffer.merge_group_id": 0, "loop.cluster": 0, "loop.stage": 0, "tt.num_buffers": 2, "ttg.partition": [3]}
+      "attributes": {"buffer.id": 0, "buffer.merge_group_id": 0, "loop.cluster": 0, "loop.stage": 0, "tt.num_buffers": 2, "ttg.partition": [1]}
     },
-    "op_89129161513552": {
+    "op_669484480": {
       "kind": "ttng.tmem_store",
       "scope": "loop:1",
-      "operands": [{"op": "op_88716844731152", "result": 0}, {"op": "op_88716844731152", "result": 1}, {"const": 0, "type": "tensor<128x128xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"}, {"const": -1, "type": "i1"}],
+      "operands": [{"op": "op_669573712", "result": 0}, {"op": "op_669573712", "result": 1}, {"const": 0, "type": "tensor<128x128xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"}, {"const": -1, "type": "i1"}],
       "result_types": ["!ttg.async.token"],
-      "attributes": {"loop.cluster": 0, "loop.stage": 0, "ttg.partition": [3]}
+      "attributes": {"loop.cluster": 0, "loop.stage": 0, "ttg.partition": [1]}
     },
-    "op_88991722437760": {
+    "op_669573904": {
       "kind": "arith.muli",
       "scope": "loop:0",
       "operands": [{"iv": 0}, {"const": 64, "type": "i32"}],
       "result_types": ["i32"],
       "attributes": {"loop.cluster": 0, "loop.stage": 0, "overflowFlags": "#arith.overflow<none>", "ttg.partition": [1]}
     },
-    "op_89129161514192": {
+    "op_669251504": {
       "kind": "tt.descriptor_load",
       "scope": "loop:0",
-      "operands": [{"arg": "arg0"}, {"op": "op_88991722430560"}, {"op": "op_88991722437760"}],
+      "operands": [{"arg": "arg0"}, {"op": "op_669555888"}, {"op": "op_669573904"}],
       "result_types": ["tensor<128x64xf16, #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>>"],
       "attributes": {"cache": 1, "evict": 1, "loop.cluster": 1, "loop.stage": 0, "ttg.partition": [1]}
     },
-    "op_88854283422432": {
+    "op_669490096": {
       "kind": "ttg.local_alloc",
       "scope": "loop:0",
-      "operands": [{"op": "op_89129161514192"}],
+      "operands": [{"op": "op_669251504"}],
       "result_types": ["!ttg.memdesc<128x64xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>, #ttg.shared_memory>"],
-      "attributes": {"buffer.id": 0, "buffer.merge_group_id": 0, "loop.cluster": 3, "loop.stage": 0, "tt.num_buffers": 2, "ttg.partition": [1]}
+      "attributes": {"buffer.id": 0, "buffer.merge_group_id": 0, "loop.cluster": 0, "loop.stage": 2, "tt.num_buffers": 3, "ttg.partition": [1]}
     },
-    "op_89129161514512": {
+    "op_669217552": {
       "kind": "tt.descriptor_load",
       "scope": "loop:0",
-      "operands": [{"arg": "arg1"}, {"op": "op_88991722437760"}, {"op": "op_88991722430800"}],
+      "operands": [{"arg": "arg1"}, {"op": "op_669573904"}, {"op": "op_669556160"}],
       "result_types": ["tensor<64x128xf16, #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>>"],
       "attributes": {"cache": 1, "evict": 1, "loop.cluster": 2, "loop.stage": 0, "ttg.partition": [2]}
     },
-    "op_88854283422640": {
+    "op_669576976": {
       "kind": "ttg.local_alloc",
       "scope": "loop:0",
-      "operands": [{"op": "op_89129161514512"}],
+      "operands": [{"op": "op_669217552"}],
       "result_types": ["!ttg.memdesc<64x128xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>, #ttg.shared_memory>"],
-      "attributes": {"buffer.id": 1, "buffer.merge_group_id": 1, "loop.cluster": 0, "loop.stage": 1, "tt.num_buffers": 2, "ttg.partition": [2]}
+      "attributes": {"buffer.id": 1, "buffer.merge_group_id": 1, "loop.cluster": 1, "loop.stage": 2, "tt.num_buffers": 3, "ttg.partition": [2]}
     },
-    "op_89266600427536": {
+    "op_668903632": {
       "kind": "ttng.tc_gen5_mma",
       "scope": "loop:0",
-      "operands": [{"op": "op_88854283422432"}, {"op": "op_88854283422640"}, {"op": "op_88716844731152", "result": 0}, {"iter_arg": {"loop": 0, "idx": 1}}, {"iter_arg": {"loop": 0, "idx": 0}}, {"const": -1, "type": "i1"}],
+      "operands": [{"op": "op_669490096"}, {"op": "op_669576976"}, {"op": "op_669573712", "result": 0}, {"iter_arg": {"loop": 0, "idx": 1}}, {"iter_arg": {"loop": 0, "idx": 0}}, {"const": -1, "type": "i1"}],
       "result_types": ["!ttg.async.token"],
-      "attributes": {"loop.cluster": 0, "loop.stage": 1, "operandSegmentSizes": [1, 1, 1, 1, 1, 1, 0, 0], "ttg.partition": [3]}
+      "attributes": {"loop.cluster": 1, "loop.stage": 2, "operandSegmentSizes": [1, 1, 1, 1, 1, 1, 0, 0], "ttg.partition": [3]}
     },
-    "op_88854283422832": {
+    "op_669577584": {
       "kind": "scf.yield",
       "scope": "loop:0",
-      "operands": [{"const": -1, "type": "i1"}, {"op": "op_89266600427536"}],
+      "operands": [{"const": -1, "type": "i1"}, {"op": "op_668903632"}],
       "result_types": [],
       "attributes": {}
     },
-    "op_89197880821472": {
+    "op_669565312": {
       "kind": "scf.for",
       "scope": "loop:1",
-      "operands": [{"const": 0, "type": "i32"}, {"op": "op_88991722429600"}, {"const": 1, "type": "i32"}, {"const": 0, "type": "i1"}, {"op": "op_89129161513552"}],
+      "operands": [{"const": 0, "type": "i32"}, {"op": "op_669552240"}, {"const": 1, "type": "i32"}, {"const": 0, "type": "i1"}, {"op": "op_669484480"}],
       "result_types": ["i1", "!ttg.async.token"],
-      "attributes": {"loop.cluster": 10, "loop.stage": 0, "tt.modulo_ii": 559, "tt.num_stages": 2, "tt.scheduled_max_stage": 1, "ttg.partition": [3], "ttg.partition.stages": [0, 0, 1, 1], "ttg.partition_num_warps": [4, 1, 1, 1], "ttg.warp_specialize.tag": 0}
+      "attributes": {"loop.cluster": 10, "loop.stage": 0, "tt.modulo_ii": 256, "tt.num_stages": 3, "tt.scheduled_max_stage": 2, "ttg.partition": [1], "ttg.partition.stages": [0, 2, 2, 2], "ttg.partition_num_warps": [4, 1, 1, 1], "ttg.warp_specialize.tag": 0}
     },
-    "op_88991722438960": {
+    "op_669572160": {
       "kind": "arith.addi",
       "scope": "loop:1",
       "operands": [{"iter_arg": {"loop": 1, "idx": 0}}, {"const": 148, "type": "i32"}],
       "result_types": ["i32"],
-      "attributes": {"loop.cluster": 1, "loop.stage": 0, "overflowFlags": "#arith.overflow<none>", "ttg.partition": [3]}
+      "attributes": {"loop.cluster": 1, "loop.stage": 0, "overflowFlags": "#arith.overflow<none>", "ttg.partition": [1]}
     },
-    "op_88991722439200": {
+    "op_669580160": {
       "kind": "arith.divsi",
       "scope": "loop:1",
-      "operands": [{"op": "op_88991722438960"}, {"op": "op_88991722429120"}],
+      "operands": [{"op": "op_669572160"}, {"op": "op_669495600"}],
       "result_types": ["i32"],
-      "attributes": {"loop.cluster": 2, "loop.stage": 0, "ttg.partition": [3]}
+      "attributes": {"loop.cluster": 2, "loop.stage": 0, "ttg.partition": [1]}
     },
-    "op_88923002951568": {
+    "op_669574240": {
       "kind": "arith.remsi",
       "scope": "loop:1",
-      "operands": [{"op": "op_88991722438960"}, {"op": "op_88991722429120"}],
+      "operands": [{"op": "op_669572160"}, {"op": "op_669495600"}],
       "result_types": ["i32"],
-      "attributes": {"loop.cluster": 3, "loop.stage": 0, "ttg.partition": [3]}
+      "attributes": {"loop.cluster": 3, "loop.stage": 0, "ttg.partition": [1]}
     },
-    "op_88991722439440": {
+    "op_669569824": {
       "kind": "arith.muli",
       "scope": "loop:1",
-      "operands": [{"op": "op_88991722439200"}, {"const": 128, "type": "i32"}],
+      "operands": [{"op": "op_669580160"}, {"const": 128, "type": "i32"}],
       "result_types": ["i32"],
-      "attributes": {"loop.cluster": 4, "loop.stage": 0, "overflowFlags": "#arith.overflow<none>", "ttg.partition": [3]}
+      "attributes": {"loop.cluster": 4, "loop.stage": 0, "overflowFlags": "#arith.overflow<none>", "ttg.partition": [1]}
     },
-    "op_88991722439680": {
+    "op_669580560": {
       "kind": "arith.muli",
       "scope": "loop:1",
-      "operands": [{"op": "op_88923002951568"}, {"const": 128, "type": "i32"}],
+      "operands": [{"op": "op_669574240"}, {"const": 128, "type": "i32"}],
       "result_types": ["i32"],
-      "attributes": {"loop.cluster": 5, "loop.stage": 0, "overflowFlags": "#arith.overflow<none>", "ttg.partition": [3]}
+      "attributes": {"loop.cluster": 5, "loop.stage": 0, "overflowFlags": "#arith.overflow<none>", "ttg.partition": [1]}
     },
-    "op_89129161514832": {
+    "op_669554864": {
       "kind": "tt.descriptor_load",
       "scope": "loop:1",
-      "operands": [{"arg": "arg2"}, {"op": "op_88991722439440"}, {"op": "op_88991722439680"}],
+      "operands": [{"arg": "arg2"}, {"op": "op_669569824"}, {"op": "op_669580560"}],
       "result_types": ["tensor<128x128xf16, #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>"],
-      "attributes": {"cache": 1, "evict": 1, "loop.cluster": 6, "loop.stage": 0, "ttg.partition": [3]}
+      "attributes": {"cache": 1, "evict": 1, "loop.cluster": 6, "loop.stage": 0, "ttg.partition": [1]}
     },
-    "op_88854283423056": {
+    "op_669566128": {
       "kind": "arith.extf",
       "scope": "loop:1",
-      "operands": [{"op": "op_89129161514832"}],
+      "operands": [{"op": "op_669554864"}],
       "result_types": ["tensor<128x128xf32, #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>"],
-      "attributes": {"loop.cluster": 11, "loop.stage": 0, "ttg.partition": [3]}
+      "attributes": {"loop.cluster": 11, "loop.stage": 0, "ttg.partition": [1]}
     },
-    "op_88785564011728": {
+    "op_669566272": {
       "kind": "ttg.convert_layout",
       "scope": "loop:1",
-      "operands": [{"op": "op_88854283423056"}],
+      "operands": [{"op": "op_669566128"}],
       "result_types": ["tensor<128x128xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"],
-      "attributes": {"loop.cluster": 12, "loop.stage": 0, "ttg.partition": [3]}
+      "attributes": {"loop.cluster": 12, "loop.stage": 0, "ttg.partition": [1]}
     },
-    "op_89129161515168": {
+    "op_669568112": {
       "kind": "ttng.tmem_load",
       "scope": "loop:1",
-      "operands": [{"op": "op_88716844731152", "result": 0}, {"op": "op_89197880821472", "result": 1}],
+      "operands": [{"op": "op_669573712", "result": 0}, {"op": "op_669565312", "result": 1}],
       "result_types": ["tensor<128x128xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>", "!ttg.async.token"],
-      "attributes": {"loop.cluster": 0, "loop.stage": 1, "resultSegmentSizes": [1, 1, 0], "ttg.partition": [3]}
+      "attributes": {"loop.cluster": 0, "loop.stage": 1, "resultSegmentSizes": [1, 1, 0], "ttg.partition": [1]}
     },
-    "op_88991722440880": {
+    "op_669581584": {
       "kind": "arith.addf",
       "scope": "loop:1",
-      "operands": [{"op": "op_89129161515168", "result": 0}, {"op": "op_88785564011728"}],
+      "operands": [{"op": "op_669568112", "result": 0}, {"op": "op_669566272"}],
       "result_types": ["tensor<128x128xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"],
-      "attributes": {"fastmath": "#arith.fastmath<none>", "loop.cluster": 1, "loop.stage": 1, "ttg.partition": [3]}
+      "attributes": {"fastmath": "#arith.fastmath<none>", "loop.cluster": 1, "loop.stage": 1, "ttg.partition": [1]}
     },
-    "op_88854283423264": {
+    "op_669575712": {
       "kind": "arith.truncf",
       "scope": "loop:1",
-      "operands": [{"op": "op_88991722440880"}],
+      "operands": [{"op": "op_669581584"}],
       "result_types": ["tensor<128x128xf16, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"],
-      "attributes": {"loop.cluster": 2, "loop.stage": 1, "ttg.partition": [3]}
+      "attributes": {"loop.cluster": 2, "loop.stage": 1, "ttg.partition": [1]}
     },
-    "op_88785564011920": {
+    "op_669575872": {
       "kind": "ttg.convert_layout",
       "scope": "loop:1",
-      "operands": [{"op": "op_88854283423264"}],
+      "operands": [{"op": "op_669575712"}],
       "result_types": ["tensor<128x128xf16, #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>"],
-      "attributes": {"loop.cluster": 3, "loop.stage": 1, "ttg.partition": [3]}
+      "attributes": {"loop.cluster": 3, "loop.stage": 1, "ttg.partition": [1]}
     },
-    "op_89129161515456": {
+    "op_669216224": {
       "kind": "tt.descriptor_store",
       "scope": "loop:1",
-      "operands": [{"arg": "arg3"}, {"op": "op_88785564011920"}, {"op": "op_88991722439440"}, {"op": "op_88991722439680"}],
+      "operands": [{"arg": "arg3"}, {"op": "op_669575872"}, {"op": "op_669569824"}, {"op": "op_669580560"}],
       "result_types": [],
-      "attributes": {"buffer.id": 1, "loop.cluster": 4, "loop.stage": 1, "reduce_kind": 0, "tt.num_buffers": 1, "ttg.partition": [3]}
+      "attributes": {"buffer.id": 1, "loop.cluster": 4, "loop.stage": 1, "reduce_kind": 0, "tt.num_buffers": 1, "ttg.partition": [1]}
     },
-    "op_88716844731296": {
+    "op_669577136": {
       "kind": "scf.yield",
       "scope": "loop:1",
-      "operands": [{"op": "op_88991722438960"}],
+      "operands": [{"op": "op_669572160"}],
       "result_types": [],
       "attributes": {}
     },
-    "op_89129161515792": {
+    "op_668957696": {
       "kind": "scf.for",
       "scope": "function",
-      "operands": [{"op": "op_88510686043440"}, {"op": "op_88991722429840"}, {"const": 148, "type": "i32"}, {"op": "op_88991722430080"}],
+      "operands": [{"op": "op_669549152"}, {"op": "op_669552512"}, {"const": 148, "type": "i32"}, {"op": "op_669554384"}],
       "result_types": ["i32"],
-      "attributes": {"tt.modulo_ii": 17888, "tt.num_stages": 2, "tt.scheduled_max_stage": 1, "tt.warp_specialize": "unit", "ttg.partition.stages": [0, 0, 0, 1], "ttg.partition_num_warps": [4, 1, 1, 4], "ttg.warp_specialize.tag": 0}
+      "attributes": {"tt.modulo_ii": 8192, "tt.num_stages": 2, "tt.scheduled_max_stage": 1, "tt.warp_specialize": "unit", "ttg.partition.stages": [0, 1], "ttg.partition_num_warps": [4, 4], "ttg.warp_specialize.tag": 0}
     },
-    "op_88441966594768": {
+    "op_669572448": {
       "kind": "tt.return",
       "scope": "function",
       "operands": [],
@@ -364,30 +364,30 @@
       "warp_groups": [{"id": 0, "num_warps": 1, "pipelines": ["NONE", "TMA"]}, {"id": 1, "num_warps": 1, "pipelines": ["NONE", "TMA"]}, {"id": 2, "num_warps": 1, "pipelines": ["TC"]}],
       "schedule_loop":     {
       "id": 0,
-      "II": 559,
+      "II": 256,
       "partition_cost": 120.9970,
-      "max_stage": 1,
-      "prologue_latency": 559,
+      "max_stage": 2,
+      "prologue_latency": 256,
       "trip_count": 4,
       "trip_count_estimated": true,
       "induction_var": {"name": "iv", "type": "i32"},
       "lower_bound": {"const": 0, "type": "i32"},
-      "upper_bound": {"op": "op_88991722429600"},
+      "upper_bound": {"op": "op_669552240"},
       "step": {"const": 1, "type": "i32"},
       "buffers": [
-        {"id": 0, "kind": "smem", "shape": [128, 64], "element_bits": 16, "count": 2, "size_bytes": 16384, "total_bytes": 32768, "merge_group_id": 0, "paired_buffer_id": 2, "live_start": 557, "live_end": 1146, "def_op": "op_88854283422432"},
-        {"id": 1, "kind": "smem", "shape": [64, 128], "element_bits": 16, "count": 2, "size_bytes": 16384, "total_bytes": 32768, "merge_group_id": 1, "paired_buffer_id": 3, "live_start": 587, "live_end": 1146, "def_op": "op_88854283422640"},
-        {"id": 2, "kind": "barrier", "shape": [], "element_bits": 16, "count": 2, "size_bytes": 8, "total_bytes": 16, "merge_group_id": null, "paired_buffer_id": 0, "live_start": 557, "live_end": 1146, "def_op": "op_88854283422432"},
-        {"id": 3, "kind": "barrier", "shape": [], "element_bits": 16, "count": 2, "size_bytes": 8, "total_bytes": 16, "merge_group_id": null, "paired_buffer_id": 1, "live_start": 587, "live_end": 1146, "def_op": "op_88854283422640"}
+        {"id": 0, "kind": "smem", "shape": [128, 64], "element_bits": 16, "count": 3, "size_bytes": 16384, "total_bytes": 49152, "merge_group_id": 0, "paired_buffer_id": 2, "live_start": 557, "live_end": 1146, "def_op": "op_669490096"},
+        {"id": 1, "kind": "smem", "shape": [64, 128], "element_bits": 16, "count": 3, "size_bytes": 16384, "total_bytes": 49152, "merge_group_id": 1, "paired_buffer_id": 3, "live_start": 587, "live_end": 1146, "def_op": "op_669576976"},
+        {"id": 2, "kind": "barrier", "shape": [], "element_bits": 16, "count": 3, "size_bytes": 8, "total_bytes": 24, "merge_group_id": null, "paired_buffer_id": 0, "live_start": 557, "live_end": 1146, "def_op": "op_669490096"},
+        {"id": 3, "kind": "barrier", "shape": [], "element_bits": 16, "count": 3, "size_bytes": 8, "total_bytes": 24, "merge_group_id": null, "paired_buffer_id": 1, "live_start": 587, "live_end": 1146, "def_op": "op_669576976"}
       ],
       "graph": {
         "nodes": [
-          {"id": 0, "op_ref": "op_88991722437760", "op_kind": "arith.muli", "pipeline": "CUDA", "warp_group": -2, "latency": 1, "self_latency": 1, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 0, "stage": 0, "cluster": 0}, "produces_buffer": null, "consumes_buffers": []},
-          {"id": 1, "op_ref": "op_89129161514192", "op_kind": "tt.descriptor_load", "pipeline": "TMA", "warp_group": 0, "latency": 556, "self_latency": 30, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 1, "stage": 0, "cluster": 1}, "produces_buffer": null, "consumes_buffers": []},
-          {"id": 2, "op_ref": "op_88854283422432", "op_kind": "ttg.local_alloc", "pipeline": "NONE", "warp_group": 0, "latency": 0, "self_latency": 0, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 557, "stage": 0, "cluster": 3}, "produces_buffer": 0, "consumes_buffers": []},
-          {"id": 3, "op_ref": "op_89129161514512", "op_kind": "tt.descriptor_load", "pipeline": "TMA", "warp_group": 1, "latency": 556, "self_latency": 30, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 31, "stage": 0, "cluster": 2}, "produces_buffer": null, "consumes_buffers": []},
-          {"id": 4, "op_ref": "op_88854283422640", "op_kind": "ttg.local_alloc", "pipeline": "NONE", "warp_group": 1, "latency": 0, "self_latency": 0, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 587, "stage": 1, "cluster": 0}, "produces_buffer": 1, "consumes_buffers": []},
-          {"id": 5, "op_ref": "op_89266600427536", "op_kind": "ttng.tc_gen5_mma", "pipeline": "TC", "warp_group": 2, "latency": 559, "self_latency": 30, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 587, "stage": 1, "cluster": 0}, "produces_buffer": null, "consumes_buffers": [0, 1]}
+          {"id": 0, "op_ref": "op_669573904", "op_kind": "arith.muli", "pipeline": "CUDA", "warp_group": -2, "latency": 1, "self_latency": 1, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 0, "stage": 0, "cluster": 0}, "produces_buffer": null, "consumes_buffers": []},
+          {"id": 1, "op_ref": "op_669251504", "op_kind": "tt.descriptor_load", "pipeline": "TMA", "warp_group": 0, "latency": 556, "self_latency": 30, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 1, "stage": 0, "cluster": 1}, "produces_buffer": null, "consumes_buffers": []},
+          {"id": 2, "op_ref": "op_669490096", "op_kind": "ttg.local_alloc", "pipeline": "NONE", "warp_group": 0, "latency": 0, "self_latency": 0, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 557, "stage": 2, "cluster": 0}, "produces_buffer": 0, "consumes_buffers": []},
+          {"id": 3, "op_ref": "op_669217552", "op_kind": "tt.descriptor_load", "pipeline": "TMA", "warp_group": 1, "latency": 556, "self_latency": 30, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 31, "stage": 0, "cluster": 2}, "produces_buffer": null, "consumes_buffers": []},
+          {"id": 4, "op_ref": "op_669576976", "op_kind": "ttg.local_alloc", "pipeline": "NONE", "warp_group": 1, "latency": 0, "self_latency": 0, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 587, "stage": 2, "cluster": 1}, "produces_buffer": 1, "consumes_buffers": []},
+          {"id": 5, "op_ref": "op_668903632", "op_kind": "ttng.tc_gen5_mma", "pipeline": "TC", "warp_group": 2, "latency": 559, "self_latency": 30, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 587, "stage": 2, "cluster": 1}, "produces_buffer": null, "consumes_buffers": [0, 1]}
         ],
         "edges": [
           {"src": 0, "dst": 1, "kind": "data", "distance": 0, "latency": 1},
@@ -396,11 +396,11 @@
           {"src": 3, "dst": 4, "kind": "data", "distance": 0, "latency": 556},
           {"src": 2, "dst": 5, "kind": "data", "distance": 0, "latency": 0},
           {"src": 4, "dst": 5, "kind": "data", "distance": 0, "latency": 0},
-          {"src": 5, "dst": 5, "kind": "data", "distance": 1, "latency": 559}
+          {"src": 5, "dst": 5, "kind": "data", "distance": 1, "latency": 256}
         ],
         "cross_wg_barriers": [
-          {"producer_node": 2, "consumer_node": 5, "producer_wg": 0, "consumer_wg": 2, "kind": "mbarrier", "depth": 2, "paired_buffer_id": 0, "expect_bytes": 16384},
-          {"producer_node": 4, "consumer_node": 5, "producer_wg": 1, "consumer_wg": 2, "kind": "mbarrier", "depth": 2, "paired_buffer_id": 1, "expect_bytes": 16384}
+          {"producer_node": 2, "consumer_node": 5, "producer_wg": 0, "consumer_wg": 2, "kind": "mbarrier", "depth": 3, "paired_buffer_id": 0, "expect_bytes": 16384},
+          {"producer_node": 4, "consumer_node": 5, "producer_wg": 1, "consumer_wg": 2, "kind": "mbarrier", "depth": 3, "paired_buffer_id": 1, "expect_bytes": 16384}
         ]
       }
     }
@@ -408,46 +408,46 @@
     {
       "loop_id": 1,
       "is_outer": true,
-      "warp_groups": [{"id": 2, "num_warps": 4, "pipelines": ["CUDA", "NONE", "TMA"]}],
+      "warp_groups": [{"id": 0, "num_warps": 4, "pipelines": ["CUDA", "NONE", "TMA"]}],
       "schedule_loop":     {
       "id": 1,
-      "II": 17888,
-      "partition_cost": 1966.9970,
+      "II": 8192,
+      "partition_cost": 0.0000,
       "max_stage": 1,
       "prologue_latency": 96,
       "trip_count": 4,
       "trip_count_estimated": true,
       "induction_var": {"name": "iv", "type": "i32"},
-      "lower_bound": {"op": "op_88510686043440"},
-      "upper_bound": {"op": "op_88991722429840"},
+      "lower_bound": {"op": "op_669549152"},
+      "upper_bound": {"op": "op_669552512"},
       "step": {"const": 148, "type": "i32"},
       "buffers": [
-        {"id": 0, "kind": "tmem", "shape": [128, 128], "element_bits": 32, "count": 2, "size_bytes": 65536, "total_bytes": 131072, "merge_group_id": 0, "paired_buffer_id": 2, "live_start": 0, "live_end": 18516, "def_op": "op_88716844731152"},
-        {"id": 1, "kind": "smem", "shape": [128, 128], "element_bits": 16, "count": 1, "size_bytes": 32768, "total_bytes": 32768, "merge_group_id": null, "paired_buffer_id": null, "live_start": 19143, "live_end": 19143, "def_op": "op_89129161515456"},
-        {"id": 2, "kind": "barrier", "shape": [], "element_bits": 16, "count": 2, "size_bytes": 8, "total_bytes": 16, "merge_group_id": null, "paired_buffer_id": 0, "live_start": 0, "live_end": 18516, "def_op": "op_88716844731152"}
+        {"id": 0, "kind": "tmem", "shape": [128, 128], "element_bits": 32, "count": 2, "size_bytes": 65536, "total_bytes": 131072, "merge_group_id": 0, "paired_buffer_id": 2, "live_start": 0, "live_end": 8820, "def_op": "op_669573712"},
+        {"id": 1, "kind": "smem", "shape": [128, 128], "element_bits": 16, "count": 1, "size_bytes": 32768, "total_bytes": 32768, "merge_group_id": null, "paired_buffer_id": null, "live_start": 9447, "live_end": 9447, "def_op": "op_669216224"},
+        {"id": 2, "kind": "barrier", "shape": [], "element_bits": 16, "count": 2, "size_bytes": 8, "total_bytes": 16, "merge_group_id": null, "paired_buffer_id": 0, "live_start": 0, "live_end": 8820, "def_op": "op_669573712"}
       ],
       "graph": {
         "nodes": [
-          {"id": 0, "op_ref": "op_88991722430320", "op_kind": "arith.divsi", "pipeline": "CUDA", "warp_group": -1, "latency": 1, "self_latency": 1, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 53, "stage": 0, "cluster": 6}, "produces_buffer": null, "consumes_buffers": []},
-          {"id": 1, "op_ref": "op_88923002951344", "op_kind": "arith.remsi", "pipeline": "CUDA", "warp_group": -1, "latency": 1, "self_latency": 1, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 54, "stage": 0, "cluster": 7}, "produces_buffer": null, "consumes_buffers": []},
-          {"id": 2, "op_ref": "op_88991722430560", "op_kind": "arith.muli", "pipeline": "CUDA", "warp_group": -1, "latency": 1, "self_latency": 1, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 55, "stage": 0, "cluster": 8}, "produces_buffer": null, "consumes_buffers": []},
-          {"id": 3, "op_ref": "op_88991722430800", "op_kind": "arith.muli", "pipeline": "CUDA", "warp_group": -1, "latency": 1, "self_latency": 1, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 56, "stage": 0, "cluster": 9}, "produces_buffer": null, "consumes_buffers": []},
-          {"id": 4, "op_ref": "op_88716844731152", "op_kind": "ttng.tmem_alloc", "pipeline": "NONE", "warp_group": 2, "latency": 0, "self_latency": 0, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 0, "stage": 0, "cluster": 0}, "produces_buffer": 0, "consumes_buffers": []},
-          {"id": 5, "op_ref": "op_89129161513552", "op_kind": "ttng.tmem_store", "pipeline": "CUDA", "warp_group": 2, "latency": 96, "self_latency": 48, "min_warps": 4, "frequency_multiplier": 1, "schedule": {"cycle": 0, "stage": 0, "cluster": 0}, "produces_buffer": null, "consumes_buffers": [0]},
-          {"id": 6, "op_ref": "op_89197880821472", "op_kind": "scf.for", "pipeline": "NONE", "warp_group": 2, "latency": 17888, "self_latency": 0, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 96, "stage": 0, "cluster": 10}, "produces_buffer": null, "consumes_buffers": [], "child_pipeline_id": 1, "prologue_latency": 559},
-          {"id": 7, "op_ref": "op_88991722438960", "op_kind": "arith.addi", "pipeline": "CUDA", "warp_group": 2, "latency": 1, "self_latency": 1, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 48, "stage": 0, "cluster": 1}, "produces_buffer": null, "consumes_buffers": []},
-          {"id": 8, "op_ref": "op_88991722439200", "op_kind": "arith.divsi", "pipeline": "CUDA", "warp_group": 2, "latency": 1, "self_latency": 1, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 49, "stage": 0, "cluster": 2}, "produces_buffer": null, "consumes_buffers": []},
-          {"id": 9, "op_ref": "op_88923002951568", "op_kind": "arith.remsi", "pipeline": "CUDA", "warp_group": 2, "latency": 1, "self_latency": 1, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 50, "stage": 0, "cluster": 3}, "produces_buffer": null, "consumes_buffers": []},
-          {"id": 10, "op_ref": "op_88991722439440", "op_kind": "arith.muli", "pipeline": "CUDA", "warp_group": 2, "latency": 1, "self_latency": 1, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 51, "stage": 0, "cluster": 4}, "produces_buffer": null, "consumes_buffers": []},
-          {"id": 11, "op_ref": "op_88991722439680", "op_kind": "arith.muli", "pipeline": "CUDA", "warp_group": 2, "latency": 1, "self_latency": 1, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 52, "stage": 0, "cluster": 5}, "produces_buffer": null, "consumes_buffers": []},
-          {"id": 12, "op_ref": "op_89129161514832", "op_kind": "tt.descriptor_load", "pipeline": "TMA", "warp_group": 2, "latency": 652, "self_latency": 30, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 53, "stage": 0, "cluster": 6}, "produces_buffer": null, "consumes_buffers": []},
-          {"id": 13, "op_ref": "op_88854283423056", "op_kind": "arith.extf", "pipeline": "CUDA", "warp_group": 2, "latency": 105, "self_latency": 64, "min_warps": 4, "frequency_multiplier": 1, "schedule": {"cycle": 705, "stage": 0, "cluster": 11}, "produces_buffer": null, "consumes_buffers": []},
-          {"id": 14, "op_ref": "op_88785564011728", "op_kind": "ttg.convert_layout", "pipeline": "CUDA", "warp_group": 2, "latency": 105, "self_latency": 105, "min_warps": 4, "frequency_multiplier": 1, "schedule": {"cycle": 810, "stage": 0, "cluster": 12}, "produces_buffer": null, "consumes_buffers": []},
-          {"id": 15, "op_ref": "op_89129161515168", "op_kind": "ttng.tmem_load", "pipeline": "CUDA", "warp_group": 2, "latency": 532, "self_latency": 256, "min_warps": 4, "frequency_multiplier": 1, "schedule": {"cycle": 17984, "stage": 1, "cluster": 0}, "produces_buffer": null, "consumes_buffers": [0]},
-          {"id": 16, "op_ref": "op_88991722440880", "op_kind": "arith.addf", "pipeline": "CUDA", "warp_group": 2, "latency": 130, "self_latency": 128, "min_warps": 4, "frequency_multiplier": 1, "schedule": {"cycle": 18803, "stage": 1, "cluster": 1}, "produces_buffer": null, "consumes_buffers": []},
-          {"id": 17, "op_ref": "op_88854283423264", "op_kind": "arith.truncf", "pipeline": "CUDA", "warp_group": 2, "latency": 105, "self_latency": 64, "min_warps": 4, "frequency_multiplier": 1, "schedule": {"cycle": 18933, "stage": 1, "cluster": 2}, "produces_buffer": null, "consumes_buffers": []},
-          {"id": 18, "op_ref": "op_88785564011920", "op_kind": "ttg.convert_layout", "pipeline": "CUDA", "warp_group": 2, "latency": 105, "self_latency": 105, "min_warps": 4, "frequency_multiplier": 1, "schedule": {"cycle": 19038, "stage": 1, "cluster": 3}, "produces_buffer": null, "consumes_buffers": []},
-          {"id": 19, "op_ref": "op_89129161515456", "op_kind": "tt.descriptor_store", "pipeline": "TMA", "warp_group": 2, "latency": 1794, "self_latency": 30, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 19143, "stage": 1, "cluster": 4}, "produces_buffer": 1, "consumes_buffers": []}
+          {"id": 0, "op_ref": "op_669555344", "op_kind": "arith.divsi", "pipeline": "CUDA", "warp_group": -1, "latency": 1, "self_latency": 1, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 53, "stage": 0, "cluster": 6}, "produces_buffer": null, "consumes_buffers": []},
+          {"id": 1, "op_ref": "op_669555616", "op_kind": "arith.remsi", "pipeline": "CUDA", "warp_group": -1, "latency": 1, "self_latency": 1, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 54, "stage": 0, "cluster": 7}, "produces_buffer": null, "consumes_buffers": []},
+          {"id": 2, "op_ref": "op_669555888", "op_kind": "arith.muli", "pipeline": "CUDA", "warp_group": -1, "latency": 1, "self_latency": 1, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 55, "stage": 0, "cluster": 8}, "produces_buffer": null, "consumes_buffers": []},
+          {"id": 3, "op_ref": "op_669556160", "op_kind": "arith.muli", "pipeline": "CUDA", "warp_group": -1, "latency": 1, "self_latency": 1, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 56, "stage": 0, "cluster": 9}, "produces_buffer": null, "consumes_buffers": []},
+          {"id": 4, "op_ref": "op_669573712", "op_kind": "ttng.tmem_alloc", "pipeline": "NONE", "warp_group": 0, "latency": 0, "self_latency": 0, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 0, "stage": 0, "cluster": 0}, "produces_buffer": 0, "consumes_buffers": []},
+          {"id": 5, "op_ref": "op_669484480", "op_kind": "ttng.tmem_store", "pipeline": "CUDA", "warp_group": 0, "latency": 96, "self_latency": 48, "min_warps": 4, "frequency_multiplier": 1, "schedule": {"cycle": 0, "stage": 0, "cluster": 0}, "produces_buffer": null, "consumes_buffers": [0]},
+          {"id": 6, "op_ref": "op_669565312", "op_kind": "scf.for", "pipeline": "NONE", "warp_group": 0, "latency": 8192, "self_latency": 0, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 96, "stage": 0, "cluster": 10}, "produces_buffer": null, "consumes_buffers": [], "child_pipeline_id": 1, "prologue_latency": 256},
+          {"id": 7, "op_ref": "op_669572160", "op_kind": "arith.addi", "pipeline": "CUDA", "warp_group": 0, "latency": 1, "self_latency": 1, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 48, "stage": 0, "cluster": 1}, "produces_buffer": null, "consumes_buffers": []},
+          {"id": 8, "op_ref": "op_669580160", "op_kind": "arith.divsi", "pipeline": "CUDA", "warp_group": 0, "latency": 1, "self_latency": 1, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 49, "stage": 0, "cluster": 2}, "produces_buffer": null, "consumes_buffers": []},
+          {"id": 9, "op_ref": "op_669574240", "op_kind": "arith.remsi", "pipeline": "CUDA", "warp_group": 0, "latency": 1, "self_latency": 1, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 50, "stage": 0, "cluster": 3}, "produces_buffer": null, "consumes_buffers": []},
+          {"id": 10, "op_ref": "op_669569824", "op_kind": "arith.muli", "pipeline": "CUDA", "warp_group": 0, "latency": 1, "self_latency": 1, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 51, "stage": 0, "cluster": 4}, "produces_buffer": null, "consumes_buffers": []},
+          {"id": 11, "op_ref": "op_669580560", "op_kind": "arith.muli", "pipeline": "CUDA", "warp_group": 0, "latency": 1, "self_latency": 1, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 52, "stage": 0, "cluster": 5}, "produces_buffer": null, "consumes_buffers": []},
+          {"id": 12, "op_ref": "op_669554864", "op_kind": "tt.descriptor_load", "pipeline": "TMA", "warp_group": 0, "latency": 652, "self_latency": 30, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 53, "stage": 0, "cluster": 6}, "produces_buffer": null, "consumes_buffers": []},
+          {"id": 13, "op_ref": "op_669566128", "op_kind": "arith.extf", "pipeline": "CUDA", "warp_group": 0, "latency": 105, "self_latency": 64, "min_warps": 4, "frequency_multiplier": 1, "schedule": {"cycle": 705, "stage": 0, "cluster": 11}, "produces_buffer": null, "consumes_buffers": []},
+          {"id": 14, "op_ref": "op_669566272", "op_kind": "ttg.convert_layout", "pipeline": "CUDA", "warp_group": 0, "latency": 105, "self_latency": 105, "min_warps": 4, "frequency_multiplier": 1, "schedule": {"cycle": 810, "stage": 0, "cluster": 12}, "produces_buffer": null, "consumes_buffers": []},
+          {"id": 15, "op_ref": "op_669568112", "op_kind": "ttng.tmem_load", "pipeline": "CUDA", "warp_group": 0, "latency": 532, "self_latency": 256, "min_warps": 4, "frequency_multiplier": 1, "schedule": {"cycle": 8288, "stage": 1, "cluster": 0}, "produces_buffer": null, "consumes_buffers": [0]},
+          {"id": 16, "op_ref": "op_669581584", "op_kind": "arith.addf", "pipeline": "CUDA", "warp_group": 0, "latency": 130, "self_latency": 128, "min_warps": 4, "frequency_multiplier": 1, "schedule": {"cycle": 9107, "stage": 1, "cluster": 1}, "produces_buffer": null, "consumes_buffers": []},
+          {"id": 17, "op_ref": "op_669575712", "op_kind": "arith.truncf", "pipeline": "CUDA", "warp_group": 0, "latency": 105, "self_latency": 64, "min_warps": 4, "frequency_multiplier": 1, "schedule": {"cycle": 9237, "stage": 1, "cluster": 2}, "produces_buffer": null, "consumes_buffers": []},
+          {"id": 18, "op_ref": "op_669575872", "op_kind": "ttg.convert_layout", "pipeline": "CUDA", "warp_group": 0, "latency": 105, "self_latency": 105, "min_warps": 4, "frequency_multiplier": 1, "schedule": {"cycle": 9342, "stage": 1, "cluster": 3}, "produces_buffer": null, "consumes_buffers": []},
+          {"id": 19, "op_ref": "op_669216224", "op_kind": "tt.descriptor_store", "pipeline": "TMA", "warp_group": 0, "latency": 1794, "self_latency": 30, "min_warps": 1, "frequency_multiplier": 1, "schedule": {"cycle": 9447, "stage": 1, "cluster": 4}, "produces_buffer": 1, "consumes_buffers": []}
         ],
         "edges": [
           {"src": 0, "dst": 2, "kind": "data", "distance": 0, "latency": 1},
@@ -464,7 +464,7 @@
           {"src": 12, "dst": 13, "kind": "data", "distance": 0, "latency": 652},
           {"src": 13, "dst": 14, "kind": "data", "distance": 0, "latency": 105},
           {"src": 4, "dst": 15, "kind": "data", "distance": 0, "latency": 0},
-          {"src": 6, "dst": 15, "kind": "data", "distance": 0, "latency": 17888},
+          {"src": 6, "dst": 15, "kind": "data", "distance": 0, "latency": 8192},
           {"src": 15, "dst": 16, "kind": "data", "distance": 0, "latency": 532},
           {"src": 14, "dst": 16, "kind": "data", "distance": 0, "latency": 105},
           {"src": 16, "dst": 17, "kind": "data", "distance": 0, "latency": 130},
@@ -472,7 +472,7 @@
           {"src": 18, "dst": 19, "kind": "data", "distance": 0, "latency": 105},
           {"src": 10, "dst": 19, "kind": "data", "distance": 0, "latency": 1},
           {"src": 11, "dst": 19, "kind": "data", "distance": 0, "latency": 1},
-          {"src": 6, "dst": 15, "kind": "data", "distance": 0, "latency": 17888},
+          {"src": 6, "dst": 15, "kind": "data", "distance": 0, "latency": 8192},
           {"src": 7, "dst": 7, "kind": "data", "distance": 1, "latency": 1}
         ],
         "cross_wg_barriers": []
