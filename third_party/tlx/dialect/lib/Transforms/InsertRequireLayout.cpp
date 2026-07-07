@@ -289,8 +289,9 @@ static Attribute computeSharedEncFromDotEnc(ttg::DotOperandEncodingAttr dotEnc,
       if (llvm::is_contained({ISAFamily::CDNA4, ISAFamily::GFX1250},
                              targetInfo.getISAFamily())) {
         if (auto padded = composePaddedLayout(
-                targetInfo, dotEnc, cast<ttg::TensorOrMemDesc>(type),
-                paddedOrder, /*useAsyncCopy=*/true)) {
+                targetInfo, dotEnc.getOpIdx(), dotEnc.getKWidth(),
+                cast<ttg::TensorOrMemDesc>(type), paddedOrder, dotEnc,
+                /*useAsyncCopy=*/true)) {
           // `composePaddedLayout` returns the bank-conflict-avoiding padded
           // layout, derived from the DOT (read) order. Its linear component is
           // a *permutation* AND, for a transposed operand, can flip the
@@ -355,8 +356,9 @@ static Attribute computeSharedEncFromDotEnc(ttg::DotOperandEncodingAttr dotEnc,
                 allocShape, type.getElementType(), type.getEncoding(),
                 type.getMemorySpace(), type.getMutableMemory(), allocShape);
             auto paddedFull = composePaddedLayout(
-                targetInfo, dotEnc, cast<ttg::TensorOrMemDesc>(fullType),
-                paddedOrder, /*useAsyncCopy=*/true);
+                targetInfo, dotEnc.getOpIdx(), dotEnc.getKWidth(),
+                cast<ttg::TensorOrMemDesc>(fullType), paddedOrder, dotEnc,
+                /*useAsyncCopy=*/true);
             // The sliced view was paddable, so the (larger) allocation shape
             // must be too; fail loudly rather than silently fall back to a
             // sliced-shape layout if that invariant ever breaks (reviewer Q1).
@@ -809,9 +811,10 @@ static Attribute chooseTDMBufEncoding(Operation *tdmOp, Value buf,
     if (auto info = findDotConsumer(buf, solver)) {
       triton::AMD::TargetInfo targetInfo(
           getAMDArch(tdmOp->getParentOfType<ModuleOp>()).value_or("").str());
-      encoding = composePaddedLayout(targetInfo, info->dotEnc,
+      encoding = composePaddedLayout(targetInfo, info->dotEnc.getOpIdx(),
+                                     info->dotEnc.getKWidth(),
                                      cast<ttg::TensorOrMemDesc>(bufType), order,
-                                     /*useAsyncCopy=*/false);
+                                     info->dotEnc, /*useAsyncCopy=*/false);
     }
   }
   if (!encoding) {

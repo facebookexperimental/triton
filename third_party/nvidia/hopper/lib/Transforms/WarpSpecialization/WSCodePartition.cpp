@@ -3137,8 +3137,14 @@ void insertAsyncComm(
       for (auto *ch : orderedChannels) {
         if (ch == chF)
           continue;
-        if (withSameTask(ch->getDstOp(), chF->getSrcOp()) &&
-            ch->getAllocOp() == chF->getAllocOp() &&
+        // Compare the cached allocOp pointers first: getSrcOp()/getDstOp() on a
+        // TMEMPost channel walk the allocOp's use-list (findTmemStartEnd), so
+        // calling them on a channel whose alloc was already erased dereferences
+        // freed memory (non-deterministic SIGSEGV). A stale channel's allocOp
+        // pointer never equals the live chF's, so this cheap pointer check
+        // short-circuits before any op is dereferenced.
+        if (ch->getAllocOp() == chF->getAllocOp() &&
+            withSameTask(ch->getDstOp(), chF->getSrcOp()) &&
             ch->getSrcOp() == chF->getDstOp() &&
             chF->getSrcOp()->getBlock() == ch->getSrcOp()->getBlock() &&
             chF->getSrcOp()->getBlock() == ch->getDstOp()->getBlock()) {
@@ -3162,8 +3168,11 @@ void insertAsyncComm(
       for (auto *ch : orderedChannels) {
         if (ch == chB)
           continue;
-        if (withSameTask(ch->getSrcOp(), chB->getDstOp()) &&
-            ch->getAllocOp() == chB->getAllocOp() &&
+        // See isForwardOfChannelLoop: compare cached allocOp pointers before
+        // getSrcOp()/getDstOp() so a stale channel (alloc already erased) is
+        // filtered out before findTmemStartEnd dereferences freed memory.
+        if (ch->getAllocOp() == chB->getAllocOp() &&
+            withSameTask(ch->getSrcOp(), chB->getDstOp()) &&
             ch->getDstOp() == chB->getSrcOp() &&
             chB->getSrcOp()->getBlock() == ch->getSrcOp()->getBlock() &&
             chB->getSrcOp()->getBlock() == ch->getDstOp()->getBlock()) {
@@ -3591,9 +3600,14 @@ void insertAsyncComm(
                            kv.second.front()->getNumBuffers(),
                            regionsWithChannels, bufferIdx, phase, config,
                            reuseGrp, masterChannel);
-    } else if (auto forOp = headProducer->getParentOfType<scf::ForOp>()) {
+    } else if (headProducer->getParentOfType<scf::ForOp>() ||
+               headProducer->getParentOfType<scf::WhileOp>()) {
       // headProducer can be local_store but bufferIdx will be used
-      // by tmaLoad as well.
+      // by tmaLoad as well. A producer directly in a persistent scf.while
+      // after region (e.g. the dynamic-persistent tile-id broadcast slot)
+      // also needs the accumCnt-derived buffer index/phase so the mbarrier
+      // parity toggles across persistent iterations; getBufferIdxAndPhase ->
+      // getAccumCount resolves the counter from the while's after-region args.
       if (producerAcquireForChannelLoop) {
         builder.setInsertionPoint(producerAcquireForChannelLoop);
       } else {
@@ -3608,7 +3622,7 @@ void insertAsyncComm(
                            regionsWithChannels, bufferIdx, phase, config,
                            reuseGrp, masterChannel);
     } else {
-      // Producer is not in a ForOp, create phase and bufferIdx here.
+      // Producer is truly outside any loop, create phase and bufferIdx here.
       bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
           headProducer->getLoc(), 0, 32);
       phase = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(

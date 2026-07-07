@@ -3859,6 +3859,10 @@ static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
       // count via ScheduleBuffer::totalBytes() (= sizeBytes() * count), which
       // the Step-4 budget, the JSON `total_bytes`, and the emitter's
       // local_alloc(..., count) all consume.
+      //
+      // The depth rule itself (TC-free TMA prefetch floor; lifetime/II+1
+      // for TMA-store consumers) lives in resolveCrossWGChannel so the
+      // scoring-time predictor and this synthesis cannot drift.
       ttg::ScheduleBuffer chan;
       chan.id = loop.buffers.size();
       chan.kind = ttg::MemoryKind::SMEM;
