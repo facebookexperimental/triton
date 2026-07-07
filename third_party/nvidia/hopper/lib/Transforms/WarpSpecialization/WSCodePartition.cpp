@@ -3137,8 +3137,14 @@ void insertAsyncComm(
       for (auto *ch : orderedChannels) {
         if (ch == chF)
           continue;
-        if (withSameTask(ch->getDstOp(), chF->getSrcOp()) &&
-            ch->getAllocOp() == chF->getAllocOp() &&
+        // Compare the cached allocOp pointers first: getSrcOp()/getDstOp() on a
+        // TMEMPost channel walk the allocOp's use-list (findTmemStartEnd), so
+        // calling them on a channel whose alloc was already erased dereferences
+        // freed memory (non-deterministic SIGSEGV). A stale channel's allocOp
+        // pointer never equals the live chF's, so this cheap pointer check
+        // short-circuits before any op is dereferenced.
+        if (ch->getAllocOp() == chF->getAllocOp() &&
+            withSameTask(ch->getDstOp(), chF->getSrcOp()) &&
             ch->getSrcOp() == chF->getDstOp() &&
             chF->getSrcOp()->getBlock() == ch->getSrcOp()->getBlock() &&
             chF->getSrcOp()->getBlock() == ch->getDstOp()->getBlock()) {
@@ -3162,8 +3168,11 @@ void insertAsyncComm(
       for (auto *ch : orderedChannels) {
         if (ch == chB)
           continue;
-        if (withSameTask(ch->getSrcOp(), chB->getDstOp()) &&
-            ch->getAllocOp() == chB->getAllocOp() &&
+        // See isForwardOfChannelLoop: compare cached allocOp pointers before
+        // getSrcOp()/getDstOp() so a stale channel (alloc already erased) is
+        // filtered out before findTmemStartEnd dereferences freed memory.
+        if (ch->getAllocOp() == chB->getAllocOp() &&
+            withSameTask(ch->getSrcOp(), chB->getDstOp()) &&
             ch->getDstOp() == chB->getSrcOp() &&
             chB->getSrcOp()->getBlock() == ch->getSrcOp()->getBlock() &&
             chB->getSrcOp()->getBlock() == ch->getDstOp()->getBlock()) {
