@@ -746,6 +746,12 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_optimize_accumulator_init(pm)
             passes.ttgpuir.add_hoist_tmem_alloc(pm, False)
             nvidia.passes.ttnvgpuir.add_promote_lhs_to_tmem(pm)
+            # CLC tile scheduler (Stages 1 & 2): split ttng.clc_advance into the
+            # async-token form and hoist the issue for compute/CLC overlap. This
+            # runs before warp specialization; the token is materialized into the
+            # completion mbarrier after WS (add_clc_materialize below).
+            nvidia.passes.ttnvgpuir.add_clc_split(pm)
+            nvidia.passes.ttnvgpuir.add_clc_hoist(pm)
             if knobs.nvidia.use_llm_schedule:
                 nvidia.passes.hopper.add_llm_schedule(pm)
             elif knobs.nvidia.use_modulo_schedule is not None:
@@ -790,6 +796,10 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             # hoist again and allow hoisting out of if statements
             passes.ttgpuir.add_hoist_tmem_alloc(pm, True)
+            # CLC tile scheduler (Stage 4): materialize the async-token form into
+            # the response buffer + completion mbarrier (single-CTA only). Runs
+            # after warp specialization.
+            nvidia.passes.ttnvgpuir.add_clc_materialize(pm)
             nvidia.passes.ttnvgpuir.add_remove_tmem_tokens(pm)
             # 2-CTA: Insert cross-CTA sync AFTER all WS passes.
             # Only for Meta WS path — non-WS 2-CTA sync is handled by

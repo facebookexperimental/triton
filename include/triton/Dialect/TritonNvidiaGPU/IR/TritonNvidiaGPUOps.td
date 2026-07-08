@@ -241,6 +241,82 @@ def TTNG_CLCGetProgramIdOp : TTNG_Op<"clc_get_program_id", [Pure]> {
 }
 
 //
+// High-level CLC scheduler op (barrier-free; lowered later)
+//
+// `clc_advance` expresses a dynamic-persistent CLC fetch WITHOUT any mbarrier /
+// response buffer / phase, so pre-warp-specialization IR stays clean. It returns
+// the decoded next tile directly: an `is_valid` predicate plus the (x, y, z)
+// program-id coordinates. The initial tile needs no op -- it is just this CTA's
+// `program_id` with is_valid = true. A later lowering pass materializes the
+// response buffer + mbarrier, expands `clc_advance` into the low-level
+// `clc_try_cancel` + `barrier_expect` (issue) and `wait_barrier` +
+// `clc_load_result` + `clc_is_canceled` / `clc_get_program_id` (consume + decode),
+// pulls the issue up to overlap the CLC latency with compute, infers the phase,
+// and drops any unused coordinate (dead loop-carried value elimination).
+
+def TTNG_CLCAdvanceOp : TTNG_Op<"clc_advance", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
+  let summary = "High-level CLC advance: fetch the next tile (decoded)";
+
+  let description = [{
+    Fetches the next work tile via Cluster Launch Control and returns it decoded:
+    `isValid` (a tile was successfully claimed) and its (`x`, `y`, `z`)
+    program-id coordinates.
+
+    References no mbarrier or buffer -- a later lowering pass materializes them,
+    splits the fetch into an (overlap-hoisted) async issue and a wait+load+decode,
+    infers the phase, and drops unused coordinates. One per persistent-loop
+    iteration.
+  }];
+
+  let results = (outs I1:$isValid, I32:$x, I32:$y, I32:$z);
+
+  let assemblyFormat = [{ attr-dict `:` type($isValid) `,` type($x) `,` type($y) `,` type($z) }];
+}
+
+//
+// Token form of the CLC fetch (produced by the Stage-1 split of clc_advance)
+//
+// `clc_advance` is remapped to `clc_try_cancel_async` (async issue -> token) +
+// `clc_read` (await the token -> decoded tile). The token is `!ttg.async.token`,
+// reusing the same async-dependency model as cp.async / TMA, so the issue can be
+// hoisted for overlap without introducing any mbarrier. A later pass materializes
+// the token into the low-level barrier form.
+
+def TTNG_CLCTryCancelAsyncOp : TTNG_Op<"clc_try_cancel_async", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
+  let summary = "Issue an async CLC request; returns a token (issue half)";
+
+  let description = [{
+    Issues an asynchronous Cluster Launch Control request to fetch the next work
+    tile (cancelling a pending cluster). Returns only an async token; the paired
+    `clc_read` awaits it and returns the decoded tile. References no mbarrier or
+    buffer. Effectful (claims a pending cluster) so it is neither DCE'd nor
+    hoisted out of the persistent loop.
+  }];
+
+  let results = (outs TTG_AsyncToken:$token);
+
+  let assemblyFormat = [{ attr-dict `:` type($token) }];
+}
+
+def TTNG_CLCReadOp : TTNG_Op<"clc_read", [MemoryEffects<[MemRead<GlobalMemory>]>]> {
+  let summary = "Await a CLC token and return the decoded tile (read half)";
+
+  let description = [{
+    Consumer half of the async CLC fetch started by `clc_try_cancel_async`: awaits
+    the token and returns the decoded tile -- `isValid` plus the (`x`, `y`, `z`)
+    program-id coordinates. References no mbarrier or buffer.
+  }];
+
+  let arguments = (ins TTG_AsyncToken:$token);
+
+  let results = (outs I1:$isValid, I32:$x, I32:$y, I32:$z);
+
+  let assemblyFormat = [{
+    $token attr-dict `:` type($token) `->` type($isValid) `,` type($x) `,` type($y) `,` type($z)
+  }];
+}
+
+//
 // WarpGroupDot Op
 //
 def TTNG_WarpGroupDotOp : TTNG_Op<"warp_group_dot", [
