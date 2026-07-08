@@ -276,8 +276,8 @@ def tlx_addmm_glu_kernel_optimized(
         # Most recently committed buffers (GR i + NUM_BUFFERS) can be in flight
         tlx.async_load_wait_group(1)
 
-    # Prefetch Y from GMEM into registers. Issues the streaming Y load into VGPRs 
-    # here so its 44MB HBM read overlaps the drain MFMAs below and is only 
+    # Prefetch Y from GMEM into registers. Issues the streaming Y load into VGPRs
+    # here so its 44MB HBM read overlaps the drain MFMAs below and is only
     # consumed at the fma
     y_ptrs = y_ptr + offs_m[:, None] * sy0 + offs_n[None, :] * sy1
     y_regs = tl.load(y_ptrs, cache_modifier=".cs")
