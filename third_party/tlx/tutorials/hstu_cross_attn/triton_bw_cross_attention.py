@@ -124,6 +124,20 @@ _HSTU_BWD_DOT_ATTRS_TLX = FrozenDotAttrs(
     }
 )
 
+# for SHARED_KV + DP and _HSTU_COMPUTE_FOLD
+# --> we can do dk += dot(...) dk += dot(...)
+# --> we use "dk_shared" instead of "dk"
+_HSTU_BWD_DOT_ATTRS_2KV = FrozenDotAttrs(
+    {
+        "qkT": {"stage": "0", "order": "0", "channels": ["opndD,tmem,1,2"]},
+        "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},
+        "dpT": {"stage": "0", "order": "2", "channels": ["opndD,tmem,1,11"]},
+        "dk": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]},
+        "dk_shared": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,7"]},
+        "dq": {"stage": "1", "order": "1", "channels": ["opndB,smem,1,8", "opndD,tmem,1,11"]},
+    }
+)
+
 
 # Triton's @jit frontend accepts `attrs=` only as a dict literal or a bare
 # module-global name bound to a dict -- it rejects passing a FrozenDotAttrs (or
@@ -142,6 +156,17 @@ _HSTU_ATTRS_DPT = tl.constexpr(_HSTU_BWD_DOT_ATTRS_TLX.get("dpT"))
 _HSTU_ATTRS_DK = tl.constexpr(_HSTU_BWD_DOT_ATTRS_TLX.get("dk"))
 _HSTU_ATTRS_DK_SHARED = tl.constexpr(_HSTU_BWD_DOT_ATTRS_TLX.get("dk_shared"))
 _HSTU_ATTRS_DQ = tl.constexpr(_HSTU_BWD_DOT_ATTRS_TLX.get("dq"))
+
+# Per-dot 2KV variants, selected in-kernel on the SHARED_KV + compute-fold path
+# (SHARED_KV and _HSTU_COMPUTE_FOLD). The 2KV schedule is fixed to the TLX
+# 2-KV-block layout and is NOT swapped by set_bwd_dot_attrs(); the active globals
+# above still drive the non-fold paths.
+_HSTU_ATTRS_QKT_2KV = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV.get("qkT"))
+_HSTU_ATTRS_DV_2KV = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV.get("dv"))
+_HSTU_ATTRS_DPT_2KV = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV.get("dpT"))
+_HSTU_ATTRS_DK_2KV = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV.get("dk"))
+_HSTU_ATTRS_DK_SHARED_2KV = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV.get("dk_shared"))
+_HSTU_ATTRS_DQ_2KV = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV.get("dq"))
 
 # "compute fold": fold dk_attn (dqk @ q) into the dv/dk accumulator (TLX 2kv
 # parity) instead of a separate dk_attn tile + register add. Kept behind a
@@ -3295,7 +3320,8 @@ def _hstu_attn_bwd_inner(  # noqa C901
         qk_trans = tl.dot(
             k,
             tl.trans(q),
-            attrs=_HSTU_ATTRS_QKT if WS_ON else None,
+            attrs=(_HSTU_ATTRS_QKT_2KV if (SHARED_KV and _HSTU_COMPUTE_FOLD)
+                   else _HSTU_ATTRS_QKT) if WS_ON else None,
         )
         if MASK_KV or HAS_CAUSAL:
             valid_mask_trans = backward_valid_mask(
@@ -3327,12 +3353,14 @@ def _hstu_attn_bwd_inner(  # noqa C901
 
         dact_qk_trans = tl.dot(
             v, tl.trans(do), allow_tf32=ALLOW_TF32,
-            attrs=_HSTU_ATTRS_DPT if WS_ON else None,
+            attrs=(_HSTU_ATTRS_DPT_2KV if (SHARED_KV and _HSTU_COMPUTE_FOLD)
+                   else _HSTU_ATTRS_DPT) if WS_ON else None,
         )
         if SHARED_KV:
             dk = tl.dot(
                 act_qk_trans, do, dk, allow_tf32=ALLOW_TF32,
-                attrs=_HSTU_ATTRS_DV if WS_ON else None,
+                attrs=(_HSTU_ATTRS_DV_2KV if _HSTU_COMPUTE_FOLD
+                       else _HSTU_ATTRS_DV) if WS_ON else None,
             )
         else:
             # pyrefly: ignore [unbound-name]
@@ -3356,11 +3384,11 @@ def _hstu_attn_bwd_inner(  # noqa C901
             dqk_trans = (dqk_trans * alpha).to(k.dtype)
             dq_trans = tl.dot(
                 tl.trans(k), dqk_trans,
-                attrs=_HSTU_ATTRS_DQ if WS_ON else None,
+                attrs=_HSTU_ATTRS_DQ_2KV if WS_ON else None,
             )
             dk = tl.dot(
                 dqk_trans, q, dk, allow_tf32=ALLOW_TF32,
-                attrs=_HSTU_ATTRS_DK_SHARED if WS_ON else None,
+                attrs=_HSTU_ATTRS_DK_SHARED_2KV if WS_ON else None,
             )
         else:
             dqk_trans = dqk_trans.to(k.dtype)
