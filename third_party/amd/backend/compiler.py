@@ -272,7 +272,7 @@ class HIPBackend(BaseBackend):
         tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
 
         passes.ttgpuir.add_remove_layout_conversions(pm, 0)
-        amd.passes.ttgpuir.add_optimize_epilogue(pm)
+        # amd.passes.ttgpuir.add_optimize_epilogue(pm)
         amd.passes.ttgpuir.add_optimize_dot_operands(pm, options.arch)
         amd.passes.ttgpuir.add_hoist_layout_conversions(pm)
         amd.passes.ttgpuir.add_sink_layout_conversions(pm)
