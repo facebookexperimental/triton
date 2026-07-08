@@ -6,9 +6,9 @@ This work runs in parallel with our ongoing Triton compiler investments. TorchTL
 
 ## Overview
 
-PT2 flows through Dynamo for graph capture and Inductor for optimization and code gen. Within Inductor, a scheduler decides which operations to fuse and then delegates to backend-specific codegen engine, selecting among template candidates (Triton/CUTLASS) and cuBLAS via autotuning.
+PT2 flows through Dynamo for graph capture and Inductor for optimization and code gen. Within Inductor, a scheduler decides which operations to fuse and then delegates to a backend-specific codegen engine, selecting among template candidates (Triton/CUTLASS) and cuBLAS via autotuning.
 
-However, low-level hardware primitives such as tile shapes, warp spec roles and TMA directionality are invisible to the scheduler, limiting its ability to leverage modern GPU arch when making fusion decisions.
+However, low-level hardware primitives such as tile shapes, warp spec roles and TMA directionality are invisible to the scheduler, limiting its ability to leverage modern GPU architecture when making fusion decisions.
 
 Meanwhile, standalone TLX matmul kernels are matching or slightly exceeding cuBLAS. Unlike opaque cuBLAS kernels, a TLX kernel at parity opens the door to richer epilogue fusions.
 
@@ -16,9 +16,9 @@ In summary, torchTLX integrates TLX as a low-level backend for Inductor, introdu
 
 ## TorchTLX Templates
 
-TorchTLX templates are jinja-based kernel definitions that encode our best-performing TLX kernels into Inductor's template infra. We have shipped a GEMM template targeting Blackwell, with a flex attention template in active development D94284002. The underlying TLX GEMM kernel incorporates a series of hardware optimizations: warp specialization, CLC-based persistent execution, multi-CTA cooperation, epilogue subslicing, data partitioning and dynamic split-K.
+TorchTLX templates are jinja-based kernel definitions that encode our best-performing TLX kernels into Inductor's template infra. We have shipped a GEMM template targeting Blackwell, with a flex attention template in active development. The underlying TLX GEMM kernel incorporates a series of hardware optimizations: warp specialization, CLC-based persistent execution, multi-CTA cooperation, epilogue subslicing, data partitioning and dynamic split-K.
 
-Our performance strategy operates on two parallel tracks: improving standalone TLX kernel upstream and closing any remaining gap when running through the Inductor template path.
+Our performance strategy operates on two parallel tracks: improving standalone TLX kernels upstream and closing any remaining gap when running through the Inductor template path.
 
 ## TorchTLX Fusions
 
@@ -43,7 +43,7 @@ Inductor's standard epilogue fusion works out of box when a TLX templated kernel
                         tl.store(out_ptr1 + (tl.broadcast_to(xindex, [BLOCK_M_SPLIT, slice_size])), tmp3, _tmp_var6)
 ```
 
-For templates using tlx.async_descriptor_store, we introduce compute_epilogue to run the fused epilogue ops and assigns the result to a variable, letting the template manually stage through SMEM and issue async_descriptor_store to preserve the async pipeline overlap with MMA warps.
+For templates using tlx.async_descriptor_store, we introduce compute_epilogue to run the fused epilogue ops and assign the result to a variable, letting the template manually stage through SMEM and issue async_descriptor_store to preserve the async pipeline overlap with MMA warps.
 
 ```
                         tlx.barrier_arrive(tmem_empty_bars[buf_idx], 1)
@@ -71,7 +71,7 @@ For templates using tlx.async_descriptor_store, we introduce compute_epilogue to
 
 As new GPU architectures arrive, torchTLX offers two key advantages.
 
-First, it streamlines access to state-of-the-art hardware intrinsics. Given that TLX provides a Triton-native API for features like TMA, WS, CLC, 2-CTA, etc., once the performance is maximized in the standalone TLX kernel, integrating those wins into the PT2 stack through torchTLX requires a fairly small amount of additional work. We hope this will make it easier to deliver "day-0 performance" on new hardware.
+First, it streamlines access to state-of-the-art hardware intrinsics. Given that TLX provides a Triton-native API for features like TMA, WS, CLC, 2-CTA, etc., once the performance is maximized in the standalone TLX kernel, integrating those wins into the PT2 stack through torchTLX requires a fairly small amount of additional work.
 
 Second, it scales better than manual agentic kernel authoring. There is growing interest across the industry in agentic kernel authoring at scale. We believe making the PT2 stack natively aware of hardware architecture features might be a more scalable path. Once the plumbing is in place, every new kernel and fusion pattern benefits automatically.
 
