@@ -17,6 +17,7 @@
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/Support/MathExtras.h"
 
 namespace mlir {
 
@@ -159,6 +160,12 @@ SmallVector<unsigned> ReduceOpHelper::getScratchRepShape() {
 
 unsigned ReduceOpHelper::getScratchSizeInBytes() {
   auto smemShape = getScratchRepShape();
+  // Round an NPOT reduction axis up to pow2 (the inter-warp shuffle butterfly
+  // needs a pow2 axis); no-op for pow2 axes. product()==0 short-circuits the
+  // {0,0} warp-sync sentinel before indexing smemShape[axis] (OOB when
+  // rank>=3).
+  if (product<unsigned>(smemShape) > 0 && !llvm::isPowerOf2_32(smemShape[axis]))
+    smemShape[axis] = llvm::NextPowerOf2(smemShape[axis]);
   auto elems = product<unsigned>(smemShape);
 
   unsigned bytesPerElem = 0;

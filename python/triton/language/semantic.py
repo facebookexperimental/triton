@@ -1854,7 +1854,23 @@ class TritonSemantic(Generic[TensorTy]):
     def reduction(self, inputs: Sequence[TensorTy], axis: int, region_builder_fn,
                   reduction_ordering=None) -> Tuple[TensorTy, ...]:
         if axis is None:
-            inputs = tuple(self.reshape(t, [t.numel.value], can_reorder=True) for t in inputs)
+            # axis=None flattens via tt.reshape(allow_reorder), whose reorder
+            # scrambles an NPOT (modular) layout: reject the multi-dim NPOT case,
+            # and skip the reshape for a 1D NPOT input. pow2/flag-off unchanged.
+            if knobs.language.allow_npot:
+                for t in inputs:
+                    shape = t.type.shape
+                    if len(shape) > 1 and any(s & (s - 1) for s in shape):
+                        raise ValueError("NPOT reduction over axis=None for a multi-dimensional tensor is "
+                                         "not supported (would scramble); reduce over an explicit axis")
+
+            def _flatten(t):
+                numel = t.numel.value
+                if knobs.language.allow_npot and len(t.type.shape) == 1 and (numel & (numel - 1)):
+                    return t
+                return self.reshape(t, [numel], can_reorder=True)
+
+            inputs = tuple(_flatten(t) for t in inputs)
             axis = 0
         # get result shape
         shape = inputs[0].type.shape
