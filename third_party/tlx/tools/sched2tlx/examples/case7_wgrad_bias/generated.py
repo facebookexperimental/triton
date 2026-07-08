@@ -31,10 +31,10 @@ def wgrad_bias_nows(
     dw_desc = tl.make_tensor_descriptor(DW, [K_out, N_in], [ext_10, 1], [128, 128])
 
     # ── Multi-buffered allocations (from modulo's lifetime analysis) ──
-    # inner-loop buf 0: SMEM count=2 (modulo lifetime [586..1145], II=559)
-    L0_smem_0 = tlx.local_alloc((64, 128), tl.float16, 2)
-    # inner-loop buf 1: SMEM count=2 (modulo lifetime [556..1145], II=559)
-    L0_smem_1 = tlx.local_alloc((64, 128), tl.float16, 2)
+    # inner-loop buf 0: SMEM count=3 (modulo lifetime [586..1145], II=256)
+    L0_smem_0 = tlx.local_alloc((64, 128), tl.float16, 3)
+    # inner-loop buf 1: SMEM count=3 (modulo lifetime [556..1145], II=256)
+    L0_smem_1 = tlx.local_alloc((64, 128), tl.float16, 3)
 
     # acc_tmem: outer-loop buf 0, count=2 (TC writes / default reads across 2 tiles)
     acc_tmem = tlx.local_alloc((128, 128), tl.float32, 2, tlx.storage_kind.tmem)
@@ -42,11 +42,11 @@ def wgrad_bias_nows(
 
     # ── Mbarriers (SemIR: full+empty pair per semaphore) ──
     # L0_smem_1: N3→N4  ttg.local_alloc→ttg.memdesc_trans  cyc556→cyc556  forward  buf=1  kind=mbarrier
-    L0_smem_1_full = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
-    L0_smem_1_empty = tlx.alloc_barriers(num_barriers=2, arrive_count=2)
+    L0_smem_1_full = tlx.alloc_barriers(num_barriers=3, arrive_count=1)
+    L0_smem_1_empty = tlx.alloc_barriers(num_barriers=3, arrive_count=2)
     # L0_smem_0: N2→N5  ttg.local_alloc→ttng.tc_gen5_mma  cyc586→cyc586  forward  buf=0  kind=mbarrier
-    L0_smem_0_full = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
-    L0_smem_0_empty = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
+    L0_smem_0_full = tlx.alloc_barriers(num_barriers=3, arrive_count=1)
+    L0_smem_0_empty = tlx.alloc_barriers(num_barriers=3, arrive_count=1)
     # acc_tmem: cross-region TC-loop → default-epilogue hand-off, depth=2 (legacy carve-out)
     acc_tmem_full = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
     acc_tmem_empty = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
@@ -54,7 +54,7 @@ def wgrad_bias_nows(
         # Async task: role=default ← outer wg0 (Phase 4 plan)
         with tlx.async_task("default"):
             tmem_accum_cnt = 0
-            # Outer persistent loop (loop 1, II=17888). Each task replays it; body trimmed to this WG's ops.
+            # Outer persistent loop (loop 1, II=8192). Each task replays it; body trimmed to this WG's ops.
             for tile_id in range(pid_0, mul_7, nprog_0):
                 tmem_buf = tmem_accum_cnt % 2
                 tmem_phase = (tmem_accum_cnt // 2) & 1
@@ -74,28 +74,28 @@ def wgrad_bias_nows(
         # Async task: role=TMA ← inner wg0 (Phase 4 plan)
         with tlx.async_task(num_warps=1, num_regs=24):
             smem_accum = 0
-            # Outer persistent loop (loop 1, II=17888). Each task replays it; body trimmed to this WG's ops.
+            # Outer persistent loop (loop 1, II=8192). Each task replays it; body trimmed to this WG's ops.
             for tile_id in range(pid_0, mul_7, nprog_0):
-                # Inner K-loop (loop 0, II=559). SMEM ring depth=2; smem_accum persists across outer tiles.
+                # Inner K-loop (loop 0, II=256). SMEM ring depth=3; smem_accum persists across outer tiles.
                 for k in range(0, M, 64):
                     _it = smem_accum
-                    buf = smem_accum % 2
-                    phase = (smem_accum // 2) & 1
-                    tlx.barrier_wait(L0_smem_1_empty[(_it % 2)], (((_it // 2) & 1) ^ 1))
-                    tlx.barrier_expect_bytes(L0_smem_1_full[(_it % 2)], 16384)
+                    buf = smem_accum % 3
+                    phase = (smem_accum // 3) & 1
+                    tlx.barrier_wait(L0_smem_1_empty[(_it % 3)], (((_it // 3) & 1) ^ 1))
+                    tlx.barrier_expect_bytes(L0_smem_1_full[(_it % 3)], 16384)
                     # load → L0_smem_1
-                    tlx.async_descriptor_load(dout_desc, L0_smem_1[buf], [k, ((tile_id // div_6) * 128)], L0_smem_1_full[(_it % 2)])
+                    tlx.async_descriptor_load(dout_desc, L0_smem_1[buf], [k, ((tile_id // div_6) * 128)], L0_smem_1_full[(_it % 3)])
                     smem_accum += 1
         # Async task: role=TMA ← inner wg1 (Phase 4 plan)
         with tlx.async_task(num_warps=1, num_regs=24):
             smem_accum = 0
-            # Outer persistent loop (loop 1, II=17888). Each task replays it; body trimmed to this WG's ops.
+            # Outer persistent loop (loop 1, II=8192). Each task replays it; body trimmed to this WG's ops.
             for tile_id in range(pid_0, mul_7, nprog_0):
-                # Inner K-loop (loop 0, II=559). SMEM ring depth=2; smem_accum persists across outer tiles.
+                # Inner K-loop (loop 0, II=256). SMEM ring depth=3; smem_accum persists across outer tiles.
                 for k in range(0, M, 64):
                     _it = smem_accum
-                    buf = smem_accum % 2
-                    phase = (smem_accum // 2) & 1
+                    buf = smem_accum % 3
+                    phase = (smem_accum // 3) & 1
                     # load → L0_smem_0
                     tlx.barrier_wait(L0_smem_0_empty[buf], phase ^ 1)
                     tlx.barrier_expect_bytes(L0_smem_0_full[buf], 16384)
@@ -105,22 +105,22 @@ def wgrad_bias_nows(
         with tlx.async_task(num_warps=1, num_regs=24):
             smem_accum = 0
             tmem_accum_cnt = 0
-            # Outer persistent loop (loop 1, II=17888). Each task replays it; body trimmed to this WG's ops.
+            # Outer persistent loop (loop 1, II=8192). Each task replays it; body trimmed to this WG's ops.
             for tile_id in range(pid_0, mul_7, nprog_0):
                 tmem_buf = tmem_accum_cnt % 2
                 tmem_phase = (tmem_accum_cnt // 2) & 1
                 tlx.barrier_wait(acc_tmem_empty[tmem_buf], tmem_phase ^ 1)
                 i0_1 = False
-                # Inner K-loop (loop 0, II=559). SMEM ring depth=2; smem_accum persists across outer tiles.
+                # Inner K-loop (loop 0, II=256). SMEM ring depth=3; smem_accum persists across outer tiles.
                 for k in range(0, M, 64):
                     _it = smem_accum
-                    buf = smem_accum % 2
-                    phase = (smem_accum // 2) & 1
+                    buf = smem_accum % 3
+                    phase = (smem_accum // 3) & 1
                     # MMA
-                    tlx.barrier_wait(L0_smem_1_full[(_it % 2)], ((_it // 2) & 1))
-                    tlx.barrier_wait(L0_smem_0_full[(_it % 2)], ((_it // 2) & 1))
+                    tlx.barrier_wait(L0_smem_1_full[(_it % 3)], ((_it // 3) & 1))
+                    tlx.barrier_wait(L0_smem_0_full[(_it % 3)], ((_it // 3) & 1))
                     use_acc = (k > 0)
-                    tlx.async_dot(tlx.local_trans(L0_smem_1[buf]), L0_smem_0[buf], acc_tmem[tmem_buf], use_acc=use_acc, mBarriers=[L0_smem_1_empty[(_it % 2)], L0_smem_0_empty[(_it % 2)]])
+                    tlx.async_dot(tlx.local_trans(L0_smem_1[buf]), L0_smem_0[buf], acc_tmem[tmem_buf], use_acc=use_acc, mBarriers=[L0_smem_1_empty[(_it % 3)], L0_smem_0_empty[(_it % 3)]])
                     smem_accum += 1
                     i0_1 = True
                 tlx.tcgen05_commit(acc_tmem_full[tmem_buf])
@@ -128,17 +128,17 @@ def wgrad_bias_nows(
         # Async task: role=CUDA ← inner wg3 (Phase 4 plan)
         with tlx.async_task(num_warps=4, num_regs=152):
             smem_accum = 0
-            # Outer persistent loop (loop 1, II=17888). Each task replays it; body trimmed to this WG's ops.
+            # Outer persistent loop (loop 1, II=8192). Each task replays it; body trimmed to this WG's ops.
             for tile_id in range(pid_0, mul_7, nprog_0):
                 i0_0 = tl.full((128,), 0, tl.float32)
-                # Inner K-loop (loop 0, II=559). SMEM ring depth=2; smem_accum persists across outer tiles.
+                # Inner K-loop (loop 0, II=256). SMEM ring depth=3; smem_accum persists across outer tiles.
                 for k in range(0, M, 64):
                     _it = smem_accum
-                    buf = smem_accum % 2
-                    phase = (smem_accum // 2) & 1
-                    tlx.barrier_wait(L0_smem_1_full[(_it % 2)], ((_it // 2) & 1))
-                    chan_L0_smem_1_0 = tlx.local_load(L0_smem_1[(_it % 2)])
-                    tlx.barrier_arrive(L0_smem_1_empty[(_it % 2)], 1)
+                    buf = smem_accum % 3
+                    phase = (smem_accum // 3) & 1
+                    tlx.barrier_wait(L0_smem_1_full[(_it % 3)], ((_it // 3) & 1))
+                    chan_L0_smem_1_0 = tlx.local_load(L0_smem_1[(_it % 3)])
+                    tlx.barrier_arrive(L0_smem_1_empty[(_it % 3)], 1)
                     ext_18 = chan_L0_smem_1_0.to(tl.float32)
                     red_19 = tl.sum(ext_18, 0)
                     addf_20 = (i0_0 + red_19)

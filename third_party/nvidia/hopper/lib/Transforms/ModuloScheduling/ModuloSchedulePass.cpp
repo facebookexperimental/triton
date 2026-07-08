@@ -3463,20 +3463,44 @@ static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
       ttg::ScheduleBuffer chan;
       chan.id = loop.buffers.size();
       chan.kind = ttg::MemoryKind::SMEM;
-      // Depth-2 for the TMA-load→compute channel of a TC-free pipelined loop
-      // so the load warp prefetches one iteration ahead; depth-1 elsewhere
-      // (SW-produced channels and all TC-loop channels keep the simple
-      // single-buffered hand-off).
+      // Channel depth. Default: depth-2 for the TMA-load→compute channel of a
+      // TC-free pipelined loop (load warp prefetches one iteration ahead);
+      // depth-1 for other register hand-offs. Deepening register-consumer
+      // channels beyond that measured 6x SLOWER on FA (the P-tile bridge's
+      // extra SMEM + barrier traffic broke the softmax/MMA pingpong), so the
+      // lifetime rule below is scoped to async TMA-STORE consumers only.
+      //
+      // TMA-store consumers get the same `lifetime / II + 1` rule
+      // computeBufferCount applies to data buffers, with the hand-off
+      // spanning src's write to dst's completion (dst.latency included: the
+      // store holds its slot until the transfer drains). A store channel
+      // whose lifetime exceeds II must be double-buffered or the producer WG
+      // serializes on the store WG's drain every iteration — exactly the
+      // layernorm compute→store stall the fixed depth-1 rule produced (0.53x
+      // of handwritten). Store channels short relative to II (GEMM outer-loop
+      // epilogues) keep depth 1, same as before.
       //
       // Depth>1 is safe to emit here: ring indexing for count>1 cross-WG
       // channels already exists and is exercised today (e.g. case3 FA has a
       // depth-2 cross-WG channel), and the channel's SMEM cost scales with
       // count via ScheduleBuffer::totalBytes() (= sizeBytes() * count), which
       // the Step-4 budget, the JSON `total_bytes`, and the emitter's
-      // local_alloc(..., count) all consume. The sched2tlx no-MMA lowering that
-      // makes a TC-free loop emit at all is stacked on top of this diff, so a
-      // depth-2 channel is only ever produced once that consumer is present.
-      chan.count = (!loopHasTC && src.pipeline == ttg::HWPipeline::TMA) ? 2 : 1;
+      // local_alloc(..., count) all consume.
+      {
+        unsigned floorDepth =
+            (!loopHasTC && src.pipeline == ttg::HWPipeline::TMA) ? 2u : 1u;
+        unsigned lifetimeDepth = 1;
+        bool dstIsTMAStore =
+            dst.op &&
+            isa<tt::DescriptorStoreOp, ttng::AsyncTMACopyLocalToGlobalOp>(
+                dst.op);
+        if (dstIsTMAStore && loop.II > 0) {
+          int chanLifetime =
+              std::max(0, (dst.cycle + std::max(dst.latency, 0)) - src.cycle);
+          lifetimeDepth = static_cast<unsigned>(chanLifetime / loop.II + 1);
+        }
+        chan.count = std::max(lifetimeDepth, floorDepth);
+      }
       depth = chan.count;
       chan.liveStart = src.cycle;
       chan.liveEnd = dst.cycle + std::max(dst.latency, 0);
@@ -3846,15 +3870,35 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
     for (auto &schedLoop : sl.graph.loops) {
       if (schedLoop.II <= 0)
         continue;
-      // All loops go through the same cost-model partitioner — no TC vs TC-free
-      // special-casing. The makespan (single-iteration latency chain over each
-      // WG's pipeAvail) plus barrier cost decides the split uniformly. This
-      // rewards warp specialization wherever it overlaps independent pipelines
-      // across groups: GEMM/FA (MEM/TC/softmax) AND memory-bound loops like
-      // LayerNorm, where putting TMA-load, compute, and TMA-store on separate
-      // warp groups frees the compute warps and removes the in-stream store
-      // drain (measured ~1.2x over 1-WG software pipelining). No env flag, no
-      // hard override.
+      // Outer WS loops stay single-WG. The sched2tlx emitter only lowers
+      // multi-WG bodies for INNER loops today; splitting an outer-loop
+      // epilogue chain (e.g. convert_layout → descriptor_store) into its own
+      // WG silently drops those ops in the emitted kernel. The modeled upside
+      // is also marginal: the outer II is dominated by the inner-loop
+      // super-node (thousands of cycles), so overlapping the epilogue saves a
+      // few percent at best while risking an unlowerable partition.
+      // This is an EMITTER-capability legality constraint — keep it (in some
+      // form) even under a global solver. See docs/SolverMigrationNotes.md
+      // (guard 3).
+      if (sl.isOuter) {
+        for (auto &node : schedLoop.nodes)
+          node.warpGroup = (node.pipeline == ttg::HWPipeline::NONE) ? -1 : 0;
+        schedLoop.topPartitions.clear();
+        schedLoop.topPartitionCosts.clear();
+        demoteScalarArithToInfra(schedLoop);
+        propagateWarpGroupToInfraOps(schedLoop);
+        coLocateOperandAllocsWithLoads(schedLoop);
+        continue;
+      }
+      // All inner loops go through the same cost-model partitioner — no TC vs
+      // TC-free special-casing. The makespan (single-iteration latency chain
+      // over each WG's pipeAvail) plus barrier cost decides the split
+      // uniformly. This rewards warp specialization wherever it overlaps
+      // independent pipelines across groups: GEMM/FA (MEM/TC/softmax) AND
+      // memory-bound loops like LayerNorm, where putting TMA-load, compute,
+      // and TMA-store on separate warp groups frees the compute warps and
+      // removes the in-stream store drain (measured ~1.2x over 1-WG software
+      // pipelining). No env flag, no hard override.
       if (useGreedy) {
         partitionIntoWarpGroups(schedLoop);
       } else {
