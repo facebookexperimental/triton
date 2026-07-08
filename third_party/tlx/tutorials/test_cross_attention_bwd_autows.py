@@ -26,6 +26,7 @@ os.environ.pop("TRITON_USE_META_WS", None)
 import pytest
 import torch
 import triton.language as tl
+from triton.runtime.errors import OutOfResources
 
 import bench_bwd as bb
 import triton_bw_cross_attention as xa
@@ -115,11 +116,14 @@ def test_cross_attention_bwd_tlx_2kv(Lq, Lkv, Z, ns):
 
 
 @pytest.mark.xfail(
-    raises=RuntimeError,
+    raises=OutOfResources,
     strict=True,
-    reason="autoWS+DP=2 compute fold is blocked on handleOperandD (T278685041): "
-    "the coalesced dv/dk_attn MMAs share one opndD TMEM tile, which the autoWS "
-    "channel model rejects. Drop the xfail once that lands.",
+    reason="T278685041 (handleOperandD chained shared-opndD accumulator) is FIXED: "
+    "the coalesced dv/dk_attn MMAs now form a producer chain in the autoWS "
+    "channel model and the autoWS+DP=2 fold compiles. The kernel still overflows "
+    "shared memory at launch (Required ~576KB > 232KB HW limit) under BLOCK_N=256 "
+    "(DP=2) -- a separate downstream memory-planner layer. Drop the xfail once "
+    "SMEM fits; the body already asserts grads vs the torch reference.",
 )
 @pytest.mark.parametrize("ns", [1, 2])
 @pytest.mark.parametrize("Lq,Lkv,Z", _SHARED_SHAPES)
