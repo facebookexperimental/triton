@@ -10,8 +10,10 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/LogicalResult.h"
+#include "llvm/Support/MathExtras.h"
 
 // Provide custom directive handlers for declarative assemblyFormat.
 // They must be visible before including the generated op classes.
@@ -800,7 +802,28 @@ LogicalResult verifyMemoryOpTypes(Operation *op, ShapedType srcTy,
 }
 
 LogicalResult verifyAllocOp(Operation *op, Value src, MemDescType dstTy) {
-  if (dstTy.getShape() != dstTy.getAllocShape())
+  // A fresh alloc is its own full footprint, so shape must equal allocShape --
+  // except under TRITON_ALLOW_NPOT, where an NPOT tile is allocated
+  // pow2-rounded (getAllocationShapePerCTA). Accept shape != allocShape only
+  // when it is that rounding: same rank and every dim unchanged or its
+  // pow2-ceil. This keeps pow2 strict (PowerOf2Ceil(pow2)==pow2), accepts
+  // single-buffer NPOT (position-independent), and still rejects over-allocs;
+  // MemDescType::verify already checks rank and shape[i] <= allocShape[i].
+  // Flag-OFF byte-identical.
+  static const bool allowNpot =
+      mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
+  auto shape = dstTy.getShape();
+  auto allocShape = dstTy.getAllocShape();
+  bool npotRounded = allowNpot && allocShape.size() == shape.size();
+  if (npotRounded) {
+    for (auto [s, a] : llvm::zip(shape, allocShape)) {
+      if (a != s && !(s > 0 && a == (int64_t)llvm::PowerOf2Ceil((uint64_t)s))) {
+        npotRounded = false;
+        break;
+      }
+    }
+  }
+  if (!npotRounded && shape != allocShape)
     return op->emitOpError("result shape and its alloc shape must match");
 
   if (!src) {

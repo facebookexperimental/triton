@@ -4,6 +4,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/TypeSwitch.h" // required by `Types.cpp.inc`
 
 using namespace mlir;
@@ -96,14 +97,24 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
   if (shape.empty()) {
     return emitError() << "rank 0 memdesc is not allowed";
   }
-  // Every dimension but the first (to allow for pipelining) must be a power of
-  // 2
-  if (!llvm::all_of(shape.drop_front(1), [](int64_t dim) {
-        return llvm::isPowerOf2_64(dim) && dim > 0;
+  // Trailing allocShape dims (all but the leading pipelining dim) must be
+  // non-zero and, for non-exempt encodings, power-of-2. Under TRITON_ALLOW_NPOT
+  // the pow2 rule is exempted for encodings whose physical alloc is
+  // pow2-rounded by getAllocationShapePerCTA (NVMMAShared, TMEM, TMEM-scale);
+  // the non-zero rule always applies. Flag-OFF is byte-identical to the
+  // original check.
+  static const bool allowNpot =
+      mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
+  bool npotExempt =
+      allowNpot && (isa<nvidia_gpu::TensorMemoryScalesEncodingAttr>(encoding) ||
+                    isa<nvidia_gpu::TensorMemoryEncodingAttr>(encoding) ||
+                    isa<NVMMASharedEncodingAttr>(encoding));
+  if (!llvm::all_of(allocShape.drop_front(1), [&](int64_t dim) {
+        return dim > 0 && (npotExempt || llvm::isPowerOf2_64(dim));
       }))
     return emitError()
-           << "shape must have power-of-2 and non-zero dimensions; got "
-           << shape;
+           << "allocShape must have power-of-2 and non-zero dimensions; got "
+           << allocShape;
   if (shape.front() == 0)
     return emitError() << "shape has 0 dimension";
   if (allocShape.size() < shape.size())
