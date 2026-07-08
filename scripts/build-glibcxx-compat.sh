@@ -26,13 +26,19 @@
 #   * DT_NEEDEDs the real lib (copied under the renamed soname
 #     "libstdc++_base.so.6") so every other symbol resolves against it.
 #
-# The result is added to LD_LIBRARY_PATH for the build only (see setup.py,
-# TRITON_GLIBC_COMPAT). It is a build-host workaround and is not shipped.
+# The two resulting .so files are installed into each <install_dir> (typically
+# the prebuilt LLVM's lib/ dir): the LLVM tools have RUNPATH "$ORIGIN/../lib", so
+# dropping the drop-in libstdc++.so.6 there makes clang++/mlir-tblgen/opt/... pick
+# it up with no LD_LIBRARY_PATH, robust to any build invocation. setup.py also
+# adds <output_dir> to LD_LIBRARY_PATH as a fallback. It is a build-host
+# workaround (writes only into the per-user LLVM cache) and is not shipped.
 #
-# Usage: build-glibcxx-compat.sh <output_dir>
+# Usage: build-glibcxx-compat.sh <output_dir> [install_dir ...]
 set -euo pipefail
 
-OUT_DIR="${1:?usage: build-glibcxx-compat.sh <output_dir>}"
+OUT_DIR="${1:?usage: build-glibcxx-compat.sh <output_dir> [install_dir ...]}"
+shift
+INSTALL_DIRS=("$@")
 mkdir -p "$OUT_DIR"
 
 # Locate the real system libstdc++.so.6.
@@ -50,10 +56,22 @@ BASE="$OUT_DIR/libstdc++_base.so.6"
 AUG="$OUT_DIR/libstdc++.so.6"
 STAMP="$OUT_DIR/.glibcxx-compat.stamp"
 
-# Skip if already built against the same base lib.
+# Install the drop-in + renamed base into each requested dir (e.g. LLVM/lib).
+install_compat() {
+    for d in "${INSTALL_DIRS[@]}"; do
+        [ -n "$d" ] || continue
+        mkdir -p "$d"
+        cp -f "$AUG" "$BASE" "$d/"
+        echo "glibcxx-compat: installed into $d"
+    done
+}
+
+# Skip the (re)build if already built against the same base lib, but still
+# (re)install in case a target dir was cleaned or is new.
 if [ -f "$STAMP" ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$REAL" ] \
         && [ -e "$AUG" ] && [ "$AUG" -nt "$REAL" ]; then
     echo "glibcxx-compat: up to date ($AUG)"
+    install_compat
     exit 0
 fi
 
@@ -118,4 +136,5 @@ gcc -shared -fPIC -O2 -o "$AUG" "$SHIM_C" \
 
 echo "$REAL" > "$STAMP"
 echo "glibcxx-compat: built $AUG"
+install_compat
 

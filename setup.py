@@ -322,14 +322,19 @@ class CMakeBuild(build_ext):
 
         # Build against the default prebuilt LLVM (compiled on a newer distro) on
         # a host with an older libstdc++: the prebuilt LLVM build tools
-        # (mlir-tblgen, ...) that run during the build dynamically need
-        # GLIBCXX_3.4.30 (GCC 12) symbols absent from the host libstdc++, so we
-        # build a drop-in libstdc++.so.6 and prepend it to LD_LIBRARY_PATH for
-        # the build subprocesses. See scripts/build-glibcxx-compat.sh.
+        # (mlir-tblgen, clang++, opt, ...) that run during the build dynamically
+        # need GLIBCXX_3.4.30 (GCC 12) symbols absent from the host libstdc++.
+        # Build a drop-in libstdc++.so.6 and install it into the LLVM lib dir; the
+        # tools have RUNPATH "$ORIGIN/../lib" so they pick it up with no env, for
+        # any build invocation. Also prepend it to LD_LIBRARY_PATH as a fallback.
+        # See scripts/build-glibcxx-compat.sh.
         if check_env_flag("TRITON_GLIBC_COMPAT"):
             compat_dir = os.path.join(self.build_temp, "glibcxx-compat")
-            subprocess.check_call(
-                [os.path.join(self.base_dir, "scripts", "build-glibcxx-compat.sh"), compat_dir])
+            compat_cmd = [os.path.join(self.base_dir, "scripts", "build-glibcxx-compat.sh"), compat_dir]
+            llvm_syspath = os.environ.get("LLVM_SYSPATH")
+            if llvm_syspath:
+                compat_cmd.append(os.path.join(llvm_syspath, "lib"))
+            subprocess.check_call(compat_cmd)
             old_ld = os.environ.get("LD_LIBRARY_PATH", "")
             os.environ["LD_LIBRARY_PATH"] = compat_dir + (os.pathsep + old_ld if old_ld else "")
 
