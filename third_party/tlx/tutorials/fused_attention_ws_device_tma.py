@@ -1,3 +1,4 @@
+import copy
 import json
 import pytest
 import torch
@@ -1408,8 +1409,8 @@ class _attention_opt(torch.autograd.Function):
 
         # NOTE: the persistent backward (_attn_bwd_persist) is functional for
         # the tested configs (bwd_config_idx 0-4). bwd_config_idx 2
-        # (_BWD_DOT_ATTRS_TMEM, the 3-group dpT/dq/dsT TMEM reuse) additionally
-        # requires early_tma_store_lowering=True and relies on the cross-tile
+        # (_BWD_DOT_ATTRS_TMEM, the 3-group dpT/dq/dsT TMEM reuse) relies on the
+        # early-TMA store staging (always on since #1709) and the cross-tile
         # staging-reuse WAR barrier (WSCodePartition.cpp Step 7.5) — without it
         # the dv/dk TMA-staging buffers (aliasing the v/do operand SMEM) race
         # the next tile's operand load. See test_bwd_tmem_dsT_reuse_3group and
@@ -1581,6 +1582,7 @@ def test_op(
     FADD2_REDUCE,
     bwd_config_idx,
     dtype=torch.float16,
+    smem_budget=None,
 ):
     # For fwd mode, only run once (bwd_config_idx=0) to avoid redundant tests
     if mode == "fwd" and bwd_config_idx > 0:
@@ -1600,12 +1602,21 @@ def test_op(
     # always on; #1709 removed the early_tma_store_lowering knob). It runs on
     # both the non-persistent (ws) and persistent (ws_persistent) backends
     # (dedicated coverage: test_bwd_tmem_dsT_reuse_3group / _persistent).
-    if mode == "bwd" and baseVariant == "ws_persistent":
-        _attn_bwd_persist.configs = [configs_bwd_persist[bwd_config_idx]]
-        _attn_bwd_persist.cache = {}
-    if mode == "bwd" and baseVariant == "ws":
-        _attn_bwd.configs = [configs_bwd_persist[bwd_config_idx]]
-        _attn_bwd.cache = {}
+    if mode == "bwd":
+        chosen_cfg = configs_bwd_persist[bwd_config_idx]
+        # Optional per-test SMEM budget override (e.g. force depth-2 early-TMA
+        # store staging for the T277224987 regression). Copy so we never mutate
+        # the shared global config.
+        if smem_budget is not None:
+            chosen_cfg = copy.copy(chosen_cfg)
+            chosen_cfg.kwargs = dict(chosen_cfg.kwargs)
+            chosen_cfg.kwargs["SMEM_BUDGET"] = smem_budget
+        if baseVariant == "ws_persistent":
+            _attn_bwd_persist.configs = [chosen_cfg]
+            _attn_bwd_persist.cache = {}
+        elif baseVariant == "ws":
+            _attn_bwd.configs = [chosen_cfg]
+            _attn_bwd.cache = {}
     torch.manual_seed(20)
     q = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
     k = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
@@ -1715,6 +1726,54 @@ def test_bwd_tmem_dsT_reuse_3group_persistent():
         VECT_MUL=0,
         FADD2_REDUCE=False,
         bwd_config_idx=2,
+    )
+
+
+# T277224987: idx0 (EPILOGUE_SUBTILE=4) is shipped at SMEM_BUDGET=200000, which
+# keeps the early-TMA dk/dv/dq store-staging single-buffered. These regressions
+# force SMEM_BUDGET=220000 so Phase 4 double-buffers that staging (buffer.copy=2)
+# — the exact config that used to (1) corrupt dv/dk/dq (staging slot staggered by
+# the outer accumCnt instead of the subtile index) and then (2) OOR (Phase 3.6
+# marking an unrealizable swizzle-mismatched staging->operand reuse, undercounting
+# SMEM). The shipped configs pin 200000 so the autotuned matrix never exercises
+# this; these tests guard the underlying compiler fix directly.
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")
+def test_bwd_early_tma_staging_depth2():
+    # Non-persistent ("ws"): correctness + fits SMEM at the depth-2 budget.
+    test_op(
+        Z=8,
+        H=16,
+        N_CTX=1024,
+        HEAD_DIM=128,
+        causal=False,
+        mode="bwd",
+        baseVariant="ws",
+        provider="triton-fp16",
+        SUBTILING=False,
+        VECT_MUL=0,
+        FADD2_REDUCE=False,
+        bwd_config_idx=0,
+        smem_budget=220000,
+    )
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")
+def test_bwd_early_tma_staging_depth2_persistent():
+    # Persistent ("ws_persistent") variant of the T277224987 regression.
+    test_op(
+        Z=8,
+        H=16,
+        N_CTX=1024,
+        HEAD_DIM=128,
+        causal=False,
+        mode="bwd",
+        baseVariant="ws_persistent",
+        provider="triton-fp16",
+        SUBTILING=False,
+        VECT_MUL=0,
+        FADD2_REDUCE=False,
+        bwd_config_idx=0,
+        smem_budget=220000,
     )
 
 
