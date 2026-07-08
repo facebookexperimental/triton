@@ -61,6 +61,12 @@ def force(ns=2, bm=BLOCK, bn=BLOCK):
     c.kwargs["BLOCK_M"] = bm
     c.kwargs["BLOCK_N"] = bn
     xa._hstu_attn_bwd_redq.configs = [c]
+    if hasattr(xa, "_hstu_attn_bwd_redq_2kv"):
+        c2 = xa._hstu_attn_bwd_redq_2kv.configs[0]
+        c2.num_stages = ns
+        c2.kwargs["BLOCK_M"] = bm
+        c2.kwargs["BLOCK_N"] = bn
+        xa._hstu_attn_bwd_redq_2kv.configs = [c2]
     xa.set_fwd_variant(xa.FwdVariant.TRITON)
 
 

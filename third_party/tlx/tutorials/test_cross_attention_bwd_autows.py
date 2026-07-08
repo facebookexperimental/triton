@@ -32,6 +32,39 @@ import bench_bwd as bb
 import triton_bw_cross_attention as xa
 
 
+def _reset_captured_globals(module):
+    """Clear every Triton jit function's captured ``used_global_vals`` in ``module``.
+
+    Triton records the value of each Python global a kernel reads at first
+    compile and, on EVERY launch (even cache hits), asserts the current value
+    still matches -- otherwise it raises RuntimeError. The fold tests flip the
+    module-global ``_HSTU_COMPUTE_FOLD`` constexpr after the earlier non-fold
+    tests already compiled/cached the shared kernels with it captured as False,
+    so that assert fires. Clearing the captured dict disarms the stale check;
+    combined with TRITON_ALWAYS_COMPILE=1 the kernels recompile and re-specialize
+    on the new constexpr value cleanly.
+    """
+    seen = set()
+
+    def _clear(obj):
+        if obj is None or id(obj) in seen:
+            return
+        seen.add(id(obj))
+        ugv = getattr(obj, "used_global_vals", None)
+        if isinstance(ugv, dict):
+            ugv.clear()
+        # Autotuner (and similar wrappers) hold the JITFunction on ``.fn``.
+        inner = getattr(obj, "fn", None)
+        if inner is not None and inner is not obj:
+            _clear(inner)
+
+    for name in dir(module):
+        try:
+            _clear(getattr(module, name))
+        except Exception:
+            pass
+
+
 # (Lq, Lkv, Z): KV=1 is always correct; KV>=2 exercised the bug (bad Q-blocks at
 # the tail of the Q range). Lq=256 -> 4 Q-blocks (needs >=2 for the inner peel).
 _SHAPES = [(256, 64, 2), (256, 128, 2), (256, 192, 2), (256, 256, 2)]
@@ -115,6 +148,43 @@ def test_cross_attention_bwd_tlx_2kv(Lq, Lkv, Z, ns):
         )
 
 
+@pytest.mark.parametrize("ns", [1, 2])
+@pytest.mark.parametrize("Lq,Lkv,Z", _SHARED_SHAPES)
+def test_cross_attention_bwd_autows_2kv(Lq, Lkv, Z, ns, monkeypatch):
+    """MANUAL 2-KV-block data-partition reduce_dq (BwdVariant.TRITON_AUTOWS_2KV),
+    shared-KV + compute fold, warp specialization OFF (milestone 1). Two KV
+    blocks are processed per step explicitly in Triton so the compiler DP pass
+    never runs. Must match the torch-float reference."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    # The fold gate is a module-level constexpr evaluated at import; override the
+    # attribute (setting the env var now is too late).
+    monkeypatch.setattr(xa, "_HSTU_COMPUTE_FOLD", tl.constexpr(True))
+    monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
+    _reset_captured_globals(xa)
+
+    # BLOCK_N=128 -> the manual 2-KV loop supplies parallelism, no compiler DP.
+    # BLOCK_M=32: the fold MMA-accumulates both blocks' dk in TMEM (256 cols
+    # fixed); with WS off, BLOCK_M>=64 overflows the 512-col TMEM (milestone 2).
+    bb.force(ns, bm=32, bn=128)
+    torch.manual_seed(0)
+    q, k, v, do, so_kv, so_q, asc = bb.make(Lq, Lkv, Z, shared=True)
+    # shared-KV: K and V are one leaf, so the returned dk = dk + dv (dv is None).
+    rq, rk, _ = bb.torch_ref(q, k, v, do, so_kv, so_q, asc, shared=True)
+
+    for t in (q, k, v):
+        t.grad = None
+    bb._fwd(xa.BwdVariant.TRITON_AUTOWS_2KV, "0", q, k, v, so_kv, so_q, Lkv, Lq,
+            asc, shared=True).backward(do)
+    dq, dk = q.grad.clone(), k.grad.clone()
+    for name, got, want in (("dq", dq, rq), ("dk", dk, rk)):
+        rl2 = bb.rel_l2(got, want)
+        assert rl2 < 1e-2, (
+            f"autows_2kv {name} rel-L2 {rl2:.2e} too high (Lq={Lq} Lkv={Lkv} ns={ns})"
+        )
+
+
 @pytest.mark.xfail(
     raises=OutOfResources,
     strict=True,
@@ -140,6 +210,7 @@ def test_cross_attention_bwd_autows_dp_fold(Lq, Lkv, Z, ns, monkeypatch):
     # attribute (setting the env var now is too late).
     monkeypatch.setattr(xa, "_HSTU_COMPUTE_FOLD", tl.constexpr(True))
     monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
+    _reset_captured_globals(xa)
     xa.set_bwd_dot_attrs(xa._HSTU_BWD_DOT_ATTRS_TLX)
 
     bb.force(ns, bm=128, bn=256)  # BLOCK_N=256 -> data_partition_factor=2
