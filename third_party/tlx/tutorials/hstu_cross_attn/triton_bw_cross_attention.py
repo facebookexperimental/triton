@@ -3833,6 +3833,8 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
             k0, tl.trans(q),
             attrs=_HSTU_ATTRS_QKT_2KV if WS_ON else None,
         )
+
+        ######### computation/activation for P0
         if MASK_KV or HAS_CAUSAL:
             valid_mask_trans0 = backward_valid_mask(
                 offs_m, offs_n0, uih_len_q, seq_len_q, seq_len_kv, HAS_CAUSAL
@@ -3854,11 +3856,6 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
             v0, tl.trans(do), allow_tf32=ALLOW_TF32,
             attrs=_HSTU_ATTRS_DPT_2KV if WS_ON else None,
         )
-        # dv fold: accumulate dv into the shared dk accumulator.
-        dk0 = tl.dot(
-            act_qk_trans0, do, dk0, allow_tf32=ALLOW_TF32,
-            attrs=_HSTU_ATTRS_DV_2KV if WS_ON else None,
-        )
         if num_softmax_heads > 0:
             dqk_trans0 = backward_d_softmax_activation(
                 dact_qk_trans0, Delta_off, offs_m, stride_mm, mask_m, pT0
@@ -3867,21 +3864,7 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
             dqk_trans0 = backward_d_silu_activation(
                 dact_qk_trans0, pT0, qk_trans0, scale, valid_mask_trans0
             )
-        # compute fold: pre-scale alpha into dqk so both dq and dk_attn carry it.
-        dqk_trans0 = (dqk_trans0 * alpha).to(k0.dtype)
-        # dq is a SINGLE accumulator over both KV blocks: b0 fresh-writes it, b1
-        # accumulates into the same TMEM tile (opndD id 11) below. This avoids a
-        # cross-partition register sum (dq0 and dq1 land in different warp
-        # partitions under WS) and a two-store race, and needs one TMEM tile.
-        dq_trans = tl.dot(
-            tl.trans(k0), dqk_trans0,
-            attrs=_HSTU_ATTRS_DQ_2KV if WS_ON else None,
-        )
-        dk0 = tl.dot(
-            dqk_trans0, q, dk0, allow_tf32=ALLOW_TF32,
-            attrs=_HSTU_ATTRS_DK_SHARED_2KV if WS_ON else None,
-        )
-
+        ######### computation/activation for P1
         # ---- KV block b1 (SHARED_KV + compute fold) ----
         # WS on: b1 uses DISJOINT buffer.ids (_B1) so its concurrently-live
         # tiles never alias b0's (which stays on _2KV).
@@ -3895,6 +3878,7 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
             )
         else:
             valid_mask_trans1 = offs_m[None, :] < seq_len_q
+        # calculate pT
         if num_softmax_heads > 0:
             qk_trans1, act_qk_trans1, pT1 = (
                 backward_softmax_activation_scaled_alpha(
@@ -3910,10 +3894,7 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
             v1, tl.trans(do), allow_tf32=ALLOW_TF32,
             attrs=_HSTU_ATTRS_DPT_2KV_B1 if WS_ON else None,
         )
-        dk1 = tl.dot(
-            act_qk_trans1, do, dk1, allow_tf32=ALLOW_TF32,
-            attrs=_HSTU_ATTRS_DV_2KV_B1 if WS_ON else None,
-        )
+        # calculate dqk_trans
         if num_softmax_heads > 0:
             dqk_trans1 = backward_d_softmax_activation(
                 dact_qk_trans1, Delta_off, offs_m, stride_mm, mask_m, pT1
@@ -3922,12 +3903,40 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
             dqk_trans1 = backward_d_silu_activation(
                 dact_qk_trans1, pT1, qk_trans1, scale, valid_mask_trans1
             )
+
+        # compute fold: pre-scale alpha into dqk so both dq and dk_attn carry it.
+        dqk_trans0 = (dqk_trans0 * alpha).to(k0.dtype)
+        # dq is a SINGLE accumulator over both KV blocks: b0 fresh-writes it, b1
+        # accumulates into the same TMEM tile (opndD id 11) below. This avoids a
+        # cross-partition register sum (dq0 and dq1 land in different warp
+        # partitions under WS) and a two-store race, and needs one TMEM tile.
+        dq_trans = tl.dot(
+            tl.trans(k0), dqk_trans0,
+            attrs=_HSTU_ATTRS_DQ_2KV if WS_ON else None,
+        )
+        # dv fold: accumulate dv into the shared dk accumulator.
+        dk0 = tl.dot(
+            act_qk_trans0, do, dk0, allow_tf32=ALLOW_TF32,
+            attrs=_HSTU_ATTRS_DV_2KV if WS_ON else None,
+        )
+        dk0 = tl.dot(
+            dqk_trans0, q, dk0, allow_tf32=ALLOW_TF32,
+            attrs=_HSTU_ATTRS_DK_SHARED_2KV if WS_ON else None,
+        )
+
+        # ---- KV block b1 (SHARED_KV + compute fold) ----
+        # WS on: b1 uses DISJOINT buffer.ids (_B1) so its concurrently-live
+        # tiles never alias b0's (which stays on _2KV).
         dqk_trans1 = (dqk_trans1 * alpha).to(k1.dtype)
         # Accumulate b1's dq into the SAME dq_trans TMEM tile (opndD id 11 via
         # _B1), reducing both KV blocks' contributions in TMEM.
         dq_trans = tl.dot(
             tl.trans(k1), dqk_trans1, dq_trans,
             attrs=_HSTU_ATTRS_DQ_2KV_B1 if WS_ON else None,
+        )
+        dk1 = tl.dot(
+            act_qk_trans1, do, dk1, allow_tf32=ALLOW_TF32,
+            attrs=_HSTU_ATTRS_DV_2KV_B1 if WS_ON else None,
         )
         dk1 = tl.dot(
             dqk_trans1, q, dk1, allow_tf32=ALLOW_TF32,
