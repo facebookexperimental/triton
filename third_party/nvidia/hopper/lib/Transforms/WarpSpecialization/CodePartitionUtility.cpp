@@ -2879,8 +2879,15 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
       continue;
     handledUsers.insert(&op);
     if (auto mmaOpT = dyn_cast<ttng::MMAv5OpInterface>(&op)) {
-      if (&op == mmaOp.getOperation()) {
-        // This uses and defines D. Will be both producer and consumer.
+      if (mmaOpT.getAccumulator() == tmemAllocOp.getResult()) {
+        // Any MMA whose accumulator IS this alloc writes operand D, so it is a
+        // producer+consumer link in the operand-D chain. Classify by role
+        // (writes D), not identity (== mmaOp): a second chained accumulator MMA
+        // (e.g. the HSTU reduce_dq fold coalesces dv then dk_attn into one TMEM
+        // tile) is handled here as another producer in the chain rather than
+        // rejected as an aliasing MMA. When two D-writers share a task the
+        // needsChannel check below skips the (redundant) same-task MMA->MMA
+        // channel and just extends currentProds. See T278685041.
         // If useAcc is false, the MMA doesn't read the accumulator - it
         // overwrites it completely. In this case, the MMA is the first
         // producer and doesn't need a prior producer.
@@ -2918,7 +2925,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
           }
         }
         if (currentProds.empty()) {
-          mmaOp->emitError(
+          op.emitError(
               "handleOperandD: no producer found for MMA operand D. "
               "Expected a tmem_store before the loop or use_acc=false.");
           return failure();
@@ -2927,7 +2934,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
         auto producerTaskIds = getAsyncTaskIds(currentProds.front());
         auto consumerIds = getAsyncTaskIds(&op);
         if (producerTaskIds.size() != 1) {
-          mmaOp->emitError(
+          op.emitError(
               "handleOperandD: expected exactly one producer task ID, got ")
               << producerTaskIds.size();
           return failure();
@@ -2947,12 +2954,9 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
           currentProds.push_back(&op);
         }
       } else {
-        if (mmaOpT.getAccumulator() == tmemAllocOp.getResult()) {
-          mmaOp->emitError(
-              "handleOperandD: unexpected MMA using same TMEM as operand D");
-          return failure();
-        }
-        // This uses tmem. mark as tmem.end = channel_id
+        // This MMA reads the alloc as an A/B operand (its own accumulator is a
+        // different TMEM tile): consumer only.
+        // mark as tmem.end = channel_id
         if (currentProds.empty()) {
           mmaOpT->emitError(
               "handleOperandD: no producer found for MMA consumer");
