@@ -710,6 +710,8 @@ void populateTLXPatterns(TritonGPUTypeConverter &typeConverter,
   patterns.add<GenericOpPattern<triton::tlx::RequireLayoutOp>>(typeConverter, context);
   patterns.add<GenericOpPattern<triton::tlx::ReleaseLayoutOp>>(typeConverter,
                                                            context);
+  patterns.add<GenericOpPattern<triton::tlx::DumpLayoutOp>>(typeConverter,
+                                                            context);
   // AMD buffer ops emitted by TLX at TTIR level need encoding added
   patterns.add<GenericOpPattern<triton::amdgpu::BufferLoadOp>>(typeConverter,
                                                                context);
