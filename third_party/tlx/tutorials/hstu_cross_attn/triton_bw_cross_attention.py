@@ -136,6 +136,20 @@ _HSTU_ATTRS_DK = tl.constexpr(_HSTU_BWD_DOT_ATTRS_TLX.get("dk"))
 _HSTU_ATTRS_DQ = tl.constexpr(_HSTU_BWD_DOT_ATTRS_TLX.get("dq"))
 
 
+def set_bwd_dot_attrs(cfg: "FrozenDotAttrs") -> None:
+    """Select the autoWS per-dot schedule for `_hstu_attn_bwd_inner`.
+
+    Pass _HSTU_BWD_DOT_ATTRS_DEFAULT or _HSTU_BWD_DOT_ATTRS_TLX. Call before the
+    kernel compiles (use TRITON_ALWAYS_COMPILE=1 to force a recompile).
+    """
+    global _HSTU_ATTRS_QKT, _HSTU_ATTRS_DV, _HSTU_ATTRS_DPT, _HSTU_ATTRS_DK, _HSTU_ATTRS_DQ
+    _HSTU_ATTRS_QKT = tl.constexpr(cfg.get("qkT"))
+    _HSTU_ATTRS_DV = tl.constexpr(cfg.get("dv"))
+    _HSTU_ATTRS_DPT = tl.constexpr(cfg.get("dpT"))
+    _HSTU_ATTRS_DK = tl.constexpr(cfg.get("dk"))
+    _HSTU_ATTRS_DQ = tl.constexpr(cfg.get("dq"))
+
+
 class FwdVariant(Enum):
     TRITON = "triton"
     TRITON_DYN_SPEC = "triton_dyn_spec"
@@ -151,6 +165,9 @@ class BwdVariant(Enum):
     # Hand-written TLX warp-specialized reduce_dq (attn_bwd_ws). Dispatched here
     # so the existing autograd path + tritonbench --bwd contract drive it.
     TLX = "tlx"
+    # TLX 2-KV-block data-partitioned reduce_dq (attn_bwd_ws_2kv): two independent
+    # MMA groups per program. Shared-KV only (V aliases K).
+    TLX_2KV = "tlx_2kv"
 
 
 # Global variables for variant selection, can be overridden in unit tests
@@ -3762,11 +3779,15 @@ class AttentionFunction(torch.autograd.Function):
             idx += 1
         else:
             num_targets = None
-        if get_bwd_variant() == BwdVariant.TLX:
+        if get_bwd_variant() in (BwdVariant.TLX, BwdVariant.TLX_2KV):
             # Hand-written TLX warp-specialized reduce_dq (attn_bwd_ws). Computes
-            # its own Delta internally; pass out/M for the softmax path.
+            # its own Delta internally; pass out/M for the softmax path. TLX_2KV
+            # dispatches the 2-KV-block data-partitioned variant (attn_bwd_ws_2kv),
+            # which is shared-KV only.
             from tlx_bw_cross_attention import tlx_bw_reduce_dq
 
+            use_2kv = get_bwd_variant() == BwdVariant.TLX_2KV
+            assert not use_2kv or ctx.shared_kv, ("BwdVariant.TLX_2KV (attn_bwd_ws_2kv) requires shared_kv")
             out_t = out if num_softmax_heads > 0 else None
             M_t = M if num_softmax_heads > 0 else None
             dq, dk, dv = tlx_bw_reduce_dq(
@@ -3784,6 +3805,7 @@ class AttentionFunction(torch.autograd.Function):
                 num_softmax_heads=num_softmax_heads,
                 out=out_t,
                 M=M_t,
+                use_2kv=use_2kv,
             )
         else:
             dq, dk, dv = torch.ops.hammer.triton_hstu_cross_attn_v3_bwd(
