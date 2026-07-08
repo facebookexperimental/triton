@@ -29,9 +29,9 @@
 # The two resulting .so files are installed into each <install_dir> (typically
 # the prebuilt LLVM's lib/ dir): the LLVM tools have RUNPATH "$ORIGIN/../lib", so
 # dropping the drop-in libstdc++.so.6 there makes clang++/mlir-tblgen/opt/... pick
-# it up with no LD_LIBRARY_PATH, robust to any build invocation. setup.py also
-# adds <output_dir> to LD_LIBRARY_PATH as a fallback. It is a build-host
-# workaround (writes only into the per-user LLVM cache) and is not shipped.
+# it up with no LD_LIBRARY_PATH, robust to any build invocation. It is a
+# build-host workaround (writes only into the per-user LLVM cache) and is not
+# shipped.
 #
 # Usage: build-glibcxx-compat.sh <output_dir> [install_dir ...]
 set -euo pipefail
